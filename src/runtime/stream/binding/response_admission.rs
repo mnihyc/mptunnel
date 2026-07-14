@@ -1,9 +1,9 @@
-use crate::model::admission::bulk_service_horizon_payload_bytes;
 use super::response_placement::ResponseRateScope;
 use super::response_session::{
     ServerResponsePathSchedulingSnapshot, valid_quic_capacity_proof_candidate_at,
 };
 use super::*;
+use crate::model::admission::bulk_service_horizon_payload_bytes;
 
 // Despite the historical filename, this module owns response path evidence,
 // TCP product-ACK calibration lifecycle, and immutable scheduler snapshots.
@@ -705,16 +705,16 @@ pub(in crate::runtime) enum ServerPathMetricsSource {
 
 #[derive(Debug, Clone, Copy)]
 pub(in crate::runtime) struct ServerPathMetricsEntry {
-    pub(super) metrics: PathMetrics,
-    pub(super) source: ServerPathMetricsSource,
+    pub(in crate::runtime::stream) metrics: PathMetrics,
+    pub(in crate::runtime::stream) source: ServerPathMetricsSource,
     // Metric age is measured at the source; residence time closes the gap when
     // the local idle publisher is delayed after this snapshot is installed.
-    pub(super) recorded_at: Instant,
+    pub(in crate::runtime::stream) recorded_at: Instant,
     // Only the exact capacity transaction creates this marker. Ordinary metric
     // refreshes may carry it to the fixed deadline but cannot mint a new proof.
-    pub(super) capacity_proof: Option<QuicCapacityProofCandidate>,
+    pub(in crate::runtime::stream) capacity_proof: Option<QuicCapacityProofCandidate>,
     // TCP uses an independent receiver receipt plus exact socket telemetry.
-    pub(super) tcp_capacity_proof: Option<TcpCapacityProofCandidate>,
+    pub(in crate::runtime::stream) tcp_capacity_proof: Option<TcpCapacityProofCandidate>,
 }
 
 fn server_output_local_path_metrics(

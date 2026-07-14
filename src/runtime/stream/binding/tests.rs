@@ -3,7 +3,7 @@ use crate::model::admission::{
     ReliableSourceServiceStagingContext, ReliableSourceStagingContext,
     bulk_service_feed_reservoir_payload_bytes, reliable_relay_source_staging_owner_tail_headroom,
 };
-use crate::runtime::relay_io::reliable_stream_recv_progress_interval;
+use crate::runtime::relay::io::reliable_stream_recv_progress_interval;
 use bytes::Bytes;
 use std::sync::mpsc as std_mpsc;
 use std::time::Duration;

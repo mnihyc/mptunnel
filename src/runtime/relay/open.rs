@@ -1,35 +1,35 @@
 use super::*;
 
-pub(super) struct OpenedRemoteStream {
-    pub(super) stream: ReliablePathStream,
-    pub(super) path_index: usize,
+pub(in crate::runtime) struct OpenedRemoteStream {
+    pub(in crate::runtime) stream: ReliablePathStream,
+    pub(in crate::runtime) path_index: usize,
 }
 
 impl OpenedRemoteStream {
     /// An accepted stream that is not committed to a remote set must release
     /// both the peer binding and the local carrier actor entry.
-    pub(super) async fn close(self) {
+    pub(in crate::runtime) async fn close(self) {
         self.stream.send_detach().await;
         self.stream.close().await;
     }
 }
 
-pub(super) struct AcceptedRemoteStreamGuard {
+pub(in crate::runtime) struct AcceptedRemoteStreamGuard {
     stream: Option<ReliablePathStream>,
 }
 
 impl AcceptedRemoteStreamGuard {
-    pub(super) fn new(stream: ReliablePathStream) -> Self {
+    pub(in crate::runtime) fn new(stream: ReliablePathStream) -> Self {
         Self {
             stream: Some(stream),
         }
     }
 
-    pub(super) fn stream(&self) -> &ReliablePathStream {
+    pub(in crate::runtime) fn stream(&self) -> &ReliablePathStream {
         self.stream.as_ref().expect("accepted stream guard")
     }
 
-    pub(super) fn commit(mut self) -> ReliablePathStream {
+    pub(in crate::runtime) fn commit(mut self) -> ReliablePathStream {
         self.stream.take().expect("accepted stream guard")
     }
 }
@@ -50,46 +50,46 @@ impl Drop for AcceptedRemoteStreamGuard {
     }
 }
 
-pub(super) struct ReliableRelayRemotePath {
-    pub(super) path_index: usize,
-    pub(super) instance_id: u64,
-    pub(super) placement: RelayPathPlacement,
-    pub(super) load_reserved: bool,
-    pub(super) load_lease: Option<RelayPathLoadLease>,
-    pub(super) attached_at: Instant,
-    pub(super) path_proof_id: Option<u64>,
-    pub(super) path_proof_generation: u64,
-    pub(super) stream: ReliablePathStreamHandle,
+pub(in crate::runtime) struct ReliableRelayRemotePath {
+    pub(in crate::runtime) path_index: usize,
+    pub(in crate::runtime) instance_id: u64,
+    pub(in crate::runtime) placement: RelayPathPlacement,
+    pub(in crate::runtime) load_reserved: bool,
+    pub(in crate::runtime) load_lease: Option<RelayPathLoadLease>,
+    pub(in crate::runtime) attached_at: Instant,
+    pub(in crate::runtime) path_proof_id: Option<u64>,
+    pub(in crate::runtime) path_proof_generation: u64,
+    pub(in crate::runtime) stream: ReliablePathStreamHandle,
 }
 
 impl ReliableRelayRemotePath {
-    pub(super) fn key(&self) -> RelayPathKey {
+    pub(in crate::runtime) fn key(&self) -> RelayPathKey {
         RelayPathKey {
             underlay: self.stream.underlay,
             index: self.path_index,
         }
     }
 
-    pub(super) fn instance(&self) -> RelayPathInstance {
+    pub(in crate::runtime) fn instance(&self) -> RelayPathInstance {
         RelayPathInstance {
             key: self.key(),
             id: self.instance_id,
         }
     }
 
-    pub(super) fn has_load_reservation(&self) -> bool {
+    pub(in crate::runtime) fn has_load_reservation(&self) -> bool {
         self.load_reserved || self.load_lease.is_some()
     }
 }
 
-pub(super) struct ReliableRelayRemoteFrame {
-    pub(super) instance: RelayPathInstance,
-    pub(super) frame: Result<Frame, RuntimeError>,
+pub(in crate::runtime) struct ReliableRelayRemoteFrame {
+    pub(in crate::runtime) instance: RelayPathInstance,
+    pub(in crate::runtime) frame: Result<Frame, RuntimeError>,
 }
 
-pub(super) struct ReliableRelayRemoteSet {
+pub(in crate::runtime) struct ReliableRelayRemoteSet {
     stream_id: StreamId,
-    pub(super) paths: Vec<ReliableRelayRemotePath>,
+    pub(in crate::runtime) paths: Vec<ReliableRelayRemotePath>,
     frames_tx: mpsc::Sender<ReliableRelayRemoteFrame>,
     frames_rx: mpsc::Receiver<ReliableRelayRemoteFrame>,
     next_instance_id: u64,
@@ -97,7 +97,7 @@ pub(super) struct ReliableRelayRemoteSet {
 }
 
 impl ReliableRelayRemoteSet {
-    pub(super) fn new(opened: OpenedRemoteStream, frame_queue: usize) -> Self {
+    pub(in crate::runtime) fn new(opened: OpenedRemoteStream, frame_queue: usize) -> Self {
         let stream_id = opened.stream.stream_id;
         let (frames_tx, frames_rx) = mpsc::channel(frame_queue);
         let mut set = Self {
@@ -112,29 +112,32 @@ impl ReliableRelayRemoteSet {
         set
     }
 
-    pub(super) fn stream_id(&self) -> StreamId {
+    pub(in crate::runtime) fn stream_id(&self) -> StreamId {
         self.stream_id
     }
 
-    pub(super) fn membership_generation(&self) -> u64 {
+    pub(in crate::runtime) fn membership_generation(&self) -> u64 {
         self.membership_generation
     }
 
-    pub(super) fn primary_path_key(&self) -> Option<RelayPathKey> {
+    pub(in crate::runtime) fn primary_path_key(&self) -> Option<RelayPathKey> {
         self.paths.first().map(|path| path.key())
     }
 
-    pub(super) fn active_path_instance(&self) -> Option<RelayPathInstance> {
+    pub(in crate::runtime) fn active_path_instance(&self) -> Option<RelayPathInstance> {
         self.active_path_position()
             .and_then(|position| self.paths.get(position))
             .map(ReliableRelayRemotePath::instance)
     }
 
-    pub(super) fn active_path_key(&self) -> Option<RelayPathKey> {
+    pub(in crate::runtime) fn active_path_key(&self) -> Option<RelayPathKey> {
         self.active_path_instance().map(|instance| instance.key)
     }
 
-    pub(super) fn active_path_index_for(&self, underlay: UnderlayProtocol) -> Option<usize> {
+    pub(in crate::runtime) fn active_path_index_for(
+        &self,
+        underlay: UnderlayProtocol,
+    ) -> Option<usize> {
         self.paths
             .iter()
             .rev()
@@ -144,35 +147,35 @@ impl ReliableRelayRemoteSet {
             .map(|path| path.path_index)
     }
 
-    pub(super) fn active_path_underlay(&self) -> Option<UnderlayProtocol> {
+    pub(in crate::runtime) fn active_path_underlay(&self) -> Option<UnderlayProtocol> {
         self.active_path_position()
             .and_then(|position| self.paths.get(position))
             .map(|path| path.stream.underlay)
     }
 
-    pub(super) fn contains_path_key(&self, key: RelayPathKey) -> bool {
+    pub(in crate::runtime) fn contains_path_key(&self, key: RelayPathKey) -> bool {
         self.paths.iter().any(|path| path.key() == key)
     }
 
-    pub(super) fn contains_path_instance(&self, instance: RelayPathInstance) -> bool {
+    pub(in crate::runtime) fn contains_path_instance(&self, instance: RelayPathInstance) -> bool {
         self.paths.iter().any(|path| path.instance() == instance)
     }
 
-    pub(super) fn path_keys(&self) -> Vec<RelayPathKey> {
+    pub(in crate::runtime) fn path_keys(&self) -> Vec<RelayPathKey> {
         self.paths
             .iter()
             .map(ReliableRelayRemotePath::key)
             .collect()
     }
 
-    pub(super) fn path_instances(&self) -> Vec<RelayPathInstance> {
+    pub(in crate::runtime) fn path_instances(&self) -> Vec<RelayPathInstance> {
         self.paths
             .iter()
             .map(ReliableRelayRemotePath::instance)
             .collect()
     }
 
-    pub(super) fn load_reserved_path_keys(&self) -> Vec<RelayPathKey> {
+    pub(in crate::runtime) fn load_reserved_path_keys(&self) -> Vec<RelayPathKey> {
         self.paths
             .iter()
             .filter(|path| path.has_load_reservation())
@@ -180,7 +183,9 @@ impl ReliableRelayRemoteSet {
             .collect()
     }
 
-    pub(super) fn repair_path_instance_for_service_recovery(&self) -> Option<RelayPathInstance> {
+    pub(in crate::runtime) fn repair_path_instance_for_service_recovery(
+        &self,
+    ) -> Option<RelayPathInstance> {
         self.paths
             .iter()
             .rev()
@@ -188,7 +193,7 @@ impl ReliableRelayRemoteSet {
             .map(ReliableRelayRemotePath::instance)
     }
 
-    pub(super) fn accepted_product_path_count(&self) -> usize {
+    pub(in crate::runtime) fn accepted_product_path_count(&self) -> usize {
         // Active and Repair opens enter this set only after peer acceptance.
         // Validation remains excluded from this attachment-role count even
         // when a stream separately graduates it from exact capacity evidence.
@@ -199,14 +204,17 @@ impl ReliableRelayRemoteSet {
     }
 
     #[cfg(test)]
-    pub(super) fn path_instance_for_key(&self, key: RelayPathKey) -> Option<RelayPathInstance> {
+    pub(in crate::runtime) fn path_instance_for_key(
+        &self,
+        key: RelayPathKey,
+    ) -> Option<RelayPathInstance> {
         self.paths
             .iter()
             .find(|path| path.key() == key)
             .map(ReliableRelayRemotePath::instance)
     }
 
-    pub(super) fn set_lane(&mut self, lane: FlowLane) {
+    pub(in crate::runtime) fn set_lane(&mut self, lane: FlowLane) {
         for path in &mut self.paths {
             path.stream.lane = lane;
             if let Some(lease) = &mut path.load_lease {
@@ -216,7 +224,7 @@ impl ReliableRelayRemoteSet {
         }
     }
 
-    pub(super) fn retry_pending_path_proofs(&mut self, context: &ClientPathContext) {
+    pub(in crate::runtime) fn retry_pending_path_proofs(&mut self, context: &ClientPathContext) {
         for path in &mut self.paths {
             if path.placement != RelayPathPlacement::Validation {
                 continue;
@@ -234,11 +242,11 @@ impl ReliableRelayRemoteSet {
         }
     }
 
-    pub(super) fn is_empty(&self) -> bool {
+    pub(in crate::runtime) fn is_empty(&self) -> bool {
         self.paths.is_empty()
     }
 
-    pub(super) fn max_offset(&self) -> u64 {
+    pub(in crate::runtime) fn max_offset(&self) -> u64 {
         self.paths
             .iter()
             .map(|path| path.stream.max_offset)
@@ -246,7 +254,7 @@ impl ReliableRelayRemoteSet {
             .unwrap_or(0)
     }
 
-    pub(super) fn max_frame_payload_bytes(&self, mux_limits: MuxLimits) -> usize {
+    pub(in crate::runtime) fn max_frame_payload_bytes(&self, mux_limits: MuxLimits) -> usize {
         self.paths
             .iter()
             .map(|path| path.stream.max_frame_payload_bytes)
@@ -255,15 +263,15 @@ impl ReliableRelayRemoteSet {
             .max(1)
     }
 
-    pub(super) fn attach(&mut self, opened: OpenedRemoteStream) {
+    pub(in crate::runtime) fn attach(&mut self, opened: OpenedRemoteStream) {
         self.attach_with_placement(opened, RelayPathPlacement::Active);
     }
 
-    pub(super) fn attach_for_repair(&mut self, opened: OpenedRemoteStream) {
+    pub(in crate::runtime) fn attach_for_repair(&mut self, opened: OpenedRemoteStream) {
         self.attach_with_placement(opened, RelayPathPlacement::Repair);
     }
 
-    pub(super) fn attach_for_validation(&mut self, opened: OpenedRemoteStream) {
+    pub(in crate::runtime) fn attach_for_validation(&mut self, opened: OpenedRemoteStream) {
         self.attach_with_placement(opened, RelayPathPlacement::Validation);
     }
 
@@ -334,18 +342,20 @@ impl ReliableRelayRemoteSet {
         self.membership_generation = self.membership_generation.wrapping_add(1);
     }
 
-    pub(super) async fn recv_frame(&mut self) -> Result<ReliableRelayRemoteFrame, RuntimeError> {
+    pub(in crate::runtime) async fn recv_frame(
+        &mut self,
+    ) -> Result<ReliableRelayRemoteFrame, RuntimeError> {
         self.frames_rx
             .recv()
             .await
             .ok_or(RuntimeError::ReliablePathSessionClosed)
     }
 
-    pub(super) fn has_buffered_frame(&self) -> bool {
+    pub(in crate::runtime) fn has_buffered_frame(&self) -> bool {
         !self.frames_rx.is_empty()
     }
 
-    pub(super) fn can_enqueue_work_lane_now(
+    pub(in crate::runtime) fn can_enqueue_work_lane_now(
         &self,
         work_lane: ReliableWorkClass,
         relay_lane: FlowLane,
@@ -356,7 +366,7 @@ impl ReliableRelayRemoteSet {
         })
     }
 
-    pub(super) async fn close_all(&mut self) {
+    pub(in crate::runtime) async fn close_all(&mut self) {
         let paths = std::mem::take(&mut self.paths);
         for path in paths {
             path.stream.send_detach().await;
@@ -364,7 +374,7 @@ impl ReliableRelayRemoteSet {
         }
     }
 
-    pub(super) async fn fail_path_instance(
+    pub(in crate::runtime) async fn fail_path_instance(
         &mut self,
         context: &ClientPathContext,
         instance: RelayPathInstance,
@@ -388,7 +398,7 @@ impl ReliableRelayRemoteSet {
         true
     }
 
-    pub(super) fn remove_path_instance(
+    pub(in crate::runtime) fn remove_path_instance(
         &mut self,
         instance: RelayPathInstance,
     ) -> Option<ReliableRelayRemotePath> {
@@ -399,13 +409,16 @@ impl ReliableRelayRemoteSet {
         self.remove_path_at(position)
     }
 
-    pub(super) fn remove_path_at(&mut self, position: usize) -> Option<ReliableRelayRemotePath> {
+    pub(in crate::runtime) fn remove_path_at(
+        &mut self,
+        position: usize,
+    ) -> Option<ReliableRelayRemotePath> {
         let path = self.paths.remove(position);
         self.membership_generation = self.membership_generation.wrapping_add(1);
         Some(path)
     }
 
-    pub(super) fn activate_path_instance_after_service_open(
+    pub(in crate::runtime) fn activate_path_instance_after_service_open(
         &mut self,
         instance: RelayPathInstance,
     ) -> bool {
@@ -431,7 +444,7 @@ impl ReliableRelayRemoteSet {
         true
     }
 
-    pub(super) fn reserve_path_instance_load_if_needed(
+    pub(in crate::runtime) fn reserve_path_instance_load_if_needed(
         &mut self,
         context: &ClientPathContext,
         instance: RelayPathInstance,
@@ -455,7 +468,7 @@ impl ReliableRelayRemoteSet {
         true
     }
 
-    pub(super) fn commit_path_instance_load_claim(
+    pub(in crate::runtime) fn commit_path_instance_load_claim(
         &mut self,
         instance: RelayPathInstance,
         lease: RelayPathLoadLease,
@@ -482,7 +495,7 @@ impl ReliableRelayRemoteSet {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(super) enum RelayPathPlacement {
+pub(in crate::runtime) enum RelayPathPlacement {
     Active,
     Repair,
     Validation,
@@ -499,32 +512,34 @@ fn relay_path_placement_may_wake_work_lane(
 }
 
 #[derive(Clone)]
-pub(super) struct ReliableRelayOpenSpec {
-    pub(super) target: TargetAddr,
-    pub(super) ingress: IngressKind,
+pub(in crate::runtime) struct ReliableRelayOpenSpec {
+    pub(in crate::runtime) target: TargetAddr,
+    pub(in crate::runtime) ingress: IngressKind,
 }
 
 #[derive(Debug, Clone, Copy)]
-pub(super) enum ReliableRelayAttachMode {
+pub(in crate::runtime) enum ReliableRelayAttachMode {
     Any,
     BulkStriping,
     RecoveryRepair,
 }
 
 #[derive(Debug, Clone, Copy)]
-pub(super) struct UdpStreamOpenOptions {
-    pub(super) wait_for_accept: bool,
-    pub(super) role: StreamOpenRole,
+pub(in crate::runtime) struct UdpStreamOpenOptions {
+    pub(in crate::runtime) wait_for_accept: bool,
+    pub(in crate::runtime) role: StreamOpenRole,
 }
 
 impl UdpStreamOpenOptions {
-    pub(super) const ACTIVE_WAIT: Self = Self {
+    pub(in crate::runtime) const ACTIVE_WAIT: Self = Self {
         wait_for_accept: true,
         role: StreamOpenRole::Active,
     };
 }
 
-pub(super) fn udp_relay_attachment_open_options(role: StreamOpenRole) -> UdpStreamOpenOptions {
+pub(in crate::runtime) fn udp_relay_attachment_open_options(
+    role: StreamOpenRole,
+) -> UdpStreamOpenOptions {
     UdpStreamOpenOptions {
         wait_for_accept: role != StreamOpenRole::Validation,
         role,
@@ -532,12 +547,12 @@ pub(super) fn udp_relay_attachment_open_options(role: StreamOpenRole) -> UdpStre
 }
 
 #[derive(Debug, Clone, Copy)]
-pub(super) struct ReliableInitialOpenAttempt {
-    pub(super) key: RelayPathKey,
-    pub(super) stream_id: StreamId,
+pub(in crate::runtime) struct ReliableInitialOpenAttempt {
+    pub(in crate::runtime) key: RelayPathKey,
+    pub(in crate::runtime) stream_id: StreamId,
 }
 
-pub(super) fn reserve_reliable_initial_open_attempt(
+pub(in crate::runtime) fn reserve_reliable_initial_open_attempt(
     context: &ClientPathContext,
     lane: FlowLane,
     payload_bytes: usize,
@@ -565,7 +580,7 @@ pub(super) fn reserve_reliable_initial_open_attempt(
     }
 }
 
-pub(super) fn mark_reliable_initial_open_retryable_failure(
+pub(in crate::runtime) fn mark_reliable_initial_open_retryable_failure(
     context: &ClientPathContext,
     key: RelayPathKey,
     lane: FlowLane,
@@ -666,7 +681,7 @@ async fn open_reliable_initial_active_attempt(
     }
 }
 
-pub(super) async fn open_remote_stream(
+pub(in crate::runtime) async fn open_remote_stream(
     context: &ClientPathContext,
     target: TargetAddr,
     ingress: IngressKind,
@@ -706,7 +721,7 @@ pub(super) async fn open_remote_stream(
     Err(last_retryable_error.unwrap_or_else(|| no_schedulable_reliable_path_error(context)))
 }
 
-pub(super) async fn open_remote_stream_on_path(
+pub(in crate::runtime) async fn open_remote_stream_on_path(
     context: &ClientPathContext,
     stream_id: StreamId,
     target: TargetAddr,
@@ -772,12 +787,12 @@ pub(super) async fn open_remote_stream_on_path(
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(super) struct ReliableRelayAttachOpenTimeouts {
-    pub(super) live: Duration,
-    pub(super) setup: Duration,
+pub(in crate::runtime) struct ReliableRelayAttachOpenTimeouts {
+    pub(in crate::runtime) live: Duration,
+    pub(in crate::runtime) setup: Duration,
 }
 
-pub(super) fn reliable_relay_attach_open_timeouts(
+pub(in crate::runtime) fn reliable_relay_attach_open_timeouts(
     context: &ClientPathContext,
     key: RelayPathKey,
     lane: FlowLane,
@@ -799,7 +814,7 @@ pub(super) fn reliable_relay_attach_open_timeouts(
     }
 }
 
-pub(super) fn reliable_initial_active_open_timeout(
+pub(in crate::runtime) fn reliable_initial_active_open_timeout(
     context: &ClientPathContext,
     key: RelayPathKey,
     lane: FlowLane,
@@ -817,7 +832,7 @@ pub(super) fn reliable_initial_active_open_timeout(
     }
 }
 
-pub(super) async fn open_remote_stream_on_reserved_path(
+pub(in crate::runtime) async fn open_remote_stream_on_reserved_path(
     context: &ClientPathContext,
     stream_id: StreamId,
     target: TargetAddr,
@@ -879,7 +894,7 @@ pub(super) async fn open_remote_stream_on_reserved_path(
     })
 }
 
-pub(super) async fn open_remote_stream_on_udp_path(
+pub(in crate::runtime) async fn open_remote_stream_on_udp_path(
     context: &ClientPathContext,
     stream_id: StreamId,
     target: TargetAddr,
@@ -917,7 +932,7 @@ pub(super) async fn open_remote_stream_on_udp_path(
     }
 }
 
-pub(super) async fn relay_path_open_with_timeout<T, F>(
+pub(in crate::runtime) async fn relay_path_open_with_timeout<T, F>(
     open_timeout: Duration,
     open: F,
 ) -> Result<T, RuntimeError>
@@ -930,7 +945,7 @@ where
     }
 }
 
-pub(super) async fn open_remote_stream_on_reserved_udp_path(
+pub(in crate::runtime) async fn open_remote_stream_on_reserved_udp_path(
     context: &ClientPathContext,
     stream_id: StreamId,
     target: TargetAddr,
@@ -1007,7 +1022,7 @@ async fn send_open_path_metrics(
     send_sender_service_control_frame(stream, Frame::PathMetrics { metrics }).map(|_| ())
 }
 
-pub(super) fn authenticated_path_join_frames(
+pub(in crate::runtime) fn authenticated_path_join_frames(
     security: &SecurityConfig,
     path: &PathSpec,
     path_id: PathId,
@@ -1017,7 +1032,7 @@ pub(super) fn authenticated_path_join_frames(
     authenticated_path_join_frames_for_session(security, path, path_id, underlay, session_id)
 }
 
-pub(super) fn authenticated_path_join_frames_for_session(
+pub(in crate::runtime) fn authenticated_path_join_frames_for_session(
     security: &SecurityConfig,
     path: &PathSpec,
     path_id: PathId,
@@ -1059,7 +1074,7 @@ pub(super) fn authenticated_path_join_frames_for_session(
     ))
 }
 
-pub(super) fn stream_open_error_is_path_retryable(err: &RuntimeError) -> bool {
+pub(in crate::runtime) fn stream_open_error_is_path_retryable(err: &RuntimeError) -> bool {
     matches!(
         err,
         RuntimeError::Io(_)
@@ -1074,7 +1089,7 @@ pub(super) fn stream_open_error_is_path_retryable(err: &RuntimeError) -> bool {
     )
 }
 
-pub(super) fn udp_stream_open_error_is_path_retryable(err: &RuntimeError) -> bool {
+pub(in crate::runtime) fn udp_stream_open_error_is_path_retryable(err: &RuntimeError) -> bool {
     matches!(
         err,
         RuntimeError::Io(_)
@@ -1089,7 +1104,9 @@ pub(super) fn udp_stream_open_error_is_path_retryable(err: &RuntimeError) -> boo
     )
 }
 
-pub(super) fn relay_error_is_tcp_path_failure<T>(result: &Result<T, RuntimeError>) -> bool {
+pub(in crate::runtime) fn relay_error_is_tcp_path_failure<T>(
+    result: &Result<T, RuntimeError>,
+) -> bool {
     matches!(
         result,
         Err(RuntimeError::PathHeartbeatTimeout)

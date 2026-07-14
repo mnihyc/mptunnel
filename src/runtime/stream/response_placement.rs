@@ -1,4 +1,4 @@
-use super::response_session::ResponseServiceFamilyLoads;
+use super::ResponseServiceFamilyLoads;
 use crate::protocol::UnderlayProtocol;
 use crate::scheduler::{PathRateScope, PathSnapshot};
 

@@ -1,7 +1,7 @@
 use super::*;
 use crate::protocol::path_capacity::CapacityReceiveTracker;
 
-pub(super) async fn handle_server_path(
+pub(in crate::runtime) async fn handle_server_path(
     stream: TcpStream,
     context: ServerPathContext,
 ) -> Result<(), RuntimeError> {
@@ -796,7 +796,7 @@ pub(super) async fn handle_server_path(
     }
 }
 
-pub(super) struct ServerTcpPathCommandContext<'a> {
+pub(in crate::runtime) struct ServerTcpPathCommandContext<'a> {
     session_id: SessionId,
     path_id: PathId,
     path_instance_id: ServerCarrierPathInstanceId,
@@ -1074,7 +1074,7 @@ async fn server_write_tcp_capacity_probe(
     .await
 }
 
-pub(super) async fn handle_server_tcp_path_command(
+pub(in crate::runtime) async fn handle_server_tcp_path_command(
     command: ReliablePathCommand,
     writer: &mut EncryptedTcpWriter,
     context: &ServerPathContext,
@@ -1136,7 +1136,7 @@ pub(super) async fn handle_server_tcp_path_command(
     }
 }
 
-pub(super) async fn server_write_tcp_path_frame(
+pub(in crate::runtime) async fn server_write_tcp_path_frame(
     framed: &mut EncryptedTcpWriter,
     frame: &Frame,
 ) -> Result<bool, RuntimeError> {
@@ -1169,7 +1169,9 @@ async fn server_flush_tcp_path_writer(
     }
 }
 
-pub(super) fn encrypted_framed_peer_closed(err: &EncryptedFramedTransportError) -> bool {
+pub(in crate::runtime) fn encrypted_framed_peer_closed(
+    err: &EncryptedFramedTransportError,
+) -> bool {
     matches!(
         err,
         EncryptedFramedTransportError::Io(io)
@@ -1183,7 +1185,7 @@ pub(super) fn encrypted_framed_peer_closed(err: &EncryptedFramedTransportError) 
     )
 }
 
-pub(super) async fn run_server_tcp_stream(
+pub(in crate::runtime) async fn run_server_tcp_stream(
     context: ServerPathContext,
     session_id: SessionId,
     stream: ReliablePathStream,
@@ -1238,6 +1240,6 @@ pub(super) async fn run_server_tcp_stream(
     result
 }
 
-pub(super) fn tcp_server_session_command_queue(context: &ServerPathContext) -> usize {
+pub(in crate::runtime) fn tcp_server_session_command_queue(context: &ServerPathContext) -> usize {
     reliable_path_command_queue(context.mux_limits)
 }

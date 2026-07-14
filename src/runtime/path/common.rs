@@ -6,7 +6,7 @@ use super::*;
 
 const UDP_DATAGRAM_RECV_BUFFER_BYTES: usize = u16::MAX as usize;
 
-pub(super) fn stream_demand_hint_for_lane(lane: FlowLane) -> StreamDemandHint {
+pub(in crate::runtime) fn stream_demand_hint_for_lane(lane: FlowLane) -> StreamDemandHint {
     match lane {
         FlowLane::Control | FlowLane::Latency => StreamDemandHint::latency(),
         FlowLane::Throughput | FlowLane::Background => StreamDemandHint::throughput(),
@@ -14,7 +14,7 @@ pub(super) fn stream_demand_hint_for_lane(lane: FlowLane) -> StreamDemandHint {
     }
 }
 
-pub(super) fn flow_lane_from_stream_demand_hint(demand: StreamDemandHint) -> FlowLane {
+pub(in crate::runtime) fn flow_lane_from_stream_demand_hint(demand: StreamDemandHint) -> FlowLane {
     let latency = demand.latency_weight_ppm;
     let throughput = demand.throughput_weight_ppm;
     let realtime = demand.realtime_weight_ppm;
@@ -27,16 +27,16 @@ pub(super) fn flow_lane_from_stream_demand_hint(demand: StreamDemandHint) -> Flo
     }
 }
 
-pub(super) struct ServerUdpDatagramFlow {
-    pub(super) flow_id: DatagramFlowId,
-    pub(super) requests: mpsc::Sender<ServerUdpDatagramRequest>,
-    pub(super) _realtime_registration: ServerRealtimeFlowRegistration,
+pub(in crate::runtime) struct ServerUdpDatagramFlow {
+    pub(in crate::runtime) flow_id: DatagramFlowId,
+    pub(in crate::runtime) requests: mpsc::Sender<ServerUdpDatagramRequest>,
+    pub(in crate::runtime) _realtime_registration: ServerRealtimeFlowRegistration,
 }
 
-pub(super) struct ServerUdpDatagramRequest {
-    pub(super) datagram_id: DatagramId,
-    pub(super) ttl_ms: u32,
-    pub(super) payload: Bytes,
+pub(in crate::runtime) struct ServerUdpDatagramRequest {
+    pub(in crate::runtime) datagram_id: DatagramId,
+    pub(in crate::runtime) ttl_ms: u32,
+    pub(in crate::runtime) payload: Bytes,
 }
 
 fn server_udp_datagram_request_queue_len(mux_limits: MuxLimits) -> usize {
@@ -47,7 +47,7 @@ fn server_udp_datagram_request_queue_len(mux_limits: MuxLimits) -> usize {
         .max(1)
 }
 
-pub(super) fn spawn_server_udp_datagram_flow_worker(
+pub(in crate::runtime) fn spawn_server_udp_datagram_flow_worker(
     flow_id: DatagramFlowId,
     mut outbound_socket: outbound::OutboundUdpSocket,
     commands: ReliablePathCommandSender,
@@ -138,7 +138,7 @@ pub(super) fn spawn_server_udp_datagram_flow_worker(
     requests_tx
 }
 
-pub(super) fn try_send_server_datagram_realtime_frame(
+pub(in crate::runtime) fn try_send_server_datagram_realtime_frame(
     commands: &ReliablePathCommandSender,
     frame: Frame,
 ) -> Result<(), RuntimeError> {
@@ -168,7 +168,7 @@ fn server_udp_next_response_ttl(
         .map(|(_, ttl_ms, datagram_id)| (ttl_ms, datagram_id))
 }
 
-pub(super) fn frame_kind_name(frame: &Frame) -> &'static str {
+pub(in crate::runtime) fn frame_kind_name(frame: &Frame) -> &'static str {
     match frame {
         Frame::SessionHello { .. } => "SESSION_HELLO",
         Frame::SessionAuth { .. } => "SESSION_AUTH",
@@ -320,7 +320,7 @@ fn frame_subject(frame: &Frame) -> String {
     }
 }
 
-pub(super) fn log_unexpected_stream_relay_frame(
+pub(in crate::runtime) fn log_unexpected_stream_relay_frame(
     kind: &'static str,
     expected: StreamId,
     frame: &Frame,
@@ -333,12 +333,12 @@ pub(super) fn log_unexpected_stream_relay_frame(
     );
 }
 
-pub(super) enum ServerTcpPathEvent {
+pub(in crate::runtime) enum ServerTcpPathEvent {
     Frame(Frame),
     Command(ReliablePathCommand),
 }
 
-pub(super) async fn recv_server_tcp_path_event(
+pub(in crate::runtime) async fn recv_server_tcp_path_event(
     path_frames: &mut mpsc::Receiver<Result<Frame, EncryptedFramedTransportError>>,
     commands_rx: &mut ReliablePathCommandReceivers,
 ) -> Result<Option<ServerTcpPathEvent>, RuntimeError> {

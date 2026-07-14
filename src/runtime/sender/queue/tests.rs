@@ -4,8 +4,8 @@ use super::super::{
 };
 use super::*;
 use crate::model::path::CarrierPathKey;
+use crate::model::path::{RelayPathInstance, RelayPathKey};
 use crate::protocol::{PathId, StreamId, UnderlayProtocol};
-use crate::runtime::relay_open::{RelayPathInstance, RelayPathKey};
 use std::time::{Duration, Instant};
 
 #[test]

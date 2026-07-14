@@ -10,7 +10,7 @@ fn reliable_relay_request_outstanding_resource_ceiling(mux_limits: MuxLimits) ->
         .max(1)
 }
 
-pub(super) fn reliable_relay_client_dispatch_payload_limit(
+pub(in crate::runtime) fn reliable_relay_client_dispatch_payload_limit(
     adaptive_chunk_bytes: usize,
     remaining_pass_bytes: usize,
 ) -> usize {
@@ -314,7 +314,7 @@ fn update_tcp_service_request_bulk_flow_registration(
     registration.update(request_bulk_active, service_underlay);
 }
 
-pub(super) async fn relay_migrating_tcp_stream<S>(
+pub(in crate::runtime) async fn relay_migrating_tcp_stream<S>(
     mut local: S,
     context: &ClientPathContext,
     spec: ReliableRelayOpenSpec,
@@ -2411,7 +2411,7 @@ fn reliable_relay_lane_changed(previous: FlowLane, current: FlowLane) -> bool {
 }
 
 #[allow(clippy::too_many_arguments)]
-pub(super) async fn recover_reliable_relay_after_path_failure(
+pub(in crate::runtime) async fn recover_reliable_relay_after_path_failure(
     sender: &mut RelaySenderService,
     sender_queue: &mut ReliableRelaySenderQueue,
     context: &ClientPathContext,
@@ -2915,7 +2915,7 @@ fn reliable_relay_validation_probe_candidates(
     selected
 }
 
-pub(super) struct RelayPathAttachRequest<'a> {
+pub(in crate::runtime) struct RelayPathAttachRequest<'a> {
     spec: &'a ReliableRelayOpenSpec,
     lane: FlowLane,
     send_stream: &'a ReliableSendStream,
@@ -3026,7 +3026,7 @@ async fn attach_relay_path_candidates(
     }
 }
 
-pub(super) async fn open_remote_stream_for_relay_path(
+pub(in crate::runtime) async fn open_remote_stream_for_relay_path(
     context: &ClientPathContext,
     stream_id: StreamId,
     target: TargetAddr,
@@ -3055,7 +3055,7 @@ pub(super) async fn open_remote_stream_for_relay_path(
     }
 }
 
-pub(super) fn relay_path_open_error_is_retryable(
+pub(in crate::runtime) fn relay_path_open_error_is_retryable(
     underlay: UnderlayProtocol,
     err: &RuntimeError,
 ) -> bool {
@@ -3065,7 +3065,9 @@ pub(super) fn relay_path_open_error_is_retryable(
     }
 }
 
-pub(super) fn no_schedulable_reliable_path_error(context: &ClientPathContext) -> RuntimeError {
+pub(in crate::runtime) fn no_schedulable_reliable_path_error(
+    context: &ClientPathContext,
+) -> RuntimeError {
     if !context.tcp_paths.is_empty() && !context.udp_paths.is_empty() {
         RuntimeError::NoSchedulableReliablePath
     } else if !context.tcp_paths.is_empty() {
@@ -3075,7 +3077,7 @@ pub(super) fn no_schedulable_reliable_path_error(context: &ClientPathContext) ->
     }
 }
 
-pub(super) async fn attach_reliable_relay_paths(
+pub(in crate::runtime) async fn attach_reliable_relay_paths(
     context: &ClientPathContext,
     spec: &ReliableRelayOpenSpec,
     lane: FlowLane,
@@ -3240,7 +3242,7 @@ async fn attach_reliable_relay_paths_with_claims_and_recovery_exclusions(
     Ok(result.attached)
 }
 
-pub(super) fn reliable_relay_attach_role(
+pub(in crate::runtime) fn reliable_relay_attach_role(
     lane: FlowLane,
     send_stream: &ReliableSendStream,
     resend_fin: bool,
@@ -3258,7 +3260,7 @@ pub(super) fn reliable_relay_attach_role(
     }
 }
 
-pub(super) fn reliable_relay_active_path_candidates(
+pub(in crate::runtime) fn reliable_relay_active_path_candidates(
     context: &ClientPathContext,
     remotes: &ReliableRelayRemoteSet,
     lane: FlowLane,
@@ -3301,7 +3303,7 @@ fn reliable_relay_exclude_inflight_open_claims(
         .collect()
 }
 
-pub(super) fn reliable_relay_repair_path_candidates(
+pub(in crate::runtime) fn reliable_relay_repair_path_candidates(
     context: &ClientPathContext,
     remotes: &ReliableRelayRemoteSet,
     lane: FlowLane,
@@ -3319,7 +3321,7 @@ pub(super) fn reliable_relay_repair_path_candidates(
         .collect()
 }
 
-pub(super) fn reliable_relay_should_race_repair(
+pub(in crate::runtime) fn reliable_relay_should_race_repair(
     lane: FlowLane,
     send_stream: &ReliableSendStream,
     resend_fin: bool,
@@ -3332,7 +3334,7 @@ pub(super) fn reliable_relay_should_race_repair(
                 && send_stream.repair_bytes() <= PATH_OPEN_SCORE_BYTES))
 }
 
-pub(super) fn reliable_relay_attach_payload_bytes(
+pub(in crate::runtime) fn reliable_relay_attach_payload_bytes(
     send_stream: &ReliableSendStream,
     lane: FlowLane,
     mux_limits: MuxLimits,
@@ -3347,7 +3349,7 @@ pub(super) fn reliable_relay_attach_payload_bytes(
     repair_bytes.min(stream_window)
 }
 
-pub(super) fn reliable_relay_bulk_striping_payload_bytes(
+pub(in crate::runtime) fn reliable_relay_bulk_striping_payload_bytes(
     send_stream: &ReliableSendStream,
     mux_limits: MuxLimits,
 ) -> usize {
@@ -3367,7 +3369,7 @@ pub(super) fn reliable_relay_bulk_striping_payload_bytes(
         .max(PATH_OPEN_SCORE_BYTES)
 }
 
-pub(super) fn reliable_relay_bulk_validation_payload_bytes(
+pub(in crate::runtime) fn reliable_relay_bulk_validation_payload_bytes(
     send_stream: &ReliableSendStream,
     mux_limits: MuxLimits,
 ) -> usize {
@@ -3379,7 +3381,7 @@ pub(super) fn reliable_relay_bulk_validation_payload_bytes(
     proof_payload.min(stream_window).max(PATH_OPEN_SCORE_BYTES)
 }
 
-pub(super) fn reliable_relay_stall_watch_active(
+pub(in crate::runtime) fn reliable_relay_stall_watch_active(
     send_stream: &ReliableSendStream,
     recv_stream: &ReliableRecvStream,
     remote_open: bool,
@@ -3392,7 +3394,7 @@ pub(super) fn reliable_relay_stall_watch_active(
         || reliable_relay_response_stall_watch_active(recv_stream, remote_open, lane, mux_limits)
 }
 
-pub(super) fn reliable_relay_response_stall_watch_active(
+pub(in crate::runtime) fn reliable_relay_response_stall_watch_active(
     recv_stream: &ReliableRecvStream,
     remote_open: bool,
     lane: FlowLane,
@@ -3404,7 +3406,7 @@ pub(super) fn reliable_relay_response_stall_watch_active(
             || recv_stream.next_offset() >= reliable_relay_response_stall_watch_bytes(mux_limits))
 }
 
-pub(super) fn reliable_relay_stall_progress_anchor(
+pub(in crate::runtime) fn reliable_relay_stall_progress_anchor(
     last_stream_progress_at: Instant,
     last_delivery_progress_at: Instant,
     last_response_stall_repair_at: Instant,
@@ -3423,14 +3425,14 @@ pub(super) fn reliable_relay_stall_progress_anchor(
     }
 }
 
-pub(super) fn reliable_relay_receive_hole_repair_active(
+pub(in crate::runtime) fn reliable_relay_receive_hole_repair_active(
     recv_stream: &ReliableRecvStream,
     remote_open: bool,
 ) -> bool {
     remote_open && recv_stream.next_offset() > 0 && recv_stream.reorder_bytes() > 0
 }
 
-pub(super) fn reliable_relay_receive_hole_repair_deadline(
+pub(in crate::runtime) fn reliable_relay_receive_hole_repair_deadline(
     last_delivery_progress_at: Instant,
     last_receive_hole_repair_at: Instant,
     path: Option<PathSnapshot>,
@@ -3444,19 +3446,19 @@ pub(super) fn reliable_relay_receive_hole_repair_deadline(
     tokio::time::Instant::from_std(anchor + reliable_relay_stall_timeout(path, lane))
 }
 
-pub(super) fn reliable_relay_product_stall_preserves_attached_path_set(
+pub(in crate::runtime) fn reliable_relay_product_stall_preserves_attached_path_set(
     remotes: &ReliableRelayRemoteSet,
 ) -> bool {
     remotes.accepted_product_path_count() > 1
 }
 
-pub(super) fn reliable_relay_product_stall_should_try_alternate_attach(
+pub(in crate::runtime) fn reliable_relay_product_stall_should_try_alternate_attach(
     remotes: &ReliableRelayRemoteSet,
 ) -> bool {
     remotes.accepted_product_path_count() <= 1 && remotes.active_path_underlay().is_some()
 }
 
-pub(super) fn reliable_relay_delivery_path_should_become_active(
+pub(in crate::runtime) fn reliable_relay_delivery_path_should_become_active(
     context: &ClientPathContext,
     current: Option<RelayPathKey>,
     delivered: RelayPathKey,
@@ -3482,7 +3484,7 @@ pub(super) fn reliable_relay_delivery_path_should_become_active(
     delivered_eta < current_eta
 }
 
-pub(super) fn relay_underlay_identity_order(
+pub(in crate::runtime) fn relay_underlay_identity_order(
     left: UnderlayProtocol,
     right: UnderlayProtocol,
 ) -> std::cmp::Ordering {
@@ -3492,18 +3494,18 @@ pub(super) fn relay_underlay_identity_order(
     (left as u8).cmp(&(right as u8))
 }
 
-pub(super) fn reliable_relay_expects_interactive_response(lane: FlowLane) -> bool {
+pub(in crate::runtime) fn reliable_relay_expects_interactive_response(lane: FlowLane) -> bool {
     matches!(
         lane,
         FlowLane::Control | FlowLane::Latency | FlowLane::RealtimeDatagram
     )
 }
 
-pub(super) fn reliable_relay_response_stall_watch_bytes(mux_limits: MuxLimits) -> u64 {
+pub(in crate::runtime) fn reliable_relay_response_stall_watch_bytes(mux_limits: MuxLimits) -> u64 {
     (reliable_relay_buffer_len(mux_limits) as u64).min(mux_limits.max_stream_window_bytes)
 }
 
-pub(super) fn reliable_relay_stall_deadline(
+pub(in crate::runtime) fn reliable_relay_stall_deadline(
     last_progress_at: Instant,
     path: Option<PathSnapshot>,
     lane: FlowLane,
@@ -3511,7 +3513,7 @@ pub(super) fn reliable_relay_stall_deadline(
     tokio::time::Instant::from_std(last_progress_at + reliable_relay_stall_timeout(path, lane))
 }
 
-pub(super) fn reliable_relay_product_stall_deadline(
+pub(in crate::runtime) fn reliable_relay_product_stall_deadline(
     last_progress_at: Instant,
     last_attempt_at: Option<Instant>,
     path: Option<PathSnapshot>,
@@ -3526,7 +3528,10 @@ pub(super) fn reliable_relay_product_stall_deadline(
     }
 }
 
-pub(super) fn reliable_relay_stall_timeout(path: Option<PathSnapshot>, lane: FlowLane) -> Duration {
+pub(in crate::runtime) fn reliable_relay_stall_timeout(
+    path: Option<PathSnapshot>,
+    lane: FlowLane,
+) -> Duration {
     let _ = lane;
     transport_pto_from_snapshot(path)
 }

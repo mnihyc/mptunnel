@@ -43,7 +43,7 @@ pub(super) use response::*;
 // still happens through carrier command senders.
 
 // Local diagnostic naming helper.  `response_admission` has a private helper
-// with the same purpose, but sender_service is a sibling module and must not
+// with the same purpose, but sender is a sibling module and must not
 // depend on that module-private symbol when `lab-diagnostics` is enabled.
 #[cfg(feature = "lab-diagnostics")]
 fn sender_service_frame_kind(frame: &Frame) -> &'static str {

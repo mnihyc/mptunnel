@@ -112,7 +112,7 @@ pub(super) struct ServerQuicCapacityCalibrationReservation {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(super) struct ServerQuicCapacityProofTicket {
+pub(in crate::runtime::stream) struct ServerQuicCapacityProofTicket {
     pub(super) session_id: SessionId,
     pub(super) binding_instance_id: u64,
     pub(super) path: CarrierPathKey,
@@ -554,13 +554,13 @@ impl ServerPathLaneTrackerState {
 }
 
 impl ServerPathLaneTracker {
-    pub(super) fn attach_session(&self, session_id: SessionId) {
+    pub(in crate::runtime::stream) fn attach_session(&self, session_id: SessionId) {
         let mut state = self.state.lock().expect("server path lane tracker lock");
         let references = state.session_references.entry(session_id).or_default();
         *references = references.saturating_add(1);
     }
 
-    pub(super) fn detach_session(&self, session_id: SessionId) {
+    pub(in crate::runtime::stream) fn detach_session(&self, session_id: SessionId) {
         let mut state = self.state.lock().expect("server path lane tracker lock");
         if let Some(references) = state.session_references.get_mut(&session_id) {
             *references = references.saturating_sub(1);
@@ -1094,7 +1094,7 @@ impl ServerPathLaneTracker {
         }
     }
 
-    pub(super) fn try_accept_quic_capacity_proof(
+    pub(in crate::runtime::stream) fn try_accept_quic_capacity_proof(
         &self,
         session_id: SessionId,
         path: CarrierPathKey,
@@ -1175,7 +1175,7 @@ impl ServerPathLaneTracker {
         })
     }
 
-    pub(super) fn commit_quic_capacity_proof(
+    pub(in crate::runtime::stream) fn commit_quic_capacity_proof(
         &self,
         ticket: ServerQuicCapacityProofTicket,
     ) -> Option<u64> {
@@ -1202,7 +1202,7 @@ impl ServerPathLaneTracker {
         Some(ticket.binding_instance_id)
     }
 
-    pub(super) fn finish_quic_capacity_proof_publication(
+    pub(in crate::runtime::stream) fn finish_quic_capacity_proof_publication(
         &self,
         ticket: ServerQuicCapacityProofTicket,
     ) -> Option<u64> {
@@ -1373,7 +1373,7 @@ impl ServerPathLaneTracker {
         }
     }
 
-    pub(super) fn retire_quic_capacity_calibration_path_instance(
+    pub(in crate::runtime::stream) fn retire_quic_capacity_calibration_path_instance(
         &self,
         session_id: SessionId,
         path: CarrierPathKey,
@@ -1929,7 +1929,10 @@ pub(in crate::runtime) struct ServerRealtimeFlowRegistration {
 }
 
 impl ServerRealtimeFlowRegistration {
-    pub(super) fn new(lane_tracker: Arc<ServerPathLaneTracker>, session_id: SessionId) -> Self {
+    pub(in crate::runtime::stream) fn new(
+        lane_tracker: Arc<ServerPathLaneTracker>,
+        session_id: SessionId,
+    ) -> Self {
         lane_tracker.attach_realtime_flow(session_id);
         Self {
             lane_tracker,

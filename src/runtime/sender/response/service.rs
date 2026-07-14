@@ -13,12 +13,12 @@ use super::*;
 /// `ReliablePathStream` binding revalidates and atomically commits exact ranges.
 pub(in crate::runtime) struct ServerResponseSenderService {
     #[cfg_attr(not(feature = "lab-diagnostics"), allow(dead_code))]
-    pub(in crate::runtime::sender_service) session_id: SessionId,
+    pub(in crate::runtime::sender) session_id: SessionId,
     #[cfg_attr(not(feature = "lab-diagnostics"), allow(dead_code))]
-    pub(in crate::runtime::sender_service) stream_id: StreamId,
-    pub(in crate::runtime::sender_service) queue: ReliableRelaySenderQueue,
-    pub(in crate::runtime::sender_service) performance: MppPerformanceConfig,
-    pub(in crate::runtime::sender_service) extra_traffic: ExtraTrafficLedger,
+    pub(in crate::runtime::sender) stream_id: StreamId,
+    pub(in crate::runtime::sender) queue: ReliableRelaySenderQueue,
+    pub(in crate::runtime::sender) performance: MppPerformanceConfig,
+    pub(in crate::runtime::sender) extra_traffic: ExtraTrafficLedger,
 }
 
 #[derive(Debug, Clone, Copy)]

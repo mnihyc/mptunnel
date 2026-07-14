@@ -11,7 +11,7 @@ use crate::model::admission::{
     bulk_active_service_product_envelope_bytes, bulk_latency_pressure_service_feed_window_bytes,
     bulk_service_feed_reservoir_payload_bytes, bulk_service_horizon_payload_bytes,
 };
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap};
 use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, Ordering};
 
 // Reliable-path bindings own attachment instances, exact range flights,
@@ -22,7 +22,7 @@ pub(in crate::runtime) const MAX_RESPONSE_QUIC_CAPACITY_CALIBRATION_ATTEMPTS_PER
 // One sustained response stream is real demand. Same-family discovery stays
 // single-owner and bounded; requiring a second stream prevents large one-flow
 // transfers from ever measuring spare paths.
-pub(super) const MIN_ACTIVE_RESPONSE_FLOWS_FOR_SAME_FAMILY_DISCOVERY: u32 = 1;
+pub(in crate::runtime) const MIN_ACTIVE_RESPONSE_FLOWS_FOR_SAME_FAMILY_DISCOVERY: u32 = 1;
 static NEXT_RESPONSE_STREAM_BINDING_INSTANCE_ID: AtomicU64 = AtomicU64::new(1);
 const RESPONSE_OWNER_TCP_SEEN: u8 = 1 << 0;
 const RESPONSE_OWNER_UDP_SEEN: u8 = 1 << 1;
@@ -36,16 +36,12 @@ fn response_owner_underlay_seen_bit(underlay: UnderlayProtocol) -> u8 {
 }
 
 mod quic_capacity_probe;
-mod registry;
 mod response_admission;
-mod response_placement;
 mod response_service_handoff;
-mod response_session;
+pub(super) mod response_session;
 
 pub(in crate::runtime) use quic_capacity_probe::ResponseQuicCapacityCalibrationRequest;
-pub(in crate::runtime) use registry::*;
-pub(super) use response_admission::*;
-pub(in crate::runtime) use response_placement::*;
+pub(in crate::runtime) use response_admission::*;
 pub(in crate::runtime) use response_service_handoff::{
     ResponseServiceHandoffDrainRequest, ResponseServiceHandoffRequest,
 };
@@ -73,18 +69,18 @@ pub(in crate::runtime) use response_session::{
 /// The handle owns the stream ID, flow lane, product frame receive queue, and
 /// response output binding for this stream. The carrier is only the emission
 /// target; product offsets and repair semantics stay above TCP/UDP engines.
-pub(super) struct ReliablePathStream {
-    pub(super) stream_id: StreamId,
-    pub(super) max_offset: u64,
-    pub(super) lane: FlowLane,
-    pub(super) underlay: UnderlayProtocol,
-    pub(super) max_frame_payload_bytes: usize,
-    pub(super) output: ReliablePathStreamOutput,
-    pub(super) frames: mpsc::Receiver<Result<Frame, RuntimeError>>,
+pub(in crate::runtime) struct ReliablePathStream {
+    pub(in crate::runtime) stream_id: StreamId,
+    pub(in crate::runtime) max_offset: u64,
+    pub(in crate::runtime) lane: FlowLane,
+    pub(in crate::runtime) underlay: UnderlayProtocol,
+    pub(in crate::runtime) max_frame_payload_bytes: usize,
+    pub(in crate::runtime) output: ReliablePathStreamOutput,
+    pub(in crate::runtime) frames: mpsc::Receiver<Result<Frame, RuntimeError>>,
 }
 
 impl ReliablePathStream {
-    pub(super) fn into_handle_and_frames(
+    pub(in crate::runtime) fn into_handle_and_frames(
         self,
     ) -> (
         ReliablePathStreamHandle,
@@ -103,7 +99,7 @@ impl ReliablePathStream {
         )
     }
 
-    pub(super) async fn recv_frame(&mut self) -> Result<Frame, RuntimeError> {
+    pub(in crate::runtime) async fn recv_frame(&mut self) -> Result<Frame, RuntimeError> {
         match self.frames.recv().await {
             Some(Ok(frame)) => Ok(frame),
             Some(Err(err)) => Err(err),
@@ -111,11 +107,11 @@ impl ReliablePathStream {
         }
     }
 
-    pub(super) fn current_lane(&self) -> FlowLane {
+    pub(in crate::runtime) fn current_lane(&self) -> FlowLane {
         self.output.current_lane(self.lane)
     }
 
-    pub(super) fn send_path_snapshot(
+    pub(in crate::runtime) fn send_path_snapshot(
         &self,
         lane: FlowLane,
         payload_bytes: usize,
@@ -123,7 +119,7 @@ impl ReliablePathStream {
         self.output.send_path_snapshot(lane, payload_bytes)
     }
 
-    pub(super) fn tail_repair_snapshot(
+    pub(in crate::runtime) fn tail_repair_snapshot(
         &self,
         ack_frontier: u64,
         lane: FlowLane,
@@ -134,48 +130,58 @@ impl ReliablePathStream {
             .or_else(|| self.send_path_snapshot(lane, payload_bytes))
     }
 
-    pub(super) fn tail_repair_owner_underlay(&self, ack_frontier: u64) -> Option<UnderlayProtocol> {
+    pub(in crate::runtime) fn tail_repair_owner_underlay(
+        &self,
+        ack_frontier: u64,
+    ) -> Option<UnderlayProtocol> {
         self.output.tail_repair_owner_underlay(ack_frontier)
     }
 
-    pub(super) fn request_active_underlay(&self) -> Option<UnderlayProtocol> {
+    pub(in crate::runtime) fn request_active_underlay(&self) -> Option<UnderlayProtocol> {
         self.output.request_active_underlay()
     }
 
-    pub(super) fn request_active_path_snapshot(&self, lane: FlowLane) -> Option<PathSnapshot> {
+    pub(in crate::runtime) fn request_active_path_snapshot(
+        &self,
+        lane: FlowLane,
+    ) -> Option<PathSnapshot> {
         self.output.request_active_path_snapshot(lane)
     }
 
-    pub(super) fn has_output_incarnation(&self, key: CarrierPathKey, incarnation: u64) -> bool {
+    pub(in crate::runtime) fn has_output_incarnation(
+        &self,
+        key: CarrierPathKey,
+        incarnation: u64,
+    ) -> bool {
         self.output.has_output_incarnation(key, incarnation)
     }
 
-    pub(super) fn set_sender_queue_bytes(&self, bytes: usize) {
+    pub(in crate::runtime) fn set_sender_queue_bytes(&self, bytes: usize) {
         self.output.set_sender_queue_bytes(bytes);
     }
 
-    pub(super) fn subscribe_output_updates(&self) -> Option<watch::Receiver<u64>> {
+    pub(in crate::runtime) fn subscribe_output_updates(&self) -> Option<watch::Receiver<u64>> {
         self.output.subscribe_updates()
     }
 
-    pub(super) fn capacity_notifies(&self) -> Vec<Arc<Notify>> {
+    pub(in crate::runtime) fn capacity_notifies(&self) -> Vec<Arc<Notify>> {
         self.output.capacity_notifies()
     }
 
-    pub(super) fn response_service_handoff_drain_active(&self) -> bool {
+    pub(in crate::runtime) fn response_service_handoff_drain_active(&self) -> bool {
         self.output.response_service_handoff_drain_active()
     }
 
-    pub(super) fn set_lane(&mut self, lane: FlowLane) {
+    pub(in crate::runtime) fn set_lane(&mut self, lane: FlowLane) {
         self.lane = lane;
         self.output.set_lane(lane);
     }
 
-    pub(super) fn release_normalized_acked_ranges(&self, ranges: &[OffsetRange]) {
+    pub(in crate::runtime) fn release_normalized_acked_ranges(&self, ranges: &[OffsetRange]) {
         self.output.release_normalized_acked_ranges(ranges);
     }
 
-    pub(super) fn has_recent_live_repair_flight_overlap(
+    pub(in crate::runtime) fn has_recent_live_repair_flight_overlap(
         &self,
         frame: &Frame,
         retry_after: Duration,
@@ -184,70 +190,79 @@ impl ReliablePathStream {
             .has_recent_live_repair_flight_overlap(frame, retry_after)
     }
 
-    pub(super) fn has_multipath_repair_alternative(&self) -> bool {
+    pub(in crate::runtime) fn has_multipath_repair_alternative(&self) -> bool {
         self.output.has_multipath_repair_alternative()
     }
 
-    pub(super) fn has_repair_output_for_frame(&self, frame: &Frame) -> bool {
+    pub(in crate::runtime) fn has_repair_output_for_frame(&self, frame: &Frame) -> bool {
         self.output.has_repair_output_for_frame(frame)
     }
 
-    pub(super) fn has_live_owner_tail_repair_output_for_frame(&self, frame: &Frame) -> bool {
+    pub(in crate::runtime) fn has_live_owner_tail_repair_output_for_frame(
+        &self,
+        frame: &Frame,
+    ) -> bool {
         self.output
             .has_live_owner_tail_repair_output_for_frame(frame)
     }
 
-    pub(super) fn has_failed_owner_repair_output_for_frame(&self, frame: &Frame) -> bool {
+    pub(in crate::runtime) fn has_failed_owner_repair_output_for_frame(
+        &self,
+        frame: &Frame,
+    ) -> bool {
         self.output.has_failed_owner_repair_output_for_frame(frame)
     }
 
-    pub(super) fn has_unknown_owner_repair_output_for_frame(&self, frame: &Frame) -> bool {
+    pub(in crate::runtime) fn has_unknown_owner_repair_output_for_frame(
+        &self,
+        frame: &Frame,
+    ) -> bool {
         self.output.has_unknown_owner_repair_output_for_frame(frame)
     }
 
-    pub(super) fn can_attempt_failed_owner_tail_repair(&self) -> bool {
+    pub(in crate::runtime) fn can_attempt_failed_owner_tail_repair(&self) -> bool {
         matches!(self.output, ReliablePathStreamOutput::Switchable(_))
     }
 
-    pub(super) async fn send_detach(&self) {
+    pub(in crate::runtime) async fn send_detach(&self) {
         self.output.send_stream_detach(self.stream_id).await;
     }
 
-    pub(super) async fn close(&self) {
+    pub(in crate::runtime) async fn close(&self) {
         self.output.close_stream(self.stream_id).await;
     }
 
-    pub(super) async fn close_ordered(&self, lane: FlowLane) {
+    pub(in crate::runtime) async fn close_ordered(&self, lane: FlowLane) {
         self.output.close_stream_ordered(self.stream_id, lane).await;
     }
 }
 
-pub(super) struct ReliablePathStreamHandle {
-    pub(super) stream_id: StreamId,
-    pub(super) max_offset: u64,
-    pub(super) lane: FlowLane,
-    pub(super) underlay: UnderlayProtocol,
-    pub(super) max_frame_payload_bytes: usize,
-    pub(super) output: ReliablePathStreamOutput,
+pub(in crate::runtime) struct ReliablePathStreamHandle {
+    pub(in crate::runtime) stream_id: StreamId,
+    pub(in crate::runtime) max_offset: u64,
+    pub(in crate::runtime) lane: FlowLane,
+    pub(in crate::runtime) underlay: UnderlayProtocol,
+    pub(in crate::runtime) max_frame_payload_bytes: usize,
+    pub(in crate::runtime) output: ReliablePathStreamOutput,
 }
 
 impl ReliablePathStreamHandle {
-    pub(super) async fn send_detach(&self) {
+    pub(in crate::runtime) async fn send_detach(&self) {
         self.output.send_stream_detach(self.stream_id).await;
     }
 
-    pub(super) fn enqueue_path_proof(&self) -> Result<Option<u64>, RuntimeError> {
+    pub(in crate::runtime) fn enqueue_path_proof(&self) -> Result<Option<u64>, RuntimeError> {
         self.output.enqueue_path_proof()
     }
 
-    pub(super) fn enqueue_stream_ordered_path_proof(
+    pub(in crate::runtime) fn enqueue_stream_ordered_path_proof(
         &self,
         lane: FlowLane,
     ) -> Result<Option<u64>, RuntimeError> {
         self.output.enqueue_stream_ordered_path_proof(lane)
     }
 
-    pub(super) fn try_enqueue_request_quic_capacity_probe(
+    pub(in crate::runtime) fn try_enqueue_request_quic_capacity_probe(
         &self,
         probe: QuicCapacityProbeCommand,
     ) -> Result<(), RuntimeError> {
@@ -261,7 +276,7 @@ impl ReliablePathStreamHandle {
         }
     }
 
-    pub(super) fn try_enqueue_request_tcp_capacity_probe(
+    pub(in crate::runtime) fn try_enqueue_request_tcp_capacity_probe(
         &self,
         request: RequestTcpCapacityProbeRequest,
         lease: RequestTcpCapacityProbeLease,
@@ -281,11 +296,11 @@ impl ReliablePathStreamHandle {
         }
     }
 
-    pub(super) fn can_enqueue_frame_now(&self, frame: &Frame, lane: FlowLane) -> bool {
+    pub(in crate::runtime) fn can_enqueue_frame_now(&self, frame: &Frame, lane: FlowLane) -> bool {
         self.output.can_enqueue_frame_now(frame, lane)
     }
 
-    pub(super) fn can_enqueue_work_lane_now(
+    pub(in crate::runtime) fn can_enqueue_work_lane_now(
         &self,
         work_lane: ReliableWorkClass,
         relay_lane: FlowLane,
@@ -294,17 +309,17 @@ impl ReliablePathStreamHandle {
             .can_enqueue_lane_now(reliable_work_lane_to_carrier_lane(work_lane, relay_lane))
     }
 
-    pub(super) fn capacity_notifies(&self) -> Vec<Arc<Notify>> {
+    pub(in crate::runtime) fn capacity_notifies(&self) -> Vec<Arc<Notify>> {
         self.output.capacity_notifies()
     }
 
-    pub(super) async fn close(&self) {
+    pub(in crate::runtime) async fn close(&self) {
         self.output.close_stream(self.stream_id).await;
     }
 }
 
 #[derive(Clone)]
-pub(super) enum ReliablePathStreamOutput {
+pub(in crate::runtime) enum ReliablePathStreamOutput {
     /// A fixed carrier command pipe, used by client-side paths where the stream
     /// is bound to the currently opened carrier association.
     Fixed(Arc<FixedReliablePathOutput>),
@@ -313,7 +328,7 @@ pub(super) enum ReliablePathStreamOutput {
     Switchable(Arc<ResponseStreamBinding>),
 }
 
-pub(super) struct FixedReliablePathOutput {
+pub(in crate::runtime) struct FixedReliablePathOutput {
     key: CarrierPathKey,
     startup: PathSnapshot,
     commands: ReliablePathCommandSender,
@@ -335,7 +350,7 @@ struct FixedReliablePathModel {
 
 impl FixedReliablePathOutput {
     #[cfg(test)]
-    pub(super) fn new(
+    pub(in crate::runtime) fn new(
         underlay: UnderlayProtocol,
         path_id: PathId,
         commands: ReliablePathCommandSender,
@@ -350,7 +365,7 @@ impl FixedReliablePathOutput {
         Self::new_with_snapshot(startup, commands, mux_limits)
     }
 
-    pub(super) fn new_with_snapshot(
+    pub(in crate::runtime) fn new_with_snapshot(
         startup: PathSnapshot,
         commands: ReliablePathCommandSender,
         mux_limits: MuxLimits,
@@ -367,11 +382,11 @@ impl FixedReliablePathOutput {
         })
     }
 
-    pub(super) fn key(&self) -> CarrierPathKey {
+    pub(in crate::runtime) fn key(&self) -> CarrierPathKey {
         self.key
     }
 
-    pub(super) fn commands(&self) -> &ReliablePathCommandSender {
+    pub(in crate::runtime) fn commands(&self) -> &ReliablePathCommandSender {
         &self.commands
     }
 
@@ -440,11 +455,11 @@ impl FixedReliablePathOutput {
         model.product_queue_bytes = bytes as u64;
     }
 
-    pub(super) fn record_owner_flight(&self, frame: &Frame) {
+    pub(in crate::runtime) fn record_owner_flight(&self, frame: &Frame) {
         self.record_product_flight(frame, CarrierWorkKind::OwnerData)
     }
 
-    pub(super) fn record_repair_flight(&self, frame: &Frame) {
+    pub(in crate::runtime) fn record_repair_flight(&self, frame: &Frame) {
         self.record_product_flight(frame, CarrierWorkKind::RepairData)
     }
 
@@ -534,7 +549,7 @@ impl FixedReliablePathOutput {
 
 impl ReliablePathStreamOutput {
     #[cfg(test)]
-    pub(super) fn fixed(
+    pub(in crate::runtime) fn fixed(
         underlay: UnderlayProtocol,
         path_id: PathId,
         commands: ReliablePathCommandSender,
@@ -545,7 +560,7 @@ impl ReliablePathStreamOutput {
         ))
     }
 
-    pub(super) fn fixed_with_snapshot(
+    pub(in crate::runtime) fn fixed_with_snapshot(
         startup: PathSnapshot,
         commands: ReliablePathCommandSender,
         mux_limits: MuxLimits,
@@ -555,7 +570,7 @@ impl ReliablePathStreamOutput {
         ))
     }
 
-    pub(super) fn can_enqueue_frame_now(&self, frame: &Frame, lane: FlowLane) -> bool {
+    pub(in crate::runtime) fn can_enqueue_frame_now(&self, frame: &Frame, lane: FlowLane) -> bool {
         match self {
             Self::Fixed(fixed) => fixed.commands().can_enqueue_frame_now(frame, lane),
             Self::Switchable(_) => true,
@@ -586,21 +601,21 @@ impl ReliablePathStreamOutput {
         }
     }
 
-    pub(super) fn can_enqueue_lane_now(&self, lane: FlowLane) -> bool {
+    pub(in crate::runtime) fn can_enqueue_lane_now(&self, lane: FlowLane) -> bool {
         match self {
             Self::Fixed(fixed) => fixed.commands().can_enqueue_lane_now(lane),
             Self::Switchable(_) => false,
         }
     }
 
-    pub(super) fn capacity_notifies(&self) -> Vec<Arc<Notify>> {
+    pub(in crate::runtime) fn capacity_notifies(&self) -> Vec<Arc<Notify>> {
         match self {
             Self::Fixed(fixed) => vec![fixed.commands().capacity_notify()],
             Self::Switchable(binding) => binding.capacity_notifies(),
         }
     }
 
-    pub(super) async fn send_stream_detach(&self, stream_id: StreamId) {
+    pub(in crate::runtime) async fn send_stream_detach(&self, stream_id: StreamId) {
         if let Self::Fixed(fixed) = self {
             let _ = fixed
                 .commands()
@@ -611,7 +626,7 @@ impl ReliablePathStreamOutput {
         }
     }
 
-    pub(super) async fn close_stream(&self, stream_id: StreamId) {
+    pub(in crate::runtime) async fn close_stream(&self, stream_id: StreamId) {
         match self {
             Self::Fixed(fixed) => {
                 let _ = fixed
@@ -623,7 +638,11 @@ impl ReliablePathStreamOutput {
         }
     }
 
-    pub(super) async fn close_stream_ordered(&self, stream_id: StreamId, lane: FlowLane) {
+    pub(in crate::runtime) async fn close_stream_ordered(
+        &self,
+        stream_id: StreamId,
+        lane: FlowLane,
+    ) {
         match self {
             Self::Fixed(fixed) => {
                 let _ = fixed
@@ -635,14 +654,14 @@ impl ReliablePathStreamOutput {
         }
     }
 
-    pub(super) fn current_lane(&self, fallback: FlowLane) -> FlowLane {
+    pub(in crate::runtime) fn current_lane(&self, fallback: FlowLane) -> FlowLane {
         match self {
             Self::Fixed(_) => fallback,
             Self::Switchable(binding) => binding.lane(),
         }
     }
 
-    pub(super) fn send_path_snapshot(
+    pub(in crate::runtime) fn send_path_snapshot(
         &self,
         lane: FlowLane,
         payload_bytes: usize,
@@ -657,7 +676,7 @@ impl ReliablePathStreamOutput {
         }
     }
 
-    pub(super) fn tail_repair_snapshot(
+    pub(in crate::runtime) fn tail_repair_snapshot(
         &self,
         ack_frontier: u64,
         lane: FlowLane,
@@ -671,21 +690,27 @@ impl ReliablePathStreamOutput {
         }
     }
 
-    pub(super) fn tail_repair_owner_underlay(&self, ack_frontier: u64) -> Option<UnderlayProtocol> {
+    pub(in crate::runtime) fn tail_repair_owner_underlay(
+        &self,
+        ack_frontier: u64,
+    ) -> Option<UnderlayProtocol> {
         match self {
             Self::Fixed(fixed) => Some(fixed.key().underlay),
             Self::Switchable(binding) => binding.tail_repair_owner_underlay(ack_frontier),
         }
     }
 
-    pub(super) fn request_active_underlay(&self) -> Option<UnderlayProtocol> {
+    pub(in crate::runtime) fn request_active_underlay(&self) -> Option<UnderlayProtocol> {
         match self {
             Self::Fixed(fixed) => Some(fixed.key().underlay),
             Self::Switchable(binding) => binding.request_active_underlay(),
         }
     }
 
-    pub(super) fn request_active_path_snapshot(&self, lane: FlowLane) -> Option<PathSnapshot> {
+    pub(in crate::runtime) fn request_active_path_snapshot(
+        &self,
+        lane: FlowLane,
+    ) -> Option<PathSnapshot> {
         match self {
             Self::Fixed(fixed) => {
                 let _ = lane;
@@ -695,41 +720,45 @@ impl ReliablePathStreamOutput {
         }
     }
 
-    pub(super) fn has_output_incarnation(&self, key: CarrierPathKey, incarnation: u64) -> bool {
+    pub(in crate::runtime) fn has_output_incarnation(
+        &self,
+        key: CarrierPathKey,
+        incarnation: u64,
+    ) -> bool {
         match self {
             Self::Fixed(_) => false,
             Self::Switchable(binding) => binding.has_output_incarnation(key, incarnation),
         }
     }
 
-    pub(super) fn set_sender_queue_bytes(&self, bytes: usize) {
+    pub(in crate::runtime) fn set_sender_queue_bytes(&self, bytes: usize) {
         match self {
             Self::Fixed(fixed) => fixed.set_sender_queue_bytes(bytes),
             Self::Switchable(binding) => binding.set_sender_queue_bytes(bytes),
         }
     }
 
-    pub(super) fn subscribe_updates(&self) -> Option<watch::Receiver<u64>> {
+    pub(in crate::runtime) fn subscribe_updates(&self) -> Option<watch::Receiver<u64>> {
         match self {
             Self::Fixed(_) => None,
             Self::Switchable(binding) => Some(binding.subscribe_updates()),
         }
     }
 
-    pub(super) fn set_lane(&self, lane: FlowLane) {
+    pub(in crate::runtime) fn set_lane(&self, lane: FlowLane) {
         if let Self::Switchable(binding) = self {
             binding.set_lane(lane);
         }
     }
 
-    pub(super) fn release_normalized_acked_ranges(&self, ranges: &[OffsetRange]) {
+    pub(in crate::runtime) fn release_normalized_acked_ranges(&self, ranges: &[OffsetRange]) {
         match self {
             Self::Fixed(fixed) => fixed.release_normalized_acked_ranges(ranges),
             Self::Switchable(binding) => binding.release_normalized_acked_ranges(ranges),
         }
     }
 
-    pub(super) fn has_recent_live_repair_flight_overlap(
+    pub(in crate::runtime) fn has_recent_live_repair_flight_overlap(
         &self,
         frame: &Frame,
         retry_after: Duration,
@@ -742,35 +771,44 @@ impl ReliablePathStreamOutput {
         }
     }
 
-    pub(super) fn has_multipath_repair_alternative(&self) -> bool {
+    pub(in crate::runtime) fn has_multipath_repair_alternative(&self) -> bool {
         match self {
             Self::Fixed(_) => false,
             Self::Switchable(binding) => binding.has_multipath_repair_alternative(),
         }
     }
 
-    pub(super) fn has_repair_output_for_frame(&self, frame: &Frame) -> bool {
+    pub(in crate::runtime) fn has_repair_output_for_frame(&self, frame: &Frame) -> bool {
         match self {
             Self::Fixed(_) => true,
             Self::Switchable(binding) => binding.has_repair_output_for_frame(frame),
         }
     }
 
-    pub(super) fn has_live_owner_tail_repair_output_for_frame(&self, frame: &Frame) -> bool {
+    pub(in crate::runtime) fn has_live_owner_tail_repair_output_for_frame(
+        &self,
+        frame: &Frame,
+    ) -> bool {
         match self {
             Self::Fixed(_) => false,
             Self::Switchable(binding) => binding.has_live_owner_tail_repair_output_for_frame(frame),
         }
     }
 
-    pub(super) fn has_failed_owner_repair_output_for_frame(&self, frame: &Frame) -> bool {
+    pub(in crate::runtime) fn has_failed_owner_repair_output_for_frame(
+        &self,
+        frame: &Frame,
+    ) -> bool {
         match self {
             Self::Fixed(_) => false,
             Self::Switchable(binding) => binding.has_failed_owner_repair_output_for_frame(frame),
         }
     }
 
-    pub(super) fn has_unknown_owner_repair_output_for_frame(&self, frame: &Frame) -> bool {
+    pub(in crate::runtime) fn has_unknown_owner_repair_output_for_frame(
+        &self,
+        frame: &Frame,
+    ) -> bool {
         match self {
             Self::Fixed(_) => false,
             Self::Switchable(binding) => binding.has_unknown_owner_repair_output_for_frame(frame),
@@ -778,7 +816,7 @@ impl ReliablePathStreamOutput {
     }
 }
 
-pub(super) fn reliable_work_lane_to_carrier_lane(
+pub(in crate::runtime) fn reliable_work_lane_to_carrier_lane(
     work_lane: ReliableWorkClass,
     relay_lane: FlowLane,
 ) -> FlowLane {
@@ -789,7 +827,7 @@ pub(super) fn reliable_work_lane_to_carrier_lane(
     }
 }
 
-pub(super) async fn wait_for_carrier_capacity_notifies(notifies: Vec<Arc<Notify>>) {
+pub(in crate::runtime) async fn wait_for_carrier_capacity_notifies(notifies: Vec<Arc<Notify>>) {
     if notifies.is_empty() {
         tokio::task::yield_now().await;
         return;
@@ -815,68 +853,68 @@ struct ResponseSubflowSetState {
 }
 
 #[derive(Debug, Clone, Copy)]
-pub(super) struct ResponseSubflowAdmissionReservation {
-    pub(super) admission: PathAdmission,
-    pub(super) epoch_generation: Option<u64>,
+pub(in crate::runtime) struct ResponseSubflowAdmissionReservation {
+    pub(in crate::runtime) admission: PathAdmission,
+    pub(in crate::runtime) epoch_generation: Option<u64>,
 }
 
 #[derive(Debug, Clone, Copy)]
-pub(super) struct ResponseSubflowAdmissionRequest {
-    pub(super) expected_planner_generation: u64,
-    pub(super) expected_lane_generation: u64,
-    pub(super) service: CarrierPathKey,
-    pub(super) startup_owner_credit_bytes: usize,
-    pub(super) optional_overhead_budget_bytes: usize,
-    pub(super) max_read_gap_budget: Duration,
-    pub(super) input: SubflowAdmissionInput,
+pub(in crate::runtime) struct ResponseSubflowAdmissionRequest {
+    pub(in crate::runtime) expected_planner_generation: u64,
+    pub(in crate::runtime) expected_lane_generation: u64,
+    pub(in crate::runtime) service: CarrierPathKey,
+    pub(in crate::runtime) startup_owner_credit_bytes: usize,
+    pub(in crate::runtime) optional_overhead_budget_bytes: usize,
+    pub(in crate::runtime) max_read_gap_budget: Duration,
+    pub(in crate::runtime) input: SubflowAdmissionInput,
 }
 
 #[derive(Debug, Clone, Copy)]
 /// Optimistic calibration reservation. Generations fence product/path model
 /// changes; pending values fence the exact queue-pressure projection.
-pub(super) struct ResponseAckClockCalibrationRequest {
-    pub(super) expected_planner_generation: u64,
-    pub(super) expected_lane_generation: u64,
-    pub(super) expected_model_generation: u64,
-    pub(super) service: CarrierPathKey,
-    pub(super) service_incarnation: u64,
-    pub(super) service_pending_bytes: u64,
-    pub(super) target_pending_bytes: u64,
-    pub(super) limit_bytes: u64,
+pub(in crate::runtime) struct ResponseAckClockCalibrationRequest {
+    pub(in crate::runtime) expected_planner_generation: u64,
+    pub(in crate::runtime) expected_lane_generation: u64,
+    pub(in crate::runtime) expected_model_generation: u64,
+    pub(in crate::runtime) service: CarrierPathKey,
+    pub(in crate::runtime) service_incarnation: u64,
+    pub(in crate::runtime) service_pending_bytes: u64,
+    pub(in crate::runtime) target_pending_bytes: u64,
+    pub(in crate::runtime) limit_bytes: u64,
     /// Fresh work requires active response demand; exact begun work may finish.
-    pub(super) requires_active_response_start: bool,
+    pub(in crate::runtime) requires_active_response_start: bool,
 }
 
 #[derive(Debug, Clone, Copy)]
 /// Zero-spend retirement uses the same coherent planner/model snapshot as Admit.
-pub(super) struct ResponseAckClockCalibrationRetirementRequest {
-    pub(super) expected_planner_generation: u64,
-    pub(super) expected_lane_generation: u64,
-    pub(super) expected_model_generation: u64,
-    pub(super) service: CarrierPathKey,
-    pub(super) service_incarnation: u64,
-    pub(super) service_pending_bytes: u64,
-    pub(super) target: CarrierPathKey,
-    pub(super) target_incarnation: u64,
-    pub(super) target_pending_bytes: u64,
-    pub(super) limit_bytes: u64,
+pub(in crate::runtime) struct ResponseAckClockCalibrationRetirementRequest {
+    pub(in crate::runtime) expected_planner_generation: u64,
+    pub(in crate::runtime) expected_lane_generation: u64,
+    pub(in crate::runtime) expected_model_generation: u64,
+    pub(in crate::runtime) service: CarrierPathKey,
+    pub(in crate::runtime) service_incarnation: u64,
+    pub(in crate::runtime) service_pending_bytes: u64,
+    pub(in crate::runtime) target: CarrierPathKey,
+    pub(in crate::runtime) target_incarnation: u64,
+    pub(in crate::runtime) target_pending_bytes: u64,
+    pub(in crate::runtime) limit_bytes: u64,
 }
 
 #[derive(Debug, Clone, Copy)]
-pub(super) struct ResponseSourceServiceSnapshot {
+pub(in crate::runtime) struct ResponseSourceServiceSnapshot {
     #[cfg_attr(not(test), allow(dead_code))]
-    pub(super) key: CarrierPathKey,
-    pub(super) active_latency_sensitive_flows: u32,
-    pub(super) has_service_feed_evidence: bool,
+    pub(in crate::runtime) key: CarrierPathKey,
+    pub(in crate::runtime) active_latency_sensitive_flows: u32,
+    pub(in crate::runtime) has_service_feed_evidence: bool,
     #[cfg_attr(not(test), allow(dead_code))]
-    pub(super) has_bulk_rate_evidence: bool,
+    pub(in crate::runtime) has_bulk_rate_evidence: bool,
 }
 
 #[derive(Debug, Clone, Copy)]
-pub(super) struct ResponseRelayReadSnapshot {
-    pub(super) send_path: Option<PathSnapshot>,
-    pub(super) source_service: Option<ResponseSourceServiceSnapshot>,
-    pub(super) independent_source_staging: bool,
+pub(in crate::runtime) struct ResponseRelayReadSnapshot {
+    pub(in crate::runtime) send_path: Option<PathSnapshot>,
+    pub(in crate::runtime) source_service: Option<ResponseSourceServiceSnapshot>,
+    pub(in crate::runtime) independent_source_staging: bool,
 }
 
 #[cfg(feature = "lab-diagnostics")]
@@ -906,7 +944,7 @@ struct ResponseServiceFeedDiagnosticState {
     emission_limit_bytes: u64,
 }
 
-pub(super) struct ResponseStreamBinding {
+pub(in crate::runtime) struct ResponseStreamBinding {
     session_id: SessionId,
     binding_instance_id: u64,
     lane: Mutex<FlowLane>,
@@ -976,7 +1014,7 @@ impl Drop for ResponseStreamBinding {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(super) enum ResponseStreamAttachOutcome {
+pub(in crate::runtime) enum ResponseStreamAttachOutcome {
     Attached,
     RoleChanged,
     ReplacedClosedOutput,
@@ -985,7 +1023,7 @@ pub(super) enum ResponseStreamAttachOutcome {
 
 impl ResponseStreamBinding {
     #[cfg(test)]
-    pub(super) fn new(
+    pub(in crate::runtime) fn new(
         session_id: SessionId,
         underlay: UnderlayProtocol,
         path_id: PathId,
@@ -1003,7 +1041,7 @@ impl ResponseStreamBinding {
     }
 
     #[cfg_attr(not(test), allow(dead_code))]
-    pub(super) fn new_with_limits(
+    pub(in crate::runtime) fn new_with_limits(
         session_id: SessionId,
         underlay: UnderlayProtocol,
         path_id: PathId,
@@ -1022,7 +1060,7 @@ impl ResponseStreamBinding {
         )
     }
 
-    pub(super) fn new_with_limits_and_tracker(
+    pub(in crate::runtime) fn new_with_limits_and_tracker(
         session_id: SessionId,
         underlay: UnderlayProtocol,
         path_id: PathId,
@@ -1043,7 +1081,7 @@ impl ResponseStreamBinding {
         )
     }
 
-    fn new_with_limits_tracker_and_path_instance(
+    pub(super) fn new_with_limits_tracker_and_path_instance(
         session_id: SessionId,
         underlay: UnderlayProtocol,
         path_id: PathId,
@@ -1129,7 +1167,7 @@ impl ResponseStreamBinding {
     }
 
     #[cfg(test)]
-    pub(super) fn attach(
+    pub(in crate::runtime) fn attach(
         &self,
         underlay: UnderlayProtocol,
         path_id: PathId,
@@ -1160,7 +1198,7 @@ impl ResponseStreamBinding {
         )
     }
 
-    fn attach_with_path_instance(
+    pub(super) fn attach_with_path_instance(
         &self,
         underlay: UnderlayProtocol,
         path_id: PathId,
@@ -1485,15 +1523,15 @@ impl ResponseStreamBinding {
         }
     }
 
-    pub(super) fn lane(&self) -> FlowLane {
+    pub(in crate::runtime) fn lane(&self) -> FlowLane {
         *self.lane.lock().expect("server reliable stream lane lock")
     }
 
-    pub(super) fn subscribe_updates(&self) -> watch::Receiver<u64> {
+    pub(in crate::runtime) fn subscribe_updates(&self) -> watch::Receiver<u64> {
         self.version.subscribe()
     }
 
-    pub(super) fn send_path_snapshot(
+    pub(in crate::runtime) fn send_path_snapshot(
         &self,
         lane: FlowLane,
         payload_bytes: usize,
@@ -1501,7 +1539,7 @@ impl ResponseStreamBinding {
         self.relay_read_snapshot(lane, payload_bytes).send_path
     }
 
-    pub(super) fn relay_read_snapshot(
+    pub(in crate::runtime) fn relay_read_snapshot(
         &self,
         lane: FlowLane,
         payload_bytes: usize,
@@ -1526,7 +1564,7 @@ impl ResponseStreamBinding {
         )
     }
 
-    pub(super) fn tail_repair_snapshot(
+    pub(in crate::runtime) fn tail_repair_snapshot(
         &self,
         ack_frontier: u64,
         lane: FlowLane,
@@ -1549,14 +1587,17 @@ impl ResponseStreamBinding {
         })
     }
 
-    pub(super) fn tail_repair_owner_underlay(&self, ack_frontier: u64) -> Option<UnderlayProtocol> {
+    pub(in crate::runtime) fn tail_repair_owner_underlay(
+        &self,
+        ack_frontier: u64,
+    ) -> Option<UnderlayProtocol> {
         self.blocking_owner_key_at_or_after(ack_frontier)
             .or_else(|| self.ordered_data_owner())
             .map(|key| key.underlay)
     }
 
     #[cfg(test)]
-    pub(super) fn has_live_mixed_owner_underlays(&self) -> bool {
+    pub(in crate::runtime) fn has_live_mixed_owner_underlays(&self) -> bool {
         if !self.may_have_mixed_owner_underlays() {
             return false;
         }
@@ -1567,7 +1608,7 @@ impl ResponseStreamBinding {
         response_outputs_have_live_mixed_owner_underlays(&outputs.entries)
     }
 
-    pub(super) fn may_have_mixed_owner_underlays(&self) -> bool {
+    pub(in crate::runtime) fn may_have_mixed_owner_underlays(&self) -> bool {
         self.owner_underlay_history.load(Ordering::Acquire) & RESPONSE_OWNER_MIXED_SEEN
             == RESPONSE_OWNER_MIXED_SEEN
     }
@@ -1605,7 +1646,7 @@ impl ResponseStreamBinding {
             .collect()
     }
 
-    pub(super) fn set_lane(&self, lane: FlowLane) {
+    pub(in crate::runtime) fn set_lane(&self, lane: FlowLane) {
         let mut current_lane = self.lane.lock().expect("server reliable stream lane lock");
         let previous_lane = *current_lane;
         if previous_lane != lane {
@@ -1630,7 +1671,7 @@ impl ResponseStreamBinding {
         self.notify_update();
     }
 
-    pub(super) fn has_multipath_repair_alternative(&self) -> bool {
+    pub(in crate::runtime) fn has_multipath_repair_alternative(&self) -> bool {
         self.outputs
             .lock()
             .expect("server reliable stream binding lock")
@@ -1639,7 +1680,7 @@ impl ResponseStreamBinding {
             > 1
     }
 
-    pub(super) fn has_repair_output_for_frame(&self, frame: &Frame) -> bool {
+    pub(in crate::runtime) fn has_repair_output_for_frame(&self, frame: &Frame) -> bool {
         let avoid_keys = self.flight_keys_overlapping_frame(frame);
         let outputs = self
             .outputs
@@ -1651,7 +1692,10 @@ impl ResponseStreamBinding {
             .any(|entry| !avoid_keys.contains(&entry.key))
     }
 
-    pub(super) fn has_live_owner_tail_repair_output_for_frame(&self, frame: &Frame) -> bool {
+    pub(in crate::runtime) fn has_live_owner_tail_repair_output_for_frame(
+        &self,
+        frame: &Frame,
+    ) -> bool {
         let owner_keys = self.owner_flight_keys_overlapping_frame(frame);
         if owner_keys.is_empty() {
             return false;
@@ -1664,7 +1708,7 @@ impl ResponseStreamBinding {
             .any(|entry| !owner_keys.contains(&entry.key))
     }
 
-    pub(super) fn has_recent_live_repair_flight_overlap(
+    pub(in crate::runtime) fn has_recent_live_repair_flight_overlap(
         &self,
         frame: &Frame,
         retry_after: Duration,
@@ -1690,7 +1734,10 @@ impl ResponseStreamBinding {
         })
     }
 
-    pub(super) fn has_failed_owner_repair_output_for_frame(&self, frame: &Frame) -> bool {
+    pub(in crate::runtime) fn has_failed_owner_repair_output_for_frame(
+        &self,
+        frame: &Frame,
+    ) -> bool {
         let avoid_keys = self.flight_keys_overlapping_frame(frame);
         if avoid_keys.is_empty() {
             return false;
@@ -1710,7 +1757,10 @@ impl ResponseStreamBinding {
                 .any(|entry| !avoid_keys.contains(&entry.key))
     }
 
-    pub(super) fn has_unknown_owner_repair_output_for_frame(&self, frame: &Frame) -> bool {
+    pub(in crate::runtime) fn has_unknown_owner_repair_output_for_frame(
+        &self,
+        frame: &Frame,
+    ) -> bool {
         if !self.flight_keys_overlapping_frame(frame).is_empty()
             || self.ordered_data_owner().is_some()
         {
@@ -1724,11 +1774,15 @@ impl ResponseStreamBinding {
             .is_empty()
     }
 
-    pub(super) fn detach(&self, key: CarrierPathKey, commands: &ReliablePathCommandSender) {
+    pub(in crate::runtime) fn detach(
+        &self,
+        key: CarrierPathKey,
+        commands: &ReliablePathCommandSender,
+    ) {
         self.detach_matching_output(key, |entry| entry.commands.same_channel(commands));
     }
 
-    fn detach_path_instance(
+    pub(super) fn detach_path_instance(
         &self,
         key: CarrierPathKey,
         path_instance_id: ServerCarrierPathInstanceId,
@@ -1796,7 +1850,7 @@ impl ResponseStreamBinding {
         }
     }
 
-    pub(super) fn release_normalized_acked_ranges(&self, ranges: &[OffsetRange]) {
+    pub(in crate::runtime) fn release_normalized_acked_ranges(&self, ranges: &[OffsetRange]) {
         self.release_normalized_acked_ranges_at(ranges, Instant::now());
     }
 
@@ -2427,7 +2481,7 @@ impl ResponseStreamBinding {
         }
     }
 
-    pub(super) fn ordered_data_owner(&self) -> Option<CarrierPathKey> {
+    pub(in crate::runtime) fn ordered_data_owner(&self) -> Option<CarrierPathKey> {
         *self
             .ordered_data_owner
             .lock()
@@ -2435,21 +2489,24 @@ impl ResponseStreamBinding {
     }
 
     #[cfg(test)]
-    pub(super) fn request_active_owner(&self) -> Option<CarrierPathKey> {
+    pub(in crate::runtime) fn request_active_owner(&self) -> Option<CarrierPathKey> {
         *self
             .request_active_owner
             .lock()
             .expect("server reliable stream request active owner lock")
     }
 
-    pub(super) fn request_active_underlay(&self) -> Option<UnderlayProtocol> {
+    pub(in crate::runtime) fn request_active_underlay(&self) -> Option<UnderlayProtocol> {
         self.request_active_owner
             .lock()
             .expect("server reliable stream request active owner lock")
             .map(|key| key.underlay)
     }
 
-    pub(super) fn request_active_path_snapshot(&self, lane: FlowLane) -> Option<PathSnapshot> {
+    pub(in crate::runtime) fn request_active_path_snapshot(
+        &self,
+        lane: FlowLane,
+    ) -> Option<PathSnapshot> {
         // Attach and detach take these locks in this order before changing the
         // request-side Active identity. Keep the identity and its metrics in a
         // single coherent snapshot without reversing that order.
@@ -2472,7 +2529,11 @@ impl ResponseStreamBinding {
         })
     }
 
-    pub(super) fn has_output_incarnation(&self, key: CarrierPathKey, incarnation: u64) -> bool {
+    pub(in crate::runtime) fn has_output_incarnation(
+        &self,
+        key: CarrierPathKey,
+        incarnation: u64,
+    ) -> bool {
         self.outputs
             .lock()
             .expect("server reliable stream binding lock")
@@ -2499,7 +2560,7 @@ impl ResponseStreamBinding {
     }
 
     #[cfg(test)]
-    pub(super) fn set_ordered_data_owner(&self, key: CarrierPathKey) {
+    pub(in crate::runtime) fn set_ordered_data_owner(&self, key: CarrierPathKey) {
         let lane = self.lane();
         let mut outputs = self
             .outputs
@@ -2521,14 +2582,14 @@ impl ResponseStreamBinding {
     }
 
     #[cfg(test)]
-    pub(super) fn commit_ordered_data_owner_for_target(
+    pub(in crate::runtime) fn commit_ordered_data_owner_for_target(
         &self,
         target: &ResponseSenderPathTarget,
     ) -> bool {
         self.commit_ordered_data_owner_for_dispatch_target(&target.into())
     }
 
-    pub(super) fn commit_ordered_data_owner_for_dispatch_target(
+    pub(in crate::runtime) fn commit_ordered_data_owner_for_dispatch_target(
         &self,
         target: &ResponseDispatchTarget,
     ) -> bool {
@@ -2616,7 +2677,7 @@ impl ResponseStreamBinding {
     }
 
     #[cfg(test)]
-    pub(super) fn subflow_set_snapshot(&self) -> Option<FlowSubflowSet> {
+    pub(in crate::runtime) fn subflow_set_snapshot(&self) -> Option<FlowSubflowSet> {
         self.subflow_set
             .lock()
             .expect("server reliable stream subflow set lock")
@@ -2624,7 +2685,7 @@ impl ResponseStreamBinding {
             .clone()
     }
 
-    pub(super) fn subflow_state_snapshot(&self) -> (u64, Option<FlowSubflowSet>) {
+    pub(in crate::runtime) fn subflow_state_snapshot(&self) -> (u64, Option<FlowSubflowSet>) {
         let state = self
             .subflow_set
             .lock()
@@ -2632,12 +2693,12 @@ impl ResponseStreamBinding {
         (state.planner_generation, state.set.clone())
     }
 
-    pub(super) fn response_model_generation(&self) -> u64 {
+    pub(in crate::runtime) fn response_model_generation(&self) -> u64 {
         self.response_model_generation.load(Ordering::Acquire)
     }
 
     #[cfg(feature = "lab-diagnostics")]
-    pub(super) fn should_emit_response_service_handoff_diagnostic(
+    pub(in crate::runtime) fn should_emit_response_service_handoff_diagnostic(
         &self,
         model_generation: u64,
         evaluation_signature: u64,
@@ -2668,22 +2729,24 @@ impl ResponseStreamBinding {
     }
 
     #[cfg(test)]
-    pub(super) fn lane_generation(&self) -> u64 {
+    pub(in crate::runtime) fn lane_generation(&self) -> u64 {
         self.lane_tracker.generation(self.session_id)
     }
 
     #[cfg(test)]
-    pub(super) fn lane_generation_and_active_response_flows(&self) -> (u64, u32) {
+    pub(in crate::runtime) fn lane_generation_and_active_response_flows(&self) -> (u64, u32) {
         self.lane_tracker
             .generation_and_active_response_flows(self.session_id)
     }
 
-    pub(super) fn response_scheduling_snapshot(&self) -> ResponseSessionSchedulingSnapshot {
+    pub(in crate::runtime) fn response_scheduling_snapshot(
+        &self,
+    ) -> ResponseSessionSchedulingSnapshot {
         self.lane_tracker
             .response_scheduling_snapshot(self.session_id)
     }
 
-    pub(super) fn try_reserve_tcp_capacity_probe(
+    pub(in crate::runtime) fn try_reserve_tcp_capacity_probe(
         &self,
         expected_generation: u64,
     ) -> Option<TcpCapacityProbeSessionLease> {
@@ -2692,7 +2755,7 @@ impl ResponseStreamBinding {
     }
 
     #[cfg(test)]
-    pub(super) fn preview_subflow_owner_admission(
+    pub(in crate::runtime) fn preview_subflow_owner_admission(
         &self,
         service: CarrierPathKey,
         startup_owner_credit_bytes: usize,
@@ -2719,7 +2782,7 @@ impl ResponseStreamBinding {
     }
 
     #[cfg(test)]
-    pub(super) fn commit_subflow_owner_admission(
+    pub(in crate::runtime) fn commit_subflow_owner_admission(
         &self,
         service: CarrierPathKey,
         startup_owner_credit_bytes: usize,
@@ -2740,7 +2803,7 @@ impl ResponseStreamBinding {
     }
 
     #[cfg(test)]
-    pub(super) fn commit_subflow_owner_admission_for_planner_generation(
+    pub(in crate::runtime) fn commit_subflow_owner_admission_for_planner_generation(
         &self,
         expected_planner_generation: u64,
         expected_lane_generation: u64,
@@ -2763,7 +2826,7 @@ impl ResponseStreamBinding {
     }
 
     #[cfg(test)]
-    pub(super) fn reserve_subflow_owner_admission_for_planner_generation(
+    pub(in crate::runtime) fn reserve_subflow_owner_admission_for_planner_generation(
         &self,
         expected_planner_generation: u64,
         expected_lane_generation: u64,
@@ -2839,7 +2902,7 @@ impl ResponseStreamBinding {
         }
     }
 
-    pub(super) fn rollback_subflow_owner_admission_for_epoch(
+    pub(in crate::runtime) fn rollback_subflow_owner_admission_for_epoch(
         &self,
         expected_epoch_generation: u64,
         input: SubflowAdmissionInput,
@@ -3074,7 +3137,7 @@ impl ResponseStreamBinding {
     }
 
     #[cfg(test)]
-    pub(super) fn reset_subflow_set(&self) {
+    pub(in crate::runtime) fn reset_subflow_set(&self) {
         let mut outputs = self
             .outputs
             .lock()
@@ -3110,7 +3173,7 @@ impl ResponseStreamBinding {
     }
 
     #[cfg(test)]
-    pub(super) fn record_owner_flight_for_target(
+    pub(in crate::runtime) fn record_owner_flight_for_target(
         &self,
         target: &ResponseSenderPathTarget,
         frame: &Frame,
@@ -3125,7 +3188,7 @@ impl ResponseStreamBinding {
         )
     }
 
-    pub(super) fn try_retire_tcp_ack_clock_calibration(
+    pub(in crate::runtime) fn try_retire_tcp_ack_clock_calibration(
         &self,
         request: ResponseAckClockCalibrationRetirementRequest,
     ) -> bool {
@@ -3259,7 +3322,7 @@ impl ResponseStreamBinding {
     }
 
     #[cfg(test)]
-    pub(super) fn try_enqueue_owner_frame_for_target(
+    pub(in crate::runtime) fn try_enqueue_owner_frame_for_target(
         &self,
         target: &ResponseSenderPathTarget,
         frame: &Frame,
@@ -3276,7 +3339,7 @@ impl ResponseStreamBinding {
         )
     }
 
-    pub(super) fn try_enqueue_owner_frame_for_dispatch_target(
+    pub(in crate::runtime) fn try_enqueue_owner_frame_for_dispatch_target(
         &self,
         target: &ResponseDispatchTarget,
         frame: &Frame,
@@ -3554,7 +3617,7 @@ impl ResponseStreamBinding {
             .fetch_add(1, Ordering::AcqRel);
     }
 
-    pub(super) fn try_enqueue_repair_frame_for_target(
+    pub(in crate::runtime) fn try_enqueue_repair_frame_for_target(
         &self,
         target: &ResponseSenderPathTarget,
         frame: &Frame,
@@ -3595,7 +3658,7 @@ impl ResponseStreamBinding {
     }
 
     #[cfg(test)]
-    pub(super) fn record_owner_flight(&self, key: CarrierPathKey, frame: &Frame) {
+    pub(in crate::runtime) fn record_owner_flight(&self, key: CarrierPathKey, frame: &Frame) {
         let (incarnation, role, commands) = self
             .outputs
             .lock()
@@ -3616,7 +3679,7 @@ impl ResponseStreamBinding {
     }
 
     #[cfg(test)]
-    pub(super) fn record_repair_flight(&self, key: CarrierPathKey, frame: &Frame) {
+    pub(in crate::runtime) fn record_repair_flight(&self, key: CarrierPathKey, frame: &Frame) {
         let (incarnation, role, commands) = self
             .outputs
             .lock()
@@ -3637,7 +3700,7 @@ impl ResponseStreamBinding {
     }
 
     #[cfg(test)]
-    pub(super) fn age_repair_flights_for_test(&self, age: Duration) {
+    pub(in crate::runtime) fn age_repair_flights_for_test(&self, age: Duration) {
         let sent_at = Instant::now().checked_sub(age).unwrap_or_else(Instant::now);
         let mut flights = self
             .flights
@@ -3765,14 +3828,20 @@ impl ResponseStreamBinding {
         }
     }
 
-    pub(super) fn lower_flights_before_frame(&self, frame: &Frame) -> Vec<CarrierPathFlightDebt> {
+    pub(in crate::runtime) fn lower_flights_before_frame(
+        &self,
+        frame: &Frame,
+    ) -> Vec<CarrierPathFlightDebt> {
         let Some((offset, _, _)) = reliable_stream_frame_extent(frame) else {
             return Vec::new();
         };
         self.lower_flights_before_offset(offset)
     }
 
-    pub(super) fn flight_keys_overlapping_frame(&self, frame: &Frame) -> Vec<CarrierPathKey> {
+    pub(in crate::runtime) fn flight_keys_overlapping_frame(
+        &self,
+        frame: &Frame,
+    ) -> Vec<CarrierPathKey> {
         let Some((start, end, _)) = reliable_stream_frame_extent(frame) else {
             return Vec::new();
         };
@@ -3792,7 +3861,10 @@ impl ResponseStreamBinding {
         keys
     }
 
-    pub(super) fn owner_flight_keys_overlapping_frame(&self, frame: &Frame) -> Vec<CarrierPathKey> {
+    pub(in crate::runtime) fn owner_flight_keys_overlapping_frame(
+        &self,
+        frame: &Frame,
+    ) -> Vec<CarrierPathKey> {
         let Some((start, end, _)) = reliable_stream_frame_extent(frame) else {
             return Vec::new();
         };
@@ -3815,7 +3887,10 @@ impl ResponseStreamBinding {
         keys
     }
 
-    pub(super) fn lower_flights_before_offset(&self, offset: u64) -> Vec<CarrierPathFlightDebt> {
+    pub(in crate::runtime) fn lower_flights_before_offset(
+        &self,
+        offset: u64,
+    ) -> Vec<CarrierPathFlightDebt> {
         let mut debts = BTreeMap::<u64, CarrierPathFlightDebt>::new();
         {
             let ack_ordering = self
@@ -3975,7 +4050,7 @@ impl ResponseStreamBinding {
         );
     }
 
-    pub(super) fn sender_path_targets(
+    pub(in crate::runtime) fn sender_path_targets(
         &self,
         lane: FlowLane,
         payload_bytes: usize,
@@ -4085,11 +4160,13 @@ impl ResponseStreamBinding {
             .collect()
     }
 
-    pub(super) fn mux_limits(&self) -> MuxLimits {
+    pub(in crate::runtime) fn mux_limits(&self) -> MuxLimits {
         self.mux_limits
     }
 
-    pub(super) fn active_tcp_ack_clock_calibration_remaining_bytes(&self) -> Option<usize> {
+    pub(in crate::runtime) fn active_tcp_ack_clock_calibration_remaining_bytes(
+        &self,
+    ) -> Option<usize> {
         let outputs = self
             .outputs
             .lock()
@@ -4109,7 +4186,7 @@ impl ResponseStreamBinding {
     }
 
     #[cfg(test)]
-    pub(super) fn mark_output_bulk_proven_for_test(&self, key: CarrierPathKey) {
+    pub(in crate::runtime) fn mark_output_bulk_proven_for_test(&self, key: CarrierPathKey) {
         let mut outputs = self
             .outputs
             .lock()
@@ -4128,7 +4205,7 @@ impl ResponseStreamBinding {
     }
 
     #[cfg(test)]
-    pub(super) fn set_output_product_model_for_test(
+    pub(in crate::runtime) fn set_output_product_model_for_test(
         &self,
         key: CarrierPathKey,
         rate_bps: f64,
@@ -4151,7 +4228,7 @@ impl ResponseStreamBinding {
     }
 
     #[cfg(test)]
-    pub(super) fn install_tcp_ack_clock_calibration_for_test(
+    pub(in crate::runtime) fn install_tcp_ack_clock_calibration_for_test(
         &self,
         key: CarrierPathKey,
         spent_bytes: u64,
@@ -4181,11 +4258,11 @@ impl ResponseStreamBinding {
         }
     }
 
-    pub(super) fn session_id(&self) -> SessionId {
+    pub(in crate::runtime) fn session_id(&self) -> SessionId {
         self.session_id
     }
 
-    pub(super) async fn close_stream(&self, stream_id: StreamId) {
+    pub(in crate::runtime) async fn close_stream(&self, stream_id: StreamId) {
         let outputs = {
             let outputs = self
                 .outputs
@@ -4216,7 +4293,11 @@ impl ResponseStreamBinding {
         self.response_flow_registration.set_service(None);
     }
 
-    pub(super) async fn close_stream_ordered(&self, stream_id: StreamId, lane: FlowLane) {
+    pub(in crate::runtime) async fn close_stream_ordered(
+        &self,
+        stream_id: StreamId,
+        lane: FlowLane,
+    ) {
         let outputs = {
             let outputs = self
                 .outputs
@@ -4252,7 +4333,7 @@ impl ResponseStreamBinding {
         let _ = self.version.send(current.wrapping_add(1));
     }
 
-    pub(super) fn update_path_metrics_for_instance(
+    pub(in crate::runtime) fn update_path_metrics_for_instance(
         &self,
         key: CarrierPathKey,
         path_instance_id: ServerCarrierPathInstanceId,
@@ -4262,7 +4343,7 @@ impl ResponseStreamBinding {
         self.update_path_metrics_matching(key, Some(path_instance_id), metrics, source);
     }
 
-    pub(super) fn install_quic_capacity_proof_for_instance(
+    pub(in crate::runtime) fn install_quic_capacity_proof_for_instance(
         &self,
         key: CarrierPathKey,
         path_instance_id: ServerCarrierPathInstanceId,
@@ -4284,7 +4365,7 @@ impl ResponseStreamBinding {
         .0
     }
 
-    pub(super) fn install_tcp_capacity_proof_for_instance(
+    pub(in crate::runtime) fn install_tcp_capacity_proof_for_instance(
         &self,
         key: CarrierPathKey,
         path_instance_id: ServerCarrierPathInstanceId,
@@ -4306,7 +4387,7 @@ impl ResponseStreamBinding {
         .0
     }
 
-    pub(super) fn install_stored_path_metrics_for_instance(
+    pub(in crate::runtime) fn install_stored_path_metrics_for_instance(
         &self,
         key: CarrierPathKey,
         path_instance_id: ServerCarrierPathInstanceId,
@@ -4315,13 +4396,13 @@ impl ResponseStreamBinding {
         self.install_path_metrics_entry_matching(key, Some(path_instance_id), path_metrics, true);
     }
 
-    pub(super) fn notify_installed_path_metrics(&self) {
+    pub(in crate::runtime) fn notify_installed_path_metrics(&self) {
         self.graduate_completed_response_startup_owner();
         self.notify_update();
     }
 
     #[cfg(test)]
-    pub(super) fn update_path_metrics(
+    pub(in crate::runtime) fn update_path_metrics(
         &self,
         key: CarrierPathKey,
         metrics: PathMetrics,

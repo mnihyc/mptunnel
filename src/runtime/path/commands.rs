@@ -1,5 +1,5 @@
-use super::reliable_path::{ReliablePathStream, TcpCapacityProbeSessionLease};
 use super::*;
+use crate::runtime::stream::{ReliablePathStream, TcpCapacityProbeSessionLease};
 use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, Ordering};
 
 // Bounded, lane-separated handoff from carrier-neutral scheduling to TCP or
@@ -14,14 +14,14 @@ const RELIABLE_PATH_PRIORITY_HEADROOM_LANES: [FlowLane; 4] = [
 ];
 
 #[derive(Clone)]
-pub(super) struct ReliablePathCommandSender {
+pub(in crate::runtime) struct ReliablePathCommandSender {
     control: mpsc::Sender<QueuedReliablePathCommand>,
     priority: mpsc::Sender<QueuedReliablePathCommand>,
     data: mpsc::Sender<QueuedReliablePathCommand>,
     metrics: Arc<ReliablePathCommandQueueMetrics>,
 }
 
-pub(super) struct ReliablePathCommandReceivers {
+pub(in crate::runtime) struct ReliablePathCommandReceivers {
     control: mpsc::Receiver<QueuedReliablePathCommand>,
     priority: mpsc::Receiver<QueuedReliablePathCommand>,
     data: mpsc::Receiver<QueuedReliablePathCommand>,
@@ -43,7 +43,7 @@ struct TcpCapacityProbeLeaseState {
 }
 
 #[derive(Debug)]
-pub(super) struct TcpCapacityProbeLease {
+pub(in crate::runtime) struct TcpCapacityProbeLease {
     state: Arc<ReliablePathCommandQueueMetrics>,
 }
 
@@ -108,7 +108,7 @@ impl Drop for QueuedReliablePathCommand {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(super) enum QuicCapacityProbeOwner {
+pub(in crate::runtime) enum QuicCapacityProbeOwner {
     /// Client request discovery is scoped to the exact logical attachment.
     Request {
         stream_id: StreamId,
@@ -184,7 +184,7 @@ impl ReliablePathCommandReceivers {
         command
     }
 
-    pub(super) fn release_pending_command_bytes(&self, bytes: usize) {
+    pub(in crate::runtime) fn release_pending_command_bytes(&self, bytes: usize) {
         let requested = bytes as u64;
         let previous = self
             .dequeued_unreleased_bytes
@@ -197,7 +197,7 @@ impl ReliablePathCommandReceivers {
     }
 
     #[cfg(feature = "lab-diagnostics")]
-    pub(super) fn pending_bytes(&self) -> u64 {
+    pub(in crate::runtime) fn pending_bytes(&self) -> u64 {
         self.metrics.pending_bytes()
     }
 }
@@ -212,7 +212,7 @@ impl Drop for ReliablePathCommandReceivers {
 }
 
 impl ReliablePathCommandSender {
-    pub(super) async fn send_control(
+    pub(in crate::runtime) async fn send_control(
         &self,
         command: ReliablePathCommand,
     ) -> Result<(), mpsc::error::SendError<ReliablePathCommand>> {
@@ -249,7 +249,7 @@ impl ReliablePathCommandSender {
         result
     }
 
-    pub(super) async fn send_stream_ordered_close(
+    pub(in crate::runtime) async fn send_stream_ordered_close(
         &self,
         stream_id: StreamId,
         _lane: FlowLane,
@@ -286,7 +286,7 @@ impl ReliablePathCommandSender {
         result
     }
 
-    pub(super) fn try_enqueue_admitted_frame(
+    pub(in crate::runtime) fn try_enqueue_admitted_frame(
         &self,
         frame: Frame,
         lane: FlowLane,
@@ -298,7 +298,7 @@ impl ReliablePathCommandSender {
     ///
     /// Keeping the frozen proof contract beside the train prevents ordinary
     /// frame batching from losing its token or mixing product data into it.
-    pub(super) fn try_enqueue_quic_capacity_probe(
+    pub(in crate::runtime) fn try_enqueue_quic_capacity_probe(
         &self,
         probe: QuicCapacityProbeCommand,
     ) -> Result<(), RuntimeError> {
@@ -342,7 +342,7 @@ impl ReliablePathCommandSender {
     }
 
     /// Reserves one offset-free capacity epoch for this exact TCP carrier.
-    pub(super) fn try_enqueue_tcp_capacity_probe(
+    pub(in crate::runtime) fn try_enqueue_tcp_capacity_probe(
         &self,
         request: TcpCapacityProbeRequest,
         session_lease: TcpCapacityProbeSessionLease,
@@ -398,7 +398,7 @@ impl ReliablePathCommandSender {
     }
 
     /// Queues one client-to-server TCP carrier proof with no product offset.
-    pub(super) fn try_enqueue_request_tcp_capacity_probe(
+    pub(in crate::runtime) fn try_enqueue_request_tcp_capacity_probe(
         &self,
         request: RequestTcpCapacityProbeRequest,
         session_lease: RequestTcpCapacityProbeLease,
@@ -453,7 +453,7 @@ impl ReliablePathCommandSender {
         Ok(())
     }
 
-    pub(super) fn tcp_capacity_probe_attempted(&self) -> bool {
+    pub(in crate::runtime) fn tcp_capacity_probe_attempted(&self) -> bool {
         self.metrics
             .tcp_capacity_probe
             .attempts
@@ -461,14 +461,14 @@ impl ReliablePathCommandSender {
             > 0
     }
 
-    pub(super) fn tcp_capacity_probe_active(&self) -> bool {
+    pub(in crate::runtime) fn tcp_capacity_probe_active(&self) -> bool {
         self.metrics
             .tcp_capacity_probe
             .active
             .load(Ordering::Acquire)
     }
 
-    pub(super) fn try_enqueue_stream_ordered_frame(
+    pub(in crate::runtime) fn try_enqueue_stream_ordered_frame(
         &self,
         frame: Frame,
         lane: FlowLane,
@@ -548,17 +548,17 @@ impl ReliablePathCommandSender {
         result
     }
 
-    pub(super) fn can_enqueue_frame_now(&self, frame: &Frame, lane: FlowLane) -> bool {
+    pub(in crate::runtime) fn can_enqueue_frame_now(&self, frame: &Frame, lane: FlowLane) -> bool {
         let effective_lane = reliable_path_effective_frame_lane(frame, lane);
         self.can_enqueue_lane_now(effective_lane)
     }
 
-    pub(super) fn can_enqueue_stream_ordered_frame_now(&self, lane: FlowLane) -> bool {
+    pub(in crate::runtime) fn can_enqueue_stream_ordered_frame_now(&self, lane: FlowLane) -> bool {
         let _ = lane;
         self.can_enqueue_lane_now(reliable_path_stream_ordered_queue_lane())
     }
 
-    pub(super) fn can_enqueue_lane_now(&self, lane: FlowLane) -> bool {
+    pub(in crate::runtime) fn can_enqueue_lane_now(&self, lane: FlowLane) -> bool {
         if reliable_path_frame_uses_priority_queue(lane) {
             self.priority.capacity() > 0
         } else {
@@ -566,38 +566,41 @@ impl ReliablePathCommandSender {
         }
     }
 
-    pub(super) fn capacity_notify(&self) -> Arc<Notify> {
+    pub(in crate::runtime) fn capacity_notify(&self) -> Arc<Notify> {
         self.metrics.capacity_released.clone()
     }
 
     #[cfg_attr(not(any(test, feature = "lab-diagnostics")), allow(dead_code))]
-    pub(super) fn pending_bytes(&self) -> u64 {
+    pub(in crate::runtime) fn pending_bytes(&self) -> u64 {
         self.metrics.pending_bytes()
     }
 
-    pub(super) fn is_closed(&self) -> bool {
+    pub(in crate::runtime) fn is_closed(&self) -> bool {
         self.control.is_closed() && self.priority.is_closed() && self.data.is_closed()
     }
 
-    pub(super) fn same_channel(&self, other: &Self) -> bool {
+    pub(in crate::runtime) fn same_channel(&self, other: &Self) -> bool {
         self.control.same_channel(&other.control)
             && self.priority.same_channel(&other.priority)
             && self.data.same_channel(&other.data)
     }
 }
 
-pub(super) fn reliable_path_frame_uses_priority_queue(lane: FlowLane) -> bool {
+pub(in crate::runtime) fn reliable_path_frame_uses_priority_queue(lane: FlowLane) -> bool {
     matches!(
         lane,
         FlowLane::Control | FlowLane::Latency | FlowLane::RealtimeDatagram
     )
 }
 
-pub(super) fn reliable_path_stream_ordered_queue_lane() -> FlowLane {
+pub(in crate::runtime) fn reliable_path_stream_ordered_queue_lane() -> FlowLane {
     FlowLane::Throughput
 }
 
-pub(super) fn reliable_path_effective_frame_lane(frame: &Frame, stream_lane: FlowLane) -> FlowLane {
+pub(in crate::runtime) fn reliable_path_effective_frame_lane(
+    frame: &Frame,
+    stream_lane: FlowLane,
+) -> FlowLane {
     match frame {
         Frame::StreamData { .. }
         | Frame::PathCapacityData { .. }
@@ -608,7 +611,7 @@ pub(super) fn reliable_path_effective_frame_lane(frame: &Frame, stream_lane: Flo
 }
 
 /// Capacity records use shared wire frames but carrier-specific commands and proof authority.
-pub(super) fn reliable_path_frame_requires_capacity_command(frame: &Frame) -> bool {
+pub(in crate::runtime) fn reliable_path_frame_requires_capacity_command(frame: &Frame) -> bool {
     matches!(
         frame,
         Frame::PathCapacityData { .. }
@@ -617,7 +620,7 @@ pub(super) fn reliable_path_frame_requires_capacity_command(frame: &Frame) -> bo
     )
 }
 
-pub(super) fn reliable_path_command_channels(
+pub(in crate::runtime) fn reliable_path_command_channels(
     queue: usize,
 ) -> (ReliablePathCommandSender, ReliablePathCommandReceivers) {
     let queue = queue.max(1);
@@ -646,13 +649,15 @@ fn path_command_receiver_may_recv<T>(receiver: &mpsc::Receiver<T>) -> bool {
     !receiver.is_closed() || !receiver.is_empty()
 }
 
-pub(super) fn reliable_path_receivers_closed(receivers: &ReliablePathCommandReceivers) -> bool {
+pub(in crate::runtime) fn reliable_path_receivers_closed(
+    receivers: &ReliablePathCommandReceivers,
+) -> bool {
     !path_command_receiver_may_recv(&receivers.control)
         && !path_command_receiver_may_recv(&receivers.priority)
         && !path_command_receiver_may_recv(&receivers.data)
 }
 
-pub(super) async fn recv_reliable_path_command(
+pub(in crate::runtime) async fn recv_reliable_path_command(
     receivers: &mut ReliablePathCommandReceivers,
 ) -> Option<ReliablePathCommand> {
     if let Some(command) = recv_ready_priority_command(receivers) {
@@ -699,7 +704,7 @@ pub(super) async fn recv_reliable_path_command(
     command.map(|command| receivers.take_queued_command(command))
 }
 
-pub(super) fn try_recv_reliable_path_command(
+pub(in crate::runtime) fn try_recv_reliable_path_command(
     receivers: &mut ReliablePathCommandReceivers,
 ) -> Option<ReliablePathCommand> {
     recv_ready_priority_command(receivers).or_else(|| {
@@ -711,13 +716,13 @@ pub(super) fn try_recv_reliable_path_command(
     })
 }
 
-pub(super) fn try_recv_reliable_path_priority_command(
+pub(in crate::runtime) fn try_recv_reliable_path_priority_command(
     receivers: &mut ReliablePathCommandReceivers,
 ) -> Option<ReliablePathCommand> {
     recv_ready_priority_command(receivers)
 }
 
-pub(super) fn reliable_path_writer_should_coalesce_partial_bulk_run(
+pub(in crate::runtime) fn reliable_path_writer_should_coalesce_partial_bulk_run(
     sent_items: usize,
     sent_bytes: usize,
     byte_budget: usize,
@@ -726,7 +731,7 @@ pub(super) fn reliable_path_writer_should_coalesce_partial_bulk_run(
     sent_items > 0 && sent_bytes > 0 && sent_bytes < byte_budget && sent_items < item_budget
 }
 
-pub(super) async fn try_coalesce_reliable_path_writer_run(
+pub(in crate::runtime) async fn try_coalesce_reliable_path_writer_run(
     receivers: &mut ReliablePathCommandReceivers,
     next_command: &mut Option<ReliablePathCommand>,
     sent_items: usize,
@@ -750,7 +755,9 @@ pub(super) async fn try_coalesce_reliable_path_writer_run(
     false
 }
 
-pub(super) fn reliable_path_command_writer_run_budget_bytes(mux_limits: MuxLimits) -> usize {
+pub(in crate::runtime) fn reliable_path_command_writer_run_budget_bytes(
+    mux_limits: MuxLimits,
+) -> usize {
     let frame_payload =
         reliable_relay_scheduler_quantum_cap(None, FlowLane::Throughput, mux_limits)
             .min(mux_limits.max_reliable_relay_chunk_bytes)
@@ -775,23 +782,27 @@ pub(super) fn reliable_path_command_writer_run_budget_bytes(mux_limits: MuxLimit
         .max(1)
 }
 
-pub(super) fn reliable_noninterlocked_tcp_writer_run_budget_bytes(mux_limits: MuxLimits) -> usize {
+pub(in crate::runtime) fn reliable_noninterlocked_tcp_writer_run_budget_bytes(
+    mux_limits: MuxLimits,
+) -> usize {
     BBR_MAX_SEND_QUANTUM_BYTES
         .min(reliable_relay_buffer_len(mux_limits))
         .min(mux_limits.max_payload_bytes)
         .max(1)
 }
 
-pub(super) fn reliable_path_command_writer_run_budget_items(mux_limits: MuxLimits) -> usize {
+pub(in crate::runtime) fn reliable_path_command_writer_run_budget_items(
+    mux_limits: MuxLimits,
+) -> usize {
     reliable_path_command_queue(mux_limits).max(1)
 }
 
-pub(super) fn reliable_path_command_queue(mux_limits: MuxLimits) -> usize {
+pub(in crate::runtime) fn reliable_path_command_queue(mux_limits: MuxLimits) -> usize {
     let frame_payload = reliable_path_command_queue_payload(mux_limits);
     reliable_path_command_queue_for_payload(mux_limits, frame_payload)
 }
 
-pub(super) fn reliable_path_command_queue_for_payload(
+pub(in crate::runtime) fn reliable_path_command_queue_for_payload(
     mux_limits: MuxLimits,
     frame_payload_bytes: usize,
 ) -> usize {
@@ -810,7 +821,7 @@ pub(super) fn reliable_path_command_queue_for_payload(
         ))
 }
 
-pub(super) fn reliable_path_writer_frame_queue(mux_limits: MuxLimits) -> usize {
+pub(in crate::runtime) fn reliable_path_writer_frame_queue(mux_limits: MuxLimits) -> usize {
     let frame_payload = reliable_path_command_queue_payload(mux_limits);
     reliable_path_writer_frame_queue_for_payload(mux_limits, frame_payload)
 }
@@ -822,7 +833,7 @@ fn reliable_path_command_queue_payload(mux_limits: MuxLimits) -> usize {
         .max(1)
 }
 
-pub(super) fn reliable_path_writer_frame_queue_for_payload(
+pub(in crate::runtime) fn reliable_path_writer_frame_queue_for_payload(
     mux_limits: MuxLimits,
     frame_payload_bytes: usize,
 ) -> usize {
@@ -831,7 +842,7 @@ pub(super) fn reliable_path_writer_frame_queue_for_payload(
         .max(reliable_path_writer_lane_count())
 }
 
-pub(super) fn reliable_stream_frame_queue(mux_limits: MuxLimits) -> usize {
+pub(in crate::runtime) fn reliable_stream_frame_queue(mux_limits: MuxLimits) -> usize {
     let frame_payload = mux_limits
         .max_reliable_relay_chunk_bytes
         .min(mux_limits.max_payload_bytes)
@@ -839,7 +850,7 @@ pub(super) fn reliable_stream_frame_queue(mux_limits: MuxLimits) -> usize {
     reliable_stream_frame_queue_for_payload(mux_limits, frame_payload)
 }
 
-pub(super) fn reliable_stream_frame_queue_for_payload(
+pub(in crate::runtime) fn reliable_stream_frame_queue_for_payload(
     mux_limits: MuxLimits,
     frame_payload_bytes: usize,
 ) -> usize {
@@ -850,7 +861,7 @@ pub(super) fn reliable_stream_frame_queue_for_payload(
         .max(priority_headroom)
 }
 
-pub(super) fn reliable_path_priority_headroom_frames() -> usize {
+pub(in crate::runtime) fn reliable_path_priority_headroom_frames() -> usize {
     RELIABLE_PATH_PRIORITY_HEADROOM_LANES.len()
 }
 
@@ -873,7 +884,9 @@ fn recv_ready_priority_command(
         .map(|command| receivers.take_queued_command(command))
 }
 
-pub(super) fn reliable_path_command_pending_bytes(command: &ReliablePathCommand) -> usize {
+pub(in crate::runtime) fn reliable_path_command_pending_bytes(
+    command: &ReliablePathCommand,
+) -> usize {
     match command {
         ReliablePathCommand::SendFrame(frame) => frame_pacing_bytes(frame),
         ReliablePathCommand::SendQuicCapacityProbe(probe) => {
@@ -888,7 +901,9 @@ pub(super) fn reliable_path_command_pending_bytes(command: &ReliablePathCommand)
     }
 }
 
-pub(super) fn reliable_path_command_writer_run_bytes(command: &ReliablePathCommand) -> usize {
+pub(in crate::runtime) fn reliable_path_command_writer_run_bytes(
+    command: &ReliablePathCommand,
+) -> usize {
     match command {
         ReliablePathCommand::SendFrame(frame) => {
             crate::protocol::codec::encoded_frame_capacity_hint(frame).max(1)
@@ -942,19 +957,19 @@ struct QuicCapacityProbeCommandTicketState {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(super) enum QuicCapacityProbeCommandResolution {
+pub(in crate::runtime) enum QuicCapacityProbeCommandResolution {
     Current = 0,
     Cancelled = 1,
     Published = 2,
 }
 
 #[derive(Debug, Clone)]
-pub(super) struct QuicCapacityProbeCommandTicket {
+pub(in crate::runtime) struct QuicCapacityProbeCommandTicket {
     state: Arc<QuicCapacityProbeCommandTicketState>,
 }
 
 impl QuicCapacityProbeCommandTicket {
-    pub(super) fn new() -> Self {
+    pub(in crate::runtime) fn new() -> Self {
         Self {
             state: Arc::new(QuicCapacityProbeCommandTicketState {
                 resolution: AtomicU8::new(QuicCapacityProbeCommandResolution::Current as u8),
@@ -963,7 +978,7 @@ impl QuicCapacityProbeCommandTicket {
         }
     }
 
-    pub(super) fn resolution(&self) -> QuicCapacityProbeCommandResolution {
+    pub(in crate::runtime) fn resolution(&self) -> QuicCapacityProbeCommandResolution {
         match self.state.resolution.load(Ordering::Acquire) {
             value if value == QuicCapacityProbeCommandResolution::Current as u8 => {
                 QuicCapacityProbeCommandResolution::Current
@@ -978,7 +993,7 @@ impl QuicCapacityProbeCommandTicket {
         }
     }
 
-    pub(super) fn is_current(&self) -> bool {
+    pub(in crate::runtime) fn is_current(&self) -> bool {
         self.resolution() == QuicCapacityProbeCommandResolution::Current
     }
 
@@ -1000,15 +1015,15 @@ impl QuicCapacityProbeCommandTicket {
         resolved
     }
 
-    pub(super) fn cancel(&self) -> bool {
+    pub(in crate::runtime) fn cancel(&self) -> bool {
         self.resolve(QuicCapacityProbeCommandResolution::Cancelled)
     }
 
-    pub(super) fn publish(&self) -> bool {
+    pub(in crate::runtime) fn publish(&self) -> bool {
         self.resolve(QuicCapacityProbeCommandResolution::Published)
     }
 
-    pub(super) async fn resolved(&self) -> QuicCapacityProbeCommandResolution {
+    pub(in crate::runtime) async fn resolved(&self) -> QuicCapacityProbeCommandResolution {
         loop {
             let resolution = self.resolution();
             if resolution != QuicCapacityProbeCommandResolution::Current {
@@ -1025,7 +1040,7 @@ impl QuicCapacityProbeCommandTicket {
         }
     }
 
-    pub(super) async fn cancelled(&self) {
+    pub(in crate::runtime) async fn cancelled(&self) {
         if self.resolved().await == QuicCapacityProbeCommandResolution::Cancelled {
             return;
         }
@@ -1034,52 +1049,52 @@ impl QuicCapacityProbeCommandTicket {
 }
 
 #[derive(Debug)]
-pub(super) struct QuicCapacityProbeCommand {
+pub(in crate::runtime) struct QuicCapacityProbeCommand {
     // The command channel is attachment-local. This identity is only a stale
     // ownership fence and lab correlation key; QUIC never interprets product
     // stream or response-binding semantics.
-    pub(super) owner: QuicCapacityProbeOwner,
-    pub(super) path_id: PathId,
-    pub(super) calibration_id: u64,
-    pub(super) train_payload_bytes: u64,
-    pub(super) sample_floor_bytes: u64,
-    pub(super) warmup_carrier_bytes: u64,
-    pub(super) required_timed_carrier_bytes: u64,
-    pub(super) proof_validity: std::time::Duration,
-    pub(super) expires_at: std::time::Instant,
-    pub(super) ticket: QuicCapacityProbeCommandTicket,
-    pub(super) cancel_on_drop: bool,
+    pub(in crate::runtime) owner: QuicCapacityProbeOwner,
+    pub(in crate::runtime) path_id: PathId,
+    pub(in crate::runtime) calibration_id: u64,
+    pub(in crate::runtime) train_payload_bytes: u64,
+    pub(in crate::runtime) sample_floor_bytes: u64,
+    pub(in crate::runtime) warmup_carrier_bytes: u64,
+    pub(in crate::runtime) required_timed_carrier_bytes: u64,
+    pub(in crate::runtime) proof_validity: std::time::Duration,
+    pub(in crate::runtime) expires_at: std::time::Instant,
+    pub(in crate::runtime) ticket: QuicCapacityProbeCommandTicket,
+    pub(in crate::runtime) cancel_on_drop: bool,
 }
 
 static NEXT_TCP_CAPACITY_CALIBRATION_ID: AtomicU64 = AtomicU64::new(1);
 
 #[derive(Debug, Clone, Copy)]
-pub(super) struct TcpCapacityProbeRequest {
-    pub(super) path_id: PathId,
-    pub(super) path_instance_id: ServerCarrierPathInstanceId,
-    pub(super) train_payload_bytes: u64,
-    pub(super) sample_floor_bytes: u64,
-    pub(super) expires_at: Instant,
+pub(in crate::runtime) struct TcpCapacityProbeRequest {
+    pub(in crate::runtime) path_id: PathId,
+    pub(in crate::runtime) path_instance_id: ServerCarrierPathInstanceId,
+    pub(in crate::runtime) train_payload_bytes: u64,
+    pub(in crate::runtime) sample_floor_bytes: u64,
+    pub(in crate::runtime) expires_at: Instant,
 }
 
 #[derive(Debug, Clone, Copy)]
-pub(super) struct RequestTcpCapacityProbeRequest {
-    pub(super) stream_id: StreamId,
-    pub(super) path_instance: RelayPathInstance,
-    pub(super) path_id: PathId,
-    pub(super) calibration_id: u64,
-    pub(super) train_payload_bytes: u64,
-    pub(super) sample_floor_bytes: u64,
-    pub(super) warmup_carrier_bytes: u64,
-    pub(super) timing_slack_bytes: u64,
-    pub(super) required_timed_carrier_bytes: u64,
-    pub(super) baseline_expires_at: Instant,
-    pub(super) write_expires_at: Instant,
-    pub(super) expires_at: Instant,
+pub(in crate::runtime) struct RequestTcpCapacityProbeRequest {
+    pub(in crate::runtime) stream_id: StreamId,
+    pub(in crate::runtime) path_instance: RelayPathInstance,
+    pub(in crate::runtime) path_id: PathId,
+    pub(in crate::runtime) calibration_id: u64,
+    pub(in crate::runtime) train_payload_bytes: u64,
+    pub(in crate::runtime) sample_floor_bytes: u64,
+    pub(in crate::runtime) warmup_carrier_bytes: u64,
+    pub(in crate::runtime) timing_slack_bytes: u64,
+    pub(in crate::runtime) required_timed_carrier_bytes: u64,
+    pub(in crate::runtime) baseline_expires_at: Instant,
+    pub(in crate::runtime) write_expires_at: Instant,
+    pub(in crate::runtime) expires_at: Instant,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(super) enum TcpCapacityProbeOwner {
+pub(in crate::runtime) enum TcpCapacityProbeOwner {
     Request {
         stream_id: StreamId,
         path_instance: RelayPathInstance,
@@ -1090,7 +1105,7 @@ pub(super) enum TcpCapacityProbeOwner {
 }
 
 #[derive(Debug)]
-pub(super) enum TcpCapacityProbeSessionLeaseOwner {
+pub(in crate::runtime) enum TcpCapacityProbeSessionLeaseOwner {
     Request(RequestTcpCapacityProbeLease),
     // This field exists for drop order: the response session reservation lives
     // until the exact carrier transaction finishes even though it is not read.
@@ -1098,7 +1113,7 @@ pub(super) enum TcpCapacityProbeSessionLeaseOwner {
 }
 
 impl TcpCapacityProbeSessionLeaseOwner {
-    pub(super) fn request(&self) -> Option<&RequestTcpCapacityProbeLease> {
+    pub(in crate::runtime) fn request(&self) -> Option<&RequestTcpCapacityProbeLease> {
         match self {
             Self::Request(lease) => Some(lease),
             Self::Response(_) => None,
@@ -1107,31 +1122,31 @@ impl TcpCapacityProbeSessionLeaseOwner {
 }
 
 #[derive(Debug)]
-pub(super) struct TcpCapacityProbeCommand {
-    pub(super) owner: TcpCapacityProbeOwner,
-    pub(super) path_id: PathId,
-    pub(super) calibration_id: u64,
-    pub(super) train_payload_bytes: u64,
-    pub(super) sample_floor_bytes: u64,
+pub(in crate::runtime) struct TcpCapacityProbeCommand {
+    pub(in crate::runtime) owner: TcpCapacityProbeOwner,
+    pub(in crate::runtime) path_id: PathId,
+    pub(in crate::runtime) calibration_id: u64,
+    pub(in crate::runtime) train_payload_bytes: u64,
+    pub(in crate::runtime) sample_floor_bytes: u64,
     /// Request-side sizing; TCP publishes only the full-train receipt sample.
-    pub(super) warmup_carrier_bytes: u64,
-    pub(super) timing_slack_bytes: u64,
-    pub(super) required_timed_carrier_bytes: u64,
-    pub(super) baseline_expires_at: Option<Instant>,
-    pub(super) write_expires_at: Option<Instant>,
-    pub(super) expires_at: Instant,
+    pub(in crate::runtime) warmup_carrier_bytes: u64,
+    pub(in crate::runtime) timing_slack_bytes: u64,
+    pub(in crate::runtime) required_timed_carrier_bytes: u64,
+    pub(in crate::runtime) baseline_expires_at: Option<Instant>,
+    pub(in crate::runtime) write_expires_at: Option<Instant>,
+    pub(in crate::runtime) expires_at: Instant,
     // Drop session ownership before the carrier lease wakes blocked planners.
-    pub(super) _session_lease: TcpCapacityProbeSessionLeaseOwner,
+    pub(in crate::runtime) _session_lease: TcpCapacityProbeSessionLeaseOwner,
     // Dropping the command or completed epoch releases exact-carrier admission.
-    pub(super) _lease: TcpCapacityProbeLease,
+    pub(in crate::runtime) _lease: TcpCapacityProbeLease,
 }
 
 impl TcpCapacityProbeCommand {
-    pub(super) fn request_lease(&self) -> Option<&RequestTcpCapacityProbeLease> {
+    pub(in crate::runtime) fn request_lease(&self) -> Option<&RequestTcpCapacityProbeLease> {
         self._session_lease.request()
     }
 
-    pub(super) fn valid_request_tcp_train(&self) -> bool {
+    pub(in crate::runtime) fn valid_request_tcp_train(&self) -> bool {
         if self.request_lease().is_none() {
             return false;
         }
@@ -1167,7 +1182,7 @@ impl Drop for TcpCapacityProbeCommand {
 }
 
 impl QuicCapacityProbeCommand {
-    pub(super) fn disarm_drop_cancellation(&mut self) {
+    pub(in crate::runtime) fn disarm_drop_cancellation(&mut self) {
         self.cancel_on_drop = false;
     }
 }
@@ -1180,7 +1195,7 @@ impl Drop for QuicCapacityProbeCommand {
     }
 }
 
-pub(super) enum ReliablePathCommand {
+pub(in crate::runtime) enum ReliablePathCommand {
     OpenStream {
         stream_id: StreamId,
         attempt_id: ClientTcpOpenAttemptId,
@@ -1207,23 +1222,23 @@ pub(super) enum ReliablePathCommand {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(super) struct ClientTcpOpenAttemptId(pub(super) u64);
+pub(in crate::runtime) struct ClientTcpOpenAttemptId(pub(in crate::runtime) u64);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(super) struct ClientTcpOpenDeadlines {
-    pub(super) live: tokio::time::Instant,
-    pub(super) setup: tokio::time::Instant,
+pub(in crate::runtime) struct ClientTcpOpenDeadlines {
+    pub(in crate::runtime) live: tokio::time::Instant,
+    pub(in crate::runtime) setup: tokio::time::Instant,
 }
 
 impl ClientTcpOpenDeadlines {
-    pub(super) fn fixed(deadline: tokio::time::Instant) -> Self {
+    pub(in crate::runtime) fn fixed(deadline: tokio::time::Instant) -> Self {
         Self {
             live: deadline,
             setup: deadline,
         }
     }
 
-    pub(super) fn from_timeouts(
+    pub(in crate::runtime) fn from_timeouts(
         now: tokio::time::Instant,
         live: Duration,
         setup: Duration,
@@ -1234,7 +1249,7 @@ impl ClientTcpOpenDeadlines {
         }
     }
 
-    pub(super) fn for_carrier_generation(
+    pub(in crate::runtime) fn for_carrier_generation(
         self,
         observed_generation: u64,
         current_generation: u64,
@@ -1247,14 +1262,14 @@ impl ClientTcpOpenDeadlines {
     }
 }
 
-pub(super) struct ClientTcpOpenedStream {
-    pub(super) stream: ReliablePathStream,
-    pub(super) open_deadline: tokio::time::Instant,
+pub(in crate::runtime) struct ClientTcpOpenedStream {
+    pub(in crate::runtime) stream: ReliablePathStream,
+    pub(in crate::runtime) open_deadline: tokio::time::Instant,
 }
 
 // A rejected duplicate never owned the wire stream, so its caller must not
 // detach the earlier owner while unwinding the failed open attempt.
-pub(super) enum ClientTcpOpenResponse {
+pub(in crate::runtime) enum ClientTcpOpenResponse {
     Opened(ClientTcpOpenedStream),
     RejectedWithoutOpen(RuntimeError),
     FailedAfterOpen(RuntimeError),

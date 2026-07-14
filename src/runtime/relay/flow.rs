@@ -1,15 +1,19 @@
-use super::relay_io::{reliable_relay_buffer_len, reliable_relay_scheduler_quantum_cap};
+use super::io::{reliable_relay_buffer_len, reliable_relay_scheduler_quantum_cap};
 use super::*;
 
 #[derive(Debug, Clone, Copy)]
-pub(super) struct ReliableRelayFlowSignals {
+pub(in crate::runtime) struct ReliableRelayFlowSignals {
     sent_offset: u64,
     received_offset: u64,
     repair_bytes: usize,
 }
 
 impl ReliableRelayFlowSignals {
-    pub(super) fn new(sent_offset: u64, received_offset: u64, repair_bytes: usize) -> Self {
+    pub(in crate::runtime) fn new(
+        sent_offset: u64,
+        received_offset: u64,
+        repair_bytes: usize,
+    ) -> Self {
         Self {
             sent_offset,
             received_offset,
@@ -17,7 +21,7 @@ impl ReliableRelayFlowSignals {
         }
     }
 
-    pub(super) fn observed_bytes(self) -> u64 {
+    pub(in crate::runtime) fn observed_bytes(self) -> u64 {
         self.sent_offset
             .max(self.received_offset)
             .saturating_add(self.repair_bytes as u64)
@@ -25,7 +29,7 @@ impl ReliableRelayFlowSignals {
 }
 
 #[derive(Debug, Clone, Copy)]
-pub(super) struct ReliableRelayFlowDemandTracker {
+pub(in crate::runtime) struct ReliableRelayFlowDemandTracker {
     current: FlowLane,
     started_at: Instant,
     last_refresh_at: Instant,
@@ -36,7 +40,7 @@ pub(super) struct ReliableRelayFlowDemandTracker {
 }
 
 impl ReliableRelayFlowDemandTracker {
-    pub(super) fn new() -> Self {
+    pub(in crate::runtime) fn new() -> Self {
         let now = Instant::now();
         Self {
             current: FlowLane::Latency,
@@ -49,7 +53,7 @@ impl ReliableRelayFlowDemandTracker {
         }
     }
 
-    pub(super) fn refresh(
+    pub(in crate::runtime) fn refresh(
         &mut self,
         signals: ReliableRelayFlowSignals,
         path: Option<PathSnapshot>,
@@ -136,11 +140,11 @@ impl ReliableRelayFlowDemandTracker {
         }
     }
 
-    pub(super) fn should_rebalance(self, update: ReliableRelayFlowDecision) -> bool {
+    pub(in crate::runtime) fn should_rebalance(self, update: ReliableRelayFlowDecision) -> bool {
         update.rebalance_due
     }
 
-    pub(super) fn mark_rebalance_attempted(&mut self) {
+    pub(in crate::runtime) fn mark_rebalance_attempted(&mut self) {
         self.next_rebalance_at = Instant::now() + self.last_rebalance_interval;
     }
 }
@@ -178,22 +182,22 @@ fn reliable_flow_rebalance_interval(path: Option<PathSnapshot>) -> Duration {
 }
 
 #[derive(Debug, Clone, Copy)]
-pub(super) struct ReliableRelayFlowDecision {
-    pub(super) demand: FlowDemand,
-    pub(super) previous_lane: FlowLane,
+pub(in crate::runtime) struct ReliableRelayFlowDecision {
+    pub(in crate::runtime) demand: FlowDemand,
+    pub(in crate::runtime) previous_lane: FlowLane,
     #[cfg_attr(not(any(test, feature = "lab-diagnostics")), allow(dead_code))]
-    pub(super) promoted_to_throughput: bool,
-    pub(super) rebalance_due: bool,
-    pub(super) prevalidate_bulk: bool,
+    pub(in crate::runtime) promoted_to_throughput: bool,
+    pub(in crate::runtime) rebalance_due: bool,
+    pub(in crate::runtime) prevalidate_bulk: bool,
     #[cfg(feature = "lab-diagnostics")]
-    pub(super) observed_bytes: u64,
+    pub(in crate::runtime) observed_bytes: u64,
     #[cfg(feature = "lab-diagnostics")]
-    pub(super) send_rate_bps: f64,
+    pub(in crate::runtime) send_rate_bps: f64,
     #[cfg(feature = "lab-diagnostics")]
-    pub(super) rebalance_interval: Duration,
+    pub(in crate::runtime) rebalance_interval: Duration,
 }
 
-pub(super) fn reliable_flow_bulk_threshold_bytes(
+pub(in crate::runtime) fn reliable_flow_bulk_threshold_bytes(
     path: Option<PathSnapshot>,
     mux_limits: MuxLimits,
 ) -> u64 {
@@ -210,7 +214,7 @@ pub(super) fn reliable_flow_bulk_threshold_bytes(
         .min(window)
 }
 
-pub(super) fn reliable_relay_bulk_prevalidation_threshold_bytes(
+pub(in crate::runtime) fn reliable_relay_bulk_prevalidation_threshold_bytes(
     path: Option<PathSnapshot>,
     mux_limits: MuxLimits,
 ) -> u64 {
@@ -228,7 +232,7 @@ pub(super) fn reliable_relay_bulk_prevalidation_threshold_bytes(
     }
 }
 
-pub(super) fn reliable_latency_startup_owner_credit_remaining_bytes(
+pub(in crate::runtime) fn reliable_latency_startup_owner_credit_remaining_bytes(
     lane: FlowLane,
     sent_offset: u64,
     queued_data_bytes: usize,

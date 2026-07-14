@@ -11,7 +11,7 @@ use crate::model::admission::{
 // Relay I/O orchestrates reads, writes, and feedback timing. It observes queue
 // counters but delegates product admission limits to their policy modules.
 
-pub(super) async fn send_sender_service_attach_control_frames(
+pub(in crate::runtime) async fn send_sender_service_attach_control_frames(
     path_stream: &ReliablePathStream,
     send_stream: &ReliableSendStream,
     resend_fin: bool,
@@ -28,7 +28,7 @@ pub(super) async fn send_sender_service_attach_control_frames(
     Ok(())
 }
 
-pub(super) fn frame_pacing_bytes(frame: &Frame) -> usize {
+pub(in crate::runtime) fn frame_pacing_bytes(frame: &Frame) -> usize {
     match frame {
         Frame::StreamData { payload, .. } | Frame::PathCapacityData { payload, .. } => {
             payload.len().max(1)
@@ -42,7 +42,7 @@ pub(super) fn frame_pacing_bytes(frame: &Frame) -> usize {
     }
 }
 
-pub(super) fn reliable_relay_error_is_migratable(err: &RuntimeError) -> bool {
+pub(in crate::runtime) fn reliable_relay_error_is_migratable(err: &RuntimeError) -> bool {
     matches!(
         err,
         RuntimeError::PathHeartbeatTimeout
@@ -55,7 +55,7 @@ pub(super) fn reliable_relay_error_is_migratable(err: &RuntimeError) -> bool {
     )
 }
 
-pub(super) fn stream_ack_gap_repair_allowed(
+pub(in crate::runtime) fn stream_ack_gap_repair_allowed(
     complete: bool,
     has_multipath_repair_alternative: bool,
     ack_gap_repair_ready: bool,
@@ -69,14 +69,14 @@ pub(super) fn stream_ack_gap_repair_allowed(
     ack_gap_repair_ready
 }
 
-pub(super) fn stream_tail_timer_repair_allowed(
+pub(in crate::runtime) fn stream_tail_timer_repair_allowed(
     live_owner_tail_repair_candidate: bool,
     has_failed_owner_repair_output: bool,
 ) -> bool {
     live_owner_tail_repair_candidate || has_failed_owner_repair_output
 }
 
-pub(super) fn reliable_relay_tail_repair_timer_active(
+pub(in crate::runtime) fn reliable_relay_tail_repair_timer_active(
     repair_bytes: usize,
     live_owner_tail_repair_candidate: bool,
     failed_owner_tail_repair_ready: bool,
@@ -88,7 +88,7 @@ pub(super) fn reliable_relay_tail_repair_timer_active(
         )
 }
 
-pub(super) fn stream_ack_is_authoritative_contiguous_prefix(
+pub(in crate::runtime) fn stream_ack_is_authoritative_contiguous_prefix(
     complete: bool,
     ranges: &[OffsetRange],
     frontier: u64,
@@ -98,7 +98,7 @@ pub(super) fn stream_ack_is_authoritative_contiguous_prefix(
         && matches!(ranges, [range] if range.start == 0 && range.end == frontier)
 }
 
-pub(super) fn stream_ack_ranges_expose_authoritative_gap(
+pub(in crate::runtime) fn stream_ack_ranges_expose_authoritative_gap(
     complete: bool,
     ranges: &[OffsetRange],
 ) -> bool {
@@ -108,7 +108,7 @@ pub(super) fn stream_ack_ranges_expose_authoritative_gap(
             .is_some_and(|first| first.start > 0 || ranges.len() > 1)
 }
 
-pub(super) fn reliable_relay_ordered_owner_debt_bytes(
+pub(in crate::runtime) fn reliable_relay_ordered_owner_debt_bytes(
     lane: FlowLane,
     _ack_complete: bool,
     ack_frontier: u64,
@@ -123,14 +123,17 @@ pub(super) fn reliable_relay_ordered_owner_debt_bytes(
     usize::try_from(next_offset.saturating_sub(ack_frontier)).unwrap_or(usize::MAX)
 }
 
-pub(super) fn stream_ack_contiguous_frontier(_complete: bool, ranges: &[OffsetRange]) -> u64 {
+pub(in crate::runtime) fn stream_ack_contiguous_frontier(
+    _complete: bool,
+    ranges: &[OffsetRange],
+) -> u64 {
     ranges
         .first()
         .filter(|range| range.start == 0)
         .map_or(0, |range| range.end)
 }
 
-pub(super) fn update_repair_authoritative_ack_snapshot(
+pub(in crate::runtime) fn update_repair_authoritative_ack_snapshot(
     stored_frontier: &mut u64,
     stored_ranges: &mut Vec<OffsetRange>,
     stored_complete: &mut bool,
@@ -166,7 +169,7 @@ fn reliable_relay_current_ordered_owner_debt_bytes(
     )
 }
 
-pub(super) fn reliable_relay_tail_repair_deadline(
+pub(in crate::runtime) fn reliable_relay_tail_repair_deadline(
     last_progress_at: Instant,
     last_repair_at: Instant,
     path: Option<PathSnapshot>,
@@ -181,7 +184,7 @@ pub(super) fn reliable_relay_tail_repair_deadline(
     tokio::time::Instant::from_std(last_progress_at + stall_timeout)
 }
 
-pub(super) fn reliable_relay_effective_tail_repair_deadline(
+pub(in crate::runtime) fn reliable_relay_effective_tail_repair_deadline(
     last_progress_at: Instant,
     last_repair_at: Instant,
     path: Option<PathSnapshot>,
@@ -198,14 +201,14 @@ pub(super) fn reliable_relay_effective_tail_repair_deadline(
     reliable_relay_tail_repair_deadline(last_progress_at, last_repair_at, path, lane)
 }
 
-pub(super) fn reliable_relay_tail_repair_delay(
+pub(in crate::runtime) fn reliable_relay_tail_repair_delay(
     path: Option<PathSnapshot>,
     lane: FlowLane,
 ) -> Duration {
     reliable_relay_stall_timeout(path, lane)
 }
 
-pub(super) fn reliable_ack_gap_repair_delay(
+pub(in crate::runtime) fn reliable_ack_gap_repair_delay(
     path: Option<PathSnapshot>,
     lane: FlowLane,
 ) -> Duration {
@@ -213,7 +216,7 @@ pub(super) fn reliable_ack_gap_repair_delay(
 }
 
 #[cfg(test)]
-pub(super) fn stream_ack_gap_repair_frames(
+pub(in crate::runtime) fn stream_ack_gap_repair_frames(
     send_stream: &ReliableSendStream,
     ranges: &[OffsetRange],
     byte_limit: usize,
@@ -234,7 +237,7 @@ pub(super) fn stream_ack_gap_repair_frames(
     }
 }
 
-pub(super) fn stream_ack_gap_repair_frames_normalized(
+pub(in crate::runtime) fn stream_ack_gap_repair_frames_normalized(
     send_stream: &ReliableSendStream,
     ranges: &[OffsetRange],
     byte_limit: usize,
@@ -255,7 +258,7 @@ pub(super) fn stream_ack_gap_repair_frames_normalized(
     }
 }
 
-pub(super) fn stream_final_offset_tail_repair_frames(
+pub(in crate::runtime) fn stream_final_offset_tail_repair_frames(
     send_stream: &ReliableSendStream,
     ranges: &[OffsetRange],
     byte_limit: usize,
@@ -282,14 +285,14 @@ pub(super) fn stream_final_offset_tail_repair_frames(
 }
 
 #[derive(Debug, Default)]
-pub(super) struct ReliableAckGapRepairProgress {
+pub(in crate::runtime) struct ReliableAckGapRepairProgress {
     first_gap_start: Option<u64>,
     first_seen_at: Option<Instant>,
     last_repair_at: Option<Instant>,
 }
 
 impl ReliableAckGapRepairProgress {
-    pub(super) fn repair_ready(
+    pub(in crate::runtime) fn repair_ready(
         &mut self,
         complete: bool,
         normalized_ranges: &[OffsetRange],
@@ -352,7 +355,7 @@ impl ReliableAckGapRepairProgress {
         true
     }
 
-    pub(super) fn record_repair_queued(&mut self) {
+    pub(in crate::runtime) fn record_repair_queued(&mut self) {
         self.record_repair_queued_at(Instant::now());
     }
 
@@ -362,7 +365,7 @@ impl ReliableAckGapRepairProgress {
         }
     }
 
-    pub(super) fn release_repair_attempt(&mut self) {
+    pub(in crate::runtime) fn release_repair_attempt(&mut self) {
         self.last_repair_at = None;
     }
 
@@ -503,7 +506,7 @@ fn offset_ranges_not_covered(ranges: &[OffsetRange], covered: &[OffsetRange]) ->
 }
 
 #[derive(Debug, Clone, Default)]
-pub(super) struct ReliableRecvProgress {
+pub(in crate::runtime) struct ReliableRecvProgress {
     last_max_data_offset: u64,
     last_max_data_window_bytes: u64,
     last_ack_offset: u64,
@@ -516,12 +519,12 @@ pub(super) struct ReliableRecvProgress {
 // Sparse history belongs only to server-side request feedback. Keeping it out
 // of shared receive progress leaves the cloned response hot path cumulative.
 #[derive(Debug, Default)]
-pub(super) struct RequestTcpSparseAckProgress {
+pub(in crate::runtime) struct RequestTcpSparseAckProgress {
     acknowledged_ranges: Vec<OffsetRange>,
 }
 
 impl ReliableRecvProgress {
-    pub(super) fn should_send_ack(
+    pub(in crate::runtime) fn should_send_ack(
         &mut self,
         recv_stream: &ReliableRecvStream,
         path: Option<PathSnapshot>,
@@ -565,7 +568,7 @@ impl ReliableRecvProgress {
         }
     }
 
-    pub(super) fn should_send_max_data(
+    pub(in crate::runtime) fn should_send_max_data(
         &mut self,
         recv_stream: &ReliableRecvStream,
         path: Option<PathSnapshot>,
@@ -593,7 +596,7 @@ impl ReliableRecvProgress {
 }
 
 impl RequestTcpSparseAckProgress {
-    pub(super) fn ack_frames(
+    pub(in crate::runtime) fn ack_frames(
         &mut self,
         recv_stream: &ReliableRecvStream,
         sparse_delta: bool,
@@ -621,7 +624,7 @@ impl RequestTcpSparseAckProgress {
 /// staging and each carrier's native congestion controller independently bound
 /// how much data can reach that envelope. Latency QUIC keeps a smaller window
 /// so unrelated bulk work cannot consume its reserved product memory.
-pub(super) fn reliable_stream_initial_advertised_window_bytes(
+pub(in crate::runtime) fn reliable_stream_initial_advertised_window_bytes(
     underlay: UnderlayProtocol,
     lane: FlowLane,
     mux_limits: MuxLimits,
@@ -629,7 +632,7 @@ pub(super) fn reliable_stream_initial_advertised_window_bytes(
     reliable_stream_advertised_window_from_underlay(None, underlay, lane, mux_limits)
 }
 
-pub(super) fn reliable_stream_advertised_window_bytes(
+pub(in crate::runtime) fn reliable_stream_advertised_window_bytes(
     path: Option<PathSnapshot>,
     lane: FlowLane,
     mux_limits: MuxLimits,
@@ -661,7 +664,7 @@ fn reliable_stream_advertised_window_from_underlay(
     startup_window
 }
 
-pub(super) fn reliable_stream_max_data_update_bytes(
+pub(in crate::runtime) fn reliable_stream_max_data_update_bytes(
     advertised_window_bytes: u64,
     mux_limits: MuxLimits,
 ) -> u64 {
@@ -672,7 +675,7 @@ pub(super) fn reliable_stream_max_data_update_bytes(
         .min(advertised_window_bytes.max(1))
 }
 
-pub(super) fn reliable_stream_ack_update_bytes(
+pub(in crate::runtime) fn reliable_stream_ack_update_bytes(
     path: Option<PathSnapshot>,
     lane: FlowLane,
     mux_limits: MuxLimits,
@@ -704,7 +707,7 @@ pub(super) fn reliable_stream_ack_update_bytes(
         .max(PATH_OPEN_SCORE_BYTES as u64)
 }
 
-pub(super) fn enqueue_tcp_recv_progress(
+pub(in crate::runtime) fn enqueue_tcp_recv_progress(
     response_sender: &mut ServerResponseSenderService,
     recv_stream: &ReliableRecvStream,
     progress: &mut ReliableRecvProgress,
@@ -745,7 +748,7 @@ pub(super) fn enqueue_tcp_recv_progress(
     sent_any
 }
 
-pub(super) fn reliable_relay_recv_progress_resend_active(
+pub(in crate::runtime) fn reliable_relay_recv_progress_resend_active(
     recv_stream: &ReliableRecvStream,
     remote_open: bool,
     active_underlay: Option<UnderlayProtocol>,
@@ -767,7 +770,7 @@ fn reliable_relay_recv_progress_timer_enabled(
     initial_underlay == UnderlayProtocol::Udp || has_multipath_repair_alternative
 }
 
-pub(super) fn reliable_stream_recv_progress_interval(
+pub(in crate::runtime) fn reliable_stream_recv_progress_interval(
     path: Option<PathSnapshot>,
     lane: FlowLane,
 ) -> Duration {
@@ -776,7 +779,10 @@ pub(super) fn reliable_stream_recv_progress_interval(
         .max(QUIC_TIMER_GRANULARITY)
 }
 
-pub(super) fn sender_service_retry_delay(path: Option<PathSnapshot>, lane: FlowLane) -> Duration {
+pub(in crate::runtime) fn sender_service_retry_delay(
+    path: Option<PathSnapshot>,
+    lane: FlowLane,
+) -> Duration {
     let _ = lane;
     (transport_pto_from_snapshot(path) / 16)
         .max(Duration::from_millis(5))
@@ -832,7 +838,7 @@ fn response_sender_wait_state(
     }
 }
 
-pub(super) fn reliable_relay_buffer_len(mux_limits: MuxLimits) -> usize {
+pub(in crate::runtime) fn reliable_relay_buffer_len(mux_limits: MuxLimits) -> usize {
     mux_limits
         .max_reliable_relay_chunk_bytes
         .min(mux_limits.max_payload_bytes)
@@ -840,7 +846,10 @@ pub(super) fn reliable_relay_buffer_len(mux_limits: MuxLimits) -> usize {
         .max(1)
 }
 
-pub(super) fn resize_reliable_relay_buffer(buffer: &mut bytes::BytesMut, target_len: usize) {
+pub(in crate::runtime) fn resize_reliable_relay_buffer(
+    buffer: &mut bytes::BytesMut,
+    target_len: usize,
+) {
     let target_len = target_len.max(1);
     buffer.clear();
     if buffer.capacity() < target_len {
@@ -848,7 +857,7 @@ pub(super) fn resize_reliable_relay_buffer(buffer: &mut bytes::BytesMut, target_
     }
 }
 
-pub(super) async fn read_reliable_relay_payload<S>(
+pub(in crate::runtime) async fn read_reliable_relay_payload<S>(
     local: &mut S,
     buffer: &mut bytes::BytesMut,
     read_budget: usize,
@@ -868,7 +877,7 @@ where
     }
 }
 
-pub(super) async fn write_delivered_payloads<S>(
+pub(in crate::runtime) async fn write_delivered_payloads<S>(
     local: &mut S,
     delivered: &[Bytes],
 ) -> std::io::Result<usize>
@@ -927,7 +936,7 @@ where
     Ok(total_bytes)
 }
 
-pub(super) fn receive_stream_fin(
+pub(in crate::runtime) fn receive_stream_fin(
     recv_stream: &ReliableRecvStream,
     pending_final_offset: &mut Option<u64>,
     final_offset: u64,
@@ -949,7 +958,7 @@ pub(super) fn receive_stream_fin(
     Ok(final_offset == recv_stream.next_offset())
 }
 
-pub(super) fn stream_data_range_already_delivered(
+pub(in crate::runtime) fn stream_data_range_already_delivered(
     recv_stream: &ReliableRecvStream,
     offset: u64,
     payload_len: usize,
@@ -957,14 +966,14 @@ pub(super) fn stream_data_range_already_delivered(
     offset.saturating_add(payload_len as u64) <= recv_stream.next_offset()
 }
 
-pub(super) fn pending_stream_fin_ready(
+pub(in crate::runtime) fn pending_stream_fin_ready(
     recv_stream: &ReliableRecvStream,
     pending_final_offset: Option<u64>,
 ) -> bool {
     pending_final_offset.is_some_and(|final_offset| recv_stream.next_offset() >= final_offset)
 }
 
-pub(super) fn stream_terminal_fin_replay_required(
+pub(in crate::runtime) fn stream_terminal_fin_replay_required(
     fin_sent: bool,
     fin_replayed: bool,
     sender_queue_empty: bool,
@@ -979,7 +988,7 @@ pub(super) fn stream_terminal_fin_replay_required(
         && ack_frontier >= final_offset
 }
 
-pub(super) fn adaptive_reliable_relay_chunk_bytes(
+pub(in crate::runtime) fn adaptive_reliable_relay_chunk_bytes(
     path: Option<PathSnapshot>,
     lane: FlowLane,
     mux_limits: MuxLimits,
@@ -1024,7 +1033,7 @@ pub(super) fn adaptive_reliable_relay_chunk_bytes(
     target.clamp(floor, cap)
 }
 
-pub(super) fn adaptive_reliable_relay_chunk_bytes_with_frame_limit(
+pub(in crate::runtime) fn adaptive_reliable_relay_chunk_bytes_with_frame_limit(
     path: Option<PathSnapshot>,
     lane: FlowLane,
     mux_limits: MuxLimits,
@@ -1035,7 +1044,7 @@ pub(super) fn adaptive_reliable_relay_chunk_bytes_with_frame_limit(
         .max(1)
 }
 
-pub(super) fn adaptive_reliable_relay_inflight_bytes(
+pub(in crate::runtime) fn adaptive_reliable_relay_inflight_bytes(
     path: Option<PathSnapshot>,
     lane: FlowLane,
     mux_limits: MuxLimits,
@@ -1057,7 +1066,7 @@ pub(super) fn adaptive_reliable_relay_inflight_bytes(
     (target.ceil() as usize).clamp(floor, cap)
 }
 
-pub(super) fn reliable_relay_sender_dispatch_budget(
+pub(in crate::runtime) fn reliable_relay_sender_dispatch_budget(
     mux_limits: MuxLimits,
     lane: FlowLane,
     adaptive_chunk: usize,
@@ -1085,7 +1094,7 @@ pub(super) fn reliable_relay_sender_dispatch_budget(
     (bytes, items)
 }
 
-pub(super) fn adaptive_reliable_relay_repair_bytes(
+pub(in crate::runtime) fn adaptive_reliable_relay_repair_bytes(
     path: Option<PathSnapshot>,
     lane: FlowLane,
     mux_limits: MuxLimits,
@@ -1097,7 +1106,7 @@ pub(super) fn adaptive_reliable_relay_repair_bytes(
     adaptive_reliable_relay_chunk_bytes(path, repair_lane, mux_limits).max(1)
 }
 
-pub(super) fn reliable_critical_tail_repair_limit_bytes(
+pub(in crate::runtime) fn reliable_critical_tail_repair_limit_bytes(
     event_repair_limit: usize,
     repair_debt_bytes: usize,
     mux_limits: MuxLimits,
@@ -1136,7 +1145,7 @@ fn reliable_live_owner_tail_repair_limit_bytes(
     reliable_critical_tail_repair_limit_bytes(event_limit, repair_debt_bytes, mux_limits)
 }
 
-pub(super) fn reliable_persistent_ack_gap_repair_limit_bytes(
+pub(in crate::runtime) fn reliable_persistent_ack_gap_repair_limit_bytes(
     path: Option<PathSnapshot>,
     owner_underlay: Option<UnderlayProtocol>,
     lane: FlowLane,
@@ -1167,7 +1176,7 @@ pub(super) fn reliable_persistent_ack_gap_repair_limit_bytes(
     reliable_critical_tail_repair_limit_bytes(event_limit, repair_debt_bytes, mux_limits)
 }
 
-pub(super) fn reliable_critical_tail_repair_is_over_budget(
+pub(in crate::runtime) fn reliable_critical_tail_repair_is_over_budget(
     budget_remaining: usize,
     repair_limit: usize,
 ) -> bool {
@@ -1255,7 +1264,7 @@ fn reliable_final_tail_repair_ready(
         || (last_send_ack_frontier == 0 && send_stream.next_offset() > 0)
 }
 
-pub(super) fn reliable_path_product_bdp_bytes(path: PathSnapshot) -> f64 {
+pub(in crate::runtime) fn reliable_path_product_bdp_bytes(path: PathSnapshot) -> f64 {
     let rate_bps = path.delivery_rate_bps.max(
         path.product_progress_rate_bps
             .unwrap_or(path.delivery_rate_bps),
@@ -1264,28 +1273,31 @@ pub(super) fn reliable_path_product_bdp_bytes(path: PathSnapshot) -> f64 {
     (rate_bps / 8.0) * (path.srtt_ms.max(1.0) / 1000.0)
 }
 
-pub(super) fn bbr_min_send_quantum_bytes(mux_limits: MuxLimits) -> usize {
+pub(in crate::runtime) fn bbr_min_send_quantum_bytes(mux_limits: MuxLimits) -> usize {
     let cap = reliable_relay_buffer_len(mux_limits).max(1);
     (BBR_MIN_SEND_QUANTUM_PACKETS * TRANSPORT_MSS_BYTES)
         .min(cap)
         .max(1)
 }
 
-pub(super) fn reliable_bulk_carrier_feed_quantum_bytes(mux_limits: MuxLimits) -> usize {
+pub(in crate::runtime) fn reliable_bulk_carrier_feed_quantum_bytes(mux_limits: MuxLimits) -> usize {
     let cap = reliable_relay_buffer_len(mux_limits).max(1);
     BBR_MAX_SEND_QUANTUM_BYTES
         .min(cap)
         .max(bbr_min_send_quantum_bytes(mux_limits))
 }
 
-pub(super) fn bbr_min_pipe_cwnd_bytes(mux_limits: MuxLimits) -> usize {
+pub(in crate::runtime) fn bbr_min_pipe_cwnd_bytes(mux_limits: MuxLimits) -> usize {
     let cap = mux_limits.max_path_flight_bytes.max(1);
     (BBR_MIN_PIPE_CWND_PACKETS * TRANSPORT_MSS_BYTES)
         .min(cap)
         .max(1)
 }
 
-pub(super) fn bbr_send_quantum_bytes(path: PathSnapshot, mux_limits: MuxLimits) -> usize {
+pub(in crate::runtime) fn bbr_send_quantum_bytes(
+    path: PathSnapshot,
+    mux_limits: MuxLimits,
+) -> usize {
     let cap = reliable_relay_buffer_len(mux_limits).max(1);
     let floor = bbr_min_send_quantum_bytes(mux_limits);
     let ceiling = BBR_MAX_SEND_QUANTUM_BYTES.min(cap).max(floor);
@@ -1298,7 +1310,7 @@ pub(super) fn bbr_send_quantum_bytes(path: PathSnapshot, mux_limits: MuxLimits) 
     quantum.clamp(floor, ceiling)
 }
 
-pub(super) fn relay_lane_min_chunk_bytes(
+pub(in crate::runtime) fn relay_lane_min_chunk_bytes(
     path: Option<PathSnapshot>,
     lane: FlowLane,
     mux_limits: MuxLimits,
@@ -1315,7 +1327,10 @@ pub(super) fn relay_lane_min_chunk_bytes(
     }
 }
 
-pub(super) fn relay_lane_startup_chunk_bytes(lane: FlowLane, mux_limits: MuxLimits) -> usize {
+pub(in crate::runtime) fn relay_lane_startup_chunk_bytes(
+    lane: FlowLane,
+    mux_limits: MuxLimits,
+) -> usize {
     let cap = reliable_relay_scheduler_quantum_cap(None, lane, mux_limits);
     let floor = relay_lane_min_chunk_bytes(None, lane, mux_limits);
     let target = match lane {
@@ -1326,7 +1341,7 @@ pub(super) fn relay_lane_startup_chunk_bytes(lane: FlowLane, mux_limits: MuxLimi
     target.clamp(floor.min(cap).max(1), cap)
 }
 
-pub(super) fn reliable_relay_scheduler_quantum_cap(
+pub(in crate::runtime) fn reliable_relay_scheduler_quantum_cap(
     path: Option<PathSnapshot>,
     lane: FlowLane,
     mux_limits: MuxLimits,
@@ -1347,7 +1362,10 @@ pub(super) fn reliable_relay_scheduler_quantum_cap(
         .max(1)
 }
 
-pub(super) fn reliable_lane_min_inflight_bytes(lane: FlowLane, mux_limits: MuxLimits) -> usize {
+pub(in crate::runtime) fn reliable_lane_min_inflight_bytes(
+    lane: FlowLane,
+    mux_limits: MuxLimits,
+) -> usize {
     let cap = mux_limits.max_path_flight_bytes.max(1);
     let min_pipe = bbr_min_pipe_cwnd_bytes(mux_limits);
     let initial_window = PATH_OPEN_SCORE_BYTES.min(cap).max(min_pipe);
@@ -1361,7 +1379,10 @@ pub(super) fn reliable_lane_min_inflight_bytes(lane: FlowLane, mux_limits: MuxLi
     }
 }
 
-pub(super) fn reliable_lane_startup_inflight_bytes(lane: FlowLane, mux_limits: MuxLimits) -> usize {
+pub(in crate::runtime) fn reliable_lane_startup_inflight_bytes(
+    lane: FlowLane,
+    mux_limits: MuxLimits,
+) -> usize {
     let cap = mux_limits.max_path_flight_bytes.max(1);
     let floor = reliable_lane_min_inflight_bytes(lane, mux_limits);
     let target = bbr_inflight_target_bytes_for_model(
@@ -1373,7 +1394,7 @@ pub(super) fn reliable_lane_startup_inflight_bytes(lane: FlowLane, mux_limits: M
     (target.ceil() as usize).clamp(floor.min(cap).max(1), cap)
 }
 
-pub(super) fn bbr_inflight_target_bytes(
+pub(in crate::runtime) fn bbr_inflight_target_bytes(
     path: PathSnapshot,
     lane: FlowLane,
     mux_limits: MuxLimits,
@@ -1409,15 +1430,15 @@ fn reliable_startup_rate_bps() -> f64 {
     PATH_OPEN_SCORE_BYTES as f64 * 8.0 / RELIABLE_INITIAL_RTT.as_secs_f64()
 }
 
-pub(super) fn reliable_startup_bdp_bytes() -> f64 {
+pub(in crate::runtime) fn reliable_startup_bdp_bytes() -> f64 {
     reliable_startup_rate_bps() / 8.0 * (reliable_startup_srtt_ms() / 1000.0)
 }
 
-pub(super) fn reliable_startup_send_quantum_bytes() -> usize {
+pub(in crate::runtime) fn reliable_startup_send_quantum_bytes() -> usize {
     bbr_send_quantum_bytes_for_rate(reliable_startup_rate_bps())
 }
 
-pub(super) fn reliable_path_stability_factor(path: PathSnapshot) -> f64 {
+pub(in crate::runtime) fn reliable_path_stability_factor(path: PathSnapshot) -> f64 {
     let bdp_bytes = reliable_path_product_bdp_bytes(path);
     let min_pipe = (BBR_MIN_PIPE_CWND_PACKETS * TRANSPORT_MSS_BYTES) as f64;
     let floor = adaptive_transport_floor_factor(min_pipe, bdp_bytes);
@@ -1427,7 +1448,7 @@ pub(super) fn reliable_path_stability_factor(path: PathSnapshot) -> f64 {
     loss_factor * jitter_factor
 }
 
-pub(super) fn reliable_path_queue_factor(path: PathSnapshot, bdp_bytes: f64) -> f64 {
+pub(in crate::runtime) fn reliable_path_queue_factor(path: PathSnapshot, bdp_bytes: f64) -> f64 {
     let queued = path.queue_bytes.saturating_add(path.bytes_in_flight) as f64;
     let floor = adaptive_transport_floor_factor(
         (BBR_MIN_PIPE_CWND_PACKETS * TRANSPORT_MSS_BYTES) as f64,
@@ -1436,7 +1457,7 @@ pub(super) fn reliable_path_queue_factor(path: PathSnapshot, bdp_bytes: f64) -> 
     (bdp_bytes / (bdp_bytes + queued.max(0.0))).max(floor)
 }
 
-pub(super) fn reliable_path_backlog_factor(path: PathSnapshot, bdp_bytes: f64) -> f64 {
+pub(in crate::runtime) fn reliable_path_backlog_factor(path: PathSnapshot, bdp_bytes: f64) -> f64 {
     let queued = path.queue_bytes as f64;
     let floor = adaptive_transport_floor_factor(
         bbr_send_quantum_bytes_for_rate(
@@ -1449,7 +1470,10 @@ pub(super) fn reliable_path_backlog_factor(path: PathSnapshot, bdp_bytes: f64) -
     (bdp_bytes / (bdp_bytes + queued.max(0.0))).max(floor)
 }
 
-pub(super) fn reliable_path_quantum_condition_factor(path: PathSnapshot, bdp_bytes: f64) -> f64 {
+pub(in crate::runtime) fn reliable_path_quantum_condition_factor(
+    path: PathSnapshot,
+    bdp_bytes: f64,
+) -> f64 {
     let stability = reliable_path_stability_factor(path);
     let queue = reliable_path_queue_factor(path, bdp_bytes);
     let floor = adaptive_transport_floor_factor(
@@ -1475,7 +1499,10 @@ fn adaptive_transport_floor_factor(minimum_bytes: f64, bdp_bytes: f64) -> f64 {
     (minimum_bytes.max(1.0) / denominator).min(1.0)
 }
 
-pub(super) fn reliable_sender_effective_relay_lane(local: FlowLane, peer: FlowLane) -> FlowLane {
+pub(in crate::runtime) fn reliable_sender_effective_relay_lane(
+    local: FlowLane,
+    peer: FlowLane,
+) -> FlowLane {
     if local == FlowLane::Throughput || peer == FlowLane::Throughput {
         FlowLane::Throughput
     } else if local == FlowLane::Background || peer == FlowLane::Background {
@@ -1486,7 +1513,7 @@ pub(super) fn reliable_sender_effective_relay_lane(local: FlowLane, peer: FlowLa
 }
 
 #[cfg(test)]
-pub(super) fn prefix_repair_frames_with_available_output(
+pub(in crate::runtime) fn prefix_repair_frames_with_available_output(
     path_stream: &ReliablePathStream,
     repair_frames: Vec<Frame>,
     allow_same_output_frontier_retransmit: bool,
@@ -1499,7 +1526,7 @@ pub(super) fn prefix_repair_frames_with_available_output(
     (frames, blocked)
 }
 
-pub(super) fn prefix_final_tail_repair_frames_with_available_output(
+pub(in crate::runtime) fn prefix_final_tail_repair_frames_with_available_output(
     path_stream: &ReliablePathStream,
     repair_frames: Vec<Frame>,
 ) -> (Vec<Frame>, Option<u64>, bool) {
@@ -1546,7 +1573,7 @@ fn prefix_live_owner_tail_repair_frames_with_available_output(
     (accepted, None)
 }
 
-pub(super) fn prefix_repair_frames_with_failed_owner_output(
+pub(in crate::runtime) fn prefix_repair_frames_with_failed_owner_output(
     path_stream: &ReliablePathStream,
     repair_frames: Vec<Frame>,
 ) -> (Vec<Frame>, Option<u64>) {
@@ -1563,7 +1590,7 @@ pub(super) fn prefix_repair_frames_with_failed_owner_output(
     (accepted, None)
 }
 
-pub(super) fn prefix_repair_frames_with_unknown_owner_output(
+pub(in crate::runtime) fn prefix_repair_frames_with_unknown_owner_output(
     path_stream: &ReliablePathStream,
     repair_frames: Vec<Frame>,
 ) -> (Vec<Frame>, Option<u64>) {
@@ -1873,7 +1900,7 @@ async fn drain_server_response_sender_ready(
     Ok(blocked_by_carrier)
 }
 
-pub(super) async fn relay_reliable_stream<S>(
+pub(in crate::runtime) async fn relay_reliable_stream<S>(
     mut local: S,
     mut path_stream: ReliablePathStream,
     mux_limits: MuxLimits,

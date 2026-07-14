@@ -1,5 +1,6 @@
 use super::*;
 use crate::protocol::path_capacity::CapacityReceiveTracker;
+use crate::transport::tcp as tcp_transport;
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -9,7 +10,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 // shutdown. Product reliable stream identity, response path-flight ownership,
 // and cross-carrier scheduling live in `reliable_path`.
 
-pub(super) struct ClientTcpPathSessionHandle {
+pub(in crate::runtime) struct ClientTcpPathSessionHandle {
     runtime: ClientTcpPathSessionRuntime,
     commands: Arc<Mutex<Option<ClientTcpPathSessionSlot>>>,
     latency_commands: Arc<Mutex<Option<ClientTcpPathSessionSlot>>>,
@@ -26,7 +27,7 @@ struct ClientTcpCarrierGeneration {
     current: u64,
 }
 
-pub(super) struct ClientTcpOpenCancellation {
+pub(in crate::runtime) struct ClientTcpOpenCancellation {
     commands: ReliablePathCommandSender,
     stream_id: StreamId,
     attempt_id: ClientTcpOpenAttemptId,
@@ -67,7 +68,7 @@ impl Drop for ClientTcpCarrierGeneration {
 }
 
 impl ClientTcpOpenCancellation {
-    pub(super) fn new(
+    pub(in crate::runtime) fn new(
         commands: ReliablePathCommandSender,
         stream_id: StreamId,
         attempt_id: ClientTcpOpenAttemptId,
@@ -124,7 +125,7 @@ impl Clone for ClientTcpPathSessionHandle {
 }
 
 impl ClientTcpPathSessionHandle {
-    pub(super) fn new(runtime: ClientTcpPathSessionRuntime) -> Self {
+    pub(in crate::runtime) fn new(runtime: ClientTcpPathSessionRuntime) -> Self {
         Self {
             runtime,
             commands: Arc::new(Mutex::new(None)),
@@ -133,12 +134,12 @@ impl ClientTcpPathSessionHandle {
     }
 
     #[cfg(test)]
-    pub(super) fn session_id(&self) -> SessionId {
+    pub(in crate::runtime) fn session_id(&self) -> SessionId {
         self.runtime.session_id
     }
 
     #[cfg(test)]
-    pub(super) fn carrier_generation(&self, lane: FlowLane) -> u64 {
+    pub(in crate::runtime) fn carrier_generation(&self, lane: FlowLane) -> u64 {
         let lane = if tcp_path_lane_uses_latency_session(lane) {
             &self.latency_commands
         } else {
@@ -153,7 +154,7 @@ impl ClientTcpPathSessionHandle {
     }
 
     #[cfg(test)]
-    pub(super) async fn open_stream(
+    pub(in crate::runtime) async fn open_stream(
         &self,
         stream_id: StreamId,
         target: TargetAddr,
@@ -174,7 +175,7 @@ impl ClientTcpPathSessionHandle {
         .map(|opened| opened.stream)
     }
 
-    pub(super) async fn open_stream_with_deadlines(
+    pub(in crate::runtime) async fn open_stream_with_deadlines(
         &self,
         stream_id: StreamId,
         target: TargetAddr,
@@ -241,7 +242,7 @@ impl ClientTcpPathSessionHandle {
     }
 
     #[cfg(test)]
-    pub(super) fn ensure_session(&self, lane: FlowLane) -> ReliablePathCommandSender {
+    pub(in crate::runtime) fn ensure_session(&self, lane: FlowLane) -> ReliablePathCommandSender {
         self.ensure_session_slot(lane).commands
     }
 
@@ -274,30 +275,30 @@ impl ClientTcpPathSessionHandle {
     }
 }
 
-pub(super) fn tcp_path_lane_uses_latency_session(lane: FlowLane) -> bool {
+pub(in crate::runtime) fn tcp_path_lane_uses_latency_session(lane: FlowLane) -> bool {
     matches!(
         lane,
         FlowLane::Control | FlowLane::Latency | FlowLane::RealtimeDatagram
     )
 }
 
-pub(super) struct ClientTcpPathConnection {
-    pub(super) startup_snapshot: PathSnapshot,
-    pub(super) startup_metrics: PathMetrics,
-    pub(super) writer: EncryptedTcpWriter,
-    pub(super) frames: mpsc::Receiver<Result<Frame, EncryptedFramedTransportError>>,
-    pub(super) heartbeat_interval: Duration,
-    pub(super) next_heartbeat_at: tokio::time::Instant,
-    pub(super) pending_heartbeat: Option<(u64, tokio::time::Instant)>,
-    pub(super) path_proofs: PathProofTracker,
+pub(in crate::runtime) struct ClientTcpPathConnection {
+    pub(in crate::runtime) startup_snapshot: PathSnapshot,
+    pub(in crate::runtime) startup_metrics: PathMetrics,
+    pub(in crate::runtime) writer: EncryptedTcpWriter,
+    pub(in crate::runtime) frames: mpsc::Receiver<Result<Frame, EncryptedFramedTransportError>>,
+    pub(in crate::runtime) heartbeat_interval: Duration,
+    pub(in crate::runtime) next_heartbeat_at: tokio::time::Instant,
+    pub(in crate::runtime) pending_heartbeat: Option<(u64, tokio::time::Instant)>,
+    pub(in crate::runtime) path_proofs: PathProofTracker,
     #[cfg(target_os = "linux")]
-    pub(super) tcp_metrics: Option<TcpMetricPublisher>,
-    pub(super) request_tcp_capacity_probe: Option<PendingClientTcpCapacityProbe>,
+    pub(in crate::runtime) tcp_metrics: Option<TcpMetricPublisher>,
+    pub(in crate::runtime) request_tcp_capacity_probe: Option<PendingClientTcpCapacityProbe>,
     discarded_request_tcp_capacity_receipt: Option<DiscardedClientTcpCapacityReceipt>,
-    pub(super) capacity_receive: CapacityReceiveTracker,
+    pub(in crate::runtime) capacity_receive: CapacityReceiveTracker,
 }
 
-pub(super) struct PendingClientTcpCapacityProbe {
+pub(in crate::runtime) struct PendingClientTcpCapacityProbe {
     probe: TcpCapacityProbeCommand,
     measurement: ClientTcpCapacityProbeMeasurement,
 }
@@ -333,17 +334,19 @@ impl DiscardedClientTcpCapacityReceipt {
     }
 }
 
-pub(super) type EncryptedTcpReader = EncryptedFramedReader<tokio::io::ReadHalf<TcpStream>>;
-pub(super) type EncryptedTcpWriter = EncryptedFramedWriter<tokio::io::WriteHalf<TcpStream>>;
+pub(in crate::runtime) type EncryptedTcpReader =
+    EncryptedFramedReader<tokio::io::ReadHalf<TcpStream>>;
+pub(in crate::runtime) type EncryptedTcpWriter =
+    EncryptedFramedWriter<tokio::io::WriteHalf<TcpStream>>;
 
-pub(super) struct ClientTcpPathStreamState {
-    pub(super) open_attempt_id: ClientTcpOpenAttemptId,
-    pub(super) frames: mpsc::Sender<Result<Frame, RuntimeError>>,
-    pub(super) pending_open: Option<ClientTcpPendingOpen>,
-    pub(super) local_close_pending: bool,
+pub(in crate::runtime) struct ClientTcpPathStreamState {
+    pub(in crate::runtime) open_attempt_id: ClientTcpOpenAttemptId,
+    pub(in crate::runtime) frames: mpsc::Sender<Result<Frame, RuntimeError>>,
+    pub(in crate::runtime) pending_open: Option<ClientTcpPendingOpen>,
+    pub(in crate::runtime) local_close_pending: bool,
 }
 
-pub(super) struct ClientTcpPendingOpen {
+pub(in crate::runtime) struct ClientTcpPendingOpen {
     response: oneshot::Sender<ClientTcpOpenResponse>,
     frames: Option<mpsc::Receiver<Result<Frame, RuntimeError>>>,
     session_commands: ReliablePathCommandSender,
@@ -352,17 +355,17 @@ pub(super) struct ClientTcpPendingOpen {
 }
 
 #[derive(Clone)]
-pub(super) struct ClientTcpPathSessionRuntime {
-    pub(super) path: PathSpec,
-    pub(super) path_index: usize,
-    pub(super) session_id: SessionId,
-    pub(super) security: SecurityConfig,
-    pub(super) codec_limits: CodecLimits,
-    pub(super) mux_limits: MuxLimits,
-    pub(super) command_queue: usize,
-    pub(super) stream_frame_queue: usize,
-    pub(super) closed_stream_cache_capacity: usize,
-    pub(super) health: Arc<Mutex<ClientPathHealth>>,
+pub(in crate::runtime) struct ClientTcpPathSessionRuntime {
+    pub(in crate::runtime) path: PathSpec,
+    pub(in crate::runtime) path_index: usize,
+    pub(in crate::runtime) session_id: SessionId,
+    pub(in crate::runtime) security: SecurityConfig,
+    pub(in crate::runtime) codec_limits: CodecLimits,
+    pub(in crate::runtime) mux_limits: MuxLimits,
+    pub(in crate::runtime) command_queue: usize,
+    pub(in crate::runtime) stream_frame_queue: usize,
+    pub(in crate::runtime) closed_stream_cache_capacity: usize,
+    pub(in crate::runtime) health: Arc<Mutex<ClientPathHealth>>,
 }
 
 struct ClientTcpPathSessionState {
@@ -1285,12 +1288,12 @@ async fn wait_for_client_tcp_write_queue_drain(
     }
 }
 
-pub(super) enum ClientTcpWriteFrameRoute {
+pub(in crate::runtime) enum ClientTcpWriteFrameRoute {
     Routed,
     Barrier(Frame),
 }
 
-pub(super) fn try_route_client_tcp_stream_frame_during_write(
+pub(in crate::runtime) fn try_route_client_tcp_stream_frame_during_write(
     frame: Frame,
     streams: &mut HashMap<StreamId, ClientTcpPathStreamState>,
     closed_streams: &mut RecentIdCache<StreamId>,
@@ -1527,7 +1530,7 @@ async fn handle_connected_client_tcp_command(
     }
 }
 
-pub(super) async fn connect_client_tcp_path(
+pub(in crate::runtime) async fn connect_client_tcp_path(
     path: &PathSpec,
     path_index: usize,
     session_id: SessionId,
@@ -1538,7 +1541,7 @@ pub(super) async fn connect_client_tcp_path(
 ) -> Result<ClientTcpPathConnection, RuntimeError> {
     let connect = async {
         let connect_timeout = open_deadline.saturating_duration_since(tokio::time::Instant::now());
-        let tcp_stream = tcp::connect_path(
+        let tcp_stream = tcp_transport::connect_path(
             path,
             TcpConnectOptions {
                 timeout: connect_timeout,
@@ -1700,7 +1703,7 @@ async fn open_client_tcp_stream_on_connection(
     Ok(())
 }
 
-pub(super) fn remove_matching_client_tcp_open(
+pub(in crate::runtime) fn remove_matching_client_tcp_open(
     streams: &mut HashMap<StreamId, ClientTcpPathStreamState>,
     stream_id: StreamId,
     attempt_id: ClientTcpOpenAttemptId,
@@ -2135,7 +2138,7 @@ async fn handle_client_tcp_path_frame(
     }
 }
 
-pub(super) fn refresh_client_tcp_path_liveness(
+pub(in crate::runtime) fn refresh_client_tcp_path_liveness(
     connection: &mut ClientTcpPathConnection,
     mux_limits: MuxLimits,
 ) {
@@ -2154,7 +2157,7 @@ fn record_client_tcp_path_outbound_activity(
     refresh_client_tcp_path_liveness(connection, mux_limits);
 }
 
-pub(super) fn refresh_client_tcp_path_liveness_state(
+pub(in crate::runtime) fn refresh_client_tcp_path_liveness_state(
     next_heartbeat_at: &mut tokio::time::Instant,
     heartbeat_interval: Duration,
     pending_heartbeat: &mut Option<(u64, tokio::time::Instant)>,
@@ -2167,7 +2170,7 @@ pub(super) fn refresh_client_tcp_path_liveness_state(
     }
 }
 
-pub(super) async fn route_client_tcp_stream_frame(
+pub(in crate::runtime) async fn route_client_tcp_stream_frame(
     streams: &mut HashMap<StreamId, ClientTcpPathStreamState>,
     closed_streams: &mut RecentIdCache<StreamId>,
     stream_id: StreamId,
@@ -2203,7 +2206,7 @@ pub(super) async fn route_client_tcp_stream_frame(
     Ok(())
 }
 
-pub(super) async fn tick_client_tcp_path_heartbeat(
+pub(in crate::runtime) async fn tick_client_tcp_path_heartbeat(
     connection: &mut ClientTcpPathConnection,
     mux_limits: MuxLimits,
     has_active_streams: bool,
@@ -2231,7 +2234,7 @@ pub(super) async fn tick_client_tcp_path_heartbeat(
     Ok(())
 }
 
-pub(super) async fn close_client_tcp_path(
+pub(in crate::runtime) async fn close_client_tcp_path(
     connection: &mut ClientTcpPathConnection,
     path_id: PathId,
     drain: bool,
@@ -2288,7 +2291,7 @@ fn tcp_path_stream_error(reason: &RuntimeError) -> RuntimeError {
     }
 }
 
-pub(super) fn spawn_encrypted_tcp_reader(
+pub(in crate::runtime) fn spawn_encrypted_tcp_reader(
     mut reader: EncryptedTcpReader,
     queue_size: usize,
 ) -> mpsc::Receiver<Result<Frame, EncryptedFramedTransportError>> {
@@ -2312,7 +2315,7 @@ pub(super) fn spawn_encrypted_tcp_reader(
     frames_rx
 }
 
-pub(super) fn tcp_session_command_queue(resources: ResourceLimits) -> usize {
+pub(in crate::runtime) fn tcp_session_command_queue(resources: ResourceLimits) -> usize {
     reliable_path_command_queue(resources.into())
 }
 

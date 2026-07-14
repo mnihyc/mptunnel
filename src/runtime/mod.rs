@@ -3,25 +3,14 @@ mod datagram;
 mod error;
 mod ingress_runtime;
 mod management;
-mod path_commands;
-mod path_common;
-mod path_model;
-mod path_proof;
+mod path;
 mod prelude;
-mod relay_control;
-mod relay_flow;
-mod relay_io;
-mod relay_open;
+mod relay;
 mod relay_striping;
-mod reliable_path;
-mod sender_service;
+mod sender;
 mod server_runtime;
-mod server_tcp;
-mod tcp_metrics;
-mod tcp_path;
+mod stream;
 mod tun_l4;
-mod udp_metrics;
-mod udp_path;
 
 pub use core::run;
 pub use datagram::client_udp_datagram_round_trip;
@@ -38,26 +27,22 @@ use core::*;
 use datagram::*;
 use ingress_runtime::*;
 use management::*;
-use path_commands::*;
-use path_common::*;
-use path_model::*;
-use path_proof::*;
+use path::udp::carrier::*;
+use path::{
+    commands::*,
+    common::*,
+    model::*,
+    proof::*,
+    tcp::{client::*, metrics::*, server::*},
+};
 use prelude::*;
-use relay_control::*;
-use relay_flow::*;
-use relay_io::*;
-use relay_open::*;
+use relay::*;
 use relay_striping::*;
-use reliable_path::*;
-use sender_service::*;
+use sender::*;
 #[cfg(test)]
 use server_runtime::run_server;
-use server_tcp::*;
-use tcp_metrics::*;
-use tcp_path::*;
+use stream::*;
 use tun_l4::*;
-use udp_metrics::*;
-use udp_path::*;
 
 #[cfg(test)]
 mod tests;

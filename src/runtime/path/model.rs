@@ -3,16 +3,16 @@ use crate::model::admission::BulkPathCandidate;
 use crate::model::timing::*;
 
 #[derive(Debug, Clone, Copy)]
-pub(super) struct UdpPathRuntimeModel {
-    pub(super) pacing_rate_bps: f64,
-    pub(super) response_timeout: Duration,
-    pub(super) mtu_payload_bytes: usize,
-    pub(super) mtu_is_measured: bool,
-    pub(super) mtu_probe_ceiling_payload_bytes: usize,
+pub(in crate::runtime) struct UdpPathRuntimeModel {
+    pub(in crate::runtime) pacing_rate_bps: f64,
+    pub(in crate::runtime) response_timeout: Duration,
+    pub(in crate::runtime) mtu_payload_bytes: usize,
+    pub(in crate::runtime) mtu_is_measured: bool,
+    pub(in crate::runtime) mtu_probe_ceiling_payload_bytes: usize,
 }
 
 impl UdpPathRuntimeModel {
-    pub(super) fn from_snapshot(
+    pub(in crate::runtime) fn from_snapshot(
         snapshot: PathSnapshot,
         ttl_ms: u32,
         mtu_payload_bytes: usize,
@@ -35,12 +35,12 @@ impl UdpPathRuntimeModel {
         }
     }
 
-    pub(super) fn accepts_or_can_probe(self, payload_bytes: usize) -> bool {
+    pub(in crate::runtime) fn accepts_or_can_probe(self, payload_bytes: usize) -> bool {
         payload_bytes <= self.mtu_payload_bytes
             || (!self.mtu_is_measured && payload_bytes <= self.mtu_probe_ceiling_payload_bytes)
     }
 
-    pub(super) fn pacing_interval(self, payload_bytes: usize) -> Duration {
+    pub(in crate::runtime) fn pacing_interval(self, payload_bytes: usize) -> Duration {
         if payload_bytes == 0 {
             return Duration::ZERO;
         }
@@ -71,7 +71,9 @@ fn adaptive_transport_byte_floor_factor(minimum_bytes: f64, model_bytes: f64) ->
     minimum_bytes.max(1.0) / model_bytes.max(minimum_bytes).max(1.0)
 }
 
-pub(super) fn path_record_failure_cooldown(record: &ClientPathHealthRecord) -> Duration {
+pub(in crate::runtime) fn path_record_failure_cooldown(
+    record: &ClientPathHealthRecord,
+) -> Duration {
     let srtt_ms = record
         .carrier_srtt_ms
         .or(record.measured_srtt_ms)
@@ -88,7 +90,7 @@ pub(super) fn path_record_failure_cooldown(record: &ClientPathHealthRecord) -> D
     pto.saturating_mul(2_u32.saturating_pow(failure_exponent))
 }
 
-pub(super) fn udp_mtu_payload_bytes(
+pub(in crate::runtime) fn udp_mtu_payload_bytes(
     path: &PathSpec,
     observation: ClientPathObservation,
     max_payload_bytes: usize,
@@ -103,11 +105,11 @@ pub(super) fn udp_mtu_payload_bytes(
     )
 }
 
-pub(super) fn udp_probe_ceiling_payload_bytes(max_payload_bytes: usize) -> usize {
+pub(in crate::runtime) fn udp_probe_ceiling_payload_bytes(max_payload_bytes: usize) -> usize {
     max_payload_bytes.clamp(UDP_MIN_MTU_PAYLOAD_BYTES, UDP_MAX_MTU_PAYLOAD_BYTES)
 }
 
-pub(super) fn health_observations(
+pub(in crate::runtime) fn health_observations(
     records: &mut [ClientPathHealthRecord],
 ) -> Vec<ClientPathObservation> {
     let now = Instant::now();
@@ -117,7 +119,7 @@ pub(super) fn health_observations(
         .collect()
 }
 
-pub(super) fn path_records_have_schedulable_alternative(
+pub(in crate::runtime) fn path_records_have_schedulable_alternative(
     records: &mut [ClientPathHealthRecord],
     failed_index: usize,
     now: Instant,
@@ -131,11 +133,13 @@ pub(super) fn path_records_have_schedulable_alternative(
     })
 }
 
-pub(super) fn path_observation_is_idle_for_probe(observation: ClientPathObservation) -> bool {
+pub(in crate::runtime) fn path_observation_is_idle_for_probe(
+    observation: ClientPathObservation,
+) -> bool {
     observation.active_flows == 0
 }
 
-pub(super) fn apply_bulk_latency_isolation(
+pub(in crate::runtime) fn apply_bulk_latency_isolation(
     observations: &mut [ClientPathObservation],
     lane: FlowLane,
     mux_limits: MuxLimits,
@@ -159,7 +163,7 @@ pub(super) fn apply_bulk_latency_isolation(
     }
 }
 
-pub(super) fn endpoint_only_reliable_startup_should_preserve_configured_order(
+pub(in crate::runtime) fn endpoint_only_reliable_startup_should_preserve_configured_order(
     paths: &[PathSpec],
     observations: &[ClientPathObservation],
     lane: FlowLane,
@@ -170,7 +174,7 @@ pub(super) fn endpoint_only_reliable_startup_should_preserve_configured_order(
         && !endpoint_only_startup_has_bulk_load(observations)
 }
 
-pub(super) fn endpoint_only_reliable_startup_should_spread_latency_load(
+pub(in crate::runtime) fn endpoint_only_reliable_startup_should_spread_latency_load(
     paths: &[PathSpec],
     observations: &[ClientPathObservation],
     lane: FlowLane,
@@ -181,7 +185,7 @@ pub(super) fn endpoint_only_reliable_startup_should_spread_latency_load(
         && !endpoint_only_startup_has_bulk_load(observations)
 }
 
-pub(super) fn endpoint_only_startup_has_latency_sensitive_load(
+pub(in crate::runtime) fn endpoint_only_startup_has_latency_sensitive_load(
     observations: &[ClientPathObservation],
 ) -> bool {
     observations
@@ -189,19 +193,23 @@ pub(super) fn endpoint_only_startup_has_latency_sensitive_load(
         .any(|observation| observation.active_latency_sensitive_flows > 0)
 }
 
-pub(super) fn endpoint_only_startup_has_any_load(observations: &[ClientPathObservation]) -> bool {
+pub(in crate::runtime) fn endpoint_only_startup_has_any_load(
+    observations: &[ClientPathObservation],
+) -> bool {
     observations
         .iter()
         .any(|observation| observation.active_flows > 0)
 }
 
-pub(super) fn endpoint_only_startup_has_bulk_load(observations: &[ClientPathObservation]) -> bool {
+pub(in crate::runtime) fn endpoint_only_startup_has_bulk_load(
+    observations: &[ClientPathObservation],
+) -> bool {
     observations
         .iter()
         .any(|observation| observation.active_flows > observation.active_latency_sensitive_flows)
 }
 
-pub(super) fn endpoint_only_reliable_startup_should_spread_bulk_load(
+pub(in crate::runtime) fn endpoint_only_reliable_startup_should_spread_bulk_load(
     paths: &[PathSpec],
     observations: &[ClientPathObservation],
     lane: FlowLane,
@@ -213,7 +221,7 @@ pub(super) fn endpoint_only_reliable_startup_should_spread_bulk_load(
         && !endpoint_only_startup_has_latency_sensitive_load(observations)
 }
 
-pub(super) fn ordered_reliable_path_indices(
+pub(in crate::runtime) fn ordered_reliable_path_indices(
     paths: &[PathSpec],
     observations: &[ClientPathObservation],
     lane: FlowLane,
@@ -225,7 +233,7 @@ pub(super) fn ordered_reliable_path_indices(
         .collect()
 }
 
-pub(super) fn reliable_stream_startup_path_scores(
+pub(in crate::runtime) fn reliable_stream_startup_path_scores(
     paths: &[PathSpec],
     observations: &[ClientPathObservation],
     lane: FlowLane,
@@ -265,7 +273,7 @@ fn reliable_stream_mixed_startup_path_scores(
     ordered_path_scores(paths, observations, lane, payload_bytes)
 }
 
-pub(super) fn endpoint_only_reliable_startup_path_scores(
+pub(in crate::runtime) fn endpoint_only_reliable_startup_path_scores(
     paths: &[PathSpec],
     observations: &[ClientPathObservation],
     lane: FlowLane,
@@ -305,14 +313,14 @@ fn endpoint_only_startup_observation_for_scoring(
     }
 }
 
-pub(super) fn path_is_endpoint_only(path: &PathSpec) -> bool {
+pub(in crate::runtime) fn path_is_endpoint_only(path: &PathSpec) -> bool {
     path.metadata.initial_srtt_ms.is_none()
         && path.metadata.initial_jitter_ms.is_none()
         && path.metadata.initial_rate == RateHint::Unknown
         && path.metadata.capabilities == crate::protocol::PathCapabilities::default()
 }
 
-pub(super) fn configured_order_path_indices(
+pub(in crate::runtime) fn configured_order_path_indices(
     paths: &[PathSpec],
     observations: &[ClientPathObservation],
     lane: FlowLane,
@@ -324,7 +332,7 @@ pub(super) fn configured_order_path_indices(
         .collect()
 }
 
-pub(super) fn configured_order_path_scores(
+pub(in crate::runtime) fn configured_order_path_scores(
     paths: &[PathSpec],
     observations: &[ClientPathObservation],
     lane: FlowLane,
@@ -346,7 +354,7 @@ pub(super) fn configured_order_path_scores(
         .collect()
 }
 
-pub(super) fn ordered_path_scores_for_ttl(
+pub(in crate::runtime) fn ordered_path_scores_for_ttl(
     paths: &[PathSpec],
     observations: &[ClientPathObservation],
     lane: FlowLane,
@@ -362,7 +370,7 @@ pub(super) fn ordered_path_scores_for_ttl(
         .collect::<Vec<_>>()
 }
 
-pub(super) fn ordered_path_scores(
+pub(in crate::runtime) fn ordered_path_scores(
     paths: &[PathSpec],
     observations: &[ClientPathObservation],
     lane: FlowLane,
@@ -390,7 +398,7 @@ pub(super) fn ordered_path_scores(
     scores
 }
 
-pub(super) fn reliable_stream_path_candidates(
+pub(in crate::runtime) fn reliable_stream_path_candidates(
     tcp_paths: &[PathSpec],
     tcp_observations: &[ClientPathObservation],
     udp_paths: &[PathSpec],
@@ -494,7 +502,7 @@ pub(super) fn reliable_stream_path_candidates(
     candidates
 }
 
-pub(super) fn bulk_path_candidate(
+pub(in crate::runtime) fn bulk_path_candidate(
     key: RelayPathKey,
     eta_ms: f64,
     path: &PathSpec,
@@ -516,7 +524,7 @@ pub(super) fn bulk_path_candidate(
     }
 }
 
-pub(super) fn path_snapshot(
+pub(in crate::runtime) fn path_snapshot(
     path: &PathSpec,
     index: usize,
     observation: ClientPathObservation,
@@ -604,7 +612,7 @@ pub(super) fn path_snapshot(
     }
 }
 
-pub(super) fn path_startup_snapshot(path: &PathSpec, index: usize) -> PathSnapshot {
+pub(in crate::runtime) fn path_startup_snapshot(path: &PathSpec, index: usize) -> PathSnapshot {
     path_snapshot(
         path,
         index,
@@ -616,7 +624,7 @@ pub(super) fn path_startup_snapshot(path: &PathSpec, index: usize) -> PathSnapsh
     )
 }
 
-pub(super) fn path_startup_metrics(
+pub(in crate::runtime) fn path_startup_metrics(
     path: &PathSpec,
     index: usize,
     direction: PathMetricDirection,
@@ -633,7 +641,7 @@ pub(super) fn path_startup_metrics(
     )
 }
 
-pub(super) fn path_metrics_from_snapshot(
+pub(in crate::runtime) fn path_metrics_from_snapshot(
     snapshot: PathSnapshot,
     observation: ClientPathObservation,
     direction: PathMetricDirection,
@@ -671,13 +679,13 @@ pub(super) fn path_metrics_from_snapshot(
     }
 }
 
-pub(super) fn metric_epoch_now() -> u64 {
+pub(in crate::runtime) fn metric_epoch_now() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map_or(0, |duration| duration.as_secs())
 }
 
-pub(super) fn ratio_to_ppm(value: f64) -> u32 {
+pub(in crate::runtime) fn ratio_to_ppm(value: f64) -> u32 {
     (value.clamp(0.0, 1.0) * 1_000_000.0).round() as u32
 }
 
@@ -686,7 +694,10 @@ fn millis_to_micros_u32(ms: f64) -> u32 {
     micros.clamp(0.0, f64::from(u32::MAX)) as u32
 }
 
-pub(super) fn path_model_srtt_ms(path: &PathSpec, observation: ClientPathObservation) -> f64 {
+pub(in crate::runtime) fn path_model_srtt_ms(
+    path: &PathSpec,
+    observation: ClientPathObservation,
+) -> f64 {
     observation
         .carrier_srtt_ms
         .or(observation.measured_srtt_ms)
@@ -697,7 +708,7 @@ pub(super) fn path_model_srtt_ms(path: &PathSpec, observation: ClientPathObserva
         })
 }
 
-pub(super) fn path_model_confidence(observation: ClientPathObservation) -> f64 {
+pub(in crate::runtime) fn path_model_confidence(observation: ClientPathObservation) -> f64 {
     if (observation.explicit_carrier_capacity_proof || observation.quic_capacity_rate_prior_fresh)
         && observation.carrier_delivery_rate_bps.is_some()
     {
@@ -723,7 +734,7 @@ pub(super) fn path_model_confidence(observation: ClientPathObservation) -> f64 {
     (delivery_confidence + rtt_confidence).clamp(0.0, 1.0)
 }
 
-pub(super) fn udp_path_has_realtime_model(
+pub(in crate::runtime) fn udp_path_has_realtime_model(
     path: &PathSpec,
     observation: ClientPathObservation,
 ) -> bool {
@@ -739,7 +750,9 @@ pub(super) fn udp_path_has_realtime_model(
         || path.metadata.initial_rate != RateHint::Unknown
 }
 
-pub(super) fn udp_observation_has_datagram_feedback(observation: &ClientPathObservation) -> bool {
+pub(in crate::runtime) fn udp_observation_has_datagram_feedback(
+    observation: &ClientPathObservation,
+) -> bool {
     observation.measured_jitter_ms.is_some()
         || observation.measured_loss_rate.is_some()
         || observation.measured_rate_bps.is_some()
@@ -747,7 +760,7 @@ pub(super) fn udp_observation_has_datagram_feedback(observation: &ClientPathObse
         || observation.measured_mtu_payload_bytes.is_some()
 }
 
-pub(super) fn path_within_adaptive_lead_hysteresis(
+pub(in crate::runtime) fn path_within_adaptive_lead_hysteresis(
     old_eta_ms: f64,
     old_snapshot: PathSnapshot,
     best_eta_ms: f64,
@@ -760,14 +773,14 @@ pub(super) fn path_within_adaptive_lead_hysteresis(
         && old_snapshot.queue_bytes <= best_snapshot.queue_bytes + queue_hysteresis_bytes
 }
 
-pub(super) fn path_can_be_auto_discovered(
+pub(in crate::runtime) fn path_can_be_auto_discovered(
     path: &PathSpec,
     observation: ClientPathObservation,
 ) -> bool {
     observation.state == SchedulerPathState::Active && path_allows_automatic_bulk_use(path)
 }
 
-pub(super) fn path_allows_automatic_bulk_use(path: &PathSpec) -> bool {
+pub(in crate::runtime) fn path_allows_automatic_bulk_use(path: &PathSpec) -> bool {
     // Operator cost/role policy is transport-independent. Automatic capacity
     // discovery may measure only paths that are also eligible to carry bulk.
     let capabilities = path.metadata.capabilities;
@@ -803,7 +816,7 @@ fn path_can_be_recovery_candidate_for_lane(
             || path.metadata.capabilities.bulk_allowed)
 }
 
-pub(super) fn bulk_candidate_has_liveness_evidence(
+pub(in crate::runtime) fn bulk_candidate_has_liveness_evidence(
     path: &PathSpec,
     observation: ClientPathObservation,
 ) -> bool {
@@ -820,11 +833,13 @@ pub(super) fn bulk_candidate_has_liveness_evidence(
         || path.metadata.initial_rate != RateHint::Unknown
 }
 
-pub(super) fn bulk_candidate_has_path_proof_evidence(observation: ClientPathObservation) -> bool {
+pub(in crate::runtime) fn bulk_candidate_has_path_proof_evidence(
+    observation: ClientPathObservation,
+) -> bool {
     observation.path_proof_success
 }
 
-pub(super) fn bulk_candidate_has_ack_data_evidence(
+pub(in crate::runtime) fn bulk_candidate_has_ack_data_evidence(
     path: &PathSpec,
     observation: ClientPathObservation,
 ) -> bool {
@@ -835,7 +850,7 @@ pub(super) fn bulk_candidate_has_ack_data_evidence(
         || observation.carrier_ack_derived_data_seen
 }
 
-pub(super) fn bulk_candidate_has_bulk_rate_evidence(
+pub(in crate::runtime) fn bulk_candidate_has_bulk_rate_evidence(
     path: &PathSpec,
     observation: ClientPathObservation,
 ) -> bool {
@@ -843,7 +858,7 @@ pub(super) fn bulk_candidate_has_bulk_rate_evidence(
     product_rate || bulk_candidate_has_native_carrier_rate_evidence(observation)
 }
 
-pub(super) fn bulk_candidate_has_native_carrier_rate_evidence(
+pub(in crate::runtime) fn bulk_candidate_has_native_carrier_rate_evidence(
     observation: ClientPathObservation,
 ) -> bool {
     (observation.explicit_carrier_capacity_proof && observation.carrier_delivery_rate_bps.is_some())
@@ -855,7 +870,7 @@ pub(super) fn bulk_candidate_has_native_carrier_rate_evidence(
                 >= client_path_observation_bulk_sample_floor_bytes(observation))
 }
 
-pub(super) fn bulk_candidate_has_fresh_native_carrier_rate_evidence(
+pub(in crate::runtime) fn bulk_candidate_has_fresh_native_carrier_rate_evidence(
     observation: ClientPathObservation,
     valid_after: Instant,
     now: Instant,
@@ -892,7 +907,7 @@ fn client_path_observation_has_durable_product_progress(
                 >= client_path_observation_bulk_sample_floor_bytes(observation))
 }
 
-pub(super) fn bulk_candidate_has_sender_delivery_evidence(
+pub(in crate::runtime) fn bulk_candidate_has_sender_delivery_evidence(
     path: &PathSpec,
     observation: ClientPathObservation,
 ) -> bool {
@@ -926,11 +941,13 @@ fn reliable_product_delivery_samples(path: &PathSpec, observation: ClientPathObs
     }
 }
 
-pub(super) fn bulk_candidate_has_active_bulk_work(candidate: &BulkPathCandidate) -> bool {
+pub(in crate::runtime) fn bulk_candidate_has_active_bulk_work(
+    candidate: &BulkPathCandidate,
+) -> bool {
     candidate.snapshot.active_flows > candidate.snapshot.active_latency_sensitive_flows
 }
 
-pub(super) fn bulk_candidates_span_underlays(candidates: &[BulkPathCandidate]) -> bool {
+pub(in crate::runtime) fn bulk_candidates_span_underlays(candidates: &[BulkPathCandidate]) -> bool {
     let Some(first) = candidates.first() else {
         return false;
     };
@@ -939,7 +956,7 @@ pub(super) fn bulk_candidates_span_underlays(candidates: &[BulkPathCandidate]) -
         .any(|candidate| candidate.key.underlay != first.key.underlay)
 }
 
-pub(super) fn carrier_diverse_bulk_validation_order(
+pub(in crate::runtime) fn carrier_diverse_bulk_validation_order(
     candidates: Vec<BulkPathCandidate>,
 ) -> Vec<BulkPathCandidate> {
     if !bulk_candidates_span_underlays(&candidates) {
@@ -971,7 +988,7 @@ pub(super) fn carrier_diverse_bulk_validation_order(
     ordered
 }
 
-pub(super) fn udp_reliable_stream_loss_repair_penalty_ms(
+pub(in crate::runtime) fn udp_reliable_stream_loss_repair_penalty_ms(
     snapshot: scheduler::PathSnapshot,
     payload_bytes: usize,
 ) -> f64 {
@@ -989,12 +1006,12 @@ pub(super) fn udp_reliable_stream_loss_repair_penalty_ms(
     expected_repairs * repair_rtt_ms
 }
 
-pub(super) fn default_path_srtt_ms(underlay: UnderlayProtocol) -> f64 {
+pub(in crate::runtime) fn default_path_srtt_ms(underlay: UnderlayProtocol) -> f64 {
     let _ = underlay;
     RELIABLE_INITIAL_RTT.as_secs_f64() * 1000.0
 }
 
-pub(super) fn default_path_rate_bps(underlay: UnderlayProtocol) -> f64 {
+pub(in crate::runtime) fn default_path_rate_bps(underlay: UnderlayProtocol) -> f64 {
     let _ = underlay;
     PATH_OPEN_SCORE_BYTES as f64 * 8.0 / RELIABLE_INITIAL_RTT.as_secs_f64()
 }

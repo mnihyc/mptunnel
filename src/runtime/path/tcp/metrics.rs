@@ -75,9 +75,9 @@ pub(in crate::runtime) fn tcp_capacity_authoritative_rate_bps(
 /// Exact same-socket sender queues used to establish a receipt-rate baseline.
 #[cfg(target_os = "linux")]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(super) struct TcpSenderQueueSnapshot {
-    pub(super) unacked_packets: u32,
-    pub(super) notsent_bytes: u32,
+pub(in crate::runtime) struct TcpSenderQueueSnapshot {
+    pub(in crate::runtime) unacked_packets: u32,
+    pub(in crate::runtime) notsent_bytes: u32,
 }
 
 #[cfg(target_os = "linux")]
@@ -85,7 +85,7 @@ impl TcpSenderQueueSnapshot {
     /// The full typed receiver receipt, not a cumulative TCP ACK, owns rate.
     /// Older unacked control can only delay that receipt; unsent bytes must
     /// drain so the measured train begins at a writer boundary.
-    pub(super) fn is_write_queue_drained(self) -> bool {
+    pub(in crate::runtime) fn is_write_queue_drained(self) -> bool {
         self.notsent_bytes == 0
     }
 }
@@ -104,7 +104,7 @@ impl From<TcpTelemetrySnapshot> for TcpSenderQueueSnapshot {
 /// exact registry registration.
 #[cfg(target_os = "linux")]
 #[derive(Debug)]
-pub(super) struct TcpMetricPublisher {
+pub(in crate::runtime) struct TcpMetricPublisher {
     socket: TcpTelemetrySocket,
     tracker: Option<TcpSenderMetricTracker>,
     next_sample_at: Instant,
@@ -112,7 +112,7 @@ pub(super) struct TcpMetricPublisher {
 
 #[cfg(target_os = "linux")]
 impl TcpMetricPublisher {
-    pub(super) fn capture(socket: &impl AsFd) -> Option<Self> {
+    pub(in crate::runtime) fn capture(socket: &impl AsFd) -> Option<Self> {
         Some(Self {
             socket: TcpTelemetrySocket::capture(socket).ok()?,
             tracker: None,
@@ -121,7 +121,7 @@ impl TcpMetricPublisher {
     }
 
     /// Starts the cumulative sender epoch after authenticated readiness bytes.
-    pub(super) fn begin_epoch(&mut self) {
+    pub(in crate::runtime) fn begin_epoch(&mut self) {
         self.tracker = self
             .socket
             .snapshot()
@@ -132,11 +132,11 @@ impl TcpMetricPublisher {
     }
 
     /// Queries exact sender queues without advancing periodic metric cadence.
-    pub(super) fn sender_queue_snapshot(&self) -> Option<TcpSenderQueueSnapshot> {
+    pub(in crate::runtime) fn sender_queue_snapshot(&self) -> Option<TcpSenderQueueSnapshot> {
         self.socket.snapshot().ok().flatten().map(Into::into)
     }
 
-    pub(super) fn maybe_observe(
+    pub(in crate::runtime) fn maybe_observe(
         &mut self,
         path_id: PathId,
         direction: PathMetricDirection,
@@ -161,17 +161,17 @@ impl TcpMetricPublisher {
 /// an optional response path.
 #[derive(Debug)]
 #[cfg(target_os = "linux")]
-pub(super) struct TcpSenderMetricTracker {
+pub(in crate::runtime) struct TcpSenderMetricTracker {
     baseline: TcpTelemetrySnapshot,
 }
 
 #[cfg(target_os = "linux")]
 impl TcpSenderMetricTracker {
-    pub(super) fn new(baseline: TcpTelemetrySnapshot) -> Self {
+    pub(in crate::runtime) fn new(baseline: TcpTelemetrySnapshot) -> Self {
         Self { baseline }
     }
 
-    pub(super) fn observe(
+    pub(in crate::runtime) fn observe(
         &self,
         path_id: PathId,
         direction: PathMetricDirection,

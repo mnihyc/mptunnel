@@ -9,7 +9,7 @@ use tokio::sync::Mutex as AsyncMutex;
 // and sender_service. Application UDP target flows are handled separately.
 
 #[derive(Clone)]
-pub(super) struct ClientUdpPathSessionHandle {
+pub(in crate::runtime) struct ClientUdpPathSessionHandle {
     runtime: ClientUdpPathSessionRuntime,
     connection: Arc<AsyncMutex<Option<ClientUdpPathConnection>>>,
 }
@@ -22,7 +22,7 @@ impl std::fmt::Debug for ClientUdpPathSessionHandle {
 }
 
 impl ClientUdpPathSessionHandle {
-    pub(super) fn new(runtime: ClientUdpPathSessionRuntime) -> Self {
+    pub(in crate::runtime) fn new(runtime: ClientUdpPathSessionRuntime) -> Self {
         Self {
             runtime,
             connection: Arc::new(AsyncMutex::new(None)),
@@ -30,11 +30,11 @@ impl ClientUdpPathSessionHandle {
     }
 
     #[cfg(test)]
-    pub(super) fn session_id(&self) -> SessionId {
+    pub(in crate::runtime) fn session_id(&self) -> SessionId {
         self.runtime.session_id
     }
 
-    pub(super) async fn open_stream(
+    pub(in crate::runtime) async fn open_stream(
         &self,
         stream_id: StreamId,
         target: TargetAddr,
@@ -73,7 +73,7 @@ impl ClientUdpPathSessionHandle {
         }
     }
 
-    pub(super) async fn open_datagram_stream(
+    pub(in crate::runtime) async fn open_datagram_stream(
         &self,
     ) -> Result<ClientUdpDatagramStream, RuntimeError> {
         let connection = self.ensure_connection().await?;
@@ -109,15 +109,15 @@ impl ClientUdpPathSessionHandle {
 }
 
 #[derive(Clone)]
-pub(super) struct ClientUdpPathSessionRuntime {
-    pub(super) path: PathSpec,
-    pub(super) path_index: usize,
-    pub(super) session_id: SessionId,
-    pub(super) security: SecurityConfig,
-    pub(super) codec_limits: CodecLimits,
-    pub(super) mux_limits: MuxLimits,
-    pub(super) stream_frame_queue: usize,
-    pub(super) health: Arc<Mutex<ClientPathHealth>>,
+pub(in crate::runtime) struct ClientUdpPathSessionRuntime {
+    pub(in crate::runtime) path: PathSpec,
+    pub(in crate::runtime) path_index: usize,
+    pub(in crate::runtime) session_id: SessionId,
+    pub(in crate::runtime) security: SecurityConfig,
+    pub(in crate::runtime) codec_limits: CodecLimits,
+    pub(in crate::runtime) mux_limits: MuxLimits,
+    pub(in crate::runtime) stream_frame_queue: usize,
+    pub(in crate::runtime) health: Arc<Mutex<ClientPathHealth>>,
 }
 
 struct ClientUdpPathConnection {
@@ -126,12 +126,12 @@ struct ClientUdpPathConnection {
 }
 
 #[derive(Debug)]
-pub(super) struct UdpPathEndpoint {
+pub(in crate::runtime) struct UdpPathEndpoint {
     endpoint: quic_carrier::Endpoint,
 }
 
 #[derive(Debug, Clone)]
-pub(super) struct UdpPathConnection {
+pub(in crate::runtime) struct UdpPathConnection {
     connection: quic_carrier::Connection,
 }
 
@@ -161,13 +161,13 @@ struct QuicPathMetricTracker {
 }
 
 #[derive(Debug)]
-pub(super) struct UdpPathSendStream {
+pub(in crate::runtime) struct UdpPathSendStream {
     stream: quic_carrier::SendStream,
     connection: UdpPathConnection,
 }
 
 #[derive(Debug)]
-pub(super) struct UdpPathRecvStream {
+pub(in crate::runtime) struct UdpPathRecvStream {
     stream: quic_carrier::RecvStream,
 }
 
@@ -216,7 +216,7 @@ impl UdpPathEndpoint {
     }
 
     #[cfg(test)]
-    pub(super) fn local_addr(&self) -> Result<SocketAddr, std::io::Error> {
+    pub(in crate::runtime) fn local_addr(&self) -> Result<SocketAddr, std::io::Error> {
         self.endpoint.local_addr()
     }
 }
@@ -745,14 +745,14 @@ impl QuicPathMetricTracker {
     }
 }
 
-pub(super) async fn udp_path_read_frame(
+pub(in crate::runtime) async fn udp_path_read_frame(
     recv: &mut UdpPathRecvStream,
     codec_limits: CodecLimits,
 ) -> Result<Frame, RuntimeError> {
     Ok(quic_carrier::read_frame(&mut recv.stream, codec_limits).await?)
 }
 
-pub(super) async fn udp_path_write_frame(
+pub(in crate::runtime) async fn udp_path_write_frame(
     send: &mut UdpPathSendStream,
     frame: &Frame,
     codec_limits: CodecLimits,
@@ -880,7 +880,9 @@ async fn flush_udp_frame_batch_with_path_proofs(
     Ok(())
 }
 
-pub(super) fn udp_path_finish_stream(send: &mut UdpPathSendStream) -> Result<(), RuntimeError> {
+pub(in crate::runtime) fn udp_path_finish_stream(
+    send: &mut UdpPathSendStream,
+) -> Result<(), RuntimeError> {
     Ok(quic_carrier::finish_stream(&mut send.stream)?)
 }
 
@@ -1008,21 +1010,21 @@ fn quic_path_metrics_poll_interval(metrics: UdpPathMetrics) -> Duration {
     }
 }
 
-pub(super) struct ClientUdpDatagramStream {
-    pub(super) send: UdpPathSendStream,
-    pub(super) frames: mpsc::Receiver<Result<Frame, RuntimeError>>,
-    pub(super) runtime: ClientUdpPathSessionRuntime,
-    pub(super) path_id: PathId,
+pub(in crate::runtime) struct ClientUdpDatagramStream {
+    pub(in crate::runtime) send: UdpPathSendStream,
+    pub(in crate::runtime) frames: mpsc::Receiver<Result<Frame, RuntimeError>>,
+    pub(in crate::runtime) runtime: ClientUdpPathSessionRuntime,
+    pub(in crate::runtime) path_id: PathId,
 }
 
-pub(super) async fn bind_server_udp_endpoint(
+pub(in crate::runtime) async fn bind_server_udp_endpoint(
     path: &PathSpec,
     context: &ServerPathContext,
 ) -> Result<UdpPathEndpoint, RuntimeError> {
     UdpPathEndpoint::bind_server(path, context).await
 }
 
-pub(super) async fn run_server_udp_listener(
+pub(in crate::runtime) async fn run_server_udp_listener(
     endpoint: UdpPathEndpoint,
     context: ServerPathContext,
 ) -> Result<(), RuntimeError> {

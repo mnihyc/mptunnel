@@ -4,15 +4,15 @@ use std::sync::atomic::{AtomicU64, Ordering};
 static NEXT_PATH_PROOF_ID: AtomicU64 = AtomicU64::new(1);
 
 #[derive(Debug, Clone, Copy)]
-pub(super) struct PathProofObservation {
-    pub(super) proof_id: u64,
-    pub(super) bytes: u64,
-    pub(super) elapsed: Duration,
-    pub(super) sent_at: Instant,
+pub(in crate::runtime) struct PathProofObservation {
+    pub(in crate::runtime) proof_id: u64,
+    pub(in crate::runtime) bytes: u64,
+    pub(in crate::runtime) elapsed: Duration,
+    pub(in crate::runtime) sent_at: Instant,
 }
 
 #[derive(Default)]
-pub(super) struct PathProofTracker {
+pub(in crate::runtime) struct PathProofTracker {
     pending: HashMap<(PathId, u64), PendingPathProof>,
 }
 
@@ -22,7 +22,7 @@ struct PendingPathProof {
 }
 
 impl PathProofTracker {
-    pub(super) fn record_sent_frame(&mut self, frame: &Frame) {
+    pub(in crate::runtime) fn record_sent_frame(&mut self, frame: &Frame) {
         let Frame::PathProofData {
             path_id,
             proof_id,
@@ -52,7 +52,7 @@ impl PathProofTracker {
         );
     }
 
-    pub(super) fn acknowledge(
+    pub(in crate::runtime) fn acknowledge(
         &mut self,
         path_id: PathId,
         proof_id: u64,
@@ -106,7 +106,11 @@ fn allocated_path_proof_data_frame(path_id: PathId, mux_limits: MuxLimits) -> (u
     (proof_id, frame)
 }
 
-pub(super) fn path_proof_ack_frame(path_id: PathId, proof_id: u64, payload_len: usize) -> Frame {
+pub(in crate::runtime) fn path_proof_ack_frame(
+    path_id: PathId,
+    proof_id: u64,
+    payload_len: usize,
+) -> Frame {
     Frame::PathProofAck {
         path_id,
         proof_id,
@@ -114,7 +118,7 @@ pub(super) fn path_proof_ack_frame(path_id: PathId, proof_id: u64, payload_len: 
     }
 }
 
-pub(super) fn enqueue_path_proof_frame(
+pub(in crate::runtime) fn enqueue_path_proof_frame(
     commands: &ReliablePathCommandSender,
     path_id: PathId,
     mux_limits: MuxLimits,
@@ -124,7 +128,7 @@ pub(super) fn enqueue_path_proof_frame(
     Ok(proof_id)
 }
 
-pub(super) fn enqueue_stream_ordered_path_proof_frame(
+pub(in crate::runtime) fn enqueue_stream_ordered_path_proof_frame(
     commands: &ReliablePathCommandSender,
     path_id: PathId,
     mux_limits: MuxLimits,
@@ -135,7 +139,7 @@ pub(super) fn enqueue_stream_ordered_path_proof_frame(
     Ok(proof_id)
 }
 
-pub(super) fn path_proof_metrics(
+pub(in crate::runtime) fn path_proof_metrics(
     path_id: PathId,
     underlay: UnderlayProtocol,
     direction: PathMetricDirection,

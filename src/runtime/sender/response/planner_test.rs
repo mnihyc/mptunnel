@@ -6987,6 +6987,45 @@ fn response_service_handoff_drain_blocks_only_its_own_binding() {
     );
 }
 
+#[test]
+fn response_readiness_preview_does_not_start_handoff_drain() {
+    let fixture = response_service_handoff_drain_fixture();
+    let payload_bytes = reliable_bulk_carrier_feed_quantum_bytes(MuxLimits::default());
+    let before = fixture.binding.response_scheduling_snapshot();
+    assert!(before.response_service_handoff_drain.is_none());
+
+    for _ in 0..2 {
+        assert!(preview_response_data_payload_with_ordered_debt(
+            &fixture.stream,
+            FlowLane::Throughput,
+            payload_bytes as u64,
+            payload_bytes,
+            payload_bytes,
+        ));
+    }
+
+    let after_preview = fixture.binding.response_scheduling_snapshot();
+    assert_eq!(after_preview.generation, before.generation);
+    assert!(after_preview.response_service_handoff_drain.is_none());
+    assert!(matches!(
+        plan_response_data_dispatch_with_ordered_debt_impl(
+            &fixture.stream,
+            FlowLane::Throughput,
+            payload_bytes as u64,
+            payload_bytes,
+            payload_bytes,
+        ),
+        Err(RuntimeError::SenderServiceBlocked)
+    ));
+    assert!(
+        fixture
+            .binding
+            .response_scheduling_snapshot()
+            .response_service_handoff_drain
+            .is_some()
+    );
+}
+
 #[tokio::test]
 async fn response_service_handoff_drain_holds_raw_offset_until_frontier_commit() {
     let mut fixture = response_service_handoff_drain_fixture();

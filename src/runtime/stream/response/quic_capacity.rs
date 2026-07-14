@@ -253,13 +253,12 @@ impl ServerPathLaneTrackerState {
             .unwrap_or(0)
     }
 
-    pub(super) fn expire_quic_capacity_calibration_at(
-        &mut self,
+    fn quic_capacity_calibration_removal_reason_at(
+        &self,
         session_id: SessionId,
         now: Instant,
-    ) {
-        let capacity_removal = self
-            .session(session_id)
+    ) -> Option<(&'static str, &'static str)> {
+        self.session(session_id)
             .and_then(|session| session.quic_capacity_calibration())
             .and_then(|reservation| {
                 if !reservation.command_ticket.is_current()
@@ -278,7 +277,24 @@ impl ServerPathLaneTrackerState {
                     }
                     _ => None,
                 }
-            });
+            })
+    }
+
+    pub(super) fn quic_capacity_calibration_requires_maintenance_at(
+        &self,
+        session_id: SessionId,
+        now: Instant,
+    ) -> bool {
+        self.quic_capacity_calibration_removal_reason_at(session_id, now)
+            .is_some()
+    }
+
+    pub(super) fn expire_quic_capacity_calibration_at(
+        &mut self,
+        session_id: SessionId,
+        now: Instant,
+    ) {
+        let capacity_removal = self.quic_capacity_calibration_removal_reason_at(session_id, now);
         if let Some((phase, reason)) = capacity_removal {
             let reservation = self
                 .session_mut(session_id)

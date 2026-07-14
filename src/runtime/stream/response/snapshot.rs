@@ -112,6 +112,16 @@ impl ResponseStreamBinding {
             .response_scheduling_snapshot(self.session_id)
     }
 
+    pub(in crate::runtime) fn maintain_response_session_operations(&self) -> bool {
+        let changed = self
+            .lane_tracker
+            .maintain_response_session_operations(self.session_id);
+        if changed {
+            self.notify_update();
+        }
+        changed
+    }
+
     pub(in crate::runtime) fn sender_path_targets(
         &self,
         lane: FlowLane,

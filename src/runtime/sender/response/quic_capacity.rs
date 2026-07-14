@@ -16,7 +16,8 @@ use crate::mux::MuxLimits;
 use crate::protocol::{StreamOpenRole, UnderlayProtocol};
 use crate::runtime::stream::response::{
     MAX_RESPONSE_QUIC_CAPACITY_CALIBRATION_ATTEMPTS_PER_PATH,
-    ResponseQuicCapacityCalibrationRequest, ResponseSenderPathTarget, ResponseStreamBinding,
+    MIN_ACTIVE_RESPONSE_FLOWS_FOR_SAME_FAMILY_DISCOVERY, ResponseQuicCapacityCalibrationRequest,
+    ResponseSenderPathTarget, ResponseStreamBinding,
 };
 use crate::scheduler::FlowLane;
 use std::time::Duration;
@@ -119,6 +120,7 @@ pub(super) fn try_start_response_quic_capacity_calibration(
     lane: FlowLane,
     ordered_data_owner: Option<CarrierPathKey>,
     service_family_loads: ResponseServiceFamilyLoads,
+    active_response_flows: u32,
     planner_generation: u64,
     lane_generation: u64,
     model_generation: u64,
@@ -126,19 +128,16 @@ pub(super) fn try_start_response_quic_capacity_calibration(
     spent_bytes: u64,
     handoff_drain_active: bool,
 ) -> bool {
-    if already_reserved || handoff_drain_active || !service_family_loads.needs_diversification() {
-        return false;
-    }
-    let remaining_probe_bytes =
-        reliable_capacity_calibration_session_limit_bytes(binding.mux_limits())
-            .saturating_sub(spent_bytes);
-    let Some(target) = select_response_quic_capacity_calibration_target(
+    let Some(target) = select_response_quic_capacity_calibration_start(
         targets,
         lane,
         ordered_data_owner,
         service_family_loads,
         binding.mux_limits(),
-        remaining_probe_bytes,
+        active_response_flows,
+        already_reserved,
+        spent_bytes,
+        handoff_drain_active,
     ) else {
         return false;
     };
@@ -163,6 +162,37 @@ pub(super) fn try_start_response_quic_capacity_calibration(
             proof_validity: response_quic_capacity_proof_validity(&target),
             lease,
         },
+    )
+}
+
+/// Pure start decision shared by readiness preview and the mutating apply path.
+pub(super) fn select_response_quic_capacity_calibration_start(
+    targets: &[ResponseSenderPathTarget],
+    lane: FlowLane,
+    ordered_data_owner: Option<CarrierPathKey>,
+    service_family_loads: ResponseServiceFamilyLoads,
+    mux_limits: MuxLimits,
+    active_response_flows: u32,
+    already_reserved: bool,
+    spent_bytes: u64,
+    handoff_drain_active: bool,
+) -> Option<ResponseSenderPathTarget> {
+    if already_reserved
+        || handoff_drain_active
+        || active_response_flows < MIN_ACTIVE_RESPONSE_FLOWS_FOR_SAME_FAMILY_DISCOVERY
+        || !service_family_loads.needs_diversification()
+    {
+        return None;
+    }
+    let remaining_probe_bytes =
+        reliable_capacity_calibration_session_limit_bytes(mux_limits).saturating_sub(spent_bytes);
+    select_response_quic_capacity_calibration_target(
+        targets,
+        lane,
+        ordered_data_owner,
+        service_family_loads,
+        mux_limits,
+        remaining_probe_bytes,
     )
 }
 

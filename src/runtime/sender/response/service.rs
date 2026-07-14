@@ -230,14 +230,13 @@ impl ServerResponseSenderService {
                 payload.len(),
             )
             .is_some_and(|payload_bytes| {
-                plan_response_data_payload_with_ordered_debt_impl(
+                preview_response_data_payload_with_ordered_debt(
                     path_stream,
                     queued.data_lane.unwrap_or(relay_lane),
                     send_stream.next_offset(),
                     payload_bytes,
                     ordered_owner_debt_bytes,
                 )
-                .is_ok()
             }),
             ReliableRelayQueuedWorkKind::Repair { frame, cause } => {
                 response_frame_has_carrier_credit(

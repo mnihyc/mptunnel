@@ -21,13 +21,16 @@ use super::diagnostics::{
     ResponseBulkCandidateDiag, lab_response_bulk_output_candidate,
     lab_response_bulk_output_selected,
 };
-use super::quic_capacity::try_start_response_quic_capacity_calibration;
+use super::quic_capacity::{
+    select_response_quic_capacity_calibration_start, try_start_response_quic_capacity_calibration,
+};
 use super::tcp_capacity::{
     ResponseAckClockCalibrationCommit, ResponseAckClockCalibrationRetirementIntent,
     response_ack_clock_calibration_blocks_generic_owner,
     response_ack_clock_calibration_needs_opportunity_decision,
     response_ack_clock_calibration_pending, response_calibration_service_reservoir_has_credit,
-    select_response_ack_clock_calibration_target, try_start_response_tcp_capacity_probe,
+    select_response_ack_clock_calibration_target, select_response_tcp_capacity_probe_start,
+    try_start_response_tcp_capacity_probe,
 };
 use super::*;
 use crate::model::admission::{
@@ -73,6 +76,19 @@ pub(super) enum ResponseDataDispatchTarget {
 #[derive(Clone)]
 pub(super) struct ResponseDataDispatchPlan {
     pub(super) primary: ResponseDataDispatchTarget,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum ResponsePlanningMode {
+    /// Reports whether dispatch or an apply transition can make progress.
+    Preview,
+    /// Owns expiry, discovery start, drain, and calibration retirement.
+    Apply,
+}
+
+enum ResponseDataPlanningOutcome {
+    Dispatch(ResponseDataDispatchPlan),
+    ApplyRequired,
 }
 
 impl ResponseDataDispatchPlan {
@@ -1792,13 +1808,38 @@ pub(super) fn plan_response_data_dispatch_with_ordered_debt_impl(
     payload_bytes: usize,
     ordered_owner_debt_bytes: usize,
 ) -> Result<ResponseDataDispatchPlan, RuntimeError> {
+    match evaluate_response_data_dispatch_with_ordered_debt(
+        stream,
+        relay_lane,
+        next_offset,
+        payload_bytes,
+        ordered_owner_debt_bytes,
+        ResponsePlanningMode::Apply,
+    )? {
+        ResponseDataPlanningOutcome::Dispatch(planned) => Ok(planned),
+        ResponseDataPlanningOutcome::ApplyRequired => {
+            unreachable!("apply mode resolves maintenance before returning")
+        }
+    }
+}
+
+fn evaluate_response_data_dispatch_with_ordered_debt(
+    stream: &ReliablePathStream,
+    relay_lane: FlowLane,
+    next_offset: u64,
+    payload_bytes: usize,
+    ordered_owner_debt_bytes: usize,
+    mode: ResponsePlanningMode,
+) -> Result<ResponseDataPlanningOutcome, RuntimeError> {
     match &stream.output {
         ReliablePathStreamOutput::Fixed(fixed) => {
             let lane = reliable_work_lane_to_carrier_lane(ReliableWorkClass::Data, relay_lane);
             if fixed.commands().can_enqueue_lane_now(lane) {
-                Ok(ResponseDataDispatchPlan {
-                    primary: ResponseDataDispatchTarget::Fixed(fixed.clone()),
-                })
+                Ok(ResponseDataPlanningOutcome::Dispatch(
+                    ResponseDataDispatchPlan {
+                        primary: ResponseDataDispatchTarget::Fixed(fixed.clone()),
+                    },
+                ))
             } else {
                 Err(RuntimeError::SenderServiceBlocked)
             }
@@ -1806,40 +1847,84 @@ pub(super) fn plan_response_data_dispatch_with_ordered_debt_impl(
         ReliablePathStreamOutput::Switchable(binding) => {
             let mut may_resnapshot_after_retirement = true;
             loop {
+                if mode == ResponsePlanningMode::Apply
+                    && binding.maintain_response_session_operations()
+                {
+                    continue;
+                }
                 let (planner_generation, subflow_set) = binding.subflow_state_snapshot();
                 let session_scheduling = binding.response_scheduling_snapshot();
+                if mode == ResponsePlanningMode::Preview
+                    && session_scheduling.operation_maintenance_due
+                {
+                    return Ok(ResponseDataPlanningOutcome::ApplyRequired);
+                }
                 let lane_generation = session_scheduling.generation;
                 let active_response_flows = session_scheduling.active_response_flows;
                 let model_generation = binding.response_model_generation();
                 let lower_flights = binding.lower_flights_before_offset(next_offset);
                 let targets = binding.sender_path_targets(relay_lane, payload_bytes);
                 let ordered_data_owner = binding.ordered_data_owner();
-                if try_start_response_tcp_capacity_probe(
-                    binding,
-                    &targets,
-                    relay_lane,
-                    ordered_data_owner,
-                    session_scheduling.service_family_loads,
-                    lane_generation,
-                    session_scheduling.tcp_capacity_probe_reserved,
-                )? {
+                if mode == ResponsePlanningMode::Preview
+                    && select_response_tcp_capacity_probe_start(
+                        &targets,
+                        relay_lane,
+                        ordered_data_owner,
+                        session_scheduling.service_family_loads,
+                        binding.mux_limits(),
+                        session_scheduling.tcp_capacity_probe_reserved,
+                    )
+                    .is_some()
+                {
+                    return Ok(ResponseDataPlanningOutcome::ApplyRequired);
+                }
+                if mode == ResponsePlanningMode::Apply
+                    && try_start_response_tcp_capacity_probe(
+                        binding,
+                        &targets,
+                        relay_lane,
+                        ordered_data_owner,
+                        session_scheduling.service_family_loads,
+                        lane_generation,
+                        session_scheduling.tcp_capacity_probe_reserved,
+                    )?
+                {
                     // Reservation advances the shared generation; resnapshot
                     // before any product decision.
                     continue;
                 }
-                if try_start_response_quic_capacity_calibration(
-                    binding,
-                    &targets,
-                    relay_lane,
-                    ordered_data_owner,
-                    session_scheduling.service_family_loads,
-                    planner_generation,
-                    lane_generation,
-                    model_generation,
-                    session_scheduling.quic_capacity_calibration_reserved,
-                    session_scheduling.quic_capacity_calibration_spent_bytes,
-                    session_scheduling.response_service_handoff_drain.is_some(),
-                ) {
+                if mode == ResponsePlanningMode::Preview
+                    && select_response_quic_capacity_calibration_start(
+                        &targets,
+                        relay_lane,
+                        ordered_data_owner,
+                        session_scheduling.service_family_loads,
+                        binding.mux_limits(),
+                        active_response_flows,
+                        session_scheduling.quic_capacity_calibration_reserved,
+                        session_scheduling.quic_capacity_calibration_spent_bytes,
+                        session_scheduling.response_service_handoff_drain.is_some(),
+                    )
+                    .is_some()
+                {
+                    return Ok(ResponseDataPlanningOutcome::ApplyRequired);
+                }
+                if mode == ResponsePlanningMode::Apply
+                    && try_start_response_quic_capacity_calibration(
+                        binding,
+                        &targets,
+                        relay_lane,
+                        ordered_data_owner,
+                        session_scheduling.service_family_loads,
+                        active_response_flows,
+                        planner_generation,
+                        lane_generation,
+                        model_generation,
+                        session_scheduling.quic_capacity_calibration_reserved,
+                        session_scheduling.quic_capacity_calibration_spent_bytes,
+                        session_scheduling.response_service_handoff_drain.is_some(),
+                    )
+                {
                     // Reservation and command admission change the session and
                     // response-model generations. Replan ordinary OwnerData.
                     continue;
@@ -1919,16 +2004,18 @@ pub(super) fn plan_response_data_dispatch_with_ordered_debt_impl(
                         selected.admission,
                         payload_bytes,
                     );
-                    return Ok(ResponseDataDispatchPlan {
-                        primary: ResponseDataDispatchTarget::Switchable {
-                            binding: binding.clone(),
-                            target: selected.target.into(),
-                            role: PathRuntimeRole::Service,
-                            service_handoff_commit: selected.service_handoff_commit,
-                            subflow_set_commit: None,
-                            ack_clock_calibration_commit: None,
+                    return Ok(ResponseDataPlanningOutcome::Dispatch(
+                        ResponseDataDispatchPlan {
+                            primary: ResponseDataDispatchTarget::Switchable {
+                                binding: binding.clone(),
+                                target: selected.target.into(),
+                                role: PathRuntimeRole::Service,
+                                service_handoff_commit: selected.service_handoff_commit,
+                                subflow_set_commit: None,
+                                ack_clock_calibration_commit: None,
+                            },
                         },
-                    });
+                    ));
                 }
                 let handoff_candidate = (handoff_context_ready && !another_binding_is_draining)
                     .then(|| {
@@ -1955,10 +2042,16 @@ pub(super) fn plan_response_data_dispatch_with_ordered_debt_impl(
                         // critical repair still preempt the blocked data lane.
                         return Err(RuntimeError::SenderServiceBlocked);
                     }
+                    if mode == ResponsePlanningMode::Preview {
+                        return Ok(ResponseDataPlanningOutcome::ApplyRequired);
+                    }
                     binding.cancel_response_service_handoff_drain("eligibility_regressed");
                     continue;
                 }
                 if let Some(candidate) = handoff_candidate {
+                    if mode == ResponsePlanningMode::Preview {
+                        return Ok(ResponseDataPlanningOutcome::ApplyRequired);
+                    }
                     let lower_flight_bytes = lower_flights
                         .iter()
                         .fold(0u64, |total, flight| total.saturating_add(flight.bytes));
@@ -1987,7 +2080,7 @@ pub(super) fn plan_response_data_dispatch_with_ordered_debt_impl(
                             mode: candidate.mode,
                             capacity_proof: response_service_handoff_start_capacity_proof(
                                 &candidate.target,
-                                Instant::now(),
+                                session_scheduling.observed_at,
                             ),
                             outstanding_owner_bytes,
                             lease,
@@ -2012,6 +2105,9 @@ pub(super) fn plan_response_data_dispatch_with_ordered_debt_impl(
                         &mut retirement_intents,
                     );
                 let mut retired_any = false;
+                if mode == ResponsePlanningMode::Preview && !retirement_intents.is_empty() {
+                    return Ok(ResponseDataPlanningOutcome::ApplyRequired);
+                }
                 if may_resnapshot_after_retirement {
                     for mut intent in retirement_intents {
                         intent.planner_generation = planner_generation;
@@ -2068,19 +2164,72 @@ pub(super) fn plan_response_data_dispatch_with_ordered_debt_impl(
                     target.has_sender_evidence,
                     target.has_bulk_rate_evidence,
                 );
-                return Ok(ResponseDataDispatchPlan {
-                    primary: ResponseDataDispatchTarget::Switchable {
-                        binding: binding.clone(),
-                        target: target.into(),
-                        role,
-                        service_handoff_commit: selected.service_handoff_commit,
-                        subflow_set_commit: selected.subflow_set_commit,
-                        ack_clock_calibration_commit: selected.ack_clock_calibration_commit,
+                return Ok(ResponseDataPlanningOutcome::Dispatch(
+                    ResponseDataDispatchPlan {
+                        primary: ResponseDataDispatchTarget::Switchable {
+                            binding: binding.clone(),
+                            target: target.into(),
+                            role,
+                            service_handoff_commit: selected.service_handoff_commit,
+                            subflow_set_commit: selected.subflow_set_commit,
+                            ack_clock_calibration_commit: selected.ack_clock_calibration_commit,
+                        },
                     },
-                });
+                ));
             }
         }
     }
+}
+
+/// Readiness must not advance protocol generations or reserve carrier work.
+pub(super) fn preview_response_data_payload_with_ordered_debt(
+    path_stream: &ReliablePathStream,
+    relay_lane: FlowLane,
+    next_offset: u64,
+    payload_bytes: usize,
+    ordered_owner_debt_bytes: usize,
+) -> bool {
+    let calibration_remaining = match &path_stream.output {
+        ReliablePathStreamOutput::Switchable(binding) => {
+            binding.active_tcp_ack_clock_calibration_remaining_bytes()
+        }
+        ReliablePathStreamOutput::Fixed(_) => None,
+    };
+    if let Some(remaining) = calibration_remaining {
+        let calibration_payload_bytes = payload_bytes.min(remaining);
+        match evaluate_response_data_dispatch_with_ordered_debt(
+            path_stream,
+            relay_lane,
+            next_offset,
+            calibration_payload_bytes,
+            ordered_owner_debt_bytes,
+            ResponsePlanningMode::Preview,
+        ) {
+            Ok(ResponseDataPlanningOutcome::ApplyRequired) => return true,
+            Ok(ResponseDataPlanningOutcome::Dispatch(planned))
+                if response_plan_is_ack_clock_calibration(&planned) =>
+            {
+                return true;
+            }
+            Ok(ResponseDataPlanningOutcome::Dispatch(_))
+                if calibration_payload_bytes == payload_bytes =>
+            {
+                return true;
+            }
+            Err(_) if calibration_payload_bytes == payload_bytes => return false,
+            Ok(ResponseDataPlanningOutcome::Dispatch(_)) | Err(_) => {}
+        }
+    }
+
+    evaluate_response_data_dispatch_with_ordered_debt(
+        path_stream,
+        relay_lane,
+        next_offset,
+        payload_bytes,
+        ordered_owner_debt_bytes,
+        ResponsePlanningMode::Preview,
+    )
+    .is_ok()
 }
 
 pub(super) fn response_plan_is_ack_clock_calibration(planned: &ResponseDataDispatchPlan) -> bool {

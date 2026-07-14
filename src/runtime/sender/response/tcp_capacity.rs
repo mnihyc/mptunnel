@@ -122,15 +122,13 @@ pub(super) fn try_start_response_tcp_capacity_probe(
     lane_generation: u64,
     already_reserved: bool,
 ) -> Result<bool, RuntimeError> {
-    if already_reserved {
-        return Ok(false);
-    }
-    let Some((target, train_bytes)) = select_response_tcp_capacity_probe_target(
+    let Some((target, train_bytes)) = select_response_tcp_capacity_probe_start(
         targets,
         lane,
         ordered_data_owner,
         service_family_loads,
         binding.mux_limits(),
+        already_reserved,
     ) else {
         return Ok(false);
     };
@@ -167,6 +165,27 @@ pub(super) fn try_start_response_tcp_capacity_probe(
         ),
     );
     Ok(true)
+}
+
+/// Pure start decision shared by readiness preview and the mutating apply path.
+pub(super) fn select_response_tcp_capacity_probe_start(
+    targets: &[ResponseSenderPathTarget],
+    lane: FlowLane,
+    ordered_data_owner: Option<CarrierPathKey>,
+    service_family_loads: ResponseServiceFamilyLoads,
+    mux_limits: MuxLimits,
+    already_reserved: bool,
+) -> Option<(ResponseSenderPathTarget, u64)> {
+    if already_reserved {
+        return None;
+    }
+    select_response_tcp_capacity_probe_target(
+        targets,
+        lane,
+        ordered_data_owner,
+        service_family_loads,
+        mux_limits,
+    )
 }
 
 pub(super) fn select_response_tcp_capacity_probe_target(

@@ -392,8 +392,13 @@ fn quic_capacity_reservation_expires_and_completion_releases_probe_slot() {
         1,
         Instant::now() - Duration::from_millis(1),
     ));
+    let observed_expiry = tracker.response_scheduling_snapshot(session_id);
+    assert!(observed_expiry.quic_capacity_calibration_reserved);
+    assert!(observed_expiry.operation_maintenance_due);
+    assert!(tracker.maintain_response_session_operations(session_id));
     let expired = tracker.response_scheduling_snapshot(session_id);
     assert!(!expired.quic_capacity_calibration_reserved);
+    assert!(!expired.operation_maintenance_due);
 
     assert!(tracker.try_reserve_test_quic_capacity_calibration(
         session_id,

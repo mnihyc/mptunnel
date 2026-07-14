@@ -333,15 +333,23 @@ impl ServerPathLaneTrackerState {
             .copied()
     }
 
+    pub(super) fn response_service_handoff_drain_requires_maintenance_at(
+        &self,
+        session_id: SessionId,
+        now: Instant,
+    ) -> bool {
+        self.session(session_id)
+            .and_then(|session| session.response_service_handoff_drain())
+            .is_some_and(|reservation| now >= reservation.expires_at)
+    }
+
     pub(super) fn expire_response_service_handoff_drain_at(
         &mut self,
         session_id: SessionId,
         now: Instant,
     ) {
-        let drain_expired = self
-            .session(session_id)
-            .and_then(|session| session.response_service_handoff_drain())
-            .is_some_and(|reservation| now >= reservation.expires_at);
+        let drain_expired =
+            self.response_service_handoff_drain_requires_maintenance_at(session_id, now);
         if drain_expired {
             let reservation = self
                 .session_mut(session_id)

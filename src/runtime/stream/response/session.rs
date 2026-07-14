@@ -19,6 +19,7 @@ use std::time::Instant;
 
 #[derive(Debug, Clone, Copy)]
 pub(in crate::runtime) struct ResponseSessionSchedulingSnapshot {
+    pub(in crate::runtime) observed_at: Instant,
     pub(in crate::runtime) generation: u64,
     pub(in crate::runtime) active_response_flows: u32,
     pub(in crate::runtime) service_family_loads: ResponseServiceFamilyLoads,
@@ -27,6 +28,7 @@ pub(in crate::runtime) struct ResponseSessionSchedulingSnapshot {
     pub(in crate::runtime) quic_capacity_calibration_spent_bytes: u64,
     pub(in crate::runtime) response_service_handoff_drain:
         Option<ResponseServiceHandoffDrainReservation>,
+    pub(in crate::runtime) operation_maintenance_due: bool,
 }
 
 #[derive(Debug, Clone, Copy, Default)]
@@ -443,10 +445,8 @@ impl ServerPathLaneTracker {
         &self,
         session_id: SessionId,
     ) -> ResponseSessionSchedulingSnapshot {
-        let mut state = self.state.lock().expect("server path lane tracker lock");
+        let state = self.state.lock().expect("server path lane tracker lock");
         let now = Instant::now();
-        state.expire_quic_capacity_calibration_at(session_id, now);
-        state.expire_response_service_handoff_drain_at(session_id, now);
         let session = state.session(session_id);
         let generation = session.map(ResponseSessionState::generation).unwrap_or(0);
         let active_response_flows = session
@@ -456,6 +456,7 @@ impl ServerPathLaneTracker {
             .map(|session| session.load().service_family_loads())
             .unwrap_or_default();
         ResponseSessionSchedulingSnapshot {
+            observed_at: now,
             generation,
             active_response_flows,
             service_family_loads,
@@ -466,7 +467,27 @@ impl ServerPathLaneTracker {
             quic_capacity_calibration_spent_bytes: state
                 .quic_capacity_calibration_spent_bytes(session_id),
             response_service_handoff_drain: state.response_service_handoff_drain(session_id),
+            operation_maintenance_due: state
+                .quic_capacity_calibration_requires_maintenance_at(session_id, now)
+                || state.response_service_handoff_drain_requires_maintenance_at(session_id, now),
         }
+    }
+
+    /// Expiry is an apply transition. Snapshot readers only report that this
+    /// maintenance is due so readiness cannot mutate session generations.
+    pub(super) fn maintain_response_session_operations(&self, session_id: SessionId) -> bool {
+        let mut state = self.state.lock().expect("server path lane tracker lock");
+        let now = Instant::now();
+        let maintenance_due = state
+            .quic_capacity_calibration_requires_maintenance_at(session_id, now)
+            || state.response_service_handoff_drain_requires_maintenance_at(session_id, now);
+        if !maintenance_due {
+            return false;
+        }
+        state.expire_quic_capacity_calibration_at(session_id, now);
+        state.expire_response_service_handoff_drain_at(session_id, now);
+        state.maybe_reclaim_session(session_id);
+        true
     }
 
     pub(super) fn with_matching_generation<R>(

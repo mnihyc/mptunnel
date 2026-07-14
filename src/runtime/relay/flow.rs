@@ -247,4 +247,5 @@ pub(in crate::runtime) fn reliable_latency_startup_owner_credit_remaining_bytes(
 }
 
 #[cfg(test)]
+#[path = "flow_test.rs"]
 mod tests;

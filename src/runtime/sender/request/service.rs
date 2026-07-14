@@ -3698,4 +3698,5 @@ fn relay_path_can_enqueue_frame_for_cause_now(
 }
 
 #[cfg(test)]
+#[path = "service_test.rs"]
 mod tests;

@@ -3239,4 +3239,5 @@ where
 }
 
 #[cfg(test)]
+#[path = "io_test.rs"]
 mod tests;

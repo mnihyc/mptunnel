@@ -1459,4 +1459,5 @@ pub(super) fn sender_service_frame_kind(frame: &Frame) -> &'static str {
 }
 
 #[cfg(test)]
+#[path = "response_admission_test.rs"]
 mod tests;

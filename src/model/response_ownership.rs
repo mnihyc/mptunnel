@@ -115,4 +115,5 @@ impl ResponseSameFamilyReservoir {
 }
 
 #[cfg(test)]
+#[path = "response_ownership_test.rs"]
 mod tests;

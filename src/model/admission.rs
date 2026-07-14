@@ -949,4 +949,5 @@ fn bulk_bbr_inflight_bytes(bdp_bytes: u64) -> u64 {
 }
 
 #[cfg(test)]
+#[path = "admission_test.rs"]
 mod tests;

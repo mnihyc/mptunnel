@@ -89,4 +89,5 @@ impl CapacityReceiveTracker {
 }
 
 #[cfg(test)]
+#[path = "path_capacity_test.rs"]
 mod tests;

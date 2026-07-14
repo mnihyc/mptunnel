@@ -864,4 +864,5 @@ impl Default for ServerReliableStreamRegistry {
 }
 
 #[cfg(test)]
+#[path = "registry_test.rs"]
 mod tests;

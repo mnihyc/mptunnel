@@ -1328,4 +1328,5 @@ fn reliable_path_frame_kind(frame: &Frame) -> &'static str {
 }
 
 #[cfg(test)]
+#[path = "commands_test.rs"]
 mod tests;

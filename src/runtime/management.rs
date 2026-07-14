@@ -1156,4 +1156,5 @@ fn unix_millis() -> u64 {
 }
 
 #[cfg(test)]
+#[path = "management_test.rs"]
 mod tests;

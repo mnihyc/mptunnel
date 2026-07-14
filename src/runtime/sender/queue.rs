@@ -580,4 +580,5 @@ pub(in crate::runtime) fn reliable_relay_sender_queue_read_budget(
 }
 
 #[cfg(test)]
+#[path = "queue_test.rs"]
 mod tests;

@@ -186,4 +186,5 @@ pub(crate) fn request_tcp_candidate_turnover_authorized(
 }
 
 #[cfg(test)]
+#[path = "evidence_test.rs"]
 mod tests;

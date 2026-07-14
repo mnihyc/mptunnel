@@ -3537,4 +3537,5 @@ pub(in crate::runtime) fn reliable_relay_stall_timeout(
 }
 
 #[cfg(test)]
+#[path = "control_test.rs"]
 mod tests;

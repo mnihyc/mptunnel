@@ -4750,4 +4750,5 @@ pub(in crate::runtime) fn next_server_carrier_path_instance_id() -> ServerCarrie
 }
 
 #[cfg(test)]
+#[path = "binding_test.rs"]
 mod tests;

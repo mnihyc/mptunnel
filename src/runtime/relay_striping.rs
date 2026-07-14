@@ -2905,4 +2905,5 @@ fn path_cursor_distance(position: usize, cursor: usize, len: usize) -> usize {
 }
 
 #[cfg(test)]
+#[path = "relay_striping_test.rs"]
 mod tests;

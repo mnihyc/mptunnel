@@ -90,4 +90,5 @@ impl RequestStartupState {
 }
 
 #[cfg(test)]
+#[path = "startup_test.rs"]
 mod tests;

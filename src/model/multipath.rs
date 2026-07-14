@@ -531,4 +531,5 @@ where
 }
 
 #[cfg(test)]
+#[path = "multipath_test.rs"]
 mod tests;

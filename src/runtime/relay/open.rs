@@ -1120,4 +1120,5 @@ pub(in crate::runtime) fn relay_error_is_tcp_path_failure<T>(
 }
 
 #[cfg(test)]
+#[path = "open_test.rs"]
 mod tests;

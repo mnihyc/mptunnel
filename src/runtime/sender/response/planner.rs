@@ -4,6 +4,7 @@
 //! remains the authority that revalidates generations and commits exact ranges.
 
 #[cfg(test)]
+#[path = "planner_test.rs"]
 mod tests;
 
 use super::*;

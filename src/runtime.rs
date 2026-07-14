@@ -45,12 +45,14 @@ use path::tcp::client_connection::*;
 use path::tcp::server::*;
 use path::{
     ClientPathContext, ClientPathHealthRecord, PathDeliveryStats, RelayPathLoadLease,
-    ReliableTcpRequestBulkFlowRegistration, RequestCapacityProbeCampaignBudget,
-    RequestQuicCapacityProbeLease, RequestQuicCapacityProductHandoffState,
-    RequestTcpCapacityProbeLease, ServerPathContext, commands::*, model::*,
+    ReliableTcpRequestBulkFlowRegistration, ServerPathContext, commands::*, model::*,
 };
 #[cfg(test)]
-use path::{ClientPathHealth, ClientPathState, UdpDatagramPathObservation};
+use path::{
+    ClientPathHealth, ClientPathState, RequestCapacityProbeCampaignBudget,
+    RequestQuicCapacityProbeLease, RequestQuicCapacityProductHandoffState,
+    RequestTcpCapacityProbeLease, UdpDatagramPathObservation,
+};
 use prelude::*;
 use relay::*;
 use relay_striping::*;

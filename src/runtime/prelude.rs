@@ -17,9 +17,9 @@ pub(super) use crate::protocol::auth::{PathJoinAuthCheck, SessionAuthCheck, Sess
 #[cfg(test)]
 pub(super) use crate::protocol::codec::CodecLimits;
 pub(super) use crate::protocol::{
-    CloseReason, Frame, IngressKind, OffsetRange, OutboundPolicy, PathId, PathMetricDirection,
-    PathMetrics, RateHint, ResetReason, SessionId, StreamFlags, StreamId, StreamOpenRole,
-    TargetAddr, UnderlayProtocol,
+    CloseReason, Frame, IngressKind, OffsetRange, PathId, PathMetricDirection, PathMetrics,
+    RateHint, ResetReason, SessionId, StreamFlags, StreamId, StreamOpenRole, TargetAddr,
+    UnderlayProtocol,
 };
 #[cfg(test)]
 pub(super) use crate::protocol::{DatagramFlowId, PathCapabilities};

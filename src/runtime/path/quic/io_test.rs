@@ -1,4 +1,71 @@
 use super::*;
+use bytes::Bytes;
+
+#[test]
+fn quic_ordinary_writer_enforces_measurement_ownership() {
+    let capacity = Frame::PathCapacityData {
+        path_id: PathId(4),
+        calibration_id: 17,
+        payload: Bytes::from_static(b"capacity"),
+    };
+    let finish = Frame::PathCapacityFinish {
+        path_id: PathId(4),
+        calibration_id: 17,
+        payload_bytes: 8,
+    };
+    let receipt = Frame::PathCapacityReceipt {
+        path_id: PathId(4),
+        calibration_id: 17,
+        received_payload_bytes: 8,
+    };
+    let stream = Frame::StreamData {
+        stream_id: StreamId(8),
+        offset: 0,
+        flags: StreamFlags::NONE,
+        payload: Bytes::from_static(b"stream"),
+    };
+    let datagram = Frame::DatagramData {
+        flow_id: DatagramFlowId(2),
+        datagram_id: DatagramId(3),
+        ttl_ms: 1_000,
+        payload: Bytes::from_static(b"datagram"),
+    };
+
+    for frame in [&capacity, &finish, &receipt] {
+        assert!(matches!(
+            ensure_quic_ordinary_frames(std::slice::from_ref(frame)),
+            Err(RuntimeError::Protocol(
+                "QUIC measurement records require the dedicated writer"
+            ))
+        ));
+    }
+    assert!(ensure_quic_ordinary_frames(&[stream.clone(), datagram.clone()]).is_ok());
+    assert!(matches!(
+        ensure_quic_ordinary_frames(&[stream, capacity, datagram]),
+        Err(RuntimeError::Protocol(
+            "QUIC measurement records require the dedicated writer"
+        ))
+    ));
+
+    assert_eq!(
+        Frame::StreamData {
+            stream_id: StreamId(8),
+            offset: 0,
+            flags: StreamFlags::NONE,
+            payload: Bytes::from_static(b"stream"),
+        }
+        .write_class(),
+        crate::protocol::FrameWriteClass::Ordinary {
+            delivery_evidence_bytes: 6,
+        }
+    );
+    assert_eq!(
+        Frame::Ping { nonce: 1 }.write_class(),
+        crate::protocol::FrameWriteClass::Ordinary {
+            delivery_evidence_bytes: 0,
+        }
+    );
+}
 
 #[test]
 fn quic_product_payload_uses_sender_quantum_not_packet_train_cap() {

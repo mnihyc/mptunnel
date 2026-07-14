@@ -3,8 +3,8 @@ use super::*;
 pub(super) fn quic_congestion(
     congestion_window: u64,
     pacing_rate_bps: Option<u64>,
-) -> quic_carrier::CongestionMetrics {
-    quic_carrier::CongestionMetrics {
+) -> quic_transport::CongestionMetrics {
+    quic_transport::CongestionMetrics {
         congestion_window,
         bytes_in_flight: Some(0),
         pending_bytes: 0,
@@ -20,32 +20,32 @@ pub(super) fn quic_congestion(
         non_app_limited_delivery_sample_count: 0,
         timed_non_app_limited_delivery_sample_count: 0,
         app_limited: true,
-        capacity_probe: None,
+        measurement: None,
     }
 }
 
 pub(super) fn with_delivery_evidence_written(
-    mut metrics: quic_carrier::CongestionMetrics,
+    mut metrics: quic_transport::CongestionMetrics,
     bytes: u64,
-) -> quic_carrier::CongestionMetrics {
+) -> quic_transport::CongestionMetrics {
     metrics.delivery_evidence_written_bytes = bytes;
     metrics
 }
 
 pub(super) fn with_acked_bytes(
-    metrics: quic_carrier::CongestionMetrics,
+    metrics: quic_transport::CongestionMetrics,
     bytes: u64,
     sample_count: u64,
-) -> quic_carrier::CongestionMetrics {
+) -> quic_transport::CongestionMetrics {
     with_acked_bytes_elapsed(metrics, bytes, sample_count, Duration::from_millis(100))
 }
 
 pub(super) fn with_acked_bytes_elapsed(
-    mut metrics: quic_carrier::CongestionMetrics,
+    mut metrics: quic_transport::CongestionMetrics,
     bytes: u64,
     sample_count: u64,
     elapsed: Duration,
-) -> quic_carrier::CongestionMetrics {
+) -> quic_transport::CongestionMetrics {
     metrics.newly_acked_bytes = Some(bytes);
     metrics.non_app_limited_acked_bytes = Some(bytes);
     metrics.timed_non_app_limited_acked_bytes = (!elapsed.is_zero()).then_some(bytes);
@@ -66,20 +66,20 @@ pub(super) fn capacity_probe_metrics(
     timed_bytes: u64,
     timed_count: u64,
     timed_elapsed: Option<Duration>,
-) -> quic_carrier::CapacityProbeMetrics {
+) -> quic_transport::MeasurementMetrics {
     let sample_floor_bytes = required_bytes.saturating_add(PATH_OPEN_SCORE_BYTES as u64);
     let train_payload_bytes = warmup_bytes
         .saturating_add(required_bytes)
         .max(sample_floor_bytes);
     let receipt_elapsed = Duration::from_millis(80);
-    quic_carrier::CapacityProbeMetrics {
+    quic_transport::MeasurementMetrics {
         token,
         train_payload_bytes,
         sample_floor_bytes,
         warmup_carrier_bytes: warmup_bytes,
         required_timed_carrier_bytes: required_bytes,
         expires_at: now + Duration::from_secs(5),
-        phase: quic_carrier::CapacityProbePhase::Proven,
+        phase: quic_transport::MeasurementPhase::Complete,
         started_clean: false,
         write_committed: true,
         written_payload_bytes: train_payload_bytes,
@@ -95,9 +95,9 @@ pub(super) fn capacity_probe_metrics(
         app_limited_acked_carrier_bytes: timed_bytes,
         app_limited_ack_sample_count: timed_count,
         timed_measurement_ack_elapsed: timed_elapsed,
-        native_proved_at: timed_elapsed.map(|_| now),
-        proved_at: Some(now),
-        proof_validity: Duration::from_secs(3),
+        native_threshold_at: timed_elapsed.map(|_| now),
+        confirmed_at: Some(now),
+        retention: Duration::from_secs(3),
         receipt_received_payload_bytes: train_payload_bytes,
         receipt_elapsed: Some(receipt_elapsed),
         receipt_rtt: Some(Duration::from_millis(20)),
@@ -111,9 +111,9 @@ pub(super) fn capacity_probe_metrics(
 }
 
 pub(super) fn with_capacity_probe(
-    mut metrics: quic_carrier::CongestionMetrics,
-    probe: quic_carrier::CapacityProbeMetrics,
-) -> quic_carrier::CongestionMetrics {
-    metrics.capacity_probe = Some(probe);
+    mut metrics: quic_transport::CongestionMetrics,
+    probe: quic_transport::MeasurementMetrics,
+) -> quic_transport::CongestionMetrics {
+    metrics.measurement = Some(probe);
     metrics
 }

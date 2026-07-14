@@ -75,7 +75,7 @@ pub(in crate::runtime) struct UdpPathMetrics {
     #[cfg_attr(not(feature = "lab-diagnostics"), allow(dead_code))]
     pub(in crate::runtime) latest_rate_sample_elapsed: Option<Duration>,
     pub(in crate::runtime) capacity_proof_candidate: Option<QuicCapacityProofCandidate>,
-    pub(in crate::runtime) capacity_probe: Option<quic_carrier::CapacityProbeMetrics>,
+    pub(in crate::runtime) capacity_probe: Option<quic_transport::MeasurementMetrics>,
     #[cfg(feature = "lab-diagnostics")]
     pub(in crate::runtime) ack_poll: QuicAckPollDiagnostics,
 }
@@ -320,8 +320,8 @@ pub(super) fn log_quic_ack_poll_diagnostics(
                     .unwrap_or_default()
                     .as_micros(),
                 probe
-                    .native_proved_at
-                    .map(|proved_at| now.saturating_duration_since(proved_at).as_micros())
+                    .native_threshold_at
+                    .map(|confirmed_at| now.saturating_duration_since(confirmed_at).as_micros())
                     .unwrap_or(0),
                 probe.receipt_received_payload_bytes,
                 probe.receipt_elapsed.unwrap_or_default().as_micros(),
@@ -338,10 +338,10 @@ pub(super) fn log_quic_ack_poll_diagnostics(
                 probe.last_authoritative_sent_watermark.unwrap_or(0),
                 probe.receipt_frozen_sent_watermark.unwrap_or(0),
                 probe.current_sent_watermark,
-                probe.proof_validity.as_millis(),
+                probe.retention.as_millis(),
                 probe
-                    .proved_at
-                    .map(|proved_at| now.saturating_duration_since(proved_at).as_micros())
+                    .confirmed_at
+                    .map(|confirmed_at| now.saturating_duration_since(confirmed_at).as_micros())
                     .unwrap_or(0),
                 probe.expires_at.saturating_duration_since(now).as_micros(),
                 metrics.capacity_proof_candidate.is_some(),
@@ -410,10 +410,10 @@ pub(super) fn quic_path_metrics_poll_interval(metrics: UdpPathMetrics) -> Durati
     if metrics.capacity_probe.is_some_and(|probe| {
         matches!(
             probe.phase,
-            quic_carrier::CapacityProbePhase::Writing
-                | quic_carrier::CapacityProbePhase::Measuring
-                | quic_carrier::CapacityProbePhase::ProvenDraining
-                | quic_carrier::CapacityProbePhase::Proven
+            quic_transport::MeasurementPhase::Writing
+                | quic_transport::MeasurementPhase::Measuring
+                | quic_transport::MeasurementPhase::AwaitingReceipt
+                | quic_transport::MeasurementPhase::Complete
         )
     }) {
         // Receipt and retirement are short-lived control transitions. Poll at

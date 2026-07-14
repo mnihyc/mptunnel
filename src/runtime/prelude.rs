@@ -26,7 +26,7 @@ pub(super) use crate::transport::encrypted::{
     EncryptedFramedReader, EncryptedFramedStream, EncryptedFramedTransportError,
     EncryptedFramedWriter, PeerRole,
 };
-pub(super) use crate::transport::quic_carrier;
+pub(super) use crate::transport::quic as quic_transport;
 pub(super) use crate::transport::tcp::{self, TcpConnectOptions};
 pub(super) use bytes::{Bytes, BytesMut};
 pub(super) use futures::{SinkExt, StreamExt};

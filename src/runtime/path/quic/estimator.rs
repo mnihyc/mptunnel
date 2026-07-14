@@ -29,7 +29,7 @@ impl UdpPathMetricTracker {
 
     pub(super) fn terminal_capacity_probe_to_retire(
         &mut self,
-        probe: Option<quic_carrier::CapacityProbeMetrics>,
+        probe: Option<quic_transport::MeasurementMetrics>,
         now: Instant,
     ) -> Option<u64> {
         self.quic.terminal_capacity_probe_to_retire(probe, now)
@@ -39,7 +39,7 @@ impl UdpPathMetricTracker {
     pub(super) fn observe(
         &mut self,
         stats: quinn::ConnectionStats,
-        congestion: quic_carrier::CongestionMetrics,
+        congestion: quic_transport::CongestionMetrics,
         direction: u8,
     ) -> UdpPathMetrics {
         self.quic.observe(stats, congestion, direction)
@@ -49,7 +49,7 @@ impl UdpPathMetricTracker {
     pub(super) fn observe_at(
         &mut self,
         stats: quinn::ConnectionStats,
-        congestion: quic_carrier::CongestionMetrics,
+        congestion: quic_transport::CongestionMetrics,
         direction: u8,
         now: Instant,
     ) -> UdpPathMetrics {
@@ -106,7 +106,7 @@ impl QuicPathMetricTracker {
 
     fn capacity_proof_candidate(
         &mut self,
-        probe: Option<quic_carrier::CapacityProbeMetrics>,
+        probe: Option<quic_transport::MeasurementMetrics>,
         now: Instant,
     ) -> Option<QuicCapacityProofCandidate> {
         let probe = probe?;
@@ -116,7 +116,7 @@ impl QuicPathMetricTracker {
         // Receipt and a committed write atomically terminalize the carrier
         // epoch. Accepting the same fields in a nonterminal phase hides a broken
         // carrier transition rather than preserving useful proof.
-        if probe.phase != quic_carrier::CapacityProbePhase::Proven {
+        if probe.phase != quic_transport::MeasurementPhase::Complete {
             return None;
         }
         if let Some(candidate) = self
@@ -139,13 +139,13 @@ impl QuicPathMetricTracker {
                 .warmup_carrier_bytes
                 .saturating_add(probe.required_timed_carrier_bytes)
                 > probe.train_payload_bytes
-            || probe.proof_validity.is_zero()
+            || probe.retention.is_zero()
             || probe.receipt_received_payload_bytes != probe.train_payload_bytes
         {
             return None;
         }
         let receipt_at = probe.receipt_at?;
-        if probe.proved_at != Some(receipt_at) || receipt_at >= probe.expires_at {
+        if probe.confirmed_at != Some(receipt_at) || receipt_at >= probe.expires_at {
             return None;
         }
         let receipt_elapsed = probe.receipt_elapsed.filter(|elapsed| !elapsed.is_zero())?;
@@ -153,7 +153,7 @@ impl QuicPathMetricTracker {
         // Use its full cold-start interval: subtracting an RTT can create an
         // unstable near-zero denominator, while native timing keeps changing.
         let proof_elapsed = receipt_elapsed.max(QUIC_TIMER_GRANULARITY);
-        let expires_at = receipt_at.checked_add(probe.proof_validity)?;
+        let expires_at = receipt_at.checked_add(probe.retention)?;
         if now >= expires_at {
             return None;
         }
@@ -175,7 +175,7 @@ impl QuicPathMetricTracker {
             rate_bps,
             accepted_at: receipt_at,
             expires_at,
-            proof_validity: probe.proof_validity,
+            proof_validity: probe.retention,
         };
         // Freeze rate and freshness on first sight. Repeated registry attempts
         // reuse this exact candidate instead of extending a delayed proof.
@@ -198,14 +198,14 @@ impl QuicPathMetricTracker {
 
     fn terminal_capacity_probe_to_retire(
         &self,
-        probe: Option<quic_carrier::CapacityProbeMetrics>,
+        probe: Option<quic_transport::MeasurementMetrics>,
         now: Instant,
     ) -> Option<u64> {
         let probe = probe?;
         match probe.phase {
-            quic_carrier::CapacityProbePhase::Expired
-            | quic_carrier::CapacityProbePhase::Aborted => Some(probe.token),
-            quic_carrier::CapacityProbePhase::Proven => {
+            quic_transport::MeasurementPhase::Expired
+            | quic_transport::MeasurementPhase::Aborted => Some(probe.token),
+            quic_transport::MeasurementPhase::Complete => {
                 if self.last_accepted_capacity_probe_token == Some(probe.token) {
                     return Some(probe.token);
                 }
@@ -218,9 +218,9 @@ impl QuicPathMetricTracker {
                     _ => Some(probe.token),
                 }
             }
-            quic_carrier::CapacityProbePhase::Writing
-            | quic_carrier::CapacityProbePhase::Measuring
-            | quic_carrier::CapacityProbePhase::ProvenDraining => None,
+            quic_transport::MeasurementPhase::Writing
+            | quic_transport::MeasurementPhase::Measuring
+            | quic_transport::MeasurementPhase::AwaitingReceipt => None,
         }
     }
 
@@ -236,7 +236,7 @@ impl QuicPathMetricTracker {
     fn observe(
         &mut self,
         stats: quinn::ConnectionStats,
-        congestion: quic_carrier::CongestionMetrics,
+        congestion: quic_transport::CongestionMetrics,
         direction: u8,
     ) -> UdpPathMetrics {
         self.observe_at(stats, congestion, direction, Instant::now())
@@ -245,7 +245,7 @@ impl QuicPathMetricTracker {
     fn observe_at(
         &mut self,
         stats: quinn::ConnectionStats,
-        congestion: quic_carrier::CongestionMetrics,
+        congestion: quic_transport::CongestionMetrics,
         direction: u8,
         now: Instant,
     ) -> UdpPathMetrics {
@@ -496,8 +496,7 @@ impl QuicPathMetricTracker {
         let pacing_rate_bps = usable_pacing_rate
             .unwrap_or(delivery_rate_bps)
             .max(delivery_rate_bps);
-        let capacity_proof_candidate =
-            self.capacity_proof_candidate(congestion.capacity_probe, now);
+        let capacity_proof_candidate = self.capacity_proof_candidate(congestion.measurement, now);
         UdpPathMetrics {
             direction,
             srtt: rtt,
@@ -522,7 +521,7 @@ impl QuicPathMetricTracker {
             latest_carrier_ack_elapsed,
             latest_rate_sample_elapsed,
             capacity_proof_candidate,
-            capacity_probe: congestion.capacity_probe,
+            capacity_probe: congestion.measurement,
             #[cfg(feature = "lab-diagnostics")]
             ack_poll: QuicAckPollDiagnostics {
                 newly_acked_bytes,

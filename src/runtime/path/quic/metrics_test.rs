@@ -94,10 +94,10 @@ fn quic_active_capacity_probe_uses_bounded_quarter_rtt_poll_cadence() {
     };
 
     for phase in [
-        quic_carrier::CapacityProbePhase::Writing,
-        quic_carrier::CapacityProbePhase::Measuring,
-        quic_carrier::CapacityProbePhase::ProvenDraining,
-        quic_carrier::CapacityProbePhase::Proven,
+        quic_transport::MeasurementPhase::Writing,
+        quic_transport::MeasurementPhase::Measuring,
+        quic_transport::MeasurementPhase::AwaitingReceipt,
+        quic_transport::MeasurementPhase::Complete,
     ] {
         assert_eq!(
             quic_path_metrics_poll_interval(metrics_for(phase, Duration::from_millis(80))),
@@ -107,20 +107,20 @@ fn quic_active_capacity_probe_uses_bounded_quarter_rtt_poll_cadence() {
     }
     assert_eq!(
         quic_path_metrics_poll_interval(metrics_for(
-            quic_carrier::CapacityProbePhase::Proven,
+            quic_transport::MeasurementPhase::Complete,
             Duration::from_millis(400),
         )),
         QUIC_MAX_ACK_DELAY
     );
     assert_eq!(
         quic_path_metrics_poll_interval(metrics_for(
-            quic_carrier::CapacityProbePhase::Measuring,
+            quic_transport::MeasurementPhase::Measuring,
             Duration::from_millis(2),
         )),
         QUIC_TIMER_GRANULARITY
     );
     let expired = metrics_for(
-        quic_carrier::CapacityProbePhase::Expired,
+        quic_transport::MeasurementPhase::Expired,
         Duration::from_millis(80),
     );
     assert!(quic_path_metrics_poll_interval(expired) > Duration::from_millis(20));

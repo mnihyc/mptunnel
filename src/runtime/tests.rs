@@ -2495,7 +2495,9 @@ fn reliable_relay_chunking_uses_product_payload_envelope() {
         max_ack_ranges: 16,
         ..MuxLimits::default()
     };
-    let max_frame_payload = quic_carrier::max_stream_payload_bytes(CodecLimits::default())
+    let max_frame_payload = CodecLimits::default()
+        .max_payload_bytes
+        .max(1)
         .min(mux_limits.max_reliable_relay_chunk_bytes)
         .max(1);
 

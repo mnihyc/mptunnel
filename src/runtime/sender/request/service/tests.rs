@@ -1093,7 +1093,7 @@ fn reserve_request_quic_capacity_calibration_for_test(
     proof_validity: Duration,
 ) -> (
     QuicCapacityProofCandidate,
-    crate::transport::quic_carrier::CapacityProbeMetrics,
+    crate::transport::quic::MeasurementMetrics,
 ) {
     let token = sender.stream_id.0.saturating_add(1_000);
     let train_bytes = (PATH_OPEN_SCORE_BYTES * 2) as u64;
@@ -1133,14 +1133,14 @@ fn reserve_request_quic_capacity_calibration_for_test(
         expires_at,
         proof_validity,
     };
-    let probe = crate::transport::quic_carrier::CapacityProbeMetrics {
+    let probe = crate::transport::quic::MeasurementMetrics {
         token,
         train_payload_bytes: train_bytes,
         sample_floor_bytes: train_bytes,
         warmup_carrier_bytes: train_bytes - required_proof_bytes,
         required_timed_carrier_bytes: required_proof_bytes,
         expires_at: train_deadline,
-        phase: crate::transport::quic_carrier::CapacityProbePhase::Proven,
+        phase: crate::transport::quic::MeasurementPhase::Complete,
         started_clean: true,
         write_committed: true,
         written_payload_bytes: train_bytes,
@@ -1156,9 +1156,9 @@ fn reserve_request_quic_capacity_calibration_for_test(
         app_limited_acked_carrier_bytes: 0,
         app_limited_ack_sample_count: 0,
         timed_measurement_ack_elapsed: Some(Duration::from_millis(10)),
-        native_proved_at: Some(accepted_at),
-        proved_at: Some(accepted_at),
-        proof_validity,
+        native_threshold_at: Some(accepted_at),
+        confirmed_at: Some(accepted_at),
+        retention: proof_validity,
         receipt_received_payload_bytes: train_bytes,
         receipt_elapsed: Some(Duration::from_millis(10)),
         receipt_rtt: Some(Duration::from_millis(5)),
@@ -1185,7 +1185,7 @@ fn publish_request_quic_capacity_calibration_for_test(
     context: &ClientPathContext,
     target: RelayPathInstance,
     candidate: QuicCapacityProofCandidate,
-    probe: crate::transport::quic_carrier::CapacityProbeMetrics,
+    probe: crate::transport::quic::MeasurementMetrics,
 ) {
     context.health().lock().expect("path health lock").udp[target.key.index]
         .accept_request_quic_capacity_proof(candidate, probe, Instant::now())

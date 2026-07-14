@@ -59,7 +59,7 @@ fn quic_capacity_receipt_publishes_after_terminalization_and_freezes_rate() {
         32,
         Some(Duration::from_millis(40)),
     );
-    probe.phase = quic_carrier::CapacityProbePhase::Proven;
+    probe.phase = quic_transport::MeasurementPhase::Complete;
     probe.last_authoritative_in_flight = Some(0);
     probe.last_authoritative_sent_watermark = Some(10_000);
     probe.receipt_frozen_sent_watermark = Some(11_200);
@@ -79,7 +79,7 @@ fn quic_capacity_receipt_publishes_after_terminalization_and_freezes_rate() {
             .expect("receipt rate")
     );
 
-    probe.phase = quic_carrier::CapacityProbePhase::Proven;
+    probe.phase = quic_transport::MeasurementPhase::Complete;
     probe.timed_measurement_ack_elapsed = Some(Duration::from_secs(2));
     probe.current_sent_watermark = 12_400;
     let later = tracker.observe_at(
@@ -124,11 +124,11 @@ fn quic_capacity_candidate_accepts_only_receipted_publishable_phases() {
     );
     assert!(proven.capacity_proof_candidate.is_some());
     for phase in [
-        quic_carrier::CapacityProbePhase::Writing,
-        quic_carrier::CapacityProbePhase::Measuring,
-        quic_carrier::CapacityProbePhase::ProvenDraining,
-        quic_carrier::CapacityProbePhase::Expired,
-        quic_carrier::CapacityProbePhase::Aborted,
+        quic_transport::MeasurementPhase::Writing,
+        quic_transport::MeasurementPhase::Measuring,
+        quic_transport::MeasurementPhase::AwaitingReceipt,
+        quic_transport::MeasurementPhase::Expired,
+        quic_transport::MeasurementPhase::Aborted,
     ] {
         let mut probe = capacity_probe_metrics(44, now, 0, required_bytes, 0, 0, None);
         probe.phase = phase;

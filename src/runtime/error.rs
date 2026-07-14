@@ -9,7 +9,7 @@ use crate::protocol::path_capacity::PathCapacityReceiveError;
 use crate::protocol::{CloseReason, ResetReason};
 use crate::transport::PathSpecParseError;
 use crate::transport::encrypted::EncryptedFramedTransportError;
-use crate::transport::quic_carrier::QuicCarrierError;
+use crate::transport::quic::QuicCarrierError;
 use crate::transport::tcp::TcpTransportError;
 use crate::transport::udp::UdpTransportError;
 

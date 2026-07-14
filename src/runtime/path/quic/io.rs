@@ -5,29 +5,29 @@ use tokio::net::lookup_host;
 
 #[derive(Debug)]
 pub(in crate::runtime) struct UdpPathEndpoint {
-    endpoint: quic_carrier::Endpoint,
+    endpoint: quic_transport::Endpoint,
 }
 
 #[derive(Debug, Clone)]
 pub(in crate::runtime) struct UdpPathConnection {
-    pub(super) connection: quic_carrier::Connection,
+    pub(super) connection: quic_transport::Connection,
 }
 
 #[derive(Debug)]
 pub(in crate::runtime) struct UdpPathSendStream {
-    stream: quic_carrier::SendStream,
+    stream: quic_transport::SendStream,
     pub(super) connection: UdpPathConnection,
 }
 
 impl UdpPathSendStream {
-    pub(super) fn transport_stream_mut(&mut self) -> &mut quic_carrier::SendStream {
+    pub(super) fn transport_stream_mut(&mut self) -> &mut quic_transport::SendStream {
         &mut self.stream
     }
 }
 
 #[derive(Debug)]
 pub(in crate::runtime) struct UdpPathRecvStream {
-    stream: quic_carrier::RecvStream,
+    stream: quic_transport::RecvStream,
 }
 
 impl UdpPathEndpoint {
@@ -37,7 +37,7 @@ impl UdpPathEndpoint {
     ) -> Result<Self, RuntimeError> {
         let addr = resolve_first_socket_addr(path).await?;
         Ok(Self {
-            endpoint: quic_carrier::Endpoint::bind_server(
+            endpoint: quic_transport::Endpoint::bind_server(
                 addr,
                 context.security.secret.as_bytes(),
                 context.mux_limits,
@@ -52,7 +52,7 @@ impl UdpPathEndpoint {
         runtime: &ClientUdpPathSessionRuntime,
     ) -> Result<Self, RuntimeError> {
         Ok(Self {
-            endpoint: quic_carrier::Endpoint::bind_client(
+            endpoint: quic_transport::Endpoint::bind_client(
                 local_addr,
                 runtime.security.secret.as_bytes(),
                 runtime.mux_limits,
@@ -115,11 +115,11 @@ impl UdpPathConnection {
     }
 
     pub(super) fn capacity_probe_active(&self) -> bool {
-        self.connection.capacity_probe_active()
+        self.connection.measurement_active()
     }
 
     pub(super) async fn wait_for_capacity_probe_release(&self) {
-        self.connection.wait_for_capacity_probe_release().await;
+        self.connection.wait_for_measurement_release().await;
     }
 
     pub(super) fn is_closed(&self) -> bool {
@@ -127,11 +127,11 @@ impl UdpPathConnection {
     }
 
     pub(super) fn retire_capacity_probe(&self, token: u64) -> bool {
-        self.connection.retire_capacity_probe(token)
+        self.connection.retire_measurement(token)
     }
 
     pub(super) fn cancel_capacity_probe(&self, token: u64) -> bool {
-        self.connection.cancel_capacity_probe(token)
+        self.connection.cancel_measurement(token)
     }
 
     pub(super) fn confirm_capacity_probe_receipt(
@@ -141,7 +141,7 @@ impl UdpPathConnection {
         received_at: Instant,
     ) -> bool {
         self.connection
-            .confirm_capacity_probe_receipt(token, received_payload_bytes, received_at)
+            .confirm_measurement_receipt(token, received_payload_bytes, received_at)
     }
 }
 
@@ -149,7 +149,7 @@ pub(in crate::runtime) async fn udp_path_read_frame(
     recv: &mut UdpPathRecvStream,
     codec_limits: CodecLimits,
 ) -> Result<Frame, RuntimeError> {
-    Ok(quic_carrier::read_frame(&mut recv.stream, codec_limits).await?)
+    Ok(quic_transport::read_frame(&mut recv.stream, codec_limits).await?)
 }
 
 pub(in crate::runtime) async fn udp_path_write_frame(
@@ -157,7 +157,8 @@ pub(in crate::runtime) async fn udp_path_write_frame(
     frame: &Frame,
     codec_limits: CodecLimits,
 ) -> Result<(), RuntimeError> {
-    quic_carrier::write_frame(&mut send.stream, frame, codec_limits).await?;
+    ensure_quic_ordinary_frames(std::slice::from_ref(frame))?;
+    quic_transport::write_frame(&mut send.stream, frame, codec_limits).await?;
     Ok(())
 }
 
@@ -166,7 +167,22 @@ async fn udp_path_write_frames(
     frames: &[Frame],
     codec_limits: CodecLimits,
 ) -> Result<(), RuntimeError> {
-    quic_carrier::write_frames(&mut send.stream, frames, codec_limits).await?;
+    ensure_quic_ordinary_frames(frames)?;
+    quic_transport::write_frames(&mut send.stream, frames, codec_limits).await?;
+    Ok(())
+}
+
+fn ensure_quic_ordinary_frames(frames: &[Frame]) -> Result<(), RuntimeError> {
+    if frames.iter().any(|frame| {
+        !matches!(
+            frame.write_class(),
+            crate::protocol::FrameWriteClass::Ordinary { .. }
+        )
+    }) {
+        return Err(RuntimeError::Protocol(
+            "QUIC measurement records require the dedicated writer",
+        ));
+    }
     Ok(())
 }
 
@@ -203,19 +219,21 @@ pub(super) async fn flush_udp_frame_batch_with_path_proofs(
 pub(in crate::runtime) fn udp_path_finish_stream(
     send: &mut UdpPathSendStream,
 ) -> Result<(), RuntimeError> {
-    Ok(quic_carrier::finish_stream(&mut send.stream)?)
+    Ok(quic_transport::finish_stream(&mut send.stream)?)
 }
 
 // Product-level UDP reliable frame size. This is intentionally the same kind of
 // BDP/service quantum used by TCP. Do not cap this to a QUIC packet train: doing
 // so turns the carrier record size into the application pacing unit and
 // underfeeds QUIC. QUIC-specific recordization is performed inside
-// transport::quic_carrier while preserving this product quantum.
+// transport::quic while preserving this product quantum.
 pub(super) fn udp_path_max_stream_payload_bytes(
     codec_limits: CodecLimits,
     mux_limits: MuxLimits,
 ) -> usize {
-    quic_carrier::max_stream_payload_bytes(codec_limits)
+    codec_limits
+        .max_payload_bytes
+        .max(1)
         .min(mux_limits.max_reliable_relay_chunk_bytes)
         .max(1)
 }
@@ -232,20 +250,18 @@ pub(super) fn udp_reliable_stream_frame_queue(
 
 pub(super) fn udp_path_frame_finished(err: &RuntimeError) -> bool {
     match err {
-        RuntimeError::QuicCarrier(quic_carrier::QuicCarrierError::Read(_)) => true,
-        RuntimeError::QuicCarrier(quic_carrier::QuicCarrierError::ReadExact(_)) => true,
-        RuntimeError::QuicCarrier(quic_carrier::QuicCarrierError::UnexpectedEnd) => true,
-        RuntimeError::QuicCarrier(quic_carrier::QuicCarrierError::Connection(_)) => true,
+        RuntimeError::QuicCarrier(quic_transport::QuicCarrierError::Read(_)) => true,
+        RuntimeError::QuicCarrier(quic_transport::QuicCarrierError::UnexpectedEnd) => true,
+        RuntimeError::QuicCarrier(quic_transport::QuicCarrierError::Connection(_)) => true,
         _ => false,
     }
 }
 
 fn udp_runtime_error_is_expected_shutdown(err: &RuntimeError) -> bool {
     match err {
-        RuntimeError::QuicCarrier(quic_carrier::QuicCarrierError::Read(_)) => true,
-        RuntimeError::QuicCarrier(quic_carrier::QuicCarrierError::ReadExact(_)) => true,
-        RuntimeError::QuicCarrier(quic_carrier::QuicCarrierError::UnexpectedEnd) => true,
-        RuntimeError::QuicCarrier(quic_carrier::QuicCarrierError::Connection(_)) => true,
+        RuntimeError::QuicCarrier(quic_transport::QuicCarrierError::Read(_)) => true,
+        RuntimeError::QuicCarrier(quic_transport::QuicCarrierError::UnexpectedEnd) => true,
+        RuntimeError::QuicCarrier(quic_transport::QuicCarrierError::Connection(_)) => true,
         RuntimeError::RemoteClosed(CloseReason::Normal) => true,
         _ => false,
     }

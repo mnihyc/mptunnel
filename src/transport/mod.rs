@@ -1,7 +1,7 @@
 pub(crate) mod aead;
 pub mod encrypted;
 pub mod framed;
-pub mod quic_carrier;
+pub mod quic;
 mod spec;
 pub mod tcp;
 pub(crate) mod tcp_telemetry;

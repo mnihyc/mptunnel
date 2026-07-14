@@ -787,7 +787,7 @@ impl ClientPathHealthRecord {
     pub(in crate::runtime) fn accept_request_quic_capacity_proof(
         &mut self,
         candidate: QuicCapacityProofCandidate,
-        probe: quic_carrier::CapacityProbeMetrics,
+        probe: quic_transport::MeasurementMetrics,
         now: Instant,
     ) -> Option<(u64, u64, bool)> {
         let reservation = self.request_quic_capacity_probe.as_ref()?;

@@ -60,6 +60,22 @@ pub(crate) struct QuicCapacityProofCandidate {
     pub(crate) proof_validity: Duration,
 }
 
+/// Converts an exact QUIC train receipt into its bounded integer rate.
+///
+/// The carrier timer floor prevents sub-granularity timestamps from creating
+/// an unstable denominator; callers still own proof freshness and eligibility.
+pub(crate) fn quic_capacity_receipt_rate_bps(
+    train_bytes: u64,
+    proof_elapsed: Duration,
+) -> Option<u64> {
+    if train_bytes == 0 || proof_elapsed.is_zero() {
+        return None;
+    }
+    let rate = train_bytes as f64 * 8.0 / proof_elapsed.max(QUIC_TIMER_GRANULARITY).as_secs_f64();
+    rate.is_finite()
+        .then_some(rate.round().max(1.0).min(u64::MAX as f64) as u64)
+}
+
 /// Immutable evidence for one exact TCP capacity train.
 ///
 /// The model owns this cross-layer handoff record; TCP runtime code owns
@@ -128,3 +144,7 @@ impl PathRateSample {
         self.elapsed
     }
 }
+
+#[cfg(test)]
+#[path = "capacity_test.rs"]
+mod tests;

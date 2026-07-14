@@ -10,7 +10,7 @@ use super::topology::ServerCarrierPathInstanceId;
 #[cfg(feature = "lab-diagnostics")]
 use crate::lab_diagnostics::lab_diagnostic;
 use crate::model::capacity::{
-    PATH_OPEN_SCORE_BYTES, QUIC_TIMER_GRANULARITY, QuicCapacityProofCandidate,
+    PATH_OPEN_SCORE_BYTES, QuicCapacityProofCandidate, quic_capacity_receipt_rate_bps,
 };
 use crate::model::path::CarrierPathKey;
 use crate::protocol::SessionId;
@@ -79,18 +79,6 @@ pub(super) fn valid_quic_capacity_geometry(
         && accounting_slack_bytes == expected_slack
         && expected_required == Some(required_proof_bytes)
         && expected_train == Some(train_bytes)
-}
-
-pub(in crate::runtime) fn quic_capacity_receipt_rate_bps(
-    train_bytes: u64,
-    proof_elapsed: Duration,
-) -> Option<u64> {
-    if train_bytes == 0 || proof_elapsed.is_zero() {
-        return None;
-    }
-    let rate = train_bytes as f64 * 8.0 / proof_elapsed.max(QUIC_TIMER_GRANULARITY).as_secs_f64();
-    rate.is_finite()
-        .then_some(rate.round().max(1.0).min(u64::MAX as f64) as u64)
 }
 
 pub(in crate::runtime) fn well_formed_quic_capacity_proof_candidate(

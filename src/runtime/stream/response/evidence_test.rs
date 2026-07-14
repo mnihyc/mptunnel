@@ -4,7 +4,6 @@ use super::super::admission::{
     server_output_has_service_feed_evidence_with_limits,
 };
 use super::super::next_server_carrier_path_instance_id;
-use super::super::quic_capacity::quic_capacity_receipt_rate_bps;
 use super::super::session::ServerPathLaneTracker;
 use super::super::snapshot::{server_bulk_output_snapshot, server_output_confidence};
 use super::super::test_support::{
@@ -19,7 +18,8 @@ use super::{
 use crate::model::capacity::QuicCapacityProofCandidate;
 use crate::model::capacity::{
     MIN_RATE_SAMPLE_BYTES, PATH_OPEN_SCORE_BYTES, QUIC_TIMER_GRANULARITY,
-    RELIABLE_INITIAL_WINDOW_PACKETS, reliable_subflow_startup_sample_limit_bytes,
+    RELIABLE_INITIAL_WINDOW_PACKETS, quic_capacity_receipt_rate_bps,
+    reliable_subflow_startup_sample_limit_bytes,
 };
 use crate::model::path::CarrierPathKey;
 use crate::model::timing::quic_bulk_proof_freshness_horizon;

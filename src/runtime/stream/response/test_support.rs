@@ -1,10 +1,9 @@
 use super::ResponseStreamBinding;
 use super::evidence::{ServerPathMetricsEntry, ServerPathMetricsSource};
-use super::quic_capacity::quic_capacity_receipt_rate_bps;
 use super::topology::ResponseStreamOutputEntry;
-use crate::model::capacity::QuicCapacityProofCandidate;
 use crate::model::capacity::{
-    PATH_OPEN_SCORE_BYTES, PathRateSample, RELIABLE_INITIAL_WINDOW_PACKETS,
+    PATH_OPEN_SCORE_BYTES, PathRateSample, QuicCapacityProofCandidate,
+    RELIABLE_INITIAL_WINDOW_PACKETS, quic_capacity_receipt_rate_bps,
     reliable_subflow_startup_sample_limit_bytes,
 };
 use crate::model::path::CarrierPathKey;

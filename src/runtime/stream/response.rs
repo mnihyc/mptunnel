@@ -44,8 +44,7 @@ pub(in crate::runtime) use placement::{
 #[cfg(any(test, feature = "lab-diagnostics"))]
 pub(in crate::runtime) use quic_capacity::well_formed_quic_capacity_proof_candidate;
 pub(in crate::runtime) use quic_capacity::{
-    quic_capacity_proof_pin_matches_marker, quic_capacity_receipt_rate_bps,
-    valid_quic_capacity_proof_candidate_at,
+    quic_capacity_proof_pin_matches_marker, valid_quic_capacity_proof_candidate_at,
 };
 pub(in crate::runtime) use quic_probe::ResponseQuicCapacityCalibrationRequest;
 pub(in crate::runtime) use session::{ResponseServiceFamilyLoads, ServerPathLaneTracker};

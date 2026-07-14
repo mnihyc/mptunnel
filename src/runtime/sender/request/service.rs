@@ -45,8 +45,7 @@ fn sender_service_frame_kind(frame: &Frame) -> &'static str {
 struct RelayPathSendSelection {
     position: usize,
     data_role: Option<PathRuntimeRole>,
-    request_subflow_rollback: Option<Option<FlowSubflowSet<RelayPathInstance>>>,
-    request_attempted_rollback: Option<RelayPathInstance>,
+    request_startup_commit: Option<RequestStartupAdmission>,
     request_calibration_commit: Option<RequestAckClockCalibrationCommit>,
     request_load_expectation: Option<(RelayPathKey, u32, u32)>,
 }
@@ -115,8 +114,7 @@ impl RelayPathSendSelection {
         Self {
             position,
             data_role,
-            request_subflow_rollback: None,
-            request_attempted_rollback: None,
+            request_startup_commit: None,
             request_calibration_commit: None,
             request_load_expectation: None,
         }
@@ -138,11 +136,7 @@ pub(in crate::runtime) struct RelaySenderService {
     flights: RelayPathFlightLedger,
     ordered_data_owner: Option<RelayPathKey>,
     ordered_data_owner_instance: Option<RelayPathInstance>,
-    request_subflow_set: Option<FlowSubflowSet<RelayPathInstance>>,
-    request_startup_acked_bytes: HashMap<RelayPathInstance, u64>,
-    request_startup_first_sent_at: HashMap<RelayPathInstance, Instant>,
-    request_startup_rate_evidence: HashSet<RelayPathInstance>,
-    request_startup_receipt_proofs: HashMap<RelayPathInstance, (u64, u64)>,
+    request_startup: RequestStartupState,
     request_rate_evidence: HashMap<RelayPathInstance, RequestPathRateEvidence>,
     request_per_flow_rate_bps: HashMap<RelayPathInstance, RequestPerFlowRateModel>,
     request_tcp_ack_turnover: HashMap<RelayPathInstance, RequestTcpAckTurnoverModel>,
@@ -164,7 +158,6 @@ pub(in crate::runtime) struct RelaySenderService {
     request_quic_capacity_attempted_paths: HashSet<usize>,
     request_quic_capacity_campaign: Arc<RequestCapacityProbeCampaignBudget>,
     request_graduated_subflows: HashSet<RelayPathInstance>,
-    request_attempted_subflows: HashSet<RelayPathInstance>,
     request_membership_generation: Option<u64>,
     request_bulk_flow_registration: Option<ReliableTcpRequestBulkFlowRegistration>,
     missing_owner_repair_attempts: HashMap<RelayPathInstance, Instant>,
@@ -215,11 +208,7 @@ impl RelaySenderService {
             flights: RelayPathFlightLedger::default(),
             ordered_data_owner: None,
             ordered_data_owner_instance: None,
-            request_subflow_set: None,
-            request_startup_acked_bytes: HashMap::new(),
-            request_startup_first_sent_at: HashMap::new(),
-            request_startup_rate_evidence: HashSet::new(),
-            request_startup_receipt_proofs: HashMap::new(),
+            request_startup: RequestStartupState::default(),
             request_rate_evidence: HashMap::new(),
             request_per_flow_rate_bps: HashMap::new(),
             request_tcp_ack_turnover: HashMap::new(),
@@ -241,7 +230,6 @@ impl RelaySenderService {
             request_quic_capacity_attempted_paths: HashSet::new(),
             request_quic_capacity_campaign: Arc::new(RequestCapacityProbeCampaignBudget::default()),
             request_graduated_subflows: HashSet::new(),
-            request_attempted_subflows: HashSet::new(),
             request_membership_generation: None,
             request_bulk_flow_registration: None,
             missing_owner_repair_attempts: HashMap::new(),
@@ -857,8 +845,7 @@ impl RelaySenderService {
             let RelayPathSendSelection {
                 position,
                 data_role,
-                request_subflow_rollback,
-                request_attempted_rollback,
+                request_startup_commit,
                 request_calibration_commit,
                 request_load_expectation,
             } = selection;
@@ -890,15 +877,6 @@ impl RelaySenderService {
                                 self.stream_id.0, instance.key.index, instance.id,
                             ),
                         );
-                        if let Some(previous) = request_subflow_rollback {
-                            self.request_subflow_set = previous;
-                        }
-                        if let Some(instance) = request_attempted_rollback {
-                            // No product byte was emitted, so this was not an
-                            // attempt. The occupied-path filter prevents an
-                            // immediate unsafe retry while the winner owns it.
-                            self.request_attempted_subflows.remove(&instance);
-                        }
                         return Err(RuntimeError::SenderServiceBlocked);
                     };
                     Some(claim)
@@ -912,6 +890,9 @@ impl RelaySenderService {
                 emit_mode,
             ) {
                 Ok(()) => {
+                    if let Some(admission) = request_startup_commit {
+                        self.request_startup.commit_admission(admission);
+                    }
                     self.commit_request_ack_clock_calibration(request_calibration_commit);
                     let claimed_load = request_load_claim.is_some();
                     if let Some(claim) = request_load_claim {
@@ -950,12 +931,14 @@ impl RelaySenderService {
                             self.ordered_data_owner_instance = Some(instance);
                         } else if data_role == Some(PathRuntimeRole::Subflow)
                             && self
-                                .request_subflow_set
+                                .request_startup
+                                .epoch
                                 .as_ref()
                                 .and_then(FlowSubflowSet::startup_owner_key)
                                 == Some(instance)
                         {
-                            self.request_startup_first_sent_at
+                            self.request_startup
+                                .first_sent_at
                                 .entry(instance)
                                 .or_insert_with(Instant::now);
                             self.try_enqueue_request_startup_receipt_proof(
@@ -971,37 +954,26 @@ impl RelaySenderService {
                     return Ok(instance);
                 }
                 Err(RuntimeError::SenderServiceBlocked) => {
-                    if let Some(previous) = request_subflow_rollback {
-                        self.request_subflow_set = previous;
-                    }
-                    if let Some(instance) = request_attempted_rollback {
-                        self.request_attempted_subflows.remove(&instance);
-                    }
                     return Err(RuntimeError::SenderServiceBlocked);
                 }
                 Err(err) => {
-                    if let Some(previous) = request_subflow_rollback {
-                        self.request_subflow_set = previous;
-                    }
-                    if let Some(instance) = request_attempted_rollback {
-                        self.request_attempted_subflows.remove(&instance);
-                    }
                     last_error = Some(err);
                     if self.ordered_data_owner_instance == Some(instance) {
                         self.ordered_data_owner = None;
                         self.ordered_data_owner_instance = None;
                         self.reset_request_subflow_epoch();
                     } else if self
-                        .request_subflow_set
+                        .request_startup
+                        .epoch
                         .as_ref()
                         .and_then(FlowSubflowSet::startup_owner_key)
                         == Some(instance)
                     {
-                        self.request_subflow_set = None;
-                        self.request_startup_acked_bytes.remove(&instance);
-                        self.request_startup_first_sent_at.remove(&instance);
-                        self.request_startup_rate_evidence.remove(&instance);
-                        self.request_startup_receipt_proofs.remove(&instance);
+                        self.request_startup.epoch = None;
+                        self.request_startup.acked_bytes.remove(&instance);
+                        self.request_startup.first_sent_at.remove(&instance);
+                        self.request_startup.rate_evidence.remove(&instance);
+                        self.request_startup.receipt_proofs.remove(&instance);
                         self.request_graduated_subflows.remove(&instance);
                     }
                     self.fail_client_path_instance(context, remotes, instance)
@@ -1062,7 +1034,7 @@ impl RelaySenderService {
             self.try_start_request_tcp_capacity_calibration(context, remotes, lane);
             self.try_start_request_quic_capacity_calibration(context, remotes, lane);
             let payload_bytes = reliable_stream_frame_payload_bytes(frame);
-            let sealed_owner = self.request_subflow_set.as_mut().and_then(|epoch| {
+            let sealed_owner = self.request_startup.epoch.as_mut().and_then(|epoch| {
                 let owner = epoch.startup_owner_key()?;
                 epoch
                     .seal_startup_owner_if_next_frame_exceeds_credit(owner, payload_bytes)
@@ -1093,10 +1065,10 @@ impl RelaySenderService {
                 avoid_keys,
                 path_flights: Some(&self.flights),
                 ordered_data_owner: self.ordered_data_owner,
-                subflow_set: self.request_subflow_set.as_ref(),
+                subflow_set: self.request_startup.epoch.as_ref(),
                 proven_subflows: Some(&self.request_rate_proven_subflows),
                 graduated_subflows: Some(&self.request_graduated_subflows),
-                attempted_subflows: Some(&self.request_attempted_subflows),
+                attempted_subflows: Some(&self.request_startup.attempted_subflows),
                 ack_clock_calibration: Some(RequestAckClockCalibration {
                     owner: self.request_ack_clock_calibration_owner,
                     pending: self.request_ack_clock_calibration_pending,
@@ -1123,17 +1095,14 @@ impl RelaySenderService {
                     load_expectation,
                 } => {
                     let payload_bytes = reliable_stream_frame_payload_bytes(frame);
-                    let (previous, newly_attempted) = self.reserve_request_startup_subflow(
-                        context,
-                        service,
-                        candidate,
-                        payload_bytes,
-                    )?;
+                    let admission = self
+                        .request_startup
+                        .plan_admission(context.mux_limits, service, candidate, payload_bytes)
+                        .ok_or(RuntimeError::SenderServiceBlocked)?;
                     return Ok(RelayPathSendSelection {
                         position,
                         data_role: Some(PathRuntimeRole::Subflow),
-                        request_subflow_rollback: Some(previous),
-                        request_attempted_rollback: newly_attempted.then_some(candidate),
+                        request_startup_commit: Some(admission),
                         request_calibration_commit: None,
                         request_load_expectation: load_expectation
                             .map(|(active, latency)| (candidate.key, active, latency)),
@@ -1164,8 +1133,7 @@ impl RelaySenderService {
                     return Ok(RelayPathSendSelection {
                         position,
                         data_role: Some(PathRuntimeRole::Subflow),
-                        request_subflow_rollback: None,
-                        request_attempted_rollback: None,
+                        request_startup_commit: None,
                         request_calibration_commit: Some(
                             RequestAckClockCalibrationCommit::OwnerData {
                                 candidate,
@@ -1201,8 +1169,7 @@ impl RelaySenderService {
                     return Ok(RelayPathSendSelection {
                         position,
                         data_role: Some(PathRuntimeRole::Service),
-                        request_subflow_rollback: None,
-                        request_attempted_rollback: None,
+                        request_startup_commit: None,
                         request_calibration_commit: Some(
                             RequestAckClockCalibrationCommit::ServiceFence {
                                 service,
@@ -1237,11 +1204,7 @@ impl RelaySenderService {
     }
 
     fn reset_request_subflow_epoch(&mut self) {
-        self.request_subflow_set = None;
-        self.request_startup_acked_bytes.clear();
-        self.request_startup_first_sent_at.clear();
-        self.request_startup_rate_evidence.clear();
-        self.request_startup_receipt_proofs.clear();
+        self.request_startup.reset_epoch();
         // Pending entry owns no candidate bytes and is valid only for the exact
         // Service epoch that drained its lower optional frontier.
         self.request_ack_clock_calibration_pending = None;
@@ -1404,7 +1367,8 @@ impl RelaySenderService {
         remotes: &ReliableRelayRemoteSet,
     ) {
         let Some(owner) = self
-            .request_subflow_set
+            .request_startup
+            .epoch
             .as_ref()
             .and_then(FlowSubflowSet::startup_owner_key)
         else {
@@ -1426,11 +1390,13 @@ impl RelaySenderService {
             .relay_path_proof_generation(owner.key.underlay, owner.key.index)
             .unwrap_or(0);
         if self
-            .request_startup_receipt_proofs
+            .request_startup
+            .receipt_proofs
             .get(&owner)
             .is_some_and(|(_, generation)| *generation == proof_generation)
             || !self
-                .request_subflow_set
+                .request_startup
+                .epoch
                 .as_ref()
                 .is_some_and(|epoch| epoch.startup_owner_sample_sealed(owner))
         {
@@ -1446,7 +1412,8 @@ impl RelaySenderService {
             .enqueue_stream_ordered_path_proof(path.stream.lane)
         {
             Ok(Some(proof_id)) => {
-                self.request_startup_receipt_proofs
+                self.request_startup
+                    .receipt_proofs
                     .insert(owner, (proof_id, proof_generation));
                 #[cfg(feature = "lab-diagnostics")]
                 lab_diagnostic(
@@ -1553,8 +1520,7 @@ impl RelaySenderService {
         let membership_generation = remotes.membership_generation();
         if self.request_membership_generation != Some(membership_generation) {
             let live_instances = remotes.path_instances().into_iter().collect::<HashSet<_>>();
-            self.request_attempted_subflows
-                .retain(|instance| live_instances.contains(instance));
+            self.request_startup.retain_live(&live_instances);
             self.request_graduated_subflows
                 .retain(|instance| live_instances.contains(instance));
             self.request_rate_proven_subflows
@@ -1576,14 +1542,6 @@ impl RelaySenderService {
             self.request_per_flow_rate_bps
                 .retain(|instance, _| live_instances.contains(instance));
             self.request_tcp_ack_turnover
-                .retain(|instance, _| live_instances.contains(instance));
-            self.request_startup_acked_bytes
-                .retain(|instance, _| live_instances.contains(instance));
-            self.request_startup_first_sent_at
-                .retain(|instance, _| live_instances.contains(instance));
-            self.request_startup_rate_evidence
-                .retain(|instance| live_instances.contains(instance));
-            self.request_startup_receipt_proofs
                 .retain(|instance, _| live_instances.contains(instance));
             self.request_membership_generation = Some(membership_generation);
         }
@@ -1884,7 +1842,8 @@ impl RelaySenderService {
             })
         });
         if self
-            .request_subflow_set
+            .request_startup
+            .epoch
             .as_ref()
             .is_some_and(|epoch| service.is_none_or(|service| epoch.service_key() != service))
         {
@@ -1892,7 +1851,8 @@ impl RelaySenderService {
             return;
         }
         let Some(owner) = self
-            .request_subflow_set
+            .request_startup
+            .epoch
             .as_ref()
             .and_then(FlowSubflowSet::startup_owner_key)
         else {
@@ -1905,20 +1865,22 @@ impl RelaySenderService {
         if !remotes.paths.iter().any(|path| {
             path.instance() == owner && path.placement == RelayPathPlacement::Validation
         }) {
-            self.request_subflow_set = None;
-            self.request_startup_acked_bytes.remove(&owner);
-            self.request_startup_first_sent_at.remove(&owner);
-            self.request_startup_rate_evidence.remove(&owner);
-            self.request_startup_receipt_proofs.remove(&owner);
+            self.request_startup.epoch = None;
+            self.request_startup.acked_bytes.remove(&owner);
+            self.request_startup.first_sent_at.remove(&owner);
+            self.request_startup.rate_evidence.remove(&owner);
+            self.request_startup.receipt_proofs.remove(&owner);
             return;
         }
         let required_evidence_bytes = self
-            .request_subflow_set
+            .request_startup
+            .epoch
             .as_ref()
             .and_then(|epoch| epoch.startup_owner_sealed_sample_bytes(owner))
             .unwrap_or(u64::MAX);
         let receipt_acked_at = self
-            .request_startup_receipt_proofs
+            .request_startup
+            .receipt_proofs
             .get(&owner)
             .copied()
             .and_then(|(proof_id, generation)| {
@@ -1941,14 +1903,14 @@ impl RelaySenderService {
                     })
             });
         if let Some(receipt_acked_at) = receipt_acked_at
-            && !self.request_startup_rate_evidence.contains(&owner)
-            && let Some(first_sent_at) = self.request_startup_first_sent_at.get(&owner).copied()
+            && !self.request_startup.rate_evidence.contains(&owner)
+            && let Some(first_sent_at) = self.request_startup.first_sent_at.get(&owner).copied()
             && let Some(sample) = PathRateSample::new(
                 required_evidence_bytes,
                 receipt_acked_at.saturating_duration_since(first_sent_at),
             )
         {
-            self.request_startup_rate_evidence.insert(owner);
+            self.request_startup.rate_evidence.insert(owner);
             self.request_rate_proven_subflows.insert(owner);
             self.record_request_per_flow_rate_sample(owner, sample, false);
             context.mark_relay_path_rate_sample(owner.key.underlay, owner.key.index, sample);
@@ -1970,7 +1932,7 @@ impl RelaySenderService {
             );
         }
         if let Some(receipt_acked_at) = receipt_acked_at
-            && self.request_startup_rate_evidence.contains(&owner)
+            && self.request_startup.rate_evidence.contains(&owner)
             && self.request_ack_clock_first_window_subflows.insert(owner)
         {
             // The ordered receipt follows the sealed startup sample on this
@@ -1981,14 +1943,14 @@ impl RelaySenderService {
                 .or_insert_with(|| RequestPathRateEvidence::new(receipt_acked_at))
                 .seed_ack_boundary(receipt_acked_at);
         }
-        if self.request_startup_rate_evidence.contains(&owner)
+        if self.request_startup.rate_evidence.contains(&owner)
             && !self.flights.has_ordering_owner_flights_for_instance(owner)
-            && let Some(epoch) = self.request_subflow_set.as_mut()
+            && let Some(epoch) = self.request_startup.epoch.as_mut()
         {
             let graduated = epoch.graduate_startup_owner(owner);
             debug_assert!(graduated);
             self.request_graduated_subflows.insert(owner);
-            self.request_startup_receipt_proofs.remove(&owner);
+            self.request_startup.receipt_proofs.remove(&owner);
             #[cfg(feature = "lab-diagnostics")]
             lab_diagnostic(
                 "request_startup_receipt",
@@ -2622,47 +2584,6 @@ impl RelaySenderService {
         );
     }
 
-    fn reserve_request_startup_subflow(
-        &mut self,
-        context: &ClientPathContext,
-        service: RelayPathInstance,
-        candidate: RelayPathInstance,
-        payload_bytes: usize,
-    ) -> Result<(Option<FlowSubflowSet<RelayPathInstance>>, bool), RuntimeError> {
-        if service.key.underlay != UnderlayProtocol::Tcp
-            || candidate.key.underlay != UnderlayProtocol::Tcp
-        {
-            return Err(RuntimeError::SenderServiceBlocked);
-        }
-        let startup_credit = usize::try_from(reliable_subflow_startup_sample_limit_bytes(
-            context.mux_limits,
-        ))
-        .unwrap_or(usize::MAX);
-        let previous = self.request_subflow_set.clone();
-        let mut epoch = previous
-            .as_ref()
-            .filter(|epoch| epoch.matches_envelope(service, startup_credit, 0, Duration::ZERO))
-            .cloned()
-            .unwrap_or_else(|| FlowSubflowSet::new(0, service, startup_credit, 0, Duration::ZERO));
-        let input = SubflowAdmissionInput {
-            key: candidate,
-            bulk_rate_proven: false,
-            startup_owner_allowed: true,
-            frontier_clear: true,
-            completion_improves: false,
-            observed_goodput_non_degrading: true,
-            read_gap: Duration::ZERO,
-            owner_bytes: payload_bytes,
-            optional_overhead_bytes: 0,
-        };
-        if epoch.admit_subflow_owner(input).decision != PathAdmissionDecision::AdmitSubflow {
-            return Err(RuntimeError::SenderServiceBlocked);
-        }
-        self.request_subflow_set = Some(epoch);
-        let newly_attempted = self.request_attempted_subflows.insert(candidate);
-        Ok((previous, newly_attempted))
-    }
-
     fn choose_lowest_eta_relay_path(
         &self,
         context: &ClientPathContext,
@@ -2804,11 +2725,13 @@ impl RelaySenderService {
         ranges: &[OffsetRange],
     ) -> smallvec::SmallVec<[RequestOwnerAckProgress<RelayPathInstance>; 4]> {
         let startup_owner = self
-            .request_subflow_set
+            .request_startup
+            .epoch
             .as_ref()
             .and_then(FlowSubflowSet::startup_owner_key);
         let startup_required_bytes = self
-            .request_subflow_set
+            .request_startup
+            .epoch
             .as_ref()
             .and_then(|epoch| {
                 startup_owner.and_then(|owner| epoch.startup_owner_sealed_sample_bytes(owner))
@@ -2851,12 +2774,14 @@ impl RelaySenderService {
                 && startup_owner == Some(release.instance)
             {
                 let first_sent_at = self
-                    .request_startup_first_sent_at
+                    .request_startup
+                    .first_sent_at
                     .entry(release.instance)
                     .or_insert(release.sent_at);
                 *first_sent_at = (*first_sent_at).min(release.sent_at);
                 let acked_bytes = self
-                    .request_startup_acked_bytes
+                    .request_startup
+                    .acked_bytes
                     .entry(release.instance)
                     .or_default();
                 *acked_bytes = acked_bytes.saturating_add(release.bytes as u64);
@@ -2889,15 +2814,15 @@ impl RelaySenderService {
         if let Some(owner) = startup_owner
             && owner.key.underlay == UnderlayProtocol::Tcp
             && let (Some(acked_bytes), Some(first_sent_at)) = (
-                self.request_startup_acked_bytes.get(&owner).copied(),
-                self.request_startup_first_sent_at.get(&owner).copied(),
+                self.request_startup.acked_bytes.get(&owner).copied(),
+                self.request_startup.first_sent_at.get(&owner).copied(),
             )
             && acked_bytes >= startup_required_bytes
             && let Some(sample) = PathRateSample::new(
                 acked_bytes,
                 acked_at.saturating_duration_since(first_sent_at),
             )
-            && self.request_startup_rate_evidence.insert(owner)
+            && self.request_startup.rate_evidence.insert(owner)
         {
             self.request_rate_proven_subflows.insert(owner);
             self.record_request_per_flow_rate_sample(owner, sample, false);
@@ -3083,7 +3008,8 @@ impl RelaySenderService {
         remotes: &ReliableRelayRemoteSet,
     ) -> Vec<RelayPathInstance> {
         let startup_owner = self
-            .request_subflow_set
+            .request_startup
+            .epoch
             .as_ref()
             .and_then(FlowSubflowSet::startup_owner_key);
         remotes

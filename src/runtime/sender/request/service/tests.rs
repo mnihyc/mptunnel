@@ -2090,7 +2090,8 @@ async fn client_fresh_validation_proof_enables_startup_data_without_replacing_se
     );
     assert_eq!(
         sender
-            .request_subflow_set
+            .request_startup
+            .epoch
             .as_ref()
             .and_then(FlowSubflowSet::startup_owner_key),
         Some(candidate_instance)
@@ -2190,7 +2191,8 @@ async fn client_request_startup_does_not_borrow_reverse_promoted_relay_lane() {
     assert!(try_recv_reliable_path_command(&mut candidate_rx).is_none());
     assert_eq!(
         sender
-            .request_subflow_set
+            .request_startup
+            .epoch
             .as_ref()
             .and_then(FlowSubflowSet::startup_owner_key),
         None,
@@ -2219,7 +2221,8 @@ async fn client_request_startup_does_not_borrow_reverse_promoted_relay_lane() {
     ));
     assert_eq!(
         sender
-            .request_subflow_set
+            .request_startup
+            .epoch
             .as_ref()
             .and_then(FlowSubflowSet::startup_owner_key),
         Some(candidate)
@@ -2453,7 +2456,8 @@ async fn client_startup_credit_is_cumulative_and_stream_acks_do_not_refill_it() 
     }
 
     let epoch = sender
-        .request_subflow_set
+        .request_startup
+        .epoch
         .as_ref()
         .expect("request startup epoch");
     let candidate_member = epoch
@@ -2463,7 +2467,8 @@ async fn client_startup_credit_is_cumulative_and_stream_acks_do_not_refill_it() 
         .expect("startup candidate member");
     assert_eq!(candidate_member.owner_sent_bytes, startup_limit as u64);
     let (receipt_proof_id, _) = sender
-        .request_startup_receipt_proofs
+        .request_startup
+        .receipt_proofs
         .get(&candidate_instance)
         .copied()
         .expect("exhausted startup credit queues one ordered receipt proof");
@@ -2512,7 +2517,8 @@ async fn client_startup_credit_is_cumulative_and_stream_acks_do_not_refill_it() 
         key => panic!("unexpected post-graduation path: {key:?}"),
     }
     let epoch = sender
-        .request_subflow_set
+        .request_startup
+        .epoch
         .as_ref()
         .expect("graduated request epoch");
     assert_eq!(epoch.startup_owner_key(), None);
@@ -2608,10 +2614,11 @@ async fn near_cap_startup_sample_seals_when_next_frame_cannot_fit() {
         ack_client_frame_for_test(&mut sender, &context, &frame);
         offset = offset.saturating_add(payload_bytes as u64);
     }
-    assert!(sender.request_startup_receipt_proofs.is_empty());
+    assert!(sender.request_startup.receipt_proofs.is_empty());
     assert_eq!(
         sender
-            .request_subflow_set
+            .request_startup
+            .epoch
             .as_ref()
             .and_then(|epoch| epoch.startup_owner_sealed_sample_bytes(candidate)),
         None
@@ -2629,12 +2636,13 @@ async fn near_cap_startup_sample_seals_when_next_frame_cannot_fit() {
     ));
     assert_eq!(
         sender
-            .request_subflow_set
+            .request_startup
+            .epoch
             .as_ref()
             .and_then(|epoch| epoch.startup_owner_sealed_sample_bytes(candidate)),
         Some(admitted_bytes as u64)
     );
-    let (receipt_proof_id, _) = sender.request_startup_receipt_proofs[&candidate];
+    let (receipt_proof_id, _) = sender.request_startup.receipt_proofs[&candidate];
     assert!(matches!(
         try_recv_reliable_path_command(&mut candidate_rx),
         Some(ReliablePathCommand::SendFrame(Frame::PathProofData {
@@ -3212,7 +3220,8 @@ async fn client_startup_graduation_advances_to_second_validation_instance() {
     ));
 
     let epoch = sender
-        .request_subflow_set
+        .request_startup
+        .epoch
         .as_ref()
         .expect("request startup epoch");
     assert_eq!(epoch.startup_owner_key(), Some(second_instance));
@@ -3294,8 +3303,11 @@ async fn delayed_old_instance_ack_cannot_graduate_replacement_candidate() {
     let mut sender = RelaySenderService::new(stream_id);
     sender.ordered_data_owner = Some(service_key);
     sender.ordered_data_owner_instance = Some(service);
-    sender.request_subflow_set = Some(epoch);
-    sender.request_attempted_subflows.insert(replacement);
+    sender.request_startup.epoch = Some(epoch);
+    sender
+        .request_startup
+        .attempted_subflows
+        .insert(replacement);
     let frame = client_data_frame_for_test(stream_id, 0, BBR_MAX_SEND_QUANTUM_BYTES);
     sender.flights.record_owner_frame_instance(stale, &frame);
     let owner_progress = sender.release_normalized_acked_ranges_with_owner_progress(
@@ -3316,7 +3328,8 @@ async fn delayed_old_instance_ack_cannot_graduate_replacement_candidate() {
     );
     assert_eq!(
         sender
-            .request_subflow_set
+            .request_startup
+            .epoch
             .as_ref()
             .and_then(FlowSubflowSet::startup_owner_key),
         Some(replacement),
@@ -3325,7 +3338,8 @@ async fn delayed_old_instance_ack_cannot_graduate_replacement_candidate() {
     assert!(!sender.request_graduated_subflows.contains(&replacement));
     assert!(
         !sender
-            .request_startup_acked_bytes
+            .request_startup
+            .acked_bytes
             .contains_key(&replacement)
     );
 }
@@ -3501,8 +3515,8 @@ async fn udp_product_stream_ack_does_not_create_quic_graduation_evidence() {
     let mut sender = RelaySenderService::new(stream_id);
     sender.ordered_data_owner = Some(service_key);
     sender.ordered_data_owner_instance = Some(service);
-    sender.request_subflow_set = Some(epoch);
-    sender.request_attempted_subflows.insert(candidate);
+    sender.request_startup.epoch = Some(epoch);
+    sender.request_startup.attempted_subflows.insert(candidate);
     let frame = client_data_frame_for_test(stream_id, 0, startup_limit);
     sender
         .flights
@@ -3516,11 +3530,12 @@ async fn udp_product_stream_ack_does_not_create_quic_graduation_evidence() {
     assert!(
         !context.relay_path_has_bulk_model_evidence(candidate_key.underlay, candidate_key.index,)
     );
-    assert!(!sender.request_startup_acked_bytes.contains_key(&candidate));
+    assert!(!sender.request_startup.acked_bytes.contains_key(&candidate));
     assert!(!sender.request_graduated_subflows.contains(&candidate));
     assert_eq!(
         sender
-            .request_subflow_set
+            .request_startup
+            .epoch
             .as_ref()
             .and_then(FlowSubflowSet::startup_owner_key),
         None,
@@ -4525,14 +4540,16 @@ async fn ordered_receipt_proof_cannot_resurrect_udp_product_startup() {
     let mut sender = RelaySenderService::new(stream_id);
     sender.ordered_data_owner = Some(service_key);
     sender.ordered_data_owner_instance = Some(service);
-    sender.request_subflow_set = Some(epoch);
-    sender.request_attempted_subflows.insert(candidate);
+    sender.request_startup.epoch = Some(epoch);
+    sender.request_startup.attempted_subflows.insert(candidate);
     let receipt_proof_id = 991;
     sender
-        .request_startup_receipt_proofs
+        .request_startup
+        .receipt_proofs
         .insert(candidate, (receipt_proof_id, 0));
     sender
-        .request_startup_first_sent_at
+        .request_startup
+        .first_sent_at
         .insert(candidate, Instant::now());
 
     let frame = client_data_frame_for_test(stream_id, 0, startup_limit);
@@ -4544,7 +4561,7 @@ async fn ordered_receipt_proof_cannot_resurrect_udp_product_startup() {
         &context,
         &[OffsetRange::new(0, startup_limit as u64).expect("ACK range")],
     );
-    assert!(!sender.request_startup_acked_bytes.contains_key(&candidate));
+    assert!(!sender.request_startup.acked_bytes.contains_key(&candidate));
 
     tokio::time::sleep(Duration::from_millis(10)).await;
     context.mark_relay_path_proof_observation(
@@ -4562,7 +4579,8 @@ async fn ordered_receipt_proof_cannot_resurrect_udp_product_startup() {
     assert!(!sender.request_graduated_subflows.contains(&candidate));
     assert_eq!(
         sender
-            .request_subflow_set
+            .request_startup
+            .epoch
             .as_ref()
             .and_then(FlowSubflowSet::startup_owner_key),
         None
@@ -4680,11 +4698,17 @@ async fn udp_service_evidence_does_not_bootstrap_validation_with_product_bytes()
     assert!(
         !context.relay_path_has_bulk_model_evidence(candidate_key.underlay, candidate_key.index,)
     );
-    assert!(!sender.request_attempted_subflows.contains(&candidate));
+    assert!(
+        !sender
+            .request_startup
+            .attempted_subflows
+            .contains(&candidate)
+    );
     assert!(!sender.request_graduated_subflows.contains(&candidate));
     assert_eq!(
         sender
-            .request_subflow_set
+            .request_startup
+            .epoch
             .as_ref()
             .and_then(FlowSubflowSet::startup_owner_key),
         None,
@@ -4768,8 +4792,8 @@ async fn udp_validation_uses_fresh_native_evidence_after_service_is_established(
         try_recv_reliable_path_command(&mut candidate_rx),
         Some(ReliablePathCommand::SendFrame(Frame::StreamData { .. }))
     ));
-    assert!(sender.request_subflow_set.is_none());
-    assert!(sender.request_startup_receipt_proofs.is_empty());
+    assert!(sender.request_startup.epoch.is_none());
+    assert!(sender.request_startup.receipt_proofs.is_empty());
 }
 
 #[tokio::test]
@@ -4993,9 +5017,9 @@ async fn invalidated_startup_receipt_proof_requeues_in_new_generation() {
         PathAdmissionDecision::AdmitSubflow
     );
     let mut sender = RelaySenderService::new(stream_id);
-    sender.request_subflow_set = Some(epoch);
+    sender.request_startup.epoch = Some(epoch);
     sender.try_enqueue_request_startup_receipt_proof(&context, &remotes, candidate);
-    let (old_proof_id, old_generation) = sender.request_startup_receipt_proofs[&candidate];
+    let (old_proof_id, old_generation) = sender.request_startup.receipt_proofs[&candidate];
     assert_eq!(old_generation, 0);
     assert!(matches!(
         try_recv_reliable_path_command(&mut candidate_rx),
@@ -5025,7 +5049,7 @@ async fn invalidated_startup_receipt_proof_requeues_in_new_generation() {
     ));
 
     sender.try_enqueue_request_startup_receipt_proof(&context, &remotes, candidate);
-    let (new_proof_id, new_generation) = sender.request_startup_receipt_proofs[&candidate];
+    let (new_proof_id, new_generation) = sender.request_startup.receipt_proofs[&candidate];
     assert_eq!(new_generation, 1);
     assert_ne!(new_proof_id, old_proof_id);
     assert!(matches!(
@@ -5053,10 +5077,10 @@ fn service_epoch_reset_retains_attempted_and_graduated_instance_tombstones() {
         id: 1,
     };
     let mut sender = RelaySenderService::new(StreamId(107));
-    sender.request_attempted_subflows.insert(attempted);
-    sender.request_attempted_subflows.insert(graduated);
+    sender.request_startup.attempted_subflows.insert(attempted);
+    sender.request_startup.attempted_subflows.insert(graduated);
     sender.request_graduated_subflows.insert(graduated);
-    sender.request_subflow_set = Some(FlowSubflowSet::new(
+    sender.request_startup.epoch = Some(FlowSubflowSet::new(
         0,
         service,
         256 * 1024,
@@ -5070,9 +5094,19 @@ fn service_epoch_reset_retains_attempted_and_graduated_instance_tombstones() {
 
     sender.reset_request_subflow_epoch();
 
-    assert!(sender.request_subflow_set.is_none());
-    assert!(sender.request_attempted_subflows.contains(&attempted));
-    assert!(sender.request_attempted_subflows.contains(&graduated));
+    assert!(sender.request_startup.epoch.is_none());
+    assert!(
+        sender
+            .request_startup
+            .attempted_subflows
+            .contains(&attempted)
+    );
+    assert!(
+        sender
+            .request_startup
+            .attempted_subflows
+            .contains(&graduated)
+    );
     assert!(sender.request_graduated_subflows.contains(&graduated));
     assert!(sender.request_ack_clock_calibration_pending.is_none());
 }
@@ -5305,8 +5339,8 @@ async fn startup_epoch_clears_when_candidate_is_no_longer_validation() {
     let mut sender = RelaySenderService::new(stream_id);
     sender.ordered_data_owner = Some(service.key);
     sender.ordered_data_owner_instance = Some(service);
-    sender.request_subflow_set = Some(epoch);
-    sender.request_attempted_subflows.insert(candidate);
+    sender.request_startup.epoch = Some(epoch);
+    sender.request_startup.attempted_subflows.insert(candidate);
     sender.request_ack_clock_calibration_owner = Some(RequestAckClockCalibrationOwner {
         candidate,
         target_bytes: 2 * 1024 * 1024,
@@ -5326,7 +5360,7 @@ async fn startup_epoch_clears_when_candidate_is_no_longer_validation() {
 
     sender.reconcile_request_subflow_set(&context, &remotes);
 
-    assert!(sender.request_subflow_set.is_none());
+    assert!(sender.request_startup.epoch.is_none());
     assert_eq!(
         sender.request_ack_clock_calibration_owner, None,
         "an optional calibration epoch cannot survive promotion away from Validation"
@@ -5345,7 +5379,10 @@ async fn startup_epoch_clears_when_candidate_is_no_longer_validation() {
         "pending exact-instance entry cannot survive promotion away from Validation"
     );
     assert!(
-        sender.request_attempted_subflows.contains(&candidate),
+        sender
+            .request_startup
+            .attempted_subflows
+            .contains(&candidate),
         "a live role change invalidates the epoch without minting fresh credit"
     );
 }

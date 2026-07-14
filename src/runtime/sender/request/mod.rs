@@ -7,5 +7,7 @@
 use super::*;
 
 mod service;
+mod startup;
 
 pub(in crate::runtime) use service::*;
+use startup::*;

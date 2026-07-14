@@ -11,8 +11,8 @@ use crate::model::response::{
     ResponseServiceFamilyLoads, ResponseServiceHandoffMode,
 };
 use crate::protocol::frame::{reliable_stream_frame_accounted_bytes, reliable_stream_frame_extent};
+use crate::runtime::sender::response::test_support::response_target;
 use crate::runtime::stream::response::{
-    MAX_RESPONSE_QUIC_CAPACITY_CALIBRATION_ATTEMPTS_PER_PATH,
     ResponseAckClockCalibrationRetirementRequest, ResponseDispatchTarget, ResponseSenderPathTarget,
     ResponseServiceHandoffDrainReservation, ResponseStreamAttachOutcome, ResponseStreamBinding,
     ServerPathLaneTracker, ServerPathMetricsSource, next_server_carrier_path_instance_id,
@@ -436,105 +436,6 @@ fn duplicate_stream_ack_release_does_not_seed_sender_service_path_rate() {
     assert!(
         owner_progress.is_empty(),
         "ambiguous OwnerData/RepairData release must not grow request read-ahead"
-    );
-}
-
-fn response_target(
-    path_id: u16,
-    underlay: UnderlayProtocol,
-    eta_ms: f64,
-    bytes_in_flight: u64,
-    inflight_limit_bytes: u64,
-    is_active: bool,
-) -> ResponseSenderPathTarget {
-    let (commands, _receivers) = reliable_path_command_channels(8);
-    let mut snapshot = PathSnapshot::new(PathId(path_id), underlay, eta_ms.max(1.0), 500_000_000.0);
-    snapshot.bytes_in_flight = bytes_in_flight;
-    snapshot.product_bytes_in_flight = bytes_in_flight;
-    snapshot.inflight_limit_bytes = inflight_limit_bytes;
-    snapshot.confidence = 1.0;
-    ResponseSenderPathTarget {
-        #[cfg(feature = "lab-diagnostics")]
-        session_id: SessionId(0),
-        #[cfg(feature = "lab-diagnostics")]
-        binding_instance_id: 0,
-        key: CarrierPathKey {
-            underlay,
-            path_id: PathId(path_id),
-        },
-        path_instance_id: next_server_carrier_path_instance_id(),
-        incarnation: u64::from(path_id) + 1,
-        commands,
-        attachment_role: if is_active {
-            StreamOpenRole::Active
-        } else {
-            StreamOpenRole::Validation
-        },
-        snapshot,
-        owner_data_in_flight_bytes: bytes_in_flight,
-        command_pending_bytes: 0,
-        eta_ms,
-        is_active,
-        is_request_active: is_active,
-        has_sender_evidence: true,
-        has_service_feed_evidence: true,
-        has_bulk_rate_evidence: true,
-        endpoint_only_service_prior_eligible: false,
-        quic_capacity_proof: None,
-        quic_capacity_calibration_attempts: 0,
-        ack_clock_calibration_eligible: false,
-        ack_clock_calibration_proven: false,
-        ack_clock_calibration_spent_bytes: 0,
-        ack_clock_calibration_credit_limit_bytes: 0,
-        ack_clock_calibration_max_limit_bytes: 0,
-        ack_clock_calibration_active: false,
-    }
-}
-
-#[test]
-fn tcp_capacity_probe_does_not_wait_for_product_subflow_graduation() {
-    let mux_limits = MuxLimits::default();
-    let mut service = response_target(0, UnderlayProtocol::Tcp, 20.0, 0, 64 * 1024, true);
-    let mut cold = response_target(1, UnderlayProtocol::Tcp, 80.0, 0, 64 * 1024, false);
-    service.has_bulk_rate_evidence = false;
-    cold.has_bulk_rate_evidence = false;
-    let (cold_commands, _cold_receivers) = reliable_path_command_channels(4);
-    cold.commands = cold_commands;
-
-    assert!(
-        select_response_tcp_capacity_probe_target(
-            &[service.clone(), cold.clone()],
-            FlowLane::Throughput,
-            Some(service.key),
-            ResponseServiceFamilyLoads::default(),
-            mux_limits,
-        )
-        .is_none()
-    );
-
-    service.has_bulk_rate_evidence = true;
-    let (selected, train_bytes) = select_response_tcp_capacity_probe_target(
-        &[service.clone(), cold.clone()],
-        FlowLane::Throughput,
-        Some(service.key),
-        ResponseServiceFamilyLoads::default(),
-        mux_limits,
-    )
-    .expect("proven Service opens offset-free discovery");
-    assert_eq!(selected.key, cold.key);
-    assert_eq!(train_bytes, 2 * 1024 * 1024);
-
-    let udp = response_target(2, UnderlayProtocol::Udp, 10.0, 0, 64 * 1024, false);
-    assert!(
-        select_response_tcp_capacity_probe_target(
-            &[service.clone(), cold, udp],
-            FlowLane::Throughput,
-            Some(service.key),
-            ResponseServiceFamilyLoads::new(2, 0),
-            mux_limits,
-        )
-        .is_none(),
-        "a measured cross-family handoff must outrank optional TCP discovery"
     );
 }
 
@@ -13184,55 +13085,6 @@ fn bulk_only_tcp_sender_evidence_admits_startup_subflow_not_service() {
 }
 
 #[test]
-fn quic_capacity_calibration_requires_reachable_underloaded_family() {
-    let service = response_target(0, UnderlayProtocol::Tcp, 50.0, 0, 16 * 1024 * 1024, true);
-    let mut udp = response_target(1, UnderlayProtocol::Udp, 5.0, 0, 16 * 1024 * 1024, false);
-    udp.has_bulk_rate_evidence = false;
-
-    assert_eq!(
-        select_response_quic_capacity_calibration_target(
-            &[service.clone(), udp.clone()],
-            FlowLane::Throughput,
-            Some(service.key),
-            ResponseServiceFamilyLoads::new(2, 0),
-            MuxLimits::default(),
-            reliable_capacity_calibration_session_limit_bytes(MuxLimits::default()),
-        )
-        .map(|target| target.key),
-        Some(udp.key),
-        "a native QUIC sample may break the proof cycle without product offsets"
-    );
-    assert!(
-        select_response_quic_capacity_calibration_target(
-            &[service.clone(), udp.clone()],
-            FlowLane::Throughput,
-            Some(service.key),
-            ResponseServiceFamilyLoads::new(1, 1),
-            MuxLimits::default(),
-            reliable_capacity_calibration_session_limit_bytes(MuxLimits::default()),
-        )
-        .is_none(),
-        "balanced Service families need no optional carrier calibration"
-    );
-    udp.has_sender_evidence = false;
-    assert!(
-        select_response_quic_capacity_calibration_target(
-            &[service, udp],
-            FlowLane::Throughput,
-            Some(CarrierPathKey {
-                underlay: UnderlayProtocol::Tcp,
-                path_id: PathId(0),
-            }),
-            ResponseServiceFamilyLoads::new(2, 0),
-            MuxLimits::default(),
-            reliable_capacity_calibration_session_limit_bytes(MuxLimits::default()),
-        )
-        .is_none(),
-        "capacity traffic must not replace path reachability proof"
-    );
-}
-
-#[test]
 fn request_quic_capacity_geometry_models_the_competing_service_rate_pipe() {
     let mux_limits = MuxLimits::default();
     let mut candidate = PathSnapshot::new(PathId(1), UnderlayProtocol::Udp, 180.0, 1_000_000.0);
@@ -13471,123 +13323,6 @@ fn request_quic_capacity_lease_covers_cold_congestion_window_growth() {
                 .saturating_mul(rounds)
                 .saturating_add(pto),
         "a competing-pipe train must not inherit the smaller startup-sample deadline"
-    );
-}
-
-#[test]
-fn quic_capacity_calibration_prefers_fresh_path_before_retry() {
-    let mux_limits = MuxLimits::default();
-    let service = response_target(0, UnderlayProtocol::Tcp, 50.0, 0, 16 * 1024 * 1024, true);
-    let mut retry = response_target(1, UnderlayProtocol::Udp, 1.0, 0, 16 * 1024 * 1024, false);
-    retry.has_bulk_rate_evidence = false;
-    retry.quic_capacity_calibration_attempts = 1;
-    let mut fresh = response_target(2, UnderlayProtocol::Udp, 100.0, 0, 16 * 1024 * 1024, false);
-    fresh.has_bulk_rate_evidence = false;
-
-    let selected = select_response_quic_capacity_calibration_target(
-        &[service.clone(), retry, fresh.clone()],
-        FlowLane::Throughput,
-        Some(service.key),
-        ResponseServiceFamilyLoads::new(2, 0),
-        mux_limits,
-        reliable_capacity_calibration_session_limit_bytes(mux_limits),
-    )
-    .expect("at least one reachable UDP path should remain probeable");
-
-    assert_eq!(
-        selected.key, fresh.key,
-        "an unattempted path must be sampled before a lower-ETA retry"
-    );
-}
-
-#[test]
-fn quic_capacity_calibration_filters_path_at_attempt_limit() {
-    let mux_limits = MuxLimits::default();
-    let service = response_target(0, UnderlayProtocol::Tcp, 50.0, 0, 16 * 1024 * 1024, true);
-    let mut exhausted = response_target(1, UnderlayProtocol::Udp, 1.0, 0, 16 * 1024 * 1024, false);
-    exhausted.has_bulk_rate_evidence = false;
-    exhausted.quic_capacity_calibration_attempts =
-        MAX_RESPONSE_QUIC_CAPACITY_CALIBRATION_ATTEMPTS_PER_PATH;
-
-    assert!(
-        select_response_quic_capacity_calibration_target(
-            &[service.clone(), exhausted],
-            FlowLane::Throughput,
-            Some(service.key),
-            ResponseServiceFamilyLoads::new(2, 0),
-            mux_limits,
-            reliable_capacity_calibration_session_limit_bytes(mux_limits),
-        )
-        .is_none(),
-        "a path must not exceed its exact-path calibration attempt limit"
-    );
-}
-
-#[test]
-fn quic_capacity_calibration_uses_smaller_retry_when_fresh_train_does_not_fit() {
-    let mux_limits = MuxLimits::default();
-    let session_limit = reliable_capacity_calibration_session_limit_bytes(mux_limits);
-    let service = response_target(0, UnderlayProtocol::Tcp, 50.0, 0, 16 * 1024 * 1024, true);
-    let mut retry = response_target(1, UnderlayProtocol::Udp, 50.0, 0, 1, false);
-    retry.has_bulk_rate_evidence = false;
-    retry.quic_capacity_calibration_attempts = 1;
-    let mut fresh = response_target(2, UnderlayProtocol::Udp, 1.0, 0, session_limit, false);
-    fresh.has_bulk_rate_evidence = false;
-
-    let retry_train = response_quic_capacity_calibration_train_bytes(&retry, mux_limits) as u64;
-    let fresh_train = response_quic_capacity_calibration_train_bytes(&fresh, mux_limits) as u64;
-    assert!(
-        !response_quic_capacity_calibration_geometry(&fresh, mux_limits).fits_session_envelope,
-        "a clamped train cannot silently change its frozen warmup/proof geometry"
-    );
-    assert!(
-        retry_train < fresh_train,
-        "the test needs a retry train that fits below the fresh path's live window"
-    );
-
-    let selected = select_response_quic_capacity_calibration_target(
-        &[service.clone(), retry.clone(), fresh],
-        FlowLane::Throughput,
-        Some(service.key),
-        ResponseServiceFamilyLoads::new(2, 0),
-        mux_limits,
-        retry_train,
-    )
-    .expect("the smaller retry should fit the remaining session envelope");
-
-    assert_eq!(
-        selected.key, retry.key,
-        "a too-large fresh train must not hide a retry that still fits the remaining budget"
-    );
-}
-
-#[test]
-fn quic_capacity_retry_fills_live_window_plus_fresh_proof_window() {
-    let mux_limits = MuxLimits::default();
-    let mut udp = response_target(3, UnderlayProtocol::Udp, 390.0, 0, 798_666, false);
-    udp.snapshot.pacing_rate_bps = 5_530_000.0;
-    udp.snapshot.delivery_rate_bps = 153_000.0;
-
-    assert_eq!(
-        response_quic_capacity_calibration_train_bytes(&udp, mux_limits),
-        1_111_746,
-        "the grown window needs one strict-proof window plus one pacing guard"
-    );
-    assert!(
-        response_quic_capacity_calibration_lease(&udp, 1_111_746)
-            >= transport_pto_from_snapshot(Some(udp.snapshot)),
-        "the admitted train lease must cover at least one recovery horizon"
-    );
-
-    udp.snapshot.inflight_limit_bytes = u64::MAX;
-    assert!(
-        !response_quic_capacity_calibration_geometry(&udp, mux_limits).fits_session_envelope,
-        "a live window larger than the resource envelope is ineligible, not repeatedly reservable"
-    );
-    assert_eq!(
-        response_quic_capacity_calibration_train_bytes(&udp, mux_limits) as u64,
-        reliable_capacity_calibration_session_limit_bytes(mux_limits),
-        "a single train cannot exceed the session carrier envelope"
     );
 }
 

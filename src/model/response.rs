@@ -114,6 +114,25 @@ pub(crate) fn response_service_handoff_mode(
         .then_some(ResponseServiceHandoffMode::PerformanceOverride)
 }
 
+/// Adapts immutable carrier snapshots to the shared Service-placement model.
+/// Concrete TCP and QUIC discovery remain separate; both may ask whether an
+/// already measured target makes further optional discovery unnecessary.
+pub(crate) fn response_snapshot_handoff_mode(
+    service_underlay: UnderlayProtocol,
+    service: PathSnapshot,
+    target_underlay: UnderlayProtocol,
+    target: PathSnapshot,
+    family_loads: ResponseServiceFamilyLoads,
+) -> Option<ResponseServiceHandoffMode> {
+    response_service_handoff_mode(
+        service_underlay,
+        response_rate_fair_share_bps(service, service.rate_scope, false),
+        target_underlay,
+        response_rate_fair_share_bps(target, target.rate_scope, true),
+        family_loads,
+    )
+}
+
 // Product offsets are shared across every response carrier, but carrier flight
 // is not. Tail arithmetic stays separate from path ranking so a connection-level
 // tail cannot silently become a per-path congestion window.

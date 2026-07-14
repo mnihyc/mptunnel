@@ -23,6 +23,15 @@ pub(crate) struct CarrierPathKey {
     pub(crate) path_id: PathId,
 }
 
+/// Deterministic scheduler order keeps the protocol path id primary while
+/// still distinguishing equal ids carried by different transports.
+pub(crate) fn carrier_path_key_order(
+    left: CarrierPathKey,
+    right: CarrierPathKey,
+) -> std::cmp::Ordering {
+    (left.path_id, left.underlay).cmp(&(right.path_id, right.underlay))
+}
+
 /// Opaque lifetime identity for one physical carrier attachment.
 ///
 /// `CarrierPathKey` names a logical path; this value changes when that path is
@@ -40,3 +49,7 @@ impl CarrierPathInstanceId {
         self.0
     }
 }
+
+#[cfg(test)]
+#[path = "path_test.rs"]
+mod tests;

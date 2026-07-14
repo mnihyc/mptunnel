@@ -3,10 +3,8 @@
 //! The planner ranks immutable binding snapshots. The reliable-path binding
 //! remains the authority that revalidates generations and commits exact ranges.
 
-#[cfg(test)]
-#[path = "planner_test.rs"]
-mod tests;
-
+use super::quic_capacity::try_start_response_quic_capacity_calibration;
+use super::tcp_capacity::try_start_response_tcp_capacity_probe;
 use super::*;
 use crate::model::ack_clock::{
     TcpAckClockCalibrationOpportunity, reliable_tcp_ack_clock_calibration_opportunity,
@@ -22,30 +20,22 @@ use crate::model::admission::{
     bulk_service_product_envelope_payload_bytes,
 };
 use crate::model::capacity::QuicCapacityProofCandidate;
-use crate::model::path::CarrierPathInstanceId;
+use crate::model::path::{CarrierPathInstanceId, carrier_path_key_order};
 use crate::model::response::{
     CarrierPathFlightDebt, ResponseCandidateTailDebt, ResponseOrderedTail,
     ResponseSameFamilyReservoir, ResponseServiceFamilyLoads, ResponseServiceHandoffMode,
     response_oldest_lower_flight_owner, response_ordering_debt_bytes, response_rate_fair_share_bps,
-    response_service_handoff_mode,
+    response_snapshot_handoff_mode,
 };
 use crate::protocol::frame::reliable_stream_frame_accounted_bytes;
 use crate::runtime::stream::response::{
-    MAX_RESPONSE_QUIC_CAPACITY_CALIBRATION_ATTEMPTS_PER_PATH,
     MIN_ACTIVE_RESPONSE_FLOWS_FOR_SAME_FAMILY_DISCOVERY,
-    ResponseAckClockCalibrationRetirementRequest, ResponseDispatchTarget,
-    ResponseQuicCapacityCalibrationRequest, ResponseSenderPathTarget,
+    ResponseAckClockCalibrationRetirementRequest, ResponseDispatchTarget, ResponseSenderPathTarget,
     ResponseServiceHandoffDrainRequest, ResponseServiceHandoffDrainReservation,
     ResponseStreamBinding, quic_capacity_proof_pin_matches_marker, server_bulk_output_eta_ms,
     valid_quic_capacity_proof_candidate_at,
 };
 use crate::scheduler::PathRateScope;
-pub(super) fn carrier_path_key_order(
-    left: CarrierPathKey,
-    right: CarrierPathKey,
-) -> std::cmp::Ordering {
-    (left.path_id, left.underlay).cmp(&(right.path_id, right.underlay))
-}
 
 #[derive(Debug, Clone, Copy)]
 pub(super) struct ResponseBulkLead {
@@ -527,87 +517,6 @@ pub(super) fn response_startup_sample_has_completion_opportunity(
     .completes_within_service_reservoir()
 }
 
-#[derive(Debug, Clone, Copy)]
-pub(super) struct ResponseQuicCapacityCalibrationGeometry {
-    train_bytes: usize,
-    fits_session_envelope: bool,
-    sample_floor_bytes: u64,
-    accounting_slack_bytes: u64,
-    fresh_strict_window_bytes: u64,
-    carrier_window_bytes: u64,
-}
-
-pub(super) fn response_quic_capacity_calibration_geometry(
-    target: &ResponseSenderPathTarget,
-    mux_limits: MuxLimits,
-) -> ResponseQuicCapacityCalibrationGeometry {
-    let sample_floor = reliable_subflow_startup_sample_limit_bytes(mux_limits);
-    let packet_accounting_slack = (PATH_OPEN_SCORE_BYTES as u64).min(sample_floor / 8);
-    let fresh_strict_window = sample_floor.saturating_sub(packet_accounting_slack).max(1);
-    let timing_slack = CAPACITY_TIMING_SLACK_BYTES;
-    let carrier_window = target
-        .snapshot
-        .inflight_limit_bytes
-        .max(target.snapshot.bytes_in_flight);
-    let session_envelope = reliable_capacity_calibration_session_limit_bytes(mux_limits);
-    let required_train = carrier_window
-        .checked_add(fresh_strict_window)
-        .and_then(|bytes| bytes.checked_add(timing_slack));
-    let fits_session_envelope = required_train
-        .map(|bytes| bytes.max(sample_floor))
-        .is_some_and(|bytes| bytes <= session_envelope);
-    let train_bytes = usize::try_from(
-        required_train
-            .unwrap_or(u64::MAX)
-            .max(sample_floor)
-            .min(session_envelope),
-    )
-    .unwrap_or(usize::MAX)
-    .max(1);
-    ResponseQuicCapacityCalibrationGeometry {
-        train_bytes,
-        fits_session_envelope,
-        sample_floor_bytes: sample_floor,
-        accounting_slack_bytes: packet_accounting_slack,
-        fresh_strict_window_bytes: fresh_strict_window,
-        carrier_window_bytes: carrier_window,
-    }
-}
-
-#[cfg(test)]
-pub(super) fn response_quic_capacity_calibration_train_bytes(
-    target: &ResponseSenderPathTarget,
-    mux_limits: MuxLimits,
-) -> usize {
-    response_quic_capacity_calibration_geometry(target, mux_limits).train_bytes
-}
-
-pub(super) fn response_quic_capacity_calibration_lease(
-    target: &ResponseSenderPathTarget,
-    train_bytes: usize,
-) -> Duration {
-    let pto = transport_pto_from_snapshot(Some(target.snapshot));
-    let pacing_rate_bps = target
-        .snapshot
-        .pacing_rate_bps
-        .max(target.snapshot.delivery_rate_bps)
-        .max(1.0);
-    let transmit_eta = Duration::from_secs_f64(train_bytes as f64 * 8.0 / pacing_rate_bps);
-    // A healthy BBR startup grows within the persistent-congestion horizon.
-    // Waiting longer would serialize useful retries behind a stale cold rate;
-    // one additional PTO covers ACK/recovery after the bounded feed horizon.
-    transmit_eta
-        .min(pto.saturating_mul(QUIC_PERSISTENT_CONGESTION_THRESHOLD))
-        .saturating_add(pto)
-        .max(Duration::from_secs(1))
-}
-
-pub(super) fn response_quic_capacity_proof_validity(target: &ResponseSenderPathTarget) -> Duration {
-    let srtt = Duration::from_secs_f64((target.snapshot.srtt_ms.max(1.0)) / 1_000.0);
-    let rttvar = Duration::from_secs_f64((target.snapshot.jitter_ms.max(1.0)) / 1_000.0);
-    quic_bulk_proof_freshness_horizon(srtt, rttvar)
-}
-
 #[cfg(any(test, feature = "lab-diagnostics"))]
 pub(super) fn response_service_handoff_preserves_fair_share(
     service: &ResponseSenderPathTarget,
@@ -630,11 +539,11 @@ pub(super) fn response_service_handoff_mode_for_targets(
     target: &ResponseSenderPathTarget,
     family_loads: ResponseServiceFamilyLoads,
 ) -> Option<ResponseServiceHandoffMode> {
-    response_service_handoff_mode(
+    response_snapshot_handoff_mode(
         service.key.underlay,
-        response_service_fair_share_bps(service, false),
+        service.snapshot,
         target.key.underlay,
-        response_service_fair_share_bps(target, true),
+        target.snapshot,
         family_loads,
     )
 }
@@ -791,138 +700,6 @@ pub(super) fn select_response_service_handoff_candidate(
         target,
         mode,
     })
-}
-
-pub(super) fn select_response_quic_capacity_calibration_target(
-    targets: &[ResponseSenderPathTarget],
-    lane: FlowLane,
-    ordered_data_owner: Option<CarrierPathKey>,
-    service_family_loads: ResponseServiceFamilyLoads,
-    mux_limits: MuxLimits,
-    remaining_probe_bytes: u64,
-) -> Option<ResponseSenderPathTarget> {
-    if !lane.is_bulk() {
-        return None;
-    }
-    let service_key = ordered_data_owner?;
-    let service = targets.iter().find(|target| target.key == service_key)?;
-    if service.key.underlay != UnderlayProtocol::Tcp
-        || !service.is_active
-        || !service.has_bulk_rate_evidence
-        || service.snapshot.active_latency_sensitive_flows > 0
-        || service.snapshot.session_active_latency_sensitive_flows > 0
-        || service_family_loads.for_underlay(UnderlayProtocol::Tcp)
-            < service_family_loads
-                .for_underlay(UnderlayProtocol::Udp)
-                .saturating_add(2)
-    {
-        return None;
-    }
-    if targets.iter().any(|target| {
-        target.key.underlay == UnderlayProtocol::Udp
-            && target.has_bulk_rate_evidence
-            && response_service_handoff_mode_for_targets(service, target, service_family_loads)
-                .is_some()
-    }) {
-        // A measured target that already clears the placement gate should drain
-        // toward handoff; probing a second path would add optional traffic only.
-        return None;
-    }
-    targets
-        .iter()
-        .filter(|target| {
-            target.key.underlay == UnderlayProtocol::Udp
-                && target.attachment_role == StreamOpenRole::Validation
-                && !target.is_active
-                && target.has_sender_evidence
-                && !target.has_bulk_rate_evidence
-                && target.quic_capacity_calibration_attempts
-                    < MAX_RESPONSE_QUIC_CAPACITY_CALIBRATION_ATTEMPTS_PER_PATH
-                && target.command_pending_bytes == 0
-                && target.snapshot.queue_bytes == 0
-                && target.snapshot.bytes_in_flight == 0
-                && target.snapshot.active_latency_sensitive_flows == 0
-                && target.snapshot.session_active_latency_sensitive_flows == 0
-                && target.commands.can_enqueue_lane_now(FlowLane::Throughput)
-                && {
-                    let geometry = response_quic_capacity_calibration_geometry(target, mux_limits);
-                    geometry.fits_session_envelope
-                        && geometry.train_bytes as u64 <= remaining_probe_bytes
-                }
-        })
-        // Attachment order must not consume discovery opportunity: sample each
-        // exact reachable path once before spending a second attempt on one.
-        .min_by(|left, right| {
-            (left.quic_capacity_calibration_attempts != 0)
-                .cmp(&(right.quic_capacity_calibration_attempts != 0))
-                .then_with(|| left.eta_ms.total_cmp(&right.eta_ms))
-                .then_with(|| carrier_path_key_order(left.key, right.key))
-                .then_with(|| left.incarnation.cmp(&right.incarnation))
-        })
-        .cloned()
-}
-
-pub(super) fn select_response_tcp_capacity_probe_target(
-    targets: &[ResponseSenderPathTarget],
-    lane: FlowLane,
-    ordered_data_owner: Option<CarrierPathKey>,
-    service_family_loads: ResponseServiceFamilyLoads,
-    mux_limits: MuxLimits,
-) -> Option<(ResponseSenderPathTarget, u64)> {
-    if !lane.is_bulk() {
-        return None;
-    }
-    let service_key = ordered_data_owner?;
-    let service = targets.iter().find(|target| target.key == service_key)?;
-    if service.key.underlay != UnderlayProtocol::Tcp
-        || !service.is_active
-        || !service.has_bulk_rate_evidence
-        || service.snapshot.active_latency_sensitive_flows > 0
-        || service.snapshot.session_active_latency_sensitive_flows > 0
-    {
-        return None;
-    }
-    if targets.iter().any(|target| {
-        target.key.underlay == UnderlayProtocol::Udp
-            && target.has_bulk_rate_evidence
-            && response_service_handoff_mode_for_targets(service, target, service_family_loads)
-                .is_some()
-    }) {
-        // A measured cross-family target that can take Service outranks
-        // optional same-family discovery on the shared product session.
-        return None;
-    }
-    // This train owns no product offset. Requiring a product Subflow first
-    // serializes two independent discovery mechanisms and delays cold paths.
-    let envelope = reliable_capacity_calibration_session_limit_bytes(mux_limits);
-    let sample_floor = reliable_subflow_startup_sample_limit_bytes(mux_limits);
-    let train_bytes = (2 * 1024 * 1024u64).min(envelope).max(sample_floor).max(1);
-    targets
-        .iter()
-        .filter(|target| {
-            target.key != service_key
-                && target.key.underlay == UnderlayProtocol::Tcp
-                && target.attachment_role == StreamOpenRole::Validation
-                && !target.is_active
-                && target.has_sender_evidence
-                && !target.has_bulk_rate_evidence
-                && !target.commands.tcp_capacity_probe_attempted()
-                && !target.commands.tcp_capacity_probe_active()
-                && target.command_pending_bytes == 0
-                && target.snapshot.queue_bytes == 0
-                && target.snapshot.bytes_in_flight == 0
-                && target.snapshot.active_latency_sensitive_flows == 0
-                && target.snapshot.session_active_latency_sensitive_flows == 0
-                && target.commands.can_enqueue_lane_now(FlowLane::Throughput)
-        })
-        .min_by(|left, right| {
-            left.eta_ms
-                .total_cmp(&right.eta_ms)
-                .then_with(|| carrier_path_key_order(left.key, right.key))
-                .then_with(|| left.incarnation.cmp(&right.incarnation))
-        })
-        .cloned()
-        .map(|target| (target, train_bytes))
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -3245,98 +3022,32 @@ pub(super) fn plan_response_data_dispatch_with_ordered_debt_impl(
                 let lower_flights = binding.lower_flights_before_offset(next_offset);
                 let targets = binding.sender_path_targets(relay_lane, payload_bytes);
                 let ordered_data_owner = binding.ordered_data_owner();
-                if !session_scheduling.tcp_capacity_probe_reserved
-                    && let Some((target, train_bytes)) = select_response_tcp_capacity_probe_target(
-                        &targets,
-                        relay_lane,
-                        ordered_data_owner,
-                        session_scheduling.service_family_loads,
-                        binding.mux_limits(),
-                    )
-                    && let Some(expires_at) = Instant::now().checked_add(Duration::from_secs(20))
-                    && let Some(session_lease) =
-                        binding.try_reserve_tcp_capacity_probe(lane_generation)
-                {
-                    let calibration_id = match target.commands.try_enqueue_tcp_capacity_probe(
-                        TcpCapacityProbeRequest {
-                            path_id: target.key.path_id,
-                            path_instance_id: target.path_instance_id,
-                            train_payload_bytes: train_bytes,
-                            sample_floor_bytes: reliable_subflow_startup_sample_limit_bytes(
-                                binding.mux_limits(),
-                            ),
-                            expires_at,
-                        },
-                        session_lease,
-                    ) {
-                        Ok(calibration_id) => calibration_id,
-                        Err(err) => return Err(err),
-                    };
-                    #[cfg(not(feature = "lab-diagnostics"))]
-                    let _ = calibration_id;
-                    #[cfg(feature = "lab-diagnostics")]
-                    lab_diagnostic(
-                        "response_tcp_capacity_probe",
-                        format_args!(
-                            "phase=started session_id={} binding_instance_id={} path_id={} path_instance_id={} incarnation={} calibration_id={} train_bytes={}",
-                            target.session_id.0,
-                            target.binding_instance_id,
-                            target.key.path_id.0,
-                            target.path_instance_id.as_u64(),
-                            target.incarnation,
-                            calibration_id,
-                            train_bytes,
-                        ),
-                    );
+                if try_start_response_tcp_capacity_probe(
+                    binding,
+                    &targets,
+                    relay_lane,
+                    ordered_data_owner,
+                    session_scheduling.service_family_loads,
+                    lane_generation,
+                    session_scheduling.tcp_capacity_probe_reserved,
+                )? {
                     // Reservation advances the shared generation; resnapshot
                     // before any product decision.
                     continue;
                 }
-                let capacity_session_limit =
-                    reliable_capacity_calibration_session_limit_bytes(binding.mux_limits());
-                let remaining_capacity_probe_bytes = capacity_session_limit
-                    .saturating_sub(session_scheduling.quic_capacity_calibration_spent_bytes);
-                if !session_scheduling.quic_capacity_calibration_reserved
-                    && session_scheduling.response_service_handoff_drain.is_none()
-                    && session_scheduling
-                        .service_family_loads
-                        .needs_diversification()
-                    && let Some(target) = select_response_quic_capacity_calibration_target(
-                        &targets,
-                        relay_lane,
-                        ordered_data_owner,
-                        session_scheduling.service_family_loads,
-                        binding.mux_limits(),
-                        remaining_capacity_probe_bytes,
-                    )
-                    && {
-                        let geometry = response_quic_capacity_calibration_geometry(
-                            &target,
-                            binding.mux_limits(),
-                        );
-                        let train_bytes = geometry.train_bytes;
-                        let lease = response_quic_capacity_calibration_lease(&target, train_bytes);
-                        binding.try_start_quic_capacity_calibration(
-                            &target,
-                            ResponseQuicCapacityCalibrationRequest {
-                                expected_planner_generation: planner_generation,
-                                expected_lane_generation: lane_generation,
-                                expected_model_generation: model_generation,
-                                target: target.key,
-                                target_path_instance_id: target.path_instance_id,
-                                target_incarnation: target.incarnation,
-                                target_pending_bytes: target.command_pending_bytes,
-                                train_bytes,
-                                sample_floor_bytes: geometry.sample_floor_bytes,
-                                accounting_slack_bytes: geometry.accounting_slack_bytes,
-                                fresh_strict_window_bytes: geometry.fresh_strict_window_bytes,
-                                carrier_window_bytes: geometry.carrier_window_bytes,
-                                proof_validity: response_quic_capacity_proof_validity(&target),
-                                lease,
-                            },
-                        )
-                    }
-                {
+                if try_start_response_quic_capacity_calibration(
+                    binding,
+                    &targets,
+                    relay_lane,
+                    ordered_data_owner,
+                    session_scheduling.service_family_loads,
+                    planner_generation,
+                    lane_generation,
+                    model_generation,
+                    session_scheduling.quic_capacity_calibration_reserved,
+                    session_scheduling.quic_capacity_calibration_spent_bytes,
+                    session_scheduling.response_service_handoff_drain.is_some(),
+                ) {
                     // Reservation and command admission change the session and
                     // response-model generations. Replan ordinary OwnerData.
                     continue;

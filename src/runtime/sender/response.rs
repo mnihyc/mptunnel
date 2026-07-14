@@ -10,7 +10,11 @@ use super::*;
 mod diagnostics;
 mod dispatch;
 mod planner;
+mod quic_capacity;
 mod service;
+mod tcp_capacity;
+#[cfg(test)]
+pub(super) mod test_support;
 
 #[cfg(feature = "lab-diagnostics")]
 use diagnostics::lab_response_service_handoff_evaluation;

@@ -467,6 +467,13 @@ fn validate_server_config(
             limit: resources.max_paths,
         });
     }
+    if server
+        .bind_paths
+        .iter()
+        .any(|path| path.binding.source_ip.is_some())
+    {
+        return Err(ConfigError::ServerPathSourceBinding);
+    }
     validate_security_config(&server.security)?;
     server.outbound_dns.validate()?;
     if server.outbound_connect_timeout.is_zero() {
@@ -592,6 +599,7 @@ pub enum ConfigError {
     TooManyPaths { actual: usize, limit: usize },
     PathProbeIntervalZero,
     PathProbeTimeoutZero,
+    ServerPathSourceBinding,
     TunAddressRequired,
     TunIpv4PrefixInvalid,
     TunIpv6PrefixInvalid,
@@ -710,6 +718,9 @@ impl std::fmt::Display for ConfigError {
             }
             Self::PathProbeTimeoutZero => {
                 write!(f, "path probe timeout must be greater than zero")
+            }
+            Self::ServerPathSourceBinding => {
+                write!(f, "source-ip is valid only for client carrier paths")
             }
             Self::TunAddressRequired => write!(f, "TUN L4 ingress requires IPv4 or IPv6 address"),
             Self::TunIpv4PrefixInvalid => write!(f, "TUN IPv4 prefix must be in 0..=32"),

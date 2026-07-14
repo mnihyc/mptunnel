@@ -18,19 +18,20 @@ use super::admission::{
 };
 #[cfg(feature = "lab-diagnostics")]
 use super::diagnostics::{
-    ResponseBulkCandidateDiag, lab_response_ack_clock_calibration_admission,
-    lab_response_bulk_output_candidate, lab_response_bulk_output_selected,
+    ResponseBulkCandidateDiag, lab_response_bulk_output_candidate,
+    lab_response_bulk_output_selected,
 };
 use super::quic_capacity::try_start_response_quic_capacity_calibration;
-use super::tcp_capacity::try_start_response_tcp_capacity_probe;
-use super::*;
-use crate::model::ack_clock::{
-    TcpAckClockCalibrationOpportunity, reliable_tcp_ack_clock_calibration_opportunity,
+use super::tcp_capacity::{
+    ResponseAckClockCalibrationCommit, ResponseAckClockCalibrationRetirementIntent,
+    response_ack_clock_calibration_blocks_generic_owner,
+    response_ack_clock_calibration_needs_opportunity_decision,
+    response_ack_clock_calibration_pending, response_calibration_service_reservoir_has_credit,
+    select_response_ack_clock_calibration_target, try_start_response_tcp_capacity_probe,
 };
+use super::*;
 use crate::model::admission::{
     BulkAdmissionCheck, BulkAdmissionRole, bulk_candidate_admission_suppression_with_ordering_debt,
-    bulk_candidate_pipe_bytes, bulk_service_feed_reservoir_payload_bytes,
-    bulk_service_product_envelope_payload_bytes,
 };
 use crate::model::capacity::{
     QuicCapacityProofCandidate, adaptive_reliable_relay_chunk_bytes_with_frame_limit,
@@ -55,40 +56,6 @@ use crate::scheduler::PathRateScope;
 #[cfg(test)]
 #[path = "planner_test.rs"]
 mod tests;
-
-pub(super) fn response_tcp_calibration_opportunity_candidate(
-    service: &ResponseSenderPathTarget,
-    target: &ResponseSenderPathTarget,
-    lane: FlowLane,
-    payload_bytes: usize,
-    mux_limits: MuxLimits,
-) -> (PathSnapshot, f64, bool) {
-    let mut snapshot = target.snapshot;
-    let service_rate_bps = service.snapshot.delivery_rate_bps.max(1.0);
-    let uses_service_prior = target.endpoint_only_service_prior_eligible
-        && service_rate_bps > snapshot.delivery_rate_bps;
-    if !uses_service_prior {
-        return (snapshot, target.eta_ms, false);
-    }
-
-    // This prior makes a bounded measurement reachable; it is not candidate
-    // evidence and never leaves this completion-opportunity calculation.
-    snapshot.delivery_rate_bps = service_rate_bps;
-    snapshot.pacing_rate_bps = snapshot.pacing_rate_bps.max(service_rate_bps);
-    snapshot.rate_scope = PathRateScope::PathCapacity;
-    snapshot.inflight_limit_bytes = snapshot
-        .inflight_limit_bytes
-        .max(bulk_candidate_pipe_bytes(snapshot));
-    let eta_ms = server_bulk_output_eta_ms(
-        target.key,
-        snapshot,
-        Some(service.key),
-        lane,
-        payload_bytes,
-        mux_limits,
-    );
-    (snapshot, eta_ms, true)
-}
 
 #[derive(Clone)]
 pub(super) enum ResponseDataDispatchTarget {
@@ -143,33 +110,6 @@ pub(super) struct ResponseServiceHandoffCommit {
     pub(super) mode: ResponseServiceHandoffMode,
     pub(super) target_command_pending_limit_bytes: u64,
     pub(super) capacity_proof: Option<QuicCapacityProofCandidate>,
-}
-
-#[derive(Clone, Copy)]
-pub(super) struct ResponseAckClockCalibrationCommit {
-    pub(super) planner_generation: u64,
-    pub(super) lane_generation: u64,
-    pub(super) model_generation: u64,
-    pub(super) service: CarrierPathKey,
-    pub(super) service_incarnation: u64,
-    pub(super) service_pending_bytes: u64,
-    pub(super) target_pending_bytes: u64,
-    pub(super) limit_bytes: u64,
-    pub(super) requires_active_response_start: bool,
-}
-
-#[derive(Clone, Copy)]
-pub(super) struct ResponseAckClockCalibrationRetirementIntent {
-    planner_generation: u64,
-    lane_generation: u64,
-    model_generation: u64,
-    service: CarrierPathKey,
-    service_incarnation: u64,
-    service_pending_bytes: u64,
-    target: CarrierPathKey,
-    target_incarnation: u64,
-    target_pending_bytes: u64,
-    limit_bytes: u64,
 }
 
 #[derive(Clone)]
@@ -476,265 +416,6 @@ pub(super) fn response_service_handoff_drain_lease(
         .saturating_add(recovery_margin)
         .max(Duration::from_secs(1))
         .min(Duration::from_secs(60))
-}
-
-pub(super) fn select_response_ack_clock_calibration_target(
-    all_targets: &[ResponseSenderPathTarget],
-    targets: &[&ResponseSenderPathTarget],
-    lane: FlowLane,
-    service_key: CarrierPathKey,
-    ordered_owner_debt_bytes: usize,
-    payload_bytes: usize,
-    mux_limits: MuxLimits,
-    lower_flights: &[CarrierPathFlightDebt],
-    subflow_set: Option<&FlowSubflowSet>,
-    may_start_fresh_calibration: bool,
-    retirement_intents: &mut Vec<ResponseAckClockCalibrationRetirementIntent>,
-) -> Option<ResponseSelectedDataTarget> {
-    if !lower_flights.is_empty()
-        || subflow_set
-            .and_then(FlowSubflowSet::startup_owner_key)
-            .is_some()
-    {
-        return None;
-    }
-    let service = targets
-        .iter()
-        .copied()
-        .find(|target| target.key == service_key)?;
-    if !service.is_active
-        || !service.has_bulk_rate_evidence
-        || service.key.underlay != UnderlayProtocol::Tcp
-        || service.snapshot.active_latency_sensitive_flows > 0
-        || service.snapshot.session_active_latency_sensitive_flows > 0
-    {
-        return None;
-    }
-
-    let product_envelope = (mux_limits.max_path_flight_bytes as u64)
-        .min(mux_limits.max_repair_bytes as u64)
-        .min(mux_limits.max_reorder_bytes as u64)
-        .min(mux_limits.max_stream_window_bytes)
-        .max(payload_bytes as u64);
-    let active_identity = all_targets
-        .iter()
-        .find(|target| target.ack_clock_calibration_active)
-        .map(|target| (target.key, target.incarnation));
-
-    targets
-        .iter()
-        .copied()
-        .filter(|target| {
-            active_identity.is_none_or(|identity| identity == (target.key, target.incarnation))
-        })
-        .filter(|target| {
-            target.attachment_role == StreamOpenRole::Validation
-                && target.key != service_key
-                && target.key.underlay == service_key.underlay
-                && !target.is_active
-                && target.has_sender_evidence
-                && target.has_bulk_rate_evidence
-                && target.ack_clock_calibration_eligible
-                && !target.ack_clock_calibration_proven
-                && (may_start_fresh_calibration
-                    || target.ack_clock_calibration_active
-                    || target.ack_clock_calibration_spent_bytes > 0)
-                && target.snapshot.active_latency_sensitive_flows == 0
-                && target.snapshot.session_active_latency_sensitive_flows == 0
-                && target.ack_clock_calibration_credit_limit_bytes > 0
-                && target.ack_clock_calibration_credit_limit_bytes
-                    <= target.ack_clock_calibration_max_limit_bytes
-                && target
-                    .ack_clock_calibration_spent_bytes
-                    .saturating_add(payload_bytes as u64)
-                    <= target.ack_clock_calibration_credit_limit_bytes
-        })
-        .filter(|target| {
-            // Calibration spends unique OwnerData only. RepairData and carrier
-            // queue copies remain real carrier pressure but never consume or
-            // preserve this product-ownership fence.
-            let candidate_debt = target.owner_data_in_flight_bytes;
-            let projected_candidate_debt = candidate_debt.saturating_add(payload_bytes as u64);
-            // Global ordered tail and per-candidate flight overlap; only the
-            // newly assigned payload is outside both current views.
-            projected_candidate_debt <= target.ack_clock_calibration_credit_limit_bytes
-                && (ordered_owner_debt_bytes as u64)
-                    .max(candidate_debt)
-                    .saturating_add(payload_bytes as u64)
-                    <= product_envelope
-        })
-        .filter(|target| {
-            if target.ack_clock_calibration_active || target.ack_clock_calibration_spent_bytes > 0 {
-                // Once exact calibration ownership exists, finish its authorized
-                // stage. Reapplying an exploration gate could strand lower offsets.
-                return true;
-            }
-            let exploration_bytes = target
-                .ack_clock_calibration_credit_limit_bytes
-                .saturating_sub(target.ack_clock_calibration_spent_bytes);
-            let (candidate_snapshot, candidate_eta_ms, _uses_service_prior) =
-                response_tcp_calibration_opportunity_candidate(
-                    service,
-                    target,
-                    lane,
-                    payload_bytes,
-                    mux_limits,
-                );
-            let opportunity = reliable_tcp_ack_clock_calibration_opportunity(
-                service.snapshot,
-                service.eta_ms,
-                candidate_snapshot,
-                candidate_eta_ms,
-                exploration_bytes,
-                payload_bytes,
-                mux_limits,
-            );
-            #[cfg(feature = "lab-diagnostics")]
-            let projection = opportunity.projection();
-            let admitted = opportunity.is_admitted();
-            #[cfg(feature = "lab-diagnostics")]
-            {
-                lab_response_ack_clock_calibration_admission(
-                    target,
-                    service,
-                    candidate_snapshot,
-                    candidate_eta_ms,
-                    _uses_service_prior,
-                    projection,
-                    admitted,
-                );
-                if !admitted {
-                    lab_response_bulk_output_candidate(
-                        "calibration_completion_horizon",
-                        target,
-                        payload_bytes,
-                        mux_limits,
-                        ResponseBulkCandidateDiag {
-                            lead: Some(ResponseBulkLead {
-                                key: service.key,
-                                snapshot: service.snapshot,
-                                eta_ms: service.eta_ms,
-                            }),
-                            role: Some(BulkAdmissionRole::AdditionalSameUnderlay),
-                            ordering_debt: ordered_owner_debt_bytes as u64,
-                        },
-                    );
-                }
-            }
-            if matches!(opportunity, TcpAckClockCalibrationOpportunity::Retire(_)) {
-                retirement_intents.push(ResponseAckClockCalibrationRetirementIntent {
-                    planner_generation: 0,
-                    lane_generation: 0,
-                    model_generation: 0,
-                    service: service.key,
-                    service_incarnation: service.incarnation,
-                    service_pending_bytes: service.command_pending_bytes,
-                    target: target.key,
-                    target_incarnation: target.incarnation,
-                    target_pending_bytes: target.command_pending_bytes,
-                    limit_bytes: target.ack_clock_calibration_credit_limit_bytes,
-                });
-            }
-            admitted
-        })
-        .filter(|target| {
-            // RepairData cannot preserve the unique-owner fence, but it still
-            // occupies the carrier/product pipe that the atomic commit checks.
-            let carrier_pressure = target
-                .snapshot
-                .product_bytes_in_flight
-                .max(target.command_pending_bytes);
-            target.commands.can_enqueue_lane_now(lane)
-                && carrier_pressure.saturating_add(payload_bytes as u64)
-                    <= target.ack_clock_calibration_credit_limit_bytes
-        })
-        .min_by(|left, right| {
-            right
-                .ack_clock_calibration_active
-                .cmp(&left.ack_clock_calibration_active)
-                .then_with(|| {
-                    (right.ack_clock_calibration_spent_bytes > 0)
-                        .cmp(&(left.ack_clock_calibration_spent_bytes > 0))
-                })
-                .then_with(|| left.eta_ms.total_cmp(&right.eta_ms))
-                .then_with(|| carrier_path_key_order(left.key, right.key))
-                .then_with(|| left.incarnation.cmp(&right.incarnation))
-        })
-        .map(|target| ResponseSelectedDataTarget {
-            target: target.clone(),
-            admission: PathAdmission::subflow_owner(PathRuntimeRole::Subflow),
-            service_handoff_commit: None,
-            subflow_set_commit: None,
-            ack_clock_calibration_commit: Some(ResponseAckClockCalibrationCommit {
-                planner_generation: 0,
-                lane_generation: 0,
-                model_generation: 0,
-                service: service_key,
-                service_incarnation: service.incarnation,
-                service_pending_bytes: service.command_pending_bytes,
-                target_pending_bytes: target.command_pending_bytes,
-                limit_bytes: target.ack_clock_calibration_credit_limit_bytes,
-                requires_active_response_start: !target.ack_clock_calibration_active
-                    && target.ack_clock_calibration_spent_bytes == 0,
-            }),
-        })
-}
-
-pub(super) fn response_ack_clock_calibration_pending(
-    target: &ResponseSenderPathTarget,
-    may_start_fresh_calibration: bool,
-) -> bool {
-    // Begun exact ownership serializes the binding. Fresh state does so only
-    // while the session can actually start exploration; otherwise it is dormant.
-    target.ack_clock_calibration_active
-        || (!target.commands.is_closed()
-            && target.ack_clock_calibration_eligible
-            && !target.ack_clock_calibration_proven
-            && (target.ack_clock_calibration_spent_bytes > 0
-                || (may_start_fresh_calibration
-                    && target.ack_clock_calibration_spent_bytes
-                        < target.ack_clock_calibration_max_limit_bytes)))
-}
-
-pub(super) fn response_ack_clock_calibration_blocks_generic_owner(
-    target: &ResponseSenderPathTarget,
-) -> bool {
-    // Dormancy opens the binding reservoir, but this exact identity stays
-    // excluded so ordinary OwnerData cannot contaminate later ACK calibration.
-    !target.is_active
-        && (target.ack_clock_calibration_active
-            || (!target.commands.is_closed()
-                && target.ack_clock_calibration_eligible
-                && !target.ack_clock_calibration_proven
-                && target.ack_clock_calibration_spent_bytes
-                    < target.ack_clock_calibration_max_limit_bytes))
-}
-
-pub(super) fn response_calibration_service_reservoir_has_credit(
-    ordered_owner_debt_bytes: usize,
-    calibration_prefix_limit_bytes: u64,
-    payload_bytes: usize,
-    mux_limits: MuxLimits,
-) -> bool {
-    let product_envelope = bulk_service_product_envelope_payload_bytes(payload_bytes, mux_limits);
-    let calibration_prefix_limit = usize::try_from(calibration_prefix_limit_bytes)
-        .unwrap_or(usize::MAX)
-        .min(product_envelope);
-    let reservoir = bulk_service_feed_reservoir_payload_bytes(payload_bytes, mux_limits)
-        .saturating_add(calibration_prefix_limit)
-        .min(product_envelope);
-    ordered_owner_debt_bytes.saturating_add(payload_bytes) <= reservoir
-}
-
-pub(super) fn response_ack_clock_calibration_needs_opportunity_decision(
-    target: &ResponseSenderPathTarget,
-) -> bool {
-    target.key.underlay == UnderlayProtocol::Tcp
-        && target.ack_clock_calibration_eligible
-        && !target.ack_clock_calibration_proven
-        && !target.ack_clock_calibration_active
-        && target.ack_clock_calibration_spent_bytes == 0
-        && target.ack_clock_calibration_credit_limit_bytes > 0
 }
 
 pub(super) fn response_cross_underlay_owner_allowed(
@@ -1793,6 +1474,15 @@ pub(super) fn select_response_sender_data_target_with_ordered_debt_inner_and_ret
             retirement_intents,
         )
     {
+        // TCP supplies its protocol-specific target and commit; the planner
+        // adds only the shared ownership metadata used by dispatch.
+        let calibration = ResponseSelectedDataTarget {
+            target: calibration.target,
+            admission: PathAdmission::subflow_owner(PathRuntimeRole::Subflow),
+            service_handoff_commit: None,
+            subflow_set_commit: None,
+            ack_clock_calibration_commit: Some(calibration.commit),
+        };
         #[cfg(feature = "lab-diagnostics")]
         lab_response_bulk_output_selected(
             "ack_clock_calibration",

@@ -1,4 +1,7 @@
 use super::*;
+use crate::model::admission::{
+    bulk_service_feed_reservoir_payload_bytes, bulk_service_product_envelope_payload_bytes,
+};
 use crate::model::capacity::QuicCapacityProofCandidate;
 use crate::model::response::{
     CarrierPathFlightDebt, ResponseOrderedTail, ResponseSameFamilyReservoir,
@@ -11,7 +14,7 @@ use crate::runtime::stream::response::{
     ResponseServiceHandoffDrainReservation, ResponseStreamAttachOutcome, ResponseStreamBinding,
     ServerPathLaneTracker, ServerPathMetricsSource, next_server_carrier_path_instance_id,
 };
-use crate::scheduler::PathRateScope;
+use crate::scheduler::{PathRateScope, PathSnapshot};
 
 #[test]
 fn response_dispatch_plan_drops_ranked_snapshot_state() {
@@ -4684,125 +4687,6 @@ fn tcp_ack_clock_calibration_rejects_seed_beyond_service_reservoir() {
     .expect("Service remains available when exploration would create an ordering stall");
     assert_eq!(selected.target.key, service.key);
     assert!(selected.ack_clock_calibration_commit.is_none());
-}
-
-#[test]
-fn endpoint_only_response_calibration_uses_service_only_as_opportunity_prior() {
-    let mux_limits = MuxLimits::default();
-    let payload_bytes = reliable_bulk_carrier_feed_quantum_bytes(mux_limits);
-    let mut service = response_target(0, UnderlayProtocol::Tcp, 600.0, 0, 16 * 1024 * 1024, true);
-    service.snapshot.delivery_rate_bps = 128_000_000.0;
-    service.snapshot.pacing_rate_bps = 128_000_000.0;
-    service.snapshot.srtt_ms = 333.0;
-    service.snapshot.min_rtt_ms = 333.0;
-
-    let mut candidate =
-        response_target(1, UnderlayProtocol::Tcp, 570.0, 0, 16 * 1024 * 1024, false);
-    candidate.snapshot.delivery_rate_bps = 2_500_000.0;
-    candidate.snapshot.pacing_rate_bps = 2_500_000.0;
-    candidate.snapshot.srtt_ms = 722.0;
-    candidate.snapshot.min_rtt_ms = 722.0;
-    candidate.snapshot.app_limited = true;
-    candidate.endpoint_only_service_prior_eligible = true;
-    candidate.ack_clock_calibration_eligible = true;
-    candidate.ack_clock_calibration_credit_limit_bytes = 452_124;
-    candidate.ack_clock_calibration_max_limit_bytes = 64 * 1024 * 1024;
-
-    let (effective, effective_eta_ms, borrowed) = response_tcp_calibration_opportunity_candidate(
-        &service,
-        &candidate,
-        FlowLane::Throughput,
-        payload_bytes,
-        mux_limits,
-    );
-    assert!(borrowed);
-    assert_eq!(
-        effective.delivery_rate_bps,
-        service.snapshot.delivery_rate_bps
-    );
-    assert_eq!(effective.rate_scope, PathRateScope::PathCapacity);
-    assert!(effective_eta_ms < candidate.eta_ms);
-    assert_eq!(candidate.snapshot.delivery_rate_bps, 2_500_000.0);
-
-    let selected = select_response_sender_data_target_with_ordered_debt_and_epoch(
-        &[service.clone(), candidate.clone()],
-        FlowLane::Throughput,
-        payload_bytes,
-        mux_limits,
-        &[],
-        Some(service.key),
-        0,
-        None,
-    )
-    .expect("the endpoint-only candidate should receive bounded calibration work");
-    assert_eq!(selected.target.key, candidate.key);
-    assert!(selected.ack_clock_calibration_commit.is_some());
-
-    let feed_reservoir = bulk_service_feed_reservoir_payload_bytes(payload_bytes, mux_limits);
-    let mut calibrating = candidate.clone();
-    calibrating.ack_clock_calibration_active = true;
-    calibrating.ack_clock_calibration_spent_bytes =
-        calibrating.ack_clock_calibration_credit_limit_bytes;
-    let calibration_reservoir = feed_reservoir
-        + usize::try_from(calibrating.ack_clock_calibration_credit_limit_bytes).unwrap();
-    let service_within_projection = select_response_sender_data_target_with_ordered_debt_and_epoch(
-        &[service.clone(), calibrating.clone()],
-        FlowLane::Throughput,
-        payload_bytes,
-        mux_limits,
-        &[],
-        Some(service.key),
-        calibration_reservoir - payload_bytes,
-        None,
-    )
-    .expect("Service may fill the exact remainder projected behind calibration");
-    assert_eq!(service_within_projection.target.key, service.key);
-    assert!(
-        select_response_sender_data_target_with_ordered_debt_and_epoch(
-            &[service.clone(), calibrating],
-            FlowLane::Throughput,
-            payload_bytes,
-            mux_limits,
-            &[],
-            Some(service.key),
-            calibration_reservoir,
-            None,
-        )
-        .is_none(),
-        "Service must wait when calibration flight and its projected follow-up fill the reservoir"
-    );
-
-    candidate.endpoint_only_service_prior_eligible = false;
-    let configured = select_response_sender_data_target_with_ordered_debt_and_epoch(
-        &[service.clone(), candidate],
-        FlowLane::Throughput,
-        payload_bytes,
-        mux_limits,
-        &[],
-        Some(service.key),
-        0,
-        None,
-    )
-    .expect("configured candidate rejection must leave Service available");
-    assert_eq!(configured.target.key, service.key);
-    assert!(configured.ack_clock_calibration_commit.is_none());
-}
-
-#[test]
-fn fresh_tcp_calibration_is_dormant_without_active_response_demand() {
-    let mut candidate =
-        response_target(1, UnderlayProtocol::Tcp, 500.0, 0, 16 * 1024 * 1024, false);
-    let (commands, _receivers) = reliable_path_command_channels(8);
-    candidate.commands = commands;
-    candidate.ack_clock_calibration_eligible = true;
-    candidate.ack_clock_calibration_credit_limit_bytes = 256 * 1024;
-    candidate.ack_clock_calibration_max_limit_bytes = 64 * 1024 * 1024;
-
-    assert!(response_ack_clock_calibration_pending(&candidate, true));
-    assert!(!response_ack_clock_calibration_pending(&candidate, false));
-    assert!(response_ack_clock_calibration_blocks_generic_owner(
-        &candidate
-    ));
 }
 
 #[test]

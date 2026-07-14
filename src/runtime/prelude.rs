@@ -21,9 +21,9 @@ pub(super) use crate::scheduler::{
     SchedulerPolicy,
 };
 pub(super) use crate::transport::PathSpec;
-pub(super) use crate::transport::encrypted::{
-    EncryptedFramedStream, EncryptedFramedTransportError, PeerRole,
-};
+#[cfg(test)]
+pub(super) use crate::transport::encrypted::EncryptedFramedTransportError;
+pub(super) use crate::transport::encrypted::{EncryptedFramedStream, PeerRole};
 pub(super) use crate::transport::quic as quic_transport;
 pub(super) use crate::transport::tcp::{self, TcpConnectOptions};
 pub(super) use bytes::{Bytes, BytesMut};

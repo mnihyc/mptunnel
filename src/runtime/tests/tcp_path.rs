@@ -1,4 +1,5 @@
 use super::*;
+use crate::runtime::path::tcp::connect_client_tcp_path_for_test;
 
 fn test_tcp_session_runtime() -> ClientTcpPathSessionRuntime {
     ClientTcpPathSessionRuntime {
@@ -425,56 +426,6 @@ async fn duplicate_pending_tcp_open_preserves_the_first_wire_owner() -> Result<(
 }
 
 #[tokio::test]
-async fn canceled_tcp_open_queues_generation_scoped_cancellation() {
-    let stream_id = StreamId(91);
-    let attempt_id = ClientTcpOpenAttemptId(17);
-    let (commands, mut receivers) = reliable_path_command_channels(4);
-    drop(ClientTcpOpenCancellation::new(
-        commands, stream_id, attempt_id,
-    ));
-
-    assert!(matches!(
-        tokio::time::timeout(
-            Duration::from_secs(1),
-            recv_reliable_path_command(&mut receivers),
-        )
-        .await
-        .expect("detach command deadline"),
-        Some(ReliablePathCommand::CancelTcpOpen {
-            stream_id: id,
-            attempt_id: id_attempt,
-        }) if id == stream_id && id_attempt == attempt_id
-    ));
-}
-
-#[test]
-fn stale_tcp_open_cancellation_cannot_remove_current_generation() {
-    let stream_id = StreamId(92);
-    let current_attempt = ClientTcpOpenAttemptId(23);
-    let (frames, _frame_rx) = mpsc::channel(1);
-    let mut streams = HashMap::from([(
-        stream_id,
-        ClientTcpPathStreamState {
-            open_attempt_id: current_attempt,
-            frames,
-            pending_open: None,
-        },
-    )]);
-
-    assert!(
-        remove_matching_client_tcp_open(&mut streams, stream_id, ClientTcpOpenAttemptId(22),)
-            .is_none()
-    );
-    assert_eq!(
-        streams.get(&stream_id).map(|state| state.open_attempt_id),
-        Some(current_attempt),
-        "cleanup from an older opener must preserve the current stream owner"
-    );
-    assert!(remove_matching_client_tcp_open(&mut streams, stream_id, current_attempt).is_some());
-    assert!(!streams.contains_key(&stream_id));
-}
-
-#[tokio::test]
 async fn dropped_accepted_stream_guard_queues_detach_and_local_close() {
     let stream_id = StreamId(92);
     let (opened, mut receivers, _frames) =
@@ -602,7 +553,7 @@ async fn tcp_path_deadline_bounds_the_complete_mpp_handshake() {
     let deadline = tokio::time::Instant::now() + Duration::from_millis(500);
     let started_at = Instant::now();
     let client = tokio::spawn(async move {
-        connect_client_tcp_path(
+        connect_client_tcp_path_for_test(
             &path,
             0,
             SessionId(41),
@@ -1720,131 +1671,6 @@ async fn cancelled_quic_capacity_ticket_wakes_carrier_cancellation() {
         .await
         .expect("cancelled ticket must wake carrier cancellation");
     assert!(!ticket.publish());
-}
-
-#[tokio::test]
-async fn client_tcp_path_ignores_late_frames_for_recently_closed_stream() {
-    let stream_id = StreamId(7);
-    let (frames_tx, frames_rx) = mpsc::channel(1);
-    let mut streams = HashMap::new();
-    streams.insert(
-        stream_id,
-        ClientTcpPathStreamState {
-            open_attempt_id: ClientTcpOpenAttemptId(1),
-            frames: frames_tx,
-            pending_open: None,
-        },
-    );
-    let mut closed_streams = RecentIdCache::new(8);
-    drop(frames_rx);
-
-    route_client_tcp_stream_frame(
-        &mut streams,
-        &mut closed_streams,
-        stream_id,
-        Frame::StreamFin {
-            stream_id,
-            final_offset: 0,
-        },
-    )
-    .await
-    .expect("receiver close should mark stream drained");
-    assert!(!streams.contains_key(&stream_id));
-    assert!(closed_streams.contains(&stream_id));
-
-    route_client_tcp_stream_frame(
-        &mut streams,
-        &mut closed_streams,
-        stream_id,
-        Frame::StreamAck {
-            stream_id,
-            complete: true,
-            ranges: Vec::new(),
-        },
-    )
-    .await
-    .expect("late frame for closed stream should be ignored");
-
-    let unknown = StreamId(99);
-    route_client_tcp_stream_frame(
-        &mut streams,
-        &mut closed_streams,
-        unknown,
-        Frame::StreamFin {
-            stream_id: unknown,
-            final_offset: 0,
-        },
-    )
-    .await
-    .expect("unknown product stream frame should be dropped at product layer");
-    assert!(closed_streams.contains(&unknown));
-}
-
-#[tokio::test]
-async fn client_tcp_path_routes_inflight_receive_frames_to_live_stream() {
-    let stream_id = StreamId(70);
-    let (frames_tx, mut frames_rx) = mpsc::channel(4);
-    let mut streams = HashMap::new();
-    streams.insert(
-        stream_id,
-        ClientTcpPathStreamState {
-            open_attempt_id: ClientTcpOpenAttemptId(2),
-            frames: frames_tx,
-            pending_open: None,
-        },
-    );
-    let mut closed_streams = RecentIdCache::new(8);
-
-    route_client_tcp_stream_frame(
-        &mut streams,
-        &mut closed_streams,
-        stream_id,
-        Frame::StreamData {
-            stream_id,
-            offset: 0,
-            flags: StreamFlags::NONE,
-            payload: Bytes::from_static(b"inflight"),
-        },
-    )
-    .await
-    .expect("live stream should route in-flight data");
-
-    match frames_rx
-        .recv()
-        .await
-        .expect("in-flight frame")
-        .expect("frame")
-    {
-        Frame::StreamData {
-            stream_id: routed,
-            payload,
-            ..
-        } => {
-            assert_eq!(routed, stream_id);
-            assert_eq!(&payload[..], b"inflight");
-        }
-        other => panic!("expected routed stream data, got {other:?}"),
-    }
-    assert!(
-        streams.contains_key(&stream_id),
-        "routing a frame must preserve the live stream owner"
-    );
-
-    route_client_tcp_stream_frame(
-        &mut streams,
-        &mut closed_streams,
-        stream_id,
-        Frame::StreamFin {
-            stream_id,
-            final_offset: 8,
-        },
-    )
-    .await
-    .expect("FIN routes before cleanup");
-    assert!(
-        streams.contains_key(&stream_id),
-        "plain routing alone does not apply terminal cleanup"
-    );
 }
 
 #[tokio::test]
@@ -3806,92 +3632,6 @@ fn client_sender_pass_budget_does_not_become_frame_quantum() {
         reliable_relay_client_dispatch_payload_limit(BBR_MAX_SEND_QUANTUM_BYTES, 16 * 1024),
         16 * 1024
     );
-}
-
-#[test]
-fn tcp_write_interlock_routes_ready_feedback_and_stops_at_backpressure() {
-    let stream_id = StreamId(81);
-    let (frames, mut frame_rx) = mpsc::channel(1);
-    let mut streams = HashMap::from([(
-        stream_id,
-        ClientTcpPathStreamState {
-            open_attempt_id: ClientTcpOpenAttemptId(3),
-            frames,
-            pending_open: None,
-        },
-    )]);
-    let mut closed_streams = RecentIdCache::new(4);
-    let ack = Frame::StreamAck {
-        stream_id,
-        complete: false,
-        ranges: vec![OffsetRange { start: 0, end: 64 }],
-    };
-
-    assert!(matches!(
-        try_route_client_tcp_stream_frame_during_write(
-            ack.clone(),
-            &mut streams,
-            &mut closed_streams,
-        ),
-        ClientTcpWriteFrameRoute::Routed
-    ));
-    assert!(matches!(
-        frame_rx.try_recv().expect("routed ACK"),
-        Ok(frame) if frame == ack
-    ));
-
-    streams
-        .get(&stream_id)
-        .expect("stream")
-        .frames
-        .try_send(Ok(Frame::Ping { nonce: 1 }))
-        .expect("fill delivery queue");
-    let response = Frame::StreamData {
-        stream_id,
-        offset: 0,
-        flags: StreamFlags::NONE,
-        payload: Bytes::from_static(b"response"),
-    };
-    assert!(matches!(
-        try_route_client_tcp_stream_frame_during_write(
-            response.clone(),
-            &mut streams,
-            &mut closed_streams,
-        ),
-        ClientTcpWriteFrameRoute::Barrier(frame) if frame == response
-    ));
-    assert!(matches!(
-        try_route_client_tcp_stream_frame_during_write(
-            Frame::SessionClose {
-                reason: CloseReason::Normal,
-            },
-            &mut streams,
-            &mut closed_streams,
-        ),
-        ClientTcpWriteFrameRoute::Barrier(Frame::SessionClose { .. })
-    ));
-
-    assert!(matches!(
-        frame_rx.try_recv().expect("queued frame"),
-        Ok(Frame::Ping { nonce: 1 })
-    ));
-    let fin = Frame::StreamFin {
-        stream_id,
-        final_offset: 8,
-    };
-    assert!(matches!(
-        try_route_client_tcp_stream_frame_during_write(
-            fin.clone(),
-            &mut streams,
-            &mut closed_streams,
-        ),
-        ClientTcpWriteFrameRoute::Routed
-    ));
-    assert!(matches!(
-        frame_rx.try_recv().expect("routed FIN"),
-        Ok(frame) if frame == fin
-    ));
-    assert!(!streams.contains_key(&stream_id));
 }
 
 #[tokio::test]

@@ -1,4 +1,20 @@
-use super::*;
+use super::{
+    TcpCapacityProbeRequest, reliable_path_command_channels, reliable_path_command_pending_bytes,
+    reliable_path_effective_frame_lane, reliable_path_frame_uses_priority_queue,
+    reliable_path_stream_ordered_queue_lane, try_recv_reliable_path_command,
+};
+use crate::model::capacity::RELIABLE_STREAM_STARTUP_PRODUCT_WINDOW_BYTES;
+use crate::protocol::{
+    DatagramFlowId, Frame, PathId, ResetReason, SessionId, StreamFlags, StreamId,
+};
+use crate::runtime::error::RuntimeError;
+use crate::runtime::stream::{
+    ServerPathLaneTracker, TcpCapacityProbeSessionLease, next_server_carrier_path_instance_id,
+};
+use crate::scheduler::FlowLane;
+use bytes::Bytes;
+use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 fn tcp_probe_tracker_and_lease() -> (Arc<ServerPathLaneTracker>, TcpCapacityProbeSessionLease) {
     let tracker = Arc::new(ServerPathLaneTracker::default());
@@ -69,4 +85,64 @@ fn tcp_capacity_attempt_is_spent_only_after_queue_admission() {
         ),
         Err(RuntimeError::SenderServiceBlocked)
     ));
+}
+
+#[test]
+fn control_and_ack_frames_never_use_throughput_lane() {
+    let priority_frames = [
+        (
+            Frame::StreamAck {
+                stream_id: StreamId(1),
+                complete: false,
+                ranges: vec![],
+            },
+            FlowLane::Control,
+        ),
+        (
+            Frame::StreamMaxData {
+                stream_id: StreamId(1),
+                max_offset: 1024,
+            },
+            FlowLane::Control,
+        ),
+        (
+            Frame::StreamFin {
+                stream_id: StreamId(1),
+                final_offset: 64,
+            },
+            FlowLane::Control,
+        ),
+        (
+            Frame::StreamReset {
+                stream_id: StreamId(1),
+                reason: ResetReason::RemoteClosed,
+            },
+            FlowLane::Control,
+        ),
+        (
+            Frame::StreamDetach {
+                stream_id: StreamId(1),
+            },
+            FlowLane::Control,
+        ),
+        (
+            Frame::DatagramFeedback {
+                flow_id: DatagramFlowId(1),
+                received: vec![],
+            },
+            FlowLane::RealtimeDatagram,
+        ),
+        (
+            Frame::DatagramClose {
+                flow_id: DatagramFlowId(1),
+            },
+            FlowLane::Control,
+        ),
+    ];
+
+    for (frame, expected_lane) in priority_frames {
+        let effective_lane = reliable_path_effective_frame_lane(&frame, FlowLane::Throughput);
+        assert_eq!(effective_lane, expected_lane);
+        assert!(reliable_path_frame_uses_priority_queue(effective_lane));
+    }
 }

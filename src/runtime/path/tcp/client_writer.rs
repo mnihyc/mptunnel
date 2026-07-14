@@ -1,0 +1,635 @@
+//! Serialized writes and bounded command draining for a reliable TCP carrier.
+//!
+//! Only this owner batches commands or interlocks reads with a pending write,
+//! preserving frame order without allowing feedback backpressure to deadlock.
+
+use super::client_capacity::{ClientTcpCapacityProbeWriteOutcome, client_write_tcp_capacity_probe};
+use super::client_receive::handle_client_tcp_path_frame;
+use super::client_state::{ClientTcpPathConnection, ClientTcpPathSessionRuntime};
+use super::client_stream::{
+    ClientTcpOpenStreamRequest, ClientTcpPathStreamState, open_client_tcp_stream_on_connection,
+    remove_matching_client_tcp_open,
+};
+#[cfg(feature = "lab-diagnostics")]
+use crate::lab_diagnostics::lab_diagnostic;
+use crate::model::capacity::reliable_capacity_calibration_session_limit_bytes;
+use crate::mux::MuxLimits;
+use crate::protocol::{Frame, PathId, StreamId, UnderlayProtocol};
+use crate::runtime::error::RuntimeError;
+use crate::runtime::path::commands::{
+    ReliablePathCommand, ReliablePathCommandReceivers, TcpCapacityProbeCommand,
+    TcpCapacityProbeOwner, reliable_path_command_pending_bytes,
+    reliable_path_command_writer_run_budget_bytes, reliable_path_command_writer_run_budget_items,
+    reliable_path_command_writer_run_bytes, reliable_path_frame_requires_capacity_command,
+    reliable_path_writer_frame_queue, try_coalesce_reliable_path_writer_run,
+    try_recv_reliable_path_command,
+};
+use crate::runtime::path::state::RequestTcpCapacityProbeLease;
+use crate::runtime::recent_ids::RecentIdCache;
+#[cfg(feature = "lab-diagnostics")]
+use crate::runtime::relay::io::stream_ack_contiguous_frontier;
+use std::collections::HashMap;
+use std::time::Instant;
+use tokio::sync::mpsc;
+
+pub(super) async fn handle_connected_client_tcp_command_run(
+    first_command: ReliablePathCommand,
+    commands: &mut ReliablePathCommandReceivers,
+    connection: &mut ClientTcpPathConnection,
+    streams: &mut HashMap<StreamId, ClientTcpPathStreamState>,
+    closed_streams: &mut RecentIdCache<StreamId>,
+    runtime: &ClientTcpPathSessionRuntime,
+    carrier_generation: u64,
+    stream_frame_queue: usize,
+    mux_limits: MuxLimits,
+    pending_frames: &mut Vec<Frame>,
+) -> Result<(), RuntimeError> {
+    #[cfg(feature = "lab-diagnostics")]
+    let drain_started = Instant::now();
+    let byte_budget = reliable_path_command_writer_run_budget_bytes(mux_limits);
+    let item_budget = reliable_path_command_writer_run_budget_items(mux_limits);
+    let mut next_command = Some(first_command);
+    pending_frames.clear();
+    let mut sent_bytes = 0usize;
+    let mut sent_items = 0usize;
+    let mut wrote_frame = false;
+
+    loop {
+        let Some(command) = next_command
+            .take()
+            .or_else(|| try_recv_reliable_path_command(commands))
+        else {
+            if try_coalesce_reliable_path_writer_run(
+                commands,
+                &mut next_command,
+                sent_items,
+                sent_bytes,
+                byte_budget,
+                item_budget,
+            )
+            .await
+            {
+                continue;
+            }
+            break;
+        };
+        let pending_bytes = reliable_path_command_pending_bytes(&command);
+        let writer_run_bytes = reliable_path_command_writer_run_bytes(&command);
+        match command {
+            ReliablePathCommand::SendFrame(frame)
+                if reliable_path_frame_requires_capacity_command(&frame) =>
+            {
+                commands.release_pending_command_bytes(pending_bytes);
+                return Err(RuntimeError::Protocol(
+                    "client TCP path received an untyped capacity frame",
+                ));
+            }
+            ReliablePathCommand::SendFrame(frame) => {
+                let is_stream_detach = matches!(&frame, Frame::StreamDetach { .. });
+                #[cfg(feature = "lab-diagnostics")]
+                if let Frame::StreamAck {
+                    stream_id,
+                    complete,
+                    ranges,
+                } = &frame
+                {
+                    lab_diagnostic(
+                        "client_tcp_stream_ack_dequeue",
+                        format_args!(
+                            "stream_id={} path_index={} complete={} ranges={} frontier={} largest_end={} pending_bytes_after={}",
+                            stream_id.0,
+                            runtime.path_index,
+                            complete,
+                            ranges.len(),
+                            stream_ack_contiguous_frontier(*complete, ranges),
+                            ranges.last().map_or(0, |range| range.end),
+                            commands.pending_bytes(),
+                        ),
+                    );
+                }
+                pending_frames.push(frame);
+                commands.release_pending_command_bytes(pending_bytes);
+                wrote_frame = true;
+                sent_bytes = sent_bytes.saturating_add(writer_run_bytes);
+                sent_items = sent_items.saturating_add(1);
+                if is_stream_detach || sent_bytes >= byte_budget || sent_items >= item_budget {
+                    break;
+                }
+                continue;
+            }
+            ReliablePathCommand::SendQuicCapacityProbe(probe) => {
+                probe.ticket.cancel();
+                commands.release_pending_command_bytes(pending_bytes);
+                return Err(RuntimeError::Protocol(
+                    "client TCP path received QUIC capacity command",
+                ));
+            }
+            ReliablePathCommand::SendTcpCapacityProbe(probe) => {
+                let TcpCapacityProbeOwner::Request {
+                    stream_id,
+                    path_instance,
+                } = probe.owner
+                else {
+                    commands.release_pending_command_bytes(pending_bytes);
+                    return Err(RuntimeError::Protocol(
+                        "client TCP path received response capacity command",
+                    ));
+                };
+                let request_current = probe
+                    .request_lease()
+                    .is_some_and(RequestTcpCapacityProbeLease::is_current);
+                let stream_is_attached = streams
+                    .get(&stream_id)
+                    .is_some_and(|state| state.pending_open.is_none());
+                if !request_current || !stream_is_attached {
+                    // A planner may revoke a queued probe after the stream or
+                    // proof epoch changes, or the product stream may detach
+                    // before dequeue. With no carrier bytes, both are normal
+                    // canceled transactions rather than shared-path failures.
+                    if let Some(lease) = probe.request_lease() {
+                        lease.refund_if_unwritten();
+                    }
+                    commands.release_pending_command_bytes(pending_bytes);
+                    return Ok(());
+                }
+                if probe.path_id != PathId(runtime.path_index as u16)
+                    || path_instance.key.underlay != UnderlayProtocol::Tcp
+                    || path_instance.key.index != runtime.path_index
+                    || probe.train_payload_bytes < probe.sample_floor_bytes
+                    || probe.train_payload_bytes
+                        > reliable_capacity_calibration_session_limit_bytes(mux_limits)
+                    || !probe.valid_request_tcp_train()
+                    || connection.capacity.has_pending_request()
+                {
+                    commands.release_pending_command_bytes(pending_bytes);
+                    return Err(RuntimeError::Protocol(
+                        "request TCP capacity command does not match its writer",
+                    ));
+                }
+                if let Err(error) = flush_client_tcp_frame_batch(
+                    connection,
+                    pending_frames,
+                    streams,
+                    closed_streams,
+                    runtime,
+                )
+                .await
+                {
+                    commands.release_pending_command_bytes(pending_bytes);
+                    return Err(error);
+                }
+                if Instant::now() >= probe.expires_at {
+                    if let Some(lease) = probe.request_lease() {
+                        lease.refund_if_unwritten();
+                    }
+                    commands.release_pending_command_bytes(pending_bytes);
+                    return Ok(());
+                }
+                let measurement_result = client_write_tcp_capacity_probe_interlocked(
+                    connection,
+                    &probe,
+                    mux_limits.max_payload_bytes,
+                    streams,
+                    closed_streams,
+                    mux_limits,
+                )
+                .await;
+                commands.release_pending_command_bytes(pending_bytes);
+                let (write_outcome, deferred_frames) = measurement_result?;
+                connection.record_outbound_activity();
+                match write_outcome {
+                    ClientTcpCapacityProbeWriteOutcome::NoWire => {
+                        if let Some(lease) = probe.request_lease() {
+                            lease.refund_if_unwritten();
+                        }
+                        #[cfg(feature = "lab-diagnostics")]
+                        lab_diagnostic(
+                            "request_tcp_capacity_probe",
+                            format_args!(
+                                "phase=discarded reason=no_wire stream_id={} path_index={} instance_id={} calibration_id={}",
+                                stream_id.0,
+                                runtime.path_index,
+                                path_instance.id,
+                                probe.calibration_id,
+                            ),
+                        );
+                    }
+                    ClientTcpCapacityProbeWriteOutcome::Measured(measurement) => {
+                        #[cfg(feature = "lab-diagnostics")]
+                        lab_diagnostic(
+                            "request_tcp_capacity_probe",
+                            format_args!(
+                                "phase=sent stream_id={} path_index={} instance_id={} calibration_id={} train_bytes={} train_wire_bytes={} sample_floor_bytes={} warmup_bytes={} timing_slack_bytes={} required_timed_bytes={}",
+                                stream_id.0,
+                                runtime.path_index,
+                                path_instance.id,
+                                probe.calibration_id,
+                                probe.train_payload_bytes,
+                                measurement.train_wire_bytes,
+                                probe.sample_floor_bytes,
+                                probe.warmup_carrier_bytes,
+                                probe.timing_slack_bytes,
+                                probe.required_timed_carrier_bytes,
+                            ),
+                        );
+                        connection.capacity.publish_request(probe, measurement);
+                    }
+                }
+                for frame in deferred_frames {
+                    handle_client_tcp_path_frame(
+                        frame,
+                        connection,
+                        streams,
+                        closed_streams,
+                        runtime,
+                    )
+                    .await?;
+                }
+                return Ok(());
+            }
+            command => {
+                flush_client_tcp_frame_batch(
+                    connection,
+                    pending_frames,
+                    streams,
+                    closed_streams,
+                    runtime,
+                )
+                .await?;
+                handle_connected_client_tcp_command(
+                    command,
+                    connection,
+                    streams,
+                    closed_streams,
+                    carrier_generation,
+                    stream_frame_queue,
+                    false,
+                )
+                .await?;
+                commands.release_pending_command_bytes(pending_bytes);
+            }
+        }
+        sent_items = sent_items.saturating_add(1);
+        if sent_bytes >= byte_budget || sent_items >= item_budget {
+            break;
+        }
+    }
+
+    flush_client_tcp_frame_batch(connection, pending_frames, streams, closed_streams, runtime)
+        .await?;
+
+    #[cfg(feature = "lab-diagnostics")]
+    lab_diagnostic(
+        "path_writer_drain",
+        format_args!(
+            "role=client underlay=Tcp sent_items={} sent_bytes={} byte_budget={} item_budget={} pending_bytes_after={} elapsed_us={} hit_byte_budget={} hit_item_budget={}",
+            sent_items,
+            sent_bytes,
+            byte_budget,
+            item_budget,
+            commands.pending_bytes(),
+            drain_started.elapsed().as_micros(),
+            sent_bytes >= byte_budget,
+            sent_items >= item_budget,
+        ),
+    );
+    if wrote_frame {
+        connection.carrier.writer.flush().await?;
+    }
+    Ok(())
+}
+
+async fn flush_client_tcp_frame_batch(
+    connection: &mut ClientTcpPathConnection,
+    frames: &mut Vec<Frame>,
+    streams: &mut HashMap<StreamId, ClientTcpPathStreamState>,
+    closed_streams: &mut RecentIdCache<StreamId>,
+    runtime: &ClientTcpPathSessionRuntime,
+) -> Result<(), RuntimeError> {
+    if frames.is_empty() {
+        return Ok(());
+    }
+    let mut deferred_frame = None;
+    let mut routed_frames = 0usize;
+    {
+        let write = connection.carrier.writer.write_frames(frames);
+        tokio::pin!(write);
+        loop {
+            tokio::select! {
+                biased;
+                result = &mut write => {
+                    result?;
+                    break;
+                }
+                incoming = connection.carrier.frames.recv(), if deferred_frame.is_none() => {
+                    match incoming {
+                        Some(Ok(frame)) => {
+                            match try_route_client_tcp_stream_frame_during_write(
+                                frame,
+                                streams,
+                                closed_streams,
+                            ) {
+                                ClientTcpWriteFrameRoute::Routed => {
+                                    routed_frames = routed_frames.saturating_add(1);
+                                }
+                                ClientTcpWriteFrameRoute::Barrier(frame) => {
+                                    deferred_frame = Some(frame);
+                                }
+                            }
+                        }
+                        Some(Err(err)) => return Err(RuntimeError::Encrypted(err)),
+                        None => return Err(RuntimeError::ReliablePathSessionClosed),
+                    }
+                }
+            }
+        }
+    }
+    #[cfg(feature = "lab-diagnostics")]
+    for frame in frames.iter() {
+        if let Frame::StreamAck {
+            stream_id,
+            complete,
+            ranges,
+        } = frame
+        {
+            lab_diagnostic(
+                "client_tcp_stream_ack_write_complete",
+                format_args!(
+                    "stream_id={} path_index={} complete={} ranges={} frontier={} largest_end={}",
+                    stream_id.0,
+                    runtime.path_index,
+                    complete,
+                    ranges.len(),
+                    stream_ack_contiguous_frontier(*complete, ranges),
+                    ranges.last().map_or(0, |range| range.end),
+                ),
+            );
+        }
+    }
+    for frame in frames.iter() {
+        connection.path_proofs.record_sent_frame(frame);
+    }
+    frames.clear();
+    connection.record_outbound_activity();
+    #[cfg(feature = "lab-diagnostics")]
+    if routed_frames > 0 || deferred_frame.is_some() {
+        lab_diagnostic(
+            "client_tcp_write_feedback_interlock",
+            format_args!(
+                "path_index={} routed_frames={} deferred_frames={}",
+                runtime.path_index,
+                routed_frames,
+                usize::from(deferred_frame.is_some()),
+            ),
+        );
+    }
+    if let Some(frame) = deferred_frame {
+        handle_client_tcp_path_frame(frame, connection, streams, closed_streams, runtime).await?;
+    }
+    Ok(())
+}
+
+async fn client_write_tcp_capacity_probe_interlocked(
+    connection: &mut ClientTcpPathConnection,
+    probe: &TcpCapacityProbeCommand,
+    max_payload_bytes: usize,
+    streams: &mut HashMap<StreamId, ClientTcpPathStreamState>,
+    closed_streams: &mut RecentIdCache<StreamId>,
+    mux_limits: MuxLimits,
+) -> Result<(ClientTcpCapacityProbeWriteOutcome, Vec<Frame>), RuntimeError> {
+    let write = client_write_tcp_capacity_probe(
+        &mut connection.carrier.writer,
+        connection.carrier.tcp_metrics.as_ref(),
+        probe,
+        max_payload_bytes,
+    );
+    tokio::pin!(write);
+    let deferred_limit = reliable_path_writer_frame_queue(mux_limits).max(1);
+    let mut deferred_frames = Vec::new();
+    let mut defer_all = false;
+    let mut routed_frames = 0usize;
+    let mut deferred_error = None;
+    let mut reader_open = true;
+    let measurement = loop {
+        tokio::select! {
+            biased;
+            result = &mut write => {
+                break result;
+            }
+            incoming = connection.carrier.frames.recv(), if reader_open => {
+                let frame = match incoming {
+                    Some(Ok(frame)) => frame,
+                    Some(Err(error)) => {
+                        deferred_error.get_or_insert(RuntimeError::Encrypted(error));
+                        reader_open = false;
+                        continue;
+                    }
+                    None => {
+                        deferred_error.get_or_insert(RuntimeError::ReliablePathSessionClosed);
+                        reader_open = false;
+                        continue;
+                    }
+                };
+                if deferred_error.is_some() {
+                    continue;
+                }
+                if !defer_all {
+                    match try_route_client_tcp_stream_frame_during_write(
+                        frame,
+                        streams,
+                        closed_streams,
+                    ) {
+                        ClientTcpWriteFrameRoute::Routed => {
+                            routed_frames = routed_frames.saturating_add(1);
+                            continue;
+                        }
+                        ClientTcpWriteFrameRoute::Barrier(frame) => {
+                            defer_all = true;
+                            deferred_frames.push(frame);
+                        }
+                    }
+                } else if deferred_frames.len() < deferred_limit {
+                    deferred_frames.push(frame);
+                } else {
+                    // Continue draining so the peer can read the in-progress
+                    // probe, then fail the carrier and let reliable repair own
+                    // any product frames that could not remain ordered here.
+                    deferred_error.get_or_insert(RuntimeError::Protocol(
+                        "request TCP capacity feedback interlock overflowed",
+                    ));
+                    deferred_frames.clear();
+                }
+            }
+        }
+    }?;
+    if let Some(error) = deferred_error {
+        return Err(error);
+    }
+    #[cfg(feature = "lab-diagnostics")]
+    if routed_frames > 0 || !deferred_frames.is_empty() {
+        lab_diagnostic(
+            "request_tcp_capacity_feedback_interlock",
+            format_args!(
+                "routed_frames={} deferred_frames={}",
+                routed_frames,
+                deferred_frames.len(),
+            ),
+        );
+    }
+    Ok((measurement, deferred_frames))
+}
+
+enum ClientTcpWriteFrameRoute {
+    Routed,
+    Barrier(Frame),
+}
+
+fn try_route_client_tcp_stream_frame_during_write(
+    frame: Frame,
+    streams: &mut HashMap<StreamId, ClientTcpPathStreamState>,
+    closed_streams: &mut RecentIdCache<StreamId>,
+) -> ClientTcpWriteFrameRoute {
+    let stream_id = match &frame {
+        Frame::StreamMaxData { stream_id, .. }
+        | Frame::StreamReset { stream_id, .. }
+        | Frame::StreamData { stream_id, .. }
+        | Frame::StreamAck { stream_id, .. }
+        | Frame::StreamFin { stream_id, .. } => *stream_id,
+        Frame::StreamDetach { stream_id } => {
+            if streams
+                .get(stream_id)
+                .is_some_and(|state| state.pending_open.is_some())
+            {
+                return ClientTcpWriteFrameRoute::Barrier(Frame::StreamDetach {
+                    stream_id: *stream_id,
+                });
+            }
+            streams.remove(stream_id);
+            closed_streams.insert(*stream_id);
+            return ClientTcpWriteFrameRoute::Routed;
+        }
+        _ => return ClientTcpWriteFrameRoute::Barrier(frame),
+    };
+    if streams
+        .get(&stream_id)
+        .is_some_and(|state| state.pending_open.is_some())
+    {
+        return ClientTcpWriteFrameRoute::Barrier(frame);
+    }
+    let closes_stream = matches!(&frame, Frame::StreamReset { .. } | Frame::StreamFin { .. });
+    let Some(state) = streams.get_mut(&stream_id) else {
+        closed_streams.insert(stream_id);
+        return ClientTcpWriteFrameRoute::Routed;
+    };
+    let send_result = state.frames.try_send(Ok(frame));
+    match send_result {
+        Ok(()) => {
+            if closes_stream {
+                streams.remove(&stream_id);
+                closed_streams.insert(stream_id);
+            }
+            ClientTcpWriteFrameRoute::Routed
+        }
+        Err(mpsc::error::TrySendError::Full(Ok(frame))) => ClientTcpWriteFrameRoute::Barrier(frame),
+        Err(mpsc::error::TrySendError::Closed(_)) => {
+            streams.remove(&stream_id);
+            closed_streams.insert(stream_id);
+            ClientTcpWriteFrameRoute::Routed
+        }
+        Err(mpsc::error::TrySendError::Full(Err(_))) => {
+            unreachable!("client TCP interlock only routes successful frames")
+        }
+    }
+}
+
+async fn handle_connected_client_tcp_command(
+    command: ReliablePathCommand,
+    connection: &mut ClientTcpPathConnection,
+    streams: &mut HashMap<StreamId, ClientTcpPathStreamState>,
+    closed_streams: &mut RecentIdCache<StreamId>,
+    carrier_generation: u64,
+    stream_frame_queue: usize,
+    flush_after_frame: bool,
+) -> Result<(), RuntimeError> {
+    match command {
+        ReliablePathCommand::OpenStream {
+            stream_id,
+            attempt_id,
+            observed_carrier_generation,
+            target,
+            ingress,
+            lane,
+            role,
+            open_deadlines,
+            session_commands,
+            response,
+        } => {
+            let open_deadline = open_deadlines
+                .for_carrier_generation(observed_carrier_generation, carrier_generation);
+            let open = ClientTcpOpenStreamRequest {
+                stream_id,
+                attempt_id,
+                target,
+                ingress,
+                lane,
+                role,
+                open_deadline,
+                session_commands,
+                response,
+            };
+            open_client_tcp_stream_on_connection(connection, open, streams, stream_frame_queue)
+                .await?;
+            connection.record_outbound_activity();
+            Ok(())
+        }
+        ReliablePathCommand::CancelTcpOpen {
+            stream_id,
+            attempt_id,
+        } => {
+            if remove_matching_client_tcp_open(streams, stream_id, attempt_id).is_none() {
+                return Ok(());
+            }
+            closed_streams.insert(stream_id);
+            let detach = Frame::StreamDetach { stream_id };
+            connection.carrier.writer.write_frame(&detach).await?;
+            connection.path_proofs.record_sent_frame(&detach);
+            connection.carrier.writer.flush().await?;
+            connection.record_outbound_activity();
+            Ok(())
+        }
+        ReliablePathCommand::SendFrame(frame)
+            if reliable_path_frame_requires_capacity_command(&frame) =>
+        {
+            Err(RuntimeError::Protocol(
+                "client TCP path received an untyped capacity frame",
+            ))
+        }
+        ReliablePathCommand::SendFrame(frame) => {
+            connection.carrier.writer.write_frame(&frame).await?;
+            connection.path_proofs.record_sent_frame(&frame);
+            if flush_after_frame {
+                connection.carrier.writer.flush().await?;
+            }
+            connection.record_outbound_activity();
+            Ok(())
+        }
+        ReliablePathCommand::SendQuicCapacityProbe(probe) => {
+            probe.ticket.cancel();
+            Err(RuntimeError::Protocol(
+                "client TCP path received QUIC capacity command",
+            ))
+        }
+        ReliablePathCommand::SendTcpCapacityProbe(_) => Err(RuntimeError::Protocol(
+            "client TCP path received server capacity command",
+        )),
+        ReliablePathCommand::CloseStream(stream_id) => {
+            streams.remove(&stream_id);
+            closed_streams.insert(stream_id);
+            Ok(())
+        }
+    }
+}
+
+#[cfg(test)]
+#[path = "client_writer_test.rs"]
+mod tests;

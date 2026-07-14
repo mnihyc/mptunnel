@@ -1,0 +1,94 @@
+use super::{ClientTcpWriteFrameRoute, try_route_client_tcp_stream_frame_during_write};
+use crate::protocol::{CloseReason, Frame, OffsetRange, StreamFlags, StreamId};
+use crate::runtime::path::commands::ClientTcpOpenAttemptId;
+use crate::runtime::path::tcp::client_stream::ClientTcpPathStreamState;
+use crate::runtime::recent_ids::RecentIdCache;
+use bytes::Bytes;
+use std::collections::HashMap;
+use tokio::sync::mpsc;
+
+#[test]
+fn tcp_write_interlock_routes_ready_feedback_and_stops_at_backpressure() {
+    let stream_id = StreamId(81);
+    let (frames, mut frame_rx) = mpsc::channel(1);
+    let mut streams = HashMap::from([(
+        stream_id,
+        ClientTcpPathStreamState {
+            open_attempt_id: ClientTcpOpenAttemptId(3),
+            frames,
+            pending_open: None,
+        },
+    )]);
+    let mut closed_streams = RecentIdCache::new(4);
+    let ack = Frame::StreamAck {
+        stream_id,
+        complete: false,
+        ranges: vec![OffsetRange { start: 0, end: 64 }],
+    };
+
+    assert!(matches!(
+        try_route_client_tcp_stream_frame_during_write(
+            ack.clone(),
+            &mut streams,
+            &mut closed_streams,
+        ),
+        ClientTcpWriteFrameRoute::Routed
+    ));
+    assert!(matches!(
+        frame_rx.try_recv().expect("routed ACK"),
+        Ok(frame) if frame == ack
+    ));
+
+    streams
+        .get(&stream_id)
+        .expect("stream")
+        .frames
+        .try_send(Ok(Frame::Ping { nonce: 1 }))
+        .expect("fill delivery queue");
+    let response = Frame::StreamData {
+        stream_id,
+        offset: 0,
+        flags: StreamFlags::NONE,
+        payload: Bytes::from_static(b"response"),
+    };
+    assert!(matches!(
+        try_route_client_tcp_stream_frame_during_write(
+            response.clone(),
+            &mut streams,
+            &mut closed_streams,
+        ),
+        ClientTcpWriteFrameRoute::Barrier(frame) if frame == response
+    ));
+    assert!(matches!(
+        try_route_client_tcp_stream_frame_during_write(
+            Frame::SessionClose {
+                reason: CloseReason::Normal,
+            },
+            &mut streams,
+            &mut closed_streams,
+        ),
+        ClientTcpWriteFrameRoute::Barrier(Frame::SessionClose { .. })
+    ));
+
+    assert!(matches!(
+        frame_rx.try_recv().expect("queued frame"),
+        Ok(Frame::Ping { nonce: 1 })
+    ));
+    let fin = Frame::StreamFin {
+        stream_id,
+        final_offset: 8,
+    };
+    assert!(matches!(
+        try_route_client_tcp_stream_frame_during_write(
+            fin.clone(),
+            &mut streams,
+            &mut closed_streams,
+        ),
+        ClientTcpWriteFrameRoute::Routed
+    ));
+    assert!(matches!(
+        frame_rx.try_recv().expect("routed FIN"),
+        Ok(frame) if frame == fin
+    ));
+    assert!(!streams.contains_key(&stream_id));
+}

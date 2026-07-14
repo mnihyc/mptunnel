@@ -1030,7 +1030,6 @@ impl RelaySenderService {
         }
         self.reconcile_request_subflow_set(context, remotes);
         if matches!(frame, Frame::StreamData { .. }) && !cause.is_repair() {
-            #[cfg(target_os = "linux")]
             self.try_start_request_tcp_capacity_calibration(context, remotes, lane);
             self.try_start_request_quic_capacity_calibration(context, remotes, lane);
             let payload_bytes = reliable_stream_frame_payload_bytes(frame);
@@ -1962,7 +1961,7 @@ impl RelaySenderService {
         }
     }
 
-    #[cfg(all(target_os = "linux", feature = "lab-diagnostics"))]
+    #[cfg(feature = "lab-diagnostics")]
     fn diagnose_request_tcp_capacity_gate(
         &mut self,
         context: &ClientPathContext,
@@ -2153,7 +2152,6 @@ impl RelaySenderService {
         );
     }
 
-    #[cfg(target_os = "linux")]
     fn try_start_request_tcp_capacity_calibration(
         &mut self,
         context: &ClientPathContext,

@@ -291,7 +291,6 @@ pub(in crate::runtime) struct ClientTcpPathConnection {
     pub(in crate::runtime) next_heartbeat_at: tokio::time::Instant,
     pub(in crate::runtime) pending_heartbeat: Option<(u64, tokio::time::Instant)>,
     pub(in crate::runtime) path_proofs: PathProofTracker,
-    #[cfg(target_os = "linux")]
     pub(in crate::runtime) tcp_metrics: Option<TcpMetricPublisher>,
     pub(in crate::runtime) request_tcp_capacity_probe: Option<PendingClientTcpCapacityProbe>,
     discarded_request_tcp_capacity_receipt: Option<DiscardedClientTcpCapacityReceipt>,
@@ -1061,11 +1060,12 @@ async fn client_write_tcp_capacity_probe_interlocked(
     closed_streams: &mut RecentIdCache<StreamId>,
     mux_limits: MuxLimits,
 ) -> Result<(ClientTcpCapacityProbeWriteOutcome, Vec<Frame>), RuntimeError> {
-    let Some(metrics) = connection.tcp_metrics.as_ref() else {
-        return Ok((ClientTcpCapacityProbeWriteOutcome::NoWire, Vec::new()));
-    };
-    let write =
-        client_write_tcp_capacity_probe(&mut connection.writer, metrics, probe, max_payload_bytes);
+    let write = client_write_tcp_capacity_probe(
+        &mut connection.writer,
+        connection.tcp_metrics.as_ref(),
+        probe,
+        max_payload_bytes,
+    );
     tokio::pin!(write);
     let deferred_limit = reliable_path_writer_frame_queue(mux_limits).max(1);
     let mut deferred_frames = Vec::new();
@@ -1144,7 +1144,7 @@ async fn client_write_tcp_capacity_probe_interlocked(
 
 async fn client_write_tcp_capacity_probe(
     writer: &mut EncryptedTcpWriter,
-    metrics: &TcpMetricPublisher,
+    metrics: Option<&TcpMetricPublisher>,
     probe: &TcpCapacityProbeCommand,
     max_payload_bytes: usize,
 ) -> Result<ClientTcpCapacityProbeWriteOutcome, RuntimeError> {
@@ -1163,12 +1163,13 @@ async fn client_write_tcp_capacity_probe(
     lab_diagnostic(
         "request_tcp_capacity_probe",
         format_args!(
-            "phase=write_queue_drained path_id={} calibration_id={} wait_ms={} unacked_packets={} notsent_bytes={}",
+            "phase=write_boundary_ready path_id={} calibration_id={} wait_ms={} native_queue={} unacked_packets={} notsent_bytes={}",
             probe.path_id.0,
             probe.calibration_id,
             baseline_wait_started_at.elapsed().as_millis(),
-            _baseline.unacked_packets,
-            _baseline.notsent_bytes,
+            _baseline.is_some(),
+            _baseline.map_or(0, |snapshot| snapshot.unacked_packets),
+            _baseline.map_or(0, |snapshot| snapshot.notsent_bytes),
         ),
     );
     let Some(write_expires_at) = probe.write_expires_at else {
@@ -1261,19 +1262,22 @@ async fn client_write_tcp_capacity_payload(
 }
 
 async fn wait_for_client_tcp_write_queue_drain(
-    metrics: &TcpMetricPublisher,
+    metrics: Option<&TcpMetricPublisher>,
     expires_at: Instant,
-) -> Result<(Instant, TcpSenderQueueSnapshot), RuntimeError> {
+) -> Result<(Instant, Option<TcpSenderQueueSnapshot>), RuntimeError> {
+    let Some(metrics) = metrics else {
+        // A completed writer flush is a portable, conservative boundary. Any
+        // older kernel-queued bytes only lengthen the typed receipt interval.
+        return Ok((Instant::now(), None));
+    };
     loop {
         // Start before getsockopt so receipt timing cannot omit syscall time.
         let observed_at = Instant::now();
-        let snapshot = metrics
-            .sender_queue_snapshot()
-            .ok_or(RuntimeError::Protocol(
-                "request TCP capacity ACK snapshot is unavailable",
-            ))?;
+        let Some(snapshot) = metrics.sender_queue_snapshot() else {
+            return Ok((observed_at, None));
+        };
         if snapshot.is_write_queue_drained() {
-            return Ok((observed_at, snapshot));
+            return Ok((observed_at, Some(snapshot)));
         }
         let now = Instant::now();
         if now >= expires_at {
@@ -1549,7 +1553,6 @@ pub(in crate::runtime) async fn connect_client_tcp_path(
             },
         )
         .await?;
-        #[cfg(target_os = "linux")]
         let mut tcp_metrics = TcpMetricPublisher::capture(&tcp_stream);
         let mut framed = EncryptedFramedStream::with_cipher_suite(
             tcp_stream,
@@ -1595,7 +1598,6 @@ pub(in crate::runtime) async fn connect_client_tcp_path(
             }
         }
 
-        #[cfg(target_os = "linux")]
         if let Some(metrics) = tcp_metrics.as_mut() {
             metrics.begin_epoch();
         }
@@ -1617,7 +1619,6 @@ pub(in crate::runtime) async fn connect_client_tcp_path(
             next_heartbeat_at: now + mux_limits.tcp_path_heartbeat_interval,
             pending_heartbeat: None,
             path_proofs: PathProofTracker::default(),
-            #[cfg(target_os = "linux")]
             tcp_metrics,
             request_tcp_capacity_probe: None,
             discarded_request_tcp_capacity_receipt: None,
@@ -2019,94 +2020,91 @@ async fn handle_client_tcp_path_frame(
                 );
                 return Ok(());
             }
-            #[cfg(target_os = "linux")]
-            {
-                let elapsed = pending.measurement.proof_started_at.elapsed();
-                let Some(receipt_rate_bps) =
-                    tcp_capacity_receipt_rate_bps(received_payload_bytes, elapsed)
-                else {
-                    return Ok(());
-                };
-                let Some(mut metrics) = connection.tcp_metrics.as_mut().and_then(|publisher| {
-                    publisher.maybe_observe(path_id, PathMetricDirection::ClientToServer, true)
-                }) else {
-                    return Ok(());
-                };
-                #[cfg(feature = "lab-diagnostics")]
-                let kernel_delivery_rate_bps = metrics.delivery_rate_bps;
-                #[cfg(feature = "lab-diagnostics")]
-                let kernel_pacing_rate_bps = metrics.pacing_rate_bps;
-                // Cold request trains can be smaller than the real path BDP, so
-                // native delivery remains diagnostic here. The full typed receipt
-                // is the seed; product ACK evidence replaces it after handoff.
-                let rate_bps = receipt_rate_bps;
-                metrics.delivery_rate_bps = rate_bps;
-                metrics.pacing_rate_bps = rate_bps;
-                metrics.has_ack_derived_data_sample = true;
-                metrics.data_sample_count = metrics.data_sample_count.max(1);
-                metrics.data_sample_bytes = metrics.data_sample_bytes.max(received_payload_bytes);
-                metrics.confidence_ppm = 1_000_000;
-                let accepted_at = Instant::now();
-                let validity = tcp_capacity_proof_validity(metrics);
-                let candidate = TcpCapacityProofCandidate {
-                    token: calibration_id,
-                    train_bytes: pending.probe.train_payload_bytes,
-                    received_bytes: received_payload_bytes,
-                    rate_sample_bytes: received_payload_bytes,
-                    proof_elapsed: elapsed,
-                    receipt_rate_bps,
-                    rate_bps,
-                    accepted_at,
-                    expires_at: accepted_at.checked_add(validity).unwrap_or(accepted_at),
-                };
-                let accepted = runtime
-                    .health
-                    .lock()
-                    .expect("client path health lock")
-                    .tcp
-                    .get_mut(runtime.path_index)
-                    .is_some_and(|record| {
-                        record.accept_request_tcp_capacity_proof(
-                            stream_id,
-                            path_instance,
-                            candidate,
-                            metrics,
-                            accepted_at,
-                        )
-                    });
-                if !accepted {
-                    #[cfg(feature = "lab-diagnostics")]
-                    lab_diagnostic(
-                        "request_tcp_capacity_probe",
-                        format_args!(
-                            "phase=discarded reason=proof_publication_rejected path_index={} calibration_id={}",
-                            runtime.path_index, calibration_id,
-                        ),
-                    );
-                    return Ok(());
-                }
+            let elapsed = pending.measurement.proof_started_at.elapsed();
+            let Some(receipt_rate_bps) =
+                tcp_capacity_receipt_rate_bps(received_payload_bytes, elapsed)
+            else {
+                return Ok(());
+            };
+            let native_metrics = connection.tcp_metrics.as_mut().and_then(|publisher| {
+                publisher.maybe_observe(path_id, PathMetricDirection::ClientToServer, true)
+            });
+            #[cfg(feature = "lab-diagnostics")]
+            let kernel_delivery_rate_bps =
+                native_metrics.map_or(0, |metrics| metrics.delivery_rate_bps);
+            #[cfg(feature = "lab-diagnostics")]
+            let kernel_pacing_rate_bps =
+                native_metrics.map_or(0, |metrics| metrics.pacing_rate_bps);
+            // Cold request trains can be smaller than the real path BDP, so
+            // native delivery remains diagnostic here. The full typed receipt
+            // is the seed; product ACK evidence replaces it after handoff.
+            let metrics = request_tcp_capacity_receipt_metrics(
+                path_id,
+                received_payload_bytes,
+                receipt_rate_bps,
+                Some(connection.startup_metrics),
+                native_metrics,
+            );
+            let rate_bps = metrics.delivery_rate_bps;
+            let accepted_at = Instant::now();
+            let validity = tcp_capacity_proof_validity(metrics);
+            let candidate = TcpCapacityProofCandidate {
+                token: calibration_id,
+                train_bytes: pending.probe.train_payload_bytes,
+                received_bytes: received_payload_bytes,
+                rate_sample_bytes: received_payload_bytes,
+                proof_elapsed: elapsed,
+                receipt_rate_bps,
+                rate_bps,
+                accepted_at,
+                expires_at: accepted_at.checked_add(validity).unwrap_or(accepted_at),
+            };
+            let accepted = runtime
+                .health
+                .lock()
+                .expect("client path health lock")
+                .tcp
+                .get_mut(runtime.path_index)
+                .is_some_and(|record| {
+                    record.accept_request_tcp_capacity_proof(
+                        stream_id,
+                        path_instance,
+                        candidate,
+                        metrics,
+                        native_metrics,
+                        accepted_at,
+                    )
+                });
+            if !accepted {
                 #[cfg(feature = "lab-diagnostics")]
                 lab_diagnostic(
                     "request_tcp_capacity_probe",
                     format_args!(
-                        "phase=confirmed stream_id={} path_index={} instance_id={} calibration_id={} train_bytes={} train_wire_bytes={} receipt_elapsed_ms={} receipt_rate_mbps={:.3} published_rate_mbps={:.3} kernel_delivery_rate_mbps={:.3} kernel_pacing_rate_mbps={:.3} srtt_ms={:.3}",
-                        stream_id.0,
-                        runtime.path_index,
-                        path_instance.id,
-                        calibration_id,
-                        received_payload_bytes,
-                        pending.measurement.train_wire_bytes,
-                        elapsed.as_millis(),
-                        receipt_rate_bps as f64 / 1_000_000.0,
-                        rate_bps as f64 / 1_000_000.0,
-                        kernel_delivery_rate_bps as f64 / 1_000_000.0,
-                        kernel_pacing_rate_bps as f64 / 1_000_000.0,
-                        metrics.srtt_us as f64 / 1_000.0,
+                        "phase=discarded reason=proof_publication_rejected path_index={} calibration_id={}",
+                        runtime.path_index, calibration_id,
                     ),
                 );
+                return Ok(());
             }
-            #[cfg(not(target_os = "linux"))]
-            return Ok(());
+            #[cfg(feature = "lab-diagnostics")]
+            lab_diagnostic(
+                "request_tcp_capacity_probe",
+                format_args!(
+                    "phase=confirmed stream_id={} path_index={} instance_id={} calibration_id={} train_bytes={} train_wire_bytes={} receipt_elapsed_ms={} receipt_rate_mbps={:.3} published_rate_mbps={:.3} kernel_delivery_rate_mbps={:.3} kernel_pacing_rate_mbps={:.3} srtt_ms={:.3}",
+                    stream_id.0,
+                    runtime.path_index,
+                    path_instance.id,
+                    calibration_id,
+                    received_payload_bytes,
+                    pending.measurement.train_wire_bytes,
+                    elapsed.as_millis(),
+                    receipt_rate_bps as f64 / 1_000_000.0,
+                    rate_bps as f64 / 1_000_000.0,
+                    kernel_delivery_rate_bps as f64 / 1_000_000.0,
+                    kernel_pacing_rate_bps as f64 / 1_000_000.0,
+                    metrics.srtt_us as f64 / 1_000.0,
+                ),
+            );
             Ok(())
         }
         Frame::Pong { nonce } => {

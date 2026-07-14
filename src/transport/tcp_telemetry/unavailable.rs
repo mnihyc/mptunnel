@@ -1,16 +1,14 @@
 //! Fallback for hosts without an implemented native TCP telemetry backend.
 
-use super::{TcpTelemetrySnapshot, TcpTelemetrySource};
+use super::TcpTelemetrySnapshot;
 use std::io;
+use tokio::net::TcpStream;
 
 #[derive(Debug)]
 pub(super) struct PlatformTcpTelemetrySocket;
 
 impl PlatformTcpTelemetrySocket {
-    pub(super) fn capture<S>(_socket: &S) -> io::Result<Self>
-    where
-        S: TcpTelemetrySource + ?Sized,
-    {
+    pub(super) fn capture(_socket: &TcpStream) -> io::Result<Self> {
         Err(io::Error::new(
             io::ErrorKind::Unsupported,
             "native TCP telemetry is unavailable on this platform",

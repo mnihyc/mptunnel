@@ -4,6 +4,7 @@
 //! policy decides whether those counters may influence path capacity.
 
 use std::io;
+use tokio::net::TcpStream;
 
 #[cfg(target_os = "linux")]
 mod linux;
@@ -14,18 +15,6 @@ mod unavailable;
 use linux as platform;
 #[cfg(not(target_os = "linux"))]
 use unavailable as platform;
-
-#[cfg(target_os = "linux")]
-pub(crate) trait TcpTelemetrySource: std::os::fd::AsFd {}
-
-#[cfg(target_os = "linux")]
-impl<T> TcpTelemetrySource for T where T: std::os::fd::AsFd + ?Sized {}
-
-#[cfg(not(target_os = "linux"))]
-pub(crate) trait TcpTelemetrySource {}
-
-#[cfg(not(target_os = "linux"))]
-impl<T> TcpTelemetrySource for T where T: ?Sized {}
 
 /// Native sender counters captured from one exact carrier socket.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -54,10 +43,7 @@ pub(crate) struct TcpTelemetrySocket {
 
 impl TcpTelemetrySocket {
     /// Captures the socket identity without moving ownership from its carrier.
-    pub(crate) fn capture<S>(socket: &S) -> io::Result<Self>
-    where
-        S: TcpTelemetrySource + ?Sized,
-    {
+    pub(crate) fn capture(socket: &TcpStream) -> io::Result<Self> {
         platform::PlatformTcpTelemetrySocket::capture(socket).map(|platform| Self { platform })
     }
 

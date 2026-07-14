@@ -1,12 +1,8 @@
 use super::*;
-#[cfg(target_os = "linux")]
 use crate::transport::tcp_telemetry::{TcpTelemetrySnapshot, TcpTelemetrySocket};
-#[cfg(target_os = "linux")]
-use std::os::fd::AsFd;
+use tokio::net::TcpStream;
 
-#[cfg(target_os = "linux")]
 const TCP_METRIC_MIN_INTERVAL: Duration = Duration::from_millis(5);
-#[cfg(target_os = "linux")]
 const TCP_METRIC_MAX_INTERVAL: Duration = Duration::from_millis(250);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -72,15 +68,129 @@ pub(in crate::runtime) fn tcp_capacity_authoritative_rate_bps(
         .max(1)
 }
 
+pub(in crate::runtime) fn request_tcp_capacity_receipt_metrics(
+    path_id: PathId,
+    received_bytes: u64,
+    receipt_rate_bps: u64,
+    baseline: Option<PathMetrics>,
+    native: Option<PathMetrics>,
+) -> PathMetrics {
+    // A cold request train may be below the real BDP. Its full receiver receipt
+    // is the conservative rate seed; product ACKs replace it after handoff.
+    tcp_capacity_receipt_metrics(
+        path_id,
+        PathMetricDirection::ClientToServer,
+        received_bytes,
+        receipt_rate_bps,
+        baseline,
+        native,
+        false,
+    )
+}
+
+pub(in crate::runtime) fn response_tcp_capacity_receipt_metrics(
+    path_id: PathId,
+    received_bytes: u64,
+    receipt_rate_bps: u64,
+    baseline: Option<PathMetrics>,
+    native: Option<PathMetrics>,
+) -> PathMetrics {
+    // Response discovery may use bounded same-socket delivery uplift because
+    // the server owns both the train and the native sender sample.
+    tcp_capacity_receipt_metrics(
+        path_id,
+        PathMetricDirection::ServerToClient,
+        received_bytes,
+        receipt_rate_bps,
+        baseline,
+        native,
+        true,
+    )
+}
+
+fn tcp_capacity_receipt_metrics(
+    path_id: PathId,
+    direction: PathMetricDirection,
+    received_bytes: u64,
+    receipt_rate_bps: u64,
+    baseline: Option<PathMetrics>,
+    native: Option<PathMetrics>,
+    native_delivery_may_uplift: bool,
+) -> PathMetrics {
+    let has_native_shape = native.is_some();
+    let native_delivery_rate_bps = native.map_or(0, |metrics| metrics.delivery_rate_bps);
+    let native_pacing_rate_bps = native.map_or(0, |metrics| metrics.pacing_rate_bps);
+    let mut metrics = native
+        .or(baseline)
+        .unwrap_or_else(|| portable_tcp_receipt_metrics(path_id, direction));
+    let rate_bps = if native_delivery_may_uplift {
+        tcp_capacity_authoritative_rate_bps(
+            receipt_rate_bps,
+            native_delivery_rate_bps,
+            native_pacing_rate_bps,
+        )
+    } else {
+        receipt_rate_bps
+    }
+    .max(1);
+    metrics.delivery_rate_bps = rate_bps;
+    metrics.pacing_rate_bps = rate_bps;
+    metrics.has_ack_derived_data_sample = true;
+    metrics.data_sample_count = metrics.data_sample_count.max(1);
+    metrics.data_sample_bytes = metrics.data_sample_bytes.max(received_bytes);
+    metrics.confidence_ppm = 1_000_000;
+    if !has_native_shape {
+        // A configured startup prior is not durable delivery evidence. Keep
+        // the path app-limited after the short typed receipt proof expires and
+        // leave cwnd unknown so receipt-rate BDP, not an initial-window hint,
+        // bounds portable high-bandwidth admission.
+        metrics.app_limited = true;
+        metrics.inflight_limit_bytes = 0;
+        metrics.inflight_hi_bytes = 0;
+    }
+    metrics
+}
+
+fn portable_tcp_receipt_metrics(path_id: PathId, direction: PathMetricDirection) -> PathMetrics {
+    // This is path shape, not rate evidence. The typed receipt installed by the
+    // caller supplies rate while this conservative prior supplies RFC-like RTT
+    // and initial-window geometry when the host has no native socket counters.
+    let initial_rtt_us = u32::try_from(RELIABLE_INITIAL_RTT.as_micros()).unwrap_or(u32::MAX);
+    PathMetrics {
+        path_id,
+        underlay: UnderlayProtocol::Tcp,
+        direction,
+        metric_epoch: metric_epoch_now(),
+        metric_age_us: 0,
+        min_rtt_us: initial_rtt_us,
+        srtt_us: initial_rtt_us,
+        rttvar_us: initial_rtt_us / 2,
+        jitter_us: initial_rtt_us / 2,
+        delivery_rate_bps: 1,
+        pacing_rate_bps: 1,
+        loss_ppm: 0,
+        ecn_ppm: 0,
+        loss_observed: false,
+        ecn_observed: false,
+        bytes_in_flight: 0,
+        queue_bytes: 0,
+        inflight_limit_bytes: PATH_OPEN_SCORE_BYTES as u64,
+        inflight_hi_bytes: PATH_OPEN_SCORE_BYTES as u64,
+        confidence_ppm: 0,
+        app_limited: true,
+        has_ack_derived_data_sample: false,
+        data_sample_count: 0,
+        data_sample_bytes: 0,
+    }
+}
+
 /// Exact same-socket sender queues used to establish a receipt-rate baseline.
-#[cfg(target_os = "linux")]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(in crate::runtime) struct TcpSenderQueueSnapshot {
     pub(in crate::runtime) unacked_packets: u32,
     pub(in crate::runtime) notsent_bytes: u32,
 }
 
-#[cfg(target_os = "linux")]
 impl TcpSenderQueueSnapshot {
     /// The full typed receiver receipt, not a cumulative TCP ACK, owns rate.
     /// Older unacked control can only delay that receipt; unsent bytes must
@@ -90,7 +200,6 @@ impl TcpSenderQueueSnapshot {
     }
 }
 
-#[cfg(target_os = "linux")]
 impl From<TcpTelemetrySnapshot> for TcpSenderQueueSnapshot {
     fn from(snapshot: TcpTelemetrySnapshot) -> Self {
         Self {
@@ -102,7 +211,6 @@ impl From<TcpTelemetrySnapshot> for TcpSenderQueueSnapshot {
 
 /// Keeps polling in the carrier task so telemetry cannot outlive its socket or
 /// exact registry registration.
-#[cfg(target_os = "linux")]
 #[derive(Debug)]
 pub(in crate::runtime) struct TcpMetricPublisher {
     socket: TcpTelemetrySocket,
@@ -110,9 +218,8 @@ pub(in crate::runtime) struct TcpMetricPublisher {
     next_sample_at: Instant,
 }
 
-#[cfg(target_os = "linux")]
 impl TcpMetricPublisher {
-    pub(in crate::runtime) fn capture(socket: &impl AsFd) -> Option<Self> {
+    pub(in crate::runtime) fn capture(socket: &TcpStream) -> Option<Self> {
         Some(Self {
             socket: TcpTelemetrySocket::capture(socket).ok()?,
             tracker: None,
@@ -160,12 +267,10 @@ impl TcpMetricPublisher {
 /// The baseline begins after authentication so handshake bytes never graduate
 /// an optional response path.
 #[derive(Debug)]
-#[cfg(target_os = "linux")]
 pub(in crate::runtime) struct TcpSenderMetricTracker {
     baseline: TcpTelemetrySnapshot,
 }
 
-#[cfg(target_os = "linux")]
 impl TcpSenderMetricTracker {
     pub(in crate::runtime) fn new(baseline: TcpTelemetrySnapshot) -> Self {
         Self { baseline }
@@ -237,7 +342,6 @@ impl TcpSenderMetricTracker {
     }
 }
 
-#[cfg(target_os = "linux")]
 fn bytes_per_second_to_bits(rate: u64) -> Option<u64> {
     (rate > 0).then(|| rate.saturating_mul(8))
 }

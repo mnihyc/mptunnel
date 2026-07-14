@@ -5,7 +5,6 @@ pub(in crate::runtime) async fn handle_server_path(
     stream: TcpStream,
     context: ServerPathContext,
 ) -> Result<(), RuntimeError> {
-    #[cfg(target_os = "linux")]
     let mut tcp_metrics = TcpMetricPublisher::capture(&stream);
     let mut framed = EncryptedFramedStream::with_cipher_suite(
         stream,
@@ -70,6 +69,7 @@ pub(in crate::runtime) async fn handle_server_path(
         context
             .reliable_streams
             .register_carrier_path(session_id, UnderlayProtocol::Tcp, path_id);
+    let mut local_metrics = context.local_path_startup_metrics(UnderlayProtocol::Tcp, path_id);
     framed
         .write_frames(&[
             Frame::SessionReady,
@@ -86,7 +86,6 @@ pub(in crate::runtime) async fn handle_server_path(
         }
         return Err(RuntimeError::Encrypted(err));
     }
-    #[cfg(target_os = "linux")]
     if let Some(metrics) = tcp_metrics.as_mut() {
         metrics.begin_epoch();
     }
@@ -138,10 +137,10 @@ pub(in crate::runtime) async fn handle_server_path(
         let Some(event) = event else {
             return Ok(());
         };
-        #[cfg(target_os = "linux")]
         if let Some(metrics) = tcp_metrics.as_mut().and_then(|publisher| {
             publisher.maybe_observe(path_id, PathMetricDirection::ServerToClient, false)
         }) {
+            local_metrics = Some(metrics);
             context
                 .reliable_streams
                 .record_local_path_metrics(&path_registration, metrics);
@@ -568,6 +567,7 @@ pub(in crate::runtime) async fn handle_server_path(
                                 observation,
                             )
                         {
+                            local_metrics = Some(metrics);
                             context
                                 .reliable_streams
                                 .record_local_path_metrics(&path_registration, metrics);
@@ -612,100 +612,78 @@ pub(in crate::runtime) async fn handle_server_path(
                             );
                             continue;
                         }
-                        #[cfg(target_os = "linux")]
-                        {
-                            let elapsed = pending.started_at.elapsed();
-                            let receipt_rate_bps =
-                                tcp_capacity_receipt_rate_bps(received_payload_bytes, elapsed)
-                                    .ok_or(RuntimeError::Protocol(
-                                        "TCP capacity receipt has invalid timing",
-                                    ))?;
-                            let Some(mut metrics) = tcp_metrics.as_mut().and_then(|publisher| {
-                                publisher.maybe_observe(
-                                    path_id,
-                                    PathMetricDirection::ServerToClient,
-                                    true,
-                                )
-                            }) else {
-                                #[cfg(feature = "lab-diagnostics")]
-                                lab_diagnostic(
-                                    "response_tcp_capacity_probe",
-                                    format_args!(
-                                        "phase=rejected reason=native_metrics_unavailable session_id={} path_id={} path_instance_id={} calibration_id={}",
-                                        session_id.0,
-                                        path_id.0,
-                                        path_registration.path_instance_id().as_u64(),
-                                        calibration_id,
-                                    ),
-                                );
-                                continue;
-                            };
-                            let kernel_delivery_rate_bps = metrics.delivery_rate_bps;
-                            let kernel_pacing_rate_bps = metrics.pacing_rate_bps;
-                            let rate_bps = tcp_capacity_authoritative_rate_bps(
-                                receipt_rate_bps,
-                                kernel_delivery_rate_bps,
-                                kernel_pacing_rate_bps,
-                            );
-                            metrics.delivery_rate_bps = rate_bps;
-                            metrics.pacing_rate_bps = rate_bps;
-                            metrics.has_ack_derived_data_sample = true;
-                            metrics.data_sample_count = metrics.data_sample_count.max(1);
-                            metrics.data_sample_bytes =
-                                metrics.data_sample_bytes.max(received_payload_bytes);
-                            metrics.confidence_ppm = 1_000_000;
-                            let accepted_at = Instant::now();
-                            let validity = tcp_capacity_proof_validity(metrics);
-                            let candidate = TcpCapacityProofCandidate {
-                                token: calibration_id,
-                                train_bytes: pending.probe.train_payload_bytes,
-                                received_bytes: received_payload_bytes,
-                                rate_sample_bytes: received_payload_bytes,
-                                proof_elapsed: elapsed,
-                                receipt_rate_bps,
-                                rate_bps,
-                                accepted_at,
-                                expires_at: accepted_at
-                                    .checked_add(validity)
-                                    .unwrap_or(accepted_at),
-                            };
-                            // Release carrier and session discovery ownership
-                            // before proof publication wakes the sender.
-                            drop(pending);
-                            if !context.reliable_streams.record_local_tcp_capacity_proof(
-                                &path_registration,
-                                metrics,
-                                candidate,
-                            ) {
-                                return Err(RuntimeError::Protocol(
-                                    "TCP capacity proof publication was rejected",
-                                ));
-                            }
-                            #[cfg(feature = "lab-diagnostics")]
-                            lab_diagnostic(
-                                "response_tcp_capacity_probe",
-                                format_args!(
-                                    "phase=confirmed session_id={} path_id={} path_instance_id={} calibration_id={} train_bytes={} elapsed_ms={} receipt_rate_mbps={:.3} published_rate_mbps={:.3} kernel_delivery_rate_mbps={:.3} kernel_pacing_rate_mbps={:.3} srtt_ms={:.3} inflight_limit_bytes={} app_limited={}",
-                                    session_id.0,
-                                    path_id.0,
-                                    path_registration.path_instance_id().as_u64(),
-                                    calibration_id,
-                                    received_payload_bytes,
-                                    elapsed.as_millis(),
-                                    receipt_rate_bps as f64 / 1_000_000.0,
-                                    rate_bps as f64 / 1_000_000.0,
-                                    kernel_delivery_rate_bps as f64 / 1_000_000.0,
-                                    kernel_pacing_rate_bps as f64 / 1_000_000.0,
-                                    metrics.srtt_us as f64 / 1_000.0,
-                                    metrics.inflight_limit_bytes,
-                                    metrics.app_limited,
-                                ),
-                            );
+                        let elapsed = pending.started_at.elapsed();
+                        let receipt_rate_bps =
+                            tcp_capacity_receipt_rate_bps(received_payload_bytes, elapsed).ok_or(
+                                RuntimeError::Protocol("TCP capacity receipt has invalid timing"),
+                            )?;
+                        let native_metrics = tcp_metrics.as_mut().and_then(|publisher| {
+                            publisher.maybe_observe(
+                                path_id,
+                                PathMetricDirection::ServerToClient,
+                                true,
+                            )
+                        });
+                        #[cfg(feature = "lab-diagnostics")]
+                        let kernel_delivery_rate_bps =
+                            native_metrics.map_or(0, |metrics| metrics.delivery_rate_bps);
+                        #[cfg(feature = "lab-diagnostics")]
+                        let kernel_pacing_rate_bps =
+                            native_metrics.map_or(0, |metrics| metrics.pacing_rate_bps);
+                        let metrics = response_tcp_capacity_receipt_metrics(
+                            path_id,
+                            received_payload_bytes,
+                            receipt_rate_bps,
+                            local_metrics,
+                            native_metrics,
+                        );
+                        let rate_bps = metrics.delivery_rate_bps;
+                        let accepted_at = Instant::now();
+                        let validity = tcp_capacity_proof_validity(metrics);
+                        let candidate = TcpCapacityProofCandidate {
+                            token: calibration_id,
+                            train_bytes: pending.probe.train_payload_bytes,
+                            received_bytes: received_payload_bytes,
+                            rate_sample_bytes: received_payload_bytes,
+                            proof_elapsed: elapsed,
+                            receipt_rate_bps,
+                            rate_bps,
+                            accepted_at,
+                            expires_at: accepted_at.checked_add(validity).unwrap_or(accepted_at),
+                        };
+                        // Release carrier and session discovery ownership before
+                        // proof publication wakes the sender.
+                        drop(pending);
+                        if !context.reliable_streams.record_local_tcp_capacity_proof(
+                            &path_registration,
+                            metrics,
+                            candidate,
+                        ) {
+                            return Err(RuntimeError::Protocol(
+                                "TCP capacity proof publication was rejected",
+                            ));
                         }
-                        #[cfg(not(target_os = "linux"))]
-                        return Err(RuntimeError::Protocol(
-                            "TCP capacity receipt is unsupported on this platform",
-                        ));
+                        local_metrics = Some(metrics);
+                        #[cfg(feature = "lab-diagnostics")]
+                        lab_diagnostic(
+                            "response_tcp_capacity_probe",
+                            format_args!(
+                                "phase=confirmed session_id={} path_id={} path_instance_id={} calibration_id={} train_bytes={} elapsed_ms={} receipt_rate_mbps={:.3} published_rate_mbps={:.3} kernel_delivery_rate_mbps={:.3} kernel_pacing_rate_mbps={:.3} srtt_ms={:.3} inflight_limit_bytes={} app_limited={}",
+                                session_id.0,
+                                path_id.0,
+                                path_registration.path_instance_id().as_u64(),
+                                calibration_id,
+                                received_payload_bytes,
+                                elapsed.as_millis(),
+                                receipt_rate_bps as f64 / 1_000_000.0,
+                                rate_bps as f64 / 1_000_000.0,
+                                kernel_delivery_rate_bps as f64 / 1_000_000.0,
+                                kernel_pacing_rate_bps as f64 / 1_000_000.0,
+                                metrics.srtt_us as f64 / 1_000.0,
+                                metrics.inflight_limit_bytes,
+                                metrics.app_limited,
+                            ),
+                        );
                     }
                     Frame::PathCapacityData {
                         path_id: capacity_path_id,

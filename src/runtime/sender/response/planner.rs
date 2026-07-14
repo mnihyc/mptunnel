@@ -859,7 +859,6 @@ pub(super) fn select_response_quic_capacity_calibration_target(
         .cloned()
 }
 
-#[cfg(target_os = "linux")]
 pub(super) fn select_response_tcp_capacity_probe_target(
     targets: &[ResponseSenderPathTarget],
     lane: FlowLane,
@@ -3243,7 +3242,6 @@ pub(super) fn plan_response_data_dispatch_with_ordered_debt_impl(
                 let lower_flights = binding.lower_flights_before_offset(next_offset);
                 let targets = binding.sender_path_targets(relay_lane, payload_bytes);
                 let ordered_data_owner = binding.ordered_data_owner();
-                #[cfg(target_os = "linux")]
                 if !session_scheduling.tcp_capacity_probe_reserved
                     && let Some((target, train_bytes)) = select_response_tcp_capacity_probe_target(
                         &targets,

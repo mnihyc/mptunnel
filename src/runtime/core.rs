@@ -951,16 +951,22 @@ impl ClientPathHealthRecord {
         stream_id: StreamId,
         path_instance: RelayPathInstance,
         candidate: TcpCapacityProofCandidate,
-        metrics: PathMetrics,
+        proof_metrics: PathMetrics,
+        native_transport_state: Option<PathMetrics>,
         now: Instant,
     ) -> bool {
         let Some(reservation) = self.request_tcp_capacity_probe.as_ref() else {
             return false;
         };
         if path_instance.key.underlay != UnderlayProtocol::Tcp
-            || metrics.underlay != UnderlayProtocol::Tcp
-            || metrics.direction != PathMetricDirection::ClientToServer
-            || metrics.path_id.0 as usize != path_instance.key.index
+            || proof_metrics.underlay != UnderlayProtocol::Tcp
+            || proof_metrics.direction != PathMetricDirection::ClientToServer
+            || proof_metrics.path_id.0 as usize != path_instance.key.index
+            || native_transport_state.is_some_and(|metrics| {
+                metrics.underlay != UnderlayProtocol::Tcp
+                    || metrics.direction != PathMetricDirection::ClientToServer
+                    || metrics.path_id.0 as usize != path_instance.key.index
+            })
             || reservation.stream_id != stream_id
             || reservation.path_instance != path_instance
             || reservation.token != candidate.token
@@ -991,7 +997,9 @@ impl ClientPathHealthRecord {
         // RTT, queue, and cwnd remain current socket diagnostics. Carrier rate
         // authority stays inside the expiring typed proof until product ACKs
         // replace it; an offset-free train must not become a cross-stream prior.
-        self.mark_tcp_transport_state(metrics);
+        if let Some(native_transport_state) = native_transport_state {
+            self.mark_tcp_transport_state(native_transport_state);
+        }
         true
     }
 
@@ -1786,15 +1794,22 @@ mod request_quic_capacity_product_handoff_tests {
                 ..candidate
             },
             request_tcp_proof_metrics(path_index),
+            None,
             accepted_at,
         ));
+        record.measured_srtt_ms = Some(25.0);
+        record.carrier_inflight_limit_bytes = 512 * 1024;
         assert!(record.accept_request_tcp_capacity_proof(
             stream_id,
             path_instance,
             candidate,
             request_tcp_proof_metrics(path_index),
+            None,
             accepted_at,
         ));
+        assert_eq!(record.measured_srtt_ms, Some(25.0));
+        assert_eq!(record.carrier_srtt_ms, None);
+        assert_eq!(record.carrier_inflight_limit_bytes, 512 * 1024);
         let active = record.observe(expires_at - Duration::from_nanos(1));
         assert!(active.explicit_carrier_capacity_proof);
         assert_eq!(active.carrier_delivery_rate_bps, Some(80_000_000.0));

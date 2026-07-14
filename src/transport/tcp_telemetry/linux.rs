@@ -1,8 +1,9 @@
 //! Linux implementation of optional native TCP telemetry.
 
-use super::{TcpTelemetrySnapshot, TcpTelemetrySource};
+use super::TcpTelemetrySnapshot;
 use std::io;
-use std::os::fd::{AsRawFd, OwnedFd};
+use std::os::fd::{AsFd, AsRawFd, OwnedFd};
+use tokio::net::TcpStream;
 
 pub(super) const TCP_INFO_V4_9_PREFIX_BYTES: usize = 168;
 
@@ -13,10 +14,7 @@ pub(super) struct PlatformTcpTelemetrySocket {
 
 impl PlatformTcpTelemetrySocket {
     /// Duplicates the exact carrier fd before higher-level framing hides it.
-    pub(super) fn capture<S>(socket: &S) -> io::Result<Self>
-    where
-        S: TcpTelemetrySource + ?Sized,
-    {
+    pub(super) fn capture(socket: &TcpStream) -> io::Result<Self> {
         Ok(Self {
             fd: socket.as_fd().try_clone_to_owned()?,
         })

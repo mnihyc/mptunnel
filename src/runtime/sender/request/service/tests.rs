@@ -477,7 +477,6 @@ fn response_target(
     }
 }
 
-#[cfg(target_os = "linux")]
 #[test]
 fn tcp_capacity_probe_does_not_wait_for_product_subflow_graduation() {
     let mux_limits = MuxLimits::default();
@@ -3814,7 +3813,6 @@ async fn request_quic_single_path_skips_health_lock() {
 }
 
 #[tokio::test]
-#[cfg(target_os = "linux")]
 async fn request_tcp_capacity_batches_only_policy_eligible_sockets() {
     let stream_id = StreamId(211);
     let context = client_test_context_with_paths(&[
@@ -3945,7 +3943,6 @@ async fn request_tcp_capacity_batches_only_policy_eligible_sockets() {
 }
 
 #[tokio::test]
-#[cfg(target_os = "linux")]
 async fn request_tcp_capacity_flow_campaign_rejects_third_parallel_train() {
     let stream_id = StreamId(214);
     let context = client_test_context_with_paths(&[
@@ -4086,7 +4083,6 @@ async fn request_tcp_capacity_flow_campaign_rejects_third_parallel_train() {
 }
 
 #[tokio::test]
-#[cfg(target_os = "linux")]
 async fn request_tcp_stable_share_rejects_oversized_train_without_retiring_candidate() {
     let stream_id = StreamId(212);
     let context = client_test_context_with_paths(&[
@@ -13256,7 +13252,6 @@ fn request_quic_capacity_geometry_models_the_competing_service_rate_pipe() {
 }
 
 #[test]
-#[cfg(target_os = "linux")]
 fn request_tcp_capacity_geometry_requires_mature_service_and_full_pipe() {
     let mux_limits = MuxLimits::default();
     let mut candidate = PathSnapshot::new(PathId(1), UnderlayProtocol::Tcp, 180.0, 1_000_000.0);
@@ -13335,7 +13330,6 @@ fn request_capacity_candidate_share_is_fixed_by_eligible_topology() {
 }
 
 #[test]
-#[cfg(target_os = "linux")]
 fn request_tcp_capacity_receipt_admission_ignores_only_stale_control_flight() {
     let mut candidate = PathSnapshot::new(PathId(1), UnderlayProtocol::Tcp, 180.0, 1_000_000.0);
     candidate.bytes_in_flight = 1_448;
@@ -13355,7 +13349,6 @@ fn request_tcp_capacity_receipt_admission_ignores_only_stale_control_flight() {
 }
 
 #[test]
-#[cfg(target_os = "linux")]
 fn request_tcp_capacity_lease_is_derived_from_growth_service_and_recovery() {
     let candidate = PathSnapshot::new(PathId(1), UnderlayProtocol::Tcp, 180.0, 1_000_000.0);
     let train_bytes = 4_813_080;

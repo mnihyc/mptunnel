@@ -12,7 +12,7 @@ use crate::runtime::datagram::{
 use crate::runtime::error::RuntimeError;
 use crate::runtime::path::commands::ReliablePathCommandSender;
 use crate::runtime::path::server_context::ServerPathContext;
-use crate::runtime::stream::ServerRealtimeFlowRegistration;
+use crate::runtime::stream::response::ServerRealtimeFlowRegistration;
 use tokio::sync::mpsc;
 
 pub(super) enum ServerTcpDatagramEffect {

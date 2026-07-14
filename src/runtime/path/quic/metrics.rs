@@ -1,7 +1,7 @@
 use super::estimator::UdpPathMetricTracker;
 use super::*;
 
-pub(in crate::runtime) use crate::model::capacity::QuicCapacityProofCandidate;
+use crate::model::capacity::QuicCapacityProofCandidate;
 
 #[cfg(feature = "lab-diagnostics")]
 #[derive(Debug, Clone, Copy, Default)]

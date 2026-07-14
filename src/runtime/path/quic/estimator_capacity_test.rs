@@ -1,5 +1,6 @@
 use super::super::estimator_test_support::*;
 use super::*;
+use crate::runtime::stream::response::quic_capacity_receipt_rate_bps;
 
 #[test]
 fn quic_app_limited_capacity_probe_emits_candidate_without_generic_proof() {

@@ -21,7 +21,20 @@ use crate::model::admission::{
     bulk_service_feed_reservoir_payload_bytes, bulk_service_horizon_payload_bytes,
     bulk_service_product_envelope_payload_bytes,
 };
+use crate::model::capacity::QuicCapacityProofCandidate;
 use crate::model::{ResponseCandidateTailDebt, ResponseOrderedTail, ResponseSameFamilyReservoir};
+use crate::runtime::stream::response::{
+    CarrierPathFlightDebt, MAX_RESPONSE_QUIC_CAPACITY_CALIBRATION_ATTEMPTS_PER_PATH,
+    MIN_ACTIVE_RESPONSE_FLOWS_FOR_SAME_FAMILY_DISCOVERY,
+    ResponseAckClockCalibrationRetirementRequest, ResponseDispatchTarget,
+    ResponseQuicCapacityCalibrationRequest, ResponseSenderPathTarget, ResponseServiceFamilyLoads,
+    ResponseServiceHandoffDrainRequest, ResponseServiceHandoffDrainReservation,
+    ResponseServiceHandoffMode, ResponseStreamBinding, ServerCarrierPathInstanceId,
+    quic_capacity_proof_pin_matches_marker, response_rate_fair_share_bps,
+    response_service_handoff_mode, server_bulk_output_eta_ms,
+    valid_quic_capacity_proof_candidate_at,
+};
+use crate::scheduler::PathRateScope;
 pub(super) fn carrier_path_key_order(
     left: CarrierPathKey,
     right: CarrierPathKey,
@@ -240,7 +253,7 @@ pub(super) fn response_tcp_calibration_opportunity_candidate(
     // evidence and never leaves this completion-opportunity calculation.
     snapshot.delivery_rate_bps = service_rate_bps;
     snapshot.pacing_rate_bps = snapshot.pacing_rate_bps.max(service_rate_bps);
-    snapshot.rate_scope = ResponseRateScope::PathCapacity;
+    snapshot.rate_scope = PathRateScope::PathCapacity;
     snapshot.inflight_limit_bytes = snapshot
         .inflight_limit_bytes
         .max(bulk_candidate_pipe_bytes(snapshot));
@@ -672,7 +685,7 @@ pub(super) fn response_service_handoff_target_view(
         // The ordinary marker still expires; only this transaction view retains it.
         target.has_bulk_rate_evidence = true;
         target.snapshot.delivery_rate_bps = proof.rate_bps.max(1) as f64;
-        target.snapshot.rate_scope = ResponseRateScope::PathCapacity;
+        target.snapshot.rate_scope = PathRateScope::PathCapacity;
         target.snapshot.confidence = target.snapshot.confidence.max(
             (proof.received_bytes as f64 / proof.sample_floor_bytes.max(1) as f64).clamp(0.0, 1.0),
         );

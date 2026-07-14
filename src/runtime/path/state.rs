@@ -6,7 +6,7 @@
 use super::commands::*;
 use super::model::*;
 use super::proof::PathProofObservation;
-use super::quic::metrics::{QuicCapacityProofCandidate, UdpPathMetrics};
+use super::quic::metrics::UdpPathMetrics;
 use super::set::ClientPathContext;
 use super::tcp::capacity::*;
 use crate::model::capacity::*;

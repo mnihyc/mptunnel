@@ -1,6 +1,7 @@
 use super::*;
 use crate::config::{DEFAULT_OUTBOUND_CONNECT_TIMEOUT, SharedSecret};
 use crate::ingress::ProxyAuthConfig;
+use crate::runtime::stream::response::{ResponseStreamAttachOutcome, ResponseStreamBinding};
 use crate::transport::Endpoint;
 use crate::transport::tcp::bind_listener;
 use tokio::io::duplex;

@@ -5,6 +5,15 @@ use crate::lab_diagnostics::{
     lab_assert_server_sender_service_balanced, lab_diag_test_guard,
     lab_sender_service_counts_for_test,
 };
+use crate::model::capacity::QuicCapacityProofCandidate;
+use crate::runtime::stream::response::{
+    CarrierPathFlightDebt, MAX_RESPONSE_QUIC_CAPACITY_CALIBRATION_ATTEMPTS_PER_PATH,
+    ResponseAckClockCalibrationRetirementRequest, ResponseDispatchTarget, ResponseSenderPathTarget,
+    ResponseServiceFamilyLoads, ResponseServiceHandoffDrainReservation, ResponseServiceHandoffMode,
+    ResponseStreamAttachOutcome, ResponseStreamBinding, ServerPathLaneTracker,
+    ServerPathMetricsSource, next_server_carrier_path_instance_id,
+};
+use crate::scheduler::PathRateScope;
 
 fn poison_client_path_health_for_test(context: &ClientPathContext) {
     let poisoned_context = context.clone();
@@ -10848,7 +10857,7 @@ fn endpoint_only_response_calibration_uses_service_only_as_opportunity_prior() {
         effective.delivery_rate_bps,
         service.snapshot.delivery_rate_bps
     );
-    assert_eq!(effective.rate_scope, ResponseRateScope::PathCapacity);
+    assert_eq!(effective.rate_scope, PathRateScope::PathCapacity);
     assert!(effective_eta_ms < candidate.eta_ms);
     assert_eq!(candidate.snapshot.delivery_rate_bps, 2_500_000.0);
 
@@ -13646,7 +13655,7 @@ fn measured_cross_family_path_handoff_allows_diversification_or_two_x_gain() {
 #[test]
 fn balanced_service_handoff_requires_two_x_projected_gain() {
     let mut service = response_target(0, UnderlayProtocol::Tcp, 80.0, 0, 16 * 1024 * 1024, true);
-    service.snapshot.rate_scope = ResponseRateScope::PerFlowGoodput;
+    service.snapshot.rate_scope = PathRateScope::PerFlowGoodput;
     service.snapshot.delivery_rate_bps = 60_000_000.0;
     let mut udp = response_target(1, UnderlayProtocol::Udp, 5.0, 0, 16 * 1024 * 1024, false);
     udp.snapshot.delivery_rate_bps = 100_000_000.0;
@@ -13677,7 +13686,7 @@ fn busy_shared_target_carrier_is_pressure_not_binding_debt() {
     let mux_limits = MuxLimits::default();
     let payload_bytes = reliable_bulk_carrier_feed_quantum_bytes(mux_limits);
     let mut service = response_target(0, UnderlayProtocol::Tcp, 80.0, 0, 16 * 1024 * 1024, true);
-    service.snapshot.rate_scope = ResponseRateScope::PerFlowGoodput;
+    service.snapshot.rate_scope = PathRateScope::PerFlowGoodput;
     service.snapshot.delivery_rate_bps = 1_000_000.0;
     let mut udp = response_target(1, UnderlayProtocol::Udp, 5.0, 0, 16 * 1024 * 1024, false);
     let (udp_commands, _udp_receivers) = reliable_path_command_channels(8);
@@ -14173,7 +14182,7 @@ fn service_handoff_diagnostic_distinguishes_frontier_and_expired_receipt() {
     assert_eq!(effective.snapshot.delivery_rate_bps, proof.rate_bps as f64);
     assert_eq!(
         effective.snapshot.rate_scope,
-        ResponseRateScope::PathCapacity,
+        PathRateScope::PathCapacity,
         "the pinned QUIC receipt rate and its capacity scope are one snapshot authority"
     );
     assert!(response_service_handoff_preserves_fair_share(
@@ -14221,9 +14230,9 @@ fn service_handoff_fair_share_respects_rate_scope() {
     udp.snapshot.delivery_rate_bps = 80_000_000.0;
     udp.snapshot.active_flows = 0;
 
-    tcp.snapshot.rate_scope = ResponseRateScope::PathCapacity;
+    tcp.snapshot.rate_scope = PathRateScope::PathCapacity;
     assert!(response_service_handoff_preserves_fair_share(&tcp, &udp));
-    tcp.snapshot.rate_scope = ResponseRateScope::PerFlowGoodput;
+    tcp.snapshot.rate_scope = PathRateScope::PerFlowGoodput;
     assert!(
         !response_service_handoff_preserves_fair_share(&tcp, &udp),
         "a 100 Mbps per-flow TCP observation must not be divided a second time"

@@ -1,4 +1,4 @@
-use super::super::response_binding::ResponseStreamBinding;
+use super::super::response::ResponseStreamBinding;
 use super::{ReliablePathStreamHandle, ReliablePathStreamOutput};
 use crate::model::capacity::{
     MIN_RATE_SAMPLE_BYTES, PATH_OPEN_SCORE_BYTES, RELIABLE_INITIAL_WINDOW_PACKETS,

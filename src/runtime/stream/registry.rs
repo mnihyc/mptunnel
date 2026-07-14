@@ -1,12 +1,13 @@
 use super::handle::{ReliablePathStream, ReliablePathStreamOutput};
-use super::response_binding::{
-    QuicCapacityProofCandidate, ResponseStreamAttachOutcome, ResponseStreamBinding,
-    ServerCarrierPathInstanceId, ServerPathLaneTracker, ServerPathMetricsEntry,
-    ServerPathMetricsSource, ServerRealtimeFlowRegistration, next_server_carrier_path_instance_id,
+use super::response::{
+    ResponseStreamAttachOutcome, ResponseStreamBinding, ServerCarrierPathInstanceId,
+    ServerPathLaneTracker, ServerPathMetricsEntry, ServerPathMetricsSource,
+    ServerRealtimeFlowRegistration, next_server_carrier_path_instance_id,
 };
 use crate::config::ResourceLimits;
 #[cfg(feature = "lab-diagnostics")]
 use crate::lab_diagnostics::{lab_diagnostic, lab_perf_record};
+use crate::model::capacity::QuicCapacityProofCandidate;
 use crate::model::path::CarrierPathKey;
 use crate::mux::MuxLimits;
 use crate::protocol::{

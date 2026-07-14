@@ -5,7 +5,7 @@ use crate::outbound;
 use crate::protocol::{DatagramFlowId, DatagramId, Frame};
 use crate::runtime::error::RuntimeError;
 use crate::runtime::path::commands::ReliablePathCommandSender;
-use crate::runtime::stream::ServerRealtimeFlowRegistration;
+use crate::runtime::stream::response::ServerRealtimeFlowRegistration;
 use crate::scheduler::FlowLane;
 use bytes::Bytes;
 use std::collections::VecDeque;

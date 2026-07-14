@@ -1,5 +1,10 @@
 use super::*;
 use crate::model::admission::BulkAdmissionRole;
+use crate::runtime::stream::response::{
+    CarrierPathFlightDebt, ResponseSenderPathTarget, ResponseServiceFamilyLoads,
+    ResponseServiceHandoffDrainReservation, ResponseStreamBinding,
+    valid_quic_capacity_proof_candidate_at, well_formed_quic_capacity_proof_candidate,
+};
 
 // Why separate: causal lab observability mirrors product gates, but it must
 // remain an observer rather than inflate or become a second hot-path policy.

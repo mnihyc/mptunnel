@@ -23,7 +23,7 @@ use crate::model::request::evidence::{
 // bindings own exact range flight and atomic commit; final TCP/UDP emission
 // still happens through carrier command senders.
 
-// Local diagnostic naming helper.  `response_admission` has a private helper
+// Local diagnostic naming helper. The response `admission` owner has a private helper
 // with the same purpose, but sender is a sibling module and must not
 // depend on that module-private symbol when `lab-diagnostics` is enabled.
 #[cfg(feature = "lab-diagnostics")]

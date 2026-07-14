@@ -1,5 +1,6 @@
 use super::*;
 use crate::config::SharedSecret;
+use crate::model::capacity::QuicCapacityProofCandidate;
 
 fn tcp_path_instance(index: usize, id: u64) -> RelayPathInstance {
     RelayPathInstance {

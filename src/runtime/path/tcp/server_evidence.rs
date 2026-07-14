@@ -23,7 +23,8 @@ use crate::runtime::path::tcp::capacity::{
     response_tcp_capacity_receipt_metrics, tcp_capacity_proof_validity,
     tcp_capacity_receipt_rate_bps,
 };
-use crate::runtime::stream::{ServerCarrierPathInstanceId, ServerCarrierPathRegistration};
+use crate::runtime::stream::ServerCarrierPathRegistration;
+use crate::runtime::stream::response::ServerCarrierPathInstanceId;
 use std::time::Instant;
 
 pub(super) enum ServerTcpEvidenceOutcome {

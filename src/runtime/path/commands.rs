@@ -1,5 +1,6 @@
 use super::*;
-use crate::runtime::stream::{ReliablePathStream, TcpCapacityProbeSessionLease};
+use crate::runtime::stream::ReliablePathStream;
+use crate::runtime::stream::response::{ServerCarrierPathInstanceId, TcpCapacityProbeSessionLease};
 use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, Ordering};
 
 // Bounded, lane-separated handoff from carrier-neutral scheduling to TCP or

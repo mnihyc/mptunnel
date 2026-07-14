@@ -1,4 +1,4 @@
-use super::response_binding::{
+use super::response::{
     CarrierPathFlight, ResponseStreamBinding, product_flights_have_recent_repair_overlap,
     release_carrier_path_flight_ranges,
 };

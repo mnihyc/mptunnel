@@ -1,4 +1,7 @@
 use super::*;
+use crate::runtime::stream::response::{
+    ResponseStreamAttachOutcome, ResponseStreamBinding, ServerPathMetricsSource,
+};
 
 #[test]
 fn stream_fin_waits_for_final_offset_before_close() {

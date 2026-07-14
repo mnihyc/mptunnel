@@ -40,7 +40,7 @@ mod response_admission;
 mod response_service_handoff;
 pub(super) mod response_session;
 
-pub(in crate::runtime) use crate::runtime::path::udp::metrics::QuicCapacityProofCandidate;
+pub(in crate::runtime) use crate::runtime::path::quic::metrics::QuicCapacityProofCandidate;
 pub(in crate::runtime) use quic_capacity_probe::ResponseQuicCapacityCalibrationRequest;
 pub(in crate::runtime) use response_admission::*;
 pub(in crate::runtime) use response_service_handoff::{

@@ -34,7 +34,7 @@ use node::server::ServerPathContext;
 use node::server::path_join_replay_cache_capacity;
 #[cfg(test)]
 use node::server::run as run_server;
-use path::udp::carrier::*;
+use path::quic::carrier::*;
 use path::{
     ClientPathContext, ClientPathHealth, ClientPathHealthRecord, ClientPathState,
     PathDeliveryStats, RelayPathLoadLease, ReliableTcpRequestBulkFlowRegistration,

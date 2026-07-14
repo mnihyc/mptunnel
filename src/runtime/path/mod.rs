@@ -10,11 +10,11 @@ pub(super) mod commands;
 pub(super) mod common;
 pub(super) mod model;
 pub(super) mod proof;
+pub(in crate::runtime) mod quic;
 mod selection;
 mod set;
 mod state;
 pub(in crate::runtime) mod tcp;
-pub(in crate::runtime) mod udp;
 
 pub(super) use commands::*;
 pub(super) use common::*;

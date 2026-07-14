@@ -8,7 +8,7 @@ use super::{
 #[cfg(feature = "lab-diagnostics")]
 use crate::lab_diagnostics::lab_diagnostic;
 use crate::protocol::{SessionId, UnderlayProtocol};
-use crate::runtime::path::udp::metrics::QuicCapacityProofCandidate;
+use crate::runtime::path::quic::metrics::QuicCapacityProofCandidate;
 use crate::scheduler::FlowLane;
 use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex};

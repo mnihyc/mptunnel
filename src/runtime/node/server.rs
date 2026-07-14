@@ -13,10 +13,10 @@ use crate::protocol::{
 use crate::runtime::error::RuntimeError;
 use crate::runtime::management::run_server_management_api;
 use crate::runtime::path::model::path_startup_metrics;
-use crate::runtime::path::tcp::server::handle_server_path;
-use crate::runtime::path::udp::carrier::{
+use crate::runtime::path::quic::carrier::{
     UdpPathEndpoint, bind_server_udp_endpoint, run_server_udp_listener,
 };
+use crate::runtime::path::tcp::server::handle_server_path;
 use crate::runtime::recent_ids::RecentIdCache;
 use crate::runtime::stream::ServerReliableStreamRegistry;
 use crate::transport::{PathSpec, tcp};

@@ -1,4 +1,4 @@
-//! UDP/QUIC carrier runtime.
+//! QUIC carrier runtime over UDP paths.
 //!
 //! QUIC packet-ACK evidence stays native to this carrier. Sender policy only
 //! consumes typed path evidence and never treats it as TCP socket telemetry.

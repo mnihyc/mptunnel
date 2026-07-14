@@ -1,6 +1,5 @@
-use super::response_admission::{
-    ResponseSenderPathTarget, server_output_has_bulk_rate_evidence_with_limits,
-};
+use super::response_admission::server_output_has_bulk_rate_evidence_with_limits;
+use super::response_topology::ResponseSenderPathTarget;
 use super::{ResponseStreamBinding, ServerCarrierPathInstanceId};
 #[cfg(feature = "lab-diagnostics")]
 use crate::lab_diagnostics::lab_diagnostic;

@@ -1,28 +1,45 @@
+#[path = "response_ack_clock.rs"]
+mod response_ack_clock;
 #[path = "response_admission.rs"]
 mod response_admission;
+#[path = "response_delivery.rs"]
+mod response_delivery;
+#[path = "response_diagnostics.rs"]
+mod response_diagnostics;
+#[path = "response_evidence.rs"]
+mod response_evidence;
 #[path = "response_handoff.rs"]
 mod response_handoff;
 #[path = "response_quic_capacity.rs"]
 mod response_quic_capacity;
 #[path = "response_session.rs"]
 pub(super) mod response_session;
+#[path = "response_snapshot.rs"]
+mod response_snapshot;
+#[path = "response_topology.rs"]
+mod response_topology;
 
 pub(in crate::runtime) use crate::runtime::path::quic::metrics::QuicCapacityProofCandidate;
-#[cfg(test)]
-pub(in crate::runtime) use response_admission::{
-    CarrierPathAckedHole, ResponseAckOrderingUpdate, server_output_has_bulk_rate_evidence,
-    server_output_has_durable_product_progress,
+pub(in crate::runtime) use response_ack_clock::{
+    ResponseAckClockCalibrationState, ResponseAckClockRateEvidence,
+    ResponseAckClockRateEvidenceUpdate,
 };
 pub(in crate::runtime) use response_admission::{
-    CarrierPathFlight, CarrierPathFlightDebt, CarrierPathReleasedFlight,
-    ResponseAckClockCalibrationState, ResponseAckClockRateEvidence,
-    ResponseAckClockRateEvidenceUpdate, ResponseAckOrderingState, ResponseDispatchTarget,
-    ResponseSenderPathTarget, ResponseStreamOutputEntry, ResponseStreamOutputs,
-    ServerPathMetricsEntry, ServerPathMetricsSource, TcpResponseCapacityPrior,
-    record_server_sender_decision, response_latest_ordering_hole, server_bulk_output_eta_ms,
     server_output_accepts_service_capacity_prior, server_output_has_bulk_rate_evidence_with_limits,
     server_output_has_sender_evidence, server_output_has_service_feed_evidence_with_limits,
 };
+#[cfg(test)]
+pub(in crate::runtime) use response_admission::{
+    server_output_has_bulk_rate_evidence, server_output_has_durable_product_progress,
+};
+#[cfg(test)]
+pub(in crate::runtime) use response_delivery::{CarrierPathAckedHole, ResponseAckOrderingUpdate};
+pub(in crate::runtime) use response_delivery::{
+    CarrierPathFlight, CarrierPathFlightDebt, CarrierPathReleasedFlight, ResponseAckOrderingState,
+    response_latest_ordering_hole,
+};
+pub(in crate::runtime) use response_diagnostics::record_server_sender_decision;
+pub(in crate::runtime) use response_evidence::{ServerPathMetricsEntry, ServerPathMetricsSource};
 pub(in crate::runtime) use response_handoff::{
     ResponseServiceHandoffDrainRequest, ResponseServiceHandoffRequest,
 };
@@ -35,14 +52,19 @@ pub(in crate::runtime) use response_session::{
     TcpCapacityProbeSessionLease, quic_capacity_proof_pin_matches_marker,
     quic_capacity_receipt_rate_bps, valid_quic_capacity_proof_candidate_at,
 };
-
-use self::response_admission::{
-    server_bulk_output_snapshot, server_bulk_output_snapshot_with_scheduling,
-    server_output_quic_capacity_proof_marker,
+pub(in crate::runtime) use response_snapshot::server_bulk_output_eta_ms;
+pub(in crate::runtime) use response_topology::{
+    ResponseDispatchTarget, ResponseSenderPathTarget, ResponseStreamOutputEntry,
+    ResponseStreamOutputs, TcpResponseCapacityPrior,
 };
+
+use self::response_evidence::server_output_quic_capacity_proof_marker;
 #[cfg(test)]
 use self::response_session::ServerQuicCapacityCalibrationPhase;
 use self::response_session::ServerResponseFlowRegistration;
+use self::response_snapshot::{
+    server_bulk_output_snapshot, server_bulk_output_snapshot_with_scheduling,
+};
 #[cfg(feature = "lab-diagnostics")]
 use crate::lab_diagnostics::{lab_diagnostic, lab_diagnostic_event_enabled};
 #[cfg(test)]

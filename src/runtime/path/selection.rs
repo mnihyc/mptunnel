@@ -4,11 +4,35 @@
 //! operations under one health lock when admission must be race-free.
 
 use super::set::ClientPathContext;
+#[cfg(test)]
 use super::*;
+#[cfg(feature = "lab-diagnostics")]
+use crate::lab_diagnostics::lab_diagnostic;
 use crate::model::admission::{
     BulkPathCandidate, bulk_service_horizon_payload_bytes, bulk_striping_admitted_subflows,
 };
-use crate::model::capacity::relay_lane_startup_chunk_bytes;
+use crate::model::capacity::{PATH_OPEN_SCORE_BYTES, relay_lane_startup_chunk_bytes};
+use crate::model::path::RelayPathKey;
+use crate::protocol::{PathMetricDirection, PathMetrics, UnderlayProtocol};
+use crate::runtime::datagram::UdpPathCandidate;
+use crate::runtime::path::model::{
+    ClientPathObservation, UdpPathRuntimeModel, apply_bulk_latency_isolation,
+    bulk_candidate_has_active_bulk_work, bulk_candidate_has_bulk_rate_evidence,
+    bulk_candidate_has_fresh_native_carrier_rate_evidence, bulk_candidates_span_underlays,
+    bulk_path_candidate, carrier_diverse_bulk_validation_order, configured_order_path_indices,
+    configured_order_path_scores, endpoint_only_reliable_startup_should_preserve_configured_order,
+    health_observations, ordered_path_scores, ordered_path_scores_for_ttl,
+    ordered_reliable_path_indices, path_allows_automatic_bulk_use, path_can_be_auto_discovered,
+    path_is_endpoint_only, path_metrics_from_snapshot, path_snapshot,
+    reliable_reservation_should_use_endpoint_only_startup_order, reliable_stream_path_candidates,
+    udp_mtu_payload_bytes, udp_observation_has_datagram_feedback, udp_path_has_realtime_model,
+    udp_probe_ceiling_payload_bytes, udp_reliable_stream_loss_repair_penalty_ms,
+};
+use crate::runtime::path::state::{ClientPathHealthRecord, RelayPathLoadLease};
+use crate::scheduler::{
+    self, FlowLane, PathSnapshot, PathState as SchedulerPathState, SchedulerPolicy,
+};
+use std::time::Instant;
 
 impl ClientPathContext {
     pub(in crate::runtime) fn relay_path_allows_automatic_bulk_use(

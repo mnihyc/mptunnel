@@ -4,6 +4,7 @@
 //! lifecycle. Product offset ownership remains in `stream`; policy remains in
 //! `model` and `sender`.
 
+#[cfg(test)]
 use super::*;
 
 pub(in crate::runtime) mod authentication;
@@ -17,10 +18,19 @@ mod set;
 mod state;
 pub(in crate::runtime) mod tcp;
 
-pub(super) use commands::*;
-pub(super) use model::*;
+pub(in crate::runtime) use commands::{
+    QuicCapacityProbeCommand, QuicCapacityProbeCommandTicket, QuicCapacityProbeOwner,
+    RequestTcpCapacityProbeRequest,
+};
+pub(in crate::runtime) use model::PathDeliveryStats;
 #[cfg(test)]
 pub(super) use proof::*;
-pub(in crate::runtime) use server_context::*;
-pub(in crate::runtime) use set::*;
-pub(in crate::runtime) use state::*;
+pub(in crate::runtime) use server_context::ServerPathContext;
+pub(in crate::runtime) use set::ClientPathContext;
+pub(in crate::runtime) use state::{
+    ClientPathHealth, ClientPathHealthRecord, ClientPathState, RelayPathLoadLease,
+    ReliableTcpRequestBulkFlowRegistration, RequestCapacityProbeCampaignBudget,
+    RequestCapacityReconciliationView, RequestQuicCapacityProbeLease,
+    RequestQuicCapacityProductHandoffState, RequestQuicCapacityReconciliationQuery,
+    RequestTcpCapacityProbeLease, RequestTcpCapacityProofQuery,
+};

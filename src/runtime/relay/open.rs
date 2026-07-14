@@ -1,6 +1,27 @@
+use super::control::{
+    no_schedulable_reliable_path_error, relay_path_open_error_is_retryable,
+    reliable_relay_stall_timeout,
+};
+#[cfg(test)]
 use super::*;
-use crate::model::capacity::reliable_relay_buffer_len;
+#[cfg(feature = "lab-diagnostics")]
+use crate::lab_diagnostics::lab_diagnostic;
+use crate::model::capacity::{PATH_OPEN_SCORE_BYTES, reliable_relay_buffer_len};
+use crate::model::path::{RelayPathInstance, RelayPathKey};
+use crate::model::timing::{
+    active_path_open_serialized_exchanges, active_path_open_timeout, path_open_pto,
+};
+use crate::model::work::ReliableWorkClass;
+use crate::mux::MuxLimits;
+use crate::protocol::{Frame, IngressKind, StreamId, StreamOpenRole, TargetAddr, UnderlayProtocol};
+use crate::runtime::error::RuntimeError;
+use crate::runtime::path::commands::ClientTcpOpenDeadlines;
+use crate::runtime::path::{ClientPathContext, RelayPathLoadLease};
 use crate::runtime::sender::emit_request_control_frame;
+use crate::runtime::stream::{ReliablePathStream, ReliablePathStreamHandle};
+use crate::scheduler::FlowLane;
+use std::time::{Duration, Instant};
+use tokio::sync::mpsc;
 
 pub(in crate::runtime) struct OpenedRemoteStream {
     pub(in crate::runtime) stream: ReliablePathStream,

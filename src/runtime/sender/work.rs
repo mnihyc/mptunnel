@@ -1,7 +1,19 @@
 //! Sender work vocabulary shared by request and response directions.
 
+#[cfg(test)]
 use super::*;
-use crate::model::capacity::reliable_bulk_carrier_feed_quantum_bytes;
+use crate::model::capacity::{PATH_OPEN_SCORE_BYTES, reliable_bulk_carrier_feed_quantum_bytes};
+use crate::model::path::{CarrierPathKey, RelayPathInstance, RelayPathKey};
+use crate::mux::MuxLimits;
+use crate::protocol::Frame;
+use crate::runtime::RuntimeError;
+use crate::runtime::path::commands::{
+    ReliablePathCommandSender, reliable_path_effective_frame_lane,
+    reliable_path_stream_ordered_queue_lane,
+};
+use crate::runtime::relay::io::reliable_ack_gap_repair_delay;
+use crate::scheduler::{FlowLane, PathSnapshot};
+use std::time::Instant;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(in crate::runtime) enum CarrierEmitMode {

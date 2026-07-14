@@ -1,6 +1,20 @@
+#[cfg(test)]
 use super::*;
-use crate::model::capacity::relay_lane_startup_chunk_bytes;
+#[cfg(feature = "lab-diagnostics")]
+use crate::lab_diagnostics::lab_diagnostic;
+use crate::model::capacity::{
+    PATH_OPEN_SCORE_BYTES, QUIC_TIMER_GRANULARITY, relay_lane_startup_chunk_bytes,
+};
+use crate::mux::MuxLimits;
+use crate::protocol::{Frame, PathId, PathMetricDirection, PathMetrics, UnderlayProtocol};
+use crate::runtime::error::RuntimeError;
+use crate::runtime::path::commands::ReliablePathCommandSender;
+use crate::runtime::path::model::{metric_epoch_now, ratio_to_ppm};
+use crate::scheduler::FlowLane;
+use bytes::Bytes;
+use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::{Duration, Instant};
 
 static NEXT_PATH_PROOF_ID: AtomicU64 = AtomicU64::new(1);
 

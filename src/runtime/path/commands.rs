@@ -1,10 +1,27 @@
+#[cfg(test)]
 use super::*;
-use crate::model::capacity::{reliable_relay_buffer_len, reliable_relay_scheduler_quantum_cap};
-use crate::model::path::CarrierPathInstanceId;
+#[cfg(feature = "lab-diagnostics")]
+use crate::lab_diagnostics::{lab_diagnostic, lab_perf_record};
+use crate::model::capacity::{
+    BBR_MAX_SEND_QUANTUM_BYTES, reliable_relay_buffer_len, reliable_relay_scheduler_quantum_cap,
+};
+use crate::model::path::{CarrierPathInstanceId, RelayPathInstance};
+use crate::mux::MuxLimits;
 use crate::protocol::frame::reliable_path_frame_pacing_bytes;
+use crate::protocol::{
+    Frame, IngressKind, PathId, ResetReason, StreamId, StreamOpenRole, TargetAddr,
+};
+use crate::runtime::error::RuntimeError;
+use crate::runtime::path::state::RequestTcpCapacityProbeLease;
 use crate::runtime::stream::ReliablePathStream;
 use crate::runtime::stream::response::TcpCapacityProbeSessionLease;
-use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, Ordering};
+use crate::scheduler::FlowLane;
+use std::sync::{
+    Arc,
+    atomic::{AtomicBool, AtomicU8, AtomicU64, Ordering},
+};
+use std::time::{Duration, Instant};
+use tokio::sync::{Notify, mpsc, oneshot};
 
 // Bounded, lane-separated handoff from carrier-neutral scheduling to TCP or
 // QUIC writers. Control keeps independent capacity; a typed carrier probe remains

@@ -2,8 +2,33 @@
 //!
 //! Each listener owns active connections so shutdown cannot leave stale streams.
 
+#[cfg(test)]
 use super::*;
+use crate::ingress::ProxyAuthConfig;
+use crate::ingress::http_connect::{self, HttpConnectError, HttpStatus};
+use crate::ingress::socks5::{self, Socks5Error, Socks5Reply};
+use crate::model::path::RelayPathKey;
+use crate::mux::MuxLimits;
+use crate::protocol::{CloseReason, Frame, IngressKind, PathId, TargetAddr, UnderlayProtocol};
+use crate::runtime::datagram::UdpDatagramClientSession;
+use crate::runtime::error::RuntimeError;
+use crate::runtime::identity::random_u64;
+use crate::runtime::path::ClientPathContext;
 use crate::runtime::path::authentication::ClientPathAuthenticationFrames;
+use crate::runtime::relay::control::relay_migrating_tcp_stream;
+use crate::runtime::relay::open::{ReliableRelayOpenSpec, open_remote_stream};
+use crate::runtime::tun_l4::{
+    UdpEdgeCompletion, UdpEdgeLane, UdpEdgeRequest, close_udp_edge_lanes,
+    dispatch_udp_edge_request, finish_udp_edge_completion, udp_edge_completion_queue,
+};
+use crate::scheduler::FlowLane;
+use crate::transport::encrypted::{EncryptedFramedStream, PeerRole};
+use crate::transport::tcp::{self, TcpConnectOptions};
+use std::net::SocketAddr;
+use std::time::{Duration, Instant};
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
+use tokio::net::{TcpListener, UdpSocket};
+use tokio::sync::mpsc;
 
 const MAX_HTTP_CONNECT_HEADER_BYTES: usize = 64 * 1024;
 

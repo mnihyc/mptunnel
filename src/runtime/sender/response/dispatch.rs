@@ -3,12 +3,25 @@
 //! This module never ranks paths. It resolves a planned identity, asks the
 //! binding to revalidate and commit, and enqueues one carrier command.
 
+use super::planner::{
+    ResponseDataDispatchPlan, ResponseDataDispatchTarget, ResponseDataEmitOutcome,
+    choose_response_sender_target,
+};
+#[cfg(test)]
 use super::*;
+use crate::model::multipath::PathRuntimeRole;
+use crate::model::path::CarrierPathKey;
+use crate::protocol::Frame;
 use crate::protocol::frame::reliable_stream_frame_accounted_bytes;
+use crate::runtime::RuntimeError;
+use crate::runtime::path::commands::reliable_path_stream_ordered_queue_lane;
+use crate::runtime::sender::{CarrierEmitMode, RelaySendCause};
 use crate::runtime::stream::response::{
     ResponseAckClockCalibrationRequest, ResponseDispatchTarget, ResponseOwnerEnqueueAdmission,
     ResponseServiceHandoffRequest, ResponseSubflowAdmissionRequest, record_server_sender_decision,
 };
+use crate::runtime::stream::{ReliablePathStream, ReliablePathStreamOutput};
+use crate::scheduler::FlowLane;
 
 pub(super) fn response_repair_carrier_lane(frame: &Frame) -> FlowLane {
     if matches!(frame, Frame::StreamData { .. }) {

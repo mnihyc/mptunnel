@@ -3,17 +3,33 @@
 //! Reservations, proof publication, and lease rollback share this owner so
 //! senders and carriers cannot observe a partially committed probe.
 
-use super::commands::*;
-use super::model::*;
+use super::commands::{QuicCapacityProbeCommandResolution, QuicCapacityProbeCommandTicket};
+use super::model::{
+    ClientPathObservation, PathDeliveryStats, UdpDatagramPathObservation,
+    path_observation_is_idle_for_probe, path_record_failure_cooldown,
+    path_records_have_schedulable_alternative,
+};
 use super::proof::PathProofObservation;
 use super::quic::metrics::UdpPathMetrics;
 use super::set::ClientPathContext;
-use super::tcp::capacity::*;
-use crate::model::capacity::*;
-use crate::model::path::*;
+use super::tcp::capacity::valid_tcp_capacity_proof_candidate_at;
+#[cfg(test)]
+use super::*;
+use crate::model::capacity::{
+    BBR_MAX_SEND_QUANTUM_BYTES, PATH_OPEN_SCORE_BYTES, PathRateSample, QuicCapacityProofCandidate,
+    TcpCapacityProofCandidate, reliable_capacity_calibration_session_limit_bytes,
+};
+use crate::model::path::{RelayPathInstance, RelayPathKey};
+use crate::protocol::{PathMetricDirection, PathMetrics, StreamId, UnderlayProtocol};
 use crate::runtime::error::RuntimeError;
-use crate::runtime::prelude::*;
-use std::sync::atomic::{AtomicU8, AtomicU32, AtomicU64, Ordering};
+use crate::scheduler::{FlowLane, PathState as SchedulerPathState};
+use crate::transport::quic as quic_transport;
+use std::collections::{HashMap, VecDeque};
+use std::sync::{
+    Arc, Mutex,
+    atomic::{AtomicU8, AtomicU32, AtomicU64, Ordering},
+};
+use std::time::{Duration, Instant};
 
 /// One transaction owner for mutable client-path evidence and probe budgets.
 #[derive(Debug)]

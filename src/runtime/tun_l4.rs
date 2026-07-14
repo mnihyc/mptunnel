@@ -1,4 +1,31 @@
+#[cfg(test)]
 use super::*;
+use crate::ingress::tun::TunL4Config;
+use crate::model::capacity::{
+    PATH_OPEN_SCORE_BYTES, QUIC_PERSISTENT_CONGESTION_THRESHOLD, QUIC_TIMER_GRANULARITY,
+    UDP_DEFAULT_MTU_PAYLOAD_BYTES, UDP_MAX_MTU_PAYLOAD_BYTES,
+};
+use crate::model::path::RelayPathKey;
+use crate::outbound;
+use crate::protocol::{IngressKind, TargetAddr};
+use crate::runtime::datagram::{DatagramClientAssociation, datagram_underlay_candidate_keys};
+use crate::runtime::error::RuntimeError;
+use crate::runtime::ingress_runtime::DEFAULT_SOCKS5_UDP_TTL_MS;
+use crate::runtime::packet_device::PacketDevice;
+use crate::runtime::path::ClientPathContext;
+use crate::runtime::path::model::UdpPathRuntimeModel;
+use crate::runtime::relay::control::relay_migrating_tcp_stream;
+use crate::runtime::relay::open::{ReliableRelayOpenSpec, open_remote_stream};
+use crate::scheduler::{FlowLane, PathSnapshot, PathState as SchedulerPathState};
+use bytes::{Bytes, BytesMut};
+use futures::{SinkExt, StreamExt};
+use netstack_smoltcp::{StackBuilder, TcpListener as TunTcpListener, UdpSocket as TunUdpSocket};
+use std::collections::{HashMap, HashSet};
+use std::net::SocketAddr;
+use std::time::Duration;
+use tokio::io::{AsyncRead, AsyncWrite};
+use tokio::sync::mpsc;
+use tun_rs::async_framed::{BytesCodec, DeviceFramed};
 
 const TUN_UDP_FLOW_IDLE_TIMEOUT: Duration = Duration::from_secs(60);
 

@@ -1,4 +1,7 @@
+#[cfg(test)]
 use super::*;
+#[cfg(feature = "lab-diagnostics")]
+use crate::lab_diagnostics::{lab_diagnostic, lab_diagnostic_event_enabled};
 #[cfg(test)]
 use crate::model::ack_clock::reliable_tcp_ack_clock_calibration_opportunity;
 use crate::model::ack_clock::{
@@ -13,14 +16,30 @@ use crate::model::admission::{
     bulk_service_feed_reservoir_payload_bytes, bulk_service_horizon_payload_bytes,
     bulk_service_product_envelope_payload_bytes,
 };
-use crate::model::capacity::bbr_inflight_target_bytes;
+use crate::model::capacity::{
+    PATH_OPEN_SCORE_BYTES, bbr_inflight_target_bytes,
+    product_delivery_samples_override_startup_prior, reliable_subflow_startup_sample_limit_bytes,
+};
+use crate::model::multipath::{
+    FlowSubflowSet, PathAdmissionDecision, PathRuntimeRole, SubflowAdmissionInput,
+};
+use crate::model::path::{RelayPathInstance, RelayPathKey};
 #[cfg(feature = "lab-diagnostics")]
 use crate::model::request::evidence::RequestPerFlowRateModel;
+use crate::mux::MuxLimits;
 use crate::protocol::frame::reliable_stream_frame_extent;
+use crate::protocol::{Frame, RateHint, StreamId, UnderlayProtocol};
+use crate::runtime::path::ClientPathContext;
+use crate::runtime::path::model::{path_startup_snapshot, path_within_adaptive_lead_hysteresis};
+use crate::runtime::relay::open::{RelayPathPlacement, ReliableRelayRemotePath};
 use crate::runtime::stream::request::{
     RequestAckClockOperation, RequestFlightLedger, RequestSubflowState, RequestSubflows,
 };
-use crate::scheduler::cyclic_cursor_distance;
+use crate::scheduler::{
+    self, FlowLane, PathRateScope, PathSnapshot, SchedulerPolicy, cyclic_cursor_distance,
+};
+use std::collections::HashSet;
+use std::time::Duration;
 
 pub(super) fn relay_frame_is_bulk_stream_data(frame: &Frame, lane: FlowLane) -> bool {
     lane.is_bulk() && matches!(frame, Frame::StreamData { .. })

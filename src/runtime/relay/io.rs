@@ -1,3 +1,5 @@
+use super::control::reliable_relay_stall_timeout;
+#[cfg(test)]
 use super::*;
 #[cfg(test)]
 use crate::model::admission::{
@@ -8,21 +10,32 @@ use crate::model::admission::{
 use crate::model::admission::{
     bulk_service_horizon_payload_bytes, bulk_service_product_envelope_payload_bytes,
 };
+use crate::model::capacity::{
+    QUIC_MAX_ACK_DELAY, QUIC_PERSISTENT_CONGESTION_THRESHOLD, QUIC_TIMER_GRANULARITY,
+    adaptive_reliable_relay_inflight_bytes, adaptive_reliable_relay_repair_bytes,
+    reliable_stream_ack_update_bytes, reliable_stream_advertised_window_bytes,
+    reliable_stream_max_data_update_bytes,
+};
 #[cfg(test)]
 use crate::model::capacity::{
     adaptive_reliable_relay_chunk_bytes_with_frame_limit, relay_lane_startup_chunk_bytes,
     reliable_bulk_carrier_feed_quantum_bytes, reliable_relay_buffer_len,
     reliable_relay_sender_dispatch_budget,
 };
-use crate::model::capacity::{
-    adaptive_reliable_relay_inflight_bytes, adaptive_reliable_relay_repair_bytes,
-    reliable_stream_ack_update_bytes, reliable_stream_advertised_window_bytes,
-    reliable_stream_max_data_update_bytes,
-};
+use crate::model::timing::transport_pto_from_snapshot;
+use crate::mux::MuxLimits;
+use crate::mux::stream::{ReliableRecvStream, ReliableSendStream};
 #[cfg(test)]
 use crate::protocol::frame::reliable_stream_frame_extent;
 use crate::protocol::frame::{normalized_offset_ranges, stream_ack_contiguous_frontier};
+use crate::protocol::{Frame, OffsetRange, UnderlayProtocol};
+use crate::runtime::error::RuntimeError;
 use crate::runtime::sender::emit_request_control_frame;
+use crate::runtime::stream::ReliablePathStream;
+use crate::scheduler::{FlowLane, PathSnapshot};
+use bytes::Bytes;
+use std::time::{Duration, Instant};
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 
 // Relay I/O orchestrates reads, writes, and feedback timing. It observes queue
 // counters but delegates product admission limits to their policy modules.

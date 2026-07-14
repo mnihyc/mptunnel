@@ -19,7 +19,7 @@ use super::admission::{
 #[cfg(feature = "lab-diagnostics")]
 use super::diagnostics::{
     ResponseBulkCandidateDiag, lab_response_bulk_output_candidate,
-    lab_response_bulk_output_selected,
+    lab_response_bulk_output_selected, lab_response_service_handoff_evaluation,
 };
 use super::quic_capacity::{
     select_response_quic_capacity_calibration_start, try_start_response_quic_capacity_calibration,
@@ -32,21 +32,36 @@ use super::tcp_capacity::{
     select_response_ack_clock_calibration_target, select_response_tcp_capacity_probe_start,
     try_start_response_tcp_capacity_probe,
 };
+#[cfg(test)]
 use super::*;
 use crate::model::admission::{
     BulkAdmissionCheck, BulkAdmissionRole, bulk_candidate_admission_suppression_with_ordering_debt,
 };
 use crate::model::capacity::{
-    QuicCapacityProofCandidate, adaptive_reliable_relay_chunk_bytes_with_frame_limit,
+    QUIC_PERSISTENT_CONGESTION_THRESHOLD, QuicCapacityProofCandidate,
+    adaptive_reliable_relay_chunk_bytes_with_frame_limit,
 };
-use crate::model::path::{CarrierPathInstanceId, carrier_path_key_order};
+use crate::model::multipath::{
+    FlowSubflowSet, PathAdmission, PathAdmissionDecision, PathRuntimeRole,
+    cross_family_reliable_owner_health,
+};
+use crate::model::path::{CarrierPathInstanceId, CarrierPathKey, carrier_path_key_order};
 use crate::model::response::{
     CarrierPathFlightDebt, ResponseCandidateTailDebt, ResponseOrderedTail,
     ResponseSameFamilyReservoir, ResponseServiceFamilyLoads, ResponseServiceHandoffMode,
     response_oldest_lower_flight_owner, response_ordering_debt_bytes, response_rate_fair_share_bps,
     response_snapshot_handoff_mode,
 };
+use crate::model::timing::transport_pto_from_snapshot;
+use crate::model::work::{CarrierWorkKind, ReliableWorkClass};
+use crate::mux::MuxLimits;
+use crate::mux::stream::ReliableSendStream;
 use crate::protocol::frame::reliable_stream_frame_accounted_bytes;
+use crate::protocol::{Frame, StreamOpenRole, UnderlayProtocol};
+use crate::runtime::RuntimeError;
+use crate::runtime::path::model::{default_path_rate_bps, path_within_adaptive_lead_hysteresis};
+use crate::runtime::relay_striping::relay_frame_is_bulk_stream_data;
+use crate::runtime::sender::{CarrierEmitMode, RelaySendCause};
 use crate::runtime::stream::response::{
     MIN_ACTIVE_RESPONSE_FLOWS_FOR_SAME_FAMILY_DISCOVERY,
     ResponseAckClockCalibrationRetirementRequest, ResponseDispatchTarget, ResponseSenderPathTarget,
@@ -54,7 +69,13 @@ use crate::runtime::stream::response::{
     ResponseStreamBinding, quic_capacity_proof_pin_matches_marker, server_bulk_output_eta_ms,
     valid_quic_capacity_proof_candidate_at,
 };
-use crate::scheduler::PathRateScope;
+use crate::runtime::stream::{
+    FixedReliablePathOutput, ReliablePathStream, ReliablePathStreamOutput,
+    reliable_work_lane_to_carrier_lane,
+};
+use crate::scheduler::{FlowLane, PathRateScope};
+use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 #[cfg(test)]
 #[path = "planner_test.rs"]

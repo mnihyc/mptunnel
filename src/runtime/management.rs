@@ -2,9 +2,24 @@
 //!
 //! Samplers are node-supervised siblings of listeners so restarts retire both.
 
+#[cfg(test)]
 use super::*;
+use crate::config::{ManagementConfig, RouteTarget, RouteTargetKind};
+use crate::ingress::IngressConfig;
+use crate::protocol::{PathMetricDirection, UnderlayProtocol};
+use crate::runtime::error::RuntimeError;
+use crate::runtime::path::model::{path_record_failure_cooldown, path_snapshot};
+use crate::runtime::path::{ClientPathContext, ClientPathHealthRecord, ServerPathContext};
+use crate::runtime::stream::ServerReliableRegistryManagementSnapshot;
+use crate::scheduler::{PathSnapshot, PathState as SchedulerPathState};
+use crate::transport::PathSpec;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
+use std::collections::VecDeque;
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::net::{TcpListener, TcpStream};
 
 const MANAGEMENT_REQUEST_LIMIT: usize = 64 * 1024;
 const MANAGEMENT_TREND_CAPACITY: usize = 300;

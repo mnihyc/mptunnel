@@ -2,16 +2,25 @@ use super::admission::{
     ResponseBulkLead, response_owner_bulk_model_suppression, response_target_emission_credit_bytes,
     response_target_has_emission_credit,
 };
+use super::planner::{
+    response_service_fair_share_bps, response_service_handoff_mode_for_targets,
+    response_service_handoff_preserves_fair_share, response_service_handoff_target_view,
+};
+#[cfg(test)]
 use super::*;
+use crate::lab_diagnostics::{lab_diagnostic, lab_diagnostic_event_enabled};
 use crate::model::admission::{BulkAdmissionRole, BulkExplorationCompletionProjection};
 use crate::model::multipath::PathAdmission;
-use crate::model::path::carrier_path_key_order;
+use crate::model::path::{CarrierPathKey, carrier_path_key_order};
 use crate::model::response::{CarrierPathFlightDebt, ResponseServiceFamilyLoads};
+use crate::mux::MuxLimits;
+use crate::protocol::{StreamOpenRole, UnderlayProtocol};
 use crate::runtime::stream::response::{
     ResponseSenderPathTarget, ResponseServiceHandoffDrainReservation, ResponseStreamBinding,
     valid_quic_capacity_proof_candidate_at, well_formed_quic_capacity_proof_candidate,
 };
-use crate::scheduler::PathSnapshot;
+use crate::scheduler::{FlowLane, PathSnapshot};
+use std::time::Instant;
 
 // Why separate: causal lab observability mirrors product gates, but it must
 // remain an observer rather than inflate or become a second hot-path policy.

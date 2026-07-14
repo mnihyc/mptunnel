@@ -1,15 +1,67 @@
+use super::diagnostics::log_unexpected_stream_relay_frame;
+use super::flow::{
+    ReliableRelayFlowDemandTracker, ReliableRelayFlowSignals, reliable_flow_bulk_threshold_bytes,
+};
+use super::io::{
+    ReliableAckGapRepairProgress, ReliableRecvProgress, pending_stream_fin_ready,
+    read_reliable_relay_payload, receive_stream_fin, reliable_critical_tail_repair_is_over_budget,
+    reliable_critical_tail_repair_limit_bytes, reliable_persistent_ack_gap_repair_limit_bytes,
+    reliable_relay_error_is_migratable, reliable_relay_recv_progress_resend_active,
+    reliable_stream_recv_progress_interval, resize_reliable_relay_buffer,
+    send_sender_service_attach_control_frames, sender_service_retry_delay,
+    stream_ack_gap_repair_frames_normalized, stream_data_range_already_delivered,
+    stream_final_offset_tail_repair_frames, stream_terminal_fin_replay_required,
+    update_repair_authoritative_ack_snapshot, write_delivered_payloads,
+};
+use super::open::{
+    AcceptedRemoteStreamGuard, OpenedRemoteStream, ReliableRelayAttachMode,
+    ReliableRelayAttachOutcome, ReliableRelayOpenSpec, ReliableRelayRemoteFrame,
+    ReliableRelayRemotePath, ReliableRelayRemoteSet, UdpStreamOpenOptions,
+    open_remote_stream_on_path, open_remote_stream_on_reserved_path,
+    open_remote_stream_on_reserved_udp_path, open_remote_stream_on_udp_path,
+    relay_error_is_tcp_path_failure, relay_path_open_with_deadline,
+    reliable_relay_attach_open_timeouts, stream_open_error_is_path_retryable,
+    udp_relay_attachment_open_options, udp_stream_open_error_is_path_retryable,
+};
+#[cfg(test)]
 use super::*;
+#[cfg(feature = "lab-diagnostics")]
+use crate::lab_diagnostics::{lab_diagnostic, lab_perf_flush, lab_perf_record};
 use crate::model::capacity::{
+    PATH_OPEN_SCORE_BYTES, QUIC_PERSISTENT_CONGESTION_THRESHOLD,
     adaptive_reliable_relay_chunk_bytes, adaptive_reliable_relay_chunk_bytes_with_frame_limit,
     adaptive_reliable_relay_inflight_bytes, adaptive_reliable_relay_repair_bytes,
     relay_lane_startup_chunk_bytes, reliable_relay_buffer_len,
     reliable_relay_sender_dispatch_budget,
 };
+use crate::model::path::{RelayPathInstance, RelayPathKey};
+use crate::model::timing::transport_pto_from_snapshot;
+use crate::mux::MuxLimits;
+use crate::mux::stream::{ReliableRecvStream, ReliableSendStream};
 use crate::protocol::frame::normalized_offset_ranges;
 #[cfg(feature = "lab-diagnostics")]
 use crate::protocol::frame::reliable_path_frame_pacing_bytes;
-
+use crate::protocol::{
+    Frame, IngressKind, OffsetRange, StreamId, StreamOpenRole, TargetAddr, UnderlayProtocol,
+};
+use crate::runtime::error::RuntimeError;
+use crate::runtime::path::commands::{ClientTcpOpenDeadlines, reliable_stream_frame_queue};
+use crate::runtime::path::{
+    ClientPathContext, PathDeliveryStats, ReliableTcpRequestBulkFlowRegistration,
+};
+use crate::runtime::sender::{
+    ClientQueuedDispatch, RelayRecvProgressSend, RelaySendCause, ReliableRelaySenderQueue,
+    RequestSenderService, reliable_relay_can_read_product_source,
+    reliable_relay_sender_queue_limit, reliable_relay_sender_queue_read_budget,
+};
 use crate::runtime::stream::request::RequestOutstandingWindow;
+use crate::runtime::stream::wait_for_carrier_capacity_notifies;
+use crate::scheduler::{FlowLane, PathSnapshot};
+use bytes::Bytes;
+use std::collections::{HashMap, HashSet};
+use std::time::{Duration, Instant};
+use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt};
+use tokio::sync::mpsc;
 
 pub(in crate::runtime) fn reliable_relay_client_dispatch_payload_limit(
     adaptive_chunk_bytes: usize,

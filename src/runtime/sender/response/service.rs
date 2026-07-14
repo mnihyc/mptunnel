@@ -3,10 +3,43 @@
 //! The service owns queued product work. Planning and carrier dispatch remain
 //! separate so queue mutation cannot silently become path-selection policy.
 
+use super::dispatch::{
+    emit_planned_response_data_frame, emit_response_frame_from_sender_service,
+    response_frame_has_carrier_credit, response_repair_carrier_lane,
+};
+use super::planner::{
+    choose_response_sender_target, plan_response_data_payload_with_ordered_debt_impl,
+    preview_response_data_payload_with_ordered_debt, response_dispatch_payload_bytes,
+};
+#[cfg(test)]
 use super::*;
+use crate::config::MppPerformanceConfig;
+#[cfg(feature = "lab-diagnostics")]
+use crate::lab_diagnostics::{
+    lab_diagnostic, lab_diagnostic_event_enabled, lab_perf_record, lab_sender_service_decision,
+    lab_server_response_stream_data,
+};
+use crate::model::multipath::{ExtraTrafficKind, ExtraTrafficLedger};
+use crate::model::path::CarrierPathKey;
+use crate::model::work::{CarrierWorkKind, ReliableWorkClass};
+use crate::mux::MuxLimits;
+use crate::mux::stream::ReliableSendStream;
 #[cfg(feature = "lab-diagnostics")]
 use crate::protocol::frame::reliable_path_frame_pacing_bytes;
 use crate::protocol::frame::reliable_stream_frame_accounted_bytes;
+use crate::protocol::{Frame, OffsetRange, SessionId, StreamFlags, StreamId};
+use crate::runtime::RuntimeError;
+use crate::runtime::path::commands::reliable_path_effective_frame_lane;
+use crate::runtime::sender::{
+    CarrierEmitMode, RelaySendCause, ReliableRelayQueuedWork, ReliableRelayQueuedWorkKind,
+    ReliableRelaySenderQueue, ServerRepairOutputIdentity, reliable_relay_can_read_product_source,
+    reliable_relay_sender_queue_read_budget, sender_extra_traffic_startup_floor_bytes,
+    sender_repair_minimum_useful_attempt_bytes,
+};
+use crate::runtime::stream::{ReliablePathStream, ReliablePathStreamOutput};
+use crate::scheduler::{FlowLane, PathSnapshot};
+use bytes::Bytes;
+use std::time::Instant;
 
 #[cfg(test)]
 #[path = "service_test.rs"]

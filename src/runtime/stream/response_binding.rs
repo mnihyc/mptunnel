@@ -10,6 +10,8 @@ mod response_diagnostics;
 mod response_evidence;
 #[path = "response_handoff.rs"]
 mod response_handoff;
+#[path = "response_handoff_commit.rs"]
+mod response_handoff_commit;
 #[path = "response_lifecycle.rs"]
 mod response_lifecycle;
 #[path = "response_load.rs"]
@@ -62,8 +64,9 @@ use response_diagnostics::{
 };
 pub(in crate::runtime) use response_evidence::{ServerPathMetricsEntry, ServerPathMetricsSource};
 pub(in crate::runtime) use response_handoff::{
-    ResponseServiceHandoffDrainRequest, ResponseServiceHandoffRequest,
+    ResponseServiceHandoffDrainRequest, ResponseServiceHandoffDrainReservation,
 };
+pub(in crate::runtime) use response_handoff_commit::ResponseServiceHandoffRequest;
 pub(in crate::runtime) use response_load::ServerRealtimeFlowRegistration;
 #[cfg(any(test, feature = "lab-diagnostics"))]
 pub(in crate::runtime) use response_quic_capacity::well_formed_quic_capacity_proof_candidate;
@@ -74,9 +77,7 @@ pub(in crate::runtime) use response_quic_capacity::{
 pub(in crate::runtime) use response_quic_probe::ResponseQuicCapacityCalibrationRequest;
 #[cfg(test)]
 pub(in crate::runtime) use response_session::ResponseSessionSchedulingSnapshot;
-pub(in crate::runtime) use response_session::{
-    ResponseServiceFamilyLoads, ResponseServiceHandoffDrainReservation, ServerPathLaneTracker,
-};
+pub(in crate::runtime) use response_session::{ResponseServiceFamilyLoads, ServerPathLaneTracker};
 pub(in crate::runtime) use response_snapshot::server_bulk_output_eta_ms;
 #[cfg(test)]
 pub(in crate::runtime) use response_snapshot::{

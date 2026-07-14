@@ -464,9 +464,7 @@ impl ServerPathLaneTracker {
             || next_spent_bytes > session_byte_limit
             || state.tcp_capacity_probe_reservations.contains(&session_id)
             || state.quic_capacity_calibrations.contains_key(&session_id)
-            || state
-                .response_service_handoff_drains
-                .contains_key(&session_id)
+            || state.response_service_handoff_drain_reserved(session_id)
         {
             return false;
         }

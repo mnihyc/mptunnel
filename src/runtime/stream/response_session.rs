@@ -1,15 +1,12 @@
 use super::ServerCarrierPathInstanceId;
+use super::response_handoff::ResponseServiceHandoffDrainReservation;
 use super::response_load::{ServerPathLaneLoad, ServerPathLoadKey};
 use super::response_quic_capacity::{
     ServerQuicCapacityCalibrationPathKey, ServerQuicCapacityCalibrationReservation,
-    finish_quic_capacity_session_reclamation, valid_quic_capacity_proof_candidate_at,
+    finish_quic_capacity_session_reclamation,
 };
-#[cfg(feature = "lab-diagnostics")]
-use crate::lab_diagnostics::lab_diagnostic;
 use crate::model::path::CarrierPathKey;
 use crate::protocol::{SessionId, UnderlayProtocol};
-use crate::runtime::path::quic::metrics::QuicCapacityProofCandidate;
-use crate::scheduler::FlowLane;
 use std::collections::{HashMap, HashSet};
 use std::sync::Mutex;
 use std::time::Instant;
@@ -41,20 +38,6 @@ pub(super) struct ServerResponsePathSchedulingSnapshot {
     pub(super) path_load: ServerPathLaneLoad,
     pub(super) session_load: ServerPathLaneLoad,
     pub(super) quic_capacity_calibration_attempts: u8,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(in crate::runtime) struct ResponseServiceHandoffDrainReservation {
-    pub(in crate::runtime) binding_instance_id: u64,
-    pub(in crate::runtime) service: CarrierPathKey,
-    pub(in crate::runtime) service_path_instance_id: ServerCarrierPathInstanceId,
-    pub(in crate::runtime) service_incarnation: u64,
-    pub(in crate::runtime) target: CarrierPathKey,
-    pub(in crate::runtime) target_path_instance_id: ServerCarrierPathInstanceId,
-    pub(in crate::runtime) target_incarnation: u64,
-    /// Pins one fresh receipt only for this bounded handoff transaction.
-    pub(in crate::runtime) capacity_proof: Option<QuicCapacityProofCandidate>,
-    pub(in crate::runtime) expires_at: Instant,
 }
 
 impl ResponseServiceFamilyLoads {
@@ -169,7 +152,7 @@ impl ServerPathLaneTrackerState {
         {
             let capacity_reservation = self.take_quic_capacity_session_reclamation(session_id);
             self.tcp_capacity_probe_reservations.remove(&session_id);
-            self.response_service_handoff_drains.remove(&session_id);
+            self.clear_response_service_handoff_drain_for_reclaim(session_id);
             self.response_service_session_loads.remove(&session_id);
             self.response_service_family_loads.remove(&session_id);
             self.session_generations.remove(&session_id);
@@ -214,31 +197,7 @@ impl ServerPathLaneTracker {
         let mut state = self.state.lock().expect("server path lane tracker lock");
         let now = Instant::now();
         state.expire_quic_capacity_calibration_at(session_id, now);
-        let drain_expired = state
-            .response_service_handoff_drains
-            .get(&session_id)
-            .is_some_and(|reservation| now >= reservation.expires_at);
-        if drain_expired {
-            let reservation = state.response_service_handoff_drains.remove(&session_id);
-            state.bump_generation(session_id);
-            #[cfg(feature = "lab-diagnostics")]
-            if let Some(reservation) = reservation {
-                lab_diagnostic(
-                    "response_service_handoff",
-                    format_args!(
-                        "phase=drain_cancelled session_id={} binding_instance_id={} reason=timeout from_underlay={:?} from_path_id={} to_underlay={:?} to_path_id={}",
-                        session_id.0,
-                        reservation.binding_instance_id,
-                        reservation.service.underlay,
-                        reservation.service.path_id.0,
-                        reservation.target.underlay,
-                        reservation.target.path_id.0,
-                    ),
-                );
-            }
-            #[cfg(not(feature = "lab-diagnostics"))]
-            let _ = reservation;
-        }
+        state.expire_response_service_handoff_drain_at(session_id, now);
         let generation = state
             .session_generations
             .get(&session_id)
@@ -265,117 +224,8 @@ impl ServerPathLaneTracker {
                 .quic_capacity_calibration_reserved(session_id),
             quic_capacity_calibration_spent_bytes: state
                 .quic_capacity_calibration_spent_bytes(session_id),
-            response_service_handoff_drain: state
-                .response_service_handoff_drains
-                .get(&session_id)
-                .copied(),
+            response_service_handoff_drain: state.response_service_handoff_drain(session_id),
         }
-    }
-
-    #[allow(clippy::too_many_arguments)]
-    pub(super) fn try_reserve_response_service_handoff_drain(
-        &self,
-        session_id: SessionId,
-        expected_generation: u64,
-        binding_instance_id: u64,
-        service: CarrierPathKey,
-        service_path_instance_id: ServerCarrierPathInstanceId,
-        service_incarnation: u64,
-        target: CarrierPathKey,
-        target_path_instance_id: ServerCarrierPathInstanceId,
-        target_incarnation: u64,
-        capacity_proof: Option<QuicCapacityProofCandidate>,
-        expires_at: Instant,
-    ) -> bool {
-        let now = Instant::now();
-        if service == target
-            || service.underlay == target.underlay
-            || expires_at <= now
-            || capacity_proof.is_some_and(|proof| {
-                target.underlay != UnderlayProtocol::Udp
-                    || !valid_quic_capacity_proof_candidate_at(proof, now)
-            })
-        {
-            return false;
-        }
-        let mut state = self.state.lock().expect("server path lane tracker lock");
-        if expires_at <= Instant::now() {
-            return false;
-        }
-        let generation = state
-            .session_generations
-            .get(&session_id)
-            .copied()
-            .unwrap_or(0);
-        // The tracker serializes a decision made from the matching generation;
-        // family/rate policy belongs to the sender snapshot that ranked it.
-        if generation != expected_generation
-            || state.tcp_capacity_probe_reservations.contains(&session_id)
-            || state.quic_capacity_calibration_reserved(session_id)
-            || state
-                .response_service_handoff_drains
-                .contains_key(&session_id)
-        {
-            return false;
-        }
-        state.response_service_handoff_drains.insert(
-            session_id,
-            ResponseServiceHandoffDrainReservation {
-                binding_instance_id,
-                service,
-                service_path_instance_id,
-                service_incarnation,
-                target,
-                target_path_instance_id,
-                target_incarnation,
-                capacity_proof,
-                expires_at,
-            },
-        );
-        state.bump_generation(session_id);
-        true
-    }
-
-    pub(super) fn clear_response_service_handoff_drain_for_binding(
-        &self,
-        session_id: SessionId,
-        binding_instance_id: u64,
-    ) -> bool {
-        let mut state = self.state.lock().expect("server path lane tracker lock");
-        let matches = state
-            .response_service_handoff_drains
-            .get(&session_id)
-            .is_some_and(|reservation| reservation.binding_instance_id == binding_instance_id);
-        if matches {
-            state.response_service_handoff_drains.remove(&session_id);
-            state.bump_generation(session_id);
-        }
-        matches
-    }
-
-    pub(super) fn clear_response_service_handoff_drain_for_path(
-        &self,
-        session_id: SessionId,
-        binding_instance_id: u64,
-        path: CarrierPathKey,
-        path_instance_id: ServerCarrierPathInstanceId,
-    ) -> bool {
-        let mut state = self.state.lock().expect("server path lane tracker lock");
-        let matches = state
-            .response_service_handoff_drains
-            .get(&session_id)
-            .is_some_and(|reservation| {
-                reservation.binding_instance_id == binding_instance_id
-                    && ((reservation.service == path
-                        && reservation.service_path_instance_id == path_instance_id)
-                        || (reservation.target == path
-                            && reservation.target_path_instance_id == path_instance_id))
-            });
-        if matches {
-            state.response_service_handoff_drains.remove(&session_id);
-            state.bump_generation(session_id);
-        }
-        matches
     }
 
     pub(super) fn with_matching_generation<R>(
@@ -456,88 +306,6 @@ impl ServerPathLaneTracker {
                 )
             })
             .collect()
-    }
-
-    pub(super) fn try_move_response_service_handoff(
-        &self,
-        session_id: SessionId,
-        expected_generation: u64,
-        binding_instance_id: u64,
-        from: CarrierPathKey,
-        from_path_instance_id: ServerCarrierPathInstanceId,
-        from_incarnation: u64,
-        to: CarrierPathKey,
-        to_path_instance_id: ServerCarrierPathInstanceId,
-        to_incarnation: u64,
-        capacity_proof: Option<QuicCapacityProofCandidate>,
-        lane: FlowLane,
-    ) -> bool {
-        if from.underlay == to.underlay || from == to {
-            return false;
-        }
-        let mut state = self.state.lock().expect("server path lane tracker lock");
-        let generation = state
-            .session_generations
-            .get(&session_id)
-            .copied()
-            .unwrap_or(0);
-        if generation != expected_generation || state.quic_capacity_calibration_reserved(session_id)
-        {
-            return false;
-        }
-        // Generation equality proves the caller ranked the same family-load
-        // state. This mutation layer owns serialization, not placement policy.
-        let now = Instant::now();
-        let drain_expired = state
-            .response_service_handoff_drains
-            .get(&session_id)
-            .is_some_and(|reservation| now >= reservation.expires_at);
-        if drain_expired {
-            state.response_service_handoff_drains.remove(&session_id);
-            state.bump_generation(session_id);
-            return false;
-        }
-        let drain = state.response_service_handoff_drains.get(&session_id);
-        // A direct move has no transaction lease to retain receipt authority,
-        // so freshness must still hold at this final serialized mutation. An
-        // exact drain instead owns the frozen proof until its own bounded lease.
-        if drain.is_none()
-            && capacity_proof.is_some_and(|proof| {
-                to.underlay != UnderlayProtocol::Udp
-                    || !valid_quic_capacity_proof_candidate_at(proof, now)
-            })
-        {
-            return false;
-        }
-        let drain_matches = drain.is_none_or(|reservation| {
-            reservation.binding_instance_id == binding_instance_id
-                && reservation.service == from
-                && reservation.service_path_instance_id == from_path_instance_id
-                && reservation.service_incarnation == from_incarnation
-                && reservation.target == to
-                && reservation.target_path_instance_id == to_path_instance_id
-                && reservation.target_incarnation == to_incarnation
-                && reservation.capacity_proof == capacity_proof
-        });
-        if !drain_matches {
-            return false;
-        }
-        if !state.move_response_service(session_id, from, to, lane) {
-            return false;
-        }
-        state.response_service_handoff_drains.remove(&session_id);
-        state.bump_generation(session_id);
-        true
-    }
-
-    pub(super) fn rollback_response_service_handoff(
-        &self,
-        session_id: SessionId,
-        from: CarrierPathKey,
-        to: CarrierPathKey,
-        lane: FlowLane,
-    ) {
-        self.move_response_service(session_id, to, from, lane);
     }
 }
 

@@ -4,7 +4,8 @@ use super::response::{
 };
 use crate::model::capacity::{
     PATH_OPEN_SCORE_BYTES, PathRateSample, RELIABLE_INITIAL_WINDOW_PACKETS,
-    product_delivery_samples_override_startup_prior, reliable_subflow_startup_sample_limit_bytes,
+    bbr_inflight_target_bytes, product_delivery_samples_override_startup_prior,
+    reliable_subflow_startup_sample_limit_bytes,
 };
 use crate::model::path::CarrierPathKey;
 use crate::model::work::{CarrierWorkKind, ReliableWorkClass};
@@ -24,7 +25,6 @@ use crate::runtime::path::model::{default_path_rate_bps, default_path_srtt_ms};
 use crate::runtime::path::proof::{
     enqueue_path_proof_frame, enqueue_stream_ordered_path_proof_frame,
 };
-use crate::runtime::relay::io::bbr_inflight_target_bytes;
 use crate::scheduler::{FlowLane, PathRateScope, PathSnapshot};
 use std::collections::BTreeMap;
 use std::sync::{Arc, Mutex};

@@ -14,7 +14,8 @@ use crate::model::admission::{
 };
 use crate::model::capacity::{
     PATH_OPEN_SCORE_BYTES, RELIABLE_INITIAL_WINDOW_PACKETS,
-    RELIABLE_STREAM_STARTUP_PRODUCT_WINDOW_BYTES, reliable_subflow_startup_sample_limit_bytes,
+    RELIABLE_STREAM_STARTUP_PRODUCT_WINDOW_BYTES, reliable_bulk_carrier_feed_quantum_bytes,
+    reliable_relay_buffer_len, reliable_subflow_startup_sample_limit_bytes,
 };
 use crate::model::path::CarrierPathKey;
 use crate::mux::MuxLimits;
@@ -23,9 +24,6 @@ use crate::protocol::{
 };
 use crate::runtime::path::commands::reliable_path_command_channels;
 use crate::runtime::path::model::{default_path_rate_bps, default_path_srtt_ms, metric_epoch_now};
-use crate::runtime::relay::io::{
-    reliable_bulk_carrier_feed_quantum_bytes, reliable_relay_buffer_len,
-};
 use crate::scheduler::{FlowLane, PathSnapshot};
 use std::sync::Arc;
 use std::sync::atomic::Ordering;

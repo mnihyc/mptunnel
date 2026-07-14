@@ -29,7 +29,9 @@ use crate::model::admission::{
     bulk_candidate_pipe_bytes, bulk_service_feed_reservoir_payload_bytes,
     bulk_service_product_envelope_payload_bytes,
 };
-use crate::model::capacity::QuicCapacityProofCandidate;
+use crate::model::capacity::{
+    QuicCapacityProofCandidate, adaptive_reliable_relay_chunk_bytes_with_frame_limit,
+};
 use crate::model::path::{CarrierPathInstanceId, carrier_path_key_order};
 use crate::model::response::{
     CarrierPathFlightDebt, ResponseCandidateTailDebt, ResponseOrderedTail,

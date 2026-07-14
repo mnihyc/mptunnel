@@ -4,12 +4,12 @@
 //! work and accounts product bytes without selecting or mutating a path.
 
 use super::RelaySendCause;
+use crate::model::capacity::reliable_relay_buffer_len;
 use crate::model::work::ReliableWorkClass;
 use crate::mux::MuxLimits;
 use crate::mux::stream::ReliableSendStream;
 use crate::protocol::frame::{reliable_stream_frame_accounted_bytes, reliable_stream_frame_extent};
 use crate::protocol::{Frame, OffsetRange, StreamFlags};
-use crate::runtime::relay::io::reliable_relay_buffer_len;
 use crate::scheduler::FlowLane;
 use bytes::Bytes;
 use std::collections::VecDeque;

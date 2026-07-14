@@ -6,7 +6,7 @@ use super::super::test_support::{
 use super::super::topology::ResponseStreamAttachOutcome;
 use super::server_output_has_bulk_rate_evidence;
 use crate::model::capacity::{
-    BBR_MAX_SEND_QUANTUM_BYTES, RELIABLE_INITIAL_WINDOW_PACKETS,
+    BBR_MAX_SEND_QUANTUM_BYTES, RELIABLE_INITIAL_WINDOW_PACKETS, reliable_relay_buffer_len,
     reliable_subflow_startup_sample_limit_bytes,
 };
 use crate::model::multipath::{FlowSubflowSet, PathAdmissionDecision, SubflowAdmissionInput};
@@ -17,7 +17,6 @@ use crate::protocol::{
 };
 use crate::runtime::path::commands::reliable_path_command_channels;
 use crate::runtime::path::model::metric_epoch_now;
-use crate::runtime::relay::io::reliable_relay_buffer_len;
 use crate::scheduler::FlowLane;
 use std::time::{Duration, Instant};
 

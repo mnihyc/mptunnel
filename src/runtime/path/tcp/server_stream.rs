@@ -5,6 +5,9 @@
 
 #[cfg(feature = "lab-diagnostics")]
 use crate::lab_diagnostics::lab_diagnostic;
+use crate::model::capacity::{
+    reliable_relay_buffer_len, reliable_stream_initial_advertised_window_bytes,
+};
 use crate::outbound::{self, TargetProtocol};
 #[cfg(feature = "lab-diagnostics")]
 use crate::protocol::frame::stream_ack_contiguous_frontier;
@@ -15,9 +18,6 @@ use crate::protocol::{
 use crate::runtime::error::RuntimeError;
 use crate::runtime::path::commands::ReliablePathCommandSender;
 use crate::runtime::path::server_context::ServerPathContext;
-use crate::runtime::relay::io::{
-    reliable_relay_buffer_len, reliable_stream_initial_advertised_window_bytes,
-};
 use crate::runtime::stream::{
     ServerCarrierPathRegistration, ServerReliablePathAttachment, ServerReliableStreamOpen,
     ServerReliableStreamOpenRequest, run_server_reliable_stream,

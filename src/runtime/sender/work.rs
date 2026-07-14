@@ -1,6 +1,7 @@
 //! Sender work vocabulary shared by request and response directions.
 
 use super::*;
+use crate::model::capacity::reliable_bulk_carrier_feed_quantum_bytes;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(in crate::runtime) enum CarrierEmitMode {

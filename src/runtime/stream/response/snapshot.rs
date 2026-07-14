@@ -23,7 +23,7 @@ use super::topology::{
 };
 use crate::model::admission::bulk_service_horizon_payload_bytes;
 use crate::model::capacity::{
-    PATH_OPEN_SCORE_BYTES, RELIABLE_INITIAL_WINDOW_PACKETS,
+    PATH_OPEN_SCORE_BYTES, RELIABLE_INITIAL_WINDOW_PACKETS, adaptive_reliable_relay_inflight_bytes,
     product_delivery_samples_override_startup_prior,
 };
 use crate::model::path::CarrierPathKey;
@@ -33,7 +33,6 @@ use crate::protocol::{SessionId, StreamOpenRole, UnderlayProtocol};
 use crate::runtime::path::model::{
     default_path_rate_bps, default_path_srtt_ms, udp_reliable_stream_loss_repair_penalty_ms,
 };
-use crate::runtime::relay::io::adaptive_reliable_relay_inflight_bytes;
 use crate::scheduler::{FlowLane, PathRateScope, PathSnapshot};
 use std::sync::Arc;
 use std::sync::atomic::Ordering;

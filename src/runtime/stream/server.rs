@@ -3,14 +3,13 @@
 use super::ReliablePathStream;
 use super::ServerReliableStreamRegistry;
 use crate::config::MppPerformanceConfig;
+use crate::model::capacity::reliable_stream_initial_advertised_window_bytes;
 use crate::mux::MuxLimits;
 use crate::outbound;
 use crate::outbound::{DnsConfig, OutboundConfig};
 use crate::protocol::{Frame, ResetReason, SessionId, TargetAddr};
 use crate::runtime::RuntimeError;
-use crate::runtime::relay::{
-    relay_reliable_stream, reliable_stream_initial_advertised_window_bytes,
-};
+use crate::runtime::relay::relay_reliable_stream;
 use crate::runtime::sender::emit_response_control_frame;
 use std::sync::Arc;
 use std::time::Duration;

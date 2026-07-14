@@ -4,6 +4,7 @@ use super::capacity::{confirm_server_quic_capacity_receipt, udp_path_write_capac
 use super::io::*;
 use super::server_writer::drain_server_udp_reliable_commands;
 use super::*;
+use crate::model::capacity::reliable_stream_initial_advertised_window_bytes;
 use crate::protocol::path_capacity::CapacityReceiveTracker;
 
 pub(super) struct ServerUdpReliableStreamContext {

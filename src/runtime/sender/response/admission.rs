@@ -16,7 +16,10 @@ use crate::model::admission::{
     bulk_exploration_completion_projection, bulk_latency_pressure_service_feed_window_bytes,
     bulk_service_feed_reservoir_payload_bytes, bulk_service_horizon_payload_bytes,
 };
-use crate::model::capacity::reliable_subflow_startup_sample_limit_bytes;
+use crate::model::capacity::{
+    adaptive_reliable_relay_inflight_bytes, reliable_bulk_carrier_feed_quantum_bytes,
+    reliable_relay_scheduler_quantum_cap, reliable_subflow_startup_sample_limit_bytes,
+};
 use crate::model::multipath::{
     FlowSubflowSet, PathAdmission, PathAdmissionDecision, SubflowAdmissionInput,
 };
@@ -27,10 +30,6 @@ use crate::model::response::{
 use crate::model::work::CarrierWorkKind;
 use crate::mux::MuxLimits;
 use crate::protocol::{StreamOpenRole, UnderlayProtocol};
-use crate::runtime::relay::{
-    adaptive_reliable_relay_inflight_bytes, reliable_bulk_carrier_feed_quantum_bytes,
-    reliable_relay_scheduler_quantum_cap,
-};
 use crate::runtime::stream::response::ResponseSenderPathTarget;
 use crate::scheduler::{FlowLane, PathSnapshot};
 use std::time::Duration;

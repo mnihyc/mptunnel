@@ -5,6 +5,9 @@ use crate::model::ack_clock::{
     reliable_ack_clock_calibration_ceiling_bytes, reliable_ack_clock_calibration_limit_bytes,
     reliable_request_ack_clock_calibration_target_bytes,
 };
+use crate::model::capacity::{
+    adaptive_reliable_relay_repair_bytes, reliable_stream_advertised_window_bytes,
+};
 #[cfg(feature = "lab-diagnostics")]
 use crate::model::request::capacity::request_quic_capacity_slow_start_rounds;
 use crate::model::request::capacity::{

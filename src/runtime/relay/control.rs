@@ -1,5 +1,11 @@
 use super::*;
 use crate::model::admission::bulk_service_feed_reservoir_payload_bytes;
+use crate::model::capacity::{
+    adaptive_reliable_relay_chunk_bytes, adaptive_reliable_relay_chunk_bytes_with_frame_limit,
+    adaptive_reliable_relay_inflight_bytes, adaptive_reliable_relay_repair_bytes,
+    relay_lane_startup_chunk_bytes, reliable_relay_buffer_len,
+    reliable_relay_sender_dispatch_budget,
+};
 use crate::protocol::frame::normalized_offset_ranges;
 #[cfg(feature = "lab-diagnostics")]
 use crate::protocol::frame::reliable_path_frame_pacing_bytes;

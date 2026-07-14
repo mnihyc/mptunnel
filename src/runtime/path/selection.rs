@@ -8,6 +8,7 @@ use super::*;
 use crate::model::admission::{
     BulkPathCandidate, bulk_service_horizon_payload_bytes, bulk_striping_admitted_subflows,
 };
+use crate::model::capacity::relay_lane_startup_chunk_bytes;
 
 impl ClientPathContext {
     pub(in crate::runtime) fn relay_path_allows_automatic_bulk_use(

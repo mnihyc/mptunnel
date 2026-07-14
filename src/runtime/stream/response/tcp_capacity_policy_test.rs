@@ -10,8 +10,10 @@ use super::test_support::{
 };
 use super::topology::ResponseStreamAttachOutcome;
 use crate::model::capacity::{
-    BBR_MAX_SEND_QUANTUM_BYTES, MIN_RATE_SAMPLE_BYTES, PATH_OPEN_SCORE_BYTES,
-    RELIABLE_INITIAL_WINDOW_PACKETS, reliable_subflow_startup_sample_limit_bytes,
+    BBR_MAX_SEND_QUANTUM_BYTES, BBR_MIN_SEND_QUANTUM_PACKETS, MIN_RATE_SAMPLE_BYTES,
+    PATH_OPEN_SCORE_BYTES, RELIABLE_INITIAL_WINDOW_PACKETS, TRANSPORT_MSS_BYTES,
+    adaptive_reliable_relay_chunk_bytes, reliable_relay_buffer_len,
+    reliable_subflow_startup_sample_limit_bytes,
 };
 use crate::model::multipath::{PathAdmissionDecision, SubflowAdmissionInput};
 use crate::model::path::CarrierPathKey;
@@ -23,9 +25,6 @@ use crate::protocol::{
 };
 use crate::runtime::path::commands::reliable_path_command_channels;
 use crate::runtime::path::model::metric_epoch_now;
-use crate::runtime::relay::io::{
-    adaptive_reliable_relay_chunk_bytes, bbr_min_send_quantum_bytes, reliable_relay_buffer_len,
-};
 use crate::scheduler::{FlowLane, PathRateScope};
 use std::time::{Duration, Instant};
 
@@ -447,7 +446,7 @@ fn tcp_local_sender_metrics_remain_send_quantum_prior_after_low_product_sample()
     assert_eq!(after_ack.delivery_rate_bps, 500_000_000.0);
     assert!(
         adaptive_reliable_relay_chunk_bytes(Some(after_ack), FlowLane::Throughput, mux_limits)
-            > bbr_min_send_quantum_bytes(mux_limits),
+            > BBR_MIN_SEND_QUANTUM_PACKETS * TRANSPORT_MSS_BYTES,
         "a low product ACK sample must not collapse TCP send quantum below the path-rate prior"
     );
 }

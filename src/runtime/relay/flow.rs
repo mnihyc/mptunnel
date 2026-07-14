@@ -1,5 +1,5 @@
-use super::io::{reliable_relay_buffer_len, reliable_relay_scheduler_quantum_cap};
 use super::*;
+use crate::model::capacity::{reliable_relay_buffer_len, reliable_relay_scheduler_quantum_cap};
 
 #[derive(Debug, Clone, Copy)]
 pub(in crate::runtime) struct ReliableRelayFlowSignals {

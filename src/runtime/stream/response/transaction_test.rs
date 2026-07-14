@@ -11,7 +11,7 @@ use super::ResponseAckClockCalibrationRequest;
 use crate::model::ack_clock::{
     reliable_ack_clock_calibration_ceiling_bytes, reliable_ack_clock_calibration_limit_bytes,
 };
-use crate::model::capacity::PATH_OPEN_SCORE_BYTES;
+use crate::model::capacity::{PATH_OPEN_SCORE_BYTES, reliable_bulk_carrier_feed_quantum_bytes};
 use crate::model::multipath::{PathAdmissionDecision, SubflowAdmissionInput};
 use crate::model::path::CarrierPathKey;
 use crate::mux::MuxLimits;
@@ -21,7 +21,6 @@ use crate::runtime::path::commands::{
     ReliablePathCommand, reliable_path_command_channels, reliable_path_command_pending_bytes,
     try_recv_reliable_path_command,
 };
-use crate::runtime::relay::io::reliable_bulk_carrier_feed_quantum_bytes;
 use crate::scheduler::FlowLane;
 use std::sync::{Arc, mpsc as std_mpsc};
 use std::time::Duration;

@@ -16,7 +16,9 @@ use crate::model::admission::{
     bulk_service_feed_reservoir_payload_bytes, bulk_service_horizon_payload_bytes,
 };
 #[cfg(feature = "lab-diagnostics")]
-use crate::model::capacity::reliable_subflow_startup_sample_limit_bytes;
+use crate::model::capacity::{
+    reliable_bulk_carrier_feed_quantum_bytes, reliable_subflow_startup_sample_limit_bytes,
+};
 #[cfg(feature = "lab-diagnostics")]
 use crate::model::path::CarrierPathInstanceId;
 use crate::model::path::CarrierPathKey;
@@ -27,8 +29,6 @@ use crate::protocol::frame::{
 use crate::protocol::{Frame, SessionId, StreamId};
 #[cfg(feature = "lab-diagnostics")]
 use crate::protocol::{StreamOpenRole, UnderlayProtocol};
-#[cfg(feature = "lab-diagnostics")]
-use crate::runtime::relay::io::reliable_bulk_carrier_feed_quantum_bytes;
 use crate::scheduler::FlowLane;
 #[cfg(feature = "lab-diagnostics")]
 use crate::scheduler::PathSnapshot;

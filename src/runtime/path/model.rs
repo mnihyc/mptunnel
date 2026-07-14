@@ -1,5 +1,6 @@
 use super::*;
 use crate::model::admission::BulkPathCandidate;
+use crate::model::capacity::adaptive_reliable_relay_inflight_bytes;
 use crate::model::timing::*;
 
 #[derive(Debug, Clone, Copy)]

@@ -6,6 +6,7 @@ use super::super::test_support::{
 use super::super::topology::ResponseStreamAttachOutcome;
 use crate::model::capacity::{
     BBR_MAX_SEND_QUANTUM_BYTES, MIN_RATE_SAMPLE_BYTES, PATH_OPEN_SCORE_BYTES,
+    reliable_relay_buffer_len,
 };
 use crate::model::path::CarrierPathKey;
 use crate::mux::MuxLimits;
@@ -15,7 +16,6 @@ use crate::runtime::RuntimeError;
 use crate::runtime::path::commands::{
     reliable_path_command_channels, try_recv_reliable_path_command,
 };
-use crate::runtime::relay::io::reliable_relay_buffer_len;
 use crate::scheduler::FlowLane;
 
 #[test]

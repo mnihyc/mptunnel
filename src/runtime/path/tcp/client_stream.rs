@@ -5,6 +5,7 @@
 
 #[cfg(feature = "lab-diagnostics")]
 use crate::lab_diagnostics::{lab_diagnostic, lab_perf_record};
+use crate::model::capacity::reliable_relay_buffer_len;
 #[cfg(feature = "lab-diagnostics")]
 use crate::protocol::frame::reliable_path_frame_pacing_bytes;
 use crate::protocol::{
@@ -19,7 +20,6 @@ use crate::runtime::path::tcp::client_state::{
     ClientTcpPathConnection, ClientTcpPathSessionRuntime,
 };
 use crate::runtime::recent_ids::RecentIdCache;
-use crate::runtime::relay::io::reliable_relay_buffer_len;
 use crate::runtime::stream::stream_demand_hint_for_lane;
 use crate::runtime::stream::{ReliablePathStream, ReliablePathStreamOutput};
 use crate::scheduler::FlowLane;

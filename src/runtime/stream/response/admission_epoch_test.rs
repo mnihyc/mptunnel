@@ -9,15 +9,14 @@ use super::super::topology::ResponseStreamAttachOutcome;
 use crate::model::ack_clock::{
     reliable_ack_clock_calibration_ceiling_bytes, reliable_ack_clock_calibration_limit_bytes,
 };
-use crate::model::capacity::MIN_RATE_SAMPLE_BYTES;
+use crate::model::capacity::{
+    MIN_RATE_SAMPLE_BYTES, reliable_bulk_carrier_feed_quantum_bytes, reliable_relay_buffer_len,
+};
 use crate::model::multipath::{PathAdmissionDecision, SubflowAdmissionInput};
 use crate::model::path::CarrierPathKey;
 use crate::mux::MuxLimits;
 use crate::protocol::{OffsetRange, PathId, SessionId, StreamOpenRole, UnderlayProtocol};
 use crate::runtime::path::commands::reliable_path_command_channels;
-use crate::runtime::relay::io::{
-    reliable_bulk_carrier_feed_quantum_bytes, reliable_relay_buffer_len,
-};
 use crate::scheduler::FlowLane;
 use std::sync::Arc;
 use std::time::{Duration, Instant};

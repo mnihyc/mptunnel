@@ -7,7 +7,9 @@ use super::response::{
 use crate::config::ResourceLimits;
 #[cfg(feature = "lab-diagnostics")]
 use crate::lab_diagnostics::{lab_diagnostic, lab_perf_record};
-use crate::model::capacity::QuicCapacityProofCandidate;
+use crate::model::capacity::{
+    QuicCapacityProofCandidate, reliable_stream_initial_advertised_window_bytes,
+};
 use crate::model::path::{CarrierPathInstanceId, CarrierPathKey};
 use crate::mux::MuxLimits;
 #[cfg(feature = "lab-diagnostics")]
@@ -24,7 +26,6 @@ use crate::runtime::path::tcp::capacity::{
     TcpCapacityProofCandidate, valid_tcp_capacity_proof_candidate_at,
 };
 use crate::runtime::recent_ids::{RecentIdCache, reliable_closed_stream_cache_capacity};
-use crate::runtime::relay::io::reliable_stream_initial_advertised_window_bytes;
 use crate::scheduler::FlowLane;
 use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex};

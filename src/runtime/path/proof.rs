@@ -1,4 +1,5 @@
 use super::*;
+use crate::model::capacity::relay_lane_startup_chunk_bytes;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 static NEXT_PATH_PROOF_ID: AtomicU64 = AtomicU64::new(1);

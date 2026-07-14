@@ -1,11 +1,11 @@
 use super::super::ResponseStreamBinding;
 use super::super::session::ServerPathLaneTracker;
 use super::super::topology::ResponseStreamAttachOutcome;
+use crate::model::capacity::reliable_relay_buffer_len;
 use crate::model::path::CarrierPathKey;
 use crate::mux::MuxLimits;
 use crate::protocol::{PathId, SessionId, StreamOpenRole, UnderlayProtocol};
 use crate::runtime::path::commands::reliable_path_command_channels;
-use crate::runtime::relay::io::reliable_relay_buffer_len;
 use crate::scheduler::FlowLane;
 use std::sync::Arc;
 

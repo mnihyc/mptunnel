@@ -34,10 +34,6 @@ pub(in crate::runtime) use diagnostics::record_server_sender_decision;
 #[cfg(feature = "lab-diagnostics")]
 use diagnostics::{ResponseServiceFeedDiagnosticState, ResponseServiceHandoffDiagnosticState};
 pub(in crate::runtime) use evidence::{ServerPathMetricsEntry, ServerPathMetricsSource};
-pub(in crate::runtime) use handoff::{
-    ResponseServiceHandoffDrainRequest, ResponseServiceHandoffDrainReservation,
-    ResponseServiceHandoffRequest,
-};
 pub(in crate::runtime) use owner_commit::{
     ResponseAckClockCalibrationRequest, ResponseAckClockCalibrationRetirementRequest,
     ResponseOwnerEnqueueAdmission,
@@ -48,14 +44,18 @@ pub(in crate::runtime) use quic_capacity::well_formed_quic_capacity_proof_candid
 pub(in crate::runtime) use quic_capacity::{
     quic_capacity_proof_pin_matches_marker, valid_quic_capacity_proof_candidate_at,
 };
-pub(in crate::runtime) use session::{ServerPathLaneTracker, TcpCapacityProbeSessionLease};
+pub(in crate::runtime) use session::{
+    ResponseServiceHandoffDrainReservation, ServerPathLaneTracker, TcpCapacityProbeSessionLease,
+};
 pub(in crate::runtime) use session_load::ServerRealtimeFlowRegistration;
 pub(in crate::runtime) use snapshot::server_bulk_output_eta_ms;
 pub(in crate::runtime) use subflow::ResponseSubflowAdmissionRequest;
 use subflow::ResponseSubflowSetState;
 
 use self::session_load::ServerResponseFlowRegistration;
+use crate::model::capacity::QuicCapacityProofCandidate;
 use crate::model::path::{CarrierPathInstanceId, CarrierPathKey};
+use crate::model::response::ResponseServiceHandoffMode;
 use crate::mux::MuxLimits;
 use crate::protocol::{PathId, ResetReason, SessionId, StreamId, StreamOpenRole, UnderlayProtocol};
 use crate::runtime::path::commands::{ReliablePathCommand, ReliablePathCommandSender};
@@ -63,6 +63,7 @@ use crate::scheduler::FlowLane;
 use std::collections::{BTreeMap, HashMap};
 use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 use tokio::sync::watch;
 
 // Reliable-path bindings own attachment instances, exact range flights,
@@ -74,6 +75,49 @@ pub(in crate::runtime) const MAX_RESPONSE_QUIC_CAPACITY_CALIBRATION_ATTEMPTS_PER
 // transfers from ever measuring spare paths.
 pub(in crate::runtime) const MIN_ACTIVE_RESPONSE_FLOWS_FOR_SAME_FAMILY_DISCOVERY: u32 = 1;
 static NEXT_RESPONSE_STREAM_BINDING_INSTANCE_ID: AtomicU64 = AtomicU64::new(1);
+
+#[derive(Debug, Clone, Copy)]
+/// Bounded pause of fresh OwnerData assignment for one response binding while
+/// already-owned ranges reach the STREAM_ACK frontier. Offset-free source
+/// staging remains sender-service state, outside this transaction.
+pub(in crate::runtime) struct ResponseServiceHandoffDrainRequest {
+    pub(in crate::runtime) expected_planner_generation: u64,
+    pub(in crate::runtime) expected_lane_generation: u64,
+    pub(in crate::runtime) expected_model_generation: u64,
+    pub(in crate::runtime) service: CarrierPathKey,
+    pub(in crate::runtime) service_path_instance_id: CarrierPathInstanceId,
+    pub(in crate::runtime) service_incarnation: u64,
+    pub(in crate::runtime) target: CarrierPathKey,
+    pub(in crate::runtime) target_path_instance_id: CarrierPathInstanceId,
+    pub(in crate::runtime) target_incarnation: u64,
+    pub(in crate::runtime) mode: ResponseServiceHandoffMode,
+    pub(in crate::runtime) capacity_proof: Option<QuicCapacityProofCandidate>,
+    #[cfg_attr(not(feature = "lab-diagnostics"), allow(dead_code))]
+    pub(in crate::runtime) outstanding_owner_bytes: u64,
+    pub(in crate::runtime) lease: Duration,
+}
+
+#[derive(Debug, Clone, Copy)]
+/// Exact clear-frontier whole-flow handoff. It changes persistent response
+/// Service ownership; it never authorizes adjacent cross-family Subflow bytes.
+pub(in crate::runtime) struct ResponseServiceHandoffRequest {
+    pub(in crate::runtime) expected_planner_generation: u64,
+    pub(in crate::runtime) expected_lane_generation: u64,
+    pub(in crate::runtime) expected_model_generation: u64,
+    pub(in crate::runtime) handoff_frontier: u64,
+    pub(in crate::runtime) service: CarrierPathKey,
+    pub(in crate::runtime) service_path_instance_id: CarrierPathInstanceId,
+    pub(in crate::runtime) service_incarnation: u64,
+    pub(in crate::runtime) target: CarrierPathKey,
+    pub(in crate::runtime) target_path_instance_id: CarrierPathInstanceId,
+    pub(in crate::runtime) target_incarnation: u64,
+    pub(in crate::runtime) mode: ResponseServiceHandoffMode,
+    /// Shared queue pressure may fall after ranking, but it may not grow beyond
+    /// the byte-credit envelope that admitted this frame.
+    pub(in crate::runtime) target_command_pending_limit_bytes: u64,
+    pub(in crate::runtime) capacity_proof: Option<QuicCapacityProofCandidate>,
+}
+
 // Ownership boundary:
 // This module owns carrier-neutral reliable stream bindings on the response
 // side. It tracks which carrier path carried each product byte range, records

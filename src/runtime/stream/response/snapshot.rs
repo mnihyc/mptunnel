@@ -14,7 +14,8 @@ use super::evidence::{
     server_udp_path_metrics_has_durable_rate_estimate,
 };
 use super::session::{
-    ResponseSessionSchedulingSnapshot, ServerPathLaneTracker, ServerResponsePathSchedulingSnapshot,
+    ResponseServiceHandoffDrainReservation, ResponseSessionState, ServerPathLaneLoad,
+    ServerPathLaneTracker, ServerPathLaneTrackerState,
 };
 use super::subflow::{
     server_output_accepts_service_capacity_prior, server_output_has_bulk_rate_evidence_with_limits,
@@ -27,6 +28,7 @@ use crate::model::capacity::{
     product_delivery_samples_override_startup_prior,
 };
 use crate::model::path::CarrierPathKey;
+use crate::model::response::ResponseServiceFamilyLoads;
 use crate::model::timing::transport_pto_from_snapshot;
 use crate::mux::MuxLimits;
 use crate::protocol::{SessionId, StreamOpenRole, UnderlayProtocol};
@@ -38,6 +40,121 @@ use std::sync::Arc;
 use std::sync::atomic::Ordering;
 use std::time::Instant;
 use tokio::sync::Notify;
+
+#[derive(Debug, Clone, Copy)]
+pub(in crate::runtime) struct ResponseSessionSchedulingSnapshot {
+    pub(in crate::runtime) observed_at: Instant,
+    pub(in crate::runtime) generation: u64,
+    pub(in crate::runtime) active_response_flows: u32,
+    pub(in crate::runtime) service_family_loads: ResponseServiceFamilyLoads,
+    pub(in crate::runtime) tcp_capacity_probe_reserved: bool,
+    pub(in crate::runtime) quic_capacity_calibration_reserved: bool,
+    pub(in crate::runtime) quic_capacity_calibration_spent_bytes: u64,
+    pub(in crate::runtime) response_service_handoff_drain:
+        Option<ResponseServiceHandoffDrainReservation>,
+    pub(in crate::runtime) operation_maintenance_due: bool,
+}
+
+#[derive(Debug, Clone, Copy, Default)]
+pub(super) struct ServerResponsePathSchedulingSnapshot {
+    pub(super) path_load: ServerPathLaneLoad,
+    pub(super) session_load: ServerPathLaneLoad,
+    pub(super) quic_capacity_calibration_attempts: u8,
+}
+
+impl ServerPathLaneTrackerState {
+    fn response_path_scheduling_snapshot(
+        &self,
+        session_id: SessionId,
+        path: CarrierPathKey,
+        path_instance_id: crate::model::path::CarrierPathInstanceId,
+        session_load: ServerPathLaneLoad,
+    ) -> ServerResponsePathSchedulingSnapshot {
+        let path_load = self
+            .session(session_id)
+            .map(|session| session.load().response_service_path_load(path))
+            .unwrap_or_default();
+        let quic_capacity_calibration_attempts =
+            self.quic_capacity_calibration_attempts_for_path(session_id, path, path_instance_id);
+        ServerResponsePathSchedulingSnapshot {
+            path_load,
+            session_load,
+            quic_capacity_calibration_attempts,
+        }
+    }
+}
+
+impl ServerPathLaneTracker {
+    pub(super) fn response_scheduling_snapshot(
+        &self,
+        session_id: SessionId,
+    ) -> ResponseSessionSchedulingSnapshot {
+        let state = self.state.lock().expect("server path lane tracker lock");
+        let now = Instant::now();
+        let session = state.session(session_id);
+        let generation = session.map(ResponseSessionState::generation).unwrap_or(0);
+        let active_response_flows = session
+            .map(|session| session.load().active_response_flows())
+            .unwrap_or(0);
+        let service_family_loads = session
+            .map(|session| session.load().service_family_loads())
+            .unwrap_or_default();
+        ResponseSessionSchedulingSnapshot {
+            observed_at: now,
+            generation,
+            active_response_flows,
+            service_family_loads,
+            tcp_capacity_probe_reserved: session
+                .is_some_and(ResponseSessionState::tcp_capacity_probe_reserved),
+            quic_capacity_calibration_reserved: state
+                .quic_capacity_calibration_reserved(session_id),
+            quic_capacity_calibration_spent_bytes: state
+                .quic_capacity_calibration_spent_bytes(session_id),
+            response_service_handoff_drain: state.response_service_handoff_drain(session_id),
+            operation_maintenance_due: state
+                .quic_capacity_calibration_requires_maintenance_at(session_id, now)
+                || state.response_service_handoff_drain_requires_maintenance_at(session_id, now),
+        }
+    }
+
+    pub(super) fn response_path_scheduling_snapshot(
+        &self,
+        session_id: SessionId,
+        path: CarrierPathKey,
+        path_instance_id: crate::model::path::CarrierPathInstanceId,
+    ) -> ServerResponsePathSchedulingSnapshot {
+        let state = self.state.lock().expect("server path lane tracker lock");
+        let session_load = state
+            .session(session_id)
+            .map(|session| session.load().response_service_session_load())
+            .unwrap_or_default();
+        state.response_path_scheduling_snapshot(session_id, path, path_instance_id, session_load)
+    }
+
+    /// Reads one target set under one lock so load and attempt budgets share an epoch.
+    pub(super) fn response_path_scheduling_snapshots(
+        &self,
+        session_id: SessionId,
+        paths: impl IntoIterator<Item = (CarrierPathKey, crate::model::path::CarrierPathInstanceId)>,
+    ) -> Vec<ServerResponsePathSchedulingSnapshot> {
+        let state = self.state.lock().expect("server path lane tracker lock");
+        let session_load = state
+            .session(session_id)
+            .map(|session| session.load().response_service_session_load())
+            .unwrap_or_default();
+        paths
+            .into_iter()
+            .map(|(path, path_instance_id)| {
+                state.response_path_scheduling_snapshot(
+                    session_id,
+                    path,
+                    path_instance_id,
+                    session_load,
+                )
+            })
+            .collect()
+    }
+}
 
 #[derive(Debug, Clone, Copy)]
 pub(in crate::runtime) struct ResponseSourceServiceSnapshot {

@@ -1,9 +1,9 @@
 //! Response Service handoff reservation and atomic ownership commit.
 //!
-//! One owner keeps the bounded drain identity and the final binding/output/queue
-//! revalidation together. The central tracker serializes Service-load movement.
+//! One algorithm keeps bounded drain validation and final binding/output/queue
+//! commit together. The session coordinator owns expiry and serializes the
+//! stored operation slot with Service-load movement.
 
-use super::ResponseStreamBinding;
 use super::attachment::{ResponseDispatchTarget, ResponseSenderPathTarget};
 use super::evidence::{
     server_output_fresh_quic_capacity_proof, server_output_quic_capacity_proof_marker,
@@ -11,79 +11,24 @@ use super::evidence::{
 use super::quic_capacity::{
     quic_capacity_proof_pin_matches_marker, valid_quic_capacity_proof_candidate_at,
 };
-use super::session::{ServerPathLaneTracker, ServerPathLaneTrackerState};
+use super::session::{ResponseServiceHandoffDrainReservation, ServerPathLaneTracker};
 use super::snapshot::server_bulk_output_snapshot_with_command_pending;
 use super::subflow::server_output_has_bulk_rate_evidence_with_limits;
+use super::{
+    ResponseServiceHandoffDrainRequest, ResponseServiceHandoffRequest, ResponseStreamBinding,
+};
 #[cfg(feature = "lab-diagnostics")]
 use crate::lab_diagnostics::lab_diagnostic;
 use crate::model::capacity::QuicCapacityProofCandidate;
 use crate::model::multipath::FlowSubflowSet;
 use crate::model::path::{CarrierPathInstanceId, CarrierPathKey};
-use crate::model::response::{
-    ResponseServiceHandoffMode, response_rate_fair_share_bps, response_service_handoff_mode,
-};
+use crate::model::response::{response_rate_fair_share_bps, response_service_handoff_mode};
 use crate::protocol::frame::reliable_stream_frame_extent;
 use crate::protocol::{Frame, SessionId, StreamOpenRole, UnderlayProtocol};
 use crate::runtime::RuntimeError;
 use crate::scheduler::{FlowLane, PathRateScope};
 use std::sync::atomic::Ordering;
-use std::time::{Duration, Instant};
-
-#[derive(Debug, Clone, Copy)]
-/// Bounded pause of fresh OwnerData assignment for one response binding while
-/// already-owned ranges reach the STREAM_ACK frontier. Offset-free source
-/// staging remains sender-service state, outside this transaction.
-pub(in crate::runtime) struct ResponseServiceHandoffDrainRequest {
-    pub(in crate::runtime) expected_planner_generation: u64,
-    pub(in crate::runtime) expected_lane_generation: u64,
-    pub(in crate::runtime) expected_model_generation: u64,
-    pub(in crate::runtime) service: CarrierPathKey,
-    pub(in crate::runtime) service_path_instance_id: CarrierPathInstanceId,
-    pub(in crate::runtime) service_incarnation: u64,
-    pub(in crate::runtime) target: CarrierPathKey,
-    pub(in crate::runtime) target_path_instance_id: CarrierPathInstanceId,
-    pub(in crate::runtime) target_incarnation: u64,
-    pub(in crate::runtime) mode: ResponseServiceHandoffMode,
-    pub(in crate::runtime) capacity_proof: Option<QuicCapacityProofCandidate>,
-    #[cfg_attr(not(feature = "lab-diagnostics"), allow(dead_code))]
-    pub(in crate::runtime) outstanding_owner_bytes: u64,
-    pub(in crate::runtime) lease: Duration,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(in crate::runtime) struct ResponseServiceHandoffDrainReservation {
-    pub(in crate::runtime) binding_instance_id: u64,
-    pub(in crate::runtime) service: CarrierPathKey,
-    pub(in crate::runtime) service_path_instance_id: CarrierPathInstanceId,
-    pub(in crate::runtime) service_incarnation: u64,
-    pub(in crate::runtime) target: CarrierPathKey,
-    pub(in crate::runtime) target_path_instance_id: CarrierPathInstanceId,
-    pub(in crate::runtime) target_incarnation: u64,
-    /// Pins one fresh receipt only for this bounded handoff transaction.
-    pub(in crate::runtime) capacity_proof: Option<QuicCapacityProofCandidate>,
-    pub(in crate::runtime) expires_at: Instant,
-}
-
-#[derive(Debug, Clone, Copy)]
-/// Exact clear-frontier whole-flow handoff. It changes persistent response
-/// Service ownership; it never authorizes adjacent cross-family Subflow bytes.
-pub(in crate::runtime) struct ResponseServiceHandoffRequest {
-    pub(in crate::runtime) expected_planner_generation: u64,
-    pub(in crate::runtime) expected_lane_generation: u64,
-    pub(in crate::runtime) expected_model_generation: u64,
-    pub(in crate::runtime) handoff_frontier: u64,
-    pub(in crate::runtime) service: CarrierPathKey,
-    pub(in crate::runtime) service_path_instance_id: CarrierPathInstanceId,
-    pub(in crate::runtime) service_incarnation: u64,
-    pub(in crate::runtime) target: CarrierPathKey,
-    pub(in crate::runtime) target_path_instance_id: CarrierPathInstanceId,
-    pub(in crate::runtime) target_incarnation: u64,
-    pub(in crate::runtime) mode: ResponseServiceHandoffMode,
-    /// Shared queue pressure may fall after ranking, but it may not grow beyond
-    /// the byte-credit envelope that admitted this frame.
-    pub(in crate::runtime) target_command_pending_limit_bytes: u64,
-    pub(in crate::runtime) capacity_proof: Option<QuicCapacityProofCandidate>,
-}
+use std::time::Instant;
 
 impl ResponseStreamBinding {
     pub(in crate::runtime) fn binding_instance_id(&self) -> u64 {
@@ -675,59 +620,6 @@ impl ResponseStreamBinding {
         );
         self.notify_update();
         Ok(())
-    }
-}
-
-impl ServerPathLaneTrackerState {
-    pub(super) fn response_service_handoff_drain(
-        &self,
-        session_id: SessionId,
-    ) -> Option<ResponseServiceHandoffDrainReservation> {
-        self.session(session_id)
-            .and_then(|session| session.response_service_handoff_drain())
-            .copied()
-    }
-
-    pub(super) fn response_service_handoff_drain_requires_maintenance_at(
-        &self,
-        session_id: SessionId,
-        now: Instant,
-    ) -> bool {
-        self.session(session_id)
-            .and_then(|session| session.response_service_handoff_drain())
-            .is_some_and(|reservation| now >= reservation.expires_at)
-    }
-
-    pub(super) fn expire_response_service_handoff_drain_at(
-        &mut self,
-        session_id: SessionId,
-        now: Instant,
-    ) {
-        let drain_expired =
-            self.response_service_handoff_drain_requires_maintenance_at(session_id, now);
-        if drain_expired {
-            let reservation = self
-                .session_mut(session_id)
-                .and_then(|session| session.take_response_service_handoff_drain());
-            self.bump_generation(session_id);
-            #[cfg(feature = "lab-diagnostics")]
-            if let Some(reservation) = reservation {
-                lab_diagnostic(
-                    "response_service_handoff",
-                    format_args!(
-                        "phase=drain_cancelled session_id={} binding_instance_id={} reason=timeout from_underlay={:?} from_path_id={} to_underlay={:?} to_path_id={}",
-                        session_id.0,
-                        reservation.binding_instance_id,
-                        reservation.service.underlay,
-                        reservation.service.path_id.0,
-                        reservation.target.underlay,
-                        reservation.target.path_id.0,
-                    ),
-                );
-            }
-            #[cfg(not(feature = "lab-diagnostics"))]
-            let _ = reservation;
-        }
     }
 }
 

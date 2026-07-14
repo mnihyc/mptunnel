@@ -1,55 +1,25 @@
 //! Session-wide QUIC capacity reservation and proof lifecycle.
 //!
-//! This owner serializes one carrier-discovery transaction through receipt and
-//! publication. Binding validation and carrier-queue admission live in
-//! `quic_admission`; all mutations still use the central session mutex.
+//! This owner validates and commits one carrier-discovery transaction through
+//! receipt and publication. The session coordinator owns its exclusive slot
+//! and expiry; binding queue admission remains in `quic_admission`.
 
 use super::MAX_RESPONSE_QUIC_CAPACITY_CALIBRATION_ATTEMPTS_PER_PATH;
-use super::session::{ServerPathLaneTracker, ServerPathLaneTrackerState};
+#[cfg(test)]
+use super::session::ServerQuicCapacityHistorySnapshot;
 #[cfg(feature = "lab-diagnostics")]
-use crate::lab_diagnostics::lab_diagnostic;
+use super::session::record_quic_capacity_lifecycle;
+use super::session::{
+    ServerPathLaneTracker, ServerPathLaneTrackerState, ServerQuicCapacityCalibrationPhase,
+    ServerQuicCapacityCalibrationReservation,
+};
 use crate::model::capacity::{
     QuicCapacityProofCandidate, quic_capacity_receipt_rate_bps, valid_quic_capacity_proof_geometry,
 };
 use crate::model::path::{CarrierPathInstanceId, CarrierPathKey};
 use crate::protocol::SessionId;
 use crate::runtime::path::commands::QuicCapacityProbeCommandTicket;
-use std::collections::HashMap;
 use std::time::{Duration, Instant};
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(super) enum ServerQuicCapacityCalibrationPhase {
-    Provisional,
-    Active {
-        expires_at: Instant,
-    },
-    // Publication is synchronous but crosses registry and binding locks. Keep
-    // serialization held until the accepted marker is visible everywhere.
-    ProofAccepted {
-        candidate: QuicCapacityProofCandidate,
-    },
-    // Once committed, carrier proof is irrevocable. Keep session serialization
-    // until the registry has published it to every current response binding.
-    ProofPublishing {
-        candidate: QuicCapacityProofCandidate,
-    },
-}
-
-#[derive(Debug, Clone)]
-pub(super) struct ServerQuicCapacityCalibrationReservation {
-    pub(super) binding_instance_id: u64,
-    pub(super) path: CarrierPathKey,
-    pub(super) path_instance_id: CarrierPathInstanceId,
-    pub(super) phase: ServerQuicCapacityCalibrationPhase,
-    pub(super) train_bytes: u64,
-    pub(super) sample_floor_bytes: u64,
-    pub(super) accounting_slack_bytes: u64,
-    pub(super) warmup_bytes: u64,
-    pub(super) required_proof_bytes: u64,
-    pub(super) proof_validity: Duration,
-    pub(super) token: u64,
-    pub(super) command_ticket: QuicCapacityProbeCommandTicket,
-}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(in crate::runtime::stream) struct ServerQuicCapacityProofTicket {
@@ -100,131 +70,6 @@ pub(in crate::runtime) fn quic_capacity_proof_pin_matches_marker(
     }
 }
 
-#[cfg(feature = "lab-diagnostics")]
-fn record_quic_capacity_lifecycle(
-    phase: &'static str,
-    reason: &'static str,
-    session_id: SessionId,
-    reservation: ServerQuicCapacityCalibrationReservation,
-    candidate: Option<QuicCapacityProofCandidate>,
-) {
-    let candidate = candidate.or(match reservation.phase {
-        ServerQuicCapacityCalibrationPhase::ProofAccepted { candidate }
-        | ServerQuicCapacityCalibrationPhase::ProofPublishing { candidate } => Some(candidate),
-        _ => None,
-    });
-    let candidate_value = |value: Option<String>| value.unwrap_or_else(|| "unknown".to_string());
-    lab_diagnostic(
-        "response_quic_capacity_calibration",
-        format_args!(
-            "phase={} reason={} session_id={} binding_instance_id={} underlay={:?} path_id={} path_instance_id={} calibration_id={} train_bytes={} sample_floor_bytes={} accounting_slack_bytes={} warmup_bytes={} required_proof_bytes={} proof_validity_ms={} written_bytes={} written_data_frame_count={} receipt_confirmed={} received_bytes={} proof_elapsed_us={} rate_bps={}",
-            phase,
-            reason,
-            session_id.0,
-            reservation.binding_instance_id,
-            reservation.path.underlay,
-            reservation.path.path_id.0,
-            reservation.path_instance_id.as_u64(),
-            reservation.token,
-            reservation.train_bytes,
-            reservation.sample_floor_bytes,
-            reservation.accounting_slack_bytes,
-            reservation.warmup_bytes,
-            reservation.required_proof_bytes,
-            reservation.proof_validity.as_millis(),
-            candidate_value(candidate.map(|proof| proof.written_bytes.to_string())),
-            candidate_value(candidate.map(|proof| proof.written_data_frame_count.to_string())),
-            candidate_value(candidate.map(|proof| proof.receipt_confirmed.to_string())),
-            candidate_value(candidate.map(|proof| proof.received_bytes.to_string())),
-            candidate_value(candidate.map(|proof| proof.proof_elapsed.as_micros().to_string())),
-            candidate_value(candidate.map(|proof| proof.rate_bps.to_string())),
-        ),
-    );
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub(super) struct ServerQuicCapacityCalibrationPathKey {
-    pub(super) path: CarrierPathKey,
-    pub(super) path_instance_id: CarrierPathInstanceId,
-}
-
-#[derive(Debug, Default)]
-pub(super) struct ResponseQuicCapacityHistory {
-    attempts: HashMap<ServerQuicCapacityCalibrationPathKey, u8>,
-    spent_bytes: u64,
-}
-
-impl ResponseQuicCapacityHistory {
-    fn attempts_for_path(
-        &self,
-        path: CarrierPathKey,
-        path_instance_id: CarrierPathInstanceId,
-    ) -> u8 {
-        self.attempts
-            .get(&ServerQuicCapacityCalibrationPathKey {
-                path,
-                path_instance_id,
-            })
-            .copied()
-            .unwrap_or(0)
-    }
-
-    fn set_attempts_for_path(
-        &mut self,
-        path: CarrierPathKey,
-        path_instance_id: CarrierPathInstanceId,
-        attempts: u8,
-    ) {
-        let key = ServerQuicCapacityCalibrationPathKey {
-            path,
-            path_instance_id,
-        };
-        if attempts == 0 {
-            self.attempts.remove(&key);
-        } else {
-            self.attempts.insert(key, attempts);
-        }
-    }
-
-    fn remove_attempts_for_path(
-        &mut self,
-        path: CarrierPathKey,
-        path_instance_id: CarrierPathInstanceId,
-    ) -> bool {
-        self.attempts
-            .remove(&ServerQuicCapacityCalibrationPathKey {
-                path,
-                path_instance_id,
-            })
-            .is_some()
-    }
-
-    fn spent_bytes(&self) -> u64 {
-        self.spent_bytes
-    }
-
-    fn set_spent_bytes(&mut self, spent_bytes: u64) {
-        self.spent_bytes = spent_bytes;
-    }
-
-    #[cfg(test)]
-    fn snapshot(&self) -> Option<ServerQuicCapacityHistorySnapshot> {
-        (!self.attempts.is_empty() || self.spent_bytes > 0).then_some(
-            ServerQuicCapacityHistorySnapshot {
-                attempt_entry_count: self.attempts.len(),
-                spent_bytes: (self.spent_bytes > 0).then_some(self.spent_bytes),
-            },
-        )
-    }
-}
-
-#[cfg(test)]
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(super) struct ServerQuicCapacityHistorySnapshot {
-    pub(super) attempt_entry_count: usize,
-    pub(super) spent_bytes: Option<u64>,
-}
-
 impl ServerPathLaneTrackerState {
     pub(super) fn quic_capacity_calibration_attempts_for_path(
         &self,
@@ -241,97 +86,11 @@ impl ServerPathLaneTrackerState {
             .unwrap_or(0)
     }
 
-    pub(super) fn quic_capacity_calibration_reserved(&self, session_id: SessionId) -> bool {
-        self.session(session_id)
-            .and_then(|session| session.quic_capacity_calibration())
-            .is_some()
-    }
-
     pub(super) fn quic_capacity_calibration_spent_bytes(&self, session_id: SessionId) -> u64 {
         self.session(session_id)
             .map(|session| session.quic_history().spent_bytes())
             .unwrap_or(0)
     }
-
-    fn quic_capacity_calibration_removal_reason_at(
-        &self,
-        session_id: SessionId,
-        now: Instant,
-    ) -> Option<(&'static str, &'static str)> {
-        self.session(session_id)
-            .and_then(|session| session.quic_capacity_calibration())
-            .and_then(|reservation| {
-                if !reservation.command_ticket.is_current()
-                    && !matches!(
-                        reservation.phase,
-                        ServerQuicCapacityCalibrationPhase::ProofPublishing { .. }
-                    )
-                {
-                    return Some(("cancelled", "command_invalidated"));
-                }
-                match reservation.phase {
-                    ServerQuicCapacityCalibrationPhase::Active { expires_at }
-                        if now >= expires_at =>
-                    {
-                        Some(("expired", "lease_elapsed"))
-                    }
-                    _ => None,
-                }
-            })
-    }
-
-    pub(super) fn quic_capacity_calibration_requires_maintenance_at(
-        &self,
-        session_id: SessionId,
-        now: Instant,
-    ) -> bool {
-        self.quic_capacity_calibration_removal_reason_at(session_id, now)
-            .is_some()
-    }
-
-    pub(super) fn expire_quic_capacity_calibration_at(
-        &mut self,
-        session_id: SessionId,
-        now: Instant,
-    ) {
-        let capacity_removal = self.quic_capacity_calibration_removal_reason_at(session_id, now);
-        if let Some((phase, reason)) = capacity_removal {
-            let reservation = self
-                .session_mut(session_id)
-                .and_then(|session| session.take_quic_capacity_calibration());
-            if let Some(reservation) = reservation.as_ref() {
-                reservation.command_ticket.cancel();
-            }
-            self.bump_generation(session_id);
-            #[cfg(feature = "lab-diagnostics")]
-            if let Some(reservation) = reservation {
-                record_quic_capacity_lifecycle(phase, reason, session_id, reservation, None);
-            }
-            #[cfg(not(feature = "lab-diagnostics"))]
-            let _ = (reservation, phase, reason);
-        }
-    }
-}
-
-pub(super) fn finish_quic_capacity_session_reclamation(
-    session_id: SessionId,
-    reservation: Option<ServerQuicCapacityCalibrationReservation>,
-) {
-    if let Some(reservation) = reservation.as_ref() {
-        reservation.command_ticket.cancel();
-    }
-    #[cfg(feature = "lab-diagnostics")]
-    if let Some(reservation) = reservation {
-        record_quic_capacity_lifecycle(
-            "cancelled",
-            "session_reclaimed",
-            session_id,
-            reservation,
-            None,
-        );
-    }
-    #[cfg(not(feature = "lab-diagnostics"))]
-    let _ = (session_id, reservation);
 }
 
 impl ServerPathLaneTracker {
@@ -515,10 +274,6 @@ impl ServerPathLaneTracker {
             .session(session_id)
             .map(|session| session.load().active_response_flows())
             .unwrap_or(0);
-        let attempt_key = ServerQuicCapacityCalibrationPathKey {
-            path,
-            path_instance_id,
-        };
         let attempts = state
             .session(session_id)
             .map(|session| {
@@ -559,8 +314,8 @@ impl ServerPathLaneTracker {
             return false;
         }
         session.quic_history_mut().set_attempts_for_path(
-            attempt_key.path,
-            attempt_key.path_instance_id,
+            path,
+            path_instance_id,
             attempts.saturating_add(1),
         );
         session.quic_history_mut().set_spent_bytes(next_spent_bytes);

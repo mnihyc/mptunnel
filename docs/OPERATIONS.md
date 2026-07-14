@@ -8,7 +8,7 @@ Use the platform command before installing a service or enabling TUN mode:
 mptunnel platform
 ```
 
-It prints the current OS/architecture, the TUN backend, privilege expectations, current TUN device status when it can be detected safely, the native service or host lifecycle, and the release target matrix.
+It prints the current OS/architecture, expected TUN backend and privileges, whether a device was actually probed, a host-lifecycle hint, and the release target matrix. Only the Linux `/dev/net/tun` report probes current device accessibility; other backends are opened later by their packet-device provider.
 
 ## Maintainability Gate
 
@@ -56,7 +56,7 @@ Service managers should run `mptunnel` with:
 --service-mode --supervise
 ```
 
-`--service-mode` makes service intent explicit. `--supervise` restarts the runtime after top-level listener/device failures using exponential backoff.
+`--service-mode` makes process-service intent explicit; it does not register a systemd unit, launchd job, Windows SCM service, or Android component. `--supervise` restarts the runtime after top-level listener/device failures using exponential backoff.
 
 Supervisor knobs:
 
@@ -65,6 +65,8 @@ Supervisor knobs:
 - `--max-restarts` / `MPTUNNEL_MAX_RESTARTS`
 
 Use service-manager restart policies as the outer process guard and `--supervise` as the in-process guard for recoverable listener/device failures.
+
+On Windows, run the executable through an SCM-capable wrapper or add a native service adapter; `--service-mode` alone is not an SCM dispatcher or control handler.
 
 On Android, the embedding application and `VpnService` own the outer lifecycle. The in-process supervisor does not replace Android service callbacks, descriptor revocation, or JNI shutdown coordination.
 

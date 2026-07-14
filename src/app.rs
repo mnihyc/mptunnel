@@ -52,7 +52,7 @@ fn run_config(config: AppConfig) -> Result<(), AppError> {
         .build()
         .map_err(AppError::BuildRuntime)?;
     if config.service.service_mode {
-        eprintln!("mptunnel service mode enabled");
+        eprintln!("mptunnel service intent enabled; process registration remains host-owned");
     }
     if config.service.supervise {
         runtime.block_on(run_supervised(config))?;

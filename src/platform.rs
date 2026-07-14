@@ -53,8 +53,8 @@ pub struct PlatformReport {
     pub arch: &'static str,
     pub tun_backend: &'static str,
     pub tun_privilege: &'static str,
-    pub tun_device_status: String,
-    pub service_manager: &'static str,
+    pub tun_device_probe: String,
+    pub service_host: &'static str,
 }
 
 impl PlatformReport {
@@ -64,8 +64,8 @@ impl PlatformReport {
             arch: std::env::consts::ARCH,
             tun_backend: tun_backend(),
             tun_privilege: tun_privilege_hint(),
-            tun_device_status: tun_device_status(),
-            service_manager: service_manager(),
+            tun_device_probe: tun_device_probe(),
+            service_host: service_host_hint(),
         }
     }
 
@@ -76,8 +76,8 @@ impl PlatformReport {
         let _ = writeln!(output, "  arch: {}", self.arch);
         let _ = writeln!(output, "  tun_backend: {}", self.tun_backend);
         let _ = writeln!(output, "  tun_privilege: {}", self.tun_privilege);
-        let _ = writeln!(output, "  tun_device_status: {}", self.tun_device_status);
-        let _ = writeln!(output, "  service_manager: {}", self.service_manager);
+        let _ = writeln!(output, "  tun_device_probe: {}", self.tun_device_probe);
+        let _ = writeln!(output, "  service_host: {}", self.service_host);
         let _ = writeln!(output, "release_targets:");
         for target in RELEASE_TARGETS {
             let _ = writeln!(
@@ -146,22 +146,22 @@ fn tun_backend() -> &'static str {
     }
 }
 
-fn service_manager() -> &'static str {
+fn service_host_hint() -> &'static str {
     #[cfg(target_os = "linux")]
     {
-        "systemd"
+        "external supervisor (systemd is common; not detected)"
     }
     #[cfg(target_os = "macos")]
     {
-        "launchd"
+        "external supervisor (launchd is common; not detected)"
     }
     #[cfg(target_os = "windows")]
     {
-        "Windows Service Control Manager"
+        "external supervisor (SCM wrapper or service adapter required)"
     }
     #[cfg(target_os = "android")]
     {
-        "Android VpnService host lifecycle"
+        "embedding Android VpnService lifecycle"
     }
     #[cfg(not(any(
         target_os = "linux",
@@ -175,34 +175,34 @@ fn service_manager() -> &'static str {
 }
 
 #[cfg(target_os = "linux")]
-fn tun_device_status() -> String {
+fn tun_device_probe() -> String {
     let path = std::path::Path::new("/dev/net/tun");
     if !path.exists() {
-        return "/dev/net/tun missing".to_string();
+        return "probed: /dev/net/tun missing".to_string();
     }
     match std::fs::OpenOptions::new()
         .read(true)
         .write(true)
         .open(path)
     {
-        Ok(_) => "/dev/net/tun present and openable".to_string(),
-        Err(err) => format!("/dev/net/tun present but not openable: {err}"),
+        Ok(_) => "probed: /dev/net/tun present and openable".to_string(),
+        Err(err) => format!("probed: /dev/net/tun present but not openable: {err}"),
     }
 }
 
 #[cfg(target_os = "macos")]
-fn tun_device_status() -> String {
-    "utun devices are allocated dynamically at runtime".to_string()
+fn tun_device_probe() -> String {
+    "not probed: utun is allocated when the packet provider opens it".to_string()
 }
 
 #[cfg(target_os = "windows")]
-fn tun_device_status() -> String {
-    "Wintun availability is checked when the TUN device is created".to_string()
+fn tun_device_probe() -> String {
+    "not probed: Wintun is checked when the packet provider opens it".to_string()
 }
 
 #[cfg(target_os = "android")]
-fn tun_device_status() -> String {
-    "requires a configured TUN descriptor from the embedding VpnService host".to_string()
+fn tun_device_probe() -> String {
+    "not probed: the embedding VpnService supplies the future descriptor".to_string()
 }
 
 #[cfg(not(any(
@@ -211,8 +211,8 @@ fn tun_device_status() -> String {
     target_os = "windows",
     target_os = "android"
 )))]
-fn tun_device_status() -> String {
-    "TUN device status is not checked on this platform".to_string()
+fn tun_device_probe() -> String {
+    "not probed: packet-device capability is provider-specific".to_string()
 }
 
 #[cfg(test)]

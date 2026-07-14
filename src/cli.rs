@@ -140,6 +140,7 @@ impl ManagementArgs {
 
 #[derive(Debug, Args)]
 pub struct ServiceArgs {
+    /// Declares service intent; does not register with a native service manager.
     #[arg(
         long,
         global = true,
@@ -148,6 +149,7 @@ pub struct ServiceArgs {
     )]
     pub service_mode: bool,
 
+    /// Restarts failed runtime generations inside the current process.
     #[arg(
         long,
         global = true,

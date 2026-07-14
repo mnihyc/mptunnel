@@ -453,7 +453,10 @@ async fn duplicate_remote_set_attach_releases_the_uncommitted_stream() {
     let (duplicate, mut duplicate_receivers, _duplicate_frames) =
         opened_relay_stream_for_test(stream_id, UnderlayProtocol::Udp, 0);
 
-    remotes.attach_for_validation(duplicate);
+    assert_eq!(
+        remotes.attach_for_validation(duplicate),
+        ReliableRelayAttachOutcome::RejectedDuplicate,
+    );
 
     assert_eq!(remotes.path_keys().len(), 1);
     assert!(matches!(
@@ -474,6 +477,62 @@ async fn duplicate_remote_set_attach_releases_the_uncommitted_stream() {
         .expect("duplicate close deadline"),
         Some(ReliablePathCommand::CloseStream(id)) if id == stream_id
     ));
+}
+
+#[tokio::test]
+async fn remote_set_close_depublishes_load_before_carrier_cleanup_waits() {
+    let stream_id = StreamId(95);
+    let path = "tcp://127.0.0.1:11095"
+        .parse::<PathSpec>()
+        .expect("tcp path");
+    let context =
+        ClientPathContext::new(vec![path], security(), ResourceLimits::default()).expect("context");
+    context.reserve_tcp_path_load(0, FlowLane::Throughput);
+
+    let mux_limits = MuxLimits::default();
+    let (commands, receivers) = reliable_path_command_channels(1);
+    commands
+        .send_control(ReliablePathCommand::CloseStream(StreamId(999)))
+        .await
+        .expect("prefill carrier control queue");
+    let (_frames_tx, frames_rx) = mpsc::channel(1);
+    let opened = OpenedRemoteStream {
+        path_index: 0,
+        stream: ReliablePathStream {
+            stream_id,
+            max_offset: mux_limits.max_stream_window_bytes,
+            lane: FlowLane::Throughput,
+            underlay: UnderlayProtocol::Tcp,
+            max_frame_payload_bytes: reliable_relay_buffer_len(mux_limits),
+            output: ReliablePathStreamOutput::fixed(
+                UnderlayProtocol::Tcp,
+                PathId(0),
+                commands,
+                mux_limits,
+            ),
+            frames: frames_rx,
+        },
+    };
+    let mut remotes = ReliableRelayRemoteSet::new(opened, 1);
+
+    let mut close = Box::pin(remotes.close_all(&context));
+    assert!(matches!(
+        futures::poll!(&mut close),
+        std::task::Poll::Pending
+    ));
+    assert_eq!(
+        context
+            .health()
+            .lock()
+            .expect("client path health lock")
+            .tcp[0]
+            .active_flows,
+        0,
+        "carrier cleanup may wait, but scheduling ownership has already ended",
+    );
+
+    drop(receivers);
+    close.await;
 }
 
 #[tokio::test]

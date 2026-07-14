@@ -2109,6 +2109,8 @@ where
         }
     };
 
+    // Logical request ownership ends here; carrier cleanup may wait on a full
+    // queue and must not keep authorizing another TCP bulk exploration flow.
     request_bulk_flow.update(false, None);
 
     let _ = drain_completed_validation_opens(
@@ -2126,7 +2128,7 @@ where
     let remaining_paths = remotes
         .paths
         .iter()
-        .map(|path| (path.key(), path.stream.lane, path.load_reserved))
+        .map(ReliableRelayRemotePath::key)
         .collect::<Vec<_>>();
     if result.is_ok() {
         for (key, stats) in path_stats {
@@ -2135,7 +2137,7 @@ where
     }
     // Success and failure both end logical stream ownership. Leaving sibling
     // carrier entries installed after one-path failure poisons later reuse.
-    remotes.close_all().await;
+    remotes.close_all(context).await;
     #[cfg(feature = "lab-diagnostics")]
     lab_diagnostic(
         "client_relay_result",
@@ -2162,12 +2164,9 @@ where
         );
     }
     sender.release_all(context);
-    for (key, lane, load_reserved) in remaining_paths {
+    for key in remaining_paths {
         if relay_error_is_tcp_path_failure(&result) {
             context.mark_relay_path_failure(key.underlay, key.index);
-        }
-        if load_reserved {
-            context.release_relay_path_load(key.underlay, key.index, lane);
         }
     }
     #[cfg(feature = "lab-diagnostics")]
@@ -2353,39 +2352,40 @@ async fn handle_validation_open_result(
     let _ = (stream_id, pending_count);
     match validation_open.result {
         Ok(opened) => {
-            if !remotes.contains_path_key(validation_open.key) {
-                remotes.attach_for_validation(opened);
-                send_stream.update_max_offset(remotes.max_offset());
-                *last_stream_progress_at = Instant::now();
-                #[cfg(feature = "lab-diagnostics")]
-                lab_diagnostic(
-                    "relay_validation_open_attached",
-                    format_args!(
-                        "stream_id={} path_underlay={:?} path_index={} pending={}",
-                        stream_id.0,
-                        validation_open.key.underlay,
-                        validation_open.key.index,
-                        pending_count,
-                    ),
-                );
-                true
-            } else {
-                #[cfg(feature = "lab-diagnostics")]
-                let lane = opened.stream.lane;
-                opened.close().await;
-                #[cfg(feature = "lab-diagnostics")]
-                lab_diagnostic(
-                    "relay_validation_open_duplicate_closed",
-                    format_args!(
-                        "stream_id={} path_underlay={:?} path_index={} lane={:?} pending={}",
-                        stream_id.0,
-                        validation_open.key.underlay,
-                        validation_open.key.index,
-                        lane,
-                        pending_count,
-                    ),
-                );
-                false
+            #[cfg(feature = "lab-diagnostics")]
+            let lane = opened.stream.lane;
+            match remotes.attach_for_validation(opened) {
+                ReliableRelayAttachOutcome::Attached => {
+                    send_stream.update_max_offset(remotes.max_offset());
+                    *last_stream_progress_at = Instant::now();
+                    #[cfg(feature = "lab-diagnostics")]
+                    lab_diagnostic(
+                        "relay_validation_open_attached",
+                        format_args!(
+                            "stream_id={} path_underlay={:?} path_index={} pending={}",
+                            stream_id.0,
+                            validation_open.key.underlay,
+                            validation_open.key.index,
+                            pending_count,
+                        ),
+                    );
+                    true
+                }
+                ReliableRelayAttachOutcome::RejectedDuplicate => {
+                    #[cfg(feature = "lab-diagnostics")]
+                    lab_diagnostic(
+                        "relay_validation_open_duplicate_closed",
+                        format_args!(
+                            "stream_id={} path_underlay={:?} path_index={} lane={:?} pending={}",
+                            stream_id.0,
+                            validation_open.key.underlay,
+                            validation_open.key.index,
+                            lane,
+                            pending_count,
+                        ),
+                    );
+                    false
+                }
             }
         }
         Err(err) if relay_path_open_error_is_retryable(validation_open.key.underlay, &err) => {
@@ -2751,16 +2751,32 @@ async fn attach_relay_path_candidates(
                             // their actual queue/inflight debt after attachment.
                             context.release_relay_path_load(key.underlay, key.index, request.lane);
                         }
-                        match request.role {
+                        let attach_outcome = match request.role {
                             StreamOpenRole::Active => remotes.attach(opened),
                             StreamOpenRole::Repair => remotes.attach_for_repair(opened),
                             StreamOpenRole::Validation => remotes.attach_for_validation(opened),
+                        };
+                        match attach_outcome {
+                            ReliableRelayAttachOutcome::Attached => {
+                                attached += 1;
+                                return Ok(RelayPathAttachResult {
+                                    attached,
+                                    key: Some(key),
+                                });
+                            }
+                            ReliableRelayAttachOutcome::RejectedDuplicate => {
+                                if request.role == StreamOpenRole::Active {
+                                    // A rejected Active open never transfers its
+                                    // path reservation into remote-set ownership.
+                                    context.release_relay_path_load(
+                                        key.underlay,
+                                        key.index,
+                                        request.lane,
+                                    );
+                                }
+                                continue;
+                            }
                         }
-                        attached += 1;
-                        return Ok(RelayPathAttachResult {
-                            attached,
-                            key: Some(key),
-                        });
                     }
                     Err(err) if reliable_relay_error_is_migratable(&err) => {
                         context.mark_relay_path_failure(key.underlay, key.index);

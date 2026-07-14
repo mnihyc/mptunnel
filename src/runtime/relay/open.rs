@@ -82,11 +82,31 @@ impl ReliableRelayRemotePath {
     pub(in crate::runtime) fn has_load_reservation(&self) -> bool {
         self.load_reserved || self.load_lease.is_some()
     }
+
+    /// Carrier shutdown may block, so retire scheduler-visible load first.
+    fn depublish_load(&mut self, context: &ClientPathContext) {
+        if std::mem::take(&mut self.load_reserved) {
+            context.release_relay_path_load(
+                self.stream.underlay,
+                self.path_index,
+                self.stream.lane,
+            );
+        }
+        drop(self.load_lease.take());
+    }
 }
 
 pub(in crate::runtime) struct ReliableRelayRemoteFrame {
     pub(in crate::runtime) instance: RelayPathInstance,
     pub(in crate::runtime) frame: Result<Frame, RuntimeError>,
+}
+
+/// Separates membership transfer from duplicate-stream cleanup so callers can
+/// commit or release the scheduler reservation that preceded the open.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(in crate::runtime) enum ReliableRelayAttachOutcome {
+    Attached,
+    RejectedDuplicate,
 }
 
 pub(in crate::runtime) struct ReliableRelayRemoteSet {
@@ -265,19 +285,32 @@ impl ReliableRelayRemoteSet {
             .max(1)
     }
 
-    pub(in crate::runtime) fn attach(&mut self, opened: OpenedRemoteStream) {
-        self.attach_with_placement(opened, RelayPathPlacement::Active);
+    pub(in crate::runtime) fn attach(
+        &mut self,
+        opened: OpenedRemoteStream,
+    ) -> ReliableRelayAttachOutcome {
+        self.attach_with_placement(opened, RelayPathPlacement::Active)
     }
 
-    pub(in crate::runtime) fn attach_for_repair(&mut self, opened: OpenedRemoteStream) {
-        self.attach_with_placement(opened, RelayPathPlacement::Repair);
+    pub(in crate::runtime) fn attach_for_repair(
+        &mut self,
+        opened: OpenedRemoteStream,
+    ) -> ReliableRelayAttachOutcome {
+        self.attach_with_placement(opened, RelayPathPlacement::Repair)
     }
 
-    pub(in crate::runtime) fn attach_for_validation(&mut self, opened: OpenedRemoteStream) {
-        self.attach_with_placement(opened, RelayPathPlacement::Validation);
+    pub(in crate::runtime) fn attach_for_validation(
+        &mut self,
+        opened: OpenedRemoteStream,
+    ) -> ReliableRelayAttachOutcome {
+        self.attach_with_placement(opened, RelayPathPlacement::Validation)
     }
 
-    fn attach_with_placement(&mut self, opened: OpenedRemoteStream, placement: RelayPathPlacement) {
+    fn attach_with_placement(
+        &mut self,
+        opened: OpenedRemoteStream,
+        placement: RelayPathPlacement,
+    ) -> ReliableRelayAttachOutcome {
         let OpenedRemoteStream { stream, path_index } = opened;
         let accepted = AcceptedRemoteStreamGuard::new(stream);
         let underlay = accepted.stream().underlay;
@@ -286,7 +319,7 @@ impl ReliableRelayRemoteSet {
             index: path_index,
         };
         if self.contains_path_key(key) {
-            return;
+            return ReliableRelayAttachOutcome::RejectedDuplicate;
         }
         let instance_id = self.next_instance_id;
         self.next_instance_id = self.next_instance_id.wrapping_add(1);
@@ -342,6 +375,7 @@ impl ReliableRelayRemoteSet {
         };
         self.paths.insert(insert_at, path);
         self.membership_generation = self.membership_generation.wrapping_add(1);
+        ReliableRelayAttachOutcome::Attached
     }
 
     pub(in crate::runtime) async fn recv_frame(
@@ -368,8 +402,13 @@ impl ReliableRelayRemoteSet {
         })
     }
 
-    pub(in crate::runtime) async fn close_all(&mut self) {
-        let paths = std::mem::take(&mut self.paths);
+    pub(in crate::runtime) async fn close_all(&mut self, context: &ClientPathContext) {
+        let mut paths = std::mem::take(&mut self.paths);
+        // The set stops owning every path as one atomic scheduling event even
+        // when the first carrier queue makes detach asynchronous.
+        for path in &mut paths {
+            path.depublish_load(context);
+        }
         for path in paths {
             path.stream.send_detach().await;
             path.stream.close().await;
@@ -385,16 +424,7 @@ impl ReliableRelayRemoteSet {
             return false;
         };
         context.mark_relay_path_data_plane_failure(path.stream.underlay, path.path_index);
-        if path.load_reserved {
-            context.release_relay_path_load(
-                path.stream.underlay,
-                path.path_index,
-                path.stream.lane,
-            );
-        }
-        // The path is no longer schedulable. Release its exact optional-flow
-        // lease before detach can wait behind a saturated carrier queue.
-        drop(path.load_lease.take());
+        path.depublish_load(context);
         path.stream.send_detach().await;
         path.stream.close().await;
         true

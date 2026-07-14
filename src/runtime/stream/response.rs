@@ -16,7 +16,6 @@ mod quic_capacity;
 mod quic_probe;
 mod session;
 mod snapshot;
-mod tcp_capacity;
 mod topology;
 mod transaction;
 
@@ -42,9 +41,8 @@ pub(in crate::runtime) use quic_capacity::{
     quic_capacity_proof_pin_matches_marker, valid_quic_capacity_proof_candidate_at,
 };
 pub(in crate::runtime) use quic_probe::ResponseQuicCapacityCalibrationRequest;
-pub(in crate::runtime) use session::ServerPathLaneTracker;
+pub(in crate::runtime) use session::{ServerPathLaneTracker, TcpCapacityProbeSessionLease};
 pub(in crate::runtime) use snapshot::server_bulk_output_eta_ms;
-pub(in crate::runtime) use tcp_capacity::TcpCapacityProbeSessionLease;
 use topology::ResponseStreamOutputs;
 pub(in crate::runtime) use topology::{
     ResponseDispatchTarget, ResponseSenderPathTarget, ResponseStreamAttachOutcome,

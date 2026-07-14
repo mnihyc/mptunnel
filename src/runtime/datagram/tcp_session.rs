@@ -3,10 +3,8 @@
 use super::policy::{
     DatagramPathSendError, datagram_remaining_ttl_ms, datagram_response_deadline_budget,
 };
-use super::session::{
-    DatagramClientFlow, SentDatagram, datagram_ack_range, datagram_id_is_in_ranges,
-};
 use super::tcp::tcp_datagram_response_timeout;
+use super::{DatagramClientFlow, SentDatagram, datagram_ack_range, datagram_id_is_in_ranges};
 use crate::model::capacity::TRANSPORT_TIMER_GRANULARITY;
 use crate::mux::MuxLimits;
 use crate::mux::datagram::DatagramFlow;

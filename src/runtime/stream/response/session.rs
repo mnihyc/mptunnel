@@ -8,9 +8,9 @@ use crate::model::path::{CarrierPathInstanceId, CarrierPathKey};
 use crate::model::response::ResponseServiceFamilyLoads;
 use crate::protocol::SessionId;
 use std::collections::HashMap;
-use std::sync::Mutex;
 #[cfg(test)]
 use std::sync::MutexGuard;
+use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
 // Session coordination owns one state mutex, generations, and probe leases.
@@ -43,6 +43,34 @@ pub(super) struct ServerResponsePathSchedulingSnapshot {
 /// and cannot reorder product frames after sender-service admission.
 pub(in crate::runtime) struct ServerPathLaneTracker {
     pub(super) state: Mutex<ServerPathLaneTrackerState>,
+}
+
+/// Holds the session-wide TCP discovery slot until its carrier command is
+/// received, cancelled, or dropped after failure.
+#[derive(Debug)]
+pub(in crate::runtime) struct TcpCapacityProbeSessionLease {
+    tracker: Arc<ServerPathLaneTracker>,
+    session_id: SessionId,
+}
+
+impl Drop for TcpCapacityProbeSessionLease {
+    fn drop(&mut self) {
+        let mut state = self
+            .tracker
+            .state
+            .lock()
+            .expect("server path lane tracker lock");
+        let released = state.session_mut(self.session_id).is_some_and(|session| {
+            if !session.clear_tcp_capacity_probe() {
+                return false;
+            }
+            session.bump_generation();
+            true
+        });
+        if released {
+            state.maybe_reclaim_session(self.session_id);
+        }
+    }
 }
 
 #[cfg(test)]
@@ -345,6 +373,26 @@ impl ServerPathLaneTrackerState {
 }
 
 impl ServerPathLaneTracker {
+    pub(in crate::runtime) fn try_reserve_tcp_capacity_probe(
+        self: &Arc<Self>,
+        session_id: SessionId,
+        expected_generation: u64,
+    ) -> Option<TcpCapacityProbeSessionLease> {
+        let mut state = self.state.lock().expect("server path lane tracker lock");
+        if state.generation(session_id) != expected_generation {
+            return None;
+        }
+        let session = state.session_mut_or_default(session_id);
+        if !session.reserve_tcp_capacity_probe() {
+            return None;
+        }
+        session.bump_generation();
+        Some(TcpCapacityProbeSessionLease {
+            tracker: Arc::clone(self),
+            session_id,
+        })
+    }
+
     pub(in crate::runtime::stream) fn attach_session(&self, session_id: SessionId) {
         let mut state = self.state.lock().expect("server path lane tracker lock");
         state.session_mut_or_default(session_id).attach_reference();

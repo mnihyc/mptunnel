@@ -3,9 +3,7 @@
 use super::policy::{
     DatagramPathSendError, datagram_remaining_ttl_ms, datagram_response_deadline_budget,
 };
-use super::session::{
-    DatagramClientFlow, SentDatagram, datagram_ack_range, datagram_id_is_in_ranges,
-};
+use super::{DatagramClientFlow, SentDatagram, datagram_ack_range, datagram_id_is_in_ranges};
 use crate::config::SecurityConfig;
 use crate::model::capacity::{PathRateSample, QUIC_TIMER_GRANULARITY};
 use crate::mux::MuxLimits;

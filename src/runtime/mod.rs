@@ -44,7 +44,7 @@ use path::{
     commands::*,
     model::*,
     proof::*,
-    tcp::{client::*, metrics::*},
+    tcp::{capacity::*, client::*},
 };
 #[cfg(test)]
 use path::{ClientPathHealth, ClientPathState, UdpDatagramPathObservation};

@@ -6,8 +6,10 @@
 
 use super::*;
 
+pub(in crate::runtime) mod capacity;
 pub(in crate::runtime) mod client;
 pub(in crate::runtime) mod metrics;
 pub(in crate::runtime) mod server;
 
+use capacity::*;
 use metrics::*;

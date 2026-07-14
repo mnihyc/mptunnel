@@ -8,7 +8,7 @@ use super::model::*;
 use super::proof::PathProofObservation;
 use super::quic::metrics::{QuicCapacityProofCandidate, UdpPathMetrics};
 use super::set::ClientPathContext;
-use super::tcp::metrics::*;
+use super::tcp::capacity::*;
 use crate::model::capacity::*;
 use crate::model::path::*;
 use crate::runtime::error::RuntimeError;

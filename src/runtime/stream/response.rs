@@ -53,7 +53,7 @@ pub(in crate::runtime) use tcp_capacity::TcpCapacityProbeSessionLease;
 use topology::ResponseStreamOutputs;
 pub(in crate::runtime) use topology::{
     ResponseDispatchTarget, ResponseSenderPathTarget, ResponseStreamAttachOutcome,
-    ServerCarrierPathInstanceId, next_server_carrier_path_instance_id,
+    next_server_carrier_path_instance_id,
 };
 pub(in crate::runtime) use transaction::{
     ResponseAckClockCalibrationRequest, ResponseAckClockCalibrationRetirementRequest,

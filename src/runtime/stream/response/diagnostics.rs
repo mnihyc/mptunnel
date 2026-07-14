@@ -5,7 +5,7 @@ use super::ResponseStreamBinding;
 #[cfg(feature = "lab-diagnostics")]
 use super::evidence::ServerPathMetricsSource;
 #[cfg(feature = "lab-diagnostics")]
-use super::topology::{ResponseStreamOutputEntry, ServerCarrierPathInstanceId};
+use super::topology::ResponseStreamOutputEntry;
 #[cfg(feature = "lab-diagnostics")]
 use crate::lab_diagnostics::{
     lab_diagnostic, lab_diagnostic_event_enabled, lab_sender_service_decision,
@@ -17,6 +17,8 @@ use crate::model::admission::{
 };
 #[cfg(feature = "lab-diagnostics")]
 use crate::model::capacity::reliable_subflow_startup_sample_limit_bytes;
+#[cfg(feature = "lab-diagnostics")]
+use crate::model::path::CarrierPathInstanceId;
 use crate::model::path::CarrierPathKey;
 #[cfg(feature = "lab-diagnostics")]
 use crate::protocol::frame::{
@@ -45,7 +47,7 @@ pub(super) struct ResponseServiceHandoffDiagnosticState {
 #[cfg(feature = "lab-diagnostics")]
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub(super) struct ResponseServiceFeedDiagnosticState {
-    path_instance_id: ServerCarrierPathInstanceId,
+    path_instance_id: CarrierPathInstanceId,
     attachment_role: StreamOpenRole,
     is_active: bool,
     has_bulk_rate_evidence: bool,

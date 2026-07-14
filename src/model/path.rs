@@ -22,3 +22,21 @@ pub(crate) struct CarrierPathKey {
     pub(crate) underlay: UnderlayProtocol,
     pub(crate) path_id: PathId,
 }
+
+/// Opaque lifetime identity for one physical carrier attachment.
+///
+/// `CarrierPathKey` names a logical path; this value changes when that path is
+/// replaced so evidence and in-flight ownership cannot cross attachment lives.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub(crate) struct CarrierPathInstanceId(u64);
+
+impl CarrierPathInstanceId {
+    pub(crate) fn from_raw(raw: u64) -> Self {
+        Self(raw)
+    }
+
+    #[cfg(feature = "lab-diagnostics")]
+    pub(crate) fn as_u64(self) -> u64 {
+        self.0
+    }
+}

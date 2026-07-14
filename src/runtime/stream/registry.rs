@@ -1,14 +1,14 @@
 use super::handle::{ReliablePathStream, ReliablePathStreamOutput};
 use super::response::{
-    ResponseStreamAttachOutcome, ResponseStreamBinding, ServerCarrierPathInstanceId,
-    ServerPathLaneTracker, ServerPathMetricsEntry, ServerPathMetricsSource,
-    ServerRealtimeFlowRegistration, next_server_carrier_path_instance_id,
+    ResponseStreamAttachOutcome, ResponseStreamBinding, ServerPathLaneTracker,
+    ServerPathMetricsEntry, ServerPathMetricsSource, ServerRealtimeFlowRegistration,
+    next_server_carrier_path_instance_id,
 };
 use crate::config::ResourceLimits;
 #[cfg(feature = "lab-diagnostics")]
 use crate::lab_diagnostics::{lab_diagnostic, lab_perf_record};
 use crate::model::capacity::QuicCapacityProofCandidate;
-use crate::model::path::CarrierPathKey;
+use crate::model::path::{CarrierPathInstanceId, CarrierPathKey};
 use crate::mux::MuxLimits;
 #[cfg(feature = "lab-diagnostics")]
 use crate::protocol::frame::reliable_path_frame_pacing_bytes;
@@ -40,23 +40,12 @@ pub(in crate::runtime) struct ServerReliableStreamRegistry {
     streams: Mutex<HashMap<(SessionId, StreamId), ServerReliableStreamEntry>>,
     path_metrics: Mutex<
         HashMap<
-            (
-                SessionId,
-                UnderlayProtocol,
-                PathId,
-                ServerCarrierPathInstanceId,
-            ),
+            (SessionId, UnderlayProtocol, PathId, CarrierPathInstanceId),
             ServerPathMetricsEntry,
         >,
     >,
-    active_path_instances: Mutex<
-        HashSet<(
-            SessionId,
-            UnderlayProtocol,
-            PathId,
-            ServerCarrierPathInstanceId,
-        )>,
-    >,
+    active_path_instances:
+        Mutex<HashSet<(SessionId, UnderlayProtocol, PathId, CarrierPathInstanceId)>>,
     closed_streams: Mutex<RecentIdCache<(SessionId, StreamId)>>,
     lane_tracker: Arc<ServerPathLaneTracker>,
 }
@@ -125,11 +114,11 @@ struct ServerCarrierPathRegistrationInner {
     session_id: SessionId,
     underlay: UnderlayProtocol,
     path_id: PathId,
-    path_instance_id: ServerCarrierPathInstanceId,
+    path_instance_id: CarrierPathInstanceId,
 }
 
 impl ServerCarrierPathRegistration {
-    pub(in crate::runtime) fn path_instance_id(&self) -> ServerCarrierPathInstanceId {
+    pub(in crate::runtime) fn path_instance_id(&self) -> CarrierPathInstanceId {
         self.inner.path_instance_id
     }
 
@@ -242,7 +231,7 @@ impl ServerReliableStreamRegistry {
         session_id: SessionId,
         underlay: UnderlayProtocol,
         path_id: PathId,
-        path_instance_id: ServerCarrierPathInstanceId,
+        path_instance_id: CarrierPathInstanceId,
     ) {
         self.active_path_instances
             .lock()
@@ -764,7 +753,7 @@ impl ServerReliableStreamRegistry {
         session_id: SessionId,
         underlay: UnderlayProtocol,
         path_id: PathId,
-        path_instance_id: ServerCarrierPathInstanceId,
+        path_instance_id: CarrierPathInstanceId,
         initial_metrics: Option<PathMetrics>,
     ) -> Option<ServerPathMetricsEntry> {
         let stored = self.stored_path_metrics(session_id, underlay, path_id, path_instance_id);
@@ -785,7 +774,7 @@ impl ServerReliableStreamRegistry {
         session_id: SessionId,
         underlay: UnderlayProtocol,
         path_id: PathId,
-        path_instance_id: ServerCarrierPathInstanceId,
+        path_instance_id: CarrierPathInstanceId,
     ) -> Option<ServerPathMetricsEntry> {
         self.path_metrics
             .lock()

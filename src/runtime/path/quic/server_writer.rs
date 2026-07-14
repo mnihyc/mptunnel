@@ -6,7 +6,7 @@ use super::capacity::{
 };
 use super::io::*;
 use super::*;
-use crate::runtime::stream::response::ServerCarrierPathInstanceId;
+use crate::model::path::CarrierPathInstanceId;
 
 pub(super) async fn drain_server_udp_reliable_commands(
     first_command: ReliablePathCommand,
@@ -16,7 +16,7 @@ pub(super) async fn drain_server_udp_reliable_commands(
     session_id: SessionId,
     stream_id: StreamId,
     path_id: PathId,
-    path_instance_id: ServerCarrierPathInstanceId,
+    path_instance_id: CarrierPathInstanceId,
     commands_tx: &ReliablePathCommandSender,
     pending_frames: &mut Vec<Frame>,
     path_proofs: &mut PathProofTracker,

@@ -6,7 +6,7 @@
 
 use super::io::UdpPathSendStream;
 use super::*;
-use crate::runtime::stream::response::ServerCarrierPathInstanceId;
+use crate::model::path::CarrierPathInstanceId;
 
 const QUIC_CAPACITY_RECORD_PAYLOAD_BYTES: usize = 64 * 1024;
 
@@ -133,7 +133,7 @@ pub(super) fn confirm_server_quic_capacity_receipt(
     send: &UdpPathSendStream,
     _session_id: SessionId,
     path_id: PathId,
-    _path_instance_id: ServerCarrierPathInstanceId,
+    _path_instance_id: CarrierPathInstanceId,
     _stream_id: StreamId,
     receipt_path_id: PathId,
     calibration_id: u64,

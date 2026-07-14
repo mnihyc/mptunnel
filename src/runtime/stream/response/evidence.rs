@@ -7,7 +7,7 @@ use super::ack_clock::ResponseAckClockCalibrationState;
 use super::quic_capacity::{
     valid_quic_capacity_proof_candidate_at, well_formed_quic_capacity_proof_candidate,
 };
-use super::topology::{ResponseStreamOutputEntry, ServerCarrierPathInstanceId};
+use super::topology::ResponseStreamOutputEntry;
 #[cfg(feature = "lab-diagnostics")]
 use crate::lab_diagnostics::lab_diagnostic;
 #[cfg(test)]
@@ -15,7 +15,7 @@ use crate::model::capacity::reliable_subflow_startup_sample_limit_bytes;
 use crate::model::capacity::{
     PATH_OPEN_SCORE_BYTES, QuicCapacityProofCandidate, RELIABLE_STREAM_STARTUP_PRODUCT_WINDOW_BYTES,
 };
-use crate::model::path::CarrierPathKey;
+use crate::model::path::{CarrierPathInstanceId, CarrierPathKey};
 use crate::model::timing::quic_bulk_proof_freshness_horizon;
 use crate::protocol::{PathMetricDirection, PathMetrics, UnderlayProtocol};
 use crate::runtime::path::tcp::capacity::{
@@ -300,7 +300,7 @@ impl ResponseStreamBinding {
     pub(in crate::runtime) fn update_path_metrics_for_instance(
         &self,
         key: CarrierPathKey,
-        path_instance_id: ServerCarrierPathInstanceId,
+        path_instance_id: CarrierPathInstanceId,
         metrics: PathMetrics,
         source: ServerPathMetricsSource,
     ) {
@@ -310,7 +310,7 @@ impl ResponseStreamBinding {
     pub(in crate::runtime) fn install_quic_capacity_proof_for_instance(
         &self,
         key: CarrierPathKey,
-        path_instance_id: ServerCarrierPathInstanceId,
+        path_instance_id: CarrierPathInstanceId,
         metrics: PathMetrics,
         candidate: QuicCapacityProofCandidate,
     ) -> bool {
@@ -332,7 +332,7 @@ impl ResponseStreamBinding {
     pub(in crate::runtime) fn install_tcp_capacity_proof_for_instance(
         &self,
         key: CarrierPathKey,
-        path_instance_id: ServerCarrierPathInstanceId,
+        path_instance_id: CarrierPathInstanceId,
         metrics: PathMetrics,
         candidate: TcpCapacityProofCandidate,
     ) -> bool {
@@ -354,7 +354,7 @@ impl ResponseStreamBinding {
     pub(in crate::runtime) fn install_stored_path_metrics_for_instance(
         &self,
         key: CarrierPathKey,
-        path_instance_id: ServerCarrierPathInstanceId,
+        path_instance_id: CarrierPathInstanceId,
         path_metrics: ServerPathMetricsEntry,
     ) {
         self.install_path_metrics_entry_matching(key, Some(path_instance_id), path_metrics, true);
@@ -378,7 +378,7 @@ impl ResponseStreamBinding {
     fn update_path_metrics_matching(
         &self,
         key: CarrierPathKey,
-        path_instance_id: Option<ServerCarrierPathInstanceId>,
+        path_instance_id: Option<CarrierPathInstanceId>,
         metrics: PathMetrics,
         source: ServerPathMetricsSource,
     ) {
@@ -421,7 +421,7 @@ impl ResponseStreamBinding {
     fn install_path_metrics_entry_matching(
         &self,
         key: CarrierPathKey,
-        path_instance_id: Option<ServerCarrierPathInstanceId>,
+        path_instance_id: Option<CarrierPathInstanceId>,
         mut path_metrics: ServerPathMetricsEntry,
         notify: bool,
     ) -> (bool, bool) {

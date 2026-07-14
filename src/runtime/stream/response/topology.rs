@@ -7,7 +7,7 @@ use super::evidence::ServerPathMetricsEntry;
 #[cfg(feature = "lab-diagnostics")]
 use crate::lab_diagnostics::lab_diagnostic;
 use crate::model::capacity::QuicCapacityProofCandidate;
-use crate::model::path::CarrierPathKey;
+use crate::model::path::{CarrierPathInstanceId, CarrierPathKey};
 #[cfg(feature = "lab-diagnostics")]
 use crate::protocol::SessionId;
 use crate::protocol::{PathId, StreamOpenRole, UnderlayProtocol};
@@ -29,18 +29,10 @@ pub(super) fn response_owner_underlay_seen_bit(underlay: UnderlayProtocol) -> u8
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub(in crate::runtime) struct ServerCarrierPathInstanceId(pub(super) u64);
-
-impl ServerCarrierPathInstanceId {
-    #[cfg(feature = "lab-diagnostics")]
-    pub(in crate::runtime) fn as_u64(self) -> u64 {
-        self.0
-    }
-}
-
-pub(in crate::runtime) fn next_server_carrier_path_instance_id() -> ServerCarrierPathInstanceId {
-    ServerCarrierPathInstanceId(NEXT_SERVER_CARRIER_PATH_INSTANCE_ID.fetch_add(1, Ordering::AcqRel))
+pub(in crate::runtime) fn next_server_carrier_path_instance_id() -> CarrierPathInstanceId {
+    CarrierPathInstanceId::from_raw(
+        NEXT_SERVER_CARRIER_PATH_INSTANCE_ID.fetch_add(1, Ordering::AcqRel),
+    )
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -58,7 +50,7 @@ pub(in crate::runtime) enum ResponseStreamAttachOutcome {
 #[derive(Clone)]
 pub(in crate::runtime) struct ResponseStreamOutputEntry {
     pub(super) key: CarrierPathKey,
-    pub(super) path_instance_id: ServerCarrierPathInstanceId,
+    pub(super) path_instance_id: CarrierPathInstanceId,
     pub(super) incarnation: u64,
     pub(super) commands: ReliablePathCommandSender,
     pub(super) role: StreamOpenRole,
@@ -158,7 +150,7 @@ impl ResponseStreamBinding {
         &self,
         underlay: UnderlayProtocol,
         path_id: PathId,
-        path_instance_id: ServerCarrierPathInstanceId,
+        path_instance_id: CarrierPathInstanceId,
         commands: ReliablePathCommandSender,
         lane: FlowLane,
         role: StreamOpenRole,
@@ -536,7 +528,7 @@ impl ResponseStreamBinding {
     pub(in crate::runtime::stream) fn detach_path_instance(
         &self,
         key: CarrierPathKey,
-        path_instance_id: ServerCarrierPathInstanceId,
+        path_instance_id: CarrierPathInstanceId,
     ) {
         self.detach_matching_output(key, |entry| entry.path_instance_id == path_instance_id);
     }
@@ -795,7 +787,7 @@ pub(in crate::runtime) struct ResponseSenderPathTarget {
     #[cfg(feature = "lab-diagnostics")]
     pub(in crate::runtime) binding_instance_id: u64,
     pub(in crate::runtime) key: CarrierPathKey,
-    pub(in crate::runtime) path_instance_id: ServerCarrierPathInstanceId,
+    pub(in crate::runtime) path_instance_id: CarrierPathInstanceId,
     pub(in crate::runtime) incarnation: u64,
     pub(in crate::runtime) commands: ReliablePathCommandSender,
     pub(in crate::runtime) attachment_role: StreamOpenRole,
@@ -834,7 +826,7 @@ pub(in crate::runtime) struct ResponseSenderPathTarget {
 #[derive(Clone)]
 pub(in crate::runtime) struct ResponseDispatchTarget {
     pub(in crate::runtime) key: CarrierPathKey,
-    pub(in crate::runtime) path_instance_id: ServerCarrierPathInstanceId,
+    pub(in crate::runtime) path_instance_id: CarrierPathInstanceId,
     pub(in crate::runtime) incarnation: u64,
     pub(in crate::runtime) commands: ReliablePathCommandSender,
     pub(in crate::runtime) attachment_role: StreamOpenRole,

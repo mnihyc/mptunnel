@@ -14,14 +14,14 @@ use super::placement::{
 };
 use super::quic_capacity::quic_capacity_proof_pin_matches_marker;
 use super::snapshot::server_bulk_output_snapshot_with_command_pending;
+use super::topology::ResponseDispatchTarget;
 #[cfg(test)]
 use super::topology::ResponseSenderPathTarget;
-use super::topology::{ResponseDispatchTarget, ServerCarrierPathInstanceId};
 #[cfg(feature = "lab-diagnostics")]
 use crate::lab_diagnostics::lab_diagnostic;
 use crate::model::capacity::QuicCapacityProofCandidate;
 use crate::model::multipath::FlowSubflowSet;
-use crate::model::path::CarrierPathKey;
+use crate::model::path::{CarrierPathInstanceId, CarrierPathKey};
 use crate::protocol::frame::reliable_stream_frame_extent;
 use crate::protocol::{Frame, StreamOpenRole};
 use crate::runtime::RuntimeError;
@@ -38,10 +38,10 @@ pub(in crate::runtime) struct ResponseServiceHandoffRequest {
     pub(in crate::runtime) expected_model_generation: u64,
     pub(in crate::runtime) handoff_frontier: u64,
     pub(in crate::runtime) service: CarrierPathKey,
-    pub(in crate::runtime) service_path_instance_id: ServerCarrierPathInstanceId,
+    pub(in crate::runtime) service_path_instance_id: CarrierPathInstanceId,
     pub(in crate::runtime) service_incarnation: u64,
     pub(in crate::runtime) target: CarrierPathKey,
-    pub(in crate::runtime) target_path_instance_id: ServerCarrierPathInstanceId,
+    pub(in crate::runtime) target_path_instance_id: CarrierPathInstanceId,
     pub(in crate::runtime) target_incarnation: u64,
     pub(in crate::runtime) mode: ResponseServiceHandoffMode,
     /// Shared queue pressure may fall after ranking, but it may not grow beyond
@@ -353,11 +353,11 @@ impl ResponseStreamBinding {
                 request.capacity_proof.map_or(0, |proof| proof.token),
                 request.service.underlay,
                 request.service.path_id.0,
-                request.service_path_instance_id.0,
+                request.service_path_instance_id.as_u64(),
                 request.service_incarnation,
                 request.target.underlay,
                 request.target.path_id.0,
-                request.target_path_instance_id.0,
+                request.target_path_instance_id.as_u64(),
                 request.target_incarnation,
                 request.handoff_frontier,
                 handoff_fair_share.6,

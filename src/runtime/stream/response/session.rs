@@ -4,8 +4,7 @@ use super::quic_capacity::{
     ResponseQuicCapacityHistory, ServerQuicCapacityCalibrationPhase,
     ServerQuicCapacityCalibrationReservation, finish_quic_capacity_session_reclamation,
 };
-use super::topology::ServerCarrierPathInstanceId;
-use crate::model::path::CarrierPathKey;
+use crate::model::path::{CarrierPathInstanceId, CarrierPathKey};
 use crate::protocol::{SessionId, UnderlayProtocol};
 use std::collections::HashMap;
 use std::sync::Mutex;
@@ -334,7 +333,7 @@ impl ServerPathLaneTrackerState {
         &self,
         session_id: SessionId,
         path: CarrierPathKey,
-        path_instance_id: ServerCarrierPathInstanceId,
+        path_instance_id: CarrierPathInstanceId,
         session_load: ServerPathLaneLoad,
     ) -> ServerResponsePathSchedulingSnapshot {
         let path_load = self
@@ -488,7 +487,7 @@ impl ServerPathLaneTracker {
         &self,
         session_id: SessionId,
         path: CarrierPathKey,
-        path_instance_id: ServerCarrierPathInstanceId,
+        path_instance_id: CarrierPathInstanceId,
     ) -> ServerResponsePathSchedulingSnapshot {
         let state = self.state.lock().expect("server path lane tracker lock");
         let session_load = state
@@ -502,7 +501,7 @@ impl ServerPathLaneTracker {
     pub(super) fn response_path_scheduling_snapshots(
         &self,
         session_id: SessionId,
-        paths: impl IntoIterator<Item = (CarrierPathKey, ServerCarrierPathInstanceId)>,
+        paths: impl IntoIterator<Item = (CarrierPathKey, CarrierPathInstanceId)>,
     ) -> Vec<ServerResponsePathSchedulingSnapshot> {
         let state = self.state.lock().expect("server path lane tracker lock");
         let session_load = state

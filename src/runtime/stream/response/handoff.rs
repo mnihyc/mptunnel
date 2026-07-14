@@ -13,12 +13,12 @@ use super::placement::{
 use super::quic_capacity::valid_quic_capacity_proof_candidate_at;
 use super::session::{ServerPathLaneTracker, ServerPathLaneTrackerState};
 use super::snapshot::server_bulk_output_snapshot_with_command_pending;
-use super::topology::{ResponseSenderPathTarget, ServerCarrierPathInstanceId};
+use super::topology::ResponseSenderPathTarget;
 #[cfg(feature = "lab-diagnostics")]
 use crate::lab_diagnostics::lab_diagnostic;
 use crate::model::capacity::QuicCapacityProofCandidate;
 use crate::model::multipath::FlowSubflowSet;
-use crate::model::path::CarrierPathKey;
+use crate::model::path::{CarrierPathInstanceId, CarrierPathKey};
 use crate::protocol::{SessionId, StreamOpenRole, UnderlayProtocol};
 use crate::scheduler::FlowLane;
 use std::sync::atomic::Ordering;
@@ -33,10 +33,10 @@ pub(in crate::runtime) struct ResponseServiceHandoffDrainRequest {
     pub(in crate::runtime) expected_lane_generation: u64,
     pub(in crate::runtime) expected_model_generation: u64,
     pub(in crate::runtime) service: CarrierPathKey,
-    pub(in crate::runtime) service_path_instance_id: ServerCarrierPathInstanceId,
+    pub(in crate::runtime) service_path_instance_id: CarrierPathInstanceId,
     pub(in crate::runtime) service_incarnation: u64,
     pub(in crate::runtime) target: CarrierPathKey,
-    pub(in crate::runtime) target_path_instance_id: ServerCarrierPathInstanceId,
+    pub(in crate::runtime) target_path_instance_id: CarrierPathInstanceId,
     pub(in crate::runtime) target_incarnation: u64,
     pub(in crate::runtime) mode: ResponseServiceHandoffMode,
     pub(in crate::runtime) capacity_proof: Option<QuicCapacityProofCandidate>,
@@ -49,10 +49,10 @@ pub(in crate::runtime) struct ResponseServiceHandoffDrainRequest {
 pub(in crate::runtime) struct ResponseServiceHandoffDrainReservation {
     pub(in crate::runtime) binding_instance_id: u64,
     pub(in crate::runtime) service: CarrierPathKey,
-    pub(in crate::runtime) service_path_instance_id: ServerCarrierPathInstanceId,
+    pub(in crate::runtime) service_path_instance_id: CarrierPathInstanceId,
     pub(in crate::runtime) service_incarnation: u64,
     pub(in crate::runtime) target: CarrierPathKey,
-    pub(in crate::runtime) target_path_instance_id: ServerCarrierPathInstanceId,
+    pub(in crate::runtime) target_path_instance_id: CarrierPathInstanceId,
     pub(in crate::runtime) target_incarnation: u64,
     /// Pins one fresh receipt only for this bounded handoff transaction.
     pub(in crate::runtime) capacity_proof: Option<QuicCapacityProofCandidate>,
@@ -298,11 +298,11 @@ impl ResponseStreamBinding {
                 request.capacity_proof.map_or(0, |proof| proof.token),
                 request.service.underlay,
                 request.service.path_id.0,
-                request.service_path_instance_id.0,
+                request.service_path_instance_id.as_u64(),
                 request.service_incarnation,
                 request.target.underlay,
                 request.target.path_id.0,
-                request.target_path_instance_id.0,
+                request.target_path_instance_id.as_u64(),
                 request.target_incarnation,
                 request.outstanding_owner_bytes,
                 request.lease.as_millis(),
@@ -397,10 +397,10 @@ impl ServerPathLaneTracker {
         expected_generation: u64,
         binding_instance_id: u64,
         service: CarrierPathKey,
-        service_path_instance_id: ServerCarrierPathInstanceId,
+        service_path_instance_id: CarrierPathInstanceId,
         service_incarnation: u64,
         target: CarrierPathKey,
-        target_path_instance_id: ServerCarrierPathInstanceId,
+        target_path_instance_id: CarrierPathInstanceId,
         target_incarnation: u64,
         capacity_proof: Option<QuicCapacityProofCandidate>,
         expires_at: Instant,
@@ -468,7 +468,7 @@ impl ServerPathLaneTracker {
         session_id: SessionId,
         binding_instance_id: u64,
         path: CarrierPathKey,
-        path_instance_id: ServerCarrierPathInstanceId,
+        path_instance_id: CarrierPathInstanceId,
     ) -> bool {
         let mut state = self.state.lock().expect("server path lane tracker lock");
         let matches = state
@@ -496,10 +496,10 @@ impl ServerPathLaneTracker {
         expected_generation: u64,
         binding_instance_id: u64,
         from: CarrierPathKey,
-        from_path_instance_id: ServerCarrierPathInstanceId,
+        from_path_instance_id: CarrierPathInstanceId,
         from_incarnation: u64,
         to: CarrierPathKey,
-        to_path_instance_id: ServerCarrierPathInstanceId,
+        to_path_instance_id: CarrierPathInstanceId,
         to_incarnation: u64,
         capacity_proof: Option<QuicCapacityProofCandidate>,
         lane: FlowLane,

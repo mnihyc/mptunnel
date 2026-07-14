@@ -10,6 +10,7 @@ use crate::lab_diagnostics::lab_diagnostic;
 use crate::model::capacity::{
     TcpCapacityProofCandidate, reliable_capacity_calibration_session_limit_bytes,
 };
+use crate::model::path::CarrierPathInstanceId;
 use crate::mux::MuxLimits;
 use crate::protocol::path_capacity::CapacityReceiveTracker;
 use crate::protocol::{
@@ -24,7 +25,6 @@ use crate::runtime::path::tcp::capacity::{
     tcp_capacity_receipt_rate_bps,
 };
 use crate::runtime::stream::ServerCarrierPathRegistration;
-use crate::runtime::stream::response::ServerCarrierPathInstanceId;
 use std::time::Instant;
 
 pub(super) enum ServerTcpEvidenceOutcome {
@@ -91,7 +91,7 @@ impl ServerTcpEvidenceState {
         &self,
         session_id: SessionId,
         path_id: PathId,
-        path_instance_id: ServerCarrierPathInstanceId,
+        path_instance_id: CarrierPathInstanceId,
     ) {
         #[cfg(not(feature = "lab-diagnostics"))]
         let _ = (session_id, path_id, path_instance_id);

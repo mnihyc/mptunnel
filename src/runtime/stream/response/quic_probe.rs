@@ -5,11 +5,11 @@
 
 use super::ResponseStreamBinding;
 use super::admission::server_output_has_bulk_rate_evidence_with_limits;
-use super::topology::{ResponseSenderPathTarget, ServerCarrierPathInstanceId};
+use super::topology::ResponseSenderPathTarget;
 #[cfg(feature = "lab-diagnostics")]
 use crate::lab_diagnostics::lab_diagnostic;
 use crate::model::capacity::reliable_capacity_calibration_session_limit_bytes;
-use crate::model::path::CarrierPathKey;
+use crate::model::path::{CarrierPathInstanceId, CarrierPathKey};
 use crate::protocol::{StreamOpenRole, UnderlayProtocol};
 use crate::runtime::path::commands::{
     QuicCapacityProbeCommand, QuicCapacityProbeCommandTicket, QuicCapacityProbeOwner,
@@ -34,7 +34,7 @@ enum QuicCapacityAdmissionState {
 struct QuicCapacityAdmissionGuard<'a> {
     binding: &'a ResponseStreamBinding,
     path: CarrierPathKey,
-    path_instance_id: ServerCarrierPathInstanceId,
+    path_instance_id: CarrierPathInstanceId,
     token: u64,
     ticket: QuicCapacityProbeCommandTicket,
     state: QuicCapacityAdmissionState,
@@ -91,7 +91,7 @@ pub(in crate::runtime) struct ResponseQuicCapacityCalibrationRequest {
     pub(in crate::runtime) expected_lane_generation: u64,
     pub(in crate::runtime) expected_model_generation: u64,
     pub(in crate::runtime) target: CarrierPathKey,
-    pub(in crate::runtime) target_path_instance_id: ServerCarrierPathInstanceId,
+    pub(in crate::runtime) target_path_instance_id: CarrierPathInstanceId,
     pub(in crate::runtime) target_incarnation: u64,
     pub(in crate::runtime) target_pending_bytes: u64,
     pub(in crate::runtime) train_bytes: usize,
@@ -280,7 +280,7 @@ impl ResponseStreamBinding {
                 self.session_id.0,
                 self.binding_instance_id,
                 request.target.path_id.0,
-                request.target_path_instance_id.0,
+                request.target_path_instance_id.as_u64(),
                 request.target_incarnation,
                 calibration_id,
                 attempt_ordinal,

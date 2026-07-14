@@ -6,13 +6,12 @@
 
 use super::MAX_RESPONSE_QUIC_CAPACITY_CALIBRATION_ATTEMPTS_PER_PATH;
 use super::session::{ServerPathLaneTracker, ServerPathLaneTrackerState};
-use super::topology::ServerCarrierPathInstanceId;
 #[cfg(feature = "lab-diagnostics")]
 use crate::lab_diagnostics::lab_diagnostic;
 use crate::model::capacity::{
     PATH_OPEN_SCORE_BYTES, QuicCapacityProofCandidate, quic_capacity_receipt_rate_bps,
 };
-use crate::model::path::CarrierPathKey;
+use crate::model::path::{CarrierPathInstanceId, CarrierPathKey};
 use crate::protocol::SessionId;
 use crate::runtime::path::commands::QuicCapacityProbeCommandTicket;
 use std::collections::HashMap;
@@ -40,7 +39,7 @@ pub(super) enum ServerQuicCapacityCalibrationPhase {
 pub(super) struct ServerQuicCapacityCalibrationReservation {
     pub(super) binding_instance_id: u64,
     pub(super) path: CarrierPathKey,
-    pub(super) path_instance_id: ServerCarrierPathInstanceId,
+    pub(super) path_instance_id: CarrierPathInstanceId,
     pub(super) phase: ServerQuicCapacityCalibrationPhase,
     pub(super) train_bytes: u64,
     pub(super) sample_floor_bytes: u64,
@@ -57,7 +56,7 @@ pub(in crate::runtime::stream) struct ServerQuicCapacityProofTicket {
     pub(super) session_id: SessionId,
     pub(super) binding_instance_id: u64,
     pub(super) path: CarrierPathKey,
-    pub(super) path_instance_id: ServerCarrierPathInstanceId,
+    pub(super) path_instance_id: CarrierPathInstanceId,
     pub(super) candidate: QuicCapacityProofCandidate,
 }
 
@@ -145,7 +144,7 @@ fn record_quic_capacity_lifecycle(
             reservation.binding_instance_id,
             reservation.path.underlay,
             reservation.path.path_id.0,
-            reservation.path_instance_id.0,
+            reservation.path_instance_id.as_u64(),
             reservation.token,
             reservation.train_bytes,
             reservation.sample_floor_bytes,
@@ -166,7 +165,7 @@ fn record_quic_capacity_lifecycle(
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub(super) struct ServerQuicCapacityCalibrationPathKey {
     pub(super) path: CarrierPathKey,
-    pub(super) path_instance_id: ServerCarrierPathInstanceId,
+    pub(super) path_instance_id: CarrierPathInstanceId,
 }
 
 #[derive(Debug, Default)]
@@ -179,7 +178,7 @@ impl ResponseQuicCapacityHistory {
     fn attempts_for_path(
         &self,
         path: CarrierPathKey,
-        path_instance_id: ServerCarrierPathInstanceId,
+        path_instance_id: CarrierPathInstanceId,
     ) -> u8 {
         self.attempts
             .get(&ServerQuicCapacityCalibrationPathKey {
@@ -193,7 +192,7 @@ impl ResponseQuicCapacityHistory {
     fn set_attempts_for_path(
         &mut self,
         path: CarrierPathKey,
-        path_instance_id: ServerCarrierPathInstanceId,
+        path_instance_id: CarrierPathInstanceId,
         attempts: u8,
     ) {
         let key = ServerQuicCapacityCalibrationPathKey {
@@ -210,7 +209,7 @@ impl ResponseQuicCapacityHistory {
     fn remove_attempts_for_path(
         &mut self,
         path: CarrierPathKey,
-        path_instance_id: ServerCarrierPathInstanceId,
+        path_instance_id: CarrierPathInstanceId,
     ) -> bool {
         self.attempts
             .remove(&ServerQuicCapacityCalibrationPathKey {
@@ -251,7 +250,7 @@ impl ServerPathLaneTrackerState {
         &self,
         session_id: SessionId,
         path: CarrierPathKey,
-        path_instance_id: ServerCarrierPathInstanceId,
+        path_instance_id: CarrierPathInstanceId,
     ) -> u8 {
         self.session(session_id)
             .map(|session| {
@@ -347,7 +346,7 @@ impl ServerPathLaneTracker {
         session_id: SessionId,
         binding_instance_id: u64,
         path: CarrierPathKey,
-        path_instance_id: ServerCarrierPathInstanceId,
+        path_instance_id: CarrierPathInstanceId,
         token: u64,
         expires_at: Instant,
     ) -> bool {
@@ -391,7 +390,7 @@ impl ServerPathLaneTracker {
         expected_generation: u64,
         binding_instance_id: u64,
         path: CarrierPathKey,
-        path_instance_id: ServerCarrierPathInstanceId,
+        path_instance_id: CarrierPathInstanceId,
         train_bytes: u64,
         session_byte_limit: u64,
         token: u64,
@@ -420,7 +419,7 @@ impl ServerPathLaneTracker {
         session_id: SessionId,
         binding_instance_id: u64,
         path: CarrierPathKey,
-        path_instance_id: ServerCarrierPathInstanceId,
+        path_instance_id: CarrierPathInstanceId,
         lease: Duration,
         token: u64,
     ) -> bool {
@@ -442,7 +441,7 @@ impl ServerPathLaneTracker {
         session_id: SessionId,
         binding_instance_id: u64,
         path: CarrierPathKey,
-        path_instance_id: ServerCarrierPathInstanceId,
+        path_instance_id: CarrierPathInstanceId,
     ) -> bool {
         let reservation = self
             .state
@@ -492,7 +491,7 @@ impl ServerPathLaneTracker {
         expected_generation: u64,
         binding_instance_id: u64,
         path: CarrierPathKey,
-        path_instance_id: ServerCarrierPathInstanceId,
+        path_instance_id: CarrierPathInstanceId,
         train_bytes: u64,
         sample_floor_bytes: u64,
         accounting_slack_bytes: u64,
@@ -578,7 +577,7 @@ impl ServerPathLaneTracker {
         session_id: SessionId,
         binding_instance_id: u64,
         path: CarrierPathKey,
-        path_instance_id: ServerCarrierPathInstanceId,
+        path_instance_id: CarrierPathInstanceId,
         token: u64,
     ) {
         let mut state = self.state.lock().expect("server path lane tracker lock");
@@ -630,7 +629,7 @@ impl ServerPathLaneTracker {
         &self,
         session_id: SessionId,
         path: CarrierPathKey,
-        path_instance_id: ServerCarrierPathInstanceId,
+        path_instance_id: CarrierPathInstanceId,
         candidate: QuicCapacityProofCandidate,
     ) -> Option<ServerQuicCapacityProofTicket> {
         let mut state = self.state.lock().expect("server path lane tracker lock");
@@ -783,7 +782,7 @@ impl ServerPathLaneTracker {
         session_id: SessionId,
         binding_instance_id: u64,
         path: CarrierPathKey,
-        path_instance_id: ServerCarrierPathInstanceId,
+        path_instance_id: CarrierPathInstanceId,
         expires_at: Instant,
         token: u64,
     ) -> bool {
@@ -820,7 +819,7 @@ impl ServerPathLaneTracker {
         session_id: SessionId,
         binding_instance_id: u64,
         path: CarrierPathKey,
-        path_instance_id: ServerCarrierPathInstanceId,
+        path_instance_id: CarrierPathInstanceId,
     ) {
         self.cancel_quic_capacity_calibration(
             session_id,
@@ -836,7 +835,7 @@ impl ServerPathLaneTracker {
         session_id: SessionId,
         binding_instance_id: u64,
         path: CarrierPathKey,
-        path_instance_id: ServerCarrierPathInstanceId,
+        path_instance_id: CarrierPathInstanceId,
         reason: &'static str,
     ) -> bool {
         let mut state = self.state.lock().expect("server path lane tracker lock");
@@ -915,7 +914,7 @@ impl ServerPathLaneTracker {
         &self,
         session_id: SessionId,
         path: CarrierPathKey,
-        path_instance_id: ServerCarrierPathInstanceId,
+        path_instance_id: CarrierPathInstanceId,
     ) {
         let mut state = self.state.lock().expect("server path lane tracker lock");
         let reservation_matches = state

@@ -22,6 +22,7 @@ use crate::model::admission::{
     bulk_service_product_envelope_payload_bytes,
 };
 use crate::model::capacity::QuicCapacityProofCandidate;
+use crate::model::path::CarrierPathInstanceId;
 use crate::model::{ResponseCandidateTailDebt, ResponseOrderedTail, ResponseSameFamilyReservoir};
 use crate::protocol::frame::reliable_stream_frame_accounted_bytes;
 use crate::runtime::stream::response::{
@@ -30,9 +31,8 @@ use crate::runtime::stream::response::{
     ResponseAckClockCalibrationRetirementRequest, ResponseDispatchTarget,
     ResponseQuicCapacityCalibrationRequest, ResponseSenderPathTarget, ResponseServiceFamilyLoads,
     ResponseServiceHandoffDrainRequest, ResponseServiceHandoffDrainReservation,
-    ResponseServiceHandoffMode, ResponseStreamBinding, ServerCarrierPathInstanceId,
-    quic_capacity_proof_pin_matches_marker, response_rate_fair_share_bps,
-    response_service_handoff_mode, server_bulk_output_eta_ms,
+    ResponseServiceHandoffMode, ResponseStreamBinding, quic_capacity_proof_pin_matches_marker,
+    response_rate_fair_share_bps, response_service_handoff_mode, server_bulk_output_eta_ms,
     valid_quic_capacity_proof_candidate_at,
 };
 use crate::scheduler::PathRateScope;
@@ -327,9 +327,9 @@ pub(super) struct ResponseServiceHandoffCommit {
     pub(super) model_generation: u64,
     pub(super) handoff_frontier: u64,
     pub(super) service: CarrierPathKey,
-    pub(super) service_path_instance_id: ServerCarrierPathInstanceId,
+    pub(super) service_path_instance_id: CarrierPathInstanceId,
     pub(super) service_incarnation: u64,
-    pub(super) target_path_instance_id: ServerCarrierPathInstanceId,
+    pub(super) target_path_instance_id: CarrierPathInstanceId,
     pub(super) mode: ResponseServiceHandoffMode,
     pub(super) target_command_pending_limit_bytes: u64,
     pub(super) capacity_proof: Option<QuicCapacityProofCandidate>,

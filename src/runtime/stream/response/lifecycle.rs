@@ -6,12 +6,11 @@ use super::delivery::ResponseAckOrderingState;
 use super::load::ServerResponseFlowRegistration;
 use super::session::ServerPathLaneTracker;
 use super::topology::{
-    ResponseStreamOutputEntry, ResponseStreamOutputs, ServerCarrierPathInstanceId,
-    next_server_carrier_path_instance_id, response_owner_underlay_seen_bit,
-    response_stream_role_reserves_flow_load,
+    ResponseStreamOutputEntry, ResponseStreamOutputs, next_server_carrier_path_instance_id,
+    response_owner_underlay_seen_bit, response_stream_role_reserves_flow_load,
 };
 use super::{NEXT_RESPONSE_STREAM_BINDING_INSTANCE_ID, ResponseStreamBinding};
-use crate::model::path::CarrierPathKey;
+use crate::model::path::{CarrierPathInstanceId, CarrierPathKey};
 use crate::mux::MuxLimits;
 use crate::protocol::{PathId, SessionId, StreamId, StreamOpenRole, UnderlayProtocol};
 use crate::runtime::path::commands::{ReliablePathCommand, ReliablePathCommandSender};
@@ -120,7 +119,7 @@ impl ResponseStreamBinding {
         lane: FlowLane,
         mux_limits: MuxLimits,
         lane_tracker: Arc<ServerPathLaneTracker>,
-        path_instance_id: ServerCarrierPathInstanceId,
+        path_instance_id: CarrierPathInstanceId,
     ) -> Arc<Self> {
         let (version, _) = watch::channel(0);
         let key = CarrierPathKey { underlay, path_id };

@@ -1,4 +1,5 @@
 use super::*;
+use crate::model::path::CarrierPathInstanceId;
 use crate::protocol::PathId;
 use std::sync::Arc;
 use std::time::Duration;
@@ -7,7 +8,7 @@ fn consume_capacity_attempt(
     tracker: &ServerPathLaneTracker,
     session_id: SessionId,
     path: CarrierPathKey,
-    path_instance_id: ServerCarrierPathInstanceId,
+    path_instance_id: CarrierPathInstanceId,
     token: u64,
 ) {
     let binding_instance_id = token;

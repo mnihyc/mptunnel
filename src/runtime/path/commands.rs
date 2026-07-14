@@ -1,7 +1,8 @@
 use super::*;
+use crate::model::path::CarrierPathInstanceId;
 use crate::protocol::frame::reliable_path_frame_pacing_bytes;
 use crate::runtime::stream::ReliablePathStream;
-use crate::runtime::stream::response::{ServerCarrierPathInstanceId, TcpCapacityProbeSessionLease};
+use crate::runtime::stream::response::TcpCapacityProbeSessionLease;
 use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, Ordering};
 
 // Bounded, lane-separated handoff from carrier-neutral scheduling to TCP or
@@ -119,7 +120,7 @@ pub(in crate::runtime) enum QuicCapacityProbeOwner {
     /// Server response discovery is scoped to the response binding instance.
     Response {
         binding_instance_id: u64,
-        path_instance_id: ServerCarrierPathInstanceId,
+        path_instance_id: CarrierPathInstanceId,
     },
 }
 
@@ -1073,7 +1074,7 @@ static NEXT_TCP_CAPACITY_CALIBRATION_ID: AtomicU64 = AtomicU64::new(1);
 #[derive(Debug, Clone, Copy)]
 pub(in crate::runtime) struct TcpCapacityProbeRequest {
     pub(in crate::runtime) path_id: PathId,
-    pub(in crate::runtime) path_instance_id: ServerCarrierPathInstanceId,
+    pub(in crate::runtime) path_instance_id: CarrierPathInstanceId,
     pub(in crate::runtime) train_payload_bytes: u64,
     pub(in crate::runtime) sample_floor_bytes: u64,
     pub(in crate::runtime) expires_at: Instant,
@@ -1102,7 +1103,7 @@ pub(in crate::runtime) enum TcpCapacityProbeOwner {
         path_instance: RelayPathInstance,
     },
     Response {
-        path_instance_id: ServerCarrierPathInstanceId,
+        path_instance_id: CarrierPathInstanceId,
     },
 }
 

@@ -46,13 +46,11 @@ use path::{
     ClientPathContext, ClientPathHealthRecord, PathDeliveryStats, RelayPathLoadLease,
     ReliableTcpRequestBulkFlowRegistration, RequestCapacityProbeCampaignBudget,
     RequestQuicCapacityProbeLease, RequestQuicCapacityProductHandoffState,
-    RequestTcpCapacityProbeLease, ServerPathContext, commands::*, model::*, proof::*,
-    tcp::capacity::*,
+    RequestTcpCapacityProbeLease, ServerPathContext, commands::*, model::*,
 };
 #[cfg(test)]
 use path::{ClientPathHealth, ClientPathState, UdpDatagramPathObservation};
 use prelude::*;
-use recent_ids::*;
 use relay::*;
 use relay_striping::*;
 use sender::*;

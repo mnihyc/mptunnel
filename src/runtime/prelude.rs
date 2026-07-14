@@ -1,6 +1,5 @@
 pub(super) use crate::config::{
-    ManagementConfig, MppPerformanceConfig, ResourceLimits, RouteTarget, RouteTargetKind,
-    SecurityConfig,
+    ManagementConfig, MppPerformanceConfig, RouteTarget, RouteTargetKind, SecurityConfig,
 };
 pub(super) use crate::ingress::http_connect::{self, HttpConnectError, HttpStatus};
 pub(super) use crate::ingress::socks5::{self, Socks5Error, Socks5Reply};
@@ -38,5 +37,5 @@ pub(super) use std::sync::{Arc, Mutex};
 pub(super) use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 pub(super) use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 pub(super) use tokio::net::{TcpListener, TcpStream, UdpSocket};
-pub(super) use tokio::sync::{Notify, mpsc, oneshot, watch};
+pub(super) use tokio::sync::{Notify, mpsc, oneshot};
 pub(super) use tun_rs::async_framed::{BytesCodec, DeviceFramed};

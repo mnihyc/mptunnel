@@ -54,5 +54,5 @@ impl TcpTelemetrySocket {
 }
 
 #[cfg(all(test, target_os = "linux"))]
-#[path = "linux_test.rs"]
+#[path = "tcp_telemetry/linux_test.rs"]
 mod tests;

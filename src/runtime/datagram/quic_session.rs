@@ -24,8 +24,8 @@ use crate::runtime::path::quic::io::{udp_path_finish_stream, udp_path_write_fram
 use crate::runtime::path::{
     ClientPathContext, ClientPathHealth, ClientPathHealthRecord, ClientPathState,
 };
-use crate::transport::PathSpec;
 use crate::transport::CarrierSocketProvider;
+use crate::transport::PathSpec;
 #[cfg(test)]
 use crate::transport::SystemCarrierSocketProvider;
 use bytes::Bytes;

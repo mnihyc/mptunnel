@@ -8,7 +8,7 @@ Use the platform command before installing a service or enabling TUN mode:
 mptunnel platform
 ```
 
-It prints the current OS/architecture, the TUN backend, privilege expectations, current TUN device status when it can be detected safely, the native service manager, and the release target matrix.
+It prints the current OS/architecture, the TUN backend, privilege expectations, current TUN device status when it can be detected safely, the native service or host lifecycle, and the release target matrix.
 
 ## Maintainability Gate
 
@@ -22,7 +22,7 @@ The threshold is 2,000 lines for tracked source and public documentation files. 
 
 ## Privileges
 
-SOCKS5 and HTTP CONNECT ingress can run as an ordinary user when binding unprivileged local ports. TUN mode needs elevated network privileges because it creates/configures a virtual network device.
+SOCKS5 and HTTP CONNECT ingress can run as an ordinary user when binding unprivileged local ports. Desktop TUN mode needs elevated network privileges because it creates/configures a virtual network device. Android instead requires user-approved `VpnService` consent and an embedding application to establish the device.
 
 Linux:
 
@@ -39,6 +39,14 @@ Windows:
 
 - TUN backend: Wintun through `tun-rs`.
 - TUN mode requires Administrator rights and the Wintun driver.
+
+Android embedding:
+
+- `VpnService.Builder.establish()` creates the TUN; the standalone mptunnel binary does not create an Android device.
+- The host implements `runtime::PacketDeviceProvider`, consumes the service's owned descriptor with `runtime::PacketDevice::from_owned_fd`, and passes the provider to `runtime::run_with_packet_device_provider`.
+- One descriptor is supplied for each configured TUN ingress. The provider transfers descriptor ownership to the runtime, which closes it when the packet device is dropped.
+- VPN permission, addresses, routes, MTU, descriptor revocation, JNI bindings, and application/service lifecycle remain host-owned. The host configuration must agree with the `TunL4Config` used by mptunnel's user-space stack.
+- The Android platform report describes this embedding requirement; it cannot inspect a future or application-owned descriptor.
 
 ## Service Mode
 
@@ -57,6 +65,8 @@ Supervisor knobs:
 - `--max-restarts` / `MPTUNNEL_MAX_RESTARTS`
 
 Use service-manager restart policies as the outer process guard and `--supervise` as the in-process guard for recoverable listener/device failures.
+
+On Android, the embedding application and `VpnService` own the outer lifecycle. The in-process supervisor does not replace Android service callbacks, descriptor revocation, or JNI shutdown coordination.
 
 ## Dual-Stack Networking
 
@@ -345,6 +355,8 @@ Release targets:
 - `aarch64-apple-darwin`
 - `x86_64-pc-windows-msvc`
 - `aarch64-pc-windows-msvc`
+
+CI performs a library-only Rust source check for `aarch64-linux-android` with the runner's Android NDK LTS toolchain. This proves that the Rust library and current dependencies compile for that target; it does not build an APK or Android release artifact, provide JNI/service glue, or exercise the `VpnService` TUN data path on a device.
 
 ## Tag Releases
 

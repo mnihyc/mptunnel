@@ -103,7 +103,16 @@ pub fn tun_privilege_hint() -> &'static str {
     {
         "requires Administrator rights and the Wintun driver for TUN mode"
     }
-    #[cfg(not(any(target_os = "linux", target_os = "macos", target_os = "windows")))]
+    #[cfg(target_os = "android")]
+    {
+        "requires VpnService consent and a host-provided owned TUN descriptor"
+    }
+    #[cfg(not(any(
+        target_os = "linux",
+        target_os = "macos",
+        target_os = "windows",
+        target_os = "android"
+    )))]
     {
         "TUN privilege requirements are platform-specific"
     }
@@ -122,7 +131,16 @@ fn tun_backend() -> &'static str {
     {
         "Windows Wintun via tun-rs"
     }
-    #[cfg(not(any(target_os = "linux", target_os = "macos", target_os = "windows")))]
+    #[cfg(target_os = "android")]
+    {
+        "Android VpnService descriptor via host PacketDeviceProvider"
+    }
+    #[cfg(not(any(
+        target_os = "linux",
+        target_os = "macos",
+        target_os = "windows",
+        target_os = "android"
+    )))]
     {
         "platform TUN via tun-rs"
     }
@@ -141,7 +159,16 @@ fn service_manager() -> &'static str {
     {
         "Windows Service Control Manager"
     }
-    #[cfg(not(any(target_os = "linux", target_os = "macos", target_os = "windows")))]
+    #[cfg(target_os = "android")]
+    {
+        "Android VpnService host lifecycle"
+    }
+    #[cfg(not(any(
+        target_os = "linux",
+        target_os = "macos",
+        target_os = "windows",
+        target_os = "android"
+    )))]
     {
         "external supervisor"
     }
@@ -173,7 +200,17 @@ fn tun_device_status() -> String {
     "Wintun availability is checked when the TUN device is created".to_string()
 }
 
-#[cfg(not(any(target_os = "linux", target_os = "macos", target_os = "windows")))]
+#[cfg(target_os = "android")]
+fn tun_device_status() -> String {
+    "requires a configured TUN descriptor from the embedding VpnService host".to_string()
+}
+
+#[cfg(not(any(
+    target_os = "linux",
+    target_os = "macos",
+    target_os = "windows",
+    target_os = "android"
+)))]
 fn tun_device_status() -> String {
     "TUN device status is not checked on this platform".to_string()
 }

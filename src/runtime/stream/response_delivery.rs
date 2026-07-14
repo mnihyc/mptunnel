@@ -90,7 +90,9 @@ pub(in crate::runtime) struct ResponseAckOrderingState {
 pub(in crate::runtime) struct ResponseAckOrderingUpdate {
     pub(super) changed: bool,
     pub(super) contiguous_frontier: u64,
-    #[cfg_attr(not(feature = "lab-diagnostics"), allow(dead_code))]
+    /// Hole volume is observation-only; ordering still computes it locally to
+    /// detect semantic state changes in every build.
+    #[cfg(feature = "lab-diagnostics")]
     pub(super) acked_hole_bytes: u64,
     pub(super) newly_contiguous: Vec<CarrierPathAckedHole>,
 }
@@ -142,6 +144,7 @@ impl ResponseAckOrderingState {
                 || previous_hole_bytes != acked_hole_bytes
                 || !newly_contiguous.is_empty(),
             contiguous_frontier: self.contiguous_frontier,
+            #[cfg(feature = "lab-diagnostics")]
             acked_hole_bytes,
             newly_contiguous,
         }

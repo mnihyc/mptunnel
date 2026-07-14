@@ -406,6 +406,7 @@ impl ResponseAckClockCalibrationState {
             .saturating_sub(self.stage_rate_ineligible_bytes)
     }
 
+    #[cfg(any(test, feature = "lab-diagnostics"))]
     pub(super) fn stage_rate_sample_count(&self) -> u8 {
         self.stage_rate_sample_count
     }
@@ -417,6 +418,144 @@ impl ResponseAckClockCalibrationState {
         self.stage_authorized_spent_bytes = self.spent_bytes;
         self.retired = true;
     }
+}
+
+#[cfg(feature = "lab-diagnostics")]
+#[derive(Clone, Copy)]
+struct ResponseAckClockWindowDiagnostic {
+    strict_rate_sample: Option<PathRateSample>,
+    window_bytes: u64,
+    fresh_window_bytes: u64,
+    first_window: bool,
+    earliest_sent_at: Instant,
+    previous_ack_at: Option<Instant>,
+    latest_sent_at: Instant,
+    before: ResponseAckClockCalibrationState,
+    after: ResponseAckClockCalibrationState,
+    credit_grew: bool,
+}
+
+#[cfg(feature = "lab-diagnostics")]
+fn emit_response_ack_clock_window_diagnostic(
+    diagnostic: ResponseAckClockWindowDiagnostic,
+    session_id: u64,
+    binding_instance_id: u64,
+    key: CarrierPathKey,
+    output_incarnation: u64,
+    now: Instant,
+) {
+    // Derive observation-only projections from the captured pre-mutation state
+    // so the calibration algorithm remains the sole mutation authority.
+    let sample_bps = diagnostic
+        .strict_rate_sample
+        .map(PathRateSample::rate_bps)
+        .unwrap_or(0.0);
+    let sample_elapsed = diagnostic
+        .strict_rate_sample
+        .map(PathRateSample::elapsed)
+        .unwrap_or(Duration::ZERO);
+    let stage_authorized_at = diagnostic.before.stage_authorized_at;
+    let stage_authorized_spent_bytes = diagnostic.before.stage_authorized_spent_bytes;
+    let stage_credit_bytes = diagnostic.before.stage_credit_bytes();
+    let stage_window_eligible = diagnostic.earliest_sent_at >= stage_authorized_at;
+    let stage_rate_evidence_accepted = stage_window_eligible
+        && diagnostic.strict_rate_sample.is_some()
+        && diagnostic.fresh_window_bytes == diagnostic.window_bytes;
+    let stage_evidence_bytes = if stage_rate_evidence_accepted {
+        diagnostic
+            .before
+            .stage_rate_evidence_bytes
+            .saturating_add(diagnostic.window_bytes)
+    } else {
+        diagnostic.before.stage_rate_evidence_bytes
+    };
+    let stage_evidence_elapsed = if stage_rate_evidence_accepted {
+        diagnostic
+            .before
+            .stage_rate_evidence_elapsed
+            .saturating_add(sample_elapsed)
+    } else {
+        diagnostic.before.stage_rate_evidence_elapsed
+    };
+    let stage_rate_ineligible_bytes =
+        if diagnostic.fresh_window_bytes > 0 && !stage_rate_evidence_accepted {
+            diagnostic
+                .before
+                .stage_rate_ineligible_bytes
+                .saturating_add(diagnostic.fresh_window_bytes)
+        } else {
+            diagnostic.before.stage_rate_ineligible_bytes
+        };
+    let stage_fully_spent = diagnostic.before.spent_bytes >= diagnostic.before.credit_limit_bytes;
+    let stage_strict_capacity_bytes =
+        stage_credit_bytes.saturating_sub(stage_rate_ineligible_bytes);
+    let aggregate_rate_bps = (stage_fully_spent
+        && stage_strict_capacity_bytes >= diagnostic.before.stage_rate_coverage_floor_bytes
+        && stage_evidence_bytes >= diagnostic.before.stage_rate_coverage_floor_bytes)
+        .then(|| {
+            stage_evidence_bytes as f64 * 8.0
+                / stage_evidence_elapsed
+                    .max(TRANSPORT_TIMER_GRANULARITY)
+                    .as_secs_f64()
+        })
+        .unwrap_or(0.0);
+    let stage_rate_sample_accepted =
+        diagnostic.after.stage_rate_sample_count() > diagnostic.before.stage_rate_sample_count();
+
+    lab_diagnostic(
+        "response_ack_clock_calibration",
+        format_args!(
+            "phase=ack_clock_window session_id={} binding_instance_id={} underlay={:?} path_id={} incarnation={} rate_bps={} sample_bytes={} fresh_sample_bytes={} sample_elapsed_us={} calibrated_rate_bps={} calibrated_rate_ready={} first_window={} strict_rate_window={} stage_window_eligible={} stage_rate_evidence_accepted={} stage_fully_spent={} stage_rate_sample_accepted={} stage_evidence_bytes={} stage_evidence_elapsed_us={} stage_rate_ineligible_bytes={} stage_rate_coverage_floor_bytes={} stage_authorized_spent_bytes={} stage_credit_bytes={} stage_strict_capacity_bytes={} aggregate_rate_bps={} spent_bytes={} credit_limit_bytes={} max_limit_bytes={} credit_grew={} proven={} stage_authorized_age_us={} earliest_sent_age_us={} previous_ack_age_us={} latest_sent_age_us={} stage_provenance_slack_us={} causal_slack_us={}",
+            session_id,
+            binding_instance_id,
+            key.underlay,
+            key.path_id.0,
+            output_incarnation,
+            sample_bps,
+            diagnostic.window_bytes,
+            diagnostic.fresh_window_bytes,
+            sample_elapsed.as_micros(),
+            diagnostic.after.calibrated_rate_bps.unwrap_or(0.0),
+            diagnostic.after.calibrated_rate_bps.is_some(),
+            diagnostic.first_window,
+            diagnostic.strict_rate_sample.is_some(),
+            stage_window_eligible,
+            stage_rate_evidence_accepted,
+            stage_fully_spent,
+            stage_rate_sample_accepted,
+            stage_evidence_bytes,
+            stage_evidence_elapsed.as_micros(),
+            stage_rate_ineligible_bytes,
+            diagnostic.after.stage_rate_coverage_floor_bytes,
+            stage_authorized_spent_bytes,
+            stage_credit_bytes,
+            stage_strict_capacity_bytes,
+            aggregate_rate_bps,
+            diagnostic.after.spent_bytes,
+            diagnostic.after.credit_limit_bytes,
+            diagnostic.after.max_limit_bytes,
+            diagnostic.credit_grew,
+            diagnostic.after.proven,
+            now.saturating_duration_since(stage_authorized_at)
+                .as_micros(),
+            now.saturating_duration_since(diagnostic.earliest_sent_at)
+                .as_micros(),
+            diagnostic.previous_ack_at.map_or(0, |acked_at| {
+                now.saturating_duration_since(acked_at).as_micros()
+            }),
+            now.saturating_duration_since(diagnostic.latest_sent_at)
+                .as_micros(),
+            diagnostic
+                .earliest_sent_at
+                .saturating_duration_since(stage_authorized_at)
+                .as_micros(),
+            diagnostic.previous_ack_at.map_or(0, |acked_at| {
+                acked_at
+                    .saturating_duration_since(diagnostic.latest_sent_at)
+                    .as_micros()
+            }),
+        ),
+    );
 }
 
 /// Applies product ACK rate and calibration feedback to already-locked outputs.
@@ -477,115 +616,57 @@ pub(super) fn apply_response_ack_clock_release_samples(
             )),
             _ => None,
         };
-        let calibration_update = ack_clock_window.and_then(
-            |(
+        let mut calibration_window_applied = false;
+        #[cfg(feature = "lab-diagnostics")]
+        let mut calibration_diagnostic = None;
+        if let Some((
+            strict_rate_sample,
+            window_bytes,
+            fresh_window_bytes,
+            _first_window,
+            earliest_sent_at,
+            _previous_ack_at,
+            _latest_sent_at,
+        )) = ack_clock_window
+            && let Some(calibration) = outputs.ack_clock_calibrations.get_mut(&identity)
+        {
+            #[cfg(debug_assertions)]
+            let previous_credit = calibration.credit_limit_bytes;
+            #[cfg(feature = "lab-diagnostics")]
+            let calibration_before = *calibration;
+            let credit_grew = calibration.record_ack_clock_window(
                 strict_rate_sample,
                 window_bytes,
                 fresh_window_bytes,
-                first_window,
                 earliest_sent_at,
-                previous_ack_at,
-                latest_sent_at,
-            )| {
-                outputs
-                    .ack_clock_calibrations
-                    .get_mut(&identity)
-                    .map(|calibration| {
-                        let sample_bps = strict_rate_sample
-                            .map(PathRateSample::rate_bps)
-                            .unwrap_or(0.0);
-                        let sample_elapsed = strict_rate_sample
-                            .map(PathRateSample::elapsed)
-                            .unwrap_or(Duration::ZERO);
-                        let previous_credit = calibration.credit_limit_bytes;
-                        let stage_authorized_at = calibration.stage_authorized_at;
-                        let stage_authorized_spent_bytes = calibration.stage_authorized_spent_bytes;
-                        let stage_credit_bytes = calibration.stage_credit_bytes();
-                        let stage_window_eligible = earliest_sent_at >= stage_authorized_at;
-                        let stage_rate_evidence_accepted = stage_window_eligible
-                            && strict_rate_sample.is_some()
-                            && fresh_window_bytes == window_bytes;
-                        let stage_evidence_bytes = if stage_rate_evidence_accepted {
-                            calibration
-                                .stage_rate_evidence_bytes
-                                .saturating_add(window_bytes)
-                        } else {
-                            calibration.stage_rate_evidence_bytes
-                        };
-                        let stage_evidence_elapsed = if stage_rate_evidence_accepted {
-                            calibration
-                                .stage_rate_evidence_elapsed
-                                .saturating_add(sample_elapsed)
-                        } else {
-                            calibration.stage_rate_evidence_elapsed
-                        };
-                        let stage_rate_ineligible_bytes =
-                            if fresh_window_bytes > 0 && !stage_rate_evidence_accepted {
-                                calibration
-                                    .stage_rate_ineligible_bytes
-                                    .saturating_add(fresh_window_bytes)
-                            } else {
-                                calibration.stage_rate_ineligible_bytes
-                            };
-                        let stage_fully_spent =
-                            calibration.spent_bytes >= calibration.credit_limit_bytes;
-                        let stage_strict_capacity_bytes =
-                            stage_credit_bytes.saturating_sub(stage_rate_ineligible_bytes);
-                        let previous_stage_rate_sample_count =
-                            calibration.stage_rate_sample_count();
-                        let aggregate_rate_bps = (stage_fully_spent
-                            && stage_strict_capacity_bytes
-                                >= calibration.stage_rate_coverage_floor_bytes
-                            && stage_evidence_bytes >= calibration.stage_rate_coverage_floor_bytes)
-                            .then(|| {
-                                stage_evidence_bytes as f64 * 8.0
-                                    / stage_evidence_elapsed
-                                        .max(TRANSPORT_TIMER_GRANULARITY)
-                                        .as_secs_f64()
-                            })
-                            .unwrap_or(0.0);
-                        let credit_grew = calibration.record_ack_clock_window(
-                            strict_rate_sample,
-                            window_bytes,
-                            fresh_window_bytes,
-                            earliest_sent_at,
-                            now,
-                        );
-                        debug_assert_eq!(
-                            credit_grew,
-                            calibration.credit_limit_bytes > previous_credit
-                        );
-                        let stage_rate_sample_accepted = calibration.stage_rate_sample_count()
-                            > previous_stage_rate_sample_count;
-                        (
-                            sample_bps,
-                            *calibration,
-                            credit_grew,
-                            first_window,
-                            strict_rate_sample.is_some(),
-                            stage_window_eligible,
-                            stage_rate_evidence_accepted,
-                            stage_fully_spent,
-                            stage_rate_sample_accepted,
-                            window_bytes,
-                            fresh_window_bytes,
-                            sample_elapsed,
-                            stage_evidence_bytes,
-                            stage_evidence_elapsed,
-                            stage_rate_ineligible_bytes,
-                            calibration.stage_rate_coverage_floor_bytes,
-                            stage_authorized_spent_bytes,
-                            stage_credit_bytes,
-                            stage_strict_capacity_bytes,
-                            aggregate_rate_bps,
-                            stage_authorized_at,
-                            earliest_sent_at,
-                            previous_ack_at,
-                            latest_sent_at,
-                        )
-                    })
-            },
-        );
+                now,
+            );
+            #[cfg(debug_assertions)]
+            debug_assert_eq!(
+                credit_grew,
+                calibration.credit_limit_bytes > previous_credit
+            );
+            // Policy only distinguishes whether this exact calibration window
+            // found live state; detailed projections belong to diagnostics.
+            calibration_window_applied = true;
+            #[cfg(feature = "lab-diagnostics")]
+            {
+                calibration_diagnostic = Some(ResponseAckClockWindowDiagnostic {
+                    strict_rate_sample,
+                    window_bytes,
+                    fresh_window_bytes,
+                    first_window: _first_window,
+                    earliest_sent_at,
+                    previous_ack_at: _previous_ack_at,
+                    latest_sent_at: _latest_sent_at,
+                    before: calibration_before,
+                    after: *calibration,
+                    credit_grew,
+                });
+            }
+            #[cfg(not(any(debug_assertions, feature = "lab-diagnostics")))]
+            let _ = credit_grew;
+        }
         let calibration_snapshot = outputs.ack_clock_calibrations.get(&identity).copied();
         let calibration_identity_active = outputs.active_ack_clock_calibration == Some(identity);
         if let Some(entry) = outputs
@@ -627,7 +708,7 @@ pub(super) fn apply_response_ack_clock_release_samples(
             let mut ordinary_tcp_rate_replaces_capacity_prior = false;
             if entry.key.underlay == UnderlayProtocol::Tcp
                 && !calibration_identity_active
-                && calibration_update.is_none()
+                && !calibration_window_applied
                 && tcp_ack_clock_window_complete
                 && let Some(prior) = entry.tcp_capacity_prior.as_mut()
             {
@@ -644,7 +725,7 @@ pub(super) fn apply_response_ack_clock_release_samples(
             // exact-ACK epoch reaches the normal evidence threshold.
             let tcp_measurement_owns_rate = entry.key.underlay == UnderlayProtocol::Tcp
                 && (calibration_identity_active
-                    || calibration_update.is_some()
+                    || calibration_window_applied
                     || entry.tcp_capacity_prior.is_some()
                     || calibration_snapshot
                         .is_some_and(|calibration| !calibration.proven && !calibration.retired));
@@ -683,180 +764,135 @@ pub(super) fn apply_response_ack_clock_release_samples(
                 entry.delivery_rate_bps = Some(calibrated_rate_bps);
             }
         }
-        if let Some((
-            sample_bps,
-            calibration,
-            credit_grew,
-            first_window,
-            strict_rate_window,
-            stage_window_eligible,
-            stage_rate_evidence_accepted,
-            stage_fully_spent,
-            stage_rate_sample_accepted,
-            sample_bytes,
-            fresh_sample_bytes,
-            sample_elapsed,
-            stage_evidence_bytes,
-            stage_evidence_elapsed,
-            stage_rate_ineligible_bytes,
-            stage_rate_coverage_floor_bytes,
-            stage_authorized_spent_bytes,
-            stage_credit_bytes,
-            stage_strict_capacity_bytes,
-            aggregate_rate_bps,
-            stage_authorized_at,
-            earliest_sent_at,
-            previous_ack_at,
-            latest_sent_at,
-        )) = calibration_update
-        {
-            #[cfg(not(feature = "lab-diagnostics"))]
-            let _ = (
-                sample_bps,
-                calibration,
-                credit_grew,
-                first_window,
-                strict_rate_window,
-                stage_window_eligible,
-                stage_rate_evidence_accepted,
-                stage_fully_spent,
-                stage_rate_sample_accepted,
-                sample_bytes,
-                fresh_sample_bytes,
-                sample_elapsed,
-                stage_evidence_bytes,
-                stage_evidence_elapsed,
-                stage_rate_ineligible_bytes,
-                stage_rate_coverage_floor_bytes,
-                stage_authorized_spent_bytes,
-                stage_credit_bytes,
-                stage_strict_capacity_bytes,
-                aggregate_rate_bps,
-                stage_authorized_at,
-                earliest_sent_at,
-                previous_ack_at,
-                latest_sent_at,
-            );
-            #[cfg(feature = "lab-diagnostics")]
-            lab_diagnostic(
-                "response_ack_clock_calibration",
-                format_args!(
-                    "phase=ack_clock_window session_id={} binding_instance_id={} underlay={:?} path_id={} incarnation={} rate_bps={} sample_bytes={} fresh_sample_bytes={} sample_elapsed_us={} calibrated_rate_bps={} calibrated_rate_ready={} first_window={} strict_rate_window={} stage_window_eligible={} stage_rate_evidence_accepted={} stage_fully_spent={} stage_rate_sample_accepted={} stage_evidence_bytes={} stage_evidence_elapsed_us={} stage_rate_ineligible_bytes={} stage_rate_coverage_floor_bytes={} stage_authorized_spent_bytes={} stage_credit_bytes={} stage_strict_capacity_bytes={} aggregate_rate_bps={} spent_bytes={} credit_limit_bytes={} max_limit_bytes={} credit_grew={} proven={} stage_authorized_age_us={} earliest_sent_age_us={} previous_ack_age_us={} latest_sent_age_us={} stage_provenance_slack_us={} causal_slack_us={}",
-                    _session_id,
-                    _binding_instance_id,
-                    key.underlay,
-                    key.path_id.0,
-                    output_incarnation,
-                    sample_bps,
-                    sample_bytes,
-                    fresh_sample_bytes,
-                    sample_elapsed.as_micros(),
-                    calibration.calibrated_rate_bps.unwrap_or(0.0),
-                    calibration.calibrated_rate_bps.is_some(),
-                    first_window,
-                    strict_rate_window,
-                    stage_window_eligible,
-                    stage_rate_evidence_accepted,
-                    stage_fully_spent,
-                    stage_rate_sample_accepted,
-                    stage_evidence_bytes,
-                    stage_evidence_elapsed.as_micros(),
-                    stage_rate_ineligible_bytes,
-                    stage_rate_coverage_floor_bytes,
-                    stage_authorized_spent_bytes,
-                    stage_credit_bytes,
-                    stage_strict_capacity_bytes,
-                    aggregate_rate_bps,
-                    calibration.spent_bytes,
-                    calibration.credit_limit_bytes,
-                    calibration.max_limit_bytes,
-                    credit_grew,
-                    calibration.proven,
-                    now.saturating_duration_since(stage_authorized_at)
-                        .as_micros(),
-                    now.saturating_duration_since(earliest_sent_at).as_micros(),
-                    previous_ack_at.map_or(0, |acked_at| {
-                        now.saturating_duration_since(acked_at).as_micros()
-                    }),
-                    now.saturating_duration_since(latest_sent_at).as_micros(),
-                    earliest_sent_at
-                        .saturating_duration_since(stage_authorized_at)
-                        .as_micros(),
-                    previous_ack_at.map_or(0, |acked_at| {
-                        acked_at
-                            .saturating_duration_since(latest_sent_at)
-                            .as_micros()
-                    }),
-                ),
+        #[cfg(feature = "lab-diagnostics")]
+        if let Some(diagnostic) = calibration_diagnostic {
+            emit_response_ack_clock_window_diagnostic(
+                diagnostic,
+                _session_id,
+                _binding_instance_id,
+                key,
+                output_incarnation,
+                now,
             );
         }
     }
     if !active_calibration_has_owner_flights
         && let Some(identity) = outputs.active_ack_clock_calibration
     {
+        // Drain reasons and the previous ceiling are observation-only; the
+        // default path retains only the calibrated rate used by policy.
+        #[cfg(feature = "lab-diagnostics")]
         let previous_credit = outputs
             .ack_clock_calibrations
             .get(&identity)
             .map_or(0, |calibration| calibration.credit_limit_bytes);
+        // Only the calibrated rate crosses into policy; the full state exists
+        // solely to explain the transition in lab diagnostics.
+        let mut transition_rate_bps = None;
+        #[cfg(feature = "lab-diagnostics")]
         let mut transition_snapshot = None;
-        let (clear_active, terminal_reason) =
-            match outputs.ack_clock_calibrations.get_mut(&identity) {
-                None => (true, "missing_state"),
-                Some(calibration) => {
-                    if calibration.proven {
+        #[cfg(feature = "lab-diagnostics")]
+        let mut terminal_reason = "credit_remaining";
+        let clear_active = match outputs.ack_clock_calibrations.get_mut(&identity) {
+            None => {
+                #[cfg(feature = "lab-diagnostics")]
+                {
+                    terminal_reason = "missing_state";
+                }
+                true
+            }
+            Some(calibration) => {
+                if calibration.proven {
+                    transition_rate_bps = calibration.calibrated_rate_bps;
+                    #[cfg(feature = "lab-diagnostics")]
+                    {
                         transition_snapshot = Some(*calibration);
-                        (
-                            true,
-                            if calibration.calibrated_rate_bps.is_some() {
+                    }
+                    #[cfg(feature = "lab-diagnostics")]
+                    {
+                        terminal_reason = if calibration.calibrated_rate_bps.is_some() {
+                            "robust_rate"
+                        } else {
+                            "hard_ceiling_no_rate"
+                        };
+                    }
+                    true
+                } else if calibration.retired {
+                    transition_rate_bps = calibration.calibrated_rate_bps;
+                    #[cfg(feature = "lab-diagnostics")]
+                    {
+                        transition_snapshot = Some(*calibration);
+                    }
+                    #[cfg(feature = "lab-diagnostics")]
+                    {
+                        terminal_reason = "retired_drain";
+                    }
+                    true
+                } else {
+                    #[cfg(feature = "lab-diagnostics")]
+                    let previous_stage_rate_samples = calibration.stage_rate_sample_count();
+                    if calibration.advance_drained_stage(now) {
+                        #[cfg(feature = "lab-diagnostics")]
+                        let accepted_stage =
+                            calibration.stage_rate_sample_count() > previous_stage_rate_samples;
+                        #[cfg(feature = "lab-diagnostics")]
+                        {
+                            transition_snapshot = Some(*calibration);
+                            terminal_reason = if accepted_stage {
+                                "drain_stage_advance"
+                            } else {
+                                "drain_reachability_topup"
+                            };
+                        }
+                        false
+                    } else if calibration.proven {
+                        transition_rate_bps = calibration.calibrated_rate_bps;
+                        #[cfg(feature = "lab-diagnostics")]
+                        {
+                            transition_snapshot = Some(*calibration);
+                        }
+                        #[cfg(feature = "lab-diagnostics")]
+                        {
+                            terminal_reason = if calibration.calibrated_rate_bps.is_some() {
                                 "robust_rate"
                             } else {
                                 "hard_ceiling_no_rate"
-                            },
-                        )
-                    } else if calibration.retired {
-                        transition_snapshot = Some(*calibration);
-                        (true, "retired_drain")
-                    } else {
-                        let previous_stage_rate_samples = calibration.stage_rate_sample_count();
-                        if calibration.advance_drained_stage(now) {
-                            let accepted_stage =
-                                calibration.stage_rate_sample_count() > previous_stage_rate_samples;
-                            transition_snapshot = Some(*calibration);
-                            (
-                                false,
-                                if accepted_stage {
-                                    "drain_stage_advance"
-                                } else {
-                                    "drain_reachability_topup"
-                                },
-                            )
-                        } else if calibration.proven {
-                            transition_snapshot = Some(*calibration);
-                            (
-                                true,
-                                if calibration.calibrated_rate_bps.is_some() {
-                                    "robust_rate"
-                                } else {
-                                    "hard_ceiling_no_rate"
-                                },
-                            )
-                        } else if calibration.spent_bytes >= calibration.max_limit_bytes {
-                            transition_snapshot = Some(*calibration);
-                            calibration.retire();
-                            (true, "hard_ceiling_drain")
-                        } else if calibration.spent_bytes >= calibration.credit_limit_bytes {
-                            transition_snapshot = Some(*calibration);
-                            calibration.retire();
-                            (true, "under_covered_drain")
-                        } else {
-                            (false, "credit_remaining")
+                            };
                         }
+                        true
+                    } else if calibration.spent_bytes >= calibration.max_limit_bytes {
+                        transition_rate_bps = calibration.calibrated_rate_bps;
+                        #[cfg(feature = "lab-diagnostics")]
+                        {
+                            transition_snapshot = Some(*calibration);
+                        }
+                        calibration.retire();
+                        #[cfg(feature = "lab-diagnostics")]
+                        {
+                            terminal_reason = "hard_ceiling_drain";
+                        }
+                        true
+                    } else if calibration.spent_bytes >= calibration.credit_limit_bytes {
+                        transition_rate_bps = calibration.calibrated_rate_bps;
+                        #[cfg(feature = "lab-diagnostics")]
+                        {
+                            transition_snapshot = Some(*calibration);
+                        }
+                        calibration.retire();
+                        #[cfg(feature = "lab-diagnostics")]
+                        {
+                            terminal_reason = "under_covered_drain";
+                        }
+                        true
+                    } else {
+                        false
                     }
                 }
-            };
+            }
+        };
+        #[cfg(feature = "lab-diagnostics")]
         if clear_active || terminal_reason != "credit_remaining" {
             let terminal = transition_snapshot;
-            #[cfg(feature = "lab-diagnostics")]
             lab_diagnostic(
                 "response_ack_clock_calibration",
                 format_args!(
@@ -889,9 +925,7 @@ pub(super) fn apply_response_ack_clock_release_samples(
                     terminal.is_some_and(|state| state.retired),
                 ),
             );
-            #[cfg(not(feature = "lab-diagnostics"))]
-            let _ = (terminal_reason, terminal, previous_credit);
-        };
+        }
         if clear_active {
             outputs.active_ack_clock_calibration = None;
             if let Some(entry) = outputs
@@ -903,9 +937,8 @@ pub(super) fn apply_response_ack_clock_release_samples(
                 // ACK clock that will eventually replace its startup prior.
                 entry.tcp_product_rate_evidence = None;
                 entry.tcp_ack_clock_rate_bps = None;
-                entry.tcp_capacity_prior = transition_snapshot
-                    .and_then(|state| state.calibrated_rate_bps)
-                    .map(|rate_bps| TcpResponseCapacityPrior {
+                entry.tcp_capacity_prior =
+                    transition_rate_bps.map(|rate_bps| TcpResponseCapacityPrior {
                         rate_bps,
                         ordinary_windows: 0,
                     });

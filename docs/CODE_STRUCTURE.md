@@ -152,6 +152,13 @@ Platform-specific code is a narrow adapter for a real host facility, such as
 Linux TCP telemetry or packet-device construction. Optional telemetry must have
 a typed portable fallback; it must not become an eligibility requirement.
 
+Packet-device acquisition and carrier-socket creation are separate host
+capabilities. A carrier-socket adapter may bind a source address or native
+network and may protect a socket from an Android VPN route before connect. TCP
+and QUIC consume that neutral socket capability; neither scheduling policy nor
+stream state may inspect an interface name, file descriptor, or OS network
+handle.
+
 Windows client with Linux server, Linux, macOS, and Android are supported design
 targets even when a local lab exercises fewer hosts. Keep target `cfg` blocks at
 adapter boundaries and never branch product policy by operating system.

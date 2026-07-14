@@ -8,10 +8,11 @@ use crate::runtime::ingress_runtime::{
     probe_tcp_client_path, probe_udp_client_path, run_http_connect_client_ingress,
     run_socks5_client_ingress,
 };
-use crate::runtime::management::run_client_management_api;
+use crate::runtime::management::spawn_client_management_services;
 use crate::runtime::packet_device::PacketDeviceProvider;
 use crate::runtime::path::ClientPathContext;
 use crate::runtime::tun_l4::run_tun_l4_client;
+use crate::transport::CarrierSocketProvider;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -20,30 +21,50 @@ pub(super) async fn run(
     resources: ResourceLimits,
     management: ManagementConfig,
     packet_devices: Arc<dyn PacketDeviceProvider>,
+    carrier_sockets: Arc<dyn CarrierSocketProvider>,
 ) -> Result<(), RuntimeError> {
     let path_probe_interval = client.path_probe_interval;
     let path_probe_timeout = client.path_probe_timeout;
-    let context = new_path_context(&client, resources)?;
-    start_path_probes(context.clone(), path_probe_interval, path_probe_timeout);
-    let mut ingresses = tokio::task::JoinSet::new();
+    let context = new_path_context(&client, resources, carrier_sockets)?;
+    let mut services = tokio::task::JoinSet::new();
     if management.enabled() {
-        let context = context.clone();
-        ingresses.spawn(async move { run_client_management_api(management, context).await });
+        spawn_client_management_services(management, context.clone(), &mut services);
     }
-    spawn_ingresses(client.ingresses, context, packet_devices, &mut ingresses);
-    wait_for_ingress(ingresses).await
+    spawn_ingresses(
+        client.ingresses,
+        context.clone(),
+        packet_devices,
+        &mut services,
+    );
+    if services.is_empty() {
+        return Err(RuntimeError::Protocol("client has no ingress tasks"));
+    }
+    spawn_path_probe_service(
+        context,
+        path_probe_interval,
+        path_probe_timeout,
+        &mut services,
+    );
+    super::supervise_runtime_services(
+        services,
+        "client ingress exited",
+        "client has no ingress tasks",
+    )
+    .await
 }
 
 pub(super) fn new_path_context(
     client: &ClientConfig,
     resources: ResourceLimits,
+    carrier_sockets: Arc<dyn CarrierSocketProvider>,
 ) -> Result<ClientPathContext, RuntimeError> {
-    ClientPathContext::new_with_path_configs_and_target(
+    ClientPathContext::new_with_carrier_sockets(
         client.paths.clone(),
         resources,
         ProxyAuthConfig::disabled(),
         client.route_target.clone(),
         client.ingresses.clone(),
+        carrier_sockets,
     )
 }
 
@@ -77,27 +98,21 @@ pub(super) fn spawn_ingresses(
     }
 }
 
-async fn wait_for_ingress(
-    mut ingresses: tokio::task::JoinSet<Result<(), RuntimeError>>,
+pub(super) fn spawn_path_probe_service(
+    context: ClientPathContext,
+    interval: Duration,
+    timeout: Duration,
+    services: &mut tokio::task::JoinSet<Result<(), RuntimeError>>,
+) {
+    // Probes share node supervision so a restart cannot update stale path state.
+    services.spawn(run_path_probes(context, interval, timeout));
+}
+
+async fn run_path_probes(
+    context: ClientPathContext,
+    interval: Duration,
+    timeout: Duration,
 ) -> Result<(), RuntimeError> {
-    if let Some(result) = ingresses.join_next().await {
-        match result {
-            Ok(Ok(())) => Err(RuntimeError::Protocol("client ingress exited")),
-            Ok(Err(err)) => Err(err),
-            Err(err) => Err(RuntimeError::TaskJoin(err)),
-        }
-    } else {
-        Err(RuntimeError::Protocol("client has no ingress tasks"))
-    }
-}
-
-pub(super) fn start_path_probes(context: ClientPathContext, interval: Duration, timeout: Duration) {
-    tokio::spawn(async move {
-        run_path_probes(context, interval, timeout).await;
-    });
-}
-
-async fn run_path_probes(context: ClientPathContext, interval: Duration, timeout: Duration) {
     let mut ticker = tokio::time::interval(interval);
     ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     loop {

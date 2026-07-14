@@ -52,15 +52,27 @@ pub(super) async fn run_tun_tcp_listener(
     mut listener: TunTcpListener,
     context: ClientPathContext,
 ) -> Result<(), RuntimeError> {
-    while let Some((stream, local, remote)) = listener.next().await {
-        let context = context.clone();
-        tokio::spawn(async move {
-            if let Err(err) = handle_tun_tcp_stream(stream, local, remote, context).await {
-                eprintln!("warning: TUN TCP flow {local} -> {remote} failed: {err}");
+    let mut flows = tokio::task::JoinSet::new();
+    loop {
+        tokio::select! {
+            accepted = listener.next() => {
+                let Some((stream, local, remote)) = accepted else {
+                    return Ok(());
+                };
+                let context = context.clone();
+                flows.spawn(async move {
+                    if let Err(err) = handle_tun_tcp_stream(stream, local, remote, context).await {
+                        eprintln!("warning: TUN TCP flow {local} -> {remote} failed: {err}");
+                    }
+                });
             }
-        });
+            Some(result) = flows.join_next(), if !flows.is_empty() => {
+                if let Err(err) = result {
+                    eprintln!("warning: TUN TCP flow task failed: {err}");
+                }
+            }
+        }
     }
-    Ok(())
 }
 
 pub(super) async fn handle_tun_tcp_stream<S>(
@@ -127,7 +139,16 @@ pub(super) struct UdpEdgeLane<M> {
     pub(super) route_hint: Option<RelayPathKey>,
     pub(super) successful_completions: usize,
     pub(super) requests: mpsc::Sender<UdpEdgeRequest<M>>,
-    pub(super) handle: tokio::task::JoinHandle<()>,
+    pub(super) handle: Option<tokio::task::JoinHandle<()>>,
+}
+
+// Lane workers must not outlive the flow that owns their request channel.
+impl<M> Drop for UdpEdgeLane<M> {
+    fn drop(&mut self) {
+        if let Some(handle) = self.handle.take() {
+            handle.abort();
+        }
+    }
 }
 
 pub(super) fn udp_edge_queue_slots(context: &ClientPathContext) -> usize {
@@ -216,7 +237,7 @@ pub(super) fn spawn_udp_edge_lane<M: Send + 'static>(
         route_hint: None,
         successful_completions: 0,
         requests,
-        handle,
+        handle: Some(handle),
     }
 }
 
@@ -361,11 +382,12 @@ pub(super) fn finish_udp_edge_completion<M>(
     }
 }
 
-pub(super) async fn close_udp_edge_lanes<M>(lanes: Vec<UdpEdgeLane<M>>) {
+pub(super) async fn close_udp_edge_lanes<M>(mut lanes: Vec<UdpEdgeLane<M>>) {
     let handles = lanes
-        .into_iter()
-        .map(|lane| lane.handle)
+        .iter_mut()
+        .filter_map(|lane| lane.handle.take())
         .collect::<Vec<_>>();
+    drop(lanes);
     for handle in handles {
         if let Err(err) = handle.await {
             eprintln!("warning: UDP edge lane task failed: {err}");
@@ -380,6 +402,7 @@ pub(super) async fn run_tun_udp_socket(
 ) -> Result<(), RuntimeError> {
     let (mut read_half, mut write_half) = udp_socket.split();
     let mut flows: HashMap<TunUdpFlowKey, mpsc::Sender<Vec<u8>>> = HashMap::new();
+    let mut flow_tasks = tokio::task::JoinSet::new();
     let flow_limit = tun_udp_flow_limit(&context);
     let flow_queue = tun_udp_flow_queue(&context);
     let response_queue = tun_udp_response_queue(&context);
@@ -404,7 +427,7 @@ pub(super) async fn run_tun_udp_socket(
                     let flow_tun = tun.clone();
                     let flow_responses = response_tx.clone();
                     let flow_done = done_tx.clone();
-                    tokio::spawn(async move {
+                    flow_tasks.spawn(async move {
                         let result =
                             handle_tun_udp_flow(key, flow_context, flow_tun, rx, flow_responses)
                                 .await;
@@ -447,6 +470,11 @@ pub(super) async fn run_tun_udp_socket(
             done = done_rx.recv() => {
                 if let Some(key) = done {
                     flows.remove(&key);
+                }
+            }
+            Some(result) = flow_tasks.join_next(), if !flow_tasks.is_empty() => {
+                if let Err(err) = result {
+                    eprintln!("warning: TUN UDP flow task failed: {err}");
                 }
             }
         }

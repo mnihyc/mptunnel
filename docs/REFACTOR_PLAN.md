@@ -20,11 +20,11 @@ protocol asymmetry is expected.
 - Request product state is scattered across sender and relay while response
   product state has a real stream owner. That directional mismatch is a deeper
   imbalance than file count and must be corrected with peer stream owners.
-- Request sender `service.rs` still contains about 96 percent of its production
-  aggregate. Response admission is now a substantive peer, while response
-  `planner.rs` still mixes selection, handoff, ACK-clock calibration, and
-  orchestration. Both directional trees remain migration targets, but every
-  child must own a real policy or transaction rather than a line-count quota.
+- The fake request sender subtree has been collapsed into one substantive
+  `sender/request.rs` owner. It earns children only when the TCP and QUIC
+  capacity mechanisms move with their state and controller transactions.
+  Response admission is a substantive peer, while response `planner.rs` still
+  mixes selection, handoff, ACK-clock calibration, and orchestration.
 - Thin facades, one-off helpers, and directories with no independent invariant
   are collapsed instead of being retained for visual symmetry.
 
@@ -45,11 +45,12 @@ generic controller.
 
 ### Request stream
 
-Use a peer `runtime/stream/request.rs` facade with one flat request directory.
-Its binding owns product offsets, exact flights, ACK state, outstanding window,
-startup epoch, evidence, repair provenance, and lifecycle. The client relay
-task already serializes this state, so the binding stays single-task and
-lock-free instead of copying the response side's mutex design.
+Use one substantive peer `runtime/stream/request.rs` owner until it has at least
+three independently meaningful children. It owns product offsets, exact
+flights, ACK state, outstanding window, startup epoch, exact-instance evidence,
+and repair provenance. The client relay task already serializes this state, so
+the aggregate stays single-task and lock-free instead of copying the response
+side's mutex design.
 
 The request binding replaces parallel per-instance maps with one typed subflow
 aggregate and replaces independently optional ACK-clock owner/pending fields
@@ -102,6 +103,15 @@ it must not gate TCP eligibility. Windows client/Linux server is the primary
 cross-platform role pair, while macOS and Android remain explicit design and
 verification targets.
 
+The remaining deployment boundary is carrier socket creation. `PathSpec`
+currently cannot select a source network, and an Android VPN host cannot protect
+internally-created TCP/QUIC sockets from its own full-tunnel route. Introduce a
+narrow carrier-socket provider beside, not inside, packet-device ownership:
+TCP and QUIC request raw sockets from it before bind/connect, while platform
+hosts apply source binding, interface/network selection, or Android
+`VpnService.protect`/`Network.bindSocket`. No OS type or branch enters model or
+scheduler state.
+
 ## Migration order
 
 1. Replace parallel response session maps with one per-session state aggregate
@@ -114,12 +124,15 @@ verification targets.
    protocol/model/scheduler owners. Remove path/stream/relay reverse imports.
 5. Move response tests out of the request mega-test and attach them to response
    admission, selection, capacity, handoff, repair, apply, and service owners.
-6. Introduce peer model/scheduler/stream request owners. Move exact flights,
-   ACK/window/startup/evidence/repair state into `stream/request`, collapse its
-   parallel maps, and keep the aggregate lock-free under the client relay task.
-7. Split request observation, dispatch, progress, repair, diagnostics, and the
-   separate TCP/QUIC capacity controllers. Move attach/fail orchestration to the
-   remote-set owner, then retire `relay_striping.rs` and the request mega-files.
+6. Complete the peer request product owner: exact flights, outstanding window,
+   startup, ordered Service identity, exclusive ACK-clock operation, and one
+   exact-instance subflow aggregate now live in `stream/request`; keep it
+   lock-free under the client relay task.
+7. Move the separate TCP/QUIC capacity controller state and transactions out of
+   the flat request service only when each becomes a substantive child. Move
+   attach/fail orchestration to the remote-set owner, then replace
+   `relay_striping.rs` with a pure request scheduler over immutable observations
+   and ID-only intents.
 8. Give response planning coherent observe, decide, typed-intent, and atomic
    apply contracts. These are phase APIs, not mandatory files: keep them inside
    admission, selection, handoff, or dispatch until one phase owns an

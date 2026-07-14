@@ -88,6 +88,6 @@ fn open_system_packet_device(config: &TunL4Config) -> io::Result<PacketDevice> {
 fn open_system_packet_device(_config: &TunL4Config) -> io::Result<PacketDevice> {
     Err(io::Error::new(
         io::ErrorKind::Unsupported,
-        "this platform requires a host-provided TUN device; use runtime::run_with_packet_device_provider",
+        "this platform requires a host-provided TUN device; use runtime::run_with_host_providers",
     ))
 }

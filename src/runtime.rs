@@ -14,9 +14,9 @@ mod sender;
 mod stream;
 mod tun_l4;
 
-pub use datagram::client_udp_datagram_round_trip;
+pub use datagram::{client_udp_datagram_round_trip, client_udp_datagram_round_trip_with_provider};
 pub use error::RuntimeError;
-pub use node::{run, run_with_packet_device_provider};
+pub use node::{run, run_with_host_providers, run_with_packet_device_provider};
 pub use packet_device::{PacketDevice, PacketDeviceProvider, SystemPacketDeviceProvider};
 
 #[cfg(feature = "lab-diagnostics")]

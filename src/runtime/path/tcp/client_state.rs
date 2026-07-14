@@ -14,6 +14,7 @@ use crate::runtime::path::commands::TcpCapacityProbeCommand;
 use crate::runtime::path::proof::PathProofTracker;
 use crate::runtime::path::state::{ClientPathState, RequestTcpCapacityProbeLease};
 use crate::scheduler::PathSnapshot;
+use crate::transport::CarrierSocketProvider;
 use crate::transport::PathSpec;
 use std::sync::Arc;
 use std::time::Instant;
@@ -51,6 +52,7 @@ impl ClientTcpPathConnection {
 pub(in crate::runtime) struct ClientTcpPathSessionRuntime {
     pub(in crate::runtime) path: PathSpec,
     pub(in crate::runtime) path_index: usize,
+    pub(in crate::runtime) config_ordinal: usize,
     pub(in crate::runtime) session_id: SessionId,
     pub(in crate::runtime) security: SecurityConfig,
     pub(in crate::runtime) codec_limits: CodecLimits,
@@ -59,6 +61,7 @@ pub(in crate::runtime) struct ClientTcpPathSessionRuntime {
     pub(in crate::runtime) stream_frame_queue: usize,
     pub(in crate::runtime) closed_stream_cache_capacity: usize,
     pub(in crate::runtime) state: Arc<ClientPathState>,
+    pub(in crate::runtime) carrier_sockets: Arc<dyn CarrierSocketProvider>,
 }
 
 /// Reliable-only calibration state must not leak into datagram carrier users.

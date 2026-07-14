@@ -14,9 +14,12 @@ use crate::model::admission::{
     bulk_service_product_envelope_payload_bytes,
 };
 use crate::model::capacity::bbr_inflight_target_bytes;
+#[cfg(feature = "lab-diagnostics")]
 use crate::model::request::evidence::RequestPerFlowRateModel;
 use crate::protocol::frame::reliable_stream_frame_extent;
-use crate::runtime::stream::request::RequestFlightLedger;
+use crate::runtime::stream::request::{
+    RequestAckClockOperation, RequestFlightLedger, RequestSubflowState, RequestSubflows,
+};
 use crate::scheduler::cyclic_cursor_distance;
 
 pub(super) fn relay_frame_is_bulk_stream_data(frame: &Frame, lane: FlowLane) -> bool {
@@ -45,62 +48,58 @@ pub(super) enum BulkRelayPathChoice {
     NotApplicable,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(super) struct RequestAckClockCalibrationOwner {
-    pub(super) candidate: RelayPathInstance,
-    pub(super) target_bytes: u64,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(super) struct RequestAckClockCalibrationPending {
-    pub(super) service: RelayPathInstance,
-    pub(super) candidate: RelayPathInstance,
-}
-
+/// Immutable request evidence consumed by path selection.
+///
+/// Scheduling may rank this state but cannot publish or revoke evidence; the
+/// serialized request sender remains the only mutation authority.
 #[derive(Clone, Copy)]
-pub(super) struct RequestAckClockCalibration<'a> {
-    pub(super) owner: Option<RequestAckClockCalibrationOwner>,
-    pub(super) pending: Option<RequestAckClockCalibrationPending>,
-    pub(super) proven_subflows: &'a HashSet<RelayPathInstance>,
-    pub(super) first_window_acked_subflows: &'a HashSet<RelayPathInstance>,
-    pub(super) spent_bytes: &'a HashMap<RelayPathInstance, u64>,
-    // An offset-free TCP receipt supplies only the causal boundary for one
-    // bounded product stage. It is never equivalent to product ACK proof.
-    pub(super) tcp_carrier_proven_candidates: Option<&'a HashSet<RelayPathInstance>>,
+pub(super) struct RequestSchedulingState<'a> {
+    pub(super) operation: Option<RequestAckClockOperation>,
+    pub(super) subflows: &'a RequestSubflows,
 }
 
-impl RequestAckClockCalibration<'_> {
+impl<'a> RequestSchedulingState<'a> {
     fn transaction_candidate(self) -> Option<RelayPathInstance> {
-        self.owner
-            .map(|owner| owner.candidate)
-            .or(self.pending.map(|pending| pending.candidate))
+        self.operation.map(RequestAckClockOperation::candidate)
+    }
+
+    fn subflow(self, instance: RelayPathInstance) -> Option<&'a RequestSubflowState> {
+        self.subflows.get(instance)
+    }
+
+    #[cfg(feature = "lab-diagnostics")]
+    fn graduated_count(self) -> usize {
+        self.subflows
+            .iter()
+            .filter(|(_, state)| state.graduated())
+            .count()
     }
 }
 
 fn live_request_ack_clock_calibration_transaction(
     paths: &[ReliableRelayRemotePath],
     service_key: RelayPathKey,
-    graduated_subflows: Option<&HashSet<RelayPathInstance>>,
-    calibration: Option<RequestAckClockCalibration<'_>>,
+    request_state: Option<RequestSchedulingState<'_>>,
 ) -> Option<RelayPathInstance> {
-    let calibration = calibration?;
+    let request_state = request_state?;
     let service = paths
         .iter()
         .find(|path| path.key() == service_key && path.placement == RelayPathPlacement::Active)?;
-    let (candidate, owner_target_spent) = if let Some(owner) = calibration.owner {
-        (
-            owner.candidate,
-            calibration
-                .spent_bytes
-                .get(&owner.candidate)
-                .is_some_and(|spent| *spent >= owner.target_bytes),
-        )
-    } else {
-        let pending = calibration.pending?;
-        (
-            (pending.service == service.instance()).then_some(pending.candidate)?,
-            false,
-        )
+    let (candidate, owner_target_spent) = match request_state.operation? {
+        RequestAckClockOperation::Owner {
+            candidate,
+            target_bytes,
+        } => (
+            candidate,
+            request_state
+                .subflow(candidate)
+                .and_then(RequestSubflowState::ack_clock_calibration_bytes)
+                .is_some_and(|spent| spent >= target_bytes),
+        ),
+        RequestAckClockOperation::Pending {
+            service: owner,
+            candidate,
+        } => ((owner == service.instance()).then_some(candidate)?, false),
     };
     let candidate_path = paths.iter().find(|path| {
         path.instance() == candidate
@@ -111,14 +110,13 @@ fn live_request_ack_clock_calibration_transaction(
     // Fresh carrier evidence authorizes entry and target emission. Once the
     // fixed target is fully committed, only exact product ACK or a real path
     // lifecycle change may retire its AwaitingAck transaction.
+    let candidate_state = request_state.subflow(candidate)?;
+    // An offset-free TCP receipt supplies only the causal boundary for one
+    // bounded product stage. It is never equivalent to product ACK proof.
     let authorized = owner_target_spent
-        || calibration.first_window_acked_subflows.contains(&candidate)
-        || calibration
-            .tcp_carrier_proven_candidates
-            .is_some_and(|candidates| candidates.contains(&candidate));
-    (graduated_subflows.is_some_and(|graduated| graduated.contains(&candidate))
-        && !calibration.proven_subflows.contains(&candidate)
-        && authorized)
+        || candidate_state.ack_clock_first_window()
+        || candidate_state.tcp_capacity_proven();
+    (candidate_state.graduated() && !candidate_state.ack_clock_proven() && authorized)
         .then_some(candidate_path.instance())
 }
 
@@ -135,14 +133,8 @@ pub(super) struct BulkRelayPathRequest<'a> {
     pub(super) path_flights: Option<&'a RequestFlightLedger>,
     pub(super) ordered_data_owner: Option<RelayPathKey>,
     pub(super) subflow_set: Option<&'a FlowSubflowSet<RelayPathInstance>>,
-    pub(super) proven_subflows: Option<&'a HashSet<RelayPathInstance>>,
-    pub(super) graduated_subflows: Option<&'a HashSet<RelayPathInstance>>,
+    pub(super) request_state: Option<RequestSchedulingState<'a>>,
     pub(super) attempted_subflows: Option<&'a HashSet<RelayPathInstance>>,
-    pub(super) ack_clock_calibration: Option<RequestAckClockCalibration<'a>>,
-    /// Exact TCP product rates belong to one logical request flow, not to the
-    /// shared carrier/path record used for eligibility and native telemetry.
-    pub(super) request_per_flow_rate_bps:
-        Option<&'a HashMap<RelayPathInstance, RequestPerFlowRateModel>>,
 }
 
 pub(super) struct BulkRelayFrameRequest<'a> {
@@ -156,12 +148,8 @@ pub(super) struct BulkRelayFrameRequest<'a> {
     pub(super) path_flights: Option<&'a RequestFlightLedger>,
     pub(super) ordered_data_owner: Option<RelayPathKey>,
     pub(super) subflow_set: Option<&'a FlowSubflowSet<RelayPathInstance>>,
-    pub(super) proven_subflows: Option<&'a HashSet<RelayPathInstance>>,
-    pub(super) graduated_subflows: Option<&'a HashSet<RelayPathInstance>>,
+    pub(super) request_state: Option<RequestSchedulingState<'a>>,
     pub(super) attempted_subflows: Option<&'a HashSet<RelayPathInstance>>,
-    pub(super) ack_clock_calibration: Option<RequestAckClockCalibration<'a>>,
-    pub(super) request_per_flow_rate_bps:
-        Option<&'a HashMap<RelayPathInstance, RequestPerFlowRateModel>>,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -188,17 +176,15 @@ fn relay_path_runtime_role(
 
 fn request_path_has_exact_flow_local_bulk_model(
     path: &ReliableRelayRemotePath,
-    graduated_subflows: Option<&HashSet<RelayPathInstance>>,
-    ack_clock_calibration: Option<RequestAckClockCalibration<'_>>,
-    request_per_flow_rate_bps: Option<&HashMap<RelayPathInstance, RequestPerFlowRateModel>>,
+    request_state: Option<RequestSchedulingState<'_>>,
 ) -> bool {
     let instance = path.instance();
+    let state = request_state.and_then(|request| request.subflow(instance));
     path.placement == RelayPathPlacement::Validation
         && instance.key.underlay == UnderlayProtocol::Tcp
-        && graduated_subflows.is_some_and(|graduated| graduated.contains(&instance))
-        && ack_clock_calibration
-            .is_some_and(|calibration| calibration.proven_subflows.contains(&instance))
-        && request_per_flow_rate_bps.is_some_and(|rates| rates.contains_key(&instance))
+        && state.is_some_and(RequestSubflowState::graduated)
+        && state.is_some_and(RequestSubflowState::ack_clock_proven)
+        && state.and_then(RequestSubflowState::per_flow_rate).is_some()
 }
 
 fn request_startup_product_envelope_bytes(payload_bytes: usize, mux_limits: MuxLimits) -> u64 {
@@ -222,17 +208,17 @@ fn request_ack_clock_calibration_service_reservoir_has_credit(
     flights: &RequestFlightLedger,
     offset: u64,
     candidate: RelayPathInstance,
-    calibration: RequestAckClockCalibration<'_>,
+    request_state: RequestSchedulingState<'_>,
     payload_bytes: usize,
     mux_limits: MuxLimits,
 ) -> bool {
-    let calibration_prefix = calibration
-        .owner
-        .filter(|owner| owner.candidate == candidate)
-        .map_or_else(
-            || reliable_request_ack_clock_calibration_target_bytes(mux_limits),
-            |owner| owner.target_bytes,
-        );
+    let calibration_prefix = match request_state.operation {
+        Some(RequestAckClockOperation::Owner {
+            candidate: owner,
+            target_bytes,
+        }) if owner == candidate => target_bytes,
+        _ => reliable_request_ack_clock_calibration_target_bytes(mux_limits),
+    };
     let product_envelope = bulk_service_product_envelope_payload_bytes(payload_bytes, mux_limits);
     let reservoir = bulk_service_feed_reservoir_payload_bytes(payload_bytes, mux_limits)
         .saturating_add(usize::try_from(calibration_prefix).unwrap_or(usize::MAX))
@@ -253,10 +239,8 @@ fn choose_request_startup_subflow_with_rates(
     active_key: Option<RelayPathKey>,
     path_flights: Option<&RequestFlightLedger>,
     subflow_set: Option<&FlowSubflowSet<RelayPathInstance>>,
-    proven_subflows: Option<&HashSet<RelayPathInstance>>,
-    graduated_subflows: Option<&HashSet<RelayPathInstance>>,
+    request_state: Option<RequestSchedulingState<'_>>,
     attempted_subflows: Option<&HashSet<RelayPathInstance>>,
-    request_per_flow_rate_bps: Option<&HashMap<RelayPathInstance, RequestPerFlowRateModel>>,
 ) -> Option<BulkRelayPathChoice> {
     let service_key = active_key?;
     // TCP can turn bounded OwnerData into strict ACK-clock capacity evidence.
@@ -290,7 +274,11 @@ fn choose_request_startup_subflow_with_rates(
         .iter()
         .find(|path| path.key() == service_key && path.placement == RelayPathPlacement::Active)?;
     let service_instance = service.instance();
-    if proven_subflows.is_some_and(|proven| !proven.contains(&service_instance)) {
+    if request_state.is_some_and(|request| {
+        !request
+            .subflow(service_instance)
+            .is_some_and(RequestSubflowState::rate_proven)
+    }) {
         #[cfg(feature = "lab-diagnostics")]
         {
             static TRACE_COUNT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
@@ -347,7 +335,7 @@ fn choose_request_startup_subflow_with_rates(
         context,
         service_instance,
         Some(service_key),
-        request_per_flow_rate_bps,
+        request_state,
         service.has_load_reservation(),
     )?;
     scheduler::score_path(
@@ -384,7 +372,11 @@ fn choose_request_startup_subflow_with_rates(
         .filter(|(_, path)| path.placement == RelayPathPlacement::Validation)
         .filter(|(_, path)| path.key().underlay == service_key.underlay)
         .filter(|(_, path)| {
-            graduated_subflows.is_none_or(|graduated| !graduated.contains(&path.instance()))
+            request_state.is_none_or(|request| {
+                !request
+                    .subflow(path.instance())
+                    .is_some_and(RequestSubflowState::graduated)
+            })
         })
         .filter(|(_, path)| {
             subflow_set.and_then(FlowSubflowSet::startup_owner_key) == Some(path.instance())
@@ -410,7 +402,7 @@ fn choose_request_startup_subflow_with_rates(
                 context,
                 path.instance(),
                 Some(service_key),
-                request_per_flow_rate_bps,
+                request_state,
                 path.has_load_reservation(),
             )?;
             if startup_owner != Some(path.instance())
@@ -474,7 +466,7 @@ fn choose_request_startup_subflow_with_rates(
                         .filter(|path| path.placement == RelayPathPlacement::Validation)
                         .count(),
                     attempted_subflows.map_or(0, HashSet::len),
-                    graduated_subflows.map_or(0, HashSet::len),
+                    request_state.map_or(0, RequestSchedulingState::graduated_count),
                 ),
             );
         }
@@ -538,8 +530,7 @@ fn choose_request_startup_subflow(
     active_key: Option<RelayPathKey>,
     path_flights: Option<&RequestFlightLedger>,
     subflow_set: Option<&FlowSubflowSet<RelayPathInstance>>,
-    proven_subflows: Option<&HashSet<RelayPathInstance>>,
-    graduated_subflows: Option<&HashSet<RelayPathInstance>>,
+    request_state: Option<RequestSchedulingState<'_>>,
     attempted_subflows: Option<&HashSet<RelayPathInstance>>,
 ) -> Option<BulkRelayPathChoice> {
     choose_request_startup_subflow_with_rates(
@@ -552,10 +543,8 @@ fn choose_request_startup_subflow(
         active_key,
         path_flights,
         subflow_set,
-        proven_subflows,
-        graduated_subflows,
+        request_state,
         attempted_subflows,
-        None,
     )
 }
 
@@ -571,10 +560,7 @@ fn choose_request_ack_clock_calibration_with_rates(
     active_key: Option<RelayPathKey>,
     path_flights: Option<&RequestFlightLedger>,
     subflow_set: Option<&FlowSubflowSet<RelayPathInstance>>,
-    proven_subflows: Option<&HashSet<RelayPathInstance>>,
-    graduated_subflows: Option<&HashSet<RelayPathInstance>>,
-    calibration: Option<RequestAckClockCalibration<'_>>,
-    request_per_flow_rate_bps: Option<&HashMap<RelayPathInstance, RequestPerFlowRateModel>>,
+    request_state: Option<RequestSchedulingState<'_>>,
 ) -> Option<BulkRelayPathChoice> {
     let service_key = active_key?;
     // Product ACK-clock calibration is the TCP fallback for unavailable native
@@ -586,14 +572,18 @@ fn choose_request_ack_clock_calibration_with_rates(
         .iter()
         .find(|path| path.key() == service_key && path.placement == RelayPathPlacement::Active)?;
     let service_instance = service.instance();
-    let service_proven = proven_subflows.is_none_or(|proven| proven.contains(&service_instance));
+    let service_proven = request_state.is_none_or(|request| {
+        request
+            .subflow(service_instance)
+            .is_some_and(RequestSubflowState::rate_proven)
+    });
     let startup_owner = subflow_set.and_then(FlowSubflowSet::startup_owner_key);
     let latency_pressure = context.reliable_relay_has_latency_pressure();
     let service_bulk_evidence =
         context.relay_path_has_bulk_model_evidence(service_key.underlay, service_key.index);
     if !service_proven || startup_owner.is_some() || latency_pressure || !service_bulk_evidence {
         #[cfg(feature = "lab-diagnostics")]
-        if graduated_subflows.is_some_and(|graduated| !graduated.is_empty()) {
+        if request_state.is_some_and(|request| request.graduated_count() > 0) {
             static EARLY_TRACE_COUNT: std::sync::atomic::AtomicU64 =
                 std::sync::atomic::AtomicU64::new(0);
             let count = EARLY_TRACE_COUNT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -618,7 +608,7 @@ fn choose_request_ack_clock_calibration_with_rates(
     let flights = path_flights?;
     if flights.has_repair_flights_before_offset(offset) {
         #[cfg(feature = "lab-diagnostics")]
-        if graduated_subflows.is_some_and(|graduated| !graduated.is_empty()) {
+        if request_state.is_some_and(|request| request.graduated_count() > 0) {
             static REPAIR_TRACE_COUNT: std::sync::atomic::AtomicU64 =
                 std::sync::atomic::AtomicU64::new(0);
             let count = REPAIR_TRACE_COUNT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -637,26 +627,37 @@ fn choose_request_ack_clock_calibration_with_rates(
     // Flight age starts at logical carrier enqueue, so a healthy deep TCP
     // pipeline can exceed one PTO. Exact repair, foreign-owner, and bounded
     // ordering-debt checks below own the product transition instead.
-    let graduated = graduated_subflows?;
-    let calibration = calibration?;
+    let request_state = request_state?;
     let default_target = reliable_request_ack_clock_calibration_target_bytes(context.mux_limits);
-    let target = |instance: RelayPathInstance| match calibration.owner {
-        Some(owner) if owner.candidate == instance => owner.target_bytes,
+    let target = |instance: RelayPathInstance| match request_state.operation {
+        Some(RequestAckClockOperation::Owner {
+            candidate,
+            target_bytes,
+        }) if candidate == instance => target_bytes,
         _ => default_target,
     };
     let spent = |instance: RelayPathInstance| {
-        calibration
-            .owner
-            .filter(|owner| owner.candidate == instance)
-            .and_then(|_| calibration.spent_bytes.get(&instance).copied())
-            .unwrap_or(0)
+        matches!(
+            request_state.operation,
+            Some(RequestAckClockOperation::Owner { candidate, .. }) if candidate == instance
+        )
+        .then(|| {
+            request_state
+                .subflow(instance)
+                .and_then(RequestSubflowState::ack_clock_calibration_bytes)
+        })
+        .flatten()
+        .unwrap_or(0)
     };
     let hard_ceiling = reliable_ack_clock_calibration_ceiling_bytes(context.mux_limits);
     let product_envelope =
         request_startup_product_envelope_bytes(payload_bytes, context.mux_limits);
     let mut allowed_owner_keys = vec![service_key];
     for path in paths.iter().filter(|path| {
-        path.key().underlay == service_key.underlay && graduated.contains(&path.instance())
+        path.key().underlay == service_key.underlay
+            && request_state
+                .subflow(path.instance())
+                .is_some_and(RequestSubflowState::graduated)
     }) {
         if !allowed_owner_keys.contains(&path.key()) {
             allowed_owner_keys.push(path.key());
@@ -670,8 +671,12 @@ fn choose_request_ack_clock_calibration_with_rates(
         if count < 32 || count % 1024 == 0 {
             for path in paths.iter().filter(|path| {
                 path.placement == RelayPathPlacement::Validation
-                    && graduated.contains(&path.instance())
-                    && !calibration.proven_subflows.contains(&path.instance())
+                    && request_state
+                        .subflow(path.instance())
+                        .is_some_and(RequestSubflowState::graduated)
+                    && !request_state
+                        .subflow(path.instance())
+                        .is_some_and(RequestSubflowState::ack_clock_proven)
             }) {
                 let proof_fresh = path.path_proof_id.is_some_and(|proof_id| {
                     context.relay_path_has_fresh_proof(
@@ -687,7 +692,7 @@ fn choose_request_ack_clock_calibration_with_rates(
                     context,
                     path.instance(),
                     Some(service_key),
-                    request_per_flow_rate_bps,
+                    Some(request_state),
                     path.has_load_reservation(),
                 );
                 let spent = spent(path.instance());
@@ -711,10 +716,10 @@ fn choose_request_ack_clock_calibration_with_rates(
                         path.key().underlay == service_key.underlay,
                         proof_fresh,
                         candidate_bulk_evidence,
-                        calibration
-                            .first_window_acked_subflows
-                            .contains(&path.instance()),
-                        calibration
+                        request_state
+                            .subflow(path.instance())
+                            .is_some_and(RequestSubflowState::ack_clock_first_window),
+                        request_state
                             .transaction_candidate()
                             .is_none_or(|candidate| candidate == path.instance()),
                         context.active_tcp_service_request_bulk_flows(),
@@ -756,18 +761,23 @@ fn choose_request_ack_clock_calibration_with_rates(
         .enumerate()
         .filter(|(_, path)| path.placement == RelayPathPlacement::Validation)
         .filter(|(_, path)| path.key().underlay == service_key.underlay)
-        .filter(|(_, path)| graduated.contains(&path.instance()))
-        .filter(|(_, path)| !calibration.proven_subflows.contains(&path.instance()))
         .filter(|(_, path)| {
-            calibration
-                .first_window_acked_subflows
-                .contains(&path.instance())
-                || calibration
-                    .tcp_carrier_proven_candidates
-                    .is_some_and(|candidates| candidates.contains(&path.instance()))
+            request_state
+                .subflow(path.instance())
+                .is_some_and(RequestSubflowState::graduated)
         })
         .filter(|(_, path)| {
-            calibration
+            !request_state
+                .subflow(path.instance())
+                .is_some_and(RequestSubflowState::ack_clock_proven)
+        })
+        .filter(|(_, path)| {
+            request_state
+                .subflow(path.instance())
+                .is_some_and(|state| state.ack_clock_first_window() || state.tcp_capacity_proven())
+        })
+        .filter(|(_, path)| {
+            request_state
                 .transaction_candidate()
                 .is_none_or(|candidate| candidate == path.instance())
         })
@@ -796,7 +806,7 @@ fn choose_request_ack_clock_calibration_with_rates(
                 context,
                 path.instance(),
                 Some(service_key),
-                request_per_flow_rate_bps,
+                Some(request_state),
                 path.has_load_reservation(),
             )?;
             if snapshot.active_latency_sensitive_flows > 0
@@ -819,11 +829,11 @@ fn choose_request_ack_clock_calibration_with_rates(
             let score =
                 scheduler::score_path(snapshot, lane, payload_bytes, SchedulerPolicy::default())?;
             let spent = spent(path.instance());
-            if calibration.transaction_candidate().is_none() {
+            if request_state.transaction_candidate().is_none() {
                 let typed_zero_spend = spent == 0
-                    && calibration
-                        .tcp_carrier_proven_candidates
-                        .is_some_and(|candidates| candidates.contains(&path.instance()));
+                    && request_state
+                        .subflow(path.instance())
+                        .is_some_and(RequestSubflowState::tcp_capacity_proven);
                 if context.active_tcp_service_request_bulk_flows() < 2 && !typed_zero_spend {
                     return None;
                 }
@@ -870,9 +880,7 @@ fn choose_request_ack_clock_calibration(
     active_key: Option<RelayPathKey>,
     path_flights: Option<&RequestFlightLedger>,
     subflow_set: Option<&FlowSubflowSet<RelayPathInstance>>,
-    proven_subflows: Option<&HashSet<RelayPathInstance>>,
-    graduated_subflows: Option<&HashSet<RelayPathInstance>>,
-    calibration: Option<RequestAckClockCalibration<'_>>,
+    request_state: Option<RequestSchedulingState<'_>>,
 ) -> Option<BulkRelayPathChoice> {
     choose_request_ack_clock_calibration_with_rates(
         context,
@@ -885,10 +893,7 @@ fn choose_request_ack_clock_calibration(
         active_key,
         path_flights,
         subflow_set,
-        proven_subflows,
-        graduated_subflows,
-        calibration,
-        None,
+        request_state,
     )
 }
 
@@ -1160,11 +1165,8 @@ pub(super) fn choose_bulk_relay_path_avoiding(
         path_flights,
         ordered_data_owner,
         subflow_set,
-        proven_subflows,
-        graduated_subflows,
+        request_state,
         attempted_subflows,
-        ack_clock_calibration,
-        request_per_flow_rate_bps,
     } = request;
     let Some((offset, _, payload_bytes)) = reliable_stream_frame_extent(frame) else {
         return BulkRelayPathChoice::NotApplicable;
@@ -1182,11 +1184,8 @@ pub(super) fn choose_bulk_relay_path_avoiding(
         path_flights,
         ordered_data_owner,
         subflow_set,
-        proven_subflows,
-        graduated_subflows,
+        request_state,
         attempted_subflows,
-        ack_clock_calibration,
-        request_per_flow_rate_bps,
     })
 }
 
@@ -1206,11 +1205,8 @@ pub(super) fn choose_bulk_relay_path_for_extent_avoiding(
         path_flights,
         ordered_data_owner,
         subflow_set,
-        proven_subflows,
-        graduated_subflows,
+        request_state,
         attempted_subflows,
-        ack_clock_calibration,
-        request_per_flow_rate_bps,
     } = request;
     #[cfg(not(feature = "lab-diagnostics"))]
     let _ = stream_id;
@@ -1271,16 +1267,15 @@ pub(super) fn choose_bulk_relay_path_for_extent_avoiding(
     };
     #[cfg(feature = "lab-diagnostics")]
     let global_admitted_bulk_keys = admitted_bulk_keys.clone();
-    if let Some(graduated) = graduated_subflows {
+    if let Some(request_state) = request_state {
         admitted_bulk_keys.retain(|key| {
             paths.iter().any(|path| {
+                let state = request_state.subflow(path.instance());
                 path.key() == *key
                     && (path.placement == RelayPathPlacement::Active
-                        || (graduated.contains(&path.instance())
+                        || (state.is_some_and(RequestSubflowState::graduated)
                             && (key.underlay != UnderlayProtocol::Tcp
-                                || ack_clock_calibration.is_some_and(|calibration| {
-                                    calibration.proven_subflows.contains(&path.instance())
-                                }))))
+                                || state.is_some_and(RequestSubflowState::ack_clock_proven))))
             })
         });
     }
@@ -1288,14 +1283,10 @@ pub(super) fn choose_bulk_relay_path_for_extent_avoiding(
         // Session-wide path health ranks shared carriers, but it cannot revoke
         // capability already proven by this exact TCP flow. Keep ownership
         // local while all ordinary completion and ordering gates remain below.
-        for path in paths.iter().filter(|path| {
-            request_path_has_exact_flow_local_bulk_model(
-                path,
-                graduated_subflows,
-                ack_clock_calibration,
-                request_per_flow_rate_bps,
-            )
-        }) {
+        for path in paths
+            .iter()
+            .filter(|path| request_path_has_exact_flow_local_bulk_model(path, request_state))
+        {
             let key = path.key();
             if !admitted_bulk_keys.contains(&key) {
                 admitted_bulk_keys.push(key);
@@ -1333,7 +1324,7 @@ pub(super) fn choose_bulk_relay_path_for_extent_avoiding(
             lower_flight_owner,
             lower_owner_cross_path_debt,
             policy,
-            request_per_flow_rate_bps,
+            request_state,
         })
     } else {
         None
@@ -1341,12 +1332,7 @@ pub(super) fn choose_bulk_relay_path_for_extent_avoiding(
     let calibration_transaction_candidate = normal_bulk_send
         .then(|| {
             active_key.and_then(|service_key| {
-                live_request_ack_clock_calibration_transaction(
-                    paths,
-                    service_key,
-                    graduated_subflows,
-                    ack_clock_calibration,
-                )
+                live_request_ack_clock_calibration_transaction(paths, service_key, request_state)
             })
         })
         .flatten();
@@ -1354,10 +1340,12 @@ pub(super) fn choose_bulk_relay_path_for_extent_avoiding(
     if let Some(candidate) = calibration_transaction_candidate {
         let service_key = active_key.expect("a live calibration transaction has a Service");
         let mut allowed_lower_owners = vec![service_key];
-        if ack_clock_calibration
-            .and_then(|calibration| calibration.owner)
-            .is_some()
-            && !allowed_lower_owners.contains(&candidate.key)
+        if request_state.is_some_and(|request| {
+            matches!(
+                request.operation,
+                Some(RequestAckClockOperation::Owner { .. })
+            )
+        }) && !allowed_lower_owners.contains(&candidate.key)
         {
             allowed_lower_owners.push(candidate.key);
         }
@@ -1376,10 +1364,7 @@ pub(super) fn choose_bulk_relay_path_for_extent_avoiding(
                 active_key,
                 path_flights,
                 subflow_set,
-                proven_subflows,
-                graduated_subflows,
-                ack_clock_calibration,
-                request_per_flow_rate_bps,
+                request_state,
             )
         {
             return choice;
@@ -1401,10 +1386,8 @@ pub(super) fn choose_bulk_relay_path_for_extent_avoiding(
             active_key,
             path_flights,
             subflow_set,
-            proven_subflows,
-            graduated_subflows,
+            request_state,
             attempted_subflows,
-            request_per_flow_rate_bps,
         )
     {
         return choice;
@@ -1423,10 +1406,7 @@ pub(super) fn choose_bulk_relay_path_for_extent_avoiding(
             active_key,
             path_flights,
             subflow_set,
-            proven_subflows,
-            graduated_subflows,
-            ack_clock_calibration,
-            request_per_flow_rate_bps,
+            request_state,
         )
     {
         if let BulkRelayPathChoice::SelectedAckClockCalibration { candidate, .. } = choice
@@ -1488,12 +1468,8 @@ pub(super) fn choose_bulk_relay_path_for_extent_avoiding(
         #[cfg(feature = "lab-diagnostics")]
         let mut flow_local_shadow_gate = None;
         #[cfg(feature = "lab-diagnostics")]
-        let exact_flow_local_candidate = request_path_has_exact_flow_local_bulk_model(
-            path,
-            graduated_subflows,
-            ack_clock_calibration,
-            request_per_flow_rate_bps,
-        );
+        let exact_flow_local_candidate =
+            request_path_has_exact_flow_local_bulk_model(path, request_state);
         if normal_bulk_send
             && subflow_set.and_then(FlowSubflowSet::startup_owner_key) == Some(path.instance())
         {
@@ -1504,11 +1480,16 @@ pub(super) fn choose_bulk_relay_path_for_extent_avoiding(
             continue;
         }
         if normal_bulk_send && path.placement == RelayPathPlacement::Validation {
-            let is_ungraduated =
-                graduated_subflows.is_some_and(|graduated| !graduated.contains(&path.instance()));
+            let is_ungraduated = request_state.is_some_and(|request| {
+                !request
+                    .subflow(path.instance())
+                    .is_some_and(RequestSubflowState::graduated)
+            });
             let lacks_tcp_capacity_proof = key.underlay == UnderlayProtocol::Tcp
-                && ack_clock_calibration.is_some_and(|calibration| {
-                    !calibration.proven_subflows.contains(&path.instance())
+                && request_state.is_some_and(|request| {
+                    !request
+                        .subflow(path.instance())
+                        .is_some_and(RequestSubflowState::ack_clock_proven)
                 });
             if is_ungraduated || lacks_tcp_capacity_proof {
                 continue;
@@ -1653,9 +1634,9 @@ pub(super) fn choose_bulk_relay_path_for_extent_avoiding(
                             "cross_family_owner_disabled",
                             &global_admitted_bulk_keys,
                             &admitted_bulk_keys,
-                            request_per_flow_rate_bps
-                                .and_then(|rates| rates.get(&path.instance()))
-                                .copied(),
+                            request_state
+                                .and_then(|request| request.subflow(path.instance()))
+                                .and_then(RequestSubflowState::per_flow_rate),
                         );
                     }
                     continue;
@@ -1673,12 +1654,7 @@ pub(super) fn choose_bulk_relay_path_for_extent_avoiding(
                 active_key,
                 lower_flight_owner,
                 context.relay_path_has_bulk_model_evidence(key.underlay, key.index)
-                    || request_path_has_exact_flow_local_bulk_model(
-                        path,
-                        graduated_subflows,
-                        ack_clock_calibration,
-                        request_per_flow_rate_bps,
-                    ),
+                    || request_path_has_exact_flow_local_bulk_model(path, request_state),
             )
             .may_own_unique_data()
         {
@@ -1709,7 +1685,7 @@ pub(super) fn choose_bulk_relay_path_for_extent_avoiding(
             context,
             path.instance(),
             active_key,
-            request_per_flow_rate_bps,
+            request_state,
             path.has_load_reservation(),
         ) else {
             #[cfg(feature = "lab-diagnostics")]
@@ -1741,9 +1717,9 @@ pub(super) fn choose_bulk_relay_path_for_extent_avoiding(
                     "no_path_snapshot",
                     &global_admitted_bulk_keys,
                     &admitted_bulk_keys,
-                    request_per_flow_rate_bps
-                        .and_then(|rates| rates.get(&path.instance()))
-                        .copied(),
+                    request_state
+                        .and_then(|request| request.subflow(path.instance()))
+                        .and_then(RequestSubflowState::per_flow_rate),
                 );
             }
             continue;
@@ -1800,9 +1776,9 @@ pub(super) fn choose_bulk_relay_path_for_extent_avoiding(
                     "no_path_score",
                     &global_admitted_bulk_keys,
                     &admitted_bulk_keys,
-                    request_per_flow_rate_bps
-                        .and_then(|rates| rates.get(&path.instance()))
-                        .copied(),
+                    request_state
+                        .and_then(|request| request.subflow(path.instance()))
+                        .and_then(RequestSubflowState::per_flow_rate),
                 );
             }
             continue;
@@ -1872,13 +1848,13 @@ pub(super) fn choose_bulk_relay_path_for_extent_avoiding(
             let calibration_service_reservoir =
                 calibration_service_fence.is_some_and(|candidate| {
                     Some(key) == active_key
-                        && ack_clock_calibration.is_some_and(|calibration| {
+                        && request_state.is_some_and(|request_state| {
                             path_flights.is_some_and(|flights| {
                                 request_ack_clock_calibration_service_reservoir_has_credit(
                                     flights,
                                     offset,
                                     candidate,
-                                    calibration,
+                                    request_state,
                                     payload_bytes,
                                     context.mux_limits,
                                 )
@@ -1905,9 +1881,9 @@ pub(super) fn choose_bulk_relay_path_for_extent_avoiding(
                             reason,
                             &global_admitted_bulk_keys,
                             &admitted_bulk_keys,
-                            request_per_flow_rate_bps
-                                .and_then(|rates| rates.get(&path.instance()))
-                                .copied(),
+                            request_state
+                                .and_then(|request| request.subflow(path.instance()))
+                                .and_then(RequestSubflowState::per_flow_rate),
                         );
                     }
                 }
@@ -1941,9 +1917,9 @@ pub(super) fn choose_bulk_relay_path_for_extent_avoiding(
                 "admissible",
                 &global_admitted_bulk_keys,
                 &admitted_bulk_keys,
-                request_per_flow_rate_bps
-                    .and_then(|rates| rates.get(&path.instance()))
-                    .copied(),
+                request_state
+                    .and_then(|request| request.subflow(path.instance()))
+                    .and_then(RequestSubflowState::per_flow_rate),
             );
             let candidate = (
                 position,
@@ -1953,9 +1929,9 @@ pub(super) fn choose_bulk_relay_path_for_extent_avoiding(
                 diagnostics,
                 path.instance(),
                 initial_gate,
-                request_per_flow_rate_bps
-                    .and_then(|rates| rates.get(&path.instance()))
-                    .copied(),
+                request_state
+                    .and_then(|request| request.subflow(path.instance()))
+                    .and_then(RequestSubflowState::per_flow_rate),
             );
             let replaces_shadow = best_flow_local_shadow.as_ref().is_none_or(
                 |(_, best_eta, best_distance, _, _, _, _, _)| {
@@ -2130,7 +2106,7 @@ struct RelayBulkLeadRequest<'a> {
     lower_flight_owner: Option<RelayPathKey>,
     lower_owner_cross_path_debt: u64,
     policy: SchedulerPolicy,
-    request_per_flow_rate_bps: Option<&'a HashMap<RelayPathInstance, RequestPerFlowRateModel>>,
+    request_state: Option<RequestSchedulingState<'a>>,
 }
 
 fn choose_admissible_relay_bulk_lead(request: RelayBulkLeadRequest<'_>) -> Option<RelayBulkLead> {
@@ -2146,7 +2122,7 @@ fn choose_admissible_relay_bulk_lead(request: RelayBulkLeadRequest<'_>) -> Optio
         lower_flight_owner,
         lower_owner_cross_path_debt,
         policy,
-        request_per_flow_rate_bps,
+        request_state,
     } = request;
     paths
         .iter()
@@ -2185,7 +2161,7 @@ fn choose_admissible_relay_bulk_lead(request: RelayBulkLeadRequest<'_>) -> Optio
                 lane,
                 payload_bytes,
                 policy,
-                request_per_flow_rate_bps,
+                request_state,
                 path.has_load_reservation(),
             )?;
             let stream_ordering_debt_bytes = if lower_flight_owner == Some(key) {
@@ -2224,14 +2200,14 @@ fn scored_relay_path_snapshot_for_bulk_choice(
     lane: FlowLane,
     payload_bytes: usize,
     policy: SchedulerPolicy,
-    request_per_flow_rate_bps: Option<&HashMap<RelayPathInstance, RequestPerFlowRateModel>>,
+    request_state: Option<RequestSchedulingState<'_>>,
     current_flow_owns_path: bool,
 ) -> Option<(PathSnapshot, f64)> {
     let snapshot = relay_path_snapshot_for_bulk_choice(
         context,
         instance,
         active_key,
-        request_per_flow_rate_bps,
+        request_state,
         current_flow_owns_path,
     )?;
     let scoring_payload_bytes = if lane.is_bulk() {
@@ -2247,7 +2223,7 @@ fn relay_path_snapshot_for_bulk_choice(
     context: &ClientPathContext,
     instance: RelayPathInstance,
     active_key: Option<RelayPathKey>,
-    request_per_flow_rate_bps: Option<&HashMap<RelayPathInstance, RequestPerFlowRateModel>>,
+    request_state: Option<RequestSchedulingState<'_>>,
     current_flow_owns_path: bool,
 ) -> Option<PathSnapshot> {
     let mut snapshot = context.reliable_path_snapshot(instance.key)?;
@@ -2256,9 +2232,9 @@ fn relay_path_snapshot_for_bulk_choice(
             context.tcp_paths.get(instance.key.index)?,
             instance.key.index,
         );
-        let local_model = request_per_flow_rate_bps
-            .and_then(|rates| rates.get(&instance))
-            .copied();
+        let local_model = request_state
+            .and_then(|request| request.subflow(instance))
+            .and_then(RequestSubflowState::per_flow_rate);
         if local_model.is_none() && snapshot.rate_scope == PathRateScope::PerFlowGoodput {
             // Shared TCP product samples belong to whichever logical flow
             // produced them. Until this flow has exact local evidence, fall
@@ -2284,10 +2260,13 @@ fn relay_path_snapshot_for_bulk_choice(
             let service_exploration_rate_bps = (Some(instance.key) != active_key && endpoint_only)
                 .then(|| {
                     active_key.and_then(|active| {
-                        request_per_flow_rate_bps
-                            .and_then(|rates| {
-                                rates.iter().find_map(|(instance, model)| {
-                                    (instance.key == active).then_some(model.rate_bps)
+                        request_state
+                            .and_then(|request| {
+                                request.subflows.iter().find_map(|(instance, state)| {
+                                    (instance.key == active)
+                                        .then(|| state.per_flow_rate())
+                                        .flatten()
+                                        .map(|model| model.rate_bps)
                                 })
                             })
                             .or_else(|| {

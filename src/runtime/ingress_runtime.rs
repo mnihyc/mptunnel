@@ -1,3 +1,7 @@
+//! Client ingress listeners and protocol handshakes.
+//!
+//! Each listener owns active connections so shutdown cannot leave stale streams.
+
 use super::*;
 use crate::runtime::path::authentication::ClientPathAuthenticationFrames;
 
@@ -32,18 +36,28 @@ pub(super) async fn run_socks5_client_listener(
     context: ClientPathContext,
     proxy_auth: ProxyAuthConfig,
 ) -> Result<(), RuntimeError> {
+    let mut connections = tokio::task::JoinSet::new();
     loop {
-        let (stream, _) = listener.accept().await?;
-        stream.set_nodelay(true)?;
-        let context = context.clone();
-        let proxy_auth = proxy_auth.clone();
-        tokio::spawn(async move {
-            if let Err(err) =
-                handle_socks5_client_stream_with_auth(stream, context, proxy_auth).await
-            {
-                eprintln!("warning: SOCKS5 client handler failed: {err}");
+        tokio::select! {
+            accepted = listener.accept() => {
+                let (stream, _) = accepted?;
+                stream.set_nodelay(true)?;
+                let context = context.clone();
+                let proxy_auth = proxy_auth.clone();
+                connections.spawn(async move {
+                    if let Err(err) =
+                        handle_socks5_client_stream_with_auth(stream, context, proxy_auth).await
+                    {
+                        eprintln!("warning: SOCKS5 client handler failed: {err}");
+                    }
+                });
             }
-        });
+            Some(result) = connections.join_next(), if !connections.is_empty() => {
+                if let Err(err) = result {
+                    eprintln!("warning: SOCKS5 client handler task failed: {err}");
+                }
+            }
+        }
     }
 }
 
@@ -77,18 +91,28 @@ pub(super) async fn run_http_connect_client_listener(
     context: ClientPathContext,
     proxy_auth: ProxyAuthConfig,
 ) -> Result<(), RuntimeError> {
+    let mut connections = tokio::task::JoinSet::new();
     loop {
-        let (stream, _) = listener.accept().await?;
-        stream.set_nodelay(true)?;
-        let context = context.clone();
-        let proxy_auth = proxy_auth.clone();
-        tokio::spawn(async move {
-            if let Err(err) =
-                handle_http_connect_client_stream_with_auth(stream, context, proxy_auth).await
-            {
-                eprintln!("warning: HTTP CONNECT client handler failed: {err}");
+        tokio::select! {
+            accepted = listener.accept() => {
+                let (stream, _) = accepted?;
+                stream.set_nodelay(true)?;
+                let context = context.clone();
+                let proxy_auth = proxy_auth.clone();
+                connections.spawn(async move {
+                    if let Err(err) =
+                        handle_http_connect_client_stream_with_auth(stream, context, proxy_auth).await
+                    {
+                        eprintln!("warning: HTTP CONNECT client handler failed: {err}");
+                    }
+                });
             }
-        });
+            Some(result) = connections.join_next(), if !connections.is_empty() => {
+                if let Err(err) = result {
+                    eprintln!("warning: HTTP CONNECT client handler task failed: {err}");
+                }
+            }
+        }
     }
 }
 
@@ -96,18 +120,22 @@ pub(super) async fn wait_for_ingress_listener_failure(
     mut listeners: tokio::task::JoinSet<Result<(), RuntimeError>>,
     ingress: &'static str,
 ) -> Result<(), RuntimeError> {
-    if let Some(result) = listeners.join_next().await {
+    let result = if let Some(result) = listeners.join_next().await {
         match result {
-            Ok(Ok(())) => return Err(RuntimeError::Protocol("client ingress listener exited")),
-            Ok(Err(err)) => return Err(err),
-            Err(err) => return Err(RuntimeError::TaskJoin(err)),
+            Ok(Ok(())) => Err(RuntimeError::Protocol("client ingress listener exited")),
+            Ok(Err(err)) => Err(err),
+            Err(err) => Err(RuntimeError::TaskJoin(err)),
         }
-    }
-    Err(RuntimeError::Protocol(match ingress {
-        "SOCKS5" => "SOCKS5 ingress has no listener tasks",
-        "HTTP CONNECT" => "HTTP CONNECT ingress has no listener tasks",
-        _ => "client ingress has no listener tasks",
-    }))
+    } else {
+        Err(RuntimeError::Protocol(match ingress {
+            "SOCKS5" => "SOCKS5 ingress has no listener tasks",
+            "HTTP CONNECT" => "HTTP CONNECT ingress has no listener tasks",
+            _ => "client ingress has no listener tasks",
+        }))
+    };
+    listeners.abort_all();
+    while listeners.join_next().await.is_some() {}
+    result
 }
 
 #[cfg(test)]
@@ -392,12 +420,17 @@ pub(super) async fn probe_tcp_client_path(
         .ok_or(RuntimeError::NoSchedulableTcpPath)?;
     let security = context.tcp_path_security(path_index)?;
     let probe_rtt = tokio::time::timeout(timeout, async {
-        let tcp_stream = tcp::connect_path(
+        let tcp_stream = tcp::connect_path_with_provider(
             path,
+            context.relay_path_config_ordinal(RelayPathKey {
+                underlay: UnderlayProtocol::Tcp,
+                index: path_index,
+            }),
             TcpConnectOptions {
                 timeout,
                 ..TcpConnectOptions::default()
             },
+            context.carrier_sockets.as_ref(),
         )
         .await?;
         let mut framed = EncryptedFramedStream::with_cipher_suite(

@@ -1,3 +1,7 @@
+//! Management sampling and HTTP control-plane services.
+//!
+//! Samplers are node-supervised siblings of listeners so restarts retire both.
+
 use super::*;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
@@ -6,40 +10,52 @@ const MANAGEMENT_REQUEST_LIMIT: usize = 64 * 1024;
 const MANAGEMENT_TREND_CAPACITY: usize = 300;
 const MANAGEMENT_SAMPLE_INTERVAL: Duration = Duration::from_secs(1);
 
-pub(super) async fn run_client_management_api(
+pub(super) fn spawn_client_management_services(
     config: ManagementConfig,
     context: ClientPathContext,
-) -> Result<(), RuntimeError> {
+    services: &mut tokio::task::JoinSet<Result<(), RuntimeError>>,
+) {
     let state = ManagementState::new("client");
-    start_client_sampler(context.clone(), state.clone());
-    run_management_listeners(config, ManagementTarget::Client { context, state }).await
+    services.spawn(run_client_sampler(context.clone(), state.clone()));
+    services.spawn(run_management_listeners(
+        config,
+        ManagementTarget::Client { context, state },
+    ));
 }
 
-pub(super) async fn run_server_management_api(
+pub(super) fn spawn_server_management_services(
     config: ManagementConfig,
     context: ServerPathContext,
-) -> Result<(), RuntimeError> {
+    services: &mut tokio::task::JoinSet<Result<(), RuntimeError>>,
+) {
     let state = ManagementState::new("server");
-    start_server_sampler(context.clone(), state.clone());
-    run_management_listeners(config, ManagementTarget::Server { context, state }).await
+    services.spawn(run_server_sampler(context.clone(), state.clone()));
+    services.spawn(run_management_listeners(
+        config,
+        ManagementTarget::Server { context, state },
+    ));
 }
 
-pub(super) async fn run_node_management_api(
+pub(super) fn spawn_node_management_services(
     config: ManagementConfig,
     clients: Vec<ClientPathContext>,
     servers: Vec<ServerPathContext>,
-) -> Result<(), RuntimeError> {
+    services: &mut tokio::task::JoinSet<Result<(), RuntimeError>>,
+) {
     let state = ManagementState::new("node");
-    start_node_sampler(clients.clone(), servers.clone(), state.clone());
-    run_management_listeners(
+    services.spawn(run_node_sampler(
+        clients.clone(),
+        servers.clone(),
+        state.clone(),
+    ));
+    services.spawn(run_management_listeners(
         config,
         ManagementTarget::Node {
             clients,
             servers,
             state,
         },
-    )
-    .await
+    ));
 }
 
 async fn run_management_listeners(
@@ -52,22 +68,9 @@ async fn run_management_listeners(
         let listener = TcpListener::bind(listen).await?;
         let target = target.clone();
         let token = token.clone();
-        listeners.spawn(async move {
-            loop {
-                let (stream, _) = listener.accept().await?;
-                let target = target.clone();
-                let token = token.clone();
-                tokio::spawn(async move {
-                    if let Err(err) = handle_management_connection(stream, target, token).await {
-                        eprintln!("warning: management API request failed: {err}");
-                    }
-                });
-            }
-            #[allow(unreachable_code)]
-            Ok::<(), RuntimeError>(())
-        });
+        listeners.spawn(run_management_listener(listener, target, token));
     }
-    if let Some(result) = listeners.join_next().await {
+    let result = if let Some(result) = listeners.join_next().await {
         match result {
             Ok(Ok(())) => Err(RuntimeError::Protocol("management listener exited")),
             Ok(Err(err)) => Err(err),
@@ -77,6 +80,36 @@ async fn run_management_listeners(
         Err(RuntimeError::Protocol(
             "management API has no listen addresses",
         ))
+    };
+    listeners.abort_all();
+    while listeners.join_next().await.is_some() {}
+    result
+}
+
+async fn run_management_listener(
+    listener: TcpListener,
+    target: ManagementTarget,
+    token: Arc<Option<String>>,
+) -> Result<(), RuntimeError> {
+    let mut requests = tokio::task::JoinSet::new();
+    loop {
+        tokio::select! {
+            accepted = listener.accept() => {
+                let (stream, _) = accepted?;
+                let target = target.clone();
+                let token = token.clone();
+                requests.spawn(async move {
+                    if let Err(err) = handle_management_connection(stream, target, token).await {
+                        eprintln!("warning: management API request failed: {err}");
+                    }
+                });
+            }
+            Some(result) = requests.join_next(), if !requests.is_empty() => {
+                if let Err(err) = result {
+                    eprintln!("warning: management API request task failed: {err}");
+                }
+            }
+        }
     }
 }
 
@@ -646,43 +679,43 @@ fn set_client_path_state(
     Ok(())
 }
 
-fn start_client_sampler(context: ClientPathContext, state: ManagementState) {
-    tokio::spawn(async move {
-        let mut ticker = tokio::time::interval(MANAGEMENT_SAMPLE_INTERVAL);
-        ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
-        loop {
-            ticker.tick().await;
-            let (_, summary) = client_path_statuses(&context);
-            state.push_sample(summary);
-        }
-    });
+async fn run_client_sampler(
+    context: ClientPathContext,
+    state: ManagementState,
+) -> Result<(), RuntimeError> {
+    let mut ticker = tokio::time::interval(MANAGEMENT_SAMPLE_INTERVAL);
+    ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    loop {
+        ticker.tick().await;
+        let (_, summary) = client_path_statuses(&context);
+        state.push_sample(summary);
+    }
 }
 
-fn start_server_sampler(context: ServerPathContext, state: ManagementState) {
-    tokio::spawn(async move {
-        let mut ticker = tokio::time::interval(MANAGEMENT_SAMPLE_INTERVAL);
-        ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
-        loop {
-            ticker.tick().await;
-            let registry = context.reliable_streams.management_snapshot();
-            state.push_sample(server_summary(&registry));
-        }
-    });
+async fn run_server_sampler(
+    context: ServerPathContext,
+    state: ManagementState,
+) -> Result<(), RuntimeError> {
+    let mut ticker = tokio::time::interval(MANAGEMENT_SAMPLE_INTERVAL);
+    ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    loop {
+        ticker.tick().await;
+        let registry = context.reliable_streams.management_snapshot();
+        state.push_sample(server_summary(&registry));
+    }
 }
 
-fn start_node_sampler(
+async fn run_node_sampler(
     clients: Vec<ClientPathContext>,
     servers: Vec<ServerPathContext>,
     state: ManagementState,
-) {
-    tokio::spawn(async move {
-        let mut ticker = tokio::time::interval(MANAGEMENT_SAMPLE_INTERVAL);
-        ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
-        loop {
-            ticker.tick().await;
-            state.push_sample(node_summary(&clients, &servers));
-        }
-    });
+) -> Result<(), RuntimeError> {
+    let mut ticker = tokio::time::interval(MANAGEMENT_SAMPLE_INTERVAL);
+    ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    loop {
+        ticker.tick().await;
+        state.push_sample(node_summary(&clients, &servers));
+    }
 }
 
 fn client_snapshot_json(context: &ClientPathContext) -> Value {

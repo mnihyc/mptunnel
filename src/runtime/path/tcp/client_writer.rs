@@ -247,6 +247,12 @@ pub(super) async fn handle_connected_client_tcp_command_run(
                 }
                 return Ok(());
             }
+            ReliablePathCommand::ResetAndCloseStream { .. } => {
+                commands.release_pending_command_bytes(pending_bytes);
+                return Err(RuntimeError::Protocol(
+                    "client TCP path received server terminal command",
+                ));
+            }
             command => {
                 flush_client_tcp_frame_batch(
                     connection,
@@ -621,6 +627,9 @@ async fn handle_connected_client_tcp_command(
         }
         ReliablePathCommand::SendTcpCapacityProbe(_) => Err(RuntimeError::Protocol(
             "client TCP path received server capacity command",
+        )),
+        ReliablePathCommand::ResetAndCloseStream { .. } => Err(RuntimeError::Protocol(
+            "client TCP path received server terminal command",
         )),
         ReliablePathCommand::CloseStream(stream_id) => {
             streams.remove(&stream_id);

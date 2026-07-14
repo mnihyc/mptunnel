@@ -5,7 +5,10 @@ use super::{
     QuicCarrierTelemetry, RecvStream, SendStream,
 };
 use crate::mux::MuxLimits;
-use quinn::{ClientConfig, Endpoint as QuinnEndpoint, ServerConfig, TransportConfig, VarInt};
+use crate::transport::CarrierSocket;
+use quinn::{
+    ClientConfig, Endpoint as QuinnEndpoint, EndpointConfig, ServerConfig, TransportConfig, VarInt,
+};
 use rustls::pki_types::{CertificateDer, PrivatePkcs8KeyDer, ServerName, UnixTime};
 use sha2::{Digest, Sha256};
 use std::net::SocketAddr;
@@ -46,6 +49,24 @@ impl Endpoint {
         mux_limits: MuxLimits,
     ) -> Result<Self, QuicCarrierError> {
         let mut endpoint = QuinnEndpoint::client(addr)?;
+        endpoint.set_default_client_config(client_config(secret, mux_limits)?);
+        Ok(Self { endpoint })
+    }
+
+    /// Builds Quinn on a socket already prepared by the host network adapter.
+    pub async fn bind_client_socket(
+        socket: CarrierSocket,
+        secret: &[u8],
+        mux_limits: MuxLimits,
+    ) -> Result<Self, QuicCarrierError> {
+        let runtime = quinn::default_runtime()
+            .ok_or_else(|| std::io::Error::other("no async runtime found"))?;
+        let mut endpoint = QuinnEndpoint::new(
+            EndpointConfig::default(),
+            None,
+            socket.into_udp_socket()?,
+            runtime,
+        )?;
         endpoint.set_default_client_config(client_config(secret, mux_limits)?);
         Ok(Self { endpoint })
     }

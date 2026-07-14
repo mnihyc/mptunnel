@@ -30,7 +30,10 @@ pub(in crate::runtime) fn spawn_encrypted_tcp_reader(
     let (frames_tx, frames_rx) = mpsc::channel(queue_size);
     tokio::spawn(async move {
         loop {
-            let frame = reader.read_frame().await;
+            let frame = tokio::select! {
+                _ = frames_tx.closed() => break,
+                frame = reader.read_frame() => frame,
+            };
             let done = frame.is_err();
             #[cfg(feature = "lab-diagnostics")]
             let bytes = frame

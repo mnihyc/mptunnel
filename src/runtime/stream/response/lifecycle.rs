@@ -12,9 +12,7 @@ use super::topology::{
 use super::{NEXT_RESPONSE_STREAM_BINDING_INSTANCE_ID, ResponseStreamBinding};
 use crate::model::path::{CarrierPathInstanceId, CarrierPathKey};
 use crate::mux::MuxLimits;
-use crate::protocol::{
-    Frame, PathId, ResetReason, SessionId, StreamId, StreamOpenRole, UnderlayProtocol,
-};
+use crate::protocol::{PathId, ResetReason, SessionId, StreamId, StreamOpenRole, UnderlayProtocol};
 use crate::runtime::path::commands::{ReliablePathCommand, ReliablePathCommandSender};
 use crate::scheduler::FlowLane;
 use std::collections::{BTreeMap, HashMap};
@@ -251,11 +249,7 @@ impl ResponseStreamBinding {
         futures::future::join_all(outputs.into_iter().map(|entry| async move {
             let _ = entry
                 .commands
-                .send_stream_ordered_frame(Frame::StreamReset { stream_id, reason }, lane)
-                .await;
-            let _ = entry
-                .commands
-                .send_stream_ordered_close(stream_id, lane)
+                .send_stream_ordered_reset_and_close(stream_id, reason, lane)
                 .await;
         }))
         .await;

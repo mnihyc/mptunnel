@@ -2,15 +2,18 @@ use super::*;
 use crate::protocol::frame::reliable_path_frame_pacing_bytes;
 use crate::runtime::path::tcp::connect_client_tcp_path_for_test;
 use crate::runtime::stream::response::next_server_carrier_path_instance_id;
+use crate::transport::{PathBinding, SystemCarrierSocketProvider};
 
 fn test_tcp_session_runtime() -> ClientTcpPathSessionRuntime {
     ClientTcpPathSessionRuntime {
         path: PathSpec {
             underlay: UnderlayProtocol::Tcp,
             endpoint: Endpoint::new("127.0.0.1", 1).expect("endpoint"),
+            binding: PathBinding::default(),
             metadata: crate::transport::PathMetadata::default(),
         },
         path_index: 0,
+        config_ordinal: 0,
         session_id: SessionId(7),
         security: security(),
         codec_limits: CodecLimits::default(),
@@ -22,6 +25,18 @@ fn test_tcp_session_runtime() -> ClientTcpPathSessionRuntime {
             tcp: vec![ClientPathHealthRecord::default()],
             udp: Vec::new(),
         }),
+        carrier_sockets: Arc::new(SystemCarrierSocketProvider),
+    }
+}
+
+fn test_tcp_session_runtime_for(
+    path: PathSpec,
+    session_id: SessionId,
+) -> ClientTcpPathSessionRuntime {
+    ClientTcpPathSessionRuntime {
+        path,
+        session_id,
+        ..test_tcp_session_runtime()
     }
 }
 
@@ -155,21 +170,7 @@ async fn concurrent_tcp_latency_opens_share_one_authenticated_carrier() {
         Ok::<(), RuntimeError>(())
     });
 
-    let handle = ClientTcpPathSessionHandle::new(ClientTcpPathSessionRuntime {
-        path,
-        path_index: 0,
-        session_id: SessionId(45),
-        security: security(),
-        codec_limits: CodecLimits::default(),
-        mux_limits: MuxLimits::default(),
-        command_queue: 4,
-        stream_frame_queue: 4,
-        closed_stream_cache_capacity: 8,
-        state: ClientPathState::new(ClientPathHealth {
-            tcp: vec![ClientPathHealthRecord::default()],
-            udp: Vec::new(),
-        }),
-    });
+    let handle = ClientTcpPathSessionHandle::new(test_tcp_session_runtime_for(path, SessionId(45)));
     let now = tokio::time::Instant::now();
     let deadlines = ClientTcpOpenDeadlines {
         live: now + Duration::from_millis(20),
@@ -248,21 +249,7 @@ async fn canceling_pending_tcp_stream_keeps_shared_carrier_sibling_live() -> Res
         Ok::<(), RuntimeError>(())
     });
 
-    let handle = ClientTcpPathSessionHandle::new(ClientTcpPathSessionRuntime {
-        path,
-        path_index: 0,
-        session_id: SessionId(46),
-        security: security(),
-        codec_limits: CodecLimits::default(),
-        mux_limits: MuxLimits::default(),
-        command_queue: 4,
-        stream_frame_queue: 4,
-        closed_stream_cache_capacity: 8,
-        state: ClientPathState::new(ClientPathHealth {
-            tcp: vec![ClientPathHealthRecord::default()],
-            udp: Vec::new(),
-        }),
-    });
+    let handle = ClientTcpPathSessionHandle::new(test_tcp_session_runtime_for(path, SessionId(46)));
     let deadline = tokio::time::Instant::now() + Duration::from_secs(3);
     let first_handle = handle.clone();
     let first = tokio::spawn(async move {
@@ -362,21 +349,7 @@ async fn duplicate_pending_tcp_open_preserves_the_first_wire_owner() -> Result<(
         Ok::<(), RuntimeError>(())
     });
 
-    let handle = ClientTcpPathSessionHandle::new(ClientTcpPathSessionRuntime {
-        path,
-        path_index: 0,
-        session_id: SessionId(47),
-        security: security(),
-        codec_limits: CodecLimits::default(),
-        mux_limits: MuxLimits::default(),
-        command_queue: 4,
-        stream_frame_queue: 4,
-        closed_stream_cache_capacity: 8,
-        state: ClientPathState::new(ClientPathHealth {
-            tcp: vec![ClientPathHealthRecord::default()],
-            udp: Vec::new(),
-        }),
-    });
+    let handle = ClientTcpPathSessionHandle::new(test_tcp_session_runtime_for(path, SessionId(47)));
     let deadline = tokio::time::Instant::now() + Duration::from_secs(3);
     let first_handle = handle.clone();
     let first = tokio::spawn(async move {
@@ -602,21 +575,7 @@ async fn expired_queued_tcp_open_does_not_start_a_late_carrier() {
             .await
             .is_err()
     });
-    let handle = ClientTcpPathSessionHandle::new(ClientTcpPathSessionRuntime {
-        path,
-        path_index: 0,
-        session_id: SessionId(42),
-        security: security(),
-        codec_limits: CodecLimits::default(),
-        mux_limits: MuxLimits::default(),
-        command_queue: 4,
-        stream_frame_queue: 4,
-        closed_stream_cache_capacity: 8,
-        state: ClientPathState::new(ClientPathHealth {
-            tcp: vec![ClientPathHealthRecord::default()],
-            udp: Vec::new(),
-        }),
-    });
+    let handle = ClientTcpPathSessionHandle::new(test_tcp_session_runtime_for(path, SessionId(42)));
 
     let first_handle = handle.clone();
     let first = tokio::spawn(async move {
@@ -742,21 +701,7 @@ async fn tcp_lane_session_expires_pending_accept_and_sends_detach() {
             .expect("write sibling data");
         framed.flush().await.expect("flush sibling data");
     });
-    let handle = ClientTcpPathSessionHandle::new(ClientTcpPathSessionRuntime {
-        path,
-        path_index: 0,
-        session_id: SessionId(43),
-        security: security(),
-        codec_limits: CodecLimits::default(),
-        mux_limits: MuxLimits::default(),
-        command_queue: 4,
-        stream_frame_queue: 4,
-        closed_stream_cache_capacity: 8,
-        state: ClientPathState::new(ClientPathHealth {
-            tcp: vec![ClientPathHealthRecord::default()],
-            udp: Vec::new(),
-        }),
-    });
+    let handle = ClientTcpPathSessionHandle::new(test_tcp_session_runtime_for(path, SessionId(43)));
 
     let mut first = handle
         .open_stream(
@@ -859,21 +804,7 @@ async fn tcp_carrier_reconnect_publishes_a_new_generation_and_uses_setup_deadlin
         Ok::<(), RuntimeError>(())
     });
 
-    let handle = ClientTcpPathSessionHandle::new(ClientTcpPathSessionRuntime {
-        path,
-        path_index: 0,
-        session_id: SessionId(48),
-        security: security(),
-        codec_limits: CodecLimits::default(),
-        mux_limits: MuxLimits::default(),
-        command_queue: 4,
-        stream_frame_queue: 4,
-        closed_stream_cache_capacity: 8,
-        state: ClientPathState::new(ClientPathHealth {
-            tcp: vec![ClientPathHealthRecord::default()],
-            udp: Vec::new(),
-        }),
-    });
+    let handle = ClientTcpPathSessionHandle::new(test_tcp_session_runtime_for(path, SessionId(48)));
     let first = handle
         .open_stream(
             StreamId(5),
@@ -958,21 +889,7 @@ async fn tcp_client_sends_path_metrics_before_open_stream() {
         Ok::<(), RuntimeError>(())
     });
 
-    let handle = ClientTcpPathSessionHandle::new(ClientTcpPathSessionRuntime {
-        path,
-        path_index: 0,
-        session_id: SessionId(44),
-        security: security(),
-        codec_limits: CodecLimits::default(),
-        mux_limits: MuxLimits::default(),
-        command_queue: 4,
-        stream_frame_queue: 4,
-        closed_stream_cache_capacity: 8,
-        state: ClientPathState::new(ClientPathHealth {
-            tcp: vec![ClientPathHealthRecord::default()],
-            udp: Vec::new(),
-        }),
-    });
+    let handle = ClientTcpPathSessionHandle::new(test_tcp_session_runtime_for(path, SessionId(44)));
     let stream = handle
         .open_stream(
             StreamId(99),
@@ -3475,7 +3392,7 @@ fn opened_relay_stream_for_test(
 }
 
 async fn send_relay_stream_frame_for_test(
-    sender: &mut RelaySenderService,
+    sender: &mut RequestSenderService,
     context: &ClientPathContext,
     remotes: &mut ReliableRelayRemoteSet,
     frame: Frame,
@@ -3523,7 +3440,7 @@ async fn relay_sender_queue_full_blocks_without_detaching_path() {
         },
     };
     let mut remotes = ReliableRelayRemoteSet::new(opened, 4);
-    let mut sender = RelaySenderService::new(stream_id);
+    let mut sender = RequestSenderService::new(stream_id);
 
     let err = sender
         .send_stream_data(
@@ -3576,7 +3493,7 @@ async fn client_sender_slices_large_upload_reads_to_service_quantum() {
     let mut remotes = ReliableRelayRemoteSet::new(opened, 4);
     let mut send_stream = ReliableSendStream::new(stream_id, mux_limits);
     send_stream.update_max_offset(mux_limits.max_stream_window_bytes);
-    let mut sender = RelaySenderService::new(stream_id);
+    let mut sender = RequestSenderService::new(stream_id);
     let mut sender_queue = ReliableRelaySenderQueue::default();
     let queued_bytes = mux_limits.max_reliable_relay_chunk_bytes;
     let quantum = BBR_MAX_SEND_QUANTUM_BYTES.min(reliable_relay_buffer_len(mux_limits));
@@ -3652,7 +3569,7 @@ async fn path_failure_repairs_enqueue_repair_lane_without_carrier_send() {
         opened_relay_stream_for_test(stream_id, UnderlayProtocol::Tcp, 0);
     let mut remotes = ReliableRelayRemoteSet::new(opened, 4);
     let mut send_stream = ReliableSendStream::new(stream_id, mux_limits);
-    let mut sender = RelaySenderService::new(stream_id);
+    let mut sender = RequestSenderService::new(stream_id);
     let failed_key = RelayPathKey {
         underlay: UnderlayProtocol::Tcp,
         index: 0,
@@ -3774,7 +3691,7 @@ async fn repair_race_attach_preserves_active_data_path() {
         ResourceLimits::default(),
     )
     .expect("context");
-    let mut sender = RelaySenderService::new(stream_id);
+    let mut sender = RequestSenderService::new(stream_id);
     send_relay_stream_frame_for_test(
         &mut sender,
         &context,
@@ -3834,7 +3751,7 @@ async fn latency_live_owner_request_tail_repair_uses_distinct_repair_path() {
     remotes.attach_for_repair(repair_stream);
     remotes.set_lane(FlowLane::Latency);
 
-    let mut sender = RelaySenderService::new(stream_id);
+    let mut sender = RequestSenderService::new(stream_id);
     let mut send_stream = ReliableSendStream::new(stream_id, limits);
     for value in [0x41, 0x42, 0x43] {
         let frame = send_stream
@@ -3998,7 +3915,7 @@ async fn repair_only_path_is_not_active_and_cannot_be_reannounced() {
         target: TargetAddr::Ip(SocketAddr::from(([127, 0, 0, 1], 80))),
         ingress: IngressKind::Socks5,
     };
-    let mut sender = RelaySenderService::new(stream_id);
+    let mut sender = RequestSenderService::new(stream_id);
     assert!(matches!(
         sender
             .reannounce_active_path(&context, &mut remotes, &spec, FlowLane::Latency)
@@ -4043,7 +3960,7 @@ async fn swallowed_active_control_failure_reports_owner_debt_before_later_data()
         underlay: UnderlayProtocol::Tcp,
         index: 0,
     };
-    let mut sender = RelaySenderService::new(stream_id);
+    let mut sender = RequestSenderService::new(stream_id);
     let mut send_stream = ReliableSendStream::new(stream_id, limits);
     let owner_frame = send_stream
         .send_data(Bytes::from_static(b"unacked-owner"), StreamFlags::NONE)
@@ -4171,7 +4088,7 @@ async fn repair_only_path_can_become_active_after_explicit_reannounce() {
         target: TargetAddr::Ip(SocketAddr::from(([127, 0, 0, 1], 80))),
         ingress: IngressKind::Socks5,
     };
-    let mut sender = RelaySenderService::new(stream_id);
+    let mut sender = RequestSenderService::new(stream_id);
     assert!(
         !remotes
             .paths
@@ -4283,7 +4200,7 @@ async fn active_teardown_promotes_sole_repair_before_failed_owner_repair() {
         underlay: UnderlayProtocol::Udp,
         index: 0,
     };
-    let mut sender = RelaySenderService::new(stream_id);
+    let mut sender = RequestSenderService::new(stream_id);
     let mut send_stream = ReliableSendStream::new(stream_id, limits);
     let frame = send_stream
         .send_data(
@@ -4395,7 +4312,7 @@ async fn bulk_relay_keeps_normal_stream_data_on_active_path() {
     )
     .expect("context");
 
-    let mut sender = RelaySenderService::new(stream_id);
+    let mut sender = RequestSenderService::new(stream_id);
     let first_payload = Bytes::from(vec![1u8; 64 * 1024]);
     send_relay_stream_frame_for_test(
         &mut sender,
@@ -4479,7 +4396,7 @@ async fn request_sender_blocked_bulk_admission_does_not_fallback_to_eta_path() {
     context.mark_tcp_path_open_success(0, Duration::from_millis(20), FlowLane::Throughput);
     context.mark_udp_path_open_success(0, Duration::from_millis(10));
 
-    let mut sender = RelaySenderService::new(stream_id);
+    let mut sender = RequestSenderService::new(stream_id);
     send_relay_stream_frame_for_test(
         &mut sender,
         &context,
@@ -4598,7 +4515,7 @@ async fn bulk_relay_validation_attach_sends_path_proof_not_unique_stream_data() 
     context.mark_tcp_path_open_success(0, Duration::from_millis(20), FlowLane::Throughput);
     context.mark_tcp_path_open_success(1, Duration::from_millis(20), FlowLane::Throughput);
 
-    let mut sender = RelaySenderService::new(stream_id);
+    let mut sender = RequestSenderService::new(stream_id);
     send_relay_stream_frame_for_test(
         &mut sender,
         &context,
@@ -4694,7 +4611,7 @@ async fn bulk_relay_uses_measured_tcp_peer_when_ecf_prefers_it() {
     context.mark_tcp_path_open_success(0, Duration::from_millis(20), FlowLane::Throughput);
     context.mark_tcp_path_open_success(1, Duration::from_millis(180), FlowLane::Throughput);
 
-    let mut sender = RelaySenderService::new(stream_id);
+    let mut sender = RequestSenderService::new(stream_id);
     send_relay_stream_frame_for_test(
         &mut sender,
         &context,
@@ -4824,7 +4741,7 @@ async fn measured_bulk_alternate_requires_explicit_service_migration() {
         target: TargetAddr::Ip(SocketAddr::from(([127, 0, 0, 1], 80))),
         ingress: IngressKind::Socks5,
     };
-    let mut sender = RelaySenderService::new(stream_id);
+    let mut sender = RequestSenderService::new(stream_id);
     assert!(
         sender
             .reannounce_path_instance_as_active(
@@ -4988,7 +4905,7 @@ async fn mixed_relay_path_status_active_does_not_replay_whole_repair_cache_on_in
     send_stream
         .send_data(Bytes::from_static(b"repair"), StreamFlags::NONE)
         .expect("repair data");
-    let mut sender = RelaySenderService::new(stream_id);
+    let mut sender = RequestSenderService::new(stream_id);
 
     assert!(
         !sender

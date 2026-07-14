@@ -257,6 +257,41 @@ pub(super) async fn drain_server_udp_reliable_commands(
                     "server QUIC path received TCP capacity command",
                 ));
             }
+            ReliablePathCommand::ResetAndCloseStream {
+                stream_id: reset_stream_id,
+                reason,
+            } => {
+                if reset_stream_id != stream_id {
+                    commands.release_pending_command_bytes(pending_bytes);
+                    return Err(RuntimeError::Protocol(
+                        "server QUIC terminal command stream does not match writer",
+                    ));
+                }
+                // This QUIC writer is stream-local; flush the reset before
+                // detaching and finishing its carrier stream.
+                pending_frames.push(Frame::StreamReset {
+                    stream_id: reset_stream_id,
+                    reason,
+                });
+                sent_bytes = sent_bytes.saturating_add(writer_run_bytes);
+                sent_items = sent_items.saturating_add(1);
+                flush_udp_frame_batch_with_path_proofs(
+                    send,
+                    pending_frames,
+                    context.codec_limits,
+                    path_proofs,
+                )
+                .await?;
+                context.reliable_streams.detach_path(
+                    session_id,
+                    stream_id,
+                    UnderlayProtocol::Udp,
+                    path_id,
+                    commands_tx,
+                );
+                let _ = udp_path_finish_stream(send);
+                true
+            }
             ReliablePathCommand::CloseStream(close_stream_id) => {
                 flush_udp_frame_batch_with_path_proofs(
                     send,

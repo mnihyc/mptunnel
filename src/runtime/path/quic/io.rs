@@ -47,13 +47,12 @@ impl UdpPathEndpoint {
     }
 
     pub(super) async fn bind_client(
-        _path: &PathSpec,
-        local_addr: SocketAddr,
+        socket: crate::transport::CarrierSocket,
         runtime: &ClientUdpPathSessionRuntime,
     ) -> Result<Self, RuntimeError> {
         Ok(Self {
-            endpoint: quic_transport::Endpoint::bind_client(
-                local_addr,
+            endpoint: quic_transport::Endpoint::bind_client_socket(
+                socket,
                 runtime.security.secret.as_bytes(),
                 runtime.mux_limits,
             )
@@ -313,7 +312,11 @@ pub(super) fn spawn_quic_path_reader(
     let (frames_tx, frames_rx) = mpsc::channel(queue_size);
     tokio::spawn(async move {
         loop {
-            let frame = match udp_path_read_frame(&mut recv, codec_limits).await {
+            let received = tokio::select! {
+                _ = frames_tx.closed() => return,
+                received = udp_path_read_frame(&mut recv, codec_limits) => received,
+            };
+            let frame = match received {
                 Ok(frame) => Ok(frame),
                 Err(err) if udp_path_frame_finished(&err) => {
                     Err(RuntimeError::ReliablePathSessionClosed)

@@ -8,6 +8,10 @@ use super::*;
 use crate::protocol::frame::reliable_path_frame_pacing_bytes;
 use crate::protocol::frame::reliable_stream_frame_accounted_bytes;
 
+#[cfg(test)]
+#[path = "service_test.rs"]
+mod tests;
+
 #[derive(Debug)]
 /// Current server response sender-service boundary.
 ///

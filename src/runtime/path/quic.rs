@@ -18,5 +18,4 @@ mod server_stream;
 mod server_writer;
 
 #[cfg(test)]
-#[path = "estimator_test_support.rs"]
 mod estimator_test_support;

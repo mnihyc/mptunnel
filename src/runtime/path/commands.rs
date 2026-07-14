@@ -271,6 +271,19 @@ impl ReliablePathCommandSender {
             .await
     }
 
+    pub(in crate::runtime) async fn send_stream_ordered_reset_and_close(
+        &self,
+        stream_id: StreamId,
+        reason: ResetReason,
+        lane: FlowLane,
+    ) -> Result<(), mpsc::error::SendError<ReliablePathCommand>> {
+        self.send_stream_ordered_command(
+            ReliablePathCommand::ResetAndCloseStream { stream_id, reason },
+            lane,
+        )
+        .await
+    }
+
     async fn send_stream_ordered_command(
         &self,
         command: ReliablePathCommand,
@@ -921,6 +934,12 @@ pub(in crate::runtime) fn reliable_path_command_pending_bytes(
         ReliablePathCommand::SendTcpCapacityProbe(probe) => {
             usize::try_from(probe.train_payload_bytes).unwrap_or(usize::MAX)
         }
+        ReliablePathCommand::ResetAndCloseStream { stream_id, reason } => {
+            reliable_path_frame_pacing_bytes(&Frame::StreamReset {
+                stream_id: *stream_id,
+                reason: *reason,
+            })
+        }
         ReliablePathCommand::OpenStream { .. }
         | ReliablePathCommand::CancelTcpOpen { .. }
         | ReliablePathCommand::CloseStream(_) => 0,
@@ -944,6 +963,13 @@ pub(in crate::runtime) fn reliable_path_command_writer_run_bytes(
                 .unwrap_or(usize::MAX)
                 .max(1)
         }
+        ReliablePathCommand::ResetAndCloseStream { stream_id, reason } => {
+            crate::protocol::codec::encoded_frame_capacity_hint(&Frame::StreamReset {
+                stream_id: *stream_id,
+                reason: *reason,
+            })
+            .max(1)
+        }
         ReliablePathCommand::OpenStream { .. }
         | ReliablePathCommand::CancelTcpOpen { .. }
         | ReliablePathCommand::CloseStream(_) => 1,
@@ -958,6 +984,7 @@ fn reliable_path_command_stream_id(command: &ReliablePathCommand) -> StreamId {
         ReliablePathCommand::SendTcpCapacityProbe(_) => StreamId(0),
         ReliablePathCommand::OpenStream { stream_id, .. }
         | ReliablePathCommand::CancelTcpOpen { stream_id, .. }
+        | ReliablePathCommand::ResetAndCloseStream { stream_id, .. }
         | ReliablePathCommand::CloseStream(stream_id) => *stream_id,
     }
 }
@@ -1244,6 +1271,12 @@ pub(in crate::runtime) enum ReliablePathCommand {
     SendQuicCapacityProbe(QuicCapacityProbeCommand),
     // TCP owns receipt timing and native socket evidence independently of QUIC.
     SendTcpCapacityProbe(TcpCapacityProbeCommand),
+    /// Server response terminal transaction: write reset in data order, then
+    /// retire that response's local carrier attachment.
+    ResetAndCloseStream {
+        stream_id: StreamId,
+        reason: ResetReason,
+    },
     CloseStream(StreamId),
 }
 
@@ -1309,6 +1342,7 @@ fn reliable_path_command_kind(command: &ReliablePathCommand) -> &'static str {
         ReliablePathCommand::SendFrame(frame) => reliable_path_frame_kind(frame),
         ReliablePathCommand::SendQuicCapacityProbe(_) => "quic_capacity_probe",
         ReliablePathCommand::SendTcpCapacityProbe(_) => "tcp_capacity_probe",
+        ReliablePathCommand::ResetAndCloseStream { .. } => "reset_and_close_stream",
         ReliablePathCommand::CloseStream(_) => "close_stream",
     }
 }

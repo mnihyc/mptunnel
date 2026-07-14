@@ -3,7 +3,9 @@
 //! This owner preserves the biased select loop, carrier generation, and the
 //! lifetime coupling between one TCP carrier and all attached product streams.
 
-use super::client_connection::{ClientTcpHeartbeatTimeoutDisposition, connect_client_tcp_carrier};
+use super::client_connection::{
+    ClientTcpCarrierConnect, ClientTcpHeartbeatTimeoutDisposition, connect_client_tcp_carrier,
+};
 use super::client_receive::handle_client_tcp_path_frame;
 use super::client_state::{ClientTcpPathConnection, ClientTcpPathSessionRuntime};
 use super::client_stream::{
@@ -12,12 +14,17 @@ use super::client_stream::{
     open_client_tcp_stream_on_connection,
 };
 use super::client_writer::handle_connected_client_tcp_command_run;
+#[cfg(test)]
 use crate::config::SecurityConfig;
 #[cfg(feature = "lab-diagnostics")]
 use crate::lab_diagnostics::lab_diagnostic;
+#[cfg(test)]
 use crate::mux::MuxLimits;
+#[cfg(test)]
+use crate::protocol::SessionId;
+#[cfg(test)]
 use crate::protocol::codec::CodecLimits;
-use crate::protocol::{Frame, PathId, PathMetricDirection, SessionId, StreamId};
+use crate::protocol::{Frame, PathId, PathMetricDirection, StreamId};
 use crate::runtime::error::RuntimeError;
 use crate::runtime::path::commands::{
     ClientTcpOpenResponse, ReliablePathCommand, ReliablePathCommandReceivers,
@@ -26,6 +33,7 @@ use crate::runtime::path::commands::{
 };
 use crate::runtime::path::model::{path_startup_metrics, path_startup_snapshot};
 use crate::runtime::recent_ids::RecentIdCache;
+#[cfg(test)]
 use crate::transport::PathSpec;
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -341,15 +349,7 @@ async fn handle_disconnected_client_tcp_command(
                 ));
                 return;
             }
-            let connect = connect_client_tcp_path(
-                &runtime.path,
-                runtime.path_index,
-                runtime.session_id,
-                &runtime.security,
-                runtime.codec_limits,
-                runtime.mux_limits,
-                open_deadline,
-            );
+            let connect = connect_client_tcp_path(&runtime, open_deadline);
             tokio::pin!(connect);
             let connect_result = tokio::select! {
                 biased;
@@ -402,29 +402,32 @@ async fn handle_disconnected_client_tcp_command(
         ReliablePathCommand::SendTcpCapacityProbe(_) => {}
         ReliablePathCommand::CancelTcpOpen { .. }
         | ReliablePathCommand::SendFrame(_)
+        | ReliablePathCommand::ResetAndCloseStream { .. }
         | ReliablePathCommand::CloseStream(_) => {}
     }
 }
 
 async fn connect_client_tcp_path(
-    path: &PathSpec,
-    path_index: usize,
-    session_id: SessionId,
-    security: &SecurityConfig,
-    codec_limits: CodecLimits,
-    mux_limits: MuxLimits,
+    runtime: &ClientTcpPathSessionRuntime,
     open_deadline: tokio::time::Instant,
 ) -> Result<ClientTcpPathConnection, RuntimeError> {
-    let startup_snapshot = path_startup_snapshot(path, path_index);
-    let startup_metrics =
-        path_startup_metrics(path, path_index, PathMetricDirection::ClientToServer);
+    let startup_snapshot = path_startup_snapshot(&runtime.path, runtime.path_index);
+    let startup_metrics = path_startup_metrics(
+        &runtime.path,
+        runtime.path_index,
+        PathMetricDirection::ClientToServer,
+    );
     let carrier = connect_client_tcp_carrier(
-        path,
-        path_index,
-        session_id,
-        security,
-        codec_limits,
-        mux_limits,
+        ClientTcpCarrierConnect {
+            path: &runtime.path,
+            path_index: runtime.path_index,
+            config_ordinal: runtime.config_ordinal,
+            session_id: runtime.session_id,
+            security: &runtime.security,
+            codec_limits: runtime.codec_limits,
+            mux_limits: runtime.mux_limits,
+            carrier_sockets: runtime.carrier_sockets.as_ref(),
+        },
         open_deadline,
     )
     .await?;
@@ -432,7 +435,7 @@ async fn connect_client_tcp_path(
         startup_snapshot,
         startup_metrics,
         carrier,
-        mux_limits,
+        runtime.mux_limits,
     ))
 }
 
@@ -446,13 +449,17 @@ pub(in crate::runtime) async fn connect_client_tcp_path_for_test(
     mux_limits: MuxLimits,
     open_deadline: tokio::time::Instant,
 ) -> Result<(), RuntimeError> {
-    connect_client_tcp_path(
-        path,
-        path_index,
-        session_id,
-        security,
-        codec_limits,
-        mux_limits,
+    connect_client_tcp_carrier(
+        ClientTcpCarrierConnect {
+            path,
+            path_index,
+            config_ordinal: path_index,
+            session_id,
+            security,
+            codec_limits,
+            mux_limits,
+            carrier_sockets: &crate::transport::SystemCarrierSocketProvider,
+        },
         open_deadline,
     )
     .await

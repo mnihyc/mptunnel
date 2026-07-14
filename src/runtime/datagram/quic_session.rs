@@ -25,6 +25,9 @@ use crate::runtime::path::{
     ClientPathContext, ClientPathHealth, ClientPathHealthRecord, ClientPathState,
 };
 use crate::transport::PathSpec;
+use crate::transport::CarrierSocketProvider;
+#[cfg(test)]
+use crate::transport::SystemCarrierSocketProvider;
 use bytes::Bytes;
 use std::collections::HashMap;
 use std::time::{Duration, Instant};
@@ -49,6 +52,7 @@ pub(in crate::runtime) struct UdpDatagramClientSession {
 }
 
 impl UdpDatagramClientSession {
+    #[cfg(test)]
     pub(in crate::runtime) async fn open(
         path: &PathSpec,
         path_index: usize,
@@ -57,8 +61,29 @@ impl UdpDatagramClientSession {
         mux_limits: MuxLimits,
         handshake_timeout: Duration,
     ) -> Result<Self, RuntimeError> {
+        Self::open_with_provider(
+            path,
+            path_index,
+            security,
+            codec_limits,
+            mux_limits,
+            handshake_timeout,
+            std::sync::Arc::new(SystemCarrierSocketProvider),
+        )
+        .await
+    }
+
+    pub(in crate::runtime) async fn open_with_provider(
+        path: &PathSpec,
+        path_index: usize,
+        security: SecurityConfig,
+        codec_limits: CodecLimits,
+        mux_limits: MuxLimits,
+        handshake_timeout: Duration,
+        carrier_sockets: std::sync::Arc<dyn CarrierSocketProvider>,
+    ) -> Result<Self, RuntimeError> {
         let session_id = random_session_id()?;
-        Self::open_for_session(
+        Self::open_for_session_with_provider(
             path,
             path_index,
             session_id,
@@ -66,10 +91,12 @@ impl UdpDatagramClientSession {
             codec_limits,
             mux_limits,
             handshake_timeout,
+            carrier_sockets,
         )
         .await
     }
 
+    #[cfg(test)]
     pub(in crate::runtime) async fn open_for_session(
         path: &PathSpec,
         path_index: usize,
@@ -79,6 +106,29 @@ impl UdpDatagramClientSession {
         mux_limits: MuxLimits,
         handshake_timeout: Duration,
     ) -> Result<Self, RuntimeError> {
+        Self::open_for_session_with_provider(
+            path,
+            path_index,
+            session_id,
+            security,
+            codec_limits,
+            mux_limits,
+            handshake_timeout,
+            std::sync::Arc::new(SystemCarrierSocketProvider),
+        )
+        .await
+    }
+
+    pub(in crate::runtime) async fn open_for_session_with_provider(
+        path: &PathSpec,
+        path_index: usize,
+        session_id: SessionId,
+        security: SecurityConfig,
+        codec_limits: CodecLimits,
+        mux_limits: MuxLimits,
+        handshake_timeout: Duration,
+        carrier_sockets: std::sync::Arc<dyn CarrierSocketProvider>,
+    ) -> Result<Self, RuntimeError> {
         let state = ClientPathState::new(ClientPathHealth {
             tcp: Vec::new(),
             udp: vec![ClientPathHealthRecord::default(); path_index.saturating_add(1)],
@@ -86,12 +136,14 @@ impl UdpDatagramClientSession {
         let path_session = ClientUdpPathSessionHandle::new(ClientUdpPathSessionRuntime {
             path: path.clone(),
             path_index,
+            config_ordinal: path_index,
             session_id,
             security,
             codec_limits,
             mux_limits,
             stream_frame_queue: reliable_stream_frame_queue(mux_limits),
             state,
+            carrier_sockets,
         });
         Self::open_from_udp_session(path_session, path_index, mux_limits, handshake_timeout).await
     }

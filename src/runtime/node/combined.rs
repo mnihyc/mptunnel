@@ -3,8 +3,9 @@
 use super::{client, server};
 use crate::config::{ManagementConfig, NodeConfig, ResourceLimits};
 use crate::runtime::error::RuntimeError;
-use crate::runtime::management::run_node_management_api;
+use crate::runtime::management::spawn_node_management_services;
 use crate::runtime::packet_device::PacketDeviceProvider;
+use crate::transport::CarrierSocketProvider;
 use std::sync::Arc;
 
 pub(super) async fn run(
@@ -12,17 +13,19 @@ pub(super) async fn run(
     resources: ResourceLimits,
     management: ManagementConfig,
     packet_devices: Arc<dyn PacketDeviceProvider>,
+    carrier_sockets: Arc<dyn CarrierSocketProvider>,
 ) -> Result<(), RuntimeError> {
     let mut services = tokio::task::JoinSet::new();
+    let mut path_probe_services = Vec::with_capacity(node.clients.len());
 
     let mut client_contexts = Vec::with_capacity(node.clients.len());
     for client_config in node.clients {
-        let context = client::new_path_context(&client_config, resources)?;
-        client::start_path_probes(
+        let context = client::new_path_context(&client_config, resources, carrier_sockets.clone())?;
+        path_probe_services.push((
             context.clone(),
             client_config.path_probe_interval,
             client_config.path_probe_timeout,
-        );
+        ));
         client::spawn_ingresses(
             client_config.ingresses,
             context.clone(),
@@ -56,24 +59,19 @@ pub(super) async fn run(
     }
 
     if management.enabled() {
-        services.spawn(async move {
-            run_node_management_api(management, client_contexts, server_contexts).await
-        });
+        spawn_node_management_services(management, client_contexts, server_contexts, &mut services);
     }
 
-    wait_for_service(services).await
-}
-
-async fn wait_for_service(
-    mut services: tokio::task::JoinSet<Result<(), RuntimeError>>,
-) -> Result<(), RuntimeError> {
-    if let Some(result) = services.join_next().await {
-        match result {
-            Ok(Ok(())) => Err(RuntimeError::Protocol("node service exited")),
-            Ok(Err(err)) => Err(err),
-            Err(err) => Err(RuntimeError::TaskJoin(err)),
-        }
-    } else {
-        Err(RuntimeError::Protocol("node has no runtime services"))
+    if services.is_empty() {
+        return Err(RuntimeError::Protocol("node has no runtime services"));
     }
+    for (context, interval, timeout) in path_probe_services {
+        client::spawn_path_probe_service(context, interval, timeout, &mut services);
+    }
+    super::supervise_runtime_services(
+        services,
+        "node service exited",
+        "node has no runtime services",
+    )
+    .await
 }

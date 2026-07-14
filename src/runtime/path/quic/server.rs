@@ -1,4 +1,7 @@
 //! Server QUIC listener, authentication, and stream dispatch.
+//!
+//! Listener and connection tasks own descendants so carrier shutdown retires
+//! the full task tree.
 
 use super::datagram::*;
 use super::io::*;
@@ -19,16 +22,29 @@ pub(in crate::runtime) async fn run_server_udp_listener(
     endpoint: UdpPathEndpoint,
     context: ServerPathContext,
 ) -> Result<(), RuntimeError> {
+    let mut connections = tokio::task::JoinSet::new();
     loop {
-        let Some(connection) = endpoint.accept().await else {
-            return Err(RuntimeError::Protocol("QUIC UDP path endpoint closed"));
-        };
-        let context = context.clone();
-        tokio::spawn(async move {
-            if let Err(err) = handle_server_udp_connection(connection, context).await {
-                warn_unexpected_udp_runtime_error("server QUIC UDP path connection failed", &err);
+        tokio::select! {
+            accepted = endpoint.accept() => {
+                let Some(connection) = accepted else {
+                    return Err(RuntimeError::Protocol("QUIC UDP path endpoint closed"));
+                };
+                let context = context.clone();
+                connections.spawn(async move {
+                    if let Err(err) = handle_server_udp_connection(connection, context).await {
+                        warn_unexpected_udp_runtime_error(
+                            "server QUIC UDP path connection failed",
+                            &err,
+                        );
+                    }
+                });
             }
-        });
+            Some(result) = connections.join_next(), if !connections.is_empty() => {
+                if let Err(err) = result {
+                    eprintln!("warning: server QUIC UDP path connection task failed: {err}");
+                }
+            }
+        }
     }
 }
 
@@ -42,33 +58,43 @@ async fn handle_server_udp_connection(
         context
             .reliable_streams
             .register_carrier_path(session_id, UnderlayProtocol::Udp, path_id);
-    spawn_server_quic_path_metrics(
+    let mut streams = tokio::task::JoinSet::new();
+    streams.spawn(run_server_quic_path_metrics(
         context.clone(),
         path_registration.clone(),
         connection.clone(),
-    );
+    ));
     loop {
-        let (send, recv) = match connection.accept_bi().await {
-            Ok(streams) => streams,
-            Err(err) => return Err(err),
-        };
-        let context = context.clone();
-        let path_registration = path_registration.clone();
-        tokio::spawn(async move {
-            if let Err(err) = handle_server_udp_bidi_stream(
-                send,
-                recv,
-                context,
-                session_id,
-                path_id,
-                path_registration,
-                capabilities,
-            )
-            .await
-            {
-                warn_unexpected_udp_runtime_error("server QUIC UDP path stream failed", &err);
+        tokio::select! {
+            accepted = connection.accept_bi() => {
+                let (send, recv) = accepted?;
+                let context = context.clone();
+                let path_registration = path_registration.clone();
+                streams.spawn(async move {
+                    if let Err(err) = handle_server_udp_bidi_stream(
+                        send,
+                        recv,
+                        context,
+                        session_id,
+                        path_id,
+                        path_registration,
+                        capabilities,
+                    )
+                    .await
+                    {
+                        warn_unexpected_udp_runtime_error(
+                            "server QUIC UDP path stream failed",
+                            &err,
+                        );
+                    }
+                });
             }
-        });
+            Some(result) = streams.join_next(), if !streams.is_empty() => {
+                if let Err(err) = result {
+                    eprintln!("warning: server QUIC UDP path stream task failed: {err}");
+                }
+            }
+        }
     }
 }
 

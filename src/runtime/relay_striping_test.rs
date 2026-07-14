@@ -94,6 +94,94 @@ fn mark_path_proof(context: &ClientPathContext, key: RelayPathKey, elapsed: Dura
     );
 }
 
+#[derive(Default)]
+struct RequestSchedulingFixture {
+    operation: Option<RequestAckClockOperation>,
+    subflows: RequestSubflows,
+}
+
+impl RequestSchedulingFixture {
+    fn with_operation(mut self, operation: RequestAckClockOperation) -> Self {
+        self.operation = Some(operation);
+        self
+    }
+
+    fn with_rate_proven(mut self, instances: impl IntoIterator<Item = RelayPathInstance>) -> Self {
+        for instance in instances {
+            self.subflows.get_mut(instance).mark_rate_proven();
+        }
+        self
+    }
+
+    fn with_graduated(mut self, instances: impl IntoIterator<Item = RelayPathInstance>) -> Self {
+        for instance in instances {
+            self.subflows.get_mut(instance).mark_graduated();
+        }
+        self
+    }
+
+    fn with_ack_clock_first_window(
+        mut self,
+        instances: impl IntoIterator<Item = RelayPathInstance>,
+    ) -> Self {
+        for instance in instances {
+            self.subflows
+                .get_mut(instance)
+                .mark_ack_clock_first_window();
+        }
+        self
+    }
+
+    fn with_ack_clock_proven(
+        mut self,
+        instances: impl IntoIterator<Item = RelayPathInstance>,
+    ) -> Self {
+        for instance in instances {
+            self.subflows.get_mut(instance).mark_ack_clock_proven();
+        }
+        self
+    }
+
+    fn with_tcp_capacity_proven(
+        mut self,
+        instances: impl IntoIterator<Item = RelayPathInstance>,
+    ) -> Self {
+        for instance in instances {
+            self.subflows.get_mut(instance).mark_tcp_capacity_proven();
+        }
+        self
+    }
+
+    fn with_calibration_spend(
+        mut self,
+        spent: impl IntoIterator<Item = (RelayPathInstance, u64)>,
+    ) -> Self {
+        for (instance, bytes) in spent {
+            self.subflows
+                .get_mut(instance)
+                .set_ack_clock_calibration_bytes(bytes);
+        }
+        self
+    }
+
+    fn with_per_flow_rates(
+        mut self,
+        rates: impl IntoIterator<Item = (RelayPathInstance, RequestPerFlowRateModel)>,
+    ) -> Self {
+        for (instance, model) in rates {
+            self.subflows.get_mut(instance).set_per_flow_rate(model);
+        }
+        self
+    }
+
+    fn state(&self) -> RequestSchedulingState<'_> {
+        RequestSchedulingState {
+            operation: self.operation,
+            subflows: &self.subflows,
+        }
+    }
+}
+
 #[test]
 fn request_bulk_flow_registration_counts_only_tcp_service_flows_once() {
     let context = context(&["tcp://127.0.0.1:10079", "udp://127.0.0.1:10080"]);
@@ -134,14 +222,14 @@ fn request_scheduler_keeps_tcp_ack_rates_flow_local() {
     let path = relay_path(UnderlayProtocol::Tcp, 0, RelayPathPlacement::Active);
     let instance = path.instance();
     mark_bulk_service(&context, instance.key);
-    let slow_flow = HashMap::from([(
+    let slow_flow = RequestSchedulingFixture::default().with_per_flow_rates([(
         instance,
         RequestPerFlowRateModel {
             rate_bps: 80_000_000.0,
             delivery_samples: RELIABLE_INITIAL_WINDOW_PACKETS as u32,
         },
     )]);
-    let fast_flow = HashMap::from([(
+    let fast_flow = RequestSchedulingFixture::default().with_per_flow_rates([(
         instance,
         RequestPerFlowRateModel {
             rate_bps: 320_000_000.0,
@@ -153,7 +241,7 @@ fn request_scheduler_keeps_tcp_ack_rates_flow_local() {
         &context,
         instance,
         Some(instance.key),
-        Some(&slow_flow),
+        Some(slow_flow.state()),
         true,
     )
     .expect("slow flow snapshot");
@@ -161,7 +249,7 @@ fn request_scheduler_keeps_tcp_ack_rates_flow_local() {
         &context,
         instance,
         Some(instance.key),
-        Some(&fast_flow),
+        Some(fast_flow.state()),
         true,
     )
     .expect("fast flow snapshot");
@@ -173,7 +261,7 @@ fn request_scheduler_keeps_tcp_ack_rates_flow_local() {
     assert_eq!(slow.rate_scope, PathRateScope::PerFlowGoodput);
     assert_eq!(fast.rate_scope, PathRateScope::PerFlowGoodput);
 
-    let provisional_flow = HashMap::from([(
+    let provisional_flow = RequestSchedulingFixture::default().with_per_flow_rates([(
         instance,
         RequestPerFlowRateModel {
             rate_bps: 24_000_000.0,
@@ -184,7 +272,7 @@ fn request_scheduler_keeps_tcp_ack_rates_flow_local() {
         &context,
         instance,
         Some(instance.key),
-        Some(&provisional_flow),
+        Some(provisional_flow.state()),
         true,
     )
     .expect("provisional flow snapshot");
@@ -218,7 +306,7 @@ fn provisional_tcp_prior_yields_to_mature_exact_subflow_pipe_credit() {
     let service = relay_path(UnderlayProtocol::Tcp, 0, RelayPathPlacement::Active);
     let candidate = relay_path(UnderlayProtocol::Tcp, 1, RelayPathPlacement::Validation);
     let candidate_instance = candidate.instance();
-    let provisional_flow = HashMap::from([(
+    let provisional_flow = RequestSchedulingFixture::default().with_per_flow_rates([(
         candidate_instance,
         RequestPerFlowRateModel {
             rate_bps: 24_000_000.0,
@@ -230,7 +318,7 @@ fn provisional_tcp_prior_yields_to_mature_exact_subflow_pipe_credit() {
         &context,
         candidate_instance,
         Some(service.key()),
-        Some(&provisional_flow),
+        Some(provisional_flow.state()),
         false,
     )
     .expect("provisional candidate snapshot");
@@ -241,7 +329,7 @@ fn provisional_tcp_prior_yields_to_mature_exact_subflow_pipe_credit() {
         subflow.inflight_limit_bytes, 22_500_000,
         "one app-limited proof sample must not prevent the TCP carrier from ramping"
     );
-    let mature_flow = HashMap::from([(
+    let mature_flow = RequestSchedulingFixture::default().with_per_flow_rates([(
         candidate_instance,
         RequestPerFlowRateModel {
             rate_bps: 24_000_000.0,
@@ -252,7 +340,7 @@ fn provisional_tcp_prior_yields_to_mature_exact_subflow_pipe_credit() {
         &context,
         candidate_instance,
         Some(service.key()),
-        Some(&mature_flow),
+        Some(mature_flow.state()),
         true,
     )
     .expect("mature candidate snapshot");
@@ -268,7 +356,7 @@ fn provisional_tcp_prior_yields_to_mature_exact_subflow_pipe_credit() {
         &context,
         candidate_instance,
         Some(service.key()),
-        Some(&provisional_flow),
+        Some(provisional_flow.state()),
         true,
     )
     .expect("owned candidate snapshot");
@@ -276,7 +364,7 @@ fn provisional_tcp_prior_yields_to_mature_exact_subflow_pipe_credit() {
         &context,
         candidate_instance,
         Some(service.key()),
-        Some(&provisional_flow),
+        Some(provisional_flow.state()),
         false,
     )
     .expect("prospective candidate snapshot");
@@ -290,7 +378,7 @@ fn endpoint_only_candidate_borrows_service_rate_only_until_its_model_matures() {
     let context = context(&["tcp://127.0.0.1:10078", "tcp://127.0.0.1:10079"]);
     let service = relay_path(UnderlayProtocol::Tcp, 0, RelayPathPlacement::Active);
     let candidate = relay_path(UnderlayProtocol::Tcp, 1, RelayPathPlacement::Validation);
-    let provisional = HashMap::from([
+    let provisional = RequestSchedulingFixture::default().with_per_flow_rates([
         (
             service.instance(),
             RequestPerFlowRateModel {
@@ -310,23 +398,34 @@ fn endpoint_only_candidate_borrows_service_rate_only_until_its_model_matures() {
         &context,
         candidate.instance(),
         Some(service.key()),
-        Some(&provisional),
+        Some(provisional.state()),
         true,
     )
     .expect("endpoint-only exploration snapshot");
     assert_eq!(exploring.delivery_rate_bps, 400_000_000.0);
     assert!(exploring.inflight_limit_bytes > 1_000_000);
 
-    let mut mature = provisional;
-    mature
-        .get_mut(&candidate.instance())
-        .unwrap()
-        .delivery_samples = RELIABLE_INITIAL_WINDOW_PACKETS as u32;
+    let mature = RequestSchedulingFixture::default().with_per_flow_rates([
+        (
+            service.instance(),
+            RequestPerFlowRateModel {
+                rate_bps: 400_000_000.0,
+                delivery_samples: RELIABLE_INITIAL_WINDOW_PACKETS as u32,
+            },
+        ),
+        (
+            candidate.instance(),
+            RequestPerFlowRateModel {
+                rate_bps: 10_000_000.0,
+                delivery_samples: RELIABLE_INITIAL_WINDOW_PACKETS as u32,
+            },
+        ),
+    ]);
     let corrected = relay_path_snapshot_for_bulk_choice(
         &context,
         candidate.instance(),
         Some(service.key()),
-        Some(&mature),
+        Some(mature.state()),
         true,
     )
     .expect("mature endpoint-only snapshot");
@@ -342,7 +441,7 @@ fn configured_slow_candidate_does_not_borrow_faster_service_rate() {
     ]);
     let service = relay_path(UnderlayProtocol::Tcp, 0, RelayPathPlacement::Active);
     let candidate = relay_path(UnderlayProtocol::Tcp, 1, RelayPathPlacement::Validation);
-    let rates = HashMap::from([
+    let rates = RequestSchedulingFixture::default().with_per_flow_rates([
         (
             service.instance(),
             RequestPerFlowRateModel {
@@ -362,7 +461,7 @@ fn configured_slow_candidate_does_not_borrow_faster_service_rate() {
         &context,
         candidate.instance(),
         Some(service.key()),
-        Some(&rates),
+        Some(rates.state()),
         true,
     )
     .expect("configured heterogeneous candidate snapshot");
@@ -396,7 +495,6 @@ fn request_startup_needs_contention_but_existing_owner_drains_after_two_to_one()
             Some(service.key),
             Some(&flights),
             epoch,
-            None,
             None,
             None,
         )
@@ -470,6 +568,7 @@ fn request_startup_prefers_idle_candidate_owned_by_no_other_flow() {
     mark_path_proof(&context, occupied.key, Duration::from_millis(180));
     mark_path_proof(&context, idle.key, Duration::from_millis(180));
     context.reserve_tcp_path_load(occupied.key.index, FlowLane::Throughput);
+    let scheduling = RequestSchedulingFixture::default().with_rate_proven([service]);
 
     assert!(matches!(
         choose_request_startup_subflow(
@@ -482,8 +581,7 @@ fn request_startup_prefers_idle_candidate_owned_by_no_other_flow() {
             Some(service.key),
             Some(&RequestFlightLedger::default()),
             None,
-            Some(&HashSet::from([service])),
-            None,
+            Some(scheduling.state()),
             None,
         ),
         Some(BulkRelayPathChoice::SelectedStartupSubflow {
@@ -504,8 +602,7 @@ fn request_startup_prefers_idle_candidate_owned_by_no_other_flow() {
             Some(service.key),
             Some(&RequestFlightLedger::default()),
             None,
-            Some(&HashSet::from([service])),
-            None,
+            Some(scheduling.state()),
             None,
         )
         .is_none(),
@@ -549,7 +646,6 @@ fn request_startup_subflow_requires_proof_from_current_attachment() {
             None,
             None,
             None,
-            None,
         )
         .is_none(),
         "a proof observed before this output attached must not authorize unique data"
@@ -578,7 +674,6 @@ fn request_startup_subflow_requires_proof_from_current_attachment() {
             None,
             None,
             None,
-            None,
         )
         .is_none(),
         "another stream's newer proof ID must not authorize this attachment"
@@ -595,7 +690,6 @@ fn request_startup_subflow_requires_proof_from_current_attachment() {
             64 * 1024,
             Some(service_key),
             Some(&ledger),
-            None,
             None,
             None,
             None,
@@ -641,16 +735,21 @@ fn request_calibration_ignores_path_wide_completion_without_directional_provenan
         PathRateSample::new(256 * 1024, Duration::from_secs(1)).expect("low receipt-rate evidence"),
     );
     mark_path_proof(&context, candidate_key, Duration::from_millis(10));
-    let proven = HashSet::from([service, candidate]);
-    let graduated = HashSet::from([candidate]);
-    let ack_clock_proven = HashSet::new();
-    let receipt_boundaries = HashSet::from([candidate]);
+    let attempted = HashSet::from([candidate]);
     let calibration_target =
         reliable_request_ack_clock_calibration_target_bytes(context.mux_limits);
-    let mut spent = HashMap::new();
     let flights = RequestFlightLedger::default();
-    let request = |spent: &HashMap<RelayPathInstance, u64>,
-                   ack_clock_proven: &HashSet<RelayPathInstance>| {
+    let request = |spent: Option<u64>, ack_clock_proven: bool| {
+        let scheduling = RequestSchedulingFixture::default()
+            .with_rate_proven([service, candidate])
+            .with_graduated([candidate])
+            .with_ack_clock_first_window([candidate])
+            .with_ack_clock_proven(ack_clock_proven.then_some(candidate))
+            .with_calibration_spend(spent.map(|bytes| (candidate, bytes)))
+            .with_operation(RequestAckClockOperation::Owner {
+                candidate,
+                target_bytes: calibration_target,
+            });
         choose_bulk_relay_path_for_extent_avoiding(BulkRelayPathRequest {
             stream_id: StreamId(7),
             context: &context,
@@ -664,27 +763,14 @@ fn request_calibration_ignores_path_wide_completion_without_directional_provenan
             path_flights: Some(&flights),
             ordered_data_owner: Some(service_key),
             subflow_set: None,
-            proven_subflows: Some(&proven),
-            graduated_subflows: Some(&graduated),
-            attempted_subflows: Some(&graduated),
-            ack_clock_calibration: Some(RequestAckClockCalibration {
-                owner: Some(RequestAckClockCalibrationOwner {
-                    candidate,
-                    target_bytes: calibration_target,
-                }),
-                pending: None,
-                proven_subflows: ack_clock_proven,
-                first_window_acked_subflows: &receipt_boundaries,
-                spent_bytes: spent,
-                tcp_carrier_proven_candidates: None,
-            }),
-            request_per_flow_rate_bps: None,
+            request_state: Some(scheduling.state()),
+            attempted_subflows: Some(&attempted),
         })
     };
 
     assert!(
         matches!(
-            request(&spent, &ack_clock_proven),
+            request(None, false),
             BulkRelayPathChoice::SelectedAckClockCalibration {
                 position: 1,
                 candidate: selected,
@@ -708,7 +794,7 @@ fn request_calibration_ignores_path_wide_completion_without_directional_provenan
     );
     assert!(
         matches!(
-            request(&spent, &ack_clock_proven),
+            request(None, false),
             BulkRelayPathChoice::SelectedAckClockCalibration {
                 position: 1,
                 candidate: selected,
@@ -726,7 +812,7 @@ fn request_calibration_ignores_path_wide_completion_without_directional_provenan
     );
     assert!(
         matches!(
-            request(&spent, &ack_clock_proven),
+            request(None, false),
             BulkRelayPathChoice::SelectedAckClockCalibration {
                 position: 1,
                 candidate: selected,
@@ -736,18 +822,16 @@ fn request_calibration_ignores_path_wide_completion_without_directional_provenan
         "a mature fast candidate fits the bounded ACK-clock calibration window"
     );
 
-    spent.insert(candidate, calibration_target);
     assert!(
         !matches!(
-            request(&spent, &ack_clock_proven),
+            request(Some(calibration_target), false),
             BulkRelayPathChoice::SelectedAckClockCalibration { .. }
         ),
         "calibration credit is cumulative and does not refill"
     );
-    let ack_clock_proven = HashSet::from([candidate]);
     assert!(
         !matches!(
-            request(&HashMap::new(), &ack_clock_proven),
+            request(None, true),
             BulkRelayPathChoice::SelectedAckClockCalibration { .. }
         ),
         "a usable ACK-clock sample permanently returns the instance to ordinary ETA ranking"
@@ -773,11 +857,6 @@ fn request_calibration_needs_contention_but_spent_owner_drains_after_two_to_one(
         PathRateSample::new(256 * 1024, Duration::from_secs(1)).expect("cold carrier receipt"),
     );
     mark_path_proof(&context, candidate.key, Duration::from_millis(8));
-    let proven = HashSet::from([service, candidate]);
-    let graduated = HashSet::from([candidate]);
-    let ack_clock_proven = HashSet::new();
-    let receipt_boundaries = HashSet::from([candidate]);
-    let carrier_proven = HashSet::from([candidate]);
     let flights = RequestFlightLedger::default();
     let calibration_target =
         reliable_request_ack_clock_calibration_target_bytes(context.mux_limits);
@@ -826,47 +905,45 @@ fn request_calibration_needs_contention_but_spent_owner_drains_after_two_to_one(
         !cold_projection.is_admitted(),
         "the fixture must be completion-noncompetitive before typed pre-measurement entry: service={service_snapshot:?} candidate={candidate_snapshot:?} projection={cold_projection:?}"
     );
-    let choose =
-        |spent: &HashMap<RelayPathInstance, u64>,
-         tcp_carrier_proven_candidates: Option<&HashSet<RelayPathInstance>>| {
-            choose_request_ack_clock_calibration(
-                &context,
-                &paths,
-                FlowLane::Throughput,
-                None,
-                0,
-                BBR_MAX_SEND_QUANTUM_BYTES,
-                1,
-                Some(service.key),
-                Some(&flights),
-                None,
-                Some(&proven),
-                Some(&graduated),
-                Some(RequestAckClockCalibration {
-                    owner: spent
-                        .get(&candidate)
-                        .map(|_| RequestAckClockCalibrationOwner {
-                            candidate,
-                            target_bytes: calibration_target,
-                        }),
-                    pending: None,
-                    proven_subflows: &ack_clock_proven,
-                    first_window_acked_subflows: &receipt_boundaries,
-                    spent_bytes: spent,
-                    tcp_carrier_proven_candidates,
-                }),
-            )
+    let choose = |spent: Option<u64>, tcp_capacity_proven: bool| {
+        let scheduling = RequestSchedulingFixture::default()
+            .with_rate_proven([service, candidate])
+            .with_graduated([candidate])
+            .with_ack_clock_first_window([candidate])
+            .with_tcp_capacity_proven(tcp_capacity_proven.then_some(candidate))
+            .with_calibration_spend(spent.map(|bytes| (candidate, bytes)));
+        let scheduling = if spent.is_some() {
+            scheduling.with_operation(RequestAckClockOperation::Owner {
+                candidate,
+                target_bytes: calibration_target,
+            })
+        } else {
+            scheduling
         };
+        choose_request_ack_clock_calibration(
+            &context,
+            &paths,
+            FlowLane::Throughput,
+            None,
+            0,
+            BBR_MAX_SEND_QUANTUM_BYTES,
+            1,
+            Some(service.key),
+            Some(&flights),
+            None,
+            Some(scheduling.state()),
+        )
+    };
 
     let only_flow = context.reliable_tcp_request_bulk_flow_registration();
     only_flow.update(true, Some(UnderlayProtocol::Tcp));
     assert!(
-        choose(&HashMap::new(), None).is_none(),
+        choose(None, false).is_none(),
         "one upload must not begin ordered calibration"
     );
     assert!(
         matches!(
-            choose(&HashMap::new(), Some(&carrier_proven)),
+            choose(None, true),
             Some(BulkRelayPathChoice::SelectedAckClockCalibration {
                 candidate: selected,
                 ..
@@ -877,19 +954,18 @@ fn request_calibration_needs_contention_but_spent_owner_drains_after_two_to_one(
     let second_flow = context.reliable_tcp_request_bulk_flow_registration();
     second_flow.update(true, Some(UnderlayProtocol::Udp));
     assert!(
-        choose(&HashMap::new(), None).is_none(),
+        choose(None, false).is_none(),
         "a QUIC-Service upload must not unlock TCP calibration"
     );
     second_flow.update(true, Some(UnderlayProtocol::Tcp));
     assert!(matches!(
-        choose(&HashMap::new(), None),
+        choose(None, false),
         Some(BulkRelayPathChoice::SelectedAckClockCalibration { .. })
     ));
     second_flow.update(true, Some(UnderlayProtocol::Udp));
-    let spent = HashMap::from([(candidate, BBR_MAX_SEND_QUANTUM_BYTES as u64)]);
     assert!(
         matches!(
-            choose(&spent, None),
+            choose(Some(BBR_MAX_SEND_QUANTUM_BYTES as u64), false),
             Some(BulkRelayPathChoice::SelectedAckClockCalibration {
                 position: 1,
                 candidate: selected,
@@ -927,14 +1003,19 @@ fn parallel_tcp_carrier_proofs_keep_one_product_calibration_owner() {
     }
     let flow = context.reliable_tcp_request_bulk_flow_registration();
     flow.update(true, Some(UnderlayProtocol::Tcp));
-    let rate_proven = HashSet::from([service, first, second]);
-    let graduated = HashSet::from([first, second]);
-    let carrier_proven = HashSet::from([first, second]);
     let flights = RequestFlightLedger::default();
-    let spent = HashMap::new();
     let target = reliable_request_ack_clock_calibration_target_bytes(context.mux_limits);
-    let choose = |owner: Option<RequestAckClockCalibrationOwner>,
-                  ack_proven: &HashSet<RelayPathInstance>| {
+    let choose = |operation: Option<RequestAckClockOperation>,
+                  ack_proven: Option<RelayPathInstance>| {
+        let scheduling = RequestSchedulingFixture::default()
+            .with_rate_proven([service, first, second])
+            .with_graduated([first, second])
+            .with_tcp_capacity_proven([first, second])
+            .with_ack_clock_proven(ack_proven);
+        let scheduling = match operation {
+            Some(operation) => scheduling.with_operation(operation),
+            None => scheduling,
+        };
         choose_request_ack_clock_calibration(
             &context,
             &paths,
@@ -946,37 +1027,28 @@ fn parallel_tcp_carrier_proofs_keep_one_product_calibration_owner() {
             Some(service.key),
             Some(&flights),
             None,
-            Some(&rate_proven),
-            Some(&graduated),
-            Some(RequestAckClockCalibration {
-                owner,
-                pending: None,
-                proven_subflows: ack_proven,
-                first_window_acked_subflows: &HashSet::new(),
-                spent_bytes: &spent,
-                tcp_carrier_proven_candidates: Some(&carrier_proven),
-            }),
+            Some(scheduling.state()),
         )
     };
 
-    let selected = match choose(None, &HashSet::new()) {
+    let selected = match choose(None, None) {
         Some(BulkRelayPathChoice::SelectedAckClockCalibration { candidate, .. }) => candidate,
         _ => panic!("one carrier-proven candidate must acquire product ownership"),
     };
     let other = if selected == first { second } else { first };
     assert!(matches!(
         choose(
-            Some(RequestAckClockCalibrationOwner {
+            Some(RequestAckClockOperation::Owner {
                 candidate: selected,
                 target_bytes: target,
             }),
-            &HashSet::new(),
+            None,
         ),
         Some(BulkRelayPathChoice::SelectedAckClockCalibration { candidate, .. })
             if candidate == selected
     ));
     assert!(matches!(
-        choose(None, &HashSet::from([selected])),
+        choose(None, Some(selected)),
         Some(BulkRelayPathChoice::SelectedAckClockCalibration { candidate, .. })
             if candidate == other
     ));
@@ -1018,22 +1090,26 @@ fn request_calibration_transaction_drains_prior_optional_owner_before_exact_entr
             .expect("prior exact product rate"),
         true,
     );
-    let proven = HashSet::from([service, previous, candidate]);
-    let graduated = HashSet::from([previous, candidate]);
     let attempted = HashSet::from([previous, candidate]);
-    let ack_proven = HashSet::from([previous]);
-    let carrier_proven = HashSet::from([candidate]);
     let target = reliable_request_ack_clock_calibration_target_bytes(context.mux_limits);
     let payload_bytes = BBR_MAX_SEND_QUANTUM_BYTES;
     let lower_frame = data_frame(0, payload_bytes);
     let mut prior_debt = RequestFlightLedger::default();
     prior_debt.record_owner_frame_instance(previous, &lower_frame);
-    let empty_spend = HashMap::new();
     let choose = |flights: &RequestFlightLedger,
                   offset: u64,
-                  owner: Option<RequestAckClockCalibrationOwner>,
-                  pending: Option<RequestAckClockCalibrationPending>,
-                  spent: &HashMap<RelayPathInstance, u64>| {
+                  operation: Option<RequestAckClockOperation>,
+                  spent: Option<u64>| {
+        let scheduling = RequestSchedulingFixture::default()
+            .with_rate_proven([service, previous, candidate])
+            .with_graduated([previous, candidate])
+            .with_ack_clock_proven([previous])
+            .with_tcp_capacity_proven([candidate])
+            .with_calibration_spend(spent.map(|bytes| (candidate, bytes)));
+        let scheduling = match operation {
+            Some(operation) => scheduling.with_operation(operation),
+            None => scheduling,
+        };
         choose_bulk_relay_path_for_extent_avoiding(BulkRelayPathRequest {
             stream_id: StreamId(7),
             context: &context,
@@ -1047,38 +1123,22 @@ fn request_calibration_transaction_drains_prior_optional_owner_before_exact_entr
             path_flights: Some(flights),
             ordered_data_owner: Some(service.key),
             subflow_set: None,
-            proven_subflows: Some(&proven),
-            graduated_subflows: Some(&graduated),
+            request_state: Some(scheduling.state()),
             attempted_subflows: Some(&attempted),
-            ack_clock_calibration: Some(RequestAckClockCalibration {
-                owner,
-                pending,
-                proven_subflows: &ack_proven,
-                first_window_acked_subflows: &HashSet::new(),
-                spent_bytes: spent,
-                tcp_carrier_proven_candidates: Some(&carrier_proven),
-            }),
-            request_per_flow_rate_bps: None,
         })
     };
 
     assert_eq!(
-        choose(&prior_debt, payload_bytes as u64, None, None, &empty_spend,),
+        choose(&prior_debt, payload_bytes as u64, None, None,),
         BulkRelayPathChoice::SelectedAckClockCalibrationFence {
             position: 0,
             candidate,
         },
         "typed entry must drain a proven prior optional owner on Service"
     );
-    let pending = Some(RequestAckClockCalibrationPending { service, candidate });
+    let pending = Some(RequestAckClockOperation::Pending { service, candidate });
     assert_eq!(
-        choose(
-            &prior_debt,
-            payload_bytes as u64,
-            None,
-            pending,
-            &empty_spend,
-        ),
+        choose(&prior_debt, payload_bytes as u64, pending, None,),
         BulkRelayPathChoice::SelectedAckClockCalibrationFence {
             position: 0,
             candidate,
@@ -1089,7 +1149,7 @@ fn request_calibration_transaction_drains_prior_optional_owner_before_exact_entr
 
     let drained = RequestFlightLedger::default();
     assert!(matches!(
-        choose(&drained, payload_bytes as u64, None, pending, &empty_spend),
+        choose(&drained, payload_bytes as u64, pending, None),
         BulkRelayPathChoice::SelectedAckClockCalibration {
             position: 2,
             candidate: selected,
@@ -1097,25 +1157,21 @@ fn request_calibration_transaction_drains_prior_optional_owner_before_exact_entr
         } if selected == candidate
     ));
 
-    let owner = Some(RequestAckClockCalibrationOwner {
+    let owner = Some(RequestAckClockOperation::Owner {
         candidate,
         target_bytes: target,
     });
-    let partial_spend = HashMap::from([(candidate, payload_bytes as u64)]);
-    let sealed_spend = HashMap::from([(candidate, target)]);
+    let live_scheduling = RequestSchedulingFixture::default()
+        .with_rate_proven([service, previous, candidate])
+        .with_graduated([previous, candidate])
+        .with_ack_clock_proven([previous])
+        .with_calibration_spend([(candidate, target)])
+        .with_operation(owner.expect("calibration owner"));
     assert_eq!(
         live_request_ack_clock_calibration_transaction(
             &paths,
             service.key,
-            Some(&graduated),
-            Some(RequestAckClockCalibration {
-                owner,
-                pending: None,
-                proven_subflows: &ack_proven,
-                first_window_acked_subflows: &HashSet::new(),
-                spent_bytes: &sealed_spend,
-                tcp_carrier_proven_candidates: Some(&HashSet::new()),
-            }),
+            Some(live_scheduling.state()),
         ),
         Some(candidate),
         "a sealed target must outlive its ephemeral carrier-entry proof"
@@ -1127,8 +1183,7 @@ fn request_calibration_transaction_drains_prior_optional_owner_before_exact_entr
             &own_debt,
             payload_bytes as u64,
             owner,
-            None,
-            &partial_spend,
+            Some(payload_bytes as u64),
         ),
         BulkRelayPathChoice::SelectedAckClockCalibration {
             candidate: selected,
@@ -1136,9 +1191,8 @@ fn request_calibration_transaction_drains_prior_optional_owner_before_exact_entr
         } if selected == candidate
     ));
 
-    let exhausted = HashMap::from([(candidate, target)]);
     assert_eq!(
-        choose(&drained, payload_bytes as u64, owner, None, &exhausted),
+        choose(&drained, payload_bytes as u64, owner, Some(target)),
         BulkRelayPathChoice::SelectedAckClockCalibrationFence {
             position: 0,
             candidate,
@@ -1151,13 +1205,7 @@ fn request_calibration_transaction_drains_prior_optional_owner_before_exact_entr
     let mut saturated = RequestFlightLedger::default();
     saturated.record_owner_frame_instance(previous, &data_frame(0, product_envelope));
     assert_eq!(
-        choose(
-            &saturated,
-            product_envelope as u64,
-            None,
-            pending,
-            &empty_spend,
-        ),
+        choose(&saturated, product_envelope as u64, pending, None,),
         BulkRelayPathChoice::Blocked,
         "the Service fence must not bypass its bounded product reservoir"
     );
@@ -1184,12 +1232,10 @@ fn request_tcp_carrier_calibration_uses_exact_debt_not_logical_flight_age() {
     mark_path_proof(&context, candidate.key, Duration::from_millis(8));
     let flow = context.reliable_tcp_request_bulk_flow_registration();
     flow.update(true, Some(UnderlayProtocol::Tcp));
-    let proven = HashSet::from([service, candidate]);
-    let graduated = HashSet::from([candidate]);
-    let ack_clock_proven = HashSet::new();
-    let first_window_acked = HashSet::new();
-    let carrier_proven = HashSet::from([candidate]);
-    let spent = HashMap::new();
+    let scheduling = RequestSchedulingFixture::default()
+        .with_rate_proven([service, candidate])
+        .with_graduated([candidate])
+        .with_tcp_capacity_proven([candidate]);
     let mut flights = RequestFlightLedger::default();
     flights.record_owner_frame_instance(service, &data_frame(0, 64 * 1024));
     flights.age_product_flights_for_test(Duration::from_secs(10));
@@ -1205,16 +1251,7 @@ fn request_tcp_carrier_calibration_uses_exact_debt_not_logical_flight_age() {
             Some(service.key),
             Some(flights),
             None,
-            Some(&proven),
-            Some(&graduated),
-            Some(RequestAckClockCalibration {
-                owner: None,
-                pending: None,
-                proven_subflows: &ack_clock_proven,
-                first_window_acked_subflows: &first_window_acked,
-                spent_bytes: &spent,
-                tcp_carrier_proven_candidates: Some(&carrier_proven),
-            }),
+            Some(scheduling.state()),
         )
     };
 
@@ -1259,13 +1296,18 @@ fn exhausted_calibration_waits_for_exact_owner_proof_before_next_candidate() {
         );
         mark_path_proof(&context, path.key(), Duration::from_millis(10));
     }
-    let proven = HashSet::from([paths[0].instance(), first, second]);
-    let graduated = HashSet::from([first, second]);
-    let ack_clock_proven = HashSet::new();
-    let receipt_boundaries = HashSet::from([first, second]);
+    let attempted = HashSet::from([first, second]);
     let calibration_target =
         reliable_request_ack_clock_calibration_target_bytes(context.mux_limits);
-    let spent = HashMap::from([(first, calibration_target)]);
+    let scheduling = RequestSchedulingFixture::default()
+        .with_rate_proven([paths[0].instance(), first, second])
+        .with_graduated([first, second])
+        .with_ack_clock_first_window([first, second])
+        .with_calibration_spend([(first, calibration_target)])
+        .with_operation(RequestAckClockOperation::Owner {
+            candidate: first,
+            target_bytes: calibration_target,
+        });
     let choose = |flights: &RequestFlightLedger| {
         choose_request_ack_clock_calibration(
             &context,
@@ -1278,19 +1320,7 @@ fn exhausted_calibration_waits_for_exact_owner_proof_before_next_candidate() {
             Some(service_key),
             Some(flights),
             None,
-            Some(&proven),
-            Some(&graduated),
-            Some(RequestAckClockCalibration {
-                owner: Some(RequestAckClockCalibrationOwner {
-                    candidate: first,
-                    target_bytes: calibration_target,
-                }),
-                pending: None,
-                proven_subflows: &ack_clock_proven,
-                first_window_acked_subflows: &receipt_boundaries,
-                spent_bytes: &spent,
-                tcp_carrier_proven_candidates: None,
-            }),
+            Some(scheduling.state()),
         )
     };
 
@@ -1315,21 +1345,8 @@ fn exhausted_calibration_waits_for_exact_owner_proof_before_next_candidate() {
             path_flights: Some(&outstanding),
             ordered_data_owner: Some(service_key),
             subflow_set: None,
-            proven_subflows: Some(&proven),
-            graduated_subflows: Some(&graduated),
-            attempted_subflows: Some(&graduated),
-            ack_clock_calibration: Some(RequestAckClockCalibration {
-                owner: Some(RequestAckClockCalibrationOwner {
-                    candidate: first,
-                    target_bytes: calibration_target,
-                }),
-                pending: None,
-                proven_subflows: &ack_clock_proven,
-                first_window_acked_subflows: &receipt_boundaries,
-                spent_bytes: &spent,
-                tcp_carrier_proven_candidates: None,
-            }),
-            request_per_flow_rate_bps: None,
+            request_state: Some(scheduling.state()),
+            attempted_subflows: Some(&attempted),
         }),
         BulkRelayPathChoice::SelectedAckClockCalibrationFence {
             position: 0,
@@ -1367,10 +1384,11 @@ fn ineligible_spent_instance_does_not_block_live_validation_calibration() {
         PathRateSample::new(256 * 1024, Duration::from_secs(1)).expect("receipt-rate evidence"),
     );
     mark_path_proof(&context, candidate.key, Duration::from_millis(10));
-    let proven = HashSet::from([paths[0].instance(), ineligible, candidate]);
-    let graduated = HashSet::from([ineligible, candidate]);
-    let receipt_boundaries = HashSet::from([candidate]);
-    let spent = HashMap::from([(ineligible, BBR_MAX_SEND_QUANTUM_BYTES as u64)]);
+    let scheduling = RequestSchedulingFixture::default()
+        .with_rate_proven([paths[0].instance(), ineligible, candidate])
+        .with_graduated([ineligible, candidate])
+        .with_ack_clock_first_window([candidate])
+        .with_calibration_spend([(ineligible, BBR_MAX_SEND_QUANTUM_BYTES as u64)]);
 
     assert!(
         matches!(
@@ -1385,16 +1403,7 @@ fn ineligible_spent_instance_does_not_block_live_validation_calibration() {
                 Some(service_key),
                 Some(&RequestFlightLedger::default()),
                 None,
-                Some(&proven),
-                Some(&graduated),
-                Some(RequestAckClockCalibration {
-                    owner: None,
-                    pending: None,
-                    proven_subflows: &HashSet::new(),
-                    first_window_acked_subflows: &receipt_boundaries,
-                    spent_bytes: &spent,
-                    tcp_carrier_proven_candidates: None,
-                }),
+                Some(scheduling.state()),
             ),
             Some(BulkRelayPathChoice::SelectedAckClockCalibration {
                 position: 2,
@@ -1441,7 +1450,6 @@ fn request_startup_subflow_rejects_cross_family_repair_and_latency_pressure() {
             None,
             None,
             None,
-            None,
         )
         .is_none(),
         "independent carrier recovery models cannot share startup credit"
@@ -1461,7 +1469,6 @@ fn request_startup_subflow_rejects_cross_family_repair_and_latency_pressure() {
             64 * 1024,
             Some(service_key),
             Some(&ledger),
-            None,
             None,
             None,
             None,
@@ -1485,7 +1492,6 @@ fn request_startup_subflow_rejects_cross_family_repair_and_latency_pressure() {
             64 * 1024,
             Some(service_key),
             Some(&ledger),
-            None,
             None,
             None,
             None,
@@ -1518,6 +1524,7 @@ fn request_startup_waits_for_service_anchor_and_authoritative_debt() {
     mark_path_proof(&context, candidate_key, Duration::from_millis(8));
     let empty = RequestFlightLedger::default();
     let exact_state = HashSet::new();
+    let scheduling = RequestSchedulingFixture::default().with_rate_proven([paths[0].instance()]);
 
     assert_eq!(
         choose_bulk_relay_path_for_extent_avoiding(BulkRelayPathRequest {
@@ -1533,11 +1540,8 @@ fn request_startup_waits_for_service_anchor_and_authoritative_debt() {
             path_flights: Some(&empty),
             ordered_data_owner: None,
             subflow_set: None,
-            proven_subflows: None,
-            graduated_subflows: Some(&exact_state),
+            request_state: Some(scheduling.state()),
             attempted_subflows: Some(&exact_state),
-            ack_clock_calibration: None,
-            request_per_flow_rate_bps: None,
         }),
         BulkRelayPathChoice::Selected(0),
         "offset zero must establish Service before any Validation path can own data"
@@ -1556,8 +1560,7 @@ fn request_startup_waits_for_service_anchor_and_authoritative_debt() {
             Some(service_key),
             Some(&foreign),
             None,
-            None,
-            Some(&exact_state),
+            Some(scheduling.state()),
             Some(&exact_state),
         )
         .is_none(),
@@ -1578,8 +1581,7 @@ fn request_startup_waits_for_service_anchor_and_authoritative_debt() {
             Some(service_key),
             Some(&repaired),
             None,
-            None,
-            Some(&exact_state),
+            Some(scheduling.state()),
             Some(&exact_state),
         )
         .is_none(),
@@ -1627,7 +1629,6 @@ fn request_startup_allows_aged_ordinary_service_flight_within_envelope() {
             None,
             None,
             None,
-            None,
         )
         .is_some(),
         "the healthy Service and fresh Validation proof satisfy every startup gate"
@@ -1645,7 +1646,6 @@ fn request_startup_allows_aged_ordinary_service_flight_within_envelope() {
                 64 * 1024,
                 Some(service_key),
                 Some(&ledger),
-                None,
                 None,
                 None,
                 None,
@@ -1671,7 +1671,6 @@ fn request_startup_allows_aged_ordinary_service_flight_within_envelope() {
             64 * 1024,
             Some(service_key),
             Some(&ledger),
-            None,
             None,
             None,
             None,
@@ -1712,7 +1711,6 @@ fn request_startup_does_not_use_ordered_product_bytes_to_probe_quic_capacity() {
             64 * 1024,
             Some(service_key),
             Some(&RequestFlightLedger::default()),
-            None,
             None,
             None,
             None,
@@ -1766,8 +1764,9 @@ fn request_startup_owner_needs_ack_clock_proof_after_flights_drain() {
     );
     let mut ledger = RequestFlightLedger::default();
     ledger.record_owner_frame(candidate_key, &data_frame(0, 64 * 1024));
-    let mut graduated = HashSet::new();
     let attempted = HashSet::from([paths[1].instance()]);
+    let pre_graduation_state =
+        RequestSchedulingFixture::default().with_rate_proven([paths[0].instance()]);
 
     let pre_graduation = choose_bulk_relay_path_for_extent_avoiding(BulkRelayPathRequest {
         stream_id: StreamId(7),
@@ -1782,11 +1781,8 @@ fn request_startup_owner_needs_ack_clock_proof_after_flights_drain() {
         path_flights: Some(&ledger),
         ordered_data_owner: Some(service_key),
         subflow_set: Some(&epoch),
-        proven_subflows: None,
-        graduated_subflows: Some(&graduated),
+        request_state: Some(pre_graduation_state.state()),
         attempted_subflows: Some(&attempted),
-        ack_clock_calibration: None,
-        request_per_flow_rate_bps: None,
     });
     assert!(
         matches!(
@@ -1801,7 +1797,9 @@ fn request_startup_owner_needs_ack_clock_proof_after_flights_drain() {
         end: 64 * 1024,
     }]);
     assert!(epoch.graduate_startup_owner(paths[1].instance()));
-    graduated.insert(paths[1].instance());
+    let graduated_state = RequestSchedulingFixture::default()
+        .with_rate_proven([paths[0].instance()])
+        .with_graduated([paths[1].instance()]);
     assert_eq!(
         choose_bulk_relay_path_for_extent_avoiding(BulkRelayPathRequest {
             stream_id: StreamId(7),
@@ -1816,24 +1814,17 @@ fn request_startup_owner_needs_ack_clock_proof_after_flights_drain() {
             path_flights: Some(&ledger),
             ordered_data_owner: Some(service_key),
             subflow_set: Some(&epoch),
-            proven_subflows: None,
-            graduated_subflows: Some(&graduated),
+            request_state: Some(graduated_state.state()),
             attempted_subflows: Some(&attempted),
-            ack_clock_calibration: Some(RequestAckClockCalibration {
-                owner: None,
-                pending: None,
-                proven_subflows: &HashSet::new(),
-                first_window_acked_subflows: &HashSet::new(),
-                spent_bytes: &HashMap::new(),
-                tcp_carrier_proven_candidates: None,
-            }),
-            request_per_flow_rate_bps: None,
         }),
         BulkRelayPathChoice::Selected(0),
         "TCP receipt graduation alone is not attributable capacity proof"
     );
 
-    let ack_clock_proven = HashSet::from([paths[1].instance()]);
+    let proven_state = RequestSchedulingFixture::default()
+        .with_rate_proven([paths[0].instance()])
+        .with_graduated([paths[1].instance()])
+        .with_ack_clock_proven([paths[1].instance()]);
     assert_eq!(
         choose_bulk_relay_path_for_extent_avoiding(BulkRelayPathRequest {
             stream_id: StreamId(7),
@@ -1848,18 +1839,8 @@ fn request_startup_owner_needs_ack_clock_proof_after_flights_drain() {
             path_flights: Some(&ledger),
             ordered_data_owner: Some(service_key),
             subflow_set: Some(&epoch),
-            proven_subflows: None,
-            graduated_subflows: Some(&graduated),
+            request_state: Some(proven_state.state()),
             attempted_subflows: Some(&attempted),
-            ack_clock_calibration: Some(RequestAckClockCalibration {
-                owner: None,
-                pending: None,
-                proven_subflows: &ack_clock_proven,
-                first_window_acked_subflows: &HashSet::new(),
-                spent_bytes: &HashMap::new(),
-                tcp_carrier_proven_candidates: None,
-            }),
-            request_per_flow_rate_bps: None,
         }),
         BulkRelayPathChoice::Selected(1),
         "drained startup plus attributable ACK-clock proof may enter ordinary admission"
@@ -1879,82 +1860,62 @@ fn exact_flow_local_model_can_own_without_session_global_membership() {
     let service = paths[0].instance();
     let candidate = paths[1].instance();
     mark_bulk_service(&context, service.key);
-    let graduated = HashSet::from([candidate]);
-    let ack_clock_proven = HashSet::from([candidate]);
-    let first_window_acked = HashSet::new();
-    let spent_bytes = HashMap::new();
-    let calibration = RequestAckClockCalibration {
-        owner: None,
-        pending: None,
-        proven_subflows: &ack_clock_proven,
-        first_window_acked_subflows: &first_window_acked,
-        spent_bytes: &spent_bytes,
-        tcp_carrier_proven_candidates: None,
+    let service_rate = RequestPerFlowRateModel {
+        rate_bps: 400_000_000.0,
+        delivery_samples: RELIABLE_INITIAL_WINDOW_PACKETS as u32,
     };
-    let rates = HashMap::from([
-        (
-            service,
-            RequestPerFlowRateModel {
-                rate_bps: 400_000_000.0,
-                delivery_samples: RELIABLE_INITIAL_WINDOW_PACKETS as u32,
-            },
-        ),
-        (
-            candidate,
-            RequestPerFlowRateModel {
-                rate_bps: 500_000_000.0,
-                delivery_samples: RELIABLE_INITIAL_WINDOW_PACKETS as u32,
-            },
-        ),
-    ]);
+    let candidate_rate = RequestPerFlowRateModel {
+        rate_bps: 500_000_000.0,
+        delivery_samples: RELIABLE_INITIAL_WINDOW_PACKETS as u32,
+    };
+    let scheduling = RequestSchedulingFixture::default()
+        .with_rate_proven([service])
+        .with_graduated([candidate])
+        .with_ack_clock_proven([candidate])
+        .with_per_flow_rates([(service, service_rate), (candidate, candidate_rate)]);
+    let missing_graduation = RequestSchedulingFixture::default()
+        .with_ack_clock_proven([candidate])
+        .with_per_flow_rates([(candidate, candidate_rate)]);
+    let missing_ack_proof = RequestSchedulingFixture::default()
+        .with_graduated([candidate])
+        .with_per_flow_rates([(candidate, candidate_rate)]);
 
     let globally_admitted = context.ordered_reliable_bulk_striping_path_keys(64 * 1024);
     assert!(globally_admitted.contains(&service.key));
     assert!(!globally_admitted.contains(&candidate.key));
     assert!(request_path_has_exact_flow_local_bulk_model(
         &paths[1],
-        Some(&graduated),
-        Some(calibration),
-        Some(&rates),
+        Some(scheduling.state()),
     ));
     assert!(!request_path_has_exact_flow_local_bulk_model(
         &paths[1],
-        None,
-        Some(calibration),
-        Some(&rates),
+        Some(missing_graduation.state()),
     ));
     assert!(!request_path_has_exact_flow_local_bulk_model(
         &paths[1],
-        Some(&graduated),
-        None,
-        Some(&rates),
+        Some(missing_ack_proof.state()),
     ));
     let udp_candidate = relay_path(UnderlayProtocol::Udp, 1, RelayPathPlacement::Validation);
-    assert!(!request_path_has_exact_flow_local_bulk_model(
-        &udp_candidate,
-        Some(&HashSet::from([udp_candidate.instance()])),
-        Some(RequestAckClockCalibration {
-            owner: None,
-            pending: None,
-            proven_subflows: &HashSet::from([udp_candidate.instance()]),
-            first_window_acked_subflows: &HashSet::new(),
-            spent_bytes: &HashMap::new(),
-            tcp_carrier_proven_candidates: None,
-        }),
-        Some(&HashMap::from([(
+    let udp_state = RequestSchedulingFixture::default()
+        .with_graduated([udp_candidate.instance()])
+        .with_ack_clock_proven([udp_candidate.instance()])
+        .with_per_flow_rates([(
             udp_candidate.instance(),
             RequestPerFlowRateModel {
                 rate_bps: 500_000_000.0,
                 delivery_samples: RELIABLE_INITIAL_WINDOW_PACKETS as u32,
             },
-        )])),
+        )]);
+    assert!(!request_path_has_exact_flow_local_bulk_model(
+        &udp_candidate,
+        Some(udp_state.state()),
     ));
 
     let service_snapshot = relay_path_snapshot_for_bulk_choice(
         &context,
         service,
         Some(service.key),
-        Some(&rates),
+        Some(scheduling.state()),
         true,
     )
     .expect("service snapshot");
@@ -1962,7 +1923,7 @@ fn exact_flow_local_model_can_own_without_session_global_membership() {
         &context,
         candidate,
         Some(service.key),
-        Some(&rates),
+        Some(scheduling.state()),
         false,
     )
     .expect("candidate snapshot");
@@ -2013,11 +1974,8 @@ fn exact_flow_local_model_can_own_without_session_global_membership() {
             path_flights: Some(&RequestFlightLedger::default()),
             ordered_data_owner: Some(service.key),
             subflow_set: None,
-            proven_subflows: None,
-            graduated_subflows: Some(&graduated),
+            request_state: Some(scheduling.state()),
             attempted_subflows: Some(&HashSet::from([candidate])),
-            ack_clock_calibration: Some(calibration),
-            request_per_flow_rate_bps: Some(&rates),
         }),
         BulkRelayPathChoice::Selected(1),
         "exact per-flow TCP proof must not be revoked by another flow's session-global model"
@@ -2055,11 +2013,8 @@ fn bulk_ready_blocks_when_no_attached_path_can_advance_ordered_frontier() {
             path_flights: Some(&ledger),
             ordered_data_owner: None,
             subflow_set: None,
-            proven_subflows: None,
-            graduated_subflows: None,
+            request_state: None,
             attempted_subflows: None,
-            ack_clock_calibration: None,
-            request_per_flow_rate_bps: None,
         }),
         BulkRelayPathChoice::Blocked
     );
@@ -2096,11 +2051,8 @@ fn relay_lower_frontier_owner_can_lead_from_validation_attachment() {
             path_flights: Some(&ledger),
             ordered_data_owner: None,
             subflow_set: None,
-            proven_subflows: None,
-            graduated_subflows: None,
+            request_state: None,
             attempted_subflows: None,
-            ack_clock_calibration: None,
-            request_per_flow_rate_bps: None,
         }),
         BulkRelayPathChoice::Selected(0)
     );
@@ -2143,7 +2095,7 @@ fn relay_bulk_lead_must_be_admissible_not_lowest_raw_eta() {
         lower_flight_owner: None,
         lower_owner_cross_path_debt: 0,
         policy: SchedulerPolicy::default(),
-        request_per_flow_rate_bps: None,
+        request_state: None,
     })
     .expect("admissible path should become lead");
 
@@ -2192,7 +2144,7 @@ fn relay_lower_owner_uses_sliding_window_not_ordering_debt() {
         lower_flight_owner: Some(owner),
         lower_owner_cross_path_debt: 1024 * 1024,
         policy: SchedulerPolicy::default(),
-        request_per_flow_rate_bps: None,
+        request_state: None,
     })
     .expect("same-carrier lower flight is sliding-window flight");
 
@@ -2221,26 +2173,27 @@ fn ack_clock_proven_tcp_subflow_can_join_across_service_bdp_debt() {
         flights.record_owner_frame_instance(service, &data_frame(offset as u64, payload_bytes));
     }
 
-    let proven_subflows = HashSet::from([service, candidate]);
-    let graduated_subflows = HashSet::from([candidate]);
-    let ack_clock_proven = HashSet::from([candidate]);
-    let spent_bytes = HashMap::from([(candidate, 2 * 1024 * 1024)]);
-    let request_rates = HashMap::from([
-        (
-            service,
-            RequestPerFlowRateModel {
-                rate_bps: 400_000_000.0,
-                delivery_samples: RELIABLE_INITIAL_WINDOW_PACKETS as u32,
-            },
-        ),
-        (
-            candidate,
-            RequestPerFlowRateModel {
-                rate_bps: 50_000_000.0,
-                delivery_samples: 1,
-            },
-        ),
-    ]);
+    let scheduling = RequestSchedulingFixture::default()
+        .with_rate_proven([service, candidate])
+        .with_graduated([candidate])
+        .with_ack_clock_proven([candidate])
+        .with_calibration_spend([(candidate, 2 * 1024 * 1024)])
+        .with_per_flow_rates([
+            (
+                service,
+                RequestPerFlowRateModel {
+                    rate_bps: 400_000_000.0,
+                    delivery_samples: RELIABLE_INITIAL_WINDOW_PACKETS as u32,
+                },
+            ),
+            (
+                candidate,
+                RequestPerFlowRateModel {
+                    rate_bps: 50_000_000.0,
+                    delivery_samples: 1,
+                },
+            ),
+        ]);
 
     assert_eq!(
         choose_bulk_relay_path_for_extent_avoiding(BulkRelayPathRequest {
@@ -2256,18 +2209,8 @@ fn ack_clock_proven_tcp_subflow_can_join_across_service_bdp_debt() {
             path_flights: Some(&flights),
             ordered_data_owner: Some(service.key),
             subflow_set: None,
-            proven_subflows: Some(&proven_subflows),
-            graduated_subflows: Some(&graduated_subflows),
+            request_state: Some(scheduling.state()),
             attempted_subflows: None,
-            ack_clock_calibration: Some(RequestAckClockCalibration {
-                owner: None,
-                pending: None,
-                proven_subflows: &ack_clock_proven,
-                first_window_acked_subflows: &HashSet::new(),
-                spent_bytes: &spent_bytes,
-                tcp_carrier_proven_candidates: None,
-            }),
-            request_per_flow_rate_bps: Some(&request_rates),
         }),
         BulkRelayPathChoice::Selected(1),
         "a proven empty candidate must not inherit the Service prefix as its local pipe saturation"
@@ -2303,11 +2246,8 @@ fn relay_ordinary_bulk_uses_lower_eta_when_frontier_is_clear() {
             path_flights: Some(&RequestFlightLedger::default()),
             ordered_data_owner: Some(lead_key),
             subflow_set: None,
-            proven_subflows: None,
-            graduated_subflows: None,
+            request_state: None,
             attempted_subflows: None,
-            ack_clock_calibration: None,
-            request_per_flow_rate_bps: None,
         }),
         BulkRelayPathChoice::Selected(1)
     );

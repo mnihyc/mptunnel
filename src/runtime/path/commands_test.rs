@@ -1,5 +1,6 @@
 use super::{
-    TcpCapacityProbeRequest, reliable_path_command_channels, reliable_path_command_pending_bytes,
+    ReliablePathCommand, TcpCapacityProbeRequest, recv_reliable_path_command,
+    reliable_path_command_channels, reliable_path_command_pending_bytes,
     reliable_path_effective_frame_lane, reliable_path_frame_uses_priority_queue,
     reliable_path_stream_ordered_queue_lane, try_recv_reliable_path_command,
 };
@@ -145,4 +146,110 @@ fn control_and_ack_frames_never_use_throughput_lane() {
         assert_eq!(effective_lane, expected_lane);
         assert!(reliable_path_frame_uses_priority_queue(effective_lane));
     }
+}
+
+#[tokio::test]
+async fn terminal_reset_and_close_uses_one_ordered_queue_item() {
+    let stream_id = StreamId(2);
+    let (commands, mut receivers) = reliable_path_command_channels(1);
+    commands
+        .try_enqueue_admitted_frame(
+            Frame::StreamData {
+                stream_id,
+                offset: 0,
+                flags: StreamFlags::NONE,
+                payload: Bytes::from_static(b"bulk"),
+            },
+            FlowLane::Throughput,
+        )
+        .expect("fill ordered data queue");
+
+    let (terminal_result, first) = tokio::join!(
+        commands.send_stream_ordered_reset_and_close(
+            stream_id,
+            ResetReason::Refused,
+            FlowLane::Throughput,
+        ),
+        recv_reliable_path_command(&mut receivers),
+    );
+    assert!(
+        terminal_result.is_ok(),
+        "queue terminal transaction after prior data"
+    );
+    let first = first.expect("prior ordered data");
+    assert!(matches!(
+        &first,
+        ReliablePathCommand::SendFrame(Frame::StreamData {
+            stream_id: data_stream_id,
+            ..
+        }) if *data_stream_id == stream_id
+    ));
+    receivers.release_pending_command_bytes(reliable_path_command_pending_bytes(&first));
+
+    let terminal = recv_reliable_path_command(&mut receivers)
+        .await
+        .expect("single terminal transaction");
+    assert!(matches!(
+        &terminal,
+        ReliablePathCommand::ResetAndCloseStream {
+            stream_id: reset_stream_id,
+            reason: ResetReason::Refused,
+        } if *reset_stream_id == stream_id
+    ));
+    assert_eq!(
+        commands.pending_bytes(),
+        u64::try_from(reliable_path_command_pending_bytes(&terminal))
+            .expect("terminal pacing debt fits queue metrics")
+    );
+    receivers.release_pending_command_bytes(reliable_path_command_pending_bytes(&terminal));
+    assert_eq!(commands.pending_bytes(), 0);
+    assert!(try_recv_reliable_path_command(&mut receivers).is_none());
+}
+
+#[tokio::test]
+async fn cancelling_waiting_terminal_reset_releases_queue_debt() {
+    let stream_id = StreamId(3);
+    let (commands, mut receivers) = reliable_path_command_channels(1);
+    commands
+        .try_enqueue_admitted_frame(
+            Frame::StreamData {
+                stream_id,
+                offset: 0,
+                flags: StreamFlags::NONE,
+                payload: Bytes::from_static(b"bulk"),
+            },
+            FlowLane::Throughput,
+        )
+        .expect("fill ordered data queue");
+    let queued_bytes = commands.pending_bytes();
+    let terminal_bytes = u64::try_from(reliable_path_command_pending_bytes(
+        &ReliablePathCommand::ResetAndCloseStream {
+            stream_id,
+            reason: ResetReason::Refused,
+        },
+    ))
+    .expect("terminal pacing debt fits queue metrics");
+
+    let mut terminal_send = Box::pin(commands.send_stream_ordered_reset_and_close(
+        stream_id,
+        ResetReason::Refused,
+        FlowLane::Throughput,
+    ));
+    tokio::select! {
+        biased;
+        _ = terminal_send.as_mut() => panic!("full queue admitted terminal transaction"),
+        _ = std::future::ready(()) => {}
+    }
+    assert_eq!(
+        commands.pending_bytes(),
+        queued_bytes.saturating_add(terminal_bytes)
+    );
+
+    drop(terminal_send);
+    assert_eq!(commands.pending_bytes(), queued_bytes);
+    let queued = recv_reliable_path_command(&mut receivers)
+        .await
+        .expect("prior ordered data");
+    receivers.release_pending_command_bytes(reliable_path_command_pending_bytes(&queued));
+    assert_eq!(commands.pending_bytes(), 0);
 }

@@ -14,7 +14,8 @@ use crate::protocol::{
 use crate::runtime::error::RuntimeError;
 use crate::runtime::identity::random_session_id;
 use crate::runtime::path::tcp::client_connection::{
-    ClientTcpCarrierConnection, ClientTcpHeartbeatTimeoutDisposition, connect_client_tcp_carrier,
+    ClientTcpCarrierConnect, ClientTcpCarrierConnection, ClientTcpHeartbeatTimeoutDisposition,
+    connect_client_tcp_carrier,
 };
 use crate::runtime::path::{ClientPathContext, PathDeliveryStats};
 use crate::scheduler::PathSnapshot;
@@ -56,12 +57,21 @@ impl TcpDatagramClientSession {
         let session_id = random_session_id()?;
         let security = context.tcp_path_security(path_index)?;
         let connection = connect_client_tcp_carrier(
-            path,
-            path_index,
-            session_id,
-            security,
-            context.codec_limits,
-            context.mux_limits,
+            ClientTcpCarrierConnect {
+                path,
+                path_index,
+                config_ordinal: context.relay_path_config_ordinal(
+                    crate::model::path::RelayPathKey {
+                        underlay: crate::protocol::UnderlayProtocol::Tcp,
+                        index: path_index,
+                    },
+                ),
+                session_id,
+                security,
+                codec_limits: context.codec_limits,
+                mux_limits: context.mux_limits,
+                carrier_sockets: context.carrier_sockets.as_ref(),
+            },
             open_deadline,
         )
         .await?;

@@ -59,45 +59,44 @@ pub(in crate::runtime) struct UdpPathMetrics {
     pub(in crate::runtime) ack_poll: QuicAckPollDiagnostics,
 }
 
-pub(super) fn spawn_server_quic_path_metrics(
+pub(super) async fn run_server_quic_path_metrics(
     context: ServerPathContext,
     path_registration: ServerCarrierPathRegistration,
     connection: UdpPathConnection,
 ) {
-    tokio::spawn(async move {
-        let path_id = path_registration.path_id();
+    let path_id = path_registration.path_id();
+    #[cfg(feature = "lab-diagnostics")]
+    let path_instance_id = path_registration.path_instance_id();
+    #[cfg(feature = "lab-diagnostics")]
+    let session_id = path_registration.session_id();
+    let mut tracker = UdpPathMetricTracker::default();
+    #[cfg(feature = "lab-diagnostics")]
+    let mut last_metrics_poll_at = None;
+    loop {
+        if connection.is_closed() {
+            return;
+        }
+        let Some(mut metrics) = connection.tx_metrics(&mut tracker, 2).await else {
+            tokio::time::sleep(default_transport_pto()).await;
+            continue;
+        };
         #[cfg(feature = "lab-diagnostics")]
-        let path_instance_id = path_registration.path_instance_id();
+        let metrics_poll_at = Instant::now();
         #[cfg(feature = "lab-diagnostics")]
-        let session_id = path_registration.session_id();
-        let mut tracker = UdpPathMetricTracker::default();
+        let poll_elapsed = last_metrics_poll_at
+            .replace(metrics_poll_at)
+            .map(|previous| metrics_poll_at.saturating_duration_since(previous))
+            .unwrap_or_default();
         #[cfg(feature = "lab-diagnostics")]
-        let mut last_metrics_poll_at = None;
-        loop {
-            if connection.is_closed() {
-                return;
-            }
-            let Some(mut metrics) = connection.tx_metrics(&mut tracker, 2).await else {
-                tokio::time::sleep(default_transport_pto()).await;
-                continue;
-            };
-            #[cfg(feature = "lab-diagnostics")]
-            let metrics_poll_at = Instant::now();
-            #[cfg(feature = "lab-diagnostics")]
-            let poll_elapsed = last_metrics_poll_at
-                .replace(metrics_poll_at)
-                .map(|previous| metrics_poll_at.saturating_duration_since(previous))
-                .unwrap_or_default();
-            #[cfg(feature = "lab-diagnostics")]
-            log_quic_ack_poll_diagnostics(
-                session_id,
-                path_id,
-                path_instance_id.as_u64(),
-                metrics,
-                poll_elapsed,
-            );
+        log_quic_ack_poll_diagnostics(
+            session_id,
+            path_id,
+            path_instance_id.as_u64(),
+            metrics,
+            poll_elapsed,
+        );
 
-            let capacity_proof_accepted = metrics.capacity_proof_candidate.is_some_and(|candidate| {
+        let capacity_proof_accepted = metrics.capacity_proof_candidate.is_some_and(|candidate| {
                 let proof_metrics = path_metrics_from_quic_capacity_proof(
                     path_id,
                     metrics,
@@ -153,65 +152,64 @@ pub(super) fn spawn_server_quic_path_metrics(
                     false
                 }
             });
-            if let Some(token) =
-                tracker.terminal_capacity_probe_to_retire(metrics.capacity_probe, Instant::now())
-            {
-                let _retired = connection.retire_capacity_probe(token);
-                tracker.retire_capacity_candidate(token);
-                #[cfg(feature = "lab-diagnostics")]
+        if let Some(token) =
+            tracker.terminal_capacity_probe_to_retire(metrics.capacity_probe, Instant::now())
+        {
+            let _retired = connection.retire_capacity_probe(token);
+            tracker.retire_capacity_candidate(token);
+            #[cfg(feature = "lab-diagnostics")]
+            lab_diagnostic(
+                "quic_capacity_probe_retired",
+                format_args!(
+                    "session_id={} path_id={} path_instance_id={} calibration_id={} proof_accepted={} carrier_retired={}",
+                    session_id.0,
+                    path_id.0,
+                    path_instance_id.as_u64(),
+                    token,
+                    capacity_proof_accepted,
+                    _retired,
+                ),
+            );
+        }
+        if quic_path_metrics_should_publish_local_sender(metrics) {
+            #[cfg(feature = "lab-diagnostics")]
+            if let (Some(carrier_elapsed), Some(rate_elapsed)) = (
+                metrics.latest_carrier_ack_elapsed,
+                metrics.latest_rate_sample_elapsed,
+            ) {
+                let raw_rate_bps = (metrics.latest_delivery_sample_bytes as f64 * 8.0
+                    / rate_elapsed.as_secs_f64())
+                .round() as u64;
                 lab_diagnostic(
-                    "quic_capacity_probe_retired",
+                    "quic_carrier_rate_sample",
                     format_args!(
-                        "session_id={} path_id={} path_instance_id={} calibration_id={} proof_accepted={} carrier_retired={}",
+                        "session_id={} path_id={} path_instance_id={} direction={} rate_source=quic_send_ack_max sample_bytes={} sample_count={} carrier_elapsed_us={} sample_elapsed_us={} raw_rate_bps={} published_rate_bps={} poll_elapsed_us={} total_sample_count={} total_sample_bytes={} app_limited={}",
                         session_id.0,
                         path_id.0,
                         path_instance_id.as_u64(),
-                        token,
-                        capacity_proof_accepted,
-                        _retired,
+                        metrics.direction,
+                        metrics.latest_delivery_sample_bytes,
+                        metrics.latest_delivery_sample_count,
+                        carrier_elapsed.as_micros(),
+                        rate_elapsed.as_micros(),
+                        raw_rate_bps,
+                        metrics.delivery_rate_bps.round() as u64,
+                        poll_elapsed.as_micros(),
+                        metrics.delivery_sample_count,
+                        metrics.delivery_sample_bytes,
+                        metrics.app_limited,
                     ),
                 );
             }
-            if quic_path_metrics_should_publish_local_sender(metrics) {
-                #[cfg(feature = "lab-diagnostics")]
-                if let (Some(carrier_elapsed), Some(rate_elapsed)) = (
-                    metrics.latest_carrier_ack_elapsed,
-                    metrics.latest_rate_sample_elapsed,
-                ) {
-                    let raw_rate_bps = (metrics.latest_delivery_sample_bytes as f64 * 8.0
-                        / rate_elapsed.as_secs_f64())
-                    .round() as u64;
-                    lab_diagnostic(
-                        "quic_carrier_rate_sample",
-                        format_args!(
-                            "session_id={} path_id={} path_instance_id={} direction={} rate_source=quic_send_ack_max sample_bytes={} sample_count={} carrier_elapsed_us={} sample_elapsed_us={} raw_rate_bps={} published_rate_bps={} poll_elapsed_us={} total_sample_count={} total_sample_bytes={} app_limited={}",
-                            session_id.0,
-                            path_id.0,
-                            path_instance_id.as_u64(),
-                            metrics.direction,
-                            metrics.latest_delivery_sample_bytes,
-                            metrics.latest_delivery_sample_count,
-                            carrier_elapsed.as_micros(),
-                            rate_elapsed.as_micros(),
-                            raw_rate_bps,
-                            metrics.delivery_rate_bps.round() as u64,
-                            poll_elapsed.as_micros(),
-                            metrics.delivery_sample_count,
-                            metrics.delivery_sample_bytes,
-                            metrics.app_limited,
-                        ),
-                    );
-                }
-                if !capacity_proof_accepted {
-                    context.reliable_streams.record_local_path_metrics(
-                        &path_registration,
-                        path_metrics_from_quic_path(path_id, metrics),
-                    );
-                }
+            if !capacity_proof_accepted {
+                context.reliable_streams.record_local_path_metrics(
+                    &path_registration,
+                    path_metrics_from_quic_path(path_id, metrics),
+                );
             }
-            tokio::time::sleep(quic_path_metrics_poll_interval(metrics)).await;
         }
-    });
+        tokio::time::sleep(quic_path_metrics_poll_interval(metrics)).await;
+    }
 }
 
 fn quic_path_metrics_should_publish_local_sender(metrics: UdpPathMetrics) -> bool {

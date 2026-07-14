@@ -7,6 +7,7 @@ use super::metrics::*;
 use super::*;
 use crate::runtime::path::authentication::ClientPathAuthenticationFrames;
 use crate::scheduler::stream_demand_hint_for_lane;
+use crate::transport::{CarrierSocketProvider, CarrierSocketRequest};
 use tokio::sync::Mutex as AsyncMutex;
 
 #[derive(Clone)]
@@ -96,7 +97,6 @@ impl ClientUdpPathSessionHandle {
         }
         let connection = connect_client_udp_path(&self.runtime).await?;
         let carrier_connection = connection.connection.clone();
-        spawn_client_udp_path_metrics(self.runtime.clone(), carrier_connection.clone());
         *current = Some(connection);
         Ok(carrier_connection)
     }
@@ -113,23 +113,36 @@ impl ClientUdpPathSessionHandle {
 pub(in crate::runtime) struct ClientUdpPathSessionRuntime {
     pub(in crate::runtime) path: PathSpec,
     pub(in crate::runtime) path_index: usize,
+    pub(in crate::runtime) config_ordinal: usize,
     pub(in crate::runtime) session_id: SessionId,
     pub(in crate::runtime) security: SecurityConfig,
     pub(in crate::runtime) codec_limits: CodecLimits,
     pub(in crate::runtime) mux_limits: MuxLimits,
     pub(in crate::runtime) stream_frame_queue: usize,
     pub(in crate::runtime) state: Arc<ClientPathState>,
+    pub(in crate::runtime) carrier_sockets: Arc<dyn CarrierSocketProvider>,
 }
 
 struct ClientUdpPathConnection {
     _endpoint: UdpPathEndpoint,
     connection: UdpPathConnection,
+    metrics_task: Option<tokio::task::JoinHandle<()>>,
+}
+
+// The metrics loop holds a carrier clone, so the session must retire it explicitly.
+impl Drop for ClientUdpPathConnection {
+    fn drop(&mut self) {
+        self.connection.close();
+        if let Some(task) = self.metrics_task.take() {
+            task.abort();
+        }
+    }
 }
 
 fn spawn_client_udp_path_metrics(
     runtime: ClientUdpPathSessionRuntime,
     connection: UdpPathConnection,
-) {
+) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
         let mut tracker = UdpPathMetricTracker::default();
         #[cfg(feature = "lab-diagnostics")]
@@ -206,7 +219,7 @@ fn spawn_client_udp_path_metrics(
             }
             tokio::time::sleep(quic_path_metrics_poll_interval(metrics)).await;
         }
-    });
+    })
 }
 
 pub(in crate::runtime) struct ClientUdpDatagramStream {
@@ -220,21 +233,19 @@ async fn connect_client_udp_path(
     runtime: &ClientUdpPathSessionRuntime,
 ) -> Result<ClientUdpPathConnection, RuntimeError> {
     let remote_addr = resolve_first_socket_addr(&runtime.path).await?;
-    let local_addr = if remote_addr.ip().is_loopback() {
-        SocketAddr::new(remote_addr.ip(), 0)
-    } else if remote_addr.is_ipv4() {
-        SocketAddr::from(([0, 0, 0, 0], 0))
-    } else {
-        "[::]:0"
-            .parse()
-            .expect("static IPv6 unspecified socket addr")
-    };
-    let endpoint = UdpPathEndpoint::bind_client(&runtime.path, local_addr, runtime).await?;
+    let carrier = runtime.carrier_sockets.create(CarrierSocketRequest {
+        path: &runtime.path,
+        config_ordinal: runtime.config_ordinal,
+        remote_addr,
+    })?;
+    let endpoint = UdpPathEndpoint::bind_client(carrier, runtime).await?;
     let connection = endpoint.connect(remote_addr).await?;
     perform_client_udp_path_handshake(&connection, runtime).await?;
+    let metrics_task = spawn_client_udp_path_metrics(runtime.clone(), connection.clone());
     Ok(ClientUdpPathConnection {
         _endpoint: endpoint,
         connection,
+        metrics_task: Some(metrics_task),
     })
 }
 

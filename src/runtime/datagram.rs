@@ -7,8 +7,9 @@ use crate::mux::MuxLimits;
 use crate::mux::datagram::{DatagramError, DatagramFlow};
 use crate::protocol::codec::CodecLimits;
 use crate::protocol::{DatagramFlowId, DatagramId, OffsetRange, TargetAddr};
-use crate::transport::PathSpec;
+use crate::transport::{CarrierSocketProvider, PathSpec, SystemCarrierSocketProvider};
 use bytes::Bytes;
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 mod association;
@@ -86,6 +87,28 @@ pub async fn client_udp_datagram_round_trip(
     payload: Bytes,
     ttl_ms: u32,
 ) -> Result<Bytes, RuntimeError> {
+    client_udp_datagram_round_trip_with_provider(
+        path,
+        security,
+        resources,
+        target,
+        payload,
+        ttl_ms,
+        Arc::new(SystemCarrierSocketProvider),
+    )
+    .await
+}
+
+/// Runs a standalone QUIC datagram flow through a host-provided carrier socket.
+pub async fn client_udp_datagram_round_trip_with_provider(
+    path: &PathSpec,
+    security: SecurityConfig,
+    resources: ResourceLimits,
+    target: TargetAddr,
+    payload: Bytes,
+    ttl_ms: u32,
+    carrier_sockets: Arc<dyn CarrierSocketProvider>,
+) -> Result<Bytes, RuntimeError> {
     client_udp_datagram_round_trip_with_limits(
         path,
         security,
@@ -94,6 +117,7 @@ pub async fn client_udp_datagram_round_trip(
         target,
         payload,
         ttl_ms,
+        carrier_sockets,
     )
     .await
 }
@@ -106,6 +130,7 @@ async fn client_udp_datagram_round_trip_with_limits(
     target: TargetAddr,
     payload: Bytes,
     ttl_ms: u32,
+    carrier_sockets: Arc<dyn CarrierSocketProvider>,
 ) -> Result<Bytes, RuntimeError> {
     let payload_len = payload.len();
     let product_deadline = tokio::time::Instant::now() + Duration::from_millis(u64::from(ttl_ms));
@@ -114,13 +139,14 @@ async fn client_udp_datagram_round_trip_with_limits(
     if handshake_timeout.is_zero() {
         return Err(RuntimeError::DatagramResponseTimedOut);
     }
-    let mut session = quic_session::UdpDatagramClientSession::open(
+    let mut session = quic_session::UdpDatagramClientSession::open_with_provider(
         path,
         0,
         security,
         codec_limits,
         mux_limits,
         handshake_timeout,
+        carrier_sockets,
     )
     .await?;
     if tokio::time::Instant::now() >= product_deadline {

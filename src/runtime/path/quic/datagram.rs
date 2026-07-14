@@ -248,6 +248,12 @@ async fn drain_server_udp_datagram_commands(
                     "server QUIC datagram writer received TCP capacity command",
                 ));
             }
+            ReliablePathCommand::ResetAndCloseStream { .. } => {
+                commands.release_pending_command_bytes(pending_bytes);
+                return Err(RuntimeError::Protocol(
+                    "server QUIC datagram writer received reliable terminal command",
+                ));
+            }
             ReliablePathCommand::CloseStream(_) => {
                 flush_udp_frame_batch(send, pending_frames, context.codec_limits).await?;
                 let _ = udp_path_finish_stream(send);

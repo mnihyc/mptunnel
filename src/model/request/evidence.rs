@@ -155,6 +155,11 @@ impl RequestPathRateEvidence {
         self.pending_bytes = 0;
         self.previous_window_acked_at = Some(acked_at);
     }
+
+    #[cfg(test)]
+    pub(crate) fn has_ack_boundary(&self) -> bool {
+        self.previous_window_acked_at.is_some()
+    }
 }
 
 pub(crate) fn request_path_rate_coverage_floor_bytes(

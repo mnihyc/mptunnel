@@ -194,6 +194,12 @@ pub(super) async fn drain_client_udp_stream_commands(
                     "client QUIC path received TCP capacity command",
                 ));
             }
+            ReliablePathCommand::ResetAndCloseStream { .. } => {
+                commands.release_pending_command_bytes(pending_bytes);
+                return Err(RuntimeError::Protocol(
+                    "client QUIC path received server terminal command",
+                ));
+            }
             ReliablePathCommand::CloseStream(close_stream_id) => {
                 flush_udp_frame_batch_with_path_proofs(
                     send,

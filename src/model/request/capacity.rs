@@ -15,6 +15,10 @@ use crate::protocol::UnderlayProtocol;
 use crate::scheduler::PathSnapshot;
 use std::time::Duration;
 
+#[cfg(test)]
+#[path = "capacity_test.rs"]
+mod tests;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct RequestQuicCapacityCalibrationGeometry {
     pub(crate) train_bytes: u64,

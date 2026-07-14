@@ -1,5 +1,7 @@
 use crate::protocol::UnderlayProtocol;
-use crate::transport::{Endpoint, PathSpec};
+use crate::transport::{
+    CarrierSocketProvider, CarrierSocketRequest, Endpoint, PathSpec, SystemCarrierSocketProvider,
+};
 use std::net::{IpAddr, SocketAddr};
 use std::time::Duration;
 use tokio::net::{TcpListener, TcpSocket, TcpStream, lookup_host};
@@ -26,10 +28,42 @@ pub async fn connect_path(
     path: &PathSpec,
     options: TcpConnectOptions,
 ) -> Result<TcpStream, TcpTransportError> {
+    connect_path_with_provider(path, 0, options, &SystemCarrierSocketProvider).await
+}
+
+/// Connects a configured carrier through the host socket boundary.
+pub async fn connect_path_with_provider(
+    path: &PathSpec,
+    config_ordinal: usize,
+    options: TcpConnectOptions,
+    provider: &dyn CarrierSocketProvider,
+) -> Result<TcpStream, TcpTransportError> {
     if path.underlay != UnderlayProtocol::Tcp {
         return Err(TcpTransportError::WrongUnderlay(path.underlay));
     }
-    connect_endpoint(&path.endpoint, options).await
+    let mut effective_path = path.clone();
+    effective_path.binding.source_ip = match (path.binding.source_ip, options.source_ip) {
+        (Some(configured), Some(requested)) if configured != requested => {
+            return Err(TcpTransportError::ConflictingSourceBinding);
+        }
+        (configured, requested) => configured.or(requested),
+    };
+    let addrs = resolve_endpoint(&effective_path.endpoint).await?;
+    let mut last_error = None;
+    for addr in addrs {
+        if effective_path
+            .binding
+            .source_ip
+            .is_some_and(|source_ip| source_ip.is_ipv4() != addr.is_ipv4())
+        {
+            continue;
+        }
+        match connect_carrier_addr(&effective_path, config_ordinal, addr, options, provider).await {
+            Ok(stream) => return Ok(stream),
+            Err(err) => last_error = Some(err),
+        }
+    }
+    Err(last_error.unwrap_or(TcpTransportError::NoCompatibleAddress))
 }
 
 pub async fn connect_endpoint(
@@ -97,11 +131,33 @@ pub async fn connect_addr(
     Ok(stream)
 }
 
+async fn connect_carrier_addr(
+    path: &PathSpec,
+    config_ordinal: usize,
+    addr: SocketAddr,
+    options: TcpConnectOptions,
+    provider: &dyn CarrierSocketProvider,
+) -> Result<TcpStream, TcpTransportError> {
+    let carrier = provider.create(CarrierSocketRequest {
+        path,
+        config_ordinal,
+        remote_addr: addr,
+    })?;
+    let socket = TcpSocket::from_std_stream(carrier.into_tcp_socket()?);
+    let stream = timeout(options.timeout, socket.connect(addr))
+        .await
+        .map_err(|_| TcpTransportError::ConnectTimedOut(addr))?
+        .map_err(TcpTransportError::Io)?;
+    stream.set_nodelay(options.nodelay)?;
+    Ok(stream)
+}
+
 #[derive(Debug)]
 pub enum TcpTransportError {
     WrongUnderlay(UnderlayProtocol),
     ResolutionEmpty(String),
     NoCompatibleAddress,
+    ConflictingSourceBinding,
     ConnectTimedOut(SocketAddr),
     Io(std::io::Error),
 }
@@ -123,6 +179,12 @@ impl std::fmt::Display for TcpTransportError {
             }
             Self::NoCompatibleAddress => {
                 write!(f, "no resolved address is compatible with source binding")
+            }
+            Self::ConflictingSourceBinding => {
+                write!(
+                    f,
+                    "path and connect options specify different source addresses"
+                )
             }
             Self::ConnectTimedOut(addr) => write!(f, "TCP connect to {addr} timed out"),
             Self::Io(err) => write!(f, "{err}"),

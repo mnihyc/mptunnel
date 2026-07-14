@@ -509,6 +509,37 @@ impl ServerTcpPathSession {
                     self.evidence.publish_response_probe(probe, started_at);
                     return Ok(ServerTcpSessionDisposition::Continue);
                 }
+                ReliablePathCommand::ResetAndCloseStream { stream_id, reason } => {
+                    // A TCP session is shared, so retire only this attachment
+                    // after its reset has entered the ordered carrier writer.
+                    self.writer
+                        .push_frame(Frame::StreamReset { stream_id, reason });
+                    self.commands_rx
+                        .release_pending_command_bytes(pending_bytes);
+                    wrote_frame = true;
+                    sent_bytes = sent_bytes.saturating_add(writer_run_bytes);
+                    sent_items = sent_items.saturating_add(1);
+                    if !self.writer.write_batch(&mut self.evidence).await? {
+                        return Ok(ServerTcpSessionDisposition::Stop);
+                    }
+                    self.streams.detach(
+                        &self.context,
+                        &self.commands_tx,
+                        self.session_id,
+                        self.path_id,
+                        stream_id,
+                    );
+                    if self.draining && self.streams.is_empty() && self.datagrams.is_empty() {
+                        let _ = self
+                            .writer
+                            .write_frame(&Frame::PathClose {
+                                path_id: self.path_id,
+                                reason: CloseReason::Normal,
+                            })
+                            .await?;
+                        return Ok(ServerTcpSessionDisposition::Stop);
+                    }
+                }
                 ReliablePathCommand::CloseStream(stream_id) => {
                     if !self.writer.write_batch(&mut self.evidence).await? {
                         return Ok(ServerTcpSessionDisposition::Stop);

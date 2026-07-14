@@ -3,16 +3,184 @@ use super::admission::{
     response_target_has_emission_credit,
 };
 use super::*;
-use crate::model::admission::BulkAdmissionRole;
+use crate::model::admission::{BulkAdmissionRole, BulkExplorationCompletionProjection};
+use crate::model::multipath::PathAdmission;
 use crate::model::path::carrier_path_key_order;
 use crate::model::response::{CarrierPathFlightDebt, ResponseServiceFamilyLoads};
 use crate::runtime::stream::response::{
     ResponseSenderPathTarget, ResponseServiceHandoffDrainReservation, ResponseStreamBinding,
     valid_quic_capacity_proof_candidate_at, well_formed_quic_capacity_proof_candidate,
 };
+use crate::scheduler::PathSnapshot;
 
 // Why separate: causal lab observability mirrors product gates, but it must
 // remain an observer rather than inflate or become a second hot-path policy.
+
+#[derive(Debug, Clone, Copy)]
+pub(super) struct ResponseBulkCandidateDiag {
+    pub(super) lead: Option<ResponseBulkLead>,
+    pub(super) role: Option<BulkAdmissionRole>,
+    pub(super) ordering_debt: u64,
+}
+
+pub(super) fn lab_response_bulk_output_candidate(
+    reason: &'static str,
+    target: &ResponseSenderPathTarget,
+    payload_bytes: usize,
+    mux_limits: MuxLimits,
+    diag: ResponseBulkCandidateDiag,
+) {
+    if !lab_diagnostic_event_enabled("server_bulk_output_candidate") {
+        return;
+    }
+    static EVENT_COUNT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let ordinal = EVENT_COUNT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    if ordinal >= 512 && ordinal % 512 != 0 {
+        return;
+    }
+    let (lead_underlay, lead_path_id, lead_eta_ms) = diag
+        .lead
+        .map(|lead| {
+            (
+                format!("{:?}", lead.key.underlay),
+                lead.key.path_id.0.to_string(),
+                lead.eta_ms,
+            )
+        })
+        .unwrap_or_else(|| ("none".to_string(), "none".to_string(), 0.0));
+    lab_diagnostic(
+        "server_bulk_output_candidate",
+        format_args!(
+            "ordinal={} reason={} session_id={} binding_instance_id={} path_underlay={:?} path_id={} is_active={} sender_evidence={} bulk_rate_evidence={} role={} eta_ms={:.3} lead_underlay={} lead_path_id={} lead_eta_ms={:.3} stream_ordering_debt={} payload_bytes={} command_pending_bytes={} path_queue_bytes={} product_queue_bytes={} carrier_inflight_bytes={} product_inflight_bytes={} owner_data_inflight_bytes={} carrier_inflight_limit={} delivery_rate_mbps={:.3} pacing_mbps={:.3} srtt_ms={:.3} confidence={:.3} app_limited={} calibration_eligible={} calibration_proven={} calibration_active={} calibration_spent_bytes={} calibration_credit_bytes={} calibration_max_bytes={} mux_max_path_flight={} mux_max_reorder={}",
+            ordinal + 1,
+            reason,
+            target.session_id.0,
+            target.binding_instance_id,
+            target.key.underlay,
+            target.key.path_id.0,
+            target.is_active,
+            target.has_sender_evidence,
+            target.has_bulk_rate_evidence,
+            diag.role
+                .map(|role| format!("{:?}", role))
+                .unwrap_or_else(|| "none".to_string()),
+            target.eta_ms,
+            lead_underlay,
+            lead_path_id,
+            lead_eta_ms,
+            diag.ordering_debt,
+            payload_bytes,
+            target.command_pending_bytes,
+            target.snapshot.queue_bytes,
+            target.snapshot.product_queue_bytes,
+            target.snapshot.bytes_in_flight,
+            target.snapshot.product_bytes_in_flight,
+            target.owner_data_in_flight_bytes,
+            target.snapshot.inflight_limit_bytes,
+            target.snapshot.delivery_rate_bps / 1_000_000.0,
+            target.snapshot.pacing_rate_bps / 1_000_000.0,
+            target.snapshot.srtt_ms,
+            target.snapshot.confidence,
+            target.snapshot.app_limited,
+            target.ack_clock_calibration_eligible,
+            target.ack_clock_calibration_proven,
+            target.ack_clock_calibration_active,
+            target.ack_clock_calibration_spent_bytes,
+            target.ack_clock_calibration_credit_limit_bytes,
+            target.ack_clock_calibration_max_limit_bytes,
+            mux_limits.max_path_flight_bytes,
+            mux_limits.max_reorder_bytes,
+        ),
+    );
+}
+
+pub(super) fn lab_response_bulk_output_selected(
+    reason: &'static str,
+    target: &ResponseSenderPathTarget,
+    admission: PathAdmission,
+    payload_bytes: usize,
+) {
+    if !lab_diagnostic_event_enabled("server_bulk_output_selected") {
+        return;
+    }
+    static EVENT_COUNT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let ordinal = EVENT_COUNT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    if ordinal >= 1024 && ordinal % 128 != 0 {
+        return;
+    }
+    lab_diagnostic(
+        "server_bulk_output_selected",
+        format_args!(
+            "ordinal={} reason={} session_id={} binding_instance_id={} path_underlay={:?} path_id={} role={:?} work={:?} payload_bytes={} command_pending_bytes={} product_inflight_bytes={} owner_data_inflight_bytes={} eta_ms={:.3} app_limited={} bulk_rate_evidence={} calibration_eligible={} calibration_proven={} calibration_active={} calibration_spent_bytes={} calibration_credit_bytes={} calibration_max_bytes={}",
+            ordinal + 1,
+            reason,
+            target.session_id.0,
+            target.binding_instance_id,
+            target.key.underlay,
+            target.key.path_id.0,
+            admission.role,
+            admission.work,
+            payload_bytes,
+            target.command_pending_bytes,
+            target.snapshot.product_bytes_in_flight,
+            target.owner_data_in_flight_bytes,
+            target.eta_ms,
+            target.snapshot.app_limited,
+            target.has_bulk_rate_evidence,
+            target.ack_clock_calibration_eligible,
+            target.ack_clock_calibration_proven,
+            target.ack_clock_calibration_active,
+            target.ack_clock_calibration_spent_bytes,
+            target.ack_clock_calibration_credit_limit_bytes,
+            target.ack_clock_calibration_max_limit_bytes,
+        ),
+    );
+}
+
+pub(super) fn lab_response_ack_clock_calibration_admission(
+    target: &ResponseSenderPathTarget,
+    service: &ResponseSenderPathTarget,
+    candidate_snapshot: PathSnapshot,
+    candidate_eta_ms: f64,
+    uses_service_prior: bool,
+    projection: BulkExplorationCompletionProjection,
+    admitted: bool,
+) {
+    if !lab_diagnostic_event_enabled("response_ack_clock_calibration_admission") {
+        return;
+    }
+    lab_diagnostic(
+        "response_ack_clock_calibration_admission",
+        format_args!(
+            "session_id={} binding_instance_id={} path_underlay={:?} path_id={} service_underlay={:?} service_path_id={} admitted={} uses_service_prior={} candidate_completion_ms={:.3} service_reservoir_horizon_ms={:.3} exploration_bytes={} service_followup_bytes={} candidate_eta_ms={:.3} service_eta_ms={:.3} candidate_rate_mbps={:.3} service_rate_mbps={:.3} candidate_srtt_ms={:.3} service_srtt_ms={:.3}",
+            target.session_id.0,
+            target.binding_instance_id,
+            target.key.underlay,
+            target.key.path_id.0,
+            service.key.underlay,
+            service.key.path_id.0,
+            admitted,
+            uses_service_prior,
+            projection.candidate_completion_ms,
+            projection.service_reservoir_horizon_ms,
+            projection.exploration_bytes,
+            projection.service_followup_bytes,
+            candidate_eta_ms,
+            service.eta_ms,
+            candidate_snapshot
+                .delivery_rate_bps
+                .max(candidate_snapshot.pacing_rate_bps)
+                / 1_000_000.0,
+            service
+                .snapshot
+                .delivery_rate_bps
+                .max(service.snapshot.pacing_rate_bps)
+                / 1_000_000.0,
+            candidate_snapshot.srtt_ms,
+            service.snapshot.srtt_ms,
+        ),
+    );
+}
 
 #[derive(Clone, Copy)]
 struct ResponseServiceHandoffTargetEvaluation<'a> {

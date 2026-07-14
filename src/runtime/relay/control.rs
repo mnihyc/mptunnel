@@ -1,5 +1,4 @@
 use super::*;
-use crate::model::admission::bulk_service_feed_reservoir_payload_bytes;
 use crate::model::capacity::{
     adaptive_reliable_relay_chunk_bytes, adaptive_reliable_relay_chunk_bytes_with_frame_limit,
     adaptive_reliable_relay_inflight_bytes, adaptive_reliable_relay_repair_bytes,
@@ -10,256 +9,13 @@ use crate::protocol::frame::normalized_offset_ranges;
 #[cfg(feature = "lab-diagnostics")]
 use crate::protocol::frame::reliable_path_frame_pacing_bytes;
 
-fn reliable_relay_request_outstanding_resource_ceiling(mux_limits: MuxLimits) -> usize {
-    let stream_window = usize::try_from(mux_limits.max_stream_window_bytes).unwrap_or(usize::MAX);
-    mux_limits
-        .max_repair_bytes
-        .min(mux_limits.max_path_flight_bytes)
-        .min(stream_window)
-        .max(1)
-}
+use crate::runtime::stream::request::RequestOutstandingWindow;
 
 pub(in crate::runtime) fn reliable_relay_client_dispatch_payload_limit(
     adaptive_chunk_bytes: usize,
     remaining_pass_bytes: usize,
 ) -> usize {
     adaptive_chunk_bytes.min(remaining_pass_bytes).max(1)
-}
-
-#[derive(Debug)]
-struct ReliableRelayRequestOutstandingWindow {
-    service_epoch_instance: Option<RelayPathInstance>,
-    product_limit_bytes: usize,
-    growth_epoch_at: Instant,
-    acked_in_epoch: usize,
-}
-
-impl ReliableRelayRequestOutstandingWindow {
-    fn new() -> Self {
-        Self::new_at(Instant::now())
-    }
-
-    fn new_at(now: Instant) -> Self {
-        Self {
-            service_epoch_instance: None,
-            product_limit_bytes: 0,
-            growth_epoch_at: now,
-            acked_in_epoch: 0,
-        }
-    }
-
-    fn limit_bytes(
-        &mut self,
-        service_instance: Option<RelayPathInstance>,
-        lane: FlowLane,
-        payload_bytes: usize,
-        mux_limits: MuxLimits,
-    ) -> usize {
-        self.limit_bytes_at(
-            service_instance,
-            lane,
-            payload_bytes,
-            mux_limits,
-            Instant::now(),
-        )
-    }
-
-    fn resolved_service_instance(
-        &self,
-        ordered_service: Option<RelayPathInstance>,
-        pre_owner_active: Option<RelayPathInstance>,
-    ) -> Option<RelayPathInstance> {
-        ordered_service.or_else(|| {
-            self.service_epoch_instance
-                .is_none()
-                .then_some(pre_owner_active)
-                .flatten()
-        })
-    }
-
-    fn limit_bytes_at(
-        &mut self,
-        service_instance: Option<RelayPathInstance>,
-        lane: FlowLane,
-        payload_bytes: usize,
-        mux_limits: MuxLimits,
-        now: Instant,
-    ) -> usize {
-        let resource_ceiling = reliable_relay_request_outstanding_resource_ceiling(mux_limits);
-        let startup_reservoir = if lane.is_bulk() {
-            bulk_service_feed_reservoir_payload_bytes(payload_bytes, mux_limits)
-        } else {
-            // Flow classification already expects one full source queue.
-            // Keeping this reservoir avoids turning the 14.6 KiB latency
-            // probe into a stop-and-wait prerequisite for sustained upload.
-            reliable_relay_buffer_len(mux_limits)
-        }
-        .min(resource_ceiling)
-        .max(1);
-        if service_instance.is_none() && self.service_epoch_instance.is_some() {
-            // Demotion still closes read-ahead during recovery, but promotion
-            // cannot manufacture a larger allowance without a Service epoch.
-            if !lane.is_bulk() && self.product_limit_bytes > startup_reservoir {
-                self.product_limit_bytes = startup_reservoir;
-                self.growth_epoch_at = now;
-                self.acked_in_epoch = 0;
-            }
-            return self.product_limit_bytes.min(resource_ceiling).max(1);
-        }
-        if let Some(instance) = service_instance
-            && self.service_epoch_instance != Some(instance)
-        {
-            // Product admission is unified above the carriers, but its ACK
-            // epoch belongs to one exact Service association. Handoffs across
-            // either protocol start from the same bounded reservoir.
-            self.service_epoch_instance = Some(instance);
-            self.product_limit_bytes = 0;
-            self.growth_epoch_at = now;
-            self.acked_in_epoch = 0;
-        }
-        // Retain a bounded allowance while Service placement is temporarily
-        // absent so recovery cannot reopen source read-ahead.
-        let lane_demoted = !lane.is_bulk() && self.product_limit_bytes > startup_reservoir;
-        if lane_demoted || self.product_limit_bytes < startup_reservoir {
-            self.product_limit_bytes = startup_reservoir;
-            self.growth_epoch_at = now;
-            self.acked_in_epoch = 0;
-        }
-        self.product_limit_bytes.min(resource_ceiling).max(1)
-    }
-
-    fn record_acked(
-        &mut self,
-        released_bytes: usize,
-        owner_instance: RelayPathInstance,
-        service_instance: Option<RelayPathInstance>,
-        owner_capable: bool,
-        lane: FlowLane,
-        growth_interval: Duration,
-        mux_limits: MuxLimits,
-    ) {
-        self.record_acked_at(
-            released_bytes,
-            owner_instance,
-            service_instance,
-            owner_capable,
-            lane,
-            growth_interval,
-            mux_limits,
-            Instant::now(),
-        );
-    }
-
-    fn record_acked_at(
-        &mut self,
-        released_bytes: usize,
-        owner_instance: RelayPathInstance,
-        service_instance: Option<RelayPathInstance>,
-        owner_capable: bool,
-        lane: FlowLane,
-        growth_interval: Duration,
-        mux_limits: MuxLimits,
-        now: Instant,
-    ) {
-        let Some(service_instance) = service_instance else {
-            return;
-        };
-        if released_bytes == 0
-            || !owner_capable
-            || service_instance.key.underlay != owner_instance.key.underlay
-            || self.service_epoch_instance != Some(service_instance)
-            || !lane.is_bulk()
-        {
-            return;
-        }
-        let resource_ceiling = reliable_relay_request_outstanding_resource_ceiling(mux_limits);
-        if self.product_limit_bytes == 0 || self.product_limit_bytes >= resource_ceiling {
-            return;
-        }
-        let growth_interval = growth_interval.max(QUIC_TIMER_GRANULARITY);
-        if now.saturating_duration_since(self.growth_epoch_at) > growth_interval {
-            self.growth_epoch_at = now;
-            self.acked_in_epoch = 0;
-            return;
-        }
-        self.acked_in_epoch = self.acked_in_epoch.saturating_add(released_bytes);
-        let durable_product_floor =
-            usize::try_from(reliable_subflow_startup_sample_limit_bytes(mux_limits))
-                .unwrap_or(usize::MAX)
-                .min(self.product_limit_bytes);
-        let growth_threshold = self
-            .product_limit_bytes
-            .div_ceil(2)
-            .max(durable_product_floor)
-            .max(1);
-        if self.acked_in_epoch < growth_threshold {
-            return;
-        }
-        self.product_limit_bytes = self
-            .product_limit_bytes
-            .saturating_mul(2)
-            .min(resource_ceiling)
-            .max(1);
-        self.growth_epoch_at = now;
-        self.acked_in_epoch = 0;
-    }
-
-    fn record_tcp_ack_clock_turnover(
-        &mut self,
-        turnover_bytes: usize,
-        service_instance: Option<RelayPathInstance>,
-        lane: FlowLane,
-        mux_limits: MuxLimits,
-    ) {
-        let Some(service_instance) = service_instance else {
-            return;
-        };
-        if service_instance.key.underlay != UnderlayProtocol::Tcp
-            || self.service_epoch_instance != Some(service_instance)
-            || !lane.is_bulk()
-        {
-            return;
-        }
-        let resource_ceiling = reliable_relay_request_outstanding_resource_ceiling(mux_limits);
-        if self.product_limit_bytes == 0 || self.product_limit_bytes >= resource_ceiling {
-            return;
-        }
-        let durable_product_floor =
-            usize::try_from(reliable_subflow_startup_sample_limit_bytes(mux_limits))
-                .unwrap_or(usize::MAX)
-                .min(self.product_limit_bytes);
-        let next_limit = reliable_relay_request_tcp_product_limit_for_turnover(
-            self.product_limit_bytes,
-            turnover_bytes,
-            durable_product_floor,
-            resource_ceiling,
-        );
-        if next_limit > self.product_limit_bytes {
-            // TCP uses freshness-bounded per-owner pipe samples. The shared
-            // product window only quantizes their aggregate into bounded
-            // stages; calibration and lifecycle code own path authority.
-            self.product_limit_bytes = next_limit;
-            self.growth_epoch_at = Instant::now();
-            self.acked_in_epoch = 0;
-        }
-    }
-}
-
-fn reliable_relay_request_tcp_product_limit_for_turnover(
-    current_limit: usize,
-    turnover_bytes: usize,
-    durable_product_floor: usize,
-    resource_ceiling: usize,
-) -> usize {
-    let mut limit = current_limit.max(1).min(resource_ceiling.max(1));
-    while limit < resource_ceiling {
-        let threshold = limit.div_ceil(2).max(durable_product_floor).max(1);
-        if turnover_bytes < threshold {
-            break;
-        }
-        limit = limit.saturating_mul(2).min(resource_ceiling).max(1);
-    }
-    limit
 }
 
 fn reliable_relay_request_outstanding_headroom_bytes(
@@ -298,7 +54,7 @@ fn reliable_tcp_service_request_bulk_flow_is_active(
 
 fn update_tcp_service_request_bulk_flow_registration(
     registration: &ReliableTcpRequestBulkFlowRegistration,
-    sender: &RelaySenderService,
+    sender: &RequestSenderService,
     remotes: &ReliableRelayRemoteSet,
     send_stream: &ReliableSendStream,
     sender_queue: &ReliableRelaySenderQueue,
@@ -351,8 +107,8 @@ where
     let mut stats = PathDeliveryStats::default();
     let mut path_stats = HashMap::<RelayPathKey, PathDeliveryStats>::new();
     let mut path_next_live_sample_bytes = HashMap::<RelayPathKey, u64>::new();
-    let mut sender = RelaySenderService::new(stream_id);
-    let mut request_outstanding_window = ReliableRelayRequestOutstandingWindow::new();
+    let mut sender = RequestSenderService::new(stream_id);
+    let mut request_outstanding_window = RequestOutstandingWindow::new();
     let mut flow_demand = ReliableRelayFlowDemandTracker::new();
     let mut request_flow_demand = ReliableRelayFlowDemandTracker::new();
     let request_bulk_flow = context.reliable_tcp_request_bulk_flow_registration();
@@ -2425,7 +2181,7 @@ fn reliable_relay_lane_changed(previous: FlowLane, current: FlowLane) -> bool {
 
 #[allow(clippy::too_many_arguments)]
 pub(in crate::runtime) async fn recover_reliable_relay_after_path_failure(
-    sender: &mut RelaySenderService,
+    sender: &mut RequestSenderService,
     sender_queue: &mut ReliableRelaySenderQueue,
     context: &ClientPathContext,
     spec: &ReliableRelayOpenSpec,

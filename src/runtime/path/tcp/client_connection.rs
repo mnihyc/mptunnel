@@ -14,9 +14,9 @@ use crate::runtime::error::RuntimeError;
 use crate::runtime::identity::random_u64;
 use crate::runtime::path::authentication::ClientPathAuthenticationFrames;
 use crate::runtime::path::commands::reliable_path_writer_frame_queue;
-use crate::transport::PathSpec;
 use crate::transport::encrypted::{EncryptedFramedStream, EncryptedFramedTransportError, PeerRole};
 use crate::transport::tcp::{self as tcp_transport, TcpConnectOptions};
+use crate::transport::{CarrierSocketProvider, PathSpec};
 use std::time::Duration;
 use tokio::sync::mpsc;
 
@@ -34,6 +34,18 @@ pub(in crate::runtime) struct ClientTcpCarrierConnection {
 pub(in crate::runtime) enum ClientTcpHeartbeatTimeoutDisposition {
     FailCarrier,
     KeepCarrierAlive,
+}
+
+/// Immutable inputs for one concrete TCP carrier generation.
+pub(in crate::runtime) struct ClientTcpCarrierConnect<'a> {
+    pub(in crate::runtime) path: &'a PathSpec,
+    pub(in crate::runtime) path_index: usize,
+    pub(in crate::runtime) config_ordinal: usize,
+    pub(in crate::runtime) session_id: SessionId,
+    pub(in crate::runtime) security: &'a SecurityConfig,
+    pub(in crate::runtime) codec_limits: CodecLimits,
+    pub(in crate::runtime) mux_limits: MuxLimits,
+    pub(in crate::runtime) carrier_sockets: &'a dyn CarrierSocketProvider,
 }
 
 impl ClientTcpCarrierConnection {
@@ -136,22 +148,29 @@ impl ClientTcpCarrierConnection {
 /// Establishes TCP, authenticates the MPP session/path, and waits for active
 /// status under one caller-supplied absolute deadline.
 pub(in crate::runtime) async fn connect_client_tcp_carrier(
-    path: &PathSpec,
-    path_index: usize,
-    session_id: SessionId,
-    security: &SecurityConfig,
-    codec_limits: CodecLimits,
-    mux_limits: MuxLimits,
+    request: ClientTcpCarrierConnect<'_>,
     open_deadline: tokio::time::Instant,
 ) -> Result<ClientTcpCarrierConnection, RuntimeError> {
+    let ClientTcpCarrierConnect {
+        path,
+        path_index,
+        config_ordinal,
+        session_id,
+        security,
+        codec_limits,
+        mux_limits,
+        carrier_sockets,
+    } = request;
     let connect = async {
         let connect_timeout = open_deadline.saturating_duration_since(tokio::time::Instant::now());
-        let tcp_stream = tcp_transport::connect_path(
+        let tcp_stream = tcp_transport::connect_path_with_provider(
             path,
+            config_ordinal,
             TcpConnectOptions {
                 timeout: connect_timeout,
                 ..TcpConnectOptions::default()
             },
+            carrier_sockets,
         )
         .await?;
         let mut tcp_metrics = TcpMetricPublisher::capture(&tcp_stream);

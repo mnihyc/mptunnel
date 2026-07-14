@@ -6,7 +6,7 @@ use crate::config::{
 use crate::outbound::{DnsConfig, OutboundConfig};
 use crate::protocol::UnderlayProtocol;
 use crate::runtime::error::RuntimeError;
-use crate::runtime::management::run_server_management_api;
+use crate::runtime::management::spawn_server_management_services;
 use crate::runtime::path::ServerPathContext;
 use crate::runtime::path::quic::io::UdpPathEndpoint;
 use crate::runtime::path::quic::server::{bind_server_udp_endpoint, run_server_udp_listener};
@@ -51,11 +51,15 @@ pub(super) async fn run(
     let mut services = tokio::task::JoinSet::new();
     services.spawn(reliable_relay.run());
     if management.enabled() {
-        let paths = paths.clone();
-        services.spawn(async move { run_server_management_api(management, paths).await });
+        spawn_server_management_services(management, paths.clone(), &mut services);
     }
     spawn_listeners(bound, paths, &mut services);
-    wait_for_service(services, "server service exited").await
+    super::supervise_runtime_services(
+        services,
+        "server service exited",
+        "server has no runtime services",
+    )
+    .await
 }
 
 pub(in crate::runtime) fn new_identity_runtime(
@@ -160,21 +164,6 @@ pub(super) fn spawn_listeners(
     }
 }
 
-async fn wait_for_service(
-    mut services: tokio::task::JoinSet<Result<(), RuntimeError>>,
-    exited_message: &'static str,
-) -> Result<(), RuntimeError> {
-    if let Some(result) = services.join_next().await {
-        match result {
-            Ok(Ok(())) => Err(RuntimeError::Protocol(exited_message)),
-            Ok(Err(err)) => Err(err),
-            Err(err) => Err(RuntimeError::TaskJoin(err)),
-        }
-    } else {
-        Err(RuntimeError::Protocol("server has no runtime services"))
-    }
-}
-
 pub(super) enum BoundServerPath {
     Tcp(TcpListener),
     Udp(UdpPathEndpoint),
@@ -184,14 +173,24 @@ pub(super) async fn run_server_tcp_listener(
     listener: TcpListener,
     context: ServerPathContext,
 ) -> Result<(), RuntimeError> {
+    let mut connections = tokio::task::JoinSet::new();
     loop {
-        let (stream, _) = listener.accept().await?;
-        stream.set_nodelay(true)?;
-        let context = context.clone();
-        tokio::spawn(async move {
-            if let Err(err) = handle_server_path(stream, context).await {
-                eprintln!("warning: server path handler failed: {err}");
+        tokio::select! {
+            accepted = listener.accept() => {
+                let (stream, _) = accepted?;
+                stream.set_nodelay(true)?;
+                let context = context.clone();
+                connections.spawn(async move {
+                    if let Err(err) = handle_server_path(stream, context).await {
+                        eprintln!("warning: server path handler failed: {err}");
+                    }
+                });
             }
-        });
+            Some(result) = connections.join_next(), if !connections.is_empty() => {
+                if let Err(err) = result {
+                    eprintln!("warning: server path handler task failed: {err}");
+                }
+            }
+        }
     }
 }

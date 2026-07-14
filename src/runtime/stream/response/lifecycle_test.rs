@@ -4,15 +4,14 @@ use super::super::topology::ResponseStreamAttachOutcome;
 use crate::model::path::CarrierPathKey;
 use crate::model::response::ResponseServiceFamilyLoads;
 use crate::mux::MuxLimits;
-use crate::protocol::{
-    Frame, PathId, ResetReason, SessionId, StreamId, StreamOpenRole, UnderlayProtocol,
-};
+use crate::protocol::{PathId, ResetReason, SessionId, StreamId, StreamOpenRole, UnderlayProtocol};
 use crate::runtime::path::commands::{
     ReliablePathCommand, recv_reliable_path_command, reliable_path_command_channels,
-    reliable_path_command_pending_bytes,
+    reliable_path_command_pending_bytes, try_recv_reliable_path_command,
 };
 use crate::scheduler::FlowLane;
 use std::sync::Arc;
+use tokio::sync::Barrier;
 
 #[test]
 fn lane_tracker_reclaims_session_state_when_last_binding_drops() {
@@ -148,21 +147,21 @@ async fn terminal_reset_captures_current_outputs_and_rejects_late_attach() {
         .await;
 
     for receivers in [&mut first_receivers, &mut second_receivers] {
-        let reset = recv_reliable_path_command(receivers)
+        let terminal = recv_reliable_path_command(receivers)
             .await
-            .expect("terminal reset");
+            .expect("terminal reset and close");
         assert!(matches!(
-            &reset,
-            ReliablePathCommand::SendFrame(Frame::StreamReset {
+            &terminal,
+            ReliablePathCommand::ResetAndCloseStream {
                 stream_id: reset_stream_id,
                 reason: ResetReason::Refused,
-            }) if *reset_stream_id == stream_id
+            } if *reset_stream_id == stream_id
         ));
-        receivers.release_pending_command_bytes(reliable_path_command_pending_bytes(&reset));
-        assert!(matches!(
-            recv_reliable_path_command(receivers).await,
-            Some(ReliablePathCommand::CloseStream(close_stream_id)) if close_stream_id == stream_id
-        ));
+        receivers.release_pending_command_bytes(reliable_path_command_pending_bytes(&terminal));
+        assert!(
+            try_recv_reliable_path_command(receivers).is_none(),
+            "terminal reset and local close must occupy one queue item"
+        );
     }
 
     let (late_commands, _late_receivers) = reliable_path_command_channels(8);
@@ -177,4 +176,82 @@ async fn terminal_reset_captures_current_outputs_and_rejects_late_attach() {
         ),
         ResponseStreamAttachOutcome::RejectedClosedStream,
     );
+}
+
+#[tokio::test]
+async fn concurrent_attach_either_joins_terminal_snapshot_or_observes_closed_stream() {
+    let stream_id = StreamId(98);
+    let (first_commands, mut first_receivers) = reliable_path_command_channels(8);
+    let binding = ResponseStreamBinding::new(
+        SessionId(98),
+        UnderlayProtocol::Tcp,
+        PathId(0),
+        first_commands,
+        FlowLane::Throughput,
+    );
+    let (racing_commands, mut racing_receivers) = reliable_path_command_channels(8);
+    let barrier = Arc::new(Barrier::new(3));
+
+    let attach_binding = binding.clone();
+    let attach_barrier = barrier.clone();
+    let attach = tokio::spawn(async move {
+        attach_barrier.wait().await;
+        attach_binding.attach(
+            UnderlayProtocol::Udp,
+            PathId(1),
+            racing_commands,
+            FlowLane::Throughput,
+            StreamOpenRole::Validation,
+            64 * 1024,
+        )
+    });
+    let close_binding = binding.clone();
+    let close_barrier = barrier.clone();
+    let close = tokio::spawn(async move {
+        close_barrier.wait().await;
+        close_binding
+            .reset_and_close_stream_ordered(stream_id, ResetReason::Refused, FlowLane::Throughput)
+            .await;
+    });
+
+    barrier.wait().await;
+    let attach_outcome = attach.await.expect("attach task");
+    close.await.expect("terminal close task");
+
+    let first_terminal = recv_reliable_path_command(&mut first_receivers)
+        .await
+        .expect("initial output terminal command");
+    assert!(matches!(
+        &first_terminal,
+        ReliablePathCommand::ResetAndCloseStream {
+            stream_id: reset_stream_id,
+            reason: ResetReason::Refused,
+        } if *reset_stream_id == stream_id
+    ));
+    first_receivers
+        .release_pending_command_bytes(reliable_path_command_pending_bytes(&first_terminal));
+
+    let mut racing_terminal_seen = false;
+    while let Some(command) = try_recv_reliable_path_command(&mut racing_receivers) {
+        racing_terminal_seen |= matches!(
+            &command,
+            ReliablePathCommand::ResetAndCloseStream {
+                stream_id: reset_stream_id,
+                reason: ResetReason::Refused,
+            } if *reset_stream_id == stream_id
+        );
+        racing_receivers
+            .release_pending_command_bytes(reliable_path_command_pending_bytes(&command));
+    }
+    match attach_outcome {
+        ResponseStreamAttachOutcome::Attached => assert!(
+            racing_terminal_seen,
+            "an attachment admitted before close must enter its terminal snapshot"
+        ),
+        ResponseStreamAttachOutcome::RejectedClosedStream => assert!(
+            !racing_terminal_seen,
+            "an attachment rejected after close never owned an output"
+        ),
+        outcome => panic!("unexpected concurrent attach outcome: {outcome:?}"),
+    }
 }

@@ -16,31 +16,31 @@ use crate::scheduler::PathSnapshot;
 use std::time::Duration;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(in crate::runtime) struct RequestQuicCapacityCalibrationGeometry {
-    pub(in crate::runtime) train_bytes: u64,
-    pub(in crate::runtime) sample_floor_bytes: u64,
-    pub(in crate::runtime) accounting_slack_bytes: u64,
-    pub(in crate::runtime) timing_slack_bytes: u64,
-    pub(in crate::runtime) desired_warmup_carrier_bytes: u64,
-    pub(in crate::runtime) warmup_carrier_bytes: u64,
-    pub(in crate::runtime) required_timed_carrier_bytes: u64,
-    pub(in crate::runtime) service_rate_bps: u64,
-    pub(in crate::runtime) candidate_carrier_flight_bytes: u64,
+pub(crate) struct RequestQuicCapacityCalibrationGeometry {
+    pub(crate) train_bytes: u64,
+    pub(crate) sample_floor_bytes: u64,
+    pub(crate) accounting_slack_bytes: u64,
+    pub(crate) timing_slack_bytes: u64,
+    pub(crate) desired_warmup_carrier_bytes: u64,
+    pub(crate) warmup_carrier_bytes: u64,
+    pub(crate) required_timed_carrier_bytes: u64,
+    pub(crate) service_rate_bps: u64,
+    pub(crate) candidate_carrier_flight_bytes: u64,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(in crate::runtime) struct RequestTcpCapacityCalibrationGeometry {
-    pub(in crate::runtime) train_bytes: u64,
-    pub(in crate::runtime) sample_floor_bytes: u64,
-    pub(in crate::runtime) accounting_slack_bytes: u64,
-    pub(in crate::runtime) timing_slack_bytes: u64,
-    pub(in crate::runtime) warmup_carrier_bytes: u64,
-    pub(in crate::runtime) required_timed_carrier_bytes: u64,
-    pub(in crate::runtime) service_rate_bps: u64,
-    pub(in crate::runtime) candidate_carrier_flight_bytes: u64,
+pub(crate) struct RequestTcpCapacityCalibrationGeometry {
+    pub(crate) train_bytes: u64,
+    pub(crate) sample_floor_bytes: u64,
+    pub(crate) accounting_slack_bytes: u64,
+    pub(crate) timing_slack_bytes: u64,
+    pub(crate) warmup_carrier_bytes: u64,
+    pub(crate) required_timed_carrier_bytes: u64,
+    pub(crate) service_rate_bps: u64,
+    pub(crate) candidate_carrier_flight_bytes: u64,
 }
 
-pub(in crate::runtime) fn request_quic_capacity_calibration_geometry(
+pub(crate) fn request_quic_capacity_calibration_geometry(
     candidate: PathSnapshot,
     service_rate_bps: f64,
     mux_limits: MuxLimits,
@@ -103,7 +103,7 @@ pub(in crate::runtime) fn request_quic_capacity_calibration_geometry(
     })
 }
 
-pub(in crate::runtime) fn request_capacity_stable_candidate_share_bytes(
+pub(crate) fn request_capacity_stable_candidate_share_bytes(
     mux_limits: MuxLimits,
     eligible_candidates: usize,
 ) -> u64 {
@@ -113,7 +113,7 @@ pub(in crate::runtime) fn request_capacity_stable_candidate_share_bytes(
     reliable_capacity_calibration_session_limit_bytes(mux_limits) / divisor
 }
 
-pub(in crate::runtime) fn request_tcp_capacity_calibration_geometry(
+pub(crate) fn request_tcp_capacity_calibration_geometry(
     candidate: PathSnapshot,
     service_model: RequestPerFlowRateModel,
     mux_limits: MuxLimits,
@@ -166,9 +166,7 @@ pub(in crate::runtime) fn request_tcp_capacity_calibration_geometry(
     })
 }
 
-pub(in crate::runtime) fn request_tcp_capacity_candidate_can_start_receipt(
-    candidate: PathSnapshot,
-) -> bool {
+pub(crate) fn request_tcp_capacity_candidate_can_start_receipt(candidate: PathSnapshot) -> bool {
     // Product and unsent queue debt cannot enter a capacity epoch. Stale
     // control flight may remain locally unacknowledged: TCP ordering plus the
     // full typed receipt makes that delay conservative rather than ambiguous.
@@ -179,7 +177,7 @@ pub(in crate::runtime) fn request_tcp_capacity_candidate_can_start_receipt(
         && candidate.session_active_latency_sensitive_flows == 0
 }
 
-pub(in crate::runtime) fn request_quic_capacity_slow_start_rounds(train_bytes: u64) -> u32 {
+pub(crate) fn request_quic_capacity_slow_start_rounds(train_bytes: u64) -> u32 {
     let mut rounds = 1_u32;
     let mut window_bytes = PATH_OPEN_SCORE_BYTES as u64;
     let mut cumulative_bytes = window_bytes;
@@ -194,7 +192,7 @@ pub(in crate::runtime) fn request_quic_capacity_slow_start_rounds(train_bytes: u
     rounds
 }
 
-pub(in crate::runtime) fn request_tcp_capacity_calibration_lease(
+pub(crate) fn request_tcp_capacity_calibration_lease(
     candidate: PathSnapshot,
     train_bytes: u64,
     service_rate_bps: u64,
@@ -213,7 +211,7 @@ pub(in crate::runtime) fn request_tcp_capacity_calibration_lease(
         .max(Duration::from_secs(1))
 }
 
-pub(in crate::runtime) fn request_quic_capacity_calibration_lease(
+pub(crate) fn request_quic_capacity_calibration_lease(
     candidate: PathSnapshot,
     train_bytes: u64,
 ) -> Duration {

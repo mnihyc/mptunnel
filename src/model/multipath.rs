@@ -4,13 +4,13 @@
 //! roles and work decisions, but neither carrier owns the product policy.
 
 use crate::config::MppPerformanceConfig;
-use crate::runtime::model::capacity::MIN_RATE_SAMPLE_BYTES;
-use crate::runtime::model::work::CarrierWorkKind;
-use crate::runtime::reliable_path::CarrierPathKey;
+use crate::model::capacity::MIN_RATE_SAMPLE_BYTES;
+use crate::model::path::CarrierPathKey;
+use crate::model::work::CarrierWorkKind;
 use std::time::Duration;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(in crate::runtime) enum PathRuntimeRole {
+pub(crate) enum PathRuntimeRole {
     /// The current primary ordered-byte owner for this product stream.
     ///
     /// This is the mptunnel equivalent of the scheduler-selected primary path
@@ -39,21 +39,21 @@ pub(in crate::runtime) enum PathRuntimeRole {
 }
 
 impl PathRuntimeRole {
-    pub(in crate::runtime) fn may_own_unique_data(self) -> bool {
+    pub(crate) fn may_own_unique_data(self) -> bool {
         matches!(self, Self::Service | Self::Subflow)
     }
 
-    pub(in crate::runtime) fn may_repair(self) -> bool {
+    pub(crate) fn may_repair(self) -> bool {
         matches!(self, Self::Service | Self::Subflow | Self::RepairOnly)
     }
 
-    pub(in crate::runtime) fn is_subflow_owner(self) -> bool {
+    pub(crate) fn is_subflow_owner(self) -> bool {
         matches!(self, Self::Subflow)
     }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(in crate::runtime) enum CarrierFamilyHealth {
+pub(crate) enum CarrierFamilyHealth {
     Healthy,
     ProbeOnly,
     RepairOnly,
@@ -61,12 +61,12 @@ pub(in crate::runtime) enum CarrierFamilyHealth {
 }
 
 impl CarrierFamilyHealth {
-    pub(in crate::runtime) fn reliable_owner_allowed(self) -> bool {
+    pub(crate) fn reliable_owner_allowed(self) -> bool {
         matches!(self, Self::Healthy)
     }
 }
 
-pub(in crate::runtime) fn cross_family_reliable_owner_health(
+pub(crate) fn cross_family_reliable_owner_health(
     current_owner: Option<CarrierPathKey>,
     current_owner_bulk_rate_proven: bool,
     candidate: CarrierPathKey,
@@ -100,7 +100,7 @@ pub(in crate::runtime) fn cross_family_reliable_owner_health(
 }
 
 #[derive(Debug, Clone, Copy)]
-pub(in crate::runtime) struct ExtraTrafficBudget {
+pub(crate) struct ExtraTrafficBudget {
     owner_progress_bytes: u64,
     optional_spent_bytes: u64,
     startup_floor_bytes: u64,
@@ -108,7 +108,7 @@ pub(in crate::runtime) struct ExtraTrafficBudget {
 }
 
 impl ExtraTrafficBudget {
-    pub(in crate::runtime) fn new(
+    pub(crate) fn new(
         owner_progress_bytes: u64,
         optional_spent_bytes: u64,
         startup_floor_bytes: usize,
@@ -122,7 +122,7 @@ impl ExtraTrafficBudget {
         }
     }
 
-    pub(in crate::runtime) fn limit_bytes(self) -> u64 {
+    pub(crate) fn limit_bytes(self) -> u64 {
         self.startup_floor_bytes.saturating_add(
             self.owner_progress_bytes
                 .saturating_mul(self.percent_budget as u64)
@@ -130,43 +130,43 @@ impl ExtraTrafficBudget {
         )
     }
 
-    pub(in crate::runtime) fn remaining_bytes(self) -> usize {
+    pub(crate) fn remaining_bytes(self) -> usize {
         self.limit_bytes()
             .saturating_sub(self.optional_spent_bytes)
             .min(usize::MAX as u64) as usize
     }
 
-    pub(in crate::runtime) fn can_spend(self, bytes: usize) -> bool {
+    pub(crate) fn can_spend(self, bytes: usize) -> bool {
         self.optional_spent_bytes.saturating_add(bytes as u64) <= self.limit_bytes()
     }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(in crate::runtime) enum ExtraTrafficKind {
+pub(crate) enum ExtraTrafficKind {
     Repair,
 }
 
 #[derive(Debug, Clone, Copy, Default)]
-pub(in crate::runtime) struct ExtraTrafficLedger {
+pub(crate) struct ExtraTrafficLedger {
     owner_progress_bytes: u64,
     repair_bytes: u64,
 }
 
 impl ExtraTrafficLedger {
     #[cfg(test)]
-    pub(in crate::runtime) fn owner_progress_bytes(self) -> u64 {
+    pub(crate) fn owner_progress_bytes(self) -> u64 {
         self.owner_progress_bytes
     }
 
-    pub(in crate::runtime) fn optional_spent_bytes(self) -> u64 {
+    pub(crate) fn optional_spent_bytes(self) -> u64 {
         self.repair_bytes
     }
 
-    pub(in crate::runtime) fn record_owner_progress(&mut self, bytes: usize) {
+    pub(crate) fn record_owner_progress(&mut self, bytes: usize) {
         self.owner_progress_bytes = self.owner_progress_bytes.saturating_add(bytes as u64);
     }
 
-    pub(in crate::runtime) fn record_optional(&mut self, kind: ExtraTrafficKind, bytes: usize) {
+    pub(crate) fn record_optional(&mut self, kind: ExtraTrafficKind, bytes: usize) {
         match kind {
             ExtraTrafficKind::Repair => {
                 self.repair_bytes = self.repair_bytes.saturating_add(bytes as u64);
@@ -174,7 +174,7 @@ impl ExtraTrafficLedger {
         }
     }
 
-    pub(in crate::runtime) fn budget(
+    pub(crate) fn budget(
         self,
         startup_floor_bytes: usize,
         performance: MppPerformanceConfig,
@@ -189,7 +189,7 @@ impl ExtraTrafficLedger {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(in crate::runtime) enum PathAdmissionDecision {
+pub(crate) enum PathAdmissionDecision {
     Service,
     AdmitSubflow,
     ProbeOnly,
@@ -197,14 +197,14 @@ pub(in crate::runtime) enum PathAdmissionDecision {
 }
 
 #[derive(Debug, Clone, Copy)]
-pub(in crate::runtime) struct PathAdmission {
-    pub(in crate::runtime) role: PathRuntimeRole,
-    pub(in crate::runtime) work: CarrierWorkKind,
-    pub(in crate::runtime) decision: PathAdmissionDecision,
+pub(crate) struct PathAdmission {
+    pub(crate) role: PathRuntimeRole,
+    pub(crate) work: CarrierWorkKind,
+    pub(crate) decision: PathAdmissionDecision,
 }
 
 impl PathAdmission {
-    pub(in crate::runtime) fn service() -> Self {
+    pub(crate) fn service() -> Self {
         Self {
             role: PathRuntimeRole::Service,
             work: CarrierWorkKind::OwnerData,
@@ -212,7 +212,7 @@ impl PathAdmission {
         }
     }
 
-    pub(in crate::runtime) fn subflow_owner(role: PathRuntimeRole) -> Self {
+    pub(crate) fn subflow_owner(role: PathRuntimeRole) -> Self {
         debug_assert!(role.is_subflow_owner());
         Self {
             role,
@@ -221,7 +221,7 @@ impl PathAdmission {
         }
     }
 
-    pub(in crate::runtime) fn probe_only() -> Self {
+    pub(crate) fn probe_only() -> Self {
         Self {
             role: PathRuntimeRole::Probe,
             work: CarrierWorkKind::Probe,
@@ -229,7 +229,7 @@ impl PathAdmission {
         }
     }
 
-    pub(in crate::runtime) fn standby() -> Self {
+    pub(crate) fn standby() -> Self {
         Self {
             role: PathRuntimeRole::Standby,
             work: CarrierWorkKind::Control,
@@ -240,24 +240,24 @@ impl PathAdmission {
 
 #[cfg_attr(not(test), allow(dead_code))]
 #[derive(Debug, Clone, Copy)]
-pub(in crate::runtime) struct SubflowMember<K = CarrierPathKey> {
-    pub(in crate::runtime) key: K,
-    pub(in crate::runtime) role: PathRuntimeRole,
-    pub(in crate::runtime) owner_sent_bytes: u64,
-    pub(in crate::runtime) optional_overhead_bytes: u64,
+pub(crate) struct SubflowMember<K = CarrierPathKey> {
+    pub(crate) key: K,
+    pub(crate) role: PathRuntimeRole,
+    pub(crate) owner_sent_bytes: u64,
+    pub(crate) optional_overhead_bytes: u64,
 }
 
 #[derive(Debug, Clone, Copy)]
-pub(in crate::runtime) struct SubflowAdmissionInput<K = CarrierPathKey> {
-    pub(in crate::runtime) key: K,
-    pub(in crate::runtime) bulk_rate_proven: bool,
-    pub(in crate::runtime) startup_owner_allowed: bool,
-    pub(in crate::runtime) frontier_clear: bool,
-    pub(in crate::runtime) completion_improves: bool,
-    pub(in crate::runtime) observed_goodput_non_degrading: bool,
-    pub(in crate::runtime) read_gap: Duration,
-    pub(in crate::runtime) owner_bytes: usize,
-    pub(in crate::runtime) optional_overhead_bytes: usize,
+pub(crate) struct SubflowAdmissionInput<K = CarrierPathKey> {
+    pub(crate) key: K,
+    pub(crate) bulk_rate_proven: bool,
+    pub(crate) startup_owner_allowed: bool,
+    pub(crate) frontier_clear: bool,
+    pub(crate) completion_improves: bool,
+    pub(crate) observed_goodput_non_degrading: bool,
+    pub(crate) read_gap: Duration,
+    pub(crate) owner_bytes: usize,
+    pub(crate) optional_overhead_bytes: usize,
 }
 
 /// Per-flow admission memory for additional subflows.
@@ -269,7 +269,7 @@ pub(in crate::runtime) struct SubflowAdmissionInput<K = CarrierPathKey> {
 /// distinction between connection-level data ownership and per-subflow
 /// scheduling.
 #[derive(Debug, Clone)]
-pub(in crate::runtime) struct FlowSubflowSet<K = CarrierPathKey> {
+pub(crate) struct FlowSubflowSet<K = CarrierPathKey> {
     _generation: u64,
     service: K,
     startup_owner_credit_bytes: u64,
@@ -297,7 +297,7 @@ impl<K> FlowSubflowSet<K>
 where
     K: Copy + Eq,
 {
-    pub(in crate::runtime) fn new(
+    pub(crate) fn new(
         generation: u64,
         service: K,
         startup_owner_credit_bytes: usize,
@@ -317,40 +317,40 @@ where
     }
 
     #[cfg(test)]
-    pub(in crate::runtime) fn members(&self) -> &[SubflowMember<K>] {
+    pub(crate) fn members(&self) -> &[SubflowMember<K>] {
         &self.members
     }
 
-    pub(in crate::runtime) fn has_members(&self) -> bool {
+    pub(crate) fn has_members(&self) -> bool {
         !self.members.is_empty()
     }
 
     #[cfg(test)]
-    pub(in crate::runtime) fn optional_overhead_spent_bytes(&self) -> u64 {
+    pub(crate) fn optional_overhead_spent_bytes(&self) -> u64 {
         self.optional_overhead_spent_bytes
     }
 
-    pub(in crate::runtime) fn startup_owner_key(&self) -> Option<K> {
+    pub(crate) fn startup_owner_key(&self) -> Option<K> {
         self.startup_owner.map(|startup| startup.key)
     }
 
-    pub(in crate::runtime) fn service_key(&self) -> K {
+    pub(crate) fn service_key(&self) -> K {
         self.service
     }
 
-    pub(in crate::runtime) fn startup_owner_sealed_sample_bytes(&self, key: K) -> Option<u64> {
+    pub(crate) fn startup_owner_sealed_sample_bytes(&self, key: K) -> Option<u64> {
         self.startup_owner
             .filter(|startup| startup.key == key && startup.sample_seal.is_some())
             .map(|startup| startup.owner_sent_bytes)
     }
 
-    pub(in crate::runtime) fn startup_owner_sample_sealed(&self, key: K) -> bool {
+    pub(crate) fn startup_owner_sample_sealed(&self, key: K) -> bool {
         self.startup_owner
             .filter(|startup| startup.key == key)
             .is_some_and(|startup| startup.sample_seal.is_some())
     }
 
-    pub(in crate::runtime) fn seal_startup_owner_if_next_frame_exceeds_credit(
+    pub(crate) fn seal_startup_owner_if_next_frame_exceeds_credit(
         &mut self,
         key: K,
         next_owner_bytes: usize,
@@ -373,7 +373,7 @@ where
         true
     }
 
-    pub(in crate::runtime) fn graduate_startup_owner(&mut self, key: K) -> bool {
+    pub(crate) fn graduate_startup_owner(&mut self, key: K) -> bool {
         if self.startup_owner_key() != Some(key) {
             return false;
         }
@@ -381,7 +381,7 @@ where
         true
     }
 
-    pub(in crate::runtime) fn matches_envelope(
+    pub(crate) fn matches_envelope(
         &self,
         service: K,
         startup_owner_credit_bytes: usize,
@@ -394,10 +394,7 @@ where
             && self.max_read_gap_budget == max_read_gap_budget
     }
 
-    pub(in crate::runtime) fn admit_subflow_owner(
-        &mut self,
-        input: SubflowAdmissionInput<K>,
-    ) -> PathAdmission {
+    pub(crate) fn admit_subflow_owner(&mut self, input: SubflowAdmissionInput<K>) -> PathAdmission {
         if input.key == self.service {
             return PathAdmission::service();
         }
@@ -453,7 +450,7 @@ where
         PathAdmission::subflow_owner(role)
     }
 
-    pub(in crate::runtime) fn rollback_subflow_owner(&mut self, input: SubflowAdmissionInput<K>) {
+    pub(crate) fn rollback_subflow_owner(&mut self, input: SubflowAdmissionInput<K>) {
         if input.key == self.service {
             return;
         }

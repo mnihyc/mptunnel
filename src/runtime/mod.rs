@@ -3,7 +3,6 @@ mod datagram;
 mod error;
 mod ingress_runtime;
 mod management;
-mod model;
 mod path_commands;
 mod path_common;
 mod path_model;
@@ -30,14 +29,15 @@ pub use error::RuntimeError;
 
 #[cfg(feature = "lab-diagnostics")]
 use crate::lab_diagnostics::*;
+use crate::model::capacity::*;
+use crate::model::multipath::*;
+use crate::model::path::*;
+use crate::model::timing::*;
+use crate::model::work::*;
 use core::*;
 use datagram::*;
 use ingress_runtime::*;
 use management::*;
-use model::capacity::*;
-use model::multipath::*;
-use model::timing::*;
-use model::work::*;
 use path_commands::*;
 use path_common::*;
 use path_model::*;

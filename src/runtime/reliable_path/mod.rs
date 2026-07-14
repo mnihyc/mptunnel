@@ -1,16 +1,16 @@
+use super::*;
 #[cfg(test)]
-use super::model::ack_clock::reliable_ack_clock_calibration_limit_bytes;
-use super::model::ack_clock::{
+use crate::model::ack_clock::reliable_ack_clock_calibration_limit_bytes;
+use crate::model::ack_clock::{
     reliable_ack_clock_calibration_ceiling_bytes,
     reliable_ack_clock_calibration_rate_coverage_floor_bytes,
     reliable_tcp_ack_clock_calibration_initial_limit_bytes,
 };
 #[cfg(feature = "lab-diagnostics")]
-use super::model::admission::{
+use crate::model::admission::{
     bulk_active_service_product_envelope_bytes, bulk_latency_pressure_service_feed_window_bytes,
     bulk_service_feed_reservoir_payload_bytes, bulk_service_horizon_payload_bytes,
 };
-use super::*;
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, Ordering};
 
@@ -4651,16 +4651,6 @@ fn response_outputs_have_live_mixed_owner_underlays(entries: &[ResponseStreamOut
         }
     }
     false
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-/// Stable identity for one live carrier path inside a session.
-///
-/// The same product stream can have flights on several carrier paths; this key
-/// names the carrier path without making the path own product bytes.
-pub(super) struct CarrierPathKey {
-    pub(super) underlay: UnderlayProtocol,
-    pub(super) path_id: PathId,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]

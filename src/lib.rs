@@ -4,6 +4,7 @@ pub mod config;
 pub mod ingress;
 #[cfg(feature = "lab-diagnostics")]
 pub(crate) mod lab_diagnostics;
+mod model;
 pub mod mux;
 pub mod outbound;
 pub mod platform;

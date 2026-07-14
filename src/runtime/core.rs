@@ -2,18 +2,12 @@ use super::datagram::*;
 use super::error::RuntimeError;
 use super::ingress_runtime::*;
 use super::management::*;
-use super::model::admission::*;
-use super::model::capacity::{
-    BBR_MAX_SEND_QUANTUM_BYTES, PATH_OPEN_SCORE_BYTES, PathRateSample,
-    QUIC_PERSISTENT_CONGESTION_THRESHOLD, reliable_capacity_calibration_session_limit_bytes,
-};
 use super::path_commands::*;
 use super::path_model::*;
 use super::path_proof::PathProofObservation;
 use super::prelude::*;
 use super::relay_control::*;
 use super::relay_io::*;
-use super::relay_open::*;
 use super::reliable_path::*;
 use super::server_runtime::*;
 use super::tcp_metrics::{TcpCapacityProofCandidate, valid_tcp_capacity_proof_candidate_at};
@@ -23,6 +17,12 @@ use super::udp_metrics::UdpPathMetrics;
 use super::udp_path::*;
 #[cfg(feature = "lab-diagnostics")]
 use crate::lab_diagnostics::lab_diagnostic;
+use crate::model::admission::*;
+use crate::model::capacity::{
+    BBR_MAX_SEND_QUANTUM_BYTES, PATH_OPEN_SCORE_BYTES, PathRateSample,
+    QUIC_PERSISTENT_CONGESTION_THRESHOLD, reliable_capacity_calibration_session_limit_bytes,
+};
+use crate::model::path::{RelayPathInstance, RelayPathKey};
 use std::sync::atomic::{AtomicU8, AtomicU32, AtomicU64, Ordering};
 
 pub(super) const MAX_HTTP_CONNECT_HEADER_BYTES: usize = 64 * 1024;

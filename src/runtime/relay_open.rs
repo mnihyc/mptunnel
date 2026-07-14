@@ -50,18 +50,6 @@ impl Drop for AcceptedRemoteStreamGuard {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub(super) struct RelayPathKey {
-    pub(super) underlay: UnderlayProtocol,
-    pub(super) index: usize,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub(super) struct RelayPathInstance {
-    pub(super) key: RelayPathKey,
-    pub(super) id: u64,
-}
-
 pub(super) struct ReliableRelayRemotePath {
     pub(super) path_index: usize,
     pub(super) instance_id: u64,

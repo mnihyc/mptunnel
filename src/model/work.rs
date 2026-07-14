@@ -4,7 +4,7 @@
 //! describe what product work may do to ordered ownership and sender queues.
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(in crate::runtime) enum CarrierWorkKind {
+pub(crate) enum CarrierWorkKind {
     OwnerData,
     RepairData,
     Probe,
@@ -12,21 +12,21 @@ pub(in crate::runtime) enum CarrierWorkKind {
 }
 
 impl CarrierWorkKind {
-    pub(in crate::runtime) fn is_ordering_owner(self) -> bool {
+    pub(crate) fn is_ordering_owner(self) -> bool {
         matches!(self, Self::OwnerData)
     }
 
-    pub(in crate::runtime) fn carries_product_offsets(self) -> bool {
+    pub(crate) fn carries_product_offsets(self) -> bool {
         matches!(self, Self::OwnerData | Self::RepairData)
     }
 
-    pub(in crate::runtime) fn counts_against_sender_extra_budget(self) -> bool {
+    pub(crate) fn counts_against_sender_extra_budget(self) -> bool {
         matches!(self, Self::RepairData)
     }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(in crate::runtime) enum ReliableWorkClass {
+pub(crate) enum ReliableWorkClass {
     Control,
     Data,
     Repair,

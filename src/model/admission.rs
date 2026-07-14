@@ -2,34 +2,34 @@
 
 #[cfg(feature = "lab-diagnostics")]
 use crate::lab_diagnostics::lab_diagnostic;
+use crate::model::capacity::{BBR_DEFAULT_CWND_GAIN, BBR_MAX_SEND_QUANTUM_BYTES};
+use crate::model::path::RelayPathKey;
 use crate::mux::MuxLimits;
 use crate::protocol::UnderlayProtocol;
-use crate::runtime::model::capacity::{BBR_DEFAULT_CWND_GAIN, BBR_MAX_SEND_QUANTUM_BYTES};
-use crate::runtime::relay_open::RelayPathKey;
 use crate::scheduler::{FlowLane, PathSnapshot};
 
 // Decisions in this module never mutate a path or enqueue carrier work.
 
 #[derive(Debug, Clone, Copy)]
-pub(in crate::runtime) struct BulkPathCandidate {
-    pub(in crate::runtime) key: RelayPathKey,
-    pub(in crate::runtime) eta_ms: f64,
+pub(crate) struct BulkPathCandidate {
+    pub(crate) key: RelayPathKey,
+    pub(crate) eta_ms: f64,
     #[cfg_attr(not(feature = "lab-diagnostics"), allow(dead_code))]
-    pub(in crate::runtime) has_liveness_evidence: bool,
+    pub(crate) has_liveness_evidence: bool,
     #[cfg_attr(not(feature = "lab-diagnostics"), allow(dead_code))]
-    pub(in crate::runtime) has_path_proof_evidence: bool,
+    pub(crate) has_path_proof_evidence: bool,
     #[cfg_attr(not(feature = "lab-diagnostics"), allow(dead_code))]
-    pub(in crate::runtime) has_ack_data_evidence: bool,
+    pub(crate) has_ack_data_evidence: bool,
     #[cfg_attr(not(feature = "lab-diagnostics"), allow(dead_code))]
-    pub(in crate::runtime) has_bulk_rate_evidence: bool,
+    pub(crate) has_bulk_rate_evidence: bool,
     #[cfg_attr(not(feature = "lab-diagnostics"), allow(dead_code))]
-    pub(in crate::runtime) has_sender_delivery_evidence: bool,
-    pub(in crate::runtime) snapshot: PathSnapshot,
+    pub(crate) has_sender_delivery_evidence: bool,
+    pub(crate) snapshot: PathSnapshot,
 }
 
 #[cfg_attr(not(test), allow(dead_code))]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(in crate::runtime) enum BulkAdmissionRole {
+pub(crate) enum BulkAdmissionRole {
     ActiveDataPath,
     ActiveSingleCarrier,
     AdditionalSameUnderlay,
@@ -37,21 +37,21 @@ pub(in crate::runtime) enum BulkAdmissionRole {
 }
 
 #[derive(Debug, Clone, Copy)]
-pub(in crate::runtime) struct BulkAdmissionCheck {
-    pub(in crate::runtime) best_snapshot: PathSnapshot,
-    pub(in crate::runtime) best_eta_ms: f64,
-    pub(in crate::runtime) candidate_snapshot: PathSnapshot,
-    pub(in crate::runtime) candidate_eta_ms: f64,
-    pub(in crate::runtime) payload_bytes: usize,
-    pub(in crate::runtime) mux_limits: MuxLimits,
-    pub(in crate::runtime) role: BulkAdmissionRole,
+pub(crate) struct BulkAdmissionCheck {
+    pub(crate) best_snapshot: PathSnapshot,
+    pub(crate) best_eta_ms: f64,
+    pub(crate) candidate_snapshot: PathSnapshot,
+    pub(crate) candidate_eta_ms: f64,
+    pub(crate) payload_bytes: usize,
+    pub(crate) mux_limits: MuxLimits,
+    pub(crate) role: BulkAdmissionRole,
     // Lower unique bytes on other owners are completion/HOL debt. Same-family
     // TCP charges their aggregate only to the stream reorder envelope; the
     // candidate-local pipe is bounded independently by the inflight gate.
-    pub(in crate::runtime) stream_ordering_debt_bytes: u64,
+    pub(crate) stream_ordering_debt_bytes: u64,
 }
 
-pub(in crate::runtime) fn bulk_additional_admission_role(
+pub(crate) fn bulk_additional_admission_role(
     reference_underlay: UnderlayProtocol,
     candidate_underlay: UnderlayProtocol,
 ) -> BulkAdmissionRole {
@@ -62,7 +62,7 @@ pub(in crate::runtime) fn bulk_additional_admission_role(
     }
 }
 
-pub(in crate::runtime) fn bulk_striping_admitted_subflows(
+pub(crate) fn bulk_striping_admitted_subflows(
     candidates: Vec<BulkPathCandidate>,
     payload_bytes: usize,
     mux_limits: MuxLimits,
@@ -146,7 +146,7 @@ pub(in crate::runtime) fn bulk_striping_admitted_subflows(
     selected
 }
 
-pub(in crate::runtime) fn bulk_service_horizon_payload_bytes(
+pub(crate) fn bulk_service_horizon_payload_bytes(
     payload_bytes: usize,
     mux_limits: MuxLimits,
 ) -> usize {
@@ -160,7 +160,7 @@ pub(in crate::runtime) fn bulk_service_horizon_payload_bytes(
     horizon.clamp(service_payload, envelope)
 }
 
-pub(in crate::runtime) fn bulk_service_product_envelope_payload_bytes(
+pub(crate) fn bulk_service_product_envelope_payload_bytes(
     payload_bytes: usize,
     mux_limits: MuxLimits,
 ) -> usize {
@@ -176,7 +176,7 @@ pub(in crate::runtime) fn bulk_service_product_envelope_payload_bytes(
         .max(1)
 }
 
-pub(in crate::runtime) fn bulk_service_feed_reservoir_payload_bytes(
+pub(crate) fn bulk_service_feed_reservoir_payload_bytes(
     payload_bytes: usize,
     mux_limits: MuxLimits,
 ) -> usize {
@@ -188,17 +188,17 @@ pub(in crate::runtime) fn bulk_service_feed_reservoir_payload_bytes(
 }
 
 #[derive(Debug, Clone, Copy)]
-pub(in crate::runtime) struct BulkExplorationCompletionProjection {
-    pub(in crate::runtime) candidate_completion_ms: f64,
-    pub(in crate::runtime) service_reservoir_horizon_ms: f64,
+pub(crate) struct BulkExplorationCompletionProjection {
+    pub(crate) candidate_completion_ms: f64,
+    pub(crate) service_reservoir_horizon_ms: f64,
     #[cfg_attr(not(feature = "lab-diagnostics"), allow(dead_code))]
-    pub(in crate::runtime) exploration_bytes: u64,
+    pub(crate) exploration_bytes: u64,
     #[cfg_attr(not(feature = "lab-diagnostics"), allow(dead_code))]
-    pub(in crate::runtime) service_followup_bytes: u64,
+    pub(crate) service_followup_bytes: u64,
 }
 
 impl BulkExplorationCompletionProjection {
-    pub(in crate::runtime) fn completes_within_service_reservoir(self) -> bool {
+    pub(crate) fn completes_within_service_reservoir(self) -> bool {
         self.candidate_completion_ms <= self.service_reservoir_horizon_ms
     }
 }
@@ -209,7 +209,7 @@ impl BulkExplorationCompletionProjection {
 /// candidate must finish its authorized seed before Service can consume the
 /// remaining feed reservoir behind those lower offsets. Carrier controllers
 /// still own pacing; this model only decides whether exploration can own bytes.
-pub(in crate::runtime) fn bulk_exploration_completion_projection(
+pub(crate) fn bulk_exploration_completion_projection(
     service_snapshot: PathSnapshot,
     service_eta_ms: f64,
     candidate_snapshot: PathSnapshot,
@@ -232,7 +232,7 @@ pub(in crate::runtime) fn bulk_exploration_completion_projection(
     }
 }
 
-pub(in crate::runtime) fn bulk_tcp_calibration_completion_projection(
+pub(crate) fn bulk_tcp_calibration_completion_projection(
     service_snapshot: PathSnapshot,
     service_eta_ms: f64,
     candidate_snapshot: PathSnapshot,
@@ -261,22 +261,22 @@ pub(in crate::runtime) fn bulk_tcp_calibration_completion_projection(
 // this limit beside the Service horizon prevents event loops from inventing a
 // second ownership model for bytes that do not have offsets yet.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(in crate::runtime) struct ReliableSourceServiceStagingContext {
+pub(crate) struct ReliableSourceServiceStagingContext {
     /// Switchable responses own an exact global tail; fixed request-side
     /// outputs keep their narrower established staging policy.
-    pub(in crate::runtime) allows_product_envelope: bool,
-    pub(in crate::runtime) has_latency_pressure: bool,
-    pub(in crate::runtime) has_feed_evidence: bool,
+    pub(crate) allows_product_envelope: bool,
+    pub(crate) has_latency_pressure: bool,
+    pub(crate) has_feed_evidence: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(in crate::runtime) struct ReliableSourceStagingContext {
+pub(crate) struct ReliableSourceStagingContext {
     /// Mixed-family raw bytes remain unassigned until dispatch chooses a path.
-    pub(in crate::runtime) independent: bool,
-    pub(in crate::runtime) service: Option<ReliableSourceServiceStagingContext>,
+    pub(crate) independent: bool,
+    pub(crate) service: Option<ReliableSourceServiceStagingContext>,
 }
 
-pub(in crate::runtime) fn reliable_relay_source_staging_owner_tail_headroom(
+pub(crate) fn reliable_relay_source_staging_owner_tail_headroom(
     context: ReliableSourceStagingContext,
     lane: FlowLane,
     ordered_owner_debt_bytes: usize,
@@ -326,7 +326,7 @@ pub(in crate::runtime) fn reliable_relay_source_staging_owner_tail_headroom(
 }
 
 #[cfg_attr(not(test), allow(dead_code))]
-pub(in crate::runtime) fn bulk_candidate_admission_suppression(
+pub(crate) fn bulk_candidate_admission_suppression(
     best_snapshot: PathSnapshot,
     best_eta_ms: f64,
     candidate_snapshot: PathSnapshot,
@@ -347,7 +347,7 @@ pub(in crate::runtime) fn bulk_candidate_admission_suppression(
     })
 }
 
-pub(in crate::runtime) fn bulk_candidate_admission_suppression_with_ordering_debt(
+pub(crate) fn bulk_candidate_admission_suppression_with_ordering_debt(
     check: BulkAdmissionCheck,
 ) -> Option<&'static str> {
     // Ordering debt bounds receive-hole resources; it does not prove that
@@ -356,7 +356,7 @@ pub(in crate::runtime) fn bulk_candidate_admission_suppression_with_ordering_deb
     bulk_candidate_admission_suppression_with_completion_backlog(check, 0)
 }
 
-pub(in crate::runtime) fn bulk_candidate_admission_suppression_with_completion_backlog(
+pub(crate) fn bulk_candidate_admission_suppression_with_completion_backlog(
     check: BulkAdmissionCheck,
     completion_backlog_bytes: u64,
 ) -> Option<&'static str> {
@@ -470,7 +470,7 @@ fn bulk_cross_underlay_completion_suppression(check: BulkAdmissionCheck) -> Opti
 }
 
 #[cfg_attr(not(feature = "lab-diagnostics"), allow(dead_code))]
-pub(in crate::runtime) fn bulk_completion_horizon_ms(
+pub(crate) fn bulk_completion_horizon_ms(
     best_snapshot: PathSnapshot,
     best_eta_ms: f64,
     candidate_snapshot: PathSnapshot,
@@ -487,7 +487,7 @@ pub(in crate::runtime) fn bulk_completion_horizon_ms(
     )
 }
 
-pub(in crate::runtime) fn bulk_completion_horizon_ms_with_ordering_debt(
+pub(crate) fn bulk_completion_horizon_ms_with_ordering_debt(
     best_snapshot: PathSnapshot,
     best_eta_ms: f64,
     candidate_snapshot: PathSnapshot,
@@ -575,7 +575,7 @@ fn bulk_active_lead_has_contiguous_frontier(
     ) && stream_ordering_debt_bytes == 0
 }
 
-pub(in crate::runtime) fn bulk_active_service_product_envelope_bytes(
+pub(crate) fn bulk_active_service_product_envelope_bytes(
     candidate: PathSnapshot,
     payload_bytes: usize,
     mux_limits: MuxLimits,
@@ -740,7 +740,7 @@ fn bulk_uses_product_only_active_gate(candidate: PathSnapshot, role: BulkAdmissi
     // this layer.
 }
 
-pub(in crate::runtime) fn bulk_latency_pressure_service_feed_window_bytes(
+pub(crate) fn bulk_latency_pressure_service_feed_window_bytes(
     payload_bytes: usize,
     mux_limits: MuxLimits,
 ) -> u64 {
@@ -935,7 +935,7 @@ fn bulk_path_bdp_bytes(candidate: PathSnapshot) -> u64 {
     bulk_rate_bdp_bytes(rate, candidate.srtt_ms)
 }
 
-pub(in crate::runtime) fn bulk_candidate_pipe_bytes(candidate: PathSnapshot) -> u64 {
+pub(crate) fn bulk_candidate_pipe_bytes(candidate: PathSnapshot) -> u64 {
     bulk_bbr_inflight_bytes(bulk_path_bdp_bytes(candidate))
 }
 

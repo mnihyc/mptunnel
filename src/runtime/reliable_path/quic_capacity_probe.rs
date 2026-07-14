@@ -4,8 +4,8 @@ use super::response_admission::{
 use super::{CarrierPathKey, ResponseStreamBinding, ServerCarrierPathInstanceId};
 #[cfg(feature = "lab-diagnostics")]
 use crate::lab_diagnostics::lab_diagnostic;
+use crate::model::capacity::reliable_capacity_calibration_session_limit_bytes;
 use crate::protocol::{StreamOpenRole, UnderlayProtocol};
-use crate::runtime::model::capacity::reliable_capacity_calibration_session_limit_bytes;
 use crate::scheduler::FlowLane;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};

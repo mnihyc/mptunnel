@@ -4,14 +4,15 @@
 //! sockets, tasks, channels, timers, or platform APIs; runtime services gather
 //! inputs and apply their outputs.
 
-pub(in crate::runtime) mod ack_clock;
-pub(in crate::runtime) mod admission;
-pub(in crate::runtime) mod capacity;
-pub(in crate::runtime) mod multipath;
-pub(in crate::runtime) mod request;
+pub(crate) mod ack_clock;
+pub(crate) mod admission;
+pub(crate) mod capacity;
+pub(crate) mod multipath;
+pub(crate) mod path;
+pub(crate) mod request;
 mod response_ownership;
-pub(in crate::runtime) mod timing;
-pub(in crate::runtime) mod work;
+pub(crate) mod timing;
+pub(crate) mod work;
 
 pub(super) use response_ownership::{
     ResponseCandidateTailDebt, ResponseOrderedTail, ResponseSameFamilyReservoir,

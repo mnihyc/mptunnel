@@ -1,6 +1,6 @@
-use super::model::admission::BulkPathCandidate;
-use super::model::timing::*;
 use super::*;
+use crate::model::admission::BulkPathCandidate;
+use crate::model::timing::*;
 
 #[derive(Debug, Clone, Copy)]
 pub(super) struct UdpPathRuntimeModel {

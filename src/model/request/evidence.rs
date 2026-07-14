@@ -12,7 +12,7 @@ use crate::protocol::UnderlayProtocol;
 use std::time::{Duration, Instant};
 
 #[derive(Debug, Clone, Copy)]
-pub(in crate::runtime) struct RequestPathRateEvidence {
+pub(crate) struct RequestPathRateEvidence {
     exact_attributed_bytes: u64,
     pending_bytes: u64,
     pending_first_sent_at: Instant,
@@ -20,7 +20,7 @@ pub(in crate::runtime) struct RequestPathRateEvidence {
     previous_window_acked_at: Option<Instant>,
 }
 
-pub(in crate::runtime) enum RequestPathRateEvidenceUpdate {
+pub(crate) enum RequestPathRateEvidenceUpdate {
     Pending,
     Proven {
         sample: Option<PathRateSample>,
@@ -29,20 +29,20 @@ pub(in crate::runtime) enum RequestPathRateEvidenceUpdate {
 }
 
 #[derive(Debug, Clone, Copy)]
-pub(in crate::runtime) struct RequestPerFlowRateModel {
-    pub(in crate::runtime) rate_bps: f64,
-    pub(in crate::runtime) delivery_samples: u32,
+pub(crate) struct RequestPerFlowRateModel {
+    pub(crate) rate_bps: f64,
+    pub(crate) delivery_samples: u32,
 }
 
 #[derive(Debug, Clone, Copy)]
-pub(in crate::runtime) struct RequestTcpAckTurnoverModel {
-    pub(in crate::runtime) turnover_bytes: f64,
-    pub(in crate::runtime) sampled_at: Instant,
-    pub(in crate::runtime) sample_pto: Duration,
+pub(crate) struct RequestTcpAckTurnoverModel {
+    pub(crate) turnover_bytes: f64,
+    pub(crate) sampled_at: Instant,
+    pub(crate) sample_pto: Duration,
 }
 
 impl RequestTcpAckTurnoverModel {
-    pub(in crate::runtime) fn observe(
+    pub(crate) fn observe(
         previous: Option<Self>,
         sample: PathRateSample,
         sample_pto: Duration,
@@ -66,7 +66,7 @@ impl RequestTcpAckTurnoverModel {
         })
     }
 
-    pub(in crate::runtime) fn is_fresh_at(self, now: Instant) -> bool {
+    pub(crate) fn is_fresh_at(self, now: Instant) -> bool {
         now.saturating_duration_since(self.sampled_at)
             < self
                 .sample_pto
@@ -75,13 +75,13 @@ impl RequestTcpAckTurnoverModel {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(in crate::runtime) struct RequestOwnerAckProgress<I> {
-    pub(in crate::runtime) instance: I,
-    pub(in crate::runtime) bytes: usize,
+pub(crate) struct RequestOwnerAckProgress<I> {
+    pub(crate) instance: I,
+    pub(crate) bytes: usize,
 }
 
 impl RequestPathRateEvidence {
-    pub(in crate::runtime) fn new(first_sent_at: Instant) -> Self {
+    pub(crate) fn new(first_sent_at: Instant) -> Self {
         Self {
             exact_attributed_bytes: 0,
             pending_bytes: 0,
@@ -91,7 +91,7 @@ impl RequestPathRateEvidence {
         }
     }
 
-    pub(in crate::runtime) fn observe(
+    pub(crate) fn observe(
         &mut self,
         bytes: u64,
         first_sent_at: Instant,
@@ -143,21 +143,21 @@ impl RequestPathRateEvidence {
         }
     }
 
-    pub(in crate::runtime) fn has_exact_path_provenance(&self) -> bool {
+    pub(crate) fn has_exact_path_provenance(&self) -> bool {
         self.exact_attributed_bytes >= PATH_OPEN_SCORE_BYTES as u64
     }
 
-    pub(in crate::runtime) fn exact_attributed_bytes(&self) -> u64 {
+    pub(crate) fn exact_attributed_bytes(&self) -> u64 {
         self.exact_attributed_bytes
     }
 
-    pub(in crate::runtime) fn seed_ack_boundary(&mut self, acked_at: Instant) {
+    pub(crate) fn seed_ack_boundary(&mut self, acked_at: Instant) {
         self.pending_bytes = 0;
         self.previous_window_acked_at = Some(acked_at);
     }
 }
 
-pub(in crate::runtime) fn request_path_rate_coverage_floor_bytes(
+pub(crate) fn request_path_rate_coverage_floor_bytes(
     underlay: UnderlayProtocol,
     is_ordered_service: bool,
     calibration_target: Option<u64>,
@@ -175,7 +175,7 @@ pub(in crate::runtime) fn request_path_rate_coverage_floor_bytes(
     }
 }
 
-pub(in crate::runtime) fn request_tcp_candidate_turnover_authorized(
+pub(crate) fn request_tcp_candidate_turnover_authorized(
     exact_acked_bytes: u64,
     calibration_target_bytes: u64,
     ordinary_coverage_bytes: u64,

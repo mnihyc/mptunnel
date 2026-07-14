@@ -3,9 +3,9 @@ use super::super::{
     ServerRepairOutputIdentity,
 };
 use super::*;
+use crate::model::path::CarrierPathKey;
 use crate::protocol::{PathId, StreamId, UnderlayProtocol};
 use crate::runtime::relay_open::{RelayPathInstance, RelayPathKey};
-use crate::runtime::reliable_path::CarrierPathKey;
 use std::time::{Duration, Instant};
 
 #[test]

@@ -4,10 +4,10 @@
 //! work and accounts product bytes without selecting or mutating a path.
 
 use super::RelaySendCause;
+use crate::model::work::ReliableWorkClass;
 use crate::mux::MuxLimits;
 use crate::mux::stream::ReliableSendStream;
 use crate::protocol::{Frame, OffsetRange, StreamFlags};
-use crate::runtime::model::work::ReliableWorkClass;
 use crate::runtime::relay_io::reliable_relay_buffer_len;
 use crate::runtime::relay_striping::{
     reliable_stream_frame_extent, reliable_stream_frame_payload_bytes,

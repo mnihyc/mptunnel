@@ -1,5 +1,5 @@
 use super::*;
-use crate::runtime::model::admission::{
+use crate::model::admission::{
     ReliableSourceServiceStagingContext, ReliableSourceStagingContext,
     bulk_service_feed_reservoir_payload_bytes, reliable_relay_source_staging_owner_tail_headroom,
 };

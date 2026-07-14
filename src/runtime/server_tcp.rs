@@ -1207,8 +1207,7 @@ pub(super) async fn run_server_tcp_stream(
                         stream_id,
                         reason: ResetReason::Refused,
                     },
-                )
-                .await?;
+                )?;
                 stream.close().await;
                 return Err(RuntimeError::OutboundConnect(err));
             }
@@ -1223,8 +1222,7 @@ pub(super) async fn run_server_tcp_stream(
                     context.mux_limits,
                 ),
             },
-        )
-        .await?;
+        )?;
         relay_reliable_stream(
             outbound_stream,
             stream,

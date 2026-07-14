@@ -1061,9 +1061,7 @@ impl RelaySenderService {
                 frame.clone(),
                 lane,
                 emit_mode,
-            )
-            .await
-            {
+            ) {
                 Ok(()) => {
                     self.commit_request_ack_clock_calibration(request_calibration_commit);
                     let claimed_load = request_load_claim.is_some();
@@ -3414,8 +3412,7 @@ impl RelaySenderService {
             demand: stream_demand_hint_for_lane(lane),
             role: StreamOpenRole::Active,
         };
-        match emit_relay_path_frame(&remotes.paths[position].stream, frame, FlowLane::Control).await
-        {
+        match emit_relay_path_frame(&remotes.paths[position].stream, frame, FlowLane::Control) {
             Ok(()) => Ok(()),
             Err(err) => {
                 self.fail_client_path_instance(context, remotes, instance)
@@ -3456,7 +3453,7 @@ impl RelaySenderService {
         let emit_result = {
             let path = &mut remotes.paths[position];
             path.stream.lane = lane;
-            emit_relay_path_frame(&path.stream, frame, FlowLane::Control).await
+            emit_relay_path_frame(&path.stream, frame, FlowLane::Control)
         };
         match emit_result {
             Ok(()) => {
@@ -3499,8 +3496,7 @@ impl RelaySenderService {
             },
             remotes.paths[position].stream.lane,
             ResponseCarrierEmitMode::StreamOrdered,
-        )
-        .await?;
+        )?;
         Ok(true)
     }
 

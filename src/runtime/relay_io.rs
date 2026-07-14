@@ -23,8 +23,7 @@ pub(super) async fn send_sender_service_attach_control_frames(
                 stream_id: path_stream.stream_id,
                 final_offset: send_stream.next_offset(),
             },
-        )
-        .await?;
+        )?;
     }
     Ok(())
 }
@@ -1803,16 +1802,13 @@ async fn drain_server_response_sender_ready(
         && dispatched_items < sender_dispatch_item_budget
         && (dispatched_payload_bytes < sender_dispatch_byte_budget || dispatched_items == 0)
     {
-        let dispatch = match response_sender
-            .dispatch_next_with_ordered_owner_debt(
-                path_stream,
-                send_stream,
-                relay_lane,
-                mux_limits,
-                ordered_owner_debt_bytes,
-            )
-            .await
-        {
+        let dispatch = match response_sender.dispatch_next_with_ordered_owner_debt(
+            path_stream,
+            send_stream,
+            relay_lane,
+            mux_limits,
+            ordered_owner_debt_bytes,
+        ) {
             Ok(dispatch) => dispatch,
             Err(RuntimeError::SenderServiceBlocked) => {
                 blocked_by_carrier = true;
@@ -3183,10 +3179,12 @@ where
                 final_offset: send_stream.next_offset(),
             };
             response_sender.enqueue_final_control_frame(frame);
-            match response_sender
-                .dispatch_next(&path_stream, &mut send_stream, last_relay_lane, mux_limits)
-                .await
-            {
+            match response_sender.dispatch_next(
+                &path_stream,
+                &mut send_stream,
+                last_relay_lane,
+                mux_limits,
+            ) {
                 Ok(dispatch) if dispatch.lane == ReliableWorkClass::Control => {
                     close_sent = true;
                 }

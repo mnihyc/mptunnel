@@ -653,7 +653,6 @@ async fn latency_live_owner_tail_repair_dispatches_suffix_on_distinct_repair_wit
             limits,
             ordered_owner_debt_bytes,
         )
-        .await
         .expect("latency tail repair must dispatch on the distinct Repair output");
     assert_eq!(dispatch.lane, ReliableWorkClass::Repair);
     assert_eq!(dispatch.selected_path, Some(repair_key));
@@ -874,7 +873,6 @@ async fn sparse_ack_failed_owner_repair_starts_at_lowest_hole() {
             limits,
             ordered_owner_debt_bytes,
         )
-        .await
         .expect("dispatch lowest failed-owner hole");
     assert_eq!(dispatch.selected_path, Some(repair_key));
     assert!(matches!(
@@ -1761,7 +1759,6 @@ async fn unknown_owner_tail_repair_dispatches_as_path_failure_repair() {
             limits,
             ordered_owner_debt_bytes,
         )
-        .await
         .expect("unknown-owner tail repair must be failover-dispatchable");
 
     assert_eq!(dispatch.lane, ReliableWorkClass::Repair);
@@ -2546,15 +2543,13 @@ async fn persistent_live_owner_tail_repair_waits_when_distinct_alternate_lacks_q
         )
         .expect("test setup fills alternate data queue");
 
-    let dispatch = response_sender
-        .dispatch_next_with_ordered_owner_debt(
-            &path_stream,
-            &mut send_stream,
-            FlowLane::Throughput,
-            limits,
-            0,
-        )
-        .await;
+    let dispatch = response_sender.dispatch_next_with_ordered_owner_debt(
+        &path_stream,
+        &mut send_stream,
+        FlowLane::Throughput,
+        limits,
+        0,
+    );
 
     assert!(matches!(dispatch, Err(RuntimeError::SenderServiceBlocked)));
     assert!(
@@ -2671,7 +2666,6 @@ async fn final_tail_repair_dispatches_on_service_when_alternate_lacks_queue_cred
             limits,
             0,
         )
-        .await
         .expect("final-tail RepairData must use the Service path when the alternate has no queue credit");
 
     let command = try_recv_reliable_path_command(&mut owner_receivers)
@@ -2755,7 +2749,6 @@ async fn final_tail_repair_dispatches_on_service_when_no_alternate_survives() {
             limits,
             0,
         )
-        .await
         .expect("final-tail RepairData must use the only Service survivor");
 
     let command = try_recv_reliable_path_command(&mut owner_receivers)
@@ -2863,7 +2856,6 @@ async fn failed_owner_repair_without_ack_frontier_starts_at_zero() {
             limits,
             0,
         )
-        .await
         .expect("dispatch failed-owner repair");
     let command = try_recv_reliable_path_command(&mut failover_receivers).expect("repair frame");
     match command {

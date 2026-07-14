@@ -1016,9 +1016,7 @@ async fn send_open_path_metrics(
     let Some(metrics) = context.relay_path_metrics(underlay, path_index) else {
         return Ok(());
     };
-    send_sender_service_control_frame(stream, Frame::PathMetrics { metrics })
-        .await
-        .map(|_| ())
+    send_sender_service_control_frame(stream, Frame::PathMetrics { metrics }).map(|_| ())
 }
 
 pub(super) fn authenticated_path_join_frames(

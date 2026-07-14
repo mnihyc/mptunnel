@@ -5741,20 +5741,17 @@ async fn formerly_mixed_response_retains_repair_preflight_after_family_detach() 
             FlowLane::Throughput,
             mux_limits,
         )
-        .await
         .expect("formerly mixed raw bytes dispatch within remaining repair capacity");
     assert_eq!(first.payload_bytes, 1024);
     assert_eq!(send_stream.repair_bytes(), 4096);
     assert_eq!(sender.data_bytes(), 3072);
     assert!(matches!(
-        sender
-            .dispatch_next(
-                &path_stream,
-                &mut send_stream,
-                FlowLane::Throughput,
-                mux_limits,
-            )
-            .await,
+        sender.dispatch_next(
+            &path_stream,
+            &mut send_stream,
+            FlowLane::Throughput,
+            mux_limits,
+        ),
         Err(RuntimeError::SenderServiceBlocked)
     ));
     assert_eq!(sender.data_bytes(), 3072);
@@ -5811,14 +5808,12 @@ async fn mixed_response_dispatch_waits_retryably_when_repair_cache_is_full() {
     sender.enqueue_data_for_lane(Bytes::from_static(b"next"), FlowLane::Throughput);
 
     assert!(matches!(
-        sender
-            .dispatch_next(
-                &path_stream,
-                &mut send_stream,
-                FlowLane::Throughput,
-                mux_limits,
-            )
-            .await,
+        sender.dispatch_next(
+            &path_stream,
+            &mut send_stream,
+            FlowLane::Throughput,
+            mux_limits,
+        ),
         Err(RuntimeError::SenderServiceBlocked)
     ));
     assert_eq!(send_stream.next_offset(), blocked_offset);
@@ -5835,7 +5830,6 @@ async fn mixed_response_dispatch_waits_retryably_when_repair_cache_is_full() {
             FlowLane::Throughput,
             mux_limits,
         )
-        .await
         .expect("ACK release restores dispatch capacity");
     assert_eq!(sender.data_bytes(), 0);
 }
@@ -5935,7 +5929,6 @@ async fn response_owner_dispatch_does_not_earn_repair_budget_before_ack_progress
             FlowLane::Throughput,
             mux_limits,
         )
-        .await
         .expect("owner dispatch should not be blocked by exhausted repair budget");
 
     assert_eq!(
@@ -5980,7 +5973,6 @@ async fn fixed_output_owner_data_records_sender_service_decision_for_conformance
             FlowLane::Throughput,
             mux_limits,
         )
-        .await
         .expect("fixed output OwnerData dispatch should succeed");
 
     assert_eq!(
@@ -9131,7 +9123,6 @@ async fn normal_repair_cache_retention_does_not_create_authoritative_owner_debt(
     sender.enqueue_data_for_lane(Bytes::from(vec![2_u8; payload_bytes]), FlowLane::Throughput);
     let dispatch = sender
         .dispatch_next(&stream, &mut send_stream, FlowLane::Throughput, mux_limits)
-        .await
         .expect("normal repair-cache retention must not block Service OwnerData");
 
     assert_eq!(dispatch.selected_path, Some(active_key));
@@ -9282,15 +9273,13 @@ async fn response_owner_tail_guard_admits_measured_subflow_when_service_is_backp
     let mut sender = ServerResponseSenderService::new(SessionId(82), StreamId(7));
     sender.enqueue_data_for_lane(Bytes::from(vec![2_u8; payload_bytes]), FlowLane::Throughput);
     let ordered_owner_debt_bytes = send_stream.repair_bytes();
-    let dispatch = sender
-        .dispatch_next_with_ordered_owner_debt(
-            &stream,
-            &mut send_stream,
-            FlowLane::Throughput,
-            mux_limits,
-            ordered_owner_debt_bytes,
-        )
-        .await;
+    let dispatch = sender.dispatch_next_with_ordered_owner_debt(
+        &stream,
+        &mut send_stream,
+        FlowLane::Throughput,
+        mux_limits,
+        ordered_owner_debt_bytes,
+    );
 
     let dispatch =
         dispatch.expect("measured same-underlay Subflow should pass no-worse tail admission");
@@ -11398,7 +11387,6 @@ async fn tcp_response_calibration_dispatch_restores_credit_after_exact_remainder
             FlowLane::Throughput,
             mux_limits,
         )
-        .await
         .expect("the exact residual remains spendable");
 
     assert_eq!(dispatch.selected_path, Some(fixture.candidate));
@@ -11477,7 +11465,6 @@ async fn active_tcp_calibration_continues_after_another_response_flow_closes() {
             FlowLane::Throughput,
             mux_limits,
         )
-        .await
         .expect("an exact active calibration may finish after the start gate closes");
 
     assert_eq!(dispatch.selected_path, Some(fixture.candidate));
@@ -11527,7 +11514,6 @@ async fn tcp_response_calibration_dispatch_treats_pending_flight_as_one_debt() {
             FlowLane::Throughput,
             mux_limits,
         )
-        .await
         .expect("overlapping ledger and queue views leave the residual spendable");
 
     assert_eq!(dispatch.selected_path, Some(fixture.candidate));
@@ -11589,7 +11575,6 @@ async fn blocked_tcp_calibration_remainder_keeps_normal_service_chunk() {
             FlowLane::Throughput,
             mux_limits,
         )
-        .await
         .expect("blocked calibration falls back to normal Service emission");
 
     assert_eq!(dispatch.selected_path, Some(fixture.service));

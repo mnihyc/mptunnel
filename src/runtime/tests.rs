@@ -767,7 +767,6 @@ async fn server_response_sender_dispatch_creates_stream_data_from_queued_bytes()
             FlowLane::Throughput,
             MuxLimits::default(),
         )
-        .await
         .expect("dispatch response bytes");
 
     assert_eq!(dispatch.lane, ReliableWorkClass::Data);
@@ -831,7 +830,6 @@ async fn fixed_response_output_learns_product_rate_from_stream_ack_batches() {
                 FlowLane::Throughput,
                 mux_limits,
             )
-            .await
             .expect("dispatch fixed response quantum");
         ack_end = ack_end.saturating_add(dispatch.payload_bytes as u64);
         let _ = recv_emitted_tcp_path_command(&mut receivers).await;
@@ -1071,7 +1069,6 @@ async fn server_response_sender_slices_large_reads_to_service_quantum() {
             FlowLane::Throughput,
             mux_limits,
         )
-        .await
         .expect("dispatch first service quantum");
 
     assert_eq!(dispatch.lane, ReliableWorkClass::Data);
@@ -1129,7 +1126,6 @@ async fn server_response_sender_keeps_enqueue_lane_for_remaining_data_after_prom
             FlowLane::Latency,
             mux_limits,
         )
-        .await
         .expect("dispatch first latency slice");
     assert_eq!(first.payload_bytes, latency_quantum);
     assert!(matches!(
@@ -1148,7 +1144,6 @@ async fn server_response_sender_keeps_enqueue_lane_for_remaining_data_after_prom
             FlowLane::Throughput,
             mux_limits,
         )
-        .await
         .expect("remaining bytes keep enqueue-time latency lane");
     assert_eq!(second.payload_bytes, latency_quantum);
     assert!(
@@ -1214,7 +1209,6 @@ async fn server_response_sender_dispatches_control_before_repair_and_data() {
             FlowLane::Throughput,
             MuxLimits::default(),
         )
-        .await
         .expect("dispatch control");
     assert_eq!(control_dispatch.lane, ReliableWorkClass::Control);
     assert_eq!(send_stream.next_offset(), 0);
@@ -1234,7 +1228,6 @@ async fn server_response_sender_dispatches_control_before_repair_and_data() {
             FlowLane::Throughput,
             MuxLimits::default(),
         )
-        .await
         .expect("dispatch repair");
     assert_eq!(repair_dispatch.lane, ReliableWorkClass::Repair);
 }
@@ -1274,7 +1267,6 @@ async fn server_response_sender_dispatches_final_fin_after_queued_data() {
             FlowLane::Throughput,
             MuxLimits::default(),
         )
-        .await
         .expect("dispatch ordinary data first");
     assert_eq!(data_dispatch.lane, ReliableWorkClass::Data);
 
@@ -1285,7 +1277,6 @@ async fn server_response_sender_dispatches_final_fin_after_queued_data() {
             FlowLane::Throughput,
             MuxLimits::default(),
         )
-        .await
         .expect("dispatch final FIN after data");
     assert_eq!(fin_dispatch.lane, ReliableWorkClass::Control);
     assert!(matches!(
@@ -1351,7 +1342,6 @@ async fn server_response_control_queue_full_is_sender_backpressure() {
             FlowLane::Throughput,
             MuxLimits::default(),
         )
-        .await
         .expect_err("full control queue should be sender-service backpressure");
     assert!(matches!(err, RuntimeError::SenderServiceBlocked));
     assert_eq!(sender.bytes(), 1);
@@ -1395,7 +1385,6 @@ async fn server_response_sender_keeps_data_queued_when_carrier_rejects() {
                 FlowLane::Throughput,
                 MuxLimits::default()
             )
-            .await
             .is_err()
     );
     assert_eq!(sender.bytes(), b"response".len());
@@ -1445,7 +1434,6 @@ async fn server_response_sender_blocks_when_switchable_outputs_detach() {
             FlowLane::Throughput,
             MuxLimits::default(),
         )
-        .await
         .expect_err("detached switchable output should block, not close product stream");
 
     assert!(matches!(err, RuntimeError::SenderServiceBlocked));
@@ -1497,7 +1485,6 @@ async fn server_response_sender_queue_full_is_backpressure_not_path_failure() {
             FlowLane::Throughput,
             MuxLimits::default(),
         )
-        .await
         .expect_err("full carrier queue should be sender-service backpressure");
 
     assert!(matches!(err, RuntimeError::SenderServiceBlocked));
@@ -1569,7 +1556,6 @@ async fn response_binding_duplicate_live_path_rejects_fresh_output() {
             FlowLane::Throughput,
             MuxLimits::default(),
         )
-        .await
         .expect("rejecting a duplicate live output must keep the existing output usable");
 
     assert!(matches!(
@@ -1642,7 +1628,6 @@ async fn response_binding_duplicate_closed_path_replaces_output() {
             FlowLane::Throughput,
             MuxLimits::default(),
         )
-        .await
         .expect("closed same-path output should be replaced by the new carrier output");
 
     assert!(matches!(
@@ -1879,7 +1864,6 @@ async fn server_response_sender_blocked_admission_does_not_fallback_to_eta_targe
             FlowLane::Throughput,
             MuxLimits::default(),
         )
-        .await
         .expect_err("cross-underlay ordering debt must block ordinary response data");
 
     assert!(matches!(err, RuntimeError::SenderServiceBlocked));
@@ -1942,7 +1926,6 @@ async fn server_response_sender_dispatches_repair_before_data() {
             FlowLane::Throughput,
             MuxLimits::default(),
         )
-        .await
         .expect("dispatch repair");
     assert_eq!(repair_dispatch.lane, ReliableWorkClass::Repair);
     assert_eq!(send_stream.next_offset(), 0);
@@ -1962,7 +1945,6 @@ async fn server_response_sender_dispatches_repair_before_data() {
             FlowLane::Throughput,
             MuxLimits::default(),
         )
-        .await
         .expect("dispatch ordinary data");
     assert_eq!(data_dispatch.lane, ReliableWorkClass::Data);
     assert_eq!(send_stream.next_offset(), b"ordinary".len() as u64);

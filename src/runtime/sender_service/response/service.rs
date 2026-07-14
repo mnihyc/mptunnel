@@ -353,7 +353,7 @@ impl ServerResponseSenderService {
         self.queue.has_queued_repair_overlap(frame)
     }
 
-    pub(in crate::runtime) async fn dispatch_next(
+    pub(in crate::runtime) fn dispatch_next(
         &mut self,
         path_stream: &ReliablePathStream,
         send_stream: &mut ReliableSendStream,
@@ -367,10 +367,9 @@ impl ServerResponseSenderService {
             mux_limits,
             0,
         )
-        .await
     }
 
-    pub(in crate::runtime) async fn dispatch_next_with_ordered_owner_debt(
+    pub(in crate::runtime) fn dispatch_next_with_ordered_owner_debt(
         &mut self,
         path_stream: &ReliablePathStream,
         send_stream: &mut ReliableSendStream,
@@ -437,9 +436,7 @@ impl ServerResponseSenderService {
                     planned,
                     frame.clone(),
                     reliable_path_effective_frame_lane(&frame, data_lane),
-                )
-                .await
-                {
+                ) {
                     Ok(outcome) => {
                         let committed = self
                             .queue
@@ -481,8 +478,7 @@ impl ServerResponseSenderService {
                     emit_mode,
                     "control",
                     None,
-                )
-                .await?
+                )?
             }
             ReliableWorkClass::Data => match emit_response_frame_from_sender_service(
                 path_stream,
@@ -491,26 +487,21 @@ impl ServerResponseSenderService {
                 ResponseCarrierEmitMode::Classified,
                 "data",
                 None,
-            )
-            .await
-            {
+            ) {
                 Ok(selected_path) => selected_path,
                 Err(err) => {
                     let _ = send_stream.rollback_committed_data(&frame);
                     return Err(err);
                 }
             },
-            ReliableWorkClass::Repair => {
-                emit_response_frame_from_sender_service(
-                    path_stream,
-                    frame.clone(),
-                    response_repair_carrier_lane(&frame),
-                    ResponseCarrierEmitMode::Classified,
-                    "tail_repair",
-                    repair_cause,
-                )
-                .await?
-            }
+            ReliableWorkClass::Repair => emit_response_frame_from_sender_service(
+                path_stream,
+                frame.clone(),
+                response_repair_carrier_lane(&frame),
+                ResponseCarrierEmitMode::Classified,
+                "tail_repair",
+                repair_cause,
+            )?,
         };
         let (_, committed) = self
             .queue

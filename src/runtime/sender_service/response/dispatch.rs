@@ -65,7 +65,7 @@ pub(super) fn response_frame_has_carrier_credit(
     }
 }
 
-pub(super) async fn emit_planned_response_data_frame(
+pub(super) fn emit_planned_response_data_frame(
     stream: &ReliablePathStream,
     planned: ResponseDataDispatchPlan,
     frame: Frame,
@@ -79,8 +79,7 @@ pub(super) async fn emit_planned_response_data_frame(
                 frame.clone(),
                 lane,
                 ResponseCarrierEmitMode::StreamOrdered,
-            )
-            .await?;
+            )?;
             fixed.record_owner_flight(&frame);
             Ok(ResponseDataEmitOutcome {
                 selected_path: Some(fixed.key()),
@@ -190,7 +189,7 @@ pub(super) async fn emit_planned_response_data_frame(
     }
 }
 
-pub(super) async fn emit_response_frame_from_sender_service(
+pub(super) fn emit_response_frame_from_sender_service(
     stream: &ReliablePathStream,
     frame: Frame,
     lane: FlowLane,
@@ -211,8 +210,7 @@ pub(super) async fn emit_response_frame_from_sender_service(
     };
     match &stream.output {
         ReliablePathStreamOutput::Fixed(fixed) => {
-            send_sender_service_frame_to_carrier(fixed.commands(), frame.clone(), lane, emit_mode)
-                .await?;
+            send_sender_service_frame_to_carrier(fixed.commands(), frame.clone(), lane, emit_mode)?;
             if matches!(frame, Frame::StreamData { .. }) {
                 if repair {
                     fixed.record_repair_flight(&frame);
@@ -277,7 +275,6 @@ pub(super) async fn emit_response_frame_from_sender_service(
                         lane,
                         emit_mode,
                     )
-                    .await
                     .map(|()| None)
                 };
                 match send_result {
@@ -313,7 +310,7 @@ pub(super) async fn emit_response_frame_from_sender_service(
     }
 }
 
-async fn send_sender_service_frame_to_carrier(
+fn send_sender_service_frame_to_carrier(
     commands: &ReliablePathCommandSender,
     frame: Frame,
     lane: FlowLane,
@@ -330,7 +327,7 @@ async fn send_sender_service_frame_to_carrier(
     }
 }
 
-pub(in crate::runtime) async fn send_sender_service_control_frame(
+pub(in crate::runtime) fn send_sender_service_control_frame(
     stream: &ReliablePathStream,
     frame: Frame,
 ) -> Result<Option<CarrierPathKey>, RuntimeError> {
@@ -346,18 +343,17 @@ pub(in crate::runtime) async fn send_sender_service_control_frame(
         "control",
         None,
     )
-    .await
 }
 
-pub(in crate::runtime) async fn emit_relay_path_frame(
+pub(in crate::runtime) fn emit_relay_path_frame(
     stream: &ReliablePathStreamHandle,
     frame: Frame,
     lane: FlowLane,
 ) -> Result<(), RuntimeError> {
-    emit_relay_path_frame_with_mode(stream, frame, lane, ResponseCarrierEmitMode::Classified).await
+    emit_relay_path_frame_with_mode(stream, frame, lane, ResponseCarrierEmitMode::Classified)
 }
 
-pub(in crate::runtime) async fn emit_relay_path_frame_with_mode(
+pub(in crate::runtime) fn emit_relay_path_frame_with_mode(
     stream: &ReliablePathStreamHandle,
     frame: Frame,
     lane: FlowLane,
@@ -365,7 +361,7 @@ pub(in crate::runtime) async fn emit_relay_path_frame_with_mode(
 ) -> Result<(), RuntimeError> {
     match &stream.output {
         ReliablePathStreamOutput::Fixed(fixed) => {
-            send_sender_service_frame_to_carrier(fixed.commands(), frame, lane, emit_mode).await
+            send_sender_service_frame_to_carrier(fixed.commands(), frame, lane, emit_mode)
         }
         ReliablePathStreamOutput::Switchable(_) => {
             Err(RuntimeError::Protocol("request relay path is not fixed"))

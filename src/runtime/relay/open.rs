@@ -19,7 +19,6 @@ use crate::protocol::{Frame, IngressKind, StreamId, StreamOpenRole, TargetAddr, 
 use crate::runtime::error::RuntimeError;
 use crate::runtime::path::ClientPathContext;
 use crate::runtime::path::commands::ClientTcpOpenDeadlines;
-use crate::runtime::sender::emit_request_control_frame;
 use crate::runtime::stream::ReliablePathStream;
 use crate::scheduler::FlowLane;
 use std::time::{Duration, Instant};
@@ -562,7 +561,7 @@ async fn send_open_path_metrics(
     let Some(metrics) = context.relay_path_metrics(underlay, path_index) else {
         return Ok(());
     };
-    emit_request_control_frame(stream, Frame::PathMetrics { metrics })
+    stream.try_enqueue_request_control_frame(Frame::PathMetrics { metrics })
 }
 
 pub(in crate::runtime) fn stream_open_error_is_path_retryable(err: &RuntimeError) -> bool {

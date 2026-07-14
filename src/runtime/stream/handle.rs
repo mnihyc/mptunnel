@@ -74,6 +74,22 @@ impl ReliablePathStream {
         }
     }
 
+    /// Client request control remains bound to the carrier that opened it;
+    /// switchable response output must use response placement instead.
+    pub(in crate::runtime) fn try_enqueue_request_control_frame(
+        &self,
+        frame: Frame,
+    ) -> Result<(), RuntimeError> {
+        match &self.output {
+            ReliablePathStreamOutput::Fixed(fixed) => fixed
+                .commands()
+                .try_enqueue_admitted_frame(frame, FlowLane::Control),
+            ReliablePathStreamOutput::Switchable(_) => {
+                Err(RuntimeError::Protocol("request relay path is not fixed"))
+            }
+        }
+    }
+
     pub(in crate::runtime) fn current_lane(&self) -> FlowLane {
         self.output.current_lane(self.lane)
     }

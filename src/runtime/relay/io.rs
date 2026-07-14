@@ -29,7 +29,6 @@ use crate::protocol::frame::reliable_stream_frame_extent;
 use crate::protocol::frame::{normalized_offset_ranges, stream_ack_contiguous_frontier};
 use crate::protocol::{Frame, OffsetRange, UnderlayProtocol};
 use crate::runtime::error::RuntimeError;
-use crate::runtime::sender::emit_request_control_frame;
 use crate::runtime::stream::ReliablePathStream;
 use crate::scheduler::{FlowLane, PathSnapshot};
 use bytes::Bytes;
@@ -39,19 +38,16 @@ use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 // Relay I/O orchestrates reads, writes, and feedback timing. It observes queue
 // counters but delegates product admission limits to their policy modules.
 
-pub(in crate::runtime) async fn send_sender_service_attach_control_frames(
+pub(in crate::runtime) fn send_request_attach_control_frames(
     path_stream: &ReliablePathStream,
     send_stream: &ReliableSendStream,
     resend_fin: bool,
 ) -> Result<(), RuntimeError> {
     if resend_fin {
-        emit_request_control_frame(
-            path_stream,
-            Frame::StreamFin {
-                stream_id: path_stream.stream_id,
-                final_offset: send_stream.next_offset(),
-            },
-        )?;
+        path_stream.try_enqueue_request_control_frame(Frame::StreamFin {
+            stream_id: path_stream.stream_id,
+            final_offset: send_stream.next_offset(),
+        })?;
     }
     Ok(())
 }

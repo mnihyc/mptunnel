@@ -20,7 +20,7 @@ pub(in crate::runtime) use queue::{
 };
 #[cfg(not(test))]
 pub(in crate::runtime) use request::{
-    ClientQueuedDispatch, RelayRecvProgressSend, RequestSenderService, emit_request_control_frame,
+    ClientQueuedDispatch, RelayRecvProgressSend, RequestSenderService,
 };
 #[cfg(not(test))]
 pub(in crate::runtime) use response::{ServerResponseSenderService, emit_response_control_frame};

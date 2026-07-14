@@ -8,7 +8,7 @@ use super::io::{
     reliable_critical_tail_repair_limit_bytes, reliable_persistent_ack_gap_repair_limit_bytes,
     reliable_relay_error_is_migratable, reliable_relay_recv_progress_resend_active,
     reliable_stream_recv_progress_interval, resize_reliable_relay_buffer,
-    send_sender_service_attach_control_frames, sender_service_retry_delay,
+    send_request_attach_control_frames, sender_service_retry_delay,
     stream_ack_gap_repair_frames_normalized, stream_data_range_already_delivered,
     stream_final_offset_tail_repair_frames, stream_terminal_fin_replay_required,
     update_repair_authoritative_ack_snapshot, write_delivered_payloads,
@@ -2779,12 +2779,11 @@ async fn attach_relay_path_candidates(
                 // the accepted stream is committed into the remote set.
                 let accepted = AcceptedRemoteStreamGuard::new(stream);
                 let attach_control_result = if request.send_attach_control {
-                    send_sender_service_attach_control_frames(
+                    send_request_attach_control_frames(
                         accepted.stream(),
                         request.send_stream,
                         request.resend_fin,
                     )
-                    .await
                 } else {
                     Ok(())
                 };

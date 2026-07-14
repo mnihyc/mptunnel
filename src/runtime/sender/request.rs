@@ -53,9 +53,7 @@ use crate::runtime::relay_striping::{
 use crate::runtime::stream::request::{
     RequestAckClockOperation, RequestStartupAdmission, RequestStreamState,
 };
-use crate::runtime::stream::{
-    ReliablePathStream, ReliablePathStreamHandle, ReliablePathStreamOutput,
-};
+use crate::runtime::stream::{ReliablePathStreamHandle, ReliablePathStreamOutput};
 use crate::scheduler::{
     self, FlowLane, PathSnapshot, SchedulerPolicy, cyclic_cursor_distance,
     stream_demand_hint_for_lane,
@@ -3081,20 +3079,6 @@ fn relay_path_can_enqueue_frame_for_cause_now(
     } else {
         path.stream.can_enqueue_frame_now(frame, path.stream.lane)
     }
-}
-
-/// Emits request work only through its fixed carrier attachment.
-/// Switchable outputs are a server-response contract and are rejected here.
-pub(in crate::runtime) fn emit_request_control_frame(
-    stream: &ReliablePathStream,
-    frame: Frame,
-) -> Result<(), RuntimeError> {
-    emit_fixed_request_output(
-        &stream.output,
-        frame,
-        FlowLane::Control,
-        CarrierEmitMode::Classified,
-    )
 }
 
 fn emit_request_frame(

@@ -97,9 +97,11 @@ and executes concrete TCP/QUIC open, deadline, acceptance, and retry contracts;
 `relay/remote.rs` owns successful attachment incarnation, placement ordering,
 load claims, frame fan-in, and teardown. Carrier-derived PTO timing comes
 directly from `model/timing.rs`; relay I/O does not import the client control
-actor for either policy. The remaining relay work is client/control ownership
-and removal of lower-layer policy still embedded in those actors, not another
-server subdirectory or small phase files.
+actor for either policy. Open and relay I/O enqueue fixed request control
+through the reliable stream binding rather than importing the request sender;
+switchable response output remains a distinct placement contract. The remaining
+relay work is client/control ownership and removal of lower-layer policy still
+embedded in those actors, not another server subdirectory or small phase files.
 
 ### Platform
 

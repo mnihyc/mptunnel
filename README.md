@@ -23,7 +23,7 @@ scripts/package-release.sh --target x86_64-unknown-linux-musl
 pwsh scripts/package-release.ps1 -Target x86_64-pc-windows-msvc
 ```
 
-CI checks Linux, macOS, and Windows, plus amd64/aarch64 Rust targets. Tag builds such as `v0.1.0` publish release archives with SHA-256 checksums. Linux tag artifacts use musl targets and do not depend on glibc. Release process details are in `docs/OPERATIONS.md`.
+CI checks Linux, macOS, and Windows, plus amd64/aarch64 Rust targets. Tag builds such as `v0.1.0` publish release archives with SHA-256 checksums. Linux tag artifacts use musl targets and do not depend on glibc. Windows archives include the architecture-matched, checksum-verified Wintun runtime DLL and its upstream license. Release process details are in `docs/OPERATIONS.md`.
 
 ## Configuration Check
 

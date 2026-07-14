@@ -322,9 +322,12 @@ Each package contains:
 - `README.md`
 - `LICENSE`
 - `docs/`
+- Windows only: `wintun.dll` and `WINTUN-LICENSE.txt`
 - a SHA-256 checksum next to the archive
 
 Release archives intentionally do not include `mptunnel-bench`, Docker lab scripts, generated lab results, service templates, or other developer-only tooling. The product binary is built as `--bin mptunnel`.
+
+Windows packaging accepts the x86_64 and aarch64 targets listed below. Both packaging scripts pin Wintun 0.14.1, verify its official archive checksum before use, and select the matching amd64 or arm64 DLL. Packaging verifies the dependency artifact; exercising the Wintun driver and TUN data path still requires a native Windows host.
 
 Linux release artifacts use musl targets, not glibc targets, so they do not depend on a host glibc baseline:
 

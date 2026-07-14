@@ -1,6 +1,37 @@
 use super::*;
 use crate::protocol::path_capacity::CapacityReceiveTracker;
 
+pub(in crate::runtime) enum ServerTcpPathEvent {
+    Frame(Frame),
+    Command(ReliablePathCommand),
+}
+
+pub(in crate::runtime) async fn recv_server_tcp_path_event(
+    path_frames: &mut mpsc::Receiver<Result<Frame, EncryptedFramedTransportError>>,
+    commands_rx: &mut ReliablePathCommandReceivers,
+) -> Result<Option<ServerTcpPathEvent>, RuntimeError> {
+    loop {
+        let command_may_recv = !reliable_path_receivers_closed(commands_rx);
+        tokio::select! {
+            biased;
+            frame = path_frames.recv() => {
+                return match frame {
+                    Some(Ok(frame)) => Ok(Some(ServerTcpPathEvent::Frame(frame))),
+                    Some(Err(err)) => Err(RuntimeError::Encrypted(err)),
+                    None => Err(RuntimeError::ReliablePathSessionClosed),
+                };
+            }
+            command = recv_reliable_path_command(commands_rx), if command_may_recv => {
+                match command {
+                    Some(command) => return Ok(Some(ServerTcpPathEvent::Command(command))),
+                    None if reliable_path_receivers_closed(commands_rx) => return Ok(None),
+                    None => continue,
+                }
+            }
+        }
+    }
+}
+
 pub(in crate::runtime) async fn handle_server_path(
     stream: TcpStream,
     context: ServerPathContext,
@@ -96,7 +127,7 @@ pub(in crate::runtime) async fn handle_server_path(
     let (commands_tx, mut commands_rx) =
         reliable_path_command_channels(tcp_server_session_command_queue(&context));
     let mut attached_streams = HashSet::new();
-    let mut datagram_flows = Vec::<ServerUdpDatagramFlow>::new();
+    let mut datagram_flows = Vec::<ServerDatagramFlow>::new();
     let mut draining = false;
     let mut pending_frames = Vec::<Frame>::new();
     let mut path_proofs = PathProofTracker::default();
@@ -205,9 +236,9 @@ pub(in crate::runtime) async fn handle_server_path(
                         )? {
                             ServerReliableStreamOpen::New(stream) => {
                                 attached_streams.insert(stream_id);
-                                let stream_context = context.clone();
+                                let stream_context = context.reliable_stream_context();
                                 tokio::spawn(async move {
-                                    if let Err(err) = run_server_tcp_stream(
+                                    if let Err(err) = run_server_reliable_stream(
                                         stream_context,
                                         session_id,
                                         stream,
@@ -322,13 +353,13 @@ pub(in crate::runtime) async fn handle_server_path(
                                 return Err(RuntimeError::OutboundConnect(err));
                             }
                         };
-                        let requests = spawn_server_udp_datagram_flow_worker(
+                        let requests = spawn_server_datagram_flow_worker(
                             flow_id,
                             outbound_socket,
                             commands_tx.clone(),
                             context.mux_limits,
                         );
-                        datagram_flows.push(ServerUdpDatagramFlow {
+                        datagram_flows.push(ServerDatagramFlow {
                             flow_id,
                             requests,
                             _realtime_registration: realtime_registration,
@@ -362,7 +393,7 @@ pub(in crate::runtime) async fn handle_server_path(
                             .ok_or(RuntimeError::Protocol("unknown TCP datagram flow"))?
                             .requests
                             .clone();
-                        match requests.try_send(ServerUdpDatagramRequest {
+                        match requests.try_send(ServerDatagramRequest {
                             datagram_id,
                             ttl_ms,
                             payload,
@@ -794,7 +825,7 @@ async fn drain_server_tcp_path_commands(
     writer: &mut EncryptedTcpWriter,
     context: &ServerPathContext,
     attached_streams: &mut HashSet<StreamId>,
-    datagram_flows: &mut Vec<ServerUdpDatagramFlow>,
+    datagram_flows: &mut Vec<ServerDatagramFlow>,
     command_context: ServerTcpPathCommandContext<'_>,
     pending_frames: &mut Vec<Frame>,
     path_proofs: &mut PathProofTracker,
@@ -1163,61 +1194,10 @@ pub(in crate::runtime) fn encrypted_framed_peer_closed(
     )
 }
 
-pub(in crate::runtime) async fn run_server_tcp_stream(
-    context: ServerPathContext,
-    session_id: SessionId,
-    stream: ReliablePathStream,
-    target: TargetAddr,
-) -> Result<(), RuntimeError> {
-    let stream_id = stream.stream_id;
-    let result = async {
-        let outbound_stream = match outbound::connect_tcp(
-            &context.outbound,
-            &context.outbound_dns,
-            &target,
-            context.outbound_connect_timeout,
-        )
-        .await
-        {
-            Ok(stream) => stream,
-            Err(err) => {
-                send_sender_service_control_frame(
-                    &stream,
-                    Frame::StreamReset {
-                        stream_id,
-                        reason: ResetReason::Refused,
-                    },
-                )?;
-                stream.close().await;
-                return Err(RuntimeError::OutboundConnect(err));
-            }
-        };
-        send_sender_service_control_frame(
-            &stream,
-            Frame::StreamMaxData {
-                stream_id,
-                max_offset: reliable_stream_initial_advertised_window_bytes(
-                    stream.underlay,
-                    stream.lane,
-                    context.mux_limits,
-                ),
-            },
-        )?;
-        relay_reliable_stream(
-            outbound_stream,
-            stream,
-            context.mux_limits,
-            context.performance,
-            session_id,
-        )
-        .await
-        .map(|_| ())
-    }
-    .await;
-    context.reliable_streams.close(session_id, stream_id);
-    result
-}
-
 pub(in crate::runtime) fn tcp_server_session_command_queue(context: &ServerPathContext) -> usize {
     reliable_path_command_queue(context.mux_limits)
 }
+
+#[cfg(test)]
+#[path = "server_test.rs"]
+mod tests;

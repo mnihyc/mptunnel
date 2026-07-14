@@ -88,11 +88,11 @@ pub(super) async fn handle_server_udp_reliable_stream(
         context.max_reliable_streams,
     )? {
         ServerReliableStreamOpen::New(stream) => {
-            let stream_context = context.clone();
+            let stream_context = context.reliable_stream_context();
             let target = target.clone();
             tokio::spawn(async move {
                 if let Err(err) =
-                    run_server_tcp_stream(stream_context, session_id, stream, target).await
+                    run_server_reliable_stream(stream_context, session_id, stream, target).await
                 {
                     eprintln!("warning: server reliable stream failed: {err}");
                 }

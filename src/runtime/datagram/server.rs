@@ -1,0 +1,162 @@
+//! Target-side UDP flow service shared by TCP and QUIC carrier sessions.
+
+use crate::mux::MuxLimits;
+use crate::outbound;
+use crate::protocol::{DatagramFlowId, DatagramId, Frame};
+use crate::runtime::error::RuntimeError;
+use crate::runtime::path::commands::ReliablePathCommandSender;
+use crate::runtime::stream::ServerRealtimeFlowRegistration;
+use crate::scheduler::FlowLane;
+use bytes::Bytes;
+use std::collections::VecDeque;
+use std::time::{Duration, Instant};
+use tokio::sync::mpsc;
+
+#[cfg(feature = "lab-diagnostics")]
+use crate::lab_diagnostics::lab_diagnostic;
+
+const OUTBOUND_UDP_RECV_BUFFER_BYTES: usize = u16::MAX as usize;
+
+pub(in crate::runtime) struct ServerDatagramFlow {
+    pub(in crate::runtime) flow_id: DatagramFlowId,
+    pub(in crate::runtime) requests: mpsc::Sender<ServerDatagramRequest>,
+    pub(in crate::runtime) _realtime_registration: ServerRealtimeFlowRegistration,
+}
+
+pub(in crate::runtime) struct ServerDatagramRequest {
+    pub(in crate::runtime) datagram_id: DatagramId,
+    pub(in crate::runtime) ttl_ms: u32,
+    pub(in crate::runtime) payload: Bytes,
+}
+
+fn server_datagram_request_queue_len(mux_limits: MuxLimits) -> usize {
+    let unit = mux_limits.max_payload_bytes.max(1);
+    mux_limits
+        .max_datagram_queue_bytes
+        .saturating_div(unit)
+        .max(1)
+}
+
+pub(in crate::runtime) fn spawn_server_datagram_flow_worker(
+    flow_id: DatagramFlowId,
+    mut outbound_socket: outbound::OutboundUdpSocket,
+    commands: ReliablePathCommandSender,
+    mux_limits: MuxLimits,
+) -> mpsc::Sender<ServerDatagramRequest> {
+    let (requests_tx, mut requests_rx) =
+        mpsc::channel::<ServerDatagramRequest>(server_datagram_request_queue_len(mux_limits));
+    tokio::spawn(async move {
+        let response_buffer_len = mux_limits
+            .max_payload_bytes
+            .min(OUTBOUND_UDP_RECV_BUFFER_BYTES);
+        let mut response_buffer = bytes::BytesMut::zeroed(response_buffer_len);
+        let mut pending_ttls = VecDeque::<(Instant, u32, DatagramId)>::new();
+        loop {
+            prune_server_pending_ttls(&mut pending_ttls);
+            tokio::select! {
+                biased;
+                received = async {
+                    response_buffer.resize(response_buffer_len, 0);
+                    outbound_socket.recv(&mut response_buffer[..]).await
+                } => {
+                    let len = match received {
+                        Ok(len) => len,
+                        Err(err) => {
+                            eprintln!("warning: UDP outbound receive failed: {err}");
+                            let _ = try_send_server_datagram_realtime_frame(
+                                &commands,
+                                Frame::DatagramClose { flow_id },
+                            );
+                            break;
+                        }
+                    };
+                    response_buffer.truncate(len);
+                    let Some((ttl_ms, datagram_id)) =
+                        server_next_response_ttl(&mut pending_ttls)
+                    else {
+                        continue;
+                    };
+                    let payload = response_buffer.split_to(len).freeze();
+                    let frame = Frame::DatagramData {
+                        flow_id,
+                        datagram_id,
+                        ttl_ms,
+                        payload,
+                    };
+                    match try_send_server_datagram_realtime_frame(&commands, frame) {
+                        Ok(()) => {}
+                        Err(RuntimeError::SenderServiceBlocked) => {
+                            #[cfg(feature = "lab-diagnostics")]
+                            lab_diagnostic(
+                                "server_datagram_response_dropped",
+                                format_args!(
+                                    "flow_id={} datagram_id={} payload_bytes={} reason=carrier_credit",
+                                    flow_id.0,
+                                    datagram_id.0,
+                                    len,
+                                ),
+                            );
+                            continue;
+                        }
+                        Err(_) => break,
+                    }
+                }
+                request = requests_rx.recv() => {
+                    let Some(request) = request else {
+                        break;
+                    };
+                    if request.ttl_ms == 0 {
+                        continue;
+                    }
+                    match outbound_socket.send(&request.payload).await {
+                        Ok(_) => {
+                            pending_ttls.push_back((
+                                Instant::now() + Duration::from_millis(u64::from(request.ttl_ms)),
+                                request.ttl_ms,
+                                request.datagram_id,
+                            ));
+                        }
+                        Err(err) => {
+                            eprintln!("warning: UDP outbound send failed: {err}");
+                        }
+                    }
+                }
+            }
+        }
+    });
+    requests_tx
+}
+
+pub(in crate::runtime) fn try_send_server_datagram_realtime_frame(
+    commands: &ReliablePathCommandSender,
+    frame: Frame,
+) -> Result<(), RuntimeError> {
+    debug_assert!(matches!(
+        frame,
+        Frame::DatagramData { .. } | Frame::DatagramFeedback { .. } | Frame::DatagramClose { .. }
+    ));
+    commands.try_enqueue_admitted_frame(frame, FlowLane::RealtimeDatagram)
+}
+
+fn prune_server_pending_ttls(pending_ttls: &mut VecDeque<(Instant, u32, DatagramId)>) {
+    let now = Instant::now();
+    while pending_ttls
+        .front()
+        .is_some_and(|(deadline, _, _)| *deadline <= now)
+    {
+        pending_ttls.pop_front();
+    }
+}
+
+fn server_next_response_ttl(
+    pending_ttls: &mut VecDeque<(Instant, u32, DatagramId)>,
+) -> Option<(u32, DatagramId)> {
+    prune_server_pending_ttls(pending_ttls);
+    pending_ttls
+        .pop_front()
+        .map(|(_, ttl_ms, datagram_id)| (ttl_ms, datagram_id))
+}
+
+#[cfg(test)]
+#[path = "server_test.rs"]
+mod tests;

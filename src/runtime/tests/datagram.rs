@@ -145,7 +145,7 @@ fn realtime_udp_datagram_feedback_beats_probe_only_paths() {
     );
     context.mark_udp_path_probe_success(1, Duration::from_millis(1));
 
-    let association = UdpDatagramClientAssociation::new(context.clone()).expect("assoc");
+    let association = UdpDatagramClientAssociation::new(context.clone());
     let candidates = context.ordered_udp_path_candidates_for_ttl(512, DEFAULT_SOCKS5_UDP_TTL_MS);
     assert_eq!(
         association.select_path_candidate(
@@ -201,7 +201,7 @@ fn endpoint_only_udp_datagram_uses_measured_eta_after_feedback() {
         },
     );
 
-    let association = UdpDatagramClientAssociation::new(context.clone()).expect("assoc");
+    let association = UdpDatagramClientAssociation::new(context.clone());
     let candidates = context.ordered_udp_path_candidates_for_ttl(512, DEFAULT_SOCKS5_UDP_TTL_MS);
     assert_eq!(
         association.select_path_candidate(
@@ -315,7 +315,7 @@ fn udp_association_suppression_prefers_survivor_without_dead_ending() {
         ResourceLimits::default(),
     )
     .expect("ctx");
-    let mut association = UdpDatagramClientAssociation::new(context).expect("assoc");
+    let mut association = UdpDatagramClientAssociation::new(context);
     let candidates = [
         UdpPathCandidate {
             path_index: 0,
@@ -359,7 +359,7 @@ fn udp_association_keeps_successful_path_within_hysteresis_until_suppressed() {
         ResourceLimits::default(),
     )
     .expect("ctx");
-    let mut association = UdpDatagramClientAssociation::new(context).expect("assoc");
+    let mut association = UdpDatagramClientAssociation::new(context);
     let candidates = [
         UdpPathCandidate {
             path_index: 1,
@@ -398,7 +398,7 @@ fn udp_association_last_successful_path_is_only_hysteresis_hint() {
         ResourceLimits::default(),
     )
     .expect("ctx");
-    let mut association = UdpDatagramClientAssociation::new(context.clone()).expect("assoc");
+    let mut association = UdpDatagramClientAssociation::new(context.clone());
 
     context.mark_udp_path_feedback(
         0,

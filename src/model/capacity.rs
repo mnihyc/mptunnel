@@ -1,10 +1,10 @@
-//! Carrier-neutral capacity and timing primitives.
+//! Capacity evidence and carrier-shared timing primitives.
 //!
-//! These constants describe protocol/model geometry. Runtime services measure
-//! paths and apply decisions; they do not own these values.
+//! Typed records and shared geometry belong to the model. Runtime services
+//! gather and validate evidence, then apply decisions without owning its shape.
 
 use crate::mux::MuxLimits;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 pub(crate) const TRANSPORT_MSS_BYTES: usize = 1460;
 pub(crate) const UDP_DEFAULT_MTU_PAYLOAD_BYTES: usize = 1200;
@@ -25,6 +25,10 @@ pub(crate) const BBR_DEFAULT_CWND_GAIN: f64 = 2.0;
 
 pub(crate) const TRANSPORT_TIMER_GRANULARITY: Duration = Duration::from_millis(1);
 pub(crate) const QUIC_TIMER_GRANULARITY: Duration = TRANSPORT_TIMER_GRANULARITY;
+// Product datagram feedback is carrier-neutral; these budgets must not change
+// just because a QUIC protocol timer is retuned.
+pub(crate) const DATAGRAM_FEEDBACK_DELAY_BUDGET: Duration = Duration::from_millis(25);
+pub(crate) const DATAGRAM_RESPONSE_DEADLINE_MULTIPLIER: u32 = 3;
 pub(crate) const RELIABLE_INITIAL_RTT: Duration = Duration::from_millis(333);
 pub(crate) const QUIC_MAX_ACK_DELAY: Duration = Duration::from_millis(25);
 pub(crate) const QUIC_PERSISTENT_CONGESTION_THRESHOLD: u32 = 3;
@@ -32,6 +36,47 @@ pub(crate) const MIN_RATE_SAMPLE_BYTES: u64 = PATH_OPEN_SCORE_BYTES as u64;
 pub(crate) const RELIABLE_STREAM_STARTUP_PRODUCT_WINDOW_BYTES: u64 = 512 * 1024;
 pub(crate) const RELIABLE_UDP_MIN_PRODUCT_WINDOW_BYTES: u64 = 512 * 1024;
 pub(crate) const CAPACITY_TIMING_SLACK_BYTES: u64 = BBR_MAX_SEND_QUANTUM_BYTES as u64;
+
+/// Immutable evidence for one exact QUIC capacity train.
+///
+/// The model owns this record's geometry; QUIC runtime code owns how evidence
+/// is gathered and validated.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct QuicCapacityProofCandidate {
+    pub(crate) token: u64,
+    pub(crate) train_bytes: u64,
+    pub(crate) sample_floor_bytes: u64,
+    pub(crate) accounting_slack_bytes: u64,
+    pub(crate) warmup_bytes: u64,
+    pub(crate) required_proof_bytes: u64,
+    pub(crate) written_bytes: u64,
+    pub(crate) written_data_frame_count: u64,
+    pub(crate) receipt_confirmed: bool,
+    pub(crate) received_bytes: u64,
+    pub(crate) proof_elapsed: Duration,
+    pub(crate) rate_bps: u64,
+    pub(crate) accepted_at: Instant,
+    pub(crate) expires_at: Instant,
+    pub(crate) proof_validity: Duration,
+}
+
+/// Immutable evidence for one exact TCP capacity train.
+///
+/// The model owns this cross-layer handoff record; TCP runtime code owns
+/// receipt interpretation and native telemetry validation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct TcpCapacityProofCandidate {
+    pub(crate) token: u64,
+    pub(crate) train_bytes: u64,
+    pub(crate) received_bytes: u64,
+    /// Payload represented by `proof_elapsed`; request TCP uses the full train.
+    pub(crate) rate_sample_bytes: u64,
+    pub(crate) proof_elapsed: Duration,
+    pub(crate) receipt_rate_bps: u64,
+    pub(crate) rate_bps: u64,
+    pub(crate) accepted_at: Instant,
+    pub(crate) expires_at: Instant,
+}
 
 pub(crate) fn product_delivery_samples_override_startup_prior(delivery_samples: u32) -> bool {
     delivery_samples >= RELIABLE_INITIAL_WINDOW_PACKETS as u32

@@ -2184,11 +2184,7 @@ pub(in crate::runtime) async fn route_client_tcp_stream_frame(
         if !was_recently_closed {
             lab_diagnostic(
                 "client_tcp_unknown_stream_frame_drop",
-                format_args!(
-                    "stream_id={} frame_kind={}",
-                    stream_id.0,
-                    frame_kind_name(&frame),
-                ),
+                format_args!("stream_id={} frame_kind={}", stream_id.0, frame.kind_name(),),
             );
         }
         return Ok(());

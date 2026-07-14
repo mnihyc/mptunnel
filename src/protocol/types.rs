@@ -466,6 +466,45 @@ impl Frame {
             },
         }
     }
+
+    pub(crate) fn kind_name(&self) -> &'static str {
+        match self {
+            Self::SessionHello { .. } => "SESSION_HELLO",
+            Self::SessionAuth { .. } => "SESSION_AUTH",
+            Self::SessionReady => "SESSION_READY",
+            Self::SessionClose { .. } => "SESSION_CLOSE",
+            Self::PathJoin { .. } => "PATH_JOIN",
+            Self::PathJoinOk { .. } => "PATH_JOIN_OK",
+            Self::PathChallenge { .. } => "PATH_CHALLENGE",
+            Self::PathResponse { .. } => "PATH_RESPONSE",
+            Self::PathStatus { .. } => "PATH_STATUS",
+            Self::PathDrain { .. } => "PATH_DRAIN",
+            Self::PathClose { .. } => "PATH_CLOSE",
+            Self::PathMtuProbe { .. } => "PATH_MTU_PROBE",
+            Self::PathMtuAck { .. } => "PATH_MTU_ACK",
+            Self::PathProofData { .. } => "PATH_PROOF_DATA",
+            Self::PathProofAck { .. } => "PATH_PROOF_ACK",
+            Self::PathCapacityData { .. } => "PATH_CAPACITY_DATA",
+            Self::PathCapacityFinish { .. } => "PATH_CAPACITY_FINISH",
+            Self::PathCapacityReceipt { .. } => "PATH_CAPACITY_RECEIPT",
+            Self::OpenStream { .. } => "OPEN_STREAM",
+            Self::StreamData { .. } => "STREAM_DATA",
+            Self::StreamAck { .. } => "STREAM_ACK",
+            Self::StreamMaxData { .. } => "STREAM_MAX_DATA",
+            Self::StreamFin { .. } => "STREAM_FIN",
+            Self::StreamDetach { .. } => "STREAM_DETACH",
+            Self::StreamReset { .. } => "STREAM_RESET",
+            Self::OpenDatagramFlow { .. } => "OPEN_DGRAM_FLOW",
+            Self::DatagramData { .. } => "DGRAM_DATA",
+            Self::DatagramClose { .. } => "DGRAM_CLOSE",
+            Self::DatagramFeedback { .. } => "DGRAM_FEEDBACK",
+            Self::PathMetrics { .. } => "PATH_METRICS",
+            Self::RxRateHint { .. } => "RX_RATE_HINT",
+            Self::MaxConnectionData { .. } => "MAX_CONNECTION_DATA",
+            Self::Ping { .. } => "PING",
+            Self::Pong { .. } => "PONG",
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

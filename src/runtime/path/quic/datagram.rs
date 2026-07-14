@@ -26,7 +26,7 @@ pub(super) async fn handle_server_udp_datagram_stream(
         context.codec_limits,
         udp_path_command_queue(context.mux_limits, context.codec_limits),
     );
-    let mut flows = Vec::<ServerUdpDatagramFlow>::new();
+    let mut flows = Vec::<ServerDatagramFlow>::new();
     let mut pending_frames = Vec::<Frame>::new();
     open_server_udp_datagram_flow(
         &context,
@@ -70,7 +70,7 @@ pub(super) async fn handle_server_udp_datagram_stream(
                             .ok_or(RuntimeError::Protocol("unknown QUIC UDP path datagram flow"))?
                             .requests
                             .clone();
-                        match requests.try_send(ServerUdpDatagramRequest { datagram_id, ttl_ms, payload }) {
+                        match requests.try_send(ServerDatagramRequest { datagram_id, ttl_ms, payload }) {
                             Ok(()) => {
                                 udp_path_write_frame(
                                     &mut send,
@@ -148,7 +148,7 @@ async fn drain_server_udp_datagram_commands(
     commands: &mut ReliablePathCommandReceivers,
     send: &mut UdpPathSendStream,
     context: &ServerPathContext,
-    flows: &mut Vec<ServerUdpDatagramFlow>,
+    flows: &mut Vec<ServerDatagramFlow>,
     pending_frames: &mut Vec<Frame>,
 ) -> Result<bool, RuntimeError> {
     #[cfg(feature = "lab-diagnostics")]
@@ -310,7 +310,7 @@ async fn open_server_udp_datagram_flow(
     context: &ServerPathContext,
     commands_tx: &ReliablePathCommandSender,
     send: &mut UdpPathSendStream,
-    flows: &mut Vec<ServerUdpDatagramFlow>,
+    flows: &mut Vec<ServerDatagramFlow>,
     session_id: SessionId,
     flow_id: DatagramFlowId,
     target: TargetAddr,
@@ -352,13 +352,13 @@ async fn open_server_udp_datagram_flow(
             return Err(RuntimeError::OutboundConnect(err));
         }
     };
-    let requests = spawn_server_udp_datagram_flow_worker(
+    let requests = spawn_server_datagram_flow_worker(
         flow_id,
         outbound_socket,
         commands_tx.clone(),
         context.mux_limits,
     );
-    flows.push(ServerUdpDatagramFlow {
+    flows.push(ServerDatagramFlow {
         flow_id,
         requests,
         _realtime_registration: realtime_registration,

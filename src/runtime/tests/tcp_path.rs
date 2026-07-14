@@ -1724,35 +1724,6 @@ async fn cancelled_quic_capacity_ticket_wakes_carrier_cancellation() {
 }
 
 #[tokio::test]
-async fn server_tcp_path_input_frame_bypasses_queued_bulk_output() {
-    let (tx, mut commands_rx) = reliable_path_command_channels(1);
-    tx.try_enqueue_admitted_frame(
-        Frame::StreamData {
-            stream_id: StreamId(10),
-            offset: 0,
-            flags: StreamFlags::NONE,
-            payload: Bytes::from_static(b"bulk"),
-        },
-        FlowLane::Throughput,
-    )
-    .expect("fill bulk output command queue");
-    let (frame_tx, mut path_frames) = mpsc::channel(1);
-    frame_tx
-        .send(Ok(Frame::Ping { nonce: 7 }))
-        .await
-        .expect("queue inbound ping");
-
-    match recv_server_tcp_path_event(&mut path_frames, &mut commands_rx)
-        .await
-        .expect("server path event")
-        .expect("event")
-    {
-        ServerTcpPathEvent::Frame(Frame::Ping { nonce }) => assert_eq!(nonce, 7),
-        _ => panic!("expected inbound frame before queued bulk output"),
-    }
-}
-
-#[tokio::test]
 async fn client_tcp_path_ignores_late_frames_for_recently_closed_stream() {
     let stream_id = StreamId(7);
     let (frames_tx, frames_rx) = mpsc::channel(1);
@@ -3991,92 +3962,6 @@ async fn path_failure_repairs_enqueue_repair_lane_without_carrier_send() {
         .await
         .is_err(),
         "path-failure repair generation must not send directly to the carrier"
-    );
-}
-
-#[tokio::test]
-async fn datagram_response_queue_full_is_realtime_backpressure() {
-    let flow_id = DatagramFlowId(12);
-    let (commands, mut command_rx) = reliable_path_command_channels(1);
-    commands
-        .try_enqueue_admitted_frame(
-            Frame::DatagramData {
-                flow_id,
-                datagram_id: DatagramId(1),
-                ttl_ms: 1000,
-                payload: Bytes::from_static(b"queued"),
-            },
-            FlowLane::RealtimeDatagram,
-        )
-        .expect("prefill realtime queue");
-
-    let err = try_send_server_datagram_realtime_frame(
-        &commands,
-        Frame::DatagramData {
-            flow_id,
-            datagram_id: DatagramId(2),
-            ttl_ms: 1000,
-            payload: Bytes::from_static(b"later"),
-        },
-    )
-    .expect_err("full realtime queue should be sender-service backpressure");
-
-    assert!(matches!(err, RuntimeError::SenderServiceBlocked));
-    assert!(matches!(
-        recv_reliable_path_command(&mut command_rx).await,
-        Some(ReliablePathCommand::SendFrame(Frame::DatagramData {
-            datagram_id,
-            payload,
-            ..
-        })) if datagram_id == DatagramId(1) && payload == Bytes::from_static(b"queued")
-    ));
-    assert!(
-        tokio::time::timeout(
-            Duration::from_millis(20),
-            recv_reliable_path_command(&mut command_rx)
-        )
-        .await
-        .is_err(),
-        "blocked datagram response must not enqueue another frame"
-    );
-}
-
-#[tokio::test]
-async fn datagram_close_queue_full_is_realtime_backpressure() {
-    let flow_id = DatagramFlowId(13);
-    let (commands, mut command_rx) = reliable_path_command_channels(1);
-    commands
-        .try_enqueue_admitted_frame(
-            Frame::DatagramData {
-                flow_id,
-                datagram_id: DatagramId(1),
-                ttl_ms: 1000,
-                payload: Bytes::from_static(b"queued"),
-            },
-            FlowLane::RealtimeDatagram,
-        )
-        .expect("prefill realtime queue");
-
-    let err = try_send_server_datagram_realtime_frame(&commands, Frame::DatagramClose { flow_id })
-        .expect_err("full realtime queue should be sender-service backpressure");
-
-    assert!(matches!(err, RuntimeError::SenderServiceBlocked));
-    assert!(matches!(
-        recv_reliable_path_command(&mut command_rx).await,
-        Some(ReliablePathCommand::SendFrame(Frame::DatagramData {
-            datagram_id,
-            payload,
-            ..
-        })) if datagram_id == DatagramId(1) && payload == Bytes::from_static(b"queued")
-    ));
-    assert!(
-        tokio::time::timeout(
-            Duration::from_millis(20),
-            recv_reliable_path_command(&mut command_rx)
-        )
-        .await
-        .is_err(),
-        "blocked datagram close must not wait or enqueue behind a full realtime queue"
     );
 }
 

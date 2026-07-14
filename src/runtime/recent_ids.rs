@@ -48,3 +48,13 @@ pub(super) fn reliable_closed_stream_cache_capacity(max_streams: usize) -> usize
     // fixed global cap on high-concurrency deployments.
     max_streams.max(1).saturating_mul(2)
 }
+
+pub(super) fn path_join_replay_cache_capacity(max_streams: usize) -> usize {
+    // Compatibility rule: retain four accepted joins per configured stream.
+    // The factor is resource sizing, not a TCP or QUIC congestion parameter.
+    const RETAINED_PATH_JOINS_PER_STREAM: usize = 4;
+
+    max_streams
+        .max(1)
+        .saturating_mul(RETAINED_PATH_JOINS_PER_STREAM)
+}

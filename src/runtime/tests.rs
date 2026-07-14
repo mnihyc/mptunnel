@@ -48,31 +48,6 @@ async fn recv_emitted_tcp_path_command(
     command
 }
 
-#[test]
-fn stream_open_demand_hint_preserves_aggressive_bulk_intent() {
-    let throughput = stream_demand_hint_for_lane(FlowLane::Throughput);
-    assert_eq!(
-        flow_lane_from_stream_demand_hint(throughput),
-        FlowLane::Throughput
-    );
-
-    let tie_break_to_throughput = StreamDemandHint {
-        latency_weight_ppm: 500_000,
-        throughput_weight_ppm: 500_000,
-        ..StreamDemandHint::latency()
-    };
-    assert_eq!(
-        flow_lane_from_stream_demand_hint(tie_break_to_throughput),
-        FlowLane::Throughput
-    );
-
-    let latency = stream_demand_hint_for_lane(FlowLane::Latency);
-    assert_eq!(
-        flow_lane_from_stream_demand_hint(latency),
-        FlowLane::Latency
-    );
-}
-
 fn udp_stream_path_indices(
     context: &ClientPathContext,
     lane: FlowLane,
@@ -3413,7 +3388,7 @@ fn acked_udp_datagram_timeout_suppresses_path_for_next_realtime_packet() {
         resources,
     )
     .expect("context");
-    let association = UdpDatagramClientAssociation::new(context.clone()).expect("association");
+    let association = UdpDatagramClientAssociation::new(context.clone());
     let payload_bytes = 512;
     let ttl_ms = 1_000;
     let candidates = context.ordered_udp_path_candidates_for_ttl(payload_bytes, ttl_ms);

@@ -5,19 +5,7 @@ use tokio::net::TcpStream;
 const TCP_METRIC_MIN_INTERVAL: Duration = Duration::from_millis(5);
 const TCP_METRIC_MAX_INTERVAL: Duration = Duration::from_millis(250);
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(in crate::runtime) struct TcpCapacityProofCandidate {
-    pub(in crate::runtime) token: u64,
-    pub(in crate::runtime) train_bytes: u64,
-    pub(in crate::runtime) received_bytes: u64,
-    /// Payload represented by `proof_elapsed`; request TCP uses the full train.
-    pub(in crate::runtime) rate_sample_bytes: u64,
-    pub(in crate::runtime) proof_elapsed: Duration,
-    pub(in crate::runtime) receipt_rate_bps: u64,
-    pub(in crate::runtime) rate_bps: u64,
-    pub(in crate::runtime) accepted_at: Instant,
-    pub(in crate::runtime) expires_at: Instant,
-}
+pub(in crate::runtime) use crate::model::capacity::TcpCapacityProofCandidate;
 
 pub(in crate::runtime) fn valid_tcp_capacity_proof_candidate_at(
     proof: TcpCapacityProofCandidate,

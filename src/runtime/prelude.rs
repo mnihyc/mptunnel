@@ -7,15 +7,14 @@ pub(super) use crate::ingress::socks5::{self, Socks5Error, Socks5Reply};
 pub(super) use crate::ingress::tun::TunL4Config;
 pub(super) use crate::ingress::{IngressConfig, ProxyAuthConfig};
 pub(super) use crate::mux::MuxLimits;
-pub(super) use crate::mux::datagram::{DatagramError, DatagramFlow};
 pub(super) use crate::mux::stream::{ReliableRecvStream, ReliableSendStream};
 pub(super) use crate::outbound::{self, TargetProtocol};
 pub(super) use crate::protocol::auth::{PathJoinAuthCheck, SessionAuthCheck, SessionAuthenticator};
 pub(super) use crate::protocol::codec::CodecLimits;
 pub(super) use crate::protocol::{
-    CloseReason, DatagramFlowId, DatagramId, Frame, IngressKind, OffsetRange, OutboundPolicy,
-    PathCapabilities, PathId, PathMetricDirection, PathMetrics, RateHint, ResetReason, SessionId,
-    StreamDemandHint, StreamFlags, StreamId, StreamOpenRole, TargetAddr, UnderlayProtocol,
+    CloseReason, DatagramFlowId, Frame, IngressKind, OffsetRange, OutboundPolicy, PathCapabilities,
+    PathId, PathMetricDirection, PathMetrics, RateHint, ResetReason, SessionId, StreamFlags,
+    StreamId, StreamOpenRole, TargetAddr, UnderlayProtocol,
 };
 pub(super) use crate::scheduler::{
     self, FlowDemand, FlowLane, PathRateScope, PathSnapshot, PathState as SchedulerPathState,

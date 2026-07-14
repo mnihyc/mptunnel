@@ -821,7 +821,7 @@ impl ServerReliableStreamRegistry {
                     "session_id={} stream_id={} frame_kind={}",
                     session_id.0,
                     stream_id.0,
-                    frame_kind_name(&frame),
+                    frame.kind_name(),
                 ),
             );
             return Ok(());

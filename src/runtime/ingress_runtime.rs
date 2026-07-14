@@ -380,30 +380,6 @@ pub(super) fn socks5_udp_peer_allowed(client_endpoint: &TargetAddr, peer: Socket
     }
 }
 
-pub(super) async fn open_udp_datagram_session_on_path(
-    context: &ClientPathContext,
-    path_index: usize,
-    session_id: SessionId,
-    handshake_timeout: Duration,
-) -> Result<UdpDatagramClientSession, RuntimeError> {
-    let path_session = context
-        .udp_sessions
-        .get(path_index)
-        .cloned()
-        .ok_or(RuntimeError::NoSchedulableUdpPath)?;
-    let _ = session_id;
-    let started_at = Instant::now();
-    let session = UdpDatagramClientSession::open_from_udp_session(
-        path_session,
-        path_index,
-        context.mux_limits,
-        handshake_timeout,
-    )
-    .await?;
-    context.mark_udp_path_open_success(path_index, started_at.elapsed());
-    Ok(session)
-}
-
 pub(super) async fn probe_tcp_client_path(
     context: &ClientPathContext,
     path_index: usize,

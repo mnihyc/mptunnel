@@ -7,9 +7,15 @@
 use super::*;
 
 pub(in crate::runtime) mod binding;
+mod demand;
 mod registry;
 mod response_placement;
+mod server;
 
 pub(in crate::runtime) use binding::*;
+pub(in crate::runtime) use demand::{
+    flow_lane_from_stream_demand_hint, stream_demand_hint_for_lane,
+};
 pub(in crate::runtime) use registry::*;
 pub(in crate::runtime) use response_placement::*;
+pub(in crate::runtime) use server::{ServerStreamContext, run_server_reliable_stream};

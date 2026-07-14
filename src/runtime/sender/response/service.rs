@@ -120,10 +120,10 @@ impl ServerResponseSenderService {
         .map(|target| {
             (
                 ServerRepairOutputIdentity {
-                    key: target.key,
-                    incarnation: target.incarnation,
+                    key: target.observation.key,
+                    incarnation: target.observation.incarnation,
                 },
-                target.snapshot,
+                target.observation.snapshot,
             )
         })
     }

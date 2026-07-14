@@ -25,7 +25,7 @@ use crate::model::multipath::{
 };
 use crate::model::path::CarrierPathKey;
 use crate::model::response::{
-    ResponseCandidateTailDebt, ResponseOrderedTail, ResponseSameFamilyReservoir,
+    ResponseBulkLead, ResponseCandidateTailDebt, ResponseOrderedTail, ResponseSameFamilyReservoir,
 };
 use crate::model::work::CarrierWorkKind;
 use crate::mux::MuxLimits;
@@ -33,13 +33,6 @@ use crate::protocol::{StreamOpenRole, UnderlayProtocol};
 use crate::runtime::stream::response::ResponseSenderPathTarget;
 use crate::scheduler::{FlowLane, PathSnapshot};
 use std::time::Duration;
-
-#[derive(Debug, Clone, Copy)]
-pub(super) struct ResponseBulkLead {
-    pub(super) key: CarrierPathKey,
-    pub(super) snapshot: PathSnapshot,
-    pub(super) eta_ms: f64,
-}
 
 #[derive(Clone, Copy)]
 pub(super) struct ResponseSubflowAdmissionCommit {
@@ -106,8 +99,8 @@ pub(super) fn response_service_anchor_key(
             candidates
                 .iter()
                 .copied()
-                .find(|candidate| candidate.is_active)
-                .map(|candidate| candidate.key)
+                .find(|candidate| candidate.observation.is_service)
+                .map(|candidate| candidate.observation.key)
         })
         .or(lower_owner)
         .unwrap_or(fallback)
@@ -121,35 +114,35 @@ fn response_unique_quic_data_would_expand_ordering_debt(
     matches!(
         lower_owner,
         Some(owner)
-            if owner != target.key
+            if owner != target.observation.key
                 && owner.underlay == UnderlayProtocol::Udp
-                && target.key.underlay == UnderlayProtocol::Udp
+                && target.observation.key.underlay == UnderlayProtocol::Udp
                 && ordering_debt > 0
-                && !target.has_bulk_rate_evidence
+                && !target.observation.has_bulk_rate_evidence
     )
 }
 
 pub(super) fn response_target_is_plausible_unique_owner_candidate(
     target: &ResponseSenderPathTarget,
 ) -> bool {
-    target.attachment_role != StreamOpenRole::Repair
-        && (target.is_active || target.has_bulk_rate_evidence)
+    target.observation.attachment_role != StreamOpenRole::Repair
+        && (target.observation.is_service || target.observation.has_bulk_rate_evidence)
 }
 
 pub(super) fn response_target_is_measured_same_underlay_subflow_candidate(
     service_key: CarrierPathKey,
     target: &ResponseSenderPathTarget,
 ) -> bool {
-    target.attachment_role != StreamOpenRole::Repair
-        && target.key != service_key
-        && target.key.underlay == service_key.underlay
-        && !target.is_active
-        && target.has_bulk_rate_evidence
+    target.observation.attachment_role != StreamOpenRole::Repair
+        && target.observation.key != service_key
+        && target.observation.key.underlay == service_key.underlay
+        && !target.observation.is_service
+        && target.observation.has_bulk_rate_evidence
 }
 
 fn response_target_measured_admission_snapshot(target: &ResponseSenderPathTarget) -> PathSnapshot {
-    let mut snapshot = target.snapshot;
-    if target.has_bulk_rate_evidence {
+    let mut snapshot = target.observation.snapshot;
+    if target.observation.has_bulk_rate_evidence {
         // An app-limited poll does not erase the retained path-scoped rate
         // model. Proven Subflows must continue to pass ECF completion math.
         snapshot.app_limited = false;
@@ -177,31 +170,33 @@ pub(super) fn response_target_is_startup_same_underlay_subflow_candidate(
         .max(candidate_committed)
         .saturating_add(payload_bytes as u64);
     let service_bulk_flows = service
+        .observation
         .snapshot
         .active_flows
-        .saturating_sub(service.snapshot.active_latency_sensitive_flows);
+        .saturating_sub(service.observation.snapshot.active_latency_sensitive_flows);
     let target_bulk_flows = target
+        .observation
         .snapshot
         .active_flows
-        .saturating_sub(target.snapshot.active_latency_sensitive_flows);
+        .saturating_sub(target.observation.snapshot.active_latency_sensitive_flows);
 
-    service.key == service_key
-        && service.is_active
-        && service.has_bulk_rate_evidence
+    service.observation.key == service_key
+        && service.observation.is_service
+        && service.observation.has_bulk_rate_evidence
         // One sustained response is real demand. The candidate must still be
         // less occupied than Service; flow count never substitutes for the
         // bounded epoch, sender evidence, or product-debt guards below.
         && service_bulk_flows > target_bulk_flows
-        && service.snapshot.active_latency_sensitive_flows == 0
-        && service.snapshot.session_active_latency_sensitive_flows == 0
-        && target.snapshot.active_latency_sensitive_flows == 0
-        && target.snapshot.session_active_latency_sensitive_flows == 0
-        && target.attachment_role == StreamOpenRole::Validation
-        && target.key != service_key
-        && target.key.underlay == service_key.underlay
-        && !target.is_active
-        && target.has_sender_evidence
-        && !target.has_bulk_rate_evidence
+        && service.observation.snapshot.active_latency_sensitive_flows == 0
+        && service.observation.snapshot.session_active_latency_sensitive_flows == 0
+        && target.observation.snapshot.active_latency_sensitive_flows == 0
+        && target.observation.snapshot.session_active_latency_sensitive_flows == 0
+        && target.observation.attachment_role == StreamOpenRole::Validation
+        && target.observation.key != service_key
+        && target.observation.key.underlay == service_key.underlay
+        && !target.observation.is_service
+        && target.observation.has_sender_evidence
+        && !target.observation.has_bulk_rate_evidence
         && projected_ordering_debt <= product_envelope
 }
 
@@ -213,8 +208,11 @@ pub(super) fn response_startup_sample_has_completion_opportunity(
     mux_limits: MuxLimits,
 ) -> bool {
     let measured_same_family_subflow_exists = candidates.iter().copied().any(|candidate| {
-        candidate.key != target.key
-            && response_target_is_measured_same_underlay_subflow_candidate(service.key, candidate)
+        candidate.observation.key != target.observation.key
+            && response_target_is_measured_same_underlay_subflow_candidate(
+                service.observation.key,
+                candidate,
+            )
     });
     if !measured_same_family_subflow_exists {
         // The first bounded candidate is the bootstrap that makes an optional
@@ -226,10 +224,10 @@ pub(super) fn response_startup_sample_has_completion_opportunity(
     // own ordering risk; serially probing every cold path starves capacity that
     // the binding has already discovered.
     bulk_exploration_completion_projection(
-        service.snapshot,
-        service.eta_ms,
-        target.snapshot,
-        target.eta_ms,
+        service.observation.snapshot,
+        service.observation.eta_ms,
+        target.observation.snapshot,
+        target.observation.eta_ms,
         reliable_subflow_startup_sample_limit_bytes(mux_limits),
         payload_bytes,
         mux_limits,
@@ -259,7 +257,7 @@ pub(super) fn response_owner_bulk_model_suppression(
             best_snapshot: lead.snapshot,
             best_eta_ms: lead.eta_ms,
             candidate_snapshot: response_target_measured_admission_snapshot(target),
-            candidate_eta_ms: target.eta_ms,
+            candidate_eta_ms: target.observation.eta_ms,
             payload_bytes,
             mux_limits,
             role,
@@ -283,8 +281,8 @@ pub(super) fn response_fallback_bulk_model_suppression(
         BulkAdmissionCheck {
             best_snapshot: lead.snapshot,
             best_eta_ms: lead.eta_ms,
-            candidate_snapshot: target.snapshot,
-            candidate_eta_ms: target.eta_ms,
+            candidate_snapshot: target.observation.snapshot,
+            candidate_eta_ms: target.observation.eta_ms,
             payload_bytes,
             mux_limits,
             role,
@@ -353,7 +351,7 @@ pub(super) fn response_target_unique_owner_admission_with_epoch(
     let completion_backlog_bytes = ordering_debt.max(ordered_tail_debt.global_bytes());
     let role = response_bulk_admission_role(
         service_key,
-        target.key,
+        target.observation.key,
         lower_owner,
         effective_ordering_debt,
     );
@@ -387,22 +385,24 @@ pub(super) fn response_target_unique_owner_admission_with_epoch(
             |reason| result(PathAdmission::standby(), None, Some(reason)),
         )
     };
-    if target.attachment_role == StreamOpenRole::Repair {
+    if target.observation.attachment_role == StreamOpenRole::Repair {
         return result(PathAdmission::standby(), None, None);
     }
-    let liveness_service_failover = allow_liveness_service_failover && target.key == service_key;
-    let continues_lower_frontier = lower_owner == Some(target.key);
+    let liveness_service_failover =
+        allow_liveness_service_failover && target.observation.key == service_key;
+    let continues_lower_frontier = lower_owner == Some(target.observation.key);
     let current_startup_owner_continues_lower_frontier = startup_sampling_allowed
         && continues_lower_frontier
-        && target.key != service_key
-        && !target.has_bulk_rate_evidence
+        && target.observation.key != service_key
+        && !target.observation.has_bulk_rate_evidence
         && subflow_set.is_some_and(|epoch| {
-            epoch.service_key() == service_key && epoch.startup_owner_key() == Some(target.key)
+            epoch.service_key() == service_key
+                && epoch.startup_owner_key() == Some(target.observation.key)
         })
         && candidates
             .iter()
             .copied()
-            .find(|candidate| candidate.key == service_key)
+            .find(|candidate| candidate.observation.key == service_key)
             .is_some_and(|service| {
                 response_target_is_startup_same_underlay_subflow_candidate(
                     service_key,
@@ -413,19 +413,21 @@ pub(super) fn response_target_unique_owner_admission_with_epoch(
                     mux_limits,
                 )
             });
-    if continues_lower_frontier && (target.key == service_key || target.is_active) {
+    if continues_lower_frontier
+        && (target.observation.key == service_key || target.observation.is_service)
+    {
         if ordering_debt > 0 {
             return result(PathAdmission::standby(), None, None);
         }
-        return if target.is_active || target.has_bulk_rate_evidence {
+        return if target.observation.is_service || target.observation.has_bulk_rate_evidence {
             direct_result(PathAdmission::service())
         } else {
             result(PathAdmission::probe_only(), None, None)
         };
     }
     if continues_lower_frontier
-        && target.key != service_key
-        && (!target.has_bulk_rate_evidence || target.is_active)
+        && target.observation.key != service_key
+        && (!target.observation.has_bulk_rate_evidence || target.observation.is_service)
         && !current_startup_owner_continues_lower_frontier
     {
         // Only the exact bounded startup owner or an already measured Subflow
@@ -435,31 +437,35 @@ pub(super) fn response_target_unique_owner_admission_with_epoch(
     if lower_owner.is_some() && !continues_lower_frontier {
         return result(PathAdmission::standby(), None, None);
     }
-    if target.key == service_key {
+    if target.observation.key == service_key {
         if ordered_tail_debt.global_bytes() > 0
-            && Some(target.key) != ordered_data_owner
-            && !target.has_bulk_rate_evidence
+            && Some(target.observation.key) != ordered_data_owner
+            && !target.observation.has_bulk_rate_evidence
             && !liveness_service_failover
         {
             return result(PathAdmission::standby(), None, None);
         }
-        return if target.is_active || target.has_bulk_rate_evidence || liveness_service_failover {
+        return if target.observation.is_service
+            || target.observation.has_bulk_rate_evidence
+            || liveness_service_failover
+        {
             direct_result(PathAdmission::service())
         } else {
             result(PathAdmission::probe_only(), None, None)
         };
     }
-    if target.is_active {
+    if target.observation.is_service {
         return result(PathAdmission::standby(), None, None);
     }
     let existing_startup_owner = subflow_set.is_some_and(|epoch| {
-        epoch.service_key() == service_key && epoch.startup_owner_key() == Some(target.key)
+        epoch.service_key() == service_key
+            && epoch.startup_owner_key() == Some(target.observation.key)
     });
     let startup_owner_allowed = startup_sampling_allowed
         && candidates
             .iter()
             .copied()
-            .find(|candidate| candidate.key == service_key)
+            .find(|candidate| candidate.observation.key == service_key)
             .is_some_and(|service| {
                 response_target_is_startup_same_underlay_subflow_candidate(
                     service_key,
@@ -501,14 +507,15 @@ pub(super) fn response_target_unique_owner_admission_with_epoch(
     // startup epoch therefore uses explicit role/pressure/resource guards and
     // does not compare the path against its own underfed rate prior.
     let model_allows_owner = startup_owner_allowed || measured_model_allows_owner;
-    let completion_improves = measured_model_allows_owner && target.has_bulk_rate_evidence;
+    let completion_improves =
+        measured_model_allows_owner && target.observation.has_bulk_rate_evidence;
     let startup_owner_credit_bytes =
         usize::try_from(reliable_subflow_startup_sample_limit_bytes(mux_limits))
             .unwrap_or(usize::MAX)
             .max(payload_bytes);
     let input = SubflowAdmissionInput {
-        key: target.key,
-        bulk_rate_proven: target.has_bulk_rate_evidence,
+        key: target.observation.key,
+        bulk_rate_proven: target.observation.has_bulk_rate_evidence,
         startup_owner_allowed,
         frontier_clear: model_allows_owner,
         completion_improves,
@@ -592,7 +599,7 @@ fn response_target_can_own_unique_bulk_data_with_epoch(
         lower_owner,
         None,
         ordering_debt,
-        ResponseOrderedTail::new(None, 0).for_candidate(target.key),
+        ResponseOrderedTail::new(None, 0).for_candidate(target.observation.key),
         payload_bytes,
         mux_limits,
         subflow_set,
@@ -611,8 +618,9 @@ pub(super) fn response_target_assigned_product_bytes(target: &ResponseSenderPath
     // Product flight includes frames still pending in the carrier command
     // pipe. Treat the ledger and queue snapshots as overlapping views so the
     // same OwnerData cannot consume calibration credit twice.
-    target.snapshot.product_bytes_in_flight.max(
+    target.observation.snapshot.product_bytes_in_flight.max(
         target
+            .observation
             .snapshot
             .queue_bytes
             .max(target.commands.pending_bytes()),
@@ -625,15 +633,19 @@ pub(super) fn response_same_family_reservoir_for_service(
     payload_bytes: usize,
     mux_limits: MuxLimits,
 ) -> Option<ResponseSameFamilyReservoir> {
-    if !service.is_active
-        || !service.has_bulk_rate_evidence
-        || service.snapshot.active_latency_sensitive_flows > 0
-        || service.snapshot.session_active_latency_sensitive_flows > 0
+    if !service.observation.is_service
+        || !service.observation.has_bulk_rate_evidence
+        || service.observation.snapshot.active_latency_sensitive_flows > 0
+        || service
+            .observation
+            .snapshot
+            .session_active_latency_sensitive_flows
+            > 0
     {
         return None;
     }
     let service_horizon = bulk_service_horizon_payload_bytes(payload_bytes, mux_limits);
-    let service_assigned = service.owner_data_in_flight_bytes;
+    let service_assigned = service.observation.owner_data_in_flight_bytes;
     // Same-family proven paths may drain a bulk backlog concurrently, but a
     // full resource envelope can become tens of MiB of receiver-prefix debt.
     // The BBR-shaped feed reservoir preserves aggregation headroom while
@@ -641,7 +653,7 @@ pub(super) fn response_same_family_reservoir_for_service(
     let ordered_reservoir = bulk_service_feed_reservoir_payload_bytes(payload_bytes, mux_limits);
 
     ResponseSameFamilyReservoir::new(
-        service.key,
+        service.observation.key,
         ordered_tail,
         service_assigned,
         service_horizon,
@@ -654,12 +666,16 @@ pub(super) fn response_target_is_same_family_reservoir_candidate(
     reservoir: ResponseSameFamilyReservoir,
     target: &ResponseSenderPathTarget,
 ) -> bool {
-    target.key != reservoir.service()
-        && target.key.underlay == reservoir.service().underlay
-        && !target.is_active
-        && target.has_bulk_rate_evidence
-        && target.snapshot.active_latency_sensitive_flows == 0
-        && target.snapshot.session_active_latency_sensitive_flows == 0
+    target.observation.key != reservoir.service()
+        && target.observation.key.underlay == reservoir.service().underlay
+        && !target.observation.is_service
+        && target.observation.has_bulk_rate_evidence
+        && target.observation.snapshot.active_latency_sensitive_flows == 0
+        && target
+            .observation
+            .snapshot
+            .session_active_latency_sensitive_flows
+            == 0
 }
 
 pub(super) fn response_same_family_reservoir_candidate_debt(
@@ -669,7 +685,10 @@ pub(super) fn response_same_family_reservoir_candidate_debt(
     // The global tail contains unique OwnerData. Subtract only this candidate's
     // unique share; generic carrier admission separately keeps every OwnerData
     // and RepairData copy charged as product flight.
-    reservoir.for_candidate(target.key, target.owner_data_in_flight_bytes)
+    reservoir.for_candidate(
+        target.observation.key,
+        target.observation.owner_data_in_flight_bytes,
+    )
 }
 
 pub(super) fn response_target_has_emission_credit(
@@ -704,8 +723,9 @@ pub(super) fn response_service_has_assigned_owner_credit(
     // an independent queue-pressure fallback for incomplete/synthetic
     // snapshots, but use a union-style maximum so those views cannot charge
     // the same assigned OwnerData twice against hard Service credit.
-    let assigned = target.snapshot.product_bytes_in_flight.max(
+    let assigned = target.observation.snapshot.product_bytes_in_flight.max(
         target
+            .observation
             .snapshot
             .queue_bytes
             .max(target.commands.pending_bytes()),
@@ -718,14 +738,14 @@ pub(super) fn response_service_emission_credit_bytes(
     payload_bytes: usize,
     mux_limits: MuxLimits,
 ) -> usize {
-    if !target.has_service_feed_evidence {
+    if !target.observation.has_service_feed_evidence {
         return response_service_startup_emission_credit_bytes(
-            target.key.underlay,
+            target.observation.key.underlay,
             payload_bytes,
             mux_limits,
         );
     }
-    if target.snapshot.active_latency_sensitive_flows > 0 {
+    if target.observation.snapshot.active_latency_sensitive_flows > 0 {
         return usize::try_from(bulk_latency_pressure_service_feed_window_bytes(
             payload_bytes,
             mux_limits,
@@ -735,7 +755,7 @@ pub(super) fn response_service_emission_credit_bytes(
         .max(1);
     }
     usize::try_from(bulk_active_service_product_envelope_bytes(
-        target.snapshot,
+        target.observation.snapshot,
         payload_bytes,
         mux_limits,
     ))
@@ -751,16 +771,16 @@ pub(super) fn response_target_emission_credit_bytes(
     mux_limits: MuxLimits,
 ) -> usize {
     if lane.is_bulk() {
-        if target.is_active {
+        if target.observation.is_service {
             return response_service_emission_credit_bytes(target, payload_bytes, mux_limits);
         }
-        if target.key.underlay == UnderlayProtocol::Udp {
+        if target.observation.key.underlay == UnderlayProtocol::Udp {
             return response_quic_carrier_feed_credit_bytes(target, payload_bytes, mux_limits);
         }
     }
-    adaptive_reliable_relay_inflight_bytes(Some(target.snapshot), lane, mux_limits)
+    adaptive_reliable_relay_inflight_bytes(Some(target.observation.snapshot), lane, mux_limits)
         .max(reliable_relay_scheduler_quantum_cap(
-            Some(target.snapshot),
+            Some(target.observation.snapshot),
             lane,
             mux_limits,
         ))
@@ -792,14 +812,15 @@ pub(super) fn response_quic_carrier_feed_credit_bytes(
         .min(usize::try_from(mux_limits.max_stream_window_bytes).unwrap_or(usize::MAX))
         .max(payload_bytes)
         .max(1);
-    let carrier_window = usize::try_from(target.snapshot.inflight_limit_bytes)
+    let carrier_window = usize::try_from(target.observation.snapshot.inflight_limit_bytes)
         .unwrap_or(usize::MAX)
         .max(reliable_bulk_carrier_feed_quantum_bytes(mux_limits));
     let live_carrier_debt = usize::try_from(
         target
+            .observation
             .snapshot
             .bytes_in_flight
-            .saturating_add(target.snapshot.queue_bytes),
+            .saturating_add(target.observation.snapshot.queue_bytes),
     )
     .unwrap_or(usize::MAX);
     product_envelope

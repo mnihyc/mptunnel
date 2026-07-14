@@ -4,9 +4,41 @@
 //! typed evidence and pure calculations shared by those transactions and the
 //! sender planner; it owns no locks, channels, timers, or carrier handles.
 
-use crate::model::path::CarrierPathKey;
-use crate::protocol::UnderlayProtocol;
+use crate::model::path::{CarrierPathInstanceId, CarrierPathKey};
+use crate::protocol::{StreamOpenRole, UnderlayProtocol};
 use crate::scheduler::{PathRateScope, PathSnapshot};
+
+/// One coherent response-path observation consumed by carrier-neutral policy.
+///
+/// Runtime command senders and TCP/QUIC controller state deliberately stay out
+/// of this value. Physical identity remains present so a decision can return an
+/// exact, generation-fenced intent instead of a live carrier handle.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct ResponsePathObservation {
+    pub(crate) key: CarrierPathKey,
+    pub(crate) path_instance_id: CarrierPathInstanceId,
+    pub(crate) incarnation: u64,
+    pub(crate) attachment_role: StreamOpenRole,
+    pub(crate) snapshot: PathSnapshot,
+    pub(crate) owner_data_in_flight_bytes: u64,
+    pub(crate) command_pending_bytes: u64,
+    pub(crate) eta_ms: f64,
+    /// True only for the persistent response Service owner.
+    pub(crate) is_service: bool,
+    /// Request Active and response Service are independent directional roles.
+    pub(crate) is_request_active: bool,
+    pub(crate) has_sender_evidence: bool,
+    pub(crate) has_service_feed_evidence: bool,
+    pub(crate) has_bulk_rate_evidence: bool,
+}
+
+/// Completion baseline used by response bulk-admission policy.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct ResponseBulkLead {
+    pub(crate) key: CarrierPathKey,
+    pub(crate) snapshot: PathSnapshot,
+    pub(crate) eta_ms: f64,
+}
 
 /// Product offset debt attributed to the carrier that owns the oldest range.
 #[derive(Debug, Clone, Copy)]

@@ -8,6 +8,7 @@ use super::evidence::ServerPathMetricsEntry;
 use crate::lab_diagnostics::lab_diagnostic;
 use crate::model::capacity::QuicCapacityProofCandidate;
 use crate::model::path::{CarrierPathInstanceId, CarrierPathKey};
+use crate::model::response::ResponsePathObservation;
 #[cfg(feature = "lab-diagnostics")]
 use crate::protocol::SessionId;
 use crate::protocol::{PathId, StreamOpenRole, UnderlayProtocol};
@@ -793,27 +794,8 @@ pub(in crate::runtime) struct ResponseSenderPathTarget {
     pub(in crate::runtime) session_id: SessionId,
     #[cfg(feature = "lab-diagnostics")]
     pub(in crate::runtime) binding_instance_id: u64,
-    pub(in crate::runtime) key: CarrierPathKey,
-    pub(in crate::runtime) path_instance_id: CarrierPathInstanceId,
-    pub(in crate::runtime) incarnation: u64,
+    pub(in crate::runtime) observation: ResponsePathObservation,
     pub(in crate::runtime) commands: ReliablePathCommandSender,
-    pub(in crate::runtime) attachment_role: StreamOpenRole,
-    pub(in crate::runtime) snapshot: PathSnapshot,
-    pub(in crate::runtime) owner_data_in_flight_bytes: u64,
-    /// Once-captured command pressure used by both projection and commit
-    /// revalidation; equality is a value fingerprint, not a queue generation.
-    pub(in crate::runtime) command_pending_bytes: u64,
-    pub(in crate::runtime) eta_ms: f64,
-    /// True only for the persistent response Service snapshot.
-    pub(in crate::runtime) is_active: bool,
-    /// Request-side Active is independent from response Service ownership.
-    pub(in crate::runtime) is_request_active: bool,
-    pub(in crate::runtime) has_sender_evidence: bool,
-    /// Current-Service feed may use unique product ACK progress or durable
-    /// app-limited carrier ACK progress; optional paths still require strict
-    /// bulk-rate evidence below.
-    pub(in crate::runtime) has_service_feed_evidence: bool,
-    pub(in crate::runtime) has_bulk_rate_evidence: bool,
     /// Endpoint-only configuration plus an immature candidate ACK model may
     /// use Service only as a bounded calibration-opportunity prior.
     pub(in crate::runtime) endpoint_only_service_prior_eligible: bool,
@@ -843,12 +825,12 @@ pub(in crate::runtime) struct ResponseDispatchTarget {
 impl From<ResponseSenderPathTarget> for ResponseDispatchTarget {
     fn from(target: ResponseSenderPathTarget) -> Self {
         Self {
-            key: target.key,
-            path_instance_id: target.path_instance_id,
-            incarnation: target.incarnation,
+            key: target.observation.key,
+            path_instance_id: target.observation.path_instance_id,
+            incarnation: target.observation.incarnation,
             commands: target.commands,
-            attachment_role: target.attachment_role,
-            has_bulk_rate_evidence: target.has_bulk_rate_evidence,
+            attachment_role: target.observation.attachment_role,
+            has_bulk_rate_evidence: target.observation.has_bulk_rate_evidence,
         }
     }
 }
@@ -856,12 +838,12 @@ impl From<ResponseSenderPathTarget> for ResponseDispatchTarget {
 impl From<&ResponseSenderPathTarget> for ResponseDispatchTarget {
     fn from(target: &ResponseSenderPathTarget) -> Self {
         Self {
-            key: target.key,
-            path_instance_id: target.path_instance_id,
-            incarnation: target.incarnation,
+            key: target.observation.key,
+            path_instance_id: target.observation.path_instance_id,
+            incarnation: target.observation.incarnation,
             commands: target.commands.clone(),
-            attachment_role: target.attachment_role,
-            has_bulk_rate_evidence: target.has_bulk_rate_evidence,
+            attachment_role: target.observation.attachment_role,
+            has_bulk_rate_evidence: target.observation.has_bulk_rate_evidence,
         }
     }
 }

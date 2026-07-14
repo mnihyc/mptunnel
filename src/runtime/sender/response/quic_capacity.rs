@@ -41,9 +41,10 @@ pub(super) fn response_quic_capacity_calibration_geometry(
     let fresh_strict_window = sample_floor.saturating_sub(packet_accounting_slack).max(1);
     let timing_slack = CAPACITY_TIMING_SLACK_BYTES;
     let carrier_window = target
+        .observation
         .snapshot
         .inflight_limit_bytes
-        .max(target.snapshot.bytes_in_flight);
+        .max(target.observation.snapshot.bytes_in_flight);
     let session_envelope = reliable_capacity_calibration_session_limit_bytes(mux_limits);
     let required_train = carrier_window
         .checked_add(fresh_strict_window)
@@ -92,11 +93,12 @@ pub(super) fn response_quic_capacity_calibration_lease(
     target: &ResponseSenderPathTarget,
     train_bytes: usize,
 ) -> Duration {
-    let pto = transport_pto_from_snapshot(Some(target.snapshot));
+    let pto = transport_pto_from_snapshot(Some(target.observation.snapshot));
     let pacing_rate_bps = target
+        .observation
         .snapshot
         .pacing_rate_bps
-        .max(target.snapshot.delivery_rate_bps)
+        .max(target.observation.snapshot.delivery_rate_bps)
         .max(1.0);
     let transmit_eta = Duration::from_secs_f64(train_bytes as f64 * 8.0 / pacing_rate_bps);
     // A healthy BBR startup grows within the persistent-congestion horizon.
@@ -108,8 +110,9 @@ pub(super) fn response_quic_capacity_calibration_lease(
 }
 
 pub(super) fn response_quic_capacity_proof_validity(target: &ResponseSenderPathTarget) -> Duration {
-    let srtt = Duration::from_secs_f64((target.snapshot.srtt_ms.max(1.0)) / 1_000.0);
-    let rttvar = Duration::from_secs_f64((target.snapshot.jitter_ms.max(1.0)) / 1_000.0);
+    let srtt = Duration::from_secs_f64((target.observation.snapshot.srtt_ms.max(1.0)) / 1_000.0);
+    let rttvar =
+        Duration::from_secs_f64((target.observation.snapshot.jitter_ms.max(1.0)) / 1_000.0);
     quic_bulk_proof_freshness_horizon(srtt, rttvar)
 }
 
@@ -150,10 +153,10 @@ pub(super) fn try_start_response_quic_capacity_calibration(
             expected_planner_generation: planner_generation,
             expected_lane_generation: lane_generation,
             expected_model_generation: model_generation,
-            target: target.key,
-            target_path_instance_id: target.path_instance_id,
-            target_incarnation: target.incarnation,
-            target_pending_bytes: target.command_pending_bytes,
+            target: target.observation.key,
+            target_path_instance_id: target.observation.path_instance_id,
+            target_incarnation: target.observation.incarnation,
+            target_pending_bytes: target.observation.command_pending_bytes,
             train_bytes,
             sample_floor_bytes: geometry.sample_floor_bytes,
             accounting_slack_bytes: geometry.accounting_slack_bytes,
@@ -208,12 +211,18 @@ pub(super) fn select_response_quic_capacity_calibration_target(
         return None;
     }
     let service_key = ordered_data_owner?;
-    let service = targets.iter().find(|target| target.key == service_key)?;
-    if service.key.underlay != UnderlayProtocol::Tcp
-        || !service.is_active
-        || !service.has_bulk_rate_evidence
-        || service.snapshot.active_latency_sensitive_flows > 0
-        || service.snapshot.session_active_latency_sensitive_flows > 0
+    let service = targets
+        .iter()
+        .find(|target| target.observation.key == service_key)?;
+    if service.observation.key.underlay != UnderlayProtocol::Tcp
+        || !service.observation.is_service
+        || !service.observation.has_bulk_rate_evidence
+        || service.observation.snapshot.active_latency_sensitive_flows > 0
+        || service
+            .observation
+            .snapshot
+            .session_active_latency_sensitive_flows
+            > 0
         || service_family_loads.for_underlay(UnderlayProtocol::Tcp)
             < service_family_loads
                 .for_underlay(UnderlayProtocol::Udp)
@@ -222,13 +231,13 @@ pub(super) fn select_response_quic_capacity_calibration_target(
         return None;
     }
     if targets.iter().any(|target| {
-        target.key.underlay == UnderlayProtocol::Udp
-            && target.has_bulk_rate_evidence
+        target.observation.key.underlay == UnderlayProtocol::Udp
+            && target.observation.has_bulk_rate_evidence
             && response_snapshot_handoff_mode(
-                service.key.underlay,
-                service.snapshot,
-                target.key.underlay,
-                target.snapshot,
+                service.observation.key.underlay,
+                service.observation.snapshot,
+                target.observation.key.underlay,
+                target.observation.snapshot,
                 service_family_loads,
             )
             .is_some()
@@ -240,18 +249,22 @@ pub(super) fn select_response_quic_capacity_calibration_target(
     targets
         .iter()
         .filter(|target| {
-            target.key.underlay == UnderlayProtocol::Udp
-                && target.attachment_role == StreamOpenRole::Validation
-                && !target.is_active
-                && target.has_sender_evidence
-                && !target.has_bulk_rate_evidence
+            target.observation.key.underlay == UnderlayProtocol::Udp
+                && target.observation.attachment_role == StreamOpenRole::Validation
+                && !target.observation.is_service
+                && target.observation.has_sender_evidence
+                && !target.observation.has_bulk_rate_evidence
                 && target.quic_capacity_calibration_attempts
                     < MAX_RESPONSE_QUIC_CAPACITY_CALIBRATION_ATTEMPTS_PER_PATH
-                && target.command_pending_bytes == 0
-                && target.snapshot.queue_bytes == 0
-                && target.snapshot.bytes_in_flight == 0
-                && target.snapshot.active_latency_sensitive_flows == 0
-                && target.snapshot.session_active_latency_sensitive_flows == 0
+                && target.observation.command_pending_bytes == 0
+                && target.observation.snapshot.queue_bytes == 0
+                && target.observation.snapshot.bytes_in_flight == 0
+                && target.observation.snapshot.active_latency_sensitive_flows == 0
+                && target
+                    .observation
+                    .snapshot
+                    .session_active_latency_sensitive_flows
+                    == 0
                 && target.commands.can_enqueue_lane_now(FlowLane::Throughput)
                 && {
                     let geometry = response_quic_capacity_calibration_geometry(target, mux_limits);
@@ -264,9 +277,13 @@ pub(super) fn select_response_quic_capacity_calibration_target(
         .min_by(|left, right| {
             (left.quic_capacity_calibration_attempts != 0)
                 .cmp(&(right.quic_capacity_calibration_attempts != 0))
-                .then_with(|| left.eta_ms.total_cmp(&right.eta_ms))
-                .then_with(|| carrier_path_key_order(left.key, right.key))
-                .then_with(|| left.incarnation.cmp(&right.incarnation))
+                .then_with(|| left.observation.eta_ms.total_cmp(&right.observation.eta_ms))
+                .then_with(|| carrier_path_key_order(left.observation.key, right.observation.key))
+                .then_with(|| {
+                    left.observation
+                        .incarnation
+                        .cmp(&right.observation.incarnation)
+                })
         })
         .cloned()
 }

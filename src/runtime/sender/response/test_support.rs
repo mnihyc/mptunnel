@@ -1,6 +1,7 @@
 //! Shared response-sender fixtures used while policy tests move to their owners.
 
 use crate::model::path::CarrierPathKey;
+use crate::model::response::ResponsePathObservation;
 use crate::protocol::{PathId, SessionId, StreamOpenRole, UnderlayProtocol};
 use crate::runtime::path::commands::reliable_path_command_channels;
 use crate::runtime::stream::response::{
@@ -27,27 +28,29 @@ pub(in crate::runtime::sender) fn response_target(
         session_id: SessionId(0),
         #[cfg(feature = "lab-diagnostics")]
         binding_instance_id: 0,
-        key: CarrierPathKey {
-            underlay,
-            path_id: PathId(path_id),
+        observation: ResponsePathObservation {
+            key: CarrierPathKey {
+                underlay,
+                path_id: PathId(path_id),
+            },
+            path_instance_id: next_server_carrier_path_instance_id(),
+            incarnation: u64::from(path_id) + 1,
+            attachment_role: if is_active {
+                StreamOpenRole::Active
+            } else {
+                StreamOpenRole::Validation
+            },
+            snapshot,
+            owner_data_in_flight_bytes: bytes_in_flight,
+            command_pending_bytes: 0,
+            eta_ms,
+            is_service: is_active,
+            is_request_active: is_active,
+            has_sender_evidence: true,
+            has_service_feed_evidence: true,
+            has_bulk_rate_evidence: true,
         },
-        path_instance_id: next_server_carrier_path_instance_id(),
-        incarnation: u64::from(path_id) + 1,
         commands,
-        attachment_role: if is_active {
-            StreamOpenRole::Active
-        } else {
-            StreamOpenRole::Validation
-        },
-        snapshot,
-        owner_data_in_flight_bytes: bytes_in_flight,
-        command_pending_bytes: 0,
-        eta_ms,
-        is_active,
-        is_request_active: is_active,
-        has_sender_evidence: true,
-        has_service_feed_evidence: true,
-        has_bulk_rate_evidence: true,
         endpoint_only_service_prior_eligible: false,
         quic_capacity_proof: None,
         quic_capacity_calibration_attempts: 0,

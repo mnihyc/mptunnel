@@ -127,9 +127,9 @@ impl ResponseStreamBinding {
         ))
         .unwrap_or(usize::MAX);
         if !self.response_stream_open.load(Ordering::Acquire)
-            || request.target != target.key
-            || request.target_path_instance_id != target.path_instance_id
-            || request.target_incarnation != target.incarnation
+            || request.target != target.observation.key
+            || request.target_path_instance_id != target.observation.path_instance_id
+            || request.target_incarnation != target.observation.incarnation
             || request.train_bytes == 0
             || request.train_bytes > session_envelope
             || request.proof_validity.is_zero()

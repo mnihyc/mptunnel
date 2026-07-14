@@ -28,7 +28,7 @@ use crate::model::capacity::{
     product_delivery_samples_override_startup_prior,
 };
 use crate::model::path::CarrierPathKey;
-use crate::model::response::ResponseServiceFamilyLoads;
+use crate::model::response::{ResponsePathObservation, ResponseServiceFamilyLoads};
 use crate::model::timing::transport_pto_from_snapshot;
 use crate::mux::MuxLimits;
 use crate::protocol::{SessionId, StreamOpenRole, UnderlayProtocol};
@@ -308,27 +308,29 @@ impl ResponseStreamBinding {
                     session_id: self.session_id,
                     #[cfg(feature = "lab-diagnostics")]
                     binding_instance_id: self.binding_instance_id,
-                    key: entry.key,
-                    path_instance_id: entry.path_instance_id,
-                    incarnation: entry.incarnation,
-                    commands: entry.commands.clone(),
-                    attachment_role: entry.role,
-                    snapshot,
-                    owner_data_in_flight_bytes: entry.owner_data_in_flight_bytes,
-                    command_pending_bytes,
-                    eta_ms: server_bulk_output_eta_ms(
-                        entry.key,
+                    observation: ResponsePathObservation {
+                        key: entry.key,
+                        path_instance_id: entry.path_instance_id,
+                        incarnation: entry.incarnation,
+                        attachment_role: entry.role,
                         snapshot,
-                        active_key,
-                        lane,
-                        payload_bytes,
-                        self.mux_limits,
-                    ),
-                    is_active,
-                    is_request_active: Some(entry.key) == request_active_key,
-                    has_sender_evidence: server_output_has_sender_evidence(entry),
-                    has_service_feed_evidence,
-                    has_bulk_rate_evidence,
+                        owner_data_in_flight_bytes: entry.owner_data_in_flight_bytes,
+                        command_pending_bytes,
+                        eta_ms: server_bulk_output_eta_ms(
+                            entry.key,
+                            snapshot,
+                            active_key,
+                            lane,
+                            payload_bytes,
+                            self.mux_limits,
+                        ),
+                        is_service: is_active,
+                        is_request_active: Some(entry.key) == request_active_key,
+                        has_sender_evidence: server_output_has_sender_evidence(entry),
+                        has_service_feed_evidence,
+                        has_bulk_rate_evidence,
+                    },
+                    commands: entry.commands.clone(),
                     endpoint_only_service_prior_eligible,
                     quic_capacity_proof: server_output_quic_capacity_proof_marker(entry),
                     quic_capacity_calibration_attempts: response_snapshot

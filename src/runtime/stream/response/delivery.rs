@@ -547,10 +547,10 @@ impl ResponseStreamBinding {
             return Err(RuntimeError::SenderServiceBlocked);
         }
         let target_matches = outputs.entries.iter().any(|entry| {
-            entry.key == target.key
-                && entry.incarnation == target.incarnation
+            entry.key == target.observation.key
+                && entry.incarnation == target.observation.incarnation
                 && entry.commands.same_channel(&target.commands)
-                && entry.role == target.attachment_role
+                && entry.role == target.observation.attachment_role
         });
         if !target_matches {
             return Err(RuntimeError::SenderServiceBlocked);
@@ -560,9 +560,9 @@ impl ResponseStreamBinding {
             .try_enqueue_admitted_frame(frame.clone(), lane)?;
         self.record_product_flight_with_outputs(
             &mut outputs,
-            target.key,
-            target.incarnation,
-            target.attachment_role,
+            target.observation.key,
+            target.observation.incarnation,
+            target.observation.attachment_role,
             &target.commands,
             frame,
             CarrierWorkKind::RepairData,

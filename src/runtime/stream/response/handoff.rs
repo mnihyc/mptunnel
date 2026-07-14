@@ -90,24 +90,24 @@ impl ResponseStreamBinding {
             || self
                 .response_service_handoff_drain_attempted
                 .load(Ordering::Acquire)
-            || request.service != service.key
-            || request.service_path_instance_id != service.path_instance_id
-            || request.service_incarnation != service.incarnation
-            || request.target != target.key
-            || request.target_path_instance_id != target.path_instance_id
-            || request.target_incarnation != target.incarnation
+            || request.service != service.observation.key
+            || request.service_path_instance_id != service.observation.path_instance_id
+            || request.service_incarnation != service.observation.incarnation
+            || request.target != target.observation.key
+            || request.target_path_instance_id != target.observation.path_instance_id
+            || request.target_incarnation != target.observation.incarnation
             || request.capacity_proof.is_some_and(|proof| {
-                target.key.underlay != UnderlayProtocol::Udp
+                target.observation.key.underlay != UnderlayProtocol::Udp
                     || !valid_quic_capacity_proof_candidate_at(proof, now)
             })
             || request.service.underlay == request.target.underlay
-            || !service.is_active
-            || !service.has_bulk_rate_evidence
-            || target.is_active
-            || !target.has_bulk_rate_evidence
-            || target.attachment_role != StreamOpenRole::Validation
-            || target.owner_data_in_flight_bytes != 0
-            || target.snapshot.product_bytes_in_flight != 0
+            || !service.observation.is_service
+            || !service.observation.has_bulk_rate_evidence
+            || target.observation.is_service
+            || !target.observation.has_bulk_rate_evidence
+            || target.observation.attachment_role != StreamOpenRole::Validation
+            || target.observation.owner_data_in_flight_bytes != 0
+            || target.observation.snapshot.product_bytes_in_flight != 0
         {
             return false;
         }

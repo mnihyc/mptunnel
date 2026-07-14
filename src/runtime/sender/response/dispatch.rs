@@ -299,20 +299,20 @@ pub(super) fn emit_response_frame_from_sender_service(
                         record_server_sender_decision(
                             binding.session_id(),
                             stream.stream_id,
-                            target.key,
+                            target.observation.key,
                             &frame,
                             lane,
                             reason,
-                            Some(target.has_bulk_rate_evidence),
+                            Some(target.observation.has_bulk_rate_evidence),
                         );
-                        return Ok(Some(target.key));
+                        return Ok(Some(target.observation.key));
                     }
                     Err(RuntimeError::SenderServiceBlocked) => {
                         return Err(RuntimeError::SenderServiceBlocked);
                     }
                     Err(err) => {
                         last_error = Some(err);
-                        binding.detach(target.key, &target.commands);
+                        binding.detach(target.observation.key, &target.commands);
                     }
                 }
             }

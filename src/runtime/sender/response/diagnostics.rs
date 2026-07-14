@@ -1,5 +1,5 @@
 use super::admission::{
-    ResponseBulkLead, response_owner_bulk_model_suppression, response_target_emission_credit_bytes,
+    response_owner_bulk_model_suppression, response_target_emission_credit_bytes,
     response_target_has_emission_credit,
 };
 use super::planner::{
@@ -12,6 +12,7 @@ use crate::lab_diagnostics::{lab_diagnostic, lab_diagnostic_event_enabled};
 use crate::model::admission::{BulkAdmissionRole, BulkExplorationCompletionProjection};
 use crate::model::multipath::PathAdmission;
 use crate::model::path::{CarrierPathKey, carrier_path_key_order};
+use crate::model::response::ResponseBulkLead;
 use crate::model::response::{CarrierPathFlightDebt, ResponseServiceFamilyLoads};
 use crate::mux::MuxLimits;
 use crate::protocol::{StreamOpenRole, UnderlayProtocol};
@@ -65,32 +66,32 @@ pub(super) fn lab_response_bulk_output_candidate(
             reason,
             target.session_id.0,
             target.binding_instance_id,
-            target.key.underlay,
-            target.key.path_id.0,
-            target.is_active,
-            target.has_sender_evidence,
-            target.has_bulk_rate_evidence,
+            target.observation.key.underlay,
+            target.observation.key.path_id.0,
+            target.observation.is_service,
+            target.observation.has_sender_evidence,
+            target.observation.has_bulk_rate_evidence,
             diag.role
                 .map(|role| format!("{:?}", role))
                 .unwrap_or_else(|| "none".to_string()),
-            target.eta_ms,
+            target.observation.eta_ms,
             lead_underlay,
             lead_path_id,
             lead_eta_ms,
             diag.ordering_debt,
             payload_bytes,
-            target.command_pending_bytes,
-            target.snapshot.queue_bytes,
-            target.snapshot.product_queue_bytes,
-            target.snapshot.bytes_in_flight,
-            target.snapshot.product_bytes_in_flight,
-            target.owner_data_in_flight_bytes,
-            target.snapshot.inflight_limit_bytes,
-            target.snapshot.delivery_rate_bps / 1_000_000.0,
-            target.snapshot.pacing_rate_bps / 1_000_000.0,
-            target.snapshot.srtt_ms,
-            target.snapshot.confidence,
-            target.snapshot.app_limited,
+            target.observation.command_pending_bytes,
+            target.observation.snapshot.queue_bytes,
+            target.observation.snapshot.product_queue_bytes,
+            target.observation.snapshot.bytes_in_flight,
+            target.observation.snapshot.product_bytes_in_flight,
+            target.observation.owner_data_in_flight_bytes,
+            target.observation.snapshot.inflight_limit_bytes,
+            target.observation.snapshot.delivery_rate_bps / 1_000_000.0,
+            target.observation.snapshot.pacing_rate_bps / 1_000_000.0,
+            target.observation.snapshot.srtt_ms,
+            target.observation.snapshot.confidence,
+            target.observation.snapshot.app_limited,
             target.ack_clock_calibration_eligible,
             target.ack_clock_calibration_proven,
             target.ack_clock_calibration_active,
@@ -125,17 +126,17 @@ pub(super) fn lab_response_bulk_output_selected(
             reason,
             target.session_id.0,
             target.binding_instance_id,
-            target.key.underlay,
-            target.key.path_id.0,
+            target.observation.key.underlay,
+            target.observation.key.path_id.0,
             admission.role,
             admission.work,
             payload_bytes,
-            target.command_pending_bytes,
-            target.snapshot.product_bytes_in_flight,
-            target.owner_data_in_flight_bytes,
-            target.eta_ms,
-            target.snapshot.app_limited,
-            target.has_bulk_rate_evidence,
+            target.observation.command_pending_bytes,
+            target.observation.snapshot.product_bytes_in_flight,
+            target.observation.owner_data_in_flight_bytes,
+            target.observation.eta_ms,
+            target.observation.snapshot.app_limited,
+            target.observation.has_bulk_rate_evidence,
             target.ack_clock_calibration_eligible,
             target.ack_clock_calibration_proven,
             target.ack_clock_calibration_active,
@@ -164,10 +165,10 @@ pub(super) fn lab_response_ack_clock_calibration_admission(
             "session_id={} binding_instance_id={} path_underlay={:?} path_id={} service_underlay={:?} service_path_id={} admitted={} uses_service_prior={} candidate_completion_ms={:.3} service_reservoir_horizon_ms={:.3} exploration_bytes={} service_followup_bytes={} candidate_eta_ms={:.3} service_eta_ms={:.3} candidate_rate_mbps={:.3} service_rate_mbps={:.3} candidate_srtt_ms={:.3} service_srtt_ms={:.3}",
             target.session_id.0,
             target.binding_instance_id,
-            target.key.underlay,
-            target.key.path_id.0,
-            service.key.underlay,
-            service.key.path_id.0,
+            target.observation.key.underlay,
+            target.observation.key.path_id.0,
+            service.observation.key.underlay,
+            service.observation.key.path_id.0,
             admitted,
             uses_service_prior,
             projection.candidate_completion_ms,
@@ -175,18 +176,19 @@ pub(super) fn lab_response_ack_clock_calibration_admission(
             projection.exploration_bytes,
             projection.service_followup_bytes,
             candidate_eta_ms,
-            service.eta_ms,
+            service.observation.eta_ms,
             candidate_snapshot
                 .delivery_rate_bps
                 .max(candidate_snapshot.pacing_rate_bps)
                 / 1_000_000.0,
             service
+                .observation
                 .snapshot
                 .delivery_rate_bps
-                .max(service.snapshot.pacing_rate_bps)
+                .max(service.observation.snapshot.pacing_rate_bps)
                 / 1_000_000.0,
             candidate_snapshot.srtt_ms,
-            service.snapshot.srtt_ms,
+            service.observation.snapshot.srtt_ms,
         ),
     );
 }
@@ -211,7 +213,7 @@ fn response_quic_capacity_marker_state(
     target: &ResponseSenderPathTarget,
     now: Instant,
 ) -> &'static str {
-    if target.key.underlay != UnderlayProtocol::Udp {
+    if target.observation.key.underlay != UnderlayProtocol::Udp {
         return "not_udp";
     }
     match target.quic_capacity_proof {
@@ -233,7 +235,7 @@ pub(super) fn response_service_handoff_diagnostic_target_view(
 ) -> Option<ResponseSenderPathTarget> {
     response_service_handoff_target_view(
         target,
-        service.key,
+        service.observation.key,
         lane,
         payload_bytes,
         mux_limits,
@@ -260,7 +262,7 @@ fn evaluate_response_service_handoff_target<'a>(
     };
     let Some(target_view) = response_service_handoff_target_view(
         target,
-        service.key,
+        service.observation.key,
         lane,
         payload_bytes,
         mux_limits,
@@ -270,16 +272,16 @@ fn evaluate_response_service_handoff_target<'a>(
         return failed(0, "drain_target_changed");
     };
     let effective_target = &target_view;
-    if effective_target.key.underlay == service.key.underlay {
+    if effective_target.observation.key.underlay == service.observation.key.underlay {
         return failed(1, "same_carrier_family");
     }
-    if effective_target.attachment_role != StreamOpenRole::Validation {
+    if effective_target.observation.attachment_role != StreamOpenRole::Validation {
         return failed(2, "target_role");
     }
-    if effective_target.is_active {
+    if effective_target.observation.is_service {
         return failed(3, "target_is_service");
     }
-    if !effective_target.has_bulk_rate_evidence {
+    if !effective_target.observation.has_bulk_rate_evidence {
         let gate = match response_quic_capacity_marker_state(target, now) {
             "expired" => "target_proof_expired",
             "invalid" => "target_proof_invalid",
@@ -287,16 +289,27 @@ fn evaluate_response_service_handoff_target<'a>(
         };
         return failed(4, gate);
     }
-    if effective_target.owner_data_in_flight_bytes != 0 {
+    if effective_target.observation.owner_data_in_flight_bytes != 0 {
         return failed(5, "target_owner_flight");
     }
-    if effective_target.snapshot.product_bytes_in_flight != 0 {
+    if effective_target
+        .observation
+        .snapshot
+        .product_bytes_in_flight
+        != 0
+    {
         return failed(6, "target_product_flight");
     }
-    if effective_target.snapshot.active_latency_sensitive_flows != 0 {
+    if effective_target
+        .observation
+        .snapshot
+        .active_latency_sensitive_flows
+        != 0
+    {
         return failed(7, "target_path_latency_load");
     }
     if effective_target
+        .observation
         .snapshot
         .session_active_latency_sensitive_flows
         != 0
@@ -314,9 +327,9 @@ fn evaluate_response_service_handoff_target<'a>(
     let model_suppression = response_owner_bulk_model_suppression(
         effective_target,
         ResponseBulkLead {
-            key: service.key,
-            snapshot: service.snapshot,
-            eta_ms: service.eta_ms,
+            key: service.observation.key,
+            snapshot: service.observation.snapshot,
+            eta_ms: service.observation.eta_ms,
         },
         None,
         0,
@@ -361,12 +374,12 @@ pub(super) fn evaluate_response_service_handoff<'a>(
     another_binding_is_draining: bool,
     now: Instant,
 ) -> ResponseServiceHandoffEvaluation<'a> {
-    let service =
-        ordered_data_owner.and_then(|key| targets.iter().find(|target| target.key == key));
+    let service = ordered_data_owner
+        .and_then(|key| targets.iter().find(|target| target.observation.key == key));
     let preferred_target = service.and_then(|service| {
         targets
             .iter()
-            .filter(|target| target.key.underlay != service.key.underlay)
+            .filter(|target| target.observation.key.underlay != service.observation.key.underlay)
             .min_by(|left, right| {
                 let marker_rank =
                     |target: &ResponseSenderPathTarget| match response_quic_capacity_marker_state(
@@ -379,8 +392,10 @@ pub(super) fn evaluate_response_service_handoff<'a>(
                     };
                 marker_rank(left)
                     .cmp(&marker_rank(right))
-                    .then_with(|| left.eta_ms.total_cmp(&right.eta_ms))
-                    .then_with(|| carrier_path_key_order(left.key, right.key))
+                    .then_with(|| left.observation.eta_ms.total_cmp(&right.observation.eta_ms))
+                    .then_with(|| {
+                        carrier_path_key_order(left.observation.key, right.observation.key)
+                    })
             })
     });
     let blocked = |first_failed_gate| ResponseServiceHandoffEvaluation {
@@ -407,26 +422,34 @@ pub(super) fn evaluate_response_service_handoff<'a>(
     let Some(service_key) = ordered_data_owner else {
         return blocked("no_frontier");
     };
-    let Some(service) = targets.iter().find(|target| target.key == service_key) else {
+    let Some(service) = targets
+        .iter()
+        .find(|target| target.observation.key == service_key)
+    else {
         return blocked("service_missing");
     };
     if required_reservation.is_some_and(|reservation| {
-        reservation.service != service.key
-            || reservation.service_path_instance_id != service.path_instance_id
-            || reservation.service_incarnation != service.incarnation
+        reservation.service != service.observation.key
+            || reservation.service_path_instance_id != service.observation.path_instance_id
+            || reservation.service_incarnation != service.observation.incarnation
     }) {
         return blocked("drain_service_changed");
     }
-    if !service.is_active {
+    if !service.observation.is_service {
         return blocked("service_not_active");
     }
-    if !service.has_bulk_rate_evidence {
+    if !service.observation.has_bulk_rate_evidence {
         return blocked("service_proof_missing");
     }
-    if service.snapshot.active_latency_sensitive_flows != 0 {
+    if service.observation.snapshot.active_latency_sensitive_flows != 0 {
         return blocked("service_path_latency_load");
     }
-    if service.snapshot.session_active_latency_sensitive_flows != 0 {
+    if service
+        .observation
+        .snapshot
+        .session_active_latency_sensitive_flows
+        != 0
+    {
         return blocked("service_session_latency_load");
     }
 
@@ -447,9 +470,15 @@ pub(super) fn evaluate_response_service_handoff<'a>(
             if best_eligible.is_none_or(|current| {
                 evaluation
                     .target
+                    .observation
                     .eta_ms
-                    .total_cmp(&current.target.eta_ms)
-                    .then_with(|| carrier_path_key_order(evaluation.target.key, current.target.key))
+                    .total_cmp(&current.target.observation.eta_ms)
+                    .then_with(|| {
+                        carrier_path_key_order(
+                            evaluation.target.observation.key,
+                            current.target.observation.key,
+                        )
+                    })
                     .is_lt()
             }) {
                 best_eligible = Some(evaluation);
@@ -501,9 +530,13 @@ fn response_service_handoff_capacity_marker_signature(
         let Some(proof) = target.quic_capacity_proof else {
             continue;
         };
-        target.key.path_id.0.hash(&mut signature);
-        (target.key.underlay == UnderlayProtocol::Udp).hash(&mut signature);
-        target.path_instance_id.as_u64().hash(&mut signature);
+        target.observation.key.path_id.0.hash(&mut signature);
+        (target.observation.key.underlay == UnderlayProtocol::Udp).hash(&mut signature);
+        target
+            .observation
+            .path_instance_id
+            .as_u64()
+            .hash(&mut signature);
         proof.token.hash(&mut signature);
         (now >= proof.expires_at).hash(&mut signature);
     }
@@ -529,16 +562,24 @@ pub(super) fn response_service_handoff_evaluation_signature(
         .for_underlay(UnderlayProtocol::Udp)
         .hash(&mut signature);
     if let Some(service) = evaluation.service {
-        service.key.path_id.0.hash(&mut signature);
-        (service.key.underlay == UnderlayProtocol::Udp).hash(&mut signature);
-        service.path_instance_id.as_u64().hash(&mut signature);
-        service.incarnation.hash(&mut signature);
+        service.observation.key.path_id.0.hash(&mut signature);
+        (service.observation.key.underlay == UnderlayProtocol::Udp).hash(&mut signature);
+        service
+            .observation
+            .path_instance_id
+            .as_u64()
+            .hash(&mut signature);
+        service.observation.incarnation.hash(&mut signature);
     }
     if let Some(target) = evaluation.target {
-        target.key.path_id.0.hash(&mut signature);
-        (target.key.underlay == UnderlayProtocol::Udp).hash(&mut signature);
-        target.path_instance_id.as_u64().hash(&mut signature);
-        target.incarnation.hash(&mut signature);
+        target.observation.key.path_id.0.hash(&mut signature);
+        (target.observation.key.underlay == UnderlayProtocol::Udp).hash(&mut signature);
+        target
+            .observation
+            .path_instance_id
+            .as_u64()
+            .hash(&mut signature);
+        target.observation.incarnation.hash(&mut signature);
     }
     signature.finish()
 }
@@ -615,16 +656,18 @@ pub(super) fn lab_response_service_handoff_evaluation(
     let target = effective_target_storage.as_ref().or(raw_target);
     let service_bulk_flows = service.map(|service| {
         service
+            .observation
             .snapshot
             .active_flows
-            .saturating_sub(service.snapshot.active_latency_sensitive_flows)
+            .saturating_sub(service.observation.snapshot.active_latency_sensitive_flows)
             .max(1)
     });
     let target_bulk_flows = target.map(|target| {
         target
+            .observation
             .snapshot
             .active_flows
-            .saturating_sub(target.snapshot.active_latency_sensitive_flows)
+            .saturating_sub(target.observation.snapshot.active_latency_sensitive_flows)
             .saturating_add(1)
             .max(1)
     });
@@ -663,7 +706,7 @@ pub(super) fn lab_response_service_handoff_evaluation(
         "pinned"
     } else if effective_proof.is_some() {
         "current"
-    } else if target.is_some_and(|target| target.has_bulk_rate_evidence) {
+    } else if target.is_some_and(|target| target.observation.has_bulk_rate_evidence) {
         "generic"
     } else {
         "none"
@@ -690,60 +733,106 @@ pub(super) fn lab_response_service_handoff_evaluation(
             ordered_owner_debt_bytes,
             lower_flights.len(),
             lower_flight_bytes,
-            service.map_or_else(unknown, |service| format!("{:?}", service.key.underlay)),
-            service.map_or_else(unknown, |service| service.key.path_id.0.to_string()),
+            service.map_or_else(unknown, |service| format!(
+                "{:?}",
+                service.observation.key.underlay
+            )),
             service.map_or_else(unknown, |service| service
+                .observation
+                .key
+                .path_id
+                .0
+                .to_string()),
+            service.map_or_else(unknown, |service| service
+                .observation
                 .path_instance_id
                 .as_u64()
                 .to_string()),
-            service.map_or_else(unknown, |service| format!("{:?}", service.attachment_role)),
-            service.map_or_else(unknown, |service| service.command_pending_bytes.to_string()),
-            service.map_or_else(unknown, |service| service.snapshot.queue_bytes.to_string()),
+            service.map_or_else(unknown, |service| format!(
+                "{:?}",
+                service.observation.attachment_role
+            )),
             service.map_or_else(unknown, |service| service
+                .observation
+                .command_pending_bytes
+                .to_string()),
+            service.map_or_else(unknown, |service| service
+                .observation
+                .snapshot
+                .queue_bytes
+                .to_string()),
+            service.map_or_else(unknown, |service| service
+                .observation
                 .snapshot
                 .bytes_in_flight
                 .to_string()),
             service.map_or_else(unknown, |service| service
+                .observation
                 .owner_data_in_flight_bytes
                 .to_string()),
             service.map_or_else(unknown, |service| service
+                .observation
                 .snapshot
                 .delivery_rate_bps
                 .round()
                 .to_string()),
             service.map_or_else(unknown, |service| {
-                format!("{:?}", service.snapshot.rate_scope)
+                format!("{:?}", service.observation.snapshot.rate_scope)
             }),
             service_bulk_flows.map_or_else(unknown, |flows| flows.to_string()),
             current_share_bps.map_or_else(unknown, |share| share.to_string()),
-            target.map_or_else(unknown, |target| format!("{:?}", target.key.underlay)),
-            target.map_or_else(unknown, |target| target.key.path_id.0.to_string()),
+            target.map_or_else(unknown, |target| format!(
+                "{:?}",
+                target.observation.key.underlay
+            )),
             target.map_or_else(unknown, |target| target
+                .observation
+                .key
+                .path_id
+                .0
+                .to_string()),
+            target.map_or_else(unknown, |target| target
+                .observation
                 .path_instance_id
                 .as_u64()
                 .to_string()),
-            target.map_or_else(unknown, |target| format!("{:?}", target.attachment_role)),
-            target.map_or_else(unknown, |target| target.is_active.to_string()),
-            target.map_or_else(unknown, |target| target.has_bulk_rate_evidence.to_string()),
+            target.map_or_else(unknown, |target| format!(
+                "{:?}",
+                target.observation.attachment_role
+            )),
+            target.map_or_else(unknown, |target| target.observation.is_service.to_string()),
+            target.map_or_else(unknown, |target| target
+                .observation
+                .has_bulk_rate_evidence
+                .to_string()),
             proof_state,
             raw_proof.map_or_else(unknown, |proof| proof.token.to_string()),
             proof_remaining_us,
             effective_proof_state,
             effective_proof.map_or_else(unknown, |proof| proof.token.to_string()),
-            target.map_or_else(unknown, |target| target.command_pending_bytes.to_string()),
-            target_pending.map_or_else(unknown, |pending| pending.to_string()),
-            target.map_or_else(unknown, |target| target.snapshot.queue_bytes.to_string()),
             target.map_or_else(unknown, |target| target
+                .observation
+                .command_pending_bytes
+                .to_string()),
+            target_pending.map_or_else(unknown, |pending| pending.to_string()),
+            target.map_or_else(unknown, |target| target
+                .observation
+                .snapshot
+                .queue_bytes
+                .to_string()),
+            target.map_or_else(unknown, |target| target
+                .observation
                 .snapshot
                 .bytes_in_flight
                 .to_string()),
             target.map_or_else(unknown, |target| target
+                .observation
                 .snapshot
                 .delivery_rate_bps
                 .round()
                 .to_string()),
             target.map_or_else(unknown, |target| {
-                format!("{:?}", target.snapshot.rate_scope)
+                format!("{:?}", target.observation.snapshot.rate_scope)
             }),
             target_bulk_flows.map_or_else(unknown, |flows| flows.to_string()),
             projected_share_bps.map_or_else(unknown, |share| share.to_string()),
@@ -753,10 +842,10 @@ pub(super) fn lab_response_service_handoff_evaluation(
                     response_service_handoff_preserves_fair_share(service, target).to_string()
                 }),
             service.map_or_else(unknown, |service| service_family_loads
-                .for_underlay(service.key.underlay)
+                .for_underlay(service.observation.key.underlay)
                 .to_string()),
             target.map_or_else(unknown, |target| service_family_loads
-                .for_underlay(target.key.underlay)
+                .for_underlay(target.observation.key.underlay)
                 .to_string()),
             evaluation.model_suppression.unwrap_or("none"),
             target_credit.map_or_else(unknown, |credit| credit.to_string()),

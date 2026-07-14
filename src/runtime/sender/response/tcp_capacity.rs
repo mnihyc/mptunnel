@@ -5,8 +5,6 @@
 //! clock. They share TCP policy, not mutable state, and remain separate from QUIC.
 
 #[cfg(feature = "lab-diagnostics")]
-use super::admission::ResponseBulkLead;
-#[cfg(feature = "lab-diagnostics")]
 use super::diagnostics::{
     ResponseBulkCandidateDiag, lab_response_ack_clock_calibration_admission,
     lab_response_bulk_output_candidate,
@@ -27,6 +25,8 @@ use crate::model::capacity::{
 };
 use crate::model::multipath::FlowSubflowSet;
 use crate::model::path::{CarrierPathKey, carrier_path_key_order};
+#[cfg(feature = "lab-diagnostics")]
+use crate::model::response::ResponseBulkLead;
 use crate::model::response::{
     CarrierPathFlightDebt, ResponseServiceFamilyLoads, response_snapshot_handoff_mode,
 };
@@ -86,12 +86,12 @@ pub(super) fn response_tcp_calibration_opportunity_candidate(
     payload_bytes: usize,
     mux_limits: MuxLimits,
 ) -> (PathSnapshot, f64, bool) {
-    let mut snapshot = target.snapshot;
-    let service_rate_bps = service.snapshot.delivery_rate_bps.max(1.0);
+    let mut snapshot = target.observation.snapshot;
+    let service_rate_bps = service.observation.snapshot.delivery_rate_bps.max(1.0);
     let uses_service_prior = target.endpoint_only_service_prior_eligible
         && service_rate_bps > snapshot.delivery_rate_bps;
     if !uses_service_prior {
-        return (snapshot, target.eta_ms, false);
+        return (snapshot, target.observation.eta_ms, false);
     }
 
     // This prior makes a bounded measurement reachable; it is not candidate
@@ -103,9 +103,9 @@ pub(super) fn response_tcp_calibration_opportunity_candidate(
         .inflight_limit_bytes
         .max(bulk_candidate_pipe_bytes(snapshot));
     let eta_ms = server_bulk_output_eta_ms(
-        target.key,
+        target.observation.key,
         snapshot,
-        Some(service.key),
+        Some(service.observation.key),
         lane,
         payload_bytes,
         mux_limits,
@@ -140,8 +140,8 @@ pub(super) fn try_start_response_tcp_capacity_probe(
     };
     let calibration_id = target.commands.try_enqueue_tcp_capacity_probe(
         TcpCapacityProbeRequest {
-            path_id: target.key.path_id,
-            path_instance_id: target.path_instance_id,
+            path_id: target.observation.key.path_id,
+            path_instance_id: target.observation.path_instance_id,
             train_payload_bytes: train_bytes,
             sample_floor_bytes: reliable_subflow_startup_sample_limit_bytes(binding.mux_limits()),
             expires_at,
@@ -157,9 +157,9 @@ pub(super) fn try_start_response_tcp_capacity_probe(
             "phase=started session_id={} binding_instance_id={} path_id={} path_instance_id={} incarnation={} calibration_id={} train_bytes={}",
             target.session_id.0,
             target.binding_instance_id,
-            target.key.path_id.0,
-            target.path_instance_id.as_u64(),
-            target.incarnation,
+            target.observation.key.path_id.0,
+            target.observation.path_instance_id.as_u64(),
+            target.observation.incarnation,
             calibration_id,
             train_bytes,
         ),
@@ -199,23 +199,29 @@ pub(super) fn select_response_tcp_capacity_probe_target(
         return None;
     }
     let service_key = ordered_data_owner?;
-    let service = targets.iter().find(|target| target.key == service_key)?;
-    if service.key.underlay != UnderlayProtocol::Tcp
-        || !service.is_active
-        || !service.has_bulk_rate_evidence
-        || service.snapshot.active_latency_sensitive_flows > 0
-        || service.snapshot.session_active_latency_sensitive_flows > 0
+    let service = targets
+        .iter()
+        .find(|target| target.observation.key == service_key)?;
+    if service.observation.key.underlay != UnderlayProtocol::Tcp
+        || !service.observation.is_service
+        || !service.observation.has_bulk_rate_evidence
+        || service.observation.snapshot.active_latency_sensitive_flows > 0
+        || service
+            .observation
+            .snapshot
+            .session_active_latency_sensitive_flows
+            > 0
     {
         return None;
     }
     if targets.iter().any(|target| {
-        target.key.underlay == UnderlayProtocol::Udp
-            && target.has_bulk_rate_evidence
+        target.observation.key.underlay == UnderlayProtocol::Udp
+            && target.observation.has_bulk_rate_evidence
             && response_snapshot_handoff_mode(
-                service.key.underlay,
-                service.snapshot,
-                target.key.underlay,
-                target.snapshot,
+                service.observation.key.underlay,
+                service.observation.snapshot,
+                target.observation.key.underlay,
+                target.observation.snapshot,
                 service_family_loads,
             )
             .is_some()
@@ -235,26 +241,35 @@ pub(super) fn select_response_tcp_capacity_probe_target(
     targets
         .iter()
         .filter(|target| {
-            target.key != service_key
-                && target.key.underlay == UnderlayProtocol::Tcp
-                && target.attachment_role == StreamOpenRole::Validation
-                && !target.is_active
-                && target.has_sender_evidence
-                && !target.has_bulk_rate_evidence
+            target.observation.key != service_key
+                && target.observation.key.underlay == UnderlayProtocol::Tcp
+                && target.observation.attachment_role == StreamOpenRole::Validation
+                && !target.observation.is_service
+                && target.observation.has_sender_evidence
+                && !target.observation.has_bulk_rate_evidence
                 && !target.commands.tcp_capacity_probe_attempted()
                 && !target.commands.tcp_capacity_probe_active()
-                && target.command_pending_bytes == 0
-                && target.snapshot.queue_bytes == 0
-                && target.snapshot.bytes_in_flight == 0
-                && target.snapshot.active_latency_sensitive_flows == 0
-                && target.snapshot.session_active_latency_sensitive_flows == 0
+                && target.observation.command_pending_bytes == 0
+                && target.observation.snapshot.queue_bytes == 0
+                && target.observation.snapshot.bytes_in_flight == 0
+                && target.observation.snapshot.active_latency_sensitive_flows == 0
+                && target
+                    .observation
+                    .snapshot
+                    .session_active_latency_sensitive_flows
+                    == 0
                 && target.commands.can_enqueue_lane_now(FlowLane::Throughput)
         })
         .min_by(|left, right| {
-            left.eta_ms
-                .total_cmp(&right.eta_ms)
-                .then_with(|| carrier_path_key_order(left.key, right.key))
-                .then_with(|| left.incarnation.cmp(&right.incarnation))
+            left.observation
+                .eta_ms
+                .total_cmp(&right.observation.eta_ms)
+                .then_with(|| carrier_path_key_order(left.observation.key, right.observation.key))
+                .then_with(|| {
+                    left.observation
+                        .incarnation
+                        .cmp(&right.observation.incarnation)
+                })
         })
         .cloned()
         .map(|target| (target, train_bytes))
@@ -283,12 +298,16 @@ pub(super) fn select_response_ack_clock_calibration_target(
     let service = targets
         .iter()
         .copied()
-        .find(|target| target.key == service_key)?;
-    if !service.is_active
-        || !service.has_bulk_rate_evidence
-        || service.key.underlay != UnderlayProtocol::Tcp
-        || service.snapshot.active_latency_sensitive_flows > 0
-        || service.snapshot.session_active_latency_sensitive_flows > 0
+        .find(|target| target.observation.key == service_key)?;
+    if !service.observation.is_service
+        || !service.observation.has_bulk_rate_evidence
+        || service.observation.key.underlay != UnderlayProtocol::Tcp
+        || service.observation.snapshot.active_latency_sensitive_flows > 0
+        || service
+            .observation
+            .snapshot
+            .session_active_latency_sensitive_flows
+            > 0
     {
         return None;
     }
@@ -301,28 +320,34 @@ pub(super) fn select_response_ack_clock_calibration_target(
     let active_identity = all_targets
         .iter()
         .find(|target| target.ack_clock_calibration_active)
-        .map(|target| (target.key, target.incarnation));
+        .map(|target| (target.observation.key, target.observation.incarnation));
 
     targets
         .iter()
         .copied()
         .filter(|target| {
-            active_identity.is_none_or(|identity| identity == (target.key, target.incarnation))
+            active_identity.is_none_or(|identity| {
+                identity == (target.observation.key, target.observation.incarnation)
+            })
         })
         .filter(|target| {
-            target.attachment_role == StreamOpenRole::Validation
-                && target.key != service_key
-                && target.key.underlay == service_key.underlay
-                && !target.is_active
-                && target.has_sender_evidence
-                && target.has_bulk_rate_evidence
+            target.observation.attachment_role == StreamOpenRole::Validation
+                && target.observation.key != service_key
+                && target.observation.key.underlay == service_key.underlay
+                && !target.observation.is_service
+                && target.observation.has_sender_evidence
+                && target.observation.has_bulk_rate_evidence
                 && target.ack_clock_calibration_eligible
                 && !target.ack_clock_calibration_proven
                 && (may_start_fresh_calibration
                     || target.ack_clock_calibration_active
                     || target.ack_clock_calibration_spent_bytes > 0)
-                && target.snapshot.active_latency_sensitive_flows == 0
-                && target.snapshot.session_active_latency_sensitive_flows == 0
+                && target.observation.snapshot.active_latency_sensitive_flows == 0
+                && target
+                    .observation
+                    .snapshot
+                    .session_active_latency_sensitive_flows
+                    == 0
                 && target.ack_clock_calibration_credit_limit_bytes > 0
                 && target.ack_clock_calibration_credit_limit_bytes
                     <= target.ack_clock_calibration_max_limit_bytes
@@ -335,7 +360,7 @@ pub(super) fn select_response_ack_clock_calibration_target(
             // Calibration spends unique OwnerData only. RepairData and carrier
             // queue copies remain real carrier pressure but never consume or
             // preserve this product-ownership fence.
-            let candidate_debt = target.owner_data_in_flight_bytes;
+            let candidate_debt = target.observation.owner_data_in_flight_bytes;
             let projected_candidate_debt = candidate_debt.saturating_add(payload_bytes as u64);
             // Global ordered tail and per-candidate flight overlap; only the
             // newly assigned payload is outside both current views.
@@ -363,8 +388,8 @@ pub(super) fn select_response_ack_clock_calibration_target(
                     mux_limits,
                 );
             let opportunity = reliable_tcp_ack_clock_calibration_opportunity(
-                service.snapshot,
-                service.eta_ms,
+                service.observation.snapshot,
+                service.observation.eta_ms,
                 candidate_snapshot,
                 candidate_eta_ms,
                 exploration_bytes,
@@ -393,9 +418,9 @@ pub(super) fn select_response_ack_clock_calibration_target(
                         mux_limits,
                         ResponseBulkCandidateDiag {
                             lead: Some(ResponseBulkLead {
-                                key: service.key,
-                                snapshot: service.snapshot,
-                                eta_ms: service.eta_ms,
+                                key: service.observation.key,
+                                snapshot: service.observation.snapshot,
+                                eta_ms: service.observation.eta_ms,
                             }),
                             role: Some(BulkAdmissionRole::AdditionalSameUnderlay),
                             ordering_debt: ordered_owner_debt_bytes as u64,
@@ -408,12 +433,12 @@ pub(super) fn select_response_ack_clock_calibration_target(
                     planner_generation: 0,
                     lane_generation: 0,
                     model_generation: 0,
-                    service: service.key,
-                    service_incarnation: service.incarnation,
-                    service_pending_bytes: service.command_pending_bytes,
-                    target: target.key,
-                    target_incarnation: target.incarnation,
-                    target_pending_bytes: target.command_pending_bytes,
+                    service: service.observation.key,
+                    service_incarnation: service.observation.incarnation,
+                    service_pending_bytes: service.observation.command_pending_bytes,
+                    target: target.observation.key,
+                    target_incarnation: target.observation.incarnation,
+                    target_pending_bytes: target.observation.command_pending_bytes,
                     limit_bytes: target.ack_clock_calibration_credit_limit_bytes,
                 });
             }
@@ -423,9 +448,10 @@ pub(super) fn select_response_ack_clock_calibration_target(
             // RepairData cannot preserve the unique-owner fence, but it still
             // occupies the carrier/product pipe that the atomic commit checks.
             let carrier_pressure = target
+                .observation
                 .snapshot
                 .product_bytes_in_flight
-                .max(target.command_pending_bytes);
+                .max(target.observation.command_pending_bytes);
             target.commands.can_enqueue_lane_now(lane)
                 && carrier_pressure.saturating_add(payload_bytes as u64)
                     <= target.ack_clock_calibration_credit_limit_bytes
@@ -438,9 +464,13 @@ pub(super) fn select_response_ack_clock_calibration_target(
                     (right.ack_clock_calibration_spent_bytes > 0)
                         .cmp(&(left.ack_clock_calibration_spent_bytes > 0))
                 })
-                .then_with(|| left.eta_ms.total_cmp(&right.eta_ms))
-                .then_with(|| carrier_path_key_order(left.key, right.key))
-                .then_with(|| left.incarnation.cmp(&right.incarnation))
+                .then_with(|| left.observation.eta_ms.total_cmp(&right.observation.eta_ms))
+                .then_with(|| carrier_path_key_order(left.observation.key, right.observation.key))
+                .then_with(|| {
+                    left.observation
+                        .incarnation
+                        .cmp(&right.observation.incarnation)
+                })
         })
         .map(|target| ResponseTcpAckClockCalibrationSelection {
             target: target.clone(),
@@ -449,9 +479,9 @@ pub(super) fn select_response_ack_clock_calibration_target(
                 lane_generation: 0,
                 model_generation: 0,
                 service: service_key,
-                service_incarnation: service.incarnation,
-                service_pending_bytes: service.command_pending_bytes,
-                target_pending_bytes: target.command_pending_bytes,
+                service_incarnation: service.observation.incarnation,
+                service_pending_bytes: service.observation.command_pending_bytes,
+                target_pending_bytes: target.observation.command_pending_bytes,
                 limit_bytes: target.ack_clock_calibration_credit_limit_bytes,
                 requires_active_response_start: !target.ack_clock_calibration_active
                     && target.ack_clock_calibration_spent_bytes == 0,
@@ -480,7 +510,7 @@ pub(super) fn response_ack_clock_calibration_blocks_generic_owner(
 ) -> bool {
     // Dormancy opens the binding reservoir, but this exact identity stays
     // excluded so ordinary OwnerData cannot contaminate later ACK calibration.
-    !target.is_active
+    !target.observation.is_service
         && (target.ack_clock_calibration_active
             || (!target.commands.is_closed()
                 && target.ack_clock_calibration_eligible
@@ -508,7 +538,7 @@ pub(super) fn response_calibration_service_reservoir_has_credit(
 pub(super) fn response_ack_clock_calibration_needs_opportunity_decision(
     target: &ResponseSenderPathTarget,
 ) -> bool {
-    target.key.underlay == UnderlayProtocol::Tcp
+    target.observation.key.underlay == UnderlayProtocol::Tcp
         && target.ack_clock_calibration_eligible
         && !target.ack_clock_calibration_proven
         && !target.ack_clock_calibration_active

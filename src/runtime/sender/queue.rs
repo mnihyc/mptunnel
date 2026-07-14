@@ -7,11 +7,10 @@ use super::RelaySendCause;
 use crate::model::work::ReliableWorkClass;
 use crate::mux::MuxLimits;
 use crate::mux::stream::ReliableSendStream;
+use crate::protocol::frame::reliable_stream_frame_extent;
 use crate::protocol::{Frame, OffsetRange, StreamFlags};
 use crate::runtime::relay::io::reliable_relay_buffer_len;
-use crate::runtime::relay_striping::{
-    reliable_stream_frame_extent, reliable_stream_frame_payload_bytes,
-};
+use crate::runtime::relay_striping::reliable_stream_frame_payload_bytes;
 use crate::scheduler::FlowLane;
 use bytes::Bytes;
 use std::collections::VecDeque;

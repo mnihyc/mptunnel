@@ -14,9 +14,9 @@ use crate::lab_diagnostics::lab_diagnostic;
 use crate::model::ack_clock::reliable_ack_clock_calibration_ceiling_bytes;
 use crate::model::multipath::PathAdmissionDecision;
 use crate::model::path::CarrierPathKey;
+use crate::protocol::frame::reliable_stream_frame_extent;
 use crate::protocol::{Frame, StreamOpenRole, UnderlayProtocol};
 use crate::runtime::RuntimeError;
-use crate::runtime::relay_striping::reliable_stream_frame_extent;
 use crate::scheduler::FlowLane;
 use std::sync::atomic::Ordering;
 

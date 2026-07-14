@@ -7,6 +7,9 @@ use crate::model::admission::{
 use crate::model::admission::{
     bulk_service_horizon_payload_bytes, bulk_service_product_envelope_payload_bytes,
 };
+use crate::protocol::frame::{
+    normalized_offset_ranges, reliable_stream_frame_extent, stream_ack_contiguous_frontier,
+};
 
 // Relay I/O orchestrates reads, writes, and feedback timing. It observes queue
 // counters but delegates product admission limits to their policy modules.
@@ -123,16 +126,6 @@ pub(in crate::runtime) fn reliable_relay_ordered_owner_debt_bytes(
     usize::try_from(next_offset.saturating_sub(ack_frontier)).unwrap_or(usize::MAX)
 }
 
-pub(in crate::runtime) fn stream_ack_contiguous_frontier(
-    _complete: bool,
-    ranges: &[OffsetRange],
-) -> u64 {
-    ranges
-        .first()
-        .filter(|range| range.start == 0)
-        .map_or(0, |range| range.end)
-}
-
 pub(in crate::runtime) fn update_repair_authoritative_ack_snapshot(
     stored_frontier: &mut u64,
     stored_ranges: &mut Vec<OffsetRange>,
@@ -150,7 +143,7 @@ pub(in crate::runtime) fn update_repair_authoritative_ack_snapshot(
     };
     merged.extend_from_slice(ranges);
     merged = normalized_offset_ranges(&merged);
-    *stored_frontier = (*stored_frontier).max(stream_ack_contiguous_frontier(true, &merged));
+    *stored_frontier = (*stored_frontier).max(stream_ack_contiguous_frontier(&merged));
     *stored_ranges = merged;
     *stored_complete = true;
 }
@@ -2440,7 +2433,7 @@ where
                         let largest_ack_end = normalized_ranges.last().map_or(0, |range| range.end);
                         #[cfg(feature = "lab-diagnostics")]
                         let incoming_ack_frontier =
-                            stream_ack_contiguous_frontier(complete, &normalized_ranges);
+                            stream_ack_contiguous_frontier(&normalized_ranges);
                         let previous_ack_frontier = last_send_ack_frontier;
                         update_repair_authoritative_ack_snapshot(
                             &mut last_send_ack_frontier,

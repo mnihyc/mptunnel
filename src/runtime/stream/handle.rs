@@ -11,6 +11,7 @@ use crate::model::work::{CarrierWorkKind, ReliableWorkClass};
 use crate::mux::MuxLimits;
 #[cfg(test)]
 use crate::protocol::PathId;
+use crate::protocol::frame::reliable_stream_frame_extent;
 use crate::protocol::{Frame, OffsetRange, StreamId, UnderlayProtocol};
 use crate::runtime::RuntimeError;
 use crate::runtime::path::RequestTcpCapacityProbeLease;
@@ -24,7 +25,6 @@ use crate::runtime::path::proof::{
     enqueue_path_proof_frame, enqueue_stream_ordered_path_proof_frame,
 };
 use crate::runtime::relay::io::bbr_inflight_target_bytes;
-use crate::runtime::relay_striping::reliable_stream_frame_extent;
 use crate::scheduler::{FlowLane, PathRateScope, PathSnapshot};
 use std::collections::BTreeMap;
 use std::sync::{Arc, Mutex};

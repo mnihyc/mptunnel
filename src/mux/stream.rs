@@ -1,4 +1,5 @@
 use crate::mux::MuxLimits;
+use crate::protocol::frame::normalized_offset_ranges;
 use crate::protocol::{Frame, OffsetRange, StreamFlags, StreamId};
 use bytes::Bytes;
 use smallvec::SmallVec;
@@ -485,24 +486,6 @@ fn push_retransmission_slice(
     });
     *emitted_bytes = (*emitted_bytes).saturating_add(slice_end - slice_start);
     *emitted_bytes < byte_limit
-}
-
-fn normalized_offset_ranges(ranges: &[OffsetRange]) -> Vec<OffsetRange> {
-    let mut ranges = ranges.to_vec();
-    ranges.sort_unstable_by_key(|range| (range.start, range.end));
-    let mut merged: Vec<OffsetRange> = Vec::with_capacity(ranges.len());
-    for range in ranges {
-        if range.start >= range.end {
-            continue;
-        }
-        match merged.last_mut() {
-            Some(previous) if previous.end >= range.start => {
-                previous.end = previous.end.max(range.end);
-            }
-            _ => merged.push(range),
-        }
-    }
-    merged
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

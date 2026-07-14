@@ -14,6 +14,8 @@ use super::client_stream::{
 use crate::lab_diagnostics::lab_diagnostic;
 use crate::model::capacity::reliable_capacity_calibration_session_limit_bytes;
 use crate::mux::MuxLimits;
+#[cfg(feature = "lab-diagnostics")]
+use crate::protocol::frame::stream_ack_contiguous_frontier;
 use crate::protocol::{Frame, PathId, StreamId, UnderlayProtocol};
 use crate::runtime::error::RuntimeError;
 use crate::runtime::path::commands::{
@@ -26,8 +28,6 @@ use crate::runtime::path::commands::{
 };
 use crate::runtime::path::state::RequestTcpCapacityProbeLease;
 use crate::runtime::recent_ids::RecentIdCache;
-#[cfg(feature = "lab-diagnostics")]
-use crate::runtime::relay::io::stream_ack_contiguous_frontier;
 use std::collections::HashMap;
 use std::time::Instant;
 use tokio::sync::mpsc;
@@ -101,7 +101,7 @@ pub(super) async fn handle_connected_client_tcp_command_run(
                             runtime.path_index,
                             complete,
                             ranges.len(),
-                            stream_ack_contiguous_frontier(*complete, ranges),
+                            stream_ack_contiguous_frontier(ranges),
                             ranges.last().map_or(0, |range| range.end),
                             commands.pending_bytes(),
                         ),
@@ -360,7 +360,7 @@ async fn flush_client_tcp_frame_batch(
                     runtime.path_index,
                     complete,
                     ranges.len(),
-                    stream_ack_contiguous_frontier(*complete, ranges),
+                    stream_ack_contiguous_frontier(ranges),
                     ranges.last().map_or(0, |range| range.end),
                 ),
             );

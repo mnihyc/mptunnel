@@ -6,6 +6,8 @@
 #[cfg(feature = "lab-diagnostics")]
 use crate::lab_diagnostics::lab_diagnostic;
 use crate::outbound::{self, TargetProtocol};
+#[cfg(feature = "lab-diagnostics")]
+use crate::protocol::frame::stream_ack_contiguous_frontier;
 use crate::protocol::{
     Frame, PathCapabilities, PathId, PathMetrics, SessionId, StreamDemandHint, StreamId,
     StreamOpenRole, TargetAddr, UnderlayProtocol,
@@ -13,8 +15,6 @@ use crate::protocol::{
 use crate::runtime::error::RuntimeError;
 use crate::runtime::path::commands::ReliablePathCommandSender;
 use crate::runtime::path::server_context::ServerPathContext;
-#[cfg(feature = "lab-diagnostics")]
-use crate::runtime::relay::io::stream_ack_contiguous_frontier;
 use crate::runtime::relay::io::{
     reliable_relay_buffer_len, reliable_stream_initial_advertised_window_bytes,
 };
@@ -142,7 +142,7 @@ impl ServerTcpStreamState {
                     path_id.0,
                     complete,
                     ranges.len(),
-                    stream_ack_contiguous_frontier(*complete, ranges),
+                    stream_ack_contiguous_frontier(ranges),
                     ranges.last().map_or(0, |range| range.end),
                 ),
             );

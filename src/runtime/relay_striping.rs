@@ -14,6 +14,7 @@ use crate::model::admission::{
     bulk_service_product_envelope_payload_bytes,
 };
 use crate::model::request::evidence::RequestPerFlowRateModel;
+use crate::protocol::frame::{normalized_offset_ranges, reliable_stream_frame_extent};
 use std::collections::BTreeMap;
 
 // Client/request-side striping owns dispatch choices and its exact flight
@@ -512,24 +513,6 @@ fn flight_interval_bytes(start: u64, end: u64) -> usize {
     usize::try_from(end.saturating_sub(start)).unwrap_or(usize::MAX)
 }
 
-pub(super) fn normalized_offset_ranges(ranges: &[OffsetRange]) -> Vec<OffsetRange> {
-    let mut ranges = ranges.to_vec();
-    ranges.sort_unstable_by_key(|range| (range.start, range.end));
-    let mut merged: Vec<OffsetRange> = Vec::with_capacity(ranges.len());
-    for range in ranges {
-        if range.start >= range.end {
-            continue;
-        }
-        match merged.last_mut() {
-            Some(previous) if previous.end >= range.start => {
-                previous.end = previous.end.max(range.end);
-            }
-            _ => merged.push(range),
-        }
-    }
-    merged
-}
-
 #[derive(Debug, Clone, Copy)]
 struct RelayPathFlight {
     instance: RelayPathInstance,
@@ -537,21 +520,6 @@ struct RelayPathFlight {
     bytes: usize,
     sent_at: Instant,
     kind: CarrierWorkKind,
-}
-
-pub(super) fn reliable_stream_frame_extent(frame: &Frame) -> Option<(u64, u64, usize)> {
-    let Frame::StreamData {
-        offset, payload, ..
-    } = frame
-    else {
-        return None;
-    };
-    let bytes = payload.len();
-    if bytes == 0 {
-        return None;
-    }
-    let end = offset.saturating_add(bytes as u64);
-    Some((*offset, end, bytes))
 }
 
 pub(super) fn reliable_stream_frame_payload_bytes(frame: &Frame) -> usize {

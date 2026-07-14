@@ -1,4 +1,5 @@
 use super::*;
+use crate::protocol::frame::{reliable_stream_frame_extent, stream_ack_contiguous_frontier};
 use crate::runtime::stream::response::{
     ResponseStreamAttachOutcome, ResponseStreamBinding, ServerPathMetricsSource,
 };
@@ -467,31 +468,6 @@ fn full_confidence_progress_does_not_unlock_source_staging_without_bulk_evidence
 }
 
 #[test]
-fn sparse_ack_largest_end_is_not_contiguous_frontier() {
-    let ranges = [
-        OffsetRange {
-            start: 0,
-            end: 1024,
-        },
-        OffsetRange {
-            start: 4096,
-            end: 8192,
-        },
-    ];
-
-    assert_eq!(
-        stream_ack_contiguous_frontier(true, &ranges),
-        1024,
-        "sparse ACK ranges must keep the scheduling frontier at the first hole, not the largest ACK end"
-    );
-    assert_eq!(
-        stream_ack_contiguous_frontier(false, &ranges),
-        1024,
-        "an incomplete ACK chunk still explicitly proves its contiguous 0-based prefix; incompleteness only forbids inferring gaps from omitted higher ranges"
-    );
-}
-
-#[test]
 fn tail_repair_uses_single_pto_stall_timeout() {
     let last_progress = Instant::now();
     let last_repair = last_progress - Duration::from_secs(1);
@@ -742,7 +718,7 @@ fn sparse_authoritative_ack_does_not_skip_lower_gap_for_live_tail_repair() {
         },
     ];
     let _ = send_stream.apply_ack(&ack_ranges);
-    assert_eq!(stream_ack_contiguous_frontier(true, &ack_ranges), 64);
+    assert_eq!(stream_ack_contiguous_frontier(&ack_ranges), 64);
     assert!(!stream_ack_is_authoritative_contiguous_prefix(
         true,
         &ack_ranges,

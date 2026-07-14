@@ -16,6 +16,10 @@ use crate::model::request::evidence::{
     RequestPerFlowRateModel, RequestTcpAckTurnoverModel, request_path_rate_coverage_floor_bytes,
     request_tcp_candidate_turnover_authorized,
 };
+use crate::protocol::frame::reliable_stream_frame_extent;
+#[cfg(feature = "lab-diagnostics")]
+use crate::protocol::frame::stream_ack_contiguous_frontier;
+
 // Ownership boundary:
 // Sender services own product work before it reaches carrier command queues.
 // Client relay sending and server response dispatch both use this module for
@@ -3309,7 +3313,7 @@ impl RelaySenderService {
                     } => (
                         *complete,
                         ranges.len(),
-                        stream_ack_contiguous_frontier(*complete, ranges),
+                        stream_ack_contiguous_frontier(ranges),
                         ranges.last().map_or(0, |range| range.end),
                     ),
                     _ => unreachable!("ack_frames only returns STREAM_ACK"),

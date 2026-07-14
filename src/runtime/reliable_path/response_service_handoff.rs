@@ -15,7 +15,7 @@ use super::{
 use crate::lab_diagnostics::lab_diagnostic;
 use crate::protocol::{Frame, StreamOpenRole, UnderlayProtocol};
 use crate::runtime::RuntimeError;
-use crate::runtime::multipath_model::FlowSubflowSet;
+use crate::runtime::model::multipath::FlowSubflowSet;
 use crate::runtime::relay_striping::reliable_stream_frame_extent;
 use crate::scheduler::FlowLane;
 use std::sync::atomic::Ordering;

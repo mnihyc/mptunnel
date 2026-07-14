@@ -709,7 +709,7 @@ fn reliable_relay_sender_queue_prioritizes_only_critical_repair_lane() {
     });
 
     let (lane, work) = queue.pop_front().expect("owner data");
-    assert_eq!(lane, ReliableRelayQueuedWorkLane::Data);
+    assert_eq!(lane, ReliableWorkClass::Data);
     assert_eq!(work.payload_bytes, b"ordinary".len());
     assert_eq!(queue.data_bytes(), 0);
 
@@ -724,7 +724,7 @@ fn reliable_relay_sender_queue_prioritizes_only_critical_repair_lane() {
         RelaySendCause::AckGapRepair,
     );
     let (lane, work) = queue.pop_front().expect("critical repair work");
-    assert_eq!(lane, ReliableRelayQueuedWorkLane::Repair);
+    assert_eq!(lane, ReliableWorkClass::Repair);
     assert!(matches!(
         work.kind,
         ReliableRelayQueuedWorkKind::Repair {
@@ -770,7 +770,7 @@ async fn server_response_sender_dispatch_creates_stream_data_from_queued_bytes()
         .await
         .expect("dispatch response bytes");
 
-    assert_eq!(dispatch.lane, ReliableRelayQueuedWorkLane::Data);
+    assert_eq!(dispatch.lane, ReliableWorkClass::Data);
     assert_eq!(dispatch.payload_bytes, b"response".len());
     assert_eq!(
         dispatch.selected_path,
@@ -1074,7 +1074,7 @@ async fn server_response_sender_slices_large_reads_to_service_quantum() {
         .await
         .expect("dispatch first service quantum");
 
-    assert_eq!(dispatch.lane, ReliableRelayQueuedWorkLane::Data);
+    assert_eq!(dispatch.lane, ReliableWorkClass::Data);
     assert_eq!(dispatch.payload_bytes, quantum);
     assert_eq!(sender.data_bytes(), queued_bytes - quantum);
     assert_eq!(send_stream.next_offset(), quantum as u64);
@@ -1216,7 +1216,7 @@ async fn server_response_sender_dispatches_control_before_repair_and_data() {
         )
         .await
         .expect("dispatch control");
-    assert_eq!(control_dispatch.lane, ReliableRelayQueuedWorkLane::Control);
+    assert_eq!(control_dispatch.lane, ReliableWorkClass::Control);
     assert_eq!(send_stream.next_offset(), 0);
     assert!(matches!(
         recv_emitted_tcp_path_command(&mut receivers).await,
@@ -1236,7 +1236,7 @@ async fn server_response_sender_dispatches_control_before_repair_and_data() {
         )
         .await
         .expect("dispatch repair");
-    assert_eq!(repair_dispatch.lane, ReliableRelayQueuedWorkLane::Repair);
+    assert_eq!(repair_dispatch.lane, ReliableWorkClass::Repair);
 }
 
 #[tokio::test]
@@ -1276,7 +1276,7 @@ async fn server_response_sender_dispatches_final_fin_after_queued_data() {
         )
         .await
         .expect("dispatch ordinary data first");
-    assert_eq!(data_dispatch.lane, ReliableRelayQueuedWorkLane::Data);
+    assert_eq!(data_dispatch.lane, ReliableWorkClass::Data);
 
     let fin_dispatch = sender
         .dispatch_next(
@@ -1287,7 +1287,7 @@ async fn server_response_sender_dispatches_final_fin_after_queued_data() {
         )
         .await
         .expect("dispatch final FIN after data");
-    assert_eq!(fin_dispatch.lane, ReliableRelayQueuedWorkLane::Control);
+    assert_eq!(fin_dispatch.lane, ReliableWorkClass::Control);
     assert!(matches!(
         recv_emitted_tcp_path_command(&mut receivers).await,
         Some(ReliablePathCommand::SendFrame(Frame::StreamData {
@@ -1944,7 +1944,7 @@ async fn server_response_sender_dispatches_repair_before_data() {
         )
         .await
         .expect("dispatch repair");
-    assert_eq!(repair_dispatch.lane, ReliableRelayQueuedWorkLane::Repair);
+    assert_eq!(repair_dispatch.lane, ReliableWorkClass::Repair);
     assert_eq!(send_stream.next_offset(), 0);
     assert!(matches!(
         recv_emitted_tcp_path_command(&mut receivers).await,
@@ -1964,7 +1964,7 @@ async fn server_response_sender_dispatches_repair_before_data() {
         )
         .await
         .expect("dispatch ordinary data");
-    assert_eq!(data_dispatch.lane, ReliableRelayQueuedWorkLane::Data);
+    assert_eq!(data_dispatch.lane, ReliableWorkClass::Data);
     assert_eq!(send_stream.next_offset(), b"ordinary".len() as u64);
     assert!(matches!(
         recv_emitted_tcp_path_command(&mut receivers).await,

@@ -3972,7 +3972,7 @@ async fn path_failure_repairs_enqueue_repair_lane_without_carrier_send() {
     ));
 
     let (lane, work) = sender_queue.pop_front().expect("queued repair");
-    assert_eq!(lane, ReliableRelayQueuedWorkLane::Repair);
+    assert_eq!(lane, ReliableWorkClass::Repair);
     assert!(matches!(
         work.kind,
         ReliableRelayQueuedWorkKind::Repair {
@@ -5007,7 +5007,7 @@ async fn validation_attach_keeps_active_data_lane_credit_visible() {
     let mut remotes = ReliableRelayRemoteSet::new(active_stream, 8);
 
     assert!(
-        remotes.can_enqueue_work_lane_now(ReliableRelayQueuedWorkLane::Data, FlowLane::Throughput),
+        remotes.can_enqueue_work_lane_now(ReliableWorkClass::Data, FlowLane::Throughput),
         "active path credit must be visible before validation attach"
     );
 
@@ -5028,7 +5028,7 @@ async fn validation_attach_keeps_active_data_lane_credit_visible() {
     }
 
     assert!(
-        remotes.can_enqueue_work_lane_now(ReliableRelayQueuedWorkLane::Data, FlowLane::Throughput),
+        remotes.can_enqueue_work_lane_now(ReliableWorkClass::Data, FlowLane::Throughput),
         "validation attachment must not hide active service-path data credit"
     );
 }

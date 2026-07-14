@@ -5,30 +5,9 @@
 
 use crate::config::MppPerformanceConfig;
 use crate::runtime::MIN_RATE_SAMPLE_BYTES;
+use crate::runtime::model::work::CarrierWorkKind;
 use crate::runtime::reliable_path::CarrierPathKey;
 use std::time::Duration;
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(in crate::runtime) enum CarrierWorkKind {
-    OwnerData,
-    RepairData,
-    Probe,
-    Control,
-}
-
-impl CarrierWorkKind {
-    pub(in crate::runtime) fn is_ordering_owner(self) -> bool {
-        matches!(self, Self::OwnerData)
-    }
-
-    pub(in crate::runtime) fn carries_product_offsets(self) -> bool {
-        matches!(self, Self::OwnerData | Self::RepairData)
-    }
-
-    pub(in crate::runtime) fn counts_against_sender_extra_budget(self) -> bool {
-        matches!(self, Self::RepairData)
-    }
-}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(in crate::runtime) enum PathRuntimeRole {

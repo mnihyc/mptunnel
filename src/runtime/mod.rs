@@ -38,6 +38,7 @@ use datagram::*;
 use ingress_runtime::*;
 use management::*;
 use model::multipath::*;
+use model::work::*;
 use path_commands::*;
 use path_common::*;
 use path_model::*;

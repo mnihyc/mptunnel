@@ -418,7 +418,7 @@ fn sender_queue_dispatches_owner_data_before_ordinary_repair() {
         .expect("ordinary owner data should be queued");
     assert_eq!(
         lane,
-        ReliableRelayQueuedWorkLane::Data,
+        ReliableWorkClass::Data,
         "ordinary RepairData must not preempt OwnerData; repair only preempts when explicitly critical"
     );
     assert_eq!(work.payload_bytes, 5);
@@ -443,7 +443,7 @@ fn sender_queue_dispatches_critical_repair_before_owner_data() {
     let (lane, work) = queue.pop_front().expect("critical repair should be queued");
     assert_eq!(
         lane,
-        ReliableRelayQueuedWorkLane::Repair,
+        ReliableWorkClass::Repair,
         "critical RepairData closes an active product hole and must preempt later OwnerData"
     );
     assert_eq!(work.payload_bytes, 6);
@@ -620,10 +620,7 @@ fn budgeted_critical_repair_preempts_owner_data_and_debits_budget() {
         "startup repair floor should be spendable"
     );
 
-    assert_eq!(
-        sender.queue.front_lane(),
-        Some(ReliableRelayQueuedWorkLane::Repair)
-    );
+    assert_eq!(sender.queue.front_lane(), Some(ReliableWorkClass::Repair));
     assert_eq!(
         sender.repair_extra_budget_remaining(mux_limits),
         0,

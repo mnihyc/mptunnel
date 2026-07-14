@@ -287,7 +287,7 @@ impl ReliablePathStreamHandle {
 
     pub(super) fn can_enqueue_work_lane_now(
         &self,
-        work_lane: ReliableRelayQueuedWorkLane,
+        work_lane: ReliableWorkClass,
         relay_lane: FlowLane,
     ) -> bool {
         self.output
@@ -785,13 +785,13 @@ impl ReliablePathStreamOutput {
 }
 
 pub(super) fn reliable_work_lane_to_carrier_lane(
-    work_lane: ReliableRelayQueuedWorkLane,
+    work_lane: ReliableWorkClass,
     relay_lane: FlowLane,
 ) -> FlowLane {
     match work_lane {
-        ReliableRelayQueuedWorkLane::Control => FlowLane::Control,
-        ReliableRelayQueuedWorkLane::Repair => reliable_path_stream_ordered_queue_lane(),
-        ReliableRelayQueuedWorkLane::Data => relay_lane,
+        ReliableWorkClass::Control => FlowLane::Control,
+        ReliableWorkClass::Repair => reliable_path_stream_ordered_queue_lane(),
+        ReliableWorkClass::Data => relay_lane,
     }
 }
 

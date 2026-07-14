@@ -527,13 +527,6 @@ pub(super) enum ReliableRelayQueuedWorkKind {
     Repair { frame: Frame, cause: RelaySendCause },
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(super) enum ReliableRelayQueuedWorkLane {
-    Control,
-    Data,
-    Repair,
-}
-
 #[derive(Debug, Clone)]
 /// Byte-bounded queue for product reliable work awaiting sender admission.
 ///
@@ -590,7 +583,7 @@ impl ReliableRelaySenderQueue {
     pub(super) fn push_control(&mut self, frame: Frame) -> u64 {
         let payload_bytes = reliable_stream_frame_payload_bytes(&frame);
         self.push_work(
-            ReliableRelayQueuedWorkLane::Control,
+            ReliableWorkClass::Control,
             ReliableRelayQueuedWorkKind::Control(frame),
             None,
             false,
@@ -601,7 +594,7 @@ impl ReliableRelaySenderQueue {
     pub(super) fn push_final_control(&mut self, frame: Frame) -> u64 {
         let payload_bytes = reliable_stream_frame_payload_bytes(&frame);
         self.push_work(
-            ReliableRelayQueuedWorkLane::Control,
+            ReliableWorkClass::Control,
             ReliableRelayQueuedWorkKind::Control(frame),
             None,
             true,
@@ -616,7 +609,7 @@ impl ReliableRelaySenderQueue {
     pub(super) fn push_data_for_lane(&mut self, payload: Bytes, lane: FlowLane) -> u64 {
         let payload_bytes = payload.len();
         self.push_work(
-            ReliableRelayQueuedWorkLane::Data,
+            ReliableWorkClass::Data,
             ReliableRelayQueuedWorkKind::Data(payload),
             Some(lane),
             false,
@@ -649,7 +642,7 @@ impl ReliableRelaySenderQueue {
         debug_assert!(cause.is_repair());
         let payload_bytes = reliable_stream_frame_payload_bytes(&frame);
         let enqueue_id = self.push_work(
-            ReliableRelayQueuedWorkLane::Repair,
+            ReliableWorkClass::Repair,
             ReliableRelayQueuedWorkKind::Repair { frame, cause },
             None,
             false,
@@ -667,7 +660,7 @@ impl ReliableRelaySenderQueue {
 
     fn push_work(
         &mut self,
-        lane: ReliableRelayQueuedWorkLane,
+        lane: ReliableWorkClass,
         kind: ReliableRelayQueuedWorkKind,
         data_lane: Option<FlowLane>,
         final_control: bool,
@@ -682,7 +675,7 @@ impl ReliableRelaySenderQueue {
         #[cfg(not(feature = "lab-diagnostics"))]
         let enqueue_id = 0;
         self.bytes = self.bytes.saturating_add(payload_bytes);
-        if lane == ReliableRelayQueuedWorkLane::Data {
+        if lane == ReliableWorkClass::Data {
             self.data_bytes = self.data_bytes.saturating_add(payload_bytes);
         }
         let work = ReliableRelayQueuedWork {
@@ -696,33 +689,33 @@ impl ReliableRelaySenderQueue {
             queued_at: Instant::now(),
         };
         match lane {
-            ReliableRelayQueuedWorkLane::Control if final_control => {
+            ReliableWorkClass::Control if final_control => {
                 self.final_control.push_back(work);
             }
-            ReliableRelayQueuedWorkLane::Control => self.control.push_back(work),
-            ReliableRelayQueuedWorkLane::Data => self.data.push_back(work),
-            ReliableRelayQueuedWorkLane::Repair => self.repair.push_back(work),
+            ReliableWorkClass::Control => self.control.push_back(work),
+            ReliableWorkClass::Data => self.data.push_back(work),
+            ReliableWorkClass::Repair => self.repair.push_back(work),
         }
         enqueue_id
     }
 
-    pub(super) fn front(&self) -> Option<(ReliableRelayQueuedWorkLane, &ReliableRelayQueuedWork)> {
+    pub(super) fn front(&self) -> Option<(ReliableWorkClass, &ReliableRelayQueuedWork)> {
         if let Some(work) = self.control.front() {
-            Some((ReliableRelayQueuedWorkLane::Control, work))
+            Some((ReliableWorkClass::Control, work))
         } else if let Some(work) = self.critical_repair.front() {
-            Some((ReliableRelayQueuedWorkLane::Repair, work))
+            Some((ReliableWorkClass::Repair, work))
         } else if let Some(work) = self.data.front() {
-            Some((ReliableRelayQueuedWorkLane::Data, work))
+            Some((ReliableWorkClass::Data, work))
         } else if let Some(work) = self.repair.front() {
-            Some((ReliableRelayQueuedWorkLane::Repair, work))
+            Some((ReliableWorkClass::Repair, work))
         } else {
             self.final_control
                 .front()
-                .map(|work| (ReliableRelayQueuedWorkLane::Control, work))
+                .map(|work| (ReliableWorkClass::Control, work))
         }
     }
 
-    pub(super) fn front_lane(&self) -> Option<ReliableRelayQueuedWorkLane> {
+    pub(super) fn front_lane(&self) -> Option<ReliableWorkClass> {
         self.front().map(|(lane, _)| lane)
     }
 
@@ -816,25 +809,20 @@ impl ReliableRelaySenderQueue {
         released
     }
 
-    pub(super) fn commit_front(
-        &mut self,
-    ) -> Option<(ReliableRelayQueuedWorkLane, ReliableRelayQueuedWork)> {
+    pub(super) fn commit_front(&mut self) -> Option<(ReliableWorkClass, ReliableRelayQueuedWork)> {
         let (lane, work) = if let Some(work) = self.control.pop_front() {
-            (ReliableRelayQueuedWorkLane::Control, work)
+            (ReliableWorkClass::Control, work)
         } else if let Some(work) = self.critical_repair.pop_front() {
-            (ReliableRelayQueuedWorkLane::Repair, work)
+            (ReliableWorkClass::Repair, work)
         } else if let Some(work) = self.data.pop_front() {
-            (ReliableRelayQueuedWorkLane::Data, work)
+            (ReliableWorkClass::Data, work)
         } else if let Some(work) = self.repair.pop_front() {
-            (ReliableRelayQueuedWorkLane::Repair, work)
+            (ReliableWorkClass::Repair, work)
         } else {
-            (
-                ReliableRelayQueuedWorkLane::Control,
-                self.final_control.pop_front()?,
-            )
+            (ReliableWorkClass::Control, self.final_control.pop_front()?)
         };
         self.bytes = self.bytes.saturating_sub(work.payload_bytes);
-        if lane == ReliableRelayQueuedWorkLane::Data {
+        if lane == ReliableWorkClass::Data {
             self.data_bytes = self.data_bytes.saturating_sub(work.payload_bytes);
         }
         Some((lane, work))
@@ -871,9 +859,7 @@ impl ReliableRelaySenderQueue {
     }
 
     #[cfg(test)]
-    pub(super) fn pop_front(
-        &mut self,
-    ) -> Option<(ReliableRelayQueuedWorkLane, ReliableRelayQueuedWork)> {
+    pub(super) fn pop_front(&mut self) -> Option<(ReliableWorkClass, ReliableRelayQueuedWork)> {
         self.commit_front()
     }
 }
@@ -1096,7 +1082,7 @@ pub(super) struct ServerResponseSenderService {
 #[derive(Debug, Clone, Copy)]
 pub(super) struct ServerResponseDispatch {
     pub(super) payload_bytes: usize,
-    pub(super) lane: ReliableRelayQueuedWorkLane,
+    pub(super) lane: ReliableWorkClass,
     #[cfg_attr(not(feature = "lab-diagnostics"), allow(dead_code))]
     pub(super) selected_path: Option<CarrierPathKey>,
 }
@@ -4535,8 +4521,7 @@ fn plan_response_data_dispatch_with_ordered_debt_impl(
 ) -> Result<ResponseDataDispatchPlan, RuntimeError> {
     match &stream.output {
         ReliablePathStreamOutput::Fixed(fixed) => {
-            let lane =
-                reliable_work_lane_to_carrier_lane(ReliableRelayQueuedWorkLane::Data, relay_lane);
+            let lane = reliable_work_lane_to_carrier_lane(ReliableWorkClass::Data, relay_lane);
             if fixed.commands().can_enqueue_lane_now(lane) {
                 Ok(ResponseDataDispatchPlan {
                     primary: ResponseDataDispatchTarget::Fixed(fixed.clone()),
@@ -5774,7 +5759,7 @@ impl ServerResponseSenderService {
             }
         };
         let selected_path = match queued_lane {
-            ReliableRelayQueuedWorkLane::Control => {
+            ReliableWorkClass::Control => {
                 let (carrier_lane, emit_mode) = if queued.stream_ordered_carrier_emit {
                     (relay_lane, ResponseCarrierEmitMode::StreamOrdered)
                 } else {
@@ -5790,7 +5775,7 @@ impl ServerResponseSenderService {
                 )
                 .await?
             }
-            ReliableRelayQueuedWorkLane::Data => match emit_response_frame_from_sender_service(
+            ReliableWorkClass::Data => match emit_response_frame_from_sender_service(
                 path_stream,
                 frame.clone(),
                 reliable_path_effective_frame_lane(&frame, relay_lane),
@@ -5806,7 +5791,7 @@ impl ServerResponseSenderService {
                     return Err(err);
                 }
             },
-            ReliableRelayQueuedWorkLane::Repair => {
+            ReliableWorkClass::Repair => {
                 emit_response_frame_from_sender_service(
                     path_stream,
                     frame.clone(),
@@ -5840,7 +5825,7 @@ impl ServerResponseSenderService {
         &mut self,
         path_stream: &ReliablePathStream,
         relay_lane: FlowLane,
-        queued_lane: ReliableRelayQueuedWorkLane,
+        queued_lane: ReliableWorkClass,
         committed: ReliableRelayQueuedWork,
         frame: Frame,
         selected_path: Option<CarrierPathKey>,
@@ -5850,9 +5835,9 @@ impl ServerResponseSenderService {
     ) -> Result<ServerResponseDispatch, RuntimeError> {
         #[cfg(feature = "lab-diagnostics")]
         let send_lane = match queued_lane {
-            ReliableRelayQueuedWorkLane::Control => FlowLane::Control,
-            ReliableRelayQueuedWorkLane::Repair => response_repair_carrier_lane(&frame),
-            ReliableRelayQueuedWorkLane::Data => reliable_path_effective_frame_lane(
+            ReliableWorkClass::Control => FlowLane::Control,
+            ReliableWorkClass::Repair => response_repair_carrier_lane(&frame),
+            ReliableWorkClass::Data => reliable_path_effective_frame_lane(
                 &frame,
                 committed.data_lane.unwrap_or(relay_lane),
             ),
@@ -5868,7 +5853,7 @@ impl ServerResponseSenderService {
         };
         #[cfg(feature = "lab-diagnostics")]
         if let Some((offset, payload_bytes)) = stream_extent {
-            if queued_lane == ReliableRelayQueuedWorkLane::Data {
+            if queued_lane == ReliableWorkClass::Data {
                 lab_server_response_stream_data(
                     self.session_id.0,
                     self.stream_id.0,
@@ -5890,7 +5875,7 @@ impl ServerResponseSenderService {
                         path_stream.underlay, send_lane, pacing_bytes,
                     ),
                 );
-            } else if queued_lane == ReliableRelayQueuedWorkLane::Data
+            } else if queued_lane == ReliableWorkClass::Data
                 && matches!(&path_stream.output, ReliablePathStreamOutput::Fixed(_))
             {
                 let selected_path =
@@ -7835,7 +7820,7 @@ impl RelaySenderService {
         });
         let can_enqueue = candidate_path.is_some_and(|path| {
             path.stream
-                .can_enqueue_work_lane_now(ReliableRelayQueuedWorkLane::Data, lane)
+                .can_enqueue_work_lane_now(ReliableWorkClass::Data, lane)
         });
         let gate = if !lane.is_bulk() {
             "non_bulk_lane"
@@ -8026,7 +8011,7 @@ impl RelaySenderService {
                     && snapshot.is_some_and(request_tcp_capacity_candidate_can_start_receipt)
                     && path
                         .stream
-                        .can_enqueue_work_lane_now(ReliableRelayQueuedWorkLane::Data, lane)
+                        .can_enqueue_work_lane_now(ReliableWorkClass::Data, lane)
             })
             .filter_map(|path| {
                 let candidate_snapshot = context.reliable_path_snapshot(path.key())?;
@@ -8251,7 +8236,7 @@ impl RelaySenderService {
                     })
                     && path
                         .stream
-                        .can_enqueue_work_lane_now(ReliableRelayQueuedWorkLane::Data, lane)
+                        .can_enqueue_work_lane_now(ReliableWorkClass::Data, lane)
             })
             .filter_map(|path| {
                 let snapshot = context.reliable_path_snapshot(path.key())?;

@@ -1821,7 +1821,7 @@ async fn drain_server_response_sender_ready(
             Err(err) => return Err(err),
         };
         dispatched_items = dispatched_items.saturating_add(1);
-        if dispatch.lane == ReliableRelayQueuedWorkLane::Repair {
+        if dispatch.lane == ReliableWorkClass::Repair {
             #[cfg(feature = "lab-diagnostics")]
             {
                 let (selected_underlay, selected_path_id) = dispatch
@@ -1844,7 +1844,7 @@ async fn drain_server_response_sender_ready(
             dispatched_payload_bytes =
                 dispatched_payload_bytes.saturating_add(dispatch.payload_bytes);
             stats.record_payload_bytes(dispatch.payload_bytes);
-            if dispatch.lane == ReliableRelayQueuedWorkLane::Data {
+            if dispatch.lane == ReliableWorkClass::Data {
                 ordered_owner_debt_bytes =
                     ordered_owner_debt_bytes.saturating_add(dispatch.payload_bytes);
             }
@@ -3187,7 +3187,7 @@ where
                 .dispatch_next(&path_stream, &mut send_stream, last_relay_lane, mux_limits)
                 .await
             {
-                Ok(dispatch) if dispatch.lane == ReliableRelayQueuedWorkLane::Control => {
+                Ok(dispatch) if dispatch.lane == ReliableWorkClass::Control => {
                     close_sent = true;
                 }
                 Ok(_) => {

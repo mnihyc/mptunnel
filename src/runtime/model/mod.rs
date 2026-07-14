@@ -8,6 +8,7 @@ pub(in crate::runtime) mod ack_clock;
 pub(in crate::runtime) mod admission;
 pub(in crate::runtime) mod multipath;
 mod response_ownership;
+pub(in crate::runtime) mod work;
 
 pub(super) use response_ownership::{
     ResponseCandidateTailDebt, ResponseOrderedTail, ResponseSameFamilyReservoir,

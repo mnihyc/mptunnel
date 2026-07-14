@@ -655,7 +655,7 @@ async fn latency_live_owner_tail_repair_dispatches_suffix_on_distinct_repair_wit
         )
         .await
         .expect("latency tail repair must dispatch on the distinct Repair output");
-    assert_eq!(dispatch.lane, ReliableRelayQueuedWorkLane::Repair);
+    assert_eq!(dispatch.lane, ReliableWorkClass::Repair);
     assert_eq!(dispatch.selected_path, Some(repair_key));
 
     let repair_frame = match try_recv_reliable_path_command(&mut repair_receivers) {
@@ -1764,7 +1764,7 @@ async fn unknown_owner_tail_repair_dispatches_as_path_failure_repair() {
         .await
         .expect("unknown-owner tail repair must be failover-dispatchable");
 
-    assert_eq!(dispatch.lane, ReliableRelayQueuedWorkLane::Repair);
+    assert_eq!(dispatch.lane, ReliableWorkClass::Repair);
     assert_eq!(dispatch.selected_path, Some(failover_key));
     assert!(matches!(
         try_recv_reliable_path_command(&mut failover_receivers),

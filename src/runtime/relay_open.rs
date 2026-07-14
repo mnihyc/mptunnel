@@ -359,7 +359,7 @@ impl ReliableRelayRemoteSet {
 
     pub(super) fn can_enqueue_work_lane_now(
         &self,
-        work_lane: ReliableRelayQueuedWorkLane,
+        work_lane: ReliableWorkClass,
         relay_lane: FlowLane,
     ) -> bool {
         self.paths.iter().any(|path| {
@@ -502,11 +502,11 @@ pub(super) enum RelayPathPlacement {
 
 fn relay_path_placement_may_wake_work_lane(
     placement: RelayPathPlacement,
-    work_lane: ReliableRelayQueuedWorkLane,
+    work_lane: ReliableWorkClass,
 ) -> bool {
     match work_lane {
-        ReliableRelayQueuedWorkLane::Data => placement != RelayPathPlacement::Repair,
-        ReliableRelayQueuedWorkLane::Control | ReliableRelayQueuedWorkLane::Repair => true,
+        ReliableWorkClass::Data => placement != RelayPathPlacement::Repair,
+        ReliableWorkClass::Control | ReliableWorkClass::Repair => true,
     }
 }
 

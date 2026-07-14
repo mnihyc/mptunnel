@@ -954,3 +954,7 @@ pub(super) fn apply_response_ack_clock_release_samples(
 #[cfg(test)]
 #[path = "response_ack_clock_test.rs"]
 mod tests;
+
+#[cfg(test)]
+#[path = "response_ack_clock_binding_test.rs"]
+mod binding_tests;

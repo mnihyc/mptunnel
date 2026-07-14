@@ -32,25 +32,8 @@ mod response_topology;
 mod response_transaction;
 
 pub(in crate::runtime) use crate::runtime::path::quic::metrics::QuicCapacityProofCandidate;
-#[cfg(test)]
-pub(in crate::runtime) use response_ack_clock::{
-    ResponseAckClockCalibrationState, ResponseAckClockRateEvidence,
-    ResponseAckClockRateEvidenceUpdate,
-};
 pub(in crate::runtime) use response_admission::ResponseSubflowAdmissionRequest;
 use response_admission::ResponseSubflowSetState;
-#[cfg(test)]
-pub(in crate::runtime) use response_admission::{
-    ResponseSubflowAdmissionReservation, server_output_accepts_service_capacity_prior,
-    server_output_has_bulk_rate_evidence, server_output_has_bulk_rate_evidence_with_limits,
-    server_output_has_durable_product_progress, server_output_has_sender_evidence,
-    server_output_has_service_feed_evidence_with_limits,
-};
-#[cfg(test)]
-pub(in crate::runtime) use response_delivery::{
-    CarrierPathAckedHole, CarrierPathReleasedFlight, ResponseAckOrderingUpdate,
-    response_latest_ordering_hole,
-};
 pub(in crate::runtime) use response_delivery::{
     CarrierPathFlight, CarrierPathFlightDebt, ResponseAckOrderingState,
 };
@@ -75,67 +58,27 @@ pub(in crate::runtime) use response_quic_capacity::{
     valid_quic_capacity_proof_candidate_at,
 };
 pub(in crate::runtime) use response_quic_probe::ResponseQuicCapacityCalibrationRequest;
-#[cfg(test)]
-pub(in crate::runtime) use response_session::ResponseSessionSchedulingSnapshot;
 pub(in crate::runtime) use response_session::{ResponseServiceFamilyLoads, ServerPathLaneTracker};
 pub(in crate::runtime) use response_snapshot::server_bulk_output_eta_ms;
-#[cfg(test)]
-pub(in crate::runtime) use response_snapshot::{
-    ResponseRelayReadSnapshot, ResponseSourceServiceSnapshot,
-};
 pub(in crate::runtime) use response_tcp_capacity::TcpCapacityProbeSessionLease;
 pub(in crate::runtime) use response_topology::{
     ResponseDispatchTarget, ResponseSenderPathTarget, ResponseStreamAttachOutcome,
     ResponseStreamOutputs, ServerCarrierPathInstanceId, next_server_carrier_path_instance_id,
 };
-#[cfg(test)]
-pub(in crate::runtime) use response_topology::{
-    ResponseStreamOutputEntry, TcpResponseCapacityPrior,
-};
 pub(in crate::runtime) use response_transaction::{
     ResponseAckClockCalibrationRequest, ResponseAckClockCalibrationRetirementRequest,
 };
 
-#[cfg(test)]
-use self::response_evidence::server_output_quic_capacity_proof_marker;
 use self::response_load::ServerResponseFlowRegistration;
-#[cfg(test)]
-use self::response_snapshot::server_bulk_output_snapshot;
-#[cfg(test)]
-use crate::model::ack_clock::{
-    reliable_ack_clock_calibration_ceiling_bytes, reliable_ack_clock_calibration_limit_bytes,
-};
-#[cfg(test)]
-use crate::model::capacity::PathRateSample;
-#[cfg(test)]
-use crate::model::multipath::{FlowSubflowSet, PathAdmissionDecision, SubflowAdmissionInput};
 use crate::model::path::CarrierPathKey;
 use crate::mux::MuxLimits;
-#[cfg(test)]
-use crate::protocol::Frame;
-#[cfg(test)]
-use crate::protocol::OffsetRange;
-#[cfg(test)]
-use crate::protocol::PathMetrics;
 use crate::protocol::SessionId;
-#[cfg(test)]
-use crate::protocol::{PathId, StreamId, StreamOpenRole, UnderlayProtocol};
-#[cfg(test)]
-use crate::runtime::RuntimeError;
-#[cfg(test)]
-use crate::runtime::path::commands::ReliablePathCommand;
 use crate::scheduler::FlowLane;
-#[cfg(test)]
-use crate::scheduler::PathSnapshot;
 use std::collections::BTreeMap;
 #[cfg(feature = "lab-diagnostics")]
 use std::collections::HashMap;
-#[cfg(test)]
-use std::sync::atomic::Ordering;
 use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU64};
 use std::sync::{Arc, Mutex};
-#[cfg(test)]
-use std::time::Instant;
 use tokio::sync::watch;
 
 // Reliable-path bindings own attachment instances, exact range flights,
@@ -223,5 +166,11 @@ impl ResponseStreamBinding {
 }
 
 #[cfg(test)]
-#[path = "response_binding_test.rs"]
-mod tests;
+#[path = "response_test_support.rs"]
+mod test_support;
+
+// TCP response capacity policy currently crosses admission, ACK application,
+// and snapshot projection; keep its integration tests explicit until one owner exists.
+#[cfg(test)]
+#[path = "response_tcp_capacity_policy_test.rs"]
+mod tcp_capacity_policy_tests;

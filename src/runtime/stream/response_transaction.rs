@@ -440,3 +440,7 @@ impl ResponseStreamBinding {
         Ok(None)
     }
 }
+
+#[cfg(test)]
+#[path = "response_transaction_test.rs"]
+mod tests;

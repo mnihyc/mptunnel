@@ -302,3 +302,7 @@ impl ResponseStreamBinding {
         true
     }
 }
+
+#[cfg(test)]
+#[path = "response_quic_probe_test.rs"]
+mod tests;

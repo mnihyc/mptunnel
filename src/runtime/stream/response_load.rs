@@ -567,3 +567,7 @@ impl Drop for ServerRealtimeFlowRegistration {
         self.lane_tracker.detach_realtime_flow(self.session_id);
     }
 }
+
+#[cfg(test)]
+#[path = "response_load_test.rs"]
+mod tests;

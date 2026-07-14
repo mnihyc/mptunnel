@@ -26,20 +26,6 @@ pub(in crate::runtime) use registry::{
 };
 #[cfg(any(test, feature = "lab-diagnostics"))]
 pub(in crate::runtime) use response_binding::well_formed_quic_capacity_proof_candidate;
-#[cfg(test)]
-pub(in crate::runtime) use response_binding::{
-    CarrierPathAckedHole, CarrierPathFlight, CarrierPathReleasedFlight, QuicCapacityProofCandidate,
-    ResponseAckClockCalibrationState, ResponseAckClockRateEvidence,
-    ResponseAckClockRateEvidenceUpdate, ResponseAckOrderingState, ResponseAckOrderingUpdate,
-    ResponseRelayReadSnapshot, ResponseSessionSchedulingSnapshot, ResponseSourceServiceSnapshot,
-    ResponseStreamAttachOutcome, ResponseStreamOutputEntry, ResponseStreamOutputs,
-    ResponseSubflowAdmissionReservation, ServerPathLaneTracker, ServerPathMetricsEntry,
-    ServerPathMetricsSource, TcpResponseCapacityPrior, next_server_carrier_path_instance_id,
-    response_latest_ordering_hole, server_output_accepts_service_capacity_prior,
-    server_output_has_bulk_rate_evidence, server_output_has_bulk_rate_evidence_with_limits,
-    server_output_has_durable_product_progress, server_output_has_sender_evidence,
-    server_output_has_service_feed_evidence_with_limits,
-};
 pub(in crate::runtime) use response_binding::{
     CarrierPathFlightDebt, MAX_RESPONSE_QUIC_CAPACITY_CALIBRATION_ATTEMPTS_PER_PATH,
     MIN_ACTIVE_RESPONSE_FLOWS_FOR_SAME_FAMILY_DISCOVERY, ResponseAckClockCalibrationRequest,
@@ -51,6 +37,11 @@ pub(in crate::runtime) use response_binding::{
     quic_capacity_proof_pin_matches_marker, quic_capacity_receipt_rate_bps,
     record_server_sender_decision, server_bulk_output_eta_ms,
     valid_quic_capacity_proof_candidate_at,
+};
+#[cfg(test)]
+pub(in crate::runtime) use response_binding::{
+    QuicCapacityProofCandidate, ResponseStreamAttachOutcome, ServerPathLaneTracker,
+    ServerPathMetricsSource, next_server_carrier_path_instance_id,
 };
 pub(in crate::runtime) use response_placement::{
     ResponseRateScope, ResponseServiceHandoffMode, response_rate_fair_share_bps,

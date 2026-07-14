@@ -596,3 +596,11 @@ impl ResponseStreamBinding {
 #[cfg(test)]
 #[path = "response_admission_test.rs"]
 mod tests;
+
+#[cfg(test)]
+#[path = "response_admission_startup_test.rs"]
+mod startup_tests;
+
+#[cfg(test)]
+#[path = "response_admission_epoch_test.rs"]
+mod epoch_tests;

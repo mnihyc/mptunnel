@@ -579,3 +579,7 @@ impl ServerPathLaneTracker {
         self.move_response_service(session_id, to, from, lane);
     }
 }
+
+#[cfg(test)]
+#[path = "response_handoff_test.rs"]
+mod tests;

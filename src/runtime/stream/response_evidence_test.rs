@@ -1,3 +1,4 @@
+use super::super::ResponseStreamBinding;
 use super::super::next_server_carrier_path_instance_id;
 use super::super::response_admission::{
     server_output_has_bulk_rate_evidence, server_output_has_sender_evidence,
@@ -7,13 +8,17 @@ use super::super::response_quic_capacity::quic_capacity_receipt_rate_bps;
 use super::super::response_session::ServerPathLaneTracker;
 use super::super::response_snapshot::{server_bulk_output_snapshot, server_output_confidence};
 use super::super::response_topology::ResponseStreamOutputEntry;
+use super::super::test_support::{
+    binding_for_underlay, mark_test_quic_output_carrier_bulk_proven, output_entry_for_key,
+};
 use super::{
     ServerPathMetricsEntry, ServerPathMetricsSource, server_path_metrics_estimate_rate_bps,
     server_path_metrics_has_bulk_rate_evidence, server_path_metrics_has_sender_evidence,
     server_path_metrics_rate_bps,
 };
 use crate::model::capacity::{
-    PATH_OPEN_SCORE_BYTES, QUIC_TIMER_GRANULARITY, reliable_subflow_startup_sample_limit_bytes,
+    MIN_RATE_SAMPLE_BYTES, PATH_OPEN_SCORE_BYTES, QUIC_TIMER_GRANULARITY,
+    RELIABLE_INITIAL_WINDOW_PACKETS, reliable_subflow_startup_sample_limit_bytes,
 };
 use crate::model::path::CarrierPathKey;
 use crate::model::timing::quic_bulk_proof_freshness_horizon;
@@ -420,4 +425,217 @@ fn udp_bulk_rate_evidence_requires_source_fresh_non_app_limited_state() {
         server_output_has_bulk_rate_evidence(&entry),
         "the same full-volume sample becomes optional-path proof only after the carrier reports non-app-limited delivery"
     );
+}
+
+#[test]
+fn generic_metrics_preserve_but_do_not_extend_fixed_capacity_proof_deadline() {
+    let mux_limits = MuxLimits::default();
+    let key = CarrierPathKey {
+        underlay: UnderlayProtocol::Udp,
+        path_id: PathId(6),
+    };
+    let (commands, _receivers) = reliable_path_command_channels(8);
+    let binding = ResponseStreamBinding::new_with_limits(
+        SessionId(521),
+        key.underlay,
+        key.path_id,
+        commands,
+        FlowLane::Throughput,
+        mux_limits,
+    );
+    let mut output = output_entry_for_key(&binding, key);
+    mark_test_quic_output_carrier_bulk_proven(&mut output, mux_limits);
+    let metrics = output
+        .local_path_metrics
+        .expect("test QUIC metrics")
+        .metrics;
+    let accepted_at = Instant::now();
+    let expires_at = accepted_at + Duration::from_millis(20);
+    let proof_bytes = reliable_subflow_startup_sample_limit_bytes(mux_limits);
+    let accounting_slack = (PATH_OPEN_SCORE_BYTES as u64).min(proof_bytes / 8);
+    let required_proof_bytes = proof_bytes - accounting_slack;
+    let proof_elapsed = Duration::from_millis(10);
+    let proof = QuicCapacityProofCandidate {
+        token: 77,
+        train_bytes: proof_bytes,
+        sample_floor_bytes: proof_bytes,
+        accounting_slack_bytes: accounting_slack,
+        warmup_bytes: 0,
+        required_proof_bytes,
+        written_bytes: proof_bytes,
+        written_data_frame_count: RELIABLE_INITIAL_WINDOW_PACKETS as u64,
+        receipt_confirmed: true,
+        received_bytes: proof_bytes,
+        proof_elapsed,
+        rate_bps: quic_capacity_receipt_rate_bps(proof_bytes, proof_elapsed)
+            .expect("valid receipt rate"),
+        accepted_at,
+        expires_at,
+        proof_validity: Duration::from_millis(20),
+    };
+    assert!(binding.install_quic_capacity_proof_for_instance(
+        output.key,
+        output.path_instance_id,
+        metrics,
+        proof,
+    ));
+    binding.update_path_metrics(
+        output.key,
+        PathMetrics {
+            delivery_rate_bps: metrics.delivery_rate_bps / 2,
+            ..metrics
+        },
+        ServerPathMetricsSource::LocalSender,
+    );
+    assert_eq!(
+        output_entry_for_key(&binding, key)
+            .local_path_metrics
+            .and_then(|entry| entry.capacity_proof)
+            .map(|proof| proof.expires_at),
+        Some(expires_at)
+    );
+
+    std::thread::sleep(Duration::from_millis(25));
+    binding.update_path_metrics(
+        output.key,
+        PathMetrics {
+            delivery_rate_bps: metrics.delivery_rate_bps / 3,
+            ..metrics
+        },
+        ServerPathMetricsSource::LocalSender,
+    );
+    assert!(
+        output_entry_for_key(&binding, key)
+            .local_path_metrics
+            .is_some_and(|entry| entry.capacity_proof.is_none()),
+        "an expired fixed proof cannot be resurrected by a generic refresh"
+    );
+}
+
+#[test]
+fn peer_app_limited_metrics_do_not_seed_response_bulk_rate_or_envelope() {
+    for underlay in [UnderlayProtocol::Tcp, UnderlayProtocol::Udp] {
+        let (binding, key) = binding_for_underlay(underlay);
+        let metrics = PathMetrics {
+            path_id: key.path_id,
+            underlay: key.underlay,
+            direction: PathMetricDirection::ServerToClient,
+            metric_epoch: metric_epoch_now(),
+            metric_age_us: 0,
+            min_rtt_us: 20_000,
+            srtt_us: 20_000,
+            rttvar_us: 1_000,
+            jitter_us: 1_000,
+            delivery_rate_bps: 614_000,
+            pacing_rate_bps: 614_000,
+            loss_ppm: 0,
+            ecn_ppm: 0,
+            loss_observed: false,
+            ecn_observed: false,
+            bytes_in_flight: PATH_OPEN_SCORE_BYTES as u64,
+            queue_bytes: PATH_OPEN_SCORE_BYTES as u64,
+            inflight_limit_bytes: PATH_OPEN_SCORE_BYTES as u64,
+            inflight_hi_bytes: PATH_OPEN_SCORE_BYTES as u64,
+            confidence_ppm: 900_000,
+            app_limited: true,
+            has_ack_derived_data_sample: true,
+            data_sample_count: 142,
+            data_sample_bytes: 0,
+        };
+        binding.update_path_metrics(key, metrics, ServerPathMetricsSource::PeerHint);
+
+        let snapshot = binding
+            .send_path_snapshot(FlowLane::Throughput, MIN_RATE_SAMPLE_BYTES as usize)
+            .expect("peer metrics remain validation hints");
+        assert_eq!(snapshot.delivery_rate_bps, default_path_rate_bps(underlay));
+        assert_eq!(snapshot.pacing_rate_bps, snapshot.delivery_rate_bps);
+        assert_eq!(snapshot.inflight_limit_bytes, 0);
+        assert_eq!(snapshot.bytes_in_flight, 0);
+        assert_eq!(snapshot.confidence, 0.0);
+        assert!(snapshot.app_limited);
+    }
+}
+
+#[test]
+fn response_peer_hint_yields_to_durable_local_quic_estimate() {
+    let (binding, key) = binding_for_underlay(UnderlayProtocol::Udp);
+    let mut peer_hint = PathMetrics {
+        path_id: key.path_id,
+        underlay: key.underlay,
+        direction: PathMetricDirection::ClientToServer,
+        metric_epoch: metric_epoch_now(),
+        metric_age_us: 0,
+        min_rtt_us: 200_000,
+        srtt_us: 200_000,
+        rttvar_us: 10_000,
+        jitter_us: 10_000,
+        delivery_rate_bps: 200_000_000,
+        pacing_rate_bps: 200_000_000,
+        loss_ppm: 0,
+        ecn_ppm: 0,
+        loss_observed: false,
+        ecn_observed: false,
+        bytes_in_flight: 0,
+        queue_bytes: 0,
+        inflight_limit_bytes: 0,
+        inflight_hi_bytes: 0,
+        confidence_ppm: 100_000,
+        app_limited: false,
+        has_ack_derived_data_sample: false,
+        data_sample_count: 0,
+        data_sample_bytes: 0,
+    };
+    binding.update_path_metrics(key, peer_hint, ServerPathMetricsSource::PeerHint);
+
+    let local_proof = PathMetrics {
+        direction: PathMetricDirection::ServerToClient,
+        min_rtt_us: 20_000,
+        srtt_us: 20_000,
+        rttvar_us: 1_000,
+        jitter_us: 1_000,
+        delivery_rate_bps: 500_000,
+        pacing_rate_bps: 500_000,
+        confidence_ppm: 1_000_000,
+        app_limited: true,
+        ..peer_hint
+    };
+    binding.update_path_metrics(key, local_proof, ServerPathMetricsSource::LocalSender);
+
+    let snapshot = binding
+        .send_path_snapshot(FlowLane::Throughput, MIN_RATE_SAMPLE_BYTES as usize)
+        .expect("path remains attached");
+
+    assert_eq!(snapshot.delivery_rate_bps, 200_000_000.0);
+    assert_eq!(snapshot.srtt_ms, 20.0);
+    assert!(snapshot.app_limited);
+
+    peer_hint.delivery_rate_bps = 300_000_000;
+    binding.update_path_metrics(key, peer_hint, ServerPathMetricsSource::PeerHint);
+    let updated = binding
+        .send_path_snapshot(FlowLane::Throughput, MIN_RATE_SAMPLE_BYTES as usize)
+        .expect("path remains attached");
+    assert_eq!(updated.delivery_rate_bps, 300_000_000.0);
+    assert_eq!(
+        updated.srtt_ms, 20.0,
+        "local liveness RTT must not be erased by peer hint refresh"
+    );
+
+    let durable_local = PathMetrics {
+        metric_epoch: metric_epoch_now(),
+        delivery_rate_bps: 500_000,
+        pacing_rate_bps: 500_000,
+        app_limited: true,
+        has_ack_derived_data_sample: true,
+        data_sample_count: RELIABLE_INITIAL_WINDOW_PACKETS as u32,
+        data_sample_bytes: reliable_subflow_startup_sample_limit_bytes(MuxLimits::default()),
+        ..local_proof
+    };
+    binding.update_path_metrics(key, durable_local, ServerPathMetricsSource::LocalSender);
+    let local_estimate = binding
+        .send_path_snapshot(FlowLane::Throughput, MIN_RATE_SAMPLE_BYTES as usize)
+        .expect("path remains attached");
+    assert_eq!(local_estimate.delivery_rate_bps, 500_000.0);
+    assert!(local_estimate.app_limited);
+    let entry = output_entry_for_key(&binding, key);
+    assert!(!server_output_has_bulk_rate_evidence(&entry));
 }

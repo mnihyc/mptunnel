@@ -254,3 +254,7 @@ impl ResponseStreamBinding {
         let _ = self.version.send(current.wrapping_add(1));
     }
 }
+
+#[cfg(test)]
+#[path = "response_lifecycle_test.rs"]
+mod tests;

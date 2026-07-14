@@ -914,3 +914,7 @@ pub(super) fn response_outputs_have_live_mixed_owner_underlays(
     }
     false
 }
+
+#[cfg(test)]
+#[path = "response_topology_test.rs"]
+mod tests;

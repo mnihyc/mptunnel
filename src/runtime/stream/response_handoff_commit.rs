@@ -379,3 +379,7 @@ impl ResponseStreamBinding {
         Ok(())
     }
 }
+
+#[cfg(test)]
+#[path = "response_handoff_commit_test.rs"]
+mod tests;

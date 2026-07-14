@@ -803,3 +803,7 @@ pub(in crate::runtime) async fn wait_for_carrier_capacity_notifies(notifies: Vec
         .collect::<Vec<_>>();
     let _ = futures::future::select_all(waits).await;
 }
+
+#[cfg(test)]
+#[path = "handle_test.rs"]
+mod tests;

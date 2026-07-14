@@ -26,7 +26,6 @@ quinn-proto = { version = "0.11", default-features = false }
 rcgen = "0.14"
 ring = "0.17"
 rustls = { version = "0.23", default-features = false, features = ["ring"] }
-rustls-pki-types = "1"
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 sha2 = "0.10"

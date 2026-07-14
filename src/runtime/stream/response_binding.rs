@@ -112,11 +112,12 @@ use crate::mux::MuxLimits;
 use crate::protocol::Frame;
 #[cfg(test)]
 use crate::protocol::OffsetRange;
-use crate::protocol::{PathId, PathMetrics, SessionId, StreamId, StreamOpenRole, UnderlayProtocol};
+#[cfg(test)]
+use crate::protocol::PathMetrics;
+use crate::protocol::{PathId, SessionId, StreamId, StreamOpenRole, UnderlayProtocol};
 #[cfg(test)]
 use crate::runtime::RuntimeError;
 use crate::runtime::path::commands::{ReliablePathCommand, ReliablePathCommandSender};
-use crate::runtime::path::tcp::capacity::TcpCapacityProofCandidate;
 #[cfg(feature = "lab-diagnostics")]
 use crate::runtime::relay::io::reliable_bulk_carrier_feed_quantum_bytes;
 use crate::scheduler::FlowLane;
@@ -127,6 +128,7 @@ use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 #[cfg(feature = "lab-diagnostics")]
 use std::time::Duration;
+#[cfg(any(test, feature = "lab-diagnostics"))]
 use std::time::Instant;
 use tokio::sync::watch;
 
@@ -381,29 +383,6 @@ impl ResponseStreamBinding {
         self.version.subscribe()
     }
 
-    pub(super) fn set_sender_queue_bytes(&self, bytes: usize) {
-        let bytes = bytes as u64;
-        let mut outputs = self
-            .outputs
-            .lock()
-            .expect("server reliable stream binding lock");
-        let mut changed = false;
-        for entry in &mut outputs.entries {
-            if entry.product_queue_bytes != bytes {
-                entry.product_queue_bytes = bytes;
-                changed = true;
-            }
-        }
-        if changed {
-            self.response_model_generation
-                .fetch_add(1, Ordering::AcqRel);
-        }
-        drop(outputs);
-        if changed {
-            self.notify_update();
-        }
-    }
-
     #[cfg(feature = "lab-diagnostics")]
     pub(in crate::runtime) fn should_emit_response_service_handoff_diagnostic(
         &self,
@@ -577,79 +556,6 @@ impl ResponseStreamBinding {
         );
     }
 
-    #[cfg(test)]
-    pub(in crate::runtime) fn mark_output_bulk_proven_for_test(&self, key: CarrierPathKey) {
-        let mut outputs = self
-            .outputs
-            .lock()
-            .expect("server reliable stream binding lock");
-        let entry = outputs
-            .entries
-            .iter_mut()
-            .find(|entry| entry.key == key)
-            .expect("test bulk-proven output");
-        entry.product_progress_rate_bps = Some(100_000_000.0);
-        entry.delivery_rate_bps = Some(100_000_000.0);
-        entry.delivery_samples = 1;
-        entry.owner_data_acked_bytes = reliable_subflow_startup_sample_limit_bytes(self.mux_limits);
-        self.response_model_generation
-            .fetch_add(1, Ordering::AcqRel);
-    }
-
-    #[cfg(test)]
-    pub(in crate::runtime) fn set_output_product_model_for_test(
-        &self,
-        key: CarrierPathKey,
-        rate_bps: f64,
-        srtt_ms: f64,
-    ) {
-        let mut outputs = self
-            .outputs
-            .lock()
-            .expect("server reliable stream binding lock");
-        let entry = outputs
-            .entries
-            .iter_mut()
-            .find(|entry| entry.key == key)
-            .expect("test modeled output");
-        entry.product_progress_rate_bps = Some(rate_bps.max(1.0));
-        entry.delivery_rate_bps = Some(rate_bps.max(1.0));
-        entry.srtt_ms = Some(srtt_ms.max(1.0));
-        self.response_model_generation
-            .fetch_add(1, Ordering::AcqRel);
-    }
-
-    #[cfg(test)]
-    pub(in crate::runtime) fn install_tcp_ack_clock_calibration_for_test(
-        &self,
-        key: CarrierPathKey,
-        spent_bytes: u64,
-        credit_limit_bytes: u64,
-        max_limit_bytes: u64,
-        active: bool,
-    ) {
-        let mut outputs = self
-            .outputs
-            .lock()
-            .expect("server reliable stream binding lock");
-        let entry = outputs
-            .entries
-            .iter()
-            .find(|entry| entry.key == key)
-            .expect("test calibration output");
-        assert_eq!(entry.key.underlay, UnderlayProtocol::Tcp);
-        let identity = (entry.key, entry.incarnation);
-        let mut calibration =
-            ResponseAckClockCalibrationState::new(credit_limit_bytes, max_limit_bytes);
-        calibration.spent_bytes = spent_bytes;
-        outputs.ack_clock_calibrations.insert(identity, calibration);
-        if active {
-            outputs.active_ack_clock_calibration = Some(identity);
-        } else if outputs.active_ack_clock_calibration == Some(identity) {
-            outputs.active_ack_clock_calibration = None;
-        }
-    }
-
     pub(in crate::runtime) async fn close_stream(&self, stream_id: StreamId) {
         let outputs = {
             let outputs = self
@@ -720,200 +626,6 @@ impl ResponseStreamBinding {
         let current = *self.version.borrow();
         let _ = self.version.send(current.wrapping_add(1));
     }
-
-    pub(in crate::runtime) fn update_path_metrics_for_instance(
-        &self,
-        key: CarrierPathKey,
-        path_instance_id: ServerCarrierPathInstanceId,
-        metrics: PathMetrics,
-        source: ServerPathMetricsSource,
-    ) {
-        self.update_path_metrics_matching(key, Some(path_instance_id), metrics, source);
-    }
-
-    pub(in crate::runtime) fn install_quic_capacity_proof_for_instance(
-        &self,
-        key: CarrierPathKey,
-        path_instance_id: ServerCarrierPathInstanceId,
-        metrics: PathMetrics,
-        candidate: QuicCapacityProofCandidate,
-    ) -> bool {
-        self.install_path_metrics_entry_matching(
-            key,
-            Some(path_instance_id),
-            ServerPathMetricsEntry {
-                metrics,
-                source: ServerPathMetricsSource::LocalSender,
-                recorded_at: Instant::now(),
-                capacity_proof: Some(candidate),
-                tcp_capacity_proof: None,
-            },
-            false,
-        )
-        .0
-    }
-
-    pub(in crate::runtime) fn install_tcp_capacity_proof_for_instance(
-        &self,
-        key: CarrierPathKey,
-        path_instance_id: ServerCarrierPathInstanceId,
-        metrics: PathMetrics,
-        candidate: TcpCapacityProofCandidate,
-    ) -> bool {
-        self.install_path_metrics_entry_matching(
-            key,
-            Some(path_instance_id),
-            ServerPathMetricsEntry {
-                metrics,
-                source: ServerPathMetricsSource::LocalSender,
-                recorded_at: Instant::now(),
-                capacity_proof: None,
-                tcp_capacity_proof: Some(candidate),
-            },
-            false,
-        )
-        .0
-    }
-
-    pub(in crate::runtime) fn install_stored_path_metrics_for_instance(
-        &self,
-        key: CarrierPathKey,
-        path_instance_id: ServerCarrierPathInstanceId,
-        path_metrics: ServerPathMetricsEntry,
-    ) {
-        self.install_path_metrics_entry_matching(key, Some(path_instance_id), path_metrics, true);
-    }
-
-    pub(in crate::runtime) fn notify_installed_path_metrics(&self) {
-        self.graduate_completed_response_startup_owner();
-        self.notify_update();
-    }
-
-    #[cfg(test)]
-    pub(in crate::runtime) fn update_path_metrics(
-        &self,
-        key: CarrierPathKey,
-        metrics: PathMetrics,
-        source: ServerPathMetricsSource,
-    ) {
-        self.update_path_metrics_matching(key, None, metrics, source);
-    }
-
-    fn update_path_metrics_matching(
-        &self,
-        key: CarrierPathKey,
-        path_instance_id: Option<ServerCarrierPathInstanceId>,
-        metrics: PathMetrics,
-        source: ServerPathMetricsSource,
-    ) {
-        let (_, changed) = self.install_path_metrics_entry_matching(
-            key,
-            path_instance_id,
-            ServerPathMetricsEntry {
-                metrics,
-                source,
-                recorded_at: Instant::now(),
-                capacity_proof: None,
-                tcp_capacity_proof: None,
-            },
-            true,
-        );
-        if changed {
-            #[cfg(feature = "lab-diagnostics")]
-            lab_diagnostic(
-                "server_response_path_metrics_attached",
-                format_args!(
-                    "session_id={} underlay={:?} path_id={} source={:?} direction={:?} rate_mbps={:.3} pacing_mbps={:.3} srtt_ms={:.3} confidence_ppm={} app_limited={} ack_sample={} sample_count={} sample_bytes={}",
-                    self.session_id.0,
-                    key.underlay,
-                    key.path_id.0,
-                    source,
-                    metrics.direction,
-                    metrics.delivery_rate_bps as f64 / 1_000_000.0,
-                    metrics.pacing_rate_bps as f64 / 1_000_000.0,
-                    metrics.srtt_us as f64 / 1000.0,
-                    metrics.confidence_ppm,
-                    metrics.app_limited,
-                    metrics.has_ack_derived_data_sample,
-                    metrics.data_sample_count,
-                    metrics.data_sample_bytes,
-                ),
-            );
-        }
-    }
-
-    fn install_path_metrics_entry_matching(
-        &self,
-        key: CarrierPathKey,
-        path_instance_id: Option<ServerCarrierPathInstanceId>,
-        mut path_metrics: ServerPathMetricsEntry,
-        notify: bool,
-    ) -> (bool, bool) {
-        let mut outputs = self
-            .outputs
-            .lock()
-            .expect("server reliable stream binding lock");
-        let now = Instant::now();
-        let source = path_metrics.source;
-        let metrics = path_metrics.metrics;
-        let explicit_quic_capacity_proof = path_metrics.capacity_proof.is_some();
-        let explicit_tcp_capacity_proof = path_metrics.tcp_capacity_proof.is_some();
-        let mut matched = false;
-        let mut changed = false;
-        for entry in &mut outputs.entries {
-            if entry.key == key
-                && path_instance_id.is_none_or(|instance| entry.path_instance_id == instance)
-            {
-                matched = true;
-                let current = match source {
-                    ServerPathMetricsSource::LocalSender => &mut entry.local_path_metrics,
-                    ServerPathMetricsSource::PeerHint => &mut entry.peer_path_metrics,
-                };
-                if !explicit_quic_capacity_proof {
-                    path_metrics.capacity_proof = current
-                        .and_then(|previous| previous.capacity_proof)
-                        .filter(|proof| proof.expires_at > now);
-                }
-                if !explicit_tcp_capacity_proof {
-                    path_metrics.tcp_capacity_proof = current
-                        .and_then(|previous| previous.tcp_capacity_proof)
-                        .filter(|proof| proof.expires_at > now);
-                }
-                let scheduling_changed = current.is_none_or(|previous| {
-                    previous.source != source
-                        || !server_path_metrics_scheduling_equivalent(previous.metrics, metrics)
-                        || previous.capacity_proof != path_metrics.capacity_proof
-                        || previous.tcp_capacity_proof != path_metrics.tcp_capacity_proof
-                });
-                *current = Some(path_metrics);
-                changed |= scheduling_changed;
-            }
-        }
-        if changed {
-            self.response_model_generation
-                .fetch_add(1, Ordering::AcqRel);
-        }
-        drop(outputs);
-        if changed && notify {
-            self.graduate_completed_response_startup_owner();
-            self.notify_update();
-        }
-        (matched, changed)
-    }
-}
-
-fn server_path_metrics_scheduling_equivalent(
-    mut left: PathMetrics,
-    mut right: PathMetrics,
-) -> bool {
-    // Epoch and age refresh evidence lifetime but do not change a ranking or
-    // admission input. Suppressing that no-op update avoids waking every bound
-    // response stream on each idle QUIC metrics poll.
-    left.metric_epoch = 0;
-    left.metric_age_us = 0;
-    right.metric_epoch = 0;
-    right.metric_age_us = 0;
-    left == right
 }
 
 #[cfg(test)]

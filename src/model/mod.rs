@@ -10,10 +10,6 @@ pub(crate) mod capacity;
 pub(crate) mod multipath;
 pub(crate) mod path;
 pub(crate) mod request;
-mod response_ownership;
+pub(crate) mod response;
 pub(crate) mod timing;
 pub(crate) mod work;
-
-pub(super) use response_ownership::{
-    ResponseCandidateTailDebt, ResponseOrderedTail, ResponseSameFamilyReservoir,
-};

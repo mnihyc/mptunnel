@@ -5,7 +5,8 @@ use super::quic_capacity::{
     ServerQuicCapacityCalibrationReservation, finish_quic_capacity_session_reclamation,
 };
 use crate::model::path::{CarrierPathInstanceId, CarrierPathKey};
-use crate::protocol::{SessionId, UnderlayProtocol};
+use crate::model::response::ResponseServiceFamilyLoads;
+use crate::protocol::SessionId;
 use std::collections::HashMap;
 use std::sync::Mutex;
 #[cfg(test)]
@@ -15,12 +16,6 @@ use std::time::Instant;
 // Session coordination owns one state mutex, generations, and probe leases.
 // `load` owns counter semantics through that same mutex. Neither layer
 // ranks paths, estimates durable transport evidence, or owns product bytes.
-
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
-pub(in crate::runtime) struct ResponseServiceFamilyLoads {
-    pub(super) tcp: u32,
-    pub(super) udp: u32,
-}
 
 #[derive(Debug, Clone, Copy)]
 pub(in crate::runtime) struct ResponseSessionSchedulingSnapshot {
@@ -39,24 +34,6 @@ pub(super) struct ServerResponsePathSchedulingSnapshot {
     pub(super) path_load: ServerPathLaneLoad,
     pub(super) session_load: ServerPathLaneLoad,
     pub(super) quic_capacity_calibration_attempts: u8,
-}
-
-impl ResponseServiceFamilyLoads {
-    #[cfg(test)]
-    pub(in crate::runtime) fn new(tcp: u32, udp: u32) -> Self {
-        Self { tcp, udp }
-    }
-
-    pub(in crate::runtime) fn for_underlay(self, underlay: UnderlayProtocol) -> u32 {
-        match underlay {
-            UnderlayProtocol::Tcp => self.tcp,
-            UnderlayProtocol::Udp => self.udp,
-        }
-    }
-
-    pub(in crate::runtime) fn needs_diversification(self) -> bool {
-        self.tcp.abs_diff(self.udp) >= 2
-    }
 }
 
 #[derive(Debug, Default)]

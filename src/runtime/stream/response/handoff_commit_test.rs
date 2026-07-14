@@ -3,14 +3,14 @@ use super::super::evidence::{
     server_output_fresh_quic_capacity_proof, server_output_quic_capacity_proof_marker,
 };
 use super::super::handoff::ResponseServiceHandoffDrainRequest;
-use super::super::session::{ResponseServiceFamilyLoads, ServerPathLaneTracker};
+use super::super::session::ServerPathLaneTracker;
 use super::super::test_support::{
     mark_test_quic_output_receipt_bulk_proven, mark_test_response_output_bulk_proven,
     stream_data_frame_at,
 };
 use super::ResponseServiceHandoffRequest;
-use super::placement::ResponseServiceHandoffMode;
 use crate::model::path::CarrierPathKey;
+use crate::model::response::{ResponseServiceFamilyLoads, ResponseServiceHandoffMode};
 use crate::mux::MuxLimits;
 use crate::protocol::{Frame, PathId, SessionId, StreamOpenRole, UnderlayProtocol};
 use crate::runtime::RuntimeError;

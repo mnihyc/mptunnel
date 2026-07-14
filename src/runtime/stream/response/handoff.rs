@@ -7,9 +7,6 @@
 use super::ResponseStreamBinding;
 use super::admission::server_output_has_bulk_rate_evidence_with_limits;
 use super::evidence::server_output_fresh_quic_capacity_proof;
-use super::placement::{
-    ResponseServiceHandoffMode, response_rate_fair_share_bps, response_service_handoff_mode,
-};
 use super::quic_capacity::valid_quic_capacity_proof_candidate_at;
 use super::session::{ServerPathLaneTracker, ServerPathLaneTrackerState};
 use super::snapshot::server_bulk_output_snapshot_with_command_pending;
@@ -19,6 +16,9 @@ use crate::lab_diagnostics::lab_diagnostic;
 use crate::model::capacity::QuicCapacityProofCandidate;
 use crate::model::multipath::FlowSubflowSet;
 use crate::model::path::{CarrierPathInstanceId, CarrierPathKey};
+use crate::model::response::{
+    ResponseServiceHandoffMode, response_rate_fair_share_bps, response_service_handoff_mode,
+};
 use crate::protocol::{SessionId, StreamOpenRole, UnderlayProtocol};
 use crate::scheduler::FlowLane;
 use std::sync::atomic::Ordering;

@@ -23,16 +23,20 @@ use crate::model::admission::{
 };
 use crate::model::capacity::QuicCapacityProofCandidate;
 use crate::model::path::CarrierPathInstanceId;
-use crate::model::{ResponseCandidateTailDebt, ResponseOrderedTail, ResponseSameFamilyReservoir};
+use crate::model::response::{
+    CarrierPathFlightDebt, ResponseCandidateTailDebt, ResponseOrderedTail,
+    ResponseSameFamilyReservoir, ResponseServiceFamilyLoads, ResponseServiceHandoffMode,
+    response_oldest_lower_flight_owner, response_ordering_debt_bytes, response_rate_fair_share_bps,
+    response_service_handoff_mode,
+};
 use crate::protocol::frame::reliable_stream_frame_accounted_bytes;
 use crate::runtime::stream::response::{
-    CarrierPathFlightDebt, MAX_RESPONSE_QUIC_CAPACITY_CALIBRATION_ATTEMPTS_PER_PATH,
+    MAX_RESPONSE_QUIC_CAPACITY_CALIBRATION_ATTEMPTS_PER_PATH,
     MIN_ACTIVE_RESPONSE_FLOWS_FOR_SAME_FAMILY_DISCOVERY,
     ResponseAckClockCalibrationRetirementRequest, ResponseDispatchTarget,
-    ResponseQuicCapacityCalibrationRequest, ResponseSenderPathTarget, ResponseServiceFamilyLoads,
+    ResponseQuicCapacityCalibrationRequest, ResponseSenderPathTarget,
     ResponseServiceHandoffDrainRequest, ResponseServiceHandoffDrainReservation,
-    ResponseServiceHandoffMode, ResponseStreamBinding, quic_capacity_proof_pin_matches_marker,
-    response_rate_fair_share_bps, response_service_handoff_mode, server_bulk_output_eta_ms,
+    ResponseStreamBinding, quic_capacity_proof_pin_matches_marker, server_bulk_output_eta_ms,
     valid_quic_capacity_proof_candidate_at,
 };
 use crate::scheduler::PathRateScope;
@@ -41,22 +45,6 @@ pub(super) fn carrier_path_key_order(
     right: CarrierPathKey,
 ) -> std::cmp::Ordering {
     (left.path_id, left.underlay).cmp(&(right.path_id, right.underlay))
-}
-
-pub(super) fn response_ordering_debt_bytes(
-    lower_flights: &[CarrierPathFlightDebt],
-    candidate: CarrierPathKey,
-) -> u64 {
-    lower_flights
-        .iter()
-        .filter_map(|flight| (flight.key != candidate).then_some(flight.bytes))
-        .sum()
-}
-
-pub(super) fn response_oldest_lower_flight_owner(
-    lower_flights: &[CarrierPathFlightDebt],
-) -> Option<CarrierPathKey> {
-    lower_flights.first().map(|flight| flight.key)
 }
 
 #[derive(Debug, Clone, Copy)]

@@ -12,7 +12,6 @@ mod handoff;
 mod handoff_commit;
 mod lifecycle;
 mod load;
-mod placement;
 mod quic_capacity;
 mod quic_probe;
 mod session;
@@ -23,7 +22,6 @@ mod transaction;
 
 pub(in crate::runtime) use admission::ResponseSubflowAdmissionRequest;
 use admission::ResponseSubflowSetState;
-pub(in crate::runtime) use delivery::CarrierPathFlightDebt;
 use delivery::ResponseAckOrderingState;
 pub(super) use delivery::{
     CarrierPathFlight, product_flights_have_recent_repair_overlap,
@@ -38,16 +36,13 @@ pub(in crate::runtime) use handoff::{
 };
 pub(in crate::runtime) use handoff_commit::ResponseServiceHandoffRequest;
 pub(in crate::runtime) use load::ServerRealtimeFlowRegistration;
-pub(in crate::runtime) use placement::{
-    ResponseServiceHandoffMode, response_rate_fair_share_bps, response_service_handoff_mode,
-};
 #[cfg(any(test, feature = "lab-diagnostics"))]
 pub(in crate::runtime) use quic_capacity::well_formed_quic_capacity_proof_candidate;
 pub(in crate::runtime) use quic_capacity::{
     quic_capacity_proof_pin_matches_marker, valid_quic_capacity_proof_candidate_at,
 };
 pub(in crate::runtime) use quic_probe::ResponseQuicCapacityCalibrationRequest;
-pub(in crate::runtime) use session::{ResponseServiceFamilyLoads, ServerPathLaneTracker};
+pub(in crate::runtime) use session::ServerPathLaneTracker;
 pub(in crate::runtime) use snapshot::server_bulk_output_eta_ms;
 pub(in crate::runtime) use tcp_capacity::TcpCapacityProbeSessionLease;
 use topology::ResponseStreamOutputs;

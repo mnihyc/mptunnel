@@ -8,6 +8,7 @@ use super::topology::{ResponseSenderPathTarget, ResponseStreamOutputs};
 #[cfg(feature = "lab-diagnostics")]
 use crate::lab_diagnostics::lab_diagnostic;
 use crate::model::path::CarrierPathKey;
+use crate::model::response::CarrierPathFlightDebt;
 use crate::model::work::CarrierWorkKind;
 use crate::protocol::frame::reliable_stream_frame_extent;
 use crate::protocol::{Frame, OffsetRange, StreamOpenRole, UnderlayProtocol};
@@ -63,12 +64,6 @@ impl CarrierPathReleasedFlight {
     pub(in crate::runtime::stream) fn fixed_output_sample(self) -> (usize, Instant, bool) {
         (self.flight.bytes, self.flight.sent_at, self.path_proving)
     }
-}
-
-#[derive(Debug, Clone, Copy)]
-pub(in crate::runtime) struct CarrierPathFlightDebt {
-    pub(in crate::runtime) key: CarrierPathKey,
-    pub(in crate::runtime) bytes: u64,
 }
 
 #[derive(Debug, Clone, Copy)]

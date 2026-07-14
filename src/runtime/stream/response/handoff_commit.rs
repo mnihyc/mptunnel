@@ -9,9 +9,6 @@ use super::admission::server_output_has_bulk_rate_evidence_with_limits;
 use super::evidence::{
     server_output_fresh_quic_capacity_proof, server_output_quic_capacity_proof_marker,
 };
-use super::placement::{
-    ResponseServiceHandoffMode, response_rate_fair_share_bps, response_service_handoff_mode,
-};
 use super::quic_capacity::quic_capacity_proof_pin_matches_marker;
 use super::snapshot::server_bulk_output_snapshot_with_command_pending;
 use super::topology::ResponseDispatchTarget;
@@ -22,6 +19,9 @@ use crate::lab_diagnostics::lab_diagnostic;
 use crate::model::capacity::QuicCapacityProofCandidate;
 use crate::model::multipath::FlowSubflowSet;
 use crate::model::path::{CarrierPathInstanceId, CarrierPathKey};
+use crate::model::response::{
+    ResponseServiceHandoffMode, response_rate_fair_share_bps, response_service_handoff_mode,
+};
 use crate::protocol::frame::reliable_stream_frame_extent;
 use crate::protocol::{Frame, StreamOpenRole};
 use crate::runtime::RuntimeError;

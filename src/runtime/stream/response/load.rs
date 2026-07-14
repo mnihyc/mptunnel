@@ -3,7 +3,8 @@
 
 use super::session::ServerPathLaneTracker;
 use crate::model::path::CarrierPathKey;
-use crate::protocol::{SessionId, UnderlayProtocol};
+use crate::model::response::ResponseServiceFamilyLoads;
+use crate::protocol::SessionId;
 use crate::scheduler::FlowLane;
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
@@ -44,7 +45,7 @@ pub(super) struct ResponseSessionLoadState {
     attachment_paths: HashMap<CarrierPathKey, ServerPathLaneLoad>,
     service_paths: HashMap<CarrierPathKey, ServerPathLaneLoad>,
     service_total: ServerPathLaneLoad,
-    service_family: super::session::ResponseServiceFamilyLoads,
+    service_family: ResponseServiceFamilyLoads,
     realtime_flows: u32,
     active_response_flows: u32,
 }
@@ -76,7 +77,7 @@ impl ResponseSessionLoadState {
         self.active_response_flows
     }
 
-    pub(super) fn service_family_loads(&self) -> super::session::ResponseServiceFamilyLoads {
+    pub(super) fn service_family_loads(&self) -> ResponseServiceFamilyLoads {
         self.service_family
     }
 
@@ -151,11 +152,8 @@ impl ResponseSessionLoadState {
     pub(super) fn add_response_service(&mut self, path: CarrierPathKey, lane: FlowLane) {
         self.service_paths.entry(path).or_default().add(lane);
         self.service_total.add(lane);
-        let family = &mut self.service_family;
-        match path.underlay {
-            UnderlayProtocol::Tcp => family.tcp = family.tcp.saturating_add(1),
-            UnderlayProtocol::Udp => family.udp = family.udp.saturating_add(1),
-        }
+        self.service_family
+            .saturating_add_one_for_underlay(path.underlay);
     }
 
     pub(super) fn remove_response_service(&mut self, path: CarrierPathKey, lane: FlowLane) -> bool {
@@ -171,14 +169,8 @@ impl ResponseSessionLoadState {
         }
 
         self.service_total.remove(lane);
-        match path.underlay {
-            UnderlayProtocol::Tcp => {
-                self.service_family.tcp = self.service_family.tcp.saturating_sub(1)
-            }
-            UnderlayProtocol::Udp => {
-                self.service_family.udp = self.service_family.udp.saturating_sub(1)
-            }
-        }
+        self.service_family
+            .saturating_remove_one_for_underlay(path.underlay);
         true
     }
 

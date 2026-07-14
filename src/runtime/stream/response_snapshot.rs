@@ -1,24 +1,26 @@
-//! Immutable scheduler projections built from output state and validated evidence.
-//! Lane pressure and path facts remain owned by their respective source models.
+//! Immutable binding views and scheduler projections over validated evidence.
+//! This module reads source models without reserving capacity or mutating scheduling state.
 
+use super::ResponseStreamBinding;
 use super::response_admission::{
-    server_output_has_bulk_rate_evidence_with_limits,
+    server_output_accepts_service_capacity_prior, server_output_has_bulk_rate_evidence_with_limits,
     server_output_has_durable_product_ack_progress, server_output_has_sender_evidence,
     server_output_has_service_feed_evidence_with_limits,
 };
 use super::response_evidence::{
     ServerPathMetricsEntry, ServerPathMetricsSource, server_output_local_path_metrics,
-    server_path_metrics_bulk_sample_floor_bytes, server_path_metrics_estimate_rate_bps,
-    server_path_metrics_has_bulk_rate_evidence, server_path_metrics_rate_bps,
-    server_quic_capacity_proof, server_tcp_capacity_proof,
+    server_output_quic_capacity_proof_marker, server_path_metrics_bulk_sample_floor_bytes,
+    server_path_metrics_estimate_rate_bps, server_path_metrics_has_bulk_rate_evidence,
+    server_path_metrics_rate_bps, server_quic_capacity_proof, server_tcp_capacity_proof,
     server_udp_path_metrics_has_durable_rate_estimate,
 };
-use super::response_session::{ServerPathLaneTracker, ServerResponsePathSchedulingSnapshot};
-use super::response_topology::{
-    ResponseStreamOutputEntry, ResponseStreamOutputs, response_live_ordered_data_owner,
-    response_outputs_have_live_mixed_owner_underlays,
+use super::response_session::{
+    ResponseSessionSchedulingSnapshot, ServerPathLaneTracker, ServerResponsePathSchedulingSnapshot,
 };
-use super::{ResponseRelayReadSnapshot, ResponseSourceServiceSnapshot};
+use super::response_topology::{
+    ResponseSenderPathTarget, ResponseStreamOutputEntry, ResponseStreamOutputs,
+    response_live_ordered_data_owner, response_outputs_have_live_mixed_owner_underlays,
+};
 use crate::model::admission::bulk_service_horizon_payload_bytes;
 use crate::model::capacity::{
     PATH_OPEN_SCORE_BYTES, RELIABLE_INITIAL_WINDOW_PACKETS,
@@ -34,7 +36,222 @@ use crate::runtime::path::model::{
 use crate::runtime::relay::io::adaptive_reliable_relay_inflight_bytes;
 use crate::runtime::stream::response_placement::ResponseRateScope;
 use crate::scheduler::{FlowLane, PathSnapshot};
+use std::sync::Arc;
+use std::sync::atomic::Ordering;
 use std::time::Instant;
+use tokio::sync::Notify;
+
+#[derive(Debug, Clone, Copy)]
+pub(in crate::runtime) struct ResponseSourceServiceSnapshot {
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub(in crate::runtime) key: CarrierPathKey,
+    pub(in crate::runtime) active_latency_sensitive_flows: u32,
+    pub(in crate::runtime) has_service_feed_evidence: bool,
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub(in crate::runtime) has_bulk_rate_evidence: bool,
+}
+
+#[derive(Debug, Clone, Copy)]
+pub(in crate::runtime) struct ResponseRelayReadSnapshot {
+    pub(in crate::runtime) send_path: Option<PathSnapshot>,
+    pub(in crate::runtime) source_service: Option<ResponseSourceServiceSnapshot>,
+    pub(in crate::runtime) independent_source_staging: bool,
+}
+
+impl ResponseStreamBinding {
+    pub(in crate::runtime) fn send_path_snapshot(
+        &self,
+        lane: FlowLane,
+        payload_bytes: usize,
+    ) -> Option<PathSnapshot> {
+        self.relay_read_snapshot(lane, payload_bytes).send_path
+    }
+
+    pub(in crate::runtime) fn relay_read_snapshot(
+        &self,
+        lane: FlowLane,
+        payload_bytes: usize,
+    ) -> ResponseRelayReadSnapshot {
+        let may_have_mixed_owner_underlays = self.may_have_mixed_owner_underlays();
+        let outputs = self
+            .outputs
+            .lock()
+            .expect("server reliable stream binding lock");
+        let stored_service_key = *self
+            .ordered_data_owner
+            .lock()
+            .expect("server reliable stream ordered data owner lock");
+        outputs.relay_read_snapshot(
+            stored_service_key,
+            may_have_mixed_owner_underlays,
+            self.session_id,
+            &self.lane_tracker,
+            lane,
+            payload_bytes,
+            self.mux_limits,
+        )
+    }
+
+    pub(in crate::runtime::stream) fn capacity_notifies(&self) -> Vec<Arc<Notify>> {
+        self.outputs
+            .lock()
+            .expect("server reliable stream binding lock")
+            .entries
+            .iter()
+            .map(|entry| entry.commands.capacity_notify())
+            .collect()
+    }
+
+    pub(in crate::runtime) fn response_model_generation(&self) -> u64 {
+        self.response_model_generation.load(Ordering::Acquire)
+    }
+
+    pub(in crate::runtime) fn response_scheduling_snapshot(
+        &self,
+    ) -> ResponseSessionSchedulingSnapshot {
+        self.lane_tracker
+            .response_scheduling_snapshot(self.session_id)
+    }
+
+    pub(in crate::runtime) fn sender_path_targets(
+        &self,
+        lane: FlowLane,
+        payload_bytes: usize,
+    ) -> Vec<ResponseSenderPathTarget> {
+        let stored_active_key = self.ordered_data_owner();
+        let outputs = self
+            .outputs
+            .lock()
+            .expect("server reliable stream binding lock");
+        let request_active_key = *self
+            .request_active_owner
+            .lock()
+            .expect("server reliable stream request active owner lock");
+        let active_key = response_live_ordered_data_owner(stored_active_key, &outputs.entries);
+        let now = Instant::now();
+        let response_scheduling = self.lane_tracker.response_path_scheduling_snapshots(
+            self.session_id,
+            outputs
+                .entries
+                .iter()
+                .map(|entry| (entry.key, entry.path_instance_id)),
+        );
+        outputs
+            .entries
+            .iter()
+            .zip(response_scheduling)
+            .map(|(entry, response_scheduling)| {
+                let command_pending_bytes = entry.commands.pending_bytes();
+                let calibration_identity = (entry.key, entry.incarnation);
+                let calibration = outputs
+                    .ack_clock_calibrations
+                    .get(&calibration_identity)
+                    .copied();
+                let response_snapshot = server_bulk_output_snapshot_with_scheduling(
+                    entry,
+                    lane,
+                    self.mux_limits,
+                    now,
+                    command_pending_bytes,
+                    response_scheduling,
+                );
+                let snapshot = response_snapshot.path;
+                let is_active = Some(entry.key) == active_key;
+                let has_bulk_rate_evidence =
+                    server_output_has_bulk_rate_evidence_with_limits(entry, self.mux_limits);
+                let has_service_feed_evidence = has_bulk_rate_evidence
+                    || (is_active
+                        && server_output_has_service_feed_evidence_with_limits(
+                            entry,
+                            self.mux_limits,
+                        ));
+                let endpoint_only_service_prior_eligible =
+                    server_output_accepts_service_capacity_prior(entry);
+                #[cfg(feature = "lab-diagnostics")]
+                self.lab_response_service_feed_state(
+                    entry,
+                    snapshot,
+                    lane,
+                    is_active,
+                    has_bulk_rate_evidence,
+                    has_service_feed_evidence,
+                    command_pending_bytes,
+                );
+                ResponseSenderPathTarget {
+                    #[cfg(feature = "lab-diagnostics")]
+                    session_id: self.session_id,
+                    #[cfg(feature = "lab-diagnostics")]
+                    binding_instance_id: self.binding_instance_id,
+                    key: entry.key,
+                    path_instance_id: entry.path_instance_id,
+                    incarnation: entry.incarnation,
+                    commands: entry.commands.clone(),
+                    attachment_role: entry.role,
+                    snapshot,
+                    owner_data_in_flight_bytes: entry.owner_data_in_flight_bytes,
+                    command_pending_bytes,
+                    eta_ms: server_bulk_output_eta_ms(
+                        entry.key,
+                        snapshot,
+                        active_key,
+                        lane,
+                        payload_bytes,
+                        self.mux_limits,
+                    ),
+                    is_active,
+                    is_request_active: Some(entry.key) == request_active_key,
+                    has_sender_evidence: server_output_has_sender_evidence(entry),
+                    has_service_feed_evidence,
+                    has_bulk_rate_evidence,
+                    endpoint_only_service_prior_eligible,
+                    quic_capacity_proof: server_output_quic_capacity_proof_marker(entry),
+                    quic_capacity_calibration_attempts: response_snapshot
+                        .quic_capacity_calibration_attempts,
+                    ack_clock_calibration_eligible: calibration.is_some(),
+                    ack_clock_calibration_proven: calibration
+                        .is_some_and(|calibration| calibration.proven),
+                    ack_clock_calibration_spent_bytes: calibration
+                        .map_or(0, |calibration| calibration.spent_bytes),
+                    ack_clock_calibration_credit_limit_bytes: calibration
+                        .map_or(0, |calibration| calibration.credit_limit_bytes),
+                    ack_clock_calibration_max_limit_bytes: calibration
+                        .map_or(0, |calibration| calibration.max_limit_bytes),
+                    ack_clock_calibration_active: outputs.active_ack_clock_calibration
+                        == Some(calibration_identity),
+                }
+            })
+            .collect()
+    }
+
+    pub(in crate::runtime) fn mux_limits(&self) -> MuxLimits {
+        self.mux_limits
+    }
+
+    pub(in crate::runtime) fn active_tcp_ack_clock_calibration_remaining_bytes(
+        &self,
+    ) -> Option<usize> {
+        let outputs = self
+            .outputs
+            .lock()
+            .expect("server reliable stream binding lock");
+        let identity = outputs.active_ack_clock_calibration?;
+        if identity.0.underlay != UnderlayProtocol::Tcp {
+            return None;
+        }
+        let calibration = outputs.ack_clock_calibrations.get(&identity)?;
+        if calibration.proven || calibration.retired {
+            return None;
+        }
+        let remaining = calibration
+            .credit_limit_bytes
+            .saturating_sub(calibration.spent_bytes);
+        (remaining > 0).then(|| usize::try_from(remaining).unwrap_or(usize::MAX))
+    }
+
+    pub(in crate::runtime) fn session_id(&self) -> SessionId {
+        self.session_id
+    }
+}
 
 impl ResponseStreamOutputs {
     pub(super) fn snapshot_for_key(

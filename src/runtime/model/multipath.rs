@@ -4,7 +4,7 @@
 //! roles and work decisions, but neither carrier owns the product policy.
 
 use crate::config::MppPerformanceConfig;
-use crate::runtime::MIN_RATE_SAMPLE_BYTES;
+use crate::runtime::model::capacity::MIN_RATE_SAMPLE_BYTES;
 use crate::runtime::model::work::CarrierWorkKind;
 use crate::runtime::reliable_path::CarrierPathKey;
 use std::time::Duration;

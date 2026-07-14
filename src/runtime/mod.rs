@@ -37,6 +37,7 @@ use core::*;
 use datagram::*;
 use ingress_runtime::*;
 use management::*;
+use model::capacity::*;
 use model::multipath::*;
 use model::work::*;
 use path_commands::*;

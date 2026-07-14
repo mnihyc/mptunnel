@@ -4,8 +4,8 @@
 use crate::lab_diagnostics::lab_diagnostic;
 use crate::mux::MuxLimits;
 use crate::protocol::UnderlayProtocol;
+use crate::runtime::model::capacity::{BBR_DEFAULT_CWND_GAIN, BBR_MAX_SEND_QUANTUM_BYTES};
 use crate::runtime::relay_open::RelayPathKey;
-use crate::runtime::{BBR_DEFAULT_CWND_GAIN, BBR_MAX_SEND_QUANTUM_BYTES};
 use crate::scheduler::{FlowLane, PathSnapshot};
 
 // Decisions in this module never mutate a path or enqueue carrier work.

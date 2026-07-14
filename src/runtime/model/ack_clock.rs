@@ -9,7 +9,7 @@ use super::admission::{
 };
 use crate::mux::MuxLimits;
 use crate::protocol::UnderlayProtocol;
-use crate::runtime::{BBR_MAX_SEND_QUANTUM_BYTES, PATH_OPEN_SCORE_BYTES};
+use crate::runtime::model::capacity::{BBR_MAX_SEND_QUANTUM_BYTES, PATH_OPEN_SCORE_BYTES};
 use crate::scheduler::PathSnapshot;
 
 #[derive(Debug, Clone, Copy)]

@@ -3,6 +3,10 @@ use super::error::RuntimeError;
 use super::ingress_runtime::*;
 use super::management::*;
 use super::model::admission::*;
+use super::model::capacity::{
+    BBR_MAX_SEND_QUANTUM_BYTES, PATH_OPEN_SCORE_BYTES, PathRateSample,
+    QUIC_PERSISTENT_CONGESTION_THRESHOLD,
+};
 use super::path_commands::*;
 use super::path_model::*;
 use super::path_proof::PathProofObservation;
@@ -22,36 +26,7 @@ use crate::lab_diagnostics::lab_diagnostic;
 use std::sync::atomic::{AtomicU8, AtomicU32, AtomicU64, Ordering};
 
 pub(super) const MAX_HTTP_CONNECT_HEADER_BYTES: usize = 64 * 1024;
-// RFC 9002's recommended QUIC initial congestion window is based on ten max
-// datagrams. mptunnel uses the same packet-count shape as the carrier-neutral
-// reliable-stream startup window instead of an arbitrary byte constant. The
-// QUIC alias below is for code that specifically consumes QUIC carrier metrics.
-pub(super) const TRANSPORT_MSS_BYTES: usize = 1460;
-pub(super) const RELIABLE_INITIAL_WINDOW_PACKETS: usize = 10;
-pub(super) const QUIC_INITIAL_WINDOW_PACKETS: usize = RELIABLE_INITIAL_WINDOW_PACKETS;
-pub(super) const PATH_OPEN_SCORE_BYTES: usize =
-    RELIABLE_INITIAL_WINDOW_PACKETS * TRANSPORT_MSS_BYTES;
-// BBR's model explicitly separates send quantum from inflight volume. These
-// values are protocol-shape constants, not mptunnel tuning knobs: send quantum
-// is pacing_rate*1ms, capped at 64 KiB and floored at 2*MSS; MinPipeCwnd is
-// four MSS-sized packets.
-pub(super) const BBR_SEND_QUANTUM_INTERVAL: Duration = Duration::from_millis(1);
-pub(super) const BBR_MAX_SEND_QUANTUM_BYTES: usize = 64 * 1024;
-pub(super) const BBR_MIN_SEND_QUANTUM_PACKETS: usize = 2;
-pub(super) const BBR_MIN_PIPE_CWND_PACKETS: usize = 4;
-pub(super) const BBR_DEFAULT_CWND_GAIN: f64 = 2.0;
-// Shared measurement floor. QUIC supplies the 1 ms precedent, but TCP product
-// ACK calibration and carrier-neutral rate samples use the same timer bound.
-pub(super) const TRANSPORT_TIMER_GRANULARITY: Duration = Duration::from_millis(1);
-pub(super) const QUIC_TIMER_GRANULARITY: Duration = TRANSPORT_TIMER_GRANULARITY;
-// Generic reliable-stream startup prior. The value follows QUIC's conservative
-// initial RTT recommendation, but product/scheduler code intentionally names it
-// without tying it to UDP or QUIC.
-pub(super) const RELIABLE_INITIAL_RTT: Duration = Duration::from_millis(333);
-pub(super) const QUIC_MAX_ACK_DELAY: Duration = Duration::from_millis(25);
-pub(super) const QUIC_PERSISTENT_CONGESTION_THRESHOLD: u32 = 3;
 pub(super) const UDP_PATH_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(2);
-pub(super) const MIN_RATE_SAMPLE_BYTES: u64 = PATH_OPEN_SCORE_BYTES as u64;
 pub(super) const UDP_DEFAULT_MTU_PAYLOAD_BYTES: usize = 1200;
 pub(super) const UDP_MIN_MTU_PAYLOAD_BYTES: usize = 512;
 pub(super) const UDP_MAX_MTU_PAYLOAD_BYTES: usize = 65_000;
@@ -2507,7 +2482,7 @@ impl ClientPathHealthRecord {
         });
         self.product_delivery_sample_bytes = self
             .product_delivery_sample_bytes
-            .saturating_add(sample.bytes);
+            .saturating_add(sample.bytes());
         self.mark_delivery(sample);
     }
 
@@ -2517,7 +2492,7 @@ impl ClientPathHealthRecord {
         }
         self.product_delivery_sample_bytes = self
             .product_delivery_sample_bytes
-            .saturating_add(sample.bytes);
+            .saturating_add(sample.bytes());
         self.product_delivery_rate_bps = Some(sample.rate_bps());
         self.state = SchedulerPathState::Active;
         self.consecutive_failures = 0;
@@ -2635,33 +2610,6 @@ impl ClientPathHealthRecord {
 
     pub(super) fn release_relay_inflight(&mut self, bytes: usize) {
         self.relay_bytes_in_flight = self.relay_bytes_in_flight.saturating_sub(bytes as u64);
-    }
-}
-
-#[derive(Debug, Clone, Copy)]
-pub(super) struct PathRateSample {
-    bytes: u64,
-    elapsed: Duration,
-}
-
-impl PathRateSample {
-    pub(super) fn new(bytes: u64, elapsed: Duration) -> Option<Self> {
-        if bytes < MIN_RATE_SAMPLE_BYTES {
-            return None;
-        }
-        Some(Self { bytes, elapsed })
-    }
-
-    pub(super) fn rate_bps(self) -> f64 {
-        self.bytes as f64 * 8.0 / self.elapsed.max(TRANSPORT_TIMER_GRANULARITY).as_secs_f64()
-    }
-
-    pub(super) fn bytes(self) -> u64 {
-        self.bytes
-    }
-
-    pub(super) fn elapsed(self) -> Duration {
-        self.elapsed
     }
 }
 

@@ -36,6 +36,9 @@ TCP and QUIC are separate concrete authorities:
 - TCP owns socket I/O and relies on kernel TCP congestion and retransmission.
   Native socket telemetry is optional evidence.
 - QUIC owns Quinn connection I/O, packet ACKs, congestion, pacing, and recovery.
+- Shared path authentication owns only the carrier-neutral HELLO, AUTH, and
+  JOIN transitions. TCP and QUIC retain their own frame I/O and acknowledgements,
+  while the server path context owns replay admission.
 - Neither carrier ACK releases product ranges. Only the product `STREAM_ACK`
   authority may release the shared exact-flight ledger.
 

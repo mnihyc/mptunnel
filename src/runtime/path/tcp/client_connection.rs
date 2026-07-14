@@ -12,8 +12,8 @@ use crate::protocol::codec::CodecLimits;
 use crate::protocol::{CloseReason, Frame, PathId, SessionId, UnderlayProtocol};
 use crate::runtime::error::RuntimeError;
 use crate::runtime::identity::random_u64;
+use crate::runtime::path::authentication::ClientPathAuthenticationFrames;
 use crate::runtime::path::commands::reliable_path_writer_frame_queue;
-use crate::runtime::relay::open::authenticated_path_join_frames_for_session;
 use crate::transport::PathSpec;
 use crate::transport::encrypted::{EncryptedFramedStream, EncryptedFramedTransportError, PeerRole};
 use crate::transport::tcp::{self as tcp_transport, TcpConnectOptions};
@@ -163,7 +163,7 @@ pub(in crate::runtime) async fn connect_client_tcp_carrier(
             security.cipher,
         )?;
         let path_id = PathId(path_index as u16);
-        let (session_hello, session_auth, path_join) = authenticated_path_join_frames_for_session(
+        let authentication_frames = ClientPathAuthenticationFrames::for_session(
             security,
             path,
             path_id,
@@ -172,7 +172,7 @@ pub(in crate::runtime) async fn connect_client_tcp_carrier(
         )?;
 
         framed
-            .write_frames(&[session_hello, session_auth, path_join])
+            .write_frames(&authentication_frames.into_array())
             .await?;
         framed.flush().await?;
 

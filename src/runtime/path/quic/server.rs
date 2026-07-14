@@ -5,6 +5,7 @@ use super::io::*;
 use super::metrics::*;
 use super::server_stream::*;
 use super::*;
+use crate::runtime::path::authentication::ServerPathAuthentication;
 use crate::scheduler::flow_lane_from_stream_demand_hint;
 
 pub(in crate::runtime) async fn bind_server_udp_endpoint(
@@ -76,63 +77,33 @@ async fn accept_server_udp_path_handshake(
     context: &ServerPathContext,
 ) -> Result<(SessionId, PathId, PathCapabilities), RuntimeError> {
     let (mut send, mut recv) = connection.accept_bi().await?;
-    let session_id = match udp_path_read_frame(&mut recv, context.codec_limits).await? {
-        Frame::SessionHello { session_id } => session_id,
-        _ => {
-            return Err(RuntimeError::Protocol(
-                "expected QUIC UDP path SESSION_HELLO",
-            ));
-        }
-    };
-    let authenticator = SessionAuthenticator::new(context.security.secret.as_bytes())?;
-    let now_unix_secs = current_unix_secs()?;
-    let auth_freshness_window_secs = context.security.auth_freshness_window.as_secs();
-    match udp_path_read_frame(&mut recv, context.codec_limits).await? {
-        Frame::SessionAuth {
-            session_id: auth_session_id,
-            nonce,
-            issued_at_unix_secs,
-            auth_tag,
-        } if auth_session_id == session_id
-            && authenticator.verify_session_auth(SessionAuthCheck {
-                session_id,
-                nonce,
-                issued_at_unix_secs,
-                tag: auth_tag,
-                now_unix_secs,
-                freshness_window_secs: auth_freshness_window_secs,
-            }) => {}
-        _ => return Err(RuntimeError::Protocol("invalid QUIC UDP path SESSION_AUTH")),
+    let authentication = ServerPathAuthentication::from_session_hello(
+        &context.security,
+        udp_path_read_frame(&mut recv, context.codec_limits).await?,
+    )?
+    .ok_or(RuntimeError::Protocol(
+        "expected QUIC UDP path SESSION_HELLO",
+    ))?;
+    let authenticated_session = authentication
+        .authenticate_session(udp_path_read_frame(&mut recv, context.codec_limits).await?)
+        .ok_or(RuntimeError::Protocol("invalid QUIC UDP path SESSION_AUTH"))?;
+    let path_join = authenticated_session
+        .authenticate_path_join(
+            UnderlayProtocol::Udp,
+            udp_path_read_frame(&mut recv, context.codec_limits).await?,
+        )
+        .ok_or(RuntimeError::Protocol("invalid QUIC UDP path PATH_JOIN"))?;
+    if !context.accept_path_join_nonce(
+        path_join.session_id,
+        path_join.path_id,
+        UnderlayProtocol::Udp,
+        path_join.nonce,
+    ) {
+        return Err(RuntimeError::Protocol("invalid QUIC UDP path PATH_JOIN"));
     }
-    let (path_id, capabilities) = match udp_path_read_frame(&mut recv, context.codec_limits).await?
-    {
-        Frame::PathJoin {
-            session_id: join_session_id,
-            path_id,
-            underlay,
-            nonce,
-            issued_at_unix_secs,
-            capabilities,
-            auth_tag,
-        } if join_session_id == session_id
-            && underlay == UnderlayProtocol::Udp
-            && authenticator.verify_path_join(PathJoinAuthCheck {
-                session_id,
-                path_id,
-                underlay,
-                nonce,
-                issued_at_unix_secs,
-                capabilities,
-                tag: auth_tag,
-                now_unix_secs,
-                freshness_window_secs: auth_freshness_window_secs,
-            })
-            && context.accept_path_join_nonce(session_id, path_id, underlay, nonce) =>
-        {
-            (path_id, capabilities)
-        }
-        _ => return Err(RuntimeError::Protocol("invalid QUIC UDP path PATH_JOIN")),
-    };
+    let session_id = path_join.session_id;
+    let path_id = path_join.path_id;
+    let capabilities = path_join.capabilities;
 
     udp_path_write_frame(&mut send, &Frame::SessionReady, context.codec_limits).await?;
     udp_path_write_frame(

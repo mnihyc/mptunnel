@@ -6,6 +6,7 @@
 
 use super::*;
 
+pub(in crate::runtime) mod authentication;
 pub(super) mod commands;
 pub(super) mod model;
 pub(super) mod proof;

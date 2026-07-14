@@ -74,8 +74,11 @@ Service ownership; a failed apply leaves none of them published.
 
 Keep TCP and QUIC actor trees separate beneath the path aggregate. Shared path
 code owns only carrier-neutral identities, health, load, typed evidence, and
-command ports. It must not import product-range ownership from stream or task
-orchestration from relay.
+command ports. The shared authentication adapter owns the protocol transition
+and signed frame construction; concrete carriers own the reads, writes, and
+activation response, and the server context owns replay admission. Path code
+must not import product-range ownership from stream or task orchestration from
+relay.
 
 ### Relay
 

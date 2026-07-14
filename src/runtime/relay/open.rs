@@ -1024,58 +1024,6 @@ async fn send_open_path_metrics(
     emit_request_control_frame(stream, Frame::PathMetrics { metrics })
 }
 
-pub(in crate::runtime) fn authenticated_path_join_frames(
-    security: &SecurityConfig,
-    path: &PathSpec,
-    path_id: PathId,
-    underlay: UnderlayProtocol,
-) -> Result<(Frame, Frame, Frame), RuntimeError> {
-    let session_id = random_session_id()?;
-    authenticated_path_join_frames_for_session(security, path, path_id, underlay, session_id)
-}
-
-pub(in crate::runtime) fn authenticated_path_join_frames_for_session(
-    security: &SecurityConfig,
-    path: &PathSpec,
-    path_id: PathId,
-    underlay: UnderlayProtocol,
-    session_id: SessionId,
-) -> Result<(Frame, Frame, Frame), RuntimeError> {
-    let authenticator = SessionAuthenticator::new(security.secret.as_bytes())?;
-    let issued_at_unix_secs = current_unix_secs()?;
-    let session_nonce = random_nonce()?;
-    let session_tag =
-        authenticator.session_auth_tag(session_id, session_nonce, issued_at_unix_secs);
-    let path_nonce = random_nonce()?;
-    let capabilities = path.metadata.capabilities;
-    let path_tag = authenticator.path_join_tag(
-        session_id,
-        path_id,
-        underlay,
-        path_nonce,
-        issued_at_unix_secs,
-        capabilities,
-    );
-    Ok((
-        Frame::SessionHello { session_id },
-        Frame::SessionAuth {
-            session_id,
-            nonce: session_nonce,
-            issued_at_unix_secs,
-            auth_tag: session_tag,
-        },
-        Frame::PathJoin {
-            session_id,
-            path_id,
-            underlay,
-            nonce: path_nonce,
-            issued_at_unix_secs,
-            capabilities,
-            auth_tag: path_tag,
-        },
-    ))
-}
-
 pub(in crate::runtime) fn stream_open_error_is_path_retryable(err: &RuntimeError) -> bool {
     matches!(
         err,

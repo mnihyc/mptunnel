@@ -8,6 +8,7 @@ pub(super) use crate::ingress::{IngressConfig, ProxyAuthConfig};
 pub(super) use crate::mux::MuxLimits;
 pub(super) use crate::mux::stream::{ReliableRecvStream, ReliableSendStream};
 pub(super) use crate::outbound::{self, TargetProtocol};
+#[cfg(test)]
 pub(super) use crate::protocol::auth::{PathJoinAuthCheck, SessionAuthCheck, SessionAuthenticator};
 pub(super) use crate::protocol::codec::CodecLimits;
 pub(super) use crate::protocol::{

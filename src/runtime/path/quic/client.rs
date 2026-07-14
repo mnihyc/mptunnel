@@ -5,6 +5,7 @@ use super::estimator::UdpPathMetricTracker;
 use super::io::*;
 use super::metrics::*;
 use super::*;
+use crate::runtime::path::authentication::ClientPathAuthenticationFrames;
 use crate::scheduler::stream_demand_hint_for_lane;
 use tokio::sync::Mutex as AsyncMutex;
 
@@ -243,13 +244,14 @@ async fn perform_client_udp_path_handshake(
 ) -> Result<(), RuntimeError> {
     let (mut send, mut recv) = connection.open_bi().await?;
     let path_id = PathId(runtime.path_index as u16);
-    let (session_hello, session_auth, path_join) = authenticated_path_join_frames_for_session(
+    let [session_hello, session_auth, path_join] = ClientPathAuthenticationFrames::for_session(
         &runtime.security,
         &runtime.path,
         path_id,
         UnderlayProtocol::Udp,
         runtime.session_id,
-    )?;
+    )?
+    .into_array();
     udp_path_write_frame(&mut send, &session_hello, runtime.codec_limits).await?;
     udp_path_write_frame(&mut send, &session_auth, runtime.codec_limits).await?;
     udp_path_write_frame(&mut send, &path_join, runtime.codec_limits).await?;

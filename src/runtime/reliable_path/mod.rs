@@ -1,12 +1,12 @@
 #[cfg(test)]
-use super::ack_clock_policy::reliable_ack_clock_calibration_limit_bytes;
-use super::ack_clock_policy::{
+use super::model::ack_clock::reliable_ack_clock_calibration_limit_bytes;
+use super::model::ack_clock::{
     reliable_ack_clock_calibration_ceiling_bytes,
     reliable_ack_clock_calibration_rate_coverage_floor_bytes,
     reliable_tcp_ack_clock_calibration_initial_limit_bytes,
 };
 #[cfg(feature = "lab-diagnostics")]
-use super::bulk_admission::{
+use super::model::admission::{
     bulk_active_service_product_envelope_bytes, bulk_latency_pressure_service_feed_window_bytes,
     bulk_service_feed_reservoir_payload_bytes, bulk_service_horizon_payload_bytes,
 };

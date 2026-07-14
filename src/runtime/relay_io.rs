@@ -1,9 +1,9 @@
-use super::bulk_admission::{
+use super::model::admission::{
     ReliableSourceServiceStagingContext, ReliableSourceStagingContext,
     bulk_service_feed_reservoir_payload_bytes, reliable_relay_source_staging_owner_tail_headroom,
 };
 #[cfg(test)]
-use super::bulk_admission::{
+use super::model::admission::{
     bulk_service_horizon_payload_bytes, bulk_service_product_envelope_payload_bytes,
 };
 use super::*;

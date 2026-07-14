@@ -1,8 +1,8 @@
-use super::bulk_admission::*;
 use super::datagram::*;
 use super::error::RuntimeError;
 use super::ingress_runtime::*;
 use super::management::*;
+use super::model::admission::*;
 use super::path_commands::*;
 use super::path_model::*;
 use super::path_proof::PathProofObservation;

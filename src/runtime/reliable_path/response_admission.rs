@@ -1,4 +1,4 @@
-use super::super::bulk_admission::bulk_service_horizon_payload_bytes;
+use super::super::model::admission::bulk_service_horizon_payload_bytes;
 use super::response_placement::ResponseRateScope;
 use super::response_session::{
     ServerResponsePathSchedulingSnapshot, valid_quic_capacity_proof_candidate_at,

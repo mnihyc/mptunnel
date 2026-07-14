@@ -3,18 +3,18 @@ mod response_service_handoff_diagnostics;
 
 #[cfg(feature = "lab-diagnostics")]
 use self::response_service_handoff_diagnostics::lab_response_service_handoff_evaluation;
-use super::ack_clock_policy::{
+use super::model::ack_clock::{
     TcpAckClockCalibrationOpportunity, reliable_ack_clock_calibration_rate_coverage_floor_bytes,
     reliable_tcp_ack_clock_calibration_opportunity,
 };
 #[cfg(test)]
-use super::ack_clock_policy::{
+use super::model::ack_clock::{
     reliable_ack_clock_calibration_ceiling_bytes, reliable_ack_clock_calibration_limit_bytes,
     reliable_request_ack_clock_calibration_target_bytes,
 };
 #[cfg(feature = "lab-diagnostics")]
-use super::bulk_admission::BulkExplorationCompletionProjection;
-use super::bulk_admission::{
+use super::model::admission::BulkExplorationCompletionProjection;
+use super::model::admission::{
     BulkAdmissionCheck, BulkAdmissionRole, bulk_active_service_product_envelope_bytes,
     bulk_additional_admission_role, bulk_candidate_admission_suppression_with_completion_backlog,
     bulk_candidate_admission_suppression_with_ordering_debt, bulk_candidate_pipe_bytes,

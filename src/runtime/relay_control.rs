@@ -1,4 +1,4 @@
-use super::bulk_admission::bulk_service_feed_reservoir_payload_bytes;
+use super::model::admission::bulk_service_feed_reservoir_payload_bytes;
 use super::*;
 
 fn reliable_relay_request_outstanding_resource_ceiling(mux_limits: MuxLimits) -> usize {

@@ -1,37 +1,40 @@
-use super::bulk_admission::{
+//! TCP product-ACK calibration policy.
+//!
+//! This model provides bounded product evidence when native TCP telemetry is
+//! unavailable. QUIC packet ACKs remain carrier-owned and never enter here.
+
+use super::admission::{
     BulkExplorationCompletionProjection, bulk_candidate_pipe_bytes,
     bulk_service_horizon_payload_bytes, bulk_tcp_calibration_completion_projection,
 };
-use super::prelude::*;
-use super::{BBR_MAX_SEND_QUANTUM_BYTES, PATH_OPEN_SCORE_BYTES};
-
-// Product ACK timing is a TCP-carrier fallback for request and response path
-// measurement. QUIC packet ACKs remain below this module and continue to own
-// UDP carrier congestion, pacing, and delivery-rate evidence.
+use crate::mux::MuxLimits;
+use crate::protocol::UnderlayProtocol;
+use crate::runtime::{BBR_MAX_SEND_QUANTUM_BYTES, PATH_OPEN_SCORE_BYTES};
+use crate::scheduler::PathSnapshot;
 
 #[derive(Debug, Clone, Copy)]
 #[cfg_attr(not(feature = "lab-diagnostics"), allow(dead_code))]
-pub(super) enum TcpAckClockCalibrationOpportunity {
+pub(in crate::runtime) enum TcpAckClockCalibrationOpportunity {
     Admit(BulkExplorationCompletionProjection),
     Retire(BulkExplorationCompletionProjection),
 }
 
 impl TcpAckClockCalibrationOpportunity {
     #[cfg(feature = "lab-diagnostics")]
-    pub(super) fn projection(self) -> BulkExplorationCompletionProjection {
+    pub(in crate::runtime) fn projection(self) -> BulkExplorationCompletionProjection {
         match self {
             Self::Admit(projection) | Self::Retire(projection) => projection,
         }
     }
 
-    pub(super) fn is_admitted(self) -> bool {
+    pub(in crate::runtime) fn is_admitted(self) -> bool {
         matches!(self, Self::Admit(_))
     }
 }
 
 /// Decide whether a fresh, zero-spend TCP stage can finish before Service
 /// consumes the ordered reservoir. Begun stages are deliberately not reevaluated.
-pub(super) fn reliable_tcp_ack_clock_calibration_opportunity(
+pub(in crate::runtime) fn reliable_tcp_ack_clock_calibration_opportunity(
     service_snapshot: PathSnapshot,
     service_eta_ms: f64,
     candidate_snapshot: PathSnapshot,
@@ -58,7 +61,7 @@ pub(super) fn reliable_tcp_ack_clock_calibration_opportunity(
     }
 }
 
-pub(super) fn reliable_ack_clock_calibration_limit_bytes(mux_limits: MuxLimits) -> u64 {
+pub(in crate::runtime) fn reliable_ack_clock_calibration_limit_bytes(mux_limits: MuxLimits) -> u64 {
     let resource_ceiling = reliable_ack_clock_calibration_ceiling_bytes(mux_limits);
     if resource_ceiling == 0 {
         return 0;
@@ -68,7 +71,7 @@ pub(super) fn reliable_ack_clock_calibration_limit_bytes(mux_limits: MuxLimits) 
     service_horizon.min(resource_ceiling)
 }
 
-pub(super) fn reliable_ack_clock_calibration_rate_coverage_floor_bytes(
+pub(in crate::runtime) fn reliable_ack_clock_calibration_rate_coverage_floor_bytes(
     mux_limits: MuxLimits,
 ) -> u64 {
     let product_limit = reliable_ack_clock_calibration_limit_bytes(mux_limits);
@@ -81,7 +84,9 @@ pub(super) fn reliable_ack_clock_calibration_rate_coverage_floor_bytes(
         .min(product_limit)
 }
 
-pub(super) fn reliable_request_ack_clock_calibration_target_bytes(mux_limits: MuxLimits) -> u64 {
+pub(in crate::runtime) fn reliable_request_ack_clock_calibration_target_bytes(
+    mux_limits: MuxLimits,
+) -> u64 {
     let base = reliable_ack_clock_calibration_limit_bytes(mux_limits);
     let ceiling = reliable_ack_clock_calibration_ceiling_bytes(mux_limits);
     if base == 0 {
@@ -107,7 +112,7 @@ pub(super) fn reliable_request_ack_clock_calibration_target_bytes(mux_limits: Mu
     }
 }
 
-pub(super) fn reliable_tcp_ack_clock_calibration_initial_limit_bytes(
+pub(in crate::runtime) fn reliable_tcp_ack_clock_calibration_initial_limit_bytes(
     candidate: PathSnapshot,
     mux_limits: MuxLimits,
 ) -> u64 {
@@ -123,7 +128,9 @@ pub(super) fn reliable_tcp_ack_clock_calibration_initial_limit_bytes(
         .min(product_limit)
 }
 
-pub(super) fn reliable_ack_clock_calibration_ceiling_bytes(mux_limits: MuxLimits) -> u64 {
+pub(in crate::runtime) fn reliable_ack_clock_calibration_ceiling_bytes(
+    mux_limits: MuxLimits,
+) -> u64 {
     let resource_ceiling = (mux_limits.max_path_flight_bytes as u64)
         .min(mux_limits.max_repair_bytes as u64)
         .min(mux_limits.max_reorder_bytes as u64)

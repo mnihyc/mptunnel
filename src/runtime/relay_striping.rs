@@ -1,12 +1,12 @@
 #[cfg(test)]
-use super::ack_clock_policy::reliable_tcp_ack_clock_calibration_opportunity;
-use super::ack_clock_policy::{
+use super::model::ack_clock::reliable_tcp_ack_clock_calibration_opportunity;
+use super::model::ack_clock::{
     reliable_ack_clock_calibration_ceiling_bytes,
     reliable_request_ack_clock_calibration_target_bytes,
 };
 #[cfg(feature = "lab-diagnostics")]
-use super::bulk_admission::bulk_completion_horizon_ms_with_ordering_debt;
-use super::bulk_admission::{
+use super::model::admission::bulk_completion_horizon_ms_with_ordering_debt;
+use super::model::admission::{
     BulkAdmissionCheck, BulkAdmissionRole, bulk_additional_admission_role,
     bulk_candidate_admission_suppression_with_ordering_debt, bulk_candidate_pipe_bytes,
     bulk_service_feed_reservoir_payload_bytes, bulk_service_horizon_payload_bytes,

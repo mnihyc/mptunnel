@@ -1,4 +1,4 @@
-use super::bulk_admission::BulkPathCandidate;
+use super::model::admission::BulkPathCandidate;
 use super::*;
 
 #[derive(Debug, Clone, Copy)]

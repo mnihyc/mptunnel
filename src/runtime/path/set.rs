@@ -4,7 +4,7 @@
 //! no sender or carrier can observe half of a request-probe transaction.
 
 use super::commands::reliable_stream_frame_queue;
-use super::quic::carrier::{ClientUdpPathSessionHandle, ClientUdpPathSessionRuntime};
+use super::quic::client::{ClientUdpPathSessionHandle, ClientUdpPathSessionRuntime};
 use super::state::{ClientPathHealth, ClientPathHealthRecord, ClientPathState};
 use super::tcp::client::{
     ClientTcpPathSessionHandle, ClientTcpPathSessionRuntime, tcp_session_command_queue,

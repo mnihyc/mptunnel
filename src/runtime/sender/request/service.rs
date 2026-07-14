@@ -4,11 +4,12 @@ use crate::model::ack_clock::{
     reliable_ack_clock_calibration_ceiling_bytes, reliable_ack_clock_calibration_limit_bytes,
     reliable_request_ack_clock_calibration_target_bytes,
 };
+#[cfg(feature = "lab-diagnostics")]
+use crate::model::request::capacity::request_quic_capacity_slow_start_rounds;
 use crate::model::request::capacity::{
     request_capacity_stable_candidate_share_bytes, request_quic_capacity_calibration_geometry,
-    request_quic_capacity_calibration_lease, request_quic_capacity_slow_start_rounds,
-    request_tcp_capacity_calibration_geometry, request_tcp_capacity_calibration_lease,
-    request_tcp_capacity_candidate_can_start_receipt,
+    request_quic_capacity_calibration_lease, request_tcp_capacity_calibration_geometry,
+    request_tcp_capacity_calibration_lease, request_tcp_capacity_candidate_can_start_receipt,
 };
 use crate::model::request::evidence::{
     RequestOwnerAckProgress, RequestPathRateEvidence, RequestPathRateEvidenceUpdate,

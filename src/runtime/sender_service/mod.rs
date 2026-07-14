@@ -7,8 +7,7 @@ pub(super) use queue::*;
 #[cfg(feature = "lab-diagnostics")]
 use self::response_service_handoff_diagnostics::lab_response_service_handoff_evaluation;
 use super::model::ack_clock::{
-    TcpAckClockCalibrationOpportunity, reliable_ack_clock_calibration_rate_coverage_floor_bytes,
-    reliable_tcp_ack_clock_calibration_opportunity,
+    TcpAckClockCalibrationOpportunity, reliable_tcp_ack_clock_calibration_opportunity,
 };
 #[cfg(test)]
 use super::model::ack_clock::{
@@ -24,6 +23,11 @@ use super::model::admission::{
     bulk_exploration_completion_projection, bulk_latency_pressure_service_feed_window_bytes,
     bulk_service_feed_reservoir_payload_bytes, bulk_service_horizon_payload_bytes,
     bulk_service_product_envelope_payload_bytes,
+};
+use super::model::request::evidence::{
+    RequestOwnerAckProgress, RequestPathRateEvidence, RequestPathRateEvidenceUpdate,
+    RequestPerFlowRateModel, RequestTcpAckTurnoverModel, request_path_rate_coverage_floor_bytes,
+    request_tcp_candidate_turnover_authorized,
 };
 use super::model::{ResponseCandidateTailDebt, ResponseOrderedTail, ResponseSameFamilyReservoir};
 use super::*;
@@ -272,181 +276,6 @@ impl RelayPathSendSelection {
             request_load_expectation: None,
         }
     }
-}
-
-#[derive(Debug, Clone, Copy)]
-struct RequestPathRateEvidence {
-    exact_attributed_bytes: u64,
-    pending_bytes: u64,
-    pending_first_sent_at: Instant,
-    pending_latest_sent_at: Instant,
-    previous_window_acked_at: Option<Instant>,
-}
-
-enum RequestPathRateEvidenceUpdate {
-    Pending,
-    Proven {
-        sample: Option<PathRateSample>,
-        first_window: bool,
-    },
-}
-
-#[derive(Debug, Clone, Copy)]
-pub(super) struct RequestPerFlowRateModel {
-    pub(super) rate_bps: f64,
-    pub(super) delivery_samples: u32,
-}
-
-#[derive(Debug, Clone, Copy)]
-struct RequestTcpAckTurnoverModel {
-    turnover_bytes: f64,
-    sampled_at: Instant,
-    sample_pto: Duration,
-}
-
-impl RequestTcpAckTurnoverModel {
-    fn observe(
-        previous: Option<Self>,
-        sample: PathRateSample,
-        sample_pto: Duration,
-        sampled_at: Instant,
-    ) -> Option<Self> {
-        let sample_turnover = sample.rate_bps().max(0.0) / 8.0 * sample_pto.as_secs_f64();
-        if !sample_turnover.is_finite() {
-            return None;
-        }
-        let turnover_bytes = previous
-            .filter(|previous| previous.is_fresh_at(sampled_at))
-            .map_or(sample_turnover, |previous| {
-                previous
-                    .turnover_bytes
-                    .mul_add(0.75, sample_turnover * 0.25)
-            });
-        Some(Self {
-            turnover_bytes,
-            sampled_at,
-            sample_pto,
-        })
-    }
-
-    fn is_fresh_at(self, now: Instant) -> bool {
-        now.saturating_duration_since(self.sampled_at)
-            < self
-                .sample_pto
-                .saturating_mul(QUIC_PERSISTENT_CONGESTION_THRESHOLD)
-    }
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(super) struct RequestOwnerAckProgress {
-    pub(super) instance: RelayPathInstance,
-    pub(super) bytes: usize,
-}
-
-impl RequestPathRateEvidence {
-    fn new(first_sent_at: Instant) -> Self {
-        Self {
-            exact_attributed_bytes: 0,
-            pending_bytes: 0,
-            pending_first_sent_at: first_sent_at,
-            pending_latest_sent_at: first_sent_at,
-            previous_window_acked_at: None,
-        }
-    }
-
-    fn observe(
-        &mut self,
-        bytes: u64,
-        first_sent_at: Instant,
-        latest_sent_at: Instant,
-        acked_at: Instant,
-        coverage_floor_bytes: u64,
-        require_post_boundary_send: bool,
-    ) -> RequestPathRateEvidenceUpdate {
-        self.exact_attributed_bytes = self.exact_attributed_bytes.saturating_add(bytes);
-        if self.pending_bytes == 0 {
-            self.pending_first_sent_at = first_sent_at;
-            self.pending_latest_sent_at = latest_sent_at;
-        } else {
-            self.pending_first_sent_at = self.pending_first_sent_at.min(first_sent_at);
-            self.pending_latest_sent_at = self.pending_latest_sent_at.max(latest_sent_at);
-        }
-        self.pending_bytes = self.pending_bytes.saturating_add(bytes);
-        let coverage_floor_bytes = coverage_floor_bytes.max(PATH_OPEN_SCORE_BYTES as u64);
-        if self.pending_bytes < coverage_floor_bytes {
-            return RequestPathRateEvidenceUpdate::Pending;
-        }
-
-        let sample_bytes = self.pending_bytes;
-        let first_window = self.previous_window_acked_at.is_none();
-        let sample_started_at = self
-            .previous_window_acked_at
-            .unwrap_or(self.pending_first_sent_at);
-        // A later staged window is causal only when every sampled byte was sent
-        // at or after the ACK that starts the interval. Charging the full
-        // ACK-to-ACK gap is conservative when the sender was briefly idle.
-        let ack_clocked = first_window
-            || !require_post_boundary_send
-            || self.pending_first_sent_at >= sample_started_at;
-        self.pending_bytes = 0;
-        self.previous_window_acked_at = Some(acked_at);
-        let ack_elapsed = acked_at.saturating_duration_since(sample_started_at);
-        let send_elapsed = self
-            .pending_latest_sent_at
-            .saturating_duration_since(self.pending_first_sent_at);
-        // Product ACKs can arrive in compressed batches. As in BBR delivery
-        // sampling, use the slower of the send and ACK clocks so ACK timing
-        // alone cannot claim a rate above the observed sender rate.
-        let sample = ack_clocked
-            .then(|| PathRateSample::new(sample_bytes, ack_elapsed.max(send_elapsed)))
-            .flatten();
-        RequestPathRateEvidenceUpdate::Proven {
-            sample,
-            first_window,
-        }
-    }
-
-    fn has_exact_path_provenance(&self) -> bool {
-        self.exact_attributed_bytes >= PATH_OPEN_SCORE_BYTES as u64
-    }
-
-    fn exact_attributed_bytes(&self) -> u64 {
-        self.exact_attributed_bytes
-    }
-
-    fn seed_ack_boundary(&mut self, acked_at: Instant) {
-        self.pending_bytes = 0;
-        self.previous_window_acked_at = Some(acked_at);
-    }
-}
-
-fn request_path_rate_coverage_floor_bytes(
-    instance: RelayPathInstance,
-    ordered_service: Option<RelayPathInstance>,
-    calibration_target: Option<u64>,
-    mux_limits: MuxLimits,
-) -> u64 {
-    match instance.key.underlay {
-        UnderlayProtocol::Tcp if Some(instance) != ordered_service => calibration_target
-            .unwrap_or_else(|| {
-                reliable_ack_clock_calibration_rate_coverage_floor_bytes(mux_limits)
-            }),
-        // Service has continuous feed; it does not need a new pipe-sized train.
-        UnderlayProtocol::Tcp => {
-            reliable_ack_clock_calibration_rate_coverage_floor_bytes(mux_limits)
-        }
-        UnderlayProtocol::Udp => PATH_OPEN_SCORE_BYTES as u64,
-    }
-}
-
-fn request_tcp_candidate_turnover_authorized(
-    exact_acked_bytes: u64,
-    calibration_target_bytes: u64,
-    ordinary_coverage_bytes: u64,
-) -> bool {
-    // The bounded calibration window proves ownership and one rate point. A
-    // second exact window proves that ordinary product traffic can sustain it.
-    exact_acked_bytes >= calibration_target_bytes.saturating_add(ordinary_coverage_bytes.max(1))
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -7995,7 +7824,7 @@ impl RelaySenderService {
         &mut self,
         context: &ClientPathContext,
         ranges: &[OffsetRange],
-    ) -> smallvec::SmallVec<[RequestOwnerAckProgress; 4]> {
+    ) -> smallvec::SmallVec<[RequestOwnerAckProgress<RelayPathInstance>; 4]> {
         let startup_owner = self
             .request_subflow_set
             .as_ref()
@@ -8010,7 +7839,8 @@ impl RelaySenderService {
         let acked_at = Instant::now();
         let mut ordinary_owner_samples =
             HashMap::<RelayPathInstance, (u64, Instant, Instant)>::new();
-        let mut owner_progress = smallvec::SmallVec::<[RequestOwnerAckProgress; 4]>::new();
+        let mut owner_progress =
+            smallvec::SmallVec::<[RequestOwnerAckProgress<RelayPathInstance>; 4]>::new();
         for release in self.flights.release_normalized_acked_ranges(ranges) {
             self.missing_owner_repair_attempts.remove(&release.instance);
             context.release_relay_path_inflight(
@@ -8110,15 +7940,15 @@ impl RelaySenderService {
             // TCP lacks carrier-native delivery telemetry, so its product ACK
             // fallback needs a representative window. QUIC keeps its existing
             // small product-provenance threshold; carrier ACKs own its rate.
+            let is_ordered_service = self.ordered_data_owner_instance == Some(instance);
             let coverage_floor_bytes = request_path_rate_coverage_floor_bytes(
-                instance,
-                self.ordered_data_owner_instance,
+                instance.key.underlay,
+                is_ordered_service,
                 self.request_ack_clock_calibration_targets
                     .get(&instance)
                     .copied(),
                 context.mux_limits,
             );
-            let is_ordered_service = self.ordered_data_owner_instance == Some(instance);
             let (update, has_exact_path_provenance, exact_attributed_bytes) = {
                 let evidence = self
                     .request_rate_evidence

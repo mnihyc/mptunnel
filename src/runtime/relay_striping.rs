@@ -12,6 +12,7 @@ use super::model::admission::{
     bulk_service_feed_reservoir_payload_bytes, bulk_service_horizon_payload_bytes,
     bulk_service_product_envelope_payload_bytes,
 };
+use super::model::request::evidence::RequestPerFlowRateModel;
 use super::*;
 use std::collections::BTreeMap;
 

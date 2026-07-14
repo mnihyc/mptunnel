@@ -230,10 +230,12 @@ paired ratio rather than cross-epoch absolute rates. Server CPU, peak memory,
 and maximum gap remain higher at 9.398/2.462%, 208.8/134.6 MB, and
 0.599/0.494 seconds for multipath/single.
 
-The Linux TCP carrier now samples `TCP_INFO` from the exact authenticated server
-socket. Passive samples are pressure/liveness only; only the typed offset-free
-receipt can temporarily authorize optional bulk placement. Native delivery is
-capped at 2x receipt rate and pacing never becomes capacity authority. Final
+The Linux TCP carrier samples `TCP_INFO` from the exact authenticated server
+socket. It accepts capability groups supported by the returned kernel prefix;
+missing RTT, flight, queue, loss, pacing, or delivery fields remain unknown.
+Passive samples are pressure/liveness only; only the typed offset-free receipt
+can temporarily authorize optional bulk placement. An actual native delivery
+field is capped at 2x receipt rate, and pacing never becomes capacity authority. Final
 Iteration 153 reaches 172.853 Mbps versus 84.992 Mbps single (`2.034x`); its
 0.504 second gap is a boundary miss, while the Iteration 154 repeat reaches
 182.917 Mbps with a 0.368 second gap. Do not restore the rejected source-only

@@ -34,7 +34,7 @@ fn tcp_info_v49_layout_matches_stable_uapi_prefix() {
 }
 
 #[test]
-fn parser_requires_complete_delivery_rate_generation() {
+fn parser_exposes_only_counter_groups_present_in_the_returned_prefix() {
     let mut bytes = [0u8; TCP_INFO_V4_9_PREFIX_BYTES];
     bytes[7] = 1;
     bytes[16..20].copy_from_slice(&1460u32.to_ne_bytes());
@@ -50,16 +50,48 @@ fn parser_requires_complete_delivery_rate_generation() {
     bytes[156..160].copy_from_slice(&42u32.to_ne_bytes());
     bytes[160..168].copy_from_slice(&8_000_000u64.to_ne_bytes());
 
-    for returned in [7, 8, 104, 120, 128, 144, 148, 160, 167] {
+    for returned in [7, 8, 75] {
         assert_eq!(parse_tcp_info_prefix(&bytes, returned), None);
     }
+    let rtt_only = parse_tcp_info_prefix(&bytes, 76).expect("RTT prefix");
+    assert_eq!(rtt_only.rtt.expect("RTT group").srtt_us, 20_000);
+    assert_eq!(rtt_only.rtt.expect("RTT group").min_rtt_us, None);
+    assert_eq!(rtt_only.flight, None);
+
+    let flight = parse_tcp_info_prefix(&bytes, 84).expect("flight prefix");
+    assert_eq!(flight.flight.expect("flight group").snd_mss_bytes, 1_460);
+    assert_eq!(flight.pacing_rate_bytes_per_second, None);
+
+    let pacing = parse_tcp_info_prefix(&bytes, 112).expect("pacing prefix");
+    assert_eq!(pacing.pacing_rate_bytes_per_second, Some(10_000_000));
+    assert_eq!(pacing.bytes_acked, None);
+
+    let acked = parse_tcp_info_prefix(&bytes, 128).expect("ACK prefix");
+    assert_eq!(acked.bytes_acked, Some(123_456));
+    assert_eq!(acked.notsent_bytes, None);
+
+    let queue = parse_tcp_info_prefix(&bytes, 148).expect("queue prefix");
+    assert_eq!(queue.notsent_bytes, Some(99));
+    assert_eq!(queue.rtt.expect("RTT group").min_rtt_us, None);
+
+    let min_rtt = parse_tcp_info_prefix(&bytes, 152).expect("minimum RTT prefix");
+    assert_eq!(min_rtt.rtt.expect("RTT group").min_rtt_us, Some(18_000));
+
+    let loss = parse_tcp_info_prefix(&bytes, 160).expect("loss prefix");
+    assert_eq!(loss.loss.expect("loss counters").retransmits, 7);
+    assert_eq!(loss.delivery_rate_bytes_per_second, None);
+    assert_eq!(loss.app_limited, None);
+    let pre_delivery = parse_tcp_info_prefix(&bytes, 167).expect("pre-delivery prefix");
+    assert_eq!(pre_delivery.delivery_rate_bytes_per_second, None);
+    assert_eq!(pre_delivery.app_limited, None);
+
     let parsed = parse_tcp_info_prefix(&bytes, 168).expect("complete v4.9 prefix");
-    assert!(parsed.app_limited);
-    assert_eq!(parsed.snd_mss_bytes, 1460);
-    assert_eq!(parsed.srtt_us, 20_000);
-    assert_eq!(parsed.pacing_rate_bytes_per_second, 10_000_000);
-    assert_eq!(parsed.bytes_acked, 123_456);
-    assert_eq!(parsed.delivery_rate_bytes_per_second, 8_000_000);
+    assert_eq!(parsed.app_limited, Some(true));
+    assert_eq!(parsed.flight.expect("flight group").snd_mss_bytes, 1460);
+    assert_eq!(parsed.rtt.expect("RTT group").srtt_us, 20_000);
+    assert_eq!(parsed.pacing_rate_bytes_per_second, Some(10_000_000));
+    assert_eq!(parsed.bytes_acked, Some(123_456));
+    assert_eq!(parsed.delivery_rate_bytes_per_second, Some(8_000_000));
 }
 
 #[tokio::test]
@@ -95,7 +127,11 @@ async fn duplicated_socket_survives_stream_split_and_observes_ack_progress() {
                 .snapshot()
                 .expect("read TCP_INFO after transfer")
                 .expect("Linux TCP_INFO v4.9 prefix");
-            if snapshot.bytes_acked > baseline.bytes_acked {
+            if snapshot
+                .bytes_acked
+                .zip(baseline.bytes_acked)
+                .is_some_and(|(snapshot_bytes, baseline_bytes)| snapshot_bytes > baseline_bytes)
+            {
                 break snapshot;
             }
             tokio::time::sleep(Duration::from_millis(5)).await;
@@ -107,7 +143,12 @@ async fn duplicated_socket_survives_stream_split_and_observes_ack_progress() {
             .snapshot()
             .expect("duplicated socket remains queryable")
             .expect("Linux TCP_INFO v4.9 prefix");
-        assert!(after_original_drop.bytes_acked >= advanced.bytes_acked);
+        assert!(
+            after_original_drop
+                .bytes_acked
+                .zip(advanced.bytes_acked)
+                .is_some_and(|(after_bytes, advanced_bytes)| after_bytes >= advanced_bytes)
+        );
     })
     .await
     .expect("loopback TCP_INFO proof exceeded three seconds");

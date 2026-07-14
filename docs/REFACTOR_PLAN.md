@@ -99,9 +99,11 @@ policy still embedded in those actors, not another server subdirectory.
 
 OS conditionals stay at packet-device, platform-reporting, or native telemetry
 adapters. Linux `TCP_INFO` is optional evidence with a portable typed fallback;
-it must not gate TCP eligibility. Windows client/Linux server is the primary
-cross-platform role pair, while macOS and Android remain explicit design and
-verification targets.
+its returned prefix is parsed as independent capabilities, and missing fields
+remain unknown rather than measured zero. Native pacing is not delivery
+authority and must not gate TCP eligibility. Windows client/Linux server is the
+primary cross-platform role pair, while macOS and Android remain explicit design
+and verification targets.
 
 Carrier network access is a narrow host provider beside, not inside,
 packet-device ownership. It receives the configured path and typed client-group

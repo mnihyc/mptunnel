@@ -3,6 +3,7 @@
 //! This owner converts typed receiver receipts and optional native snapshots
 //! into capacity evidence. Socket capture and polling remain in `metrics`.
 
+use super::metrics::TcpNativeObservation;
 pub(in crate::runtime) use crate::model::capacity::TcpCapacityProofCandidate;
 use crate::model::capacity::{
     BBR_DEFAULT_CWND_GAIN, PATH_OPEN_SCORE_BYTES, RELIABLE_INITIAL_RTT, TRANSPORT_TIMER_GRANULARITY,
@@ -48,7 +49,6 @@ pub(in crate::runtime) fn tcp_capacity_proof_validity(metrics: PathMetrics) -> D
 pub(in crate::runtime) fn tcp_capacity_authoritative_rate_bps(
     receipt_rate_bps: u64,
     delivery_rate_bps: u64,
-    _pacing_rate_bps: u64,
 ) -> u64 {
     // The typed receipt rate remains the floor. Native ACK delivery may lift
     // it by one BBR cwnd gain; pacing alone still proves no delivery.
@@ -65,7 +65,7 @@ pub(in crate::runtime) fn request_tcp_capacity_receipt_metrics(
     received_bytes: u64,
     receipt_rate_bps: u64,
     baseline: Option<PathMetrics>,
-    native: Option<PathMetrics>,
+    native: Option<TcpNativeObservation>,
 ) -> PathMetrics {
     // A cold request train may be below the real BDP. Its full receiver receipt
     // is the conservative rate seed; product ACKs replace it after handoff.
@@ -85,7 +85,7 @@ pub(in crate::runtime) fn response_tcp_capacity_receipt_metrics(
     received_bytes: u64,
     receipt_rate_bps: u64,
     baseline: Option<PathMetrics>,
-    native: Option<PathMetrics>,
+    native: Option<TcpNativeObservation>,
 ) -> PathMetrics {
     // Response discovery may use bounded same-socket delivery uplift because
     // the server owns both the train and the native sender sample.
@@ -106,37 +106,38 @@ fn tcp_capacity_receipt_metrics(
     received_bytes: u64,
     receipt_rate_bps: u64,
     baseline: Option<PathMetrics>,
-    native: Option<PathMetrics>,
+    native: Option<TcpNativeObservation>,
     native_delivery_may_uplift: bool,
 ) -> PathMetrics {
-    let has_native_shape = native.is_some();
-    let native_delivery_rate_bps = native.map_or(0, |metrics| metrics.delivery_rate_bps);
-    let native_pacing_rate_bps = native.map_or(0, |metrics| metrics.pacing_rate_bps);
-    let mut metrics = native
-        .or(baseline)
-        .unwrap_or_else(|| portable_tcp_receipt_metrics(path_id, direction));
+    let native_delivery_rate_bps = native.and_then(TcpNativeObservation::delivery_rate_bps);
+    let mut metrics = baseline.unwrap_or_else(|| portable_tcp_receipt_metrics(path_id, direction));
+    if let Some(native) = native {
+        native.apply_transport_shape(&mut metrics);
+        metrics.metric_epoch = metric_epoch_now();
+        metrics.metric_age_us = 0;
+    }
     let rate_bps = if native_delivery_may_uplift {
-        tcp_capacity_authoritative_rate_bps(
-            receipt_rate_bps,
-            native_delivery_rate_bps,
-            native_pacing_rate_bps,
-        )
+        tcp_capacity_authoritative_rate_bps(receipt_rate_bps, native_delivery_rate_bps.unwrap_or(0))
     } else {
         receipt_rate_bps
     }
     .max(1);
+    metrics.path_id = path_id;
+    metrics.underlay = UnderlayProtocol::Tcp;
+    metrics.direction = direction;
     metrics.delivery_rate_bps = rate_bps;
     metrics.pacing_rate_bps = rate_bps;
     metrics.has_ack_derived_data_sample = true;
     metrics.data_sample_count = metrics.data_sample_count.max(1);
     metrics.data_sample_bytes = metrics.data_sample_bytes.max(received_bytes);
     metrics.confidence_ppm = 1_000_000;
-    if !has_native_shape {
-        // A configured startup prior is not durable delivery evidence. Keep
-        // the path app-limited after the short typed receipt proof expires and
-        // leave cwnd unknown so receipt-rate BDP, not an initial-window hint,
-        // bounds portable high-bandwidth admission.
-        metrics.app_limited = true;
+    metrics.app_limited = native
+        .and_then(TcpNativeObservation::app_limited)
+        .unwrap_or(true);
+    if !native.is_some_and(TcpNativeObservation::has_flight) {
+        // A configured startup prior is not native congestion evidence. Keep
+        // cwnd unknown so receipt-rate BDP, not an initial-window hint, bounds
+        // portable high-bandwidth admission.
         metrics.inflight_limit_bytes = 0;
         metrics.inflight_hi_bytes = 0;
     }

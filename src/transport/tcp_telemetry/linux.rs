@@ -1,6 +1,6 @@
 //! Linux implementation of optional native TCP telemetry.
 
-use super::TcpTelemetrySnapshot;
+use super::{TcpNativeFlight, TcpNativeLossCounters, TcpNativeRtt, TcpNativeSnapshot};
 use std::io;
 use std::os::fd::{AsFd, AsRawFd, OwnedFd};
 use tokio::net::TcpStream;
@@ -21,7 +21,7 @@ impl PlatformTcpTelemetrySocket {
     }
 
     /// Missing or truncated kernel telemetry is not a carrier failure.
-    pub(super) fn snapshot(&self) -> io::Result<Option<TcpTelemetrySnapshot>> {
+    pub(super) fn snapshot(&self) -> io::Result<Option<TcpNativeSnapshot>> {
         let mut bytes = [0u8; TCP_INFO_V4_9_PREFIX_BYTES];
         let mut returned = libc::socklen_t::try_from(bytes.len()).unwrap_or(libc::socklen_t::MAX);
         // SAFETY: `bytes` is writable for `returned` bytes and `returned` points
@@ -45,12 +45,8 @@ impl PlatformTcpTelemetrySocket {
     }
 }
 
-pub(super) fn parse_tcp_info_prefix(bytes: &[u8], returned: usize) -> Option<TcpTelemetrySnapshot> {
-    // Linux 4.9 added both tcpi_delivery_rate and the app-limited bit. Older
-    // kernels used byte 7 as padding, so a shorter reply cannot prove either.
-    if returned < TCP_INFO_V4_9_PREFIX_BYTES || bytes.len() < TCP_INFO_V4_9_PREFIX_BYTES {
-        return None;
-    }
+pub(super) fn parse_tcp_info_prefix(bytes: &[u8], returned: usize) -> Option<TcpNativeSnapshot> {
+    let available = returned.min(bytes.len());
     let u32_at = |offset| {
         u32::from_ne_bytes(
             bytes[offset..offset + 4]
@@ -65,20 +61,34 @@ pub(super) fn parse_tcp_info_prefix(bytes: &[u8], returned: usize) -> Option<Tcp
                 .expect("validated TCP_INFO u64 field"),
         )
     };
-    Some(TcpTelemetrySnapshot {
-        app_limited: bytes[7] & 1 != 0,
-        snd_mss_bytes: u32_at(16),
-        unacked_packets: u32_at(24),
+
+    let rtt = (available >= 76).then(|| TcpNativeRtt {
         srtt_us: u32_at(68),
         rttvar_us: u32_at(72),
+        min_rtt_us: (available >= 152).then(|| u32_at(148)),
+    });
+    let flight = (available >= 84).then(|| TcpNativeFlight {
+        snd_mss_bytes: u32_at(16),
+        unacked_packets: u32_at(24),
         snd_ssthresh_packets: u32_at(76),
         snd_cwnd_packets: u32_at(80),
+    });
+    let loss = (available >= 160).then(|| TcpNativeLossCounters {
         retransmits: u32_at(100),
-        pacing_rate_bytes_per_second: u64_at(104),
-        bytes_acked: u64_at(120),
-        notsent_bytes: u32_at(144),
-        min_rtt_us: u32_at(148),
         data_segments_out: u32_at(156),
-        delivery_rate_bytes_per_second: u64_at(160),
-    })
+    });
+    // Linux 4.9 added both tcpi_delivery_rate and the app-limited bit. Older
+    // kernels used byte 7 as padding, so a shorter reply cannot prove either.
+    let has_delivery_fields = available >= TCP_INFO_V4_9_PREFIX_BYTES;
+    let snapshot = TcpNativeSnapshot {
+        rtt,
+        flight,
+        pacing_rate_bytes_per_second: (available >= 112).then(|| u64_at(104)),
+        bytes_acked: (available >= 128).then(|| u64_at(120)),
+        notsent_bytes: (available >= 148).then(|| u32_at(144)),
+        loss,
+        delivery_rate_bytes_per_second: has_delivery_fields.then(|| u64_at(160)),
+        app_limited: has_delivery_fields.then(|| bytes[7] & 1 != 0),
+    };
+    snapshot.has_evidence().then_some(snapshot)
 }

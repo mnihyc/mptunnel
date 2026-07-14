@@ -1,6 +1,6 @@
 //! Fallback for hosts without an implemented native TCP telemetry backend.
 
-use super::TcpTelemetrySnapshot;
+use super::TcpNativeSnapshot;
 use std::io;
 use tokio::net::TcpStream;
 
@@ -15,7 +15,7 @@ impl PlatformTcpTelemetrySocket {
         ))
     }
 
-    pub(super) fn snapshot(&self) -> io::Result<Option<TcpTelemetrySnapshot>> {
+    pub(super) fn snapshot(&self) -> io::Result<Option<TcpNativeSnapshot>> {
         Ok(None)
     }
 }

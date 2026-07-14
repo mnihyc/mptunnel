@@ -13,6 +13,7 @@ use super::proof::PathProofObservation;
 use super::quic::metrics::UdpPathMetrics;
 use super::set::ClientPathContext;
 use super::tcp::capacity::valid_tcp_capacity_proof_candidate_at;
+use super::tcp::metrics::TcpNativeObservation;
 #[cfg(test)]
 use super::*;
 use crate::model::capacity::{
@@ -800,19 +801,30 @@ impl ClientPathHealthRecord {
             .map(|proof| proof.acked_at)
     }
 
-    pub(in crate::runtime) fn mark_tcp_transport_state(&mut self, metrics: PathMetrics) {
-        if self.manual_disabled || metrics.underlay != UnderlayProtocol::Tcp {
+    pub(in crate::runtime) fn mark_tcp_transport_state(
+        &mut self,
+        observation: TcpNativeObservation,
+    ) {
+        if self.manual_disabled {
             return;
         }
         self.mark_liveness_success();
-        // Same-socket TCP_INFO owns transport state only. A small path proof
-        // must not turn its native delivery estimate into path-rate authority.
-        self.carrier_srtt_ms = Some(f64::from(metrics.srtt_us.max(1)) / 1_000.0);
-        self.carrier_rttvar_ms = Some(f64::from(metrics.rttvar_us) / 1_000.0);
-        self.carrier_bytes_in_flight = metrics.bytes_in_flight;
-        self.carrier_queue_bytes = metrics.queue_bytes;
-        self.carrier_inflight_limit_bytes = metrics.inflight_limit_bytes;
-        self.measured_loss_rate = Some(f64::from(metrics.loss_ppm) / 1_000_000.0);
+        // Same-socket native evidence updates only capabilities the host exposed.
+        // Delivery rate stays inside typed proofs and product ACK authority.
+        if let Some((srtt_us, rttvar_us)) = observation.rtt() {
+            self.carrier_srtt_ms = Some(f64::from(srtt_us.max(1)) / 1_000.0);
+            self.carrier_rttvar_ms = Some(f64::from(rttvar_us) / 1_000.0);
+        }
+        if let Some((bytes_in_flight, inflight_limit_bytes, _)) = observation.flight() {
+            self.carrier_bytes_in_flight = bytes_in_flight;
+            self.carrier_inflight_limit_bytes = inflight_limit_bytes;
+        }
+        if let Some(queue_bytes) = observation.queue_bytes() {
+            self.carrier_queue_bytes = queue_bytes;
+        }
+        if let Some(loss_ppm) = observation.loss_ppm() {
+            self.measured_loss_rate = Some(f64::from(loss_ppm) / 1_000_000.0);
+        }
     }
 
     pub(in crate::runtime) fn accept_request_tcp_capacity_proof(
@@ -821,7 +833,7 @@ impl ClientPathHealthRecord {
         path_instance: RelayPathInstance,
         candidate: TcpCapacityProofCandidate,
         proof_metrics: PathMetrics,
-        native_transport_state: Option<PathMetrics>,
+        native_transport_state: Option<TcpNativeObservation>,
         now: Instant,
     ) -> bool {
         let Some(reservation) = self.request_tcp_capacity_probe.as_ref() else {
@@ -831,10 +843,9 @@ impl ClientPathHealthRecord {
             || proof_metrics.underlay != UnderlayProtocol::Tcp
             || proof_metrics.direction != PathMetricDirection::ClientToServer
             || proof_metrics.path_id.0 as usize != path_instance.key.index
-            || native_transport_state.is_some_and(|metrics| {
-                metrics.underlay != UnderlayProtocol::Tcp
-                    || metrics.direction != PathMetricDirection::ClientToServer
-                    || metrics.path_id.0 as usize != path_instance.key.index
+            || native_transport_state.is_some_and(|observation| {
+                observation.direction() != PathMetricDirection::ClientToServer
+                    || observation.path_id().0 as usize != path_instance.key.index
             })
             || reservation.stream_id != stream_id
             || reservation.path_instance != path_instance

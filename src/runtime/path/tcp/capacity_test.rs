@@ -1,4 +1,39 @@
 use super::*;
+use crate::runtime::path::tcp::metrics::{TcpNativeObservation, TcpSenderMetricTracker};
+use crate::transport::tcp_telemetry::{
+    TcpNativeFlight, TcpNativeLossCounters, TcpNativeRtt, TcpNativeSnapshot,
+};
+
+fn native_observation(
+    path_id: PathId,
+    delivery_rate_bytes_per_second: Option<u64>,
+    pacing_rate_bytes_per_second: Option<u64>,
+    flight: Option<TcpNativeFlight>,
+    app_limited: Option<bool>,
+) -> TcpNativeObservation {
+    let snapshot = TcpNativeSnapshot {
+        rtt: Some(TcpNativeRtt {
+            min_rtt_us: Some(18_000),
+            srtt_us: 20_000,
+            rttvar_us: 2_000,
+        }),
+        flight,
+        notsent_bytes: Some(0),
+        bytes_acked: Some(100),
+        loss: Some(TcpNativeLossCounters {
+            retransmits: 0,
+            data_segments_out: 10,
+        }),
+        pacing_rate_bytes_per_second,
+        delivery_rate_bytes_per_second,
+        app_limited,
+    };
+    TcpSenderMetricTracker::new(snapshot).observe(
+        path_id,
+        PathMetricDirection::ServerToClient,
+        snapshot,
+    )
+}
 
 #[test]
 fn tcp_capacity_proof_requires_exact_fresh_receipt() {
@@ -31,11 +66,11 @@ fn tcp_capacity_proof_requires_exact_fresh_receipt() {
 #[test]
 fn tcp_capacity_authority_ignores_pacing_and_bounds_delivery_uplift() {
     assert_eq!(
-        tcp_capacity_authoritative_rate_bps(10_000_000, 15_000_000, 1_000_000_000),
+        tcp_capacity_authoritative_rate_bps(10_000_000, 15_000_000),
         15_000_000
     );
     assert_eq!(
-        tcp_capacity_authoritative_rate_bps(10_000_000, 1_000_000_000, 2_000_000_000),
+        tcp_capacity_authoritative_rate_bps(10_000_000, 1_000_000_000),
         20_000_000
     );
 }
@@ -70,12 +105,18 @@ fn portable_request_receipt_uses_exact_rate_and_configured_path_shape() {
 
 #[test]
 fn response_receipt_uses_bounded_native_delivery_without_rewriting_native_shape() {
-    let mut native = portable_tcp_receipt_metrics(PathId(4), PathMetricDirection::ServerToClient);
-    native.delivery_rate_bps = 1_000_000_000;
-    native.pacing_rate_bps = 2_000_000_000;
-    native.inflight_limit_bytes = 48_000;
-    native.inflight_hi_bytes = 40_000;
-    native.app_limited = true;
+    let native = native_observation(
+        PathId(4),
+        Some(125_000_000),
+        Some(250_000_000),
+        Some(TcpNativeFlight {
+            snd_mss_bytes: 1_000,
+            unacked_packets: 4,
+            snd_ssthresh_packets: 40,
+            snd_cwnd_packets: 48,
+        }),
+        Some(true),
+    );
 
     let metrics = response_tcp_capacity_receipt_metrics(
         PathId(4),
@@ -87,9 +128,25 @@ fn response_receipt_uses_bounded_native_delivery_without_rewriting_native_shape(
 
     assert_eq!(metrics.delivery_rate_bps, 200_000_000);
     assert_eq!(metrics.pacing_rate_bps, 200_000_000);
-    assert_eq!(metrics.inflight_limit_bytes, native.inflight_limit_bytes);
-    assert_eq!(metrics.inflight_hi_bytes, native.inflight_hi_bytes);
-    assert_eq!(metrics.app_limited, native.app_limited);
+    assert_eq!(metrics.inflight_limit_bytes, 48_000);
+    assert_eq!(metrics.inflight_hi_bytes, 40_000);
+    assert!(metrics.app_limited);
+}
+
+#[test]
+fn response_receipt_does_not_promote_native_pacing_to_delivery() {
+    let native = native_observation(PathId(6), Some(0), Some(250_000_000), None, None);
+    let metrics = response_tcp_capacity_receipt_metrics(
+        PathId(6),
+        4 * 1024 * 1024,
+        100_000_000,
+        None,
+        Some(native),
+    );
+
+    assert_eq!(metrics.delivery_rate_bps, 100_000_000);
+    assert_eq!(metrics.inflight_limit_bytes, 0);
+    assert!(metrics.app_limited);
 }
 
 #[test]

@@ -55,7 +55,9 @@ pub(super) async fn client_write_tcp_capacity_probe(
             probe.calibration_id,
             baseline_wait_started_at.elapsed().as_millis(),
             _baseline.is_some(),
-            _baseline.map_or(0, |snapshot| snapshot.unacked_packets),
+            _baseline
+                .and_then(|snapshot| snapshot.unacked_packets)
+                .unwrap_or(0),
             _baseline.map_or(0, |snapshot| snapshot.notsent_bytes),
         ),
     );
@@ -289,19 +291,22 @@ pub(super) async fn handle_client_tcp_capacity_frame(
             else {
                 return Ok(());
             };
-            let native_metrics = connection
-                .carrier
-                .tcp_metrics
-                .as_mut()
-                .and_then(|publisher| {
-                    publisher.maybe_observe(path_id, PathMetricDirection::ClientToServer, true)
-                });
+            let native_observation =
+                connection
+                    .carrier
+                    .tcp_metrics
+                    .as_mut()
+                    .and_then(|publisher| {
+                        publisher.maybe_observe(path_id, PathMetricDirection::ClientToServer, true)
+                    });
             #[cfg(feature = "lab-diagnostics")]
-            let kernel_delivery_rate_bps =
-                native_metrics.map_or(0, |metrics| metrics.delivery_rate_bps);
+            let kernel_delivery_rate_bps = native_observation
+                .and_then(super::metrics::TcpNativeObservation::delivery_rate_bps)
+                .unwrap_or(0);
             #[cfg(feature = "lab-diagnostics")]
-            let kernel_pacing_rate_bps =
-                native_metrics.map_or(0, |metrics| metrics.pacing_rate_bps);
+            let kernel_pacing_rate_bps = native_observation
+                .and_then(super::metrics::TcpNativeObservation::pacing_rate_bps)
+                .unwrap_or(0);
             // Cold request trains can be smaller than the real path BDP, so
             // native delivery remains diagnostic here. The full typed receipt
             // is the seed; product ACK evidence replaces it after handoff.
@@ -310,7 +315,7 @@ pub(super) async fn handle_client_tcp_capacity_frame(
                 received_payload_bytes,
                 receipt_rate_bps,
                 Some(connection.startup_metrics),
-                native_metrics,
+                native_observation,
             );
             let rate_bps = metrics.delivery_rate_bps;
             let accepted_at = Instant::now();
@@ -339,7 +344,7 @@ pub(super) async fn handle_client_tcp_capacity_frame(
                         path_instance,
                         candidate,
                         metrics,
-                        native_metrics,
+                        native_observation,
                         accepted_at,
                     )
                 });

@@ -116,9 +116,14 @@ impl ServerTcpEvidenceState {
         path_registration: &ServerCarrierPathRegistration,
         path_id: PathId,
     ) {
-        if let Some(metrics) = self.tcp_metrics.as_mut().and_then(|publisher| {
-            publisher.maybe_observe(path_id, PathMetricDirection::ServerToClient, false)
-        }) {
+        if let Some(metrics) = self
+            .tcp_metrics
+            .as_mut()
+            .and_then(|publisher| {
+                publisher.maybe_observe(path_id, PathMetricDirection::ServerToClient, false)
+            })
+            .and_then(super::metrics::TcpNativeObservation::complete_path_metrics)
+        {
             self.local_metrics = Some(metrics);
             context
                 .reliable_streams
@@ -212,20 +217,23 @@ impl ServerTcpEvidenceState {
             .ok_or(RuntimeError::Protocol(
                 "TCP capacity receipt has invalid timing",
             ))?;
-        let native_metrics = self.tcp_metrics.as_mut().and_then(|publisher| {
+        let native_observation = self.tcp_metrics.as_mut().and_then(|publisher| {
             publisher.maybe_observe(path_id, PathMetricDirection::ServerToClient, true)
         });
         #[cfg(feature = "lab-diagnostics")]
-        let kernel_delivery_rate_bps =
-            native_metrics.map_or(0, |metrics| metrics.delivery_rate_bps);
+        let kernel_delivery_rate_bps = native_observation
+            .and_then(super::metrics::TcpNativeObservation::delivery_rate_bps)
+            .unwrap_or(0);
         #[cfg(feature = "lab-diagnostics")]
-        let kernel_pacing_rate_bps = native_metrics.map_or(0, |metrics| metrics.pacing_rate_bps);
+        let kernel_pacing_rate_bps = native_observation
+            .and_then(super::metrics::TcpNativeObservation::pacing_rate_bps)
+            .unwrap_or(0);
         let metrics = response_tcp_capacity_receipt_metrics(
             path_id,
             received_payload_bytes,
             receipt_rate_bps,
             self.local_metrics,
-            native_metrics,
+            native_observation,
         );
         let rate_bps = metrics.delivery_rate_bps;
         let accepted_at = Instant::now();

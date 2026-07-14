@@ -3347,7 +3347,11 @@ async fn server_tcp_binding_keeps_tcp_and_udp_paths_with_same_id_separate() {
     }
 }
 
+#[path = "runtime/tests/datagram_test.rs"]
 mod datagram;
+#[path = "runtime/tests/integration_test.rs"]
 mod integration;
+#[path = "runtime/tests/security_test.rs"]
 mod security;
+#[path = "runtime/tests/tcp_path_test.rs"]
 mod tcp_path;

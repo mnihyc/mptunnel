@@ -58,4 +58,5 @@ use stream::*;
 use tun_l4::*;
 
 #[cfg(test)]
+#[path = "runtime_test.rs"]
 mod tests;

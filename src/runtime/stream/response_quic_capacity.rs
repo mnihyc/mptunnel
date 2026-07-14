@@ -15,6 +15,7 @@ use crate::model::path::CarrierPathKey;
 use crate::protocol::SessionId;
 use crate::runtime::path::commands::QuicCapacityProbeCommandTicket;
 use crate::runtime::path::quic::metrics::QuicCapacityProofCandidate;
+use std::collections::HashMap;
 use std::time::{Duration, Instant};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -176,9 +177,78 @@ fn record_quic_capacity_lifecycle(
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub(super) struct ServerQuicCapacityCalibrationPathKey {
-    pub(super) session_id: SessionId,
     pub(super) path: CarrierPathKey,
     pub(super) path_instance_id: ServerCarrierPathInstanceId,
+}
+
+#[derive(Debug, Default)]
+pub(super) struct ResponseQuicCapacityHistory {
+    attempts: HashMap<ServerQuicCapacityCalibrationPathKey, u8>,
+    spent_bytes: u64,
+}
+
+impl ResponseQuicCapacityHistory {
+    fn attempts_for_path(
+        &self,
+        path: CarrierPathKey,
+        path_instance_id: ServerCarrierPathInstanceId,
+    ) -> u8 {
+        self.attempts
+            .get(&ServerQuicCapacityCalibrationPathKey {
+                path,
+                path_instance_id,
+            })
+            .copied()
+            .unwrap_or(0)
+    }
+
+    fn set_attempts_for_path(
+        &mut self,
+        path: CarrierPathKey,
+        path_instance_id: ServerCarrierPathInstanceId,
+        attempts: u8,
+    ) {
+        let key = ServerQuicCapacityCalibrationPathKey {
+            path,
+            path_instance_id,
+        };
+        if attempts == 0 {
+            self.attempts.remove(&key);
+        } else {
+            self.attempts.insert(key, attempts);
+        }
+    }
+
+    fn remove_attempts_for_path(
+        &mut self,
+        path: CarrierPathKey,
+        path_instance_id: ServerCarrierPathInstanceId,
+    ) -> bool {
+        self.attempts
+            .remove(&ServerQuicCapacityCalibrationPathKey {
+                path,
+                path_instance_id,
+            })
+            .is_some()
+    }
+
+    fn spent_bytes(&self) -> u64 {
+        self.spent_bytes
+    }
+
+    fn set_spent_bytes(&mut self, spent_bytes: u64) {
+        self.spent_bytes = spent_bytes;
+    }
+
+    #[cfg(test)]
+    fn snapshot(&self) -> Option<ServerQuicCapacityHistorySnapshot> {
+        (!self.attempts.is_empty() || self.spent_bytes > 0).then_some(
+            ServerQuicCapacityHistorySnapshot {
+                attempt_entry_count: self.attempts.len(),
+                spent_bytes: (self.spent_bytes > 0).then_some(self.spent_bytes),
+            },
+        )
+    }
 }
 
 #[cfg(test)]
@@ -195,39 +265,25 @@ impl ServerPathLaneTrackerState {
         path: CarrierPathKey,
         path_instance_id: ServerCarrierPathInstanceId,
     ) -> u8 {
-        self.quic_capacity_calibration_attempts
-            .get(&ServerQuicCapacityCalibrationPathKey {
-                session_id,
-                path,
-                path_instance_id,
+        self.session(session_id)
+            .map(|session| {
+                session
+                    .quic_history()
+                    .attempts_for_path(path, path_instance_id)
             })
-            .copied()
             .unwrap_or(0)
     }
 
     pub(super) fn quic_capacity_calibration_reserved(&self, session_id: SessionId) -> bool {
-        self.quic_capacity_calibrations.contains_key(&session_id)
+        self.session(session_id)
+            .and_then(|session| session.quic_capacity_calibration())
+            .is_some()
     }
 
     pub(super) fn quic_capacity_calibration_spent_bytes(&self, session_id: SessionId) -> u64 {
-        self.quic_capacity_calibration_bytes
-            .get(&session_id)
-            .copied()
+        self.session(session_id)
+            .map(|session| session.quic_history().spent_bytes())
             .unwrap_or(0)
-    }
-
-    pub(super) fn quic_capacity_proof_publication_in_progress(
-        &self,
-        session_id: SessionId,
-    ) -> bool {
-        self.quic_capacity_calibrations
-            .get(&session_id)
-            .is_some_and(|reservation| {
-                matches!(
-                    reservation.phase,
-                    ServerQuicCapacityCalibrationPhase::ProofPublishing { .. }
-                )
-            })
     }
 
     pub(super) fn expire_quic_capacity_calibration_at(
@@ -235,29 +291,31 @@ impl ServerPathLaneTrackerState {
         session_id: SessionId,
         now: Instant,
     ) {
-        let capacity_removal =
-            self.quic_capacity_calibrations
-                .get(&session_id)
-                .and_then(|reservation| {
-                    if !reservation.command_ticket.is_current()
-                        && !matches!(
-                            reservation.phase,
-                            ServerQuicCapacityCalibrationPhase::ProofPublishing { .. }
-                        )
+        let capacity_removal = self
+            .session(session_id)
+            .and_then(|session| session.quic_capacity_calibration())
+            .and_then(|reservation| {
+                if !reservation.command_ticket.is_current()
+                    && !matches!(
+                        reservation.phase,
+                        ServerQuicCapacityCalibrationPhase::ProofPublishing { .. }
+                    )
+                {
+                    return Some(("cancelled", "command_invalidated"));
+                }
+                match reservation.phase {
+                    ServerQuicCapacityCalibrationPhase::Active { expires_at }
+                        if now >= expires_at =>
                     {
-                        return Some(("cancelled", "command_invalidated"));
+                        Some(("expired", "lease_elapsed"))
                     }
-                    match reservation.phase {
-                        ServerQuicCapacityCalibrationPhase::Active { expires_at }
-                            if now >= expires_at =>
-                        {
-                            Some(("expired", "lease_elapsed"))
-                        }
-                        _ => None,
-                    }
-                });
+                    _ => None,
+                }
+            });
         if let Some((phase, reason)) = capacity_removal {
-            let reservation = self.quic_capacity_calibrations.remove(&session_id);
+            let reservation = self
+                .session_mut(session_id)
+                .and_then(|session| session.take_quic_capacity_calibration());
             if let Some(reservation) = reservation.as_ref() {
                 reservation.command_ticket.cancel();
             }
@@ -269,17 +327,6 @@ impl ServerPathLaneTrackerState {
             #[cfg(not(feature = "lab-diagnostics"))]
             let _ = (reservation, phase, reason);
         }
-    }
-
-    pub(super) fn take_quic_capacity_session_reclamation(
-        &mut self,
-        session_id: SessionId,
-    ) -> Option<ServerQuicCapacityCalibrationReservation> {
-        let reservation = self.quic_capacity_calibrations.remove(&session_id);
-        self.quic_capacity_calibration_attempts
-            .retain(|key, _| key.session_id != session_id);
-        self.quic_capacity_calibration_bytes.remove(&session_id);
-        reservation
     }
 }
 
@@ -318,8 +365,8 @@ impl ServerPathLaneTracker {
     ) -> bool {
         let mut state = self.state.lock().expect("server path lane tracker lock");
         let Some(reservation) = state
-            .quic_capacity_calibrations
-            .get_mut(&session_id)
+            .session_mut(session_id)
+            .and_then(|session| session.quic_capacity_calibration_mut())
             .filter(|reservation| {
                 reservation.binding_instance_id == binding_instance_id
                     && reservation.path == path
@@ -343,21 +390,9 @@ impl ServerPathLaneTracker {
         session_id: SessionId,
     ) -> Option<ServerQuicCapacityHistorySnapshot> {
         let state = self.state.lock().expect("server path lane tracker lock");
-        let attempt_entry_count = state
-            .quic_capacity_calibration_attempts
-            .keys()
-            .filter(|key| key.session_id == session_id)
-            .count();
-        let spent_bytes = state
-            .quic_capacity_calibration_bytes
-            .get(&session_id)
-            .copied();
-        (attempt_entry_count > 0 || spent_bytes.is_some()).then_some(
-            ServerQuicCapacityHistorySnapshot {
-                attempt_entry_count,
-                spent_bytes,
-            },
-        )
+        state
+            .session(session_id)
+            .and_then(|session| session.quic_history().snapshot())
     }
 
     #[cfg(test)]
@@ -425,8 +460,8 @@ impl ServerPathLaneTracker {
             .state
             .lock()
             .expect("server path lane tracker lock")
-            .quic_capacity_calibrations
-            .get(&session_id)
+            .session(session_id)
+            .and_then(|session| session.quic_capacity_calibration())
             .cloned();
         let Some(reservation) = reservation.filter(|reservation| {
             reservation.binding_instance_id == binding_instance_id
@@ -492,30 +527,26 @@ impl ServerPathLaneTracker {
             return false;
         }
         let mut state = self.state.lock().expect("server path lane tracker lock");
-        let generation = state
-            .session_generations
-            .get(&session_id)
-            .copied()
-            .unwrap_or(0);
+        let generation = state.generation(session_id);
         let active_response_flows = state
-            .active_response_flows
-            .get(&session_id)
-            .copied()
+            .session(session_id)
+            .map(|session| session.load().active_response_flows())
             .unwrap_or(0);
         let attempt_key = ServerQuicCapacityCalibrationPathKey {
-            session_id,
             path,
             path_instance_id,
         };
         let attempts = state
-            .quic_capacity_calibration_attempts
-            .get(&attempt_key)
-            .copied()
+            .session(session_id)
+            .map(|session| {
+                session
+                    .quic_history()
+                    .attempts_for_path(path, path_instance_id)
+            })
             .unwrap_or(0);
         let spent_bytes = state
-            .quic_capacity_calibration_bytes
-            .get(&session_id)
-            .copied()
+            .session(session_id)
+            .map(|session| session.quic_history().spent_bytes())
             .unwrap_or(0);
         let Some(next_spent_bytes) = spent_bytes.checked_add(train_bytes) else {
             return false;
@@ -524,36 +555,33 @@ impl ServerPathLaneTracker {
             || active_response_flows < 2
             || attempts >= MAX_RESPONSE_QUIC_CAPACITY_CALIBRATION_ATTEMPTS_PER_PATH
             || next_spent_bytes > session_byte_limit
-            || state.tcp_capacity_probe_reservations.contains(&session_id)
-            || state.quic_capacity_calibrations.contains_key(&session_id)
-            || state.response_service_handoff_drain_reserved(session_id)
         {
             return false;
         }
-        state.quic_capacity_calibrations.insert(
-            session_id,
-            ServerQuicCapacityCalibrationReservation {
-                binding_instance_id,
-                path,
-                path_instance_id,
-                phase: ServerQuicCapacityCalibrationPhase::Provisional,
-                train_bytes,
-                sample_floor_bytes,
-                accounting_slack_bytes,
-                warmup_bytes,
-                required_proof_bytes,
-                proof_validity,
-                token,
-                command_ticket,
-            },
+        let session = state.session_mut_or_default(session_id);
+        if !session.reserve_quic_capacity_calibration(ServerQuicCapacityCalibrationReservation {
+            binding_instance_id,
+            path,
+            path_instance_id,
+            phase: ServerQuicCapacityCalibrationPhase::Provisional,
+            train_bytes,
+            sample_floor_bytes,
+            accounting_slack_bytes,
+            warmup_bytes,
+            required_proof_bytes,
+            proof_validity,
+            token,
+            command_ticket,
+        }) {
+            return false;
+        }
+        session.quic_history_mut().set_attempts_for_path(
+            attempt_key.path,
+            attempt_key.path_instance_id,
+            attempts.saturating_add(1),
         );
-        state
-            .quic_capacity_calibration_attempts
-            .insert(attempt_key, attempts.saturating_add(1));
-        state
-            .quic_capacity_calibration_bytes
-            .insert(session_id, next_spent_bytes);
-        state.bump_generation(session_id);
+        session.quic_history_mut().set_spent_bytes(next_spent_bytes);
+        session.bump_generation();
         true
     }
 
@@ -567,8 +595,8 @@ impl ServerPathLaneTracker {
     ) {
         let mut state = self.state.lock().expect("server path lane tracker lock");
         let matches = state
-            .quic_capacity_calibrations
-            .get(&session_id)
+            .session(session_id)
+            .and_then(|session| session.quic_capacity_calibration())
             .is_some_and(|reservation| {
                 reservation.binding_instance_id == binding_instance_id
                     && reservation.path == path
@@ -578,34 +606,27 @@ impl ServerPathLaneTracker {
             });
         if matches {
             let reservation = state
-                .quic_capacity_calibrations
-                .remove(&session_id)
+                .session_mut(session_id)
+                .and_then(|session| session.take_quic_capacity_calibration())
                 .expect("matching QUIC capacity reservation");
             reservation.command_ticket.cancel();
-            let attempt_key = ServerQuicCapacityCalibrationPathKey {
-                session_id,
+            let session = state
+                .session_mut(session_id)
+                .expect("matching QUIC capacity session");
+            let attempts = session
+                .quic_history()
+                .attempts_for_path(path, path_instance_id);
+            session.quic_history_mut().set_attempts_for_path(
                 path,
                 path_instance_id,
-            };
-            if let Some(attempts) = state
-                .quic_capacity_calibration_attempts
-                .get_mut(&attempt_key)
-            {
-                *attempts = attempts.saturating_sub(1);
-                if *attempts == 0 {
-                    state
-                        .quic_capacity_calibration_attempts
-                        .remove(&attempt_key);
-                }
-            }
-            if let Some(spent_bytes) = state.quic_capacity_calibration_bytes.get_mut(&session_id) {
-                debug_assert!(*spent_bytes >= reservation.train_bytes);
-                *spent_bytes -= reservation.train_bytes.min(*spent_bytes);
-                if *spent_bytes == 0 {
-                    state.quic_capacity_calibration_bytes.remove(&session_id);
-                }
-            }
-            state.bump_generation(session_id);
+                attempts.saturating_sub(1),
+            );
+            let spent_bytes = session.quic_history().spent_bytes();
+            debug_assert!(spent_bytes >= reservation.train_bytes);
+            session.quic_history_mut().set_spent_bytes(
+                spent_bytes.saturating_sub(reservation.train_bytes.min(spent_bytes)),
+            );
+            session.bump_generation();
             #[cfg(feature = "lab-diagnostics")]
             record_quic_capacity_lifecycle(
                 "cancelled",
@@ -629,8 +650,8 @@ impl ServerPathLaneTracker {
         // contention can make stale carrier evidence appear lease-valid.
         let now = Instant::now();
         let removal = state
-            .quic_capacity_calibrations
-            .get(&session_id)
+            .session(session_id)
+            .and_then(|session| session.quic_capacity_calibration())
             .and_then(|reservation| {
                 if !reservation.command_ticket.is_current()
                     && !matches!(
@@ -651,8 +672,8 @@ impl ServerPathLaneTracker {
             });
         if let Some((phase, reason)) = removal {
             let reservation = state
-                .quic_capacity_calibrations
-                .remove(&session_id)
+                .session_mut(session_id)
+                .and_then(|session| session.take_quic_capacity_calibration())
                 .expect("expired QUIC capacity calibration");
             reservation.command_ticket.cancel();
             state.bump_generation(session_id);
@@ -663,7 +684,9 @@ impl ServerPathLaneTracker {
             return None;
         }
 
-        let reservation = state.quic_capacity_calibrations.get_mut(&session_id)?;
+        let reservation = state
+            .session_mut(session_id)?
+            .quic_capacity_calibration_mut()?;
         let active_expires_at = match reservation.phase {
             ServerQuicCapacityCalibrationPhase::Active { expires_at } => expires_at,
             ServerQuicCapacityCalibrationPhase::Provisional
@@ -704,8 +727,8 @@ impl ServerPathLaneTracker {
     ) -> Option<u64> {
         let mut state = self.state.lock().expect("server path lane tracker lock");
         let reservation = state
-            .quic_capacity_calibrations
-            .get_mut(&ticket.session_id)
+            .session_mut(ticket.session_id)?
+            .quic_capacity_calibration_mut()
             .filter(|reservation| {
                 reservation.command_ticket.is_current()
                     && reservation.binding_instance_id == ticket.binding_instance_id
@@ -731,8 +754,8 @@ impl ServerPathLaneTracker {
     ) -> Option<u64> {
         let mut state = self.state.lock().expect("server path lane tracker lock");
         let matches = state
-            .quic_capacity_calibrations
-            .get(&ticket.session_id)
+            .session(ticket.session_id)
+            .and_then(|session| session.quic_capacity_calibration())
             .is_some_and(|reservation| {
                 reservation.binding_instance_id == ticket.binding_instance_id
                     && reservation.path == ticket.path
@@ -747,8 +770,8 @@ impl ServerPathLaneTracker {
             return None;
         }
         let reservation = state
-            .quic_capacity_calibrations
-            .remove(&ticket.session_id)
+            .session_mut(ticket.session_id)
+            .and_then(|session| session.take_quic_capacity_calibration())
             .expect("matching published QUIC capacity proof");
         reservation.command_ticket.publish();
         // Publication releases serialization but never refunds attempts or bytes.
@@ -784,8 +807,8 @@ impl ServerPathLaneTracker {
             return false;
         }
         if let Some(reservation) = state
-            .quic_capacity_calibrations
-            .get_mut(&session_id)
+            .session_mut(session_id)
+            .and_then(|session| session.quic_capacity_calibration_mut())
             .filter(|reservation| {
                 reservation.command_ticket.is_current()
                     && reservation.binding_instance_id == binding_instance_id
@@ -830,8 +853,8 @@ impl ServerPathLaneTracker {
     ) -> bool {
         let mut state = self.state.lock().expect("server path lane tracker lock");
         let matches = state
-            .quic_capacity_calibrations
-            .get(&session_id)
+            .session(session_id)
+            .and_then(|session| session.quic_capacity_calibration())
             .is_some_and(|reservation| {
                 reservation.binding_instance_id == binding_instance_id
                     && reservation.path == path
@@ -842,7 +865,9 @@ impl ServerPathLaneTracker {
                     )
             });
         if matches {
-            let reservation = state.quic_capacity_calibrations.remove(&session_id);
+            let reservation = state
+                .session_mut(session_id)
+                .and_then(|session| session.take_quic_capacity_calibration());
             if let Some(reservation) = reservation.as_ref() {
                 reservation.command_ticket.cancel();
             }
@@ -864,8 +889,8 @@ impl ServerPathLaneTracker {
     ) {
         let mut state = self.state.lock().expect("server path lane tracker lock");
         let matches = state
-            .quic_capacity_calibrations
-            .get(&session_id)
+            .session(session_id)
+            .and_then(|session| session.quic_capacity_calibration())
             .is_some_and(|reservation| {
                 reservation.binding_instance_id == binding_instance_id
                     && !matches!(
@@ -876,7 +901,9 @@ impl ServerPathLaneTracker {
         if matches {
             // Close may race carrier dequeue, so transmitted-byte and attempt
             // charges remain consumed even though session serialization clears.
-            let reservation = state.quic_capacity_calibrations.remove(&session_id);
+            let reservation = state
+                .session_mut(session_id)
+                .and_then(|session| session.take_quic_capacity_calibration());
             if let Some(reservation) = reservation.as_ref() {
                 reservation.command_ticket.cancel();
             }
@@ -904,8 +931,8 @@ impl ServerPathLaneTracker {
     ) {
         let mut state = self.state.lock().expect("server path lane tracker lock");
         let reservation_matches = state
-            .quic_capacity_calibrations
-            .get(&session_id)
+            .session(session_id)
+            .and_then(|session| session.quic_capacity_calibration())
             .is_some_and(|reservation| {
                 reservation.path == path
                     && reservation.path_instance_id == path_instance_id
@@ -917,21 +944,20 @@ impl ServerPathLaneTracker {
         let retired_reservation = if reservation_matches {
             // An admitted train may already be on the retired carrier queue;
             // retirement releases serialization but never refunds session spend.
-            state.quic_capacity_calibrations.remove(&session_id)
+            state
+                .session_mut(session_id)
+                .and_then(|session| session.take_quic_capacity_calibration())
         } else {
             None
         };
         if let Some(reservation) = retired_reservation.as_ref() {
             reservation.command_ticket.cancel();
         }
-        let attempts_removed = state
-            .quic_capacity_calibration_attempts
-            .remove(&ServerQuicCapacityCalibrationPathKey {
-                session_id,
-                path,
-                path_instance_id,
-            })
-            .is_some();
+        let attempts_removed = state.session_mut(session_id).is_some_and(|session| {
+            session
+                .quic_history_mut()
+                .remove_attempts_for_path(path, path_instance_id)
+        });
         if reservation_matches || attempts_removed {
             state.bump_generation(session_id);
         }

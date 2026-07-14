@@ -1,10 +1,11 @@
 //! Session load accounting and response-flow registration guards.
 //! Every counter mutation uses the single tracker-state mutex owned by response_session.
 
-use super::response_session::{ServerPathLaneTracker, ServerPathLaneTrackerState};
+use super::response_session::ServerPathLaneTracker;
 use crate::model::path::CarrierPathKey;
 use crate::protocol::{SessionId, UnderlayProtocol};
 use crate::scheduler::FlowLane;
+use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
 fn response_lane_is_latency_sensitive(lane: FlowLane) -> bool {
@@ -12,12 +13,6 @@ fn response_lane_is_latency_sensitive(lane: FlowLane) -> bool {
         lane,
         FlowLane::Control | FlowLane::Latency | FlowLane::RealtimeDatagram
     )
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub(super) struct ServerPathLoadKey {
-    pub(super) session_id: SessionId,
-    pub(super) path: CarrierPathKey,
 }
 
 #[derive(Debug, Clone, Copy, Default)]
@@ -44,39 +39,129 @@ impl ServerPathLaneLoad {
     }
 }
 
-impl ServerPathLaneTrackerState {
-    fn add_response_service(
+#[derive(Debug, Default)]
+pub(super) struct ResponseSessionLoadState {
+    attachment_paths: HashMap<CarrierPathKey, ServerPathLaneLoad>,
+    service_paths: HashMap<CarrierPathKey, ServerPathLaneLoad>,
+    service_total: ServerPathLaneLoad,
+    service_family: super::response_session::ResponseServiceFamilyLoads,
+    realtime_flows: u32,
+    active_response_flows: u32,
+}
+
+impl ResponseSessionLoadState {
+    pub(super) fn blocks_session_reclamation(&self) -> bool {
+        self.realtime_flows > 0
+            || self.active_response_flows > 0
+            || !self.attachment_paths.is_empty()
+            || !self.service_paths.is_empty()
+    }
+
+    #[cfg(test)]
+    pub(super) fn attachment_path_count(&self) -> usize {
+        self.attachment_paths.len()
+    }
+
+    #[cfg(test)]
+    pub(super) fn service_path_count(&self) -> usize {
+        self.service_paths.len()
+    }
+
+    #[cfg(test)]
+    pub(super) fn realtime_flows(&self) -> u32 {
+        self.realtime_flows
+    }
+
+    pub(super) fn active_response_flows(&self) -> u32 {
+        self.active_response_flows
+    }
+
+    pub(super) fn service_family_loads(
+        &self,
+    ) -> super::response_session::ResponseServiceFamilyLoads {
+        self.service_family
+    }
+
+    #[cfg(test)]
+    pub(super) fn attachment_path_load(&self, path: CarrierPathKey) -> ServerPathLaneLoad {
+        self.attachment_paths
+            .get(&path)
+            .copied()
+            .unwrap_or_default()
+    }
+
+    pub(super) fn response_service_path_load(&self, path: CarrierPathKey) -> ServerPathLaneLoad {
+        self.service_paths.get(&path).copied().unwrap_or_default()
+    }
+
+    pub(super) fn attach(&mut self, path: CarrierPathKey, lane: FlowLane) {
+        self.attachment_paths.entry(path).or_default().add(lane);
+    }
+
+    pub(super) fn detach(&mut self, path: CarrierPathKey, lane: FlowLane) -> bool {
+        let Some(load) = self.attachment_paths.get_mut(&path) else {
+            return false;
+        };
+        load.remove(lane);
+        if load.active_flows == 0 {
+            self.attachment_paths.remove(&path);
+        }
+        true
+    }
+
+    pub(super) fn change_attachment_lanes(
         &mut self,
-        session_id: SessionId,
-        path: CarrierPathKey,
-        lane: FlowLane,
-    ) {
-        self.response_service_loads
-            .entry(ServerPathLoadKey { session_id, path })
-            .or_default()
-            .add(lane);
-        self.response_service_session_loads
-            .entry(session_id)
-            .or_default()
-            .add(lane);
-        let family = self
-            .response_service_family_loads
-            .entry(session_id)
-            .or_default();
+        paths: &[CarrierPathKey],
+        from: FlowLane,
+        to: FlowLane,
+    ) -> bool {
+        let mut changed = false;
+        for path in paths {
+            if let Some(load) = self.attachment_paths.get_mut(path) {
+                load.remove(from);
+                load.add(to);
+                changed = true;
+            }
+        }
+        changed
+    }
+
+    pub(super) fn attach_realtime_flow(&mut self) {
+        self.realtime_flows = self.realtime_flows.saturating_add(1);
+    }
+
+    pub(super) fn detach_realtime_flow(&mut self) -> bool {
+        if self.realtime_flows == 0 {
+            return false;
+        }
+        self.realtime_flows = self.realtime_flows.saturating_sub(1);
+        true
+    }
+
+    pub(super) fn set_response_flow_active(&mut self, active: bool) -> bool {
+        if active {
+            self.active_response_flows = self.active_response_flows.saturating_add(1);
+            return true;
+        }
+        if self.active_response_flows == 0 {
+            return false;
+        }
+        self.active_response_flows = self.active_response_flows.saturating_sub(1);
+        true
+    }
+
+    pub(super) fn add_response_service(&mut self, path: CarrierPathKey, lane: FlowLane) {
+        self.service_paths.entry(path).or_default().add(lane);
+        self.service_total.add(lane);
+        let family = &mut self.service_family;
         match path.underlay {
             UnderlayProtocol::Tcp => family.tcp = family.tcp.saturating_add(1),
             UnderlayProtocol::Udp => family.udp = family.udp.saturating_add(1),
         }
     }
 
-    fn remove_response_service(
-        &mut self,
-        session_id: SessionId,
-        path: CarrierPathKey,
-        lane: FlowLane,
-    ) -> bool {
-        let key = ServerPathLoadKey { session_id, path };
-        let Some(path_load) = self.response_service_loads.get_mut(&key) else {
+    pub(super) fn remove_response_service(&mut self, path: CarrierPathKey, lane: FlowLane) -> bool {
+        let Some(path_load) = self.service_paths.get_mut(&path) else {
             return false;
         };
         if path_load.active_flows == 0 {
@@ -84,22 +169,16 @@ impl ServerPathLaneTrackerState {
         }
         path_load.remove(lane);
         if path_load.active_flows == 0 {
-            self.response_service_loads.remove(&key);
+            self.service_paths.remove(&path);
         }
 
-        if let Some(session_load) = self.response_service_session_loads.get_mut(&session_id) {
-            session_load.remove(lane);
-            if session_load.active_flows == 0 {
-                self.response_service_session_loads.remove(&session_id);
+        self.service_total.remove(lane);
+        match path.underlay {
+            UnderlayProtocol::Tcp => {
+                self.service_family.tcp = self.service_family.tcp.saturating_sub(1)
             }
-        }
-        if let Some(family) = self.response_service_family_loads.get_mut(&session_id) {
-            match path.underlay {
-                UnderlayProtocol::Tcp => family.tcp = family.tcp.saturating_sub(1),
-                UnderlayProtocol::Udp => family.udp = family.udp.saturating_sub(1),
-            }
-            if family.tcp == 0 && family.udp == 0 {
-                self.response_service_family_loads.remove(&session_id);
+            UnderlayProtocol::Udp => {
+                self.service_family.udp = self.service_family.udp.saturating_sub(1)
             }
         }
         true
@@ -107,41 +186,64 @@ impl ServerPathLaneTrackerState {
 
     pub(super) fn move_response_service(
         &mut self,
-        session_id: SessionId,
         from: CarrierPathKey,
         to: CarrierPathKey,
         lane: FlowLane,
     ) -> bool {
         if from == to {
-            return self
-                .response_service_loads
-                .contains_key(&ServerPathLoadKey {
-                    session_id,
-                    path: from,
-                });
+            return self.service_paths.contains_key(&from);
         }
-        if !self.remove_response_service(session_id, from, lane) {
+        if !self.remove_response_service(from, lane) {
             return false;
         }
-        self.add_response_service(session_id, to, lane);
+        self.add_response_service(to, lane);
         true
     }
 
-    pub(super) fn response_service_session_load(
-        &self,
-        session_id: SessionId,
-    ) -> ServerPathLaneLoad {
-        let mut session_load = self
-            .response_service_session_loads
-            .get(&session_id)
-            .copied()
-            .unwrap_or_default();
-        let realtime_flows = self.realtime_flows.get(&session_id).copied().unwrap_or(0);
-        session_load.active_flows = session_load.active_flows.saturating_add(realtime_flows);
+    pub(super) fn change_response_service_lane(
+        &mut self,
+        path: CarrierPathKey,
+        from: FlowLane,
+        to: FlowLane,
+    ) -> bool {
+        let Some(load) = self.service_paths.get_mut(&path) else {
+            return false;
+        };
+        load.remove(from);
+        load.add(to);
+        self.service_total.remove(from);
+        self.service_total.add(to);
+        true
+    }
+
+    pub(super) fn response_service_session_load(&self) -> ServerPathLaneLoad {
+        let mut session_load = self.service_total;
+        session_load.active_flows = session_load
+            .active_flows
+            .saturating_add(self.realtime_flows);
         session_load.active_latency_sensitive_flows = session_load
             .active_latency_sensitive_flows
-            .saturating_add(realtime_flows);
+            .saturating_add(self.realtime_flows);
         session_load
+    }
+
+    #[cfg(test)]
+    pub(super) fn attachment_session_load(&self) -> ServerPathLaneLoad {
+        let mut total = self.attachment_paths.values().fold(
+            ServerPathLaneLoad::default(),
+            |mut total, load| {
+                total.active_flows = total.active_flows.saturating_add(load.active_flows);
+                total.active_latency_sensitive_flows = total
+                    .active_latency_sensitive_flows
+                    .saturating_add(load.active_latency_sensitive_flows);
+                total
+            },
+        );
+        total.active_flows = total.active_flows.saturating_add(self.realtime_flows);
+        total.active_latency_sensitive_flows = total
+            .active_latency_sensitive_flows
+            .saturating_add(self.realtime_flows);
+        total
     }
 }
 
@@ -149,43 +251,27 @@ impl ServerPathLaneTracker {
     #[cfg(test)]
     pub(super) fn generation_and_active_response_flows(&self, session_id: SessionId) -> (u64, u32) {
         let state = self.state.lock().expect("server path lane tracker lock");
-        let generation = state
-            .session_generations
-            .get(&session_id)
-            .copied()
-            .unwrap_or(0);
+        let generation = state.generation(session_id);
         let active_response_flows = state
-            .active_response_flows
-            .get(&session_id)
-            .copied()
+            .session(session_id)
+            .map(|session| session.load().active_response_flows())
             .unwrap_or(0);
         (generation, active_response_flows)
     }
 
     pub(super) fn attach(&self, session_id: SessionId, path: CarrierPathKey, lane: FlowLane) {
         let mut state = self.state.lock().expect("server path lane tracker lock");
-        state
-            .loads
-            .entry(ServerPathLoadKey { session_id, path })
-            .or_default()
-            .add(lane);
-        state.bump_generation(session_id);
+        let session = state.session_mut_or_default(session_id);
+        session.load_mut().attach(path, lane);
+        session.bump_generation();
     }
 
     pub(super) fn detach(&self, session_id: SessionId, path: CarrierPathKey, lane: FlowLane) {
         let mut state = self.state.lock().expect("server path lane tracker lock");
-        let key = ServerPathLoadKey { session_id, path };
-        let changed = if let Some(load) = state.loads.get_mut(&key) {
-            load.remove(lane);
-            if load.active_flows == 0 {
-                state.loads.remove(&key);
+        if let Some(session) = state.session_mut(session_id) {
+            if session.load_mut().detach(path, lane) {
+                session.bump_generation();
             }
-            true
-        } else {
-            false
-        };
-        if changed {
-            state.bump_generation(session_id);
         }
         state.maybe_reclaim_session(session_id);
     }
@@ -201,67 +287,44 @@ impl ServerPathLaneTracker {
             return;
         }
         let mut state = self.state.lock().expect("server path lane tracker lock");
-        let mut changed = false;
-        for path in paths {
-            if let Some(load) = state.loads.get_mut(&ServerPathLoadKey {
-                session_id,
-                path: *path,
-            }) {
-                load.remove(from);
-                load.add(to);
-                changed = true;
+        if let Some(session) = state.session_mut(session_id) {
+            if session.load_mut().change_attachment_lanes(paths, from, to) {
+                session.bump_generation();
             }
-        }
-        if changed {
-            state.bump_generation(session_id);
         }
         state.maybe_reclaim_session(session_id);
     }
 
     pub(super) fn attach_realtime_flow(&self, session_id: SessionId) {
         let mut state = self.state.lock().expect("server path lane tracker lock");
-        let count = state.realtime_flows.entry(session_id).or_default();
-        *count = count.saturating_add(1);
-        state.bump_generation(session_id);
+        let session = state.session_mut_or_default(session_id);
+        session.load_mut().attach_realtime_flow();
+        session.bump_generation();
     }
 
     pub(super) fn set_response_flow_active(&self, session_id: SessionId, active: bool) {
         let mut state = self.state.lock().expect("server path lane tracker lock");
         if active {
-            let count = state.active_response_flows.entry(session_id).or_default();
-            *count = count.saturating_add(1);
-            state.bump_generation(session_id);
+            let session = state.session_mut_or_default(session_id);
+            session.load_mut().set_response_flow_active(true);
+            session.bump_generation();
             return;
         }
 
-        let changed = if let Some(count) = state.active_response_flows.get_mut(&session_id) {
-            *count = count.saturating_sub(1);
-            if *count == 0 {
-                state.active_response_flows.remove(&session_id);
+        if let Some(session) = state.session_mut(session_id) {
+            if session.load_mut().set_response_flow_active(false) {
+                session.bump_generation();
             }
-            true
-        } else {
-            false
-        };
-        if changed {
-            state.bump_generation(session_id);
         }
         state.maybe_reclaim_session(session_id);
     }
 
     pub(super) fn detach_realtime_flow(&self, session_id: SessionId) {
         let mut state = self.state.lock().expect("server path lane tracker lock");
-        let changed = if let Some(count) = state.realtime_flows.get_mut(&session_id) {
-            *count = count.saturating_sub(1);
-            if *count == 0 {
-                state.realtime_flows.remove(&session_id);
+        if let Some(session) = state.session_mut(session_id) {
+            if session.load_mut().detach_realtime_flow() {
+                session.bump_generation();
             }
-            true
-        } else {
-            false
-        };
-        if changed {
-            state.bump_generation(session_id);
         }
         state.maybe_reclaim_session(session_id);
     }
@@ -275,32 +338,18 @@ impl ServerPathLaneTracker {
         self.state
             .lock()
             .expect("server path lane tracker lock")
-            .loads
-            .get(&ServerPathLoadKey { session_id, path })
-            .copied()
+            .session(session_id)
+            .map(|session| session.load().attachment_path_load(path))
             .unwrap_or_default()
     }
 
     #[cfg(test)]
     pub(super) fn session_snapshot(&self, session_id: SessionId) -> ServerPathLaneLoad {
         let state = self.state.lock().expect("server path lane tracker lock");
-        let mut total = state
-            .loads
-            .iter()
-            .filter(|(key, _)| key.session_id == session_id)
-            .fold(ServerPathLaneLoad::default(), |mut total, (_, load)| {
-                total.active_flows = total.active_flows.saturating_add(load.active_flows);
-                total.active_latency_sensitive_flows = total
-                    .active_latency_sensitive_flows
-                    .saturating_add(load.active_latency_sensitive_flows);
-                total
-            });
-        let realtime_flows = state.realtime_flows.get(&session_id).copied().unwrap_or(0);
-        total.active_flows = total.active_flows.saturating_add(realtime_flows);
-        total.active_latency_sensitive_flows = total
-            .active_latency_sensitive_flows
-            .saturating_add(realtime_flows);
-        total
+        state
+            .session(session_id)
+            .map(|session| session.load().attachment_session_load())
+            .unwrap_or_default()
     }
 
     pub(super) fn response_service_snapshot(
@@ -311,9 +360,8 @@ impl ServerPathLaneTracker {
         self.state
             .lock()
             .expect("server path lane tracker lock")
-            .response_service_loads
-            .get(&ServerPathLoadKey { session_id, path })
-            .copied()
+            .session(session_id)
+            .map(|session| session.load().response_service_path_load(path))
             .unwrap_or_default()
     }
 
@@ -324,8 +372,9 @@ impl ServerPathLaneTracker {
         lane: FlowLane,
     ) {
         let mut state = self.state.lock().expect("server path lane tracker lock");
-        state.add_response_service(session_id, path, lane);
-        state.bump_generation(session_id);
+        let session = state.session_mut_or_default(session_id);
+        session.load_mut().add_response_service(path, lane);
+        session.bump_generation();
     }
 
     pub(super) fn detach_response_service(
@@ -335,9 +384,10 @@ impl ServerPathLaneTracker {
         lane: FlowLane,
     ) {
         let mut state = self.state.lock().expect("server path lane tracker lock");
-        let changed = state.remove_response_service(session_id, path, lane);
-        if changed {
-            state.bump_generation(session_id);
+        if let Some(session) = state.session_mut(session_id) {
+            if session.load_mut().remove_response_service(path, lane) {
+                session.bump_generation();
+            }
         }
         state.maybe_reclaim_session(session_id);
     }
@@ -353,8 +403,10 @@ impl ServerPathLaneTracker {
             return;
         }
         let mut state = self.state.lock().expect("server path lane tracker lock");
-        if state.move_response_service(session_id, from, to, lane) {
-            state.bump_generation(session_id);
+        if let Some(session) = state.session_mut(session_id) {
+            if session.load_mut().move_response_service(from, to, lane) {
+                session.bump_generation();
+            }
         }
     }
 
@@ -369,17 +421,13 @@ impl ServerPathLaneTracker {
             return;
         }
         let mut state = self.state.lock().expect("server path lane tracker lock");
-        if let Some(load) = state
-            .response_service_loads
-            .get_mut(&ServerPathLoadKey { session_id, path })
-        {
-            load.remove(from);
-            load.add(to);
-            if let Some(session_load) = state.response_service_session_loads.get_mut(&session_id) {
-                session_load.remove(from);
-                session_load.add(to);
+        if let Some(session) = state.session_mut(session_id) {
+            if session
+                .load_mut()
+                .change_response_service_lane(path, from, to)
+            {
+                session.bump_generation();
             }
-            state.bump_generation(session_id);
         }
     }
 }

@@ -1,13 +1,13 @@
 use super::ServerCarrierPathInstanceId;
 use super::response_handoff::ResponseServiceHandoffDrainReservation;
-use super::response_load::{ServerPathLaneLoad, ServerPathLoadKey};
+use super::response_load::{ResponseSessionLoadState, ServerPathLaneLoad};
 use super::response_quic_capacity::{
-    ServerQuicCapacityCalibrationPathKey, ServerQuicCapacityCalibrationReservation,
-    finish_quic_capacity_session_reclamation,
+    ResponseQuicCapacityHistory, ServerQuicCapacityCalibrationPhase,
+    ServerQuicCapacityCalibrationReservation, finish_quic_capacity_session_reclamation,
 };
 use crate::model::path::CarrierPathKey;
 use crate::protocol::{SessionId, UnderlayProtocol};
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::sync::Mutex;
 #[cfg(test)]
 use std::sync::MutexGuard;
@@ -87,35 +87,247 @@ pub(super) struct ServerSessionRetentionSnapshot {
 
 #[derive(Debug, Default)]
 pub(super) struct ServerPathLaneTrackerState {
-    // Attachment load describes control-plane Active roles. Response Service
-    // load is separate because a clear-frontier handoff changes product
-    // ownership without rewriting the request-side attachment role.
-    pub(super) loads: HashMap<ServerPathLoadKey, ServerPathLaneLoad>,
-    pub(super) response_service_loads: HashMap<ServerPathLoadKey, ServerPathLaneLoad>,
-    pub(super) response_service_session_loads: HashMap<SessionId, ServerPathLaneLoad>,
-    pub(super) response_service_family_loads: HashMap<SessionId, ResponseServiceFamilyLoads>,
-    // One active train serializes admission. Attempts belong to exact carrier
-    // instances, while spent bytes are a non-refilling session envelope.
-    pub(super) quic_capacity_calibrations:
-        HashMap<SessionId, ServerQuicCapacityCalibrationReservation>,
-    pub(super) quic_capacity_calibration_attempts:
-        HashMap<ServerQuicCapacityCalibrationPathKey, u8>,
-    pub(super) quic_capacity_calibration_bytes: HashMap<SessionId, u64>,
-    pub(super) tcp_capacity_probe_reservations: HashSet<SessionId>,
-    // A drain is only a session-wide intent: it pauses fresh data on the exact
-    // binding but does not move Service ownership until clear-frontier commit.
-    pub(super) response_service_handoff_drains:
-        HashMap<SessionId, ResponseServiceHandoffDrainReservation>,
-    pub(super) realtime_flows: HashMap<SessionId, u32>,
-    pub(super) active_response_flows: HashMap<SessionId, u32>,
-    pub(super) session_references: HashMap<SessionId, u32>,
-    pub(super) session_generations: HashMap<SessionId, u64>,
+    sessions: HashMap<SessionId, ResponseSessionState>,
+}
+
+/// One typed slot makes mutually exclusive session transactions structural;
+/// concrete variants retain owner-specific cancellation and reclaim behavior.
+#[derive(Debug)]
+pub(super) enum ResponseSessionOperation {
+    TcpCapacityProbe,
+    QuicCapacityCalibration(ServerQuicCapacityCalibrationReservation),
+    ResponseServiceHandoffDrain(ResponseServiceHandoffDrainReservation),
+}
+
+/// Co-locates one session's coordination state for one hash lookup under the
+/// tracker mutex while load and transport owners retain typed payloads.
+#[derive(Debug, Default)]
+pub(super) struct ResponseSessionState {
+    references: u32,
+    generation: u64,
+    load: ResponseSessionLoadState,
+    active_operation: Option<ResponseSessionOperation>,
+    quic_history: ResponseQuicCapacityHistory,
+}
+
+impl ResponseSessionState {
+    #[cfg(test)]
+    pub(super) fn references(&self) -> u32 {
+        self.references
+    }
+
+    pub(super) fn attach_reference(&mut self) {
+        self.references = self.references.saturating_add(1);
+    }
+
+    pub(super) fn detach_reference(&mut self) {
+        self.references = self.references.saturating_sub(1);
+    }
+
+    pub(super) fn generation(&self) -> u64 {
+        self.generation
+    }
+
+    pub(super) fn bump_generation(&mut self) {
+        self.generation = self.generation.wrapping_add(1);
+    }
+
+    pub(super) fn load(&self) -> &ResponseSessionLoadState {
+        &self.load
+    }
+
+    pub(super) fn load_mut(&mut self) -> &mut ResponseSessionLoadState {
+        &mut self.load
+    }
+
+    pub(super) fn tcp_capacity_probe_reserved(&self) -> bool {
+        matches!(
+            self.active_operation,
+            Some(ResponseSessionOperation::TcpCapacityProbe)
+        )
+    }
+
+    pub(super) fn reserve_tcp_capacity_probe(&mut self) -> bool {
+        if self.active_operation.is_some() {
+            return false;
+        }
+        self.active_operation = Some(ResponseSessionOperation::TcpCapacityProbe);
+        true
+    }
+
+    pub(super) fn clear_tcp_capacity_probe(&mut self) -> bool {
+        if !self.tcp_capacity_probe_reserved() {
+            return false;
+        }
+        self.active_operation = None;
+        true
+    }
+
+    pub(super) fn quic_capacity_calibration(
+        &self,
+    ) -> Option<&ServerQuicCapacityCalibrationReservation> {
+        match self.active_operation.as_ref() {
+            Some(ResponseSessionOperation::QuicCapacityCalibration(reservation)) => {
+                Some(reservation)
+            }
+            _ => None,
+        }
+    }
+
+    pub(super) fn quic_capacity_calibration_mut(
+        &mut self,
+    ) -> Option<&mut ServerQuicCapacityCalibrationReservation> {
+        match self.active_operation.as_mut() {
+            Some(ResponseSessionOperation::QuicCapacityCalibration(reservation)) => {
+                Some(reservation)
+            }
+            _ => None,
+        }
+    }
+
+    pub(super) fn reserve_quic_capacity_calibration(
+        &mut self,
+        reservation: ServerQuicCapacityCalibrationReservation,
+    ) -> bool {
+        if self.active_operation.is_some() {
+            return false;
+        }
+        self.active_operation = Some(ResponseSessionOperation::QuicCapacityCalibration(
+            reservation,
+        ));
+        true
+    }
+
+    pub(super) fn take_quic_capacity_calibration(
+        &mut self,
+    ) -> Option<ServerQuicCapacityCalibrationReservation> {
+        if !matches!(
+            self.active_operation,
+            Some(ResponseSessionOperation::QuicCapacityCalibration(_))
+        ) {
+            return None;
+        }
+        match self.active_operation.take() {
+            Some(ResponseSessionOperation::QuicCapacityCalibration(reservation)) => {
+                Some(reservation)
+            }
+            _ => unreachable!("checked QUIC capacity operation"),
+        }
+    }
+
+    pub(super) fn response_service_handoff_drain(
+        &self,
+    ) -> Option<&ResponseServiceHandoffDrainReservation> {
+        match self.active_operation.as_ref() {
+            Some(ResponseSessionOperation::ResponseServiceHandoffDrain(reservation)) => {
+                Some(reservation)
+            }
+            _ => None,
+        }
+    }
+
+    #[cfg(test)]
+    pub(super) fn response_service_handoff_drain_mut(
+        &mut self,
+    ) -> Option<&mut ResponseServiceHandoffDrainReservation> {
+        match self.active_operation.as_mut() {
+            Some(ResponseSessionOperation::ResponseServiceHandoffDrain(reservation)) => {
+                Some(reservation)
+            }
+            _ => None,
+        }
+    }
+
+    pub(super) fn reserve_response_service_handoff_drain(
+        &mut self,
+        reservation: ResponseServiceHandoffDrainReservation,
+    ) -> bool {
+        if self.active_operation.is_some() {
+            return false;
+        }
+        self.active_operation = Some(ResponseSessionOperation::ResponseServiceHandoffDrain(
+            reservation,
+        ));
+        true
+    }
+
+    pub(super) fn take_response_service_handoff_drain(
+        &mut self,
+    ) -> Option<ResponseServiceHandoffDrainReservation> {
+        if !matches!(
+            self.active_operation,
+            Some(ResponseSessionOperation::ResponseServiceHandoffDrain(_))
+        ) {
+            return None;
+        }
+        match self.active_operation.take() {
+            Some(ResponseSessionOperation::ResponseServiceHandoffDrain(reservation)) => {
+                Some(reservation)
+            }
+            _ => unreachable!("checked response Service handoff operation"),
+        }
+    }
+
+    pub(super) fn quic_history(&self) -> &ResponseQuicCapacityHistory {
+        &self.quic_history
+    }
+
+    pub(super) fn quic_history_mut(&mut self) -> &mut ResponseQuicCapacityHistory {
+        &mut self.quic_history
+    }
+
+    fn blocks_session_reclamation(&self) -> bool {
+        self.references > 0
+            || self.load.blocks_session_reclamation()
+            || match self.active_operation.as_ref() {
+                Some(ResponseSessionOperation::TcpCapacityProbe) => true,
+                Some(ResponseSessionOperation::QuicCapacityCalibration(reservation)) => matches!(
+                    reservation.phase,
+                    ServerQuicCapacityCalibrationPhase::ProofPublishing { .. }
+                ),
+                Some(ResponseSessionOperation::ResponseServiceHandoffDrain(_)) | None => false,
+            }
+    }
+
+    fn into_reclaimed_quic_capacity_reservation(
+        self,
+    ) -> Option<ServerQuicCapacityCalibrationReservation> {
+        match self.active_operation {
+            Some(ResponseSessionOperation::QuicCapacityCalibration(reservation)) => {
+                Some(reservation)
+            }
+            _ => None,
+        }
+    }
 }
 
 impl ServerPathLaneTrackerState {
+    pub(super) fn session(&self, session_id: SessionId) -> Option<&ResponseSessionState> {
+        self.sessions.get(&session_id)
+    }
+
+    pub(super) fn session_mut(
+        &mut self,
+        session_id: SessionId,
+    ) -> Option<&mut ResponseSessionState> {
+        self.sessions.get_mut(&session_id)
+    }
+
+    pub(super) fn session_mut_or_default(
+        &mut self,
+        session_id: SessionId,
+    ) -> &mut ResponseSessionState {
+        self.sessions.entry(session_id).or_default()
+    }
+
+    pub(super) fn generation(&self, session_id: SessionId) -> u64 {
+        self.session(session_id)
+            .map(ResponseSessionState::generation)
+            .unwrap_or(0)
+    }
+
     pub(super) fn bump_generation(&mut self, session_id: SessionId) {
-        let generation = self.session_generations.entry(session_id).or_default();
-        *generation = generation.wrapping_add(1);
+        self.session_mut_or_default(session_id).bump_generation();
     }
 
     fn response_path_scheduling_snapshot(
@@ -126,9 +338,8 @@ impl ServerPathLaneTrackerState {
         session_load: ServerPathLaneLoad,
     ) -> ServerResponsePathSchedulingSnapshot {
         let path_load = self
-            .response_service_loads
-            .get(&ServerPathLoadKey { session_id, path })
-            .copied()
+            .session(session_id)
+            .map(|session| session.load().response_service_path_load(path))
             .unwrap_or_default();
         let quic_capacity_calibration_attempts =
             self.quic_capacity_calibration_attempts_for_path(session_id, path, path_instance_id);
@@ -140,59 +351,33 @@ impl ServerPathLaneTrackerState {
     }
 
     pub(super) fn maybe_reclaim_session(&mut self, session_id: SessionId) {
-        let has_references = self
-            .session_references
-            .get(&session_id)
-            .is_some_and(|count| *count > 0);
-        let has_realtime = self
-            .realtime_flows
-            .get(&session_id)
-            .is_some_and(|count| *count > 0);
-        let has_active_response_flows = self
-            .active_response_flows
-            .get(&session_id)
-            .is_some_and(|count| *count > 0);
-        let has_loads = self.loads.keys().any(|key| key.session_id == session_id)
-            || self
-                .response_service_loads
-                .keys()
-                .any(|key| key.session_id == session_id);
-        let proof_publication_in_progress =
-            self.quic_capacity_proof_publication_in_progress(session_id);
-        let tcp_capacity_probe_in_progress =
-            self.tcp_capacity_probe_reservations.contains(&session_id);
-        if !has_references
-            && !has_realtime
-            && !has_active_response_flows
-            && !has_loads
-            && !proof_publication_in_progress
-            && !tcp_capacity_probe_in_progress
-        {
-            let capacity_reservation = self.take_quic_capacity_session_reclamation(session_id);
-            self.tcp_capacity_probe_reservations.remove(&session_id);
-            self.clear_response_service_handoff_drain_for_reclaim(session_id);
-            self.response_service_session_loads.remove(&session_id);
-            self.response_service_family_loads.remove(&session_id);
-            self.session_generations.remove(&session_id);
-            finish_quic_capacity_session_reclamation(session_id, capacity_reservation);
+        let should_reclaim = self
+            .session(session_id)
+            .is_some_and(|session| !session.blocks_session_reclamation());
+        if !should_reclaim {
+            return;
         }
+        let session = self
+            .sessions
+            .remove(&session_id)
+            .expect("reclaimable response session");
+        finish_quic_capacity_session_reclamation(
+            session_id,
+            session.into_reclaimed_quic_capacity_reservation(),
+        );
     }
 }
 
 impl ServerPathLaneTracker {
     pub(in crate::runtime::stream) fn attach_session(&self, session_id: SessionId) {
         let mut state = self.state.lock().expect("server path lane tracker lock");
-        let references = state.session_references.entry(session_id).or_default();
-        *references = references.saturating_add(1);
+        state.session_mut_or_default(session_id).attach_reference();
     }
 
     pub(in crate::runtime::stream) fn detach_session(&self, session_id: SessionId) {
         let mut state = self.state.lock().expect("server path lane tracker lock");
-        if let Some(references) = state.session_references.get_mut(&session_id) {
-            *references = references.saturating_sub(1);
-            if *references == 0 {
-                state.session_references.remove(&session_id);
-            }
+        if let Some(session) = state.session_mut(session_id) {
+            session.detach_reference();
         }
         state.maybe_reclaim_session(session_id);
     }
@@ -202,10 +387,7 @@ impl ServerPathLaneTracker {
         self.state
             .lock()
             .expect("server path lane tracker lock")
-            .session_generations
-            .get(&session_id)
-            .copied()
-            .unwrap_or(0)
+            .generation(session_id)
     }
 
     #[cfg(test)]
@@ -221,34 +403,16 @@ impl ServerPathLaneTracker {
         session_id: SessionId,
     ) -> Option<ServerSessionRetentionSnapshot> {
         let state = self.state.lock().expect("server path lane tracker lock");
-        let references = state.session_references.get(&session_id).copied();
-        let generation = state.session_generations.get(&session_id).copied();
-        let attachment_path_count = state
-            .loads
-            .keys()
-            .filter(|key| key.session_id == session_id)
-            .count();
-        let service_path_count = state
-            .response_service_loads
-            .keys()
-            .filter(|key| key.session_id == session_id)
-            .count();
-        let realtime_flows = state.realtime_flows.get(&session_id).copied();
-        let active_response_flows = state.active_response_flows.get(&session_id).copied();
-        let retained = references.is_some()
-            || generation.is_some()
-            || attachment_path_count > 0
-            || service_path_count > 0
-            || realtime_flows.is_some()
-            || active_response_flows.is_some();
-        retained.then_some(ServerSessionRetentionSnapshot {
-            references: references.unwrap_or(0),
-            generation: generation.unwrap_or(0),
-            attachment_path_count,
-            service_path_count,
-            realtime_flows: realtime_flows.unwrap_or(0),
-            active_response_flows: active_response_flows.unwrap_or(0),
-        })
+        state
+            .session(session_id)
+            .map(|session| ServerSessionRetentionSnapshot {
+                references: session.references(),
+                generation: session.generation(),
+                attachment_path_count: session.load().attachment_path_count(),
+                service_path_count: session.load().service_path_count(),
+                realtime_flows: session.load().realtime_flows(),
+                active_response_flows: session.load().active_response_flows(),
+            })
     }
 
     pub(super) fn response_scheduling_snapshot(
@@ -259,28 +423,20 @@ impl ServerPathLaneTracker {
         let now = Instant::now();
         state.expire_quic_capacity_calibration_at(session_id, now);
         state.expire_response_service_handoff_drain_at(session_id, now);
-        let generation = state
-            .session_generations
-            .get(&session_id)
-            .copied()
+        let session = state.session(session_id);
+        let generation = session.map(ResponseSessionState::generation).unwrap_or(0);
+        let active_response_flows = session
+            .map(|session| session.load().active_response_flows())
             .unwrap_or(0);
-        let active_response_flows = state
-            .active_response_flows
-            .get(&session_id)
-            .copied()
-            .unwrap_or(0);
-        let service_family_loads = state
-            .response_service_family_loads
-            .get(&session_id)
-            .copied()
+        let service_family_loads = session
+            .map(|session| session.load().service_family_loads())
             .unwrap_or_default();
         ResponseSessionSchedulingSnapshot {
             generation,
             active_response_flows,
             service_family_loads,
-            tcp_capacity_probe_reserved: state
-                .tcp_capacity_probe_reservations
-                .contains(&session_id),
+            tcp_capacity_probe_reserved: session
+                .is_some_and(ResponseSessionState::tcp_capacity_probe_reserved),
             quic_capacity_calibration_reserved: state
                 .quic_capacity_calibration_reserved(session_id),
             quic_capacity_calibration_spent_bytes: state
@@ -296,11 +452,7 @@ impl ServerPathLaneTracker {
         apply: impl FnOnce() -> R,
     ) -> Option<R> {
         let state = self.state.lock().expect("server path lane tracker lock");
-        let generation = state
-            .session_generations
-            .get(&session_id)
-            .copied()
-            .unwrap_or(0);
+        let generation = state.generation(session_id);
         if generation != expected_generation {
             return None;
         }
@@ -317,15 +469,10 @@ impl ServerPathLaneTracker {
         apply: impl FnOnce() -> R,
     ) -> Option<R> {
         let state = self.state.lock().expect("server path lane tracker lock");
-        let generation = state
-            .session_generations
-            .get(&session_id)
-            .copied()
-            .unwrap_or(0);
+        let generation = state.generation(session_id);
         let active_response_flows = state
-            .active_response_flows
-            .get(&session_id)
-            .copied()
+            .session(session_id)
+            .map(|session| session.load().active_response_flows())
             .unwrap_or(0);
         if generation != expected_generation
             || active_response_flows < minimum_active_response_flows
@@ -344,7 +491,10 @@ impl ServerPathLaneTracker {
         path_instance_id: ServerCarrierPathInstanceId,
     ) -> ServerResponsePathSchedulingSnapshot {
         let state = self.state.lock().expect("server path lane tracker lock");
-        let session_load = state.response_service_session_load(session_id);
+        let session_load = state
+            .session(session_id)
+            .map(|session| session.load().response_service_session_load())
+            .unwrap_or_default();
         state.response_path_scheduling_snapshot(session_id, path, path_instance_id, session_load)
     }
 
@@ -355,7 +505,10 @@ impl ServerPathLaneTracker {
         paths: impl IntoIterator<Item = (CarrierPathKey, ServerCarrierPathInstanceId)>,
     ) -> Vec<ServerResponsePathSchedulingSnapshot> {
         let state = self.state.lock().expect("server path lane tracker lock");
-        let session_load = state.response_service_session_load(session_id);
+        let session_load = state
+            .session(session_id)
+            .map(|session| session.load().response_service_session_load())
+            .unwrap_or_default();
         paths
             .into_iter()
             .map(|(path, path_instance_id)| {

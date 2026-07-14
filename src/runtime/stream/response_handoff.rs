@@ -324,25 +324,13 @@ impl ResponseStreamBinding {
 }
 
 impl ServerPathLaneTrackerState {
-    pub(super) fn response_service_handoff_drain_reserved(&self, session_id: SessionId) -> bool {
-        self.response_service_handoff_drains
-            .contains_key(&session_id)
-    }
-
     pub(super) fn response_service_handoff_drain(
         &self,
         session_id: SessionId,
     ) -> Option<ResponseServiceHandoffDrainReservation> {
-        self.response_service_handoff_drains
-            .get(&session_id)
+        self.session(session_id)
+            .and_then(|session| session.response_service_handoff_drain())
             .copied()
-    }
-
-    pub(super) fn clear_response_service_handoff_drain_for_reclaim(
-        &mut self,
-        session_id: SessionId,
-    ) {
-        self.response_service_handoff_drains.remove(&session_id);
     }
 
     pub(super) fn expire_response_service_handoff_drain_at(
@@ -351,11 +339,13 @@ impl ServerPathLaneTrackerState {
         now: Instant,
     ) {
         let drain_expired = self
-            .response_service_handoff_drains
-            .get(&session_id)
+            .session(session_id)
+            .and_then(|session| session.response_service_handoff_drain())
             .is_some_and(|reservation| now >= reservation.expires_at);
         if drain_expired {
-            let reservation = self.response_service_handoff_drains.remove(&session_id);
+            let reservation = self
+                .session_mut(session_id)
+                .and_then(|session| session.take_response_service_handoff_drain());
             self.bump_generation(session_id);
             #[cfg(feature = "lab-diagnostics")]
             if let Some(reservation) = reservation {
@@ -387,7 +377,10 @@ impl ServerPathLaneTracker {
         expires_at: Instant,
     ) -> bool {
         let mut state = self.state.lock().expect("server path lane tracker lock");
-        let Some(reservation) = state.response_service_handoff_drains.get_mut(&session_id) else {
+        let Some(reservation) = state
+            .session_mut(session_id)
+            .and_then(|session| session.response_service_handoff_drain_mut())
+        else {
             return false;
         };
         if *reservation != current {
@@ -427,37 +420,27 @@ impl ServerPathLaneTracker {
         if expires_at <= Instant::now() {
             return false;
         }
-        let generation = state
-            .session_generations
-            .get(&session_id)
-            .copied()
-            .unwrap_or(0);
+        let generation = state.generation(session_id);
         // The tracker serializes a decision made from the matching generation;
         // family/rate policy belongs to the sender snapshot that ranked it.
-        if generation != expected_generation
-            || state.tcp_capacity_probe_reservations.contains(&session_id)
-            || state.quic_capacity_calibration_reserved(session_id)
-            || state
-                .response_service_handoff_drains
-                .contains_key(&session_id)
-        {
+        if generation != expected_generation {
             return false;
         }
-        state.response_service_handoff_drains.insert(
-            session_id,
-            ResponseServiceHandoffDrainReservation {
-                binding_instance_id,
-                service,
-                service_path_instance_id,
-                service_incarnation,
-                target,
-                target_path_instance_id,
-                target_incarnation,
-                capacity_proof,
-                expires_at,
-            },
-        );
-        state.bump_generation(session_id);
+        let session = state.session_mut_or_default(session_id);
+        if !session.reserve_response_service_handoff_drain(ResponseServiceHandoffDrainReservation {
+            binding_instance_id,
+            service,
+            service_path_instance_id,
+            service_incarnation,
+            target,
+            target_path_instance_id,
+            target_incarnation,
+            capacity_proof,
+            expires_at,
+        }) {
+            return false;
+        }
+        session.bump_generation();
         true
     }
 
@@ -468,11 +451,13 @@ impl ServerPathLaneTracker {
     ) -> bool {
         let mut state = self.state.lock().expect("server path lane tracker lock");
         let matches = state
-            .response_service_handoff_drains
-            .get(&session_id)
+            .session(session_id)
+            .and_then(|session| session.response_service_handoff_drain())
             .is_some_and(|reservation| reservation.binding_instance_id == binding_instance_id);
         if matches {
-            state.response_service_handoff_drains.remove(&session_id);
+            state
+                .session_mut(session_id)
+                .and_then(|session| session.take_response_service_handoff_drain());
             state.bump_generation(session_id);
         }
         matches
@@ -487,8 +472,8 @@ impl ServerPathLaneTracker {
     ) -> bool {
         let mut state = self.state.lock().expect("server path lane tracker lock");
         let matches = state
-            .response_service_handoff_drains
-            .get(&session_id)
+            .session(session_id)
+            .and_then(|session| session.response_service_handoff_drain())
             .is_some_and(|reservation| {
                 reservation.binding_instance_id == binding_instance_id
                     && ((reservation.service == path
@@ -497,7 +482,9 @@ impl ServerPathLaneTracker {
                             && reservation.target_path_instance_id == path_instance_id))
             });
         if matches {
-            state.response_service_handoff_drains.remove(&session_id);
+            state
+                .session_mut(session_id)
+                .and_then(|session| session.take_response_service_handoff_drain());
             state.bump_generation(session_id);
         }
         matches
@@ -521,11 +508,7 @@ impl ServerPathLaneTracker {
             return false;
         }
         let mut state = self.state.lock().expect("server path lane tracker lock");
-        let generation = state
-            .session_generations
-            .get(&session_id)
-            .copied()
-            .unwrap_or(0);
+        let generation = state.generation(session_id);
         if generation != expected_generation || state.quic_capacity_calibration_reserved(session_id)
         {
             return false;
@@ -534,15 +517,20 @@ impl ServerPathLaneTracker {
         // state. This mutation layer owns serialization, not placement policy.
         let now = Instant::now();
         let drain_expired = state
-            .response_service_handoff_drains
-            .get(&session_id)
+            .session(session_id)
+            .and_then(|session| session.response_service_handoff_drain())
             .is_some_and(|reservation| now >= reservation.expires_at);
         if drain_expired {
-            state.response_service_handoff_drains.remove(&session_id);
+            state
+                .session_mut(session_id)
+                .and_then(|session| session.take_response_service_handoff_drain());
             state.bump_generation(session_id);
             return false;
         }
-        let drain = state.response_service_handoff_drains.get(&session_id);
+        let drain = state
+            .session(session_id)
+            .and_then(|session| session.response_service_handoff_drain())
+            .copied();
         // A direct move has no transaction lease to retain receipt authority,
         // so freshness must still hold at this final serialized mutation. An
         // exact drain instead owns the frozen proof until its own bounded lease.
@@ -567,11 +555,17 @@ impl ServerPathLaneTracker {
         if !drain_matches {
             return false;
         }
-        if !state.move_response_service(session_id, from, to, lane) {
+        let moved = state
+            .session_mut(session_id)
+            .is_some_and(|session| session.load_mut().move_response_service(from, to, lane));
+        if !moved {
             return false;
         }
-        state.response_service_handoff_drains.remove(&session_id);
-        state.bump_generation(session_id);
+        let session = state
+            .session_mut(session_id)
+            .expect("moved response Service session");
+        session.take_response_service_handoff_drain();
+        session.bump_generation();
         true
     }
 

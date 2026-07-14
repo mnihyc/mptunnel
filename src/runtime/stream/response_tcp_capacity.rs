@@ -22,11 +22,14 @@ impl Drop for TcpCapacityProbeSessionLease {
             .state
             .lock()
             .expect("server path lane tracker lock");
-        if state
-            .tcp_capacity_probe_reservations
-            .remove(&self.session_id)
-        {
-            state.bump_generation(self.session_id);
+        let released = state.session_mut(self.session_id).is_some_and(|session| {
+            if !session.clear_tcp_capacity_probe() {
+                return false;
+            }
+            session.bump_generation();
+            true
+        });
+        if released {
             state.maybe_reclaim_session(self.session_id);
         }
     }
@@ -39,20 +42,15 @@ impl ServerPathLaneTracker {
         expected_generation: u64,
     ) -> Option<TcpCapacityProbeSessionLease> {
         let mut state = self.state.lock().expect("server path lane tracker lock");
-        let generation = state
-            .session_generations
-            .get(&session_id)
-            .copied()
-            .unwrap_or(0);
-        if generation != expected_generation
-            || state.tcp_capacity_probe_reservations.contains(&session_id)
-            || state.quic_capacity_calibration_reserved(session_id)
-            || state.response_service_handoff_drain_reserved(session_id)
-        {
+        let generation = state.generation(session_id);
+        if generation != expected_generation {
             return None;
         }
-        state.tcp_capacity_probe_reservations.insert(session_id);
-        state.bump_generation(session_id);
+        let session = state.session_mut_or_default(session_id);
+        if !session.reserve_tcp_capacity_probe() {
+            return None;
+        }
+        session.bump_generation();
         Some(TcpCapacityProbeSessionLease {
             tracker: Arc::clone(self),
             session_id,

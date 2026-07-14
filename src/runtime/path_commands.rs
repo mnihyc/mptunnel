@@ -361,14 +361,21 @@ impl ReliablePathCommandSender {
         let pending_bytes = usize::try_from(request.train_payload_bytes).unwrap_or(usize::MAX);
         let calibration_id = NEXT_TCP_CAPACITY_CALIBRATION_ID.fetch_add(1, Ordering::Relaxed);
         let probe = TcpCapacityProbeCommand {
+            owner: TcpCapacityProbeOwner::Response {
+                path_instance_id: request.path_instance_id,
+            },
             path_id: request.path_id,
-            path_instance_id: request.path_instance_id,
             calibration_id,
             train_payload_bytes: request.train_payload_bytes,
             sample_floor_bytes: request.sample_floor_bytes,
+            warmup_carrier_bytes: 0,
+            timing_slack_bytes: 0,
+            required_timed_carrier_bytes: request.train_payload_bytes,
+            baseline_expires_at: None,
+            write_expires_at: None,
             expires_at: request.expires_at,
             _lease: lease,
-            _session_lease: session_lease,
+            _session_lease: TcpCapacityProbeSessionLeaseOwner::Response(session_lease),
         };
         self.metrics.add_pending_bytes(pending_bytes);
         permit.send(QueuedReliablePathCommand::new(
@@ -388,6 +395,62 @@ impl ReliablePathCommandSender {
             ),
         );
         Ok(calibration_id)
+    }
+
+    /// Queues one client-to-server TCP carrier proof with no product offset.
+    pub(super) fn try_enqueue_request_tcp_capacity_probe(
+        &self,
+        request: RequestTcpCapacityProbeRequest,
+        session_lease: RequestTcpCapacityProbeLease,
+    ) -> Result<(), RuntimeError> {
+        let permit = match self.data.try_reserve() {
+            Ok(permit) => permit,
+            Err(tokio::sync::mpsc::error::TrySendError::Full(_)) => {
+                return Err(RuntimeError::SenderServiceBlocked);
+            }
+            Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => {
+                return Err(RuntimeError::ReliablePathSessionClosed);
+            }
+        };
+        let lease = self.metrics.try_reserve_tcp_capacity_probe()?;
+        let pending_bytes = usize::try_from(request.train_payload_bytes).unwrap_or(usize::MAX);
+        let probe = TcpCapacityProbeCommand {
+            owner: TcpCapacityProbeOwner::Request {
+                stream_id: request.stream_id,
+                path_instance: request.path_instance,
+            },
+            path_id: request.path_id,
+            calibration_id: request.calibration_id,
+            train_payload_bytes: request.train_payload_bytes,
+            sample_floor_bytes: request.sample_floor_bytes,
+            warmup_carrier_bytes: request.warmup_carrier_bytes,
+            timing_slack_bytes: request.timing_slack_bytes,
+            required_timed_carrier_bytes: request.required_timed_carrier_bytes,
+            baseline_expires_at: Some(request.baseline_expires_at),
+            write_expires_at: Some(request.write_expires_at),
+            expires_at: request.expires_at,
+            _session_lease: TcpCapacityProbeSessionLeaseOwner::Request(session_lease),
+            _lease: lease,
+        };
+        self.metrics.add_pending_bytes(pending_bytes);
+        permit.send(QueuedReliablePathCommand::new(
+            ReliablePathCommand::SendTcpCapacityProbe(probe),
+            pending_bytes,
+            self.metrics.clone(),
+        ));
+        #[cfg(feature = "lab-diagnostics")]
+        lab_diagnostic(
+            "path_command_queue_send",
+            format_args!(
+                "queue=data command_kind=request_tcp_capacity_probe stream_id={} lane={:?} effective_lane={:?} pacing_bytes={} wait_ms=0 result=queued calibration_id={}",
+                request.stream_id.0,
+                FlowLane::Throughput,
+                FlowLane::Throughput,
+                pending_bytes,
+                request.calibration_id,
+            ),
+        );
+        Ok(())
     }
 
     pub(super) fn tcp_capacity_probe_attempted(&self) -> bool {
@@ -819,7 +882,9 @@ pub(super) fn reliable_path_command_pending_bytes(command: &ReliablePathCommand)
         ReliablePathCommand::SendTcpCapacityProbe(probe) => {
             usize::try_from(probe.train_payload_bytes).unwrap_or(usize::MAX)
         }
-        ReliablePathCommand::OpenStream { .. } | ReliablePathCommand::CloseStream(_) => 0,
+        ReliablePathCommand::OpenStream { .. }
+        | ReliablePathCommand::CancelTcpOpen { .. }
+        | ReliablePathCommand::CloseStream(_) => 0,
     }
 }
 
@@ -838,7 +903,9 @@ pub(super) fn reliable_path_command_writer_run_bytes(command: &ReliablePathComma
                 .unwrap_or(usize::MAX)
                 .max(1)
         }
-        ReliablePathCommand::OpenStream { .. } | ReliablePathCommand::CloseStream(_) => 1,
+        ReliablePathCommand::OpenStream { .. }
+        | ReliablePathCommand::CancelTcpOpen { .. }
+        | ReliablePathCommand::CloseStream(_) => 1,
     }
 }
 
@@ -849,6 +916,7 @@ fn reliable_path_command_stream_id(command: &ReliablePathCommand) -> StreamId {
         ReliablePathCommand::SendQuicCapacityProbe(_) => StreamId(0),
         ReliablePathCommand::SendTcpCapacityProbe(_) => StreamId(0),
         ReliablePathCommand::OpenStream { stream_id, .. }
+        | ReliablePathCommand::CancelTcpOpen { stream_id, .. }
         | ReliablePathCommand::CloseStream(stream_id) => *stream_id,
     }
 }
@@ -994,18 +1062,108 @@ pub(super) struct TcpCapacityProbeRequest {
     pub(super) expires_at: Instant,
 }
 
-#[derive(Debug)]
-pub(super) struct TcpCapacityProbeCommand {
+#[derive(Debug, Clone, Copy)]
+pub(super) struct RequestTcpCapacityProbeRequest {
+    pub(super) stream_id: StreamId,
+    pub(super) path_instance: RelayPathInstance,
     pub(super) path_id: PathId,
-    pub(super) path_instance_id: ServerCarrierPathInstanceId,
     pub(super) calibration_id: u64,
     pub(super) train_payload_bytes: u64,
     pub(super) sample_floor_bytes: u64,
+    pub(super) warmup_carrier_bytes: u64,
+    pub(super) timing_slack_bytes: u64,
+    pub(super) required_timed_carrier_bytes: u64,
+    pub(super) baseline_expires_at: Instant,
+    pub(super) write_expires_at: Instant,
+    pub(super) expires_at: Instant,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum TcpCapacityProbeOwner {
+    Request {
+        stream_id: StreamId,
+        path_instance: RelayPathInstance,
+    },
+    Response {
+        path_instance_id: ServerCarrierPathInstanceId,
+    },
+}
+
+#[derive(Debug)]
+pub(super) enum TcpCapacityProbeSessionLeaseOwner {
+    Request(RequestTcpCapacityProbeLease),
+    // This field exists for drop order: the response session reservation lives
+    // until the exact carrier transaction finishes even though it is not read.
+    Response(#[allow(dead_code)] TcpCapacityProbeSessionLease),
+}
+
+impl TcpCapacityProbeSessionLeaseOwner {
+    pub(super) fn request(&self) -> Option<&RequestTcpCapacityProbeLease> {
+        match self {
+            Self::Request(lease) => Some(lease),
+            Self::Response(_) => None,
+        }
+    }
+}
+
+#[derive(Debug)]
+pub(super) struct TcpCapacityProbeCommand {
+    pub(super) owner: TcpCapacityProbeOwner,
+    pub(super) path_id: PathId,
+    pub(super) calibration_id: u64,
+    pub(super) train_payload_bytes: u64,
+    pub(super) sample_floor_bytes: u64,
+    /// Request-side sizing; TCP publishes only the full-train receipt sample.
+    pub(super) warmup_carrier_bytes: u64,
+    pub(super) timing_slack_bytes: u64,
+    pub(super) required_timed_carrier_bytes: u64,
+    pub(super) baseline_expires_at: Option<Instant>,
+    pub(super) write_expires_at: Option<Instant>,
     pub(super) expires_at: Instant,
     // Drop session ownership before the carrier lease wakes blocked planners.
-    pub(super) _session_lease: TcpCapacityProbeSessionLease,
+    pub(super) _session_lease: TcpCapacityProbeSessionLeaseOwner,
     // Dropping the command or completed epoch releases exact-carrier admission.
     pub(super) _lease: TcpCapacityProbeLease,
+}
+
+impl TcpCapacityProbeCommand {
+    pub(super) fn request_lease(&self) -> Option<&RequestTcpCapacityProbeLease> {
+        self._session_lease.request()
+    }
+
+    pub(super) fn valid_request_tcp_train(&self) -> bool {
+        if self.request_lease().is_none() {
+            return false;
+        }
+        // TCP uses the whole continuous train as a conservative receipt sample.
+        // The phase fields still size warmup and minimum evidence consistently
+        // with QUIC policy, but no short ACK tail receives rate authority.
+        let measurement_bytes = match self
+            .timing_slack_bytes
+            .checked_add(self.required_timed_carrier_bytes)
+        {
+            Some(bytes) => bytes,
+            None => return false,
+        };
+        let train = self.warmup_carrier_bytes.checked_add(measurement_bytes);
+        self.warmup_carrier_bytes > 0
+            && self.timing_slack_bytes > 0
+            && self.required_timed_carrier_bytes > 0
+            && measurement_bytes >= self.sample_floor_bytes
+            && train == Some(self.train_payload_bytes)
+            && self
+                .baseline_expires_at
+                .zip(self.write_expires_at)
+                .is_some_and(|(idle, write)| idle < write && write < self.expires_at)
+    }
+}
+
+impl Drop for TcpCapacityProbeCommand {
+    fn drop(&mut self) {
+        if let Some(lease) = self.request_lease() {
+            lease.cancel();
+        }
+    }
 }
 
 impl QuicCapacityProbeCommand {
@@ -1025,13 +1183,19 @@ impl Drop for QuicCapacityProbeCommand {
 pub(super) enum ReliablePathCommand {
     OpenStream {
         stream_id: StreamId,
+        attempt_id: ClientTcpOpenAttemptId,
+        observed_carrier_generation: u64,
         target: TargetAddr,
         ingress: IngressKind,
         lane: FlowLane,
         role: StreamOpenRole,
-        open_deadline: tokio::time::Instant,
+        open_deadlines: ClientTcpOpenDeadlines,
         session_commands: ReliablePathCommandSender,
-        response: oneshot::Sender<Result<ReliablePathStream, RuntimeError>>,
+        response: oneshot::Sender<ClientTcpOpenResponse>,
+    },
+    CancelTcpOpen {
+        stream_id: StreamId,
+        attempt_id: ClientTcpOpenAttemptId,
     },
     SendFrame(Frame),
     // TCP writers reject this carrier-specific command. The shared scheduler
@@ -1042,10 +1206,65 @@ pub(super) enum ReliablePathCommand {
     CloseStream(StreamId),
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) struct ClientTcpOpenAttemptId(pub(super) u64);
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) struct ClientTcpOpenDeadlines {
+    pub(super) live: tokio::time::Instant,
+    pub(super) setup: tokio::time::Instant,
+}
+
+impl ClientTcpOpenDeadlines {
+    pub(super) fn fixed(deadline: tokio::time::Instant) -> Self {
+        Self {
+            live: deadline,
+            setup: deadline,
+        }
+    }
+
+    pub(super) fn from_timeouts(
+        now: tokio::time::Instant,
+        live: Duration,
+        setup: Duration,
+    ) -> Self {
+        Self {
+            live: now + live,
+            setup: now + setup.max(live),
+        }
+    }
+
+    pub(super) fn for_carrier_generation(
+        self,
+        observed_generation: u64,
+        current_generation: u64,
+    ) -> tokio::time::Instant {
+        if observed_generation != 0 && observed_generation == current_generation {
+            self.live
+        } else {
+            self.setup
+        }
+    }
+}
+
+pub(super) struct ClientTcpOpenedStream {
+    pub(super) stream: ReliablePathStream,
+    pub(super) open_deadline: tokio::time::Instant,
+}
+
+// A rejected duplicate never owned the wire stream, so its caller must not
+// detach the earlier owner while unwinding the failed open attempt.
+pub(super) enum ClientTcpOpenResponse {
+    Opened(ClientTcpOpenedStream),
+    RejectedWithoutOpen(RuntimeError),
+    FailedAfterOpen(RuntimeError),
+}
+
 #[cfg(feature = "lab-diagnostics")]
 fn reliable_path_command_kind(command: &ReliablePathCommand) -> &'static str {
     match command {
         ReliablePathCommand::OpenStream { .. } => "open_stream",
+        ReliablePathCommand::CancelTcpOpen { .. } => "cancel_tcp_open",
         ReliablePathCommand::SendFrame(frame) => reliable_path_frame_kind(frame),
         ReliablePathCommand::SendQuicCapacityProbe(_) => "quic_capacity_probe",
         ReliablePathCommand::SendTcpCapacityProbe(_) => "tcp_capacity_probe",

@@ -396,6 +396,113 @@ fn normalized_stream_ack_first_gap(normalized_ranges: &[OffsetRange]) -> Option<
     None
 }
 
+#[cfg(feature = "lab-diagnostics")]
+#[derive(Debug, Default)]
+struct ServerReceiveHoleDiagnostics {
+    opened_at: Option<Instant>,
+    last_delivery_at: Option<Instant>,
+}
+
+#[cfg(feature = "lab-diagnostics")]
+impl ServerReceiveHoleDiagnostics {
+    fn observe(
+        &mut self,
+        stream_id: StreamId,
+        recv_stream: &ReliableRecvStream,
+        delivered_bytes: usize,
+    ) {
+        let now = Instant::now();
+        let reorder_bytes = recv_stream.reorder_bytes();
+        let ranges = recv_stream.ack_ranges();
+        let first_gap = normalized_stream_ack_first_gap(&ranges);
+        if reorder_bytes > 0 && self.opened_at.is_none() {
+            self.opened_at = Some(now);
+            lab_diagnostic(
+                "server_receive_hole",
+                format_args!(
+                    "stream_id={} state=open next_offset={} reorder_bytes={} range_count={} first_gap_start={} first_gap_end={}",
+                    stream_id.0,
+                    recv_stream.next_offset(),
+                    reorder_bytes,
+                    ranges.len(),
+                    first_gap.map_or(0, |gap| gap.0),
+                    first_gap.map_or(0, |gap| gap.1),
+                ),
+            );
+        } else if reorder_bytes == 0
+            && let Some(opened_at) = self.opened_at.take()
+        {
+            lab_diagnostic(
+                "server_receive_hole",
+                format_args!(
+                    "stream_id={} state=clear duration_us={} next_offset={} delivered_bytes={}",
+                    stream_id.0,
+                    now.saturating_duration_since(opened_at).as_micros(),
+                    recv_stream.next_offset(),
+                    delivered_bytes,
+                ),
+            );
+        }
+        if delivered_bytes > 0 {
+            if let Some(last_delivery_at) = self.last_delivery_at {
+                let delivery_gap = now.saturating_duration_since(last_delivery_at);
+                // Keep the causal trace bounded to WAN-scale stalls; ordinary
+                // per-frame delivery remains visible in the perf counters.
+                if delivery_gap >= Duration::from_millis(100) {
+                    lab_diagnostic(
+                        "server_receive_delivery_stall",
+                        format_args!(
+                            "stream_id={} duration_us={} delivered_bytes={} next_offset={} reorder_bytes={} range_count={} first_gap_start={} first_gap_end={} hole_open={}",
+                            stream_id.0,
+                            delivery_gap.as_micros(),
+                            delivered_bytes,
+                            recv_stream.next_offset(),
+                            reorder_bytes,
+                            ranges.len(),
+                            first_gap.map_or(0, |gap| gap.0),
+                            first_gap.map_or(0, |gap| gap.1),
+                            self.opened_at.is_some(),
+                        ),
+                    );
+                }
+            }
+            self.last_delivery_at = Some(now);
+        }
+    }
+}
+
+fn offset_ranges_not_covered(ranges: &[OffsetRange], covered: &[OffsetRange]) -> Vec<OffsetRange> {
+    let mut uncovered = Vec::new();
+    let mut covered_index = 0usize;
+    for range in ranges {
+        let mut cursor = range.start;
+        while covered_index < covered.len() && covered[covered_index].end <= cursor {
+            covered_index += 1;
+        }
+        let mut index = covered_index;
+        while index < covered.len() && covered[index].start < range.end {
+            let known = covered[index];
+            if known.start > cursor
+                && let Some(missing) = OffsetRange::new(cursor, known.start.min(range.end))
+            {
+                uncovered.push(missing);
+            }
+            cursor = cursor.max(known.end).min(range.end);
+            if cursor >= range.end {
+                break;
+            }
+            index += 1;
+        }
+        covered_index = index;
+        if cursor < range.end
+            && let Some(missing) = OffsetRange::new(cursor, range.end)
+        {
+            uncovered.push(missing);
+        }
+    }
+    uncovered
+}
+
 #[derive(Debug, Clone, Default)]
 pub(super) struct ReliableRecvProgress {
     last_max_data_offset: u64,
@@ -405,6 +512,13 @@ pub(super) struct ReliableRecvProgress {
     last_ack_range_count: usize,
     last_ack_largest_end: u64,
     last_ack_at: Option<Instant>,
+}
+
+// Sparse history belongs only to server-side request feedback. Keeping it out
+// of shared receive progress leaves the cloned response hot path cumulative.
+#[derive(Debug, Default)]
+pub(super) struct RequestTcpSparseAckProgress {
+    acknowledged_ranges: Vec<OffsetRange>,
 }
 
 impl ReliableRecvProgress {
@@ -476,6 +590,28 @@ impl ReliableRecvProgress {
         } else {
             false
         }
+    }
+}
+
+impl RequestTcpSparseAckProgress {
+    pub(super) fn ack_frames(
+        &mut self,
+        recv_stream: &ReliableRecvStream,
+        sparse_delta: bool,
+    ) -> Vec<Frame> {
+        let current_ranges = recv_stream.ack_ranges();
+        if !sparse_delta {
+            self.acknowledged_ranges = current_ranges;
+            return recv_stream.ack_frames();
+        }
+        let delta = offset_ranges_not_covered(&current_ranges, &self.acknowledged_ranges);
+        if delta.is_empty() {
+            return Vec::new();
+        }
+        let mut acknowledged = std::mem::take(&mut self.acknowledged_ranges);
+        acknowledged.extend(delta.iter().copied());
+        self.acknowledged_ranges = normalized_offset_ranges(&acknowledged);
+        recv_stream.ack_delta_frames(&delta)
     }
 }
 
@@ -573,16 +709,22 @@ pub(super) fn enqueue_tcp_recv_progress(
     response_sender: &mut ServerResponseSenderService,
     recv_stream: &ReliableRecvStream,
     progress: &mut ReliableRecvProgress,
+    sparse_ack_progress: &mut RequestTcpSparseAckProgress,
     path: Option<PathSnapshot>,
     lane: FlowLane,
     mux_limits: MuxLimits,
     force_max_data: bool,
 ) -> bool {
     let mut sent_any = false;
+    let sparse_delta = !force_max_data
+        && progress.last_ack_at.is_some()
+        && lane.is_bulk()
+        && path.is_some_and(|snapshot| snapshot.underlay == UnderlayProtocol::Tcp)
+        && recv_stream.reorder_bytes() > 0;
     if progress.should_send_ack(recv_stream, path, lane, mux_limits, force_max_data) {
         #[cfg(feature = "lab-diagnostics")]
         let ack_started = Instant::now();
-        let ack_frames = recv_stream.ack_frames();
+        let ack_frames = sparse_ack_progress.ack_frames(recv_stream, sparse_delta);
         #[cfg(feature = "lab-diagnostics")]
         lab_perf_record("mux.ack_frames", ack_started.elapsed(), ack_frames.len());
         // Multipath receive ranges can exceed one ACK frame under normal
@@ -1766,6 +1908,7 @@ where
     let mut pending_local_fin = false;
     let mut pending_remote_fin_offset = None;
     let mut recv_progress = ReliableRecvProgress::default();
+    let mut request_sparse_ack_progress = RequestTcpSparseAckProgress::default();
     let mut ack_gap_repair = ReliableAckGapRepairProgress::default();
     let mut last_recv_progress_sent_at = Instant::now();
     let mut last_send_ack_progress_at = Instant::now();
@@ -1789,6 +1932,8 @@ where
     let mut last_reported_budget: Option<(FlowLane, usize, usize)> = None;
     #[cfg(feature = "lab-diagnostics")]
     let mut reported_former_source_staging_block = false;
+    #[cfg(feature = "lab-diagnostics")]
+    let mut receive_hole_diagnostics = ServerReceiveHoleDiagnostics::default();
 
     let result = loop {
         if stream_terminal_fin_replay_required(
@@ -2194,6 +2339,12 @@ where
                         #[cfg(feature = "lab-diagnostics")]
                         lab_perf_record("mux.receive_data", mux_started.elapsed(), payload_len);
                         let delivered = outcome.delivered;
+                        #[cfg(feature = "lab-diagnostics")]
+                        receive_hole_diagnostics.observe(
+                            stream_id,
+                            &recv_stream,
+                            delivered.iter().map(|chunk| chunk.len()).sum(),
+                        );
                         for chunk in delivered.iter() {
                             stats.record_payload_bytes(chunk.len());
                         }
@@ -2215,7 +2366,8 @@ where
                             &mut response_sender,
                             &recv_stream,
                             &mut recv_progress,
-                            send_path_snapshot,
+                            &mut request_sparse_ack_progress,
+                            request_active_path_snapshot,
                             relay_lane,
                             mux_limits,
                             false,
@@ -2231,7 +2383,8 @@ where
                                 &mut response_sender,
                                 &recv_stream,
                                 &mut recv_progress,
-                                send_path_snapshot,
+                                &mut request_sparse_ack_progress,
+                                request_active_path_snapshot,
                                 relay_lane,
                                 mux_limits,
                                 true,
@@ -2262,6 +2415,9 @@ where
                         response_sender.release_normalized_acked_repairs(&normalized_ranges);
                         #[cfg(feature = "lab-diagnostics")]
                         let largest_ack_end = normalized_ranges.last().map_or(0, |range| range.end);
+                        #[cfg(feature = "lab-diagnostics")]
+                        let incoming_ack_frontier =
+                            stream_ack_contiguous_frontier(complete, &normalized_ranges);
                         let previous_ack_frontier = last_send_ack_frontier;
                         update_repair_authoritative_ack_snapshot(
                             &mut last_send_ack_frontier,
@@ -2401,10 +2557,12 @@ where
                         lab_diagnostic(
                             "stream_ack_received",
                             format_args!(
-                                "stream_id={} complete={} ranges={} largest_end={} released_bytes={} sent_offset={} sender_queue_bytes={} repair_bytes_after={} repair_frames={} repair_kind={} active_underlay={:?} multipath_repair_alternative={} ack_gap_repair_ready={} base_repair_limit={} repair_limit={} extra_traffic_hint_percent={}",
+                                "stream_id={} complete={} ranges={} incoming_frontier={} stored_frontier={} largest_end={} released_bytes={} sent_offset={} sender_queue_bytes={} repair_bytes_after={} repair_frames={} repair_kind={} active_underlay={:?} multipath_repair_alternative={} ack_gap_repair_ready={} base_repair_limit={} repair_limit={} extra_traffic_hint_percent={}",
                                 stream_id.0,
                                 complete,
                                 ranges.len(),
+                                incoming_ack_frontier,
+                                last_send_ack_frontier,
                                 largest_ack_end,
                                 ack.released_bytes,
                                 send_stream.next_offset(),
@@ -2502,7 +2660,8 @@ where
                                 &mut response_sender,
                                 &recv_stream,
                                 &mut recv_progress,
-                                send_path_snapshot,
+                                &mut request_sparse_ack_progress,
+                                request_active_path_snapshot,
                                 relay_lane,
                                 mux_limits,
                                 true,
@@ -2531,7 +2690,8 @@ where
                             &mut response_sender,
                             &recv_stream,
                             &mut recv_progress,
-                            send_path_snapshot,
+                            &mut request_sparse_ack_progress,
+                            request_active_path_snapshot,
                             relay_lane,
                             mux_limits,
                             true,
@@ -2748,7 +2908,8 @@ where
                     &mut response_sender,
                     &recv_stream,
                     &mut recv_progress,
-                    send_path_snapshot,
+                    &mut request_sparse_ack_progress,
+                    request_active_path_snapshot,
                     relay_lane,
                     mux_limits,
                     true,

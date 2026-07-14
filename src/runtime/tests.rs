@@ -2777,12 +2777,14 @@ fn reliable_recv_progress_batches_bulk_acks_by_repair_release_cadence() {
     recv_stream
         .receive_data(0, Bytes::from(vec![0x11; 1024]), StreamFlags::NONE)
         .expect("first data");
-    assert!(progress.should_send_ack(&recv_stream, None, FlowLane::Throughput, mux_limits, false));
+    assert!(progress.should_send_ack(&recv_stream, None, FlowLane::Throughput, mux_limits, false,));
 
     recv_stream
         .receive_data(1024, Bytes::from(vec![0x22; 1024]), StreamFlags::NONE)
         .expect("below ack step");
-    assert!(!progress.should_send_ack(&recv_stream, None, FlowLane::Throughput, mux_limits, false));
+    assert!(
+        !progress.should_send_ack(&recv_stream, None, FlowLane::Throughput, mux_limits, false,)
+    );
 
     recv_stream
         .receive_data(
@@ -2791,7 +2793,7 @@ fn reliable_recv_progress_batches_bulk_acks_by_repair_release_cadence() {
             StreamFlags::NONE,
         )
         .expect("past ack step");
-    assert!(progress.should_send_ack(&recv_stream, None, FlowLane::Throughput, mux_limits, false));
+    assert!(progress.should_send_ack(&recv_stream, None, FlowLane::Throughput, mux_limits, false,));
 }
 
 #[test]
@@ -2811,12 +2813,87 @@ fn reliable_recv_progress_acks_reorder_gap_without_waiting_for_bulk_step() {
     recv_stream
         .receive_data(0, Bytes::from(vec![0x11; 1024]), StreamFlags::NONE)
         .expect("first data");
-    assert!(progress.should_send_ack(&recv_stream, None, FlowLane::Throughput, mux_limits, false));
+    assert!(progress.should_send_ack(&recv_stream, None, FlowLane::Throughput, mux_limits, false,));
 
     recv_stream
         .receive_data(8192, Bytes::from(vec![0x22; 1024]), StreamFlags::NONE)
         .expect("out-of-order data");
-    assert!(progress.should_send_ack(&recv_stream, None, FlowLane::Throughput, mux_limits, false));
+    assert!(progress.should_send_ack(&recv_stream, None, FlowLane::Throughput, mux_limits, false,));
+}
+
+#[test]
+fn reliable_recv_progress_sends_exact_tcp_sparse_deltas_without_delaying_feedback() {
+    let mux_limits = MuxLimits {
+        max_ack_ranges: 16,
+        max_stream_window_bytes: 64 * 1024,
+        max_repair_bytes: 64 * 1024,
+        max_reorder_bytes: 64 * 1024,
+        max_path_flight_bytes: 64 * 1024,
+        max_reliable_relay_chunk_bytes: 64 * 1024,
+        ..MuxLimits::default()
+    };
+    let tcp = PathSnapshot::new(PathId(0), UnderlayProtocol::Tcp, 180.0, 500_000_000.0);
+    let udp = PathSnapshot::new(PathId(1), UnderlayProtocol::Udp, 180.0, 500_000_000.0);
+
+    for (path, request_sparse, compact) in
+        [(tcp, true, true), (tcp, false, false), (udp, true, false)]
+    {
+        let mut recv_stream = ReliableRecvStream::new(StreamId(24), mux_limits);
+        let mut progress = ReliableRecvProgress::default();
+        let mut sparse_progress = RequestTcpSparseAckProgress::default();
+        recv_stream
+            .receive_data(0, Bytes::from(vec![0x11; 1024]), StreamFlags::NONE)
+            .expect("contiguous prefix");
+        assert!(progress.should_send_ack(
+            &recv_stream,
+            Some(path),
+            FlowLane::Throughput,
+            mux_limits,
+            false,
+        ));
+        assert_eq!(sparse_progress.ack_frames(&recv_stream, false).len(), 1);
+
+        let mut frames = Vec::new();
+        for offset in [8192, 32768, 16384, 12288] {
+            recv_stream
+                .receive_data(offset, Bytes::from(vec![0x22; 1024]), StreamFlags::NONE)
+                .expect("sparse range");
+            assert!(
+                progress.should_send_ack(
+                    &recv_stream,
+                    Some(path),
+                    FlowLane::Throughput,
+                    mux_limits,
+                    false,
+                ),
+                "range-shape feedback cadence must not be weakened"
+            );
+            frames = sparse_progress.ack_frames(
+                &recv_stream,
+                request_sparse && path.underlay == UnderlayProtocol::Tcp,
+            );
+        }
+        assert_eq!(frames.len(), 1);
+        let Frame::StreamAck {
+            complete, ranges, ..
+        } = &frames[0]
+        else {
+            panic!("receive progress must emit STREAM_ACK");
+        };
+        assert_eq!(*complete, !compact);
+        assert_eq!(ranges.len(), if compact { 1 } else { 5 });
+        assert_eq!(
+            ranges.first().map(|range| range.start),
+            Some(if compact { 12288 } else { 0 })
+        );
+        assert_eq!(
+            ranges.last().map(|range| range.start),
+            Some(if compact { 12288 } else { 32768 })
+        );
+        if compact {
+            assert_eq!(ranges[0], OffsetRange::new(12288, 13312).unwrap());
+        }
+    }
 }
 
 #[test]
@@ -2839,13 +2916,13 @@ fn reliable_recv_progress_acks_repair_horizon_advancement() {
     recv_stream
         .receive_data(8192, Bytes::from(vec![0x22; 1024]), StreamFlags::NONE)
         .expect("first tail");
-    assert!(progress.should_send_ack(&recv_stream, None, FlowLane::Throughput, mux_limits, false));
+    assert!(progress.should_send_ack(&recv_stream, None, FlowLane::Throughput, mux_limits, false,));
 
     recv_stream
         .receive_data(9216, Bytes::from(vec![0x33; 1024]), StreamFlags::NONE)
         .expect("small tail extension");
     assert!(
-        !progress.should_send_ack(&recv_stream, None, FlowLane::Throughput, mux_limits, false),
+        !progress.should_send_ack(&recv_stream, None, FlowLane::Throughput, mux_limits, false,),
         "small same-range horizon movement should be batched"
     );
 
@@ -2862,7 +2939,7 @@ fn reliable_recv_progress_acks_repair_horizon_advancement() {
         )
         .expect("meaningful tail extension");
     assert!(
-        progress.should_send_ack(&recv_stream, None, FlowLane::Throughput, mux_limits, false),
+        progress.should_send_ack(&recv_stream, None, FlowLane::Throughput, mux_limits, false,),
         "meaningful repair horizon advancement must be ACKed even when range count is unchanged"
     );
 }

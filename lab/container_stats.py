@@ -6,6 +6,9 @@ from __future__ import annotations
 import argparse
 import json
 import math
+import os
+import re
+import select
 import subprocess
 import sys
 import time
@@ -30,6 +33,7 @@ BYTE_UNITS = {
 STOP_POLL_INTERVAL_SECONDS = 0.05
 NETDEV_COUNTER_FIELDS = ("rx_bytes", "rx_packets", "tx_bytes", "tx_packets")
 IPV4_MARKER = "__MPTUNNEL_IPV4__"
+ANSI_CONTROL_SEQUENCE = re.compile(r"\x1b\[[0-?]*[ -/]*[@-~]")
 
 
 def run(argv: list[str], timeout: float = 3.0) -> subprocess.CompletedProcess[str]:
@@ -116,27 +120,98 @@ def wait_for_stop_or_deadline(
     return True
 
 
-def docker_stats(container_ids: list[str]) -> dict[str, dict[str, object]]:
+def docker_stats_lines(
+    container_ids: list[str],
+    should_stop: Callable[[], bool] | None = None,
+):
+    """Yield lines from one stop-aware Docker stats process."""
     if not container_ids:
-        return {}
-    result = run(
-        ["docker", "stats", "--no-stream", "--format", "{{json .}}", *container_ids],
-        timeout=8.0,
+        return
+    process = subprocess.Popen(
+        ["docker", "stats", "--format", "{{json .}}", *container_ids],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.DEVNULL,
     )
-    stats: dict[str, dict[str, object]] = {}
-    if result.returncode != 0:
-        return stats
-    for line in result.stdout.splitlines():
-        if not line.strip():
+    if process.stdout is None:
+        process.terminate()
+        process.wait()
+        return
+
+    fd = process.stdout.fileno()
+    os.set_blocking(fd, False)
+    buffered = bytearray()
+    try:
+        while should_stop is None or not should_stop():
+            readable, _, _ = select.select(
+                [fd], [], [], STOP_POLL_INTERVAL_SECONDS
+            )
+            if not readable:
+                if process.poll() is not None:
+                    break
+                continue
+            try:
+                chunk = os.read(fd, 64 * 1024)
+            except BlockingIOError:
+                continue
+            if not chunk:
+                if buffered:
+                    yield buffered.decode("utf-8", errors="replace")
+                    buffered.clear()
+                break
+            buffered.extend(chunk)
+            while True:
+                newline = buffered.find(b"\n")
+                if newline < 0:
+                    break
+                line = bytes(buffered[:newline])
+                del buffered[: newline + 1]
+                yield line.decode("utf-8", errors="replace")
+    finally:
+        process.stdout.close()
+        if process.poll() is None:
+            process.terminate()
+            try:
+                process.wait(timeout=1.0)
+            except subprocess.TimeoutExpired:
+                process.kill()
+                process.wait()
+
+
+def docker_stats_frames(
+    container_ids: list[str],
+    should_stop: Callable[[], bool] | None = None,
+):
+    """Yield only complete, same-generation multi-container stats frames."""
+    pending: dict[str, dict[str, object]] = {}
+    for line in docker_stats_lines(container_ids, should_stop):
+        payload = ANSI_CONTROL_SEQUENCE.sub("", line).strip()
+        if not payload:
             continue
         try:
-            row = json.loads(line)
+            row = json.loads(payload)
         except json.JSONDecodeError:
             continue
+        if not isinstance(row, dict):
+            continue
         stat_id = str(row.get("ID", ""))
-        if stat_id:
-            stats[stat_id] = row
-    return stats
+        container_id = next(
+            (
+                candidate
+                for candidate in container_ids
+                if candidate.startswith(stat_id)
+                or stat_id.startswith(candidate[:12])
+            ),
+            None,
+        )
+        if not stat_id or container_id is None:
+            continue
+        if container_id in pending:
+            # A repeated ID starts a new Docker refresh; do not mix generations.
+            pending = {}
+        pending[container_id] = row
+        if len(pending) == len(container_ids):
+            yield pending
+            pending = {}
 
 
 def stat_for_container(stats: dict[str, dict[str, object]], container_id: str) -> dict[str, object]:
@@ -323,6 +398,21 @@ def rate_fields(
     }
 
 
+def advance_sampling_deadline(
+    deadline_monotonic: float,
+    interval: float,
+    now_monotonic: float,
+) -> float:
+    """Advance an absolute schedule past completed or missed intervals."""
+    if interval <= 0:
+        return now_monotonic
+    elapsed_intervals = max(
+        math.floor((now_monotonic - deadline_monotonic) / interval) + 1,
+        1,
+    )
+    return deadline_monotonic + elapsed_intervals * interval
+
+
 def sample(args: argparse.Namespace) -> int:
     output = Path(args.output)
     output.parent.mkdir(parents=True, exist_ok=True)
@@ -334,44 +424,61 @@ def sample(args: argparse.Namespace) -> int:
     def should_stop() -> bool:
         return stop_requested(stop_file)
 
+    ids = compose_container_ids(args.compose_file, args.services, should_stop)
+    if should_stop() or not ids:
+        return 0
+    interval = max(args.interval, 0.0)
+    next_sample_at = started_at
+    frames = docker_stats_frames(list(ids.values()), should_stop)
     with output.open("a", encoding="utf-8") as handle:
-        while not stop_requested(stop_file):
-            now_monotonic = time.monotonic()
-            ids = compose_container_ids(args.compose_file, args.services, should_stop)
-            if should_stop():
-                break
-            stats = docker_stats(list(ids.values()))
-            if should_stop():
-                break
-            for service, container_id in ids.items():
+        try:
+            while not should_stop():
+                if wait_for_stop_or_deadline(stop_file, next_sample_at):
+                    break
+                try:
+                    stats = next(frames)
+                except StopIteration:
+                    break
                 if should_stop():
                     break
-                sample_index[service] += 1
-                stat = stat_for_container(stats, container_id)
-                mem_usage, mem_limit = parse_mem_usage(str(stat.get("MemUsage", "")))
-                net = read_netdev(container_id)
-                if net is None:
-                    continue
-                rates = rate_fields(net, previous_net.get(service), now_monotonic)
-                previous_net[service] = (now_monotonic, net)
-                row = {
-                    "case": args.case,
-                    "ts": utc_now(),
-                    "t_mono_ms": int((now_monotonic - started_at) * 1000),
-                    "sample_index": sample_index[service],
-                    "service": service,
-                    "container_id": container_id[:12],
-                    "cpu_pct": parse_percent(str(stat.get("CPUPerc", ""))),
-                    "mem_bytes": mem_usage,
-                    "mem_limit_bytes": mem_limit,
-                    "mem_pct": parse_percent(str(stat.get("MemPerc", ""))),
-                    **net,
-                    **rates,
-                }
-                print(json.dumps(row, sort_keys=True), file=handle, flush=True)
-            next_sample_at = time.monotonic() + max(args.interval, 0.0)
-            if wait_for_stop_or_deadline(stop_file, next_sample_at):
-                break
+                now_monotonic = time.monotonic()
+                for service, container_id in ids.items():
+                    if should_stop():
+                        break
+                    sample_index[service] += 1
+                    stat = stat_for_container(stats, container_id)
+                    mem_usage, mem_limit = parse_mem_usage(
+                        str(stat.get("MemUsage", ""))
+                    )
+                    net = read_netdev(container_id)
+                    if net is None:
+                        continue
+                    rates = rate_fields(net, previous_net.get(service), now_monotonic)
+                    previous_net[service] = (now_monotonic, net)
+                    row = {
+                        "case": args.case,
+                        "ts": utc_now(),
+                        "t_mono_ms": int((now_monotonic - started_at) * 1000),
+                        "sample_index": sample_index[service],
+                        "service": service,
+                        "container_id": container_id[:12],
+                        "cpu_pct": parse_percent(str(stat.get("CPUPerc", ""))),
+                        "mem_bytes": mem_usage,
+                        "mem_limit_bytes": mem_limit,
+                        "mem_pct": parse_percent(str(stat.get("MemPerc", ""))),
+                        **net,
+                        **rates,
+                    }
+                    print(json.dumps(row, sort_keys=True), file=handle, flush=True)
+                next_sample_at = advance_sampling_deadline(
+                    next_sample_at,
+                    interval,
+                    time.monotonic(),
+                )
+        finally:
+            close_frames = getattr(frames, "close", None)
+            if close_frames is not None:
+                close_frames()
     return 0
 
 

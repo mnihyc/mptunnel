@@ -5,6 +5,15 @@ pub(super) struct OpenedRemoteStream {
     pub(super) path_index: usize,
 }
 
+impl OpenedRemoteStream {
+    /// An accepted stream that is not committed to a remote set must release
+    /// both the peer binding and the local carrier actor entry.
+    pub(super) async fn close(self) {
+        self.stream.send_detach().await;
+        self.stream.close().await;
+    }
+}
+
 pub(super) struct AcceptedRemoteStreamGuard {
     stream: Option<ReliablePathStream>,
 }
@@ -16,11 +25,11 @@ impl AcceptedRemoteStreamGuard {
         }
     }
 
-    fn stream(&self) -> &ReliablePathStream {
+    pub(super) fn stream(&self) -> &ReliablePathStream {
         self.stream.as_ref().expect("accepted stream guard")
     }
 
-    fn commit(mut self) -> ReliablePathStream {
+    pub(super) fn commit(mut self) -> ReliablePathStream {
         self.stream.take().expect("accepted stream guard")
     }
 }
@@ -271,8 +280,9 @@ impl ReliableRelayRemoteSet {
     }
 
     fn attach_with_placement(&mut self, opened: OpenedRemoteStream, placement: RelayPathPlacement) {
-        let path_index = opened.path_index;
-        let underlay = opened.stream.underlay;
+        let OpenedRemoteStream { stream, path_index } = opened;
+        let accepted = AcceptedRemoteStreamGuard::new(stream);
+        let underlay = accepted.stream().underlay;
         let key = RelayPathKey {
             underlay,
             index: path_index,
@@ -286,7 +296,7 @@ impl ReliableRelayRemoteSet {
             key,
             id: instance_id,
         };
-        let (stream, mut frames) = opened.stream.into_handle_and_frames();
+        let (stream, mut frames) = accepted.commit().into_handle_and_frames();
         let frames_tx = self.frames_tx.clone();
         tokio::spawn(async move {
             while let Some(frame) = frames.recv().await {
@@ -593,7 +603,8 @@ async fn open_reliable_initial_active_attempt(
                 lane,
                 has_unattempted_alternative,
             );
-            let open_deadline = tokio::time::Instant::now() + open_timeout;
+            let open_deadlines =
+                ClientTcpOpenDeadlines::fixed(tokio::time::Instant::now() + open_timeout);
             match open_remote_stream_on_reserved_path(
                 context,
                 stream_id,
@@ -602,7 +613,7 @@ async fn open_reliable_initial_active_attempt(
                 lane,
                 key.index,
                 StreamOpenRole::Active,
-                open_deadline,
+                open_deadlines,
             )
             .await
             {
@@ -717,7 +728,7 @@ pub(super) async fn open_remote_stream_on_path(
     role: StreamOpenRole,
 ) -> Result<OpenedRemoteStream, RuntimeError> {
     context.reserve_tcp_path_load(path_index, lane);
-    let open_timeout = reliable_relay_attach_open_timeout(
+    let open_timeouts = reliable_relay_attach_open_timeouts(
         context,
         RelayPathKey {
             underlay: UnderlayProtocol::Tcp,
@@ -725,7 +736,11 @@ pub(super) async fn open_remote_stream_on_path(
         },
         lane,
     );
-    let open_deadline = tokio::time::Instant::now() + open_timeout;
+    let open_deadlines = ClientTcpOpenDeadlines::from_timeouts(
+        tokio::time::Instant::now(),
+        open_timeouts.live,
+        open_timeouts.setup,
+    );
     let open_result = open_remote_stream_on_reserved_path(
         context,
         stream_id,
@@ -734,7 +749,7 @@ pub(super) async fn open_remote_stream_on_path(
         lane,
         path_index,
         role,
-        open_deadline,
+        open_deadlines,
     )
     .await;
     match open_result {
@@ -750,12 +765,13 @@ pub(super) async fn open_remote_stream_on_path(
             lab_diagnostic(
                 "reliable_stream_open_timeout",
                 format_args!(
-                    "stream_id={} underlay=tcp path_index={} lane={:?} role={:?} timeout_ms={}",
+                    "stream_id={} underlay=tcp path_index={} lane={:?} role={:?} live_timeout_ms={} setup_timeout_ms={}",
                     stream_id.0,
                     path_index,
                     lane,
                     role,
-                    open_timeout.as_millis(),
+                    open_timeouts.live.as_millis(),
+                    open_timeouts.setup.as_millis(),
                 ),
             );
             Err(RuntimeError::PathOpenTimedOut)
@@ -767,12 +783,32 @@ pub(super) async fn open_remote_stream_on_path(
     }
 }
 
-pub(super) fn reliable_relay_attach_open_timeout(
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) struct ReliableRelayAttachOpenTimeouts {
+    pub(super) live: Duration,
+    pub(super) setup: Duration,
+}
+
+pub(super) fn reliable_relay_attach_open_timeouts(
     context: &ClientPathContext,
     key: RelayPathKey,
     lane: FlowLane,
-) -> Duration {
-    reliable_relay_stall_timeout(context.reliable_path_snapshot(key), lane)
+) -> ReliableRelayAttachOpenTimeouts {
+    let snapshot = context.reliable_path_snapshot(key);
+    let live = reliable_relay_stall_timeout(snapshot, lane);
+    let setup = match key.underlay {
+        UnderlayProtocol::Tcp => {
+            // A cold lane-class actor owns carrier dial, authenticated path
+            // join, and product open. A live association owns only the last.
+            path_open_pto(snapshot, false)
+                .saturating_mul(active_path_open_serialized_exchanges(snapshot))
+        }
+        UnderlayProtocol::Udp => live,
+    };
+    ReliableRelayAttachOpenTimeouts {
+        live,
+        setup: setup.max(live),
+    }
 }
 
 pub(super) fn reliable_initial_active_open_timeout(
@@ -801,7 +837,7 @@ pub(super) async fn open_remote_stream_on_reserved_path(
     lane: FlowLane,
     path_index: usize,
     role: StreamOpenRole,
-    open_deadline: tokio::time::Instant,
+    open_deadlines: ClientTcpOpenDeadlines,
 ) -> Result<OpenedRemoteStream, RuntimeError> {
     #[cfg(feature = "lab-diagnostics")]
     lab_diagnostic(
@@ -817,15 +853,15 @@ pub(super) async fn open_remote_stream_on_reserved_path(
         ),
     );
     let started_at = Instant::now();
-    let stream = context
+    let opened = context
         .tcp_sessions
         .get(path_index)
         .ok_or(RuntimeError::NoSchedulableTcpPath)?
-        .open_stream(stream_id, target, ingress, lane, role, open_deadline)
+        .open_stream_with_deadlines(stream_id, target, ingress, lane, role, open_deadlines)
         .await?;
-    let accepted = AcceptedRemoteStreamGuard::new(stream);
+    let accepted = AcceptedRemoteStreamGuard::new(opened.stream);
     tokio::time::timeout_at(
-        open_deadline,
+        opened.open_deadline,
         send_open_path_metrics(
             context,
             accepted.stream(),
@@ -868,14 +904,15 @@ pub(super) async fn open_remote_stream_on_udp_path(
         return Err(RuntimeError::NoSchedulableUdpPath);
     }
     context.reserve_udp_stream_path_load(path_index, lane);
-    let open_timeout = reliable_relay_attach_open_timeout(
+    let open_timeout = reliable_relay_attach_open_timeouts(
         context,
         RelayPathKey {
             underlay: UnderlayProtocol::Udp,
             index: path_index,
         },
         lane,
-    );
+    )
+    .setup;
     match relay_path_open_with_timeout(
         open_timeout,
         open_remote_stream_on_reserved_udp_path(

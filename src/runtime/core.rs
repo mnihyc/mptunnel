@@ -12,13 +12,14 @@ use super::relay_io::*;
 use super::relay_open::*;
 use super::reliable_path::*;
 use super::server_runtime::*;
+use super::tcp_metrics::{TcpCapacityProofCandidate, valid_tcp_capacity_proof_candidate_at};
 use super::tcp_path::*;
 use super::tun_l4::*;
 use super::udp_metrics::UdpPathMetrics;
 use super::udp_path::*;
 #[cfg(feature = "lab-diagnostics")]
 use crate::lab_diagnostics::lab_diagnostic;
-use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU8, AtomicU32, AtomicU64, Ordering};
 
 pub(super) const MAX_HTTP_CONNECT_HEADER_BYTES: usize = 64 * 1024;
 // RFC 9002's recommended QUIC initial congestion window is based on ten max
@@ -311,6 +312,10 @@ pub struct ClientPathContext {
     // Request-side QUIC capacity discovery is one carrier-only epoch per MPP
     // session. It is deliberately independent of TCP and product ACK clocks.
     request_quic_capacity_probe: Arc<RequestQuicCapacityProbeSession>,
+    // TCP uses its own exact-socket proof controller. The byte envelope is a
+    // shared product resource, but TCP_INFO/receipt authority never crosses
+    // into QUIC's native packet-ACK model.
+    request_tcp_capacity_probe: Arc<RequestTcpCapacityProbeSession>,
     // Path-model ownership: health records are evidence snapshots consumed by
     // schedulers; they must not own product bytes or carrier queues.
     pub(super) health: Arc<Mutex<ClientPathHealth>>,
@@ -320,15 +325,286 @@ pub struct ClientPathContext {
     pub(super) proxy_auth: ProxyAuthConfig,
 }
 
+#[derive(Debug)]
+struct RequestCapacityProbeBudget {
+    spent_bytes: AtomicU64,
+    path_spent_bytes: Box<[AtomicU64]>,
+    candidate_share_bytes: AtomicU64,
+}
+
+impl RequestCapacityProbeBudget {
+    fn new(path_count: usize) -> Self {
+        Self {
+            spent_bytes: AtomicU64::new(0),
+            path_spent_bytes: (0..path_count)
+                .map(|_| AtomicU64::new(0))
+                .collect::<Vec<_>>()
+                .into_boxed_slice(),
+            candidate_share_bytes: AtomicU64::new(0),
+        }
+    }
+
+    fn remaining_bytes(&self, limit: u64) -> u64 {
+        limit.saturating_sub(self.spent_bytes.load(Ordering::Acquire))
+    }
+
+    fn effective_candidate_share_bytes(&self, proposed_path_limit: u64, session_limit: u64) -> u64 {
+        let frozen_limit = self.candidate_share_bytes.load(Ordering::Acquire);
+        if frozen_limit == 0 {
+            proposed_path_limit.min(session_limit)
+        } else {
+            frozen_limit
+        }
+    }
+
+    fn path_remaining_bytes(
+        &self,
+        path_index: usize,
+        proposed_path_limit: u64,
+        session_limit: u64,
+    ) -> u64 {
+        let Some(spent) = self.path_spent_bytes.get(path_index) else {
+            return 0;
+        };
+        let frozen_limit = self.candidate_share_bytes.load(Ordering::Acquire);
+        let path_limit = if frozen_limit == 0 {
+            proposed_path_limit.min(session_limit)
+        } else {
+            frozen_limit
+        };
+        path_limit.saturating_sub(spent.load(Ordering::Acquire))
+    }
+
+    fn try_reserve(
+        &self,
+        path_index: usize,
+        bytes: u64,
+        proposed_path_limit: u64,
+        session_limit: u64,
+    ) -> bool {
+        let Some(path_spent) = self.path_spent_bytes.get(path_index) else {
+            return false;
+        };
+        let proposed_path_limit = proposed_path_limit.min(session_limit);
+        if proposed_path_limit == 0 {
+            return false;
+        }
+        let path_limit = match self.candidate_share_bytes.compare_exchange(
+            0,
+            proposed_path_limit,
+            Ordering::AcqRel,
+            Ordering::Acquire,
+        ) {
+            Ok(_) => proposed_path_limit,
+            Err(frozen_limit) => frozen_limit,
+        };
+        if path_spent
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |spent| {
+                spent.checked_add(bytes).filter(|next| *next <= path_limit)
+            })
+            .is_err()
+        {
+            return false;
+        }
+        if self
+            .spent_bytes
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |spent| {
+                spent
+                    .checked_add(bytes)
+                    .filter(|next| *next <= session_limit)
+            })
+            .is_err()
+        {
+            path_spent.fetch_sub(bytes, Ordering::AcqRel);
+            return false;
+        }
+        true
+    }
+
+    fn refund(&self, path_index: usize, bytes: u64) {
+        if let Some(path_spent) = self.path_spent_bytes.get(path_index) {
+            path_spent.fetch_sub(bytes, Ordering::AcqRel);
+            self.spent_bytes.fetch_sub(bytes, Ordering::AcqRel);
+        }
+    }
+}
+
+/// One logical flow may spend one candidate share per protocol. The session
+/// retains the full envelope so later flows can still discover other paths.
 #[derive(Debug, Default)]
+pub(super) struct RequestCapacityProbeCampaignBudget {
+    spent_bytes: AtomicU64,
+    limit_bytes: AtomicU64,
+}
+
+impl RequestCapacityProbeCampaignBudget {
+    pub(super) fn remaining_bytes(&self, proposed_limit: u64) -> u64 {
+        let frozen_limit = self.limit_bytes.load(Ordering::Acquire);
+        let limit = if frozen_limit == 0 {
+            proposed_limit
+        } else {
+            frozen_limit
+        };
+        limit.saturating_sub(self.spent_bytes.load(Ordering::Acquire))
+    }
+
+    fn try_reserve(&self, bytes: u64, proposed_limit: u64) -> bool {
+        if proposed_limit == 0 {
+            return false;
+        }
+        let limit = match self.limit_bytes.compare_exchange(
+            0,
+            proposed_limit,
+            Ordering::AcqRel,
+            Ordering::Acquire,
+        ) {
+            Ok(_) => proposed_limit,
+            Err(frozen_limit) => frozen_limit,
+        };
+        self.spent_bytes
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |spent| {
+                spent.checked_add(bytes).filter(|next| *next <= limit)
+            })
+            .is_ok()
+    }
+
+    fn refund(&self, bytes: u64) {
+        self.spent_bytes.fetch_sub(bytes, Ordering::AcqRel);
+    }
+}
+
+#[derive(Debug)]
 struct RequestQuicCapacityProbeSession {
     active_token: AtomicU64,
-    spent_bytes: AtomicU64,
+    budget: RequestCapacityProbeBudget,
+}
+
+impl RequestQuicCapacityProbeSession {
+    fn new(path_count: usize) -> Self {
+        Self {
+            active_token: AtomicU64::new(0),
+            budget: RequestCapacityProbeBudget::new(path_count),
+        }
+    }
+}
+
+#[derive(Debug)]
+struct RequestTcpCapacityProbeSession {
+    budget: RequestCapacityProbeBudget,
+}
+
+impl RequestTcpCapacityProbeSession {
+    fn new(path_count: usize) -> Self {
+        Self {
+            budget: RequestCapacityProbeBudget::new(path_count),
+        }
+    }
+}
+
+#[repr(u8)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RequestTcpCapacityProbeSpendState {
+    Reserved = 0,
+    Committed = 1,
+    Refund = 2,
+}
+
+#[derive(Debug, Clone)]
+pub(super) struct RequestTcpCapacityProbeLease {
+    state: Arc<RequestTcpCapacityProbeLeaseState>,
+}
+
+#[derive(Debug)]
+struct RequestTcpCapacityProbeLeaseState {
+    session: Arc<RequestTcpCapacityProbeSession>,
+    campaign: Arc<RequestCapacityProbeCampaignBudget>,
+    health: Arc<Mutex<ClientPathHealth>>,
+    path_index: usize,
+    token: u64,
+    bytes: u64,
+    spend_state: AtomicU8,
+    ticket: QuicCapacityProbeCommandTicket,
+}
+
+impl RequestTcpCapacityProbeLease {
+    pub(super) fn commit(&self) -> bool {
+        match self.state.spend_state.compare_exchange(
+            RequestTcpCapacityProbeSpendState::Reserved as u8,
+            RequestTcpCapacityProbeSpendState::Committed as u8,
+            Ordering::AcqRel,
+            Ordering::Acquire,
+        ) {
+            Ok(_) => true,
+            Err(state) => state == RequestTcpCapacityProbeSpendState::Committed as u8,
+        }
+    }
+
+    pub(super) fn refund_if_unwritten(&self) {
+        // Planning reserves the session envelope before queueing. A carrier
+        // that proves it wrote nothing returns that reservation without
+        // reopening the bounded per-path attempt policy. Refund is terminal so
+        // a fast carrier cannot have this decision overwritten by a later
+        // planner commit after queue admission.
+        self.state.spend_state.store(
+            RequestTcpCapacityProbeSpendState::Refund as u8,
+            Ordering::Release,
+        );
+    }
+
+    pub(super) fn is_current(&self) -> bool {
+        self.state.ticket.is_current()
+    }
+
+    pub(super) fn is_published(&self) -> bool {
+        self.state.ticket.resolution() == QuicCapacityProbeCommandResolution::Published
+    }
+
+    pub(super) fn cancel(&self) -> bool {
+        self.state.ticket.cancel()
+    }
+
+    pub(super) async fn cancelled(&self) {
+        self.state.ticket.cancelled().await;
+    }
+}
+
+impl Drop for RequestTcpCapacityProbeLeaseState {
+    fn drop(&mut self) {
+        self.ticket.cancel();
+        if let Some(record) = self
+            .health
+            .lock()
+            .expect("client path health lock")
+            .tcp
+            .get_mut(self.path_index)
+        {
+            if record
+                .request_tcp_capacity_probe
+                .as_ref()
+                .is_some_and(|reservation| reservation.token == self.token)
+            {
+                record.request_tcp_capacity_probe = None;
+            }
+            if record
+                .tcp_capacity_proof
+                .is_some_and(|proof| proof.candidate.token == self.token)
+            {
+                record.tcp_capacity_proof = None;
+            }
+        }
+        if self.spend_state.load(Ordering::Acquire)
+            != RequestTcpCapacityProbeSpendState::Committed as u8
+        {
+            self.session.budget.refund(self.path_index, self.bytes);
+            self.campaign.refund(self.bytes);
+        }
+    }
 }
 
 #[derive(Debug)]
 pub(super) struct RequestQuicCapacityProbeLease {
     session: Arc<RequestQuicCapacityProbeSession>,
+    campaign: Arc<RequestCapacityProbeCampaignBudget>,
     health: Arc<Mutex<ClientPathHealth>>,
     path_index: usize,
     token: u64,
@@ -373,9 +649,8 @@ impl Drop for RequestQuicCapacityProbeLease {
             }
         }
         if !self.committed {
-            self.session
-                .spent_bytes
-                .fetch_sub(self.bytes, Ordering::AcqRel);
+            self.session.budget.refund(self.path_index, self.bytes);
+            self.campaign.refund(self.bytes);
         }
         let _ = self.session.active_token.compare_exchange(
             self.token,
@@ -509,6 +784,8 @@ pub(super) struct ClientPathHealthRecord {
     pub(super) carrier_last_delivery_at: Option<Instant>,
     pub(super) carrier_app_limited: bool,
     pub(super) carrier_ack_derived_data_seen: bool,
+    request_tcp_capacity_probe: Option<RequestTcpCapacityProbeReservation>,
+    tcp_capacity_proof: Option<RequestTcpCapacityProof>,
     request_quic_capacity_probe: Option<RequestQuicCapacityProbeReservation>,
     quic_capacity_proof: Option<RequestQuicCapacityProof>,
     request_quic_capacity_product_handoff: Option<RequestQuicCapacityProductHandoff>,
@@ -518,6 +795,25 @@ pub(super) struct ClientPathHealthRecord {
     successful_path_proofs: HashMap<u64, SuccessfulPathProof>,
     successful_path_proof_order: VecDeque<u64>,
     successful_path_proof_limit: usize,
+}
+
+#[derive(Debug, Clone)]
+struct RequestTcpCapacityProbeReservation {
+    stream_id: StreamId,
+    path_instance: RelayPathInstance,
+    token: u64,
+    valid_after: Instant,
+    expires_at: Instant,
+    train_bytes: u64,
+    required_timed_bytes: u64,
+    ticket: QuicCapacityProbeCommandTicket,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct RequestTcpCapacityProof {
+    stream_id: StreamId,
+    path_instance: RelayPathInstance,
+    candidate: TcpCapacityProofCandidate,
 }
 
 #[derive(Debug, Clone)]
@@ -637,6 +933,8 @@ impl Default for ClientPathHealthRecord {
             carrier_last_delivery_at: None,
             carrier_app_limited: true,
             carrier_ack_derived_data_seen: false,
+            request_tcp_capacity_probe: None,
+            tcp_capacity_proof: None,
             request_quic_capacity_probe: None,
             quic_capacity_proof: None,
             request_quic_capacity_product_handoff: None,
@@ -656,6 +954,70 @@ impl ClientPathHealthRecord {
             successful_path_proof_limit: limit.max(1),
             ..Self::default()
         }
+    }
+
+    pub(super) fn mark_tcp_transport_state(&mut self, metrics: PathMetrics) {
+        if self.manual_disabled || metrics.underlay != UnderlayProtocol::Tcp {
+            return;
+        }
+        self.mark_liveness_success();
+        // Same-socket TCP_INFO owns transport state only. A small path proof
+        // must not turn its native delivery estimate into path-rate authority.
+        self.carrier_srtt_ms = Some(f64::from(metrics.srtt_us.max(1)) / 1_000.0);
+        self.carrier_rttvar_ms = Some(f64::from(metrics.rttvar_us) / 1_000.0);
+        self.carrier_bytes_in_flight = metrics.bytes_in_flight;
+        self.carrier_queue_bytes = metrics.queue_bytes;
+        self.carrier_inflight_limit_bytes = metrics.inflight_limit_bytes;
+        self.measured_loss_rate = Some(f64::from(metrics.loss_ppm) / 1_000_000.0);
+    }
+
+    pub(super) fn accept_request_tcp_capacity_proof(
+        &mut self,
+        stream_id: StreamId,
+        path_instance: RelayPathInstance,
+        candidate: TcpCapacityProofCandidate,
+        metrics: PathMetrics,
+        now: Instant,
+    ) -> bool {
+        let Some(reservation) = self.request_tcp_capacity_probe.as_ref() else {
+            return false;
+        };
+        if path_instance.key.underlay != UnderlayProtocol::Tcp
+            || metrics.underlay != UnderlayProtocol::Tcp
+            || metrics.direction != PathMetricDirection::ClientToServer
+            || metrics.path_id.0 as usize != path_instance.key.index
+            || reservation.stream_id != stream_id
+            || reservation.path_instance != path_instance
+            || reservation.token != candidate.token
+            || reservation.train_bytes != candidate.train_bytes
+            || candidate.rate_bps != candidate.receipt_rate_bps
+            || candidate.rate_sample_bytes < reservation.required_timed_bytes
+            || candidate.rate_sample_bytes > candidate.train_bytes
+            || candidate.accepted_at < reservation.valid_after
+            || candidate.accepted_at >= reservation.expires_at
+            || !valid_tcp_capacity_proof_candidate_at(candidate, now)
+        {
+            return false;
+        }
+        let reservation = self
+            .request_tcp_capacity_probe
+            .take()
+            .expect("validated request TCP capacity reservation");
+        // Publication wins cancellation before proof becomes visible. The health
+        // lock keeps readers from observing the transaction between those steps.
+        if !reservation.ticket.publish() {
+            return false;
+        }
+        self.tcp_capacity_proof = Some(RequestTcpCapacityProof {
+            stream_id,
+            path_instance,
+            candidate,
+        });
+        // RTT, queue, and cwnd remain current socket diagnostics. Carrier rate
+        // authority stays inside the expiring typed proof until product ACKs
+        // replace it; an offset-free train must not become a cross-stream prior.
+        self.mark_tcp_transport_state(metrics);
+        true
     }
 
     pub(super) fn accept_request_quic_capacity_proof(
@@ -765,6 +1127,715 @@ impl ClientPathHealthRecord {
 #[cfg(test)]
 mod request_quic_capacity_product_handoff_tests {
     use super::*;
+    use crate::config::SharedSecret;
+
+    fn tcp_path_instance(index: usize, id: u64) -> RelayPathInstance {
+        RelayPathInstance {
+            key: RelayPathKey {
+                underlay: UnderlayProtocol::Tcp,
+                index,
+            },
+            id,
+        }
+    }
+
+    fn request_tcp_capacity_test_context(path_count: usize) -> ClientPathContext {
+        let paths = (0..path_count)
+            .map(|index| {
+                format!("tcp://127.0.0.1:{}", 12_700 + index)
+                    .parse::<PathSpec>()
+                    .expect("request TCP capacity test path")
+            })
+            .collect();
+        let security = SecurityConfig::encrypted(
+            SharedSecret::new(b"0123456789abcdef0123456789abcdef".to_vec())
+                .expect("request TCP capacity test secret"),
+        );
+        ClientPathContext::new(paths, security, ResourceLimits::default())
+            .expect("request TCP capacity test context")
+    }
+
+    fn request_quic_capacity_test_context(path_count: usize) -> ClientPathContext {
+        let paths = (0..path_count)
+            .map(|index| {
+                format!("udp://127.0.0.1:{}", 12_800 + index)
+                    .parse::<PathSpec>()
+                    .expect("request QUIC capacity test path")
+            })
+            .collect();
+        let security = SecurityConfig::encrypted(
+            SharedSecret::new(b"0123456789abcdef0123456789abcdef".to_vec())
+                .expect("request QUIC capacity test secret"),
+        );
+        ClientPathContext::new(paths, security, ResourceLimits::default())
+            .expect("request QUIC capacity test context")
+    }
+
+    fn reserve_request_tcp_capacity_for_test(
+        context: &ClientPathContext,
+        path_index: usize,
+        token: u64,
+        train_bytes: u64,
+    ) -> Option<RequestTcpCapacityProbeLease> {
+        reserve_request_tcp_capacity_with_limit_for_test(
+            context,
+            path_index,
+            token,
+            train_bytes,
+            reliable_quic_capacity_calibration_session_limit_bytes(context.mux_limits),
+        )
+    }
+
+    fn reserve_request_tcp_capacity_with_limit_for_test(
+        context: &ClientPathContext,
+        path_index: usize,
+        token: u64,
+        train_bytes: u64,
+        path_limit_bytes: u64,
+    ) -> Option<RequestTcpCapacityProbeLease> {
+        reserve_request_tcp_capacity_identity_with_limit_for_test(
+            context,
+            StreamId(70),
+            path_index,
+            100 + path_index as u64,
+            token,
+            train_bytes,
+            path_limit_bytes,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn reserve_request_tcp_capacity_identity_with_limit_for_test(
+        context: &ClientPathContext,
+        stream_id: StreamId,
+        path_index: usize,
+        instance_id: u64,
+        token: u64,
+        train_bytes: u64,
+        path_limit_bytes: u64,
+    ) -> Option<RequestTcpCapacityProbeLease> {
+        reserve_request_tcp_capacity_identity_with_campaign_for_test(
+            context,
+            stream_id,
+            path_index,
+            instance_id,
+            token,
+            train_bytes,
+            path_limit_bytes,
+            Arc::new(RequestCapacityProbeCampaignBudget::default()),
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn reserve_request_tcp_capacity_identity_with_campaign_for_test(
+        context: &ClientPathContext,
+        stream_id: StreamId,
+        path_index: usize,
+        instance_id: u64,
+        token: u64,
+        train_bytes: u64,
+        path_limit_bytes: u64,
+        campaign: Arc<RequestCapacityProbeCampaignBudget>,
+    ) -> Option<RequestTcpCapacityProbeLease> {
+        let now = Instant::now();
+        context.try_reserve_request_tcp_capacity_probe(
+            stream_id,
+            path_index,
+            tcp_path_instance(path_index, instance_id),
+            token,
+            train_bytes,
+            path_limit_bytes,
+            campaign,
+            PATH_OPEN_SCORE_BYTES as u64,
+            now,
+            now + Duration::from_secs(30),
+            QuicCapacityProbeCommandTicket::new(),
+        )
+    }
+
+    #[test]
+    fn request_capacity_campaign_bounds_one_flow_without_spending_later_flow_credit() {
+        const CANDIDATE_SHARE: u64 = 16 * 1024 * 1024;
+        const ITER298_FIRST_TRAIN: u64 = 3_471_410;
+        const ITER298_SECOND_TRAIN: u64 = 7_070_776;
+        const ITER298_THIRD_TRAIN: u64 = 7_897_460;
+        const HISTORICAL_CAMPAIGN: u64 = 16_193_904;
+
+        let context = request_tcp_capacity_test_context(3);
+        let first_flow = Arc::new(RequestCapacityProbeCampaignBudget::default());
+        let first = reserve_request_tcp_capacity_identity_with_campaign_for_test(
+            &context,
+            StreamId(60),
+            0,
+            160,
+            61,
+            ITER298_FIRST_TRAIN,
+            CANDIDATE_SHARE,
+            first_flow.clone(),
+        )
+        .expect("the first measured Iter298 train fits the flow campaign");
+        let second = reserve_request_tcp_capacity_identity_with_campaign_for_test(
+            &context,
+            StreamId(60),
+            1,
+            161,
+            62,
+            ITER298_SECOND_TRAIN,
+            CANDIDATE_SHARE,
+            first_flow.clone(),
+        )
+        .expect("the second measured Iter298 train fits the residual campaign");
+        assert!(first.commit());
+        assert!(second.commit());
+        drop(first);
+        drop(second);
+        assert_eq!(
+            first_flow.remaining_bytes(CANDIDATE_SHARE),
+            CANDIDATE_SHARE - ITER298_FIRST_TRAIN - ITER298_SECOND_TRAIN
+        );
+        assert!(
+            reserve_request_tcp_capacity_identity_with_campaign_for_test(
+                &context,
+                StreamId(60),
+                2,
+                162,
+                63,
+                ITER298_THIRD_TRAIN,
+                CANDIDATE_SHARE,
+                first_flow,
+            )
+            .is_none(),
+            "the third Iter298 train must not overbook one flow's campaign"
+        );
+
+        let later_flow = Arc::new(RequestCapacityProbeCampaignBudget::default());
+        let later = reserve_request_tcp_capacity_identity_with_campaign_for_test(
+            &context,
+            StreamId(61),
+            2,
+            262,
+            64,
+            ITER298_THIRD_TRAIN,
+            CANDIDATE_SHARE,
+            later_flow,
+        )
+        .expect("a later flow retains independent campaign credit");
+        assert!(later.commit());
+        drop(later);
+
+        let historical = RequestCapacityProbeCampaignBudget::default();
+        assert!(historical.try_reserve(HISTORICAL_CAMPAIGN, CANDIDATE_SHARE));
+        assert_eq!(
+            historical.remaining_bytes(CANDIDATE_SHARE),
+            CANDIDATE_SHARE - HISTORICAL_CAMPAIGN,
+            "the bounded policy must preserve the historical successful campaign"
+        );
+        let frozen_residual = CANDIDATE_SHARE - HISTORICAL_CAMPAIGN;
+        assert!(
+            !historical.try_reserve(frozen_residual + 1, 4 * CANDIDATE_SHARE),
+            "a later topology proposal cannot expand the first frozen campaign share"
+        );
+    }
+
+    #[test]
+    fn request_tcp_capacity_path_share_is_cumulative_and_cannot_expand() {
+        let context = request_tcp_capacity_test_context(2);
+        let session_limit =
+            reliable_quic_capacity_calibration_session_limit_bytes(context.mux_limits);
+        let path_share = 8 * 1024 * 1024;
+        let half_share = path_share / 2;
+
+        let first = reserve_request_tcp_capacity_with_limit_for_test(
+            &context, 0, 31, half_share, path_share,
+        )
+        .expect("reserve first half of the path share");
+        assert!(first.commit());
+        drop(first);
+        assert_eq!(
+            context.request_tcp_capacity_probe_path_remaining_bytes(0, session_limit),
+            half_share,
+            "a larger later proposal must observe the frozen first share"
+        );
+
+        let later_flow_campaign = Arc::new(RequestCapacityProbeCampaignBudget::default());
+        let second = reserve_request_tcp_capacity_identity_with_campaign_for_test(
+            &context,
+            StreamId(71),
+            0,
+            201,
+            32,
+            half_share,
+            session_limit,
+            later_flow_campaign.clone(),
+        )
+        .expect("a later stream may spend the residual fixed share");
+        assert!(second.commit());
+        drop(second);
+        assert_eq!(
+            later_flow_campaign.remaining_bytes(session_limit),
+            half_share,
+            "a later flow must freeze to the session's authoritative candidate share"
+        );
+        assert_eq!(
+            context.request_tcp_capacity_probe_path_remaining_bytes(0, session_limit),
+            0
+        );
+        let rejected_flow_campaign = Arc::new(RequestCapacityProbeCampaignBudget::default());
+        assert!(
+            reserve_request_tcp_capacity_identity_with_campaign_for_test(
+                &context,
+                StreamId(72),
+                0,
+                202,
+                33,
+                PATH_OPEN_SCORE_BYTES as u64,
+                session_limit,
+                rejected_flow_campaign.clone(),
+            )
+            .is_none(),
+            "retries and path replacement cannot expand the frozen share"
+        );
+        assert_eq!(
+            rejected_flow_campaign.remaining_bytes(session_limit),
+            path_share,
+            "a path-budget rejection must refund the flow reservation exactly"
+        );
+
+        let other = reserve_request_tcp_capacity_with_limit_for_test(
+            &context,
+            1,
+            34,
+            path_share,
+            session_limit,
+        )
+        .expect("one exhausted path must not consume another path's share");
+        assert!(other.commit());
+        drop(other);
+        assert_eq!(
+            context.request_tcp_capacity_probe_remaining_bytes(),
+            session_limit - 2 * path_share
+        );
+    }
+
+    #[test]
+    fn request_quic_capacity_refund_and_replacement_preserve_frozen_share() {
+        let context = request_quic_capacity_test_context(1);
+        let session_limit =
+            reliable_quic_capacity_calibration_session_limit_bytes(context.mux_limits);
+        let path_share = 8 * 1024 * 1024;
+        let provisional_bytes = 1024 * 1024;
+        let now = Instant::now();
+        let campaign = Arc::new(RequestCapacityProbeCampaignBudget::default());
+        let provisional = context
+            .try_reserve_request_quic_capacity_probe(
+                StreamId(80),
+                0,
+                udp_path_instance(0, 300),
+                41,
+                provisional_bytes,
+                path_share,
+                campaign.clone(),
+                now,
+                now + Duration::from_secs(1),
+                Duration::from_secs(1),
+                QuicCapacityProbeCommandTicket::new(),
+            )
+            .expect("reserve provisional QUIC path spend");
+        assert_eq!(
+            campaign.remaining_bytes(path_share),
+            path_share - provisional_bytes
+        );
+        assert_eq!(
+            context.request_quic_capacity_probe_path_remaining_bytes(0, session_limit),
+            path_share - provisional_bytes
+        );
+        drop(provisional);
+        assert_eq!(
+            context.request_quic_capacity_probe_remaining_bytes(),
+            session_limit
+        );
+        assert_eq!(
+            context.request_quic_capacity_probe_path_remaining_bytes(0, session_limit),
+            path_share,
+            "uncommitted QUIC cleanup refunds both counters but not the frozen share"
+        );
+        assert_eq!(campaign.remaining_bytes(session_limit), path_share);
+
+        let mut replacement = context
+            .try_reserve_request_quic_capacity_probe(
+                StreamId(81),
+                0,
+                udp_path_instance(0, 301),
+                42,
+                path_share,
+                session_limit,
+                campaign.clone(),
+                now,
+                now + Duration::from_secs(1),
+                Duration::from_secs(1),
+                QuicCapacityProbeCommandTicket::new(),
+            )
+            .expect("a replacement may consume only the original path share");
+        replacement.commit();
+        drop(replacement);
+        assert_eq!(
+            context.request_quic_capacity_probe_path_remaining_bytes(0, session_limit),
+            0
+        );
+        assert_eq!(
+            campaign.remaining_bytes(session_limit),
+            0,
+            "committed QUIC carrier spend remains charged to its flow"
+        );
+        assert!(
+            context
+                .try_reserve_request_quic_capacity_probe(
+                    StreamId(82),
+                    0,
+                    udp_path_instance(0, 302),
+                    43,
+                    PATH_OPEN_SCORE_BYTES as u64,
+                    session_limit,
+                    campaign,
+                    now,
+                    now + Duration::from_secs(1),
+                    Duration::from_secs(1),
+                    QuicCapacityProbeCommandTicket::new(),
+                )
+                .is_none(),
+            "flapping replacement cannot reopen the candidate share"
+        );
+    }
+
+    #[test]
+    fn request_capacity_budgets_share_policy_but_not_protocol_spend() {
+        let paths = vec![
+            "tcp://127.0.0.1:12810"
+                .parse::<PathSpec>()
+                .expect("TCP path"),
+            "udp://127.0.0.1:12811"
+                .parse::<PathSpec>()
+                .expect("QUIC path"),
+        ];
+        let security = SecurityConfig::encrypted(
+            SharedSecret::new(b"0123456789abcdef0123456789abcdef".to_vec())
+                .expect("mixed capacity test secret"),
+        );
+        let context = ClientPathContext::new(paths, security, ResourceLimits::default())
+            .expect("mixed capacity test context");
+        let session_limit =
+            reliable_quic_capacity_calibration_session_limit_bytes(context.mux_limits);
+        let train_bytes = 1024 * 1024;
+        let path_share = 8 * 1024 * 1024;
+        let tcp_campaign = Arc::new(RequestCapacityProbeCampaignBudget::default());
+        let quic_campaign = RequestCapacityProbeCampaignBudget::default();
+
+        let tcp = reserve_request_tcp_capacity_identity_with_campaign_for_test(
+            &context,
+            StreamId(70),
+            0,
+            100,
+            51,
+            train_bytes,
+            path_share,
+            tcp_campaign.clone(),
+        )
+        .expect("reserve TCP carrier spend");
+        assert!(tcp.commit());
+        drop(tcp);
+
+        assert_eq!(
+            context.request_tcp_capacity_probe_remaining_bytes(),
+            session_limit - train_bytes
+        );
+        assert_eq!(
+            context.request_quic_capacity_probe_remaining_bytes(),
+            session_limit,
+            "TCP spend must not debit QUIC's native proof controller"
+        );
+        assert_eq!(
+            context.request_quic_capacity_probe_path_remaining_bytes(0, path_share),
+            path_share
+        );
+        assert_eq!(
+            tcp_campaign.remaining_bytes(path_share),
+            path_share - train_bytes
+        );
+        assert_eq!(
+            quic_campaign.remaining_bytes(path_share),
+            path_share,
+            "TCP flow spend must not debit a QUIC flow campaign"
+        );
+    }
+
+    #[test]
+    fn request_tcp_capacity_reservations_are_path_parallel_and_session_bounded() {
+        let context = request_tcp_capacity_test_context(3);
+        let session_limit =
+            reliable_quic_capacity_calibration_session_limit_bytes(context.mux_limits);
+        let first_bytes = session_limit / 2;
+        let second_bytes = session_limit - first_bytes;
+
+        let first = reserve_request_tcp_capacity_for_test(&context, 0, 1, first_bytes)
+            .expect("reserve first exact TCP path");
+        let remaining_after_first = context.request_tcp_capacity_probe_remaining_bytes();
+        assert_eq!(remaining_after_first, second_bytes);
+        assert!(
+            reserve_request_tcp_capacity_for_test(&context, 0, 2, PATH_OPEN_SCORE_BYTES as u64,)
+                .is_none(),
+            "one TCP path record must retain exact transaction ownership"
+        );
+        assert_eq!(
+            context.request_tcp_capacity_probe_remaining_bytes(),
+            remaining_after_first,
+            "same-path rejection must not spend the shared envelope"
+        );
+
+        let second = reserve_request_tcp_capacity_for_test(&context, 1, 3, second_bytes)
+            .expect("reserve a distinct TCP path concurrently");
+        assert_eq!(context.request_tcp_capacity_probe_remaining_bytes(), 0);
+        assert!(
+            reserve_request_tcp_capacity_for_test(&context, 2, 4, PATH_OPEN_SCORE_BYTES as u64,)
+                .is_none(),
+            "parallel reservations must not overbook the cumulative session envelope"
+        );
+        {
+            let health = context.health.lock().expect("client path health lock");
+            assert!(health.tcp[0].request_tcp_capacity_probe.is_some());
+            assert!(health.tcp[1].request_tcp_capacity_probe.is_some());
+            assert!(health.tcp[2].request_tcp_capacity_probe.is_none());
+        }
+
+        assert!(first.commit());
+        assert!(second.commit());
+        drop(first);
+        drop(second);
+        assert_eq!(
+            context.request_tcp_capacity_probe_remaining_bytes(),
+            0,
+            "committed carrier spend is cumulative and non-refilling"
+        );
+        let health = context.health.lock().expect("client path health lock");
+        assert!(
+            health
+                .tcp
+                .iter()
+                .all(|record| record.request_tcp_capacity_probe.is_none())
+        );
+    }
+
+    #[test]
+    fn request_tcp_capacity_unwritten_refund_is_terminal_and_path_local() {
+        let context = request_tcp_capacity_test_context(3);
+        let session_limit =
+            reliable_quic_capacity_calibration_session_limit_bytes(context.mux_limits);
+        let train_bytes = 1024 * 1024;
+        let before = context.request_tcp_capacity_probe_remaining_bytes();
+        assert_eq!(before, session_limit);
+        let campaign = Arc::new(RequestCapacityProbeCampaignBudget::default());
+
+        let reserve = |path_index, token| {
+            reserve_request_tcp_capacity_identity_with_campaign_for_test(
+                &context,
+                StreamId(70),
+                path_index,
+                100 + path_index as u64,
+                token,
+                train_bytes,
+                session_limit,
+                campaign.clone(),
+            )
+        };
+        let refund_before_commit = reserve(0, 11).expect("reserve refund-before-commit path");
+        let refund_before_commit_clone = refund_before_commit.clone();
+        let refund_after_commit = reserve(1, 12).expect("reserve refund-after-commit path");
+        let committed = reserve(2, 13).expect("reserve committed path");
+        assert_eq!(
+            context.request_tcp_capacity_probe_remaining_bytes(),
+            session_limit - 3 * train_bytes
+        );
+        assert_eq!(
+            campaign.remaining_bytes(session_limit),
+            session_limit - 3 * train_bytes
+        );
+        assert_eq!(
+            context.request_tcp_capacity_probe_path_remaining_bytes(0, session_limit),
+            session_limit - train_bytes
+        );
+
+        refund_before_commit.refund_if_unwritten();
+        assert!(
+            !refund_before_commit.commit(),
+            "planner commit must not overwrite an earlier no-wire decision"
+        );
+        drop(refund_before_commit);
+        assert_eq!(
+            context.request_tcp_capacity_probe_remaining_bytes(),
+            session_limit - 3 * train_bytes,
+            "one live lease clone retains exact transaction ownership"
+        );
+        drop(refund_before_commit_clone);
+        assert_eq!(
+            context.request_tcp_capacity_probe_remaining_bytes(),
+            session_limit - 2 * train_bytes
+        );
+        assert_eq!(
+            context.request_tcp_capacity_probe_path_remaining_bytes(0, session_limit),
+            session_limit,
+            "an unwritten refund restores both aggregate and path-local budget"
+        );
+        assert_eq!(
+            campaign.remaining_bytes(session_limit),
+            session_limit - 2 * train_bytes,
+            "the exact flow campaign refunds only after the last lease clone drops"
+        );
+
+        assert!(refund_after_commit.commit());
+        refund_after_commit.refund_if_unwritten();
+        assert!(
+            !refund_after_commit.commit(),
+            "a later planner call must not resurrect committed no-wire spend"
+        );
+        drop(refund_after_commit);
+        assert_eq!(
+            context.request_tcp_capacity_probe_remaining_bytes(),
+            session_limit - train_bytes
+        );
+        assert_eq!(
+            campaign.remaining_bytes(session_limit),
+            session_limit - train_bytes
+        );
+
+        assert!(committed.commit());
+        assert!(
+            committed.commit(),
+            "commit is idempotent before carrier write"
+        );
+        drop(committed);
+        assert_eq!(
+            context.request_tcp_capacity_probe_remaining_bytes(),
+            session_limit - train_bytes,
+            "written carrier spend remains charged after lease cleanup"
+        );
+        assert_eq!(
+            context.request_tcp_capacity_probe_path_remaining_bytes(2, session_limit),
+            session_limit - train_bytes
+        );
+        let health = context.health.lock().expect("client path health lock");
+        assert!(
+            health
+                .tcp
+                .iter()
+                .all(|record| record.request_tcp_capacity_probe.is_none())
+        );
+    }
+
+    fn request_tcp_proof_metrics(path_index: usize) -> PathMetrics {
+        PathMetrics {
+            path_id: PathId(path_index as u16),
+            underlay: UnderlayProtocol::Tcp,
+            direction: PathMetricDirection::ClientToServer,
+            metric_epoch: 1,
+            metric_age_us: 0,
+            min_rtt_us: 170_000,
+            srtt_us: 180_000,
+            rttvar_us: 10_000,
+            jitter_us: 10_000,
+            delivery_rate_bps: 1_000_000_000,
+            pacing_rate_bps: 2_000_000_000,
+            loss_ppm: 0,
+            ecn_ppm: 0,
+            loss_observed: false,
+            ecn_observed: false,
+            bytes_in_flight: 64 * 1024,
+            queue_bytes: 0,
+            inflight_limit_bytes: 512 * 1024,
+            inflight_hi_bytes: 512 * 1024,
+            confidence_ppm: 1_000_000,
+            app_limited: false,
+            has_ack_derived_data_sample: true,
+            data_sample_count: 1,
+            data_sample_bytes: 256 * 1024,
+        }
+    }
+
+    #[test]
+    fn tcp_transport_state_updates_native_rtt_without_rate_authority() {
+        let mut record = ClientPathHealthRecord::default();
+        let metrics = request_tcp_proof_metrics(2);
+
+        record.mark_tcp_transport_state(metrics);
+
+        assert_eq!(record.carrier_srtt_ms, Some(180.0));
+        assert_eq!(record.carrier_rttvar_ms, Some(10.0));
+        assert_eq!(record.carrier_bytes_in_flight, 64 * 1024);
+        assert_eq!(record.carrier_inflight_limit_bytes, 512 * 1024);
+        assert_eq!(record.carrier_delivery_rate_bps, None);
+        assert_eq!(record.carrier_delivery_samples, 0);
+        assert!(!record.carrier_ack_derived_data_seen);
+    }
+
+    #[test]
+    fn request_tcp_capacity_authority_expires_without_a_native_rate_prior() {
+        let accepted_at = Instant::now();
+        let expires_at = accepted_at + Duration::from_secs(2);
+        let stream_id = StreamId(70);
+        let path_index = 1;
+        let path_instance = tcp_path_instance(path_index, 16);
+        let train_bytes = 3 * 1024 * 1024;
+        let rate_sample_bytes = 256 * 1024;
+        let token = 40;
+        let mut record = ClientPathHealthRecord::default();
+        record.request_tcp_capacity_probe = Some(RequestTcpCapacityProbeReservation {
+            stream_id,
+            path_instance,
+            token,
+            valid_after: accepted_at,
+            expires_at,
+            train_bytes,
+            required_timed_bytes: rate_sample_bytes,
+            ticket: QuicCapacityProbeCommandTicket::new(),
+        });
+        let candidate = TcpCapacityProofCandidate {
+            token,
+            train_bytes,
+            received_bytes: train_bytes,
+            rate_sample_bytes,
+            proof_elapsed: Duration::from_millis(25),
+            receipt_rate_bps: 80_000_000,
+            rate_bps: 80_000_000,
+            accepted_at,
+            expires_at,
+        };
+
+        assert!(!record.accept_request_tcp_capacity_proof(
+            stream_id,
+            path_instance,
+            TcpCapacityProofCandidate {
+                rate_bps: candidate.rate_bps + 1,
+                ..candidate
+            },
+            request_tcp_proof_metrics(path_index),
+            accepted_at,
+        ));
+        assert!(record.accept_request_tcp_capacity_proof(
+            stream_id,
+            path_instance,
+            candidate,
+            request_tcp_proof_metrics(path_index),
+            accepted_at,
+        ));
+        let active = record.observe(expires_at - Duration::from_nanos(1));
+        assert!(active.explicit_carrier_capacity_proof);
+        assert_eq!(active.carrier_delivery_rate_bps, Some(80_000_000.0));
+        assert_eq!(active.carrier_delivery_sample_bytes, rate_sample_bytes);
+
+        let expired = record.observe(expires_at);
+        assert!(!expired.explicit_carrier_capacity_proof);
+        assert_eq!(expired.carrier_delivery_rate_bps, None);
+        assert_eq!(expired.carrier_delivery_sample_bytes, 0);
+        assert!(!expired.carrier_ack_derived_data_seen);
+    }
 
     fn proof_candidate(
         token: u64,
@@ -1160,6 +2231,20 @@ fn paths_have_sender_delivery_evidence(
 impl ClientPathHealthRecord {
     pub(super) fn observe(&mut self, now: Instant) -> ClientPathObservation {
         if self
+            .request_tcp_capacity_probe
+            .as_ref()
+            .is_some_and(|reservation| now >= reservation.expires_at)
+            && let Some(reservation) = self.request_tcp_capacity_probe.take()
+        {
+            reservation.ticket.cancel();
+        }
+        if self
+            .tcp_capacity_proof
+            .is_some_and(|proof| now >= proof.candidate.expires_at)
+        {
+            self.tcp_capacity_proof = None;
+        }
+        if self
             .request_quic_capacity_probe
             .as_ref()
             .is_some_and(|reservation| {
@@ -1222,17 +2307,28 @@ impl ClientPathHealthRecord {
             self.state = SchedulerPathState::Suspect;
             self.failed_until = None;
         }
-        let proof = self.quic_capacity_proof;
+        let tcp_proof = self.tcp_capacity_proof;
+        let quic_proof = self.quic_capacity_proof;
         let complete_handoff = self
             .request_quic_capacity_product_handoff
             .filter(|handoff| handoff.complete);
         // Once stream ACKs complete the handoff, prefer their product model
         // until a full native carrier window supplies a replacement estimate.
         let handoff_capacity_prior = complete_handoff.filter(|handoff| {
-            proof.is_none()
+            quic_proof.is_none()
                 && handoff.rate_prior_fresh(now)
                 && !self.has_durable_native_carrier_window()
         });
+        let proof_rate_bps = tcp_proof
+            .map(|proof| proof.candidate.rate_bps as f64)
+            .or_else(|| quic_proof.map(|proof| proof.rate_bps as f64));
+        let proof_sample_bytes = tcp_proof
+            .map(|proof| proof.candidate.rate_sample_bytes)
+            .or_else(|| quic_proof.map(|proof| proof.rate_sample_bytes));
+        let proof_accepted_at = tcp_proof
+            .map(|proof| proof.candidate.accepted_at)
+            .or_else(|| quic_proof.map(|proof| proof.candidate.accepted_at));
+        let explicit_carrier_capacity_proof = proof_rate_bps.is_some();
         ClientPathObservation {
             state: self.state,
             manual_disabled: false,
@@ -1252,35 +2348,34 @@ impl ClientPathHealthRecord {
             relay_queue_bytes: self.relay_queue_bytes,
             carrier_srtt_ms: self.carrier_srtt_ms,
             carrier_rttvar_ms: self.carrier_rttvar_ms,
-            carrier_delivery_rate_bps: proof
-                .map(|proof| proof.rate_bps as f64)
+            carrier_delivery_rate_bps: proof_rate_bps
                 .or_else(|| handoff_capacity_prior.map(|handoff| handoff.rate_bps as f64))
                 .or(self.carrier_delivery_rate_bps),
             carrier_bytes_in_flight: self.carrier_bytes_in_flight,
             carrier_queue_bytes: self.carrier_queue_bytes,
             carrier_inflight_limit_bytes: self.carrier_inflight_limit_bytes,
-            carrier_delivery_samples: if proof.is_some() || handoff_capacity_prior.is_some() {
+            carrier_delivery_samples: if explicit_carrier_capacity_proof
+                || handoff_capacity_prior.is_some()
+            {
                 self.carrier_delivery_samples.max(1)
             } else {
                 self.carrier_delivery_samples
             },
-            carrier_delivery_sample_bytes: proof
-                .map(|proof| proof.rate_sample_bytes)
+            carrier_delivery_sample_bytes: proof_sample_bytes
                 .or_else(|| handoff_capacity_prior.map(|handoff| handoff.rate_sample_bytes))
                 .map_or(self.carrier_delivery_sample_bytes, |sample_bytes| {
                     self.carrier_delivery_sample_bytes.max(sample_bytes)
                 }),
-            carrier_last_delivery_at: proof
-                .map(|proof| proof.candidate.accepted_at)
+            carrier_last_delivery_at: proof_accepted_at
                 .or_else(|| handoff_capacity_prior.map(|handoff| handoff.accepted_at))
                 .or(self.carrier_last_delivery_at),
-            carrier_app_limited: proof.is_none()
+            carrier_app_limited: !explicit_carrier_capacity_proof
                 && handoff_capacity_prior.is_none()
                 && self.carrier_app_limited,
-            carrier_ack_derived_data_seen: proof.is_some()
+            carrier_ack_derived_data_seen: explicit_carrier_capacity_proof
                 || handoff_capacity_prior.is_some()
                 || self.carrier_ack_derived_data_seen,
-            explicit_carrier_capacity_proof: proof.is_some(),
+            explicit_carrier_capacity_proof,
             quic_capacity_product_handoff_complete: complete_handoff.is_some(),
             quic_capacity_rate_prior_fresh: handoff_capacity_prior.is_some(),
             path_proof_success: self.path_proof_success,
@@ -1515,6 +2610,10 @@ impl ClientPathHealthRecord {
         self.carrier_last_delivery_at = None;
         self.carrier_app_limited = true;
         self.carrier_ack_derived_data_seen = false;
+        if let Some(reservation) = self.request_tcp_capacity_probe.take() {
+            reservation.ticket.cancel();
+        }
+        self.tcp_capacity_proof = None;
         if let Some(reservation) = self.request_quic_capacity_probe.take() {
             reservation.ticket.cancel();
         }
@@ -1668,19 +2767,197 @@ pub(super) fn path_join_replay_cache_capacity(max_streams: usize) -> usize {
 }
 
 impl ClientPathContext {
-    pub(super) fn configured_relay_path_count(&self, underlay: UnderlayProtocol) -> usize {
-        match underlay {
-            UnderlayProtocol::Tcp => self.tcp_paths.len(),
-            UnderlayProtocol::Udp => self.udp_paths.len(),
+    pub(super) fn relay_path_allows_automatic_bulk_use(&self, key: RelayPathKey) -> bool {
+        match key.underlay {
+            UnderlayProtocol::Tcp => self.tcp_paths.get(key.index),
+            UnderlayProtocol::Udp => self.udp_paths.get(key.index),
         }
+        .is_some_and(path_allows_automatic_bulk_use)
+    }
+
+    pub(super) fn automatic_bulk_path_count(
+        &self,
+        underlay: UnderlayProtocol,
+        service_index: Option<usize>,
+    ) -> usize {
+        let paths = match underlay {
+            UnderlayProtocol::Tcp => &self.tcp_paths,
+            UnderlayProtocol::Udp => &self.udp_paths,
+        };
+        paths
+            .iter()
+            .enumerate()
+            .filter(|(index, path)| {
+                Some(*index) != service_index && path_allows_automatic_bulk_use(path)
+            })
+            .count()
     }
 
     pub(super) fn request_quic_capacity_probe_remaining_bytes(&self) -> u64 {
-        reliable_quic_capacity_calibration_session_limit_bytes(self.mux_limits).saturating_sub(
-            self.request_quic_capacity_probe
-                .spent_bytes
-                .load(Ordering::Acquire),
+        self.request_quic_capacity_probe.budget.remaining_bytes(
+            reliable_quic_capacity_calibration_session_limit_bytes(self.mux_limits),
         )
+    }
+
+    pub(super) fn request_tcp_capacity_probe_remaining_bytes(&self) -> u64 {
+        self.request_tcp_capacity_probe.budget.remaining_bytes(
+            reliable_quic_capacity_calibration_session_limit_bytes(self.mux_limits),
+        )
+    }
+
+    pub(super) fn request_quic_capacity_probe_candidate_share_bytes(
+        &self,
+        proposed_path_limit: u64,
+    ) -> u64 {
+        self.request_quic_capacity_probe
+            .budget
+            .effective_candidate_share_bytes(
+                proposed_path_limit,
+                reliable_quic_capacity_calibration_session_limit_bytes(self.mux_limits),
+            )
+    }
+
+    pub(super) fn request_tcp_capacity_probe_candidate_share_bytes(
+        &self,
+        proposed_path_limit: u64,
+    ) -> u64 {
+        self.request_tcp_capacity_probe
+            .budget
+            .effective_candidate_share_bytes(
+                proposed_path_limit,
+                reliable_quic_capacity_calibration_session_limit_bytes(self.mux_limits),
+            )
+    }
+
+    pub(super) fn request_quic_capacity_probe_path_remaining_bytes(
+        &self,
+        path_index: usize,
+        path_limit: u64,
+    ) -> u64 {
+        self.request_quic_capacity_probe
+            .budget
+            .path_remaining_bytes(
+                path_index,
+                path_limit,
+                reliable_quic_capacity_calibration_session_limit_bytes(self.mux_limits),
+            )
+    }
+
+    pub(super) fn request_tcp_capacity_probe_path_remaining_bytes(
+        &self,
+        path_index: usize,
+        path_limit: u64,
+    ) -> u64 {
+        self.request_tcp_capacity_probe.budget.path_remaining_bytes(
+            path_index,
+            path_limit,
+            reliable_quic_capacity_calibration_session_limit_bytes(self.mux_limits),
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(super) fn try_reserve_request_tcp_capacity_probe(
+        &self,
+        stream_id: StreamId,
+        path_index: usize,
+        path_instance: RelayPathInstance,
+        token: u64,
+        train_bytes: u64,
+        path_limit_bytes: u64,
+        campaign: Arc<RequestCapacityProbeCampaignBudget>,
+        required_timed_bytes: u64,
+        valid_after: Instant,
+        expires_at: Instant,
+        ticket: QuicCapacityProbeCommandTicket,
+    ) -> Option<RequestTcpCapacityProbeLease> {
+        let now = Instant::now();
+        if path_instance.key.underlay != UnderlayProtocol::Tcp
+            || path_instance.key.index != path_index
+            || token == 0
+            || train_bytes < PATH_OPEN_SCORE_BYTES as u64
+            || required_timed_bytes < PATH_OPEN_SCORE_BYTES as u64
+            || required_timed_bytes > train_bytes
+            || expires_at <= now
+        {
+            return None;
+        }
+        let mut health = self.health.lock().expect("client path health lock");
+        let Some(record) = health.tcp.get_mut(path_index) else {
+            return None;
+        };
+        let _ = record.observe(now);
+        // Offset-free trains on distinct TCP sockets have independent carrier
+        // ordering. The health record remains the exact per-path transaction
+        // owner while the session counter bounds their cumulative byte cost.
+        if record.request_tcp_capacity_probe.is_some() || record.tcp_capacity_proof.is_some() {
+            return None;
+        }
+        let session_limit = reliable_quic_capacity_calibration_session_limit_bytes(self.mux_limits);
+        let campaign_limit = self
+            .request_tcp_capacity_probe
+            .budget
+            .effective_candidate_share_bytes(path_limit_bytes, session_limit);
+        if !campaign.try_reserve(train_bytes, campaign_limit) {
+            return None;
+        }
+        if !self.request_tcp_capacity_probe.budget.try_reserve(
+            path_index,
+            train_bytes,
+            path_limit_bytes,
+            session_limit,
+        ) {
+            campaign.refund(train_bytes);
+            return None;
+        }
+        record.request_tcp_capacity_probe = Some(RequestTcpCapacityProbeReservation {
+            stream_id,
+            path_instance,
+            token,
+            valid_after,
+            expires_at,
+            train_bytes,
+            required_timed_bytes,
+            ticket: ticket.clone(),
+        });
+        drop(health);
+        Some(RequestTcpCapacityProbeLease {
+            state: Arc::new(RequestTcpCapacityProbeLeaseState {
+                session: self.request_tcp_capacity_probe.clone(),
+                campaign,
+                health: self.health.clone(),
+                path_index,
+                token,
+                bytes: train_bytes,
+                spend_state: AtomicU8::new(RequestTcpCapacityProbeSpendState::Reserved as u8),
+                ticket,
+            }),
+        })
+    }
+
+    pub(super) fn request_tcp_capacity_probe_proof(
+        &self,
+        stream_id: StreamId,
+        path_index: usize,
+        path_instance: RelayPathInstance,
+        token: u64,
+    ) -> Option<TcpCapacityProofCandidate> {
+        let now = Instant::now();
+        self.health
+            .lock()
+            .expect("client path health lock")
+            .tcp
+            .get_mut(path_index)
+            .and_then(|record| {
+                let _ = record.observe(now);
+                record
+                    .tcp_capacity_proof
+                    .filter(|proof| {
+                        proof.stream_id == stream_id
+                            && proof.path_instance == path_instance
+                            && proof.candidate.token == token
+                    })
+                    .map(|proof| proof.candidate)
+            })
     }
 
     pub(super) fn try_reserve_request_quic_capacity_probe(
@@ -1690,6 +2967,8 @@ impl ClientPathContext {
         path_instance: RelayPathInstance,
         token: u64,
         train_bytes: u64,
+        path_limit_bytes: u64,
+        campaign: Arc<RequestCapacityProbeCampaignBudget>,
         valid_after: Instant,
         expires_at: Instant,
         proof_validity: Duration,
@@ -1746,15 +3025,25 @@ impl ClientPathContext {
         {
             return None;
         }
-        let limit = reliable_quic_capacity_calibration_session_limit_bytes(self.mux_limits);
-        if self
+        let session_limit = reliable_quic_capacity_calibration_session_limit_bytes(self.mux_limits);
+        let campaign_limit = self
             .request_quic_capacity_probe
-            .spent_bytes
-            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |spent| {
-                spent.checked_add(train_bytes).filter(|next| *next <= limit)
-            })
-            .is_err()
-        {
+            .budget
+            .effective_candidate_share_bytes(path_limit_bytes, session_limit);
+        if !campaign.try_reserve(train_bytes, campaign_limit) {
+            let _ = self
+                .request_quic_capacity_probe
+                .active_token
+                .compare_exchange(token, 0, Ordering::AcqRel, Ordering::Acquire);
+            return None;
+        }
+        if !self.request_quic_capacity_probe.budget.try_reserve(
+            path_index,
+            train_bytes,
+            path_limit_bytes,
+            session_limit,
+        ) {
+            campaign.refund(train_bytes);
             let _ = self
                 .request_quic_capacity_probe
                 .active_token
@@ -1763,8 +3052,9 @@ impl ClientPathContext {
         }
         let Some(record) = health.udp.get_mut(path_index) else {
             self.request_quic_capacity_probe
-                .spent_bytes
-                .fetch_sub(train_bytes, Ordering::AcqRel);
+                .budget
+                .refund(path_index, train_bytes);
+            campaign.refund(train_bytes);
             let _ = self
                 .request_quic_capacity_probe
                 .active_token
@@ -1773,8 +3063,9 @@ impl ClientPathContext {
         };
         if record.request_quic_capacity_probe.is_some() {
             self.request_quic_capacity_probe
-                .spent_bytes
-                .fetch_sub(train_bytes, Ordering::AcqRel);
+                .budget
+                .refund(path_index, train_bytes);
+            campaign.refund(train_bytes);
             let _ = self
                 .request_quic_capacity_probe
                 .active_token
@@ -1794,6 +3085,7 @@ impl ClientPathContext {
         drop(health);
         Some(RequestQuicCapacityProbeLease {
             session: self.request_quic_capacity_probe.clone(),
+            campaign,
             health: self.health.clone(),
             path_index,
             token,
@@ -1966,6 +3258,10 @@ impl ClientPathContext {
                 })
             })
             .collect::<Vec<_>>();
+        let request_quic_capacity_probe =
+            Arc::new(RequestQuicCapacityProbeSession::new(udp_paths.len()));
+        let request_tcp_capacity_probe =
+            Arc::new(RequestTcpCapacityProbeSession::new(tcp_paths.len()));
         #[cfg(not(test))]
         let _ = proxy_auth;
         Ok(Self {
@@ -1980,7 +3276,8 @@ impl ClientPathContext {
             udp_sessions: Arc::new(udp_sessions),
             next_reliable_stream_id: Arc::new(Mutex::new(0)),
             active_tcp_service_request_bulk_flows: Arc::new(AtomicU32::new(0)),
-            request_quic_capacity_probe: Arc::new(RequestQuicCapacityProbeSession::default()),
+            request_quic_capacity_probe,
+            request_tcp_capacity_probe,
             health,
             codec_limits,
             mux_limits,

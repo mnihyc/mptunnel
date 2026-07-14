@@ -209,6 +209,10 @@ impl ReliablePathStream {
         matches!(self.output, ReliablePathStreamOutput::Switchable(_))
     }
 
+    pub(super) async fn send_detach(&self) {
+        self.output.send_stream_detach(self.stream_id).await;
+    }
+
     pub(super) async fn close(&self) {
         self.output.close_stream(self.stream_id).await;
     }
@@ -253,6 +257,26 @@ impl ReliablePathStreamHandle {
             }
             ReliablePathStreamOutput::Switchable(_) => Err(RuntimeError::Protocol(
                 "request QUIC capacity probe requires a fixed client output",
+            )),
+        }
+    }
+
+    pub(super) fn try_enqueue_request_tcp_capacity_probe(
+        &self,
+        request: RequestTcpCapacityProbeRequest,
+        lease: RequestTcpCapacityProbeLease,
+    ) -> Result<(), RuntimeError> {
+        if self.underlay != UnderlayProtocol::Tcp {
+            return Err(RuntimeError::Protocol(
+                "request TCP capacity probe requires a TCP output",
+            ));
+        }
+        match &self.output {
+            ReliablePathStreamOutput::Fixed(fixed) => fixed
+                .commands()
+                .try_enqueue_request_tcp_capacity_probe(request, lease),
+            ReliablePathStreamOutput::Switchable(_) => Err(RuntimeError::Protocol(
+                "request TCP capacity probe requires a fixed client output",
             )),
         }
     }

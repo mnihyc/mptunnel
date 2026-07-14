@@ -207,6 +207,56 @@ class TcpSinkTests(unittest.TestCase):
             self.assertTrue(final["connections"]["0"]["final"])
             self.assertEqual(request.responses, [b"ACK 3\n", b"OK 8\n"])
 
+    def test_progress_file_tracks_longest_target_receive_gap(self):
+        with tempfile.TemporaryDirectory() as directory:
+            progress_file = Path(directory) / "sink-progress.json"
+            server = ThreadingTcpServer(
+                ("127.0.0.1", 0),
+                SinkHandler,
+                progress_file=str(progress_file),
+                snapshot_interval_seconds=60.0,
+            )
+            try:
+                connection = server.allocate_connection()
+                with mock.patch(
+                    "tcp_sink.time.monotonic", side_effect=[1.0, 1.25, 1.40]
+                ):
+                    server.record_progress(connection, 10, final=False)
+                    server.record_progress(connection, 20, final=False)
+                    server.record_progress(connection, 30, final=False)
+                self.assertTrue(server.flush_progress())
+                observed = read_snapshot(progress_file)["connections"]["0"]
+            finally:
+                server.server_close()
+
+        self.assertEqual(observed["max_receive_gap_ns"], 250_000_000)
+        self.assertEqual(observed["max_receive_gap_start_bytes"], 10)
+        self.assertEqual(observed["max_receive_gap_end_bytes"], 20)
+
+    def test_merged_receive_gap_orders_events_across_connections(self):
+        with tempfile.TemporaryDirectory() as directory:
+            server = ThreadingTcpServer(
+                ("127.0.0.1", 0),
+                SinkHandler,
+                progress_file=str(Path(directory) / "sink-progress.json"),
+                snapshot_interval_seconds=60.0,
+            )
+            try:
+                first = server.allocate_connection()
+                second = server.allocate_connection()
+                server.record_progress(first, 10, final=False, received_at=1.0)
+                server.record_progress(second, 20, final=False, received_at=1.1)
+                server.record_progress(first, 30, final=False, received_at=1.4)
+                observed = server._merged_receive_gap_data()
+            finally:
+                server.server_close()
+
+        self.assertEqual(observed["merged_max_receive_gap_ns"], 300_000_000)
+        self.assertEqual(observed["merged_max_receive_gap_start_connection_id"], 1)
+        self.assertEqual(observed["merged_max_receive_gap_start_bytes"], 20)
+        self.assertEqual(observed["merged_max_receive_gap_end_connection_id"], 0)
+        self.assertEqual(observed["merged_max_receive_gap_end_bytes"], 30)
+
     def test_background_snapshot_flushes_dirty_progress_on_cadence(self):
         with tempfile.TemporaryDirectory() as directory:
             progress_file = Path(directory) / "sink-progress.json"

@@ -217,6 +217,7 @@ def enrich_upload_target_observer(
     connections_with_delivery = 0
     normalized_ids = set()
     connection_summaries = []
+    target_max_receive_gap_ns = None
     for raw_connection_id, raw_connection in connections.items():
         try:
             connection_id = int(raw_connection_id)
@@ -248,6 +249,31 @@ def enrich_upload_target_observer(
         }
         if connection_updated_at is not None:
             connection_summary["updated_wall_time_ns"] = connection_updated_at
+        if "max_receive_gap_ns" in raw_connection:
+            max_receive_gap_ns = _strict_nonnegative_integer(
+                raw_connection.get("max_receive_gap_ns"),
+                "target sink observer maximum receive gap",
+            )
+            max_receive_gap_start_bytes = _strict_nonnegative_integer(
+                raw_connection.get("max_receive_gap_start_bytes"),
+                "target sink observer maximum receive gap start",
+            )
+            max_receive_gap_end_bytes = _strict_nonnegative_integer(
+                raw_connection.get("max_receive_gap_end_bytes"),
+                "target sink observer maximum receive gap end",
+            )
+            if max_receive_gap_start_bytes > max_receive_gap_end_bytes:
+                raise ValueError("target sink observer maximum receive gap is invalid")
+            connection_summary.update(
+                {
+                    "max_receive_gap_s": round(max_receive_gap_ns / 1_000_000_000, 6),
+                    "max_receive_gap_start_bytes": max_receive_gap_start_bytes,
+                    "max_receive_gap_end_bytes": max_receive_gap_end_bytes,
+                }
+            )
+            target_max_receive_gap_ns = max(
+                target_max_receive_gap_ns or 0, max_receive_gap_ns
+            )
         connection_summaries.append(connection_summary)
 
     local_accepted_bytes = _strict_nonnegative_integer(
@@ -340,6 +366,37 @@ def enrich_upload_target_observer(
         )
     if snapshot_updated_at is not None:
         updates["target_observer_updated_wall_time_ns"] = snapshot_updated_at
+    if target_max_receive_gap_ns is not None:
+        updates["target_observer_max_receive_gap_s"] = round(
+            target_max_receive_gap_ns / 1_000_000_000, 6
+        )
+    if "merged_max_receive_gap_ns" in parsed:
+        merged_gap_ns = _strict_nonnegative_integer(
+            parsed.get("merged_max_receive_gap_ns"),
+            "target sink observer merged maximum receive gap",
+        )
+        merged_fields = {
+            "target_observer_merged_max_receive_gap_start_connection_id": (
+                "merged_max_receive_gap_start_connection_id"
+            ),
+            "target_observer_merged_max_receive_gap_start_bytes": (
+                "merged_max_receive_gap_start_bytes"
+            ),
+            "target_observer_merged_max_receive_gap_end_connection_id": (
+                "merged_max_receive_gap_end_connection_id"
+            ),
+            "target_observer_merged_max_receive_gap_end_bytes": (
+                "merged_max_receive_gap_end_bytes"
+            ),
+        }
+        updates["target_observer_merged_max_receive_gap_s"] = round(
+            merged_gap_ns / 1_000_000_000, 6
+        )
+        for output_field, snapshot_field in merged_fields.items():
+            updates[output_field] = _strict_nonnegative_integer(
+                parsed.get(snapshot_field),
+                f"target sink observer {snapshot_field}",
+            )
     row.update(updates)
 
 

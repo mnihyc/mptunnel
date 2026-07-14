@@ -120,6 +120,7 @@ async fn concurrent_tcp_latency_opens_share_one_authenticated_carrier() {
     let listener = bind_listener(&path).await.expect("bind");
     let server = tokio::spawn(async move {
         let (mut framed, path_id, _) = accept_authenticated_test_tcp_path(&listener).await?;
+        tokio::time::sleep(Duration::from_millis(100)).await;
         let mut opened = HashSet::new();
         for index in 0..2 {
             match framed.read_frame().await? {
@@ -166,26 +167,30 @@ async fn concurrent_tcp_latency_opens_share_one_authenticated_carrier() {
             udp: Vec::new(),
         })),
     });
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(3);
-    let first = handle.open_stream(
+    let now = tokio::time::Instant::now();
+    let deadlines = ClientTcpOpenDeadlines {
+        live: now + Duration::from_millis(20),
+        setup: now + Duration::from_secs(3),
+    };
+    let first = handle.open_stream_with_deadlines(
         StreamId(71),
         TargetAddr::Ip(SocketAddr::from(([127, 0, 0, 1], 80))),
         IngressKind::HttpConnect,
         FlowLane::Latency,
         StreamOpenRole::Active,
-        deadline,
+        deadlines,
     );
-    let second = handle.open_stream(
+    let second = handle.open_stream_with_deadlines(
         StreamId(72),
         TargetAddr::Ip(SocketAddr::from(([127, 0, 0, 1], 81))),
         IngressKind::HttpConnect,
         FlowLane::Latency,
         StreamOpenRole::Active,
-        deadline,
+        deadlines,
     );
     let (first, second) = tokio::join!(first, second);
-    drop(first.expect("first stream"));
-    drop(second.expect("second stream"));
+    drop(first.expect("first stream").stream);
+    drop(second.expect("second stream").stream);
     server.await.expect("server task").expect("server path");
 }
 
@@ -306,10 +311,127 @@ async fn canceling_pending_tcp_stream_keeps_shared_carrier_sibling_live() -> Res
 }
 
 #[tokio::test]
-async fn canceled_tcp_open_queues_detach_and_local_close() {
+async fn duplicate_pending_tcp_open_preserves_the_first_wire_owner() -> Result<(), RuntimeError> {
+    let path = reserve_tcp_path().await;
+    let listener = bind_listener(&path).await.expect("bind");
+    let (first_open_tx, first_open_rx) = oneshot::channel();
+    let (inspect_wire_tx, inspect_wire_rx) = oneshot::channel();
+    let (owner_live_tx, owner_live_rx) = oneshot::channel();
+    let server = tokio::spawn(async move {
+        let (mut framed, _, _) = accept_authenticated_test_tcp_path(&listener).await?;
+        assert!(matches!(
+            framed.read_frame().await?,
+            Frame::PathMetrics { .. }
+        ));
+        match framed.read_frame().await? {
+            Frame::OpenStream {
+                stream_id: StreamId(83),
+                role: StreamOpenRole::Validation,
+                ..
+            } => {}
+            other => panic!("expected the validation OPEN_STREAM, got {other:?}"),
+        }
+        let _ = first_open_tx.send(());
+        inspect_wire_rx.await.expect("inspect wire signal");
+
+        assert!(
+            tokio::time::timeout(Duration::from_millis(50), framed.read_frame())
+                .await
+                .is_err(),
+            "a duplicate local open must emit neither OPEN_STREAM nor STREAM_DETACH"
+        );
+        framed
+            .write_frames(&[
+                Frame::StreamMaxData {
+                    stream_id: StreamId(83),
+                    max_offset: ResourceLimits::default().max_stream_window_bytes,
+                },
+                Frame::StreamData {
+                    stream_id: StreamId(83),
+                    offset: 0,
+                    flags: StreamFlags::NONE,
+                    payload: Bytes::from_static(b"first-owner-live"),
+                },
+            ])
+            .await?;
+        framed.flush().await?;
+        owner_live_rx.await.expect("original owner progress signal");
+        Ok::<(), RuntimeError>(())
+    });
+
+    let handle = ClientTcpPathSessionHandle::new(ClientTcpPathSessionRuntime {
+        path,
+        path_index: 0,
+        session_id: SessionId(47),
+        security: security(),
+        codec_limits: CodecLimits::default(),
+        mux_limits: MuxLimits::default(),
+        command_queue: 4,
+        stream_frame_queue: 4,
+        closed_stream_cache_capacity: 8,
+        health: Arc::new(Mutex::new(ClientPathHealth {
+            tcp: vec![ClientPathHealthRecord::default()],
+            udp: Vec::new(),
+        })),
+    });
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(3);
+    let first_handle = handle.clone();
+    let first = tokio::spawn(async move {
+        first_handle
+            .open_stream(
+                StreamId(83),
+                TargetAddr::Ip(SocketAddr::from(([127, 0, 0, 1], 80))),
+                IngressKind::HttpConnect,
+                FlowLane::Throughput,
+                StreamOpenRole::Validation,
+                deadline,
+            )
+            .await
+    });
+    first_open_rx
+        .await
+        .expect("server observed validation open");
+    let duplicate = handle
+        .open_stream(
+            StreamId(83),
+            TargetAddr::Ip(SocketAddr::from(([127, 0, 0, 1], 80))),
+            IngressKind::HttpConnect,
+            FlowLane::Throughput,
+            StreamOpenRole::Repair,
+            deadline,
+        )
+        .await;
+    assert!(matches!(duplicate, Err(RuntimeError::SenderServiceBlocked)));
+    let _ = inspect_wire_tx.send(());
+
+    let mut original = first
+        .await
+        .expect("validation task")
+        .expect("validation open");
+    assert!(matches!(
+        tokio::time::timeout(Duration::from_secs(1), original.recv_frame())
+            .await
+            .expect("original owner progress deadline")?,
+        Frame::StreamData {
+            stream_id: StreamId(83),
+            payload,
+            ..
+        } if payload == Bytes::from_static(b"first-owner-live")
+    ));
+    let _ = owner_live_tx.send(());
+    original.close().await;
+    server.await.expect("server task").expect("server path");
+    Ok(())
+}
+
+#[tokio::test]
+async fn canceled_tcp_open_queues_generation_scoped_cancellation() {
     let stream_id = StreamId(91);
+    let attempt_id = ClientTcpOpenAttemptId(17);
     let (commands, mut receivers) = reliable_path_command_channels(4);
-    drop(ClientTcpOpenCancellation::new(commands, stream_id));
+    drop(ClientTcpOpenCancellation::new(
+        commands, stream_id, attempt_id,
+    ));
 
     assert!(matches!(
         tokio::time::timeout(
@@ -318,17 +440,39 @@ async fn canceled_tcp_open_queues_detach_and_local_close() {
         )
         .await
         .expect("detach command deadline"),
-        Some(ReliablePathCommand::SendFrame(Frame::StreamDetach { stream_id: id })) if id == stream_id
+        Some(ReliablePathCommand::CancelTcpOpen {
+            stream_id: id,
+            attempt_id: id_attempt,
+        }) if id == stream_id && id_attempt == attempt_id
     ));
-    assert!(matches!(
-        tokio::time::timeout(
-            Duration::from_secs(1),
-            recv_reliable_path_command(&mut receivers),
-        )
-        .await
-        .expect("close command deadline"),
-        Some(ReliablePathCommand::CloseStream(id)) if id == stream_id
-    ));
+}
+
+#[test]
+fn stale_tcp_open_cancellation_cannot_remove_current_generation() {
+    let stream_id = StreamId(92);
+    let current_attempt = ClientTcpOpenAttemptId(23);
+    let (frames, _frame_rx) = mpsc::channel(1);
+    let mut streams = HashMap::from([(
+        stream_id,
+        ClientTcpPathStreamState {
+            open_attempt_id: current_attempt,
+            frames,
+            pending_open: None,
+            local_close_pending: false,
+        },
+    )]);
+
+    assert!(
+        remove_matching_client_tcp_open(&mut streams, stream_id, ClientTcpOpenAttemptId(22),)
+            .is_none()
+    );
+    assert_eq!(
+        streams.get(&stream_id).map(|state| state.open_attempt_id),
+        Some(current_attempt),
+        "cleanup from an older opener must preserve the current stream owner"
+    );
+    assert!(remove_matching_client_tcp_open(&mut streams, stream_id, current_attempt).is_some());
+    assert!(!streams.contains_key(&stream_id));
 }
 
 #[tokio::test]
@@ -354,6 +498,55 @@ async fn dropped_accepted_stream_guard_queues_detach_and_local_close() {
         )
         .await
         .expect("close command deadline"),
+        Some(ReliablePathCommand::CloseStream(id)) if id == stream_id
+    ));
+}
+
+#[tokio::test]
+async fn rejected_opened_stream_detaches_peer_before_local_close() {
+    let stream_id = StreamId(93);
+    let (opened, mut receivers, _frames) =
+        opened_relay_stream_for_test(stream_id, UnderlayProtocol::Udp, 0);
+    opened.close().await;
+
+    assert!(matches!(
+        recv_reliable_path_command(&mut receivers).await,
+        Some(ReliablePathCommand::SendFrame(Frame::StreamDetach { stream_id: id })) if id == stream_id
+    ));
+    assert!(matches!(
+        recv_reliable_path_command(&mut receivers).await,
+        Some(ReliablePathCommand::CloseStream(id)) if id == stream_id
+    ));
+}
+
+#[tokio::test]
+async fn duplicate_remote_set_attach_releases_the_uncommitted_stream() {
+    let stream_id = StreamId(94);
+    let (first, _first_receivers, _first_frames) =
+        opened_relay_stream_for_test(stream_id, UnderlayProtocol::Udp, 0);
+    let mut remotes = ReliableRelayRemoteSet::new(first, 4);
+    let (duplicate, mut duplicate_receivers, _duplicate_frames) =
+        opened_relay_stream_for_test(stream_id, UnderlayProtocol::Udp, 0);
+
+    remotes.attach_for_validation(duplicate);
+
+    assert_eq!(remotes.path_keys().len(), 1);
+    assert!(matches!(
+        tokio::time::timeout(
+            Duration::from_secs(1),
+            recv_reliable_path_command(&mut duplicate_receivers),
+        )
+        .await
+        .expect("duplicate detach deadline"),
+        Some(ReliablePathCommand::SendFrame(Frame::StreamDetach { stream_id: id })) if id == stream_id
+    ));
+    assert!(matches!(
+        tokio::time::timeout(
+            Duration::from_secs(1),
+            recv_reliable_path_command(&mut duplicate_receivers),
+        )
+        .await
+        .expect("duplicate close deadline"),
         Some(ReliablePathCommand::CloseStream(id)) if id == stream_id
     ));
 }
@@ -553,12 +746,28 @@ async fn tcp_lane_session_expires_pending_accept_and_sends_detach() {
             .expect("write path ready");
         framed.flush().await.expect("flush path ready");
         assert!(matches!(
-            framed.read_frame().await.expect("path metrics"),
+            framed.read_frame().await.expect("first path metrics"),
             Frame::PathMetrics { .. }
         ));
-        let stream_id = match framed.read_frame().await.expect("open stream") {
+        let first_stream_id = match framed.read_frame().await.expect("first open stream") {
             Frame::OpenStream { stream_id, .. } => stream_id,
             other => panic!("expected OPEN_STREAM, got {other:?}"),
+        };
+        framed
+            .write_frame(&Frame::StreamMaxData {
+                stream_id: first_stream_id,
+                max_offset: ResourceLimits::default().max_stream_window_bytes,
+            })
+            .await
+            .expect("accept first stream");
+        framed.flush().await.expect("flush first acceptance");
+        assert!(matches!(
+            framed.read_frame().await.expect("second path metrics"),
+            Frame::PathMetrics { .. }
+        ));
+        let second_stream_id = match framed.read_frame().await.expect("second open stream") {
+            Frame::OpenStream { stream_id, .. } => stream_id,
+            other => panic!("expected second OPEN_STREAM, got {other:?}"),
         };
         match tokio::time::timeout(Duration::from_secs(1), framed.read_frame())
             .await
@@ -567,9 +776,19 @@ async fn tcp_lane_session_expires_pending_accept_and_sends_detach() {
         {
             Frame::StreamDetach {
                 stream_id: detached,
-            } => assert_eq!(detached, stream_id),
+            } => assert_eq!(detached, second_stream_id),
             other => panic!("expected STREAM_DETACH, got {other:?}"),
         }
+        framed
+            .write_frame(&Frame::StreamData {
+                stream_id: first_stream_id,
+                offset: 0,
+                flags: StreamFlags::NONE,
+                payload: Bytes::from_static(b"live-after-open-timeout"),
+            })
+            .await
+            .expect("write sibling data");
+        framed.flush().await.expect("flush sibling data");
     });
     let handle = ClientTcpPathSessionHandle::new(ClientTcpPathSessionRuntime {
         path,
@@ -587,21 +806,169 @@ async fn tcp_lane_session_expires_pending_accept_and_sends_detach() {
         })),
     });
 
-    let result = handle
+    let mut first = handle
         .open_stream(
             StreamId(3),
             TargetAddr::Ip(SocketAddr::from(([127, 0, 0, 1], 82))),
             IngressKind::HttpConnect,
             FlowLane::Latency,
             StreamOpenRole::Active,
-            tokio::time::Instant::now() + Duration::from_millis(100),
+            tokio::time::Instant::now() + Duration::from_secs(2),
+        )
+        .await
+        .expect("first stream accepted");
+    assert_ne!(handle.carrier_generation(FlowLane::Latency), 0);
+    assert_eq!(
+        handle.carrier_generation(FlowLane::Throughput),
+        0,
+        "an authenticated latency carrier must not warm the throughput lane class"
+    );
+    let started_at = Instant::now();
+    let result = handle
+        .open_stream_with_deadlines(
+            StreamId(4),
+            TargetAddr::Ip(SocketAddr::from(([127, 0, 0, 1], 83))),
+            IngressKind::HttpConnect,
+            FlowLane::Latency,
+            StreamOpenRole::Validation,
+            ClientTcpOpenDeadlines::from_timeouts(
+                tokio::time::Instant::now(),
+                Duration::from_millis(100),
+                Duration::from_secs(2),
+            ),
         )
         .await;
     assert!(matches!(result, Err(RuntimeError::PathOpenTimedOut)));
+    assert!(
+        started_at.elapsed() < Duration::from_secs(1),
+        "a same-generation live open must not borrow the cold setup budget"
+    );
+    assert!(matches!(
+        tokio::time::timeout(Duration::from_secs(1), first.recv_frame())
+            .await
+            .expect("sibling progress deadline")
+            .expect("sibling frame"),
+        Frame::StreamData { payload, .. }
+            if payload == Bytes::from_static(b"live-after-open-timeout")
+    ));
+    first.close().await;
     tokio::time::timeout(Duration::from_secs(1), server)
         .await
         .expect("server saw detach")
         .expect("server task");
+}
+
+#[tokio::test]
+async fn tcp_carrier_reconnect_publishes_a_new_generation_and_uses_setup_deadline() {
+    let path = reserve_tcp_path().await;
+    let listener = bind_listener(&path).await.expect("bind");
+    let (close_first_tx, close_first_rx) = oneshot::channel();
+    let (finish_second_tx, finish_second_rx) = oneshot::channel();
+    let server = tokio::spawn(async move {
+        let (mut first, _, _) = accept_authenticated_test_tcp_path(&listener).await?;
+        assert!(matches!(
+            first.read_frame().await?,
+            Frame::PathMetrics { .. }
+        ));
+        let first_stream_id = match first.read_frame().await? {
+            Frame::OpenStream { stream_id, .. } => stream_id,
+            other => panic!("expected first OPEN_STREAM, got {other:?}"),
+        };
+        first
+            .write_frame(&Frame::StreamMaxData {
+                stream_id: first_stream_id,
+                max_offset: ResourceLimits::default().max_stream_window_bytes,
+            })
+            .await?;
+        first.flush().await?;
+        close_first_rx.await.expect("close first carrier signal");
+        drop(first);
+
+        let (mut second, _, _) = accept_authenticated_test_tcp_path(&listener).await?;
+        assert!(matches!(
+            second.read_frame().await?,
+            Frame::PathMetrics { .. }
+        ));
+        let second_stream_id = match second.read_frame().await? {
+            Frame::OpenStream { stream_id, .. } => stream_id,
+            other => panic!("expected second OPEN_STREAM, got {other:?}"),
+        };
+        tokio::time::sleep(Duration::from_millis(150)).await;
+        second
+            .write_frame(&Frame::StreamMaxData {
+                stream_id: second_stream_id,
+                max_offset: ResourceLimits::default().max_stream_window_bytes,
+            })
+            .await?;
+        second.flush().await?;
+        finish_second_rx
+            .await
+            .expect("finish second carrier signal");
+        Ok::<(), RuntimeError>(())
+    });
+
+    let handle = ClientTcpPathSessionHandle::new(ClientTcpPathSessionRuntime {
+        path,
+        path_index: 0,
+        session_id: SessionId(48),
+        security: security(),
+        codec_limits: CodecLimits::default(),
+        mux_limits: MuxLimits::default(),
+        command_queue: 4,
+        stream_frame_queue: 4,
+        closed_stream_cache_capacity: 8,
+        health: Arc::new(Mutex::new(ClientPathHealth {
+            tcp: vec![ClientPathHealthRecord::default()],
+            udp: Vec::new(),
+        })),
+    });
+    let first = handle
+        .open_stream(
+            StreamId(5),
+            TargetAddr::Ip(SocketAddr::from(([127, 0, 0, 1], 84))),
+            IngressKind::HttpConnect,
+            FlowLane::Throughput,
+            StreamOpenRole::Active,
+            tokio::time::Instant::now() + Duration::from_secs(2),
+        )
+        .await
+        .expect("first stream accepted");
+    let first_generation = handle.carrier_generation(FlowLane::Throughput);
+    assert_ne!(first_generation, 0);
+    close_first_tx.send(()).expect("close first carrier");
+    tokio::time::timeout(Duration::from_secs(1), async {
+        while handle.carrier_generation(FlowLane::Throughput) != 0 {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("carrier disconnect publication");
+
+    let started_at = Instant::now();
+    let second = handle
+        .open_stream_with_deadlines(
+            StreamId(6),
+            TargetAddr::Ip(SocketAddr::from(([127, 0, 0, 1], 85))),
+            IngressKind::HttpConnect,
+            FlowLane::Throughput,
+            StreamOpenRole::Repair,
+            ClientTcpOpenDeadlines::from_timeouts(
+                tokio::time::Instant::now(),
+                Duration::from_millis(20),
+                Duration::from_secs(2),
+            ),
+        )
+        .await
+        .expect("reconnect open uses setup deadline");
+    assert!(started_at.elapsed() >= Duration::from_millis(100));
+    let second_generation = handle.carrier_generation(FlowLane::Throughput);
+    assert_ne!(second_generation, 0);
+    assert_ne!(second_generation, first_generation);
+
+    drop(first);
+    drop(second.stream);
+    finish_second_tx.send(()).expect("finish second carrier");
+    server.await.expect("server task").expect("server path");
 }
 
 #[tokio::test]
@@ -1393,6 +1760,7 @@ async fn client_tcp_path_ignores_late_frames_for_recently_closed_stream() {
     streams.insert(
         stream_id,
         ClientTcpPathStreamState {
+            open_attempt_id: ClientTcpOpenAttemptId(1),
             frames: frames_tx,
             pending_open: None,
             local_close_pending: false,
@@ -1451,6 +1819,7 @@ async fn client_tcp_path_local_close_keeps_inflight_receive_route() {
     streams.insert(
         stream_id,
         ClientTcpPathStreamState {
+            open_attempt_id: ClientTcpOpenAttemptId(2),
             frames: frames_tx,
             pending_open: None,
             local_close_pending: true,
@@ -2019,7 +2388,7 @@ fn data_plane_failure_requires_probe_success_before_bulk_readmission() {
 }
 
 #[test]
-fn tcp_attach_open_timeout_uses_active_data_plane_budget() {
+fn tcp_attach_open_timeouts_separate_live_and_cold_carrier_phases() {
     let low_latency_path = "tcp://127.0.0.1:10130?srtt-ms=20&rate-mbps=100"
         .parse::<PathSpec>()
         .expect("low latency path");
@@ -2033,28 +2402,36 @@ fn tcp_attach_open_timeout_uses_active_data_plane_budget() {
     )
     .expect("context");
 
-    assert_eq!(
-        reliable_relay_attach_open_timeout(
-            &context,
-            RelayPathKey {
-                underlay: UnderlayProtocol::Tcp,
-                index: 0,
-            },
-            FlowLane::Latency,
-        ),
-        transport_pto_from_snapshot(context.tcp_path_snapshot(0))
-    );
-    assert_eq!(
-        reliable_relay_attach_open_timeout(
-            &context,
-            RelayPathKey {
-                underlay: UnderlayProtocol::Tcp,
-                index: 1,
-            },
-            FlowLane::Throughput,
-        ),
-        transport_pto_from_snapshot(context.tcp_path_snapshot(1))
-    );
+    for (index, lane) in [(0, FlowLane::Latency), (1, FlowLane::Throughput)] {
+        let key = RelayPathKey {
+            underlay: UnderlayProtocol::Tcp,
+            index,
+        };
+        let snapshot = context.tcp_path_snapshot(index);
+        let timeouts = reliable_relay_attach_open_timeouts(&context, key, lane);
+        assert_eq!(timeouts.live, transport_pto_from_snapshot(snapshot));
+        assert_eq!(
+            timeouts.setup,
+            path_open_pto(snapshot, false)
+                .saturating_mul(active_path_open_serialized_exchanges(snapshot)),
+            "a cold TCP lane owns carrier dial, authenticated join, and product acceptance"
+        );
+        assert!(timeouts.setup > timeouts.live);
+    }
+}
+
+#[test]
+fn tcp_open_deadline_selection_is_carrier_generation_scoped() {
+    let now = tokio::time::Instant::now();
+    let deadlines = ClientTcpOpenDeadlines {
+        live: now + Duration::from_millis(20),
+        setup: now + Duration::from_secs(1),
+    };
+
+    assert_eq!(deadlines.for_carrier_generation(7, 7), deadlines.live);
+    assert_eq!(deadlines.for_carrier_generation(0, 7), deadlines.setup);
+    assert_eq!(deadlines.for_carrier_generation(7, 0), deadlines.setup);
+    assert_eq!(deadlines.for_carrier_generation(7, 8), deadlines.setup);
 }
 
 #[test]
@@ -3419,6 +3796,7 @@ async fn client_sender_slices_large_upload_reads_to_service_quantum() {
             &mut send_stream,
             &mut sender_queue,
             true,
+            &HashSet::new(),
             quantum,
         )
         .await
@@ -3469,6 +3847,7 @@ fn tcp_write_interlock_routes_ready_feedback_and_stops_at_backpressure() {
     let mut streams = HashMap::from([(
         stream_id,
         ClientTcpPathStreamState {
+            open_attempt_id: ClientTcpOpenAttemptId(3),
             frames,
             pending_open: None,
             local_close_pending: false,
@@ -3905,6 +4284,7 @@ async fn latency_live_owner_request_tail_repair_uses_distinct_repair_path() {
             &mut send_stream,
             &mut sender_queue,
             true,
+            &HashSet::new(),
             64,
         )
         .await
@@ -4337,6 +4717,7 @@ async fn active_teardown_promotes_sole_repair_before_failed_owner_repair() {
             &mut send_stream,
             &mut sender_queue,
             true,
+            &HashSet::new(),
             64,
         )
         .await

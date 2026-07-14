@@ -1807,6 +1807,11 @@ async fn drain_client_udp_stream_commands(
                     "client QUIC UDP path stream received open command",
                 ));
             }
+            ReliablePathCommand::CancelTcpOpen { .. } => {
+                return Err(RuntimeError::Protocol(
+                    "client QUIC UDP path stream received TCP open cancellation",
+                ));
+            }
         };
         commands.release_pending_command_bytes(pending_bytes);
         if should_close {
@@ -3272,6 +3277,11 @@ async fn drain_server_udp_reliable_commands(
                     "server QUIC UDP path stream received client open command",
                 ));
             }
+            ReliablePathCommand::CancelTcpOpen { .. } => {
+                return Err(RuntimeError::Protocol(
+                    "server QUIC UDP path stream received TCP open cancellation",
+                ));
+            }
         };
         commands.release_pending_command_bytes(pending_bytes);
         if should_close {
@@ -3578,6 +3588,11 @@ async fn drain_server_udp_datagram_commands(
             ReliablePathCommand::OpenStream { .. } => {
                 return Err(RuntimeError::Protocol(
                     "server QUIC UDP path datagram stream received open command",
+                ));
+            }
+            ReliablePathCommand::CancelTcpOpen { .. } => {
+                return Err(RuntimeError::Protocol(
+                    "server QUIC UDP datagram stream received TCP open cancellation",
                 ));
             }
         };

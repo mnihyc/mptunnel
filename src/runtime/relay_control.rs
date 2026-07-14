@@ -194,6 +194,63 @@ impl ReliableRelayRequestOutstandingWindow {
         self.growth_epoch_at = now;
         self.acked_in_epoch = 0;
     }
+
+    fn record_tcp_ack_clock_turnover(
+        &mut self,
+        turnover_bytes: usize,
+        service_instance: Option<RelayPathInstance>,
+        lane: FlowLane,
+        mux_limits: MuxLimits,
+    ) {
+        let Some(service_instance) = service_instance else {
+            return;
+        };
+        if service_instance.key.underlay != UnderlayProtocol::Tcp
+            || self.service_epoch_instance != Some(service_instance)
+            || !lane.is_bulk()
+        {
+            return;
+        }
+        let resource_ceiling = reliable_relay_request_outstanding_resource_ceiling(mux_limits);
+        if self.product_limit_bytes == 0 || self.product_limit_bytes >= resource_ceiling {
+            return;
+        }
+        let durable_product_floor =
+            usize::try_from(reliable_subflow_startup_sample_limit_bytes(mux_limits))
+                .unwrap_or(usize::MAX)
+                .min(self.product_limit_bytes);
+        let next_limit = reliable_relay_request_tcp_product_limit_for_turnover(
+            self.product_limit_bytes,
+            turnover_bytes,
+            durable_product_floor,
+            resource_ceiling,
+        );
+        if next_limit > self.product_limit_bytes {
+            // TCP uses freshness-bounded per-owner pipe samples. The shared
+            // product window only quantizes their aggregate into bounded
+            // stages; calibration and lifecycle code own path authority.
+            self.product_limit_bytes = next_limit;
+            self.growth_epoch_at = Instant::now();
+            self.acked_in_epoch = 0;
+        }
+    }
+}
+
+fn reliable_relay_request_tcp_product_limit_for_turnover(
+    current_limit: usize,
+    turnover_bytes: usize,
+    durable_product_floor: usize,
+    resource_ceiling: usize,
+) -> usize {
+    let mut limit = current_limit.max(1).min(resource_ceiling.max(1));
+    while limit < resource_ceiling {
+        let threshold = limit.div_ceil(2).max(durable_product_floor).max(1);
+        if turnover_bytes < threshold {
+            break;
+        }
+        limit = limit.saturating_mul(2).min(resource_ceiling).max(1);
+    }
+    limit
 }
 
 fn reliable_relay_request_outstanding_headroom_bytes(
@@ -480,6 +537,7 @@ where
                 &send_stream,
                 !local_open,
                 ReliableRelayAttachMode::BulkStriping,
+                &pending_validation_opens,
             )
             .await
             {
@@ -686,6 +744,7 @@ where
                     !local_open,
                     ReliableRelayAttachMode::RecoveryRepair,
                     &mut recovery_excluded_paths,
+                    &pending_validation_opens,
                 )
                 .await
                 {
@@ -746,6 +805,7 @@ where
                                     !local_open,
                                     ReliableRelayAttachMode::RecoveryRepair,
                                     &mut recovery_excluded_paths,
+                                    &pending_validation_opens,
                                 )
                                 .await
                                 {
@@ -870,6 +930,7 @@ where
                         !local_open,
                         ReliableRelayAttachMode::RecoveryRepair,
                         &mut recovery_excluded_paths,
+                        &pending_validation_opens,
                     )
                     .await
                     {
@@ -1000,6 +1061,7 @@ where
                             !local_open,
                             ReliableRelayAttachMode::Any,
                             &mut recovery_excluded_paths,
+                            &pending_validation_opens,
                         )
                         .await
                         {
@@ -1083,6 +1145,7 @@ where
                             !local_open,
                             ReliableRelayAttachMode::Any,
                             &mut recovery_excluded_paths,
+                            &pending_validation_opens,
                         )
                         .await
                         {
@@ -1128,6 +1191,7 @@ where
                             true,
                             ReliableRelayAttachMode::Any,
                             &mut recovery_excluded_paths,
+                            &pending_validation_opens,
                         )
                         .await
                         {
@@ -1182,6 +1246,7 @@ where
                             true,
                             ReliableRelayAttachMode::Any,
                             &mut recovery_excluded_paths,
+                            &pending_validation_opens,
                         )
                         .await
                         {
@@ -1203,6 +1268,10 @@ where
                 let mut dispatched_payload_bytes = 0usize;
                 let mut blocked_by_carrier = false;
                 let mut dispatch_error = None;
+                let inflight_path_claims = pending_validation_opens
+                    .keys()
+                    .copied()
+                    .collect::<HashSet<_>>();
                 while !sender_queue.is_empty()
                     && dispatched_items < sender_dispatch_item_budget
                     && (dispatched_payload_bytes < sender_dispatch_byte_budget
@@ -1218,6 +1287,7 @@ where
                             &mut send_stream,
                             &mut sender_queue,
                             local_open,
+                            &inflight_path_claims,
                             reliable_relay_client_dispatch_payload_limit(
                                 adaptive_chunk,
                                 sender_dispatch_byte_budget
@@ -1440,6 +1510,7 @@ where
                             !local_open,
                             ReliableRelayAttachMode::Any,
                             &mut recovery_excluded_paths,
+                            &pending_validation_opens,
                         )
                         .await
                         {
@@ -1537,6 +1608,7 @@ where
                                 !local_open,
                                 ReliableRelayAttachMode::Any,
                                 &mut recovery_excluded_paths,
+                                &pending_validation_opens,
                             )
                             .await
                             {
@@ -1803,6 +1875,7 @@ where
                                     !local_open,
                                     ReliableRelayAttachMode::Any,
                                     &mut recovery_excluded_paths,
+                                    &pending_validation_opens,
                                 )
                             .await
                             {
@@ -1878,23 +1951,47 @@ where
                                     .filter(|service| remotes.contains_path_instance(*service)),
                                 remotes.active_path_instance(),
                             );
-                        let growth_interval = service_instance
+                        let udp_growth_interval = service_instance
+                            .filter(|service| service.key.underlay == UnderlayProtocol::Udp)
                             .map(|service| {
                                 reliable_relay_request_ack_growth_interval(service, context)
-                            })
-                            .unwrap_or_else(|| transport_pto_from_snapshot(None));
+                            });
+                        let mut tcp_owner_progress = false;
                         for progress in owner_progress {
-                            request_outstanding_window.record_acked(
-                                progress.bytes,
-                                progress.instance,
+                            let owner_capable = sender.request_owner_ack_can_grow_window(
+                                &remotes,
                                 service_instance,
-                                sender.request_owner_ack_can_grow_window(
-                                    &remotes,
-                                    service_instance,
+                                progress.instance,
+                            );
+                            if service_instance.is_some_and(|service| {
+                                service.key.underlay == UnderlayProtocol::Tcp
+                            }) {
+                                tcp_owner_progress |= owner_capable;
+                            } else {
+                                // QUIC keeps product-ACK turnover separate from
+                                // its native packet ACK and congestion model.
+                                request_outstanding_window.record_acked(
+                                    progress.bytes,
                                     progress.instance,
-                                ),
+                                    service_instance,
+                                    owner_capable,
+                                    relay_lane,
+                                    udp_growth_interval
+                                        .unwrap_or_else(|| transport_pto_from_snapshot(None)),
+                                    context.mux_limits,
+                                );
+                            }
+                        }
+                        if tcp_owner_progress {
+                            let turnover_bytes = sender.request_tcp_owner_ack_turnover_bytes(
+                                &remotes,
+                                service_instance,
+                                Instant::now(),
+                            );
+                            request_outstanding_window.record_tcp_ack_clock_turnover(
+                                turnover_bytes,
+                                service_instance,
                                 relay_lane,
-                                growth_interval,
                                 context.mux_limits,
                             );
                         }
@@ -2093,6 +2190,7 @@ where
                                         true,
                                         ReliableRelayAttachMode::Any,
                                         &mut recovery_excluded_paths,
+                                        &pending_validation_opens,
                                     )
                                     .await
                                     {
@@ -2266,9 +2364,9 @@ where
             context.mark_relay_path_delivery(key.underlay, key.index, stats);
         }
     }
-    if result.is_ok() {
-        remotes.close_all().await;
-    }
+    // Success and failure both end logical stream ownership. Leaving sibling
+    // carrier entries installed after one-path failure poisons later reuse.
+    remotes.close_all().await;
     #[cfg(feature = "lab-diagnostics")]
     lab_diagnostic(
         "client_relay_result",
@@ -2349,7 +2447,7 @@ pub(super) async fn recover_reliable_relay_after_path_failure(
     Ok(Some(repair_queued))
 }
 
-pub(super) async fn switch_reliable_relay_to_best_path(
+async fn switch_reliable_relay_to_best_path(
     context: &ClientPathContext,
     spec: &ReliableRelayOpenSpec,
     lane: FlowLane,
@@ -2357,10 +2455,23 @@ pub(super) async fn switch_reliable_relay_to_best_path(
     send_stream: &ReliableSendStream,
     resend_fin: bool,
     mode: ReliableRelayAttachMode,
+    pending_validation_opens: &HashMap<RelayPathKey, RelayValidationOpenTask>,
 ) -> Result<bool, RuntimeError> {
-    let attached =
-        attach_reliable_relay_paths(context, spec, lane, remotes, send_stream, resend_fin, mode)
-            .await?;
+    let inflight_path_claims = pending_validation_opens
+        .keys()
+        .copied()
+        .collect::<HashSet<_>>();
+    let attached = attach_reliable_relay_paths(
+        context,
+        spec,
+        lane,
+        remotes,
+        send_stream,
+        resend_fin,
+        mode,
+        &inflight_path_claims,
+    )
+    .await?;
     if attached == 0 {
         return Ok(false);
     }
@@ -2492,7 +2603,7 @@ async fn handle_validation_open_result(
             } else {
                 #[cfg(feature = "lab-diagnostics")]
                 let lane = opened.stream.lane;
-                opened.stream.close().await;
+                opened.close().await;
                 #[cfg(feature = "lab-diagnostics")]
                 lab_diagnostic(
                     "relay_validation_open_duplicate_closed",
@@ -2554,7 +2665,7 @@ async fn drain_completed_validation_opens(
     while let Ok(validation_open) = validation_open_rx.try_recv() {
         if pending.remove(&validation_open.key).is_none() {
             if let Ok(opened) = validation_open.result {
-                opened.stream.close().await;
+                opened.close().await;
             }
             continue;
         }
@@ -2648,12 +2759,16 @@ fn spawn_reliable_relay_validation_opens(
         let ingress = spec.ingress;
         let result_tx = result_tx.clone();
         let handle = tokio::spawn(async move {
-            let open_timeout = reliable_relay_attach_open_timeout(&context, key, lane);
+            let open_timeouts = reliable_relay_attach_open_timeouts(&context, key, lane);
             let result = match key.underlay {
                 UnderlayProtocol::Tcp => {
-                    let open_deadline = tokio::time::Instant::now() + open_timeout;
+                    let open_deadlines = ClientTcpOpenDeadlines::from_timeouts(
+                        tokio::time::Instant::now(),
+                        open_timeouts.live,
+                        open_timeouts.setup,
+                    );
                     let result = relay_path_open_with_timeout(
-                        open_timeout,
+                        open_timeouts.setup,
                         open_remote_stream_on_reserved_path(
                             &context,
                             stream_id,
@@ -2662,7 +2777,7 @@ fn spawn_reliable_relay_validation_opens(
                             lane,
                             key.index,
                             StreamOpenRole::Validation,
-                            open_deadline,
+                            open_deadlines,
                         ),
                     )
                     .await;
@@ -2670,7 +2785,7 @@ fn spawn_reliable_relay_validation_opens(
                 }
                 UnderlayProtocol::Udp => {
                     relay_path_open_with_timeout(
-                        open_timeout,
+                        open_timeouts.setup,
                         open_remote_stream_on_reserved_udp_path(
                             &context,
                             stream_id,
@@ -2695,7 +2810,7 @@ fn spawn_reliable_relay_validation_opens(
                 if let Ok(opened) = result {
                     #[cfg(feature = "lab-diagnostics")]
                     let lane = opened.stream.lane;
-                    opened.stream.close().await;
+                    opened.close().await;
                     #[cfg(feature = "lab-diagnostics")]
                     lab_diagnostic(
                         "relay_validation_open_orphan_closed",
@@ -2841,9 +2956,13 @@ async fn attach_relay_path_candidates(
         .await
         {
             Ok(opened) => {
+                let OpenedRemoteStream { stream, path_index } = opened;
+                // Attach-control emission is fallible. Keep cleanup armed until
+                // the accepted stream is committed into the remote set.
+                let accepted = AcceptedRemoteStreamGuard::new(stream);
                 let attach_control_result = if request.send_attach_control {
                     send_sender_service_attach_control_frames(
-                        &opened.stream,
+                        accepted.stream(),
                         request.send_stream,
                         request.resend_fin,
                     )
@@ -2853,6 +2972,10 @@ async fn attach_relay_path_candidates(
                 };
                 match attach_control_result {
                     Ok(()) => {
+                        let opened = OpenedRemoteStream {
+                            stream: accepted.commit(),
+                            path_index,
+                        };
                         if request.role != StreamOpenRole::Active {
                             // Path choice temporarily reserves a share while the
                             // open is in flight. Passive attachments keep only
@@ -2960,9 +3083,10 @@ pub(super) async fn attach_reliable_relay_paths(
     send_stream: &ReliableSendStream,
     resend_fin: bool,
     mode: ReliableRelayAttachMode,
+    inflight_path_claims: &HashSet<RelayPathKey>,
 ) -> Result<usize, RuntimeError> {
     let mut recovery_excluded_paths = HashSet::<RelayPathKey>::new();
-    attach_reliable_relay_paths_with_recovery_exclusions(
+    attach_reliable_relay_paths_with_claims_and_recovery_exclusions(
         context,
         spec,
         lane,
@@ -2971,6 +3095,7 @@ pub(super) async fn attach_reliable_relay_paths(
         resend_fin,
         mode,
         &mut recovery_excluded_paths,
+        inflight_path_claims,
     )
     .await
 }
@@ -2984,6 +3109,39 @@ async fn attach_reliable_relay_paths_with_recovery_exclusions(
     resend_fin: bool,
     mode: ReliableRelayAttachMode,
     recovery_excluded_paths: &mut HashSet<RelayPathKey>,
+    pending_validation_opens: &HashMap<RelayPathKey, RelayValidationOpenTask>,
+) -> Result<usize, RuntimeError> {
+    // Validation already owns logical (stream, path) membership. Synchronous
+    // recovery must not race that claim through either TCP or QUIC carriers.
+    let inflight_path_claims = pending_validation_opens
+        .keys()
+        .copied()
+        .collect::<HashSet<_>>();
+    attach_reliable_relay_paths_with_claims_and_recovery_exclusions(
+        context,
+        spec,
+        lane,
+        remotes,
+        send_stream,
+        resend_fin,
+        mode,
+        recovery_excluded_paths,
+        &inflight_path_claims,
+    )
+    .await
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn attach_reliable_relay_paths_with_claims_and_recovery_exclusions(
+    context: &ClientPathContext,
+    spec: &ReliableRelayOpenSpec,
+    lane: FlowLane,
+    remotes: &mut ReliableRelayRemoteSet,
+    send_stream: &ReliableSendStream,
+    resend_fin: bool,
+    mode: ReliableRelayAttachMode,
+    recovery_excluded_paths: &mut HashSet<RelayPathKey>,
+    inflight_path_claims: &HashSet<RelayPathKey>,
 ) -> Result<usize, RuntimeError> {
     let payload_bytes = match mode {
         ReliableRelayAttachMode::Any | ReliableRelayAttachMode::RecoveryRepair => {
@@ -3002,7 +3160,10 @@ async fn attach_reliable_relay_paths_with_recovery_exclusions(
                 lane,
                 send_stream,
                 resend_fin,
-                candidates: context.ordered_reliable_bulk_striping_path_keys(payload_bytes),
+                candidates: reliable_relay_exclude_inflight_open_claims(
+                    context.ordered_reliable_bulk_striping_path_keys(payload_bytes),
+                    &inflight_path_claims,
+                ),
                 role: StreamOpenRole::Validation,
                 send_attach_control: false,
             },
@@ -3030,10 +3191,18 @@ async fn attach_reliable_relay_paths_with_recovery_exclusions(
                 lane,
                 send_stream,
                 resend_fin,
-                candidates: reliable_relay_recovery_attach_candidates(
-                    reliable_relay_repair_path_candidates(context, remotes, lane, payload_bytes),
-                    recovery_excluded_paths,
-                    remotes.is_empty(),
+                candidates: reliable_relay_exclude_inflight_open_claims(
+                    reliable_relay_recovery_attach_candidates(
+                        reliable_relay_repair_path_candidates(
+                            context,
+                            remotes,
+                            lane,
+                            payload_bytes,
+                        ),
+                        recovery_excluded_paths,
+                        remotes.is_empty(),
+                    ),
+                    &inflight_path_claims,
                 ),
                 role,
                 send_attach_control: true,
@@ -3055,10 +3224,13 @@ async fn attach_reliable_relay_paths_with_recovery_exclusions(
             lane,
             send_stream,
             resend_fin,
-            candidates: reliable_relay_recovery_attach_candidates(
-                reliable_relay_active_path_candidates(context, remotes, lane, payload_bytes),
-                recovery_excluded_paths,
-                remotes.is_empty(),
+            candidates: reliable_relay_exclude_inflight_open_claims(
+                reliable_relay_recovery_attach_candidates(
+                    reliable_relay_active_path_candidates(context, remotes, lane, payload_bytes),
+                    recovery_excluded_paths,
+                    remotes.is_empty(),
+                ),
+                &inflight_path_claims,
             ),
             role,
             send_attach_control: true,
@@ -3117,6 +3289,16 @@ fn reliable_relay_recovery_attach_candidates(
     } else {
         filtered
     }
+}
+
+fn reliable_relay_exclude_inflight_open_claims(
+    candidates: Vec<RelayPathKey>,
+    inflight_path_claims: &HashSet<RelayPathKey>,
+) -> Vec<RelayPathKey> {
+    candidates
+        .into_iter()
+        .filter(|candidate| !inflight_path_claims.contains(candidate))
+        .collect()
 }
 
 pub(super) fn reliable_relay_repair_path_candidates(
@@ -3525,8 +3707,6 @@ mod tests {
         );
         assert_eq!(startup, reliable_relay_buffer_len(mux_limits));
 
-        let path = PathSnapshot::new(PathId(3), UnderlayProtocol::Tcp, 100.0, 160_000_000.0);
-        let growth_interval = transport_pto_from_snapshot(Some(path));
         let promoted_at = now + Duration::from_millis(1);
         assert_eq!(
             window.limit_bytes_at(
@@ -3538,45 +3718,27 @@ mod tests {
             ),
             4 * 1024 * 1024
         );
-        window.record_acked_at(
+        window.record_tcp_ack_clock_turnover(
             2 * 1024 * 1024,
-            tcp,
             Some(tcp),
-            true,
             FlowLane::Throughput,
-            growth_interval,
             mux_limits,
-            promoted_at + Duration::from_millis(50),
         );
         assert_eq!(window.product_limit_bytes, 8 * 1024 * 1024);
 
         let expired_at = promoted_at + Duration::from_secs(1);
-        window.record_acked_at(
+        window.growth_epoch_at = promoted_at;
+        window.record_tcp_ack_clock_turnover(
             4 * 1024 * 1024,
-            tcp,
             Some(tcp),
-            true,
             FlowLane::Throughput,
-            growth_interval,
             mux_limits,
-            expired_at,
         );
         assert_eq!(
             window.product_limit_bytes,
-            8 * 1024 * 1024,
-            "slow release must not expand the request window"
+            16 * 1024 * 1024,
+            "exact per-owner ACK-clock turnover must not depend on relay callback timing"
         );
-        window.record_acked_at(
-            4 * 1024 * 1024,
-            tcp,
-            Some(tcp),
-            true,
-            FlowLane::Throughput,
-            growth_interval,
-            mux_limits,
-            expired_at + Duration::from_millis(50),
-        );
-        assert_eq!(window.product_limit_bytes, 16 * 1024 * 1024);
         assert_eq!(
             window.limit_bytes_at(
                 Some(tcp),
@@ -3598,6 +3760,73 @@ mod tests {
             ),
             4 * 1024 * 1024,
             "promotion starts from the bounded Service reservoir, not the old bulk allowance"
+        );
+    }
+
+    #[test]
+    fn tcp_request_outstanding_turnover_preserves_threshold_carryover() {
+        let mux_limits = MuxLimits::default();
+        let now = Instant::now();
+        let tcp = request_test_path_instance(UnderlayProtocol::Tcp, 0, 1);
+        let mut coalesced = ReliableRelayRequestOutstandingWindow::new_at(now);
+        assert_eq!(
+            coalesced.limit_bytes_at(Some(tcp), FlowLane::Throughput, 64 * 1024, mux_limits, now,),
+            4 * 1024 * 1024
+        );
+
+        coalesced.record_tcp_ack_clock_turnover(
+            4 * 1024 * 1024,
+            Some(tcp),
+            FlowLane::Throughput,
+            mux_limits,
+        );
+        assert_eq!(
+            coalesced.product_limit_bytes,
+            16 * 1024 * 1024,
+            "one modeled aggregate must cross every satisfied doubling threshold"
+        );
+
+        let mut poor = ReliableRelayRequestOutstandingWindow::new_at(now);
+        poor.limit_bytes_at(Some(tcp), FlowLane::Throughput, 64 * 1024, mux_limits, now);
+        poor.record_tcp_ack_clock_turnover(
+            2 * 1024 * 1024 - 1,
+            Some(tcp),
+            FlowLane::Throughput,
+            mux_limits,
+        );
+        assert_eq!(
+            poor.product_limit_bytes,
+            4 * 1024 * 1024,
+            "a slow modeled pipe below half-window turnover stays at the memory floor"
+        );
+    }
+
+    #[test]
+    fn tcp_request_turnover_quantization_has_exact_stage_boundaries() {
+        let mib = 1024 * 1024;
+        let current = 4 * mib;
+        let floor = 2 * mib;
+        let ceiling = 64 * mib;
+        assert_eq!(
+            reliable_relay_request_tcp_product_limit_for_turnover(
+                current,
+                2 * mib - 1,
+                floor,
+                ceiling,
+            ),
+            4 * mib
+        );
+        assert_eq!(
+            reliable_relay_request_tcp_product_limit_for_turnover(current, 2 * mib, floor, ceiling,),
+            8 * mib
+        );
+        assert_eq!(
+            reliable_relay_request_tcp_product_limit_for_turnover(current, 4 * mib, floor, ceiling,),
+            16 * mib
+        );
+        assert_eq!(
+            reliable_relay_request_tcp_product_limit_for_turnover(current, 8 * mib, floor, ceiling,),
+            32 * mib
         );
     }
 
@@ -4278,6 +4507,88 @@ mod tests {
             vec![tcp0],
             "a failed path remains retryable only as a last-resort route when no survivor is attached"
         );
+    }
+
+    #[test]
+    fn inflight_open_claim_stays_hard_after_soft_recovery_fallback() {
+        let claimed = RelayPathKey {
+            underlay: UnderlayProtocol::Tcp,
+            index: 1,
+        };
+        let unclaimed = RelayPathKey {
+            underlay: UnderlayProtocol::Udp,
+            index: 2,
+        };
+        let soft_excluded = HashSet::from([claimed]);
+        let inflight_claims = HashSet::from([claimed]);
+
+        let last_resort =
+            reliable_relay_recovery_attach_candidates(vec![claimed], &soft_excluded, true);
+        assert_eq!(last_resort, vec![claimed]);
+        assert!(
+            reliable_relay_exclude_inflight_open_claims(last_resort, &inflight_claims).is_empty(),
+            "soft last-resort recovery must never reopen a path whose validation task still owns the logical stream/path claim"
+        );
+        assert_eq!(
+            reliable_relay_exclude_inflight_open_claims(vec![claimed, unclaimed], &inflight_claims,),
+            vec![unclaimed],
+            "an independent carrier remains available while the claimed open completes"
+        );
+    }
+
+    #[tokio::test]
+    async fn sender_recovery_attach_api_cannot_bypass_inflight_claim() {
+        let context = ClientPathContext::new(
+            vec![
+                "tcp://127.0.0.1:23211?srtt-ms=20&rate-mbps=100"
+                    .parse()
+                    .expect("active path"),
+                "tcp://127.0.0.1:23212?srtt-ms=30&rate-mbps=200"
+                    .parse()
+                    .expect("claimed path"),
+            ],
+            test_security(),
+            ResourceLimits::default(),
+        )
+        .expect("context");
+        let (commands, _receivers) = reliable_path_command_channels(1);
+        let mut remotes = ReliableRelayRemoteSet::new(
+            OpenedRemoteStream {
+                path_index: 0,
+                stream: test_reliable_path_stream(
+                    StreamId(14),
+                    UnderlayProtocol::Tcp,
+                    0,
+                    commands,
+                    FlowLane::Throughput,
+                ),
+            },
+            4,
+        );
+        let send_stream = ReliableSendStream::new(StreamId(14), MuxLimits::default());
+        let spec = ReliableRelayOpenSpec {
+            target: TargetAddr::Ip(SocketAddr::from(([127, 0, 0, 1], 80))),
+            ingress: IngressKind::Socks5,
+        };
+        let claimed = HashSet::from([RelayPathKey {
+            underlay: UnderlayProtocol::Tcp,
+            index: 1,
+        }]);
+
+        let attached = attach_reliable_relay_paths(
+            &context,
+            &spec,
+            FlowLane::Throughput,
+            &mut remotes,
+            &send_stream,
+            false,
+            ReliableRelayAttachMode::RecoveryRepair,
+            &claimed,
+        )
+        .await
+        .expect("claimed recovery is a clean no-op");
+        assert_eq!(attached, 0);
+        assert_eq!(remotes.path_keys().len(), 1);
     }
 
     #[tokio::test]

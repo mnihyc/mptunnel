@@ -28,6 +28,10 @@ class ConnectionProgress:
         self.bytes = 0
         self.final = False
         self.updated_wall_time_ns = time.time_ns()
+        self.last_receive_monotonic = None
+        self.max_receive_gap_ns = 0
+        self.max_receive_gap_start_bytes = 0
+        self.max_receive_gap_end_bytes = 0
         self.generation = 0
         self.flushed_generation = -1
 
@@ -52,9 +56,11 @@ class SinkHandler(socketserver.BaseRequestHandler):
                     natural_eof = not is_quiescing()
                     break
                 total += len(data)
-                if connection is not None:
-                    self.server.record_progress(connection, total, final=False)
                 now = time.monotonic()
+                if connection is not None:
+                    self.server.record_progress(
+                        connection, total, final=False, received_at=now
+                    )
                 if (
                     last_ack_total == 0
                     or total - last_ack_total >= ACK_BYTES
@@ -108,6 +114,8 @@ class ThreadingTcpServer(socketserver.ThreadingMixIn, socketserver.TCPServer):
         self.snapshot_stop = threading.Event()
         self.snapshot_thread = None
         self.snapshot_error = None
+        self.receive_events_lock = threading.Lock()
+        self.receive_events = []
         self.serving_lock = threading.Lock()
         self.serving = False
         self.serving_thread_id = None
@@ -183,19 +191,69 @@ class ThreadingTcpServer(socketserver.ThreadingMixIn, socketserver.TCPServer):
         with self.connections_lock:
             return self.progress_connections[connection]
 
-    def record_progress(self, connection, total, final):
+    def record_progress(self, connection, total, final, received_at=None):
         connection = self._resolve_connection(connection)
+        receive_event = None
         with connection.lock:
             if total < connection.bytes:
                 raise RuntimeError("TCP sink byte count decreased")
             if connection.final and (not final or total != connection.bytes):
                 raise RuntimeError("TCP sink changed a finalized connection")
+            if total > connection.bytes:
+                received_at = (
+                    time.monotonic() if received_at is None else received_at
+                )
+                if connection.last_receive_monotonic is not None:
+                    gap_ns = max(
+                        0,
+                        int(
+                            round(
+                                (received_at - connection.last_receive_monotonic)
+                                * 1_000_000_000
+                            )
+                        ),
+                    )
+                    if gap_ns > connection.max_receive_gap_ns:
+                        connection.max_receive_gap_ns = gap_ns
+                        connection.max_receive_gap_start_bytes = connection.bytes
+                        connection.max_receive_gap_end_bytes = total
+                connection.last_receive_monotonic = received_at
+                receive_event = (
+                    int(round(received_at * 1_000_000_000)),
+                    connection.connection_id,
+                    total,
+                )
             changed = total != connection.bytes or bool(final) != connection.final
             connection.bytes = total
             connection.final = bool(final)
             if changed:
                 connection.updated_wall_time_ns = time.time_ns()
                 connection.generation += 1
+        if receive_event is not None:
+            with self.receive_events_lock:
+                self.receive_events.append(receive_event)
+
+    def _merged_receive_gap_data(self):
+        with self.receive_events_lock:
+            events = sorted(self.receive_events)
+        maximum = {
+            "merged_max_receive_gap_ns": 0,
+            "merged_max_receive_gap_start_connection_id": 0,
+            "merged_max_receive_gap_start_bytes": 0,
+            "merged_max_receive_gap_end_connection_id": 0,
+            "merged_max_receive_gap_end_bytes": 0,
+        }
+        for start, end in zip(events, events[1:]):
+            gap_ns = max(0, end[0] - start[0])
+            if gap_ns > maximum["merged_max_receive_gap_ns"]:
+                maximum = {
+                    "merged_max_receive_gap_ns": gap_ns,
+                    "merged_max_receive_gap_start_connection_id": start[1],
+                    "merged_max_receive_gap_start_bytes": start[2],
+                    "merged_max_receive_gap_end_connection_id": end[1],
+                    "merged_max_receive_gap_end_bytes": end[2],
+                }
+        return maximum
 
     def finish_connection(self, connection, total, final):
         connection = self._resolve_connection(connection)
@@ -220,6 +278,11 @@ class ThreadingTcpServer(socketserver.ThreadingMixIn, socketserver.TCPServer):
                     "bytes": connection.bytes,
                     "final": connection.final,
                     "updated_wall_time_ns": connection.updated_wall_time_ns,
+                    "max_receive_gap_ns": connection.max_receive_gap_ns,
+                    "max_receive_gap_start_bytes": (
+                        connection.max_receive_gap_start_bytes
+                    ),
+                    "max_receive_gap_end_bytes": connection.max_receive_gap_end_bytes,
                 }
                 connection_generations[connection.connection_id] = connection.generation
                 dirty = dirty or (
@@ -230,14 +293,19 @@ class ThreadingTcpServer(socketserver.ThreadingMixIn, socketserver.TCPServer):
             finalized = self.finalized
             lifecycle_generation = self.lifecycle_generation
             dirty = dirty or (lifecycle_generation != self.flushed_lifecycle_generation)
+        snapshot = {
+            "version": 2,
+            "quiesced": quiesced,
+            "finalized": finalized,
+            "connections": connection_rows,
+            "updated_wall_time_ns": time.time_ns(),
+        }
+        # The merged timeline is retained in memory and summarized only after
+        # quiesce, so periodic observer snapshots do not copy the hot event set.
+        if finalized:
+            snapshot.update(self._merged_receive_gap_data())
         return (
-            {
-                "version": 2,
-                "quiesced": quiesced,
-                "finalized": finalized,
-                "connections": connection_rows,
-                "updated_wall_time_ns": time.time_ns(),
-            },
+            snapshot,
             connections,
             connection_generations,
             lifecycle_generation,

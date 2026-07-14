@@ -80,6 +80,7 @@ pub struct EncryptedFramedWriter<W> {
     send_direction: u8,
     send_counter: u64,
     write_poisoned: bool,
+    wire_bytes_written: u64,
     encode_buffer: Vec<u8>,
 }
 
@@ -253,6 +254,7 @@ impl<S> EncryptedFramedStream<S> {
                 send_direction,
                 send_counter,
                 write_poisoned,
+                wire_bytes_written: 0,
                 encode_buffer: Vec::new(),
             },
         ))
@@ -303,6 +305,7 @@ where
             self.send_direction,
             &mut self.send_counter,
             &mut self.write_poisoned,
+            None,
             frame,
             &mut self.encode_buffer,
         )
@@ -323,6 +326,7 @@ where
             self.send_direction,
             &mut self.send_counter,
             &mut self.write_poisoned,
+            None,
             frames,
             &mut self.encode_buffer,
         )
@@ -391,6 +395,11 @@ impl<W> EncryptedFramedWriter<W>
 where
     W: AsyncWrite + Unpin,
 {
+    /// Encoded record bytes accepted by the underlying writer since this writer was split.
+    pub fn wire_bytes_written(&self) -> u64 {
+        self.wire_bytes_written
+    }
+
     pub async fn write_frame(
         &mut self,
         frame: &Frame,
@@ -405,6 +414,7 @@ where
             self.send_direction,
             &mut self.send_counter,
             &mut self.write_poisoned,
+            Some(&mut self.wire_bytes_written),
             frame,
             &mut self.encode_buffer,
         )
@@ -425,6 +435,7 @@ where
             self.send_direction,
             &mut self.send_counter,
             &mut self.write_poisoned,
+            Some(&mut self.wire_bytes_written),
             frames,
             &mut self.encode_buffer,
         )
@@ -587,6 +598,7 @@ async fn write_frame_to<W>(
     send_direction: u8,
     send_counter: &mut u64,
     write_poisoned: &mut bool,
+    wire_bytes_written: Option<&mut u64>,
     frame: &Frame,
     payload: &mut Vec<u8>,
 ) -> Result<(), EncryptedFramedTransportError>
@@ -645,13 +657,30 @@ where
         stage_started.elapsed(),
         payload.len(),
     );
-    #[cfg(feature = "lab-diagnostics")]
-    let written_bytes = HEADER_LEN + payload.len() + tag.len();
+    let written_bytes = HEADER_LEN
+        .checked_add(payload.len())
+        .and_then(|len| len.checked_add(tag.len()))
+        .ok_or(EncryptedFramedTransportError::LengthOverflow)?;
+    let next_wire_bytes_written = match wire_bytes_written.as_deref() {
+        Some(current) => Some(
+            current
+                .checked_add(
+                    u64::try_from(written_bytes)
+                        .map_err(|_| EncryptedFramedTransportError::LengthOverflow)?,
+                )
+                .ok_or(EncryptedFramedTransportError::LengthOverflow)?,
+        ),
+        None => None,
+    };
     #[cfg(feature = "lab-diagnostics")]
     let stage_started = std::time::Instant::now();
     let write_guard = WritePoisonGuard::new(write_poisoned)?;
     write_all_vectored_parts(stream, [&header, payload.as_slice(), tag.as_slice()]).await?;
     *send_counter = next_counter;
+    if let Some(next_wire_bytes_written) = next_wire_bytes_written {
+        *wire_bytes_written.expect("wire byte counter exists when next value was calculated") =
+            next_wire_bytes_written;
+    }
     write_guard.commit();
     #[cfg(feature = "lab-diagnostics")]
     lab_perf_record(
@@ -679,6 +708,7 @@ async fn write_frames_to<W>(
     send_direction: u8,
     send_counter: &mut u64,
     write_poisoned: &mut bool,
+    wire_bytes_written: Option<&mut u64>,
     frames: &[Frame],
     payload: &mut Vec<u8>,
 ) -> Result<(), EncryptedFramedTransportError>
@@ -702,6 +732,7 @@ where
             send_direction,
             send_counter,
             write_poisoned,
+            wire_bytes_written,
             &frames[0],
             payload,
         )
@@ -767,12 +798,27 @@ where
         payload.extend_from_slice(&tag);
         next_counter += 1;
     }
+    let next_wire_bytes_written = match wire_bytes_written.as_deref() {
+        Some(current) => Some(
+            current
+                .checked_add(
+                    u64::try_from(payload.len())
+                        .map_err(|_| EncryptedFramedTransportError::LengthOverflow)?,
+                )
+                .ok_or(EncryptedFramedTransportError::LengthOverflow)?,
+        ),
+        None => None,
+    };
     #[cfg(feature = "lab-diagnostics")]
     let stage_started = std::time::Instant::now();
     let write_guard = WritePoisonGuard::new(write_poisoned)?;
     stream.write_all(payload).await?;
     debug_assert_eq!(next_counter, final_counter);
     *send_counter = final_counter;
+    if let Some(next_wire_bytes_written) = next_wire_bytes_written {
+        *wire_bytes_written.expect("wire byte counter exists when next value was calculated") =
+            next_wire_bytes_written;
+    }
     write_guard.commit();
     #[cfg(feature = "lab-diagnostics")]
     lab_perf_record(
@@ -1221,6 +1267,90 @@ mod tests {
                 .await
                 .expect("read ciphertext");
         }
+    }
+
+    #[tokio::test]
+    async fn split_writer_accumulates_exact_encoded_wire_bytes() {
+        let (client, server) = duplex(4096);
+        let limits = CodecLimits::default();
+        let mut client = test_stream(client, PeerRole::Client, limits);
+        let mut server = test_stream(server, PeerRole::Server, limits);
+        let hello = Frame::SessionHello {
+            session_id: SessionId(42),
+        };
+        client.write_frame(&hello).await.expect("write hello");
+        assert_eq!(server.read_frame().await.expect("read hello"), hello);
+        server
+            .write_frame(&Frame::Pong { nonce: 42 })
+            .await
+            .expect("write response");
+        assert_eq!(
+            client.read_frame().await.expect("read response"),
+            Frame::Pong { nonce: 42 }
+        );
+        let (_reader, mut writer) = client.split().expect("split confirmed client");
+        let first = Frame::Ping { nonce: 7 };
+        let batch = [Frame::Pong { nonce: 7 }, Frame::Ping { nonce: 8 }];
+        let record_wire_len = |frame: &Frame| {
+            u64::try_from(
+                HEADER_LEN
+                    + encode_frame(frame, limits)
+                        .expect("encode expected frame")
+                        .len()
+                    + TAG_LEN,
+            )
+            .expect("test record length fits u64")
+        };
+
+        assert_eq!(writer.wire_bytes_written(), 0);
+        writer.write_frame(&first).await.expect("write first frame");
+        assert_eq!(writer.wire_bytes_written(), record_wire_len(&first));
+        writer
+            .write_frames(&batch)
+            .await
+            .expect("write frame batch");
+        assert_eq!(
+            writer.wire_bytes_written(),
+            record_wire_len(&first) + batch.iter().map(record_wire_len).sum::<u64>()
+        );
+    }
+
+    #[tokio::test]
+    async fn split_writer_does_not_publish_partial_record_bytes() {
+        let (client, server) = duplex(256);
+        let limits = CodecLimits::default();
+        let mut client = test_stream(client, PeerRole::Client, limits);
+        let mut server = test_stream(server, PeerRole::Server, limits);
+        client
+            .write_frame(&Frame::SessionHello {
+                session_id: SessionId(42),
+            })
+            .await
+            .expect("write hello");
+        server.read_frame().await.expect("read hello");
+        server
+            .write_frame(&Frame::Pong { nonce: 42 })
+            .await
+            .expect("write response");
+        client.read_frame().await.expect("read response");
+        let (_reader, mut writer) = client.split().expect("split confirmed client");
+        let frame = Frame::PathCapacityData {
+            path_id: crate::protocol::PathId(1),
+            calibration_id: 7,
+            payload: Bytes::from(vec![0; 4096]),
+        };
+
+        assert!(
+            tokio::time::timeout(Duration::from_millis(10), writer.write_frame(&frame))
+                .await
+                .is_err()
+        );
+        assert_eq!(writer.wire_bytes_written(), 0);
+        assert!(matches!(
+            writer.write_frame(&Frame::Ping { nonce: 9 }).await,
+            Err(EncryptedFramedTransportError::WriteStatePoisoned)
+        ));
+        assert_eq!(writer.wire_bytes_written(), 0);
     }
 
     #[tokio::test]

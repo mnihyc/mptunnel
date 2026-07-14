@@ -347,10 +347,10 @@ pub(super) fn bulk_candidate_admission_suppression(
 pub(super) fn bulk_candidate_admission_suppression_with_ordering_debt(
     check: BulkAdmissionCheck,
 ) -> Option<&'static str> {
-    bulk_candidate_admission_suppression_with_completion_backlog(
-        check,
-        check.stream_ordering_debt_bytes,
-    )
+    // Ordering debt bounds receive-hole resources; it does not prove that
+    // Service has an independent lower backlog. Response policy supplies that
+    // product backlog explicitly when it owns one.
+    bulk_candidate_admission_suppression_with_completion_backlog(check, 0)
 }
 
 pub(super) fn bulk_candidate_admission_suppression_with_completion_backlog(
@@ -2531,6 +2531,30 @@ mod tests {
                 stream_ordering_debt_bytes: 512 * 1024,
             }),
             Some("same_underlay_no_completion_gain")
+        );
+    }
+
+    #[test]
+    fn request_ordering_debt_does_not_mint_service_completion_backlog() {
+        let mut lead = candidate(0, 400.0, 360.0, 400.0);
+        let mut extra = candidate(1, 410.0, 360.0, 200.0);
+        lead.snapshot.confidence = 1.0;
+        extra.snapshot.confidence = 1.0;
+        extra.snapshot.app_limited = false;
+        let check = BulkAdmissionCheck {
+            best_snapshot: lead.snapshot,
+            best_eta_ms: lead.eta_ms,
+            candidate_snapshot: extra.snapshot,
+            candidate_eta_ms: extra.eta_ms,
+            payload_bytes: 64 * 1024,
+            mux_limits: MuxLimits::default(),
+            role: BulkAdmissionRole::AdditionalSameUnderlay,
+            stream_ordering_debt_bytes: 8 * 1024 * 1024,
+        };
+        assert_eq!(
+            bulk_candidate_admission_suppression_with_ordering_debt(check),
+            Some("same_underlay_no_completion_gain"),
+            "a lower receive hole cannot extend Service's completion deadline and authorize more later-offset request work"
         );
     }
 

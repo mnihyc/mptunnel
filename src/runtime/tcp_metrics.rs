@@ -14,6 +14,8 @@ pub(in crate::runtime) struct TcpCapacityProofCandidate {
     pub(in crate::runtime) token: u64,
     pub(in crate::runtime) train_bytes: u64,
     pub(in crate::runtime) received_bytes: u64,
+    /// Payload represented by `proof_elapsed`; request TCP uses the full train.
+    pub(in crate::runtime) rate_sample_bytes: u64,
     pub(in crate::runtime) proof_elapsed: Duration,
     pub(in crate::runtime) receipt_rate_bps: u64,
     pub(in crate::runtime) rate_bps: u64,
@@ -28,6 +30,8 @@ pub(in crate::runtime) fn valid_tcp_capacity_proof_candidate_at(
     proof.token > 0
         && proof.train_bytes >= PATH_OPEN_SCORE_BYTES as u64
         && proof.received_bytes == proof.train_bytes
+        && proof.rate_sample_bytes >= PATH_OPEN_SCORE_BYTES as u64
+        && proof.rate_sample_bytes <= proof.train_bytes
         && !proof.proof_elapsed.is_zero()
         && proof.receipt_rate_bps > 0
         && proof.rate_bps >= proof.receipt_rate_bps
@@ -36,13 +40,13 @@ pub(in crate::runtime) fn valid_tcp_capacity_proof_candidate_at(
 }
 
 pub(in crate::runtime) fn tcp_capacity_receipt_rate_bps(
-    train_bytes: u64,
+    sample_bytes: u64,
     elapsed: Duration,
 ) -> Option<u64> {
-    if train_bytes == 0 || elapsed.is_zero() {
+    if sample_bytes == 0 || elapsed.is_zero() {
         return None;
     }
-    let rate = train_bytes as f64 * 8.0 / elapsed.max(TRANSPORT_TIMER_GRANULARITY).as_secs_f64();
+    let rate = sample_bytes as f64 * 8.0 / elapsed.max(TRANSPORT_TIMER_GRANULARITY).as_secs_f64();
     rate.is_finite()
         .then_some(rate.round().clamp(1.0, u64::MAX as f64) as u64)
 }
@@ -58,14 +62,42 @@ pub(in crate::runtime) fn tcp_capacity_authoritative_rate_bps(
     delivery_rate_bps: u64,
     _pacing_rate_bps: u64,
 ) -> u64 {
-    // A receiver receipt may conservatively include startup and one RTT. Native
-    // delivery can lift it by one BBR cwnd gain; pacing alone proves no delivery.
+    // The typed ACK/receipt rate remains the floor. Native ACK delivery may lift
+    // it by one BBR cwnd gain; pacing alone still proves no delivery.
     let receipt_uplift = (receipt_rate_bps as f64 * BBR_DEFAULT_CWND_GAIN)
         .ceil()
         .clamp(1.0, u64::MAX as f64) as u64;
     receipt_rate_bps
         .max(delivery_rate_bps.min(receipt_uplift))
         .max(1)
+}
+
+/// Exact same-socket sender queues used to establish a receipt-rate baseline.
+#[cfg(target_os = "linux")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) struct TcpSenderQueueSnapshot {
+    pub(super) unacked_packets: u32,
+    pub(super) notsent_bytes: u32,
+}
+
+#[cfg(target_os = "linux")]
+impl TcpSenderQueueSnapshot {
+    /// The full typed receiver receipt, not a cumulative TCP ACK, owns rate.
+    /// Older unacked control can only delay that receipt; unsent bytes must
+    /// drain so the measured train begins at a writer boundary.
+    pub(super) fn is_write_queue_drained(self) -> bool {
+        self.notsent_bytes == 0
+    }
+}
+
+#[cfg(target_os = "linux")]
+impl From<TcpInfoSnapshot> for TcpSenderQueueSnapshot {
+    fn from(snapshot: TcpInfoSnapshot) -> Self {
+        Self {
+            unacked_packets: snapshot.unacked_packets,
+            notsent_bytes: snapshot.notsent_bytes,
+        }
+    }
 }
 
 /// Keeps polling in the carrier task so telemetry cannot outlive its socket or
@@ -97,6 +129,11 @@ impl TcpMetricPublisher {
             .flatten()
             .map(TcpSenderMetricTracker::new);
         self.next_sample_at = Instant::now();
+    }
+
+    /// Queries exact sender queues without advancing periodic metric cadence.
+    pub(super) fn sender_queue_snapshot(&self) -> Option<TcpSenderQueueSnapshot> {
+        self.socket.snapshot().ok().flatten().map(Into::into)
     }
 
     pub(super) fn maybe_observe(
@@ -229,6 +266,26 @@ mod tests {
         }
     }
 
+    #[cfg(target_os = "linux")]
+    fn sender_queue_snapshot(unacked_packets: u32, notsent_bytes: u32) -> TcpSenderQueueSnapshot {
+        TcpSenderQueueSnapshot {
+            unacked_packets,
+            notsent_bytes,
+        }
+    }
+
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn tcp_receipt_baseline_waits_only_for_unsent_bytes() {
+        assert!(sender_queue_snapshot(0, 0).is_write_queue_drained());
+        assert!(
+            sender_queue_snapshot(1, 0).is_write_queue_drained(),
+            "prior unacked control can only lengthen a full receiver receipt"
+        );
+        assert!(!sender_queue_snapshot(0, 1).is_write_queue_drained());
+        assert!(!sender_queue_snapshot(1, 1).is_write_queue_drained());
+    }
+
     #[test]
     #[cfg(target_os = "linux")]
     fn native_tcp_metrics_are_post_handshake_and_keep_kernel_units_explicit() {
@@ -281,6 +338,7 @@ mod tests {
             token: 7,
             train_bytes: 2 * 1024 * 1024,
             received_bytes: 2 * 1024 * 1024,
+            rate_sample_bytes: 2 * 1024 * 1024,
             proof_elapsed: Duration::from_millis(400),
             receipt_rate_bps: 40_000_000,
             rate_bps: 80_000_000,

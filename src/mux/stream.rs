@@ -682,6 +682,21 @@ impl ReliableRecvStream {
         }
     }
 
+    /// Encode newly received ranges without claiming a complete snapshot.
+    /// Reliable-carrier sparse ACK deltas release exact new bytes immediately;
+    /// periodic `ack_frames` snapshots retain cumulative recovery authority.
+    pub fn ack_delta_frames(&self, ranges: &[OffsetRange]) -> Vec<Frame> {
+        let chunk_size = self.limits.max_ack_ranges.max(1);
+        ranges
+            .chunks(chunk_size)
+            .map(|chunk| Frame::StreamAck {
+                stream_id: self.stream_id,
+                complete: false,
+                ranges: chunk.to_vec(),
+            })
+            .collect()
+    }
+
     /// Build every ACK chunk needed to describe the current receive ranges.
     ///
     /// When multiple frames are needed each chunk is explicitly incomplete.
@@ -1219,6 +1234,19 @@ mod tests {
                     OffsetRange::new(30, 31).expect("fourth range"),
                 ]
             }
+        );
+        let delta_ranges = [
+            OffsetRange::new(20, 21).expect("middle delta"),
+            OffsetRange::new(50, 51).expect("tail delta"),
+        ];
+        assert_eq!(
+            stream.ack_delta_frames(&delta_ranges),
+            vec![Frame::StreamAck {
+                stream_id: StreamId(7),
+                complete: false,
+                ranges: delta_ranges.to_vec(),
+            }],
+            "a delta ACK must preserve exact new coverage without claiming a full snapshot"
         );
     }
 

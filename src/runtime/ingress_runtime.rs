@@ -412,8 +412,7 @@ pub(super) async fn probe_tcp_client_path(
         .get(path_index)
         .ok_or(RuntimeError::NoSchedulableTcpPath)?;
     let security = context.tcp_path_security(path_index)?;
-    let started_at = Instant::now();
-    tokio::time::timeout(timeout, async {
+    let probe_rtt = tokio::time::timeout(timeout, async {
         let tcp_stream = tcp::connect_path(
             path,
             TcpConnectOptions {
@@ -434,6 +433,9 @@ pub(super) async fn probe_tcp_client_path(
             authenticated_path_join_frames(security, path, path_id, UnderlayProtocol::Tcp)?;
         let nonce = random_u64()?;
 
+        // Connection setup is liveness cost, not RTT. Time only the single
+        // authenticated request/response exchange used by the path model.
+        let ping_started_at = Instant::now();
         framed
             .write_frames(&[
                 session_hello,
@@ -466,6 +468,7 @@ pub(super) async fn probe_tcp_client_path(
                 _ => return Err(RuntimeError::Protocol("unexpected TCP path probe frame")),
             }
         }
+        let probe_rtt = ping_started_at.elapsed();
 
         framed
             .write_frame(&Frame::SessionClose {
@@ -473,11 +476,11 @@ pub(super) async fn probe_tcp_client_path(
             })
             .await?;
         framed.flush().await?;
-        Ok(())
+        Ok(probe_rtt)
     })
     .await
     .map_err(|_| RuntimeError::Protocol("TCP path probe timed out"))??;
-    Ok(started_at.elapsed())
+    Ok(probe_rtt)
 }
 
 pub(super) async fn probe_udp_client_path(
@@ -490,8 +493,7 @@ pub(super) async fn probe_udp_client_path(
         .get(path_index)
         .cloned()
         .ok_or(RuntimeError::NoSchedulableUdpPath)?;
-    let started_at = Instant::now();
-    tokio::time::timeout(timeout, async {
+    let probe_rtt = tokio::time::timeout(timeout, async {
         let mut session = UdpDatagramClientSession::open_from_udp_session(
             path_session,
             path_index,
@@ -499,13 +501,15 @@ pub(super) async fn probe_udp_client_path(
             timeout,
         )
         .await?;
+        let ping_started_at = Instant::now();
         session.ping(timeout).await?;
+        let probe_rtt = ping_started_at.elapsed();
         let _ = session.close_session().await;
-        Ok::<(), RuntimeError>(())
+        Ok::<Duration, RuntimeError>(probe_rtt)
     })
     .await
     .map_err(|_| RuntimeError::Protocol("UDP path probe timed out"))??;
-    Ok(started_at.elapsed())
+    Ok(probe_rtt)
 }
 
 pub(super) async fn read_socks5_auth<S>(stream: &mut S) -> Result<socks5::AuthRequest, RuntimeError>

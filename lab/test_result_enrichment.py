@@ -36,16 +36,27 @@ class ResultEnrichmentTests(unittest.TestCase):
             "quiesced": True,
             "finalized": True,
             "updated_wall_time_ns": 1_000,
+            "merged_max_receive_gap_ns": 200_000_000,
+            "merged_max_receive_gap_start_connection_id": 0,
+            "merged_max_receive_gap_start_bytes": 40,
+            "merged_max_receive_gap_end_connection_id": 1,
+            "merged_max_receive_gap_end_bytes": 60,
             "connections": {
                 "0": {
                     "bytes": 120,
                     "final": True,
                     "updated_wall_time_ns": 900,
+                    "max_receive_gap_ns": 250_000_000,
+                    "max_receive_gap_start_bytes": 40,
+                    "max_receive_gap_end_bytes": 80,
                 },
                 "1": {
                     "bytes": 180,
                     "final": True,
                     "updated_wall_time_ns": 950,
+                    "max_receive_gap_ns": 125_000_000,
+                    "max_receive_gap_start_bytes": 60,
+                    "max_receive_gap_end_bytes": 90,
                 },
             },
         }
@@ -66,6 +77,15 @@ class ResultEnrichmentTests(unittest.TestCase):
         self.assertEqual(row["upload_goodput_mbps"], 0.001)
         self.assertEqual(row["target_observer_connections"], 2)
         self.assertEqual(row["target_observer_final_connections"], 2)
+        self.assertEqual(row["target_observer_max_receive_gap_s"], 0.25)
+        self.assertEqual(row["target_observer_merged_max_receive_gap_s"], 0.2)
+        self.assertEqual(
+            row["target_observer_merged_max_receive_gap_end_connection_id"], 1
+        )
+        self.assertEqual(
+            row["target_observer_connection_summaries"][0]["max_receive_gap_s"],
+            0.25,
+        )
         self.assertEqual(row["streams_with_delivery"], 2)
         self.assertEqual(row["complete_streams"], 2)
         self.assertEqual(row["failed_streams"], 0)

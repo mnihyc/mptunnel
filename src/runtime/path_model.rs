@@ -827,11 +827,17 @@ pub(super) fn path_can_be_auto_discovered(
     path: &PathSpec,
     observation: ClientPathObservation,
 ) -> bool {
-    observation.state == SchedulerPathState::Active
-        && !path.metadata.capabilities.expensive
-        && !path.metadata.capabilities.backup
-        && !path.metadata.capabilities.probe_only
-        && path.metadata.capabilities.bulk_allowed
+    observation.state == SchedulerPathState::Active && path_allows_automatic_bulk_use(path)
+}
+
+pub(super) fn path_allows_automatic_bulk_use(path: &PathSpec) -> bool {
+    // Operator cost/role policy is transport-independent. Automatic capacity
+    // discovery may measure only paths that are also eligible to carry bulk.
+    let capabilities = path.metadata.capabilities;
+    !capabilities.expensive
+        && !capabilities.backup
+        && !capabilities.probe_only
+        && capabilities.bulk_allowed
 }
 
 fn path_can_be_auto_discovered_for_lane(
@@ -1059,6 +1065,50 @@ pub(super) fn default_path_rate_bps(underlay: UnderlayProtocol) -> f64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn automatic_bulk_use_honors_every_operator_capability() {
+        let allowed = "tcp://127.0.0.1:10000"
+            .parse::<PathSpec>()
+            .expect("allowed path");
+        let active = ClientPathObservation {
+            state: SchedulerPathState::Active,
+            ..ClientPathObservation::default()
+        };
+        assert!(path_allows_automatic_bulk_use(&allowed));
+        assert!(path_can_be_auto_discovered(&allowed, active));
+        let low_latency = "udp://127.0.0.1:10001?low-latency=true"
+            .parse::<PathSpec>()
+            .expect("low-latency path");
+        assert!(path_allows_automatic_bulk_use(&low_latency));
+
+        for query in [
+            "expensive=true",
+            "backup=true",
+            "probe-only=true",
+            "bulk=false",
+        ] {
+            let path = format!("udp://127.0.0.1:10002?{query}")
+                .parse::<PathSpec>()
+                .expect("policy path");
+            assert!(
+                !path_allows_automatic_bulk_use(&path),
+                "{query} must block automatic bulk use"
+            );
+            assert!(
+                !path_can_be_auto_discovered(&path, active),
+                "{query} must block automatic discovery"
+            );
+        }
+
+        assert!(!path_can_be_auto_discovered(
+            &allowed,
+            ClientPathObservation {
+                state: SchedulerPathState::Suspect,
+                ..active
+            }
+        ));
+    }
 
     #[test]
     fn path_snapshot_preserves_rate_provenance() {

@@ -1,4 +1,3 @@
-
 use super::*;
 use crate::config::{CipherSuite, CommandConfig, TransportSecurity};
 use clap::Parser;

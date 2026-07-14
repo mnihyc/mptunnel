@@ -1,4 +1,3 @@
-
 use super::*;
 use crate::ingress::socks5 as ingress_socks5;
 use std::time::Duration;

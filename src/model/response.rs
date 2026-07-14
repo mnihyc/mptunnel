@@ -4,7 +4,12 @@
 //! typed evidence and pure calculations shared by those transactions and the
 //! sender planner; it owns no locks, channels, timers, or carrier handles.
 
-use crate::model::path::{CarrierPathInstanceId, CarrierPathKey};
+use crate::model::admission::{
+    BulkAdmissionCheck, BulkAdmissionRole, bulk_candidate_admission_suppression_with_ordering_debt,
+};
+use crate::model::multipath::cross_family_reliable_owner_health;
+use crate::model::path::{CarrierPathInstanceId, CarrierPathKey, carrier_path_key_order};
+use crate::mux::MuxLimits;
 use crate::protocol::{StreamOpenRole, UnderlayProtocol};
 use crate::scheduler::{PathRateScope, PathSnapshot};
 
@@ -32,12 +37,320 @@ pub(crate) struct ResponsePathObservation {
     pub(crate) has_bulk_rate_evidence: bool,
 }
 
+impl AsRef<ResponsePathObservation> for ResponsePathObservation {
+    fn as_ref(&self) -> &ResponsePathObservation {
+        self
+    }
+}
+
+impl ResponsePathObservation {
+    pub(crate) fn same_physical_output(self, other: Self) -> bool {
+        self.key == other.key
+            && self.path_instance_id == other.path_instance_id
+            && self.incarnation == other.incarnation
+    }
+
+    pub(crate) fn active_bulk_flows(self) -> u32 {
+        self.snapshot
+            .active_flows
+            .saturating_sub(self.snapshot.active_latency_sensitive_flows)
+    }
+
+    pub(crate) fn is_plausible_unique_owner_candidate(self) -> bool {
+        self.attachment_role != StreamOpenRole::Repair
+            && (self.is_service || self.has_bulk_rate_evidence)
+    }
+
+    pub(crate) fn has_ack_gap_repair_evidence(self) -> bool {
+        self.is_service || self.has_bulk_rate_evidence
+    }
+}
+
 /// Completion baseline used by response bulk-admission policy.
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct ResponseBulkLead {
     pub(crate) key: CarrierPathKey,
     pub(crate) snapshot: PathSnapshot,
     pub(crate) eta_ms: f64,
+}
+
+pub(crate) fn response_service_fair_share_bps(
+    target: &ResponsePathObservation,
+    adds_flow: bool,
+) -> f64 {
+    response_rate_fair_share_bps(target.snapshot, target.snapshot.rate_scope, adds_flow)
+}
+
+#[cfg(any(test, feature = "lab-diagnostics"))]
+pub(crate) fn response_service_handoff_preserves_fair_share(
+    service: &ResponsePathObservation,
+    target: &ResponsePathObservation,
+) -> bool {
+    // Sticky placement compares one moved flow; only aggregate carrier rates
+    // are divided because TCP product ACK clocks already measure a flow share.
+    response_service_fair_share_bps(service, false) <= response_service_fair_share_bps(target, true)
+}
+
+pub(crate) fn response_service_handoff_mode_for_observations(
+    service: &ResponsePathObservation,
+    target: &ResponsePathObservation,
+    family_loads: ResponseServiceFamilyLoads,
+) -> Option<ResponseServiceHandoffMode> {
+    response_snapshot_handoff_mode(
+        service.key.underlay,
+        service.snapshot,
+        target.key.underlay,
+        target.snapshot,
+        family_loads,
+    )
+}
+
+pub(crate) fn response_cross_underlay_owner_allowed<T>(
+    target: &ResponsePathObservation,
+    candidates: &[T],
+    ordered_data_owner: Option<CarrierPathKey>,
+    lower_flights: &[CarrierPathFlightDebt],
+) -> bool
+where
+    T: AsRef<ResponsePathObservation>,
+{
+    // A candidate that owns the lower frontier does not expand cross-path debt.
+    let fallback_service = candidates
+        .iter()
+        .map(AsRef::as_ref)
+        .find(|candidate| candidate.is_service);
+    let current_owner = ordered_data_owner.or_else(|| fallback_service.map(|service| service.key));
+    let current_owner_bulk_rate_proven = current_owner
+        .and_then(|owner| {
+            candidates
+                .iter()
+                .map(AsRef::as_ref)
+                .find(|candidate| candidate.key == owner)
+        })
+        .is_none_or(|owner| owner.has_bulk_rate_evidence);
+    let continues_lower_frontier =
+        response_oldest_lower_flight_owner(lower_flights) == Some(target.key);
+    if continues_lower_frontier && (target.is_service || target.has_bulk_rate_evidence) {
+        return true;
+    }
+    cross_family_reliable_owner_health(
+        current_owner,
+        current_owner_bulk_rate_proven,
+        target.key,
+        target.has_bulk_rate_evidence,
+        continues_lower_frontier,
+    )
+    .reliable_owner_allowed()
+}
+
+pub(crate) fn response_ordered_owner_missing_under_debt<T>(
+    targets: &[T],
+    lower_flights: &[CarrierPathFlightDebt],
+    ordered_data_owner: Option<CarrierPathKey>,
+    ordered_owner_debt_bytes: usize,
+) -> bool
+where
+    T: AsRef<ResponsePathObservation>,
+{
+    if ordered_owner_debt_bytes == 0 || response_oldest_lower_flight_owner(lower_flights).is_some()
+    {
+        return false;
+    }
+    match ordered_data_owner {
+        Some(owner) => {
+            let live_owner = targets
+                .iter()
+                .map(AsRef::as_ref)
+                .any(|target| target.key == owner);
+            let same_family_sender_evidence = targets
+                .iter()
+                .map(AsRef::as_ref)
+                .any(|target| target.key.underlay == owner.underlay && target.has_sender_evidence);
+            !live_owner && !same_family_sender_evidence
+        }
+        None => true,
+    }
+}
+
+pub(crate) fn response_active_lead_suppression(
+    target: &ResponsePathObservation,
+    mux_limits: MuxLimits,
+    payload_bytes: usize,
+    stream_ordering_debt_bytes: u64,
+) -> Option<&'static str> {
+    bulk_candidate_admission_suppression_with_ordering_debt(BulkAdmissionCheck {
+        best_snapshot: target.snapshot,
+        best_eta_ms: target.eta_ms,
+        candidate_snapshot: target.snapshot,
+        candidate_eta_ms: target.eta_ms,
+        payload_bytes,
+        mux_limits,
+        role: BulkAdmissionRole::ActiveDataPath,
+        stream_ordering_debt_bytes,
+    })
+}
+
+pub(crate) fn choose_response_admissible_lead<T>(
+    candidate_targets: &[T],
+    service_baseline: Option<&ResponsePathObservation>,
+    mux_limits: MuxLimits,
+    payload_bytes: usize,
+    lower_flights: &[CarrierPathFlightDebt],
+    allow_liveness_service_failover: bool,
+) -> Option<ResponseBulkLead>
+where
+    T: AsRef<ResponsePathObservation>,
+{
+    let lower_owner = response_oldest_lower_flight_owner(lower_flights);
+    if let Some(service) = service_baseline {
+        return Some(ResponseBulkLead {
+            key: service.key,
+            snapshot: service.snapshot,
+            eta_ms: service.eta_ms,
+        });
+    }
+
+    if let Some(owner) = lower_owner {
+        let owner = candidate_targets
+            .iter()
+            .map(AsRef::as_ref)
+            .find(|candidate| candidate.key == owner)?;
+        if owner.is_service || owner.has_bulk_rate_evidence {
+            let debt = response_ordering_debt_bytes(lower_flights, owner.key);
+            return response_active_lead_suppression(owner, mux_limits, payload_bytes, debt)
+                .is_none()
+                .then_some(ResponseBulkLead {
+                    key: owner.key,
+                    snapshot: owner.snapshot,
+                    eta_ms: owner.eta_ms,
+                });
+        }
+    }
+
+    let choose = |require_plausible: bool, require_proven: bool, require_unsuppressed: bool| {
+        candidate_targets
+            .iter()
+            .map(AsRef::as_ref)
+            .filter(|target| {
+                (!require_plausible || target.is_plausible_unique_owner_candidate())
+                    && (!require_proven || target.has_bulk_rate_evidence)
+                    && (!require_unsuppressed
+                        || response_active_lead_suppression(target, mux_limits, payload_bytes, 0)
+                            .is_none())
+            })
+            .min_by(|left, right| {
+                left.eta_ms
+                    .total_cmp(&right.eta_ms)
+                    .then_with(|| carrier_path_key_order(left.key, right.key))
+            })
+            .map(|target| ResponseBulkLead {
+                key: target.key,
+                snapshot: target.snapshot,
+                eta_ms: target.eta_ms,
+            })
+    };
+
+    choose(true, false, true)
+        .or_else(|| {
+            (lower_owner.is_none() && allow_liveness_service_failover)
+                .then(|| choose(false, false, true))
+                .flatten()
+        })
+        .or_else(|| {
+            (lower_owner.is_none())
+                .then(|| choose(false, true, false))
+                .flatten()
+        })
+}
+
+pub(crate) fn select_response_lowest_eta_observation<T>(
+    targets: &[T],
+    avoid_keys: &[CarrierPathKey],
+    prefer_avoiding: bool,
+) -> Option<ResponsePathObservation>
+where
+    T: AsRef<ResponsePathObservation>,
+{
+    targets
+        .iter()
+        .map(AsRef::as_ref)
+        .filter(|target| !prefer_avoiding || !avoid_keys.contains(&target.key))
+        .min_by(|left, right| {
+            left.eta_ms
+                .total_cmp(&right.eta_ms)
+                .then_with(|| carrier_path_key_order(left.key, right.key))
+        })
+        .copied()
+}
+
+pub(crate) fn select_response_same_family_sender_evidenced_observation<T>(
+    targets: &[T],
+    avoid_keys: &[CarrierPathKey],
+) -> Option<ResponsePathObservation>
+where
+    T: AsRef<ResponsePathObservation>,
+{
+    if avoid_keys.is_empty() {
+        return None;
+    }
+    targets
+        .iter()
+        .map(AsRef::as_ref)
+        .filter(|target| {
+            !avoid_keys.contains(&target.key)
+                && target.has_sender_evidence
+                && avoid_keys
+                    .iter()
+                    .any(|avoid| avoid.underlay == target.key.underlay)
+        })
+        .min_by(|left, right| {
+            left.eta_ms
+                .total_cmp(&right.eta_ms)
+                .then_with(|| carrier_path_key_order(left.key, right.key))
+        })
+        .copied()
+}
+
+pub(crate) fn select_response_service_or_proven_observation<T>(
+    targets: &[T],
+    lower_flights: &[CarrierPathFlightDebt],
+    avoid_keys: &[CarrierPathKey],
+) -> Option<ResponsePathObservation>
+where
+    T: AsRef<ResponsePathObservation>,
+{
+    if let Some(lower_owner) = response_oldest_lower_flight_owner(lower_flights)
+        && let Some(target) = targets
+            .iter()
+            .map(AsRef::as_ref)
+            .find(|target| target.key == lower_owner && !avoid_keys.contains(&target.key))
+    {
+        return Some(*target);
+    }
+    if let Some(service) = targets
+        .iter()
+        .map(AsRef::as_ref)
+        .find(|target| target.is_service && !avoid_keys.contains(&target.key))
+    {
+        return Some(*service);
+    }
+    let choose = |require_proven: bool, prefer_avoiding: bool| {
+        targets
+            .iter()
+            .map(AsRef::as_ref)
+            .filter(|target| !require_proven || target.has_bulk_rate_evidence)
+            .filter(|target| !prefer_avoiding || !avoid_keys.contains(&target.key))
+            .min_by(|left, right| {
+                left.eta_ms
+                    .total_cmp(&right.eta_ms)
+                    .then_with(|| carrier_path_key_order(left.key, right.key))
+            })
+            .copied()
+    };
+    choose(true, true)
+        .or_else(|| choose(true, false))
+        .or_else(|| choose(false, true))
+        .or_else(|| choose(false, false))
 }
 
 /// Product offset debt attributed to the carrier that owns the oldest range.

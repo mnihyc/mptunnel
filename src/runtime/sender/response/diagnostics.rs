@@ -2,18 +2,18 @@ use super::admission::{
     response_owner_bulk_model_suppression, response_target_emission_credit_bytes,
     response_target_has_emission_credit,
 };
-use super::planner::{
-    response_service_fair_share_bps, response_service_handoff_mode_for_targets,
-    response_service_handoff_preserves_fair_share, response_service_handoff_target_view,
-};
+use super::planner::response_service_handoff_target_view;
 #[cfg(test)]
 use super::*;
 use crate::lab_diagnostics::{lab_diagnostic, lab_diagnostic_event_enabled};
 use crate::model::admission::{BulkAdmissionRole, BulkExplorationCompletionProjection};
 use crate::model::multipath::PathAdmission;
 use crate::model::path::{CarrierPathKey, carrier_path_key_order};
-use crate::model::response::ResponseBulkLead;
-use crate::model::response::{CarrierPathFlightDebt, ResponseServiceFamilyLoads};
+use crate::model::response::{
+    CarrierPathFlightDebt, ResponseBulkLead, ResponseServiceFamilyLoads,
+    response_service_fair_share_bps, response_service_handoff_mode_for_observations,
+    response_service_handoff_preserves_fair_share,
+};
 use crate::mux::MuxLimits;
 use crate::protocol::{StreamOpenRole, UnderlayProtocol};
 use crate::runtime::stream::response::{
@@ -316,8 +316,12 @@ fn evaluate_response_service_handoff_target<'a>(
     {
         return failed(8, "target_session_latency_load");
     }
-    if response_service_handoff_mode_for_targets(service, effective_target, service_family_loads)
-        .is_none()
+    if response_service_handoff_mode_for_observations(
+        &service.observation,
+        &effective_target.observation,
+        service_family_loads,
+    )
+    .is_none()
     {
         return failed(9, "family_or_gain");
     }
@@ -671,14 +675,18 @@ pub(super) fn lab_response_service_handoff_evaluation(
             .saturating_add(1)
             .max(1)
     });
-    let current_share_bps =
-        service.map(|service| response_service_fair_share_bps(service, false).round() as u64);
-    let projected_share_bps =
-        target.map(|target| response_service_fair_share_bps(target, true).round() as u64);
+    let current_share_bps = service
+        .map(|service| response_service_fair_share_bps(&service.observation, false).round() as u64);
+    let projected_share_bps = target
+        .map(|target| response_service_fair_share_bps(&target.observation, true).round() as u64);
     let handoff_mode = service
         .zip(target)
         .and_then(|(service, target)| {
-            response_service_handoff_mode_for_targets(service, target, service_family_loads)
+            response_service_handoff_mode_for_observations(
+                &service.observation,
+                &target.observation,
+                service_family_loads,
+            )
         })
         .map(|mode| format!("{mode:?}"));
     let target_credit = target.map(|target| {
@@ -839,7 +847,11 @@ pub(super) fn lab_response_service_handoff_evaluation(
             service
                 .zip(target)
                 .map_or_else(unknown, |(service, target)| {
-                    response_service_handoff_preserves_fair_share(service, target).to_string()
+                    response_service_handoff_preserves_fair_share(
+                        &service.observation,
+                        &target.observation,
+                    )
+                    .to_string()
                 }),
             service.map_or_else(unknown, |service| service_family_loads
                 .for_underlay(service.observation.key.underlay)

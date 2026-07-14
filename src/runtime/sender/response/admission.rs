@@ -122,13 +122,6 @@ fn response_unique_quic_data_would_expand_ordering_debt(
     )
 }
 
-pub(super) fn response_target_is_plausible_unique_owner_candidate(
-    target: &ResponseSenderPathTarget,
-) -> bool {
-    target.observation.attachment_role != StreamOpenRole::Repair
-        && (target.observation.is_service || target.observation.has_bulk_rate_evidence)
-}
-
 pub(super) fn response_target_is_measured_same_underlay_subflow_candidate(
     service_key: CarrierPathKey,
     target: &ResponseSenderPathTarget,

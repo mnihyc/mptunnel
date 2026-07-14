@@ -810,6 +810,12 @@ pub(in crate::runtime) struct ResponseSenderPathTarget {
     pub(in crate::runtime) ack_clock_calibration_active: bool,
 }
 
+impl AsRef<ResponsePathObservation> for ResponseSenderPathTarget {
+    fn as_ref(&self) -> &ResponsePathObservation {
+        &self.observation
+    }
+}
+
 /// Compact identity retained after path ranking. Model snapshots and
 /// calibration state are intentionally dropped before the per-frame emit path.
 #[derive(Clone)]

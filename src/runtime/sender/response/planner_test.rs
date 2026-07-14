@@ -3947,7 +3947,7 @@ fn active_service_remains_admissible_lead_when_subflow_is_not_admissible() {
 
     let lead = choose_response_admissible_lead(
         &candidates,
-        Some(&service),
+        Some(&service.observation),
         mux_limits,
         payload_bytes,
         &[],
@@ -3972,7 +3972,7 @@ fn active_service_remains_lead_when_measured_subflow_has_lower_eta() {
 
     let lead = choose_response_admissible_lead(
         &candidates,
-        Some(&service),
+        Some(&service.observation),
         mux_limits,
         payload_bytes,
         &[],
@@ -6864,35 +6864,6 @@ fn measured_cross_family_path_handoff_allows_diversification_or_two_x_gain() {
 }
 
 #[test]
-fn balanced_service_handoff_requires_two_x_projected_gain() {
-    let mut service = response_target(0, UnderlayProtocol::Tcp, 80.0, 0, 16 * 1024 * 1024, true);
-    service.snapshot.rate_scope = PathRateScope::PerFlowGoodput;
-    service.snapshot.delivery_rate_bps = 60_000_000.0;
-    let mut udp = response_target(1, UnderlayProtocol::Udp, 5.0, 0, 16 * 1024 * 1024, false);
-    udp.snapshot.delivery_rate_bps = 100_000_000.0;
-
-    assert_eq!(
-        response_service_handoff_mode_for_targets(
-            &service,
-            &udp,
-            ResponseServiceFamilyLoads::new(1, 1),
-        ),
-        None,
-        "a modest gain must not churn sticky Service ownership"
-    );
-    service.snapshot.delivery_rate_bps = 50_000_000.0;
-    assert_eq!(
-        response_service_handoff_mode_for_targets(
-            &service,
-            &udp,
-            ResponseServiceFamilyLoads::new(1, 1),
-        ),
-        Some(ResponseServiceHandoffMode::PerformanceOverride),
-        "a two-fold projected gain survives one additional equal-share flow"
-    );
-}
-
-#[test]
 fn busy_shared_target_carrier_is_pressure_not_binding_debt() {
     let mux_limits = MuxLimits::default();
     let payload_bytes = reliable_bulk_carrier_feed_quantum_bytes(mux_limits);
@@ -7436,7 +7407,8 @@ fn service_handoff_diagnostic_distinguishes_frontier_and_expired_receipt() {
         "the pinned QUIC receipt rate and its capacity scope are one snapshot authority"
     );
     assert!(response_service_handoff_preserves_fair_share(
-        &service, &effective
+        &service.observation,
+        &effective.observation,
     ));
 
     udp.has_bulk_rate_evidence = true;
@@ -7466,27 +7438,15 @@ fn service_handoff_diagnostic_distinguishes_frontier_and_expired_receipt() {
     );
     assert_eq!(blocked_frontier.first_failed_gate, "frontier_not_clear");
     assert!(response_service_handoff_preserves_fair_share(
-        blocked_frontier.service.expect("diagnostic Service"),
-        blocked_frontier.target.expect("diagnostic target"),
+        &blocked_frontier
+            .service
+            .expect("diagnostic Service")
+            .observation,
+        &blocked_frontier
+            .target
+            .expect("diagnostic target")
+            .observation,
     ));
-}
-
-#[test]
-fn service_handoff_fair_share_respects_rate_scope() {
-    let mut tcp = response_target(0, UnderlayProtocol::Tcp, 20.0, 0, 16 * 1024 * 1024, true);
-    tcp.snapshot.delivery_rate_bps = 100_000_000.0;
-    tcp.snapshot.active_flows = 2;
-    let mut udp = response_target(1, UnderlayProtocol::Udp, 80.0, 0, 16 * 1024 * 1024, false);
-    udp.snapshot.delivery_rate_bps = 80_000_000.0;
-    udp.snapshot.active_flows = 0;
-
-    tcp.snapshot.rate_scope = PathRateScope::PathCapacity;
-    assert!(response_service_handoff_preserves_fair_share(&tcp, &udp));
-    tcp.snapshot.rate_scope = PathRateScope::PerFlowGoodput;
-    assert!(
-        !response_service_handoff_preserves_fair_share(&tcp, &udp),
-        "a 100 Mbps per-flow TCP observation must not be divided a second time"
-    );
 }
 
 #[cfg(feature = "lab-diagnostics")]

@@ -19,6 +19,7 @@ pub(in crate::runtime) mod tcp;
 
 pub(super) use commands::*;
 pub(super) use model::*;
+#[cfg(test)]
 pub(super) use proof::*;
 pub(in crate::runtime) use server_context::*;
 pub(in crate::runtime) use set::*;

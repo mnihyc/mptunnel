@@ -2,13 +2,37 @@
 
 use super::client_stream::run_client_udp_stream;
 use super::estimator::UdpPathMetricTracker;
-use super::io::*;
-use super::metrics::*;
-use super::*;
+use super::io::{
+    UdpPathConnection, UdpPathEndpoint, UdpPathRecvStream, UdpPathSendStream,
+    quic_path_open_error_is_retryable, resolve_first_socket_addr, spawn_quic_path_reader,
+    udp_path_command_queue, udp_path_finish_stream, udp_path_max_stream_payload_bytes,
+    udp_path_read_frame, udp_path_write_frame, udp_reliable_stream_frame_queue,
+};
+#[cfg(feature = "lab-diagnostics")]
+use super::metrics::log_quic_ack_poll_diagnostics;
+use super::metrics::quic_path_metrics_poll_interval;
+use crate::config::SecurityConfig;
+#[cfg(feature = "lab-diagnostics")]
+use crate::lab_diagnostics::lab_diagnostic;
+use crate::model::timing::default_transport_pto;
+use crate::mux::MuxLimits;
+use crate::protocol::codec::CodecLimits;
+use crate::protocol::{
+    Frame, IngressKind, OutboundPolicy, PathId, SessionId, StreamId, TargetAddr, UnderlayProtocol,
+};
+use crate::runtime::error::RuntimeError;
 use crate::runtime::path::authentication::ClientPathAuthenticationFrames;
-use crate::scheduler::stream_demand_hint_for_lane;
-use crate::transport::{CarrierSocketProvider, CarrierSocketRequest};
+use crate::runtime::path::commands::reliable_path_command_channels;
+use crate::runtime::path::model::path_startup_snapshot;
+use crate::runtime::path::state::ClientPathState;
+use crate::runtime::relay::UdpStreamOpenOptions;
+use crate::runtime::stream::{ReliablePathStream, ReliablePathStreamOutput};
+use crate::scheduler::{FlowLane, stream_demand_hint_for_lane};
+use crate::transport::{CarrierSocketProvider, CarrierSocketRequest, PathSpec};
+use std::sync::Arc;
+use std::time::Instant;
 use tokio::sync::Mutex as AsyncMutex;
+use tokio::sync::mpsc;
 
 #[derive(Clone)]
 pub(in crate::runtime) struct ClientUdpPathSessionHandle {

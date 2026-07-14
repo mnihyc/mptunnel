@@ -3,8 +3,6 @@
 //! QUIC packet-ACK evidence stays native to this carrier. Sender policy only
 //! consumes typed path evidence and never treats it as TCP socket telemetry.
 
-use super::*;
-
 mod capacity;
 pub(in crate::runtime) mod client;
 mod client_stream;

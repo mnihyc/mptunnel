@@ -7,10 +7,17 @@ use super::io::UdpPathConnection;
 #[cfg(feature = "lab-diagnostics")]
 use super::metrics::QuicAckPollDiagnostics;
 use super::metrics::UdpPathMetrics;
-use super::*;
 use crate::model::capacity::{
-    QuicCapacityProofCandidate, quic_capacity_receipt_rate_bps, valid_quic_capacity_proof_geometry,
+    BBR_DEFAULT_CWND_GAIN, PATH_OPEN_SCORE_BYTES, QUIC_INITIAL_WINDOW_PACKETS,
+    QUIC_TIMER_GRANULARITY, QuicCapacityProofCandidate,
+    RELIABLE_STREAM_STARTUP_PRODUCT_WINDOW_BYTES, quic_capacity_receipt_rate_bps,
+    valid_quic_capacity_proof_geometry,
 };
+use crate::model::timing::quic_bulk_proof_freshness_horizon;
+use crate::protocol::UnderlayProtocol;
+use crate::runtime::path::model::default_path_rate_bps;
+use crate::transport::quic as quic_transport;
+use std::time::{Duration, Instant};
 
 #[derive(Debug, Default)]
 pub(super) struct UdpPathMetricTracker {

@@ -2,9 +2,27 @@
 
 use super::capacity::udp_path_write_capacity_receipt;
 use super::client_writer::drain_client_udp_stream_commands;
-use super::io::*;
-use super::*;
+use super::io::{
+    UdpPathRecvStream, UdpPathSendStream, spawn_quic_path_reader, udp_path_finish_stream,
+    udp_path_write_frame,
+};
+#[cfg(feature = "lab-diagnostics")]
+use crate::lab_diagnostics::lab_diagnostic;
+use crate::model::capacity::reliable_capacity_calibration_session_limit_bytes;
+use crate::mux::MuxLimits;
+use crate::protocol::codec::CodecLimits;
 use crate::protocol::path_capacity::CapacityReceiveTracker;
+use crate::protocol::{Frame, PathId, StreamId};
+use crate::runtime::error::RuntimeError;
+use crate::runtime::path::commands::{
+    ReliablePathCommandReceivers, recv_reliable_path_command, reliable_path_receivers_closed,
+    try_recv_reliable_path_command, try_recv_reliable_path_priority_command,
+};
+use crate::runtime::path::proof::{PathProofTracker, path_proof_ack_frame};
+use crate::runtime::path::state::ClientPathState;
+use std::sync::Arc;
+use std::time::Instant;
+use tokio::sync::mpsc;
 
 pub(super) async fn run_client_udp_stream(
     mut send: UdpPathSendStream,

@@ -1,5 +1,7 @@
+#[cfg(test)]
+pub(super) use crate::config::SecurityConfig;
 pub(super) use crate::config::{
-    ManagementConfig, MppPerformanceConfig, RouteTarget, RouteTargetKind, SecurityConfig,
+    ManagementConfig, MppPerformanceConfig, RouteTarget, RouteTargetKind,
 };
 pub(super) use crate::ingress::http_connect::{self, HttpConnectError, HttpStatus};
 pub(super) use crate::ingress::socks5::{self, Socks5Error, Socks5Reply};
@@ -7,15 +9,20 @@ pub(super) use crate::ingress::tun::TunL4Config;
 pub(super) use crate::ingress::{IngressConfig, ProxyAuthConfig};
 pub(super) use crate::mux::MuxLimits;
 pub(super) use crate::mux::stream::{ReliableRecvStream, ReliableSendStream};
-pub(super) use crate::outbound::{self, TargetProtocol};
+pub(super) use crate::outbound;
+#[cfg(test)]
+pub(super) use crate::outbound::TargetProtocol;
 #[cfg(test)]
 pub(super) use crate::protocol::auth::{PathJoinAuthCheck, SessionAuthCheck, SessionAuthenticator};
+#[cfg(test)]
 pub(super) use crate::protocol::codec::CodecLimits;
 pub(super) use crate::protocol::{
-    CloseReason, DatagramFlowId, Frame, IngressKind, OffsetRange, OutboundPolicy, PathCapabilities,
-    PathId, PathMetricDirection, PathMetrics, RateHint, ResetReason, SessionId, StreamFlags,
-    StreamId, StreamOpenRole, TargetAddr, UnderlayProtocol,
+    CloseReason, Frame, IngressKind, OffsetRange, OutboundPolicy, PathId, PathMetricDirection,
+    PathMetrics, RateHint, ResetReason, SessionId, StreamFlags, StreamId, StreamOpenRole,
+    TargetAddr, UnderlayProtocol,
 };
+#[cfg(test)]
+pub(super) use crate::protocol::{DatagramFlowId, PathCapabilities};
 pub(super) use crate::scheduler::{
     self, FlowDemand, FlowLane, PathRateScope, PathSnapshot, PathState as SchedulerPathState,
     SchedulerPolicy,

@@ -17,10 +17,12 @@ protocol asymmetry is expected.
 - TCP and QUIC path directories are concrete carrier implementations with
   distinct I/O, telemetry, recovery, and actor lifecycles. Their depth is
   earned even when their file counts differ.
-- Request sender `service.rs` and its test file contain nearly their entire
-  aggregate. Response sender `planner.rs` also owns several unrelated policy
-  stages. Those are real imbalance and must be divided by state and algorithm
-  ownership.
+- Request product state is scattered across sender and relay while response
+  product state has a real stream owner. That directional mismatch is a deeper
+  imbalance than file count and must be corrected with peer stream owners.
+- Request sender `service.rs` still contains about 98 percent of its production
+  aggregate, and response sender `planner.rs` about 70 percent of its aggregate.
+  Both earn flat directional children divided by state and algorithm ownership.
 - Thin facades, one-off helpers, and directories with no independent invariant
   are collapsed instead of being retained for visual symmetry.
 
@@ -39,13 +41,32 @@ QUIC calibration, and handoff remain distinct typed operations but share an
 exclusive-operation enum. Carrier-specific proof state is never unified into a
 generic controller.
 
-### Sender
+### Request stream
 
-Keep request and response as directional aggregates. Each named facade owns its
-service state and orchestration; children own observation, capacity evidence,
-admission, selection, intent construction, dispatch, repair, and diagnostics.
-Pure planning receives immutable snapshots and returns generation-fenced
-intents. Runtime application revalidates and commits those intents atomically.
+Use a peer `runtime/stream/request.rs` facade with one flat request directory.
+Its binding owns product offsets, exact flights, ACK state, outstanding window,
+startup epoch, evidence, repair provenance, and lifecycle. The client relay
+task already serializes this state, so the binding stays single-task and
+lock-free instead of copying the response side's mutex design.
+
+The request binding replaces parallel per-instance maps with one typed subflow
+aggregate and replaces independently optional ACK-clock owner/pending fields
+with one exclusive operation enum. TCP and QUIC capacity controller state does
+not move into this product aggregate.
+
+### Model, scheduler, and sender
+
+Keep request and response as peer directional owners at each earned layer.
+Model owns immutable evidence and intent vocabulary. Scheduler owns pure
+admission and selection over snapshots. Sender owns queues, observation,
+dispatch orchestration, progress, repair, diagnostics, and distinct TCP/QUIC
+capacity controllers.
+
+Planning returns ID-only, generation-fenced intents without command senders,
+binding handles, or mutable runtime state. Readiness preview must use the same
+pure decision path without reserving probes, drains, or ACK-clock state. Apply
+resolves the exact identity and atomically commits enqueue, exact flight, and
+Service ownership; a failed apply leaves none of them published.
 
 ### Carrier paths
 
@@ -79,17 +100,24 @@ verification targets.
    production `#[path]` wiring and broad re-export chain.
 4. Move pure frame, range, ordering, capacity, and path-order functions to
    protocol/model/scheduler owners. Remove path/stream/relay reverse imports.
-5. Split request sender by flight, ACK clock, capacity, planner, dispatch,
-   repair, startup, and diagnostics ownership. Split its tests at the same
-   boundaries and retire `relay_striping.rs` as a catch-all owner.
-6. Split response planning into observe, decide, intent, and apply contracts.
-   Keep selection pure and put queue/flight mutation only in apply owners.
-7. Split shared path state and command code by health, capacity transactions,
-   load, queue, and writer ownership without merging TCP and QUIC controllers.
-8. Split relay orchestration after its lower-level utilities have moved out.
-9. Replace repeated `mod.rs` facades, production glob imports, runtime prelude
-   leakage, and broad re-exports with named contracts.
-10. Move remaining inline tests, update `ARCHITECTURE.md` to the final paths,
+5. Move response tests out of the request mega-test and attach them to response
+   admission, selection, capacity, handoff, repair, apply, and service owners.
+6. Introduce peer model/scheduler/stream request owners. Move exact flights,
+   ACK/window/startup/evidence/repair state into `stream/request`, collapse its
+   parallel maps, and keep the aggregate lock-free under the client relay task.
+7. Split request observation, dispatch, progress, repair, diagnostics, and the
+   separate TCP/QUIC capacity controllers. Move attach/fail orchestration to the
+   remote-set owner, then retire `relay_striping.rs` and the request mega-files.
+8. Split response planning into coherent observe, decide, typed intent, and
+   atomic apply contracts. Make preview side-effect free and move pure capacity
+   and placement arithmetic to model/scheduler owners without changing values.
+9. Split shared path state and command code by identity, health, capacity
+   transactions, load, queue, and writer ownership without merging TCP and QUIC
+   controllers.
+10. Split relay orchestration after its lower-level utilities have moved out.
+11. Replace repeated `mod.rs` facades, production glob imports, runtime prelude
+    leakage, and broad re-exports with named contracts.
+12. Move remaining inline tests, update `ARCHITECTURE.md` to the final paths,
     then run the deferred test, target, Wine, and lab verification matrix.
 
 ## Checkpoint policy
@@ -99,6 +127,10 @@ pass default and all-feature production checks. Unit and integration tests are
 deliberately deferred until the migration reaches a coherent endpoint, as
 requested. Behavioral fixes found during migration are recorded and applied in
 separate commits with focused tests and relevant lab evidence.
+
+The response fixed TCP train/validity policy remains unchanged during ownership
+moves. Its high-BDP adequacy is a later behavior checkpoint requiring matched
+100-500 Mbps experiments; a structural commit cannot silently tune it.
 
 The final checkpoint requires source tests, supported target builds, Windows
 CLI/config/TCP/QUIC smoke under Wine, native packet-device follow-up where Wine

@@ -4,6 +4,7 @@ mod identity;
 mod ingress_runtime;
 mod management;
 mod node;
+mod packet_device;
 mod path;
 mod prelude;
 mod recent_ids;
@@ -15,7 +16,8 @@ mod tun_l4;
 
 pub use datagram::client_udp_datagram_round_trip;
 pub use error::RuntimeError;
-pub use node::run;
+pub use node::{run, run_with_packet_device_provider};
+pub use packet_device::{PacketDevice, PacketDeviceProvider, SystemPacketDeviceProvider};
 
 #[cfg(feature = "lab-diagnostics")]
 use crate::lab_diagnostics::*;

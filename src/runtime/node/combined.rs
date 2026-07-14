@@ -4,11 +4,14 @@ use super::{client, server};
 use crate::config::{ManagementConfig, NodeConfig, ResourceLimits};
 use crate::runtime::error::RuntimeError;
 use crate::runtime::management::run_node_management_api;
+use crate::runtime::packet_device::PacketDeviceProvider;
+use std::sync::Arc;
 
 pub(super) async fn run(
     node: NodeConfig,
     resources: ResourceLimits,
     management: ManagementConfig,
+    packet_devices: Arc<dyn PacketDeviceProvider>,
 ) -> Result<(), RuntimeError> {
     let mut services = tokio::task::JoinSet::new();
 
@@ -20,7 +23,12 @@ pub(super) async fn run(
             client_config.path_probe_interval,
             client_config.path_probe_timeout,
         );
-        client::spawn_ingresses(client_config.ingresses, context.clone(), &mut services);
+        client::spawn_ingresses(
+            client_config.ingresses,
+            context.clone(),
+            packet_devices.clone(),
+            &mut services,
+        );
         client_contexts.push(context);
     }
 

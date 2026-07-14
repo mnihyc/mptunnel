@@ -5,9 +5,9 @@ const TUN_UDP_FLOW_IDLE_TIMEOUT: Duration = Duration::from_secs(60);
 pub(super) async fn run_tun_l4_client(
     tun: TunL4Config,
     context: ClientPathContext,
+    device: PacketDevice,
 ) -> Result<(), RuntimeError> {
-    let device = build_tun_device(&tun)?;
-    let framed = DeviceFramed::new(device, BytesCodec::new());
+    let framed = DeviceFramed::new(device.into_inner(), BytesCodec::new());
     let (mut tun_sink, mut tun_stream) = framed.split();
 
     let (stack, runner, udp_socket, tcp_listener) = StackBuilder::default()
@@ -46,20 +46,6 @@ pub(super) async fn run_tun_l4_client(
         run_tun_udp_socket(udp_socket, context, tun)
     )?;
     Ok(())
-}
-
-pub(super) fn build_tun_device(tun: &TunL4Config) -> Result<tun_rs::AsyncDevice, RuntimeError> {
-    let mut builder = DeviceBuilder::new().mtu(tun.mtu);
-    if let Some(name) = &tun.name {
-        builder = builder.name(name.clone());
-    }
-    if let Some(ipv4) = tun.ipv4 {
-        builder = builder.ipv4(ipv4, tun.ipv4_prefix, tun.ipv4_gateway);
-    }
-    if let Some(ipv6) = tun.ipv6 {
-        builder = builder.ipv6(ipv6, tun.ipv6_prefix);
-    }
-    builder.build_async().map_err(RuntimeError::TunDevice)
 }
 
 pub(super) async fn run_tun_tcp_listener(

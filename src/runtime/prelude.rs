@@ -39,5 +39,4 @@ pub(super) use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 pub(super) use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 pub(super) use tokio::net::{TcpListener, TcpStream, UdpSocket};
 pub(super) use tokio::sync::{Notify, mpsc, oneshot, watch};
-pub(super) use tun_rs::DeviceBuilder;
 pub(super) use tun_rs::async_framed::{BytesCodec, DeviceFramed};

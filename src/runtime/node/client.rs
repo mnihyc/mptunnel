@@ -9,14 +9,17 @@ use crate::runtime::ingress_runtime::{
     run_socks5_client_ingress,
 };
 use crate::runtime::management::run_client_management_api;
+use crate::runtime::packet_device::PacketDeviceProvider;
 use crate::runtime::path::ClientPathContext;
 use crate::runtime::tun_l4::run_tun_l4_client;
+use std::sync::Arc;
 use std::time::Duration;
 
 pub(super) async fn run(
     client: ClientConfig,
     resources: ResourceLimits,
     management: ManagementConfig,
+    packet_devices: Arc<dyn PacketDeviceProvider>,
 ) -> Result<(), RuntimeError> {
     let path_probe_interval = client.path_probe_interval;
     let path_probe_timeout = client.path_probe_timeout;
@@ -27,7 +30,7 @@ pub(super) async fn run(
         let context = context.clone();
         ingresses.spawn(async move { run_client_management_api(management, context).await });
     }
-    spawn_ingresses(client.ingresses, context, &mut ingresses);
+    spawn_ingresses(client.ingresses, context, packet_devices, &mut ingresses);
     wait_for_ingress(ingresses).await
 }
 
@@ -47,6 +50,7 @@ pub(super) fn new_path_context(
 pub(super) fn spawn_ingresses(
     ingresses: Vec<LocalIngressConfig>,
     context: ClientPathContext,
+    packet_devices: Arc<dyn PacketDeviceProvider>,
     tasks: &mut tokio::task::JoinSet<Result<(), RuntimeError>>,
 ) {
     for ingress in ingresses {
@@ -63,7 +67,11 @@ pub(super) fn spawn_ingresses(
                 });
             }
             IngressConfig::TunL4(tun) => {
-                tasks.spawn(async move { run_tun_l4_client(tun, context).await });
+                let packet_devices = packet_devices.clone();
+                tasks.spawn(async move {
+                    let device = packet_devices.open(&tun).map_err(RuntimeError::TunDevice)?;
+                    run_tun_l4_client(tun, context, device).await
+                });
             }
         }
     }

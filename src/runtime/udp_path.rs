@@ -1,4 +1,5 @@
 use super::*;
+use crate::protocol::path_capacity::CapacityReceiveTracker;
 use tokio::net::lookup_host;
 use tokio::sync::Mutex as AsyncMutex;
 
@@ -1329,7 +1330,7 @@ async fn run_client_udp_stream(
                             {
                                 Ok(bytes) => bytes,
                                 Err(err) => {
-                                    let _ = frames.send(Err(err)).await;
+                                    let _ = frames.send(Err(err.into())).await;
                                     return;
                                 }
                             };
@@ -1482,7 +1483,7 @@ async fn run_client_udp_stream(
                         {
                             Ok(bytes) => bytes,
                             Err(err) => {
-                                let _ = frames.send(Err(err)).await;
+                                let _ = frames.send(Err(err.into())).await;
                                 return;
                             }
                         };

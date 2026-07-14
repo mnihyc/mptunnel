@@ -5,6 +5,7 @@ use crate::mux::stream::StreamError;
 use crate::outbound;
 use crate::platform;
 use crate::protocol::auth::AuthError;
+use crate::protocol::path_capacity::PathCapacityReceiveError;
 use crate::protocol::{CloseReason, ResetReason};
 use crate::transport::PathSpecParseError;
 use crate::transport::encrypted::EncryptedFramedTransportError;
@@ -121,6 +122,12 @@ impl From<DatagramError> for RuntimeError {
 impl From<PathSpecParseError> for RuntimeError {
     fn from(value: PathSpecParseError) -> Self {
         Self::PathSpec(value)
+    }
+}
+
+impl From<PathCapacityReceiveError> for RuntimeError {
+    fn from(value: PathCapacityReceiveError) -> Self {
+        Self::Protocol(value.message())
     }
 }
 

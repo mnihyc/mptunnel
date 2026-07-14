@@ -1,4 +1,5 @@
 use super::*;
+use crate::protocol::path_capacity::CapacityReceiveTracker;
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -1925,7 +1926,8 @@ async fn handle_client_tcp_path_frame(
             payload,
         } if capacity_path_id == path_id => connection
             .capacity_receive
-            .record_data(calibration_id, payload.len()),
+            .record_data(calibration_id, payload.len())
+            .map_err(Into::into),
         Frame::PathCapacityFinish {
             path_id: capacity_path_id,
             calibration_id,

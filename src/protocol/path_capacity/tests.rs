@@ -15,14 +15,14 @@ fn capacity_receive_tracker_rejects_over_limit_and_interleaving() {
     over_limit.record_data(7, 900).expect("first record");
     assert!(matches!(
         over_limit.record_data(7, 125),
-        Err(RuntimeError::Protocol(_))
+        Err(PathCapacityReceiveError::SessionEnvelopeExceeded)
     ));
 
     let mut interleaved = CapacityReceiveTracker::new(1024);
     interleaved.record_data(7, 400).expect("first token");
     assert!(matches!(
         interleaved.record_data(8, 400),
-        Err(RuntimeError::Protocol(_))
+        Err(PathCapacityReceiveError::InterleavedToken)
     ));
 }
 
@@ -33,6 +33,6 @@ fn capacity_receive_tracker_rejects_mismatched_finish() {
 
     assert!(matches!(
         tracker.finish(8, 400),
-        Err(RuntimeError::Protocol(_))
+        Err(PathCapacityReceiveError::FinishMismatch)
     ));
 }

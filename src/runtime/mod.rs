@@ -1,6 +1,5 @@
 mod ack_clock_policy;
 mod bulk_admission;
-mod capacity_receipt;
 mod core;
 mod datagram;
 mod error;
@@ -37,7 +36,6 @@ pub use error::RuntimeError;
 
 #[cfg(feature = "lab-diagnostics")]
 use crate::lab_diagnostics::*;
-use capacity_receipt::*;
 use core::*;
 use datagram::*;
 use ingress_runtime::*;

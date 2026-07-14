@@ -1,5 +1,40 @@
 use super::*;
 use bytes::Bytes;
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
+
+#[test]
+fn quic_resolution_keeps_all_unique_source_compatible_addresses() {
+    let v4_first = SocketAddr::from(([192, 0, 2, 10], 443));
+    let v6 = SocketAddr::from(([0x2001, 0xdb8, 0, 0, 0, 0, 0, 10], 443));
+    let v4_second = SocketAddr::from(([192, 0, 2, 11], 443));
+    let resolved = [v4_first, v6, v4_first, v4_second];
+
+    assert_eq!(
+        compatible_udp_path_socket_addrs(resolved, None),
+        vec![v4_first, v6, v4_second]
+    );
+    assert_eq!(
+        compatible_udp_path_socket_addrs(resolved, Some(IpAddr::V4(Ipv4Addr::LOCALHOST))),
+        vec![v4_first, v4_second]
+    );
+    assert_eq!(
+        compatible_udp_path_socket_addrs(resolved, Some(IpAddr::V6(Ipv6Addr::LOCALHOST))),
+        vec![v6]
+    );
+}
+
+#[test]
+fn quic_resolution_interleaves_grouped_address_families() {
+    let v6_first = SocketAddr::from(([0x2001, 0xdb8, 0, 0, 0, 0, 0, 1], 443));
+    let v6_second = SocketAddr::from(([0x2001, 0xdb8, 0, 0, 0, 0, 0, 2], 443));
+    let v4_first = SocketAddr::from(([192, 0, 2, 1], 443));
+    let v4_second = SocketAddr::from(([192, 0, 2, 2], 443));
+
+    assert_eq!(
+        interleave_udp_path_socket_addr_families(vec![v6_first, v6_second, v4_first, v4_second,]),
+        vec![v6_first, v4_first, v6_second, v4_second]
+    );
+}
 
 #[test]
 fn quic_ordinary_writer_enforces_measurement_ownership() {

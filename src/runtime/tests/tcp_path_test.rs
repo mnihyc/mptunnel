@@ -400,29 +400,19 @@ async fn duplicate_pending_tcp_open_preserves_the_first_wire_owner() -> Result<(
     Ok(())
 }
 
-#[tokio::test]
-async fn dropped_accepted_stream_guard_queues_detach_and_local_close() {
+#[test]
+fn dropped_accepted_stream_guard_queues_detach_and_local_close() {
     let stream_id = StreamId(92);
     let (opened, mut receivers, _frames) =
         opened_relay_stream_for_test(stream_id, UnderlayProtocol::Udp, 0);
     drop(AcceptedRemoteStreamGuard::new(opened.stream));
 
     assert!(matches!(
-        tokio::time::timeout(
-            Duration::from_secs(1),
-            recv_reliable_path_command(&mut receivers),
-        )
-        .await
-        .expect("detach command deadline"),
+        try_recv_reliable_path_command(&mut receivers),
         Some(ReliablePathCommand::SendFrame(Frame::StreamDetach { stream_id: id })) if id == stream_id
     ));
     assert!(matches!(
-        tokio::time::timeout(
-            Duration::from_secs(1),
-            recv_reliable_path_command(&mut receivers),
-        )
-        .await
-        .expect("close command deadline"),
+        try_recv_reliable_path_command(&mut receivers),
         Some(ReliablePathCommand::CloseStream(id)) if id == stream_id
     ));
 }

@@ -111,24 +111,24 @@ pub(in crate::runtime) fn udp_probe_ceiling_payload_bytes(max_payload_bytes: usi
 }
 
 pub(in crate::runtime) fn health_observations(
-    records: &mut [ClientPathHealthRecord],
+    records: &[ClientPathHealthRecord],
+    now: Instant,
 ) -> Vec<ClientPathObservation> {
-    let now = Instant::now();
     records
-        .iter_mut()
-        .map(|record| record.observe(now))
+        .iter()
+        .map(|record| record.observation_at(now))
         .collect()
 }
 
 pub(in crate::runtime) fn path_records_have_schedulable_alternative(
-    records: &mut [ClientPathHealthRecord],
+    records: &[ClientPathHealthRecord],
     failed_index: usize,
     now: Instant,
 ) -> bool {
-    records.iter_mut().enumerate().any(|(index, record)| {
+    records.iter().enumerate().any(|(index, record)| {
         index != failed_index
             && !matches!(
-                record.observe(now).state,
+                record.observation_at(now).state,
                 SchedulerPathState::Failed | SchedulerPathState::Draining
             )
     })

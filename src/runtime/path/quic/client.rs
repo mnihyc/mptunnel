@@ -4,9 +4,10 @@ use super::client_stream::run_client_udp_stream;
 use super::estimator::UdpPathMetricTracker;
 use super::io::{
     UdpPathConnection, UdpPathEndpoint, UdpPathRecvStream, UdpPathSendStream,
-    quic_path_open_error_is_retryable, resolve_first_socket_addr, spawn_quic_path_reader,
-    udp_path_command_queue, udp_path_finish_stream, udp_path_max_stream_payload_bytes,
-    udp_path_read_frame, udp_path_write_frame, udp_reliable_stream_frame_queue,
+    interleave_udp_path_socket_addr_families, quic_path_open_error_is_retryable,
+    resolve_udp_path_socket_addrs, spawn_quic_path_reader, udp_path_command_queue,
+    udp_path_finish_stream, udp_path_max_stream_payload_bytes, udp_path_read_frame,
+    udp_path_write_frame, udp_reliable_stream_frame_queue,
 };
 #[cfg(feature = "lab-diagnostics")]
 use super::metrics::log_quic_ack_poll_diagnostics;
@@ -29,10 +30,32 @@ use crate::runtime::relay::UdpStreamOpenOptions;
 use crate::runtime::stream::{ReliablePathStream, ReliablePathStreamOutput};
 use crate::scheduler::{FlowLane, stream_demand_hint_for_lane};
 use crate::transport::{CarrierSocketProvider, CarrierSocketRequest, PathSpec};
+use futures::StreamExt;
+use futures::stream::FuturesUnordered;
+use std::collections::VecDeque;
 use std::sync::Arc;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 use tokio::sync::Mutex as AsyncMutex;
+
+// RFC 8305's default keeps a blackholed family from monopolizing setup without
+// opening every resolver answer in one socket/TLS burst.
+const QUIC_ADDRESS_ATTEMPT_DELAY: Duration = Duration::from_millis(250);
+const MAX_QUIC_ADDRESS_ATTEMPTS: usize = 8;
 use tokio::sync::mpsc;
+
+fn quic_address_attempt_delay(remaining: Duration, unstarted: usize) -> Duration {
+    debug_assert!(unstarted > 0 && unstarted < u32::MAX as usize);
+    let slots = unstarted as u32 + 1;
+    (remaining / slots).min(QUIC_ADDRESS_ATTEMPT_DELAY)
+}
+
+fn next_quic_address_attempt_at(
+    open_deadline: tokio::time::Instant,
+    unstarted: usize,
+) -> tokio::time::Instant {
+    let now = tokio::time::Instant::now();
+    now + quic_address_attempt_delay(open_deadline.saturating_duration_since(now), unstarted)
+}
 
 #[derive(Clone)]
 pub(in crate::runtime) struct ClientUdpPathSessionHandle {
@@ -67,59 +90,74 @@ impl ClientUdpPathSessionHandle {
         ingress: IngressKind,
         lane: FlowLane,
         options: UdpStreamOpenOptions,
+        open_deadline: tokio::time::Instant,
     ) -> Result<ReliablePathStream, RuntimeError> {
-        let connection = self.ensure_connection().await?;
-        match open_client_udp_stream_on_connection(
-            connection,
-            stream_id,
-            target.clone(),
-            ingress,
-            lane,
-            options,
-            self.runtime.clone(),
-        )
-        .await
-        {
-            Ok(stream) => Ok(stream),
-            Err(err) if quic_path_open_error_is_retryable(&err) => {
-                self.drop_connection().await;
-                let connection = self.ensure_connection().await?;
-                open_client_udp_stream_on_connection(
-                    connection,
-                    stream_id,
-                    target,
-                    ingress,
-                    lane,
-                    options,
-                    self.runtime.clone(),
-                )
-                .await
+        let open = async {
+            let connection = self.ensure_connection(open_deadline).await?;
+            match open_client_udp_stream_on_connection(
+                connection,
+                stream_id,
+                target.clone(),
+                ingress,
+                lane,
+                options,
+                self.runtime.clone(),
+            )
+            .await
+            {
+                Ok(stream) => Ok(stream),
+                Err(err) if quic_path_open_error_is_retryable(&err) => {
+                    self.drop_connection().await;
+                    let connection = self.ensure_connection(open_deadline).await?;
+                    open_client_udp_stream_on_connection(
+                        connection,
+                        stream_id,
+                        target,
+                        ingress,
+                        lane,
+                        options,
+                        self.runtime.clone(),
+                    )
+                    .await
+                }
+                Err(err) => Err(err),
             }
-            Err(err) => Err(err),
-        }
+        };
+        tokio::time::timeout_at(open_deadline, open)
+            .await
+            .map_err(|_| RuntimeError::PathOpenTimedOut)?
     }
 
     pub(in crate::runtime) async fn open_datagram_stream(
         &self,
+        open_deadline: tokio::time::Instant,
     ) -> Result<ClientUdpDatagramStream, RuntimeError> {
-        let connection = self.ensure_connection().await?;
-        match open_client_udp_datagram_stream(connection, self.runtime.clone()).await {
-            Ok(stream) => Ok(stream),
-            Err(err) if quic_path_open_error_is_retryable(&err) => {
-                self.drop_connection().await;
-                let connection = self.ensure_connection().await?;
-                open_client_udp_datagram_stream(connection, self.runtime.clone()).await
+        let open = async {
+            let connection = self.ensure_connection(open_deadline).await?;
+            match open_client_udp_datagram_stream(connection, self.runtime.clone()).await {
+                Ok(stream) => Ok(stream),
+                Err(err) if quic_path_open_error_is_retryable(&err) => {
+                    self.drop_connection().await;
+                    let connection = self.ensure_connection(open_deadline).await?;
+                    open_client_udp_datagram_stream(connection, self.runtime.clone()).await
+                }
+                Err(err) => Err(err),
             }
-            Err(err) => Err(err),
-        }
+        };
+        tokio::time::timeout_at(open_deadline, open)
+            .await
+            .map_err(|_| RuntimeError::PathOpenTimedOut)?
     }
 
-    async fn ensure_connection(&self) -> Result<UdpPathConnection, RuntimeError> {
+    async fn ensure_connection(
+        &self,
+        open_deadline: tokio::time::Instant,
+    ) -> Result<UdpPathConnection, RuntimeError> {
         let mut current = self.connection.lock().await;
         if let Some(connection) = current.as_ref() {
             return Ok(connection.connection.clone());
         }
-        let connection = connect_client_udp_path(&self.runtime).await?;
+        let connection = connect_client_udp_path(&self.runtime, open_deadline).await?;
         let carrier_connection = connection.connection.clone();
         *current = Some(connection);
         Ok(carrier_connection)
@@ -255,8 +293,97 @@ pub(in crate::runtime) struct ClientUdpDatagramStream {
 
 async fn connect_client_udp_path(
     runtime: &ClientUdpPathSessionRuntime,
+    open_deadline: tokio::time::Instant,
 ) -> Result<ClientUdpPathConnection, RuntimeError> {
-    let remote_addr = resolve_first_socket_addr(&runtime.path).await?;
+    let connect = async {
+        let resolved = resolve_udp_path_socket_addrs(&runtime.path).await?;
+        let mut remote_addrs = interleave_udp_path_socket_addr_families(resolved)
+            .into_iter()
+            .take(MAX_QUIC_ADDRESS_ATTEMPTS)
+            .collect::<VecDeque<_>>();
+        let mut attempts = FuturesUnordered::new();
+        let first_addr = remote_addrs
+            .pop_front()
+            .expect("resolver rejects an empty address set");
+        attempts.push(connect_client_udp_addr(runtime, first_addr));
+        let mut next_attempt_at = (!remote_addrs.is_empty())
+            .then(|| next_quic_address_attempt_at(open_deadline, remote_addrs.len()));
+
+        // A blackholed first DNS record must not consume the whole path budget.
+        // Race establishment only; dropping the remaining futures closes losers.
+        let mut last_error = None;
+        let established = loop {
+            let completed = if remote_addrs.is_empty() {
+                attempts.next().await
+            } else {
+                tokio::select! {
+                    biased;
+                    completed = attempts.next() => completed,
+                    _ = tokio::time::sleep_until(
+                        next_attempt_at.expect("unstarted addresses have a launch time")
+                    ) => {
+                        if tokio::time::Instant::now() >= open_deadline {
+                            return Err(RuntimeError::PathOpenTimedOut);
+                        }
+                        let remote_addr = remote_addrs
+                            .pop_front()
+                            .expect("address availability checked before stagger timer");
+                        attempts.push(connect_client_udp_addr(runtime, remote_addr));
+                        next_attempt_at = (!remote_addrs.is_empty()).then(|| {
+                            next_quic_address_attempt_at(open_deadline, remote_addrs.len())
+                        });
+                        continue;
+                    }
+                }
+            };
+            match completed {
+                Some(Ok(connection)) => break connection,
+                Some(Err(err)) => {
+                    last_error = Some(err);
+                    tokio::task::yield_now().await;
+                    if tokio::time::Instant::now() >= open_deadline {
+                        return Err(RuntimeError::PathOpenTimedOut);
+                    }
+                    // A hard failure does not need the blackhole stagger.
+                    if attempts.is_empty()
+                        && let Some(remote_addr) = remote_addrs.pop_front()
+                    {
+                        attempts.push(connect_client_udp_addr(runtime, remote_addr));
+                        next_attempt_at = (!remote_addrs.is_empty()).then(|| {
+                            next_quic_address_attempt_at(open_deadline, remote_addrs.len())
+                        });
+                    }
+                }
+                None => {
+                    return Err(last_error.unwrap_or(RuntimeError::Protocol(
+                        "QUIC UDP path exhausted resolved socket addresses",
+                    )));
+                }
+            }
+        };
+        drop(attempts);
+        let (endpoint, connection) = established;
+
+        // Address retry owns only carrier establishment. Authenticate exactly
+        // once so a rejected MPP identity is never retried as a DNS decision.
+        perform_client_udp_path_handshake(&connection, runtime).await?;
+        let metrics_task = spawn_client_udp_path_metrics(runtime.clone(), connection.clone());
+        Ok(ClientUdpPathConnection {
+            _endpoint: endpoint,
+            connection,
+            metrics_task: Some(metrics_task),
+        })
+    };
+    tokio::time::timeout_at(open_deadline, connect)
+        .await
+        .map_err(|_| RuntimeError::PathOpenTimedOut)?
+}
+
+async fn connect_client_udp_addr(
+    runtime: &ClientUdpPathSessionRuntime,
+    remote_addr: std::net::SocketAddr,
+) -> Result<(UdpPathEndpoint, UdpPathConnection), RuntimeError> {
+    // Each attempt needs its own family-correct, host-protected socket.
     let carrier = runtime.carrier_sockets.create(CarrierSocketRequest {
         path: &runtime.path,
         config_ordinal: runtime.config_ordinal,
@@ -264,13 +391,7 @@ async fn connect_client_udp_path(
     })?;
     let endpoint = UdpPathEndpoint::bind_client(carrier, runtime).await?;
     let connection = endpoint.connect(remote_addr).await?;
-    perform_client_udp_path_handshake(&connection, runtime).await?;
-    let metrics_task = spawn_client_udp_path_metrics(runtime.clone(), connection.clone());
-    Ok(ClientUdpPathConnection {
-        _endpoint: endpoint,
-        connection,
-        metrics_task: Some(metrics_task),
-    })
+    Ok((endpoint, connection))
 }
 
 async fn perform_client_udp_path_handshake(

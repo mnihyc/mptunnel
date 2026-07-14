@@ -19,7 +19,8 @@ use crate::model::work::ReliableWorkClass;
 use crate::protocol::{PathId, StreamId, UnderlayProtocol};
 use crate::runtime::path::{
     ClientPathContext, QuicCapacityProbeCommandTicket, RequestCapacityProbeCampaignBudget,
-    RequestTcpCapacityProbeLease, RequestTcpCapacityProbeRequest,
+    RequestCapacityReconciliationView, RequestTcpCapacityProbeLease,
+    RequestTcpCapacityProbeRequest, RequestTcpCapacityProofQuery,
 };
 #[cfg(feature = "lab-diagnostics")]
 use crate::runtime::relay::ReliableRelayRemotePath;
@@ -105,14 +106,22 @@ impl RequestTcpCapacityController {
         self.calibrations.remove(&target);
     }
 
+    pub(super) fn proof_queries(&self) -> impl Iterator<Item = RequestTcpCapacityProofQuery> + '_ {
+        self.calibrations
+            .iter()
+            .map(|(target, calibration)| RequestTcpCapacityProofQuery {
+                target: *target,
+                token: calibration.token,
+            })
+    }
+
     pub(super) fn reconcile(
         &mut self,
-        stream_id: StreamId,
-        context: &ClientPathContext,
+        view: &RequestCapacityReconciliationView,
         remotes: &ReliableRelayRemoteSet,
         completed_product_handoffs: &HashSet<RelayPathInstance>,
-        now: Instant,
     ) -> Vec<RequestTcpCapacityEvent> {
+        let now = view.observed_at();
         let mut events = Vec::new();
         let detached = self
             .calibrations
@@ -136,12 +145,7 @@ impl RequestTcpCapacityController {
             .calibrations
             .iter()
             .map(|(target, calibration)| {
-                let proof = context.request_tcp_capacity_probe_proof(
-                    stream_id,
-                    target.key.index,
-                    *target,
-                    calibration.token,
-                );
+                let proof = view.tcp_proof(*target);
                 (
                     *target,
                     calibration.token,

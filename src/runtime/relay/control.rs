@@ -2529,15 +2529,16 @@ fn spawn_reliable_relay_validation_opens(
         let result_tx = result_tx.clone();
         let handle = tokio::spawn(async move {
             let open_timeouts = reliable_relay_attach_open_timeouts(&context, key, lane);
+            let open_started_at = tokio::time::Instant::now();
             let result = match key.underlay {
                 UnderlayProtocol::Tcp => {
                     let open_deadlines = ClientTcpOpenDeadlines::from_timeouts(
-                        tokio::time::Instant::now(),
+                        open_started_at,
                         open_timeouts.live,
                         open_timeouts.setup,
                     );
-                    let result = relay_path_open_with_timeout(
-                        open_timeouts.setup,
+                    let result = relay_path_open_with_deadline(
+                        open_deadlines.setup,
                         open_remote_stream_on_reserved_path(
                             &context,
                             stream_id,
@@ -2553,8 +2554,9 @@ fn spawn_reliable_relay_validation_opens(
                     result
                 }
                 UnderlayProtocol::Udp => {
-                    relay_path_open_with_timeout(
-                        open_timeouts.setup,
+                    let open_deadline = open_started_at + open_timeouts.setup;
+                    relay_path_open_with_deadline(
+                        open_deadline,
                         open_remote_stream_on_reserved_udp_path(
                             &context,
                             stream_id,
@@ -2566,6 +2568,7 @@ fn spawn_reliable_relay_validation_opens(
                                 wait_for_accept: false,
                                 role: StreamOpenRole::Validation,
                             },
+                            open_deadline,
                         ),
                     )
                     .await

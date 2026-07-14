@@ -18,8 +18,8 @@ fn reliable_udp_service_and_repair_attachments_wait_for_peer_acceptance() {
 
 #[tokio::test]
 async fn relay_attach_open_timeout_bounds_pending_connection_setup() {
-    let result = relay_path_open_with_timeout(
-        Duration::from_millis(1),
+    let result = relay_path_open_with_deadline(
+        tokio::time::Instant::now() + Duration::from_millis(1),
         std::future::pending::<Result<(), RuntimeError>>(),
     )
     .await;

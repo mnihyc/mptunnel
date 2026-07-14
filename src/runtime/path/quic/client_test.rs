@@ -17,3 +17,23 @@ fn blocking_udp_open_uses_accepted_initial_window() {
         8192
     );
 }
+
+#[test]
+fn address_retry_uses_rfc_delay_for_normal_budgets() {
+    assert_eq!(
+        quic_address_attempt_delay(Duration::from_secs(4), 3),
+        QUIC_ADDRESS_ATTEMPT_DELAY
+    );
+}
+
+#[test]
+fn address_retry_fits_alternates_inside_short_budget() {
+    assert_eq!(
+        quic_address_attempt_delay(Duration::from_millis(120), 3),
+        Duration::from_millis(30)
+    );
+    assert_eq!(
+        quic_address_attempt_delay(Duration::from_nanos(1), 1),
+        Duration::ZERO
+    );
+}

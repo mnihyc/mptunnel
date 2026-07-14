@@ -3138,7 +3138,7 @@ async fn request_quic_proof_at_train_deadline_keeps_exact_handoff_owner() {
 
     tokio::time::sleep(Duration::from_millis(60)).await;
     sender.reconcile_request_subflow_set(&context, &remotes);
-    assert!(!context.request_quic_capacity_probe_proven(1, proof.token));
+    assert!(!context.request_quic_capacity_probe_proven_at(1, proof.token, Instant::now()));
     assert!(
         sender
             .quic_capacity
@@ -3155,7 +3155,7 @@ async fn request_quic_proof_at_train_deadline_keeps_exact_handoff_owner() {
         proof,
         probe,
     );
-    assert!(context.request_quic_capacity_probe_proven(1, proof.token));
+    assert!(context.request_quic_capacity_probe_proven_at(1, proof.token, Instant::now()));
     sender.reconcile_request_subflow_set(&context, &remotes);
     assert!(
         sender
@@ -3172,7 +3172,7 @@ async fn request_quic_proof_at_train_deadline_keeps_exact_handoff_owner() {
             .is_some_and(|calibration| calibration.graduated)
     );
     assert_eq!(
-        context.request_quic_capacity_product_handoff_state(1, proof.token),
+        context.request_quic_capacity_product_handoff_state_at(1, proof.token, Instant::now()),
         RequestQuicCapacityProductHandoffState::Pending
     );
 
@@ -3187,7 +3187,7 @@ async fn request_quic_proof_at_train_deadline_keeps_exact_handoff_owner() {
         .record_owner_frame_instance(candidate_instance, &foreign_frame);
     foreign_sender.release_normalized_acked_ranges(&context, &[ack_range]);
     assert_eq!(
-        context.request_quic_capacity_product_handoff_state(1, proof.token),
+        context.request_quic_capacity_product_handoff_state_at(1, proof.token, Instant::now()),
         RequestQuicCapacityProductHandoffState::Pending,
         "a colliding stream-local path instance cannot satisfy the owner handoff"
     );
@@ -3233,13 +3233,13 @@ async fn request_quic_proof_at_train_deadline_keeps_exact_handoff_owner() {
         )
         .expect("completion releases session ownership without another owner send");
     assert_eq!(
-        context.request_quic_capacity_product_handoff_state(1, proof.token),
+        context.request_quic_capacity_product_handoff_state_at(1, proof.token, Instant::now()),
         RequestQuicCapacityProductHandoffState::Complete
     );
     sender.reconcile_request_subflow_set(&context, &remotes);
     assert!(sender.quic_capacity.active.is_none());
     assert_eq!(
-        context.request_quic_capacity_product_handoff_state(1, proof.token),
+        context.request_quic_capacity_product_handoff_state_at(1, proof.token, Instant::now()),
         RequestQuicCapacityProductHandoffState::Complete
     );
     assert!(
@@ -3309,13 +3309,13 @@ fn dropping_request_quic_owner_revokes_pending_handoff() {
         Duration::from_secs(1),
     );
     assert_eq!(
-        context.request_quic_capacity_product_handoff_state(0, proof.token),
+        context.request_quic_capacity_product_handoff_state_at(0, proof.token, Instant::now()),
         RequestQuicCapacityProductHandoffState::Pending
     );
 
     sender.quic_capacity.active = None;
     assert_eq!(
-        context.request_quic_capacity_product_handoff_state(0, proof.token),
+        context.request_quic_capacity_product_handoff_state_at(0, proof.token, Instant::now()),
         RequestQuicCapacityProductHandoffState::Absent
     );
     assert!(
@@ -3418,7 +3418,7 @@ async fn incomplete_request_quic_handoff_revokes_ephemeral_graduation() {
             .get(candidate_instance)
             .is_some_and(|state| state.graduated())
     );
-    let _ = context.health().lock().expect("path health lock").udp[1].observe(proof.expires_at);
+    context.health().lock().expect("path health lock").udp[1].maintain(proof.expires_at);
     let next_lease = context
         .try_reserve_request_quic_capacity_probe(
             StreamId(208),
@@ -3445,7 +3445,7 @@ async fn incomplete_request_quic_handoff_revokes_ephemeral_graduation() {
             .is_some_and(|state| state.graduated())
     );
     assert_eq!(
-        context.request_quic_capacity_product_handoff_state(1, proof.token),
+        context.request_quic_capacity_product_handoff_state_at(1, proof.token, Instant::now()),
         RequestQuicCapacityProductHandoffState::Absent
     );
     assert!(

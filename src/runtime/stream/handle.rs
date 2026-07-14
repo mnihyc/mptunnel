@@ -202,6 +202,12 @@ impl ReliablePathStream {
     pub(in crate::runtime) async fn close_ordered(&self, lane: FlowLane) {
         self.output.close_stream_ordered(self.stream_id, lane).await;
     }
+
+    /// Retires a client-opened stream that never transferred into product
+    /// ownership. The carrier mailbox makes this cancellation-safe for Drop.
+    pub(in crate::runtime) fn retire_uncommitted(self) -> Result<(), RuntimeError> {
+        self.output.retire_accepted_stream(self.stream_id)
+    }
 }
 
 pub(in crate::runtime) struct ReliablePathStreamHandle {
@@ -513,6 +519,15 @@ impl FixedReliablePathOutput {
 }
 
 impl ReliablePathStreamOutput {
+    fn retire_accepted_stream(&self, stream_id: StreamId) -> Result<(), RuntimeError> {
+        match self {
+            Self::Fixed(fixed) => fixed.commands().retire_accepted_stream(stream_id),
+            Self::Switchable(_) => Err(RuntimeError::Protocol(
+                "accepted remote stream unexpectedly has switchable output",
+            )),
+        }
+    }
+
     #[cfg(test)]
     pub(in crate::runtime) fn fixed(
         underlay: UnderlayProtocol,

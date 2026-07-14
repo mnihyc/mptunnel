@@ -135,10 +135,10 @@ impl UdpDatagramClientAssociation {
                     .lock()
                     .expect("client path health lock")
                     .udp
-                    .iter_mut()
+                    .iter()
                     .enumerate()
                     .map(|(index, record)| {
-                        let observation = record.observe(now);
+                        let observation = record.observation_at(now);
                         format!(
                             "{}:{:?}:srtt={:?}:rate={:?}:carrier_rate={:?}:flows={}:failed={:?}",
                             index,
@@ -492,14 +492,15 @@ impl UdpDatagramClientAssociation {
         let Some(path) = self.context.udp_paths.get(path_index) else {
             return false;
         };
+        let now = Instant::now();
         let Some(observation) = self
             .context
             .health()
             .lock()
             .expect("client path health lock")
             .udp
-            .get_mut(path_index)
-            .map(|record| record.observe(Instant::now()))
+            .get(path_index)
+            .map(|record| record.observation_at(now))
         else {
             return false;
         };
@@ -538,13 +539,20 @@ impl UdpDatagramClientAssociation {
         }
         let path_session_was_open = self.path_session_is_open(path_index);
         let association_had_open_path = !self.paths.is_empty();
+        let open_started_at = tokio::time::Instant::now();
         let handshake_timeout = udp_datagram_path_open_timeout(
             association_had_open_path,
             has_unattempted_alternative,
             model,
             ttl_ms,
         )
-        .min(fallback_deadline.saturating_duration_since(tokio::time::Instant::now()));
+        .min(fallback_deadline.saturating_duration_since(open_started_at));
+        let open_deadline = (open_started_at + handshake_timeout).min(fallback_deadline);
+        let setup_owns_remaining_product_budget = !association_had_open_path
+            && !has_unattempted_alternative
+            && fallback_deadline == product_deadline
+            && product_deadline.saturating_duration_since(open_started_at)
+                <= UDP_PATH_HANDSHAKE_TIMEOUT;
         let response_timeout = udp_datagram_first_response_timeout(
             path_session_was_open,
             association_had_open_path,
@@ -552,10 +560,15 @@ impl UdpDatagramClientAssociation {
             model,
             ttl_ms,
         );
-        let position = self
-            .ensure_path_session(path_index, handshake_timeout)
-            .await
-            .map_err(|err| DatagramPathSendError::runtime(err, false))?;
+        let position = match self.ensure_path_session(path_index, open_deadline).await {
+            Err(RuntimeError::PathOpenTimedOut) if setup_owns_remaining_product_budget => {
+                return Err(DatagramPathSendError::Timeout {
+                    path_was_acked: false,
+                    response_timeout,
+                });
+            }
+            result => result.map_err(|err| DatagramPathSendError::runtime(err, false))?,
+        };
         let current_mtu = self
             .paths
             .get(position)
@@ -648,7 +661,7 @@ impl UdpDatagramClientAssociation {
     async fn ensure_path_session(
         &mut self,
         path_index: usize,
-        handshake_timeout: Duration,
+        open_deadline: tokio::time::Instant,
     ) -> Result<usize, RuntimeError> {
         if let Some(position) = self
             .paths
@@ -658,7 +671,7 @@ impl UdpDatagramClientAssociation {
             return Ok(position);
         }
         let session =
-            open_udp_datagram_session_on_path(&self.context, path_index, handshake_timeout).await?;
+            open_udp_datagram_session_on_path(&self.context, path_index, open_deadline).await?;
         self.paths.push(UdpDatagramAssociationPath {
             session,
             pacer: UdpDatagramPacer::new(),
@@ -694,6 +707,7 @@ pub(in crate::runtime) fn udp_datagram_error_is_path_retryable(err: &RuntimeErro
             | RuntimeError::QuicCarrier(_)
             | RuntimeError::Auth(_)
             | RuntimeError::RemoteClosed(_)
+            | RuntimeError::PathOpenTimedOut
             | RuntimeError::Protocol(_)
     )
 }

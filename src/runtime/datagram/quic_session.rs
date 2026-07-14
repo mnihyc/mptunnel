@@ -61,13 +61,14 @@ impl UdpDatagramClientSession {
         mux_limits: MuxLimits,
         handshake_timeout: Duration,
     ) -> Result<Self, RuntimeError> {
+        let open_deadline = tokio::time::Instant::now() + handshake_timeout;
         Self::open_with_provider(
             path,
             path_index,
             security,
             codec_limits,
             mux_limits,
-            handshake_timeout,
+            open_deadline,
             std::sync::Arc::new(SystemCarrierSocketProvider),
         )
         .await
@@ -79,7 +80,7 @@ impl UdpDatagramClientSession {
         security: SecurityConfig,
         codec_limits: CodecLimits,
         mux_limits: MuxLimits,
-        handshake_timeout: Duration,
+        open_deadline: tokio::time::Instant,
         carrier_sockets: std::sync::Arc<dyn CarrierSocketProvider>,
     ) -> Result<Self, RuntimeError> {
         let session_id = random_session_id()?;
@@ -90,7 +91,7 @@ impl UdpDatagramClientSession {
             security,
             codec_limits,
             mux_limits,
-            handshake_timeout,
+            open_deadline,
             carrier_sockets,
         )
         .await
@@ -106,6 +107,7 @@ impl UdpDatagramClientSession {
         mux_limits: MuxLimits,
         handshake_timeout: Duration,
     ) -> Result<Self, RuntimeError> {
+        let open_deadline = tokio::time::Instant::now() + handshake_timeout;
         Self::open_for_session_with_provider(
             path,
             path_index,
@@ -113,7 +115,7 @@ impl UdpDatagramClientSession {
             security,
             codec_limits,
             mux_limits,
-            handshake_timeout,
+            open_deadline,
             std::sync::Arc::new(SystemCarrierSocketProvider),
         )
         .await
@@ -126,7 +128,7 @@ impl UdpDatagramClientSession {
         security: SecurityConfig,
         codec_limits: CodecLimits,
         mux_limits: MuxLimits,
-        handshake_timeout: Duration,
+        open_deadline: tokio::time::Instant,
         carrier_sockets: std::sync::Arc<dyn CarrierSocketProvider>,
     ) -> Result<Self, RuntimeError> {
         let state = ClientPathState::new(ClientPathHealth {
@@ -145,20 +147,16 @@ impl UdpDatagramClientSession {
             state,
             carrier_sockets,
         });
-        Self::open_from_udp_session(path_session, path_index, mux_limits, handshake_timeout).await
+        Self::open_from_udp_session(path_session, path_index, mux_limits, open_deadline).await
     }
 
     pub(in crate::runtime) async fn open_from_udp_session(
         path_session: ClientUdpPathSessionHandle,
         path_index: usize,
         mux_limits: MuxLimits,
-        handshake_timeout: Duration,
+        open_deadline: tokio::time::Instant,
     ) -> Result<Self, RuntimeError> {
-        let stream = tokio::time::timeout(handshake_timeout, path_session.open_datagram_stream())
-            .await
-            .map_err(|_| {
-                RuntimeError::Protocol("QUIC UDP path datagram stream open timed out")
-            })??;
+        let stream = path_session.open_datagram_stream(open_deadline).await?;
         let path_id = stream.path_id;
         Ok(Self {
             _path_session: path_session,
@@ -490,21 +488,27 @@ impl UdpDatagramClientSession {
         Ok(())
     }
 
-    pub(in crate::runtime) async fn ping(
+    pub(in crate::runtime) async fn ping_until(
         &mut self,
-        probe_timeout: Duration,
+        probe_deadline: tokio::time::Instant,
     ) -> Result<(), RuntimeError> {
         let nonce = random_u64()?;
-        udp_path_write_frame(
-            &mut self.stream.send,
-            &Frame::Ping { nonce },
-            self.stream.runtime.codec_limits,
-        )
-        .await?;
-        match tokio::time::timeout(probe_timeout, self.stream.frames.recv())
+        let ping = async {
+            udp_path_write_frame(
+                &mut self.stream.send,
+                &Frame::Ping { nonce },
+                self.stream.runtime.codec_limits,
+            )
+            .await?;
+            self.stream
+                .frames
+                .recv()
+                .await
+                .ok_or(RuntimeError::ReliablePathSessionClosed)?
+        };
+        match tokio::time::timeout_at(probe_deadline, ping)
             .await
-            .map_err(|_| RuntimeError::Protocol("UDP path probe ping timed out"))?
-            .ok_or(RuntimeError::ReliablePathSessionClosed)??
+            .map_err(|_| RuntimeError::Protocol("UDP path probe ping timed out"))??
         {
             Frame::Pong {
                 nonce: received_nonce,
@@ -631,7 +635,7 @@ impl UdpDatagramClientSession {
 pub(super) async fn open_udp_datagram_session_on_path(
     context: &ClientPathContext,
     path_index: usize,
-    handshake_timeout: Duration,
+    open_deadline: tokio::time::Instant,
 ) -> Result<UdpDatagramClientSession, RuntimeError> {
     let path_session = context
         .udp_sessions
@@ -643,7 +647,7 @@ pub(super) async fn open_udp_datagram_session_on_path(
         path_session,
         path_index,
         context.mux_limits,
-        handshake_timeout,
+        open_deadline,
     )
     .await?;
     context.mark_udp_path_open_success(path_index, started_at.elapsed());

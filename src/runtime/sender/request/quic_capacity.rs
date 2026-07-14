@@ -18,8 +18,9 @@ use crate::model::work::ReliableWorkClass;
 use crate::protocol::{PathId, StreamId, UnderlayProtocol};
 use crate::runtime::path::{
     ClientPathContext, QuicCapacityProbeCommand, QuicCapacityProbeCommandTicket,
-    QuicCapacityProbeOwner, RequestCapacityProbeCampaignBudget, RequestQuicCapacityProbeLease,
-    RequestQuicCapacityProductHandoffState,
+    QuicCapacityProbeOwner, RequestCapacityProbeCampaignBudget, RequestCapacityReconciliationView,
+    RequestQuicCapacityProbeLease, RequestQuicCapacityProductHandoffState,
+    RequestQuicCapacityReconciliationQuery,
 };
 use crate::runtime::relay::{RelayPathPlacement, ReliableRelayRemoteSet};
 use crate::runtime::stream::request::RequestStreamState;
@@ -78,6 +79,15 @@ impl Default for RequestQuicCapacityController {
 }
 
 impl RequestQuicCapacityController {
+    pub(super) fn reconciliation_query(&self) -> Option<RequestQuicCapacityReconciliationQuery> {
+        self.active
+            .as_ref()
+            .map(|calibration| RequestQuicCapacityReconciliationQuery {
+                target: calibration.target,
+                token: calibration.token,
+            })
+    }
+
     /// Native QUIC packet-ACK evidence is carrier admission evidence; the
     /// request owner applies the returned exact-instance graduations.
     pub(super) fn native_evidence_targets<'a>(
@@ -85,6 +95,7 @@ impl RequestQuicCapacityController {
         context: &'a ClientPathContext,
         ordered_service: Option<RelayPathInstance>,
         remotes: &'a ReliableRelayRemoteSet,
+        now: Instant,
     ) -> impl Iterator<Item = RelayPathInstance> + 'a {
         let service_available = ordered_service.is_some_and(|service| {
             service.key.underlay == UnderlayProtocol::Udp && remotes.contains_path_instance(service)
@@ -95,17 +106,19 @@ impl RequestQuicCapacityController {
                 && path.placement == RelayPathPlacement::Validation
                 && instance.key.underlay == UnderlayProtocol::Udp
                 && path.path_proof_id.is_some_and(|proof_id| {
-                    context.relay_path_has_fresh_proof(
+                    context.relay_path_has_fresh_proof_as_of(
                         instance.key.underlay,
                         instance.key.index,
                         proof_id,
                         path.attached_at,
+                        now,
                     )
                 })
-                && context.relay_path_has_native_bulk_model_evidence_since(
+                && context.relay_path_has_native_bulk_model_evidence_as_of(
                     instance.key.underlay,
                     instance.key.index,
                     path.attached_at,
+                    now,
                 );
             admissible.then_some(instance)
         })
@@ -114,16 +127,22 @@ impl RequestQuicCapacityController {
     pub(super) fn reconcile(
         &mut self,
         context: &ClientPathContext,
+        view: &RequestCapacityReconciliationView,
         remotes: &ReliableRelayRemoteSet,
-        now: Instant,
     ) -> Vec<RequestQuicCapacityEvent> {
+        let now = view.observed_at();
         let mut events = Vec::new();
         if self
             .active
             .as_ref()
             .is_some_and(|calibration| !remotes.contains_path_instance(calibration.target))
         {
-            self.active = None;
+            let calibration = self
+                .active
+                .take()
+                .expect("detached QUIC calibration was just observed");
+            context.retire_request_quic_capacity_probe_token(calibration.token);
+            drop(calibration);
             return events;
         }
 
@@ -132,12 +151,7 @@ impl RequestQuicCapacityController {
             .active
             .as_ref()
             .filter(|calibration| !calibration.graduated)
-            .filter(|calibration| {
-                context.request_quic_capacity_probe_proven(
-                    calibration.target.key.index,
-                    calibration.token,
-                )
-            })
+            .filter(|calibration| view.quic_carrier_proven(calibration.target, calibration.token))
             .map(|calibration| (calibration.target, calibration.token));
         if let Some((target, token)) = accepted {
             if let Some(calibration) = self.active.as_mut() {
@@ -149,7 +163,12 @@ impl RequestQuicCapacityController {
         if self.active.as_ref().is_some_and(|calibration| {
             !calibration.graduated && now >= calibration.publication_expires_at
         }) {
-            self.active = None;
+            let calibration = self
+                .active
+                .take()
+                .expect("expired QUIC calibration was just observed");
+            context.retire_request_quic_capacity_probe_token(calibration.token);
+            drop(calibration);
             return events;
         }
 
@@ -161,10 +180,7 @@ impl RequestQuicCapacityController {
                 (
                     calibration.target,
                     calibration.token,
-                    context.request_quic_capacity_product_handoff_state(
-                        calibration.target.key.index,
-                        calibration.token,
-                    ),
+                    view.quic_handoff_state(calibration.target, calibration.token),
                 )
             });
         let Some((target, token, state)) = handoff else {
@@ -173,6 +189,7 @@ impl RequestQuicCapacityController {
         match state {
             RequestQuicCapacityProductHandoffState::Pending => events,
             RequestQuicCapacityProductHandoffState::Complete => {
+                context.retire_request_quic_capacity_probe_token(token);
                 let calibration = self
                     .active
                     .take()
@@ -185,6 +202,7 @@ impl RequestQuicCapacityController {
                 events
             }
             RequestQuicCapacityProductHandoffState::Absent => {
+                context.retire_request_quic_capacity_probe_token(token);
                 let calibration = self
                     .active
                     .take()

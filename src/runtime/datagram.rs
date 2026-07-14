@@ -133,22 +133,28 @@ async fn client_udp_datagram_round_trip_with_limits(
     carrier_sockets: Arc<dyn CarrierSocketProvider>,
 ) -> Result<Bytes, RuntimeError> {
     let payload_len = payload.len();
-    let product_deadline = tokio::time::Instant::now() + Duration::from_millis(u64::from(ttl_ms));
-    let handshake_timeout = UDP_PATH_HANDSHAKE_TIMEOUT
-        .min(product_deadline.saturating_duration_since(tokio::time::Instant::now()));
-    if handshake_timeout.is_zero() {
+    let setup_started_at = tokio::time::Instant::now();
+    let product_deadline = setup_started_at + Duration::from_millis(u64::from(ttl_ms));
+    let open_deadline = (setup_started_at + UDP_PATH_HANDSHAKE_TIMEOUT).min(product_deadline);
+    if open_deadline <= tokio::time::Instant::now() {
         return Err(RuntimeError::DatagramResponseTimedOut);
     }
-    let mut session = quic_session::UdpDatagramClientSession::open_with_provider(
+    let open = quic_session::UdpDatagramClientSession::open_with_provider(
         path,
         0,
         security,
         codec_limits,
         mux_limits,
-        handshake_timeout,
+        open_deadline,
         carrier_sockets,
     )
-    .await?;
+    .await;
+    let mut session = match open {
+        Err(RuntimeError::PathOpenTimedOut) if open_deadline == product_deadline => {
+            return Err(RuntimeError::DatagramResponseTimedOut);
+        }
+        result => result?,
+    };
     if tokio::time::Instant::now() >= product_deadline {
         return Err(RuntimeError::DatagramResponseTimedOut);
     }

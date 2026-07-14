@@ -699,16 +699,36 @@ fn request_tcp_capacity_authority_expires_without_a_native_rate_prior() {
     assert_eq!(record.measured_srtt_ms, Some(25.0));
     assert_eq!(record.carrier_srtt_ms, None);
     assert_eq!(record.carrier_inflight_limit_bytes, 512 * 1024);
-    let active = record.observe(expires_at - Duration::from_nanos(1));
+    let active = record.observation_at(expires_at - Duration::from_nanos(1));
     assert!(active.explicit_carrier_capacity_proof);
     assert_eq!(active.carrier_delivery_rate_bps, Some(80_000_000.0));
     assert_eq!(active.carrier_delivery_sample_bytes, rate_sample_bytes);
 
-    let expired = record.observe(expires_at);
+    let expired = record.observation_at(expires_at);
     assert!(!expired.explicit_carrier_capacity_proof);
     assert_eq!(expired.carrier_delivery_rate_bps, None);
     assert_eq!(expired.carrier_delivery_sample_bytes, 0);
     assert!(!expired.carrier_ack_derived_data_seen);
+}
+
+#[test]
+fn observation_projects_deadlines_without_applying_lifecycle_transitions() {
+    let deadline = Instant::now();
+    let mut record = ClientPathHealthRecord {
+        state: SchedulerPathState::Failed,
+        failed_until: Some(deadline),
+        ..ClientPathHealthRecord::default()
+    };
+
+    let observation = record.observation_at(deadline);
+
+    assert_eq!(observation.state, SchedulerPathState::Suspect);
+    assert_eq!(record.state, SchedulerPathState::Failed);
+    assert_eq!(record.failed_until, Some(deadline));
+
+    record.maintain(deadline);
+    assert_eq!(record.state, SchedulerPathState::Suspect);
+    assert_eq!(record.failed_until, None);
 }
 
 fn proof_candidate(
@@ -767,6 +787,7 @@ fn install_handoff(
         accepted_at,
         expires_at,
         complete: false,
+        completed_at: None,
         rate_prior_expires_at: None,
     });
 }
@@ -846,7 +867,8 @@ fn exact_post_proof_product_floor_survives_carrier_proof_expiry() {
         RequestQuicCapacityProductHandoffState::Complete
     );
 
-    let observation = record.observe(expires_at);
+    record.maintain(expires_at);
+    let observation = record.observation_at(expires_at);
     assert!(!observation.explicit_carrier_capacity_proof);
     assert!(observation.quic_capacity_product_handoff_complete);
     assert!(observation.product_delivery_rate_bps.is_none());
@@ -900,7 +922,8 @@ fn incomplete_product_handoff_expires_with_its_carrier_proof() {
         RequestQuicCapacityProductHandoffState::Pending
     );
 
-    let observation = record.observe(expires_at);
+    record.maintain(expires_at);
+    let observation = record.observation_at(expires_at);
     assert!(!observation.explicit_carrier_capacity_proof);
     assert!(!observation.quic_capacity_product_handoff_complete);
     assert_eq!(
@@ -943,12 +966,12 @@ fn completed_handoff_yields_at_the_durable_native_window_floor() {
     record.carrier_inflight_limit_bytes = native_window;
     record.carrier_delivery_sample_bytes = native_window - 1;
 
-    let below_floor = record.observe(expires_at);
+    let below_floor = record.observation_at(expires_at);
     assert!(below_floor.quic_capacity_product_handoff_complete);
     assert_eq!(below_floor.carrier_delivery_rate_bps, Some(117_000_000.0));
 
     record.carrier_delivery_sample_bytes = native_window;
-    let at_floor = record.observe(expires_at);
+    let at_floor = record.observation_at(expires_at);
     assert!(at_floor.quic_capacity_product_handoff_complete);
     assert_eq!(at_floor.carrier_delivery_rate_bps, Some(native_rate_bps));
 }
@@ -987,13 +1010,13 @@ fn completed_handoff_rate_prior_expires_without_erasing_product_progress() {
     record.carrier_inflight_limit_bytes = native_window;
     record.carrier_delivery_sample_bytes = native_window - 1;
 
-    let proof_expired = record.observe(expires_at);
+    let proof_expired = record.observation_at(expires_at);
     assert!(proof_expired.quic_capacity_product_handoff_complete);
     assert!(proof_expired.quic_capacity_rate_prior_fresh);
     assert_eq!(proof_expired.carrier_delivery_rate_bps, Some(117_000_000.0));
 
     let prior_expires_at = completed_at + Duration::from_secs(2);
-    let prior_expired = record.observe(prior_expires_at);
+    let prior_expired = record.observation_at(prior_expires_at);
     assert!(prior_expired.quic_capacity_product_handoff_complete);
     assert!(!prior_expired.quic_capacity_rate_prior_fresh);
     assert_eq!(

@@ -94,10 +94,11 @@ impl ClientPathContext {
         payload_bytes: usize,
         excluded: &[RelayPathKey],
     ) -> Option<RelayPathKey> {
+        let now = Instant::now();
         let mut health = self.state.health().lock().expect("client path health lock");
-        let mut tcp_observations = health_observations(&mut health.tcp);
+        let mut tcp_observations = health_observations(&mut health.tcp, now);
         apply_bulk_latency_isolation(&mut tcp_observations, lane, self.mux_limits);
-        let mut udp_observations = health_observations(&mut health.udp);
+        let mut udp_observations = health_observations(&mut health.udp, now);
         apply_bulk_latency_isolation(&mut udp_observations, lane, self.mux_limits);
         let mut candidates = reliable_stream_path_candidates(
             &self.tcp_paths,
@@ -184,10 +185,11 @@ impl ClientPathContext {
         lane: FlowLane,
         payload_bytes: usize,
     ) -> Vec<RelayPathKey> {
+        let now = Instant::now();
         let mut health = self.state.health().lock().expect("client path health lock");
-        let mut tcp_observations = health_observations(&mut health.tcp);
+        let mut tcp_observations = health_observations(&mut health.tcp, now);
         apply_bulk_latency_isolation(&mut tcp_observations, lane, self.mux_limits);
-        let mut udp_observations = health_observations(&mut health.udp);
+        let mut udp_observations = health_observations(&mut health.udp, now);
         apply_bulk_latency_isolation(&mut udp_observations, lane, self.mux_limits);
         let mut candidates = reliable_stream_path_candidates(
             &self.tcp_paths,
@@ -250,6 +252,7 @@ impl ClientPathContext {
         lane: FlowLane,
         payload_bytes: usize,
     ) -> Vec<usize> {
+        let now = Instant::now();
         let mut observations = health_observations(
             &mut self
                 .state
@@ -257,6 +260,7 @@ impl ClientPathContext {
                 .lock()
                 .expect("client path health lock")
                 .udp,
+            now,
         );
         apply_bulk_latency_isolation(&mut observations, lane, self.mux_limits);
         let scores = if endpoint_only_reliable_startup_should_preserve_configured_order(
@@ -395,9 +399,10 @@ impl ClientPathContext {
         &self,
         payload_bytes: usize,
     ) -> Vec<BulkPathCandidate> {
+        let now = Instant::now();
         let mut health = self.state.health().lock().expect("client path health lock");
-        let tcp_observations = health_observations(&mut health.tcp);
-        let udp_observations = health_observations(&mut health.udp);
+        let tcp_observations = health_observations(&mut health.tcp, now);
+        let udp_observations = health_observations(&mut health.udp, now);
         let scoring_payload_bytes =
             bulk_service_horizon_payload_bytes(payload_bytes, self.mux_limits);
         ordered_path_scores(
@@ -453,6 +458,7 @@ impl ClientPathContext {
         &self,
         lane: FlowLane,
     ) -> Vec<ClientPathObservation> {
+        let now = Instant::now();
         let mut observations = health_observations(
             &mut self
                 .state
@@ -460,12 +466,14 @@ impl ClientPathContext {
                 .lock()
                 .expect("client path health lock")
                 .tcp,
+            now,
         );
         apply_bulk_latency_isolation(&mut observations, lane, self.mux_limits);
         observations
     }
 
     pub(in crate::runtime) fn tcp_path_snapshot(&self, index: usize) -> Option<PathSnapshot> {
+        let now = Instant::now();
         let path = self.tcp_paths.get(index)?;
         let observation = self
             .state
@@ -473,12 +481,13 @@ impl ClientPathContext {
             .lock()
             .expect("client path health lock")
             .tcp
-            .get_mut(index)?
-            .observe(Instant::now());
+            .get(index)?
+            .observation_at(now);
         Some(path_snapshot(path, index, observation))
     }
 
     pub(in crate::runtime) fn udp_path_snapshot(&self, index: usize) -> Option<PathSnapshot> {
+        let now = Instant::now();
         let path = self.udp_paths.get(index)?;
         let observation = self
             .state
@@ -486,8 +495,8 @@ impl ClientPathContext {
             .lock()
             .expect("client path health lock")
             .udp
-            .get_mut(index)?
-            .observe(Instant::now());
+            .get(index)?
+            .observation_at(now);
         Some(path_snapshot(path, index, observation))
     }
 
@@ -532,6 +541,7 @@ impl ClientPathContext {
         underlay: UnderlayProtocol,
         index: usize,
     ) -> Option<PathMetrics> {
+        let now = Instant::now();
         let (path, observation) = match underlay {
             UnderlayProtocol::Tcp => {
                 let path = self.tcp_paths.get(index)?;
@@ -541,8 +551,8 @@ impl ClientPathContext {
                     .lock()
                     .expect("client path health lock")
                     .tcp
-                    .get_mut(index)?
-                    .observe(Instant::now());
+                    .get(index)?
+                    .observation_at(now);
                 (path, observation)
             }
             UnderlayProtocol::Udp => {
@@ -553,8 +563,8 @@ impl ClientPathContext {
                     .lock()
                     .expect("client path health lock")
                     .udp
-                    .get_mut(index)?
-                    .observe(Instant::now());
+                    .get(index)?
+                    .observation_at(now);
                 (path, observation)
             }
         };
@@ -574,6 +584,7 @@ impl ClientPathContext {
         if ttl_ms == 0 {
             return Vec::new();
         }
+        let now = Instant::now();
         let observations = health_observations(
             &mut self
                 .state
@@ -581,6 +592,7 @@ impl ClientPathContext {
                 .lock()
                 .expect("client path health lock")
                 .udp,
+            now,
         );
         if self.udp_paths.iter().all(path_is_endpoint_only)
             && !observations
@@ -656,14 +668,15 @@ impl ClientPathContext {
             return None;
         }
         let path = self.udp_paths.get(index)?;
+        let now = Instant::now();
         let mut observation = self
             .state
             .health()
             .lock()
             .expect("client path health lock")
             .udp
-            .get_mut(index)?
-            .observe(Instant::now());
+            .get(index)?
+            .observation_at(now);
         if discount_open_udp_session {
             observation.active_flows = observation.active_flows.saturating_sub(1);
         }
@@ -686,14 +699,15 @@ impl ClientPathContext {
             return None;
         }
         let path = self.udp_paths.get(index)?;
+        let now = Instant::now();
         let observation = self
             .state
             .health()
             .lock()
             .expect("client path health lock")
             .udp
-            .get_mut(index)?
-            .observe(Instant::now());
+            .get(index)?
+            .observation_at(now);
         let snapshot = path_snapshot(path, index, observation);
         scheduler::score_path(
             snapshot,
@@ -715,7 +729,8 @@ impl ClientPathContext {
         underlay: UnderlayProtocol,
         index: usize,
     ) -> bool {
-        let mut health = self.state.health().lock().expect("client path health lock");
+        let now = Instant::now();
+        let health = self.state.health().lock().expect("client path health lock");
         match underlay {
             UnderlayProtocol::Tcp => {
                 let Some(path) = self.tcp_paths.get(index) else {
@@ -723,9 +738,9 @@ impl ClientPathContext {
                 };
                 health
                     .tcp
-                    .get_mut(index)
+                    .get(index)
                     .map(|record| {
-                        bulk_candidate_has_bulk_rate_evidence(path, record.observe(Instant::now()))
+                        bulk_candidate_has_bulk_rate_evidence(path, record.observation_at(now))
                     })
                     .unwrap_or(false)
             }
@@ -735,9 +750,9 @@ impl ClientPathContext {
                 };
                 health
                     .udp
-                    .get_mut(index)
+                    .get(index)
                     .map(|record| {
-                        bulk_candidate_has_bulk_rate_evidence(path, record.observe(Instant::now()))
+                        bulk_candidate_has_bulk_rate_evidence(path, record.observation_at(now))
                     })
                     .unwrap_or(false)
             }
@@ -750,16 +765,30 @@ impl ClientPathContext {
         index: usize,
         valid_after: Instant,
     ) -> bool {
+        self.relay_path_has_native_bulk_model_evidence_as_of(
+            underlay,
+            index,
+            valid_after,
+            Instant::now(),
+        )
+    }
+
+    pub(in crate::runtime) fn relay_path_has_native_bulk_model_evidence_as_of(
+        &self,
+        underlay: UnderlayProtocol,
+        index: usize,
+        valid_after: Instant,
+        now: Instant,
+    ) -> bool {
         if underlay != UnderlayProtocol::Udp {
             return false;
         }
-        let now = Instant::now();
-        let mut health = self.state.health().lock().expect("client path health lock");
+        let health = self.state.health().lock().expect("client path health lock");
         health
             .udp
-            .get_mut(index)
+            .get(index)
             .map(|record| {
-                let observation = record.observe(now);
+                let observation = record.observation_at(now);
                 bulk_candidate_has_fresh_native_carrier_rate_evidence(observation, valid_after, now)
             })
             .unwrap_or(false)
@@ -772,7 +801,24 @@ impl ClientPathContext {
         proof_id: u64,
         attached_at: Instant,
     ) -> bool {
-        self.relay_path_fresh_proof_acked_at(underlay, index, proof_id, attached_at)
+        self.relay_path_has_fresh_proof_as_of(
+            underlay,
+            index,
+            proof_id,
+            attached_at,
+            Instant::now(),
+        )
+    }
+
+    pub(in crate::runtime) fn relay_path_has_fresh_proof_as_of(
+        &self,
+        underlay: UnderlayProtocol,
+        index: usize,
+        proof_id: u64,
+        attached_at: Instant,
+        now: Instant,
+    ) -> bool {
+        self.relay_path_fresh_proof_acked_as_of(underlay, index, proof_id, attached_at, now)
             .is_some()
     }
 
@@ -789,40 +835,38 @@ impl ClientPathContext {
         .map(ClientPathHealthRecord::path_proof_generation)
     }
 
-    pub(in crate::runtime) fn relay_path_fresh_proof_acked_at(
+    pub(in crate::runtime) fn relay_path_fresh_proof_acked_as_of(
         &self,
         underlay: UnderlayProtocol,
         index: usize,
         proof_id: u64,
         attached_at: Instant,
+        now: Instant,
     ) -> Option<Instant> {
-        let mut health = self.state.health().lock().expect("client path health lock");
+        let health = self.state.health().lock().expect("client path health lock");
         let record = match underlay {
-            UnderlayProtocol::Tcp => health.tcp.get_mut(index),
-            UnderlayProtocol::Udp => health.udp.get_mut(index),
+            UnderlayProtocol::Tcp => health.tcp.get(index),
+            UnderlayProtocol::Udp => health.udp.get(index),
         };
         record.and_then(|record| {
-            let observation = record.observe(Instant::now());
+            let observation = record.observation_at(now);
             (observation.state == SchedulerPathState::Active && !observation.manual_disabled)
-                .then(|| record.successful_path_proof_acked_at(proof_id, attached_at))
+                .then(|| record.successful_path_proof_acked_at(proof_id, attached_at, now))
                 .flatten()
         })
     }
 
     pub(in crate::runtime) fn reliable_relay_has_latency_pressure(&self) -> bool {
-        let mut health = self.state.health().lock().expect("client path health lock");
-        let tcp_pressure = health.tcp.iter_mut().any(|record| {
-            record
-                .observe(Instant::now())
-                .active_latency_sensitive_flows
-                > 0
-        });
+        let now = Instant::now();
+        let health = self.state.health().lock().expect("client path health lock");
+        let tcp_pressure = health
+            .tcp
+            .iter()
+            .any(|record| record.observation_at(now).active_latency_sensitive_flows > 0);
         tcp_pressure
-            || health.udp.iter_mut().any(|record| {
-                record
-                    .observe(Instant::now())
-                    .active_latency_sensitive_flows
-                    > 0
-            })
+            || health
+                .udp
+                .iter()
+                .any(|record| record.observation_at(now).active_latency_sensitive_flows > 0)
     }
 }

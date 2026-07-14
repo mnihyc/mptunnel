@@ -955,7 +955,7 @@ fn client_path_statuses(
 
 fn client_path_status_set(
     specs: &[PathSpec],
-    records: &mut [ClientPathHealthRecord],
+    records: &[ClientPathHealthRecord],
     underlay: UnderlayProtocol,
     now: Instant,
     summary: &mut ManagementSummary,
@@ -965,8 +965,8 @@ fn client_path_status_set(
         .enumerate()
         .map(|(index, spec)| {
             let observation = records
-                .get_mut(index)
-                .map(|record| record.observe(now))
+                .get(index)
+                .map(|record| record.observation_at(now))
                 .unwrap_or_default();
             let snapshot = path_snapshot(spec, index, observation);
             apply_summary(summary, snapshot, observation.manual_disabled);

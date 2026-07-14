@@ -511,16 +511,17 @@ pub(super) async fn probe_udp_client_path(
         .get(path_index)
         .cloned()
         .ok_or(RuntimeError::NoSchedulableUdpPath)?;
-    let probe_rtt = tokio::time::timeout(timeout, async {
+    let probe_deadline = tokio::time::Instant::now() + timeout;
+    let probe_rtt = tokio::time::timeout_at(probe_deadline, async {
         let mut session = UdpDatagramClientSession::open_from_udp_session(
             path_session,
             path_index,
             context.mux_limits,
-            timeout,
+            probe_deadline,
         )
         .await?;
         let ping_started_at = Instant::now();
-        session.ping(timeout).await?;
+        session.ping_until(probe_deadline).await?;
         let probe_rtt = ping_started_at.elapsed();
         let _ = session.close_session().await;
         Ok::<Duration, RuntimeError>(probe_rtt)

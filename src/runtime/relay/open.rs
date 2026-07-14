@@ -41,14 +41,7 @@ impl Drop for AcceptedRemoteStreamGuard {
         let Some(stream) = self.stream.take() else {
             return;
         };
-        let stream_id = stream.stream_id;
-        let output = stream.output.clone();
-        if let Ok(runtime) = tokio::runtime::Handle::try_current() {
-            runtime.spawn(async move {
-                output.send_stream_detach(stream_id).await;
-                output.close_stream(stream_id).await;
-            });
-        }
+        let _ = stream.retire_uncommitted();
     }
 }
 
@@ -678,8 +671,9 @@ async fn open_reliable_initial_active_attempt(
                 lane,
                 has_unattempted_alternative,
             );
-            match tokio::time::timeout(
-                open_timeout,
+            let open_deadline = tokio::time::Instant::now() + open_timeout;
+            match relay_path_open_with_deadline(
+                open_deadline,
                 open_remote_stream_on_reserved_udp_path(
                     context,
                     stream_id,
@@ -688,12 +682,13 @@ async fn open_reliable_initial_active_attempt(
                     lane,
                     key.index,
                     UdpStreamOpenOptions::ACTIVE_WAIT,
+                    open_deadline,
                 ),
             )
             .await
             {
-                Ok(result) => result,
-                Err(_) => {
+                Ok(opened) => Ok(opened),
+                Err(RuntimeError::PathOpenTimedOut) => {
                     #[cfg(feature = "lab-diagnostics")]
                     lab_diagnostic(
                         "reliable_stream_open_timeout",
@@ -708,6 +703,7 @@ async fn open_reliable_initial_active_attempt(
                     );
                     Err(RuntimeError::PathOpenTimedOut)
                 }
+                Err(err) => Err(err),
             }
         }
     }
@@ -948,10 +944,18 @@ pub(in crate::runtime) async fn open_remote_stream_on_udp_path(
         lane,
     )
     .setup;
-    match relay_path_open_with_timeout(
-        open_timeout,
+    let open_deadline = tokio::time::Instant::now() + open_timeout;
+    match relay_path_open_with_deadline(
+        open_deadline,
         open_remote_stream_on_reserved_udp_path(
-            context, stream_id, target, ingress, lane, path_index, options,
+            context,
+            stream_id,
+            target,
+            ingress,
+            lane,
+            path_index,
+            options,
+            open_deadline,
         ),
     )
     .await
@@ -964,14 +968,14 @@ pub(in crate::runtime) async fn open_remote_stream_on_udp_path(
     }
 }
 
-pub(in crate::runtime) async fn relay_path_open_with_timeout<T, F>(
-    open_timeout: Duration,
+pub(in crate::runtime) async fn relay_path_open_with_deadline<T, F>(
+    open_deadline: tokio::time::Instant,
     open: F,
 ) -> Result<T, RuntimeError>
 where
     F: std::future::Future<Output = Result<T, RuntimeError>>,
 {
-    match tokio::time::timeout(open_timeout, open).await {
+    match tokio::time::timeout_at(open_deadline, open).await {
         Ok(result) => result,
         Err(_) => Err(RuntimeError::PathOpenTimedOut),
     }
@@ -985,6 +989,7 @@ pub(in crate::runtime) async fn open_remote_stream_on_reserved_udp_path(
     lane: FlowLane,
     path_index: usize,
     options: UdpStreamOpenOptions,
+    open_deadline: tokio::time::Instant,
 ) -> Result<OpenedRemoteStream, RuntimeError> {
     let UdpStreamOpenOptions {
         wait_for_accept,
@@ -1011,7 +1016,7 @@ pub(in crate::runtime) async fn open_remote_stream_on_reserved_udp_path(
         .udp_sessions
         .get(path_index)
         .ok_or(RuntimeError::NoSchedulableUdpPath)?
-        .open_stream(stream_id, target, ingress, lane, options)
+        .open_stream(stream_id, target, ingress, lane, options, open_deadline)
         .await?;
     let accepted = AcceptedRemoteStreamGuard::new(stream);
     let elapsed = started_at.elapsed();

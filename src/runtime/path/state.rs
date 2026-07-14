@@ -215,6 +215,12 @@ impl RequestQuicCapacityProbeSession {
             budget: RequestCapacityProbeBudget::new(path_count),
         }
     }
+
+    fn retire(&self, token: u64) {
+        let _ = self
+            .active_token
+            .compare_exchange(token, 0, Ordering::AcqRel, Ordering::Acquire);
+    }
 }
 
 #[derive(Debug)]
@@ -387,11 +393,9 @@ impl Drop for RequestQuicCapacityProbeLease {
                 .refund(self.path_index, self.bytes);
             self.campaign.refund(self.bytes);
         }
-        let _ = self
-            .path_state
+        self.path_state
             .request_quic_capacity_probe
-            .active_token
-            .compare_exchange(self.token, 0, Ordering::AcqRel, Ordering::Acquire);
+            .retire(self.token);
     }
 }
 
@@ -589,6 +593,7 @@ struct RequestQuicCapacityProductHandoff {
     accepted_at: Instant,
     expires_at: Instant,
     complete: bool,
+    completed_at: Option<Instant>,
     rate_prior_expires_at: Option<Instant>,
 }
 
@@ -612,6 +617,7 @@ impl RequestQuicCapacityProductHandoff {
         self.acked_product_bytes = self.acked_product_bytes.saturating_add(bytes as u64);
         if self.acked_product_bytes >= self.required_product_sample_bytes {
             self.complete = true;
+            self.completed_at.get_or_insert(acked_at);
             let proof_validity = self.expires_at.saturating_duration_since(self.accepted_at);
             self.rate_prior_expires_at = acked_at
                 .checked_add(proof_validity)
@@ -632,6 +638,70 @@ pub(in crate::runtime) enum RequestQuicCapacityProductHandoffState {
     Absent,
     Pending,
     Complete,
+}
+
+#[derive(Debug, Clone, Copy)]
+pub(in crate::runtime) struct RequestTcpCapacityProofQuery {
+    pub(in crate::runtime) target: RelayPathInstance,
+    pub(in crate::runtime) token: u64,
+}
+
+#[derive(Debug, Clone, Copy)]
+pub(in crate::runtime) struct RequestQuicCapacityReconciliationQuery {
+    pub(in crate::runtime) target: RelayPathInstance,
+    pub(in crate::runtime) token: u64,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct RequestQuicCapacityReconciliationObservation {
+    target: RelayPathInstance,
+    token: u64,
+    carrier_proven: bool,
+    handoff: RequestQuicCapacityProductHandoffState,
+}
+
+/// One lock-coherent carrier-authority view for request reconciliation.
+/// Controllers consume only exact transaction identities from this snapshot.
+pub(in crate::runtime) struct RequestCapacityReconciliationView {
+    observed_at: Instant,
+    tcp_proofs: HashMap<RelayPathInstance, TcpCapacityProofCandidate>,
+    quic: Option<RequestQuicCapacityReconciliationObservation>,
+}
+
+impl RequestCapacityReconciliationView {
+    pub(in crate::runtime) fn observed_at(&self) -> Instant {
+        self.observed_at
+    }
+
+    pub(in crate::runtime) fn tcp_proof(
+        &self,
+        target: RelayPathInstance,
+    ) -> Option<TcpCapacityProofCandidate> {
+        self.tcp_proofs.get(&target).copied()
+    }
+
+    pub(in crate::runtime) fn quic_carrier_proven(
+        &self,
+        target: RelayPathInstance,
+        token: u64,
+    ) -> bool {
+        self.quic.is_some_and(|observation| {
+            observation.target == target && observation.token == token && observation.carrier_proven
+        })
+    }
+
+    pub(in crate::runtime) fn quic_handoff_state(
+        &self,
+        target: RelayPathInstance,
+        token: u64,
+    ) -> RequestQuicCapacityProductHandoffState {
+        self.quic
+            .filter(|observation| observation.target == target && observation.token == token)
+            .map_or(
+                RequestQuicCapacityProductHandoffState::Absent,
+                |observation| observation.handoff,
+            )
+    }
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -704,10 +774,13 @@ impl ClientPathHealthRecord {
         &self,
         proof_id: u64,
         attached_at: Instant,
+        now: Instant,
     ) -> Option<Instant> {
         self.successful_path_proofs
             .get(&proof_id)
-            .filter(|proof| proof.proof_id == proof_id && proof.sent_at >= attached_at)
+            .filter(|proof| {
+                proof.proof_id == proof_id && proof.sent_at >= attached_at && proof.acked_at <= now
+            })
             .map(|proof| proof.acked_at)
     }
 
@@ -839,6 +912,7 @@ impl ClientPathHealthRecord {
             accepted_at: candidate.accepted_at,
             expires_at: candidate.expires_at,
             complete: false,
+            completed_at: None,
             rate_prior_expires_at: None,
         });
         Some((rate_bps, rate_sample_bytes, native_tail_rate))
@@ -871,6 +945,7 @@ impl ClientPathHealthRecord {
                     .max(PATH_OPEN_SCORE_BYTES as u64)
     }
 
+    #[cfg(test)]
     fn request_quic_capacity_product_handoff_state(
         &self,
         token: u64,
@@ -888,7 +963,9 @@ impl ClientPathHealthRecord {
 }
 
 impl ClientPathHealthRecord {
-    pub(in crate::runtime) fn observe(&mut self, now: Instant) -> ClientPathObservation {
+    /// Applies time-driven lifecycle transitions. Keeping this separate from
+    /// observation prevents diagnostics and ranking reads from canceling work.
+    pub(in crate::runtime) fn maintain(&mut self, now: Instant) {
         if self
             .request_tcp_capacity_probe
             .as_ref()
@@ -925,6 +1002,17 @@ impl ClientPathHealthRecord {
                 self.request_quic_capacity_product_handoff = None;
             }
         }
+        if self.state == SchedulerPathState::Failed
+            && self.failed_until.is_some_and(|deadline| now >= deadline)
+        {
+            self.state = SchedulerPathState::Suspect;
+            self.failed_until = None;
+        }
+    }
+
+    /// Returns a time-indexed immutable view. Deadline projection keeps a pure
+    /// diagnostic view truthful even when its owner has not run maintenance yet.
+    pub(in crate::runtime) fn observation_at(&self, now: Instant) -> ClientPathObservation {
         if self.manual_disabled {
             return ClientPathObservation {
                 state: SchedulerPathState::Failed,
@@ -960,17 +1048,22 @@ impl ClientPathHealthRecord {
                 path_proof_success: self.path_proof_success,
             };
         }
-        if self.state == SchedulerPathState::Failed
+        let state = if self.state == SchedulerPathState::Failed
             && self.failed_until.is_some_and(|deadline| now >= deadline)
         {
-            self.state = SchedulerPathState::Suspect;
-            self.failed_until = None;
-        }
-        let tcp_proof = self.tcp_capacity_proof;
-        let quic_proof = self.quic_capacity_proof;
+            SchedulerPathState::Suspect
+        } else {
+            self.state
+        };
+        let tcp_proof = self
+            .tcp_capacity_proof
+            .filter(|proof| proof.candidate.accepted_at <= now && now < proof.candidate.expires_at);
+        let quic_proof = self
+            .quic_capacity_proof
+            .filter(|proof| proof.candidate.accepted_at <= now && now < proof.candidate.expires_at);
         let complete_handoff = self
             .request_quic_capacity_product_handoff
-            .filter(|handoff| handoff.complete);
+            .filter(|handoff| handoff.complete && handoff.completed_at.is_some_and(|at| at <= now));
         // Once stream ACKs complete the handoff, prefer their product model
         // until a full native carrier window supplies a replacement estimate.
         let handoff_capacity_prior = complete_handoff.filter(|handoff| {
@@ -989,7 +1082,7 @@ impl ClientPathHealthRecord {
             .or_else(|| quic_proof.map(|proof| proof.candidate.accepted_at));
         let explicit_carrier_capacity_proof = proof_rate_bps.is_some();
         ClientPathObservation {
-            state: self.state,
+            state,
             manual_disabled: false,
             measured_srtt_ms: self.measured_srtt_ms,
             measured_jitter_ms: self.measured_jitter_ms,
@@ -1311,6 +1404,10 @@ impl ClientPathContext {
         self.state.health()
     }
 
+    pub(in crate::runtime) fn retire_request_quic_capacity_probe_token(&self, token: u64) {
+        self.state.request_quic_capacity_probe.retire(token);
+    }
+
     pub(in crate::runtime) fn request_quic_capacity_probe_remaining_bytes(&self) -> u64 {
         self.state
             .request_quic_capacity_probe
@@ -1415,7 +1512,7 @@ impl ClientPathContext {
         let Some(record) = health.tcp.get_mut(path_index) else {
             return None;
         };
-        let _ = record.observe(now);
+        record.maintain(now);
         // Offset-free trains on distinct TCP sockets have independent carrier
         // ordering. The health record remains the exact per-path transaction
         // owner while the session counter bounds their cumulative byte cost.
@@ -1464,31 +1561,78 @@ impl ClientPathContext {
         })
     }
 
-    pub(in crate::runtime) fn request_tcp_capacity_probe_proof(
+    pub(in crate::runtime) fn request_capacity_reconciliation_view(
         &self,
         stream_id: StreamId,
-        path_index: usize,
-        path_instance: RelayPathInstance,
-        token: u64,
-    ) -> Option<TcpCapacityProofCandidate> {
-        let now = Instant::now();
-        self.state
-            .health
-            .lock()
-            .expect("client path health lock")
-            .tcp
-            .get_mut(path_index)
-            .and_then(|record| {
-                let _ = record.observe(now);
-                record
-                    .tcp_capacity_proof
+        tcp_queries: impl Iterator<Item = RequestTcpCapacityProofQuery>,
+        quic_query: Option<RequestQuicCapacityReconciliationQuery>,
+        now: Instant,
+    ) -> RequestCapacityReconciliationView {
+        let mut tcp_queries = tcp_queries.peekable();
+        if tcp_queries.peek().is_none() && quic_query.is_none() {
+            return RequestCapacityReconciliationView {
+                observed_at: now,
+                tcp_proofs: HashMap::new(),
+                quic: None,
+            };
+        }
+        let health = self.state.health.lock().expect("client path health lock");
+        let tcp_proofs = tcp_queries
+            .filter_map(|query| {
+                health
+                    .tcp
+                    .get(query.target.key.index)
+                    .and_then(|record| record.tcp_capacity_proof)
                     .filter(|proof| {
                         proof.stream_id == stream_id
-                            && proof.path_instance == path_instance
-                            && proof.candidate.token == token
+                            && proof.path_instance == query.target
+                            && proof.candidate.token == query.token
+                            && proof.candidate.accepted_at <= now
+                            && now < proof.candidate.expires_at
                     })
-                    .map(|proof| proof.candidate)
+                    .map(|proof| (query.target, proof.candidate))
             })
+            .collect();
+        let quic = quic_query.map(|query| {
+            let record = health.udp.get(query.target.key.index);
+            let exact_handoff = record
+                .and_then(|record| record.request_quic_capacity_product_handoff)
+                .filter(|handoff| {
+                    handoff.stream_id == stream_id
+                        && handoff.path_instance == query.target
+                        && handoff.token == query.token
+                        && handoff.accepted_at <= now
+                });
+            let carrier_proven = record.is_some_and(|record| {
+                record.quic_capacity_proof.is_some_and(|proof| {
+                    proof.candidate.token == query.token
+                        && proof.candidate.accepted_at <= now
+                        && now < proof.candidate.expires_at
+                })
+            }) && exact_handoff.is_some();
+            let handoff = match exact_handoff {
+                Some(handoff)
+                    if handoff.complete && handoff.completed_at.is_some_and(|at| at <= now) =>
+                {
+                    RequestQuicCapacityProductHandoffState::Complete
+                }
+                Some(handoff) if now < handoff.expires_at => {
+                    RequestQuicCapacityProductHandoffState::Pending
+                }
+                _ => RequestQuicCapacityProductHandoffState::Absent,
+            };
+            RequestQuicCapacityReconciliationObservation {
+                target: query.target,
+                token: query.token,
+                carrier_proven,
+                handoff,
+            }
+        });
+        RequestCapacityReconciliationView {
+            observed_at: now,
+            tcp_proofs,
+            quic,
+        }
     }
 
     pub(in crate::runtime) fn try_reserve_request_quic_capacity_probe(
@@ -1524,16 +1668,7 @@ impl ClientPathContext {
             .load(Ordering::Acquire);
         if active_token != 0 {
             let transaction_live = health.udp.iter_mut().any(|record| {
-                let _ = record.observe(now);
-                if record
-                    .request_quic_capacity_probe
-                    .as_ref()
-                    .is_some_and(|reservation| {
-                        reservation.token == active_token && !reservation.ticket.is_current()
-                    })
-                {
-                    record.request_quic_capacity_probe = None;
-                }
+                record.maintain(now);
                 record
                     .request_quic_capacity_probe
                     .as_ref()
@@ -1543,11 +1678,7 @@ impl ClientPathContext {
                         .is_some_and(|handoff| handoff.token == active_token && !handoff.complete)
             });
             if !transaction_live {
-                let _ = self
-                    .state
-                    .request_quic_capacity_probe
-                    .active_token
-                    .compare_exchange(active_token, 0, Ordering::AcqRel, Ordering::Acquire);
+                self.state.request_quic_capacity_probe.retire(active_token);
             }
         }
         if self
@@ -1566,11 +1697,7 @@ impl ClientPathContext {
             .budget
             .effective_candidate_share_bytes(path_limit_bytes, session_limit);
         if !campaign.try_reserve(train_bytes, campaign_limit) {
-            let _ = self
-                .state
-                .request_quic_capacity_probe
-                .active_token
-                .compare_exchange(token, 0, Ordering::AcqRel, Ordering::Acquire);
+            self.state.request_quic_capacity_probe.retire(token);
             return None;
         }
         if !self.state.request_quic_capacity_probe.budget.try_reserve(
@@ -1580,11 +1707,7 @@ impl ClientPathContext {
             session_limit,
         ) {
             campaign.refund(train_bytes);
-            let _ = self
-                .state
-                .request_quic_capacity_probe
-                .active_token
-                .compare_exchange(token, 0, Ordering::AcqRel, Ordering::Acquire);
+            self.state.request_quic_capacity_probe.retire(token);
             return None;
         }
         let Some(record) = health.udp.get_mut(path_index) else {
@@ -1593,11 +1716,7 @@ impl ClientPathContext {
                 .budget
                 .refund(path_index, train_bytes);
             campaign.refund(train_bytes);
-            let _ = self
-                .state
-                .request_quic_capacity_probe
-                .active_token
-                .compare_exchange(token, 0, Ordering::AcqRel, Ordering::Acquire);
+            self.state.request_quic_capacity_probe.retire(token);
             return None;
         };
         if record.request_quic_capacity_probe.is_some() {
@@ -1606,11 +1725,7 @@ impl ClientPathContext {
                 .budget
                 .refund(path_index, train_bytes);
             campaign.refund(train_bytes);
-            let _ = self
-                .state
-                .request_quic_capacity_probe
-                .active_token
-                .compare_exchange(token, 0, Ordering::AcqRel, Ordering::Acquire);
+            self.state.request_quic_capacity_probe.retire(token);
             return None;
         }
         record.request_quic_capacity_probe = Some(RequestQuicCapacityProbeReservation {
@@ -1634,51 +1749,62 @@ impl ClientPathContext {
         })
     }
 
-    pub(in crate::runtime) fn request_quic_capacity_probe_proven(
+    #[cfg(test)]
+    pub(in crate::runtime) fn request_quic_capacity_probe_proven_at(
         &self,
         path_index: usize,
         token: u64,
+        now: Instant,
     ) -> bool {
-        let now = Instant::now();
         self.state
             .health
             .lock()
             .expect("client path health lock")
             .udp
-            .get_mut(path_index)
+            .get(path_index)
             .is_some_and(|record| {
-                let _ = record.observe(now);
                 record.quic_capacity_proof.is_some_and(|proof| {
-                    proof.candidate.token == token && now < proof.candidate.expires_at
+                    proof.candidate.token == token
+                        && proof.candidate.accepted_at <= now
+                        && now < proof.candidate.expires_at
                 })
             })
     }
 
-    pub(in crate::runtime) fn request_quic_capacity_product_handoff_state(
+    #[cfg(test)]
+    pub(in crate::runtime) fn request_quic_capacity_product_handoff_state_at(
         &self,
         path_index: usize,
         token: u64,
+        now: Instant,
     ) -> RequestQuicCapacityProductHandoffState {
-        let now = Instant::now();
-        let state = self
-            .state
+        self.state
             .health
             .lock()
             .expect("client path health lock")
             .udp
-            .get_mut(path_index)
-            .map_or(RequestQuicCapacityProductHandoffState::Absent, |record| {
-                let _ = record.observe(now);
-                record.request_quic_capacity_product_handoff_state(token)
-            });
-        if state != RequestQuicCapacityProductHandoffState::Pending {
-            let _ = self
-                .state
-                .request_quic_capacity_probe
-                .active_token
-                .compare_exchange(token, 0, Ordering::AcqRel, Ordering::Acquire);
-        }
-        state
+            .get(path_index)
+            .map_or(
+                RequestQuicCapacityProductHandoffState::Absent,
+                |record| match record.request_quic_capacity_product_handoff {
+                    Some(handoff)
+                        if handoff.token == token
+                            && handoff.accepted_at <= now
+                            && handoff.complete
+                            && handoff.completed_at.is_some_and(|at| at <= now) =>
+                    {
+                        RequestQuicCapacityProductHandoffState::Complete
+                    }
+                    Some(handoff)
+                        if handoff.token == token
+                            && handoff.accepted_at <= now
+                            && now < handoff.expires_at =>
+                    {
+                        RequestQuicCapacityProductHandoffState::Pending
+                    }
+                    _ => RequestQuicCapacityProductHandoffState::Absent,
+                },
+            )
     }
 
     pub(in crate::runtime) fn allocate_reliable_stream_id(&self) -> Result<StreamId, RuntimeError> {
@@ -1786,6 +1912,7 @@ impl ClientPathContext {
     }
 
     pub(in crate::runtime) fn should_probe_tcp_path(&self, index: usize) -> bool {
+        let now = Instant::now();
         self.state
             .health
             .lock()
@@ -1793,7 +1920,8 @@ impl ClientPathContext {
             .tcp
             .get_mut(index)
             .is_some_and(|record| {
-                path_observation_is_idle_for_probe(record.observe(Instant::now()))
+                record.maintain(now);
+                path_observation_is_idle_for_probe(record.observation_at(now))
             })
     }
 
@@ -1952,11 +2080,7 @@ impl ClientPathContext {
                 })
         };
         if let Some(token) = completed_token {
-            let _ = self
-                .state
-                .request_quic_capacity_probe
-                .active_token
-                .compare_exchange(token, 0, Ordering::AcqRel, Ordering::Acquire);
+            self.retire_request_quic_capacity_probe_token(token);
         }
     }
 
@@ -2118,6 +2242,7 @@ impl ClientPathContext {
     }
 
     pub(in crate::runtime) fn should_probe_udp_path(&self, index: usize) -> bool {
+        let now = Instant::now();
         self.state
             .health
             .lock()
@@ -2125,7 +2250,8 @@ impl ClientPathContext {
             .udp
             .get_mut(index)
             .is_some_and(|record| {
-                path_observation_is_idle_for_probe(record.observe(Instant::now()))
+                record.maintain(now);
+                path_observation_is_idle_for_probe(record.observation_at(now))
             })
     }
 

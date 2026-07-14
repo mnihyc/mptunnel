@@ -539,7 +539,7 @@ async fn server_udp_listener_accepts_probe_after_noise() {
     .await
     .expect("open udp datagram session");
     session
-        .ping(Duration::from_secs(2))
+        .ping_until(tokio::time::Instant::now() + Duration::from_secs(2))
         .await
         .expect("udp ping");
     let _ = session.close_session().await;
@@ -920,11 +920,11 @@ fn data_plane_failure_invalidates_durable_product_and_native_window_authority() 
     health.mark_product_delivery(
         PathRateSample::new(sample_floor, Duration::from_millis(360)).expect("rate sample"),
     );
-    let before_failure = health.observe(Instant::now());
+    let before_failure = health.observation_at(Instant::now());
     assert!(path_snapshot(&path, 0, before_failure).has_durable_product_progress);
 
     health.mark_data_plane_failure(Instant::now(), false);
-    let after_failure = health.observe(Instant::now());
+    let after_failure = health.observation_at(Instant::now());
     assert_eq!(after_failure.state, SchedulerPathState::Suspect);
     assert!(after_failure.product_delivery_rate_bps.is_none());
     assert_eq!(after_failure.product_delivery_sample_bytes, 0);

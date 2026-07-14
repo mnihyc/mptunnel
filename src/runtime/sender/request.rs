@@ -1681,6 +1681,13 @@ impl RequestSenderService {
             self.request.membership_generation = Some(membership_generation);
         }
         let now = Instant::now();
+        let quic_query = self.quic_capacity.reconciliation_query();
+        let reconciliation = context.request_capacity_reconciliation_view(
+            self.stream_id,
+            self.tcp_capacity.proof_queries(),
+            quic_query,
+            now,
+        );
         let completed_product_handoffs = self
             .tcp_capacity
             .calibrations
@@ -1692,17 +1699,16 @@ impl RequestSenderService {
                 })
             })
             .collect::<HashSet<_>>();
-        let tcp_events = self.tcp_capacity.reconcile(
-            self.stream_id,
-            context,
-            remotes,
-            &completed_product_handoffs,
-            now,
-        );
+        let tcp_events =
+            self.tcp_capacity
+                .reconcile(&reconciliation, remotes, &completed_product_handoffs);
         for event in tcp_events {
             self.apply_request_tcp_capacity_event(event);
         }
-        for event in self.quic_capacity.reconcile(context, remotes, now) {
+        for event in self
+            .quic_capacity
+            .reconcile(context, &reconciliation, remotes)
+        {
             self.apply_request_quic_capacity_event(event);
         }
         if self.request.ack_clock_operation.is_some_and(|operation| {
@@ -1775,6 +1781,7 @@ impl RequestSenderService {
             context,
             self.request.ordered_service,
             remotes,
+            now,
         ) {
             self.request.subflows.get_mut(instance).mark_graduated();
         }
@@ -1840,11 +1847,12 @@ impl RequestSenderService {
                     .iter()
                     .find(|path| path.instance() == owner)
                     .and_then(|path| {
-                        context.relay_path_fresh_proof_acked_at(
+                        context.relay_path_fresh_proof_acked_as_of(
                             owner.key.underlay,
                             owner.key.index,
                             proof_id,
                             path.attached_at,
+                            now,
                         )
                     })
             });

@@ -19,6 +19,7 @@ const RELIABLE_PATH_PRIORITY_HEADROOM_LANES: [FlowLane; 4] = [
 
 #[derive(Clone)]
 pub(in crate::runtime) struct ReliablePathCommandSender {
+    retirement: mpsc::UnboundedSender<ReliablePathRetirementCommand>,
     control: mpsc::Sender<QueuedReliablePathCommand>,
     priority: mpsc::Sender<QueuedReliablePathCommand>,
     data: mpsc::Sender<QueuedReliablePathCommand>,
@@ -26,11 +27,22 @@ pub(in crate::runtime) struct ReliablePathCommandSender {
 }
 
 pub(in crate::runtime) struct ReliablePathCommandReceivers {
+    retirement: mpsc::UnboundedReceiver<ReliablePathRetirementCommand>,
+    pending_retirement_close: Option<StreamId>,
     control: mpsc::Receiver<QueuedReliablePathCommand>,
     priority: mpsc::Receiver<QueuedReliablePathCommand>,
     data: mpsc::Receiver<QueuedReliablePathCommand>,
     metrics: Arc<ReliablePathCommandQueueMetrics>,
     dequeued_unreleased_bytes: AtomicU64,
+}
+
+/// A carrier-owned terminal transaction for an accepted stream whose product
+/// attachment never committed. It is intentionally separate from bounded work:
+/// queue pressure must not leak a peer binding or its local actor entry. The
+/// carrier's accepted-stream limit bounds outstanding retirements.
+#[derive(Debug, Clone, Copy)]
+enum ReliablePathRetirementCommand {
+    RetireAcceptedStream(StreamId),
 }
 
 /// Holds queue capacity without publishing a frame. Response transactions use
@@ -261,6 +273,17 @@ impl Drop for ReliablePathCommandReceivers {
 }
 
 impl ReliablePathCommandSender {
+    pub(in crate::runtime) fn retire_accepted_stream(
+        &self,
+        stream_id: StreamId,
+    ) -> Result<(), RuntimeError> {
+        self.retirement
+            .send(ReliablePathRetirementCommand::RetireAcceptedStream(
+                stream_id,
+            ))
+            .map_err(|_| RuntimeError::ReliablePathSessionClosed)
+    }
+
     pub(in crate::runtime) async fn send_control(
         &self,
         command: ReliablePathCommand,
@@ -695,11 +718,15 @@ impl ReliablePathCommandSender {
     }
 
     pub(in crate::runtime) fn is_closed(&self) -> bool {
-        self.control.is_closed() && self.priority.is_closed() && self.data.is_closed()
+        self.retirement.is_closed()
+            && self.control.is_closed()
+            && self.priority.is_closed()
+            && self.data.is_closed()
     }
 
     pub(in crate::runtime) fn same_channel(&self, other: &Self) -> bool {
-        self.control.same_channel(&other.control)
+        self.retirement.same_channel(&other.retirement)
+            && self.control.same_channel(&other.control)
             && self.priority.same_channel(&other.priority)
             && self.data.same_channel(&other.data)
     }
@@ -740,18 +767,22 @@ pub(in crate::runtime) fn reliable_path_command_channels(
     queue: usize,
 ) -> (ReliablePathCommandSender, ReliablePathCommandReceivers) {
     let queue = queue.max(1);
+    let (retirement_tx, retirement_rx) = mpsc::unbounded_channel();
     let (control_tx, control_rx) = mpsc::channel(queue);
     let (priority_tx, priority_rx) = mpsc::channel(queue);
     let (data_tx, data_rx) = mpsc::channel(queue);
     let metrics = Arc::new(ReliablePathCommandQueueMetrics::default());
     (
         ReliablePathCommandSender {
+            retirement: retirement_tx,
             control: control_tx,
             priority: priority_tx,
             data: data_tx,
             metrics: metrics.clone(),
         },
         ReliablePathCommandReceivers {
+            retirement: retirement_rx,
+            pending_retirement_close: None,
             control: control_rx,
             priority: priority_rx,
             data: data_rx,
@@ -765,10 +796,16 @@ fn path_command_receiver_may_recv<T>(receiver: &mpsc::Receiver<T>) -> bool {
     !receiver.is_closed() || !receiver.is_empty()
 }
 
+fn retirement_receiver_may_recv<T>(receiver: &mpsc::UnboundedReceiver<T>) -> bool {
+    !receiver.is_closed() || !receiver.is_empty()
+}
+
 pub(in crate::runtime) fn reliable_path_receivers_closed(
     receivers: &ReliablePathCommandReceivers,
 ) -> bool {
-    !path_command_receiver_may_recv(&receivers.control)
+    receivers.pending_retirement_close.is_none()
+        && !retirement_receiver_may_recv(&receivers.retirement)
+        && !path_command_receiver_may_recv(&receivers.control)
         && !path_command_receiver_may_recv(&receivers.priority)
         && !path_command_receiver_may_recv(&receivers.data)
 }
@@ -776,48 +813,45 @@ pub(in crate::runtime) fn reliable_path_receivers_closed(
 pub(in crate::runtime) async fn recv_reliable_path_command(
     receivers: &mut ReliablePathCommandReceivers,
 ) -> Option<ReliablePathCommand> {
-    if let Some(command) = recv_ready_priority_command(receivers) {
-        return Some(command);
+    enum ReceivedCommand {
+        Retirement(Option<ReliablePathRetirementCommand>),
+        Queued(Option<QueuedReliablePathCommand>),
     }
-    let control_may_recv = path_command_receiver_may_recv(&receivers.control);
-    let priority_may_recv = path_command_receiver_may_recv(&receivers.priority);
-    let data_may_recv = path_command_receiver_may_recv(&receivers.data);
-    let command = match (control_may_recv, priority_may_recv, data_may_recv) {
-        (true, true, true) => {
-            tokio::select! {
-                biased;
-                command = receivers.control.recv() => command,
-                command = receivers.priority.recv() => command,
-                command = receivers.data.recv() => command,
-            }
+
+    loop {
+        if let Some(command) = recv_ready_priority_command(receivers) {
+            return Some(command);
         }
-        (true, true, false) => {
-            tokio::select! {
-                biased;
-                command = receivers.control.recv() => command,
-                command = receivers.priority.recv() => command,
+        let retirement_may_recv = retirement_receiver_may_recv(&receivers.retirement);
+        let control_may_recv = path_command_receiver_may_recv(&receivers.control);
+        let priority_may_recv = path_command_receiver_may_recv(&receivers.priority);
+        let data_may_recv = path_command_receiver_may_recv(&receivers.data);
+        let received = tokio::select! {
+            biased;
+            command = receivers.retirement.recv(), if retirement_may_recv => {
+                ReceivedCommand::Retirement(command)
             }
-        }
-        (true, false, true) => {
-            tokio::select! {
-                biased;
-                command = receivers.control.recv() => command,
-                command = receivers.data.recv() => command,
+            command = receivers.control.recv(), if control_may_recv => {
+                ReceivedCommand::Queued(command)
             }
-        }
-        (false, true, true) => {
-            tokio::select! {
-                biased;
-                command = receivers.priority.recv() => command,
-                command = receivers.data.recv() => command,
+            command = receivers.priority.recv(), if priority_may_recv => {
+                ReceivedCommand::Queued(command)
             }
+            command = receivers.data.recv(), if data_may_recv => {
+                ReceivedCommand::Queued(command)
+            }
+            else => return None,
+        };
+        match received {
+            ReceivedCommand::Retirement(Some(command)) => {
+                return Some(begin_reliable_path_retirement(receivers, command));
+            }
+            ReceivedCommand::Queued(Some(command)) => {
+                return Some(receivers.take_queued_command(command));
+            }
+            ReceivedCommand::Retirement(None) | ReceivedCommand::Queued(None) => {}
         }
-        (true, false, false) => receivers.control.recv().await,
-        (false, true, false) => receivers.priority.recv().await,
-        (false, false, true) => receivers.data.recv().await,
-        (false, false, false) => None,
-    };
-    command.map(|command| receivers.take_queued_command(command))
+    }
 }
 
 pub(in crate::runtime) fn try_recv_reliable_path_command(
@@ -990,6 +1024,12 @@ fn reliable_path_writer_lane_count() -> usize {
 fn recv_ready_priority_command(
     receivers: &mut ReliablePathCommandReceivers,
 ) -> Option<ReliablePathCommand> {
+    if let Some(stream_id) = receivers.pending_retirement_close.take() {
+        return Some(ReliablePathCommand::CloseStream(stream_id));
+    }
+    if let Ok(command) = receivers.retirement.try_recv() {
+        return Some(begin_reliable_path_retirement(receivers, command));
+    }
     if let Ok(command) = receivers.control.try_recv() {
         return Some(receivers.take_queued_command(command));
     }
@@ -998,6 +1038,19 @@ fn recv_ready_priority_command(
         .try_recv()
         .ok()
         .map(|command| receivers.take_queued_command(command))
+}
+
+fn begin_reliable_path_retirement(
+    receivers: &mut ReliablePathCommandReceivers,
+    command: ReliablePathRetirementCommand,
+) -> ReliablePathCommand {
+    match command {
+        ReliablePathRetirementCommand::RetireAcceptedStream(stream_id) => {
+            debug_assert!(receivers.pending_retirement_close.is_none());
+            receivers.pending_retirement_close = Some(stream_id);
+            ReliablePathCommand::SendFrame(Frame::StreamDetach { stream_id })
+        }
+    }
 }
 
 pub(in crate::runtime) fn reliable_path_command_pending_bytes(

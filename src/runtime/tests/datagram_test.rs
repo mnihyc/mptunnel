@@ -71,7 +71,7 @@ fn measured_udp_delivery_rate_updates_next_datagram_order() {
         .lock()
         .expect("client path health lock")
         .udp[0]
-        .observe(Instant::now());
+        .observation_at(Instant::now());
     let reliable_snapshot = path_snapshot(&context.udp_paths[0], 0, observation);
     assert!(observation.measured_rate_bps.is_some());
     assert!(observation.product_delivery_rate_bps.is_none());

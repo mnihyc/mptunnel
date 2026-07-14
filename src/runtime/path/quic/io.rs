@@ -12,7 +12,9 @@ use crate::runtime::path::proof::PathProofTracker;
 use crate::runtime::path::server_context::ServerPathContext;
 use crate::transport::PathSpec;
 use crate::transport::quic as quic_transport;
-use std::net::SocketAddr;
+use crate::transport::udp::UdpTransportError;
+use std::collections::VecDeque;
+use std::net::{IpAddr, SocketAddr};
 use std::time::Instant;
 use tokio::net::lookup_host;
 use tokio::sync::mpsc;
@@ -49,15 +51,25 @@ impl UdpPathEndpoint {
         path: &PathSpec,
         context: &ServerPathContext,
     ) -> Result<Self, RuntimeError> {
-        let addr = resolve_first_socket_addr(path).await?;
-        Ok(Self {
-            endpoint: quic_transport::Endpoint::bind_server(
+        let addrs = resolve_udp_path_socket_addrs(path).await?;
+        let mut last_error = None;
+        for addr in addrs {
+            match quic_transport::Endpoint::bind_server(
                 addr,
                 context.security.secret.as_bytes(),
                 context.mux_limits,
             )
-            .await?,
-        })
+            .await
+            {
+                Ok(endpoint) => return Ok(Self { endpoint }),
+                Err(err) => last_error = Some(err),
+            }
+        }
+        Err(last_error
+            .map(RuntimeError::from)
+            .unwrap_or(RuntimeError::Protocol(
+                "QUIC UDP path endpoint resolved no bindable socket addresses",
+            )))
     }
 
     pub(super) async fn bind_client(
@@ -311,11 +323,69 @@ pub(super) fn udp_path_command_queue(mux_limits: MuxLimits, _codec_limits: Codec
     reliable_path_command_queue(mux_limits)
 }
 
-pub(super) async fn resolve_first_socket_addr(path: &PathSpec) -> Result<SocketAddr, RuntimeError> {
-    let mut addrs = lookup_host((path.endpoint.host.as_str(), path.endpoint.port)).await?;
-    addrs.next().ok_or(RuntimeError::Protocol(
-        "QUIC UDP path endpoint resolved no socket addresses",
-    ))
+/// Resolves every address the configured source binding can actually use.
+/// Address order remains resolver-owned; connection setup decides retry timing.
+pub(super) async fn resolve_udp_path_socket_addrs(
+    path: &PathSpec,
+) -> Result<Vec<SocketAddr>, RuntimeError> {
+    let resolved = lookup_host((path.endpoint.host.as_str(), path.endpoint.port))
+        .await?
+        .collect::<Vec<_>>();
+    if resolved.is_empty() {
+        return Err(RuntimeError::Udp(UdpTransportError::ResolutionEmpty(
+            path.endpoint.authority(),
+        )));
+    }
+    let compatible = compatible_udp_path_socket_addrs(resolved, path.binding.source_ip);
+    if compatible.is_empty() {
+        Err(RuntimeError::Udp(UdpTransportError::NoCompatibleAddress))
+    } else {
+        Ok(compatible)
+    }
+}
+
+/// Alternates address families while preserving resolver preference and each
+/// family's internal order, so a grouped AAAA set cannot hide a usable A set.
+pub(super) fn interleave_udp_path_socket_addr_families(addrs: Vec<SocketAddr>) -> Vec<SocketAddr> {
+    let Some(first) = addrs.first() else {
+        return addrs;
+    };
+    let prefer_v4 = first.is_ipv4();
+    let mut preferred = VecDeque::new();
+    let mut alternate = VecDeque::new();
+    for addr in addrs {
+        if addr.is_ipv4() == prefer_v4 {
+            preferred.push_back(addr);
+        } else {
+            alternate.push_back(addr);
+        }
+    }
+    let mut interleaved = Vec::with_capacity(preferred.len() + alternate.len());
+    while !preferred.is_empty() || !alternate.is_empty() {
+        if let Some(addr) = preferred.pop_front() {
+            interleaved.push(addr);
+        }
+        if let Some(addr) = alternate.pop_front() {
+            interleaved.push(addr);
+        }
+    }
+    interleaved
+}
+
+fn compatible_udp_path_socket_addrs(
+    resolved: impl IntoIterator<Item = SocketAddr>,
+    source_ip: Option<IpAddr>,
+) -> Vec<SocketAddr> {
+    let mut compatible = Vec::new();
+    for addr in resolved {
+        if source_ip.is_some_and(|source| source.is_ipv4() != addr.is_ipv4())
+            || compatible.contains(&addr)
+        {
+            continue;
+        }
+        compatible.push(addr);
+    }
+    compatible
 }
 
 pub(super) fn spawn_quic_path_reader(

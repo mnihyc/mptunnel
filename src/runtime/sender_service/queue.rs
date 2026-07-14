@@ -578,3 +578,6 @@ pub(in crate::runtime) fn reliable_relay_sender_queue_read_budget(
         )
         .min(buffer_len)
 }
+
+#[cfg(test)]
+mod tests;

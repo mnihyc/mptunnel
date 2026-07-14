@@ -105,7 +105,9 @@ async fn duplicated_socket_survives_stream_split_and_observes_ack_progress() {
             .expect("connect loopback client");
         let (mut server, _) = listener.accept().await.expect("accept loopback client");
 
-        let telemetry = TcpTelemetrySocket::capture(&client).expect("duplicate client socket");
+        let telemetry = TcpTelemetrySocket::capture(&client)
+            .expect("duplicate client socket")
+            .expect("Linux native TCP telemetry capability");
         let baseline = telemetry
             .snapshot()
             .expect("read initial TCP_INFO")

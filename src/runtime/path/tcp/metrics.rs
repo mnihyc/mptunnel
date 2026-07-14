@@ -188,11 +188,18 @@ pub(in crate::runtime) struct TcpMetricPublisher {
 
 impl TcpMetricPublisher {
     pub(in crate::runtime) fn capture(socket: &TcpStream) -> Option<Self> {
-        Some(Self {
-            socket: TcpTelemetrySocket::capture(socket).ok()?,
-            tracker: None,
-            next_sample_at: Instant::now(),
-        })
+        match TcpTelemetrySocket::capture(socket) {
+            Ok(Some(socket)) => Some(Self {
+                socket,
+                tracker: None,
+                next_sample_at: Instant::now(),
+            }),
+            Ok(None) => None,
+            Err(error) => {
+                eprintln!("warning: native TCP telemetry capture failed: {error}");
+                None
+            }
+        }
     }
 
     /// Starts the cumulative sender epoch after authenticated readiness bytes.

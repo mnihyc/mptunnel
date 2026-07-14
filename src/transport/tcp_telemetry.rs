@@ -8,13 +8,6 @@ use tokio::net::TcpStream;
 
 #[cfg(target_os = "linux")]
 mod linux;
-#[cfg(not(target_os = "linux"))]
-mod unavailable;
-
-#[cfg(target_os = "linux")]
-use linux as platform;
-#[cfg(not(target_os = "linux"))]
-use unavailable as platform;
 
 /// Coherent RTT fields available from one native snapshot.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -73,18 +66,37 @@ impl TcpNativeSnapshot {
 /// Owns a duplicate of the carrier socket when native telemetry is supported.
 #[derive(Debug)]
 pub(crate) struct TcpTelemetrySocket {
-    platform: platform::PlatformTcpTelemetrySocket,
+    #[cfg(target_os = "linux")]
+    platform: linux::PlatformTcpTelemetrySocket,
 }
 
 impl TcpTelemetrySocket {
-    /// Captures the socket identity without moving ownership from its carrier.
-    pub(crate) fn capture(socket: &TcpStream) -> io::Result<Self> {
-        platform::PlatformTcpTelemetrySocket::capture(socket).map(|platform| Self { platform })
+    /// Distinguishes an unsupported host from failure to capture a supported
+    /// native socket. Either outcome remains optional to carrier operation.
+    pub(crate) fn capture(socket: &TcpStream) -> io::Result<Option<Self>> {
+        #[cfg(target_os = "linux")]
+        {
+            return linux::PlatformTcpTelemetrySocket::capture(socket)
+                .map(|platform| Some(Self { platform }));
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            let _ = socket;
+            Ok(None)
+        }
     }
 
     /// Returns `None` when the host exposes no understood native counter group.
     pub(crate) fn snapshot(&self) -> io::Result<Option<TcpNativeSnapshot>> {
-        self.platform.snapshot()
+        #[cfg(target_os = "linux")]
+        {
+            return self.platform.snapshot();
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            let _ = self;
+            Ok(None)
+        }
     }
 }
 

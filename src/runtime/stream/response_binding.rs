@@ -54,8 +54,13 @@ pub(in crate::runtime) use response_session::{
 };
 pub(in crate::runtime) use response_snapshot::server_bulk_output_eta_ms;
 pub(in crate::runtime) use response_topology::{
-    ResponseDispatchTarget, ResponseSenderPathTarget, ResponseStreamOutputEntry,
-    ResponseStreamOutputs, TcpResponseCapacityPrior,
+    ResponseDispatchTarget, ResponseSenderPathTarget, ResponseStreamAttachOutcome,
+    ResponseStreamOutputEntry, ResponseStreamOutputs, ServerCarrierPathInstanceId,
+    TcpResponseCapacityPrior, next_server_carrier_path_instance_id,
+};
+use response_topology::{
+    response_live_ordered_data_owner, response_owner_underlay_seen_bit,
+    response_stream_role_reserves_flow_load,
 };
 
 use self::response_evidence::server_output_quic_capacity_proof_marker;
@@ -95,7 +100,6 @@ use crate::protocol::{
 };
 use crate::runtime::RuntimeError;
 use crate::runtime::path::commands::{ReliablePathCommand, ReliablePathCommandSender};
-use crate::runtime::path::proof::enqueue_path_proof_frame;
 use crate::runtime::path::tcp::capacity::TcpCapacityProofCandidate;
 #[cfg(feature = "lab-diagnostics")]
 use crate::runtime::relay::io::reliable_bulk_carrier_feed_quantum_bytes;
@@ -110,24 +114,12 @@ use tokio::sync::{Notify, watch};
 // Reliable-path bindings own attachment instances, exact range flights,
 // evidence, and atomic commit. Sender services rank immutable snapshots.
 
-static NEXT_SERVER_CARRIER_PATH_INSTANCE_ID: AtomicU64 = AtomicU64::new(1);
 pub(in crate::runtime) const MAX_RESPONSE_QUIC_CAPACITY_CALIBRATION_ATTEMPTS_PER_PATH: u8 = 2;
 // One sustained response stream is real demand. Same-family discovery stays
 // single-owner and bounded; requiring a second stream prevents large one-flow
 // transfers from ever measuring spare paths.
 pub(in crate::runtime) const MIN_ACTIVE_RESPONSE_FLOWS_FOR_SAME_FAMILY_DISCOVERY: u32 = 1;
 static NEXT_RESPONSE_STREAM_BINDING_INSTANCE_ID: AtomicU64 = AtomicU64::new(1);
-const RESPONSE_OWNER_TCP_SEEN: u8 = 1 << 0;
-const RESPONSE_OWNER_UDP_SEEN: u8 = 1 << 1;
-const RESPONSE_OWNER_MIXED_SEEN: u8 = RESPONSE_OWNER_TCP_SEEN | RESPONSE_OWNER_UDP_SEEN;
-
-fn response_owner_underlay_seen_bit(underlay: UnderlayProtocol) -> u8 {
-    match underlay {
-        UnderlayProtocol::Tcp => RESPONSE_OWNER_TCP_SEEN,
-        UnderlayProtocol::Udp => RESPONSE_OWNER_UDP_SEEN,
-    }
-}
-
 // Ownership boundary:
 // This module owns carrier-neutral reliable stream bindings on the response
 // side. It tracks which carrier path carried each product byte range, records
@@ -310,14 +302,6 @@ impl Drop for ResponseStreamBinding {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(in crate::runtime) enum ResponseStreamAttachOutcome {
-    Attached,
-    RoleChanged,
-    ReplacedClosedOutput,
-    RejectedDuplicateLiveOutput,
-}
-
 impl ResponseStreamBinding {
     #[cfg(test)]
     pub(in crate::runtime) fn new(
@@ -445,385 +429,6 @@ impl ResponseStreamBinding {
         })
     }
 
-    fn allocate_output_incarnation(&self) -> u64 {
-        self.next_output_incarnation.fetch_add(1, Ordering::AcqRel)
-    }
-
-    fn response_flow_is_active(outputs: &ResponseStreamOutputs) -> bool {
-        outputs
-            .entries
-            .iter()
-            .any(|entry| response_stream_role_reserves_flow_load(entry.role))
-    }
-
-    fn sync_response_flow_activity(&self, outputs: &ResponseStreamOutputs) {
-        // Deactivation calls this before path-load removal; activation calls it
-        // after path-load registration so every visible generation is conservative.
-        self.response_flow_registration
-            .set_active(Self::response_flow_is_active(outputs));
-    }
-
-    #[cfg(test)]
-    pub(in crate::runtime) fn attach(
-        &self,
-        underlay: UnderlayProtocol,
-        path_id: PathId,
-        commands: ReliablePathCommandSender,
-        lane: FlowLane,
-        role: StreamOpenRole,
-        max_frame_payload_bytes: usize,
-    ) -> ResponseStreamAttachOutcome {
-        let key = CarrierPathKey { underlay, path_id };
-        let path_instance_id = self
-            .outputs
-            .lock()
-            .expect("server reliable stream binding lock")
-            .entries
-            .iter()
-            .find(|entry| entry.key == key && entry.commands.same_channel(&commands))
-            .map_or_else(next_server_carrier_path_instance_id, |entry| {
-                entry.path_instance_id
-            });
-        self.attach_with_path_instance(
-            underlay,
-            path_id,
-            path_instance_id,
-            commands,
-            lane,
-            role,
-            max_frame_payload_bytes,
-        )
-    }
-
-    pub(super) fn attach_with_path_instance(
-        &self,
-        underlay: UnderlayProtocol,
-        path_id: PathId,
-        path_instance_id: ServerCarrierPathInstanceId,
-        commands: ReliablePathCommandSender,
-        lane: FlowLane,
-        role: StreamOpenRole,
-        _max_frame_payload_bytes: usize,
-    ) -> ResponseStreamAttachOutcome {
-        let mut current_lane = self.lane.lock().expect("server reliable stream lane lock");
-        let previous_lane = *current_lane;
-        let proof_commands = commands.clone();
-        let mut outputs = self
-            .outputs
-            .lock()
-            .expect("server reliable stream binding lock");
-        let response_flow_was_active = Self::response_flow_is_active(&outputs);
-        let key = CarrierPathKey { underlay, path_id };
-        let mut was_active = false;
-        let mut previous_load_registered = false;
-        let mut replaced_closed = false;
-        let mut replaced_incarnation = None;
-        let mut replaced_path_instance_id = None;
-        let existing_position = outputs.entries.iter().position(|entry| entry.key == key);
-        if let Some(position) = existing_position {
-            let entry = &mut outputs.entries[position];
-            if !entry.commands.is_closed() {
-                let same_channel = entry.commands.same_channel(&commands);
-                #[cfg(feature = "lab-diagnostics")]
-                let attach_result = match same_channel {
-                    true => "same_channel_role_update",
-                    false => "duplicate_live",
-                };
-                #[cfg(feature = "lab-diagnostics")]
-                lab_diagnostic(
-                    "server_stream_output_attach",
-                    format_args!(
-                        "session_id={} path_underlay={:?} path_id={} role={:?} lane={:?} result={} same_channel={}",
-                        self.session_id.0,
-                        underlay,
-                        path_id.0,
-                        role,
-                        lane,
-                        attach_result,
-                        same_channel,
-                    ),
-                );
-                if same_channel {
-                    let previous_role = entry.role;
-                    let previous_load_registered =
-                        response_stream_role_reserves_flow_load(previous_role);
-                    entry.role = response_stream_live_role_update(entry.role, role);
-                    let role_changed = entry.role != previous_role;
-                    let response_state_invalidated =
-                        response_stream_role_change_invalidates_response_state(
-                            previous_role,
-                            entry.role,
-                        );
-                    let response_state_incarnations = response_state_invalidated.then(|| {
-                        let previous = entry.incarnation;
-                        let current = self.allocate_output_incarnation();
-                        (previous, current)
-                    });
-                    if response_state_invalidated {
-                        entry.incarnation = response_state_incarnations
-                            .expect("response eligibility change allocates an incarnation")
-                            .1;
-                        entry.product_progress_rate_bps = None;
-                        entry.delivery_rate_bps = None;
-                        entry.tcp_ack_clock_rate_bps = None;
-                        entry.tcp_product_rate_evidence = None;
-                        entry.tcp_capacity_prior = None;
-                        entry.srtt_ms = None;
-                        entry.delivery_samples = 0;
-                        entry.owner_data_acked_bytes = 0;
-                        entry.local_path_metrics = None;
-                        entry.peer_path_metrics = None;
-                    }
-                    let updated_role = entry.role;
-                    let updated_load_registered =
-                        response_stream_role_reserves_flow_load(updated_role);
-                    let lane_registered_keys = outputs
-                        .entries
-                        .iter()
-                        .filter(|entry| {
-                            response_stream_role_reserves_flow_load(entry.role)
-                                && (entry.key != key || previous_load_registered)
-                        })
-                        .map(|entry| entry.key)
-                        .collect::<Vec<_>>();
-                    let response_flow_is_active = Self::response_flow_is_active(&outputs);
-                    if response_flow_was_active && !response_flow_is_active {
-                        self.sync_response_flow_activity(&outputs);
-                    }
-                    if let Some((previous_incarnation, current_incarnation)) =
-                        response_state_incarnations
-                    {
-                        outputs
-                            .ack_clock_calibrations
-                            .remove(&(key, previous_incarnation));
-                        if outputs.active_ack_clock_calibration == Some((key, previous_incarnation))
-                        {
-                            outputs.active_ack_clock_calibration = None;
-                        }
-                        self.rebind_path_flights_after_live_role_change(
-                            key,
-                            previous_incarnation,
-                            current_incarnation,
-                        );
-                    }
-                    if role_changed && updated_role != StreamOpenRole::Active {
-                        self.clear_ordered_data_owner_if(key);
-                    }
-                    if previous_load_registered && !updated_load_registered {
-                        self.lane_tracker
-                            .detach(self.session_id, key, previous_lane);
-                    }
-                    *current_lane = lane;
-                    if previous_lane != lane {
-                        self.lane_tracker.change_lanes(
-                            self.session_id,
-                            &lane_registered_keys,
-                            previous_lane,
-                            lane,
-                        );
-                    }
-                    if !previous_load_registered && updated_load_registered {
-                        self.lane_tracker.attach(self.session_id, key, lane);
-                    }
-                    if !response_flow_was_active && response_flow_is_active {
-                        self.sync_response_flow_activity(&outputs);
-                    }
-                    if response_state_invalidated {
-                        // Crossing Repair changes response ownership
-                        // eligibility, so publish the role and reset Subflow
-                        // identities at one outputs-lock linearization point.
-                        self.reset_subflow_set_with_outputs(&mut outputs);
-                    }
-                    if updated_role != StreamOpenRole::Repair {
-                        self.owner_underlay_history
-                            .fetch_or(response_owner_underlay_seen_bit(underlay), Ordering::AcqRel);
-                    }
-                    if role == StreamOpenRole::Active {
-                        self.set_request_active_owner(key);
-                    }
-                    drop(outputs);
-                    drop(current_lane);
-                    self.notify_update();
-                    return if role_changed {
-                        ResponseStreamAttachOutcome::RoleChanged
-                    } else {
-                        ResponseStreamAttachOutcome::Attached
-                    };
-                }
-                return ResponseStreamAttachOutcome::RejectedDuplicateLiveOutput;
-            }
-        }
-        let entry = if let Some(position) = existing_position {
-            was_active = position + 1 == outputs.entries.len();
-            let mut entry = outputs.entries.remove(position);
-            if entry.commands.is_closed() {
-                previous_load_registered = response_stream_role_reserves_flow_load(entry.role);
-                replaced_incarnation = Some(entry.incarnation);
-                replaced_path_instance_id = Some(entry.path_instance_id);
-                entry.path_instance_id = path_instance_id;
-                entry.incarnation = self.allocate_output_incarnation();
-                entry.commands = commands;
-                entry.role = role;
-                entry.owner_data_in_flight_bytes = 0;
-                entry.bytes_in_flight = 0;
-                entry.product_queue_bytes = 0;
-                entry.product_progress_rate_bps = None;
-                entry.delivery_rate_bps = None;
-                entry.tcp_ack_clock_rate_bps = None;
-                entry.tcp_product_rate_evidence = None;
-                entry.tcp_capacity_prior = None;
-                entry.srtt_ms = None;
-                entry.delivery_samples = 0;
-                entry.owner_data_acked_bytes = 0;
-                entry.local_path_metrics = None;
-                entry.peer_path_metrics = None;
-                replaced_closed = true;
-                #[cfg(feature = "lab-diagnostics")]
-                lab_diagnostic(
-                    "server_stream_output_attach",
-                    format_args!(
-                        "session_id={} path_underlay={:?} path_id={} role={:?} lane={:?} result=replace_closed",
-                        self.session_id.0, underlay, path_id.0, role, lane,
-                    ),
-                );
-            } else {
-                #[cfg(feature = "lab-diagnostics")]
-                {
-                    let same_channel = entry.commands.same_channel(&commands);
-                    lab_diagnostic(
-                        "server_stream_output_attach",
-                        format_args!(
-                            "session_id={} path_underlay={:?} path_id={} role={:?} lane={:?} result=duplicate_live same_channel={}",
-                            self.session_id.0, underlay, path_id.0, role, lane, same_channel,
-                        ),
-                    );
-                }
-            }
-            entry
-        } else {
-            ResponseStreamOutputEntry {
-                key,
-                path_instance_id,
-                incarnation: self.allocate_output_incarnation(),
-                commands,
-                role,
-                owner_data_in_flight_bytes: 0,
-                bytes_in_flight: 0,
-                product_queue_bytes: 0,
-                product_progress_rate_bps: None,
-                delivery_rate_bps: None,
-                tcp_ack_clock_rate_bps: None,
-                tcp_product_rate_evidence: None,
-                tcp_capacity_prior: None,
-                srtt_ms: None,
-                delivery_samples: 0,
-                owner_data_acked_bytes: 0,
-                local_path_metrics: None,
-                peer_path_metrics: None,
-            }
-        };
-        let promote_or_keep_active_slot = was_active || outputs.entries.is_empty();
-        if promote_or_keep_active_slot {
-            outputs.entries.push(entry);
-        } else {
-            let insert_at = outputs.entries.len().saturating_sub(1);
-            outputs.entries.insert(insert_at, entry);
-        }
-        let updated_load_registered = response_stream_role_reserves_flow_load(role);
-        let lane_registered_keys = outputs
-            .entries
-            .iter()
-            .filter(|entry| {
-                response_stream_role_reserves_flow_load(entry.role)
-                    && (entry.key != key || previous_load_registered)
-            })
-            .map(|entry| entry.key)
-            .collect::<Vec<_>>();
-        let response_flow_is_active = Self::response_flow_is_active(&outputs);
-        if response_flow_was_active && !response_flow_is_active {
-            self.sync_response_flow_activity(&outputs);
-        }
-        if let Some(incarnation) = replaced_incarnation {
-            outputs.ack_clock_calibrations.remove(&(key, incarnation));
-            if outputs.active_ack_clock_calibration == Some((key, incarnation)) {
-                outputs.active_ack_clock_calibration = None;
-            }
-            self.invalidate_path_flight_evidence(key, incarnation);
-        }
-        if let Some(replaced_path_instance_id) = replaced_path_instance_id {
-            // Output replacement retires this binding's queue, not the shared
-            // carrier instance. Only registry path-registration drop may reset
-            // an exact carrier's bounded attempt count.
-            self.lane_tracker.clear_quic_capacity_calibration(
-                self.session_id,
-                self.binding_instance_id,
-                key,
-                replaced_path_instance_id,
-            );
-            self.lane_tracker
-                .clear_response_service_handoff_drain_for_path(
-                    self.session_id,
-                    self.binding_instance_id,
-                    key,
-                    replaced_path_instance_id,
-                );
-        }
-        if replaced_closed && role != StreamOpenRole::Active {
-            self.clear_ordered_data_owner_if(key);
-        }
-        if previous_load_registered && !updated_load_registered {
-            self.lane_tracker
-                .detach(self.session_id, key, previous_lane);
-        }
-        *current_lane = lane;
-        if previous_lane != lane {
-            self.lane_tracker.change_lanes(
-                self.session_id,
-                &lane_registered_keys,
-                previous_lane,
-                lane,
-            );
-        }
-        if !previous_load_registered && updated_load_registered {
-            self.lane_tracker.attach(self.session_id, key, lane);
-        }
-        if !response_flow_was_active && response_flow_is_active {
-            self.sync_response_flow_activity(&outputs);
-        }
-        // A planner may snapshot the old generation before blocking on outputs,
-        // but it cannot observe new membership before this invalidation completes.
-        // Passive growth does not recreate cumulative startup sampling credit.
-        if replaced_closed || role == StreamOpenRole::Active {
-            self.reset_subflow_set_with_outputs(&mut outputs);
-        } else {
-            self.invalidate_subflow_plan();
-        }
-        if role != StreamOpenRole::Repair {
-            self.owner_underlay_history
-                .fetch_or(response_owner_underlay_seen_bit(underlay), Ordering::AcqRel);
-        }
-        if replaced_closed && role != StreamOpenRole::Active {
-            self.clear_request_active_owner_if(key);
-        } else if role == StreamOpenRole::Active {
-            self.set_request_active_owner(key);
-        }
-        drop(outputs);
-        drop(current_lane);
-        if role == StreamOpenRole::Validation {
-            let _ = enqueue_path_proof_frame(&proof_commands, path_id, self.mux_limits);
-        }
-        self.notify_update();
-        if replaced_closed {
-            ResponseStreamAttachOutcome::ReplacedClosedOutput
-        } else {
-            ResponseStreamAttachOutcome::Attached
-        }
-    }
-
-    pub(in crate::runtime) fn lane(&self) -> FlowLane {
-        *self.lane.lock().expect("server reliable stream lane lock")
-    }
-
     pub(in crate::runtime) fn subscribe_updates(&self) -> watch::Receiver<u64> {
         self.version.subscribe()
     }
@@ -893,23 +498,6 @@ impl ResponseStreamBinding {
             .map(|key| key.underlay)
     }
 
-    #[cfg(test)]
-    pub(in crate::runtime) fn has_live_mixed_owner_underlays(&self) -> bool {
-        if !self.may_have_mixed_owner_underlays() {
-            return false;
-        }
-        let outputs = self
-            .outputs
-            .lock()
-            .expect("server reliable stream binding lock");
-        response_outputs_have_live_mixed_owner_underlays(&outputs.entries)
-    }
-
-    pub(in crate::runtime) fn may_have_mixed_owner_underlays(&self) -> bool {
-        self.owner_underlay_history.load(Ordering::Acquire) & RESPONSE_OWNER_MIXED_SEEN
-            == RESPONSE_OWNER_MIXED_SEEN
-    }
-
     pub(super) fn set_sender_queue_bytes(&self, bytes: usize) {
         let bytes = bytes as u64;
         let mut outputs = self
@@ -941,31 +529,6 @@ impl ResponseStreamBinding {
             .iter()
             .map(|entry| entry.commands.capacity_notify())
             .collect()
-    }
-
-    pub(in crate::runtime) fn set_lane(&self, lane: FlowLane) {
-        let mut current_lane = self.lane.lock().expect("server reliable stream lane lock");
-        let previous_lane = *current_lane;
-        if previous_lane != lane {
-            let outputs = self
-                .outputs
-                .lock()
-                .expect("server reliable stream binding lock");
-            let attached_keys = outputs
-                .entries
-                .iter()
-                .filter(|entry| response_stream_role_reserves_flow_load(entry.role))
-                .map(|entry| entry.key)
-                .collect::<Vec<_>>();
-            *current_lane = lane;
-            self.lane_tracker
-                .change_lanes(self.session_id, &attached_keys, previous_lane, lane);
-            self.response_flow_registration
-                .change_lane_if_present(previous_lane, lane);
-            drop(outputs);
-        }
-        drop(current_lane);
-        self.notify_update();
     }
 
     pub(in crate::runtime) fn has_multipath_repair_alternative(&self) -> bool {
@@ -1069,82 +632,6 @@ impl ResponseStreamBinding {
             .expect("server reliable stream binding lock")
             .entries
             .is_empty()
-    }
-
-    pub(in crate::runtime) fn detach(
-        &self,
-        key: CarrierPathKey,
-        commands: &ReliablePathCommandSender,
-    ) {
-        self.detach_matching_output(key, |entry| entry.commands.same_channel(commands));
-    }
-
-    pub(super) fn detach_path_instance(
-        &self,
-        key: CarrierPathKey,
-        path_instance_id: ServerCarrierPathInstanceId,
-    ) {
-        self.detach_matching_output(key, |entry| entry.path_instance_id == path_instance_id);
-    }
-
-    fn detach_matching_output(
-        &self,
-        key: CarrierPathKey,
-        matches: impl Fn(&ResponseStreamOutputEntry) -> bool,
-    ) {
-        let current_lane = self.lane.lock().expect("server reliable stream lane lock");
-        let lane = *current_lane;
-        let mut outputs = self
-            .outputs
-            .lock()
-            .expect("server reliable stream binding lock");
-        let response_flow_was_active = Self::response_flow_is_active(&outputs);
-        let removed = outputs
-            .entries
-            .iter()
-            .find(|entry| entry.key == key && matches(entry))
-            .map(|entry| {
-                (
-                    entry.incarnation,
-                    entry.path_instance_id,
-                    response_stream_role_reserves_flow_load(entry.role),
-                )
-            });
-        outputs
-            .entries
-            .retain(|entry| entry.key != key || !matches(entry));
-        if let Some((incarnation, path_instance_id, load_registered)) = removed {
-            if response_flow_was_active && !Self::response_flow_is_active(&outputs) {
-                self.sync_response_flow_activity(&outputs);
-            }
-            self.invalidate_path_flight_evidence(key, incarnation);
-            outputs.ack_clock_calibrations.remove(&(key, incarnation));
-            if outputs.active_ack_clock_calibration == Some((key, incarnation)) {
-                outputs.active_ack_clock_calibration = None;
-            }
-            if load_registered {
-                self.lane_tracker.detach(self.session_id, key, lane);
-            }
-            self.lane_tracker.clear_quic_capacity_calibration(
-                self.session_id,
-                self.binding_instance_id,
-                key,
-                path_instance_id,
-            );
-            self.lane_tracker
-                .clear_response_service_handoff_drain_for_path(
-                    self.session_id,
-                    self.binding_instance_id,
-                    key,
-                    path_instance_id,
-                );
-            self.repair_ordered_data_owner_after_output_change(&outputs.entries);
-            self.reset_subflow_set_with_outputs(&mut outputs);
-            self.clear_request_active_owner_if(key);
-            drop(outputs);
-            drop(current_lane);
-            self.notify_update();
-        }
     }
 
     pub(in crate::runtime) fn release_normalized_acked_ranges(&self, ranges: &[OffsetRange]) {
@@ -1778,173 +1265,6 @@ impl ResponseStreamBinding {
         }
     }
 
-    pub(in crate::runtime) fn ordered_data_owner(&self) -> Option<CarrierPathKey> {
-        *self
-            .ordered_data_owner
-            .lock()
-            .expect("server reliable stream ordered data owner lock")
-    }
-
-    #[cfg(test)]
-    pub(in crate::runtime) fn request_active_owner(&self) -> Option<CarrierPathKey> {
-        *self
-            .request_active_owner
-            .lock()
-            .expect("server reliable stream request active owner lock")
-    }
-
-    pub(in crate::runtime) fn request_active_underlay(&self) -> Option<UnderlayProtocol> {
-        self.request_active_owner
-            .lock()
-            .expect("server reliable stream request active owner lock")
-            .map(|key| key.underlay)
-    }
-
-    pub(in crate::runtime) fn request_active_path_snapshot(
-        &self,
-        lane: FlowLane,
-    ) -> Option<PathSnapshot> {
-        // Attach and detach take these locks in this order before changing the
-        // request-side Active identity. Keep the identity and its metrics in a
-        // single coherent snapshot without reversing that order.
-        let outputs = self
-            .outputs
-            .lock()
-            .expect("server reliable stream binding lock");
-        let active_key = *self
-            .request_active_owner
-            .lock()
-            .expect("server reliable stream request active owner lock");
-        active_key.and_then(|key| {
-            outputs.snapshot_for_key(
-                key,
-                self.session_id,
-                &self.lane_tracker,
-                lane,
-                self.mux_limits,
-            )
-        })
-    }
-
-    pub(in crate::runtime) fn has_output_incarnation(
-        &self,
-        key: CarrierPathKey,
-        incarnation: u64,
-    ) -> bool {
-        self.outputs
-            .lock()
-            .expect("server reliable stream binding lock")
-            .entries
-            .iter()
-            .any(|entry| entry.key == key && entry.incarnation == incarnation)
-    }
-
-    fn set_request_active_owner(&self, key: CarrierPathKey) {
-        *self
-            .request_active_owner
-            .lock()
-            .expect("server reliable stream request active owner lock") = Some(key);
-    }
-
-    fn clear_request_active_owner_if(&self, key: CarrierPathKey) {
-        let mut active = self
-            .request_active_owner
-            .lock()
-            .expect("server reliable stream request active owner lock");
-        if *active == Some(key) {
-            *active = None;
-        }
-    }
-
-    #[cfg(test)]
-    pub(in crate::runtime) fn set_ordered_data_owner(&self, key: CarrierPathKey) {
-        let lane = self.lane();
-        let mut outputs = self
-            .outputs
-            .lock()
-            .expect("server reliable stream binding lock");
-        let mut lead = self
-            .ordered_data_owner
-            .lock()
-            .expect("server reliable stream ordered data owner lock");
-        if *lead != Some(key) {
-            *lead = Some(key);
-            self.reset_subflow_set_with_outputs(&mut outputs);
-            self.response_flow_registration
-                .set_service(Some((key, lane)));
-            drop(lead);
-            drop(outputs);
-            self.notify_update();
-        }
-    }
-
-    #[cfg(test)]
-    pub(in crate::runtime) fn commit_ordered_data_owner_for_target(
-        &self,
-        target: &ResponseSenderPathTarget,
-    ) -> bool {
-        self.commit_ordered_data_owner_for_dispatch_target(&target.into())
-    }
-
-    pub(in crate::runtime) fn commit_ordered_data_owner_for_dispatch_target(
-        &self,
-        target: &ResponseDispatchTarget,
-    ) -> bool {
-        let lane = self.lane();
-        let mut outputs = self
-            .outputs
-            .lock()
-            .expect("server reliable stream binding lock");
-        let target_is_live = outputs.entries.iter().any(|entry| {
-            entry.key == target.key
-                && entry.incarnation == target.incarnation
-                && entry.commands.same_channel(&target.commands)
-                && !entry.commands.is_closed()
-        });
-        if !target_is_live {
-            return false;
-        }
-        let mut lead = self
-            .ordered_data_owner
-            .lock()
-            .expect("server reliable stream ordered data owner lock");
-        if !self.response_stream_open.load(Ordering::Acquire) {
-            return false;
-        }
-        let changed = *lead != Some(target.key);
-        if changed {
-            *lead = Some(target.key);
-            outputs
-                .ack_clock_calibrations
-                .remove(&(target.key, target.incarnation));
-            if outputs.active_ack_clock_calibration == Some((target.key, target.incarnation)) {
-                outputs.active_ack_clock_calibration = None;
-            }
-            self.reset_subflow_set_with_outputs(&mut outputs);
-            self.response_flow_registration
-                .set_service(Some((target.key, lane)));
-        }
-        drop(lead);
-        drop(outputs);
-        if changed {
-            self.notify_update();
-        }
-        true
-    }
-
-    fn clear_ordered_data_owner_if(&self, key: CarrierPathKey) {
-        let mut lead = self
-            .ordered_data_owner
-            .lock()
-            .expect("server reliable stream ordered data owner lock");
-        let changed = *lead == Some(key);
-        if changed {
-            *lead = None;
-            self.response_flow_registration.set_service(None);
-        }
-        drop(lead);
-    }
-
     fn subflow_set_for(
         current: Option<FlowSubflowSet>,
         epoch_generation: u64,
@@ -2448,25 +1768,6 @@ impl ResponseStreamBinding {
             .lock()
             .expect("server reliable stream subflow set lock");
         state.planner_generation = state.planner_generation.wrapping_add(1);
-    }
-
-    fn repair_ordered_data_owner_after_output_change(
-        &self,
-        live_entries: &[ResponseStreamOutputEntry],
-    ) {
-        let mut lead = self
-            .ordered_data_owner
-            .lock()
-            .expect("server reliable stream ordered data owner lock");
-        let live_lead = lead.is_some_and(|key| live_entries.iter().any(|entry| entry.key == key));
-        let cleared = !live_lead && lead.is_some();
-        if !live_lead {
-            *lead = None;
-        }
-        if cleared {
-            self.response_flow_registration.set_service(None);
-        }
-        drop(lead);
     }
 
     #[cfg(test)]
@@ -3825,30 +3126,6 @@ fn server_path_metrics_scheduling_equivalent(
     left == right
 }
 
-fn response_stream_live_role_update(
-    current: StreamOpenRole,
-    requested: StreamOpenRole,
-) -> StreamOpenRole {
-    match (current, requested) {
-        (StreamOpenRole::Active, _) => StreamOpenRole::Active,
-        (_, StreamOpenRole::Active) => StreamOpenRole::Active,
-        (StreamOpenRole::Repair, _) | (_, StreamOpenRole::Repair) => StreamOpenRole::Repair,
-        _ => current,
-    }
-}
-
-fn response_stream_role_change_invalidates_response_state(
-    previous: StreamOpenRole,
-    current: StreamOpenRole,
-) -> bool {
-    previous != current
-        && ((previous == StreamOpenRole::Repair) != (current == StreamOpenRole::Repair))
-}
-
-fn response_stream_role_reserves_flow_load(role: StreamOpenRole) -> bool {
-    role == StreamOpenRole::Active
-}
-
 pub(super) fn release_carrier_path_flight_ranges(
     flights: &mut BTreeMap<u64, Vec<CarrierPathFlight>>,
     ranges: &[OffsetRange],
@@ -4007,42 +3284,6 @@ pub(super) fn product_flights_have_recent_repair_overlap(
         }
     }
     false
-}
-
-fn response_live_ordered_data_owner(
-    stored: Option<CarrierPathKey>,
-    entries: &[ResponseStreamOutputEntry],
-) -> Option<CarrierPathKey> {
-    stored.filter(|key| entries.iter().any(|entry| entry.key == *key))
-}
-
-fn response_outputs_have_live_mixed_owner_underlays(entries: &[ResponseStreamOutputEntry]) -> bool {
-    let mut first_underlay = None;
-    for entry in entries
-        .iter()
-        .filter(|entry| entry.role != StreamOpenRole::Repair && !entry.commands.is_closed())
-    {
-        match first_underlay {
-            Some(underlay) if underlay != entry.key.underlay => return true,
-            Some(_) => {}
-            None => first_underlay = Some(entry.key.underlay),
-        }
-    }
-    false
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub(in crate::runtime) struct ServerCarrierPathInstanceId(u64);
-
-impl ServerCarrierPathInstanceId {
-    #[cfg(feature = "lab-diagnostics")]
-    pub(in crate::runtime) fn as_u64(self) -> u64 {
-        self.0
-    }
-}
-
-pub(in crate::runtime) fn next_server_carrier_path_instance_id() -> ServerCarrierPathInstanceId {
-    ServerCarrierPathInstanceId(NEXT_SERVER_CARRIER_PATH_INSTANCE_ID.fetch_add(1, Ordering::AcqRel))
 }
 
 #[cfg(test)]

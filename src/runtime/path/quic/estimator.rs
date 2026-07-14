@@ -8,7 +8,9 @@ use super::io::UdpPathConnection;
 use super::metrics::QuicAckPollDiagnostics;
 use super::metrics::UdpPathMetrics;
 use super::*;
-use crate::model::capacity::{QuicCapacityProofCandidate, quic_capacity_receipt_rate_bps};
+use crate::model::capacity::{
+    QuicCapacityProofCandidate, quic_capacity_receipt_rate_bps, valid_quic_capacity_proof_geometry,
+};
 
 #[derive(Debug, Default)]
 pub(super) struct UdpPathMetricTracker {
@@ -130,16 +132,13 @@ impl QuicPathMetricTracker {
             || probe.train_payload_bytes == 0
             || probe.written_payload_bytes != probe.train_payload_bytes
             || probe.written_data_frame_count == 0
-            || probe.required_timed_carrier_bytes == 0
-            || probe.required_timed_carrier_bytes
-                != probe.sample_floor_bytes.saturating_sub(
-                    (PATH_OPEN_SCORE_BYTES as u64).min(probe.sample_floor_bytes / 8),
-                )
-            || probe.sample_floor_bytes > probe.train_payload_bytes
-            || probe
-                .warmup_carrier_bytes
-                .saturating_add(probe.required_timed_carrier_bytes)
-                > probe.train_payload_bytes
+            || !valid_quic_capacity_proof_geometry(
+                probe.train_payload_bytes,
+                probe.sample_floor_bytes,
+                (PATH_OPEN_SCORE_BYTES as u64).min(probe.sample_floor_bytes / 8),
+                probe.warmup_carrier_bytes,
+                probe.required_timed_carrier_bytes,
+            )
             || probe.retention.is_zero()
             || probe.receipt_received_payload_bytes != probe.train_payload_bytes
         {

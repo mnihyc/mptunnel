@@ -1,8 +1,97 @@
 use super::*;
 use crate::model::capacity::reliable_capacity_calibration_session_limit_bytes;
 use crate::model::path::CarrierPathKey;
-use crate::protocol::{PathId, UnderlayProtocol};
+use crate::protocol::{Frame, PathId, SessionId, StreamOpenRole, UnderlayProtocol};
+use crate::runtime::path::commands::{
+    ReliablePathCommand, reliable_path_command_channels, try_recv_reliable_path_command,
+};
 use crate::runtime::sender::response::test_support::response_target;
+use crate::runtime::stream::response::ServerPathLaneTracker;
+use std::sync::Arc;
+
+#[test]
+fn sender_quic_geometry_is_accepted_by_the_binding_transaction() {
+    let mux_limits = MuxLimits::default();
+    let session_id = SessionId(911);
+    let tracker = Arc::new(ServerPathLaneTracker::default());
+    let (service_commands, _service_receivers) = reliable_path_command_channels(8);
+    let binding = ResponseStreamBinding::new_with_limits_and_tracker(
+        session_id,
+        UnderlayProtocol::Tcp,
+        PathId(0),
+        service_commands,
+        FlowLane::Throughput,
+        mux_limits,
+        tracker.clone(),
+    );
+    let (second_commands, _second_receivers) = reliable_path_command_channels(8);
+    let _second_flow = ResponseStreamBinding::new_with_limits_and_tracker(
+        session_id,
+        UnderlayProtocol::Tcp,
+        PathId(2),
+        second_commands,
+        FlowLane::Throughput,
+        mux_limits,
+        tracker,
+    );
+    let candidate = CarrierPathKey {
+        underlay: UnderlayProtocol::Udp,
+        path_id: PathId(1),
+    };
+    let (candidate_commands, mut candidate_receivers) = reliable_path_command_channels(8);
+    binding.attach(
+        candidate.underlay,
+        candidate.path_id,
+        candidate_commands,
+        FlowLane::Throughput,
+        StreamOpenRole::Validation,
+        mux_limits.max_payload_bytes,
+    );
+    assert!(matches!(
+        try_recv_reliable_path_command(&mut candidate_receivers),
+        Some(ReliablePathCommand::SendFrame(Frame::PathProofData { .. }))
+    ));
+
+    let (planner_generation, _) = binding.subflow_state_snapshot();
+    let scheduling = binding.response_scheduling_snapshot();
+    let model_generation = binding.response_model_generation();
+    let target = binding
+        .sender_path_targets(FlowLane::Throughput, 64 * 1024)
+        .into_iter()
+        .find(|target| target.key == candidate)
+        .expect("UDP Validation target");
+    let geometry = response_quic_capacity_calibration_geometry(&target, mux_limits);
+    assert!(
+        geometry.train_bytes as u64
+            > geometry
+                .carrier_window_bytes
+                .saturating_add(geometry.fresh_strict_window_bytes),
+        "the regression requires sender timing guard bytes"
+    );
+    assert!(binding.try_start_quic_capacity_calibration(
+        &target,
+        ResponseQuicCapacityCalibrationRequest {
+            expected_planner_generation: planner_generation,
+            expected_lane_generation: scheduling.generation,
+            expected_model_generation: model_generation,
+            target: candidate,
+            target_path_instance_id: target.path_instance_id,
+            target_incarnation: target.incarnation,
+            target_pending_bytes: target.command_pending_bytes,
+            train_bytes: geometry.train_bytes,
+            sample_floor_bytes: geometry.sample_floor_bytes,
+            accounting_slack_bytes: geometry.accounting_slack_bytes,
+            fresh_strict_window_bytes: geometry.fresh_strict_window_bytes,
+            carrier_window_bytes: geometry.carrier_window_bytes,
+            proof_validity: response_quic_capacity_proof_validity(&target),
+            lease: response_quic_capacity_calibration_lease(&target, geometry.train_bytes),
+        },
+    ));
+    assert!(matches!(
+        try_recv_reliable_path_command(&mut candidate_receivers),
+        Some(ReliablePathCommand::SendQuicCapacityProbe(_))
+    ));
+}
 
 #[test]
 fn quic_capacity_calibration_requires_reachable_underloaded_family() {

@@ -1,7 +1,7 @@
 use super::super::ResponseStreamBinding;
 use super::super::session::ServerPathLaneTracker;
 use super::super::topology::{ResponseStreamAttachOutcome, next_server_carrier_path_instance_id};
-use super::{ServerQuicCapacityHistorySnapshot, valid_quic_capacity_geometry};
+use super::ServerQuicCapacityHistorySnapshot;
 use crate::model::capacity::QuicCapacityProofCandidate;
 use crate::model::path::CarrierPathKey;
 use crate::mux::MuxLimits;
@@ -188,23 +188,6 @@ fn quic_capacity_evidence_after_active_lease_expires_instead_of_completing() {
         !tracker
             .response_scheduling_snapshot(session_id)
             .quic_capacity_calibration_reserved
-    );
-}
-
-#[test]
-fn quic_capacity_geometry_freezes_policy_slack_and_exact_train() {
-    assert!(valid_quic_capacity_geometry(838, 500, 62, 400, 438));
-    assert!(
-        !valid_quic_capacity_geometry(838, 500, 0, 400, 500),
-        "zero slack may not weaken or rewrite the planner policy"
-    );
-    assert!(
-        !valid_quic_capacity_geometry(838, 500, 62, 400, 1),
-        "one byte cannot satisfy a representative sample floor"
-    );
-    assert!(
-        !valid_quic_capacity_geometry(900, 500, 62, 400, 438),
-        "the declared train must equal the frozen planner geometry"
     );
 }
 

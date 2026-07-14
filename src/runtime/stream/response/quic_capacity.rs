@@ -9,7 +9,7 @@ use super::session::{ServerPathLaneTracker, ServerPathLaneTrackerState};
 #[cfg(feature = "lab-diagnostics")]
 use crate::lab_diagnostics::lab_diagnostic;
 use crate::model::capacity::{
-    PATH_OPEN_SCORE_BYTES, QuicCapacityProofCandidate, quic_capacity_receipt_rate_bps,
+    QuicCapacityProofCandidate, quic_capacity_receipt_rate_bps, valid_quic_capacity_proof_geometry,
 };
 use crate::model::path::{CarrierPathInstanceId, CarrierPathKey};
 use crate::protocol::SessionId;
@@ -60,30 +60,10 @@ pub(in crate::runtime::stream) struct ServerQuicCapacityProofTicket {
     pub(super) candidate: QuicCapacityProofCandidate,
 }
 
-pub(super) fn valid_quic_capacity_geometry(
-    train_bytes: u64,
-    sample_floor_bytes: u64,
-    accounting_slack_bytes: u64,
-    warmup_bytes: u64,
-    required_proof_bytes: u64,
-) -> bool {
-    let expected_slack = (PATH_OPEN_SCORE_BYTES as u64).min(sample_floor_bytes / 8);
-    let expected_required = sample_floor_bytes.checked_sub(accounting_slack_bytes);
-    let expected_train = warmup_bytes
-        .checked_add(required_proof_bytes)
-        .map(|bytes| bytes.max(sample_floor_bytes));
-    train_bytes > 0
-        && sample_floor_bytes > 0
-        && required_proof_bytes > 0
-        && accounting_slack_bytes == expected_slack
-        && expected_required == Some(required_proof_bytes)
-        && expected_train == Some(train_bytes)
-}
-
 pub(in crate::runtime) fn well_formed_quic_capacity_proof_candidate(
     proof: QuicCapacityProofCandidate,
 ) -> bool {
-    valid_quic_capacity_geometry(
+    valid_quic_capacity_proof_geometry(
         proof.train_bytes,
         proof.sample_floor_bytes,
         proof.accounting_slack_bytes,
@@ -503,7 +483,7 @@ impl ServerPathLaneTracker {
         command_ticket: QuicCapacityProbeCommandTicket,
     ) -> bool {
         if proof_validity.is_zero()
-            || !valid_quic_capacity_geometry(
+            || !valid_quic_capacity_proof_geometry(
                 train_bytes,
                 sample_floor_bytes,
                 accounting_slack_bytes,

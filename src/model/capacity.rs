@@ -60,6 +60,31 @@ pub(crate) struct QuicCapacityProofCandidate {
     pub(crate) proof_validity: Duration,
 }
 
+/// Validates carrier-proof safety without reimplementing sender train policy.
+///
+/// Warmup plus the strict proof window is the evidence minimum. A sender may
+/// append bounded timing guard bytes; the reservation owner separately enforces
+/// the session envelope before any carrier command is admitted.
+pub(crate) fn valid_quic_capacity_proof_geometry(
+    train_bytes: u64,
+    sample_floor_bytes: u64,
+    accounting_slack_bytes: u64,
+    warmup_bytes: u64,
+    required_proof_bytes: u64,
+) -> bool {
+    let expected_slack = (PATH_OPEN_SCORE_BYTES as u64).min(sample_floor_bytes / 8);
+    let expected_required = sample_floor_bytes.checked_sub(accounting_slack_bytes);
+    let minimum_train = warmup_bytes
+        .checked_add(required_proof_bytes)
+        .map(|bytes| bytes.max(sample_floor_bytes));
+    train_bytes > 0
+        && sample_floor_bytes > 0
+        && required_proof_bytes > 0
+        && accounting_slack_bytes == expected_slack
+        && expected_required == Some(required_proof_bytes)
+        && minimum_train.is_some_and(|minimum| train_bytes >= minimum)
+}
+
 /// Converts an exact QUIC train receipt into its bounded integer rate.
 ///
 /// The carrier timer floor prevents sub-granularity timestamps from creating

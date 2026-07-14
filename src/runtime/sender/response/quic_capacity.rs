@@ -7,6 +7,7 @@
 use crate::model::capacity::{
     CAPACITY_TIMING_SLACK_BYTES, PATH_OPEN_SCORE_BYTES, QUIC_PERSISTENT_CONGESTION_THRESHOLD,
     reliable_capacity_calibration_session_limit_bytes, reliable_subflow_startup_sample_limit_bytes,
+    valid_quic_capacity_proof_geometry,
 };
 use crate::model::path::{CarrierPathKey, carrier_path_key_order};
 use crate::model::response::{ResponseServiceFamilyLoads, response_snapshot_handoff_mode};
@@ -57,14 +58,25 @@ pub(super) fn response_quic_capacity_calibration_geometry(
     )
     .unwrap_or(usize::MAX)
     .max(1);
-    ResponseQuicCapacityCalibrationGeometry {
+    let geometry = ResponseQuicCapacityCalibrationGeometry {
         train_bytes,
         fits_session_envelope,
         sample_floor_bytes: sample_floor,
         accounting_slack_bytes: packet_accounting_slack,
         fresh_strict_window_bytes: fresh_strict_window,
         carrier_window_bytes: carrier_window,
-    }
+    };
+    debug_assert!(
+        !geometry.fits_session_envelope
+            || valid_quic_capacity_proof_geometry(
+                geometry.train_bytes as u64,
+                geometry.sample_floor_bytes,
+                geometry.accounting_slack_bytes,
+                geometry.carrier_window_bytes,
+                geometry.fresh_strict_window_bytes,
+            )
+    );
+    geometry
 }
 
 #[cfg(test)]

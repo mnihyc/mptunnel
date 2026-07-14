@@ -1,7 +1,7 @@
 //! Finite TCP calibration budget and its causal product ACK-clock evidence.
 //! Generic path metrics cannot create or advance this capacity proof.
 
-use super::topology::{ResponseStreamOutputs, TcpResponseCapacityPrior};
+use super::attachment::{ResponseStreamOutputs, TcpResponseCapacityPrior};
 #[cfg(feature = "lab-diagnostics")]
 use crate::lab_diagnostics::lab_diagnostic;
 use crate::model::capacity::{

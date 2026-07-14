@@ -1,9 +1,9 @@
 use super::super::ack_clock::RESPONSE_ACK_CLOCK_GOODPUT_MIN_ELAPSED;
+use super::super::attachment::ResponseStreamAttachOutcome;
 use super::super::evidence::ServerPathMetricsSource;
 use super::super::test_support::{
     binding_for_underlay, output_entry_for_key, stream_data_frame, stream_data_frame_at,
 };
-use super::super::topology::ResponseStreamAttachOutcome;
 use super::server_output_has_bulk_rate_evidence;
 use crate::model::capacity::{
     BBR_MAX_SEND_QUANTUM_BYTES, RELIABLE_INITIAL_WINDOW_PACKETS, reliable_relay_buffer_len,

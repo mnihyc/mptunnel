@@ -552,5 +552,5 @@ impl Drop for ServerRealtimeFlowRegistration {
 }
 
 #[cfg(test)]
-#[path = "load_test.rs"]
+#[path = "session_load_test.rs"]
 mod tests;

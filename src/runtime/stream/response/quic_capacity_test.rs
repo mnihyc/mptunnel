@@ -1,6 +1,6 @@
 use super::super::ResponseStreamBinding;
+use super::super::attachment::{ResponseStreamAttachOutcome, next_server_carrier_path_instance_id};
 use super::super::session::ServerPathLaneTracker;
-use super::super::topology::{ResponseStreamAttachOutcome, next_server_carrier_path_instance_id};
 use super::ServerQuicCapacityHistorySnapshot;
 use crate::model::capacity::QuicCapacityProofCandidate;
 use crate::model::path::CarrierPathKey;

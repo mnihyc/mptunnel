@@ -1,6 +1,6 @@
-use super::super::ResponseStreamBinding;
-use super::super::session::{ServerPathLaneTracker, ServerSessionRetentionSnapshot};
-use super::super::topology::ResponseStreamAttachOutcome;
+use super::ResponseStreamBinding;
+use super::attachment::ResponseStreamAttachOutcome;
+use super::session::{ServerPathLaneTracker, ServerSessionRetentionSnapshot};
 use crate::model::path::CarrierPathKey;
 use crate::model::response::ResponseServiceFamilyLoads;
 use crate::mux::MuxLimits;

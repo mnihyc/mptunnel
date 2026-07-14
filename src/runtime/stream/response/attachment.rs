@@ -1,5 +1,5 @@
 //! Response attachment, role, lane, and persistent Service ownership.
-//! It linearizes topology changes; ranking and carrier recovery stay outside it.
+//! It linearizes output-set changes; ranking and carrier recovery stay outside it.
 
 use super::ResponseStreamBinding;
 use super::ack_clock::{ResponseAckClockCalibrationState, ResponseAckClockRateEvidence};
@@ -915,5 +915,5 @@ pub(super) fn response_outputs_have_live_mixed_owner_underlays(
 }
 
 #[cfg(test)]
-#[path = "topology_test.rs"]
+#[path = "attachment_test.rs"]
 mod tests;

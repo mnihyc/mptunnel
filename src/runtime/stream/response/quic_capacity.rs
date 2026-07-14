@@ -2,7 +2,7 @@
 //!
 //! This owner serializes one carrier-discovery transaction through receipt and
 //! publication. Binding validation and carrier-queue admission live in
-//! `quic_probe`; all mutations still use the central session mutex.
+//! `quic_admission`; all mutations still use the central session mutex.
 
 use super::MAX_RESPONSE_QUIC_CAPACITY_CALIBRATION_ATTEMPTS_PER_PATH;
 use super::session::{ServerPathLaneTracker, ServerPathLaneTrackerState};

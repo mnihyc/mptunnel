@@ -1,8 +1,8 @@
+use super::super::attachment::ResponseStreamOutputEntry;
 use super::super::evidence::{ServerPathMetricsEntry, ServerPathMetricsSource};
 use super::super::next_server_carrier_path_instance_id;
 use super::super::session::ServerPathLaneTracker;
 use super::super::snapshot::server_bulk_output_snapshot;
-use super::super::topology::ResponseStreamOutputEntry;
 use super::{
     server_output_has_bulk_rate_evidence, server_output_has_bulk_rate_evidence_with_limits,
     server_output_has_durable_product_progress, server_output_has_sender_evidence,

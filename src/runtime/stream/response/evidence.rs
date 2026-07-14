@@ -4,10 +4,10 @@
 use super::ResponseStreamBinding;
 #[cfg(test)]
 use super::ack_clock::ResponseAckClockCalibrationState;
+use super::attachment::ResponseStreamOutputEntry;
 use super::quic_capacity::{
     valid_quic_capacity_proof_candidate_at, well_formed_quic_capacity_proof_candidate,
 };
-use super::topology::ResponseStreamOutputEntry;
 #[cfg(feature = "lab-diagnostics")]
 use crate::lab_diagnostics::lab_diagnostic;
 #[cfg(test)]

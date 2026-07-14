@@ -1,6 +1,6 @@
 use super::super::ResponseStreamBinding;
+use super::super::attachment::ResponseStreamAttachOutcome;
 use super::super::session::ServerPathLaneTracker;
-use super::super::topology::ResponseStreamAttachOutcome;
 use crate::model::capacity::reliable_relay_buffer_len;
 use crate::model::path::CarrierPathKey;
 use crate::mux::MuxLimits;

@@ -1,9 +1,9 @@
 use super::handoff::ResponseServiceHandoffDrainReservation;
-use super::load::{ResponseSessionLoadState, ServerPathLaneLoad};
 use super::quic_capacity::{
     ResponseQuicCapacityHistory, ServerQuicCapacityCalibrationPhase,
     ServerQuicCapacityCalibrationReservation, finish_quic_capacity_session_reclamation,
 };
+use super::session_load::{ResponseSessionLoadState, ServerPathLaneLoad};
 use crate::model::path::{CarrierPathInstanceId, CarrierPathKey};
 use crate::model::response::ResponseServiceFamilyLoads;
 use crate::protocol::SessionId;
@@ -14,7 +14,7 @@ use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
 // Session coordination owns one state mutex, generations, and probe leases.
-// `load` owns counter semantics through that same mutex. Neither layer
+// `session_load` owns counter semantics through that same mutex. Neither layer
 // ranks paths, estimates durable transport evidence, or owns product bytes.
 
 #[derive(Debug, Clone, Copy)]

@@ -4,12 +4,12 @@
 //! Ordinary Service admission orders locks as lane, outputs, ordered owner,
 //! flights, Subflow state, Service registration, then the session lane tracker.
 
-use super::admission::{
+#[cfg(test)]
+use super::attachment::ResponseSenderPathTarget;
+use super::attachment::{ResponseDispatchTarget, ResponseStreamOutputEntry};
+use super::subflow::{
     ResponseSubflowAdmissionRequest, server_output_has_bulk_rate_evidence_with_limits,
 };
-#[cfg(test)]
-use super::topology::ResponseSenderPathTarget;
-use super::topology::{ResponseDispatchTarget, ResponseStreamOutputEntry};
 use super::{MIN_ACTIVE_RESPONSE_FLOWS_FOR_SAME_FAMILY_DISCOVERY, ResponseStreamBinding};
 #[cfg(feature = "lab-diagnostics")]
 use crate::lab_diagnostics::lab_diagnostic;
@@ -497,5 +497,5 @@ impl ResponseStreamBinding {
 }
 
 #[cfg(test)]
-#[path = "transaction_test.rs"]
+#[path = "owner_commit_test.rs"]
 mod tests;

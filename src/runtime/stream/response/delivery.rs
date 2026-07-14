@@ -4,7 +4,7 @@
 
 use super::ResponseStreamBinding;
 use super::ack_clock::apply_response_ack_clock_release_samples;
-use super::topology::{ResponseSenderPathTarget, ResponseStreamOutputs};
+use super::attachment::{ResponseSenderPathTarget, ResponseStreamOutputs};
 #[cfg(feature = "lab-diagnostics")]
 use crate::lab_diagnostics::lab_diagnostic;
 use crate::model::path::CarrierPathKey;

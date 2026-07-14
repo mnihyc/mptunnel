@@ -3,9 +3,9 @@
 
 use super::ResponseStreamBinding;
 #[cfg(feature = "lab-diagnostics")]
-use super::evidence::ServerPathMetricsSource;
+use super::attachment::ResponseStreamOutputEntry;
 #[cfg(feature = "lab-diagnostics")]
-use super::topology::ResponseStreamOutputEntry;
+use super::evidence::ServerPathMetricsSource;
 #[cfg(feature = "lab-diagnostics")]
 use crate::lab_diagnostics::{
     lab_diagnostic, lab_diagnostic_event_enabled, lab_sender_service_decision,

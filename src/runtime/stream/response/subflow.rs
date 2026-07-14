@@ -1,15 +1,17 @@
 //! Response evidence gates and Subflow admission-epoch ownership.
-//! One mutex owns epoch mutation; metrics, topology, and carrier recovery stay outside it.
+//! One mutex owns epoch mutation; metrics, attachments, and carrier recovery stay outside it.
 
 use super::ResponseStreamBinding;
 use super::ack_clock::ResponseAckClockCalibrationState;
+use super::attachment::{
+    ResponseStreamOutputEntry, ResponseStreamOutputs, TcpResponseCapacityPrior,
+};
 use super::evidence::{
     ServerPathMetricsSource, server_output_local_path_metrics,
     server_path_metrics_has_bulk_rate_evidence, server_path_metrics_has_sender_evidence,
     server_udp_path_metrics_has_durable_rate_estimate,
 };
 use super::snapshot::server_bulk_output_snapshot;
-use super::topology::{ResponseStreamOutputEntry, ResponseStreamOutputs, TcpResponseCapacityPrior};
 #[cfg(feature = "lab-diagnostics")]
 use crate::lab_diagnostics::lab_diagnostic;
 use crate::model::ack_clock::{
@@ -592,13 +594,13 @@ impl ResponseStreamBinding {
 }
 
 #[cfg(test)]
-#[path = "admission_test.rs"]
+#[path = "subflow_test.rs"]
 mod tests;
 
 #[cfg(test)]
-#[path = "admission_startup_test.rs"]
+#[path = "subflow_startup_test.rs"]
 mod startup_tests;
 
 #[cfg(test)]
-#[path = "admission_epoch_test.rs"]
+#[path = "subflow_epoch_test.rs"]
 mod epoch_tests;

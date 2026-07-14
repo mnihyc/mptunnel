@@ -1,6 +1,6 @@
 use super::ResponseStreamBinding;
+use super::attachment::ResponseStreamOutputEntry;
 use super::evidence::{ServerPathMetricsEntry, ServerPathMetricsSource};
-use super::topology::ResponseStreamOutputEntry;
 use crate::model::capacity::{
     PATH_OPEN_SCORE_BYTES, PathRateSample, QuicCapacityProofCandidate,
     RELIABLE_INITIAL_WINDOW_PACKETS, quic_capacity_receipt_rate_bps,

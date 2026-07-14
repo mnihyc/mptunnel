@@ -1,15 +1,15 @@
 use super::super::ResponseStreamBinding;
-use super::super::admission::{
-    server_output_has_bulk_rate_evidence, server_output_has_sender_evidence,
-    server_output_has_service_feed_evidence_with_limits,
-};
+use super::super::attachment::ResponseStreamOutputEntry;
 use super::super::next_server_carrier_path_instance_id;
 use super::super::session::ServerPathLaneTracker;
 use super::super::snapshot::{server_bulk_output_snapshot, server_output_confidence};
+use super::super::subflow::{
+    server_output_has_bulk_rate_evidence, server_output_has_sender_evidence,
+    server_output_has_service_feed_evidence_with_limits,
+};
 use super::super::test_support::{
     binding_for_underlay, mark_test_quic_output_carrier_bulk_proven, output_entry_for_key,
 };
-use super::super::topology::ResponseStreamOutputEntry;
 use super::{
     ServerPathMetricsEntry, ServerPathMetricsSource, server_path_metrics_estimate_rate_bps,
     server_path_metrics_has_bulk_rate_evidence, server_path_metrics_has_sender_evidence,

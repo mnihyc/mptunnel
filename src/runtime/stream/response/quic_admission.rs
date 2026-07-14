@@ -4,8 +4,8 @@
 //! `quic_capacity` under the central tracker mutex.
 
 use super::ResponseStreamBinding;
-use super::admission::server_output_has_bulk_rate_evidence_with_limits;
-use super::topology::ResponseSenderPathTarget;
+use super::attachment::ResponseSenderPathTarget;
+use super::subflow::server_output_has_bulk_rate_evidence_with_limits;
 #[cfg(feature = "lab-diagnostics")]
 use crate::lab_diagnostics::lab_diagnostic;
 use crate::model::capacity::reliable_capacity_calibration_session_limit_bytes;
@@ -304,5 +304,5 @@ impl ResponseStreamBinding {
 }
 
 #[cfg(test)]
-#[path = "quic_probe_test.rs"]
+#[path = "quic_admission_test.rs"]
 mod tests;

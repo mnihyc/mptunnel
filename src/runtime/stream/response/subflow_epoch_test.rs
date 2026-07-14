@@ -2,10 +2,10 @@ use super::super::ResponseStreamBinding;
 use super::super::ack_clock::{
     RESPONSE_ACK_CLOCK_GOODPUT_MIN_ELAPSED, ResponseAckClockCalibrationState,
 };
-use super::super::load::ServerRealtimeFlowRegistration;
+use super::super::attachment::ResponseStreamAttachOutcome;
 use super::super::session::ServerPathLaneTracker;
+use super::super::session_load::ServerRealtimeFlowRegistration;
 use super::super::test_support::{binding_for_underlay, stream_data_frame, stream_data_frame_at};
-use super::super::topology::ResponseStreamAttachOutcome;
 use crate::model::ack_clock::{
     reliable_ack_clock_calibration_ceiling_bytes, reliable_ack_clock_calibration_limit_bytes,
 };

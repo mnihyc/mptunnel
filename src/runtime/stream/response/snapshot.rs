@@ -2,10 +2,9 @@
 //! This module reads source models without reserving capacity or mutating scheduling state.
 
 use super::ResponseStreamBinding;
-use super::admission::{
-    server_output_accepts_service_capacity_prior, server_output_has_bulk_rate_evidence_with_limits,
-    server_output_has_durable_product_ack_progress, server_output_has_sender_evidence,
-    server_output_has_service_feed_evidence_with_limits,
+use super::attachment::{
+    ResponseSenderPathTarget, ResponseStreamOutputEntry, ResponseStreamOutputs,
+    response_live_ordered_data_owner, response_outputs_have_live_mixed_owner_underlays,
 };
 use super::evidence::{
     ServerPathMetricsEntry, ServerPathMetricsSource, server_output_local_path_metrics,
@@ -17,9 +16,10 @@ use super::evidence::{
 use super::session::{
     ResponseSessionSchedulingSnapshot, ServerPathLaneTracker, ServerResponsePathSchedulingSnapshot,
 };
-use super::topology::{
-    ResponseSenderPathTarget, ResponseStreamOutputEntry, ResponseStreamOutputs,
-    response_live_ordered_data_owner, response_outputs_have_live_mixed_owner_underlays,
+use super::subflow::{
+    server_output_accepts_service_capacity_prior, server_output_has_bulk_rate_evidence_with_limits,
+    server_output_has_durable_product_ack_progress, server_output_has_sender_evidence,
+    server_output_has_service_feed_evidence_with_limits,
 };
 use crate::model::admission::bulk_service_horizon_payload_bytes;
 use crate::model::capacity::{

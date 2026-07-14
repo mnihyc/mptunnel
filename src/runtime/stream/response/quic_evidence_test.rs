@@ -1,10 +1,10 @@
-use super::super::admission::{
-    server_output_has_bulk_rate_evidence, server_output_has_sender_evidence,
-};
+use super::super::attachment::ResponseStreamOutputEntry;
 use super::super::next_server_carrier_path_instance_id;
 use super::super::session::ServerPathLaneTracker;
 use super::super::snapshot::server_bulk_output_snapshot;
-use super::super::topology::ResponseStreamOutputEntry;
+use super::super::subflow::{
+    server_output_has_bulk_rate_evidence, server_output_has_sender_evidence,
+};
 use super::{
     ServerPathMetricsEntry, ServerPathMetricsSource, server_path_metrics_has_ack_data_evidence,
 };

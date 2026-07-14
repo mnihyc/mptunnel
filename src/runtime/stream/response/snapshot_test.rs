@@ -1,12 +1,12 @@
 use super::super::ResponseStreamBinding;
+use super::super::attachment::{
+    RESPONSE_OWNER_MIXED_SEEN, RESPONSE_OWNER_TCP_SEEN, ResponseStreamAttachOutcome,
+    ResponseStreamOutputEntry,
+};
 use super::super::evidence::ServerPathMetricsSource;
 use super::super::next_server_carrier_path_instance_id;
 use super::super::session::ServerPathLaneTracker;
 use super::super::test_support::{mark_test_quic_output_carrier_bulk_proven, output_entry_for_key};
-use super::super::topology::{
-    RESPONSE_OWNER_MIXED_SEEN, RESPONSE_OWNER_TCP_SEEN, ResponseStreamAttachOutcome,
-    ResponseStreamOutputEntry,
-};
 use super::{server_bulk_output_eta_ms, server_bulk_output_snapshot};
 use crate::model::admission::{
     ReliableSourceServiceStagingContext, ReliableSourceStagingContext,

@@ -1,6 +1,6 @@
+use super::super::attachment::next_server_carrier_path_instance_id;
 use super::super::session::ServerPathLaneTracker;
 use super::super::test_support::test_quic_capacity_proof;
-use super::super::topology::next_server_carrier_path_instance_id;
 use crate::model::capacity::QuicCapacityProofCandidate;
 use crate::model::path::CarrierPathKey;
 use crate::model::response::ResponseServiceFamilyLoads;

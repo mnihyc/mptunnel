@@ -1,12 +1,12 @@
 use super::super::ResponseStreamBinding;
 use super::super::ack_clock::ResponseAckClockCalibrationState;
-use super::super::admission::ResponseSubflowAdmissionRequest;
+use super::super::attachment::{ResponseDispatchTarget, ResponseStreamAttachOutcome};
 use super::super::session::ServerPathLaneTracker;
+use super::super::subflow::ResponseSubflowAdmissionRequest;
 use super::super::test_support::{
     mark_test_response_output_bulk_proven, stream_data_frame, stream_data_frame_at,
     test_ack_clock_rate_sample,
 };
-use super::super::topology::{ResponseDispatchTarget, ResponseStreamAttachOutcome};
 use super::{ResponseAckClockCalibrationRequest, ResponseOwnerEnqueueAdmission};
 use crate::model::ack_clock::{
     reliable_ack_clock_calibration_ceiling_bytes, reliable_ack_clock_calibration_limit_bytes,

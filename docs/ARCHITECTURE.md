@@ -71,12 +71,13 @@ wrappers that merely pass the same state between them.
 - `src/runtime/stream/response.rs` and `src/runtime/stream/response/`: own the
   response binding and its session, evidence, admission, handoff, delivery, and
   commit invariants. One per-session aggregate serializes shared response state.
-- `src/runtime/sender/response.rs` and `src/runtime/sender/response/`: observe,
-  plan, and dispatch response work without claiming product ownership before
-  the stream transaction commits. Ranking and dispatch carry exactly one typed
-  product-mutation intent; ordinary Service/Subflow frames do not allocate,
-  while the rare large whole-flow handoff record is boxed instead of inflating
-  every per-frame plan.
+- `src/runtime/sender/response/service.rs`: owns queued response work and source
+  stream mutation. `planner.rs` owns path ranking/admission over one captured
+  target batch; `multipath.rs` serializes session maintenance, concrete TCP and
+  QUIC capacity starts, handoff drain, retirement, coherent generation stamps,
+  and executable-plan construction; `dispatch.rs` alone revalidates and
+  enqueues carrier commands. The rare large whole-flow handoff record is boxed
+  instead of inflating every per-frame plan.
 - `src/runtime/path/{set,state,selection}.rs`: own configured carrier identity,
   shared health/load ledgers, carrier-neutral capacity budgets, coherent batch
   observation, and atomic load reservation. Protocol-specific reservation and

@@ -1,7 +1,7 @@
-//! Response-direction planning, reservation, and dispatch service.
+//! Response-direction path ranking and admission.
 //!
-//! The planner ranks immutable binding snapshots. The reliable-path binding
-//! remains the authority that revalidates generations and commits exact ranges.
+//! This module ranks one captured target batch and returns a typed selection.
+//! Session maintenance, generation stamping, and carrier dispatch stay outside.
 
 use super::admission::{
     ResponseSubflowAdmissionCommit, response_bulk_admission_role,
@@ -18,18 +18,20 @@ use super::admission::{
 #[cfg(feature = "lab-diagnostics")]
 use super::diagnostics::{
     ResponseBulkCandidateDiag, lab_response_bulk_output_candidate,
-    lab_response_bulk_output_selected, lab_response_service_handoff_evaluation,
+    lab_response_bulk_output_selected,
 };
-use super::quic_capacity::{
-    select_response_quic_capacity_calibration_start, try_start_response_quic_capacity_calibration,
+#[cfg(test)]
+use super::multipath::{
+    ResponseDataDispatchPlan, ResponseDataDispatchTarget, plan_response_data_dispatch,
+    plan_response_data_dispatch_with_ordered_debt_impl,
+    preview_response_data_payload_with_ordered_debt,
 };
 use super::tcp_capacity::{
     ResponseAckClockCalibrationCommit, ResponseAckClockCalibrationRetirementIntent,
     response_ack_clock_calibration_blocks_generic_owner,
     response_ack_clock_calibration_needs_opportunity_decision,
     response_ack_clock_calibration_pending, response_calibration_service_reservoir_has_credit,
-    select_response_ack_clock_calibration_target, select_response_tcp_capacity_probe_start,
-    try_start_response_tcp_capacity_probe,
+    select_response_ack_clock_calibration_target,
 };
 #[cfg(test)]
 use super::*;
@@ -56,45 +58,25 @@ use crate::model::response::{
     select_response_service_or_proven_observation,
 };
 use crate::model::timing::transport_pto_from_snapshot;
-use crate::model::work::{CarrierWorkKind, ReliableWorkClass};
+use crate::model::work::CarrierWorkKind;
 use crate::mux::MuxLimits;
 use crate::mux::stream::ReliableSendStream;
 use crate::protocol::frame::reliable_stream_frame_accounted_bytes;
 use crate::protocol::{Frame, StreamOpenRole, UnderlayProtocol};
-use crate::runtime::RuntimeError;
 use crate::runtime::path::model::default_path_rate_bps;
 use crate::runtime::sender::{CarrierEmitMode, RelaySendCause};
 use crate::runtime::stream::response::{
-    MIN_ACTIVE_RESPONSE_FLOWS_FOR_SAME_FAMILY_DISCOVERY,
-    ResponseAckClockCalibrationRetirementRequest, ResponseDispatchTarget, ResponseSenderPathTarget,
-    ResponseServiceHandoffDrainRequest, ResponseServiceHandoffDrainReservation,
-    ResponseStreamBinding, quic_capacity_proof_pin_matches_marker, server_bulk_output_eta_ms,
+    ResponseSenderPathTarget, ResponseServiceHandoffDrainReservation,
+    quic_capacity_proof_pin_matches_marker, server_bulk_output_eta_ms,
     valid_quic_capacity_proof_candidate_at,
 };
-use crate::runtime::stream::{
-    FixedReliablePathOutput, ReliablePathStream, ReliablePathStreamOutput,
-    reliable_work_lane_to_carrier_lane,
-};
+use crate::runtime::stream::{ReliablePathStream, ReliablePathStreamOutput};
 use crate::scheduler::path_within_adaptive_lead_hysteresis;
 use crate::scheduler::{FlowLane, PathRateScope};
-use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 fn response_frame_is_bulk_stream_data(frame: &Frame, lane: FlowLane) -> bool {
     lane.is_bulk() && matches!(frame, Frame::StreamData { .. })
-}
-
-pub(super) enum ResponseDataDispatchTarget {
-    Fixed(Arc<FixedReliablePathOutput>),
-    Switchable {
-        binding: Arc<ResponseStreamBinding>,
-        target: ResponseDispatchTarget,
-        intent: ResponseDataDispatchIntent,
-    },
-}
-
-pub(super) struct ResponseDataDispatchPlan {
-    pub(super) primary: ResponseDataDispatchTarget,
 }
 
 /// Exact mutation authorized after ranking one compact carrier identity.
@@ -191,41 +173,6 @@ impl ResponseDataDispatchIntent {
     }
 }
 
-#[derive(Clone, Copy, PartialEq, Eq)]
-enum ResponsePlanningMode {
-    /// Reports whether dispatch or an apply transition can make progress.
-    Preview,
-    /// Owns expiry, discovery start, drain, and calibration retirement.
-    Apply,
-}
-
-enum ResponseDataPlanningOutcome {
-    Dispatch(ResponseDataDispatchPlan),
-    ApplyRequired,
-}
-
-impl ResponseDataDispatchPlan {
-    #[cfg(test)]
-    fn primary_key(&self) -> Option<CarrierPathKey> {
-        match &self.primary {
-            ResponseDataDispatchTarget::Fixed(fixed) => Some(fixed.key()),
-            ResponseDataDispatchTarget::Switchable { target, .. } => Some(target.key),
-        }
-    }
-
-    #[cfg(test)]
-    fn primary_role(&self) -> PathRuntimeRole {
-        match &self.primary {
-            ResponseDataDispatchTarget::Fixed(_) => PathRuntimeRole::Service,
-            ResponseDataDispatchTarget::Switchable { intent, .. } => intent.role(),
-        }
-    }
-}
-
-pub(super) struct ResponseDataEmitOutcome {
-    pub(super) selected_path: Option<CarrierPathKey>,
-}
-
 #[derive(Clone, Copy)]
 pub(super) struct ResponseServiceHandoffCommit {
     pub(super) planner_generation: u64,
@@ -248,23 +195,33 @@ pub(super) struct ResponseSelectedDataTarget {
 }
 
 impl ResponseSelectedDataTarget {
-    fn admission(&self) -> PathAdmission {
+    pub(super) fn target(&self) -> &ResponseSenderPathTarget {
+        &self.target
+    }
+
+    pub(super) fn into_parts(self) -> (ResponseSenderPathTarget, ResponseDataDispatchIntent) {
+        (self.target, self.intent)
+    }
+
+    pub(super) fn admission(&self) -> PathAdmission {
         self.intent.admission()
     }
 
-    fn service_handoff_commit(&self) -> Option<&ResponseServiceHandoffCommit> {
+    pub(super) fn service_handoff_commit(&self) -> Option<&ResponseServiceHandoffCommit> {
         self.intent.service_handoff_commit()
     }
 
-    fn service_handoff_commit_mut(&mut self) -> Option<&mut ResponseServiceHandoffCommit> {
+    pub(super) fn service_handoff_commit_mut(
+        &mut self,
+    ) -> Option<&mut ResponseServiceHandoffCommit> {
         self.intent.service_handoff_commit_mut()
     }
 
-    fn subflow_set_commit(&self) -> Option<ResponseSubflowAdmissionCommit> {
+    pub(super) fn subflow_set_commit(&self) -> Option<ResponseSubflowAdmissionCommit> {
         self.intent.subflow_commit()
     }
 
-    fn subflow_set_commit_mut(&mut self) -> Option<&mut ResponseSubflowAdmissionCommit> {
+    pub(super) fn subflow_set_commit_mut(&mut self) -> Option<&mut ResponseSubflowAdmissionCommit> {
         self.intent.subflow_commit_mut()
     }
 
@@ -273,7 +230,7 @@ impl ResponseSelectedDataTarget {
         self.intent.ack_clock_calibration_commit()
     }
 
-    fn ack_clock_calibration_commit_mut(
+    pub(super) fn ack_clock_calibration_commit_mut(
         &mut self,
     ) -> Option<&mut ResponseAckClockCalibrationCommit> {
         self.intent.ack_clock_calibration_commit_mut()
@@ -346,6 +303,20 @@ pub(super) struct ResponseServiceHandoffCandidate {
     service: ResponseSenderPathTarget,
     target: ResponseSenderPathTarget,
     mode: ResponseServiceHandoffMode,
+}
+
+impl ResponseServiceHandoffCandidate {
+    pub(super) fn service(&self) -> &ResponseSenderPathTarget {
+        &self.service
+    }
+
+    pub(super) fn target(&self) -> &ResponseSenderPathTarget {
+        &self.target
+    }
+
+    pub(super) fn mode(&self) -> ResponseServiceHandoffMode {
+        self.mode
+    }
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1729,511 +1700,6 @@ pub(super) fn response_same_family_reservoir_subflow_target(
                 })
         })
         .cloned()
-}
-
-#[cfg(test)]
-pub(super) fn plan_response_data_dispatch(
-    stream: &ReliablePathStream,
-    relay_lane: FlowLane,
-    next_offset: u64,
-    payload_bytes: usize,
-) -> Result<ResponseDataDispatchPlan, RuntimeError> {
-    plan_response_data_dispatch_with_ordered_debt_impl(
-        stream,
-        relay_lane,
-        next_offset,
-        payload_bytes,
-        0,
-    )
-}
-
-pub(super) fn plan_response_data_dispatch_with_ordered_debt_impl(
-    stream: &ReliablePathStream,
-    relay_lane: FlowLane,
-    next_offset: u64,
-    payload_bytes: usize,
-    ordered_owner_debt_bytes: usize,
-) -> Result<ResponseDataDispatchPlan, RuntimeError> {
-    match evaluate_response_data_dispatch_with_ordered_debt(
-        stream,
-        relay_lane,
-        next_offset,
-        payload_bytes,
-        ordered_owner_debt_bytes,
-        ResponsePlanningMode::Apply,
-    )? {
-        ResponseDataPlanningOutcome::Dispatch(planned) => Ok(planned),
-        ResponseDataPlanningOutcome::ApplyRequired => {
-            unreachable!("apply mode resolves maintenance before returning")
-        }
-    }
-}
-
-fn evaluate_response_data_dispatch_with_ordered_debt(
-    stream: &ReliablePathStream,
-    relay_lane: FlowLane,
-    next_offset: u64,
-    payload_bytes: usize,
-    ordered_owner_debt_bytes: usize,
-    mode: ResponsePlanningMode,
-) -> Result<ResponseDataPlanningOutcome, RuntimeError> {
-    match &stream.output {
-        ReliablePathStreamOutput::Fixed(fixed) => {
-            let lane = reliable_work_lane_to_carrier_lane(ReliableWorkClass::Data, relay_lane);
-            if fixed.commands().can_enqueue_lane_now(lane) {
-                Ok(ResponseDataPlanningOutcome::Dispatch(
-                    ResponseDataDispatchPlan {
-                        primary: ResponseDataDispatchTarget::Fixed(fixed.clone()),
-                    },
-                ))
-            } else {
-                Err(RuntimeError::SenderServiceBlocked)
-            }
-        }
-        ReliablePathStreamOutput::Switchable(binding) => {
-            let mut may_resnapshot_after_retirement = true;
-            loop {
-                if mode == ResponsePlanningMode::Apply
-                    && binding.maintain_response_session_operations()
-                {
-                    continue;
-                }
-                let (planner_generation, subflow_set) = binding.subflow_state_snapshot();
-                let session_scheduling = binding.response_scheduling_snapshot();
-                if mode == ResponsePlanningMode::Preview
-                    && session_scheduling.operation_maintenance_due
-                {
-                    return Ok(ResponseDataPlanningOutcome::ApplyRequired);
-                }
-                let lane_generation = session_scheduling.generation;
-                let active_response_flows = session_scheduling.active_response_flows;
-                let model_generation = binding.response_model_generation();
-                let lower_flights = binding.lower_flights_before_offset(next_offset);
-                let targets = binding.sender_path_targets(relay_lane, payload_bytes);
-                let ordered_data_owner = binding.ordered_data_owner();
-                if mode == ResponsePlanningMode::Preview
-                    && select_response_tcp_capacity_probe_start(
-                        &targets,
-                        relay_lane,
-                        ordered_data_owner,
-                        session_scheduling.service_family_loads,
-                        binding.mux_limits(),
-                        session_scheduling.tcp_capacity_probe_reserved,
-                    )
-                    .is_some()
-                {
-                    return Ok(ResponseDataPlanningOutcome::ApplyRequired);
-                }
-                if mode == ResponsePlanningMode::Apply
-                    && try_start_response_tcp_capacity_probe(
-                        binding,
-                        &targets,
-                        relay_lane,
-                        ordered_data_owner,
-                        session_scheduling.service_family_loads,
-                        lane_generation,
-                        session_scheduling.tcp_capacity_probe_reserved,
-                    )?
-                {
-                    // Reservation advances the shared generation; resnapshot
-                    // before any product decision.
-                    continue;
-                }
-                if mode == ResponsePlanningMode::Preview
-                    && select_response_quic_capacity_calibration_start(
-                        &targets,
-                        relay_lane,
-                        ordered_data_owner,
-                        session_scheduling.service_family_loads,
-                        binding.mux_limits(),
-                        active_response_flows,
-                        session_scheduling.quic_capacity_calibration_reserved,
-                        session_scheduling.quic_capacity_calibration_spent_bytes,
-                        session_scheduling.response_service_handoff_drain.is_some(),
-                    )
-                    .is_some()
-                {
-                    return Ok(ResponseDataPlanningOutcome::ApplyRequired);
-                }
-                if mode == ResponsePlanningMode::Apply
-                    && try_start_response_quic_capacity_calibration(
-                        binding,
-                        &targets,
-                        relay_lane,
-                        ordered_data_owner,
-                        session_scheduling.service_family_loads,
-                        active_response_flows,
-                        planner_generation,
-                        lane_generation,
-                        model_generation,
-                        session_scheduling.quic_capacity_calibration_reserved,
-                        session_scheduling.quic_capacity_calibration_spent_bytes,
-                        session_scheduling.response_service_handoff_drain.is_some(),
-                    )
-                {
-                    // Reservation and command admission change the session and
-                    // response-model generations. Replan ordinary OwnerData.
-                    continue;
-                }
-                let binding_instance_id = binding.binding_instance_id();
-                let current_drain = session_scheduling
-                    .response_service_handoff_drain
-                    .filter(|reservation| reservation.binding_instance_id == binding_instance_id);
-                let another_binding_is_draining = session_scheduling
-                    .response_service_handoff_drain
-                    .is_some_and(|reservation| {
-                        reservation.binding_instance_id != binding_instance_id
-                    });
-                let handoff_open = binding.response_service_handoff_open();
-                let startup_owner_active = subflow_set
-                    .as_ref()
-                    .and_then(FlowSubflowSet::startup_owner_key)
-                    .is_some();
-                let calibration_active = targets
-                    .iter()
-                    .any(|target| target.ack_clock_calibration_active);
-                let handoff_context_ready =
-                    handoff_open && !startup_owner_active && !calibration_active;
-                #[cfg(feature = "lab-diagnostics")]
-                lab_response_service_handoff_evaluation(
-                    binding,
-                    &targets,
-                    relay_lane,
-                    payload_bytes,
-                    binding.mux_limits(),
-                    &lower_flights,
-                    ordered_data_owner,
-                    ordered_owner_debt_bytes,
-                    session_scheduling.service_family_loads,
-                    current_drain,
-                    handoff_open,
-                    startup_owner_active,
-                    calibration_active,
-                    another_binding_is_draining,
-                    planner_generation,
-                    lane_generation,
-                    model_generation,
-                );
-                if handoff_context_ready
-                    && !another_binding_is_draining
-                    && let Some(mut selected) = select_response_service_handoff_target(
-                        &targets,
-                        relay_lane,
-                        payload_bytes,
-                        binding.mux_limits(),
-                        &lower_flights,
-                        ordered_data_owner,
-                        ordered_owner_debt_bytes,
-                        session_scheduling.service_family_loads,
-                        next_offset,
-                        current_drain,
-                    )
-                {
-                    debug_assert!(current_drain.is_none_or(|reservation| {
-                        response_service_handoff_drain_matches_selection(
-                            binding_instance_id,
-                            reservation,
-                            &selected,
-                        )
-                    }));
-                    let commit = selected
-                        .service_handoff_commit_mut()
-                        .expect("response Service handoff selection has a commit");
-                    commit.planner_generation = planner_generation;
-                    commit.lane_generation = lane_generation;
-                    commit.model_generation = model_generation;
-                    #[cfg(feature = "lab-diagnostics")]
-                    lab_response_bulk_output_selected(
-                        "service_handoff",
-                        &selected.target,
-                        selected.admission(),
-                        payload_bytes,
-                    );
-                    let ResponseSelectedDataTarget { target, intent } = selected;
-                    debug_assert!(matches!(
-                        &intent,
-                        ResponseDataDispatchIntent::ServiceHandoff(_)
-                    ));
-                    return Ok(ResponseDataPlanningOutcome::Dispatch(
-                        ResponseDataDispatchPlan {
-                            primary: ResponseDataDispatchTarget::Switchable {
-                                binding: binding.clone(),
-                                target: target.into(),
-                                intent,
-                            },
-                        },
-                    ));
-                }
-                let handoff_candidate = (handoff_context_ready && !another_binding_is_draining)
-                    .then(|| {
-                        select_response_service_handoff_candidate(
-                            &targets,
-                            relay_lane,
-                            payload_bytes,
-                            binding.mux_limits(),
-                            ordered_data_owner,
-                            session_scheduling.service_family_loads,
-                            current_drain,
-                        )
-                    })
-                    .flatten();
-                if let Some(reservation) = current_drain {
-                    if handoff_candidate.as_ref().is_some_and(|candidate| {
-                        response_service_handoff_drain_matches_candidate(
-                            binding_instance_id,
-                            reservation,
-                            candidate,
-                        )
-                    }) {
-                        // Only this binding pauses fresh OwnerData. Control and
-                        // critical repair still preempt the blocked data lane.
-                        return Err(RuntimeError::SenderServiceBlocked);
-                    }
-                    if mode == ResponsePlanningMode::Preview {
-                        return Ok(ResponseDataPlanningOutcome::ApplyRequired);
-                    }
-                    binding.cancel_response_service_handoff_drain("eligibility_regressed");
-                    continue;
-                }
-                if let Some(candidate) = handoff_candidate {
-                    if mode == ResponsePlanningMode::Preview {
-                        return Ok(ResponseDataPlanningOutcome::ApplyRequired);
-                    }
-                    let lower_flight_bytes = lower_flights
-                        .iter()
-                        .fold(0u64, |total, flight| total.saturating_add(flight.bytes));
-                    let outstanding_owner_bytes = u64::try_from(ordered_owner_debt_bytes)
-                        .unwrap_or(u64::MAX)
-                        .max(lower_flight_bytes)
-                        .max(candidate.service.observation.owner_data_in_flight_bytes);
-                    let lease = response_service_handoff_drain_lease(
-                        &candidate.service,
-                        outstanding_owner_bytes,
-                    );
-                    if binding.try_start_response_service_handoff_drain(
-                        &candidate.service,
-                        &candidate.target,
-                        relay_lane,
-                        ResponseServiceHandoffDrainRequest {
-                            expected_planner_generation: planner_generation,
-                            expected_lane_generation: lane_generation,
-                            expected_model_generation: model_generation,
-                            service: candidate.service.observation.key,
-                            service_path_instance_id: candidate
-                                .service
-                                .observation
-                                .path_instance_id,
-                            service_incarnation: candidate.service.observation.incarnation,
-                            target: candidate.target.observation.key,
-                            target_path_instance_id: candidate.target.observation.path_instance_id,
-                            target_incarnation: candidate.target.observation.incarnation,
-                            mode: candidate.mode,
-                            capacity_proof: response_service_handoff_start_capacity_proof(
-                                &candidate.target,
-                                session_scheduling.observed_at,
-                            ),
-                            outstanding_owner_bytes,
-                            lease,
-                        },
-                    ) {
-                        return Err(RuntimeError::SenderServiceBlocked);
-                    }
-                }
-                let mut retirement_intents = Vec::new();
-                let selected =
-                    select_response_sender_data_target_with_ordered_debt_inner_and_retirements(
-                        &targets,
-                        relay_lane,
-                        payload_bytes,
-                        binding.mux_limits(),
-                        &lower_flights,
-                        ordered_data_owner,
-                        ordered_owner_debt_bytes,
-                        subflow_set.as_ref(),
-                        active_response_flows
-                            >= MIN_ACTIVE_RESPONSE_FLOWS_FOR_SAME_FAMILY_DISCOVERY,
-                        &mut retirement_intents,
-                    );
-                let mut retired_any = false;
-                if mode == ResponsePlanningMode::Preview && !retirement_intents.is_empty() {
-                    return Ok(ResponseDataPlanningOutcome::ApplyRequired);
-                }
-                if may_resnapshot_after_retirement {
-                    for mut intent in retirement_intents {
-                        intent.planner_generation = planner_generation;
-                        intent.lane_generation = lane_generation;
-                        intent.model_generation = model_generation;
-                        retired_any |= binding.try_retire_tcp_ack_clock_calibration(
-                            ResponseAckClockCalibrationRetirementRequest {
-                                expected_planner_generation: intent.planner_generation,
-                                expected_lane_generation: intent.lane_generation,
-                                expected_model_generation: intent.model_generation,
-                                service: intent.service,
-                                service_incarnation: intent.service_incarnation,
-                                service_pending_bytes: intent.service_pending_bytes,
-                                target: intent.target,
-                                target_incarnation: intent.target_incarnation,
-                                target_pending_bytes: intent.target_pending_bytes,
-                                limit_bytes: intent.limit_bytes,
-                            },
-                        );
-                    }
-                }
-                if retired_any {
-                    // Retirement invalidates the planner generation. Recompute
-                    // once so the resulting Service/reservoir plan uses the tombstone.
-                    may_resnapshot_after_retirement = false;
-                    continue;
-                }
-                let Some(mut selected) = selected else {
-                    return Err(RuntimeError::SenderServiceBlocked);
-                };
-                if let Some(commit) = selected.subflow_set_commit_mut() {
-                    commit.planner_generation = planner_generation;
-                    commit.lane_generation = lane_generation;
-                }
-                if let Some(commit) = selected.ack_clock_calibration_commit_mut() {
-                    commit.planner_generation = planner_generation;
-                    commit.lane_generation = lane_generation;
-                    commit.model_generation = model_generation;
-                }
-                let role = selected.admission().role;
-                let target = &selected.target;
-                debug_assert!(
-                    role != PathRuntimeRole::Subflow
-                        || target.observation.has_bulk_rate_evidence
-                        || selected
-                            .subflow_set_commit()
-                            .is_some_and(|commit| commit.input.startup_owner_allowed),
-                    "Subflow OwnerData requires bulk-rate evidence or explicit bounded startup admission: target={:?} role={:?} ordered_owner={:?} lower_owner={:?} is_active={} sender_evidence={} bulk_evidence={}",
-                    target.observation.key,
-                    role,
-                    ordered_data_owner,
-                    response_oldest_lower_flight_owner(&lower_flights),
-                    target.observation.is_service,
-                    target.observation.has_sender_evidence,
-                    target.observation.has_bulk_rate_evidence,
-                );
-                if selected.service_handoff_commit().is_some() {
-                    return Err(RuntimeError::SenderServiceBlocked);
-                }
-                let ResponseSelectedDataTarget { target, intent } = selected;
-                return Ok(ResponseDataPlanningOutcome::Dispatch(
-                    ResponseDataDispatchPlan {
-                        primary: ResponseDataDispatchTarget::Switchable {
-                            binding: binding.clone(),
-                            target: target.into(),
-                            intent,
-                        },
-                    },
-                ));
-            }
-        }
-    }
-}
-
-/// Readiness must not advance protocol generations or reserve carrier work.
-pub(super) fn preview_response_data_payload_with_ordered_debt(
-    path_stream: &ReliablePathStream,
-    relay_lane: FlowLane,
-    next_offset: u64,
-    payload_bytes: usize,
-    ordered_owner_debt_bytes: usize,
-) -> bool {
-    let calibration_remaining = match &path_stream.output {
-        ReliablePathStreamOutput::Switchable(binding) => {
-            binding.active_tcp_ack_clock_calibration_remaining_bytes()
-        }
-        ReliablePathStreamOutput::Fixed(_) => None,
-    };
-    if let Some(remaining) = calibration_remaining {
-        let calibration_payload_bytes = payload_bytes.min(remaining);
-        match evaluate_response_data_dispatch_with_ordered_debt(
-            path_stream,
-            relay_lane,
-            next_offset,
-            calibration_payload_bytes,
-            ordered_owner_debt_bytes,
-            ResponsePlanningMode::Preview,
-        ) {
-            Ok(ResponseDataPlanningOutcome::ApplyRequired) => return true,
-            Ok(ResponseDataPlanningOutcome::Dispatch(planned))
-                if response_plan_is_ack_clock_calibration(&planned) =>
-            {
-                return true;
-            }
-            Ok(ResponseDataPlanningOutcome::Dispatch(_))
-                if calibration_payload_bytes == payload_bytes =>
-            {
-                return true;
-            }
-            Err(_) if calibration_payload_bytes == payload_bytes => return false,
-            Ok(ResponseDataPlanningOutcome::Dispatch(_)) | Err(_) => {}
-        }
-    }
-
-    evaluate_response_data_dispatch_with_ordered_debt(
-        path_stream,
-        relay_lane,
-        next_offset,
-        payload_bytes,
-        ordered_owner_debt_bytes,
-        ResponsePlanningMode::Preview,
-    )
-    .is_ok()
-}
-
-pub(super) fn response_plan_is_ack_clock_calibration(planned: &ResponseDataDispatchPlan) -> bool {
-    matches!(
-        &planned.primary,
-        ResponseDataDispatchTarget::Switchable {
-            intent: ResponseDataDispatchIntent::AckClockCalibration(_),
-            ..
-        }
-    )
-}
-
-pub(super) fn plan_response_data_payload_with_ordered_debt_impl(
-    path_stream: &ReliablePathStream,
-    relay_lane: FlowLane,
-    next_offset: u64,
-    payload_bytes: usize,
-    ordered_owner_debt_bytes: usize,
-) -> Result<(usize, ResponseDataDispatchPlan), RuntimeError> {
-    let calibration_remaining = match &path_stream.output {
-        ReliablePathStreamOutput::Switchable(binding) => {
-            binding.active_tcp_ack_clock_calibration_remaining_bytes()
-        }
-        ReliablePathStreamOutput::Fixed(_) => None,
-    };
-    if let Some(remaining) = calibration_remaining {
-        let calibration_payload_bytes = payload_bytes.min(remaining);
-        match plan_response_data_dispatch_with_ordered_debt_impl(
-            path_stream,
-            relay_lane,
-            next_offset,
-            calibration_payload_bytes,
-            ordered_owner_debt_bytes,
-        ) {
-            Ok(planned) if response_plan_is_ack_clock_calibration(&planned) => {
-                return Ok((calibration_payload_bytes, planned));
-            }
-            Ok(planned) if calibration_payload_bytes == payload_bytes => {
-                return Ok((payload_bytes, planned));
-            }
-            Err(err) if calibration_payload_bytes == payload_bytes => return Err(err),
-            Ok(_) | Err(_) => {}
-        }
-    }
-
-    plan_response_data_dispatch_with_ordered_debt_impl(
-        path_stream,
-        relay_lane,
-        next_offset,
-        payload_bytes,
-        ordered_owner_debt_bytes,
-    )
-    .map(|planned| (payload_bytes, planned))
 }
 
 pub(super) fn response_dispatch_payload_bytes(

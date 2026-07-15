@@ -3,10 +3,8 @@
 //! This module never ranks paths. It resolves a planned identity, asks the
 //! binding to revalidate and commit, and enqueues one carrier command.
 
-use super::planner::{
-    ResponseDataDispatchIntent, ResponseDataDispatchPlan, ResponseDataDispatchTarget,
-    ResponseDataEmitOutcome, choose_response_sender_target,
-};
+use super::multipath::{ResponseDataDispatchPlan, ResponseDataDispatchTarget};
+use super::planner::{ResponseDataDispatchIntent, choose_response_sender_target};
 #[cfg(test)]
 use super::*;
 use crate::model::multipath::PathRuntimeRole;
@@ -22,6 +20,10 @@ use crate::runtime::stream::response::{
 };
 use crate::runtime::stream::{ReliablePathStream, ReliablePathStreamOutput};
 use crate::scheduler::FlowLane;
+
+pub(super) struct ResponseDataEmitOutcome {
+    pub(super) selected_path: Option<CarrierPathKey>,
+}
 
 pub(super) fn response_repair_carrier_lane(frame: &Frame) -> FlowLane {
     if matches!(frame, Frame::StreamData { .. }) {

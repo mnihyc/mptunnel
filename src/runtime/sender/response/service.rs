@@ -7,10 +7,11 @@ use super::dispatch::{
     emit_planned_response_data_frame, emit_response_frame_from_sender_service,
     response_frame_has_carrier_credit, response_repair_carrier_lane,
 };
-use super::planner::{
-    choose_response_sender_target, plan_response_data_payload_with_ordered_debt_impl,
-    preview_response_data_payload_with_ordered_debt, response_dispatch_payload_bytes,
+use super::multipath::{
+    plan_response_data_payload_with_ordered_debt_impl,
+    preview_response_data_payload_with_ordered_debt,
 };
+use super::planner::{choose_response_sender_target, response_dispatch_payload_bytes};
 #[cfg(test)]
 use super::*;
 use crate::config::MppPerformanceConfig;
@@ -45,8 +46,8 @@ use std::time::Instant;
 /// Current server response sender-service boundary.
 ///
 /// Target reads enqueue STREAM_DATA here before any carrier path write. The
-/// service owns queueing, path ranking, and reservation intents. The
-/// `ReliablePathStream` binding revalidates and atomically commits exact ranges.
+/// service owns queueing and source-stream mutation. The multipath transaction
+/// plans path work; the binding revalidates and atomically commits exact ranges.
 pub(in crate::runtime) struct ServerResponseSenderService {
     #[cfg_attr(not(feature = "lab-diagnostics"), allow(dead_code))]
     pub(in crate::runtime::sender) session_id: SessionId,

@@ -611,11 +611,10 @@ impl ServerResponseSenderService {
                         path_stream.underlay, send_lane, pacing_bytes,
                     ),
                 );
-            } else if queued_lane == ReliableWorkClass::Data
+            } else if let Some(selected_path) = selected_path
+                && queued_lane == ReliableWorkClass::Data
                 && matches!(&path_stream.output, ReliablePathStreamOutput::Fixed(_))
             {
-                let selected_path =
-                    selected_path.expect("selected fixed output path must be available");
                 lab_sender_service_decision(
                     "server",
                     Some(self.session_id.0),

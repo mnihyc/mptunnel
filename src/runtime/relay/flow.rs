@@ -102,21 +102,14 @@ impl ReliableRelayFlowDemandTracker {
             && (rate_proven_bulk || flow_age >= reliable_flow_bulk_sustained_age(path));
         let rate_proven_sustained_bulk = rate_proven_bulk && observed_bytes >= rate_evidence_bytes;
         let sustained_bulk = byte_proven_bulk || rate_proven_sustained_bulk;
-        if self.current == FlowLane::Throughput && !idle_gap {
+        if (self.current == FlowLane::Throughput && !idle_gap) || sustained_bulk {
             demand.lane = FlowLane::Throughput;
             demand.throughput_weight_ppm = demand
                 .throughput_weight_ppm
                 .max(FlowDemand::PPM_MAX / 2 + 1);
             demand.latency_weight_ppm =
                 FlowDemand::PPM_MAX.saturating_sub(demand.throughput_weight_ppm);
-        } else if sustained_bulk {
-            demand.lane = FlowLane::Throughput;
-            demand.throughput_weight_ppm = demand
-                .throughput_weight_ppm
-                .max(FlowDemand::PPM_MAX / 2 + 1);
-            demand.latency_weight_ppm =
-                FlowDemand::PPM_MAX.saturating_sub(demand.throughput_weight_ppm);
-        } else if !sustained_bulk {
+        } else {
             demand.lane = FlowLane::Latency;
             demand.throughput_weight_ppm =
                 demand.throughput_weight_ppm.min(FlowDemand::PPM_MAX / 2);

@@ -132,7 +132,6 @@ pub(in crate::runtime) struct ResponseServiceHandoffRequest {
 /// ledger, stream-ACK ordering state, lane tracking, and path-metric hints used
 /// for response scheduling. It does not own the target socket and does not own
 /// TCP/QUIC packet recovery.
-
 pub(in crate::runtime) struct ResponseStreamBinding {
     session_id: SessionId,
     binding_instance_id: u64,

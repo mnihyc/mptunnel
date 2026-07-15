@@ -716,12 +716,8 @@ pub(in crate::runtime) fn udp_datagram_path_open_timeout(
     if !association_has_open_path && !has_unattempted_alternative {
         return UDP_PATH_HANDSHAKE_TIMEOUT.min(ttl_timeout);
     }
-    let response_timeout = if association_has_open_path {
-        model.response_timeout
-    } else {
-        model.response_timeout
-    };
-    response_timeout
+    model
+        .response_timeout
         .max(QUIC_TIMER_GRANULARITY)
         .min(UDP_PATH_HANDSHAKE_TIMEOUT)
         .min(ttl_timeout)

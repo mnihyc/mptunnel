@@ -1,27 +1,47 @@
-use super::*;
+use super::ServerUdpReliableOutputDetachGuard;
 use crate::config::{
     DEFAULT_OUTBOUND_CONNECT_TIMEOUT, MppPerformanceConfig, ResourceLimits, SecurityConfig,
     SharedSecret,
 };
+use crate::model::capacity::BBR_MAX_SEND_QUANTUM_BYTES;
+use crate::mux::MuxLimits;
 use crate::outbound::{DnsConfig, OutboundConfig};
+use crate::protocol::codec::CodecLimits;
+use crate::protocol::{
+    Frame, PathId, ResetReason, SessionId, StreamId, StreamOpenRole, TargetAddr, UnderlayProtocol,
+};
+use crate::runtime::error::RuntimeError;
 use crate::runtime::node::server::{ServerIdentityRuntime, new_identity_runtime};
 use crate::runtime::path::commands::{
     ReliablePathCommandReceivers, ReliablePathCommandSender, recv_reliable_path_command,
-    reliable_path_command_pending_bytes,
+    reliable_path_command_channels, reliable_path_command_pending_bytes,
 };
+use crate::runtime::path::proof::PathProofTracker;
 use crate::runtime::path::quic::client::ClientUdpPathSessionRuntime;
-use crate::runtime::path::{ClientPathHealth, ClientPathState};
-use crate::runtime::relay::ServerReliableRelayService;
-use crate::runtime::stream::AcceptedServerReliableStream;
+use crate::runtime::path::quic::io::{
+    UdpPathConnection, UdpPathEndpoint, UdpPathRecvStream, UdpPathSendStream,
+    udp_path_max_stream_payload_bytes, udp_path_read_frame, udp_path_write_frame,
+};
+use crate::runtime::path::quic::server_writer::drain_server_udp_reliable_commands;
+use crate::runtime::path::server_context::ServerPathContext;
+use crate::runtime::path::{
+    ClientPathHealth, ClientPathState, ServerCarrierPathRegistration, ServerStreamOpenOutcome,
+    ServerStreamOpenRequest, ServerStreamPathAttachment,
+};
+use crate::runtime::stream::{
+    AcceptedServerReliableStream, ReliablePathStreamOutput, ServerReliableStreamRegistry,
+};
+use crate::scheduler::FlowLane;
 use crate::transport::{
     CarrierPathIdentity, CarrierSocket, CarrierSocketRequest, Endpoint as PathEndpoint,
     PathBinding, PathMetadata, PathSpec, SystemCarrierNetworkProvider,
 };
+use std::net::SocketAddr;
+use std::sync::Arc;
 use std::time::Duration;
 
 struct ServerUdpTerminalWriterFixture {
     context: ServerPathContext,
-    _reliable_relay: ServerReliableRelayService,
     session_id: SessionId,
     path_id: PathId,
     stream_id: StreamId,
@@ -46,8 +66,8 @@ impl ServerUdpTerminalWriterFixture {
                 .expect("test shared secret"),
         );
         let ServerIdentityRuntime {
-            paths: context,
-            reliable_relay,
+            paths: mut context,
+            reliable_relay: _,
         } = new_identity_runtime(
             Vec::new(),
             OutboundConfig::Direct,
@@ -57,6 +77,9 @@ impl ServerUdpTerminalWriterFixture {
             MppPerformanceConfig::default(),
             ResourceLimits::default(),
         );
+        let (registry, mut accepted_rx) =
+            ServerReliableStreamRegistry::new_accepting(context.mux_limits.max_streams);
+        context.reliable_streams = registry.path_port();
         let session_id = SessionId(401);
         let path_id = PathId(0);
         let path_registration = context.reliable_streams.register_carrier_path(
@@ -66,32 +89,32 @@ impl ServerUdpTerminalWriterFixture {
         );
         let (commands_tx, commands_rx) = reliable_path_command_channels(8);
         let target = TargetAddr::Ip(SocketAddr::from(([127, 0, 0, 1], 80)));
-        let accepted = match context
+        let outcome = context
             .reliable_streams
-            .open_or_attach(
-                ServerReliableStreamOpenRequest {
-                    session_id,
-                    stream_id,
-                    target: &target,
-                    lane: FlowLane::Throughput,
-                    attachment: ServerReliablePathAttachment {
-                        path_registration: path_registration.clone(),
-                        commands: commands_tx.clone(),
-                        max_frame_payload_bytes: udp_path_max_stream_payload_bytes(
-                            context.codec_limits,
-                            context.mux_limits,
-                        ),
-                        role: StreamOpenRole::Active,
-                        initial_metrics: None,
-                    },
+            .open_or_attach(ServerStreamOpenRequest {
+                session_id,
+                stream_id,
+                target,
+                lane: FlowLane::Throughput,
+                attachment: ServerStreamPathAttachment {
+                    path_registration: path_registration.clone(),
+                    commands: commands_tx.clone(),
+                    max_frame_payload_bytes: udp_path_max_stream_payload_bytes(
+                        context.codec_limits,
+                        context.mux_limits,
+                    ),
+                    role: StreamOpenRole::Active,
+                    initial_metrics: None,
                 },
-                context.mux_limits,
-            )
-            .expect("open server QUIC response stream")
-        {
-            ServerReliableStreamOpen::New(accepted) => accepted,
-            _ => panic!("expected a new server QUIC response stream"),
-        };
+                mux_limits: context.mux_limits,
+            })
+            .await
+            .expect("open server QUIC response stream");
+        assert_eq!(outcome, ServerStreamOpenOutcome::New);
+        let accepted = accepted_rx
+            .recv()
+            .await
+            .expect("receive accepted server QUIC response stream");
 
         let bind_path = PathSpec {
             underlay: UnderlayProtocol::Udp,
@@ -175,7 +198,6 @@ impl ServerUdpTerminalWriterFixture {
 
         Self {
             context,
-            _reliable_relay: reliable_relay,
             session_id,
             path_id,
             stream_id,
@@ -204,44 +226,44 @@ impl ServerUdpTerminalWriterFixture {
     }
 }
 
-#[test]
-fn reliable_output_guard_detaches_on_abnormal_stream_exit() {
-    let registry = Arc::new(ServerReliableStreamRegistry::new(
-        ResourceLimits::default().max_streams,
-    ));
+#[tokio::test]
+async fn reliable_output_guard_detaches_on_abnormal_stream_exit() {
+    let (registry, mut accepted_rx) =
+        ServerReliableStreamRegistry::new_accepting(ResourceLimits::default().max_streams);
+    let streams = registry.path_port();
     let session_id = SessionId(201);
     let stream_id = StreamId(301);
     let path_id = PathId(0);
     let path_registration =
-        registry.register_carrier_path(session_id, UnderlayProtocol::Udp, path_id);
+        streams.register_carrier_path(session_id, UnderlayProtocol::Udp, path_id);
     let target = TargetAddr::Ip(SocketAddr::from(([127, 0, 0, 1], 80)));
     let (commands, _receivers) = reliable_path_command_channels(8);
     let commands_for_guard = commands.clone();
-    let accepted = match registry
-        .open_or_attach(
-            ServerReliableStreamOpenRequest {
-                session_id,
-                stream_id,
-                target: &target,
-                lane: FlowLane::Throughput,
-                attachment: ServerReliablePathAttachment {
-                    path_registration: path_registration.clone(),
-                    commands,
-                    max_frame_payload_bytes: udp_path_max_stream_payload_bytes(
-                        CodecLimits::default(),
-                        MuxLimits::default(),
-                    ),
-                    role: StreamOpenRole::Active,
-                    initial_metrics: None,
-                },
+    let outcome = streams
+        .open_or_attach(ServerStreamOpenRequest {
+            session_id,
+            stream_id,
+            target,
+            lane: FlowLane::Throughput,
+            attachment: ServerStreamPathAttachment {
+                path_registration: path_registration.clone(),
+                commands,
+                max_frame_payload_bytes: udp_path_max_stream_payload_bytes(
+                    CodecLimits::default(),
+                    MuxLimits::default(),
+                ),
+                role: StreamOpenRole::Active,
+                initial_metrics: None,
             },
-            MuxLimits::default(),
-        )
-        .expect("open UDP response stream")
-    {
-        ServerReliableStreamOpen::New(accepted) => accepted,
-        _ => panic!("expected new UDP response stream"),
-    };
+            mux_limits: MuxLimits::default(),
+        })
+        .await
+        .expect("open UDP response stream");
+    assert_eq!(outcome, ServerStreamOpenOutcome::New);
+    let accepted = accepted_rx
+        .recv()
+        .await
+        .expect("receive accepted UDP response stream");
     let stream = accepted.stream();
     let ReliablePathStreamOutput::Switchable(binding) = &stream.output else {
         panic!("expected switchable response output");
@@ -254,7 +276,7 @@ fn reliable_output_guard_detaches_on_abnormal_stream_exit() {
     );
 
     drop(ServerUdpReliableOutputDetachGuard {
-        registry,
+        streams,
         session_id,
         stream_id,
         path_id,
@@ -357,7 +379,7 @@ async fn server_quic_mismatched_terminal_releases_debt_and_guard_fails_closed() 
     let command_debt = reliable_path_command_pending_bytes(&command) as u64;
     assert_eq!(fixture.commands_tx.pending_bytes(), command_debt);
     let output_guard = ServerUdpReliableOutputDetachGuard {
-        registry: fixture.context.reliable_streams.clone(),
+        streams: fixture.context.reliable_streams.clone(),
         session_id: fixture.session_id,
         stream_id: fixture.stream_id,
         path_id: fixture.path_id,

@@ -42,16 +42,9 @@ fn tcp_request_contention_requires_present_request_work() {
 fn tcp_request_outstanding_limit_uses_service_reservoir_then_ack_headroom() {
     let mux_limits = MuxLimits::default();
     let payload_bytes = 64 * 1024;
-    let now = Instant::now();
-    let mut window = RequestOutstandingWindow::new_at(now);
+    let mut window = RequestOutstandingWindow::new();
     let tcp = request_test_path_instance(UnderlayProtocol::Tcp, 0, 1);
-    let limit = window.limit_bytes_at(
-        Some(tcp),
-        FlowLane::Throughput,
-        payload_bytes,
-        mux_limits,
-        now,
-    );
+    let limit = window.limit_bytes(Some(tcp), FlowLane::Throughput, payload_bytes, mux_limits);
     assert_eq!(limit, 4 * 1024 * 1024);
 
     let mut send_stream = ReliableSendStream::new(StreamId(90), mux_limits);

@@ -1,4 +1,5 @@
 use super::*;
+use crate::protocol::StreamOpenRole;
 
 #[test]
 fn nonblocking_udp_open_uses_zero_initial_window_without_accept() {

@@ -1,5 +1,3 @@
-#[cfg(test)]
-use super::*;
 use crate::model::admission::{BulkPathCandidate, bulk_candidates_span_underlays};
 use crate::model::capacity::{
     BBR_DEFAULT_CWND_GAIN, BBR_MAX_SEND_QUANTUM_BYTES, PATH_OPEN_SCORE_BYTES, PathRateSample,

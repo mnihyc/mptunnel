@@ -4,8 +4,6 @@
 //! operations under one health lock when admission must be race-free.
 
 use super::set::ClientPathContext;
-#[cfg(test)]
-use super::*;
 #[cfg(feature = "lab-diagnostics")]
 use crate::lab_diagnostics::lab_diagnostic;
 use crate::model::admission::{

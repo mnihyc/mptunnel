@@ -1,6 +1,4 @@
 #[cfg(test)]
-use super::*;
-#[cfg(test)]
 use crate::model::admission::{
     ReliableSourceServiceStagingContext, ReliableSourceStagingContext,
     bulk_service_feed_reservoir_payload_bytes, reliable_relay_source_staging_owner_tail_headroom,
@@ -16,16 +14,10 @@ use crate::model::capacity::{
     reliable_stream_max_data_update_bytes,
 };
 #[cfg(test)]
-use crate::model::capacity::{
-    adaptive_reliable_relay_chunk_bytes_with_frame_limit, relay_lane_startup_chunk_bytes,
-    reliable_bulk_carrier_feed_quantum_bytes, reliable_relay_buffer_len,
-    reliable_relay_sender_dispatch_budget,
-};
+use crate::model::capacity::{reliable_bulk_carrier_feed_quantum_bytes, reliable_relay_buffer_len};
 use crate::model::timing::transport_pto_from_snapshot;
 use crate::mux::MuxLimits;
 use crate::mux::stream::{ReliableRecvStream, ReliableSendStream};
-#[cfg(test)]
-use crate::protocol::frame::reliable_stream_frame_extent;
 use crate::protocol::frame::{normalized_offset_ranges, stream_ack_contiguous_frontier};
 use crate::protocol::{Frame, OffsetRange, UnderlayProtocol};
 use crate::runtime::error::RuntimeError;

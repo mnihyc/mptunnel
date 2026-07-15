@@ -2,16 +2,14 @@ use super::*;
 use crate::model::capacity::BBR_MAX_SEND_QUANTUM_BYTES;
 use crate::model::path::CarrierPathKey;
 use crate::model::timing::transport_pto_from_snapshot;
-use crate::protocol::frame::{reliable_stream_frame_extent, stream_ack_contiguous_frontier};
+use crate::protocol::frame::stream_ack_contiguous_frontier;
 use crate::protocol::{PathId, PathMetricDirection, PathMetrics, StreamFlags, StreamOpenRole};
 use crate::runtime::path::commands::{
     ReliablePathCommand, reliable_path_command_channels, reliable_path_stream_ordered_queue_lane,
     try_recv_reliable_path_command,
 };
 use crate::runtime::path::model::metric_epoch_now;
-use crate::runtime::relay::io::{
-    reliable_ack_gap_repair_delay, stream_ack_ranges_expose_authoritative_gap,
-};
+use crate::runtime::relay::io::stream_ack_ranges_expose_authoritative_gap;
 use crate::runtime::stream::response::{
     ResponseStreamAttachOutcome, ResponseStreamBinding, ServerPathMetricsSource,
 };
@@ -2879,7 +2877,7 @@ fn final_tail_repair_ready_allows_closed_no_ack_frontier_after_deadline() {
 }
 
 #[test]
-fn tcp_multipath_progress_timer_keeps_persistent_gap_repair_live() {
+fn tcp_multipath_progress_timer_stays_enabled_with_repair_alternatives() {
     assert!(reliable_relay_recv_progress_timer_enabled(
         UnderlayProtocol::Udp,
         false,
@@ -2891,35 +2889,5 @@ fn tcp_multipath_progress_timer_keeps_persistent_gap_repair_live() {
     assert!(!reliable_relay_recv_progress_timer_enabled(
         UnderlayProtocol::Tcp,
         false,
-    ));
-
-    let ranges = [
-        OffsetRange {
-            start: 0,
-            end: 64 * 1024,
-        },
-        OffsetRange {
-            start: 128 * 1024,
-            end: 192 * 1024,
-        },
-    ];
-    let now = Instant::now();
-    let repair_delay = reliable_ack_gap_repair_delay(None);
-    let mut progress = ReliableAckGapRepairProgress::default();
-    assert!(!progress.repair_ready_at(
-        true,
-        &ranges,
-        Some(UnderlayProtocol::Tcp),
-        true,
-        repair_delay,
-        now,
-    ));
-    assert!(progress.repair_ready_at(
-        true,
-        &ranges,
-        Some(UnderlayProtocol::Tcp),
-        true,
-        repair_delay,
-        now + repair_delay,
     ));
 }

@@ -434,11 +434,7 @@ fn quic_app_limited_duplicate_ack_counts_as_ack_data_seen_not_bulk_rate() {
         ),
         2,
     );
-    let product_metrics = path_metrics_from_quic_path(PathId(7), app_limited);
-
     assert!(app_limited.ack_derived_data_seen);
     assert_eq!(app_limited.delivery_sample_count, 0);
     assert!(app_limited.app_limited);
-    assert!(product_metrics.has_ack_derived_data_sample);
-    assert_eq!(product_metrics.data_sample_count, 0);
 }

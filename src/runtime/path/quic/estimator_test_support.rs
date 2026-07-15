@@ -1,4 +1,6 @@
-use super::*;
+use crate::model::capacity::PATH_OPEN_SCORE_BYTES;
+use crate::transport::quic as quic_transport;
+use std::time::{Duration, Instant};
 
 pub(super) fn quic_congestion(
     congestion_window: u64,

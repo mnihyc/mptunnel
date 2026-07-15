@@ -1,5 +1,5 @@
 use super::*;
-use crate::config::SharedSecret;
+use crate::config::{ResourceLimits, SharedSecret};
 
 fn tcp_path_instance(index: usize, id: u64) -> RelayPathInstance {
     RelayPathInstance {

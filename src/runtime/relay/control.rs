@@ -34,8 +34,6 @@ use super::remote::{
     ReliableRelayAttachMode, ReliableRelayRemoteFrame, ReliableRelayRemotePath,
     ReliableRelayRemoteSet, reliable_relay_attach_payload_bytes,
 };
-#[cfg(test)]
-use super::*;
 use crate::config::MppPerformanceConfig;
 #[cfg(feature = "lab-diagnostics")]
 use crate::lab_diagnostics::{lab_diagnostic, lab_perf_flush, lab_perf_record};

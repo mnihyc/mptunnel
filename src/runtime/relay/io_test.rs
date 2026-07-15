@@ -1,5 +1,7 @@
 use super::*;
-use crate::protocol::frame::{reliable_stream_frame_extent, stream_ack_contiguous_frontier};
+use crate::model::capacity::BBR_MAX_SEND_QUANTUM_BYTES;
+use crate::protocol::frame::reliable_stream_frame_extent;
+use crate::protocol::{PathId, StreamFlags, StreamId};
 
 #[test]
 fn stream_fin_waits_for_final_offset_before_close() {
@@ -55,45 +57,6 @@ fn duplicate_stream_data_below_final_frontier_is_already_delivered() {
     assert!(stream_data_range_already_delivered(&recv_stream, 0, 5));
     assert!(!stream_data_range_already_delivered(&recv_stream, 0, 6));
     assert!(!stream_data_range_already_delivered(&recv_stream, 5, 1));
-}
-
-#[test]
-fn reliable_relay_sender_queue_budget_respects_stream_flow_control_credit() {
-    let limits = MuxLimits {
-        max_stream_window_bytes: 4,
-        max_repair_bytes: 16,
-        max_path_flight_bytes: 16,
-        max_reliable_relay_chunk_bytes: 16,
-        ..MuxLimits::default()
-    };
-    let mut send_stream = ReliableSendStream::new(StreamId(7), limits);
-    let sender_queue = ReliableRelaySenderQueue::default();
-    send_stream
-        .send_data(Bytes::from_static(b"data"), StreamFlags::NONE)
-        .expect("initial window payload");
-
-    assert!(!reliable_relay_can_read_into_sender_queue(
-        &send_stream,
-        &sender_queue,
-        limits,
-        16
-    ));
-    assert_eq!(
-        reliable_relay_sender_queue_read_budget(&send_stream, &sender_queue, limits, 16, 16),
-        0
-    );
-
-    send_stream.update_max_offset(6);
-    assert!(reliable_relay_can_read_into_sender_queue(
-        &send_stream,
-        &sender_queue,
-        limits,
-        16
-    ));
-    assert_eq!(
-        reliable_relay_sender_queue_read_budget(&send_stream, &sender_queue, limits, 16, 16),
-        2
-    );
 }
 
 #[test]

@@ -4,8 +4,6 @@
 //! deadlines, peer acceptance, and retry classification. Successful opens
 //! cross into attachment-set ownership through `OpenedRemoteStream`.
 
-#[cfg(test)]
-use super::*;
 #[cfg(feature = "lab-diagnostics")]
 use crate::lab_diagnostics::lab_diagnostic;
 use crate::model::capacity::PATH_OPEN_SCORE_BYTES;

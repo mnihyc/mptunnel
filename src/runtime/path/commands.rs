@@ -12,7 +12,7 @@ use crate::protocol::{
     Frame, IngressKind, PathId, ResetReason, StreamId, StreamOpenRole, TargetAddr,
 };
 use crate::runtime::error::RuntimeError;
-use crate::runtime::path::state::RequestTcpCapacityProbeLease;
+use crate::runtime::path::tcp::capacity::RequestTcpCapacityProbeLease;
 use crate::runtime::stream::ReliablePathStream;
 use crate::runtime::stream::response::TcpCapacityProbeSessionLease;
 use crate::scheduler::FlowLane;

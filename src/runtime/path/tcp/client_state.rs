@@ -3,6 +3,7 @@
 //! Algorithms may mutate these bounded state machines, but reconnect, stream,
 //! receive, capacity, and writer modules do not own each other's lifetimes.
 
+use super::capacity::RequestTcpCapacityProbeLease;
 use super::client_connection::ClientTcpCarrierConnection;
 use crate::config::SecurityConfig;
 use crate::model::capacity::reliable_capacity_calibration_session_limit_bytes;
@@ -12,7 +13,7 @@ use crate::protocol::path_capacity::{CapacityReceiveTracker, PathCapacityReceive
 use crate::protocol::{PathMetrics, SessionId};
 use crate::runtime::path::commands::TcpCapacityProbeCommand;
 use crate::runtime::path::proof::PathProofTracker;
-use crate::runtime::path::state::{ClientPathState, RequestTcpCapacityProbeLease};
+use crate::runtime::path::state::ClientPathState;
 use crate::scheduler::PathSnapshot;
 use crate::transport::PathSpec;
 use crate::transport::{CarrierNetworkProvider, CarrierPathIdentity};

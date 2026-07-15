@@ -3,6 +3,10 @@
 //! The train remains a protocol transaction with an exact receipt. Writer
 //! serialization is delegated to `client_writer`; publication stays here.
 
+use super::capacity::{
+    RequestTcpCapacityProbeLease, request_tcp_capacity_receipt_metrics,
+    tcp_capacity_proof_validity, tcp_capacity_receipt_rate_bps,
+};
 use super::client_state::{
     ClientTcpCapacityProbeMeasurement, ClientTcpPathConnection, ClientTcpPathSessionRuntime,
     ClientTcpRequestReceipt,
@@ -15,11 +19,6 @@ use crate::model::capacity::{TRANSPORT_TIMER_GRANULARITY, TcpCapacityProofCandid
 use crate::protocol::{Frame, PathId, PathMetricDirection, UnderlayProtocol};
 use crate::runtime::error::RuntimeError;
 use crate::runtime::path::commands::{TcpCapacityProbeCommand, TcpCapacityProbeOwner};
-use crate::runtime::path::state::RequestTcpCapacityProbeLease;
-use crate::runtime::path::tcp::capacity::{
-    request_tcp_capacity_receipt_metrics, tcp_capacity_proof_validity,
-    tcp_capacity_receipt_rate_bps,
-};
 use bytes::Bytes;
 use std::time::Instant;
 

@@ -3,6 +3,7 @@
 //! Only this owner batches commands or interlocks reads with a pending write,
 //! preserving frame order without allowing feedback backpressure to deadlock.
 
+use super::capacity::RequestTcpCapacityProbeLease;
 use super::client_capacity::{ClientTcpCapacityProbeWriteOutcome, client_write_tcp_capacity_probe};
 use super::client_receive::handle_client_tcp_path_frame;
 use super::client_state::{ClientTcpPathConnection, ClientTcpPathSessionRuntime};
@@ -26,7 +27,6 @@ use crate::runtime::path::commands::{
     reliable_path_writer_frame_queue, try_coalesce_reliable_path_writer_run,
     try_recv_reliable_path_command,
 };
-use crate::runtime::path::state::RequestTcpCapacityProbeLease;
 use crate::runtime::recent_ids::RecentIdCache;
 use std::collections::HashMap;
 use std::time::Instant;

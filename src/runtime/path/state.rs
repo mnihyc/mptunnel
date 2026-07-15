@@ -1,9 +1,9 @@
-//! Mutable client-path evidence and capacity transactions.
+//! Shared client-path evidence and carrier-neutral capacity budgets.
 //!
-//! Reservations, proof publication, and lease rollback share this owner so
-//! senders and carriers cannot observe a partially committed probe.
+//! One health lock makes mixed TCP/QUIC observations coherent. Each carrier
+//! module owns its reservation, proof, and rollback transaction.
 
-use super::commands::{CapacityProbeCommandResolution, CapacityProbeCommandTicket};
+use super::commands::CapacityProbeCommandTicket;
 use super::model::{
     ClientPathObservation, PathDeliveryStats, UdpDatagramPathObservation,
     path_observation_is_idle_for_probe, path_record_failure_cooldown,
@@ -12,7 +12,10 @@ use super::model::{
 use super::proof::PathProofObservation;
 use super::quic::metrics::UdpPathMetrics;
 use super::set::ClientPathContext;
-use super::tcp::capacity::valid_tcp_capacity_proof_candidate_at;
+use super::tcp::capacity::{
+    RequestTcpCapacityProbeLease, RequestTcpCapacityProbeSession, RequestTcpCapacityProofQuery,
+    RequestTcpCapacityRecord,
+};
 use super::tcp::metrics::TcpNativeObservation;
 #[cfg(test)]
 use super::*;
@@ -21,18 +24,18 @@ use crate::model::capacity::{
     TcpCapacityProofCandidate, reliable_capacity_calibration_session_limit_bytes,
 };
 use crate::model::path::{RelayPathInstance, RelayPathKey};
-use crate::protocol::{PathMetricDirection, PathMetrics, StreamId, UnderlayProtocol};
+use crate::protocol::{StreamId, UnderlayProtocol};
 use crate::runtime::error::RuntimeError;
 use crate::scheduler::{FlowLane, PathState as SchedulerPathState};
 use crate::transport::quic as quic_transport;
 use std::collections::{HashMap, VecDeque};
 use std::sync::{
     Arc, Mutex,
-    atomic::{AtomicU8, AtomicU32, AtomicU64, Ordering},
+    atomic::{AtomicU32, AtomicU64, Ordering},
 };
 use std::time::{Duration, Instant};
 
-/// One transaction owner for mutable client-path evidence and probe budgets.
+/// One lock domain for coherent health, load, and carrier budget composition.
 #[derive(Debug)]
 pub(in crate::runtime) struct ClientPathState {
     health: Mutex<ClientPathHealth>,
@@ -59,6 +62,12 @@ impl ClientPathState {
         &self.health
     }
 
+    pub(in crate::runtime::path) fn request_tcp_capacity_probe_session(
+        &self,
+    ) -> &RequestTcpCapacityProbeSession {
+        &self.request_tcp_capacity_probe
+    }
+
     fn release_relay_path_load(&self, key: RelayPathKey, lane: FlowLane) {
         let mut health = self.health.lock().expect("client path health lock");
         let records = match key.underlay {
@@ -72,14 +81,14 @@ impl ClientPathState {
 }
 
 #[derive(Debug)]
-struct RequestCapacityProbeBudget {
+pub(in crate::runtime::path) struct RequestCapacityProbeBudget {
     spent_bytes: AtomicU64,
     path_spent_bytes: Box<[AtomicU64]>,
     candidate_share_bytes: AtomicU64,
 }
 
 impl RequestCapacityProbeBudget {
-    fn new(path_count: usize) -> Self {
+    pub(in crate::runtime::path) fn new(path_count: usize) -> Self {
         Self {
             spent_bytes: AtomicU64::new(0),
             path_spent_bytes: (0..path_count)
@@ -90,11 +99,15 @@ impl RequestCapacityProbeBudget {
         }
     }
 
-    fn remaining_bytes(&self, limit: u64) -> u64 {
+    pub(in crate::runtime::path) fn remaining_bytes(&self, limit: u64) -> u64 {
         limit.saturating_sub(self.spent_bytes.load(Ordering::Acquire))
     }
 
-    fn effective_candidate_share_bytes(&self, proposed_path_limit: u64, session_limit: u64) -> u64 {
+    pub(in crate::runtime::path) fn effective_candidate_share_bytes(
+        &self,
+        proposed_path_limit: u64,
+        session_limit: u64,
+    ) -> u64 {
         let frozen_limit = self.candidate_share_bytes.load(Ordering::Acquire);
         if frozen_limit == 0 {
             proposed_path_limit.min(session_limit)
@@ -103,7 +116,7 @@ impl RequestCapacityProbeBudget {
         }
     }
 
-    fn path_remaining_bytes(
+    pub(in crate::runtime::path) fn path_remaining_bytes(
         &self,
         path_index: usize,
         proposed_path_limit: u64,
@@ -121,7 +134,7 @@ impl RequestCapacityProbeBudget {
         path_limit.saturating_sub(spent.load(Ordering::Acquire))
     }
 
-    fn try_reserve(
+    pub(in crate::runtime::path) fn try_reserve(
         &self,
         path_index: usize,
         bytes: u64,
@@ -167,7 +180,7 @@ impl RequestCapacityProbeBudget {
         true
     }
 
-    fn refund(&self, path_index: usize, bytes: u64) {
+    pub(in crate::runtime::path) fn refund(&self, path_index: usize, bytes: u64) {
         if let Some(path_spent) = self.path_spent_bytes.get(path_index) {
             path_spent.fetch_sub(bytes, Ordering::AcqRel);
             self.spent_bytes.fetch_sub(bytes, Ordering::AcqRel);
@@ -194,7 +207,7 @@ impl RequestCapacityProbeCampaignBudget {
         limit.saturating_sub(self.spent_bytes.load(Ordering::Acquire))
     }
 
-    fn try_reserve(&self, bytes: u64, proposed_limit: u64) -> bool {
+    pub(in crate::runtime::path) fn try_reserve(&self, bytes: u64, proposed_limit: u64) -> bool {
         if proposed_limit == 0 {
             return false;
         }
@@ -214,7 +227,7 @@ impl RequestCapacityProbeCampaignBudget {
             .is_ok()
     }
 
-    fn refund(&self, bytes: u64) {
+    pub(in crate::runtime::path) fn refund(&self, bytes: u64) {
         self.spent_bytes.fetch_sub(bytes, Ordering::AcqRel);
     }
 }
@@ -237,122 +250,6 @@ impl RequestQuicCapacityProbeSession {
         let _ = self
             .active_token
             .compare_exchange(token, 0, Ordering::AcqRel, Ordering::Acquire);
-    }
-}
-
-#[derive(Debug)]
-struct RequestTcpCapacityProbeSession {
-    budget: RequestCapacityProbeBudget,
-}
-
-impl RequestTcpCapacityProbeSession {
-    fn new(path_count: usize) -> Self {
-        Self {
-            budget: RequestCapacityProbeBudget::new(path_count),
-        }
-    }
-}
-
-#[repr(u8)]
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum RequestTcpCapacityProbeSpendState {
-    Reserved = 0,
-    Committed = 1,
-    Refund = 2,
-}
-
-#[derive(Debug, Clone)]
-pub(in crate::runtime) struct RequestTcpCapacityProbeLease {
-    state: Arc<RequestTcpCapacityProbeLeaseState>,
-}
-
-#[derive(Debug)]
-struct RequestTcpCapacityProbeLeaseState {
-    path_state: Arc<ClientPathState>,
-    campaign: Arc<RequestCapacityProbeCampaignBudget>,
-    path_index: usize,
-    token: u64,
-    bytes: u64,
-    spend_state: AtomicU8,
-    ticket: CapacityProbeCommandTicket,
-}
-
-impl RequestTcpCapacityProbeLease {
-    pub(in crate::runtime) fn commit(&self) -> bool {
-        match self.state.spend_state.compare_exchange(
-            RequestTcpCapacityProbeSpendState::Reserved as u8,
-            RequestTcpCapacityProbeSpendState::Committed as u8,
-            Ordering::AcqRel,
-            Ordering::Acquire,
-        ) {
-            Ok(_) => true,
-            Err(state) => state == RequestTcpCapacityProbeSpendState::Committed as u8,
-        }
-    }
-
-    pub(in crate::runtime) fn refund_if_unwritten(&self) {
-        // Planning reserves the session envelope before queueing. A carrier
-        // that proves it wrote nothing returns that reservation without
-        // reopening the bounded per-path attempt policy. Refund is terminal so
-        // a fast carrier cannot have this decision overwritten by a later
-        // planner commit after queue admission.
-        self.state.spend_state.store(
-            RequestTcpCapacityProbeSpendState::Refund as u8,
-            Ordering::Release,
-        );
-    }
-
-    pub(in crate::runtime) fn is_current(&self) -> bool {
-        self.state.ticket.is_current()
-    }
-
-    pub(in crate::runtime) fn is_published(&self) -> bool {
-        self.state.ticket.resolution() == CapacityProbeCommandResolution::Published
-    }
-
-    pub(in crate::runtime) fn cancel(&self) -> bool {
-        self.state.ticket.cancel()
-    }
-
-    pub(in crate::runtime) async fn cancelled(&self) {
-        self.state.ticket.cancelled().await;
-    }
-}
-
-impl Drop for RequestTcpCapacityProbeLeaseState {
-    fn drop(&mut self) {
-        self.ticket.cancel();
-        if let Some(record) = self
-            .path_state
-            .health
-            .lock()
-            .expect("client path health lock")
-            .tcp
-            .get_mut(self.path_index)
-        {
-            if record
-                .request_tcp_capacity_probe
-                .as_ref()
-                .is_some_and(|reservation| reservation.token == self.token)
-            {
-                record.request_tcp_capacity_probe = None;
-            }
-            if record
-                .tcp_capacity_proof
-                .is_some_and(|proof| proof.candidate.token == self.token)
-            {
-                record.tcp_capacity_proof = None;
-            }
-        }
-        if self.spend_state.load(Ordering::Acquire)
-            != RequestTcpCapacityProbeSpendState::Committed as u8
-        {
-            self.path_state
-                .request_tcp_capacity_probe
-                .budget
-                .refund(self.path_index, self.bytes);
-            self.campaign.refund(self.bytes);
-        }
     }
 }
 
@@ -549,8 +446,7 @@ pub(in crate::runtime) struct ClientPathHealthRecord {
     pub(in crate::runtime) carrier_last_delivery_at: Option<Instant>,
     pub(in crate::runtime) carrier_app_limited: bool,
     pub(in crate::runtime) carrier_ack_derived_data_seen: bool,
-    request_tcp_capacity_probe: Option<RequestTcpCapacityProbeReservation>,
-    tcp_capacity_proof: Option<RequestTcpCapacityProof>,
+    pub(in crate::runtime::path) tcp_capacity: RequestTcpCapacityRecord,
     request_quic_capacity_probe: Option<RequestQuicCapacityProbeReservation>,
     quic_capacity_proof: Option<RequestQuicCapacityProof>,
     request_quic_capacity_product_handoff: Option<RequestQuicCapacityProductHandoff>,
@@ -560,25 +456,6 @@ pub(in crate::runtime) struct ClientPathHealthRecord {
     successful_path_proofs: HashMap<u64, SuccessfulPathProof>,
     successful_path_proof_order: VecDeque<u64>,
     successful_path_proof_limit: usize,
-}
-
-#[derive(Debug, Clone)]
-struct RequestTcpCapacityProbeReservation {
-    stream_id: StreamId,
-    path_instance: RelayPathInstance,
-    token: u64,
-    valid_after: Instant,
-    expires_at: Instant,
-    train_bytes: u64,
-    required_timed_bytes: u64,
-    ticket: CapacityProbeCommandTicket,
-}
-
-#[derive(Debug, Clone, Copy)]
-struct RequestTcpCapacityProof {
-    stream_id: StreamId,
-    path_instance: RelayPathInstance,
-    candidate: TcpCapacityProofCandidate,
 }
 
 #[derive(Debug, Clone)]
@@ -659,12 +536,6 @@ pub(in crate::runtime) enum RequestQuicCapacityProductHandoffState {
     Absent,
     Pending,
     Complete,
-}
-
-#[derive(Debug, Clone, Copy)]
-pub(in crate::runtime) struct RequestTcpCapacityProofQuery {
-    pub(in crate::runtime) target: RelayPathInstance,
-    pub(in crate::runtime) token: u64,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -764,8 +635,7 @@ impl Default for ClientPathHealthRecord {
             carrier_last_delivery_at: None,
             carrier_app_limited: true,
             carrier_ack_derived_data_seen: false,
-            request_tcp_capacity_probe: None,
-            tcp_capacity_proof: None,
+            tcp_capacity: RequestTcpCapacityRecord::default(),
             request_quic_capacity_probe: None,
             quic_capacity_proof: None,
             request_quic_capacity_product_handoff: None,
@@ -829,62 +699,6 @@ impl ClientPathHealthRecord {
         if let Some(loss_ppm) = observation.loss_ppm() {
             self.measured_loss_rate = Some(f64::from(loss_ppm) / 1_000_000.0);
         }
-    }
-
-    pub(in crate::runtime) fn accept_request_tcp_capacity_proof(
-        &mut self,
-        stream_id: StreamId,
-        path_instance: RelayPathInstance,
-        candidate: TcpCapacityProofCandidate,
-        proof_metrics: PathMetrics,
-        native_transport_state: Option<TcpNativeObservation>,
-        now: Instant,
-    ) -> bool {
-        let Some(reservation) = self.request_tcp_capacity_probe.as_ref() else {
-            return false;
-        };
-        if path_instance.key.underlay != UnderlayProtocol::Tcp
-            || proof_metrics.underlay != UnderlayProtocol::Tcp
-            || proof_metrics.direction != PathMetricDirection::ClientToServer
-            || proof_metrics.path_id.0 as usize != path_instance.key.index
-            || native_transport_state.is_some_and(|observation| {
-                observation.direction() != PathMetricDirection::ClientToServer
-                    || observation.path_id().0 as usize != path_instance.key.index
-            })
-            || reservation.stream_id != stream_id
-            || reservation.path_instance != path_instance
-            || reservation.token != candidate.token
-            || reservation.train_bytes != candidate.train_bytes
-            || candidate.rate_bps != candidate.receipt_rate_bps
-            || candidate.rate_sample_bytes < reservation.required_timed_bytes
-            || candidate.rate_sample_bytes > candidate.train_bytes
-            || candidate.accepted_at < reservation.valid_after
-            || candidate.accepted_at >= reservation.expires_at
-            || !valid_tcp_capacity_proof_candidate_at(candidate, now)
-        {
-            return false;
-        }
-        let reservation = self
-            .request_tcp_capacity_probe
-            .take()
-            .expect("validated request TCP capacity reservation");
-        // Publication wins cancellation before proof becomes visible. The health
-        // lock keeps readers from observing the transaction between those steps.
-        if !reservation.ticket.publish() {
-            return false;
-        }
-        self.tcp_capacity_proof = Some(RequestTcpCapacityProof {
-            stream_id,
-            path_instance,
-            candidate,
-        });
-        // RTT, queue, and cwnd remain current socket diagnostics. Carrier rate
-        // authority stays inside the expiring typed proof until product ACKs
-        // replace it; an offset-free train must not become a cross-stream prior.
-        if let Some(native_transport_state) = native_transport_state {
-            self.mark_tcp_transport_state(native_transport_state);
-        }
-        true
     }
 
     pub(in crate::runtime) fn accept_request_quic_capacity_proof(
@@ -997,20 +811,7 @@ impl ClientPathHealthRecord {
     /// Applies time-driven lifecycle transitions. Keeping this separate from
     /// observation prevents diagnostics and ranking reads from canceling work.
     pub(in crate::runtime) fn maintain(&mut self, now: Instant) {
-        if self
-            .request_tcp_capacity_probe
-            .as_ref()
-            .is_some_and(|reservation| now >= reservation.expires_at)
-            && let Some(reservation) = self.request_tcp_capacity_probe.take()
-        {
-            reservation.ticket.cancel();
-        }
-        if self
-            .tcp_capacity_proof
-            .is_some_and(|proof| now >= proof.candidate.expires_at)
-        {
-            self.tcp_capacity_proof = None;
-        }
+        self.tcp_capacity.maintain(now);
         if self
             .request_quic_capacity_probe
             .as_ref()
@@ -1086,9 +887,7 @@ impl ClientPathHealthRecord {
         } else {
             self.state
         };
-        let tcp_proof = self
-            .tcp_capacity_proof
-            .filter(|proof| proof.candidate.accepted_at <= now && now < proof.candidate.expires_at);
+        let tcp_proof = self.tcp_capacity.proof_candidate_at(now);
         let quic_proof = self
             .quic_capacity_proof
             .filter(|proof| proof.candidate.accepted_at <= now && now < proof.candidate.expires_at);
@@ -1103,13 +902,13 @@ impl ClientPathHealthRecord {
                 && !self.has_durable_native_carrier_window()
         });
         let proof_rate_bps = tcp_proof
-            .map(|proof| proof.candidate.rate_bps as f64)
+            .map(|proof| proof.rate_bps as f64)
             .or_else(|| quic_proof.map(|proof| proof.rate_bps as f64));
         let proof_sample_bytes = tcp_proof
-            .map(|proof| proof.candidate.rate_sample_bytes)
+            .map(|proof| proof.rate_sample_bytes)
             .or_else(|| quic_proof.map(|proof| proof.rate_sample_bytes));
         let proof_accepted_at = tcp_proof
-            .map(|proof| proof.candidate.accepted_at)
+            .map(|proof| proof.accepted_at)
             .or_else(|| quic_proof.map(|proof| proof.candidate.accepted_at));
         let explicit_carrier_capacity_proof = proof_rate_bps.is_some();
         ClientPathObservation {
@@ -1402,10 +1201,7 @@ impl ClientPathHealthRecord {
         self.carrier_last_delivery_at = None;
         self.carrier_app_limited = true;
         self.carrier_ack_derived_data_seen = false;
-        if let Some(reservation) = self.request_tcp_capacity_probe.take() {
-            reservation.ticket.cancel();
-        }
-        self.tcp_capacity_proof = None;
+        self.tcp_capacity.reset_after_data_plane_failure();
         if let Some(reservation) = self.request_quic_capacity_probe.take() {
             reservation.ticket.cancel();
         }
@@ -1449,12 +1245,9 @@ impl ClientPathContext {
     }
 
     pub(in crate::runtime) fn request_tcp_capacity_probe_remaining_bytes(&self) -> u64 {
-        self.state
-            .request_tcp_capacity_probe
-            .budget
-            .remaining_bytes(reliable_capacity_calibration_session_limit_bytes(
-                self.mux_limits,
-            ))
+        self.state.request_tcp_capacity_probe_remaining_bytes(
+            reliable_capacity_calibration_session_limit_bytes(self.mux_limits),
+        )
     }
 
     pub(in crate::runtime) fn request_quic_capacity_probe_candidate_share_bytes(
@@ -1474,13 +1267,10 @@ impl ClientPathContext {
         &self,
         proposed_path_limit: u64,
     ) -> u64 {
-        self.state
-            .request_tcp_capacity_probe
-            .budget
-            .effective_candidate_share_bytes(
-                proposed_path_limit,
-                reliable_capacity_calibration_session_limit_bytes(self.mux_limits),
-            )
+        self.state.request_tcp_capacity_probe_candidate_share_bytes(
+            proposed_path_limit,
+            reliable_capacity_calibration_session_limit_bytes(self.mux_limits),
+        )
     }
 
     pub(in crate::runtime) fn request_quic_capacity_probe_path_remaining_bytes(
@@ -1503,14 +1293,11 @@ impl ClientPathContext {
         path_index: usize,
         path_limit: u64,
     ) -> u64 {
-        self.state
-            .request_tcp_capacity_probe
-            .budget
-            .path_remaining_bytes(
-                path_index,
-                path_limit,
-                reliable_capacity_calibration_session_limit_bytes(self.mux_limits),
-            )
+        self.state.request_tcp_capacity_probe_path_remaining_bytes(
+            path_index,
+            path_limit,
+            reliable_capacity_calibration_session_limit_bytes(self.mux_limits),
+        )
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -1528,68 +1315,20 @@ impl ClientPathContext {
         expires_at: Instant,
         ticket: CapacityProbeCommandTicket,
     ) -> Option<RequestTcpCapacityProbeLease> {
-        let now = Instant::now();
-        if path_instance.key.underlay != UnderlayProtocol::Tcp
-            || path_instance.key.index != path_index
-            || token == 0
-            || train_bytes < PATH_OPEN_SCORE_BYTES as u64
-            || required_timed_bytes < PATH_OPEN_SCORE_BYTES as u64
-            || required_timed_bytes > train_bytes
-            || expires_at <= now
-        {
-            return None;
-        }
-        let mut health = self.state.health.lock().expect("client path health lock");
-        let Some(record) = health.tcp.get_mut(path_index) else {
-            return None;
-        };
-        record.maintain(now);
-        // Offset-free trains on distinct TCP sockets have independent carrier
-        // ordering. The health record remains the exact per-path transaction
-        // owner while the session counter bounds their cumulative byte cost.
-        if record.request_tcp_capacity_probe.is_some() || record.tcp_capacity_proof.is_some() {
-            return None;
-        }
-        let session_limit = reliable_capacity_calibration_session_limit_bytes(self.mux_limits);
-        let campaign_limit = self
-            .state
-            .request_tcp_capacity_probe
-            .budget
-            .effective_candidate_share_bytes(path_limit_bytes, session_limit);
-        if !campaign.try_reserve(train_bytes, campaign_limit) {
-            return None;
-        }
-        if !self.state.request_tcp_capacity_probe.budget.try_reserve(
-            path_index,
-            train_bytes,
-            path_limit_bytes,
-            session_limit,
-        ) {
-            campaign.refund(train_bytes);
-            return None;
-        }
-        record.request_tcp_capacity_probe = Some(RequestTcpCapacityProbeReservation {
+        self.state.try_reserve_request_tcp_capacity_probe(
             stream_id,
+            path_index,
             path_instance,
             token,
+            train_bytes,
+            path_limit_bytes,
+            reliable_capacity_calibration_session_limit_bytes(self.mux_limits),
+            campaign,
+            required_timed_bytes,
             valid_after,
             expires_at,
-            train_bytes,
-            required_timed_bytes,
-            ticket: ticket.clone(),
-        });
-        drop(health);
-        Some(RequestTcpCapacityProbeLease {
-            state: Arc::new(RequestTcpCapacityProbeLeaseState {
-                path_state: self.state.clone(),
-                campaign,
-                path_index,
-                token,
-                bytes: train_bytes,
-                spend_state: AtomicU8::new(RequestTcpCapacityProbeSpendState::Reserved as u8),
-                ticket,
-            }),
-        })
+            ticket,
+        )
     }
 
     pub(in crate::runtime) fn request_capacity_reconciliation_view(
@@ -1613,15 +1352,15 @@ impl ClientPathContext {
                 health
                     .tcp
                     .get(query.target.key.index)
-                    .and_then(|record| record.tcp_capacity_proof)
-                    .filter(|proof| {
-                        proof.stream_id == stream_id
-                            && proof.path_instance == query.target
-                            && proof.candidate.token == query.token
-                            && proof.candidate.accepted_at <= now
-                            && now < proof.candidate.expires_at
+                    .and_then(|record| {
+                        record.tcp_capacity.exact_proof_candidate_at(
+                            stream_id,
+                            query.target,
+                            query.token,
+                            now,
+                        )
                     })
-                    .map(|proof| (query.target, proof.candidate))
+                    .map(|proof| (query.target, proof))
             })
             .collect();
         let quic = quic_query.map(|query| {

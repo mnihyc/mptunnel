@@ -32,5 +32,7 @@ pub(in crate::runtime) use state::{
     ReliableTcpRequestBulkFlowRegistration, RequestCapacityProbeCampaignBudget,
     RequestCapacityReconciliationView, RequestQuicCapacityProbeLease,
     RequestQuicCapacityProductHandoffState, RequestQuicCapacityReconciliationQuery,
+};
+pub(in crate::runtime) use tcp::capacity::{
     RequestTcpCapacityProbeLease, RequestTcpCapacityProofQuery,
 };

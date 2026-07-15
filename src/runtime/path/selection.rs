@@ -15,6 +15,7 @@ use crate::model::capacity::{PATH_OPEN_SCORE_BYTES, relay_lane_startup_chunk_byt
 use crate::model::path::{RelayPathKey, RelayPathProofEpoch};
 use crate::protocol::{PathMetricDirection, PathMetrics, RateHint, UnderlayProtocol};
 use crate::runtime::datagram::UdpPathCandidate;
+use crate::runtime::path::health::ClientPathHealthRecord;
 use crate::runtime::path::model::{
     ClientPathObservation, UdpPathRuntimeModel, apply_bulk_latency_isolation,
     bulk_candidate_has_bulk_rate_evidence, bulk_candidate_has_fresh_native_carrier_rate_evidence,
@@ -27,7 +28,7 @@ use crate::runtime::path::model::{
     udp_mtu_payload_bytes, udp_observation_has_datagram_feedback, udp_path_has_realtime_model,
     udp_probe_ceiling_payload_bytes, udp_reliable_stream_loss_repair_penalty_ms,
 };
-use crate::runtime::path::state::{ClientPathHealthRecord, RelayPathLoadLease};
+use crate::runtime::path::state::RelayPathLoadLease;
 use crate::scheduler::{
     self, FlowLane, PathSnapshot, PathState as SchedulerPathState, SchedulerPolicy,
 };

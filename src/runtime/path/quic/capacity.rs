@@ -16,9 +16,9 @@ use crate::protocol::codec::CodecLimits;
 use crate::protocol::{Frame, PathId, SessionId, StreamId, UnderlayProtocol};
 use crate::runtime::error::RuntimeError;
 use crate::runtime::path::commands::{CapacityProbeCommandTicket, QuicCapacityProbeCommand};
+use crate::runtime::path::health::ClientPathHealthRecord;
 use crate::runtime::path::state::{
-    ClientPathHealthRecord, ClientPathState, RequestCapacityProbeBudget,
-    RequestCapacityProbeCampaignBudget,
+    ClientPathState, RequestCapacityProbeBudget, RequestCapacityProbeCampaignBudget,
 };
 use crate::transport::quic as quic_transport;
 use std::sync::{

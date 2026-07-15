@@ -14,7 +14,7 @@ use crate::model::timing::{
 };
 use crate::mux::MuxLimits;
 use crate::protocol::{PathId, PathMetricDirection, PathMetrics, RateHint, UnderlayProtocol};
-use crate::runtime::path::state::ClientPathHealthRecord;
+use crate::runtime::path::health::ClientPathHealthRecord;
 use crate::scheduler::{
     self, FlowLane, PathRateScope, PathSnapshot, PathState as SchedulerPathState, SchedulerPolicy,
 };

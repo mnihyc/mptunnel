@@ -9,9 +9,11 @@ use super::*;
 
 pub(in crate::runtime) mod authentication;
 pub(super) mod commands;
+mod health;
 pub(super) mod model;
 mod ports;
 pub(super) mod proof;
+mod queue;
 pub(in crate::runtime) mod quic;
 mod selection;
 mod server_context;
@@ -22,6 +24,9 @@ pub(in crate::runtime) mod tcp;
 pub(in crate::runtime) use commands::{
     CapacityProbeCommandTicket, QuicCapacityProbeCommand, QuicCapacityProbeOwner,
     RequestTcpCapacityProbeRequest,
+};
+pub(in crate::runtime) use health::{
+    ClientPathHealth, ClientPathHealthRecord, RequestCapacityReconciliationView,
 };
 pub(in crate::runtime) use model::PathDeliveryStats;
 pub(in crate::runtime) use ports::{
@@ -40,9 +45,8 @@ pub(in crate::runtime) use quic::{
 pub(in crate::runtime) use server_context::ServerPathContext;
 pub(in crate::runtime) use set::ClientPathContext;
 pub(in crate::runtime) use state::{
-    ClientPathHealth, ClientPathHealthRecord, ClientPathState, RelayPathLoadLease,
-    ReliableTcpRequestBulkFlowRegistration, RequestCapacityProbeCampaignBudget,
-    RequestCapacityReconciliationView,
+    ClientPathState, RelayPathLoadLease, ReliableTcpRequestBulkFlowRegistration,
+    RequestCapacityProbeCampaignBudget,
 };
 pub(in crate::runtime) use tcp::capacity::{
     RequestTcpCapacityProbeLease, RequestTcpCapacityProofQuery,

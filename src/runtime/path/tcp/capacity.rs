@@ -12,10 +12,10 @@ use crate::model::capacity::{
 use crate::model::path::RelayPathInstance;
 use crate::protocol::{PathId, PathMetricDirection, PathMetrics, StreamId, UnderlayProtocol};
 use crate::runtime::path::commands::{CapacityProbeCommandResolution, CapacityProbeCommandTicket};
+use crate::runtime::path::health::ClientPathHealthRecord;
 use crate::runtime::path::model::metric_epoch_now;
 use crate::runtime::path::state::{
-    ClientPathHealthRecord, ClientPathState, RequestCapacityProbeBudget,
-    RequestCapacityProbeCampaignBudget,
+    ClientPathState, RequestCapacityProbeBudget, RequestCapacityProbeCampaignBudget,
 };
 use std::sync::{
     Arc,

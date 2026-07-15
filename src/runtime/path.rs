@@ -10,6 +10,7 @@ use super::*;
 pub(in crate::runtime) mod authentication;
 pub(super) mod commands;
 pub(super) mod model;
+mod ports;
 pub(super) mod proof;
 pub(in crate::runtime) mod quic;
 mod selection;
@@ -23,6 +24,7 @@ pub(in crate::runtime) use commands::{
     RequestTcpCapacityProbeRequest,
 };
 pub(in crate::runtime) use model::PathDeliveryStats;
+pub(in crate::runtime) use ports::{OpenedReliableCarrierStream, UdpStreamOpenOptions};
 #[cfg(test)]
 pub(super) use proof::*;
 pub(in crate::runtime) use quic::{

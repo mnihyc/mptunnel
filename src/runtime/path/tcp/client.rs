@@ -99,7 +99,7 @@ impl ClientTcpPathSessionHandle {
             ClientTcpOpenDeadlines::fixed(open_deadline),
         )
         .await
-        .map(|opened| opened.stream)
+        .map(|opened| ReliablePathStream::from_opened_carrier(opened.carrier))
     }
 
     pub(in crate::runtime) async fn open_stream_with_deadlines(

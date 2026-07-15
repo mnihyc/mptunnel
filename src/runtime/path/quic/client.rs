@@ -25,9 +25,8 @@ use crate::runtime::error::RuntimeError;
 use crate::runtime::path::authentication::ClientPathAuthenticationFrames;
 use crate::runtime::path::commands::reliable_path_command_channels;
 use crate::runtime::path::model::path_startup_snapshot;
+use crate::runtime::path::ports::{OpenedReliableCarrierStream, UdpStreamOpenOptions};
 use crate::runtime::path::state::ClientPathState;
-use crate::runtime::relay::UdpStreamOpenOptions;
-use crate::runtime::stream::{ReliablePathStream, ReliablePathStreamOutput};
 use crate::scheduler::{FlowLane, stream_demand_hint_for_lane};
 use crate::transport::{
     CarrierNetworkProvider, CarrierPathIdentity, CarrierResolutionRequest, CarrierSocketRequest,
@@ -94,7 +93,7 @@ impl ClientUdpPathSessionHandle {
         lane: FlowLane,
         options: UdpStreamOpenOptions,
         open_deadline: tokio::time::Instant,
-    ) -> Result<ReliablePathStream, RuntimeError> {
+    ) -> Result<OpenedReliableCarrierStream, RuntimeError> {
         let open = async {
             let connection = self.ensure_connection(open_deadline).await?;
             match open_client_udp_stream_on_connection(
@@ -458,7 +457,7 @@ async fn open_client_udp_stream_on_connection(
     lane: FlowLane,
     options: UdpStreamOpenOptions,
     runtime: ClientUdpPathSessionRuntime,
-) -> Result<ReliablePathStream, RuntimeError> {
+) -> Result<OpenedReliableCarrierStream, RuntimeError> {
     let UdpStreamOpenOptions {
         wait_for_accept,
         role,
@@ -498,7 +497,7 @@ async fn open_client_udp_stream_on_connection(
         receivers,
         frames_tx,
     ));
-    Ok(ReliablePathStream {
+    Ok(OpenedReliableCarrierStream {
         stream_id,
         max_offset,
         lane,
@@ -507,11 +506,9 @@ async fn open_client_udp_stream_on_connection(
             runtime.codec_limits,
             runtime.mux_limits,
         ),
-        output: ReliablePathStreamOutput::fixed_with_snapshot(
-            path_startup_snapshot(&runtime.path, runtime.path_index),
-            commands,
-            runtime.mux_limits,
-        ),
+        startup: path_startup_snapshot(&runtime.path, runtime.path_index),
+        commands,
+        mux_limits: runtime.mux_limits,
         frames: frames_rx,
     })
 }

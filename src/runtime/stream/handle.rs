@@ -15,7 +15,6 @@ use crate::protocol::PathId;
 use crate::protocol::frame::reliable_stream_frame_extent;
 use crate::protocol::{Frame, OffsetRange, ResetReason, StreamId, UnderlayProtocol};
 use crate::runtime::RuntimeError;
-use crate::runtime::path::RequestTcpCapacityProbeLease;
 use crate::runtime::path::commands::{
     QuicCapacityProbeCommand, ReliablePathCommand, ReliablePathCommandSender,
     RequestTcpCapacityProbeRequest, reliable_path_stream_ordered_queue_lane,
@@ -25,6 +24,7 @@ use crate::runtime::path::model::{default_path_rate_bps, default_path_srtt_ms};
 use crate::runtime::path::proof::{
     enqueue_path_proof_frame, enqueue_stream_ordered_path_proof_frame,
 };
+use crate::runtime::path::{OpenedReliableCarrierStream, RequestTcpCapacityProbeLease};
 use crate::scheduler::{FlowLane, PathRateScope, PathSnapshot};
 use std::collections::BTreeMap;
 use std::sync::{Arc, Mutex};
@@ -47,6 +47,23 @@ pub(in crate::runtime) struct ReliablePathStream {
 }
 
 impl ReliablePathStream {
+    /// Promotes accepted carrier state into product offset and output ownership.
+    pub(in crate::runtime) fn from_opened_carrier(opened: OpenedReliableCarrierStream) -> Self {
+        Self {
+            stream_id: opened.stream_id,
+            max_offset: opened.max_offset,
+            lane: opened.lane,
+            underlay: opened.underlay,
+            max_frame_payload_bytes: opened.max_frame_payload_bytes,
+            output: ReliablePathStreamOutput::fixed_with_snapshot(
+                opened.startup,
+                opened.commands,
+                opened.mux_limits,
+            ),
+            frames: opened.frames,
+        }
+    }
+
     pub(in crate::runtime) fn into_handle_and_frames(
         self,
     ) -> (

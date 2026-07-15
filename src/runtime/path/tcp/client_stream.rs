@@ -16,11 +16,11 @@ use crate::runtime::path::commands::{
     ClientTcpOpenAttemptId, ClientTcpOpenResponse, ClientTcpOpenedStream, ReliablePathCommand,
     ReliablePathCommandSender,
 };
+use crate::runtime::path::ports::OpenedReliableCarrierStream;
 use crate::runtime::path::tcp::client_state::{
     ClientTcpPathConnection, ClientTcpPathSessionRuntime,
 };
 use crate::runtime::recent_ids::RecentIdCache;
-use crate::runtime::stream::{ReliablePathStream, ReliablePathStreamOutput};
 use crate::scheduler::{FlowLane, stream_demand_hint_for_lane};
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -333,23 +333,21 @@ pub(super) async fn handle_client_tcp_stream_frame(
                         .frames
                         .take()
                         .ok_or(RuntimeError::Protocol("missing TCP stream frame receiver"))?;
-                    let stream = ReliablePathStream {
+                    let carrier = OpenedReliableCarrierStream {
                         stream_id,
                         max_offset,
                         lane: pending.lane,
                         underlay: UnderlayProtocol::Tcp,
                         max_frame_payload_bytes: reliable_relay_buffer_len(runtime.mux_limits),
-                        output: ReliablePathStreamOutput::fixed_with_snapshot(
-                            connection.startup_snapshot,
-                            pending.session_commands,
-                            runtime.mux_limits,
-                        ),
+                        startup: connection.startup_snapshot,
+                        commands: pending.session_commands,
+                        mux_limits: runtime.mux_limits,
                         frames,
                     };
                     if pending
                         .response
                         .send(ClientTcpOpenResponse::Opened(ClientTcpOpenedStream {
-                            stream,
+                            carrier,
                             open_deadline,
                         }))
                         .is_err()

@@ -17,7 +17,7 @@ use crate::model::timing::{
 use crate::protocol::{Frame, IngressKind, StreamId, StreamOpenRole, TargetAddr, UnderlayProtocol};
 use crate::runtime::error::RuntimeError;
 use crate::runtime::path::commands::ClientTcpOpenDeadlines;
-use crate::runtime::path::{ClientPathContext, RelayPathLoadLease};
+use crate::runtime::path::{ClientPathContext, RelayPathLoadLease, UdpStreamOpenOptions};
 use crate::runtime::stream::ReliablePathStream;
 use crate::scheduler::FlowLane;
 use std::time::{Duration, Instant};
@@ -99,19 +99,6 @@ impl Drop for OpenedRemoteStream {
 pub(in crate::runtime) struct ReliableRelayOpenSpec {
     pub(in crate::runtime) target: TargetAddr,
     pub(in crate::runtime) ingress: IngressKind,
-}
-
-#[derive(Debug, Clone, Copy)]
-pub(in crate::runtime) struct UdpStreamOpenOptions {
-    pub(in crate::runtime) wait_for_accept: bool,
-    pub(in crate::runtime) role: StreamOpenRole,
-}
-
-impl UdpStreamOpenOptions {
-    pub(in crate::runtime) const ACTIVE_WAIT: Self = Self {
-        wait_for_accept: true,
-        role: StreamOpenRole::Active,
-    };
 }
 
 pub(in crate::runtime) fn udp_relay_attachment_open_options(
@@ -426,7 +413,10 @@ pub(in crate::runtime) async fn open_remote_stream_on_preselected_tcp_path(
         .ok_or(RuntimeError::NoSchedulableTcpPath)?
         .open_stream_with_deadlines(stream_id, target, ingress, lane, role, open_deadlines)
         .await?;
-    let pending = OpenedRemoteStream::pending(opened.stream, path_index);
+    let pending = OpenedRemoteStream::pending(
+        ReliablePathStream::from_opened_carrier(opened.carrier),
+        path_index,
+    );
     tokio::time::timeout_at(
         opened.open_deadline,
         send_open_path_metrics(context, pending.stream(), UnderlayProtocol::Tcp, path_index),
@@ -566,13 +556,14 @@ pub(in crate::runtime) async fn open_remote_stream_on_preselected_udp_path(
     #[cfg(not(feature = "lab-diagnostics"))]
     let _ = (wait_for_accept, role);
     let started_at = Instant::now();
-    let stream = context
+    let carrier = context
         .udp_sessions
         .get(path_index)
         .ok_or(RuntimeError::NoSchedulableUdpPath)?
         .open_stream(stream_id, target, ingress, lane, options, open_deadline)
         .await?;
-    let pending = OpenedRemoteStream::pending(stream, path_index);
+    let pending =
+        OpenedRemoteStream::pending(ReliablePathStream::from_opened_carrier(carrier), path_index);
     let elapsed = started_at.elapsed();
     context.mark_udp_stream_reserved_open_success(path_index, elapsed, wait_for_accept);
     send_open_path_metrics(context, pending.stream(), UnderlayProtocol::Udp, path_index).await?;

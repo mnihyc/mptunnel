@@ -14,10 +14,10 @@ use super::io::{
     write_delivered_payloads,
 };
 use super::open::{
-    OpenedRemoteStream, ReliableRelayOpenSpec, UdpStreamOpenOptions,
-    open_remote_stream_on_preselected_tcp_path, open_remote_stream_on_preselected_udp_path,
-    relay_error_is_tcp_path_failure, relay_path_open_error_is_retryable,
-    relay_path_open_with_deadline, reliable_relay_attach_open_timeouts,
+    OpenedRemoteStream, ReliableRelayOpenSpec, open_remote_stream_on_preselected_tcp_path,
+    open_remote_stream_on_preselected_udp_path, relay_error_is_tcp_path_failure,
+    relay_path_open_error_is_retryable, relay_path_open_with_deadline,
+    reliable_relay_attach_open_timeouts,
 };
 use super::remote::{
     ReliableRelayAttachMode, ReliableRelayAttachOutcome, ReliableRelayRemoteFrame,
@@ -45,6 +45,7 @@ use crate::protocol::frame::normalized_offset_ranges;
 use crate::protocol::frame::reliable_path_frame_pacing_bytes;
 use crate::protocol::{Frame, OffsetRange, StreamId, StreamOpenRole, UnderlayProtocol};
 use crate::runtime::error::RuntimeError;
+use crate::runtime::path::UdpStreamOpenOptions;
 use crate::runtime::path::commands::{ClientTcpOpenDeadlines, reliable_stream_frame_queue};
 use crate::runtime::path::{
     ClientPathContext, PathDeliveryStats, ReliableTcpRequestBulkFlowRegistration,

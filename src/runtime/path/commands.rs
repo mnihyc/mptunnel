@@ -12,8 +12,8 @@ use crate::protocol::{
     Frame, IngressKind, PathId, ResetReason, StreamId, StreamOpenRole, TargetAddr,
 };
 use crate::runtime::error::RuntimeError;
+use crate::runtime::path::ports::OpenedReliableCarrierStream;
 use crate::runtime::path::tcp::capacity::RequestTcpCapacityProbeLease;
-use crate::runtime::stream::ReliablePathStream;
 use crate::runtime::stream::response::TcpCapacityProbeSessionLease;
 use crate::scheduler::FlowLane;
 use std::sync::{
@@ -1508,7 +1508,7 @@ impl ClientTcpOpenDeadlines {
 }
 
 pub(in crate::runtime) struct ClientTcpOpenedStream {
-    pub(in crate::runtime) stream: ReliablePathStream,
+    pub(in crate::runtime) carrier: OpenedReliableCarrierStream,
     pub(in crate::runtime) open_deadline: tokio::time::Instant,
 }
 

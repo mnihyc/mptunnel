@@ -21,9 +21,7 @@ use crate::model::capacity::{
     PathRateSample, QUIC_PERSISTENT_CONGESTION_THRESHOLD, adaptive_reliable_relay_repair_bytes,
     reliable_stream_advertised_window_bytes,
 };
-use crate::model::multipath::{
-    ExtraTrafficKind, ExtraTrafficLedger, FlowSubflowSet, PathRuntimeRole,
-};
+use crate::model::multipath::{ExtraTrafficKind, ExtraTrafficLedger, FlowSubflowSet};
 use crate::model::path::{
     RelayPathInstance, RelayPathKey, RelayPathPlacement, RelayPathProofEpoch,
 };
@@ -261,9 +259,7 @@ fn choose_observed_ordinary_data_path(
 #[derive(Debug)]
 struct RelayPathSendSelection {
     target: RequestRelayPathIntent,
-    data_role: Option<PathRuntimeRole>,
-    request_startup_commit: Option<RequestStartupAdmission>,
-    request_calibration_commit: Option<RequestAckClockCalibrationCommit>,
+    product_mutation: RequestProductSendMutation,
     request_load_expectation: Option<(RelayPathKey, u32, u32)>,
     request_proof_expectation: Option<RelayPathProofEpoch>,
 }
@@ -284,8 +280,13 @@ struct RequestRelayPathIntent {
     instance: RelayPathInstance,
 }
 
-#[derive(Debug, Clone, Copy)]
-enum RequestAckClockCalibrationCommit {
+/// The one product-state mutation authorized after carrier enqueue succeeds.
+#[derive(Debug)]
+enum RequestProductSendMutation {
+    None,
+    InstallService,
+    PreserveSubflow,
+    CommitStartup(RequestStartupAdmission),
     ServiceFence {
         service: RelayPathInstance,
         candidate: RelayPathInstance,
@@ -304,12 +305,10 @@ enum RequestAckClockCalibrationCommit {
 }
 
 impl RelayPathSendSelection {
-    fn new(target: RequestRelayPathIntent, data_role: Option<PathRuntimeRole>) -> Self {
+    fn new(target: RequestRelayPathIntent, product_mutation: RequestProductSendMutation) -> Self {
         Self {
             target,
-            data_role,
-            request_startup_commit: None,
-            request_calibration_commit: None,
+            product_mutation,
             request_load_expectation: None,
             request_proof_expectation: None,
         }
@@ -1035,9 +1034,7 @@ impl RequestSenderService {
             };
             let RelayPathSendSelection {
                 target,
-                data_role,
-                request_startup_commit,
-                request_calibration_commit,
+                product_mutation,
                 request_load_expectation,
                 request_proof_expectation,
             } = selection;
@@ -1113,38 +1110,13 @@ impl RequestSenderService {
                             ),
                         );
                     }
-                    if let Some(admission) = request_startup_commit {
-                        self.request.startup.commit_admission(admission);
-                    }
-                    self.commit_request_ack_clock_calibration(request_calibration_commit);
-                    if matches!(frame, Frame::StreamData { .. }) {
-                        let sent_bytes = reliable_stream_frame_accounted_bytes(&frame);
-                        context.record_relay_path_send(
-                            instance.key.underlay,
-                            instance.key.index,
-                            sent_bytes,
-                        );
-                        if data_role == Some(PathRuntimeRole::Service) {
-                            self.request.ordered_service = Some(instance);
-                        } else if data_role == Some(PathRuntimeRole::Subflow)
-                            && self
-                                .request
-                                .startup
-                                .epoch
-                                .as_ref()
-                                .and_then(FlowSubflowSet::startup_owner_key)
-                                == Some(instance)
-                        {
-                            self.request
-                                .startup
-                                .first_sent_at
-                                .entry(instance)
-                                .or_insert_with(Instant::now);
-                            self.try_enqueue_request_startup_receipt_proof(
-                                context, remotes, instance,
-                            );
-                        }
-                    }
+                    self.commit_enqueued_request_product_send(
+                        context,
+                        remotes,
+                        instance,
+                        &frame,
+                        product_mutation,
+                    );
                     self.next_send_index = if remotes.paths.is_empty() {
                         0
                     } else {
@@ -1304,21 +1276,21 @@ impl RequestSenderService {
             }) {
                 BulkRelayPathChoice::Selected(instance) => {
                     let key = instance.key;
-                    let role = if self
+                    let product_mutation = if self
                         .request
                         .ordered_service_key()
                         .is_none_or(|owner| owner == key)
                     {
-                        PathRuntimeRole::Service
+                        RequestProductSendMutation::InstallService
                     } else {
-                        PathRuntimeRole::Subflow
+                        RequestProductSendMutation::PreserveSubflow
                     };
                     let mut selection = RelayPathSendSelection::new(
                         RequestRelayPathIntent {
                             membership_generation: relay_observation.membership_generation,
                             instance,
                         },
-                        Some(role),
+                        product_mutation,
                     );
                     selection.request_load_expectation =
                         observed_request_load_expectation(&relay_observation, instance)?;
@@ -1340,9 +1312,7 @@ impl RequestSenderService {
                             membership_generation: relay_observation.membership_generation,
                             instance: candidate,
                         },
-                        data_role: Some(PathRuntimeRole::Subflow),
-                        request_startup_commit: Some(admission),
-                        request_calibration_commit: None,
+                        product_mutation: RequestProductSendMutation::CommitStartup(admission),
                         request_load_expectation: observed_request_load_expectation(
                             &relay_observation,
                             candidate,
@@ -1379,18 +1349,14 @@ impl RequestSenderService {
                             membership_generation: relay_observation.membership_generation,
                             instance: candidate,
                         },
-                        data_role: Some(PathRuntimeRole::Subflow),
-                        request_startup_commit: None,
-                        request_calibration_commit: Some(
-                            RequestAckClockCalibrationCommit::OwnerData {
-                                candidate,
-                                target_bytes,
-                                payload_bytes,
-                                entry_offset,
-                                foreign_optional_ranges,
-                                foreign_optional_bytes,
-                            },
-                        ),
+                        product_mutation: RequestProductSendMutation::OwnerData {
+                            candidate,
+                            target_bytes,
+                            payload_bytes,
+                            entry_offset,
+                            foreign_optional_ranges,
+                            foreign_optional_bytes,
+                        },
                         request_load_expectation: observed_request_load_expectation(
                             &relay_observation,
                             candidate,
@@ -1419,17 +1385,13 @@ impl RequestSenderService {
                             membership_generation: relay_observation.membership_generation,
                             instance: service,
                         },
-                        data_role: Some(PathRuntimeRole::Service),
-                        request_startup_commit: None,
-                        request_calibration_commit: Some(
-                            RequestAckClockCalibrationCommit::ServiceFence {
-                                service,
-                                candidate,
-                                entry_offset,
-                                foreign_optional_ranges,
-                                foreign_optional_bytes,
-                            },
-                        ),
+                        product_mutation: RequestProductSendMutation::ServiceFence {
+                            service,
+                            candidate,
+                            entry_offset,
+                            foreign_optional_ranges,
+                            foreign_optional_bytes,
+                        },
                         request_load_expectation: observed_request_load_expectation(
                             &relay_observation,
                             service,
@@ -1451,7 +1413,7 @@ impl RequestSenderService {
                             membership_generation: relay_observation.membership_generation,
                             instance,
                         },
-                        Some(PathRuntimeRole::Service),
+                        RequestProductSendMutation::InstallService,
                     );
                     selection.request_load_expectation =
                         observed_request_load_expectation(&relay_observation, instance)?;
@@ -1468,17 +1430,17 @@ impl RequestSenderService {
             avoid_keys,
             prepared.unique_data_payload_bytes.is_some(),
         )?;
-        let data_role = if prepared.unique_data_payload_bytes.is_some() {
-            Some(PathRuntimeRole::Service)
+        let product_mutation = if prepared.unique_data_payload_bytes.is_some() {
+            RequestProductSendMutation::InstallService
         } else {
-            None
+            RequestProductSendMutation::None
         };
         Ok(RelayPathSendSelection::new(
             RequestRelayPathIntent {
                 membership_generation: prepared.membership_generation,
                 instance: remotes.paths[position].instance(),
             },
-            data_role,
+            product_mutation,
         ))
     }
 
@@ -1486,21 +1448,89 @@ impl RequestSenderService {
         self.request.reset_subflow_epoch();
     }
 
-    fn commit_request_ack_clock_calibration(
+    fn commit_enqueued_request_product_send(
         &mut self,
-        commit: Option<RequestAckClockCalibrationCommit>,
+        context: &ClientPathContext,
+        remotes: &ReliableRelayRemoteSet,
+        instance: RelayPathInstance,
+        frame: &Frame,
+        mutation: RequestProductSendMutation,
     ) {
-        let Some(commit) = commit else {
+        self.commit_request_ack_clock_calibration(&mutation);
+        if !matches!(frame, Frame::StreamData { .. }) {
+            debug_assert!(matches!(mutation, RequestProductSendMutation::None));
             return;
-        };
+        }
+        let sent_bytes = reliable_stream_frame_accounted_bytes(frame);
+        match mutation {
+            RequestProductSendMutation::InstallService => {
+                context.record_relay_path_send(
+                    instance.key.underlay,
+                    instance.key.index,
+                    sent_bytes,
+                );
+                self.request.ordered_service = Some(instance);
+            }
+            RequestProductSendMutation::CommitStartup(admission) => {
+                self.request.startup.commit_admission(admission);
+                context.record_relay_path_send(
+                    instance.key.underlay,
+                    instance.key.index,
+                    sent_bytes,
+                );
+                if self
+                    .request
+                    .startup
+                    .epoch
+                    .as_ref()
+                    .and_then(FlowSubflowSet::startup_owner_key)
+                    == Some(instance)
+                {
+                    self.request
+                        .startup
+                        .first_sent_at
+                        .entry(instance)
+                        .or_insert_with(Instant::now);
+                    self.try_enqueue_request_startup_receipt_proof(context, remotes, instance);
+                }
+            }
+            RequestProductSendMutation::PreserveSubflow
+            | RequestProductSendMutation::ServiceFence { .. }
+            | RequestProductSendMutation::OwnerData { .. } => {
+                context.record_relay_path_send(
+                    instance.key.underlay,
+                    instance.key.index,
+                    sent_bytes,
+                );
+            }
+            RequestProductSendMutation::None => {
+                debug_assert!(false, "STREAM_DATA selection requires a product mutation");
+            }
+        }
+    }
+
+    fn commit_request_ack_clock_calibration(&mut self, commit: &RequestProductSendMutation) {
         match commit {
-            RequestAckClockCalibrationCommit::ServiceFence {
+            RequestProductSendMutation::ServiceFence {
                 service,
                 candidate,
                 entry_offset,
                 foreign_optional_ranges,
                 foreign_optional_bytes,
             } => {
+                let (
+                    service,
+                    candidate,
+                    entry_offset,
+                    foreign_optional_ranges,
+                    foreign_optional_bytes,
+                ) = (
+                    *service,
+                    *candidate,
+                    *entry_offset,
+                    *foreign_optional_ranges,
+                    *foreign_optional_bytes,
+                );
                 #[cfg(not(feature = "lab-diagnostics"))]
                 let _ = (
                     entry_offset,
@@ -1537,7 +1567,7 @@ impl RequestSenderService {
                     ),
                 );
             }
-            RequestAckClockCalibrationCommit::OwnerData {
+            RequestProductSendMutation::OwnerData {
                 candidate,
                 target_bytes,
                 payload_bytes,
@@ -1545,6 +1575,21 @@ impl RequestSenderService {
                 foreign_optional_ranges,
                 foreign_optional_bytes,
             } => {
+                let (
+                    candidate,
+                    target_bytes,
+                    payload_bytes,
+                    entry_offset,
+                    foreign_optional_ranges,
+                    foreign_optional_bytes,
+                ) = (
+                    *candidate,
+                    *target_bytes,
+                    *payload_bytes,
+                    *entry_offset,
+                    *foreign_optional_ranges,
+                    *foreign_optional_bytes,
+                );
                 #[cfg(not(feature = "lab-diagnostics"))]
                 let _ = (
                     entry_offset,
@@ -1647,6 +1692,10 @@ impl RequestSenderService {
                     }
                 }
             }
+            RequestProductSendMutation::None
+            | RequestProductSendMutation::InstallService
+            | RequestProductSendMutation::PreserveSubflow
+            | RequestProductSendMutation::CommitStartup(_) => {}
         }
     }
 

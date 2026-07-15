@@ -2385,11 +2385,11 @@ async fn graduated_candidate_calibration_produces_ack_clock_capacity_sample() {
         )
         .expect("calibration selection before carrier enqueue");
     assert!(matches!(
-        cancelled_selection.request_calibration_commit,
-        Some(RequestAckClockCalibrationCommit::OwnerData {
+        cancelled_selection.product_mutation,
+        RequestProductSendMutation::OwnerData {
             candidate: selected,
             ..
-        }) if selected == candidate
+        } if selected == candidate
     ));
     assert_eq!(sender.request.ack_clock_operation, None);
     assert!(sender.request.subflows.iter().all(|(_, state)| {
@@ -4175,15 +4175,13 @@ fn request_calibration_commit_installs_pending_owner_and_spend_atomically() {
     };
     let mut sender = RequestSenderService::new(StreamId(109));
     sender.request.ordered_service = Some(service);
-    sender.commit_request_ack_clock_calibration(Some(
-        RequestAckClockCalibrationCommit::ServiceFence {
-            service,
-            candidate,
-            entry_offset: 64 * 1024,
-            foreign_optional_ranges: 1,
-            foreign_optional_bytes: 64 * 1024,
-        },
-    ));
+    sender.commit_request_ack_clock_calibration(&RequestProductSendMutation::ServiceFence {
+        service,
+        candidate,
+        entry_offset: 64 * 1024,
+        foreign_optional_ranges: 1,
+        foreign_optional_bytes: 64 * 1024,
+    });
     assert_eq!(
         sender.request.ack_clock_operation,
         Some(RequestAckClockOperation::Pending { service, candidate })
@@ -4193,16 +4191,14 @@ fn request_calibration_commit_installs_pending_owner_and_spend_atomically() {
             && state.ack_clock_calibration_target().is_none()
     }));
 
-    sender.commit_request_ack_clock_calibration(Some(
-        RequestAckClockCalibrationCommit::OwnerData {
-            candidate,
-            target_bytes: 2 * 1024 * 1024,
-            payload_bytes: 64 * 1024,
-            entry_offset: 64 * 1024,
-            foreign_optional_ranges: 0,
-            foreign_optional_bytes: 0,
-        },
-    ));
+    sender.commit_request_ack_clock_calibration(&RequestProductSendMutation::OwnerData {
+        candidate,
+        target_bytes: 2 * 1024 * 1024,
+        payload_bytes: 64 * 1024,
+        entry_offset: 64 * 1024,
+        foreign_optional_ranges: 0,
+        foreign_optional_bytes: 0,
+    });
     assert!(matches!(
         sender.request.ack_clock_operation,
         Some(RequestAckClockOperation::Owner { .. })
@@ -4232,16 +4228,14 @@ fn request_calibration_commit_installs_pending_owner_and_spend_atomically() {
         })
     );
 
-    sender.commit_request_ack_clock_calibration(Some(
-        RequestAckClockCalibrationCommit::OwnerData {
-            candidate,
-            target_bytes: 2 * 1024 * 1024,
-            payload_bytes: 64 * 1024,
-            entry_offset: 128 * 1024,
-            foreign_optional_ranges: 1,
-            foreign_optional_bytes: 64 * 1024,
-        },
-    ));
+    sender.commit_request_ack_clock_calibration(&RequestProductSendMutation::OwnerData {
+        candidate,
+        target_bytes: 2 * 1024 * 1024,
+        payload_bytes: 64 * 1024,
+        entry_offset: 128 * 1024,
+        foreign_optional_ranges: 1,
+        foreign_optional_bytes: 64 * 1024,
+    });
     assert_eq!(
         sender
             .request

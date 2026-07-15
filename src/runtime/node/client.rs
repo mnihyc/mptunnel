@@ -1,6 +1,8 @@
 //! Client process lifecycle and background path liveness probes.
 
-use crate::config::{ClientConfig, LocalIngressConfig, ManagementConfig, ResourceLimits};
+use crate::config::{
+    ClientConfig, LocalIngressConfig, ManagementConfig, MppPerformanceConfig, ResourceLimits,
+};
 use crate::ingress::{IngressConfig, ProxyAuthConfig};
 use crate::protocol::UnderlayProtocol;
 use crate::runtime::error::RuntimeError;
@@ -25,6 +27,9 @@ pub(super) async fn run(
 ) -> Result<(), RuntimeError> {
     let path_probe_interval = client.path_probe_interval;
     let path_probe_timeout = client.path_probe_timeout;
+    // Product sender policy follows the configured path group without becoming
+    // carrier-state ownership in `ClientPathContext`.
+    let performance = client.performance;
     let context = new_path_context(&client, resources, 0, carrier_network)?;
     let mut services = tokio::task::JoinSet::new();
     if management.enabled() {
@@ -33,6 +38,7 @@ pub(super) async fn run(
     spawn_ingresses(
         client.ingresses,
         context.clone(),
+        performance,
         packet_devices,
         &mut services,
     );
@@ -73,6 +79,7 @@ pub(super) fn new_path_context(
 pub(super) fn spawn_ingresses(
     ingresses: Vec<LocalIngressConfig>,
     context: ClientPathContext,
+    performance: MppPerformanceConfig,
     packet_devices: Arc<dyn PacketDeviceProvider>,
     tasks: &mut tokio::task::JoinSet<Result<(), RuntimeError>>,
 ) {
@@ -80,20 +87,20 @@ pub(super) fn spawn_ingresses(
         let context = context.clone();
         match ingress.config {
             IngressConfig::Socks5 { listen, proxy_auth } => {
-                tasks.spawn(
-                    async move { run_socks5_client_ingress(listen, context, proxy_auth).await },
-                );
+                tasks.spawn(async move {
+                    run_socks5_client_ingress(listen, context, proxy_auth, performance).await
+                });
             }
             IngressConfig::HttpConnect { listen, proxy_auth } => {
                 tasks.spawn(async move {
-                    run_http_connect_client_ingress(listen, context, proxy_auth).await
+                    run_http_connect_client_ingress(listen, context, proxy_auth, performance).await
                 });
             }
             IngressConfig::TunL4(tun) => {
                 let packet_devices = packet_devices.clone();
                 tasks.spawn(async move {
                     let device = packet_devices.open(&tun).map_err(RuntimeError::TunDevice)?;
-                    run_tun_l4_client(tun, context, device).await
+                    run_tun_l4_client(tun, context, performance, device).await
                 });
             }
         }

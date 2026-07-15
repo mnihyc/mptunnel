@@ -366,6 +366,7 @@ impl RelayRecvProgressSend {
 }
 
 impl RequestSenderService {
+    #[cfg(test)]
     pub(in crate::runtime) fn new(stream_id: StreamId) -> Self {
         Self::new_with_performance(stream_id, MppPerformanceConfig::default())
     }

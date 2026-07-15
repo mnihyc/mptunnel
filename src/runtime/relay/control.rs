@@ -27,6 +27,7 @@ use super::remote::{
 };
 #[cfg(test)]
 use super::*;
+use crate::config::MppPerformanceConfig;
 #[cfg(feature = "lab-diagnostics")]
 use crate::lab_diagnostics::{lab_diagnostic, lab_perf_flush, lab_perf_record};
 use crate::model::capacity::{
@@ -133,6 +134,7 @@ fn update_tcp_service_request_bulk_flow_registration(
 pub(in crate::runtime) async fn relay_migrating_tcp_stream<S>(
     mut local: S,
     context: &ClientPathContext,
+    performance: MppPerformanceConfig,
     spec: ReliableRelayOpenSpec,
     remote: OpenedRemoteStream,
 ) -> Result<PathDeliveryStats, RuntimeError>
@@ -158,7 +160,7 @@ where
     let mut stats = PathDeliveryStats::default();
     let mut path_stats = HashMap::<RelayPathKey, PathDeliveryStats>::new();
     let mut path_next_live_sample_bytes = HashMap::<RelayPathKey, u64>::new();
-    let mut sender = RequestSenderService::new(stream_id);
+    let mut sender = RequestSenderService::new_with_performance(stream_id, performance);
     let mut request_outstanding_window = RequestOutstandingWindow::new();
     let mut flow_demand = ReliableRelayFlowDemandTracker::new();
     let mut request_flow_demand = ReliableRelayFlowDemandTracker::new();

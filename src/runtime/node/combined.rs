@@ -34,6 +34,7 @@ pub(super) async fn run(
         client::spawn_ingresses(
             client_config.ingresses,
             context.clone(),
+            client_config.performance,
             packet_devices.clone(),
             &mut services,
         );

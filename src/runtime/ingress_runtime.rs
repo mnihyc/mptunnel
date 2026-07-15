@@ -4,6 +4,7 @@
 
 #[cfg(test)]
 use super::*;
+use crate::config::MppPerformanceConfig;
 use crate::ingress::ProxyAuthConfig;
 use crate::ingress::http_connect::{self, HttpConnectError, HttpStatus};
 use crate::ingress::socks5::{self, Socks5Error, Socks5Reply};
@@ -36,6 +37,7 @@ pub(super) async fn run_socks5_client_ingress(
     listen: Vec<SocketAddr>,
     context: ClientPathContext,
     proxy_auth: ProxyAuthConfig,
+    performance: MppPerformanceConfig,
 ) -> Result<(), RuntimeError> {
     let mut bound = Vec::with_capacity(listen.len());
     for addr in listen {
@@ -50,8 +52,9 @@ pub(super) async fn run_socks5_client_ingress(
     for listener in bound {
         let context = context.clone();
         let proxy_auth = proxy_auth.clone();
-        listeners
-            .spawn(async move { run_socks5_client_listener(listener, context, proxy_auth).await });
+        listeners.spawn(async move {
+            run_socks5_client_listener(listener, context, proxy_auth, performance).await
+        });
     }
     wait_for_ingress_listener_failure(listeners, "SOCKS5").await
 }
@@ -60,6 +63,7 @@ pub(super) async fn run_socks5_client_listener(
     listener: TcpListener,
     context: ClientPathContext,
     proxy_auth: ProxyAuthConfig,
+    performance: MppPerformanceConfig,
 ) -> Result<(), RuntimeError> {
     let mut connections = tokio::task::JoinSet::new();
     loop {
@@ -71,7 +75,13 @@ pub(super) async fn run_socks5_client_listener(
                 let proxy_auth = proxy_auth.clone();
                 connections.spawn(async move {
                     if let Err(err) =
-                        handle_socks5_client_stream_with_auth(stream, context, proxy_auth).await
+                        handle_socks5_client_stream_with_auth(
+                            stream,
+                            context,
+                            proxy_auth,
+                            performance,
+                        )
+                        .await
                     {
                         eprintln!("warning: SOCKS5 client handler failed: {err}");
                     }
@@ -90,6 +100,7 @@ pub(super) async fn run_http_connect_client_ingress(
     listen: Vec<SocketAddr>,
     context: ClientPathContext,
     proxy_auth: ProxyAuthConfig,
+    performance: MppPerformanceConfig,
 ) -> Result<(), RuntimeError> {
     let mut bound = Vec::with_capacity(listen.len());
     for addr in listen {
@@ -105,7 +116,7 @@ pub(super) async fn run_http_connect_client_ingress(
         let context = context.clone();
         let proxy_auth = proxy_auth.clone();
         listeners.spawn(async move {
-            run_http_connect_client_listener(listener, context, proxy_auth).await
+            run_http_connect_client_listener(listener, context, proxy_auth, performance).await
         });
     }
     wait_for_ingress_listener_failure(listeners, "HTTP CONNECT").await
@@ -115,6 +126,7 @@ pub(super) async fn run_http_connect_client_listener(
     listener: TcpListener,
     context: ClientPathContext,
     proxy_auth: ProxyAuthConfig,
+    performance: MppPerformanceConfig,
 ) -> Result<(), RuntimeError> {
     let mut connections = tokio::task::JoinSet::new();
     loop {
@@ -126,7 +138,13 @@ pub(super) async fn run_http_connect_client_listener(
                 let proxy_auth = proxy_auth.clone();
                 connections.spawn(async move {
                     if let Err(err) =
-                        handle_http_connect_client_stream_with_auth(stream, context, proxy_auth).await
+                        handle_http_connect_client_stream_with_auth(
+                            stream,
+                            context,
+                            proxy_auth,
+                            performance,
+                        )
+                        .await
                     {
                         eprintln!("warning: HTTP CONNECT client handler failed: {err}");
                     }
@@ -172,13 +190,20 @@ where
     S: AsyncRead + AsyncWrite + Unpin,
 {
     let proxy_auth = context.proxy_auth.clone();
-    handle_socks5_client_stream_with_auth(stream, context, proxy_auth).await
+    handle_socks5_client_stream_with_auth(
+        stream,
+        context,
+        proxy_auth,
+        MppPerformanceConfig::default(),
+    )
+    .await
 }
 
 pub(super) async fn handle_socks5_client_stream_with_auth<S>(
     mut stream: S,
     context: ClientPathContext,
     proxy_auth: ProxyAuthConfig,
+    performance: MppPerformanceConfig,
 ) -> Result<(), RuntimeError>
 where
     S: AsyncRead + AsyncWrite + Unpin,
@@ -218,6 +243,7 @@ where
                 relay_migrating_tcp_stream(
                     stream,
                     &context,
+                    performance,
                     ReliableRelayOpenSpec {
                         target,
                         ingress: IngressKind::Socks5,
@@ -251,13 +277,20 @@ where
     S: AsyncRead + AsyncWrite + Unpin,
 {
     let proxy_auth = context.proxy_auth.clone();
-    handle_http_connect_client_stream_with_auth(stream, context, proxy_auth).await
+    handle_http_connect_client_stream_with_auth(
+        stream,
+        context,
+        proxy_auth,
+        MppPerformanceConfig::default(),
+    )
+    .await
 }
 
 pub(super) async fn handle_http_connect_client_stream_with_auth<S>(
     mut stream: S,
     context: ClientPathContext,
     proxy_auth: ProxyAuthConfig,
+    performance: MppPerformanceConfig,
 ) -> Result<(), RuntimeError>
 where
     S: AsyncRead + AsyncWrite + Unpin,
@@ -296,6 +329,7 @@ where
         relay_migrating_tcp_stream(
             stream,
             &context,
+            performance,
             ReliableRelayOpenSpec {
                 target,
                 ingress: IngressKind::HttpConnect,

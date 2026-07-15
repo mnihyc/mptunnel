@@ -37,6 +37,9 @@ contract as same-family multipath placement.
   connection policy, not carrier selection.
 - `src/protocol/`: MPP wire types, authentication, and bounded codecs. A frame
   being representable here does not make it legal on every carrier or role.
+- `src/runtime/node/`: composes configured client/server identities. Per-group
+  product performance policy is passed explicitly to relay flows; carrier path
+  state neither owns nor silently defaults that policy.
 - `src/runtime/relay/`: owns client and server flow orchestration, carrier open
   and attach transactions, remote membership, recovery, and target I/O. It does
   not own product scheduling formulas or carrier congestion control.

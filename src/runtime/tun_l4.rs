@@ -1,5 +1,6 @@
 #[cfg(test)]
 use super::*;
+use crate::config::MppPerformanceConfig;
 use crate::ingress::tun::TunL4Config;
 use crate::model::capacity::{
     PATH_OPEN_SCORE_BYTES, QUIC_PERSISTENT_CONGESTION_THRESHOLD, QUIC_TIMER_GRANULARITY,
@@ -32,6 +33,7 @@ const TUN_UDP_FLOW_IDLE_TIMEOUT: Duration = Duration::from_secs(60);
 pub(super) async fn run_tun_l4_client(
     tun: TunL4Config,
     context: ClientPathContext,
+    performance: MppPerformanceConfig,
     device: PacketDevice,
 ) -> Result<(), RuntimeError> {
     let framed = DeviceFramed::new(device.into_inner(), BytesCodec::new());
@@ -69,7 +71,7 @@ pub(super) async fn run_tun_l4_client(
         stack_runner,
         stack_to_tun,
         tun_to_stack,
-        run_tun_tcp_listener(tcp_listener, context.clone()),
+        run_tun_tcp_listener(tcp_listener, context.clone(), performance),
         run_tun_udp_socket(udp_socket, context, tun)
     )?;
     Ok(())
@@ -78,6 +80,7 @@ pub(super) async fn run_tun_l4_client(
 pub(super) async fn run_tun_tcp_listener(
     mut listener: TunTcpListener,
     context: ClientPathContext,
+    performance: MppPerformanceConfig,
 ) -> Result<(), RuntimeError> {
     let mut flows = tokio::task::JoinSet::new();
     loop {
@@ -88,7 +91,9 @@ pub(super) async fn run_tun_tcp_listener(
                 };
                 let context = context.clone();
                 flows.spawn(async move {
-                    if let Err(err) = handle_tun_tcp_stream(stream, local, remote, context).await {
+                    if let Err(err) =
+                        handle_tun_tcp_stream(stream, local, remote, context, performance).await
+                    {
                         eprintln!("warning: TUN TCP flow {local} -> {remote} failed: {err}");
                     }
                 });
@@ -107,6 +112,7 @@ pub(super) async fn handle_tun_tcp_stream<S>(
     _local: SocketAddr,
     remote: SocketAddr,
     context: ClientPathContext,
+    performance: MppPerformanceConfig,
 ) -> Result<(), RuntimeError>
 where
     S: AsyncRead + AsyncWrite + Unpin,
@@ -123,6 +129,7 @@ where
     relay_migrating_tcp_stream(
         stream,
         &context,
+        performance,
         ReliableRelayOpenSpec {
             target,
             ingress: IngressKind::TunTcp,

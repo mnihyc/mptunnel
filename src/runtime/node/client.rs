@@ -3,7 +3,7 @@
 use crate::config::{
     ClientConfig, LocalIngressConfig, ManagementConfig, MppPerformanceConfig, ResourceLimits,
 };
-use crate::ingress::{IngressConfig, ProxyAuthConfig};
+use crate::ingress::IngressConfig;
 use crate::protocol::UnderlayProtocol;
 use crate::runtime::error::RuntimeError;
 use crate::runtime::ingress_runtime::{
@@ -68,7 +68,6 @@ pub(super) fn new_path_context(
     ClientPathContext::new_with_carrier_network(
         client.paths.clone(),
         resources,
-        ProxyAuthConfig::disabled(),
         client.route_target.clone(),
         client.ingresses.clone(),
         path_group_ordinal,

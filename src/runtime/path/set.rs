@@ -13,6 +13,7 @@ use super::tcp::client::{
 use crate::config::{
     ClientPathConfig, LocalIngressConfig, ResourceLimits, RouteTarget, SecurityConfig,
 };
+#[cfg(test)]
 use crate::ingress::ProxyAuthConfig;
 use crate::model::path::RelayPathKey;
 use crate::mux::MuxLimits;
@@ -85,21 +86,21 @@ impl ClientPathContext {
         route_target: Option<RouteTarget>,
         ingresses: Vec<LocalIngressConfig>,
     ) -> Result<Self, RuntimeError> {
-        Self::new_with_carrier_network(
+        let mut context = Self::new_with_carrier_network(
             paths,
             resources,
-            proxy_auth,
             route_target,
             ingresses,
             0,
             Arc::new(SystemCarrierNetworkProvider),
-        )
+        )?;
+        context.proxy_auth = proxy_auth;
+        Ok(context)
     }
 
     pub fn new_with_carrier_network(
         paths: Vec<ClientPathConfig>,
         resources: ResourceLimits,
-        proxy_auth: ProxyAuthConfig,
         route_target: Option<RouteTarget>,
         ingresses: Vec<LocalIngressConfig>,
         path_group_ordinal: usize,
@@ -206,8 +207,6 @@ impl ClientPathContext {
                 })
             })
             .collect::<Vec<_>>();
-        #[cfg(not(test))]
-        let _ = proxy_auth;
         Ok(Self {
             route_target,
             ingresses: Arc::new(ingresses),
@@ -224,7 +223,7 @@ impl ClientPathContext {
             codec_limits,
             mux_limits,
             #[cfg(test)]
-            proxy_auth,
+            proxy_auth: ProxyAuthConfig::disabled(),
         })
     }
 

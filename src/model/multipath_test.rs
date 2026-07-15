@@ -1,4 +1,5 @@
 use super::*;
+use crate::protocol::{PathId, UnderlayProtocol};
 
 #[test]
 fn only_owner_data_can_own_frontier_or_be_ack_evidence_candidate() {

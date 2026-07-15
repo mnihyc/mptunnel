@@ -28,7 +28,10 @@ fn test_measurement_spec(base: Instant) -> MeasurementSpec {
     }
 }
 
-async fn install_test_measurement(telemetry: &Arc<QuicCarrierTelemetry>, spec: MeasurementSpec) {
+async fn install_test_measurement(
+    telemetry: &Arc<QuicCarrierTelemetry>,
+    spec: MeasurementSpec,
+) -> Instant {
     let reservation = telemetry
         .reserve_measurement_token(spec.token, spec.expires_at)
         .await
@@ -37,9 +40,11 @@ async fn install_test_measurement(telemetry: &Arc<QuicCarrierTelemetry>, spec: M
         .install_measurement(spec, 0)
         .expect("install measurement epoch");
     reservation.commit();
-    assert!(telemetry.mark_measurement_write_started(spec.token, Instant::now()));
+    let write_started_at = Instant::now();
+    assert!(telemetry.mark_measurement_write_started(spec.token, write_started_at));
     assert!(telemetry.record_measurement_data_written(spec.token, spec.train_payload_bytes,));
     assert!(telemetry.commit_measurement_write(spec.token, Instant::now()));
+    write_started_at
 }
 #[tokio::test]
 async fn quic_measurement_accepts_app_limited_acks_without_product_evidence() {
@@ -330,12 +335,12 @@ async fn quic_measurement_exact_receipt_releases_despite_native_flight_snapshot(
 #[tokio::test]
 async fn quic_measurement_zero_then_ack_only_then_receipt_releases_gate() {
     let base = Instant::now();
-    let telemetry = Arc::new(QuicCarrierTelemetry::default());
+    let (mut controller, telemetry) = test_instrumented_controller(base);
     let spec = test_measurement_spec(base);
     install_test_measurement(&telemetry, spec).await;
 
     telemetry.finish_measurement_ack_batch(base + Duration::from_millis(1), 0);
-    telemetry.add_sent(1200);
+    quinn::congestion::Controller::on_sent(&mut controller, base, 1200, 0);
     assert!(telemetry.confirm_measurement_receipt(
         spec.token,
         spec.train_payload_bytes,
@@ -368,11 +373,11 @@ async fn quic_measurement_zero_then_ack_only_then_receipt_releases_gate() {
 #[tokio::test]
 async fn quic_measurement_exact_receipt_releases_without_ack_batch() {
     let base = Instant::now();
-    let telemetry = Arc::new(QuicCarrierTelemetry::default());
+    let (mut controller, telemetry) = test_instrumented_controller(base);
     let spec = test_measurement_spec(base);
     install_test_measurement(&telemetry, spec).await;
 
-    telemetry.add_sent(1200);
+    quinn::congestion::Controller::on_sent(&mut controller, base, 1200, 0);
     assert!(telemetry.confirm_measurement_receipt(
         spec.token,
         spec.train_payload_bytes,
@@ -399,14 +404,7 @@ async fn quic_capacity_receipt_releases_writers_but_quarantines_probe_era_acks()
     let base = Instant::now();
     let (mut controller, telemetry) = test_instrumented_controller(base);
     let spec = test_measurement_spec(base);
-    install_test_measurement(&telemetry, spec).await;
-    let probe_started_at = telemetry
-        .measurement
-        .lock()
-        .expect("measurement epoch lock")
-        .as_ref()
-        .expect("installed measurement epoch")
-        .started_at;
+    let probe_started_at = install_test_measurement(&telemetry, spec).await;
     let receipt_at = Instant::now();
 
     assert!(telemetry.confirm_measurement_receipt(
@@ -513,8 +511,8 @@ async fn quic_measurement_ack_after_deadline_expires_instead_of_proving() {
 #[tokio::test]
 async fn quic_ack_only_flight_estimate_cannot_claim_or_block_clean_start() {
     let base = Instant::now();
-    let telemetry = Arc::new(QuicCarrierTelemetry::default());
-    telemetry.bytes_in_flight.store(37, Ordering::Release);
+    let (mut controller, telemetry) = test_instrumented_controller(base);
+    quinn::congestion::Controller::on_sent(&mut controller, base, 37, 0);
     assert_eq!(telemetry.snapshot().bytes_in_flight, None);
     let spec = test_measurement_spec(base);
     let reservation = telemetry

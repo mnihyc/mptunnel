@@ -1,4 +1,5 @@
 use super::*;
+use crate::protocol::PathId;
 
 #[test]
 fn calibration_never_raises_a_configured_resource_ceiling() {

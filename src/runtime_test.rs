@@ -130,6 +130,15 @@ fn tun_udp_dns_target_uses_configured_matching_resolver() {
     );
 }
 
+#[test]
+fn socks5_udp_relay_preserves_control_address_family() {
+    let v4 = std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST);
+    let v6 = std::net::IpAddr::V6(std::net::Ipv6Addr::LOCALHOST);
+
+    assert_eq!(socks5_udp_relay_bind_addr(v4), SocketAddr::new(v4, 0));
+    assert_eq!(socks5_udp_relay_bind_addr(v6), SocketAddr::new(v6, 0));
+}
+
 async fn reserve_tcp_path() -> PathSpec {
     let port = reserve_process_unique_tcp_port().await;
     format!("tcp://127.0.0.1:{port}").parse().expect("path")

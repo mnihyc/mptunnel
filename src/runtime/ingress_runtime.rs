@@ -23,7 +23,7 @@ use crate::runtime::tun_l4::{
 use crate::scheduler::FlowLane;
 use crate::transport::encrypted::{EncryptedFramedStream, PeerRole};
 use crate::transport::tcp::{self, TcpConnectOptions};
-use std::net::SocketAddr;
+use std::net::{IpAddr, SocketAddr};
 use std::time::{Duration, Instant};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::net::{TcpListener, UdpSocket};
@@ -69,6 +69,7 @@ pub(super) async fn run_socks5_client_listener(
             accepted = listener.accept() => {
                 let (stream, _) = accepted?;
                 stream.set_nodelay(true)?;
+                let udp_relay_ip = stream.local_addr()?.ip();
                 let context = context.clone();
                 let proxy_auth = proxy_auth.clone();
                 connections.spawn(async move {
@@ -78,6 +79,7 @@ pub(super) async fn run_socks5_client_listener(
                             context,
                             proxy_auth,
                             performance,
+                            udp_relay_ip,
                         )
                         .await
                     {
@@ -193,6 +195,7 @@ where
         context,
         proxy_auth,
         MppPerformanceConfig::default(),
+        IpAddr::V4(std::net::Ipv4Addr::LOCALHOST),
     )
     .await
 }
@@ -202,6 +205,7 @@ pub(super) async fn handle_socks5_client_stream_with_auth<S>(
     context: ClientPathContext,
     proxy_auth: ProxyAuthConfig,
     performance: MppPerformanceConfig,
+    udp_relay_ip: IpAddr,
 ) -> Result<(), RuntimeError>
 where
     S: AsyncRead + AsyncWrite + Unpin,
@@ -260,6 +264,7 @@ where
                 socks5::UdpAssociateRequest {
                     client_endpoint: request.target,
                 },
+                udp_relay_ip,
             )
             .await
         }
@@ -346,6 +351,7 @@ pub(super) async fn handle_socks5_udp_associate<S>(
     stream: &mut S,
     context: ClientPathContext,
     request: socks5::UdpAssociateRequest,
+    relay_ip: IpAddr,
 ) -> Result<(), RuntimeError>
 where
     S: AsyncRead + AsyncWrite + Unpin,
@@ -354,7 +360,7 @@ where
         return Err(RuntimeError::NoDatagramPath);
     }
     let client_endpoint = request.client_endpoint;
-    let relay_socket = UdpSocket::bind(SocketAddr::from(([127, 0, 0, 1], 0))).await?;
+    let relay_socket = UdpSocket::bind(socks5_udp_relay_bind_addr(relay_ip)).await?;
     let relay_addr = relay_socket.local_addr()?;
     stream
         .write_all(&socks5::connect_reply(Socks5Reply::Succeeded, relay_addr))
@@ -441,6 +447,12 @@ where
     drop(completion_tx);
     close_udp_edge_lanes(lanes).await;
     result
+}
+
+pub(super) fn socks5_udp_relay_bind_addr(control_ip: IpAddr) -> SocketAddr {
+    // The accepted TCP local address identifies the interface and family the
+    // client can already reach; UDP association must preserve that boundary.
+    SocketAddr::new(control_ip, 0)
 }
 
 pub(super) fn local_udp_buffer_len(mux_limits: MuxLimits) -> usize {

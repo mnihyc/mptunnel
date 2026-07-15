@@ -21,7 +21,7 @@ use crate::runtime::error::RuntimeError;
 use crate::runtime::path::ClientPathContext;
 use crate::runtime::path::commands::{
     ReliablePathCommand, ReliablePathCommandReceivers, recv_reliable_path_command,
-    reliable_path_command_channels,
+    reliable_path_command_channels, try_recv_reliable_path_priority_command,
 };
 use crate::runtime::relay::open::{OpenedRemoteStream, ReliableRelayOpenSpec};
 use crate::runtime::stream::{ReliablePathStream, ReliablePathStreamOutput};
@@ -72,6 +72,69 @@ fn opened_relay_stream_for_test(
         command_rx,
         frames_tx,
     )
+}
+
+fn path_proof_test_context() -> ClientPathContext {
+    let path = "tcp://127.0.0.1:11090"
+        .parse::<PathSpec>()
+        .expect("path-proof test path");
+    ClientPathContext::new(vec![path], security(), ResourceLimits::default())
+        .expect("path-proof test context")
+}
+
+#[test]
+fn failed_path_proof_enqueue_retries_without_sticking_validation() {
+    let stream_id = StreamId(106);
+    let context = path_proof_test_context();
+    let (opened, mut receivers, _frames) =
+        opened_relay_stream_for_test(stream_id, UnderlayProtocol::Tcp, 0);
+    opened
+        .stream()
+        .try_enqueue_request_control_frame(Frame::StreamAck {
+            stream_id,
+            complete: false,
+            ranges: Vec::new(),
+        })
+        .expect("fill priority queue");
+    let mut remotes = ReliableRelayRemoteSet::new(opened, 4);
+    remotes.paths[0].placement = crate::model::path::RelayPathPlacement::Validation;
+    remotes.paths[0].path_proof_id = None;
+    assert!(matches!(
+        try_recv_reliable_path_priority_command(&mut receivers),
+        Some(ReliablePathCommand::SendFrame(Frame::StreamAck { .. }))
+    ));
+
+    remotes.retry_pending_path_proofs(&context);
+
+    assert!(remotes.paths[0].path_proof_id.is_some());
+    assert!(matches!(
+        try_recv_reliable_path_priority_command(&mut receivers),
+        Some(ReliablePathCommand::SendFrame(Frame::PathProofData { .. }))
+    ));
+}
+
+#[test]
+fn queued_path_proof_keeps_one_identity_until_ack_or_path_failure() {
+    let stream_id = StreamId(108);
+    let context = path_proof_test_context();
+    let (opened, mut receivers, _frames) =
+        opened_relay_stream_for_test(stream_id, UnderlayProtocol::Tcp, 0);
+    let mut remotes = ReliableRelayRemoteSet::new(opened, 4);
+    remotes.paths[0].placement = crate::model::path::RelayPathPlacement::Validation;
+    remotes.paths[0].path_proof_id = Some(41);
+
+    remotes.retry_pending_path_proofs(&context);
+
+    assert_eq!(remotes.paths[0].path_proof_id, Some(41));
+    assert!(try_recv_reliable_path_priority_command(&mut receivers).is_none());
+
+    context.health().lock().expect("path health lock").tcp[0].invalidate_path_proofs();
+    remotes.retry_pending_path_proofs(&context);
+    assert_ne!(remotes.paths[0].path_proof_id, Some(41));
+    assert!(matches!(
+        try_recv_reliable_path_priority_command(&mut receivers),
+        Some(ReliablePathCommand::SendFrame(Frame::PathProofData { .. }))
+    ));
 }
 
 #[tokio::test]

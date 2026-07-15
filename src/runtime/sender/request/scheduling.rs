@@ -64,6 +64,14 @@ pub(super) enum BulkRelayPathChoice {
     NotApplicable,
 }
 
+/// Carrier-neutral outcome of ordinary request path ranking.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum ObservedOrdinaryPathChoice {
+    Selected(RelayPathInstance),
+    Blocked,
+    NoLivePath,
+}
+
 /// Immutable carrier evidence for one request scheduling decision.
 ///
 /// Queue credit and path health can change immediately after observation. The
@@ -97,6 +105,74 @@ impl RequestRelayPathObservation {
 
     fn instance(self) -> RelayPathInstance {
         self.instance
+    }
+}
+
+/// Chooses ordinary data from one immutable observation when no multipath
+/// admission transaction applies.
+pub(super) fn choose_observed_ordinary_data_path(
+    observation: &RequestRelaySchedulingObservation,
+    lane: FlowLane,
+    payload_bytes: usize,
+    cursor: usize,
+    avoid_keys: &[RelayPathKey],
+) -> ObservedOrdinaryPathChoice {
+    let has_active_path = observation
+        .paths
+        .iter()
+        .any(|path| path.placement == RelayPathPlacement::Active);
+    let allowed = |path: &&RequestRelayPathObservation| {
+        (!has_active_path || path.placement == RelayPathPlacement::Active)
+            && path.can_enqueue_stream_lane
+    };
+    let choose = |prefer_avoiding: bool| {
+        observation
+            .paths
+            .iter()
+            .enumerate()
+            .filter(|(_, path)| !prefer_avoiding || !avoid_keys.contains(&path.instance.key))
+            .filter(|(_, path)| allowed(path))
+            .filter_map(|(position, path)| {
+                let snapshot = path.shared_snapshot?;
+                let score = scheduler::score_path(
+                    snapshot,
+                    lane,
+                    payload_bytes,
+                    SchedulerPolicy::default(),
+                )?;
+                Some((
+                    path.instance,
+                    score.eta_ms,
+                    cyclic_cursor_distance(position, cursor, observation.paths.len()),
+                ))
+            })
+            .min_by(|left, right| {
+                left.1
+                    .total_cmp(&right.1)
+                    .then_with(|| left.2.cmp(&right.2))
+            })
+            .map(|(instance, _, _)| instance)
+    };
+    if let Some(instance) = choose(true).or_else(|| choose(false)) {
+        return ObservedOrdinaryPathChoice::Selected(instance);
+    }
+    let capacity_fallback = observation
+        .paths
+        .iter()
+        .filter(&allowed)
+        .find(|path| !avoid_keys.contains(&path.instance.key))
+        .or_else(|| observation.paths.iter().find(allowed));
+    if let Some(path) = capacity_fallback {
+        return ObservedOrdinaryPathChoice::Selected(path.instance);
+    }
+    if observation
+        .paths
+        .iter()
+        .any(|path| !has_active_path || path.placement == RelayPathPlacement::Active)
+    {
+        ObservedOrdinaryPathChoice::Blocked
+    } else {
+        ObservedOrdinaryPathChoice::NoLivePath
     }
 }
 

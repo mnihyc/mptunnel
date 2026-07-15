@@ -23,7 +23,7 @@ use crate::transport::PathSpec;
 use std::time::{Duration, Instant};
 use tokio::sync::mpsc;
 
-fn security() -> SecurityConfig {
+pub(super) fn security() -> SecurityConfig {
     SecurityConfig::encrypted(
         SharedSecret::new(b"0123456789abcdef0123456789abcdef".to_vec()).expect("secret"),
     )

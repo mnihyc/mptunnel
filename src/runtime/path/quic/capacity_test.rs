@@ -29,6 +29,34 @@ fn request_quic_capacity_test_context(path_count: usize) -> ClientPathContext {
         .expect("request QUIC capacity test context")
 }
 
+fn poison_request_quic_capacity_health(context: &ClientPathContext) {
+    let poisoned = context.clone();
+    assert!(
+        std::thread::spawn(move || {
+            let _guard = poisoned.health().lock().expect("path health lock");
+            panic!("poison path health for no-lock product ACK assertion");
+        })
+        .join()
+        .is_err()
+    );
+    assert!(context.health().is_poisoned());
+}
+
+#[test]
+fn product_ack_without_quic_transaction_skips_health_lock() {
+    let context = request_quic_capacity_test_context(1);
+    poison_request_quic_capacity_health(&context);
+    let now = Instant::now();
+
+    context.record_relay_path_product_ack(
+        StreamId(209),
+        udp_path_instance(0, 1),
+        PATH_OPEN_SCORE_BYTES,
+        now,
+        now + Duration::from_millis(1),
+    );
+}
+
 fn udp_path_instance(index: usize, id: u64) -> RelayPathInstance {
     RelayPathInstance {
         key: RelayPathKey {

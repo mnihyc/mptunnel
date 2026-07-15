@@ -32,6 +32,35 @@ fn tcp_path_test_context(path_count: usize) -> ClientPathContext {
 }
 
 #[test]
+fn stale_shared_load_snapshot_has_only_one_claim_winner() {
+    let context = tcp_path_test_context(1);
+    let key = RelayPathKey {
+        underlay: UnderlayProtocol::Tcp,
+        index: 0,
+    };
+
+    let first = context
+        .try_reserve_relay_path_load_if_unchanged(key, FlowLane::Throughput, 0, 0)
+        .expect("first exact snapshot claim");
+    assert!(
+        context
+            .try_reserve_relay_path_load_if_unchanged(key, FlowLane::Throughput, 0, 0)
+            .is_none(),
+        "a stale contender must rescore instead of sharing one idle candidate"
+    );
+    assert_eq!(
+        context.health().lock().expect("path health lock").tcp[0].active_flows,
+        1
+    );
+
+    drop(first);
+    assert_eq!(
+        context.health().lock().expect("path health lock").tcp[0].active_flows,
+        0
+    );
+}
+
+#[test]
 fn relay_path_load_lease_rolls_back_scheduler_demand_on_drop() {
     let context = tcp_path_test_context(1);
     let key = RelayPathKey {

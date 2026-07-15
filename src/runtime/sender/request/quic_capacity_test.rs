@@ -1,10 +1,10 @@
-use super::super::RequestSenderService;
 use super::super::test_support::*;
 use super::*;
 use crate::runtime::path::commands::{
     QuicCapacityProbeOwner, ReliablePathCommand, reliable_path_command_channels,
     try_recv_reliable_path_command,
 };
+use crate::runtime::stream::request::RequestStreamState;
 
 #[tokio::test]
 async fn request_quic_single_path_skips_health_lock() {
@@ -22,13 +22,20 @@ async fn request_quic_single_path_skips_health_lock() {
         8,
     );
     let service = remotes.active_path_instance().expect("Active Service");
-    let mut sender = RequestSenderService::new(stream_id);
-    sender.request.ordered_service = Some(service);
+    let mut request = RequestStreamState::default();
+    let mut controller = RequestQuicCapacityController::default();
+    request.ordered_service = Some(service);
     poison_client_path_health_for_test(&context);
 
-    sender.try_start_request_quic_capacity_calibration(&context, &remotes, FlowLane::Throughput);
+    controller.try_start(
+        stream_id,
+        &request,
+        &context,
+        &remotes,
+        FlowLane::Throughput,
+    );
 
-    assert!(sender.quic_capacity.active.is_none());
+    assert!(controller.active.is_none());
 }
 
 #[tokio::test]
@@ -116,9 +123,16 @@ async fn request_quic_capacity_skips_an_earlier_exhausted_path_share() {
         0
     );
 
-    let mut sender = RequestSenderService::new(stream_id);
-    sender.request.ordered_service = Some(service);
-    sender.try_start_request_quic_capacity_calibration(&context, &remotes, FlowLane::Throughput);
+    let mut request = RequestStreamState::default();
+    let mut controller = RequestQuicCapacityController::default();
+    request.ordered_service = Some(service);
+    controller.try_start(
+        stream_id,
+        &request,
+        &context,
+        &remotes,
+        FlowLane::Throughput,
+    );
 
     assert!(try_recv_reliable_path_command(&mut first_rx).is_none());
     let probe = match try_recv_reliable_path_command(&mut second_rx) {
@@ -175,16 +189,29 @@ async fn request_quic_train_waits_for_candidate_latency_pressure_to_clear() {
     context.health().lock().expect("path health lock").udp[candidate.key.index]
         .reserve_load(FlowLane::Latency);
 
-    let mut sender = RequestSenderService::new(stream_id);
-    sender.request.ordered_service = Some(service);
-    sender.try_start_request_quic_capacity_calibration(&context, &remotes, FlowLane::Throughput);
-    assert!(sender.quic_capacity.active.is_none());
-    assert!(sender.quic_capacity.attempted_paths.is_empty());
+    let mut request = RequestStreamState::default();
+    let mut controller = RequestQuicCapacityController::default();
+    request.ordered_service = Some(service);
+    controller.try_start(
+        stream_id,
+        &request,
+        &context,
+        &remotes,
+        FlowLane::Throughput,
+    );
+    assert!(controller.active.is_none());
+    assert!(controller.attempted_paths.is_empty());
 
     context.health().lock().expect("path health lock").udp[candidate.key.index]
         .release_load(FlowLane::Latency);
-    sender.try_start_request_quic_capacity_calibration(&context, &remotes, FlowLane::Throughput);
-    assert!(sender.quic_capacity.active.is_some());
+    controller.try_start(
+        stream_id,
+        &request,
+        &context,
+        &remotes,
+        FlowLane::Throughput,
+    );
+    assert!(controller.active.is_some());
     assert!(matches!(
         try_recv_reliable_path_command(&mut candidate_rx),
         Some(ReliablePathCommand::SendQuicCapacityProbe(_))

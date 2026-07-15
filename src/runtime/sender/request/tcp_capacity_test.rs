@@ -1,13 +1,14 @@
 use super::super::test_support::*;
-use super::super::{RequestPerFlowRateModel, RequestSenderService};
 use super::*;
 use crate::model::request::capacity::{
     request_capacity_stable_candidate_share_bytes, request_tcp_capacity_calibration_geometry,
 };
+use crate::model::request::evidence::RequestPerFlowRateModel;
 use crate::runtime::path::commands::{
     ReliablePathCommand, TcpCapacityProbeOwner, reliable_path_command_channels,
     try_recv_reliable_path_command,
 };
+use crate::runtime::stream::request::RequestStreamState;
 
 #[tokio::test]
 async fn request_tcp_capacity_batches_only_policy_eligible_sockets() {
@@ -58,10 +59,10 @@ async fn request_tcp_capacity_batches_only_policy_eligible_sockets() {
         rate_bps: 100_000_000.0,
         delivery_samples: RELIABLE_INITIAL_WINDOW_PACKETS as u32,
     };
-    let mut sender = RequestSenderService::new(stream_id);
-    sender.request.ordered_service = Some(service);
-    sender
-        .request
+    let mut request = RequestStreamState::default();
+    let mut controller = RequestTcpCapacityController::default();
+    request.ordered_service = Some(service);
+    request
         .subflows
         .get_mut(service)
         .set_per_flow_rate(service_model);
@@ -91,7 +92,13 @@ async fn request_tcp_capacity_batches_only_policy_eligible_sockets() {
         train_envelope,
     )
     .expect("second train geometry");
-    sender.try_start_request_tcp_capacity_calibration(&context, &remotes, FlowLane::Throughput);
+    controller.try_start(
+        stream_id,
+        &request,
+        &context,
+        &remotes,
+        FlowLane::Throughput,
+    );
 
     assert!(try_recv_reliable_path_command(&mut forbidden_rx).is_none());
     let first_probe = match try_recv_reliable_path_command(&mut first_rx) {
@@ -119,12 +126,12 @@ async fn request_tcp_capacity_batches_only_policy_eligible_sockets() {
         TcpCapacityProbeOwner::Request { path_instance, .. } if path_instance == second
     ));
     assert_eq!(
-        sender.tcp_capacity.attempted_paths,
+        controller.attempted_paths,
         HashSet::from([first.key.index, second.key.index])
     );
-    assert_eq!(sender.tcp_capacity.calibrations.len(), 2);
-    assert!(sender.tcp_capacity.calibrations.contains_key(&first));
-    assert!(sender.tcp_capacity.calibrations.contains_key(&second));
+    assert_eq!(controller.calibrations.len(), 2);
+    assert!(controller.calibrations.contains_key(&first));
+    assert!(controller.calibrations.contains_key(&second));
     assert_eq!(
         context.automatic_bulk_path_count(UnderlayProtocol::Tcp, Some(service.key.index)),
         2,
@@ -179,10 +186,10 @@ async fn request_tcp_capacity_flow_campaign_rejects_third_parallel_train() {
         rate_bps: 100_000_000.0,
         delivery_samples: RELIABLE_INITIAL_WINDOW_PACKETS as u32,
     };
-    let mut sender = RequestSenderService::new(stream_id);
-    sender.request.ordered_service = Some(service);
-    sender
-        .request
+    let mut request = RequestStreamState::default();
+    let mut controller = RequestTcpCapacityController::default();
+    request.ordered_service = Some(service);
+    request
         .subflows
         .get_mut(service)
         .set_per_flow_rate(service_model);
@@ -208,7 +215,13 @@ async fn request_tcp_capacity_flow_campaign_rejects_third_parallel_train() {
             > stable_share
     );
 
-    sender.try_start_request_tcp_capacity_calibration(&context, &remotes, FlowLane::Throughput);
+    controller.try_start(
+        stream_id,
+        &request,
+        &context,
+        &remotes,
+        FlowLane::Throughput,
+    );
 
     for (index, receiver) in candidate_receivers.iter_mut().enumerate() {
         let command = try_recv_reliable_path_command(receiver);
@@ -226,12 +239,12 @@ async fn request_tcp_capacity_flow_campaign_rejects_third_parallel_train() {
         }
     }
     assert_eq!(
-        sender.tcp_capacity.attempted_paths,
+        controller.attempted_paths,
         HashSet::from([candidates[0].key.index, candidates[1].key.index])
     );
-    assert_eq!(sender.tcp_capacity.calibrations.len(), 2);
+    assert_eq!(controller.calibrations.len(), 2);
     assert_eq!(
-        sender.tcp_capacity.campaign.remaining_bytes(stable_share),
+        controller.campaign.remaining_bytes(stable_share),
         stable_share - geometries[0].train_bytes - geometries[1].train_bytes
     );
     assert_eq!(
@@ -241,10 +254,16 @@ async fn request_tcp_capacity_flow_campaign_rejects_third_parallel_train() {
             - geometries[1].train_bytes,
         "rejected flow work must preserve the session envelope for later streams"
     );
-    let campaign_remaining = sender.tcp_capacity.campaign.remaining_bytes(stable_share);
+    let campaign_remaining = controller.campaign.remaining_bytes(stable_share);
     let session_remaining = context.request_tcp_capacity_probe_remaining_bytes();
 
-    sender.try_start_request_tcp_capacity_calibration(&context, &remotes, FlowLane::Throughput);
+    controller.try_start(
+        stream_id,
+        &request,
+        &context,
+        &remotes,
+        FlowLane::Throughput,
+    );
 
     assert!(
         candidate_receivers
@@ -253,7 +272,7 @@ async fn request_tcp_capacity_flow_campaign_rejects_third_parallel_train() {
         "repeated planning must not reopen rejected campaign work"
     );
     assert_eq!(
-        sender.tcp_capacity.campaign.remaining_bytes(stable_share),
+        controller.campaign.remaining_bytes(stable_share),
         campaign_remaining
     );
     assert_eq!(
@@ -261,7 +280,7 @@ async fn request_tcp_capacity_flow_campaign_rejects_third_parallel_train() {
         session_remaining
     );
     assert_eq!(
-        sender.tcp_capacity.attempted_paths,
+        controller.attempted_paths,
         HashSet::from([candidates[0].key.index, candidates[1].key.index]),
         "campaign rejection is not a path retirement decision"
     );
@@ -304,10 +323,10 @@ async fn request_tcp_stable_share_rejects_oversized_train_without_retiring_candi
         rate_bps: 100_000_000.0,
         delivery_samples: RELIABLE_INITIAL_WINDOW_PACKETS as u32,
     };
-    let mut sender = RequestSenderService::new(stream_id);
-    sender.request.ordered_service = Some(service);
-    sender
-        .request
+    let mut request = RequestStreamState::default();
+    let mut controller = RequestTcpCapacityController::default();
+    request.ordered_service = Some(service);
+    request
         .subflows
         .get_mut(service)
         .set_per_flow_rate(service_model);
@@ -341,11 +360,17 @@ async fn request_tcp_stable_share_rejects_oversized_train_without_retiring_candi
     );
     let session_remaining_before = context.request_tcp_capacity_probe_remaining_bytes();
 
-    sender.try_start_request_tcp_capacity_calibration(&context, &remotes, FlowLane::Throughput);
+    controller.try_start(
+        stream_id,
+        &request,
+        &context,
+        &remotes,
+        FlowLane::Throughput,
+    );
 
     assert!(try_recv_reliable_path_command(&mut candidate_rx).is_none());
-    assert!(sender.tcp_capacity.attempted_paths.is_empty());
-    assert!(sender.tcp_capacity.calibrations.is_empty());
+    assert!(controller.attempted_paths.is_empty());
+    assert!(controller.calibrations.is_empty());
     assert_eq!(
         context.request_tcp_capacity_probe_remaining_bytes(),
         session_remaining_before,

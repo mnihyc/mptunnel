@@ -1,6 +1,6 @@
 use super::{
-    RequestFlightLedger, RequestOutstandingWindow, RequestStartupState,
-    request_tcp_product_limit_for_turnover,
+    RequestAckClockOperation, RequestFlightLedger, RequestOutstandingWindow, RequestStartupState,
+    RequestStreamState, request_tcp_product_limit_for_turnover,
 };
 use crate::model::capacity::{PATH_OPEN_SCORE_BYTES, reliable_relay_buffer_len};
 use crate::model::multipath::FlowSubflowSet;
@@ -20,6 +20,51 @@ fn data_frame(offset: u64, len: usize) -> Frame {
         flags: StreamFlags::NONE,
         payload: Bytes::from(vec![0x5a; len]),
     }
+}
+
+#[test]
+fn service_epoch_reset_retains_attempted_and_graduated_instance_tombstones() {
+    let key = RelayPathKey {
+        underlay: UnderlayProtocol::Tcp,
+        index: 1,
+    };
+    let attempted = RelayPathInstance { key, id: 7 };
+    let graduated = RelayPathInstance { key, id: 8 };
+    let service = RelayPathInstance {
+        key: RelayPathKey {
+            underlay: UnderlayProtocol::Tcp,
+            index: 0,
+        },
+        id: 1,
+    };
+    let mut request = RequestStreamState::default();
+    request.startup.attempted_subflows.insert(attempted);
+    request.startup.attempted_subflows.insert(graduated);
+    request.subflows.get_mut(graduated).mark_graduated();
+    request.startup.epoch = Some(FlowSubflowSet::new(
+        0,
+        service,
+        256 * 1024,
+        0,
+        Duration::ZERO,
+    ));
+    request.ack_clock_operation = Some(RequestAckClockOperation::Pending {
+        service,
+        candidate: graduated,
+    });
+
+    request.reset_subflow_epoch();
+
+    assert!(request.startup.epoch.is_none());
+    assert!(request.startup.attempted_subflows.contains(&attempted));
+    assert!(request.startup.attempted_subflows.contains(&graduated));
+    assert!(
+        request
+            .subflows
+            .get(graduated)
+            .is_some_and(|state| state.graduated())
+    );
+    assert!(request.ack_clock_operation.is_none());
 }
 
 #[test]

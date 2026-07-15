@@ -52,13 +52,19 @@ wrappers that merely pass the same state between them.
   exact offset flights, ordered Service identity, startup epochs, ACK-clock
   operation, and per-instance evidence. This aggregate stays lock-free because
   one client relay task mutates it.
-- `src/runtime/sender/request.rs`: owns request preparation and apply. It
-  reconciles lifecycle state, captures observations, revalidates exact topology,
-  claims load, commits carrier enqueue, and then publishes product state.
+- `src/runtime/sender/request.rs`: is the relay-facing request facade. It owns
+  queue dispatch, carrier command enqueue, load-claim transfer, control output,
+  and recovery orchestration; it does not expose the serialized product state.
+- `src/runtime/sender/request/multipath.rs`: owns the request multipath
+  lifecycle transaction. It captures immutable observations, plans and
+  revalidates one exact-instance intent, and publishes product state only after
+  carrier enqueue succeeds. Failure invalidation, ACK/window effects, and send
+  cursor advancement remain serialized here.
 - `src/runtime/sender/request/scheduling.rs`: owns request path admission and
-  ranking over immutable, handle-free observations. TCP startup and ACK-clock
-  calibration remain distinct from QUIC native capacity below this shared
-  product policy.
+  ranking over immutable, handle-free observations. Its choices are
+  carrier-neutral values, not runtime errors or I/O actions. TCP startup and
+  ACK-clock calibration remain distinct from QUIC native capacity below this
+  shared product policy.
 - `src/runtime/sender/request/{tcp_capacity,quic_capacity}.rs`: own separate
   request-direction carrier capacity transactions. They share product intents,
   not controller state or proof semantics.

@@ -8,7 +8,7 @@ use super::session::TcpCapacityProbeSessionLease;
 #[cfg(feature = "lab-diagnostics")]
 use crate::lab_diagnostics::lab_diagnostic;
 use crate::model::capacity::QuicCapacityProofCandidate;
-use crate::model::path::{CarrierPathInstanceId, CarrierPathKey};
+use crate::model::path::{CarrierPathInstanceId, CarrierPathKey, next_carrier_path_instance_id};
 use crate::model::response::ResponsePathObservation;
 #[cfg(feature = "lab-diagnostics")]
 use crate::protocol::SessionId;
@@ -21,9 +21,7 @@ use crate::runtime::path::commands::{
 use crate::runtime::path::proof::enqueue_path_proof_frame;
 use crate::scheduler::{FlowLane, PathSnapshot};
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicU64, Ordering};
-
-static NEXT_SERVER_CARRIER_PATH_INSTANCE_ID: AtomicU64 = AtomicU64::new(1);
+use std::sync::atomic::Ordering;
 const RESPONSE_OWNER_TCP_SEEN: u8 = 1 << 0;
 const RESPONSE_OWNER_UDP_SEEN: u8 = 1 << 1;
 const RESPONSE_OWNER_MIXED_SEEN: u8 = RESPONSE_OWNER_TCP_SEEN | RESPONSE_OWNER_UDP_SEEN;
@@ -36,9 +34,7 @@ pub(super) fn response_owner_underlay_seen_bit(underlay: UnderlayProtocol) -> u8
 }
 
 pub(in crate::runtime) fn next_server_carrier_path_instance_id() -> CarrierPathInstanceId {
-    CarrierPathInstanceId::from_raw(
-        NEXT_SERVER_CARRIER_PATH_INSTANCE_ID.fetch_add(1, Ordering::AcqRel),
-    )
+    next_carrier_path_instance_id()
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

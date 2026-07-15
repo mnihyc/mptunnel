@@ -18,9 +18,9 @@ use crate::protocol::{
 use crate::runtime::error::RuntimeError;
 use crate::runtime::path::commands::ReliablePathCommandSender;
 use crate::runtime::path::server_context::ServerPathContext;
-use crate::runtime::stream::{
-    ServerCarrierPathRegistration, ServerReliablePathAttachment, ServerReliableStreamOpen,
-    ServerReliableStreamOpenRequest,
+use crate::runtime::path::{
+    ServerCarrierPathRegistration, ServerStreamOpenOutcome, ServerStreamOpenRequest,
+    ServerStreamPathAttachment,
 };
 use crate::scheduler::flow_lane_from_stream_demand_hint;
 use std::collections::HashSet;
@@ -57,33 +57,29 @@ impl ServerTcpStreamState {
         outbound::validate_target(&target)?;
         context.outbound.ensure_supports(TargetProtocol::Tcp)?;
         let lane = flow_lane_from_stream_demand_hint(demand);
-        let response = match context.reliable_streams.open_or_attach(
-            ServerReliableStreamOpenRequest {
+        let response = match context
+            .reliable_streams
+            .open_or_attach(ServerStreamOpenRequest {
                 session_id,
                 stream_id,
-                target: &target,
+                target,
                 lane,
-                attachment: ServerReliablePathAttachment {
+                attachment: ServerStreamPathAttachment {
                     path_registration: path_registration.clone(),
                     commands: commands.clone(),
                     max_frame_payload_bytes: reliable_relay_buffer_len(context.mux_limits),
                     role,
                     initial_metrics: startup_metrics,
                 },
-            },
-            context.mux_limits,
-        )? {
-            ServerReliableStreamOpen::New(accepted) => {
+                mux_limits: context.mux_limits,
+            })
+            .await?
+        {
+            ServerStreamOpenOutcome::New => {
                 self.attached.insert(stream_id);
-                if let Err(accepted) = context.reliable_streams.submit_accepted(accepted) {
-                    accepted.close().await;
-                    return Err(RuntimeError::Protocol(
-                        "server reliable stream service closed",
-                    ));
-                }
                 None
             }
-            ServerReliableStreamOpen::Existing => {
+            ServerStreamOpenOutcome::Existing => {
                 if role != StreamOpenRole::Validation {
                     self.attached.insert(stream_id);
                 }
@@ -108,8 +104,8 @@ impl ServerTcpStreamState {
                     ),
                 })
             }
-            ServerReliableStreamOpen::DuplicateLiveIgnored => None,
-            ServerReliableStreamOpen::Rejected => Some(Frame::StreamReset {
+            ServerStreamOpenOutcome::DuplicateLiveIgnored => None,
+            ServerStreamOpenOutcome::Rejected => Some(Frame::StreamReset {
                 stream_id,
                 reason: crate::protocol::ResetReason::Refused,
             }),

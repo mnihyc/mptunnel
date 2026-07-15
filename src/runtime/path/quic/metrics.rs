@@ -10,9 +10,9 @@ use crate::model::timing::{default_transport_pto, transport_pto_from_ms};
 #[cfg(feature = "lab-diagnostics")]
 use crate::protocol::SessionId;
 use crate::protocol::{PathId, PathMetricDirection, PathMetrics, UnderlayProtocol};
+use crate::runtime::path::ServerCarrierPathRegistration;
 use crate::runtime::path::model::{metric_epoch_now, ratio_to_ppm};
 use crate::runtime::path::server_context::ServerPathContext;
-use crate::runtime::stream::ServerCarrierPathRegistration;
 use crate::transport::quic as quic_transport;
 use std::time::{Duration, Instant};
 

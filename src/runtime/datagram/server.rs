@@ -4,8 +4,8 @@ use crate::mux::MuxLimits;
 use crate::outbound;
 use crate::protocol::{DatagramFlowId, DatagramId, Frame};
 use crate::runtime::error::RuntimeError;
+use crate::runtime::path::ServerRealtimeFlowLease;
 use crate::runtime::path::commands::ReliablePathCommandSender;
-use crate::runtime::stream::response::ServerRealtimeFlowRegistration;
 use crate::scheduler::FlowLane;
 use bytes::Bytes;
 use std::collections::VecDeque;
@@ -20,7 +20,7 @@ const OUTBOUND_UDP_RECV_BUFFER_BYTES: usize = u16::MAX as usize;
 pub(in crate::runtime) struct ServerDatagramFlow {
     pub(in crate::runtime) flow_id: DatagramFlowId,
     pub(in crate::runtime) requests: mpsc::Sender<ServerDatagramRequest>,
-    pub(in crate::runtime) _realtime_registration: ServerRealtimeFlowRegistration,
+    pub(in crate::runtime) _realtime_registration: ServerRealtimeFlowLease,
 }
 
 pub(in crate::runtime) struct ServerDatagramRequest {

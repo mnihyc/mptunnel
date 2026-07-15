@@ -16,7 +16,6 @@ mod server;
 
 #[cfg(test)]
 pub(super) use control::*;
-pub(in crate::runtime) use diagnostics::log_unexpected_stream_relay_frame;
 #[cfg(test)]
 pub(super) use flow::*;
 #[cfg(test)]

@@ -13,9 +13,9 @@ use super::metrics::run_server_quic_path_metrics;
 use super::server_stream::{ServerUdpReliableStreamContext, handle_server_udp_reliable_stream};
 use crate::protocol::{Frame, PathCapabilities, PathId, SessionId, UnderlayProtocol};
 use crate::runtime::error::RuntimeError;
+use crate::runtime::path::ServerCarrierPathRegistration;
 use crate::runtime::path::authentication::ServerPathAuthentication;
 use crate::runtime::path::server_context::ServerPathContext;
-use crate::runtime::stream::ServerCarrierPathRegistration;
 use crate::scheduler::{FlowLane, flow_lane_from_stream_demand_hint};
 use crate::transport::PathSpec;
 

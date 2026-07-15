@@ -11,6 +11,7 @@ use super::server_writer::ServerTcpWriter;
 use crate::lab_diagnostics::lab_diagnostic;
 use crate::protocol::{CloseReason, Frame, PathCapabilities, PathId, ResetReason, SessionId};
 use crate::runtime::error::RuntimeError;
+use crate::runtime::path::ServerCarrierPathRegistration;
 use crate::runtime::path::commands::{
     ReliablePathCommand, ReliablePathCommandReceivers, ReliablePathCommandSender,
     TcpCapacityProbeOwner, recv_reliable_path_command,
@@ -20,7 +21,6 @@ use crate::runtime::path::commands::{
     try_coalesce_reliable_path_writer_run, try_recv_reliable_path_command,
 };
 use crate::runtime::path::server_context::ServerPathContext;
-use crate::runtime::stream::ServerCarrierPathRegistration;
 use crate::transport::encrypted::EncryptedFramedTransportError;
 use std::time::Instant;
 use tokio::sync::mpsc;

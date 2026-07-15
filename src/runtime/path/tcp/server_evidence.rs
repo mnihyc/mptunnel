@@ -17,6 +17,7 @@ use crate::protocol::{
     Frame, PathId, PathMetricDirection, PathMetrics, SessionId, UnderlayProtocol,
 };
 use crate::runtime::error::RuntimeError;
+use crate::runtime::path::ServerCarrierPathRegistration;
 use crate::runtime::path::commands::{TcpCapacityProbeCommand, TcpCapacityProbeOwner};
 use crate::runtime::path::proof::{PathProofTracker, path_proof_ack_frame, path_proof_metrics};
 use crate::runtime::path::server_context::ServerPathContext;
@@ -24,7 +25,6 @@ use crate::runtime::path::tcp::capacity::{
     response_tcp_capacity_receipt_metrics, tcp_capacity_proof_validity,
     tcp_capacity_receipt_rate_bps,
 };
-use crate::runtime::stream::ServerCarrierPathRegistration;
 use std::time::Instant;
 
 pub(super) enum ServerTcpEvidenceOutcome {
@@ -319,6 +319,6 @@ impl ServerTcpEvidenceState {
     ) {
         context
             .reliable_streams
-            .record_path_metrics(path_registration, metrics);
+            .record_peer_path_metrics(path_registration, metrics);
     }
 }

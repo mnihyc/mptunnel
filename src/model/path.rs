@@ -4,7 +4,10 @@
 //! the carrier in model snapshots, intents, and exact-flight accounting.
 
 use crate::protocol::{PathId, UnderlayProtocol};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Instant;
+
+static NEXT_CARRIER_PATH_INSTANCE_ID: AtomicU64 = AtomicU64::new(1);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub(crate) struct RelayPathKey {
@@ -72,6 +75,11 @@ impl CarrierPathInstanceId {
     pub(crate) fn as_u64(self) -> u64 {
         self.0
     }
+}
+
+/// Allocates process-unique carrier lifetime identity across all path owners.
+pub(crate) fn next_carrier_path_instance_id() -> CarrierPathInstanceId {
+    CarrierPathInstanceId::from_raw(NEXT_CARRIER_PATH_INSTANCE_ID.fetch_add(1, Ordering::AcqRel))
 }
 
 #[cfg(test)]

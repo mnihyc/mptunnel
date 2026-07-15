@@ -27,13 +27,11 @@ use crate::runtime::path::commands::{
 };
 use crate::runtime::path::proof::{PathProofTracker, path_proof_ack_frame, path_proof_metrics};
 use crate::runtime::path::server_context::ServerPathContext;
-use crate::runtime::relay::log_unexpected_stream_relay_frame;
-use crate::runtime::stream::{
-    ServerCarrierPathRegistration, ServerReliablePathAttachment, ServerReliableStreamOpen,
-    ServerReliableStreamOpenRequest, ServerReliableStreamRegistry,
+use crate::runtime::path::{
+    ServerCarrierPathRegistration, ServerStreamOpenOutcome, ServerStreamOpenRequest,
+    ServerStreamPathAttachment, ServerStreamPort,
 };
 use crate::scheduler::{FlowLane, flow_lane_from_stream_demand_hint};
-use std::sync::Arc;
 
 pub(super) struct ServerUdpReliableStreamContext {
     pub(super) session_id: SessionId,
@@ -47,7 +45,7 @@ pub(super) struct ServerUdpReliableStreamContext {
 }
 
 struct ServerUdpReliableOutputDetachGuard {
-    registry: Arc<ServerReliableStreamRegistry>,
+    streams: ServerStreamPort,
     session_id: SessionId,
     stream_id: StreamId,
     path_id: PathId,
@@ -56,7 +54,7 @@ struct ServerUdpReliableOutputDetachGuard {
 
 impl Drop for ServerUdpReliableOutputDetachGuard {
     fn drop(&mut self) {
-        self.registry.detach_path(
+        self.streams.detach_path(
             self.session_id,
             self.stream_id,
             UnderlayProtocol::Udp,
@@ -90,19 +88,20 @@ pub(super) async fn handle_server_udp_reliable_stream(
         context.codec_limits,
     ));
     let _output_detach_guard = ServerUdpReliableOutputDetachGuard {
-        registry: context.reliable_streams.clone(),
+        streams: context.reliable_streams.clone(),
         session_id,
         stream_id,
         path_id,
         commands: commands_tx.clone(),
     };
-    match context.reliable_streams.open_or_attach(
-        ServerReliableStreamOpenRequest {
+    match context
+        .reliable_streams
+        .open_or_attach(ServerStreamOpenRequest {
             session_id,
             stream_id,
-            target: &target,
+            target: target.clone(),
             lane,
-            attachment: ServerReliablePathAttachment {
+            attachment: ServerStreamPathAttachment {
                 path_registration: path_registration.clone(),
                 commands: commands_tx.clone(),
                 max_frame_payload_bytes: udp_path_max_stream_payload_bytes(
@@ -112,18 +111,12 @@ pub(super) async fn handle_server_udp_reliable_stream(
                 role,
                 initial_metrics: context.local_path_startup_metrics(UnderlayProtocol::Udp, path_id),
             },
-        },
-        context.mux_limits,
-    )? {
-        ServerReliableStreamOpen::New(accepted) => {
-            if let Err(accepted) = context.reliable_streams.submit_accepted(accepted) {
-                accepted.close().await;
-                return Err(RuntimeError::Protocol(
-                    "server reliable stream service closed",
-                ));
-            }
-        }
-        ServerReliableStreamOpen::Existing => {
+            mux_limits: context.mux_limits,
+        })
+        .await?
+    {
+        ServerStreamOpenOutcome::New => {}
+        ServerStreamOpenOutcome::Existing => {
             context
                 .reliable_streams
                 .route_frame(
@@ -150,11 +143,11 @@ pub(super) async fn handle_server_udp_reliable_stream(
             )
             .await?;
         }
-        ServerReliableStreamOpen::DuplicateLiveIgnored => {
+        ServerStreamOpenOutcome::DuplicateLiveIgnored => {
             let _ = udp_path_finish_stream(&mut send);
             return Ok(());
         }
-        ServerReliableStreamOpen::Rejected => {
+        ServerStreamOpenOutcome::Rejected => {
             udp_path_write_frame(
                 &mut send,
                 &Frame::StreamReset {
@@ -375,7 +368,7 @@ async fn run_server_udp_reliable_stream_loop(
                         return Ok(());
                     }
                     Some(Ok(Frame::PathMetrics { metrics })) if metrics.path_id == path_id => {
-                        context.reliable_streams.record_path_metrics(
+                        context.reliable_streams.record_peer_path_metrics(
                             &path_registration,
                             metrics,
                         );
@@ -389,13 +382,14 @@ async fn run_server_udp_reliable_stream_loop(
                     })) if open_stream_id == stream_id && open_target == target =>
                     {
                         let updated_lane = flow_lane_from_stream_demand_hint(open_demand);
-                        match context.reliable_streams.open_or_attach(
-                            ServerReliableStreamOpenRequest {
+                        match context
+                            .reliable_streams
+                            .attach_existing(ServerStreamOpenRequest {
                                 session_id,
                                 stream_id,
-                                target: &target,
+                                target: target.clone(),
                                 lane: updated_lane,
-                                attachment: ServerReliablePathAttachment {
+                                attachment: ServerStreamPathAttachment {
                                     path_registration: path_registration.clone(),
                                     commands: commands_tx.clone(),
                                     max_frame_payload_bytes: udp_path_max_stream_payload_bytes(
@@ -406,10 +400,11 @@ async fn run_server_udp_reliable_stream_loop(
                                     initial_metrics: context
                                         .local_path_startup_metrics(UnderlayProtocol::Udp, path_id),
                                 },
-                            },
-                            context.mux_limits,
-                        )? {
-                            ServerReliableStreamOpen::Existing => {
+                                mux_limits: context.mux_limits,
+                            })
+                            .await?
+                        {
+                            ServerStreamOpenOutcome::Existing => {
                                 context
                                     .reliable_streams
                                     .route_frame(
@@ -436,17 +431,16 @@ async fn run_server_udp_reliable_stream_loop(
                                 )
                                 .await?;
                             }
-                            ServerReliableStreamOpen::New(accepted) => {
-                                accepted.close().await;
+                            ServerStreamOpenOutcome::New => {
                                 return Err(RuntimeError::Protocol(
                                     "QUIC UDP path reannouncement opened duplicate stream",
                                 ));
                             }
-                            ServerReliableStreamOpen::DuplicateLiveIgnored => {
+                            ServerStreamOpenOutcome::DuplicateLiveIgnored => {
                                 let _ = udp_path_finish_stream(&mut send);
                                 return Ok(());
                             }
-                            ServerReliableStreamOpen::Rejected => {
+                            ServerStreamOpenOutcome::Rejected => {
                                 udp_path_write_frame(
                                     &mut send,
                                     &Frame::StreamReset {
@@ -561,10 +555,10 @@ async fn run_server_udp_reliable_stream_loop(
                     }
                     Some(Ok(Frame::SessionClose { reason })) => return Err(RuntimeError::RemoteClosed(reason)),
                     Some(Ok(frame)) => {
-                        log_unexpected_stream_relay_frame(
-                            "server QUIC UDP path reliable",
-                            stream_id,
-                            &frame,
+                        eprintln!(
+                            "warning: unexpected server QUIC reliable carrier frame: stream_id={} frame_kind={}",
+                            stream_id.0,
+                            frame.kind_name(),
                         );
                         return Err(RuntimeError::Protocol("unexpected server QUIC UDP path reliable stream frame"));
                     }

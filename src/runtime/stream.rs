@@ -15,9 +15,9 @@ pub(in crate::runtime) use handle::{
     ReliablePathStream, ReliablePathStreamHandle, ReliablePathStreamOutput,
     reliable_work_lane_to_carrier_lane, wait_for_carrier_capacity_notifies,
 };
+#[cfg(test)]
+pub(in crate::runtime) use registry::ServerReliableStreamOpen;
 pub(in crate::runtime) use registry::{
     AcceptedServerReliableStream, AcceptedServerReliableStreamRetirement,
-    ServerCarrierPathRegistration, ServerReliablePathAttachment,
-    ServerReliableRegistryManagementSnapshot, ServerReliableStreamOpen,
-    ServerReliableStreamOpenRequest, ServerReliableStreamRegistry,
+    ServerReliableStreamRegistry,
 };

@@ -103,6 +103,7 @@ pub(super) fn new_identity_runtime_with_metadata(
         performance,
         mux_limits,
     );
+    let reliable_stream_port = reliable_streams.path_port();
     let paths = ServerPathContext {
         tag,
         route_target,
@@ -113,7 +114,7 @@ pub(super) fn new_identity_runtime_with_metadata(
         codec_limits: resources.into(),
         mux_limits,
         security,
-        reliable_streams,
+        reliable_streams: reliable_stream_port,
         path_join_replay: Arc::new(Mutex::new(RecentIdCache::new(
             path_join_replay_cache_capacity(resources.max_streams),
         ))),

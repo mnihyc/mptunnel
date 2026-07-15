@@ -8,9 +8,9 @@ use crate::config::{ManagementConfig, RouteTarget, RouteTargetKind};
 use crate::ingress::IngressConfig;
 use crate::protocol::{PathMetricDirection, UnderlayProtocol};
 use crate::runtime::error::RuntimeError;
+use crate::runtime::path::ServerStreamManagementSnapshot;
 use crate::runtime::path::model::{path_record_failure_cooldown, path_snapshot};
 use crate::runtime::path::{ClientPathContext, ClientPathHealthRecord, ServerPathContext};
-use crate::runtime::stream::ServerReliableRegistryManagementSnapshot;
 use crate::scheduler::{PathSnapshot, PathState as SchedulerPathState};
 use crate::transport::PathSpec;
 use serde::{Deserialize, Serialize};
@@ -1103,9 +1103,7 @@ struct ServerMetricStatus {
     data_sample_bytes: u64,
 }
 
-fn server_path_metrics(
-    registry: &ServerReliableRegistryManagementSnapshot,
-) -> Vec<ServerMetricStatus> {
+fn server_path_metrics(registry: &ServerStreamManagementSnapshot) -> Vec<ServerMetricStatus> {
     registry
         .path_metrics
         .iter()
@@ -1139,7 +1137,7 @@ fn server_path_metrics(
         .collect()
 }
 
-fn server_summary(registry: &ServerReliableRegistryManagementSnapshot) -> ManagementSummary {
+fn server_summary(registry: &ServerStreamManagementSnapshot) -> ManagementSummary {
     let mut summary = ManagementSummary {
         active_flows: registry.active_streams as u64,
         path_count: registry.path_metrics.len(),

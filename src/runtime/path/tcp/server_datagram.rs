@@ -10,9 +10,9 @@ use crate::runtime::datagram::{
     spawn_server_datagram_flow_worker,
 };
 use crate::runtime::error::RuntimeError;
+use crate::runtime::path::ServerRealtimeFlowLease;
 use crate::runtime::path::commands::ReliablePathCommandSender;
 use crate::runtime::path::server_context::ServerPathContext;
-use crate::runtime::stream::response::ServerRealtimeFlowRegistration;
 use tokio::sync::mpsc;
 
 pub(super) enum ServerTcpDatagramEffect {
@@ -22,7 +22,7 @@ pub(super) enum ServerTcpDatagramEffect {
     ReplyThenError {
         frame: Frame,
         error: RuntimeError,
-        registration: ServerRealtimeFlowRegistration,
+        registration: ServerRealtimeFlowLease,
     },
 }
 

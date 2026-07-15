@@ -9,6 +9,7 @@ use super::super::capacity::{
 };
 use crate::mux::MuxLimits;
 use crate::protocol::UnderlayProtocol;
+use smallvec::SmallVec;
 use std::time::{Duration, Instant};
 
 #[derive(Debug, Clone, Copy)]
@@ -78,6 +79,27 @@ impl RequestTcpAckTurnoverModel {
 pub(crate) struct RequestOwnerAckProgress<I> {
     pub(crate) instance: I,
     pub(crate) bytes: usize,
+}
+
+/// Product-authoritative evidence for growing one request source window.
+///
+/// TCP supplies a stable ACK-clock turnover projection; carriers with native
+/// delivery timing supply exact product-owner credits over one bounded epoch.
+/// The source-window owner applies either form without inspecting path models.
+#[derive(Debug)]
+pub(crate) enum RequestWindowGrowthEvidence<I> {
+    None,
+    OwnerAckCredits {
+        service: I,
+        credits: SmallVec<[RequestOwnerAckProgress<I>; 4]>,
+        growth_interval: Duration,
+        observed_at: Instant,
+    },
+    AckClockTurnover {
+        service: I,
+        turnover_bytes: usize,
+        observed_at: Instant,
+    },
 }
 
 impl RequestPathRateEvidence {

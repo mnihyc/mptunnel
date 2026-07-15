@@ -29,12 +29,12 @@ use crate::model::path::{
 };
 use crate::model::request::evidence::{
     RequestOwnerAckProgress, RequestPathRateEvidenceUpdate, RequestPerFlowRateModel,
-    RequestTcpAckTurnoverModel, request_path_rate_coverage_floor_bytes,
-    request_tcp_candidate_turnover_authorized,
+    RequestTcpAckTurnoverModel, RequestWindowGrowthEvidence,
+    request_path_rate_coverage_floor_bytes, request_tcp_candidate_turnover_authorized,
 };
 use crate::model::timing::transport_pto_from_snapshot;
 use crate::mux::MuxLimits;
-use crate::mux::stream::{ReliableRecvStream, ReliableSendStream};
+use crate::mux::stream::{AckOutcome, ReliableRecvStream, ReliableSendStream};
 #[cfg(feature = "lab-diagnostics")]
 use crate::protocol::frame::{reliable_path_frame_pacing_bytes, stream_ack_contiguous_frontier};
 use crate::protocol::frame::{reliable_stream_frame_accounted_bytes, reliable_stream_frame_extent};
@@ -322,6 +322,11 @@ pub(in crate::runtime) enum ClientQueuedDispatch {
     Repair { payload_bytes: usize },
     RepairDeferred,
     PersistentRepairCancelled,
+}
+
+pub(in crate::runtime) struct RequestProductAckOutcome {
+    pub(in crate::runtime) mux: AckOutcome,
+    pub(in crate::runtime) window: RequestWindowGrowthEvidence<RelayPathInstance>,
 }
 
 #[derive(Debug)]
@@ -2323,10 +2328,96 @@ impl RequestSenderService {
         let _ = self.release_normalized_acked_ranges_with_owner_progress(context, ranges);
     }
 
+    /// Advances the complete request product-ACK transaction once.
+    ///
+    /// Unique mux bytes, every transmitted flight copy, and exact OwnerData
+    /// evidence are distinct accounting domains. This owner advances them in
+    /// order and returns one neutral source-window effect.
+    pub(in crate::runtime) fn apply_request_product_ack(
+        &mut self,
+        context: &ClientPathContext,
+        remotes: &ReliableRelayRemoteSet,
+        send_stream: &mut ReliableSendStream,
+        ranges: &[OffsetRange],
+    ) -> RequestProductAckOutcome {
+        #[cfg(feature = "lab-diagnostics")]
+        let mux_started = Instant::now();
+        let mux = send_stream.apply_normalized_ack(ranges);
+        #[cfg(feature = "lab-diagnostics")]
+        lab_perf_record("mux.apply_ack", mux_started.elapsed(), mux.released_bytes);
+        if mux.released_bytes > 0 {
+            self.record_owner_progress(mux.released_bytes);
+        }
+        let acked_at = Instant::now();
+        let mut owner_progress =
+            self.release_normalized_acked_ranges_with_owner_progress_at(context, ranges, acked_at);
+        let window = self
+            .request
+            .ordered_service
+            .filter(|service| remotes.contains_path_instance(*service))
+            .map_or(RequestWindowGrowthEvidence::None, |service| {
+                match service.key.underlay {
+                    UnderlayProtocol::Tcp => {
+                        let owner_capable = owner_progress.iter().any(|progress| {
+                            self.request_owner_ack_can_grow_window(
+                                remotes,
+                                Some(service),
+                                progress.instance,
+                            )
+                        });
+                        if !owner_capable {
+                            RequestWindowGrowthEvidence::None
+                        } else {
+                            RequestWindowGrowthEvidence::AckClockTurnover {
+                                service,
+                                turnover_bytes: self.request_tcp_owner_ack_turnover_bytes(
+                                    remotes,
+                                    Some(service),
+                                    acked_at,
+                                ),
+                                observed_at: acked_at,
+                            }
+                        }
+                    }
+                    UnderlayProtocol::Udp => {
+                        owner_progress.retain(|progress| {
+                            self.request_owner_ack_can_grow_window(
+                                remotes,
+                                Some(service),
+                                progress.instance,
+                            )
+                        });
+                        if owner_progress.is_empty() {
+                            RequestWindowGrowthEvidence::None
+                        } else {
+                            let snapshot = context.reliable_path_snapshot(service.key);
+                            RequestWindowGrowthEvidence::OwnerAckCredits {
+                                service,
+                                credits: owner_progress,
+                                growth_interval: transport_pto_from_snapshot(snapshot),
+                                observed_at: acked_at,
+                            }
+                        }
+                    }
+                }
+            });
+        RequestProductAckOutcome { mux, window }
+    }
+
+    #[cfg(test)]
     pub(in crate::runtime) fn release_normalized_acked_ranges_with_owner_progress(
         &mut self,
         context: &ClientPathContext,
         ranges: &[OffsetRange],
+    ) -> smallvec::SmallVec<[RequestOwnerAckProgress<RelayPathInstance>; 4]> {
+        self.release_normalized_acked_ranges_with_owner_progress_at(context, ranges, Instant::now())
+    }
+
+    fn release_normalized_acked_ranges_with_owner_progress_at(
+        &mut self,
+        context: &ClientPathContext,
+        ranges: &[OffsetRange],
+        acked_at: Instant,
     ) -> smallvec::SmallVec<[RequestOwnerAckProgress<RelayPathInstance>; 4]> {
         let startup_owner = self
             .request
@@ -2343,7 +2434,6 @@ impl RequestSenderService {
                 startup_owner.and_then(|owner| epoch.startup_owner_sealed_sample_bytes(owner))
             })
             .unwrap_or(u64::MAX);
-        let acked_at = Instant::now();
         let mut ordinary_owner_samples =
             HashMap::<RelayPathInstance, (u64, Instant, Instant)>::new();
         let mut owner_progress =

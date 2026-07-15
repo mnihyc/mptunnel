@@ -59,7 +59,7 @@ use crate::runtime::stream::wait_for_carrier_capacity_notifies;
 use crate::scheduler::{FlowLane, PathSnapshot};
 use bytes::Bytes;
 use std::collections::{HashMap, HashSet};
-use std::time::{Duration, Instant};
+use std::time::Instant;
 use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt};
 use tokio::sync::mpsc;
 
@@ -80,16 +80,6 @@ fn reliable_relay_request_outstanding_headroom_bytes(
             .repair_bytes()
             .saturating_add(sender_queue.data_bytes()),
     )
-}
-
-fn reliable_relay_request_ack_growth_interval(
-    service_instance: RelayPathInstance,
-    context: &ClientPathContext,
-) -> Duration {
-    context
-        .reliable_path_snapshot(service_instance.key)
-        .map(|snapshot| transport_pto_from_snapshot(Some(snapshot)))
-        .unwrap_or_else(|| transport_pto_from_snapshot(None))
 }
 
 fn reliable_tcp_service_request_bulk_flow_is_active(
@@ -1750,70 +1740,18 @@ where
                         );
                         #[cfg(feature = "lab-diagnostics")]
                         let previous_repair_bytes = send_stream.repair_bytes();
-                        #[cfg(feature = "lab-diagnostics")]
-                        let mux_started = Instant::now();
-                        let ack = send_stream.apply_normalized_ack(&normalized_ranges);
-                        if ack.released_bytes > 0 {
-                            sender.record_owner_progress(ack.released_bytes);
-                        }
-                        #[cfg(feature = "lab-diagnostics")]
-                        lab_perf_record("mux.apply_ack", mux_started.elapsed(), ack.released_bytes);
-                        let owner_progress = sender
-                            .release_normalized_acked_ranges_with_owner_progress(
-                                context,
-                                &normalized_ranges,
-                            );
-                        let service_instance = request_outstanding_window
-                            .resolved_service_instance(
-                                sender
-                                    .request_ordered_service_instance()
-                                    .filter(|service| remotes.contains_path_instance(*service)),
-                                remotes.active_path_instance(),
-                            );
-                        let udp_growth_interval = service_instance
-                            .filter(|service| service.key.underlay == UnderlayProtocol::Udp)
-                            .map(|service| {
-                                reliable_relay_request_ack_growth_interval(service, context)
-                            });
-                        let mut tcp_owner_progress = false;
-                        for progress in owner_progress {
-                            let owner_capable = sender.request_owner_ack_can_grow_window(
-                                &remotes,
-                                service_instance,
-                                progress.instance,
-                            );
-                            if service_instance.is_some_and(|service| {
-                                service.key.underlay == UnderlayProtocol::Tcp
-                            }) {
-                                tcp_owner_progress |= owner_capable;
-                            } else {
-                                // QUIC keeps product-ACK turnover separate from
-                                // its native packet ACK and congestion model.
-                                request_outstanding_window.record_acked(
-                                    progress.bytes,
-                                    progress.instance,
-                                    service_instance,
-                                    owner_capable,
-                                    relay_lane,
-                                    udp_growth_interval
-                                        .unwrap_or_else(|| transport_pto_from_snapshot(None)),
-                                    context.mux_limits,
-                                );
-                            }
-                        }
-                        if tcp_owner_progress {
-                            let turnover_bytes = sender.request_tcp_owner_ack_turnover_bytes(
-                                &remotes,
-                                service_instance,
-                                Instant::now(),
-                            );
-                            request_outstanding_window.record_tcp_ack_clock_turnover(
-                                turnover_bytes,
-                                service_instance,
-                                relay_lane,
-                                context.mux_limits,
-                            );
-                        }
+                        let ack_outcome = sender.apply_request_product_ack(
+                            context,
+                            &remotes,
+                            &mut send_stream,
+                            &normalized_ranges,
+                        );
+                        let ack = ack_outcome.mux;
+                        request_outstanding_window.apply_growth_evidence(
+                            ack_outcome.window,
+                            relay_lane,
+                            context.mux_limits,
+                        );
                         sender_queue.release_normalized_acked_repairs(&normalized_ranges);
                         let base_repair_limit = adaptive_reliable_relay_repair_bytes(
                             path_snapshot,

@@ -31,6 +31,11 @@ contract as same-family multipath placement.
 
 ## Code owners
 
+A source module exists only when it owns a durable capability, state machine,
+or invariant. File size alone is not a boundary: keep small helpers beside the
+behavior they explain, and prefer one cohesive flat module to several shallow
+wrappers that merely pass the same state between them.
+
 - `src/ingress/`: accepts local SOCKS5, HTTP CONNECT, and TUN traffic. It owns
   ingress parsing, not multipath placement.
 - `src/outbound/`: opens the remote target or upstream proxy. It owns target
@@ -104,6 +109,12 @@ numeric path ID is not enough to inherit flights, leases, or proof from a dead
 connection. Stream attachment role and carrier instance lifetime are separate:
 closing the last product stream must not silently reset a live carrier's
 session-wide probe budget.
+
+Request `STREAM_ACK` advances one ordered product transaction: release unique
+mux bytes, release every exact transmitted copy, and derive exact OwnerData
+evidence. It returns a carrier-neutral source-window effect. The relay owns
+applying that effect and scheduling repair, so it never reconstructs path-owner
+eligibility from partially updated sender state.
 
 QUIC capacity proof is a transaction:
 

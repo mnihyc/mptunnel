@@ -11,6 +11,7 @@ use crate::model::multipath::{FlowSubflowSet, PathAdmissionDecision, SubflowAdmi
 use crate::model::path::{RelayPathInstance, RelayPathKey};
 use crate::model::request::evidence::{
     RequestPathRateEvidence, RequestPerFlowRateModel, RequestTcpAckTurnoverModel,
+    RequestWindowGrowthEvidence,
 };
 use crate::model::work::CarrierWorkKind;
 use crate::mux::MuxLimits;
@@ -401,6 +402,48 @@ impl RequestOutstandingWindow {
         })
     }
 
+    /// Applies one product-owner decision without reading scheduler or path state.
+    pub(in crate::runtime) fn apply_growth_evidence(
+        &mut self,
+        evidence: RequestWindowGrowthEvidence<RelayPathInstance>,
+        lane: crate::scheduler::FlowLane,
+        mux_limits: MuxLimits,
+    ) {
+        match evidence {
+            RequestWindowGrowthEvidence::None => {}
+            RequestWindowGrowthEvidence::OwnerAckCredits {
+                service,
+                credits,
+                growth_interval,
+                observed_at,
+            } => {
+                for credit in credits {
+                    self.record_acked_at(
+                        credit.bytes,
+                        credit.instance,
+                        Some(service),
+                        true,
+                        lane,
+                        growth_interval,
+                        mux_limits,
+                        observed_at,
+                    );
+                }
+            }
+            RequestWindowGrowthEvidence::AckClockTurnover {
+                service,
+                turnover_bytes,
+                observed_at,
+            } => self.record_tcp_ack_clock_turnover_at(
+                turnover_bytes,
+                Some(service),
+                lane,
+                mux_limits,
+                observed_at,
+            ),
+        }
+    }
+
     fn limit_bytes_at(
         &mut self,
         service_instance: Option<RelayPathInstance>,
@@ -444,28 +487,6 @@ impl RequestOutstandingWindow {
             self.acked_in_epoch = 0;
         }
         self.product_limit_bytes.min(resource_ceiling).max(1)
-    }
-
-    pub(in crate::runtime) fn record_acked(
-        &mut self,
-        released_bytes: usize,
-        owner_instance: RelayPathInstance,
-        service_instance: Option<RelayPathInstance>,
-        owner_capable: bool,
-        lane: crate::scheduler::FlowLane,
-        growth_interval: Duration,
-        mux_limits: MuxLimits,
-    ) {
-        self.record_acked_at(
-            released_bytes,
-            owner_instance,
-            service_instance,
-            owner_capable,
-            lane,
-            growth_interval,
-            mux_limits,
-            Instant::now(),
-        );
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -523,12 +544,30 @@ impl RequestOutstandingWindow {
         self.acked_in_epoch = 0;
     }
 
+    #[cfg(test)]
     pub(in crate::runtime) fn record_tcp_ack_clock_turnover(
         &mut self,
         turnover_bytes: usize,
         service_instance: Option<RelayPathInstance>,
         lane: crate::scheduler::FlowLane,
         mux_limits: MuxLimits,
+    ) {
+        self.record_tcp_ack_clock_turnover_at(
+            turnover_bytes,
+            service_instance,
+            lane,
+            mux_limits,
+            Instant::now(),
+        );
+    }
+
+    fn record_tcp_ack_clock_turnover_at(
+        &mut self,
+        turnover_bytes: usize,
+        service_instance: Option<RelayPathInstance>,
+        lane: crate::scheduler::FlowLane,
+        mux_limits: MuxLimits,
+        observed_at: Instant,
     ) {
         let Some(service_instance) = service_instance else {
             return;
@@ -555,7 +594,7 @@ impl RequestOutstandingWindow {
         );
         if next_limit > self.product_limit_bytes {
             self.product_limit_bytes = next_limit;
-            self.growth_epoch_at = Instant::now();
+            self.growth_epoch_at = observed_at;
             self.acked_in_epoch = 0;
         }
     }

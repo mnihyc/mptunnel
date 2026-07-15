@@ -5,10 +5,12 @@ use super::{
 use crate::model::capacity::{PATH_OPEN_SCORE_BYTES, reliable_relay_buffer_len};
 use crate::model::multipath::FlowSubflowSet;
 use crate::model::path::{RelayPathInstance, RelayPathKey};
+use crate::model::request::evidence::{RequestOwnerAckProgress, RequestWindowGrowthEvidence};
 use crate::mux::MuxLimits;
 use crate::protocol::{Frame, OffsetRange, StreamFlags, StreamId, UnderlayProtocol};
 use crate::scheduler::FlowLane;
 use bytes::Bytes;
+use smallvec::smallvec;
 use std::time::{Duration, Instant};
 
 fn data_frame(offset: u64, len: usize) -> Frame {
@@ -365,9 +367,12 @@ fn tcp_request_outstanding_limit_preserves_classifier_reservoir_and_ack_growth()
         ),
         4 * 1024 * 1024
     );
-    window.record_tcp_ack_clock_turnover(
-        2 * 1024 * 1024,
-        Some(tcp),
+    window.apply_growth_evidence(
+        RequestWindowGrowthEvidence::AckClockTurnover {
+            service: tcp,
+            turnover_bytes: 2 * 1024 * 1024,
+            observed_at: promoted_at,
+        },
         FlowLane::Throughput,
         mux_limits,
     );
@@ -484,15 +489,18 @@ fn udp_request_outstanding_limit_uses_service_reservoir_then_product_ack_growth(
         4 * 1024 * 1024,
         "QUIC carrier capacity must not bypass the staged product window"
     );
-    window.record_acked_at(
-        2 * 1024 * 1024,
-        udp,
-        Some(udp),
-        true,
+    window.apply_growth_evidence(
+        RequestWindowGrowthEvidence::OwnerAckCredits {
+            service: udp,
+            credits: smallvec![RequestOwnerAckProgress {
+                instance: udp,
+                bytes: 2 * 1024 * 1024,
+            }],
+            growth_interval: Duration::from_secs(1),
+            observed_at: now + Duration::from_millis(1),
+        },
         FlowLane::Throughput,
-        Duration::from_secs(1),
         mux_limits,
-        now + Duration::from_millis(1),
     );
     assert_eq!(
         window.limit_bytes_at(

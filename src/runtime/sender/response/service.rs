@@ -41,10 +41,6 @@ use crate::scheduler::{FlowLane, PathSnapshot};
 use bytes::Bytes;
 use std::time::Instant;
 
-#[cfg(test)]
-#[path = "service_test.rs"]
-mod tests;
-
 #[derive(Debug)]
 /// Current server response sender-service boundary.
 ///
@@ -673,3 +669,7 @@ impl ServerResponseSenderService {
         })
     }
 }
+
+#[cfg(test)]
+#[path = "service_test.rs"]
+mod tests;

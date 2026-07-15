@@ -6,10 +6,6 @@
 //! path without a product-flight envelope is not a complete protocol state.
 //! Ranking and mutable stream commits remain outside this module.
 
-#[cfg(test)]
-#[path = "admission_test.rs"]
-mod tests;
-
 use crate::model::admission::{
     BulkAdmissionCheck, BulkAdmissionRole, bulk_active_service_product_envelope_bytes,
     bulk_additional_admission_role, bulk_candidate_admission_suppression_with_completion_backlog,
@@ -821,3 +817,7 @@ pub(super) fn response_quic_carrier_feed_credit_bytes(
         .max(reliable_bulk_carrier_feed_quantum_bytes(mux_limits))
         .max(payload_bytes)
 }
+
+#[cfg(test)]
+#[path = "admission_test.rs"]
+mod tests;

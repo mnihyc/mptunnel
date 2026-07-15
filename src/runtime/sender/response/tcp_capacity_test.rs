@@ -9,8 +9,8 @@ fn tcp_capacity_probe_does_not_wait_for_product_subflow_graduation() {
     let mux_limits = MuxLimits::default();
     let mut service = response_target(0, UnderlayProtocol::Tcp, 20.0, 0, 64 * 1024, true);
     let mut cold = response_target(1, UnderlayProtocol::Tcp, 80.0, 0, 64 * 1024, false);
-    service.has_bulk_rate_evidence = false;
-    cold.has_bulk_rate_evidence = false;
+    service.observation.has_bulk_rate_evidence = false;
+    cold.observation.has_bulk_rate_evidence = false;
     let (cold_commands, _cold_receivers) = reliable_path_command_channels(4);
     cold.commands = cold_commands;
 
@@ -18,23 +18,23 @@ fn tcp_capacity_probe_does_not_wait_for_product_subflow_graduation() {
         select_response_tcp_capacity_probe_target(
             &[service.clone(), cold.clone()],
             FlowLane::Throughput,
-            Some(service.key),
+            Some(service.observation.key),
             ResponseServiceFamilyLoads::default(),
             mux_limits,
         )
         .is_none()
     );
 
-    service.has_bulk_rate_evidence = true;
+    service.observation.has_bulk_rate_evidence = true;
     let (selected, train_bytes) = select_response_tcp_capacity_probe_target(
         &[service.clone(), cold.clone()],
         FlowLane::Throughput,
-        Some(service.key),
+        Some(service.observation.key),
         ResponseServiceFamilyLoads::default(),
         mux_limits,
     )
     .expect("proven Service opens offset-free discovery");
-    assert_eq!(selected.key, cold.key);
+    assert_eq!(selected.observation.key, cold.observation.key);
     assert_eq!(train_bytes, 2 * 1024 * 1024);
 
     let udp = response_target(2, UnderlayProtocol::Udp, 10.0, 0, 64 * 1024, false);
@@ -42,7 +42,7 @@ fn tcp_capacity_probe_does_not_wait_for_product_subflow_graduation() {
         select_response_tcp_capacity_probe_target(
             &[service.clone(), cold, udp],
             FlowLane::Throughput,
-            Some(service.key),
+            Some(service.observation.key),
             ResponseServiceFamilyLoads::new(2, 0),
             mux_limits,
         )
@@ -56,18 +56,18 @@ fn endpoint_only_response_calibration_uses_service_only_as_opportunity_prior() {
     let mux_limits = MuxLimits::default();
     let payload_bytes = reliable_bulk_carrier_feed_quantum_bytes(mux_limits);
     let mut service = response_target(0, UnderlayProtocol::Tcp, 600.0, 0, 16 * 1024 * 1024, true);
-    service.snapshot.delivery_rate_bps = 128_000_000.0;
-    service.snapshot.pacing_rate_bps = 128_000_000.0;
-    service.snapshot.srtt_ms = 333.0;
-    service.snapshot.min_rtt_ms = 333.0;
+    service.observation.snapshot.delivery_rate_bps = 128_000_000.0;
+    service.observation.snapshot.pacing_rate_bps = 128_000_000.0;
+    service.observation.snapshot.srtt_ms = 333.0;
+    service.observation.snapshot.min_rtt_ms = 333.0;
 
     let mut candidate =
         response_target(1, UnderlayProtocol::Tcp, 570.0, 0, 16 * 1024 * 1024, false);
-    candidate.snapshot.delivery_rate_bps = 2_500_000.0;
-    candidate.snapshot.pacing_rate_bps = 2_500_000.0;
-    candidate.snapshot.srtt_ms = 722.0;
-    candidate.snapshot.min_rtt_ms = 722.0;
-    candidate.snapshot.app_limited = true;
+    candidate.observation.snapshot.delivery_rate_bps = 2_500_000.0;
+    candidate.observation.snapshot.pacing_rate_bps = 2_500_000.0;
+    candidate.observation.snapshot.srtt_ms = 722.0;
+    candidate.observation.snapshot.min_rtt_ms = 722.0;
+    candidate.observation.snapshot.app_limited = true;
     candidate.endpoint_only_service_prior_eligible = true;
     candidate.ack_clock_calibration_eligible = true;
     candidate.ack_clock_calibration_credit_limit_bytes = 452_124;
@@ -83,11 +83,14 @@ fn endpoint_only_response_calibration_uses_service_only_as_opportunity_prior() {
     assert!(borrowed);
     assert_eq!(
         effective.delivery_rate_bps,
-        service.snapshot.delivery_rate_bps
+        service.observation.snapshot.delivery_rate_bps
     );
     assert_eq!(effective.rate_scope, PathRateScope::PathCapacity);
-    assert!(effective_eta_ms < candidate.eta_ms);
-    assert_eq!(candidate.snapshot.delivery_rate_bps, 2_500_000.0);
+    assert!(effective_eta_ms < candidate.observation.eta_ms);
+    assert_eq!(
+        candidate.observation.snapshot.delivery_rate_bps,
+        2_500_000.0
+    );
 
     let all_targets = [service.clone(), candidate.clone()];
     let targets = all_targets.iter().collect::<Vec<_>>();
@@ -95,7 +98,7 @@ fn endpoint_only_response_calibration_uses_service_only_as_opportunity_prior() {
         &all_targets,
         &targets,
         FlowLane::Throughput,
-        service.key,
+        service.observation.key,
         0,
         payload_bytes,
         mux_limits,
@@ -105,7 +108,7 @@ fn endpoint_only_response_calibration_uses_service_only_as_opportunity_prior() {
         &mut Vec::new(),
     )
     .expect("the endpoint-only candidate should receive bounded calibration work");
-    assert_eq!(selected.target.key, candidate.key);
+    assert_eq!(selected.target.observation.key, candidate.observation.key);
     assert_eq!(
         (
             selected.commit.limit_bytes,
@@ -153,8 +156,8 @@ fn endpoint_only_response_calibration_uses_service_only_as_opportunity_prior() {
             configured_borrowed,
         ),
         (
-            candidate.snapshot.delivery_rate_bps,
-            candidate.eta_ms,
+            candidate.observation.snapshot.delivery_rate_bps,
+            candidate.observation.eta_ms,
             false,
         ),
     );
@@ -165,7 +168,7 @@ fn endpoint_only_response_calibration_uses_service_only_as_opportunity_prior() {
             &configured_targets,
             &configured_refs,
             FlowLane::Throughput,
-            service.key,
+            service.observation.key,
             0,
             payload_bytes,
             mux_limits,

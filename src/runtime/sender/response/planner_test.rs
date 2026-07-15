@@ -329,11 +329,11 @@ fn response_calibration_retirement_request(
         .sender_path_targets(FlowLane::Throughput, payload_bytes);
     let service = targets
         .iter()
-        .find(|target| target.key == fixture.service)
+        .find(|target| target.observation.key == fixture.service)
         .expect("Service target");
     let candidate = targets
         .iter()
-        .find(|target| target.key == fixture.candidate)
+        .find(|target| target.observation.key == fixture.candidate)
         .expect("calibration target");
     let (expected_planner_generation, _) = fixture.binding.subflow_state_snapshot();
     let expected_lane_generation = fixture
@@ -344,12 +344,12 @@ fn response_calibration_retirement_request(
         expected_planner_generation,
         expected_lane_generation,
         expected_model_generation: fixture.binding.response_model_generation(),
-        service: service.key,
-        service_incarnation: service.incarnation,
-        service_pending_bytes: service.command_pending_bytes,
-        target: candidate.key,
-        target_incarnation: candidate.incarnation,
-        target_pending_bytes: candidate.command_pending_bytes,
+        service: service.observation.key,
+        service_incarnation: service.observation.incarnation,
+        service_pending_bytes: service.observation.command_pending_bytes,
+        target: candidate.observation.key,
+        target_incarnation: candidate.observation.incarnation,
+        target_pending_bytes: candidate.observation.command_pending_bytes,
         limit_bytes: candidate.ack_clock_calibration_credit_limit_bytes,
     }
 }
@@ -357,11 +357,11 @@ fn response_calibration_retirement_request(
 #[test]
 fn repair_target_requires_active_or_bulk_rate_evidence() {
     let mut proof_only = response_target(1, UnderlayProtocol::Udp, 25.0, 0, 1_000_000, false);
-    proof_only.has_sender_evidence = true;
-    proof_only.has_bulk_rate_evidence = false;
+    proof_only.observation.has_sender_evidence = true;
+    proof_only.observation.has_bulk_rate_evidence = false;
     let mut unevidenced = response_target(2, UnderlayProtocol::Tcp, 5.0, 0, 1_000_000, false);
-    unevidenced.has_sender_evidence = false;
-    unevidenced.has_bulk_rate_evidence = false;
+    unevidenced.observation.has_sender_evidence = false;
+    unevidenced.observation.has_bulk_rate_evidence = false;
 
     assert!(
         choose_response_repair_target(
@@ -380,21 +380,21 @@ fn persistent_response_repair_stays_bound_to_modeled_output() {
     let alternate = response_target(2, UnderlayProtocol::Tcp, 5.0, 0, 1_000_000, false);
     let cause = RelaySendCause::persistent_server_ack_gap_repair(
         ServerRepairOutputIdentity {
-            key: modeled.key,
-            incarnation: modeled.incarnation,
+            key: modeled.observation.key,
+            incarnation: modeled.observation.incarnation,
         },
-        modeled.snapshot,
+        modeled.observation.snapshot,
     );
 
     let selected = choose_response_repair_target(&[modeled.clone(), alternate.clone()], &[], cause)
         .expect("modeled output remains eligible");
-    assert_eq!(selected.key, modeled.key);
+    assert_eq!(selected.observation.key, modeled.observation.key);
     assert!(
         choose_response_repair_target(&[alternate], &[], cause).is_none(),
         "a queued BDP repair must pause instead of switching to a differently modeled output"
     );
     let mut replacement = modeled;
-    replacement.incarnation = replacement.incarnation.saturating_add(1);
+    replacement.observation.incarnation = replacement.observation.incarnation.saturating_add(1);
     assert!(
         choose_response_repair_target(&[replacement], &[], cause).is_none(),
         "a same-key replacement must not inherit a batch sized from the old output incarnation"
@@ -412,7 +412,7 @@ fn response_owner_data_waits_for_missing_lower_owner_debt() {
     let survivor = response_target(1, UnderlayProtocol::Udp, 10.0, 0, 1_000_000, false);
     let lower_flights = [
         CarrierPathFlightDebt {
-            key: survivor.key,
+            key: survivor.observation.key,
             bytes: 64,
         },
         CarrierPathFlightDebt {
@@ -456,13 +456,13 @@ fn response_owner_data_waits_for_missing_lower_owner_debt() {
 fn repair_target_does_not_fallback_to_avoided_owner_path() {
     let owner = response_target(1, UnderlayProtocol::Tcp, 5.0, 0, 1_000_000, true);
     let mut proof_only = response_target(2, UnderlayProtocol::Udp, 25.0, 0, 1_000_000, false);
-    proof_only.has_sender_evidence = true;
-    proof_only.has_bulk_rate_evidence = false;
+    proof_only.observation.has_sender_evidence = true;
+    proof_only.observation.has_bulk_rate_evidence = false;
 
     assert!(
         choose_response_repair_target(
             &[owner.clone(), proof_only],
-            &[owner.key],
+            &[owner.observation.key],
             RelaySendCause::AckGapRepair,
         )
         .is_none(),
@@ -477,19 +477,19 @@ fn path_failure_repair_may_retry_stale_copy_when_all_outputs_are_avoided() {
 
     let selected = choose_response_repair_target(
         &[owner.clone(), backup.clone()],
-        &[owner.key, backup.key],
+        &[owner.observation.key, backup.observation.key],
         RelaySendCause::PathFailureRepair,
     )
     .expect("path-failure recovery may retry on a stale live output");
 
     assert_eq!(
-        selected.key, owner.key,
+        selected.observation.key, owner.observation.key,
         "PathFailureRepair should fall back by metrics when every live output already has a stale copy; this must not be available to ordinary AckGapRepair"
     );
     assert!(
         choose_response_repair_target(
             &[owner.clone(), backup.clone()],
-            &[selected.key],
+            &[selected.observation.key],
             RelaySendCause::AckGapRepair,
         )
         .is_some(),
@@ -498,7 +498,7 @@ fn path_failure_repair_may_retry_stale_copy_when_all_outputs_are_avoided() {
     assert!(
         choose_response_repair_target(
             &[owner.clone(), backup.clone()],
-            &[owner.key, backup.key],
+            &[owner.observation.key, backup.observation.key],
             RelaySendCause::AckGapRepair,
         )
         .is_none(),
@@ -511,7 +511,10 @@ fn response_lead_must_be_admissible_not_lowest_raw_eta() {
     let mux_limits = MuxLimits::default();
     let mut saturated_low_eta =
         response_target(0, UnderlayProtocol::Udp, 1.0, 512 * 1024, 512 * 1024, true);
-    saturated_low_eta.snapshot.product_bytes_in_flight = mux_limits.max_path_flight_bytes as u64;
+    saturated_low_eta
+        .observation
+        .snapshot
+        .product_bytes_in_flight = mux_limits.max_path_flight_bytes as u64;
     let admissible_higher_eta =
         response_target(1, UnderlayProtocol::Udp, 2.0, 0, 512 * 1024, false);
     let selected = choose_response_sender_target(
@@ -531,7 +534,10 @@ fn response_lead_must_be_admissible_not_lowest_raw_eta() {
     )
     .expect("admissible higher ETA path should lead");
 
-    assert_eq!(selected.key, admissible_higher_eta.key);
+    assert_eq!(
+        selected.observation.key,
+        admissible_higher_eta.observation.key
+    );
 }
 
 #[test]
@@ -555,7 +561,7 @@ fn response_stream_ordered_final_control_stays_on_active_lead() {
     .expect("stream-ordered final control should remain dispatchable");
 
     assert_eq!(
-        selected.key, active_data_owner.key,
+        selected.observation.key, active_data_owner.observation.key,
         "FIN/final-offset must not move to a validation path and overtake older data"
     );
 }
@@ -563,9 +569,9 @@ fn response_stream_ordered_final_control_stays_on_active_lead() {
 #[test]
 fn response_stream_ack_prefers_request_active_over_response_owner() {
     let mut request_active = response_target(1, UnderlayProtocol::Tcp, 50.0, 0, 512 * 1024, false);
-    request_active.is_request_active = true;
+    request_active.observation.is_request_active = true;
     let mut response_owner = response_target(0, UnderlayProtocol::Udp, 5.0, 0, 512 * 1024, true);
-    response_owner.is_request_active = false;
+    response_owner.observation.is_request_active = false;
     let selected = choose_response_sender_target(
         &[response_owner, request_active.clone()],
         FlowLane::Control,
@@ -582,7 +588,7 @@ fn response_stream_ack_prefers_request_active_over_response_owner() {
     )
     .expect("request Active ACK carrier should remain dispatchable");
 
-    assert_eq!(selected.key, request_active.key);
+    assert_eq!(selected.observation.key, request_active.observation.key);
 }
 
 #[test]
@@ -629,20 +635,22 @@ fn single_active_response_target_still_obeys_bulk_admission() {
     let mux_limits = MuxLimits::default();
     let mut saturated =
         response_target(0, UnderlayProtocol::Udp, 1.0, 512 * 1024, 512 * 1024, true);
-    saturated.snapshot.product_bytes_in_flight = mux_limits.max_path_flight_bytes as u64;
+    saturated.observation.snapshot.product_bytes_in_flight =
+        mux_limits.max_path_flight_bytes as u64;
     let candidates = [&saturated];
     let outcome = response_target_unique_owner_admission_with_epoch(
         &saturated,
         &candidates,
         ResponseBulkLead {
-            key: saturated.key,
-            snapshot: saturated.snapshot,
-            eta_ms: saturated.eta_ms,
+            key: saturated.observation.key,
+            snapshot: saturated.observation.snapshot,
+            eta_ms: saturated.observation.eta_ms,
         },
         None,
-        Some(saturated.key),
+        Some(saturated.observation.key),
         0,
-        ResponseOrderedTail::new(Some(saturated.key), 0).for_candidate(saturated.key),
+        ResponseOrderedTail::new(Some(saturated.observation.key), 0)
+            .for_candidate(saturated.observation.key),
         64 * 1024,
         mux_limits,
         None,
@@ -746,7 +754,7 @@ fn response_data_admission_uses_writer_pending_bytes_not_only_slots() {
     )
     .expect("higher-ETA target with writer credit should be selected");
 
-    assert_eq!(selected.key, admissible.key);
+    assert_eq!(selected.observation.key, admissible.observation.key);
     assert!(
         saturated
             .commands
@@ -769,13 +777,15 @@ fn quic_proof_success_path_gets_bounded_bulk_only_startup_sampling() {
         4 * payload_bytes as u64,
         true,
     );
-    active.snapshot.active_flows = 2;
+    active.observation.snapshot.active_flows = 2;
     let mut proof_success = response_target(1, UnderlayProtocol::Udp, 500.0, 0, 0, false);
-    proof_success.snapshot.delivery_rate_bps = default_path_rate_bps(UnderlayProtocol::Udp);
-    proof_success.snapshot.pacing_rate_bps = proof_success.snapshot.delivery_rate_bps;
-    proof_success.snapshot.app_limited = true;
-    proof_success.snapshot.confidence = 1.0;
-    proof_success.has_bulk_rate_evidence = false;
+    proof_success.observation.snapshot.delivery_rate_bps =
+        default_path_rate_bps(UnderlayProtocol::Udp);
+    proof_success.observation.snapshot.pacing_rate_bps =
+        proof_success.observation.snapshot.delivery_rate_bps;
+    proof_success.observation.snapshot.app_limited = true;
+    proof_success.observation.snapshot.confidence = 1.0;
+    proof_success.observation.has_bulk_rate_evidence = false;
 
     let selected = select_response_sender_data_target_with_ordered_debt_and_epoch(
         &[active.clone(), proof_success.clone()],
@@ -783,13 +793,16 @@ fn quic_proof_success_path_gets_bounded_bulk_only_startup_sampling() {
         payload_bytes,
         mux_limits,
         &[],
-        Some(active.key),
+        Some(active.observation.key),
         0,
         None,
     )
     .expect("QUIC Validation sampling should be dispatchable");
 
-    assert_eq!(selected.target.key, proof_success.key);
+    assert_eq!(
+        selected.target.observation.key,
+        proof_success.observation.key
+    );
     assert_eq!(selected.admission().role, PathRuntimeRole::Subflow);
     assert!(
         selected
@@ -810,10 +823,10 @@ fn proof_path_owner_sampling_is_explicit_subflow_not_service_migration() {
         4 * payload_bytes as u64,
         true,
     );
-    active.snapshot.active_flows = 2;
+    active.observation.snapshot.active_flows = 2;
     let mut proof_success = response_target(1, UnderlayProtocol::Udp, 500.0, 0, 0, false);
-    proof_success.has_sender_evidence = true;
-    proof_success.has_bulk_rate_evidence = false;
+    proof_success.observation.has_sender_evidence = true;
+    proof_success.observation.has_bulk_rate_evidence = false;
 
     let selected = select_response_sender_data_target_with_ordered_debt_and_epoch(
         &[active.clone(), proof_success],
@@ -821,13 +834,13 @@ fn proof_path_owner_sampling_is_explicit_subflow_not_service_migration() {
         payload_bytes,
         mux_limits,
         &[],
-        Some(active.key),
+        Some(active.observation.key),
         0,
         None,
     )
     .expect("bounded startup sampling should be dispatchable");
 
-    assert_ne!(selected.target.key, active.key);
+    assert_ne!(selected.target.observation.key, active.observation.key);
     assert_eq!(selected.admission().role, PathRuntimeRole::Subflow);
     assert!(
         selected
@@ -871,7 +884,7 @@ fn measured_udp_bulk_path_remains_overflow_behind_feedable_udp_service() {
     .expect("the feedable UDP Service should remain eligible for ordinary bulk");
 
     assert_eq!(
-        selected.key, active_udp.key,
+        selected.observation.key, active_udp.observation.key,
         "a measured same-family Subflow is additive overflow and must not displace feedable Service"
     );
 }
@@ -903,15 +916,15 @@ fn measured_udp_bulk_path_does_not_steal_tcp_owner_under_lower_debt() {
         payload_bytes,
         mux_limits,
         &[CarrierPathFlightDebt {
-            key: active_tcp.key,
+            key: active_tcp.observation.key,
             bytes: payload_bytes as u64,
         }],
-        Some(active_tcp.key),
+        Some(active_tcp.observation.key),
     )
     .expect("current TCP primary remains eligible while it owns unresolved lower bytes");
 
     assert_eq!(
-        selected.key, active_tcp.key,
+        selected.observation.key, active_tcp.observation.key,
         "mixed TCP/QUIC paths may probe or repair, but must not steal same-stream OwnerData under lower-owner debt"
     );
 }
@@ -928,7 +941,7 @@ fn measured_udp_alternate_does_not_replace_active_service_at_clear_frontier() {
         4 * payload_bytes as u64,
         true,
     );
-    active_unproven_udp.has_bulk_rate_evidence = false;
+    active_unproven_udp.observation.has_bulk_rate_evidence = false;
     let measured_udp = response_target(
         1,
         UnderlayProtocol::Udp,
@@ -952,7 +965,7 @@ fn measured_udp_alternate_does_not_replace_active_service_at_clear_frontier() {
     .expect("bulk-rate-proven UDP owner should be eligible at a clear frontier");
 
     assert_eq!(
-        selected.key,
+        selected.observation.key,
         CarrierPathKey {
             underlay: UnderlayProtocol::Udp,
             path_id: PathId(0),
@@ -973,8 +986,8 @@ fn clear_frontier_without_live_service_elects_liveness_service_failover() {
         4 * payload_bytes as u64,
         false,
     );
-    restart.has_sender_evidence = false;
-    restart.has_bulk_rate_evidence = false;
+    restart.observation.has_sender_evidence = false;
+    restart.observation.has_bulk_rate_evidence = false;
 
     let selected = select_response_sender_data_target_with_ordered_debt_and_epoch(
         &[restart.clone()],
@@ -991,7 +1004,7 @@ fn clear_frontier_without_live_service_elects_liveness_service_failover() {
         "when the previous Service is gone and the ordered frontier is clear, the stream must elect a new Service failover path",
     );
     assert_eq!(
-        selected.target.key, restart.key,
+        selected.target.observation.key, restart.observation.key,
         "liveness from an attached output is enough for bounded Service failover only when no live Service owner remains"
     );
     assert_eq!(
@@ -1013,7 +1026,7 @@ fn repair_attachment_cannot_suppress_liveness_service_failover() {
         4 * payload_bytes as u64,
         false,
     );
-    repair.attachment_role = StreamOpenRole::Repair;
+    repair.observation.attachment_role = StreamOpenRole::Repair;
     let mut validation = response_target(
         1,
         UnderlayProtocol::Tcp,
@@ -1022,8 +1035,8 @@ fn repair_attachment_cannot_suppress_liveness_service_failover() {
         4 * payload_bytes as u64,
         false,
     );
-    validation.has_sender_evidence = false;
-    validation.has_bulk_rate_evidence = false;
+    validation.observation.has_sender_evidence = false;
+    validation.observation.has_bulk_rate_evidence = false;
 
     let selected = select_response_sender_data_target_with_ordered_debt_and_epoch(
         &[repair, validation.clone()],
@@ -1037,7 +1050,7 @@ fn repair_attachment_cannot_suppress_liveness_service_failover() {
     )
     .expect("Repair output must not hide an eligible liveness Service survivor");
 
-    assert_eq!(selected.target.key, validation.key);
+    assert_eq!(selected.target.observation.key, validation.observation.key);
     assert_eq!(selected.admission().role, PathRuntimeRole::Service);
 }
 
@@ -1054,13 +1067,14 @@ fn unproven_liveness_service_failover_respects_startup_assigned_credit() {
         false,
     );
     let startup_credit = response_service_startup_emission_credit_bytes(
-        failover.key.underlay,
+        failover.observation.key.underlay,
         payload_bytes,
         mux_limits,
     );
-    failover.has_service_feed_evidence = false;
-    failover.has_bulk_rate_evidence = false;
-    failover.snapshot.product_bytes_in_flight = startup_credit.saturating_sub(payload_bytes) as u64;
+    failover.observation.has_service_feed_evidence = false;
+    failover.observation.has_bulk_rate_evidence = false;
+    failover.observation.snapshot.product_bytes_in_flight =
+        startup_credit.saturating_sub(payload_bytes) as u64;
 
     let selected = select_response_sender_data_target_with_ordered_debt_and_epoch(
         &[failover.clone()],
@@ -1075,7 +1089,7 @@ fn unproven_liveness_service_failover_respects_startup_assigned_credit() {
     .expect("a prospective Service with startup credit remaining stays feedable");
     assert_eq!(selected.admission().role, PathRuntimeRole::Service);
 
-    failover.snapshot.product_bytes_in_flight = startup_credit as u64;
+    failover.observation.snapshot.product_bytes_in_flight = startup_credit as u64;
     assert!(
         select_response_sender_data_target_with_ordered_debt_and_epoch(
             &[failover],
@@ -1106,9 +1120,9 @@ fn prospective_service_uses_service_credit_instead_of_optional_pipe_credit() {
         false,
     );
     failover.commands = commands;
-    failover.has_bulk_rate_evidence = false;
-    failover.snapshot.delivery_rate_bps = 1.0;
-    failover.snapshot.pacing_rate_bps = 1.0;
+    failover.observation.has_bulk_rate_evidence = false;
+    failover.observation.snapshot.delivery_rate_bps = 1.0;
+    failover.observation.snapshot.pacing_rate_bps = 1.0;
     let optional_credit = response_target_emission_credit_bytes(
         &failover,
         FlowLane::Throughput,
@@ -1192,7 +1206,7 @@ fn mature_liveness_service_failover_uses_product_envelope() {
     let mature_credit =
         response_service_emission_credit_bytes(&failover, payload_bytes, mux_limits);
     let full_envelope = usize::try_from(bulk_active_service_product_envelope_bytes(
-        failover.snapshot,
+        failover.observation.snapshot,
         payload_bytes,
         mux_limits,
     ))
@@ -1200,14 +1214,15 @@ fn mature_liveness_service_failover_uses_product_envelope() {
     assert!(
         mature_credit
             > response_service_startup_emission_credit_bytes(
-                failover.key.underlay,
+                failover.observation.key.underlay,
                 payload_bytes,
                 mux_limits,
             ),
         "fixture requires a mature product envelope larger than startup credit"
     );
     assert_eq!(mature_credit, full_envelope);
-    failover.snapshot.product_bytes_in_flight = mature_credit.saturating_sub(payload_bytes) as u64;
+    failover.observation.snapshot.product_bytes_in_flight =
+        mature_credit.saturating_sub(payload_bytes) as u64;
 
     let selected = select_response_sender_data_target_with_ordered_debt_and_epoch(
         &[failover.clone()],
@@ -1222,7 +1237,7 @@ fn mature_liveness_service_failover_uses_product_envelope() {
     .expect("bulk-rate-proven prospective Service may use the product envelope");
     assert_eq!(selected.admission().role, PathRuntimeRole::Service);
 
-    failover.snapshot.product_bytes_in_flight = mature_credit as u64;
+    failover.observation.snapshot.product_bytes_in_flight = mature_credit as u64;
     assert!(
         select_response_sender_data_target_with_ordered_debt_and_epoch(
             &[failover],
@@ -1251,8 +1266,8 @@ fn mixed_family_clear_frontier_service_failover_is_metric_first() {
         4 * payload_bytes as u64,
         false,
     );
-    tcp.has_sender_evidence = true;
-    tcp.has_bulk_rate_evidence = false;
+    tcp.observation.has_sender_evidence = true;
+    tcp.observation.has_bulk_rate_evidence = false;
     let mut udp = response_target(
         0,
         UnderlayProtocol::Udp,
@@ -1261,8 +1276,8 @@ fn mixed_family_clear_frontier_service_failover_is_metric_first() {
         4 * payload_bytes as u64,
         false,
     );
-    udp.has_sender_evidence = true;
-    udp.has_bulk_rate_evidence = false;
+    udp.observation.has_sender_evidence = true;
+    udp.observation.has_bulk_rate_evidence = false;
 
     let selected = select_response_sender_data_target_with_ordered_debt_and_epoch(
         &[tcp, udp.clone()],
@@ -1278,7 +1293,7 @@ fn mixed_family_clear_frontier_service_failover_is_metric_first() {
     let selected = selected
         .expect("Service failover must be carrier-neutral when no live ordered owner remains");
     assert_eq!(
-        selected.target.key, udp.key,
+        selected.target.observation.key, udp.observation.key,
         "clear-frontier Service failover is selected by path metrics, not by TCP/UDP family"
     );
     assert_eq!(
@@ -1315,8 +1330,8 @@ fn clear_frontier_stale_owner_without_lane_capacity_elects_liveness_service_fail
         4 * payload_bytes as u64,
         false,
     );
-    failover.has_sender_evidence = true;
-    failover.has_bulk_rate_evidence = false;
+    failover.observation.has_sender_evidence = true;
+    failover.observation.has_bulk_rate_evidence = false;
 
     let selected = select_response_sender_data_target_with_ordered_debt_and_epoch(
         &[stale_owner.clone(), failover.clone()],
@@ -1324,7 +1339,7 @@ fn clear_frontier_stale_owner_without_lane_capacity_elects_liveness_service_fail
         payload_bytes,
         mux_limits,
         &[],
-        Some(stale_owner.key),
+        Some(stale_owner.observation.key),
         0,
         None,
     );
@@ -1333,7 +1348,7 @@ fn clear_frontier_stale_owner_without_lane_capacity_elects_liveness_service_fail
         "when the ordered frontier is clear and the old Service cannot enqueue, a validated survivor must become Service failover",
     );
     assert_eq!(
-        selected.target.key, failover.key,
+        selected.target.observation.key, failover.observation.key,
         "clear-frontier failover is metric-first and must not be trapped by the stale owner's carrier family"
     );
     assert_eq!(selected.admission().role, PathRuntimeRole::Service);
@@ -1351,8 +1366,8 @@ fn liveness_service_failover_waits_behind_live_owner_tail_guard() {
         4 * payload_bytes as u64,
         false,
     );
-    failover.has_sender_evidence = true;
-    failover.has_bulk_rate_evidence = false;
+    failover.observation.has_sender_evidence = true;
+    failover.observation.has_bulk_rate_evidence = false;
 
     let selected = select_response_sender_data_target_with_ordered_debt_and_epoch(
         &[failover],
@@ -1399,7 +1414,7 @@ fn repair_prefers_bulk_proven_path_over_proof_only_low_eta_path() {
         4 * payload_bytes as u64,
         false,
     );
-    proof_only_udp.has_bulk_rate_evidence = false;
+    proof_only_udp.observation.has_bulk_rate_evidence = false;
 
     let selected = choose_response_sender_target(
         &[
@@ -1417,13 +1432,13 @@ fn repair_prefers_bulk_proven_path_over_proof_only_low_eta_path() {
         CarrierEmitMode::Classified,
         mux_limits,
         &[],
-        &[original_owner.key],
+        &[original_owner.observation.key],
         Some(RelaySendCause::AckGapRepair),
     )
     .expect("repair should remain dispatchable on the proven alternate");
 
     assert_eq!(
-        selected.key, proven_alternate.key,
+        selected.observation.key, proven_alternate.observation.key,
         "repair must not treat proof-only validation as bulk-capable just because it has lower ETA"
     );
 }
@@ -1448,7 +1463,7 @@ fn repair_does_not_use_proof_only_path_when_no_proven_repair_path_exists() {
         4 * payload_bytes as u64,
         false,
     );
-    proof_only_udp.has_bulk_rate_evidence = false;
+    proof_only_udp.observation.has_bulk_rate_evidence = false;
 
     let selected = choose_response_sender_target(
         &[original_owner.clone(), proof_only_udp.clone()],
@@ -1462,7 +1477,7 @@ fn repair_does_not_use_proof_only_path_when_no_proven_repair_path_exists() {
         CarrierEmitMode::Classified,
         mux_limits,
         &[],
-        &[original_owner.key],
+        &[original_owner.observation.key],
         Some(RelaySendCause::AckGapRepair),
     );
 
@@ -1492,8 +1507,8 @@ fn path_failure_repair_can_use_live_liveness_survivor_without_path_proving_it() 
         4 * payload_bytes as u64,
         false,
     );
-    liveness_survivor.has_sender_evidence = true;
-    liveness_survivor.has_bulk_rate_evidence = false;
+    liveness_survivor.observation.has_sender_evidence = true;
+    liveness_survivor.observation.has_bulk_rate_evidence = false;
 
     let selected = choose_response_sender_target(
         &[original_owner.clone(), liveness_survivor.clone()],
@@ -1507,13 +1522,13 @@ fn path_failure_repair_can_use_live_liveness_survivor_without_path_proving_it() 
         CarrierEmitMode::Classified,
         mux_limits,
         &[],
-        &[original_owner.key],
+        &[original_owner.observation.key],
         Some(RelaySendCause::PathFailureRepair),
     )
     .expect("path-failure repair must be able to recover on a live non-owner output");
 
     assert_eq!(
-        selected.key, liveness_survivor.key,
+        selected.observation.key, liveness_survivor.observation.key,
         "PathFailureRepair is bounded failover retransmission; it must not require bulk-rate proof because it never path-proves or changes Service ownership"
     );
 }
@@ -1538,8 +1553,8 @@ fn path_failure_repair_prefers_same_family_survivor_before_cross_family_low_eta(
         4 * payload_bytes as u64,
         false,
     );
-    same_family_survivor.has_sender_evidence = true;
-    same_family_survivor.has_bulk_rate_evidence = false;
+    same_family_survivor.observation.has_sender_evidence = true;
+    same_family_survivor.observation.has_bulk_rate_evidence = false;
     let mut cross_family_low_eta = response_target(
         2,
         UnderlayProtocol::Udp,
@@ -1548,8 +1563,8 @@ fn path_failure_repair_prefers_same_family_survivor_before_cross_family_low_eta(
         4 * payload_bytes as u64,
         false,
     );
-    cross_family_low_eta.has_sender_evidence = true;
-    cross_family_low_eta.has_bulk_rate_evidence = false;
+    cross_family_low_eta.observation.has_sender_evidence = true;
+    cross_family_low_eta.observation.has_bulk_rate_evidence = false;
 
     let selected = choose_response_sender_target(
         &[
@@ -1567,13 +1582,13 @@ fn path_failure_repair_prefers_same_family_survivor_before_cross_family_low_eta(
         CarrierEmitMode::Classified,
         mux_limits,
         &[],
-        &[original_owner.key],
+        &[original_owner.observation.key],
         Some(RelaySendCause::PathFailureRepair),
     )
     .expect("path-failure repair should remain dispatchable on a live survivor");
 
     assert_eq!(
-        selected.key, same_family_survivor.key,
+        selected.observation.key, same_family_survivor.observation.key,
         "failed-owner RepairData should follow the same-family failover survivor before trying cross-family low-ETA repair"
     );
 }
@@ -1591,8 +1606,8 @@ fn path_failure_repair_bypasses_stale_owner_emission_credit_but_not_queue_capaci
     let (commands, _receivers) = reliable_path_command_channels(64);
     let mut survivor = response_target(1, UnderlayProtocol::Udp, 5.0, 0, 16 * 1024, false);
     survivor.commands = commands.clone();
-    survivor.has_sender_evidence = true;
-    survivor.has_bulk_rate_evidence = false;
+    survivor.observation.has_sender_evidence = true;
+    survivor.observation.has_bulk_rate_evidence = false;
 
     let credit = response_target_emission_credit_bytes(
         &survivor,
@@ -1653,7 +1668,7 @@ fn path_failure_repair_bypasses_stale_owner_emission_credit_but_not_queue_capaci
     .expect("path-failure RepairData must be admitted while a live queue slot exists");
 
     assert_eq!(
-        selected.key, survivor.key,
+        selected.observation.key, survivor.observation.key,
         "failed-owner repair is bounded correctness traffic and must not be blocked by stale owner emission credit"
     );
 }
@@ -1833,9 +1848,9 @@ fn ack_data_only_udp_path_cannot_own_unique_data_when_lower_owner_exists() {
         4 * payload_bytes as u64,
         true,
     );
-    active.has_bulk_rate_evidence = false;
+    active.observation.has_bulk_rate_evidence = false;
     let mut ack_data_only_path = response_target(1, UnderlayProtocol::Udp, 5.0, 0, 0, false);
-    ack_data_only_path.has_bulk_rate_evidence = false;
+    ack_data_only_path.observation.has_bulk_rate_evidence = false;
 
     let selected = choose_response_sender_data_target(
         &[active.clone(), ack_data_only_path.clone()],
@@ -1851,7 +1866,7 @@ fn ack_data_only_udp_path_cannot_own_unique_data_when_lower_owner_exists() {
     .expect("active owner should remain admissible while lower bytes are unresolved");
 
     assert_eq!(
-        selected.key, active.key,
+        selected.observation.key, active.observation.key,
         "ACK-data-only QUIC paths must not own later ordered bytes while another path owns unresolved lower bytes"
     );
 }
@@ -1872,12 +1887,14 @@ fn ack_data_quic_path_does_not_preempt_service_owner_under_lower_debt() {
         16 * payload_bytes as u64,
         true,
     );
-    active.has_bulk_rate_evidence = true;
+    active.observation.has_bulk_rate_evidence = true;
     let mut ack_data_only_path = response_target(1, UnderlayProtocol::Udp, 500.0, 0, 0, false);
-    ack_data_only_path.has_bulk_rate_evidence = false;
-    ack_data_only_path.snapshot.delivery_rate_bps = default_path_rate_bps(UnderlayProtocol::Udp);
-    ack_data_only_path.snapshot.pacing_rate_bps = ack_data_only_path.snapshot.delivery_rate_bps;
-    ack_data_only_path.snapshot.app_limited = true;
+    ack_data_only_path.observation.has_bulk_rate_evidence = false;
+    ack_data_only_path.observation.snapshot.delivery_rate_bps =
+        default_path_rate_bps(UnderlayProtocol::Udp);
+    ack_data_only_path.observation.snapshot.pacing_rate_bps =
+        ack_data_only_path.observation.snapshot.delivery_rate_bps;
+    ack_data_only_path.observation.snapshot.app_limited = true;
 
     let selected = choose_response_sender_data_target(
         &[active.clone(), ack_data_only_path.clone()],
@@ -1893,7 +1910,7 @@ fn ack_data_quic_path_does_not_preempt_service_owner_under_lower_debt() {
     .expect("active owner should remain selected while it owns the lower frontier");
 
     assert_eq!(
-        selected.key, active.key,
+        selected.observation.key, active.observation.key,
         "ACK-data-only paths must not preempt the service owner while lower-owner debt exists"
     );
 }
@@ -1910,11 +1927,11 @@ fn quic_ack_data_seen_validation_path_bootstraps_as_bounded_subflow() {
         4 * payload_bytes as u64,
         true,
     );
-    active.has_bulk_rate_evidence = true;
-    active.snapshot.active_flows = 2;
+    active.observation.has_bulk_rate_evidence = true;
+    active.observation.snapshot.active_flows = 2;
     let mut ack_data_only = response_target(1, UnderlayProtocol::Udp, 5.0, 0, 0, false);
-    ack_data_only.has_bulk_rate_evidence = false;
-    ack_data_only.has_sender_evidence = true;
+    ack_data_only.observation.has_bulk_rate_evidence = false;
+    ack_data_only.observation.has_sender_evidence = true;
 
     let selected = select_response_sender_data_target_with_ordered_debt_and_epoch(
         &[active.clone(), ack_data_only.clone()],
@@ -1932,7 +1949,7 @@ fn quic_ack_data_seen_validation_path_bootstraps_as_bounded_subflow() {
     .expect("bulk-rate-proven Service should remain dispatchable");
 
     assert_eq!(
-        selected.target.key, ack_data_only.key,
+        selected.target.observation.key, ack_data_only.observation.key,
         "sender-evidenced same-family Validation may consume bounded startup sampling credit"
     );
     assert_eq!(
@@ -1963,14 +1980,17 @@ fn measured_same_family_subflow_is_not_throttled_by_startup_credit() {
         16 * payload_bytes as u64,
         true,
     );
-    active.has_bulk_rate_evidence = true;
-    let service_envelope =
-        bulk_active_service_product_envelope_bytes(active.snapshot, payload_bytes, mux_limits);
-    active.snapshot.product_bytes_in_flight = service_envelope;
-    active.snapshot.queue_bytes = payload_bytes as u64;
+    active.observation.has_bulk_rate_evidence = true;
+    let service_envelope = bulk_active_service_product_envelope_bytes(
+        active.observation.snapshot,
+        payload_bytes,
+        mux_limits,
+    );
+    active.observation.snapshot.product_bytes_in_flight = service_envelope;
+    active.observation.snapshot.queue_bytes = payload_bytes as u64;
     let mut bulk_rate_subflow = response_target(1, UnderlayProtocol::Udp, 5.0, 0, 0, false);
-    bulk_rate_subflow.has_sender_evidence = true;
-    bulk_rate_subflow.has_bulk_rate_evidence = true;
+    bulk_rate_subflow.observation.has_sender_evidence = true;
+    bulk_rate_subflow.observation.has_bulk_rate_evidence = true;
 
     let first = select_response_sender_data_target_with_ordered_debt_and_epoch(
         &[active.clone(), bulk_rate_subflow.clone()],
@@ -2016,7 +2036,10 @@ fn measured_same_family_subflow_is_not_throttled_by_startup_credit() {
         Some(&subflow_set),
     )
     .expect("measured Subflow should remain eligible if per-decision no-worse gates pass");
-    assert_eq!(second.target.key, bulk_rate_subflow.key);
+    assert_eq!(
+        second.target.observation.key,
+        bulk_rate_subflow.observation.key
+    );
     assert_eq!(second.admission().role, PathRuntimeRole::Subflow);
 }
 
@@ -2214,10 +2237,10 @@ async fn stale_service_plan_cannot_enqueue_owner_data_after_repair_role_change()
     let target = binding
         .sender_path_targets(FlowLane::Throughput, payload_bytes)
         .into_iter()
-        .find(|target| target.key == validation)
+        .find(|target| target.observation.key == validation)
         .expect("Repair output remains attached");
-    assert_eq!(target.attachment_role, StreamOpenRole::Repair);
-    assert_eq!(target.snapshot.product_bytes_in_flight, 0);
+    assert_eq!(target.observation.attachment_role, StreamOpenRole::Repair);
+    assert_eq!(target.observation.snapshot.product_bytes_in_flight, 0);
     assert_eq!(target.commands.pending_bytes(), 0);
     assert_eq!(binding.ordered_data_owner(), None);
 }
@@ -2475,8 +2498,8 @@ fn sender_evidence_same_family_candidate_cannot_own_under_lower_owner_debt() {
         4 * payload_bytes as u64,
         false,
     );
-    proof_only.has_bulk_rate_evidence = false;
-    proof_only.has_sender_evidence = true;
+    proof_only.observation.has_bulk_rate_evidence = false;
+    proof_only.observation.has_sender_evidence = true;
 
     let selected = choose_response_sender_data_target(
         &[active.clone(), proof_only.clone()],
@@ -2492,7 +2515,7 @@ fn sender_evidence_same_family_candidate_cannot_own_under_lower_owner_debt() {
     .expect("service path should remain dispatchable");
 
     assert_eq!(
-        selected.key, active.key,
+        selected.observation.key, active.observation.key,
         "same-family sender evidence is not enough to assign later unique bytes while the Service owns unresolved lower bytes"
     );
 }
@@ -2509,10 +2532,10 @@ fn bulk_rate_same_family_candidate_cannot_own_later_data_under_lower_owner_debt(
         16 * 1024 * 1024,
         true,
     );
-    owner.snapshot.product_progress_rate_bps = Some(500_000_000.0);
+    owner.observation.snapshot.product_progress_rate_bps = Some(500_000_000.0);
     let alternate = response_target(1, UnderlayProtocol::Udp, 7.0, 0, 16 * 1024 * 1024, false);
     let lower_flights = vec![CarrierPathFlightDebt {
-        key: owner.key,
+        key: owner.observation.key,
         bytes: 2 * 1024 * 1024,
     }];
 
@@ -2522,12 +2545,12 @@ fn bulk_rate_same_family_candidate_cannot_own_later_data_under_lower_owner_debt(
         payload_bytes,
         mux_limits,
         &lower_flights,
-        Some(owner.key),
+        Some(owner.observation.key),
     )
     .expect("lower owner should remain dispatchable");
 
     assert_eq!(
-        selected.key, owner.key,
+        selected.observation.key, owner.observation.key,
         "bulk-rate evidence proves the alternate path is eligible at a clear frontier, not that it may extend an existing ordered receive hole"
     );
 }
@@ -2756,7 +2779,7 @@ async fn blocked_path_queue_rolls_back_unemitted_startup_credit() {
     let target = binding
         .sender_path_targets(FlowLane::Throughput, payload_bytes)
         .into_iter()
-        .find(|target| target.key == candidate)
+        .find(|target| target.observation.key == candidate)
         .expect("candidate output is attached");
     let (planner_generation, _) = binding.subflow_state_snapshot();
     let commit = ResponseSubflowAdmissionCommit {
@@ -2874,7 +2897,7 @@ async fn stale_passive_topology_plan_blocks_subflow_reservation_and_enqueue() {
     let target = binding
         .sender_path_targets(FlowLane::Throughput, payload_bytes)
         .into_iter()
-        .find(|target| target.key == candidate)
+        .find(|target| target.observation.key == candidate)
         .expect("candidate output is attached");
     let (stale_planner_generation, _) = binding.subflow_state_snapshot();
     let lane_generation = binding.lane_generation();
@@ -3405,9 +3428,9 @@ fn single_response_carrier_uses_sliding_window_not_multipath_ordering_debt() {
         16 * 1024 * 1024,
         true,
     );
-    target.snapshot.product_progress_rate_bps = Some(10_000_000_000.0);
+    target.observation.snapshot.product_progress_rate_bps = Some(10_000_000_000.0);
     let lower_flights = vec![CarrierPathFlightDebt {
-        key: target.key,
+        key: target.observation.key,
         bytes: assigned_bytes as u64,
     }];
 
@@ -3417,11 +3440,11 @@ fn single_response_carrier_uses_sliding_window_not_multipath_ordering_debt() {
         payload_bytes,
         mux_limits,
         &lower_flights,
-        Some(target.key),
+        Some(target.observation.key),
     )
     .expect("single carrier lower flight is normal sliding-window debt");
 
-    assert_eq!(selected.key, target.key);
+    assert_eq!(selected.observation.key, target.observation.key);
 }
 
 #[test]
@@ -3434,10 +3457,10 @@ fn proven_udp_candidate_cannot_overtake_large_lower_owner() {
         16 * 1024 * 1024,
         true,
     );
-    owner.snapshot.product_progress_rate_bps = Some(500_000_000.0);
+    owner.observation.snapshot.product_progress_rate_bps = Some(500_000_000.0);
     let alternate = response_target(1, UnderlayProtocol::Udp, 7.0, 0, 16 * 1024 * 1024, false);
     let lower_flights = vec![CarrierPathFlightDebt {
-        key: owner.key,
+        key: owner.observation.key,
         bytes: 2 * 1024 * 1024,
     }];
 
@@ -3447,11 +3470,11 @@ fn proven_udp_candidate_cannot_overtake_large_lower_owner() {
         64 * 1024,
         MuxLimits::default(),
         &lower_flights,
-        Some(owner.key),
+        Some(owner.observation.key),
     )
     .expect("lower owner should remain eligible while it owns unresolved lower bytes");
 
-    assert_eq!(selected.key, owner.key);
+    assert_eq!(selected.observation.key, owner.observation.key);
 }
 
 #[test]
@@ -3464,11 +3487,11 @@ fn proven_udp_candidate_waits_even_when_lower_owner_debt_is_within_reorder_budge
         16 * 1024 * 1024,
         true,
     );
-    owner.snapshot.product_progress_rate_bps = Some(500_000_000.0);
+    owner.observation.snapshot.product_progress_rate_bps = Some(500_000_000.0);
     let lower_eta_alternate =
         response_target(1, UnderlayProtocol::Udp, 7.0, 0, 16 * 1024 * 1024, false);
     let lower_flights = vec![CarrierPathFlightDebt {
-        key: owner.key,
+        key: owner.observation.key,
         bytes: 64 * 1024,
     }];
 
@@ -3478,11 +3501,11 @@ fn proven_udp_candidate_waits_even_when_lower_owner_debt_is_within_reorder_budge
         64 * 1024,
         MuxLimits::default(),
         &lower_flights,
-        Some(owner.key),
+        Some(owner.observation.key),
     )
     .expect("lower owner should remain eligible while the frontier is not clear");
 
-    assert_eq!(selected.key.path_id, PathId(0));
+    assert_eq!(selected.observation.key.path_id, PathId(0));
 }
 
 #[test]
@@ -3495,11 +3518,11 @@ fn proof_only_udp_candidate_is_blocked_from_unique_data_with_lower_udp_owner() {
         16 * 1024 * 1024,
         true,
     );
-    owner.snapshot.product_progress_rate_bps = Some(500_000_000.0);
+    owner.observation.snapshot.product_progress_rate_bps = Some(500_000_000.0);
     let mut proof_only = response_target(1, UnderlayProtocol::Udp, 7.0, 0, 16 * 1024 * 1024, false);
-    proof_only.has_bulk_rate_evidence = false;
+    proof_only.observation.has_bulk_rate_evidence = false;
     let lower_flights = vec![CarrierPathFlightDebt {
-        key: owner.key,
+        key: owner.observation.key,
         bytes: 64 * 1024,
     }];
 
@@ -3509,11 +3532,11 @@ fn proof_only_udp_candidate_is_blocked_from_unique_data_with_lower_udp_owner() {
         64 * 1024,
         MuxLimits::default(),
         &lower_flights,
-        Some(owner.key),
+        Some(owner.observation.key),
     )
     .expect("proof-only path should not own unique later bytes");
 
-    assert_eq!(selected.key, owner.key);
+    assert_eq!(selected.observation.key, owner.observation.key);
 }
 
 #[test]
@@ -3522,8 +3545,8 @@ fn proof_only_tcp_candidate_does_not_displace_bulk_rate_proven_udp() {
         response_target(0, UnderlayProtocol::Udp, 50.0, 0, 16 * 1024 * 1024, true);
     let mut proof_only_tcp =
         response_target(0, UnderlayProtocol::Tcp, 5.0, 0, 16 * 1024 * 1024, false);
-    proof_only_tcp.has_sender_evidence = true;
-    proof_only_tcp.has_bulk_rate_evidence = false;
+    proof_only_tcp.observation.has_sender_evidence = true;
+    proof_only_tcp.observation.has_bulk_rate_evidence = false;
 
     let selected = choose_response_sender_data_target(
         &[bulk_proven_udp.clone(), proof_only_tcp],
@@ -3531,11 +3554,11 @@ fn proof_only_tcp_candidate_does_not_displace_bulk_rate_proven_udp() {
         64 * 1024,
         MuxLimits::default(),
         &[],
-        Some(bulk_proven_udp.key),
+        Some(bulk_proven_udp.observation.key),
     )
     .expect("bulk-rate-proven path should remain unique ordered owner");
 
-    assert_eq!(selected.key, bulk_proven_udp.key);
+    assert_eq!(selected.observation.key, bulk_proven_udp.observation.key);
 }
 
 #[test]
@@ -3550,11 +3573,11 @@ fn response_clear_frontier_keeps_feedable_service_ahead_of_lower_eta_subflow() {
         64 * 1024,
         MuxLimits::default(),
         &[],
-        Some(lead.key),
+        Some(lead.observation.key),
     )
     .expect("feedable Service should remain selected");
 
-    assert_eq!(selected.key, lead.key);
+    assert_eq!(selected.observation.key, lead.observation.key);
 }
 
 #[test]
@@ -3569,13 +3592,13 @@ fn feedable_service_precedes_lower_eta_same_family_subflow() {
         64 * 1024,
         MuxLimits::default(),
         &[],
-        Some(service.key),
+        Some(service.observation.key),
         0,
         None,
     )
     .expect("feedable Service should remain selected ahead of admitted overflow");
 
-    assert_eq!(selected.target.key, service.key);
+    assert_eq!(selected.target.observation.key, service.observation.key);
     assert_eq!(
         selected.admission().role,
         PathRuntimeRole::Service,
@@ -3592,7 +3615,7 @@ fn same_family_lower_frontier_owner_remains_subflow() {
         let service = response_target(1, underlay, 50.0, 0, 16 * 1024 * 1024, true);
         let lower_owner = response_target(0, underlay, 5.0, 0, 16 * 1024 * 1024, false);
         let lower_flights = [CarrierPathFlightDebt {
-            key: lower_owner.key,
+            key: lower_owner.observation.key,
             bytes: payload_bytes as u64,
         }];
 
@@ -3602,17 +3625,20 @@ fn same_family_lower_frontier_owner_remains_subflow() {
             payload_bytes,
             mux_limits,
             &lower_flights,
-            Some(service.key),
+            Some(service.observation.key),
             payload_bytes.saturating_mul(2),
             None,
         )
         .expect("measured lower-frontier owner should remain dispatchable as a Subflow");
 
-        assert_eq!(selected.target.key, lower_owner.key, "{underlay:?}");
+        assert_eq!(
+            selected.target.observation.key, lower_owner.observation.key,
+            "{underlay:?}"
+        );
         assert_eq!(selected.admission().role, PathRuntimeRole::Subflow);
         assert_eq!(
             selected.subflow_set_commit().map(|commit| commit.service),
-            Some(service.key),
+            Some(service.observation.key),
             "{underlay:?} lower-frontier continuation must retain the Service anchor"
         );
     }
@@ -3625,7 +3651,7 @@ fn cross_family_lower_frontier_owner_remains_subflow() {
     let service = response_target(1, UnderlayProtocol::Tcp, 50.0, 0, 16 * 1024 * 1024, true);
     let lower_owner = response_target(0, UnderlayProtocol::Udp, 5.0, 0, 16 * 1024 * 1024, false);
     let lower_flights = [CarrierPathFlightDebt {
-        key: lower_owner.key,
+        key: lower_owner.observation.key,
         bytes: payload_bytes as u64,
     }];
 
@@ -3635,17 +3661,17 @@ fn cross_family_lower_frontier_owner_remains_subflow() {
         payload_bytes,
         mux_limits,
         &lower_flights,
-        Some(service.key),
+        Some(service.observation.key),
         payload_bytes.saturating_mul(2),
         None,
     )
     .expect("measured cross-family lower-frontier owner should remain dispatchable");
 
-    assert_eq!(selected.target.key, lower_owner.key);
+    assert_eq!(selected.target.observation.key, lower_owner.observation.key);
     assert_eq!(selected.admission().role, PathRuntimeRole::Subflow);
     assert_eq!(
         selected.subflow_set_commit().map(|commit| commit.service),
-        Some(service.key),
+        Some(service.observation.key),
         "cross-family continuation must not commit an implicit Service migration"
     );
 }
@@ -3658,9 +3684,9 @@ fn authoritative_lower_frontier_suspends_unmeasured_startup_sampling() {
     for underlay in [UnderlayProtocol::Tcp, UnderlayProtocol::Udp] {
         let service = response_target(1, underlay, 50.0, 0, 16 * 1024 * 1024, true);
         let mut proof_only = response_target(0, underlay, 5.0, 0, 16 * 1024 * 1024, false);
-        proof_only.has_bulk_rate_evidence = false;
+        proof_only.observation.has_bulk_rate_evidence = false;
         let lower_flights = [CarrierPathFlightDebt {
-            key: proof_only.key,
+            key: proof_only.observation.key,
             bytes: payload_bytes as u64,
         }];
 
@@ -3670,7 +3696,7 @@ fn authoritative_lower_frontier_suspends_unmeasured_startup_sampling() {
             payload_bytes,
             mux_limits,
             &lower_flights,
-            Some(service.key),
+            Some(service.observation.key),
             payload_bytes.saturating_mul(2),
             None,
         );
@@ -3690,11 +3716,14 @@ fn slow_measured_lower_frontier_cannot_borrow_service_admission() {
     for underlay in [UnderlayProtocol::Tcp, UnderlayProtocol::Udp] {
         let service = response_target(1, underlay, 5.0, 0, 16 * 1024 * 1024, true);
         let mut slow_lower_owner = response_target(0, underlay, 500.0, 0, 16 * 1024 * 1024, false);
-        slow_lower_owner.snapshot.delivery_rate_bps = 20_000_000.0;
-        slow_lower_owner.snapshot.pacing_rate_bps = 20_000_000.0;
-        slow_lower_owner.snapshot.product_progress_rate_bps = Some(20_000_000.0);
+        slow_lower_owner.observation.snapshot.delivery_rate_bps = 20_000_000.0;
+        slow_lower_owner.observation.snapshot.pacing_rate_bps = 20_000_000.0;
+        slow_lower_owner
+            .observation
+            .snapshot
+            .product_progress_rate_bps = Some(20_000_000.0);
         let lower_flights = [CarrierPathFlightDebt {
-            key: slow_lower_owner.key,
+            key: slow_lower_owner.observation.key,
             bytes: payload_bytes as u64,
         }];
 
@@ -3704,7 +3733,7 @@ fn slow_measured_lower_frontier_cannot_borrow_service_admission() {
             payload_bytes,
             mux_limits,
             &lower_flights,
-            Some(service.key),
+            Some(service.observation.key),
             payload_bytes.saturating_mul(2),
             None,
         );
@@ -3736,7 +3765,7 @@ fn backpressured_service_remains_lower_frontier_completion_baseline() {
     service.commands = service_commands;
     let lower_owner = response_target(0, UnderlayProtocol::Udp, 5.0, 0, 16 * 1024 * 1024, false);
     let lower_flights = [CarrierPathFlightDebt {
-        key: lower_owner.key,
+        key: lower_owner.observation.key,
         bytes: payload_bytes as u64,
     }];
 
@@ -3746,17 +3775,17 @@ fn backpressured_service_remains_lower_frontier_completion_baseline() {
         payload_bytes,
         mux_limits,
         &lower_flights,
-        Some(service.key),
+        Some(service.observation.key),
         payload_bytes.saturating_mul(2),
         None,
     )
     .expect("measured lower-frontier Subflow should be evaluated against queued Service");
 
-    assert_eq!(selected.target.key, lower_owner.key);
+    assert_eq!(selected.target.observation.key, lower_owner.observation.key);
     assert_eq!(selected.admission().role, PathRuntimeRole::Subflow);
     assert_eq!(
         selected.subflow_set_commit().map(|commit| commit.service),
-        Some(service.key)
+        Some(service.observation.key)
     );
 }
 
@@ -3766,7 +3795,7 @@ fn detached_service_with_lower_frontier_waits_for_repair_or_ack_clear() {
     let payload_bytes = reliable_bulk_carrier_feed_quantum_bytes(mux_limits);
     let lower_owner = response_target(0, UnderlayProtocol::Udp, 5.0, 0, 16 * 1024 * 1024, false);
     let lower_flights = [CarrierPathFlightDebt {
-        key: lower_owner.key,
+        key: lower_owner.observation.key,
         bytes: payload_bytes as u64,
     }];
 
@@ -3849,13 +3878,16 @@ fn clear_frontier_unavailable_ordered_owner_reanchors_service_to_bulk_proven_pat
         64 * 1024,
         MuxLimits::default(),
         &[],
-        Some(service.key),
+        Some(service.observation.key),
         0,
         None,
     )
     .expect("bulk-rate-proven alternate should become Service when the prior clear-frontier owner is not dispatchable");
 
-    assert_eq!(selected.target.key, lower_eta_subflow.key);
+    assert_eq!(
+        selected.target.observation.key,
+        lower_eta_subflow.observation.key
+    );
     assert_eq!(
         selected.admission().role,
         PathRuntimeRole::Service,
@@ -3870,9 +3902,12 @@ fn lower_eta_same_family_subflow_does_not_borrow_active_service_envelope() {
     let service = response_target(0, UnderlayProtocol::Udp, 50.0, 0, 16 * 1024 * 1024, true);
     let mut saturated_subflow =
         response_target(1, UnderlayProtocol::Udp, 5.0, 0, 512 * 1024, false);
-    saturated_subflow.snapshot.product_bytes_in_flight =
+    saturated_subflow
+        .observation
+        .snapshot
+        .product_bytes_in_flight = RELIABLE_STREAM_STARTUP_PRODUCT_WINDOW_BYTES;
+    saturated_subflow.observation.snapshot.bytes_in_flight =
         RELIABLE_STREAM_STARTUP_PRODUCT_WINDOW_BYTES;
-    saturated_subflow.snapshot.bytes_in_flight = RELIABLE_STREAM_STARTUP_PRODUCT_WINDOW_BYTES;
 
     let selected = select_response_sender_data_target_with_ordered_debt_and_epoch(
         &[service.clone(), saturated_subflow],
@@ -3880,14 +3915,14 @@ fn lower_eta_same_family_subflow_does_not_borrow_active_service_envelope() {
         payload_bytes,
         mux_limits,
         &[],
-        Some(service.key),
+        Some(service.observation.key),
         0,
         None,
     )
     .expect("Service should remain eligible when the lower-ETA Subflow is out of credit");
 
     assert_eq!(
-        selected.target.key, service.key,
+        selected.target.observation.key, service.observation.key,
         "non-active Subflow admission must use additional-path gates instead of the active Service envelope"
     );
     assert_eq!(selected.admission().role, PathRuntimeRole::Service);
@@ -3898,8 +3933,8 @@ fn response_ordinary_bulk_keeps_lead_only_inside_measured_hysteresis() {
     let mut lead = response_target(0, UnderlayProtocol::Udp, 5.1, 0, 16 * 1024 * 1024, true);
     let mut lower_eta_alternate =
         response_target(1, UnderlayProtocol::Udp, 5.0, 0, 16 * 1024 * 1024, false);
-    lead.snapshot.jitter_ms = 0.2;
-    lower_eta_alternate.snapshot.jitter_ms = 0.1;
+    lead.observation.snapshot.jitter_ms = 0.2;
+    lower_eta_alternate.observation.snapshot.jitter_ms = 0.1;
 
     let selected = choose_response_sender_data_target(
         &[lead.clone(), lower_eta_alternate],
@@ -3907,11 +3942,11 @@ fn response_ordinary_bulk_keeps_lead_only_inside_measured_hysteresis() {
         64 * 1024,
         MuxLimits::default(),
         &[],
-        Some(lead.key),
+        Some(lead.observation.key),
     )
     .expect("near-tie lead should remain selected inside observed jitter");
 
-    assert_eq!(selected.key, lead.key);
+    assert_eq!(selected.observation.key, lead.observation.key);
 }
 
 #[test]
@@ -3919,7 +3954,7 @@ fn active_service_remains_admissible_lead_when_subflow_is_not_admissible() {
     let mux_limits = MuxLimits::default();
     let payload_bytes = reliable_bulk_carrier_feed_quantum_bytes(mux_limits);
     let mut service = response_target(0, UnderlayProtocol::Tcp, 25.0, 0, 16 * 1024 * 1024, true);
-    service.has_bulk_rate_evidence = false;
+    service.observation.has_bulk_rate_evidence = false;
     let mut subflow = response_target(
         1,
         UnderlayProtocol::Tcp,
@@ -3928,7 +3963,7 @@ fn active_service_remains_admissible_lead_when_subflow_is_not_admissible() {
         16 * 1024 * 1024,
         false,
     );
-    subflow.has_bulk_rate_evidence = true;
+    subflow.observation.has_bulk_rate_evidence = true;
     let candidates = [&service, &subflow];
 
     let lead = choose_response_admissible_lead(
@@ -3942,7 +3977,7 @@ fn active_service_remains_admissible_lead_when_subflow_is_not_admissible() {
     .expect("active Service must remain a lead candidate when optional Subflow is blocked");
 
     assert_eq!(
-        lead.key, service.key,
+        lead.key, service.observation.key,
         "optional bulk-rate evidence must not hide the current Service owner"
     );
 }
@@ -3967,7 +4002,7 @@ fn active_service_remains_lead_when_measured_subflow_has_lower_eta() {
     .expect("active Service should remain the lead anchor");
 
     assert_eq!(
-        lead.key, service.key,
+        lead.key, service.observation.key,
         "a lower-ETA same-family Subflow must not redefine Service ownership"
     );
 }
@@ -3977,16 +4012,19 @@ fn feedable_service_owner_is_selected_before_lower_eta_same_family_subflow() {
     let mux_limits = MuxLimits::default();
     let payload_bytes = reliable_bulk_carrier_feed_quantum_bytes(mux_limits);
     let mut service = response_target(0, UnderlayProtocol::Udp, 25.0, 0, 16 * 1024 * 1024, true);
-    service.snapshot.product_progress_rate_bps = Some(80_000_000.0);
-    service.has_sender_evidence = true;
-    service.has_bulk_rate_evidence = true;
+    service.observation.snapshot.product_progress_rate_bps = Some(80_000_000.0);
+    service.observation.has_sender_evidence = true;
+    service.observation.has_bulk_rate_evidence = true;
 
     let mut measured_subflow =
         response_target(1, UnderlayProtocol::Udp, 5.0, 0, 16 * 1024 * 1024, false);
-    measured_subflow.snapshot.product_progress_rate_bps = Some(120_000_000.0);
-    measured_subflow.snapshot.app_limited = false;
-    measured_subflow.has_sender_evidence = true;
-    measured_subflow.has_bulk_rate_evidence = true;
+    measured_subflow
+        .observation
+        .snapshot
+        .product_progress_rate_bps = Some(120_000_000.0);
+    measured_subflow.observation.snapshot.app_limited = false;
+    measured_subflow.observation.has_sender_evidence = true;
+    measured_subflow.observation.has_bulk_rate_evidence = true;
 
     let selected = select_response_sender_data_target_with_ordered_debt_and_epoch(
         &[service.clone(), measured_subflow],
@@ -3994,14 +4032,14 @@ fn feedable_service_owner_is_selected_before_lower_eta_same_family_subflow() {
         payload_bytes,
         mux_limits,
         &[],
-        Some(service.key),
+        Some(service.observation.key),
         0,
         None,
     )
     .expect("feedable Service owner should remain dispatchable");
 
     assert_eq!(
-        selected.target.key, service.key,
+        selected.target.observation.key, service.observation.key,
         "same-family Subflow OwnerData is additive; it must not replace a feedable Service quantum just because its instantaneous ETA is lower"
     );
     assert_eq!(selected.admission().role, PathRuntimeRole::Service);
@@ -4020,7 +4058,7 @@ fn measured_tcp_subflow_uses_bounded_reservoir_beyond_service_horizon() {
         mux_limits.max_path_flight_bytes as u64,
         true,
     );
-    service.snapshot.product_progress_rate_bps = Some(80_000_000.0);
+    service.observation.snapshot.product_progress_rate_bps = Some(80_000_000.0);
     let mut measured_subflow = response_target(
         1,
         UnderlayProtocol::Tcp,
@@ -4029,12 +4067,15 @@ fn measured_tcp_subflow_uses_bounded_reservoir_beyond_service_horizon() {
         mux_limits.max_path_flight_bytes as u64,
         false,
     );
-    measured_subflow.snapshot.product_progress_rate_bps = Some(120_000_000.0);
-    measured_subflow.snapshot.srtt_ms = 80.0;
-    measured_subflow.snapshot.min_rtt_ms = 80.0;
-    measured_subflow.snapshot.delivery_rate_bps = 200_000_000.0;
-    measured_subflow.snapshot.pacing_rate_bps = 200_000_000.0;
-    measured_subflow.snapshot.app_limited = false;
+    measured_subflow
+        .observation
+        .snapshot
+        .product_progress_rate_bps = Some(120_000_000.0);
+    measured_subflow.observation.snapshot.srtt_ms = 80.0;
+    measured_subflow.observation.snapshot.min_rtt_ms = 80.0;
+    measured_subflow.observation.snapshot.delivery_rate_bps = 200_000_000.0;
+    measured_subflow.observation.snapshot.pacing_rate_bps = 200_000_000.0;
+    measured_subflow.observation.snapshot.app_limited = false;
 
     let below_horizon = select_response_sender_data_target_with_ordered_debt_and_epoch(
         &[service.clone(), measured_subflow.clone()],
@@ -4042,69 +4083,78 @@ fn measured_tcp_subflow_uses_bounded_reservoir_beyond_service_horizon() {
         payload_bytes,
         mux_limits,
         &[],
-        Some(service.key),
+        Some(service.observation.key),
         service_horizon.saturating_sub(payload_bytes),
         None,
     )
     .expect("Service should fill its protected horizon first");
-    assert_eq!(below_horizon.target.key, service.key);
+    assert_eq!(
+        below_horizon.target.observation.key,
+        service.observation.key
+    );
     assert_eq!(below_horizon.admission().role, PathRuntimeRole::Service);
 
-    service.snapshot.product_bytes_in_flight = service_horizon as u64;
-    service.owner_data_in_flight_bytes = service_horizon as u64;
+    service.observation.snapshot.product_bytes_in_flight = service_horizon as u64;
+    service.observation.owner_data_in_flight_bytes = service_horizon as u64;
     let reservoir_subflow = select_response_sender_data_target_with_ordered_debt_and_epoch(
         &[service.clone(), measured_subflow.clone()],
         FlowLane::Throughput,
         payload_bytes,
         mux_limits,
         &[],
-        Some(service.key),
+        Some(service.observation.key),
         service_horizon,
         None,
     )
     .expect("measured TCP Subflow should use the remaining source reservoir");
-    assert_eq!(reservoir_subflow.target.key, measured_subflow.key);
+    assert_eq!(
+        reservoir_subflow.target.observation.key,
+        measured_subflow.observation.key
+    );
     assert_eq!(reservoir_subflow.admission().role, PathRuntimeRole::Subflow);
     assert_eq!(
         reservoir_subflow
             .subflow_set_commit()
             .map(|commit| commit.service),
-        Some(service.key),
+        Some(service.observation.key),
         "overflow must remain bound to the exact current Service epoch"
     );
 
     let product_reservoir = bulk_service_product_envelope_payload_bytes(payload_bytes, mux_limits);
-    service.snapshot.product_bytes_in_flight = (product_reservoir / 2) as u64;
-    service.owner_data_in_flight_bytes = (product_reservoir / 2) as u64;
+    service.observation.snapshot.product_bytes_in_flight = (product_reservoir / 2) as u64;
+    service.observation.owner_data_in_flight_bytes = (product_reservoir / 2) as u64;
     let mut backlog_subflow = measured_subflow.clone();
-    backlog_subflow.eta_ms = 400.0;
-    backlog_subflow.snapshot.srtt_ms = 360.0;
-    backlog_subflow.snapshot.min_rtt_ms = 360.0;
-    backlog_subflow.snapshot.delivery_rate_bps = 200_000_000.0;
-    backlog_subflow.snapshot.pacing_rate_bps = 200_000_000.0;
+    backlog_subflow.observation.eta_ms = 400.0;
+    backlog_subflow.observation.snapshot.srtt_ms = 360.0;
+    backlog_subflow.observation.snapshot.min_rtt_ms = 360.0;
+    backlog_subflow.observation.snapshot.delivery_rate_bps = 200_000_000.0;
+    backlog_subflow.observation.snapshot.pacing_rate_bps = 200_000_000.0;
     let backlog_selection = select_response_sender_data_target_with_ordered_debt_and_epoch(
         &[service.clone(), backlog_subflow.clone()],
         FlowLane::Throughput,
         payload_bytes,
         mux_limits,
         &[],
-        Some(service.key),
+        Some(service.observation.key),
         product_reservoir / 2,
         None,
     )
     .expect("Service remains feedable when cross-path prefix debt is capped");
-    assert_eq!(backlog_selection.target.key, service.key);
+    assert_eq!(
+        backlog_selection.target.observation.key,
+        service.observation.key
+    );
     assert_eq!(backlog_selection.admission().role, PathRuntimeRole::Service);
 
-    service.snapshot.product_bytes_in_flight = product_reservoir as u64;
-    service.owner_data_in_flight_bytes = product_reservoir as u64;
+    service.observation.snapshot.product_bytes_in_flight = product_reservoir as u64;
+    service.observation.owner_data_in_flight_bytes = product_reservoir as u64;
     let exhausted_reservoir = select_response_sender_data_target_with_ordered_debt_and_epoch(
         &[service.clone(), measured_subflow],
         FlowLane::Throughput,
         payload_bytes,
         mux_limits,
         &[],
-        Some(service.key),
+        Some(service.observation.key),
         product_reservoir,
         None,
     );
@@ -4127,9 +4177,9 @@ fn measured_quic_subflow_uses_bounded_reservoir_before_new_startup() {
         mux_limits.max_path_flight_bytes as u64,
         true,
     );
-    service.snapshot.product_progress_rate_bps = Some(80_000_000.0);
-    service.snapshot.active_flows = 1;
-    service.owner_data_in_flight_bytes = service_horizon as u64;
+    service.observation.snapshot.product_progress_rate_bps = Some(80_000_000.0);
+    service.observation.snapshot.active_flows = 1;
+    service.observation.owner_data_in_flight_bytes = service_horizon as u64;
     let mut measured_subflow = response_target(
         1,
         UnderlayProtocol::Udp,
@@ -4138,12 +4188,15 @@ fn measured_quic_subflow_uses_bounded_reservoir_before_new_startup() {
         mux_limits.max_path_flight_bytes as u64,
         false,
     );
-    measured_subflow.snapshot.product_progress_rate_bps = Some(120_000_000.0);
-    measured_subflow.snapshot.srtt_ms = 80.0;
-    measured_subflow.snapshot.min_rtt_ms = 80.0;
-    measured_subflow.snapshot.delivery_rate_bps = 200_000_000.0;
-    measured_subflow.snapshot.pacing_rate_bps = 200_000_000.0;
-    measured_subflow.snapshot.app_limited = false;
+    measured_subflow
+        .observation
+        .snapshot
+        .product_progress_rate_bps = Some(120_000_000.0);
+    measured_subflow.observation.snapshot.srtt_ms = 80.0;
+    measured_subflow.observation.snapshot.min_rtt_ms = 80.0;
+    measured_subflow.observation.snapshot.delivery_rate_bps = 200_000_000.0;
+    measured_subflow.observation.snapshot.pacing_rate_bps = 200_000_000.0;
+    measured_subflow.observation.snapshot.app_limited = false;
     let mut unmeasured = response_target(
         2,
         UnderlayProtocol::Udp,
@@ -4152,7 +4205,7 @@ fn measured_quic_subflow_uses_bounded_reservoir_before_new_startup() {
         mux_limits.max_path_flight_bytes as u64,
         false,
     );
-    unmeasured.has_bulk_rate_evidence = false;
+    unmeasured.observation.has_bulk_rate_evidence = false;
 
     let selected = select_response_sender_data_target_with_ordered_debt_and_epoch(
         &[service.clone(), measured_subflow.clone(), unmeasured],
@@ -4160,17 +4213,20 @@ fn measured_quic_subflow_uses_bounded_reservoir_before_new_startup() {
         payload_bytes,
         mux_limits,
         &[],
-        Some(service.key),
+        Some(service.observation.key),
         service_horizon,
         None,
     )
     .expect("a measured QUIC Subflow should use the bounded same-family partition");
 
-    assert_eq!(selected.target.key, measured_subflow.key);
+    assert_eq!(
+        selected.target.observation.key,
+        measured_subflow.observation.key
+    );
     assert_eq!(selected.admission().role, PathRuntimeRole::Subflow);
     assert_eq!(
         selected.subflow_set_commit().map(|commit| commit.service),
-        Some(service.key),
+        Some(service.observation.key),
         "measured QUIC overflow remains bound to the current Service"
     );
 
@@ -4181,12 +4237,12 @@ fn measured_quic_subflow_uses_bounded_reservoir_before_new_startup() {
         payload_bytes,
         mux_limits,
         &[],
-        Some(service.key),
+        Some(service.observation.key),
         product_reservoir,
         None,
     )
     .expect("Service remains the fallback at the ordering-reservoir boundary");
-    assert_eq!(exhausted.target.key, service.key);
+    assert_eq!(exhausted.target.observation.key, service.observation.key);
     assert_eq!(exhausted.admission().role, PathRuntimeRole::Service);
 }
 
@@ -4203,8 +4259,8 @@ fn measured_quic_subflow_does_not_cross_into_equal_path_load() {
         mux_limits.max_path_flight_bytes as u64,
         true,
     );
-    service.owner_data_in_flight_bytes = service_horizon as u64;
-    service.snapshot.active_flows = 1;
+    service.observation.owner_data_in_flight_bytes = service_horizon as u64;
+    service.observation.snapshot.active_flows = 1;
     let mut measured_subflow = response_target(
         1,
         UnderlayProtocol::Udp,
@@ -4213,8 +4269,8 @@ fn measured_quic_subflow_does_not_cross_into_equal_path_load() {
         mux_limits.max_path_flight_bytes as u64,
         false,
     );
-    measured_subflow.snapshot.active_flows = 1;
-    measured_subflow.snapshot.app_limited = false;
+    measured_subflow.observation.snapshot.active_flows = 1;
+    measured_subflow.observation.snapshot.app_limited = false;
 
     let selected = select_response_sender_data_target_with_ordered_debt_and_epoch(
         &[service.clone(), measured_subflow],
@@ -4222,13 +4278,13 @@ fn measured_quic_subflow_does_not_cross_into_equal_path_load() {
         payload_bytes,
         mux_limits,
         &[],
-        Some(service.key),
+        Some(service.observation.key),
         service_horizon,
         None,
     )
     .expect("the balanced QUIC Service should remain dispatchable");
 
-    assert_eq!(selected.target.key, service.key);
+    assert_eq!(selected.target.observation.key, service.observation.key);
     assert_eq!(selected.admission().role, PathRuntimeRole::Service);
 }
 
@@ -4245,7 +4301,7 @@ fn tcp_reservoir_does_not_charge_service_horizon_to_low_bdp_subflow() {
         mux_limits.max_path_flight_bytes as u64,
         true,
     );
-    service.snapshot.product_progress_rate_bps = Some(80_000_000.0);
+    service.observation.snapshot.product_progress_rate_bps = Some(80_000_000.0);
 
     let mut low_bdp_subflow = response_target(
         1,
@@ -4255,12 +4311,15 @@ fn tcp_reservoir_does_not_charge_service_horizon_to_low_bdp_subflow() {
         mux_limits.max_path_flight_bytes as u64,
         false,
     );
-    low_bdp_subflow.snapshot.product_progress_rate_bps = Some(54_016_000.0);
-    low_bdp_subflow.snapshot.delivery_rate_bps = 54_016_000.0;
-    low_bdp_subflow.snapshot.pacing_rate_bps = 54_016_000.0;
-    low_bdp_subflow.snapshot.srtt_ms = 137.968;
-    low_bdp_subflow.snapshot.min_rtt_ms = 137.968;
-    low_bdp_subflow.snapshot.app_limited = false;
+    low_bdp_subflow
+        .observation
+        .snapshot
+        .product_progress_rate_bps = Some(54_016_000.0);
+    low_bdp_subflow.observation.snapshot.delivery_rate_bps = 54_016_000.0;
+    low_bdp_subflow.observation.snapshot.pacing_rate_bps = 54_016_000.0;
+    low_bdp_subflow.observation.snapshot.srtt_ms = 137.968;
+    low_bdp_subflow.observation.snapshot.min_rtt_ms = 137.968;
+    low_bdp_subflow.observation.snapshot.app_limited = false;
 
     let selected = select_response_sender_data_target_with_ordered_debt_and_epoch(
         &[service.clone(), low_bdp_subflow.clone()],
@@ -4268,14 +4327,14 @@ fn tcp_reservoir_does_not_charge_service_horizon_to_low_bdp_subflow() {
         payload_bytes,
         mux_limits,
         &[],
-        Some(service.key),
+        Some(service.observation.key),
         service_horizon,
         None,
     )
     .expect("Service or its measured TCP Subflow must remain feedable");
 
     assert_eq!(
-        selected.target.key, low_bdp_subflow.key,
+        selected.target.observation.key, low_bdp_subflow.observation.key,
         "the connection-level Service horizon consumes global reservoir credit once; it is not candidate-local BDP flight"
     );
     assert_eq!(selected.admission().role, PathRuntimeRole::Subflow);
@@ -4294,9 +4353,9 @@ fn tcp_reservoir_requires_unique_service_owner_horizon() {
         mux_limits.max_path_flight_bytes as u64,
         true,
     );
-    service.owner_data_in_flight_bytes = payload_bytes as u64;
-    service.snapshot.queue_bytes = service_horizon as u64;
-    service.snapshot.product_progress_rate_bps = Some(80_000_000.0);
+    service.observation.owner_data_in_flight_bytes = payload_bytes as u64;
+    service.observation.snapshot.queue_bytes = service_horizon as u64;
+    service.observation.snapshot.product_progress_rate_bps = Some(80_000_000.0);
 
     let mut measured_subflow = response_target(
         1,
@@ -4306,10 +4365,13 @@ fn tcp_reservoir_requires_unique_service_owner_horizon() {
         mux_limits.max_path_flight_bytes as u64,
         false,
     );
-    measured_subflow.snapshot.product_progress_rate_bps = Some(200_000_000.0);
-    measured_subflow.snapshot.delivery_rate_bps = 200_000_000.0;
-    measured_subflow.snapshot.pacing_rate_bps = 200_000_000.0;
-    measured_subflow.snapshot.app_limited = false;
+    measured_subflow
+        .observation
+        .snapshot
+        .product_progress_rate_bps = Some(200_000_000.0);
+    measured_subflow.observation.snapshot.delivery_rate_bps = 200_000_000.0;
+    measured_subflow.observation.snapshot.pacing_rate_bps = 200_000_000.0;
+    measured_subflow.observation.snapshot.app_limited = false;
 
     let selected = select_response_sender_data_target_with_ordered_debt_and_epoch(
         &[service.clone(), measured_subflow],
@@ -4317,13 +4379,13 @@ fn tcp_reservoir_requires_unique_service_owner_horizon() {
         payload_bytes,
         mux_limits,
         &[],
-        Some(service.key),
+        Some(service.observation.key),
         service_horizon,
         None,
     )
     .expect("Service remains the fallback until its unique quota is assigned");
 
-    assert_eq!(selected.target.key, service.key);
+    assert_eq!(selected.target.observation.key, service.observation.key);
     assert_eq!(selected.admission().role, PathRuntimeRole::Service);
 }
 
@@ -4359,11 +4421,11 @@ fn tcp_reservoir_split_derives_reduced_resource_geometry() {
         resource_limit as u64,
         false,
     );
-    measured_subflow.snapshot.srtt_ms = 80.0;
-    measured_subflow.snapshot.min_rtt_ms = 80.0;
-    measured_subflow.snapshot.delivery_rate_bps = 200_000_000.0;
-    measured_subflow.snapshot.pacing_rate_bps = 200_000_000.0;
-    measured_subflow.snapshot.app_limited = false;
+    measured_subflow.observation.snapshot.srtt_ms = 80.0;
+    measured_subflow.observation.snapshot.min_rtt_ms = 80.0;
+    measured_subflow.observation.snapshot.delivery_rate_bps = 200_000_000.0;
+    measured_subflow.observation.snapshot.pacing_rate_bps = 200_000_000.0;
+    measured_subflow.observation.snapshot.app_limited = false;
 
     let selected = select_response_sender_data_target_with_ordered_debt_and_epoch(
         &[service.clone(), measured_subflow.clone()],
@@ -4371,12 +4433,15 @@ fn tcp_reservoir_split_derives_reduced_resource_geometry() {
         payload_bytes,
         mux_limits,
         &[],
-        Some(service.key),
+        Some(service.observation.key),
         service_horizon,
         None,
     )
     .expect("reduced valid resources should retain the derived TCP split");
-    assert_eq!(selected.target.key, measured_subflow.key);
+    assert_eq!(
+        selected.target.observation.key,
+        measured_subflow.observation.key
+    );
     assert_eq!(selected.admission().role, PathRuntimeRole::Subflow);
 }
 
@@ -4401,42 +4466,54 @@ fn tcp_reservoir_split_yields_to_latency_and_calibration_fences() {
         mux_limits.max_path_flight_bytes as u64,
         false,
     );
-    measured_subflow.snapshot.srtt_ms = 80.0;
-    measured_subflow.snapshot.min_rtt_ms = 80.0;
-    measured_subflow.snapshot.delivery_rate_bps = 200_000_000.0;
-    measured_subflow.snapshot.pacing_rate_bps = 200_000_000.0;
-    measured_subflow.snapshot.app_limited = false;
+    measured_subflow.observation.snapshot.srtt_ms = 80.0;
+    measured_subflow.observation.snapshot.min_rtt_ms = 80.0;
+    measured_subflow.observation.snapshot.delivery_rate_bps = 200_000_000.0;
+    measured_subflow.observation.snapshot.pacing_rate_bps = 200_000_000.0;
+    measured_subflow.observation.snapshot.app_limited = false;
 
-    service.snapshot.active_latency_sensitive_flows = 1;
+    service.observation.snapshot.active_latency_sensitive_flows = 1;
     let path_pressure = select_response_sender_data_target_with_ordered_debt_and_epoch(
         &[service.clone(), measured_subflow.clone()],
         FlowLane::Throughput,
         payload_bytes,
         mux_limits,
         &[],
-        Some(service.key),
+        Some(service.observation.key),
         service_horizon,
         None,
     )
     .expect("Service stays live under path-local latency pressure");
-    assert_eq!(path_pressure.target.key, service.key);
+    assert_eq!(
+        path_pressure.target.observation.key,
+        service.observation.key
+    );
 
-    service.snapshot.active_latency_sensitive_flows = 0;
-    service.snapshot.session_active_latency_sensitive_flows = 1;
+    service.observation.snapshot.active_latency_sensitive_flows = 0;
+    service
+        .observation
+        .snapshot
+        .session_active_latency_sensitive_flows = 1;
     let session_pressure = select_response_sender_data_target_with_ordered_debt_and_epoch(
         &[service.clone(), measured_subflow.clone()],
         FlowLane::Throughput,
         payload_bytes,
         mux_limits,
         &[],
-        Some(service.key),
+        Some(service.observation.key),
         service_horizon,
         None,
     )
     .expect("Service stays live under session latency pressure");
-    assert_eq!(session_pressure.target.key, service.key);
+    assert_eq!(
+        session_pressure.target.observation.key,
+        service.observation.key
+    );
 
-    service.snapshot.session_active_latency_sensitive_flows = 0;
+    service
+        .observation
+        .snapshot
+        .session_active_latency_sensitive_flows = 0;
     measured_subflow.ack_clock_calibration_eligible = true;
     measured_subflow.ack_clock_calibration_active = true;
     measured_subflow.ack_clock_calibration_proven = true;
@@ -4452,12 +4529,15 @@ fn tcp_reservoir_split_yields_to_latency_and_calibration_fences() {
         payload_bytes,
         mux_limits,
         &[],
-        Some(service.key),
+        Some(service.observation.key),
         service_horizon,
         None,
     )
     .expect("Service remains available while exact calibration flights drain");
-    assert_eq!(calibration_fence.target.key, service.key);
+    assert_eq!(
+        calibration_fence.target.observation.key,
+        service.observation.key
+    );
     assert_eq!(calibration_fence.admission().role, PathRuntimeRole::Service);
 }
 
@@ -4474,7 +4554,7 @@ fn tcp_reservoir_waits_for_binding_calibration_tail() {
         mux_limits.max_path_flight_bytes as u64,
         true,
     );
-    service.snapshot.product_progress_rate_bps = Some(80_000_000.0);
+    service.observation.snapshot.product_progress_rate_bps = Some(80_000_000.0);
 
     let mut proven = response_target(
         1,
@@ -4484,10 +4564,10 @@ fn tcp_reservoir_waits_for_binding_calibration_tail() {
         mux_limits.max_path_flight_bytes as u64,
         false,
     );
-    proven.snapshot.product_progress_rate_bps = Some(200_000_000.0);
-    proven.snapshot.delivery_rate_bps = 200_000_000.0;
-    proven.snapshot.pacing_rate_bps = 200_000_000.0;
-    proven.snapshot.app_limited = false;
+    proven.observation.snapshot.product_progress_rate_bps = Some(200_000_000.0);
+    proven.observation.snapshot.delivery_rate_bps = 200_000_000.0;
+    proven.observation.snapshot.pacing_rate_bps = 200_000_000.0;
+    proven.observation.snapshot.app_limited = false;
 
     let mut calibrating = response_target(
         2,
@@ -4510,13 +4590,13 @@ fn tcp_reservoir_waits_for_binding_calibration_tail() {
         payload_bytes,
         mux_limits,
         &[],
-        Some(service.key),
+        Some(service.observation.key),
         service_horizon,
         None,
     )
     .expect("Service remains available while calibration waits for ACK evidence");
 
-    assert_eq!(selected.target.key, service.key);
+    assert_eq!(selected.target.observation.key, service.observation.key);
     assert_eq!(selected.admission().role, PathRuntimeRole::Service);
 }
 
@@ -4548,12 +4628,12 @@ fn udp_service_remains_first_after_its_service_horizon() {
         payload_bytes,
         mux_limits,
         &[],
-        Some(service.key),
+        Some(service.observation.key),
         service_horizon,
         None,
     )
     .expect("UDP Service remains the packet-controller owner policy");
-    assert_eq!(selected.target.key, service.key);
+    assert_eq!(selected.target.observation.key, service.observation.key);
     assert_eq!(selected.admission().role, PathRuntimeRole::Service);
 }
 
@@ -4562,14 +4642,14 @@ fn unproven_service_bootstraps_before_app_limited_proven_subflow() {
     let mux_limits = MuxLimits::default();
     let payload_bytes = reliable_bulk_carrier_feed_quantum_bytes(mux_limits);
     let mut service = response_target(0, UnderlayProtocol::Udp, 25.0, 0, 16 * 1024 * 1024, true);
-    service.snapshot.product_queue_bytes = (2 * payload_bytes) as u64;
-    service.snapshot.app_limited = true;
-    service.has_bulk_rate_evidence = false;
+    service.observation.snapshot.product_queue_bytes = (2 * payload_bytes) as u64;
+    service.observation.snapshot.app_limited = true;
+    service.observation.has_bulk_rate_evidence = false;
 
     let mut proven_subflow =
         response_target(1, UnderlayProtocol::Udp, 5.0, 0, 16 * 1024 * 1024, false);
-    proven_subflow.snapshot.app_limited = true;
-    proven_subflow.has_bulk_rate_evidence = true;
+    proven_subflow.observation.snapshot.app_limited = true;
+    proven_subflow.observation.has_bulk_rate_evidence = true;
 
     let selected = select_response_sender_data_target_with_ordered_debt_and_epoch(
         &[service.clone(), proven_subflow],
@@ -4577,13 +4657,13 @@ fn unproven_service_bootstraps_before_app_limited_proven_subflow() {
         payload_bytes,
         mux_limits,
         &[],
-        Some(service.key),
+        Some(service.observation.key),
         0,
         None,
     )
     .expect("the unproven live Service remains feedable");
 
-    assert_eq!(selected.target.key, service.key);
+    assert_eq!(selected.target.observation.key, service.observation.key);
     assert_eq!(selected.admission().role, PathRuntimeRole::Service);
 }
 
@@ -4592,17 +4672,17 @@ fn feedable_service_precedes_less_committed_app_limited_subflow() {
     let mux_limits = MuxLimits::default();
     let payload_bytes = reliable_bulk_carrier_feed_quantum_bytes(mux_limits);
     let mut service = response_target(0, UnderlayProtocol::Udp, 25.0, 0, 16 * 1024 * 1024, true);
-    service.snapshot.product_queue_bytes = (2 * payload_bytes) as u64;
+    service.observation.snapshot.product_queue_bytes = (2 * payload_bytes) as u64;
 
     let mut underloaded =
         response_target(1, UnderlayProtocol::Udp, 5.0, 0, 16 * 1024 * 1024, false);
-    underloaded.snapshot.app_limited = true;
-    underloaded.has_bulk_rate_evidence = true;
+    underloaded.observation.snapshot.app_limited = true;
+    underloaded.observation.has_bulk_rate_evidence = true;
 
     let mut overloaded = response_target(2, UnderlayProtocol::Udp, 1.0, 0, 16 * 1024 * 1024, false);
-    overloaded.snapshot.product_queue_bytes = (4 * payload_bytes) as u64;
-    overloaded.snapshot.app_limited = true;
-    overloaded.has_bulk_rate_evidence = true;
+    overloaded.observation.snapshot.product_queue_bytes = (4 * payload_bytes) as u64;
+    overloaded.observation.snapshot.app_limited = true;
+    overloaded.observation.has_bulk_rate_evidence = true;
 
     let selected = select_response_sender_data_target_with_ordered_debt_and_epoch(
         &[service.clone(), underloaded, overloaded],
@@ -4619,7 +4699,7 @@ fn feedable_service_precedes_less_committed_app_limited_subflow() {
     )
     .expect("feedable Service remains selected despite more committed work");
 
-    assert_eq!(selected.target.key, service.key);
+    assert_eq!(selected.target.observation.key, service.observation.key);
     assert_eq!(selected.admission().role, PathRuntimeRole::Service);
 }
 
@@ -4636,18 +4716,18 @@ fn tcp_ack_clock_calibration_rejects_seed_beyond_service_reservoir() {
         16 * 1024 * 1024,
         false,
     );
-    candidate.snapshot.delivery_rate_bps = 2_000_000.0;
-    candidate.snapshot.product_progress_rate_bps = Some(2_000_000.0);
-    candidate.snapshot.app_limited = true;
+    candidate.observation.snapshot.delivery_rate_bps = 2_000_000.0;
+    candidate.observation.snapshot.product_progress_rate_bps = Some(2_000_000.0);
+    candidate.observation.snapshot.app_limited = true;
     candidate.ack_clock_calibration_eligible = true;
     let initial_limit = reliable_ack_clock_calibration_limit_bytes(mux_limits);
     candidate.ack_clock_calibration_credit_limit_bytes = initial_limit;
     candidate.ack_clock_calibration_max_limit_bytes = initial_limit.saturating_mul(4);
     let candidates = [&service, &candidate];
     let lead = ResponseBulkLead {
-        key: service.key,
-        snapshot: service.snapshot,
-        eta_ms: service.eta_ms,
+        key: service.observation.key,
+        snapshot: service.observation.snapshot,
+        eta_ms: service.observation.eta_ms,
     };
     assert_eq!(
         response_target_unique_owner_admission(
@@ -4670,12 +4750,12 @@ fn tcp_ack_clock_calibration_rejects_seed_beyond_service_reservoir() {
         payload_bytes,
         mux_limits,
         &[],
-        Some(service.key),
+        Some(service.observation.key),
         0,
         None,
     )
     .expect("Service remains available when exploration would create an ordering stall");
-    assert_eq!(selected.target.key, service.key);
+    assert_eq!(selected.target.observation.key, service.observation.key);
     assert!(selected.ack_clock_calibration_commit().is_none());
 }
 
@@ -4691,10 +4771,10 @@ fn tcp_ack_clock_calibration_explores_within_service_reservoir() {
         16 * 1024 * 1024,
         true,
     );
-    service.snapshot.delivery_rate_bps = 18_561_000.0;
-    service.snapshot.pacing_rate_bps = 18_561_000.0;
-    service.snapshot.srtt_ms = 333.0;
-    service.snapshot.min_rtt_ms = 333.0;
+    service.observation.snapshot.delivery_rate_bps = 18_561_000.0;
+    service.observation.snapshot.pacing_rate_bps = 18_561_000.0;
+    service.observation.snapshot.srtt_ms = 333.0;
+    service.observation.snapshot.min_rtt_ms = 333.0;
 
     let mut candidate = response_target(
         1,
@@ -4704,21 +4784,21 @@ fn tcp_ack_clock_calibration_explores_within_service_reservoir() {
         16 * 1024 * 1024,
         false,
     );
-    candidate.snapshot.delivery_rate_bps = 1_007_000.0;
-    candidate.snapshot.pacing_rate_bps = 1_007_000.0;
-    candidate.snapshot.product_progress_rate_bps = Some(1_007_000.0);
-    candidate.snapshot.srtt_ms = 730.287;
-    candidate.snapshot.min_rtt_ms = 730.287;
-    candidate.snapshot.app_limited = true;
+    candidate.observation.snapshot.delivery_rate_bps = 1_007_000.0;
+    candidate.observation.snapshot.pacing_rate_bps = 1_007_000.0;
+    candidate.observation.snapshot.product_progress_rate_bps = Some(1_007_000.0);
+    candidate.observation.snapshot.srtt_ms = 730.287;
+    candidate.observation.snapshot.min_rtt_ms = 730.287;
+    candidate.observation.snapshot.app_limited = true;
     candidate.ack_clock_calibration_eligible = true;
     let initial_limit = 183_802;
     candidate.ack_clock_calibration_credit_limit_bytes = initial_limit;
     candidate.ack_clock_calibration_max_limit_bytes = 64 * 1024 * 1024;
     let candidates = [&service, &candidate];
     let lead = ResponseBulkLead {
-        key: service.key,
-        snapshot: service.snapshot,
-        eta_ms: service.eta_ms,
+        key: service.observation.key,
+        snapshot: service.observation.snapshot,
+        eta_ms: service.observation.eta_ms,
     };
     assert_eq!(
         response_target_unique_owner_admission(
@@ -4741,12 +4821,12 @@ fn tcp_ack_clock_calibration_explores_within_service_reservoir() {
         payload_bytes,
         mux_limits,
         &[],
-        Some(service.key),
+        Some(service.observation.key),
         0,
         None,
     )
     .expect("bounded exploration should fit behind the Service reservoir");
-    assert_eq!(selected.target.key, candidate.key);
+    assert_eq!(selected.target.observation.key, candidate.observation.key);
     assert_eq!(selected.admission().role, PathRuntimeRole::Subflow);
     assert!(selected.ack_clock_calibration_commit().is_some());
 
@@ -4759,12 +4839,12 @@ fn tcp_ack_clock_calibration_explores_within_service_reservoir() {
         payload_bytes,
         mux_limits,
         &[],
-        Some(service.key),
+        Some(service.observation.key),
         0,
         None,
     )
     .expect("a causally authorized stage continues calibration");
-    assert_eq!(grown.target.key, candidate.key);
+    assert_eq!(grown.target.observation.key, candidate.observation.key);
     assert_eq!(
         grown
             .ack_clock_calibration_commit()
@@ -4780,12 +4860,15 @@ fn tcp_ack_clock_calibration_explores_within_service_reservoir() {
         payload_bytes,
         mux_limits,
         &[],
-        Some(service.key),
+        Some(service.observation.key),
         0,
         None,
     )
     .expect("a stage awaiting new ACK evidence returns to Service");
-    assert_eq!(awaiting_evidence.target.key, service.key);
+    assert_eq!(
+        awaiting_evidence.target.observation.key,
+        service.observation.key
+    );
     assert!(awaiting_evidence.ack_clock_calibration_commit().is_none());
 }
 
@@ -4799,8 +4882,8 @@ fn safe_tcp_calibration_waits_for_repair_carrier_headroom() {
     candidate.ack_clock_calibration_eligible = true;
     candidate.ack_clock_calibration_credit_limit_bytes = 256 * 1024;
     candidate.ack_clock_calibration_max_limit_bytes = 64 * 1024 * 1024;
-    candidate.snapshot.product_bytes_in_flight = 256 * 1024;
-    candidate.owner_data_in_flight_bytes = 0;
+    candidate.observation.snapshot.product_bytes_in_flight = 256 * 1024;
+    candidate.observation.owner_data_in_flight_bytes = 0;
 
     let selected = select_response_sender_data_target_with_ordered_debt_and_epoch(
         &[service.clone(), candidate],
@@ -4808,13 +4891,13 @@ fn safe_tcp_calibration_waits_for_repair_carrier_headroom() {
         payload_bytes,
         mux_limits,
         &[],
-        Some(service.key),
+        Some(service.observation.key),
         0,
         None,
     )
     .expect("Service remains available while RepairData occupies candidate headroom");
 
-    assert_eq!(selected.target.key, service.key);
+    assert_eq!(selected.target.observation.key, service.observation.key);
     assert!(selected.ack_clock_calibration_commit().is_none());
 }
 
@@ -4837,7 +4920,7 @@ fn tcp_ack_clock_calibration_retirement_releases_binding_fences() {
         .binding
         .sender_path_targets(FlowLane::Throughput, payload_bytes)
         .into_iter()
-        .find(|target| target.key == fixture.candidate)
+        .find(|target| target.observation.key == fixture.candidate)
         .expect("retired candidate remains attached");
     assert_eq!(candidate.ack_clock_calibration_spent_bytes, 0);
     assert_eq!(candidate.ack_clock_calibration_credit_limit_bytes, 0);
@@ -4880,10 +4963,10 @@ fn tcp_ack_clock_calibration_retirement_ignores_repair_only_carrier_debt() {
         .binding
         .sender_path_targets(FlowLane::Throughput, payload_bytes)
         .into_iter()
-        .find(|target| target.key == fixture.candidate)
+        .find(|target| target.observation.key == fixture.candidate)
         .expect("candidate remains attached");
-    assert_eq!(candidate.owner_data_in_flight_bytes, 0);
-    assert!(candidate.snapshot.product_bytes_in_flight > 0);
+    assert_eq!(candidate.observation.owner_data_in_flight_bytes, 0);
+    assert!(candidate.observation.snapshot.product_bytes_in_flight > 0);
     assert_eq!(candidate.ack_clock_calibration_credit_limit_bytes, 0);
     assert_eq!(candidate.ack_clock_calibration_max_limit_bytes, 0);
     assert!(!response_ack_clock_calibration_blocks_generic_owner(
@@ -4900,7 +4983,7 @@ fn tcp_ack_clock_calibration_retirement_refuses_exact_owner_flight() {
         .binding
         .sender_path_targets(FlowLane::Throughput, payload_bytes)
         .into_iter()
-        .find(|target| target.key == fixture.candidate)
+        .find(|target| target.observation.key == fixture.candidate)
         .expect("fresh calibration candidate");
     fixture.binding.record_owner_flight_for_target(
         &candidate,
@@ -4920,7 +5003,7 @@ fn tcp_ack_clock_calibration_retirement_refuses_exact_owner_flight() {
         .binding
         .sender_path_targets(FlowLane::Throughput, payload_bytes)
         .into_iter()
-        .find(|target| target.key == fixture.candidate)
+        .find(|target| target.observation.key == fixture.candidate)
         .expect("candidate remains attached");
     assert!(candidate.ack_clock_calibration_credit_limit_bytes > 0);
     assert!(candidate.ack_clock_calibration_max_limit_bytes > 0);
@@ -4948,7 +5031,7 @@ fn tcp_ack_clock_calibration_retirement_rejects_stale_path_model() {
         .binding
         .sender_path_targets(FlowLane::Throughput, payload_bytes)
         .into_iter()
-        .find(|target| target.key == fixture.candidate)
+        .find(|target| target.observation.key == fixture.candidate)
         .expect("candidate remains attached");
     assert!(candidate.ack_clock_calibration_credit_limit_bytes > 0);
 }
@@ -4989,7 +5072,7 @@ fn tcp_ack_clock_calibration_retirement_rejects_stale_pending_snapshots() {
         .binding
         .sender_path_targets(FlowLane::Throughput, payload_bytes)
         .into_iter()
-        .find(|target| target.key == fixture.service)
+        .find(|target| target.observation.key == fixture.service)
         .expect("Service target");
     service
         .commands
@@ -5033,7 +5116,7 @@ fn tcp_response_calibration_does_not_double_count_pending_owner_flight() {
     candidate.commands = commands;
     let initial_limit = reliable_ack_clock_calibration_limit_bytes(mux_limits);
     let committed = initial_limit - payload_bytes as u64;
-    candidate.snapshot.product_bytes_in_flight = committed;
+    candidate.observation.snapshot.product_bytes_in_flight = committed;
     candidate.ack_clock_calibration_eligible = true;
     candidate.ack_clock_calibration_active = true;
     candidate.ack_clock_calibration_spent_bytes = committed;
@@ -5063,13 +5146,13 @@ fn tcp_response_calibration_does_not_double_count_pending_owner_flight() {
         payload_bytes,
         mux_limits,
         &[],
-        Some(service.key),
+        Some(service.observation.key),
         0,
         None,
     )
     .expect("overlapping flight and queue views count as one debt");
 
-    assert_eq!(selected.target.key, candidate.key);
+    assert_eq!(selected.target.observation.key, candidate.observation.key);
     assert_eq!(selected.admission().role, PathRuntimeRole::Subflow);
     assert_eq!(
         selected
@@ -5089,7 +5172,7 @@ fn tcp_response_calibration_does_not_double_count_global_ordered_tail() {
         response_target(1, UnderlayProtocol::Tcp, 500.0, 0, 64 * 1024 * 1024, false);
     let ceiling = reliable_ack_clock_calibration_ceiling_bytes(mux_limits);
     let committed = ceiling - payload_bytes as u64;
-    candidate.snapshot.product_bytes_in_flight = committed;
+    candidate.observation.snapshot.product_bytes_in_flight = committed;
     candidate.ack_clock_calibration_eligible = true;
     candidate.ack_clock_calibration_active = true;
     candidate.ack_clock_calibration_spent_bytes = committed;
@@ -5102,13 +5185,13 @@ fn tcp_response_calibration_does_not_double_count_global_ordered_tail() {
         payload_bytes,
         mux_limits,
         &[],
-        Some(service.key),
+        Some(service.observation.key),
         committed as usize,
         None,
     )
     .expect("the global tail and candidate flight are the same product debt");
 
-    assert_eq!(selected.target.key, candidate.key);
+    assert_eq!(selected.target.observation.key, candidate.observation.key);
     assert_eq!(
         selected
             .ack_clock_calibration_commit()
@@ -5156,7 +5239,7 @@ async fn tcp_response_calibration_dispatch_restores_credit_after_exact_remainder
         .binding
         .sender_path_targets(FlowLane::Throughput, normal_payload_bytes)
         .into_iter()
-        .find(|target| target.key == fixture.candidate)
+        .find(|target| target.observation.key == fixture.candidate)
         .expect("calibration target");
     assert_eq!(
         target.ack_clock_calibration_spent_bytes,
@@ -5174,7 +5257,7 @@ async fn tcp_response_calibration_dispatch_restores_credit_after_exact_remainder
         .binding
         .sender_path_targets(FlowLane::Throughput, normal_payload_bytes)
         .into_iter()
-        .find(|target| target.key == fixture.candidate)
+        .find(|target| target.observation.key == fixture.candidate)
         .expect("drained calibration target");
     assert!(drained.ack_clock_calibration_active);
     assert!(
@@ -5286,7 +5369,7 @@ async fn tcp_response_calibration_dispatch_treats_pending_flight_as_one_debt() {
         .binding
         .sender_path_targets(FlowLane::Throughput, normal_payload_bytes)
         .into_iter()
-        .find(|target| target.key == fixture.candidate)
+        .find(|target| target.observation.key == fixture.candidate)
         .expect("calibration target");
     assert_eq!(
         target.ack_clock_calibration_spent_bytes,
@@ -5382,9 +5465,12 @@ fn blocked_active_ack_clock_candidate_does_not_select_another_calibration_owner(
         16 * 1024 * 1024,
         false,
     );
-    other_candidate.snapshot.delivery_rate_bps = 2_000_000.0;
-    other_candidate.snapshot.product_progress_rate_bps = Some(2_000_000.0);
-    other_candidate.snapshot.app_limited = true;
+    other_candidate.observation.snapshot.delivery_rate_bps = 2_000_000.0;
+    other_candidate
+        .observation
+        .snapshot
+        .product_progress_rate_bps = Some(2_000_000.0);
+    other_candidate.observation.snapshot.app_limited = true;
     other_candidate.ack_clock_calibration_eligible = true;
     other_candidate.ack_clock_calibration_credit_limit_bytes = initial_limit;
     other_candidate.ack_clock_calibration_max_limit_bytes = initial_limit.saturating_mul(2);
@@ -5395,12 +5481,12 @@ fn blocked_active_ack_clock_candidate_does_not_select_another_calibration_owner(
         payload_bytes,
         mux_limits,
         &[],
-        Some(service.key),
+        Some(service.observation.key),
         0,
         None,
     )
     .expect("Service remains feedable while the active calibration path is blocked");
-    assert_eq!(selected.target.key, service.key);
+    assert_eq!(selected.target.observation.key, service.observation.key);
     assert!(selected.ack_clock_calibration_commit().is_none());
 }
 
@@ -5438,7 +5524,7 @@ fn exhausted_active_calibration_cannot_bypass_saturated_service_via_generic_subf
             payload_bytes,
             mux_limits,
             &[],
-            Some(service.key),
+            Some(service.observation.key),
             0,
             None,
         )
@@ -5485,7 +5571,7 @@ fn proven_active_calibration_cannot_reenter_generic_ownership_before_drain() {
             payload_bytes,
             mux_limits,
             &[],
-            Some(service.key),
+            Some(service.observation.key),
             0,
             None,
         )
@@ -5523,7 +5609,7 @@ fn closed_active_calibration_drain_fence_blocks_next_startup_owner() {
         response_target(2, UnderlayProtocol::Tcp, 1.0, 0, 16 * 1024 * 1024, false);
     let (startup_commands, _startup_receivers) = reliable_path_command_channels(8);
     next_startup.commands = startup_commands;
-    next_startup.has_bulk_rate_evidence = false;
+    next_startup.observation.has_bulk_rate_evidence = false;
 
     let selected = select_response_sender_data_target_with_ordered_debt_and_epoch(
         &[service.clone(), draining, next_startup],
@@ -5531,12 +5617,12 @@ fn closed_active_calibration_drain_fence_blocks_next_startup_owner() {
         payload_bytes,
         mux_limits,
         &[],
-        Some(service.key),
+        Some(service.observation.key),
         0,
         None,
     )
     .expect("Service remains available during exact-flight drain");
-    assert_eq!(selected.target.key, service.key);
+    assert_eq!(selected.target.observation.key, service.observation.key);
     assert!(selected.subflow_set_commit().is_none());
 }
 
@@ -5545,10 +5631,13 @@ fn measured_same_family_alternate_is_subflow_when_service_is_not_feedable() {
     let mux_limits = MuxLimits::default();
     let payload_bytes = reliable_bulk_carrier_feed_quantum_bytes(mux_limits);
     let mut service = response_target(0, UnderlayProtocol::Tcp, 25.0, 0, 16 * 1024 * 1024, true);
-    let service_envelope =
-        bulk_active_service_product_envelope_bytes(service.snapshot, payload_bytes, mux_limits);
-    service.snapshot.product_bytes_in_flight = service_envelope;
-    service.snapshot.queue_bytes = payload_bytes as u64;
+    let service_envelope = bulk_active_service_product_envelope_bytes(
+        service.observation.snapshot,
+        payload_bytes,
+        mux_limits,
+    );
+    service.observation.snapshot.product_bytes_in_flight = service_envelope;
+    service.observation.snapshot.queue_bytes = payload_bytes as u64;
     let measured_subflow =
         response_target(1, UnderlayProtocol::Tcp, 5.0, 0, 16 * 1024 * 1024, false);
 
@@ -5558,13 +5647,16 @@ fn measured_same_family_alternate_is_subflow_when_service_is_not_feedable() {
         payload_bytes,
         mux_limits,
         &[],
-        Some(service.key),
+        Some(service.observation.key),
         0,
         None,
     )
     .expect("measured same-family path should remain an admissible Subflow when Service is not feedable");
 
-    assert_eq!(selected.target.key, measured_subflow.key);
+    assert_eq!(
+        selected.target.observation.key,
+        measured_subflow.observation.key
+    );
     assert_eq!(
         selected.admission().role,
         PathRuntimeRole::Subflow,
@@ -5588,15 +5680,16 @@ fn saturated_service_may_admit_one_startup_same_underlay_subflow_owner() {
         16 * 1024 * 1024,
         true,
     );
-    service.snapshot.product_progress_rate_bps = Some(180_000_000.0);
-    service.has_sender_evidence = true;
-    service.has_bulk_rate_evidence = true;
-    service.snapshot.active_flows = 2;
+    service.observation.snapshot.product_progress_rate_bps = Some(180_000_000.0);
+    service.observation.has_sender_evidence = true;
+    service.observation.has_bulk_rate_evidence = true;
+    service.observation.snapshot.active_flows = 2;
     let mut startup_subflow =
         response_target(1, UnderlayProtocol::Tcp, 5.0, 0, 16 * 1024 * 1024, false);
-    startup_subflow.has_sender_evidence = true;
-    startup_subflow.has_bulk_rate_evidence = false;
-    startup_subflow.snapshot.product_queue_bytes = mux_limits.max_path_flight_bytes as u64;
+    startup_subflow.observation.has_sender_evidence = true;
+    startup_subflow.observation.has_bulk_rate_evidence = false;
+    startup_subflow.observation.snapshot.product_queue_bytes =
+        mux_limits.max_path_flight_bytes as u64;
 
     let selected = select_response_sender_data_target_with_ordered_debt_and_epoch(
         &[service.clone(), startup_subflow.clone()],
@@ -5604,14 +5697,17 @@ fn saturated_service_may_admit_one_startup_same_underlay_subflow_owner() {
         payload_bytes,
         mux_limits,
         &[],
-        Some(service.key),
+        Some(service.observation.key),
         0,
         None,
     );
 
     let selected =
         selected.expect("startup same-underlay Subflow should receive one owner quantum");
-    assert_eq!(selected.target.key, startup_subflow.key);
+    assert_eq!(
+        selected.target.observation.key,
+        startup_subflow.observation.key
+    );
     assert_eq!(selected.admission().role, PathRuntimeRole::Subflow);
     assert!(
         selected
@@ -5626,14 +5722,14 @@ fn bulk_only_live_tcp_service_tail_admits_bounded_same_underlay_startup_sampling
     let mux_limits = MuxLimits::default();
     let payload_bytes = reliable_bulk_carrier_feed_quantum_bytes(mux_limits);
     let mut service = response_target(0, UnderlayProtocol::Tcp, 25.0, 0, 16 * 1024 * 1024, true);
-    service.snapshot.product_progress_rate_bps = Some(180_000_000.0);
-    service.has_sender_evidence = true;
-    service.has_bulk_rate_evidence = true;
-    service.snapshot.active_flows = 2;
+    service.observation.snapshot.product_progress_rate_bps = Some(180_000_000.0);
+    service.observation.has_sender_evidence = true;
+    service.observation.has_bulk_rate_evidence = true;
+    service.observation.snapshot.active_flows = 2;
     let mut startup_subflow =
         response_target(1, UnderlayProtocol::Tcp, 5.0, 0, 16 * 1024 * 1024, false);
-    startup_subflow.has_sender_evidence = true;
-    startup_subflow.has_bulk_rate_evidence = false;
+    startup_subflow.observation.has_sender_evidence = true;
+    startup_subflow.observation.has_bulk_rate_evidence = false;
 
     let selected = select_response_sender_data_target_with_ordered_debt_and_epoch(
         &[service.clone(), startup_subflow.clone()],
@@ -5641,13 +5737,16 @@ fn bulk_only_live_tcp_service_tail_admits_bounded_same_underlay_startup_sampling
         payload_bytes,
         mux_limits,
         &[],
-        Some(service.key),
+        Some(service.observation.key),
         payload_bytes,
         None,
     )
     .expect("bounded TCP startup sampling should remain dispatchable behind a live Service suffix");
 
-    assert_eq!(selected.target.key, startup_subflow.key);
+    assert_eq!(
+        selected.target.observation.key,
+        startup_subflow.observation.key
+    );
     assert_eq!(selected.admission().role, PathRuntimeRole::Subflow);
     assert!(
         selected
@@ -5662,14 +5761,14 @@ fn quic_service_uses_bounded_startup_when_no_measured_subflow_exists() {
     let mux_limits = MuxLimits::default();
     let payload_bytes = reliable_bulk_carrier_feed_quantum_bytes(mux_limits);
     let mut service = response_target(0, UnderlayProtocol::Udp, 25.0, 0, 16 * 1024 * 1024, true);
-    service.snapshot.product_progress_rate_bps = Some(180_000_000.0);
-    service.has_sender_evidence = true;
-    service.has_bulk_rate_evidence = true;
-    service.snapshot.active_flows = 2;
+    service.observation.snapshot.product_progress_rate_bps = Some(180_000_000.0);
+    service.observation.has_sender_evidence = true;
+    service.observation.has_bulk_rate_evidence = true;
+    service.observation.snapshot.active_flows = 2;
     let mut startup_subflow =
         response_target(1, UnderlayProtocol::Udp, 5.0, 0, 16 * 1024 * 1024, false);
-    startup_subflow.has_sender_evidence = true;
-    startup_subflow.has_bulk_rate_evidence = false;
+    startup_subflow.observation.has_sender_evidence = true;
+    startup_subflow.observation.has_bulk_rate_evidence = false;
 
     let selected = select_response_sender_data_target_with_ordered_debt_and_epoch(
         &[service.clone(), startup_subflow.clone()],
@@ -5677,13 +5776,16 @@ fn quic_service_uses_bounded_startup_when_no_measured_subflow_exists() {
         payload_bytes,
         mux_limits,
         &[],
-        Some(service.key),
+        Some(service.observation.key),
         payload_bytes,
         None,
     )
     .expect("one unmeasured QUIC path should receive bounded startup work");
 
-    assert_eq!(selected.target.key, startup_subflow.key);
+    assert_eq!(
+        selected.target.observation.key,
+        startup_subflow.observation.key
+    );
     assert_eq!(selected.admission().role, PathRuntimeRole::Subflow);
     assert!(
         selected
@@ -5697,11 +5799,11 @@ fn sole_quic_service_does_not_sample_an_equally_loaded_path() {
     let mux_limits = MuxLimits::default();
     let payload_bytes = reliable_bulk_carrier_feed_quantum_bytes(mux_limits);
     let mut service = response_target(0, UnderlayProtocol::Udp, 25.0, 0, 16 * 1024 * 1024, true);
-    service.snapshot.product_progress_rate_bps = Some(180_000_000.0);
-    service.snapshot.active_flows = 1;
+    service.observation.snapshot.product_progress_rate_bps = Some(180_000_000.0);
+    service.observation.snapshot.active_flows = 1;
     let mut validation = response_target(1, UnderlayProtocol::Udp, 5.0, 0, 16 * 1024 * 1024, false);
-    validation.has_bulk_rate_evidence = false;
-    validation.snapshot.active_flows = 1;
+    validation.observation.has_bulk_rate_evidence = false;
+    validation.observation.snapshot.active_flows = 1;
 
     let selected = select_response_sender_data_target_with_ordered_debt_inner(
         &[service.clone(), validation],
@@ -5709,14 +5811,14 @@ fn sole_quic_service_does_not_sample_an_equally_loaded_path() {
         payload_bytes,
         mux_limits,
         &[],
-        Some(service.key),
+        Some(service.observation.key),
         payload_bytes,
         None,
         true,
     )
     .expect("the equally loaded Service should remain dispatchable");
 
-    assert_eq!(selected.target.key, service.key);
+    assert_eq!(selected.target.observation.key, service.observation.key);
     assert_eq!(selected.admission().role, PathRuntimeRole::Service);
     assert!(selected.subflow_set_commit().is_none());
 }
@@ -5726,10 +5828,13 @@ fn latency_pressure_keeps_unmeasured_validation_path_out_of_owner_sampling() {
     let mux_limits = MuxLimits::default();
     let payload_bytes = reliable_bulk_carrier_feed_quantum_bytes(mux_limits);
     let mut service = response_target(0, UnderlayProtocol::Udp, 25.0, 0, 16 * 1024 * 1024, true);
-    service.snapshot.product_progress_rate_bps = Some(180_000_000.0);
-    service.snapshot.session_active_latency_sensitive_flows = 1;
+    service.observation.snapshot.product_progress_rate_bps = Some(180_000_000.0);
+    service
+        .observation
+        .snapshot
+        .session_active_latency_sensitive_flows = 1;
     let mut validation = response_target(1, UnderlayProtocol::Udp, 5.0, 0, 16 * 1024 * 1024, false);
-    validation.has_bulk_rate_evidence = false;
+    validation.observation.has_bulk_rate_evidence = false;
 
     let selected = select_response_sender_data_target_with_ordered_debt_and_epoch(
         &[service.clone(), validation.clone()],
@@ -5737,13 +5842,13 @@ fn latency_pressure_keeps_unmeasured_validation_path_out_of_owner_sampling() {
         payload_bytes,
         mux_limits,
         &[],
-        Some(service.key),
+        Some(service.observation.key),
         payload_bytes,
         None,
     )
     .expect("the Service path should remain dispatchable under latency pressure");
 
-    assert_eq!(selected.target.key, service.key);
+    assert_eq!(selected.target.observation.key, service.observation.key);
     assert_eq!(selected.admission().role, PathRuntimeRole::Service);
     assert!(selected.subflow_set_commit().is_none());
 }
@@ -5753,10 +5858,10 @@ fn repair_attachment_never_receives_startup_owner_sampling() {
     let mux_limits = MuxLimits::default();
     let payload_bytes = reliable_bulk_carrier_feed_quantum_bytes(mux_limits);
     let mut service = response_target(0, UnderlayProtocol::Tcp, 25.0, 0, 16 * 1024 * 1024, true);
-    service.snapshot.product_progress_rate_bps = Some(180_000_000.0);
+    service.observation.snapshot.product_progress_rate_bps = Some(180_000_000.0);
     let mut repair = response_target(1, UnderlayProtocol::Tcp, 5.0, 0, 16 * 1024 * 1024, false);
-    repair.attachment_role = StreamOpenRole::Repair;
-    repair.has_bulk_rate_evidence = true;
+    repair.observation.attachment_role = StreamOpenRole::Repair;
+    repair.observation.has_bulk_rate_evidence = true;
 
     let selected = select_response_sender_data_target_with_ordered_debt_and_epoch(
         &[service.clone(), repair],
@@ -5764,13 +5869,13 @@ fn repair_attachment_never_receives_startup_owner_sampling() {
         payload_bytes,
         mux_limits,
         &[],
-        Some(service.key),
+        Some(service.observation.key),
         payload_bytes,
         None,
     )
     .expect("the Service path should remain dispatchable with a proven Repair attachment");
 
-    assert_eq!(selected.target.key, service.key);
+    assert_eq!(selected.target.observation.key, service.observation.key);
     assert_eq!(selected.admission().role, PathRuntimeRole::Service);
 }
 
@@ -5783,11 +5888,11 @@ fn exact_startup_owner_continues_lower_frontier_within_multi_flow_cap() {
     assert_eq!(startup_credit % payload_bytes, 0);
 
     let mut service = response_target(0, UnderlayProtocol::Udp, 25.0, 0, 16 * 1024 * 1024, true);
-    service.snapshot.active_flows = 2;
-    service.has_bulk_rate_evidence = true;
+    service.observation.snapshot.active_flows = 2;
+    service.observation.has_bulk_rate_evidence = true;
     let mut startup_owner =
         response_target(1, UnderlayProtocol::Udp, 5.0, 0, 16 * 1024 * 1024, false);
-    startup_owner.has_bulk_rate_evidence = false;
+    startup_owner.observation.has_bulk_rate_evidence = false;
 
     let first = select_response_sender_data_target_with_ordered_debt_inner(
         &[service.clone(), startup_owner.clone()],
@@ -5795,7 +5900,7 @@ fn exact_startup_owner_continues_lower_frontier_within_multi_flow_cap() {
         payload_bytes,
         mux_limits,
         &[],
-        Some(service.key),
+        Some(service.observation.key),
         0,
         None,
         true,
@@ -5805,15 +5910,21 @@ fn exact_startup_owner_continues_lower_frontier_within_multi_flow_cap() {
         .subflow_set_commit()
         .expect("startup admission must carry the exact epoch commit")
         .input;
-    let mut partial_epoch = FlowSubflowSet::new(0, service.key, startup_credit, 0, Duration::ZERO);
+    let mut partial_epoch = FlowSubflowSet::new(
+        0,
+        service.observation.key,
+        startup_credit,
+        0,
+        Duration::ZERO,
+    );
     assert_eq!(
         partial_epoch.admit_subflow_owner(input).decision,
         PathAdmissionDecision::AdmitSubflow
     );
-    startup_owner.snapshot.product_bytes_in_flight = payload_bytes as u64;
-    startup_owner.owner_data_in_flight_bytes = payload_bytes as u64;
+    startup_owner.observation.snapshot.product_bytes_in_flight = payload_bytes as u64;
+    startup_owner.observation.owner_data_in_flight_bytes = payload_bytes as u64;
     let startup_lower_flight = [CarrierPathFlightDebt {
-        key: startup_owner.key,
+        key: startup_owner.observation.key,
         bytes: payload_bytes as u64,
     }];
 
@@ -5824,7 +5935,7 @@ fn exact_startup_owner_continues_lower_frontier_within_multi_flow_cap() {
             payload_bytes,
             mux_limits,
             &startup_lower_flight,
-            Some(service.key),
+            Some(service.observation.key),
             payload_bytes,
             Some(&partial_epoch),
             false,
@@ -5839,20 +5950,23 @@ fn exact_startup_owner_continues_lower_frontier_within_multi_flow_cap() {
         payload_bytes,
         mux_limits,
         &startup_lower_flight,
-        Some(service.key),
+        Some(service.observation.key),
         payload_bytes,
         Some(&partial_epoch),
         true,
     )
     .expect("the exact startup owner should continue its own lower frontier");
-    assert_eq!(continued.target.key, startup_owner.key);
+    assert_eq!(
+        continued.target.observation.key,
+        startup_owner.observation.key
+    );
     assert_eq!(continued.admission().role, PathRuntimeRole::Subflow);
 
     let mut other_unmeasured =
         response_target(2, UnderlayProtocol::Udp, 4.0, 0, 16 * 1024 * 1024, false);
-    other_unmeasured.has_bulk_rate_evidence = false;
+    other_unmeasured.observation.has_bulk_rate_evidence = false;
     let other_lower_flight = [CarrierPathFlightDebt {
-        key: other_unmeasured.key,
+        key: other_unmeasured.observation.key,
         bytes: payload_bytes as u64,
     }];
     assert!(
@@ -5862,7 +5976,7 @@ fn exact_startup_owner_continues_lower_frontier_within_multi_flow_cap() {
             payload_bytes,
             mux_limits,
             &other_lower_flight,
-            Some(service.key),
+            Some(service.observation.key),
             payload_bytes,
             Some(&partial_epoch),
             true,
@@ -5878,8 +5992,8 @@ fn exact_startup_owner_continues_lower_frontier_within_multi_flow_cap() {
             PathAdmissionDecision::AdmitSubflow
         );
     }
-    startup_owner.snapshot.product_bytes_in_flight = startup_credit as u64;
-    startup_owner.owner_data_in_flight_bytes = startup_credit as u64;
+    startup_owner.observation.snapshot.product_bytes_in_flight = startup_credit as u64;
+    startup_owner.observation.owner_data_in_flight_bytes = startup_credit as u64;
     assert!(
         select_response_sender_data_target_with_ordered_debt_inner(
             &[service.clone(), startup_owner.clone()],
@@ -5887,7 +6001,7 @@ fn exact_startup_owner_continues_lower_frontier_within_multi_flow_cap() {
             payload_bytes,
             mux_limits,
             &startup_lower_flight,
-            Some(service.key),
+            Some(service.observation.key),
             startup_credit,
             Some(&exhausted_epoch),
             true,
@@ -5902,13 +6016,13 @@ fn exact_startup_owner_continues_lower_frontier_within_multi_flow_cap() {
         payload_bytes,
         mux_limits,
         &[],
-        Some(service.key),
+        Some(service.observation.key),
         startup_credit,
         Some(&exhausted_epoch),
         true,
     )
     .expect("Service should resume after the exhausted startup hole clears");
-    assert_eq!(after_ack.target.key, service.key);
+    assert_eq!(after_ack.target.observation.key, service.observation.key);
     assert_eq!(after_ack.admission().role, PathRuntimeRole::Service);
 }
 
@@ -5917,11 +6031,11 @@ fn active_response_flow_may_start_one_bounded_same_family_sample() {
     let mux_limits = MuxLimits::default();
     let payload_bytes = reliable_bulk_carrier_feed_quantum_bytes(mux_limits);
     let mut service = response_target(0, UnderlayProtocol::Udp, 25.0, 0, 16 * 1024 * 1024, true);
-    service.snapshot.product_progress_rate_bps = Some(180_000_000.0);
-    service.snapshot.active_flows = 1;
-    let service_key = service.key;
+    service.observation.snapshot.product_progress_rate_bps = Some(180_000_000.0);
+    service.observation.snapshot.active_flows = 1;
+    let service_key = service.observation.key;
     let mut validation = response_target(1, UnderlayProtocol::Udp, 5.0, 0, 16 * 1024 * 1024, false);
-    validation.has_bulk_rate_evidence = false;
+    validation.observation.has_bulk_rate_evidence = false;
 
     let no_active_work = select_response_sender_data_target_with_ordered_debt_inner(
         &[service.clone(), validation.clone()],
@@ -5935,7 +6049,10 @@ fn active_response_flow_may_start_one_bounded_same_family_sample() {
         false,
     )
     .expect("the Service remains dispatchable while discovery is dormant");
-    assert_eq!(no_active_work.target.key, service.key);
+    assert_eq!(
+        no_active_work.target.observation.key,
+        service.observation.key
+    );
     assert_eq!(no_active_work.admission().role, PathRuntimeRole::Service);
     assert!(no_active_work.subflow_set_commit().is_none());
 
@@ -5951,7 +6068,10 @@ fn active_response_flow_may_start_one_bounded_same_family_sample() {
         true,
     )
     .expect("one active response may spend the bounded startup sample");
-    assert_eq!(active_response.target.key, validation.key);
+    assert_eq!(
+        active_response.target.observation.key,
+        validation.observation.key
+    );
     assert!(
         active_response
             .subflow_set_commit()
@@ -5968,24 +6088,25 @@ fn startup_sample_cap_returns_dispatch_to_service() {
     assert_eq!(startup_credit % payload_bytes, 0);
 
     let mut service = response_target(0, UnderlayProtocol::Udp, 25.0, 0, 16 * 1024 * 1024, true);
-    service.snapshot.product_progress_rate_bps = Some(180_000_000.0);
-    service.snapshot.active_flows = 2;
+    service.observation.snapshot.product_progress_rate_bps = Some(180_000_000.0);
+    service.observation.snapshot.active_flows = 2;
     let mut validation = response_target(1, UnderlayProtocol::Udp, 5.0, 0, 16 * 1024 * 1024, false);
-    validation.has_bulk_rate_evidence = false;
+    validation.observation.has_bulk_rate_evidence = false;
     let candidates = [&service, &validation];
     let lead = ResponseBulkLead {
-        key: service.key,
-        snapshot: service.snapshot,
-        eta_ms: service.eta_ms,
+        key: service.observation.key,
+        snapshot: service.observation.snapshot,
+        eta_ms: service.observation.eta_ms,
     };
     let outcome = response_target_unique_owner_admission_with_epoch(
         &validation,
         &candidates,
         lead,
         None,
-        Some(service.key),
+        Some(service.observation.key),
         0,
-        ResponseOrderedTail::new(Some(service.key), payload_bytes).for_candidate(validation.key),
+        ResponseOrderedTail::new(Some(service.observation.key), payload_bytes)
+            .for_candidate(validation.observation.key),
         payload_bytes,
         mux_limits,
         None,
@@ -5996,7 +6117,13 @@ fn startup_sample_cap_returns_dispatch_to_service() {
         .subflow_set_commit()
         .expect("first sample quantum should be admitted")
         .input;
-    let mut epoch = FlowSubflowSet::new(0, service.key, startup_credit, 0, Duration::ZERO);
+    let mut epoch = FlowSubflowSet::new(
+        0,
+        service.observation.key,
+        startup_credit,
+        0,
+        Duration::ZERO,
+    );
     for _ in 0..(startup_credit / payload_bytes) {
         assert_eq!(
             epoch.admit_subflow_owner(input).decision,
@@ -6010,13 +6137,13 @@ fn startup_sample_cap_returns_dispatch_to_service() {
         payload_bytes,
         mux_limits,
         &[],
-        Some(service.key),
+        Some(service.observation.key),
         payload_bytes,
         Some(&epoch),
     )
     .expect("Service should resume once startup sampling credit is exhausted");
 
-    assert_eq!(selected.target.key, service.key);
+    assert_eq!(selected.target.observation.key, service.observation.key);
     assert_eq!(selected.admission().role, PathRuntimeRole::Service);
     assert!(selected.subflow_set_commit().is_none());
 }
@@ -6026,13 +6153,13 @@ fn feedable_service_precedes_measured_subflow_under_bounded_tail_debt() {
     let mux_limits = MuxLimits::default();
     let payload_bytes = reliable_bulk_carrier_feed_quantum_bytes(mux_limits);
     let mut service = response_target(0, UnderlayProtocol::Tcp, 50.0, 0, 16 * 1024 * 1024, true);
-    service.has_sender_evidence = true;
-    service.has_bulk_rate_evidence = true;
+    service.observation.has_sender_evidence = true;
+    service.observation.has_bulk_rate_evidence = true;
     let mut measured_subflow =
         response_target(1, UnderlayProtocol::Tcp, 5.0, 0, 16 * 1024 * 1024, false);
-    measured_subflow.has_sender_evidence = true;
-    measured_subflow.has_bulk_rate_evidence = true;
-    measured_subflow.snapshot.app_limited = false;
+    measured_subflow.observation.has_sender_evidence = true;
+    measured_subflow.observation.has_bulk_rate_evidence = true;
+    measured_subflow.observation.snapshot.app_limited = false;
 
     let selected = select_response_sender_data_target_with_ordered_debt_and_epoch(
         &[service.clone(), measured_subflow.clone()],
@@ -6040,13 +6167,13 @@ fn feedable_service_precedes_measured_subflow_under_bounded_tail_debt() {
         payload_bytes,
         mux_limits,
         &[],
-        Some(service.key),
+        Some(service.observation.key),
         payload_bytes.saturating_mul(2),
         None,
     )
     .expect("feedable Service should remain selected under bounded tail debt");
 
-    assert_eq!(selected.target.key, service.key);
+    assert_eq!(selected.target.observation.key, service.observation.key);
     assert_eq!(
         selected.admission().role,
         PathRuntimeRole::Service,
@@ -6060,7 +6187,7 @@ fn response_owner_tail_guard_keeps_service_owner_feedable_under_pressure() {
     let payload_bytes = reliable_bulk_carrier_feed_quantum_bytes(mux_limits);
     let owner = response_target(0, UnderlayProtocol::Tcp, 5.0, 0, 16 * 1024 * 1024, true);
     let alternate = response_target(1, UnderlayProtocol::Tcp, 50.0, 0, 16 * 1024 * 1024, false);
-    let owner_key = owner.key;
+    let owner_key = owner.observation.key;
     let owner_tail_guard_bytes = payload_bytes.saturating_mul(2);
 
     let selected = select_response_sender_data_target_with_ordered_debt_and_epoch(
@@ -6076,7 +6203,7 @@ fn response_owner_tail_guard_keeps_service_owner_feedable_under_pressure() {
     .expect("live Service owner must remain feedable under contiguous owner-tail guard");
 
     assert_eq!(
-        selected.target.key, owner_key,
+        selected.target.observation.key, owner_key,
         "contiguous owner-tail guard blocks alternates but must not starve the current Service owner"
     );
     assert_eq!(selected.admission().role, PathRuntimeRole::Service);
@@ -6110,13 +6237,13 @@ fn response_owner_tail_guard_uses_measured_same_underlay_when_service_queue_is_f
         payload_bytes,
         mux_limits,
         &[],
-        Some(owner.key),
+        Some(owner.observation.key),
         owner_tail_guard_bytes,
         None,
     );
     let selected =
         selected.expect("measured same-underlay Subflow should remain eligible under tail debt");
-    assert_eq!(selected.target.key, alternate.key);
+    assert_eq!(selected.target.observation.key, alternate.observation.key);
     assert_eq!(
         selected.admission().role,
         PathRuntimeRole::Subflow,
@@ -6151,7 +6278,7 @@ fn ordered_owner_debt_admits_measured_same_underlay_subflow_when_service_is_back
         payload_bytes,
         mux_limits,
         &[],
-        Some(service.key),
+        Some(service.observation.key),
         owner_tail_guard_bytes,
         None,
         true,
@@ -6159,7 +6286,7 @@ fn ordered_owner_debt_admits_measured_same_underlay_subflow_when_service_is_back
 
     let selected =
         selected.expect("measured same-underlay Subflow should pass tail-debt admission");
-    assert_eq!(selected.target.key, survivor.key);
+    assert_eq!(selected.target.observation.key, survivor.observation.key);
     assert_eq!(
         selected.admission().role,
         PathRuntimeRole::Subflow,
@@ -6172,9 +6299,9 @@ fn ordered_owner_debt_keeps_live_service_owner_when_it_has_capacity() {
     let mux_limits = MuxLimits::default();
     let payload_bytes = reliable_bulk_carrier_feed_quantum_bytes(mux_limits);
     let mut service = response_target(0, UnderlayProtocol::Tcp, 333.0, 0, 16 * 1024 * 1024, true);
-    service.has_sender_evidence = true;
-    service.has_bulk_rate_evidence = true;
-    service.snapshot.product_progress_rate_bps = Some(1_121_000.0);
+    service.observation.has_sender_evidence = true;
+    service.observation.has_bulk_rate_evidence = true;
+    service.observation.snapshot.product_progress_rate_bps = Some(1_121_000.0);
     let survivor = response_target(1, UnderlayProtocol::Tcp, 712.0, 0, 16 * 1024 * 1024, false);
     let owner_tail_guard_bytes = payload_bytes.saturating_mul(58);
 
@@ -6184,7 +6311,7 @@ fn ordered_owner_debt_keeps_live_service_owner_when_it_has_capacity() {
         payload_bytes,
         mux_limits,
         &[],
-        Some(service.key),
+        Some(service.observation.key),
         owner_tail_guard_bytes,
         None,
         true,
@@ -6192,7 +6319,7 @@ fn ordered_owner_debt_keeps_live_service_owner_when_it_has_capacity() {
     .expect("ordered-owner debt must not suppress a live Service owner with emission credit");
 
     assert_eq!(
-        selected.target.key, service.key,
+        selected.target.observation.key, service.observation.key,
         "ordered-owner debt must not eject a live owner and create no_admissible_lead"
     );
     assert_eq!(selected.admission().role, PathRuntimeRole::Service);
@@ -6218,8 +6345,8 @@ fn unresolved_ordered_owner_debt_does_not_grant_owner_bytes_to_unmeasured_surviv
         .expect("seed full stale Service data queue");
     stale_service.commands = service_commands;
     let mut proof_only = response_target(1, UnderlayProtocol::Tcp, 5.0, 0, 16 * 1024 * 1024, false);
-    proof_only.has_sender_evidence = true;
-    proof_only.has_bulk_rate_evidence = false;
+    proof_only.observation.has_sender_evidence = true;
+    proof_only.observation.has_bulk_rate_evidence = false;
     let owner_tail_guard_bytes = payload_bytes.saturating_mul(2);
 
     let selected = select_response_sender_data_target_with_ordered_debt_inner(
@@ -6228,7 +6355,7 @@ fn unresolved_ordered_owner_debt_does_not_grant_owner_bytes_to_unmeasured_surviv
         payload_bytes,
         mux_limits,
         &[],
-        Some(stale_service.key),
+        Some(stale_service.observation.key),
         owner_tail_guard_bytes,
         None,
         true,
@@ -6250,8 +6377,8 @@ fn unresolved_ordered_owner_debt_blocks_active_liveness_survivor() {
     };
     let mut active_validation =
         response_target(1, UnderlayProtocol::Udp, 5.0, 0, 16 * 1024 * 1024, true);
-    active_validation.has_sender_evidence = true;
-    active_validation.has_bulk_rate_evidence = false;
+    active_validation.observation.has_sender_evidence = true;
+    active_validation.observation.has_bulk_rate_evidence = false;
     let owner_tail_guard_bytes = payload_bytes.saturating_mul(2);
 
     let selected = select_response_sender_data_target_with_ordered_debt_inner(
@@ -6278,11 +6405,11 @@ fn clear_frontier_stale_owner_hint_does_not_block_liveness_service_failover() {
     let payload_bytes = reliable_bulk_carrier_feed_quantum_bytes(mux_limits);
     let mut stale_owner =
         response_target(2, UnderlayProtocol::Tcp, 500.0, 0, 16 * 1024 * 1024, false);
-    stale_owner.has_sender_evidence = true;
-    stale_owner.has_bulk_rate_evidence = false;
+    stale_owner.observation.has_sender_evidence = true;
+    stale_owner.observation.has_bulk_rate_evidence = false;
     let mut survivor = response_target(3, UnderlayProtocol::Tcp, 50.0, 0, 16 * 1024 * 1024, false);
-    survivor.has_sender_evidence = true;
-    survivor.has_bulk_rate_evidence = false;
+    survivor.observation.has_sender_evidence = true;
+    survivor.observation.has_bulk_rate_evidence = false;
 
     let selected = select_response_sender_data_target_with_ordered_debt_and_epoch(
         &[stale_owner.clone(), survivor.clone()],
@@ -6290,14 +6417,14 @@ fn clear_frontier_stale_owner_hint_does_not_block_liveness_service_failover() {
         payload_bytes,
         mux_limits,
         &[],
-        Some(stale_owner.key),
+        Some(stale_owner.observation.key),
         0,
         None,
     )
     .expect("with no active Service and a clear frontier, sender-evidence survivors may elect exactly one liveness Service");
 
     assert_eq!(
-        selected.target.key, survivor.key,
+        selected.target.observation.key, survivor.observation.key,
         "a stale ordered-owner hint without unresolved bytes must not pin Service ownership to a worse proof-only path"
     );
     assert_eq!(
@@ -6326,7 +6453,7 @@ fn clear_frontier_ownerless_stream_elects_measured_service() {
     )
     .expect("frontier-clear ownerless stream may elect a measured survivor as Service");
 
-    assert_eq!(selected.target.key, survivor.key);
+    assert_eq!(selected.target.observation.key, survivor.observation.key);
     assert_eq!(
         selected.admission().role,
         PathRuntimeRole::Service,
@@ -6343,10 +6470,13 @@ fn response_owner_tail_guard_admits_measured_same_underlay_when_service_over_bud
     };
     let payload_bytes = 64 * 1024usize;
     let mut owner = response_target(0, UnderlayProtocol::Udp, 50.0, 0, 16 * 1024 * 1024, true);
-    let service_envelope =
-        bulk_active_service_product_envelope_bytes(owner.snapshot, payload_bytes, mux_limits);
-    owner.snapshot.product_bytes_in_flight = service_envelope;
-    owner.snapshot.queue_bytes = payload_bytes as u64;
+    let service_envelope = bulk_active_service_product_envelope_bytes(
+        owner.observation.snapshot,
+        payload_bytes,
+        mux_limits,
+    );
+    owner.observation.snapshot.product_bytes_in_flight = service_envelope;
+    owner.observation.snapshot.queue_bytes = payload_bytes as u64;
     let alternate = response_target(1, UnderlayProtocol::Udp, 5.0, 0, 16 * 1024 * 1024, false);
     let owner_tail_guard_bytes = payload_bytes.saturating_mul(2);
 
@@ -6356,7 +6486,7 @@ fn response_owner_tail_guard_admits_measured_same_underlay_when_service_over_bud
         payload_bytes,
         mux_limits,
         &[],
-        Some(owner.key),
+        Some(owner.observation.key),
         owner_tail_guard_bytes,
         None,
     )
@@ -6397,7 +6527,7 @@ fn response_owner_tail_guard_blocks_cross_underlay_when_owner_queue_is_full() {
             payload_bytes,
             mux_limits,
             &[],
-            Some(owner.key),
+            Some(owner.observation.key),
             owner_tail_guard_bytes,
             None,
         )
@@ -6429,14 +6559,14 @@ fn cross_underlay_alternate_waits_when_service_owner_is_backpressured() {
         payload_bytes,
         mux_limits,
         &[],
-        Some(owner.key),
+        Some(owner.observation.key),
         owner_tail_guard_bytes,
         None,
     );
 
     let selected = selected.expect("feedable Service owner should remain selected under tail debt");
     assert_eq!(
-        selected.target.key, owner.key,
+        selected.target.observation.key, owner.observation.key,
         "a cross-underlay alternate must not own later bytes while the current Service owner has unresolved contiguous tail"
     );
 }
@@ -6447,8 +6577,8 @@ fn response_owner_tail_guard_blocks_proof_only_same_family_subflow() {
     let payload_bytes = reliable_bulk_carrier_feed_quantum_bytes(mux_limits);
     let mut owner = response_target(0, UnderlayProtocol::Udp, 50.0, 0, 16 * 1024 * 1024, true);
     let mut alternate = response_target(1, UnderlayProtocol::Udp, 5.0, 0, 16 * 1024 * 1024, false);
-    alternate.has_sender_evidence = true;
-    alternate.has_bulk_rate_evidence = false;
+    alternate.observation.has_sender_evidence = true;
+    alternate.observation.has_bulk_rate_evidence = false;
     let (owner_commands, _owner_rx) = reliable_path_command_channels(1);
     owner_commands
         .try_enqueue_admitted_frame(
@@ -6472,7 +6602,7 @@ fn response_owner_tail_guard_blocks_proof_only_same_family_subflow() {
             payload_bytes,
             mux_limits,
             &[],
-            Some(owner.key),
+            Some(owner.observation.key),
             owner_tail_guard_bytes,
             None,
         )
@@ -6493,14 +6623,14 @@ fn response_small_owner_debt_keeps_feedable_service_ahead_of_measured_subflow() 
         64 * 1024,
         MuxLimits::default(),
         &[],
-        Some(owner.key),
+        Some(owner.observation.key),
         64 * 1024,
         None,
     )
     .expect("feedable Service should pass bounded tail-debt admission");
 
     assert_eq!(
-        selected.target.key, owner.key,
+        selected.target.observation.key, owner.observation.key,
         "small Service-tail debt must not displace a feedable Service with optional same-underlay work"
     );
     assert_eq!(
@@ -6522,7 +6652,7 @@ fn small_ordered_owner_debt_blocks_cross_underlay_service_migration() {
         64 * 1024,
         MuxLimits::default(),
         &[],
-        Some(owner.key),
+        Some(owner.observation.key),
         64 * 1024,
         None,
     );
@@ -6531,7 +6661,7 @@ fn small_ordered_owner_debt_blocks_cross_underlay_service_migration() {
         selected.is_none()
             || selected
                 .as_ref()
-                .is_some_and(|selected| selected.target.key == owner.key),
+                .is_some_and(|selected| selected.target.observation.key == owner.observation.key),
         "any unresolved ordered-owner tail must block TCP/QUIC Service migration until the frontier clears or the candidate already owns the lower range"
     );
 }
@@ -6585,7 +6715,10 @@ fn missing_same_underlay_owner_debt_admits_measured_service_failover() {
     )
     .expect("a bulk-rate-proven same-underlay survivor should elect Service failover when the previous Service output is gone and no lower-flight owner remains");
 
-    assert_eq!(selected.target.key, measured_survivor.key);
+    assert_eq!(
+        selected.target.observation.key,
+        measured_survivor.observation.key
+    );
     assert_eq!(
         selected.admission().role,
         PathRuntimeRole::Service,
@@ -6609,16 +6742,21 @@ fn missing_same_underlay_service_failover_respects_path_latency_window() {
         mux_limits.max_path_flight_bytes as u64,
         false,
     );
-    measured_survivor.snapshot.delivery_rate_bps = 10_000_000_000.0;
-    measured_survivor.snapshot.pacing_rate_bps = 10_000_000_000.0;
-    measured_survivor.snapshot.active_latency_sensitive_flows = 1;
+    measured_survivor.observation.snapshot.delivery_rate_bps = 10_000_000_000.0;
+    measured_survivor.observation.snapshot.pacing_rate_bps = 10_000_000_000.0;
+    measured_survivor
+        .observation
+        .snapshot
+        .active_latency_sensitive_flows = 1;
     let latency_credit = usize::try_from(bulk_latency_pressure_service_feed_window_bytes(
         payload_bytes,
         mux_limits,
     ))
     .unwrap();
-    measured_survivor.snapshot.product_bytes_in_flight =
-        latency_credit.saturating_sub(payload_bytes) as u64;
+    measured_survivor
+        .observation
+        .snapshot
+        .product_bytes_in_flight = latency_credit.saturating_sub(payload_bytes) as u64;
 
     let selected = select_response_sender_data_target_with_ordered_debt_and_epoch(
         std::slice::from_ref(&measured_survivor),
@@ -6633,7 +6771,10 @@ fn missing_same_underlay_service_failover_respects_path_latency_window() {
     .expect("mature same-underlay Service failover may consume remaining latency-window credit");
     assert_eq!(selected.admission().role, PathRuntimeRole::Service);
 
-    measured_survivor.snapshot.product_bytes_in_flight = latency_credit as u64;
+    measured_survivor
+        .observation
+        .snapshot
+        .product_bytes_in_flight = latency_credit as u64;
     assert!(
         select_response_sender_data_target_with_ordered_debt_and_epoch(
             &[measured_survivor],
@@ -6660,8 +6801,8 @@ fn missing_same_underlay_owner_debt_admits_sender_evidence_service_failover() {
     };
     let mut liveness_survivor =
         response_target(1, UnderlayProtocol::Tcp, 5.0, 0, 16 * 1024 * 1024, false);
-    liveness_survivor.has_sender_evidence = true;
-    liveness_survivor.has_bulk_rate_evidence = false;
+    liveness_survivor.observation.has_sender_evidence = true;
+    liveness_survivor.observation.has_bulk_rate_evidence = false;
 
     let selected = select_response_sender_data_target_with_ordered_debt_and_epoch(
         std::slice::from_ref(&liveness_survivor),
@@ -6675,7 +6816,10 @@ fn missing_same_underlay_owner_debt_admits_sender_evidence_service_failover() {
     )
     .expect("a same-underlay sender-evidenced survivor should receive bounded Service failover when the previous Service output is gone and no lower-flight owner remains");
 
-    assert_eq!(selected.target.key, liveness_survivor.key);
+    assert_eq!(
+        selected.target.observation.key,
+        liveness_survivor.observation.key
+    );
     assert_eq!(
         selected.admission().role,
         PathRuntimeRole::Service,
@@ -6713,8 +6857,8 @@ fn ordered_owner_debt_without_owner_hint_blocks_active_fallback_service() {
 fn proof_only_active_service_can_continue_under_its_own_tail_guard() {
     let mut active_fallback =
         response_target(0, UnderlayProtocol::Udp, 5.0, 0, 16 * 1024 * 1024, true);
-    active_fallback.has_sender_evidence = true;
-    active_fallback.has_bulk_rate_evidence = false;
+    active_fallback.observation.has_sender_evidence = true;
+    active_fallback.observation.has_bulk_rate_evidence = false;
 
     let selected = select_response_sender_data_target_with_ordered_debt_and_epoch(
         &[active_fallback.clone()],
@@ -6722,14 +6866,17 @@ fn proof_only_active_service_can_continue_under_its_own_tail_guard() {
         64 * 1024,
         MuxLimits::default(),
         &[],
-        Some(active_fallback.key),
+        Some(active_fallback.observation.key),
         315_680,
         None,
     );
 
     let selected =
         selected.expect("the live active Service owner may continue under its own tail guard");
-    assert_eq!(selected.target.key, active_fallback.key);
+    assert_eq!(
+        selected.target.observation.key,
+        active_fallback.observation.key
+    );
     assert_eq!(
         selected.admission().role,
         PathRuntimeRole::Service,
@@ -6740,11 +6887,11 @@ fn proof_only_active_service_can_continue_under_its_own_tail_guard() {
 #[test]
 fn bulk_only_tcp_sender_evidence_admits_startup_subflow_not_service() {
     let mut owner = response_target(0, UnderlayProtocol::Tcp, 50.0, 0, 16 * 1024 * 1024, true);
-    owner.snapshot.active_flows = 2;
+    owner.observation.snapshot.active_flows = 2;
     let mut lower_eta_alternate =
         response_target(1, UnderlayProtocol::Tcp, 5.0, 0, 16 * 1024 * 1024, false);
-    lower_eta_alternate.has_sender_evidence = true;
-    lower_eta_alternate.has_bulk_rate_evidence = false;
+    lower_eta_alternate.observation.has_sender_evidence = true;
+    lower_eta_alternate.observation.has_bulk_rate_evidence = false;
 
     let selected = select_response_sender_data_target_with_ordered_debt_and_epoch(
         &[owner.clone(), lower_eta_alternate.clone()],
@@ -6752,14 +6899,14 @@ fn bulk_only_tcp_sender_evidence_admits_startup_subflow_not_service() {
         64 * 1024,
         MuxLimits::default(),
         &[],
-        Some(owner.key),
+        Some(owner.observation.key),
         0,
         None,
     )
     .expect("current Service owner should remain eligible");
 
     assert_eq!(
-        selected.target.key, lower_eta_alternate.key,
+        selected.target.observation.key, lower_eta_alternate.observation.key,
         "sender evidence may start one bounded same-underlay Subflow sampling epoch"
     );
     assert_eq!(
@@ -6789,7 +6936,7 @@ fn measured_cross_family_path_handoff_allows_diversification_or_two_x_gain() {
     let mux_limits = MuxLimits::default();
     let payload_bytes = reliable_bulk_carrier_feed_quantum_bytes(mux_limits);
     let mut service = response_target(0, UnderlayProtocol::Tcp, 80.0, 0, 16 * 1024 * 1024, true);
-    service.snapshot.active_flows = 2;
+    service.observation.snapshot.active_flows = 2;
     let udp = response_target(1, UnderlayProtocol::Udp, 5.0, 0, 16 * 1024 * 1024, false);
 
     let selected = select_response_service_handoff_target(
@@ -6798,14 +6945,14 @@ fn measured_cross_family_path_handoff_allows_diversification_or_two_x_gain() {
         payload_bytes,
         mux_limits,
         &[],
-        Some(service.key),
+        Some(service.observation.key),
         0,
         ResponseServiceFamilyLoads::new(2, 0),
         4096,
         None,
     )
     .expect("measured underloaded family should receive one whole flow");
-    assert_eq!(selected.target.key, udp.key);
+    assert_eq!(selected.target.observation.key, udp.observation.key);
     assert_eq!(selected.admission().role, PathRuntimeRole::Service);
     assert_eq!(
         selected
@@ -6821,7 +6968,7 @@ fn measured_cross_family_path_handoff_allows_diversification_or_two_x_gain() {
             payload_bytes,
             mux_limits,
             &[],
-            Some(service.key),
+            Some(service.observation.key),
             1,
             ResponseServiceFamilyLoads::new(2, 0),
             4096,
@@ -6854,25 +7001,25 @@ fn busy_shared_target_carrier_is_pressure_not_binding_debt() {
     let mux_limits = MuxLimits::default();
     let payload_bytes = reliable_bulk_carrier_feed_quantum_bytes(mux_limits);
     let mut service = response_target(0, UnderlayProtocol::Tcp, 80.0, 0, 16 * 1024 * 1024, true);
-    service.snapshot.rate_scope = PathRateScope::PerFlowGoodput;
-    service.snapshot.delivery_rate_bps = 1_000_000.0;
+    service.observation.snapshot.rate_scope = PathRateScope::PerFlowGoodput;
+    service.observation.snapshot.delivery_rate_bps = 1_000_000.0;
     let mut udp = response_target(1, UnderlayProtocol::Udp, 5.0, 0, 16 * 1024 * 1024, false);
     let (udp_commands, _udp_receivers) = reliable_path_command_channels(8);
     udp.commands = udp_commands;
-    udp.snapshot.delivery_rate_bps = 100_000_000.0;
-    udp.snapshot.active_flows = 1;
+    udp.observation.snapshot.delivery_rate_bps = 100_000_000.0;
+    udp.observation.snapshot.active_flows = 1;
     udp.commands
         .try_enqueue_stream_ordered_frame(
             client_data_frame_for_test(StreamId(999), 0, 1),
             FlowLane::Throughput,
         )
         .expect("shared target carrier accepts unrelated queued work");
-    udp.command_pending_bytes = udp.commands.pending_bytes();
-    udp.snapshot.queue_bytes = udp.command_pending_bytes;
-    udp.snapshot.bytes_in_flight = 1;
-    assert!(udp.command_pending_bytes > 0);
-    assert_eq!(udp.owner_data_in_flight_bytes, 0);
-    assert_eq!(udp.snapshot.product_bytes_in_flight, 0);
+    udp.observation.command_pending_bytes = udp.commands.pending_bytes();
+    udp.observation.snapshot.queue_bytes = udp.observation.command_pending_bytes;
+    udp.observation.snapshot.bytes_in_flight = 1;
+    assert!(udp.observation.command_pending_bytes > 0);
+    assert_eq!(udp.observation.owner_data_in_flight_bytes, 0);
+    assert_eq!(udp.observation.snapshot.product_bytes_in_flight, 0);
 
     let selected = select_response_service_handoff_target(
         &[service.clone(), udp.clone()],
@@ -6880,14 +7027,14 @@ fn busy_shared_target_carrier_is_pressure_not_binding_debt() {
         payload_bytes,
         mux_limits,
         &[],
-        Some(service.key),
+        Some(service.observation.key),
         0,
         ResponseServiceFamilyLoads::new(1, 1),
         4096,
         None,
     )
     .expect("another binding's carrier pressure must not masquerade as this binding's debt");
-    assert_eq!(selected.target.key, udp.key);
+    assert_eq!(selected.target.observation.key, udp.observation.key);
 }
 
 #[test]
@@ -6996,7 +7143,7 @@ async fn response_service_handoff_drain_holds_raw_offset_until_frontier_commit()
         .binding
         .sender_path_targets(FlowLane::Throughput, payload_bytes)
         .into_iter()
-        .find(|target| target.key == fixture.service)
+        .find(|target| target.observation.key == fixture.service)
         .expect("TCP Service target");
     let old_owner_frame = Frame::StreamData {
         stream_id: fixture.stream.stream_id,
@@ -7082,7 +7229,7 @@ async fn balanced_performance_override_commits_full_handoff_transaction() {
         .binding
         .sender_path_targets(FlowLane::Throughput, payload_bytes)
         .into_iter()
-        .find(|target| target.key == fixture.service)
+        .find(|target| target.observation.key == fixture.service)
         .expect("slow TCP Service target");
     fixture.binding.record_owner_flight_for_target(
         &service_target,
@@ -7144,7 +7291,7 @@ async fn handoff_commit_rejects_shared_queue_growth_beyond_ranked_credit() {
         .binding
         .sender_path_targets(FlowLane::Throughput, payload_bytes)
         .into_iter()
-        .find(|target| target.key == fixture.service)
+        .find(|target| target.observation.key == fixture.service)
         .expect("TCP Service target");
     fixture.binding.record_owner_flight_for_target(
         &service_target,
@@ -7215,10 +7362,10 @@ fn service_handoff_rejects_lower_projected_fair_share() {
     let mux_limits = MuxLimits::default();
     let payload_bytes = reliable_bulk_carrier_feed_quantum_bytes(mux_limits);
     let mut service = response_target(0, UnderlayProtocol::Tcp, 80.0, 0, 16 * 1024 * 1024, true);
-    service.snapshot.active_flows = 1;
-    service.snapshot.delivery_rate_bps = 500_000_000.0;
+    service.observation.snapshot.active_flows = 1;
+    service.observation.snapshot.delivery_rate_bps = 500_000_000.0;
     let mut udp = response_target(1, UnderlayProtocol::Udp, 5.0, 0, 16 * 1024 * 1024, false);
-    udp.snapshot.delivery_rate_bps = 100_000_000.0;
+    udp.observation.snapshot.delivery_rate_bps = 100_000_000.0;
 
     assert!(
         select_response_service_handoff_target(
@@ -7227,7 +7374,7 @@ fn service_handoff_rejects_lower_projected_fair_share() {
             payload_bytes,
             mux_limits,
             &[],
-            Some(service.key),
+            Some(service.observation.key),
             0,
             ResponseServiceFamilyLoads::new(2, 0),
             4096,
@@ -7243,7 +7390,7 @@ fn generic_evidence_drain_clears_unpinned_expired_receipt_marker() {
     let mux_limits = MuxLimits::default();
     let payload_bytes = reliable_bulk_carrier_feed_quantum_bytes(mux_limits);
     let mut service = response_target(0, UnderlayProtocol::Tcp, 80.0, 0, 16 * 1024 * 1024, true);
-    service.snapshot.delivery_rate_bps = 1_000_000.0;
+    service.observation.snapshot.delivery_rate_bps = 1_000_000.0;
     let mut target = response_target(1, UnderlayProtocol::Udp, 5.0, 0, 16 * 1024 * 1024, false);
     let now = Instant::now();
     let accepted_at = now
@@ -7266,22 +7413,22 @@ fn generic_evidence_drain_clears_unpinned_expired_receipt_marker() {
         expires_at: accepted_at + Duration::from_secs(1),
         proof_validity: Duration::from_secs(1),
     });
-    target.has_bulk_rate_evidence = true;
+    target.observation.has_bulk_rate_evidence = true;
     let reservation = ResponseServiceHandoffDrainReservation {
         binding_instance_id: 8,
-        service: service.key,
-        service_path_instance_id: service.path_instance_id,
-        service_incarnation: service.incarnation,
-        target: target.key,
-        target_path_instance_id: target.path_instance_id,
-        target_incarnation: target.incarnation,
+        service: service.observation.key,
+        service_path_instance_id: service.observation.path_instance_id,
+        service_incarnation: service.observation.incarnation,
+        target: target.observation.key,
+        target_path_instance_id: target.observation.path_instance_id,
+        target_incarnation: target.observation.incarnation,
         capacity_proof: None,
         expires_at: now + Duration::from_secs(1),
     };
 
     let effective = response_service_handoff_target_view(
         &target,
-        service.key,
+        service.observation.key,
         FlowLane::Throughput,
         payload_bytes,
         mux_limits,
@@ -7289,7 +7436,7 @@ fn generic_evidence_drain_clears_unpinned_expired_receipt_marker() {
         now,
     )
     .expect("the exact generic-evidence drain target");
-    assert!(effective.has_bulk_rate_evidence);
+    assert!(effective.observation.has_bulk_rate_evidence);
     assert_eq!(effective.quic_capacity_proof, None);
     assert!(response_service_handoff_drain_matches_candidate(
         reservation.binding_instance_id,
@@ -7308,7 +7455,7 @@ fn service_handoff_diagnostic_distinguishes_frontier_and_expired_receipt() {
     let mux_limits = MuxLimits::default();
     let payload_bytes = reliable_bulk_carrier_feed_quantum_bytes(mux_limits);
     let mut service = response_target(0, UnderlayProtocol::Tcp, 80.0, 0, 16 * 1024 * 1024, true);
-    service.snapshot.delivery_rate_bps = 1_000_000.0;
+    service.observation.snapshot.delivery_rate_bps = 1_000_000.0;
     let mut udp = response_target(1, UnderlayProtocol::Udp, 5.0, 0, 16 * 1024 * 1024, false);
     let now = Instant::now();
     let accepted_at = now
@@ -7331,7 +7478,7 @@ fn service_handoff_diagnostic_distinguishes_frontier_and_expired_receipt() {
         expires_at: accepted_at + Duration::from_secs(1),
         proof_validity: Duration::from_secs(1),
     });
-    udp.has_bulk_rate_evidence = false;
+    udp.observation.has_bulk_rate_evidence = false;
     let targets = [service.clone(), udp.clone()];
     let expired = response_service_handoff_diagnostics::evaluate_response_service_handoff(
         &targets,
@@ -7339,7 +7486,7 @@ fn service_handoff_diagnostic_distinguishes_frontier_and_expired_receipt() {
         payload_bytes,
         mux_limits,
         &[],
-        Some(service.key),
+        Some(service.observation.key),
         0,
         ResponseServiceFamilyLoads::new(2, 0),
         None,
@@ -7354,12 +7501,12 @@ fn service_handoff_diagnostic_distinguishes_frontier_and_expired_receipt() {
     let proof = udp.quic_capacity_proof.expect("raw expired marker");
     let reservation = ResponseServiceHandoffDrainReservation {
         binding_instance_id: 7,
-        service: service.key,
-        service_path_instance_id: service.path_instance_id,
-        service_incarnation: service.incarnation,
-        target: udp.key,
-        target_path_instance_id: udp.path_instance_id,
-        target_incarnation: udp.incarnation,
+        service: service.observation.key,
+        service_path_instance_id: service.observation.path_instance_id,
+        service_incarnation: service.observation.incarnation,
+        target: udp.observation.key,
+        target_path_instance_id: udp.observation.path_instance_id,
+        target_incarnation: udp.observation.incarnation,
         capacity_proof: Some(proof),
         expires_at: now + Duration::from_secs(1),
     };
@@ -7374,15 +7521,21 @@ fn service_handoff_diagnostic_distinguishes_frontier_and_expired_receipt() {
             now,
         )
         .expect("diagnostic must retain the exact bounded proof view");
-    assert!(!udp.has_bulk_rate_evidence, "raw marker is expired");
     assert!(
-        effective.has_bulk_rate_evidence,
+        !udp.observation.has_bulk_rate_evidence,
+        "raw marker is expired"
+    );
+    assert!(
+        effective.observation.has_bulk_rate_evidence,
         "pinned view remains authoritative"
     );
     assert_eq!(effective.quic_capacity_proof, Some(proof));
-    assert_eq!(effective.snapshot.delivery_rate_bps, proof.rate_bps as f64);
     assert_eq!(
-        effective.snapshot.rate_scope,
+        effective.observation.snapshot.delivery_rate_bps,
+        proof.rate_bps as f64
+    );
+    assert_eq!(
+        effective.observation.snapshot.rate_scope,
         PathRateScope::PathCapacity,
         "the pinned QUIC receipt rate and its capacity scope are one snapshot authority"
     );
@@ -7391,7 +7544,7 @@ fn service_handoff_diagnostic_distinguishes_frontier_and_expired_receipt() {
         &effective.observation,
     ));
 
-    udp.has_bulk_rate_evidence = true;
+    udp.observation.has_bulk_rate_evidence = true;
     udp.quic_capacity_proof = udp
         .quic_capacity_proof
         .map(|proof| QuicCapacityProofCandidate {
@@ -7406,7 +7559,7 @@ fn service_handoff_diagnostic_distinguishes_frontier_and_expired_receipt() {
         payload_bytes,
         mux_limits,
         &[],
-        Some(service.key),
+        Some(service.observation.key),
         payload_bytes,
         ResponseServiceFamilyLoads::new(2, 0),
         None,
@@ -7446,7 +7599,7 @@ fn family_or_gain_diagnostic_ignores_shared_carrier_churn() {
             payload_bytes,
             mux_limits,
             &[],
-            Some(targets[0].key),
+            Some(targets[0].observation.key),
             0,
             service_family_loads,
             None,
@@ -7464,9 +7617,9 @@ fn family_or_gain_diagnostic_ignores_shared_carrier_churn() {
     };
 
     let before = signature(&targets);
-    targets[1].snapshot.bytes_in_flight = payload_bytes as u64;
-    targets[1].snapshot.queue_bytes = payload_bytes as u64;
-    targets[1].eta_ms = 1_000_000.0;
+    targets[1].observation.snapshot.bytes_in_flight = payload_bytes as u64;
+    targets[1].observation.snapshot.queue_bytes = payload_bytes as u64;
+    targets[1].observation.eta_ms = 1_000_000.0;
     let after = signature(&targets);
 
     assert_eq!(
@@ -7479,7 +7632,7 @@ fn family_or_gain_diagnostic_ignores_shared_carrier_churn() {
 fn cross_underlay_candidate_does_not_displace_owner_without_bulk_rate() {
     let owner = response_target(0, UnderlayProtocol::Tcp, 80.0, 0, 16 * 1024 * 1024, true);
     let mut candidate = response_target(1, UnderlayProtocol::Udp, 5.0, 0, 16 * 1024 * 1024, false);
-    candidate.has_bulk_rate_evidence = false;
+    candidate.observation.has_bulk_rate_evidence = false;
 
     let selected = choose_response_sender_data_target(
         &[owner.clone(), candidate],
@@ -7487,13 +7640,13 @@ fn cross_underlay_candidate_does_not_displace_owner_without_bulk_rate() {
         64 * 1024,
         MuxLimits::default(),
         &[],
-        Some(owner.key),
+        Some(owner.observation.key),
     )
     .expect(
         "current service owner should remain eligible while cross-family candidate is unproven",
     );
 
-    assert_eq!(selected.key, owner.key);
+    assert_eq!(selected.observation.key, owner.observation.key);
 }
 
 #[test]
@@ -7507,12 +7660,12 @@ fn cross_underlay_bulk_rate_candidate_does_not_become_service_at_clear_frontier(
         64 * 1024,
         MuxLimits::default(),
         &[],
-        Some(owner.key),
+        Some(owner.observation.key),
     )
     .expect("current Service owner should remain eligible at a clear frontier");
 
     assert_eq!(
-        selected.key, owner.key,
+        selected.observation.key, owner.observation.key,
         "mixed-family Service migration must be explicit; lower-ETA cross-underlay candidates do not become Service through per-quantum selection"
     );
 }
@@ -7535,7 +7688,7 @@ fn cross_underlay_candidate_does_not_become_service_when_owner_hint_is_missing()
     );
 
     assert_eq!(
-        selected.key, owner.key,
+        selected.observation.key, owner.observation.key,
         "a missing ordered-owner hint is not permission for implicit cross-family Service migration while an active Service output is live"
     );
 }
@@ -7545,7 +7698,7 @@ fn cross_underlay_bulk_rate_candidate_that_owns_lower_flight_remains_eligible() 
     let service = response_target(0, UnderlayProtocol::Tcp, 80.0, 0, 16 * 1024 * 1024, true);
     let candidate = response_target(1, UnderlayProtocol::Udp, 5.0, 0, 16 * 1024 * 1024, false);
     let lower_flights = vec![CarrierPathFlightDebt {
-        key: candidate.key,
+        key: candidate.observation.key,
         bytes: 64 * 1024,
     }];
 
@@ -7555,12 +7708,12 @@ fn cross_underlay_bulk_rate_candidate_that_owns_lower_flight_remains_eligible() 
         64 * 1024,
         MuxLimits::default(),
         &lower_flights,
-        Some(service.key),
+        Some(service.observation.key),
     )
     .expect("candidate owning the lower flight should remain eligible");
 
     assert_eq!(
-        selected.key, candidate.key,
+        selected.observation.key, candidate.observation.key,
         "a bulk-rate-proven path that already owns the lower range must not be blocked by a stale cross-family frontier check"
     );
 }
@@ -7569,13 +7722,13 @@ fn cross_underlay_bulk_rate_candidate_that_owns_lower_flight_remains_eligible() 
 fn active_cross_underlay_path_that_owns_lower_flight_remains_service_candidate() {
     let mut old_service =
         response_target(0, UnderlayProtocol::Tcp, 80.0, 0, 16 * 1024 * 1024, false);
-    old_service.has_bulk_rate_evidence = true;
+    old_service.observation.has_bulk_rate_evidence = true;
     let mut lower_active =
         response_target(1, UnderlayProtocol::Udp, 5.0, 0, 16 * 1024 * 1024, true);
-    lower_active.has_sender_evidence = true;
-    lower_active.has_bulk_rate_evidence = false;
+    lower_active.observation.has_sender_evidence = true;
+    lower_active.observation.has_bulk_rate_evidence = false;
     let lower_flights = vec![CarrierPathFlightDebt {
-        key: lower_active.key,
+        key: lower_active.observation.key,
         bytes: 64 * 1024,
     }];
 
@@ -7585,12 +7738,12 @@ fn active_cross_underlay_path_that_owns_lower_flight_remains_service_candidate()
         64 * 1024,
         MuxLimits::default(),
         &lower_flights,
-        Some(old_service.key),
+        Some(old_service.observation.key),
     )
     .expect("active lower-owner path must remain eligible to advance its own frontier");
 
     assert_eq!(
-        selected.key, lower_active.key,
+        selected.observation.key, lower_active.observation.key,
         "mixed-family health gates must not remove the active path that already owns unresolved lower bytes"
     );
 }
@@ -7602,7 +7755,7 @@ fn owner_tail_guard_keeps_cross_underlay_candidate_that_owns_lower_flight() {
     let service = response_target(0, UnderlayProtocol::Tcp, 80.0, 0, 16 * 1024 * 1024, true);
     let candidate = response_target(1, UnderlayProtocol::Udp, 5.0, 0, 16 * 1024 * 1024, false);
     let lower_flights = vec![CarrierPathFlightDebt {
-        key: candidate.key,
+        key: candidate.observation.key,
         bytes: payload_bytes as u64,
     }];
     let owner_tail_guard_bytes = payload_bytes.saturating_mul(2);
@@ -7613,14 +7766,14 @@ fn owner_tail_guard_keeps_cross_underlay_candidate_that_owns_lower_flight() {
         payload_bytes,
         mux_limits,
         &lower_flights,
-        Some(service.key),
+        Some(service.observation.key),
         owner_tail_guard_bytes,
         None,
     )
     .expect("candidate owning the lower flight should survive tail-guard filtering");
 
     assert_eq!(
-        selected.target.key, candidate.key,
+        selected.target.observation.key, candidate.observation.key,
         "tail guard must filter by candidate ordering safety, not by carrier family alone"
     );
 }

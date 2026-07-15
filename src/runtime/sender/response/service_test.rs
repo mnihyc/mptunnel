@@ -46,9 +46,9 @@ fn persistent_response_repair_is_cancelled_when_output_incarnation_detaches() {
         RelaySendCause::persistent_server_ack_gap_repair(
             ServerRepairOutputIdentity {
                 key,
-                incarnation: target.incarnation,
+                incarnation: target.observation.incarnation,
             },
-            target.snapshot,
+            target.observation.snapshot,
         ),
     );
 

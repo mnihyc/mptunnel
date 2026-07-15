@@ -80,10 +80,6 @@ use crate::scheduler::{FlowLane, PathRateScope};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-#[cfg(test)]
-#[path = "planner_test.rs"]
-mod tests;
-
 fn response_frame_is_bulk_stream_data(frame: &Frame, lane: FlowLane) -> bool {
     lane.is_bulk() && matches!(frame, Frame::StreamData { .. })
 }
@@ -2275,3 +2271,7 @@ pub(super) fn response_dispatch_payload_bytes(
         .max(1),
     )
 }
+
+#[cfg(test)]
+#[path = "planner_test.rs"]
+mod tests;

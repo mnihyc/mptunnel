@@ -62,7 +62,10 @@ contract as same-family multipath placement.
   commit invariants. One per-session aggregate serializes shared response state.
 - `src/runtime/sender/response.rs` and `src/runtime/sender/response/`: observe,
   plan, and dispatch response work without claiming product ownership before
-  the stream transaction commits.
+  the stream transaction commits. Ranking and dispatch carry exactly one typed
+  product-mutation intent; ordinary Service/Subflow frames do not allocate,
+  while the rare large whole-flow handoff record is boxed instead of inflating
+  every per-frame plan.
 - `src/runtime/path/{set,state,selection}.rs`: own configured carrier identity,
   shared health/load ledgers, carrier-neutral capacity budgets, coherent batch
   observation, and atomic load reservation. Protocol-specific reservation and

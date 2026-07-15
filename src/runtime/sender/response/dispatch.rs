@@ -4,8 +4,8 @@
 //! binding to revalidate and commit, and enqueues one carrier command.
 
 use super::planner::{
-    ResponseDataDispatchPlan, ResponseDataDispatchTarget, ResponseDataEmitOutcome,
-    choose_response_sender_target,
+    ResponseDataDispatchIntent, ResponseDataDispatchPlan, ResponseDataDispatchTarget,
+    ResponseDataEmitOutcome, choose_response_sender_target,
 };
 #[cfg(test)]
 use super::*;
@@ -103,37 +103,63 @@ pub(super) fn emit_planned_response_data_frame(
         ResponseDataDispatchTarget::Switchable {
             binding,
             target,
-            role,
-            service_handoff_commit,
-            subflow_set_commit,
-            ack_clock_calibration_commit,
+            intent,
         } => {
-            let subflow_request =
-                subflow_set_commit.map(|commit| ResponseSubflowAdmissionRequest {
-                    expected_planner_generation: commit.planner_generation,
-                    expected_lane_generation: commit.lane_generation,
-                    service: commit.service,
-                    startup_owner_credit_bytes: commit.startup_owner_credit_bytes,
-                    optional_overhead_budget_bytes: commit.optional_overhead_budget_bytes,
-                    max_read_gap_budget: commit.max_read_gap_budget,
-                    input: commit.input,
-                });
-            let calibration_request =
-                ack_clock_calibration_commit.map(|commit| ResponseAckClockCalibrationRequest {
-                    expected_planner_generation: commit.planner_generation,
-                    expected_lane_generation: commit.lane_generation,
-                    expected_model_generation: commit.model_generation,
-                    service: commit.service,
-                    service_incarnation: commit.service_incarnation,
-                    service_pending_bytes: commit.service_pending_bytes,
-                    target_pending_bytes: commit.target_pending_bytes,
-                    limit_bytes: commit.limit_bytes,
-                    requires_active_response_start: commit.requires_active_response_start,
-                });
-            let calibrating = calibration_request.is_some();
-            let handoff = service_handoff_commit.is_some();
-            let enqueue_result = if let Some(commit) = service_handoff_commit {
-                binding
+            let role = intent.role();
+            let calibrating = matches!(&intent, ResponseDataDispatchIntent::AckClockCalibration(_));
+            let handoff = matches!(&intent, ResponseDataDispatchIntent::ServiceHandoff(_));
+            let enqueue_result = match intent {
+                ResponseDataDispatchIntent::Service => binding
+                    .try_enqueue_owner_frame_for_dispatch_target(
+                        &target,
+                        &frame,
+                        lane,
+                        ResponseOwnerEnqueueAdmission::Service,
+                    ),
+                ResponseDataDispatchIntent::ExistingSubflow => binding
+                    .try_enqueue_owner_frame_for_dispatch_target(
+                        &target,
+                        &frame,
+                        lane,
+                        ResponseOwnerEnqueueAdmission::ExistingSubflow,
+                    ),
+                ResponseDataDispatchIntent::NewSubflow(commit) => {
+                    let request = ResponseSubflowAdmissionRequest {
+                        expected_planner_generation: commit.planner_generation,
+                        expected_lane_generation: commit.lane_generation,
+                        service: commit.service,
+                        startup_owner_credit_bytes: commit.startup_owner_credit_bytes,
+                        optional_overhead_budget_bytes: commit.optional_overhead_budget_bytes,
+                        max_read_gap_budget: commit.max_read_gap_budget,
+                        input: commit.input,
+                    };
+                    binding.try_enqueue_owner_frame_for_dispatch_target(
+                        &target,
+                        &frame,
+                        lane,
+                        ResponseOwnerEnqueueAdmission::NewSubflow(request),
+                    )
+                }
+                ResponseDataDispatchIntent::AckClockCalibration(commit) => {
+                    let request = ResponseAckClockCalibrationRequest {
+                        expected_planner_generation: commit.planner_generation,
+                        expected_lane_generation: commit.lane_generation,
+                        expected_model_generation: commit.model_generation,
+                        service: commit.service,
+                        service_incarnation: commit.service_incarnation,
+                        service_pending_bytes: commit.service_pending_bytes,
+                        target_pending_bytes: commit.target_pending_bytes,
+                        limit_bytes: commit.limit_bytes,
+                        requires_active_response_start: commit.requires_active_response_start,
+                    };
+                    binding.try_enqueue_owner_frame_for_dispatch_target(
+                        &target,
+                        &frame,
+                        lane,
+                        ResponseOwnerEnqueueAdmission::AckClockCalibration(request),
+                    )
+                }
+                ResponseDataDispatchIntent::ServiceHandoff(commit) => binding
                     .try_enqueue_response_service_handoff_for_dispatch(
                         &target,
                         &frame,
@@ -155,25 +181,7 @@ pub(super) fn emit_planned_response_data_frame(
                             capacity_proof: commit.capacity_proof,
                         },
                     )
-                    .map(|()| None)
-            } else {
-                let admission = match (role, subflow_request, calibration_request) {
-                    (PathRuntimeRole::Service, None, None) => {
-                        ResponseOwnerEnqueueAdmission::Service
-                    }
-                    (PathRuntimeRole::Subflow, None, None) => {
-                        ResponseOwnerEnqueueAdmission::ExistingSubflow
-                    }
-                    (PathRuntimeRole::Subflow, Some(request), None) => {
-                        ResponseOwnerEnqueueAdmission::NewSubflow(request)
-                    }
-                    (PathRuntimeRole::Subflow, None, Some(request)) => {
-                        ResponseOwnerEnqueueAdmission::AckClockCalibration(request)
-                    }
-                    _ => return Err(RuntimeError::SenderServiceBlocked),
-                };
-                binding
-                    .try_enqueue_owner_frame_for_dispatch_target(&target, &frame, lane, admission)
+                    .map(|()| None),
             };
             match enqueue_result {
                 Ok(_) => {}

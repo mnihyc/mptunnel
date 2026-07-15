@@ -17,15 +17,20 @@ use crate::runtime::stream::response::{
 use crate::scheduler::{PathRateScope, PathSnapshot};
 
 #[test]
-fn response_dispatch_plan_drops_ranked_snapshot_state() {
+fn response_dispatch_values_drop_snapshot_and_impossible_commit_state() {
     let ranked = std::mem::size_of::<ResponseSenderPathTarget>();
+    let selected = std::mem::size_of::<ResponseSelectedDataTarget>();
     let dispatch = std::mem::size_of::<ResponseDispatchTarget>();
     let plan = std::mem::size_of::<ResponseDataDispatchTarget>();
 
     assert!(dispatch < ranked, "dispatch={dispatch} ranked={ranked}");
     assert!(
-        plan <= 512,
-        "the per-frame plan must not regain full scheduler snapshots: {plan} bytes"
+        selected <= 576,
+        "selection must retain only one transition record: {selected} bytes"
+    );
+    assert!(
+        plan <= 192,
+        "the per-frame plan must retain one compact dispatch intent: {plan} bytes"
     );
 }
 
@@ -785,10 +790,10 @@ fn quic_proof_success_path_gets_bounded_bulk_only_startup_sampling() {
     .expect("QUIC Validation sampling should be dispatchable");
 
     assert_eq!(selected.target.key, proof_success.key);
-    assert_eq!(selected.admission.role, PathRuntimeRole::Subflow);
+    assert_eq!(selected.admission().role, PathRuntimeRole::Subflow);
     assert!(
         selected
-            .subflow_set_commit
+            .subflow_set_commit()
             .is_some_and(|commit| commit.input.startup_owner_allowed)
     );
 }
@@ -823,10 +828,10 @@ fn proof_path_owner_sampling_is_explicit_subflow_not_service_migration() {
     .expect("bounded startup sampling should be dispatchable");
 
     assert_ne!(selected.target.key, active.key);
-    assert_eq!(selected.admission.role, PathRuntimeRole::Subflow);
+    assert_eq!(selected.admission().role, PathRuntimeRole::Subflow);
     assert!(
         selected
-            .subflow_set_commit
+            .subflow_set_commit()
             .is_some_and(|commit| commit.input.startup_owner_allowed)
     );
 }
@@ -990,7 +995,7 @@ fn clear_frontier_without_live_service_elects_liveness_service_failover() {
         "liveness from an attached output is enough for bounded Service failover only when no live Service owner remains"
     );
     assert_eq!(
-        selected.admission.role,
+        selected.admission().role,
         PathRuntimeRole::Service,
         "failover owner bytes are Service OwnerData, not optional Subflow exploration"
     );
@@ -1033,7 +1038,7 @@ fn repair_attachment_cannot_suppress_liveness_service_failover() {
     .expect("Repair output must not hide an eligible liveness Service survivor");
 
     assert_eq!(selected.target.key, validation.key);
-    assert_eq!(selected.admission.role, PathRuntimeRole::Service);
+    assert_eq!(selected.admission().role, PathRuntimeRole::Service);
 }
 
 #[test]
@@ -1068,7 +1073,7 @@ fn unproven_liveness_service_failover_respects_startup_assigned_credit() {
         None,
     )
     .expect("a prospective Service with startup credit remaining stays feedable");
-    assert_eq!(selected.admission.role, PathRuntimeRole::Service);
+    assert_eq!(selected.admission().role, PathRuntimeRole::Service);
 
     failover.snapshot.product_bytes_in_flight = startup_credit as u64;
     assert!(
@@ -1169,7 +1174,7 @@ fn prospective_service_uses_service_credit_instead_of_optional_pipe_credit() {
         None,
     )
     .expect("pre-role optional-path credit must not suppress Service failover");
-    assert_eq!(selected.admission.role, PathRuntimeRole::Service);
+    assert_eq!(selected.admission().role, PathRuntimeRole::Service);
 }
 
 #[test]
@@ -1215,7 +1220,7 @@ fn mature_liveness_service_failover_uses_product_envelope() {
         None,
     )
     .expect("bulk-rate-proven prospective Service may use the product envelope");
-    assert_eq!(selected.admission.role, PathRuntimeRole::Service);
+    assert_eq!(selected.admission().role, PathRuntimeRole::Service);
 
     failover.snapshot.product_bytes_in_flight = mature_credit as u64;
     assert!(
@@ -1277,7 +1282,7 @@ fn mixed_family_clear_frontier_service_failover_is_metric_first() {
         "clear-frontier Service failover is selected by path metrics, not by TCP/UDP family"
     );
     assert_eq!(
-        selected.admission.role,
+        selected.admission().role,
         PathRuntimeRole::Service,
         "the elected failover path becomes the new Service owner"
     );
@@ -1331,7 +1336,7 @@ fn clear_frontier_stale_owner_without_lane_capacity_elects_liveness_service_fail
         selected.target.key, failover.key,
         "clear-frontier failover is metric-first and must not be trapped by the stale owner's carrier family"
     );
-    assert_eq!(selected.admission.role, PathRuntimeRole::Service);
+    assert_eq!(selected.admission().role, PathRuntimeRole::Service);
 }
 
 #[test]
@@ -1931,13 +1936,13 @@ fn quic_ack_data_seen_validation_path_bootstraps_as_bounded_subflow() {
         "sender-evidenced same-family Validation may consume bounded startup sampling credit"
     );
     assert_eq!(
-        selected.admission.role,
+        selected.admission().role,
         PathRuntimeRole::Subflow,
         "startup sampling must not migrate the Service owner"
     );
     assert!(
         selected
-            .subflow_set_commit
+            .subflow_set_commit()
             .is_some_and(|commit| commit.input.startup_owner_allowed)
     );
 }
@@ -1979,9 +1984,9 @@ fn measured_same_family_subflow_is_not_throttled_by_startup_credit() {
     )
     .expect("first measured Subflow frame should be admitted");
     let commit = first
-        .subflow_set_commit
+        .subflow_set_commit()
         .expect("measured Subflow admission should carry commit state");
-    assert_eq!(first.admission.role, PathRuntimeRole::Subflow);
+    assert_eq!(first.admission().role, PathRuntimeRole::Subflow);
     assert_eq!(
         commit.startup_owner_credit_bytes,
         usize::try_from(reliable_subflow_startup_sample_limit_bytes(mux_limits)).unwrap(),
@@ -2012,7 +2017,7 @@ fn measured_same_family_subflow_is_not_throttled_by_startup_credit() {
     )
     .expect("measured Subflow should remain eligible if per-decision no-worse gates pass");
     assert_eq!(second.target.key, bulk_rate_subflow.key);
-    assert_eq!(second.admission.role, PathRuntimeRole::Subflow);
+    assert_eq!(second.admission().role, PathRuntimeRole::Subflow);
 }
 
 #[test]
@@ -2392,20 +2397,14 @@ async fn response_owner_data_keeps_fifo_order_across_lane_changes() {
         primary: ResponseDataDispatchTarget::Switchable {
             binding: binding.clone(),
             target: target.clone().into(),
-            role: PathRuntimeRole::Service,
-            service_handoff_commit: None,
-            subflow_set_commit: None,
-            ack_clock_calibration_commit: None,
+            intent: ResponseDataDispatchIntent::Service,
         },
     };
     let latency_second = ResponseDataDispatchPlan {
         primary: ResponseDataDispatchTarget::Switchable {
             binding,
             target: target.into(),
-            role: PathRuntimeRole::Service,
-            service_handoff_commit: None,
-            subflow_set_commit: None,
-            ack_clock_calibration_commit: None,
+            intent: ResponseDataDispatchIntent::Service,
         },
     };
 
@@ -2804,10 +2803,7 @@ async fn blocked_path_queue_rolls_back_unemitted_startup_credit() {
             primary: ResponseDataDispatchTarget::Switchable {
                 binding: binding.clone(),
                 target: target.clone().into(),
-                role: PathRuntimeRole::Subflow,
-                service_handoff_commit: None,
-                subflow_set_commit: Some(commit),
-                ack_clock_calibration_commit: None,
+                intent: ResponseDataDispatchIntent::NewSubflow(commit),
             },
         },
         frame.clone(),
@@ -2823,10 +2819,7 @@ async fn blocked_path_queue_rolls_back_unemitted_startup_credit() {
             primary: ResponseDataDispatchTarget::Switchable {
                 binding,
                 target: target.into(),
-                role: PathRuntimeRole::Subflow,
-                service_handoff_commit: None,
-                subflow_set_commit: Some(commit),
-                ack_clock_calibration_commit: None,
+                intent: ResponseDataDispatchIntent::NewSubflow(commit),
             },
         },
         frame,
@@ -2942,10 +2935,7 @@ async fn stale_passive_topology_plan_blocks_subflow_reservation_and_enqueue() {
             primary: ResponseDataDispatchTarget::Switchable {
                 binding: binding.clone(),
                 target: target.clone().into(),
-                role: PathRuntimeRole::Subflow,
-                service_handoff_commit: None,
-                subflow_set_commit: Some(stale_commit),
-                ack_clock_calibration_commit: None,
+                intent: ResponseDataDispatchIntent::NewSubflow(stale_commit),
             },
         },
         frame.clone(),
@@ -2964,13 +2954,10 @@ async fn stale_passive_topology_plan_blocks_subflow_reservation_and_enqueue() {
             primary: ResponseDataDispatchTarget::Switchable {
                 binding,
                 target: target.into(),
-                role: PathRuntimeRole::Subflow,
-                service_handoff_commit: None,
-                subflow_set_commit: Some(ResponseSubflowAdmissionCommit {
+                intent: ResponseDataDispatchIntent::NewSubflow(ResponseSubflowAdmissionCommit {
                     planner_generation: fresh_planner_generation,
                     ..stale_commit
                 }),
-                ack_clock_calibration_commit: None,
             },
         },
         frame,
@@ -3590,7 +3577,7 @@ fn feedable_service_precedes_lower_eta_same_family_subflow() {
 
     assert_eq!(selected.target.key, service.key);
     assert_eq!(
-        selected.admission.role,
+        selected.admission().role,
         PathRuntimeRole::Service,
         "a lower-ETA Subflow remains eligible overflow and does not displace feedable Service"
     );
@@ -3622,9 +3609,9 @@ fn same_family_lower_frontier_owner_remains_subflow() {
         .expect("measured lower-frontier owner should remain dispatchable as a Subflow");
 
         assert_eq!(selected.target.key, lower_owner.key, "{underlay:?}");
-        assert_eq!(selected.admission.role, PathRuntimeRole::Subflow);
+        assert_eq!(selected.admission().role, PathRuntimeRole::Subflow);
         assert_eq!(
-            selected.subflow_set_commit.map(|commit| commit.service),
+            selected.subflow_set_commit().map(|commit| commit.service),
             Some(service.key),
             "{underlay:?} lower-frontier continuation must retain the Service anchor"
         );
@@ -3655,9 +3642,9 @@ fn cross_family_lower_frontier_owner_remains_subflow() {
     .expect("measured cross-family lower-frontier owner should remain dispatchable");
 
     assert_eq!(selected.target.key, lower_owner.key);
-    assert_eq!(selected.admission.role, PathRuntimeRole::Subflow);
+    assert_eq!(selected.admission().role, PathRuntimeRole::Subflow);
     assert_eq!(
-        selected.subflow_set_commit.map(|commit| commit.service),
+        selected.subflow_set_commit().map(|commit| commit.service),
         Some(service.key),
         "cross-family continuation must not commit an implicit Service migration"
     );
@@ -3766,9 +3753,9 @@ fn backpressured_service_remains_lower_frontier_completion_baseline() {
     .expect("measured lower-frontier Subflow should be evaluated against queued Service");
 
     assert_eq!(selected.target.key, lower_owner.key);
-    assert_eq!(selected.admission.role, PathRuntimeRole::Subflow);
+    assert_eq!(selected.admission().role, PathRuntimeRole::Subflow);
     assert_eq!(
-        selected.subflow_set_commit.map(|commit| commit.service),
+        selected.subflow_set_commit().map(|commit| commit.service),
         Some(service.key)
     );
 }
@@ -3870,7 +3857,7 @@ fn clear_frontier_unavailable_ordered_owner_reanchors_service_to_bulk_proven_pat
 
     assert_eq!(selected.target.key, lower_eta_subflow.key);
     assert_eq!(
-        selected.admission.role,
+        selected.admission().role,
         PathRuntimeRole::Service,
         "a clear-frontier owner hint is not a permanent Service anchor when that output cannot enqueue owner bytes"
     );
@@ -3903,7 +3890,7 @@ fn lower_eta_same_family_subflow_does_not_borrow_active_service_envelope() {
         selected.target.key, service.key,
         "non-active Subflow admission must use additional-path gates instead of the active Service envelope"
     );
-    assert_eq!(selected.admission.role, PathRuntimeRole::Service);
+    assert_eq!(selected.admission().role, PathRuntimeRole::Service);
 }
 
 #[test]
@@ -4017,7 +4004,7 @@ fn feedable_service_owner_is_selected_before_lower_eta_same_family_subflow() {
         selected.target.key, service.key,
         "same-family Subflow OwnerData is additive; it must not replace a feedable Service quantum just because its instantaneous ETA is lower"
     );
-    assert_eq!(selected.admission.role, PathRuntimeRole::Service);
+    assert_eq!(selected.admission().role, PathRuntimeRole::Service);
 }
 
 #[test]
@@ -4061,7 +4048,7 @@ fn measured_tcp_subflow_uses_bounded_reservoir_beyond_service_horizon() {
     )
     .expect("Service should fill its protected horizon first");
     assert_eq!(below_horizon.target.key, service.key);
-    assert_eq!(below_horizon.admission.role, PathRuntimeRole::Service);
+    assert_eq!(below_horizon.admission().role, PathRuntimeRole::Service);
 
     service.snapshot.product_bytes_in_flight = service_horizon as u64;
     service.owner_data_in_flight_bytes = service_horizon as u64;
@@ -4077,10 +4064,10 @@ fn measured_tcp_subflow_uses_bounded_reservoir_beyond_service_horizon() {
     )
     .expect("measured TCP Subflow should use the remaining source reservoir");
     assert_eq!(reservoir_subflow.target.key, measured_subflow.key);
-    assert_eq!(reservoir_subflow.admission.role, PathRuntimeRole::Subflow);
+    assert_eq!(reservoir_subflow.admission().role, PathRuntimeRole::Subflow);
     assert_eq!(
         reservoir_subflow
-            .subflow_set_commit
+            .subflow_set_commit()
             .map(|commit| commit.service),
         Some(service.key),
         "overflow must remain bound to the exact current Service epoch"
@@ -4107,7 +4094,7 @@ fn measured_tcp_subflow_uses_bounded_reservoir_beyond_service_horizon() {
     )
     .expect("Service remains feedable when cross-path prefix debt is capped");
     assert_eq!(backlog_selection.target.key, service.key);
-    assert_eq!(backlog_selection.admission.role, PathRuntimeRole::Service);
+    assert_eq!(backlog_selection.admission().role, PathRuntimeRole::Service);
 
     service.snapshot.product_bytes_in_flight = product_reservoir as u64;
     service.owner_data_in_flight_bytes = product_reservoir as u64;
@@ -4180,9 +4167,9 @@ fn measured_quic_subflow_uses_bounded_reservoir_before_new_startup() {
     .expect("a measured QUIC Subflow should use the bounded same-family partition");
 
     assert_eq!(selected.target.key, measured_subflow.key);
-    assert_eq!(selected.admission.role, PathRuntimeRole::Subflow);
+    assert_eq!(selected.admission().role, PathRuntimeRole::Subflow);
     assert_eq!(
-        selected.subflow_set_commit.map(|commit| commit.service),
+        selected.subflow_set_commit().map(|commit| commit.service),
         Some(service.key),
         "measured QUIC overflow remains bound to the current Service"
     );
@@ -4200,7 +4187,7 @@ fn measured_quic_subflow_uses_bounded_reservoir_before_new_startup() {
     )
     .expect("Service remains the fallback at the ordering-reservoir boundary");
     assert_eq!(exhausted.target.key, service.key);
-    assert_eq!(exhausted.admission.role, PathRuntimeRole::Service);
+    assert_eq!(exhausted.admission().role, PathRuntimeRole::Service);
 }
 
 #[test]
@@ -4242,7 +4229,7 @@ fn measured_quic_subflow_does_not_cross_into_equal_path_load() {
     .expect("the balanced QUIC Service should remain dispatchable");
 
     assert_eq!(selected.target.key, service.key);
-    assert_eq!(selected.admission.role, PathRuntimeRole::Service);
+    assert_eq!(selected.admission().role, PathRuntimeRole::Service);
 }
 
 #[test]
@@ -4291,7 +4278,7 @@ fn tcp_reservoir_does_not_charge_service_horizon_to_low_bdp_subflow() {
         selected.target.key, low_bdp_subflow.key,
         "the connection-level Service horizon consumes global reservoir credit once; it is not candidate-local BDP flight"
     );
-    assert_eq!(selected.admission.role, PathRuntimeRole::Subflow);
+    assert_eq!(selected.admission().role, PathRuntimeRole::Subflow);
 }
 
 #[test]
@@ -4337,7 +4324,7 @@ fn tcp_reservoir_requires_unique_service_owner_horizon() {
     .expect("Service remains the fallback until its unique quota is assigned");
 
     assert_eq!(selected.target.key, service.key);
-    assert_eq!(selected.admission.role, PathRuntimeRole::Service);
+    assert_eq!(selected.admission().role, PathRuntimeRole::Service);
 }
 
 #[test]
@@ -4390,7 +4377,7 @@ fn tcp_reservoir_split_derives_reduced_resource_geometry() {
     )
     .expect("reduced valid resources should retain the derived TCP split");
     assert_eq!(selected.target.key, measured_subflow.key);
-    assert_eq!(selected.admission.role, PathRuntimeRole::Subflow);
+    assert_eq!(selected.admission().role, PathRuntimeRole::Subflow);
 }
 
 #[test]
@@ -4471,7 +4458,7 @@ fn tcp_reservoir_split_yields_to_latency_and_calibration_fences() {
     )
     .expect("Service remains available while exact calibration flights drain");
     assert_eq!(calibration_fence.target.key, service.key);
-    assert_eq!(calibration_fence.admission.role, PathRuntimeRole::Service);
+    assert_eq!(calibration_fence.admission().role, PathRuntimeRole::Service);
 }
 
 #[test]
@@ -4530,7 +4517,7 @@ fn tcp_reservoir_waits_for_binding_calibration_tail() {
     .expect("Service remains available while calibration waits for ACK evidence");
 
     assert_eq!(selected.target.key, service.key);
-    assert_eq!(selected.admission.role, PathRuntimeRole::Service);
+    assert_eq!(selected.admission().role, PathRuntimeRole::Service);
 }
 
 #[test]
@@ -4567,7 +4554,7 @@ fn udp_service_remains_first_after_its_service_horizon() {
     )
     .expect("UDP Service remains the packet-controller owner policy");
     assert_eq!(selected.target.key, service.key);
-    assert_eq!(selected.admission.role, PathRuntimeRole::Service);
+    assert_eq!(selected.admission().role, PathRuntimeRole::Service);
 }
 
 #[test]
@@ -4597,7 +4584,7 @@ fn unproven_service_bootstraps_before_app_limited_proven_subflow() {
     .expect("the unproven live Service remains feedable");
 
     assert_eq!(selected.target.key, service.key);
-    assert_eq!(selected.admission.role, PathRuntimeRole::Service);
+    assert_eq!(selected.admission().role, PathRuntimeRole::Service);
 }
 
 #[test]
@@ -4633,7 +4620,7 @@ fn feedable_service_precedes_less_committed_app_limited_subflow() {
     .expect("feedable Service remains selected despite more committed work");
 
     assert_eq!(selected.target.key, service.key);
-    assert_eq!(selected.admission.role, PathRuntimeRole::Service);
+    assert_eq!(selected.admission().role, PathRuntimeRole::Service);
 }
 
 #[test]
@@ -4689,7 +4676,7 @@ fn tcp_ack_clock_calibration_rejects_seed_beyond_service_reservoir() {
     )
     .expect("Service remains available when exploration would create an ordering stall");
     assert_eq!(selected.target.key, service.key);
-    assert!(selected.ack_clock_calibration_commit.is_none());
+    assert!(selected.ack_clock_calibration_commit().is_none());
 }
 
 #[test]
@@ -4760,8 +4747,8 @@ fn tcp_ack_clock_calibration_explores_within_service_reservoir() {
     )
     .expect("bounded exploration should fit behind the Service reservoir");
     assert_eq!(selected.target.key, candidate.key);
-    assert_eq!(selected.admission.role, PathRuntimeRole::Subflow);
-    assert!(selected.ack_clock_calibration_commit.is_some());
+    assert_eq!(selected.admission().role, PathRuntimeRole::Subflow);
+    assert!(selected.ack_clock_calibration_commit().is_some());
 
     candidate.ack_clock_calibration_active = true;
     candidate.ack_clock_calibration_spent_bytes = initial_limit;
@@ -4780,7 +4767,7 @@ fn tcp_ack_clock_calibration_explores_within_service_reservoir() {
     assert_eq!(grown.target.key, candidate.key);
     assert_eq!(
         grown
-            .ack_clock_calibration_commit
+            .ack_clock_calibration_commit()
             .expect("staged calibration commit")
             .limit_bytes,
         initial_limit.saturating_mul(2)
@@ -4799,7 +4786,7 @@ fn tcp_ack_clock_calibration_explores_within_service_reservoir() {
     )
     .expect("a stage awaiting new ACK evidence returns to Service");
     assert_eq!(awaiting_evidence.target.key, service.key);
-    assert!(awaiting_evidence.ack_clock_calibration_commit.is_none());
+    assert!(awaiting_evidence.ack_clock_calibration_commit().is_none());
 }
 
 #[test]
@@ -4828,7 +4815,7 @@ fn safe_tcp_calibration_waits_for_repair_carrier_headroom() {
     .expect("Service remains available while RepairData occupies candidate headroom");
 
     assert_eq!(selected.target.key, service.key);
-    assert!(selected.ack_clock_calibration_commit.is_none());
+    assert!(selected.ack_clock_calibration_commit().is_none());
 }
 
 #[test]
@@ -5083,10 +5070,10 @@ fn tcp_response_calibration_does_not_double_count_pending_owner_flight() {
     .expect("overlapping flight and queue views count as one debt");
 
     assert_eq!(selected.target.key, candidate.key);
-    assert_eq!(selected.admission.role, PathRuntimeRole::Subflow);
+    assert_eq!(selected.admission().role, PathRuntimeRole::Subflow);
     assert_eq!(
         selected
-            .ack_clock_calibration_commit
+            .ack_clock_calibration_commit()
             .expect("calibration commit")
             .limit_bytes,
         initial_limit
@@ -5124,7 +5111,7 @@ fn tcp_response_calibration_does_not_double_count_global_ordered_tail() {
     assert_eq!(selected.target.key, candidate.key);
     assert_eq!(
         selected
-            .ack_clock_calibration_commit
+            .ack_clock_calibration_commit()
             .expect("calibration commit")
             .limit_bytes,
         ceiling
@@ -5414,7 +5401,7 @@ fn blocked_active_ack_clock_candidate_does_not_select_another_calibration_owner(
     )
     .expect("Service remains feedable while the active calibration path is blocked");
     assert_eq!(selected.target.key, service.key);
-    assert!(selected.ack_clock_calibration_commit.is_none());
+    assert!(selected.ack_clock_calibration_commit().is_none());
 }
 
 #[test]
@@ -5550,7 +5537,7 @@ fn closed_active_calibration_drain_fence_blocks_next_startup_owner() {
     )
     .expect("Service remains available during exact-flight drain");
     assert_eq!(selected.target.key, service.key);
-    assert!(selected.subflow_set_commit.is_none());
+    assert!(selected.subflow_set_commit().is_none());
 }
 
 #[test]
@@ -5579,12 +5566,12 @@ fn measured_same_family_alternate_is_subflow_when_service_is_not_feedable() {
 
     assert_eq!(selected.target.key, measured_subflow.key);
     assert_eq!(
-        selected.admission.role,
+        selected.admission().role,
         PathRuntimeRole::Subflow,
         "additional same-family owner bytes must be labeled Subflow, not Service"
     );
     assert!(
-        selected.subflow_set_commit.is_some(),
+        selected.subflow_set_commit().is_some(),
         "Subflow OwnerData must be committed through the Subflow admission ledger"
     );
 }
@@ -5625,10 +5612,10 @@ fn saturated_service_may_admit_one_startup_same_underlay_subflow_owner() {
     let selected =
         selected.expect("startup same-underlay Subflow should receive one owner quantum");
     assert_eq!(selected.target.key, startup_subflow.key);
-    assert_eq!(selected.admission.role, PathRuntimeRole::Subflow);
+    assert_eq!(selected.admission().role, PathRuntimeRole::Subflow);
     assert!(
         selected
-            .subflow_set_commit
+            .subflow_set_commit()
             .is_some_and(|commit| commit.input.startup_owner_allowed),
         "sender evidence permits only explicit bounded startup Subflow admission"
     );
@@ -5661,10 +5648,10 @@ fn bulk_only_live_tcp_service_tail_admits_bounded_same_underlay_startup_sampling
     .expect("bounded TCP startup sampling should remain dispatchable behind a live Service suffix");
 
     assert_eq!(selected.target.key, startup_subflow.key);
-    assert_eq!(selected.admission.role, PathRuntimeRole::Subflow);
+    assert_eq!(selected.admission().role, PathRuntimeRole::Subflow);
     assert!(
         selected
-            .subflow_set_commit
+            .subflow_set_commit()
             .is_some_and(|commit| commit.input.startup_owner_allowed),
         "TCP startup sampling must be explicit and ledger-bounded"
     );
@@ -5697,10 +5684,10 @@ fn quic_service_uses_bounded_startup_when_no_measured_subflow_exists() {
     .expect("one unmeasured QUIC path should receive bounded startup work");
 
     assert_eq!(selected.target.key, startup_subflow.key);
-    assert_eq!(selected.admission.role, PathRuntimeRole::Subflow);
+    assert_eq!(selected.admission().role, PathRuntimeRole::Subflow);
     assert!(
         selected
-            .subflow_set_commit
+            .subflow_set_commit()
             .is_some_and(|commit| commit.input.startup_owner_allowed)
     );
 }
@@ -5730,8 +5717,8 @@ fn sole_quic_service_does_not_sample_an_equally_loaded_path() {
     .expect("the equally loaded Service should remain dispatchable");
 
     assert_eq!(selected.target.key, service.key);
-    assert_eq!(selected.admission.role, PathRuntimeRole::Service);
-    assert!(selected.subflow_set_commit.is_none());
+    assert_eq!(selected.admission().role, PathRuntimeRole::Service);
+    assert!(selected.subflow_set_commit().is_none());
 }
 
 #[test]
@@ -5757,8 +5744,8 @@ fn latency_pressure_keeps_unmeasured_validation_path_out_of_owner_sampling() {
     .expect("the Service path should remain dispatchable under latency pressure");
 
     assert_eq!(selected.target.key, service.key);
-    assert_eq!(selected.admission.role, PathRuntimeRole::Service);
-    assert!(selected.subflow_set_commit.is_none());
+    assert_eq!(selected.admission().role, PathRuntimeRole::Service);
+    assert!(selected.subflow_set_commit().is_none());
 }
 
 #[test]
@@ -5784,7 +5771,7 @@ fn repair_attachment_never_receives_startup_owner_sampling() {
     .expect("the Service path should remain dispatchable with a proven Repair attachment");
 
     assert_eq!(selected.target.key, service.key);
-    assert_eq!(selected.admission.role, PathRuntimeRole::Service);
+    assert_eq!(selected.admission().role, PathRuntimeRole::Service);
 }
 
 #[test]
@@ -5815,7 +5802,7 @@ fn exact_startup_owner_continues_lower_frontier_within_multi_flow_cap() {
     )
     .expect("the first bounded startup quantum should be admitted");
     let input = first
-        .subflow_set_commit
+        .subflow_set_commit()
         .expect("startup admission must carry the exact epoch commit")
         .input;
     let mut partial_epoch = FlowSubflowSet::new(0, service.key, startup_credit, 0, Duration::ZERO);
@@ -5859,7 +5846,7 @@ fn exact_startup_owner_continues_lower_frontier_within_multi_flow_cap() {
     )
     .expect("the exact startup owner should continue its own lower frontier");
     assert_eq!(continued.target.key, startup_owner.key);
-    assert_eq!(continued.admission.role, PathRuntimeRole::Subflow);
+    assert_eq!(continued.admission().role, PathRuntimeRole::Subflow);
 
     let mut other_unmeasured =
         response_target(2, UnderlayProtocol::Udp, 4.0, 0, 16 * 1024 * 1024, false);
@@ -5922,7 +5909,7 @@ fn exact_startup_owner_continues_lower_frontier_within_multi_flow_cap() {
     )
     .expect("Service should resume after the exhausted startup hole clears");
     assert_eq!(after_ack.target.key, service.key);
-    assert_eq!(after_ack.admission.role, PathRuntimeRole::Service);
+    assert_eq!(after_ack.admission().role, PathRuntimeRole::Service);
 }
 
 #[test]
@@ -5949,8 +5936,8 @@ fn active_response_flow_may_start_one_bounded_same_family_sample() {
     )
     .expect("the Service remains dispatchable while discovery is dormant");
     assert_eq!(no_active_work.target.key, service.key);
-    assert_eq!(no_active_work.admission.role, PathRuntimeRole::Service);
-    assert!(no_active_work.subflow_set_commit.is_none());
+    assert_eq!(no_active_work.admission().role, PathRuntimeRole::Service);
+    assert!(no_active_work.subflow_set_commit().is_none());
 
     let active_response = select_response_sender_data_target_with_ordered_debt_inner(
         &[service, validation.clone()],
@@ -5967,7 +5954,7 @@ fn active_response_flow_may_start_one_bounded_same_family_sample() {
     assert_eq!(active_response.target.key, validation.key);
     assert!(
         active_response
-            .subflow_set_commit
+            .subflow_set_commit()
             .is_some_and(|commit| commit.input.startup_owner_allowed)
     );
 }
@@ -6006,7 +5993,7 @@ fn startup_sample_cap_returns_dispatch_to_service() {
         false,
     );
     let input = outcome
-        .subflow_set_commit
+        .subflow_set_commit()
         .expect("first sample quantum should be admitted")
         .input;
     let mut epoch = FlowSubflowSet::new(0, service.key, startup_credit, 0, Duration::ZERO);
@@ -6030,8 +6017,8 @@ fn startup_sample_cap_returns_dispatch_to_service() {
     .expect("Service should resume once startup sampling credit is exhausted");
 
     assert_eq!(selected.target.key, service.key);
-    assert_eq!(selected.admission.role, PathRuntimeRole::Service);
-    assert!(selected.subflow_set_commit.is_none());
+    assert_eq!(selected.admission().role, PathRuntimeRole::Service);
+    assert!(selected.subflow_set_commit().is_none());
 }
 
 #[test]
@@ -6061,7 +6048,7 @@ fn feedable_service_precedes_measured_subflow_under_bounded_tail_debt() {
 
     assert_eq!(selected.target.key, service.key);
     assert_eq!(
-        selected.admission.role,
+        selected.admission().role,
         PathRuntimeRole::Service,
         "measured Subflow remains overflow while Service has capacity"
     );
@@ -6092,7 +6079,7 @@ fn response_owner_tail_guard_keeps_service_owner_feedable_under_pressure() {
         selected.target.key, owner_key,
         "contiguous owner-tail guard blocks alternates but must not starve the current Service owner"
     );
-    assert_eq!(selected.admission.role, PathRuntimeRole::Service);
+    assert_eq!(selected.admission().role, PathRuntimeRole::Service);
 }
 
 #[test]
@@ -6131,7 +6118,7 @@ fn response_owner_tail_guard_uses_measured_same_underlay_when_service_queue_is_f
         selected.expect("measured same-underlay Subflow should remain eligible under tail debt");
     assert_eq!(selected.target.key, alternate.key);
     assert_eq!(
-        selected.admission.role,
+        selected.admission().role,
         PathRuntimeRole::Subflow,
         "queue backpressure on Service does not promote a new Service; it admits a measured same-underlay Subflow"
     );
@@ -6174,7 +6161,7 @@ fn ordered_owner_debt_admits_measured_same_underlay_subflow_when_service_is_back
         selected.expect("measured same-underlay Subflow should pass tail-debt admission");
     assert_eq!(selected.target.key, survivor.key);
     assert_eq!(
-        selected.admission.role,
+        selected.admission().role,
         PathRuntimeRole::Subflow,
         "queue backpressure on a live Service owner is not Service failure; measured same-underlay work remains Subflow OwnerData"
     );
@@ -6208,7 +6195,7 @@ fn ordered_owner_debt_keeps_live_service_owner_when_it_has_capacity() {
         selected.target.key, service.key,
         "ordered-owner debt must not eject a live owner and create no_admissible_lead"
     );
-    assert_eq!(selected.admission.role, PathRuntimeRole::Service);
+    assert_eq!(selected.admission().role, PathRuntimeRole::Service);
 }
 
 #[test]
@@ -6314,7 +6301,7 @@ fn clear_frontier_stale_owner_hint_does_not_block_liveness_service_failover() {
         "a stale ordered-owner hint without unresolved bytes must not pin Service ownership to a worse proof-only path"
     );
     assert_eq!(
-        selected.admission.role,
+        selected.admission().role,
         PathRuntimeRole::Service,
         "liveness failover elects one Service owner; it must not admit optional Subflow ownership"
     );
@@ -6341,7 +6328,7 @@ fn clear_frontier_ownerless_stream_elects_measured_service() {
 
     assert_eq!(selected.target.key, survivor.key);
     assert_eq!(
-        selected.admission.role,
+        selected.admission().role,
         PathRuntimeRole::Service,
         "ownerless failover elects a new Service, not an optional Subflow behind missing-owner debt"
     );
@@ -6375,7 +6362,7 @@ fn response_owner_tail_guard_admits_measured_same_underlay_when_service_over_bud
     )
     .expect("measured same-underlay Subflow should remain eligible under bounded tail debt");
     assert_eq!(
-        selected.admission.role,
+        selected.admission().role,
         PathRuntimeRole::Subflow,
         "owner-tail debt is accounted as ordering risk, not an absolute same-underlay Subflow ban"
     );
@@ -6517,7 +6504,7 @@ fn response_small_owner_debt_keeps_feedable_service_ahead_of_measured_subflow() 
         "small Service-tail debt must not displace a feedable Service with optional same-underlay work"
     );
     assert_eq!(
-        selected.admission.role,
+        selected.admission().role,
         PathRuntimeRole::Service,
         "the lower-ETA same-underlay path remains Subflow overflow"
     );
@@ -6600,7 +6587,7 @@ fn missing_same_underlay_owner_debt_admits_measured_service_failover() {
 
     assert_eq!(selected.target.key, measured_survivor.key);
     assert_eq!(
-        selected.admission.role,
+        selected.admission().role,
         PathRuntimeRole::Service,
         "same-underlay failover resumes Service OwnerData; it is not optional Subflow exploration and does not credit RepairData as proof"
     );
@@ -6644,7 +6631,7 @@ fn missing_same_underlay_service_failover_respects_path_latency_window() {
         None,
     )
     .expect("mature same-underlay Service failover may consume remaining latency-window credit");
-    assert_eq!(selected.admission.role, PathRuntimeRole::Service);
+    assert_eq!(selected.admission().role, PathRuntimeRole::Service);
 
     measured_survivor.snapshot.product_bytes_in_flight = latency_credit as u64;
     assert!(
@@ -6690,12 +6677,12 @@ fn missing_same_underlay_owner_debt_admits_sender_evidence_service_failover() {
 
     assert_eq!(selected.target.key, liveness_survivor.key);
     assert_eq!(
-        selected.admission.role,
+        selected.admission().role,
         PathRuntimeRole::Service,
         "same-underlay failover is Service continuation, not Subflow aggregation"
     );
     assert!(
-        selected.subflow_set_commit.is_none(),
+        selected.subflow_set_commit().is_none(),
         "failover Service election must not spend Subflow owner credit"
     );
 }
@@ -6744,7 +6731,7 @@ fn proof_only_active_service_can_continue_under_its_own_tail_guard() {
         selected.expect("the live active Service owner may continue under its own tail guard");
     assert_eq!(selected.target.key, active_fallback.key);
     assert_eq!(
-        selected.admission.role,
+        selected.admission().role,
         PathRuntimeRole::Service,
         "tail guard must not turn active Service OwnerData into Subflow exploration"
     );
@@ -6776,13 +6763,13 @@ fn bulk_only_tcp_sender_evidence_admits_startup_subflow_not_service() {
         "sender evidence may start one bounded same-underlay Subflow sampling epoch"
     );
     assert_eq!(
-        selected.admission.role,
+        selected.admission().role,
         PathRuntimeRole::Subflow,
         "startup owner bytes are Subflow OwnerData and must not migrate Service ownership"
     );
     assert!(
         selected
-            .subflow_set_commit
+            .subflow_set_commit()
             .is_some_and(|commit| commit.input.startup_owner_allowed),
         "startup Subflow admission must be explicit and bounded"
     );
@@ -6819,10 +6806,10 @@ fn measured_cross_family_path_handoff_allows_diversification_or_two_x_gain() {
     )
     .expect("measured underloaded family should receive one whole flow");
     assert_eq!(selected.target.key, udp.key);
-    assert_eq!(selected.admission.role, PathRuntimeRole::Service);
+    assert_eq!(selected.admission().role, PathRuntimeRole::Service);
     assert_eq!(
         selected
-            .service_handoff_commit
+            .service_handoff_commit()
             .map(|commit| commit.handoff_frontier),
         Some(4096)
     );
@@ -6859,7 +6846,7 @@ fn measured_cross_family_path_handoff_allows_diversification_or_two_x_gain() {
         None,
     )
     .expect("a balanced family may still move one flow for a two-fold projected gain");
-    assert_eq!(balanced_gain.admission.role, PathRuntimeRole::Service);
+    assert_eq!(balanced_gain.admission().role, PathRuntimeRole::Service);
 }
 
 #[test]
@@ -7054,12 +7041,9 @@ async fn response_service_handoff_drain_holds_raw_offset_until_frontier_commit()
     assert!(matches!(
         &plan.primary,
         ResponseDataDispatchTarget::Switchable {
-            service_handoff_commit: Some(ResponseServiceHandoffCommit {
-                handoff_frontier,
-                ..
-            }),
+            intent: ResponseDataDispatchIntent::ServiceHandoff(commit),
             ..
-        } if *handoff_frontier == frontier
+        } if commit.handoff_frontier == frontier
     ));
 
     let handoff_frame = Frame::StreamData {
@@ -7129,12 +7113,9 @@ async fn balanced_performance_override_commits_full_handoff_transaction() {
     assert!(matches!(
         &plan.primary,
         ResponseDataDispatchTarget::Switchable {
-            service_handoff_commit: Some(ResponseServiceHandoffCommit {
-                mode: ResponseServiceHandoffMode::PerformanceOverride,
-                ..
-            }),
+            intent: ResponseDataDispatchIntent::ServiceHandoff(commit),
             ..
-        }
+        } if commit.mode == ResponseServiceHandoffMode::PerformanceOverride
     ));
 
     let outcome = emit_planned_response_data_frame(
@@ -7193,7 +7174,7 @@ async fn handoff_commit_rejects_shared_queue_growth_beyond_ranked_credit() {
     let (target_commands, pending_limit) = match &plan.primary {
         ResponseDataDispatchTarget::Switchable {
             target,
-            service_handoff_commit: Some(commit),
+            intent: ResponseDataDispatchIntent::ServiceHandoff(commit),
             ..
         } => (
             target.commands.clone(),

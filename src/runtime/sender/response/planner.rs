@@ -88,22 +88,111 @@ fn response_frame_is_bulk_stream_data(frame: &Frame, lane: FlowLane) -> bool {
     lane.is_bulk() && matches!(frame, Frame::StreamData { .. })
 }
 
-#[derive(Clone)]
 pub(super) enum ResponseDataDispatchTarget {
     Fixed(Arc<FixedReliablePathOutput>),
     Switchable {
         binding: Arc<ResponseStreamBinding>,
         target: ResponseDispatchTarget,
-        role: PathRuntimeRole,
-        service_handoff_commit: Option<ResponseServiceHandoffCommit>,
-        subflow_set_commit: Option<ResponseSubflowAdmissionCommit>,
-        ack_clock_calibration_commit: Option<ResponseAckClockCalibrationCommit>,
+        intent: ResponseDataDispatchIntent,
     },
 }
 
-#[derive(Clone)]
 pub(super) struct ResponseDataDispatchPlan {
     pub(super) primary: ResponseDataDispatchTarget,
+}
+
+/// Exact mutation authorized after ranking one compact carrier identity.
+///
+/// These alternatives are mutually exclusive. Only Service handoff is boxed:
+/// it is a rare whole-flow transition and carries a large pinned proof, while
+/// ACK calibration may authorize several consecutive ordinary frames.
+#[derive(Clone)]
+pub(super) enum ResponseDataDispatchIntent {
+    Service,
+    ExistingSubflow,
+    NewSubflow(ResponseSubflowAdmissionCommit),
+    AckClockCalibration(ResponseAckClockCalibrationCommit),
+    ServiceHandoff(Box<ResponseServiceHandoffCommit>),
+}
+
+impl ResponseDataDispatchIntent {
+    fn from_owner_admission(
+        role: PathRuntimeRole,
+        subflow: Option<ResponseSubflowAdmissionCommit>,
+        calibration: Option<ResponseAckClockCalibrationCommit>,
+    ) -> Option<Self> {
+        match (role, subflow, calibration) {
+            (PathRuntimeRole::Service, None, None) => Some(Self::Service),
+            (PathRuntimeRole::Subflow, None, None) => Some(Self::ExistingSubflow),
+            (PathRuntimeRole::Subflow, Some(commit), None) => Some(Self::NewSubflow(commit)),
+            (PathRuntimeRole::Subflow, None, Some(commit)) => {
+                Some(Self::AckClockCalibration(commit))
+            }
+            _ => None,
+        }
+    }
+
+    pub(super) fn role(&self) -> PathRuntimeRole {
+        match self {
+            Self::Service | Self::ServiceHandoff(_) => PathRuntimeRole::Service,
+            Self::ExistingSubflow | Self::NewSubflow(_) | Self::AckClockCalibration(_) => {
+                PathRuntimeRole::Subflow
+            }
+        }
+    }
+
+    fn admission(&self) -> PathAdmission {
+        match self.role() {
+            PathRuntimeRole::Service => PathAdmission::service(),
+            PathRuntimeRole::Subflow => PathAdmission::subflow_owner(PathRuntimeRole::Subflow),
+            _ => unreachable!("response OwnerData intent has only Service or Subflow roles"),
+        }
+    }
+
+    fn service_handoff_commit(&self) -> Option<&ResponseServiceHandoffCommit> {
+        match self {
+            Self::ServiceHandoff(commit) => Some(commit),
+            _ => None,
+        }
+    }
+
+    fn service_handoff_commit_mut(&mut self) -> Option<&mut ResponseServiceHandoffCommit> {
+        match self {
+            Self::ServiceHandoff(commit) => Some(commit),
+            _ => None,
+        }
+    }
+
+    fn subflow_commit(&self) -> Option<ResponseSubflowAdmissionCommit> {
+        match self {
+            Self::NewSubflow(commit) => Some(*commit),
+            _ => None,
+        }
+    }
+
+    fn subflow_commit_mut(&mut self) -> Option<&mut ResponseSubflowAdmissionCommit> {
+        match self {
+            Self::NewSubflow(commit) => Some(commit),
+            _ => None,
+        }
+    }
+
+    #[cfg(test)]
+    fn ack_clock_calibration_commit(&self) -> Option<ResponseAckClockCalibrationCommit> {
+        match self {
+            Self::AckClockCalibration(commit) => Some(*commit),
+            _ => None,
+        }
+    }
+
+    fn ack_clock_calibration_commit_mut(
+        &mut self,
+    ) -> Option<&mut ResponseAckClockCalibrationCommit> {
+        match self {
+            Self::AckClockCalibration(commit) => Some(commit),
+            _ => None,
+        }
+    }
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -132,7 +221,7 @@ impl ResponseDataDispatchPlan {
     fn primary_role(&self) -> PathRuntimeRole {
         match &self.primary {
             ResponseDataDispatchTarget::Fixed(_) => PathRuntimeRole::Service,
-            ResponseDataDispatchTarget::Switchable { role, .. } => *role,
+            ResponseDataDispatchTarget::Switchable { intent, .. } => intent.role(),
         }
     }
 }
@@ -159,10 +248,40 @@ pub(super) struct ResponseServiceHandoffCommit {
 #[derive(Clone)]
 pub(super) struct ResponseSelectedDataTarget {
     target: ResponseSenderPathTarget,
-    admission: PathAdmission,
-    service_handoff_commit: Option<ResponseServiceHandoffCommit>,
-    subflow_set_commit: Option<ResponseSubflowAdmissionCommit>,
-    ack_clock_calibration_commit: Option<ResponseAckClockCalibrationCommit>,
+    intent: ResponseDataDispatchIntent,
+}
+
+impl ResponseSelectedDataTarget {
+    fn admission(&self) -> PathAdmission {
+        self.intent.admission()
+    }
+
+    fn service_handoff_commit(&self) -> Option<&ResponseServiceHandoffCommit> {
+        self.intent.service_handoff_commit()
+    }
+
+    fn service_handoff_commit_mut(&mut self) -> Option<&mut ResponseServiceHandoffCommit> {
+        self.intent.service_handoff_commit_mut()
+    }
+
+    fn subflow_set_commit(&self) -> Option<ResponseSubflowAdmissionCommit> {
+        self.intent.subflow_commit()
+    }
+
+    fn subflow_set_commit_mut(&mut self) -> Option<&mut ResponseSubflowAdmissionCommit> {
+        self.intent.subflow_commit_mut()
+    }
+
+    #[cfg(test)]
+    fn ack_clock_calibration_commit(&self) -> Option<ResponseAckClockCalibrationCommit> {
+        self.intent.ack_clock_calibration_commit()
+    }
+
+    fn ack_clock_calibration_commit_mut(
+        &mut self,
+    ) -> Option<&mut ResponseAckClockCalibrationCommit> {
+        self.intent.ack_clock_calibration_commit_mut()
+    }
 }
 
 pub(super) fn response_service_handoff_target_view(
@@ -378,26 +497,25 @@ pub(super) fn select_response_service_handoff_target(
 
     Some(ResponseSelectedDataTarget {
         target: target.clone(),
-        admission: PathAdmission::service(),
-        service_handoff_commit: Some(ResponseServiceHandoffCommit {
-            planner_generation: 0,
-            lane_generation: 0,
-            model_generation: 0,
-            handoff_frontier,
-            service: service.observation.key,
-            service_path_instance_id: service.observation.path_instance_id,
-            service_incarnation: service.observation.incarnation,
-            target_path_instance_id: target.observation.path_instance_id,
-            mode: candidate.mode,
-            target_command_pending_limit_bytes,
-            capacity_proof: required_reservation
-                .map(|reservation| reservation.capacity_proof)
-                .unwrap_or_else(|| {
-                    response_service_handoff_start_capacity_proof(&target, Instant::now())
-                }),
-        }),
-        subflow_set_commit: None,
-        ack_clock_calibration_commit: None,
+        intent: ResponseDataDispatchIntent::ServiceHandoff(Box::new(
+            ResponseServiceHandoffCommit {
+                planner_generation: 0,
+                lane_generation: 0,
+                model_generation: 0,
+                handoff_frontier,
+                service: service.observation.key,
+                service_path_instance_id: service.observation.path_instance_id,
+                service_incarnation: service.observation.incarnation,
+                target_path_instance_id: target.observation.path_instance_id,
+                mode: candidate.mode,
+                target_command_pending_limit_bytes,
+                capacity_proof: required_reservation
+                    .map(|reservation| reservation.capacity_proof)
+                    .unwrap_or_else(|| {
+                        response_service_handoff_start_capacity_proof(&target, Instant::now())
+                    }),
+            },
+        )),
     })
 }
 
@@ -421,7 +539,7 @@ pub(super) fn response_service_handoff_drain_matches_selection(
     reservation: ResponseServiceHandoffDrainReservation,
     selection: &ResponseSelectedDataTarget,
 ) -> bool {
-    let Some(commit) = selection.service_handoff_commit else {
+    let Some(commit) = selection.service_handoff_commit() else {
         return false;
     };
     reservation.binding_instance_id == binding_instance_id
@@ -907,12 +1025,11 @@ pub(super) fn admit_response_data_target(
         );
         return None;
     }
+    let intent =
+        ResponseDataDispatchIntent::from_owner_admission(admission.role, subflow_set_commit, None)?;
     Some(ResponseSelectedDataTarget {
         target: target.clone(),
-        admission,
-        service_handoff_commit: None,
-        subflow_set_commit,
-        ack_clock_calibration_commit: None,
+        intent,
     })
 }
 
@@ -1013,10 +1130,7 @@ pub(super) fn select_response_sender_data_target_with_ordered_debt_inner_and_ret
         )
         .map(|target| ResponseSelectedDataTarget {
             target,
-            admission: PathAdmission::service(),
-            service_handoff_commit: None,
-            subflow_set_commit: None,
-            ack_clock_calibration_commit: None,
+            intent: ResponseDataDispatchIntent::Service,
         });
     }
 
@@ -1315,16 +1429,13 @@ pub(super) fn select_response_sender_data_target_with_ordered_debt_inner_and_ret
         // adds only the shared ownership metadata used by dispatch.
         let calibration = ResponseSelectedDataTarget {
             target: calibration.target,
-            admission: PathAdmission::subflow_owner(PathRuntimeRole::Subflow),
-            service_handoff_commit: None,
-            subflow_set_commit: None,
-            ack_clock_calibration_commit: Some(calibration.commit),
+            intent: ResponseDataDispatchIntent::AckClockCalibration(calibration.commit),
         };
         #[cfg(feature = "lab-diagnostics")]
         lab_response_bulk_output_selected(
             "ack_clock_calibration",
             &calibration.target,
-            calibration.admission,
+            calibration.admission(),
             payload_bytes,
         );
         return Some(calibration);
@@ -1446,7 +1557,7 @@ pub(super) fn select_response_sender_data_target_with_ordered_debt_inner_and_ret
         lab_response_bulk_output_selected(
             "same_family_subflow_reservoir",
             &subflow_target.target,
-            subflow_target.admission,
+            subflow_target.admission(),
             payload_bytes,
         );
         return Some(subflow_target);
@@ -1455,7 +1566,7 @@ pub(super) fn select_response_sender_data_target_with_ordered_debt_inner_and_ret
         .iter()
         .filter(|selected| {
             selected
-                .subflow_set_commit
+                .subflow_set_commit()
                 .is_some_and(|commit| commit.input.startup_owner_allowed)
         })
         .min_by(|left, right| {
@@ -1476,7 +1587,7 @@ pub(super) fn select_response_sender_data_target_with_ordered_debt_inner_and_ret
         lab_response_bulk_output_selected(
             "startup_sample",
             &startup.target,
-            startup.admission,
+            startup.admission(),
             payload_bytes,
         );
         return Some(startup);
@@ -1499,7 +1610,7 @@ pub(super) fn select_response_sender_data_target_with_ordered_debt_inner_and_ret
         lab_response_bulk_output_selected(
             "service_first",
             &service_target.target,
-            service_target.admission,
+            service_target.admission(),
             payload_bytes,
         );
         return Some(service_target);
@@ -1528,13 +1639,13 @@ pub(super) fn select_response_sender_data_target_with_ordered_debt_inner_and_ret
         lab_response_bulk_output_selected(
             "hysteresis",
             &lead_target.target,
-            lead_target.admission,
+            lead_target.admission(),
             payload_bytes,
         );
         return Some(lead_target.clone());
     }
     #[cfg(feature = "lab-diagnostics")]
-    lab_response_bulk_output_selected("best_eta", &best.target, best.admission, payload_bytes);
+    lab_response_bulk_output_selected("best_eta", &best.target, best.admission(), payload_bytes);
     Some(best.clone())
 }
 
@@ -1560,7 +1671,7 @@ pub(super) fn response_feedable_service_owner_target(
 ) -> Option<ResponseSelectedDataTarget> {
     admitted
         .iter()
-        .filter(|selected| selected.admission.role == PathRuntimeRole::Service)
+        .filter(|selected| selected.admission().role == PathRuntimeRole::Service)
         .min_by(|left, right| {
             response_target_assigned_product_bytes(&left.target)
                 .cmp(&response_target_assigned_product_bytes(&right.target))
@@ -1593,7 +1704,7 @@ pub(super) fn response_same_family_reservoir_subflow_target(
     admitted
         .iter()
         .filter(|selected| {
-            selected.admission.role == PathRuntimeRole::Subflow
+            selected.admission().role == PathRuntimeRole::Subflow
                 && response_target_is_same_family_reservoir_candidate(reservoir, &selected.target)
                 // Separate QUIC connections own independent congestion
                 // controllers. Crossing into an equally loaded connection
@@ -1602,7 +1713,7 @@ pub(super) fn response_same_family_reservoir_subflow_target(
                     || service.target.observation.active_bulk_flows()
                         > selected.target.observation.active_bulk_flows())
                 && selected
-                    .subflow_set_commit
+                    .subflow_set_commit()
                     .is_some_and(|commit| commit.service == reservoir.service())
         })
         .min_by(|left, right| {
@@ -1830,8 +1941,7 @@ fn evaluate_response_data_dispatch_with_ordered_debt(
                         )
                     }));
                     let commit = selected
-                        .service_handoff_commit
-                        .as_mut()
+                        .service_handoff_commit_mut()
                         .expect("response Service handoff selection has a commit");
                     commit.planner_generation = planner_generation;
                     commit.lane_generation = lane_generation;
@@ -1840,18 +1950,20 @@ fn evaluate_response_data_dispatch_with_ordered_debt(
                     lab_response_bulk_output_selected(
                         "service_handoff",
                         &selected.target,
-                        selected.admission,
+                        selected.admission(),
                         payload_bytes,
                     );
+                    let ResponseSelectedDataTarget { target, intent } = selected;
+                    debug_assert!(matches!(
+                        &intent,
+                        ResponseDataDispatchIntent::ServiceHandoff(_)
+                    ));
                     return Ok(ResponseDataPlanningOutcome::Dispatch(
                         ResponseDataDispatchPlan {
                             primary: ResponseDataDispatchTarget::Switchable {
                                 binding: binding.clone(),
-                                target: selected.target.into(),
-                                role: PathRuntimeRole::Service,
-                                service_handoff_commit: selected.service_handoff_commit,
-                                subflow_set_commit: None,
-                                ack_clock_calibration_commit: None,
+                                target: target.into(),
+                                intent,
                             },
                         },
                     ));
@@ -1980,22 +2092,22 @@ fn evaluate_response_data_dispatch_with_ordered_debt(
                 let Some(mut selected) = selected else {
                     return Err(RuntimeError::SenderServiceBlocked);
                 };
-                if let Some(commit) = selected.subflow_set_commit.as_mut() {
+                if let Some(commit) = selected.subflow_set_commit_mut() {
                     commit.planner_generation = planner_generation;
                     commit.lane_generation = lane_generation;
                 }
-                if let Some(commit) = selected.ack_clock_calibration_commit.as_mut() {
+                if let Some(commit) = selected.ack_clock_calibration_commit_mut() {
                     commit.planner_generation = planner_generation;
                     commit.lane_generation = lane_generation;
                     commit.model_generation = model_generation;
                 }
-                let target = selected.target;
-                let role = selected.admission.role;
+                let role = selected.admission().role;
+                let target = &selected.target;
                 debug_assert!(
                     role != PathRuntimeRole::Subflow
                         || target.observation.has_bulk_rate_evidence
                         || selected
-                            .subflow_set_commit
+                            .subflow_set_commit()
                             .is_some_and(|commit| commit.input.startup_owner_allowed),
                     "Subflow OwnerData requires bulk-rate evidence or explicit bounded startup admission: target={:?} role={:?} ordered_owner={:?} lower_owner={:?} is_active={} sender_evidence={} bulk_evidence={}",
                     target.observation.key,
@@ -2006,15 +2118,16 @@ fn evaluate_response_data_dispatch_with_ordered_debt(
                     target.observation.has_sender_evidence,
                     target.observation.has_bulk_rate_evidence,
                 );
+                if selected.service_handoff_commit().is_some() {
+                    return Err(RuntimeError::SenderServiceBlocked);
+                }
+                let ResponseSelectedDataTarget { target, intent } = selected;
                 return Ok(ResponseDataPlanningOutcome::Dispatch(
                     ResponseDataDispatchPlan {
                         primary: ResponseDataDispatchTarget::Switchable {
                             binding: binding.clone(),
                             target: target.into(),
-                            role,
-                            service_handoff_commit: selected.service_handoff_commit,
-                            subflow_set_commit: selected.subflow_set_commit,
-                            ack_clock_calibration_commit: selected.ack_clock_calibration_commit,
+                            intent,
                         },
                     },
                 ));
@@ -2078,7 +2191,7 @@ pub(super) fn response_plan_is_ack_clock_calibration(planned: &ResponseDataDispa
     matches!(
         &planned.primary,
         ResponseDataDispatchTarget::Switchable {
-            ack_clock_calibration_commit: Some(_),
+            intent: ResponseDataDispatchIntent::AckClockCalibration(_),
             ..
         }
     )

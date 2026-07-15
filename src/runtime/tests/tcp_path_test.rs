@@ -1,10 +1,19 @@
 use super::*;
+use crate::config::ResourceLimits;
 use crate::protocol::frame::reliable_path_frame_pacing_bytes;
+use crate::runtime::path::proof::path_proof_metrics;
 use crate::runtime::path::tcp::connect_client_tcp_path_for_test;
+use crate::runtime::path::{
+    PathProofObservation, ServerStreamOpenRequest, ServerStreamPathAttachment,
+};
+use crate::runtime::relay::lifecycle::{
+    recover_reliable_relay_after_path_failure, reliable_relay_delivery_path_should_become_active,
+};
 use crate::runtime::relay::open::{
-    OpenedRemoteStream, relay_error_is_tcp_path_failure, relay_path_open_error_is_retryable,
-    reliable_initial_active_open_timeout, reliable_relay_attach_open_timeouts,
-    stream_open_error_is_path_retryable, udp_stream_open_error_is_path_retryable,
+    OpenedRemoteStream, ReliableRelayOpenSpec, relay_error_is_tcp_path_failure,
+    relay_path_open_error_is_retryable, reliable_initial_active_open_timeout,
+    reliable_relay_attach_open_timeouts, stream_open_error_is_path_retryable,
+    udp_stream_open_error_is_path_retryable,
 };
 use crate::runtime::relay::remote::{
     ReliableRelayRemoteSet, reliable_relay_active_path_candidates,
@@ -205,8 +214,8 @@ async fn concurrent_tcp_latency_opens_share_one_authenticated_carrier() {
         deadlines,
     );
     let (first, second) = tokio::join!(first, second);
-    drop(first.expect("first stream").stream);
-    drop(second.expect("second stream").stream);
+    drop(first.expect("first stream").carrier);
+    drop(second.expect("second stream").carrier);
     server.await.expect("server task").expect("server path");
 }
 
@@ -785,7 +794,7 @@ async fn tcp_carrier_reconnect_publishes_a_new_generation_and_uses_setup_deadlin
     assert_ne!(second_generation, first_generation);
 
     drop(first);
-    drop(second.stream);
+    drop(second.carrier);
     finish_second_tx.send(()).expect("finish second carrier");
     server.await.expect("server task").expect("server path");
 }
@@ -1542,22 +1551,20 @@ async fn server_tcp_registry_ignores_late_frames_for_recently_closed_stream() {
         registry.register_carrier_path(session_id, UnderlayProtocol::Tcp, PathId(0));
 
     let opened = registry
-        .open_or_attach(
-            ServerReliableStreamOpenRequest {
-                session_id,
-                stream_id,
-                target: &target,
-                lane: FlowLane::Latency,
-                attachment: ServerReliablePathAttachment {
-                    path_registration: first_path_registration.clone(),
-                    commands,
-                    max_frame_payload_bytes: reliable_relay_buffer_len(MuxLimits::default()),
-                    role: StreamOpenRole::Active,
-                    initial_metrics: None,
-                },
+        .open_or_attach(ServerStreamOpenRequest {
+            session_id,
+            stream_id,
+            target: target.clone(),
+            lane: FlowLane::Latency,
+            attachment: ServerStreamPathAttachment {
+                path_registration: first_path_registration.clone(),
+                commands,
+                max_frame_payload_bytes: reliable_relay_buffer_len(MuxLimits::default()),
+                role: StreamOpenRole::Active,
+                initial_metrics: None,
             },
-            MuxLimits::default(),
-        )
+            mux_limits: MuxLimits::default(),
+        })
         .expect("server stream open");
     let _accepted = match opened {
         ServerReliableStreamOpen::New(accepted) => accepted,
@@ -1594,22 +1601,20 @@ async fn server_tcp_registry_ignores_late_frames_for_recently_closed_stream() {
     let second_path_registration =
         registry.register_carrier_path(session_id, UnderlayProtocol::Tcp, PathId(1));
     let opened = registry
-        .open_or_attach(
-            ServerReliableStreamOpenRequest {
-                session_id,
-                stream_id: unknown,
-                target: &target,
-                lane: FlowLane::Latency,
-                attachment: ServerReliablePathAttachment {
-                    path_registration: second_path_registration.clone(),
-                    commands,
-                    max_frame_payload_bytes: reliable_relay_buffer_len(MuxLimits::default()),
-                    role: StreamOpenRole::Active,
-                    initial_metrics: None,
-                },
+        .open_or_attach(ServerStreamOpenRequest {
+            session_id,
+            stream_id: unknown,
+            target: target.clone(),
+            lane: FlowLane::Latency,
+            attachment: ServerStreamPathAttachment {
+                path_registration: second_path_registration.clone(),
+                commands,
+                max_frame_payload_bytes: reliable_relay_buffer_len(MuxLimits::default()),
+                role: StreamOpenRole::Active,
+                initial_metrics: None,
             },
-            MuxLimits::default(),
-        )
+            mux_limits: MuxLimits::default(),
+        })
         .expect("unknown-frame drop must not poison active open");
     let _unknown_accepted = match opened {
         ServerReliableStreamOpen::New(accepted) => accepted,

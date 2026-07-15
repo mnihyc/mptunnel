@@ -1,10 +1,20 @@
 use super::test_support::*;
 use super::*;
+use crate::config::ResourceLimits;
+use crate::model::work::ReliableWorkClass;
+use crate::protocol::{IngressKind, PathId, SessionId, TargetAddr};
 use crate::runtime::path::commands::{
-    ReliablePathCommand, reliable_path_command_channels, try_recv_reliable_path_command,
-    try_recv_reliable_path_priority_command,
+    ReliablePathCommand, recv_reliable_path_command, reliable_path_command_channels,
+    try_recv_reliable_path_command, try_recv_reliable_path_priority_command,
 };
+use crate::runtime::relay::ReliableRelayRemotePath;
+use crate::runtime::relay::io::reliable_persistent_ack_gap_repair_limit_bytes;
+use crate::runtime::sender::response::ServerResponseSenderService;
+use crate::runtime::stream::FixedReliablePathOutput;
 use crate::runtime::stream::response::ResponseStreamBinding;
+use crate::transport::PathSpec;
+use std::net::SocketAddr;
+use std::sync::Arc;
 
 #[test]
 fn budgeted_critical_repair_preempts_owner_data_and_debits_budget() {
@@ -772,12 +782,7 @@ async fn client_path_failure_releases_optional_load_before_cleanup_waits() {
     let lease = context
         .try_reserve_relay_path_load_if_unchanged(candidate.key, FlowLane::Throughput, 0, 0)
         .expect("reserve optional path load");
-    assert!(
-        remotes
-            .commit_path_instance_load_claim(candidate, lease)
-            .is_ok(),
-        "commit optional path load"
-    );
+    remotes.commit_path_instance_load_claim(candidate, lease);
     let registration = context.reliable_tcp_request_bulk_flow_registration();
     registration.update(true, Some(UnderlayProtocol::Tcp));
     let mut sender = RequestSenderService::new(stream_id);

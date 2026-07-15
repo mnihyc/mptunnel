@@ -1,5 +1,5 @@
 use super::*;
-use crate::config::SharedSecret;
+use crate::config::{ClientPathConfig, LocalIngressConfig, ResourceLimits, SharedSecret};
 
 #[test]
 fn auth_accepts_bearer_and_rejects_wrong_token() {

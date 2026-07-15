@@ -3,13 +3,33 @@ use super::super::tcp_capacity::request_tcp_carrier_authority_expired_naturally;
 use super::super::test_support::*;
 use super::super::*;
 use super::*;
-use crate::model::ack_clock::reliable_request_ack_clock_calibration_target_bytes;
-use crate::model::capacity::QuicCapacityProofCandidate;
-use crate::protocol::frame::reliable_stream_frame_extent;
-use crate::runtime::path::ReliableTcpRequestBulkFlowRegistration;
-use crate::runtime::path::commands::{
-    ReliablePathCommand, reliable_path_command_channels, try_recv_reliable_path_command,
+use crate::config::ResourceLimits;
+use crate::model::ack_clock::{
+    reliable_ack_clock_calibration_rate_coverage_floor_bytes,
+    reliable_request_ack_clock_calibration_target_bytes,
 };
+use crate::model::capacity::{
+    BBR_MAX_SEND_QUANTUM_BYTES, PATH_OPEN_SCORE_BYTES, QuicCapacityProofCandidate,
+    reliable_capacity_calibration_session_limit_bytes, reliable_subflow_startup_sample_limit_bytes,
+};
+use crate::model::multipath::{PathAdmissionDecision, SubflowAdmissionInput};
+use crate::model::request::evidence::RequestPathRateEvidence;
+use crate::protocol::frame::reliable_stream_frame_extent;
+use crate::protocol::{IngressKind, TargetAddr};
+use crate::runtime::path::commands::{
+    CapacityProbeCommandResolution, CapacityProbeCommandTicket, ReliablePathCommand,
+    reliable_path_command_channels, try_recv_reliable_path_command,
+};
+#[cfg(feature = "lab-diagnostics")]
+use crate::runtime::path::quic::metrics::QuicAckPollDiagnostics;
+use crate::runtime::path::quic::metrics::UdpPathMetrics;
+use crate::runtime::path::{
+    PathProofObservation, ReliableTcpRequestBulkFlowRegistration,
+    RequestCapacityProbeCampaignBudget, RequestQuicCapacityProductHandoffState,
+};
+use crate::transport::PathSpec;
+use std::net::SocketAddr;
+use std::sync::Arc;
 
 fn active_request_bulk_flow_registrations(
     context: &ClientPathContext,
@@ -1519,7 +1539,11 @@ async fn tcp_product_window_turnover_sums_only_live_exact_owner_models() {
         service_turnover,
         "a candidate pipe is stale at the exact three-PTO boundary"
     );
-    assert!(!sender.revoke_request_tcp_capacity_calibration(candidate, false));
+    assert!(
+        !sender
+            .multipath
+            .revoke_request_tcp_capacity_calibration(candidate, false)
+    );
     assert!(
         sender
             .multipath
@@ -1658,9 +1682,10 @@ async fn graduated_candidate_calibration_produces_ack_clock_capacity_sample() {
         .seed_ack_boundary(Instant::now());
 
     let cancelled_selection = sender
-        .choose_relay_path_position(
+        .multipath
+        .plan_relay_path_send(
             &context,
-            &remotes,
+            &mut remotes,
             &calibration_frames[0],
             FlowLane::Throughput,
             RelaySendCause::StreamData,
@@ -1744,7 +1769,11 @@ async fn graduated_candidate_calibration_produces_ack_clock_capacity_sample() {
     for frame in &sent_calibration_frames[..final_ack_start] {
         ack_client_frame_for_test(&mut sender, &context, frame);
     }
-    assert!(sender.revoke_request_tcp_capacity_calibration(candidate, true));
+    assert!(
+        sender
+            .multipath
+            .revoke_request_tcp_capacity_calibration(candidate, true)
+    );
     let candidate_state = sender
         .multipath
         .request
@@ -2531,6 +2560,7 @@ async fn request_quic_proof_at_train_deadline_keeps_exact_handoff_owner() {
         client_data_frame_for_test(foreign_stream_id, 0, proof.required_proof_bytes as usize);
     let mut foreign_sender = RequestSenderService::new(foreign_stream_id);
     foreign_sender
+        .multipath
         .request
         .flights
         .record_owner_frame_instance(candidate_instance, &foreign_frame);
@@ -3294,7 +3324,9 @@ async fn invalidated_startup_receipt_proof_requeues_in_new_generation() {
     );
     let mut sender = RequestSenderService::new(stream_id);
     sender.multipath.request.startup.epoch = Some(epoch);
-    sender.try_enqueue_request_startup_receipt_proof(&context, &remotes, candidate);
+    sender
+        .multipath
+        .try_enqueue_request_startup_receipt_proof(&context, &remotes, candidate);
     let (old_proof_id, old_generation) =
         sender.multipath.request.startup.receipt_proofs[&candidate];
     assert_eq!(old_generation, 0);
@@ -3325,7 +3357,9 @@ async fn invalidated_startup_receipt_proof_requeues_in_new_generation() {
         attached_at,
     ));
 
-    sender.try_enqueue_request_startup_receipt_proof(&context, &remotes, candidate);
+    sender
+        .multipath
+        .try_enqueue_request_startup_receipt_proof(&context, &remotes, candidate);
     let (new_proof_id, new_generation) =
         sender.multipath.request.startup.receipt_proofs[&candidate];
     assert_eq!(new_generation, 1);
@@ -3487,7 +3521,11 @@ fn tcp_carrier_expiry_preserves_only_sealed_product_transaction() {
     };
 
     let mut sealed = seed_owner(target_bytes);
-    assert!(sealed.revoke_request_tcp_capacity_calibration(candidate, true));
+    assert!(
+        sealed
+            .multipath
+            .revoke_request_tcp_capacity_calibration(candidate, true)
+    );
     assert!(
         !sealed
             .multipath
@@ -3540,7 +3578,11 @@ fn tcp_carrier_expiry_preserves_only_sealed_product_transaction() {
     );
 
     let mut partial = seed_owner(target_bytes - 64 * 1024);
-    assert!(!partial.revoke_request_tcp_capacity_calibration(candidate, true));
+    assert!(
+        !partial
+            .multipath
+            .revoke_request_tcp_capacity_calibration(candidate, true)
+    );
     assert!(partial.multipath.request.ack_clock_operation.is_none());
     assert!(
         !partial
@@ -3575,7 +3617,11 @@ fn tcp_carrier_expiry_preserves_only_sealed_product_transaction() {
     let candidate_state = pending.multipath.request.subflows.get_mut(candidate);
     candidate_state.mark_tcp_capacity_proven();
     candidate_state.mark_graduated();
-    assert!(!pending.revoke_request_tcp_capacity_calibration(candidate, true));
+    assert!(
+        !pending
+            .multipath
+            .revoke_request_tcp_capacity_calibration(candidate, true)
+    );
     assert!(pending.multipath.request.ack_clock_operation.is_none());
     assert!(
         !pending
@@ -3587,7 +3633,11 @@ fn tcp_carrier_expiry_preserves_only_sealed_product_transaction() {
     );
 
     let mut detached = seed_owner(target_bytes);
-    assert!(!detached.revoke_request_tcp_capacity_calibration(candidate, false));
+    assert!(
+        !detached
+            .multipath
+            .revoke_request_tcp_capacity_calibration(candidate, false)
+    );
     assert!(detached.multipath.request.ack_clock_operation.is_none());
     assert!(
         !detached

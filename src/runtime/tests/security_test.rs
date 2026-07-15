@@ -1,4 +1,5 @@
 use super::*;
+use crate::protocol::AuthNonce;
 
 #[test]
 fn server_path_context_rejects_replayed_path_join_nonce() {

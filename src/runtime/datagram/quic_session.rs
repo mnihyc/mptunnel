@@ -96,30 +96,6 @@ impl UdpDatagramClientSession {
         .await
     }
 
-    #[cfg(test)]
-    pub(in crate::runtime) async fn open_for_session(
-        path: &PathSpec,
-        path_index: usize,
-        session_id: SessionId,
-        security: SecurityConfig,
-        codec_limits: CodecLimits,
-        mux_limits: MuxLimits,
-        handshake_timeout: Duration,
-    ) -> Result<Self, RuntimeError> {
-        let open_deadline = tokio::time::Instant::now() + handshake_timeout;
-        Self::open_for_session_with_provider(
-            path,
-            path_index,
-            session_id,
-            security,
-            codec_limits,
-            mux_limits,
-            open_deadline,
-            std::sync::Arc::new(SystemCarrierNetworkProvider),
-        )
-        .await
-    }
-
     pub(in crate::runtime) async fn open_for_session_with_provider(
         path: &PathSpec,
         path_index: usize,

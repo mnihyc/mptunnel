@@ -199,15 +199,17 @@ fn response_sender_targets_active_path_follows_ordered_data_owner_not_output_tai
     assert!(
         targets
             .iter()
-            .find(|target| target.key == active)
-            .is_some_and(|target| target.is_active && target.is_request_active),
+            .find(|target| target.observation.key == active)
+            .is_some_and(
+                |target| target.observation.is_service && target.observation.is_request_active
+            ),
         "the initial active output remains the scheduler-active target"
     );
     assert!(
         targets
             .iter()
-            .find(|target| target.key == validation)
-            .is_some_and(|target| !target.is_active),
+            .find(|target| target.observation.key == validation)
+            .is_some_and(|target| !target.observation.is_service),
         "validation output must not be active before lead migration"
     );
 
@@ -217,15 +219,19 @@ fn response_sender_targets_active_path_follows_ordered_data_owner_not_output_tai
     assert!(
         targets
             .iter()
-            .find(|target| target.key == validation)
-            .is_some_and(|target| target.is_active && !target.is_request_active),
+            .find(|target| target.observation.key == validation)
+            .is_some_and(
+                |target| target.observation.is_service && !target.observation.is_request_active
+            ),
         "scheduler-active target must follow ordered_data_owner after migration"
     );
     assert!(
         targets
             .iter()
-            .find(|target| target.key == active)
-            .is_some_and(|target| !target.is_active && target.is_request_active),
+            .find(|target| target.observation.key == active)
+            .is_some_and(
+                |target| !target.observation.is_service && target.observation.is_request_active
+            ),
         "response owner migration must not overwrite the request Active identity"
     );
 }
@@ -405,8 +411,10 @@ fn response_detaching_service_owner_does_not_promote_probe_only_survivor_to_serv
     assert!(
         targets
             .iter()
-            .find(|target| target.key == survivor)
-            .is_some_and(|target| !target.is_active && target.has_sender_evidence),
+            .find(|target| target.observation.key == survivor)
+            .is_some_and(
+                |target| !target.observation.is_service && target.observation.has_sender_evidence
+            ),
         "probe-only survivor stays attached for validation but is not scheduler-active"
     );
 }
@@ -482,8 +490,10 @@ fn response_detaching_service_owner_does_not_promote_ack_data_survivor() {
     assert!(
         targets
             .iter()
-            .find(|target| target.key == survivor)
-            .is_some_and(|target| !target.is_active && target.has_sender_evidence),
+            .find(|target| target.observation.key == survivor)
+            .is_some_and(
+                |target| !target.observation.is_service && target.observation.has_sender_evidence
+            ),
         "ACK-data survivor remains attached evidence, not the scheduler-active Service"
     );
 }
@@ -711,10 +721,10 @@ fn validation_to_active_preserves_response_identity_evidence_and_subflow_epoch()
     let target = binding
         .sender_path_targets(FlowLane::Throughput, BBR_MAX_SEND_QUANTUM_BYTES)
         .into_iter()
-        .find(|target| target.key == candidate)
+        .find(|target| target.observation.key == candidate)
         .expect("promoted response output");
-    assert_eq!(target.incarnation, incarnation);
-    assert!(target.has_bulk_rate_evidence);
+    assert_eq!(target.observation.incarnation, incarnation);
+    assert!(target.observation.has_bulk_rate_evidence);
     let (after_generation, after_epoch) = binding.subflow_state_snapshot();
     assert_eq!(after_generation, planner_generation);
     assert_eq!(

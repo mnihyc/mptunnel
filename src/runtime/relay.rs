@@ -3,13 +3,11 @@
 //! Relay modules bridge local product I/O and sender/stream owners. They may
 //! coordinate tasks, but carrier policy and exact-flight state live elsewhere.
 
-#[cfg(test)]
-use super::*;
-
 pub(super) mod control;
 mod diagnostics;
 pub(super) mod flow;
 pub(super) mod io;
+pub(super) mod lifecycle;
 pub(super) mod open;
 pub(super) mod remote;
 mod server;

@@ -119,7 +119,7 @@ fn scheduling_observation_for_test(
     payload_bytes: usize,
     include_bulk_admission: bool,
 ) -> RequestRelaySchedulingObservation {
-    super::super::observe_request_relay_scheduling(
+    super::super::multipath::observe_request_relay_scheduling(
         context,
         paths
             .first()

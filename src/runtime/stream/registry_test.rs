@@ -1,5 +1,7 @@
 use super::*;
 use crate::model::capacity::QuicCapacityProofCandidate;
+use crate::mux::MuxLimits;
+use crate::runtime::path::ServerStreamPathAttachment;
 use crate::runtime::path::commands::reliable_path_command_channels;
 use crate::runtime::path::model::metric_epoch_now;
 use crate::runtime::stream::response::{ServerPathMetricsEntry, ServerPathMetricsSource};
@@ -80,22 +82,20 @@ fn late_open_and_closed_output_replacement_inherit_capacity_receipt() {
     let target = TargetAddr::Ip(SocketAddr::from(([127, 0, 0, 1], 80)));
     let (commands, first_receivers) = reliable_path_command_channels(8);
     let accepted = match registry
-        .open_or_attach(
-            ServerReliableStreamOpenRequest {
-                session_id,
-                stream_id,
-                target: &target,
-                lane: FlowLane::Throughput,
-                attachment: ServerReliablePathAttachment {
-                    path_registration: registration.clone(),
-                    commands,
-                    max_frame_payload_bytes: MuxLimits::default().max_payload_bytes,
-                    role: StreamOpenRole::Active,
-                    initial_metrics: Some(metrics),
-                },
+        .open_or_attach(ServerStreamOpenRequest {
+            session_id,
+            stream_id,
+            target: target.clone(),
+            lane: FlowLane::Throughput,
+            attachment: ServerStreamPathAttachment {
+                path_registration: registration.clone(),
+                commands,
+                max_frame_payload_bytes: MuxLimits::default().max_payload_bytes,
+                role: StreamOpenRole::Active,
+                initial_metrics: Some(metrics),
             },
-            MuxLimits::default(),
-        )
+            mux_limits: MuxLimits::default(),
+        })
         .expect("open response stream")
     {
         ServerReliableStreamOpen::New(accepted) => accepted,
@@ -108,39 +108,37 @@ fn late_open_and_closed_output_replacement_inherit_capacity_receipt() {
     let inherited = binding
         .sender_path_targets(FlowLane::Throughput, 1)
         .into_iter()
-        .find(|target| target.key.path_id == path_id)
+        .find(|target| target.observation.key.path_id == path_id)
         .expect("inherited receipt target");
-    assert!(inherited.has_bulk_rate_evidence);
-    assert_eq!(inherited.snapshot.confidence, 1.0);
+    assert!(inherited.observation.has_bulk_rate_evidence);
+    assert_eq!(inherited.observation.snapshot.confidence, 1.0);
 
     drop(first_receivers);
     let (replacement_commands, _replacement_receivers) = reliable_path_command_channels(8);
     assert!(matches!(
         registry
-            .open_or_attach(
-                ServerReliableStreamOpenRequest {
-                    session_id,
-                    stream_id,
-                    target: &target,
-                    lane: FlowLane::Throughput,
-                    attachment: ServerReliablePathAttachment {
-                        path_registration: registration.clone(),
-                        commands: replacement_commands,
-                        max_frame_payload_bytes: MuxLimits::default().max_payload_bytes,
-                        role: StreamOpenRole::Active,
-                        initial_metrics: Some(metrics),
-                    },
+            .open_or_attach(ServerStreamOpenRequest {
+                session_id,
+                stream_id,
+                target: target.clone(),
+                lane: FlowLane::Throughput,
+                attachment: ServerStreamPathAttachment {
+                    path_registration: registration.clone(),
+                    commands: replacement_commands,
+                    max_frame_payload_bytes: MuxLimits::default().max_payload_bytes,
+                    role: StreamOpenRole::Active,
+                    initial_metrics: Some(metrics),
                 },
-                MuxLimits::default(),
-            )
+                mux_limits: MuxLimits::default(),
+            },)
             .expect("replace closed response output"),
         ServerReliableStreamOpen::Existing
     ));
     let replacement = binding
         .sender_path_targets(FlowLane::Throughput, 1)
         .into_iter()
-        .find(|target| target.key.path_id == path_id)
+        .find(|target| target.observation.key.path_id == path_id)
         .expect("replacement receipt target");
-    assert!(replacement.has_bulk_rate_evidence);
-    assert_eq!(replacement.snapshot.confidence, 1.0);
+    assert!(replacement.observation.has_bulk_rate_evidence);
+    assert_eq!(replacement.observation.snapshot.confidence, 1.0);
 }

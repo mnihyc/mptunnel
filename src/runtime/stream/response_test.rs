@@ -78,7 +78,7 @@ async fn close_command_detaches_shared_lane_load_exactly_once() {
     let stale_target = first
         .sender_path_targets(FlowLane::Throughput, 64 * 1024)
         .into_iter()
-        .find(|target| target.key == key)
+        .find(|target| target.observation.key == key)
         .expect("first response Service target");
 
     first.close_stream(StreamId(10)).await;

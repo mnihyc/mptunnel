@@ -358,10 +358,10 @@ fn response_relay_read_snapshot_keeps_source_evidence_on_the_ordered_service() {
     let service_target = binding
         .sender_path_targets(FlowLane::Throughput, PATH_OPEN_SCORE_BYTES)
         .into_iter()
-        .find(|target| target.key == service)
+        .find(|target| target.observation.key == service)
         .expect("ordered Service sender target");
     assert_eq!(
-        source.has_bulk_rate_evidence, service_target.has_bulk_rate_evidence,
+        source.has_bulk_rate_evidence, service_target.observation.has_bulk_rate_evidence,
         "source staging and sender admission must consume the same Service proof"
     );
 
@@ -455,11 +455,11 @@ fn udp_app_limited_carrier_progress_feeds_only_the_current_service() {
     let target = binding
         .sender_path_targets(FlowLane::Throughput, PATH_OPEN_SCORE_BYTES)
         .into_iter()
-        .find(|target| target.key == service)
+        .find(|target| target.observation.key == service)
         .expect("current Service sender target");
-    assert!(target.is_active);
-    assert!(target.has_service_feed_evidence);
-    assert!(!target.has_bulk_rate_evidence);
+    assert!(target.observation.is_service);
+    assert!(target.observation.has_service_feed_evidence);
+    assert!(!target.observation.has_bulk_rate_evidence);
 
     let alternate = CarrierPathKey {
         underlay: UnderlayProtocol::Udp,
@@ -502,9 +502,9 @@ fn udp_app_limited_carrier_progress_feeds_only_the_current_service() {
     let alternate_target = binding
         .sender_path_targets(FlowLane::Throughput, PATH_OPEN_SCORE_BYTES)
         .into_iter()
-        .find(|target| target.key == alternate)
+        .find(|target| target.observation.key == alternate)
         .expect("Validation sender target");
-    assert!(!alternate_target.is_active);
-    assert!(!alternate_target.has_service_feed_evidence);
-    assert!(!alternate_target.has_bulk_rate_evidence);
+    assert!(!alternate_target.observation.is_service);
+    assert!(!alternate_target.observation.has_service_feed_evidence);
+    assert!(!alternate_target.observation.has_bulk_rate_evidence);
 }

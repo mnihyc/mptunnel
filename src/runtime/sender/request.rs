@@ -728,6 +728,21 @@ impl RequestSenderService {
     ) -> Result<RelayPathInstance, RuntimeError> {
         let mut last_error = None;
         while !remotes.paths.is_empty() {
+            if let Some(instance) = remotes
+                .paths
+                .iter()
+                .find(|path| path.stream.output_is_terminally_closed())
+                .map(|path| path.instance())
+            {
+                // Capacity and closure are different scheduling facts. Retire
+                // a dead carrier before fallback can hide its owner debt.
+                last_error = Some(RuntimeError::ReliablePathSessionClosed);
+                self.multipath.record_emit_failure(instance);
+                self.fail_client_path_instance(context, remotes, instance)
+                    .await;
+                self.multipath.normalize_cursor(remotes.paths.len());
+                continue;
+            }
             let stream_lane = remotes
                 .paths
                 .last()

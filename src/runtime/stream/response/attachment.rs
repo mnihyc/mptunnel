@@ -22,9 +22,9 @@ use crate::runtime::path::proof::enqueue_path_proof_frame;
 use crate::scheduler::{FlowLane, PathSnapshot};
 use std::collections::HashMap;
 use std::sync::atomic::Ordering;
-const RESPONSE_OWNER_TCP_SEEN: u8 = 1 << 0;
+pub(super) const RESPONSE_OWNER_TCP_SEEN: u8 = 1 << 0;
 const RESPONSE_OWNER_UDP_SEEN: u8 = 1 << 1;
-const RESPONSE_OWNER_MIXED_SEEN: u8 = RESPONSE_OWNER_TCP_SEEN | RESPONSE_OWNER_UDP_SEEN;
+pub(super) const RESPONSE_OWNER_MIXED_SEEN: u8 = RESPONSE_OWNER_TCP_SEEN | RESPONSE_OWNER_UDP_SEEN;
 
 pub(super) fn response_owner_underlay_seen_bit(underlay: UnderlayProtocol) -> u8 {
     match underlay {
@@ -802,8 +802,9 @@ impl ResponseStreamBinding {
             .expect("server reliable stream binding lock");
         let target_is_live = outputs.entries.iter().any(|entry| {
             entry.key == target.key
+                && entry.path_instance_id == target.path_instance_id
                 && entry.incarnation == target.incarnation
-                && entry.commands.same_channel(&target.commands)
+                && entry.role == target.attachment_role
                 && !entry.commands.is_closed()
         });
         if !target_is_live {

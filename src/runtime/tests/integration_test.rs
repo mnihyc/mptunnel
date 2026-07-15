@@ -1,5 +1,6 @@
 use super::*;
-use crate::config::DEFAULT_OUTBOUND_CONNECT_TIMEOUT;
+use crate::config::{DEFAULT_OUTBOUND_CONNECT_TIMEOUT, ResourceLimits};
+use crate::outbound::{DnsConfig, OutboundConfig};
 
 const FULL_STACK_RESPONSE_TIMEOUT: Duration = Duration::from_secs(15);
 

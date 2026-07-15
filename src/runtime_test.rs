@@ -1,8 +1,24 @@
 use super::*;
-use crate::config::{DEFAULT_OUTBOUND_CONNECT_TIMEOUT, SharedSecret};
+use crate::config::{DEFAULT_OUTBOUND_CONNECT_TIMEOUT, ResourceLimits, SharedSecret};
 use crate::ingress::ProxyAuthConfig;
+use crate::outbound::{DnsConfig, OutboundConfig};
 use crate::protocol::frame::{reliable_path_frame_pacing_bytes, reliable_stream_frame_extent};
 use crate::runtime::node::server::{ServerIdentityRuntime, new_identity_runtime};
+use crate::runtime::path::commands::{
+    reliable_path_command_queue_for_payload, reliable_path_priority_headroom_frames,
+    reliable_path_writer_frame_queue_for_payload,
+    reliable_path_writer_should_coalesce_partial_bulk_run,
+};
+use crate::runtime::path::quic::server::{bind_server_udp_endpoint, run_server_udp_listener};
+use crate::runtime::path::{
+    ServerCarrierPathIdentity, ServerCarrierPathRegistration, ServerStreamOpenRequest,
+    ServerStreamPathAttachment,
+};
+use crate::runtime::relay::lifecycle::{
+    reliable_relay_receive_hole_repair_active, reliable_relay_receive_hole_repair_deadline,
+    reliable_relay_response_stall_watch_bytes, reliable_relay_stall_progress_anchor,
+    reliable_relay_stall_watch_active,
+};
 use crate::runtime::stream::response::{ResponseStreamAttachOutcome, ResponseStreamBinding};
 use crate::transport::Endpoint;
 use crate::transport::tcp::bind_listener;
@@ -12,6 +28,17 @@ fn security() -> SecurityConfig {
     SecurityConfig::encrypted(
         SharedSecret::new(b"0123456789abcdef0123456789abcdef".to_vec()).expect("secret"),
     )
+}
+
+fn server_carrier_identity(
+    registration: &ServerCarrierPathRegistration,
+) -> ServerCarrierPathIdentity {
+    ServerCarrierPathIdentity {
+        session_id: registration.session_id(),
+        underlay: registration.underlay(),
+        path_id: registration.path_id(),
+        path_instance_id: registration.path_instance_id(),
+    }
 }
 
 fn udp_candidate_indices(
@@ -62,6 +89,7 @@ fn udp_stream_path_indices(
             .lock()
             .expect("client path health lock")
             .udp,
+        Instant::now(),
     );
     ordered_reliable_path_indices(&context.udp_paths, &observations, lane, payload_bytes)
 }
@@ -1688,22 +1716,20 @@ fn server_registry_replaced_output_does_not_reuse_cached_bulk_metrics() {
         registry.register_carrier_path(session_id, UnderlayProtocol::Tcp, path_id);
     let (old_commands, old_receivers) = reliable_path_command_channels(8);
     let accepted = match registry
-        .open_or_attach(
-            ServerReliableStreamOpenRequest {
-                session_id,
-                stream_id,
-                target: &target,
-                lane: FlowLane::Throughput,
-                attachment: ServerReliablePathAttachment {
-                    path_registration: old_path_registration.clone(),
-                    commands: old_commands,
-                    max_frame_payload_bytes: reliable_relay_buffer_len(MuxLimits::default()),
-                    role: StreamOpenRole::Active,
-                    initial_metrics: None,
-                },
+        .open_or_attach(ServerStreamOpenRequest {
+            session_id,
+            stream_id,
+            target: target.clone(),
+            lane: FlowLane::Throughput,
+            attachment: ServerStreamPathAttachment {
+                path_registration: old_path_registration.clone(),
+                commands: old_commands,
+                max_frame_payload_bytes: reliable_relay_buffer_len(MuxLimits::default()),
+                role: StreamOpenRole::Active,
+                initial_metrics: None,
             },
-            MuxLimits::default(),
-        )
+            mux_limits: MuxLimits::default(),
+        })
         .expect("open response stream")
     {
         ServerReliableStreamOpen::New(accepted) => accepted,
@@ -1715,14 +1741,14 @@ fn server_registry_replaced_output_does_not_reuse_cached_bulk_metrics() {
     };
     let binding = binding.clone();
     registry.record_local_path_metrics(
-        &old_path_registration,
+        server_carrier_identity(&old_path_registration),
         server_test_bulk_path_metrics(path_id, 200_000_000),
     );
     assert!(
         binding
             .sender_path_targets(FlowLane::Throughput, BBR_MAX_SEND_QUANTUM_BYTES)
             .first()
-            .is_some_and(|entry| entry.has_bulk_rate_evidence)
+            .is_some_and(|entry| entry.observation.has_bulk_rate_evidence)
     );
     drop(old_receivers);
 
@@ -1731,34 +1757,32 @@ fn server_registry_replaced_output_does_not_reuse_cached_bulk_metrics() {
     let (new_commands, _new_receivers) = reliable_path_command_channels(8);
     assert!(matches!(
         registry
-            .open_or_attach(
-                ServerReliableStreamOpenRequest {
-                    session_id,
-                    stream_id,
-                    target: &target,
-                    lane: FlowLane::Throughput,
-                    attachment: ServerReliablePathAttachment {
-                        path_registration: new_path_registration.clone(),
-                        commands: new_commands,
-                        max_frame_payload_bytes: reliable_relay_buffer_len(MuxLimits::default()),
-                        role: StreamOpenRole::Active,
-                        initial_metrics: None,
-                    },
+            .open_or_attach(ServerStreamOpenRequest {
+                session_id,
+                stream_id,
+                target: target.clone(),
+                lane: FlowLane::Throughput,
+                attachment: ServerStreamPathAttachment {
+                    path_registration: new_path_registration.clone(),
+                    commands: new_commands,
+                    max_frame_payload_bytes: reliable_relay_buffer_len(MuxLimits::default()),
+                    role: StreamOpenRole::Active,
+                    initial_metrics: None,
                 },
-                MuxLimits::default(),
-            )
+                mux_limits: MuxLimits::default(),
+            },)
             .expect("replace closed response output"),
         ServerReliableStreamOpen::Existing
     ));
     registry.record_local_path_metrics(
-        &old_path_registration,
+        server_carrier_identity(&old_path_registration),
         server_test_bulk_path_metrics(path_id, 300_000_000),
     );
 
     let targets = binding.sender_path_targets(FlowLane::Throughput, BBR_MAX_SEND_QUANTUM_BYTES);
     assert_eq!(targets.len(), 1);
     assert!(
-        !targets[0].has_bulk_rate_evidence,
+        !targets[0].observation.has_bulk_rate_evidence,
         "cached metrics from the closed carrier must not prove its replacement"
     );
 }
@@ -1774,7 +1798,7 @@ fn carrier_metrics_retire_after_last_publication_lease() {
     let sampler_registration = registration.clone();
 
     registry.record_local_path_metrics(
-        &registration,
+        server_carrier_identity(&registration),
         PathMetrics {
             underlay: UnderlayProtocol::Udp,
             ..server_test_bulk_path_metrics(path_id, 200_000_000)
@@ -1786,7 +1810,7 @@ fn carrier_metrics_retire_after_last_publication_lease() {
     assert_eq!(registry.management_snapshot().path_metrics.len(), 1);
 
     registry.record_local_path_metrics(
-        &sampler_registration,
+        server_carrier_identity(&sampler_registration),
         PathMetrics {
             underlay: UnderlayProtocol::Udp,
             ..server_test_bulk_path_metrics(path_id, 300_000_000)
@@ -2963,22 +2987,20 @@ fn switchable_stream_demand_updates_from_local_sender_metrics() {
         registry.register_carrier_path(SessionId(1), UnderlayProtocol::Tcp, PathId(0));
     let (commands, _rx) = reliable_path_command_channels(4);
     let mut accepted = match registry
-        .open_or_attach(
-            ServerReliableStreamOpenRequest {
-                session_id: SessionId(1),
-                stream_id: StreamId(7),
-                target: &target,
-                lane: FlowLane::Latency,
-                attachment: ServerReliablePathAttachment {
-                    path_registration: path_registration.clone(),
-                    commands,
-                    max_frame_payload_bytes: reliable_relay_buffer_len(MuxLimits::default()),
-                    role: StreamOpenRole::Active,
-                    initial_metrics: None,
-                },
+        .open_or_attach(ServerStreamOpenRequest {
+            session_id: SessionId(1),
+            stream_id: StreamId(7),
+            target: target.clone(),
+            lane: FlowLane::Latency,
+            attachment: ServerStreamPathAttachment {
+                path_registration: path_registration.clone(),
+                commands,
+                max_frame_payload_bytes: reliable_relay_buffer_len(MuxLimits::default()),
+                role: StreamOpenRole::Active,
+                initial_metrics: None,
             },
-            MuxLimits::default(),
-        )
+            mux_limits: MuxLimits::default(),
+        })
         .expect("open stream")
     {
         ServerReliableStreamOpen::New(accepted) => accepted,
@@ -3013,22 +3035,20 @@ fn server_registry_ignores_active_duplicate_same_path_input_without_output_repla
         registry.register_carrier_path(session_id, UnderlayProtocol::Udp, PathId(0));
     let (first_commands, _first_rx) = reliable_path_command_channels(4);
     let opened = registry
-        .open_or_attach(
-            ServerReliableStreamOpenRequest {
-                session_id,
-                stream_id,
-                target: &target,
-                lane: FlowLane::Throughput,
-                attachment: ServerReliablePathAttachment {
-                    path_registration: first_path_registration.clone(),
-                    commands: first_commands,
-                    max_frame_payload_bytes: reliable_relay_buffer_len(MuxLimits::default()),
-                    role: StreamOpenRole::Active,
-                    initial_metrics: None,
-                },
+        .open_or_attach(ServerStreamOpenRequest {
+            session_id,
+            stream_id,
+            target: target.clone(),
+            lane: FlowLane::Throughput,
+            attachment: ServerStreamPathAttachment {
+                path_registration: first_path_registration.clone(),
+                commands: first_commands,
+                max_frame_payload_bytes: reliable_relay_buffer_len(MuxLimits::default()),
+                role: StreamOpenRole::Active,
+                initial_metrics: None,
             },
-            MuxLimits::default(),
-        )
+            mux_limits: MuxLimits::default(),
+        })
         .expect("open stream");
     let _accepted = match opened {
         ServerReliableStreamOpen::New(accepted) => accepted,
@@ -3039,22 +3059,20 @@ fn server_registry_ignores_active_duplicate_same_path_input_without_output_repla
     let duplicate_path_registration =
         registry.register_carrier_path(session_id, UnderlayProtocol::Udp, PathId(0));
     let duplicate = registry
-        .open_or_attach(
-            ServerReliableStreamOpenRequest {
-                session_id,
-                stream_id,
-                target: &target,
-                lane: FlowLane::Throughput,
-                attachment: ServerReliablePathAttachment {
-                    path_registration: duplicate_path_registration.clone(),
-                    commands: duplicate_commands,
-                    max_frame_payload_bytes: reliable_relay_buffer_len(MuxLimits::default()),
-                    role: StreamOpenRole::Active,
-                    initial_metrics: None,
-                },
+        .open_or_attach(ServerStreamOpenRequest {
+            session_id,
+            stream_id,
+            target: target.clone(),
+            lane: FlowLane::Throughput,
+            attachment: ServerStreamPathAttachment {
+                path_registration: duplicate_path_registration.clone(),
+                commands: duplicate_commands,
+                max_frame_payload_bytes: reliable_relay_buffer_len(MuxLimits::default()),
+                role: StreamOpenRole::Active,
+                initial_metrics: None,
             },
-            MuxLimits::default(),
-        )
+            mux_limits: MuxLimits::default(),
+        })
         .expect("duplicate live attach should be handled");
 
     assert!(matches!(
@@ -3082,22 +3100,20 @@ fn server_response_output_inherits_open_path_startup_metrics() {
         "configured startup rate hints are advisory priors, not app-limited samples"
     );
     let accepted = match registry
-        .open_or_attach(
-            ServerReliableStreamOpenRequest {
-                session_id: SessionId(1),
-                stream_id: StreamId(8),
-                target: &target,
-                lane: FlowLane::Throughput,
-                attachment: ServerReliablePathAttachment {
-                    path_registration: path_registration.clone(),
-                    commands,
-                    max_frame_payload_bytes: reliable_relay_buffer_len(MuxLimits::default()),
-                    role: StreamOpenRole::Active,
-                    initial_metrics: Some(initial_metrics),
-                },
+        .open_or_attach(ServerStreamOpenRequest {
+            session_id: SessionId(1),
+            stream_id: StreamId(8),
+            target: target.clone(),
+            lane: FlowLane::Throughput,
+            attachment: ServerStreamPathAttachment {
+                path_registration: path_registration.clone(),
+                commands,
+                max_frame_payload_bytes: reliable_relay_buffer_len(MuxLimits::default()),
+                role: StreamOpenRole::Active,
+                initial_metrics: Some(initial_metrics),
             },
-            MuxLimits::default(),
-        )
+            mux_limits: MuxLimits::default(),
+        })
         .expect("open stream")
     {
         ServerReliableStreamOpen::New(accepted) => accepted,
@@ -3169,22 +3185,20 @@ fn server_reliable_registry_rejects_attach_only_unknown_stream() {
         registry.register_carrier_path(SessionId(1), UnderlayProtocol::Tcp, PathId(1));
     let (commands, _rx) = reliable_path_command_channels(4);
     let opened = registry
-        .open_or_attach(
-            ServerReliableStreamOpenRequest {
-                session_id: SessionId(1),
-                stream_id: StreamId(99),
-                target: &target,
-                lane: FlowLane::Throughput,
-                attachment: ServerReliablePathAttachment {
-                    path_registration: path_registration.clone(),
-                    commands,
-                    max_frame_payload_bytes: reliable_relay_buffer_len(MuxLimits::default()),
-                    role: StreamOpenRole::Validation,
-                    initial_metrics: None,
-                },
+        .open_or_attach(ServerStreamOpenRequest {
+            session_id: SessionId(1),
+            stream_id: StreamId(99),
+            target: target.clone(),
+            lane: FlowLane::Throughput,
+            attachment: ServerStreamPathAttachment {
+                path_registration: path_registration.clone(),
+                commands,
+                max_frame_payload_bytes: reliable_relay_buffer_len(MuxLimits::default()),
+                role: StreamOpenRole::Validation,
+                initial_metrics: None,
             },
-            MuxLimits::default(),
-        )
+            mux_limits: MuxLimits::default(),
+        })
         .expect("attach-only open should be handled");
     assert!(matches!(opened, ServerReliableStreamOpen::Rejected));
     assert_eq!(registry.management_snapshot().active_streams, 0);
@@ -3202,22 +3216,20 @@ fn server_reliable_registry_rejects_active_reopen_for_closed_stream() {
     let first_path_registration =
         registry.register_carrier_path(session_id, UnderlayProtocol::Tcp, PathId(0));
     let opened = registry
-        .open_or_attach(
-            ServerReliableStreamOpenRequest {
-                session_id,
-                stream_id,
-                target: &target,
-                lane: FlowLane::Throughput,
-                attachment: ServerReliablePathAttachment {
-                    path_registration: first_path_registration.clone(),
-                    commands,
-                    max_frame_payload_bytes: reliable_relay_buffer_len(MuxLimits::default()),
-                    role: StreamOpenRole::Active,
-                    initial_metrics: None,
-                },
+        .open_or_attach(ServerStreamOpenRequest {
+            session_id,
+            stream_id,
+            target: target.clone(),
+            lane: FlowLane::Throughput,
+            attachment: ServerStreamPathAttachment {
+                path_registration: first_path_registration.clone(),
+                commands,
+                max_frame_payload_bytes: reliable_relay_buffer_len(MuxLimits::default()),
+                role: StreamOpenRole::Active,
+                initial_metrics: None,
             },
-            MuxLimits::default(),
-        )
+            mux_limits: MuxLimits::default(),
+        })
         .expect("active open should be handled");
     let _accepted = match opened {
         ServerReliableStreamOpen::New(accepted) => accepted,
@@ -3229,22 +3241,20 @@ fn server_reliable_registry_rejects_active_reopen_for_closed_stream() {
     let replacement_path_registration =
         registry.register_carrier_path(session_id, UnderlayProtocol::Tcp, PathId(1));
     let reopened = registry
-        .open_or_attach(
-            ServerReliableStreamOpenRequest {
-                session_id,
-                stream_id,
-                target: &target,
-                lane: FlowLane::Throughput,
-                attachment: ServerReliablePathAttachment {
-                    path_registration: replacement_path_registration.clone(),
-                    commands,
-                    max_frame_payload_bytes: reliable_relay_buffer_len(MuxLimits::default()),
-                    role: StreamOpenRole::Active,
-                    initial_metrics: None,
-                },
+        .open_or_attach(ServerStreamOpenRequest {
+            session_id,
+            stream_id,
+            target: target.clone(),
+            lane: FlowLane::Throughput,
+            attachment: ServerStreamPathAttachment {
+                path_registration: replacement_path_registration.clone(),
+                commands,
+                max_frame_payload_bytes: reliable_relay_buffer_len(MuxLimits::default()),
+                role: StreamOpenRole::Active,
+                initial_metrics: None,
             },
-            MuxLimits::default(),
-        )
+            mux_limits: MuxLimits::default(),
+        })
         .expect("closed-stream reopen should be handled");
     assert!(matches!(reopened, ServerReliableStreamOpen::Rejected));
     assert_eq!(registry.management_snapshot().active_streams, 0);

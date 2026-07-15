@@ -1,7 +1,5 @@
 //! Sender work vocabulary shared by request and response directions.
 
-#[cfg(test)]
-use super::*;
 use crate::model::capacity::{PATH_OPEN_SCORE_BYTES, reliable_bulk_carrier_feed_quantum_bytes};
 use crate::model::path::{CarrierPathKey, RelayPathInstance, RelayPathKey};
 use crate::mux::MuxLimits;

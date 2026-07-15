@@ -17,6 +17,7 @@ use crate::runtime::path::commands::{
     reliable_path_command_channels, try_recv_reliable_path_command,
 };
 use crate::scheduler::FlowLane;
+use std::time::Duration;
 
 #[test]
 fn response_repair_enqueue_rejects_detached_output_incarnation() {
@@ -51,9 +52,10 @@ fn response_repair_enqueue_rejects_detached_output_incarnation() {
         ResponseStreamAttachOutcome::Attached
     );
 
+    let stale_dispatch = (&stale_target).into();
     assert!(matches!(
         binding.try_enqueue_repair_frame_for_target(
-            &stale_target,
+            &stale_dispatch,
             &stream_data_frame(64),
             FlowLane::Throughput,
         ),
@@ -440,9 +442,9 @@ fn old_flight_ack_does_not_debit_or_prove_replaced_output() {
     let replacement = binding
         .sender_path_targets(FlowLane::Throughput, BBR_MAX_SEND_QUANTUM_BYTES)
         .into_iter()
-        .find(|target| target.key == key)
+        .find(|target| target.observation.key == key)
         .expect("replacement target remains attached");
-    assert!(!replacement.is_active);
+    assert!(!replacement.observation.is_service);
     let replacement_frame = stream_data_frame_at(
         BBR_MAX_SEND_QUANTUM_BYTES as u64,
         BBR_MAX_SEND_QUANTUM_BYTES,
@@ -516,7 +518,7 @@ fn late_old_output_record_cannot_account_or_prove_replacement() {
         binding
             .sender_path_targets(FlowLane::Throughput, BBR_MAX_SEND_QUANTUM_BYTES)
             .iter()
-            .all(|target| !target.is_active),
+            .all(|target| !target.observation.is_service),
         "a same-key Validation replacement must not inherit stale Service ownership"
     );
     assert_eq!(output_entry_for_key(&binding, key).bytes_in_flight, 0);
@@ -600,7 +602,7 @@ fn late_record_from_pre_role_change_plan_is_not_path_proving() {
     let stale_target = binding
         .sender_path_targets(FlowLane::Throughput, BBR_MAX_SEND_QUANTUM_BYTES)
         .into_iter()
-        .find(|target| target.key == key)
+        .find(|target| target.observation.key == key)
         .expect("validation target is attached");
     assert_eq!(
         binding.attach(
@@ -618,8 +620,8 @@ fn late_record_from_pre_role_change_plan_is_not_path_proving() {
     binding.record_owner_flight_for_target(&stale_target, &frame);
     assert_eq!(
         output_entry_for_key(&binding, key).bytes_in_flight,
-        BBR_MAX_SEND_QUANTUM_BYTES as u64,
-        "a late record on the same live channel must follow the new incarnation as non-proving debt"
+        0,
+        "a role-stale observation must not mutate the replacement incarnation"
     );
     binding.release_normalized_acked_ranges(&[OffsetRange {
         start: 0,

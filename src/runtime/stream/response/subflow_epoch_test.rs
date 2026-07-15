@@ -119,7 +119,7 @@ fn response_semantic_reset_retires_partial_ack_clock_credit_without_refill() {
     let target = binding
         .sender_path_targets(FlowLane::Throughput, 1)
         .into_iter()
-        .find(|target| target.key == candidate)
+        .find(|target| target.observation.key == candidate)
         .expect("retired candidate target");
     assert_eq!(
         target.ack_clock_calibration_spent_bytes, target.ack_clock_calibration_max_limit_bytes,
@@ -183,7 +183,7 @@ fn response_semantic_reset_keeps_retired_active_identity_until_owner_flight_drai
     let target = binding
         .sender_path_targets(FlowLane::Throughput, 1)
         .into_iter()
-        .find(|target| target.key == candidate)
+        .find(|target| target.observation.key == candidate)
         .expect("retired candidate target");
     assert!(target.ack_clock_calibration_active);
 

@@ -1,7 +1,7 @@
 use super::super::snapshot::ServerResponsePathSchedulingSnapshot;
 use super::*;
 use crate::model::path::CarrierPathInstanceId;
-use crate::protocol::PathId;
+use crate::protocol::{PathId, UnderlayProtocol};
 use std::sync::Arc;
 use std::time::Duration;
 

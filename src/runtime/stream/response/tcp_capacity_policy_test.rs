@@ -290,12 +290,18 @@ fn endpoint_only_tcp_startup_uses_service_capacity_prior_without_exclusive_calib
     let target = binding
         .sender_path_targets(FlowLane::Throughput, BBR_MAX_SEND_QUANTUM_BYTES)
         .into_iter()
-        .find(|target| target.key == candidate)
+        .find(|target| target.observation.key == candidate)
         .expect("graduated endpoint-only candidate");
-    assert!(target.has_bulk_rate_evidence);
+    assert!(target.observation.has_bulk_rate_evidence);
     assert!(!target.ack_clock_calibration_eligible);
-    assert_eq!(target.snapshot.rate_scope, PathRateScope::PathCapacity);
-    assert_test_rate_close(Some(target.snapshot.delivery_rate_bps), 100_000_000.0);
+    assert_eq!(
+        target.observation.snapshot.rate_scope,
+        PathRateScope::PathCapacity
+    );
+    assert_test_rate_close(
+        Some(target.observation.snapshot.delivery_rate_bps),
+        100_000_000.0,
+    );
 }
 
 #[test]
@@ -372,7 +378,7 @@ fn tcp_response_graduation_skips_calibration_below_ack_sample_resource_floor() {
     let candidate_target = binding
         .sender_path_targets(FlowLane::Throughput, 1)
         .into_iter()
-        .find(|target| target.key == candidate)
+        .find(|target| target.observation.key == candidate)
         .expect("graduated candidate target");
     assert!(!candidate_target.ack_clock_calibration_eligible);
 }

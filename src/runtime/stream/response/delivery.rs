@@ -481,11 +481,29 @@ impl ResponseStreamBinding {
         target: &ResponseSenderPathTarget,
         frame: &Frame,
     ) {
+        let observation = target.observation;
+        let Some(commands) = self
+            .outputs
+            .lock()
+            .expect("server reliable stream binding lock")
+            .entries
+            .iter()
+            .find(|entry| {
+                entry.key == observation.key
+                    && entry.path_instance_id == observation.path_instance_id
+                    && entry.incarnation == observation.incarnation
+                    && entry.role == observation.attachment_role
+            })
+            .map(|entry| entry.commands.clone())
+        else {
+            // A stale observe result cannot mutate a replacement output.
+            return;
+        };
         self.record_product_flight(
-            target.key,
-            target.incarnation,
-            target.attachment_role,
-            &target.commands,
+            observation.key,
+            observation.incarnation,
+            observation.attachment_role,
+            &commands,
             frame,
             CarrierWorkKind::OwnerData,
         )

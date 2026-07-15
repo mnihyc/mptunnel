@@ -24,7 +24,7 @@ pub(in crate::runtime) struct ServerIdentityRuntime {
     pub(in crate::runtime) reliable_relay: ServerReliableRelayService,
 }
 
-pub(super) async fn run(
+pub(in crate::runtime) async fn run(
     path_specs: Vec<PathSpec>,
     outbound: OutboundConfig,
     outbound_dns: DnsConfig,

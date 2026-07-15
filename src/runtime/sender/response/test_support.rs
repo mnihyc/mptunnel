@@ -2,8 +2,10 @@
 
 use crate::model::path::CarrierPathKey;
 use crate::model::response::ResponsePathObservation;
-use crate::protocol::{PathId, SessionId, StreamOpenRole, UnderlayProtocol};
-use crate::runtime::path::commands::reliable_path_command_channels;
+#[cfg(feature = "lab-diagnostics")]
+use crate::protocol::SessionId;
+use crate::protocol::{PathId, StreamOpenRole, UnderlayProtocol};
+use crate::runtime::path::commands::{ReliablePathCommandSender, reliable_path_command_channels};
 use crate::runtime::stream::response::{
     ResponseSenderPathTarget, next_server_carrier_path_instance_id,
 };
@@ -50,7 +52,9 @@ pub(in crate::runtime::sender) fn response_target(
             has_service_feed_evidence: true,
             has_bulk_rate_evidence: true,
         },
-        commands,
+        command_queue: commands.queue_snapshot(),
+        tcp_capacity_probe_attempted: commands.tcp_capacity_probe_attempted(),
+        tcp_capacity_probe_active: commands.tcp_capacity_probe_active(),
         endpoint_only_service_prior_eligible: false,
         quic_capacity_proof: None,
         quic_capacity_calibration_attempts: 0,
@@ -61,4 +65,15 @@ pub(in crate::runtime::sender) fn response_target(
         ack_clock_calibration_max_limit_bytes: 0,
         ack_clock_calibration_active: false,
     }
+}
+
+/// Refresh the immutable queue evidence after a test mutates its carrier port.
+pub(in crate::runtime::sender) fn observe_response_target_commands(
+    target: &mut ResponseSenderPathTarget,
+    commands: &ReliablePathCommandSender,
+) {
+    target.command_queue = commands.queue_snapshot();
+    target.observation.command_pending_bytes = commands.pending_bytes();
+    target.tcp_capacity_probe_attempted = commands.tcp_capacity_probe_attempted();
+    target.tcp_capacity_probe_active = commands.tcp_capacity_probe_active();
 }

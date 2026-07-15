@@ -39,7 +39,7 @@ pub(in crate::runtime) use owner_commit::{
     ResponseOwnerEnqueueAdmission,
 };
 pub(in crate::runtime) use quic_admission::ResponseQuicCapacityCalibrationRequest;
-#[cfg(any(test, feature = "lab-diagnostics"))]
+#[cfg(feature = "lab-diagnostics")]
 pub(in crate::runtime) use quic_capacity::well_formed_quic_capacity_proof_candidate;
 pub(in crate::runtime) use quic_capacity::{
     quic_capacity_proof_pin_matches_marker, valid_quic_capacity_proof_candidate_at,

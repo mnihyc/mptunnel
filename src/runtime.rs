@@ -20,77 +20,60 @@ pub use packet_device::{PacketDevice, PacketDeviceProvider, SystemPacketDevicePr
 // Runtime integration suites intentionally share the composition namespace.
 // Production modules never inherit these test-only conveniences.
 #[cfg(test)]
-use crate::config::{
-    ManagementConfig, MppPerformanceConfig, RouteTarget, RouteTargetKind, SecurityConfig,
-};
+use crate::config::{ManagementConfig, MppPerformanceConfig, SecurityConfig};
 #[cfg(test)]
-use crate::ingress::http_connect::{self, HttpConnectError, HttpStatus};
+use crate::ingress::ProxyAuthConfig;
 #[cfg(test)]
-use crate::ingress::socks5::{self, Socks5Error, Socks5Reply};
+use crate::ingress::http_connect::{self, HttpStatus};
+#[cfg(test)]
+use crate::ingress::socks5::{self, Socks5Reply};
 #[cfg(test)]
 use crate::ingress::tun::TunL4Config;
-#[cfg(test)]
-use crate::ingress::{IngressConfig, ProxyAuthConfig};
 #[cfg(test)]
 use crate::mux::MuxLimits;
 #[cfg(test)]
 use crate::mux::stream::{ReliableRecvStream, ReliableSendStream};
-#[cfg(test)]
-use crate::outbound::{self, TargetProtocol};
 #[cfg(test)]
 use crate::protocol::auth::{PathJoinAuthCheck, SessionAuthCheck, SessionAuthenticator};
 #[cfg(test)]
 use crate::protocol::codec::CodecLimits;
 #[cfg(test)]
 use crate::protocol::{
-    CloseReason, DatagramFlowId, Frame, IngressKind, OffsetRange, PathCapabilities, PathId,
-    PathMetricDirection, PathMetrics, RateHint, ResetReason, SessionId, StreamFlags, StreamId,
-    StreamOpenRole, TargetAddr, UnderlayProtocol,
+    DatagramFlowId, Frame, IngressKind, OffsetRange, PathCapabilities, PathId, PathMetricDirection,
+    PathMetrics, RateHint, SessionId, StreamFlags, StreamId, StreamOpenRole, TargetAddr,
+    UnderlayProtocol,
 };
 #[cfg(test)]
 use crate::scheduler::{
-    self, FlowDemand, FlowLane, PathRateScope, PathSnapshot, PathState as SchedulerPathState,
-    SchedulerPolicy,
+    self, FlowDemand, FlowLane, PathSnapshot, PathState as SchedulerPathState, SchedulerPolicy,
 };
 #[cfg(test)]
 use crate::transport::PathSpec;
 #[cfg(test)]
 use crate::transport::encrypted::{EncryptedFramedStream, EncryptedFramedTransportError, PeerRole};
 #[cfg(test)]
-use crate::transport::quic as quic_transport;
-#[cfg(test)]
 use crate::transport::tcp::{self, TcpConnectOptions};
 #[cfg(test)]
-use bytes::{Bytes, BytesMut};
+use bytes::Bytes;
 #[cfg(test)]
-use futures::{SinkExt, StreamExt};
-#[cfg(test)]
-use netstack_smoltcp::{StackBuilder, TcpListener as TunTcpListener, UdpSocket as TunUdpSocket};
-#[cfg(test)]
-use std::collections::{HashMap, HashSet, VecDeque};
+use std::collections::HashSet;
 #[cfg(test)]
 use std::hash::Hash;
 #[cfg(test)]
 use std::net::SocketAddr;
 #[cfg(test)]
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 #[cfg(test)]
-use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant};
 #[cfg(test)]
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 #[cfg(test)]
 use tokio::net::{TcpListener, TcpStream, UdpSocket};
 #[cfg(test)]
-use tokio::sync::{Notify, mpsc, oneshot};
-#[cfg(test)]
-use tun_rs::async_framed::{BytesCodec, DeviceFramed};
+use tokio::sync::{mpsc, oneshot};
 
-#[cfg(all(test, feature = "lab-diagnostics"))]
-use crate::lab_diagnostics::*;
 #[cfg(test)]
 use crate::model::capacity::*;
-#[cfg(test)]
-use crate::model::multipath::*;
 #[cfg(test)]
 use crate::model::path::*;
 #[cfg(test)]
@@ -110,24 +93,15 @@ use node::probe_paths as probe_client_paths;
 #[cfg(test)]
 use node::server::run as run_server;
 #[cfg(test)]
-use path::quic::{client::*, io::*};
-#[cfg(test)]
 use path::tcp::client::*;
 #[cfg(test)]
 use path::tcp::client_connection::*;
 #[cfg(test)]
 use path::tcp::server::*;
 #[cfg(test)]
-use path::{
-    ClientPathContext, ClientPathHealthRecord, PathDeliveryStats, RelayPathLoadLease,
-    ReliableTcpRequestBulkFlowRegistration, ServerPathContext, commands::*, model::*,
-};
+use path::{ClientPathContext, ClientPathHealthRecord, PathDeliveryStats, commands::*, model::*};
 #[cfg(test)]
-use path::{
-    ClientPathHealth, ClientPathState, RequestCapacityProbeCampaignBudget,
-    RequestQuicCapacityProbeLease, RequestQuicCapacityProductHandoffState,
-    RequestTcpCapacityProbeLease, UdpDatagramPathObservation,
-};
+use path::{ClientPathHealth, ClientPathState};
 #[cfg(test)]
 use relay::*;
 #[cfg(test)]

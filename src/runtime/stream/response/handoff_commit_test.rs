@@ -97,12 +97,12 @@ fn exact_clear_frontier_handoff_pins_quic_proof_through_marker_expiry() {
     let targets = binding.sender_path_targets(FlowLane::Throughput, 64 * 1024);
     let service_target = targets
         .iter()
-        .find(|target| target.key == service)
+        .find(|target| target.observation.key == service)
         .expect("TCP Service target")
         .clone();
     let candidate_target = targets
         .iter()
-        .find(|target| target.key == candidate)
+        .find(|target| target.observation.key == candidate)
         .expect("measured QUIC target")
         .clone();
     let frame = stream_data_frame_at(frontier, 64 * 1024);
@@ -112,11 +112,11 @@ fn exact_clear_frontier_handoff_pins_quic_proof_through_marker_expiry() {
         expected_model_generation: model_generation,
         handoff_frontier: frontier,
         service,
-        service_path_instance_id: service_target.path_instance_id,
-        service_incarnation: service_target.incarnation,
+        service_path_instance_id: service_target.observation.path_instance_id,
+        service_incarnation: service_target.observation.incarnation,
         target: candidate,
-        target_path_instance_id: candidate_target.path_instance_id,
-        target_incarnation: candidate_target.incarnation,
+        target_path_instance_id: candidate_target.observation.path_instance_id,
+        target_incarnation: candidate_target.observation.incarnation,
         mode: ResponseServiceHandoffMode::Diversification,
         target_command_pending_limit_bytes: u64::MAX,
         capacity_proof: Some(proof),
@@ -148,11 +148,11 @@ fn exact_clear_frontier_handoff_pins_quic_proof_through_marker_expiry() {
             expected_lane_generation: request.expected_lane_generation,
             expected_model_generation: model_generation,
             service,
-            service_path_instance_id: service_target.path_instance_id,
-            service_incarnation: service_target.incarnation,
+            service_path_instance_id: service_target.observation.path_instance_id,
+            service_incarnation: service_target.observation.incarnation,
             target: candidate,
-            target_path_instance_id: candidate_target.path_instance_id,
-            target_incarnation: candidate_target.incarnation,
+            target_path_instance_id: candidate_target.observation.path_instance_id,
+            target_incarnation: candidate_target.observation.incarnation,
             mode: ResponseServiceHandoffMode::Diversification,
             capacity_proof: Some(proof),
             outstanding_owner_bytes: 64 * 1024,
@@ -184,9 +184,9 @@ fn exact_clear_frontier_handoff_pins_quic_proof_through_marker_expiry() {
     let candidate_target = binding
         .sender_path_targets(FlowLane::Throughput, 64 * 1024)
         .into_iter()
-        .find(|target| target.key == candidate)
+        .find(|target| target.observation.key == candidate)
         .expect("reserved QUIC target after marker expiry");
-    assert!(!candidate_target.has_bulk_rate_evidence);
+    assert!(!candidate_target.observation.has_bulk_rate_evidence);
     binding
         .try_enqueue_response_service_handoff(
             &candidate_target,
@@ -231,8 +231,9 @@ fn exact_clear_frontier_handoff_pins_quic_proof_through_marker_expiry() {
     assert_eq!(
         moved_targets
             .iter()
-            .find(|target| target.key == service)
+            .find(|target| target.observation.key == service)
             .expect("old TCP attachment")
+            .observation
             .snapshot
             .active_flows,
         0
@@ -240,8 +241,9 @@ fn exact_clear_frontier_handoff_pins_quic_proof_through_marker_expiry() {
     assert_eq!(
         moved_targets
             .iter()
-            .find(|target| target.key == candidate)
+            .find(|target| target.observation.key == candidate)
             .expect("new QUIC Service")
+            .observation
             .snapshot
             .active_flows,
         1

@@ -319,6 +319,10 @@ impl ReliablePathStreamHandle {
         self.output.capacity_notifies()
     }
 
+    pub(in crate::runtime) fn output_is_terminally_closed(&self) -> bool {
+        self.output.is_terminally_closed()
+    }
+
     pub(in crate::runtime) async fn close(&self) {
         self.output.close_stream(self.stream_id).await;
     }
@@ -552,6 +556,15 @@ impl FixedReliablePathOutput {
 }
 
 impl ReliablePathStreamOutput {
+    /// Fixed request outputs die with their carrier command port. Switchable
+    /// response outputs remain live while the binding can select another port.
+    fn is_terminally_closed(&self) -> bool {
+        match self {
+            Self::Fixed(fixed) => fixed.commands().is_closed(),
+            Self::Switchable(_) => false,
+        }
+    }
+
     fn retire_accepted_stream(&self, stream_id: StreamId) -> Result<(), RuntimeError> {
         match self {
             Self::Fixed(fixed) => fixed.commands().retire_accepted_stream(stream_id),

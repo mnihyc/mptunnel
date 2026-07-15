@@ -13,6 +13,8 @@ use super::session::{
     ServerPathLaneTracker, ServerPathLaneTrackerState, ServerQuicCapacityCalibrationPhase,
     ServerQuicCapacityCalibrationReservation,
 };
+#[cfg(test)]
+use crate::model::capacity::PATH_OPEN_SCORE_BYTES;
 use crate::model::capacity::{
     QuicCapacityProofCandidate, quic_capacity_receipt_rate_bps, valid_quic_capacity_proof_geometry,
 };

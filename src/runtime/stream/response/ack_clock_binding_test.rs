@@ -11,7 +11,7 @@ use crate::model::capacity::{
 use crate::protocol::frame::reliable_stream_frame_accounted_bytes;
 use crate::protocol::{OffsetRange, PathMetricDirection, PathMetrics, UnderlayProtocol};
 use crate::runtime::path::model::metric_epoch_now;
-use crate::scheduler::{FlowLane, PathRateScope};
+use crate::scheduler::FlowLane;
 use std::time::{Duration, Instant};
 
 #[test]

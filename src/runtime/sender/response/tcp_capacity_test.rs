@@ -11,7 +11,9 @@ use crate::model::multipath::{PathAdmissionDecision, PathRuntimeRole};
 use crate::model::response::ResponseBulkLead;
 use crate::protocol::{Frame, StreamFlags, StreamId};
 use crate::runtime::path::commands::reliable_path_command_channels;
-use crate::runtime::sender::response::test_support::response_target;
+use crate::runtime::sender::response::test_support::{
+    observe_response_target_commands, response_target,
+};
 use crate::scheduler::PathRateScope;
 use bytes::Bytes;
 
@@ -23,7 +25,7 @@ fn tcp_capacity_probe_does_not_wait_for_product_subflow_graduation() {
     service.observation.has_bulk_rate_evidence = false;
     cold.observation.has_bulk_rate_evidence = false;
     let (cold_commands, _cold_receivers) = reliable_path_command_channels(4);
-    cold.commands = cold_commands;
+    observe_response_target_commands(&mut cold, &cold_commands);
 
     assert!(
         select_response_tcp_capacity_probe_target(
@@ -198,7 +200,7 @@ fn fresh_tcp_calibration_is_dormant_without_active_response_demand() {
     let mut candidate =
         response_target(1, UnderlayProtocol::Tcp, 500.0, 0, 16 * 1024 * 1024, false);
     let (commands, _receivers) = reliable_path_command_channels(8);
-    candidate.commands = commands;
+    observe_response_target_commands(&mut candidate, &commands);
     candidate.ack_clock_calibration_eligible = true;
     candidate.ack_clock_calibration_credit_limit_bytes = 256 * 1024;
     candidate.ack_clock_calibration_max_limit_bytes = 64 * 1024 * 1024;
@@ -420,7 +422,7 @@ fn tcp_response_calibration_does_not_double_count_pending_owner_flight() {
     let mut candidate =
         response_target(1, UnderlayProtocol::Tcp, 500.0, 0, 16 * 1024 * 1024, false);
     let (commands, _receivers) = reliable_path_command_channels(8);
-    candidate.commands = commands;
+    observe_response_target_commands(&mut candidate, &commands);
     let initial_limit = reliable_ack_clock_calibration_limit_bytes(mux_limits);
     let committed = initial_limit - payload_bytes as u64;
     candidate.observation.snapshot.product_bytes_in_flight = committed;
@@ -430,8 +432,7 @@ fn tcp_response_calibration_does_not_double_count_pending_owner_flight() {
     candidate.ack_clock_calibration_credit_limit_bytes = initial_limit;
     candidate.ack_clock_calibration_max_limit_bytes =
         reliable_ack_clock_calibration_ceiling_bytes(mux_limits);
-    candidate
-        .commands
+    commands
         .try_enqueue_stream_ordered_frame(
             Frame::StreamData {
                 stream_id: StreamId(991),
@@ -442,7 +443,8 @@ fn tcp_response_calibration_does_not_double_count_pending_owner_flight() {
             FlowLane::Throughput,
         )
         .expect("mirror the product flight in the carrier queue");
-    assert_eq!(candidate.commands.pending_bytes(), committed);
+    observe_response_target_commands(&mut candidate, &commands);
+    assert_eq!(commands.pending_bytes(), committed);
     assert_eq!(
         response_target_assigned_product_bytes(&candidate),
         committed
@@ -529,7 +531,7 @@ fn blocked_active_ack_clock_candidate_does_not_select_another_calibration_owner(
             FlowLane::Throughput,
         )
         .expect("fill active calibration candidate queue");
-    active_candidate.commands = blocked_commands;
+    observe_response_target_commands(&mut active_candidate, &blocked_commands);
     active_candidate.ack_clock_calibration_eligible = true;
     active_candidate.ack_clock_calibration_active = true;
     active_candidate.ack_clock_calibration_credit_limit_bytes = initial_limit;
@@ -585,7 +587,7 @@ fn exhausted_active_calibration_cannot_bypass_saturated_service_via_generic_subf
             FlowLane::Throughput,
         )
         .expect("fill Service queue");
-    service.commands = blocked_service_commands;
+    observe_response_target_commands(&mut service, &blocked_service_commands);
 
     let initial_limit = reliable_ack_clock_calibration_limit_bytes(mux_limits);
     let mut candidate = response_target(1, UnderlayProtocol::Tcp, 1.0, 0, 16 * 1024 * 1024, false);
@@ -628,7 +630,7 @@ fn proven_active_calibration_cannot_reenter_generic_ownership_before_drain() {
             FlowLane::Throughput,
         )
         .expect("fill Service queue");
-    service.commands = blocked_service_commands;
+    observe_response_target_commands(&mut service, &blocked_service_commands);
 
     let initial_limit = reliable_ack_clock_calibration_limit_bytes(mux_limits);
     let mut candidate = response_target(1, UnderlayProtocol::Tcp, 1.0, 0, 16 * 1024 * 1024, false);
@@ -669,24 +671,24 @@ fn closed_active_calibration_drain_fence_blocks_next_startup_owner() {
     let payload_bytes = reliable_bulk_carrier_feed_quantum_bytes(mux_limits);
     let mut service = response_target(0, UnderlayProtocol::Tcp, 5.0, 0, 16 * 1024 * 1024, true);
     let (service_commands, _service_receivers) = reliable_path_command_channels(8);
-    service.commands = service_commands;
+    observe_response_target_commands(&mut service, &service_commands);
 
     let initial_limit = reliable_ack_clock_calibration_limit_bytes(mux_limits);
     let mut draining = response_target(1, UnderlayProtocol::Tcp, 500.0, 0, 16 * 1024 * 1024, false);
     let (closed_commands, closed_receivers) = reliable_path_command_channels(8);
     drop(closed_receivers);
-    draining.commands = closed_commands;
+    observe_response_target_commands(&mut draining, &closed_commands);
     draining.ack_clock_calibration_eligible = true;
     draining.ack_clock_calibration_active = true;
     draining.ack_clock_calibration_spent_bytes = initial_limit;
     draining.ack_clock_calibration_credit_limit_bytes = initial_limit;
     draining.ack_clock_calibration_max_limit_bytes = initial_limit.saturating_mul(2);
-    assert!(draining.commands.is_closed());
+    assert!(closed_commands.is_closed());
 
     let mut next_startup =
         response_target(2, UnderlayProtocol::Tcp, 1.0, 0, 16 * 1024 * 1024, false);
     let (startup_commands, _startup_receivers) = reliable_path_command_channels(8);
-    next_startup.commands = startup_commands;
+    observe_response_target_commands(&mut next_startup, &startup_commands);
     next_startup.observation.has_bulk_rate_evidence = false;
 
     let selected = select_response_sender_data_target_with_ordered_debt_and_epoch(

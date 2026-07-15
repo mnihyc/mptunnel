@@ -41,7 +41,7 @@ use crate::scheduler::{self, FlowLane, PathSnapshot, SchedulerPolicy, cyclic_cur
 use std::collections::{HashMap, HashSet};
 use std::time::{Duration, Instant};
 
-fn observe_request_relay_scheduling(
+pub(super) fn observe_request_relay_scheduling(
     context: &ClientPathContext,
     stream_id: StreamId,
     membership_generation: u64,
@@ -905,9 +905,9 @@ impl RequestMultipathController {
                     sent_bytes,
                 );
             }
-            RequestProductSendMutation::None => {
-                debug_assert!(false, "STREAM_DATA selection requires a product mutation");
-            }
+            // Repair data repeats an existing product offset, so enqueue must
+            // not install or advance unique-data ownership.
+            RequestProductSendMutation::None => {}
         }
         self.next_send_index = if path_count == 0 {
             0

@@ -2,8 +2,6 @@
 //!
 //! Each listener owns active connections so shutdown cannot leave stale streams.
 
-#[cfg(test)]
-use super::*;
 use crate::config::MppPerformanceConfig;
 use crate::ingress::ProxyAuthConfig;
 use crate::ingress::http_connect::{self, HttpConnectError, HttpStatus};

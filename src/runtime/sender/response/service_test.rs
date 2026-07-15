@@ -4,6 +4,7 @@ use crate::lab_diagnostics::{
     lab_assert_server_sender_service_balanced, lab_diag_test_guard,
     lab_sender_service_counts_for_test,
 };
+use crate::runtime::stream::response::ServerPathMetricsSource;
 use crate::runtime::stream::response::{ResponseStreamAttachOutcome, ResponseStreamBinding};
 
 #[test]

@@ -32,6 +32,12 @@ pub(in crate::runtime) use super::queue::{
     try_coalesce_reliable_path_writer_run, try_recv_reliable_path_command,
     try_recv_reliable_path_priority_command,
 };
+#[cfg(test)]
+pub(in crate::runtime) use super::queue::{
+    reliable_path_command_queue_for_payload, reliable_path_priority_headroom_frames,
+    reliable_path_writer_frame_queue_for_payload,
+    reliable_path_writer_should_coalesce_partial_bulk_run,
+};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(in crate::runtime) enum QuicCapacityProbeOwner {

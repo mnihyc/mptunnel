@@ -1,9 +1,9 @@
+#[cfg(feature = "lab-diagnostics")]
+use super::super::diagnostics as response_service_handoff_diagnostics;
 use super::super::dispatch::*;
 use super::super::planner::*;
 use super::super::tcp_capacity::response_ack_clock_calibration_blocks_generic_owner;
 use super::super::test_support::{observe_response_target_commands, response_target};
-#[cfg(feature = "lab-diagnostics")]
-use super::super::diagnostics as response_service_handoff_diagnostics;
 use super::*;
 use crate::model::ack_clock::*;
 use crate::model::capacity::*;

@@ -1,4 +1,8 @@
 use super::*;
+use crate::config::ResourceLimits;
+#[cfg(feature = "lab-diagnostics")]
+use crate::runtime::path::quic::metrics::QuicAckPollDiagnostics;
+use crate::runtime::path::quic::metrics::UdpPathMetrics;
 
 #[test]
 fn mixed_bulk_striping_includes_unmeasured_endpoint_only_udp() {

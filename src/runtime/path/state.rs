@@ -708,20 +708,6 @@ impl ClientPathContext {
         }
     }
 
-    #[cfg(test)]
-    pub(in crate::runtime) fn release_udp_stream_path_load(&self, index: usize, lane: FlowLane) {
-        if let Some(current) = self
-            .state
-            .health
-            .lock()
-            .expect("client path health lock")
-            .udp
-            .get_mut(index)
-        {
-            current.release_load(lane);
-        }
-    }
-
     pub(in crate::runtime) fn mark_relay_path_failure(
         &self,
         underlay: UnderlayProtocol,

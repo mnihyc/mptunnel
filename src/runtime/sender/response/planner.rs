@@ -38,8 +38,6 @@ use crate::model::multipath::{
     FlowSubflowSet, PathAdmission, PathAdmissionDecision, PathRuntimeRole,
 };
 use crate::model::path::{CarrierPathInstanceId, CarrierPathKey, carrier_path_key_order};
-#[cfg(test)]
-use crate::model::response::response_service_handoff_preserves_fair_share;
 use crate::model::response::{
     CarrierPathFlightDebt, ResponseBulkLead, ResponseCandidateTailDebt, ResponseOrderedTail,
     ResponsePathObservation, ResponseSameFamilyReservoir, ResponseServiceFamilyLoads,
@@ -251,6 +249,18 @@ pub(super) struct ResponseServiceHandoffCandidate {
 }
 
 impl ResponseServiceHandoffCandidate {
+    pub(super) fn new(
+        service: ResponseSenderPathTarget,
+        target: ResponseSenderPathTarget,
+        mode: ResponseServiceHandoffMode,
+    ) -> Self {
+        Self {
+            service,
+            target,
+            mode,
+        }
+    }
+
     pub(super) fn service(&self) -> &ResponseSenderPathTarget {
         &self.service
     }
@@ -366,11 +376,11 @@ pub(super) fn select_response_service_handoff_candidate(
         &target.observation,
         service_family_loads,
     )?;
-    Some(ResponseServiceHandoffCandidate {
-        service: service.clone(),
+    Some(ResponseServiceHandoffCandidate::new(
+        service.clone(),
         target,
         mode,
-    })
+    ))
 }
 
 #[allow(clippy::too_many_arguments)]

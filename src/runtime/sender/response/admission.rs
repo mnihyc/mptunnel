@@ -296,7 +296,7 @@ pub(super) fn response_target_unique_owner_admission(
         lower_owner,
         None,
         ordering_debt,
-        ResponseOrderedTail::new(None, 0).for_candidate(target.key),
+        ResponseOrderedTail::new(None, 0).for_candidate(target.observation.key),
         payload_bytes,
         mux_limits,
         None,

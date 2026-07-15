@@ -1,13 +1,9 @@
-use super::super::admission::*;
 use super::super::multipath::*;
 use super::super::planner::*;
-use super::super::test_support::response_target;
 use super::*;
-use crate::model::admission::*;
 use crate::model::capacity::*;
 use crate::model::multipath::*;
 use crate::model::path::*;
-use crate::model::response::*;
 use crate::mux::MuxLimits;
 use crate::protocol::*;
 use crate::runtime::path::commands::*;
@@ -17,7 +13,7 @@ use crate::runtime::stream::*;
 use crate::scheduler::*;
 use bytes::Bytes;
 use std::sync::Arc;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 use tokio::sync::mpsc;
 
 #[test]
@@ -307,7 +303,7 @@ async fn stale_service_plan_cannot_enqueue_owner_data_after_repair_role_change()
         .expect("Repair output remains attached");
     assert_eq!(target.observation.attachment_role, StreamOpenRole::Repair);
     assert_eq!(target.observation.snapshot.product_bytes_in_flight, 0);
-    assert_eq!(target.commands.pending_bytes(), 0);
+    assert_eq!(target.observation.command_pending_bytes, 0);
     assert_eq!(binding.ordered_data_owner(), None);
 }
 
@@ -482,14 +478,12 @@ async fn response_owner_data_keeps_fifo_order_across_lane_changes() {
 
     let bulk_first = ResponseDataDispatchPlan {
         primary: ResponseDataDispatchTarget::Switchable {
-            binding: binding.clone(),
             target: target.clone().into(),
             intent: ResponseDataDispatchIntent::Service,
         },
     };
     let latency_second = ResponseDataDispatchPlan {
         primary: ResponseDataDispatchTarget::Switchable {
-            binding,
             target: target.into(),
             intent: ResponseDataDispatchIntent::Service,
         },
@@ -803,7 +797,6 @@ async fn blocked_path_queue_rolls_back_unemitted_startup_credit() {
         &stream,
         ResponseDataDispatchPlan {
             primary: ResponseDataDispatchTarget::Switchable {
-                binding: binding.clone(),
                 target: target.clone().into(),
                 intent: ResponseDataDispatchIntent::SubflowAdmission(request),
             },
@@ -818,7 +811,6 @@ async fn blocked_path_queue_rolls_back_unemitted_startup_credit() {
         &stream,
         ResponseDataDispatchPlan {
             primary: ResponseDataDispatchTarget::Switchable {
-                binding,
                 target: target.into(),
                 intent: ResponseDataDispatchIntent::SubflowAdmission(request),
             },
@@ -933,7 +925,6 @@ async fn stale_passive_topology_plan_blocks_subflow_reservation_and_enqueue() {
         &stream,
         ResponseDataDispatchPlan {
             primary: ResponseDataDispatchTarget::Switchable {
-                binding: binding.clone(),
                 target: target.clone().into(),
                 intent: ResponseDataDispatchIntent::SubflowAdmission(stale_request),
             },
@@ -951,7 +942,6 @@ async fn stale_passive_topology_plan_blocks_subflow_reservation_and_enqueue() {
         &stream,
         ResponseDataDispatchPlan {
             primary: ResponseDataDispatchTarget::Switchable {
-                binding,
                 target: target.into(),
                 intent: ResponseDataDispatchIntent::SubflowAdmission(
                     ResponseSubflowAdmissionRequest {

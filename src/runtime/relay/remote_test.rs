@@ -146,6 +146,84 @@ async fn duplicate_remote_set_attach_releases_the_uncommitted_stream() {
 }
 
 #[tokio::test]
+async fn remote_set_generation_rejects_a_replaced_logical_path_instance() {
+    let stream_id = StreamId(941);
+    let (first, _first_receivers, _first_frames) =
+        opened_relay_stream_for_test(stream_id, UnderlayProtocol::Udp, 0);
+    let mut remotes = ReliableRelayRemoteSet::new(first, 4);
+    let first_generation = remotes.membership_generation();
+    let first_instance = remotes.active_path_instance().expect("first instance");
+    assert_eq!(
+        remotes.path_position_at_generation(first_generation, first_instance),
+        Some(0)
+    );
+
+    let _removed = remotes
+        .remove_path_instance(first_instance)
+        .expect("remove first instance");
+    let (replacement, _replacement_receivers, _replacement_frames) =
+        opened_relay_stream_for_test(stream_id, UnderlayProtocol::Udp, 0);
+    assert_eq!(
+        remotes.attach(replacement),
+        ReliableRelayAttachOutcome::Attached
+    );
+    let replacement_generation = remotes.membership_generation();
+    let replacement_instance = remotes
+        .active_path_instance()
+        .expect("replacement instance");
+
+    assert_eq!(replacement_instance.key, first_instance.key);
+    assert_ne!(replacement_instance, first_instance);
+    assert_eq!(
+        remotes.path_position_at_generation(first_generation, first_instance),
+        None,
+        "an old decision cannot resolve after membership changes"
+    );
+    assert_eq!(
+        remotes.path_position_at_generation(replacement_generation, first_instance),
+        None,
+        "logical path identity cannot stand in for attachment identity"
+    );
+    assert_eq!(
+        remotes.path_position_at_generation(replacement_generation, replacement_instance),
+        Some(0)
+    );
+}
+
+#[tokio::test]
+async fn remote_set_activation_advances_the_observed_topology_generation() {
+    let stream_id = StreamId(942);
+    let (service, _service_receivers, _service_frames) =
+        opened_relay_stream_for_test(stream_id, UnderlayProtocol::Tcp, 0);
+    let mut remotes = ReliableRelayRemoteSet::new(service, 4);
+    let (candidate, _candidate_receivers, _candidate_frames) =
+        opened_relay_stream_for_test(stream_id, UnderlayProtocol::Tcp, 1);
+    assert_eq!(
+        remotes.attach_for_validation(candidate),
+        ReliableRelayAttachOutcome::Attached
+    );
+    let candidate = remotes
+        .path_instances()
+        .into_iter()
+        .find(|instance| instance.key.index == 1)
+        .expect("candidate instance");
+    let observed_generation = remotes.membership_generation();
+
+    assert!(remotes.activate_path_instance_after_service_open(candidate));
+    let activated_generation = remotes.membership_generation();
+    assert_ne!(activated_generation, observed_generation);
+    assert_eq!(
+        remotes.path_position_at_generation(observed_generation, candidate),
+        None
+    );
+    assert!(
+        remotes
+            .path_position_at_generation(activated_generation, candidate)
+            .is_some()
+    );
+}
+
+#[tokio::test]
 async fn remote_set_close_depublishes_load_before_carrier_cleanup_waits() {
     let stream_id = StreamId(95);
     let path = "tcp://127.0.0.1:11095"
@@ -180,6 +258,8 @@ async fn remote_set_close_depublishes_load_before_carrier_cleanup_waits() {
         },
     };
     let mut remotes = ReliableRelayRemoteSet::new(opened, 1);
+    let observed_generation = remotes.membership_generation();
+    let observed_instance = remotes.active_path_instance().expect("active instance");
 
     let mut close = Box::pin(remotes.close_all(&context));
     assert!(matches!(
@@ -199,6 +279,12 @@ async fn remote_set_close_depublishes_load_before_carrier_cleanup_waits() {
 
     drop(receivers);
     close.await;
+    assert_ne!(remotes.membership_generation(), observed_generation);
+    assert_eq!(
+        remotes.path_position_at_generation(observed_generation, observed_instance),
+        None,
+        "closing the set invalidates an outstanding selection"
+    );
 }
 
 #[test]

@@ -695,7 +695,6 @@ fn request_startup_subflow_requires_proof_from_current_attachment() {
             None,
         ),
         Some(BulkRelayPathChoice::SelectedStartupSubflow {
-            position: 1,
             service,
             candidate,
             ..
@@ -772,7 +771,6 @@ fn request_calibration_ignores_path_wide_completion_without_directional_provenan
         matches!(
             request(None, false),
             BulkRelayPathChoice::SelectedAckClockCalibration {
-                position: 1,
                 candidate: selected,
                 ..
             } if selected == candidate
@@ -796,7 +794,6 @@ fn request_calibration_ignores_path_wide_completion_without_directional_provenan
         matches!(
             request(None, false),
             BulkRelayPathChoice::SelectedAckClockCalibration {
-                position: 1,
                 candidate: selected,
                 ..
             } if selected == candidate
@@ -814,7 +811,6 @@ fn request_calibration_ignores_path_wide_completion_without_directional_provenan
         matches!(
             request(None, false),
             BulkRelayPathChoice::SelectedAckClockCalibration {
-                position: 1,
                 candidate: selected,
                 ..
             } if selected == candidate
@@ -967,7 +963,6 @@ fn request_calibration_needs_contention_but_spent_owner_drains_after_two_to_one(
         matches!(
             choose(Some(BBR_MAX_SEND_QUANTUM_BYTES as u64), false),
             Some(BulkRelayPathChoice::SelectedAckClockCalibration {
-                position: 1,
                 candidate: selected,
                 ..
             }) if selected == candidate
@@ -1130,19 +1125,13 @@ fn request_calibration_transaction_drains_prior_optional_owner_before_exact_entr
 
     assert_eq!(
         choose(&prior_debt, payload_bytes as u64, None, None,),
-        BulkRelayPathChoice::SelectedAckClockCalibrationFence {
-            position: 0,
-            candidate,
-        },
+        BulkRelayPathChoice::SelectedAckClockCalibrationFence { service, candidate },
         "typed entry must drain a proven prior optional owner on Service"
     );
     let pending = Some(RequestAckClockOperation::Pending { service, candidate });
     assert_eq!(
         choose(&prior_debt, payload_bytes as u64, pending, None,),
-        BulkRelayPathChoice::SelectedAckClockCalibrationFence {
-            position: 0,
-            candidate,
-        },
+        BulkRelayPathChoice::SelectedAckClockCalibrationFence { service, candidate },
         "pending identity must suppress both prior-path refill and a new startup owner"
     );
     assert_ne!(candidate, ungraduated);
@@ -1151,7 +1140,6 @@ fn request_calibration_transaction_drains_prior_optional_owner_before_exact_entr
     assert!(matches!(
         choose(&drained, payload_bytes as u64, pending, None),
         BulkRelayPathChoice::SelectedAckClockCalibration {
-            position: 2,
             candidate: selected,
             ..
         } if selected == candidate
@@ -1193,10 +1181,7 @@ fn request_calibration_transaction_drains_prior_optional_owner_before_exact_entr
 
     assert_eq!(
         choose(&drained, payload_bytes as u64, owner, Some(target)),
-        BulkRelayPathChoice::SelectedAckClockCalibrationFence {
-            position: 0,
-            candidate,
-        },
+        BulkRelayPathChoice::SelectedAckClockCalibrationFence { service, candidate },
         "target exhaustion must not release generic optional ownership before exact proof"
     );
 
@@ -1349,7 +1334,7 @@ fn exhausted_calibration_waits_for_exact_owner_proof_before_next_candidate() {
             attempted_subflows: Some(&attempted),
         }),
         BulkRelayPathChoice::SelectedAckClockCalibrationFence {
-            position: 0,
+            service: paths[0].instance(),
             candidate: first,
         },
         "an exhausted unproven owner must drain through Service before any ordinary owner bypasses it"
@@ -1406,7 +1391,6 @@ fn ineligible_spent_instance_does_not_block_live_validation_calibration() {
                 Some(scheduling.state()),
             ),
             Some(BulkRelayPathChoice::SelectedAckClockCalibration {
-                position: 2,
                 candidate: selected,
                 ..
             }) if selected == candidate
@@ -1543,7 +1527,7 @@ fn request_startup_waits_for_service_anchor_and_authoritative_debt() {
             request_state: Some(scheduling.state()),
             attempted_subflows: Some(&exact_state),
         }),
-        BulkRelayPathChoice::Selected(0),
+        BulkRelayPathChoice::Selected(paths[0].instance()),
         "offset zero must establish Service before any Validation path can own data"
     );
 
@@ -1651,7 +1635,6 @@ fn request_startup_allows_aged_ordinary_service_flight_within_envelope() {
                 None,
             ),
             Some(BulkRelayPathChoice::SelectedStartupSubflow {
-                position: 1,
                 service,
                 candidate,
                 ..
@@ -1785,10 +1768,8 @@ fn request_startup_owner_needs_ack_clock_proof_after_flights_drain() {
         attempted_subflows: Some(&attempted),
     });
     assert!(
-        matches!(
-            pre_graduation,
-            BulkRelayPathChoice::Selected(0) | BulkRelayPathChoice::Blocked
-        ),
+        pre_graduation == BulkRelayPathChoice::Selected(paths[0].instance())
+            || pre_graduation == BulkRelayPathChoice::Blocked,
         "early rate evidence must not let the startup owner escape its cumulative epoch while attributed ranges remain"
     );
 
@@ -1817,7 +1798,7 @@ fn request_startup_owner_needs_ack_clock_proof_after_flights_drain() {
             request_state: Some(graduated_state.state()),
             attempted_subflows: Some(&attempted),
         }),
-        BulkRelayPathChoice::Selected(0),
+        BulkRelayPathChoice::Selected(paths[0].instance()),
         "TCP receipt graduation alone is not attributable capacity proof"
     );
 
@@ -1842,7 +1823,7 @@ fn request_startup_owner_needs_ack_clock_proof_after_flights_drain() {
             request_state: Some(proven_state.state()),
             attempted_subflows: Some(&attempted),
         }),
-        BulkRelayPathChoice::Selected(1),
+        BulkRelayPathChoice::Selected(paths[1].instance()),
         "drained startup plus attributable ACK-clock proof may enter ordinary admission"
     );
 }
@@ -1977,7 +1958,7 @@ fn exact_flow_local_model_can_own_without_session_global_membership() {
             request_state: Some(scheduling.state()),
             attempted_subflows: Some(&HashSet::from([candidate])),
         }),
-        BulkRelayPathChoice::Selected(1),
+        BulkRelayPathChoice::Selected(paths[1].instance()),
         "exact per-flow TCP proof must not be revoked by another flow's session-global model"
     );
 }
@@ -2054,7 +2035,7 @@ fn relay_lower_frontier_owner_can_lead_from_validation_attachment() {
             request_state: None,
             attempted_subflows: None,
         }),
-        BulkRelayPathChoice::Selected(0)
+        BulkRelayPathChoice::Selected(paths[0].instance())
     );
 }
 
@@ -2212,7 +2193,7 @@ fn ack_clock_proven_tcp_subflow_can_join_across_service_bdp_debt() {
             request_state: Some(scheduling.state()),
             attempted_subflows: None,
         }),
-        BulkRelayPathChoice::Selected(1),
+        BulkRelayPathChoice::Selected(paths[1].instance()),
         "a proven empty candidate must not inherit the Service prefix as its local pipe saturation"
     );
 }
@@ -2249,7 +2230,7 @@ fn relay_ordinary_bulk_uses_lower_eta_when_frontier_is_clear() {
             request_state: None,
             attempted_subflows: None,
         }),
-        BulkRelayPathChoice::Selected(1)
+        BulkRelayPathChoice::Selected(paths[1].instance())
     );
 }
 

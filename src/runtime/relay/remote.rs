@@ -118,6 +118,20 @@ impl ReliableRelayRemoteSet {
         self.membership_generation
     }
 
+    /// A selection is valid only for the exact attachment topology it observed.
+    pub(in crate::runtime) fn path_position_at_generation(
+        &self,
+        generation: u64,
+        instance: RelayPathInstance,
+    ) -> Option<usize> {
+        if self.membership_generation != generation {
+            return None;
+        }
+        self.paths
+            .iter()
+            .position(|path| path.instance() == instance)
+    }
+
     pub(in crate::runtime) fn primary_path_key(&self) -> Option<RelayPathKey> {
         self.paths.first().map(|path| path.key())
     }
@@ -379,6 +393,9 @@ impl ReliableRelayRemoteSet {
     }
 
     pub(in crate::runtime) async fn close_all(&mut self, context: &ClientPathContext) {
+        if !self.paths.is_empty() {
+            self.membership_generation = self.membership_generation.wrapping_add(1);
+        }
         let mut paths = std::mem::take(&mut self.paths);
         // The set stops owning every path as one atomic scheduling event even
         // when the first carrier queue makes detach asynchronous.
@@ -444,11 +461,13 @@ impl ReliableRelayRemoteSet {
         }
         if position + 1 == self.paths.len() {
             self.paths[position].placement = RelayPathPlacement::Active;
+            self.membership_generation = self.membership_generation.wrapping_add(1);
             return true;
         }
         let mut path = self.paths.remove(position);
         path.placement = RelayPathPlacement::Active;
         self.paths.push(path);
+        self.membership_generation = self.membership_generation.wrapping_add(1);
         true
     }
 

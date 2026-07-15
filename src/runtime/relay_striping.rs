@@ -41,26 +41,20 @@ use crate::scheduler::{
 use std::collections::HashSet;
 use std::time::Duration;
 
-pub(super) fn relay_frame_is_bulk_stream_data(frame: &Frame, lane: FlowLane) -> bool {
-    lane.is_bulk() && matches!(frame, Frame::StreamData { .. })
-}
-
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) enum BulkRelayPathChoice {
-    Selected(usize),
+    Selected(RelayPathInstance),
     SelectedStartupSubflow {
-        position: usize,
         service: RelayPathInstance,
         candidate: RelayPathInstance,
         load_expectation: Option<(u32, u32)>,
     },
     SelectedAckClockCalibration {
-        position: usize,
         candidate: RelayPathInstance,
         target_bytes: u64,
     },
     SelectedAckClockCalibrationFence {
-        position: usize,
+        service: RelayPathInstance,
         candidate: RelayPathInstance,
     },
     Blocked,
@@ -496,7 +490,7 @@ fn choose_request_startup_subflow_with_rates(
             .then_with(|| left.1.instance_id.cmp(&right.1.instance_id))
     });
 
-    for (position, path, _, snapshot) in candidates {
+    for (_, path, _, snapshot) in candidates {
         let input = SubflowAdmissionInput {
             key: path.instance(),
             bulk_rate_proven: false,
@@ -521,7 +515,6 @@ fn choose_request_startup_subflow_with_rates(
                 ),
             );
             return Some(BulkRelayPathChoice::SelectedStartupSubflow {
-                position,
                 service: service_instance,
                 candidate: path.instance(),
                 // Bulk scoring includes this flow's prospective use. The
@@ -877,9 +870,8 @@ fn choose_request_ack_clock_calibration_with_rates(
                 .then_with(|| left.5.total_cmp(&right.5))
                 .then_with(|| left.1.id.cmp(&right.1.id))
         })
-        .map(|(position, candidate, target_bytes, _, _, _)| {
+        .map(|(_, candidate, target_bytes, _, _, _)| {
             BulkRelayPathChoice::SelectedAckClockCalibration {
-                position,
                 candidate,
                 target_bytes,
             }
@@ -1458,7 +1450,7 @@ pub(super) fn choose_bulk_relay_path_for_extent_avoiding(
             // First owner bytes establish the lower-frontier owner.  The
             // no-fallback rule applies after that frontier exists; before then,
             // blocking the active primary just creates a sender-service stall.
-            return BulkRelayPathChoice::Selected(position);
+            return BulkRelayPathChoice::Selected(paths[position].instance());
         }
         return BulkRelayPathChoice::Blocked;
     }
@@ -2085,11 +2077,11 @@ pub(super) fn choose_bulk_relay_path_for_extent_avoiding(
         if let Some(candidate) = calibration_service_fence {
             debug_assert_eq!(Some(paths[position].key()), active_key);
             return BulkRelayPathChoice::SelectedAckClockCalibrationFence {
-                position,
+                service: paths[position].instance(),
                 candidate,
             };
         }
-        return BulkRelayPathChoice::Selected(position);
+        return BulkRelayPathChoice::Selected(paths[position].instance());
     }
     if !normal_bulk_send {
         return BulkRelayPathChoice::NotApplicable;

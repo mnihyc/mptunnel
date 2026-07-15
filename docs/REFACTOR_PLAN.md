@@ -71,6 +71,13 @@ pure decision path without reserving probes, drains, or ACK-clock state. Apply
 resolves the exact identity and atomically commits enqueue, exact flight, and
 Service ownership; a failed apply leaves none of them published.
 
+Request selection now stops attachment-vector ordinals at the policy boundary.
+The sender carries the chosen `RelayPathInstance` with the observed remote-set
+membership generation and resolves it again immediately before carrier enqueue.
+Attach, removal, activation/reordering, and set closure advance that generation,
+so a stale choice cannot silently address a replacement attachment. Internal
+cursor arithmetic remains unchanged until the immutable observation migration.
+
 ### Carrier paths
 
 Keep TCP and QUIC actor trees separate beneath the path aggregate. Shared path

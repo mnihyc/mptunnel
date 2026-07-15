@@ -100,11 +100,19 @@ fn sender_service_frame_kind(frame: &Frame) -> &'static str {
 
 #[derive(Debug)]
 struct RelayPathSendSelection {
-    position: usize,
+    target: RequestRelayPathIntent,
     data_role: Option<PathRuntimeRole>,
     request_startup_commit: Option<RequestStartupAdmission>,
     request_calibration_commit: Option<RequestAckClockCalibrationCommit>,
     request_load_expectation: Option<(RelayPathKey, u32, u32)>,
+}
+
+/// Reconnects may reuse a logical path key, so apply is fenced by incarnation
+/// identity and by the complete attachment topology observed during selection.
+#[derive(Debug, Clone, Copy)]
+struct RequestRelayPathIntent {
+    membership_generation: u64,
+    instance: RelayPathInstance,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -127,9 +135,9 @@ enum RequestAckClockCalibrationCommit {
 }
 
 impl RelayPathSendSelection {
-    fn new(position: usize, data_role: Option<PathRuntimeRole>) -> Self {
+    fn new(target: RequestRelayPathIntent, data_role: Option<PathRuntimeRole>) -> Self {
         Self {
-            position,
+            target,
             data_role,
             request_startup_commit: None,
             request_calibration_commit: None,
@@ -841,7 +849,7 @@ impl RequestSenderService {
                 remotes.retry_pending_path_proofs(context);
             }
             let selection_lane = request_lane.unwrap_or(stream_lane);
-            let selection = match self.choose_relay_path_position(
+            let selection = match self.choose_relay_path_send(
                 context,
                 remotes,
                 &frame,
@@ -856,13 +864,18 @@ impl RequestSenderService {
                 Err(err) => return Err(last_error.unwrap_or(err)),
             };
             let RelayPathSendSelection {
-                position,
+                target,
                 data_role,
                 request_startup_commit,
                 request_calibration_commit,
                 request_load_expectation,
             } = selection;
-            let instance = remotes.paths[position].instance();
+            let Some(position) =
+                remotes.path_position_at_generation(target.membership_generation, target.instance)
+            else {
+                return Err(RuntimeError::SenderServiceBlocked);
+            };
+            let instance = target.instance;
             let (lane, emit_mode) = if matches!(cause, RelaySendCause::StreamFin) {
                 (
                     remotes.paths[position].stream.lane,
@@ -1005,7 +1018,7 @@ impl RequestSenderService {
         Err(last_error.unwrap_or(RuntimeError::ReliablePathSessionClosed))
     }
 
-    fn choose_relay_path_position(
+    fn choose_relay_path_send(
         &mut self,
         context: &ClientPathContext,
         remotes: &ReliableRelayRemoteSet,
@@ -1017,6 +1030,7 @@ impl RequestSenderService {
         if remotes.paths.is_empty() {
             return Err(RuntimeError::ReliablePathSessionClosed);
         }
+        let membership_generation = remotes.membership_generation();
         self.retry_request_startup_receipt_proof(context, remotes);
         if !cause.is_repair()
             && let Some((offset, _, _)) = reliable_stream_frame_extent(frame)
@@ -1079,8 +1093,8 @@ impl RequestSenderService {
                 }),
                 attempted_subflows: Some(&self.request.startup.attempted_subflows),
             }) {
-                BulkRelayPathChoice::Selected(position) => {
-                    let key = remotes.paths[position].key();
+                BulkRelayPathChoice::Selected(instance) => {
+                    let key = instance.key;
                     let role = if self
                         .request
                         .ordered_service_key()
@@ -1090,10 +1104,15 @@ impl RequestSenderService {
                     } else {
                         PathRuntimeRole::Subflow
                     };
-                    return Ok(RelayPathSendSelection::new(position, Some(role)));
+                    return Ok(RelayPathSendSelection::new(
+                        RequestRelayPathIntent {
+                            membership_generation,
+                            instance,
+                        },
+                        Some(role),
+                    ));
                 }
                 BulkRelayPathChoice::SelectedStartupSubflow {
-                    position,
                     service,
                     candidate,
                     load_expectation,
@@ -1105,7 +1124,10 @@ impl RequestSenderService {
                         .plan_admission(context.mux_limits, service, candidate, payload_bytes)
                         .ok_or(RuntimeError::SenderServiceBlocked)?;
                     return Ok(RelayPathSendSelection {
-                        position,
+                        target: RequestRelayPathIntent {
+                            membership_generation,
+                            instance: candidate,
+                        },
                         data_role: Some(PathRuntimeRole::Subflow),
                         request_startup_commit: Some(admission),
                         request_calibration_commit: None,
@@ -1114,7 +1136,6 @@ impl RequestSenderService {
                     });
                 }
                 BulkRelayPathChoice::SelectedAckClockCalibration {
-                    position,
                     candidate,
                     target_bytes,
                 } => {
@@ -1138,7 +1159,10 @@ impl RequestSenderService {
                         (0, 0)
                     };
                     return Ok(RelayPathSendSelection {
-                        position,
+                        target: RequestRelayPathIntent {
+                            membership_generation,
+                            instance: candidate,
+                        },
                         data_role: Some(PathRuntimeRole::Subflow),
                         request_startup_commit: None,
                         request_calibration_commit: Some(
@@ -1154,11 +1178,7 @@ impl RequestSenderService {
                         request_load_expectation: None,
                     });
                 }
-                BulkRelayPathChoice::SelectedAckClockCalibrationFence {
-                    position,
-                    candidate,
-                } => {
-                    let service = remotes.paths[position].instance();
+                BulkRelayPathChoice::SelectedAckClockCalibrationFence { service, candidate } => {
                     debug_assert_eq!(Some(service), self.request.ordered_service);
                     let entry_offset = reliable_stream_frame_extent(frame)
                         .map(|(offset, _, _)| offset)
@@ -1175,7 +1195,10 @@ impl RequestSenderService {
                         (0, 0)
                     };
                     return Ok(RelayPathSendSelection {
-                        position,
+                        target: RequestRelayPathIntent {
+                            membership_generation,
+                            instance: service,
+                        },
                         data_role: Some(PathRuntimeRole::Service),
                         request_startup_commit: None,
                         request_calibration_commit: Some(
@@ -1208,7 +1231,13 @@ impl RequestSenderService {
         } else {
             None
         };
-        Ok(RelayPathSendSelection::new(position, data_role))
+        Ok(RelayPathSendSelection::new(
+            RequestRelayPathIntent {
+                membership_generation,
+                instance: remotes.paths[position].instance(),
+            },
+            data_role,
+        ))
     }
 
     fn reset_request_subflow_epoch(&mut self) {

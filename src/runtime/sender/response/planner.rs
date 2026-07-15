@@ -63,7 +63,6 @@ use crate::protocol::frame::reliable_stream_frame_accounted_bytes;
 use crate::protocol::{Frame, StreamOpenRole, UnderlayProtocol};
 use crate::runtime::RuntimeError;
 use crate::runtime::path::model::{default_path_rate_bps, path_within_adaptive_lead_hysteresis};
-use crate::runtime::relay_striping::relay_frame_is_bulk_stream_data;
 use crate::runtime::sender::{CarrierEmitMode, RelaySendCause};
 use crate::runtime::stream::response::{
     MIN_ACTIVE_RESPONSE_FLOWS_FOR_SAME_FAMILY_DISCOVERY,
@@ -83,6 +82,10 @@ use std::time::{Duration, Instant};
 #[cfg(test)]
 #[path = "planner_test.rs"]
 mod tests;
+
+fn response_frame_is_bulk_stream_data(frame: &Frame, lane: FlowLane) -> bool {
+    lane.is_bulk() && matches!(frame, Frame::StreamData { .. })
+}
 
 #[derive(Clone)]
 pub(super) enum ResponseDataDispatchTarget {
@@ -572,7 +575,7 @@ pub(super) fn choose_response_sender_target(
     }
     if !repair
         && emit_mode == CarrierEmitMode::StreamOrdered
-        && !relay_frame_is_bulk_stream_data(frame, lane)
+        && !response_frame_is_bulk_stream_data(frame, lane)
         && let Some(active) = targets.iter().find(|target| {
             target.observation.is_service && !avoid_keys.contains(&target.observation.key)
         })
@@ -619,7 +622,7 @@ pub(super) fn choose_response_sender_target(
         // normal fallback below so progress is not lost during backpressure.
         return Some(active.clone());
     }
-    if !relay_frame_is_bulk_stream_data(frame, lane) {
+    if !response_frame_is_bulk_stream_data(frame, lane) {
         if matches!(frame, Frame::StreamData { .. }) {
             return choose_response_service_or_proven_data_target(
                 targets,

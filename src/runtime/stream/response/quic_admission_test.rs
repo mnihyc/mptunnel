@@ -63,7 +63,7 @@ fn quic_capacity_calibration_uses_carrier_bytes_without_product_flight() {
     let target = binding
         .sender_path_targets(FlowLane::Throughput, 64 * 1024)
         .into_iter()
-        .find(|target| target.key == candidate)
+        .find(|target| target.observation.key == candidate)
         .expect("UDP Validation target");
     let train_bytes = mux_limits
         .max_payload_bytes
@@ -71,16 +71,17 @@ fn quic_capacity_calibration_uses_carrier_bytes_without_product_flight() {
     let sample_floor_bytes = train_bytes as u64;
     let accounting_slack_bytes = (PATH_OPEN_SCORE_BYTES as u64).min(sample_floor_bytes / 8);
     let required_proof_bytes = sample_floor_bytes - accounting_slack_bytes;
-    assert!(binding.try_start_quic_capacity_calibration(
-        &target,
-        ResponseQuicCapacityCalibrationRequest {
+    assert!(
+        binding.try_start_quic_capacity_calibration(ResponseQuicCapacityCalibrationRequest {
             expected_planner_generation: planner_generation,
             expected_lane_generation: scheduling.generation,
             expected_model_generation: model_generation,
             target: candidate,
-            target_path_instance_id: target.path_instance_id,
-            target_incarnation: target.incarnation,
-            target_pending_bytes: target.command_pending_bytes,
+            target_path_instance_id: target.observation.path_instance_id,
+            target_incarnation: target.observation.incarnation,
+            target_pending_bytes: target.observation.command_pending_bytes,
+            #[cfg(feature = "lab-diagnostics")]
+            attempt_ordinal: 1,
             train_bytes,
             sample_floor_bytes,
             accounting_slack_bytes,
@@ -88,8 +89,8 @@ fn quic_capacity_calibration_uses_carrier_bytes_without_product_flight() {
             carrier_window_bytes: 0,
             lease: Duration::from_secs(1),
             proof_validity: Duration::from_secs(3),
-        },
-    ));
+        },)
+    );
     let probe = match try_recv_reliable_path_command(&mut candidate_receivers)
         .expect("capacity probe command")
     {
@@ -201,7 +202,7 @@ fn quic_capacity_lease_deadline_is_created_after_admission_and_failure_propagate
     let target = binding
         .sender_path_targets(FlowLane::Throughput, 64 * 1024)
         .into_iter()
-        .find(|target| target.key == candidate)
+        .find(|target| target.observation.key == candidate)
         .expect("UDP Validation target");
     let pending_before_train = candidate_queue.pending_bytes();
     let train_bytes = mux_limits.max_payload_bytes / 2;
@@ -210,15 +211,16 @@ fn quic_capacity_lease_deadline_is_created_after_admission_and_failure_propagate
     let required_proof_bytes = sample_floor_bytes - accounting_slack_bytes;
     let mut deadline_observed_admitted_train = false;
     assert!(!binding.try_start_quic_capacity_calibration_with_lease(
-        &target,
         ResponseQuicCapacityCalibrationRequest {
             expected_planner_generation: planner_generation,
             expected_lane_generation: scheduling.generation,
             expected_model_generation: binding.response_model_generation(),
             target: candidate,
-            target_path_instance_id: target.path_instance_id,
-            target_incarnation: target.incarnation,
-            target_pending_bytes: target.command_pending_bytes,
+            target_path_instance_id: target.observation.path_instance_id,
+            target_incarnation: target.observation.incarnation,
+            target_pending_bytes: target.observation.command_pending_bytes,
+            #[cfg(feature = "lab-diagnostics")]
+            attempt_ordinal: 1,
             train_bytes,
             sample_floor_bytes,
             accounting_slack_bytes,
@@ -243,7 +245,11 @@ fn quic_capacity_lease_deadline_is_created_after_admission_and_failure_propagate
     assert_eq!(
         binding
             .lane_tracker
-            .response_path_scheduling_snapshot(session_id, candidate, target.path_instance_id,)
+            .response_path_scheduling_snapshot(
+                session_id,
+                candidate,
+                target.observation.path_instance_id,
+            )
             .quic_capacity_calibration_attempts,
         1
     );

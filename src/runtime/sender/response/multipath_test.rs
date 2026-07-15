@@ -1,14 +1,11 @@
-use super::super::admission::*;
 use super::super::dispatch::*;
 use super::super::planner::*;
 use super::super::tcp_capacity::response_ack_clock_calibration_blocks_generic_owner;
-use super::super::test_support::response_target;
-use super::*;
-use crate::config::MppPerformanceConfig;
+use super::super::test_support::{observe_response_target_commands, response_target};
 #[cfg(feature = "lab-diagnostics")]
-use crate::lab_diagnostics::*;
+use super::super::diagnostics as response_service_handoff_diagnostics;
+use super::*;
 use crate::model::ack_clock::*;
-use crate::model::admission::*;
 use crate::model::capacity::*;
 use crate::model::multipath::*;
 use crate::model::path::*;
@@ -34,6 +31,7 @@ struct ResponseServiceHandoffDrainFixture {
     service: CarrierPathKey,
     target: CarrierPathKey,
     other_service: CarrierPathKey,
+    target_commands: ReliablePathCommandSender,
     _service_receivers: ReliablePathCommandReceivers,
     target_receivers: ReliablePathCommandReceivers,
     _other_service_receivers: ReliablePathCommandReceivers,
@@ -91,7 +89,7 @@ fn response_service_handoff_drain_fixture_with_other_service(
         binding.attach(
             target.underlay,
             target.path_id,
-            target_commands,
+            target_commands.clone(),
             FlowLane::Throughput,
             StreamOpenRole::Validation,
             payload_bytes,
@@ -173,6 +171,7 @@ fn response_service_handoff_drain_fixture_with_other_service(
         service,
         target,
         other_service,
+        target_commands,
         _service_receivers: service_receivers,
         target_receivers,
         _other_service_receivers: other_service_receivers,
@@ -184,6 +183,7 @@ struct ResponseCalibrationDispatchFixture {
     stream: ReliablePathStream,
     service: CarrierPathKey,
     candidate: CarrierPathKey,
+    service_commands: ReliablePathCommandSender,
     candidate_commands: ReliablePathCommandSender,
     service_receivers: ReliablePathCommandReceivers,
     candidate_receivers: ReliablePathCommandReceivers,
@@ -210,7 +210,7 @@ fn response_calibration_dispatch_fixture(
         session_id,
         service.underlay,
         service.path_id,
-        service_commands,
+        service_commands.clone(),
         FlowLane::Throughput,
         mux_limits,
         tracker.clone(),
@@ -289,6 +289,7 @@ fn response_calibration_dispatch_fixture(
         stream,
         service,
         candidate,
+        service_commands,
         candidate_commands,
         service_receivers,
         candidate_receivers,
@@ -513,14 +514,8 @@ fn tcp_ack_clock_calibration_retirement_rejects_stale_pending_snapshots() {
         .release_pending_command_bytes(candidate_pending_bytes);
 
     let stale_service = response_calibration_retirement_request(&fixture);
-    let service = fixture
-        .binding
-        .sender_path_targets(FlowLane::Throughput, payload_bytes)
-        .into_iter()
-        .find(|target| target.observation.key == fixture.service)
-        .expect("Service target");
-    service
-        .commands
+    fixture
+        .service_commands
         .try_enqueue_stream_ordered_frame(
             Frame::StreamData {
                 stream_id: fixture.stream.stream_id,
@@ -807,6 +802,7 @@ fn measured_cross_family_path_handoff_allows_diversification_or_two_x_gain() {
         ResponseServiceFamilyLoads::new(2, 0),
         4096,
         None,
+        Instant::now(),
     )
     .expect("measured underloaded family should receive one whole flow");
     assert_eq!(selected.target().observation.key, udp.observation.key);
@@ -830,6 +826,7 @@ fn measured_cross_family_path_handoff_allows_diversification_or_two_x_gain() {
             ResponseServiceFamilyLoads::new(2, 0),
             4096,
             None,
+            Instant::now(),
         )
         .is_none(),
         "any unresolved product tail blocks carrier-family handoff"
@@ -848,6 +845,7 @@ fn measured_cross_family_path_handoff_allows_diversification_or_two_x_gain() {
         ResponseServiceFamilyLoads::new(1, 1),
         4096,
         None,
+        Instant::now(),
     )
     .expect("a balanced family may still move one flow for a two-fold projected gain");
     assert_eq!(balanced_gain.admission().role, PathRuntimeRole::Service);
@@ -862,16 +860,16 @@ fn busy_shared_target_carrier_is_pressure_not_binding_debt() {
     service.observation.snapshot.delivery_rate_bps = 1_000_000.0;
     let mut udp = response_target(1, UnderlayProtocol::Udp, 5.0, 0, 16 * 1024 * 1024, false);
     let (udp_commands, _udp_receivers) = reliable_path_command_channels(8);
-    udp.commands = udp_commands;
+    observe_response_target_commands(&mut udp, &udp_commands);
     udp.observation.snapshot.delivery_rate_bps = 100_000_000.0;
     udp.observation.snapshot.active_flows = 1;
-    udp.commands
+    udp_commands
         .try_enqueue_stream_ordered_frame(
             client_data_frame_for_test(StreamId(999), 0, 1),
             FlowLane::Throughput,
         )
         .expect("shared target carrier accepts unrelated queued work");
-    udp.observation.command_pending_bytes = udp.commands.pending_bytes();
+    observe_response_target_commands(&mut udp, &udp_commands);
     udp.observation.snapshot.queue_bytes = udp.observation.command_pending_bytes;
     udp.observation.snapshot.bytes_in_flight = 1;
     assert!(udp.observation.command_pending_bytes > 0);
@@ -889,6 +887,7 @@ fn busy_shared_target_carrier_is_pressure_not_binding_debt() {
         ResponseServiceFamilyLoads::new(1, 1),
         4096,
         None,
+        Instant::now(),
     )
     .expect("another binding's carrier pressure must not masquerade as this binding's debt");
     assert_eq!(selected.target().observation.key, udp.observation.key);
@@ -1175,11 +1174,11 @@ async fn handoff_commit_rejects_shared_queue_growth_beyond_ranked_credit() {
     .expect("clear frontier should produce a bounded handoff commit");
     let (target_commands, pending_limit) = match &plan.primary {
         ResponseDataDispatchTarget::Switchable {
-            target,
+            target: _,
             intent: ResponseDataDispatchIntent::ServiceHandoff(handoff),
             ..
         } => (
-            target.commands.clone(),
+            fixture.target_commands.clone(),
             handoff.selection.target_command_pending_limit_bytes,
         ),
         _ => panic!("expected switchable handoff plan"),
@@ -1233,6 +1232,7 @@ fn service_handoff_rejects_lower_projected_fair_share() {
             ResponseServiceFamilyLoads::new(2, 0),
             4096,
             None,
+            Instant::now(),
         )
         .is_none(),
         "low RTT cannot justify a sticky move to a much slower carrier"
@@ -1295,11 +1295,11 @@ fn generic_evidence_drain_clears_unpinned_expired_receipt_marker() {
     assert!(response_service_handoff_drain_matches_candidate(
         reservation.binding_instance_id,
         reservation,
-        &ResponseServiceHandoffCandidate {
+        &ResponseServiceHandoffCandidate::new(
             service,
-            target: effective,
-            mode: ResponseServiceHandoffMode::Diversification,
-        },
+            effective,
+            ResponseServiceHandoffMode::Diversification,
+        ),
     ));
 }
 

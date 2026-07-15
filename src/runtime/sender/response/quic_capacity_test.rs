@@ -68,9 +68,8 @@ fn sender_quic_geometry_is_accepted_by_the_binding_transaction() {
                 .saturating_add(geometry.fresh_strict_window_bytes),
         "the regression requires sender timing guard bytes"
     );
-    assert!(binding.try_start_quic_capacity_calibration(
-        &target,
-        ResponseQuicCapacityCalibrationRequest {
+    assert!(
+        binding.try_start_quic_capacity_calibration(ResponseQuicCapacityCalibrationRequest {
             expected_planner_generation: planner_generation,
             expected_lane_generation: scheduling.generation,
             expected_model_generation: model_generation,
@@ -78,6 +77,8 @@ fn sender_quic_geometry_is_accepted_by_the_binding_transaction() {
             target_path_instance_id: target.observation.path_instance_id,
             target_incarnation: target.observation.incarnation,
             target_pending_bytes: target.observation.command_pending_bytes,
+            #[cfg(feature = "lab-diagnostics")]
+            attempt_ordinal: 1,
             train_bytes: geometry.train_bytes,
             sample_floor_bytes: geometry.sample_floor_bytes,
             accounting_slack_bytes: geometry.accounting_slack_bytes,
@@ -85,8 +86,8 @@ fn sender_quic_geometry_is_accepted_by_the_binding_transaction() {
             carrier_window_bytes: geometry.carrier_window_bytes,
             proof_validity: response_quic_capacity_proof_validity(&target),
             lease: response_quic_capacity_calibration_lease(&target, geometry.train_bytes),
-        },
-    ));
+        },)
+    );
     assert!(matches!(
         try_recv_reliable_path_command(&mut candidate_receivers),
         Some(ReliablePathCommand::SendQuicCapacityProbe(_))

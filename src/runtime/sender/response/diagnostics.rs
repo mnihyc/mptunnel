@@ -3,8 +3,6 @@ use super::admission::{
     response_target_has_emission_credit,
 };
 use super::planner::response_service_handoff_target_view;
-#[cfg(test)]
-use super::*;
 use crate::lab_diagnostics::{lab_diagnostic, lab_diagnostic_event_enabled};
 use crate::model::admission::{BulkAdmissionRole, BulkExplorationCompletionProjection};
 use crate::model::multipath::PathAdmission;

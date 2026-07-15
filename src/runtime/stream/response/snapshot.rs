@@ -268,6 +268,7 @@ impl ResponseStreamBinding {
             .zip(response_scheduling)
             .map(|(entry, response_scheduling)| {
                 let command_pending_bytes = entry.commands.pending_bytes();
+                let command_queue = entry.commands.queue_snapshot();
                 let calibration_identity = (entry.key, entry.incarnation);
                 let calibration = outputs
                     .ack_clock_calibrations
@@ -330,7 +331,9 @@ impl ResponseStreamBinding {
                         has_service_feed_evidence,
                         has_bulk_rate_evidence,
                     },
-                    commands: entry.commands.clone(),
+                    command_queue,
+                    tcp_capacity_probe_attempted: entry.commands.tcp_capacity_probe_attempted(),
+                    tcp_capacity_probe_active: entry.commands.tcp_capacity_probe_active(),
                     endpoint_only_service_prior_eligible,
                     quic_capacity_proof: server_output_quic_capacity_proof_marker(entry),
                     quic_capacity_calibration_attempts: response_snapshot

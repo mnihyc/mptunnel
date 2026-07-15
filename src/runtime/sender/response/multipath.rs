@@ -24,7 +24,6 @@ use super::tcp_capacity::{
     try_start_response_tcp_capacity_probe,
 };
 use crate::model::multipath::{FlowSubflowSet, PathRuntimeRole};
-#[cfg(test)]
 use crate::model::path::CarrierPathKey;
 use crate::model::response::response_oldest_lower_flight_owner;
 use crate::model::work::ReliableWorkClass;
@@ -32,15 +31,13 @@ use crate::runtime::RuntimeError;
 use crate::runtime::stream::response::{
     MIN_ACTIVE_RESPONSE_FLOWS_FOR_SAME_FAMILY_DISCOVERY, ResponseAckClockCalibrationRequest,
     ResponseAckClockCalibrationRetirementRequest, ResponseDispatchTarget,
-    ResponseServiceHandoffDrainRequest, ResponseServiceHandoffRequest, ResponseStreamBinding,
+    ResponseServiceHandoffDrainRequest, ResponseServiceHandoffRequest,
     ResponseSubflowAdmissionRequest,
 };
 use crate::runtime::stream::{
-    FixedReliablePathOutput, ReliablePathStream, ReliablePathStreamOutput,
-    reliable_work_lane_to_carrier_lane,
+    ReliablePathStream, ReliablePathStreamOutput, reliable_work_lane_to_carrier_lane,
 };
 use crate::scheduler::FlowLane;
-use std::sync::Arc;
 
 /// Optimistic-concurrency fence associated with one planning pass. Each owner
 /// revalidates its generation, so this is not an atomic state snapshot.
@@ -159,9 +156,10 @@ fn stamp_response_calibration_retirement(
 }
 
 pub(super) enum ResponseDataDispatchTarget {
-    Fixed(Arc<FixedReliablePathOutput>),
+    Fixed {
+        key: CarrierPathKey,
+    },
     Switchable {
-        binding: Arc<ResponseStreamBinding>,
         target: ResponseDispatchTarget,
         intent: ResponseDataDispatchIntent,
     },
@@ -188,7 +186,7 @@ impl ResponseDataDispatchPlan {
     #[cfg(test)]
     pub(super) fn primary_key(&self) -> Option<CarrierPathKey> {
         match &self.primary {
-            ResponseDataDispatchTarget::Fixed(fixed) => Some(fixed.key()),
+            ResponseDataDispatchTarget::Fixed { key } => Some(*key),
             ResponseDataDispatchTarget::Switchable { target, .. } => Some(target.key),
         }
     }
@@ -196,7 +194,7 @@ impl ResponseDataDispatchPlan {
     #[cfg(test)]
     pub(super) fn primary_role(&self) -> PathRuntimeRole {
         match &self.primary {
-            ResponseDataDispatchTarget::Fixed(_) => PathRuntimeRole::Service,
+            ResponseDataDispatchTarget::Fixed { .. } => PathRuntimeRole::Service,
             ResponseDataDispatchTarget::Switchable { intent, .. } => intent.role(),
         }
     }
@@ -254,7 +252,7 @@ fn evaluate_response_data_dispatch_with_ordered_debt(
             if fixed.commands().can_enqueue_lane_now(lane) {
                 Ok(ResponseDataPlanningOutcome::Dispatch(
                     ResponseDataDispatchPlan {
-                        primary: ResponseDataDispatchTarget::Fixed(fixed.clone()),
+                        primary: ResponseDataDispatchTarget::Fixed { key: fixed.key() },
                     },
                 ))
             } else {
@@ -403,6 +401,7 @@ fn evaluate_response_data_dispatch_with_ordered_debt(
                         session_scheduling.service_family_loads,
                         next_offset,
                         current_drain,
+                        session_scheduling.observed_at,
                     )
                 {
                     debug_assert!(current_drain.is_none_or(|reservation| {
@@ -426,11 +425,7 @@ fn evaluate_response_data_dispatch_with_ordered_debt(
                     ));
                     return Ok(ResponseDataPlanningOutcome::Dispatch(
                         ResponseDataDispatchPlan {
-                            primary: ResponseDataDispatchTarget::Switchable {
-                                binding: binding.clone(),
-                                target,
-                                intent,
-                            },
+                            primary: ResponseDataDispatchTarget::Switchable { target, intent },
                         },
                     ));
                 }
@@ -444,6 +439,7 @@ fn evaluate_response_data_dispatch_with_ordered_debt(
                             ordered_data_owner,
                             session_scheduling.service_family_loads,
                             current_drain,
+                            session_scheduling.observed_at,
                         )
                     })
                     .flatten();
@@ -570,11 +566,7 @@ fn evaluate_response_data_dispatch_with_ordered_debt(
                 let (target, intent) = stamp_response_data_selection(selected, planning_epoch);
                 return Ok(ResponseDataPlanningOutcome::Dispatch(
                     ResponseDataDispatchPlan {
-                        primary: ResponseDataDispatchTarget::Switchable {
-                            binding: binding.clone(),
-                            target,
-                            intent,
-                        },
+                        primary: ResponseDataDispatchTarget::Switchable { target, intent },
                     },
                 ));
             }

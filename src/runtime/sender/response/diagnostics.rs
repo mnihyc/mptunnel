@@ -325,7 +325,7 @@ fn evaluate_response_service_handoff_target<'a>(
     {
         return failed(9, "family_or_gain");
     }
-    if !effective_target.commands.can_enqueue_lane_now(lane) {
+    if !effective_target.can_enqueue_lane(lane) {
         return failed(10, "target_queue_slot");
     }
     let model_suppression = response_owner_bulk_model_suppression(
@@ -692,7 +692,7 @@ pub(super) fn lab_response_service_handoff_evaluation(
     let target_credit = target.map(|target| {
         response_target_emission_credit_bytes(target, lane, payload_bytes, mux_limits)
     });
-    let target_pending = target.map(|target| target.commands.pending_bytes());
+    let target_pending = target.map(|target| target.observation.command_pending_bytes);
     let raw_proof = raw_target.and_then(|target| target.quic_capacity_proof);
     let proof_state = raw_target
         .map(|target| response_quic_capacity_marker_state(target, now))

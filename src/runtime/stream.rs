@@ -9,10 +9,11 @@ mod registry;
 pub(in crate::runtime) mod request;
 pub(in crate::runtime) mod response;
 
+#[cfg(test)]
+pub(in crate::runtime) use handle::FixedReliablePathOutput;
 pub(in crate::runtime) use handle::{
-    FixedReliablePathOutput, ReliablePathStream, ReliablePathStreamHandle,
-    ReliablePathStreamOutput, reliable_work_lane_to_carrier_lane,
-    wait_for_carrier_capacity_notifies,
+    ReliablePathStream, ReliablePathStreamHandle, ReliablePathStreamOutput,
+    reliable_work_lane_to_carrier_lane, wait_for_carrier_capacity_notifies,
 };
 pub(in crate::runtime) use registry::{
     AcceptedServerReliableStream, AcceptedServerReliableStreamRetirement,

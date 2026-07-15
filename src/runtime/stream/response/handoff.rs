@@ -145,7 +145,6 @@ impl ResponseStreamBinding {
             entry.key == request.service
                 && entry.path_instance_id == request.service_path_instance_id
                 && entry.incarnation == request.service_incarnation
-                && entry.commands.same_channel(&service.commands)
                 && !entry.commands.is_closed()
                 && server_output_has_bulk_rate_evidence_with_limits(entry, self.mux_limits)
         });
@@ -153,7 +152,6 @@ impl ResponseStreamBinding {
             entry.key == request.target
                 && entry.path_instance_id == request.target_path_instance_id
                 && entry.incarnation == request.target_incarnation
-                && entry.commands.same_channel(&target.commands)
                 && entry.role == StreamOpenRole::Validation
                 && entry.owner_data_in_flight_bytes == 0
                 && entry.bytes_in_flight == 0
@@ -395,7 +393,6 @@ impl ResponseStreamBinding {
             entry.key == request.target
                 && entry.path_instance_id == request.target_path_instance_id
                 && entry.incarnation == request.target_incarnation
-                && entry.commands.same_channel(&target.commands)
                 && entry.role == StreamOpenRole::Validation
                 && entry.owner_data_in_flight_bytes == 0
                 && entry.bytes_in_flight == 0
@@ -408,6 +405,7 @@ impl ResponseStreamBinding {
             }
             return Err(RuntimeError::SenderServiceBlocked);
         };
+        let target_commands = outputs.entries[target_index].commands.clone();
         let now = Instant::now();
         let service_entry = &outputs.entries[service_index];
         let target_entry = &outputs.entries[target_index];
@@ -558,10 +556,7 @@ impl ResponseStreamBinding {
             return Err(RuntimeError::SenderServiceBlocked);
         }
         *lead = Some(request.target);
-        if let Err(err) = target
-            .commands
-            .try_enqueue_stream_ordered_frame(frame.clone(), lane)
-        {
+        if let Err(err) = target_commands.try_enqueue_stream_ordered_frame(frame.clone(), lane) {
             *lead = Some(request.service);
             drop(lead);
             self.lane_tracker.rollback_response_service_handoff(

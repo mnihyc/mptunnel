@@ -252,7 +252,6 @@ impl ResponseStreamBinding {
             entry.key == target.key
                 && entry.path_instance_id == target.path_instance_id
                 && entry.incarnation == target.incarnation
-                && entry.commands.same_channel(&target.commands)
                 && entry.role == target.attachment_role
                 && entry.role != StreamOpenRole::Repair
         };
@@ -265,6 +264,7 @@ impl ResponseStreamBinding {
         let Some(target_index) = target_index else {
             return Err(RuntimeError::SenderServiceBlocked);
         };
+        let target_commands = outputs.entries[target_index].commands.clone();
         if let ResponseOwnerEnqueueAdmission::AckClockCalibration(request) = admission {
             let calibration_ceiling = reliable_ack_clock_calibration_ceiling_bytes(self.mux_limits);
             let calibration_limit = request.limit_bytes.min(calibration_ceiling);
@@ -367,9 +367,8 @@ impl ResponseStreamBinding {
                     #[cfg(not(feature = "lab-diagnostics"))]
                     let _ = reserved_calibration;
                     outputs.active_ack_clock_calibration = Some(identity);
-                    if let Err(err) = target
-                        .commands
-                        .try_enqueue_stream_ordered_frame(frame.clone(), lane)
+                    if let Err(err) =
+                        target_commands.try_enqueue_stream_ordered_frame(frame.clone(), lane)
                     {
                         *outputs
                             .ack_clock_calibrations
@@ -415,9 +414,8 @@ impl ResponseStreamBinding {
                         return Err(RuntimeError::SenderServiceBlocked);
                     }
                     after_subflow_reservation();
-                    if let Err(err) = target
-                        .commands
-                        .try_enqueue_stream_ordered_frame(frame.clone(), lane)
+                    if let Err(err) =
+                        target_commands.try_enqueue_stream_ordered_frame(frame.clone(), lane)
                     {
                         if let Some(epoch_generation) = reservation.epoch_generation {
                             self.rollback_subflow_owner_admission_for_epoch(
@@ -450,9 +448,8 @@ impl ResponseStreamBinding {
                 // Slot reservation is the only fallible operation. Publish
                 // the command only after its owner and exact flight exist, so
                 // the carrier cannot dequeue work ahead of response metadata.
-                let command = target
-                    .commands
-                    .try_reserve_stream_ordered_frame(frame.clone(), lane)?;
+                let command =
+                    target_commands.try_reserve_stream_ordered_frame(frame.clone(), lane)?;
                 self.record_validated_owner_flight_with_outputs(&mut outputs, target_index, frame);
                 if changed {
                     *service = Some(target.key);

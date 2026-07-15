@@ -4,6 +4,7 @@
 use super::ResponseStreamBinding;
 use super::ack_clock::{ResponseAckClockCalibrationState, ResponseAckClockRateEvidence};
 use super::evidence::ServerPathMetricsEntry;
+use super::session::TcpCapacityProbeSessionLease;
 #[cfg(feature = "lab-diagnostics")]
 use crate::lab_diagnostics::lab_diagnostic;
 use crate::model::capacity::QuicCapacityProofCandidate;
@@ -11,8 +12,11 @@ use crate::model::path::{CarrierPathInstanceId, CarrierPathKey};
 use crate::model::response::ResponsePathObservation;
 #[cfg(feature = "lab-diagnostics")]
 use crate::protocol::SessionId;
-use crate::protocol::{PathId, StreamOpenRole, UnderlayProtocol};
-use crate::runtime::path::commands::ReliablePathCommandSender;
+use crate::protocol::{Frame, PathId, StreamOpenRole, UnderlayProtocol};
+use crate::runtime::RuntimeError;
+use crate::runtime::path::commands::{
+    ReliablePathCommandQueueSnapshot, ReliablePathCommandSender, TcpCapacityProbeRequest,
+};
 use crate::runtime::path::proof::enqueue_path_proof_frame;
 use crate::scheduler::{FlowLane, PathSnapshot};
 use std::collections::HashMap;
@@ -532,7 +536,7 @@ impl ResponseStreamBinding {
         self.detach_matching_output(key, |entry| entry.commands.same_channel(commands));
     }
 
-    pub(in crate::runtime::stream) fn detach_path_instance(
+    pub(in crate::runtime) fn detach_path_instance(
         &self,
         key: CarrierPathKey,
         path_instance_id: CarrierPathInstanceId,
@@ -659,6 +663,87 @@ impl ResponseStreamBinding {
             .entries
             .iter()
             .any(|entry| entry.key == key && entry.incarnation == incarnation)
+    }
+
+    pub(in crate::runtime) fn try_enqueue_tcp_capacity_probe_for_target(
+        &self,
+        target: &ResponseDispatchTarget,
+        expected_pending_bytes: u64,
+        request: TcpCapacityProbeRequest,
+        session_lease: TcpCapacityProbeSessionLease,
+    ) -> Result<u64, RuntimeError> {
+        if !self.response_stream_open.load(Ordering::Acquire)
+            || request.path_id != target.key.path_id
+            || request.path_instance_id != target.path_instance_id
+        {
+            return Err(RuntimeError::SenderServiceBlocked);
+        }
+        let outputs = self
+            .outputs
+            .lock()
+            .expect("server reliable stream binding lock");
+        let Some(entry) = outputs.entries.iter().find(|entry| {
+            entry.key == target.key
+                && entry.path_instance_id == target.path_instance_id
+                && entry.incarnation == target.incarnation
+                && entry.role == target.attachment_role
+                && entry.role == StreamOpenRole::Validation
+                && entry.key.underlay == UnderlayProtocol::Tcp
+                && !entry.commands.is_closed()
+                && entry.commands.pending_bytes() == expected_pending_bytes
+                && !entry.commands.tcp_capacity_probe_attempted()
+                && !entry.commands.tcp_capacity_probe_active()
+        }) else {
+            return Err(RuntimeError::SenderServiceBlocked);
+        };
+        entry
+            .commands
+            .try_enqueue_tcp_capacity_probe(request, session_lease)
+    }
+
+    pub(in crate::runtime) fn try_enqueue_classified_frame_for_target(
+        &self,
+        target: &ResponseDispatchTarget,
+        frame: Frame,
+        lane: FlowLane,
+    ) -> Result<(), RuntimeError> {
+        self.try_enqueue_frame_for_target(target, frame, lane, false)
+    }
+
+    pub(in crate::runtime) fn try_enqueue_stream_ordered_frame_for_target(
+        &self,
+        target: &ResponseDispatchTarget,
+        frame: Frame,
+        lane: FlowLane,
+    ) -> Result<(), RuntimeError> {
+        self.try_enqueue_frame_for_target(target, frame, lane, true)
+    }
+
+    fn try_enqueue_frame_for_target(
+        &self,
+        target: &ResponseDispatchTarget,
+        frame: Frame,
+        lane: FlowLane,
+        stream_ordered: bool,
+    ) -> Result<(), RuntimeError> {
+        let outputs = self
+            .outputs
+            .lock()
+            .expect("server reliable stream binding lock");
+        let Some(entry) = outputs.entries.iter().find(|entry| {
+            entry.key == target.key
+                && entry.path_instance_id == target.path_instance_id
+                && entry.incarnation == target.incarnation
+                && entry.role == target.attachment_role
+                && !entry.commands.is_closed()
+        }) else {
+            return Err(RuntimeError::SenderServiceBlocked);
+        };
+        if stream_ordered {
+            entry.commands.try_enqueue_stream_ordered_frame(frame, lane)
+        } else {
+            entry.commands.try_enqueue_admitted_frame(frame, lane)
+        }
     }
 
     fn set_request_active_owner(&self, key: CarrierPathKey) {
@@ -788,6 +873,7 @@ impl ResponseStreamBinding {
     }
 }
 
+/// Handle-free response candidate captured by one observe pass.
 #[derive(Clone)]
 pub(in crate::runtime) struct ResponseSenderPathTarget {
     #[cfg(feature = "lab-diagnostics")]
@@ -795,7 +881,9 @@ pub(in crate::runtime) struct ResponseSenderPathTarget {
     #[cfg(feature = "lab-diagnostics")]
     pub(in crate::runtime) binding_instance_id: u64,
     pub(in crate::runtime) observation: ResponsePathObservation,
-    pub(in crate::runtime) commands: ReliablePathCommandSender,
+    pub(in crate::runtime) command_queue: ReliablePathCommandQueueSnapshot,
+    pub(in crate::runtime) tcp_capacity_probe_attempted: bool,
+    pub(in crate::runtime) tcp_capacity_probe_active: bool,
     /// Endpoint-only configuration plus an immature candidate ACK model may
     /// use Service only as a bounded calibration-opportunity prior.
     pub(in crate::runtime) endpoint_only_service_prior_eligible: bool,
@@ -816,14 +904,35 @@ impl AsRef<ResponsePathObservation> for ResponseSenderPathTarget {
     }
 }
 
-/// Compact identity retained after path ranking. Model snapshots and
-/// calibration state are intentionally dropped before the per-frame emit path.
-#[derive(Clone)]
+impl ResponseSenderPathTarget {
+    pub(in crate::runtime) fn can_enqueue_lane(&self, lane: FlowLane) -> bool {
+        self.command_queue.can_enqueue_lane(lane)
+    }
+
+    pub(in crate::runtime) fn can_enqueue_frame(
+        &self,
+        frame: &crate::protocol::Frame,
+        lane: FlowLane,
+    ) -> bool {
+        self.command_queue.can_enqueue_frame(frame, lane)
+    }
+
+    pub(in crate::runtime) fn can_enqueue_stream_ordered_frame(&self) -> bool {
+        self.command_queue.can_enqueue_stream_ordered_frame()
+    }
+
+    pub(in crate::runtime) fn data_queue_open(&self) -> bool {
+        self.command_queue.data_open()
+    }
+}
+
+/// ID-only apply target retained after ranking. The binding resolves the exact
+/// live command port under its output lock before committing any mutation.
+#[derive(Debug, Clone, Copy)]
 pub(in crate::runtime) struct ResponseDispatchTarget {
     pub(in crate::runtime) key: CarrierPathKey,
     pub(in crate::runtime) path_instance_id: CarrierPathInstanceId,
     pub(in crate::runtime) incarnation: u64,
-    pub(in crate::runtime) commands: ReliablePathCommandSender,
     pub(in crate::runtime) attachment_role: StreamOpenRole,
     pub(in crate::runtime) has_bulk_rate_evidence: bool,
 }
@@ -834,7 +943,6 @@ impl From<ResponseSenderPathTarget> for ResponseDispatchTarget {
             key: target.observation.key,
             path_instance_id: target.observation.path_instance_id,
             incarnation: target.observation.incarnation,
-            commands: target.commands,
             attachment_role: target.observation.attachment_role,
             has_bulk_rate_evidence: target.observation.has_bulk_rate_evidence,
         }
@@ -847,7 +955,6 @@ impl From<&ResponseSenderPathTarget> for ResponseDispatchTarget {
             key: target.observation.key,
             path_instance_id: target.observation.path_instance_id,
             incarnation: target.observation.incarnation,
-            commands: target.commands.clone(),
             attachment_role: target.observation.attachment_role,
             has_bulk_rate_evidence: target.observation.has_bulk_rate_evidence,
         }

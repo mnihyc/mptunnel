@@ -4,7 +4,9 @@
 
 use super::ResponseStreamBinding;
 use super::ack_clock::apply_response_ack_clock_release_samples;
-use super::attachment::{ResponseSenderPathTarget, ResponseStreamOutputs};
+#[cfg(test)]
+use super::attachment::ResponseSenderPathTarget;
+use super::attachment::{ResponseDispatchTarget, ResponseStreamOutputs};
 #[cfg(feature = "lab-diagnostics")]
 use crate::lab_diagnostics::lab_diagnostic;
 use crate::model::path::CarrierPathKey;
@@ -532,7 +534,7 @@ impl ResponseStreamBinding {
 
     pub(in crate::runtime) fn try_enqueue_repair_frame_for_target(
         &self,
-        target: &ResponseSenderPathTarget,
+        target: &ResponseDispatchTarget,
         frame: &Frame,
         lane: FlowLane,
     ) -> Result<(), RuntimeError> {
@@ -546,24 +548,22 @@ impl ResponseStreamBinding {
         if !self.response_stream_open.load(Ordering::Acquire) {
             return Err(RuntimeError::SenderServiceBlocked);
         }
-        let target_matches = outputs.entries.iter().any(|entry| {
-            entry.key == target.observation.key
-                && entry.incarnation == target.observation.incarnation
-                && entry.commands.same_channel(&target.commands)
-                && entry.role == target.observation.attachment_role
-        });
-        if !target_matches {
+        let Some(target_index) = outputs.entries.iter().position(|entry| {
+            entry.key == target.key
+                && entry.path_instance_id == target.path_instance_id
+                && entry.incarnation == target.incarnation
+                && entry.role == target.attachment_role
+        }) else {
             return Err(RuntimeError::SenderServiceBlocked);
-        }
-        target
-            .commands
-            .try_enqueue_admitted_frame(frame.clone(), lane)?;
+        };
+        let commands = outputs.entries[target_index].commands.clone();
+        commands.try_enqueue_admitted_frame(frame.clone(), lane)?;
         self.record_product_flight_with_outputs(
             &mut outputs,
-            target.observation.key,
-            target.observation.incarnation,
-            target.observation.attachment_role,
-            &target.commands,
+            target.key,
+            target.incarnation,
+            target.attachment_role,
+            &commands,
             frame,
             CarrierWorkKind::RepairData,
         );

@@ -4,7 +4,6 @@
 //! `quic_capacity` under the central tracker mutex.
 
 use super::ResponseStreamBinding;
-use super::attachment::ResponseSenderPathTarget;
 use super::subflow::server_output_has_bulk_rate_evidence_with_limits;
 #[cfg(feature = "lab-diagnostics")]
 use crate::lab_diagnostics::lab_diagnostic;
@@ -94,6 +93,8 @@ pub(in crate::runtime) struct ResponseQuicCapacityCalibrationRequest {
     pub(in crate::runtime) target_path_instance_id: CarrierPathInstanceId,
     pub(in crate::runtime) target_incarnation: u64,
     pub(in crate::runtime) target_pending_bytes: u64,
+    #[cfg(feature = "lab-diagnostics")]
+    pub(in crate::runtime) attempt_ordinal: u8,
     pub(in crate::runtime) train_bytes: usize,
     #[cfg_attr(not(feature = "lab-diagnostics"), allow(dead_code))]
     pub(in crate::runtime) sample_floor_bytes: u64,
@@ -110,15 +111,13 @@ pub(in crate::runtime) struct ResponseQuicCapacityCalibrationRequest {
 impl ResponseStreamBinding {
     pub(in crate::runtime) fn try_start_quic_capacity_calibration(
         &self,
-        target: &ResponseSenderPathTarget,
         request: ResponseQuicCapacityCalibrationRequest,
     ) -> bool {
-        self.try_start_quic_capacity_calibration_with_lease(target, request, |lease| lease)
+        self.try_start_quic_capacity_calibration_with_lease(request, |lease| lease)
     }
 
     pub(super) fn try_start_quic_capacity_calibration_with_lease(
         &self,
-        target: &ResponseSenderPathTarget,
         request: ResponseQuicCapacityCalibrationRequest,
         lease_after_admission: impl FnOnce(Duration) -> Duration,
     ) -> bool {
@@ -127,9 +126,6 @@ impl ResponseStreamBinding {
         ))
         .unwrap_or(usize::MAX);
         if !self.response_stream_open.load(Ordering::Acquire)
-            || request.target != target.observation.key
-            || request.target_path_instance_id != target.observation.path_instance_id
-            || request.target_incarnation != target.observation.incarnation
             || request.train_bytes == 0
             || request.train_bytes > session_envelope
             || request.proof_validity.is_zero()
@@ -159,28 +155,28 @@ impl ResponseStreamBinding {
         // A QUIC train is connection-wide optional traffic. Exact Validation
         // identity plus the captured idle queue value isolates one carrier
         // epoch and fences stale proposals; neither is product-byte ownership.
-        let target_is_exact_udp_validation = outputs.entries.iter().any(|entry| {
+        let target_index = outputs.entries.iter().position(|entry| {
             entry.key == request.target
                 && entry.path_instance_id == request.target_path_instance_id
                 && entry.incarnation == request.target_incarnation
-                && entry.commands.same_channel(&target.commands)
                 && entry.role == StreamOpenRole::Validation
                 && entry.key.underlay == UnderlayProtocol::Udp
                 && !entry.commands.is_closed()
                 && entry.commands.pending_bytes() == request.target_pending_bytes
                 && !server_output_has_bulk_rate_evidence_with_limits(entry, self.mux_limits)
         });
-        if !target_is_exact_udp_validation {
+        let Some(target_index) = target_index else {
             return false;
-        }
-        if !target.commands.can_enqueue_lane_now(FlowLane::Throughput) {
+        };
+        let target_commands = outputs.entries[target_index].commands.clone();
+        if !target_commands.can_enqueue_lane_now(FlowLane::Throughput) {
             return false;
         }
         let calibration_id =
             NEXT_RESPONSE_QUIC_CAPACITY_CALIBRATION_ID.fetch_add(1, Ordering::Relaxed);
         let command_ticket = CapacityProbeCommandTicket::new();
         #[cfg(feature = "lab-diagnostics")]
-        let attempt_ordinal = target.quic_capacity_calibration_attempts.saturating_add(1);
+        let attempt_ordinal = request.attempt_ordinal;
         #[cfg(feature = "lab-diagnostics")]
         let selection = if attempt_ordinal == 1 {
             "fresh"
@@ -237,8 +233,7 @@ impl ResponseStreamBinding {
             ticket: command_ticket,
             cancel_on_drop: true,
         };
-        if target
-            .commands
+        if target_commands
             .try_enqueue_quic_capacity_probe(probe)
             .is_err()
         {

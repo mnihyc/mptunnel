@@ -92,7 +92,13 @@ pub(super) fn emit_planned_response_data_frame(
 ) -> Result<ResponseDataEmitOutcome, RuntimeError> {
     let ResponseDataDispatchPlan { primary } = planned;
     match primary {
-        ResponseDataDispatchTarget::Fixed(fixed) => {
+        ResponseDataDispatchTarget::Fixed { key } => {
+            let ReliablePathStreamOutput::Fixed(fixed) = &stream.output else {
+                return Err(RuntimeError::SenderServiceBlocked);
+            };
+            if fixed.key() != key {
+                return Err(RuntimeError::SenderServiceBlocked);
+            }
             CarrierEmitMode::StreamOrdered.try_enqueue_frame(
                 fixed.commands(),
                 frame.clone(),
@@ -103,11 +109,10 @@ pub(super) fn emit_planned_response_data_frame(
                 selected_path: Some(fixed.key()),
             })
         }
-        ResponseDataDispatchTarget::Switchable {
-            binding,
-            target,
-            intent,
-        } => {
+        ResponseDataDispatchTarget::Switchable { target, intent } => {
+            let ReliablePathStreamOutput::Switchable(binding) = &stream.output else {
+                return Err(RuntimeError::SenderServiceBlocked);
+            };
             let role = intent.role();
             let calibrating = matches!(&intent, ResponseDataDispatchIntent::AckClockCalibration(_));
             let handoff = matches!(&intent, ResponseDataDispatchIntent::ServiceHandoff(_));
@@ -148,7 +153,7 @@ pub(super) fn emit_planned_response_data_frame(
                     return Err(RuntimeError::SenderServiceBlocked);
                 }
                 Err(_) => {
-                    binding.detach(target.key, &target.commands);
+                    binding.detach_path_instance(target.key, target.path_instance_id);
                     return Err(RuntimeError::SenderServiceBlocked);
                 }
             }
@@ -246,7 +251,7 @@ pub(super) fn emit_response_frame_from_sender_service(
                 let send_result = if matches!(frame, Frame::StreamData { .. }) {
                     if repair {
                         binding
-                            .try_enqueue_repair_frame_for_target(&target, &frame, lane)
+                            .try_enqueue_repair_frame_for_target(&dispatch_target, &frame, lane)
                             .map(|()| None)
                     } else {
                         binding.try_enqueue_owner_frame_for_dispatch_target(
@@ -257,9 +262,21 @@ pub(super) fn emit_response_frame_from_sender_service(
                         )
                     }
                 } else {
-                    emit_mode
-                        .try_enqueue_frame(&target.commands, frame.clone(), lane)
-                        .map(|()| None)
+                    match emit_mode {
+                        CarrierEmitMode::Classified => binding
+                            .try_enqueue_classified_frame_for_target(
+                                &dispatch_target,
+                                frame.clone(),
+                                lane,
+                            ),
+                        CarrierEmitMode::StreamOrdered => binding
+                            .try_enqueue_stream_ordered_frame_for_target(
+                                &dispatch_target,
+                                frame.clone(),
+                                lane,
+                            ),
+                    }
+                    .map(|()| None)
                 };
                 match send_result {
                     Ok(_) => {
@@ -279,7 +296,10 @@ pub(super) fn emit_response_frame_from_sender_service(
                     }
                     Err(err) => {
                         last_error = Some(err);
-                        binding.detach(target.observation.key, &target.commands);
+                        binding.detach_path_instance(
+                            target.observation.key,
+                            target.observation.path_instance_id,
+                        );
                     }
                 }
             }

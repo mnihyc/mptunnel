@@ -35,7 +35,8 @@ use crate::protocol::{StreamOpenRole, UnderlayProtocol};
 use crate::runtime::RuntimeError;
 use crate::runtime::path::commands::TcpCapacityProbeRequest;
 use crate::runtime::stream::response::{
-    ResponseSenderPathTarget, ResponseStreamBinding, server_bulk_output_eta_ms,
+    ResponseDispatchTarget, ResponseSenderPathTarget, ResponseStreamBinding,
+    server_bulk_output_eta_ms,
 };
 use crate::scheduler::{FlowLane, PathRateScope, PathSnapshot};
 use std::time::{Duration, Instant};
@@ -132,7 +133,10 @@ pub(super) fn try_start_response_tcp_capacity_probe(
     let Some(session_lease) = binding.try_reserve_tcp_capacity_probe(lane_generation) else {
         return Ok(false);
     };
-    let calibration_id = target.commands.try_enqueue_tcp_capacity_probe(
+    let dispatch_target = ResponseDispatchTarget::from(&target);
+    let calibration_id = binding.try_enqueue_tcp_capacity_probe_for_target(
+        &dispatch_target,
+        target.observation.command_pending_bytes,
         TcpCapacityProbeRequest {
             path_id: target.observation.key.path_id,
             path_instance_id: target.observation.path_instance_id,
@@ -241,8 +245,8 @@ pub(super) fn select_response_tcp_capacity_probe_target(
                 && !target.observation.is_service
                 && target.observation.has_sender_evidence
                 && !target.observation.has_bulk_rate_evidence
-                && !target.commands.tcp_capacity_probe_attempted()
-                && !target.commands.tcp_capacity_probe_active()
+                && !target.tcp_capacity_probe_attempted
+                && !target.tcp_capacity_probe_active
                 && target.observation.command_pending_bytes == 0
                 && target.observation.snapshot.queue_bytes == 0
                 && target.observation.snapshot.bytes_in_flight == 0
@@ -252,7 +256,7 @@ pub(super) fn select_response_tcp_capacity_probe_target(
                     .snapshot
                     .session_active_latency_sensitive_flows
                     == 0
-                && target.commands.can_enqueue_lane_now(FlowLane::Throughput)
+                && target.can_enqueue_lane(FlowLane::Throughput)
         })
         .min_by(|left, right| {
             left.observation
@@ -443,7 +447,7 @@ pub(super) fn select_response_ack_clock_calibration_target(
                 .snapshot
                 .product_bytes_in_flight
                 .max(target.observation.command_pending_bytes);
-            target.commands.can_enqueue_lane_now(lane)
+            target.can_enqueue_lane(lane)
                 && carrier_pressure.saturating_add(payload_bytes as u64)
                     <= target.ack_clock_calibration_credit_limit_bytes
         })
@@ -484,7 +488,7 @@ pub(super) fn response_ack_clock_calibration_pending(
     // Begun exact ownership serializes the binding. Fresh state does so only
     // while the session can actually start exploration; otherwise it is dormant.
     target.ack_clock_calibration_active
-        || (!target.commands.is_closed()
+        || (target.data_queue_open()
             && target.ack_clock_calibration_eligible
             && !target.ack_clock_calibration_proven
             && (target.ack_clock_calibration_spent_bytes > 0
@@ -500,7 +504,7 @@ pub(super) fn response_ack_clock_calibration_blocks_generic_owner(
     // excluded so ordinary OwnerData cannot contaminate later ACK calibration.
     !target.observation.is_service
         && (target.ack_clock_calibration_active
-            || (!target.commands.is_closed()
+            || (target.data_queue_open()
                 && target.ack_clock_calibration_eligible
                 && !target.ack_clock_calibration_proven
                 && target.ack_clock_calibration_spent_bytes

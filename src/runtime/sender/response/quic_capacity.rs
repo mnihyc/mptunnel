@@ -147,25 +147,24 @@ pub(super) fn try_start_response_quic_capacity_calibration(
     let geometry = response_quic_capacity_calibration_geometry(&target, binding.mux_limits());
     let train_bytes = geometry.train_bytes;
     let lease = response_quic_capacity_calibration_lease(&target, train_bytes);
-    binding.try_start_quic_capacity_calibration(
-        &target,
-        ResponseQuicCapacityCalibrationRequest {
-            expected_planner_generation: planner_generation,
-            expected_lane_generation: lane_generation,
-            expected_model_generation: model_generation,
-            target: target.observation.key,
-            target_path_instance_id: target.observation.path_instance_id,
-            target_incarnation: target.observation.incarnation,
-            target_pending_bytes: target.observation.command_pending_bytes,
-            train_bytes,
-            sample_floor_bytes: geometry.sample_floor_bytes,
-            accounting_slack_bytes: geometry.accounting_slack_bytes,
-            fresh_strict_window_bytes: geometry.fresh_strict_window_bytes,
-            carrier_window_bytes: geometry.carrier_window_bytes,
-            proof_validity: response_quic_capacity_proof_validity(&target),
-            lease,
-        },
-    )
+    binding.try_start_quic_capacity_calibration(ResponseQuicCapacityCalibrationRequest {
+        expected_planner_generation: planner_generation,
+        expected_lane_generation: lane_generation,
+        expected_model_generation: model_generation,
+        target: target.observation.key,
+        target_path_instance_id: target.observation.path_instance_id,
+        target_incarnation: target.observation.incarnation,
+        target_pending_bytes: target.observation.command_pending_bytes,
+        #[cfg(feature = "lab-diagnostics")]
+        attempt_ordinal: target.quic_capacity_calibration_attempts.saturating_add(1),
+        train_bytes,
+        sample_floor_bytes: geometry.sample_floor_bytes,
+        accounting_slack_bytes: geometry.accounting_slack_bytes,
+        fresh_strict_window_bytes: geometry.fresh_strict_window_bytes,
+        carrier_window_bytes: geometry.carrier_window_bytes,
+        proof_validity: response_quic_capacity_proof_validity(&target),
+        lease,
+    })
 }
 
 /// Pure start decision shared by readiness preview and the mutating apply path.
@@ -265,7 +264,7 @@ pub(super) fn select_response_quic_capacity_calibration_target(
                     .snapshot
                     .session_active_latency_sensitive_flows
                     == 0
-                && target.commands.can_enqueue_lane_now(FlowLane::Throughput)
+                && target.can_enqueue_lane(FlowLane::Throughput)
                 && {
                     let geometry = response_quic_capacity_calibration_geometry(target, mux_limits);
                     geometry.fits_session_envelope

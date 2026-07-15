@@ -609,7 +609,7 @@ pub(super) fn response_target_assigned_product_bytes(target: &ResponseSenderPath
             .observation
             .snapshot
             .queue_bytes
-            .max(target.commands.pending_bytes()),
+            .max(target.observation.command_pending_bytes),
     )
 }
 
@@ -688,8 +688,8 @@ pub(super) fn response_target_has_emission_credit(
     }
     let credit = response_target_emission_credit_bytes(target, lane, payload_bytes, mux_limits);
     target
-        .commands
-        .pending_bytes()
+        .observation
+        .command_pending_bytes
         .saturating_add(payload_bytes as u64)
         <= credit as u64
 }
@@ -714,7 +714,7 @@ pub(super) fn response_service_has_assigned_owner_credit(
             .observation
             .snapshot
             .queue_bytes
-            .max(target.commands.pending_bytes()),
+            .max(target.observation.command_pending_bytes),
     );
     assigned.saturating_add(payload_bytes as u64) <= credit as u64
 }

@@ -273,6 +273,7 @@ pub(super) fn select_response_service_handoff_candidate(
     ordered_data_owner: Option<CarrierPathKey>,
     service_family_loads: ResponseServiceFamilyLoads,
     required_reservation: Option<ResponseServiceHandoffDrainReservation>,
+    now: Instant,
 ) -> Option<ResponseServiceHandoffCandidate> {
     if !lane.is_bulk() {
         return None;
@@ -299,7 +300,6 @@ pub(super) fn select_response_service_handoff_candidate(
     {
         return None;
     }
-    let now = Instant::now();
     let target = targets
         .iter()
         .filter_map(|target| {
@@ -332,7 +332,7 @@ pub(super) fn select_response_service_handoff_candidate(
                     service_family_loads,
                 )
                 .is_some()
-                && target.commands.can_enqueue_lane_now(lane)
+                && target.can_enqueue_lane(lane)
                 && response_owner_bulk_model_suppression(
                     target,
                     ResponseBulkLead {
@@ -385,6 +385,7 @@ pub(super) fn select_response_service_handoff_target(
     service_family_loads: ResponseServiceFamilyLoads,
     handoff_frontier: u64,
     required_reservation: Option<ResponseServiceHandoffDrainReservation>,
+    now: Instant,
 ) -> Option<ResponseSelectedDataTarget> {
     if !lane.is_bulk() || ordered_owner_debt_bytes > 0 || !lower_flights.is_empty() {
         return None;
@@ -397,6 +398,7 @@ pub(super) fn select_response_service_handoff_target(
         ordered_data_owner,
         service_family_loads,
         required_reservation,
+        now,
     )?;
     let service = candidate.service;
     let target = candidate.target;
@@ -405,7 +407,7 @@ pub(super) fn select_response_service_handoff_target(
             .saturating_sub(payload_bytes),
     )
     .unwrap_or(u64::MAX);
-    debug_assert!(target.commands.pending_bytes() <= target_command_pending_limit_bytes);
+    debug_assert!(target.observation.command_pending_bytes <= target_command_pending_limit_bytes);
 
     Some(ResponseSelectedDataTarget {
         target: target.clone(),
@@ -419,9 +421,7 @@ pub(super) fn select_response_service_handoff_target(
                 target_command_pending_limit_bytes,
                 capacity_proof: required_reservation
                     .map(|reservation| reservation.capacity_proof)
-                    .unwrap_or_else(|| {
-                        response_service_handoff_start_capacity_proof(&target, Instant::now())
-                    }),
+                    .unwrap_or_else(|| response_service_handoff_start_capacity_proof(&target, now)),
             },
         )),
     })
@@ -729,10 +729,8 @@ pub(super) fn response_target_can_enqueue_frame_now(
     emit_mode: CarrierEmitMode,
 ) -> bool {
     match emit_mode {
-        CarrierEmitMode::Classified => target.commands.can_enqueue_frame_now(frame, lane),
-        CarrierEmitMode::StreamOrdered => {
-            target.commands.can_enqueue_stream_ordered_frame_now(lane)
-        }
+        CarrierEmitMode::Classified => target.can_enqueue_frame(frame, lane),
+        CarrierEmitMode::StreamOrdered => target.can_enqueue_stream_ordered_frame(),
     }
 }
 
@@ -1002,7 +1000,7 @@ pub(super) fn select_response_sender_data_target_with_ordered_debt_inner_and_ret
             );
             continue;
         }
-        if !target.commands.can_enqueue_lane_now(lane)
+        if !target.can_enqueue_lane(lane)
             && !(startup_sampling_allowed
                 && response_ack_clock_calibration_needs_opportunity_decision(target))
         {

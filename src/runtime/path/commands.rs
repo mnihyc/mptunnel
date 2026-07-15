@@ -53,6 +53,37 @@ pub(in crate::runtime) struct ReliablePathCommandReceivers {
     dequeued_unreleased_bytes: AtomicU64,
 }
 
+/// Immutable queue readiness captured at an observe boundary. Policy may rank
+/// this value, but only the command owner may resolve a sender and enqueue.
+#[derive(Debug, Clone, Copy)]
+pub(in crate::runtime) struct ReliablePathCommandQueueSnapshot {
+    priority_ready: bool,
+    data_open: bool,
+    data_ready: bool,
+}
+
+impl ReliablePathCommandQueueSnapshot {
+    pub(in crate::runtime) fn can_enqueue_lane(self, lane: FlowLane) -> bool {
+        if reliable_path_frame_uses_priority_queue(lane) {
+            self.priority_ready
+        } else {
+            self.data_ready
+        }
+    }
+
+    pub(in crate::runtime) fn can_enqueue_frame(self, frame: &Frame, lane: FlowLane) -> bool {
+        self.can_enqueue_lane(reliable_path_effective_frame_lane(frame, lane))
+    }
+
+    pub(in crate::runtime) fn can_enqueue_stream_ordered_frame(self) -> bool {
+        self.can_enqueue_lane(reliable_path_stream_ordered_queue_lane())
+    }
+
+    pub(in crate::runtime) fn data_open(self) -> bool {
+        self.data_open
+    }
+}
+
 /// A carrier-owned terminal transaction for an accepted stream whose product
 /// attachment never committed. It is intentionally separate from bounded work:
 /// queue pressure must not leak a peer binding or its local actor entry. The
@@ -290,6 +321,16 @@ impl Drop for ReliablePathCommandReceivers {
 }
 
 impl ReliablePathCommandSender {
+    pub(in crate::runtime) fn queue_snapshot(&self) -> ReliablePathCommandQueueSnapshot {
+        let priority_open = !self.priority.is_closed();
+        let data_open = !self.data.is_closed();
+        ReliablePathCommandQueueSnapshot {
+            priority_ready: priority_open && self.priority.capacity() > 0,
+            data_open,
+            data_ready: data_open && self.data.capacity() > 0,
+        }
+    }
+
     pub(in crate::runtime) fn retire_accepted_stream(
         &self,
         stream_id: StreamId,
@@ -718,11 +759,7 @@ impl ReliablePathCommandSender {
     }
 
     pub(in crate::runtime) fn can_enqueue_lane_now(&self, lane: FlowLane) -> bool {
-        if reliable_path_frame_uses_priority_queue(lane) {
-            self.priority.capacity() > 0
-        } else {
-            self.data.capacity() > 0
-        }
+        self.queue_snapshot().can_enqueue_lane(lane)
     }
 
     pub(in crate::runtime) fn capacity_notify(&self) -> Arc<Notify> {

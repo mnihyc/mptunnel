@@ -65,7 +65,6 @@ pub(super) fn parse_tcp_info_prefix(bytes: &[u8], returned: usize) -> Option<Tcp
     let rtt = (available >= 76).then(|| TcpNativeRtt {
         srtt_us: u32_at(68),
         rttvar_us: u32_at(72),
-        min_rtt_us: (available >= 152).then(|| u32_at(148)),
     });
     let flight = (available >= 84).then(|| TcpNativeFlight {
         snd_mss_bytes: u32_at(16),

@@ -4,7 +4,6 @@ use crate::transport::tcp_telemetry::{TcpNativeFlight, TcpNativeLossCounters, Tc
 fn snapshot() -> TcpNativeSnapshot {
     TcpNativeSnapshot {
         rtt: Some(TcpNativeRtt {
-            min_rtt_us: Some(18_000),
             srtt_us: 20_000,
             rttvar_us: 2_000,
         }),
@@ -135,10 +134,9 @@ fn partial_pacing_snapshot_cannot_replace_complete_path_metrics() {
 }
 
 #[test]
-fn partial_rtt_snapshot_preserves_unknown_minimum_rtt() {
+fn partial_rtt_snapshot_applies_available_timing() {
     let snapshot = TcpNativeSnapshot {
         rtt: Some(TcpNativeRtt {
-            min_rtt_us: None,
             srtt_us: 30_000,
             rttvar_us: 3_000,
         }),
@@ -156,11 +154,8 @@ fn partial_rtt_snapshot_preserves_unknown_minimum_rtt() {
         None,
         None,
     );
-    metrics.min_rtt_us = 18_000;
-
     observation.apply_transport_shape(&mut metrics);
 
-    assert_eq!(metrics.min_rtt_us, 18_000);
     assert_eq!(metrics.srtt_us, 30_000);
     assert_eq!(observation.complete_path_metrics(), None);
 }

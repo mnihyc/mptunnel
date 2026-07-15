@@ -41,7 +41,6 @@ fn persistent_response_repair_is_cancelled_when_output_incarnation_detaches() {
         Frame::StreamData {
             stream_id: StreamId(84),
             offset: 0,
-            flags: StreamFlags::NONE,
             payload: Bytes::from_static(&[0x5e; 64]),
         },
         RelaySendCause::persistent_server_ack_gap_repair(
@@ -85,7 +84,6 @@ fn response_repair_extra_budget_is_cumulative_not_per_event() {
                 Frame::StreamData {
                     stream_id,
                     offset: 0,
-                    flags: StreamFlags::NONE,
                     payload: repair_payload.clone(),
                 },
                 mux_limits,
@@ -101,7 +99,6 @@ fn response_repair_extra_budget_is_cumulative_not_per_event() {
                 Frame::StreamData {
                     stream_id,
                     offset: startup_floor as u64,
-                    flags: StreamFlags::NONE,
                     payload: repair_payload.clone(),
                 },
                 mux_limits,
@@ -124,7 +121,6 @@ fn response_repair_extra_budget_is_cumulative_not_per_event() {
                 Frame::StreamData {
                     stream_id,
                     offset: (startup_floor * 2) as u64,
-                    flags: StreamFlags::NONE,
                     payload: repair_payload,
                 },
                 mux_limits,
@@ -147,10 +143,7 @@ fn response_source_read_budget_is_separate_from_repair_cache_retention() {
     let mut send_stream =
         ReliableSendStream::new_with_initial_max_offset(stream_id, mux_limits, u64::MAX);
     send_stream
-        .send_data(
-            Bytes::from(vec![0x5a; mux_limits.max_repair_bytes]),
-            StreamFlags::NONE,
-        )
+        .send_data(Bytes::from(vec![0x5a; mux_limits.max_repair_bytes]))
         .expect("seed retained unacked OwnerData");
     assert_eq!(send_stream.repair_bytes(), mux_limits.max_repair_bytes);
 
@@ -159,7 +152,6 @@ fn response_source_read_budget_is_separate_from_repair_cache_retention() {
         reliable_relay_can_read_into_sender_queue(
             &send_stream,
             &sender_queue,
-            mux_limits,
             mux_limits.max_repair_bytes,
         ),
         "repair cache retention is unacked OwnerData memory, not already-queued source bytes"
@@ -168,7 +160,6 @@ fn response_source_read_budget_is_separate_from_repair_cache_retention() {
         reliable_relay_sender_queue_read_budget(
             &send_stream,
             &sender_queue,
-            mux_limits,
             mux_limits.max_repair_bytes,
             mux_limits.max_repair_bytes,
         ),
@@ -204,7 +195,6 @@ fn mixed_response_dispatch_payload_is_bounded_by_remaining_repair_capacity() {
             validation_commands,
             FlowLane::Throughput,
             StreamOpenRole::Validation,
-            4096,
         ),
         ResponseStreamAttachOutcome::Attached
     );
@@ -221,7 +211,7 @@ fn mixed_response_dispatch_payload_is_bounded_by_remaining_repair_capacity() {
     let mut send_stream =
         ReliableSendStream::new_with_initial_max_offset(stream_id, mux_limits, u64::MAX);
     send_stream
-        .send_data(Bytes::from(vec![0x5a; 3072]), StreamFlags::NONE)
+        .send_data(Bytes::from(vec![0x5a; 3072]))
         .expect("seed retained OwnerData");
 
     assert_eq!(
@@ -235,7 +225,7 @@ fn mixed_response_dispatch_payload_is_bounded_by_remaining_repair_capacity() {
         Some(1024),
     );
     send_stream
-        .send_data(Bytes::from(vec![0x5a; 1024]), StreamFlags::NONE)
+        .send_data(Bytes::from(vec![0x5a; 1024]))
         .expect("fill repair cache");
     assert_eq!(
         response_dispatch_payload_bytes(
@@ -281,7 +271,7 @@ fn coupled_response_dispatch_keeps_the_authoritative_send_stream_check() {
     let mut send_stream =
         ReliableSendStream::new_with_initial_max_offset(stream_id, mux_limits, u64::MAX);
     send_stream
-        .send_data(Bytes::from(vec![0x5a; 4096]), StreamFlags::NONE)
+        .send_data(Bytes::from(vec![0x5a; 4096]))
         .expect("fill repair cache");
 
     assert_eq!(
@@ -328,7 +318,6 @@ async fn formerly_mixed_response_retains_repair_preflight_after_family_detach() 
             udp_commands.clone(),
             FlowLane::Throughput,
             StreamOpenRole::Validation,
-            4096,
         ),
         ResponseStreamAttachOutcome::Attached
     );
@@ -350,7 +339,7 @@ async fn formerly_mixed_response_retains_repair_preflight_after_family_detach() 
     let mut send_stream =
         ReliableSendStream::new_with_initial_max_offset(stream_id, mux_limits, u64::MAX);
     send_stream
-        .send_data(Bytes::from(vec![0x5a; 3072]), StreamFlags::NONE)
+        .send_data(Bytes::from(vec![0x5a; 3072]))
         .expect("seed retained OwnerData");
     let mut sender = ServerResponseSenderService::new(SessionId(96), stream_id);
     sender.enqueue_data_for_lane(Bytes::from(vec![0x33; 4096]), FlowLane::Throughput);
@@ -405,7 +394,6 @@ async fn mixed_response_dispatch_waits_retryably_when_repair_cache_is_full() {
             validation_commands,
             FlowLane::Throughput,
             StreamOpenRole::Validation,
-            4096,
         ),
         ResponseStreamAttachOutcome::Attached
     );
@@ -422,7 +410,7 @@ async fn mixed_response_dispatch_waits_retryably_when_repair_cache_is_full() {
     let mut send_stream =
         ReliableSendStream::new_with_initial_max_offset(stream_id, mux_limits, u64::MAX);
     send_stream
-        .send_data(Bytes::from(vec![0x5a; 4096]), StreamFlags::NONE)
+        .send_data(Bytes::from(vec![0x5a; 4096]))
         .expect("fill repair cache");
     let blocked_offset = send_stream.next_offset();
     let mut sender = ServerResponseSenderService::new(SessionId(99), stream_id);
@@ -476,7 +464,6 @@ fn response_repair_extra_budget_accumulates_until_useful_attempt() {
                 Frame::StreamData {
                     stream_id,
                     offset: 0,
-                    flags: StreamFlags::NONE,
                     payload: Bytes::from(vec![0x44; startup_floor]),
                 },
                 mux_limits,
@@ -534,9 +521,7 @@ async fn response_owner_dispatch_does_not_earn_repair_budget_before_ack_progress
         },
     );
 
-    sender
-        .extra_traffic
-        .record_optional(ExtraTrafficKind::Repair, startup_floor);
+    sender.extra_traffic.record_repair(startup_floor);
     assert_eq!(sender.repair_extra_budget_remaining(mux_limits), 0);
 
     sender.enqueue_data_for_lane(
@@ -619,7 +604,6 @@ fn response_critical_repair_closes_tail_after_optional_budget_exhaustion() {
     let frame = Frame::StreamData {
         stream_id,
         offset: 0,
-        flags: StreamFlags::NONE,
         payload: Bytes::from(vec![0x44; startup_floor]),
     };
     assert!(
@@ -631,7 +615,6 @@ fn response_critical_repair_closes_tail_after_optional_budget_exhaustion() {
     let closure_frame = Frame::StreamData {
         stream_id,
         offset: startup_floor as u64,
-        flags: StreamFlags::NONE,
         payload: Bytes::from_static(b"tail"),
     };
     assert!(
@@ -659,7 +642,6 @@ fn response_critical_tail_repair_is_idempotent_while_range_is_queued() {
     let first = Frame::StreamData {
         stream_id,
         offset: 128,
-        flags: StreamFlags::NONE,
         payload: Bytes::from_static(&[0x44; 64]),
     };
     let duplicate = first.clone();
@@ -711,7 +693,6 @@ async fn normal_repair_cache_retention_does_not_create_authoritative_owner_debt(
             direction: PathMetricDirection::ServerToClient,
             metric_epoch: metric_epoch_now(),
             metric_age_us: 0,
-            min_rtt_us: 50_000,
             srtt_us: 50_000,
             rttvar_us: 1_000,
             jitter_us: 1_000,
@@ -741,7 +722,6 @@ async fn normal_repair_cache_retention_does_not_create_authoritative_owner_debt(
             alternate_commands,
             FlowLane::Throughput,
             StreamOpenRole::Validation,
-            payload_bytes,
         ),
         ResponseStreamAttachOutcome::Attached
     );
@@ -753,7 +733,6 @@ async fn normal_repair_cache_retention_does_not_create_authoritative_owner_debt(
             direction: PathMetricDirection::ServerToClient,
             metric_epoch: metric_epoch_now(),
             metric_age_us: 0,
-            min_rtt_us: 5_000,
             srtt_us: 5_000,
             rttvar_us: 500,
             jitter_us: 500,
@@ -791,7 +770,7 @@ async fn normal_repair_cache_retention_does_not_create_authoritative_owner_debt(
     while retained_unacked_bytes > 0 {
         let chunk = retained_unacked_bytes.min(payload_bytes);
         let _unacked = send_stream
-            .send_data(Bytes::from(vec![1_u8; chunk]), StreamFlags::NONE)
+            .send_data(Bytes::from(vec![1_u8; chunk]))
             .expect("seed normal retained unacked OwnerData above the synthetic tail guard");
         retained_unacked_bytes -= chunk;
     }
@@ -857,7 +836,6 @@ async fn response_owner_tail_guard_admits_measured_subflow_when_service_is_backp
             direction: PathMetricDirection::ServerToClient,
             metric_epoch: metric_epoch_now(),
             metric_age_us: 0,
-            min_rtt_us: 50_000,
             srtt_us: 50_000,
             rttvar_us: 1_000,
             jitter_us: 1_000,
@@ -887,7 +865,6 @@ async fn response_owner_tail_guard_admits_measured_subflow_when_service_is_backp
             alternate_commands,
             FlowLane::Throughput,
             StreamOpenRole::Validation,
-            payload_bytes,
         ),
         ResponseStreamAttachOutcome::Attached
     );
@@ -899,7 +876,6 @@ async fn response_owner_tail_guard_admits_measured_subflow_when_service_is_backp
             direction: PathMetricDirection::ServerToClient,
             metric_epoch: metric_epoch_now(),
             metric_age_us: 0,
-            min_rtt_us: 5_000,
             srtt_us: 5_000,
             rttvar_us: 500,
             jitter_us: 500,
@@ -937,7 +913,7 @@ async fn response_owner_tail_guard_admits_measured_subflow_when_service_is_backp
     while remaining_owner_debt > 0 {
         let chunk = remaining_owner_debt.min(payload_bytes);
         let _unacked = send_stream
-            .send_data(Bytes::from(vec![1_u8; chunk]), StreamFlags::NONE)
+            .send_data(Bytes::from(vec![1_u8; chunk]))
             .expect("seed unacked ordered-owner tail guard");
         remaining_owner_debt -= chunk;
     }
@@ -948,7 +924,6 @@ async fn response_owner_tail_guard_admits_measured_subflow_when_service_is_backp
             Frame::StreamData {
                 stream_id: StreamId(7),
                 offset: 0,
-                flags: StreamFlags::NONE,
                 payload: Bytes::from_static(b"queued"),
             },
             FlowLane::Throughput,

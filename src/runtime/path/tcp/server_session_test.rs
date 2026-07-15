@@ -10,13 +10,13 @@ use crate::config::{
 };
 use crate::outbound::{DnsConfig, OutboundConfig};
 use crate::protocol::{
-    Frame, PathCapabilities, PathId, ResetReason, SessionId, StreamDemandHint, StreamFlags,
-    StreamId, StreamOpenRole, TargetAddr, UnderlayProtocol,
+    Frame, PathId, ResetReason, SessionId, StreamDemandHint, StreamId, StreamOpenRole, TargetAddr,
+    UnderlayProtocol,
 };
 use crate::runtime::node::server::{ServerIdentityRuntime, new_identity_runtime};
 use crate::runtime::path::commands::{recv_reliable_path_command, reliable_path_command_channels};
 use crate::scheduler::FlowLane;
-use crate::transport::encrypted::{EncryptedFramedStream, PeerRole};
+use crate::transport::encrypted::{EncryptedFramedStream, EncryptedFramedTransportError, PeerRole};
 use bytes::Bytes;
 use std::net::SocketAddr;
 use std::time::Duration;
@@ -30,7 +30,6 @@ async fn server_tcp_path_input_frame_bypasses_queued_bulk_output() {
         Frame::StreamData {
             stream_id: StreamId(10),
             offset: 0,
-            flags: StreamFlags::NONE,
             payload: Bytes::from_static(b"bulk"),
         },
         FlowLane::Throughput,
@@ -50,6 +49,26 @@ async fn server_tcp_path_input_frame_bypasses_queued_bulk_output() {
         ServerTcpPathEvent::Frame(Frame::Ping { nonce }) => assert_eq!(nonce, 7),
         _ => panic!("expected inbound frame before queued bulk output"),
     }
+}
+
+#[tokio::test]
+async fn server_tcp_peer_eof_terminates_carrier_cleanly() {
+    let (_commands_tx, mut commands_rx) = reliable_path_command_channels(1);
+    let (frame_tx, mut path_frames) = mpsc::channel(1);
+    frame_tx
+        .send(Err(EncryptedFramedTransportError::Io(std::io::Error::new(
+            std::io::ErrorKind::UnexpectedEof,
+            "peer closed",
+        ))))
+        .await
+        .expect("queue peer close");
+
+    assert!(
+        recv_server_tcp_path_event(&mut path_frames, &mut commands_rx)
+            .await
+            .expect("normal peer close")
+            .is_none()
+    );
 }
 
 #[tokio::test]
@@ -136,7 +155,6 @@ async fn server_tcp_terminal_reset_precedes_detach_and_preserves_shared_session(
         context,
         session_id,
         path_id,
-        path_capabilities: PathCapabilities::default(),
         path_registration,
         writer: ServerTcpWriter::new(server_writer),
         path_frames,
@@ -160,7 +178,6 @@ async fn server_tcp_terminal_reset_precedes_detach_and_preserves_shared_session(
                     &open_commands,
                     session_id,
                     path_id,
-                    PathCapabilities::default(),
                     None,
                     stream_id,
                     target.clone(),

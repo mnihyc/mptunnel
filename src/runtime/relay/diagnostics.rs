@@ -18,14 +18,9 @@ fn frame_subject(frame: &Frame) -> String {
             session_id.0, path_id.0
         ),
         Frame::PathJoinOk { path_id, .. }
-        | Frame::PathChallenge { path_id, .. }
-        | Frame::PathResponse { path_id, .. }
         | Frame::PathDrain { path_id }
-        | Frame::PathMtuProbe { path_id, .. }
-        | Frame::PathMtuAck { path_id, .. }
         | Frame::PathProofData { path_id, .. }
-        | Frame::PathProofAck { path_id, .. }
-        | Frame::RxRateHint { path_id, .. } => format!("path_id={}", path_id.0),
+        | Frame::PathProofAck { path_id, .. } => format!("path_id={}", path_id.0),
         Frame::PathCapacityData {
             path_id,
             calibration_id,
@@ -108,7 +103,6 @@ fn frame_subject(frame: &Frame) -> String {
             format!("flow_id={} ranges={}", flow_id.0, received.len())
         }
         Frame::PathMetrics { metrics } => format!("path_id={}", metrics.path_id.0),
-        Frame::MaxConnectionData { max_bytes } => format!("max_bytes={max_bytes}"),
         Frame::Ping { nonce } | Frame::Pong { nonce } => format!("nonce={nonce}"),
     }
 }

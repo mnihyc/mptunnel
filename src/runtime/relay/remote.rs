@@ -15,7 +15,6 @@ use crate::model::capacity::{
     reliable_relay_buffer_len,
 };
 use crate::model::path::{RelayPathInstance, RelayPathKey, RelayPathPlacement};
-use crate::model::work::ReliableWorkClass;
 use crate::mux::MuxLimits;
 use crate::mux::stream::ReliableSendStream;
 use crate::protocol::{Frame, StreamId, StreamOpenRole, UnderlayProtocol};
@@ -377,17 +376,6 @@ impl ReliableRelayRemoteSet {
         !self.frames_rx.is_empty()
     }
 
-    pub(in crate::runtime) fn can_enqueue_work_lane_now(
-        &self,
-        work_lane: ReliableWorkClass,
-        relay_lane: FlowLane,
-    ) -> bool {
-        self.paths.iter().any(|path| {
-            relay_path_placement_may_wake_work_lane(path.placement, work_lane)
-                && path.stream.can_enqueue_work_lane_now(work_lane, relay_lane)
-        })
-    }
-
     pub(in crate::runtime) async fn close_all(&mut self) {
         if !self.paths.is_empty() {
             self.membership_generation = self.membership_generation.wrapping_add(1);
@@ -516,16 +504,6 @@ impl ReliableRelayRemoteSet {
     }
 }
 
-fn relay_path_placement_may_wake_work_lane(
-    placement: RelayPathPlacement,
-    work_lane: ReliableWorkClass,
-) -> bool {
-    match work_lane {
-        ReliableWorkClass::Data => placement != RelayPathPlacement::Repair,
-        ReliableWorkClass::Control | ReliableWorkClass::Repair => true,
-    }
-}
-
 #[derive(Debug, Clone, Copy)]
 pub(in crate::runtime) enum ReliableRelayAttachMode {
     Any,
@@ -579,7 +557,6 @@ async fn attach_relay_path_candidates(
             context,
             stream_id,
             request.spec.target.clone(),
-            request.spec.ingress,
             request.lane,
             key,
             request.role,

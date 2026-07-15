@@ -92,7 +92,6 @@ fn response_service_handoff_drain_fixture_with_other_service(
             target_commands.clone(),
             FlowLane::Throughput,
             StreamOpenRole::Validation,
-            payload_bytes,
         ),
         ResponseStreamAttachOutcome::Attached
     );
@@ -111,7 +110,6 @@ fn response_service_handoff_drain_fixture_with_other_service(
             direction: PathMetricDirection::ServerToClient,
             metric_epoch: metric_epoch_now(),
             metric_age_us: 0,
-            min_rtt_us: 10_000,
             srtt_us: 12_000,
             rttvar_us: 1_000,
             jitter_us: 1_000,
@@ -234,7 +232,6 @@ fn response_calibration_dispatch_fixture(
             candidate_commands.clone(),
             FlowLane::Throughput,
             StreamOpenRole::Validation,
-            payload_bytes,
         ),
         ResponseStreamAttachOutcome::Attached
     );
@@ -245,26 +242,20 @@ fn response_calibration_dispatch_fixture(
     binding.mark_output_bulk_proven_for_test(service);
     binding.mark_output_bulk_proven_for_test(candidate);
     assert_eq!(
-        binding
-            .commit_subflow_owner_admission(
-                service,
-                payload_bytes,
-                0,
-                Duration::ZERO,
-                SubflowAdmissionInput {
-                    key: candidate,
-                    bulk_rate_proven: true,
-                    startup_owner_allowed: false,
-                    frontier_clear: true,
-                    completion_improves: true,
-                    observed_goodput_non_degrading: true,
-                    read_gap: Duration::ZERO,
-                    owner_bytes: payload_bytes,
-                    optional_overhead_bytes: 0,
-                },
-            )
-            .decision,
-        PathAdmissionDecision::AdmitSubflow
+        binding.commit_subflow_owner_admission(
+            service,
+            payload_bytes,
+            SubflowAdmissionInput {
+                key: candidate,
+                bulk_rate_proven: true,
+                startup_owner_allowed: false,
+                frontier_clear: true,
+                completion_improves: true,
+                observed_goodput_non_degrading: true,
+                owner_bytes: payload_bytes,
+            },
+        ),
+        PathAdmission::Subflow
     );
     let stage_limit = reliable_ack_clock_calibration_limit_bytes(mux_limits);
     binding.install_tcp_ack_clock_calibration_for_test(
@@ -385,7 +376,6 @@ fn tcp_ack_clock_calibration_retirement_ignores_repair_only_carrier_debt() {
     let repair = Frame::StreamData {
         stream_id: fixture.stream.stream_id,
         offset: 0,
-        flags: StreamFlags::NONE,
         payload: Bytes::from_static(b"repair-only"),
     };
     fixture
@@ -436,7 +426,6 @@ fn tcp_ack_clock_calibration_retirement_refuses_exact_owner_flight() {
         &Frame::StreamData {
             stream_id: fixture.stream.stream_id,
             offset: 0,
-            flags: StreamFlags::NONE,
             payload: Bytes::from_static(b"stale-owner"),
         },
     );
@@ -495,7 +484,6 @@ fn tcp_ack_clock_calibration_retirement_rejects_stale_pending_snapshots() {
             Frame::StreamData {
                 stream_id: fixture.stream.stream_id,
                 offset: 0,
-                flags: StreamFlags::NONE,
                 payload: Bytes::from_static(b"candidate-pending"),
             },
             FlowLane::Throughput,
@@ -520,7 +508,6 @@ fn tcp_ack_clock_calibration_retirement_rejects_stale_pending_snapshots() {
             Frame::StreamData {
                 stream_id: fixture.stream.stream_id,
                 offset: payload_bytes as u64,
-                flags: StreamFlags::NONE,
                 payload: Bytes::from_static(b"service-pending"),
             },
             FlowLane::Throughput,
@@ -667,7 +654,6 @@ async fn tcp_response_calibration_dispatch_treats_pending_flight_as_one_debt() {
     let overlap = Frame::StreamData {
         stream_id: fixture.stream.stream_id,
         offset: normal_payload_bytes as u64,
-        flags: StreamFlags::NONE,
         payload: Bytes::from(vec![0x5a; committed as usize]),
     };
     fixture
@@ -732,7 +718,6 @@ async fn blocked_tcp_calibration_remainder_keeps_normal_service_chunk() {
             Frame::StreamData {
                 stream_id: fixture.stream.stream_id,
                 offset: 0,
-                flags: StreamFlags::NONE,
                 payload: Bytes::from_static(b"blocked"),
             },
             FlowLane::Throughput,
@@ -778,7 +763,6 @@ fn client_data_frame_for_test(stream_id: StreamId, offset: u64, payload_bytes: u
     Frame::StreamData {
         stream_id,
         offset,
-        flags: StreamFlags::NONE,
         payload: Bytes::from(vec![0x5a; payload_bytes]),
     }
 }
@@ -806,7 +790,7 @@ fn measured_cross_family_path_handoff_allows_diversification_or_two_x_gain() {
     )
     .expect("measured underloaded family should receive one whole flow");
     assert_eq!(selected.target().observation.key, udp.observation.key);
-    assert_eq!(selected.admission().role, PathRuntimeRole::Service);
+    assert_eq!(selected.admission(), PathAdmission::Service);
     assert_eq!(
         selected
             .service_handoff_selection()
@@ -848,7 +832,7 @@ fn measured_cross_family_path_handoff_allows_diversification_or_two_x_gain() {
         Instant::now(),
     )
     .expect("a balanced family may still move one flow for a two-fold projected gain");
-    assert_eq!(balanced_gain.admission().role, PathRuntimeRole::Service);
+    assert_eq!(balanced_gain.admission(), PathAdmission::Service);
 }
 
 #[test]
@@ -1004,7 +988,6 @@ async fn response_service_handoff_drain_holds_raw_offset_until_frontier_commit()
     let old_owner_frame = Frame::StreamData {
         stream_id: fixture.stream.stream_id,
         offset: 0,
-        flags: StreamFlags::NONE,
         payload: Bytes::from(vec![0x61; payload_bytes]),
     };
     fixture
@@ -1052,7 +1035,6 @@ async fn response_service_handoff_drain_holds_raw_offset_until_frontier_commit()
     let handoff_frame = Frame::StreamData {
         stream_id: fixture.stream.stream_id,
         offset: frontier,
-        flags: StreamFlags::NONE,
         payload: Bytes::from(vec![0x62; payload_bytes]),
     };
     let outcome = emit_planned_response_data_frame(
@@ -1507,7 +1489,6 @@ fn quic_ack_data_seen_path_does_not_own_unique_data_without_bulk_rate_proof() {
             validation_commands,
             FlowLane::Throughput,
             StreamOpenRole::Validation,
-            payload_bytes,
         ),
         ResponseStreamAttachOutcome::Attached
     );
@@ -1519,7 +1500,6 @@ fn quic_ack_data_seen_path_does_not_own_unique_data_without_bulk_rate_proof() {
             direction: PathMetricDirection::ServerToClient,
             metric_epoch: metric_epoch_now(),
             metric_age_us: 0,
-            min_rtt_us: 5_000,
             srtt_us: 5_000,
             rttvar_us: 500,
             jitter_us: 500,
@@ -1564,8 +1544,8 @@ fn quic_ack_data_seen_path_does_not_own_unique_data_without_bulk_rate_proof() {
         "ACK-data evidence cannot create Subflow OwnerData before the candidate has bulk-rate evidence"
     );
     assert_eq!(
-        plan.primary_role(),
-        PathRuntimeRole::Service,
+        plan.primary_admission(),
+        PathAdmission::Service,
         "ACK-data-only paths must not become Service owners"
     );
 }

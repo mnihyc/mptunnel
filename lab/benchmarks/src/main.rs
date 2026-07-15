@@ -17,7 +17,7 @@ struct Cli {
 enum Command {
     /// Run deterministic regression gates outside the release mptunnel binary.
     Gates(GatesArgs),
-    /// Run deterministic scheduler ablation comparisons.
+    /// Run deterministic path-profile ablation comparisons.
     Ablation(AblationArgs),
 }
 

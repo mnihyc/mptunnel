@@ -8,7 +8,7 @@ use crate::ingress::http_connect::{self, HttpConnectError, HttpStatus};
 use crate::ingress::socks5::{self, Socks5Error, Socks5Reply};
 use crate::model::path::RelayPathKey;
 use crate::mux::MuxLimits;
-use crate::protocol::{CloseReason, Frame, IngressKind, PathId, TargetAddr, UnderlayProtocol};
+use crate::protocol::{CloseReason, Frame, PathId, TargetAddr, UnderlayProtocol};
 use crate::runtime::datagram::UdpDatagramClientSession;
 use crate::runtime::error::RuntimeError;
 use crate::runtime::identity::random_u64;
@@ -215,13 +215,7 @@ where
     match request.command {
         socks5::Socks5Command::Connect => {
             let target = request.target;
-            let remote = match open_remote_stream(
-                &context,
-                target.clone(),
-                IngressKind::Socks5,
-                FlowLane::Latency,
-            )
-            .await
+            let remote = match open_remote_stream(&context, target.clone(), FlowLane::Latency).await
             {
                 Ok(remote) => remote,
                 Err(err) => {
@@ -246,10 +240,7 @@ where
                     stream,
                     &context,
                     performance,
-                    ReliableRelayOpenSpec {
-                        target,
-                        ingress: IngressKind::Socks5,
-                    },
+                    ReliableRelayOpenSpec { target },
                     remote,
                 )
                 .await
@@ -310,14 +301,7 @@ where
         return Err(RuntimeError::Protocol("HTTP proxy authentication failed"));
     }
     let target = request.target;
-    let remote = match open_remote_stream(
-        &context,
-        target.clone(),
-        IngressKind::HttpConnect,
-        FlowLane::Latency,
-    )
-    .await
-    {
+    let remote = match open_remote_stream(&context, target.clone(), FlowLane::Latency).await {
         Ok(remote) => remote,
         Err(err) => {
             stream
@@ -333,10 +317,7 @@ where
             stream,
             &context,
             performance,
-            ReliableRelayOpenSpec {
-                target,
-                ingress: IngressKind::HttpConnect,
-            },
+            ReliableRelayOpenSpec { target },
             remote,
         )
         .await
@@ -513,7 +494,6 @@ pub(super) async fn probe_tcp_client_path(
         let [session_hello, session_auth, path_join] =
             ClientPathAuthenticationFrames::for_new_session(
                 security,
-                path,
                 path_id,
                 UnderlayProtocol::Tcp,
             )?

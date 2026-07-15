@@ -1,7 +1,7 @@
 use super::*;
 
 #[test]
-fn automatic_bulk_use_honors_every_operator_capability() {
+fn automatic_bulk_use_honors_every_operator_policy() {
     let allowed = "tcp://127.0.0.1:10000"
         .parse::<PathSpec>()
         .expect("allowed path");
@@ -11,11 +11,6 @@ fn automatic_bulk_use_honors_every_operator_capability() {
     };
     assert!(path_allows_automatic_bulk_use(&allowed));
     assert!(path_can_be_auto_discovered(&allowed, active));
-    let low_latency = "udp://127.0.0.1:10001?low-latency=true"
-        .parse::<PathSpec>()
-        .expect("low-latency path");
-    assert!(path_allows_automatic_bulk_use(&low_latency));
-
     for query in [
         "expensive=true",
         "backup=true",

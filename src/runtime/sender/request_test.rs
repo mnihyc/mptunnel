@@ -2,7 +2,7 @@ use super::test_support::*;
 use super::*;
 use crate::config::ResourceLimits;
 use crate::model::work::ReliableWorkClass;
-use crate::protocol::{IngressKind, PathId, SessionId, TargetAddr};
+use crate::protocol::{PathId, SessionId, TargetAddr};
 use crate::runtime::path::commands::{
     ReliablePathCommand, recv_reliable_path_command, reliable_path_command_channels,
     try_recv_reliable_path_command, try_recv_reliable_path_priority_command,
@@ -36,7 +36,6 @@ fn budgeted_critical_repair_preempts_owner_data_and_debits_budget() {
                 Frame::StreamData {
                     stream_id,
                     offset: 0,
-                    flags: StreamFlags::NONE,
                     payload: Bytes::from(vec![0x7a; startup_floor]),
                 },
                 mux_limits,
@@ -46,7 +45,10 @@ fn budgeted_critical_repair_preempts_owner_data_and_debits_budget() {
         "startup repair floor should be spendable"
     );
 
-    assert_eq!(sender.queue.front_lane(), Some(ReliableWorkClass::Repair));
+    assert_eq!(
+        sender.queue.front().map(|(lane, _)| lane),
+        Some(ReliableWorkClass::Repair)
+    );
     assert_eq!(
         sender.repair_extra_budget_remaining(mux_limits),
         0,
@@ -170,10 +172,10 @@ async fn client_ack_gap_model_separates_owner_transport_from_repair_output() {
     let limits = MuxLimits::default();
     let mut send_stream = ReliableSendStream::new(stream_id, limits);
     let blocked = send_stream
-        .send_data(Bytes::from(vec![0x41; 4096]), StreamFlags::NONE)
+        .send_data(Bytes::from(vec![0x41; 4096]))
         .expect("blocked owner data");
     send_stream
-        .send_data(Bytes::from(vec![0x42; 4096]), StreamFlags::NONE)
+        .send_data(Bytes::from(vec![0x42; 4096]))
         .expect("later delivered data");
     let mut sender = RequestSenderService::new(stream_id);
     sender.record_owner_frame_for_test(
@@ -260,7 +262,6 @@ async fn client_ack_gap_model_separates_owner_transport_from_repair_output() {
             Frame::StreamData {
                 stream_id: StreamId(91),
                 offset: 0,
-                flags: StreamFlags::NONE,
                 payload: Bytes::from_static(b"busy"),
             },
             FlowLane::Throughput,
@@ -297,7 +298,6 @@ async fn client_ack_gap_model_separates_owner_transport_from_repair_output() {
             &context,
             &ReliableRelayOpenSpec {
                 target: TargetAddr::Ip(SocketAddr::from(([127, 0, 0, 1], 80))),
-                ingress: IngressKind::Socks5,
             },
             FlowLane::Throughput,
             FlowLane::Throughput,
@@ -336,7 +336,7 @@ async fn client_recv_progress_backpressure_is_retryable_not_stream_fatal() {
         ReliableRelayRemoteSet::new(opened_test_relay_stream(stream_id, 0, commands), 4);
     let mut recv_stream = ReliableRecvStream::new(stream_id, MuxLimits::default());
     recv_stream
-        .receive_data(0, Bytes::from_static(b"reply"), StreamFlags::NONE)
+        .receive_data(0, Bytes::from_static(b"reply"))
         .expect("receive response bytes");
     let mut progress = ReliableRecvProgress::default();
     let mut sender = RequestSenderService::new(stream_id);
@@ -411,7 +411,7 @@ async fn client_recv_progress_uses_available_control_queue_instead_of_full_low_e
     remotes.attach(opened_test_relay_stream(stream_id, 1, second_commands));
     let mut recv_stream = ReliableRecvStream::new(stream_id, MuxLimits::default());
     recv_stream
-        .receive_data(0, Bytes::from_static(b"reply"), StreamFlags::NONE)
+        .receive_data(0, Bytes::from_static(b"reply"))
         .expect("receive response bytes");
     let mut progress = ReliableRecvProgress::default();
     let mut sender = RequestSenderService::new(stream_id);
@@ -467,7 +467,7 @@ async fn client_recv_progress_prefers_active_service_path_over_validation_probe(
     ));
     let mut recv_stream = ReliableRecvStream::new(stream_id, MuxLimits::default());
     recv_stream
-        .receive_data(0, Bytes::from_static(b"reply"), StreamFlags::NONE)
+        .receive_data(0, Bytes::from_static(b"reply"))
         .expect("receive response bytes");
     let mut progress = ReliableRecvProgress::default();
     let mut sender = RequestSenderService::new(stream_id);
@@ -522,7 +522,7 @@ async fn client_stall_recv_progress_prefers_accepted_repair_path() {
     ));
     let mut recv_stream = ReliableRecvStream::new(stream_id, MuxLimits::default());
     recv_stream
-        .receive_data(0, Bytes::from_static(b"reply"), StreamFlags::NONE)
+        .receive_data(0, Bytes::from_static(b"reply"))
         .expect("receive response bytes");
     let mut progress = ReliableRecvProgress::default();
     let mut sender = RequestSenderService::new(stream_id);
@@ -610,7 +610,7 @@ async fn client_stall_recv_progress_falls_back_to_active_when_repair_is_full() {
     ));
     let mut recv_stream = ReliableRecvStream::new(stream_id, MuxLimits::default());
     recv_stream
-        .receive_data(0, Bytes::from_static(b"reply"), StreamFlags::NONE)
+        .receive_data(0, Bytes::from_static(b"reply"))
         .expect("receive response bytes");
     let mut progress = ReliableRecvProgress::default();
     let mut sender = RequestSenderService::new(stream_id);
@@ -675,7 +675,7 @@ async fn client_stall_recv_progress_never_uses_validation_path() {
     ));
     let mut recv_stream = ReliableRecvStream::new(stream_id, MuxLimits::default());
     recv_stream
-        .receive_data(0, Bytes::from_static(b"reply"), StreamFlags::NONE)
+        .receive_data(0, Bytes::from_static(b"reply"))
         .expect("receive response bytes");
     let mut progress = ReliableRecvProgress::default();
     let mut sender = RequestSenderService::new(stream_id);
@@ -850,7 +850,6 @@ fn client_repair_extra_budget_is_cumulative_not_per_event() {
         Frame::StreamData {
             stream_id,
             offset: 0,
-            flags: StreamFlags::NONE,
             payload: repair_payload.clone(),
         },
         RelaySendCause::AckGapRepair,
@@ -862,7 +861,6 @@ fn client_repair_extra_budget_is_cumulative_not_per_event() {
         Frame::StreamData {
             stream_id,
             offset: startup_floor as u64,
-            flags: StreamFlags::NONE,
             payload: repair_payload.clone(),
         },
         RelaySendCause::AckGapRepair,
@@ -876,7 +874,6 @@ fn client_repair_extra_budget_is_cumulative_not_per_event() {
         Frame::StreamData {
             stream_id,
             offset: (startup_floor * 2) as u64,
-            flags: StreamFlags::NONE,
             payload: repair_payload,
         },
         RelaySendCause::PathFailureRepair,
@@ -900,7 +897,6 @@ fn client_critical_repair_closes_tail_after_optional_budget_exhaustion() {
     let frame = Frame::StreamData {
         stream_id,
         offset: 0,
-        flags: StreamFlags::NONE,
         payload: Bytes::from(vec![0x33; startup_floor]),
     };
     assert!(sender.enqueue_repair_frame_with_priority(
@@ -914,7 +910,6 @@ fn client_critical_repair_closes_tail_after_optional_budget_exhaustion() {
     let closure_frame = Frame::StreamData {
         stream_id,
         offset: startup_floor as u64,
-        flags: StreamFlags::NONE,
         payload: Bytes::from_static(b"tail"),
     };
     assert!(!sender.enqueue_repair_frame_with_priority(
@@ -931,38 +926,4 @@ fn client_critical_repair_closes_tail_after_optional_budget_exhaustion() {
         RelaySendCause::AckGapRepair,
     );
     assert_eq!(sender.extra_traffic_budget_remaining(mux_limits), 0);
-}
-
-#[test]
-fn client_critical_tail_repair_is_idempotent_while_range_is_queued() {
-    let mux_limits = MuxLimits::default();
-    let stream_id = StreamId(97);
-    let mut sender = RequestSenderService::new_with_performance(
-        stream_id,
-        MppPerformanceConfig {
-            extra_traffic_hint_percent: 1,
-        },
-    );
-    let mut sender_queue = ReliableRelaySenderQueue::default();
-    let first = Frame::StreamData {
-        stream_id,
-        offset: 128,
-        flags: StreamFlags::NONE,
-        payload: Bytes::from_static(&[0x55; 64]),
-    };
-    let duplicate = first.clone();
-
-    assert!(sender.enqueue_critical_tail_repair_frame(&mut sender_queue, first));
-    let bytes_after_first = sender_queue.bytes();
-    let budget_after_first = sender.extra_traffic_budget_remaining(mux_limits);
-
-    assert!(
-        !sender.enqueue_critical_tail_repair_frame(&mut sender_queue, duplicate),
-        "client final-tail RepairData must not stack duplicate pending ranges"
-    );
-    assert_eq!(sender_queue.bytes(), bytes_after_first);
-    assert_eq!(
-        sender.extra_traffic_budget_remaining(mux_limits),
-        budget_after_first
-    );
 }

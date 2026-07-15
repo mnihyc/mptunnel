@@ -4,7 +4,7 @@ use crate::model::capacity::{
 };
 use crate::model::timing::transport_pto_from_snapshot;
 use crate::mux::MuxLimits;
-use crate::scheduler::{FlowDemand, FlowLane, PathSnapshot};
+use crate::scheduler::{FlowLane, PathSnapshot};
 use std::time::{Duration, Instant};
 
 #[derive(Debug, Clone, Copy)]
@@ -86,9 +86,6 @@ impl ReliableRelayFlowDemandTracker {
         let rebalance_interval = reliable_flow_rebalance_interval(path);
         self.last_rebalance_interval = rebalance_interval;
         let threshold = reliable_flow_bulk_threshold_bytes(path, mux_limits);
-        let demand =
-            FlowDemand::reliable_stream(observed_bytes, signals.repair_bytes as u64, threshold);
-        let mut demand = demand;
         let flow_age = now.duration_since(self.started_at);
         let idle_gap = delta_bytes == 0 && elapsed >= reliable_flow_interactive_idle_gap(path);
         let rate_threshold = reliable_flow_bulk_rate_threshold_bps(path, mux_limits);
@@ -102,30 +99,21 @@ impl ReliableRelayFlowDemandTracker {
             && (rate_proven_bulk || flow_age >= reliable_flow_bulk_sustained_age(path));
         let rate_proven_sustained_bulk = rate_proven_bulk && observed_bytes >= rate_evidence_bytes;
         let sustained_bulk = byte_proven_bulk || rate_proven_sustained_bulk;
-        if (self.current == FlowLane::Throughput && !idle_gap) || sustained_bulk {
-            demand.lane = FlowLane::Throughput;
-            demand.throughput_weight_ppm = demand
-                .throughput_weight_ppm
-                .max(FlowDemand::PPM_MAX / 2 + 1);
-            demand.latency_weight_ppm =
-                FlowDemand::PPM_MAX.saturating_sub(demand.throughput_weight_ppm);
+        let lane = if (self.current == FlowLane::Throughput && !idle_gap) || sustained_bulk {
+            FlowLane::Throughput
         } else {
-            demand.lane = FlowLane::Latency;
-            demand.throughput_weight_ppm =
-                demand.throughput_weight_ppm.min(FlowDemand::PPM_MAX / 2);
-            demand.latency_weight_ppm =
-                FlowDemand::PPM_MAX.saturating_sub(demand.throughput_weight_ppm);
             if idle_gap {
                 self.next_rebalance_at = now;
             }
-        }
-        self.current = demand.lane;
+            FlowLane::Latency
+        };
+        self.current = lane;
         let promoted_to_throughput =
             previous != FlowLane::Throughput && self.current == FlowLane::Throughput;
         let rebalance_due = self.current == FlowLane::Throughput
             && (promoted_to_throughput || now >= self.next_rebalance_at);
         ReliableRelayFlowDecision {
-            demand,
+            lane,
             previous_lane: previous,
             promoted_to_throughput,
             rebalance_due,
@@ -182,7 +170,7 @@ fn reliable_flow_rebalance_interval(path: Option<PathSnapshot>) -> Duration {
 
 #[derive(Debug, Clone, Copy)]
 pub(in crate::runtime) struct ReliableRelayFlowDecision {
-    pub(in crate::runtime) demand: FlowDemand,
+    pub(in crate::runtime) lane: FlowLane,
     pub(in crate::runtime) previous_lane: FlowLane,
     #[cfg_attr(not(any(test, feature = "lab-diagnostics")), allow(dead_code))]
     pub(in crate::runtime) promoted_to_throughput: bool,

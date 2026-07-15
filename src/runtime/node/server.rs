@@ -36,7 +36,7 @@ pub(in crate::runtime) async fn run(
     management: ManagementConfig,
 ) -> Result<(), RuntimeError> {
     let runtime = new_identity_runtime(
-        path_specs.clone(),
+        path_specs,
         outbound,
         outbound_dns,
         outbound_connect_timeout,
@@ -44,7 +44,7 @@ pub(in crate::runtime) async fn run(
         performance,
         resources,
     );
-    let bound = bind_paths(path_specs, &runtime.paths).await?;
+    let bound = bind_paths(&runtime.paths).await?;
     let ServerIdentityRuntime {
         paths,
         reliable_relay,
@@ -141,18 +141,17 @@ pub(super) fn new_identity_runtime_with_metadata(
 }
 
 pub(super) async fn bind_paths(
-    bind_paths: Vec<PathSpec>,
     context: &ServerPathContext,
 ) -> Result<Vec<BoundServerPath>, RuntimeError> {
-    let mut bound = Vec::with_capacity(bind_paths.len());
-    for path in bind_paths {
+    let mut bound = Vec::with_capacity(context.server_paths.len());
+    for path in context.server_paths.iter() {
         match path.underlay {
             UnderlayProtocol::Tcp => {
-                let listener = tcp::bind_listener(&path).await?;
+                let listener = tcp::bind_listener(path).await?;
                 bound.push(BoundServerPath::Tcp(listener));
             }
             UnderlayProtocol::Udp => {
-                let endpoint = bind_server_udp_endpoint(&path, context).await?;
+                let endpoint = bind_server_udp_endpoint(path, context).await?;
                 bound.push(BoundServerPath::Udp(endpoint));
             }
         }

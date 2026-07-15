@@ -29,6 +29,12 @@ scheduler comparing immutable evidence from two independent carrier families.
 Cross-family placement must preserve the same product offset and ordering
 contract as same-family multipath placement.
 
+Reliable-path admission has exactly four outcomes: `Service`, `Subflow`,
+`ProbeOnly`, and `Standby`. One enum makes contradictory role/work combinations
+unrepresentable. Repair is separately selected `RepairData` work against an
+existing product range; it is not a fifth path role and never grants ownership
+of a new offset.
+
 ## Code owners
 
 A source module exists only when it owns a durable capability, state machine,
@@ -103,6 +109,11 @@ wrappers that merely pass the same state between them.
 - `src/model/` and `src/scheduler/`: own carrier-neutral evidence vocabulary,
   bounded product models, admission, and pure ranking. They do not import live
   relay, stream, or carrier handles.
+- `src/simulator/`: owns deterministic virtual queues, DRR, tail mode,
+  close-ETA duplication, and shared-bottleneck experiments. It reuses pure
+  production path scoring but none of its queue state is deployed. Runtime
+  senders own real per-flow queues, carrier admission, ownership ledgers, and
+  TCP/QUIC recovery; only end-to-end labs prove those behaviors.
 - `src/transport/`: owns framing/encryption and thin TCP, UDP, and Quinn
   adapters. Native telemetry is optional capability evidence, not product
   ownership authority. TCP bounds resolution and staggered dual-stack address
@@ -124,11 +135,37 @@ connection. Stream attachment role and carrier instance lifetime are separate:
 closing the last product stream must not silently reset a live carrier's
 session-wide probe budget.
 
+The client path context owns one immutable path list and one immutable security
+list. TCP and QUIC session actors carry a stable index into those shared
+allocations rather than cloning endpoint strings and secrets per carrier. The
+index is configuration identity only; live health, queues, proof, and product
+ownership remain in their typed runtime owners.
+
+`FlowSubflowSet` owns only Service identity, measured membership, and the one
+unproven startup owner with its frozen cumulative credit. Queue pressure,
+carrier/product flight, and ordering debt are live observations, not copied
+epoch fields. Request startup proof, ACK progress, and rate state are one
+exact-instance evidence record so detach and replacement cannot partially clean
+parallel maps. On the response side, raw product queue bytes belong to the
+stream once and are projected identically into each carrier snapshot; attachment
+does not create a second queue ledger.
+
+A configured QUIC datagram payload ceiling is a product allocation bound only.
+Quinn owns transport PMTU discovery and packetization; the product layer does
+not infer measured MTU or create probe/ack frame state.
+
 Request `STREAM_ACK` advances one ordered product transaction: release unique
 mux bytes, release every exact transmitted copy, and derive exact OwnerData
 evidence. It returns a carrier-neutral source-window effect. The relay owns
 applying that effect and scheduling repair, so it never reconstructs path-owner
 eligibility from partially updated sender state.
+
+The version 1 wire model carries only peer-owned facts. Stream opens contain a
+target, initial demand class, and attachment role; datagram opens contain a
+target. Client ingress identity, server outbound choice, and configured path
+policy remain endpoint-local. `STREAM_FIN` is the sole EOF transition,
+and `PATH_STATUS` carries status only. This avoids parallel wire and runtime
+authorities for state that the peer never consumes.
 
 QUIC capacity proof is a transaction:
 

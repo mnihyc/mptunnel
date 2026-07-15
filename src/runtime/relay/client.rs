@@ -6,10 +6,8 @@
 
 use super::io::{
     ReliableAckGapRepairProgress, ReliableRecvProgress,
-    reliable_critical_tail_repair_is_over_budget, reliable_critical_tail_repair_limit_bytes,
     reliable_persistent_ack_gap_repair_limit_bytes, stream_ack_gap_repair_frames_normalized,
-    stream_final_offset_tail_repair_frames, update_repair_authoritative_ack_snapshot,
-    write_delivered_payloads,
+    update_repair_authoritative_ack_snapshot, write_delivered_payloads,
 };
 use super::lifecycle::{RelayValidationOpenTask, maybe_mark_live_relay_path_delivery};
 use super::remote::ReliableRelayRemoteSet;
@@ -18,8 +16,8 @@ use crate::lab_diagnostics::{lab_diagnostic, lab_perf_record};
 use crate::model::capacity::adaptive_reliable_relay_repair_bytes;
 use crate::model::path::RelayPathKey;
 use crate::mux::stream::{ReliableRecvStream, ReliableSendStream};
-use crate::protocol::frame::normalized_offset_ranges;
-use crate::protocol::{OffsetRange, StreamFlags, StreamId};
+use crate::protocol::frame::normalize_offset_ranges;
+use crate::protocol::{OffsetRange, StreamId};
 use crate::runtime::error::RuntimeError;
 use crate::runtime::path::{ClientPathContext, PathDeliveryStats};
 use crate::runtime::sender::{RelaySendCause, ReliableRelaySenderQueue, RequestSenderService};
@@ -232,7 +230,6 @@ pub(super) async fn apply_client_stream_data<S>(
     stream_id: StreamId,
     path_key: RelayPathKey,
     offset: u64,
-    flags: StreamFlags,
     payload: Bytes,
 ) -> Result<ClientStreamDataEffect, RuntimeError>
 where
@@ -245,7 +242,7 @@ where
     #[cfg(feature = "lab-diagnostics")]
     let mux_started = Instant::now();
     let outcome = recv_stream
-        .receive_data(offset, payload, flags)
+        .receive_data(offset, payload)
         .map_err(RuntimeError::Stream)?;
     #[cfg(feature = "lab-diagnostics")]
     {
@@ -315,11 +312,10 @@ where
     Ok(ClientStreamDataEffect {
         delivered_payload_bytes,
         delivered_progress,
-        fin_ready: outcome.fin
-            || super::io::pending_stream_fin_ready(
-                recv_stream,
-                state.endpoint.pending_remote_fin_offset,
-            ),
+        fin_ready: super::io::pending_stream_fin_ready(
+            recv_stream,
+            state.endpoint.pending_remote_fin_offset,
+        ),
     })
 }
 
@@ -341,7 +337,7 @@ pub(super) fn apply_client_stream_ack(
     ack_context: ClientStreamAckContext<'_>,
     stream_id: StreamId,
     complete: bool,
-    ranges: &[OffsetRange],
+    ranges: Vec<OffsetRange>,
 ) {
     #[cfg(not(feature = "lab-diagnostics"))]
     let _ = stream_id;
@@ -356,7 +352,7 @@ pub(super) fn apply_client_stream_ack(
         path_snapshot,
         relay_lane,
     } = ack_context;
-    let normalized_ranges = normalized_offset_ranges(ranges);
+    let normalized_ranges = normalize_offset_ranges(ranges);
     update_repair_authoritative_ack_snapshot(
         &mut state.progress.last_send_ack_frontier,
         &mut state.progress.last_send_ack_ranges,
@@ -412,7 +408,7 @@ pub(super) fn apply_client_stream_ack(
     } else {
         RelaySendCause::AckGapRepair
     };
-    let mut repair_frames = stream_ack_gap_repair_frames_normalized(
+    let repair_frames = stream_ack_gap_repair_frames_normalized(
         send_stream,
         &normalized_ranges,
         repair_limit,
@@ -420,38 +416,7 @@ pub(super) fn apply_client_stream_ack(
         has_multipath_repair_alternative,
         ack_gap_repair_ready,
     );
-    let mut critical_tail_repair = ack_gap_repair_ready && !repair_frames.is_empty();
-    let repair_kind = if repair_frames.is_empty() {
-        let fin_tail_limit = if !state.endpoint.local_open {
-            let limit = reliable_critical_tail_repair_limit_bytes(
-                base_repair_limit,
-                send_stream.repair_bytes(),
-                context.mux_limits,
-            );
-            critical_tail_repair =
-                reliable_critical_tail_repair_is_over_budget(repair_event_budget, limit);
-            limit
-        } else {
-            repair_limit
-        };
-        let fin_tail_frames = stream_final_offset_tail_repair_frames(
-            send_stream,
-            ranges,
-            fin_tail_limit,
-            !state.endpoint.local_open,
-            false,
-        );
-        if fin_tail_frames.is_empty() {
-            "ack_gap"
-        } else {
-            repair_frames = fin_tail_frames;
-            "fin_tail"
-        }
-    } else {
-        "ack_gap"
-    };
-    #[cfg(not(feature = "lab-diagnostics"))]
-    let _ = repair_kind;
+    let persistent_ack_gap_repair = ack_gap_repair_ready && !repair_frames.is_empty();
     #[cfg(feature = "lab-diagnostics")]
     lab_diagnostic(
         "stream_ack_received",
@@ -459,13 +424,17 @@ pub(super) fn apply_client_stream_ack(
             "stream_id={} complete={} ranges={} largest_end={} released_bytes={} repair_bytes_before={} repair_bytes_after={} repair_frames={} repair_kind={} active_underlay={:?} multipath_repair_alternative={} ack_gap_repair_ready={}",
             stream_id.0,
             complete,
-            ranges.len(),
-            ranges.iter().map(|range| range.end).max().unwrap_or(0),
+            normalized_ranges.len(),
+            normalized_ranges
+                .iter()
+                .map(|range| range.end)
+                .max()
+                .unwrap_or(0),
             ack.released_bytes,
             previous_repair_bytes,
             ack.remaining_repair_bytes,
             repair_frames.len(),
-            repair_kind,
+            "ack_gap",
             remotes.active_path_underlay(),
             has_multipath_repair_alternative,
             ack_gap_repair_ready,
@@ -475,13 +444,9 @@ pub(super) fn apply_client_stream_ack(
     for frame in repair_frames {
         let queued = if sender_queue.has_queued_repair_overlap(&frame) {
             false
-        } else if critical_tail_repair {
-            if repair_kind == "fin_tail" {
-                sender.enqueue_critical_tail_repair_frame(sender_queue, frame)
-            } else {
-                sender.enqueue_critical_repair_frame(sender_queue, frame, ack_gap_repair_cause);
-                true
-            }
+        } else if persistent_ack_gap_repair {
+            sender.enqueue_critical_repair_frame(sender_queue, frame, ack_gap_repair_cause);
+            true
         } else {
             sender.enqueue_repair_frame_with_priority(
                 sender_queue,
@@ -496,11 +461,11 @@ pub(super) fn apply_client_stream_ack(
             "repair",
             format_args!(
                 "stream_id={} cause={} queued={}",
-                stream_id.0, repair_kind, queued,
+                stream_id.0, "ack_gap", queued,
             ),
         );
         if queued {
-            queued_persistent_ack_gap_repair |= ack_gap_repair_ready && repair_kind == "ack_gap";
+            queued_persistent_ack_gap_repair |= ack_gap_repair_ready;
             state.progress.sender_retry_at = None;
         }
     }

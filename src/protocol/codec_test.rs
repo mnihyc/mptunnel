@@ -14,18 +14,12 @@ fn stream_frames_round_trip() {
             host: "example.com".to_string(),
             port: 443,
         },
-        ingress: IngressKind::Socks5,
-        outbound: OutboundPolicy::Direct,
-        demand: StreamDemandHint::throughput(),
+        demand: StreamDemandHint::Throughput,
         role: StreamOpenRole::Active,
     });
     round_trip(Frame::StreamData {
         stream_id: StreamId(7),
         offset: 1024,
-        flags: StreamFlags {
-            fin: true,
-            early_data: false,
-        },
         payload: Bytes::from_static(b"hello"),
     });
     round_trip(Frame::StreamAck {
@@ -50,7 +44,6 @@ fn owned_decode_slices_payloads_without_copying() {
     let data = Frame::StreamData {
         stream_id: StreamId(7),
         offset: 1024,
-        flags: StreamFlags::NONE,
         payload: Bytes::from_static(b"zero-copy-payload"),
     };
     let encoded = Bytes::from(encode_frame(&data, CodecLimits::default()).expect("encode"));
@@ -74,7 +67,6 @@ fn owned_single_frame_decode_slices_payload_without_copying() {
     let data = Frame::StreamData {
         stream_id: StreamId(7),
         offset: 1024,
-        flags: StreamFlags::NONE,
         payload: Bytes::from_static(b"quic-zero-copy-payload"),
     };
     let encoded = Bytes::from(encode_frame(&data, CodecLimits::default()).expect("encode"));
@@ -98,10 +90,6 @@ fn datagram_flow_uses_compact_flow_id_after_open() {
     round_trip(Frame::OpenDatagramFlow {
         flow_id: DatagramFlowId(9),
         target: TargetAddr::Ip("192.0.2.10:53".parse().expect("addr")),
-        ingress: IngressKind::TunUdp,
-        outbound: OutboundPolicy::Socks5 {
-            proxy: "127.0.0.1:1080".parse().expect("proxy"),
-        },
     });
     let data = Frame::DatagramData {
         flow_id: DatagramFlowId(9),
@@ -121,14 +109,6 @@ fn datagram_flow_uses_compact_flow_id_after_open() {
 fn control_frames_round_trip_auth_and_path_metrics() {
     let nonce = AuthNonce([7; 16]);
     let auth_tag = AuthTag([9; 32]);
-    let caps = PathCapabilities {
-        backup: true,
-        expensive: true,
-        low_latency: true,
-        bulk_allowed: false,
-        probe_only: true,
-        no_udp: true,
-    };
 
     round_trip(Frame::SessionAuth {
         session_id: SessionId(42),
@@ -142,7 +122,6 @@ fn control_frames_round_trip_auth_and_path_metrics() {
         underlay: UnderlayProtocol::Udp,
         nonce,
         issued_at_unix_secs: 1_735_689_600,
-        capabilities: caps,
         auth_tag,
     });
     round_trip(Frame::PathJoinOk {
@@ -153,22 +132,11 @@ fn control_frames_round_trip_auth_and_path_metrics() {
     round_trip(Frame::PathStatus {
         path_id: PathId(3),
         status: PathStatus::Suspect,
-        capabilities: caps,
     });
     round_trip(Frame::PathDrain { path_id: PathId(3) });
     round_trip(Frame::PathClose {
         path_id: PathId(3),
         reason: CloseReason::ProtocolError,
-    });
-    round_trip(Frame::PathMtuProbe {
-        path_id: PathId(3),
-        probe_id: 99,
-        payload: Bytes::from_static(b"mtu-probe"),
-    });
-    round_trip(Frame::PathMtuAck {
-        path_id: PathId(3),
-        probe_id: 99,
-        payload_bytes: 9,
     });
     round_trip(Frame::PathProofData {
         path_id: PathId(3),
@@ -194,7 +162,6 @@ fn control_frames_round_trip_auth_and_path_metrics() {
             direction: PathMetricDirection::ServerToClient,
             metric_epoch: 1_735_689_600,
             metric_age_us: 5_000,
-            min_rtt_us: 18_000,
             srtt_us: 25_000,
             rttvar_us: 3_000,
             jitter_us: 1_200,
@@ -214,18 +181,6 @@ fn control_frames_round_trip_auth_and_path_metrics() {
             data_sample_count: 9,
             data_sample_bytes: 512 * 1024,
         },
-    });
-    round_trip(Frame::RxRateHint {
-        path_id: PathId(3),
-        hint: RateHint::Unknown,
-    });
-    round_trip(Frame::RxRateHint {
-        path_id: PathId(3),
-        hint: RateHint::Unlimited,
-    });
-    round_trip(Frame::RxRateHint {
-        path_id: PathId(3),
-        hint: RateHint::BitsPerSecond(300_000_000),
     });
 }
 
@@ -258,7 +213,6 @@ fn codec_rejects_oversize_payloads_and_ack_ranges() {
     let oversized = Frame::StreamData {
         stream_id: StreamId(1),
         offset: 0,
-        flags: StreamFlags::NONE,
         payload: Bytes::from_static(b"hello"),
     };
     assert!(matches!(
@@ -290,27 +244,6 @@ fn codec_rejects_oversize_payloads_and_ack_ranges() {
         encode_frame(&too_many_datagram_ranges, limits),
         Err(CodecError::TooManyAckRanges { .. })
     ));
-}
-
-#[test]
-fn decoder_rejects_unknown_path_capability_bits() {
-    let frame = Frame::PathJoin {
-        session_id: SessionId(1),
-        path_id: PathId(1),
-        underlay: UnderlayProtocol::Tcp,
-        nonce: AuthNonce([0; 16]),
-        issued_at_unix_secs: 1_735_689_600,
-        capabilities: PathCapabilities::default(),
-        auth_tag: AuthTag([0; 32]),
-    };
-    let mut encoded = encode_frame(&frame, CodecLimits::default()).expect("encode");
-    let capability_offset = FRAME_HEADER_LEN + 8 + 2 + 1 + 16 + 8;
-    encoded[capability_offset] = 0x80;
-
-    assert_eq!(
-        decode_frame_bytes(Bytes::from(encoded), CodecLimits::default()),
-        Err(CodecError::InvalidEnum)
-    );
 }
 
 #[test]

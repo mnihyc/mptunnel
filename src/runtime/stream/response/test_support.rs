@@ -9,8 +9,7 @@ use crate::model::capacity::{
 use crate::model::path::CarrierPathKey;
 use crate::mux::MuxLimits;
 use crate::protocol::{
-    Frame, PathId, PathMetricDirection, PathMetrics, SessionId, StreamFlags, StreamId,
-    UnderlayProtocol,
+    Frame, PathId, PathMetricDirection, PathMetrics, SessionId, StreamId, UnderlayProtocol,
 };
 use crate::runtime::path::commands::reliable_path_command_channels;
 use crate::scheduler::FlowLane;
@@ -44,7 +43,6 @@ pub(super) fn stream_data_frame_at(offset: u64, payload_len: usize) -> Frame {
     Frame::StreamData {
         stream_id: StreamId(7),
         offset,
-        flags: StreamFlags::NONE,
         payload: Bytes::from(vec![0x5a; payload_len]),
     }
 }
@@ -104,7 +102,6 @@ pub(super) fn mark_test_quic_output_carrier_bulk_proven(
             direction: PathMetricDirection::ServerToClient,
             metric_epoch: 1,
             metric_age_us: 0,
-            min_rtt_us: 10_000,
             srtt_us: 12_000,
             rttvar_us: 1_000,
             jitter_us: 1_000,

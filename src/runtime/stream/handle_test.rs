@@ -6,9 +6,7 @@ use crate::model::capacity::{
 use crate::model::path::CarrierPathKey;
 use crate::mux::MuxLimits;
 use crate::protocol::frame::reliable_stream_frame_accounted_bytes;
-use crate::protocol::{
-    Frame, OffsetRange, PathId, SessionId, StreamFlags, StreamId, UnderlayProtocol,
-};
+use crate::protocol::{Frame, OffsetRange, PathId, SessionId, StreamId, UnderlayProtocol};
 use crate::runtime::path::commands::{
     ReliablePathCommand, reliable_path_command_channels, try_recv_reliable_path_command,
     try_recv_reliable_path_priority_command,
@@ -46,7 +44,6 @@ fn stream_data_frame_at(offset: u64, payload_len: usize) -> Frame {
     Frame::StreamData {
         stream_id: StreamId(7),
         offset,
-        flags: StreamFlags::NONE,
         payload: Bytes::from(vec![0x5a; payload_len]),
     }
 }

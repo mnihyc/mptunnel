@@ -14,7 +14,7 @@ use crate::model::capacity::{
     valid_quic_capacity_proof_geometry,
 };
 use crate::model::timing::quic_bulk_proof_freshness_horizon;
-use crate::protocol::UnderlayProtocol;
+use crate::protocol::PathMetricDirection;
 use crate::runtime::path::model::default_path_rate_bps;
 use crate::transport::quic as quic_transport;
 use std::time::{Duration, Instant};
@@ -50,7 +50,7 @@ impl UdpPathMetricTracker {
         &mut self,
         stats: quinn::ConnectionStats,
         congestion: quic_transport::CongestionMetrics,
-        direction: u8,
+        direction: PathMetricDirection,
     ) -> UdpPathMetrics {
         self.quic.observe(stats, congestion, direction)
     }
@@ -60,7 +60,7 @@ impl UdpPathMetricTracker {
         &mut self,
         stats: quinn::ConnectionStats,
         congestion: quic_transport::CongestionMetrics,
-        direction: u8,
+        direction: PathMetricDirection,
         now: Instant,
     ) -> UdpPathMetrics {
         self.quic.observe_at(stats, congestion, direction, now)
@@ -84,18 +84,17 @@ struct QuicPathMetricTracker {
     // not observation, so a transient publication race may retry the same token.
     last_accepted_capacity_probe_token: Option<u64>,
     pending_capacity_proof_candidate: Option<QuicCapacityProofCandidate>,
-    min_rtt: Option<Duration>,
 }
 
 impl UdpPathConnection {
-    pub(super) async fn tx_metrics(
+    pub(super) fn tx_metrics(
         &self,
         tracker: &mut UdpPathMetricTracker,
-        direction: u8,
-    ) -> Option<UdpPathMetrics> {
+        direction: PathMetricDirection,
+    ) -> UdpPathMetrics {
         let stats = self.connection.stats();
         let congestion = self.connection.congestion_metrics();
-        Some(tracker.quic.observe(stats, congestion, direction))
+        tracker.quic.observe(stats, congestion, direction)
     }
 }
 
@@ -244,7 +243,7 @@ impl QuicPathMetricTracker {
         &mut self,
         stats: quinn::ConnectionStats,
         congestion: quic_transport::CongestionMetrics,
-        direction: u8,
+        direction: PathMetricDirection,
     ) -> UdpPathMetrics {
         self.observe_at(stats, congestion, direction, Instant::now())
     }
@@ -253,7 +252,7 @@ impl QuicPathMetricTracker {
         &mut self,
         stats: quinn::ConnectionStats,
         congestion: quic_transport::CongestionMetrics,
-        direction: u8,
+        direction: PathMetricDirection,
         now: Instant,
     ) -> UdpPathMetrics {
         let delivery_evidence_delta = congestion
@@ -264,15 +263,8 @@ impl QuicPathMetricTracker {
             .delivery_evidence_pending_ack_bytes
             .saturating_add(delivery_evidence_delta);
 
-        if stats.path.rtt > Duration::ZERO {
-            self.min_rtt = Some(
-                self.min_rtt
-                    .map_or(stats.path.rtt, |previous| previous.min(stats.path.rtt)),
-            );
-        }
         let rtt = stats.path.rtt.max(QUIC_TIMER_GRANULARITY);
         let rttvar = rtt / 4;
-        let min_rtt = self.min_rtt.unwrap_or(rtt);
         let bulk_proof_freshness_horizon = quic_bulk_proof_freshness_horizon(rtt, rttvar);
         self.expire_stale_bulk_proof(now);
         let congestion_window = congestion.congestion_window.max(stats.path.cwnd);
@@ -283,7 +275,7 @@ impl QuicPathMetricTracker {
         } else {
             0
         };
-        let startup_rate = default_path_rate_bps(UnderlayProtocol::Udp);
+        let startup_rate = default_path_rate_bps();
         let raw_pacing_rate = congestion.pacing_rate_bps.map(|rate| rate.max(1) as f64);
         let usable_pacing_rate = raw_pacing_rate.map(|rate| {
             if self.delivery_sample_count == 0 {
@@ -508,8 +500,7 @@ impl QuicPathMetricTracker {
             direction,
             srtt: rtt,
             rttvar,
-            min_rtt,
-            min_rtt_observed: stats.path.rtt > Duration::ZERO,
+            rtt_observed: stats.path.rtt > Duration::ZERO,
             delivery_rate_bps,
             pacing_rate_bps,
             inflight_hi,

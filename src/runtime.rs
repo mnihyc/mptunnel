@@ -1,3 +1,8 @@
+//! Runtime composition for product flows and concrete carrier actors.
+//!
+//! This layer owns tasks, queues, channels, and mutation; pure evidence and
+//! admission formulas remain in `model` and `scheduler`.
+
 mod datagram;
 mod error;
 mod identity;
@@ -39,20 +44,17 @@ use crate::protocol::auth::{PathJoinAuthCheck, SessionAuthCheck, SessionAuthenti
 use crate::protocol::codec::CodecLimits;
 #[cfg(test)]
 use crate::protocol::{
-    DatagramFlowId, Frame, IngressKind, OffsetRange, PathCapabilities, PathId, PathMetricDirection,
-    PathMetrics, RateHint, SessionId, StreamFlags, StreamId, StreamOpenRole, TargetAddr,
-    UnderlayProtocol,
+    DatagramFlowId, Frame, OffsetRange, PathId, PathMetricDirection, PathMetrics, SessionId,
+    StreamId, StreamOpenRole, TargetAddr, UnderlayProtocol,
 };
 #[cfg(test)]
-use crate::scheduler::{
-    self, FlowDemand, FlowLane, PathSnapshot, PathState as SchedulerPathState, SchedulerPolicy,
-};
-#[cfg(test)]
-use crate::transport::PathSpec;
+use crate::scheduler::{self, FlowLane, PathSnapshot, PathState as SchedulerPathState};
 #[cfg(test)]
 use crate::transport::encrypted::{EncryptedFramedStream, EncryptedFramedTransportError, PeerRole};
 #[cfg(test)]
 use crate::transport::tcp::{self, TcpConnectOptions};
+#[cfg(test)]
+use crate::transport::{PathSpec, RateHint};
 #[cfg(test)]
 use bytes::Bytes;
 #[cfg(test)]

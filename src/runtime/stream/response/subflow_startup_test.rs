@@ -6,10 +6,10 @@ use super::super::test_support::{
 };
 use super::server_output_has_bulk_rate_evidence;
 use crate::model::capacity::{
-    BBR_MAX_SEND_QUANTUM_BYTES, RELIABLE_INITIAL_WINDOW_PACKETS, reliable_relay_buffer_len,
+    BBR_MAX_SEND_QUANTUM_BYTES, RELIABLE_INITIAL_WINDOW_PACKETS,
     reliable_subflow_startup_sample_limit_bytes,
 };
-use crate::model::multipath::{FlowSubflowSet, PathAdmissionDecision, SubflowAdmissionInput};
+use crate::model::multipath::{FlowSubflowSet, PathAdmission, SubflowAdmissionInput};
 use crate::model::path::CarrierPathKey;
 use crate::mux::MuxLimits;
 use crate::protocol::{
@@ -87,7 +87,6 @@ fn tcp_response_startup_ack_graduates_epoch_and_admits_next_candidate() {
             first_commands,
             FlowLane::Throughput,
             StreamOpenRole::Validation,
-            reliable_relay_buffer_len(limits),
         ),
         ResponseStreamAttachOutcome::Attached
     );
@@ -98,7 +97,6 @@ fn tcp_response_startup_ack_graduates_epoch_and_admits_next_candidate() {
             second_commands,
             FlowLane::Throughput,
             StreamOpenRole::Validation,
-            reliable_relay_buffer_len(limits),
         ),
         ResponseStreamAttachOutcome::Attached
     );
@@ -109,34 +107,16 @@ fn tcp_response_startup_ack_graduates_epoch_and_admits_next_candidate() {
         frontier_clear: true,
         completion_improves: false,
         observed_goodput_non_degrading: true,
-        read_gap: Duration::ZERO,
         owner_bytes: sample_bytes,
-        optional_overhead_bytes: 0,
     };
 
     assert_eq!(
-        binding
-            .commit_subflow_owner_admission(
-                service,
-                sample_bytes,
-                0,
-                Duration::ZERO,
-                startup_input(first),
-            )
-            .decision,
-        PathAdmissionDecision::AdmitSubflow
+        binding.commit_subflow_owner_admission(service, sample_bytes, startup_input(first),),
+        PathAdmission::Subflow
     );
     assert_eq!(
-        binding
-            .commit_subflow_owner_admission(
-                service,
-                sample_bytes,
-                0,
-                Duration::ZERO,
-                startup_input(second),
-            )
-            .decision,
-        PathAdmissionDecision::ProbeOnly,
+        binding.commit_subflow_owner_admission(service, sample_bytes, startup_input(second),),
+        PathAdmission::ProbeOnly,
         "only one unproven response candidate may own startup bytes"
     );
     let generation_before_ack = binding.subflow_state_snapshot().0;
@@ -169,16 +149,8 @@ fn tcp_response_startup_ack_graduates_epoch_and_admits_next_candidate() {
         );
     }
     assert_eq!(
-        binding
-            .commit_subflow_owner_admission(
-                service,
-                sample_bytes,
-                0,
-                Duration::ZERO,
-                startup_input(second),
-            )
-            .decision,
-        PathAdmissionDecision::AdmitSubflow
+        binding.commit_subflow_owner_admission(service, sample_bytes, startup_input(second),),
+        PathAdmission::Subflow
     );
     assert_eq!(
         binding
@@ -211,7 +183,6 @@ fn udp_response_startup_requires_local_carrier_bulk_evidence_to_graduate() {
             first_commands,
             FlowLane::Throughput,
             StreamOpenRole::Validation,
-            reliable_relay_buffer_len(limits),
         ),
         ResponseStreamAttachOutcome::Attached
     );
@@ -222,7 +193,6 @@ fn udp_response_startup_requires_local_carrier_bulk_evidence_to_graduate() {
             second_commands,
             FlowLane::Throughput,
             StreamOpenRole::Validation,
-            reliable_relay_buffer_len(limits),
         ),
         ResponseStreamAttachOutcome::Attached
     );
@@ -233,22 +203,12 @@ fn udp_response_startup_requires_local_carrier_bulk_evidence_to_graduate() {
         frontier_clear: true,
         completion_improves: false,
         observed_goodput_non_degrading: true,
-        read_gap: Duration::ZERO,
         owner_bytes: sample_bytes,
-        optional_overhead_bytes: 0,
     };
 
     assert_eq!(
-        binding
-            .commit_subflow_owner_admission(
-                service,
-                sample_bytes,
-                0,
-                Duration::ZERO,
-                startup_input(first),
-            )
-            .decision,
-        PathAdmissionDecision::AdmitSubflow
+        binding.commit_subflow_owner_admission(service, sample_bytes, startup_input(first),),
+        PathAdmission::Subflow
     );
     let generation_before_ack = binding.subflow_state_snapshot().0;
     binding.record_owner_flight(first, &stream_data_frame(sample_bytes));
@@ -266,16 +226,8 @@ fn udp_response_startup_requires_local_carrier_bulk_evidence_to_graduate() {
         "UDP product ACKs alone must not graduate a QUIC response Subflow"
     );
     assert_eq!(
-        binding
-            .commit_subflow_owner_admission(
-                service,
-                sample_bytes,
-                0,
-                Duration::ZERO,
-                startup_input(second),
-            )
-            .decision,
-        PathAdmissionDecision::ProbeOnly
+        binding.commit_subflow_owner_admission(service, sample_bytes, startup_input(second),),
+        PathAdmission::ProbeOnly
     );
 
     binding.update_path_metrics(
@@ -286,7 +238,6 @@ fn udp_response_startup_requires_local_carrier_bulk_evidence_to_graduate() {
             direction: PathMetricDirection::ServerToClient,
             metric_epoch: metric_epoch_now(),
             metric_age_us: 0,
-            min_rtt_us: 80_000,
             srtt_us: 80_000,
             rttvar_us: 5_000,
             jitter_us: 5_000,
@@ -325,15 +276,7 @@ fn udp_response_startup_requires_local_carrier_bulk_evidence_to_graduate() {
         "UDP/QUIC graduation remains carrier-owned and never enters TCP calibration"
     );
     assert_eq!(
-        binding
-            .commit_subflow_owner_admission(
-                service,
-                sample_bytes,
-                0,
-                Duration::ZERO,
-                startup_input(second),
-            )
-            .decision,
-        PathAdmissionDecision::AdmitSubflow
+        binding.commit_subflow_owner_admission(service, sample_bytes, startup_input(second),),
+        PathAdmission::Subflow
     );
 }

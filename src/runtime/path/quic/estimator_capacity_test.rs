@@ -26,7 +26,7 @@ fn quic_app_limited_capacity_probe_emits_candidate_without_generic_proof() {
     stats.path.current_mtu = 1400;
     let mut tracker = QuicPathMetricTracker::default();
 
-    let observed = tracker.observe_at(stats, congestion, 2, now);
+    let observed = tracker.observe_at(stats, congestion, PathMetricDirection::ServerToClient, now);
     let candidate = observed
         .capacity_proof_candidate
         .expect("receiver-confirmed capacity token");
@@ -67,7 +67,12 @@ fn quic_capacity_receipt_publishes_after_terminalization_and_freezes_rate() {
     probe.current_sent_watermark = 11_200;
     let mut tracker = QuicPathMetricTracker::default();
 
-    let measured = tracker.observe_at(stats, with_capacity_probe(base, probe), 2, now);
+    let measured = tracker.observe_at(
+        stats,
+        with_capacity_probe(base, probe),
+        PathMetricDirection::ServerToClient,
+        now,
+    );
     let candidate = measured
         .capacity_proof_candidate
         .expect("terminal exact receipt publishes independently of native cleanup");
@@ -86,7 +91,7 @@ fn quic_capacity_receipt_publishes_after_terminalization_and_freezes_rate() {
     let later = tracker.observe_at(
         stats,
         with_capacity_probe(base, probe),
-        2,
+        PathMetricDirection::ServerToClient,
         now + Duration::from_millis(10),
     );
     assert_eq!(later.capacity_proof_candidate, Some(candidate));
@@ -95,7 +100,7 @@ fn quic_capacity_receipt_publishes_after_terminalization_and_freezes_rate() {
     let independently_observed = late_tracker.observe_at(
         stats,
         with_capacity_probe(base, probe),
-        2,
+        PathMetricDirection::ServerToClient,
         now + Duration::from_millis(20),
     );
     assert_eq!(
@@ -120,7 +125,7 @@ fn quic_capacity_candidate_accepts_only_receipted_publishable_phases() {
             base,
             capacity_probe_metrics(43, now, 0, required_bytes, 0, 0, None),
         ),
-        2,
+        PathMetricDirection::ServerToClient,
         now,
     );
     assert!(proven.capacity_proof_candidate.is_some());
@@ -136,7 +141,7 @@ fn quic_capacity_candidate_accepts_only_receipted_publishable_phases() {
         let observed = QuicPathMetricTracker::default().observe_at(
             stats,
             with_capacity_probe(base, probe),
-            2,
+            PathMetricDirection::ServerToClient,
             now,
         );
         assert!(
@@ -161,8 +166,12 @@ fn quic_capacity_probe_requires_exact_full_train_receipt() {
     let mut incomplete_receipt =
         capacity_probe_metrics(51, now, warmup_bytes, required_bytes, 0, 0, None);
     incomplete_receipt.receipt_received_payload_bytes = incomplete_receipt.train_payload_bytes - 1;
-    let below_floor =
-        tracker.observe_at(stats, with_capacity_probe(base, incomplete_receipt), 2, now);
+    let below_floor = tracker.observe_at(
+        stats,
+        with_capacity_probe(base, incomplete_receipt),
+        PathMetricDirection::ServerToClient,
+        now,
+    );
     assert!(below_floor.capacity_proof_candidate.is_none());
 
     let proven = tracker.observe_at(
@@ -171,7 +180,7 @@ fn quic_capacity_probe_requires_exact_full_train_receipt() {
             base,
             capacity_probe_metrics(51, now, warmup_bytes, required_bytes, 0, 0, None),
         ),
-        2,
+        PathMetricDirection::ServerToClient,
         now + Duration::from_millis(1),
     );
     let candidate = proven
@@ -199,14 +208,19 @@ fn quic_capacity_receipt_candidate_is_sticky_and_frozen() {
         )
     };
 
-    let received = tracker.observe_at(stats, probe(61, None), 2, now);
+    let received = tracker.observe_at(
+        stats,
+        probe(61, None),
+        PathMetricDirection::ServerToClient,
+        now,
+    );
     let accepted = received
         .capacity_proof_candidate
         .expect("receipt does not depend on a native ACK span");
     let mut retried = tracker.observe_at(
         stats,
         probe(61, Some(Duration::from_millis(40))),
-        2,
+        PathMetricDirection::ServerToClient,
         now + Duration::from_millis(2),
     );
     let retried_candidate = retried
@@ -222,7 +236,7 @@ fn quic_capacity_receipt_candidate_is_sticky_and_frozen() {
     let sticky = tracker.observe_at(
         stats,
         probe(61, Some(Duration::from_millis(40))),
-        2,
+        PathMetricDirection::ServerToClient,
         now + Duration::from_millis(3),
     );
     assert!(sticky.capacity_proof_candidate.is_none());
@@ -230,7 +244,7 @@ fn quic_capacity_receipt_candidate_is_sticky_and_frozen() {
     let expired_sticky = tracker.observe_at(
         stats,
         probe(61, Some(Duration::from_millis(40))),
-        2,
+        PathMetricDirection::ServerToClient,
         frozen_deadline,
     );
     assert!(expired_sticky.app_limited);
@@ -250,7 +264,7 @@ fn quic_capacity_receipt_candidate_is_sticky_and_frozen() {
                 Some(Duration::from_millis(40)),
             ),
         ),
-        2,
+        PathMetricDirection::ServerToClient,
         rollover_at,
     );
     assert_eq!(

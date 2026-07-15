@@ -12,7 +12,7 @@ fn quic_bulk_proof_deadline_does_not_shrink_with_falling_rtt() {
     let base = Instant::now();
     let proof_at = base + Duration::from_millis(1);
     let mut tracker = QuicPathMetricTracker::default();
-    let _ = tracker.observe_at(stats, congestion, 2, base);
+    let _ = tracker.observe_at(stats, congestion, PathMetricDirection::ServerToClient, base);
     let proven = tracker.observe_at(
         stats,
         with_acked_bytes(
@@ -20,7 +20,7 @@ fn quic_bulk_proof_deadline_does_not_shrink_with_falling_rtt() {
             sample_bytes,
             QUIC_INITIAL_WINDOW_PACKETS as u64,
         ),
-        2,
+        PathMetricDirection::ServerToClient,
         proof_at,
     );
     let frozen_deadline = proven
@@ -33,7 +33,7 @@ fn quic_bulk_proof_deadline_does_not_shrink_with_falling_rtt() {
     let still_fresh = tracker.observe_at(
         stats,
         with_delivery_evidence_written(congestion, sample_bytes),
-        2,
+        PathMetricDirection::ServerToClient,
         proof_at + smaller_horizon,
     );
     assert!(!still_fresh.app_limited);
@@ -42,7 +42,7 @@ fn quic_bulk_proof_deadline_does_not_shrink_with_falling_rtt() {
     let expired = tracker.observe_at(
         stats,
         with_delivery_evidence_written(congestion, sample_bytes),
-        2,
+        PathMetricDirection::ServerToClient,
         frozen_deadline,
     );
     assert!(expired.app_limited);
@@ -61,7 +61,7 @@ fn quic_expired_proof_preserves_new_pending_sample() {
     let base = Instant::now();
     let proof_at = base + Duration::from_millis(1);
     let mut tracker = QuicPathMetricTracker::default();
-    let _ = tracker.observe_at(stats, congestion, 2, base);
+    let _ = tracker.observe_at(stats, congestion, PathMetricDirection::ServerToClient, base);
     let proven = tracker.observe_at(
         stats,
         with_acked_bytes(
@@ -69,7 +69,7 @@ fn quic_expired_proof_preserves_new_pending_sample() {
             sample_bytes,
             QUIC_INITIAL_WINDOW_PACKETS as u64,
         ),
-        2,
+        PathMetricDirection::ServerToClient,
         proof_at,
     );
     let deadline = proven.bulk_proof_expires_at.expect("proof deadline");
@@ -81,7 +81,7 @@ fn quic_expired_proof_preserves_new_pending_sample() {
             fragment_bytes,
             2,
         ),
-        2,
+        PathMetricDirection::ServerToClient,
         deadline - QUIC_TIMER_GRANULARITY,
     );
     assert_eq!(tracker.pending_non_app_limited_sample_bytes, fragment_bytes);
@@ -89,7 +89,7 @@ fn quic_expired_proof_preserves_new_pending_sample() {
     let expired = tracker.observe_at(
         stats,
         with_delivery_evidence_written(congestion, written_bytes),
-        2,
+        PathMetricDirection::ServerToClient,
         deadline,
     );
     assert!(expired.app_limited);
@@ -110,7 +110,7 @@ fn quic_bulk_proof_is_fresh_inside_persistent_congestion_horizon() {
     let proof_at = base + Duration::from_millis(1);
     let horizon = quic_bulk_proof_freshness_horizon(stats.path.rtt, stats.path.rtt / 4);
     let mut tracker = QuicPathMetricTracker::default();
-    let _ = tracker.observe_at(stats, congestion, 2, base);
+    let _ = tracker.observe_at(stats, congestion, PathMetricDirection::ServerToClient, base);
     let proven = tracker.observe_at(
         stats,
         with_acked_bytes(
@@ -118,7 +118,7 @@ fn quic_bulk_proof_is_fresh_inside_persistent_congestion_horizon() {
             sample_bytes,
             QUIC_INITIAL_WINDOW_PACKETS as u64,
         ),
-        2,
+        PathMetricDirection::ServerToClient,
         proof_at,
     );
 
@@ -126,7 +126,7 @@ fn quic_bulk_proof_is_fresh_inside_persistent_congestion_horizon() {
     let fresh = tracker.observe_at(
         stats,
         with_delivery_evidence_written(congestion, sample_bytes),
-        2,
+        PathMetricDirection::ServerToClient,
         proof_at + horizon - QUIC_TIMER_GRANULARITY,
     );
     assert_eq!(fresh.delivery_sample_count, proven.delivery_sample_count);
@@ -146,7 +146,7 @@ fn quic_aged_bulk_proof_expires_without_erasing_ack_reachability() {
     let proof_at = base + Duration::from_millis(1);
     let horizon = quic_bulk_proof_freshness_horizon(stats.path.rtt, stats.path.rtt / 4);
     let mut tracker = QuicPathMetricTracker::default();
-    let _ = tracker.observe_at(stats, congestion, 2, base);
+    let _ = tracker.observe_at(stats, congestion, PathMetricDirection::ServerToClient, base);
     let proven = tracker.observe_at(
         stats,
         with_acked_bytes(
@@ -154,7 +154,7 @@ fn quic_aged_bulk_proof_expires_without_erasing_ack_reachability() {
             sample_bytes,
             QUIC_INITIAL_WINDOW_PACKETS as u64,
         ),
-        2,
+        PathMetricDirection::ServerToClient,
         proof_at,
     );
     assert!(proven.ack_derived_data_seen);
@@ -162,7 +162,7 @@ fn quic_aged_bulk_proof_expires_without_erasing_ack_reachability() {
     let aged = tracker.observe_at(
         stats,
         with_delivery_evidence_written(congestion, sample_bytes),
-        2,
+        PathMetricDirection::ServerToClient,
         proof_at + horizon,
     );
     assert!(aged.ack_derived_data_seen);
@@ -186,7 +186,7 @@ fn quic_reproved_bulk_rights_are_not_permanently_sticky() {
     let first_proof_at = base + Duration::from_millis(1);
     let horizon = quic_bulk_proof_freshness_horizon(stats.path.rtt, stats.path.rtt / 4);
     let mut tracker = QuicPathMetricTracker::default();
-    let _ = tracker.observe_at(stats, congestion, 2, base);
+    let _ = tracker.observe_at(stats, congestion, PathMetricDirection::ServerToClient, base);
     let _ = tracker.observe_at(
         stats,
         with_acked_bytes(
@@ -194,13 +194,13 @@ fn quic_reproved_bulk_rights_are_not_permanently_sticky() {
             sample_bytes,
             QUIC_INITIAL_WINDOW_PACKETS as u64,
         ),
-        2,
+        PathMetricDirection::ServerToClient,
         first_proof_at,
     );
     let _ = tracker.observe_at(
         stats,
         with_delivery_evidence_written(congestion, sample_bytes),
-        2,
+        PathMetricDirection::ServerToClient,
         first_proof_at + horizon,
     );
 
@@ -212,7 +212,7 @@ fn quic_reproved_bulk_rights_are_not_permanently_sticky() {
             sample_bytes,
             QUIC_INITIAL_WINDOW_PACKETS as u64,
         ),
-        2,
+        PathMetricDirection::ServerToClient,
         second_proof_at,
     );
     assert!(!reproved.app_limited);
@@ -221,7 +221,7 @@ fn quic_reproved_bulk_rights_are_not_permanently_sticky() {
     let aged_again = tracker.observe_at(
         stats,
         with_delivery_evidence_written(congestion, sample_bytes * 2),
-        2,
+        PathMetricDirection::ServerToClient,
         second_proof_at + horizon,
     );
     assert!(aged_again.app_limited);
@@ -250,7 +250,9 @@ fn quic_first_confident_sample_replaces_optimistic_startup_prior() {
     stats.path.rtt = Duration::from_millis(50);
     stats.path.cwnd = PATH_OPEN_SCORE_BYTES as u64;
     stats.path.current_mtu = 1400;
-    let startup = tracker.quic.observe(stats, congestion, 2);
+    let startup = tracker
+        .quic
+        .observe(stats, congestion, PathMetricDirection::ServerToClient);
     stats.frame_rx.acks = 1;
     let first_quantum = tracker.quic.observe(
         stats,
@@ -259,7 +261,7 @@ fn quic_first_confident_sample_replaces_optimistic_startup_prior() {
             PATH_OPEN_SCORE_BYTES as u64,
             1,
         ),
-        2,
+        PathMetricDirection::ServerToClient,
     );
     assert_eq!(first_quantum.delivery_sample_count, 1);
     assert_eq!(first_quantum.delivery_rate_bps, startup.delivery_rate_bps);
@@ -277,7 +279,7 @@ fn quic_first_confident_sample_replaces_optimistic_startup_prior() {
             9,
             Duration::from_millis(200),
         ),
-        2,
+        PathMetricDirection::ServerToClient,
     );
 
     assert_eq!(
@@ -302,7 +304,9 @@ fn quic_confidence_boundary_discards_inflated_preconfidence_sample() {
     stats.path.rtt = Duration::from_millis(50);
     stats.path.cwnd = PATH_OPEN_SCORE_BYTES as u64;
     stats.path.current_mtu = 1400;
-    let startup = tracker.quic.observe(stats, congestion, 2);
+    let startup = tracker
+        .quic
+        .observe(stats, congestion, PathMetricDirection::ServerToClient);
 
     let fast_sample_bytes = 64 * 1024_u64;
     stats.frame_rx.acks = 1;
@@ -314,7 +318,7 @@ fn quic_confidence_boundary_discards_inflated_preconfidence_sample() {
             1,
             Duration::from_millis(1),
         ),
-        2,
+        PathMetricDirection::ServerToClient,
     );
     assert_eq!(preconfidence.delivery_sample_count, 1);
     assert!(
@@ -335,7 +339,7 @@ fn quic_confidence_boundary_discards_inflated_preconfidence_sample() {
             9,
             Duration::from_millis(200),
         ),
-        2,
+        PathMetricDirection::ServerToClient,
     );
 
     let expected_rate = measured_bytes as f64 * 8.0 / 0.2;
@@ -360,7 +364,11 @@ fn quic_confidence_requires_ack_samples_and_current_flight_volume() {
     stats.path.rtt = Duration::from_millis(50);
     stats.path.cwnd = startup_cwnd;
     stats.path.current_mtu = 1400;
-    let startup = tracker.quic.observe(stats, startup_congestion, 2);
+    let startup = tracker.quic.observe(
+        stats,
+        startup_congestion,
+        PathMetricDirection::ServerToClient,
+    );
     let first = tracker.quic.observe(
         stats,
         with_acked_bytes(
@@ -368,7 +376,7 @@ fn quic_confidence_requires_ack_samples_and_current_flight_volume() {
             startup_cwnd,
             1,
         ),
-        2,
+        PathMetricDirection::ServerToClient,
     );
     assert_eq!(first.delivery_sample_count, 1);
 
@@ -386,7 +394,7 @@ fn quic_confidence_requires_ack_samples_and_current_flight_volume() {
             tiny_followup,
             9,
         ),
-        2,
+        PathMetricDirection::ServerToClient,
     );
     assert_eq!(
         count_only.delivery_sample_count,
@@ -406,7 +414,7 @@ fn quic_confidence_requires_ack_samples_and_current_flight_volume() {
             grown_cwnd,
             1,
         ),
-        2,
+        PathMetricDirection::ServerToClient,
     );
     assert_eq!(
         byte_confident.delivery_sample_count,
@@ -423,7 +431,9 @@ fn quic_app_limited_duplicate_ack_counts_as_ack_data_seen_not_bulk_rate() {
     stats.path.rtt = Duration::from_millis(50);
     stats.path.cwnd = 4 * 1024 * 1024;
     stats.path.current_mtu = 1400;
-    let _ = tracker.quic.observe(stats, congestion, 2);
+    let _ = tracker
+        .quic
+        .observe(stats, congestion, PathMetricDirection::ServerToClient);
     stats.frame_rx.acks = 1;
     let app_limited = tracker.quic.observe(
         stats,
@@ -432,7 +442,7 @@ fn quic_app_limited_duplicate_ack_counts_as_ack_data_seen_not_bulk_rate() {
             32 * 1024,
             1,
         ),
-        2,
+        PathMetricDirection::ServerToClient,
     );
     assert!(app_limited.ack_derived_data_seen);
     assert_eq!(app_limited.delivery_sample_count, 0);

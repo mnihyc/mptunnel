@@ -6,6 +6,7 @@
 use super::*;
 use crate::config::{ManagementConfig, RouteTarget, RouteTargetKind};
 use crate::ingress::IngressConfig;
+use crate::model::path::PathPolicy;
 use crate::protocol::{PathMetricDirection, UnderlayProtocol};
 use crate::runtime::error::RuntimeError;
 use crate::runtime::path::ServerStreamManagementSnapshot;
@@ -914,7 +915,7 @@ struct ManagementPathStatus {
     endpoint: String,
     state: &'static str,
     manual_disabled: bool,
-    flags: ManagementPathFlags,
+    policy: PathPolicy,
     srtt_ms: f64,
     jitter_ms: f64,
     delivery_rate_bps: u64,
@@ -934,33 +935,23 @@ struct ManagementPathStatus {
     carrier_last_delivery_age_ms: Option<u64>,
 }
 
-#[derive(Debug, Clone, Serialize)]
-struct ManagementPathFlags {
-    backup: bool,
-    expensive: bool,
-    low_latency: bool,
-    bulk_allowed: bool,
-    probe_only: bool,
-    no_udp: bool,
-}
-
 fn client_path_statuses(
     context: &ClientPathContext,
 ) -> (Vec<ManagementPathStatus>, ManagementSummary) {
     let now = Instant::now();
     let mut summary = ManagementSummary::default();
-    let mut health = context.health().lock().expect("client path health lock");
+    let health = context.health().lock().expect("client path health lock");
     let mut paths = Vec::with_capacity(context.tcp_paths.len() + context.udp_paths.len());
     paths.extend(client_path_status_set(
         &context.tcp_paths,
-        &mut health.tcp,
+        &health.tcp,
         UnderlayProtocol::Tcp,
         now,
         &mut summary,
     ));
     paths.extend(client_path_status_set(
         &context.udp_paths,
-        &mut health.udp,
+        &health.udp,
         UnderlayProtocol::Udp,
         now,
         &mut summary,
@@ -991,14 +982,7 @@ fn client_path_status_set(
                 endpoint: path_endpoint(spec),
                 state: path_state_name(snapshot.state),
                 manual_disabled: observation.manual_disabled,
-                flags: ManagementPathFlags {
-                    backup: snapshot.flags.backup,
-                    expensive: snapshot.flags.expensive,
-                    low_latency: snapshot.flags.low_latency,
-                    bulk_allowed: snapshot.flags.bulk_allowed,
-                    probe_only: snapshot.flags.probe_only,
-                    no_udp: snapshot.flags.no_udp,
-                },
+                policy: snapshot.policy,
                 srtt_ms: snapshot.srtt_ms,
                 jitter_ms: snapshot.jitter_ms,
                 delivery_rate_bps: snapshot.delivery_rate_bps.round() as u64,

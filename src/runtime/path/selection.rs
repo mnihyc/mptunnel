@@ -11,7 +11,7 @@ use crate::model::admission::{
 };
 use crate::model::capacity::{PATH_OPEN_SCORE_BYTES, relay_lane_startup_chunk_bytes};
 use crate::model::path::{RelayPathKey, RelayPathProofEpoch};
-use crate::protocol::{PathMetricDirection, PathMetrics, RateHint, UnderlayProtocol};
+use crate::protocol::{PathMetricDirection, PathMetrics, UnderlayProtocol};
 use crate::runtime::path::health::ClientPathHealthRecord;
 use crate::runtime::path::model::{
     ClientPathObservation, UdpPathCandidate, UdpPathRuntimeModel, apply_bulk_latency_isolation,
@@ -22,13 +22,12 @@ use crate::runtime::path::model::{
     ordered_reliable_path_indices, path_allows_automatic_bulk_use, path_can_be_auto_discovered,
     path_is_endpoint_only, path_metrics_from_snapshot, path_snapshot, path_startup_snapshot,
     reliable_reservation_should_use_endpoint_only_startup_order, reliable_stream_path_candidates,
-    udp_mtu_payload_bytes, udp_observation_has_datagram_feedback, udp_path_has_realtime_model,
-    udp_probe_ceiling_payload_bytes, udp_reliable_stream_loss_repair_penalty_ms,
+    udp_datagram_payload_limit_bytes, udp_observation_has_datagram_feedback,
+    udp_path_has_realtime_model, udp_reliable_stream_loss_repair_penalty_ms,
 };
 use crate::runtime::path::state::RelayPathLoadLease;
-use crate::scheduler::{
-    self, FlowLane, PathSnapshot, PathState as SchedulerPathState, SchedulerPolicy,
-};
+use crate::scheduler::{self, FlowLane, PathSnapshot, PathState as SchedulerPathState};
+use crate::transport::RateHint;
 use smallvec::SmallVec;
 use std::time::Instant;
 
@@ -146,9 +145,9 @@ impl ClientPathContext {
     ) -> Option<RelayPathLoadLease> {
         let now = Instant::now();
         let mut health = self.state.health().lock().expect("client path health lock");
-        let mut tcp_observations = health_observations(&mut health.tcp, now);
+        let mut tcp_observations = health_observations(&health.tcp, now);
         apply_bulk_latency_isolation(&mut tcp_observations, lane, self.mux_limits);
-        let mut udp_observations = health_observations(&mut health.udp, now);
+        let mut udp_observations = health_observations(&health.udp, now);
         apply_bulk_latency_isolation(&mut udp_observations, lane, self.mux_limits);
         let mut candidates = reliable_stream_path_candidates(
             &self.tcp_paths,
@@ -236,10 +235,10 @@ impl ClientPathContext {
         payload_bytes: usize,
     ) -> Vec<RelayPathKey> {
         let now = Instant::now();
-        let mut health = self.state.health().lock().expect("client path health lock");
-        let mut tcp_observations = health_observations(&mut health.tcp, now);
+        let health = self.state.health().lock().expect("client path health lock");
+        let mut tcp_observations = health_observations(&health.tcp, now);
         apply_bulk_latency_isolation(&mut tcp_observations, lane, self.mux_limits);
-        let mut udp_observations = health_observations(&mut health.udp, now);
+        let mut udp_observations = health_observations(&health.udp, now);
         apply_bulk_latency_isolation(&mut udp_observations, lane, self.mux_limits);
         let mut candidates = reliable_stream_path_candidates(
             &self.tcp_paths,
@@ -304,7 +303,7 @@ impl ClientPathContext {
     ) -> Vec<usize> {
         let now = Instant::now();
         let mut observations = health_observations(
-            &mut self
+            &self
                 .state
                 .health()
                 .lock()
@@ -431,9 +430,9 @@ impl ClientPathContext {
         payload_bytes: usize,
     ) -> SmallVec<[BulkPathCandidate; 4]> {
         let now = Instant::now();
-        let mut health = self.state.health().lock().expect("client path health lock");
-        let tcp_observations = health_observations(&mut health.tcp, now);
-        let udp_observations = health_observations(&mut health.udp, now);
+        let health = self.state.health().lock().expect("client path health lock");
+        let tcp_observations = health_observations(&health.tcp, now);
+        let udp_observations = health_observations(&health.udp, now);
         self.reliable_bulk_path_candidates_from_observations(
             payload_bytes,
             &tcp_observations,
@@ -609,7 +608,7 @@ impl ClientPathContext {
     ) -> Vec<ClientPathObservation> {
         let now = Instant::now();
         let mut observations = health_observations(
-            &mut self
+            &self
                 .state
                 .health()
                 .lock()
@@ -680,8 +679,7 @@ impl ClientPathContext {
         payload_bytes: usize,
     ) -> Option<f64> {
         self.reliable_path_snapshot(key).and_then(|snapshot| {
-            scheduler::score_path(snapshot, lane, payload_bytes, SchedulerPolicy::default())
-                .map(|score| score.eta_ms)
+            scheduler::score_path(snapshot, lane, payload_bytes).map(|score| score.eta_ms)
         })
     }
 
@@ -735,7 +733,7 @@ impl ClientPathContext {
         }
         let now = Instant::now();
         let observations = health_observations(
-            &mut self
+            &self
                 .state
                 .health()
                 .lock()
@@ -763,7 +761,6 @@ impl ClientPathContext {
                     path_snapshot(path, path_index, observation),
                     FlowLane::RealtimeDatagram,
                     payload_bytes,
-                    SchedulerPolicy::default(),
                 )?
                 .eta_ms;
                 (eta_ms <= freshness_budget_ms).then_some(UdpPathCandidate { path_index, eta_ms })
@@ -833,7 +830,6 @@ impl ClientPathContext {
             path_snapshot(path, index, observation),
             FlowLane::RealtimeDatagram,
             payload_bytes,
-            SchedulerPolicy::default(),
         )?;
         let freshness_budget_ms = f64::from(ttl_ms);
         (score.eta_ms <= freshness_budget_ms).then_some(score.eta_ms)
@@ -858,18 +854,11 @@ impl ClientPathContext {
             .get(index)?
             .observation_at(now);
         let snapshot = path_snapshot(path, index, observation);
-        scheduler::score_path(
-            snapshot,
-            FlowLane::RealtimeDatagram,
-            1,
-            SchedulerPolicy::default(),
-        )?;
+        scheduler::score_path(snapshot, FlowLane::RealtimeDatagram, 1)?;
         Some(UdpPathRuntimeModel::from_snapshot(
             snapshot,
             ttl_ms,
-            udp_mtu_payload_bytes(path, observation, self.mux_limits.max_payload_bytes),
-            observation.measured_mtu_payload_bytes.is_some(),
-            udp_probe_ceiling_payload_bytes(self.mux_limits.max_payload_bytes),
+            udp_datagram_payload_limit_bytes(path, self.mux_limits.max_payload_bytes),
         ))
     }
 

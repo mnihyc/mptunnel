@@ -168,20 +168,20 @@ impl ResponseStreamBinding {
         }
         let service_model = server_bulk_output_snapshot_with_command_pending(
             &outputs.entries[service_index],
+            outputs.product_queue_bytes,
             self.session_id,
             lane,
             &self.lane_tracker,
             self.mux_limits,
-            now,
             outputs.entries[service_index].commands.pending_bytes(),
         );
         let target_model = server_bulk_output_snapshot_with_command_pending(
             &outputs.entries[target_index],
+            outputs.product_queue_bytes,
             self.session_id,
             lane,
             &self.lane_tracker,
             self.mux_limits,
-            now,
             outputs.entries[target_index].commands.pending_bytes(),
         );
         let service_snapshot = service_model.path;
@@ -439,20 +439,20 @@ impl ResponseStreamBinding {
         }
         let service_model = server_bulk_output_snapshot_with_command_pending(
             service_entry,
+            outputs.product_queue_bytes,
             self.session_id,
             lane,
             &self.lane_tracker,
             self.mux_limits,
-            now,
             service_entry.commands.pending_bytes(),
         );
         let mut target_model = server_bulk_output_snapshot_with_command_pending(
             target_entry,
+            outputs.product_queue_bytes,
             self.session_id,
             lane,
             &self.lane_tracker,
             self.mux_limits,
-            now,
             target_entry.commands.pending_bytes(),
         );
         if let Some(proof) = pinned_proof {

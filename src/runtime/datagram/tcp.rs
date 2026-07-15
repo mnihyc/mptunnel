@@ -55,7 +55,6 @@ impl TcpDatagramClientAssociation {
                 index: path_index,
             };
             let snapshot = context.tcp_path_snapshot(path_index);
-            let rtt_is_observed = context.reliable_path_rtt_is_observed(key);
             let eta_ms = context
                 .reliable_relay_path_eta_ms(
                     key,
@@ -68,7 +67,6 @@ impl TcpDatagramClientAssociation {
             }
             let path_budget = tcp_datagram_path_open_timeout(
                 snapshot,
-                rtt_is_observed,
                 has_unattempted_alternative || position + 1 < candidate_count,
                 remaining,
             );
@@ -267,7 +265,7 @@ impl TcpDatagramClientAssociation {
                         source,
                     });
                 }
-                Err(DatagramPathSendError::MtuExceeded { limit }) => {
+                Err(DatagramPathSendError::PayloadLimitExceeded { limit }) => {
                     return Err(DatagramUnderlaySendError::Runtime {
                         path_was_acked: false,
                         product_attempts,
@@ -319,7 +317,6 @@ pub(in crate::runtime) fn tcp_datagram_response_timeout(
 
 pub(in crate::runtime) fn tcp_datagram_path_open_timeout(
     snapshot: Option<PathSnapshot>,
-    _rtt_is_observed: bool,
     has_unattempted_alternative: bool,
     remaining_ttl: Duration,
 ) -> Duration {

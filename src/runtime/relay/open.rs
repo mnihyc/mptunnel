@@ -12,7 +12,7 @@ use crate::model::timing::{
     active_path_open_serialized_exchanges, active_path_open_timeout, path_open_pto,
     transport_pto_from_snapshot,
 };
-use crate::protocol::{Frame, IngressKind, StreamId, StreamOpenRole, TargetAddr, UnderlayProtocol};
+use crate::protocol::{Frame, StreamId, StreamOpenRole, TargetAddr, UnderlayProtocol};
 use crate::runtime::error::RuntimeError;
 use crate::runtime::path::commands::ClientTcpOpenDeadlines;
 use crate::runtime::path::{ClientPathContext, RelayPathLoadLease, UdpStreamOpenOptions};
@@ -96,7 +96,6 @@ impl Drop for OpenedRemoteStream {
 #[derive(Clone)]
 pub(in crate::runtime) struct ReliableRelayOpenSpec {
     pub(in crate::runtime) target: TargetAddr,
-    pub(in crate::runtime) ingress: IngressKind,
 }
 
 pub(in crate::runtime) fn udp_relay_attachment_open_options(
@@ -157,7 +156,6 @@ async fn open_reliable_initial_active_attempt(
     context: &ClientPathContext,
     attempt: ReliableInitialOpenAttempt,
     target: TargetAddr,
-    ingress: IngressKind,
     lane: FlowLane,
     has_unattempted_alternative: bool,
 ) -> Result<OpenedRemoteStream, RuntimeError> {
@@ -176,7 +174,6 @@ async fn open_reliable_initial_active_attempt(
                 context,
                 stream_id,
                 target,
-                ingress,
                 lane,
                 key.index,
                 StreamOpenRole::Active,
@@ -213,7 +210,6 @@ async fn open_reliable_initial_active_attempt(
                     context,
                     stream_id,
                     target,
-                    ingress,
                     lane,
                     key.index,
                     UdpStreamOpenOptions::ACTIVE_WAIT,
@@ -247,7 +243,6 @@ async fn open_reliable_initial_active_attempt(
 pub(in crate::runtime) async fn open_remote_stream(
     context: &ClientPathContext,
     target: TargetAddr,
-    ingress: IngressKind,
     lane: FlowLane,
 ) -> Result<OpenedRemoteStream, RuntimeError> {
     let mut attempted = Vec::new();
@@ -264,7 +259,6 @@ pub(in crate::runtime) async fn open_remote_stream(
             context,
             attempt,
             target.clone(),
-            ingress,
             lane,
             has_unattempted_alternative,
         )
@@ -285,7 +279,6 @@ pub(in crate::runtime) async fn open_remote_stream_on_path(
     context: &ClientPathContext,
     stream_id: StreamId,
     target: TargetAddr,
-    ingress: IngressKind,
     lane: FlowLane,
     path_index: usize,
     role: StreamOpenRole,
@@ -307,7 +300,6 @@ pub(in crate::runtime) async fn open_remote_stream_on_path(
         context,
         stream_id,
         target,
-        ingress,
         lane,
         path_index,
         role,
@@ -385,7 +377,6 @@ pub(in crate::runtime) async fn open_remote_stream_on_preselected_tcp_path(
     context: &ClientPathContext,
     stream_id: StreamId,
     target: TargetAddr,
-    ingress: IngressKind,
     lane: FlowLane,
     path_index: usize,
     role: StreamOpenRole,
@@ -409,7 +400,7 @@ pub(in crate::runtime) async fn open_remote_stream_on_preselected_tcp_path(
         .tcp_sessions
         .get(path_index)
         .ok_or(RuntimeError::NoSchedulableTcpPath)?
-        .open_stream_with_deadlines(stream_id, target, ingress, lane, role, open_deadlines)
+        .open_stream_with_deadlines(stream_id, target, lane, role, open_deadlines)
         .await?;
     let pending = OpenedRemoteStream::pending(
         ReliablePathStream::from_opened_carrier(opened.carrier),
@@ -442,7 +433,6 @@ pub(in crate::runtime) async fn open_remote_stream_on_udp_path(
     context: &ClientPathContext,
     stream_id: StreamId,
     target: TargetAddr,
-    ingress: IngressKind,
     lane: FlowLane,
     path_index: usize,
     options: UdpStreamOpenOptions,
@@ -465,7 +455,6 @@ pub(in crate::runtime) async fn open_remote_stream_on_udp_path(
             context,
             stream_id,
             target,
-            ingress,
             lane,
             path_index,
             options,
@@ -485,22 +474,19 @@ pub(in crate::runtime) async fn open_remote_stream_for_relay_path(
     context: &ClientPathContext,
     stream_id: StreamId,
     target: TargetAddr,
-    ingress: IngressKind,
     lane: FlowLane,
     key: RelayPathKey,
     role: StreamOpenRole,
 ) -> Result<OpenedRemoteStream, RuntimeError> {
     match key.underlay {
         UnderlayProtocol::Tcp => {
-            open_remote_stream_on_path(context, stream_id, target, ingress, lane, key.index, role)
-                .await
+            open_remote_stream_on_path(context, stream_id, target, lane, key.index, role).await
         }
         UnderlayProtocol::Udp => {
             open_remote_stream_on_udp_path(
                 context,
                 stream_id,
                 target,
-                ingress,
                 lane,
                 key.index,
                 udp_relay_attachment_open_options(role),
@@ -527,7 +513,6 @@ pub(in crate::runtime) async fn open_remote_stream_on_preselected_udp_path(
     context: &ClientPathContext,
     stream_id: StreamId,
     target: TargetAddr,
-    ingress: IngressKind,
     lane: FlowLane,
     path_index: usize,
     options: UdpStreamOpenOptions,
@@ -558,7 +543,7 @@ pub(in crate::runtime) async fn open_remote_stream_on_preselected_udp_path(
         .udp_sessions
         .get(path_index)
         .ok_or(RuntimeError::NoSchedulableUdpPath)?
-        .open_stream(stream_id, target, ingress, lane, options, open_deadline)
+        .open_stream(stream_id, target, lane, options, open_deadline)
         .await?;
     let pending =
         OpenedRemoteStream::pending(ReliablePathStream::from_opened_carrier(carrier), path_index);

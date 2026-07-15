@@ -8,9 +8,7 @@ use crate::lab_diagnostics::{lab_diagnostic, lab_perf_record};
 use crate::model::capacity::reliable_relay_buffer_len;
 #[cfg(feature = "lab-diagnostics")]
 use crate::protocol::frame::reliable_path_frame_pacing_bytes;
-use crate::protocol::{
-    Frame, IngressKind, OutboundPolicy, StreamId, StreamOpenRole, TargetAddr, UnderlayProtocol,
-};
+use crate::protocol::{Frame, StreamId, StreamOpenRole, TargetAddr, UnderlayProtocol};
 use crate::runtime::error::RuntimeError;
 use crate::runtime::path::commands::{
     ClientTcpOpenAttemptId, ClientTcpOpenResponse, ClientTcpOpenedStream, ReliablePathCommand,
@@ -99,7 +97,6 @@ pub(super) struct ClientTcpOpenStreamRequest {
     pub(super) stream_id: StreamId,
     pub(super) attempt_id: ClientTcpOpenAttemptId,
     pub(super) target: TargetAddr,
-    pub(super) ingress: IngressKind,
     pub(super) lane: FlowLane,
     pub(super) role: StreamOpenRole,
     pub(super) open_deadline: tokio::time::Instant,
@@ -176,7 +173,6 @@ pub(super) async fn open_client_tcp_stream_on_connection(
         stream_id,
         attempt_id,
         target,
-        ingress,
         lane,
         role,
         open_deadline,
@@ -224,8 +220,6 @@ pub(super) async fn open_client_tcp_stream_on_connection(
             .write_frame(&Frame::OpenStream {
                 stream_id,
                 target,
-                ingress,
-                outbound: OutboundPolicy::Direct,
                 demand: stream_demand_hint_for_lane(lane),
                 role,
             })
@@ -405,7 +399,6 @@ pub(super) async fn handle_client_tcp_stream_frame(
         Frame::StreamData {
             stream_id,
             offset,
-            flags,
             payload,
         } => {
             route_client_tcp_stream_frame(
@@ -415,7 +408,6 @@ pub(super) async fn handle_client_tcp_stream_frame(
                 Frame::StreamData {
                     stream_id,
                     offset,
-                    flags,
                     payload,
                 },
             )

@@ -6,10 +6,9 @@
 
 use crate::config::SecurityConfig;
 use crate::protocol::auth::{PathJoinAuthCheck, SessionAuthCheck, SessionAuthenticator};
-use crate::protocol::{AuthNonce, Frame, PathCapabilities, PathId, SessionId, UnderlayProtocol};
+use crate::protocol::{AuthNonce, Frame, PathId, SessionId, UnderlayProtocol};
 use crate::runtime::error::RuntimeError;
 use crate::runtime::identity::{current_unix_secs, random_nonce, random_session_id};
-use crate::transport::PathSpec;
 
 /// The authenticated three-frame flight that starts one client carrier path.
 pub(in crate::runtime) struct ClientPathAuthenticationFrames {
@@ -23,18 +22,16 @@ impl ClientPathAuthenticationFrames {
     /// delivery evidence from a long-lived multipath session.
     pub(in crate::runtime) fn for_new_session(
         security: &SecurityConfig,
-        path: &PathSpec,
         path_id: PathId,
         underlay: UnderlayProtocol,
     ) -> Result<Self, RuntimeError> {
-        Self::for_session(security, path, path_id, underlay, random_session_id()?)
+        Self::for_session(security, path_id, underlay, random_session_id()?)
     }
 
     /// Persistent TCP and QUIC carriers authenticate under their shared MPP
-    /// session while retaining distinct path identities and capabilities.
+    /// session while retaining distinct path identities.
     pub(in crate::runtime) fn for_session(
         security: &SecurityConfig,
-        path: &PathSpec,
         path_id: PathId,
         underlay: UnderlayProtocol,
         session_id: SessionId,
@@ -45,14 +42,12 @@ impl ClientPathAuthenticationFrames {
         let session_tag =
             authenticator.session_auth_tag(session_id, session_nonce, issued_at_unix_secs);
         let path_nonce = random_nonce()?;
-        let capabilities = path.metadata.capabilities;
         let path_tag = authenticator.path_join_tag(
             session_id,
             path_id,
             underlay,
             path_nonce,
             issued_at_unix_secs,
-            capabilities,
         );
         Ok(Self {
             session_hello: Frame::SessionHello { session_id },
@@ -68,7 +63,6 @@ impl ClientPathAuthenticationFrames {
                 underlay,
                 nonce: path_nonce,
                 issued_at_unix_secs,
-                capabilities,
                 auth_tag: path_tag,
             },
         })
@@ -161,7 +155,6 @@ impl AuthenticatedServerPathSession {
             underlay,
             nonce,
             issued_at_unix_secs,
-            capabilities,
             auth_tag,
         } = frame
         else {
@@ -175,7 +168,6 @@ impl AuthenticatedServerPathSession {
                 underlay,
                 nonce,
                 issued_at_unix_secs,
-                capabilities,
                 tag: auth_tag,
                 now_unix_secs: self.now_unix_secs,
                 freshness_window_secs: self.freshness_window_secs,
@@ -187,7 +179,6 @@ impl AuthenticatedServerPathSession {
             session_id,
             path_id,
             nonce,
-            capabilities,
         })
     }
 }
@@ -197,5 +188,4 @@ pub(in crate::runtime) struct AuthenticatedPathJoin {
     pub(in crate::runtime) session_id: SessionId,
     pub(in crate::runtime) path_id: PathId,
     pub(in crate::runtime) nonce: AuthNonce,
-    pub(in crate::runtime) capabilities: PathCapabilities,
 }

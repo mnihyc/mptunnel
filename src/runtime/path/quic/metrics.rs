@@ -6,7 +6,7 @@ use crate::model::capacity::{
     QUIC_INITIAL_WINDOW_PACKETS, QUIC_MAX_ACK_DELAY, QUIC_TIMER_GRANULARITY,
     QuicCapacityProofCandidate,
 };
-use crate::model::timing::{default_transport_pto, transport_pto_from_ms};
+use crate::model::timing::transport_pto_from_ms;
 #[cfg(feature = "lab-diagnostics")]
 use crate::protocol::SessionId;
 use crate::protocol::{PathId, PathMetricDirection, PathMetrics, UnderlayProtocol};
@@ -37,11 +37,10 @@ pub(in crate::runtime) struct QuicAckPollDiagnostics {
 
 #[derive(Debug, Clone, Copy)]
 pub(in crate::runtime) struct UdpPathMetrics {
-    pub(in crate::runtime) direction: u8,
+    pub(in crate::runtime) direction: PathMetricDirection,
     pub(in crate::runtime) srtt: Duration,
     pub(in crate::runtime) rttvar: Duration,
-    pub(in crate::runtime) min_rtt: Duration,
-    pub(in crate::runtime) min_rtt_observed: bool,
+    pub(in crate::runtime) rtt_observed: bool,
     pub(in crate::runtime) delivery_rate_bps: f64,
     pub(in crate::runtime) pacing_rate_bps: f64,
     pub(in crate::runtime) inflight_hi: usize,
@@ -89,10 +88,7 @@ pub(super) async fn run_server_quic_path_metrics(
         if connection.is_closed() {
             return;
         }
-        let Some(mut metrics) = connection.tx_metrics(&mut tracker, 2).await else {
-            tokio::time::sleep(default_transport_pto()).await;
-            continue;
-        };
+        let mut metrics = connection.tx_metrics(&mut tracker, PathMetricDirection::ServerToClient);
         #[cfg(feature = "lab-diagnostics")]
         let metrics_poll_at = Instant::now();
         #[cfg(feature = "lab-diagnostics")]
@@ -196,7 +192,7 @@ pub(super) async fn run_server_quic_path_metrics(
                 lab_diagnostic(
                     "quic_carrier_rate_sample",
                     format_args!(
-                        "session_id={} path_id={} path_instance_id={} direction={} rate_source=quic_send_ack_max sample_bytes={} sample_count={} carrier_elapsed_us={} sample_elapsed_us={} raw_rate_bps={} published_rate_bps={} poll_elapsed_us={} total_sample_count={} total_sample_bytes={} app_limited={}",
+                        "session_id={} path_id={} path_instance_id={} direction={:?} rate_source=quic_send_ack_max sample_bytes={} sample_count={} carrier_elapsed_us={} sample_elapsed_us={} raw_rate_bps={} published_rate_bps={} poll_elapsed_us={} total_sample_count={} total_sample_bytes={} app_limited={}",
                         session_id.0,
                         path_id.0,
                         path_instance_id.as_u64(),
@@ -246,7 +242,7 @@ pub(super) fn log_quic_ack_poll_diagnostics(
         lab_diagnostic(
             "quic_carrier_ack_poll",
             format_args!(
-                "session_id={} path_id={} path_instance_id={} direction={} poll_elapsed_us={} newly_acked_bytes={} non_app_limited_acked_bytes={} timed_non_app_limited_acked_bytes={} ack_elapsed_us={} sample_count={} non_app_limited_sample_count={} timed_non_app_limited_sample_count={} carrier_app_limited={} evidence_written_delta={} evidence_newly_acked_bytes={} evidence_pending_ack_bytes={} pending_sample_bytes={} pending_sample_count={} pending_sample_elapsed_us={} proof_expires_in_us={}",
+                "session_id={} path_id={} path_instance_id={} direction={:?} poll_elapsed_us={} newly_acked_bytes={} non_app_limited_acked_bytes={} timed_non_app_limited_acked_bytes={} ack_elapsed_us={} sample_count={} non_app_limited_sample_count={} timed_non_app_limited_sample_count={} carrier_app_limited={} evidence_written_delta={} evidence_newly_acked_bytes={} evidence_pending_ack_bytes={} pending_sample_bytes={} pending_sample_count={} pending_sample_elapsed_us={} proof_expires_in_us={}",
                 session_id.0,
                 path_id.0,
                 path_instance_id,
@@ -280,7 +276,7 @@ pub(super) fn log_quic_ack_poll_diagnostics(
         lab_diagnostic(
             "quic_capacity_ack_poll",
             format_args!(
-                "session_id={} path_id={} path_instance_id={} direction={} calibration_id={} phase={:?} write_committed={} train_bytes={} written_bytes={} written_data_frame_count={} sample_floor_bytes={} warmup_bytes={} required_proof_bytes={} native_started_clean={} native_total_acked_bytes={} native_total_ack_count={} native_warmup_acked_bytes={} native_warmup_ack_count={} native_measurement_acked_bytes={} native_measurement_ack_count={} native_timed_measurement_acked_bytes={} native_timed_measurement_ack_count={} native_app_limited_acked_bytes={} native_app_limited_ack_count={} native_timed_elapsed_us={} native_proved_age_us={} receipt_received_bytes={} receipt_elapsed_us={} receipt_rtt_us={} receipt_age_us={} last_authoritative_bif_bytes={} last_authoritative_bif_age_us={} last_authoritative_sent_watermark={} receipt_frozen_sent_watermark={} current_sent_watermark={} proof_validity_ms={} proved_age_us={} attempt_remaining_us={} candidate_emitted={}",
+                "session_id={} path_id={} path_instance_id={} direction={:?} calibration_id={} phase={:?} write_committed={} train_bytes={} written_bytes={} written_data_frame_count={} sample_floor_bytes={} warmup_bytes={} required_proof_bytes={} native_started_clean={} native_total_acked_bytes={} native_total_ack_count={} native_warmup_acked_bytes={} native_warmup_ack_count={} native_measurement_acked_bytes={} native_measurement_ack_count={} native_timed_measurement_acked_bytes={} native_timed_measurement_ack_count={} native_app_limited_acked_bytes={} native_app_limited_ack_count={} native_timed_elapsed_us={} native_proved_age_us={} receipt_received_bytes={} receipt_elapsed_us={} receipt_rtt_us={} receipt_age_us={} last_authoritative_bif_bytes={} last_authoritative_bif_age_us={} last_authoritative_sent_watermark={} receipt_frozen_sent_watermark={} current_sent_watermark={} proof_validity_ms={} proved_age_us={} attempt_remaining_us={} candidate_emitted={}",
                 session_id.0,
                 path_id.0,
                 path_instance_id,
@@ -344,11 +340,7 @@ fn path_metrics_from_quic_path(path_id: PathId, metrics: UdpPathMetrics) -> Path
     PathMetrics {
         path_id,
         underlay: UnderlayProtocol::Udp,
-        direction: match metrics.direction {
-            1 => PathMetricDirection::ClientToServer,
-            2 => PathMetricDirection::ServerToClient,
-            _ => PathMetricDirection::ServerToClient,
-        },
+        direction: metrics.direction,
         metric_epoch: metric_epoch_now(),
         metric_age_us: metrics
             .last_delivery_sample_at
@@ -357,7 +349,6 @@ fn path_metrics_from_quic_path(path_id: PathId, metrics: UdpPathMetrics) -> Path
                 u32::try_from(micros).unwrap_or(u32::MAX)
             })
             .unwrap_or(0),
-        min_rtt_us: duration_to_micros_u32(metrics.min_rtt),
         srtt_us: duration_to_micros_u32(metrics.srtt),
         rttvar_us: duration_to_micros_u32(metrics.rttvar),
         jitter_us: duration_to_micros_u32(metrics.rttvar),

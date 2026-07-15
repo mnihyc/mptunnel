@@ -78,7 +78,7 @@ impl UdpPathEndpoint {
         Ok(Self {
             endpoint: quic_transport::Endpoint::bind_client_socket(
                 socket,
-                runtime.security.secret.as_bytes(),
+                runtime.security().secret.as_bytes(),
                 runtime.mux_limits,
             )
             .await?,

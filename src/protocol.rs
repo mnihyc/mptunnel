@@ -1,3 +1,8 @@
+//! Versioned MPP wire vocabulary and bounded codecs.
+//!
+//! Only peer-owned facts belong here; ingress, outbound, and configured path
+//! policy stay with their local endpoint owners.
+
 pub mod auth;
 pub mod codec;
 pub(crate) mod frame;
@@ -6,8 +11,7 @@ mod types;
 
 pub(crate) use types::FrameWriteClass;
 pub use types::{
-    AuthNonce, AuthTag, CloseReason, DatagramFlowId, DatagramId, Frame, IngressKind, OffsetRange,
-    OutboundPolicy, PacketNumber, PathCapabilities, PathId, PathMetricDirection, PathMetrics,
-    PathStatus, RateHint, ResetReason, SessionId, StreamDemandHint, StreamFlags, StreamId,
-    StreamOpenRole, TargetAddr, UnderlayProtocol,
+    AuthNonce, AuthTag, CloseReason, DatagramFlowId, DatagramId, Frame, OffsetRange, PathId,
+    PathMetricDirection, PathMetrics, PathStatus, ResetReason, SessionId, StreamDemandHint,
+    StreamId, StreamOpenRole, TargetAddr, UnderlayProtocol,
 };

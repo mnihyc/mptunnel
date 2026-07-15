@@ -175,7 +175,6 @@ pub(in crate::runtime) fn path_proof_metrics(
         direction,
         metric_epoch: metric_epoch_now(),
         metric_age_us: 0,
-        min_rtt_us: srtt_us,
         srtt_us,
         rttvar_us: 0,
         jitter_us: 0,

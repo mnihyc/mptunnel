@@ -15,8 +15,8 @@ use crate::model::capacity::{
 };
 use crate::protocol::path_capacity::CapacityReceiveTracker;
 use crate::protocol::{
-    Frame, PathCapabilities, PathId, PathMetricDirection, ResetReason, SessionId, StreamId,
-    StreamOpenRole, TargetAddr, UnderlayProtocol,
+    Frame, PathId, PathMetricDirection, ResetReason, SessionId, StreamId, StreamOpenRole,
+    TargetAddr, UnderlayProtocol,
 };
 use crate::runtime::error::RuntimeError;
 use crate::runtime::path::commands::{
@@ -36,7 +36,6 @@ pub(super) struct ServerUdpReliableStreamContext {
     pub(super) session_id: SessionId,
     pub(super) path_id: PathId,
     pub(super) path_registration: ServerCarrierPathRegistration,
-    pub(super) capabilities: PathCapabilities,
     pub(super) stream_id: StreamId,
     pub(super) target: TargetAddr,
     pub(super) lane: FlowLane,
@@ -73,7 +72,6 @@ pub(super) async fn handle_server_udp_reliable_stream(
         session_id,
         path_id,
         path_registration,
-        capabilities,
         stream_id,
         target,
         lane,
@@ -123,7 +121,6 @@ pub(super) async fn handle_server_udp_reliable_stream(
                     Frame::PathStatus {
                         path_id,
                         status: crate::protocol::PathStatus::Active,
-                        capabilities,
                     },
                 )
                 .await?;
@@ -166,7 +163,6 @@ pub(super) async fn handle_server_udp_reliable_stream(
             session_id,
             path_id,
             path_registration,
-            capabilities,
             stream_id,
             target: duplicate_open_target,
             lane,
@@ -183,7 +179,6 @@ struct ServerUdpReliableStreamLoop {
     session_id: SessionId,
     path_id: PathId,
     path_registration: ServerCarrierPathRegistration,
-    capabilities: PathCapabilities,
     stream_id: StreamId,
     target: TargetAddr,
     lane: FlowLane,
@@ -202,7 +197,6 @@ async fn run_server_udp_reliable_stream_loop(
         session_id,
         path_id,
         path_registration,
-        capabilities,
         stream_id,
         target,
         lane,
@@ -411,7 +405,6 @@ async fn run_server_udp_reliable_stream_loop(
                                         Frame::PathStatus {
                                             path_id,
                                             status: crate::protocol::PathStatus::Active,
-                                            capabilities,
                                         },
                                     )
                                     .await?;

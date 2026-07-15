@@ -139,7 +139,7 @@ impl ResponseStreamBinding {
         let source_limit_bytes = if latency_pressure {
             service_floor
         } else if has_service_feed_evidence {
-            bulk_active_service_product_envelope_bytes(snapshot, payload_bytes, self.mux_limits)
+            bulk_active_service_product_envelope_bytes(payload_bytes, self.mux_limits)
         } else {
             bulk_service_feed_reservoir_payload_bytes(payload_bytes, self.mux_limits) as u64
         };
@@ -152,7 +152,7 @@ impl ResponseStreamBinding {
         } else if latency_pressure {
             bulk_latency_pressure_service_feed_window_bytes(payload_bytes, self.mux_limits)
         } else {
-            bulk_active_service_product_envelope_bytes(snapshot, payload_bytes, self.mux_limits)
+            bulk_active_service_product_envelope_bytes(payload_bytes, self.mux_limits)
         };
         let state = ResponseServiceFeedDiagnosticState {
             path_instance_id: entry.path_instance_id,

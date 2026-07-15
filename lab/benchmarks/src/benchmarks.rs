@@ -3,7 +3,7 @@ use aes_gcm::{Aes256Gcm, Nonce as AesNonce};
 use chacha20poly1305::{ChaCha20Poly1305, Nonce as ChaChaNonce};
 use mptunnel::config::ResourceLimits;
 use mptunnel::protocol::{PathId, UnderlayProtocol};
-use mptunnel::scheduler::{FlowLane, PathSnapshot, SchedulerPolicy};
+use mptunnel::scheduler::{FlowLane, PathSnapshot};
 use mptunnel::simulator::{Simulator, VirtualPath};
 use serde::Serialize;
 use std::hint::black_box;
@@ -303,7 +303,6 @@ impl AblationReport {
 pub struct AblationRow {
     pub name: String,
     pub path_profile: String,
-    pub scheduler_profile: String,
     pub page_interactive_p95_ms: f64,
     pub download_goodput_mbps: f64,
     pub aggregation_efficiency: f64,
@@ -316,55 +315,41 @@ pub fn run_ablation_study() -> AblationReport {
         ablation_row(
             "single_low_latency",
             "low_latency_only",
-            "default",
             vec![download_paths()[0]],
-            SchedulerPolicy::default(),
         ),
         ablation_row(
             "single_high_bandwidth",
             "high_bandwidth_only",
-            "default",
             vec![download_paths()[1]],
-            SchedulerPolicy::default(),
         ),
         ablation_row(
             "single_poor_internet",
             "poor_internet_only",
-            "default",
             vec![download_paths()[2]],
-            SchedulerPolicy::default(),
         ),
         ablation_row(
             "multipath_full",
             "heterogeneous_all_links",
-            "default",
             download_paths(),
-            SchedulerPolicy::default(),
         ),
         ablation_row(
             "multipath_good_links",
             "heterogeneous_good_links",
-            "default",
             download_paths().into_iter().take(2).collect(),
-            SchedulerPolicy::default(),
         ),
         ablation_row(
             "multipath_unstable_mix",
             "low_latency_plus_unstable",
-            "default",
             vec![download_paths()[0], download_paths()[2]],
-            SchedulerPolicy::default(),
         ),
         ablation_row(
             "ideal_lab_same_protocol_group",
             "ideal_udp_udp_tcp_group",
-            "default",
             ideal_lab_paths(),
-            SchedulerPolicy::default(),
         ),
     ];
     AblationReport {
-        profile: "deterministic-ablation-v1".to_string(),
+        profile: "deterministic-path-ablation-v2".to_string(),
         rows,
     }
 }
@@ -372,11 +357,9 @@ pub fn run_ablation_study() -> AblationReport {
 fn ablation_row(
     name: &str,
     path_profile: &str,
-    scheduler_profile: &str,
     paths: Vec<VirtualPath>,
-    policy: SchedulerPolicy,
 ) -> AblationRow {
-    let mut page_simulator = Simulator::new(policy, paths.clone());
+    let mut page_simulator = Simulator::new(paths.clone());
     page_simulator
         .schedule_transfer(FlowLane::Throughput, 128 * MIB, MIB)
         .expect("ablation paths schedule background bulk");
@@ -386,12 +369,12 @@ fn ablation_row(
         .p95_latency_ms()
         .expect("interactive burst is nonempty");
 
-    let mut download_simulator = Simulator::new(policy, paths.clone());
+    let mut download_simulator = Simulator::new(paths.clone());
     let download = download_simulator
         .schedule_transfer(FlowLane::Throughput, 512 * MIB, MIB)
         .expect("ablation paths schedule file download");
 
-    let mut failover_simulator = Simulator::new(policy, failover_paths_for(paths));
+    let mut failover_simulator = Simulator::new(failover_paths_for(paths));
     let failover = failover_simulator
         .schedule_transfer_with_repair(FlowLane::Throughput, 8 * MIB, 256 * 1024, 10.0)
         .expect("ablation paths schedule repaired transfer");
@@ -399,7 +382,6 @@ fn ablation_row(
     AblationRow {
         name: name.to_string(),
         path_profile: path_profile.to_string(),
-        scheduler_profile: scheduler_profile.to_string(),
         page_interactive_p95_ms,
         download_goodput_mbps: download.achieved_goodput_bps() / 1_000_000.0,
         aggregation_efficiency: download.aggregation_efficiency(mbps(1_000.0)),
@@ -458,7 +440,7 @@ struct PageLoadMetrics {
 }
 
 fn page_load_benchmark() -> PageLoadMetrics {
-    let mut simulator = Simulator::new(SchedulerPolicy::default(), browser_paths());
+    let mut simulator = Simulator::new(browser_paths());
     simulator
         .schedule_transfer(FlowLane::Throughput, 128 * MIB, MIB)
         .expect("benchmark paths schedule bulk warmup");
@@ -493,7 +475,7 @@ fn page_load_benchmark() -> PageLoadMetrics {
     completions.sort_by(f64::total_cmp);
     let complete_ms = completions.last().copied().unwrap_or_default();
 
-    let mut interactive_simulator = Simulator::new(SchedulerPolicy::default(), browser_paths());
+    let mut interactive_simulator = Simulator::new(browser_paths());
     interactive_simulator
         .schedule_transfer(FlowLane::Throughput, 128 * MIB, MIB)
         .expect("benchmark paths schedule background bulk");
@@ -515,7 +497,7 @@ struct VideoMetrics {
 }
 
 fn video_streaming_benchmark() -> VideoMetrics {
-    let mut simulator = Simulator::new(SchedulerPolicy::default(), browser_paths());
+    let mut simulator = Simulator::new(browser_paths());
     let first_segment = simulator
         .schedule_transfer(FlowLane::Throughput, 3 * MIB, 512 * 1024)
         .expect("benchmark paths schedule first video segment");
@@ -548,7 +530,7 @@ struct DownloadMetrics {
 }
 
 fn file_download_benchmark() -> DownloadMetrics {
-    let mut simulator = Simulator::new(SchedulerPolicy::default(), download_paths());
+    let mut simulator = Simulator::new(download_paths());
     let transfer = simulator
         .schedule_transfer(FlowLane::Throughput, 512 * MIB, MIB)
         .expect("benchmark paths schedule file download");
@@ -559,7 +541,7 @@ fn file_download_benchmark() -> DownloadMetrics {
 }
 
 fn ideal_lab_benchmark() -> DownloadMetrics {
-    let mut simulator = Simulator::new(SchedulerPolicy::default(), ideal_lab_paths());
+    let mut simulator = Simulator::new(ideal_lab_paths());
     let transfer = simulator
         .schedule_transfer(FlowLane::Throughput, 1024 * MIB, MIB)
         .expect("ideal lab paths schedule file download");
@@ -579,7 +561,6 @@ fn failover_benchmark() -> FailoverMetrics {
     let primary = PathSnapshot::new(PathId(0), UnderlayProtocol::Udp, 20.0, mbps(120.0));
     let survivor = PathSnapshot::new(PathId(1), UnderlayProtocol::Udp, 80.0, mbps(160.0));
     let mut simulator = Simulator::new(
-        SchedulerPolicy::default(),
         vec![
             VirtualPath::new(primary).with_failure_at(70.0),
             VirtualPath::new(survivor),
@@ -678,8 +659,7 @@ where
 
 fn browser_paths() -> Vec<VirtualPath> {
     let mut low_latency = PathSnapshot::new(PathId(0), UnderlayProtocol::Udp, 20.0, mbps(30.0));
-    low_latency.flags.low_latency = true;
-    low_latency.flags.bulk_allowed = false;
+    low_latency.policy.bulk_allowed = false;
     let high_bandwidth = PathSnapshot::new(PathId(1), UnderlayProtocol::Udp, 180.0, mbps(300.0));
     let mut unstable = PathSnapshot::new(PathId(2), UnderlayProtocol::Udp, 80.0, mbps(100.0));
     unstable.jitter_ms = 20.0;
@@ -692,8 +672,7 @@ fn browser_paths() -> Vec<VirtualPath> {
 }
 
 fn download_paths() -> Vec<VirtualPath> {
-    let mut low_latency = PathSnapshot::new(PathId(0), UnderlayProtocol::Udp, 20.0, mbps(30.0));
-    low_latency.flags.low_latency = true;
+    let low_latency = PathSnapshot::new(PathId(0), UnderlayProtocol::Udp, 20.0, mbps(30.0));
     let high_bandwidth = PathSnapshot::new(PathId(1), UnderlayProtocol::Udp, 180.0, mbps(300.0));
     let mut unstable = PathSnapshot::new(PathId(2), UnderlayProtocol::Udp, 80.0, mbps(100.0));
     unstable.jitter_ms = 20.0;
@@ -790,7 +769,7 @@ mod tests {
         );
         assert!(report.rows.iter().any(|row| row.name == "multipath_full"));
         let json = report.render_json().expect("json");
-        assert!(json.contains("deterministic-ablation-v1"));
+        assert!(json.contains("deterministic-path-ablation-v2"));
     }
 
     #[test]

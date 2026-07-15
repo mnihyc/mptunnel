@@ -207,13 +207,8 @@ impl ResponseStreamBinding {
             .outputs
             .lock()
             .expect("server reliable stream binding lock");
-        let mut changed = false;
-        for entry in &mut outputs.entries {
-            if entry.product_queue_bytes != bytes {
-                entry.product_queue_bytes = bytes;
-                changed = true;
-            }
-        }
+        let changed = outputs.product_queue_bytes != bytes;
+        outputs.product_queue_bytes = bytes;
         if changed {
             self.response_model_generation
                 .fetch_add(1, Ordering::AcqRel);

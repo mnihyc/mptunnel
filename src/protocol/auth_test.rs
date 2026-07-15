@@ -54,69 +54,49 @@ fn session_auth_tag_verifies_and_detects_tampering() {
 }
 
 #[test]
-fn path_join_tag_covers_underlay_and_capabilities() {
+fn path_join_tag_covers_identity_underlay_nonce_and_freshness() {
     let auth = authenticator();
     let nonce = AuthNonce([3; 16]);
     let issued_at = 1_735_689_600;
-    let caps = PathCapabilities {
-        low_latency: true,
-        bulk_allowed: true,
-        ..PathCapabilities::default()
-    };
     let tag = auth.path_join_tag(
         SessionId(9),
         PathId(2),
         UnderlayProtocol::Udp,
         nonce,
         issued_at,
-        caps,
     );
+    let check = PathJoinAuthCheck {
+        session_id: SessionId(9),
+        path_id: PathId(2),
+        underlay: UnderlayProtocol::Udp,
+        nonce,
+        issued_at_unix_secs: issued_at,
+        tag,
+        now_unix_secs: issued_at,
+        freshness_window_secs: 300,
+    };
 
-    assert!(auth.verify_path_join(PathJoinAuthCheck {
-        session_id: SessionId(9),
-        path_id: PathId(2),
-        underlay: UnderlayProtocol::Udp,
-        nonce,
-        issued_at_unix_secs: issued_at,
-        capabilities: caps,
-        tag,
-        now_unix_secs: issued_at,
-        freshness_window_secs: 300,
+    assert!(auth.verify_path_join(check));
+    assert!(!auth.verify_path_join(PathJoinAuthCheck {
+        path_id: PathId(3),
+        ..check
     }));
     assert!(!auth.verify_path_join(PathJoinAuthCheck {
-        session_id: SessionId(9),
-        path_id: PathId(2),
         underlay: UnderlayProtocol::Tcp,
-        nonce,
-        issued_at_unix_secs: issued_at,
-        capabilities: caps,
-        tag,
-        now_unix_secs: issued_at,
-        freshness_window_secs: 300,
+        ..check
     }));
     assert!(!auth.verify_path_join(PathJoinAuthCheck {
-        session_id: SessionId(9),
-        path_id: PathId(2),
-        underlay: UnderlayProtocol::Udp,
-        nonce,
-        issued_at_unix_secs: issued_at,
-        capabilities: PathCapabilities {
-            expensive: true,
-            ..caps
-        },
-        tag,
-        now_unix_secs: issued_at,
-        freshness_window_secs: 300,
+        nonce: AuthNonce([4; 16]),
+        ..check
+    }));
+    let mut tampered_tag = tag.0;
+    tampered_tag[0] ^= 1;
+    assert!(!auth.verify_path_join(PathJoinAuthCheck {
+        tag: AuthTag(tampered_tag),
+        ..check
     }));
     assert!(!auth.verify_path_join(PathJoinAuthCheck {
-        session_id: SessionId(9),
-        path_id: PathId(2),
-        underlay: UnderlayProtocol::Udp,
-        nonce,
-        issued_at_unix_secs: issued_at,
-        capabilities: caps,
-        tag,
         now_unix_secs: issued_at + 301,
-        freshness_window_secs: 300,
+        ..check
     }));
 }

@@ -9,7 +9,7 @@ use super::client_stream::{ClientTcpOpenCancellation, next_client_tcp_open_attem
 use crate::config::ResourceLimits;
 #[cfg(test)]
 use crate::protocol::SessionId;
-use crate::protocol::{IngressKind, StreamId, StreamOpenRole, TargetAddr};
+use crate::protocol::{StreamId, StreamOpenRole, TargetAddr};
 use crate::runtime::error::RuntimeError;
 use crate::runtime::path::commands::{
     ClientTcpOpenDeadlines, ClientTcpOpenResponse, ClientTcpOpenedStream, ReliablePathCommand,
@@ -85,7 +85,6 @@ impl ClientTcpPathSessionHandle {
         &self,
         stream_id: StreamId,
         target: TargetAddr,
-        ingress: IngressKind,
         lane: FlowLane,
         role: StreamOpenRole,
         open_deadline: tokio::time::Instant,
@@ -93,7 +92,6 @@ impl ClientTcpPathSessionHandle {
         self.open_stream_with_deadlines(
             stream_id,
             target,
-            ingress,
             lane,
             role,
             ClientTcpOpenDeadlines::fixed(open_deadline),
@@ -106,7 +104,6 @@ impl ClientTcpPathSessionHandle {
         &self,
         stream_id: StreamId,
         target: TargetAddr,
-        ingress: IngressKind,
         lane: FlowLane,
         role: StreamOpenRole,
         open_deadlines: ClientTcpOpenDeadlines,
@@ -136,7 +133,6 @@ impl ClientTcpPathSessionHandle {
                 attempt_id,
                 observed_carrier_generation,
                 target,
-                ingress,
                 lane,
                 role,
                 open_deadlines,

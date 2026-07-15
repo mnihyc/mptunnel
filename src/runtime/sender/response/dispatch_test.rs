@@ -13,7 +13,6 @@ use crate::runtime::stream::*;
 use crate::scheduler::*;
 use bytes::Bytes;
 use std::sync::Arc;
-use std::time::Duration;
 use tokio::sync::mpsc;
 
 #[test]
@@ -42,7 +41,6 @@ fn path_failure_repair_stream_data_uses_data_queue_when_priority_is_full() {
     let repair_frame = Frame::StreamData {
         stream_id,
         offset: 1024,
-        flags: StreamFlags::NONE,
         payload: Bytes::from(vec![7_u8; payload_bytes]),
     };
     let active_key = CarrierPathKey {
@@ -78,7 +76,6 @@ fn path_failure_repair_stream_data_uses_data_queue_when_priority_is_full() {
             survivor_commands,
             FlowLane::Throughput,
             StreamOpenRole::Validation,
-            payload_bytes,
         ),
         ResponseStreamAttachOutcome::Attached
     );
@@ -129,7 +126,6 @@ fn mixed_dispatch_plan_does_not_carry_udp_product_duplicate_when_primary_is_tcp(
             direction: PathMetricDirection::ServerToClient,
             metric_epoch: metric_epoch_now(),
             metric_age_us: 0,
-            min_rtt_us: 50_000,
             srtt_us: 50_000,
             rttvar_us: 1_000,
             jitter_us: 1_000,
@@ -159,7 +155,6 @@ fn mixed_dispatch_plan_does_not_carry_udp_product_duplicate_when_primary_is_tcp(
             validation_commands,
             FlowLane::Throughput,
             StreamOpenRole::Validation,
-            payload_bytes,
         ),
         ResponseStreamAttachOutcome::Attached
     );
@@ -174,7 +169,6 @@ fn mixed_dispatch_plan_does_not_carry_udp_product_duplicate_when_primary_is_tcp(
             direction: PathMetricDirection::ServerToClient,
             metric_epoch: metric_epoch_now(),
             metric_age_us: 0,
-            min_rtt_us: 20_000,
             srtt_us: 20_000,
             rttvar_us: 1_000,
             jitter_us: 1_000,
@@ -248,7 +242,6 @@ async fn stale_service_plan_cannot_enqueue_owner_data_after_repair_role_change()
             validation_commands.clone(),
             FlowLane::Throughput,
             StreamOpenRole::Validation,
-            payload_bytes,
         ),
         ResponseStreamAttachOutcome::Attached
     );
@@ -269,7 +262,7 @@ async fn stale_service_plan_cannot_enqueue_owner_data_after_repair_role_change()
     let plan = plan_response_data_dispatch(&stream, FlowLane::Throughput, 0, payload_bytes)
         .expect("liveness survivor may become the frontier-clear Service");
     assert_eq!(plan.primary_key(), Some(validation));
-    assert_eq!(plan.primary_role(), PathRuntimeRole::Service);
+    assert_eq!(plan.primary_admission(), PathAdmission::Service);
     assert_eq!(
         binding.attach(
             validation.underlay,
@@ -277,14 +270,12 @@ async fn stale_service_plan_cannot_enqueue_owner_data_after_repair_role_change()
             validation_commands,
             FlowLane::Throughput,
             StreamOpenRole::Repair,
-            payload_bytes,
         ),
         ResponseStreamAttachOutcome::RoleChanged
     );
     let frame = Frame::StreamData {
         stream_id: StreamId(77),
         offset: 0,
-        flags: StreamFlags::NONE,
         payload: Bytes::from(vec![0x77; payload_bytes]),
     };
 
@@ -337,7 +328,7 @@ async fn passive_attach_preserves_one_bounded_exact_service_plan() {
     let plan = plan_response_data_dispatch(&stream, FlowLane::Throughput, 0, payload_bytes)
         .expect("live Service has a bounded owner plan");
     assert_eq!(plan.primary_key(), Some(service));
-    assert_eq!(plan.primary_role(), PathRuntimeRole::Service);
+    assert_eq!(plan.primary_admission(), PathAdmission::Service);
     let planner_generation = binding.subflow_state_snapshot().0;
 
     let repair = CarrierPathKey {
@@ -352,7 +343,6 @@ async fn passive_attach_preserves_one_bounded_exact_service_plan() {
             repair_commands,
             FlowLane::Throughput,
             StreamOpenRole::Repair,
-            payload_bytes,
         ),
         ResponseStreamAttachOutcome::Attached
     );
@@ -361,7 +351,6 @@ async fn passive_attach_preserves_one_bounded_exact_service_plan() {
     let frame = Frame::StreamData {
         stream_id: StreamId(109),
         offset: 0,
-        flags: StreamFlags::NONE,
         payload: Bytes::from(vec![0x6d; payload_bytes]),
     };
     let outcome =
@@ -400,7 +389,6 @@ async fn quic_probe_path_does_not_receive_product_duplicate_data() {
             validation_commands,
             FlowLane::Throughput,
             StreamOpenRole::Validation,
-            payload_bytes,
         ),
         ResponseStreamAttachOutcome::Attached
     );
@@ -420,7 +408,6 @@ async fn quic_probe_path_does_not_receive_product_duplicate_data() {
     let frame = Frame::StreamData {
         stream_id: StreamId(7),
         offset: 0,
-        flags: StreamFlags::NONE,
         payload: Bytes::from(vec![7_u8; payload_bytes]),
     };
 
@@ -495,7 +482,6 @@ async fn response_owner_data_keeps_fifo_order_across_lane_changes() {
         Frame::StreamData {
             stream_id: StreamId(108),
             offset: 0,
-            flags: StreamFlags::NONE,
             payload: Bytes::from_static(b"aaaa"),
         },
         FlowLane::Throughput,
@@ -507,7 +493,6 @@ async fn response_owner_data_keeps_fifo_order_across_lane_changes() {
         Frame::StreamData {
             stream_id: StreamId(108),
             offset: 4,
-            flags: StreamFlags::NONE,
             payload: Bytes::from_static(b"bbbb"),
         },
         FlowLane::Latency,
@@ -557,7 +542,6 @@ async fn one_flow_response_bounds_app_limited_sampling_before_service_resumes() 
             direction: PathMetricDirection::ServerToClient,
             metric_epoch: metric_epoch_now(),
             metric_age_us: 0,
-            min_rtt_us: 50_000,
             srtt_us: 50_000,
             rttvar_us: 1_000,
             jitter_us: 1_000,
@@ -591,7 +575,6 @@ async fn one_flow_response_bounds_app_limited_sampling_before_service_resumes() 
             optional_commands,
             FlowLane::Throughput,
             StreamOpenRole::Validation,
-            payload_bytes,
         ),
         ResponseStreamAttachOutcome::Attached
     );
@@ -603,7 +586,6 @@ async fn one_flow_response_bounds_app_limited_sampling_before_service_resumes() 
             direction: PathMetricDirection::ServerToClient,
             metric_epoch: metric_epoch_now(),
             metric_age_us: 0,
-            min_rtt_us: 5_000,
             srtt_us: 5_000,
             rttvar_us: 500,
             jitter_us: 500,
@@ -633,7 +615,6 @@ async fn one_flow_response_bounds_app_limited_sampling_before_service_resumes() 
             direction: PathMetricDirection::ServerToClient,
             metric_epoch: metric_epoch_now(),
             metric_age_us: 0,
-            min_rtt_us: 5_000,
             srtt_us: 5_000,
             rttvar_us: 500,
             jitter_us: 500,
@@ -675,12 +656,11 @@ async fn one_flow_response_bounds_app_limited_sampling_before_service_resumes() 
             plan_response_data_dispatch(&stream, FlowLane::Throughput, offset, payload_bytes)
                 .expect("bounded Validation sampling should be dispatchable");
         assert_eq!(plan.primary_key(), Some(optional));
-        assert_eq!(plan.primary_role(), PathRuntimeRole::Subflow);
+        assert_eq!(plan.primary_admission(), PathAdmission::Subflow);
 
         let frame = Frame::StreamData {
             stream_id: StreamId(88),
             offset,
-            flags: StreamFlags::NONE,
             payload: Bytes::from(vec![9_u8; payload_bytes]),
         };
         let outcome = emit_planned_response_data_frame(&stream, plan, frame, FlowLane::Throughput)
@@ -699,11 +679,10 @@ async fn one_flow_response_bounds_app_limited_sampling_before_service_resumes() 
         plan_response_data_dispatch(&stream, FlowLane::Throughput, service_offset, payload_bytes)
             .expect("Service should resume after the startup sample cap");
     assert_eq!(plan.primary_key(), Some(service));
-    assert_eq!(plan.primary_role(), PathRuntimeRole::Service);
+    assert_eq!(plan.primary_admission(), PathAdmission::Service);
     let frame = Frame::StreamData {
         stream_id: StreamId(88),
         offset: service_offset,
-        flags: StreamFlags::NONE,
         payload: Bytes::from(vec![7_u8; payload_bytes]),
     };
     let outcome = emit_planned_response_data_frame(&stream, plan, frame, FlowLane::Throughput)
@@ -741,7 +720,6 @@ async fn blocked_path_queue_rolls_back_unemitted_startup_credit() {
             candidate_commands.clone(),
             FlowLane::Throughput,
             StreamOpenRole::Validation,
-            payload_bytes,
         ),
         ResponseStreamAttachOutcome::Attached
     );
@@ -760,8 +738,6 @@ async fn blocked_path_queue_rolls_back_unemitted_startup_credit() {
         expected_lane_generation: binding.lane_generation(),
         service,
         startup_owner_credit_bytes: payload_bytes,
-        optional_overhead_budget_bytes: 0,
-        max_read_gap_budget: Duration::ZERO,
         input: SubflowAdmissionInput {
             key: candidate,
             bulk_rate_proven: false,
@@ -769,9 +745,7 @@ async fn blocked_path_queue_rolls_back_unemitted_startup_credit() {
             frontier_clear: true,
             completion_improves: false,
             observed_goodput_non_degrading: true,
-            read_gap: Duration::ZERO,
             owner_bytes: payload_bytes,
-            optional_overhead_bytes: 0,
         },
     };
     let (_frames_tx, frames_rx) = mpsc::channel(1);
@@ -787,7 +761,6 @@ async fn blocked_path_queue_rolls_back_unemitted_startup_credit() {
     let frame = Frame::StreamData {
         stream_id: StreamId(89),
         offset: 0,
-        flags: StreamFlags::NONE,
         payload: Bytes::from(vec![5_u8; payload_bytes]),
     };
     candidate_commands
@@ -855,7 +828,6 @@ async fn stale_passive_topology_plan_blocks_subflow_reservation_and_enqueue() {
             candidate_commands,
             FlowLane::Throughput,
             StreamOpenRole::Validation,
-            payload_bytes,
         ),
         ResponseStreamAttachOutcome::Attached
     );
@@ -877,17 +849,13 @@ async fn stale_passive_topology_plan_blocks_subflow_reservation_and_enqueue() {
         frontier_clear: true,
         completion_improves: false,
         observed_goodput_non_degrading: true,
-        read_gap: Duration::ZERO,
         owner_bytes: payload_bytes,
-        optional_overhead_bytes: 0,
     };
     let stale_request = ResponseSubflowAdmissionRequest {
         expected_planner_generation: stale_planner_generation,
         expected_lane_generation: lane_generation,
         service,
         startup_owner_credit_bytes: payload_bytes,
-        optional_overhead_budget_bytes: 0,
-        max_read_gap_budget: Duration::ZERO,
         input,
     };
     let (unrelated_commands, _unrelated_rx) = reliable_path_command_channels(8);
@@ -898,7 +866,6 @@ async fn stale_passive_topology_plan_blocks_subflow_reservation_and_enqueue() {
             unrelated_commands,
             FlowLane::Throughput,
             StreamOpenRole::Validation,
-            payload_bytes,
         ),
         ResponseStreamAttachOutcome::Attached
     );
@@ -918,7 +885,6 @@ async fn stale_passive_topology_plan_blocks_subflow_reservation_and_enqueue() {
     let frame = Frame::StreamData {
         stream_id: StreamId(90),
         offset: 0,
-        flags: StreamFlags::NONE,
         payload: Bytes::from(vec![0x55; payload_bytes]),
     };
     let stale = emit_planned_response_data_frame(
@@ -983,7 +949,6 @@ async fn quic_ack_data_path_does_not_own_range_under_lower_owner_debt() {
     let active_frame = Frame::StreamData {
         stream_id: StreamId(7),
         offset: 0,
-        flags: StreamFlags::NONE,
         payload: Bytes::from(vec![3_u8; payload_bytes]),
     };
     binding.record_owner_flight(active_key, &active_frame);
@@ -996,7 +961,6 @@ async fn quic_ack_data_path_does_not_own_range_under_lower_owner_debt() {
             ack_data_path_commands,
             FlowLane::Throughput,
             StreamOpenRole::Validation,
-            payload_bytes,
         ),
         ResponseStreamAttachOutcome::Attached
     );
@@ -1012,12 +976,11 @@ async fn quic_ack_data_path_does_not_own_range_under_lower_owner_debt() {
             direction: PathMetricDirection::ServerToClient,
             metric_epoch: metric_epoch_now(),
             metric_age_us: 0,
-            min_rtt_us: 20_000,
             srtt_us: 20_000,
             rttvar_us: 1_000,
             jitter_us: 1_000,
-            delivery_rate_bps: default_path_rate_bps(UnderlayProtocol::Udp).round() as u64,
-            pacing_rate_bps: default_path_rate_bps(UnderlayProtocol::Udp).round() as u64,
+            delivery_rate_bps: default_path_rate_bps().round() as u64,
+            pacing_rate_bps: default_path_rate_bps().round() as u64,
             loss_ppm: 0,
             ecn_ppm: 0,
             loss_observed: false,
@@ -1053,15 +1016,14 @@ async fn quic_ack_data_path_does_not_own_range_under_lower_owner_debt() {
     .expect("active owner should remain dispatchable");
     assert_eq!(plan.primary_key(), Some(active_key));
     assert_eq!(
-        plan.primary_role(),
-        PathRuntimeRole::Service,
+        plan.primary_admission(),
+        PathAdmission::Service,
         "validation paths must not receive unique owner data while lower bytes are unresolved"
     );
 
     let service_frame = Frame::StreamData {
         stream_id: StreamId(7),
         offset: payload_bytes as u64,
-        flags: StreamFlags::NONE,
         payload: Bytes::from(vec![4_u8; payload_bytes]),
     };
     let outcome =

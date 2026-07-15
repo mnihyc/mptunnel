@@ -5,9 +5,7 @@ use super::{
     reliable_path_stream_ordered_queue_lane, try_recv_reliable_path_command,
 };
 use crate::model::capacity::RELIABLE_STREAM_STARTUP_PRODUCT_WINDOW_BYTES;
-use crate::protocol::{
-    DatagramFlowId, Frame, PathId, ResetReason, SessionId, StreamFlags, StreamId,
-};
+use crate::protocol::{DatagramFlowId, Frame, PathId, ResetReason, SessionId, StreamId};
 use crate::runtime::error::RuntimeError;
 use crate::runtime::path::CarrierCommandLease;
 use crate::runtime::stream::response::{
@@ -48,7 +46,6 @@ fn tcp_capacity_attempt_is_spent_only_after_queue_admission() {
             Frame::StreamData {
                 stream_id: StreamId(1),
                 offset: 0,
-                flags: StreamFlags::NONE,
                 payload: Bytes::from_static(b"queued"),
             },
             reliable_path_stream_ordered_queue_lane(),
@@ -158,7 +155,6 @@ async fn terminal_reset_and_close_uses_one_ordered_queue_item() {
             Frame::StreamData {
                 stream_id,
                 offset: 0,
-                flags: StreamFlags::NONE,
                 payload: Bytes::from_static(b"bulk"),
             },
             FlowLane::Throughput,
@@ -216,7 +212,6 @@ async fn cancelling_waiting_terminal_reset_releases_queue_debt() {
             Frame::StreamData {
                 stream_id,
                 offset: 0,
-                flags: StreamFlags::NONE,
                 payload: Bytes::from_static(b"bulk"),
             },
             FlowLane::Throughput,

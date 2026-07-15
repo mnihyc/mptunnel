@@ -3,13 +3,14 @@
 //! The registration guard, substates, and biased input loop live together so
 //! no stream, datagram, or proof can outlive the TCP carrier that owns it.
 
+use super::io::encrypted_framed_peer_closed;
 use super::server_datagram::{ServerTcpDatagramEffect, ServerTcpDatagramState};
 use super::server_evidence::{ServerTcpEvidenceOutcome, ServerTcpEvidenceState};
 use super::server_stream::ServerTcpStreamState;
 use super::server_writer::ServerTcpWriter;
 #[cfg(feature = "lab-diagnostics")]
 use crate::lab_diagnostics::lab_diagnostic;
-use crate::protocol::{CloseReason, Frame, PathCapabilities, PathId, ResetReason, SessionId};
+use crate::protocol::{CloseReason, Frame, PathId, ResetReason, SessionId};
 use crate::runtime::error::RuntimeError;
 use crate::runtime::path::ServerCarrierPathRegistration;
 use crate::runtime::path::commands::{
@@ -46,7 +47,6 @@ pub(super) struct ServerTcpPathAdmission {
     pub(super) context: ServerPathContext,
     pub(super) session_id: SessionId,
     pub(super) path_id: PathId,
-    pub(super) path_capabilities: PathCapabilities,
     pub(super) path_registration: ServerCarrierPathRegistration,
     pub(super) writer: ServerTcpWriter,
     pub(super) path_frames: mpsc::Receiver<Result<Frame, EncryptedFramedTransportError>>,
@@ -58,7 +58,6 @@ pub(super) struct ServerTcpPathAdmission {
 pub(super) struct ServerTcpPathSession {
     session_id: SessionId,
     path_id: PathId,
-    path_capabilities: PathCapabilities,
     draining: bool,
     // Field order releases probe/flow RAII before queues and registration.
     evidence: ServerTcpEvidenceState,
@@ -77,7 +76,6 @@ impl ServerTcpPathSession {
         Self {
             session_id: admission.session_id,
             path_id: admission.path_id,
-            path_capabilities: admission.path_capabilities,
             draining: false,
             evidence: admission.evidence,
             datagrams: ServerTcpDatagramState::new(),
@@ -168,7 +166,6 @@ impl ServerTcpPathSession {
                         &self.commands_tx,
                         self.session_id,
                         self.path_id,
-                        self.path_capabilities,
                         self.evidence.startup_metrics(),
                         stream_id,
                         target,
@@ -340,7 +337,6 @@ impl ServerTcpPathSession {
                     .write_frame(&Frame::PathStatus {
                         path_id: self.path_id,
                         status: crate::protocol::PathStatus::Draining,
-                        capabilities: self.path_capabilities,
                     })
                     .await?
                 {
@@ -681,6 +677,7 @@ async fn recv_server_tcp_path_event(
             frame = path_frames.recv() => {
                 return match frame {
                     Some(Ok(frame)) => Ok(Some(ServerTcpPathEvent::Frame(frame))),
+                    Some(Err(err)) if encrypted_framed_peer_closed(&err) => Ok(None),
                     Some(Err(err)) => Err(RuntimeError::Encrypted(err)),
                     None => Err(RuntimeError::ReliablePathSessionClosed),
                 };

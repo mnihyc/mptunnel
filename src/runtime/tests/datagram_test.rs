@@ -1,5 +1,6 @@
 use super::*;
 use crate::config::ResourceLimits;
+use crate::protocol::PathMetricDirection;
 #[cfg(feature = "lab-diagnostics")]
 use crate::runtime::path::quic::metrics::QuicAckPollDiagnostics;
 use crate::runtime::path::quic::metrics::UdpPathMetrics;
@@ -480,13 +481,13 @@ fn tcp_datagram_open_budget_is_ttl_bounded_and_reserves_an_alternative() {
     let ttl = Duration::from_millis(DEFAULT_SOCKS5_UDP_TTL_MS.into());
     let initial_pto = path_open_pto(None, false);
     assert_eq!(
-        tcp_datagram_path_open_timeout(None, false, false, ttl),
+        tcp_datagram_path_open_timeout(None, false, ttl),
         initial_pto
             .saturating_mul(active_path_open_pto_multiplier(None))
             .min(ttl)
     );
     assert_eq!(
-        tcp_datagram_path_open_timeout(None, false, true, ttl),
+        tcp_datagram_path_open_timeout(None, true, ttl),
         initial_pto
             .saturating_mul(active_path_open_serialized_exchanges(None))
             .min(ttl / 2)
@@ -494,11 +495,11 @@ fn tcp_datagram_open_budget_is_ttl_bounded_and_reserves_an_alternative() {
 
     let tight_ttl = Duration::from_millis(250);
     assert_eq!(
-        tcp_datagram_path_open_timeout(None, false, false, tight_ttl),
+        tcp_datagram_path_open_timeout(None, false, tight_ttl),
         tight_ttl
     );
     assert_eq!(
-        tcp_datagram_path_open_timeout(None, false, true, tight_ttl),
+        tcp_datagram_path_open_timeout(None, true, tight_ttl),
         tight_ttl / 2
     );
 }
@@ -520,13 +521,13 @@ fn fresh_tcp_datagram_carrier_keeps_initial_pto_floor_after_live_probe() {
 
     let ttl = Duration::from_secs(30);
     assert_eq!(
-        tcp_datagram_path_open_timeout(context.tcp_path_snapshot(0), true, true, ttl),
+        tcp_datagram_path_open_timeout(context.tcp_path_snapshot(0), true, ttl),
         path_open_pto(context.tcp_path_snapshot(0), false).saturating_mul(
             active_path_open_serialized_exchanges(context.tcp_path_snapshot(0))
         ),
     );
     assert_eq!(
-        tcp_datagram_path_open_timeout(context.tcp_path_snapshot(0), true, false, ttl),
+        tcp_datagram_path_open_timeout(context.tcp_path_snapshot(0), false, ttl),
         path_open_pto(context.tcp_path_snapshot(0), false).saturating_mul(
             active_path_open_pto_multiplier(context.tcp_path_snapshot(0))
         ),
@@ -538,9 +539,7 @@ fn udp_path_open_timeout_uses_adaptive_multipath_startup_budget() {
     let mut model = UdpPathRuntimeModel {
         pacing_rate_bps: 1.0,
         response_timeout: Duration::from_millis(300),
-        mtu_payload_bytes: UDP_DEFAULT_MTU_PAYLOAD_BYTES,
-        mtu_is_measured: false,
-        mtu_probe_ceiling_payload_bytes: UDP_MAX_MTU_PAYLOAD_BYTES,
+        max_payload_bytes: MAX_PRODUCT_DATAGRAM_PAYLOAD_BYTES,
     };
 
     assert_eq!(
@@ -588,9 +587,7 @@ fn udp_first_datagram_response_uses_startup_budget_for_cold_association() {
     let mut model = UdpPathRuntimeModel {
         pacing_rate_bps: 1.0,
         response_timeout: Duration::from_millis(65),
-        mtu_payload_bytes: UDP_DEFAULT_MTU_PAYLOAD_BYTES,
-        mtu_is_measured: false,
-        mtu_probe_ceiling_payload_bytes: UDP_MAX_MTU_PAYLOAD_BYTES,
+        max_payload_bytes: MAX_PRODUCT_DATAGRAM_PAYLOAD_BYTES,
     };
 
     assert_eq!(
@@ -622,16 +619,12 @@ fn udp_runtime_model_backs_off_response_timeout_after_loss() {
     let stable_model = UdpPathRuntimeModel::from_snapshot(
         stable,
         DEFAULT_SOCKS5_UDP_TTL_MS,
-        UDP_DEFAULT_MTU_PAYLOAD_BYTES,
-        true,
-        UDP_MAX_MTU_PAYLOAD_BYTES,
+        MAX_PRODUCT_DATAGRAM_PAYLOAD_BYTES,
     );
     let lossy_model = UdpPathRuntimeModel::from_snapshot(
         lossy,
         DEFAULT_SOCKS5_UDP_TTL_MS,
-        UDP_DEFAULT_MTU_PAYLOAD_BYTES,
-        true,
-        UDP_MAX_MTU_PAYLOAD_BYTES,
+        MAX_PRODUCT_DATAGRAM_PAYLOAD_BYTES,
     );
 
     assert!(lossy_model.response_timeout > stable_model.response_timeout);
@@ -1196,11 +1189,10 @@ fn quic_path_metrics_feed_path_model_without_fake_bulk_evidence() {
     {
         let mut health = context.health().lock().expect("health lock");
         health.udp[0].mark_quic_path_metrics(UdpPathMetrics {
-            direction: 1,
+            direction: PathMetricDirection::ClientToServer,
             srtt: Duration::from_millis(42),
             rttvar: Duration::from_millis(7),
-            min_rtt: Duration::from_millis(40),
-            min_rtt_observed: true,
+            rtt_observed: true,
             delivery_rate_bps: 300_000_000.0,
             pacing_rate_bps: 300_000_000.0,
             inflight_hi: 512 * 1024,
@@ -1239,11 +1231,10 @@ fn quic_path_metrics_feed_path_model_without_fake_bulk_evidence() {
     {
         let mut health = context.health().lock().expect("health lock");
         health.udp[0].mark_quic_path_metrics(UdpPathMetrics {
-            direction: 1,
+            direction: PathMetricDirection::ClientToServer,
             srtt: Duration::from_millis(42),
             rttvar: Duration::from_millis(7),
-            min_rtt: Duration::from_millis(40),
-            min_rtt_observed: true,
+            rtt_observed: true,
             delivery_rate_bps: 300_000_000.0,
             pacing_rate_bps: 300_000_000.0,
             inflight_hi: 512 * 1024,

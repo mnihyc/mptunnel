@@ -1,8 +1,9 @@
 use super::*;
 use crate::model::capacity::{
-    BBR_MAX_SEND_QUANTUM_BYTES, UDP_DEFAULT_MTU_PAYLOAD_BYTES, reliable_relay_scheduler_quantum_cap,
+    BBR_MAX_SEND_QUANTUM_BYTES, UDP_BASELINE_PACKET_PAYLOAD_BYTES,
+    reliable_relay_scheduler_quantum_cap,
 };
-use crate::protocol::{DatagramFlowId, DatagramId, PathId, StreamFlags, StreamId};
+use crate::protocol::{DatagramFlowId, DatagramId, PathId, StreamId};
 use crate::runtime::path::commands::{
     reliable_path_command_queue_for_payload, reliable_stream_frame_queue,
 };
@@ -51,7 +52,6 @@ fn quic_ordinary_writer_enforces_measurement_ownership() {
     let stream = Frame::StreamData {
         stream_id: StreamId(8),
         offset: 0,
-        flags: StreamFlags::NONE,
         payload: Bytes::from_static(b"stream"),
     };
     let datagram = Frame::DatagramData {
@@ -81,7 +81,6 @@ fn quic_ordinary_writer_enforces_measurement_ownership() {
         Frame::StreamData {
             stream_id: StreamId(8),
             offset: 0,
-            flags: StreamFlags::NONE,
             payload: Bytes::from_static(b"stream"),
         }
         .write_class(),
@@ -132,7 +131,7 @@ fn quic_udp_command_queue_tracks_sender_quantum_not_record_size() {
         reliable_relay_scheduler_quantum_cap(None, FlowLane::Throughput, mux_limits);
     let record_sized_queue = reliable_path_command_queue_for_payload(
         mux_limits,
-        sender_quantum.min(UDP_DEFAULT_MTU_PAYLOAD_BYTES).max(1),
+        sender_quantum.min(UDP_BASELINE_PACKET_PAYLOAD_BYTES).max(1),
     );
 
     assert_eq!(

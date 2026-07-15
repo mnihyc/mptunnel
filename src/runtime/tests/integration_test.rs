@@ -365,8 +365,7 @@ async fn auto_bulk_tcp_stream_attaches_measured_path_for_large_response() {
         stream.shutdown().await.expect("target shutdown");
     });
 
-    let low_latency_path =
-        reserve_tcp_path_with_query("srtt-ms=10&rate-mbps=20&low-latency=true").await;
+    let low_latency_path = reserve_tcp_path_with_query("srtt-ms=10&rate-mbps=20").await;
     let high_bandwidth_path = reserve_tcp_path_with_query("srtt-ms=120&rate-mbps=300").await;
     let low_latency_listener = bind_listener(&low_latency_path)
         .await
@@ -727,8 +726,7 @@ fn tcp_path_activity_extends_pending_heartbeat_deadline() {
 async fn socks5_ingress_schedules_tcp_stream_to_best_configured_path() {
     let (target_addr, target) = spawn_echo_target().await;
     let high_latency_path = reserve_tcp_path_with_query("srtt-ms=200&rate-mbps=1000").await;
-    let low_latency_path =
-        reserve_tcp_path_with_query("srtt-ms=10&rate-mbps=50&low-latency=true").await;
+    let low_latency_path = reserve_tcp_path_with_query("srtt-ms=10&rate-mbps=50").await;
     let (accepted_tx, mut accepted_rx) = mpsc::channel(2);
     let high_latency_server = spawn_notified_server_path(
         high_latency_path.clone(),
@@ -1134,12 +1132,8 @@ async fn spawn_scripted_tcp_datagram_path(
         if !matches!(framed.read_frame().await?, Frame::SessionAuth { .. }) {
             return Err(RuntimeError::Protocol("expected SESSION_AUTH"));
         }
-        let (path_id, capabilities) = match framed.read_frame().await? {
-            Frame::PathJoin {
-                path_id,
-                capabilities,
-                ..
-            } => (path_id, capabilities),
+        let path_id = match framed.read_frame().await? {
+            Frame::PathJoin { path_id, .. } => path_id,
             _ => return Err(RuntimeError::Protocol("expected PATH_JOIN")),
         };
         tokio::time::sleep(ready_delay).await;
@@ -1149,7 +1143,6 @@ async fn spawn_scripted_tcp_datagram_path(
                 Frame::PathStatus {
                     path_id,
                     status: crate::protocol::PathStatus::Active,
-                    capabilities,
                 },
             ])
             .await?;
@@ -1482,7 +1475,7 @@ async fn tcp_datagram_runtime_fallback_emits_at_most_twice() {
 }
 
 #[tokio::test]
-async fn known_udp_path_mtu_exclusion_falls_through_to_tcp_without_emission() {
+async fn configured_udp_payload_limit_falls_through_to_tcp_without_emission() {
     let target = UdpSocket::bind("127.0.0.1:0").await.expect("target bind");
     let target_addr = target.local_addr().expect("target address");
     let target_task = tokio::spawn(async move {
@@ -1494,6 +1487,7 @@ async fn known_udp_path_mtu_exclusion_falls_through_to_tcp_without_emission() {
     let mut udp_path = reserve_udp_path().await;
     udp_path.metadata.initial_srtt_ms = Some(10);
     udp_path.metadata.initial_rate = RateHint::BitsPerSecond(1_000_000_000);
+    udp_path.metadata.max_datagram_payload_bytes = Some(1_200);
     let (mut tcp_path, tcp_server) = spawn_server_path(OutboundConfig::Direct).await;
     tcp_path.metadata.initial_srtt_ms = Some(100);
     let context = ClientPathContext::new(
@@ -1502,7 +1496,6 @@ async fn known_udp_path_mtu_exclusion_falls_through_to_tcp_without_emission() {
         ResourceLimits::default(),
     )
     .expect("context");
-    context.mark_udp_path_mtu(0, 1_200);
     let mut association = DatagramClientAssociation::new(context)
         .await
         .expect("association");

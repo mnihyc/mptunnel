@@ -1,4 +1,10 @@
-use crate::protocol::{PathCapabilities, RateHint, UnderlayProtocol};
+//! Endpoint-local carrier specifications.
+//!
+//! Binding, policy, and startup hints configure this endpoint only and never
+//! become peer protocol authority or measured capacity evidence.
+
+pub use crate::model::path::PathPolicy;
+use crate::protocol::UnderlayProtocol;
 use std::net::IpAddr;
 use std::str::FromStr;
 
@@ -71,23 +77,35 @@ pub struct PathBinding {
     pub source_ip: Option<IpAddr>,
 }
 
+/// Endpoint-local startup capacity prior for a configured carrier path.
+///
+/// This is configuration, not peer evidence: it is never serialized and cannot
+/// by itself authorize multipath ownership.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RateHint {
+    Unknown,
+    Unlimited,
+    BitsPerSecond(u64),
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct PathMetadata {
-    pub capabilities: PathCapabilities,
+    pub policy: PathPolicy,
     pub initial_srtt_ms: Option<u32>,
     pub initial_jitter_ms: Option<u32>,
     pub initial_rate: RateHint,
-    pub initial_mtu_payload_bytes: Option<usize>,
+    /// Optional product datagram ceiling. QUIC owns transport PMTU discovery.
+    pub max_datagram_payload_bytes: Option<usize>,
 }
 
 impl Default for PathMetadata {
     fn default() -> Self {
         Self {
-            capabilities: PathCapabilities::default(),
+            policy: PathPolicy::default(),
             initial_srtt_ms: None,
             initial_jitter_ms: None,
             initial_rate: RateHint::Unknown,
-            initial_mtu_payload_bytes: None,
+            max_datagram_payload_bytes: None,
         }
     }
 }
@@ -111,7 +129,7 @@ impl FromStr for PathSpec {
             Some(query) => parse_path_options(query)?,
             None => (PathBinding::default(), PathMetadata::default()),
         };
-        if underlay == UnderlayProtocol::Udp && metadata.capabilities.no_udp {
+        if underlay == UnderlayProtocol::Udp && metadata.policy.no_udp {
             return Err(PathSpecParseError::NoUdpOnUdpPath);
         }
         Ok(Self {
@@ -133,7 +151,7 @@ fn parse_path_options(query: &str) -> Result<(PathBinding, PathMetadata), PathSp
     let mut srtt_set = false;
     let mut jitter_set = false;
     let mut rate_set = false;
-    let mut mtu_set = false;
+    let mut datagram_payload_limit_set = false;
     for part in query.split('&') {
         if part.is_empty() {
             return Err(PathSpecParseError::EmptyQueryParam);
@@ -196,20 +214,18 @@ fn parse_path_options(query: &str) -> Result<(PathBinding, PathMetadata), PathSp
                     }
                 };
             }
-            "mtu" | "mtu-bytes" | "payload-mtu" => {
-                reject_duplicate(mtu_set, key)?;
-                mtu_set = true;
-                metadata.initial_mtu_payload_bytes = Some(parse_mtu_param(key, value)?);
+            "datagram-payload-limit" | "mtu" | "mtu-bytes" | "payload-mtu" => {
+                reject_duplicate(datagram_payload_limit_set, key)?;
+                datagram_payload_limit_set = true;
+                metadata.max_datagram_payload_bytes =
+                    Some(parse_datagram_payload_limit(key, value)?);
             }
-            "backup" => metadata.capabilities.backup = parse_bool_param(key, value)?,
-            "expensive" => metadata.capabilities.expensive = parse_bool_param(key, value)?,
-            "low-latency" => metadata.capabilities.low_latency = parse_bool_param(key, value)?,
-            "bulk-allowed" | "bulk" => {
-                metadata.capabilities.bulk_allowed = parse_bool_param(key, value)?
-            }
-            "no-bulk" => metadata.capabilities.bulk_allowed = !parse_bool_param(key, value)?,
-            "probe-only" => metadata.capabilities.probe_only = parse_bool_param(key, value)?,
-            "no-udp" => metadata.capabilities.no_udp = parse_bool_param(key, value)?,
+            "backup" => metadata.policy.backup = parse_bool_param(key, value)?,
+            "expensive" => metadata.policy.expensive = parse_bool_param(key, value)?,
+            "bulk-allowed" | "bulk" => metadata.policy.bulk_allowed = parse_bool_param(key, value)?,
+            "no-bulk" => metadata.policy.bulk_allowed = !parse_bool_param(key, value)?,
+            "probe-only" => metadata.policy.probe_only = parse_bool_param(key, value)?,
+            "no-udp" => metadata.policy.no_udp = parse_bool_param(key, value)?,
             _ => return Err(PathSpecParseError::UnknownQueryParam(key.to_string())),
         }
     }
@@ -245,20 +261,23 @@ fn parse_u64_param(key: &str, value: Option<&str>) -> Result<u64, PathSpecParseE
         .map_err(|_| PathSpecParseError::InvalidQueryParamValue(key.to_string(), value.to_string()))
 }
 
-fn parse_mtu_param(key: &str, value: Option<&str>) -> Result<usize, PathSpecParseError> {
-    const MIN_MTU: usize = 512;
-    const MAX_MTU: usize = 65_000;
+fn parse_datagram_payload_limit(
+    key: &str,
+    value: Option<&str>,
+) -> Result<usize, PathSpecParseError> {
+    const MIN_PAYLOAD: usize = 512;
+    const MAX_PAYLOAD: usize = 65_000;
     let value = value.ok_or_else(|| PathSpecParseError::MissingQueryParamValue(key.to_string()))?;
-    let mtu = value.parse::<usize>().map_err(|_| {
+    let payload_limit = value.parse::<usize>().map_err(|_| {
         PathSpecParseError::InvalidQueryParamValue(key.to_string(), value.to_string())
     })?;
-    if !(MIN_MTU..=MAX_MTU).contains(&mtu) {
+    if !(MIN_PAYLOAD..=MAX_PAYLOAD).contains(&payload_limit) {
         return Err(PathSpecParseError::InvalidQueryParamValue(
             key.to_string(),
             value.to_string(),
         ));
     }
-    Ok(mtu)
+    Ok(payload_limit)
 }
 
 fn parse_bool_param(key: &str, value: Option<&str>) -> Result<bool, PathSpecParseError> {

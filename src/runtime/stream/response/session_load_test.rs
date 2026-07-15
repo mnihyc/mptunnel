@@ -1,7 +1,6 @@
 use super::super::ResponseStreamBinding;
 use super::super::attachment::ResponseStreamAttachOutcome;
 use super::super::session::ServerPathLaneTracker;
-use crate::model::capacity::reliable_relay_buffer_len;
 use crate::model::path::CarrierPathKey;
 use crate::mux::MuxLimits;
 use crate::protocol::{PathId, SessionId, StreamOpenRole, UnderlayProtocol};
@@ -41,7 +40,6 @@ fn active_response_flow_count_is_per_binding_not_per_attachment() {
             alternate_commands,
             FlowLane::Throughput,
             StreamOpenRole::Active,
-            reliable_relay_buffer_len(MuxLimits::default()),
         ),
         ResponseStreamAttachOutcome::Attached
     );
@@ -106,7 +104,6 @@ fn passive_attachments_do_not_consume_or_release_shared_flow_load() {
             repair_commands,
             FlowLane::Throughput,
             StreamOpenRole::Repair,
-            reliable_relay_buffer_len(MuxLimits::default()),
         ),
         ResponseStreamAttachOutcome::Attached
     );
@@ -132,7 +129,6 @@ fn passive_attachments_do_not_consume_or_release_shared_flow_load() {
             validation_commands,
             FlowLane::Throughput,
             StreamOpenRole::Validation,
-            reliable_relay_buffer_len(MuxLimits::default()),
         ),
         ResponseStreamAttachOutcome::Attached
     );
@@ -149,7 +145,6 @@ fn passive_attachments_do_not_consume_or_release_shared_flow_load() {
             validation_commands_for_promotion,
             FlowLane::Latency,
             StreamOpenRole::Active,
-            reliable_relay_buffer_len(MuxLimits::default()),
         ),
         ResponseStreamAttachOutcome::RoleChanged
     );
@@ -170,7 +165,6 @@ fn passive_attachments_do_not_consume_or_release_shared_flow_load() {
             validation_commands_for_repeat,
             FlowLane::Latency,
             StreamOpenRole::Active,
-            reliable_relay_buffer_len(MuxLimits::default()),
         ),
         ResponseStreamAttachOutcome::Attached
     );
@@ -231,7 +225,6 @@ fn closed_output_replacement_reconciles_role_flow_load() {
             validation_commands,
             FlowLane::Latency,
             StreamOpenRole::Validation,
-            reliable_relay_buffer_len(MuxLimits::default()),
         ),
         ResponseStreamAttachOutcome::ReplacedClosedOutput
     );
@@ -247,7 +240,6 @@ fn closed_output_replacement_reconciles_role_flow_load() {
             replacement_commands,
             FlowLane::Throughput,
             StreamOpenRole::Active,
-            reliable_relay_buffer_len(MuxLimits::default()),
         ),
         ResponseStreamAttachOutcome::ReplacedClosedOutput
     );

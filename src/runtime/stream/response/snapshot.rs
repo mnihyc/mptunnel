@@ -250,7 +250,6 @@ impl ResponseStreamBinding {
             .lock()
             .expect("server reliable stream request active owner lock");
         let active_key = response_live_ordered_data_owner(stored_active_key, &outputs.entries);
-        let now = Instant::now();
         let response_scheduling = self.lane_tracker.response_path_scheduling_snapshots(
             self.session_id,
             outputs
@@ -272,9 +271,9 @@ impl ResponseStreamBinding {
                     .copied();
                 let response_snapshot = server_bulk_output_snapshot_with_scheduling(
                     entry,
+                    outputs.product_queue_bytes,
                     lane,
                     self.mux_limits,
-                    now,
                     command_pending_bytes,
                     response_scheduling,
                 );
@@ -389,12 +388,18 @@ impl ResponseStreamOutputs {
         lane: FlowLane,
         mux_limits: MuxLimits,
     ) -> Option<PathSnapshot> {
-        let now = Instant::now();
         self.entries
             .iter()
             .find(|entry| entry.key == key)
             .map(|entry| {
-                server_bulk_output_snapshot(entry, session_id, lane, lane_tracker, mux_limits, now)
+                server_bulk_output_snapshot(
+                    entry,
+                    self.product_queue_bytes,
+                    session_id,
+                    lane,
+                    lane_tracker,
+                    mux_limits,
+                )
             })
     }
 
@@ -407,10 +412,16 @@ impl ResponseStreamOutputs {
         payload_bytes: usize,
         mux_limits: MuxLimits,
     ) -> Option<PathSnapshot> {
-        let now = Instant::now();
         if !lane.is_bulk() {
             return self.entries.last().map(|entry| {
-                server_bulk_output_snapshot(entry, session_id, lane, lane_tracker, mux_limits, now)
+                server_bulk_output_snapshot(
+                    entry,
+                    self.product_queue_bytes,
+                    session_id,
+                    lane,
+                    lane_tracker,
+                    mux_limits,
+                )
             });
         }
         self.entries
@@ -421,11 +432,11 @@ impl ResponseStreamOutputs {
             .map(|entry| {
                 let snapshot = server_bulk_output_snapshot(
                     entry,
+                    self.product_queue_bytes,
                     session_id,
                     lane,
                     lane_tracker,
                     mux_limits,
-                    now,
                 );
                 let eta_ms = server_bulk_output_eta_ms(
                     entry.key,
@@ -504,19 +515,19 @@ pub(super) struct ResponseBulkOutputSnapshot {
 
 pub(super) fn server_bulk_output_snapshot(
     entry: &ResponseStreamOutputEntry,
+    product_queue_bytes: u64,
     session_id: SessionId,
     lane: FlowLane,
     lane_tracker: &ServerPathLaneTracker,
     mux_limits: MuxLimits,
-    now: Instant,
 ) -> PathSnapshot {
     server_bulk_output_snapshot_with_command_pending(
         entry,
+        product_queue_bytes,
         session_id,
         lane,
         lane_tracker,
         mux_limits,
-        now,
         entry.commands.pending_bytes(),
     )
     .path
@@ -524,11 +535,11 @@ pub(super) fn server_bulk_output_snapshot(
 
 pub(super) fn server_bulk_output_snapshot_with_command_pending(
     entry: &ResponseStreamOutputEntry,
+    product_queue_bytes: u64,
     session_id: SessionId,
     lane: FlowLane,
     lane_tracker: &ServerPathLaneTracker,
     mux_limits: MuxLimits,
-    now: Instant,
     command_pending_bytes: u64,
 ) -> ResponseBulkOutputSnapshot {
     let response_scheduling = lane_tracker.response_path_scheduling_snapshot(
@@ -538,9 +549,9 @@ pub(super) fn server_bulk_output_snapshot_with_command_pending(
     );
     server_bulk_output_snapshot_with_scheduling(
         entry,
+        product_queue_bytes,
         lane,
         mux_limits,
-        now,
         command_pending_bytes,
         response_scheduling,
     )
@@ -549,9 +560,9 @@ pub(super) fn server_bulk_output_snapshot_with_command_pending(
 /// Combines output-local evidence with one caller-batched scheduling record.
 pub(super) fn server_bulk_output_snapshot_with_scheduling(
     entry: &ResponseStreamOutputEntry,
+    product_queue_bytes: u64,
     lane: FlowLane,
     mux_limits: MuxLimits,
-    now: Instant,
     command_pending_bytes: u64,
     response_scheduling: ServerResponsePathSchedulingSnapshot,
 ) -> ResponseBulkOutputSnapshot {
@@ -563,11 +574,7 @@ pub(super) fn server_bulk_output_snapshot_with_scheduling(
     let bulk_rate_metrics = local_carrier_metrics
         .filter(|path_metrics| server_path_metrics_has_bulk_rate_evidence(*path_metrics));
     let srtt_ms = liveness_metrics.map_or_else(
-        || {
-            entry
-                .srtt_ms
-                .unwrap_or_else(|| default_path_srtt_ms(entry.key.underlay))
-        },
+        || entry.srtt_ms.unwrap_or_else(|| default_path_srtt_ms()),
         |path_metrics| f64::from(path_metrics.metrics.srtt_us.max(1)) / 1000.0,
     );
     let jitter_ms = liveness_metrics.map_or(0.0, |path_metrics| {
@@ -606,10 +613,7 @@ pub(super) fn server_bulk_output_snapshot_with_scheduling(
     } else if let Some(rate_bps) = product_owner_rate_bps {
         (rate_bps, PathRateScope::PerFlowGoodput)
     } else {
-        (
-            default_path_rate_bps(entry.key.underlay),
-            PathRateScope::PathCapacity,
-        )
+        (default_path_rate_bps(), PathRateScope::PathCapacity)
     };
     let (rate_bps, rate_scope) = match (
         entry.key.underlay,
@@ -645,9 +649,6 @@ pub(super) fn server_bulk_output_snapshot_with_scheduling(
     let rate_bps = rate_bps.max(1.0);
     let mut snapshot = PathSnapshot::new(entry.key.path_id, entry.key.underlay, srtt_ms, rate_bps);
     snapshot.rate_scope = rate_scope;
-    if let Some(path_metrics) = liveness_metrics {
-        snapshot.min_rtt_ms = f64::from(path_metrics.metrics.min_rtt_us.max(1)) / 1000.0;
-    }
     snapshot.product_progress_rate_bps = entry.product_progress_rate_bps;
     snapshot.has_durable_product_progress =
         server_output_has_durable_product_ack_progress(entry, mux_limits);
@@ -663,7 +664,7 @@ pub(super) fn server_bulk_output_snapshot_with_scheduling(
     let metric_queue_bytes =
         local_carrier_metrics.map_or(0, |path_metrics| path_metrics.metrics.queue_bytes);
     snapshot.queue_bytes = metric_queue_bytes.saturating_add(command_pending_bytes);
-    snapshot.product_queue_bytes = entry.product_queue_bytes;
+    snapshot.product_queue_bytes = product_queue_bytes;
     snapshot.bytes_in_flight = match entry.key.underlay {
         UnderlayProtocol::Udp => {
             local_carrier_metrics.map_or(0, |path_metrics| path_metrics.metrics.bytes_in_flight)
@@ -683,7 +684,7 @@ pub(super) fn server_bulk_output_snapshot_with_scheduling(
             bulk_rate_metrics.map_or(0, |path_metrics| path_metrics.metrics.inflight_limit_bytes)
         }
     };
-    snapshot.confidence = server_output_confidence(entry, now);
+    snapshot.confidence = server_output_confidence(entry);
     // Response pressure follows product Service ownership. Control-plane Active
     // attachment roles intentionally remain unchanged across a whole-flow
     // handoff and therefore cannot describe the carrier doing response work.
@@ -767,7 +768,7 @@ fn confidence_sample_denominator() -> f64 {
     f64::from(RELIABLE_INITIAL_WINDOW_PACKETS as u32)
 }
 
-pub(super) fn server_output_confidence(entry: &ResponseStreamOutputEntry, _now: Instant) -> f64 {
+pub(super) fn server_output_confidence(entry: &ResponseStreamOutputEntry) -> f64 {
     let delivery_confidence =
         (f64::from(entry.delivery_samples) / confidence_sample_denominator()).clamp(0.0, 1.0);
     let metric_confidence = match server_output_local_path_metrics(entry) {

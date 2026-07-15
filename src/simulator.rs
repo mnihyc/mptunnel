@@ -1,8 +1,15 @@
+//! Deterministic multipath experiments over virtual time and path snapshots.
+//!
+//! The harness shares production scoring primitives but does not represent
+//! deployed sender queues, carrier recovery, or end-to-end performance proof.
+
+mod scheduling;
+
+pub use scheduling::{FlowId, SchedulingMode};
+
 use crate::protocol::PathId;
-use crate::scheduler::{
-    EnqueueRequest, FlowId, FlowLane, HeterogeneousScheduler, PathSnapshot, PathState,
-    SchedulerPolicy, SchedulingMode,
-};
+use crate::scheduler::{FlowLane, PathSnapshot, PathState};
+use scheduling::{EnqueueRequest, HeterogeneousScheduler};
 use std::collections::BTreeMap;
 
 #[derive(Debug, Clone, Copy)]
@@ -129,17 +136,15 @@ impl InteractiveBurst {
 #[derive(Debug)]
 pub struct Simulator {
     now_ms: f64,
-    policy: SchedulerPolicy,
     paths: Vec<VirtualPath>,
     scheduler: HeterogeneousScheduler,
     next_flow_id: u64,
 }
 
 impl Simulator {
-    pub fn new(policy: SchedulerPolicy, paths: Vec<VirtualPath>) -> Self {
+    pub fn new(paths: Vec<VirtualPath>) -> Self {
         Self {
             now_ms: 0.0,
-            policy,
             paths,
             scheduler: HeterogeneousScheduler::default(),
             next_flow_id: 0,
@@ -182,7 +187,7 @@ impl Simulator {
             duplicate_eligible,
         });
         let snapshots = self.path_snapshots();
-        let decision = self.scheduler.schedule_next(&snapshots, self.policy)?;
+        let decision = self.scheduler.schedule_next(&snapshots)?;
         Some(SimulatedSend {
             flow_id: decision.flow_id,
             path_id: decision.path_id,

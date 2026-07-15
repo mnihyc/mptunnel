@@ -25,7 +25,7 @@ JSON output is available for saved lab reports and dashboards:
 cargo run --manifest-path lab/benchmarks/Cargo.toml -- gates --strict --format json
 ```
 
-The gate command is safe to run on a normal host. It uses deterministic scheduler/runtime models and a bounded local AEAD hot-path sample. It does not create TUN devices, alter routes, change DNS, bind privileged service state, or modify host networking.
+The gate command is safe to run on a normal host. It uses deterministic models, including a simulator-private virtual queue that shares production path-scoring primitives, plus a bounded local AEAD hot-path sample. It does not exercise deployed sender queues or carrier recovery, create TUN devices, alter routes, change DNS, bind privileged service state, or modify host networking.
 
 Deterministic ablation output is also available:
 
@@ -34,7 +34,7 @@ cargo run --manifest-path lab/benchmarks/Cargo.toml -- ablation
 cargo run --manifest-path lab/benchmarks/Cargo.toml -- ablation --format json
 ```
 
-The ablation report compares single low-latency, single high-bandwidth, single poor-Internet, full multipath, and scheduler-ablation profiles. These are model comparisons only; Docker lab tests are required before making external performance claims.
+The ablation report compares single low-latency, single high-bandwidth, single poor-Internet, and heterogeneous multipath profiles. These are simulator path-profile comparisons only; matched Docker/runtime labs are required before making external performance claims.
 
 ## Gates
 

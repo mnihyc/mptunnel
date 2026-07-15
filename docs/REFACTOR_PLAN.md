@@ -14,6 +14,18 @@ production wildcard imports, production `#[path]` wiring, stale migration
 trees, or platform branches in protocol/model/scheduler policy. Default and
 all-feature suites and the all-target/all-feature host check pass.
 
+The final semantic pass is also complete. It removed unused wire frames and
+product-owned QUIC PMTU state, collapsed path admission to one valid-state enum,
+made repair a separate work decision, reduced subflow epochs to their actual
+membership/startup-credit authority, consolidated request startup evidence,
+and restored response queue pressure to one stream owner. It also moved virtual
+DRR/tail/duplication models under the simulator, consolidated ACK-flight interval
+algebra and TCP path evidence, and made endpoint path/security configuration one
+immutable indexed allocation shared by its sessions. Normal TCP peer departure
+now follows the same carrier-lifetime transition on admission, read, and write.
+This was a model and data-flow cleanup, not another source-tree migration; the
+existing module boundaries remained intact.
+
 External proof remains deliberately separate from source completion. The
 Windows GNU binary builds and its CLI, config, platform report, and
 Windows-client/Linux-server TCP flow work under Wine. Quinn's own Windows UDP
@@ -208,6 +220,11 @@ after that shared boundary. No OS type or branch enters model or scheduler state
     leakage, and broad re-exports with named contracts.
 12. Move remaining inline tests, update `ARCHITECTURE.md` to the final paths,
     then run the deferred test, target, Wine, and lab verification matrix.
+
+The endpoint semantic pass also removed unowned version 1 wire state: ingress
+and outbound copies on open frames, inline stream flags, weighted demand
+snapshots, path-policy echoes, and frames with no producer or transition.
+Endpoint-local policy and live measurements now stay with their actual owners.
 
 ## Checkpoint policy
 

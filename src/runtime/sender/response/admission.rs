@@ -16,26 +16,20 @@ use crate::model::capacity::{
     adaptive_reliable_relay_inflight_bytes, reliable_bulk_carrier_feed_quantum_bytes,
     reliable_relay_scheduler_quantum_cap, reliable_subflow_startup_sample_limit_bytes,
 };
-use crate::model::multipath::{
-    FlowSubflowSet, PathAdmission, PathAdmissionDecision, SubflowAdmissionInput,
-};
+use crate::model::multipath::{FlowSubflowSet, PathAdmission, SubflowAdmissionInput};
 use crate::model::path::CarrierPathKey;
 use crate::model::response::{
     ResponseBulkLead, ResponseCandidateTailDebt, ResponseOrderedTail, ResponseSameFamilyReservoir,
 };
-use crate::model::work::CarrierWorkKind;
 use crate::mux::MuxLimits;
 use crate::protocol::{StreamOpenRole, UnderlayProtocol};
 use crate::runtime::stream::response::ResponseSenderPathTarget;
 use crate::scheduler::{FlowLane, PathSnapshot};
-use std::time::Duration;
 
 #[derive(Clone, Copy)]
 pub(super) struct ResponseSubflowAdmissionSelection {
     pub(super) service: CarrierPathKey,
     pub(super) startup_owner_credit_bytes: usize,
-    pub(super) optional_overhead_budget_bytes: usize,
-    pub(super) max_read_gap_budget: Duration,
     pub(super) input: SubflowAdmissionInput,
 }
 
@@ -350,12 +344,7 @@ pub(super) fn response_target_unique_owner_admission_with_epoch(
             model_suppression,
         };
     let direct_result = |admission: PathAdmission| {
-        let owns_unique_data = matches!(
-            admission.decision,
-            PathAdmissionDecision::Service | PathAdmissionDecision::AdmitSubflow
-        ) && admission.work == CarrierWorkKind::OwnerData
-            && admission.role.may_own_unique_data();
-        if !owns_unique_data {
+        if !admission.owns_unique_data() {
             return result(admission, None, None);
         }
         let suppression = response_owner_bulk_model_suppression(
@@ -370,11 +359,11 @@ pub(super) fn response_target_unique_owner_admission_with_epoch(
         );
         suppression.map_or_else(
             || result(admission, None, None),
-            |reason| result(PathAdmission::standby(), None, Some(reason)),
+            |reason| result(PathAdmission::Standby, None, Some(reason)),
         )
     };
     if target.observation.attachment_role == StreamOpenRole::Repair {
-        return result(PathAdmission::standby(), None, None);
+        return result(PathAdmission::Standby, None, None);
     }
     let liveness_service_failover =
         allow_liveness_service_failover && target.observation.key == service_key;
@@ -405,12 +394,12 @@ pub(super) fn response_target_unique_owner_admission_with_epoch(
         && (target.observation.key == service_key || target.observation.is_service)
     {
         if ordering_debt > 0 {
-            return result(PathAdmission::standby(), None, None);
+            return result(PathAdmission::Standby, None, None);
         }
         return if target.observation.is_service || target.observation.has_bulk_rate_evidence {
-            direct_result(PathAdmission::service())
+            direct_result(PathAdmission::Service)
         } else {
-            result(PathAdmission::probe_only(), None, None)
+            result(PathAdmission::ProbeOnly, None, None)
         };
     }
     if continues_lower_frontier
@@ -420,10 +409,10 @@ pub(super) fn response_target_unique_owner_admission_with_epoch(
     {
         // Only the exact bounded startup owner or an already measured Subflow
         // may continue its own authoritative lower frontier.
-        return result(PathAdmission::standby(), None, None);
+        return result(PathAdmission::Standby, None, None);
     }
     if lower_owner.is_some() && !continues_lower_frontier {
-        return result(PathAdmission::standby(), None, None);
+        return result(PathAdmission::Standby, None, None);
     }
     if target.observation.key == service_key {
         if ordered_tail_debt.global_bytes() > 0
@@ -431,19 +420,19 @@ pub(super) fn response_target_unique_owner_admission_with_epoch(
             && !target.observation.has_bulk_rate_evidence
             && !liveness_service_failover
         {
-            return result(PathAdmission::standby(), None, None);
+            return result(PathAdmission::Standby, None, None);
         }
         return if target.observation.is_service
             || target.observation.has_bulk_rate_evidence
             || liveness_service_failover
         {
-            direct_result(PathAdmission::service())
+            direct_result(PathAdmission::Service)
         } else {
-            result(PathAdmission::probe_only(), None, None)
+            result(PathAdmission::ProbeOnly, None, None)
         };
     }
     if target.observation.is_service {
-        return result(PathAdmission::standby(), None, None);
+        return result(PathAdmission::Standby, None, None);
     }
     let existing_startup_owner = subflow_set.is_some_and(|epoch| {
         epoch.service_key() == service_key
@@ -476,7 +465,7 @@ pub(super) fn response_target_unique_owner_admission_with_epoch(
         && !response_target_is_measured_same_underlay_subflow_candidate(service_key, target)
         && !startup_owner_allowed
     {
-        return result(PathAdmission::standby(), None, None);
+        return result(PathAdmission::Standby, None, None);
     }
 
     let model_suppression = response_owner_bulk_model_suppression(
@@ -508,34 +497,19 @@ pub(super) fn response_target_unique_owner_admission_with_epoch(
         frontier_clear: model_allows_owner,
         completion_improves,
         observed_goodput_non_degrading: model_allows_owner,
-        read_gap: Duration::ZERO,
         owner_bytes: payload_bytes,
-        optional_overhead_bytes: 0,
     };
     let mut epoch = subflow_set
-        .filter(|epoch| {
-            epoch.matches_envelope(service_key, startup_owner_credit_bytes, 0, Duration::ZERO)
-        })
+        .filter(|epoch| epoch.matches_envelope(service_key, startup_owner_credit_bytes))
         .cloned()
-        .unwrap_or_else(|| {
-            FlowSubflowSet::new(
-                0,
-                service_key,
-                startup_owner_credit_bytes,
-                0,
-                Duration::ZERO,
-            )
-        });
+        .unwrap_or_else(|| FlowSubflowSet::new(service_key, startup_owner_credit_bytes));
     let admission = epoch.admit_subflow_owner(input);
-    let selection = (admission.decision == PathAdmissionDecision::AdmitSubflow).then_some(
-        ResponseSubflowAdmissionSelection {
+    let selection =
+        (admission == PathAdmission::Subflow).then_some(ResponseSubflowAdmissionSelection {
             service: service_key,
             startup_owner_credit_bytes,
-            optional_overhead_budget_bytes: 0,
-            max_read_gap_budget: Duration::ZERO,
             input,
-        },
-    );
+        });
     result(
         admission,
         selection,
@@ -593,11 +567,7 @@ fn response_target_can_own_unique_bulk_data_with_epoch(
         false,
     )
     .admission;
-    matches!(
-        admission.decision,
-        PathAdmissionDecision::Service | PathAdmissionDecision::AdmitSubflow
-    ) && admission.work == CarrierWorkKind::OwnerData
-        && admission.role.may_own_unique_data()
+    admission.owns_unique_data()
 }
 
 pub(super) fn response_target_assigned_product_bytes(target: &ResponseSenderPathTarget) -> u64 {
@@ -741,7 +711,6 @@ pub(super) fn response_service_emission_credit_bytes(
         .max(1);
     }
     usize::try_from(bulk_active_service_product_envelope_bytes(
-        target.observation.snapshot,
         payload_bytes,
         mux_limits,
     ))

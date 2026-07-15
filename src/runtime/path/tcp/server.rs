@@ -52,7 +52,6 @@ pub(in crate::runtime) async fn handle_server_path(
     }
     let session_id = path_join.session_id;
     let path_id = path_join.path_id;
-    let path_capabilities = path_join.capabilities;
     let path_registration =
         context
             .reliable_streams
@@ -64,7 +63,6 @@ pub(in crate::runtime) async fn handle_server_path(
             Frame::PathStatus {
                 path_id,
                 status: PathStatus::Active,
-                capabilities: path_capabilities,
             },
         ])
         .await?;
@@ -88,7 +86,6 @@ pub(in crate::runtime) async fn handle_server_path(
         context,
         session_id,
         path_id,
-        path_capabilities,
         path_registration,
         writer: ServerTcpWriter::new(writer),
         path_frames,

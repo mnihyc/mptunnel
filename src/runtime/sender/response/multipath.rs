@@ -23,7 +23,7 @@ use super::tcp_capacity::{
     ResponseAckClockCalibrationRetirementSelection, select_response_tcp_capacity_probe_start,
     try_start_response_tcp_capacity_probe,
 };
-use crate::model::multipath::{FlowSubflowSet, PathRuntimeRole};
+use crate::model::multipath::{FlowSubflowSet, PathAdmission};
 use crate::model::path::CarrierPathKey;
 use crate::model::response::response_oldest_lower_flight_owner;
 use crate::model::work::ReliableWorkClass;
@@ -88,10 +88,11 @@ impl ResponseStampedServiceHandoff {
 }
 
 impl ResponseDataDispatchIntent {
-    pub(super) fn role(&self) -> PathRuntimeRole {
+    #[cfg(test)]
+    pub(super) fn admission(&self) -> PathAdmission {
         match self {
-            Self::Service | Self::ServiceHandoff(_) => PathRuntimeRole::Service,
-            Self::SubflowAdmission(_) | Self::AckClockCalibration(_) => PathRuntimeRole::Subflow,
+            Self::Service | Self::ServiceHandoff(_) => PathAdmission::Service,
+            Self::SubflowAdmission(_) | Self::AckClockCalibration(_) => PathAdmission::Subflow,
         }
     }
 }
@@ -109,8 +110,6 @@ fn stamp_response_data_selection(
                 expected_lane_generation: epoch.lane_generation,
                 service: selection.service,
                 startup_owner_credit_bytes: selection.startup_owner_credit_bytes,
-                optional_overhead_budget_bytes: selection.optional_overhead_budget_bytes,
-                max_read_gap_budget: selection.max_read_gap_budget,
                 input: selection.input,
             })
         }
@@ -192,10 +191,10 @@ impl ResponseDataDispatchPlan {
     }
 
     #[cfg(test)]
-    pub(super) fn primary_role(&self) -> PathRuntimeRole {
+    pub(super) fn primary_admission(&self) -> PathAdmission {
         match &self.primary {
-            ResponseDataDispatchTarget::Fixed { .. } => PathRuntimeRole::Service,
-            ResponseDataDispatchTarget::Switchable { intent, .. } => intent.role(),
+            ResponseDataDispatchTarget::Fixed { .. } => PathAdmission::Service,
+            ResponseDataDispatchTarget::Switchable { intent, .. } => intent.admission(),
         }
     }
 }
@@ -543,17 +542,17 @@ fn evaluate_response_data_dispatch_with_ordered_debt(
                 let Some(selected) = selected else {
                     return Err(RuntimeError::SenderServiceBlocked);
                 };
-                let role = selected.admission().role;
+                let admission = selected.admission();
                 let target = selected.target();
                 debug_assert!(
-                    role != PathRuntimeRole::Subflow
+                    admission != PathAdmission::Subflow
                         || target.observation.has_bulk_rate_evidence
                         || selected
                             .subflow_admission_selection()
                             .is_some_and(|selection| selection.input.startup_owner_allowed),
-                    "Subflow OwnerData requires bulk-rate evidence or explicit bounded startup admission: target={:?} role={:?} ordered_owner={:?} lower_owner={:?} is_active={} sender_evidence={} bulk_evidence={}",
+                    "Subflow OwnerData requires bulk-rate evidence or explicit bounded startup admission: target={:?} admission={:?} ordered_owner={:?} lower_owner={:?} is_active={} sender_evidence={} bulk_evidence={}",
                     target.observation.key,
-                    role,
+                    admission,
                     ordered_data_owner,
                     response_oldest_lower_flight_owner(&lower_flights),
                     target.observation.is_service,

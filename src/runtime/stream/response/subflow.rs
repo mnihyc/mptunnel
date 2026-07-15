@@ -23,13 +23,10 @@ use crate::model::capacity::{
     PATH_OPEN_SCORE_BYTES, product_delivery_samples_override_startup_prior,
     reliable_subflow_startup_sample_limit_bytes,
 };
-use crate::model::multipath::{
-    FlowSubflowSet, PathAdmission, PathAdmissionDecision, SubflowAdmissionInput,
-};
+use crate::model::multipath::{FlowSubflowSet, PathAdmission, SubflowAdmissionInput};
 use crate::model::path::CarrierPathKey;
 use crate::mux::MuxLimits;
 use crate::protocol::{StreamOpenRole, UnderlayProtocol};
-use std::time::{Duration, Instant};
 
 #[derive(Default)]
 pub(super) struct ResponseSubflowSetState {
@@ -50,8 +47,6 @@ pub(in crate::runtime) struct ResponseSubflowAdmissionRequest {
     pub(in crate::runtime) expected_lane_generation: u64,
     pub(in crate::runtime) service: CarrierPathKey,
     pub(in crate::runtime) startup_owner_credit_bytes: usize,
-    pub(in crate::runtime) optional_overhead_budget_bytes: usize,
-    pub(in crate::runtime) max_read_gap_budget: Duration,
     pub(in crate::runtime) input: SubflowAdmissionInput,
 }
 
@@ -150,30 +145,12 @@ pub(in crate::runtime) fn server_output_has_service_feed_evidence_with_limits(
 impl ResponseStreamBinding {
     fn subflow_set_for(
         current: Option<FlowSubflowSet>,
-        epoch_generation: u64,
         service: CarrierPathKey,
         startup_owner_credit_bytes: usize,
-        optional_overhead_budget_bytes: usize,
-        max_read_gap_budget: Duration,
     ) -> FlowSubflowSet {
         current
-            .filter(|epoch| {
-                epoch.matches_envelope(
-                    service,
-                    startup_owner_credit_bytes,
-                    optional_overhead_budget_bytes,
-                    max_read_gap_budget,
-                )
-            })
-            .unwrap_or_else(|| {
-                FlowSubflowSet::new(
-                    epoch_generation,
-                    service,
-                    startup_owner_credit_bytes,
-                    optional_overhead_budget_bytes,
-                    max_read_gap_budget,
-                )
-            })
+            .filter(|epoch| epoch.matches_envelope(service, startup_owner_credit_bytes))
+            .unwrap_or_else(|| FlowSubflowSet::new(service, startup_owner_credit_bytes))
     }
 
     #[cfg(test)]
@@ -198,25 +175,15 @@ impl ResponseStreamBinding {
         &self,
         service: CarrierPathKey,
         startup_owner_credit_bytes: usize,
-        optional_overhead_budget_bytes: usize,
-        max_read_gap_budget: Duration,
         input: SubflowAdmissionInput,
     ) -> PathAdmission {
         let state = self
             .subflow_set
             .lock()
             .expect("server reliable stream subflow set lock");
-        let epoch_generation = state.epoch_generation;
         let current = state.set.clone();
         drop(state);
-        let mut epoch = Self::subflow_set_for(
-            current,
-            epoch_generation,
-            service,
-            startup_owner_credit_bytes,
-            optional_overhead_budget_bytes,
-            max_read_gap_budget,
-        );
+        let mut epoch = Self::subflow_set_for(current, service, startup_owner_credit_bytes);
         epoch.admit_subflow_owner(input)
     }
 
@@ -225,8 +192,6 @@ impl ResponseStreamBinding {
         &self,
         service: CarrierPathKey,
         startup_owner_credit_bytes: usize,
-        optional_overhead_budget_bytes: usize,
-        max_read_gap_budget: Duration,
         input: SubflowAdmissionInput,
     ) -> PathAdmission {
         let (generation, _) = self.subflow_state_snapshot();
@@ -235,8 +200,6 @@ impl ResponseStreamBinding {
             self.lane_generation(),
             service,
             startup_owner_credit_bytes,
-            optional_overhead_budget_bytes,
-            max_read_gap_budget,
             input,
         )
     }
@@ -248,8 +211,6 @@ impl ResponseStreamBinding {
         expected_lane_generation: u64,
         service: CarrierPathKey,
         startup_owner_credit_bytes: usize,
-        optional_overhead_budget_bytes: usize,
-        max_read_gap_budget: Duration,
         input: SubflowAdmissionInput,
     ) -> PathAdmission {
         self.reserve_subflow_owner_admission_for_planner_generation(
@@ -257,8 +218,6 @@ impl ResponseStreamBinding {
             expected_lane_generation,
             service,
             startup_owner_credit_bytes,
-            optional_overhead_budget_bytes,
-            max_read_gap_budget,
             input,
         )
         .admission
@@ -271,8 +230,6 @@ impl ResponseStreamBinding {
         expected_lane_generation: u64,
         service: CarrierPathKey,
         startup_owner_credit_bytes: usize,
-        optional_overhead_budget_bytes: usize,
-        max_read_gap_budget: Duration,
         input: SubflowAdmissionInput,
     ) -> ResponseSubflowAdmissionReservation {
         let request = ResponseSubflowAdmissionRequest {
@@ -280,12 +237,10 @@ impl ResponseStreamBinding {
             expected_lane_generation,
             service,
             startup_owner_credit_bytes,
-            optional_overhead_budget_bytes,
-            max_read_gap_budget,
             input,
         };
         let standby = || ResponseSubflowAdmissionReservation {
-            admission: PathAdmission::standby(),
+            admission: PathAdmission::Standby,
             epoch_generation: None,
         };
         self.lane_tracker
@@ -300,7 +255,7 @@ impl ResponseStreamBinding {
         request: ResponseSubflowAdmissionRequest,
     ) -> ResponseSubflowAdmissionReservation {
         let standby = || ResponseSubflowAdmissionReservation {
-            admission: PathAdmission::standby(),
+            admission: PathAdmission::Standby,
             epoch_generation: None,
         };
         let mut state = self
@@ -311,12 +266,7 @@ impl ResponseStreamBinding {
             return standby();
         }
         let envelope_changed = state.set.as_ref().is_some_and(|epoch| {
-            !epoch.matches_envelope(
-                request.service,
-                request.startup_owner_credit_bytes,
-                request.optional_overhead_budget_bytes,
-                request.max_read_gap_budget,
-            )
+            !epoch.matches_envelope(request.service, request.startup_owner_credit_bytes)
         });
         if envelope_changed {
             state.planner_generation = state.planner_generation.wrapping_add(1);
@@ -324,18 +274,12 @@ impl ResponseStreamBinding {
             state.set = None;
         }
         let current = state.set.take();
-        let mut epoch = Self::subflow_set_for(
-            current,
-            state.epoch_generation,
-            request.service,
-            request.startup_owner_credit_bytes,
-            request.optional_overhead_budget_bytes,
-            request.max_read_gap_budget,
-        );
+        let mut epoch =
+            Self::subflow_set_for(current, request.service, request.startup_owner_credit_bytes);
         let admission = epoch.admit_subflow_owner(request.input);
-        state.set = epoch.has_members().then_some(epoch);
+        state.set = epoch.has_admitted_paths().then_some(epoch);
         ResponseSubflowAdmissionReservation {
-            epoch_generation: (admission.decision == PathAdmissionDecision::AdmitSubflow)
+            epoch_generation: (admission == PathAdmission::Subflow)
                 .then_some(state.epoch_generation),
             admission,
         }
@@ -452,11 +396,11 @@ impl ResponseStreamBinding {
                             .map(|service| {
                                 server_bulk_output_snapshot(
                                     service,
+                                    outputs.product_queue_bytes,
                                     self.session_id,
                                     lane,
                                     &self.lane_tracker,
                                     self.mux_limits,
-                                    Instant::now(),
                                 )
                                 .delivery_rate_bps
                             })
@@ -495,11 +439,11 @@ impl ResponseStreamBinding {
                 } else {
                     let calibration_snapshot = server_bulk_output_snapshot(
                         &outputs.entries[owner_position],
+                        outputs.product_queue_bytes,
                         self.session_id,
                         lane,
                         &self.lane_tracker,
                         self.mux_limits,
-                        Instant::now(),
                     );
                     let initial_limit = reliable_tcp_ack_clock_calibration_initial_limit_bytes(
                         calibration_snapshot,

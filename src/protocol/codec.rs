@@ -1,8 +1,7 @@
 use super::{
-    AuthNonce, AuthTag, CloseReason, DatagramFlowId, DatagramId, Frame, IngressKind, OffsetRange,
-    OutboundPolicy, PathCapabilities, PathId, PathMetricDirection, PathMetrics, PathStatus,
-    RateHint, ResetReason, SessionId, StreamDemandHint, StreamFlags, StreamId, StreamOpenRole,
-    TargetAddr, UnderlayProtocol,
+    AuthNonce, AuthTag, CloseReason, DatagramFlowId, DatagramId, Frame, OffsetRange, PathId,
+    PathMetricDirection, PathMetrics, PathStatus, ResetReason, SessionId, StreamDemandHint,
+    StreamId, StreamOpenRole, TargetAddr, UnderlayProtocol,
 };
 use bytes::Bytes;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
@@ -110,9 +109,9 @@ fn encoded_payload_capacity_hint(frame: &Frame) -> usize {
         Frame::StreamData { payload, .. } | Frame::DatagramData { payload, .. } => {
             payload.len().saturating_add(32)
         }
-        Frame::PathMtuProbe { payload, .. }
-        | Frame::PathProofData { payload, .. }
-        | Frame::PathCapacityData { payload, .. } => payload.len().saturating_add(16),
+        Frame::PathProofData { payload, .. } | Frame::PathCapacityData { payload, .. } => {
+            payload.len().saturating_add(16)
+        }
         Frame::StreamAck { ranges, .. } => 16usize.saturating_add(ranges.len().saturating_mul(16)),
         Frame::OpenStream { .. } => 128,
         _ => 64,
@@ -236,7 +235,6 @@ fn encode_payload(
             underlay,
             nonce,
             issued_at_unix_secs,
-            capabilities,
             auth_tag,
         } => {
             put_u64(out, session_id.0);
@@ -244,7 +242,6 @@ fn encode_payload(
             put_u8(out, underlay_to_u8(*underlay));
             encode_nonce(out, *nonce);
             put_u64(out, *issued_at_unix_secs);
-            encode_path_capabilities(out, *capabilities);
             encode_auth_tag(out, *auth_tag);
             Ok(FrameKind::PathJoin)
         }
@@ -258,24 +255,9 @@ fn encode_payload(
             encode_auth_tag(out, *auth_tag);
             Ok(FrameKind::PathJoinOk)
         }
-        Frame::PathChallenge { path_id, nonce } => {
-            put_u16(out, path_id.0);
-            put_u64(out, *nonce);
-            Ok(FrameKind::PathChallenge)
-        }
-        Frame::PathResponse { path_id, nonce } => {
-            put_u16(out, path_id.0);
-            put_u64(out, *nonce);
-            Ok(FrameKind::PathResponse)
-        }
-        Frame::PathStatus {
-            path_id,
-            status,
-            capabilities,
-        } => {
+        Frame::PathStatus { path_id, status } => {
             put_u16(out, path_id.0);
             put_u8(out, path_status_to_u8(*status));
-            encode_path_capabilities(out, *capabilities);
             Ok(FrameKind::PathStatus)
         }
         Frame::PathDrain { path_id } => {
@@ -286,28 +268,6 @@ fn encode_payload(
             put_u16(out, path_id.0);
             put_u8(out, close_reason_to_u8(*reason));
             Ok(FrameKind::PathClose)
-        }
-        Frame::PathMtuProbe {
-            path_id,
-            probe_id,
-            payload,
-        } => {
-            encode_payload_bytes_len(payload.len(), limits)?;
-            put_u16(out, path_id.0);
-            put_u64(out, *probe_id);
-            put_u32(out, payload.len() as u32);
-            out.extend_from_slice(payload);
-            Ok(FrameKind::PathMtuProbe)
-        }
-        Frame::PathMtuAck {
-            path_id,
-            probe_id,
-            payload_bytes,
-        } => {
-            put_u16(out, path_id.0);
-            put_u64(out, *probe_id);
-            put_u32(out, *payload_bytes);
-            Ok(FrameKind::PathMtuAck)
         }
         Frame::PathProofData {
             path_id,
@@ -366,15 +326,11 @@ fn encode_payload(
         Frame::OpenStream {
             stream_id,
             target,
-            ingress,
-            outbound,
             demand,
             role,
         } => {
             put_u64(out, stream_id.0);
             encode_target(out, target, limits)?;
-            put_u8(out, ingress_to_u8(*ingress));
-            encode_outbound(out, outbound, limits)?;
             encode_stream_demand_hint(out, *demand);
             put_u8(out, stream_open_role_to_u8(*role));
             Ok(FrameKind::OpenStream)
@@ -382,13 +338,11 @@ fn encode_payload(
         Frame::StreamData {
             stream_id,
             offset,
-            flags,
             payload,
         } => {
             encode_payload_bytes_len(payload.len(), limits)?;
             put_u64(out, stream_id.0);
             put_u64(out, *offset);
-            put_u8(out, stream_flags_to_u8(*flags));
             put_u32(out, payload.len() as u32);
             out.extend_from_slice(payload);
             Ok(FrameKind::StreamData)
@@ -444,16 +398,9 @@ fn encode_payload(
             put_u8(out, reset_reason_to_u8(*reason));
             Ok(FrameKind::StreamReset)
         }
-        Frame::OpenDatagramFlow {
-            flow_id,
-            target,
-            ingress,
-            outbound,
-        } => {
+        Frame::OpenDatagramFlow { flow_id, target } => {
             put_u64(out, flow_id.0);
             encode_target(out, target, limits)?;
-            put_u8(out, ingress_to_u8(*ingress));
-            encode_outbound(out, outbound, limits)?;
             Ok(FrameKind::OpenDatagramFlow)
         }
         Frame::DatagramData {
@@ -482,15 +429,6 @@ fn encode_payload(
         Frame::PathMetrics { metrics } => {
             encode_path_metrics(out, *metrics);
             Ok(FrameKind::PathMetrics)
-        }
-        Frame::RxRateHint { path_id, hint } => {
-            put_u16(out, path_id.0);
-            encode_rate_hint(out, *hint);
-            Ok(FrameKind::RxRateHint)
-        }
-        Frame::MaxConnectionData { max_bytes } => {
-            put_u64(out, *max_bytes);
-            Ok(FrameKind::MaxConnectionData)
         }
         Frame::Ping { nonce } => {
             put_u64(out, *nonce);
@@ -528,7 +466,6 @@ fn decode_payload(
             underlay: underlay_from_u8(reader.get_u8()?)?,
             nonce: decode_nonce(reader)?,
             issued_at_unix_secs: reader.get_u64()?,
-            capabilities: decode_path_capabilities(reader)?,
             auth_tag: decode_auth_tag(reader)?,
         }),
         FrameKind::PathJoinOk => Ok(Frame::PathJoinOk {
@@ -536,18 +473,9 @@ fn decode_payload(
             nonce: decode_nonce(reader)?,
             auth_tag: decode_auth_tag(reader)?,
         }),
-        FrameKind::PathChallenge => Ok(Frame::PathChallenge {
-            path_id: PathId(reader.get_u16()?),
-            nonce: reader.get_u64()?,
-        }),
-        FrameKind::PathResponse => Ok(Frame::PathResponse {
-            path_id: PathId(reader.get_u16()?),
-            nonce: reader.get_u64()?,
-        }),
         FrameKind::PathStatus => Ok(Frame::PathStatus {
             path_id: PathId(reader.get_u16()?),
             status: path_status_from_u8(reader.get_u8()?)?,
-            capabilities: decode_path_capabilities(reader)?,
         }),
         FrameKind::PathDrain => Ok(Frame::PathDrain {
             path_id: PathId(reader.get_u16()?),
@@ -555,21 +483,6 @@ fn decode_payload(
         FrameKind::PathClose => Ok(Frame::PathClose {
             path_id: PathId(reader.get_u16()?),
             reason: close_reason_from_u8(reader.get_u8()?)?,
-        }),
-        FrameKind::PathMtuProbe => {
-            let path_id = PathId(reader.get_u16()?);
-            let probe_id = reader.get_u64()?;
-            let payload = reader.get_bytes_u32(limits.max_payload_bytes)?;
-            Ok(Frame::PathMtuProbe {
-                path_id,
-                probe_id,
-                payload,
-            })
-        }
-        FrameKind::PathMtuAck => Ok(Frame::PathMtuAck {
-            path_id: PathId(reader.get_u16()?),
-            probe_id: reader.get_u64()?,
-            payload_bytes: reader.get_u32()?,
         }),
         FrameKind::PathProofData => {
             let path_id = PathId(reader.get_u16()?);
@@ -609,20 +522,16 @@ fn decode_payload(
         FrameKind::OpenStream => Ok(Frame::OpenStream {
             stream_id: StreamId(reader.get_u64()?),
             target: decode_target(reader, limits)?,
-            ingress: ingress_from_u8(reader.get_u8()?)?,
-            outbound: decode_outbound(reader, limits)?,
             demand: decode_stream_demand_hint(reader)?,
             role: stream_open_role_from_u8(reader.get_u8()?)?,
         }),
         FrameKind::StreamData => {
             let stream_id = StreamId(reader.get_u64()?);
             let offset = reader.get_u64()?;
-            let flags = stream_flags_from_u8(reader.get_u8()?)?;
             let payload = reader.get_bytes_u32(limits.max_payload_bytes)?;
             Ok(Frame::StreamData {
                 stream_id,
                 offset,
-                flags,
                 payload,
             })
         }
@@ -673,8 +582,6 @@ fn decode_payload(
         FrameKind::OpenDatagramFlow => Ok(Frame::OpenDatagramFlow {
             flow_id: DatagramFlowId(reader.get_u64()?),
             target: decode_target(reader, limits)?,
-            ingress: ingress_from_u8(reader.get_u8()?)?,
-            outbound: decode_outbound(reader, limits)?,
         }),
         FrameKind::DatagramData => {
             let flow_id = DatagramFlowId(reader.get_u64()?);
@@ -698,13 +605,6 @@ fn decode_payload(
         FrameKind::PathMetrics => Ok(Frame::PathMetrics {
             metrics: decode_path_metrics(reader)?,
         }),
-        FrameKind::RxRateHint => Ok(Frame::RxRateHint {
-            path_id: PathId(reader.get_u16()?),
-            hint: decode_rate_hint(reader)?,
-        }),
-        FrameKind::MaxConnectionData => Ok(Frame::MaxConnectionData {
-            max_bytes: reader.get_u64()?,
-        }),
         FrameKind::Ping => Ok(Frame::Ping {
             nonce: reader.get_u64()?,
         }),
@@ -724,7 +624,7 @@ fn encode_target(
             encode_host(out, 1, host, *port, limits)?;
         }
         TargetAddr::Ip(addr) => {
-            encode_socket_addr(out, addr, limits)?;
+            encode_socket_addr(out, addr)?;
         }
     }
     Ok(())
@@ -766,51 +666,7 @@ fn decode_target(reader: &mut Reader<'_>, limits: CodecLimits) -> Result<TargetA
     }
 }
 
-fn encode_outbound(
-    out: &mut Vec<u8>,
-    outbound: &OutboundPolicy,
-    limits: CodecLimits,
-) -> Result<(), CodecError> {
-    match outbound {
-        OutboundPolicy::Direct => put_u8(out, 0),
-        OutboundPolicy::BindSourceIp(ip) => {
-            put_u8(out, 1);
-            encode_ip_addr(out, *ip);
-        }
-        OutboundPolicy::Socks5 { proxy } => {
-            put_u8(out, 2);
-            encode_socket_addr(out, proxy, limits)?;
-        }
-        OutboundPolicy::HttpConnect { proxy } => {
-            put_u8(out, 3);
-            encode_socket_addr(out, proxy, limits)?;
-        }
-    }
-    Ok(())
-}
-
-fn decode_outbound(
-    reader: &mut Reader<'_>,
-    limits: CodecLimits,
-) -> Result<OutboundPolicy, CodecError> {
-    match reader.get_u8()? {
-        0 => Ok(OutboundPolicy::Direct),
-        1 => Ok(OutboundPolicy::BindSourceIp(decode_ip_addr(reader)?)),
-        2 => Ok(OutboundPolicy::Socks5 {
-            proxy: decode_socket_addr(reader, limits)?,
-        }),
-        3 => Ok(OutboundPolicy::HttpConnect {
-            proxy: decode_socket_addr(reader, limits)?,
-        }),
-        _ => Err(CodecError::InvalidEnum),
-    }
-}
-
-fn encode_socket_addr(
-    out: &mut Vec<u8>,
-    addr: &SocketAddr,
-    _limits: CodecLimits,
-) -> Result<(), CodecError> {
+fn encode_socket_addr(out: &mut Vec<u8>, addr: &SocketAddr) -> Result<(), CodecError> {
     match addr {
         SocketAddr::V4(addr) => {
             put_u8(out, 2);
@@ -824,31 +680,6 @@ fn encode_socket_addr(
         }
     }
     Ok(())
-}
-
-fn decode_socket_addr(
-    reader: &mut Reader<'_>,
-    _limits: CodecLimits,
-) -> Result<SocketAddr, CodecError> {
-    match reader.get_u8()? {
-        2 => {
-            let octets = reader.get_array::<4>()?;
-            let port = reader.get_u16()?;
-            if port == 0 {
-                return Err(CodecError::InvalidPort);
-            }
-            Ok(SocketAddr::new(IpAddr::V4(Ipv4Addr::from(octets)), port))
-        }
-        3 => {
-            let octets = reader.get_array::<16>()?;
-            let port = reader.get_u16()?;
-            if port == 0 {
-                return Err(CodecError::InvalidPort);
-            }
-            Ok(SocketAddr::new(IpAddr::V6(Ipv6Addr::from(octets)), port))
-        }
-        _ => Err(CodecError::InvalidEnum),
-    }
 }
 
 fn encode_host(
@@ -877,27 +708,6 @@ fn encode_host(
     Ok(())
 }
 
-fn encode_ip_addr(out: &mut Vec<u8>, ip: IpAddr) {
-    match ip {
-        IpAddr::V4(ip) => {
-            put_u8(out, 2);
-            out.extend_from_slice(&ip.octets());
-        }
-        IpAddr::V6(ip) => {
-            put_u8(out, 3);
-            out.extend_from_slice(&ip.octets());
-        }
-    }
-}
-
-fn decode_ip_addr(reader: &mut Reader<'_>) -> Result<IpAddr, CodecError> {
-    match reader.get_u8()? {
-        2 => Ok(IpAddr::V4(Ipv4Addr::from(reader.get_array::<4>()?))),
-        3 => Ok(IpAddr::V6(Ipv6Addr::from(reader.get_array::<16>()?))),
-        _ => Err(CodecError::InvalidEnum),
-    }
-}
-
 fn encode_nonce(out: &mut Vec<u8>, nonce: AuthNonce) {
     out.extend_from_slice(&nonce.0);
 }
@@ -914,22 +724,12 @@ fn decode_auth_tag(reader: &mut Reader<'_>) -> Result<AuthTag, CodecError> {
     Ok(AuthTag(reader.get_array::<32>()?))
 }
 
-fn encode_path_capabilities(out: &mut Vec<u8>, caps: PathCapabilities) {
-    put_u16(out, caps.to_bits());
-}
-
-fn decode_path_capabilities(reader: &mut Reader<'_>) -> Result<PathCapabilities, CodecError> {
-    let bits = reader.get_u16()?;
-    PathCapabilities::from_bits(bits).ok_or(CodecError::InvalidEnum)
-}
-
 fn encode_path_metrics(out: &mut Vec<u8>, metrics: PathMetrics) {
     put_u16(out, metrics.path_id.0);
     put_u8(out, underlay_to_u8(metrics.underlay));
     put_u8(out, path_metric_direction_to_u8(metrics.direction));
     put_u64(out, metrics.metric_epoch);
     put_u32(out, metrics.metric_age_us);
-    put_u32(out, metrics.min_rtt_us);
     put_u32(out, metrics.srtt_us);
     put_u32(out, metrics.rttvar_us);
     put_u32(out, metrics.jitter_us);
@@ -957,7 +757,6 @@ fn decode_path_metrics(reader: &mut Reader<'_>) -> Result<PathMetrics, CodecErro
         direction: path_metric_direction_from_u8(reader.get_u8()?)?,
         metric_epoch: reader.get_u64()?,
         metric_age_us: reader.get_u32()?,
-        min_rtt_us: reader.get_u32()?,
         srtt_us: reader.get_u32()?,
         rttvar_us: reader.get_u32()?,
         jitter_us: reader.get_u32()?,
@@ -977,26 +776,6 @@ fn decode_path_metrics(reader: &mut Reader<'_>) -> Result<PathMetrics, CodecErro
         data_sample_count: reader.get_u32()?,
         data_sample_bytes: reader.get_u64()?,
     })
-}
-
-fn encode_rate_hint(out: &mut Vec<u8>, hint: RateHint) {
-    match hint {
-        RateHint::Unknown => put_u8(out, 0),
-        RateHint::Unlimited => put_u8(out, 1),
-        RateHint::BitsPerSecond(rate) => {
-            put_u8(out, 2);
-            put_u64(out, rate);
-        }
-    }
-}
-
-fn decode_rate_hint(reader: &mut Reader<'_>) -> Result<RateHint, CodecError> {
-    match reader.get_u8()? {
-        0 => Ok(RateHint::Unknown),
-        1 => Ok(RateHint::Unlimited),
-        2 => Ok(RateHint::BitsPerSecond(reader.get_u64()?)),
-        _ => Err(CodecError::InvalidEnum),
-    }
 }
 
 fn encode_offset_ranges(
@@ -1025,21 +804,23 @@ fn encode_offset_ranges(
 }
 
 fn encode_stream_demand_hint(out: &mut Vec<u8>, demand: StreamDemandHint) {
-    put_u64(out, demand.observed_bytes);
-    put_u64(out, demand.repair_bytes);
-    put_u32(out, demand.latency_weight_ppm);
-    put_u32(out, demand.throughput_weight_ppm);
-    put_u32(out, demand.realtime_weight_ppm);
+    put_u8(
+        out,
+        match demand {
+            StreamDemandHint::Latency => 1,
+            StreamDemandHint::Throughput => 2,
+            StreamDemandHint::Realtime => 3,
+        },
+    );
 }
 
 fn decode_stream_demand_hint(reader: &mut Reader<'_>) -> Result<StreamDemandHint, CodecError> {
-    Ok(StreamDemandHint {
-        observed_bytes: reader.get_u64()?,
-        repair_bytes: reader.get_u64()?,
-        latency_weight_ppm: reader.get_u32()?,
-        throughput_weight_ppm: reader.get_u32()?,
-        realtime_weight_ppm: reader.get_u32()?,
-    })
+    match reader.get_u8()? {
+        1 => Ok(StreamDemandHint::Latency),
+        2 => Ok(StreamDemandHint::Throughput),
+        3 => Ok(StreamDemandHint::Realtime),
+        _ => Err(CodecError::InvalidEnum),
+    }
 }
 
 fn decode_offset_ranges(
@@ -1192,8 +973,7 @@ enum FrameKind {
     SessionReady = 2,
     SessionClose = 3,
     PathJoin = 4,
-    PathChallenge = 5,
-    PathResponse = 6,
+    // 5 and 6 are reserved; an abandoned challenge exchange never had a sender.
     OpenStream = 7,
     StreamData = 8,
     StreamAck = 9,
@@ -1202,7 +982,7 @@ enum FrameKind {
     OpenDatagramFlow = 12,
     DatagramData = 13,
     DatagramClose = 14,
-    MaxConnectionData = 15,
+    // 15 is reserved; connection flow control is owned by the carrier.
     Ping = 16,
     Pong = 17,
     SessionAuth = 18,
@@ -1212,10 +992,9 @@ enum FrameKind {
     PathClose = 22,
     DatagramFeedback = 23,
     PathMetrics = 24,
-    RxRateHint = 25,
+    // 25 is reserved for a removed hint; 26 has never been allocated.
     StreamFin = 27,
-    PathMtuProbe = 28,
-    PathMtuAck = 29,
+    // 28 and 29 are reserved for a removed product-PMTU experiment.
     StreamDetach = 30,
     PathProofData = 31,
     PathProofAck = 32,
@@ -1231,8 +1010,6 @@ impl FrameKind {
             2 => Ok(Self::SessionReady),
             3 => Ok(Self::SessionClose),
             4 => Ok(Self::PathJoin),
-            5 => Ok(Self::PathChallenge),
-            6 => Ok(Self::PathResponse),
             7 => Ok(Self::OpenStream),
             8 => Ok(Self::StreamData),
             9 => Ok(Self::StreamAck),
@@ -1241,7 +1018,6 @@ impl FrameKind {
             12 => Ok(Self::OpenDatagramFlow),
             13 => Ok(Self::DatagramData),
             14 => Ok(Self::DatagramClose),
-            15 => Ok(Self::MaxConnectionData),
             16 => Ok(Self::Ping),
             17 => Ok(Self::Pong),
             18 => Ok(Self::SessionAuth),
@@ -1251,10 +1027,7 @@ impl FrameKind {
             22 => Ok(Self::PathClose),
             23 => Ok(Self::DatagramFeedback),
             24 => Ok(Self::PathMetrics),
-            25 => Ok(Self::RxRateHint),
             27 => Ok(Self::StreamFin),
-            28 => Ok(Self::PathMtuProbe),
-            29 => Ok(Self::PathMtuAck),
             30 => Ok(Self::StreamDetach),
             31 => Ok(Self::PathProofData),
             32 => Ok(Self::PathProofAck),
@@ -1323,25 +1096,6 @@ fn path_status_from_u8(value: u8) -> Result<PathStatus, CodecError> {
     }
 }
 
-fn ingress_to_u8(value: IngressKind) -> u8 {
-    match value {
-        IngressKind::Socks5 => 1,
-        IngressKind::HttpConnect => 2,
-        IngressKind::TunTcp => 3,
-        IngressKind::TunUdp => 4,
-    }
-}
-
-fn ingress_from_u8(value: u8) -> Result<IngressKind, CodecError> {
-    match value {
-        1 => Ok(IngressKind::Socks5),
-        2 => Ok(IngressKind::HttpConnect),
-        3 => Ok(IngressKind::TunTcp),
-        4 => Ok(IngressKind::TunUdp),
-        _ => Err(CodecError::InvalidEnum),
-    }
-}
-
 fn stream_open_role_to_u8(value: StreamOpenRole) -> u8 {
     match value {
         StreamOpenRole::Active => 1,
@@ -1395,20 +1149,6 @@ fn reset_reason_from_u8(value: u8) -> Result<ResetReason, CodecError> {
         4 => Ok(ResetReason::PolicyRejected),
         _ => Err(CodecError::InvalidEnum),
     }
-}
-
-fn stream_flags_to_u8(flags: StreamFlags) -> u8 {
-    u8::from(flags.fin) | (u8::from(flags.early_data) << 1)
-}
-
-fn stream_flags_from_u8(value: u8) -> Result<StreamFlags, CodecError> {
-    if value & !0x03 != 0 {
-        return Err(CodecError::InvalidEnum);
-    }
-    Ok(StreamFlags {
-        fin: value & 0x01 != 0,
-        early_data: value & 0x02 != 0,
-    })
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

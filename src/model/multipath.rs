@@ -6,11 +6,121 @@
 use crate::config::MppPerformanceConfig;
 use crate::model::capacity::MIN_RATE_SAMPLE_BYTES;
 use crate::model::path::CarrierPathKey;
-use crate::model::work::CarrierWorkKind;
-use std::time::Duration;
+use smallvec::SmallVec;
 
+pub(crate) fn cross_family_reliable_owner_allowed(
+    current_owner: Option<CarrierPathKey>,
+    candidate: CarrierPathKey,
+    candidate_bulk_rate_proven: bool,
+    candidate_continues_lower_frontier: bool,
+) -> bool {
+    let Some(owner) = current_owner else {
+        return true;
+    };
+    if owner == candidate || owner.underlay == candidate.underlay {
+        return true;
+    }
+
+    // MPTCP/MPQUIC schedule by path state inside one carrier-family recovery
+    // model. mptunnel's mixed TCP+QUIC reliable streams have independent ACK
+    // clocks, pacing, flow control, and loss recovery. A cross-family path
+    // therefore cannot become an ordered-byte owner merely because it is
+    // lower-ETA at a clear frontier; it is owner-eligible only when it is
+    // continuing a lower-frontier range it already owns. Explicit Service
+    // migration/failover is handled outside this health predicate.
+    if candidate_continues_lower_frontier && candidate_bulk_rate_proven {
+        return true;
+    }
+    false
+}
+
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct ExtraTrafficBudget {
+    owner_progress_bytes: u64,
+    repair_spent_bytes: u64,
+    startup_floor_bytes: u64,
+    percent_budget: u16,
+}
+
+impl ExtraTrafficBudget {
+    pub(crate) fn new(
+        owner_progress_bytes: u64,
+        repair_spent_bytes: u64,
+        startup_floor_bytes: usize,
+        performance: MppPerformanceConfig,
+    ) -> Self {
+        Self {
+            owner_progress_bytes,
+            repair_spent_bytes,
+            startup_floor_bytes: startup_floor_bytes as u64,
+            percent_budget: performance.extra_traffic_hint_percent,
+        }
+    }
+
+    pub(crate) fn limit_bytes(self) -> u64 {
+        self.startup_floor_bytes.saturating_add(
+            self.owner_progress_bytes
+                .saturating_mul(self.percent_budget as u64)
+                / 100,
+        )
+    }
+
+    pub(crate) fn remaining_bytes(self) -> usize {
+        self.limit_bytes()
+            .saturating_sub(self.repair_spent_bytes)
+            .min(usize::MAX as u64) as usize
+    }
+
+    pub(crate) fn can_spend(self, bytes: usize) -> bool {
+        self.repair_spent_bytes.saturating_add(bytes as u64) <= self.limit_bytes()
+    }
+}
+
+#[derive(Debug, Clone, Copy, Default)]
+pub(crate) struct ExtraTrafficLedger {
+    owner_progress_bytes: u64,
+    repair_bytes: u64,
+}
+
+impl ExtraTrafficLedger {
+    #[cfg(test)]
+    pub(crate) fn owner_progress_bytes(self) -> u64 {
+        self.owner_progress_bytes
+    }
+
+    pub(crate) fn repair_spent_bytes(self) -> u64 {
+        self.repair_bytes
+    }
+
+    pub(crate) fn record_owner_progress(&mut self, bytes: usize) {
+        self.owner_progress_bytes = self.owner_progress_bytes.saturating_add(bytes as u64);
+    }
+
+    pub(crate) fn record_repair(&mut self, bytes: usize) {
+        self.repair_bytes = self.repair_bytes.saturating_add(bytes as u64);
+    }
+
+    pub(crate) fn budget(
+        self,
+        startup_floor_bytes: usize,
+        performance: MppPerformanceConfig,
+    ) -> ExtraTrafficBudget {
+        ExtraTrafficBudget::new(
+            self.owner_progress_bytes,
+            self.repair_spent_bytes(),
+            startup_floor_bytes,
+            performance,
+        )
+    }
+}
+
+/// One path's authority for the next unique product range.
+///
+/// A single enum prevents role/work/decision combinations that the protocol
+/// cannot execute. Repair selection is independent because it never grants
+/// ownership of a new product offset.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum PathRuntimeRole {
+pub(crate) enum PathAdmission {
     /// The current primary ordered-byte owner for this product stream.
     ///
     /// This is the mptunnel equivalent of the scheduler-selected primary path
@@ -28,223 +138,14 @@ pub(crate) enum PathRuntimeRole {
     Subflow,
     /// Path-manager/control-plane probing only. A probe cannot own product
     /// offsets and cannot create product delivery proof.
-    Probe,
-    RepairOnly,
-    Standby,
-    /// Failed paths are filtered before ordinary sender targets are built.
-    /// The role remains in the shared vocabulary for diagnostics and RFC
-    /// alignment, but it is not an admissible data-plane outcome.
-    #[allow(dead_code)]
-    Failed,
-}
-
-impl PathRuntimeRole {
-    pub(crate) fn may_own_unique_data(self) -> bool {
-        matches!(self, Self::Service | Self::Subflow)
-    }
-
-    pub(crate) fn may_repair(self) -> bool {
-        matches!(self, Self::Service | Self::Subflow | Self::RepairOnly)
-    }
-
-    pub(crate) fn is_subflow_owner(self) -> bool {
-        matches!(self, Self::Subflow)
-    }
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum CarrierFamilyHealth {
-    Healthy,
-    ProbeOnly,
-    RepairOnly,
-    DisabledForReliableOwner,
-}
-
-impl CarrierFamilyHealth {
-    pub(crate) fn reliable_owner_allowed(self) -> bool {
-        matches!(self, Self::Healthy)
-    }
-}
-
-pub(crate) fn cross_family_reliable_owner_health(
-    current_owner: Option<CarrierPathKey>,
-    current_owner_bulk_rate_proven: bool,
-    candidate: CarrierPathKey,
-    candidate_bulk_rate_proven: bool,
-    candidate_continues_lower_frontier: bool,
-) -> CarrierFamilyHealth {
-    let Some(owner) = current_owner else {
-        return CarrierFamilyHealth::Healthy;
-    };
-    if owner == candidate || owner.underlay == candidate.underlay {
-        return CarrierFamilyHealth::Healthy;
-    }
-
-    // MPTCP/MPQUIC schedule by path state inside one carrier-family recovery
-    // model. mptunnel's mixed TCP+QUIC reliable streams have independent ACK
-    // clocks, pacing, flow control, and loss recovery. A cross-family path
-    // therefore cannot become an ordered-byte owner merely because it is
-    // lower-ETA at a clear frontier; it is owner-eligible only when it is
-    // continuing a lower-frontier range it already owns. Explicit Service
-    // migration/failover is handled outside this health predicate.
-    if candidate_continues_lower_frontier && candidate_bulk_rate_proven {
-        return CarrierFamilyHealth::Healthy;
-    }
-    if candidate_bulk_rate_proven {
-        CarrierFamilyHealth::RepairOnly
-    } else if current_owner_bulk_rate_proven {
-        CarrierFamilyHealth::ProbeOnly
-    } else {
-        CarrierFamilyHealth::DisabledForReliableOwner
-    }
-}
-
-#[derive(Debug, Clone, Copy)]
-pub(crate) struct ExtraTrafficBudget {
-    owner_progress_bytes: u64,
-    optional_spent_bytes: u64,
-    startup_floor_bytes: u64,
-    percent_budget: u16,
-}
-
-impl ExtraTrafficBudget {
-    pub(crate) fn new(
-        owner_progress_bytes: u64,
-        optional_spent_bytes: u64,
-        startup_floor_bytes: usize,
-        performance: MppPerformanceConfig,
-    ) -> Self {
-        Self {
-            owner_progress_bytes,
-            optional_spent_bytes,
-            startup_floor_bytes: startup_floor_bytes as u64,
-            percent_budget: performance.extra_traffic_hint_percent,
-        }
-    }
-
-    pub(crate) fn limit_bytes(self) -> u64 {
-        self.startup_floor_bytes.saturating_add(
-            self.owner_progress_bytes
-                .saturating_mul(self.percent_budget as u64)
-                / 100,
-        )
-    }
-
-    pub(crate) fn remaining_bytes(self) -> usize {
-        self.limit_bytes()
-            .saturating_sub(self.optional_spent_bytes)
-            .min(usize::MAX as u64) as usize
-    }
-
-    pub(crate) fn can_spend(self, bytes: usize) -> bool {
-        self.optional_spent_bytes.saturating_add(bytes as u64) <= self.limit_bytes()
-    }
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum ExtraTrafficKind {
-    Repair,
-}
-
-#[derive(Debug, Clone, Copy, Default)]
-pub(crate) struct ExtraTrafficLedger {
-    owner_progress_bytes: u64,
-    repair_bytes: u64,
-}
-
-impl ExtraTrafficLedger {
-    #[cfg(test)]
-    pub(crate) fn owner_progress_bytes(self) -> u64 {
-        self.owner_progress_bytes
-    }
-
-    pub(crate) fn optional_spent_bytes(self) -> u64 {
-        self.repair_bytes
-    }
-
-    pub(crate) fn record_owner_progress(&mut self, bytes: usize) {
-        self.owner_progress_bytes = self.owner_progress_bytes.saturating_add(bytes as u64);
-    }
-
-    pub(crate) fn record_optional(&mut self, kind: ExtraTrafficKind, bytes: usize) {
-        match kind {
-            ExtraTrafficKind::Repair => {
-                self.repair_bytes = self.repair_bytes.saturating_add(bytes as u64);
-            }
-        }
-    }
-
-    pub(crate) fn budget(
-        self,
-        startup_floor_bytes: usize,
-        performance: MppPerformanceConfig,
-    ) -> ExtraTrafficBudget {
-        ExtraTrafficBudget::new(
-            self.owner_progress_bytes,
-            self.optional_spent_bytes(),
-            startup_floor_bytes,
-            performance,
-        )
-    }
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum PathAdmissionDecision {
-    Service,
-    AdmitSubflow,
     ProbeOnly,
     Standby,
-}
-
-#[derive(Debug, Clone, Copy)]
-pub(crate) struct PathAdmission {
-    pub(crate) role: PathRuntimeRole,
-    pub(crate) work: CarrierWorkKind,
-    pub(crate) decision: PathAdmissionDecision,
 }
 
 impl PathAdmission {
-    pub(crate) fn service() -> Self {
-        Self {
-            role: PathRuntimeRole::Service,
-            work: CarrierWorkKind::OwnerData,
-            decision: PathAdmissionDecision::Service,
-        }
+    pub(crate) fn owns_unique_data(self) -> bool {
+        matches!(self, Self::Service | Self::Subflow)
     }
-
-    pub(crate) fn subflow_owner(role: PathRuntimeRole) -> Self {
-        debug_assert!(role.is_subflow_owner());
-        Self {
-            role,
-            work: CarrierWorkKind::OwnerData,
-            decision: PathAdmissionDecision::AdmitSubflow,
-        }
-    }
-
-    pub(crate) fn probe_only() -> Self {
-        Self {
-            role: PathRuntimeRole::Probe,
-            work: CarrierWorkKind::Probe,
-            decision: PathAdmissionDecision::ProbeOnly,
-        }
-    }
-
-    pub(crate) fn standby() -> Self {
-        Self {
-            role: PathRuntimeRole::Standby,
-            work: CarrierWorkKind::Control,
-            decision: PathAdmissionDecision::Standby,
-        }
-    }
-}
-
-#[cfg_attr(not(test), allow(dead_code))]
-#[derive(Debug, Clone, Copy)]
-pub(crate) struct SubflowMember<K = CarrierPathKey> {
-    pub(crate) key: K,
-    pub(crate) role: PathRuntimeRole,
-    pub(crate) owner_sent_bytes: u64,
-    pub(crate) optional_overhead_bytes: u64,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -255,9 +156,7 @@ pub(crate) struct SubflowAdmissionInput<K = CarrierPathKey> {
     pub(crate) frontier_clear: bool,
     pub(crate) completion_improves: bool,
     pub(crate) observed_goodput_non_degrading: bool,
-    pub(crate) read_gap: Duration,
     pub(crate) owner_bytes: usize,
-    pub(crate) optional_overhead_bytes: usize,
 }
 
 /// Per-flow admission memory for additional subflows.
@@ -270,14 +169,12 @@ pub(crate) struct SubflowAdmissionInput<K = CarrierPathKey> {
 /// scheduling.
 #[derive(Debug, Clone)]
 pub(crate) struct FlowSubflowSet<K = CarrierPathKey> {
-    _generation: u64,
     service: K,
     startup_owner_credit_bytes: u64,
     startup_owner: Option<StartupSubflowOwner<K>>,
-    optional_overhead_budget_bytes: u64,
-    optional_overhead_spent_bytes: u64,
-    max_read_gap_budget: Duration,
-    members: Vec<SubflowMember<K>>,
+    // Keys remain after startup graduation so one path cannot receive a fresh
+    // unproven startup allowance in the same flow epoch.
+    admitted_keys: SmallVec<[K; 4]>,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -297,37 +194,22 @@ impl<K> FlowSubflowSet<K>
 where
     K: Copy + Eq,
 {
-    pub(crate) fn new(
-        generation: u64,
-        service: K,
-        startup_owner_credit_bytes: usize,
-        optional_overhead_budget_bytes: usize,
-        max_read_gap_budget: Duration,
-    ) -> Self {
+    pub(crate) fn new(service: K, startup_owner_credit_bytes: usize) -> Self {
         Self {
-            _generation: generation,
             service,
             startup_owner_credit_bytes: startup_owner_credit_bytes as u64,
             startup_owner: None,
-            optional_overhead_budget_bytes: optional_overhead_budget_bytes as u64,
-            optional_overhead_spent_bytes: 0,
-            max_read_gap_budget,
-            members: Vec::new(),
+            admitted_keys: SmallVec::new(),
         }
     }
 
     #[cfg(test)]
-    pub(crate) fn members(&self) -> &[SubflowMember<K>] {
-        &self.members
+    pub(crate) fn admitted_keys(&self) -> &[K] {
+        &self.admitted_keys
     }
 
-    pub(crate) fn has_members(&self) -> bool {
-        !self.members.is_empty()
-    }
-
-    #[cfg(test)]
-    pub(crate) fn optional_overhead_spent_bytes(&self) -> u64 {
-        self.optional_overhead_spent_bytes
+    pub(crate) fn has_admitted_paths(&self) -> bool {
+        !self.admitted_keys.is_empty()
     }
 
     pub(crate) fn startup_owner_key(&self) -> Option<K> {
@@ -348,6 +230,13 @@ where
         self.startup_owner
             .filter(|startup| startup.key == key)
             .is_some_and(|startup| startup.sample_seal.is_some())
+    }
+
+    #[cfg(test)]
+    pub(crate) fn startup_owner_sent_bytes(&self, key: K) -> Option<u64> {
+        self.startup_owner
+            .filter(|startup| startup.key == key)
+            .map(|startup| startup.owner_sent_bytes)
     }
 
     pub(crate) fn seal_startup_owner_if_next_frame_exceeds_credit(
@@ -381,32 +270,22 @@ where
         true
     }
 
-    pub(crate) fn matches_envelope(
-        &self,
-        service: K,
-        startup_owner_credit_bytes: usize,
-        optional_overhead_budget_bytes: usize,
-        max_read_gap_budget: Duration,
-    ) -> bool {
+    pub(crate) fn matches_envelope(&self, service: K, startup_owner_credit_bytes: usize) -> bool {
         self.service == service
             && self.startup_owner_credit_bytes == startup_owner_credit_bytes as u64
-            && self.optional_overhead_budget_bytes == optional_overhead_budget_bytes as u64
-            && self.max_read_gap_budget == max_read_gap_budget
     }
 
     pub(crate) fn admit_subflow_owner(&mut self, input: SubflowAdmissionInput<K>) -> PathAdmission {
         if input.key == self.service {
-            return PathAdmission::service();
+            return PathAdmission::Service;
         }
 
         if !self.subflow_owner_allowed(input) {
             if self.probe_allowed(input) {
-                return PathAdmission::probe_only();
+                return PathAdmission::ProbeOnly;
             }
-            return PathAdmission::standby();
+            return PathAdmission::Standby;
         }
-
-        let role = PathRuntimeRole::Subflow;
 
         if !input.bulk_rate_proven {
             let startup = self.startup_owner.get_or_insert(StartupSubflowOwner {
@@ -423,31 +302,11 @@ where
             }
         }
 
-        self.optional_overhead_spent_bytes = self
-            .optional_overhead_spent_bytes
-            .saturating_add(input.optional_overhead_bytes as u64);
-        if let Some(member) = self
-            .members
-            .iter_mut()
-            .find(|member| member.key == input.key)
-        {
-            debug_assert!(member.role.is_subflow_owner());
-            member.owner_sent_bytes = member
-                .owner_sent_bytes
-                .saturating_add(input.owner_bytes as u64);
-            member.optional_overhead_bytes = member
-                .optional_overhead_bytes
-                .saturating_add(input.optional_overhead_bytes as u64);
-        } else {
-            self.members.push(SubflowMember {
-                key: input.key,
-                role,
-                owner_sent_bytes: input.owner_bytes as u64,
-                optional_overhead_bytes: input.optional_overhead_bytes as u64,
-            });
+        if !self.admitted_keys.contains(&input.key) {
+            self.admitted_keys.push(input.key);
         }
 
-        PathAdmission::subflow_owner(role)
+        PathAdmission::Subflow
     }
 
     pub(crate) fn rollback_subflow_owner(&mut self, input: SubflowAdmissionInput<K>) {
@@ -469,21 +328,6 @@ where
                 startup.sample_seal = None;
             }
         }
-        self.optional_overhead_spent_bytes = self
-            .optional_overhead_spent_bytes
-            .saturating_sub(input.optional_overhead_bytes as u64);
-        if let Some(member) = self
-            .members
-            .iter_mut()
-            .find(|member| member.key == input.key)
-        {
-            member.owner_sent_bytes = member
-                .owner_sent_bytes
-                .saturating_sub(input.owner_bytes as u64);
-            member.optional_overhead_bytes = member
-                .optional_overhead_bytes
-                .saturating_sub(input.optional_overhead_bytes as u64);
-        }
     }
 
     fn subflow_owner_allowed(&self, input: SubflowAdmissionInput<K>) -> bool {
@@ -496,17 +340,12 @@ where
         (bulk_rate_owner || startup_owner)
             && input.frontier_clear
             && input.observed_goodput_non_degrading
-            && input.read_gap <= self.max_read_gap_budget
-            && self
-                .optional_overhead_spent_bytes
-                .saturating_add(input.optional_overhead_bytes as u64)
-                <= self.optional_overhead_budget_bytes
     }
 
     fn startup_owner_key_available(&self, key: K) -> bool {
         match self.startup_owner {
             Some(startup) => startup.key == key,
-            None => !self.members.iter().any(|member| member.key == key),
+            None => !self.admitted_keys.contains(&key),
         }
     }
 
@@ -522,11 +361,6 @@ where
 
     fn probe_allowed(&self, input: SubflowAdmissionInput<K>) -> bool {
         input.frontier_clear
-            && input.read_gap <= self.max_read_gap_budget
-            && self
-                .optional_overhead_spent_bytes
-                .saturating_add(input.optional_overhead_bytes as u64)
-                <= self.optional_overhead_budget_bytes
     }
 }
 

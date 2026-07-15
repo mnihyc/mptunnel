@@ -2,7 +2,7 @@ use super::{
     ClientTcpOpenCancellation, ClientTcpPathStreamState, remove_matching_client_tcp_open,
     route_client_tcp_stream_frame,
 };
-use crate::protocol::{Frame, StreamFlags, StreamId};
+use crate::protocol::{Frame, StreamId};
 use crate::runtime::path::commands::{
     ClientTcpOpenAttemptId, ReliablePathCommand, recv_reliable_path_command,
     reliable_path_command_channels,
@@ -143,7 +143,6 @@ async fn client_tcp_path_routes_inflight_receive_frames_to_live_stream() {
         Frame::StreamData {
             stream_id,
             offset: 0,
-            flags: StreamFlags::NONE,
             payload: Bytes::from_static(b"inflight"),
         },
     )

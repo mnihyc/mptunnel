@@ -7,7 +7,7 @@
 use crate::model::admission::{
     BulkAdmissionCheck, BulkAdmissionRole, bulk_candidate_admission_suppression_with_ordering_debt,
 };
-use crate::model::multipath::cross_family_reliable_owner_health;
+use crate::model::multipath::cross_family_reliable_owner_allowed;
 use crate::model::path::{CarrierPathInstanceId, CarrierPathKey, carrier_path_key_order};
 use crate::mux::MuxLimits;
 use crate::protocol::{StreamOpenRole, UnderlayProtocol};
@@ -120,27 +120,17 @@ where
         .map(AsRef::as_ref)
         .find(|candidate| candidate.is_service);
     let current_owner = ordered_data_owner.or_else(|| fallback_service.map(|service| service.key));
-    let current_owner_bulk_rate_proven = current_owner
-        .and_then(|owner| {
-            candidates
-                .iter()
-                .map(AsRef::as_ref)
-                .find(|candidate| candidate.key == owner)
-        })
-        .is_none_or(|owner| owner.has_bulk_rate_evidence);
     let continues_lower_frontier =
         response_oldest_lower_flight_owner(lower_flights) == Some(target.key);
     if continues_lower_frontier && (target.is_service || target.has_bulk_rate_evidence) {
         return true;
     }
-    cross_family_reliable_owner_health(
+    cross_family_reliable_owner_allowed(
         current_owner,
-        current_owner_bulk_rate_proven,
         target.key,
         target.has_bulk_rate_evidence,
         continues_lower_frontier,
     )
-    .reliable_owner_allowed()
 }
 
 pub(crate) fn response_ordered_owner_missing_under_debt<T>(

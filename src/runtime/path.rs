@@ -44,6 +44,7 @@ pub(in crate::runtime) use quic::{
     RequestQuicCapacityProbeLease, RequestQuicCapacityProductHandoffState,
     RequestQuicCapacityReconciliationQuery,
 };
+pub(in crate::runtime) use selection::ReliableRequestTcpPathEvidence;
 pub(in crate::runtime) use server_context::ServerPathContext;
 pub(in crate::runtime) use set::ClientPathContext;
 pub(in crate::runtime) use state::{

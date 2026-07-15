@@ -76,7 +76,6 @@ pub(crate) fn bulk_striping_admitted_candidates(
     bulk_striping_admitted_subflows(candidates, payload_bytes, mux_limits)
 }
 
-#[cfg_attr(not(test), allow(dead_code))]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum BulkAdmissionRole {
     ActiveDataPath,
@@ -374,7 +373,7 @@ pub(crate) fn reliable_relay_source_staging_owner_tail_headroom(
     feed_limit.saturating_sub(staged_debt)
 }
 
-#[cfg_attr(not(test), allow(dead_code))]
+#[cfg(test)]
 pub(crate) fn bulk_candidate_admission_suppression(
     best_snapshot: PathSnapshot,
     best_eta_ms: f64,
@@ -485,7 +484,7 @@ fn bulk_same_underlay_requires_completion_gain(candidate: PathSnapshot) -> bool 
     // meaningful completion model.  Otherwise the scheduler becomes circular:
     // the path needs evidence to prove a rate, while the rate proof is required
     // to own bytes.  Low-confidence or app-limited same-underlay paths remain
-    // Probe/Standby/RepairOnly; they are simply not rejected by measured
+    // Probe-only and standby paths are simply not rejected by measured
     // completion-gain math.
     !candidate.app_limited && candidate.confidence >= 1.0
 }
@@ -560,9 +559,8 @@ fn bulk_candidate_within_inflight_limit(check: BulkAdmissionCheck) -> bool {
     let payload_bytes = check.payload_bytes;
     let mux_limits = check.mux_limits;
     let role = check.role;
-    if bulk_active_lead_has_contiguous_frontier(candidate, role, check.stream_ordering_debt_bytes) {
-        let inflight_limit =
-            bulk_active_service_product_envelope_bytes(candidate, payload_bytes, mux_limits);
+    if bulk_active_lead_has_contiguous_frontier(role, check.stream_ordering_debt_bytes) {
+        let inflight_limit = bulk_active_service_product_envelope_bytes(payload_bytes, mux_limits);
         let committed = bulk_assigned_service_debt_bytes(candidate);
         if committed.saturating_add(payload_bytes as u64) > inflight_limit
             && committed >= inflight_limit
@@ -613,21 +611,17 @@ fn bulk_quantum_granular_limit_allows(
 }
 
 fn bulk_active_lead_has_contiguous_frontier(
-    candidate: PathSnapshot,
     role: BulkAdmissionRole,
     stream_ordering_debt_bytes: u64,
 ) -> bool {
-    let _ = candidate;
     role == BulkAdmissionRole::ActiveDataPath && stream_ordering_debt_bytes == 0
 }
 
 pub(crate) fn bulk_active_service_product_envelope_bytes(
-    candidate: PathSnapshot,
     payload_bytes: usize,
     mux_limits: MuxLimits,
 ) -> u64 {
     let stream_window = usize::try_from(mux_limits.max_stream_window_bytes).unwrap_or(usize::MAX);
-    let _ = candidate;
     mux_limits
         .max_path_flight_bytes
         .min(stream_window)
@@ -642,7 +636,7 @@ fn bulk_product_inflight_limit_bytes(
     role: BulkAdmissionRole,
 ) -> u64 {
     if candidate.underlay == UnderlayProtocol::Udp && role == BulkAdmissionRole::ActiveDataPath {
-        return bulk_active_service_product_envelope_bytes(candidate, payload_bytes, mux_limits);
+        return bulk_active_service_product_envelope_bytes(payload_bytes, mux_limits);
     }
     let configured_ceiling = mux_limits.max_path_flight_bytes as u64;
     let payload_floor = payload_bytes as u64;
@@ -863,7 +857,7 @@ fn bulk_admission_reorder_budget_bytes_for_ordering_debt(
             if bulk_active_role_has_latency_pressure(candidate, role) {
                 bulk_service_horizon_payload_bytes(payload_bytes, mux_limits) as u64
             } else {
-                bulk_active_service_product_envelope_bytes(candidate, payload_bytes, mux_limits)
+                bulk_active_service_product_envelope_bytes(payload_bytes, mux_limits)
             }
         }
         BulkAdmissionRole::ActiveDataPath => {

@@ -6,10 +6,8 @@ use super::super::test_support::{
 };
 use crate::model::capacity::{
     BBR_MAX_SEND_QUANTUM_BYTES, MIN_RATE_SAMPLE_BYTES, PATH_OPEN_SCORE_BYTES,
-    reliable_relay_buffer_len,
 };
 use crate::model::path::CarrierPathKey;
-use crate::mux::MuxLimits;
 use crate::protocol::frame::reliable_stream_frame_accounted_bytes;
 use crate::protocol::{OffsetRange, PathId, SessionId, StreamOpenRole, UnderlayProtocol};
 use crate::runtime::RuntimeError;
@@ -47,7 +45,6 @@ fn response_repair_enqueue_rejects_detached_output_incarnation() {
             replacement_commands,
             FlowLane::Throughput,
             StreamOpenRole::Active,
-            reliable_relay_buffer_len(MuxLimits::default()),
         ),
         ResponseStreamAttachOutcome::Attached
     );
@@ -100,7 +97,6 @@ fn duplicate_response_validation_copy_does_not_become_ordering_owner() {
         duplicate_commands,
         FlowLane::Throughput,
         StreamOpenRole::Repair,
-        reliable_relay_buffer_len(MuxLimits::default()),
     );
     let frame = stream_data_frame_at(0, 4096);
 
@@ -183,7 +179,6 @@ fn partial_same_start_response_ack_releases_each_copy_and_retains_owner_suffix()
             repair_commands,
             FlowLane::Latency,
             StreamOpenRole::Repair,
-            reliable_relay_buffer_len(MuxLimits::default()),
         ),
         ResponseStreamAttachOutcome::Attached,
     );
@@ -314,7 +309,6 @@ fn repair_stream_ack_progress_does_not_promote_repair_output() {
         repair_commands,
         FlowLane::Throughput,
         StreamOpenRole::Repair,
-        reliable_relay_buffer_len(MuxLimits::default()),
     );
     let frame = stream_data_frame_at(0, 4096);
 
@@ -371,7 +365,6 @@ fn repair_flight_kind_never_owns_ordering_or_delivery_evidence() {
         repair_commands,
         FlowLane::Throughput,
         StreamOpenRole::Repair,
-        reliable_relay_buffer_len(MuxLimits::default()),
     );
 
     let owner_frame = stream_data_frame_at(0, 1024);
@@ -430,7 +423,6 @@ fn old_flight_ack_does_not_debit_or_prove_replaced_output() {
             new_commands,
             FlowLane::Throughput,
             StreamOpenRole::Validation,
-            reliable_relay_buffer_len(MuxLimits::default()),
         ),
         ResponseStreamAttachOutcome::ReplacedClosedOutput
     );
@@ -502,7 +494,6 @@ fn late_old_output_record_cannot_account_or_prove_replacement() {
             new_commands,
             FlowLane::Throughput,
             StreamOpenRole::Validation,
-            reliable_relay_buffer_len(MuxLimits::default()),
         ),
         ResponseStreamAttachOutcome::Attached
     );
@@ -565,7 +556,6 @@ fn old_acked_hole_cannot_prove_replacement_when_frontier_advances() {
             new_commands,
             FlowLane::Throughput,
             StreamOpenRole::Validation,
-            reliable_relay_buffer_len(MuxLimits::default()),
         ),
         ResponseStreamAttachOutcome::ReplacedClosedOutput
     );
@@ -595,7 +585,6 @@ fn late_record_from_pre_role_change_plan_is_not_path_proving() {
             commands.clone(),
             FlowLane::Throughput,
             StreamOpenRole::Validation,
-            reliable_relay_buffer_len(MuxLimits::default()),
         ),
         ResponseStreamAttachOutcome::Attached
     );
@@ -611,7 +600,6 @@ fn late_record_from_pre_role_change_plan_is_not_path_proving() {
             commands,
             FlowLane::Throughput,
             StreamOpenRole::Repair,
-            reliable_relay_buffer_len(MuxLimits::default()),
         ),
         ResponseStreamAttachOutcome::RoleChanged
     );
@@ -655,7 +643,6 @@ fn pre_role_change_acked_hole_cannot_restore_delivery_evidence() {
             commands.clone(),
             FlowLane::Throughput,
             StreamOpenRole::Validation,
-            reliable_relay_buffer_len(MuxLimits::default()),
         ),
         ResponseStreamAttachOutcome::Attached
     );
@@ -673,7 +660,6 @@ fn pre_role_change_acked_hole_cannot_restore_delivery_evidence() {
             commands,
             FlowLane::Throughput,
             StreamOpenRole::Repair,
-            reliable_relay_buffer_len(MuxLimits::default()),
         ),
         ResponseStreamAttachOutcome::RoleChanged
     );
@@ -707,7 +693,6 @@ fn response_acked_hole_debt_counts_unique_ordering_owner_only() {
         duplicate_commands,
         FlowLane::Throughput,
         StreamOpenRole::Repair,
-        reliable_relay_buffer_len(MuxLimits::default()),
     );
     let lower_missing = stream_data_frame_at(0, 1024);
     let later = stream_data_frame_at(1024, 4096);

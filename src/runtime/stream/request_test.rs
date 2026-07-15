@@ -7,7 +7,7 @@ use crate::model::multipath::FlowSubflowSet;
 use crate::model::path::{RelayPathInstance, RelayPathKey};
 use crate::model::request::evidence::{RequestOwnerAckProgress, RequestWindowGrowthEvidence};
 use crate::mux::MuxLimits;
-use crate::protocol::{Frame, OffsetRange, StreamFlags, StreamId, UnderlayProtocol};
+use crate::protocol::{Frame, OffsetRange, StreamId, UnderlayProtocol};
 use crate::scheduler::FlowLane;
 use bytes::Bytes;
 use smallvec::smallvec;
@@ -17,7 +17,6 @@ fn data_frame(offset: u64, len: usize) -> Frame {
     Frame::StreamData {
         stream_id: StreamId(7),
         offset,
-        flags: StreamFlags::NONE,
         payload: Bytes::from(vec![0x5a; len]),
     }
 }
@@ -41,13 +40,7 @@ fn service_epoch_reset_retains_attempted_and_graduated_instance_tombstones() {
     request.startup.attempted_subflows.insert(attempted);
     request.startup.attempted_subflows.insert(graduated);
     request.subflows.get_mut(graduated).mark_graduated();
-    request.startup.epoch = Some(FlowSubflowSet::new(
-        0,
-        service,
-        256 * 1024,
-        0,
-        Duration::ZERO,
-    ));
+    request.startup.epoch = Some(FlowSubflowSet::new(service, 256 * 1024));
     request.ack_clock_operation = Some(RequestAckClockOperation::Pending {
         service,
         candidate: graduated,
@@ -189,8 +182,12 @@ fn repair_copy_does_not_become_ordering_owner() {
         end: 4096,
     }]);
     assert_eq!(released.len(), 2);
-    assert!(released.iter().any(|release| release.key == owner));
-    assert!(released.iter().any(|release| release.key == duplicate));
+    assert!(released.iter().any(|release| release.instance.key == owner));
+    assert!(
+        released
+            .iter()
+            .any(|release| release.instance.key == duplicate)
+    );
     assert!(
         released.iter().all(|release| !release.path_proving),
         "ACK of duplicated request bytes releases inflight state but is not path-scoped proof"
@@ -213,7 +210,7 @@ fn owner_only_ack_release_is_path_proving() {
     }]);
 
     assert_eq!(released.len(), 1);
-    assert_eq!(released[0].key, owner);
+    assert_eq!(released[0].instance.key, owner);
     assert!(
         released[0].path_proving,
         "a single outstanding owner copy is path-scoped STREAM_ACK evidence"
@@ -270,7 +267,7 @@ fn partial_same_start_duplicate_ack_retains_owner_suffix() {
         end: 4096,
     }]);
     assert_eq!(suffix_releases.len(), 1);
-    assert_eq!(suffix_releases[0].key, owner);
+    assert_eq!(suffix_releases[0].instance.key, owner);
     assert_eq!(suffix_releases[0].bytes, 3072);
     assert!(
         suffix_releases[0].path_proving,

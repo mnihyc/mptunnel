@@ -109,42 +109,35 @@ impl ClientPathContext {
         if paths.len() > u16::MAX as usize {
             return Err(RuntimeError::PathIdOverflow);
         }
-        let tcp_entries = paths
-            .iter()
-            .enumerate()
-            .filter(|(_, path)| path.spec.underlay == UnderlayProtocol::Tcp)
-            .map(|(ordinal, path)| (ordinal, path.spec.clone(), path.security.clone()))
-            .collect::<Vec<_>>();
-        let tcp_path_ordinals = tcp_entries
-            .iter()
-            .map(|(ordinal, _, _)| *ordinal)
-            .collect::<Vec<_>>();
-        let tcp_paths = tcp_entries
-            .iter()
-            .map(|(_, path, _)| path.clone())
-            .collect::<Vec<_>>();
-        let tcp_security = tcp_entries
-            .into_iter()
-            .map(|(_, _, security)| security)
-            .collect::<Vec<_>>();
-        let udp_entries = paths
-            .into_iter()
-            .enumerate()
-            .filter(|(_, path)| path.spec.underlay == UnderlayProtocol::Udp)
-            .map(|(ordinal, path)| (ordinal, path.spec, path.security))
-            .collect::<Vec<_>>();
-        let udp_path_ordinals = udp_entries
-            .iter()
-            .map(|(ordinal, _, _)| *ordinal)
-            .collect::<Vec<_>>();
-        let udp_paths = udp_entries
-            .iter()
-            .map(|(_, path, _)| path.clone())
-            .collect::<Vec<_>>();
-        let udp_security = udp_entries
-            .into_iter()
-            .map(|(_, _, security)| security)
-            .collect::<Vec<_>>();
+        let mut tcp_paths = Vec::new();
+        let mut tcp_path_ordinals = Vec::new();
+        let mut tcp_security = Vec::new();
+        let mut udp_paths = Vec::new();
+        let mut udp_path_ordinals = Vec::new();
+        let mut udp_security = Vec::new();
+        for (ordinal, path) in paths.into_iter().enumerate() {
+            let ClientPathConfig { spec, security } = path;
+            match spec.underlay {
+                UnderlayProtocol::Tcp => {
+                    tcp_path_ordinals.push(ordinal);
+                    tcp_paths.push(spec);
+                    tcp_security.push(security);
+                }
+                UnderlayProtocol::Udp => {
+                    udp_path_ordinals.push(ordinal);
+                    udp_paths.push(spec);
+                    udp_security.push(security);
+                }
+            }
+        }
+        // Context and carrier actors share one immutable configuration backing;
+        // reconnecting a session must not deep-copy endpoint or secret material.
+        let tcp_paths = Arc::new(tcp_paths);
+        let tcp_path_ordinals = Arc::new(tcp_path_ordinals);
+        let tcp_security = Arc::new(tcp_security);
+        let udp_paths = Arc::new(udp_paths);
+        let udp_path_ordinals = Arc::new(udp_path_ordinals);
+        let udp_security = Arc::new(udp_security);
         let path_proof_limit = resources.max_streams.saturating_mul(2).max(1);
         let state = ClientPathState::new(ClientPathHealth {
             tcp: vec![
@@ -159,20 +152,18 @@ impl ClientPathContext {
         let codec_limits = resources.into();
         let mux_limits = resources.into();
         let session_id = random_session_id()?;
-        let tcp_sessions = tcp_paths
-            .iter()
-            .cloned()
-            .enumerate()
-            .map(|(path_index, path)| {
+        let tcp_sessions = (0..tcp_paths.len())
+            .map(|path_index| {
                 ClientTcpPathSessionHandle::new(ClientTcpPathSessionRuntime {
-                    path,
+                    paths: tcp_paths.clone(),
+                    config_index: path_index,
                     path_index,
                     carrier_identity: CarrierPathIdentity {
                         group_ordinal: path_group_ordinal,
                         path_ordinal: tcp_path_ordinals[path_index],
                     },
                     session_id,
-                    security: tcp_security[path_index].clone(),
+                    security: tcp_security.clone(),
                     codec_limits,
                     mux_limits,
                     command_queue: tcp_session_command_queue(resources),
@@ -185,20 +176,18 @@ impl ClientPathContext {
                 })
             })
             .collect::<Vec<_>>();
-        let udp_sessions = udp_paths
-            .iter()
-            .cloned()
-            .enumerate()
-            .map(|(path_index, path)| {
+        let udp_sessions = (0..udp_paths.len())
+            .map(|path_index| {
                 ClientUdpPathSessionHandle::new(ClientUdpPathSessionRuntime {
-                    path,
+                    paths: udp_paths.clone(),
+                    config_index: path_index,
                     path_index,
                     carrier_identity: CarrierPathIdentity {
                         group_ordinal: path_group_ordinal,
                         path_ordinal: udp_path_ordinals[path_index],
                     },
                     session_id,
-                    security: udp_security[path_index].clone(),
+                    security: udp_security.clone(),
                     codec_limits,
                     mux_limits,
                     stream_frame_queue: reliable_stream_frame_queue(mux_limits),
@@ -210,12 +199,12 @@ impl ClientPathContext {
         Ok(Self {
             route_target,
             ingresses: Arc::new(ingresses),
-            tcp_paths: Arc::new(tcp_paths),
-            udp_paths: Arc::new(udp_paths),
-            tcp_path_ordinals: Arc::new(tcp_path_ordinals),
-            udp_path_ordinals: Arc::new(udp_path_ordinals),
+            tcp_paths,
+            udp_paths,
+            tcp_path_ordinals,
+            udp_path_ordinals,
             path_group_ordinal,
-            tcp_security: Arc::new(tcp_security),
+            tcp_security,
             tcp_sessions: Arc::new(tcp_sessions),
             udp_sessions: Arc::new(udp_sessions),
             carrier_network,

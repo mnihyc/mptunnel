@@ -50,7 +50,6 @@ fn quic_capacity_calibration_uses_carrier_bytes_without_product_flight() {
         candidate_commands,
         FlowLane::Throughput,
         StreamOpenRole::Validation,
-        mux_limits.max_payload_bytes,
     );
     assert!(matches!(
         try_recv_reliable_path_command(&mut candidate_receivers),
@@ -190,7 +189,6 @@ fn quic_capacity_lease_deadline_is_created_after_admission_and_failure_propagate
         candidate_commands,
         FlowLane::Throughput,
         StreamOpenRole::Validation,
-        mux_limits.max_payload_bytes,
     );
     assert!(matches!(
         try_recv_reliable_path_command(&mut candidate_receivers),

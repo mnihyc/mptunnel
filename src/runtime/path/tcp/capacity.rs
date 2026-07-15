@@ -602,7 +602,6 @@ fn portable_tcp_receipt_metrics(path_id: PathId, direction: PathMetricDirection)
         direction,
         metric_epoch: metric_epoch_now(),
         metric_age_us: 0,
-        min_rtt_us: initial_rtt_us,
         srtt_us: initial_rtt_us,
         rttvar_us: initial_rtt_us / 2,
         jitter_us: initial_rtt_us / 2,

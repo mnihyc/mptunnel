@@ -287,12 +287,16 @@ mptunnel --check-config \
   --path tcp://127.0.0.1:7443
 ```
 
-Normal client launches only need endpoint paths. Optional path URI query parameters can seed the runtime scheduler before live health observations exist, but Auto must correct those hints from measured link status and flow demand. Supported path hints are:
+Normal client launches only need endpoint paths. Optional path URI query parameters can seed the runtime scheduler before live health observations exist, but Auto must correct those hints from measured link status and flow demand. Supported measurement and admission hints are:
 
 - `srtt-ms`, `rtt-ms`, `jitter-ms`
 - `rate-bps`, `rate-kbps`, `rate-mbps`, `rate=unknown`, `rate=unlimited`
-- `mtu`, `mtu-bytes`, `payload-mtu`
-- `backup`, `expensive`, `low-latency`, `bulk-allowed`, `bulk`, `no-bulk`, `probe-only`, `no-udp`
+- `backup`, `expensive`, `bulk-allowed`, `bulk`, `no-bulk`, `probe-only`, `no-udp`
+
+For UDP paths, `datagram-payload-limit` sets an optional product datagram
+allocation ceiling. The legacy aliases `mtu`, `mtu-bytes`, and `payload-mtu`
+remain accepted with the same meaning; none reports or overrides Quinn's live
+transport PMTU.
 
 Boolean hints accept `true`, `false`, `1`, `0`, `yes`, `no`, `on`, and `off`; bare boolean hints mean `true`.
 
@@ -527,7 +531,7 @@ SOCKS5 UDP ASSOCIATE ingress uses authenticated encrypted datagram flows per tar
 
 Datagrams are acknowledged with internal `DGRAM_FEEDBACK` ranges, and response datagrams are acknowledged back to the server. QUIC UDP feedback updates scheduler RTT, jitter, loss, and rate evidence; TCP-carried feedback updates its association-local response timers, while association close feeds useful-payload delivery rate and releases scheduler load. When several carriers are configured, one local datagram association can lazily own TCP and QUIC UDP carrier associations, but realtime datagrams prefer the ready lowest-ETA carrier instead of spraying ordinary probes across high-RTT paths. One absolute expiry is fixed from the original product TTL before carrier selection. Carrier setup, flow setup, pacing, request emission, feedback/response waiting, and permitted fallback all consume that same remaining TTL. Before `DGRAM_FEEDBACK`, at most one fresh product attempt may follow the original attempt, and only on the next evidence-ordered carrier whose current setup ETA still fits; after feedback or product expiry, mptunnel does not reopen a carrier or replay the product datagram. Request blackholes mark the path failed; an acknowledged request may wait only to the original expiry and never becomes replay permission. The same bounded authenticated idle-path probe loop exercises carrier handshakes and `PING`/`PONG` without opening datagram flows or adding probe traffic to active associations.
 
-TUN L4 ingress uses `tun-rs` for packet-device I/O and `netstack-smoltcp` for user-space TCP/UDP flow translation. Desktop hosts use the system packet-device provider. Android applications establish the TUN through `VpnService`, wrap its owned descriptor with `runtime::PacketDevice::from_owned_fd`, implement both `runtime::PacketDeviceProvider` and `transport::CarrierNetworkProvider`, and call `runtime::run_with_host_providers`. For each configured path, the carrier provider must resolve the remote endpoint through the selected native network and protect or bind every TCP and QUIC socket to that same network before connection so mptunnel's carriers cannot re-enter its catch-all TUN. `run_with_packet_device_provider` intentionally uses the system carrier network and is not a full-tunnel Android entry point. Routes, addresses, MTU, JNI integration, and service lifecycle remain host-owned. TCP packets accepted from the TUN stack become encrypted internal reliable streams with `IngressKind::TunTcp` over TCP, UDP, or mixed reliable underlays. UDP packets are demuxed by local/remote socket pair into bounded per-flow tasks and sent as encrypted internal datagram flows with `IngressKind::TunUdp` over the best live TCP or QUIC UDP datagram carrier. TUN supports IPv4, IPv6, or dual-stack addressing. UDP port 53 traffic can be explicitly remapped to configured `--tun-dns-resolver` addresses while responses are written back to the TUN client as if they came from the original DNS destination, so DNS traffic can pass through TUN without relying on host resolver defaults.
+TUN L4 ingress uses `tun-rs` for packet-device I/O and `netstack-smoltcp` for user-space TCP/UDP flow translation. Desktop hosts use the system packet-device provider. Android applications establish the TUN through `VpnService`, wrap its owned descriptor with `runtime::PacketDevice::from_owned_fd`, implement both `runtime::PacketDeviceProvider` and `transport::CarrierNetworkProvider`, and call `runtime::run_with_host_providers`. For each configured path, the carrier provider must resolve the remote endpoint through the selected native network and protect or bind every TCP and QUIC socket to that same network before connection so mptunnel's carriers cannot re-enter its catch-all TUN. `run_with_packet_device_provider` intentionally uses the system carrier network and is not a full-tunnel Android entry point. Routes, addresses, MTU, JNI integration, and service lifecycle remain host-owned. TCP packets accepted from the TUN stack become encrypted internal reliable streams over TCP, UDP, or mixed reliable underlays. UDP packets are demuxed locally by socket pair into bounded per-flow tasks and sent as encrypted internal datagram flows over the best live TCP or QUIC UDP datagram carrier. The ingress adapter owns that local classification; it is not serialized into the peer's routing policy. TUN supports IPv4, IPv6, or dual-stack addressing. UDP port 53 traffic can be explicitly remapped to configured `--tun-dns-resolver` addresses while responses are written back to the TUN client as if they came from the original DNS destination, so DNS traffic can pass through TUN without relying on host resolver defaults.
 
 UDP targets can be reached through direct UDP, bind-source-IP direct UDP, upstream SOCKS5 UDP ASSOCIATE, or upstream HTTP CONNECT-UDP. The `http-connect-udp` outbound performs the RFC 9298 HTTP/1.1 Upgrade handshake, requires a `101 Switching Protocols` response with capsule support, and carries UDP payloads in HTTP Datagram capsules. Plain `http-connect` outbound is TCP-only.
 
@@ -537,18 +541,18 @@ Server direct and bind-source outbounds resolve domain targets through `--outbou
 
 ## Scheduler Regression Gates
 
-The deterministic simulator exercises the scheduler against heterogeneous path conditions before runtime changes are made. Current gates cover:
+The deterministic simulator shares production path-scoring primitives but owns a private virtual queue and scheduling harness. It explores heterogeneous path hypotheses before runtime changes are made; it does not prove deployed queueing behavior. Current model gates cover:
 
 - bulk transfer aggregation efficiency across low-latency and high-bandwidth paths
 - failover gap after path failure and chunk reinjection onto a survivor path
 - interactive p95 latency while a bulk transfer is queued
 - bulk tail penalty for heterogeneous RTT/bandwidth paths
-- per-lane priority and per-flow deficit scheduling
-- per-path queued-byte pressure from scheduled payloads
-- bulk tail avoidance that promotes the final bulk bytes onto latency-sensitive scoring
-- duplication of small control/realtime packets onto a second close-ETA path
-- shared-bottleneck suspicion that avoids a low-RTT path when a similar-RTT peer is already queued
+- simulator-only per-lane priority and per-flow deficit scheduling
+- simulator-only per-path virtual queued-byte pressure
+- simulator-only bulk-tail, close-ETA duplication, and shared-bottleneck hypotheses
+
+The deployed runtime instead owns per-flow sender queues, carrier admission, repair ledgers, and TCP/QUIC-specific recovery. Those mechanisms require matched end-to-end labs; simulator results cannot substitute for them.
 
 ## Developer Benchmark Gates
 
-`cargo run --manifest-path lab/benchmarks/Cargo.toml -- gates --strict` runs the manual developer regression profile. It checks modeled page-load completion, interactive p95 under bulk load, video startup/rebuffering, file-download goodput, aggregation efficiency, ideal-lab goodput near 1 Gbps, failover recovery gap, repaired chunks, local AEAD CPU cost for ChaCha20-Poly1305 and AES-256-GCM, and lab RAM-budget diagnostics. These are lab signals only; the release `mptunnel` binary does not contain those thresholds and does not terminate because a lab goal is missed. `cargo run --manifest-path lab/benchmarks/Cargo.toml -- ablation` compares single-link, multipath, and scheduler-ablation profiles. Docker lab comparisons are documented in `docs/LAB.md`.
+`cargo run --manifest-path lab/benchmarks/Cargo.toml -- gates --strict` runs the manual developer regression profile. It checks modeled page-load completion, interactive p95 under bulk load, video startup/rebuffering, file-download goodput, aggregation efficiency, ideal-lab goodput near 1 Gbps, failover recovery gap, repaired chunks, local AEAD CPU cost for ChaCha20-Poly1305 and AES-256-GCM, and lab RAM-budget diagnostics. These are lab signals only; the release `mptunnel` binary does not contain those thresholds and does not terminate because a lab goal is missed. `cargo run --manifest-path lab/benchmarks/Cargo.toml -- ablation` compares single-link and heterogeneous multipath path profiles. Docker lab comparisons are documented in `docs/LAB.md`.

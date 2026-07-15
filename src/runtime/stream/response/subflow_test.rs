@@ -36,7 +36,6 @@ fn udp_product_ack_without_unique_owner_rate_is_sender_evidence_not_bulk_rate() 
         role: StreamOpenRole::Active,
         owner_data_in_flight_bytes: 0,
         bytes_in_flight: 0,
-        product_queue_bytes: 0,
         product_progress_rate_bps: None,
         delivery_rate_bps: None,
         tcp_ack_clock_rate_bps: None,
@@ -75,7 +74,6 @@ fn udp_unique_owner_ack_product_rate_does_not_replace_carrier_rate() {
         role: StreamOpenRole::Active,
         owner_data_in_flight_bytes: 0,
         bytes_in_flight: 0,
-        product_queue_bytes: 0,
         product_progress_rate_bps: Some(product_rate),
         delivery_rate_bps: None,
         tcp_ack_clock_rate_bps: None,
@@ -95,11 +93,10 @@ fn udp_unique_owner_ack_product_rate_does_not_replace_carrier_rate() {
                 direction: PathMetricDirection::ServerToClient,
                 metric_epoch: metric_epoch_now(),
                 metric_age_us: 0,
-                min_rtt_us: 160_000,
                 srtt_us: 160_000,
                 rttvar_us: 5_000,
                 jitter_us: 5_000,
-                delivery_rate_bps: default_path_rate_bps(UnderlayProtocol::Udp).round() as u64,
+                delivery_rate_bps: default_path_rate_bps().round() as u64,
                 pacing_rate_bps: 200_000_000,
                 loss_ppm: 0,
                 ecn_ppm: 0,
@@ -126,15 +123,15 @@ fn udp_unique_owner_ack_product_rate_does_not_replace_carrier_rate() {
     );
     let snapshot = server_bulk_output_snapshot(
         &entry,
+        0,
         SessionId(78),
         FlowLane::Throughput,
         &ServerPathLaneTracker::default(),
         MuxLimits::default(),
-        Instant::now(),
     );
     assert_eq!(
         snapshot.delivery_rate_bps,
-        default_path_rate_bps(UnderlayProtocol::Udp),
+        default_path_rate_bps(),
         "product STREAM_ACK timing is backlog evidence, not QUIC carrier delivery rate"
     );
     assert_eq!(snapshot.product_progress_rate_bps, Some(product_rate));
@@ -147,11 +144,11 @@ fn udp_unique_owner_ack_product_rate_does_not_replace_carrier_rate() {
     entry.product_progress_rate_bps = None;
     let fragmented_snapshot = server_bulk_output_snapshot(
         &entry,
+        0,
         SessionId(78),
         FlowLane::Throughput,
         &ServerPathLaneTracker::default(),
         MuxLimits::default(),
-        Instant::now(),
     );
     assert!(fragmented_snapshot.has_durable_product_progress);
     assert!(fragmented_snapshot.product_progress_rate_bps.is_none());
@@ -180,7 +177,6 @@ fn one_owner_quantum_is_sender_evidence_but_not_bulk_rate_proof() {
             role: StreamOpenRole::Validation,
             owner_data_in_flight_bytes: 0,
             bytes_in_flight: 0,
-            product_queue_bytes: 0,
             product_progress_rate_bps: Some(80_000_000.0),
             delivery_rate_bps: (underlay == UnderlayProtocol::Tcp).then_some(80_000_000.0),
             tcp_ack_clock_rate_bps: None,

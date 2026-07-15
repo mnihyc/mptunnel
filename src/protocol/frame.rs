@@ -16,7 +16,11 @@ pub(crate) fn datagram_ack_range(datagram_id: DatagramId) -> Option<OffsetRange>
 /// Adjacent ranges are one continuous product interval, so they merge just as
 /// overlapping ranges do; empty or inverted input carries no byte evidence.
 pub(crate) fn normalized_offset_ranges(ranges: &[OffsetRange]) -> Vec<OffsetRange> {
-    let mut ranges = ranges.to_vec();
+    normalize_offset_ranges(ranges.to_vec())
+}
+
+/// Canonicalizes an owned range set without copying it first.
+pub(crate) fn normalize_offset_ranges(mut ranges: Vec<OffsetRange>) -> Vec<OffsetRange> {
     ranges.sort_unstable_by_key(|range| (range.start, range.end));
     let mut merged: Vec<OffsetRange> = Vec::with_capacity(ranges.len());
     for range in ranges {

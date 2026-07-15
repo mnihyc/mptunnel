@@ -9,7 +9,6 @@ use super::multipath::{
 use super::planner::choose_response_sender_target;
 #[cfg(test)]
 use super::*;
-use crate::model::multipath::PathRuntimeRole;
 use crate::model::path::CarrierPathKey;
 use crate::protocol::Frame;
 use crate::protocol::frame::reliable_stream_frame_accounted_bytes;
@@ -113,9 +112,14 @@ pub(super) fn emit_planned_response_data_frame(
             let ReliablePathStreamOutput::Switchable(binding) = &stream.output else {
                 return Err(RuntimeError::SenderServiceBlocked);
             };
-            let role = intent.role();
-            let calibrating = matches!(&intent, ResponseDataDispatchIntent::AckClockCalibration(_));
-            let handoff = matches!(&intent, ResponseDataDispatchIntent::ServiceHandoff(_));
+            let decision_reason = match &intent {
+                ResponseDataDispatchIntent::Service => "data_service",
+                ResponseDataDispatchIntent::SubflowAdmission(_) => "data_subflow",
+                ResponseDataDispatchIntent::AckClockCalibration(_) => {
+                    "data_subflow_ack_clock_calibration"
+                }
+                ResponseDataDispatchIntent::ServiceHandoff(_) => "data_service_handoff",
+            };
             let enqueue_result = match intent {
                 ResponseDataDispatchIntent::Service => binding
                     .try_enqueue_owner_frame_for_dispatch_target(
@@ -157,16 +161,6 @@ pub(super) fn emit_planned_response_data_frame(
                     return Err(RuntimeError::SenderServiceBlocked);
                 }
             }
-            let decision_reason = match role {
-                PathRuntimeRole::Service if handoff => "data_service_handoff",
-                PathRuntimeRole::Service => "data_service",
-                PathRuntimeRole::Subflow if calibrating => "data_subflow_ack_clock_calibration",
-                PathRuntimeRole::Subflow => "data_subflow",
-                PathRuntimeRole::Probe
-                | PathRuntimeRole::RepairOnly
-                | PathRuntimeRole::Standby
-                | PathRuntimeRole::Failed => "data",
-            };
             record_server_sender_decision(
                 binding.session_id(),
                 stream.stream_id,

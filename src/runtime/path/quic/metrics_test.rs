@@ -9,12 +9,12 @@ fn quic_product_data_accepted_by_quinn_counts_as_queue_until_ack() {
     stats.path.rtt = Duration::from_millis(50);
     stats.path.cwnd = 4 * 1024 * 1024;
     stats.path.current_mtu = 1400;
-    let _ = tracker.observe(stats, congestion, 2);
+    let _ = tracker.observe(stats, congestion, PathMetricDirection::ServerToClient);
 
     let queued = tracker.observe(
         stats,
         with_delivery_evidence_written(congestion, 8 * 1024 * 1024),
-        2,
+        PathMetricDirection::ServerToClient,
     );
     assert_eq!(queued.bytes_in_flight, 0);
     assert_eq!(queued.pending_bytes, 8 * 1024 * 1024);
@@ -28,7 +28,7 @@ fn quic_product_data_accepted_by_quinn_counts_as_queue_until_ack() {
             2 * 1024 * 1024,
             1,
         ),
-        2,
+        PathMetricDirection::ServerToClient,
     );
     assert_eq!(partially_acked.pending_bytes, 6 * 1024 * 1024);
 }
@@ -36,11 +36,10 @@ fn quic_product_data_accepted_by_quinn_counts_as_queue_until_ack() {
 #[test]
 fn quic_loss_unknown_is_not_reported_as_observed_zero() {
     let metrics = UdpPathMetrics {
-        direction: 2,
+        direction: PathMetricDirection::ServerToClient,
         srtt: Duration::from_millis(20),
         rttvar: Duration::from_millis(2),
-        min_rtt: Duration::from_millis(18),
-        min_rtt_observed: true,
+        rtt_observed: true,
         delivery_rate_bps: 500_000_000.0,
         pacing_rate_bps: 500_000_000.0,
         inflight_hi: 4 * 1024 * 1024,
@@ -88,7 +87,7 @@ fn quic_active_capacity_probe_uses_bounded_quarter_rtt_poll_cadence() {
         UdpPathMetricTracker::default().observe_at(
             stats,
             with_capacity_probe(quic_congestion(256 * 1024, None), probe),
-            2,
+            PathMetricDirection::ServerToClient,
             now,
         )
     };
@@ -129,11 +128,10 @@ fn quic_active_capacity_probe_uses_bounded_quarter_rtt_poll_cadence() {
 #[test]
 fn quic_server_metrics_publish_ack_data_seen_even_when_app_limited() {
     let metrics = UdpPathMetrics {
-        direction: 2,
+        direction: PathMetricDirection::ServerToClient,
         srtt: Duration::from_millis(50),
         rttvar: Duration::from_millis(5),
-        min_rtt: Duration::from_millis(45),
-        min_rtt_observed: true,
+        rtt_observed: true,
         delivery_rate_bps: 500_000_000.0,
         pacing_rate_bps: 500_000_000.0,
         inflight_hi: 4 * 1024 * 1024,

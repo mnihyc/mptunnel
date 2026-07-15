@@ -10,7 +10,7 @@ use super::quic_session::{UdpDatagramClientSession, open_udp_datagram_session_on
 use crate::model::capacity::{QUIC_PERSISTENT_CONGESTION_THRESHOLD, QUIC_TIMER_GRANULARITY};
 use crate::model::timing::default_transport_pto;
 use crate::mux::datagram::DatagramError;
-use crate::protocol::{RateHint, TargetAddr};
+use crate::protocol::TargetAddr;
 use crate::runtime::error::RuntimeError;
 use crate::runtime::path::model::{
     UdpDatagramPathObservation, UdpPathRuntimeModel, path_is_endpoint_only,
@@ -18,6 +18,7 @@ use crate::runtime::path::model::{
 };
 use crate::runtime::path::{ClientPathContext, UdpPathCandidate};
 use crate::scheduler::{PathSnapshot, path_within_adaptive_lead_hysteresis};
+use crate::transport::RateHint;
 use bytes::Bytes;
 use std::collections::{HashMap, HashSet};
 use std::time::{Duration, Instant};
@@ -216,14 +217,14 @@ impl UdpDatagramClientAssociation {
                     self.last_successful_path = Some(path_index);
                     return Ok(response);
                 }
-                Err(DatagramPathSendError::MtuExceeded { limit }) => {
+                Err(DatagramPathSendError::PayloadLimitExceeded { limit }) => {
                     let source = RuntimeError::Datagram(DatagramError::PayloadTooLarge {
                         actual: payload.len(),
                         limit,
                     });
                     product_attempts = product_attempts.saturating_sub(1);
                     if !has_unattempted_internal_alternative {
-                        return Err(DatagramUnderlaySendError::PathMtuExceeded {
+                        return Err(DatagramUnderlaySendError::PayloadLimitExceeded {
                             product_attempts,
                             source,
                         });
@@ -382,7 +383,7 @@ impl UdpDatagramClientAssociation {
                 let model = self
                     .context
                     .udp_path_runtime_model(candidate.path_index, ttl_ms)?;
-                if !model.accepts_or_can_probe(payload_bytes) {
+                if !model.accepts_payload(payload_bytes) {
                     return None;
                 }
                 let snapshot = self.context.udp_path_snapshot(candidate.path_index)?;
@@ -526,9 +527,9 @@ impl UdpDatagramClientAssociation {
             .ok_or_else(|| {
                 DatagramPathSendError::runtime(RuntimeError::NoSchedulableUdpPath, false)
             })?;
-        if !model.accepts_or_can_probe(payload.len()) {
-            return Err(DatagramPathSendError::MtuExceeded {
-                limit: model.mtu_payload_bytes,
+        if !model.accepts_payload(payload.len()) {
+            return Err(DatagramPathSendError::PayloadLimitExceeded {
+                limit: model.max_payload_bytes,
             });
         }
         let path_session_was_open = self.path_session_is_open(path_index);
@@ -563,37 +564,6 @@ impl UdpDatagramClientAssociation {
             }
             result => result.map_err(|err| DatagramPathSendError::runtime(err, false))?,
         };
-        let current_mtu = self
-            .paths
-            .get(position)
-            .ok_or_else(|| {
-                DatagramPathSendError::runtime(RuntimeError::NoSchedulableUdpPath, false)
-            })?
-            .session
-            .mtu_payload_bytes();
-        if payload.len() > current_mtu {
-            let probe_result = {
-                let path = self.paths.get_mut(position).ok_or_else(|| {
-                    DatagramPathSendError::runtime(RuntimeError::NoSchedulableUdpPath, false)
-                })?;
-                tokio::time::timeout_at(fallback_deadline, path.session.probe_mtu(payload.len()))
-                    .await
-            };
-            match probe_result {
-                Ok(Ok(probed_mtu)) => {
-                    self.context.mark_udp_path_mtu(path_index, probed_mtu);
-                }
-                Ok(Err(err)) if udp_datagram_error_is_path_retryable(&err) => {
-                    self.context.mark_udp_path_mtu(path_index, current_mtu);
-                    return Err(DatagramPathSendError::MtuExceeded { limit: current_mtu });
-                }
-                Ok(Err(err)) => return Err(DatagramPathSendError::runtime(err, false)),
-                Err(_) => {
-                    self.context.mark_udp_path_mtu(path_index, current_mtu);
-                    return Err(DatagramPathSendError::MtuExceeded { limit: current_mtu });
-                }
-            }
-        }
         let (observation_path_index, observation, result, connection_usable) = {
             let path = self.paths.get_mut(position).ok_or_else(|| {
                 DatagramPathSendError::runtime(RuntimeError::NoSchedulableUdpPath, false)

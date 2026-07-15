@@ -680,7 +680,6 @@ fn quic_capacity_replacement_only_resets_a_distinct_retired_instance() {
             old_commands,
             FlowLane::Throughput,
             StreamOpenRole::Validation,
-            mux_limits.max_payload_bytes,
         ),
         ResponseStreamAttachOutcome::Attached
     );
@@ -713,7 +712,6 @@ fn quic_capacity_replacement_only_resets_a_distinct_retired_instance() {
             same_instance_commands,
             FlowLane::Throughput,
             StreamOpenRole::Validation,
-            mux_limits.max_payload_bytes,
         ),
         ResponseStreamAttachOutcome::ReplacedClosedOutput
     );
@@ -742,7 +740,6 @@ fn quic_capacity_replacement_only_resets_a_distinct_retired_instance() {
             replacement_commands,
             FlowLane::Throughput,
             StreamOpenRole::Validation,
-            mux_limits.max_payload_bytes,
         ),
         ResponseStreamAttachOutcome::ReplacedClosedOutput
     );

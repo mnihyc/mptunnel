@@ -3,7 +3,7 @@ use crate::model::capacity::BBR_MAX_SEND_QUANTUM_BYTES;
 use crate::model::path::CarrierPathKey;
 use crate::model::timing::transport_pto_from_snapshot;
 use crate::protocol::frame::stream_ack_contiguous_frontier;
-use crate::protocol::{PathId, PathMetricDirection, PathMetrics, StreamFlags, StreamOpenRole};
+use crate::protocol::{PathId, PathMetricDirection, PathMetrics, StreamOpenRole};
 use crate::runtime::path::commands::{
     ReliablePathCommand, reliable_path_command_channels, reliable_path_stream_ordered_queue_lane,
     try_recv_reliable_path_command,
@@ -36,7 +36,7 @@ fn reliable_recv_progress_sends_exact_tcp_sparse_deltas_without_delaying_feedbac
         let mut progress = ReliableRecvProgress::default();
         let mut sparse_progress = RequestTcpSparseAckProgress::default();
         recv_stream
-            .receive_data(0, Bytes::from(vec![0x11; 1024]), StreamFlags::NONE)
+            .receive_data(0, Bytes::from(vec![0x11; 1024]))
             .expect("contiguous prefix");
         assert!(progress.should_send_ack(
             &recv_stream,
@@ -50,7 +50,7 @@ fn reliable_recv_progress_sends_exact_tcp_sparse_deltas_without_delaying_feedbac
         let mut frames = Vec::new();
         for offset in [8192, 32768, 16384, 12288] {
             recv_stream
-                .receive_data(offset, Bytes::from(vec![0x22; 1024]), StreamFlags::NONE)
+                .receive_data(offset, Bytes::from(vec![0x22; 1024]))
                 .expect("sparse range");
             assert!(
                 progress.should_send_ack(
@@ -114,7 +114,6 @@ fn tail_stall_repair_retransmits_same_frontier_only_after_stall_evidence() {
     let frame = Frame::StreamData {
         stream_id,
         offset: 128,
-        flags: StreamFlags::NONE,
         payload: Bytes::from_static(b"frontier"),
     };
     binding.record_owner_flight(
@@ -127,7 +126,6 @@ fn tail_stall_repair_retransmits_same_frontier_only_after_stall_evidence() {
     let later_frame = Frame::StreamData {
         stream_id,
         offset: 136,
-        flags: StreamFlags::NONE,
         payload: Bytes::from_static(b"later"),
     };
 
@@ -241,22 +239,17 @@ fn contiguous_ack_frontier_lag_is_tail_guard_not_repair_debt() {
         "a contiguous unacknowledged suffix is not an authoritative product repair gap"
     );
     assert_eq!(
-        reliable_relay_ordered_owner_debt_bytes(FlowLane::Throughput, true, 1024, 8192,),
+        reliable_relay_ordered_owner_debt_bytes(FlowLane::Throughput, 1024, 8192,),
         7168,
         "a contiguous unacknowledged suffix is a tail guard for alternate owners"
     );
     assert_eq!(
-        reliable_relay_ordered_owner_debt_bytes(FlowLane::Throughput, false, 1024, 8192,),
-        7168,
-        "an incomplete ACK chunk can still prove the contiguous prefix for owner-tail guarding"
-    );
-    assert_eq!(
-        reliable_relay_ordered_owner_debt_bytes(FlowLane::Throughput, false, 0, 8192,),
+        reliable_relay_ordered_owner_debt_bytes(FlowLane::Throughput, 0, 8192,),
         8192,
         "before the first contiguous ACK, already-sent bulk bytes are still owner-tail debt for alternate owners"
     );
     assert_eq!(
-        reliable_relay_ordered_owner_debt_bytes(FlowLane::Latency, true, 1024, 8192,),
+        reliable_relay_ordered_owner_debt_bytes(FlowLane::Latency, 1024, 8192,),
         0,
         "latency traffic must not be pinned by bulk owner-tail pressure"
     );
@@ -321,7 +314,6 @@ async fn latency_live_owner_tail_repair_dispatches_suffix_on_distinct_repair_wit
             repair_commands,
             FlowLane::Latency,
             StreamOpenRole::Repair,
-            reliable_relay_buffer_len(limits),
         ),
         ResponseStreamAttachOutcome::Attached
     );
@@ -340,7 +332,7 @@ async fn latency_live_owner_tail_repair_dispatches_suffix_on_distinct_repair_wit
         ReliableSendStream::new_with_initial_max_offset(stream_id, limits, u64::MAX);
     for value in [0x41, 0x42, 0x43] {
         let frame = send_stream
-            .send_data(Bytes::from(vec![value; 64]), StreamFlags::NONE)
+            .send_data(Bytes::from(vec![value; 64]))
             .expect("seed owner response data");
         binding.record_owner_flight(owner_key, &frame);
     }
@@ -400,10 +392,9 @@ async fn latency_live_owner_tail_repair_dispatches_suffix_on_distinct_repair_wit
                 &frame,
                 Frame::StreamData {
                     offset: 128,
-                    flags,
                     payload,
                     ..
-                } if payload.len() == 64 && !flags.fin
+                } if payload.len() == 64
             ));
             frame
         }
@@ -445,7 +436,6 @@ fn sparse_authoritative_ack_does_not_skip_lower_gap_for_live_tail_repair() {
             repair_commands,
             FlowLane::Latency,
             StreamOpenRole::Repair,
-            reliable_relay_buffer_len(limits),
         ),
         ResponseStreamAttachOutcome::Attached
     );
@@ -464,7 +454,7 @@ fn sparse_authoritative_ack_does_not_skip_lower_gap_for_live_tail_repair() {
         ReliableSendStream::new_with_initial_max_offset(stream_id, limits, u64::MAX);
     for value in [0x41, 0x42, 0x43, 0x44] {
         let frame = send_stream
-            .send_data(Bytes::from(vec![value; 64]), StreamFlags::NONE)
+            .send_data(Bytes::from(vec![value; 64]))
             .expect("seed owner response data");
         binding.record_owner_flight(owner_key, &frame);
     }
@@ -544,7 +534,6 @@ async fn sparse_ack_failed_owner_repair_starts_at_lowest_hole() {
             repair_commands,
             FlowLane::Latency,
             StreamOpenRole::Repair,
-            reliable_relay_buffer_len(limits),
         ),
         ResponseStreamAttachOutcome::Attached
     );
@@ -562,7 +551,7 @@ async fn sparse_ack_failed_owner_repair_starts_at_lowest_hole() {
         ReliableSendStream::new_with_initial_max_offset(stream_id, limits, u64::MAX);
     for value in [0x51, 0x52, 0x53, 0x54] {
         let frame = send_stream
-            .send_data(Bytes::from(vec![value; 64]), StreamFlags::NONE)
+            .send_data(Bytes::from(vec![value; 64]))
             .expect("seed failed-owner response data");
         binding.record_owner_flight(owner_key, &frame);
     }
@@ -664,7 +653,6 @@ fn live_tail_repair_timer_uses_blocking_owner_snapshot_not_fast_alternate() {
             alternate_commands,
             FlowLane::Throughput,
             StreamOpenRole::Validation,
-            reliable_relay_buffer_len(limits),
         ),
         ResponseStreamAttachOutcome::Attached
     );
@@ -675,7 +663,6 @@ fn live_tail_repair_timer_uses_blocking_owner_snapshot_not_fast_alternate() {
         direction: PathMetricDirection::ServerToClient,
         metric_epoch: metric_epoch_now(),
         metric_age_us: 0,
-        min_rtt_us: 480_000,
         srtt_us: 500_000,
         rttvar_us: 60_000,
         jitter_us: 60_000,
@@ -698,7 +685,6 @@ fn live_tail_repair_timer_uses_blocking_owner_snapshot_not_fast_alternate() {
     let fast_alternate_metrics = PathMetrics {
         path_id: fast_alternate.path_id,
         underlay: fast_alternate.underlay,
-        min_rtt_us: 20_000,
         srtt_us: 25_000,
         rttvar_us: 2_000,
         jitter_us: 2_000,
@@ -730,7 +716,6 @@ fn live_tail_repair_timer_uses_blocking_owner_snapshot_not_fast_alternate() {
     let owner_frame = Frame::StreamData {
         stream_id,
         offset: 1024,
-        flags: StreamFlags::NONE,
         payload: Bytes::from(vec![0x55; 65_536]),
     };
     binding.record_owner_flight(owner_key, &owner_frame);
@@ -778,7 +763,6 @@ fn failed_owner_tail_repair_deadline_is_immediate_for_repairable_detached_owner(
             failover_commands,
             FlowLane::Throughput,
             StreamOpenRole::Active,
-            reliable_relay_buffer_len(limits),
         ),
         ResponseStreamAttachOutcome::Attached
     );
@@ -796,7 +780,7 @@ fn failed_owner_tail_repair_deadline_is_immediate_for_repairable_detached_owner(
     let mut send_stream =
         ReliableSendStream::new_with_initial_max_offset(stream_id, limits, u64::MAX);
     let frame = send_stream
-        .prepare_data(Bytes::from(vec![0x51; 4096]), StreamFlags::NONE)
+        .prepare_data(Bytes::from(vec![0x51; 4096]))
         .expect("prepare owner data");
     send_stream
         .commit_prepared_data(&frame)
@@ -926,7 +910,7 @@ fn live_tail_stall_repair_is_not_queued_even_with_optional_budget() {
     let mut send_stream =
         ReliableSendStream::new_with_initial_max_offset(stream_id, limits, u64::MAX);
     send_stream
-        .send_data(Bytes::from(vec![0x32; repair_debt]), StreamFlags::NONE)
+        .send_data(Bytes::from(vec![0x32; repair_debt]))
         .expect("owner data");
     let ack_frontier = base_limit as u64;
 
@@ -989,7 +973,6 @@ fn failed_owner_tail_repair_uses_remaining_output_after_persistent_stall() {
             failover_commands,
             FlowLane::Throughput,
             StreamOpenRole::Active,
-            reliable_relay_buffer_len(limits),
         ),
         ResponseStreamAttachOutcome::Attached
     );
@@ -1006,7 +989,7 @@ fn failed_owner_tail_repair_uses_remaining_output_after_persistent_stall() {
     let mut send_stream =
         ReliableSendStream::new_with_initial_max_offset(stream_id, limits, u64::MAX);
     let frame = send_stream
-        .prepare_data(Bytes::from(vec![0x42; 4096]), StreamFlags::NONE)
+        .prepare_data(Bytes::from(vec![0x42; 4096]))
         .expect("prepare owner data");
     send_stream
         .commit_prepared_data(&frame)
@@ -1080,7 +1063,6 @@ fn failed_owner_tail_repair_queues_single_service_quantum_not_recovery_burst() {
             failover_commands,
             FlowLane::Throughput,
             StreamOpenRole::Active,
-            reliable_relay_buffer_len(limits),
         ),
         ResponseStreamAttachOutcome::Attached
     );
@@ -1100,10 +1082,7 @@ fn failed_owner_tail_repair_queues_single_service_quantum_not_recovery_burst() {
         .saturating_add(BBR_MAX_SEND_QUANTUM_BYTES)
         .min(limits.max_payload_bytes);
     let frame = send_stream
-        .prepare_data(
-            Bytes::from(vec![0x52; unresolved_payload_len]),
-            StreamFlags::NONE,
-        )
+        .prepare_data(Bytes::from(vec![0x52; unresolved_payload_len]))
         .expect("prepare owner data");
     send_stream
         .commit_prepared_data(&frame)
@@ -1177,7 +1156,6 @@ fn unknown_owner_tail_repair_uses_remaining_output_after_persistent_stall() {
             failover_commands,
             FlowLane::Throughput,
             StreamOpenRole::Active,
-            reliable_relay_buffer_len(limits),
         ),
         ResponseStreamAttachOutcome::Attached
     );
@@ -1196,7 +1174,7 @@ fn unknown_owner_tail_repair_uses_remaining_output_after_persistent_stall() {
     let mut send_stream =
         ReliableSendStream::new_with_initial_max_offset(stream_id, limits, u64::MAX);
     let frame = send_stream
-        .prepare_data(Bytes::from(vec![0x43; 4096]), StreamFlags::NONE)
+        .prepare_data(Bytes::from(vec![0x43; 4096]))
         .expect("prepare owner data");
     send_stream
         .commit_prepared_data(&frame)
@@ -1268,7 +1246,6 @@ async fn unknown_owner_tail_repair_dispatches_as_path_failure_repair() {
             failover_commands,
             FlowLane::Throughput,
             StreamOpenRole::Active,
-            reliable_relay_buffer_len(limits),
         ),
         ResponseStreamAttachOutcome::Attached
     );
@@ -1287,7 +1264,7 @@ async fn unknown_owner_tail_repair_dispatches_as_path_failure_repair() {
     let mut send_stream =
         ReliableSendStream::new_with_initial_max_offset(stream_id, limits, u64::MAX);
     let frame = send_stream
-        .prepare_data(Bytes::from(vec![0x43; 4096]), StreamFlags::NONE)
+        .prepare_data(Bytes::from(vec![0x43; 4096]))
         .expect("prepare owner data");
     send_stream
         .commit_prepared_data(&frame)
@@ -1372,7 +1349,6 @@ fn live_owner_no_ack_frontier_tail_repair_waits_for_authoritative_gap() {
             repair_commands,
             FlowLane::Throughput,
             StreamOpenRole::Active,
-            reliable_relay_buffer_len(limits),
         ),
         ResponseStreamAttachOutcome::Attached
     );
@@ -1390,7 +1366,7 @@ fn live_owner_no_ack_frontier_tail_repair_waits_for_authoritative_gap() {
     let mut send_stream =
         ReliableSendStream::new_with_initial_max_offset(stream_id, limits, u64::MAX);
     let frame = send_stream
-        .prepare_data(Bytes::from(vec![0x48; 4096]), StreamFlags::NONE)
+        .prepare_data(Bytes::from(vec![0x48; 4096]))
         .expect("prepare owner data");
     send_stream
         .commit_prepared_data(&frame)
@@ -1456,7 +1432,6 @@ fn live_owner_no_ack_frontier_tail_repair_does_not_probe_prefix() {
             repair_commands,
             FlowLane::Throughput,
             StreamOpenRole::Active,
-            reliable_relay_buffer_len(limits),
         ),
         ResponseStreamAttachOutcome::Attached
     );
@@ -1478,7 +1453,7 @@ fn live_owner_no_ack_frontier_tail_repair_does_not_probe_prefix() {
     while remaining > 0 {
         let chunk = remaining.min(limits.max_payload_bytes);
         let frame = send_stream
-            .prepare_data(Bytes::from(vec![0x48; chunk]), StreamFlags::NONE)
+            .prepare_data(Bytes::from(vec![0x48; chunk]))
             .expect("prepare owner data");
         send_stream
             .commit_prepared_data(&frame)
@@ -1547,7 +1522,6 @@ fn unknown_owner_tail_repair_without_ack_frontier_waits() {
             failover_commands,
             FlowLane::Throughput,
             StreamOpenRole::Active,
-            reliable_relay_buffer_len(limits),
         ),
         ResponseStreamAttachOutcome::Attached
     );
@@ -1566,7 +1540,7 @@ fn unknown_owner_tail_repair_without_ack_frontier_waits() {
     let mut send_stream =
         ReliableSendStream::new_with_initial_max_offset(stream_id, limits, u64::MAX);
     let frame = send_stream
-        .prepare_data(Bytes::from(vec![0x44; 4096]), StreamFlags::NONE)
+        .prepare_data(Bytes::from(vec![0x44; 4096]))
         .expect("prepare owner data");
     send_stream
         .commit_prepared_data(&frame)
@@ -1632,7 +1606,6 @@ fn failed_owner_tail_repair_does_not_duplicate_queued_repair_range() {
             failover_commands,
             FlowLane::Throughput,
             StreamOpenRole::Active,
-            reliable_relay_buffer_len(limits),
         ),
         ResponseStreamAttachOutcome::Attached
     );
@@ -1650,7 +1623,7 @@ fn failed_owner_tail_repair_does_not_duplicate_queued_repair_range() {
     let mut send_stream =
         ReliableSendStream::new_with_initial_max_offset(stream_id, limits, u64::MAX);
     let frame = send_stream
-        .prepare_data(Bytes::from(vec![0x43; 4096]), StreamFlags::NONE)
+        .prepare_data(Bytes::from(vec![0x43; 4096]))
         .expect("prepare owner data");
     send_stream
         .commit_prepared_data(&frame)
@@ -1746,7 +1719,6 @@ fn tail_repair_treats_live_inflight_repair_as_pending() {
             repair_commands,
             FlowLane::Throughput,
             StreamOpenRole::Active,
-            reliable_relay_buffer_len(limits),
         ),
         ResponseStreamAttachOutcome::Attached
     );
@@ -1764,7 +1736,7 @@ fn tail_repair_treats_live_inflight_repair_as_pending() {
     let mut send_stream =
         ReliableSendStream::new_with_initial_max_offset(stream_id, limits, u64::MAX);
     let frame = send_stream
-        .prepare_data(Bytes::from(vec![0x49; 4096]), StreamFlags::NONE)
+        .prepare_data(Bytes::from(vec![0x49; 4096]))
         .expect("prepare owner data");
     send_stream
         .commit_prepared_data(&frame)
@@ -1847,7 +1819,6 @@ fn persistent_tail_repair_waits_when_live_repair_copy_is_in_flight() {
             repair_commands,
             FlowLane::Throughput,
             StreamOpenRole::Active,
-            reliable_relay_buffer_len(limits),
         ),
         ResponseStreamAttachOutcome::Attached
     );
@@ -1865,7 +1836,7 @@ fn persistent_tail_repair_waits_when_live_repair_copy_is_in_flight() {
     let mut send_stream =
         ReliableSendStream::new_with_initial_max_offset(stream_id, limits, u64::MAX);
     let frame = send_stream
-        .prepare_data(Bytes::from(vec![0x48; 4096]), StreamFlags::NONE)
+        .prepare_data(Bytes::from(vec![0x48; 4096]))
         .expect("prepare owner data");
     send_stream
         .commit_prepared_data(&frame)
@@ -1943,7 +1914,6 @@ fn stale_live_repair_flight_does_not_block_terminal_tail_retry() {
             repair_commands,
             FlowLane::Throughput,
             StreamOpenRole::Active,
-            reliable_relay_buffer_len(limits),
         ),
         ResponseStreamAttachOutcome::Attached
     );
@@ -1961,7 +1931,7 @@ fn stale_live_repair_flight_does_not_block_terminal_tail_retry() {
     let mut send_stream =
         ReliableSendStream::new_with_initial_max_offset(stream_id, limits, u64::MAX);
     let frame = send_stream
-        .prepare_data(Bytes::from(vec![0x4a; 4096]), StreamFlags::NONE)
+        .prepare_data(Bytes::from(vec![0x4a; 4096]))
         .expect("prepare owner data");
     send_stream
         .commit_prepared_data(&frame)
@@ -2048,7 +2018,6 @@ async fn persistent_live_owner_tail_repair_waits_when_distinct_alternate_lacks_q
             repair_commands,
             FlowLane::Throughput,
             StreamOpenRole::Active,
-            reliable_relay_buffer_len(limits),
         ),
         ResponseStreamAttachOutcome::Attached
     );
@@ -2066,7 +2035,7 @@ async fn persistent_live_owner_tail_repair_waits_when_distinct_alternate_lacks_q
     let mut send_stream =
         ReliableSendStream::new_with_initial_max_offset(stream_id, limits, u64::MAX);
     let frame = send_stream
-        .prepare_data(Bytes::from(vec![0x55; 4096]), StreamFlags::NONE)
+        .prepare_data(Bytes::from(vec![0x55; 4096]))
         .expect("prepare owner data");
     send_stream
         .commit_prepared_data(&frame)
@@ -2110,7 +2079,6 @@ async fn persistent_live_owner_tail_repair_waits_when_distinct_alternate_lacks_q
             Frame::StreamData {
                 stream_id,
                 offset: 4096,
-                flags: StreamFlags::NONE,
                 payload: Bytes::from_static(b"queued"),
             },
             FlowLane::Throughput,
@@ -2172,7 +2140,6 @@ async fn final_tail_repair_dispatches_on_service_when_alternate_lacks_queue_cred
             repair_commands,
             FlowLane::Latency,
             StreamOpenRole::Active,
-            reliable_relay_buffer_len(limits),
         ),
         ResponseStreamAttachOutcome::Attached
     );
@@ -2190,7 +2157,7 @@ async fn final_tail_repair_dispatches_on_service_when_alternate_lacks_queue_cred
     let mut send_stream =
         ReliableSendStream::new_with_initial_max_offset(stream_id, limits, u64::MAX);
     let frame = send_stream
-        .prepare_data(Bytes::from(vec![0x56; 192]), StreamFlags::NONE)
+        .prepare_data(Bytes::from(vec![0x56; 192]))
         .expect("prepare owner data");
     send_stream
         .commit_prepared_data(&frame)
@@ -2211,7 +2178,13 @@ async fn final_tail_repair_dispatches_on_service_when_alternate_lacks_queue_cred
     let (repair_frames, blocked_frontier_offset, same_output_frontier_retransmit) =
         prefix_final_tail_repair_frames_with_available_output(
             &path_stream,
-            stream_final_offset_tail_repair_frames(&send_stream, &ack_ranges, 64, true, true),
+            stream_final_offset_tail_repair_frames_normalized(
+                &send_stream,
+                &ack_ranges,
+                64,
+                true,
+                true,
+            ),
         );
     assert_eq!(blocked_frontier_offset, None);
     assert!(!same_output_frontier_retransmit);
@@ -2225,7 +2198,6 @@ async fn final_tail_repair_dispatches_on_service_when_alternate_lacks_queue_cred
             Frame::StreamData {
                 stream_id,
                 offset: 192,
-                flags: StreamFlags::NONE,
                 payload: Bytes::from_static(b"queued"),
             },
             reliable_path_stream_ordered_queue_lane(),
@@ -2285,7 +2257,7 @@ async fn final_tail_repair_dispatches_on_service_when_no_alternate_survives() {
     let mut send_stream =
         ReliableSendStream::new_with_initial_max_offset(stream_id, limits, u64::MAX);
     let frame = send_stream
-        .prepare_data(Bytes::from(vec![0x57; 192]), StreamFlags::NONE)
+        .prepare_data(Bytes::from(vec![0x57; 192]))
         .expect("prepare owner data");
     send_stream
         .commit_prepared_data(&frame)
@@ -2306,7 +2278,13 @@ async fn final_tail_repair_dispatches_on_service_when_no_alternate_survives() {
     let (repair_frames, blocked_frontier_offset, same_output_frontier_retransmit) =
         prefix_final_tail_repair_frames_with_available_output(
             &path_stream,
-            stream_final_offset_tail_repair_frames(&send_stream, &ack_ranges, 64, true, true),
+            stream_final_offset_tail_repair_frames_normalized(
+                &send_stream,
+                &ack_ranges,
+                64,
+                true,
+                true,
+            ),
         );
     assert_eq!(blocked_frontier_offset, None);
     assert!(same_output_frontier_retransmit);
@@ -2366,7 +2344,6 @@ async fn failed_owner_repair_without_ack_frontier_starts_at_zero() {
             failover_commands,
             FlowLane::Throughput,
             StreamOpenRole::Active,
-            reliable_relay_buffer_len(limits),
         ),
         ResponseStreamAttachOutcome::Attached
     );
@@ -2384,7 +2361,7 @@ async fn failed_owner_repair_without_ack_frontier_starts_at_zero() {
     let mut send_stream =
         ReliableSendStream::new_with_initial_max_offset(stream_id, limits, u64::MAX);
     let frame = send_stream
-        .prepare_data(Bytes::from(vec![0x46; 4096]), StreamFlags::NONE)
+        .prepare_data(Bytes::from(vec![0x46; 4096]))
         .expect("prepare owner data");
     send_stream
         .commit_prepared_data(&frame)
@@ -2471,7 +2448,6 @@ fn live_owner_tail_without_ack_frontier_does_not_repair_on_alternate() {
             alternative_commands,
             FlowLane::Throughput,
             StreamOpenRole::Active,
-            reliable_relay_buffer_len(limits),
         ),
         ResponseStreamAttachOutcome::Attached
     );
@@ -2489,7 +2465,7 @@ fn live_owner_tail_without_ack_frontier_does_not_repair_on_alternate() {
     let mut send_stream =
         ReliableSendStream::new_with_initial_max_offset(stream_id, limits, u64::MAX);
     let frame = send_stream
-        .prepare_data(Bytes::from(vec![0x47; 4096]), StreamFlags::NONE)
+        .prepare_data(Bytes::from(vec![0x47; 4096]))
         .expect("prepare owner data");
     send_stream
         .commit_prepared_data(&frame)
@@ -2555,7 +2531,6 @@ fn failed_owner_tail_repair_is_not_blocked_by_optional_budget() {
             failover_commands,
             FlowLane::Throughput,
             StreamOpenRole::Active,
-            reliable_relay_buffer_len(limits),
         ),
         ResponseStreamAttachOutcome::Attached
     );
@@ -2573,7 +2548,7 @@ fn failed_owner_tail_repair_is_not_blocked_by_optional_budget() {
     let mut send_stream =
         ReliableSendStream::new_with_initial_max_offset(stream_id, limits, u64::MAX);
     let frame = send_stream
-        .prepare_data(Bytes::from(vec![0x44; 4096]), StreamFlags::NONE)
+        .prepare_data(Bytes::from(vec![0x44; 4096]))
         .expect("prepare owner data");
     send_stream
         .commit_prepared_data(&frame)
@@ -2601,7 +2576,6 @@ fn failed_owner_tail_repair_is_not_blocked_by_optional_budget() {
                 Frame::StreamData {
                     stream_id,
                     offset: 10_000,
-                    flags: StreamFlags::NONE,
                     payload: Bytes::from(vec![0x99; optional_budget]),
                 },
                 limits,
@@ -2666,7 +2640,6 @@ fn persistent_ack_gap_tail_timer_does_not_duplicate_ack_gap_controller() {
             repair_commands,
             FlowLane::Throughput,
             StreamOpenRole::Active,
-            reliable_relay_buffer_len(limits),
         ),
         ResponseStreamAttachOutcome::Attached
     );
@@ -2684,7 +2657,7 @@ fn persistent_ack_gap_tail_timer_does_not_duplicate_ack_gap_controller() {
     let mut send_stream =
         ReliableSendStream::new_with_initial_max_offset(stream_id, limits, u64::MAX);
     let frame = send_stream
-        .prepare_data(Bytes::from(vec![0x45; 4096]), StreamFlags::NONE)
+        .prepare_data(Bytes::from(vec![0x45; 4096]))
         .expect("prepare owner data");
     send_stream
         .commit_prepared_data(&frame)
@@ -2717,7 +2690,6 @@ fn persistent_ack_gap_tail_timer_does_not_duplicate_ack_gap_controller() {
                 Frame::StreamData {
                     stream_id,
                     offset: 10_000,
-                    flags: StreamFlags::NONE,
                     payload: Bytes::from(vec![0x99; optional_budget]),
                 },
                 limits,
@@ -2782,7 +2754,6 @@ fn persistent_live_owner_tail_repair_queues_repairdata_without_service_migration
             alternative_commands,
             FlowLane::Throughput,
             StreamOpenRole::Active,
-            reliable_relay_buffer_len(limits),
         ),
         ResponseStreamAttachOutcome::Attached
     );
@@ -2804,7 +2775,7 @@ fn persistent_live_owner_tail_repair_queues_repairdata_without_service_migration
     while remaining > 0 {
         let chunk = remaining.min(limits.max_payload_bytes);
         let frame = send_stream
-            .send_data(Bytes::from(vec![0x43; chunk]), StreamFlags::NONE)
+            .send_data(Bytes::from(vec![0x43; chunk]))
             .expect("seed owner data");
         binding.record_owner_flight(owner_key, &frame);
         remaining = remaining.saturating_sub(chunk);
@@ -2862,7 +2833,7 @@ fn final_tail_repair_ready_allows_closed_no_ack_frontier_after_deadline() {
     let limits = MuxLimits::default();
     let mut send_stream = ReliableSendStream::new(StreamId(9), limits);
     send_stream
-        .send_data(Bytes::from_static(&[7; 4096]), StreamFlags::NONE)
+        .send_data(Bytes::from_static(&[7; 4096]))
         .expect("send stream data");
     let now = tokio::time::Instant::now();
 

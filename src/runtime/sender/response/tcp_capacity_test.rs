@@ -7,9 +7,9 @@ use crate::model::ack_clock::{
     reliable_ack_clock_calibration_ceiling_bytes, reliable_ack_clock_calibration_limit_bytes,
 };
 use crate::model::capacity::reliable_bulk_carrier_feed_quantum_bytes;
-use crate::model::multipath::{PathAdmissionDecision, PathRuntimeRole};
+use crate::model::multipath::PathAdmission;
 use crate::model::response::ResponseBulkLead;
-use crate::protocol::{Frame, StreamFlags, StreamId};
+use crate::protocol::{Frame, StreamId};
 use crate::runtime::path::commands::reliable_path_command_channels;
 use crate::runtime::sender::response::test_support::{
     observe_response_target_commands, response_target,
@@ -72,14 +72,12 @@ fn endpoint_only_response_calibration_uses_service_only_as_opportunity_prior() {
     service.observation.snapshot.delivery_rate_bps = 128_000_000.0;
     service.observation.snapshot.pacing_rate_bps = 128_000_000.0;
     service.observation.snapshot.srtt_ms = 333.0;
-    service.observation.snapshot.min_rtt_ms = 333.0;
 
     let mut candidate =
         response_target(1, UnderlayProtocol::Tcp, 570.0, 0, 16 * 1024 * 1024, false);
     candidate.observation.snapshot.delivery_rate_bps = 2_500_000.0;
     candidate.observation.snapshot.pacing_rate_bps = 2_500_000.0;
     candidate.observation.snapshot.srtt_ms = 722.0;
-    candidate.observation.snapshot.min_rtt_ms = 722.0;
     candidate.observation.snapshot.app_limited = true;
     candidate.endpoint_only_service_prior_eligible = true;
     candidate.ack_clock_calibration_eligible = true;
@@ -247,9 +245,8 @@ fn tcp_ack_clock_calibration_rejects_seed_beyond_service_reservoir() {
             0,
             payload_bytes,
             mux_limits,
-        )
-        .decision,
-        PathAdmissionDecision::Standby,
+        ),
+        PathAdmission::Standby,
         "the provisional first-RTT rate remains too slow for ordinary ECF admission"
     );
 
@@ -283,7 +280,6 @@ fn tcp_ack_clock_calibration_explores_within_service_reservoir() {
     service.observation.snapshot.delivery_rate_bps = 18_561_000.0;
     service.observation.snapshot.pacing_rate_bps = 18_561_000.0;
     service.observation.snapshot.srtt_ms = 333.0;
-    service.observation.snapshot.min_rtt_ms = 333.0;
 
     let mut candidate = response_target(
         1,
@@ -297,7 +293,6 @@ fn tcp_ack_clock_calibration_explores_within_service_reservoir() {
     candidate.observation.snapshot.pacing_rate_bps = 1_007_000.0;
     candidate.observation.snapshot.product_progress_rate_bps = Some(1_007_000.0);
     candidate.observation.snapshot.srtt_ms = 730.287;
-    candidate.observation.snapshot.min_rtt_ms = 730.287;
     candidate.observation.snapshot.app_limited = true;
     candidate.ack_clock_calibration_eligible = true;
     let initial_limit = 183_802;
@@ -318,9 +313,8 @@ fn tcp_ack_clock_calibration_explores_within_service_reservoir() {
             0,
             payload_bytes,
             mux_limits,
-        )
-        .decision,
-        PathAdmissionDecision::Standby,
+        ),
+        PathAdmission::Standby,
         "the provisional model still cannot claim ordinary ownership"
     );
 
@@ -336,7 +330,7 @@ fn tcp_ack_clock_calibration_explores_within_service_reservoir() {
     )
     .expect("bounded exploration should fit behind the Service reservoir");
     assert_eq!(selected.target().observation.key, candidate.observation.key);
-    assert_eq!(selected.admission().role, PathRuntimeRole::Subflow);
+    assert_eq!(selected.admission(), PathAdmission::Subflow);
     assert!(selected.ack_clock_calibration_selection().is_some());
 
     candidate.ack_clock_calibration_active = true;
@@ -437,7 +431,6 @@ fn tcp_response_calibration_does_not_double_count_pending_owner_flight() {
             Frame::StreamData {
                 stream_id: StreamId(991),
                 offset: 0,
-                flags: StreamFlags::NONE,
                 payload: Bytes::from(vec![0x5a; committed as usize]),
             },
             FlowLane::Throughput,
@@ -462,7 +455,7 @@ fn tcp_response_calibration_does_not_double_count_pending_owner_flight() {
     .expect("overlapping flight and queue views count as one debt");
 
     assert_eq!(selected.target().observation.key, candidate.observation.key);
-    assert_eq!(selected.admission().role, PathRuntimeRole::Subflow);
+    assert_eq!(selected.admission(), PathAdmission::Subflow);
     assert_eq!(
         selected
             .ack_clock_calibration_selection()
@@ -525,7 +518,6 @@ fn blocked_active_ack_clock_candidate_does_not_select_another_calibration_owner(
             Frame::StreamData {
                 stream_id: StreamId(901),
                 offset: 0,
-                flags: StreamFlags::NONE,
                 payload: Bytes::from_static(b"x"),
             },
             FlowLane::Throughput,
@@ -581,7 +573,6 @@ fn exhausted_active_calibration_cannot_bypass_saturated_service_via_generic_subf
             Frame::StreamData {
                 stream_id: StreamId(902),
                 offset: 0,
-                flags: StreamFlags::NONE,
                 payload: Bytes::from_static(b"x"),
             },
             FlowLane::Throughput,
@@ -624,7 +615,6 @@ fn proven_active_calibration_cannot_reenter_generic_ownership_before_drain() {
             Frame::StreamData {
                 stream_id: StreamId(903),
                 offset: 0,
-                flags: StreamFlags::NONE,
                 payload: Bytes::from_static(b"x"),
             },
             FlowLane::Throughput,

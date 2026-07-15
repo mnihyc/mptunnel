@@ -1,7 +1,7 @@
 use super::*;
 use crate::model::capacity::BBR_MAX_SEND_QUANTUM_BYTES;
 use crate::protocol::frame::reliable_stream_frame_extent;
-use crate::protocol::{PathId, StreamFlags, StreamId};
+use crate::protocol::{PathId, StreamId};
 
 #[test]
 fn stream_fin_waits_for_final_offset_before_close() {
@@ -19,7 +19,7 @@ fn stream_fin_waits_for_final_offset_before_close() {
     ));
 
     recv_stream
-        .receive_data(0, Bytes::from_static(b"hello"), StreamFlags::NONE)
+        .receive_data(0, Bytes::from_static(b"hello"))
         .expect("tail data");
 
     assert!(pending_stream_fin_ready(&recv_stream, pending_final_offset));
@@ -51,7 +51,7 @@ fn terminal_fin_replay_requires_sent_fin_and_completed_owner_bytes() {
 fn duplicate_stream_data_below_final_frontier_is_already_delivered() {
     let mut recv_stream = ReliableRecvStream::new(StreamId(1), MuxLimits::default());
     recv_stream
-        .receive_data(0, Bytes::from_static(b"hello"), StreamFlags::NONE)
+        .receive_data(0, Bytes::from_static(b"hello"))
         .expect("receive data");
 
     assert!(stream_data_range_already_delivered(&recv_stream, 0, 5));
@@ -514,7 +514,7 @@ fn ack_gap_repair_still_repairs_authoritative_ack_gap() {
     let limits = MuxLimits::default();
     let mut send_stream = ReliableSendStream::new(StreamId(9), limits);
     send_stream
-        .send_data(Bytes::from_static(&[7; 4096]), StreamFlags::NONE)
+        .send_data(Bytes::from_static(&[7; 4096]))
         .expect("send stream data");
 
     let repair_frames = stream_ack_gap_repair_frames(
@@ -547,10 +547,10 @@ fn final_offset_tail_repair_can_recover_unacked_terminal_tail() {
     let limits = MuxLimits::default();
     let mut send_stream = ReliableSendStream::new(StreamId(9), limits);
     send_stream
-        .send_data(Bytes::from_static(&[7; 4096]), StreamFlags::NONE)
+        .send_data(Bytes::from_static(&[7; 4096]))
         .expect("send stream data");
 
-    let repair_frames = stream_final_offset_tail_repair_frames(
+    let repair_frames = stream_final_offset_tail_repair_frames_normalized(
         &send_stream,
         &[OffsetRange {
             start: 0,
@@ -573,10 +573,10 @@ fn final_offset_tail_repair_can_use_service_when_no_alternate_survives() {
     let limits = MuxLimits::default();
     let mut send_stream = ReliableSendStream::new(StreamId(9), limits);
     send_stream
-        .send_data(Bytes::from_static(&[7; 4096]), StreamFlags::NONE)
+        .send_data(Bytes::from_static(&[7; 4096]))
         .expect("send stream data");
 
-    let repair_frames = stream_final_offset_tail_repair_frames(
+    let repair_frames = stream_final_offset_tail_repair_frames_normalized(
         &send_stream,
         &[OffsetRange {
             start: 0,
@@ -600,10 +600,11 @@ fn final_offset_tail_repair_can_recover_tail_with_no_ack_frontier() {
     let limits = MuxLimits::default();
     let mut send_stream = ReliableSendStream::new(StreamId(9), limits);
     send_stream
-        .send_data(Bytes::from_static(&[7; 4096]), StreamFlags::NONE)
+        .send_data(Bytes::from_static(&[7; 4096]))
         .expect("send stream data");
 
-    let repair_frames = stream_final_offset_tail_repair_frames(&send_stream, &[], 4096, true, true);
+    let repair_frames =
+        stream_final_offset_tail_repair_frames_normalized(&send_stream, &[], 4096, true, true);
 
     assert_eq!(repair_frames.len(), 1);
     assert_eq!(
@@ -618,10 +619,10 @@ fn final_offset_tail_repair_waits_for_persistent_stall_evidence() {
     let limits = MuxLimits::default();
     let mut send_stream = ReliableSendStream::new(StreamId(9), limits);
     send_stream
-        .send_data(Bytes::from_static(&[7; 4096]), StreamFlags::NONE)
+        .send_data(Bytes::from_static(&[7; 4096]))
         .expect("send stream data");
 
-    let repair_frames = stream_final_offset_tail_repair_frames(
+    let repair_frames = stream_final_offset_tail_repair_frames_normalized(
         &send_stream,
         &[OffsetRange {
             start: 0,

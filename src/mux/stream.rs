@@ -1,6 +1,6 @@
 use crate::mux::MuxLimits;
 use crate::protocol::frame::normalized_offset_ranges;
-use crate::protocol::{Frame, OffsetRange, StreamFlags, StreamId};
+use crate::protocol::{Frame, OffsetRange, StreamId};
 use bytes::Bytes;
 use smallvec::SmallVec;
 use std::collections::BTreeMap;
@@ -64,13 +64,13 @@ impl ReliableSendStream {
         self.max_offset = self.max_offset.max(max_offset);
     }
 
-    pub fn send_data(&mut self, payload: Bytes, flags: StreamFlags) -> Result<Frame, StreamError> {
-        let frame = self.prepare_data(payload, flags)?;
+    pub fn send_data(&mut self, payload: Bytes) -> Result<Frame, StreamError> {
+        let frame = self.prepare_data(payload)?;
         self.commit_prepared_data(&frame)?;
         Ok(frame)
     }
 
-    pub fn prepare_data(&self, payload: Bytes, flags: StreamFlags) -> Result<Frame, StreamError> {
+    pub fn prepare_data(&self, payload: Bytes) -> Result<Frame, StreamError> {
         if payload.is_empty() {
             return Err(StreamError::EmptyPayload);
         }
@@ -108,7 +108,6 @@ impl ReliableSendStream {
         Ok(Frame::StreamData {
             stream_id: self.stream_id,
             offset,
-            flags,
             payload,
         })
     }
@@ -117,7 +116,6 @@ impl ReliableSendStream {
         let Frame::StreamData {
             stream_id,
             offset,
-            flags,
             payload,
         } = frame
         else {
@@ -156,7 +154,6 @@ impl ReliableSendStream {
             SentChunk {
                 offset: *offset,
                 payload: payload.clone(),
-                flags: *flags,
             },
         );
         Ok(())
@@ -416,15 +413,9 @@ fn sent_chunk_slice(chunk: &SentChunk, start: u64, end: u64) -> Option<SentChunk
     if slice_start >= slice_end {
         return None;
     }
-    let full_chunk = slice_start == 0 && slice_end == chunk.payload.len();
     Some(SentChunk {
         offset: start,
         payload: chunk.payload.slice(slice_start..slice_end),
-        flags: if full_chunk {
-            chunk.flags
-        } else {
-            StreamFlags::NONE
-        },
     })
 }
 
@@ -473,15 +464,9 @@ fn push_retransmission_slice(
     if slice_start >= slice_end {
         return false;
     }
-    let full_chunk = slice_start == 0 && slice_end == chunk.payload.len();
     frames.push(Frame::StreamData {
         stream_id,
         offset: start,
-        flags: if full_chunk {
-            chunk.flags
-        } else {
-            StreamFlags::NONE
-        },
         payload: chunk.payload.slice(slice_start..slice_end),
     });
     *emitted_bytes = (*emitted_bytes).saturating_add(slice_end - slice_start);
@@ -492,7 +477,6 @@ fn push_retransmission_slice(
 struct SentChunk {
     offset: u64,
     payload: Bytes,
-    flags: StreamFlags,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -536,7 +520,6 @@ impl ReliableRecvStream {
         &mut self,
         offset: u64,
         payload: Bytes,
-        flags: StreamFlags,
     ) -> Result<ReceiveOutcome, StreamError> {
         if payload.is_empty() {
             return Err(StreamError::EmptyPayload);
@@ -566,14 +549,12 @@ impl ReliableRecvStream {
             self.next_offset = end;
             let mut delivered = SmallVec::new();
             delivered.push(payload);
-            let mut fin = flags.fin;
             while let Some(chunk) = self.buffered.remove(&self.next_offset) {
                 self.reorder_bytes = self.reorder_bytes.saturating_sub(chunk.payload.len());
                 self.next_offset = self.next_offset.saturating_add(chunk.payload.len() as u64);
-                fin |= chunk.flags.fin;
                 delivered.push(chunk.payload);
             }
-            return Ok(ReceiveOutcome { delivered, fin });
+            return Ok(ReceiveOutcome { delivered });
         }
         let missing_bytes = missing_ranges
             .iter()
@@ -609,25 +590,18 @@ impl ReliableRecvStream {
                 range.start,
                 RecvChunk {
                     payload: payload.slice(start..stop),
-                    flags: if flags.fin && range.end == end {
-                        flags
-                    } else {
-                        StreamFlags::NONE
-                    },
                 },
             );
         }
 
         let mut delivered = SmallVec::new();
-        let mut fin = false;
         while let Some(chunk) = self.buffered.remove(&self.next_offset) {
             self.reorder_bytes = self.reorder_bytes.saturating_sub(chunk.payload.len());
             self.next_offset = self.next_offset.saturating_add(chunk.payload.len() as u64);
-            fin |= chunk.flags.fin;
             delivered.push(chunk.payload);
         }
 
-        Ok(ReceiveOutcome { delivered, fin })
+        Ok(ReceiveOutcome { delivered })
     }
 
     pub fn ack_ranges(&self) -> Vec<OffsetRange> {
@@ -729,13 +703,11 @@ impl ReliableRecvStream {
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct RecvChunk {
     payload: Bytes,
-    flags: StreamFlags,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct ReceiveOutcome {
     pub delivered: SmallVec<[Bytes; 1]>,
-    pub fin: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]

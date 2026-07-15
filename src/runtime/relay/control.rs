@@ -177,8 +177,7 @@ where
             path_snapshot,
             context.mux_limits,
         );
-        let relay_demand = demand_update.demand;
-        let relay_lane = relay_demand.lane;
+        let relay_lane = demand_update.lane;
         let request_observed_bytes = send_stream
             .next_offset()
             .saturating_add(sender_queue.data_bytes() as u64);
@@ -187,7 +186,7 @@ where
             path_snapshot,
             context.mux_limits,
         );
-        let request_lane = request_demand_update.demand.lane;
+        let request_lane = request_demand_update.lane;
         #[cfg(feature = "lab-diagnostics")]
         if reliable_relay_lane_changed(request_demand_update.previous_lane, request_lane) {
             lab_diagnostic(
@@ -233,12 +232,10 @@ where
             lab_diagnostic(
                 "client_stream_lane_changed",
                 format_args!(
-                    "stream_id={} previous={:?} lane={:?} latency_weight_ppm={} throughput_weight_ppm={} sent_offset={} received_offset={} repair_bytes={}",
+                    "stream_id={} previous={:?} lane={:?} sent_offset={} received_offset={} repair_bytes={}",
                     stream_id.0,
                     demand_update.previous_lane,
                     relay_lane,
-                    demand_update.demand.latency_weight_ppm,
-                    demand_update.demand.throughput_weight_ppm,
                     send_stream.next_offset(),
                     recv_stream.next_offset(),
                     send_stream.repair_bytes(),
@@ -426,9 +423,6 @@ where
         let queued_send_blocked = reliable_relay_queued_send_blocked_for_retry(
             sender_queue.is_empty(),
             state.progress.sender_retry_at,
-            sender_queue
-                .front_lane()
-                .is_some_and(|work_lane| remotes.can_enqueue_work_lane_now(work_lane, relay_lane)),
         );
         let queued_send_ready =
             !sender_queue.is_empty() && !queued_send_blocked && !inbound_frame_ready;
@@ -451,7 +445,6 @@ where
             queued_send_blocked,
             &send_stream,
             &sender_queue,
-            context.mux_limits,
             sender_queue_limit,
         );
         let request_outstanding_headroom = reliable_relay_request_outstanding_headroom_bytes(
@@ -464,7 +457,6 @@ where
             reliable_relay_sender_queue_read_budget(
                 &send_stream,
                 &sender_queue,
-                context.mux_limits,
                 sender_queue_limit,
                 source_read_ceiling,
             )
@@ -1181,7 +1173,6 @@ where
                             false,
                             &send_stream,
                             &sender_queue,
-                            context.mux_limits,
                             sender_queue_limit,
                         )
                         && sender_queue.data_bytes() < sender_dispatch_byte_budget
@@ -1189,7 +1180,6 @@ where
                         let next_read_budget = reliable_relay_sender_queue_read_budget(
                             &send_stream,
                             &sender_queue,
-                            context.mux_limits,
                             sender_queue_limit,
                             source_read_ceiling,
                         );
@@ -1452,7 +1442,6 @@ where
                     Frame::StreamData {
                         stream_id: received_stream_id,
                         offset,
-                        flags,
                         payload,
                     } if received_stream_id == stream_id && state.endpoint.remote_open => {
                         let data_effect = match apply_client_stream_data(
@@ -1463,7 +1452,6 @@ where
                             stream_id,
                             path_key,
                             offset,
-                            flags,
                             payload,
                         )
                         .await
@@ -1592,7 +1580,7 @@ where
                             },
                             stream_id,
                             complete,
-                            &ranges,
+                            ranges,
                         );
                         if reliable_relay_can_send_pending_fin(
                             state.endpoint.pending_local_fin,

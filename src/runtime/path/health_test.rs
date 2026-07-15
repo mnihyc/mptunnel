@@ -9,7 +9,6 @@ use crate::transport::tcp_telemetry::{
 fn request_tcp_native_observation(path_index: usize) -> TcpNativeObservation {
     let snapshot = TcpNativeSnapshot {
         rtt: Some(TcpNativeRtt {
-            min_rtt_us: Some(170_000),
             srtt_us: 180_000,
             rttvar_us: 10_000,
         }),
@@ -60,7 +59,6 @@ fn partial_tcp_transport_state_does_not_clear_unknown_fields() {
     record.carrier_queue_bytes = 8 * 1024;
     let snapshot = TcpNativeSnapshot {
         rtt: Some(TcpNativeRtt {
-            min_rtt_us: None,
             srtt_us: 30_000,
             rttvar_us: 3_000,
         }),

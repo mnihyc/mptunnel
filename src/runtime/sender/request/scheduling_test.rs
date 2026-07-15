@@ -1,10 +1,10 @@
 use super::{
     BulkRelayPathChoice, BulkRelayPathRequest, RelayBulkLeadRequest, RequestRelayPathObservation,
-    RequestRelaySchedulingObservation, RequestRelayTcpPathObservation, RequestSchedulingState,
-    choose_admissible_relay_bulk_lead, choose_bulk_relay_path_for_extent_avoiding,
-    choose_request_ack_clock_calibration_with_rates, choose_request_startup_subflow_with_rates,
-    observed_request_ack_clock_calibration_transaction, relay_path_snapshot_for_bulk_choice,
-    relay_path_within_adaptive_lead_hysteresis, request_path_has_exact_flow_local_bulk_model,
+    RequestRelaySchedulingObservation, RequestSchedulingState, choose_admissible_relay_bulk_lead,
+    choose_bulk_relay_path_for_extent_avoiding, choose_request_ack_clock_calibration_with_rates,
+    choose_request_startup_subflow_with_rates, observed_request_ack_clock_calibration_transaction,
+    relay_path_snapshot_for_bulk_choice, relay_path_within_adaptive_lead_hysteresis,
+    request_path_has_exact_flow_local_bulk_model,
 };
 use crate::config::{ResourceLimits, SecurityConfig, SharedSecret};
 use crate::model::ack_clock::{
@@ -20,11 +20,11 @@ use crate::model::capacity::{
     BBR_MAX_SEND_QUANTUM_BYTES, PATH_OPEN_SCORE_BYTES, PathRateSample,
     RELIABLE_INITIAL_WINDOW_PACKETS, reliable_subflow_startup_sample_limit_bytes,
 };
-use crate::model::multipath::{FlowSubflowSet, PathAdmissionDecision, SubflowAdmissionInput};
+use crate::model::multipath::{FlowSubflowSet, PathAdmission, SubflowAdmissionInput};
 use crate::model::path::{RelayPathInstance, RelayPathKey, RelayPathPlacement};
 use crate::model::request::evidence::RequestPerFlowRateModel;
 use crate::mux::MuxLimits;
-use crate::protocol::{Frame, OffsetRange, PathId, StreamFlags, StreamId, UnderlayProtocol};
+use crate::protocol::{Frame, OffsetRange, PathId, StreamId, UnderlayProtocol};
 use crate::runtime::path::commands::reliable_path_command_channels;
 use crate::runtime::path::{
     ClientPathContext, PathProofObservation, ReliableTcpRequestBulkFlowRegistration,
@@ -34,7 +34,7 @@ use crate::runtime::stream::request::{
     RequestAckClockOperation, RequestFlightLedger, RequestSubflows,
 };
 use crate::runtime::stream::{ReliablePathStreamHandle, ReliablePathStreamOutput};
-use crate::scheduler::{self, FlowLane, PathRateScope, PathSnapshot, SchedulerPolicy};
+use crate::scheduler::{self, FlowLane, PathRateScope, PathSnapshot};
 use crate::transport::PathSpec;
 use bytes::Bytes;
 use smallvec::SmallVec;
@@ -76,7 +76,6 @@ fn data_frame(offset: u64, len: usize) -> Frame {
     Frame::StreamData {
         stream_id: StreamId(7),
         offset,
-        flags: StreamFlags::NONE,
         payload: Bytes::from(vec![0x5a; len]),
     }
 }
@@ -212,10 +211,7 @@ fn relay_path_snapshot_for_test(
             can_enqueue_stream_lane: true,
             load_owned: current_flow_owns_path,
             shared_snapshot: evidence.shared_snapshot,
-            tcp: evidence.tcp.map(|tcp| RequestRelayTcpPathObservation {
-                startup_snapshot: tcp.startup_snapshot,
-                rate_hint_unknown: tcp.rate_hint_unknown,
-            }),
+            tcp: evidence.tcp,
             has_bulk_model_evidence: evidence.has_bulk_model_evidence,
             fresh_proof: evidence.fresh_proof,
             config_ordinal: evidence.config_ordinal,
@@ -661,22 +657,18 @@ fn request_startup_needs_contention_but_existing_owner_drains_after_two_to_one()
         context.mux_limits,
     ))
     .expect("startup credit");
-    let mut epoch = FlowSubflowSet::new(0, service, startup_credit, 0, Duration::ZERO);
+    let mut epoch = FlowSubflowSet::new(service, startup_credit);
     assert_eq!(
-        epoch
-            .admit_subflow_owner(SubflowAdmissionInput {
-                key: candidate,
-                bulk_rate_proven: false,
-                startup_owner_allowed: true,
-                frontier_clear: true,
-                completion_improves: false,
-                observed_goodput_non_degrading: true,
-                read_gap: Duration::ZERO,
-                owner_bytes: 64 * 1024,
-                optional_overhead_bytes: 0,
-            })
-            .decision,
-        PathAdmissionDecision::AdmitSubflow
+        epoch.admit_subflow_owner(SubflowAdmissionInput {
+            key: candidate,
+            bulk_rate_proven: false,
+            startup_owner_allowed: true,
+            frontier_clear: true,
+            completion_improves: false,
+            observed_goodput_non_degrading: true,
+            owner_bytes: 64 * 1024,
+        }),
+        PathAdmission::Subflow
     );
     second.update(true, Some(UnderlayProtocol::Udp));
     assert_eq!(context.active_tcp_service_request_bulk_flows(), 1);
@@ -1015,7 +1007,6 @@ fn request_calibration_needs_contention_but_spent_owner_drains_after_two_to_one(
         service_snapshot,
         FlowLane::Throughput,
         BBR_MAX_SEND_QUANTUM_BYTES,
-        SchedulerPolicy::default(),
     )
     .expect("service score")
     .eta_ms;
@@ -1023,7 +1014,6 @@ fn request_calibration_needs_contention_but_spent_owner_drains_after_two_to_one(
         candidate_snapshot,
         FlowLane::Throughput,
         BBR_MAX_SEND_QUANTUM_BYTES,
-        SchedulerPolicy::default(),
     )
     .expect("candidate score")
     .eta_ms;
@@ -1862,22 +1852,18 @@ fn request_startup_owner_needs_ack_clock_proof_after_flights_drain() {
         context.mux_limits,
     ))
     .expect("startup credit");
-    let mut epoch = FlowSubflowSet::new(0, paths[0].instance(), startup_credit, 0, Duration::ZERO);
+    let mut epoch = FlowSubflowSet::new(paths[0].instance(), startup_credit);
     assert_eq!(
-        epoch
-            .admit_subflow_owner(SubflowAdmissionInput {
-                key: paths[1].instance(),
-                bulk_rate_proven: false,
-                startup_owner_allowed: true,
-                frontier_clear: true,
-                completion_improves: false,
-                observed_goodput_non_degrading: true,
-                read_gap: Duration::ZERO,
-                owner_bytes: startup_credit,
-                optional_overhead_bytes: 0,
-            })
-            .decision,
-        PathAdmissionDecision::AdmitSubflow
+        epoch.admit_subflow_owner(SubflowAdmissionInput {
+            key: paths[1].instance(),
+            bulk_rate_proven: false,
+            startup_owner_allowed: true,
+            frontier_clear: true,
+            completion_improves: false,
+            observed_goodput_non_degrading: true,
+            owner_bytes: startup_credit,
+        }),
+        PathAdmission::Subflow
     );
     let mut ledger = RequestFlightLedger::default();
     ledger.record_owner_frame(candidate_key, &data_frame(0, 64 * 1024));
@@ -2042,13 +2028,11 @@ fn exact_flow_local_model_can_own_without_session_global_membership() {
         false,
     )
     .expect("candidate snapshot");
-    let policy = SchedulerPolicy::default();
     let scoring_payload_bytes = bulk_service_horizon_payload_bytes(64 * 1024, context.mux_limits);
     let service_eta = scheduler::score_path(
         service_snapshot,
         FlowLane::Throughput,
         scoring_payload_bytes,
-        policy,
     )
     .expect("service score")
     .eta_ms;
@@ -2056,7 +2040,6 @@ fn exact_flow_local_model_can_own_without_session_global_membership() {
         candidate_snapshot,
         FlowLane::Throughput,
         scoring_payload_bytes,
-        policy,
     )
     .expect("candidate score")
     .eta_ms;
@@ -2201,7 +2184,6 @@ fn relay_bulk_lead_must_be_admissible_not_lowest_raw_eta() {
         restrict_to_admitted: true,
         lower_flight_owner: None,
         lower_owner_cross_path_debt: 0,
-        policy: SchedulerPolicy::default(),
         request_state: None,
     })
     .expect("admissible path should become lead");
@@ -2249,7 +2231,6 @@ fn relay_lower_owner_uses_sliding_window_not_ordering_debt() {
         restrict_to_admitted: true,
         lower_flight_owner: Some(owner),
         lower_owner_cross_path_debt: 1024 * 1024,
-        policy: SchedulerPolicy::default(),
         request_state: None,
     })
     .expect("same-carrier lower flight is sliding-window flight");

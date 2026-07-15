@@ -14,11 +14,10 @@ use super::metrics::quic_path_metrics_poll_interval;
 use crate::config::SecurityConfig;
 #[cfg(feature = "lab-diagnostics")]
 use crate::lab_diagnostics::lab_diagnostic;
-use crate::model::timing::default_transport_pto;
 use crate::mux::MuxLimits;
 use crate::protocol::codec::CodecLimits;
 use crate::protocol::{
-    Frame, IngressKind, OutboundPolicy, PathId, SessionId, StreamId, TargetAddr, UnderlayProtocol,
+    Frame, PathId, PathMetricDirection, SessionId, StreamId, TargetAddr, UnderlayProtocol,
 };
 use crate::runtime::error::RuntimeError;
 use crate::runtime::path::authentication::ClientPathAuthenticationFrames;
@@ -88,7 +87,6 @@ impl ClientUdpPathSessionHandle {
         &self,
         stream_id: StreamId,
         target: TargetAddr,
-        ingress: IngressKind,
         lane: FlowLane,
         options: UdpStreamOpenOptions,
         open_deadline: tokio::time::Instant,
@@ -99,7 +97,6 @@ impl ClientUdpPathSessionHandle {
                 connection,
                 stream_id,
                 target.clone(),
-                ingress,
                 lane,
                 options,
                 self.runtime.clone(),
@@ -114,7 +111,6 @@ impl ClientUdpPathSessionHandle {
                         connection,
                         stream_id,
                         target,
-                        ingress,
                         lane,
                         options,
                         self.runtime.clone(),
@@ -174,16 +170,31 @@ impl ClientUdpPathSessionHandle {
 
 #[derive(Clone)]
 pub(in crate::runtime) struct ClientUdpPathSessionRuntime {
-    pub(in crate::runtime) path: PathSpec,
+    pub(in crate::runtime) paths: Arc<Vec<PathSpec>>,
+    pub(in crate::runtime) config_index: usize,
     pub(in crate::runtime) path_index: usize,
     pub(in crate::runtime) carrier_identity: CarrierPathIdentity,
     pub(in crate::runtime) session_id: SessionId,
-    pub(in crate::runtime) security: SecurityConfig,
+    pub(in crate::runtime) security: Arc<Vec<SecurityConfig>>,
     pub(in crate::runtime) codec_limits: CodecLimits,
     pub(in crate::runtime) mux_limits: MuxLimits,
     pub(in crate::runtime) stream_frame_queue: usize,
     pub(in crate::runtime) state: Arc<ClientPathState>,
     pub(in crate::runtime) carrier_network: Arc<dyn CarrierNetworkProvider>,
+}
+
+impl ClientUdpPathSessionRuntime {
+    pub(in crate::runtime) fn path(&self) -> &PathSpec {
+        self.paths
+            .get(self.config_index)
+            .expect("UDP session path inventory matches its index")
+    }
+
+    pub(in crate::runtime) fn security(&self) -> &SecurityConfig {
+        self.security
+            .get(self.config_index)
+            .expect("UDP session security inventory matches its index")
+    }
 }
 
 struct ClientUdpPathConnection {
@@ -214,10 +225,8 @@ fn spawn_client_udp_path_metrics(
             if connection.is_closed() {
                 return;
             }
-            let Some(mut metrics) = connection.tx_metrics(&mut tracker, 1).await else {
-                tokio::time::sleep(default_transport_pto()).await;
-                continue;
-            };
+            let mut metrics =
+                connection.tx_metrics(&mut tracker, PathMetricDirection::ClientToServer);
             let capacity_candidate = metrics.capacity_proof_candidate;
             let capacity_probe = metrics.capacity_probe;
             #[cfg(feature = "lab-diagnostics")]
@@ -300,11 +309,11 @@ async fn connect_client_udp_path(
         let resolved = runtime
             .carrier_network
             .resolve(CarrierResolutionRequest {
-                path: &runtime.path,
+                path: runtime.path(),
                 identity: runtime.carrier_identity,
             })
             .await?;
-        let resolved = usable_udp_path_socket_addrs(&runtime.path, resolved)?;
+        let resolved = usable_udp_path_socket_addrs(runtime.path(), resolved)?;
         let mut remote_addrs = interleave_socket_addr_families(resolved)
             .into_iter()
             .take(MAX_QUIC_ADDRESS_ATTEMPTS)
@@ -395,7 +404,7 @@ async fn connect_client_udp_addr(
     let carrier = runtime
         .carrier_network
         .create_socket(CarrierSocketRequest {
-            path: &runtime.path,
+            path: runtime.path(),
             identity: runtime.carrier_identity,
             remote_addr,
         })?;
@@ -411,8 +420,7 @@ async fn perform_client_udp_path_handshake(
     let (mut send, mut recv) = connection.open_bi().await?;
     let path_id = PathId(runtime.path_index as u16);
     let [session_hello, session_auth, path_join] = ClientPathAuthenticationFrames::for_session(
-        &runtime.security,
-        &runtime.path,
+        runtime.security(),
         path_id,
         UnderlayProtocol::Udp,
         runtime.session_id,
@@ -452,7 +460,6 @@ async fn open_client_udp_stream_on_connection(
     connection: UdpPathConnection,
     stream_id: StreamId,
     target: TargetAddr,
-    ingress: IngressKind,
     lane: FlowLane,
     options: UdpStreamOpenOptions,
     runtime: ClientUdpPathSessionRuntime,
@@ -465,8 +472,6 @@ async fn open_client_udp_stream_on_connection(
     let open = Frame::OpenStream {
         stream_id,
         target,
-        ingress,
-        outbound: OutboundPolicy::Direct,
         demand: stream_demand_hint_for_lane(lane),
         role,
     };
@@ -505,7 +510,7 @@ async fn open_client_udp_stream_on_connection(
             runtime.codec_limits,
             runtime.mux_limits,
         ),
-        startup: path_startup_snapshot(&runtime.path, runtime.path_index),
+        startup: path_startup_snapshot(runtime.path(), runtime.path_index),
         commands,
         mux_limits: runtime.mux_limits,
         frames: frames_rx,

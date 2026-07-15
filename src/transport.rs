@@ -1,3 +1,8 @@
+//! Concrete carrier adapters and endpoint-local path configuration.
+//!
+//! TCP and QUIC share framing and host-network contracts but retain independent
+//! connection, congestion, telemetry, and recovery mechanics.
+
 pub(crate) mod aead;
 mod carrier_network;
 pub mod encrypted;
@@ -14,5 +19,6 @@ pub use carrier_network::{
     CarrierSocket, CarrierSocketRequest, SystemCarrierNetworkProvider,
 };
 pub use spec::{
-    Endpoint, EndpointParseError, PathBinding, PathMetadata, PathSpec, PathSpecParseError,
+    Endpoint, EndpointParseError, PathBinding, PathMetadata, PathPolicy, PathSpec,
+    PathSpecParseError, RateHint,
 };

@@ -9,7 +9,7 @@ use crate::model::work::ReliableWorkClass;
 use crate::mux::MuxLimits;
 use crate::mux::stream::ReliableSendStream;
 use crate::protocol::frame::{reliable_stream_frame_accounted_bytes, reliable_stream_frame_extent};
-use crate::protocol::{Frame, OffsetRange, StreamFlags};
+use crate::protocol::{Frame, OffsetRange};
 use crate::scheduler::FlowLane;
 use bytes::Bytes;
 use std::collections::VecDeque;
@@ -214,10 +214,6 @@ impl ReliableRelaySenderQueue {
                 .front()
                 .map(|work| (ReliableWorkClass::Control, work))
         }
-    }
-
-    pub(in crate::runtime) fn front_lane(&self) -> Option<ReliableWorkClass> {
-        self.front().map(|(lane, _)| lane)
     }
 
     pub(super) fn persistent_ack_gap_repair_deadline(&self) -> Option<Instant> {
@@ -473,7 +469,6 @@ fn unacked_repair_frame_slices(frame: &Frame, ranges: &[OffsetRange]) -> Vec<Fra
     let Frame::StreamData {
         stream_id,
         offset,
-        flags,
         payload,
     } = frame
     else {
@@ -508,11 +503,6 @@ fn unacked_repair_frame_slices(frame: &Frame, ranges: &[OffsetRange]) -> Vec<Fra
             (slice_start < slice_end && slice_end <= payload.len()).then(|| Frame::StreamData {
                 stream_id: *stream_id,
                 offset: start,
-                flags: if end == frame_end {
-                    *flags
-                } else {
-                    StreamFlags::NONE
-                },
                 payload: payload.slice(slice_start..slice_end),
             })
         })
@@ -535,7 +525,6 @@ pub(in crate::runtime) fn reliable_relay_sender_queue_limit(
 pub(in crate::runtime) fn reliable_relay_can_read_into_sender_queue(
     send_stream: &ReliableSendStream,
     sender_queue: &ReliableRelaySenderQueue,
-    _mux_limits: MuxLimits,
     queue_limit: usize,
 ) -> bool {
     sender_queue.bytes() < queue_limit
@@ -547,23 +536,16 @@ pub(in crate::runtime) fn reliable_relay_can_read_product_source(
     queued_send_blocked: bool,
     send_stream: &ReliableSendStream,
     sender_queue: &ReliableRelaySenderQueue,
-    mux_limits: MuxLimits,
     queue_limit: usize,
 ) -> bool {
     local_open
         && !queued_send_blocked
-        && reliable_relay_can_read_into_sender_queue(
-            send_stream,
-            sender_queue,
-            mux_limits,
-            queue_limit,
-        )
+        && reliable_relay_can_read_into_sender_queue(send_stream, sender_queue, queue_limit)
 }
 
 pub(in crate::runtime) fn reliable_relay_sender_queue_read_budget(
     send_stream: &ReliableSendStream,
     sender_queue: &ReliableRelaySenderQueue,
-    _mux_limits: MuxLimits,
     queue_limit: usize,
     buffer_len: usize,
 ) -> usize {

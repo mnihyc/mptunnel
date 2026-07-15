@@ -6,7 +6,7 @@ use crate::lab_diagnostics::lab_perf_record;
 use crate::protocol::codec::{
     CodecLimits, decode_frame_bytes, encode_frame_into, encoded_frame_capacity_hint,
 };
-use crate::protocol::{Frame, FrameWriteClass, StreamFlags};
+use crate::protocol::{Frame, FrameWriteClass};
 use bytes::BytesMut;
 use quinn::VarInt;
 use std::sync::Arc;
@@ -194,7 +194,6 @@ pub(super) fn encode_quic_length_prefixed_frame(
     let Frame::StreamData {
         stream_id,
         offset,
-        flags,
         payload,
     } = frame
     else {
@@ -210,14 +209,9 @@ pub(super) fn encode_quic_length_prefixed_frame(
         let next = cursor
             .saturating_add(QUIC_STREAM_RECORD_PAYLOAD_BYTES)
             .min(payload.len());
-        let split_flags = StreamFlags {
-            fin: flags.fin && next == payload.len(),
-            early_data: flags.early_data && cursor == 0,
-        };
         let split = Frame::StreamData {
             stream_id: *stream_id,
             offset: offset.saturating_add(cursor as u64),
-            flags: split_flags,
             payload: payload.slice(cursor..next),
         };
         encode_length_prefixed_frame(&split, limits, packet)?;

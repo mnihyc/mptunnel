@@ -11,7 +11,10 @@ use super::attachment::{ResponseDispatchTarget, ResponseStreamOutputs};
 use crate::lab_diagnostics::lab_diagnostic;
 use crate::model::path::CarrierPathKey;
 use crate::model::response::CarrierPathFlightDebt;
-use crate::model::work::CarrierWorkKind;
+use crate::model::work::{
+    CarrierWorkKind, ambiguous_flight_intervals, flight_interval_bytes, flight_intervals_overlap,
+    split_flight_interval_by_ack,
+};
 use crate::protocol::frame::reliable_stream_frame_extent;
 use crate::protocol::{Frame, OffsetRange, StreamOpenRole, UnderlayProtocol};
 use crate::runtime::RuntimeError;
@@ -682,7 +685,6 @@ impl ResponseStreamBinding {
         frame: &Frame,
         kind: CarrierWorkKind,
     ) {
-        debug_assert!(kind.carries_product_offsets());
         let Some((offset, end, bytes)) = reliable_stream_frame_extent(frame) else {
             return;
         };
@@ -877,12 +879,16 @@ pub(in crate::runtime::stream) fn release_carrier_path_flight_ranges(
             path_flights.into_iter().map(move |flight| (start, flight))
         })
         .collect::<Vec<_>>();
-    let ambiguous_intervals = carrier_path_ambiguous_flight_intervals(&original_flights);
+    let ambiguous_intervals = ambiguous_flight_intervals(
+        original_flights
+            .iter()
+            .map(|(start, flight)| (*start, flight.end)),
+    );
     let mut released = Vec::new();
     for (start, flight) in original_flights.iter().copied() {
-        let split = split_carrier_flight_interval_by_ack(start, flight.end, ranges);
+        let split = split_flight_interval_by_ack(start, flight.end, ranges);
         for (acked_start, acked_end) in split.acked {
-            let bytes = carrier_flight_interval_bytes(acked_start, acked_end);
+            let bytes = flight_interval_bytes(acked_start, acked_end);
             if bytes == 0 {
                 continue;
             }
@@ -896,16 +902,12 @@ pub(in crate::runtime::stream) fn release_carrier_path_flight_ranges(
                     },
                     path_proving: flight.evidence_eligible
                         && flight.kind.is_ordering_owner()
-                        && !carrier_flight_intervals_overlap(
-                            &ambiguous_intervals,
-                            acked_start,
-                            acked_end,
-                        ),
+                        && !flight_intervals_overlap(&ambiguous_intervals, acked_start, acked_end),
                 },
             ));
         }
         for (retained_start, retained_end) in split.retained {
-            let bytes = carrier_flight_interval_bytes(retained_start, retained_end);
+            let bytes = flight_interval_bytes(retained_start, retained_end);
             if bytes == 0 {
                 continue;
             }
@@ -920,80 +922,6 @@ pub(in crate::runtime::stream) fn release_carrier_path_flight_ranges(
         }
     }
     released
-}
-
-fn carrier_path_ambiguous_flight_intervals(
-    flights: &[(u64, CarrierPathFlight)],
-) -> Vec<(u64, u64)> {
-    let mut events = BTreeMap::<u64, i64>::new();
-    for (start, flight) in flights {
-        *events.entry(*start).or_default() += 1;
-        *events.entry(flight.end).or_default() -= 1;
-    }
-    let mut intervals = Vec::new();
-    let mut active = 0_i64;
-    let mut previous = None;
-    for (position, delta) in events {
-        if let Some(previous) = previous
-            && previous < position
-            && active > 1
-        {
-            intervals.push((previous, position));
-        }
-        active += delta;
-        previous = Some(position);
-    }
-    intervals
-}
-
-fn carrier_flight_intervals_overlap(intervals: &[(u64, u64)], start: u64, end: u64) -> bool {
-    let position = intervals.partition_point(|(_, interval_end)| *interval_end <= start);
-    intervals
-        .get(position)
-        .is_some_and(|(interval_start, _)| *interval_start < end)
-}
-
-struct CarrierFlightIntervalSplit {
-    acked: Vec<(u64, u64)>,
-    retained: Vec<(u64, u64)>,
-}
-
-fn split_carrier_flight_interval_by_ack(
-    start: u64,
-    end: u64,
-    ranges: &[OffsetRange],
-) -> CarrierFlightIntervalSplit {
-    let mut acked = Vec::new();
-    let mut retained = Vec::new();
-    let mut cursor = start;
-    for range in ranges {
-        if range.end <= cursor {
-            continue;
-        }
-        if range.start >= end {
-            break;
-        }
-        let ack_start = cursor.max(range.start);
-        if cursor < ack_start {
-            retained.push((cursor, ack_start));
-        }
-        let ack_end = end.min(range.end);
-        if ack_start < ack_end {
-            acked.push((ack_start, ack_end));
-            cursor = ack_end;
-        }
-        if cursor >= end {
-            break;
-        }
-    }
-    if cursor < end {
-        retained.push((cursor, end));
-    }
-    CarrierFlightIntervalSplit { acked, retained }
-}
-
-fn carrier_flight_interval_bytes(start: u64, end: u64) -> usize {
-    usize::try_from(end.saturating_sub(start)).unwrap_or(usize::MAX)
 }
 
 pub(in crate::runtime::stream) fn product_flights_have_recent_repair_overlap(

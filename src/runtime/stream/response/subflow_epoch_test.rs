@@ -9,10 +9,8 @@ use super::super::test_support::{binding_for_underlay, stream_data_frame, stream
 use crate::model::ack_clock::{
     reliable_ack_clock_calibration_ceiling_bytes, reliable_ack_clock_calibration_limit_bytes,
 };
-use crate::model::capacity::{
-    MIN_RATE_SAMPLE_BYTES, reliable_bulk_carrier_feed_quantum_bytes, reliable_relay_buffer_len,
-};
-use crate::model::multipath::{PathAdmissionDecision, SubflowAdmissionInput};
+use crate::model::capacity::{MIN_RATE_SAMPLE_BYTES, reliable_bulk_carrier_feed_quantum_bytes};
+use crate::model::multipath::{PathAdmission, SubflowAdmissionInput};
 use crate::model::path::CarrierPathKey;
 use crate::mux::MuxLimits;
 use crate::protocol::{OffsetRange, PathId, SessionId, StreamOpenRole, UnderlayProtocol};
@@ -36,31 +34,25 @@ fn response_subflow_set_allows_repeated_measured_subflow_admission() {
         frontier_clear: true,
         completion_improves: true,
         observed_goodput_non_degrading: true,
-        read_gap: Duration::ZERO,
         owner_bytes: payload_bytes,
-        optional_overhead_bytes: 0,
     };
 
-    let first =
-        binding.preview_subflow_owner_admission(service, payload_bytes, 0, Duration::ZERO, input);
-    assert_eq!(first.decision, PathAdmissionDecision::AdmitSubflow);
+    let first = binding.preview_subflow_owner_admission(service, payload_bytes, input);
+    assert_eq!(first, PathAdmission::Subflow);
 
-    let committed =
-        binding.commit_subflow_owner_admission(service, payload_bytes, 0, Duration::ZERO, input);
-    assert_eq!(committed.decision, PathAdmissionDecision::AdmitSubflow);
+    let committed = binding.commit_subflow_owner_admission(service, payload_bytes, input);
+    assert_eq!(committed, PathAdmission::Subflow);
 
-    let second =
-        binding.preview_subflow_owner_admission(service, payload_bytes, 0, Duration::ZERO, input);
+    let second = binding.preview_subflow_owner_admission(service, payload_bytes, input);
     assert_eq!(
-        second.decision,
-        PathAdmissionDecision::AdmitSubflow,
+        second,
+        PathAdmission::Subflow,
         "measured subflows are paced by inflight/completion/reorder gates, not by a startup quantum"
     );
 
     binding.reset_subflow_set();
-    let after_reset =
-        binding.preview_subflow_owner_admission(service, payload_bytes, 0, Duration::ZERO, input);
-    assert_eq!(after_reset.decision, PathAdmissionDecision::AdmitSubflow);
+    let after_reset = binding.preview_subflow_owner_admission(service, payload_bytes, input);
+    assert_eq!(after_reset, PathAdmission::Subflow);
 }
 
 #[test]
@@ -79,7 +71,6 @@ fn response_semantic_reset_retires_partial_ack_clock_credit_without_refill() {
             candidate_commands,
             FlowLane::Throughput,
             StreamOpenRole::Validation,
-            reliable_relay_buffer_len(mux_limits),
         ),
         ResponseStreamAttachOutcome::Attached
     );
@@ -143,7 +134,6 @@ fn response_semantic_reset_keeps_retired_active_identity_until_owner_flight_drai
             candidate_commands,
             FlowLane::Throughput,
             StreamOpenRole::Validation,
-            reliable_relay_buffer_len(mux_limits),
         ),
         ResponseStreamAttachOutcome::Attached
     );
@@ -253,32 +243,27 @@ fn response_subflow_set_rejects_unproven_owner_without_bulk_rate() {
         frontier_clear: true,
         completion_improves: true,
         observed_goodput_non_degrading: true,
-        read_gap: Duration::ZERO,
         owner_bytes: payload_bytes,
-        optional_overhead_bytes: 0,
     };
 
-    let committed =
-        binding.commit_subflow_owner_admission(service, payload_bytes, 0, Duration::ZERO, input);
+    let committed = binding.commit_subflow_owner_admission(service, payload_bytes, input);
     assert_eq!(
-        committed.decision,
-        PathAdmissionDecision::ProbeOnly,
+        committed,
+        PathAdmission::ProbeOnly,
         "sender/proof/ACK-data evidence is not enough to enter the owner Subflow set"
     );
     assert!(binding.subflow_set_snapshot().is_none());
 
-    let second =
-        binding.preview_subflow_owner_admission(service, payload_bytes, 0, Duration::ZERO, input);
+    let second = binding.preview_subflow_owner_admission(service, payload_bytes, input);
     assert_eq!(
-        second.decision,
-        PathAdmissionDecision::ProbeOnly,
+        second,
+        PathAdmission::ProbeOnly,
         "unproven Subflows remain Probe until they have bulk-rate evidence"
     );
 
     binding.reset_subflow_set();
-    let after_reset =
-        binding.preview_subflow_owner_admission(service, payload_bytes, 0, Duration::ZERO, input);
-    assert_eq!(after_reset.decision, PathAdmissionDecision::ProbeOnly);
+    let after_reset = binding.preview_subflow_owner_admission(service, payload_bytes, input);
+    assert_eq!(after_reset, PathAdmission::ProbeOnly);
 }
 
 #[test]
@@ -296,22 +281,16 @@ fn response_subflow_unproven_probe_state_survives_ack_progress() {
         frontier_clear: true,
         completion_improves: true,
         observed_goodput_non_degrading: true,
-        read_gap: Duration::ZERO,
         owner_bytes: payload_bytes,
-        optional_overhead_bytes: 0,
     };
 
     assert_eq!(
-        binding
-            .commit_subflow_owner_admission(service, payload_bytes, 0, Duration::ZERO, input)
-            .decision,
-        PathAdmissionDecision::ProbeOnly
+        binding.commit_subflow_owner_admission(service, payload_bytes, input),
+        PathAdmission::ProbeOnly
     );
     assert_eq!(
-        binding
-            .preview_subflow_owner_admission(service, payload_bytes, 0, Duration::ZERO, input)
-            .decision,
-        PathAdmissionDecision::ProbeOnly
+        binding.preview_subflow_owner_admission(service, payload_bytes, input),
+        PathAdmission::ProbeOnly
     );
 
     let service_frame = stream_data_frame(payload_bytes);
@@ -322,10 +301,8 @@ fn response_subflow_unproven_probe_state_survives_ack_progress() {
     }]);
 
     assert_eq!(
-        binding
-            .preview_subflow_owner_admission(service, payload_bytes, 0, Duration::ZERO, input)
-            .decision,
-        PathAdmissionDecision::ProbeOnly,
+        binding.preview_subflow_owner_admission(service, payload_bytes, input),
+        PathAdmission::ProbeOnly,
         "ordinary ACK progress must not convert an unproven path into a Subflow owner"
     );
 }
@@ -344,7 +321,6 @@ fn response_subflow_epoch_survives_passive_growth_but_resets_on_detach() {
         commands.clone(),
         FlowLane::Throughput,
         StreamOpenRole::Validation,
-        reliable_relay_buffer_len(MuxLimits::default()),
     );
 
     let payload_bytes = reliable_bulk_carrier_feed_quantum_bytes(MuxLimits::default());
@@ -355,16 +331,12 @@ fn response_subflow_epoch_survives_passive_growth_but_resets_on_detach() {
         frontier_clear: true,
         completion_improves: true,
         observed_goodput_non_degrading: true,
-        read_gap: Duration::ZERO,
         owner_bytes: payload_bytes,
-        optional_overhead_bytes: 0,
     };
 
     assert_eq!(
-        binding
-            .commit_subflow_owner_admission(service, payload_bytes, 0, Duration::ZERO, input)
-            .decision,
-        PathAdmissionDecision::AdmitSubflow
+        binding.commit_subflow_owner_admission(service, payload_bytes, input),
+        PathAdmission::Subflow
     );
     assert!(binding.subflow_set_snapshot().is_some());
 
@@ -382,7 +354,6 @@ fn response_subflow_epoch_survives_passive_growth_but_resets_on_detach() {
             added_commands,
             FlowLane::Throughput,
             StreamOpenRole::Validation,
-            reliable_relay_buffer_len(MuxLimits::default()),
         ),
         ResponseStreamAttachOutcome::Attached
     );
@@ -391,25 +362,19 @@ fn response_subflow_epoch_survives_passive_growth_but_resets_on_detach() {
         "passive output growth must preserve the current Subflow epoch"
     );
     assert_eq!(
-        binding
-            .commit_subflow_owner_admission_for_planner_generation(
-                stale_generation,
-                stale_lane_generation,
-                service,
-                payload_bytes,
-                0,
-                Duration::ZERO,
-                input,
-            )
-            .decision,
-        PathAdmissionDecision::Standby,
+        binding.commit_subflow_owner_admission_for_planner_generation(
+            stale_generation,
+            stale_lane_generation,
+            service,
+            payload_bytes,
+            input,
+        ),
+        PathAdmission::Standby,
         "a plan made before passive membership changed must not commit afterward"
     );
     assert_eq!(
-        binding
-            .commit_subflow_owner_admission(service, payload_bytes, 0, Duration::ZERO, input,)
-            .decision,
-        PathAdmissionDecision::AdmitSubflow
+        binding.commit_subflow_owner_admission(service, payload_bytes, input,),
+        PathAdmission::Subflow
     );
     assert!(binding.subflow_set_snapshot().is_some());
 
@@ -435,7 +400,6 @@ fn passive_cross_family_attach_does_not_refill_or_transfer_startup_epoch() {
         candidate_commands,
         FlowLane::Throughput,
         StreamOpenRole::Validation,
-        reliable_relay_buffer_len(MuxLimits::default()),
     );
 
     let quantum = reliable_bulk_carrier_feed_quantum_bytes(MuxLimits::default());
@@ -447,32 +411,24 @@ fn passive_cross_family_attach_does_not_refill_or_transfer_startup_epoch() {
         frontier_clear: true,
         completion_improves: false,
         observed_goodput_non_degrading: true,
-        read_gap: Duration::ZERO,
         owner_bytes: quantum,
-        optional_overhead_bytes: 0,
     };
     for _ in 0..4 {
         assert_eq!(
-            binding
-                .commit_subflow_owner_admission(service, startup_credit, 0, Duration::ZERO, input,)
-                .decision,
-            PathAdmissionDecision::AdmitSubflow
+            binding.commit_subflow_owner_admission(service, startup_credit, input,),
+            PathAdmission::Subflow
         );
     }
     assert_eq!(
-        binding
-            .preview_subflow_owner_admission(
-                service,
-                startup_credit,
-                0,
-                Duration::ZERO,
-                SubflowAdmissionInput {
-                    owner_bytes: 1,
-                    ..input
-                },
-            )
-            .decision,
-        PathAdmissionDecision::ProbeOnly,
+        binding.preview_subflow_owner_admission(
+            service,
+            startup_credit,
+            SubflowAdmissionInput {
+                owner_bytes: 1,
+                ..input
+            },
+        ),
+        PathAdmission::ProbeOnly,
         "the initial candidate has spent the cumulative startup cap"
     );
 
@@ -490,7 +446,6 @@ fn passive_cross_family_attach_does_not_refill_or_transfer_startup_epoch() {
             added_commands,
             FlowLane::Throughput,
             StreamOpenRole::Validation,
-            reliable_relay_buffer_len(MuxLimits::default()),
         ),
         ResponseStreamAttachOutcome::Attached
     );
@@ -498,55 +453,45 @@ fn passive_cross_family_attach_does_not_refill_or_transfer_startup_epoch() {
     let (current_generation, epoch) = binding.subflow_state_snapshot();
     assert_ne!(current_generation, stale_generation);
     let epoch = epoch.expect("passive attachment preserves startup epoch");
-    assert_eq!(epoch.members().len(), 1);
-    assert_eq!(epoch.members()[0].key, candidate);
-    assert_eq!(epoch.members()[0].owner_sent_bytes, startup_credit as u64);
+    assert_eq!(epoch.admitted_keys(), &[candidate]);
     assert_eq!(
-        binding
-            .commit_subflow_owner_admission_for_planner_generation(
-                stale_generation,
-                stale_lane_generation,
-                service,
-                startup_credit,
-                0,
-                Duration::ZERO,
-                input,
-            )
-            .decision,
-        PathAdmissionDecision::Standby,
+        epoch.startup_owner_sent_bytes(candidate),
+        Some(startup_credit as u64)
+    );
+    assert_eq!(
+        binding.commit_subflow_owner_admission_for_planner_generation(
+            stale_generation,
+            stale_lane_generation,
+            service,
+            startup_credit,
+            input,
+        ),
+        PathAdmission::Standby,
         "a plan made before passive growth must not commit afterward"
     );
     assert_eq!(
-        binding
-            .commit_subflow_owner_admission(
-                service,
-                startup_credit,
-                0,
-                Duration::ZERO,
-                SubflowAdmissionInput {
-                    owner_bytes: 1,
-                    ..input
-                },
-            )
-            .decision,
-        PathAdmissionDecision::ProbeOnly,
+        binding.commit_subflow_owner_admission(
+            service,
+            startup_credit,
+            SubflowAdmissionInput {
+                owner_bytes: 1,
+                ..input
+            },
+        ),
+        PathAdmission::ProbeOnly,
         "passive growth must not refill the selected candidate's startup credit"
     );
     assert_eq!(
-        binding
-            .commit_subflow_owner_admission(
-                service,
-                startup_credit,
-                0,
-                Duration::ZERO,
-                SubflowAdmissionInput {
-                    key: added,
-                    owner_bytes: 1,
-                    ..input
-                },
-            )
-            .decision,
-        PathAdmissionDecision::ProbeOnly,
+        binding.commit_subflow_owner_admission(
+            service,
+            startup_credit,
+            SubflowAdmissionInput {
+                key: added,
+                owner_bytes: 1,
+                ..input
+            },
+        ),
+        PathAdmission::ProbeOnly,
         "passive growth must not transfer startup ownership to the new output"
     );
 }
@@ -566,10 +511,8 @@ fn passive_attach_after_reservation_preserves_unemitted_credit_rollback() {
             candidate_commands,
             FlowLane::Throughput,
             StreamOpenRole::Validation,
-            reliable_relay_buffer_len(MuxLimits::default()),
         );
         let quantum = reliable_bulk_carrier_feed_quantum_bytes(MuxLimits::default());
-        let optional_bytes = 1024;
         let input = SubflowAdmissionInput {
             key: candidate,
             bulk_rate_proven: false,
@@ -577,9 +520,7 @@ fn passive_attach_after_reservation_preserves_unemitted_credit_rollback() {
             frontier_clear: true,
             completion_improves: false,
             observed_goodput_non_degrading: true,
-            read_gap: Duration::ZERO,
             owner_bytes: quantum,
-            optional_overhead_bytes: optional_bytes,
         };
         let (planner_generation, _) = binding.subflow_state_snapshot();
         let reservation = binding.reserve_subflow_owner_admission_for_planner_generation(
@@ -587,14 +528,9 @@ fn passive_attach_after_reservation_preserves_unemitted_credit_rollback() {
             binding.lane_generation(),
             service,
             quantum,
-            optional_bytes,
-            Duration::ZERO,
             input,
         );
-        assert_eq!(
-            reservation.admission.decision,
-            PathAdmissionDecision::AdmitSubflow
-        );
+        assert_eq!(reservation.admission, PathAdmission::Subflow);
         let epoch_generation = reservation
             .epoch_generation
             .expect("admitted Subflow reservation has an epoch token");
@@ -611,23 +547,14 @@ fn passive_attach_after_reservation_preserves_unemitted_credit_rollback() {
                 passive_commands,
                 FlowLane::Throughput,
                 passive_role,
-                reliable_relay_buffer_len(MuxLimits::default()),
             ),
             ResponseStreamAttachOutcome::Attached
         );
         binding.rollback_subflow_owner_admission_for_epoch(epoch_generation, input);
 
         assert_eq!(
-            binding
-                .commit_subflow_owner_admission(
-                    service,
-                    quantum,
-                    optional_bytes,
-                    Duration::ZERO,
-                    input,
-                )
-                .decision,
-            PathAdmissionDecision::AdmitSubflow,
+            binding.commit_subflow_owner_admission(service, quantum, input,),
+            PathAdmission::Subflow,
             "{passive_role:?} planner invalidation must not block refund of unemitted bytes"
         );
     }
@@ -648,9 +575,7 @@ fn full_reset_rejects_stale_epoch_rollback() {
         frontier_clear: true,
         completion_improves: false,
         observed_goodput_non_degrading: true,
-        read_gap: Duration::ZERO,
         owner_bytes: quantum,
-        optional_overhead_bytes: 0,
     };
     let (planner_generation, _) = binding.subflow_state_snapshot();
     let reservation = binding.reserve_subflow_owner_admission_for_planner_generation(
@@ -658,8 +583,6 @@ fn full_reset_rejects_stale_epoch_rollback() {
         binding.lane_generation(),
         service,
         quantum,
-        0,
-        Duration::ZERO,
         input,
     );
     let stale_epoch_generation = reservation
@@ -668,33 +591,27 @@ fn full_reset_rejects_stale_epoch_rollback() {
 
     binding.reset_subflow_set();
     assert_eq!(
-        binding
-            .commit_subflow_owner_admission(service, quantum, 0, Duration::ZERO, input,)
-            .decision,
-        PathAdmissionDecision::AdmitSubflow
+        binding.commit_subflow_owner_admission(service, quantum, input,),
+        PathAdmission::Subflow
     );
     binding.rollback_subflow_owner_admission_for_epoch(stale_epoch_generation, input);
 
     assert_eq!(
-        binding
-            .preview_subflow_owner_admission(
-                service,
-                quantum,
-                0,
-                Duration::ZERO,
-                SubflowAdmissionInput {
-                    owner_bytes: 1,
-                    ..input
-                },
-            )
-            .decision,
-        PathAdmissionDecision::ProbeOnly,
+        binding.preview_subflow_owner_admission(
+            service,
+            quantum,
+            SubflowAdmissionInput {
+                owner_bytes: 1,
+                ..input
+            },
+        ),
+        PathAdmission::ProbeOnly,
         "a stale refund must not debit a replacement epoch"
     );
 }
 
 #[test]
-fn every_envelope_change_replaces_epoch_and_invalidates_competing_plans() {
+fn service_or_credit_change_replaces_epoch_and_invalidates_competing_plans() {
     let base_service = CarrierPathKey {
         underlay: UnderlayProtocol::Tcp,
         path_id: PathId(0),
@@ -709,21 +626,9 @@ fn every_envelope_change_replaces_epoch_and_invalidates_competing_plans() {
     };
     let quantum = reliable_bulk_carrier_feed_quantum_bytes(MuxLimits::default());
     let base_credit = quantum * 2;
-    let base_overhead = 1024;
-    let base_gap = Duration::from_millis(10);
-    let variants = [
-        (changed_service, base_credit, base_overhead, base_gap),
-        (base_service, quantum, base_overhead, base_gap),
-        (base_service, base_credit, base_overhead * 2, base_gap),
-        (
-            base_service,
-            base_credit,
-            base_overhead,
-            Duration::from_millis(20),
-        ),
-    ];
+    let variants = [(changed_service, base_credit), (base_service, quantum)];
 
-    for (service, credit, overhead, max_gap) in variants {
+    for (service, credit) in variants {
         let (binding, _) = binding_for_underlay(UnderlayProtocol::Tcp);
         let input = SubflowAdmissionInput {
             key: candidate,
@@ -732,9 +637,7 @@ fn every_envelope_change_replaces_epoch_and_invalidates_competing_plans() {
             frontier_clear: true,
             completion_improves: false,
             observed_goodput_non_degrading: true,
-            read_gap: Duration::ZERO,
             owner_bytes: quantum,
-            optional_overhead_bytes: 0,
         };
         let (initial_planner_generation, _) = binding.subflow_state_snapshot();
         let initial = binding.reserve_subflow_owner_admission_for_planner_generation(
@@ -742,8 +645,6 @@ fn every_envelope_change_replaces_epoch_and_invalidates_competing_plans() {
             binding.lane_generation(),
             base_service,
             base_credit,
-            base_overhead,
-            base_gap,
             input,
         );
         let stale_epoch_generation = initial
@@ -756,34 +657,25 @@ fn every_envelope_change_replaces_epoch_and_invalidates_competing_plans() {
             binding.lane_generation(),
             service,
             credit,
-            overhead,
-            max_gap,
             input,
         );
-        assert_eq!(
-            replacement.admission.decision,
-            PathAdmissionDecision::AdmitSubflow
-        );
+        assert_eq!(replacement.admission, PathAdmission::Subflow);
         assert_ne!(
             replacement.epoch_generation,
             Some(stale_epoch_generation),
-            "each envelope field owns a new epoch identity"
+            "service and startup credit each own a new epoch identity"
         );
         let (current_planner_generation, _) = binding.subflow_state_snapshot();
         assert_ne!(current_planner_generation, stale_planner_generation);
         assert_eq!(
-            binding
-                .commit_subflow_owner_admission_for_planner_generation(
-                    stale_planner_generation,
-                    binding.lane_generation(),
-                    service,
-                    credit,
-                    overhead,
-                    max_gap,
-                    input,
-                )
-                .decision,
-            PathAdmissionDecision::Standby,
+            binding.commit_subflow_owner_admission_for_planner_generation(
+                stale_planner_generation,
+                binding.lane_generation(),
+                service,
+                credit,
+                input,
+            ),
+            PathAdmission::Standby,
             "a competing plan for the replaced envelope must be stale"
         );
 
@@ -791,8 +683,11 @@ fn every_envelope_change_replaces_epoch_and_invalidates_competing_plans() {
         let epoch = binding
             .subflow_set_snapshot()
             .expect("replacement epoch remains present");
-        assert_eq!(epoch.members().len(), 1);
-        assert_eq!(epoch.members()[0].owner_sent_bytes, quantum as u64);
+        assert_eq!(epoch.admitted_keys().len(), 1);
+        assert_eq!(
+            epoch.startup_owner_sent_bytes(input.key),
+            Some(quantum as u64)
+        );
     }
 }
 
@@ -826,27 +721,21 @@ fn stale_subflow_commit_is_rejected_after_reset_or_realtime_pressure() {
         frontier_clear: true,
         completion_improves: false,
         observed_goodput_non_degrading: true,
-        read_gap: Duration::ZERO,
         owner_bytes: payload_bytes,
-        optional_overhead_bytes: 0,
     };
 
     let (stale_generation, _) = binding.subflow_state_snapshot();
     let stale_lane_generation = binding.lane_generation();
     binding.reset_subflow_set();
     assert_eq!(
-        binding
-            .commit_subflow_owner_admission_for_planner_generation(
-                stale_generation,
-                stale_lane_generation,
-                service,
-                payload_bytes * 4,
-                0,
-                Duration::ZERO,
-                input,
-            )
-            .decision,
-        PathAdmissionDecision::Standby,
+        binding.commit_subflow_owner_admission_for_planner_generation(
+            stale_generation,
+            stale_lane_generation,
+            service,
+            payload_bytes * 4,
+            input,
+        ),
+        PathAdmission::Standby,
         "a reset must invalidate an already-planned startup commit"
     );
 
@@ -860,18 +749,14 @@ fn stale_subflow_commit_is_rejected_after_reset_or_realtime_pressure() {
         1
     );
     assert_eq!(
-        binding
-            .commit_subflow_owner_admission_for_planner_generation(
-                current_generation,
-                pre_pressure_lane_generation,
-                service,
-                payload_bytes * 4,
-                0,
-                Duration::ZERO,
-                input,
-            )
-            .decision,
-        PathAdmissionDecision::Standby,
+        binding.commit_subflow_owner_admission_for_planner_generation(
+            current_generation,
+            pre_pressure_lane_generation,
+            service,
+            payload_bytes * 4,
+            input,
+        ),
+        PathAdmission::Standby,
         "new realtime pressure must invalidate an already-planned startup commit"
     );
     drop(realtime);
@@ -929,8 +814,6 @@ fn startup_commit_rechecks_response_flow_generation() {
         multi_flow_generation,
         service,
         payload_bytes * 4,
-        0,
-        Duration::ZERO,
         SubflowAdmissionInput {
             key: candidate,
             bulk_rate_proven: false,
@@ -938,14 +821,12 @@ fn startup_commit_rechecks_response_flow_generation() {
             frontier_clear: true,
             completion_improves: false,
             observed_goodput_non_degrading: true,
-            read_gap: Duration::ZERO,
             owner_bytes: payload_bytes,
-            optional_overhead_bytes: 0,
         },
     );
     assert_eq!(
-        admission.decision,
-        PathAdmissionDecision::Standby,
+        admission,
+        PathAdmission::Standby,
         "response-flow churn must invalidate a planned startup sample before commit"
     );
 }
@@ -987,28 +868,22 @@ fn unrelated_session_churn_does_not_invalidate_subflow_commit() {
     assert_eq!(binding.lane_generation(), lane_generation);
     let payload_bytes = reliable_bulk_carrier_feed_quantum_bytes(MuxLimits::default());
     assert_eq!(
-        binding
-            .commit_subflow_owner_admission_for_planner_generation(
-                planner_generation,
-                lane_generation,
-                service,
-                payload_bytes * 4,
-                0,
-                Duration::ZERO,
-                SubflowAdmissionInput {
-                    key: candidate,
-                    bulk_rate_proven: false,
-                    startup_owner_allowed: true,
-                    frontier_clear: true,
-                    completion_improves: false,
-                    observed_goodput_non_degrading: true,
-                    read_gap: Duration::ZERO,
-                    owner_bytes: payload_bytes,
-                    optional_overhead_bytes: 0,
-                },
-            )
-            .decision,
-        PathAdmissionDecision::AdmitSubflow,
+        binding.commit_subflow_owner_admission_for_planner_generation(
+            planner_generation,
+            lane_generation,
+            service,
+            payload_bytes * 4,
+            SubflowAdmissionInput {
+                key: candidate,
+                bulk_rate_proven: false,
+                startup_owner_allowed: true,
+                frontier_clear: true,
+                completion_improves: false,
+                observed_goodput_non_degrading: true,
+                owner_bytes: payload_bytes,
+            },
+        ),
+        PathAdmission::Subflow,
         "lane and realtime churn in another session must not reject this session's commit"
     );
     drop(realtime);

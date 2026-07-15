@@ -18,7 +18,7 @@ use crate::model::capacity::{reliable_bulk_carrier_feed_quantum_bytes, reliable_
 use crate::model::timing::transport_pto_from_snapshot;
 use crate::mux::MuxLimits;
 use crate::mux::stream::{ReliableRecvStream, ReliableSendStream};
-use crate::protocol::frame::{normalized_offset_ranges, stream_ack_contiguous_frontier};
+use crate::protocol::frame::{normalize_offset_ranges, stream_ack_contiguous_frontier};
 use crate::protocol::{Frame, OffsetRange, UnderlayProtocol};
 use crate::runtime::error::RuntimeError;
 use crate::scheduler::{FlowLane, PathSnapshot};
@@ -77,12 +77,12 @@ pub(in crate::runtime) fn update_repair_authoritative_ack_snapshot(
         return;
     }
     let mut merged = if *stored_complete {
-        stored_ranges.clone()
+        std::mem::take(stored_ranges)
     } else {
         Vec::new()
     };
     merged.extend_from_slice(ranges);
-    merged = normalized_offset_ranges(&merged);
+    merged = normalize_offset_ranges(merged);
     *stored_frontier = (*stored_frontier).max(stream_ack_contiguous_frontier(&merged));
     *stored_ranges = merged;
     *stored_complete = true;
@@ -139,7 +139,7 @@ pub(in crate::runtime) fn stream_ack_gap_repair_frames_normalized(
     }
 }
 
-pub(in crate::runtime) fn stream_final_offset_tail_repair_frames(
+pub(in crate::runtime) fn stream_final_offset_tail_repair_frames_normalized(
     send_stream: &ReliableSendStream,
     ranges: &[OffsetRange],
     byte_limit: usize,
@@ -162,7 +162,7 @@ pub(in crate::runtime) fn stream_final_offset_tail_repair_frames(
     if largest_ack_end >= next_offset {
         return Vec::new();
     }
-    send_stream.retransmission_frames_after_ack_frontier(ranges, byte_limit)
+    send_stream.retransmission_frames_after_normalized_ack_frontier(ranges, byte_limit)
 }
 
 #[derive(Debug, Default)]

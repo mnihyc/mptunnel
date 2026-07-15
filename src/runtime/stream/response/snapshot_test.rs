@@ -15,7 +15,7 @@ use crate::model::admission::{
 use crate::model::capacity::{
     PATH_OPEN_SCORE_BYTES, RELIABLE_INITIAL_WINDOW_PACKETS,
     RELIABLE_STREAM_STARTUP_PRODUCT_WINDOW_BYTES, reliable_bulk_carrier_feed_quantum_bytes,
-    reliable_relay_buffer_len, reliable_subflow_startup_sample_limit_bytes,
+    reliable_subflow_startup_sample_limit_bytes,
 };
 use crate::model::path::CarrierPathKey;
 use crate::mux::MuxLimits;
@@ -27,12 +27,11 @@ use crate::runtime::path::model::{default_path_rate_bps, default_path_srtt_ms, m
 use crate::scheduler::{FlowLane, PathSnapshot};
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
-use std::time::Instant;
 
 #[test]
 fn tcp_response_snapshot_persistent_delivery_samples_override_default_prior() {
     let (commands, _receivers) = reliable_path_command_channels(8);
-    let prior_rate = default_path_rate_bps(UnderlayProtocol::Tcp);
+    let prior_rate = default_path_rate_bps();
     let entry = ResponseStreamOutputEntry {
         key: CarrierPathKey {
             underlay: UnderlayProtocol::Tcp,
@@ -44,13 +43,12 @@ fn tcp_response_snapshot_persistent_delivery_samples_override_default_prior() {
         role: StreamOpenRole::Active,
         owner_data_in_flight_bytes: 0,
         bytes_in_flight: 0,
-        product_queue_bytes: 0,
         product_progress_rate_bps: Some(prior_rate / 10.0),
         delivery_rate_bps: Some(prior_rate / 10.0),
         tcp_ack_clock_rate_bps: None,
         tcp_product_rate_evidence: None,
         tcp_capacity_prior: None,
-        srtt_ms: Some(default_path_srtt_ms(UnderlayProtocol::Tcp)),
+        srtt_ms: Some(default_path_srtt_ms()),
         delivery_samples: RELIABLE_INITIAL_WINDOW_PACKETS as u32,
         owner_data_acked_bytes: reliable_subflow_startup_sample_limit_bytes(MuxLimits::default()),
         local_path_metrics: None,
@@ -60,11 +58,11 @@ fn tcp_response_snapshot_persistent_delivery_samples_override_default_prior() {
     let lane_tracker = ServerPathLaneTracker::default();
     let snapshot = server_bulk_output_snapshot(
         &entry,
+        0,
         SessionId(77),
         FlowLane::Throughput,
         &lane_tracker,
         MuxLimits::default(),
-        Instant::now(),
     );
 
     assert_eq!(snapshot.delivery_rate_bps, prior_rate / 10.0);
@@ -136,6 +134,46 @@ fn response_subflow_eta_uses_owner_quantum_not_service_horizon() {
 }
 
 #[test]
+fn response_queue_pressure_is_shared_by_every_carrier_snapshot() {
+    let service = CarrierPathKey {
+        underlay: UnderlayProtocol::Tcp,
+        path_id: PathId(0),
+    };
+    let (service_commands, _service_receivers) = reliable_path_command_channels(8);
+    let binding = ResponseStreamBinding::new(
+        SessionId(42),
+        service.underlay,
+        service.path_id,
+        service_commands,
+        FlowLane::Throughput,
+    );
+    let product_queue_bytes = 48 * 1024;
+    binding.set_sender_queue_bytes(product_queue_bytes);
+
+    let alternate = CarrierPathKey {
+        underlay: UnderlayProtocol::Udp,
+        path_id: PathId(1),
+    };
+    let (alternate_commands, _alternate_receivers) = reliable_path_command_channels(8);
+    assert_eq!(
+        binding.attach(
+            alternate.underlay,
+            alternate.path_id,
+            alternate_commands,
+            FlowLane::Throughput,
+            StreamOpenRole::Validation,
+        ),
+        ResponseStreamAttachOutcome::Attached,
+    );
+
+    let targets = binding.sender_path_targets(FlowLane::Throughput, PATH_OPEN_SCORE_BYTES);
+    assert_eq!(targets.len(), 2);
+    assert!(targets.iter().all(|target| {
+        target.observation.snapshot.product_queue_bytes == product_queue_bytes as u64
+    }));
+}
+
+#[test]
 fn independent_source_staging_requires_live_mixed_owner_underlays() {
     let (active_commands, active_receivers) = reliable_path_command_channels(8);
     let binding = ResponseStreamBinding::new(
@@ -188,7 +226,6 @@ fn independent_source_staging_requires_live_mixed_owner_underlays() {
                 commands,
                 FlowLane::Throughput,
                 role,
-                reliable_relay_buffer_len(MuxLimits::default()),
             ),
             ResponseStreamAttachOutcome::Attached,
         );
@@ -244,7 +281,6 @@ fn response_relay_read_snapshot_keeps_source_evidence_on_the_ordered_service() {
             alternate_commands,
             FlowLane::Throughput,
             StreamOpenRole::Validation,
-            reliable_relay_buffer_len(MuxLimits::default()),
         ),
         ResponseStreamAttachOutcome::Attached,
     );
@@ -277,7 +313,6 @@ fn response_relay_read_snapshot_keeps_source_evidence_on_the_ordered_service() {
             direction: PathMetricDirection::ServerToClient,
             metric_epoch: metric_epoch_now(),
             metric_age_us: 0,
-            min_rtt_us: 5_000,
             srtt_us: 5_000,
             rttvar_us: 500,
             jitter_us: 500,
@@ -477,7 +512,6 @@ fn udp_app_limited_carrier_progress_feeds_only_the_current_service() {
             alternate_commands,
             FlowLane::Throughput,
             StreamOpenRole::Validation,
-            reliable_relay_buffer_len(mux_limits),
         ),
         ResponseStreamAttachOutcome::Attached
     );

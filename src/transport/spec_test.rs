@@ -2,7 +2,7 @@ use super::*;
 
 #[test]
 fn path_specs_parse_tcp_and_udp() {
-    let tcp = "tcp://example.com:443?source-ip=192.0.2.10&srtt-ms=20&rate-mbps=30&low-latency=true"
+    let tcp = "tcp://example.com:443?source-ip=192.0.2.10&srtt-ms=20&rate-mbps=30&no-bulk=true"
         .parse::<PathSpec>()
         .expect("tcp");
     let udp = "udp://[2001:db8::1]:8443?jitter-ms=5&rate-bps=100000000&mtu=1400"
@@ -21,7 +21,7 @@ fn path_specs_parse_tcp_and_udp() {
         tcp.metadata.initial_rate,
         RateHint::BitsPerSecond(30_000_000)
     );
-    assert!(tcp.metadata.capabilities.low_latency);
+    assert!(!tcp.metadata.policy.bulk_allowed);
     assert_eq!(udp.underlay, UnderlayProtocol::Udp);
     assert_eq!(udp.endpoint.host, "2001:db8::1");
     assert_eq!(udp.endpoint.port, 8443);
@@ -31,7 +31,7 @@ fn path_specs_parse_tcp_and_udp() {
         udp.metadata.initial_rate,
         RateHint::BitsPerSecond(100_000_000)
     );
-    assert_eq!(udp.metadata.initial_mtu_payload_bytes, Some(1400));
+    assert_eq!(udp.metadata.max_datagram_payload_bytes, Some(1400));
 }
 
 #[test]

@@ -1,5 +1,10 @@
+//! Canonical product-wire values.
+//!
+//! These types describe interoperable facts, not runtime handles, transport
+//! congestion state, or endpoint-local configuration.
+
 use bytes::Bytes;
-use std::net::{IpAddr, SocketAddr};
+use std::net::SocketAddr;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct SessionId(pub u64);
@@ -15,9 +20,6 @@ pub struct DatagramFlowId(pub u64);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct DatagramId(pub u64);
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
-pub struct PacketNumber(pub u64);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct AuthNonce(pub [u8; 16]);
@@ -35,14 +37,6 @@ pub enum UnderlayProtocol {
 pub enum PathMetricDirection {
     ClientToServer,
     ServerToClient,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum IngressKind {
-    Socks5,
-    HttpConnect,
-    TunTcp,
-    TunUdp,
 }
 
 /// Control-plane attachment role; product Service/Subflow ownership is chosen
@@ -76,142 +70,24 @@ impl TargetAddr {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum OutboundPolicy {
-    Direct,
-    BindSourceIp(IpAddr),
-    Socks5 { proxy: SocketAddr },
-    HttpConnect { proxy: SocketAddr },
-}
-
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct StreamFlags {
-    pub fin: bool,
-    pub early_data: bool,
-}
-
-impl StreamFlags {
-    pub const NONE: Self = Self {
-        fin: false,
-        early_data: false,
-    };
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct StreamDemandHint {
-    pub observed_bytes: u64,
-    pub repair_bytes: u64,
-    pub latency_weight_ppm: u32,
-    pub throughput_weight_ppm: u32,
-    pub realtime_weight_ppm: u32,
+pub enum StreamDemandHint {
+    Latency,
+    Throughput,
+    Realtime,
 }
 
 impl StreamDemandHint {
-    pub const PPM_MAX: u32 = 1_000_000;
-
     pub const fn latency() -> Self {
-        Self {
-            observed_bytes: 0,
-            repair_bytes: 0,
-            latency_weight_ppm: Self::PPM_MAX,
-            throughput_weight_ppm: 0,
-            realtime_weight_ppm: 0,
-        }
+        Self::Latency
     }
 
     pub const fn throughput() -> Self {
-        Self {
-            observed_bytes: 0,
-            repair_bytes: 0,
-            latency_weight_ppm: 0,
-            throughput_weight_ppm: Self::PPM_MAX,
-            realtime_weight_ppm: 0,
-        }
+        Self::Throughput
     }
 
     pub const fn realtime() -> Self {
-        Self {
-            observed_bytes: 0,
-            repair_bytes: 0,
-            latency_weight_ppm: 0,
-            throughput_weight_ppm: 0,
-            realtime_weight_ppm: Self::PPM_MAX,
-        }
-    }
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct PathCapabilities {
-    pub backup: bool,
-    pub expensive: bool,
-    pub low_latency: bool,
-    pub bulk_allowed: bool,
-    pub probe_only: bool,
-    pub no_udp: bool,
-}
-
-impl Default for PathCapabilities {
-    fn default() -> Self {
-        Self {
-            backup: false,
-            expensive: false,
-            low_latency: false,
-            bulk_allowed: true,
-            probe_only: false,
-            no_udp: false,
-        }
-    }
-}
-
-impl PathCapabilities {
-    const BACKUP: u16 = 0x0001;
-    const EXPENSIVE: u16 = 0x0002;
-    const LOW_LATENCY: u16 = 0x0004;
-    const BULK_ALLOWED: u16 = 0x0008;
-    const PROBE_ONLY: u16 = 0x0010;
-    const NO_UDP: u16 = 0x0020;
-    const KNOWN_MASK: u16 = Self::BACKUP
-        | Self::EXPENSIVE
-        | Self::LOW_LATENCY
-        | Self::BULK_ALLOWED
-        | Self::PROBE_ONLY
-        | Self::NO_UDP;
-
-    pub fn to_bits(self) -> u16 {
-        let mut bits = 0u16;
-        if self.backup {
-            bits |= Self::BACKUP;
-        }
-        if self.expensive {
-            bits |= Self::EXPENSIVE;
-        }
-        if self.low_latency {
-            bits |= Self::LOW_LATENCY;
-        }
-        if self.bulk_allowed {
-            bits |= Self::BULK_ALLOWED;
-        }
-        if self.probe_only {
-            bits |= Self::PROBE_ONLY;
-        }
-        if self.no_udp {
-            bits |= Self::NO_UDP;
-        }
-        bits
-    }
-
-    pub fn from_bits(bits: u16) -> Option<Self> {
-        if bits & !Self::KNOWN_MASK != 0 {
-            return None;
-        }
-        Some(Self {
-            backup: bits & Self::BACKUP != 0,
-            expensive: bits & Self::EXPENSIVE != 0,
-            low_latency: bits & Self::LOW_LATENCY != 0,
-            bulk_allowed: bits & Self::BULK_ALLOWED != 0,
-            probe_only: bits & Self::PROBE_ONLY != 0,
-            no_udp: bits & Self::NO_UDP != 0,
-        })
+        Self::Realtime
     }
 }
 
@@ -230,7 +106,6 @@ pub struct PathMetrics {
     pub direction: PathMetricDirection,
     pub metric_epoch: u64,
     pub metric_age_us: u32,
-    pub min_rtt_us: u32,
     pub srtt_us: u32,
     pub rttvar_us: u32,
     pub jitter_us: u32,
@@ -249,13 +124,6 @@ pub struct PathMetrics {
     pub has_ack_derived_data_sample: bool,
     pub data_sample_count: u32,
     pub data_sample_bytes: u64,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum RateHint {
-    Unknown,
-    Unlimited,
-    BitsPerSecond(u64),
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -299,7 +167,6 @@ pub enum Frame {
         underlay: UnderlayProtocol,
         nonce: AuthNonce,
         issued_at_unix_secs: u64,
-        capabilities: PathCapabilities,
         auth_tag: AuthTag,
     },
     PathJoinOk {
@@ -307,18 +174,9 @@ pub enum Frame {
         nonce: AuthNonce,
         auth_tag: AuthTag,
     },
-    PathChallenge {
-        path_id: PathId,
-        nonce: u64,
-    },
-    PathResponse {
-        path_id: PathId,
-        nonce: u64,
-    },
     PathStatus {
         path_id: PathId,
         status: PathStatus,
-        capabilities: PathCapabilities,
     },
     PathDrain {
         path_id: PathId,
@@ -326,16 +184,6 @@ pub enum Frame {
     PathClose {
         path_id: PathId,
         reason: CloseReason,
-    },
-    PathMtuProbe {
-        path_id: PathId,
-        probe_id: u64,
-        payload: Bytes,
-    },
-    PathMtuAck {
-        path_id: PathId,
-        probe_id: u64,
-        payload_bytes: u32,
     },
     PathProofData {
         path_id: PathId,
@@ -367,15 +215,12 @@ pub enum Frame {
     OpenStream {
         stream_id: StreamId,
         target: TargetAddr,
-        ingress: IngressKind,
-        outbound: OutboundPolicy,
         demand: StreamDemandHint,
         role: StreamOpenRole,
     },
     StreamData {
         stream_id: StreamId,
         offset: u64,
-        flags: StreamFlags,
         payload: Bytes,
     },
     StreamAck {
@@ -401,8 +246,6 @@ pub enum Frame {
     OpenDatagramFlow {
         flow_id: DatagramFlowId,
         target: TargetAddr,
-        ingress: IngressKind,
-        outbound: OutboundPolicy,
     },
     DatagramData {
         flow_id: DatagramFlowId,
@@ -419,13 +262,6 @@ pub enum Frame {
     },
     PathMetrics {
         metrics: PathMetrics,
-    },
-    RxRateHint {
-        path_id: PathId,
-        hint: RateHint,
-    },
-    MaxConnectionData {
-        max_bytes: u64,
     },
     Ping {
         nonce: u64,
@@ -475,13 +311,9 @@ impl Frame {
             Self::SessionClose { .. } => "SESSION_CLOSE",
             Self::PathJoin { .. } => "PATH_JOIN",
             Self::PathJoinOk { .. } => "PATH_JOIN_OK",
-            Self::PathChallenge { .. } => "PATH_CHALLENGE",
-            Self::PathResponse { .. } => "PATH_RESPONSE",
             Self::PathStatus { .. } => "PATH_STATUS",
             Self::PathDrain { .. } => "PATH_DRAIN",
             Self::PathClose { .. } => "PATH_CLOSE",
-            Self::PathMtuProbe { .. } => "PATH_MTU_PROBE",
-            Self::PathMtuAck { .. } => "PATH_MTU_ACK",
             Self::PathProofData { .. } => "PATH_PROOF_DATA",
             Self::PathProofAck { .. } => "PATH_PROOF_ACK",
             Self::PathCapacityData { .. } => "PATH_CAPACITY_DATA",
@@ -499,8 +331,6 @@ impl Frame {
             Self::DatagramClose { .. } => "DGRAM_CLOSE",
             Self::DatagramFeedback { .. } => "DGRAM_FEEDBACK",
             Self::PathMetrics { .. } => "PATH_METRICS",
-            Self::RxRateHint { .. } => "RX_RATE_HINT",
-            Self::MaxConnectionData { .. } => "MAX_CONNECTION_DATA",
             Self::Ping { .. } => "PING",
             Self::Pong { .. } => "PONG",
         }

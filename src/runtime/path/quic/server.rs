@@ -11,7 +11,7 @@ use super::io::{
 };
 use super::metrics::run_server_quic_path_metrics;
 use super::server_stream::{ServerUdpReliableStreamContext, handle_server_udp_reliable_stream};
-use crate::protocol::{Frame, PathCapabilities, PathId, SessionId, UnderlayProtocol};
+use crate::protocol::{Frame, PathId, SessionId, UnderlayProtocol};
 use crate::runtime::error::RuntimeError;
 use crate::runtime::path::ServerCarrierPathRegistration;
 use crate::runtime::path::authentication::ServerPathAuthentication;
@@ -60,8 +60,7 @@ async fn handle_server_udp_connection(
     connection: UdpPathConnection,
     context: ServerPathContext,
 ) -> Result<(), RuntimeError> {
-    let (session_id, path_id, capabilities) =
-        accept_server_udp_path_handshake(&connection, &context).await?;
+    let (session_id, path_id) = accept_server_udp_path_handshake(&connection, &context).await?;
     let path_registration =
         context
             .reliable_streams
@@ -86,7 +85,6 @@ async fn handle_server_udp_connection(
                         session_id,
                         path_id,
                         path_registration,
-                        capabilities,
                     )
                     .await
                     {
@@ -109,7 +107,7 @@ async fn handle_server_udp_connection(
 async fn accept_server_udp_path_handshake(
     connection: &UdpPathConnection,
     context: &ServerPathContext,
-) -> Result<(SessionId, PathId, PathCapabilities), RuntimeError> {
+) -> Result<(SessionId, PathId), RuntimeError> {
     let (mut send, mut recv) = connection.accept_bi().await?;
     let authentication = ServerPathAuthentication::from_session_hello(
         &context.security,
@@ -137,21 +135,18 @@ async fn accept_server_udp_path_handshake(
     }
     let session_id = path_join.session_id;
     let path_id = path_join.path_id;
-    let capabilities = path_join.capabilities;
-
     udp_path_write_frame(&mut send, &Frame::SessionReady, context.codec_limits).await?;
     udp_path_write_frame(
         &mut send,
         &Frame::PathStatus {
             path_id,
             status: crate::protocol::PathStatus::Active,
-            capabilities,
         },
         context.codec_limits,
     )
     .await?;
     udp_path_finish_stream(&mut send)?;
-    Ok((session_id, path_id, capabilities))
+    Ok((session_id, path_id))
 }
 
 async fn handle_server_udp_bidi_stream(
@@ -161,7 +156,6 @@ async fn handle_server_udp_bidi_stream(
     session_id: SessionId,
     path_id: PathId,
     path_registration: ServerCarrierPathRegistration,
-    capabilities: PathCapabilities,
 ) -> Result<(), RuntimeError> {
     match udp_path_read_frame(&mut recv, context.codec_limits).await? {
         Frame::OpenStream {
@@ -180,7 +174,6 @@ async fn handle_server_udp_bidi_stream(
                     session_id,
                     path_id,
                     path_registration,
-                    capabilities,
                     stream_id,
                     target,
                     lane,

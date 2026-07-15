@@ -15,7 +15,6 @@ fn receipt_test_metrics(path_id: PathId) -> PathMetrics {
         direction: PathMetricDirection::ServerToClient,
         metric_epoch: metric_epoch_now(),
         metric_age_us: 0,
-        min_rtt_us: 20_000,
         srtt_us: 20_000,
         rttvar_us: 1_000,
         jitter_us: 0,

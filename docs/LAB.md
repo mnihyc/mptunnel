@@ -428,7 +428,7 @@ Useful environment variables:
 - `MPTUNNEL_LAB_LOG`: log level passed to lab-launched mptunnel processes, default `info`.
 - `PATH_PROBE_INTERVAL_MS`: optional diagnostic override for the mptunnel client path-probe interval. Unset by default so product launches use built-in defaults.
 - `PATH_PROBE_TIMEOUT_MS`: optional diagnostic override for the mptunnel client path-probe timeout. Unset by default so product launches use built-in defaults.
-- `MPTUNNEL_LAB_USE_PATH_HINTS=1`: optional diagnostic override that adds RTT/rate/capability query hints to path URIs. Unset by default so product launches use endpoint paths only.
+- `MPTUNNEL_LAB_USE_PATH_HINTS=1`: optional diagnostic override that adds RTT/rate hints and endpoint-local policy to path URIs. Unset by default so product launches use endpoint paths only.
 - `MPTUNNEL_LAB_LOWLAT_RATE`, `MPTUNNEL_LAB_LOWLAT_DELAY`, `MPTUNNEL_LAB_LOWLAT_JITTER`, `MPTUNNEL_LAB_LOWLAT_LOSS`: low-latency path netem values. The default loss is `1.00%`.
 - `MPTUNNEL_LAB_BALANCED_RATE`, `MPTUNNEL_LAB_BALANCED_DELAY`, `MPTUNNEL_LAB_BALANCED_JITTER`, `MPTUNNEL_LAB_BALANCED_LOSS`: balanced daily-use path netem values. The default loss is `1.00%`.
 - `MPTUNNEL_LAB_MILDLOSS_RATE`, `MPTUNNEL_LAB_MILDLOSS_DELAY`, `MPTUNNEL_LAB_MILDLOSS_JITTER`, `MPTUNNEL_LAB_MILDLOSS_LOSS`: lower-loss companion path netem values. Defaults are half the balanced rate, twice the balanced delay, balanced jitter, and `0.10%` loss.

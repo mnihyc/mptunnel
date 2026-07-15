@@ -20,15 +20,15 @@ use crate::lab_diagnostics::{
     lab_diagnostic, lab_diagnostic_event_enabled, lab_perf_record, lab_sender_service_decision,
     lab_server_response_stream_data,
 };
-use crate::model::multipath::{ExtraTrafficKind, ExtraTrafficLedger};
+use crate::model::multipath::ExtraTrafficLedger;
 use crate::model::path::CarrierPathKey;
-use crate::model::work::{CarrierWorkKind, ReliableWorkClass};
+use crate::model::work::ReliableWorkClass;
 use crate::mux::MuxLimits;
 use crate::mux::stream::ReliableSendStream;
 #[cfg(feature = "lab-diagnostics")]
 use crate::protocol::frame::reliable_path_frame_pacing_bytes;
 use crate::protocol::frame::reliable_stream_frame_accounted_bytes;
-use crate::protocol::{Frame, OffsetRange, SessionId, StreamFlags, StreamId};
+use crate::protocol::{Frame, OffsetRange, SessionId, StreamId};
 use crate::runtime::RuntimeError;
 use crate::runtime::path::commands::reliable_path_effective_frame_lane;
 use crate::runtime::sender::{
@@ -285,7 +285,6 @@ impl ServerResponseSenderService {
         local_open: bool,
         queued_send_blocked: bool,
         send_stream: &ReliableSendStream,
-        mux_limits: MuxLimits,
         queue_limit: usize,
     ) -> bool {
         reliable_relay_can_read_product_source(
@@ -293,7 +292,6 @@ impl ServerResponseSenderService {
             queued_send_blocked,
             send_stream,
             &self.queue,
-            mux_limits,
             queue_limit,
         )
     }
@@ -301,17 +299,10 @@ impl ServerResponseSenderService {
     pub(in crate::runtime) fn read_budget(
         &self,
         send_stream: &ReliableSendStream,
-        mux_limits: MuxLimits,
         queue_limit: usize,
         buffer_len: usize,
     ) -> usize {
-        reliable_relay_sender_queue_read_budget(
-            send_stream,
-            &self.queue,
-            mux_limits,
-            queue_limit,
-            buffer_len,
-        )
+        reliable_relay_sender_queue_read_budget(send_stream, &self.queue, queue_limit, buffer_len)
     }
 
     pub(in crate::runtime) fn enqueue_data_for_lane(
@@ -337,7 +328,6 @@ impl ServerResponseSenderService {
         critical_priority: bool,
     ) -> Option<u64> {
         let payload_bytes = reliable_stream_frame_accounted_bytes(&frame);
-        debug_assert!(CarrierWorkKind::RepairData.counts_against_sender_extra_budget());
         let budget = self.extra_traffic.budget(
             sender_extra_traffic_startup_floor_bytes(mux_limits),
             self.performance,
@@ -345,8 +335,7 @@ impl ServerResponseSenderService {
         if !budget.can_spend(payload_bytes) {
             return None;
         }
-        self.extra_traffic
-            .record_optional(ExtraTrafficKind::Repair, payload_bytes);
+        self.extra_traffic.record_repair(payload_bytes);
         Some(if critical_priority {
             self.queue
                 .push_critical_repair_with_cause(frame, RelaySendCause::AckGapRepair)
@@ -379,9 +368,7 @@ impl ServerResponseSenderService {
     ) -> u64 {
         debug_assert!(cause.is_repair());
         let payload_bytes = reliable_stream_frame_accounted_bytes(&frame);
-        debug_assert!(CarrierWorkKind::RepairData.counts_against_sender_extra_budget());
-        self.extra_traffic
-            .record_optional(ExtraTrafficKind::Repair, payload_bytes);
+        self.extra_traffic.record_repair(payload_bytes);
         self.queue.push_critical_repair_with_cause(frame, cause)
     }
 
@@ -460,7 +447,7 @@ impl ServerResponseSenderService {
                 let dispatch_payload = payload.slice(..dispatch_payload_bytes);
                 #[cfg(feature = "lab-diagnostics")]
                 let mux_started = Instant::now();
-                let frame = send_stream.send_data(dispatch_payload, StreamFlags::NONE)?;
+                let frame = send_stream.send_data(dispatch_payload)?;
                 #[cfg(feature = "lab-diagnostics")]
                 lab_perf_record(
                     "mux.send_data",

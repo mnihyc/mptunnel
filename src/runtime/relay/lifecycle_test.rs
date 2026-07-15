@@ -1,6 +1,6 @@
 use super::*;
 use crate::config::{ResourceLimits, SecurityConfig, SharedSecret};
-use crate::protocol::{IngressKind, PathId, TargetAddr};
+use crate::protocol::{PathId, TargetAddr};
 use crate::runtime::path::commands::{ReliablePathCommandSender, reliable_path_command_channels};
 use crate::runtime::stream::{ReliablePathStream, ReliablePathStreamOutput};
 use std::collections::HashMap;
@@ -65,16 +65,12 @@ fn queued_sender_retry_blocks_even_when_carrier_has_capacity() {
     assert!(reliable_relay_queued_send_blocked_for_retry(
         false,
         Some(tokio::time::Instant::now()),
-        true,
     ));
     assert!(!reliable_relay_queued_send_blocked_for_retry(
         true,
         Some(tokio::time::Instant::now()),
-        true,
     ));
-    assert!(!reliable_relay_queued_send_blocked_for_retry(
-        false, None, false,
-    ));
+    assert!(!reliable_relay_queued_send_blocked_for_retry(false, None));
 }
 
 #[test]
@@ -411,7 +407,6 @@ async fn latency_lane_does_not_spawn_standby_validation_probe() {
     let send_stream = ReliableSendStream::new(StreamId(9), MuxLimits::default());
     let spec = ReliableRelayOpenSpec {
         target: TargetAddr::Ip(SocketAddr::from(([127, 0, 0, 1], 80))),
-        ingress: IngressKind::Socks5,
     };
     let (result_tx, _result_rx) = mpsc::channel(1);
     let mut pending = HashMap::<RelayPathKey, RelayValidationOpenTask>::new();

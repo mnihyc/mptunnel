@@ -34,7 +34,6 @@ pub(in crate::runtime) struct ClientPathHealthRecord {
     pub(in crate::runtime) measured_jitter_ms: Option<f64>,
     pub(in crate::runtime) measured_rate_bps: Option<f64>,
     pub(in crate::runtime) measured_loss_rate: Option<f64>,
-    pub(in crate::runtime) measured_mtu_payload_bytes: Option<usize>,
     pub(in crate::runtime) delivery_samples: u32,
     // Reliable product rate is separate from generic/datagram path goodput.
     pub(in crate::runtime) product_delivery_rate_bps: Option<f64>,
@@ -136,7 +135,6 @@ impl Default for ClientPathHealthRecord {
             measured_jitter_ms: None,
             measured_rate_bps: None,
             measured_loss_rate: None,
-            measured_mtu_payload_bytes: None,
             delivery_samples: 0,
             product_delivery_rate_bps: None,
             product_delivery_sample_bytes: 0,
@@ -255,7 +253,6 @@ impl ClientPathHealthRecord {
                 measured_jitter_ms: self.measured_jitter_ms,
                 measured_rate_bps: self.measured_rate_bps,
                 measured_loss_rate: self.measured_loss_rate,
-                measured_mtu_payload_bytes: self.measured_mtu_payload_bytes,
                 delivery_samples: self.delivery_samples,
                 product_delivery_rate_bps: self.product_delivery_rate_bps,
                 product_delivery_sample_bytes: self.product_delivery_sample_bytes,
@@ -312,7 +309,6 @@ impl ClientPathHealthRecord {
             measured_jitter_ms: self.measured_jitter_ms,
             measured_rate_bps: self.measured_rate_bps,
             measured_loss_rate: self.measured_loss_rate,
-            measured_mtu_payload_bytes: self.measured_mtu_payload_bytes,
             delivery_samples: self.delivery_samples,
             product_delivery_rate_bps: self.product_delivery_rate_bps,
             product_delivery_sample_bytes: self.product_delivery_sample_bytes,
@@ -525,10 +521,6 @@ impl ClientPathHealthRecord {
         });
     }
 
-    pub(in crate::runtime) fn mark_udp_mtu(&mut self, payload_bytes: usize) {
-        self.measured_mtu_payload_bytes = Some(payload_bytes);
-    }
-
     pub(in crate::runtime) fn mark_quic_path_metrics(&mut self, metrics: UdpPathMetrics) {
         if self.manual_disabled {
             return;
@@ -536,7 +528,7 @@ impl ClientPathHealthRecord {
         self.state = SchedulerPathState::Active;
         self.consecutive_failures = 0;
         self.failed_until = None;
-        if metrics.min_rtt_observed {
+        if metrics.rtt_observed {
             self.carrier_srtt_ms = Some(metrics.srtt.as_secs_f64() * 1000.0);
             self.carrier_rttvar_ms = Some(metrics.rttvar.as_secs_f64() * 1000.0);
         }

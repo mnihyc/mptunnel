@@ -35,7 +35,7 @@ pub(in crate::runtime) enum DatagramUnderlaySendError {
         product_attempts: usize,
         source: RuntimeError,
     },
-    PathMtuExceeded {
+    PayloadLimitExceeded {
         product_attempts: usize,
         source: RuntimeError,
     },
@@ -46,7 +46,7 @@ impl DatagramUnderlaySendError {
         match self {
             Self::Timeout { source, .. }
             | Self::Runtime { source, .. }
-            | Self::PathMtuExceeded { source, .. } => source,
+            | Self::PayloadLimitExceeded { source, .. } => source,
         }
     }
 }
@@ -156,7 +156,7 @@ impl DatagramClientAssociation {
                             }
                             last_retryable_error = Some(source);
                         }
-                        Err(DatagramUnderlaySendError::PathMtuExceeded {
+                        Err(DatagramUnderlaySendError::PayloadLimitExceeded {
                             product_attempts,
                             source,
                         }) => {
@@ -213,7 +213,7 @@ impl DatagramClientAssociation {
                             }
                             last_retryable_error = Some(source);
                         }
-                        Err(DatagramUnderlaySendError::PathMtuExceeded {
+                        Err(DatagramUnderlaySendError::PayloadLimitExceeded {
                             product_attempts,
                             source,
                         }) => {

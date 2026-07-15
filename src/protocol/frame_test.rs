@@ -4,7 +4,7 @@ use crate::protocol::frame::{
     stream_ack_contiguous_frontier,
 };
 use crate::protocol::{
-    DatagramFlowId, DatagramId, Frame, OffsetRange, PathId, ResetReason, StreamFlags, StreamId,
+    DatagramFlowId, DatagramId, Frame, OffsetRange, PathId, ResetReason, StreamId,
 };
 use bytes::Bytes;
 
@@ -44,7 +44,6 @@ fn reliable_stream_extent_counts_payload_and_saturates_end() {
     let frame = Frame::StreamData {
         stream_id: StreamId(7),
         offset: u64::MAX - 1,
-        flags: StreamFlags::NONE,
         payload: Bytes::from_static(b"data"),
     };
 
@@ -59,7 +58,6 @@ fn reliable_stream_extent_rejects_empty_and_non_stream_frames() {
     let empty = Frame::StreamData {
         stream_id: StreamId(7),
         offset: 11,
-        flags: StreamFlags::NONE,
         payload: Bytes::new(),
     };
 
@@ -80,7 +78,6 @@ fn frame_accounting_and_pacing_cover_each_semantic_row() {
             Frame::StreamData {
                 stream_id,
                 offset: 0,
-                flags: StreamFlags::NONE,
                 payload: Bytes::from_static(b"data"),
             },
             4,
@@ -91,7 +88,6 @@ fn frame_accounting_and_pacing_cover_each_semantic_row() {
             Frame::StreamData {
                 stream_id,
                 offset: 0,
-                flags: StreamFlags::NONE,
                 payload: Bytes::new(),
             },
             1,

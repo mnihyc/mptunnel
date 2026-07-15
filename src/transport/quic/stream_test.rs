@@ -15,10 +15,6 @@ fn quic_writer_splits_large_stream_data_below_product_scheduler() {
         &Frame::StreamData {
             stream_id: StreamId(9),
             offset: 123,
-            flags: StreamFlags {
-                fin: true,
-                early_data: true,
-            },
             payload,
         },
         limits,
@@ -47,11 +43,10 @@ fn quic_writer_splits_large_stream_data_below_product_scheduler() {
 
     assert_eq!(decoded.len(), 3);
     let mut expected_offset = 123u64;
-    for (index, frame) in decoded.iter().enumerate() {
+    for frame in &decoded {
         let Frame::StreamData {
             stream_id,
             offset,
-            flags,
             payload,
         } = frame
         else {
@@ -61,8 +56,6 @@ fn quic_writer_splits_large_stream_data_below_product_scheduler() {
         assert_eq!(*offset, expected_offset);
         expected_offset = expected_offset.saturating_add(payload.len() as u64);
         assert!(payload.len() <= QUIC_STREAM_RECORD_PAYLOAD_BYTES);
-        assert_eq!(flags.early_data, index == 0);
-        assert_eq!(flags.fin, index == 2);
     }
 }
 
@@ -177,7 +170,6 @@ async fn stopped_quic_write_fail_closes_and_releases_backlog() {
         &Frame::StreamData {
             stream_id: StreamId(9),
             offset: 0,
-            flags: StreamFlags::NONE,
             payload,
         },
         limits,
@@ -257,7 +249,6 @@ async fn cancelled_quic_write_fail_closes_and_releases_backlog() {
             &Frame::StreamData {
                 stream_id: StreamId(9),
                 offset: 0,
-                flags: StreamFlags::NONE,
                 payload: Bytes::from(vec![0x5a; payload_len]),
             },
             limits,

@@ -37,7 +37,7 @@ pub(in crate::runtime) fn datagram_remaining_ttl_ms(expires_at: tokio::time::Ins
 }
 
 pub(in crate::runtime) enum DatagramPathSendError {
-    MtuExceeded {
+    PayloadLimitExceeded {
         limit: usize,
     },
     Timeout {

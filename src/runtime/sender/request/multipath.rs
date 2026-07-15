@@ -10,8 +10,7 @@ use super::quic_capacity::{RequestQuicCapacityController, RequestQuicCapacityEve
 use super::scheduling::{
     BulkRelayFrameRequest, BulkRelayPathChoice, ObservedBulkPathCandidate,
     ObservedOrdinaryPathChoice, RequestRelayPathObservation, RequestRelaySchedulingObservation,
-    RequestRelayTcpPathObservation, RequestSchedulingState, choose_bulk_relay_path_avoiding,
-    choose_observed_ordinary_data_path,
+    RequestSchedulingState, choose_bulk_relay_path_avoiding, choose_observed_ordinary_data_path,
 };
 use super::tcp_capacity::{
     RequestTcpCapacityController, RequestTcpCapacityEvent, RequestTcpCapacityRetirement,
@@ -37,7 +36,7 @@ use crate::runtime::relay::remote::{ReliableRelayRemotePath, ReliableRelayRemote
 use crate::runtime::stream::request::{
     RequestAckClockOperation, RequestStartupAdmission, RequestStreamState,
 };
-use crate::scheduler::{self, FlowLane, PathSnapshot, SchedulerPolicy, cyclic_cursor_distance};
+use crate::scheduler::{self, FlowLane, PathSnapshot, cyclic_cursor_distance};
 use std::collections::{HashMap, HashSet};
 use std::time::{Duration, Instant};
 
@@ -82,10 +81,7 @@ pub(super) fn observe_request_relay_scheduling(
                     .unwrap_or(true),
                 load_owned: path.has_load_reservation(),
                 shared_snapshot: evidence.shared_snapshot,
-                tcp: evidence.tcp.map(|tcp| RequestRelayTcpPathObservation {
-                    startup_snapshot: tcp.startup_snapshot,
-                    rate_hint_unknown: tcp.rate_hint_unknown,
-                }),
+                tcp: evidence.tcp,
                 has_bulk_model_evidence: evidence.has_bulk_model_evidence,
                 fresh_proof: evidence.fresh_proof,
                 config_ordinal: evidence.config_ordinal,
@@ -444,10 +440,7 @@ impl RequestMultipathController {
             == Some(instance)
         {
             self.request.startup.epoch = None;
-            self.request.startup.acked_bytes.remove(&instance);
-            self.request.startup.first_sent_at.remove(&instance);
-            self.request.startup.rate_evidence.remove(&instance);
-            self.request.startup.receipt_proofs.remove(&instance);
+            self.request.startup.clear_path(instance);
             if let Some(state) = self.request.subflows.get_existing_mut(instance) {
                 state.clear_graduated();
             }
@@ -590,7 +583,7 @@ impl RequestMultipathController {
             self.request.ordered_service = None;
             self.reset_request_subflow_epoch();
         }
-        self.reconcile_request_subflow_set(context, remotes);
+        self.reconcile_request_path_state(context, remotes);
         if let Some(payload_bytes) = unique_data_payload_bytes {
             self.try_start_request_tcp_capacity_calibration(context, remotes, lane);
             self.try_start_request_quic_capacity_calibration(context, remotes, lane);
@@ -890,9 +883,7 @@ impl RequestMultipathController {
                 {
                     self.request
                         .startup
-                        .first_sent_at
-                        .entry(instance)
-                        .or_insert_with(Instant::now);
+                        .record_first_sent_at(instance, Instant::now());
                     self.try_enqueue_request_startup_receipt_proof(context, remotes, instance);
                 }
             }
@@ -1138,9 +1129,8 @@ impl RequestMultipathController {
         if self
             .request
             .startup
-            .receipt_proofs
-            .get(&owner)
-            .is_some_and(|(_, generation)| *generation == proof_generation)
+            .receipt_proof(owner)
+            .is_some_and(|(_, generation)| generation == proof_generation)
             || !self
                 .request
                 .startup
@@ -1162,8 +1152,7 @@ impl RequestMultipathController {
             Ok(Some(proof_id)) => {
                 self.request
                     .startup
-                    .receipt_proofs
-                    .insert(owner, (proof_id, proof_generation));
+                    .set_receipt_proof(owner, (proof_id, proof_generation));
                 #[cfg(feature = "lab-diagnostics")]
                 lab_diagnostic(
                     "request_startup_receipt",
@@ -1393,7 +1382,7 @@ impl RequestMultipathController {
         let _ = (phase, target, _token);
     }
 
-    fn reconcile_request_subflow_set(
+    fn reconcile_request_path_state(
         &mut self,
         context: &ClientPathContext,
         remotes: &ReliableRelayRemoteSet,
@@ -1542,10 +1531,7 @@ impl RequestMultipathController {
             path.instance() == owner && path.placement == RelayPathPlacement::Validation
         }) {
             self.request.startup.epoch = None;
-            self.request.startup.acked_bytes.remove(&owner);
-            self.request.startup.first_sent_at.remove(&owner);
-            self.request.startup.rate_evidence.remove(&owner);
-            self.request.startup.receipt_proofs.remove(&owner);
+            self.request.startup.clear_path(owner);
             return;
         }
         let required_evidence_bytes = self
@@ -1558,9 +1544,7 @@ impl RequestMultipathController {
         let receipt_acked_at = self
             .request
             .startup
-            .receipt_proofs
-            .get(&owner)
-            .copied()
+            .receipt_proof(owner)
             .and_then(|(proof_id, generation)| {
                 (context.relay_path_proof_generation(owner.key.underlay, owner.key.index)
                     == Some(generation))
@@ -1582,14 +1566,14 @@ impl RequestMultipathController {
                     })
             });
         if let Some(receipt_acked_at) = receipt_acked_at
-            && !self.request.startup.rate_evidence.contains(&owner)
-            && let Some(first_sent_at) = self.request.startup.first_sent_at.get(&owner).copied()
+            && !self.request.startup.sample_rate_proven(owner)
+            && let Some(first_sent_at) = self.request.startup.first_sent_at(owner)
             && let Some(sample) = PathRateSample::new(
                 required_evidence_bytes,
                 receipt_acked_at.saturating_duration_since(first_sent_at),
             )
         {
-            self.request.startup.rate_evidence.insert(owner);
+            self.request.startup.mark_sample_rate_proven(owner);
             self.request.subflows.get_mut(owner).mark_rate_proven();
             self.record_request_per_flow_rate_sample(owner, sample, false);
             context.mark_relay_path_rate_sample(owner.key.underlay, owner.key.index, sample);
@@ -1611,7 +1595,7 @@ impl RequestMultipathController {
             );
         }
         if let Some(receipt_acked_at) = receipt_acked_at
-            && self.request.startup.rate_evidence.contains(&owner)
+            && self.request.startup.sample_rate_proven(owner)
             && self
                 .request
                 .subflows
@@ -1627,7 +1611,7 @@ impl RequestMultipathController {
                 .rate_evidence_mut(receipt_acked_at)
                 .seed_ack_boundary(receipt_acked_at);
         }
-        if self.request.startup.rate_evidence.contains(&owner)
+        if self.request.startup.sample_rate_proven(owner)
             && !self
                 .request
                 .flights
@@ -1637,7 +1621,7 @@ impl RequestMultipathController {
             let graduated = epoch.graduate_startup_owner(owner);
             debug_assert!(graduated);
             self.request.subflows.get_mut(owner).mark_graduated();
-            self.request.startup.receipt_proofs.remove(&owner);
+            self.request.startup.clear_receipt_proof(owner);
             #[cfg(feature = "lab-diagnostics")]
             lab_diagnostic(
                 "request_startup_receipt",
@@ -1758,8 +1742,8 @@ impl RequestMultipathController {
                 .missing_owner_repair_attempts
                 .remove(&release.instance);
             context.release_relay_path_inflight(
-                release.key.underlay,
-                release.key.index,
+                release.instance.key.underlay,
+                release.instance.key.index,
                 release.bytes,
             );
             if release.path_proving {
@@ -1783,23 +1767,12 @@ impl RequestMultipathController {
                 }
             }
             if release.path_proving
-                && release.key.underlay == UnderlayProtocol::Tcp
+                && release.instance.key.underlay == UnderlayProtocol::Tcp
                 && startup_owner == Some(release.instance)
             {
-                let first_sent_at = self
-                    .request
+                self.request
                     .startup
-                    .first_sent_at
-                    .entry(release.instance)
-                    .or_insert(release.sent_at);
-                *first_sent_at = (*first_sent_at).min(release.sent_at);
-                let acked_bytes = self
-                    .request
-                    .startup
-                    .acked_bytes
-                    .entry(release.instance)
-                    .or_default();
-                *acked_bytes = acked_bytes.saturating_add(release.bytes as u64);
+                    .record_acked(release.instance, release.bytes, release.sent_at);
             }
             if release.path_proving && startup_owner != Some(release.instance) {
                 let sample = ordinary_owner_samples.entry(release.instance).or_insert((
@@ -1817,8 +1790,8 @@ impl RequestMultipathController {
                 format_args!(
                     "stream_id={} path_underlay={:?} path_index={} path_instance={} released_bytes={} elapsed_ms={:.3} path_proving={} cause=stream_ack",
                     self.stream_id.0,
-                    release.key.underlay,
-                    release.key.index,
+                    release.instance.key.underlay,
+                    release.instance.key.index,
                     release.instance.id,
                     release.bytes,
                     release.elapsed.as_secs_f64() * 1000.0,
@@ -1828,16 +1801,13 @@ impl RequestMultipathController {
         }
         if let Some(owner) = startup_owner
             && owner.key.underlay == UnderlayProtocol::Tcp
-            && let (Some(acked_bytes), Some(first_sent_at)) = (
-                self.request.startup.acked_bytes.get(&owner).copied(),
-                self.request.startup.first_sent_at.get(&owner).copied(),
-            )
+            && let Some((acked_bytes, first_sent_at)) = self.request.startup.acked_sample(owner)
             && acked_bytes >= startup_required_bytes
             && let Some(sample) = PathRateSample::new(
                 acked_bytes,
                 acked_at.saturating_duration_since(first_sent_at),
             )
-            && self.request.startup.rate_evidence.insert(owner)
+            && self.request.startup.mark_sample_rate_proven(owner)
         {
             self.request.subflows.get_mut(owner).mark_rate_proven();
             self.record_request_per_flow_rate_sample(owner, sample, false);
@@ -2182,8 +2152,8 @@ impl RequestMultipathController {
     pub(super) fn release_all(&mut self, context: &ClientPathContext) {
         for release in self.request.flights.drain_all() {
             context.release_relay_path_inflight(
-                release.key.underlay,
-                release.key.index,
+                release.instance.key.underlay,
+                release.instance.key.index,
                 release.bytes,
             );
         }
@@ -2271,12 +2241,7 @@ impl RequestMultipathController {
                 .filter_map(|(position, path)| {
                     let key = path.key();
                     let snapshot = context.reliable_path_snapshot(key)?;
-                    let score = scheduler::score_path(
-                        snapshot,
-                        lane,
-                        payload_bytes,
-                        SchedulerPolicy::default(),
-                    )?;
+                    let score = scheduler::score_path(snapshot, lane, payload_bytes)?;
                     Some((
                         position,
                         score.eta_ms,

@@ -495,7 +495,6 @@ impl ServerReliableStreamRegistry {
                 commands,
                 lane,
                 role,
-                max_frame_payload_bytes,
             );
             if matches!(
                 attach_outcome,

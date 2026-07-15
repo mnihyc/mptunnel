@@ -7,15 +7,18 @@ use crate::model::admission::bulk_service_feed_reservoir_payload_bytes;
 use crate::model::capacity::{
     QUIC_TIMER_GRANULARITY, reliable_relay_buffer_len, reliable_subflow_startup_sample_limit_bytes,
 };
-use crate::model::multipath::{FlowSubflowSet, PathAdmissionDecision, SubflowAdmissionInput};
+use crate::model::multipath::{FlowSubflowSet, PathAdmission, SubflowAdmissionInput};
 use crate::model::path::{RelayPathInstance, RelayPathKey};
 use crate::model::request::evidence::{
     RequestPathRateEvidence, RequestPerFlowRateModel, RequestTcpAckTurnoverModel,
     RequestWindowGrowthEvidence,
 };
-use crate::model::work::CarrierWorkKind;
+use crate::model::work::{
+    CarrierWorkKind, ambiguous_flight_intervals, flight_interval_bytes, flight_intervals_overlap,
+    split_flight_interval_by_ack,
+};
 use crate::mux::MuxLimits;
-use crate::protocol::frame::{normalized_offset_ranges, reliable_stream_frame_extent};
+use crate::protocol::frame::{normalize_offset_ranges, reliable_stream_frame_extent};
 use crate::protocol::{Frame, OffsetRange, UnderlayProtocol};
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::time::{Duration, Instant};
@@ -27,11 +30,18 @@ use std::time::{Duration, Instant};
 #[derive(Debug, Default)]
 pub(in crate::runtime) struct RequestStartupState {
     pub(in crate::runtime) epoch: Option<FlowSubflowSet<RelayPathInstance>>,
-    pub(in crate::runtime) acked_bytes: HashMap<RelayPathInstance, u64>,
-    pub(in crate::runtime) first_sent_at: HashMap<RelayPathInstance, Instant>,
-    pub(in crate::runtime) rate_evidence: HashSet<RelayPathInstance>,
-    pub(in crate::runtime) receipt_proofs: HashMap<RelayPathInstance, (u64, u64)>,
+    paths: HashMap<RelayPathInstance, RequestStartupPathEvidence>,
     pub(in crate::runtime) attempted_subflows: HashSet<RelayPathInstance>,
+}
+
+#[derive(Debug, Default)]
+struct RequestStartupPathEvidence {
+    acked_bytes: u64,
+    first_sent_at: Option<Instant>,
+    // Transaction-local completion for this startup sample. Durable path
+    // scheduling evidence lives in RequestSubflowState after graduation.
+    sample_rate_proven: bool,
+    receipt_proof: Option<(u64, u64)>,
 }
 
 #[derive(Debug)]
@@ -281,6 +291,83 @@ impl RequestStreamState {
 }
 
 impl RequestStartupState {
+    pub(in crate::runtime) fn record_first_sent_at(
+        &mut self,
+        instance: RelayPathInstance,
+        sent_at: Instant,
+    ) {
+        let first_sent_at = &mut self.paths.entry(instance).or_default().first_sent_at;
+        *first_sent_at = Some(first_sent_at.map_or(sent_at, |current| current.min(sent_at)));
+    }
+
+    pub(in crate::runtime) fn record_acked(
+        &mut self,
+        instance: RelayPathInstance,
+        bytes: usize,
+        sent_at: Instant,
+    ) {
+        self.record_first_sent_at(instance, sent_at);
+        let evidence = self.paths.entry(instance).or_default();
+        evidence.acked_bytes = evidence.acked_bytes.saturating_add(bytes as u64);
+    }
+
+    pub(in crate::runtime) fn acked_sample(
+        &self,
+        instance: RelayPathInstance,
+    ) -> Option<(u64, Instant)> {
+        let evidence = self.paths.get(&instance)?;
+        Some((evidence.acked_bytes, evidence.first_sent_at?))
+    }
+
+    pub(in crate::runtime) fn first_sent_at(&self, instance: RelayPathInstance) -> Option<Instant> {
+        self.paths
+            .get(&instance)
+            .and_then(|evidence| evidence.first_sent_at)
+    }
+
+    pub(in crate::runtime) fn sample_rate_proven(&self, instance: RelayPathInstance) -> bool {
+        self.paths
+            .get(&instance)
+            .is_some_and(|evidence| evidence.sample_rate_proven)
+    }
+
+    pub(in crate::runtime) fn mark_sample_rate_proven(
+        &mut self,
+        instance: RelayPathInstance,
+    ) -> bool {
+        !std::mem::replace(
+            &mut self.paths.entry(instance).or_default().sample_rate_proven,
+            true,
+        )
+    }
+
+    pub(in crate::runtime) fn receipt_proof(
+        &self,
+        instance: RelayPathInstance,
+    ) -> Option<(u64, u64)> {
+        self.paths
+            .get(&instance)
+            .and_then(|evidence| evidence.receipt_proof)
+    }
+
+    pub(in crate::runtime) fn set_receipt_proof(
+        &mut self,
+        instance: RelayPathInstance,
+        proof: (u64, u64),
+    ) {
+        self.paths.entry(instance).or_default().receipt_proof = Some(proof);
+    }
+
+    pub(in crate::runtime) fn clear_receipt_proof(&mut self, instance: RelayPathInstance) {
+        if let Some(evidence) = self.paths.get_mut(&instance) {
+            evidence.receipt_proof = None;
+        }
+    }
+
+    pub(in crate::runtime) fn clear_path(&mut self, instance: RelayPathInstance) {
+        self.paths.remove(&instance);
+    }
+
     pub(in crate::runtime) fn plan_admission(
         &self,
         mux_limits: MuxLimits,
@@ -299,9 +386,9 @@ impl RequestStartupState {
         let mut next_epoch = self
             .epoch
             .as_ref()
-            .filter(|epoch| epoch.matches_envelope(service, startup_credit, 0, Duration::ZERO))
+            .filter(|epoch| epoch.matches_envelope(service, startup_credit))
             .cloned()
-            .unwrap_or_else(|| FlowSubflowSet::new(0, service, startup_credit, 0, Duration::ZERO));
+            .unwrap_or_else(|| FlowSubflowSet::new(service, startup_credit));
         let input = SubflowAdmissionInput {
             key: candidate,
             bulk_rate_proven: false,
@@ -309,15 +396,14 @@ impl RequestStartupState {
             frontier_clear: true,
             completion_improves: false,
             observed_goodput_non_degrading: true,
-            read_gap: Duration::ZERO,
             owner_bytes: payload_bytes,
-            optional_overhead_bytes: 0,
         };
-        (next_epoch.admit_subflow_owner(input).decision == PathAdmissionDecision::AdmitSubflow)
-            .then_some(RequestStartupAdmission {
+        (next_epoch.admit_subflow_owner(input) == PathAdmission::Subflow).then_some(
+            RequestStartupAdmission {
                 next_epoch,
                 candidate,
-            })
+            },
+        )
     }
 
     pub(in crate::runtime) fn commit_admission(&mut self, admission: RequestStartupAdmission) {
@@ -327,23 +413,13 @@ impl RequestStartupState {
 
     pub(in crate::runtime) fn reset_epoch(&mut self) {
         self.epoch = None;
-        self.acked_bytes.clear();
-        self.first_sent_at.clear();
-        self.rate_evidence.clear();
-        self.receipt_proofs.clear();
+        self.paths.clear();
     }
 
     pub(in crate::runtime) fn retain_live(&mut self, live: &HashSet<RelayPathInstance>) {
         self.attempted_subflows
             .retain(|instance| live.contains(instance));
-        self.acked_bytes
-            .retain(|instance, _| live.contains(instance));
-        self.first_sent_at
-            .retain(|instance, _| live.contains(instance));
-        self.rate_evidence
-            .retain(|instance| live.contains(instance));
-        self.receipt_proofs
-            .retain(|instance, _| live.contains(instance));
+        self.paths.retain(|instance, _| live.contains(instance));
     }
 }
 
@@ -628,7 +704,6 @@ fn request_tcp_product_limit_for_turnover(
 
 #[derive(Debug, Clone, Copy)]
 pub(in crate::runtime) struct RequestPathRelease {
-    pub(in crate::runtime) key: RelayPathKey,
     pub(in crate::runtime) instance: RelayPathInstance,
     pub(in crate::runtime) bytes: usize,
     pub(in crate::runtime) sent_at: Instant,
@@ -685,7 +760,6 @@ impl RequestFlightLedger {
         frame: &Frame,
         kind: CarrierWorkKind,
     ) -> usize {
-        debug_assert!(kind.carries_product_offsets());
         let Some((offset, end, bytes)) = reliable_stream_frame_extent(frame) else {
             return 0;
         };
@@ -711,7 +785,11 @@ impl RequestFlightLedger {
             .into_iter()
             .flat_map(|(start, flights)| flights.into_iter().map(move |flight| (start, flight)))
             .collect::<Vec<_>>();
-        let ambiguous_intervals = request_ambiguous_flight_intervals(&original_flights);
+        let ambiguous_intervals = ambiguous_flight_intervals(
+            original_flights
+                .iter()
+                .map(|(start, flight)| (*start, flight.end)),
+        );
         let now = Instant::now();
         let mut released = Vec::new();
         for (start, flight) in original_flights.iter().copied() {
@@ -722,7 +800,6 @@ impl RequestFlightLedger {
                     continue;
                 }
                 released.push(RequestPathRelease {
-                    key: flight.instance.key,
                     instance: flight.instance,
                     bytes,
                     sent_at: flight.sent_at,
@@ -754,7 +831,6 @@ impl RequestFlightLedger {
         for flights in std::mem::take(&mut self.flights).into_values() {
             for flight in flights {
                 released.push(RequestPathRelease {
-                    key: flight.instance.key,
                     instance: flight.instance,
                     bytes: flight.bytes,
                     sent_at: flight.sent_at,
@@ -934,7 +1010,7 @@ impl RequestFlightLedger {
                 });
             }
         }
-        normalized_offset_ranges(&ranges)
+        normalize_offset_ranges(ranges)
     }
 
     pub(in crate::runtime) fn latest_unacked_ranges_for_path_instance(
@@ -953,7 +1029,7 @@ impl RequestFlightLedger {
                     })
             })
             .collect::<Vec<_>>();
-        normalized_offset_ranges(&ranges)
+        normalize_offset_ranges(ranges)
     }
 
     pub(in crate::runtime) fn ordering_owner_instances(&self) -> Vec<RelayPathInstance> {
@@ -1056,78 +1132,6 @@ fn latest_ordering_owner(flights: &[RequestFlight]) -> Option<&RequestFlight> {
         .iter()
         .rev()
         .find(|flight| flight.kind.is_ordering_owner())
-}
-
-fn request_ambiguous_flight_intervals(flights: &[(u64, RequestFlight)]) -> Vec<(u64, u64)> {
-    let mut events = BTreeMap::<u64, i64>::new();
-    for (start, flight) in flights {
-        *events.entry(*start).or_default() += 1;
-        *events.entry(flight.end).or_default() -= 1;
-    }
-    let mut intervals = Vec::new();
-    let mut active = 0_i64;
-    let mut previous = None;
-    for (position, delta) in events {
-        if let Some(previous) = previous
-            && previous < position
-            && active > 1
-        {
-            intervals.push((previous, position));
-        }
-        active += delta;
-        previous = Some(position);
-    }
-    intervals
-}
-
-fn flight_intervals_overlap(intervals: &[(u64, u64)], start: u64, end: u64) -> bool {
-    let position = intervals.partition_point(|(_, interval_end)| *interval_end <= start);
-    intervals
-        .get(position)
-        .is_some_and(|(interval_start, _)| *interval_start < end)
-}
-
-struct FlightIntervalSplit {
-    acked: Vec<(u64, u64)>,
-    retained: Vec<(u64, u64)>,
-}
-
-fn split_flight_interval_by_ack(
-    start: u64,
-    end: u64,
-    ranges: &[OffsetRange],
-) -> FlightIntervalSplit {
-    let mut acked = Vec::new();
-    let mut retained = Vec::new();
-    let mut cursor = start;
-    for range in ranges {
-        if range.end <= cursor {
-            continue;
-        }
-        if range.start >= end {
-            break;
-        }
-        let ack_start = cursor.max(range.start);
-        if cursor < ack_start {
-            retained.push((cursor, ack_start));
-        }
-        let ack_end = end.min(range.end);
-        if ack_start < ack_end {
-            acked.push((ack_start, ack_end));
-            cursor = ack_end;
-        }
-        if cursor >= end {
-            break;
-        }
-    }
-    if cursor < end {
-        retained.push((cursor, end));
-    }
-    FlightIntervalSplit { acked, retained }
-}
-
-fn flight_interval_bytes(start: u64, end: u64) -> usize {
-    usize::try_from(end.saturating_sub(start)).unwrap_or(usize::MAX)
 }
 
 #[derive(Debug, Clone, Copy)]

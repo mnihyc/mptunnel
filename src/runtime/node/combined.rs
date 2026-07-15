@@ -44,9 +44,9 @@ pub(super) async fn run(
     let mut server_contexts = Vec::with_capacity(node.servers.len());
     for server_config in node.servers {
         let runtime = server::new_identity_runtime_with_metadata(
-            server_config.tag.clone(),
-            server_config.route_target.clone(),
-            server_config.bind_paths.clone(),
+            server_config.tag,
+            server_config.route_target,
+            server_config.bind_paths,
             server_config.outbound,
             server_config.outbound_dns,
             server_config.outbound_connect_timeout,
@@ -54,7 +54,7 @@ pub(super) async fn run(
             server_config.performance,
             resources,
         );
-        let bound = server::bind_paths(server_config.bind_paths, &runtime.paths).await?;
+        let bound = server::bind_paths(&runtime.paths).await?;
         let server::ServerIdentityRuntime {
             paths,
             reliable_relay,

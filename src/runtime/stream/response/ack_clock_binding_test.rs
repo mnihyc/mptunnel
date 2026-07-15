@@ -137,7 +137,6 @@ fn tcp_ack_clock_can_reduce_rate_while_carrier_snapshot_is_app_limited() {
             direction: PathMetricDirection::ServerToClient,
             metric_epoch: metric_epoch_now(),
             metric_age_us: 0,
-            min_rtt_us: 20_000,
             srtt_us: 20_000,
             rttvar_us: 1_000,
             jitter_us: 1_000,
@@ -393,11 +392,11 @@ fn tcp_response_robust_calibration_yields_to_mature_ordinary_rate_without_fake_r
     let prior_entry = output_entry_for_key(&binding, key);
     let prior_snapshot = server_bulk_output_snapshot(
         &prior_entry,
+        0,
         binding.session_id,
         FlowLane::Throughput,
         binding.lane_tracker.as_ref(),
         binding.mux_limits,
-        Instant::now(),
     );
     assert_test_rate_close(Some(prior_snapshot.delivery_rate_bps), 110_000_000.0);
     assert_eq!(
@@ -470,11 +469,11 @@ fn tcp_response_robust_calibration_yields_to_mature_ordinary_rate_without_fake_r
     );
     let ordinary_snapshot = server_bulk_output_snapshot(
         entry,
+        0,
         binding.session_id,
         FlowLane::Throughput,
         binding.lane_tracker.as_ref(),
         binding.mux_limits,
-        Instant::now(),
     );
     assert_eq!(
         ordinary_snapshot.rate_scope,

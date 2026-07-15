@@ -1,4 +1,4 @@
-use super::{AuthNonce, AuthTag, PathCapabilities, PathId, SessionId, UnderlayProtocol};
+use super::{AuthNonce, AuthTag, PathId, SessionId, UnderlayProtocol};
 use hmac::{Hmac, Mac};
 use sha2::Sha256;
 
@@ -24,7 +24,6 @@ pub struct PathJoinAuthCheck {
     pub underlay: UnderlayProtocol,
     pub nonce: AuthNonce,
     pub issued_at_unix_secs: u64,
-    pub capabilities: PathCapabilities,
     pub tag: AuthTag,
     pub now_unix_secs: u64,
     pub freshness_window_secs: u64,
@@ -83,7 +82,6 @@ impl SessionAuthenticator {
         underlay: UnderlayProtocol,
         nonce: AuthNonce,
         issued_at_unix_secs: u64,
-        capabilities: PathCapabilities,
     ) -> AuthTag {
         let mut mac = self.mac();
         mac.update(PATH_JOIN_CONTEXT);
@@ -92,7 +90,6 @@ impl SessionAuthenticator {
         update_underlay(&mut mac, underlay);
         update_nonce(&mut mac, nonce);
         update_issued_at(&mut mac, issued_at_unix_secs);
-        update_capabilities(&mut mac, capabilities);
         finalize_tag(mac)
     }
 
@@ -111,7 +108,6 @@ impl SessionAuthenticator {
         update_underlay(&mut mac, check.underlay);
         update_nonce(&mut mac, check.nonce);
         update_issued_at(&mut mac, check.issued_at_unix_secs);
-        update_capabilities(&mut mac, check.capabilities);
         verify_tag(mac, check.tag)
     }
 
@@ -157,10 +153,6 @@ fn update_nonce(mac: &mut HmacSha256, nonce: AuthNonce) {
 
 fn update_issued_at(mac: &mut HmacSha256, issued_at_unix_secs: u64) {
     mac.update(&issued_at_unix_secs.to_be_bytes());
-}
-
-fn update_capabilities(mac: &mut HmacSha256, capabilities: PathCapabilities) {
-    mac.update(&capabilities.to_bits().to_be_bytes());
 }
 
 fn issued_at_is_fresh(

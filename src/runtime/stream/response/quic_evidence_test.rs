@@ -37,7 +37,6 @@ fn udp_app_limited_ack_data_snapshot_keeps_carrier_inflight_limit() {
         role: StreamOpenRole::Active,
         owner_data_in_flight_bytes: 0,
         bytes_in_flight: 0,
-        product_queue_bytes: 0,
         product_progress_rate_bps: None,
         delivery_rate_bps: None,
         tcp_ack_clock_rate_bps: None,
@@ -57,12 +56,11 @@ fn udp_app_limited_ack_data_snapshot_keeps_carrier_inflight_limit() {
                 direction: PathMetricDirection::ServerToClient,
                 metric_epoch: metric_epoch_now(),
                 metric_age_us: 0,
-                min_rtt_us: 80_000,
                 srtt_us: 80_000,
                 rttvar_us: 2_000,
                 jitter_us: 2_000,
-                delivery_rate_bps: default_path_rate_bps(UnderlayProtocol::Udp).round() as u64,
-                pacing_rate_bps: default_path_rate_bps(UnderlayProtocol::Udp).round() as u64,
+                delivery_rate_bps: default_path_rate_bps().round() as u64,
+                pacing_rate_bps: default_path_rate_bps().round() as u64,
                 loss_ppm: 0,
                 ecn_ppm: 0,
                 loss_observed: false,
@@ -84,16 +82,16 @@ fn udp_app_limited_ack_data_snapshot_keeps_carrier_inflight_limit() {
     let lane_tracker = ServerPathLaneTracker::default();
     let snapshot = server_bulk_output_snapshot(
         &entry,
+        0,
         SessionId(77),
         FlowLane::Throughput,
         &lane_tracker,
         MuxLimits::default(),
-        Instant::now(),
     );
 
     assert_eq!(
         snapshot.delivery_rate_bps,
-        default_path_rate_bps(UnderlayProtocol::Udp),
+        default_path_rate_bps(),
         "app-limited ACK-data must not create a tiny bulk-rate model"
     );
     assert_eq!(
@@ -122,7 +120,6 @@ fn local_proof_metrics_are_sender_evidence_not_ack_data_evidence() {
         role: StreamOpenRole::Active,
         owner_data_in_flight_bytes: 0,
         bytes_in_flight: 0,
-        product_queue_bytes: 0,
         product_progress_rate_bps: None,
         delivery_rate_bps: None,
         tcp_ack_clock_rate_bps: None,
@@ -142,7 +139,6 @@ fn local_proof_metrics_are_sender_evidence_not_ack_data_evidence() {
                 direction: PathMetricDirection::ServerToClient,
                 metric_epoch: metric_epoch_now(),
                 metric_age_us: 0,
-                min_rtt_us: 40_000,
                 srtt_us: 40_000,
                 rttvar_us: 2_000,
                 jitter_us: 2_000,
@@ -186,7 +182,6 @@ fn udp_tiny_non_app_limited_sample_is_ack_data_not_bulk_rate_evidence() {
         role: StreamOpenRole::Active,
         owner_data_in_flight_bytes: 0,
         bytes_in_flight: 0,
-        product_queue_bytes: 0,
         product_progress_rate_bps: None,
         delivery_rate_bps: None,
         tcp_ack_clock_rate_bps: None,
@@ -206,7 +201,6 @@ fn udp_tiny_non_app_limited_sample_is_ack_data_not_bulk_rate_evidence() {
                 direction: PathMetricDirection::ServerToClient,
                 metric_epoch: metric_epoch_now(),
                 metric_age_us: 0,
-                min_rtt_us: 80_000,
                 srtt_us: 80_000,
                 rttvar_us: 2_000,
                 jitter_us: 2_000,
@@ -240,16 +234,13 @@ fn udp_tiny_non_app_limited_sample_is_ack_data_not_bulk_rate_evidence() {
     );
     let snapshot = server_bulk_output_snapshot(
         &entry,
+        0,
         SessionId(77),
         FlowLane::Throughput,
         &ServerPathLaneTracker::default(),
         MuxLimits::default(),
-        Instant::now(),
     );
-    assert_eq!(
-        snapshot.delivery_rate_bps,
-        default_path_rate_bps(UnderlayProtocol::Udp)
-    );
+    assert_eq!(snapshot.delivery_rate_bps, default_path_rate_bps());
     assert!(snapshot.confidence < 1.0);
 }
 
@@ -269,7 +260,6 @@ fn udp_startup_window_sample_graduates_even_when_inflight_limit_is_larger() {
         role: StreamOpenRole::Active,
         owner_data_in_flight_bytes: 0,
         bytes_in_flight: 0,
-        product_queue_bytes: 0,
         product_progress_rate_bps: None,
         delivery_rate_bps: None,
         tcp_ack_clock_rate_bps: None,
@@ -289,7 +279,6 @@ fn udp_startup_window_sample_graduates_even_when_inflight_limit_is_larger() {
                 direction: PathMetricDirection::ServerToClient,
                 metric_epoch: metric_epoch_now(),
                 metric_age_us: 0,
-                min_rtt_us: 160_000,
                 srtt_us: 160_000,
                 rttvar_us: 5_000,
                 jitter_us: 5_000,
@@ -335,7 +324,6 @@ fn udp_near_startup_window_sample_graduates_with_packet_accounting_slack() {
         role: StreamOpenRole::Active,
         owner_data_in_flight_bytes: 0,
         bytes_in_flight: 0,
-        product_queue_bytes: 0,
         product_progress_rate_bps: None,
         delivery_rate_bps: None,
         tcp_ack_clock_rate_bps: None,
@@ -355,7 +343,6 @@ fn udp_near_startup_window_sample_graduates_with_packet_accounting_slack() {
                 direction: PathMetricDirection::ServerToClient,
                 metric_epoch: metric_epoch_now(),
                 metric_age_us: 0,
-                min_rtt_us: 160_000,
                 srtt_us: 160_000,
                 rttvar_us: 5_000,
                 jitter_us: 5_000,

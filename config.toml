@@ -126,11 +126,12 @@ protocol = "mpp"
 endpoints = ["tcp://127.0.0.1:7443", "udp://127.0.0.1:7443"]
 # path_probe_interval_ms = 10000
 # path_probe_timeout_ms = 2000
-# MPP sender budget for evidence-backed duplicate/repair/probe overhead. `5`
-# means roughly 5% extra optional traffic plus a small startup floor can be
-# spent when it reduces stalls. This is a hard optional-work budget, not a
-# product-data throttle or named mode; `100` permits full duplication in severe
-# moments, and `200` may be useful on very unstable paths.
+# MPP sender budget for evidence-backed repair copies. `5` permits repair bytes
+# up to roughly 5% of owner progress plus a small startup floor when that work
+# reduces stalls. This is a hard repair budget, not a product-data throttle or
+# named mode; path proof and carrier-capacity measurement use their own bounded
+# transactions. `100` permits repair equal to owner progress in severe moments,
+# and `200` may be useful on very unstable paths.
 # [outbounds.performance]
 # extra_traffic_hint_percent = 5
 

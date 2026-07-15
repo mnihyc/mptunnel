@@ -164,7 +164,7 @@ async fn client_udp_datagram_round_trip_with_limits(
         .await
         .map_err(|err| match err {
             policy::DatagramPathSendError::Runtime { source, .. } => source,
-            policy::DatagramPathSendError::MtuExceeded { limit } => {
+            policy::DatagramPathSendError::PayloadLimitExceeded { limit } => {
                 RuntimeError::Datagram(DatagramError::PayloadTooLarge {
                     actual: payload_len,
                     limit,

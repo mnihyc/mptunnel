@@ -24,19 +24,20 @@ use crate::transport::{CarrierPathIdentity, PathBinding, SystemCarrierNetworkPro
 
 fn test_tcp_session_runtime() -> ClientTcpPathSessionRuntime {
     ClientTcpPathSessionRuntime {
-        path: PathSpec {
+        paths: Arc::new(vec![PathSpec {
             underlay: UnderlayProtocol::Tcp,
             endpoint: Endpoint::new("127.0.0.1", 1).expect("endpoint"),
             binding: PathBinding::default(),
             metadata: crate::transport::PathMetadata::default(),
-        },
+        }]),
+        config_index: 0,
         path_index: 0,
         carrier_identity: CarrierPathIdentity {
             group_ordinal: 0,
             path_ordinal: 0,
         },
         session_id: SessionId(7),
-        security: security(),
+        security: Arc::new(vec![security()]),
         codec_limits: CodecLimits::default(),
         mux_limits: MuxLimits::default(),
         command_queue: 4,
@@ -55,7 +56,7 @@ fn test_tcp_session_runtime_for(
     session_id: SessionId,
 ) -> ClientTcpPathSessionRuntime {
     ClientTcpPathSessionRuntime {
-        path,
+        paths: Arc::new(vec![path]),
         session_id,
         ..test_tcp_session_runtime()
     }
@@ -63,7 +64,7 @@ fn test_tcp_session_runtime_for(
 
 async fn accept_authenticated_test_tcp_path(
     listener: &TcpListener,
-) -> Result<(EncryptedFramedStream<TcpStream>, PathId, PathCapabilities), RuntimeError> {
+) -> Result<(EncryptedFramedStream<TcpStream>, PathId), RuntimeError> {
     let (stream, _) = listener.accept().await?;
     let security = security();
     let mut framed = EncryptedFramedStream::with_cipher_suite(
@@ -95,14 +96,13 @@ async fn accept_authenticated_test_tcp_path(
             }) => {}
         _ => return Err(RuntimeError::Protocol("invalid SESSION_AUTH")),
     }
-    let (path_id, capabilities) = match framed.read_frame().await? {
+    let path_id = match framed.read_frame().await? {
         Frame::PathJoin {
             session_id: join_session_id,
             path_id,
             underlay,
             nonce,
             issued_at_unix_secs,
-            capabilities,
             auth_tag,
         } if join_session_id == session_id
             && underlay == UnderlayProtocol::Tcp
@@ -112,13 +112,12 @@ async fn accept_authenticated_test_tcp_path(
                 underlay,
                 nonce,
                 issued_at_unix_secs,
-                capabilities,
                 tag: auth_tag,
                 now_unix_secs: current_unix_secs()?,
                 freshness_window_secs: security.auth_freshness_window.as_secs(),
             }) =>
         {
-            (path_id, capabilities)
+            path_id
         }
         _ => return Err(RuntimeError::Protocol("invalid PATH_JOIN")),
     };
@@ -128,12 +127,11 @@ async fn accept_authenticated_test_tcp_path(
             Frame::PathStatus {
                 path_id,
                 status: crate::protocol::PathStatus::Active,
-                capabilities,
             },
         ])
         .await?;
     framed.flush().await?;
-    Ok((framed, path_id, capabilities))
+    Ok((framed, path_id))
 }
 
 #[tokio::test]
@@ -158,7 +156,7 @@ async fn concurrent_tcp_latency_opens_share_one_authenticated_carrier() {
     let path = reserve_tcp_path_with_query("srtt-ms=20&rate-mbps=500").await;
     let listener = bind_listener(&path).await.expect("bind");
     let server = tokio::spawn(async move {
-        let (mut framed, path_id, _) = accept_authenticated_test_tcp_path(&listener).await?;
+        let (mut framed, path_id) = accept_authenticated_test_tcp_path(&listener).await?;
         tokio::time::sleep(Duration::from_millis(100)).await;
         let mut opened = HashSet::new();
         for index in 0..2 {
@@ -200,7 +198,6 @@ async fn concurrent_tcp_latency_opens_share_one_authenticated_carrier() {
     let first = handle.open_stream_with_deadlines(
         StreamId(71),
         TargetAddr::Ip(SocketAddr::from(([127, 0, 0, 1], 80))),
-        IngressKind::HttpConnect,
         FlowLane::Latency,
         StreamOpenRole::Active,
         deadlines,
@@ -208,7 +205,6 @@ async fn concurrent_tcp_latency_opens_share_one_authenticated_carrier() {
     let second = handle.open_stream_with_deadlines(
         StreamId(72),
         TargetAddr::Ip(SocketAddr::from(([127, 0, 0, 1], 81))),
-        IngressKind::HttpConnect,
         FlowLane::Latency,
         StreamOpenRole::Active,
         deadlines,
@@ -226,7 +222,7 @@ async fn canceling_pending_tcp_stream_keeps_shared_carrier_sibling_live() -> Res
     let listener = bind_listener(&path).await.expect("bind");
     let (opens_seen_tx, opens_seen_rx) = oneshot::channel();
     let server = tokio::spawn(async move {
-        let (mut framed, path_id, _) = accept_authenticated_test_tcp_path(&listener).await?;
+        let (mut framed, path_id) = accept_authenticated_test_tcp_path(&listener).await?;
         let mut opened = HashSet::new();
         for _ in 0..2 {
             assert!(matches!(
@@ -262,7 +258,6 @@ async fn canceling_pending_tcp_stream_keeps_shared_carrier_sibling_live() -> Res
             .write_frame(&Frame::StreamData {
                 stream_id: StreamId(82),
                 offset: 0,
-                flags: StreamFlags::NONE,
                 payload: Bytes::from_static(b"sibling-live"),
             })
             .await?;
@@ -278,7 +273,6 @@ async fn canceling_pending_tcp_stream_keeps_shared_carrier_sibling_live() -> Res
             .open_stream(
                 StreamId(81),
                 TargetAddr::Ip(SocketAddr::from(([127, 0, 0, 1], 80))),
-                IngressKind::HttpConnect,
                 FlowLane::Latency,
                 StreamOpenRole::Active,
                 deadline,
@@ -291,7 +285,6 @@ async fn canceling_pending_tcp_stream_keeps_shared_carrier_sibling_live() -> Res
             .open_stream(
                 StreamId(82),
                 TargetAddr::Ip(SocketAddr::from(([127, 0, 0, 1], 81))),
-                IngressKind::HttpConnect,
                 FlowLane::Latency,
                 StreamOpenRole::Active,
                 deadline,
@@ -329,7 +322,7 @@ async fn duplicate_pending_tcp_open_preserves_the_first_wire_owner() -> Result<(
     let (inspect_wire_tx, inspect_wire_rx) = oneshot::channel();
     let (owner_live_tx, owner_live_rx) = oneshot::channel();
     let server = tokio::spawn(async move {
-        let (mut framed, _, _) = accept_authenticated_test_tcp_path(&listener).await?;
+        let (mut framed, _) = accept_authenticated_test_tcp_path(&listener).await?;
         assert!(matches!(
             framed.read_frame().await?,
             Frame::PathMetrics { .. }
@@ -360,7 +353,6 @@ async fn duplicate_pending_tcp_open_preserves_the_first_wire_owner() -> Result<(
                 Frame::StreamData {
                     stream_id: StreamId(83),
                     offset: 0,
-                    flags: StreamFlags::NONE,
                     payload: Bytes::from_static(b"first-owner-live"),
                 },
             ])
@@ -378,7 +370,6 @@ async fn duplicate_pending_tcp_open_preserves_the_first_wire_owner() -> Result<(
             .open_stream(
                 StreamId(83),
                 TargetAddr::Ip(SocketAddr::from(([127, 0, 0, 1], 80))),
-                IngressKind::HttpConnect,
                 FlowLane::Throughput,
                 StreamOpenRole::Validation,
                 deadline,
@@ -392,7 +383,6 @@ async fn duplicate_pending_tcp_open_preserves_the_first_wire_owner() -> Result<(
         .open_stream(
             StreamId(83),
             TargetAddr::Ip(SocketAddr::from(([127, 0, 0, 1], 80))),
-            IngressKind::HttpConnect,
             FlowLane::Throughput,
             StreamOpenRole::Repair,
             deadline,
@@ -528,7 +518,6 @@ async fn expired_queued_tcp_open_does_not_start_a_late_carrier() {
             .open_stream(
                 StreamId(1),
                 TargetAddr::Ip(SocketAddr::from(([127, 0, 0, 1], 80))),
-                IngressKind::HttpConnect,
                 FlowLane::Throughput,
                 StreamOpenRole::Active,
                 tokio::time::Instant::now() + Duration::from_millis(200),
@@ -541,7 +530,6 @@ async fn expired_queued_tcp_open_does_not_start_a_late_carrier() {
         .open_stream(
             StreamId(2),
             TargetAddr::Ip(SocketAddr::from(([127, 0, 0, 1], 81))),
-            IngressKind::HttpConnect,
             FlowLane::Throughput,
             StreamOpenRole::Active,
             tokio::time::Instant::now() + Duration::from_millis(40),
@@ -581,12 +569,8 @@ async fn tcp_lane_session_expires_pending_accept_and_sends_detach() {
             framed.read_frame().await.expect("session auth"),
             Frame::SessionAuth { .. }
         ));
-        let (path_id, capabilities) = match framed.read_frame().await.expect("path join") {
-            Frame::PathJoin {
-                path_id,
-                capabilities,
-                ..
-            } => (path_id, capabilities),
+        let path_id = match framed.read_frame().await.expect("path join") {
+            Frame::PathJoin { path_id, .. } => path_id,
             other => panic!("expected PATH_JOIN, got {other:?}"),
         };
         framed
@@ -595,7 +579,6 @@ async fn tcp_lane_session_expires_pending_accept_and_sends_detach() {
                 Frame::PathStatus {
                     path_id,
                     status: crate::protocol::PathStatus::Active,
-                    capabilities,
                 },
             ])
             .await
@@ -639,7 +622,6 @@ async fn tcp_lane_session_expires_pending_accept_and_sends_detach() {
             .write_frame(&Frame::StreamData {
                 stream_id: first_stream_id,
                 offset: 0,
-                flags: StreamFlags::NONE,
                 payload: Bytes::from_static(b"live-after-open-timeout"),
             })
             .await
@@ -652,7 +634,6 @@ async fn tcp_lane_session_expires_pending_accept_and_sends_detach() {
         .open_stream(
             StreamId(3),
             TargetAddr::Ip(SocketAddr::from(([127, 0, 0, 1], 82))),
-            IngressKind::HttpConnect,
             FlowLane::Latency,
             StreamOpenRole::Active,
             tokio::time::Instant::now() + Duration::from_secs(2),
@@ -670,7 +651,6 @@ async fn tcp_lane_session_expires_pending_accept_and_sends_detach() {
         .open_stream_with_deadlines(
             StreamId(4),
             TargetAddr::Ip(SocketAddr::from(([127, 0, 0, 1], 83))),
-            IngressKind::HttpConnect,
             FlowLane::Latency,
             StreamOpenRole::Validation,
             ClientTcpOpenDeadlines::from_timeouts(
@@ -707,7 +687,7 @@ async fn tcp_carrier_reconnect_publishes_a_new_generation_and_uses_setup_deadlin
     let (close_first_tx, close_first_rx) = oneshot::channel();
     let (finish_second_tx, finish_second_rx) = oneshot::channel();
     let server = tokio::spawn(async move {
-        let (mut first, _, _) = accept_authenticated_test_tcp_path(&listener).await?;
+        let (mut first, _) = accept_authenticated_test_tcp_path(&listener).await?;
         assert!(matches!(
             first.read_frame().await?,
             Frame::PathMetrics { .. }
@@ -726,7 +706,7 @@ async fn tcp_carrier_reconnect_publishes_a_new_generation_and_uses_setup_deadlin
         close_first_rx.await.expect("close first carrier signal");
         drop(first);
 
-        let (mut second, _, _) = accept_authenticated_test_tcp_path(&listener).await?;
+        let (mut second, _) = accept_authenticated_test_tcp_path(&listener).await?;
         assert!(matches!(
             second.read_frame().await?,
             Frame::PathMetrics { .. }
@@ -754,7 +734,6 @@ async fn tcp_carrier_reconnect_publishes_a_new_generation_and_uses_setup_deadlin
         .open_stream(
             StreamId(5),
             TargetAddr::Ip(SocketAddr::from(([127, 0, 0, 1], 84))),
-            IngressKind::HttpConnect,
             FlowLane::Throughput,
             StreamOpenRole::Active,
             tokio::time::Instant::now() + Duration::from_secs(2),
@@ -777,7 +756,6 @@ async fn tcp_carrier_reconnect_publishes_a_new_generation_and_uses_setup_deadlin
         .open_stream_with_deadlines(
             StreamId(6),
             TargetAddr::Ip(SocketAddr::from(([127, 0, 0, 1], 85))),
-            IngressKind::HttpConnect,
             FlowLane::Throughput,
             StreamOpenRole::Repair,
             ClientTcpOpenDeadlines::from_timeouts(
@@ -804,7 +782,7 @@ async fn tcp_client_sends_path_metrics_before_open_stream() {
     let path = reserve_tcp_path_with_query("srtt-ms=20&rate-mbps=500").await;
     let listener = bind_listener(&path).await.expect("bind");
     let server = tokio::spawn(async move {
-        let (mut framed, path_id, _) = accept_authenticated_test_tcp_path(&listener).await?;
+        let (mut framed, path_id) = accept_authenticated_test_tcp_path(&listener).await?;
 
         match framed.read_frame().await? {
             Frame::PathMetrics { metrics } => {
@@ -839,7 +817,6 @@ async fn tcp_client_sends_path_metrics_before_open_stream() {
         .open_stream(
             StreamId(99),
             TargetAddr::Ip(SocketAddr::from(([127, 0, 0, 1], 80))),
-            IngressKind::HttpConnect,
             FlowLane::Throughput,
             StreamOpenRole::Active,
             tokio::time::Instant::now() + active_path_open_timeout(None, false),
@@ -971,7 +948,7 @@ fn mixed_reliable_latency_startup_preserves_global_order_without_family_preferen
 fn latency_startup_prefers_lowest_latency_path_before_bulk_promotion() {
     let context = ClientPathContext::new(
         vec![
-            "udp://127.0.0.1:11120?srtt-ms=20&rate-mbps=80&low-latency=true"
+            "udp://127.0.0.1:11120?srtt-ms=20&rate-mbps=80"
                 .parse()
                 .expect("low latency path"),
             "udp://127.0.0.1:11121?srtt-ms=80&rate-mbps=200"
@@ -1086,7 +1063,6 @@ fn reliable_initial_open_allows_no_bulk_path_for_latency_lane() {
         context.tcp_path_snapshot(0).expect("low-latency snapshot"),
         FlowLane::Latency,
         PATH_OPEN_SCORE_BYTES,
-        SchedulerPolicy::default(),
     )
     .expect("low-latency score")
     .eta_ms;
@@ -1094,7 +1070,6 @@ fn reliable_initial_open_allows_no_bulk_path_for_latency_lane() {
         context.tcp_path_snapshot(1).expect("bulk snapshot"),
         FlowLane::Latency,
         PATH_OPEN_SCORE_BYTES,
-        SchedulerPolicy::default(),
     )
     .expect("bulk score")
     .eta_ms;
@@ -1118,7 +1093,6 @@ async fn tcp_path_control_command_bypasses_saturated_data_queue() {
         Frame::StreamData {
             stream_id: StreamId(3),
             offset: 0,
-            flags: StreamFlags::NONE,
             payload: Bytes::from_static(b"queued-data"),
         },
         FlowLane::Throughput,
@@ -1149,7 +1123,6 @@ async fn tcp_path_priority_probe_does_not_consume_bulk_data() {
         Frame::StreamData {
             stream_id: StreamId(10),
             offset: 0,
-            flags: StreamFlags::NONE,
             payload: Bytes::from_static(b"bulk"),
         },
         FlowLane::Throughput,
@@ -1263,7 +1236,6 @@ async fn tcp_path_interactive_frame_bypasses_saturated_bulk_queue() {
         Frame::StreamData {
             stream_id: StreamId(10),
             offset: 0,
-            flags: StreamFlags::NONE,
             payload: Bytes::from_static(b"bulk"),
         },
         FlowLane::Throughput,
@@ -1274,7 +1246,6 @@ async fn tcp_path_interactive_frame_bypasses_saturated_bulk_queue() {
         Frame::StreamData {
             stream_id: StreamId(11),
             offset: 0,
-            flags: StreamFlags::NONE,
             payload: Bytes::from_static(b"i"),
         },
         FlowLane::Latency,
@@ -1302,7 +1273,6 @@ async fn tcp_path_stream_fin_bypasses_saturated_bulk_queue() {
         Frame::StreamData {
             stream_id: StreamId(30),
             offset: 0,
-            flags: StreamFlags::NONE,
             payload: Bytes::from_static(b"bulk"),
         },
         FlowLane::Throughput,
@@ -1340,7 +1310,6 @@ async fn tcp_path_stream_ordered_fin_and_close_do_not_overtake_bulk_data() {
         Frame::StreamData {
             stream_id: StreamId(31),
             offset: 0,
-            flags: StreamFlags::NONE,
             payload: Bytes::from_static(b"bulk"),
         },
         FlowLane::Throughput,
@@ -1381,7 +1350,6 @@ async fn tcp_path_command_queue_tracks_pending_frame_bytes() {
     let frame = Frame::StreamData {
         stream_id: StreamId(13),
         offset: 0,
-        flags: StreamFlags::NONE,
         payload: Bytes::from_static(b"queued-bytes"),
     };
     let expected = reliable_path_frame_pacing_bytes(&frame) as u64;
@@ -1412,7 +1380,6 @@ async fn dropping_receiver_releases_already_dequeued_command_debt() {
     let frame = Frame::StreamData {
         stream_id: StreamId(14),
         offset: 0,
-        flags: StreamFlags::NONE,
         payload: Bytes::from_static(b"held-by-writer"),
     };
     let expected = reliable_path_frame_pacing_bytes(&frame) as u64;
@@ -1681,7 +1648,6 @@ async fn server_reliable_relay_does_not_replay_whole_repair_cache_on_path_reatta
         .send(Ok(Frame::PathStatus {
             path_id: PathId(1),
             status: crate::protocol::PathStatus::Active,
-            capabilities: Default::default(),
         }))
         .await
         .expect("reattach signal");
@@ -1833,7 +1799,7 @@ fn measured_tcp_delivery_rate_updates_next_bulk_order() {
 
 #[test]
 fn bulk_striping_orders_paths_by_bulk_eta() {
-    let low_latency_path = "tcp://127.0.0.1:10015?srtt-ms=20&rate-mbps=30&low-latency=true"
+    let low_latency_path = "tcp://127.0.0.1:10015?srtt-ms=20&rate-mbps=30"
         .parse::<PathSpec>()
         .expect("low-latency path");
     let high_bandwidth_path = "tcp://127.0.0.1:10016?srtt-ms=180&rate-mbps=300"
@@ -1867,7 +1833,7 @@ fn bulk_striping_orders_paths_by_bulk_eta() {
 
 #[test]
 fn bulk_striping_uses_service_horizon_for_realistic_fat_path() {
-    let low_latency_path = "tcp://127.0.0.1:10019?srtt-ms=20&rate-mbps=80&low-latency=true"
+    let low_latency_path = "tcp://127.0.0.1:10019?srtt-ms=20&rate-mbps=80"
         .parse::<PathSpec>()
         .expect("low-latency path");
     let high_bandwidth_path = "tcp://127.0.0.1:10020?srtt-ms=180&rate-mbps=500"
@@ -1899,7 +1865,7 @@ fn bulk_striping_uses_service_horizon_for_realistic_fat_path() {
 
 #[test]
 fn bulk_striping_skips_expensive_path() {
-    let low_latency_path = "tcp://127.0.0.1:10017?srtt-ms=20&rate-mbps=30&low-latency=true"
+    let low_latency_path = "tcp://127.0.0.1:10017?srtt-ms=20&rate-mbps=30"
         .parse::<PathSpec>()
         .expect("low-latency path");
     let expensive_path = "tcp://127.0.0.1:10018?srtt-ms=80&rate-mbps=500&expensive=true"
@@ -2679,7 +2645,7 @@ fn endpoint_only_udp_stream_bulk_striping_admits_only_best_unmeasured_path() {
 
 #[test]
 fn endpoint_only_udp_rate_hints_rank_service_but_do_not_prove_subflows() {
-    let low_latency_path = "udp://127.0.0.1:10140?srtt-ms=20&rate-mbps=80&low-latency=true"
+    let low_latency_path = "udp://127.0.0.1:10140?srtt-ms=20&rate-mbps=80"
         .parse::<PathSpec>()
         .expect("low latency path");
     let balanced_path = "udp://127.0.0.1:10141?srtt-ms=80&rate-mbps=200"
@@ -3142,7 +3108,6 @@ async fn relay_sender_queue_full_blocks_without_detaching_path() {
             Frame::StreamData {
                 stream_id,
                 offset: 0,
-                flags: StreamFlags::NONE,
                 payload: Bytes::from_static(b"queued"),
             },
             FlowLane::Throughput,
@@ -3176,7 +3141,6 @@ async fn relay_sender_queue_full_blocks_without_detaching_path() {
             Frame::StreamData {
                 stream_id,
                 offset: 1024,
-                flags: StreamFlags::NONE,
                 payload: Bytes::from_static(b"later"),
             },
         )
@@ -3231,7 +3195,6 @@ async fn client_sender_slices_large_upload_reads_to_service_quantum() {
             &context,
             &ReliableRelayOpenSpec {
                 target: TargetAddr::Ip(SocketAddr::from(([127, 0, 0, 1], 80))),
-                ingress: IngressKind::Socks5,
             },
             FlowLane::Throughput,
             FlowLane::Throughput,
@@ -3303,7 +3266,7 @@ async fn path_failure_repairs_enqueue_repair_lane_without_carrier_send() {
     };
 
     let frame = send_stream
-        .send_data(Bytes::from_static(b"repair-me"), StreamFlags::NONE)
+        .send_data(Bytes::from_static(b"repair-me"))
         .expect("stream data frame");
     sender
         .send_stream_data(&context, &mut remotes, frame)
@@ -3426,7 +3389,6 @@ async fn repair_race_attach_preserves_active_data_path() {
         Frame::StreamData {
             stream_id,
             offset: 0,
-            flags: StreamFlags::NONE,
             payload: Bytes::from_static(b"data"),
         },
     )
@@ -3482,7 +3444,7 @@ async fn latency_live_owner_request_tail_repair_uses_distinct_repair_path() {
     let mut send_stream = ReliableSendStream::new(stream_id, limits);
     for value in [0x41, 0x42, 0x43] {
         let frame = send_stream
-            .send_data(Bytes::from(vec![value; 64]), StreamFlags::NONE)
+            .send_data(Bytes::from(vec![value; 64]))
             .expect("seed request OwnerData");
         sender
             .send_stream_data(&context, &mut remotes, frame)
@@ -3494,7 +3456,7 @@ async fn latency_live_owner_request_tail_repair_uses_distinct_repair_path() {
         ));
     }
     let later_owner_frame = send_stream
-        .send_data(Bytes::from(vec![0x44; 64]), StreamFlags::NONE)
+        .send_data(Bytes::from(vec![0x44; 64]))
         .expect("seed later request OwnerData on the alternate");
     let later_owner_key = RelayPathKey {
         underlay: UnderlayProtocol::Udp,
@@ -3542,7 +3504,6 @@ async fn latency_live_owner_request_tail_repair_uses_distinct_repair_path() {
     ));
     let spec = ReliableRelayOpenSpec {
         target: TargetAddr::Ip(SocketAddr::from(([127, 0, 0, 1], 80))),
-        ingress: IngressKind::Socks5,
     };
     let dispatch = sender
         .dispatch_client_queued_work(
@@ -3575,7 +3536,6 @@ async fn latency_live_owner_request_tail_repair_uses_distinct_repair_path() {
         recv_reliable_path_command(&mut repair_commands).await,
         Some(ReliablePathCommand::SendFrame(Frame::StreamData {
             offset: 128,
-            flags: StreamFlags { fin: false, .. },
             payload,
             ..
         })) if payload.len() == 64
@@ -3620,7 +3580,7 @@ async fn repair_only_path_is_not_active_and_cannot_be_reannounced() {
     assert_eq!(
         remotes.active_path_key(),
         None,
-        "RepairOnly attachment must not masquerade as the active service path"
+        "Repair attachment must not masquerade as the active service path"
     );
     assert_eq!(remotes.active_path_underlay(), None);
     assert_eq!(
@@ -3640,7 +3600,6 @@ async fn repair_only_path_is_not_active_and_cannot_be_reannounced() {
     .expect("context");
     let spec = ReliableRelayOpenSpec {
         target: TargetAddr::Ip(SocketAddr::from(([127, 0, 0, 1], 80))),
-        ingress: IngressKind::Socks5,
     };
     let mut sender = RequestSenderService::new(stream_id);
     assert!(matches!(
@@ -3656,7 +3615,7 @@ async fn repair_only_path_is_not_active_and_cannot_be_reannounced() {
         )
         .await
         .is_err(),
-        "reannounce must not emit Active OpenStream on a RepairOnly channel"
+        "reannounce must not emit Active OpenStream on a Repair channel"
     );
 }
 
@@ -3690,7 +3649,7 @@ async fn swallowed_active_control_failure_reports_owner_debt_before_later_data()
     let mut sender = RequestSenderService::new(stream_id);
     let mut send_stream = ReliableSendStream::new(stream_id, limits);
     let owner_frame = send_stream
-        .send_data(Bytes::from_static(b"unacked-owner"), StreamFlags::NONE)
+        .send_data(Bytes::from_static(b"unacked-owner"))
         .expect("seed owner data");
     sender
         .send_stream_data(&context, &mut remotes, owner_frame)
@@ -3734,7 +3693,6 @@ async fn swallowed_active_control_failure_reports_owner_debt_before_later_data()
             Frame::StreamData {
                 stream_id,
                 offset: 1_000_000 + attempt * optional_payload.len() as u64,
-                flags: StreamFlags::NONE,
                 payload: optional_payload.clone(),
             },
             RelaySendCause::AckGapRepair,
@@ -3769,7 +3727,7 @@ async fn swallowed_active_control_failure_reports_owner_debt_before_later_data()
         "the missing owner becomes retryable when its failed-owner PTO expires"
     );
     let later_frame = send_stream
-        .send_data(Bytes::from_static(b"later-owner"), StreamFlags::NONE)
+        .send_data(Bytes::from_static(b"later-owner"))
         .expect("seed later data");
     assert!(matches!(
         sender
@@ -3813,7 +3771,6 @@ async fn repair_only_path_can_become_active_after_explicit_reannounce() {
     .expect("context");
     let spec = ReliableRelayOpenSpec {
         target: TargetAddr::Ip(SocketAddr::from(([127, 0, 0, 1], 80))),
-        ingress: IngressKind::Socks5,
     };
     let mut sender = RequestSenderService::new(stream_id);
     assert!(
@@ -3930,10 +3887,7 @@ async fn active_teardown_promotes_sole_repair_before_failed_owner_repair() {
     let mut sender = RequestSenderService::new(stream_id);
     let mut send_stream = ReliableSendStream::new(stream_id, limits);
     let frame = send_stream
-        .send_data(
-            Bytes::from_static(b"recover-on-survivor"),
-            StreamFlags::NONE,
-        )
+        .send_data(Bytes::from_static(b"recover-on-survivor"))
         .expect("seed failed-owner data");
     sender
         .send_stream_data(&context, &mut remotes, frame)
@@ -3960,7 +3914,6 @@ async fn active_teardown_promotes_sole_repair_before_failed_owner_repair() {
 
     let spec = ReliableRelayOpenSpec {
         target: TargetAddr::Ip(SocketAddr::from(([127, 0, 0, 1], 80))),
-        ingress: IngressKind::Socks5,
     };
     let mut sender_queue = ReliableRelaySenderQueue::default();
     assert_eq!(
@@ -4048,7 +4001,6 @@ async fn bulk_relay_keeps_normal_stream_data_on_active_path() {
         Frame::StreamData {
             stream_id,
             offset: 0,
-            flags: StreamFlags::NONE,
             payload: first_payload,
         },
     )
@@ -4072,7 +4024,6 @@ async fn bulk_relay_keeps_normal_stream_data_on_active_path() {
         Frame::StreamData {
             stream_id,
             offset: 64 * 1024,
-            flags: StreamFlags::NONE,
             payload: second_payload,
         },
     )
@@ -4131,7 +4082,6 @@ async fn request_sender_blocked_bulk_admission_does_not_fallback_to_eta_path() {
         Frame::StreamData {
             stream_id,
             offset: 0,
-            flags: StreamFlags::NONE,
             payload: Bytes::from(vec![1u8; 64 * 1024]),
         },
     )
@@ -4183,7 +4133,6 @@ async fn request_sender_blocked_bulk_admission_does_not_fallback_to_eta_path() {
         Frame::StreamData {
             stream_id,
             offset: 64 * 1024,
-            flags: StreamFlags::NONE,
             payload: Bytes::from(vec![2u8; 64 * 1024]),
         },
     )
@@ -4250,7 +4199,6 @@ async fn bulk_relay_validation_attach_sends_path_proof_not_unique_stream_data() 
         Frame::StreamData {
             stream_id,
             offset: 0,
-            flags: StreamFlags::NONE,
             payload: Bytes::from(vec![8u8; 64 * 1024]),
         },
     )
@@ -4276,40 +4224,6 @@ async fn bulk_relay_validation_attach_sends_path_proof_not_unique_stream_data() 
         .await
         .is_err(),
         "validation path must not receive unique ordinary data before path-scoped proof graduates"
-    );
-}
-
-#[tokio::test]
-async fn validation_attach_keeps_active_data_lane_credit_visible() {
-    let stream_id = StreamId(146);
-    let (active_stream, _active_commands, _active_frames) =
-        opened_relay_stream_for_test(stream_id, UnderlayProtocol::Tcp, 0);
-    let mut remotes = ReliableRelayRemoteSet::new(active_stream, 8);
-
-    assert!(
-        remotes.can_enqueue_work_lane_now(ReliableWorkClass::Data, FlowLane::Throughput),
-        "active path credit must be visible before validation attach"
-    );
-
-    let (validation_stream, mut validation_commands, _validation_frames) =
-        opened_relay_stream_for_test(stream_id, UnderlayProtocol::Tcp, 1);
-    remotes.attach_for_validation(validation_stream);
-
-    match tokio::time::timeout(
-        Duration::from_millis(100),
-        recv_reliable_path_command(&mut validation_commands),
-    )
-    .await
-    .expect("validation proof timeout")
-    .expect("validation proof command")
-    {
-        ReliablePathCommand::SendFrame(Frame::PathProofData { .. }) => {}
-        _ => panic!("validation attach must send carrier proof"),
-    }
-
-    assert!(
-        remotes.can_enqueue_work_lane_now(ReliableWorkClass::Data, FlowLane::Throughput),
-        "validation attachment must not hide active service-path data credit"
     );
 }
 
@@ -4346,7 +4260,6 @@ async fn bulk_relay_uses_measured_tcp_peer_when_ecf_prefers_it() {
         Frame::StreamData {
             stream_id,
             offset: 0,
-            flags: StreamFlags::NONE,
             payload: Bytes::from(vec![4u8; 64 * 1024]),
         },
     )
@@ -4466,7 +4379,6 @@ async fn measured_bulk_alternate_requires_explicit_service_migration() {
     );
     let spec = ReliableRelayOpenSpec {
         target: TargetAddr::Ip(SocketAddr::from(([127, 0, 0, 1], 80))),
-        ingress: IngressKind::Socks5,
     };
     let mut sender = RequestSenderService::new(stream_id);
     assert!(
@@ -4503,7 +4415,6 @@ async fn measured_bulk_alternate_requires_explicit_service_migration() {
         Frame::StreamData {
             stream_id,
             offset: 0,
-            flags: StreamFlags::NONE,
             payload: Bytes::from_static(b"bulk"),
         },
     )
@@ -4630,7 +4541,7 @@ async fn mixed_relay_path_status_active_does_not_replay_whole_repair_cache_on_in
     let mut send_stream = ReliableSendStream::new(stream_id, mux_limits);
     send_stream.update_max_offset(mux_limits.max_stream_window_bytes);
     send_stream
-        .send_data(Bytes::from_static(b"repair"), StreamFlags::NONE)
+        .send_data(Bytes::from_static(b"repair"))
         .expect("repair data");
     let mut sender = RequestSenderService::new(stream_id);
 

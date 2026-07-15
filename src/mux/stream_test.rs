@@ -21,7 +21,7 @@ fn limits() -> MuxLimits {
 fn send_stream_keeps_data_until_tunnel_ack() {
     let mut stream = ReliableSendStream::new(StreamId(1), limits());
     stream
-        .send_data(Bytes::from_static(b"hello"), StreamFlags::NONE)
+        .send_data(Bytes::from_static(b"hello"))
         .expect("send");
 
     assert_eq!(stream.repair_bytes(), 5);
@@ -42,7 +42,7 @@ fn send_stream_keeps_data_until_tunnel_ack() {
 fn send_stream_trims_repair_cache_by_ack_subranges() {
     let mut stream = ReliableSendStream::new(StreamId(2), limits());
     stream
-        .send_data(Bytes::from_static(b"abcdefgh"), StreamFlags::NONE)
+        .send_data(Bytes::from_static(b"abcdefgh"))
         .expect("send");
 
     let outcome = stream.apply_ack(&[OffsetRange::new(2, 6).expect("range")]);
@@ -59,13 +59,11 @@ fn send_stream_trims_repair_cache_by_ack_subranges() {
     assert_eq!(frames.len(), 2);
     assert!(matches!(
         &frames[0],
-        Frame::StreamData { offset: 0, flags, payload, .. }
-            if *flags == StreamFlags::NONE && payload.as_ref() == b"ab"
+        Frame::StreamData { offset: 0, payload, .. } if payload.as_ref() == b"ab"
     ));
     assert!(matches!(
         &frames[1],
-        Frame::StreamData { offset: 6, flags, payload, .. }
-            if *flags == StreamFlags::NONE && payload.as_ref() == b"gh"
+        Frame::StreamData { offset: 6, payload, .. } if payload.as_ref() == b"gh"
     ));
 }
 
@@ -74,7 +72,7 @@ fn send_stream_retransmits_ack_range_holes_before_later_inflight() {
     let mut stream = ReliableSendStream::new(StreamId(7), limits());
     for payload in [b"aaaa", b"bbbb", b"cccc", b"dddd"] {
         stream
-            .send_data(Bytes::copy_from_slice(payload), StreamFlags::NONE)
+            .send_data(Bytes::copy_from_slice(payload))
             .expect("send");
     }
 
@@ -102,7 +100,7 @@ fn send_stream_retransmits_ack_range_holes_before_later_inflight() {
 fn send_stream_slices_ack_gap_repairs_to_byte_limit() {
     let mut stream = ReliableSendStream::new(StreamId(8), limits());
     stream
-        .send_data(Bytes::from_static(b"abcdefgh"), StreamFlags::NONE)
+        .send_data(Bytes::from_static(b"abcdefgh"))
         .expect("send");
 
     let frames = stream.retransmission_frames_for_ack_gaps(
@@ -116,8 +114,7 @@ fn send_stream_slices_ack_gap_repairs_to_byte_limit() {
     assert_eq!(frames.len(), 1);
     assert!(matches!(
         &frames[0],
-        Frame::StreamData { offset: 2, flags, payload, .. }
-            if *flags == StreamFlags::NONE && payload.as_ref() == b"cde"
+        Frame::StreamData { offset: 2, payload, .. } if payload.as_ref() == b"cde"
     ));
 }
 
@@ -125,7 +122,7 @@ fn send_stream_slices_ack_gap_repairs_to_byte_limit() {
 fn send_stream_slices_path_failure_repairs_to_byte_limit() {
     let mut stream = ReliableSendStream::new(StreamId(9), limits());
     stream
-        .send_data(Bytes::from_static(b"abcdefgh"), StreamFlags::NONE)
+        .send_data(Bytes::from_static(b"abcdefgh"))
         .expect("send");
 
     let frames = stream.retransmission_frames_for_ranges(&[OffsetRange { start: 2, end: 7 }], 4);
@@ -133,8 +130,7 @@ fn send_stream_slices_path_failure_repairs_to_byte_limit() {
     assert_eq!(frames.len(), 1);
     assert!(matches!(
         &frames[0],
-        Frame::StreamData { offset: 2, flags, payload, .. }
-            if *flags == StreamFlags::NONE && payload.as_ref() == b"cdef"
+        Frame::StreamData { offset: 2, payload, .. } if payload.as_ref() == b"cdef"
     ));
 }
 
@@ -143,7 +139,7 @@ fn send_stream_repairs_tail_after_ack_frontier() {
     let mut stream = ReliableSendStream::new(StreamId(10), limits());
     for payload in [b"aaaa", b"bbbb", b"cccc"] {
         stream
-            .send_data(Bytes::copy_from_slice(payload), StreamFlags::NONE)
+            .send_data(Bytes::copy_from_slice(payload))
             .expect("send");
     }
 
@@ -165,7 +161,7 @@ fn send_stream_repairs_tail_after_ack_frontier() {
 fn send_stream_prepares_data_without_taking_ownership_until_commit() {
     let mut stream = ReliableSendStream::new(StreamId(1), limits());
     let frame = stream
-        .prepare_data(Bytes::from_static(b"hello"), StreamFlags::NONE)
+        .prepare_data(Bytes::from_static(b"hello"))
         .expect("prepare");
 
     assert_eq!(stream.next_offset(), 0);
@@ -199,13 +195,13 @@ fn send_stream_with_explicit_zero_credit_waits_for_peer_max_data() {
     let mut stream = ReliableSendStream::new_with_initial_max_offset(StreamId(11), limits(), 0);
 
     assert!(matches!(
-        stream.send_data(Bytes::from_static(b"hello"), StreamFlags::NONE),
+        stream.send_data(Bytes::from_static(b"hello")),
         Err(StreamError::FlowControlBlocked { max: 0, .. })
     ));
 
     stream.update_max_offset(5);
     stream
-        .send_data(Bytes::from_static(b"hello"), StreamFlags::NONE)
+        .send_data(Bytes::from_static(b"hello"))
         .expect("peer max data creates send credit");
 }
 
@@ -216,7 +212,7 @@ fn send_stream_enforces_flow_control_and_repair_limit() {
     let mut stream = ReliableSendStream::new(StreamId(1), limit);
 
     assert!(matches!(
-        stream.send_data(Bytes::from_static(b"hello"), StreamFlags::NONE),
+        stream.send_data(Bytes::from_static(b"hello")),
         Err(StreamError::FlowControlBlocked { .. })
     ));
 
@@ -224,7 +220,7 @@ fn send_stream_enforces_flow_control_and_repair_limit() {
     limit.max_repair_bytes = 4;
     let mut stream = ReliableSendStream::new(StreamId(1), limit);
     assert!(matches!(
-        stream.send_data(Bytes::from_static(b"hello"), StreamFlags::NONE),
+        stream.send_data(Bytes::from_static(b"hello")),
         Err(StreamError::RepairCacheFull { .. })
     ));
 }
@@ -234,14 +230,7 @@ fn recv_stream_reassembles_out_of_order_data_and_builds_ack_ranges() {
     let mut stream = ReliableRecvStream::new(StreamId(7), limits());
     assert_eq!(stream.max_data_offset(), limits().max_stream_window_bytes);
     let first = stream
-        .receive_data(
-            5,
-            Bytes::from_static(b" world"),
-            StreamFlags {
-                fin: true,
-                early_data: false,
-            },
-        )
+        .receive_data(5, Bytes::from_static(b" world"))
         .expect("second chunk");
     assert!(first.delivered.is_empty());
     assert_eq!(
@@ -250,14 +239,13 @@ fn recv_stream_reassembles_out_of_order_data_and_builds_ack_ranges() {
     );
 
     let second = stream
-        .receive_data(0, Bytes::from_static(b"hello"), StreamFlags::NONE)
+        .receive_data(0, Bytes::from_static(b"hello"))
         .expect("first chunk");
 
     assert_eq!(
         second.delivered.as_slice(),
         &[Bytes::from_static(b"hello"), Bytes::from_static(b" world")]
     );
-    assert!(second.fin);
     assert_eq!(stream.next_offset(), 11);
     assert_eq!(stream.reorder_bytes(), 0);
     assert_eq!(
@@ -292,22 +280,22 @@ fn recv_stream_limits_encoded_ack_ranges_without_rejecting_reordering() {
     let mut stream = ReliableRecvStream::new(StreamId(7), limit);
 
     stream
-        .receive_data(0, Bytes::from_static(b"a"), StreamFlags::NONE)
+        .receive_data(0, Bytes::from_static(b"a"))
         .expect("first chunk");
     stream
-        .receive_data(10, Bytes::from_static(b"b"), StreamFlags::NONE)
+        .receive_data(10, Bytes::from_static(b"b"))
         .expect("second range");
     stream
-        .receive_data(20, Bytes::from_static(b"c"), StreamFlags::NONE)
+        .receive_data(20, Bytes::from_static(b"c"))
         .expect("third range");
     stream
-        .receive_data(30, Bytes::from_static(b"d"), StreamFlags::NONE)
+        .receive_data(30, Bytes::from_static(b"d"))
         .expect("fourth range");
     stream
-        .receive_data(40, Bytes::from_static(b"e"), StreamFlags::NONE)
+        .receive_data(40, Bytes::from_static(b"e"))
         .expect("fifth range");
     stream
-        .receive_data(50, Bytes::from_static(b"f"), StreamFlags::NONE)
+        .receive_data(50, Bytes::from_static(b"f"))
         .expect("sixth range");
 
     assert_eq!(stream.ack_ranges().len(), 6);
@@ -347,7 +335,7 @@ fn recv_stream_splits_large_ack_sets_into_bounded_frames() {
 
     for offset in [0, 10, 20, 30, 40] {
         stream
-            .receive_data(offset, Bytes::from_static(b"x"), StreamFlags::NONE)
+            .receive_data(offset, Bytes::from_static(b"x"))
             .expect("range");
     }
 
@@ -383,19 +371,19 @@ fn recv_stream_splits_large_ack_sets_into_bounded_frames() {
 fn recv_stream_accepts_duplicate_overlap_and_rejects_reorder_pressure() {
     let mut stream = ReliableRecvStream::new(StreamId(7), limits());
     stream
-        .receive_data(0, Bytes::from_static(b"hello"), StreamFlags::NONE)
+        .receive_data(0, Bytes::from_static(b"hello"))
         .expect("first");
     assert_eq!(
-        stream.receive_data(2, Bytes::from_static(b"xx"), StreamFlags::NONE),
+        stream.receive_data(2, Bytes::from_static(b"xx")),
         Ok(ReceiveOutcome::default())
     );
 
     let mut stream = ReliableRecvStream::new(StreamId(8), limits());
     stream
-        .receive_data(5, Bytes::from_static(b"world"), StreamFlags::NONE)
+        .receive_data(5, Bytes::from_static(b"world"))
         .expect("out of order tail");
     let outcome = stream
-        .receive_data(0, Bytes::from_static(b"hello w"), StreamFlags::NONE)
+        .receive_data(0, Bytes::from_static(b"hello w"))
         .expect("partially overlapping lower range");
     assert_eq!(
         outcome.delivered.as_slice(),
@@ -404,7 +392,7 @@ fn recv_stream_accepts_duplicate_overlap_and_rejects_reorder_pressure() {
     assert_eq!(stream.next_offset(), 10);
     assert_eq!(stream.reorder_bytes(), 0);
     assert_eq!(
-        stream.receive_data(3, Bytes::from_static(b"lo wo"), StreamFlags::NONE),
+        stream.receive_data(3, Bytes::from_static(b"lo wo")),
         Ok(ReceiveOutcome::default())
     );
 
@@ -412,7 +400,7 @@ fn recv_stream_accepts_duplicate_overlap_and_rejects_reorder_pressure() {
     limit.max_reorder_bytes = 4;
     let mut stream = ReliableRecvStream::new(StreamId(9), limit);
     assert!(matches!(
-        stream.receive_data(10, Bytes::from_static(b"hello"), StreamFlags::NONE),
+        stream.receive_data(10, Bytes::from_static(b"hello")),
         Err(StreamError::ReorderBufferFull { .. })
     ));
 }

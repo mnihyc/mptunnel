@@ -165,7 +165,6 @@ pub(super) fn reliable_relay_can_send_pending_fin(
 pub(super) fn reliable_relay_queued_send_blocked_for_retry(
     sender_queue_empty: bool,
     sender_retry_at: Option<tokio::time::Instant>,
-    _front_has_carrier_credit: bool,
 ) -> bool {
     !sender_queue_empty && sender_retry_at.is_some()
 }
@@ -363,7 +362,6 @@ pub(super) fn spawn_reliable_relay_validation_opens(
         *attempt = attempt.saturating_add(1);
         let context = context.clone();
         let target = spec.target.clone();
-        let ingress = spec.ingress;
         let result_tx = result_tx.clone();
         let handle = tokio::spawn(async move {
             let open_timeouts = reliable_relay_attach_open_timeouts(&context, key);
@@ -381,7 +379,6 @@ pub(super) fn spawn_reliable_relay_validation_opens(
                             &context,
                             stream_id,
                             target,
-                            ingress,
                             lane,
                             key.index,
                             StreamOpenRole::Validation,
@@ -399,7 +396,6 @@ pub(super) fn spawn_reliable_relay_validation_opens(
                             &context,
                             stream_id,
                             target,
-                            ingress,
                             lane,
                             key.index,
                             UdpStreamOpenOptions {

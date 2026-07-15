@@ -8,7 +8,9 @@ use super::session::TcpCapacityProbeSessionLease;
 #[cfg(feature = "lab-diagnostics")]
 use crate::lab_diagnostics::lab_diagnostic;
 use crate::model::capacity::QuicCapacityProofCandidate;
-use crate::model::path::{CarrierPathInstanceId, CarrierPathKey, next_carrier_path_instance_id};
+#[cfg(test)]
+use crate::model::path::next_carrier_path_instance_id;
+use crate::model::path::{CarrierPathInstanceId, CarrierPathKey};
 use crate::model::response::ResponsePathObservation;
 #[cfg(feature = "lab-diagnostics")]
 use crate::protocol::SessionId;
@@ -33,6 +35,7 @@ pub(super) fn response_owner_underlay_seen_bit(underlay: UnderlayProtocol) -> u8
     }
 }
 
+#[cfg(test)]
 pub(in crate::runtime) fn next_server_carrier_path_instance_id() -> CarrierPathInstanceId {
     next_carrier_path_instance_id()
 }
@@ -50,7 +53,7 @@ pub(in crate::runtime) enum ResponseStreamAttachOutcome {
 ///
 /// It owns carrier command access and sender-evidence fields for this stream on
 /// this path. Product repair and ordering identity stay in `ResponseStreamBinding`.
-#[derive(Clone)]
+#[cfg_attr(test, derive(Clone))]
 pub(in crate::runtime) struct ResponseStreamOutputEntry {
     pub(super) key: CarrierPathKey,
     pub(super) path_instance_id: CarrierPathInstanceId,
@@ -61,7 +64,6 @@ pub(in crate::runtime) struct ResponseStreamOutputEntry {
     /// Repair copies remain in `bytes_in_flight` but never enter this counter.
     pub(super) owner_data_in_flight_bytes: u64,
     pub(super) bytes_in_flight: u64,
-    pub(super) product_queue_bytes: u64,
     pub(super) product_progress_rate_bps: Option<f64>,
     pub(super) delivery_rate_bps: Option<f64>,
     /// TCP per-flow goodput from exact OwnerData ACKs. It is not carrier
@@ -93,6 +95,9 @@ pub(in crate::runtime) struct TcpResponseCapacityPrior {
 
 pub(in crate::runtime) struct ResponseStreamOutputs {
     pub(super) entries: Vec<ResponseStreamOutputEntry>,
+    /// Offset-free sender-service staging belongs to the response stream, not
+    /// to any carrier output.
+    pub(super) product_queue_bytes: u64,
     pub(super) ack_clock_calibrations:
         HashMap<(CarrierPathKey, u64), ResponseAckClockCalibrationState>,
     pub(super) active_ack_clock_calibration: Option<(CarrierPathKey, u64)>,
@@ -125,7 +130,6 @@ impl ResponseStreamBinding {
         commands: ReliablePathCommandSender,
         lane: FlowLane,
         role: StreamOpenRole,
-        max_frame_payload_bytes: usize,
     ) -> ResponseStreamAttachOutcome {
         let key = CarrierPathKey { underlay, path_id };
         let path_instance_id = self
@@ -138,15 +142,7 @@ impl ResponseStreamBinding {
             .map_or_else(next_server_carrier_path_instance_id, |entry| {
                 entry.path_instance_id
             });
-        self.attach_with_path_instance(
-            underlay,
-            path_id,
-            path_instance_id,
-            commands,
-            lane,
-            role,
-            max_frame_payload_bytes,
-        )
+        self.attach_with_path_instance(underlay, path_id, path_instance_id, commands, lane, role)
     }
 
     pub(in crate::runtime::stream) fn attach_with_path_instance(
@@ -157,7 +153,6 @@ impl ResponseStreamBinding {
         commands: ReliablePathCommandSender,
         lane: FlowLane,
         role: StreamOpenRole,
-        _max_frame_payload_bytes: usize,
     ) -> ResponseStreamAttachOutcome {
         let mut current_lane = self.lane.lock().expect("server reliable stream lane lock");
         let previous_lane = *current_lane;
@@ -325,7 +320,6 @@ impl ResponseStreamBinding {
                 entry.role = role;
                 entry.owner_data_in_flight_bytes = 0;
                 entry.bytes_in_flight = 0;
-                entry.product_queue_bytes = 0;
                 entry.product_progress_rate_bps = None;
                 entry.delivery_rate_bps = None;
                 entry.tcp_ack_clock_rate_bps = None;
@@ -368,7 +362,6 @@ impl ResponseStreamBinding {
                 role,
                 owner_data_in_flight_bytes: 0,
                 bytes_in_flight: 0,
-                product_queue_bytes: 0,
                 product_progress_rate_bps: None,
                 delivery_rate_bps: None,
                 tcp_ack_clock_rate_bps: None,

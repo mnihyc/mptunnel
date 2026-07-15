@@ -45,7 +45,6 @@ fn sender_quic_geometry_is_accepted_by_the_binding_transaction() {
         candidate_commands,
         FlowLane::Throughput,
         StreamOpenRole::Validation,
-        mux_limits.max_payload_bytes,
     );
     assert!(matches!(
         try_recv_reliable_path_command(&mut candidate_receivers),

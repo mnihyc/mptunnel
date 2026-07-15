@@ -1,6 +1,6 @@
 use super::*;
 use crate::model::admission::bulk_candidate_admission_suppression_with_ordering_debt;
-use crate::model::multipath::PathRuntimeRole;
+use crate::model::multipath::PathAdmission;
 use crate::runtime::sender::response::test_support::response_target;
 
 #[test]
@@ -19,11 +19,7 @@ fn active_quic_response_owner_emission_credit_uses_product_envelope_not_carrier_
 
     assert_eq!(
         credit,
-        bulk_active_service_product_envelope_bytes(
-            active.observation.snapshot,
-            payload_bytes,
-            mux_limits
-        ) as usize,
+        bulk_active_service_product_envelope_bytes(payload_bytes, mux_limits) as usize,
         "active response owner must use the product envelope, not current carrier cwnd"
     );
     assert!(
@@ -92,12 +88,7 @@ fn active_quic_response_owner_bootstraps_with_bounded_feed_reservoir() {
         "QUIC needs a durable ACK-derived sample before the full product envelope"
     );
     assert!(
-        credit
-            < bulk_active_service_product_envelope_bytes(
-                active.observation.snapshot,
-                payload_bytes,
-                mux_limits,
-            ) as usize
+        credit < bulk_active_service_product_envelope_bytes(payload_bytes, mux_limits,) as usize
     );
 
     active.observation.has_service_feed_evidence = true;
@@ -109,11 +100,7 @@ fn active_quic_response_owner_bootstraps_with_bounded_feed_reservoir() {
     );
     assert_eq!(
         mature_feed_credit,
-        bulk_active_service_product_envelope_bytes(
-            active.observation.snapshot,
-            payload_bytes,
-            mux_limits
-        ) as usize,
+        bulk_active_service_product_envelope_bytes(payload_bytes, mux_limits) as usize,
         "durable current-Service QUIC ACK progress unlocks the product envelope"
     );
     assert!(
@@ -147,11 +134,7 @@ fn response_quic_feed_credit_uses_live_carrier_debt_not_outdated_bdp() {
 
     assert_eq!(
         quic_credit,
-        bulk_active_service_product_envelope_bytes(
-            loaded_quic.observation.snapshot,
-            payload_bytes,
-            mux_limits,
-        ) as usize,
+        bulk_active_service_product_envelope_bytes(payload_bytes, mux_limits,) as usize,
         "active QUIC Service feed credit must follow the product envelope, not live carrier debt"
     );
     assert!(
@@ -174,11 +157,7 @@ fn response_quic_feed_credit_uses_live_carrier_debt_not_outdated_bdp() {
 
     assert_eq!(
         tcp_credit,
-        bulk_active_service_product_envelope_bytes(
-            loaded_tcp.observation.snapshot,
-            payload_bytes,
-            mux_limits,
-        ) as usize,
+        bulk_active_service_product_envelope_bytes(payload_bytes, mux_limits,) as usize,
         "active TCP owners use the same carrier-neutral product envelope as active QUIC owners"
     );
 
@@ -221,11 +200,7 @@ fn active_tcp_response_owner_uses_product_envelope() {
             payload_bytes,
             mux_limits
         ),
-        bulk_active_service_product_envelope_bytes(
-            target.observation.snapshot,
-            payload_bytes,
-            mux_limits
-        ) as usize,
+        bulk_active_service_product_envelope_bytes(payload_bytes, mux_limits) as usize,
         "active TCP and QUIC owners should use the same product envelope; transport pacing belongs below the sender service"
     );
 }
@@ -261,11 +236,11 @@ fn proof_only_fallback_lead_cannot_become_response_service_owner() {
     );
 
     assert_eq!(
-        admission.decision,
-        PathAdmissionDecision::ProbeOnly,
+        admission,
+        PathAdmission::ProbeOnly,
         "sender/proof evidence is not Service ownership; only an active anchor or bulk-rate-proven failover may own the Service role"
     );
-    assert_eq!(admission.role, PathRuntimeRole::Probe);
+    assert_eq!(admission, PathAdmission::ProbeOnly);
 }
 
 #[test]
@@ -308,8 +283,8 @@ fn proof_only_validation_candidate_gets_explicit_startup_admission() {
         mux_limits,
     );
 
-    assert_eq!(admission.decision, PathAdmissionDecision::AdmitSubflow);
-    assert_eq!(admission.role, PathRuntimeRole::Subflow);
+    assert_eq!(admission, PathAdmission::Subflow);
+    assert_eq!(admission, PathAdmission::Subflow);
 }
 
 #[test]
@@ -335,8 +310,8 @@ fn frontier_clear_bulk_rate_candidate_is_subflow_not_service() {
         mux_limits,
     );
 
-    assert_eq!(admission.decision, PathAdmissionDecision::AdmitSubflow);
-    assert_eq!(admission.role, PathRuntimeRole::Subflow);
+    assert_eq!(admission, PathAdmission::Subflow);
+    assert_eq!(admission, PathAdmission::Subflow);
 }
 
 #[test]
@@ -416,7 +391,7 @@ fn app_limited_bulk_proven_slow_subflow_still_requires_completion_gain() {
         mux_limits,
     );
 
-    assert_eq!(admission.decision, PathAdmissionDecision::Standby);
+    assert_eq!(admission, PathAdmission::Standby);
 }
 
 #[test]
@@ -472,7 +447,7 @@ fn app_limited_bulk_proven_fast_subflow_can_still_improve_completion() {
         mux_limits,
     );
 
-    assert_eq!(admission.decision, PathAdmissionDecision::AdmitSubflow);
+    assert_eq!(admission, PathAdmission::Subflow);
 }
 
 #[test]
@@ -501,8 +476,8 @@ fn active_attachment_without_bulk_evidence_remains_service_anchor_when_measured_
     );
 
     assert_eq!(
-        admission.decision,
-        PathAdmissionDecision::Service,
+        admission,
+        PathAdmission::Service,
         "the active attachment remains the Service anchor; measured alternates are Subflows"
     );
 }

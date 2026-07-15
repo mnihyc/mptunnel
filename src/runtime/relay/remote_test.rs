@@ -14,9 +14,7 @@ use crate::model::capacity::{
 use crate::model::path::RelayPathKey;
 use crate::mux::MuxLimits;
 use crate::mux::stream::ReliableSendStream;
-use crate::protocol::{
-    Frame, IngressKind, PathId, StreamFlags, StreamId, StreamOpenRole, TargetAddr, UnderlayProtocol,
-};
+use crate::protocol::{Frame, PathId, StreamId, StreamOpenRole, TargetAddr, UnderlayProtocol};
 use crate::runtime::error::RuntimeError;
 use crate::runtime::path::ClientPathContext;
 use crate::runtime::path::commands::{
@@ -497,7 +495,6 @@ async fn sender_recovery_attach_api_cannot_bypass_inflight_claim() {
     let send_stream = ReliableSendStream::new(StreamId(14), MuxLimits::default());
     let spec = ReliableRelayOpenSpec {
         target: TargetAddr::Ip(SocketAddr::from(([127, 0, 0, 1], 80))),
-        ingress: IngressKind::Socks5,
     };
     let claimed = HashSet::from([RelayPathKey {
         underlay: UnderlayProtocol::Tcp,
@@ -591,7 +588,7 @@ async fn repair_attach_candidates_cross_carrier_by_eta_not_active_family() {
 fn throughput_repair_bytes_use_repair_attachment_role() {
     let mut send_stream = ReliableSendStream::new(StreamId(152), MuxLimits::default());
     send_stream
-        .send_data(Bytes::from_static(b"repairable"), StreamFlags::NONE)
+        .send_data(Bytes::from_static(b"repairable"))
         .expect("send data");
 
     assert!(reliable_relay_should_race_repair(

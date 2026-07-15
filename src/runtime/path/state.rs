@@ -1038,19 +1038,6 @@ impl ClientPathContext {
         }
     }
 
-    pub(in crate::runtime) fn mark_udp_path_mtu(&self, index: usize, payload_bytes: usize) {
-        if let Some(current) = self
-            .state
-            .health
-            .lock()
-            .expect("client path health lock")
-            .udp
-            .get_mut(index)
-        {
-            current.mark_udp_mtu(payload_bytes);
-        }
-    }
-
     pub(in crate::runtime) fn mark_udp_path_failure(&self, index: usize) {
         let now = Instant::now();
         let mut health = self.state.health.lock().expect("client path health lock");

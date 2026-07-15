@@ -46,7 +46,6 @@ fn parser_exposes_only_counter_groups_present_in_the_returned_prefix() {
     bytes[104..112].copy_from_slice(&10_000_000u64.to_ne_bytes());
     bytes[120..128].copy_from_slice(&123_456u64.to_ne_bytes());
     bytes[144..148].copy_from_slice(&99u32.to_ne_bytes());
-    bytes[148..152].copy_from_slice(&18_000u32.to_ne_bytes());
     bytes[156..160].copy_from_slice(&42u32.to_ne_bytes());
     bytes[160..168].copy_from_slice(&8_000_000u64.to_ne_bytes());
 
@@ -55,7 +54,6 @@ fn parser_exposes_only_counter_groups_present_in_the_returned_prefix() {
     }
     let rtt_only = parse_tcp_info_prefix(&bytes, 76).expect("RTT prefix");
     assert_eq!(rtt_only.rtt.expect("RTT group").srtt_us, 20_000);
-    assert_eq!(rtt_only.rtt.expect("RTT group").min_rtt_us, None);
     assert_eq!(rtt_only.flight, None);
 
     let flight = parse_tcp_info_prefix(&bytes, 84).expect("flight prefix");
@@ -72,10 +70,6 @@ fn parser_exposes_only_counter_groups_present_in_the_returned_prefix() {
 
     let queue = parse_tcp_info_prefix(&bytes, 148).expect("queue prefix");
     assert_eq!(queue.notsent_bytes, Some(99));
-    assert_eq!(queue.rtt.expect("RTT group").min_rtt_us, None);
-
-    let min_rtt = parse_tcp_info_prefix(&bytes, 152).expect("minimum RTT prefix");
-    assert_eq!(min_rtt.rtt.expect("RTT group").min_rtt_us, Some(18_000));
 
     let loss = parse_tcp_info_prefix(&bytes, 160).expect("loss prefix");
     assert_eq!(loss.loss.expect("loss counters").retransmits, 7);

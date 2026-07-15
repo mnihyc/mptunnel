@@ -139,14 +139,15 @@ impl ServerUdpTerminalWriterFixture {
             metadata: PathMetadata::default(),
         };
         let client_runtime = ClientUdpPathSessionRuntime {
-            path: client_path.clone(),
+            paths: Arc::new(vec![client_path.clone()]),
+            config_index: 0,
             path_index: 0,
             carrier_identity: CarrierPathIdentity {
                 group_ordinal: 0,
                 path_ordinal: 0,
             },
             session_id,
-            security: context.security.clone(),
+            security: Arc::new(vec![context.security.clone()]),
             codec_limits: context.codec_limits,
             mux_limits: context.mux_limits,
             stream_frame_queue: 8,

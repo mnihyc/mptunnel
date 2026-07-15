@@ -6,10 +6,9 @@ use super::super::test_support::{
 use super::{RESPONSE_OWNER_MIXED_SEEN, RESPONSE_OWNER_TCP_SEEN, ResponseStreamAttachOutcome};
 use crate::model::capacity::{
     BBR_MAX_SEND_QUANTUM_BYTES, MIN_RATE_SAMPLE_BYTES, PATH_OPEN_SCORE_BYTES,
-    RELIABLE_INITIAL_WINDOW_PACKETS, reliable_relay_buffer_len,
-    reliable_subflow_startup_sample_limit_bytes,
+    RELIABLE_INITIAL_WINDOW_PACKETS, reliable_subflow_startup_sample_limit_bytes,
 };
-use crate::model::multipath::{FlowSubflowSet, PathAdmissionDecision, SubflowAdmissionInput};
+use crate::model::multipath::{FlowSubflowSet, PathAdmission, SubflowAdmissionInput};
 use crate::model::path::CarrierPathKey;
 use crate::mux::MuxLimits;
 use crate::protocol::{
@@ -22,7 +21,6 @@ use crate::runtime::path::model::metric_epoch_now;
 use crate::runtime::relay::io::reliable_stream_recv_progress_interval;
 use crate::scheduler::FlowLane;
 use std::sync::atomic::Ordering;
-use std::time::Duration;
 
 #[test]
 fn response_validation_attach_adds_output_without_promoting_lead() {
@@ -41,7 +39,6 @@ fn response_validation_attach_adds_output_without_promoting_lead() {
             validation_commands,
             FlowLane::Throughput,
             StreamOpenRole::Validation,
-            reliable_relay_buffer_len(MuxLimits::default()),
         ),
         ResponseStreamAttachOutcome::Attached
     );
@@ -86,7 +83,6 @@ fn response_repair_output_requires_explicit_active_reannounce() {
             repair_commands.clone(),
             FlowLane::Latency,
             StreamOpenRole::Repair,
-            reliable_relay_buffer_len(MuxLimits::default()),
         ),
         ResponseStreamAttachOutcome::Attached
     );
@@ -103,7 +99,6 @@ fn response_repair_output_requires_explicit_active_reannounce() {
             repair_commands.clone(),
             FlowLane::Latency,
             StreamOpenRole::Validation,
-            reliable_relay_buffer_len(MuxLimits::default()),
         ),
         ResponseStreamAttachOutcome::Attached,
         "same-channel Validation cannot weaken an existing Repair role"
@@ -121,7 +116,6 @@ fn response_repair_output_requires_explicit_active_reannounce() {
             repair_commands,
             FlowLane::Latency,
             StreamOpenRole::Active,
-            reliable_relay_buffer_len(MuxLimits::default()),
         ),
         ResponseStreamAttachOutcome::RoleChanged,
         "explicit Active reannounce may promote future work without changing old repair-flight semantics"
@@ -190,7 +184,6 @@ fn response_sender_targets_active_path_follows_ordered_data_owner_not_output_tai
             validation_commands,
             FlowLane::Throughput,
             StreamOpenRole::Validation,
-            reliable_relay_buffer_len(MuxLimits::default()),
         ),
         ResponseStreamAttachOutcome::Attached
     );
@@ -251,7 +244,6 @@ fn response_duplicate_active_attach_with_different_channel_is_rejected() {
             validation_commands,
             FlowLane::Throughput,
             StreamOpenRole::Validation,
-            reliable_relay_buffer_len(MuxLimits::default()),
         ),
         ResponseStreamAttachOutcome::Attached
     );
@@ -272,7 +264,6 @@ fn response_duplicate_active_attach_with_different_channel_is_rejected() {
             duplicate_commands,
             FlowLane::Throughput,
             StreamOpenRole::Active,
-            reliable_relay_buffer_len(MuxLimits::default()),
         ),
         ResponseStreamAttachOutcome::RejectedDuplicateLiveOutput
     );
@@ -304,7 +295,6 @@ fn response_validation_same_channel_active_attach_does_not_promote_service_owner
             validation_commands.clone(),
             FlowLane::Throughput,
             StreamOpenRole::Validation,
-            reliable_relay_buffer_len(MuxLimits::default()),
         ),
         ResponseStreamAttachOutcome::Attached
     );
@@ -317,7 +307,6 @@ fn response_validation_same_channel_active_attach_does_not_promote_service_owner
             validation_commands,
             FlowLane::Throughput,
             StreamOpenRole::Active,
-            reliable_relay_buffer_len(MuxLimits::default()),
         ),
         ResponseStreamAttachOutcome::RoleChanged
     );
@@ -355,7 +344,6 @@ fn response_detaching_service_owner_does_not_promote_probe_only_survivor_to_serv
             survivor_commands,
             FlowLane::Throughput,
             StreamOpenRole::Validation,
-            reliable_relay_buffer_len(MuxLimits::default()),
         ),
         ResponseStreamAttachOutcome::Attached
     );
@@ -367,7 +355,6 @@ fn response_detaching_service_owner_does_not_promote_probe_only_survivor_to_serv
             direction: PathMetricDirection::ServerToClient,
             metric_epoch: metric_epoch_now(),
             metric_age_us: 0,
-            min_rtt_us: 20_000,
             srtt_us: 20_000,
             rttvar_us: 1_000,
             jitter_us: 1_000,
@@ -434,7 +421,6 @@ fn response_detaching_service_owner_does_not_promote_ack_data_survivor() {
             survivor_commands,
             FlowLane::Throughput,
             StreamOpenRole::Validation,
-            reliable_relay_buffer_len(MuxLimits::default()),
         ),
         ResponseStreamAttachOutcome::Attached
     );
@@ -446,7 +432,6 @@ fn response_detaching_service_owner_does_not_promote_ack_data_survivor() {
             direction: PathMetricDirection::ServerToClient,
             metric_epoch: metric_epoch_now(),
             metric_age_us: 0,
-            min_rtt_us: 20_000,
             srtt_us: 20_000,
             rttvar_us: 1_000,
             jitter_us: 1_000,
@@ -519,7 +504,6 @@ fn response_service_detach_does_not_pick_measured_survivor_by_output_tail() {
             measured_commands,
             FlowLane::Throughput,
             StreamOpenRole::Validation,
-            reliable_relay_buffer_len(MuxLimits::default()),
         ),
         ResponseStreamAttachOutcome::Attached
     );
@@ -531,7 +515,6 @@ fn response_service_detach_does_not_pick_measured_survivor_by_output_tail() {
             direction: PathMetricDirection::ServerToClient,
             metric_epoch: metric_epoch_now(),
             metric_age_us: 0,
-            min_rtt_us: 20_000,
             srtt_us: 20_000,
             rttvar_us: 1_000,
             jitter_us: 1_000,
@@ -560,7 +543,6 @@ fn response_service_detach_does_not_pick_measured_survivor_by_output_tail() {
             probe_commands,
             FlowLane::Throughput,
             StreamOpenRole::Validation,
-            reliable_relay_buffer_len(MuxLimits::default()),
         ),
         ResponseStreamAttachOutcome::Attached
     );
@@ -599,7 +581,6 @@ fn live_role_change_clears_evidence_and_invalidates_old_flights() {
             commands.clone(),
             FlowLane::Throughput,
             StreamOpenRole::Validation,
-            reliable_relay_buffer_len(MuxLimits::default()),
         ),
         ResponseStreamAttachOutcome::Attached
     );
@@ -618,7 +599,6 @@ fn live_role_change_clears_evidence_and_invalidates_old_flights() {
             commands,
             FlowLane::Throughput,
             StreamOpenRole::Repair,
-            reliable_relay_buffer_len(MuxLimits::default()),
         ),
         ResponseStreamAttachOutcome::RoleChanged
     );
@@ -663,7 +643,6 @@ fn validation_to_active_preserves_response_identity_evidence_and_subflow_epoch()
             commands.clone(),
             FlowLane::Throughput,
             StreamOpenRole::Validation,
-            reliable_relay_buffer_len(limits),
         ),
         ResponseStreamAttachOutcome::Attached
     );
@@ -674,21 +653,11 @@ fn validation_to_active_preserves_response_identity_evidence_and_subflow_epoch()
         frontier_clear: true,
         completion_improves: false,
         observed_goodput_non_degrading: true,
-        read_gap: Duration::ZERO,
         owner_bytes: sample_bytes,
-        optional_overhead_bytes: 0,
     };
     assert_eq!(
-        binding
-            .commit_subflow_owner_admission(
-                service,
-                sample_bytes,
-                0,
-                Duration::ZERO,
-                startup_input,
-            )
-            .decision,
-        PathAdmissionDecision::AdmitSubflow
+        binding.commit_subflow_owner_admission(service, sample_bytes, startup_input,),
+        PathAdmission::Subflow
     );
     let incarnation = {
         let mut outputs = binding.outputs.lock().expect("test response outputs lock");
@@ -713,7 +682,6 @@ fn validation_to_active_preserves_response_identity_evidence_and_subflow_epoch()
             commands,
             FlowLane::Throughput,
             StreamOpenRole::Active,
-            reliable_relay_buffer_len(limits),
         ),
         ResponseStreamAttachOutcome::RoleChanged
     );

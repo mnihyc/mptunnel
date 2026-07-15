@@ -21,9 +21,7 @@ use crate::model::capacity::{
     PATH_OPEN_SCORE_BYTES, bbr_inflight_target_bytes,
     product_delivery_samples_override_startup_prior, reliable_subflow_startup_sample_limit_bytes,
 };
-use crate::model::multipath::{
-    FlowSubflowSet, PathAdmissionDecision, PathRuntimeRole, SubflowAdmissionInput,
-};
+use crate::model::multipath::{FlowSubflowSet, PathAdmission, SubflowAdmissionInput};
 use crate::model::path::{
     RelayPathInstance, RelayPathKey, RelayPathPlacement, RelayPathProofEpoch,
 };
@@ -32,16 +30,16 @@ use crate::model::request::evidence::RequestPerFlowRateModel;
 use crate::mux::MuxLimits;
 use crate::protocol::frame::reliable_stream_frame_extent;
 use crate::protocol::{Frame, StreamId, UnderlayProtocol};
+use crate::runtime::path::ReliableRequestTcpPathEvidence;
 use crate::runtime::stream::request::{
     RequestAckClockOperation, RequestFlightLedger, RequestSubflowState, RequestSubflows,
 };
 use crate::scheduler::{
-    self, FlowLane, PathRateScope, PathSnapshot, SchedulerPolicy, cyclic_cursor_distance,
+    self, FlowLane, PathRateScope, PathSnapshot, cyclic_cursor_distance,
     path_within_adaptive_lead_hysteresis,
 };
 use smallvec::SmallVec;
 use std::collections::HashSet;
-use std::time::Duration;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) enum BulkRelayPathChoice {
@@ -85,17 +83,10 @@ pub(super) struct RequestRelayPathObservation {
     pub(super) can_enqueue_stream_lane: bool,
     pub(super) load_owned: bool,
     pub(super) shared_snapshot: Option<PathSnapshot>,
-    pub(super) tcp: Option<RequestRelayTcpPathObservation>,
+    pub(super) tcp: Option<ReliableRequestTcpPathEvidence>,
     pub(super) has_bulk_model_evidence: bool,
     pub(super) fresh_proof: Option<RelayPathProofEpoch>,
     pub(super) config_ordinal: usize,
-}
-
-/// TCP-only scheduling priors; QUIC paths cannot construct this extension.
-#[derive(Debug, Clone, Copy)]
-pub(super) struct RequestRelayTcpPathObservation {
-    pub(super) startup_snapshot: PathSnapshot,
-    pub(super) rate_hint_unknown: bool,
 }
 
 impl RequestRelayPathObservation {
@@ -134,12 +125,7 @@ pub(super) fn choose_observed_ordinary_data_path(
             .filter(|(_, path)| allowed(path))
             .filter_map(|(position, path)| {
                 let snapshot = path.shared_snapshot?;
-                let score = scheduler::score_path(
-                    snapshot,
-                    lane,
-                    payload_bytes,
-                    SchedulerPolicy::default(),
-                )?;
+                let score = scheduler::score_path(snapshot, lane, payload_bytes)?;
                 Some((
                     path.instance,
                     score.eta_ms,
@@ -332,18 +318,18 @@ struct RelayBulkLead {
     eta_ms: f64,
 }
 
-fn relay_path_runtime_role(
+fn relay_path_admission(
     key: RelayPathKey,
     active_key: Option<RelayPathKey>,
     lower_flight_owner: Option<RelayPathKey>,
     has_bulk_model_evidence: bool,
-) -> PathRuntimeRole {
+) -> PathAdmission {
     if Some(key) == active_key || Some(key) == lower_flight_owner {
-        PathRuntimeRole::Service
+        PathAdmission::Service
     } else if has_bulk_model_evidence {
-        PathRuntimeRole::Subflow
+        PathAdmission::Subflow
     } else {
-        PathRuntimeRole::Standby
+        PathAdmission::Standby
     }
 }
 
@@ -522,12 +508,7 @@ fn choose_request_startup_subflow_with_rates(
         request_state,
         service.load_owned,
     )?;
-    scheduler::score_path(
-        service_snapshot,
-        lane,
-        payload_bytes,
-        SchedulerPolicy::default(),
-    )?;
+    scheduler::score_path(service_snapshot, lane, payload_bytes)?;
     if service_snapshot.active_latency_sensitive_flows > 0
         || service_snapshot.session_active_latency_sensitive_flows > 0
     {
@@ -542,12 +523,11 @@ fn choose_request_startup_subflow_with_rates(
         observation.mux_limits,
     ))
     .unwrap_or(usize::MAX);
-    let current_epoch = subflow_set.filter(|epoch| {
-        epoch.matches_envelope(service_instance, startup_credit, 0, Duration::ZERO)
-    });
-    let mut epoch = current_epoch.cloned().unwrap_or_else(|| {
-        FlowSubflowSet::new(0, service_instance, startup_credit, 0, Duration::ZERO)
-    });
+    let current_epoch =
+        subflow_set.filter(|epoch| epoch.matches_envelope(service_instance, startup_credit));
+    let mut epoch = current_epoch
+        .cloned()
+        .unwrap_or_else(|| FlowSubflowSet::new(service_instance, startup_credit));
     let product_envelope =
         request_startup_product_envelope_bytes(payload_bytes, observation.mux_limits);
     let mut candidates = paths
@@ -617,8 +597,7 @@ fn choose_request_startup_subflow_with_rates(
             if projected_product_debt > product_envelope {
                 return None;
             }
-            let score =
-                scheduler::score_path(snapshot, lane, payload_bytes, SchedulerPolicy::default())?;
+            let score = scheduler::score_path(snapshot, lane, payload_bytes)?;
             Some((position, path, proof, score.eta_ms, snapshot))
         })
         .collect::<Vec<_>>();
@@ -656,11 +635,9 @@ fn choose_request_startup_subflow_with_rates(
             frontier_clear: true,
             completion_improves: false,
             observed_goodput_non_degrading: true,
-            read_gap: Duration::ZERO,
             owner_bytes: payload_bytes,
-            optional_overhead_bytes: 0,
         };
-        if epoch.admit_subflow_owner(input).decision == PathAdmissionDecision::AdmitSubflow {
+        if epoch.admit_subflow_owner(input) == PathAdmission::Subflow {
             #[cfg(feature = "lab-diagnostics")]
             lab_diagnostic(
                 "request_startup_selection",
@@ -860,13 +837,9 @@ fn choose_request_ack_clock_calibration_with_rates(
                             && ordering_debt.saturating_add(candidate_product_debt)
                                 <= product_envelope,
                         path.can_enqueue_frame,
-                        snapshot.is_some_and(|snapshot| scheduler::score_path(
-                            snapshot,
-                            lane,
-                            payload_bytes,
-                            SchedulerPolicy::default(),
-                        )
-                        .is_some()),
+                        snapshot.is_some_and(|snapshot| {
+                            scheduler::score_path(snapshot, lane, payload_bytes).is_some()
+                        }),
                         snapshot.map_or(0, |snapshot| snapshot.product_bytes_in_flight),
                         snapshot.map_or(0, |snapshot| snapshot.product_queue_bytes),
                         snapshot.map_or(0, |snapshot| snapshot.active_latency_sensitive_flows),
@@ -934,8 +907,7 @@ fn choose_request_ack_clock_calibration_with_rates(
             {
                 return None;
             }
-            let score =
-                scheduler::score_path(snapshot, lane, payload_bytes, SchedulerPolicy::default())?;
+            let score = scheduler::score_path(snapshot, lane, payload_bytes)?;
             let spent = spent(path.instance());
             if request_state.transaction_candidate().is_none() {
                 let typed_zero_spend = spent == 0
@@ -1287,7 +1259,6 @@ pub(super) fn choose_bulk_relay_path_for_extent_avoiding(
     if !lane.is_bulk() || payload_bytes == 0 {
         return BulkRelayPathChoice::NotApplicable;
     }
-    let policy = SchedulerPolicy::default();
     // The request-side primary owner is the existing ordered-data owner when it
     // is still attached; otherwise it is the first active path opened for the
     // stream.  Newly attached active paths are candidate subflows, not automatic
@@ -1395,7 +1366,6 @@ pub(super) fn choose_bulk_relay_path_for_extent_avoiding(
             restrict_to_admitted,
             lower_flight_owner,
             lower_owner_cross_path_debt,
-            policy,
             request_state,
         })
     } else {
@@ -1714,14 +1684,14 @@ pub(super) fn choose_bulk_relay_path_for_extent_avoiding(
             && !(lower_flight_owner.is_none()
                 && restrict_to_admitted
                 && admitted_bulk_keys.contains(&key))
-            && !relay_path_runtime_role(
+            && !relay_path_admission(
                 key,
                 active_key,
                 lower_flight_owner,
                 path.has_bulk_model_evidence
                     || request_path_has_exact_flow_local_bulk_model(path, request_state),
             )
-            .may_own_unique_data()
+            .owns_unique_data()
         {
             #[cfg(feature = "lab-diagnostics")]
             if flow_local_shadow_gate.is_none() {
@@ -1794,8 +1764,7 @@ pub(super) fn choose_bulk_relay_path_for_extent_avoiding(
         } else {
             payload_bytes
         };
-        let Some(score) = scheduler::score_path(snapshot, lane, scoring_payload_bytes, policy)
-        else {
+        let Some(score) = scheduler::score_path(snapshot, lane, scoring_payload_bytes) else {
             #[cfg(feature = "lab-diagnostics")]
             if flow_local_shadow_gate.is_none() {
                 log_bulk_relay_candidate_decision(
@@ -2168,7 +2137,6 @@ struct RelayBulkLeadRequest<'a> {
     restrict_to_admitted: bool,
     lower_flight_owner: Option<RelayPathKey>,
     lower_owner_cross_path_debt: u64,
-    policy: SchedulerPolicy,
     request_state: Option<RequestSchedulingState<'a>>,
 }
 
@@ -2182,7 +2150,6 @@ fn choose_admissible_relay_bulk_lead(request: RelayBulkLeadRequest<'_>) -> Optio
         restrict_to_admitted,
         lower_flight_owner,
         lower_owner_cross_path_debt,
-        policy,
         request_state,
     } = request;
     let paths = observation.paths.as_slice();
@@ -2218,7 +2185,6 @@ fn choose_admissible_relay_bulk_lead(request: RelayBulkLeadRequest<'_>) -> Optio
                 active_key,
                 lane,
                 payload_bytes,
-                policy,
                 request_state,
                 path.load_owned,
             )?;
@@ -2257,7 +2223,6 @@ fn scored_relay_path_snapshot_for_bulk_choice(
     active_key: Option<RelayPathKey>,
     lane: FlowLane,
     payload_bytes: usize,
-    policy: SchedulerPolicy,
     request_state: Option<RequestSchedulingState<'_>>,
     current_flow_owns_path: bool,
 ) -> Option<(PathSnapshot, f64)> {
@@ -2273,7 +2238,7 @@ fn scored_relay_path_snapshot_for_bulk_choice(
     } else {
         payload_bytes
     };
-    let score = scheduler::score_path(snapshot, lane, scoring_payload_bytes, policy)?;
+    let score = scheduler::score_path(snapshot, lane, scoring_payload_bytes)?;
     Some((snapshot, score.eta_ms))
 }
 

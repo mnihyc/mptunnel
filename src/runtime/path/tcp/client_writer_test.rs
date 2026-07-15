@@ -1,5 +1,5 @@
 use super::{ClientTcpWriteFrameRoute, try_route_client_tcp_stream_frame_during_write};
-use crate::protocol::{CloseReason, Frame, OffsetRange, StreamFlags, StreamId};
+use crate::protocol::{CloseReason, Frame, OffsetRange, StreamId};
 use crate::runtime::path::commands::ClientTcpOpenAttemptId;
 use crate::runtime::path::tcp::client_stream::ClientTcpPathStreamState;
 use crate::runtime::recent_ids::RecentIdCache;
@@ -48,7 +48,6 @@ fn tcp_write_interlock_routes_ready_feedback_and_stops_at_backpressure() {
     let response = Frame::StreamData {
         stream_id,
         offset: 0,
-        flags: StreamFlags::NONE,
         payload: Bytes::from_static(b"response"),
     };
     assert!(matches!(

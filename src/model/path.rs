@@ -9,6 +9,31 @@ use std::time::Instant;
 
 static NEXT_CARRIER_PATH_INSTANCE_ID: AtomicU64 = AtomicU64::new(1);
 
+/// Endpoint-local scheduling restrictions for one configured carrier path.
+///
+/// These values never cross the wire: each endpoint applies the policy attached
+/// to its own path configuration and publishes only resulting observations.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+pub struct PathPolicy {
+    pub backup: bool,
+    pub expensive: bool,
+    pub bulk_allowed: bool,
+    pub probe_only: bool,
+    pub no_udp: bool,
+}
+
+impl Default for PathPolicy {
+    fn default() -> Self {
+        Self {
+            backup: false,
+            expensive: false,
+            bulk_allowed: true,
+            probe_only: false,
+            no_udp: false,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub(crate) struct RelayPathKey {
     pub(crate) underlay: UnderlayProtocol,

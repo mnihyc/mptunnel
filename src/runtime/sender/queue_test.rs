@@ -7,7 +7,7 @@ use crate::model::path::CarrierPathKey;
 use crate::model::path::{RelayPathInstance, RelayPathKey};
 use crate::mux::MuxLimits;
 use crate::mux::stream::ReliableSendStream;
-use crate::protocol::{PathId, StreamFlags, StreamId, UnderlayProtocol};
+use crate::protocol::{PathId, StreamId, UnderlayProtocol};
 use std::time::{Duration, Instant};
 
 #[test]
@@ -22,17 +22,16 @@ fn sender_queue_read_budget_respects_stream_flow_control_credit() {
     let mut send_stream = ReliableSendStream::new(StreamId(7), limits);
     let sender_queue = ReliableRelaySenderQueue::default();
     send_stream
-        .send_data(Bytes::from_static(b"data"), StreamFlags::NONE)
+        .send_data(Bytes::from_static(b"data"))
         .expect("initial window payload");
 
     assert!(!reliable_relay_can_read_into_sender_queue(
         &send_stream,
         &sender_queue,
-        limits,
         16,
     ));
     assert_eq!(
-        reliable_relay_sender_queue_read_budget(&send_stream, &sender_queue, limits, 16, 16),
+        reliable_relay_sender_queue_read_budget(&send_stream, &sender_queue, 16, 16),
         0,
     );
 
@@ -40,11 +39,10 @@ fn sender_queue_read_budget_respects_stream_flow_control_credit() {
     assert!(reliable_relay_can_read_into_sender_queue(
         &send_stream,
         &sender_queue,
-        limits,
         16,
     ));
     assert_eq!(
-        reliable_relay_sender_queue_read_budget(&send_stream, &sender_queue, limits, 16, 16),
+        reliable_relay_sender_queue_read_budget(&send_stream, &sender_queue, 16, 16),
         2,
     );
 }
@@ -58,7 +56,6 @@ fn sender_queue_dispatches_owner_data_before_ordinary_repair() {
     queue.push_repair(Frame::StreamData {
         stream_id,
         offset: 0,
-        flags: StreamFlags::NONE,
         payload: Bytes::from_static(b"repair"),
     });
 
@@ -83,7 +80,6 @@ fn sender_queue_dispatches_critical_repair_before_owner_data() {
         Frame::StreamData {
             stream_id,
             offset: 0,
-            flags: StreamFlags::NONE,
             payload: Bytes::from_static(b"repair"),
         },
         RelaySendCause::AckGapRepair,
@@ -106,7 +102,6 @@ fn sender_queue_trims_and_releases_acked_live_tail_repair() {
         Frame::StreamData {
             stream_id,
             offset: 128,
-            flags: StreamFlags::NONE,
             payload: Bytes::from_static(&[0x5a; 64]),
         },
         RelaySendCause::LiveOwnerTailRepair,
@@ -149,7 +144,6 @@ fn sender_queue_discards_only_unusable_live_owner_tail_repair() {
                 } else {
                     64
                 },
-                flags: StreamFlags::NONE,
                 payload: Bytes::from_static(&[0x5b; 64]),
             },
             cause,
@@ -191,7 +185,6 @@ fn sender_queue_discards_stale_bound_repair_without_touching_ordinary_repair() {
             Frame::StreamData {
                 stream_id,
                 offset,
-                flags: StreamFlags::NONE,
                 payload: Bytes::from_static(&[0x5c; 64]),
             },
             cause,
@@ -219,7 +212,6 @@ fn sender_queue_discards_expired_bound_repair_on_live_output() {
         Frame::StreamData {
             stream_id: StreamId(83),
             offset: 0,
-            flags: StreamFlags::NONE,
             payload: Bytes::from_static(&[0x5d; 64]),
         },
         RelaySendCause::PersistentServerAckGapRepair(PersistentServerAckGapBatch {

@@ -14,7 +14,6 @@ mod linux;
 pub(crate) struct TcpNativeRtt {
     pub(crate) srtt_us: u32,
     pub(crate) rttvar_us: u32,
-    pub(crate) min_rtt_us: Option<u32>,
 }
 
 /// Coherent congestion-flight fields available from one native snapshot.

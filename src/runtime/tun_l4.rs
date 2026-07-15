@@ -3,12 +3,12 @@ use super::*;
 use crate::config::MppPerformanceConfig;
 use crate::ingress::tun::TunL4Config;
 use crate::model::capacity::{
-    PATH_OPEN_SCORE_BYTES, QUIC_PERSISTENT_CONGESTION_THRESHOLD, QUIC_TIMER_GRANULARITY,
-    UDP_DEFAULT_MTU_PAYLOAD_BYTES, UDP_MAX_MTU_PAYLOAD_BYTES,
+    MAX_PRODUCT_DATAGRAM_PAYLOAD_BYTES, PATH_OPEN_SCORE_BYTES,
+    QUIC_PERSISTENT_CONGESTION_THRESHOLD, QUIC_TIMER_GRANULARITY,
 };
 use crate::model::path::RelayPathKey;
 use crate::outbound;
-use crate::protocol::{IngressKind, TargetAddr};
+use crate::protocol::TargetAddr;
 use crate::runtime::datagram::{DatagramClientAssociation, datagram_underlay_candidate_keys};
 use crate::runtime::error::RuntimeError;
 use crate::runtime::ingress_runtime::DEFAULT_SOCKS5_UDP_TTL_MS;
@@ -119,21 +119,12 @@ where
 {
     let target = TargetAddr::Ip(remote);
     outbound::validate_target(&target)?;
-    let remote = open_remote_stream(
-        &context,
-        target.clone(),
-        IngressKind::TunTcp,
-        FlowLane::Latency,
-    )
-    .await?;
+    let remote = open_remote_stream(&context, target.clone(), FlowLane::Latency).await?;
     relay_migrating_tcp_stream(
         stream,
         &context,
         performance,
-        ReliableRelayOpenSpec {
-            target,
-            ingress: IngressKind::TunTcp,
-        },
+        ReliableRelayOpenSpec { target },
         remote,
     )
     .await?;
@@ -197,9 +188,7 @@ pub(super) fn datagram_edge_path_lane_parallelism(snapshot: PathSnapshot) -> usi
     let model = UdpPathRuntimeModel::from_snapshot(
         snapshot,
         DEFAULT_SOCKS5_UDP_TTL_MS,
-        UDP_DEFAULT_MTU_PAYLOAD_BYTES,
-        false,
-        UDP_MAX_MTU_PAYLOAD_BYTES,
+        MAX_PRODUCT_DATAGRAM_PAYLOAD_BYTES,
     );
     let response_window_bytes = (model.pacing_rate_bps.max(1.0) / 8.0
         * model
@@ -207,7 +196,7 @@ pub(super) fn datagram_edge_path_lane_parallelism(snapshot: PathSnapshot) -> usi
             .max(QUIC_TIMER_GRANULARITY)
             .as_secs_f64())
     .ceil() as usize;
-    let initial_window_bytes = PATH_OPEN_SCORE_BYTES.max(model.mtu_payload_bytes).max(1);
+    let initial_window_bytes = PATH_OPEN_SCORE_BYTES.max(model.max_payload_bytes).max(1);
     response_window_bytes
         .div_ceil(initial_window_bytes)
         .max(QUIC_PERSISTENT_CONGESTION_THRESHOLD as usize)

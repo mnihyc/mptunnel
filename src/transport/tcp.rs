@@ -10,6 +10,7 @@ use crate::transport::{
 };
 use futures::StreamExt;
 use futures::stream::FuturesUnordered;
+use std::borrow::Cow;
 use std::collections::VecDeque;
 use std::future::Future;
 use std::net::{IpAddr, SocketAddr};
@@ -64,19 +65,23 @@ pub async fn connect_path_with_provider(
     if path.underlay != UnderlayProtocol::Tcp {
         return Err(TcpTransportError::WrongUnderlay(path.underlay));
     }
-    let mut effective_path = path.clone();
-    effective_path.binding.source_ip = match (path.binding.source_ip, options.source_ip) {
+    let effective_path = match (path.binding.source_ip, options.source_ip) {
         (Some(configured), Some(requested)) if configured != requested => {
             return Err(TcpTransportError::ConflictingSourceBinding);
         }
-        (configured, requested) => configured.or(requested),
+        (None, Some(requested)) => {
+            let mut overridden_path = path.clone();
+            overridden_path.binding.source_ip = Some(requested);
+            Cow::Owned(overridden_path)
+        }
+        _ => Cow::Borrowed(path),
     };
     let deadline = Instant::now() + options.timeout;
     let authority = effective_path.endpoint.authority();
     let addrs = timeout_at(
         deadline,
         provider.resolve(CarrierResolutionRequest {
-            path: &effective_path,
+            path: effective_path.as_ref(),
             identity,
         }),
     )
@@ -90,7 +95,14 @@ pub async fn connect_path_with_provider(
         return Err(TcpTransportError::NoCompatibleAddress);
     }
     race_tcp_address_attempts(addrs, deadline, |addr, deadline| {
-        connect_carrier_addr_before(&effective_path, identity, addr, options, deadline, provider)
+        connect_carrier_addr_before(
+            effective_path.as_ref(),
+            identity,
+            addr,
+            options,
+            deadline,
+            provider,
+        )
     })
     .await
 }

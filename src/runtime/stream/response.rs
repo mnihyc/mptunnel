@@ -17,9 +17,10 @@ mod session_load;
 mod snapshot;
 mod subflow;
 
+#[cfg(test)]
+pub(in crate::runtime) use attachment::next_server_carrier_path_instance_id;
 pub(in crate::runtime) use attachment::{
     ResponseDispatchTarget, ResponseSenderPathTarget, ResponseStreamAttachOutcome,
-    next_server_carrier_path_instance_id,
 };
 use attachment::{
     ResponseStreamOutputEntry, ResponseStreamOutputs, response_owner_underlay_seen_bit,
@@ -242,7 +243,7 @@ impl ResponseStreamBinding {
         )
     }
 
-    #[cfg_attr(not(test), allow(dead_code))]
+    #[cfg(test)]
     pub(in crate::runtime) fn new_with_limits(
         session_id: SessionId,
         underlay: UnderlayProtocol,
@@ -262,6 +263,7 @@ impl ResponseStreamBinding {
         )
     }
 
+    #[cfg(test)]
     pub(in crate::runtime) fn new_with_limits_and_tracker(
         session_id: SessionId,
         underlay: UnderlayProtocol,
@@ -326,7 +328,6 @@ impl ResponseStreamBinding {
                     role: StreamOpenRole::Active,
                     owner_data_in_flight_bytes: 0,
                     bytes_in_flight: 0,
-                    product_queue_bytes: 0,
                     product_progress_rate_bps: None,
                     delivery_rate_bps: None,
                     tcp_ack_clock_rate_bps: None,
@@ -338,6 +339,7 @@ impl ResponseStreamBinding {
                     local_path_metrics: None,
                     peer_path_metrics: None,
                 }],
+                product_queue_bytes: 0,
                 ack_clock_calibrations: HashMap::new(),
                 active_ack_clock_calibration: None,
             }),
@@ -354,14 +356,18 @@ impl ResponseStreamBinding {
         self.version.subscribe()
     }
 
-    fn begin_close(&self) -> Vec<ResponseStreamOutputEntry> {
+    fn begin_close(&self) -> Vec<ReliablePathCommandSender> {
         let outputs = {
             let outputs = self
                 .outputs
                 .lock()
                 .expect("server reliable stream binding lock");
             self.response_stream_open.store(false, Ordering::Release);
-            outputs.entries.clone()
+            outputs
+                .entries
+                .iter()
+                .map(|entry| entry.commands.clone())
+                .collect()
         };
         self.response_flow_registration.set_active(false);
         self.lane_tracker
@@ -385,9 +391,8 @@ impl ResponseStreamBinding {
 
     pub(in crate::runtime) async fn close_stream(&self, stream_id: StreamId) {
         let outputs = self.begin_close();
-        for entry in outputs {
-            let _ = entry
-                .commands
+        for commands in outputs {
+            let _ = commands
                 .send_control(ReliablePathCommand::CloseStream(stream_id))
                 .await;
         }
@@ -400,11 +405,8 @@ impl ResponseStreamBinding {
         lane: FlowLane,
     ) {
         let outputs = self.begin_close();
-        for entry in outputs {
-            let _ = entry
-                .commands
-                .send_stream_ordered_close(stream_id, lane)
-                .await;
+        for commands in outputs {
+            let _ = commands.send_stream_ordered_close(stream_id, lane).await;
         }
         self.finish_close();
     }
@@ -418,9 +420,8 @@ impl ResponseStreamBinding {
         lane: FlowLane,
     ) {
         let outputs = self.begin_close();
-        futures::future::join_all(outputs.into_iter().map(|entry| async move {
-            let _ = entry
-                .commands
+        futures::future::join_all(outputs.into_iter().map(|commands| async move {
+            let _ = commands
                 .send_stream_ordered_reset_and_close(stream_id, reason, lane)
                 .await;
         }))

@@ -39,7 +39,6 @@ impl TcpSenderQueueSnapshot {
 pub(in crate::runtime) struct TcpNativeObservation {
     path_id: PathId,
     direction: PathMetricDirection,
-    min_rtt_us: Option<u32>,
     srtt_us: Option<u32>,
     rttvar_us: Option<u32>,
     bytes_in_flight: Option<u64>,
@@ -110,9 +109,6 @@ impl TcpNativeObservation {
             metrics.rttvar_us = rttvar_us;
             metrics.jitter_us = rttvar_us;
         }
-        if let Some(min_rtt_us) = self.min_rtt_us {
-            metrics.min_rtt_us = min_rtt_us.max(1);
-        }
         if let Some((bytes_in_flight, inflight_limit_bytes, inflight_hi_bytes)) = self.flight() {
             metrics.bytes_in_flight = bytes_in_flight;
             metrics.inflight_limit_bytes = inflight_limit_bytes;
@@ -135,7 +131,6 @@ impl TcpNativeObservation {
     /// prior registry entry or acquire a fresh recorded-at timestamp.
     pub(in crate::runtime) fn complete_path_metrics(self) -> Option<PathMetrics> {
         let (srtt_us, rttvar_us) = self.rtt()?;
-        let min_rtt_us = self.min_rtt_us?;
         let (bytes_in_flight, inflight_limit_bytes, inflight_hi_bytes) = self.flight()?;
         let queue_bytes = self.queue_bytes?;
         let delivery_rate_bps = self.delivery_rate_bps?;
@@ -149,7 +144,6 @@ impl TcpNativeObservation {
             direction: self.direction,
             metric_epoch: metric_epoch_now(),
             metric_age_us: 0,
-            min_rtt_us: min_rtt_us.max(1),
             srtt_us: srtt_us.max(1),
             rttvar_us,
             jitter_us: rttvar_us,
@@ -289,10 +283,10 @@ impl TcpSenderMetricTracker {
         direction: PathMetricDirection,
         current: TcpNativeSnapshot,
     ) -> TcpNativeObservation {
-        let (min_rtt_us, srtt_us, rttvar_us) = current
+        let (srtt_us, rttvar_us) = current
             .rtt
-            .map(|rtt| (rtt.min_rtt_us, Some(rtt.srtt_us), Some(rtt.rttvar_us)))
-            .unwrap_or((None, None, None));
+            .map(|rtt| (Some(rtt.srtt_us), Some(rtt.rttvar_us)))
+            .unwrap_or((None, None));
         let (bytes_in_flight, inflight_limit_bytes, inflight_hi_bytes) = current
             .flight
             .map(|flight| {
@@ -346,7 +340,6 @@ impl TcpSenderMetricTracker {
         TcpNativeObservation {
             path_id,
             direction,
-            min_rtt_us,
             srtt_us,
             rttvar_us,
             bytes_in_flight,

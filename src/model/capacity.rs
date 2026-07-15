@@ -9,9 +9,10 @@ use crate::scheduler::{FlowLane, PathSnapshot};
 use std::time::{Duration, Instant};
 
 pub(crate) const TRANSPORT_MSS_BYTES: usize = 1460;
-pub(crate) const UDP_DEFAULT_MTU_PAYLOAD_BYTES: usize = 1200;
-pub(crate) const UDP_MIN_MTU_PAYLOAD_BYTES: usize = 512;
-pub(crate) const UDP_MAX_MTU_PAYLOAD_BYTES: usize = 65_000;
+// Conservative packet-size estimate for UDP scheduling math. Quinn owns the
+// live QUIC PMTU and packetization; this is not measured path state.
+pub(crate) const UDP_BASELINE_PACKET_PAYLOAD_BYTES: usize = 1200;
+pub(crate) const MAX_PRODUCT_DATAGRAM_PAYLOAD_BYTES: usize = 65_000;
 pub(crate) const RELIABLE_INITIAL_WINDOW_PACKETS: usize = 10;
 pub(crate) const QUIC_INITIAL_WINDOW_PACKETS: usize = RELIABLE_INITIAL_WINDOW_PACKETS;
 pub(crate) const PATH_OPEN_SCORE_BYTES: usize =
@@ -166,7 +167,7 @@ pub(crate) fn reliable_stream_initial_advertised_window_bytes(
     lane: FlowLane,
     mux_limits: MuxLimits,
 ) -> u64 {
-    reliable_stream_advertised_window_from_underlay(None, underlay, lane, mux_limits)
+    reliable_stream_advertised_window_from_underlay(underlay, lane, mux_limits)
 }
 
 pub(crate) fn reliable_stream_advertised_window_bytes(
@@ -177,11 +178,10 @@ pub(crate) fn reliable_stream_advertised_window_bytes(
     let underlay = path
         .map(|snapshot| snapshot.underlay)
         .unwrap_or(UnderlayProtocol::Tcp);
-    reliable_stream_advertised_window_from_underlay(path, underlay, lane, mux_limits)
+    reliable_stream_advertised_window_from_underlay(underlay, lane, mux_limits)
 }
 
 fn reliable_stream_advertised_window_from_underlay(
-    _path: Option<PathSnapshot>,
     underlay: UnderlayProtocol,
     lane: FlowLane,
     mux_limits: MuxLimits,

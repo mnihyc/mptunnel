@@ -23,7 +23,6 @@ fn native_observation(
 ) -> TcpNativeObservation {
     let snapshot = TcpNativeSnapshot {
         rtt: Some(TcpNativeRtt {
-            min_rtt_us: Some(18_000),
             srtt_us: 20_000,
             rttvar_us: 2_000,
         }),
@@ -484,7 +483,6 @@ fn request_tcp_proof_metrics(path_index: usize) -> PathMetrics {
         direction: PathMetricDirection::ClientToServer,
         metric_epoch: 1,
         metric_age_us: 0,
-        min_rtt_us: 170_000,
         srtt_us: 180_000,
         rttvar_us: 10_000,
         jitter_us: 10_000,

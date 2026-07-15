@@ -7,9 +7,7 @@ use super::ports::{CarrierCommandLease, OpenedReliableCarrierStream};
 use super::queue::TcpCapacityProbeLease;
 use super::tcp::capacity::RequestTcpCapacityProbeLease;
 use crate::model::path::{CarrierPathInstanceId, RelayPathInstance};
-use crate::protocol::{
-    Frame, IngressKind, PathId, ResetReason, StreamId, StreamOpenRole, TargetAddr,
-};
+use crate::protocol::{Frame, PathId, ResetReason, StreamId, StreamOpenRole, TargetAddr};
 use crate::runtime::error::RuntimeError;
 use crate::scheduler::FlowLane;
 use std::sync::{
@@ -296,7 +294,6 @@ pub(in crate::runtime) enum ReliablePathCommand {
         attempt_id: ClientTcpOpenAttemptId,
         observed_carrier_generation: u64,
         target: TargetAddr,
-        ingress: IngressKind,
         lane: FlowLane,
         role: StreamOpenRole,
         open_deadlines: ClientTcpOpenDeadlines,

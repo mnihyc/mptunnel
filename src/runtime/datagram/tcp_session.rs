@@ -8,9 +8,7 @@ use super::{DatagramClientFlow, SentDatagram, datagram_ack_range, datagram_id_is
 use crate::model::capacity::TRANSPORT_TIMER_GRANULARITY;
 use crate::mux::MuxLimits;
 use crate::mux::datagram::DatagramFlow;
-use crate::protocol::{
-    DatagramFlowId, DatagramId, Frame, IngressKind, OffsetRange, OutboundPolicy, PathId, TargetAddr,
-};
+use crate::protocol::{DatagramFlowId, DatagramId, Frame, OffsetRange, PathId, TargetAddr};
 use crate::runtime::error::RuntimeError;
 use crate::runtime::identity::random_session_id;
 use crate::runtime::path::tcp::client_connection::{
@@ -97,7 +95,7 @@ impl TcpDatagramClientSession {
         product_deadline: tokio::time::Instant,
     ) -> Result<Bytes, DatagramPathSendError> {
         if payload.len() > self.mux_limits.max_payload_bytes {
-            return Err(DatagramPathSendError::MtuExceeded {
+            return Err(DatagramPathSendError::PayloadLimitExceeded {
                 limit: self.mux_limits.max_payload_bytes,
             });
         }
@@ -418,8 +416,6 @@ impl TcpDatagramClientSession {
             .write_frame(&Frame::OpenDatagramFlow {
                 flow_id,
                 target: target.clone(),
-                ingress: IngressKind::Socks5,
-                outbound: OutboundPolicy::Direct,
             })
             .await?;
         self.connection.writer.flush().await?;

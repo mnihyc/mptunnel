@@ -335,7 +335,6 @@ async fn handle_disconnected_client_tcp_command(
             attempt_id,
             observed_carrier_generation: _,
             target,
-            ingress,
             lane,
             role,
             open_deadlines,
@@ -368,7 +367,6 @@ async fn handle_disconnected_client_tcp_command(
                         stream_id,
                         attempt_id,
                         target,
-                        ingress,
                         lane,
                         role,
                         open_deadline,
@@ -411,19 +409,19 @@ async fn connect_client_tcp_path(
     runtime: &ClientTcpPathSessionRuntime,
     open_deadline: tokio::time::Instant,
 ) -> Result<ClientTcpPathConnection, RuntimeError> {
-    let startup_snapshot = path_startup_snapshot(&runtime.path, runtime.path_index);
+    let startup_snapshot = path_startup_snapshot(runtime.path(), runtime.path_index);
     let startup_metrics = path_startup_metrics(
-        &runtime.path,
+        runtime.path(),
         runtime.path_index,
         PathMetricDirection::ClientToServer,
     );
     let carrier = connect_client_tcp_carrier(
         ClientTcpCarrierConnect {
-            path: &runtime.path,
+            path: runtime.path(),
             path_index: runtime.path_index,
             carrier_identity: runtime.carrier_identity,
             session_id: runtime.session_id,
-            security: &runtime.security,
+            security: runtime.security(),
             codec_limits: runtime.codec_limits,
             mux_limits: runtime.mux_limits,
             carrier_network: runtime.carrier_network.as_ref(),

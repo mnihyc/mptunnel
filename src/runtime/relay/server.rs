@@ -17,7 +17,7 @@ use super::io::{
     reliable_relay_recv_progress_resend_active, reliable_relay_tail_repair_delay,
     reliable_stream_recv_progress_interval, resize_reliable_relay_buffer,
     sender_service_retry_delay, stream_ack_gap_repair_frames_normalized,
-    stream_data_range_already_delivered, stream_final_offset_tail_repair_frames,
+    stream_data_range_already_delivered, stream_final_offset_tail_repair_frames_normalized,
     stream_terminal_fin_replay_required, update_repair_authoritative_ack_snapshot,
     write_delivered_payloads,
 };
@@ -46,7 +46,7 @@ use crate::outbound::{DnsConfig, OutboundConfig};
 use crate::protocol::frame::reliable_path_frame_pacing_bytes;
 #[cfg(feature = "lab-diagnostics")]
 use crate::protocol::frame::stream_ack_contiguous_frontier;
-use crate::protocol::frame::{normalized_offset_ranges, reliable_stream_frame_extent};
+use crate::protocol::frame::{normalize_offset_ranges, reliable_stream_frame_extent};
 use crate::protocol::{Frame, OffsetRange, ResetReason, SessionId, StreamId, UnderlayProtocol};
 use crate::runtime::RuntimeError;
 use crate::runtime::path::PathDeliveryStats;
@@ -263,7 +263,6 @@ fn stream_ack_is_authoritative_contiguous_prefix(
 // Response ordered-owner debt
 fn reliable_relay_ordered_owner_debt_bytes(
     lane: FlowLane,
-    _ack_complete: bool,
     ack_frontier: u64,
     next_offset: u64,
 ) -> usize {
@@ -280,15 +279,9 @@ fn reliable_relay_ordered_owner_debt_bytes(
 fn reliable_relay_current_ordered_owner_debt_bytes(
     lane: FlowLane,
     send_stream: &ReliableSendStream,
-    ack_complete: bool,
     ack_frontier: u64,
 ) -> usize {
-    reliable_relay_ordered_owner_debt_bytes(
-        lane,
-        ack_complete,
-        ack_frontier,
-        send_stream.next_offset(),
-    )
+    reliable_relay_ordered_owner_debt_bytes(lane, ack_frontier, send_stream.next_offset())
 }
 
 fn reliable_relay_tail_repair_deadline(
@@ -455,7 +448,7 @@ impl RequestTcpSparseAckProgress {
         }
         let mut acknowledged = std::mem::take(&mut self.acknowledged_ranges);
         acknowledged.extend(delta.iter().copied());
-        self.acknowledged_ranges = normalized_offset_ranges(&acknowledged);
+        self.acknowledged_ranges = normalize_offset_ranges(acknowledged);
         recv_stream.ack_delta_frames(&delta)
     }
 }
@@ -626,7 +619,7 @@ fn reliable_failed_owner_tail_repair_ready(
         return false;
     }
     let (failed_owner_frames, _) =
-        prefix_repair_frames_with_failed_owner_output(path_stream, source_frames.clone());
+        prefix_repair_frames_with_failed_owner_output(path_stream, source_frames);
     if !failed_owner_frames.is_empty() {
         return true;
     }
@@ -868,10 +861,7 @@ fn enqueue_reliable_tail_repair(
                 tail_limit,
             );
             let (unknown_owner_frames, unknown_owner_blocked_offset) =
-                prefix_repair_frames_with_unknown_owner_output(
-                    path_stream,
-                    tail_source_frames.clone(),
-                );
+                prefix_repair_frames_with_unknown_owner_output(path_stream, tail_source_frames);
             if !unknown_owner_frames.is_empty() {
                 critical_tail_repair = true;
                 repair_limit = tail_limit;
@@ -1211,22 +1201,19 @@ where
             None,
             mux_limits,
         );
-        let relay_demand = demand_update.demand;
-        let relay_lane = reliable_sender_effective_relay_lane(relay_demand.lane, peer_lane);
+        let relay_lane = reliable_sender_effective_relay_lane(demand_update.lane, peer_lane);
         if relay_lane != peer_lane {
             path_stream.set_lane(relay_lane);
             #[cfg(feature = "lab-diagnostics")]
             lab_diagnostic(
                 "server_stream_lane_promoted_local",
                 format_args!(
-                    "stream_id={} previous={:?} local_lane={:?} peer_lane={:?} lane={:?} latency_weight_ppm={} throughput_weight_ppm={} sent_offset={} received_offset={} repair_bytes={}",
+                    "stream_id={} previous={:?} local_lane={:?} peer_lane={:?} lane={:?} sent_offset={} received_offset={} repair_bytes={}",
                     stream_id.0,
                     demand_update.previous_lane,
-                    demand_update.demand.lane,
+                    demand_update.lane,
                     peer_lane,
                     relay_lane,
-                    demand_update.demand.latency_weight_ppm,
-                    demand_update.demand.throughput_weight_ppm,
                     send_stream.next_offset(),
                     recv_stream.next_offset(),
                     send_stream.repair_bytes(),
@@ -1316,7 +1303,6 @@ where
         let ordered_owner_debt_bytes = reliable_relay_current_ordered_owner_debt_bytes(
             relay_lane,
             &send_stream,
-            last_send_ack_complete,
             last_send_ack_frontier,
         );
         let tail_repair_deadline = reliable_relay_effective_tail_repair_deadline(
@@ -1478,16 +1464,10 @@ where
                 local_open,
                 queued_send_blocks_source_read,
                 &send_stream,
-                mux_limits,
                 sender_queue_limit,
             );
         let read_budget = if can_read_by_flow {
-            response_sender.read_budget(
-                &send_stream,
-                mux_limits,
-                sender_queue_limit,
-                source_read_ceiling,
-            )
+            response_sender.read_budget(&send_stream, sender_queue_limit, source_read_ceiling)
         } else {
             0
         };
@@ -1519,7 +1499,6 @@ where
             let ordered_owner_debt_bytes = reliable_relay_current_ordered_owner_debt_bytes(
                 relay_lane,
                 &send_stream,
-                last_send_ack_complete,
                 last_send_ack_frontier,
             );
             if drain_server_response_sender_ready(
@@ -1561,14 +1540,13 @@ where
                 Frame::StreamData {
                     stream_id: received_stream_id,
                     offset,
-                    flags,
                     payload,
                 } if received_stream_id == stream_id && remote_open => {
                     #[cfg(feature = "lab-diagnostics")]
                     let payload_len = payload.len();
                     #[cfg(feature = "lab-diagnostics")]
                     let mux_started = Instant::now();
-                    let outcome = recv_stream.receive_data(offset, payload, flags)?;
+                    let outcome = recv_stream.receive_data(offset, payload)?;
                     #[cfg(feature = "lab-diagnostics")]
                     lab_perf_record("mux.receive_data", mux_started.elapsed(), payload_len);
                     let delivered = outcome.delivered;
@@ -1609,9 +1587,7 @@ where
                         response_sender_retry_at = None;
                         last_recv_progress_sent_at = Instant::now();
                     }
-                    if outcome.fin
-                        || pending_stream_fin_ready(&recv_stream, pending_remote_fin_offset)
-                    {
+                    if pending_stream_fin_ready(&recv_stream, pending_remote_fin_offset) {
                         if enqueue_tcp_recv_progress(
                             &mut response_sender,
                             &recv_stream,
@@ -1635,7 +1611,7 @@ where
                     complete,
                     ranges,
                 } if ack_stream_id == stream_id => {
-                    let normalized_ranges = normalized_offset_ranges(&ranges);
+                    let normalized_ranges = normalize_offset_ranges(ranges);
                     #[cfg(feature = "lab-diagnostics")]
                     let mux_started = Instant::now();
                     let ack = send_stream.apply_normalized_ack(&normalized_ranges);
@@ -1751,9 +1727,9 @@ where
                             _same_output_frontier_retransmit,
                         ) = prefix_final_tail_repair_frames_with_available_output(
                             &path_stream,
-                            stream_final_offset_tail_repair_frames(
+                            stream_final_offset_tail_repair_frames_normalized(
                                 &send_stream,
-                                &ranges,
+                                &normalized_ranges,
                                 fin_tail_limit,
                                 fin_tail_ready,
                                 fin_tail_stall_ready,
@@ -1791,7 +1767,7 @@ where
                             "stream_id={} complete={} ranges={} incoming_frontier={} stored_frontier={} largest_end={} released_bytes={} sent_offset={} sender_queue_bytes={} repair_bytes_after={} repair_frames={} repair_kind={} active_underlay={:?} multipath_repair_alternative={} ack_gap_repair_ready={} base_repair_limit={} repair_limit={} extra_traffic_hint_percent={}",
                             stream_id.0,
                             complete,
-                            ranges.len(),
+                            normalized_ranges.len(),
                             incoming_ack_frontier,
                             last_send_ack_frontier,
                             largest_ack_end,
@@ -1940,7 +1916,6 @@ where
                 let ordered_owner_debt_bytes = reliable_relay_current_ordered_owner_debt_bytes(
                     relay_lane,
                     &send_stream,
-                    last_send_ack_complete,
                     last_send_ack_frontier,
                 );
                 if drain_server_response_sender_ready(
@@ -2021,7 +1996,7 @@ where
                     same_output_frontier_retransmit,
                 ) = prefix_final_tail_repair_frames_with_available_output(
                     &path_stream,
-                    stream_final_offset_tail_repair_frames(
+                    stream_final_offset_tail_repair_frames_normalized(
                         &send_stream,
                         &last_send_ack_ranges,
                         repair_limit,
@@ -2095,7 +2070,6 @@ where
                 let ordered_owner_debt_bytes = reliable_relay_current_ordered_owner_debt_bytes(
                     relay_lane,
                     &send_stream,
-                    last_send_ack_complete,
                     last_send_ack_frontier,
                 );
                 if drain_server_response_sender_ready(
@@ -2152,7 +2126,6 @@ where
                 let ordered_owner_debt_bytes = reliable_relay_current_ordered_owner_debt_bytes(
                     relay_lane,
                     &send_stream,
-                    last_send_ack_complete,
                     last_send_ack_frontier,
                 );
                 if drain_server_response_sender_ready(
@@ -2186,7 +2159,6 @@ where
             let ordered_owner_debt_bytes = reliable_relay_current_ordered_owner_debt_bytes(
                 relay_lane,
                 &send_stream,
-                last_send_ack_complete,
                 last_send_ack_frontier,
             );
             if drain_server_response_sender_ready(
@@ -2211,7 +2183,6 @@ where
             let ordered_owner_debt_bytes = reliable_relay_current_ordered_owner_debt_bytes(
                 relay_lane,
                 &send_stream,
-                last_send_ack_complete,
                 last_send_ack_frontier,
             );
             if drain_server_response_sender_ready(
@@ -2276,7 +2247,6 @@ where
                         local_open,
                         false,
                         &send_stream,
-                        mux_limits,
                         sender_queue_limit,
                     )
                     && response_sender.data_bytes() < sender_dispatch_byte_budget
@@ -2294,7 +2264,7 @@ where
                         break;
                     }
                     let next_read_budget = response_sender
-                        .read_budget(&send_stream, mux_limits, sender_queue_limit, buf.len())
+                        .read_budget(&send_stream, sender_queue_limit, buf.len())
                         .min(owner_tail_read_headroom);
                     if next_read_budget == 0 {
                         break;
@@ -2337,7 +2307,6 @@ where
                     let ordered_owner_debt_bytes = reliable_relay_current_ordered_owner_debt_bytes(
                         relay_lane,
                         &send_stream,
-                        last_send_ack_complete,
                         last_send_ack_frontier,
                     );
                     if drain_server_response_sender_ready(
@@ -2374,7 +2343,6 @@ where
             let ordered_owner_debt_bytes = reliable_relay_current_ordered_owner_debt_bytes(
                 close.lane,
                 &send_stream,
-                last_send_ack_complete,
                 last_send_ack_frontier,
             );
             match drain_server_response_sender_ready(

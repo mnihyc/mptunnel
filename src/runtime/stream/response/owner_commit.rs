@@ -14,7 +14,7 @@ use super::{MIN_ACTIVE_RESPONSE_FLOWS_FOR_SAME_FAMILY_DISCOVERY, ResponseStreamB
 #[cfg(feature = "lab-diagnostics")]
 use crate::lab_diagnostics::lab_diagnostic;
 use crate::model::ack_clock::reliable_ack_clock_calibration_ceiling_bytes;
-use crate::model::multipath::PathAdmissionDecision;
+use crate::model::multipath::PathAdmission;
 use crate::model::path::CarrierPathKey;
 use crate::protocol::frame::reliable_stream_frame_extent;
 use crate::protocol::{Frame, StreamOpenRole, UnderlayProtocol};
@@ -410,7 +410,7 @@ impl ResponseStreamBinding {
                 .lane_tracker
                 .with_matching_generation(self.session_id, request.expected_lane_generation, || {
                     let reservation = self.reserve_subflow_owner_admission_for_request(request);
-                    if reservation.admission.decision != PathAdmissionDecision::AdmitSubflow {
+                    if reservation.admission != PathAdmission::Subflow {
                         return Err(RuntimeError::SenderServiceBlocked);
                     }
                     after_subflow_reservation();

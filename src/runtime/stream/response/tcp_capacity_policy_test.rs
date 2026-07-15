@@ -12,10 +12,9 @@ use super::test_support::{
 use crate::model::capacity::{
     BBR_MAX_SEND_QUANTUM_BYTES, BBR_MIN_SEND_QUANTUM_PACKETS, MIN_RATE_SAMPLE_BYTES,
     PATH_OPEN_SCORE_BYTES, RELIABLE_INITIAL_WINDOW_PACKETS, TRANSPORT_MSS_BYTES,
-    adaptive_reliable_relay_chunk_bytes, reliable_relay_buffer_len,
-    reliable_subflow_startup_sample_limit_bytes,
+    adaptive_reliable_relay_chunk_bytes, reliable_subflow_startup_sample_limit_bytes,
 };
-use crate::model::multipath::{PathAdmissionDecision, SubflowAdmissionInput};
+use crate::model::multipath::{PathAdmission, SubflowAdmissionInput};
 use crate::model::path::CarrierPathKey;
 use crate::mux::MuxLimits;
 use crate::protocol::frame::reliable_stream_frame_accounted_bytes;
@@ -166,7 +165,6 @@ fn endpoint_only_tcp_startup_uses_service_capacity_prior_without_exclusive_calib
             candidate_commands,
             FlowLane::Throughput,
             StreamOpenRole::Validation,
-            reliable_relay_buffer_len(limits),
         ),
         ResponseStreamAttachOutcome::Attached
     );
@@ -179,7 +177,6 @@ fn endpoint_only_tcp_startup_uses_service_capacity_prior_without_exclusive_calib
             direction: PathMetricDirection::ServerToClient,
             metric_epoch: metric_epoch_now(),
             metric_age_us: 0,
-            min_rtt_us: 333_000,
             srtt_us: 333_000,
             rttvar_us: 0,
             jitter_us: 0,
@@ -222,26 +219,20 @@ fn endpoint_only_tcp_startup_uses_service_capacity_prior_without_exclusive_calib
         ));
     }
     assert_eq!(
-        binding
-            .commit_subflow_owner_admission(
-                service,
-                sample_bytes,
-                0,
-                Duration::ZERO,
-                SubflowAdmissionInput {
-                    key: candidate,
-                    bulk_rate_proven: false,
-                    startup_owner_allowed: true,
-                    frontier_clear: true,
-                    completion_improves: false,
-                    observed_goodput_non_degrading: true,
-                    read_gap: Duration::ZERO,
-                    owner_bytes: sample_bytes,
-                    optional_overhead_bytes: 0,
-                },
-            )
-            .decision,
-        PathAdmissionDecision::AdmitSubflow
+        binding.commit_subflow_owner_admission(
+            service,
+            sample_bytes,
+            SubflowAdmissionInput {
+                key: candidate,
+                bulk_rate_proven: false,
+                startup_owner_allowed: true,
+                frontier_clear: true,
+                completion_improves: false,
+                observed_goodput_non_degrading: true,
+                owner_bytes: sample_bytes,
+            },
+        ),
+        PathAdmission::Subflow
     );
     binding.record_owner_flight(candidate, &stream_data_frame(sample_bytes));
     std::thread::sleep(Duration::from_millis(1));
@@ -336,31 +327,24 @@ fn tcp_response_graduation_skips_calibration_below_ack_sample_resource_floor() {
             candidate_commands,
             FlowLane::Throughput,
             StreamOpenRole::Validation,
-            reliable_relay_buffer_len(limits),
         ),
         ResponseStreamAttachOutcome::Attached
     );
     assert_eq!(
-        binding
-            .commit_subflow_owner_admission(
-                service,
-                sample_bytes,
-                0,
-                Duration::ZERO,
-                SubflowAdmissionInput {
-                    key: candidate,
-                    bulk_rate_proven: false,
-                    startup_owner_allowed: true,
-                    frontier_clear: true,
-                    completion_improves: false,
-                    observed_goodput_non_degrading: true,
-                    read_gap: Duration::ZERO,
-                    owner_bytes: sample_bytes,
-                    optional_overhead_bytes: 0,
-                },
-            )
-            .decision,
-        PathAdmissionDecision::AdmitSubflow
+        binding.commit_subflow_owner_admission(
+            service,
+            sample_bytes,
+            SubflowAdmissionInput {
+                key: candidate,
+                bulk_rate_proven: false,
+                startup_owner_allowed: true,
+                frontier_clear: true,
+                completion_improves: false,
+                observed_goodput_non_degrading: true,
+                owner_bytes: sample_bytes,
+            },
+        ),
+        PathAdmission::Subflow
     );
     binding.record_owner_flight(candidate, &stream_data_frame(sample_bytes));
     binding.release_normalized_acked_ranges(&[OffsetRange {
@@ -393,7 +377,6 @@ fn tcp_local_sender_metrics_remain_send_quantum_prior_after_low_product_sample()
         direction: PathMetricDirection::ServerToClient,
         metric_epoch: metric_epoch_now(),
         metric_age_us: 0,
-        min_rtt_us: 20_000,
         srtt_us: 20_000,
         rttvar_us: 1_000,
         jitter_us: 1_000,

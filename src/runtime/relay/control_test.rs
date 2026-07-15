@@ -1,6 +1,6 @@
 use super::*;
 use crate::model::path::{RelayPathInstance, RelayPathKey};
-use crate::protocol::{OffsetRange, StreamFlags, StreamId, UnderlayProtocol};
+use crate::protocol::{OffsetRange, StreamId, UnderlayProtocol};
 use bytes::Bytes;
 
 fn request_test_path_instance(
@@ -49,10 +49,10 @@ fn tcp_request_outstanding_limit_uses_service_reservoir_then_ack_headroom() {
 
     let mut send_stream = ReliableSendStream::new(StreamId(90), mux_limits);
     send_stream
-        .send_data(Bytes::from(vec![0x11; 512 * 1024]), StreamFlags::NONE)
+        .send_data(Bytes::from(vec![0x11; 512 * 1024]))
         .expect("first dispatched request chunk");
     send_stream
-        .send_data(Bytes::from(vec![0x22; 512 * 1024]), StreamFlags::NONE)
+        .send_data(Bytes::from(vec![0x22; 512 * 1024]))
         .expect("second dispatched request chunk");
     let mut sender_queue = ReliableRelaySenderQueue::default();
     sender_queue.push_data(Bytes::from(vec![0x33; 1024 * 1024]));

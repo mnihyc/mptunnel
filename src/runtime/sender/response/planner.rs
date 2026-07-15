@@ -34,9 +34,7 @@ use crate::model::capacity::{
     QUIC_PERSISTENT_CONGESTION_THRESHOLD, QuicCapacityProofCandidate,
     adaptive_reliable_relay_chunk_bytes_with_frame_limit,
 };
-use crate::model::multipath::{
-    FlowSubflowSet, PathAdmission, PathAdmissionDecision, PathRuntimeRole,
-};
+use crate::model::multipath::{FlowSubflowSet, PathAdmission};
 use crate::model::path::{CarrierPathInstanceId, CarrierPathKey, carrier_path_key_order};
 use crate::model::response::{
     CarrierPathFlightDebt, ResponseBulkLead, ResponseCandidateTailDebt, ResponseOrderedTail,
@@ -50,7 +48,6 @@ use crate::model::response::{
     select_response_service_or_proven_observation,
 };
 use crate::model::timing::transport_pto_from_snapshot;
-use crate::model::work::CarrierWorkKind;
 use crate::mux::MuxLimits;
 use crate::mux::stream::ReliableSendStream;
 use crate::protocol::frame::reliable_stream_frame_accounted_bytes;
@@ -86,28 +83,20 @@ pub(super) enum ResponseDataSelectionIntent {
 
 impl ResponseDataSelectionIntent {
     fn from_owner_admission(
-        role: PathRuntimeRole,
+        admission: PathAdmission,
         subflow: Option<ResponseSubflowAdmissionSelection>,
     ) -> Option<Self> {
-        match (role, subflow) {
-            (PathRuntimeRole::Service, None) => Some(Self::Service),
-            (PathRuntimeRole::Subflow, Some(selection)) => Some(Self::SubflowAdmission(selection)),
+        match (admission, subflow) {
+            (PathAdmission::Service, None) => Some(Self::Service),
+            (PathAdmission::Subflow, Some(selection)) => Some(Self::SubflowAdmission(selection)),
             _ => None,
         }
     }
 
-    pub(super) fn role(&self) -> PathRuntimeRole {
-        match self {
-            Self::Service | Self::ServiceHandoff(_) => PathRuntimeRole::Service,
-            Self::SubflowAdmission(_) | Self::AckClockCalibration(_) => PathRuntimeRole::Subflow,
-        }
-    }
-
     fn admission(&self) -> PathAdmission {
-        match self.role() {
-            PathRuntimeRole::Service => PathAdmission::service(),
-            PathRuntimeRole::Subflow => PathAdmission::subflow_owner(PathRuntimeRole::Subflow),
-            _ => unreachable!("response OwnerData selection has only Service or Subflow roles"),
+        match self {
+            Self::Service | Self::ServiceHandoff(_) => PathAdmission::Service,
+            Self::SubflowAdmission(_) | Self::AckClockCalibration(_) => PathAdmission::Subflow,
         }
     }
 
@@ -475,7 +464,7 @@ pub(super) fn response_service_handoff_drain_lease(
     outstanding_owner_bytes: u64,
 ) -> Duration {
     let rate_bps = response_service_fair_share_bps(&service.observation, false)
-        .max(default_path_rate_bps(service.observation.key.underlay))
+        .max(default_path_rate_bps())
         .max(1.0);
     let transmit_seconds = outstanding_owner_bytes as f64 * 8.0 / rate_bps;
     let transmit_eta = Duration::from_secs_f64(transmit_seconds);
@@ -535,7 +524,6 @@ pub(super) fn choose_response_repair_target(
     avoid_keys: &[CarrierPathKey],
     cause: RelaySendCause,
 ) -> Option<ResponseSenderPathTarget> {
-    debug_assert!(PathRuntimeRole::RepairOnly.may_repair());
     debug_assert!(cause.is_repair());
     let repair_targets = targets
         .iter()
@@ -877,12 +865,7 @@ pub(super) fn admit_response_data_target(
         .into_parts();
     #[cfg(not(feature = "lab-diagnostics"))]
     let _ = (effective_ordering_debt, role, model_suppression);
-    if !matches!(
-        admission.decision,
-        PathAdmissionDecision::Service | PathAdmissionDecision::AdmitSubflow
-    ) || admission.work != CarrierWorkKind::OwnerData
-        || !admission.role.may_own_unique_data()
-    {
+    if !admission.owns_unique_data() {
         #[cfg(feature = "lab-diagnostics")]
         lab_response_bulk_output_candidate(
             model_suppression.unwrap_or("not_owner_admission"),
@@ -897,7 +880,7 @@ pub(super) fn admit_response_data_target(
         );
         return None;
     }
-    if admission.role == PathRuntimeRole::Service
+    if admission == PathAdmission::Service
         && !response_service_has_assigned_owner_credit(
             target,
             policy.lane,
@@ -919,7 +902,7 @@ pub(super) fn admit_response_data_target(
         );
         return None;
     }
-    if admission.role == PathRuntimeRole::Subflow
+    if admission == PathAdmission::Subflow
         && !response_target_has_emission_credit(
             target,
             policy.lane,
@@ -941,10 +924,8 @@ pub(super) fn admit_response_data_target(
         );
         return None;
     }
-    let selection = ResponseDataSelectionIntent::from_owner_admission(
-        admission.role,
-        subflow_admission_selection,
-    )?;
+    let selection =
+        ResponseDataSelectionIntent::from_owner_admission(admission, subflow_admission_selection)?;
     Some(ResponseSelectedDataTarget {
         target: target.clone(),
         selection,
@@ -1589,7 +1570,7 @@ pub(super) fn response_feedable_service_owner_target(
 ) -> Option<ResponseSelectedDataTarget> {
     admitted
         .iter()
-        .filter(|selected| selected.admission().role == PathRuntimeRole::Service)
+        .filter(|selected| selected.admission() == PathAdmission::Service)
         .min_by(|left, right| {
             response_target_assigned_product_bytes(&left.target)
                 .cmp(&response_target_assigned_product_bytes(&right.target))
@@ -1622,7 +1603,7 @@ pub(super) fn response_same_family_reservoir_subflow_target(
     admitted
         .iter()
         .filter(|selected| {
-            selected.admission().role == PathRuntimeRole::Subflow
+            selected.admission() == PathAdmission::Subflow
                 && response_target_is_same_family_reservoir_candidate(reservoir, &selected.target)
                 // Separate QUIC connections own independent congestion
                 // controllers. Crossing into an equally loaded connection

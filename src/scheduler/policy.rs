@@ -1,9 +1,14 @@
+//! Pure production path eligibility and completion scoring.
+//!
+//! Formulas consume live evidence and protocol-derived timing; this module owns
+//! no queues, flow lifetimes, carrier I/O, or simulator-only heuristics.
+
 use super::FlowLane;
-use crate::protocol::{PathCapabilities, PathId, UnderlayProtocol};
-use std::collections::VecDeque;
+use crate::model::path::PathPolicy;
+use crate::protocol::{PathId, UnderlayProtocol};
 
 const BBR_DEFAULT_CWND_GAIN: f64 = 2.0;
-const QUIC_INITIAL_WINDOW_PACKETS: f64 = 10.0;
+pub(crate) const QUIC_INITIAL_WINDOW_PACKETS: f64 = 10.0;
 const QUIC_MAX_ACK_DELAY_MS: f64 = 25.0;
 const QUIC_PERSISTENT_CONGESTION_THRESHOLD: f64 = 3.0;
 
@@ -13,42 +18,6 @@ pub enum PathState {
     Suspect,
     Draining,
     Failed,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct PathFlags {
-    pub backup: bool,
-    pub expensive: bool,
-    pub low_latency: bool,
-    pub bulk_allowed: bool,
-    pub probe_only: bool,
-    pub no_udp: bool,
-}
-
-impl Default for PathFlags {
-    fn default() -> Self {
-        Self {
-            backup: false,
-            expensive: false,
-            low_latency: false,
-            bulk_allowed: true,
-            probe_only: false,
-            no_udp: false,
-        }
-    }
-}
-
-impl From<PathCapabilities> for PathFlags {
-    fn from(value: PathCapabilities) -> Self {
-        Self {
-            backup: value.backup,
-            expensive: value.expensive,
-            low_latency: value.low_latency,
-            bulk_allowed: value.bulk_allowed,
-            probe_only: value.probe_only,
-            no_udp: value.no_udp,
-        }
-    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -64,9 +33,8 @@ pub struct PathSnapshot {
     pub id: PathId,
     pub underlay: UnderlayProtocol,
     pub state: PathState,
-    pub flags: PathFlags,
+    pub policy: PathPolicy,
     pub srtt_ms: f64,
-    pub min_rtt_ms: f64,
     pub jitter_ms: f64,
     pub delivery_rate_bps: f64,
     pub rate_scope: PathRateScope,
@@ -99,9 +67,8 @@ impl PathSnapshot {
             id,
             underlay,
             state: PathState::Active,
-            flags: PathFlags::default(),
+            policy: PathPolicy::default(),
             srtt_ms,
-            min_rtt_ms: srtt_ms,
             jitter_ms: 0.0,
             delivery_rate_bps,
             rate_scope: PathRateScope::PathCapacity,
@@ -138,14 +105,6 @@ pub(crate) fn path_within_adaptive_lead_hysteresis(
         && old_snapshot.queue_bytes <= best_snapshot.queue_bytes + queue_hysteresis_bytes
 }
 
-/// Scheduler policy is intentionally parameter-free in production.
-///
-/// Scheduling may use live path evidence, protocol-derived timer shape, and
-/// resource envelopes. It must not hide mptunnel-only millisecond weights or
-/// byte thresholds that silently become lab-tuned modes.
-#[derive(Debug, Clone, Copy, Default)]
-pub struct SchedulerPolicy;
-
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct PathScore {
     pub path_id: PathId,
@@ -156,280 +115,14 @@ pub fn choose_path(
     paths: &[PathSnapshot],
     lane: FlowLane,
     payload_bytes: usize,
-    policy: SchedulerPolicy,
 ) -> Option<PathScore> {
     paths
         .iter()
-        .filter_map(|path| score_path(*path, lane, payload_bytes, policy))
+        .filter_map(|path| score_path(*path, lane, payload_bytes))
         .min_by(|left, right| left.eta_ms.total_cmp(&right.eta_ms))
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct FlowId(pub u64);
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum SchedulingMode {
-    Normal,
-    TailAvoidance,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct EnqueueRequest {
-    pub flow_id: FlowId,
-    pub lane: FlowLane,
-    pub payload_bytes: usize,
-    pub remaining_flow_bytes: usize,
-    pub duplicate_eligible: bool,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq)]
-pub struct SchedulerDecision {
-    pub flow_id: FlowId,
-    pub lane: FlowLane,
-    pub scheduled_lane: FlowLane,
-    pub mode: SchedulingMode,
-    pub payload_bytes: usize,
-    pub path_id: PathId,
-    pub duplicate_path_id: Option<PathId>,
-    pub estimated_completion_ms: f64,
-}
-
-#[derive(Debug, Default)]
-pub struct HeterogeneousScheduler {
-    lanes: Vec<LaneQueue>,
-    path_queues: Vec<PathQueue>,
-}
-
-impl HeterogeneousScheduler {
-    pub fn enqueue(&mut self, request: EnqueueRequest) {
-        if request.payload_bytes == 0 {
-            return;
-        }
-        let lane_index = self.lane_index(request.lane);
-        let lane_queue = &mut self.lanes[lane_index];
-        if let Some(flow) = lane_queue
-            .flows
-            .iter_mut()
-            .find(|flow| flow.flow_id == request.flow_id)
-        {
-            flow.packets.push_back(request);
-            return;
-        }
-        let mut flow = FlowQueue {
-            flow_id: request.flow_id,
-            deficit_bytes: 0,
-            packets: VecDeque::new(),
-        };
-        flow.packets.push_back(request);
-        lane_queue.flows.push_back(flow);
-    }
-
-    pub fn has_queued(&self) -> bool {
-        self.lanes
-            .iter()
-            .any(|lane| lane.flows.iter().any(|flow| !flow.packets.is_empty()))
-    }
-
-    pub fn queued_path_bytes(&self, path_id: PathId) -> u64 {
-        self.path_queues
-            .iter()
-            .find(|queue| queue.path_id == path_id)
-            .map_or(0, |queue| queue.bytes)
-    }
-
-    pub fn schedule_next(
-        &mut self,
-        paths: &[PathSnapshot],
-        policy: SchedulerPolicy,
-    ) -> Option<SchedulerDecision> {
-        for lane in priority_order() {
-            let lane_index = self.lane_index(lane);
-            let flow_count = self.lanes[lane_index].flows.len();
-            if flow_count == 0 {
-                continue;
-            }
-            let lane_quantum = self.lanes[lane_index]
-                .flows
-                .iter()
-                .filter_map(|flow| flow.packets.front())
-                .map(|packet| deficit_charge_bytes(packet.lane, packet.payload_bytes))
-                .max()
-                .unwrap_or(1);
-            self.lanes[lane_index].deficit_bytes = self.lanes[lane_index]
-                .deficit_bytes
-                .saturating_add(lane_quantum);
-
-            for _ in 0..flow_count {
-                let mut flow = self.lanes[lane_index]
-                    .flows
-                    .pop_front()
-                    .expect("flow exists");
-                let Some(packet) = flow.packets.front().copied() else {
-                    continue;
-                };
-                let charge_bytes = deficit_charge_bytes(packet.lane, packet.payload_bytes);
-                flow.deficit_bytes = flow.deficit_bytes.saturating_add(charge_bytes);
-                if charge_bytes > self.lanes[lane_index].deficit_bytes
-                    || charge_bytes > flow.deficit_bytes
-                {
-                    self.lanes[lane_index].flows.push_back(flow);
-                    continue;
-                }
-                let Some(decision) = self.choose_packet_paths(packet, paths, policy) else {
-                    self.lanes[lane_index].flows.push_front(flow);
-                    return None;
-                };
-                self.lanes[lane_index].deficit_bytes = self.lanes[lane_index]
-                    .deficit_bytes
-                    .saturating_sub(charge_bytes);
-                flow.deficit_bytes = flow.deficit_bytes.saturating_sub(charge_bytes);
-                flow.packets.pop_front();
-                if !flow.packets.is_empty() {
-                    self.lanes[lane_index].flows.push_back(flow);
-                }
-                self.add_path_queue(decision.path_id, packet.payload_bytes as u64);
-                if let Some(path_id) = decision.duplicate_path_id {
-                    self.add_path_queue(path_id, packet.payload_bytes as u64);
-                }
-                return Some(decision);
-            }
-        }
-        None
-    }
-
-    pub fn advance_time(&mut self, paths: &[PathSnapshot], elapsed_ms: f64) {
-        if elapsed_ms <= 0.0 {
-            return;
-        }
-        for queue in &mut self.path_queues {
-            let Some(path) = paths.iter().find(|path| path.id == queue.path_id) else {
-                queue.bytes = 0;
-                continue;
-            };
-            if !matches!(path.state, PathState::Active | PathState::Suspect) {
-                queue.bytes = 0;
-                continue;
-            }
-            let drained = (path.delivery_rate_bps.max(0.0) * elapsed_ms / 8000.0) as u64;
-            queue.bytes = queue.bytes.saturating_sub(drained);
-        }
-    }
-
-    pub fn remove_path(&mut self, path_id: PathId) {
-        self.path_queues.retain(|queue| queue.path_id != path_id);
-    }
-
-    fn lane_index(&mut self, lane: FlowLane) -> usize {
-        if let Some(index) = self.lanes.iter().position(|queue| queue.lane == lane) {
-            return index;
-        }
-        self.lanes.push(LaneQueue {
-            lane,
-            deficit_bytes: 0,
-            flows: VecDeque::new(),
-        });
-        self.lanes.len() - 1
-    }
-
-    fn choose_packet_paths(
-        &self,
-        packet: EnqueueRequest,
-        paths: &[PathSnapshot],
-        policy: SchedulerPolicy,
-    ) -> Option<SchedulerDecision> {
-        let mode = scheduling_mode(packet, paths);
-        let scheduled_lane = scheduled_lane(packet.lane, mode);
-        let scored = self.scored_paths(
-            paths,
-            packet.lane,
-            scheduled_lane,
-            packet.payload_bytes,
-            mode,
-            policy,
-        );
-        let primary = scored.first().copied()?;
-        let duplicate_path_id = duplicate_path(packet, primary, &scored, paths);
-        Some(SchedulerDecision {
-            flow_id: packet.flow_id,
-            lane: packet.lane,
-            scheduled_lane,
-            mode,
-            payload_bytes: packet.payload_bytes,
-            path_id: primary.path_id,
-            duplicate_path_id,
-            estimated_completion_ms: primary.eta_ms,
-        })
-    }
-
-    fn scored_paths(
-        &self,
-        paths: &[PathSnapshot],
-        original_lane: FlowLane,
-        scheduled_lane: FlowLane,
-        payload_bytes: usize,
-        mode: SchedulingMode,
-        policy: SchedulerPolicy,
-    ) -> Vec<PathScore> {
-        let mut scored = paths
-            .iter()
-            .filter(|path| original_lane != FlowLane::Throughput || path.flags.bulk_allowed)
-            .filter_map(|path| {
-                let mut path = *path;
-                path.queue_bytes = path
-                    .queue_bytes
-                    .saturating_add(self.queued_path_bytes(path.id));
-                score_path(path, scheduled_lane, payload_bytes, policy).map(|mut score| {
-                    score.eta_ms += shared_bottleneck_penalty(path, paths);
-                    if mode == SchedulingMode::TailAvoidance {
-                        score.eta_ms += adaptive_tail_avoidance_penalty_ms(path);
-                    }
-                    score
-                })
-            })
-            .collect::<Vec<_>>();
-        scored.sort_by(|left, right| left.eta_ms.total_cmp(&right.eta_ms));
-        scored
-    }
-
-    fn add_path_queue(&mut self, path_id: PathId, bytes: u64) {
-        if let Some(queue) = self
-            .path_queues
-            .iter_mut()
-            .find(|queue| queue.path_id == path_id)
-        {
-            queue.bytes = queue.bytes.saturating_add(bytes);
-            return;
-        }
-        self.path_queues.push(PathQueue { path_id, bytes });
-    }
-}
-
-#[derive(Debug)]
-struct LaneQueue {
-    lane: FlowLane,
-    deficit_bytes: u64,
-    flows: VecDeque<FlowQueue>,
-}
-
-#[derive(Debug)]
-struct FlowQueue {
-    flow_id: FlowId,
-    deficit_bytes: u64,
-    packets: VecDeque<EnqueueRequest>,
-}
-
-#[derive(Debug, Clone, Copy)]
-struct PathQueue {
-    path_id: PathId,
-    bytes: u64,
-}
-
-pub fn score_path(
-    path: PathSnapshot,
-    lane: FlowLane,
-    payload_bytes: usize,
-    _policy: SchedulerPolicy,
-) -> Option<PathScore> {
+pub fn score_path(path: PathSnapshot, lane: FlowLane, payload_bytes: usize) -> Option<PathScore> {
     if !path_is_schedulable(path, lane) {
         return None;
     }
@@ -461,10 +154,10 @@ pub fn score_path(
     if path.state == PathState::Suspect {
         eta_ms += suspect_penalty_ms(path, lane);
     }
-    if path.flags.backup {
+    if path.policy.backup {
         eta_ms += adaptive_backup_penalty_ms(path);
     }
-    if path.flags.expensive {
+    if path.policy.expensive {
         eta_ms += adaptive_expensive_path_penalty_ms(path, payload_bytes);
     }
     Some(PathScore {
@@ -508,100 +201,17 @@ fn effective_path_rate_bps(path: PathSnapshot, lane: FlowLane) -> f64 {
     }
 }
 
-fn priority_order() -> [FlowLane; 5] {
-    [
-        FlowLane::Control,
-        FlowLane::RealtimeDatagram,
-        FlowLane::Latency,
-        FlowLane::Throughput,
-        FlowLane::Background,
-    ]
-}
-
-fn deficit_charge_bytes(lane: FlowLane, payload_bytes: usize) -> u64 {
-    // Fairness charges the actual sender-service quantum. The sender service is
-    // responsible for keeping product frames preemptible; this scheduler does
-    // not hide another fixed byte quantum underneath it.
-    let _ = lane;
-    (payload_bytes as u64).max(1)
-}
-
-fn scheduling_mode(packet: EnqueueRequest, paths: &[PathSnapshot]) -> SchedulingMode {
-    if packet.lane == FlowLane::Throughput
-        && packet.remaining_flow_bytes <= adaptive_tail_avoidance_threshold_bytes(paths, packet)
-    {
-        SchedulingMode::TailAvoidance
-    } else {
-        SchedulingMode::Normal
-    }
-}
-
-fn scheduled_lane(lane: FlowLane, mode: SchedulingMode) -> FlowLane {
-    match (lane, mode) {
-        (FlowLane::Throughput, SchedulingMode::TailAvoidance) => FlowLane::Latency,
-        _ => lane,
-    }
-}
-
-fn duplicate_path(
-    packet: EnqueueRequest,
-    primary: PathScore,
-    scored: &[PathScore],
-    paths: &[PathSnapshot],
-) -> Option<PathId> {
-    if !packet.duplicate_eligible
-        || !matches!(packet.lane, FlowLane::Control | FlowLane::RealtimeDatagram)
-    {
-        return None;
-    }
-    let primary_snapshot = paths
-        .iter()
-        .copied()
-        .find(|path| path.id == primary.path_id)?;
-    scored
-        .iter()
-        .copied()
-        .find(|score| {
-            let Some(candidate) = paths.iter().copied().find(|path| path.id == score.path_id)
-            else {
-                return false;
-            };
-            let eta_slack = adaptive_duplication_eta_slack_ms(primary_snapshot, candidate);
-            let duplicate_tx = payload_tx_ms(candidate, packet.payload_bytes);
-            score.path_id != primary.path_id
-                && score.eta_ms <= primary.eta_ms + eta_slack
-                && duplicate_tx <= eta_slack
-        })
-        .map(|score| score.path_id)
-}
-
-fn shared_bottleneck_penalty(path: PathSnapshot, paths: &[PathSnapshot]) -> f64 {
-    paths
-        .iter()
-        .filter(|other| {
-            other.id != path.id
-                && matches!(other.state, PathState::Active | PathState::Suspect)
-                && other.queue_bytes.saturating_add(other.bytes_in_flight) > 0
-                && path_rtt_samples_overlap(path, **other)
-        })
-        .map(|other| {
-            let queued = other.queue_bytes.saturating_add(other.bytes_in_flight) as usize;
-            payload_tx_ms(path, queued)
-        })
-        .fold(0.0, f64::max)
-}
-
-fn path_is_schedulable(path: PathSnapshot, lane: FlowLane) -> bool {
+pub(crate) fn path_is_schedulable(path: PathSnapshot, lane: FlowLane) -> bool {
     if matches!(path.state, PathState::Failed | PathState::Draining) {
         return false;
     }
-    if path.flags.probe_only && lane != FlowLane::Control {
+    if path.policy.probe_only && lane != FlowLane::Control {
         return false;
     }
-    if lane == FlowLane::Throughput && !path.flags.bulk_allowed {
+    if lane == FlowLane::Throughput && !path.policy.bulk_allowed {
         return false;
     }
-    if lane == FlowLane::RealtimeDatagram && path.flags.no_udp {
+    if lane == FlowLane::RealtimeDatagram && path.policy.no_udp {
         return false;
     }
     true
@@ -641,47 +251,17 @@ fn adaptive_expensive_path_penalty_ms(path: PathSnapshot, payload_bytes: usize) 
     path_pto_ms(path).max(payload_tx_ms(path, payload_bytes))
 }
 
-fn adaptive_tail_avoidance_threshold_bytes(
-    paths: &[PathSnapshot],
-    packet: EnqueueRequest,
-) -> usize {
-    paths
-        .iter()
-        .copied()
-        .filter(|path| path_is_schedulable(*path, FlowLane::Latency))
-        .map(path_bdp_bytes)
-        .min()
-        .unwrap_or(packet.payload_bytes.max(1))
-        .max(packet.payload_bytes.max(1))
-}
-
-fn adaptive_tail_avoidance_penalty_ms(path: PathSnapshot) -> f64 {
-    path_pto_ms(path)
-}
-
-fn adaptive_duplication_eta_slack_ms(primary: PathSnapshot, candidate: PathSnapshot) -> f64 {
-    let pto = path_pto_ms(primary).min(path_pto_ms(candidate));
-    let jitter = primary.jitter_ms.max(candidate.jitter_ms).max(0.0);
-    (pto / QUIC_INITIAL_WINDOW_PACKETS).max(jitter)
-}
-
-fn path_rtt_samples_overlap(path: PathSnapshot, other: PathSnapshot) -> bool {
-    let path_window = path.jitter_ms.max(path.srtt_ms.max(1.0) / 4.0);
-    let other_window = other.jitter_ms.max(other.srtt_ms.max(1.0) / 4.0);
-    (path.srtt_ms - other.srtt_ms).abs() <= path_window.max(other_window)
-}
-
-fn path_bdp_bytes(path: PathSnapshot) -> usize {
+pub(crate) fn path_bdp_bytes(path: PathSnapshot) -> usize {
     ((effective_path_rate_bps(path, FlowLane::Throughput) / 8.0) * (path.srtt_ms.max(1.0) / 1000.0))
         .ceil()
         .max(1.0) as usize
 }
 
-fn payload_tx_ms(path: PathSnapshot, payload_bytes: usize) -> f64 {
+pub(crate) fn payload_tx_ms(path: PathSnapshot, payload_bytes: usize) -> f64 {
     payload_bytes as f64 * 8.0 / effective_path_rate_bps(path, FlowLane::Throughput) * 1000.0
 }
 
-fn path_pto_ms(path: PathSnapshot) -> f64 {
+pub(crate) fn path_pto_ms(path: PathSnapshot) -> f64 {
     let srtt = path.srtt_ms.max(1.0);
     let rttvar = path.jitter_ms.max(srtt / 8.0);
     srtt + (4.0 * rttvar).max(1.0) + srtt.min(QUIC_MAX_ACK_DELAY_MS)

@@ -51,11 +51,12 @@ impl ClientTcpPathConnection {
 
 #[derive(Clone)]
 pub(in crate::runtime) struct ClientTcpPathSessionRuntime {
-    pub(in crate::runtime) path: PathSpec,
+    pub(in crate::runtime) paths: Arc<Vec<PathSpec>>,
+    pub(in crate::runtime) config_index: usize,
     pub(in crate::runtime) path_index: usize,
     pub(in crate::runtime) carrier_identity: CarrierPathIdentity,
     pub(in crate::runtime) session_id: SessionId,
-    pub(in crate::runtime) security: SecurityConfig,
+    pub(in crate::runtime) security: Arc<Vec<SecurityConfig>>,
     pub(in crate::runtime) codec_limits: CodecLimits,
     pub(in crate::runtime) mux_limits: MuxLimits,
     pub(in crate::runtime) command_queue: usize,
@@ -63,6 +64,20 @@ pub(in crate::runtime) struct ClientTcpPathSessionRuntime {
     pub(in crate::runtime) closed_stream_cache_capacity: usize,
     pub(in crate::runtime) state: Arc<ClientPathState>,
     pub(in crate::runtime) carrier_network: Arc<dyn CarrierNetworkProvider>,
+}
+
+impl ClientTcpPathSessionRuntime {
+    pub(in crate::runtime) fn path(&self) -> &PathSpec {
+        self.paths
+            .get(self.config_index)
+            .expect("TCP session path inventory matches its index")
+    }
+
+    pub(in crate::runtime) fn security(&self) -> &SecurityConfig {
+        self.security
+            .get(self.config_index)
+            .expect("TCP session security inventory matches its index")
+    }
 }
 
 /// Reliable-only calibration state must not leak into datagram carrier users.

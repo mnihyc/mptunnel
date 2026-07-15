@@ -133,7 +133,6 @@ async fn terminal_reset_captures_current_outputs_and_rejects_late_attach() {
             second_commands,
             FlowLane::Throughput,
             StreamOpenRole::Validation,
-            64 * 1024,
         ),
         ResponseStreamAttachOutcome::Attached,
     );
@@ -172,7 +171,6 @@ async fn terminal_reset_captures_current_outputs_and_rejects_late_attach() {
             late_commands,
             FlowLane::Throughput,
             StreamOpenRole::Validation,
-            64 * 1024,
         ),
         ResponseStreamAttachOutcome::RejectedClosedStream,
     );
@@ -202,7 +200,6 @@ async fn concurrent_attach_either_joins_terminal_snapshot_or_observes_closed_str
             racing_commands,
             FlowLane::Throughput,
             StreamOpenRole::Validation,
-            64 * 1024,
         )
     });
     let close_binding = binding.clone();

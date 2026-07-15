@@ -7,11 +7,11 @@ use super::{DatagramClientFlow, SentDatagram, datagram_ack_range, datagram_id_is
 use crate::config::SecurityConfig;
 use crate::model::capacity::{PathRateSample, QUIC_TIMER_GRANULARITY};
 use crate::mux::MuxLimits;
-use crate::mux::datagram::{DatagramError, DatagramFlow};
+use crate::mux::datagram::DatagramFlow;
 use crate::protocol::codec::CodecLimits;
 use crate::protocol::{
-    CloseReason, DatagramFlowId, DatagramId, Frame, IngressKind, OffsetRange, OutboundPolicy,
-    PathId, PathMetrics, SessionId, TargetAddr,
+    CloseReason, DatagramFlowId, DatagramId, Frame, OffsetRange, PathId, PathMetrics, SessionId,
+    TargetAddr,
 };
 use crate::runtime::error::RuntimeError;
 use crate::runtime::identity::{random_session_id, random_u64};
@@ -46,7 +46,6 @@ pub(in crate::runtime) struct UdpDatagramClientSession {
     sent_datagrams: HashMap<(DatagramFlowId, DatagramId), SentDatagram>,
     last_datagram_rtt: Option<Duration>,
     last_feedback_observation: Option<UdpDatagramPathObservation>,
-    mtu_payload_bytes: usize,
     pub(in crate::runtime) connection_usable: bool,
 }
 
@@ -111,14 +110,15 @@ impl UdpDatagramClientSession {
             udp: vec![ClientPathHealthRecord::default(); path_index.saturating_add(1)],
         });
         let path_session = ClientUdpPathSessionHandle::new(ClientUdpPathSessionRuntime {
-            path: path.clone(),
+            paths: std::sync::Arc::new(vec![path.clone()]),
+            config_index: 0,
             path_index,
             carrier_identity: CarrierPathIdentity {
                 group_ordinal: 0,
                 path_ordinal: path_index,
             },
             session_id,
-            security,
+            security: std::sync::Arc::new(vec![security]),
             codec_limits,
             mux_limits,
             stream_frame_queue: reliable_stream_frame_queue(mux_limits),
@@ -148,7 +148,6 @@ impl UdpDatagramClientSession {
             sent_datagrams: HashMap::new(),
             last_datagram_rtt: None,
             last_feedback_observation: None,
-            mtu_payload_bytes: mux_limits.max_payload_bytes,
             connection_usable: true,
         })
     }
@@ -397,7 +396,6 @@ impl UdpDatagramClientSession {
                     self.observe_remote_path_metrics(metrics);
                 }
                 Frame::SessionReady => {}
-                Frame::RxRateHint { path_id, .. } if path_id == self.path_id => {}
                 Frame::DatagramClose {
                     flow_id: closed_flow_id,
                 } if closed_flow_id == flow_id => {
@@ -436,8 +434,6 @@ impl UdpDatagramClientSession {
             &Frame::OpenDatagramFlow {
                 flow_id,
                 target: target.clone(),
-                ingress: IngressKind::Socks5,
-                outbound: OutboundPolicy::Direct,
             },
             self.stream.runtime.codec_limits,
         )
@@ -511,24 +507,6 @@ impl UdpDatagramClientSession {
 
     pub(in crate::runtime) fn delivery_stats(&self) -> PathDeliveryStats {
         self.stats
-    }
-
-    pub(in crate::runtime) fn mtu_payload_bytes(&self) -> usize {
-        self.mtu_payload_bytes
-    }
-
-    pub(in crate::runtime) async fn probe_mtu(
-        &mut self,
-        payload_bytes: usize,
-    ) -> Result<usize, RuntimeError> {
-        if payload_bytes > self.mux_limits.max_payload_bytes {
-            return Err(RuntimeError::Datagram(DatagramError::PayloadTooLarge {
-                actual: payload_bytes,
-                limit: self.mux_limits.max_payload_bytes,
-            }));
-        }
-        self.mtu_payload_bytes = self.mux_limits.max_payload_bytes;
-        Ok(self.mtu_payload_bytes)
     }
 
     pub(in crate::runtime) fn take_feedback_observation(

@@ -12,7 +12,7 @@ use crate::model::ack_clock::{
     reliable_ack_clock_calibration_ceiling_bytes, reliable_ack_clock_calibration_limit_bytes,
 };
 use crate::model::capacity::{PATH_OPEN_SCORE_BYTES, reliable_bulk_carrier_feed_quantum_bytes};
-use crate::model::multipath::{PathAdmissionDecision, SubflowAdmissionInput};
+use crate::model::multipath::{PathAdmission, SubflowAdmissionInput};
 use crate::model::path::CarrierPathKey;
 use crate::mux::MuxLimits;
 use crate::protocol::{Frame, PathId, SessionId, StreamOpenRole, UnderlayProtocol};
@@ -57,7 +57,6 @@ fn service_admission_publishes_queue_flight_and_owner_as_one_transaction() {
             candidate_commands.clone(),
             FlowLane::Throughput,
             StreamOpenRole::Validation,
-            payload_bytes,
         ),
         ResponseStreamAttachOutcome::Attached
     );
@@ -276,7 +275,6 @@ fn tcp_calibration_commit_fences_generations_and_rolls_back_blocked_enqueue() {
             candidate_commands.clone(),
             FlowLane::Throughput,
             StreamOpenRole::Validation,
-            payload_bytes,
         ),
         ResponseStreamAttachOutcome::Attached
     );
@@ -314,26 +312,20 @@ fn tcp_calibration_commit_fences_generations_and_rolls_back_blocked_enqueue() {
         (service_incarnation, candidate_incarnation)
     };
     assert_eq!(
-        binding
-            .commit_subflow_owner_admission(
-                service,
-                payload_bytes,
-                0,
-                Duration::ZERO,
-                SubflowAdmissionInput {
-                    key: candidate,
-                    bulk_rate_proven: true,
-                    startup_owner_allowed: false,
-                    frontier_clear: true,
-                    completion_improves: true,
-                    observed_goodput_non_degrading: true,
-                    read_gap: Duration::ZERO,
-                    owner_bytes: payload_bytes,
-                    optional_overhead_bytes: 0,
-                },
-            )
-            .decision,
-        PathAdmissionDecision::AdmitSubflow
+        binding.commit_subflow_owner_admission(
+            service,
+            payload_bytes,
+            SubflowAdmissionInput {
+                key: candidate,
+                bulk_rate_proven: true,
+                startup_owner_allowed: false,
+                frontier_clear: true,
+                completion_improves: true,
+                observed_goodput_non_degrading: true,
+                owner_bytes: payload_bytes,
+            },
+        ),
+        PathAdmission::Subflow
     );
     let target = binding
         .sender_path_targets(FlowLane::Throughput, payload_bytes)
@@ -604,7 +596,6 @@ fn subflow_reservation_and_enqueue_linearize_before_topology_reset() {
             candidate_commands,
             FlowLane::Throughput,
             StreamOpenRole::Validation,
-            payload_bytes,
         ),
         ResponseStreamAttachOutcome::Attached
     );
@@ -620,7 +611,6 @@ fn subflow_reservation_and_enqueue_linearize_before_topology_reset() {
             unrelated_commands.clone(),
             FlowLane::Throughput,
             StreamOpenRole::Validation,
-            payload_bytes,
         ),
         ResponseStreamAttachOutcome::Attached
     );
@@ -640,8 +630,6 @@ fn subflow_reservation_and_enqueue_linearize_before_topology_reset() {
         expected_lane_generation: binding.lane_generation(),
         service,
         startup_owner_credit_bytes: payload_bytes,
-        optional_overhead_budget_bytes: 0,
-        max_read_gap_budget: Duration::ZERO,
         input: SubflowAdmissionInput {
             key: candidate,
             bulk_rate_proven: false,
@@ -649,9 +637,7 @@ fn subflow_reservation_and_enqueue_linearize_before_topology_reset() {
             frontier_clear: true,
             completion_improves: false,
             observed_goodput_non_degrading: true,
-            read_gap: Duration::ZERO,
             owner_bytes: payload_bytes,
-            optional_overhead_bytes: 0,
         },
     };
     let frame = stream_data_frame(payload_bytes);

@@ -61,7 +61,6 @@ fn exact_clear_frontier_handoff_pins_quic_proof_through_marker_expiry() {
         candidate_commands,
         FlowLane::Throughput,
         StreamOpenRole::Validation,
-        mux_limits.max_payload_bytes,
     );
     let _ = try_recv_reliable_path_command(&mut candidate_receivers);
     let proof = {

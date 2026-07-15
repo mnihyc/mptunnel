@@ -45,7 +45,7 @@ fn rate_evidence_does_not_promote_before_service_quantum_floor() {
         limits,
     );
 
-    assert_eq!(decision.demand.lane, FlowLane::Latency);
+    assert_eq!(decision.lane, FlowLane::Latency);
     assert!(!decision.promoted_to_throughput);
     assert!(
         decision.prevalidate_bulk,
@@ -66,7 +66,7 @@ fn initial_window_response_stays_latency_and_does_not_prevalidate_bulk() {
         limits,
     );
 
-    assert_eq!(decision.demand.lane, FlowLane::Latency);
+    assert_eq!(decision.lane, FlowLane::Latency);
     assert!(!decision.promoted_to_throughput);
     assert!(
         !decision.prevalidate_bulk,
@@ -93,7 +93,7 @@ fn bulk_prevalidation_uses_amortized_floor_before_throughput_promotion() {
         limits,
     );
 
-    assert_eq!(decision.demand.lane, FlowLane::Latency);
+    assert_eq!(decision.lane, FlowLane::Latency);
     assert!(!decision.promoted_to_throughput);
     assert!(decision.prevalidate_bulk);
 }
@@ -106,7 +106,7 @@ fn rate_evidence_promotes_after_service_quantum_floor() {
 
     let decision = tracker.refresh(ReliableRelayFlowSignals::new(floor, 0, 0), None, limits);
 
-    assert_eq!(decision.demand.lane, FlowLane::Throughput);
+    assert_eq!(decision.lane, FlowLane::Throughput);
     assert!(decision.promoted_to_throughput);
     assert!(tracker.should_rebalance(decision));
 }

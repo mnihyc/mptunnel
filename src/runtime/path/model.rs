@@ -1,9 +1,9 @@
 use crate::model::admission::{BulkPathCandidate, bulk_candidates_span_underlays};
 use crate::model::capacity::{
-    BBR_DEFAULT_CWND_GAIN, BBR_MAX_SEND_QUANTUM_BYTES, PATH_OPEN_SCORE_BYTES, PathRateSample,
-    QUIC_PERSISTENT_CONGESTION_THRESHOLD, QUIC_TIMER_GRANULARITY, RELIABLE_INITIAL_RTT,
-    RELIABLE_INITIAL_WINDOW_PACKETS, UDP_DEFAULT_MTU_PAYLOAD_BYTES, UDP_MAX_MTU_PAYLOAD_BYTES,
-    UDP_MIN_MTU_PAYLOAD_BYTES, adaptive_reliable_relay_inflight_bytes,
+    BBR_DEFAULT_CWND_GAIN, BBR_MAX_SEND_QUANTUM_BYTES, MAX_PRODUCT_DATAGRAM_PAYLOAD_BYTES,
+    PATH_OPEN_SCORE_BYTES, PathRateSample, QUIC_PERSISTENT_CONGESTION_THRESHOLD,
+    QUIC_TIMER_GRANULARITY, RELIABLE_INITIAL_RTT, RELIABLE_INITIAL_WINDOW_PACKETS,
+    UDP_BASELINE_PACKET_PAYLOAD_BYTES, adaptive_reliable_relay_inflight_bytes,
     product_delivery_samples_override_startup_prior,
 };
 use crate::model::path::RelayPathKey;
@@ -11,12 +11,12 @@ use crate::model::timing::{
     quic_bulk_proof_freshness_horizon, transport_pto_from_ms, transport_pto_from_snapshot,
 };
 use crate::mux::MuxLimits;
-use crate::protocol::{PathId, PathMetricDirection, PathMetrics, RateHint, UnderlayProtocol};
+use crate::protocol::{PathId, PathMetricDirection, PathMetrics, UnderlayProtocol};
 use crate::runtime::path::health::ClientPathHealthRecord;
 use crate::scheduler::{
-    self, FlowLane, PathRateScope, PathSnapshot, PathState as SchedulerPathState, SchedulerPolicy,
+    self, FlowLane, PathRateScope, PathSnapshot, PathState as SchedulerPathState,
 };
-use crate::transport::PathSpec;
+use crate::transport::{PathSpec, RateHint};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 /// Ranked UDP path value shared with the product datagram association.
@@ -30,38 +30,34 @@ pub(in crate::runtime) struct UdpPathCandidate {
 pub(in crate::runtime) struct UdpPathRuntimeModel {
     pub(in crate::runtime) pacing_rate_bps: f64,
     pub(in crate::runtime) response_timeout: Duration,
-    pub(in crate::runtime) mtu_payload_bytes: usize,
-    pub(in crate::runtime) mtu_is_measured: bool,
-    pub(in crate::runtime) mtu_probe_ceiling_payload_bytes: usize,
+    pub(in crate::runtime) max_payload_bytes: usize,
 }
 
 impl UdpPathRuntimeModel {
     pub(in crate::runtime) fn from_snapshot(
         snapshot: PathSnapshot,
         ttl_ms: u32,
-        mtu_payload_bytes: usize,
-        mtu_is_measured: bool,
-        mtu_probe_ceiling_payload_bytes: usize,
+        max_payload_bytes: usize,
     ) -> Self {
         let ttl_timeout = Duration::from_millis(u64::from(ttl_ms));
         let pto = transport_pto_from_snapshot(Some(snapshot));
-        let loss_backoff = datagram_loss_backoff(snapshot, mtu_payload_bytes);
-        let min_pacing_rate_bps = datagram_min_pacing_rate_bps(mtu_payload_bytes, pto);
+        let pacing_payload_bytes = max_payload_bytes
+            .min(UDP_BASELINE_PACKET_PAYLOAD_BYTES)
+            .max(1);
+        let loss_backoff = datagram_loss_backoff(snapshot, pacing_payload_bytes);
+        let min_pacing_rate_bps = datagram_min_pacing_rate_bps(pacing_payload_bytes, pto);
         let pacing_rate_bps = (snapshot.delivery_rate_bps * loss_backoff).max(min_pacing_rate_bps);
         let timeout_loss_gain = 1.0 + snapshot.loss_rate.clamp(0.0, 1.0);
         let response_timeout = pto.mul_f64(timeout_loss_gain).min(ttl_timeout);
         Self {
             pacing_rate_bps,
             response_timeout,
-            mtu_payload_bytes,
-            mtu_is_measured,
-            mtu_probe_ceiling_payload_bytes,
+            max_payload_bytes,
         }
     }
 
-    pub(in crate::runtime) fn accepts_or_can_probe(self, payload_bytes: usize) -> bool {
-        payload_bytes <= self.mtu_payload_bytes
-            || (!self.mtu_is_measured && payload_bytes <= self.mtu_probe_ceiling_payload_bytes)
+    pub(in crate::runtime) fn accepts_payload(self, payload_bytes: usize) -> bool {
+        payload_bytes <= self.max_payload_bytes
     }
 
     pub(in crate::runtime) fn pacing_interval(self, payload_bytes: usize) -> Duration {
@@ -114,23 +110,17 @@ pub(in crate::runtime) fn path_record_failure_cooldown(
     pto.saturating_mul(2_u32.saturating_pow(failure_exponent))
 }
 
-pub(in crate::runtime) fn udp_mtu_payload_bytes(
+pub(in crate::runtime) fn udp_datagram_payload_limit_bytes(
     path: &PathSpec,
-    observation: ClientPathObservation,
     max_payload_bytes: usize,
 ) -> usize {
-    let seeded = observation
-        .measured_mtu_payload_bytes
-        .or(path.metadata.initial_mtu_payload_bytes)
-        .unwrap_or(UDP_DEFAULT_MTU_PAYLOAD_BYTES);
-    seeded.clamp(
-        UDP_MIN_MTU_PAYLOAD_BYTES,
-        udp_probe_ceiling_payload_bytes(max_payload_bytes),
-    )
-}
-
-pub(in crate::runtime) fn udp_probe_ceiling_payload_bytes(max_payload_bytes: usize) -> usize {
-    max_payload_bytes.clamp(UDP_MIN_MTU_PAYLOAD_BYTES, UDP_MAX_MTU_PAYLOAD_BYTES)
+    let protocol_ceiling = max_payload_bytes
+        .min(MAX_PRODUCT_DATAGRAM_PAYLOAD_BYTES)
+        .max(1);
+    path.metadata
+        .max_datagram_payload_bytes
+        .unwrap_or(protocol_ceiling)
+        .clamp(1, protocol_ceiling)
 }
 
 pub(in crate::runtime) fn health_observations(
@@ -322,7 +312,6 @@ fn endpoint_only_startup_observation_for_scoring(
         measured_jitter_ms: None,
         measured_rate_bps: None,
         measured_loss_rate: None,
-        measured_mtu_payload_bytes: observation.measured_mtu_payload_bytes,
         delivery_samples: 0,
         product_delivery_rate_bps: None,
         product_delivery_sample_bytes: 0,
@@ -341,7 +330,7 @@ pub(in crate::runtime) fn path_is_endpoint_only(path: &PathSpec) -> bool {
     path.metadata.initial_srtt_ms.is_none()
         && path.metadata.initial_jitter_ms.is_none()
         && path.metadata.initial_rate == RateHint::Unknown
-        && path.metadata.capabilities == crate::protocol::PathCapabilities::default()
+        && path.metadata.policy == crate::model::path::PathPolicy::default()
 }
 
 pub(in crate::runtime) fn configured_order_path_indices(
@@ -367,13 +356,8 @@ pub(in crate::runtime) fn configured_order_path_scores(
         .enumerate()
         .filter_map(|(index, path)| {
             let observation = observations.get(index).copied().unwrap_or_default();
-            scheduler::score_path(
-                path_snapshot(path, index, observation),
-                lane,
-                payload_bytes,
-                SchedulerPolicy::default(),
-            )
-            .map(|score| (index, score.eta_ms))
+            scheduler::score_path(path_snapshot(path, index, observation), lane, payload_bytes)
+                .map(|score| (index, score.eta_ms))
         })
         .collect()
 }
@@ -405,13 +389,8 @@ pub(in crate::runtime) fn ordered_path_scores(
         .enumerate()
         .filter_map(|(index, path)| {
             let observation = observations.get(index).copied().unwrap_or_default();
-            scheduler::score_path(
-                path_snapshot(path, index, observation),
-                lane,
-                payload_bytes,
-                SchedulerPolicy::default(),
-            )
-            .map(|score| (index, score.eta_ms))
+            scheduler::score_path(path_snapshot(path, index, observation), lane, payload_bytes)
+                .map(|score| (index, score.eta_ms))
         })
         .collect::<Vec<_>>();
     scores.sort_by(|left, right| {
@@ -554,7 +533,7 @@ pub(in crate::runtime) fn path_snapshot(
     observation: ClientPathObservation,
 ) -> PathSnapshot {
     let hinted_delivery_rate_bps = match path.metadata.initial_rate {
-        RateHint::Unknown => default_path_rate_bps(path.underlay),
+        RateHint::Unknown => default_path_rate_bps(),
         RateHint::Unlimited => 1_000_000_000_000.0,
         RateHint::BitsPerSecond(rate) => rate.max(1) as f64,
     };
@@ -609,9 +588,8 @@ pub(in crate::runtime) fn path_snapshot(
         id: PathId(index as u16),
         underlay: path.underlay,
         state: observation.state,
-        flags: path.metadata.capabilities.into(),
+        policy: path.metadata.policy,
         srtt_ms,
-        min_rtt_ms: srtt_ms,
         jitter_ms,
         delivery_rate_bps,
         rate_scope,
@@ -681,7 +659,6 @@ pub(in crate::runtime) fn path_metrics_from_snapshot(
         direction,
         metric_epoch: metric_epoch_now(),
         metric_age_us: 0,
-        min_rtt_us: millis_to_micros_u32(snapshot.min_rtt_ms),
         srtt_us: millis_to_micros_u32(snapshot.srtt_ms),
         rttvar_us: millis_to_micros_u32(snapshot.jitter_ms.max(0.0)),
         jitter_us: millis_to_micros_u32(snapshot.jitter_ms.max(0.0)),
@@ -728,7 +705,7 @@ pub(in crate::runtime) fn path_model_srtt_ms(
         .unwrap_or_else(|| {
             path.metadata
                 .initial_srtt_ms
-                .map_or_else(|| default_path_srtt_ms(path.underlay), f64::from)
+                .map_or_else(|| default_path_srtt_ms(), f64::from)
         })
 }
 
@@ -781,7 +758,6 @@ pub(in crate::runtime) fn udp_observation_has_datagram_feedback(
         || observation.measured_loss_rate.is_some()
         || observation.measured_rate_bps.is_some()
         || observation.carrier_delivery_rate_bps.is_some()
-        || observation.measured_mtu_payload_bytes.is_some()
 }
 
 pub(in crate::runtime) fn path_can_be_auto_discovered(
@@ -794,11 +770,8 @@ pub(in crate::runtime) fn path_can_be_auto_discovered(
 pub(in crate::runtime) fn path_allows_automatic_bulk_use(path: &PathSpec) -> bool {
     // Operator cost/role policy is transport-independent. Automatic capacity
     // discovery may measure only paths that are also eligible to carry bulk.
-    let capabilities = path.metadata.capabilities;
-    !capabilities.expensive
-        && !capabilities.backup
-        && !capabilities.probe_only
-        && capabilities.bulk_allowed
+    let policy = path.metadata.policy;
+    !policy.expensive && !policy.backup && !policy.probe_only && policy.bulk_allowed
 }
 
 fn path_can_be_auto_discovered_for_lane(
@@ -807,11 +780,11 @@ fn path_can_be_auto_discovered_for_lane(
     lane: FlowLane,
 ) -> bool {
     observation.state == SchedulerPathState::Active
-        && !path.metadata.capabilities.expensive
-        && !path.metadata.capabilities.backup
-        && !path.metadata.capabilities.probe_only
+        && !path.metadata.policy.expensive
+        && !path.metadata.policy.backup
+        && !path.metadata.policy.probe_only
         && (!matches!(lane, FlowLane::Throughput | FlowLane::Background)
-            || path.metadata.capabilities.bulk_allowed)
+            || path.metadata.policy.bulk_allowed)
 }
 
 fn path_can_be_recovery_candidate_for_lane(
@@ -822,9 +795,9 @@ fn path_can_be_recovery_candidate_for_lane(
     !matches!(
         observation.state,
         SchedulerPathState::Failed | SchedulerPathState::Draining
-    ) && !path.metadata.capabilities.probe_only
+    ) && !path.metadata.policy.probe_only
         && (!matches!(lane, FlowLane::Throughput | FlowLane::Background)
-            || path.metadata.capabilities.bulk_allowed)
+            || path.metadata.policy.bulk_allowed)
 }
 
 pub(in crate::runtime) fn bulk_candidate_has_liveness_evidence(
@@ -992,23 +965,21 @@ pub(in crate::runtime) fn udp_reliable_stream_loss_repair_penalty_ms(
     if loss <= f64::EPSILON {
         return 0.0;
     }
-    let fragment_count = (payload_bytes as f64 / UDP_DEFAULT_MTU_PAYLOAD_BYTES as f64)
+    let fragment_count = (payload_bytes as f64 / UDP_BASELINE_PACKET_PAYLOAD_BYTES as f64)
         .ceil()
         .max(1.0);
-    let bdp_bytes = path_bdp_floor_bytes(snapshot).max(UDP_DEFAULT_MTU_PAYLOAD_BYTES as f64);
-    let progress_floor = (UDP_DEFAULT_MTU_PAYLOAD_BYTES as f64 / bdp_bytes).min(1.0);
+    let bdp_bytes = path_bdp_floor_bytes(snapshot).max(UDP_BASELINE_PACKET_PAYLOAD_BYTES as f64);
+    let progress_floor = (UDP_BASELINE_PACKET_PAYLOAD_BYTES as f64 / bdp_bytes).min(1.0);
     let expected_repairs = fragment_count * loss / (1.0 - loss).max(progress_floor);
     let repair_rtt_ms = transport_pto_from_snapshot(Some(snapshot)).as_secs_f64() * 1000.0;
     expected_repairs * repair_rtt_ms
 }
 
-pub(in crate::runtime) fn default_path_srtt_ms(underlay: UnderlayProtocol) -> f64 {
-    let _ = underlay;
+pub(in crate::runtime) fn default_path_srtt_ms() -> f64 {
     RELIABLE_INITIAL_RTT.as_secs_f64() * 1000.0
 }
 
-pub(in crate::runtime) fn default_path_rate_bps(underlay: UnderlayProtocol) -> f64 {
-    let _ = underlay;
+pub(in crate::runtime) fn default_path_rate_bps() -> f64 {
     PATH_OPEN_SCORE_BYTES as f64 * 8.0 / RELIABLE_INITIAL_RTT.as_secs_f64()
 }
 
@@ -1020,7 +991,6 @@ pub(in crate::runtime) struct ClientPathObservation {
     pub(in crate::runtime) measured_jitter_ms: Option<f64>,
     pub(in crate::runtime) measured_rate_bps: Option<f64>,
     pub(in crate::runtime) measured_loss_rate: Option<f64>,
-    pub(in crate::runtime) measured_mtu_payload_bytes: Option<usize>,
     pub(in crate::runtime) delivery_samples: u32,
     pub(in crate::runtime) product_delivery_rate_bps: Option<f64>,
     pub(in crate::runtime) product_delivery_sample_bytes: u64,
@@ -1056,7 +1026,6 @@ impl Default for ClientPathObservation {
             measured_jitter_ms: None,
             measured_rate_bps: None,
             measured_loss_rate: None,
-            measured_mtu_payload_bytes: None,
             delivery_samples: 0,
             product_delivery_rate_bps: None,
             product_delivery_sample_bytes: 0,

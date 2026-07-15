@@ -119,15 +119,14 @@ pub(super) fn lab_response_bulk_output_selected(
     lab_diagnostic(
         "server_bulk_output_selected",
         format_args!(
-            "ordinal={} reason={} session_id={} binding_instance_id={} path_underlay={:?} path_id={} role={:?} work={:?} payload_bytes={} command_pending_bytes={} product_inflight_bytes={} owner_data_inflight_bytes={} eta_ms={:.3} app_limited={} bulk_rate_evidence={} calibration_eligible={} calibration_proven={} calibration_active={} calibration_spent_bytes={} calibration_credit_bytes={} calibration_max_bytes={}",
+            "ordinal={} reason={} session_id={} binding_instance_id={} path_underlay={:?} path_id={} admission={:?} payload_bytes={} command_pending_bytes={} product_inflight_bytes={} owner_data_inflight_bytes={} eta_ms={:.3} app_limited={} bulk_rate_evidence={} calibration_eligible={} calibration_proven={} calibration_active={} calibration_spent_bytes={} calibration_credit_bytes={} calibration_max_bytes={}",
             ordinal + 1,
             reason,
             target.session_id.0,
             target.binding_instance_id,
             target.observation.key.underlay,
             target.observation.key.path_id.0,
-            admission.role,
-            admission.work,
+            admission,
             payload_bytes,
             target.observation.command_pending_bytes,
             target.observation.snapshot.product_bytes_in_flight,

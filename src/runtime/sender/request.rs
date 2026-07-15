@@ -17,7 +17,7 @@ use crate::model::capacity::{
     QUIC_PERSISTENT_CONGESTION_THRESHOLD, adaptive_reliable_relay_repair_bytes,
     reliable_stream_advertised_window_bytes,
 };
-use crate::model::multipath::{ExtraTrafficKind, ExtraTrafficLedger};
+use crate::model::multipath::ExtraTrafficLedger;
 use crate::model::path::{RelayPathInstance, RelayPathKey, RelayPathPlacement};
 use crate::model::request::evidence::RequestWindowGrowthEvidence;
 use crate::mux::MuxLimits;
@@ -25,9 +25,7 @@ use crate::mux::stream::{AckOutcome, ReliableRecvStream, ReliableSendStream};
 use crate::protocol::frame::reliable_stream_frame_accounted_bytes;
 #[cfg(feature = "lab-diagnostics")]
 use crate::protocol::frame::{reliable_path_frame_pacing_bytes, stream_ack_contiguous_frontier};
-use crate::protocol::{
-    Frame, OffsetRange, OutboundPolicy, StreamFlags, StreamId, StreamOpenRole, UnderlayProtocol,
-};
+use crate::protocol::{Frame, OffsetRange, StreamId, StreamOpenRole, UnderlayProtocol};
 use crate::runtime::error::RuntimeError;
 use crate::runtime::path::commands::reliable_path_effective_frame_lane;
 use crate::runtime::path::{ClientPathContext, ReliableTcpRequestBulkFlowRegistration};
@@ -210,8 +208,7 @@ impl RequestSenderService {
         if !budget.can_spend(payload_bytes) {
             return false;
         }
-        self.extra_traffic
-            .record_optional(ExtraTrafficKind::Repair, payload_bytes);
+        self.extra_traffic.record_repair(payload_bytes);
         if critical_priority {
             sender_queue.push_critical_repair_with_cause(frame, cause);
         } else {
@@ -228,21 +225,8 @@ impl RequestSenderService {
     ) {
         debug_assert!(cause.is_repair());
         let payload_bytes = reliable_stream_frame_accounted_bytes(&frame);
-        self.extra_traffic
-            .record_optional(ExtraTrafficKind::Repair, payload_bytes);
+        self.extra_traffic.record_repair(payload_bytes);
         sender_queue.push_critical_repair_with_cause(frame, cause);
-    }
-
-    pub(in crate::runtime) fn enqueue_critical_tail_repair_frame(
-        &mut self,
-        sender_queue: &mut ReliableRelaySenderQueue,
-        frame: Frame,
-    ) -> bool {
-        if sender_queue.has_queued_repair_overlap(&frame) {
-            return false;
-        }
-        self.enqueue_critical_repair_frame(sender_queue, frame, RelaySendCause::PathFailureRepair);
-        true
     }
 
     #[cfg(test)]
@@ -501,7 +485,7 @@ impl RequestSenderService {
         let dispatch_payload_bytes = data_quantum_bytes.min(payload.len()).max(1);
         let dispatch_payload = payload.slice(..dispatch_payload_bytes);
         let frame = send_stream
-            .send_data(dispatch_payload, StreamFlags::NONE)
+            .send_data(dispatch_payload)
             .map_err(RuntimeError::Stream)?;
         let retry_frame = frame.clone();
         // Queue priority stays duplex-aware, but request exploration must not
@@ -886,8 +870,6 @@ impl RequestSenderService {
         let frame = Frame::OpenStream {
             stream_id: remotes.stream_id(),
             target: spec.target.clone(),
-            ingress: spec.ingress,
-            outbound: OutboundPolicy::Direct,
             demand: stream_demand_hint_for_lane(lane),
             role: StreamOpenRole::Active,
         };
@@ -924,8 +906,6 @@ impl RequestSenderService {
         let frame = Frame::OpenStream {
             stream_id: remotes.stream_id(),
             target: spec.target.clone(),
-            ingress: spec.ingress,
-            outbound: OutboundPolicy::Direct,
             demand: stream_demand_hint_for_lane(lane),
             role: StreamOpenRole::Active,
         };

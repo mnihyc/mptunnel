@@ -184,7 +184,6 @@ pub(in crate::runtime) async fn connect_client_tcp_carrier(
         let path_id = PathId(path_index as u16);
         let authentication_frames = ClientPathAuthenticationFrames::for_session(
             security,
-            path,
             path_id,
             UnderlayProtocol::Tcp,
             session_id,

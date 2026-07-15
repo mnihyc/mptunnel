@@ -369,8 +369,8 @@ impl FixedReliablePathOutput {
         let startup = PathSnapshot::new(
             path_id,
             underlay,
-            default_path_srtt_ms(underlay),
-            default_path_rate_bps(underlay),
+            default_path_srtt_ms(),
+            default_path_rate_bps(),
         );
         Self::new_with_snapshot(startup, commands, mux_limits)
     }
@@ -474,7 +474,6 @@ impl FixedReliablePathOutput {
     }
 
     fn record_product_flight(&self, frame: &Frame, kind: CarrierWorkKind) {
-        debug_assert!(kind.carries_product_offsets());
         let Some((offset, end, bytes)) = reliable_stream_frame_extent(frame) else {
             return;
         };

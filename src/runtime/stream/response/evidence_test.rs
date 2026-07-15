@@ -44,7 +44,6 @@ fn local_carrier_bulk_evidence_requires_response_direction_and_exact_path_identi
         direction: PathMetricDirection::ServerToClient,
         metric_epoch: metric_epoch_now(),
         metric_age_us: 0,
-        min_rtt_us: 20_000,
         srtt_us: 20_000,
         rttvar_us: 1_000,
         jitter_us: 1_000,
@@ -74,7 +73,6 @@ fn local_carrier_bulk_evidence_requires_response_direction_and_exact_path_identi
             role: StreamOpenRole::Validation,
             owner_data_in_flight_bytes: 0,
             bytes_in_flight: 0,
-            product_queue_bytes: 0,
             product_progress_rate_bps: None,
             delivery_rate_bps: None,
             tcp_ack_clock_rate_bps: None,
@@ -116,15 +114,15 @@ fn local_carrier_bulk_evidence_requires_response_direction_and_exact_path_identi
         assert!(!server_output_has_bulk_rate_evidence(&entry));
         let snapshot = server_bulk_output_snapshot(
             &entry,
+            0,
             SessionId(79),
             FlowLane::Throughput,
             &ServerPathLaneTracker::default(),
             MuxLimits::default(),
-            Instant::now(),
         );
         assert_eq!(
             snapshot.delivery_rate_bps,
-            default_path_rate_bps(key.underlay),
+            default_path_rate_bps(),
             "foreign carrier metrics must not influence the response path model"
         );
     }
@@ -138,7 +136,6 @@ fn aged_udp_metric_loses_handoff_rights_but_keeps_sender_reachability() {
         direction: PathMetricDirection::ServerToClient,
         metric_epoch: metric_epoch_now(),
         metric_age_us: 0,
-        min_rtt_us: 20_000,
         srtt_us: 20_000,
         rttvar_us: 5_000,
         jitter_us: 5_000,
@@ -228,7 +225,6 @@ fn accepted_quic_capacity_marker_uses_frozen_floor_rate_and_deadline() {
         direction: PathMetricDirection::ServerToClient,
         metric_epoch: metric_epoch_now(),
         metric_age_us: u32::MAX,
-        min_rtt_us: 20_000,
         srtt_us: 1,
         rttvar_us: 0,
         jitter_us: 0,
@@ -272,7 +268,6 @@ fn accepted_quic_capacity_marker_uses_frozen_floor_rate_and_deadline() {
         role: StreamOpenRole::Validation,
         owner_data_in_flight_bytes: 0,
         bytes_in_flight: 0,
-        product_queue_bytes: 0,
         product_progress_rate_bps: None,
         delivery_rate_bps: None,
         tcp_ack_clock_rate_bps: None,
@@ -285,18 +280,18 @@ fn accepted_quic_capacity_marker_uses_frozen_floor_rate_and_deadline() {
         peer_path_metrics: None,
     };
     assert_eq!(
-        server_output_confidence(&output, Instant::now()),
+        server_output_confidence(&output),
         1.0,
         "exact receipt bytes establish confidence without generic ACK samples"
     );
     let lane_tracker = ServerPathLaneTracker::default();
     let accepted_snapshot = server_bulk_output_snapshot(
         &output,
+        0,
         SessionId(77),
         FlowLane::Throughput,
         &lane_tracker,
         MuxLimits::default(),
-        Instant::now(),
     );
     assert_eq!(
         accepted_snapshot.delivery_rate_bps,
@@ -320,11 +315,11 @@ fn accepted_quic_capacity_marker_uses_frozen_floor_rate_and_deadline() {
     expired_output.local_path_metrics = Some(expired);
     let expired_snapshot = server_bulk_output_snapshot(
         &expired_output,
+        0,
         SessionId(77),
         FlowLane::Throughput,
         &lane_tracker,
         MuxLimits::default(),
-        Instant::now(),
     );
     assert_eq!(
         expired_snapshot.delivery_rate_bps,
@@ -348,7 +343,6 @@ fn udp_bulk_rate_evidence_requires_source_fresh_non_app_limited_state() {
         role: StreamOpenRole::Active,
         owner_data_in_flight_bytes: 0,
         bytes_in_flight: 0,
-        product_queue_bytes: 0,
         product_progress_rate_bps: Some(500_000_000.0),
         delivery_rate_bps: None,
         tcp_ack_clock_rate_bps: None,
@@ -368,7 +362,6 @@ fn udp_bulk_rate_evidence_requires_source_fresh_non_app_limited_state() {
                 direction: PathMetricDirection::ServerToClient,
                 metric_epoch: metric_epoch_now(),
                 metric_age_us: 0,
-                min_rtt_us: 20_000,
                 srtt_us: 20_000,
                 rttvar_us: 1_000,
                 jitter_us: 1_000,
@@ -403,11 +396,11 @@ fn udp_bulk_rate_evidence_requires_source_fresh_non_app_limited_state() {
     assert!(server_output_has_sender_evidence(&entry));
     let snapshot = server_bulk_output_snapshot(
         &entry,
+        0,
         SessionId(77),
         FlowLane::Throughput,
         &ServerPathLaneTracker::default(),
         MuxLimits::default(),
-        Instant::now(),
     );
     assert_eq!(snapshot.delivery_rate_bps, 200_000_000.0);
     assert!(
@@ -522,7 +515,6 @@ fn peer_app_limited_metrics_do_not_seed_response_bulk_rate_or_envelope() {
             direction: PathMetricDirection::ServerToClient,
             metric_epoch: metric_epoch_now(),
             metric_age_us: 0,
-            min_rtt_us: 20_000,
             srtt_us: 20_000,
             rttvar_us: 1_000,
             jitter_us: 1_000,
@@ -547,7 +539,7 @@ fn peer_app_limited_metrics_do_not_seed_response_bulk_rate_or_envelope() {
         let snapshot = binding
             .send_path_snapshot(FlowLane::Throughput, MIN_RATE_SAMPLE_BYTES as usize)
             .expect("peer metrics remain validation hints");
-        assert_eq!(snapshot.delivery_rate_bps, default_path_rate_bps(underlay));
+        assert_eq!(snapshot.delivery_rate_bps, default_path_rate_bps());
         assert_eq!(snapshot.pacing_rate_bps, snapshot.delivery_rate_bps);
         assert_eq!(snapshot.inflight_limit_bytes, 0);
         assert_eq!(snapshot.bytes_in_flight, 0);
@@ -565,7 +557,6 @@ fn response_peer_hint_yields_to_durable_local_quic_estimate() {
         direction: PathMetricDirection::ClientToServer,
         metric_epoch: metric_epoch_now(),
         metric_age_us: 0,
-        min_rtt_us: 200_000,
         srtt_us: 200_000,
         rttvar_us: 10_000,
         jitter_us: 10_000,
@@ -589,7 +580,6 @@ fn response_peer_hint_yields_to_durable_local_quic_estimate() {
 
     let local_proof = PathMetrics {
         direction: PathMetricDirection::ServerToClient,
-        min_rtt_us: 20_000,
         srtt_us: 20_000,
         rttvar_us: 1_000,
         jitter_us: 1_000,

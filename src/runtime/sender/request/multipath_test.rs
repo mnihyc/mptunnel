@@ -12,10 +12,10 @@ use crate::model::capacity::{
     BBR_MAX_SEND_QUANTUM_BYTES, PATH_OPEN_SCORE_BYTES, QuicCapacityProofCandidate,
     reliable_capacity_calibration_session_limit_bytes, reliable_subflow_startup_sample_limit_bytes,
 };
-use crate::model::multipath::{PathAdmissionDecision, SubflowAdmissionInput};
+use crate::model::multipath::{PathAdmission, SubflowAdmissionInput};
 use crate::model::request::evidence::RequestPathRateEvidence;
 use crate::protocol::frame::reliable_stream_frame_extent;
-use crate::protocol::{IngressKind, TargetAddr};
+use crate::protocol::{PathMetricDirection, TargetAddr};
 use crate::runtime::path::commands::{
     CapacityProbeCommandResolution, CapacityProbeCommandTicket, ReliablePathCommand,
     reliable_path_command_channels, try_recv_reliable_path_command,
@@ -45,7 +45,6 @@ fn client_data_frame_for_test(stream_id: StreamId, offset: u64, payload_bytes: u
     Frame::StreamData {
         stream_id,
         offset,
-        flags: StreamFlags::NONE,
         payload: Bytes::from(vec![0x5a; payload_bytes]),
     }
 }
@@ -206,11 +205,10 @@ fn install_request_quic_capacity_calibration_for_test(
 fn seed_client_quic_native_bulk_evidence_for_test(context: &ClientPathContext, index: usize) {
     context.health().lock().expect("path health lock").udp[index].mark_quic_path_metrics(
         UdpPathMetrics {
-            direction: 1,
+            direction: PathMetricDirection::ClientToServer,
             srtt: Duration::from_millis(20),
             rttvar: Duration::from_millis(2),
-            min_rtt: Duration::from_millis(18),
-            min_rtt_observed: true,
+            rtt_observed: true,
             delivery_rate_bps: 500_000_000.0,
             pacing_rate_bps: 500_000_000.0,
             inflight_hi: 4 * 1024 * 1024,
@@ -252,7 +250,6 @@ fn stream_ack_releases_flights_without_publishing_a_tiny_rate_sample() {
     let frame = Frame::StreamData {
         stream_id: StreamId(7),
         offset: 0,
-        flags: StreamFlags::NONE,
         payload: Bytes::from(vec![0u8; PATH_OPEN_SCORE_BYTES]),
     };
     context.record_relay_path_send(key.underlay, key.index, PATH_OPEN_SCORE_BYTES);
@@ -676,7 +673,6 @@ fn duplicate_stream_ack_release_does_not_seed_sender_service_path_rate() {
     let frame = Frame::StreamData {
         stream_id: StreamId(8),
         offset: 0,
-        flags: StreamFlags::NONE,
         payload: Bytes::from(vec![0u8; PATH_OPEN_SCORE_BYTES]),
     };
     context.record_relay_path_send(owner.underlay, owner.index, PATH_OPEN_SCORE_BYTES);
@@ -755,7 +751,6 @@ async fn client_subflow_data_preserves_service_owner_after_frontier_clear_select
     let frame = Frame::StreamData {
         stream_id,
         offset: 0,
-        flags: StreamFlags::NONE,
         payload: Bytes::from(vec![0xab; 64 * 1024]),
     };
     let outcome = sender
@@ -900,10 +895,7 @@ async fn client_request_startup_does_not_borrow_reverse_promoted_relay_lane() {
     );
     let mut send_stream = ReliableSendStream::new(stream_id, context.mux_limits);
     let service_frame = send_stream
-        .send_data(
-            Bytes::from(vec![0x41; PATH_OPEN_SCORE_BYTES]),
-            StreamFlags::NONE,
-        )
+        .send_data(Bytes::from(vec![0x41; PATH_OPEN_SCORE_BYTES]))
         .expect("initial Service request frame");
     let mut sender = RequestSenderService::new(stream_id);
     sender
@@ -938,7 +930,6 @@ async fn client_request_startup_does_not_borrow_reverse_promoted_relay_lane() {
 
     let spec = ReliableRelayOpenSpec {
         target: TargetAddr::Ip(SocketAddr::from(([127, 0, 0, 1], 80))),
-        ingress: IngressKind::Socks5,
     };
     let mut sender_queue = ReliableRelaySenderQueue::default();
     sender_queue.push_data(Bytes::from(vec![0x42; 8 * 1024]));
@@ -1100,19 +1091,15 @@ async fn client_startup_credit_is_cumulative_and_stream_acks_do_not_refill_it() 
         .epoch
         .as_ref()
         .expect("request startup epoch");
-    let candidate_member = epoch
-        .members()
-        .iter()
-        .find(|member| member.key == candidate_instance)
-        .expect("startup candidate member");
-    assert_eq!(candidate_member.owner_sent_bytes, startup_limit as u64);
+    assert_eq!(
+        epoch.startup_owner_sent_bytes(candidate_instance),
+        Some(startup_limit as u64)
+    );
     let (receipt_proof_id, _) = sender
         .multipath
         .request
         .startup
-        .receipt_proofs
-        .get(&candidate_instance)
-        .copied()
+        .receipt_proof(candidate_instance)
         .expect("exhausted startup credit queues one ordered receipt proof");
     assert!(matches!(
         try_recv_reliable_path_command(&mut candidate_rx),
@@ -1167,14 +1154,9 @@ async fn client_startup_credit_is_cumulative_and_stream_acks_do_not_refill_it() 
         .expect("graduated request epoch");
     assert_eq!(epoch.startup_owner_key(), None);
     assert_eq!(
-        epoch
-            .members()
-            .iter()
-            .find(|member| member.key == candidate_instance)
-            .expect("retained graduated member")
-            .owner_sent_bytes,
-        startup_limit as u64,
-        "ACK release and ordinary measured sends must not refill or extend startup credit"
+        epoch.admitted_keys(),
+        &[candidate_instance],
+        "ACK release must retain the graduated path without reopening startup credit"
     );
     assert_eq!(
         sender.multipath.request.ordered_service_key(),
@@ -1261,7 +1243,14 @@ async fn near_cap_startup_sample_seals_when_next_frame_cannot_fit() {
         ack_client_frame_for_test(&mut sender, &context, &frame);
         offset = offset.saturating_add(payload_bytes as u64);
     }
-    assert!(sender.multipath.request.startup.receipt_proofs.is_empty());
+    assert!(
+        sender
+            .multipath
+            .request
+            .startup
+            .receipt_proof(candidate)
+            .is_none()
+    );
     assert_eq!(
         sender
             .multipath
@@ -1293,7 +1282,12 @@ async fn near_cap_startup_sample_seals_when_next_frame_cannot_fit() {
             .and_then(|epoch| epoch.startup_owner_sealed_sample_bytes(candidate)),
         Some(admitted_bytes as u64)
     );
-    let (receipt_proof_id, _) = sender.multipath.request.startup.receipt_proofs[&candidate];
+    let (receipt_proof_id, _) = sender
+        .multipath
+        .request
+        .startup
+        .receipt_proof(candidate)
+        .expect("sealed startup sample receipt proof");
     assert!(matches!(
         try_recv_reliable_path_command(&mut candidate_rx),
         Some(ReliablePathCommand::SendFrame(Frame::PathProofData {
@@ -1314,7 +1308,7 @@ async fn near_cap_startup_sample_seals_when_next_frame_cannot_fit() {
     );
     sender
         .multipath
-        .reconcile_request_subflow_set(&context, &remotes);
+        .reconcile_request_path_state(&context, &remotes);
 
     assert!(
         sender
@@ -2069,18 +2063,8 @@ async fn client_startup_graduation_advances_to_second_validation_instance() {
         .as_ref()
         .expect("request startup epoch");
     assert_eq!(epoch.startup_owner_key(), Some(second_instance));
-    assert!(
-        epoch
-            .members()
-            .iter()
-            .any(|member| member.key == first_instance)
-    );
-    assert!(
-        epoch
-            .members()
-            .iter()
-            .any(|member| member.key == second_instance)
-    );
+    assert!(epoch.admitted_keys().contains(&first_instance));
+    assert!(epoch.admitted_keys().contains(&second_instance));
     assert_eq!(
         sender.multipath.request.ordered_service_key(),
         Some(service_key)
@@ -2130,22 +2114,18 @@ async fn delayed_old_instance_ack_cannot_graduate_replacement_candidate() {
         context.mux_limits,
     ))
     .expect("startup limit");
-    let mut epoch = FlowSubflowSet::new(0, service, startup_limit, 0, Duration::ZERO);
+    let mut epoch = FlowSubflowSet::new(service, startup_limit);
     assert_eq!(
-        epoch
-            .admit_subflow_owner(SubflowAdmissionInput {
-                key: replacement,
-                bulk_rate_proven: false,
-                startup_owner_allowed: true,
-                frontier_clear: true,
-                completion_improves: false,
-                observed_goodput_non_degrading: true,
-                read_gap: Duration::ZERO,
-                owner_bytes: BBR_MAX_SEND_QUANTUM_BYTES,
-                optional_overhead_bytes: 0,
-            })
-            .decision,
-        PathAdmissionDecision::AdmitSubflow
+        epoch.admit_subflow_owner(SubflowAdmissionInput {
+            key: replacement,
+            bulk_rate_proven: false,
+            startup_owner_allowed: true,
+            frontier_clear: true,
+            completion_improves: false,
+            observed_goodput_non_degrading: true,
+            owner_bytes: BBR_MAX_SEND_QUANTUM_BYTES,
+        }),
+        PathAdmission::Subflow
     );
     let mut sender = RequestSenderService::new(stream_id);
     sender.multipath.request.ordered_service = Some(service);
@@ -2186,7 +2166,7 @@ async fn delayed_old_instance_ack_cannot_graduate_replacement_candidate() {
     );
     sender
         .multipath
-        .reconcile_request_subflow_set(&context, &remotes);
+        .reconcile_request_path_state(&context, &remotes);
 
     assert!(
         context.relay_path_has_bulk_model_evidence(candidate_key.underlay, candidate_key.index,)
@@ -2211,12 +2191,12 @@ async fn delayed_old_instance_ack_cannot_graduate_replacement_candidate() {
             .is_some_and(|state| state.graduated())
     );
     assert!(
-        !sender
+        sender
             .multipath
             .request
             .startup
-            .acked_bytes
-            .contains_key(&replacement)
+            .acked_sample(replacement)
+            .is_none()
     );
 }
 
@@ -2384,22 +2364,18 @@ async fn udp_product_stream_ack_does_not_create_quic_graduation_evidence() {
         context.mux_limits,
     ))
     .expect("startup limit");
-    let mut epoch = FlowSubflowSet::new(0, service, startup_limit, 0, Duration::ZERO);
+    let mut epoch = FlowSubflowSet::new(service, startup_limit);
     assert_eq!(
-        epoch
-            .admit_subflow_owner(SubflowAdmissionInput {
-                key: candidate,
-                bulk_rate_proven: false,
-                startup_owner_allowed: true,
-                frontier_clear: true,
-                completion_improves: false,
-                observed_goodput_non_degrading: true,
-                read_gap: Duration::ZERO,
-                owner_bytes: startup_limit,
-                optional_overhead_bytes: 0,
-            })
-            .decision,
-        PathAdmissionDecision::AdmitSubflow
+        epoch.admit_subflow_owner(SubflowAdmissionInput {
+            key: candidate,
+            bulk_rate_proven: false,
+            startup_owner_allowed: true,
+            frontier_clear: true,
+            completion_improves: false,
+            observed_goodput_non_degrading: true,
+            owner_bytes: startup_limit,
+        }),
+        PathAdmission::Subflow
     );
     let mut sender = RequestSenderService::new(stream_id);
     sender.multipath.request.ordered_service = Some(service);
@@ -2422,18 +2398,18 @@ async fn udp_product_stream_ack_does_not_create_quic_graduation_evidence() {
     );
     sender
         .multipath
-        .reconcile_request_subflow_set(&context, &remotes);
+        .reconcile_request_path_state(&context, &remotes);
 
     assert!(
         !context.relay_path_has_bulk_model_evidence(candidate_key.underlay, candidate_key.index,)
     );
     assert!(
-        !sender
+        sender
             .multipath
             .request
             .startup
-            .acked_bytes
-            .contains_key(&candidate)
+            .acked_sample(candidate)
+            .is_none()
     );
     assert!(
         !sender
@@ -2510,7 +2486,7 @@ async fn request_quic_proof_at_train_deadline_keeps_exact_handoff_owner() {
     tokio::time::sleep(Duration::from_millis(60)).await;
     sender
         .multipath
-        .reconcile_request_subflow_set(&context, &remotes);
+        .reconcile_request_path_state(&context, &remotes);
     assert!(!context.request_quic_capacity_probe_proven_at(1, proof.token, Instant::now()));
     assert!(
         sender
@@ -2532,7 +2508,7 @@ async fn request_quic_proof_at_train_deadline_keeps_exact_handoff_owner() {
     assert!(context.request_quic_capacity_probe_proven_at(1, proof.token, Instant::now()));
     sender
         .multipath
-        .reconcile_request_subflow_set(&context, &remotes);
+        .reconcile_request_path_state(&context, &remotes);
     assert!(
         sender
             .multipath
@@ -2618,7 +2594,7 @@ async fn request_quic_proof_at_train_deadline_keeps_exact_handoff_owner() {
     );
     sender
         .multipath
-        .reconcile_request_subflow_set(&context, &remotes);
+        .reconcile_request_path_state(&context, &remotes);
     assert!(sender.multipath.quic_capacity.active.is_none());
     assert_eq!(
         context.request_quic_capacity_product_handoff_state_at(1, proof.token, Instant::now()),
@@ -2723,7 +2699,7 @@ async fn incomplete_request_quic_handoff_revokes_ephemeral_graduation() {
     tokio::time::sleep(Duration::from_millis(60)).await;
     sender
         .multipath
-        .reconcile_request_subflow_set(&context, &remotes);
+        .reconcile_request_path_state(&context, &remotes);
     assert!(
         sender
             .multipath
@@ -2750,7 +2726,7 @@ async fn incomplete_request_quic_handoff_revokes_ephemeral_graduation() {
         .expect("an expired idle handoff is reclaimed by the next reservation");
     sender
         .multipath
-        .reconcile_request_subflow_set(&context, &remotes);
+        .reconcile_request_path_state(&context, &remotes);
 
     assert!(sender.multipath.quic_capacity.active.is_none());
     assert!(
@@ -2845,22 +2821,18 @@ async fn ordered_receipt_proof_cannot_resurrect_udp_product_startup() {
         context.mux_limits,
     ))
     .expect("startup limit");
-    let mut epoch = FlowSubflowSet::new(0, service, startup_limit, 0, Duration::ZERO);
+    let mut epoch = FlowSubflowSet::new(service, startup_limit);
     assert_eq!(
-        epoch
-            .admit_subflow_owner(SubflowAdmissionInput {
-                key: candidate,
-                bulk_rate_proven: false,
-                startup_owner_allowed: true,
-                frontier_clear: true,
-                completion_improves: false,
-                observed_goodput_non_degrading: true,
-                read_gap: Duration::ZERO,
-                owner_bytes: startup_limit,
-                optional_overhead_bytes: 0,
-            })
-            .decision,
-        PathAdmissionDecision::AdmitSubflow
+        epoch.admit_subflow_owner(SubflowAdmissionInput {
+            key: candidate,
+            bulk_rate_proven: false,
+            startup_owner_allowed: true,
+            frontier_clear: true,
+            completion_improves: false,
+            observed_goodput_non_degrading: true,
+            owner_bytes: startup_limit,
+        }),
+        PathAdmission::Subflow
     );
     let mut sender = RequestSenderService::new(stream_id);
     sender.multipath.request.ordered_service = Some(service);
@@ -2876,14 +2848,12 @@ async fn ordered_receipt_proof_cannot_resurrect_udp_product_startup() {
         .multipath
         .request
         .startup
-        .receipt_proofs
-        .insert(candidate, (receipt_proof_id, 0));
+        .set_receipt_proof(candidate, (receipt_proof_id, 0));
     sender
         .multipath
         .request
         .startup
-        .first_sent_at
-        .insert(candidate, Instant::now());
+        .record_first_sent_at(candidate, Instant::now());
 
     let frame = client_data_frame_for_test(stream_id, 0, startup_limit);
     sender
@@ -2901,12 +2871,12 @@ async fn ordered_receipt_proof_cannot_resurrect_udp_product_startup() {
         &[OffsetRange::new(0, startup_limit as u64).expect("ACK range")],
     );
     assert!(
-        !sender
+        sender
             .multipath
             .request
             .startup
-            .acked_bytes
-            .contains_key(&candidate)
+            .acked_sample(candidate)
+            .is_some_and(|(acked_bytes, _)| acked_bytes == 0)
     );
 
     tokio::time::sleep(Duration::from_millis(10)).await;
@@ -2922,7 +2892,7 @@ async fn ordered_receipt_proof_cannot_resurrect_udp_product_startup() {
     );
     sender
         .multipath
-        .reconcile_request_subflow_set(&context, &remotes);
+        .reconcile_request_path_state(&context, &remotes);
 
     assert!(
         !sender
@@ -2965,11 +2935,10 @@ async fn udp_service_evidence_does_not_bootstrap_validation_with_product_bytes()
     };
     context.health().lock().expect("path health lock").udp[service_key.index]
         .mark_quic_path_metrics(UdpPathMetrics {
-            direction: 1,
+            direction: PathMetricDirection::ClientToServer,
             srtt: Duration::from_millis(20),
             rttvar: Duration::from_millis(2),
-            min_rtt: Duration::from_millis(18),
-            min_rtt_observed: true,
+            rtt_observed: true,
             delivery_rate_bps: 500_000_000.0,
             pacing_rate_bps: 500_000_000.0,
             inflight_hi: 4 * 1024 * 1024,
@@ -3179,7 +3148,14 @@ async fn udp_validation_uses_fresh_native_evidence_after_service_is_established(
         Some(ReliablePathCommand::SendFrame(Frame::StreamData { .. }))
     ));
     assert!(sender.multipath.request.startup.epoch.is_none());
-    assert!(sender.multipath.request.startup.receipt_proofs.is_empty());
+    assert!(
+        sender
+            .multipath
+            .request
+            .startup
+            .receipt_proof(candidate)
+            .is_none()
+    );
 }
 
 #[tokio::test]
@@ -3305,30 +3281,30 @@ async fn invalidated_startup_receipt_proof_requeues_in_new_generation() {
         .expect("Validation candidate");
     let candidate = candidate_path.instance();
     let attached_at = candidate_path.attached_at;
-    let mut epoch = FlowSubflowSet::new(0, service, 64 * 1024, 0, Duration::ZERO);
+    let mut epoch = FlowSubflowSet::new(service, 64 * 1024);
     assert_eq!(
-        epoch
-            .admit_subflow_owner(SubflowAdmissionInput {
-                key: candidate,
-                bulk_rate_proven: false,
-                startup_owner_allowed: true,
-                frontier_clear: true,
-                completion_improves: false,
-                observed_goodput_non_degrading: true,
-                read_gap: Duration::ZERO,
-                owner_bytes: 64 * 1024,
-                optional_overhead_bytes: 0,
-            })
-            .decision,
-        PathAdmissionDecision::AdmitSubflow
+        epoch.admit_subflow_owner(SubflowAdmissionInput {
+            key: candidate,
+            bulk_rate_proven: false,
+            startup_owner_allowed: true,
+            frontier_clear: true,
+            completion_improves: false,
+            observed_goodput_non_degrading: true,
+            owner_bytes: 64 * 1024,
+        }),
+        PathAdmission::Subflow
     );
     let mut sender = RequestSenderService::new(stream_id);
     sender.multipath.request.startup.epoch = Some(epoch);
     sender
         .multipath
         .try_enqueue_request_startup_receipt_proof(&context, &remotes, candidate);
-    let (old_proof_id, old_generation) =
-        sender.multipath.request.startup.receipt_proofs[&candidate];
+    let (old_proof_id, old_generation) = sender
+        .multipath
+        .request
+        .startup
+        .receipt_proof(candidate)
+        .expect("initial startup receipt proof");
     assert_eq!(old_generation, 0);
     assert!(matches!(
         try_recv_reliable_path_command(&mut candidate_rx),
@@ -3360,8 +3336,12 @@ async fn invalidated_startup_receipt_proof_requeues_in_new_generation() {
     sender
         .multipath
         .try_enqueue_request_startup_receipt_proof(&context, &remotes, candidate);
-    let (new_proof_id, new_generation) =
-        sender.multipath.request.startup.receipt_proofs[&candidate];
+    let (new_proof_id, new_generation) = sender
+        .multipath
+        .request
+        .startup
+        .receipt_proof(candidate)
+        .expect("replacement startup receipt proof");
     assert_eq!(new_generation, 1);
     assert_ne!(new_proof_id, old_proof_id);
     assert!(matches!(
@@ -3673,22 +3653,18 @@ async fn startup_epoch_clears_when_candidate_is_no_longer_validation() {
         .find(|path| path.placement == RelayPathPlacement::Validation)
         .expect("Validation candidate")
         .instance();
-    let mut epoch = FlowSubflowSet::new(0, service, 256 * 1024, 0, Duration::ZERO);
+    let mut epoch = FlowSubflowSet::new(service, 256 * 1024);
     assert_eq!(
-        epoch
-            .admit_subflow_owner(SubflowAdmissionInput {
-                key: candidate,
-                bulk_rate_proven: false,
-                startup_owner_allowed: true,
-                frontier_clear: true,
-                completion_improves: false,
-                observed_goodput_non_degrading: true,
-                read_gap: Duration::ZERO,
-                owner_bytes: 64 * 1024,
-                optional_overhead_bytes: 0,
-            })
-            .decision,
-        PathAdmissionDecision::AdmitSubflow
+        epoch.admit_subflow_owner(SubflowAdmissionInput {
+            key: candidate,
+            bulk_rate_proven: false,
+            startup_owner_allowed: true,
+            frontier_clear: true,
+            completion_improves: false,
+            observed_goodput_non_degrading: true,
+            owner_bytes: 64 * 1024,
+        }),
+        PathAdmission::Subflow
     );
     let mut sender = RequestSenderService::new(stream_id);
     sender.multipath.request.ordered_service = Some(service);
@@ -3715,7 +3691,7 @@ async fn startup_epoch_clears_when_candidate_is_no_longer_validation() {
 
     sender
         .multipath
-        .reconcile_request_subflow_set(&context, &remotes);
+        .reconcile_request_path_state(&context, &remotes);
 
     assert!(sender.multipath.request.startup.epoch.is_none());
     assert_eq!(
@@ -3753,7 +3729,7 @@ async fn startup_epoch_clears_when_candidate_is_no_longer_validation() {
         Some(RequestAckClockOperation::Pending { service, candidate });
     sender
         .multipath
-        .reconcile_request_subflow_set(&context, &remotes);
+        .reconcile_request_path_state(&context, &remotes);
     assert_eq!(
         sender.multipath.request.ack_clock_operation, None,
         "pending exact-instance entry cannot survive promotion away from Validation"
@@ -3847,10 +3823,10 @@ async fn orphaned_validation_owner_tail_repairs_on_active_service() {
         .instance();
     let mut send_stream = ReliableSendStream::new(stream_id, limits);
     let _prefix = send_stream
-        .send_data(Bytes::from(vec![0x31; 64]), StreamFlags::NONE)
+        .send_data(Bytes::from(vec![0x31; 64]))
         .expect("prefix");
     let candidate_tail = send_stream
-        .send_data(Bytes::from(vec![0x32; 64]), StreamFlags::NONE)
+        .send_data(Bytes::from(vec![0x32; 64]))
         .expect("candidate tail");
     let ack_ranges = [OffsetRange::new(0, 64).expect("prefix ACK")];
     let _ = send_stream.apply_ack(&ack_ranges);
@@ -3882,7 +3858,6 @@ async fn orphaned_validation_owner_tail_repairs_on_active_service() {
     );
     let spec = ReliableRelayOpenSpec {
         target: TargetAddr::Ip(SocketAddr::from(([127, 0, 0, 1], 80))),
-        ingress: IngressKind::Socks5,
     };
     let dispatch = sender
         .dispatch_client_queued_work(

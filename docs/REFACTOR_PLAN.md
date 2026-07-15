@@ -5,6 +5,25 @@ tree. It is intentionally ordered by dependency and state ownership. Moving
 files before their contracts are clear would only preserve the existing
 coupling under new paths.
 
+## Source endpoint status
+
+The ordered source migration is complete through step 11, together with the
+source, test-layout, documentation, and host-build parts of step 12. The final
+tree has no orphan Rust modules, inline test bodies, `mod.rs` facades,
+production wildcard imports, production `#[path]` wiring, stale migration
+trees, or platform branches in protocol/model/scheduler policy. Default and
+all-feature suites and the all-target/all-feature host check pass.
+
+External proof remains deliberately separate from source completion. The
+Windows GNU binary builds and its CLI, config, platform report, and
+Windows-client/Linux-server TCP flow work under Wine. Quinn's own Windows UDP
+endpoint fails under Wine before mptunnel code because Wine rejects
+`IPV6_V6ONLY` inspection on an IPv4 socket; native Windows must therefore prove
+QUIC and Wintun. The installed macOS Rust targets cannot pass the dependency
+build without an Apple cross C toolchain/SDK. Historical performance labs are
+also a separate behavior checkpoint and were not substituted with structural
+test results.
+
 ## Balance rule
 
 Balance means comparable responsibility granularity, not equal file counts.

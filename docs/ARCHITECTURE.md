@@ -105,7 +105,9 @@ wrappers that merely pass the same state between them.
   relay, stream, or carrier handles.
 - `src/transport/`: owns framing/encryption and thin TCP, UDP, and Quinn
   adapters. Native telemetry is optional capability evidence, not product
-  ownership authority.
+  ownership authority. TCP bounds resolution and staggered dual-stack address
+  attempts with one absolute setup deadline; QUIC keeps a separate handshake
+  race over the same neutral resolver ordering.
 
 ## Mutation contracts
 

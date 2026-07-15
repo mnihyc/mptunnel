@@ -10,7 +10,7 @@ use crate::model::capacity::QuicCapacityProofCandidate;
 use crate::model::path::{CarrierPathInstanceId, CarrierPathKey};
 use crate::model::response::ResponseServiceFamilyLoads;
 use crate::protocol::SessionId;
-use crate::runtime::path::commands::QuicCapacityProbeCommandTicket;
+use crate::runtime::path::commands::CapacityProbeCommandTicket;
 use crate::scheduler::FlowLane;
 use std::collections::HashMap;
 #[cfg(test)]
@@ -274,7 +274,7 @@ pub(super) struct ServerQuicCapacityCalibrationReservation {
     pub(super) required_proof_bytes: u64,
     pub(super) proof_validity: Duration,
     pub(super) token: u64,
-    pub(super) command_ticket: QuicCapacityProbeCommandTicket,
+    pub(super) command_ticket: CapacityProbeCommandTicket,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]

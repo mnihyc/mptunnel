@@ -7,8 +7,7 @@ use crate::model::path::CarrierPathKey;
 use crate::mux::MuxLimits;
 use crate::protocol::{PathId, SessionId, StreamOpenRole, UnderlayProtocol};
 use crate::runtime::path::commands::{
-    QuicCapacityProbeCommandResolution, QuicCapacityProbeCommandTicket,
-    reliable_path_command_channels,
+    CapacityProbeCommandResolution, CapacityProbeCommandTicket, reliable_path_command_channels,
 };
 use crate::scheduler::FlowLane;
 use std::sync::Arc;
@@ -25,7 +24,7 @@ fn quic_capacity_proof_is_spec_exact_and_stays_reserved_until_publish_commit() {
     let path_instance_id = super::super::next_server_carrier_path_instance_id();
     let binding_instance_id = 91;
     let token = 17;
-    let command_ticket = QuicCapacityProbeCommandTicket::new();
+    let command_ticket = CapacityProbeCommandTicket::new();
     tracker.set_response_flow_active(session_id, true);
     tracker.set_response_flow_active(session_id, true);
     assert!(tracker.try_reserve_quic_capacity_calibration(
@@ -100,7 +99,7 @@ fn quic_capacity_proof_is_spec_exact_and_stays_reserved_until_publish_commit() {
     );
     assert_eq!(
         command_ticket.resolution(),
-        QuicCapacityProbeCommandResolution::Current
+        CapacityProbeCommandResolution::Current
     );
     assert!(
         tracker
@@ -114,7 +113,7 @@ fn quic_capacity_proof_is_spec_exact_and_stays_reserved_until_publish_commit() {
     );
     assert_eq!(
         command_ticket.resolution(),
-        QuicCapacityProbeCommandResolution::Published,
+        CapacityProbeCommandResolution::Published,
         "registry publication wakes carrier cleanup without cancelling it"
     );
     assert!(
@@ -243,7 +242,7 @@ fn invalidated_capacity_command_releases_serialization_without_refund() {
         path_id: PathId(6),
     };
     let path_instance_id = super::super::next_server_carrier_path_instance_id();
-    let ticket = QuicCapacityProbeCommandTicket::new();
+    let ticket = CapacityProbeCommandTicket::new();
     tracker.set_response_flow_active(session_id, true);
     tracker.set_response_flow_active(session_id, true);
     assert!(tracker.try_reserve_quic_capacity_calibration(

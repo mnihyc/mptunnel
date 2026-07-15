@@ -19,7 +19,7 @@ use crate::model::timing::transport_pto_from_snapshot;
 use crate::model::work::ReliableWorkClass;
 use crate::protocol::{PathId, StreamId, UnderlayProtocol};
 use crate::runtime::path::{
-    ClientPathContext, QuicCapacityProbeCommandTicket, RequestCapacityProbeCampaignBudget,
+    CapacityProbeCommandTicket, ClientPathContext, RequestCapacityProbeCampaignBudget,
     RequestCapacityReconciliationView, RequestTcpCapacityProbeLease,
     RequestTcpCapacityProbeRequest, RequestTcpCapacityProofQuery,
 };
@@ -549,7 +549,7 @@ impl RequestTcpCapacityController {
             let train_payload_bytes = geometry.train_bytes;
             let token =
                 NEXT_REQUEST_TCP_CAPACITY_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-            let ticket = QuicCapacityProbeCommandTicket::new();
+            let ticket = CapacityProbeCommandTicket::new();
             let now = Instant::now();
             let baseline_budget = transport_pto_from_snapshot(Some(candidate_snapshot));
             let lease_duration = request_tcp_capacity_calibration_lease(

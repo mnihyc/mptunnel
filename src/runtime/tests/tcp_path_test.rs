@@ -1422,7 +1422,7 @@ async fn dropping_receiver_releases_already_dequeued_command_debt() {
 #[tokio::test]
 async fn abandoned_quic_capacity_command_releases_queue_debt_and_ticket() {
     let (tx, rx) = reliable_path_command_channels(2);
-    let ticket = QuicCapacityProbeCommandTicket::new();
+    let ticket = CapacityProbeCommandTicket::new();
     let train_payload_bytes = 512 * 1024_u64;
     tx.try_enqueue_quic_capacity_probe(QuicCapacityProbeCommand {
         owner: QuicCapacityProbeOwner::Response {
@@ -1449,18 +1449,18 @@ async fn abandoned_quic_capacity_command_releases_queue_debt_and_ticket() {
     assert!(!ticket.is_current());
     assert_eq!(
         ticket.resolution(),
-        QuicCapacityProbeCommandResolution::Cancelled
+        CapacityProbeCommandResolution::Cancelled
     );
     let resolution = tokio::time::timeout(Duration::from_millis(100), ticket.resolved())
         .await
         .expect("an already-invalid ticket must be observable without a lost wakeup");
-    assert_eq!(resolution, QuicCapacityProbeCommandResolution::Cancelled);
+    assert_eq!(resolution, CapacityProbeCommandResolution::Cancelled);
 }
 
 #[tokio::test]
 async fn dequeued_quic_capacity_command_drop_cancels_ticket_and_receiver_debt() {
     let (tx, mut rx) = reliable_path_command_channels(2);
-    let ticket = QuicCapacityProbeCommandTicket::new();
+    let ticket = CapacityProbeCommandTicket::new();
     let train_payload_bytes = 512 * 1024_u64;
     tx.try_enqueue_quic_capacity_probe(QuicCapacityProbeCommand {
         owner: QuicCapacityProbeOwner::Response {
@@ -1491,17 +1491,17 @@ async fn dequeued_quic_capacity_command_drop_cancels_ticket_and_receiver_debt() 
     drop(command);
     assert_eq!(
         ticket.resolution(),
-        QuicCapacityProbeCommandResolution::Cancelled
+        CapacityProbeCommandResolution::Cancelled
     );
 }
 
 #[tokio::test]
-async fn published_quic_capacity_ticket_wakes_resolution_without_cancelling() {
-    let ticket = QuicCapacityProbeCommandTicket::new();
+async fn published_capacity_command_ticket_wakes_resolution_without_cancelling() {
+    let ticket = CapacityProbeCommandTicket::new();
     assert!(ticket.publish());
     assert_eq!(
         ticket.resolved().await,
-        QuicCapacityProbeCommandResolution::Published
+        CapacityProbeCommandResolution::Published
     );
     assert!(
         tokio::time::timeout(Duration::from_millis(10), ticket.cancelled())
@@ -1513,14 +1513,14 @@ async fn published_quic_capacity_ticket_wakes_resolution_without_cancelling() {
 }
 
 #[tokio::test]
-async fn cancelled_quic_capacity_ticket_wakes_carrier_cancellation() {
-    let ticket = QuicCapacityProbeCommandTicket::new();
+async fn cancelled_capacity_command_ticket_wakes_carrier_cancellation() {
+    let ticket = CapacityProbeCommandTicket::new();
     let waiter = ticket.clone();
     let resolved = tokio::spawn(async move { waiter.resolved().await });
     assert!(ticket.cancel());
     assert_eq!(
         resolved.await.expect("ticket resolution task"),
-        QuicCapacityProbeCommandResolution::Cancelled
+        CapacityProbeCommandResolution::Cancelled
     );
     tokio::time::timeout(Duration::from_millis(10), ticket.cancelled())
         .await

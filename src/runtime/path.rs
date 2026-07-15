@@ -19,7 +19,7 @@ mod state;
 pub(in crate::runtime) mod tcp;
 
 pub(in crate::runtime) use commands::{
-    QuicCapacityProbeCommand, QuicCapacityProbeCommandTicket, QuicCapacityProbeOwner,
+    CapacityProbeCommandTicket, QuicCapacityProbeCommand, QuicCapacityProbeOwner,
     RequestTcpCapacityProbeRequest,
 };
 pub(in crate::runtime) use model::PathDeliveryStats;

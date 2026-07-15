@@ -106,7 +106,7 @@ async fn request_quic_capacity_skips_an_earlier_exhausted_path_share() {
             candidate(1).attached_at,
             now + Duration::from_secs(1),
             Duration::from_secs(1),
-            QuicCapacityProbeCommandTicket::new(),
+            CapacityProbeCommandTicket::new(),
         )
         .expect("reserve the earlier path's complete fixed share");
     spent.commit();

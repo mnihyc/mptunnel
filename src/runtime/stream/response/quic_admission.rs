@@ -12,7 +12,7 @@ use crate::model::capacity::reliable_capacity_calibration_session_limit_bytes;
 use crate::model::path::{CarrierPathInstanceId, CarrierPathKey};
 use crate::protocol::{StreamOpenRole, UnderlayProtocol};
 use crate::runtime::path::commands::{
-    QuicCapacityProbeCommand, QuicCapacityProbeCommandTicket, QuicCapacityProbeOwner,
+    CapacityProbeCommandTicket, QuicCapacityProbeCommand, QuicCapacityProbeOwner,
 };
 use crate::scheduler::FlowLane;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -36,7 +36,7 @@ struct QuicCapacityAdmissionGuard<'a> {
     path: CarrierPathKey,
     path_instance_id: CarrierPathInstanceId,
     token: u64,
-    ticket: QuicCapacityProbeCommandTicket,
+    ticket: CapacityProbeCommandTicket,
     state: QuicCapacityAdmissionState,
 }
 
@@ -178,7 +178,7 @@ impl ResponseStreamBinding {
         }
         let calibration_id =
             NEXT_RESPONSE_QUIC_CAPACITY_CALIBRATION_ID.fetch_add(1, Ordering::Relaxed);
-        let command_ticket = QuicCapacityProbeCommandTicket::new();
+        let command_ticket = CapacityProbeCommandTicket::new();
         #[cfg(feature = "lab-diagnostics")]
         let attempt_ordinal = target.quic_capacity_calibration_attempts.saturating_add(1);
         #[cfg(feature = "lab-diagnostics")]

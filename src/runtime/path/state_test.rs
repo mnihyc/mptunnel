@@ -212,7 +212,7 @@ fn reserve_request_tcp_capacity_identity_with_campaign_for_test(
         PATH_OPEN_SCORE_BYTES as u64,
         now,
         now + Duration::from_secs(30),
-        QuicCapacityProbeCommandTicket::new(),
+        CapacityProbeCommandTicket::new(),
     )
 }
 
@@ -398,7 +398,7 @@ fn request_quic_capacity_refund_and_replacement_preserve_frozen_share() {
             now,
             now + Duration::from_secs(1),
             Duration::from_secs(1),
-            QuicCapacityProbeCommandTicket::new(),
+            CapacityProbeCommandTicket::new(),
         )
         .expect("reserve provisional QUIC path spend");
     assert_eq!(
@@ -433,7 +433,7 @@ fn request_quic_capacity_refund_and_replacement_preserve_frozen_share() {
             now,
             now + Duration::from_secs(1),
             Duration::from_secs(1),
-            QuicCapacityProbeCommandTicket::new(),
+            CapacityProbeCommandTicket::new(),
         )
         .expect("a replacement may consume only the original path share");
     replacement.commit();
@@ -460,7 +460,7 @@ fn request_quic_capacity_refund_and_replacement_preserve_frozen_share() {
                 now,
                 now + Duration::from_secs(1),
                 Duration::from_secs(1),
-                QuicCapacityProbeCommandTicket::new(),
+                CapacityProbeCommandTicket::new(),
             )
             .is_none(),
         "flapping replacement cannot reopen the candidate share"
@@ -809,7 +809,7 @@ fn request_tcp_capacity_authority_expires_without_a_native_rate_prior() {
         expires_at,
         train_bytes,
         required_timed_bytes: rate_sample_bytes,
-        ticket: QuicCapacityProbeCommandTicket::new(),
+        ticket: CapacityProbeCommandTicket::new(),
     });
     let candidate = TcpCapacityProofCandidate {
         token,

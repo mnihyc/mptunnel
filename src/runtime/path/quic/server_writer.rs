@@ -13,7 +13,7 @@ use crate::model::path::CarrierPathInstanceId;
 use crate::protocol::{Frame, PathId, SessionId, StreamId, UnderlayProtocol};
 use crate::runtime::error::RuntimeError;
 use crate::runtime::path::commands::{
-    QuicCapacityProbeCommandResolution, QuicCapacityProbeOwner, ReliablePathCommand,
+    CapacityProbeCommandResolution, QuicCapacityProbeOwner, ReliablePathCommand,
     ReliablePathCommandReceivers, ReliablePathCommandSender, reliable_path_command_pending_bytes,
     reliable_path_command_writer_run_budget_bytes, reliable_path_command_writer_run_budget_items,
     reliable_path_command_writer_run_bytes, reliable_path_frame_requires_capacity_command,
@@ -239,7 +239,7 @@ pub(super) async fn drain_server_udp_reliable_commands(
                 let cancellation_token = probe.calibration_id;
                 tokio::spawn(async move {
                     if cancellation_ticket.resolved().await
-                        == QuicCapacityProbeCommandResolution::Cancelled
+                        == CapacityProbeCommandResolution::Cancelled
                     {
                         let _ = cancellation_connection.cancel_capacity_probe(cancellation_token);
                     }

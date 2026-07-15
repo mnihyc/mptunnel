@@ -18,7 +18,7 @@ use crate::model::capacity::{
 };
 use crate::model::path::{CarrierPathInstanceId, CarrierPathKey};
 use crate::protocol::SessionId;
-use crate::runtime::path::commands::QuicCapacityProbeCommandTicket;
+use crate::runtime::path::commands::CapacityProbeCommandTicket;
 use std::time::{Duration, Instant};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -164,7 +164,7 @@ impl ServerPathLaneTracker {
             Duration::from_secs(1),
             session_byte_limit,
             token,
-            QuicCapacityProbeCommandTicket::new(),
+            CapacityProbeCommandTicket::new(),
         )
     }
 
@@ -255,7 +255,7 @@ impl ServerPathLaneTracker {
         proof_validity: Duration,
         session_byte_limit: u64,
         token: u64,
-        command_ticket: QuicCapacityProbeCommandTicket,
+        command_ticket: CapacityProbeCommandTicket,
     ) -> bool {
         if proof_validity.is_zero()
             || !valid_quic_capacity_proof_geometry(

@@ -18,7 +18,7 @@ use crate::model::timing::quic_bulk_proof_freshness_horizon;
 use crate::model::work::ReliableWorkClass;
 use crate::protocol::{PathId, StreamId, UnderlayProtocol};
 use crate::runtime::path::{
-    ClientPathContext, QuicCapacityProbeCommand, QuicCapacityProbeCommandTicket,
+    CapacityProbeCommandTicket, ClientPathContext, QuicCapacityProbeCommand,
     QuicCapacityProbeOwner, RequestCapacityProbeCampaignBudget, RequestCapacityReconciliationView,
     RequestQuicCapacityProbeLease, RequestQuicCapacityProductHandoffState,
     RequestQuicCapacityReconciliationQuery,
@@ -36,7 +36,7 @@ pub(super) struct RequestQuicCapacityCalibration {
     pub(super) token: u64,
     pub(super) publication_expires_at: Instant,
     pub(super) graduated: bool,
-    pub(super) ticket: QuicCapacityProbeCommandTicket,
+    pub(super) ticket: CapacityProbeCommandTicket,
     pub(super) _lease: RequestQuicCapacityProbeLease,
 }
 
@@ -343,7 +343,7 @@ impl RequestQuicCapacityController {
             std::sync::atomic::AtomicU64::new(1);
         let token =
             NEXT_REQUEST_QUIC_CAPACITY_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        let ticket = QuicCapacityProbeCommandTicket::new();
+        let ticket = CapacityProbeCommandTicket::new();
         let lease_duration = request_quic_capacity_calibration_lease(snapshot, train_payload_bytes);
         let Some(expires_at) = Instant::now().checked_add(lease_duration) else {
             return;

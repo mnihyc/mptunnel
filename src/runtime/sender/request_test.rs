@@ -585,7 +585,7 @@ fn reserve_request_quic_capacity_calibration_for_test(
     let token = sender.stream_id.0.saturating_add(1_000);
     let train_bytes = (PATH_OPEN_SCORE_BYTES * 2) as u64;
     let required_proof_bytes = PATH_OPEN_SCORE_BYTES as u64;
-    let ticket = QuicCapacityProbeCommandTicket::new();
+    let ticket = CapacityProbeCommandTicket::new();
     let mut lease = context
         .try_reserve_request_quic_capacity_probe(
             sender.stream_id,
@@ -685,7 +685,7 @@ fn publish_request_quic_capacity_calibration_for_test(
             .expect("request QUIC calibration")
             .ticket
             .resolution(),
-        QuicCapacityProbeCommandResolution::Published
+        CapacityProbeCommandResolution::Published
     );
 }
 
@@ -3200,7 +3200,7 @@ async fn request_quic_proof_at_train_deadline_keeps_exact_handoff_owner() {
                 service_attached_at,
                 Instant::now() + Duration::from_secs(1),
                 Duration::from_secs(1),
-                QuicCapacityProbeCommandTicket::new(),
+                CapacityProbeCommandTicket::new(),
             )
             .is_none(),
         "a pending product handoff still serializes the next carrier train"
@@ -3212,7 +3212,7 @@ async fn request_quic_proof_at_train_deadline_keeps_exact_handoff_owner() {
         .flights
         .record_owner_frame_instance(candidate_instance, &owner_frame);
     sender.release_normalized_acked_ranges(&context, &[ack_range]);
-    let next_ticket = QuicCapacityProbeCommandTicket::new();
+    let next_ticket = CapacityProbeCommandTicket::new();
     let next_lease = context
         .try_reserve_request_quic_capacity_probe(
             StreamId(204),
@@ -3258,7 +3258,7 @@ async fn request_quic_proof_at_train_deadline_keeps_exact_handoff_owner() {
                 service_attached_at,
                 Instant::now() + Duration::from_secs(1),
                 Duration::from_secs(1),
-                QuicCapacityProbeCommandTicket::new(),
+                CapacityProbeCommandTicket::new(),
             )
             .is_none(),
         "dropping the old owner lease cannot clear a newer token"
@@ -3277,7 +3277,7 @@ async fn request_quic_proof_at_train_deadline_keeps_exact_handoff_owner() {
                 service_attached_at,
                 Instant::now() + Duration::from_secs(1),
                 Duration::from_secs(1),
-                QuicCapacityProbeCommandTicket::new(),
+                CapacityProbeCommandTicket::new(),
             )
             .is_some()
     );
@@ -3327,7 +3327,7 @@ fn dropping_request_quic_owner_revokes_pending_handoff() {
                 Instant::now() - Duration::from_millis(1),
                 Instant::now() + Duration::from_secs(1),
                 Duration::from_secs(1),
-                QuicCapacityProbeCommandTicket::new(),
+                CapacityProbeCommandTicket::new(),
             )
             .is_some()
     );
@@ -3427,7 +3427,7 @@ async fn incomplete_request_quic_handoff_revokes_ephemeral_graduation() {
             service_attached_at,
             Instant::now() + Duration::from_secs(1),
             Duration::from_secs(1),
-            QuicCapacityProbeCommandTicket::new(),
+            CapacityProbeCommandTicket::new(),
         )
         .expect("an expired idle handoff is reclaimed by the next reservation");
     sender.reconcile_request_subflow_set(&context, &remotes);
@@ -3457,7 +3457,7 @@ async fn incomplete_request_quic_handoff_revokes_ephemeral_graduation() {
                 service_attached_at,
                 Instant::now() + Duration::from_secs(1),
                 Duration::from_secs(1),
-                QuicCapacityProbeCommandTicket::new(),
+                CapacityProbeCommandTicket::new(),
             )
             .is_none()
     );
@@ -3475,7 +3475,7 @@ async fn incomplete_request_quic_handoff_revokes_ephemeral_graduation() {
                 service_attached_at,
                 Instant::now() + Duration::from_secs(1),
                 Duration::from_secs(1),
-                QuicCapacityProbeCommandTicket::new(),
+                CapacityProbeCommandTicket::new(),
             )
             .is_some()
     );

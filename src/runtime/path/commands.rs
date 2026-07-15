@@ -1151,59 +1151,61 @@ fn reliable_path_frame_stream_id(frame: &Frame) -> StreamId {
 }
 
 #[derive(Debug)]
-struct QuicCapacityProbeCommandTicketState {
+struct CapacityProbeCommandTicketState {
     resolution: AtomicU8,
     resolved: tokio::sync::Notify,
 }
 
+/// One-shot publication or cancellation authority for queued capacity work.
+/// Protocol geometry stays on the enclosing TCP or QUIC command/lease.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(in crate::runtime) enum QuicCapacityProbeCommandResolution {
+pub(in crate::runtime) enum CapacityProbeCommandResolution {
     Current = 0,
     Cancelled = 1,
     Published = 2,
 }
 
 #[derive(Debug, Clone)]
-pub(in crate::runtime) struct QuicCapacityProbeCommandTicket {
-    state: Arc<QuicCapacityProbeCommandTicketState>,
+pub(in crate::runtime) struct CapacityProbeCommandTicket {
+    state: Arc<CapacityProbeCommandTicketState>,
 }
 
-impl QuicCapacityProbeCommandTicket {
+impl CapacityProbeCommandTicket {
     pub(in crate::runtime) fn new() -> Self {
         Self {
-            state: Arc::new(QuicCapacityProbeCommandTicketState {
-                resolution: AtomicU8::new(QuicCapacityProbeCommandResolution::Current as u8),
+            state: Arc::new(CapacityProbeCommandTicketState {
+                resolution: AtomicU8::new(CapacityProbeCommandResolution::Current as u8),
                 resolved: tokio::sync::Notify::new(),
             }),
         }
     }
 
-    pub(in crate::runtime) fn resolution(&self) -> QuicCapacityProbeCommandResolution {
+    pub(in crate::runtime) fn resolution(&self) -> CapacityProbeCommandResolution {
         match self.state.resolution.load(Ordering::Acquire) {
-            value if value == QuicCapacityProbeCommandResolution::Current as u8 => {
-                QuicCapacityProbeCommandResolution::Current
+            value if value == CapacityProbeCommandResolution::Current as u8 => {
+                CapacityProbeCommandResolution::Current
             }
-            value if value == QuicCapacityProbeCommandResolution::Cancelled as u8 => {
-                QuicCapacityProbeCommandResolution::Cancelled
+            value if value == CapacityProbeCommandResolution::Cancelled as u8 => {
+                CapacityProbeCommandResolution::Cancelled
             }
-            value if value == QuicCapacityProbeCommandResolution::Published as u8 => {
-                QuicCapacityProbeCommandResolution::Published
+            value if value == CapacityProbeCommandResolution::Published as u8 => {
+                CapacityProbeCommandResolution::Published
             }
-            _ => unreachable!("invalid QUIC capacity command ticket resolution"),
+            _ => unreachable!("invalid capacity command ticket resolution"),
         }
     }
 
     pub(in crate::runtime) fn is_current(&self) -> bool {
-        self.resolution() == QuicCapacityProbeCommandResolution::Current
+        self.resolution() == CapacityProbeCommandResolution::Current
     }
 
-    fn resolve(&self, resolution: QuicCapacityProbeCommandResolution) -> bool {
-        debug_assert_ne!(resolution, QuicCapacityProbeCommandResolution::Current);
+    fn resolve(&self, resolution: CapacityProbeCommandResolution) -> bool {
+        debug_assert_ne!(resolution, CapacityProbeCommandResolution::Current);
         let resolved = self
             .state
             .resolution
             .compare_exchange(
-                QuicCapacityProbeCommandResolution::Current as u8,
+                CapacityProbeCommandResolution::Current as u8,
                 resolution as u8,
                 Ordering::AcqRel,
                 Ordering::Acquire,
@@ -1216,24 +1218,24 @@ impl QuicCapacityProbeCommandTicket {
     }
 
     pub(in crate::runtime) fn cancel(&self) -> bool {
-        self.resolve(QuicCapacityProbeCommandResolution::Cancelled)
+        self.resolve(CapacityProbeCommandResolution::Cancelled)
     }
 
     pub(in crate::runtime) fn publish(&self) -> bool {
-        self.resolve(QuicCapacityProbeCommandResolution::Published)
+        self.resolve(CapacityProbeCommandResolution::Published)
     }
 
-    pub(in crate::runtime) async fn resolved(&self) -> QuicCapacityProbeCommandResolution {
+    pub(in crate::runtime) async fn resolved(&self) -> CapacityProbeCommandResolution {
         loop {
             let resolution = self.resolution();
-            if resolution != QuicCapacityProbeCommandResolution::Current {
+            if resolution != CapacityProbeCommandResolution::Current {
                 return resolution;
             }
             let notified = self.state.resolved.notified();
             tokio::pin!(notified);
             notified.as_mut().enable();
             let resolution = self.resolution();
-            if resolution != QuicCapacityProbeCommandResolution::Current {
+            if resolution != CapacityProbeCommandResolution::Current {
                 return resolution;
             }
             notified.await;
@@ -1241,7 +1243,7 @@ impl QuicCapacityProbeCommandTicket {
     }
 
     pub(in crate::runtime) async fn cancelled(&self) {
-        if self.resolved().await == QuicCapacityProbeCommandResolution::Cancelled {
+        if self.resolved().await == CapacityProbeCommandResolution::Cancelled {
             return;
         }
         std::future::pending::<()>().await;
@@ -1262,7 +1264,7 @@ pub(in crate::runtime) struct QuicCapacityProbeCommand {
     pub(in crate::runtime) required_timed_carrier_bytes: u64,
     pub(in crate::runtime) proof_validity: std::time::Duration,
     pub(in crate::runtime) expires_at: std::time::Instant,
-    pub(in crate::runtime) ticket: QuicCapacityProbeCommandTicket,
+    pub(in crate::runtime) ticket: CapacityProbeCommandTicket,
     pub(in crate::runtime) cancel_on_drop: bool,
 }
 

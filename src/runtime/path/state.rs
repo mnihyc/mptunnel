@@ -3,7 +3,7 @@
 //! Reservations, proof publication, and lease rollback share this owner so
 //! senders and carriers cannot observe a partially committed probe.
 
-use super::commands::{QuicCapacityProbeCommandResolution, QuicCapacityProbeCommandTicket};
+use super::commands::{CapacityProbeCommandResolution, CapacityProbeCommandTicket};
 use super::model::{
     ClientPathObservation, PathDeliveryStats, UdpDatagramPathObservation,
     path_observation_is_idle_for_probe, path_record_failure_cooldown,
@@ -274,7 +274,7 @@ struct RequestTcpCapacityProbeLeaseState {
     token: u64,
     bytes: u64,
     spend_state: AtomicU8,
-    ticket: QuicCapacityProbeCommandTicket,
+    ticket: CapacityProbeCommandTicket,
 }
 
 impl RequestTcpCapacityProbeLease {
@@ -307,7 +307,7 @@ impl RequestTcpCapacityProbeLease {
     }
 
     pub(in crate::runtime) fn is_published(&self) -> bool {
-        self.state.ticket.resolution() == QuicCapacityProbeCommandResolution::Published
+        self.state.ticket.resolution() == CapacityProbeCommandResolution::Published
     }
 
     pub(in crate::runtime) fn cancel(&self) -> bool {
@@ -571,7 +571,7 @@ struct RequestTcpCapacityProbeReservation {
     expires_at: Instant,
     train_bytes: u64,
     required_timed_bytes: u64,
-    ticket: QuicCapacityProbeCommandTicket,
+    ticket: CapacityProbeCommandTicket,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -590,7 +590,7 @@ struct RequestQuicCapacityProbeReservation {
     expires_at: Instant,
     publication_expires_at: Instant,
     train_bytes: u64,
-    ticket: QuicCapacityProbeCommandTicket,
+    ticket: CapacityProbeCommandTicket,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -1526,7 +1526,7 @@ impl ClientPathContext {
         required_timed_bytes: u64,
         valid_after: Instant,
         expires_at: Instant,
-        ticket: QuicCapacityProbeCommandTicket,
+        ticket: CapacityProbeCommandTicket,
     ) -> Option<RequestTcpCapacityProbeLease> {
         let now = Instant::now();
         if path_instance.key.underlay != UnderlayProtocol::Tcp
@@ -1678,7 +1678,7 @@ impl ClientPathContext {
         valid_after: Instant,
         expires_at: Instant,
         proof_validity: Duration,
-        ticket: QuicCapacityProbeCommandTicket,
+        ticket: CapacityProbeCommandTicket,
     ) -> Option<RequestQuicCapacityProbeLease> {
         let now = Instant::now();
         let publication_expires_at = expires_at.checked_add(proof_validity)?;

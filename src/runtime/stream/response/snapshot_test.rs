@@ -311,11 +311,16 @@ fn response_relay_read_snapshot_keeps_source_evidence_on_the_ordered_service() {
             .active_latency_sensitive_flows,
         1
     );
-    let source = before
+    before
         .source_service
         .expect("live ordered Service snapshot");
-    assert_eq!(source.key, service);
-    assert!(!source.has_bulk_rate_evidence);
+    assert!(
+        binding
+            .sender_path_targets(FlowLane::Throughput, PATH_OPEN_SCORE_BYTES)
+            .into_iter()
+            .find(|target| target.observation.key == service)
+            .is_some_and(|target| !target.observation.has_bulk_rate_evidence)
+    );
     assert!(before.independent_source_staging);
 
     {
@@ -331,7 +336,13 @@ fn response_relay_read_snapshot_keeps_source_evidence_on_the_ordered_service() {
     }
     let after = binding.relay_read_snapshot(FlowLane::Throughput, PATH_OPEN_SCORE_BYTES);
     let source = after.source_service.expect("live ordered Service snapshot");
-    assert!(source.has_bulk_rate_evidence);
+    assert!(
+        binding
+            .sender_path_targets(FlowLane::Throughput, PATH_OPEN_SCORE_BYTES)
+            .into_iter()
+            .find(|target| target.observation.key == service)
+            .is_some_and(|target| target.observation.has_bulk_rate_evidence)
+    );
     assert_eq!(source.active_latency_sensitive_flows, 0);
     assert_eq!(
         reliable_relay_source_staging_owner_tail_headroom(
@@ -355,16 +366,6 @@ fn response_relay_read_snapshot_keeps_source_evidence_on_the_ordered_service() {
         ),
         "alternate-path latency pressure must not narrow exact-Service source staging"
     );
-    let service_target = binding
-        .sender_path_targets(FlowLane::Throughput, PATH_OPEN_SCORE_BYTES)
-        .into_iter()
-        .find(|target| target.observation.key == service)
-        .expect("ordered Service sender target");
-    assert_eq!(
-        source.has_bulk_rate_evidence, service_target.observation.has_bulk_rate_evidence,
-        "source staging and sender admission must consume the same Service proof"
-    );
-
     binding.detach(alternate, &alternate_commands_for_detach);
     assert!(
         !binding
@@ -404,7 +405,6 @@ fn udp_product_progress_matures_only_current_service_feed() {
 
     let read = binding.relay_read_snapshot(FlowLane::Throughput, PATH_OPEN_SCORE_BYTES);
     let source = read.source_service.expect("live ordered Service snapshot");
-    assert_eq!(source.key, service);
     let send_path = read.send_path.expect("single live Service send snapshot");
     assert_eq!(send_path.confidence, 1.0);
     assert!(send_path.product_progress_rate_bps.is_some());
@@ -413,7 +413,11 @@ fn udp_product_progress_matures_only_current_service_feed() {
         "substantial uniquely owned product ACKs may release current-Service staging"
     );
     assert!(
-        !source.has_bulk_rate_evidence,
+        binding
+            .sender_path_targets(FlowLane::Throughput, PATH_OPEN_SCORE_BYTES)
+            .into_iter()
+            .find(|target| target.observation.key == service)
+            .is_some_and(|target| !target.observation.has_bulk_rate_evidence),
         "product ACK timing must not mint optional QUIC placement authority"
     );
 }
@@ -447,10 +451,6 @@ fn udp_app_limited_carrier_progress_feeds_only_the_current_service() {
     let read = binding.relay_read_snapshot(FlowLane::Throughput, PATH_OPEN_SCORE_BYTES);
     let source = read.source_service.expect("current response Service");
     assert!(source.has_service_feed_evidence);
-    assert!(
-        !source.has_bulk_rate_evidence,
-        "an app-limited sample must not authorize optional placement"
-    );
 
     let target = binding
         .sender_path_targets(FlowLane::Throughput, PATH_OPEN_SCORE_BYTES)
@@ -458,6 +458,10 @@ fn udp_app_limited_carrier_progress_feeds_only_the_current_service() {
         .find(|target| target.observation.key == service)
         .expect("current Service sender target");
     assert!(target.observation.is_service);
+    assert!(
+        !target.observation.has_bulk_rate_evidence,
+        "an app-limited sample must not authorize optional placement"
+    );
     assert!(target.observation.has_service_feed_evidence);
     assert!(!target.observation.has_bulk_rate_evidence);
 

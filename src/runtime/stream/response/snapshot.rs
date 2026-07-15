@@ -158,12 +158,8 @@ impl ServerPathLaneTracker {
 
 #[derive(Debug, Clone, Copy)]
 pub(in crate::runtime) struct ResponseSourceServiceSnapshot {
-    #[cfg_attr(not(test), allow(dead_code))]
-    pub(in crate::runtime) key: CarrierPathKey,
     pub(in crate::runtime) active_latency_sensitive_flows: u32,
     pub(in crate::runtime) has_service_feed_evidence: bool,
-    #[cfg_attr(not(test), allow(dead_code))]
-    pub(in crate::runtime) has_bulk_rate_evidence: bool,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -485,13 +481,9 @@ impl ResponseStreamOutputs {
                                 .active_latency_sensitive_flows
                         });
                     ResponseSourceServiceSnapshot {
-                        key,
                         active_latency_sensitive_flows,
                         has_service_feed_evidence:
                             server_output_has_service_feed_evidence_with_limits(entry, mux_limits),
-                        has_bulk_rate_evidence: server_output_has_bulk_rate_evidence_with_limits(
-                            entry, mux_limits,
-                        ),
                     }
                 })
         });

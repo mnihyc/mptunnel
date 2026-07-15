@@ -80,7 +80,6 @@ pub(crate) fn bulk_striping_admitted_candidates(
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum BulkAdmissionRole {
     ActiveDataPath,
-    ActiveSingleCarrier,
     AdditionalSameUnderlay,
     AdditionalCrossUnderlay,
 }
@@ -619,10 +618,7 @@ fn bulk_active_lead_has_contiguous_frontier(
     stream_ordering_debt_bytes: u64,
 ) -> bool {
     let _ = candidate;
-    matches!(
-        role,
-        BulkAdmissionRole::ActiveDataPath | BulkAdmissionRole::ActiveSingleCarrier
-    ) && stream_ordering_debt_bytes == 0
+    role == BulkAdmissionRole::ActiveDataPath && stream_ordering_debt_bytes == 0
 }
 
 pub(crate) fn bulk_active_service_product_envelope_bytes(
@@ -645,12 +641,7 @@ fn bulk_product_inflight_limit_bytes(
     mux_limits: MuxLimits,
     role: BulkAdmissionRole,
 ) -> u64 {
-    if candidate.underlay == UnderlayProtocol::Udp
-        && matches!(
-            role,
-            BulkAdmissionRole::ActiveDataPath | BulkAdmissionRole::ActiveSingleCarrier
-        )
-    {
+    if candidate.underlay == UnderlayProtocol::Udp && role == BulkAdmissionRole::ActiveDataPath {
         return bulk_active_service_product_envelope_bytes(candidate, payload_bytes, mux_limits);
     }
     let configured_ceiling = mux_limits.max_path_flight_bytes as u64;
@@ -755,10 +746,7 @@ fn bulk_reorder_absorption_ms(
 }
 
 fn bulk_scheduler_inflight_debt_bytes(candidate: PathSnapshot, role: BulkAdmissionRole) -> u64 {
-    if matches!(
-        role,
-        BulkAdmissionRole::ActiveDataPath | BulkAdmissionRole::ActiveSingleCarrier
-    ) {
+    if role == BulkAdmissionRole::ActiveDataPath {
         return bulk_assigned_service_debt_bytes(candidate);
     }
     if candidate.underlay == UnderlayProtocol::Udp
@@ -779,11 +767,7 @@ fn bulk_assigned_service_debt_bytes(candidate: PathSnapshot) -> u64 {
 }
 
 fn bulk_uses_product_only_active_gate(candidate: PathSnapshot, role: BulkAdmissionRole) -> bool {
-    candidate.underlay == UnderlayProtocol::Udp
-        && matches!(
-            role,
-            BulkAdmissionRole::ActiveDataPath | BulkAdmissionRole::ActiveSingleCarrier
-        )
+    candidate.underlay == UnderlayProtocol::Udp && role == BulkAdmissionRole::ActiveDataPath
     // Lane fairness is enforced above carrier admission. It must not move the
     // active owner back onto a tiny carrier/startup hard gate while the product
     // ordered frontier is clear. QUIC/TCP carriers own packet pacing below
@@ -807,10 +791,7 @@ pub(crate) fn bulk_latency_pressure_service_feed_window_bytes(
 }
 
 fn bulk_active_role_has_latency_pressure(candidate: PathSnapshot, role: BulkAdmissionRole) -> bool {
-    matches!(
-        role,
-        BulkAdmissionRole::ActiveDataPath | BulkAdmissionRole::ActiveSingleCarrier
-    ) && bulk_latency_pressure_flows(candidate) > 0
+    role == BulkAdmissionRole::ActiveDataPath && bulk_latency_pressure_flows(candidate) > 0
 }
 
 fn bulk_latency_pressure_flows(candidate: PathSnapshot) -> u32 {
@@ -831,7 +812,7 @@ fn bulk_total_reorder_debt_bytes(
     stream_ordering_debt_bytes: u64,
 ) -> u64 {
     let path_debt = match role {
-        BulkAdmissionRole::ActiveDataPath | BulkAdmissionRole::ActiveSingleCarrier => 0,
+        BulkAdmissionRole::ActiveDataPath => 0,
         BulkAdmissionRole::AdditionalSameUnderlay | BulkAdmissionRole::AdditionalCrossUnderlay => {
             bulk_product_reorder_debt_bytes(candidate)
         }
@@ -878,16 +859,14 @@ fn bulk_admission_reorder_budget_bytes_for_ordering_debt(
     stream_ordering_debt_bytes: u64,
 ) -> u64 {
     match role {
-        BulkAdmissionRole::ActiveDataPath | BulkAdmissionRole::ActiveSingleCarrier
-            if stream_ordering_debt_bytes == 0 =>
-        {
+        BulkAdmissionRole::ActiveDataPath if stream_ordering_debt_bytes == 0 => {
             if bulk_active_role_has_latency_pressure(candidate, role) {
                 bulk_service_horizon_payload_bytes(payload_bytes, mux_limits) as u64
             } else {
                 bulk_active_service_product_envelope_bytes(candidate, payload_bytes, mux_limits)
             }
         }
-        BulkAdmissionRole::ActiveDataPath | BulkAdmissionRole::ActiveSingleCarrier => {
+        BulkAdmissionRole::ActiveDataPath => {
             let reorder_budget = bulk_reorder_budget_bytes(candidate, payload_bytes, mux_limits);
             if stream_ordering_debt_bytes > 0
                 && bulk_active_role_has_latency_pressure(candidate, role)

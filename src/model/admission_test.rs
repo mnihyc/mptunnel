@@ -1309,7 +1309,7 @@ fn udp_single_carrier_lead_uses_product_budget_not_duplicate_carrier_cwnd() {
             active.eta_ms,
             64 * 1024,
             MuxLimits::default(),
-            BulkAdmissionRole::ActiveSingleCarrier,
+            BulkAdmissionRole::ActiveDataPath,
         ),
         None
     );
@@ -1333,7 +1333,7 @@ fn udp_single_flow_lead_uses_product_gate_not_carrier_queue_gate() {
             active.eta_ms,
             64 * 1024,
             MuxLimits::default(),
-            BulkAdmissionRole::ActiveSingleCarrier,
+            BulkAdmissionRole::ActiveDataPath,
         ),
         None
     );
@@ -1378,7 +1378,7 @@ fn udp_active_path_without_carrier_limit_uses_modeled_credit() {
             startup.eta_ms,
             64 * 1024,
             MuxLimits::default(),
-            BulkAdmissionRole::ActiveSingleCarrier,
+            BulkAdmissionRole::ActiveDataPath,
         ),
         None
     );

@@ -1,6 +1,6 @@
 use super::*;
 use crate::model::path::{RelayPathInstance, RelayPathKey};
-use crate::protocol::{StreamFlags, StreamId, UnderlayProtocol};
+use crate::protocol::{OffsetRange, StreamFlags, StreamId, UnderlayProtocol};
 use bytes::Bytes;
 
 fn request_test_path_instance(

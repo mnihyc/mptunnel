@@ -78,36 +78,6 @@ fn queued_sender_retry_blocks_even_when_carrier_has_capacity() {
 }
 
 #[test]
-fn response_delivery_accounting_credits_current_frame_not_released_buffer() {
-    let path_key = RelayPathKey {
-        underlay: UnderlayProtocol::Udp,
-        index: 1,
-    };
-    let delivered = [
-        Bytes::from_static(&[0; 1024]),
-        Bytes::from_static(&[1; 4096]),
-    ];
-    let mut total = PathDeliveryStats::default();
-    let mut path_stats = HashMap::<RelayPathKey, PathDeliveryStats>::new();
-
-    let delivered_bytes = record_client_response_delivery_accounting(
-        &mut total,
-        &mut path_stats,
-        path_key,
-        &delivered,
-        1024,
-    );
-
-    assert_eq!(delivered_bytes, 5120);
-    assert_eq!(total.payload_bytes, 5120);
-    assert_eq!(
-        path_stats.get(&path_key).expect("path stat").payload_bytes,
-        1024,
-        "hole-closing carrier must not inherit buffered bytes released from other paths"
-    );
-}
-
-#[test]
 fn pending_response_stall_watch_survives_lane_promotion() {
     let send_stream = ReliableSendStream::new(StreamId(1), MuxLimits::default());
     let recv_stream = ReliableRecvStream::new(StreamId(1), MuxLimits::default());

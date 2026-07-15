@@ -3,6 +3,7 @@
 //! Relay modules bridge local product I/O and sender/stream owners. They may
 //! coordinate tasks, but carrier policy and exact-flight state live elsewhere.
 
+mod client;
 pub(super) mod control;
 mod diagnostics;
 pub(super) mod flow;

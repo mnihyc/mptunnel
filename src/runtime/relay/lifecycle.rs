@@ -27,7 +27,6 @@ use crate::runtime::path::commands::ClientTcpOpenDeadlines;
 use crate::runtime::path::{ClientPathContext, PathDeliveryStats, UdpStreamOpenOptions};
 use crate::runtime::sender::{ReliableRelaySenderQueue, RequestSenderService};
 use crate::scheduler::{FlowLane, PathSnapshot};
-use bytes::Bytes;
 use std::collections::{HashMap, HashSet};
 use std::time::Instant;
 use tokio::sync::mpsc;
@@ -136,28 +135,6 @@ pub(super) fn maybe_mark_live_relay_path_delivery(
                 * 1000.0,
         ),
     );
-}
-
-pub(super) fn record_client_response_delivery_accounting(
-    total_stats: &mut PathDeliveryStats,
-    path_stats: &mut HashMap<RelayPathKey, PathDeliveryStats>,
-    path_key: RelayPathKey,
-    delivered: &[Bytes],
-    path_scoped_received_bytes: usize,
-) -> usize {
-    let mut delivered_payload_bytes = 0usize;
-    for chunk in delivered {
-        total_stats.record_payload_bytes(chunk.len());
-        delivered_payload_bytes = delivered_payload_bytes.saturating_add(chunk.len());
-    }
-    let path_scoped_delivered_bytes = path_scoped_received_bytes.min(delivered_payload_bytes);
-    if path_scoped_delivered_bytes > 0 {
-        path_stats
-            .entry(path_key)
-            .or_default()
-            .record_payload_bytes(path_scoped_delivered_bytes);
-    }
-    delivered_payload_bytes
 }
 
 pub(super) fn reliable_relay_can_finish_after_path_loss(

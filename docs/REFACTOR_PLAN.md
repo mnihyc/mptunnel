@@ -118,9 +118,13 @@ comes directly from `model/timing.rs`; relay I/O does not import the client
 control actor for either policy. Open and remote attachment enqueue fixed
 request control through the reliable stream binding rather than importing the
 request sender. Dependencies run from control to sender, then remote, open, and
-stream; switchable response output remains a distinct placement contract. The
-remaining relay work is control actor decomposition, not another server
-subdirectory or small phase files.
+stream; switchable response output remains a distinct placement contract.
+Client relay orchestration keeps one serialized select actor in
+`relay/control.rs`, while `relay/client.rs` owns its durable endpoint/FIN,
+progress/ACK, recovery, and delivery aggregates. Peer STREAM_DATA application
+and STREAM_ACK repair derivation commit through that owner before path policy
+runs. This is one flat substantive module, not a phase directory or collection
+of pass-through helpers.
 
 The opened-stream value is itself the pending attachment transaction: it owns
 both carrier cleanup and an optional scheduler-load lease. Initial and direct
@@ -179,7 +183,8 @@ after that shared boundary. No OS type or branch enters model or scheduler state
    transactions, load, queue, and writer ownership without merging TCP and QUIC
    controllers.
 10. Complete client/control relay orchestration after its lower-level utilities
-    have moved out; the server target-relay lifecycle is already owned.
+    have moved out; client durable state and peer data/ACK application now live
+    in `relay/client.rs`, and the server target-relay lifecycle is already owned.
 11. Replace repeated `mod.rs` facades, production glob imports, runtime prelude
     leakage, and broad re-exports with named contracts.
 12. Move remaining inline tests, update `ARCHITECTURE.md` to the final paths,

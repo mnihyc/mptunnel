@@ -591,3 +591,7 @@ pub(super) fn plan_response_data_payload_with_ordered_debt_impl(
     )
     .map(|planned| (payload_bytes, planned))
 }
+
+#[cfg(test)]
+#[path = "multipath_test.rs"]
+mod tests;

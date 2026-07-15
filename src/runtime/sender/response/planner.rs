@@ -20,12 +20,6 @@ use super::diagnostics::{
     ResponseBulkCandidateDiag, lab_response_bulk_output_candidate,
     lab_response_bulk_output_selected,
 };
-#[cfg(test)]
-use super::multipath::{
-    ResponseDataDispatchPlan, ResponseDataDispatchTarget, plan_response_data_dispatch,
-    plan_response_data_dispatch_with_ordered_debt_impl,
-    preview_response_data_payload_with_ordered_debt,
-};
 use super::tcp_capacity::{
     ResponseAckClockCalibrationCommit, ResponseAckClockCalibrationRetirementIntent,
     response_ack_clock_calibration_blocks_generic_owner,

@@ -347,3 +347,7 @@ pub(in crate::runtime) fn emit_response_control_frame(
         None,
     )
 }
+
+#[cfg(test)]
+#[path = "dispatch_test.rs"]
+mod tests;

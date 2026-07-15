@@ -64,15 +64,20 @@ contract as same-family multipath placement.
   plan, and dispatch response work without claiming product ownership before
   the stream transaction commits.
 - `src/runtime/path/{set,state,selection}.rs`: own configured carrier identity,
-  shared health and load ledgers, coherent batch observation, and atomic load
-  reservation. The session-shared TCP-Service request-flow count lives in path
-  state and counts each logical stream once, not each attachment.
+  shared health/load ledgers, carrier-neutral capacity budgets, coherent batch
+  observation, and atomic load reservation. Protocol-specific reservation and
+  proof state is composed here but owned below. The session-shared TCP-Service
+  request-flow count lives in path state and counts each logical stream once,
+  not each attachment.
 - `src/runtime/path/commands.rs`: owns bounded, lane-separated transfer to
   carrier writers. Queue accounting must balance on enqueue, dequeue,
   cancellation, and receiver drop.
 - `src/runtime/path/tcp/` and `src/runtime/path/quic/`: own independent carrier
   actors, I/O, telemetry, recovery, and native capacity evidence. Kernel TCP and
   Quinn remain their respective congestion and retransmission authorities.
+  Their `capacity.rs` owners contain the complete request reservation, proof,
+  rollback, and carrier-specific handoff lifecycle; TCP stays path-parallel,
+  while QUIC serializes one native measurement epoch per session.
 - `src/runtime/stream/{handle,registry}.rs`: own carrier-neutral stream handles,
   server stream lookup, exact carrier-instance attachment, and binding lifetime.
 - `src/model/` and `src/scheduler/`: own carrier-neutral evidence vocabulary,

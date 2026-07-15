@@ -25,13 +25,16 @@ pub(in crate::runtime) use commands::{
 pub(in crate::runtime) use model::PathDeliveryStats;
 #[cfg(test)]
 pub(super) use proof::*;
+pub(in crate::runtime) use quic::{
+    RequestQuicCapacityProbeLease, RequestQuicCapacityProductHandoffState,
+    RequestQuicCapacityReconciliationQuery,
+};
 pub(in crate::runtime) use server_context::ServerPathContext;
 pub(in crate::runtime) use set::ClientPathContext;
 pub(in crate::runtime) use state::{
     ClientPathHealth, ClientPathHealthRecord, ClientPathState, RelayPathLoadLease,
     ReliableTcpRequestBulkFlowRegistration, RequestCapacityProbeCampaignBudget,
-    RequestCapacityReconciliationView, RequestQuicCapacityProbeLease,
-    RequestQuicCapacityProductHandoffState, RequestQuicCapacityReconciliationQuery,
+    RequestCapacityReconciliationView,
 };
 pub(in crate::runtime) use tcp::capacity::{
     RequestTcpCapacityProbeLease, RequestTcpCapacityProofQuery,

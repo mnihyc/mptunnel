@@ -92,16 +92,18 @@ Server target relay lifetime is now one flat `runtime/relay/server.rs` owner.
 Each server identity constructs one registry/service pair; TCP and QUIC carrier
 actors submit accepted leases through that pair instead of spawning detached
 target tasks. Shared receive/range primitives remain in `relay/io.rs`. The
-client side keeps two balanced flat owners: `relay/open.rs` reserves candidates
-and executes concrete TCP/QUIC open, deadline, acceptance, and retry contracts;
-`relay/remote.rs` owns successful attachment incarnation, placement ordering,
-load claims, frame fan-in, and teardown. Carrier-derived PTO timing comes
-directly from `model/timing.rs`; relay I/O does not import the client control
-actor for either policy. Open and relay I/O enqueue fixed request control
-through the reliable stream binding rather than importing the request sender;
-switchable response output remains a distinct placement contract. The remaining
-relay work is client/control ownership and removal of lower-layer policy still
-embedded in those actors, not another server subdirectory or small phase files.
+client side keeps two flat owners: `relay/open.rs` executes concrete TCP/QUIC
+reservation, deadline, acceptance, and retry contracts, and owns cleanup until
+an opened stream commits; `relay/remote.rs` owns attachment role/candidate
+policy, in-flight claim exclusion, membership commit/rollback, placement
+ordering, load claims, frame fan-in, and teardown. Carrier-derived PTO timing
+comes directly from `model/timing.rs`; relay I/O does not import the client
+control actor for either policy. Open and remote attachment enqueue fixed
+request control through the reliable stream binding rather than importing the
+request sender. Dependencies run from control to sender, then remote, open, and
+stream; switchable response output remains a distinct placement contract. The
+remaining relay work is control actor decomposition, not another server
+subdirectory or small phase files.
 
 ### Platform
 

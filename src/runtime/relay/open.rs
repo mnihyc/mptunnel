@@ -4,7 +4,6 @@
 //! deadlines, peer acceptance, and retry classification. Successful opens
 //! cross into attachment-set ownership through `OpenedRemoteStream`.
 
-use super::remote::{AcceptedRemoteStreamGuard, OpenedRemoteStream};
 #[cfg(test)]
 use super::*;
 #[cfg(feature = "lab-diagnostics")]
@@ -23,17 +22,53 @@ use crate::runtime::stream::ReliablePathStream;
 use crate::scheduler::FlowLane;
 use std::time::{Duration, Instant};
 
+pub(in crate::runtime) struct OpenedRemoteStream {
+    pub(in crate::runtime) stream: ReliablePathStream,
+    pub(in crate::runtime) path_index: usize,
+}
+
+impl OpenedRemoteStream {
+    /// A stream that never commits to a remote set must release both the peer
+    /// binding and the local carrier actor entry.
+    pub(in crate::runtime) async fn close(self) {
+        self.stream.send_detach().await;
+        self.stream.close().await;
+    }
+}
+
+pub(in crate::runtime) struct UncommittedRemoteStreamGuard {
+    stream: Option<ReliablePathStream>,
+}
+
+impl UncommittedRemoteStreamGuard {
+    pub(in crate::runtime) fn new(stream: ReliablePathStream) -> Self {
+        Self {
+            stream: Some(stream),
+        }
+    }
+
+    pub(in crate::runtime) fn stream(&self) -> &ReliablePathStream {
+        self.stream.as_ref().expect("uncommitted stream guard")
+    }
+
+    pub(in crate::runtime) fn commit(mut self) -> ReliablePathStream {
+        self.stream.take().expect("uncommitted stream guard")
+    }
+}
+
+impl Drop for UncommittedRemoteStreamGuard {
+    fn drop(&mut self) {
+        let Some(stream) = self.stream.take() else {
+            return;
+        };
+        let _ = stream.retire_uncommitted();
+    }
+}
+
 #[derive(Clone)]
 pub(in crate::runtime) struct ReliableRelayOpenSpec {
     pub(in crate::runtime) target: TargetAddr,
     pub(in crate::runtime) ingress: IngressKind,
-}
-
-#[derive(Debug, Clone, Copy)]
-pub(in crate::runtime) enum ReliableRelayAttachMode {
-    Any,
-    BulkStriping,
-    RecoveryRepair,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -365,12 +400,12 @@ pub(in crate::runtime) async fn open_remote_stream_on_reserved_path(
         .ok_or(RuntimeError::NoSchedulableTcpPath)?
         .open_stream_with_deadlines(stream_id, target, ingress, lane, role, open_deadlines)
         .await?;
-    let accepted = AcceptedRemoteStreamGuard::new(opened.stream);
+    let uncommitted = UncommittedRemoteStreamGuard::new(opened.stream);
     tokio::time::timeout_at(
         opened.open_deadline,
         send_open_path_metrics(
             context,
-            accepted.stream(),
+            uncommitted.stream(),
             UnderlayProtocol::Tcp,
             path_index,
         ),
@@ -392,7 +427,7 @@ pub(in crate::runtime) async fn open_remote_stream_on_reserved_path(
         ),
     );
     Ok(OpenedRemoteStream {
-        stream: accepted.commit(),
+        stream: uncommitted.commit(),
         path_index,
     })
 }
@@ -523,12 +558,12 @@ pub(in crate::runtime) async fn open_remote_stream_on_reserved_udp_path(
         .ok_or(RuntimeError::NoSchedulableUdpPath)?
         .open_stream(stream_id, target, ingress, lane, options, open_deadline)
         .await?;
-    let accepted = AcceptedRemoteStreamGuard::new(stream);
+    let uncommitted = UncommittedRemoteStreamGuard::new(stream);
     let elapsed = started_at.elapsed();
     context.mark_udp_stream_reserved_open_success(path_index, elapsed, wait_for_accept);
     send_open_path_metrics(
         context,
-        accepted.stream(),
+        uncommitted.stream(),
         UnderlayProtocol::Udp,
         path_index,
     )
@@ -547,7 +582,7 @@ pub(in crate::runtime) async fn open_remote_stream_on_reserved_udp_path(
         ),
     );
     Ok(OpenedRemoteStream {
-        stream: accepted.commit(),
+        stream: uncommitted.commit(),
         path_index,
     })
 }

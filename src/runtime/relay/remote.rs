@@ -1,63 +1,32 @@
 //! Client relay attachment-set ownership.
 //!
-//! After a carrier open succeeds, this module owns attachment incarnation
-//! identity, placement ordering, scheduler load claims, frame fan-in, and
-//! teardown. Carrier selection and TCP/QUIC open transactions stay in `open`.
+//! This module owns attachment incarnation identity, role and candidate policy,
+//! in-flight claim exclusion, membership commit/rollback, scheduler load,
+//! frame fan-in, and teardown. Concrete TCP/QUIC opens stay in `open`.
 
-use crate::model::capacity::reliable_relay_buffer_len;
+use super::io::reliable_relay_error_is_migratable;
+use super::open::{
+    OpenedRemoteStream, ReliableRelayOpenSpec, UncommittedRemoteStreamGuard,
+    no_schedulable_reliable_path_error, open_remote_stream_for_relay_path,
+    relay_path_open_error_is_retryable, stream_open_error_is_path_retryable,
+    udp_stream_open_error_is_path_retryable,
+};
+use crate::model::capacity::{
+    PATH_OPEN_SCORE_BYTES, adaptive_reliable_relay_chunk_bytes, relay_lane_startup_chunk_bytes,
+    reliable_relay_buffer_len,
+};
 use crate::model::path::{RelayPathInstance, RelayPathKey};
 use crate::model::work::ReliableWorkClass;
 use crate::mux::MuxLimits;
-use crate::protocol::{Frame, StreamId, UnderlayProtocol};
+use crate::mux::stream::ReliableSendStream;
+use crate::protocol::{Frame, StreamId, StreamOpenRole, UnderlayProtocol};
 use crate::runtime::error::RuntimeError;
 use crate::runtime::path::{ClientPathContext, RelayPathLoadLease};
 use crate::runtime::stream::{ReliablePathStream, ReliablePathStreamHandle};
 use crate::scheduler::FlowLane;
+use std::collections::HashSet;
 use std::time::Instant;
 use tokio::sync::mpsc;
-
-pub(in crate::runtime) struct OpenedRemoteStream {
-    pub(in crate::runtime) stream: ReliablePathStream,
-    pub(in crate::runtime) path_index: usize,
-}
-
-impl OpenedRemoteStream {
-    /// An accepted stream that is not committed to a remote set must release
-    /// both the peer binding and the local carrier actor entry.
-    pub(in crate::runtime) async fn close(self) {
-        self.stream.send_detach().await;
-        self.stream.close().await;
-    }
-}
-
-pub(in crate::runtime) struct AcceptedRemoteStreamGuard {
-    stream: Option<ReliablePathStream>,
-}
-
-impl AcceptedRemoteStreamGuard {
-    pub(in crate::runtime) fn new(stream: ReliablePathStream) -> Self {
-        Self {
-            stream: Some(stream),
-        }
-    }
-
-    pub(in crate::runtime) fn stream(&self) -> &ReliablePathStream {
-        self.stream.as_ref().expect("accepted stream guard")
-    }
-
-    pub(in crate::runtime) fn commit(mut self) -> ReliablePathStream {
-        self.stream.take().expect("accepted stream guard")
-    }
-}
-
-impl Drop for AcceptedRemoteStreamGuard {
-    fn drop(&mut self) {
-        let Some(stream) = self.stream.take() else {
-            return;
-        };
-        let _ = stream.retire_uncommitted();
-    }
-}
 
 pub(in crate::runtime) struct ReliableRelayRemotePath {
     pub(in crate::runtime) path_index: usize,
@@ -319,8 +288,8 @@ impl ReliableRelayRemoteSet {
         placement: RelayPathPlacement,
     ) -> ReliableRelayAttachOutcome {
         let OpenedRemoteStream { stream, path_index } = opened;
-        let accepted = AcceptedRemoteStreamGuard::new(stream);
-        let underlay = accepted.stream().underlay;
+        let uncommitted = UncommittedRemoteStreamGuard::new(stream);
+        let underlay = uncommitted.stream().underlay;
         let key = RelayPathKey {
             underlay,
             index: path_index,
@@ -334,7 +303,7 @@ impl ReliableRelayRemoteSet {
             key,
             id: instance_id,
         };
-        let (stream, mut frames) = accepted.commit().into_handle_and_frames();
+        let (stream, mut frames) = uncommitted.commit().into_handle_and_frames();
         let frames_tx = self.frames_tx.clone();
         tokio::spawn(async move {
             while let Some(frame) = frames.recv().await {
@@ -548,6 +517,418 @@ fn relay_path_placement_may_wake_work_lane(
         ReliableWorkClass::Data => placement != RelayPathPlacement::Repair,
         ReliableWorkClass::Control | ReliableWorkClass::Repair => true,
     }
+}
+
+#[derive(Debug, Clone, Copy)]
+pub(in crate::runtime) enum ReliableRelayAttachMode {
+    Any,
+    BulkStriping,
+    RecoveryRepair,
+}
+
+fn send_request_attach_control_frames(
+    path_stream: &ReliablePathStream,
+    send_stream: &ReliableSendStream,
+    resend_fin: bool,
+) -> Result<(), RuntimeError> {
+    if resend_fin {
+        path_stream.try_enqueue_request_control_frame(Frame::StreamFin {
+            stream_id: path_stream.stream_id,
+            final_offset: send_stream.next_offset(),
+        })?;
+    }
+    Ok(())
+}
+
+struct RelayPathAttachRequest<'a> {
+    spec: &'a ReliableRelayOpenSpec,
+    lane: FlowLane,
+    send_stream: &'a ReliableSendStream,
+    resend_fin: bool,
+    candidates: Vec<RelayPathKey>,
+    role: StreamOpenRole,
+    send_attach_control: bool,
+}
+
+struct RelayPathAttachResult {
+    attached: usize,
+    key: Option<RelayPathKey>,
+}
+
+async fn attach_relay_path_candidates(
+    context: &ClientPathContext,
+    remotes: &mut ReliableRelayRemoteSet,
+    request: RelayPathAttachRequest<'_>,
+) -> Result<RelayPathAttachResult, RuntimeError> {
+    let stream_id = remotes.stream_id();
+    let mut last_retryable_error = None;
+    let candidates = request.candidates;
+
+    for key in candidates {
+        if remotes.contains_path_key(key) {
+            continue;
+        }
+        match open_remote_stream_for_relay_path(
+            context,
+            stream_id,
+            request.spec.target.clone(),
+            request.spec.ingress,
+            request.lane,
+            key,
+            request.role,
+        )
+        .await
+        {
+            Ok(opened) => {
+                let OpenedRemoteStream { stream, path_index } = opened;
+                // Attach-control emission is fallible. Keep cleanup armed until
+                // the uncommitted stream is committed into the remote set.
+                let uncommitted = UncommittedRemoteStreamGuard::new(stream);
+                let attach_control_result = if request.send_attach_control {
+                    send_request_attach_control_frames(
+                        uncommitted.stream(),
+                        request.send_stream,
+                        request.resend_fin,
+                    )
+                } else {
+                    Ok(())
+                };
+                match attach_control_result {
+                    Ok(()) => {
+                        let opened = OpenedRemoteStream {
+                            stream: uncommitted.commit(),
+                            path_index,
+                        };
+                        if request.role != StreamOpenRole::Active {
+                            // Path choice temporarily reserves a share while the
+                            // open is in flight. Passive attachments keep only
+                            // their actual queue/inflight debt after attachment.
+                            context.release_relay_path_load(key.underlay, key.index, request.lane);
+                        }
+                        let attach_outcome = match request.role {
+                            StreamOpenRole::Active => remotes.attach(opened),
+                            StreamOpenRole::Repair => remotes.attach_for_repair(opened),
+                            StreamOpenRole::Validation => remotes.attach_for_validation(opened),
+                        };
+                        match attach_outcome {
+                            ReliableRelayAttachOutcome::Attached => {
+                                return Ok(RelayPathAttachResult {
+                                    attached: 1,
+                                    key: Some(key),
+                                });
+                            }
+                            ReliableRelayAttachOutcome::RejectedDuplicate => {
+                                if request.role == StreamOpenRole::Active {
+                                    // A rejected Active open never transfers its
+                                    // path reservation into remote-set ownership.
+                                    context.release_relay_path_load(
+                                        key.underlay,
+                                        key.index,
+                                        request.lane,
+                                    );
+                                }
+                                continue;
+                            }
+                        }
+                    }
+                    Err(err) if reliable_relay_error_is_migratable(&err) => {
+                        context.mark_relay_path_failure(key.underlay, key.index);
+                        context.release_relay_path_load(key.underlay, key.index, request.lane);
+                        last_retryable_error = Some(err);
+                    }
+                    Err(err) => {
+                        context.release_relay_path_load(key.underlay, key.index, request.lane);
+                        return Err(err);
+                    }
+                }
+            }
+            Err(err) if relay_path_open_error_is_retryable(key.underlay, &err) => {
+                context.mark_relay_path_failure(key.underlay, key.index);
+                last_retryable_error = Some(err);
+            }
+            Err(err) => return Err(err),
+        }
+    }
+    if remotes.is_empty() {
+        Err(last_retryable_error.unwrap_or_else(|| no_schedulable_reliable_path_error(context)))
+    } else {
+        Ok(RelayPathAttachResult {
+            attached: 0,
+            key: None,
+        })
+    }
+}
+
+pub(in crate::runtime) async fn attach_reliable_relay_paths(
+    context: &ClientPathContext,
+    spec: &ReliableRelayOpenSpec,
+    lane: FlowLane,
+    remotes: &mut ReliableRelayRemoteSet,
+    send_stream: &ReliableSendStream,
+    resend_fin: bool,
+    mode: ReliableRelayAttachMode,
+    inflight_path_claims: &HashSet<RelayPathKey>,
+) -> Result<usize, RuntimeError> {
+    let mut recovery_excluded_paths = HashSet::<RelayPathKey>::new();
+    attach_reliable_relay_paths_with_claims_and_recovery_exclusions(
+        context,
+        spec,
+        lane,
+        remotes,
+        send_stream,
+        resend_fin,
+        mode,
+        &mut recovery_excluded_paths,
+        inflight_path_claims,
+    )
+    .await
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(super) async fn attach_reliable_relay_paths_with_claims_and_recovery_exclusions(
+    context: &ClientPathContext,
+    spec: &ReliableRelayOpenSpec,
+    lane: FlowLane,
+    remotes: &mut ReliableRelayRemoteSet,
+    send_stream: &ReliableSendStream,
+    resend_fin: bool,
+    mode: ReliableRelayAttachMode,
+    recovery_excluded_paths: &mut HashSet<RelayPathKey>,
+    inflight_path_claims: &HashSet<RelayPathKey>,
+) -> Result<usize, RuntimeError> {
+    let payload_bytes = match mode {
+        ReliableRelayAttachMode::Any | ReliableRelayAttachMode::RecoveryRepair => {
+            reliable_relay_attach_payload_bytes(send_stream, lane, context.mux_limits)
+        }
+        ReliableRelayAttachMode::BulkStriping => {
+            reliable_relay_bulk_striping_payload_bytes(send_stream, context.mux_limits)
+        }
+    };
+    if matches!(mode, ReliableRelayAttachMode::BulkStriping) {
+        let result = attach_relay_path_candidates(
+            context,
+            remotes,
+            RelayPathAttachRequest {
+                spec,
+                lane,
+                send_stream,
+                resend_fin,
+                candidates: reliable_relay_exclude_inflight_open_claims(
+                    context.ordered_reliable_bulk_striping_path_keys(payload_bytes),
+                    &inflight_path_claims,
+                ),
+                role: StreamOpenRole::Validation,
+                send_attach_control: false,
+            },
+        )
+        .await;
+        match result {
+            Ok(result) if result.attached > 0 || !remotes.is_empty() => {
+                return Ok(result.attached);
+            }
+            Ok(_) => {}
+            Err(err)
+                if remotes.is_empty()
+                    && (stream_open_error_is_path_retryable(&err)
+                        || udp_stream_open_error_is_path_retryable(&err)) => {}
+            Err(err) => return Err(err),
+        }
+    }
+    let role = reliable_relay_attach_role(lane, send_stream, resend_fin, mode);
+    if role == StreamOpenRole::Repair {
+        let result = attach_relay_path_candidates(
+            context,
+            remotes,
+            RelayPathAttachRequest {
+                spec,
+                lane,
+                send_stream,
+                resend_fin,
+                candidates: reliable_relay_exclude_inflight_open_claims(
+                    reliable_relay_recovery_attach_candidates(
+                        reliable_relay_repair_path_candidates(
+                            context,
+                            remotes,
+                            lane,
+                            payload_bytes,
+                        ),
+                        recovery_excluded_paths,
+                        remotes.is_empty(),
+                    ),
+                    &inflight_path_claims,
+                ),
+                role,
+                send_attach_control: true,
+            },
+        )
+        .await?;
+        if result.attached > 0
+            && let Some(key) = result.key
+        {
+            recovery_excluded_paths.insert(key);
+        }
+        return Ok(result.attached);
+    }
+    let result = attach_relay_path_candidates(
+        context,
+        remotes,
+        RelayPathAttachRequest {
+            spec,
+            lane,
+            send_stream,
+            resend_fin,
+            candidates: reliable_relay_exclude_inflight_open_claims(
+                reliable_relay_recovery_attach_candidates(
+                    reliable_relay_active_path_candidates(context, remotes, lane, payload_bytes),
+                    recovery_excluded_paths,
+                    remotes.is_empty(),
+                ),
+                &inflight_path_claims,
+            ),
+            role,
+            send_attach_control: true,
+        },
+    )
+    .await?;
+    Ok(result.attached)
+}
+
+pub(in crate::runtime) fn reliable_relay_attach_role(
+    lane: FlowLane,
+    send_stream: &ReliableSendStream,
+    resend_fin: bool,
+    mode: ReliableRelayAttachMode,
+) -> StreamOpenRole {
+    match mode {
+        ReliableRelayAttachMode::BulkStriping => StreamOpenRole::Validation,
+        ReliableRelayAttachMode::RecoveryRepair => StreamOpenRole::Repair,
+        ReliableRelayAttachMode::Any
+            if reliable_relay_should_race_repair(lane, send_stream, resend_fin, mode) =>
+        {
+            StreamOpenRole::Repair
+        }
+        ReliableRelayAttachMode::Any => StreamOpenRole::Active,
+    }
+}
+
+pub(in crate::runtime) fn reliable_relay_active_path_candidates(
+    context: &ClientPathContext,
+    remotes: &ReliableRelayRemoteSet,
+    lane: FlowLane,
+    payload_bytes: usize,
+) -> Vec<RelayPathKey> {
+    context
+        .ordered_reliable_path_keys(lane, payload_bytes)
+        .into_iter()
+        .filter(|key| !remotes.contains_path_key(*key))
+        .collect()
+}
+
+fn reliable_relay_recovery_attach_candidates(
+    candidates: Vec<RelayPathKey>,
+    recovery_excluded_paths: &HashSet<RelayPathKey>,
+    allow_excluded_last_resort: bool,
+) -> Vec<RelayPathKey> {
+    if recovery_excluded_paths.is_empty() {
+        return candidates;
+    }
+    let filtered = candidates
+        .iter()
+        .copied()
+        .filter(|key| !recovery_excluded_paths.contains(key))
+        .collect::<Vec<_>>();
+    if filtered.is_empty() && allow_excluded_last_resort {
+        candidates
+    } else {
+        filtered
+    }
+}
+
+fn reliable_relay_exclude_inflight_open_claims(
+    candidates: Vec<RelayPathKey>,
+    inflight_path_claims: &HashSet<RelayPathKey>,
+) -> Vec<RelayPathKey> {
+    candidates
+        .into_iter()
+        .filter(|candidate| !inflight_path_claims.contains(candidate))
+        .collect()
+}
+
+pub(in crate::runtime) fn reliable_relay_repair_path_candidates(
+    context: &ClientPathContext,
+    remotes: &ReliableRelayRemoteSet,
+    lane: FlowLane,
+    payload_bytes: usize,
+) -> Vec<RelayPathKey> {
+    context
+        .ordered_reliable_repair_path_keys(
+            remotes.active_path_index_for(UnderlayProtocol::Tcp),
+            remotes.active_path_index_for(UnderlayProtocol::Udp),
+            lane,
+            payload_bytes,
+        )
+        .into_iter()
+        .filter(|key| !remotes.contains_path_key(*key))
+        .collect()
+}
+
+pub(in crate::runtime) fn reliable_relay_should_race_repair(
+    lane: FlowLane,
+    send_stream: &ReliableSendStream,
+    resend_fin: bool,
+    mode: ReliableRelayAttachMode,
+) -> bool {
+    matches!(mode, ReliableRelayAttachMode::Any)
+        && !resend_fin
+        && (send_stream.repair_bytes() > 0
+            || (lane.is_latency_sensitive() && send_stream.repair_bytes() <= PATH_OPEN_SCORE_BYTES))
+}
+
+pub(in crate::runtime) fn reliable_relay_attach_payload_bytes(
+    send_stream: &ReliableSendStream,
+    lane: FlowLane,
+    mux_limits: MuxLimits,
+) -> usize {
+    let floor = if lane.is_latency_sensitive() {
+        PATH_OPEN_SCORE_BYTES
+    } else {
+        reliable_relay_buffer_len(mux_limits)
+    };
+    let repair_bytes = send_stream.repair_bytes().max(floor);
+    let stream_window = usize::try_from(mux_limits.max_stream_window_bytes).unwrap_or(usize::MAX);
+    repair_bytes.min(stream_window)
+}
+
+pub(in crate::runtime) fn reliable_relay_bulk_striping_payload_bytes(
+    send_stream: &ReliableSendStream,
+    mux_limits: MuxLimits,
+) -> usize {
+    let stream_window = usize::try_from(mux_limits.max_stream_window_bytes).unwrap_or(usize::MAX);
+    let decision_quantum =
+        adaptive_reliable_relay_chunk_bytes(None, FlowLane::Throughput, mux_limits)
+            .min(reliable_relay_buffer_len(mux_limits))
+            .min(stream_window)
+            .max(PATH_OPEN_SCORE_BYTES);
+    let repair_bytes = send_stream.repair_bytes();
+    if repair_bytes == 0 {
+        return decision_quantum;
+    }
+    repair_bytes
+        .min(decision_quantum)
+        .min(stream_window)
+        .max(PATH_OPEN_SCORE_BYTES)
+}
+
+pub(in crate::runtime) fn reliable_relay_bulk_validation_payload_bytes(
+    send_stream: &ReliableSendStream,
+    mux_limits: MuxLimits,
+) -> usize {
+    let proof_ceiling = relay_lane_startup_chunk_bytes(FlowLane::Latency, mux_limits);
+    let proof_payload = reliable_relay_bulk_striping_payload_bytes(send_stream, mux_limits)
+        .min(proof_ceiling)
+        .max(PATH_OPEN_SCORE_BYTES);
+    let stream_window = usize::try_from(mux_limits.max_stream_window_bytes).unwrap_or(usize::MAX);
+    proof_payload.min(stream_window).max(PATH_OPEN_SCORE_BYTES)
 }
 
 #[cfg(test)]

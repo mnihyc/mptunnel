@@ -15,7 +15,8 @@ use crate::runtime::path::commands::{
     ReliablePathCommand, ReliablePathCommandReceivers, ReliablePathCommandSender,
     try_recv_reliable_path_priority_command,
 };
-use crate::runtime::relay::remote::{OpenedRemoteStream, ReliableRelayRemoteSet};
+use crate::runtime::relay::open::OpenedRemoteStream;
+use crate::runtime::relay::remote::ReliableRelayRemoteSet;
 use crate::runtime::stream::{ReliablePathStream, ReliablePathStreamOutput};
 use crate::scheduler::FlowLane;
 use crate::transport::PathSpec;

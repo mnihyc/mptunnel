@@ -1,6 +1,6 @@
 use super::*;
 use crate::config::SharedSecret;
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::net::SocketAddr;
 
 fn test_security() -> SecurityConfig {
@@ -349,122 +349,6 @@ fn validation_probe_candidates_group_one_family_with_bounded_retry() {
             .is_empty(),
         "two attempts bound reconnect churn for every stream/path"
     );
-}
-
-#[test]
-fn recovery_attach_candidates_skip_failed_stream_path_when_alternative_exists() {
-    let tcp0 = RelayPathKey {
-        underlay: UnderlayProtocol::Tcp,
-        index: 0,
-    };
-    let tcp1 = RelayPathKey {
-        underlay: UnderlayProtocol::Tcp,
-        index: 1,
-    };
-    let udp0 = RelayPathKey {
-        underlay: UnderlayProtocol::Udp,
-        index: 0,
-    };
-    let excluded = HashSet::from([tcp0]);
-
-    assert_eq!(
-        reliable_relay_recovery_attach_candidates(vec![tcp0, tcp1, udp0], &excluded, false),
-        vec![tcp1, udp0],
-        "stream-local failover should not immediately reopen the same failed path while another candidate exists"
-    );
-
-    assert!(
-        reliable_relay_recovery_attach_candidates(vec![tcp0], &excluded, false).is_empty(),
-        "a failed path must not be reopened while the stream still has an attached survivor"
-    );
-
-    assert_eq!(
-        reliable_relay_recovery_attach_candidates(vec![tcp0], &excluded, true),
-        vec![tcp0],
-        "a failed path remains retryable only as a last-resort route when no survivor is attached"
-    );
-}
-
-#[test]
-fn inflight_open_claim_stays_hard_after_soft_recovery_fallback() {
-    let claimed = RelayPathKey {
-        underlay: UnderlayProtocol::Tcp,
-        index: 1,
-    };
-    let unclaimed = RelayPathKey {
-        underlay: UnderlayProtocol::Udp,
-        index: 2,
-    };
-    let soft_excluded = HashSet::from([claimed]);
-    let inflight_claims = HashSet::from([claimed]);
-
-    let last_resort =
-        reliable_relay_recovery_attach_candidates(vec![claimed], &soft_excluded, true);
-    assert_eq!(last_resort, vec![claimed]);
-    assert!(
-        reliable_relay_exclude_inflight_open_claims(last_resort, &inflight_claims).is_empty(),
-        "soft last-resort recovery must never reopen a path whose validation task still owns the logical stream/path claim"
-    );
-    assert_eq!(
-        reliable_relay_exclude_inflight_open_claims(vec![claimed, unclaimed], &inflight_claims,),
-        vec![unclaimed],
-        "an independent carrier remains available while the claimed open completes"
-    );
-}
-
-#[tokio::test]
-async fn sender_recovery_attach_api_cannot_bypass_inflight_claim() {
-    let context = ClientPathContext::new(
-        vec![
-            "tcp://127.0.0.1:23211?srtt-ms=20&rate-mbps=100"
-                .parse()
-                .expect("active path"),
-            "tcp://127.0.0.1:23212?srtt-ms=30&rate-mbps=200"
-                .parse()
-                .expect("claimed path"),
-        ],
-        test_security(),
-        ResourceLimits::default(),
-    )
-    .expect("context");
-    let (commands, _receivers) = reliable_path_command_channels(1);
-    let mut remotes = ReliableRelayRemoteSet::new(
-        OpenedRemoteStream {
-            path_index: 0,
-            stream: test_reliable_path_stream(
-                StreamId(14),
-                UnderlayProtocol::Tcp,
-                0,
-                commands,
-                FlowLane::Throughput,
-            ),
-        },
-        4,
-    );
-    let send_stream = ReliableSendStream::new(StreamId(14), MuxLimits::default());
-    let spec = ReliableRelayOpenSpec {
-        target: TargetAddr::Ip(SocketAddr::from(([127, 0, 0, 1], 80))),
-        ingress: IngressKind::Socks5,
-    };
-    let claimed = HashSet::from([RelayPathKey {
-        underlay: UnderlayProtocol::Tcp,
-        index: 1,
-    }]);
-
-    let attached = attach_reliable_relay_paths(
-        &context,
-        &spec,
-        FlowLane::Throughput,
-        &mut remotes,
-        &send_stream,
-        false,
-        ReliableRelayAttachMode::RecoveryRepair,
-        &claimed,
-    )
-    .await
-    .expect("claimed recovery is a clean no-op");
-    assert_eq!(attached, 0);
-    assert_eq!(remotes.path_keys().len(), 1);
 }
 
 #[tokio::test]

@@ -2,11 +2,14 @@ use super::*;
 use crate::protocol::frame::reliable_path_frame_pacing_bytes;
 use crate::runtime::path::tcp::connect_client_tcp_path_for_test;
 use crate::runtime::relay::open::{
-    relay_error_is_tcp_path_failure, relay_path_open_error_is_retryable,
+    OpenedRemoteStream, relay_error_is_tcp_path_failure, relay_path_open_error_is_retryable,
     reliable_initial_active_open_timeout, reliable_relay_attach_open_timeouts,
     stream_open_error_is_path_retryable, udp_stream_open_error_is_path_retryable,
 };
-use crate::runtime::relay::remote::{OpenedRemoteStream, ReliableRelayRemoteSet};
+use crate::runtime::relay::remote::{
+    ReliableRelayRemoteSet, reliable_relay_active_path_candidates,
+    reliable_relay_repair_path_candidates,
+};
 use crate::runtime::stream::response::next_server_carrier_path_instance_id;
 use crate::transport::{CarrierPathIdentity, PathBinding, SystemCarrierNetworkProvider};
 
@@ -3176,114 +3179,6 @@ fn mixed_bulk_striping_can_choose_best_carrier_without_active_subflow_set() {
             underlay: UnderlayProtocol::Udp,
             index: 0,
         })
-    );
-}
-
-#[tokio::test]
-async fn relay_active_attach_candidates_are_metric_ordered_across_carriers() {
-    let context = ClientPathContext::new(
-        vec![
-            "udp://127.0.0.1:10179?srtt-ms=100&rate-mbps=20"
-                .parse()
-                .expect("active slow udp path"),
-            "tcp://127.0.0.1:10180?srtt-ms=10&rate-mbps=500"
-                .parse()
-                .expect("fast tcp path"),
-            "udp://127.0.0.1:10181?srtt-ms=20&rate-mbps=200"
-                .parse()
-                .expect("moderate udp path"),
-        ],
-        security(),
-        ResourceLimits::default(),
-    )
-    .expect("context");
-    let (active_udp, _commands, _frames) =
-        opened_relay_stream_for_test(StreamId(160), UnderlayProtocol::Udp, 0);
-    let remotes = ReliableRelayRemoteSet::new(active_udp, 4);
-
-    let candidates =
-        reliable_relay_active_path_candidates(&context, &remotes, FlowLane::Throughput, 64 * 1024);
-
-    assert_eq!(
-        candidates.first().copied(),
-        Some(RelayPathKey {
-            underlay: UnderlayProtocol::Tcp,
-            index: 0,
-        }),
-        "active UDP must not hide a better measured TCP candidate"
-    );
-}
-
-#[tokio::test]
-async fn repair_attach_candidates_cross_carrier_by_eta_not_active_family() {
-    let context = ClientPathContext::new(
-        vec![
-            "tcp://127.0.0.1:11168?srtt-ms=20&rate-mbps=500"
-                .parse()
-                .expect("fast tcp repair path"),
-            "udp://127.0.0.1:11169?srtt-ms=180&rate-mbps=40"
-                .parse()
-                .expect("slow active udp path"),
-        ],
-        security(),
-        ResourceLimits::default(),
-    )
-    .expect("context");
-    let stream_id = StreamId(151);
-    let (udp_stream, _udp_commands, _udp_frames) =
-        opened_relay_stream_for_test(stream_id, UnderlayProtocol::Udp, 0);
-    let remotes = ReliableRelayRemoteSet::new(udp_stream, 4);
-
-    let candidates =
-        reliable_relay_repair_path_candidates(&context, &remotes, FlowLane::Throughput, 64 * 1024);
-
-    assert_eq!(
-        candidates.first().copied(),
-        Some(RelayPathKey {
-            underlay: UnderlayProtocol::Tcp,
-            index: 0,
-        })
-    );
-}
-
-#[test]
-fn throughput_repair_bytes_use_repair_attachment_role() {
-    let mut send_stream = ReliableSendStream::new(StreamId(152), MuxLimits::default());
-    send_stream
-        .send_data(Bytes::from_static(b"repairable"), StreamFlags::NONE)
-        .expect("send data");
-
-    assert!(reliable_relay_should_race_repair(
-        FlowLane::Throughput,
-        &send_stream,
-        false,
-        ReliableRelayAttachMode::Any,
-    ));
-}
-
-#[test]
-fn response_recovery_after_request_fin_preserves_active_role() {
-    let send_stream = ReliableSendStream::new(StreamId(153), MuxLimits::default());
-
-    assert_eq!(
-        reliable_relay_attach_role(
-            FlowLane::Throughput,
-            &send_stream,
-            true,
-            ReliableRelayAttachMode::RecoveryRepair,
-        ),
-        StreamOpenRole::Repair,
-        "response-side timer recovery remains Repair after the request FIN"
-    );
-    assert_eq!(
-        reliable_relay_attach_role(
-            FlowLane::Throughput,
-            &send_stream,
-            true,
-            ReliableRelayAttachMode::Any,
-        ),
-        StreamOpenRole::Active,
-        "generic Any mode remains available for explicit Active failover"
     );
 }
 

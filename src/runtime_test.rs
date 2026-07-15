@@ -2900,39 +2900,6 @@ fn tcp_receive_hole_repair_deadline_is_progress_signal_not_path_victim_policy() 
 }
 
 #[test]
-fn reliable_relay_attach_scoring_keeps_interactive_repairs_small() {
-    let mux_limits = MuxLimits::default();
-    let send_stream = ReliableSendStream::new(StreamId(12), mux_limits);
-
-    assert_eq!(
-        reliable_relay_attach_payload_bytes(&send_stream, FlowLane::Latency, mux_limits),
-        PATH_OPEN_SCORE_BYTES
-    );
-    assert_eq!(
-        reliable_relay_attach_payload_bytes(&send_stream, FlowLane::Throughput, mux_limits),
-        reliable_relay_buffer_len(mux_limits)
-    );
-}
-
-#[test]
-fn reliable_relay_bulk_admission_payload_uses_preemptible_quantum_not_inflight_ceiling() {
-    let mux_limits = MuxLimits::default();
-    let send_stream = ReliableSendStream::new(StreamId(12), mux_limits);
-    let expected_quantum =
-        adaptive_reliable_relay_chunk_bytes(None, FlowLane::Throughput, mux_limits);
-
-    assert_eq!(
-        reliable_relay_bulk_striping_payload_bytes(&send_stream, mux_limits),
-        expected_quantum
-    );
-    let validation_quantum = reliable_relay_bulk_validation_payload_bytes(&send_stream, mux_limits);
-    assert!(validation_quantum >= PATH_OPEN_SCORE_BYTES);
-    assert!(validation_quantum <= relay_lane_startup_chunk_bytes(FlowLane::Latency, mux_limits));
-    assert!(validation_quantum <= expected_quantum);
-    assert!(expected_quantum < mux_limits.max_path_flight_bytes);
-}
-
-#[test]
 fn tcp_path_lane_classes_separate_latency_from_throughput_opens() {
     assert!(tcp_path_lane_uses_latency_session(FlowLane::Latency));
     assert!(tcp_path_lane_uses_latency_session(FlowLane::Control));

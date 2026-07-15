@@ -37,14 +37,14 @@ use crate::protocol::{
 use crate::runtime::error::RuntimeError;
 use crate::runtime::path::commands::reliable_path_effective_frame_lane;
 use crate::runtime::path::{ClientPathContext, ReliableTcpRequestBulkFlowRegistration};
-use crate::runtime::relay::control::attach_reliable_relay_paths;
 use crate::runtime::relay::io::{
     ReliableRecvProgress, reliable_critical_tail_repair_limit_bytes,
     reliable_relay_error_is_migratable, reliable_relay_tail_repair_delay,
 };
-use crate::runtime::relay::open::{ReliableRelayAttachMode, ReliableRelayOpenSpec};
+use crate::runtime::relay::open::ReliableRelayOpenSpec;
 use crate::runtime::relay::remote::{
-    RelayPathPlacement, ReliableRelayRemotePath, ReliableRelayRemoteSet,
+    RelayPathPlacement, ReliableRelayAttachMode, ReliableRelayRemotePath, ReliableRelayRemoteSet,
+    attach_reliable_relay_paths,
 };
 use crate::runtime::relay_striping::{
     BulkRelayFrameRequest, BulkRelayPathChoice, RequestSchedulingState,

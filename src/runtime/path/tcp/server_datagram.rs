@@ -1,19 +1,17 @@
 //! Application-datagram lifecycle carried by one server TCP session.
 //!
-//! Flow membership and target-side UDP workers stay together so closing one
-//! flow releases its realtime registration without changing carrier lifetime.
+//! The carrier owns flow membership and wire replies; accepted target workers
+//! and their policy lifetime arrive through the neutral datagram port.
 
-use crate::outbound::{self, TargetProtocol};
+use crate::protocol::frame::datagram_ack_range;
 use crate::protocol::{DatagramFlowId, DatagramId, Frame, SessionId, TargetAddr};
-use crate::runtime::datagram::{
-    ServerDatagramFlow, ServerDatagramRequest, datagram_ack_range,
-    spawn_server_datagram_flow_worker,
-};
 use crate::runtime::error::RuntimeError;
-use crate::runtime::path::ServerRealtimeFlowLease;
 use crate::runtime::path::commands::ReliablePathCommandSender;
 use crate::runtime::path::server_context::ServerPathContext;
-use tokio::sync::mpsc;
+use crate::runtime::path::{
+    AcceptedServerDatagramFlow, ServerDatagramOpenError, ServerDatagramOpenRequest,
+    ServerDatagramRequest, ServerDatagramSendOutcome,
+};
 
 pub(super) enum ServerTcpDatagramEffect {
     None,
@@ -21,13 +19,12 @@ pub(super) enum ServerTcpDatagramEffect {
     ReplyAndSkipCommandPoll(Frame),
     ReplyThenError {
         frame: Frame,
-        error: RuntimeError,
-        registration: ServerRealtimeFlowLease,
+        failure: ServerDatagramOpenError,
     },
 }
 
 pub(super) struct ServerTcpDatagramState {
-    flows: Vec<ServerDatagramFlow>,
+    flows: Vec<AcceptedServerDatagramFlow>,
 }
 
 impl ServerTcpDatagramState {
@@ -47,7 +44,7 @@ impl ServerTcpDatagramState {
         flow_id: DatagramFlowId,
         target: TargetAddr,
     ) -> Result<ServerTcpDatagramEffect, RuntimeError> {
-        if self.flows.iter().any(|flow| flow.flow_id == flow_id) {
+        if self.flows.iter().any(|flow| flow.flow_id() == flow_id) {
             return Err(RuntimeError::Protocol("duplicate TCP datagram flow"));
         }
         if self.flows.len() >= context.max_udp_flows_per_session {
@@ -55,37 +52,26 @@ impl ServerTcpDatagramState {
                 Frame::DatagramClose { flow_id },
             ));
         }
-        outbound::validate_target(&target)?;
-        context.outbound.ensure_supports(TargetProtocol::Udp)?;
-        let realtime_registration = context.reliable_streams.register_realtime_flow(session_id);
-        let outbound_socket = match outbound::connect_udp(
-            &context.outbound,
-            &context.outbound_dns,
-            &target,
-            context.outbound_connect_timeout,
-        )
-        .await
+        let flow = match context
+            .datagrams
+            .open(ServerDatagramOpenRequest {
+                session_id,
+                flow_id,
+                target,
+                commands: commands.clone(),
+            })
+            .await
         {
-            Ok(socket) => socket,
-            Err(err) => {
+            Ok(flow) => flow,
+            Err(failure) if !failure.requires_close() => return Err(failure.into_error()),
+            Err(failure) => {
                 return Ok(ServerTcpDatagramEffect::ReplyThenError {
                     frame: Frame::DatagramClose { flow_id },
-                    error: RuntimeError::OutboundConnect(err),
-                    registration: realtime_registration,
+                    failure,
                 });
             }
         };
-        let requests = spawn_server_datagram_flow_worker(
-            flow_id,
-            outbound_socket,
-            commands.clone(),
-            context.mux_limits,
-        );
-        self.flows.push(ServerDatagramFlow {
-            flow_id,
-            requests,
-            _realtime_registration: realtime_registration,
-        });
+        self.flows.push(flow);
         Ok(ServerTcpDatagramEffect::None)
     }
 
@@ -99,26 +85,29 @@ impl ServerTcpDatagramState {
         if ttl_ms == 0 {
             return Err(RuntimeError::Protocol("expired TCP datagram received"));
         }
-        let requests = self
+        let flow = self
             .flows
             .iter()
-            .find(|flow| flow.flow_id == flow_id)
-            .map(|flow| flow.requests.clone())
+            .find(|flow| flow.flow_id() == flow_id)
             .ok_or(RuntimeError::Protocol("unknown TCP datagram flow"))?;
-        let effect = match requests.try_send(ServerDatagramRequest {
+        let effect = match flow.try_send(ServerDatagramRequest {
             datagram_id,
             ttl_ms,
             payload,
         }) {
-            Ok(()) => ServerTcpDatagramEffect::Reply(Frame::DatagramFeedback {
-                flow_id,
-                received: vec![datagram_ack_range(datagram_id)?],
-            }),
-            Err(mpsc::error::TrySendError::Full(_)) => {
+            ServerDatagramSendOutcome::Accepted => {
+                let received = datagram_ack_range(datagram_id)
+                    .ok_or(RuntimeError::Protocol("datagram ACK range overflow"))?;
+                ServerTcpDatagramEffect::Reply(Frame::DatagramFeedback {
+                    flow_id,
+                    received: vec![received],
+                })
+            }
+            ServerDatagramSendOutcome::Full => {
                 eprintln!("warning: TCP datagram worker queue full; dropping request");
                 ServerTcpDatagramEffect::None
             }
-            Err(mpsc::error::TrySendError::Closed(_)) => {
+            ServerDatagramSendOutcome::Closed => {
                 self.remove(flow_id);
                 ServerTcpDatagramEffect::Reply(Frame::DatagramClose { flow_id })
             }
@@ -127,6 +116,6 @@ impl ServerTcpDatagramState {
     }
 
     pub(super) fn remove(&mut self, flow_id: DatagramFlowId) {
-        self.flows.retain(|flow| flow.flow_id != flow_id);
+        self.flows.retain(|flow| flow.flow_id() != flow_id);
     }
 }

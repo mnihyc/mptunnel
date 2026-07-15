@@ -3,8 +3,9 @@
 use crate::config::{
     ManagementConfig, MppPerformanceConfig, ResourceLimits, RouteTarget, SecurityConfig,
 };
-use crate::outbound::{DnsConfig, OutboundConfig};
+use crate::outbound::{self, DnsConfig, OutboundConfig, TargetProtocol};
 use crate::protocol::UnderlayProtocol;
+use crate::runtime::datagram::ServerDatagramService;
 use crate::runtime::error::RuntimeError;
 use crate::runtime::management::spawn_server_management_services;
 use crate::runtime::path::ServerPathContext;
@@ -103,18 +104,31 @@ pub(super) fn new_identity_runtime_with_metadata(
         performance,
         mux_limits,
     );
-    let reliable_stream_port = reliable_streams.path_port();
+    let stream_target_outbound = outbound.clone();
+    let reliable_stream_port =
+        reliable_streams
+            .path_port()
+            .with_target_admission(Arc::new(move |target| {
+                outbound::validate_target(target)?;
+                stream_target_outbound.ensure_supports(TargetProtocol::Tcp)?;
+                Ok(())
+            }));
+    let datagram_port = ServerDatagramService::path_port(
+        outbound,
+        outbound_dns,
+        outbound_connect_timeout,
+        mux_limits,
+        reliable_stream_port.clone(),
+    );
     let paths = ServerPathContext {
         tag,
         route_target,
         server_paths: Arc::new(server_paths),
-        outbound,
-        outbound_dns,
-        outbound_connect_timeout,
         codec_limits: resources.into(),
         mux_limits,
         security,
         reliable_streams: reliable_stream_port,
+        datagrams: datagram_port,
         path_join_replay: Arc::new(Mutex::new(RecentIdCache::new(
             path_join_replay_cache_capacity(resources.max_streams),
         ))),

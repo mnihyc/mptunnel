@@ -1,5 +1,5 @@
 use crate::protocol::frame::{
-    normalized_offset_ranges, reliable_path_frame_pacing_bytes,
+    datagram_ack_range, normalized_offset_ranges, reliable_path_frame_pacing_bytes,
     reliable_stream_frame_accounted_bytes, reliable_stream_frame_extent,
     stream_ack_contiguous_frontier,
 };
@@ -7,6 +7,15 @@ use crate::protocol::{
     DatagramFlowId, DatagramId, Frame, OffsetRange, PathId, ResetReason, StreamFlags, StreamId,
 };
 use bytes::Bytes;
+
+#[test]
+fn datagram_ack_range_is_one_identity_and_rejects_overflow() {
+    assert_eq!(
+        datagram_ack_range(DatagramId(7)),
+        Some(OffsetRange { start: 7, end: 8 })
+    );
+    assert_eq!(datagram_ack_range(DatagramId(u64::MAX)), None);
+}
 
 #[test]
 fn offset_range_normalization_sorts_filters_and_merges_adjacency() {

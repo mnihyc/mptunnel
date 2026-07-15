@@ -14,6 +14,7 @@ use crate::protocol::{
 };
 use crate::runtime::error::RuntimeError;
 use crate::scheduler::{FlowLane, PathSnapshot};
+use bytes::Bytes;
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
@@ -59,6 +60,154 @@ impl ServerRealtimeFlowLease {
         Self {
             _guard: Box::new(guard),
         }
+    }
+}
+
+/// One target-bound datagram handed from a carrier to the product worker.
+pub(in crate::runtime) struct ServerDatagramRequest {
+    pub(in crate::runtime) datagram_id: crate::protocol::DatagramId,
+    pub(in crate::runtime) ttl_ms: u32,
+    pub(in crate::runtime) payload: Bytes,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(in crate::runtime) enum ServerDatagramSendOutcome {
+    Accepted,
+    Full,
+    Closed,
+}
+
+/// Accepted target worker plus the higher-layer accounting it keeps alive.
+pub(in crate::runtime) struct AcceptedServerDatagramFlow {
+    flow_id: crate::protocol::DatagramFlowId,
+    requests: mpsc::Sender<ServerDatagramRequest>,
+    _realtime_registration: ServerRealtimeFlowLease,
+}
+
+impl AcceptedServerDatagramFlow {
+    pub(in crate::runtime) fn holding(
+        flow_id: crate::protocol::DatagramFlowId,
+        requests: mpsc::Sender<ServerDatagramRequest>,
+        realtime_registration: ServerRealtimeFlowLease,
+    ) -> Self {
+        Self {
+            flow_id,
+            requests,
+            _realtime_registration: realtime_registration,
+        }
+    }
+
+    pub(in crate::runtime) fn flow_id(&self) -> crate::protocol::DatagramFlowId {
+        self.flow_id
+    }
+
+    pub(in crate::runtime) fn try_send(
+        &self,
+        request: ServerDatagramRequest,
+    ) -> ServerDatagramSendOutcome {
+        match self.requests.try_send(request) {
+            Ok(()) => ServerDatagramSendOutcome::Accepted,
+            Err(mpsc::error::TrySendError::Full(_)) => ServerDatagramSendOutcome::Full,
+            Err(mpsc::error::TrySendError::Closed(_)) => ServerDatagramSendOutcome::Closed,
+        }
+    }
+}
+
+impl std::fmt::Debug for AcceptedServerDatagramFlow {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("AcceptedServerDatagramFlow")
+            .field("flow_id", &self.flow_id)
+            .finish_non_exhaustive()
+    }
+}
+
+/// Target-open failure plus any registered flow accounting awaiting close.
+pub(in crate::runtime) struct ServerDatagramOpenError {
+    error: RuntimeError,
+    _realtime_registration: Option<ServerRealtimeFlowLease>,
+}
+
+impl ServerDatagramOpenError {
+    pub(in crate::runtime) fn new(error: RuntimeError) -> Self {
+        Self {
+            error,
+            _realtime_registration: None,
+        }
+    }
+
+    pub(in crate::runtime) fn holding(
+        error: RuntimeError,
+        realtime_registration: ServerRealtimeFlowLease,
+    ) -> Self {
+        Self {
+            error,
+            _realtime_registration: Some(realtime_registration),
+        }
+    }
+
+    pub(in crate::runtime) fn into_error(self) -> RuntimeError {
+        self.error
+    }
+
+    /// A registered flow must publish its close before releasing accounting.
+    pub(in crate::runtime) fn requires_close(&self) -> bool {
+        self._realtime_registration.is_some()
+    }
+}
+
+impl std::fmt::Debug for ServerDatagramOpenError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("ServerDatagramOpenError")
+            .field("error", &self.error)
+            .finish_non_exhaustive()
+    }
+}
+
+pub(in crate::runtime) struct ServerDatagramOpenRequest {
+    pub(in crate::runtime) session_id: SessionId,
+    pub(in crate::runtime) flow_id: crate::protocol::DatagramFlowId,
+    pub(in crate::runtime) target: TargetAddr,
+    pub(in crate::runtime) commands: ReliablePathCommandSender,
+}
+
+type ServerDatagramPortFuture<'a> = Pin<
+    Box<
+        dyn Future<Output = Result<AcceptedServerDatagramFlow, ServerDatagramOpenError>>
+            + Send
+            + 'a,
+    >,
+>;
+
+/// Target-side datagram service implemented above TCP and QUIC carriers.
+pub(in crate::runtime) trait ServerDatagramPortBackend: Send + Sync {
+    fn open<'a>(&'a self, request: ServerDatagramOpenRequest) -> ServerDatagramPortFuture<'a>;
+}
+
+#[derive(Clone)]
+pub(in crate::runtime) struct ServerDatagramPort {
+    backend: Arc<dyn ServerDatagramPortBackend>,
+}
+
+impl ServerDatagramPort {
+    pub(in crate::runtime) fn new(backend: Arc<dyn ServerDatagramPortBackend>) -> Self {
+        Self { backend }
+    }
+
+    pub(in crate::runtime) async fn open(
+        &self,
+        request: ServerDatagramOpenRequest,
+    ) -> Result<AcceptedServerDatagramFlow, ServerDatagramOpenError> {
+        self.backend.open(request).await
+    }
+}
+
+impl std::fmt::Debug for ServerDatagramPort {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("ServerDatagramPort")
+            .finish_non_exhaustive()
     }
 }
 
@@ -231,7 +380,11 @@ pub(in crate::runtime) trait ServerStreamPortBackend: Send + Sync {
 pub(in crate::runtime) struct ServerStreamPort {
     backend: Arc<dyn ServerStreamPortBackend>,
     owner_token: usize,
+    target_admission: Arc<ServerStreamTargetAdmission>,
 }
+
+pub(in crate::runtime) type ServerStreamTargetAdmission =
+    dyn Fn(&TargetAddr) -> Result<(), RuntimeError> + Send + Sync;
 
 impl std::fmt::Debug for ServerStreamPort {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -247,7 +400,24 @@ impl ServerStreamPort {
         Self {
             backend,
             owner_token,
+            target_admission: Arc::new(|_| Ok(())),
         }
+    }
+
+    /// Installs composition-owned target policy without exposing it to carriers.
+    pub(in crate::runtime) fn with_target_admission(
+        mut self,
+        target_admission: Arc<ServerStreamTargetAdmission>,
+    ) -> Self {
+        self.target_admission = target_admission;
+        self
+    }
+
+    pub(in crate::runtime) fn validate_target(
+        &self,
+        target: &TargetAddr,
+    ) -> Result<(), RuntimeError> {
+        (self.target_admission)(target)
     }
 
     pub(in crate::runtime) fn register_carrier_path(

@@ -12,11 +12,11 @@ use crate::model::timing::default_transport_pto;
 use crate::mux::datagram::DatagramError;
 use crate::protocol::{RateHint, TargetAddr};
 use crate::runtime::error::RuntimeError;
-use crate::runtime::path::ClientPathContext;
 use crate::runtime::path::model::{
     UdpDatagramPathObservation, UdpPathRuntimeModel, path_is_endpoint_only,
     udp_observation_has_datagram_feedback,
 };
+use crate::runtime::path::{ClientPathContext, UdpPathCandidate};
 use crate::scheduler::{PathSnapshot, path_within_adaptive_lead_hysteresis};
 use bytes::Bytes;
 use std::collections::{HashMap, HashSet};
@@ -30,12 +30,6 @@ pub(in crate::runtime) struct UdpDatagramClientAssociation {
     pub(in crate::runtime) paths: Vec<UdpDatagramAssociationPath>,
     pub(in crate::runtime) suppressed_paths: HashMap<usize, Instant>,
     pub(in crate::runtime) last_successful_path: Option<usize>,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq)]
-pub(in crate::runtime) struct UdpPathCandidate {
-    pub(in crate::runtime) path_index: usize,
-    pub(in crate::runtime) eta_ms: f64,
 }
 
 #[derive(Debug, Clone, Copy)]

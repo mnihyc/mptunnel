@@ -19,6 +19,13 @@ use crate::scheduler::{
 use crate::transport::PathSpec;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
+/// Ranked UDP path value shared with the product datagram association.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub(in crate::runtime) struct UdpPathCandidate {
+    pub(in crate::runtime) path_index: usize,
+    pub(in crate::runtime) eta_ms: f64,
+}
+
 #[derive(Debug, Clone, Copy)]
 pub(in crate::runtime) struct UdpPathRuntimeModel {
     pub(in crate::runtime) pacing_rate_bps: f64,

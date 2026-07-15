@@ -87,12 +87,17 @@ wrappers that merely pass the same state between them.
 - `src/runtime/path/commands.rs`: owns bounded, lane-separated transfer to
   carrier writers. Queue accounting must balance on enqueue, dequeue,
   cancellation, and receiver drop.
+- `src/runtime/datagram/`: owns product datagram associations, outbound UDP
+  admission and connections, and target worker lifetime. Carrier actors retain
+  only accepted flow handles obtained through `ServerDatagramPort`.
 - `src/runtime/path/tcp/` and `src/runtime/path/quic/`: own independent carrier
   actors, I/O, telemetry, recovery, and native capacity evidence. Kernel TCP and
   Quinn remain their respective congestion and retransmission authorities.
   Their `capacity.rs` owners contain the complete request reservation, proof,
   rollback, and carrier-specific handoff lifecycle; TCP stays path-parallel,
-  while QUIC serializes one native measurement epoch per session.
+  while QUIC serializes one native measurement epoch per session. Server target
+  work enters through typed stream/datagram ports; carriers do not own outbound
+  policy, target sockets, or target worker tasks.
 - `src/runtime/stream/{handle,registry}.rs`: own carrier-neutral stream handles,
   server stream lookup, exact carrier-instance attachment, and binding lifetime.
 - `src/model/` and `src/scheduler/`: own carrier-neutral evidence vocabulary,

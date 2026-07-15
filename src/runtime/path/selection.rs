@@ -12,10 +12,9 @@ use crate::model::admission::{
 use crate::model::capacity::{PATH_OPEN_SCORE_BYTES, relay_lane_startup_chunk_bytes};
 use crate::model::path::{RelayPathKey, RelayPathProofEpoch};
 use crate::protocol::{PathMetricDirection, PathMetrics, RateHint, UnderlayProtocol};
-use crate::runtime::datagram::UdpPathCandidate;
 use crate::runtime::path::health::ClientPathHealthRecord;
 use crate::runtime::path::model::{
-    ClientPathObservation, UdpPathRuntimeModel, apply_bulk_latency_isolation,
+    ClientPathObservation, UdpPathCandidate, UdpPathRuntimeModel, apply_bulk_latency_isolation,
     bulk_candidate_has_bulk_rate_evidence, bulk_candidate_has_fresh_native_carrier_rate_evidence,
     bulk_path_candidate, carrier_diverse_bulk_validation_order, configured_order_path_indices,
     configured_order_path_scores, endpoint_only_reliable_startup_should_preserve_configured_order,

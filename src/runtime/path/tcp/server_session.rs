@@ -629,15 +629,10 @@ impl ServerTcpPathSession {
                     Ok(ServerTcpFrameDisposition::Stop)
                 }
             }
-            ServerTcpDatagramEffect::ReplyThenError {
-                frame,
-                error,
-                registration,
-            } => {
+            ServerTcpDatagramEffect::ReplyThenError { frame, failure } => {
                 let wrote = self.writer.write_frame(&frame).await?;
-                drop(registration);
                 if wrote {
-                    Err(error)
+                    Err(failure.into_error())
                 } else {
                     Ok(ServerTcpFrameDisposition::Stop)
                 }

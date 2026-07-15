@@ -6,12 +6,8 @@ use super::io::{
 };
 #[cfg(feature = "lab-diagnostics")]
 use crate::lab_diagnostics::lab_diagnostic;
-use crate::outbound::{self, TargetProtocol};
+use crate::protocol::frame::datagram_ack_range;
 use crate::protocol::{DatagramFlowId, Frame, SessionId, TargetAddr};
-use crate::runtime::datagram::{
-    ServerDatagramFlow, ServerDatagramRequest, datagram_ack_range,
-    spawn_server_datagram_flow_worker,
-};
 use crate::runtime::error::RuntimeError;
 use crate::runtime::path::commands::{
     ReliablePathCommand, ReliablePathCommandReceivers, ReliablePathCommandSender,
@@ -22,16 +18,17 @@ use crate::runtime::path::commands::{
     try_coalesce_reliable_path_writer_run, try_recv_reliable_path_command,
 };
 use crate::runtime::path::server_context::ServerPathContext;
-use crate::scheduler::FlowLane;
+use crate::runtime::path::{
+    AcceptedServerDatagramFlow, ServerDatagramOpenRequest, ServerDatagramRequest,
+    ServerDatagramSendOutcome,
+};
 #[cfg(feature = "lab-diagnostics")]
 use std::time::Instant;
-use tokio::sync::mpsc;
 
 pub(super) struct ServerUdpDatagramStreamContext {
     pub(super) session_id: SessionId,
     pub(super) flow_id: DatagramFlowId,
     pub(super) target: TargetAddr,
-    pub(super) lane: FlowLane,
 }
 
 pub(super) async fn handle_server_udp_datagram_stream(
@@ -50,7 +47,7 @@ pub(super) async fn handle_server_udp_datagram_stream(
         context.codec_limits,
         udp_path_command_queue(context.mux_limits, context.codec_limits),
     );
-    let mut flows = Vec::<ServerDatagramFlow>::new();
+    let mut flows = Vec::<AcceptedServerDatagramFlow>::new();
     let mut pending_frames = Vec::<Frame>::new();
     open_server_udp_datagram_flow(
         &context,
@@ -60,7 +57,6 @@ pub(super) async fn handle_server_udp_datagram_stream(
         stream_context.session_id,
         stream_context.flow_id,
         stream_context.target,
-        stream_context.lane,
     )
     .await?;
     loop {
@@ -78,7 +74,6 @@ pub(super) async fn handle_server_udp_datagram_stream(
                             stream_context.session_id,
                             flow_id,
                             target,
-                            FlowLane::RealtimeDatagram,
                         ).await?;
                     }
                     Some(Ok(Frame::DatagramData { flow_id, datagram_id, ttl_ms, payload })) => {
@@ -87,36 +82,36 @@ pub(super) async fn handle_server_udp_datagram_stream(
                         }
                         let flow_index = flows
                             .iter()
-                            .position(|flow| flow.flow_id == flow_id)
+                            .position(|flow| flow.flow_id() == flow_id)
                             .ok_or(RuntimeError::Protocol("unknown QUIC UDP path datagram flow"))?;
-                        let requests = flows
+                        let flow = flows
                             .get(flow_index)
-                            .ok_or(RuntimeError::Protocol("unknown QUIC UDP path datagram flow"))?
-                            .requests
-                            .clone();
-                        match requests.try_send(ServerDatagramRequest { datagram_id, ttl_ms, payload }) {
-                            Ok(()) => {
+                            .ok_or(RuntimeError::Protocol("unknown QUIC UDP path datagram flow"))?;
+                        match flow.try_send(ServerDatagramRequest { datagram_id, ttl_ms, payload }) {
+                            ServerDatagramSendOutcome::Accepted => {
+                                let received = datagram_ack_range(datagram_id)
+                                    .ok_or(RuntimeError::Protocol("datagram ACK range overflow"))?;
                                 udp_path_write_frame(
                                     &mut send,
                                     &Frame::DatagramFeedback {
                                         flow_id,
-                                        received: vec![datagram_ack_range(datagram_id)?],
+                                        received: vec![received],
                                     },
                                     context.codec_limits,
                                 ).await?;
                             }
-                            Err(mpsc::error::TrySendError::Full(_)) => {
+                            ServerDatagramSendOutcome::Full => {
                                 eprintln!("warning: QUIC UDP path datagram worker queue full; dropping request");
                             }
-                            Err(mpsc::error::TrySendError::Closed(_)) => {
-                                flows.retain(|flow| flow.flow_id != flow_id);
+                            ServerDatagramSendOutcome::Closed => {
+                                flows.retain(|flow| flow.flow_id() != flow_id);
                                 udp_path_write_frame(&mut send, &Frame::DatagramClose { flow_id }, context.codec_limits).await?;
                             }
                         }
                     }
                     Some(Ok(Frame::DatagramFeedback { .. })) => {}
                     Some(Ok(Frame::DatagramClose { flow_id })) => {
-                        flows.retain(|flow| flow.flow_id != flow_id);
+                        flows.retain(|flow| flow.flow_id() != flow_id);
                         if flows.is_empty() {
                             let _ = udp_path_finish_stream(&mut send);
                             return Ok(());
@@ -172,7 +167,7 @@ async fn drain_server_udp_datagram_commands(
     commands: &mut ReliablePathCommandReceivers,
     send: &mut UdpPathSendStream,
     context: &ServerPathContext,
-    flows: &mut Vec<ServerDatagramFlow>,
+    flows: &mut Vec<AcceptedServerDatagramFlow>,
     pending_frames: &mut Vec<Frame>,
 ) -> Result<bool, RuntimeError> {
     #[cfg(feature = "lab-diagnostics")]
@@ -232,7 +227,7 @@ async fn drain_server_udp_datagram_commands(
             }
             ReliablePathCommand::SendFrame(frame) => {
                 if let Frame::DatagramClose { flow_id } = frame {
-                    flows.retain(|flow| flow.flow_id != flow_id);
+                    flows.retain(|flow| flow.flow_id() != flow_id);
                 }
                 pending_frames.push(frame);
                 commands.release_pending_command_bytes(pending_bytes);
@@ -340,13 +335,12 @@ async fn open_server_udp_datagram_flow(
     context: &ServerPathContext,
     commands_tx: &ReliablePathCommandSender,
     send: &mut UdpPathSendStream,
-    flows: &mut Vec<ServerDatagramFlow>,
+    flows: &mut Vec<AcceptedServerDatagramFlow>,
     session_id: SessionId,
     flow_id: DatagramFlowId,
     target: TargetAddr,
-    _lane: FlowLane,
 ) -> Result<(), RuntimeError> {
-    if flows.iter().any(|flow| flow.flow_id == flow_id) {
+    if flows.iter().any(|flow| flow.flow_id() == flow_id) {
         return Err(RuntimeError::Protocol(
             "duplicate QUIC UDP path datagram flow",
         ));
@@ -360,38 +354,28 @@ async fn open_server_udp_datagram_flow(
         .await?;
         return Ok(());
     }
-    outbound::validate_target(&target)?;
-    context.outbound.ensure_supports(TargetProtocol::Udp)?;
-    let realtime_registration = context.reliable_streams.register_realtime_flow(session_id);
-    let outbound_socket = match outbound::connect_udp(
-        &context.outbound,
-        &context.outbound_dns,
-        &target,
-        context.outbound_connect_timeout,
-    )
-    .await
+    let flow = match context
+        .datagrams
+        .open(ServerDatagramOpenRequest {
+            session_id,
+            flow_id,
+            target,
+            commands: commands_tx.clone(),
+        })
+        .await
     {
-        Ok(socket) => socket,
-        Err(err) => {
+        Ok(flow) => flow,
+        Err(failure) if !failure.requires_close() => return Err(failure.into_error()),
+        Err(failure) => {
             udp_path_write_frame(
                 send,
                 &Frame::DatagramClose { flow_id },
                 context.codec_limits,
             )
             .await?;
-            return Err(RuntimeError::OutboundConnect(err));
+            return Err(failure.into_error());
         }
     };
-    let requests = spawn_server_datagram_flow_worker(
-        flow_id,
-        outbound_socket,
-        commands_tx.clone(),
-        context.mux_limits,
-    );
-    flows.push(ServerDatagramFlow {
-        flow_id,
-        requests,
-        _realtime_registration: realtime_registration,
-    });
+    flows.push(flow);
     Ok(())
 }

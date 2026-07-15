@@ -8,7 +8,6 @@ use crate::lab_diagnostics::lab_diagnostic;
 use crate::model::capacity::{
     reliable_relay_buffer_len, reliable_stream_initial_advertised_window_bytes,
 };
-use crate::outbound::{self, TargetProtocol};
 #[cfg(feature = "lab-diagnostics")]
 use crate::protocol::frame::stream_ack_contiguous_frontier;
 use crate::protocol::{
@@ -54,8 +53,7 @@ impl ServerTcpStreamState {
         demand: StreamDemandHint,
         role: StreamOpenRole,
     ) -> Result<Option<Frame>, RuntimeError> {
-        outbound::validate_target(&target)?;
-        context.outbound.ensure_supports(TargetProtocol::Tcp)?;
+        context.reliable_streams.validate_target(&target)?;
         let lane = flow_lane_from_stream_demand_hint(demand);
         let response = match context
             .reliable_streams

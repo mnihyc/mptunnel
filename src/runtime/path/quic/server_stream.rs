@@ -13,7 +13,6 @@ use crate::model::capacity::{
     reliable_capacity_calibration_session_limit_bytes,
     reliable_stream_initial_advertised_window_bytes,
 };
-use crate::outbound::{self, TargetProtocol};
 use crate::protocol::path_capacity::CapacityReceiveTracker;
 use crate::protocol::{
     Frame, PathCapabilities, PathId, PathMetricDirection, ResetReason, SessionId, StreamId,
@@ -80,8 +79,7 @@ pub(super) async fn handle_server_udp_reliable_stream(
         lane,
         role,
     } = stream_context;
-    outbound::validate_target(&target)?;
-    context.outbound.ensure_supports(TargetProtocol::Tcp)?;
+    context.reliable_streams.validate_target(&target)?;
     let duplicate_open_target = target.clone();
     let (commands_tx, commands_rx) = reliable_path_command_channels(udp_path_command_queue(
         context.mux_limits,

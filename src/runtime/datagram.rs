@@ -6,6 +6,7 @@ use crate::model::timing::default_transport_pto;
 use crate::mux::MuxLimits;
 use crate::mux::datagram::{DatagramError, DatagramFlow};
 use crate::protocol::codec::CodecLimits;
+use crate::protocol::frame::datagram_ack_range as protocol_datagram_ack_range;
 use crate::protocol::{DatagramFlowId, DatagramId, OffsetRange, TargetAddr};
 use crate::transport::{CarrierNetworkProvider, PathSpec, SystemCarrierNetworkProvider};
 use bytes::Bytes;
@@ -21,11 +22,8 @@ mod tcp;
 mod tcp_session;
 
 pub(super) use association::{DatagramClientAssociation, datagram_underlay_candidate_keys};
-pub(super) use quic::UdpPathCandidate;
 pub(super) use quic_session::UdpDatagramClientSession;
-pub(super) use server::{
-    ServerDatagramFlow, ServerDatagramRequest, spawn_server_datagram_flow_worker,
-};
+pub(in crate::runtime) use server::ServerDatagramService;
 
 #[cfg(test)]
 pub(super) use association::{
@@ -66,11 +64,8 @@ pub(super) struct SentDatagram {
 pub(in crate::runtime) fn datagram_ack_range(
     datagram_id: DatagramId,
 ) -> Result<OffsetRange, RuntimeError> {
-    let end = datagram_id
-        .0
-        .checked_add(1)
-        .ok_or(RuntimeError::Protocol("datagram ACK range overflow"))?;
-    OffsetRange::new(datagram_id.0, end).ok_or(RuntimeError::Protocol("invalid datagram ACK range"))
+    protocol_datagram_ack_range(datagram_id)
+        .ok_or(RuntimeError::Protocol("datagram ACK range overflow"))
 }
 
 pub(super) fn datagram_id_is_in_ranges(datagram_id: DatagramId, ranges: &[OffsetRange]) -> bool {

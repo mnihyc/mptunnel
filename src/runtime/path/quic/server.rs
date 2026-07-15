@@ -16,7 +16,7 @@ use crate::runtime::error::RuntimeError;
 use crate::runtime::path::ServerCarrierPathRegistration;
 use crate::runtime::path::authentication::ServerPathAuthentication;
 use crate::runtime::path::server_context::ServerPathContext;
-use crate::scheduler::{FlowLane, flow_lane_from_stream_demand_hint};
+use crate::scheduler::flow_lane_from_stream_demand_hint;
 use crate::transport::PathSpec;
 
 pub(in crate::runtime) async fn bind_server_udp_endpoint(
@@ -200,7 +200,6 @@ async fn handle_server_udp_bidi_stream(
                     session_id,
                     flow_id,
                     target,
-                    lane: FlowLane::RealtimeDatagram,
                 },
             )
             .await

@@ -3,7 +3,13 @@
 //! These operations belong to the wire model because their answers depend
 //! only on protocol fields, not on carrier state or scheduling policy.
 
-use crate::protocol::{Frame, OffsetRange};
+use crate::protocol::{DatagramId, Frame, OffsetRange};
+
+/// Maps one datagram identity to its single-item acknowledgement range.
+pub(crate) fn datagram_ack_range(datagram_id: DatagramId) -> Option<OffsetRange> {
+    let end = datagram_id.0.checked_add(1)?;
+    OffsetRange::new(datagram_id.0, end)
+}
 
 /// Canonicalizes byte evidence for ledger and ACK operations.
 ///

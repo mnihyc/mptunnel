@@ -2,17 +2,15 @@
 
 use crate::config::{RouteTarget, SecurityConfig};
 use crate::mux::MuxLimits;
-use crate::outbound::{DnsConfig, OutboundConfig};
 use crate::protocol::codec::CodecLimits;
 use crate::protocol::{
     AuthNonce, PathId, PathMetricDirection, PathMetrics, SessionId, UnderlayProtocol,
 };
-use crate::runtime::path::ServerStreamPort;
 use crate::runtime::path::model::path_startup_metrics;
+use crate::runtime::path::{ServerDatagramPort, ServerStreamPort};
 use crate::runtime::recent_ids::RecentIdCache;
 use crate::transport::PathSpec;
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
 
 /// Immutable server policy plus registries shared by every carrier listener.
 #[derive(Debug, Clone)]
@@ -20,13 +18,11 @@ pub(in crate::runtime) struct ServerPathContext {
     pub(in crate::runtime) tag: Option<String>,
     pub(in crate::runtime) route_target: Option<RouteTarget>,
     pub(in crate::runtime) server_paths: Arc<Vec<PathSpec>>,
-    pub(in crate::runtime) outbound: OutboundConfig,
-    pub(in crate::runtime) outbound_dns: DnsConfig,
-    pub(in crate::runtime) outbound_connect_timeout: Duration,
     pub(in crate::runtime) codec_limits: CodecLimits,
     pub(in crate::runtime) mux_limits: MuxLimits,
     pub(in crate::runtime) security: SecurityConfig,
     pub(in crate::runtime) reliable_streams: ServerStreamPort,
+    pub(in crate::runtime) datagrams: ServerDatagramPort,
     pub(in crate::runtime) path_join_replay: Arc<Mutex<RecentIdCache<PathJoinReplayKey>>>,
     pub(in crate::runtime) max_udp_flows_per_session: usize,
 }

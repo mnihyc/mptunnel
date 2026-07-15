@@ -293,7 +293,7 @@ async fn stale_service_plan_cannot_enqueue_owner_data_after_repair_role_change()
     };
 
     assert!(matches!(
-        emit_planned_response_data_frame(&stream, plan, frame, FlowLane::Throughput).await,
+        emit_planned_response_data_frame(&stream, plan, frame, FlowLane::Throughput),
         Err(RuntimeError::SenderServiceBlocked)
     ));
     assert!(
@@ -370,7 +370,6 @@ async fn passive_attach_preserves_one_bounded_exact_service_plan() {
     };
     let outcome =
         emit_planned_response_data_frame(&stream, plan, frame.clone(), FlowLane::Throughput)
-            .await
             .expect("passive growth does not revoke the exact live Service quantum");
     assert_eq!(outcome.selected_path, Some(service));
     assert!(matches!(
@@ -431,7 +430,6 @@ async fn quic_probe_path_does_not_receive_product_duplicate_data() {
 
     let outcome =
         emit_planned_response_data_frame(&stream, plan, frame.clone(), FlowLane::Throughput)
-            .await
             .expect("primary data should emit");
 
     assert_eq!(
@@ -508,7 +506,6 @@ async fn response_owner_data_keeps_fifo_order_across_lane_changes() {
         },
         FlowLane::Throughput,
     )
-    .await
     .expect("bulk owner data should enqueue");
     emit_planned_response_data_frame(
         &stream,
@@ -521,7 +518,6 @@ async fn response_owner_data_keeps_fifo_order_across_lane_changes() {
         },
         FlowLane::Latency,
     )
-    .await
     .expect("latency owner data should enqueue");
 
     assert!(matches!(
@@ -694,7 +690,6 @@ async fn one_flow_response_bounds_app_limited_sampling_before_service_resumes() 
             payload: Bytes::from(vec![9_u8; payload_bytes]),
         };
         let outcome = emit_planned_response_data_frame(&stream, plan, frame, FlowLane::Throughput)
-            .await
             .expect("bounded startup Subflow OwnerData should emit");
         assert_eq!(outcome.selected_path, Some(optional));
         assert!(try_recv_reliable_path_command(&mut optional_rx).is_some());
@@ -718,7 +713,6 @@ async fn one_flow_response_bounds_app_limited_sampling_before_service_resumes() 
         payload: Bytes::from(vec![7_u8; payload_bytes]),
     };
     let outcome = emit_planned_response_data_frame(&stream, plan, frame, FlowLane::Throughput)
-        .await
         .expect("Service OwnerData should emit after bounded sampling");
     assert_eq!(outcome.selected_path, Some(service));
     assert!(try_recv_reliable_path_command(&mut active_rx).is_some());
@@ -767,9 +761,9 @@ async fn blocked_path_queue_rolls_back_unemitted_startup_credit() {
         .find(|target| target.observation.key == candidate)
         .expect("candidate output is attached");
     let (planner_generation, _) = binding.subflow_state_snapshot();
-    let commit = ResponseSubflowAdmissionCommit {
-        planner_generation,
-        lane_generation: binding.lane_generation(),
+    let request = ResponseSubflowAdmissionRequest {
+        expected_planner_generation: planner_generation,
+        expected_lane_generation: binding.lane_generation(),
         service,
         startup_owner_credit_bytes: payload_bytes,
         optional_overhead_budget_bytes: 0,
@@ -811,13 +805,12 @@ async fn blocked_path_queue_rolls_back_unemitted_startup_credit() {
             primary: ResponseDataDispatchTarget::Switchable {
                 binding: binding.clone(),
                 target: target.clone().into(),
-                intent: ResponseDataDispatchIntent::NewSubflow(commit),
+                intent: ResponseDataDispatchIntent::SubflowAdmission(request),
             },
         },
         frame.clone(),
         FlowLane::Throughput,
-    )
-    .await;
+    );
     assert!(matches!(blocked, Err(RuntimeError::SenderServiceBlocked)));
     assert!(try_recv_reliable_path_command(&mut candidate_rx).is_some());
 
@@ -827,13 +820,12 @@ async fn blocked_path_queue_rolls_back_unemitted_startup_credit() {
             primary: ResponseDataDispatchTarget::Switchable {
                 binding,
                 target: target.into(),
-                intent: ResponseDataDispatchIntent::NewSubflow(commit),
+                intent: ResponseDataDispatchIntent::SubflowAdmission(request),
             },
         },
         frame,
         FlowLane::Throughput,
     )
-    .await
     .expect("the rolled-back startup quantum remains admissible");
     assert_eq!(emitted.selected_path, Some(candidate));
 }
@@ -897,9 +889,9 @@ async fn stale_passive_topology_plan_blocks_subflow_reservation_and_enqueue() {
         owner_bytes: payload_bytes,
         optional_overhead_bytes: 0,
     };
-    let stale_commit = ResponseSubflowAdmissionCommit {
-        planner_generation: stale_planner_generation,
-        lane_generation,
+    let stale_request = ResponseSubflowAdmissionRequest {
+        expected_planner_generation: stale_planner_generation,
+        expected_lane_generation: lane_generation,
         service,
         startup_owner_credit_bytes: payload_bytes,
         optional_overhead_budget_bytes: 0,
@@ -943,13 +935,12 @@ async fn stale_passive_topology_plan_blocks_subflow_reservation_and_enqueue() {
             primary: ResponseDataDispatchTarget::Switchable {
                 binding: binding.clone(),
                 target: target.clone().into(),
-                intent: ResponseDataDispatchIntent::NewSubflow(stale_commit),
+                intent: ResponseDataDispatchIntent::SubflowAdmission(stale_request),
             },
         },
         frame.clone(),
         FlowLane::Throughput,
-    )
-    .await;
+    );
     assert!(matches!(stale, Err(RuntimeError::SenderServiceBlocked)));
     assert!(
         try_recv_reliable_path_command(&mut candidate_rx).is_none(),
@@ -962,16 +953,17 @@ async fn stale_passive_topology_plan_blocks_subflow_reservation_and_enqueue() {
             primary: ResponseDataDispatchTarget::Switchable {
                 binding,
                 target: target.into(),
-                intent: ResponseDataDispatchIntent::NewSubflow(ResponseSubflowAdmissionCommit {
-                    planner_generation: fresh_planner_generation,
-                    ..stale_commit
-                }),
+                intent: ResponseDataDispatchIntent::SubflowAdmission(
+                    ResponseSubflowAdmissionRequest {
+                        expected_planner_generation: fresh_planner_generation,
+                        ..stale_request
+                    },
+                ),
             },
         },
         frame,
         FlowLane::Throughput,
     )
-    .await
     .expect("fresh generation may reserve and enqueue the startup quantum");
     assert_eq!(fresh.selected_path, Some(candidate));
     assert!(matches!(
@@ -1084,7 +1076,6 @@ async fn quic_ack_data_path_does_not_own_range_under_lower_owner_debt() {
     };
     let outcome =
         emit_planned_response_data_frame(&stream, plan, service_frame, FlowLane::Throughput)
-            .await
             .expect("service owner data should emit");
 
     assert_eq!(outcome.selected_path, Some(active_key));

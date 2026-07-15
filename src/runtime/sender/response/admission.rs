@@ -1,8 +1,8 @@
 //! Response OwnerData admission and byte-credit policy.
 //!
 //! Admission decides whether one immutable carrier snapshot may own new
-//! product offsets and returns the exact Subflow commit needed to make that
-//! decision authoritative. The same owner bounds emitted bytes: an admitted
+//! product offsets and returns the exact Subflow selection that may be stamped
+//! by the lifecycle owner. The same owner bounds emitted bytes: an admitted
 //! path without a product-flight envelope is not a complete protocol state.
 //! Ranking and mutable stream commits remain outside this module.
 
@@ -31,9 +31,7 @@ use crate::scheduler::{FlowLane, PathSnapshot};
 use std::time::Duration;
 
 #[derive(Clone, Copy)]
-pub(super) struct ResponseSubflowAdmissionCommit {
-    pub(super) planner_generation: u64,
-    pub(super) lane_generation: u64,
+pub(super) struct ResponseSubflowAdmissionSelection {
     pub(super) service: CarrierPathKey,
     pub(super) startup_owner_credit_bytes: usize,
     pub(super) optional_overhead_budget_bytes: usize,
@@ -43,7 +41,7 @@ pub(super) struct ResponseSubflowAdmissionCommit {
 
 pub(super) struct ResponseOwnerAdmission {
     admission: PathAdmission,
-    subflow_set_commit: Option<ResponseSubflowAdmissionCommit>,
+    subflow_admission_selection: Option<ResponseSubflowAdmissionSelection>,
     bulk_role: BulkAdmissionRole,
     model_suppression: Option<&'static str>,
 }
@@ -53,13 +51,13 @@ impl ResponseOwnerAdmission {
         self,
     ) -> (
         PathAdmission,
-        Option<ResponseSubflowAdmissionCommit>,
+        Option<ResponseSubflowAdmissionSelection>,
         BulkAdmissionRole,
         Option<&'static str>,
     ) {
         (
             self.admission,
-            self.subflow_set_commit,
+            self.subflow_admission_selection,
             self.bulk_role,
             self.model_suppression,
         )
@@ -344,12 +342,13 @@ pub(super) fn response_target_unique_owner_admission_with_epoch(
         lower_owner,
         effective_ordering_debt,
     );
-    let result = |admission, subflow_set_commit, model_suppression| ResponseOwnerAdmission {
-        admission,
-        subflow_set_commit,
-        bulk_role: role,
-        model_suppression,
-    };
+    let result =
+        |admission, subflow_admission_selection, model_suppression| ResponseOwnerAdmission {
+            admission,
+            subflow_admission_selection,
+            bulk_role: role,
+            model_suppression,
+        };
     let direct_result = |admission: PathAdmission| {
         let owns_unique_data = matches!(
             admission.decision,
@@ -528,10 +527,8 @@ pub(super) fn response_target_unique_owner_admission_with_epoch(
             )
         });
     let admission = epoch.admit_subflow_owner(input);
-    let commit = (admission.decision == PathAdmissionDecision::AdmitSubflow).then_some(
-        ResponseSubflowAdmissionCommit {
-            planner_generation: 0,
-            lane_generation: 0,
+    let selection = (admission.decision == PathAdmissionDecision::AdmitSubflow).then_some(
+        ResponseSubflowAdmissionSelection {
             service: service_key,
             startup_owner_credit_bytes,
             optional_overhead_budget_bytes: 0,
@@ -541,7 +538,7 @@ pub(super) fn response_target_unique_owner_admission_with_epoch(
     );
     result(
         admission,
-        commit,
+        selection,
         if startup_owner_allowed {
             None
         } else {

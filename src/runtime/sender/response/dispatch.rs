@@ -3,8 +3,10 @@
 //! This module never ranks paths. It resolves a planned identity, asks the
 //! binding to revalidate and commit, and enqueues one carrier command.
 
-use super::multipath::{ResponseDataDispatchPlan, ResponseDataDispatchTarget};
-use super::planner::{ResponseDataDispatchIntent, choose_response_sender_target};
+use super::multipath::{
+    ResponseDataDispatchIntent, ResponseDataDispatchPlan, ResponseDataDispatchTarget,
+};
+use super::planner::choose_response_sender_target;
 #[cfg(test)]
 use super::*;
 use crate::model::multipath::PathRuntimeRole;
@@ -15,8 +17,7 @@ use crate::runtime::RuntimeError;
 use crate::runtime::path::commands::reliable_path_stream_ordered_queue_lane;
 use crate::runtime::sender::{CarrierEmitMode, RelaySendCause};
 use crate::runtime::stream::response::{
-    ResponseAckClockCalibrationRequest, ResponseDispatchTarget, ResponseOwnerEnqueueAdmission,
-    ResponseServiceHandoffRequest, ResponseSubflowAdmissionRequest, record_server_sender_decision,
+    ResponseDispatchTarget, ResponseOwnerEnqueueAdmission, record_server_sender_decision,
 };
 use crate::runtime::stream::{ReliablePathStream, ReliablePathStreamOutput};
 use crate::scheduler::FlowLane;
@@ -118,70 +119,26 @@ pub(super) fn emit_planned_response_data_frame(
                         lane,
                         ResponseOwnerEnqueueAdmission::Service,
                     ),
-                ResponseDataDispatchIntent::ExistingSubflow => binding
+                ResponseDataDispatchIntent::SubflowAdmission(request) => binding
                     .try_enqueue_owner_frame_for_dispatch_target(
                         &target,
                         &frame,
                         lane,
-                        ResponseOwnerEnqueueAdmission::ExistingSubflow,
+                        ResponseOwnerEnqueueAdmission::SubflowAdmission(request),
                     ),
-                ResponseDataDispatchIntent::NewSubflow(commit) => {
-                    let request = ResponseSubflowAdmissionRequest {
-                        expected_planner_generation: commit.planner_generation,
-                        expected_lane_generation: commit.lane_generation,
-                        service: commit.service,
-                        startup_owner_credit_bytes: commit.startup_owner_credit_bytes,
-                        optional_overhead_budget_bytes: commit.optional_overhead_budget_bytes,
-                        max_read_gap_budget: commit.max_read_gap_budget,
-                        input: commit.input,
-                    };
-                    binding.try_enqueue_owner_frame_for_dispatch_target(
-                        &target,
-                        &frame,
-                        lane,
-                        ResponseOwnerEnqueueAdmission::NewSubflow(request),
-                    )
-                }
-                ResponseDataDispatchIntent::AckClockCalibration(commit) => {
-                    let request = ResponseAckClockCalibrationRequest {
-                        expected_planner_generation: commit.planner_generation,
-                        expected_lane_generation: commit.lane_generation,
-                        expected_model_generation: commit.model_generation,
-                        service: commit.service,
-                        service_incarnation: commit.service_incarnation,
-                        service_pending_bytes: commit.service_pending_bytes,
-                        target_pending_bytes: commit.target_pending_bytes,
-                        limit_bytes: commit.limit_bytes,
-                        requires_active_response_start: commit.requires_active_response_start,
-                    };
-                    binding.try_enqueue_owner_frame_for_dispatch_target(
+                ResponseDataDispatchIntent::AckClockCalibration(request) => binding
+                    .try_enqueue_owner_frame_for_dispatch_target(
                         &target,
                         &frame,
                         lane,
                         ResponseOwnerEnqueueAdmission::AckClockCalibration(request),
-                    )
-                }
-                ResponseDataDispatchIntent::ServiceHandoff(commit) => binding
+                    ),
+                ResponseDataDispatchIntent::ServiceHandoff(handoff) => binding
                     .try_enqueue_response_service_handoff_for_dispatch(
                         &target,
                         &frame,
                         lane,
-                        ResponseServiceHandoffRequest {
-                            expected_planner_generation: commit.planner_generation,
-                            expected_lane_generation: commit.lane_generation,
-                            expected_model_generation: commit.model_generation,
-                            handoff_frontier: commit.handoff_frontier,
-                            service: commit.service,
-                            service_path_instance_id: commit.service_path_instance_id,
-                            service_incarnation: commit.service_incarnation,
-                            target: target.key,
-                            target_path_instance_id: commit.target_path_instance_id,
-                            target_incarnation: target.incarnation,
-                            mode: commit.mode,
-                            target_command_pending_limit_bytes: commit
-                                .target_command_pending_limit_bytes,
-                            capacity_proof: commit.capacity_proof,
-                        },
+                        handoff.into_request(&target),
                     )
                     .map(|()| None),
             };

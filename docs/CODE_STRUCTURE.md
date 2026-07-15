@@ -61,11 +61,12 @@ Scheduling and ownership changes use three explicit phases:
 
 1. **Observe**: the owner refreshes expiring state and creates one coherent,
    immutable snapshot. Observing must not silently reserve work.
-2. **Decide**: a pure function ranks snapshots and returns an ID-only,
-   generation-stamped intent. It takes no runtime lock and performs no I/O.
-3. **Apply**: the state owner reacquires its lock, revalidates identity,
-   generations, evidence, limits, and queue pressure, then reserves, enqueues,
-   records exact flight, and publishes one coherent result.
+2. **Decide**: a pure function ranks snapshots and returns an ID-only selection.
+   It takes no runtime lock and performs no I/O.
+3. **Apply**: the lifecycle owner combines that selection with the generations
+   observed for the planning pass. The state owner then reacquires its lock,
+   revalidates identity, generations, evidence, limits, and queue pressure,
+   reserves, enqueues, records exact flight, and publishes one coherent result.
 
 A rejected apply leaves no partial ownership. RAII guards must make cancellation,
 queue drop, timeout, and task exit reconcile reservations exactly.

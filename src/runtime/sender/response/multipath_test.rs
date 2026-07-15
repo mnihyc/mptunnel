@@ -14,6 +14,7 @@ use crate::model::multipath::*;
 use crate::model::path::*;
 use crate::model::response::*;
 use crate::mux::MuxLimits;
+use crate::protocol::frame::reliable_stream_frame_accounted_bytes;
 use crate::protocol::*;
 use crate::runtime::path::commands::*;
 use crate::runtime::sender::*;
@@ -808,11 +809,11 @@ fn measured_cross_family_path_handoff_allows_diversification_or_two_x_gain() {
         None,
     )
     .expect("measured underloaded family should receive one whole flow");
-    assert_eq!(selected.target.observation.key, udp.observation.key);
+    assert_eq!(selected.target().observation.key, udp.observation.key);
     assert_eq!(selected.admission().role, PathRuntimeRole::Service);
     assert_eq!(
         selected
-            .service_handoff_commit()
+            .service_handoff_selection()
             .map(|commit| commit.handoff_frontier),
         Some(4096)
     );
@@ -890,7 +891,7 @@ fn busy_shared_target_carrier_is_pressure_not_binding_debt() {
         None,
     )
     .expect("another binding's carrier pressure must not masquerade as this binding's debt");
-    assert_eq!(selected.target.observation.key, udp.observation.key);
+    assert_eq!(selected.target().observation.key, udp.observation.key);
 }
 
 #[test]
@@ -1044,9 +1045,9 @@ async fn response_service_handoff_drain_holds_raw_offset_until_frontier_commit()
     assert!(matches!(
         &plan.primary,
         ResponseDataDispatchTarget::Switchable {
-            intent: ResponseDataDispatchIntent::ServiceHandoff(commit),
+            intent: ResponseDataDispatchIntent::ServiceHandoff(handoff),
             ..
-        } if commit.handoff_frontier == frontier
+        } if handoff.selection.handoff_frontier == frontier
     ));
 
     let handoff_frame = Frame::StreamData {
@@ -1061,7 +1062,6 @@ async fn response_service_handoff_drain_holds_raw_offset_until_frontier_commit()
         handoff_frame,
         FlowLane::Throughput,
     )
-    .await
     .expect("the first post-drain raw payload should atomically move Service");
     assert_eq!(outcome.selected_path, Some(fixture.target));
     assert_eq!(fixture.binding.ordered_data_owner(), Some(fixture.target));
@@ -1116,9 +1116,9 @@ async fn balanced_performance_override_commits_full_handoff_transaction() {
     assert!(matches!(
         &plan.primary,
         ResponseDataDispatchTarget::Switchable {
-            intent: ResponseDataDispatchIntent::ServiceHandoff(commit),
+            intent: ResponseDataDispatchIntent::ServiceHandoff(handoff),
             ..
-        } if commit.mode == ResponseServiceHandoffMode::PerformanceOverride
+        } if handoff.selection.mode == ResponseServiceHandoffMode::PerformanceOverride
     ));
 
     let outcome = emit_planned_response_data_frame(
@@ -1127,7 +1127,6 @@ async fn balanced_performance_override_commits_full_handoff_transaction() {
         client_data_frame_for_test(fixture.stream.stream_id, frontier, payload_bytes),
         FlowLane::Throughput,
     )
-    .await
     .expect("the balanced performance override should commit atomically");
     assert_eq!(outcome.selected_path, Some(fixture.target));
     assert_eq!(fixture.binding.ordered_data_owner(), Some(fixture.target));
@@ -1177,11 +1176,11 @@ async fn handoff_commit_rejects_shared_queue_growth_beyond_ranked_credit() {
     let (target_commands, pending_limit) = match &plan.primary {
         ResponseDataDispatchTarget::Switchable {
             target,
-            intent: ResponseDataDispatchIntent::ServiceHandoff(commit),
+            intent: ResponseDataDispatchIntent::ServiceHandoff(handoff),
             ..
         } => (
             target.commands.clone(),
-            commit.target_command_pending_limit_bytes,
+            handoff.selection.target_command_pending_limit_bytes,
         ),
         _ => panic!("expected switchable handoff plan"),
     };
@@ -1199,8 +1198,7 @@ async fn handoff_commit_rejects_shared_queue_growth_beyond_ranked_credit() {
         plan,
         client_data_frame_for_test(fixture.stream.stream_id, frontier, payload_bytes),
         FlowLane::Throughput,
-    )
-    .await;
+    );
     assert!(matches!(result, Err(RuntimeError::SenderServiceBlocked)));
     assert_eq!(fixture.binding.ordered_data_owner(), Some(fixture.service));
     assert!(

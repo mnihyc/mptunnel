@@ -46,10 +46,7 @@ const RESPONSE_TCP_CAPACITY_PROBE_BYTES: u64 = 2 * 1024 * 1024;
 const RESPONSE_TCP_CAPACITY_PROBE_DEADLINE: Duration = Duration::from_secs(20);
 
 #[derive(Clone, Copy)]
-pub(super) struct ResponseAckClockCalibrationCommit {
-    pub(super) planner_generation: u64,
-    pub(super) lane_generation: u64,
-    pub(super) model_generation: u64,
+pub(super) struct ResponseAckClockCalibrationSelection {
     pub(super) service: CarrierPathKey,
     pub(super) service_incarnation: u64,
     pub(super) service_pending_bytes: u64,
@@ -59,10 +56,7 @@ pub(super) struct ResponseAckClockCalibrationCommit {
 }
 
 #[derive(Clone, Copy)]
-pub(super) struct ResponseAckClockCalibrationRetirementIntent {
-    pub(super) planner_generation: u64,
-    pub(super) lane_generation: u64,
-    pub(super) model_generation: u64,
+pub(super) struct ResponseAckClockCalibrationRetirementSelection {
     pub(super) service: CarrierPathKey,
     pub(super) service_incarnation: u64,
     pub(super) service_pending_bytes: u64,
@@ -76,7 +70,7 @@ pub(super) struct ResponseAckClockCalibrationRetirementIntent {
 #[derive(Clone)]
 pub(super) struct ResponseTcpAckClockCalibrationSelection {
     pub(super) target: ResponseSenderPathTarget,
-    pub(super) commit: ResponseAckClockCalibrationCommit,
+    pub(super) selection: ResponseAckClockCalibrationSelection,
 }
 
 pub(super) fn response_tcp_calibration_opportunity_candidate(
@@ -286,7 +280,7 @@ pub(super) fn select_response_ack_clock_calibration_target(
     lower_flights: &[CarrierPathFlightDebt],
     subflow_set: Option<&FlowSubflowSet>,
     may_start_fresh_calibration: bool,
-    retirement_intents: &mut Vec<ResponseAckClockCalibrationRetirementIntent>,
+    retirement_selections: &mut Vec<ResponseAckClockCalibrationRetirementSelection>,
 ) -> Option<ResponseTcpAckClockCalibrationSelection> {
     if !lower_flights.is_empty()
         || subflow_set
@@ -429,10 +423,7 @@ pub(super) fn select_response_ack_clock_calibration_target(
                 }
             }
             if matches!(opportunity, TcpAckClockCalibrationOpportunity::Retire(_)) {
-                retirement_intents.push(ResponseAckClockCalibrationRetirementIntent {
-                    planner_generation: 0,
-                    lane_generation: 0,
-                    model_generation: 0,
+                retirement_selections.push(ResponseAckClockCalibrationRetirementSelection {
                     service: service.observation.key,
                     service_incarnation: service.observation.incarnation,
                     service_pending_bytes: service.observation.command_pending_bytes,
@@ -474,10 +465,7 @@ pub(super) fn select_response_ack_clock_calibration_target(
         })
         .map(|target| ResponseTcpAckClockCalibrationSelection {
             target: target.clone(),
-            commit: ResponseAckClockCalibrationCommit {
-                planner_generation: 0,
-                lane_generation: 0,
-                model_generation: 0,
+            selection: ResponseAckClockCalibrationSelection {
                 service: service_key,
                 service_incarnation: service.observation.incarnation,
                 service_pending_bytes: service.observation.command_pending_bytes,

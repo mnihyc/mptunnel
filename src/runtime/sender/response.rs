@@ -1,8 +1,9 @@
 //! Response-direction sender ownership.
 //!
 //! The planner ranks captured path evidence into one selection intent. The
-//! multipath transaction maintains shared state, stamps one coherent epoch,
-//! and returns an executable plan. The service owns queued response work;
+//! multipath transaction maintains shared state, attaches planning-pass
+//! generation fences, and returns an executable plan. The service owns queued
+//! response work;
 //! dispatch alone revalidates the plan and enqueues commands.
 
 #[cfg(test)]

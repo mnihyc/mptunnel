@@ -122,8 +122,8 @@ fn endpoint_only_response_calibration_uses_service_only_as_opportunity_prior() {
     assert_eq!(selected.target.observation.key, candidate.observation.key);
     assert_eq!(
         (
-            selected.commit.limit_bytes,
-            selected.commit.requires_active_response_start,
+            selected.selection.limit_bytes,
+            selected.selection.requires_active_response_start,
         ),
         (candidate.ack_clock_calibration_credit_limit_bytes, true),
     );
@@ -262,8 +262,8 @@ fn tcp_ack_clock_calibration_rejects_seed_beyond_service_reservoir() {
         None,
     )
     .expect("Service remains available when exploration would create an ordering stall");
-    assert_eq!(selected.target.observation.key, service.observation.key);
-    assert!(selected.ack_clock_calibration_commit().is_none());
+    assert_eq!(selected.target().observation.key, service.observation.key);
+    assert!(selected.ack_clock_calibration_selection().is_none());
 }
 
 #[test]
@@ -333,9 +333,9 @@ fn tcp_ack_clock_calibration_explores_within_service_reservoir() {
         None,
     )
     .expect("bounded exploration should fit behind the Service reservoir");
-    assert_eq!(selected.target.observation.key, candidate.observation.key);
+    assert_eq!(selected.target().observation.key, candidate.observation.key);
     assert_eq!(selected.admission().role, PathRuntimeRole::Subflow);
-    assert!(selected.ack_clock_calibration_commit().is_some());
+    assert!(selected.ack_clock_calibration_selection().is_some());
 
     candidate.ack_clock_calibration_active = true;
     candidate.ack_clock_calibration_spent_bytes = initial_limit;
@@ -351,10 +351,10 @@ fn tcp_ack_clock_calibration_explores_within_service_reservoir() {
         None,
     )
     .expect("a causally authorized stage continues calibration");
-    assert_eq!(grown.target.observation.key, candidate.observation.key);
+    assert_eq!(grown.target().observation.key, candidate.observation.key);
     assert_eq!(
         grown
-            .ack_clock_calibration_commit()
+            .ack_clock_calibration_selection()
             .expect("staged calibration commit")
             .limit_bytes,
         initial_limit.saturating_mul(2)
@@ -373,10 +373,14 @@ fn tcp_ack_clock_calibration_explores_within_service_reservoir() {
     )
     .expect("a stage awaiting new ACK evidence returns to Service");
     assert_eq!(
-        awaiting_evidence.target.observation.key,
+        awaiting_evidence.target().observation.key,
         service.observation.key
     );
-    assert!(awaiting_evidence.ack_clock_calibration_commit().is_none());
+    assert!(
+        awaiting_evidence
+            .ack_clock_calibration_selection()
+            .is_none()
+    );
 }
 
 #[test]
@@ -404,8 +408,8 @@ fn safe_tcp_calibration_waits_for_repair_carrier_headroom() {
     )
     .expect("Service remains available while RepairData occupies candidate headroom");
 
-    assert_eq!(selected.target.observation.key, service.observation.key);
-    assert!(selected.ack_clock_calibration_commit().is_none());
+    assert_eq!(selected.target().observation.key, service.observation.key);
+    assert!(selected.ack_clock_calibration_selection().is_none());
 }
 
 #[test]
@@ -455,11 +459,11 @@ fn tcp_response_calibration_does_not_double_count_pending_owner_flight() {
     )
     .expect("overlapping flight and queue views count as one debt");
 
-    assert_eq!(selected.target.observation.key, candidate.observation.key);
+    assert_eq!(selected.target().observation.key, candidate.observation.key);
     assert_eq!(selected.admission().role, PathRuntimeRole::Subflow);
     assert_eq!(
         selected
-            .ack_clock_calibration_commit()
+            .ack_clock_calibration_selection()
             .expect("calibration commit")
             .limit_bytes,
         initial_limit
@@ -494,10 +498,10 @@ fn tcp_response_calibration_does_not_double_count_global_ordered_tail() {
     )
     .expect("the global tail and candidate flight are the same product debt");
 
-    assert_eq!(selected.target.observation.key, candidate.observation.key);
+    assert_eq!(selected.target().observation.key, candidate.observation.key);
     assert_eq!(
         selected
-            .ack_clock_calibration_commit()
+            .ack_clock_calibration_selection()
             .expect("calibration commit")
             .limit_bytes,
         ceiling
@@ -560,8 +564,8 @@ fn blocked_active_ack_clock_candidate_does_not_select_another_calibration_owner(
         None,
     )
     .expect("Service remains feedable while the active calibration path is blocked");
-    assert_eq!(selected.target.observation.key, service.observation.key);
-    assert!(selected.ack_clock_calibration_commit().is_none());
+    assert_eq!(selected.target().observation.key, service.observation.key);
+    assert!(selected.ack_clock_calibration_selection().is_none());
 }
 
 #[test]
@@ -696,6 +700,6 @@ fn closed_active_calibration_drain_fence_blocks_next_startup_owner() {
         None,
     )
     .expect("Service remains available during exact-flight drain");
-    assert_eq!(selected.target.observation.key, service.observation.key);
-    assert!(selected.subflow_set_commit().is_none());
+    assert_eq!(selected.target().observation.key, service.observation.key);
+    assert!(selected.subflow_admission_selection().is_none());
 }

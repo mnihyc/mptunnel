@@ -59,8 +59,7 @@ pub(in crate::runtime) struct ResponseAckClockCalibrationRetirementRequest {
 /// impossible combinations unrepresentable at the binding commit boundary.
 pub(in crate::runtime) enum ResponseOwnerEnqueueAdmission {
     Service,
-    ExistingSubflow,
-    NewSubflow(ResponseSubflowAdmissionRequest),
+    SubflowAdmission(ResponseSubflowAdmissionRequest),
     AckClockCalibration(ResponseAckClockCalibrationRequest),
 }
 
@@ -407,7 +406,7 @@ impl ResponseStreamBinding {
                 )
                 .unwrap_or(Err(RuntimeError::SenderServiceBlocked));
         }
-        if let ResponseOwnerEnqueueAdmission::NewSubflow(request) = admission {
+        if let ResponseOwnerEnqueueAdmission::SubflowAdmission(request) = admission {
             return self
                 .lane_tracker
                 .with_matching_generation(self.session_id, request.expected_lane_generation, || {
@@ -481,14 +480,7 @@ impl ResponseStreamBinding {
                 }
                 Ok(None)
             }
-            ResponseOwnerEnqueueAdmission::ExistingSubflow => {
-                target
-                    .commands
-                    .try_enqueue_stream_ordered_frame(frame.clone(), lane)?;
-                self.record_validated_owner_flight_with_outputs(&mut outputs, target_index, frame);
-                Ok(None)
-            }
-            ResponseOwnerEnqueueAdmission::NewSubflow(_)
+            ResponseOwnerEnqueueAdmission::SubflowAdmission(_)
             | ResponseOwnerEnqueueAdmission::AckClockCalibration(_) => {
                 unreachable!("typed response admission was handled above")
             }

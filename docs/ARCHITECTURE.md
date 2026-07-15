@@ -74,7 +74,7 @@ wrappers that merely pass the same state between them.
 - `src/runtime/sender/response/service.rs`: owns queued response work and source
   stream mutation. `planner.rs` owns path ranking/admission over one captured
   target batch; `multipath.rs` serializes session maintenance, concrete TCP and
-  QUIC capacity starts, handoff drain, retirement, coherent generation stamps,
+  QUIC capacity starts, handoff drain, retirement, planning-pass generation fences,
   and executable-plan construction; `dispatch.rs` alone revalidates and
   enqueues carrier commands. The rare large whole-flow handoff record is boxed
   instead of inflating every per-frame plan.

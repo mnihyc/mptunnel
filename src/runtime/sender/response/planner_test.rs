@@ -1,6 +1,12 @@
+use super::super::admission::{
+    response_service_emission_credit_bytes, response_service_startup_emission_credit_bytes,
+};
 use super::*;
+use crate::model::ack_clock::reliable_ack_clock_calibration_limit_bytes;
 use crate::model::admission::{
-    bulk_service_feed_reservoir_payload_bytes, bulk_service_product_envelope_payload_bytes,
+    bulk_active_service_product_envelope_bytes, bulk_latency_pressure_service_feed_window_bytes,
+    bulk_service_feed_reservoir_payload_bytes, bulk_service_horizon_payload_bytes,
+    bulk_service_product_envelope_payload_bytes,
 };
 use crate::model::capacity::QuicCapacityProofCandidate;
 use crate::model::response::{
@@ -319,8 +325,9 @@ fn single_active_response_target_still_obeys_bulk_admission() {
         true,
         false,
     );
-    assert_eq!(outcome.admission.decision, PathAdmissionDecision::Standby);
-    assert_eq!(outcome.model_suppression, Some("inflight_limit"));
+    let (admission, _, _, model_suppression) = outcome.into_parts();
+    assert_eq!(admission.decision, PathAdmissionDecision::Standby);
+    assert_eq!(model_suppression, Some("inflight_limit"));
 
     let selected = choose_response_sender_data_target(
         &[saturated],
@@ -468,7 +475,7 @@ fn quic_proof_success_path_gets_bounded_bulk_only_startup_sampling() {
     assert_eq!(selected.admission().role, PathRuntimeRole::Subflow);
     assert!(
         selected
-            .subflow_set_commit()
+            .subflow_admission_selection()
             .is_some_and(|commit| commit.input.startup_owner_allowed)
     );
 }
@@ -506,7 +513,7 @@ fn proof_path_owner_sampling_is_explicit_subflow_not_service_migration() {
     assert_eq!(selected.admission().role, PathRuntimeRole::Subflow);
     assert!(
         selected
-            .subflow_set_commit()
+            .subflow_admission_selection()
             .is_some_and(|commit| commit.input.startup_owner_allowed)
     );
 }
@@ -1462,7 +1469,7 @@ fn quic_ack_data_seen_validation_path_bootstraps_as_bounded_subflow() {
     );
     assert!(
         selected
-            .subflow_set_commit()
+            .subflow_admission_selection()
             .is_some_and(|commit| commit.input.startup_owner_allowed)
     );
 }
@@ -1507,7 +1514,7 @@ fn measured_same_family_subflow_is_not_throttled_by_startup_credit() {
     )
     .expect("first measured Subflow frame should be admitted");
     let commit = first
-        .subflow_set_commit()
+        .subflow_admission_selection()
         .expect("measured Subflow admission should carry commit state");
     assert_eq!(first.admission().role, PathRuntimeRole::Subflow);
     assert_eq!(
@@ -1850,7 +1857,9 @@ fn same_family_lower_frontier_owner_remains_subflow() {
         );
         assert_eq!(selected.admission().role, PathRuntimeRole::Subflow);
         assert_eq!(
-            selected.subflow_set_commit().map(|commit| commit.service),
+            selected
+                .subflow_admission_selection()
+                .map(|commit| commit.service),
             Some(service.observation.key),
             "{underlay:?} lower-frontier continuation must retain the Service anchor"
         );
@@ -1883,7 +1892,9 @@ fn cross_family_lower_frontier_owner_remains_subflow() {
     assert_eq!(selected.target.observation.key, lower_owner.observation.key);
     assert_eq!(selected.admission().role, PathRuntimeRole::Subflow);
     assert_eq!(
-        selected.subflow_set_commit().map(|commit| commit.service),
+        selected
+            .subflow_admission_selection()
+            .map(|commit| commit.service),
         Some(service.observation.key),
         "cross-family continuation must not commit an implicit Service migration"
     );
@@ -1997,7 +2008,9 @@ fn backpressured_service_remains_lower_frontier_completion_baseline() {
     assert_eq!(selected.target.observation.key, lower_owner.observation.key);
     assert_eq!(selected.admission().role, PathRuntimeRole::Subflow);
     assert_eq!(
-        selected.subflow_set_commit().map(|commit| commit.service),
+        selected
+            .subflow_admission_selection()
+            .map(|commit| commit.service),
         Some(service.observation.key)
     );
 }
@@ -2327,7 +2340,7 @@ fn measured_tcp_subflow_uses_bounded_reservoir_beyond_service_horizon() {
     assert_eq!(reservoir_subflow.admission().role, PathRuntimeRole::Subflow);
     assert_eq!(
         reservoir_subflow
-            .subflow_set_commit()
+            .subflow_admission_selection()
             .map(|commit| commit.service),
         Some(service.observation.key),
         "overflow must remain bound to the exact current Service epoch"
@@ -2438,7 +2451,9 @@ fn measured_quic_subflow_uses_bounded_reservoir_before_new_startup() {
     );
     assert_eq!(selected.admission().role, PathRuntimeRole::Subflow);
     assert_eq!(
-        selected.subflow_set_commit().map(|commit| commit.service),
+        selected
+            .subflow_admission_selection()
+            .map(|commit| commit.service),
         Some(service.observation.key),
         "measured QUIC overflow remains bound to the current Service"
     );
@@ -2953,7 +2968,7 @@ fn measured_same_family_alternate_is_subflow_when_service_is_not_feedable() {
         "additional same-family owner bytes must be labeled Subflow, not Service"
     );
     assert!(
-        selected.subflow_set_commit().is_some(),
+        selected.subflow_admission_selection().is_some(),
         "Subflow OwnerData must be committed through the Subflow admission ledger"
     );
 }
@@ -3001,7 +3016,7 @@ fn saturated_service_may_admit_one_startup_same_underlay_subflow_owner() {
     assert_eq!(selected.admission().role, PathRuntimeRole::Subflow);
     assert!(
         selected
-            .subflow_set_commit()
+            .subflow_admission_selection()
             .is_some_and(|commit| commit.input.startup_owner_allowed),
         "sender evidence permits only explicit bounded startup Subflow admission"
     );
@@ -3040,7 +3055,7 @@ fn bulk_only_live_tcp_service_tail_admits_bounded_same_underlay_startup_sampling
     assert_eq!(selected.admission().role, PathRuntimeRole::Subflow);
     assert!(
         selected
-            .subflow_set_commit()
+            .subflow_admission_selection()
             .is_some_and(|commit| commit.input.startup_owner_allowed),
         "TCP startup sampling must be explicit and ledger-bounded"
     );
@@ -3079,7 +3094,7 @@ fn quic_service_uses_bounded_startup_when_no_measured_subflow_exists() {
     assert_eq!(selected.admission().role, PathRuntimeRole::Subflow);
     assert!(
         selected
-            .subflow_set_commit()
+            .subflow_admission_selection()
             .is_some_and(|commit| commit.input.startup_owner_allowed)
     );
 }
@@ -3110,7 +3125,7 @@ fn sole_quic_service_does_not_sample_an_equally_loaded_path() {
 
     assert_eq!(selected.target.observation.key, service.observation.key);
     assert_eq!(selected.admission().role, PathRuntimeRole::Service);
-    assert!(selected.subflow_set_commit().is_none());
+    assert!(selected.subflow_admission_selection().is_none());
 }
 
 #[test]
@@ -3140,7 +3155,7 @@ fn latency_pressure_keeps_unmeasured_validation_path_out_of_owner_sampling() {
 
     assert_eq!(selected.target.observation.key, service.observation.key);
     assert_eq!(selected.admission().role, PathRuntimeRole::Service);
-    assert!(selected.subflow_set_commit().is_none());
+    assert!(selected.subflow_admission_selection().is_none());
 }
 
 #[test]
@@ -3197,7 +3212,7 @@ fn exact_startup_owner_continues_lower_frontier_within_multi_flow_cap() {
     )
     .expect("the first bounded startup quantum should be admitted");
     let input = first
-        .subflow_set_commit()
+        .subflow_admission_selection()
         .expect("startup admission must carry the exact epoch commit")
         .input;
     let mut partial_epoch = FlowSubflowSet::new(
@@ -3344,7 +3359,7 @@ fn active_response_flow_may_start_one_bounded_same_family_sample() {
         service.observation.key
     );
     assert_eq!(no_active_work.admission().role, PathRuntimeRole::Service);
-    assert!(no_active_work.subflow_set_commit().is_none());
+    assert!(no_active_work.subflow_admission_selection().is_none());
 
     let active_response = select_response_sender_data_target_with_ordered_debt_inner(
         &[service, validation.clone()],
@@ -3364,7 +3379,7 @@ fn active_response_flow_may_start_one_bounded_same_family_sample() {
     );
     assert!(
         active_response
-            .subflow_set_commit()
+            .subflow_admission_selection()
             .is_some_and(|commit| commit.input.startup_owner_allowed)
     );
 }
@@ -3403,8 +3418,8 @@ fn startup_sample_cap_returns_dispatch_to_service() {
         true,
         false,
     );
-    let input = outcome
-        .subflow_set_commit()
+    let (_, subflow_selection, _, _) = outcome.into_parts();
+    let input = subflow_selection
         .expect("first sample quantum should be admitted")
         .input;
     let mut epoch = FlowSubflowSet::new(
@@ -3435,7 +3450,7 @@ fn startup_sample_cap_returns_dispatch_to_service() {
 
     assert_eq!(selected.target.observation.key, service.observation.key);
     assert_eq!(selected.admission().role, PathRuntimeRole::Service);
-    assert!(selected.subflow_set_commit().is_none());
+    assert!(selected.subflow_admission_selection().is_none());
 }
 
 #[test]
@@ -4116,7 +4131,7 @@ fn missing_same_underlay_owner_debt_admits_sender_evidence_service_failover() {
         "same-underlay failover is Service continuation, not Subflow aggregation"
     );
     assert!(
-        selected.subflow_set_commit().is_none(),
+        selected.subflow_admission_selection().is_none(),
         "failover Service election must not spend Subflow owner credit"
     );
 }
@@ -4206,7 +4221,7 @@ fn bulk_only_tcp_sender_evidence_admits_startup_subflow_not_service() {
     );
     assert!(
         selected
-            .subflow_set_commit()
+            .subflow_admission_selection()
             .is_some_and(|commit| commit.input.startup_owner_allowed),
         "startup Subflow admission must be explicit and bounded"
     );

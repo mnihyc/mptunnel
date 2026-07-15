@@ -87,9 +87,9 @@ fn service_admission_publishes_queue_flight_and_owner_as_one_transaction() {
     let target = binding
         .sender_path_targets(FlowLane::Throughput, payload_bytes)
         .into_iter()
-        .find(|target| target.key == candidate)
+        .find(|target| target.observation.key == candidate)
         .expect("candidate target remains attached");
-    let identity = (target.key, target.incarnation);
+    let identity = (target.observation.key, target.observation.incarnation);
     {
         let mut outputs = binding.outputs.lock().expect("test response outputs lock");
         outputs.ack_clock_calibrations.insert(
@@ -106,7 +106,7 @@ fn service_admission_publishes_queue_flight_and_owner_as_one_transaction() {
     let unchanged_lane_generation = binding.lane_generation();
 
     let mut stale_target = target.clone();
-    stale_target.incarnation = stale_target.incarnation.wrapping_add(1);
+    stale_target.observation.incarnation = stale_target.observation.incarnation.wrapping_add(1);
     assert!(matches!(
         binding.try_enqueue_owner_frame_for_target(
             &stale_target,
@@ -338,12 +338,12 @@ fn tcp_calibration_commit_fences_generations_and_rolls_back_blocked_enqueue() {
     let target = binding
         .sender_path_targets(FlowLane::Throughput, payload_bytes)
         .into_iter()
-        .find(|target| target.key == candidate)
+        .find(|target| target.observation.key == candidate)
         .expect("candidate target");
     let service_target = binding
         .sender_path_targets(FlowLane::Throughput, payload_bytes)
         .into_iter()
-        .find(|target| target.key == service)
+        .find(|target| target.observation.key == service)
         .expect("service target");
     let request_for = |binding: &ResponseStreamBinding| {
         let (expected_planner_generation, _) = binding.subflow_state_snapshot();
@@ -628,7 +628,7 @@ fn subflow_reservation_and_enqueue_linearize_before_topology_reset() {
     let target = binding
         .sender_path_targets(FlowLane::Throughput, payload_bytes)
         .into_iter()
-        .find(|target| target.key == candidate)
+        .find(|target| target.observation.key == candidate)
         .expect("candidate output is attached");
     let (planner_generation, _) = binding.subflow_state_snapshot();
     let request = ResponseSubflowAdmissionRequest {
@@ -660,7 +660,7 @@ fn subflow_reservation_and_enqueue_linearize_before_topology_reset() {
             &ResponseDispatchTarget::from(&target),
             &frame_for_sender,
             FlowLane::Throughput,
-            ResponseOwnerEnqueueAdmission::NewSubflow(request),
+            ResponseOwnerEnqueueAdmission::SubflowAdmission(request),
             || {
                 reserved_tx
                     .send(())

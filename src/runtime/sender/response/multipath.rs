@@ -9,8 +9,8 @@ use super::diagnostics::{
     lab_response_bulk_output_selected, lab_response_service_handoff_evaluation,
 };
 use super::planner::{
-    ResponseDataDispatchIntent, response_service_handoff_drain_lease,
-    response_service_handoff_drain_matches_candidate,
+    ResponseDataSelectionIntent, ResponseSelectedDataTarget, ResponseServiceHandoffSelection,
+    response_service_handoff_drain_lease, response_service_handoff_drain_matches_candidate,
     response_service_handoff_drain_matches_selection,
     response_service_handoff_start_capacity_proof,
     select_response_sender_data_target_with_ordered_debt_inner_and_retirements,
@@ -20,7 +20,8 @@ use super::quic_capacity::{
     select_response_quic_capacity_calibration_start, try_start_response_quic_capacity_calibration,
 };
 use super::tcp_capacity::{
-    select_response_tcp_capacity_probe_start, try_start_response_tcp_capacity_probe,
+    ResponseAckClockCalibrationRetirementSelection, select_response_tcp_capacity_probe_start,
+    try_start_response_tcp_capacity_probe,
 };
 use crate::model::multipath::{FlowSubflowSet, PathRuntimeRole};
 #[cfg(test)]
@@ -29,9 +30,10 @@ use crate::model::response::response_oldest_lower_flight_owner;
 use crate::model::work::ReliableWorkClass;
 use crate::runtime::RuntimeError;
 use crate::runtime::stream::response::{
-    MIN_ACTIVE_RESPONSE_FLOWS_FOR_SAME_FAMILY_DISCOVERY,
+    MIN_ACTIVE_RESPONSE_FLOWS_FOR_SAME_FAMILY_DISCOVERY, ResponseAckClockCalibrationRequest,
     ResponseAckClockCalibrationRetirementRequest, ResponseDispatchTarget,
-    ResponseServiceHandoffDrainRequest, ResponseStreamBinding,
+    ResponseServiceHandoffDrainRequest, ResponseServiceHandoffRequest, ResponseStreamBinding,
+    ResponseSubflowAdmissionRequest,
 };
 use crate::runtime::stream::{
     FixedReliablePathOutput, ReliablePathStream, ReliablePathStreamOutput,
@@ -39,6 +41,122 @@ use crate::runtime::stream::{
 };
 use crate::scheduler::FlowLane;
 use std::sync::Arc;
+
+/// Optimistic-concurrency fence associated with one planning pass. Each owner
+/// revalidates its generation, so this is not an atomic state snapshot.
+#[derive(Clone, Copy)]
+struct ResponsePlanningEpoch {
+    planner_generation: u64,
+    lane_generation: u64,
+    model_generation: u64,
+}
+
+/// Executable response ownership transition. Reservation and handoff variants
+/// carry their generation fences; plain Service is re-elected during apply.
+pub(super) enum ResponseDataDispatchIntent {
+    Service,
+    SubflowAdmission(ResponseSubflowAdmissionRequest),
+    AckClockCalibration(ResponseAckClockCalibrationRequest),
+    ServiceHandoff(ResponseStampedServiceHandoff),
+}
+
+pub(super) struct ResponseStampedServiceHandoff {
+    // Preserve the planner's rare allocation; dispatch projects the complete
+    // request on its stack instead of freeing and boxing it a second time.
+    epoch: ResponsePlanningEpoch,
+    selection: Box<ResponseServiceHandoffSelection>,
+}
+
+impl ResponseStampedServiceHandoff {
+    pub(super) fn into_request(
+        self,
+        target: &ResponseDispatchTarget,
+    ) -> ResponseServiceHandoffRequest {
+        ResponseServiceHandoffRequest {
+            expected_planner_generation: self.epoch.planner_generation,
+            expected_lane_generation: self.epoch.lane_generation,
+            expected_model_generation: self.epoch.model_generation,
+            handoff_frontier: self.selection.handoff_frontier,
+            service: self.selection.service,
+            service_path_instance_id: self.selection.service_path_instance_id,
+            service_incarnation: self.selection.service_incarnation,
+            target: target.key,
+            target_path_instance_id: target.path_instance_id,
+            target_incarnation: target.incarnation,
+            mode: self.selection.mode,
+            target_command_pending_limit_bytes: self.selection.target_command_pending_limit_bytes,
+            capacity_proof: self.selection.capacity_proof,
+        }
+    }
+}
+
+impl ResponseDataDispatchIntent {
+    pub(super) fn role(&self) -> PathRuntimeRole {
+        match self {
+            Self::Service | Self::ServiceHandoff(_) => PathRuntimeRole::Service,
+            Self::SubflowAdmission(_) | Self::AckClockCalibration(_) => PathRuntimeRole::Subflow,
+        }
+    }
+}
+
+fn stamp_response_data_selection(
+    selected: ResponseSelectedDataTarget,
+    epoch: ResponsePlanningEpoch,
+) -> (ResponseDispatchTarget, ResponseDataDispatchIntent) {
+    let (target, selection) = selected.into_parts();
+    let intent = match selection {
+        ResponseDataSelectionIntent::Service => ResponseDataDispatchIntent::Service,
+        ResponseDataSelectionIntent::SubflowAdmission(selection) => {
+            ResponseDataDispatchIntent::SubflowAdmission(ResponseSubflowAdmissionRequest {
+                expected_planner_generation: epoch.planner_generation,
+                expected_lane_generation: epoch.lane_generation,
+                service: selection.service,
+                startup_owner_credit_bytes: selection.startup_owner_credit_bytes,
+                optional_overhead_budget_bytes: selection.optional_overhead_budget_bytes,
+                max_read_gap_budget: selection.max_read_gap_budget,
+                input: selection.input,
+            })
+        }
+        ResponseDataSelectionIntent::AckClockCalibration(selection) => {
+            ResponseDataDispatchIntent::AckClockCalibration(ResponseAckClockCalibrationRequest {
+                expected_planner_generation: epoch.planner_generation,
+                expected_lane_generation: epoch.lane_generation,
+                expected_model_generation: epoch.model_generation,
+                service: selection.service,
+                service_incarnation: selection.service_incarnation,
+                service_pending_bytes: selection.service_pending_bytes,
+                target_pending_bytes: selection.target_pending_bytes,
+                limit_bytes: selection.limit_bytes,
+                requires_active_response_start: selection.requires_active_response_start,
+            })
+        }
+        ResponseDataSelectionIntent::ServiceHandoff(selection) => {
+            ResponseDataDispatchIntent::ServiceHandoff(ResponseStampedServiceHandoff {
+                epoch,
+                selection,
+            })
+        }
+    };
+    (target.into(), intent)
+}
+
+fn stamp_response_calibration_retirement(
+    selection: ResponseAckClockCalibrationRetirementSelection,
+    epoch: ResponsePlanningEpoch,
+) -> ResponseAckClockCalibrationRetirementRequest {
+    ResponseAckClockCalibrationRetirementRequest {
+        expected_planner_generation: epoch.planner_generation,
+        expected_lane_generation: epoch.lane_generation,
+        expected_model_generation: epoch.model_generation,
+        service: selection.service,
+        service_incarnation: selection.service_incarnation,
+        service_pending_bytes: selection.service_pending_bytes,
+        target: selection.target,
+        target_incarnation: selection.target_incarnation,
+        target_pending_bytes: selection.target_pending_bytes,
+        limit_bytes: selection.limit_bytes,
+    }
+}
 
 pub(super) enum ResponseDataDispatchTarget {
     Fixed(Arc<FixedReliablePathOutput>),
@@ -161,6 +279,11 @@ fn evaluate_response_data_dispatch_with_ordered_debt(
                 let lane_generation = session_scheduling.generation;
                 let active_response_flows = session_scheduling.active_response_flows;
                 let model_generation = binding.response_model_generation();
+                let planning_epoch = ResponsePlanningEpoch {
+                    planner_generation,
+                    lane_generation,
+                    model_generation,
+                };
                 let lower_flights = binding.lower_flights_before_offset(next_offset);
                 let targets = binding.sender_path_targets(relay_lane, payload_bytes);
                 let ordered_data_owner = binding.ordered_data_owner();
@@ -269,7 +392,7 @@ fn evaluate_response_data_dispatch_with_ordered_debt(
                 );
                 if handoff_context_ready
                     && !another_binding_is_draining
-                    && let Some(mut selected) = select_response_service_handoff_target(
+                    && let Some(selected) = select_response_service_handoff_target(
                         &targets,
                         relay_lane,
                         payload_bytes,
@@ -289,12 +412,6 @@ fn evaluate_response_data_dispatch_with_ordered_debt(
                             &selected,
                         )
                     }));
-                    let commit = selected
-                        .service_handoff_commit_mut()
-                        .expect("response Service handoff selection has a commit");
-                    commit.planner_generation = planner_generation;
-                    commit.lane_generation = lane_generation;
-                    commit.model_generation = model_generation;
                     #[cfg(feature = "lab-diagnostics")]
                     lab_response_bulk_output_selected(
                         "service_handoff",
@@ -302,7 +419,7 @@ fn evaluate_response_data_dispatch_with_ordered_debt(
                         selected.admission(),
                         payload_bytes,
                     );
-                    let (target, intent) = selected.into_parts();
+                    let (target, intent) = stamp_response_data_selection(selected, planning_epoch);
                     debug_assert!(matches!(
                         &intent,
                         ResponseDataDispatchIntent::ServiceHandoff(_)
@@ -311,7 +428,7 @@ fn evaluate_response_data_dispatch_with_ordered_debt(
                         ResponseDataDispatchPlan {
                             primary: ResponseDataDispatchTarget::Switchable {
                                 binding: binding.clone(),
-                                target: target.into(),
+                                target,
                                 intent,
                             },
                         },
@@ -395,7 +512,7 @@ fn evaluate_response_data_dispatch_with_ordered_debt(
                         return Err(RuntimeError::SenderServiceBlocked);
                     }
                 }
-                let mut retirement_intents = Vec::new();
+                let mut retirement_selections = Vec::new();
                 let selected =
                     select_response_sender_data_target_with_ordered_debt_inner_and_retirements(
                         &targets,
@@ -408,30 +525,16 @@ fn evaluate_response_data_dispatch_with_ordered_debt(
                         subflow_set.as_ref(),
                         active_response_flows
                             >= MIN_ACTIVE_RESPONSE_FLOWS_FOR_SAME_FAMILY_DISCOVERY,
-                        &mut retirement_intents,
+                        &mut retirement_selections,
                     );
                 let mut retired_any = false;
-                if mode == ResponsePlanningMode::Preview && !retirement_intents.is_empty() {
+                if mode == ResponsePlanningMode::Preview && !retirement_selections.is_empty() {
                     return Ok(ResponseDataPlanningOutcome::ApplyRequired);
                 }
                 if may_resnapshot_after_retirement {
-                    for mut intent in retirement_intents {
-                        intent.planner_generation = planner_generation;
-                        intent.lane_generation = lane_generation;
-                        intent.model_generation = model_generation;
+                    for selection in retirement_selections {
                         retired_any |= binding.try_retire_tcp_ack_clock_calibration(
-                            ResponseAckClockCalibrationRetirementRequest {
-                                expected_planner_generation: intent.planner_generation,
-                                expected_lane_generation: intent.lane_generation,
-                                expected_model_generation: intent.model_generation,
-                                service: intent.service,
-                                service_incarnation: intent.service_incarnation,
-                                service_pending_bytes: intent.service_pending_bytes,
-                                target: intent.target,
-                                target_incarnation: intent.target_incarnation,
-                                target_pending_bytes: intent.target_pending_bytes,
-                                limit_bytes: intent.limit_bytes,
-                            },
+                            stamp_response_calibration_retirement(selection, planning_epoch),
                         );
                     }
                 }
@@ -441,26 +544,17 @@ fn evaluate_response_data_dispatch_with_ordered_debt(
                     may_resnapshot_after_retirement = false;
                     continue;
                 }
-                let Some(mut selected) = selected else {
+                let Some(selected) = selected else {
                     return Err(RuntimeError::SenderServiceBlocked);
                 };
-                if let Some(commit) = selected.subflow_set_commit_mut() {
-                    commit.planner_generation = planner_generation;
-                    commit.lane_generation = lane_generation;
-                }
-                if let Some(commit) = selected.ack_clock_calibration_commit_mut() {
-                    commit.planner_generation = planner_generation;
-                    commit.lane_generation = lane_generation;
-                    commit.model_generation = model_generation;
-                }
                 let role = selected.admission().role;
                 let target = selected.target();
                 debug_assert!(
                     role != PathRuntimeRole::Subflow
                         || target.observation.has_bulk_rate_evidence
                         || selected
-                            .subflow_set_commit()
-                            .is_some_and(|commit| commit.input.startup_owner_allowed),
+                            .subflow_admission_selection()
+                            .is_some_and(|selection| selection.input.startup_owner_allowed),
                     "Subflow OwnerData requires bulk-rate evidence or explicit bounded startup admission: target={:?} role={:?} ordered_owner={:?} lower_owner={:?} is_active={} sender_evidence={} bulk_evidence={}",
                     target.observation.key,
                     role,
@@ -470,15 +564,15 @@ fn evaluate_response_data_dispatch_with_ordered_debt(
                     target.observation.has_sender_evidence,
                     target.observation.has_bulk_rate_evidence,
                 );
-                if selected.service_handoff_commit().is_some() {
+                if selected.service_handoff_selection().is_some() {
                     return Err(RuntimeError::SenderServiceBlocked);
                 }
-                let (target, intent) = selected.into_parts();
+                let (target, intent) = stamp_response_data_selection(selected, planning_epoch);
                 return Ok(ResponseDataPlanningOutcome::Dispatch(
                     ResponseDataDispatchPlan {
                         primary: ResponseDataDispatchTarget::Switchable {
                             binding: binding.clone(),
-                            target: target.into(),
+                            target,
                             intent,
                         },
                     },

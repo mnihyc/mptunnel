@@ -11,6 +11,33 @@ use crate::runtime::error::RuntimeError;
 use crate::scheduler::{FlowLane, PathSnapshot};
 use tokio::sync::mpsc;
 
+/// Keeps a higher-layer reservation alive for exactly one queued carrier command.
+///
+/// The carrier only owns the lifetime contract; the reservation's policy and
+/// release behavior remain in the layer that created the guard.
+pub(in crate::runtime) struct CarrierCommandLease {
+    _guard: Box<dyn Send + Sync>,
+}
+
+impl CarrierCommandLease {
+    pub(in crate::runtime) fn hold<T>(guard: T) -> Self
+    where
+        T: Send + Sync + 'static,
+    {
+        Self {
+            _guard: Box::new(guard),
+        }
+    }
+}
+
+impl std::fmt::Debug for CarrierCommandLease {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("CarrierCommandLease")
+            .finish_non_exhaustive()
+    }
+}
+
 /// Accepted client carrier state before product-stream ownership begins.
 pub(in crate::runtime) struct OpenedReliableCarrierStream {
     pub(in crate::runtime) stream_id: StreamId,

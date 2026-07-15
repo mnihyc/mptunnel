@@ -14,6 +14,7 @@ use crate::model::response::ResponsePathObservation;
 use crate::protocol::SessionId;
 use crate::protocol::{Frame, PathId, StreamOpenRole, UnderlayProtocol};
 use crate::runtime::RuntimeError;
+use crate::runtime::path::CarrierCommandLease;
 use crate::runtime::path::commands::{
     ReliablePathCommandQueueSnapshot, ReliablePathCommandSender, TcpCapacityProbeRequest,
 };
@@ -698,7 +699,7 @@ impl ResponseStreamBinding {
         };
         entry
             .commands
-            .try_enqueue_tcp_capacity_probe(request, session_lease)
+            .try_enqueue_tcp_capacity_probe(request, CarrierCommandLease::hold(session_lease))
     }
 
     pub(in crate::runtime) fn try_enqueue_classified_frame_for_target(

@@ -12,9 +12,8 @@ use crate::protocol::{
     Frame, IngressKind, PathId, ResetReason, StreamId, StreamOpenRole, TargetAddr,
 };
 use crate::runtime::error::RuntimeError;
-use crate::runtime::path::ports::OpenedReliableCarrierStream;
+use crate::runtime::path::ports::{CarrierCommandLease, OpenedReliableCarrierStream};
 use crate::runtime::path::tcp::capacity::RequestTcpCapacityProbeLease;
-use crate::runtime::stream::response::TcpCapacityProbeSessionLease;
 use crate::scheduler::FlowLane;
 use std::sync::{
     Arc,
@@ -513,7 +512,7 @@ impl ReliablePathCommandSender {
     pub(in crate::runtime) fn try_enqueue_tcp_capacity_probe(
         &self,
         request: TcpCapacityProbeRequest,
-        session_lease: TcpCapacityProbeSessionLease,
+        session_lease: CarrierCommandLease,
     ) -> Result<u64, RuntimeError> {
         let permit = match self.data.try_reserve() {
             Ok(permit) => permit,
@@ -1348,7 +1347,7 @@ pub(in crate::runtime) enum TcpCapacityProbeSessionLeaseOwner {
     Request(RequestTcpCapacityProbeLease),
     // This field exists for drop order: the response session reservation lives
     // until the exact carrier transaction finishes even though it is not read.
-    Response(#[allow(dead_code)] TcpCapacityProbeSessionLease),
+    Response(#[allow(dead_code)] CarrierCommandLease),
 }
 
 impl TcpCapacityProbeSessionLeaseOwner {

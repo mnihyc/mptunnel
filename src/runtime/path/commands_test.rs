@@ -9,23 +9,24 @@ use crate::protocol::{
     DatagramFlowId, Frame, PathId, ResetReason, SessionId, StreamFlags, StreamId,
 };
 use crate::runtime::error::RuntimeError;
+use crate::runtime::path::CarrierCommandLease;
 use crate::runtime::stream::response::{
-    ServerPathLaneTracker, TcpCapacityProbeSessionLease, next_server_carrier_path_instance_id,
+    ServerPathLaneTracker, next_server_carrier_path_instance_id,
 };
 use crate::scheduler::FlowLane;
 use bytes::Bytes;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-fn tcp_probe_tracker_and_lease() -> (Arc<ServerPathLaneTracker>, TcpCapacityProbeSessionLease) {
+fn tcp_probe_tracker_and_lease() -> (Arc<ServerPathLaneTracker>, CarrierCommandLease) {
     let tracker = Arc::new(ServerPathLaneTracker::default());
     let lease = tracker
         .try_reserve_tcp_capacity_probe(SessionId(1), 0)
         .expect("reserve isolated test session");
-    (tracker, lease)
+    (tracker, CarrierCommandLease::hold(lease))
 }
 
-fn tcp_probe_session_lease() -> TcpCapacityProbeSessionLease {
+fn tcp_probe_session_lease() -> CarrierCommandLease {
     tcp_probe_tracker_and_lease().1
 }
 

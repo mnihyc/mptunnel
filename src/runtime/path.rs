@@ -24,7 +24,9 @@ pub(in crate::runtime) use commands::{
     RequestTcpCapacityProbeRequest,
 };
 pub(in crate::runtime) use model::PathDeliveryStats;
-pub(in crate::runtime) use ports::{OpenedReliableCarrierStream, UdpStreamOpenOptions};
+pub(in crate::runtime) use ports::{
+    CarrierCommandLease, OpenedReliableCarrierStream, UdpStreamOpenOptions,
+};
 #[cfg(test)]
 pub(super) use proof::*;
 pub(in crate::runtime) use quic::{

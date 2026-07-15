@@ -4,10 +4,9 @@ use super::client_stream::run_client_udp_stream;
 use super::estimator::UdpPathMetricTracker;
 use super::io::{
     UdpPathConnection, UdpPathEndpoint, UdpPathRecvStream, UdpPathSendStream,
-    interleave_udp_path_socket_addr_families, quic_path_open_error_is_retryable,
-    spawn_quic_path_reader, udp_path_command_queue, udp_path_finish_stream,
-    udp_path_max_stream_payload_bytes, udp_path_read_frame, udp_path_write_frame,
-    udp_reliable_stream_frame_queue, usable_udp_path_socket_addrs,
+    quic_path_open_error_is_retryable, spawn_quic_path_reader, udp_path_command_queue,
+    udp_path_finish_stream, udp_path_max_stream_payload_bytes, udp_path_read_frame,
+    udp_path_write_frame, udp_reliable_stream_frame_queue, usable_udp_path_socket_addrs,
 };
 #[cfg(feature = "lab-diagnostics")]
 use super::metrics::log_quic_ack_poll_diagnostics;
@@ -30,7 +29,7 @@ use crate::runtime::path::state::ClientPathState;
 use crate::scheduler::{FlowLane, stream_demand_hint_for_lane};
 use crate::transport::{
     CarrierNetworkProvider, CarrierPathIdentity, CarrierResolutionRequest, CarrierSocketRequest,
-    PathSpec,
+    PathSpec, interleave_socket_addr_families,
 };
 use futures::StreamExt;
 use futures::stream::FuturesUnordered;
@@ -306,7 +305,7 @@ async fn connect_client_udp_path(
             })
             .await?;
         let resolved = usable_udp_path_socket_addrs(&runtime.path, resolved)?;
-        let mut remote_addrs = interleave_udp_path_socket_addr_families(resolved)
+        let mut remote_addrs = interleave_socket_addr_families(resolved)
             .into_iter()
             .take(MAX_QUIC_ADDRESS_ATTEMPTS)
             .collect::<VecDeque<_>>();

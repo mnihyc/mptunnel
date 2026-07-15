@@ -13,7 +13,6 @@ use crate::runtime::path::server_context::ServerPathContext;
 use crate::transport::PathSpec;
 use crate::transport::quic as quic_transport;
 use crate::transport::udp::UdpTransportError;
-use std::collections::VecDeque;
 use std::net::{IpAddr, SocketAddr};
 use std::time::Instant;
 use tokio::net::lookup_host;
@@ -349,34 +348,6 @@ pub(super) fn usable_udp_path_socket_addrs(
     } else {
         Ok(compatible)
     }
-}
-
-/// Alternates address families while preserving resolver preference and each
-/// family's internal order, so a grouped AAAA set cannot hide a usable A set.
-pub(super) fn interleave_udp_path_socket_addr_families(addrs: Vec<SocketAddr>) -> Vec<SocketAddr> {
-    let Some(first) = addrs.first() else {
-        return addrs;
-    };
-    let prefer_v4 = first.is_ipv4();
-    let mut preferred = VecDeque::new();
-    let mut alternate = VecDeque::new();
-    for addr in addrs {
-        if addr.is_ipv4() == prefer_v4 {
-            preferred.push_back(addr);
-        } else {
-            alternate.push_back(addr);
-        }
-    }
-    let mut interleaved = Vec::with_capacity(preferred.len() + alternate.len());
-    while !preferred.is_empty() || !alternate.is_empty() {
-        if let Some(addr) = preferred.pop_front() {
-            interleaved.push(addr);
-        }
-        if let Some(addr) = alternate.pop_front() {
-            interleaved.push(addr);
-        }
-    }
-    interleaved
 }
 
 fn compatible_udp_path_socket_addrs(

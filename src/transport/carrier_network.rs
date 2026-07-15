@@ -7,6 +7,7 @@
 use crate::protocol::UnderlayProtocol;
 use crate::transport::PathSpec;
 use socket2::{Domain, Protocol, SockAddr, Socket, Type};
+use std::collections::VecDeque;
 use std::future::Future;
 use std::io;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
@@ -49,6 +50,34 @@ pub trait CarrierNetworkProvider: Send + Sync + 'static {
 
     /// Creates one socket on the native network used for this path's resolution.
     fn create_socket(&self, request: CarrierSocketRequest<'_>) -> io::Result<CarrierSocket>;
+}
+
+/// Alternates address families while preserving resolver preference and each
+/// family's order. TCP and QUIC own separate races over this neutral ordering.
+pub(crate) fn interleave_socket_addr_families(addrs: Vec<SocketAddr>) -> Vec<SocketAddr> {
+    let Some(first) = addrs.first() else {
+        return addrs;
+    };
+    let preferred_is_v4 = first.is_ipv4();
+    let mut preferred = VecDeque::new();
+    let mut alternate = VecDeque::new();
+    for addr in addrs {
+        if addr.is_ipv4() == preferred_is_v4 {
+            preferred.push_back(addr);
+        } else {
+            alternate.push_back(addr);
+        }
+    }
+    let mut ordered = Vec::with_capacity(preferred.len() + alternate.len());
+    while !preferred.is_empty() || !alternate.is_empty() {
+        if let Some(addr) = preferred.pop_front() {
+            ordered.push(addr);
+        }
+        if let Some(addr) = alternate.pop_front() {
+            ordered.push(addr);
+        }
+    }
+    ordered
 }
 
 #[derive(Debug, Clone, Copy, Default)]

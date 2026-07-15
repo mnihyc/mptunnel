@@ -60,3 +60,16 @@ fn carrier_conversion_rejects_the_wrong_transport() {
         io::ErrorKind::InvalidInput
     );
 }
+
+#[test]
+fn carrier_resolution_interleaves_grouped_address_families() {
+    let v6_first = SocketAddr::from(([0x2001, 0xdb8, 0, 0, 0, 0, 0, 1], 443));
+    let v6_second = SocketAddr::from(([0x2001, 0xdb8, 0, 0, 0, 0, 0, 2], 443));
+    let v4_first = SocketAddr::from(([192, 0, 2, 1], 443));
+    let v4_second = SocketAddr::from(([192, 0, 2, 2], 443));
+
+    assert_eq!(
+        interleave_socket_addr_families(vec![v6_first, v6_second, v4_first, v4_second]),
+        vec![v6_first, v4_first, v6_second, v4_second]
+    );
+}

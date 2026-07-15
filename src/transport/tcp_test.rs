@@ -51,6 +51,29 @@ async fn tcp_path_rejects_udp_underlay() {
     ));
 }
 
+#[tokio::test]
+async fn tcp_address_race_does_not_let_one_family_consume_the_deadline() {
+    let v6 = SocketAddr::from(([0x2001, 0xdb8, 0, 0, 0, 0, 0, 1], 443));
+    let v4 = SocketAddr::from(([192, 0, 2, 1], 443));
+    let deadline = Instant::now() + Duration::from_millis(120);
+
+    let selected = tokio::time::timeout(
+        Duration::from_secs(1),
+        race_tcp_address_attempts(vec![v6, v4], deadline, |addr, _| async move {
+            if addr.is_ipv6() {
+                std::future::pending::<Result<SocketAddr, TcpTransportError>>().await
+            } else {
+                Ok(addr)
+            }
+        }),
+    )
+    .await
+    .expect("family stagger must not hang")
+    .expect("alternate family succeeds");
+
+    assert_eq!(selected, v4);
+}
+
 async fn reserve_tcp_path() -> PathSpec {
     let probe = TcpListener::bind("127.0.0.1:0")
         .await

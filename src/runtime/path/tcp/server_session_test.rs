@@ -105,6 +105,21 @@ async fn server_tcp_terminal_reset_precedes_detach_and_preserves_shared_session(
             .expect("read carrier opener"),
         Frame::Ping { nonce: 1 }
     );
+    server_framed
+        .write_frame(&Frame::Pong { nonce: 1 })
+        .await
+        .expect("confirm encrypted carrier");
+    server_framed
+        .flush()
+        .await
+        .expect("flush carrier confirmation");
+    assert_eq!(
+        tokio::time::timeout(Duration::from_secs(5), client_framed.read_frame())
+            .await
+            .expect("carrier confirmation timeout")
+            .expect("read carrier confirmation"),
+        Frame::Pong { nonce: 1 }
+    );
     let (_server_reader, server_writer) = server_framed.split().expect("split server carrier");
 
     let session_id = SessionId(202);

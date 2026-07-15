@@ -82,8 +82,8 @@ fn path_proof_test_context() -> ClientPathContext {
         .expect("path-proof test context")
 }
 
-#[test]
-fn failed_path_proof_enqueue_retries_without_sticking_validation() {
+#[tokio::test]
+async fn failed_path_proof_enqueue_retries_without_sticking_validation() {
     let stream_id = StreamId(106);
     let context = path_proof_test_context();
     let (opened, mut receivers, _frames) =
@@ -113,8 +113,8 @@ fn failed_path_proof_enqueue_retries_without_sticking_validation() {
     ));
 }
 
-#[test]
-fn queued_path_proof_keeps_one_identity_until_ack_or_path_failure() {
+#[tokio::test]
+async fn queued_path_proof_keeps_one_identity_until_ack_or_path_failure() {
     let stream_id = StreamId(108);
     let context = path_proof_test_context();
     let (opened, mut receivers, _frames) =

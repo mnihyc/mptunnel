@@ -62,7 +62,7 @@ use crate::mux::stream::ReliableSendStream;
 use crate::protocol::frame::reliable_stream_frame_accounted_bytes;
 use crate::protocol::{Frame, StreamOpenRole, UnderlayProtocol};
 use crate::runtime::RuntimeError;
-use crate::runtime::path::model::{default_path_rate_bps, path_within_adaptive_lead_hysteresis};
+use crate::runtime::path::model::default_path_rate_bps;
 use crate::runtime::sender::{CarrierEmitMode, RelaySendCause};
 use crate::runtime::stream::response::{
     MIN_ACTIVE_RESPONSE_FLOWS_FOR_SAME_FAMILY_DISCOVERY,
@@ -75,6 +75,7 @@ use crate::runtime::stream::{
     FixedReliablePathOutput, ReliablePathStream, ReliablePathStreamOutput,
     reliable_work_lane_to_carrier_lane,
 };
+use crate::scheduler::path_within_adaptive_lead_hysteresis;
 use crate::scheduler::{FlowLane, PathRateScope};
 use std::sync::Arc;
 use std::time::{Duration, Instant};

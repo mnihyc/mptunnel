@@ -4,6 +4,7 @@
 //! the carrier in model snapshots, intents, and exact-flight accounting.
 
 use crate::protocol::{PathId, UnderlayProtocol};
+use std::time::Instant;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub(crate) struct RelayPathKey {
@@ -15,6 +16,29 @@ pub(crate) struct RelayPathKey {
 pub(crate) struct RelayPathInstance {
     pub(crate) key: RelayPathKey,
     pub(crate) id: u64,
+}
+
+/// Attachment-set placement of one carrier instance.
+///
+/// Placement is transport-neutral: TCP and QUIC retain separate carrier
+/// mechanics while request/response policy reasons over the same lifecycle
+/// state. `Active` does not by itself grant ordered product ownership.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum RelayPathPlacement {
+    Active,
+    Repair,
+    Validation,
+}
+
+/// Exact path-proof authority observed for one carrier attachment.
+///
+/// A proof ID alone is not durable: management invalidation advances the
+/// generation, while attachment time prevents evidence crossing reconnects.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct RelayPathProofEpoch {
+    pub(crate) proof_id: u64,
+    pub(crate) proof_generation: u64,
+    pub(crate) attached_at: Instant,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]

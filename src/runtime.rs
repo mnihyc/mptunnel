@@ -8,7 +8,6 @@ mod packet_device;
 mod path;
 mod recent_ids;
 mod relay;
-mod relay_striping;
 mod sender;
 mod stream;
 mod tun_l4;
@@ -131,8 +130,6 @@ use path::{
 };
 #[cfg(test)]
 use relay::*;
-#[cfg(test)]
-use relay_striping::*;
 #[cfg(test)]
 use sender::*;
 #[cfg(test)]

@@ -1,5 +1,45 @@
-use super::*;
-use crate::config::SharedSecret;
+use super::{
+    BulkRelayPathChoice, BulkRelayPathRequest, RelayBulkLeadRequest, RequestRelayPathObservation,
+    RequestRelaySchedulingObservation, RequestRelayTcpPathObservation, RequestSchedulingState,
+    choose_admissible_relay_bulk_lead, choose_bulk_relay_path_for_extent_avoiding,
+    choose_request_ack_clock_calibration_with_rates, choose_request_startup_subflow_with_rates,
+    observed_request_ack_clock_calibration_transaction, relay_path_snapshot_for_bulk_choice,
+    relay_path_within_adaptive_lead_hysteresis, request_path_has_exact_flow_local_bulk_model,
+};
+use crate::config::{ResourceLimits, SecurityConfig, SharedSecret};
+use crate::model::ack_clock::{
+    reliable_request_ack_clock_calibration_target_bytes,
+    reliable_tcp_ack_clock_calibration_opportunity,
+};
+use crate::model::admission::{
+    BulkAdmissionCheck, bulk_additional_admission_role,
+    bulk_candidate_admission_suppression_with_ordering_debt, bulk_service_horizon_payload_bytes,
+    bulk_service_product_envelope_payload_bytes,
+};
+use crate::model::capacity::{
+    BBR_MAX_SEND_QUANTUM_BYTES, PATH_OPEN_SCORE_BYTES, PathRateSample,
+    RELIABLE_INITIAL_WINDOW_PACKETS, reliable_subflow_startup_sample_limit_bytes,
+};
+use crate::model::multipath::{FlowSubflowSet, PathAdmissionDecision, SubflowAdmissionInput};
+use crate::model::path::{RelayPathInstance, RelayPathKey, RelayPathPlacement};
+use crate::model::request::evidence::RequestPerFlowRateModel;
+use crate::mux::MuxLimits;
+use crate::protocol::{Frame, OffsetRange, PathId, StreamFlags, StreamId, UnderlayProtocol};
+use crate::runtime::path::commands::reliable_path_command_channels;
+use crate::runtime::path::{
+    ClientPathContext, PathProofObservation, ReliableTcpRequestBulkFlowRegistration,
+};
+use crate::runtime::relay::remote::ReliableRelayRemotePath;
+use crate::runtime::stream::request::{
+    RequestAckClockOperation, RequestFlightLedger, RequestSubflows,
+};
+use crate::runtime::stream::{ReliablePathStreamHandle, ReliablePathStreamOutput};
+use crate::scheduler::{self, FlowLane, PathRateScope, PathSnapshot, SchedulerPolicy};
+use crate::transport::PathSpec;
+use bytes::Bytes;
+use smallvec::SmallVec;
+use std::collections::HashSet;
+use std::time::{Duration, Instant};
 
 fn security() -> SecurityConfig {
     SecurityConfig::encrypted(
@@ -69,6 +109,143 @@ fn relay_path(
             ),
         },
     }
+}
+
+fn scheduling_observation_for_test(
+    context: &ClientPathContext,
+    paths: &[ReliableRelayRemotePath],
+    lane: FlowLane,
+    frame: Option<&Frame>,
+    payload_bytes: usize,
+    include_bulk_admission: bool,
+) -> RequestRelaySchedulingObservation {
+    super::super::observe_request_relay_scheduling(
+        context,
+        paths
+            .first()
+            .map(|path| path.stream.stream_id)
+            .unwrap_or(StreamId(0)),
+        0,
+        paths,
+        frame,
+        lane,
+        payload_bytes,
+        include_bulk_admission,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn choose_request_startup_subflow(
+    context: &ClientPathContext,
+    paths: &[ReliableRelayRemotePath],
+    lane: FlowLane,
+    frame: Option<&Frame>,
+    offset: u64,
+    payload_bytes: usize,
+    active_key: Option<RelayPathKey>,
+    path_flights: Option<&RequestFlightLedger>,
+    subflow_set: Option<&FlowSubflowSet<RelayPathInstance>>,
+    request_state: Option<RequestSchedulingState<'_>>,
+    attempted_subflows: Option<&HashSet<RelayPathInstance>>,
+) -> Option<BulkRelayPathChoice> {
+    let observation =
+        scheduling_observation_for_test(context, paths, lane, frame, payload_bytes, true);
+    choose_request_startup_subflow_with_rates(
+        &observation,
+        lane,
+        offset,
+        payload_bytes,
+        active_key,
+        path_flights,
+        subflow_set,
+        request_state,
+        attempted_subflows,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn choose_request_ack_clock_calibration(
+    context: &ClientPathContext,
+    paths: &[ReliableRelayRemotePath],
+    lane: FlowLane,
+    frame: Option<&Frame>,
+    offset: u64,
+    payload_bytes: usize,
+    cursor: usize,
+    active_key: Option<RelayPathKey>,
+    path_flights: Option<&RequestFlightLedger>,
+    subflow_set: Option<&FlowSubflowSet<RelayPathInstance>>,
+    request_state: Option<RequestSchedulingState<'_>>,
+) -> Option<BulkRelayPathChoice> {
+    let observation =
+        scheduling_observation_for_test(context, paths, lane, frame, payload_bytes, true);
+    choose_request_ack_clock_calibration_with_rates(
+        &observation,
+        lane,
+        offset,
+        payload_bytes,
+        cursor,
+        active_key,
+        path_flights,
+        subflow_set,
+        request_state,
+    )
+}
+
+fn relay_path_snapshot_for_test(
+    context: &ClientPathContext,
+    instance: RelayPathInstance,
+    active_key: Option<RelayPathKey>,
+    request_state: Option<RequestSchedulingState<'_>>,
+    current_flow_owns_path: bool,
+) -> Option<PathSnapshot> {
+    let mut batch = context.observe_reliable_request_paths([(instance.key, None)], 0, false);
+    let evidence = batch.paths.pop()?;
+    let observation = RequestRelaySchedulingObservation {
+        stream_id: StreamId(0),
+        membership_generation: 0,
+        mux_limits: context.mux_limits,
+        paths: smallvec::smallvec![RequestRelayPathObservation {
+            instance,
+            placement: RelayPathPlacement::Active,
+            can_enqueue_frame: true,
+            can_enqueue_stream_lane: true,
+            load_owned: current_flow_owns_path,
+            shared_snapshot: evidence.shared_snapshot,
+            tcp: evidence.tcp.map(|tcp| RequestRelayTcpPathObservation {
+                startup_snapshot: tcp.startup_snapshot,
+                rate_hint_unknown: tcp.rate_hint_unknown,
+            }),
+            has_bulk_model_evidence: evidence.has_bulk_model_evidence,
+            fresh_proof: evidence.fresh_proof,
+            config_ordinal: evidence.config_ordinal,
+        }],
+        global_bulk_candidates: SmallVec::new(),
+        active_tcp_service_bulk_flows: batch.active_tcp_service_bulk_flows,
+        latency_pressure: batch.latency_pressure,
+    };
+    relay_path_snapshot_for_bulk_choice(
+        &observation,
+        instance,
+        active_key,
+        request_state,
+        current_flow_owns_path,
+    )
+}
+
+fn bulk_observation(
+    context: &ClientPathContext,
+    paths: &[ReliableRelayRemotePath],
+    payload_bytes: usize,
+) -> RequestRelaySchedulingObservation {
+    scheduling_observation_for_test(
+        context,
+        paths,
+        FlowLane::Throughput,
+        None,
+        payload_bytes,
+        true,
+    )
 }
 
 fn mark_bulk_service(context: &ClientPathContext, key: RelayPathKey) {
@@ -182,40 +359,6 @@ impl RequestSchedulingFixture {
 }
 
 #[test]
-fn request_bulk_flow_registration_counts_only_tcp_service_flows_once() {
-    let context = context(&["tcp://127.0.0.1:10079", "udp://127.0.0.1:10080"]);
-    assert_eq!(context.active_tcp_service_request_bulk_flows(), 0);
-
-    let first = context.reliable_tcp_request_bulk_flow_registration();
-    first.update(true, Some(UnderlayProtocol::Udp));
-    assert_eq!(context.active_tcp_service_request_bulk_flows(), 0);
-    first.update(true, Some(UnderlayProtocol::Tcp));
-    first.update(true, Some(UnderlayProtocol::Tcp));
-    assert_eq!(context.active_tcp_service_request_bulk_flows(), 1);
-
-    {
-        let second = context.reliable_tcp_request_bulk_flow_registration();
-        second.update(true, Some(UnderlayProtocol::Udp));
-        assert_eq!(context.active_tcp_service_request_bulk_flows(), 1);
-        second.update(true, Some(UnderlayProtocol::Tcp));
-        assert_eq!(context.active_tcp_service_request_bulk_flows(), 2);
-        second.update(true, Some(UnderlayProtocol::Udp));
-        assert_eq!(context.active_tcp_service_request_bulk_flows(), 1);
-    }
-    assert_eq!(context.active_tcp_service_request_bulk_flows(), 1);
-
-    let shared = first.clone();
-    drop(first);
-    assert_eq!(
-        context.active_tcp_service_request_bulk_flows(),
-        1,
-        "dropping one publisher must not retire shared flow state"
-    );
-    drop(shared);
-    assert_eq!(context.active_tcp_service_request_bulk_flows(), 0);
-}
-
-#[test]
 fn request_scheduler_keeps_tcp_ack_rates_flow_local() {
     let context = context(&["tcp://127.0.0.1:10078?rate-mbps=500"]);
     let path = relay_path(UnderlayProtocol::Tcp, 0, RelayPathPlacement::Active);
@@ -236,7 +379,7 @@ fn request_scheduler_keeps_tcp_ack_rates_flow_local() {
         },
     )]);
 
-    let slow = relay_path_snapshot_for_bulk_choice(
+    let slow = relay_path_snapshot_for_test(
         &context,
         instance,
         Some(instance.key),
@@ -244,7 +387,7 @@ fn request_scheduler_keeps_tcp_ack_rates_flow_local() {
         true,
     )
     .expect("slow flow snapshot");
-    let fast = relay_path_snapshot_for_bulk_choice(
+    let fast = relay_path_snapshot_for_test(
         &context,
         instance,
         Some(instance.key),
@@ -267,7 +410,7 @@ fn request_scheduler_keeps_tcp_ack_rates_flow_local() {
             delivery_samples: 1,
         },
     )]);
-    let provisional = relay_path_snapshot_for_bulk_choice(
+    let provisional = relay_path_snapshot_for_test(
         &context,
         instance,
         Some(instance.key),
@@ -285,9 +428,8 @@ fn request_scheduler_keeps_tcp_ack_rates_flow_local() {
             .expect("other-flow ACK sample"),
         true,
     );
-    let unowned =
-        relay_path_snapshot_for_bulk_choice(&context, instance, Some(instance.key), None, true)
-            .expect("flow without local rate snapshot");
+    let unowned = relay_path_snapshot_for_test(&context, instance, Some(instance.key), None, true)
+        .expect("flow without local rate snapshot");
     assert_eq!(unowned.delivery_rate_bps, 500_000_000.0);
     assert_eq!(
         unowned.rate_scope,
@@ -313,7 +455,7 @@ fn provisional_tcp_prior_yields_to_mature_exact_subflow_pipe_credit() {
         },
     )]);
 
-    let subflow = relay_path_snapshot_for_bulk_choice(
+    let subflow = relay_path_snapshot_for_test(
         &context,
         candidate_instance,
         Some(service.key()),
@@ -335,7 +477,7 @@ fn provisional_tcp_prior_yields_to_mature_exact_subflow_pipe_credit() {
             delivery_samples: RELIABLE_INITIAL_WINDOW_PACKETS as u32,
         },
     )]);
-    let mature = relay_path_snapshot_for_bulk_choice(
+    let mature = relay_path_snapshot_for_test(
         &context,
         candidate_instance,
         Some(service.key()),
@@ -351,7 +493,7 @@ fn provisional_tcp_prior_yields_to_mature_exact_subflow_pipe_credit() {
     );
 
     context.reserve_tcp_path_load(candidate_instance.key.index, FlowLane::Throughput);
-    let owned = relay_path_snapshot_for_bulk_choice(
+    let owned = relay_path_snapshot_for_test(
         &context,
         candidate_instance,
         Some(service.key()),
@@ -359,7 +501,7 @@ fn provisional_tcp_prior_yields_to_mature_exact_subflow_pipe_credit() {
         true,
     )
     .expect("owned candidate snapshot");
-    let prospective = relay_path_snapshot_for_bulk_choice(
+    let prospective = relay_path_snapshot_for_test(
         &context,
         candidate_instance,
         Some(service.key()),
@@ -393,7 +535,7 @@ fn endpoint_only_candidate_borrows_service_rate_only_until_its_model_matures() {
             },
         ),
     ]);
-    let exploring = relay_path_snapshot_for_bulk_choice(
+    let exploring = relay_path_snapshot_for_test(
         &context,
         candidate.instance(),
         Some(service.key()),
@@ -420,7 +562,7 @@ fn endpoint_only_candidate_borrows_service_rate_only_until_its_model_matures() {
             },
         ),
     ]);
-    let corrected = relay_path_snapshot_for_bulk_choice(
+    let corrected = relay_path_snapshot_for_test(
         &context,
         candidate.instance(),
         Some(service.key()),
@@ -456,7 +598,7 @@ fn configured_slow_candidate_does_not_borrow_faster_service_rate() {
             },
         ),
     ]);
-    let snapshot = relay_path_snapshot_for_bulk_choice(
+    let snapshot = relay_path_snapshot_for_test(
         &context,
         candidate.instance(),
         Some(service.key()),
@@ -748,12 +890,10 @@ fn request_calibration_ignores_path_wide_completion_without_directional_provenan
                 candidate,
                 target_bytes: calibration_target,
             });
+        let observation = bulk_observation(&context, &paths, BBR_MAX_SEND_QUANTUM_BYTES);
         choose_bulk_relay_path_for_extent_avoiding(BulkRelayPathRequest {
-            stream_id: StreamId(7),
-            context: &context,
-            paths: &paths,
+            observation: &observation,
             lane: FlowLane::Throughput,
-            frame: None,
             offset: 0,
             payload_bytes: BBR_MAX_SEND_QUANTUM_BYTES,
             cursor: 1,
@@ -855,7 +995,7 @@ fn request_calibration_needs_contention_but_spent_owner_drains_after_two_to_one(
     let flights = RequestFlightLedger::default();
     let calibration_target =
         reliable_request_ack_clock_calibration_target_bytes(context.mux_limits);
-    let service_snapshot = relay_path_snapshot_for_bulk_choice(
+    let service_snapshot = relay_path_snapshot_for_test(
         &context,
         service,
         Some(service.key),
@@ -863,7 +1003,7 @@ fn request_calibration_needs_contention_but_spent_owner_drains_after_two_to_one(
         paths[0].has_load_reservation(),
     )
     .expect("service snapshot");
-    let candidate_snapshot = relay_path_snapshot_for_bulk_choice(
+    let candidate_snapshot = relay_path_snapshot_for_test(
         &context,
         candidate,
         Some(service.key),
@@ -1104,12 +1244,10 @@ fn request_calibration_transaction_drains_prior_optional_owner_before_exact_entr
             Some(operation) => scheduling.with_operation(operation),
             None => scheduling,
         };
+        let observation = bulk_observation(&context, &paths, payload_bytes);
         choose_bulk_relay_path_for_extent_avoiding(BulkRelayPathRequest {
-            stream_id: StreamId(7),
-            context: &context,
-            paths: &paths,
+            observation: &observation,
             lane: FlowLane::Throughput,
-            frame: None,
             offset,
             payload_bytes,
             cursor: 2,
@@ -1154,9 +1292,10 @@ fn request_calibration_transaction_drains_prior_optional_owner_before_exact_entr
         .with_ack_clock_proven([previous])
         .with_calibration_spend([(candidate, target)])
         .with_operation(owner.expect("calibration owner"));
+    let live_observation = bulk_observation(&context, &paths, payload_bytes);
     assert_eq!(
-        live_request_ack_clock_calibration_transaction(
-            &paths,
+        observed_request_ack_clock_calibration_transaction(
+            live_observation.paths.as_slice(),
             service.key,
             Some(live_scheduling.state()),
         ),
@@ -1315,13 +1454,11 @@ fn exhausted_calibration_waits_for_exact_owner_proof_before_next_candidate() {
         None,
         "another candidate must wait while the exhausted exact calibration still owns bytes"
     );
+    let observation = bulk_observation(&context, &paths, BBR_MAX_SEND_QUANTUM_BYTES);
     assert_eq!(
         choose_bulk_relay_path_for_extent_avoiding(BulkRelayPathRequest {
-            stream_id: StreamId(7),
-            context: &context,
-            paths: &paths,
+            observation: &observation,
             lane: FlowLane::Throughput,
-            frame: None,
             offset: BBR_MAX_SEND_QUANTUM_BYTES as u64,
             payload_bytes: BBR_MAX_SEND_QUANTUM_BYTES,
             cursor: 1,
@@ -1508,14 +1645,12 @@ fn request_startup_waits_for_service_anchor_and_authoritative_debt() {
     let empty = RequestFlightLedger::default();
     let exact_state = HashSet::new();
     let scheduling = RequestSchedulingFixture::default().with_rate_proven([paths[0].instance()]);
+    let observation = bulk_observation(&context, &paths, 64 * 1024);
 
     assert_eq!(
         choose_bulk_relay_path_for_extent_avoiding(BulkRelayPathRequest {
-            stream_id: StreamId(7),
-            context: &context,
-            paths: &paths,
+            observation: &observation,
             lane: FlowLane::Throughput,
-            frame: None,
             offset: 0,
             payload_bytes: 64 * 1024,
             cursor: 1,
@@ -1749,13 +1884,11 @@ fn request_startup_owner_needs_ack_clock_proof_after_flights_drain() {
     let attempted = HashSet::from([paths[1].instance()]);
     let pre_graduation_state =
         RequestSchedulingFixture::default().with_rate_proven([paths[0].instance()]);
+    let observation = bulk_observation(&context, &paths, 64 * 1024);
 
     let pre_graduation = choose_bulk_relay_path_for_extent_avoiding(BulkRelayPathRequest {
-        stream_id: StreamId(7),
-        context: &context,
-        paths: &paths,
+        observation: &observation,
         lane: FlowLane::Throughput,
-        frame: None,
         offset: 64 * 1024,
         payload_bytes: 64 * 1024,
         cursor: 1,
@@ -1782,11 +1915,8 @@ fn request_startup_owner_needs_ack_clock_proof_after_flights_drain() {
         .with_graduated([paths[1].instance()]);
     assert_eq!(
         choose_bulk_relay_path_for_extent_avoiding(BulkRelayPathRequest {
-            stream_id: StreamId(7),
-            context: &context,
-            paths: &paths,
+            observation: &observation,
             lane: FlowLane::Throughput,
-            frame: None,
             offset: 64 * 1024,
             payload_bytes: 64 * 1024,
             cursor: 1,
@@ -1807,11 +1937,8 @@ fn request_startup_owner_needs_ack_clock_proof_after_flights_drain() {
         .with_ack_clock_proven([paths[1].instance()]);
     assert_eq!(
         choose_bulk_relay_path_for_extent_avoiding(BulkRelayPathRequest {
-            stream_id: StreamId(7),
-            context: &context,
-            paths: &paths,
+            observation: &observation,
             lane: FlowLane::Throughput,
-            frame: None,
             offset: 64 * 1024,
             payload_bytes: 64 * 1024,
             cursor: 1,
@@ -1863,16 +1990,20 @@ fn exact_flow_local_model_can_own_without_session_global_membership() {
     let globally_admitted = context.ordered_reliable_bulk_striping_path_keys(64 * 1024);
     assert!(globally_admitted.contains(&service.key));
     assert!(!globally_admitted.contains(&candidate.key));
+    let observation = bulk_observation(&context, &paths, 64 * 1024);
+    let candidate_path = observation
+        .path_by_instance(candidate)
+        .expect("candidate observation");
     assert!(request_path_has_exact_flow_local_bulk_model(
-        &paths[1],
+        candidate_path,
         Some(scheduling.state()),
     ));
     assert!(!request_path_has_exact_flow_local_bulk_model(
-        &paths[1],
+        candidate_path,
         Some(missing_graduation.state()),
     ));
     assert!(!request_path_has_exact_flow_local_bulk_model(
-        &paths[1],
+        candidate_path,
         Some(missing_ack_proof.state()),
     ));
     let udp_candidate = relay_path(UnderlayProtocol::Udp, 1, RelayPathPlacement::Validation);
@@ -1886,12 +2017,16 @@ fn exact_flow_local_model_can_own_without_session_global_membership() {
                 delivery_samples: RELIABLE_INITIAL_WINDOW_PACKETS as u32,
             },
         )]);
+    let udp_observation =
+        bulk_observation(&context, std::slice::from_ref(&udp_candidate), 64 * 1024);
     assert!(!request_path_has_exact_flow_local_bulk_model(
-        &udp_candidate,
+        udp_observation
+            .path_by_instance(udp_candidate.instance())
+            .expect("UDP candidate observation"),
         Some(udp_state.state()),
     ));
 
-    let service_snapshot = relay_path_snapshot_for_bulk_choice(
+    let service_snapshot = relay_path_snapshot_for_test(
         &context,
         service,
         Some(service.key),
@@ -1899,7 +2034,7 @@ fn exact_flow_local_model_can_own_without_session_global_membership() {
         true,
     )
     .expect("service snapshot");
-    let candidate_snapshot = relay_path_snapshot_for_bulk_choice(
+    let candidate_snapshot = relay_path_snapshot_for_test(
         &context,
         candidate,
         Some(service.key),
@@ -1942,11 +2077,8 @@ fn exact_flow_local_model_can_own_without_session_global_membership() {
 
     assert_eq!(
         choose_bulk_relay_path_for_extent_avoiding(BulkRelayPathRequest {
-            stream_id: StreamId(7),
-            context: &context,
-            paths: &paths,
+            observation: &observation,
             lane: FlowLane::Throughput,
-            frame: None,
             offset: 64 * 1024,
             payload_bytes: 64 * 1024,
             cursor: 1,
@@ -1978,14 +2110,12 @@ fn bulk_ready_blocks_when_no_attached_path_can_advance_ordered_frontier() {
     };
     let mut ledger = RequestFlightLedger::default();
     ledger.record_owner_frame(missing_owner, &data_frame(0, 64 * 1024));
+    let observation = bulk_observation(&context, &paths, 64 * 1024);
 
     assert_eq!(
         choose_bulk_relay_path_for_extent_avoiding(BulkRelayPathRequest {
-            stream_id: StreamId(7),
-            context: &context,
-            paths: &paths,
+            observation: &observation,
             lane: FlowLane::Throughput,
-            frame: None,
             offset: 64 * 1024,
             payload_bytes: 64 * 1024,
             cursor: 0,
@@ -2016,14 +2146,12 @@ fn relay_lower_frontier_owner_can_lead_from_validation_attachment() {
     ];
     let mut ledger = RequestFlightLedger::default();
     ledger.record_owner_frame(lower_owner, &data_frame(0, 64 * 1024));
+    let observation = bulk_observation(&context, &paths, 64 * 1024);
 
     assert_eq!(
         choose_bulk_relay_path_for_extent_avoiding(BulkRelayPathRequest {
-            stream_id: StreamId(7),
-            context: &context,
-            paths: &paths,
+            observation: &observation,
             lane: FlowLane::Throughput,
-            frame: None,
             offset: 64 * 1024,
             payload_bytes: 64 * 1024,
             cursor: 0,
@@ -2062,13 +2190,12 @@ fn relay_bulk_lead_must_be_admissible_not_lowest_raw_eta() {
         relay_path(UnderlayProtocol::Udp, 0, RelayPathPlacement::Active),
         relay_path(UnderlayProtocol::Udp, 1, RelayPathPlacement::Validation),
     ];
+    let observation = bulk_observation(&context, &paths, 64 * 1024);
 
     let lead = choose_admissible_relay_bulk_lead(RelayBulkLeadRequest {
-        context: &context,
-        paths: &paths,
+        observation: &observation,
         lane: FlowLane::Throughput,
         payload_bytes: 64 * 1024,
-        frame: None,
         active_key: Some(saturated),
         admitted_bulk_keys: &[saturated, admissible],
         restrict_to_admitted: true,
@@ -2111,13 +2238,12 @@ fn relay_lower_owner_uses_sliding_window_not_ordering_debt() {
         relay_path(UnderlayProtocol::Udp, 0, RelayPathPlacement::Active),
         relay_path(UnderlayProtocol::Udp, 1, RelayPathPlacement::Validation),
     ];
+    let observation = bulk_observation(&context, &paths, 64 * 1024);
 
     let lead = choose_admissible_relay_bulk_lead(RelayBulkLeadRequest {
-        context: &context,
-        paths: &paths,
+        observation: &observation,
         lane: FlowLane::Throughput,
         payload_bytes: 64 * 1024,
-        frame: None,
         active_key: Some(owner),
         admitted_bulk_keys: &[owner, alternate],
         restrict_to_admitted: true,
@@ -2174,14 +2300,12 @@ fn ack_clock_proven_tcp_subflow_can_join_across_service_bdp_debt() {
                 },
             ),
         ]);
+    let observation = bulk_observation(&context, &paths, payload_bytes);
 
     assert_eq!(
         choose_bulk_relay_path_for_extent_avoiding(BulkRelayPathRequest {
-            stream_id: StreamId(7),
-            context: &context,
-            paths: &paths,
+            observation: &observation,
             lane: FlowLane::Throughput,
-            frame: None,
             offset: service_debt_bytes as u64,
             payload_bytes,
             cursor: 1,
@@ -2211,14 +2335,12 @@ fn relay_ordinary_bulk_uses_lower_eta_when_frontier_is_clear() {
         relay_path(UnderlayProtocol::Udp, 0, RelayPathPlacement::Active),
         relay_path(UnderlayProtocol::Udp, 1, RelayPathPlacement::Validation),
     ];
+    let observation = bulk_observation(&context, &paths, 64 * 1024);
 
     assert_eq!(
         choose_bulk_relay_path_for_extent_avoiding(BulkRelayPathRequest {
-            stream_id: StreamId(7),
-            context: &context,
-            paths: &paths,
+            observation: &observation,
             lane: FlowLane::Throughput,
-            frame: None,
             offset: 64 * 1024,
             payload_bytes: 64 * 1024,
             cursor: 1,

@@ -37,52 +37,47 @@ contract as same-family multipath placement.
   connection policy, not carrier selection.
 - `src/protocol/`: MPP wire types, authentication, and bounded codecs. A frame
   being representable here does not make it legal on every carrier or role.
-- `src/runtime/relay_*`: product-flow lifecycle, local/target I/O, validation,
-  repair triggers, and client-side relay coordination.
-- `src/runtime/core.rs`: owns the session-shared TCP-Service request-flow count
-  and its cancellation-safe registration lifetime. One active request stream
-  with present work contributes once only while its exact Service is TCP; path
-  attachment load and QUIC-Service demand are different ledgers. It also owns
-  request-side QUIC probe spend and the exact carrier-proof to product-ACK
-  handoff; neither ledger publishes product rate.
-- `src/runtime/relay_striping.rs`: owns TCP request startup, exact-owner
-  graduation, and product-ACK calibration admission. It consumes the frozen
-  exact calibration owner/target plus logical-flow and path evidence but does
-  not redefine any of them.
-- `src/runtime/sender_service.rs`: owns request-local exact calibration identity,
-  frozen target/spend rollback, causal ACK boundaries, and the continuous
-  per-flow ACK model. It serializes request QUIC proof/handoff epochs and counts
-  exact owner ACK bytes without using them as QUIC rate samples. It also ranks
-  immutable response-path snapshots and proposes work. It must not mutate
-  carrier recovery state or claim product offsets before the reliable-path
-  commit.
-- `src/runtime/reliable_path.rs`: owns product stream attachments, exact range
-  flights, ordering debt, and atomic response placement commits.
-- `src/runtime/reliable_path/response_admission.rs`: owns response path evidence,
-  TCP product-ACK calibration state, and scheduler snapshots.
-- `src/runtime/reliable_path/response_placement.rs`: normalizes evidence scope and
-  owns carrier-neutral whole-response-flow placement policy.
-- `src/runtime/reliable_path/response_session.rs`: owns session-wide load,
-  generation fences, bounded probe spend, and exclusive calibration leases.
-- `src/runtime/reliable_path/registry.rs`: owns server stream lookup, carrier
-  instance lifetime, and publication of local/peer path metrics.
-- `src/runtime/reliable_path/quic_capacity_probe.rs`: admits one typed,
-  token-scoped QUIC capacity request. It does not generate generic product
-  evidence.
-- `src/runtime/reliable_path/response_service_handoff.rs`: revalidates and
-  commits whole-flow Service handoff at a clear product frontier.
-- `src/runtime/path_commands.rs`: bounded, lane-separated transfer from the
-  carrier-neutral scheduler to a carrier writer. Queue accounting is owned here
-  and must balance on enqueue, dequeue, cancellation, and receiver drop.
-- `src/runtime/tcp_path.rs` and `src/runtime/server_tcp.rs`: TCP carrier frame
-  I/O. Kernel TCP remains the congestion/retransmission authority.
-- `src/runtime/udp_path.rs` and `src/runtime/udp_metrics.rs`: QUIC path lifecycle
-  and conversion of native carrier observations into path evidence. Application
-  datagram flows are separate from reliable streams carried by QUIC.
-- `src/transport/quic_carrier.rs`: the thin Quinn boundary. It owns QUIC record
-  writes and coherent native ACK/congestion telemetry, not product scheduling.
-- `src/runtime/bulk_admission.rs`, `multipath_model.rs`, and
-  `response_ownership.rs`: carrier-neutral policy and bounded product models.
+- `src/runtime/relay/`: owns client and server flow orchestration, carrier open
+  and attach transactions, remote membership, recovery, and target I/O. It does
+  not own product scheduling formulas or carrier congestion control.
+- `src/runtime/stream/request.rs`: owns the serialized request product state:
+  exact offset flights, ordered Service identity, startup epochs, ACK-clock
+  operation, and per-instance evidence. This aggregate stays lock-free because
+  one client relay task mutates it.
+- `src/runtime/sender/request.rs`: owns request preparation and apply. It
+  reconciles lifecycle state, captures observations, revalidates exact topology,
+  claims load, commits carrier enqueue, and then publishes product state.
+- `src/runtime/sender/request/scheduling.rs`: owns request path admission and
+  ranking over immutable, handle-free observations. TCP startup and ACK-clock
+  calibration remain distinct from QUIC native capacity below this shared
+  product policy.
+- `src/runtime/sender/request/{tcp_capacity,quic_capacity}.rs`: own separate
+  request-direction carrier capacity transactions. They share product intents,
+  not controller state or proof semantics.
+- `src/runtime/stream/response.rs` and `src/runtime/stream/response/`: own the
+  response binding and its session, evidence, admission, handoff, delivery, and
+  commit invariants. One per-session aggregate serializes shared response state.
+- `src/runtime/sender/response.rs` and `src/runtime/sender/response/`: observe,
+  plan, and dispatch response work without claiming product ownership before
+  the stream transaction commits.
+- `src/runtime/path/{set,state,selection}.rs`: own configured carrier identity,
+  shared health and load ledgers, coherent batch observation, and atomic load
+  reservation. The session-shared TCP-Service request-flow count lives in path
+  state and counts each logical stream once, not each attachment.
+- `src/runtime/path/commands.rs`: owns bounded, lane-separated transfer to
+  carrier writers. Queue accounting must balance on enqueue, dequeue,
+  cancellation, and receiver drop.
+- `src/runtime/path/tcp/` and `src/runtime/path/quic/`: own independent carrier
+  actors, I/O, telemetry, recovery, and native capacity evidence. Kernel TCP and
+  Quinn remain their respective congestion and retransmission authorities.
+- `src/runtime/stream/{handle,registry}.rs`: own carrier-neutral stream handles,
+  server stream lookup, exact carrier-instance attachment, and binding lifetime.
+- `src/model/` and `src/scheduler/`: own carrier-neutral evidence vocabulary,
+  bounded product models, admission, and pure ranking. They do not import live
+  relay, stream, or carrier handles.
+- `src/transport/`: owns framing/encryption and thin TCP, UDP, and Quinn
+  adapters. Native telemetry is optional capability evidence, not product
+  ownership authority.
 
 ## Mutation contracts
 

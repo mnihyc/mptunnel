@@ -17,14 +17,14 @@ protocol asymmetry is expected.
 - TCP and QUIC path directories are concrete carrier implementations with
   distinct I/O, telemetry, recovery, and actor lifecycles. Their depth is
   earned even when their file counts differ.
-- Request product state is scattered across sender and relay while response
-  product state has a real stream owner. That directional mismatch is a deeper
-  imbalance than file count and must be corrected with peer stream owners.
-- The fake request sender subtree has been collapsed into one substantive
-  `sender/request.rs` owner. It earns children only when the TCP and QUIC
-  capacity mechanisms move with their state and controller transactions.
-  Response admission is a substantive peer, while response `planner.rs` still
-  mixes selection, handoff, ACK-clock calibration, and orchestration.
+- Request product state now has one lock-free `stream/request.rs` owner, peer to
+  the response binding. Remaining imbalance is orchestration concentrated in
+  the request sender facade, not a reason to fragment the product aggregate.
+- Request sending keeps one flat capability directory. TCP capacity, QUIC
+  capacity, and request scheduling each own a substantive mechanism; the
+  `sender/request.rs` facade retains serialized preparation and apply. It must
+  shrink by moving whole evidence, dispatch, or repair capabilities, not by
+  creating shallow phase directories or hundred-line helper files.
 - Thin facades, one-off helpers, and directories with no independent invariant
   are collapsed instead of being retained for visual symmetry.
 
@@ -71,12 +71,22 @@ pure decision path without reserving probes, drains, or ACK-clock state. Apply
 resolves the exact identity and atomically commits enqueue, exact flight, and
 Service ownership; a failed apply leaves none of them published.
 
-Request selection now stops attachment-vector ordinals at the policy boundary.
-The sender carries the chosen `RelayPathInstance` with the observed remote-set
-membership generation and resolves it again immediately before carrier enqueue.
-Attach, removal, activation/reordering, and set closure advance that generation,
-so a stale choice cannot silently address a replacement attachment. Internal
-cursor arithmetic remains unchanged until the immutable observation migration.
+Request selection stops live runtime owners at the policy boundary. One batch
+path observation uses one health lock and timestamp, then joins exact attachment
+instances, placement, queue readiness, and load ownership without exposing path
+or carrier handles to policy. Shared admission consumes raw candidate evidence;
+TCP and QUIC keep distinct native evidence below that carrier-neutral input.
+
+The serialized sender explicitly executes `prepare -> observe -> decide ->
+apply`. Preparation may reconcile lifecycle state and enqueue control evidence,
+but never unique data. A decision carries the observed `RelayPathInstance` and
+complete remote-set membership generation. Apply resolves that identity,
+conditionally claims scheduler load, enqueues the carrier frame as the commit
+point, transfers the lease, and only then publishes request state. Queue credit
+is revalidated by enqueue, so a stale observation cannot partially commit.
+Proof-authorized startup and calibration also carry proof ID, health generation,
+and attachment epoch; apply revalidates that exact authority before claiming
+load or enqueueing unique data.
 
 ### Carrier paths
 
@@ -153,11 +163,12 @@ after that shared boundary. No OS type or branch enters model or scheduler state
    startup, ordered Service identity, exclusive ACK-clock operation, and one
    exact-instance subflow aggregate now live in `stream/request`; keep it
    lock-free under the client relay task.
-7. Move the separate TCP/QUIC capacity controller state and transactions out of
-   the flat request service only when each becomes a substantive child. Move
-   attach/fail orchestration to the remote-set owner, then replace
-   `relay_striping.rs` with a pure request scheduler over immutable observations
-   and ID-only intents.
+7. Keep separate TCP/QUIC capacity controllers as substantive request children.
+   Request scheduling now consumes immutable observations and returns
+   exact-instance decisions from `sender/request/scheduling.rs`; keep it intact
+   rather than splitting policy phases into shallow files. Remaining work moves
+   attach/fail orchestration to relay ownership and extracts only substantive
+   request evidence, dispatch, or repair capabilities from the facade.
 8. Give response planning coherent observe, decide, typed-intent, and atomic
    apply contracts. These are phase APIs, not mandatory files: keep them inside
    admission, selection, handoff, or dispatch until one phase owns an

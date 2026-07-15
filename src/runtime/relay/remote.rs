@@ -14,7 +14,7 @@ use crate::model::capacity::{
     PATH_OPEN_SCORE_BYTES, adaptive_reliable_relay_chunk_bytes, relay_lane_startup_chunk_bytes,
     reliable_relay_buffer_len,
 };
-use crate::model::path::{RelayPathInstance, RelayPathKey};
+use crate::model::path::{RelayPathInstance, RelayPathKey, RelayPathPlacement};
 use crate::model::work::ReliableWorkClass;
 use crate::mux::MuxLimits;
 use crate::mux::stream::ReliableSendStream;
@@ -490,23 +490,23 @@ impl ReliableRelayRemoteSet {
         true
     }
 
+    /// Transfers a pre-enqueue claim after the synchronous queue commit.
+    /// Generation and instance were resolved with no intervening await.
     pub(in crate::runtime) fn commit_path_instance_load_claim(
         &mut self,
         instance: RelayPathInstance,
         lease: RelayPathLoadLease,
-    ) -> Result<(), RelayPathLoadLease> {
-        let Some(path) = self
+    ) {
+        let path = self
             .paths
             .iter_mut()
             .find(|path| path.instance() == instance)
-        else {
-            return Err(lease);
-        };
-        if path.has_load_reservation() {
-            return Err(lease);
-        }
+            .expect("generation-fenced selected path must remain attached");
+        assert!(
+            !path.has_load_reservation(),
+            "conditionally claimed path load must remain unowned before transfer"
+        );
         path.load_lease = Some(lease);
-        Ok(())
     }
 
     fn active_path_position(&self) -> Option<usize> {
@@ -514,13 +514,6 @@ impl ReliableRelayRemoteSet {
             .iter()
             .rposition(|path| path.placement == RelayPathPlacement::Active)
     }
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(in crate::runtime) enum RelayPathPlacement {
-    Active,
-    Repair,
-    Validation,
 }
 
 fn relay_path_placement_may_wake_work_lane(

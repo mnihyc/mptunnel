@@ -95,6 +95,45 @@ fn relay_path_load_lease_releases_the_reclassified_lane() {
     assert_eq!(health.tcp[0].active_latency_sensitive_flows, 0);
 }
 
+#[test]
+fn request_bulk_flow_registration_counts_only_tcp_service_flows_once() {
+    let paths = vec![
+        "tcp://127.0.0.1:10079".parse().expect("TCP path"),
+        "udp://127.0.0.1:10080".parse().expect("QUIC path"),
+    ];
+    let security = SecurityConfig::encrypted(
+        SharedSecret::new(b"0123456789abcdef0123456789abcdef".to_vec())
+            .expect("registration test secret"),
+    );
+    let context = ClientPathContext::new(paths, security, ResourceLimits::default())
+        .expect("registration test context");
+    assert_eq!(context.active_tcp_service_request_bulk_flows(), 0);
+
+    let first = context.reliable_tcp_request_bulk_flow_registration();
+    first.update(true, Some(UnderlayProtocol::Udp));
+    assert_eq!(context.active_tcp_service_request_bulk_flows(), 0);
+    first.update(true, Some(UnderlayProtocol::Tcp));
+    first.update(true, Some(UnderlayProtocol::Tcp));
+    assert_eq!(context.active_tcp_service_request_bulk_flows(), 1);
+
+    {
+        let second = context.reliable_tcp_request_bulk_flow_registration();
+        second.update(true, Some(UnderlayProtocol::Udp));
+        assert_eq!(context.active_tcp_service_request_bulk_flows(), 1);
+        second.update(true, Some(UnderlayProtocol::Tcp));
+        assert_eq!(context.active_tcp_service_request_bulk_flows(), 2);
+        second.update(true, Some(UnderlayProtocol::Udp));
+        assert_eq!(context.active_tcp_service_request_bulk_flows(), 1);
+    }
+    assert_eq!(context.active_tcp_service_request_bulk_flows(), 1);
+
+    let shared = first.clone();
+    drop(first);
+    assert_eq!(context.active_tcp_service_request_bulk_flows(), 1);
+    drop(shared);
+    assert_eq!(context.active_tcp_service_request_bulk_flows(), 0);
+}
+
 fn reserve_request_tcp_capacity_for_test(
     context: &ClientPathContext,
     path_index: usize,

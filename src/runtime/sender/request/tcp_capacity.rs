@@ -10,6 +10,7 @@ use crate::model::capacity::{
     TcpCapacityProofCandidate, product_delivery_samples_override_startup_prior,
 };
 use crate::model::path::RelayPathInstance;
+use crate::model::path::RelayPathPlacement;
 use crate::model::request::capacity::{
     request_capacity_stable_candidate_share_bytes, request_tcp_capacity_calibration_geometry,
     request_tcp_capacity_calibration_lease, request_tcp_capacity_candidate_can_start_receipt,
@@ -24,7 +25,7 @@ use crate::runtime::path::{
 };
 #[cfg(feature = "lab-diagnostics")]
 use crate::runtime::relay::ReliableRelayRemotePath;
-use crate::runtime::relay::{RelayPathPlacement, ReliableRelayRemoteSet};
+use crate::runtime::relay::ReliableRelayRemoteSet;
 use crate::runtime::stream::request::RequestStreamState;
 use crate::scheduler::FlowLane;
 use std::collections::{HashMap, HashSet};

@@ -4,6 +4,11 @@
 //! observe/intent/apply scheduling cycle. TCP receipt calibration and QUIC
 //! packet-ACK calibration remain distinct mechanisms below that product state.
 
+use self::scheduling::{
+    BulkRelayFrameRequest, BulkRelayPathChoice, ObservedBulkPathCandidate,
+    RequestRelayPathObservation, RequestRelaySchedulingObservation, RequestRelayTcpPathObservation,
+    RequestSchedulingState, choose_bulk_relay_path_avoiding,
+};
 use super::queue::{ReliableRelayQueuedWorkKind, ReliableRelaySenderQueue};
 use super::work::{
     CarrierEmitMode, ClientRepairOutputIdentity, RelaySendCause, RelaySendOutcome,
@@ -19,7 +24,9 @@ use crate::model::capacity::{
 use crate::model::multipath::{
     ExtraTrafficKind, ExtraTrafficLedger, FlowSubflowSet, PathRuntimeRole,
 };
-use crate::model::path::{RelayPathInstance, RelayPathKey};
+use crate::model::path::{
+    RelayPathInstance, RelayPathKey, RelayPathPlacement, RelayPathProofEpoch,
+};
 use crate::model::request::evidence::{
     RequestOwnerAckProgress, RequestPathRateEvidenceUpdate, RequestPerFlowRateModel,
     RequestTcpAckTurnoverModel, request_path_rate_coverage_floor_bytes,
@@ -43,12 +50,8 @@ use crate::runtime::relay::io::{
 };
 use crate::runtime::relay::open::ReliableRelayOpenSpec;
 use crate::runtime::relay::remote::{
-    RelayPathPlacement, ReliableRelayAttachMode, ReliableRelayRemotePath, ReliableRelayRemoteSet,
+    ReliableRelayAttachMode, ReliableRelayRemotePath, ReliableRelayRemoteSet,
     attach_reliable_relay_paths,
-};
-use crate::runtime::relay_striping::{
-    BulkRelayFrameRequest, BulkRelayPathChoice, RequestSchedulingState,
-    choose_bulk_relay_path_avoiding,
 };
 use crate::runtime::stream::request::{
     RequestAckClockOperation, RequestStartupAdmission, RequestStreamState,
@@ -63,6 +66,7 @@ use std::collections::{HashMap, HashSet};
 use std::time::{Duration, Instant};
 
 mod quic_capacity;
+mod scheduling;
 mod tcp_capacity;
 #[cfg(test)]
 pub(super) mod test_support;
@@ -98,6 +102,162 @@ fn sender_service_frame_kind(frame: &Frame) -> &'static str {
     }
 }
 
+/// Samples runtime owners once; policy below this boundary is read-only.
+fn observe_request_relay_scheduling(
+    context: &ClientPathContext,
+    stream_id: StreamId,
+    membership_generation: u64,
+    remote_paths: &[ReliableRelayRemotePath],
+    frame: Option<&Frame>,
+    lane: FlowLane,
+    payload_bytes: usize,
+    include_bulk_admission: bool,
+) -> RequestRelaySchedulingObservation {
+    let path_evidence = context.observe_reliable_request_paths(
+        remote_paths.iter().map(|path| {
+            (
+                path.key(),
+                path.path_proof_id.map(|proof_id| RelayPathProofEpoch {
+                    proof_id,
+                    proof_generation: path.path_proof_generation,
+                    attached_at: path.attached_at,
+                }),
+            )
+        }),
+        payload_bytes,
+        include_bulk_admission,
+    );
+    let paths = remote_paths
+        .iter()
+        .zip(path_evidence.paths)
+        .map(|(path, evidence)| {
+            let instance = path.instance();
+            debug_assert_eq!(instance.key, evidence.key);
+            RequestRelayPathObservation {
+                instance,
+                placement: path.placement,
+                can_enqueue_frame: frame
+                    .map(|frame| path.stream.can_enqueue_frame_now(frame, lane))
+                    .unwrap_or(true),
+                can_enqueue_stream_lane: frame
+                    .map(|frame| path.stream.can_enqueue_frame_now(frame, path.stream.lane))
+                    .unwrap_or(true),
+                load_owned: path.has_load_reservation(),
+                shared_snapshot: evidence.shared_snapshot,
+                tcp: evidence.tcp.map(|tcp| RequestRelayTcpPathObservation {
+                    startup_snapshot: tcp.startup_snapshot,
+                    rate_hint_unknown: tcp.rate_hint_unknown,
+                }),
+                has_bulk_model_evidence: evidence.has_bulk_model_evidence,
+                fresh_proof: evidence.fresh_proof,
+                config_ordinal: evidence.config_ordinal,
+            }
+        })
+        .collect();
+    RequestRelaySchedulingObservation {
+        stream_id,
+        membership_generation,
+        mux_limits: context.mux_limits,
+        paths,
+        global_bulk_candidates: path_evidence
+            .bulk_candidates
+            .into_iter()
+            .map(|candidate| ObservedBulkPathCandidate {
+                candidate,
+                config_ordinal: context.relay_path_config_ordinal(candidate.key),
+            })
+            .collect(),
+        active_tcp_service_bulk_flows: path_evidence.active_tcp_service_bulk_flows,
+        latency_pressure: path_evidence.latency_pressure,
+    }
+}
+
+fn observed_request_load_expectation(
+    observation: &RequestRelaySchedulingObservation,
+    instance: RelayPathInstance,
+) -> Result<Option<(RelayPathKey, u32, u32)>, RuntimeError> {
+    let path = observation
+        .path_by_instance(instance)
+        .ok_or(RuntimeError::SenderServiceBlocked)?;
+    if path.load_owned {
+        return Ok(None);
+    }
+    let snapshot = path
+        .shared_snapshot
+        .ok_or(RuntimeError::SenderServiceBlocked)?;
+    Ok(Some((
+        instance.key,
+        snapshot.active_flows,
+        snapshot.active_latency_sensitive_flows,
+    )))
+}
+
+fn choose_observed_ordinary_data_path(
+    observation: &RequestRelaySchedulingObservation,
+    lane: FlowLane,
+    payload_bytes: usize,
+    cursor: usize,
+    avoid_keys: &[RelayPathKey],
+) -> Result<RelayPathInstance, RuntimeError> {
+    let has_active_path = observation
+        .paths
+        .iter()
+        .any(|path| path.placement == RelayPathPlacement::Active);
+    let allowed = |path: &&RequestRelayPathObservation| {
+        (!has_active_path || path.placement == RelayPathPlacement::Active)
+            && path.can_enqueue_stream_lane
+    };
+    let choose = |prefer_avoiding: bool| {
+        observation
+            .paths
+            .iter()
+            .enumerate()
+            .filter(|(_, path)| !prefer_avoiding || !avoid_keys.contains(&path.instance.key))
+            .filter(|(_, path)| allowed(path))
+            .filter_map(|(position, path)| {
+                let snapshot = path.shared_snapshot?;
+                let score = scheduler::score_path(
+                    snapshot,
+                    lane,
+                    payload_bytes,
+                    SchedulerPolicy::default(),
+                )?;
+                Some((
+                    path.instance,
+                    score.eta_ms,
+                    cyclic_cursor_distance(position, cursor, observation.paths.len()),
+                ))
+            })
+            .min_by(|left, right| {
+                left.1
+                    .total_cmp(&right.1)
+                    .then_with(|| left.2.cmp(&right.2))
+            })
+            .map(|(instance, _, _)| instance)
+    };
+    if let Some(instance) = choose(true).or_else(|| choose(false)) {
+        return Ok(instance);
+    }
+    let capacity_fallback = observation
+        .paths
+        .iter()
+        .filter(&allowed)
+        .find(|path| !avoid_keys.contains(&path.instance.key))
+        .or_else(|| observation.paths.iter().find(allowed));
+    if let Some(path) = capacity_fallback {
+        return Ok(path.instance);
+    }
+    if observation
+        .paths
+        .iter()
+        .any(|path| !has_active_path || path.placement == RelayPathPlacement::Active)
+    {
+        Err(RuntimeError::SenderServiceBlocked)
+    } else {
+        Err(RuntimeError::ReliablePathSessionClosed)
+    }
+}
+
 #[derive(Debug)]
 struct RelayPathSendSelection {
     target: RequestRelayPathIntent,
@@ -105,6 +265,15 @@ struct RelayPathSendSelection {
     request_startup_commit: Option<RequestStartupAdmission>,
     request_calibration_commit: Option<RequestAckClockCalibrationCommit>,
     request_load_expectation: Option<(RelayPathKey, u32, u32)>,
+    request_proof_expectation: Option<RelayPathProofEpoch>,
+}
+
+/// Preparation may enqueue control evidence but never publishes unique data.
+/// The resulting generation and payload classification bound one observation.
+#[derive(Debug, Clone, Copy)]
+struct PreparedRelayPathDecision {
+    membership_generation: u64,
+    unique_data_payload_bytes: Option<usize>,
 }
 
 /// Reconnects may reuse a logical path key, so apply is fenced by incarnation
@@ -142,6 +311,7 @@ impl RelayPathSendSelection {
             request_startup_commit: None,
             request_calibration_commit: None,
             request_load_expectation: None,
+            request_proof_expectation: None,
         }
     }
 }
@@ -842,14 +1012,8 @@ impl RequestSenderService {
                 .last()
                 .map(|path| path.stream.lane)
                 .unwrap_or(FlowLane::Latency);
-            if stream_lane.is_bulk()
-                && matches!(frame, Frame::StreamData { .. })
-                && !cause.is_repair()
-            {
-                remotes.retry_pending_path_proofs(context);
-            }
             let selection_lane = request_lane.unwrap_or(stream_lane);
-            let selection = match self.choose_relay_path_send(
+            let selection = match self.plan_relay_path_send(
                 context,
                 remotes,
                 &frame,
@@ -869,6 +1033,7 @@ impl RequestSenderService {
                 request_startup_commit,
                 request_calibration_commit,
                 request_load_expectation,
+                request_proof_expectation,
             } = selection;
             let Some(position) =
                 remotes.path_position_at_generation(target.membership_generation, target.instance)
@@ -876,6 +1041,19 @@ impl RequestSenderService {
                 return Err(RuntimeError::SenderServiceBlocked);
             };
             let instance = target.instance;
+            if request_proof_expectation.is_some_and(|proof| {
+                !context.relay_path_proof_epoch_is_current(instance.key, proof)
+            }) {
+                #[cfg(feature = "lab-diagnostics")]
+                lab_diagnostic(
+                    "request_path_proof",
+                    format_args!(
+                        "phase=apply_stale stream_id={} underlay={:?} path_index={} instance_id={}",
+                        self.stream_id.0, instance.key.underlay, instance.key.index, instance.id,
+                    ),
+                );
+                return Err(RuntimeError::SenderServiceBlocked);
+            }
             let (lane, emit_mode) = if matches!(cause, RelaySendCause::StreamFin) {
                 (
                     remotes.paths[position].stream.lane,
@@ -916,15 +1094,10 @@ impl RequestSenderService {
                 emit_mode,
             ) {
                 Ok(()) => {
-                    if let Some(admission) = request_startup_commit {
-                        self.request.startup.commit_admission(admission);
-                    }
-                    self.commit_request_ack_clock_calibration(request_calibration_commit);
-                    let claimed_load = request_load_claim.is_some();
                     if let Some(claim) = request_load_claim {
                         // The exact path owns the lease after carrier enqueue;
                         // path removal or relay cancellation releases it.
-                        let _ = remotes.commit_path_instance_load_claim(instance, claim);
+                        remotes.commit_path_instance_load_claim(instance, claim);
                         #[cfg(feature = "lab-diagnostics")]
                         lab_diagnostic(
                             "request_startup_selection",
@@ -934,19 +1107,12 @@ impl RequestSenderService {
                             ),
                         );
                     }
+                    if let Some(admission) = request_startup_commit {
+                        self.request.startup.commit_admission(admission);
+                    }
+                    self.commit_request_ack_clock_calibration(request_calibration_commit);
                     if matches!(frame, Frame::StreamData { .. }) {
                         let sent_bytes = reliable_stream_frame_accounted_bytes(&frame);
-                        if data_role.is_some() && !claimed_load {
-                            // Validation attachment is not demand. Its first
-                            // unique OwnerData commits this flow's carrier load
-                            // so concurrent flows divide capacity and explore a
-                            // different idle Subflow when one exists.
-                            remotes.reserve_path_instance_load_if_needed(
-                                context,
-                                instance,
-                                selection_lane,
-                            );
-                        }
                         context.record_relay_path_send(
                             instance.key.underlay,
                             instance.key.index,
@@ -1018,19 +1184,29 @@ impl RequestSenderService {
         Err(last_error.unwrap_or(RuntimeError::ReliablePathSessionClosed))
     }
 
-    fn choose_relay_path_send(
+    fn prepare_relay_path_decision(
         &mut self,
         context: &ClientPathContext,
-        remotes: &ReliableRelayRemoteSet,
+        remotes: &mut ReliableRelayRemoteSet,
         frame: &Frame,
         lane: FlowLane,
         cause: RelaySendCause,
-        avoid_keys: &[RelayPathKey],
-    ) -> Result<RelayPathSendSelection, RuntimeError> {
+    ) -> Result<PreparedRelayPathDecision, RuntimeError> {
         if remotes.paths.is_empty() {
             return Err(RuntimeError::ReliablePathSessionClosed);
         }
         let membership_generation = remotes.membership_generation();
+        let unique_data_payload_bytes = (matches!(frame, Frame::StreamData { .. })
+            && !cause.is_repair())
+        .then(|| reliable_stream_frame_accounted_bytes(frame));
+        if remotes
+            .paths
+            .last()
+            .is_some_and(|path| path.stream.lane.is_bulk())
+            && unique_data_payload_bytes.is_some()
+        {
+            remotes.retry_pending_path_proofs(context);
+        }
         self.retry_request_startup_receipt_proof(context, remotes);
         if !cause.is_repair()
             && let Some((offset, _, _)) = reliable_stream_frame_extent(frame)
@@ -1051,10 +1227,9 @@ impl RequestSenderService {
             self.reset_request_subflow_epoch();
         }
         self.reconcile_request_subflow_set(context, remotes);
-        if matches!(frame, Frame::StreamData { .. }) && !cause.is_repair() {
+        if let Some(payload_bytes) = unique_data_payload_bytes {
             self.try_start_request_tcp_capacity_calibration(context, remotes, lane);
             self.try_start_request_quic_capacity_calibration(context, remotes, lane);
-            let payload_bytes = reliable_stream_frame_accounted_bytes(frame);
             let sealed_owner = self.request.startup.epoch.as_mut().and_then(|epoch| {
                 let owner = epoch.startup_owner_key()?;
                 epoch
@@ -1076,10 +1251,38 @@ impl RequestSenderService {
                 );
                 self.try_enqueue_request_startup_receipt_proof(context, remotes, owner);
             }
-            match choose_bulk_relay_path_avoiding(BulkRelayFrameRequest {
-                stream_id: remotes.stream_id(),
+        }
+        Ok(PreparedRelayPathDecision {
+            membership_generation,
+            unique_data_payload_bytes,
+        })
+    }
+
+    fn plan_relay_path_send(
+        &mut self,
+        context: &ClientPathContext,
+        remotes: &mut ReliableRelayRemoteSet,
+        frame: &Frame,
+        lane: FlowLane,
+        cause: RelaySendCause,
+        avoid_keys: &[RelayPathKey],
+    ) -> Result<RelayPathSendSelection, RuntimeError> {
+        let prepared = self.prepare_relay_path_decision(context, remotes, frame, lane, cause)?;
+        if let Some(payload_bytes) = prepared.unique_data_payload_bytes {
+            let observe_bulk_admission =
+                lane.is_bulk() && remotes.paths.len() > 1 && avoid_keys.is_empty();
+            let relay_observation = observe_request_relay_scheduling(
                 context,
-                paths: &remotes.paths,
+                remotes.stream_id(),
+                prepared.membership_generation,
+                &remotes.paths,
+                Some(frame),
+                lane,
+                payload_bytes,
+                observe_bulk_admission,
+            );
+            match choose_bulk_relay_path_avoiding(BulkRelayFrameRequest {
+                observation: &relay_observation,
                 lane,
                 frame,
                 cursor: self.next_send_index,
@@ -1104,18 +1307,21 @@ impl RequestSenderService {
                     } else {
                         PathRuntimeRole::Subflow
                     };
-                    return Ok(RelayPathSendSelection::new(
+                    let mut selection = RelayPathSendSelection::new(
                         RequestRelayPathIntent {
-                            membership_generation,
+                            membership_generation: relay_observation.membership_generation,
                             instance,
                         },
                         Some(role),
-                    ));
+                    );
+                    selection.request_load_expectation =
+                        observed_request_load_expectation(&relay_observation, instance)?;
+                    return Ok(selection);
                 }
                 BulkRelayPathChoice::SelectedStartupSubflow {
                     service,
                     candidate,
-                    load_expectation,
+                    proof,
                 } => {
                     let payload_bytes = reliable_stream_frame_accounted_bytes(frame);
                     let admission = self
@@ -1125,19 +1331,23 @@ impl RequestSenderService {
                         .ok_or(RuntimeError::SenderServiceBlocked)?;
                     return Ok(RelayPathSendSelection {
                         target: RequestRelayPathIntent {
-                            membership_generation,
+                            membership_generation: relay_observation.membership_generation,
                             instance: candidate,
                         },
                         data_role: Some(PathRuntimeRole::Subflow),
                         request_startup_commit: Some(admission),
                         request_calibration_commit: None,
-                        request_load_expectation: load_expectation
-                            .map(|(active, latency)| (candidate.key, active, latency)),
+                        request_load_expectation: observed_request_load_expectation(
+                            &relay_observation,
+                            candidate,
+                        )?,
+                        request_proof_expectation: Some(proof),
                     });
                 }
                 BulkRelayPathChoice::SelectedAckClockCalibration {
                     candidate,
                     target_bytes,
+                    proof,
                 } => {
                     let payload_bytes = reliable_stream_frame_accounted_bytes(frame) as u64;
                     let entry_offset = reliable_stream_frame_extent(frame)
@@ -1160,7 +1370,7 @@ impl RequestSenderService {
                     };
                     return Ok(RelayPathSendSelection {
                         target: RequestRelayPathIntent {
-                            membership_generation,
+                            membership_generation: relay_observation.membership_generation,
                             instance: candidate,
                         },
                         data_role: Some(PathRuntimeRole::Subflow),
@@ -1175,7 +1385,11 @@ impl RequestSenderService {
                                 foreign_optional_bytes,
                             },
                         ),
-                        request_load_expectation: None,
+                        request_load_expectation: observed_request_load_expectation(
+                            &relay_observation,
+                            candidate,
+                        )?,
+                        request_proof_expectation: Some(proof),
                     });
                 }
                 BulkRelayPathChoice::SelectedAckClockCalibrationFence { service, candidate } => {
@@ -1196,7 +1410,7 @@ impl RequestSenderService {
                     };
                     return Ok(RelayPathSendSelection {
                         target: RequestRelayPathIntent {
-                            membership_generation,
+                            membership_generation: relay_observation.membership_generation,
                             instance: service,
                         },
                         data_role: Some(PathRuntimeRole::Service),
@@ -1210,11 +1424,33 @@ impl RequestSenderService {
                                 foreign_optional_bytes,
                             },
                         ),
-                        request_load_expectation: None,
+                        request_load_expectation: observed_request_load_expectation(
+                            &relay_observation,
+                            service,
+                        )?,
+                        request_proof_expectation: None,
                     });
                 }
                 BulkRelayPathChoice::Blocked => return Err(RuntimeError::SenderServiceBlocked),
-                BulkRelayPathChoice::NotApplicable => {}
+                BulkRelayPathChoice::NotApplicable => {
+                    let instance = choose_observed_ordinary_data_path(
+                        &relay_observation,
+                        lane,
+                        payload_bytes,
+                        self.next_send_index,
+                        avoid_keys,
+                    )?;
+                    let mut selection = RelayPathSendSelection::new(
+                        RequestRelayPathIntent {
+                            membership_generation: relay_observation.membership_generation,
+                            instance,
+                        },
+                        Some(PathRuntimeRole::Service),
+                    );
+                    selection.request_load_expectation =
+                        observed_request_load_expectation(&relay_observation, instance)?;
+                    return Ok(selection);
+                }
             }
         }
         let position = self.choose_lowest_eta_relay_path(
@@ -1224,16 +1460,16 @@ impl RequestSenderService {
             lane,
             cause,
             avoid_keys,
-            matches!(frame, Frame::StreamData { .. }) && !cause.is_repair(),
+            prepared.unique_data_payload_bytes.is_some(),
         )?;
-        let data_role = if matches!(frame, Frame::StreamData { .. }) && !cause.is_repair() {
+        let data_role = if prepared.unique_data_payload_bytes.is_some() {
             Some(PathRuntimeRole::Service)
         } else {
             None
         };
         Ok(RelayPathSendSelection::new(
             RequestRelayPathIntent {
-                membership_generation,
+                membership_generation: prepared.membership_generation,
                 instance: remotes.paths[position].instance(),
             },
             data_role,

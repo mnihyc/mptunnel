@@ -9,21 +9,20 @@ use super::*;
 #[cfg(feature = "lab-diagnostics")]
 use crate::lab_diagnostics::lab_diagnostic;
 use crate::model::admission::{
-    BulkPathCandidate, bulk_service_horizon_payload_bytes, bulk_striping_admitted_subflows,
+    BulkPathCandidate, bulk_service_horizon_payload_bytes, bulk_striping_admitted_candidates,
 };
 use crate::model::capacity::{PATH_OPEN_SCORE_BYTES, relay_lane_startup_chunk_bytes};
-use crate::model::path::RelayPathKey;
-use crate::protocol::{PathMetricDirection, PathMetrics, UnderlayProtocol};
+use crate::model::path::{RelayPathKey, RelayPathProofEpoch};
+use crate::protocol::{PathMetricDirection, PathMetrics, RateHint, UnderlayProtocol};
 use crate::runtime::datagram::UdpPathCandidate;
 use crate::runtime::path::model::{
     ClientPathObservation, UdpPathRuntimeModel, apply_bulk_latency_isolation,
-    bulk_candidate_has_active_bulk_work, bulk_candidate_has_bulk_rate_evidence,
-    bulk_candidate_has_fresh_native_carrier_rate_evidence, bulk_candidates_span_underlays,
+    bulk_candidate_has_bulk_rate_evidence, bulk_candidate_has_fresh_native_carrier_rate_evidence,
     bulk_path_candidate, carrier_diverse_bulk_validation_order, configured_order_path_indices,
     configured_order_path_scores, endpoint_only_reliable_startup_should_preserve_configured_order,
     health_observations, ordered_path_scores, ordered_path_scores_for_ttl,
     ordered_reliable_path_indices, path_allows_automatic_bulk_use, path_can_be_auto_discovered,
-    path_is_endpoint_only, path_metrics_from_snapshot, path_snapshot,
+    path_is_endpoint_only, path_metrics_from_snapshot, path_snapshot, path_startup_snapshot,
     reliable_reservation_should_use_endpoint_only_startup_order, reliable_stream_path_candidates,
     udp_mtu_payload_bytes, udp_observation_has_datagram_feedback, udp_path_has_realtime_model,
     udp_probe_ceiling_payload_bytes, udp_reliable_stream_loss_repair_penalty_ms,
@@ -32,7 +31,35 @@ use crate::runtime::path::state::{ClientPathHealthRecord, RelayPathLoadLease};
 use crate::scheduler::{
     self, FlowLane, PathSnapshot, PathState as SchedulerPathState, SchedulerPolicy,
 };
+use smallvec::SmallVec;
 use std::time::Instant;
+
+/// One coherent path-owner sample used by request scheduling.
+#[derive(Debug, Clone, Copy)]
+pub(in crate::runtime) struct ReliableRequestPathEvidence {
+    pub(in crate::runtime) key: RelayPathKey,
+    pub(in crate::runtime) shared_snapshot: Option<PathSnapshot>,
+    pub(in crate::runtime) tcp: Option<ReliableRequestTcpPathEvidence>,
+    pub(in crate::runtime) has_bulk_model_evidence: bool,
+    pub(in crate::runtime) fresh_proof: Option<RelayPathProofEpoch>,
+    pub(in crate::runtime) config_ordinal: usize,
+}
+
+/// TCP-only priors stay typed so a QUIC observation cannot carry TCP state.
+#[derive(Debug, Clone, Copy)]
+pub(in crate::runtime) struct ReliableRequestTcpPathEvidence {
+    pub(in crate::runtime) startup_snapshot: PathSnapshot,
+    pub(in crate::runtime) rate_hint_unknown: bool,
+}
+
+/// Coherent request-path evidence captured under one path-state lock.
+#[derive(Debug)]
+pub(in crate::runtime) struct ReliableRequestPathBatchObservation {
+    pub(in crate::runtime) paths: SmallVec<[ReliableRequestPathEvidence; 4]>,
+    pub(in crate::runtime) bulk_candidates: SmallVec<[BulkPathCandidate; 4]>,
+    pub(in crate::runtime) active_tcp_service_bulk_flows: u32,
+    pub(in crate::runtime) latency_pressure: bool,
+}
 
 impl ClientPathContext {
     pub(in crate::runtime) fn relay_path_allows_automatic_bulk_use(
@@ -100,9 +127,10 @@ impl ClientPathContext {
         let Some(current) = records.get_mut(key.index) else {
             return None;
         };
-        if current.manual_disabled
-            || current.state != SchedulerPathState::Active
-            || current.active_flows != expected_active_flows
+        // Topology and carrier credit are revalidated by the sender. This
+        // conditional claim fences only the shared load that influenced the
+        // score; a still-attached Suspect path remains usable as before.
+        if current.active_flows != expected_active_flows
             || current.active_latency_sensitive_flows != expected_active_latency_sensitive_flows
         {
             return None;
@@ -361,34 +389,15 @@ impl ClientPathContext {
         &self,
         payload_bytes: usize,
     ) -> Vec<RelayPathKey> {
-        let mut candidates = self.ordered_reliable_bulk_path_candidates(payload_bytes);
-        let has_bulk_rate_evidence = candidates
-            .iter()
-            .any(|candidate| candidate.has_bulk_rate_evidence);
-        let has_active_bulk_work = candidates.iter().any(bulk_candidate_has_active_bulk_work);
-        if has_bulk_rate_evidence {
-            candidates.retain(|candidate| candidate.has_bulk_rate_evidence);
-        } else if has_active_bulk_work {
-            candidates.retain(bulk_candidate_has_active_bulk_work);
-        } else if !bulk_candidates_span_underlays(&candidates)
-            && candidates
-                .iter()
-                .any(|candidate| candidate.snapshot.active_flows > 0)
-        {
-            candidates.retain(|candidate| candidate.snapshot.active_flows > 0);
-        }
-        candidates.sort_by(|left, right| {
-            left.eta_ms
-                .total_cmp(&right.eta_ms)
-                .then_with(|| self.relay_path_key_order(left.key, right.key))
-        });
-        if !has_bulk_rate_evidence && !has_active_bulk_work {
-            candidates.truncate(1);
-        }
-        bulk_striping_admitted_subflows(candidates, payload_bytes, self.mux_limits)
-            .into_iter()
-            .map(|candidate| candidate.key)
-            .collect()
+        bulk_striping_admitted_candidates(
+            self.ordered_reliable_bulk_path_candidates(payload_bytes),
+            payload_bytes,
+            self.mux_limits,
+            |left, right| self.relay_path_key_order(left, right),
+        )
+        .into_iter()
+        .map(|candidate| candidate.key)
+        .collect()
     }
 
     pub(in crate::runtime) fn ordered_reliable_bulk_validation_path_keys(
@@ -422,11 +431,24 @@ impl ClientPathContext {
     fn ordered_reliable_bulk_path_candidates(
         &self,
         payload_bytes: usize,
-    ) -> Vec<BulkPathCandidate> {
+    ) -> SmallVec<[BulkPathCandidate; 4]> {
         let now = Instant::now();
         let mut health = self.state.health().lock().expect("client path health lock");
         let tcp_observations = health_observations(&mut health.tcp, now);
         let udp_observations = health_observations(&mut health.udp, now);
+        self.reliable_bulk_path_candidates_from_observations(
+            payload_bytes,
+            &tcp_observations,
+            &udp_observations,
+        )
+    }
+
+    fn reliable_bulk_path_candidates_from_observations(
+        &self,
+        payload_bytes: usize,
+        tcp_observations: &[ClientPathObservation],
+        udp_observations: &[ClientPathObservation],
+    ) -> SmallVec<[BulkPathCandidate; 4]> {
         let scoring_payload_bytes =
             bulk_service_horizon_payload_bytes(payload_bytes, self.mux_limits);
         ordered_path_scores(
@@ -475,7 +497,112 @@ impl ClientPathContext {
                 ))
             }),
         )
-        .collect::<Vec<_>>()
+        .collect::<SmallVec<[BulkPathCandidate; 4]>>()
+    }
+
+    /// Captures carrier health for one request decision under one state lock.
+    pub(in crate::runtime) fn observe_reliable_request_paths<I>(
+        &self,
+        attached_paths: I,
+        payload_bytes: usize,
+        include_bulk_admission: bool,
+    ) -> ReliableRequestPathBatchObservation
+    where
+        I: IntoIterator<Item = (RelayPathKey, Option<RelayPathProofEpoch>)>,
+    {
+        let now = Instant::now();
+        let health = self.state.health().lock().expect("client path health lock");
+        // Full configured-path vectors are needed only for multipath admission.
+        // Ordinary and single-path sends sample attached records directly.
+        let bulk_observations = include_bulk_admission.then(|| {
+            (
+                health_observations(&health.tcp, now),
+                health_observations(&health.udp, now),
+            )
+        });
+        let bulk_candidates = bulk_observations
+            .as_ref()
+            .map(|(tcp, udp)| {
+                self.reliable_bulk_path_candidates_from_observations(payload_bytes, tcp, udp)
+            })
+            .unwrap_or_default();
+        let latency_pressure = bulk_observations.as_ref().is_some_and(|(tcp, udp)| {
+            tcp.iter()
+                .chain(udp)
+                .any(|observation| observation.active_latency_sensitive_flows > 0)
+        });
+        let paths = attached_paths
+            .into_iter()
+            .map(|(key, proof)| {
+                let observed = match key.underlay {
+                    UnderlayProtocol::Tcp => self
+                        .tcp_paths
+                        .get(key.index)
+                        .zip(health.tcp.get(key.index))
+                        .map(|(path, record)| {
+                            let observation = bulk_observations
+                                .as_ref()
+                                .and_then(|(tcp, _)| tcp.get(key.index))
+                                .copied()
+                                .unwrap_or_else(|| record.observation_at(now));
+                            (path, observation, record)
+                        }),
+                    UnderlayProtocol::Udp => self
+                        .udp_paths
+                        .get(key.index)
+                        .zip(health.udp.get(key.index))
+                        .map(|(path, record)| {
+                            let observation = bulk_observations
+                                .as_ref()
+                                .and_then(|(_, udp)| udp.get(key.index))
+                                .copied()
+                                .unwrap_or_else(|| record.observation_at(now));
+                            (path, observation, record)
+                        }),
+                };
+                let Some((path, observation, record)) = observed else {
+                    return ReliableRequestPathEvidence {
+                        key,
+                        shared_snapshot: None,
+                        tcp: None,
+                        has_bulk_model_evidence: false,
+                        fresh_proof: None,
+                        config_ordinal: self.relay_path_config_ordinal(key),
+                    };
+                };
+                let fresh_proof = proof.filter(|proof| {
+                    include_bulk_admission
+                        && observation.state == SchedulerPathState::Active
+                        && !observation.manual_disabled
+                        && record.path_proof_generation() == proof.proof_generation
+                        && record
+                            .successful_path_proof_acked_at(proof.proof_id, proof.attached_at, now)
+                            .is_some()
+                });
+                ReliableRequestPathEvidence {
+                    key,
+                    shared_snapshot: Some(path_snapshot(path, key.index, observation)),
+                    tcp: (key.underlay == UnderlayProtocol::Tcp).then(|| {
+                        ReliableRequestTcpPathEvidence {
+                            startup_snapshot: path_startup_snapshot(path, key.index),
+                            rate_hint_unknown: path.metadata.initial_rate == RateHint::Unknown,
+                        }
+                    }),
+                    has_bulk_model_evidence: include_bulk_admission
+                        && bulk_candidate_has_bulk_rate_evidence(path, observation),
+                    fresh_proof,
+                    config_ordinal: self.relay_path_config_ordinal(key),
+                }
+            })
+            .collect();
+        ReliableRequestPathBatchObservation {
+            paths,
+            bulk_candidates,
+            active_tcp_service_bulk_flows: include_bulk_admission
+                .then(|| self.active_tcp_service_request_bulk_flows())
+                .unwrap_or(0),
+            latency_pressure,
+        }
     }
 
     pub(in crate::runtime) fn tcp_health_observations_for_lane(
@@ -857,6 +984,29 @@ impl ClientPathContext {
             UnderlayProtocol::Udp => health.udp.get(index),
         }
         .map(ClientPathHealthRecord::path_proof_generation)
+    }
+
+    /// Revalidates the exact proof epoch at the apply linearization point.
+    pub(in crate::runtime) fn relay_path_proof_epoch_is_current(
+        &self,
+        key: RelayPathKey,
+        proof: RelayPathProofEpoch,
+    ) -> bool {
+        let now = Instant::now();
+        let health = self.state.health().lock().expect("client path health lock");
+        let record = match key.underlay {
+            UnderlayProtocol::Tcp => health.tcp.get(key.index),
+            UnderlayProtocol::Udp => health.udp.get(key.index),
+        };
+        record.is_some_and(|record| {
+            let observation = record.observation_at(now);
+            observation.state == SchedulerPathState::Active
+                && !observation.manual_disabled
+                && record.path_proof_generation() == proof.proof_generation
+                && record
+                    .successful_path_proof_acked_at(proof.proof_id, proof.attached_at, now)
+                    .is_some()
+        })
     }
 
     pub(in crate::runtime) fn relay_path_fresh_proof_acked_as_of(

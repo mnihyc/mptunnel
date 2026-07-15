@@ -24,7 +24,7 @@ pub(super) use io::*;
 pub(in crate::runtime) use open::UdpStreamOpenOptions;
 #[cfg(any(test, feature = "lab-diagnostics"))]
 pub(in crate::runtime) use remote::ReliableRelayRemotePath;
-pub(in crate::runtime) use remote::{RelayPathPlacement, ReliableRelayRemoteSet};
+pub(in crate::runtime) use remote::ReliableRelayRemoteSet;
 pub(in crate::runtime) use server::ServerReliableRelayService;
 #[cfg(test)]
 pub(in crate::runtime) use server::relay_reliable_stream;

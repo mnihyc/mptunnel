@@ -1,6 +1,6 @@
 #[cfg(test)]
 use super::*;
-use crate::model::admission::BulkPathCandidate;
+use crate::model::admission::{BulkPathCandidate, bulk_candidates_span_underlays};
 use crate::model::capacity::{
     BBR_DEFAULT_CWND_GAIN, BBR_MAX_SEND_QUANTUM_BYTES, PATH_OPEN_SCORE_BYTES, PathRateSample,
     QUIC_PERSISTENT_CONGESTION_THRESHOLD, QUIC_TIMER_GRANULARITY, RELIABLE_INITIAL_RTT,
@@ -779,19 +779,6 @@ pub(in crate::runtime) fn udp_observation_has_datagram_feedback(
         || observation.measured_mtu_payload_bytes.is_some()
 }
 
-pub(in crate::runtime) fn path_within_adaptive_lead_hysteresis(
-    old_eta_ms: f64,
-    old_snapshot: PathSnapshot,
-    best_eta_ms: f64,
-    best_snapshot: PathSnapshot,
-    payload_bytes: usize,
-) -> bool {
-    let jitter_hysteresis_ms = old_snapshot.jitter_ms.max(best_snapshot.jitter_ms);
-    let queue_hysteresis_bytes = payload_bytes as u64;
-    old_eta_ms <= best_eta_ms + jitter_hysteresis_ms
-        && old_snapshot.queue_bytes <= best_snapshot.queue_bytes + queue_hysteresis_bytes
-}
-
 pub(in crate::runtime) fn path_can_be_auto_discovered(
     path: &PathSpec,
     observation: ClientPathObservation,
@@ -958,21 +945,6 @@ fn reliable_product_delivery_samples(path: &PathSpec, observation: ClientPathObs
             .saturating_sub(observation.datagram_feedback_samples),
         UnderlayProtocol::Tcp => observation.delivery_samples,
     }
-}
-
-pub(in crate::runtime) fn bulk_candidate_has_active_bulk_work(
-    candidate: &BulkPathCandidate,
-) -> bool {
-    candidate.snapshot.active_flows > candidate.snapshot.active_latency_sensitive_flows
-}
-
-pub(in crate::runtime) fn bulk_candidates_span_underlays(candidates: &[BulkPathCandidate]) -> bool {
-    let Some(first) = candidates.first() else {
-        return false;
-    };
-    candidates
-        .iter()
-        .any(|candidate| candidate.key.underlay != first.key.underlay)
 }
 
 pub(in crate::runtime) fn carrier_diverse_bulk_validation_order(

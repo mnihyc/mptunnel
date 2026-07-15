@@ -7,6 +7,7 @@
 use crate::lab_diagnostics::lab_diagnostic;
 use crate::model::capacity::reliable_subflow_startup_sample_limit_bytes;
 use crate::model::path::RelayPathInstance;
+use crate::model::path::RelayPathPlacement;
 #[cfg(feature = "lab-diagnostics")]
 use crate::model::request::capacity::request_quic_capacity_slow_start_rounds;
 use crate::model::request::capacity::{
@@ -22,7 +23,7 @@ use crate::runtime::path::{
     RequestQuicCapacityProbeLease, RequestQuicCapacityProductHandoffState,
     RequestQuicCapacityReconciliationQuery,
 };
-use crate::runtime::relay::{RelayPathPlacement, ReliableRelayRemoteSet};
+use crate::runtime::relay::ReliableRelayRemoteSet;
 use crate::runtime::stream::request::RequestStreamState;
 use crate::scheduler::FlowLane;
 use std::collections::HashSet;

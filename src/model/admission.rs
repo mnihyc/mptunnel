@@ -7,6 +7,7 @@ use crate::model::path::RelayPathKey;
 use crate::mux::MuxLimits;
 use crate::protocol::UnderlayProtocol;
 use crate::scheduler::{FlowLane, PathSnapshot};
+use smallvec::SmallVec;
 
 // Decisions in this module never mutate a path or enqueue carrier work.
 
@@ -25,6 +26,54 @@ pub(crate) struct BulkPathCandidate {
     #[cfg_attr(not(feature = "lab-diagnostics"), allow(dead_code))]
     pub(crate) has_sender_delivery_evidence: bool,
     pub(crate) snapshot: PathSnapshot,
+}
+
+pub(crate) fn bulk_candidate_has_active_bulk_work(candidate: &BulkPathCandidate) -> bool {
+    candidate.snapshot.active_flows > candidate.snapshot.active_latency_sensitive_flows
+}
+
+pub(crate) fn bulk_candidates_span_underlays(candidates: &[BulkPathCandidate]) -> bool {
+    let Some(first) = candidates.first() else {
+        return false;
+    };
+    candidates
+        .iter()
+        .any(|candidate| candidate.key.underlay != first.key.underlay)
+}
+
+pub(crate) fn bulk_striping_admitted_candidates(
+    candidates: impl IntoIterator<Item = BulkPathCandidate>,
+    payload_bytes: usize,
+    mux_limits: MuxLimits,
+    compare_keys: impl Fn(RelayPathKey, RelayPathKey) -> std::cmp::Ordering,
+) -> SmallVec<[BulkPathCandidate; 4]> {
+    let mut candidates = candidates
+        .into_iter()
+        .collect::<SmallVec<[BulkPathCandidate; 4]>>();
+    let has_bulk_rate_evidence = candidates
+        .iter()
+        .any(|candidate| candidate.has_bulk_rate_evidence);
+    let has_active_bulk_work = candidates.iter().any(bulk_candidate_has_active_bulk_work);
+    if has_bulk_rate_evidence {
+        candidates.retain(|candidate| candidate.has_bulk_rate_evidence);
+    } else if has_active_bulk_work {
+        candidates.retain(|candidate| bulk_candidate_has_active_bulk_work(candidate));
+    } else if !bulk_candidates_span_underlays(&candidates)
+        && candidates
+            .iter()
+            .any(|candidate| candidate.snapshot.active_flows > 0)
+    {
+        candidates.retain(|candidate| candidate.snapshot.active_flows > 0);
+    }
+    candidates.sort_by(|left, right| {
+        left.eta_ms
+            .total_cmp(&right.eta_ms)
+            .then_with(|| compare_keys(left.key, right.key))
+    });
+    if !has_bulk_rate_evidence && !has_active_bulk_work {
+        candidates.truncate(1);
+    }
+    bulk_striping_admitted_subflows(candidates, payload_bytes, mux_limits)
 }
 
 #[cfg_attr(not(test), allow(dead_code))]
@@ -63,15 +112,16 @@ pub(crate) fn bulk_additional_admission_role(
 }
 
 pub(crate) fn bulk_striping_admitted_subflows(
-    candidates: Vec<BulkPathCandidate>,
+    candidates: impl IntoIterator<Item = BulkPathCandidate>,
     payload_bytes: usize,
     mux_limits: MuxLimits,
-) -> Vec<BulkPathCandidate> {
-    let Some(best) = candidates.first().copied() else {
-        return candidates;
+) -> SmallVec<[BulkPathCandidate; 4]> {
+    let mut candidates = candidates.into_iter();
+    let Some(best) = candidates.next() else {
+        return SmallVec::new();
     };
-    let mut selected = Vec::new();
-    for candidate in candidates {
+    let mut selected = SmallVec::new();
+    for candidate in std::iter::once(best).chain(candidates) {
         let role = if selected.is_empty() {
             BulkAdmissionRole::ActiveDataPath
         } else {

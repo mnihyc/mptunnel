@@ -15,9 +15,9 @@ use crate::runtime::error::RuntimeError;
 use crate::runtime::path::ClientPathContext;
 use crate::runtime::path::model::{
     UdpDatagramPathObservation, UdpPathRuntimeModel, path_is_endpoint_only,
-    path_within_adaptive_lead_hysteresis, udp_observation_has_datagram_feedback,
+    udp_observation_has_datagram_feedback,
 };
-use crate::scheduler::PathSnapshot;
+use crate::scheduler::{PathSnapshot, path_within_adaptive_lead_hysteresis};
 use bytes::Bytes;
 use std::collections::{HashMap, HashSet};
 use std::time::{Duration, Instant};

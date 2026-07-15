@@ -123,6 +123,21 @@ impl PathSnapshot {
     }
 }
 
+/// Retains a current lead when the challenger does not clear measured timing
+/// and one scheduling quantum of queue uncertainty.
+pub(crate) fn path_within_adaptive_lead_hysteresis(
+    old_eta_ms: f64,
+    old_snapshot: PathSnapshot,
+    best_eta_ms: f64,
+    best_snapshot: PathSnapshot,
+    payload_bytes: usize,
+) -> bool {
+    let jitter_hysteresis_ms = old_snapshot.jitter_ms.max(best_snapshot.jitter_ms);
+    let queue_hysteresis_bytes = payload_bytes as u64;
+    old_eta_ms <= best_eta_ms + jitter_hysteresis_ms
+        && old_snapshot.queue_bytes <= best_snapshot.queue_bytes + queue_hysteresis_bytes
+}
+
 /// Scheduler policy is intentionally parameter-free in production.
 ///
 /// Scheduling may use live path evidence, protocol-derived timer shape, and

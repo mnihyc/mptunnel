@@ -251,7 +251,7 @@ fn tcp_calibration_commit_fences_generations_and_rolls_back_blocked_enqueue() {
         session_id,
         service.underlay,
         service.path_id,
-        service_commands,
+        service_commands.clone(),
         FlowLane::Throughput,
         mux_limits,
         tracker.clone(),
@@ -340,12 +340,16 @@ fn tcp_calibration_commit_fences_generations_and_rolls_back_blocked_enqueue() {
         .into_iter()
         .find(|target| target.observation.key == candidate)
         .expect("candidate target");
-    let service_target = binding
-        .sender_path_targets(FlowLane::Throughput, payload_bytes)
-        .into_iter()
-        .find(|target| target.observation.key == service)
-        .expect("service target");
     let request_for = |binding: &ResponseStreamBinding| {
+        let targets = binding.sender_path_targets(FlowLane::Throughput, payload_bytes);
+        let pending_bytes = |key| {
+            targets
+                .iter()
+                .find(|target| target.observation.key == key)
+                .expect("calibration target remains attached")
+                .observation
+                .command_pending_bytes
+        };
         let (expected_planner_generation, _) = binding.subflow_state_snapshot();
         ResponseAckClockCalibrationRequest {
             expected_planner_generation,
@@ -353,8 +357,8 @@ fn tcp_calibration_commit_fences_generations_and_rolls_back_blocked_enqueue() {
             expected_model_generation: binding.response_model_generation(),
             service,
             service_incarnation,
-            service_pending_bytes: 0,
-            target_pending_bytes: target.commands.pending_bytes(),
+            service_pending_bytes: pending_bytes(service),
+            target_pending_bytes: pending_bytes(candidate),
             limit_bytes: reliable_ack_clock_calibration_limit_bytes(mux_limits),
             requires_active_response_start: true,
         }
@@ -468,8 +472,7 @@ fn tcp_calibration_commit_fences_generations_and_rolls_back_blocked_enqueue() {
     candidate_receivers.release_pending_command_bytes(candidate_pending_bytes);
 
     let stale_service_pending = request_for(&binding);
-    service_target
-        .commands
+    service_commands
         .try_enqueue_stream_ordered_frame(
             stream_data_frame_at(payload_bytes as u64, payload_bytes),
             FlowLane::Throughput,
@@ -544,13 +547,14 @@ fn tcp_calibration_commit_fences_generations_and_rolls_back_blocked_enqueue() {
         );
     }
 
+    let detached = request_for(&binding);
     binding.detach(candidate, &candidate_commands);
     assert!(matches!(
         binding.try_enqueue_owner_frame_for_target(
             &target,
             &frame,
             FlowLane::Throughput,
-            ResponseOwnerEnqueueAdmission::AckClockCalibration(request_for(&binding)),
+            ResponseOwnerEnqueueAdmission::AckClockCalibration(detached),
         ),
         Err(RuntimeError::SenderServiceBlocked)
     ));

@@ -14,7 +14,9 @@ use crate::model::response::{
     ResponseServiceFamilyLoads, ResponseServiceHandoffMode,
 };
 use crate::protocol::frame::reliable_stream_frame_accounted_bytes;
-use crate::runtime::sender::response::test_support::response_target;
+use crate::runtime::sender::response::test_support::{
+    observe_response_target_commands, response_target,
+};
 use crate::runtime::stream::response::{
     ResponseAckClockCalibrationRetirementRequest, ResponseDispatchTarget, ResponseSenderPathTarget,
     ResponseServiceHandoffDrainReservation, ResponseStreamAttachOutcome, ResponseStreamBinding,
@@ -275,7 +277,7 @@ fn response_stream_ordered_final_control_waits_for_backpressured_active_lead() {
         .expect("fill active data queue");
     let mut active_data_owner =
         response_target(0, UnderlayProtocol::Tcp, 50.0, 0, 512 * 1024, true);
-    active_data_owner.commands = active_commands;
+    observe_response_target_commands(&mut active_data_owner, &active_commands);
     let validation_lower_eta = response_target(1, UnderlayProtocol::Tcp, 5.0, 0, 512 * 1024, false);
 
     let selected = choose_response_sender_target(
@@ -357,7 +359,7 @@ fn response_data_admission_uses_writer_pending_bytes_not_only_slots() {
     let (commands, _receivers) = reliable_path_command_channels(2048);
     let mut snapshot = PathSnapshot::new(PathId(0), UnderlayProtocol::Udp, 1.0, 8_000_000.0);
     snapshot.confidence = 1.0;
-    let saturated = ResponseSenderPathTarget {
+    let mut saturated = ResponseSenderPathTarget {
         #[cfg(feature = "lab-diagnostics")]
         session_id: SessionId(0),
         #[cfg(feature = "lab-diagnostics")]
@@ -380,7 +382,9 @@ fn response_data_admission_uses_writer_pending_bytes_not_only_slots() {
             has_service_feed_evidence: true,
             has_bulk_rate_evidence: true,
         },
-        commands,
+        command_queue: commands.queue_snapshot(),
+        tcp_capacity_probe_attempted: commands.tcp_capacity_probe_attempted(),
+        tcp_capacity_probe_active: commands.tcp_capacity_probe_active(),
         endpoint_only_service_prior_eligible: false,
         quic_capacity_proof: None,
         quic_capacity_calibration_attempts: 0,
@@ -397,13 +401,12 @@ fn response_data_admission_uses_writer_pending_bytes_not_only_slots() {
         payload_bytes,
         mux_limits,
     );
-    while saturated.commands.pending_bytes() + payload_bytes as u64 <= credit as u64 {
-        saturated
-            .commands
+    while commands.pending_bytes() + payload_bytes as u64 <= credit as u64 {
+        commands
             .try_enqueue_admitted_frame(
                 Frame::StreamData {
                     stream_id: StreamId(7),
-                    offset: saturated.commands.pending_bytes(),
+                    offset: commands.pending_bytes(),
                     flags: StreamFlags::NONE,
                     payload: Bytes::from(vec![0; payload_bytes]),
                 },
@@ -411,6 +414,7 @@ fn response_data_admission_uses_writer_pending_bytes_not_only_slots() {
             )
             .expect("prefill data pipe");
     }
+    observe_response_target_commands(&mut saturated, &commands);
 
     let admissible = response_target(1, UnderlayProtocol::Udp, 2.0, 0, 512 * 1024, false);
     let selected = choose_response_sender_data_target(
@@ -425,8 +429,7 @@ fn response_data_admission_uses_writer_pending_bytes_not_only_slots() {
 
     assert_eq!(selected.observation.key, admissible.observation.key);
     assert!(
-        saturated
-            .commands
+        commands
             .pending_bytes()
             .saturating_add(payload_bytes as u64)
             > credit as u64,
@@ -788,7 +791,7 @@ fn prospective_service_uses_service_credit_instead_of_optional_pipe_credit() {
         payload_bytes as u64,
         false,
     );
-    failover.commands = commands;
+    observe_response_target_commands(&mut failover, &commands);
     failover.observation.has_bulk_rate_evidence = false;
     failover.observation.snapshot.delivery_rate_bps = 1.0;
     failover.observation.snapshot.pacing_rate_bps = 1.0;
@@ -804,18 +807,16 @@ fn prospective_service_uses_service_credit_instead_of_optional_pipe_credit() {
         optional_credit < service_credit,
         "fixture requires optional-path credit below prospective Service credit"
     );
-    while failover
-        .commands
+    while commands
         .pending_bytes()
         .saturating_add(payload_bytes as u64)
         <= optional_credit as u64
     {
-        failover
-            .commands
+        commands
             .try_enqueue_admitted_frame(
                 Frame::StreamData {
                     stream_id: StreamId(74),
-                    offset: failover.commands.pending_bytes(),
+                    offset: commands.pending_bytes(),
                     flags: StreamFlags::NONE,
                     payload: Bytes::from(vec![0; payload_bytes]),
                 },
@@ -823,8 +824,9 @@ fn prospective_service_uses_service_credit_instead_of_optional_pipe_credit() {
             )
             .expect("prefill prospective Service without exhausting queue slots");
     }
+    observe_response_target_commands(&mut failover, &commands);
     assert!(
-        failover.commands.can_enqueue_lane_now(FlowLane::Throughput),
+        commands.can_enqueue_lane_now(FlowLane::Throughput),
         "fixture must retain a real writer queue slot"
     );
     assert!(
@@ -990,7 +992,7 @@ fn clear_frontier_stale_owner_without_lane_capacity_elects_liveness_service_fail
             FlowLane::Throughput,
         )
         .expect("seed full owner data queue");
-    stale_owner.commands = owner_commands;
+    observe_response_target_commands(&mut stale_owner, &owner_commands);
     let mut failover = response_target(
         0,
         UnderlayProtocol::Udp,
@@ -1274,7 +1276,7 @@ fn path_failure_repair_bypasses_stale_owner_emission_credit_but_not_queue_capaci
     let payload_bytes = 8 * 1024;
     let (commands, _receivers) = reliable_path_command_channels(64);
     let mut survivor = response_target(1, UnderlayProtocol::Udp, 5.0, 0, 16 * 1024, false);
-    survivor.commands = commands.clone();
+    observe_response_target_commands(&mut survivor, &commands);
     survivor.observation.has_sender_evidence = true;
     survivor.observation.has_bulk_rate_evidence = false;
 
@@ -1301,6 +1303,7 @@ fn path_failure_repair_bypasses_stale_owner_emission_credit_but_not_queue_capaci
             )
             .expect("prefill survivor data queue without exhausting slots");
     }
+    observe_response_target_commands(&mut survivor, &commands);
 
     let repair_frame = Frame::StreamData {
         stream_id: StreamId(72),
@@ -1309,9 +1312,7 @@ fn path_failure_repair_bypasses_stale_owner_emission_credit_but_not_queue_capaci
         payload: Bytes::from(vec![7_u8; payload_bytes]),
     };
     assert!(
-        survivor
-            .commands
-            .can_enqueue_frame_now(&repair_frame, FlowLane::Throughput),
+        commands.can_enqueue_frame_now(&repair_frame, FlowLane::Throughput),
         "test setup must leave a real queue slot for failover RepairData"
     );
     assert!(
@@ -1986,7 +1987,7 @@ fn backpressured_service_remains_lower_frontier_completion_baseline() {
             FlowLane::Throughput,
         )
         .expect("test setup should fill the Service data queue");
-    service.commands = service_commands;
+    observe_response_target_commands(&mut service, &service_commands);
     let lower_owner = response_target(0, UnderlayProtocol::Udp, 5.0, 0, 16 * 1024 * 1024, false);
     let lower_flights = [CarrierPathFlightDebt {
         key: lower_owner.observation.key,
@@ -2049,7 +2050,7 @@ fn clear_frontier_unavailable_ordered_owner_reanchors_service_to_bulk_proven_pat
         PathSnapshot::new(PathId(1), UnderlayProtocol::Tcp, 50.0, 500_000_000.0);
     service_snapshot.inflight_limit_bytes = 16 * 1024 * 1024;
     service_snapshot.confidence = 1.0;
-    let service = ResponseSenderPathTarget {
+    let mut service = ResponseSenderPathTarget {
         #[cfg(feature = "lab-diagnostics")]
         session_id: SessionId(0),
         #[cfg(feature = "lab-diagnostics")]
@@ -2072,7 +2073,9 @@ fn clear_frontier_unavailable_ordered_owner_reanchors_service_to_bulk_proven_pat
             has_service_feed_evidence: true,
             has_bulk_rate_evidence: true,
         },
-        commands: service_commands,
+        command_queue: service_commands.queue_snapshot(),
+        tcp_capacity_probe_attempted: service_commands.tcp_capacity_probe_attempted(),
+        tcp_capacity_probe_active: service_commands.tcp_capacity_probe_active(),
         endpoint_only_service_prior_eligible: false,
         quic_capacity_proof: None,
         quic_capacity_calibration_attempts: 0,
@@ -2083,8 +2086,7 @@ fn clear_frontier_unavailable_ordered_owner_reanchors_service_to_bulk_proven_pat
         ack_clock_calibration_max_limit_bytes: 0,
         ack_clock_calibration_active: false,
     };
-    service
-        .commands
+    service_commands
         .try_enqueue_stream_ordered_frame(
             Frame::StreamData {
                 stream_id: StreamId(900),
@@ -2095,6 +2097,7 @@ fn clear_frontier_unavailable_ordered_owner_reanchors_service_to_bulk_proven_pat
             FlowLane::Throughput,
         )
         .expect("test setup should fill the service data queue");
+    observe_response_target_commands(&mut service, &service_commands);
     let lower_eta_subflow =
         response_target(2, UnderlayProtocol::Tcp, 5.0, 0, 16 * 1024 * 1024, false);
 
@@ -3532,7 +3535,7 @@ fn response_owner_tail_guard_uses_measured_same_underlay_when_service_queue_is_f
             FlowLane::Throughput,
         )
         .expect("seed full owner data queue");
-    owner.commands = owner_commands;
+    observe_response_target_commands(&mut owner, &owner_commands);
 
     let owner_tail_guard_bytes = payload_bytes.saturating_mul(2);
 
@@ -3573,7 +3576,7 @@ fn ordered_owner_debt_admits_measured_same_underlay_subflow_when_service_is_back
             FlowLane::Throughput,
         )
         .expect("seed full stale Service data queue");
-    service.commands = service_commands;
+    observe_response_target_commands(&mut service, &service_commands);
     let survivor = response_target(1, UnderlayProtocol::Udp, 5.0, 0, 16 * 1024 * 1024, false);
     let owner_tail_guard_bytes = payload_bytes.saturating_mul(2);
 
@@ -3648,7 +3651,7 @@ fn unresolved_ordered_owner_debt_does_not_grant_owner_bytes_to_unmeasured_surviv
             FlowLane::Throughput,
         )
         .expect("seed full stale Service data queue");
-    stale_service.commands = service_commands;
+    observe_response_target_commands(&mut stale_service, &service_commands);
     let mut proof_only = response_target(1, UnderlayProtocol::Tcp, 5.0, 0, 16 * 1024 * 1024, false);
     proof_only.observation.has_sender_evidence = true;
     proof_only.observation.has_bulk_rate_evidence = false;
@@ -3821,7 +3824,7 @@ fn response_owner_tail_guard_blocks_cross_underlay_when_owner_queue_is_full() {
             FlowLane::Throughput,
         )
         .expect("seed full owner data queue");
-    owner.commands = owner_commands;
+    observe_response_target_commands(&mut owner, &owner_commands);
 
     let owner_tail_guard_bytes = payload_bytes.saturating_mul(2);
 
@@ -3896,7 +3899,7 @@ fn response_owner_tail_guard_blocks_proof_only_same_family_subflow() {
             FlowLane::Throughput,
         )
         .expect("seed full owner data queue");
-    owner.commands = owner_commands;
+    observe_response_target_commands(&mut owner, &owner_commands);
 
     let owner_tail_guard_bytes = payload_bytes.saturating_mul(2);
 

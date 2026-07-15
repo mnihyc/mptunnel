@@ -270,8 +270,13 @@ fn invalidated_capacity_command_releases_serialization_without_refund() {
         20,
     ));
     ticket.cancel();
+    let invalidated = tracker.response_scheduling_snapshot(session_id);
+    assert!(invalidated.quic_capacity_calibration_reserved);
+    assert!(invalidated.operation_maintenance_due);
+    assert!(tracker.maintain_response_session_operations(session_id));
     let scheduling = tracker.response_scheduling_snapshot(session_id);
     assert!(!scheduling.quic_capacity_calibration_reserved);
+    assert!(!scheduling.operation_maintenance_due);
     assert_eq!(scheduling.quic_capacity_calibration_spent_bytes, 100);
     assert_eq!(
         tracker

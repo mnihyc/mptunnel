@@ -48,6 +48,53 @@ fn request_quic_capacity_test_context(path_count: usize) -> ClientPathContext {
         .expect("request QUIC capacity test context")
 }
 
+#[test]
+fn relay_path_load_lease_rolls_back_scheduler_demand_on_drop() {
+    let context = request_tcp_capacity_test_context(1);
+    let key = RelayPathKey {
+        underlay: UnderlayProtocol::Tcp,
+        index: 0,
+    };
+    let lease = context
+        .reserve_relay_path_load(key, FlowLane::Throughput)
+        .expect("path load lease");
+    assert_eq!(lease.key(), key);
+    assert_eq!(
+        context.health().lock().expect("path health").tcp[0].active_flows,
+        1
+    );
+
+    drop(lease);
+    assert_eq!(
+        context.health().lock().expect("path health").tcp[0].active_flows,
+        0
+    );
+}
+
+#[test]
+fn relay_path_load_lease_releases_the_reclassified_lane() {
+    let context = request_tcp_capacity_test_context(1);
+    let key = RelayPathKey {
+        underlay: UnderlayProtocol::Tcp,
+        index: 0,
+    };
+    let mut lease = context
+        .reserve_relay_path_load(key, FlowLane::Throughput)
+        .expect("path load lease");
+    context.change_relay_path_lane_load(
+        UnderlayProtocol::Tcp,
+        0,
+        FlowLane::Throughput,
+        FlowLane::Latency,
+    );
+    lease.set_recorded_lane(FlowLane::Latency);
+
+    drop(lease);
+    let health = context.health().lock().expect("path health");
+    assert_eq!(health.tcp[0].active_flows, 0);
+    assert_eq!(health.tcp[0].active_latency_sensitive_flows, 0);
+}
+
 fn reserve_request_tcp_capacity_for_test(
     context: &ClientPathContext,
     path_index: usize,

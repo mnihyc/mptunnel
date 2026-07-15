@@ -74,9 +74,8 @@ pub(super) fn opened_test_relay_stream_with_underlay(
     commands: ReliablePathCommandSender,
 ) -> OpenedRemoteStream {
     let (_frame_tx, frame_rx) = mpsc::channel(1);
-    OpenedRemoteStream {
-        path_index,
-        stream: ReliablePathStream {
+    OpenedRemoteStream::pending(
+        ReliablePathStream {
             stream_id,
             max_offset: MuxLimits::default().max_stream_window_bytes,
             lane: FlowLane::Throughput,
@@ -90,7 +89,8 @@ pub(super) fn opened_test_relay_stream_with_underlay(
             ),
             frames: frame_rx,
         },
-    }
+        path_index,
+    )
 }
 
 pub(super) fn seed_client_bulk_evidence_for_test(context: &ClientPathContext, key: RelayPathKey) {

@@ -117,7 +117,7 @@ impl ClientPathContext {
         lane: FlowLane,
         payload_bytes: usize,
         excluded: &[RelayPathKey],
-    ) -> Option<RelayPathKey> {
+    ) -> Option<RelayPathLoadLease> {
         let now = Instant::now();
         let mut health = self.state.health().lock().expect("client path health lock");
         let mut tcp_observations = health_observations(&mut health.tcp, now);
@@ -201,7 +201,7 @@ impl ClientPathContext {
                 candidates.len(),
             ),
         );
-        Some(selected)
+        Some(RelayPathLoadLease::new(self.state.clone(), selected, lane))
     }
 
     pub(in crate::runtime) fn ordered_reliable_path_keys(

@@ -112,6 +112,14 @@ stream; switchable response output remains a distinct placement contract. The
 remaining relay work is control actor decomposition, not another server
 subdirectory or small phase files.
 
+The opened-stream value is itself the pending attachment transaction: it owns
+both carrier cleanup and an optional scheduler-load lease. Initial and direct
+Active opens acquire the lease before asynchronous I/O; successful Active
+attachment transfers it to the remote path, while Repair/Validation attachment
+drops the temporary lease before publishing membership. Background validation
+opens are explicitly lease-free because attachment alone is not product demand.
+There is no parallel `load_reserved` boolean or manual async rollback matrix.
+
 ### Platform
 
 OS conditionals stay at packet-device, platform-reporting, or native telemetry

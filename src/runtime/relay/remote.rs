@@ -6,10 +6,9 @@
 
 use super::io::reliable_relay_error_is_migratable;
 use super::open::{
-    OpenedRemoteStream, ReliableRelayOpenSpec, UncommittedRemoteStreamGuard,
-    no_schedulable_reliable_path_error, open_remote_stream_for_relay_path,
-    relay_path_open_error_is_retryable, stream_open_error_is_path_retryable,
-    udp_stream_open_error_is_path_retryable,
+    OpenedRemoteStream, ReliableRelayOpenSpec, no_schedulable_reliable_path_error,
+    open_remote_stream_for_relay_path, relay_path_open_error_is_retryable,
+    stream_open_error_is_path_retryable, udp_stream_open_error_is_path_retryable,
 };
 use crate::model::capacity::{
     PATH_OPEN_SCORE_BYTES, adaptive_reliable_relay_chunk_bytes, relay_lane_startup_chunk_bytes,
@@ -32,7 +31,7 @@ pub(in crate::runtime) struct ReliableRelayRemotePath {
     pub(in crate::runtime) path_index: usize,
     pub(in crate::runtime) instance_id: u64,
     pub(in crate::runtime) placement: RelayPathPlacement,
-    pub(in crate::runtime) load_reserved: bool,
+    // Declaration order also depublishes load before an abrupt stream drop.
     pub(in crate::runtime) load_lease: Option<RelayPathLoadLease>,
     pub(in crate::runtime) attached_at: Instant,
     pub(in crate::runtime) path_proof_id: Option<u64>,
@@ -56,18 +55,11 @@ impl ReliableRelayRemotePath {
     }
 
     pub(in crate::runtime) fn has_load_reservation(&self) -> bool {
-        self.load_reserved || self.load_lease.is_some()
+        self.load_lease.is_some()
     }
 
     /// Carrier shutdown may block, so retire scheduler-visible load first.
-    fn depublish_load(&mut self, context: &ClientPathContext) {
-        if std::mem::take(&mut self.load_reserved) {
-            context.release_relay_path_load(
-                self.stream.underlay,
-                self.path_index,
-                self.stream.lane,
-            );
-        }
+    fn depublish_load(&mut self) {
         drop(self.load_lease.take());
     }
 }
@@ -77,8 +69,8 @@ pub(in crate::runtime) struct ReliableRelayRemoteFrame {
     pub(in crate::runtime) frame: Result<Frame, RuntimeError>,
 }
 
-/// Separates membership transfer from duplicate-stream cleanup so callers can
-/// commit or release the scheduler reservation that preceded the open.
+/// Reports whether attachment-set ownership committed; a rejected pending open
+/// rolls back its carrier and scheduler lease when the value is dropped.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(in crate::runtime) enum ReliableRelayAttachOutcome {
     Attached,
@@ -96,7 +88,7 @@ pub(in crate::runtime) struct ReliableRelayRemoteSet {
 
 impl ReliableRelayRemoteSet {
     pub(in crate::runtime) fn new(opened: OpenedRemoteStream, frame_queue: usize) -> Self {
-        let stream_id = opened.stream.stream_id;
+        let stream_id = opened.stream().stream_id;
         let (frames_tx, frames_rx) = mpsc::channel(frame_queue);
         let mut set = Self {
             stream_id,
@@ -187,7 +179,7 @@ impl ReliableRelayRemoteSet {
             .collect()
     }
 
-    pub(in crate::runtime) fn load_reserved_path_keys(&self) -> Vec<RelayPathKey> {
+    pub(in crate::runtime) fn load_owned_path_keys(&self) -> Vec<RelayPathKey> {
         self.paths
             .iter()
             .filter(|path| path.has_load_reservation())
@@ -301,9 +293,8 @@ impl ReliableRelayRemoteSet {
         opened: OpenedRemoteStream,
         placement: RelayPathPlacement,
     ) -> ReliableRelayAttachOutcome {
-        let OpenedRemoteStream { stream, path_index } = opened;
-        let uncommitted = UncommittedRemoteStreamGuard::new(stream);
-        let underlay = uncommitted.stream().underlay;
+        let path_index = opened.path_index();
+        let underlay = opened.stream().underlay;
         let key = RelayPathKey {
             underlay,
             index: path_index,
@@ -317,7 +308,13 @@ impl ReliableRelayRemoteSet {
             key,
             id: instance_id,
         };
-        let (stream, mut frames) = uncommitted.commit().into_handle_and_frames();
+        let (stream, path_index, mut load_lease) = opened.into_attachment_parts();
+        if placement != RelayPathPlacement::Active {
+            // Candidate ranking reserves during a synchronous attach open, but
+            // passive membership is not product demand.
+            drop(load_lease.take());
+        }
+        let (stream, mut frames) = stream.into_handle_and_frames();
         let frames_tx = self.frames_tx.clone();
         tokio::spawn(async move {
             while let Some(frame) = frames.recv().await {
@@ -342,8 +339,7 @@ impl ReliableRelayRemoteSet {
             path_index,
             instance_id,
             placement,
-            load_reserved: placement == RelayPathPlacement::Active,
-            load_lease: None,
+            load_lease,
             attached_at: Instant::now(),
             path_proof_id: None,
             path_proof_generation: 0,
@@ -392,7 +388,7 @@ impl ReliableRelayRemoteSet {
         })
     }
 
-    pub(in crate::runtime) async fn close_all(&mut self, context: &ClientPathContext) {
+    pub(in crate::runtime) async fn close_all(&mut self) {
         if !self.paths.is_empty() {
             self.membership_generation = self.membership_generation.wrapping_add(1);
         }
@@ -400,7 +396,7 @@ impl ReliableRelayRemoteSet {
         // The set stops owning every path as one atomic scheduling event even
         // when the first carrier queue makes detach asynchronous.
         for path in &mut paths {
-            path.depublish_load(context);
+            path.depublish_load();
         }
         for path in paths {
             path.stream.send_detach().await;
@@ -417,7 +413,7 @@ impl ReliableRelayRemoteSet {
             return false;
         };
         context.mark_relay_path_data_plane_failure(path.stream.underlay, path.path_index);
-        path.depublish_load(context);
+        path.depublish_load();
         path.stream.send_detach().await;
         path.stream.close().await;
         true
@@ -487,11 +483,10 @@ impl ReliableRelayRemoteSet {
         if path.has_load_reservation() {
             return false;
         }
-        match path.stream.underlay {
-            UnderlayProtocol::Tcp => context.reserve_tcp_path_load(path.path_index, lane),
-            UnderlayProtocol::Udp => context.reserve_udp_stream_path_load(path.path_index, lane),
-        }
-        path.load_reserved = true;
+        let Some(lease) = context.reserve_relay_path_load(path.key(), lane) else {
+            return false;
+        };
+        path.load_lease = Some(lease);
         true
     }
 
@@ -599,13 +594,9 @@ async fn attach_relay_path_candidates(
         .await
         {
             Ok(opened) => {
-                let OpenedRemoteStream { stream, path_index } = opened;
-                // Attach-control emission is fallible. Keep cleanup armed until
-                // the uncommitted stream is committed into the remote set.
-                let uncommitted = UncommittedRemoteStreamGuard::new(stream);
                 let attach_control_result = if request.send_attach_control {
                     send_request_attach_control_frames(
-                        uncommitted.stream(),
+                        opened.stream(),
                         request.send_stream,
                         request.resend_fin,
                     )
@@ -614,16 +605,6 @@ async fn attach_relay_path_candidates(
                 };
                 match attach_control_result {
                     Ok(()) => {
-                        let opened = OpenedRemoteStream {
-                            stream: uncommitted.commit(),
-                            path_index,
-                        };
-                        if request.role != StreamOpenRole::Active {
-                            // Path choice temporarily reserves a share while the
-                            // open is in flight. Passive attachments keep only
-                            // their actual queue/inflight debt after attachment.
-                            context.release_relay_path_load(key.underlay, key.index, request.lane);
-                        }
                         let attach_outcome = match request.role {
                             StreamOpenRole::Active => remotes.attach(opened),
                             StreamOpenRole::Repair => remotes.attach_for_repair(opened),
@@ -637,28 +618,15 @@ async fn attach_relay_path_candidates(
                                 });
                             }
                             ReliableRelayAttachOutcome::RejectedDuplicate => {
-                                if request.role == StreamOpenRole::Active {
-                                    // A rejected Active open never transfers its
-                                    // path reservation into remote-set ownership.
-                                    context.release_relay_path_load(
-                                        key.underlay,
-                                        key.index,
-                                        request.lane,
-                                    );
-                                }
                                 continue;
                             }
                         }
                     }
                     Err(err) if reliable_relay_error_is_migratable(&err) => {
                         context.mark_relay_path_failure(key.underlay, key.index);
-                        context.release_relay_path_load(key.underlay, key.index, request.lane);
                         last_retryable_error = Some(err);
                     }
-                    Err(err) => {
-                        context.release_relay_path_load(key.underlay, key.index, request.lane);
-                        return Err(err);
-                    }
+                    Err(err) => return Err(err),
                 }
             }
             Err(err) if relay_path_open_error_is_retryable(key.underlay, &err) => {

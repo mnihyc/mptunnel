@@ -418,9 +418,9 @@ impl Drop for RequestQuicCapacityProbeLease {
 
 /// Cancellation-safe ownership of one logical flow's shared path load.
 ///
-/// Validation attachment alone is not demand. The lease starts only when the
-/// flow commits unique product bytes and releases the shared scheduler load if
-/// that path, relay task, or enqueue attempt is dropped.
+/// Initial Active opens acquire a lease before I/O and transfer it with the
+/// attachment. Passive validation acquires one only after unique product bytes
+/// commit. Dropping any transaction owner rolls the scheduler load back.
 pub(in crate::runtime) struct RelayPathLoadLease {
     state: Arc<ClientPathState>,
     key: RelayPathKey,
@@ -434,6 +434,10 @@ impl RelayPathLoadLease {
 
     pub(in crate::runtime) fn set_recorded_lane(&mut self, lane: FlowLane) {
         self.lane = lane;
+    }
+
+    pub(in crate::runtime) fn key(&self) -> RelayPathKey {
+        self.key
     }
 }
 
@@ -1864,6 +1868,7 @@ impl ClientPathContext {
             .load(Ordering::Acquire)
     }
 
+    #[cfg(test)]
     pub(in crate::runtime) fn reserve_tcp_path_load(&self, index: usize, lane: FlowLane) {
         if let Some(current) = self
             .state
@@ -1877,6 +1882,7 @@ impl ClientPathContext {
         }
     }
 
+    #[cfg(test)]
     pub(in crate::runtime) fn reserve_udp_stream_path_load(&self, index: usize, lane: FlowLane) {
         if let Some(current) = self
             .state
@@ -1888,6 +1894,22 @@ impl ClientPathContext {
         {
             current.reserve_load(lane);
         }
+    }
+
+    /// Returns the only owner of the newly published scheduler load.
+    pub(in crate::runtime) fn reserve_relay_path_load(
+        &self,
+        key: RelayPathKey,
+        lane: FlowLane,
+    ) -> Option<RelayPathLoadLease> {
+        let mut health = self.state.health.lock().expect("client path health lock");
+        let records = match key.underlay {
+            UnderlayProtocol::Tcp => &mut health.tcp,
+            UnderlayProtocol::Udp => &mut health.udp,
+        };
+        records.get_mut(key.index)?.reserve_load(lane);
+        drop(health);
+        Some(RelayPathLoadLease::new(self.state.clone(), key, lane))
     }
 
     pub(in crate::runtime) fn mark_tcp_path_open_success(
@@ -1986,6 +2008,7 @@ impl ClientPathContext {
         }
     }
 
+    #[cfg(test)]
     pub(in crate::runtime) fn release_udp_stream_path_load(&self, index: usize, lane: FlowLane) {
         if let Some(current) = self
             .state
@@ -2021,6 +2044,7 @@ impl ClientPathContext {
         }
     }
 
+    #[cfg(test)]
     pub(in crate::runtime) fn release_relay_path_load(
         &self,
         underlay: UnderlayProtocol,

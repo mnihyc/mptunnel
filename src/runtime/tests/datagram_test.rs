@@ -1044,15 +1044,15 @@ fn endpoint_only_tcp_open_reservations_spread_concurrent_streams_without_probe_n
         .reserve_reliable_stream_path(FlowLane::Latency, PATH_OPEN_SCORE_BYTES, &[])
         .expect("second reservation");
 
-    assert_eq!(first.underlay, UnderlayProtocol::Tcp);
-    assert_eq!(first.index, 0);
-    assert_eq!(second.underlay, UnderlayProtocol::Tcp);
-    assert_eq!(second.index, 1);
+    assert_eq!(first.key().underlay, UnderlayProtocol::Tcp);
+    assert_eq!(first.key().index, 0);
+    assert_eq!(second.key().underlay, UnderlayProtocol::Tcp);
+    assert_eq!(second.key().index, 1);
 
-    context.mark_tcp_path_reserved_open_success(first.index, Duration::from_millis(20));
-    context.mark_tcp_path_reserved_open_success(second.index, Duration::from_millis(80));
-    context.release_relay_path_load(first.underlay, first.index, FlowLane::Latency);
-    context.release_relay_path_load(second.underlay, second.index, FlowLane::Latency);
+    context.mark_tcp_path_reserved_open_success(first.key().index, Duration::from_millis(20));
+    context.mark_tcp_path_reserved_open_success(second.key().index, Duration::from_millis(80));
+    drop(first);
+    drop(second);
 
     let health = context.health().lock().expect("health lock");
     assert_eq!(health.tcp[0].active_flows, 0);
@@ -1087,8 +1087,8 @@ fn endpoint_only_tcp_bulk_load_spreads_replacement_without_realtime_work() {
     let reserved = context
         .reserve_reliable_stream_path(FlowLane::Latency, PATH_OPEN_SCORE_BYTES, &[])
         .expect("interactive reservation");
-    assert_eq!(reserved.underlay, UnderlayProtocol::Tcp);
-    assert_eq!(reserved.index, 1);
+    assert_eq!(reserved.key().underlay, UnderlayProtocol::Tcp);
+    assert_eq!(reserved.key().index, 1);
 }
 
 #[test]
@@ -1121,8 +1121,8 @@ fn endpoint_only_tcp_bulk_load_keeps_new_interactive_streams_latency_first_with_
     let reserved = context
         .reserve_reliable_stream_path(FlowLane::Latency, PATH_OPEN_SCORE_BYTES, &[])
         .expect("interactive reservation");
-    assert_eq!(reserved.underlay, UnderlayProtocol::Tcp);
-    assert_eq!(reserved.index, 1);
+    assert_eq!(reserved.key().underlay, UnderlayProtocol::Tcp);
+    assert_eq!(reserved.key().index, 1);
 }
 
 #[test]
@@ -1152,8 +1152,8 @@ fn endpoint_only_tcp_bulk_and_interactive_load_keep_new_interactive_streams_late
     let reserved = context
         .reserve_reliable_stream_path(FlowLane::Latency, PATH_OPEN_SCORE_BYTES, &[])
         .expect("interactive reservation");
-    assert_eq!(reserved.underlay, UnderlayProtocol::Tcp);
-    assert_eq!(reserved.index, 1);
+    assert_eq!(reserved.key().underlay, UnderlayProtocol::Tcp);
+    assert_eq!(reserved.key().index, 1);
 }
 
 #[test]

@@ -883,8 +883,8 @@ fn mixed_reliable_initial_open_uses_best_carrier_not_tcp_first() {
         .reserve_reliable_stream_path(FlowLane::Latency, PATH_OPEN_SCORE_BYTES, &[])
         .expect("selected path");
 
-    assert_eq!(selected.underlay, UnderlayProtocol::Udp);
-    assert_eq!(selected.index, 0);
+    assert_eq!(selected.key().underlay, UnderlayProtocol::Udp);
+    assert_eq!(selected.key().index, 0);
 }
 
 #[test]
@@ -904,8 +904,8 @@ fn mixed_reliable_latency_startup_ignores_probe_noise_without_product_evidence()
         .reserve_reliable_stream_path(FlowLane::Latency, PATH_OPEN_SCORE_BYTES, &[])
         .expect("selected path");
 
-    assert_eq!(selected.underlay, UnderlayProtocol::Tcp);
-    assert_eq!(selected.index, 0);
+    assert_eq!(selected.key().underlay, UnderlayProtocol::Tcp);
+    assert_eq!(selected.key().index, 0);
 }
 
 #[test]
@@ -934,8 +934,8 @@ fn mixed_reliable_latency_startup_uses_delivery_backed_metrics_after_idle() {
         .reserve_reliable_stream_path(FlowLane::Latency, PATH_OPEN_SCORE_BYTES, &[])
         .expect("selected path");
 
-    assert_eq!(selected.underlay, UnderlayProtocol::Udp);
-    assert_eq!(selected.index, 0);
+    assert_eq!(selected.key().underlay, UnderlayProtocol::Udp);
+    assert_eq!(selected.key().index, 0);
 }
 
 #[test]
@@ -954,8 +954,8 @@ fn mixed_reliable_latency_startup_preserves_global_order_without_family_preferen
         .reserve_reliable_stream_path(FlowLane::Latency, PATH_OPEN_SCORE_BYTES, &[])
         .expect("selected path");
 
-    assert_eq!(selected.underlay, UnderlayProtocol::Udp);
-    assert_eq!(selected.index, 0);
+    assert_eq!(selected.key().underlay, UnderlayProtocol::Udp);
+    assert_eq!(selected.key().index, 0);
 }
 
 #[test]
@@ -987,7 +987,7 @@ fn latency_startup_prefers_lowest_latency_path_before_bulk_promotion() {
         .reserve_reliable_stream_path(FlowLane::Latency, PATH_OPEN_SCORE_BYTES, &[])
         .expect("first latency path");
     assert_eq!(
-        first,
+        first.key(),
         RelayPathKey {
             underlay: UnderlayProtocol::Udp,
             index: 0,
@@ -998,9 +998,9 @@ fn latency_startup_prefers_lowest_latency_path_before_bulk_promotion() {
     let second = context
         .reserve_reliable_stream_path(FlowLane::Latency, PATH_OPEN_SCORE_BYTES, &[])
         .expect("second latency path");
-    assert_eq!(second.underlay, UnderlayProtocol::Udp);
+    assert_eq!(second.key().underlay, UnderlayProtocol::Udp);
     assert!(
-        second.index <= 1,
+        second.key().index <= 1,
         "additional latency opens may reuse the best latency path or spread to the next low-latency path, but must not jump to a high-RTT bulk path before demand is proven"
     );
 }
@@ -1028,8 +1028,8 @@ fn endpoint_only_latency_startup_uses_scored_order_when_bulk_load_exists() {
         .reserve_reliable_stream_path(FlowLane::Latency, PATH_OPEN_SCORE_BYTES, &[])
         .expect("selected path");
 
-    assert_eq!(selected.underlay, UnderlayProtocol::Tcp);
-    assert_eq!(selected.index, 1);
+    assert_eq!(selected.key().underlay, UnderlayProtocol::Tcp);
+    assert_eq!(selected.key().index, 1);
 }
 
 #[test]
@@ -1098,8 +1098,8 @@ fn reliable_initial_open_allows_no_bulk_path_for_latency_lane() {
         .reserve_reliable_stream_path(FlowLane::Latency, PATH_OPEN_SCORE_BYTES, &[])
         .expect("selected path");
 
-    assert_eq!(selected.underlay, UnderlayProtocol::Tcp);
-    assert_eq!(selected.index, 0);
+    assert_eq!(selected.key().underlay, UnderlayProtocol::Tcp);
+    assert_eq!(selected.key().index, 0);
 }
 
 #[tokio::test]
@@ -1983,7 +1983,9 @@ fn sole_suspect_path_remains_reopenable_when_no_survivor_exists() {
     context.mark_relay_path_data_plane_failure(UnderlayProtocol::Tcp, 0);
 
     assert_eq!(
-        context.reserve_reliable_stream_path(FlowLane::Throughput, 64 * 1024, &[]),
+        context
+            .reserve_reliable_stream_path(FlowLane::Throughput, 64 * 1024, &[])
+            .map(|lease| lease.key()),
         Some(RelayPathKey {
             underlay: UnderlayProtocol::Tcp,
             index: 0,
@@ -2186,114 +2188,6 @@ fn path_open_timeout_is_a_migratable_retryable_path_failure() {
     ));
     assert!(reliable_relay_error_is_migratable(&err));
     assert!(relay_error_is_tcp_path_failure::<()>(&Err(err)));
-}
-
-#[test]
-fn initial_active_open_retry_uses_fresh_stream_id() {
-    let first_path = "tcp://127.0.0.1:10132?srtt-ms=20&rate-mbps=100"
-        .parse::<PathSpec>()
-        .expect("first path");
-    let second_path = "tcp://127.0.0.1:10133?srtt-ms=80&rate-mbps=200"
-        .parse::<PathSpec>()
-        .expect("second path");
-    let context = ClientPathContext::new(
-        vec![first_path, second_path],
-        security(),
-        ResourceLimits::default(),
-    )
-    .expect("context");
-    let mut attempted = Vec::new();
-
-    let first = reserve_reliable_initial_open_attempt(
-        &context,
-        FlowLane::Latency,
-        PATH_OPEN_SCORE_BYTES,
-        &mut attempted,
-    )
-    .expect("first attempt")
-    .expect("first candidate");
-    context.release_relay_path_load(first.key.underlay, first.key.index, FlowLane::Latency);
-    context.mark_relay_path_failure(first.key.underlay, first.key.index);
-
-    let second = reserve_reliable_initial_open_attempt(
-        &context,
-        FlowLane::Latency,
-        PATH_OPEN_SCORE_BYTES,
-        &mut attempted,
-    )
-    .expect("second attempt")
-    .expect("second candidate");
-
-    assert_ne!(
-        first.stream_id, second.stream_id,
-        "a timed-out initial Active open can arrive late at the server; retrying with a fresh product stream ID prevents that stale attempt from poisoning the next candidate"
-    );
-    assert_ne!(first.key, second.key);
-}
-
-#[test]
-fn initial_active_open_retryable_failure_cools_path_for_next_open() {
-    let failed_path = "tcp://127.0.0.1:10132?srtt-ms=20&rate-mbps=100"
-        .parse::<PathSpec>()
-        .expect("failed path");
-    let survivor_path = "tcp://127.0.0.1:10133?srtt-ms=80&rate-mbps=100"
-        .parse::<PathSpec>()
-        .expect("survivor path");
-    let context = ClientPathContext::new(
-        vec![failed_path, survivor_path],
-        security(),
-        ResourceLimits::default(),
-    )
-    .expect("context");
-    let failed = RelayPathKey {
-        underlay: UnderlayProtocol::Tcp,
-        index: 0,
-    };
-
-    context.reserve_reliable_stream_path(FlowLane::Latency, PATH_OPEN_SCORE_BYTES, &[]);
-    mark_reliable_initial_open_retryable_failure(&context, failed, FlowLane::Latency);
-
-    assert_eq!(
-        context.reserve_reliable_stream_path(FlowLane::Latency, PATH_OPEN_SCORE_BYTES, &[]),
-        Some(RelayPathKey {
-            underlay: UnderlayProtocol::Tcp,
-            index: 1,
-        }),
-        "a retryable initial Active open failure is a data-plane failure; when a survivor exists, the failed candidate must cool down before the next user-visible open"
-    );
-}
-
-#[test]
-fn nonblocking_udp_attach_does_not_clear_data_plane_failure_before_accept() {
-    let failed_path = "udp://127.0.0.1:10142?srtt-ms=20&rate-mbps=100"
-        .parse::<PathSpec>()
-        .expect("failed path");
-    let survivor_path = "udp://127.0.0.1:10143?srtt-ms=80&rate-mbps=100"
-        .parse::<PathSpec>()
-        .expect("survivor path");
-    let context = ClientPathContext::new(
-        vec![failed_path, survivor_path],
-        security(),
-        ResourceLimits::default(),
-    )
-    .expect("context");
-    let failed = RelayPathKey {
-        underlay: UnderlayProtocol::Udp,
-        index: 0,
-    };
-
-    context.reserve_reliable_stream_path(FlowLane::Latency, PATH_OPEN_SCORE_BYTES, &[]);
-    mark_reliable_initial_open_retryable_failure(&context, failed, FlowLane::Latency);
-    context.mark_udp_stream_reserved_open_success(0, Duration::from_millis(0), false);
-
-    assert_eq!(
-        context.reserve_reliable_stream_path(FlowLane::Latency, PATH_OPEN_SCORE_BYTES, &[]),
-        Some(RelayPathKey {
-            underlay: UnderlayProtocol::Udp,
-            index: 1,
-        }),
-        "non-blocking UDP attach only proves local carrier stream creation; it must not clear an active-open data-plane failure until STREAM_MAX_DATA/proof/data evidence arrives"
-    );
 }
 
 #[test]
@@ -2699,7 +2593,7 @@ fn endpoint_only_udp_latency_reservation_preserves_configured_order_on_probe_noi
         .expect("selected path");
 
     assert_eq!(
-        selected,
+        selected.key(),
         RelayPathKey {
             underlay: UnderlayProtocol::Udp,
             index: 0,
@@ -2725,7 +2619,7 @@ fn endpoint_only_udp_latency_reservation_spreads_by_order_not_probe_noise() {
         .reserve_reliable_stream_path(FlowLane::Latency, PATH_OPEN_SCORE_BYTES, &[])
         .expect("first latency reservation");
     assert_eq!(
-        first,
+        first.key(),
         RelayPathKey {
             underlay: UnderlayProtocol::Udp,
             index: 0,
@@ -2739,7 +2633,7 @@ fn endpoint_only_udp_latency_reservation_spreads_by_order_not_probe_noise() {
         .expect("second latency reservation");
 
     assert_eq!(
-        second,
+        second.key(),
         RelayPathKey {
             underlay: UnderlayProtocol::Udp,
             index: 1,
@@ -2829,8 +2723,8 @@ fn endpoint_only_udp_bulk_load_spreads_replacement_without_realtime_work() {
     let reserved = context
         .reserve_reliable_stream_path(FlowLane::Latency, PATH_OPEN_SCORE_BYTES, &[])
         .expect("interactive reservation");
-    assert_eq!(reserved.underlay, UnderlayProtocol::Udp);
-    assert_eq!(reserved.index, 1);
+    assert_eq!(reserved.key().underlay, UnderlayProtocol::Udp);
+    assert_eq!(reserved.key().index, 1);
 }
 
 #[test]
@@ -2966,7 +2860,9 @@ fn mixed_latency_startup_uses_metrics_not_udp_family_penalty() {
     context.reserve_udp_stream_path_load(0, FlowLane::RealtimeDatagram);
 
     assert_eq!(
-        context.reserve_reliable_stream_path(FlowLane::Latency, PATH_OPEN_SCORE_BYTES, &[]),
+        context
+            .reserve_reliable_stream_path(FlowLane::Latency, PATH_OPEN_SCORE_BYTES, &[])
+            .map(|lease| lease.key()),
         Some(RelayPathKey {
             underlay: UnderlayProtocol::Udp,
             index: 0,
@@ -3195,9 +3091,8 @@ fn opened_relay_stream_for_test(
     let (commands, command_rx) = reliable_path_command_channels(4);
     let (frames_tx, frames_rx) = mpsc::channel(4);
     (
-        OpenedRemoteStream {
-            path_index,
-            stream: ReliablePathStream {
+        OpenedRemoteStream::pending(
+            ReliablePathStream {
                 stream_id,
                 max_offset: mux_limits.max_stream_window_bytes,
                 lane: FlowLane::Throughput,
@@ -3211,7 +3106,8 @@ fn opened_relay_stream_for_test(
                 ),
                 frames: frames_rx,
             },
-        },
+            path_index,
+        ),
         command_rx,
         frames_tx,
     )
@@ -3248,9 +3144,8 @@ async fn relay_sender_queue_full_blocks_without_detaching_path() {
         )
         .expect("prefill relay carrier queue");
     let (_frames_tx, frames_rx) = mpsc::channel(4);
-    let opened = OpenedRemoteStream {
-        path_index: 0,
-        stream: ReliablePathStream {
+    let opened = OpenedRemoteStream::pending(
+        ReliablePathStream {
             stream_id,
             max_offset: mux_limits.max_stream_window_bytes,
             lane: FlowLane::Throughput,
@@ -3264,7 +3159,8 @@ async fn relay_sender_queue_full_blocks_without_detaching_path() {
             ),
             frames: frames_rx,
         },
-    };
+        0,
+    );
     let mut remotes = ReliableRelayRemoteSet::new(opened, 4);
     let mut sender = RequestSenderService::new(stream_id);
 
@@ -3921,7 +3817,7 @@ async fn repair_only_path_can_become_active_after_explicit_reannounce() {
             .iter()
             .find(|path| path.instance() == repair_instance)
             .expect("repair path")
-            .load_reserved,
+            .has_load_reservation(),
         "a passive Repair attachment must not reserve an ordinary flow share"
     );
     assert_eq!(
@@ -3963,7 +3859,7 @@ async fn repair_only_path_can_become_active_after_explicit_reannounce() {
             .iter()
             .find(|path| path.instance() == repair_instance)
             .expect("promoted path")
-            .load_reserved
+            .has_load_reservation()
     );
     {
         let health = context.health().lock().expect("client path health lock");
@@ -4707,9 +4603,8 @@ async fn mixed_relay_path_status_active_does_not_replay_whole_repair_cache_on_in
     let stream_id = StreamId(45);
     let (commands, mut command_rx) = reliable_path_command_channels(4);
     let (_frames_tx, frames_rx) = mpsc::channel(4);
-    let opened = OpenedRemoteStream {
-        path_index: 1,
-        stream: ReliablePathStream {
+    let opened = OpenedRemoteStream::pending(
+        ReliablePathStream {
             stream_id,
             max_offset: mux_limits.max_stream_window_bytes,
             lane: FlowLane::Throughput,
@@ -4723,7 +4618,8 @@ async fn mixed_relay_path_status_active_does_not_replay_whole_repair_cache_on_in
             ),
             frames: frames_rx,
         },
-    };
+        1,
+    );
     let mut remotes = ReliableRelayRemoteSet::new(opened, 4);
     let instance = remotes.active_path_instance().expect("active path");
     let mut send_stream = ReliableSendStream::new(stream_id, mux_limits);

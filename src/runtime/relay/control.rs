@@ -15,7 +15,7 @@ use super::io::{
 };
 use super::open::{
     OpenedRemoteStream, ReliableRelayOpenSpec, UdpStreamOpenOptions,
-    open_remote_stream_on_reserved_path, open_remote_stream_on_reserved_udp_path,
+    open_remote_stream_on_preselected_tcp_path, open_remote_stream_on_preselected_udp_path,
     relay_error_is_tcp_path_failure, relay_path_open_error_is_retryable,
     relay_path_open_with_deadline, reliable_relay_attach_open_timeouts,
 };
@@ -281,7 +281,7 @@ where
                     send_stream.repair_bytes(),
                 ),
             );
-            for key in remotes.load_reserved_path_keys() {
+            for key in remotes.load_owned_path_keys() {
                 context.change_relay_path_lane_load(
                     key.underlay,
                     key.index,
@@ -2183,7 +2183,7 @@ where
     }
     // Success and failure both end logical stream ownership. Leaving sibling
     // carrier entries installed after one-path failure poisons later reuse.
-    remotes.close_all(context).await;
+    remotes.close_all().await;
     #[cfg(feature = "lab-diagnostics")]
     lab_diagnostic(
         "client_relay_result",
@@ -2399,7 +2399,7 @@ async fn handle_validation_open_result(
     match validation_open.result {
         Ok(opened) => {
             #[cfg(feature = "lab-diagnostics")]
-            let lane = opened.stream.lane;
+            let lane = opened.stream().lane;
             match remotes.attach_for_validation(opened) {
                 ReliableRelayAttachOutcome::Attached => {
                     send_stream.update_max_offset(remotes.max_offset());
@@ -2585,7 +2585,7 @@ fn spawn_reliable_relay_validation_opens(
                     );
                     let result = relay_path_open_with_deadline(
                         open_deadlines.setup,
-                        open_remote_stream_on_reserved_path(
+                        open_remote_stream_on_preselected_tcp_path(
                             &context,
                             stream_id,
                             target,
@@ -2603,7 +2603,7 @@ fn spawn_reliable_relay_validation_opens(
                     let open_deadline = open_started_at + open_timeouts.setup;
                     relay_path_open_with_deadline(
                         open_deadline,
-                        open_remote_stream_on_reserved_udp_path(
+                        open_remote_stream_on_preselected_udp_path(
                             &context,
                             stream_id,
                             target,
@@ -2627,7 +2627,7 @@ fn spawn_reliable_relay_validation_opens(
                 let _ = key;
                 if let Ok(opened) = result {
                     #[cfg(feature = "lab-diagnostics")]
-                    let lane = opened.stream.lane;
+                    let lane = opened.stream().lane;
                     opened.close().await;
                     #[cfg(feature = "lab-diagnostics")]
                     lab_diagnostic(

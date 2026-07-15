@@ -256,26 +256,26 @@ fn upload_only_stall_attempt_uses_a_future_retry_deadline() {
 async fn latency_product_stall_keeps_active_and_cross_underlay_repair_membership() {
     let (commands_a, _receivers_a) = reliable_path_command_channels(1);
     let (commands_b, _receivers_b) = reliable_path_command_channels(1);
-    let first = OpenedRemoteStream {
-        path_index: 0,
-        stream: test_reliable_path_stream(
+    let first = OpenedRemoteStream::pending(
+        test_reliable_path_stream(
             StreamId(1),
             UnderlayProtocol::Tcp,
             0,
             commands_a,
             FlowLane::Latency,
         ),
-    };
-    let second = OpenedRemoteStream {
-        path_index: 0,
-        stream: test_reliable_path_stream(
+        0,
+    );
+    let second = OpenedRemoteStream::pending(
+        test_reliable_path_stream(
             StreamId(1),
             UnderlayProtocol::Udp,
             0,
             commands_b,
             FlowLane::Latency,
         ),
-    };
+        0,
+    );
     let mut remotes = ReliableRelayRemoteSet::new(first, 4);
     let active = remotes.active_path_instance();
     let original_keys = remotes.path_keys();
@@ -294,16 +294,16 @@ async fn latency_product_stall_keeps_active_and_cross_underlay_repair_membership
 #[tokio::test]
 async fn product_stall_on_sole_carrier_attempts_alternate_attach() {
     let (commands, _receivers) = reliable_path_command_channels(1);
-    let active = OpenedRemoteStream {
-        path_index: 0,
-        stream: test_reliable_path_stream(
+    let active = OpenedRemoteStream::pending(
+        test_reliable_path_stream(
             StreamId(1),
             UnderlayProtocol::Tcp,
             0,
             commands,
             FlowLane::Latency,
         ),
-    };
+        0,
+    );
     let remotes = ReliableRelayRemoteSet::new(active, 4);
 
     assert!(reliable_relay_product_stall_should_try_alternate_attach(
@@ -370,16 +370,16 @@ async fn validation_open_candidates_prefer_active_family_survivor_before_cross_f
     )
     .expect("context");
     let (commands, _receivers) = reliable_path_command_channels(1);
-    let active = OpenedRemoteStream {
-        path_index: 0,
-        stream: test_reliable_path_stream(
+    let active = OpenedRemoteStream::pending(
+        test_reliable_path_stream(
             StreamId(11),
             UnderlayProtocol::Tcp,
             0,
             commands,
             FlowLane::Throughput,
         ),
-    };
+        0,
+    );
     let remotes = ReliableRelayRemoteSet::new(active, 4);
 
     let candidates = reliable_relay_validation_open_candidates(
@@ -422,21 +422,38 @@ async fn validation_open_candidates_offer_distinct_idle_paths_before_occupied_se
         ResourceLimits::default(),
     )
     .expect("context");
-    context.reserve_tcp_path_load(0, FlowLane::Throughput);
-    context.reserve_tcp_path_load(1, FlowLane::Throughput);
+    let first_service_load = context
+        .reserve_relay_path_load(
+            RelayPathKey {
+                underlay: UnderlayProtocol::Tcp,
+                index: 0,
+            },
+            FlowLane::Throughput,
+        )
+        .expect("first Service load");
+    let second_service_load = context
+        .reserve_relay_path_load(
+            RelayPathKey {
+                underlay: UnderlayProtocol::Tcp,
+                index: 1,
+            },
+            FlowLane::Throughput,
+        )
+        .expect("second Service load");
 
     let (first_commands, _first_receivers) = reliable_path_command_channels(1);
     let first = ReliableRelayRemoteSet::new(
-        OpenedRemoteStream {
-            path_index: 0,
-            stream: test_reliable_path_stream(
+        OpenedRemoteStream::pending(
+            test_reliable_path_stream(
                 StreamId(12),
                 UnderlayProtocol::Tcp,
                 0,
                 first_commands,
                 FlowLane::Throughput,
             ),
-        },
+            0,
+        )
+        .with_load_lease(first_service_load),
         5,
     );
     let first_candidates = reliable_relay_validation_open_candidates(
@@ -449,16 +466,17 @@ async fn validation_open_candidates_offer_distinct_idle_paths_before_occupied_se
     context.reserve_tcp_path_load(2, FlowLane::Throughput);
     let (second_commands, _second_receivers) = reliable_path_command_channels(1);
     let second = ReliableRelayRemoteSet::new(
-        OpenedRemoteStream {
-            path_index: 1,
-            stream: test_reliable_path_stream(
+        OpenedRemoteStream::pending(
+            test_reliable_path_stream(
                 StreamId(13),
                 UnderlayProtocol::Tcp,
                 1,
                 second_commands,
                 FlowLane::Throughput,
             ),
-        },
+            1,
+        )
+        .with_load_lease(second_service_load),
         5,
     );
     let second_candidates = reliable_relay_validation_open_candidates(
@@ -488,16 +506,16 @@ async fn latency_lane_does_not_spawn_standby_validation_probe() {
     )
     .expect("context");
     let (commands, _receivers) = reliable_path_command_channels(1);
-    let active = OpenedRemoteStream {
-        path_index: 0,
-        stream: test_reliable_path_stream(
+    let active = OpenedRemoteStream::pending(
+        test_reliable_path_stream(
             StreamId(9),
             UnderlayProtocol::Udp,
             0,
             commands,
             FlowLane::Latency,
         ),
-    };
+        0,
+    );
     let remotes = ReliableRelayRemoteSet::new(active, 4);
     let send_stream = ReliableSendStream::new(StreamId(9), MuxLimits::default());
     let spec = ReliableRelayOpenSpec {

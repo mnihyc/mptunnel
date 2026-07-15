@@ -16,48 +16,78 @@ use crate::model::timing::{
 };
 use crate::protocol::{Frame, IngressKind, StreamId, StreamOpenRole, TargetAddr, UnderlayProtocol};
 use crate::runtime::error::RuntimeError;
-use crate::runtime::path::ClientPathContext;
 use crate::runtime::path::commands::ClientTcpOpenDeadlines;
+use crate::runtime::path::{ClientPathContext, RelayPathLoadLease};
 use crate::runtime::stream::ReliablePathStream;
 use crate::scheduler::FlowLane;
 use std::time::{Duration, Instant};
 
+/// Open carrier awaiting attachment-set commit.
+///
+/// Keeping stream cleanup and scheduler load in one value makes cancellation,
+/// duplicate rejection, and attach-control failure the same rollback path.
 pub(in crate::runtime) struct OpenedRemoteStream {
-    pub(in crate::runtime) stream: ReliablePathStream,
-    pub(in crate::runtime) path_index: usize,
+    stream: Option<ReliablePathStream>,
+    path_index: usize,
+    load_lease: Option<RelayPathLoadLease>,
 }
 
 impl OpenedRemoteStream {
-    /// A stream that never commits to a remote set must release both the peer
-    /// binding and the local carrier actor entry.
-    pub(in crate::runtime) async fn close(self) {
-        self.stream.send_detach().await;
-        self.stream.close().await;
-    }
-}
-
-pub(in crate::runtime) struct UncommittedRemoteStreamGuard {
-    stream: Option<ReliablePathStream>,
-}
-
-impl UncommittedRemoteStreamGuard {
-    pub(in crate::runtime) fn new(stream: ReliablePathStream) -> Self {
+    /// Low-level validation opens have no demand lease; higher open owners add
+    /// one before any await when the attempt represents product demand.
+    pub(in crate::runtime) fn pending(stream: ReliablePathStream, path_index: usize) -> Self {
         Self {
             stream: Some(stream),
+            path_index,
+            load_lease: None,
         }
     }
 
     pub(in crate::runtime) fn stream(&self) -> &ReliablePathStream {
-        self.stream.as_ref().expect("uncommitted stream guard")
+        self.stream.as_ref().expect("pending remote stream")
     }
 
-    pub(in crate::runtime) fn commit(mut self) -> ReliablePathStream {
-        self.stream.take().expect("uncommitted stream guard")
+    pub(in crate::runtime) fn path_index(&self) -> usize {
+        self.path_index
+    }
+
+    pub(in crate::runtime) fn with_load_lease(mut self, lease: RelayPathLoadLease) -> Self {
+        debug_assert!(self.load_lease.is_none());
+        debug_assert_eq!(
+            lease.key(),
+            RelayPathKey {
+                underlay: self.stream().underlay,
+                index: self.path_index,
+            }
+        );
+        self.load_lease = Some(lease);
+        self
+    }
+
+    pub(in crate::runtime) fn into_attachment_parts(
+        mut self,
+    ) -> (ReliablePathStream, usize, Option<RelayPathLoadLease>) {
+        let stream = self.stream.take().expect("pending remote stream");
+        let load_lease = self.load_lease.take();
+        (stream, self.path_index, load_lease)
+    }
+
+    /// A stream that never commits to a remote set must release both the peer
+    /// binding and the local carrier actor entry.
+    pub(in crate::runtime) async fn close(mut self) {
+        drop(self.load_lease.take());
+        if let Some(stream) = self.stream.as_ref() {
+            stream.send_detach().await;
+            stream.close().await;
+        }
+        drop(self.stream.take());
     }
 }
 
-impl Drop for UncommittedRemoteStreamGuard {
+impl Drop for OpenedRemoteStream {
     fn drop(&mut self) {
+        // Scheduler ownership must disappear before carrier cleanup can block.
+        drop(self.load_lease.take());
         let Some(stream) = self.stream.take() else {
             return;
         };
@@ -93,10 +123,11 @@ pub(in crate::runtime) fn udp_relay_attachment_open_options(
     }
 }
 
-#[derive(Debug, Clone, Copy)]
+/// A selected initial carrier whose scheduler load remains owned across I/O.
 pub(in crate::runtime) struct ReliableInitialOpenAttempt {
     pub(in crate::runtime) key: RelayPathKey,
     pub(in crate::runtime) stream_id: StreamId,
+    load_lease: RelayPathLoadLease,
 }
 
 pub(in crate::runtime) fn reserve_reliable_initial_open_attempt(
@@ -112,27 +143,28 @@ pub(in crate::runtime) fn reserve_reliable_initial_open_attempt(
     if attempted.len() >= candidate_count {
         return Ok(None);
     }
-    let Some(key) = context.reserve_reliable_stream_path(lane, payload_bytes, attempted) else {
+    let Some(load_lease) = context.reserve_reliable_stream_path(lane, payload_bytes, attempted)
+    else {
         return Ok(None);
     };
+    let key = load_lease.key();
     match context.allocate_reliable_stream_id() {
         Ok(stream_id) => {
             attempted.push(key);
-            Ok(Some(ReliableInitialOpenAttempt { key, stream_id }))
+            Ok(Some(ReliableInitialOpenAttempt {
+                key,
+                stream_id,
+                load_lease,
+            }))
         }
-        Err(err) => {
-            context.release_relay_path_load(key.underlay, key.index, lane);
-            Err(err)
-        }
+        Err(err) => Err(err),
     }
 }
 
 pub(in crate::runtime) fn mark_reliable_initial_open_retryable_failure(
     context: &ClientPathContext,
     key: RelayPathKey,
-    lane: FlowLane,
 ) {
-    context.release_relay_path_load(key.underlay, key.index, lane);
     context.mark_relay_path_data_plane_failure(key.underlay, key.index);
 }
 
@@ -144,14 +176,18 @@ async fn open_reliable_initial_active_attempt(
     lane: FlowLane,
     has_unattempted_alternative: bool,
 ) -> Result<OpenedRemoteStream, RuntimeError> {
-    let ReliableInitialOpenAttempt { key, stream_id } = attempt;
+    let ReliableInitialOpenAttempt {
+        key,
+        stream_id,
+        load_lease,
+    } = attempt;
     match key.underlay {
         UnderlayProtocol::Tcp => {
             let open_timeout =
                 reliable_initial_active_open_timeout(context, key, has_unattempted_alternative);
             let open_deadlines =
                 ClientTcpOpenDeadlines::fixed(tokio::time::Instant::now() + open_timeout);
-            match open_remote_stream_on_reserved_path(
+            match open_remote_stream_on_preselected_tcp_path(
                 context,
                 stream_id,
                 target,
@@ -163,7 +199,7 @@ async fn open_reliable_initial_active_attempt(
             )
             .await
             {
-                Ok(opened) => Ok(opened),
+                Ok(opened) => Ok(opened.with_load_lease(load_lease)),
                 Err(RuntimeError::PathOpenTimedOut) => {
                     #[cfg(feature = "lab-diagnostics")]
                     lab_diagnostic(
@@ -188,7 +224,7 @@ async fn open_reliable_initial_active_attempt(
             let open_deadline = tokio::time::Instant::now() + open_timeout;
             match relay_path_open_with_deadline(
                 open_deadline,
-                open_remote_stream_on_reserved_udp_path(
+                open_remote_stream_on_preselected_udp_path(
                     context,
                     stream_id,
                     target,
@@ -201,7 +237,7 @@ async fn open_reliable_initial_active_attempt(
             )
             .await
             {
-                Ok(opened) => Ok(opened),
+                Ok(opened) => Ok(opened.with_load_lease(load_lease)),
                 Err(RuntimeError::PathOpenTimedOut) => {
                     #[cfg(feature = "lab-diagnostics")]
                     lab_diagnostic(
@@ -251,13 +287,10 @@ pub(in crate::runtime) async fn open_remote_stream(
         {
             Ok(opened) => return Ok(opened),
             Err(err) if relay_path_open_error_is_retryable(key.underlay, &err) => {
-                mark_reliable_initial_open_retryable_failure(context, key, lane);
+                mark_reliable_initial_open_retryable_failure(context, key);
                 last_retryable_error = Some(err);
             }
-            Err(err) => {
-                context.release_relay_path_load(key.underlay, key.index, lane);
-                return Err(err);
-            }
+            Err(err) => return Err(err),
         }
     }
     Err(last_retryable_error.unwrap_or_else(|| no_schedulable_reliable_path_error(context)))
@@ -272,20 +305,20 @@ pub(in crate::runtime) async fn open_remote_stream_on_path(
     path_index: usize,
     role: StreamOpenRole,
 ) -> Result<OpenedRemoteStream, RuntimeError> {
-    context.reserve_tcp_path_load(path_index, lane);
-    let open_timeouts = reliable_relay_attach_open_timeouts(
-        context,
-        RelayPathKey {
-            underlay: UnderlayProtocol::Tcp,
-            index: path_index,
-        },
-    );
+    let key = RelayPathKey {
+        underlay: UnderlayProtocol::Tcp,
+        index: path_index,
+    };
+    let load_lease = context
+        .reserve_relay_path_load(key, lane)
+        .ok_or(RuntimeError::NoSchedulableTcpPath)?;
+    let open_timeouts = reliable_relay_attach_open_timeouts(context, key);
     let open_deadlines = ClientTcpOpenDeadlines::from_timeouts(
         tokio::time::Instant::now(),
         open_timeouts.live,
         open_timeouts.setup,
     );
-    let open_result = open_remote_stream_on_reserved_path(
+    let open_result = open_remote_stream_on_preselected_tcp_path(
         context,
         stream_id,
         target,
@@ -297,13 +330,9 @@ pub(in crate::runtime) async fn open_remote_stream_on_path(
     )
     .await;
     match open_result {
-        Ok(opened) => Ok(opened),
-        Err(err) if !matches!(err, RuntimeError::PathOpenTimedOut) => {
-            context.release_tcp_path_load(path_index, lane);
-            Err(err)
-        }
+        Ok(opened) => Ok(opened.with_load_lease(load_lease)),
+        Err(err) if !matches!(err, RuntimeError::PathOpenTimedOut) => Err(err),
         Err(RuntimeError::PathOpenTimedOut) => {
-            context.release_tcp_path_load(path_index, lane);
             context.mark_tcp_path_data_plane_failure(path_index);
             #[cfg(feature = "lab-diagnostics")]
             lab_diagnostic(
@@ -320,10 +349,7 @@ pub(in crate::runtime) async fn open_remote_stream_on_path(
             );
             Err(RuntimeError::PathOpenTimedOut)
         }
-        Err(err) => {
-            context.release_tcp_path_load(path_index, lane);
-            Err(err)
-        }
+        Err(err) => Err(err),
     }
 }
 
@@ -370,7 +396,7 @@ pub(in crate::runtime) fn reliable_initial_active_open_timeout(
     }
 }
 
-pub(in crate::runtime) async fn open_remote_stream_on_reserved_path(
+pub(in crate::runtime) async fn open_remote_stream_on_preselected_tcp_path(
     context: &ClientPathContext,
     stream_id: StreamId,
     target: TargetAddr,
@@ -400,15 +426,10 @@ pub(in crate::runtime) async fn open_remote_stream_on_reserved_path(
         .ok_or(RuntimeError::NoSchedulableTcpPath)?
         .open_stream_with_deadlines(stream_id, target, ingress, lane, role, open_deadlines)
         .await?;
-    let uncommitted = UncommittedRemoteStreamGuard::new(opened.stream);
+    let pending = OpenedRemoteStream::pending(opened.stream, path_index);
     tokio::time::timeout_at(
         opened.open_deadline,
-        send_open_path_metrics(
-            context,
-            uncommitted.stream(),
-            UnderlayProtocol::Tcp,
-            path_index,
-        ),
+        send_open_path_metrics(context, pending.stream(), UnderlayProtocol::Tcp, path_index),
     )
     .await
     .map_err(|_| RuntimeError::PathOpenTimedOut)??;
@@ -426,10 +447,7 @@ pub(in crate::runtime) async fn open_remote_stream_on_reserved_path(
             elapsed.as_secs_f64() * 1000.0,
         ),
     );
-    Ok(OpenedRemoteStream {
-        stream: uncommitted.commit(),
-        path_index,
-    })
+    Ok(pending)
 }
 
 pub(in crate::runtime) async fn open_remote_stream_on_udp_path(
@@ -444,19 +462,18 @@ pub(in crate::runtime) async fn open_remote_stream_on_udp_path(
     if context.udp_paths.get(path_index).is_none() {
         return Err(RuntimeError::NoSchedulableUdpPath);
     }
-    context.reserve_udp_stream_path_load(path_index, lane);
-    let open_timeout = reliable_relay_attach_open_timeouts(
-        context,
-        RelayPathKey {
-            underlay: UnderlayProtocol::Udp,
-            index: path_index,
-        },
-    )
-    .setup;
+    let key = RelayPathKey {
+        underlay: UnderlayProtocol::Udp,
+        index: path_index,
+    };
+    let load_lease = context
+        .reserve_relay_path_load(key, lane)
+        .ok_or(RuntimeError::NoSchedulableUdpPath)?;
+    let open_timeout = reliable_relay_attach_open_timeouts(context, key).setup;
     let open_deadline = tokio::time::Instant::now() + open_timeout;
     match relay_path_open_with_deadline(
         open_deadline,
-        open_remote_stream_on_reserved_udp_path(
+        open_remote_stream_on_preselected_udp_path(
             context,
             stream_id,
             target,
@@ -469,11 +486,8 @@ pub(in crate::runtime) async fn open_remote_stream_on_udp_path(
     )
     .await
     {
-        Ok(opened) => Ok(opened),
-        Err(err) => {
-            context.release_udp_stream_path_load(path_index, lane);
-            Err(err)
-        }
+        Ok(opened) => Ok(opened.with_load_lease(load_lease)),
+        Err(err) => Err(err),
     }
 }
 
@@ -521,7 +535,7 @@ where
     }
 }
 
-pub(in crate::runtime) async fn open_remote_stream_on_reserved_udp_path(
+pub(in crate::runtime) async fn open_remote_stream_on_preselected_udp_path(
     context: &ClientPathContext,
     stream_id: StreamId,
     target: TargetAddr,
@@ -558,16 +572,10 @@ pub(in crate::runtime) async fn open_remote_stream_on_reserved_udp_path(
         .ok_or(RuntimeError::NoSchedulableUdpPath)?
         .open_stream(stream_id, target, ingress, lane, options, open_deadline)
         .await?;
-    let uncommitted = UncommittedRemoteStreamGuard::new(stream);
+    let pending = OpenedRemoteStream::pending(stream, path_index);
     let elapsed = started_at.elapsed();
     context.mark_udp_stream_reserved_open_success(path_index, elapsed, wait_for_accept);
-    send_open_path_metrics(
-        context,
-        uncommitted.stream(),
-        UnderlayProtocol::Udp,
-        path_index,
-    )
-    .await?;
+    send_open_path_metrics(context, pending.stream(), UnderlayProtocol::Udp, path_index).await?;
     #[cfg(feature = "lab-diagnostics")]
     lab_diagnostic(
         "reliable_stream_open_success",
@@ -581,10 +589,7 @@ pub(in crate::runtime) async fn open_remote_stream_on_reserved_udp_path(
             elapsed.as_secs_f64() * 1000.0,
         ),
     );
-    Ok(OpenedRemoteStream {
-        stream: uncommitted.commit(),
-        path_index,
-    })
+    Ok(pending)
 }
 
 async fn send_open_path_metrics(

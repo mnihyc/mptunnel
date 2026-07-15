@@ -21,11 +21,9 @@ use crate::runtime::error::RuntimeError;
 use crate::runtime::path::ClientPathContext;
 use crate::runtime::path::commands::{
     ReliablePathCommand, ReliablePathCommandReceivers, recv_reliable_path_command,
-    reliable_path_command_channels, try_recv_reliable_path_command,
+    reliable_path_command_channels,
 };
-use crate::runtime::relay::open::{
-    OpenedRemoteStream, ReliableRelayOpenSpec, UncommittedRemoteStreamGuard,
-};
+use crate::runtime::relay::open::{OpenedRemoteStream, ReliableRelayOpenSpec};
 use crate::runtime::stream::{ReliablePathStream, ReliablePathStreamOutput};
 use crate::scheduler::FlowLane;
 use crate::transport::PathSpec;
@@ -54,9 +52,8 @@ fn opened_relay_stream_for_test(
     let (commands, command_rx) = reliable_path_command_channels(4);
     let (frames_tx, frames_rx) = mpsc::channel(4);
     (
-        OpenedRemoteStream {
-            path_index,
-            stream: ReliablePathStream {
+        OpenedRemoteStream::pending(
+            ReliablePathStream {
                 stream_id,
                 max_offset: mux_limits.max_stream_window_bytes,
                 lane: FlowLane::Throughput,
@@ -70,61 +67,47 @@ fn opened_relay_stream_for_test(
                 ),
                 frames: frames_rx,
             },
-        },
+            path_index,
+        ),
         command_rx,
         frames_tx,
     )
 }
 
-#[test]
-fn dropped_uncommitted_stream_guard_queues_detach_and_local_close() {
-    let stream_id = StreamId(92);
-    let (opened, mut receivers, _frames) =
-        opened_relay_stream_for_test(stream_id, UnderlayProtocol::Udp, 0);
-    drop(UncommittedRemoteStreamGuard::new(opened.stream));
-
-    assert!(matches!(
-        try_recv_reliable_path_command(&mut receivers),
-        Some(ReliablePathCommand::SendFrame(Frame::StreamDetach { stream_id: id })) if id == stream_id
-    ));
-    assert!(matches!(
-        try_recv_reliable_path_command(&mut receivers),
-        Some(ReliablePathCommand::CloseStream(id)) if id == stream_id
-    ));
-}
-
 #[tokio::test]
-async fn rejected_opened_stream_detaches_peer_before_local_close() {
-    let stream_id = StreamId(93);
-    let (opened, mut receivers, _frames) =
-        opened_relay_stream_for_test(stream_id, UnderlayProtocol::Udp, 0);
-    opened.close().await;
-
-    assert!(matches!(
-        recv_reliable_path_command(&mut receivers).await,
-        Some(ReliablePathCommand::SendFrame(Frame::StreamDetach { stream_id: id })) if id == stream_id
-    ));
-    assert!(matches!(
-        recv_reliable_path_command(&mut receivers).await,
-        Some(ReliablePathCommand::CloseStream(id)) if id == stream_id
-    ));
-}
-
-#[tokio::test]
-async fn duplicate_remote_set_attach_releases_the_uncommitted_stream() {
+async fn duplicate_remote_set_attach_releases_pending_stream_and_load() {
     let stream_id = StreamId(94);
+    let path = "udp://127.0.0.1:11094"
+        .parse::<PathSpec>()
+        .expect("udp path");
+    let context =
+        ClientPathContext::new(vec![path], security(), ResourceLimits::default()).expect("context");
     let (first, _first_receivers, _first_frames) =
         opened_relay_stream_for_test(stream_id, UnderlayProtocol::Udp, 0);
     let mut remotes = ReliableRelayRemoteSet::new(first, 4);
     let (duplicate, mut duplicate_receivers, _duplicate_frames) =
         opened_relay_stream_for_test(stream_id, UnderlayProtocol::Udp, 0);
+    let duplicate_load = context
+        .reserve_relay_path_load(
+            RelayPathKey {
+                underlay: UnderlayProtocol::Udp,
+                index: 0,
+            },
+            FlowLane::Throughput,
+        )
+        .expect("duplicate open load");
 
     assert_eq!(
-        remotes.attach_for_validation(duplicate),
+        remotes.attach_for_validation(duplicate.with_load_lease(duplicate_load)),
         ReliableRelayAttachOutcome::RejectedDuplicate,
     );
 
     assert_eq!(remotes.path_keys().len(), 1);
+    assert_eq!(
+        context.health().lock().expect("path health").udp[0].active_flows,
+        0,
+        "duplicate rejection must drop the pending open load"
+    );
     assert!(matches!(
         tokio::time::timeout(
             Duration::from_secs(1),
@@ -143,6 +126,50 @@ async fn duplicate_remote_set_attach_releases_the_uncommitted_stream() {
         .expect("duplicate close deadline"),
         Some(ReliablePathCommand::CloseStream(id)) if id == stream_id
     ));
+}
+
+#[tokio::test]
+async fn passive_attachment_drops_temporary_open_load_before_membership_publish() {
+    let context = ClientPathContext::new(
+        vec![
+            "tcp://127.0.0.1:11100".parse().expect("Service path"),
+            "tcp://127.0.0.1:11101".parse().expect("candidate path"),
+        ],
+        security(),
+        ResourceLimits::default(),
+    )
+    .expect("context");
+    let stream_id = StreamId(97);
+    let (service, _service_receivers, _service_frames) =
+        opened_relay_stream_for_test(stream_id, UnderlayProtocol::Tcp, 0);
+    let mut remotes = ReliableRelayRemoteSet::new(service, 4);
+    let (candidate, _candidate_receivers, _candidate_frames) =
+        opened_relay_stream_for_test(stream_id, UnderlayProtocol::Tcp, 1);
+    let candidate_lease = context
+        .reserve_relay_path_load(
+            RelayPathKey {
+                underlay: UnderlayProtocol::Tcp,
+                index: 1,
+            },
+            FlowLane::Throughput,
+        )
+        .expect("candidate open load");
+
+    assert_eq!(
+        remotes.attach_for_validation(candidate.with_load_lease(candidate_lease)),
+        ReliableRelayAttachOutcome::Attached
+    );
+    let candidate = remotes
+        .paths
+        .iter()
+        .find(|path| path.path_index == 1)
+        .expect("candidate membership");
+    assert!(!candidate.has_load_reservation());
+    assert_eq!(
+        context.health().lock().expect("path health").tcp[1].active_flows,
+        0,
+        "Validation membership alone is not product demand"
+    );
 }
 
 #[tokio::test]
@@ -231,7 +258,15 @@ async fn remote_set_close_depublishes_load_before_carrier_cleanup_waits() {
         .expect("tcp path");
     let context =
         ClientPathContext::new(vec![path], security(), ResourceLimits::default()).expect("context");
-    context.reserve_tcp_path_load(0, FlowLane::Throughput);
+    let load_lease = context
+        .reserve_relay_path_load(
+            RelayPathKey {
+                underlay: UnderlayProtocol::Tcp,
+                index: 0,
+            },
+            FlowLane::Throughput,
+        )
+        .expect("active path load lease");
 
     let mux_limits = MuxLimits::default();
     let (commands, receivers) = reliable_path_command_channels(1);
@@ -240,9 +275,8 @@ async fn remote_set_close_depublishes_load_before_carrier_cleanup_waits() {
         .await
         .expect("prefill carrier control queue");
     let (_frames_tx, frames_rx) = mpsc::channel(1);
-    let opened = OpenedRemoteStream {
-        path_index: 0,
-        stream: ReliablePathStream {
+    let opened = OpenedRemoteStream::pending(
+        ReliablePathStream {
             stream_id,
             max_offset: mux_limits.max_stream_window_bytes,
             lane: FlowLane::Throughput,
@@ -256,12 +290,14 @@ async fn remote_set_close_depublishes_load_before_carrier_cleanup_waits() {
             ),
             frames: frames_rx,
         },
-    };
+        0,
+    )
+    .with_load_lease(load_lease);
     let mut remotes = ReliableRelayRemoteSet::new(opened, 1);
     let observed_generation = remotes.membership_generation();
     let observed_instance = remotes.active_path_instance().expect("active instance");
 
-    let mut close = Box::pin(remotes.close_all(&context));
+    let mut close = Box::pin(remotes.close_all());
     assert!(matches!(
         futures::poll!(&mut close),
         std::task::Poll::Pending
@@ -284,6 +320,35 @@ async fn remote_set_close_depublishes_load_before_carrier_cleanup_waits() {
         remotes.path_position_at_generation(observed_generation, observed_instance),
         None,
         "closing the set invalidates an outstanding selection"
+    );
+}
+
+#[tokio::test]
+async fn dropping_remote_set_releases_owned_scheduler_load() {
+    let path = "tcp://127.0.0.1:11098"
+        .parse::<PathSpec>()
+        .expect("tcp path");
+    let context =
+        ClientPathContext::new(vec![path], security(), ResourceLimits::default()).expect("context");
+    let key = RelayPathKey {
+        underlay: UnderlayProtocol::Tcp,
+        index: 0,
+    };
+    let load_lease = context
+        .reserve_relay_path_load(key, FlowLane::Throughput)
+        .expect("active path load lease");
+    let (opened, _receivers, _frames) =
+        opened_relay_stream_for_test(StreamId(96), UnderlayProtocol::Tcp, 0);
+    let remotes = ReliableRelayRemoteSet::new(opened.with_load_lease(load_lease), 1);
+    assert_eq!(
+        context.health().lock().expect("path health").tcp[0].active_flows,
+        1
+    );
+
+    drop(remotes);
+    assert_eq!(
+        context.health().lock().expect("path health").tcp[0].active_flows,
+        0
     );
 }
 

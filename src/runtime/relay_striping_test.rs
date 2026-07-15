@@ -51,7 +51,6 @@ fn relay_path(
         path_index: index,
         instance_id: index as u64 + 1,
         placement,
-        load_reserved: placement == RelayPathPlacement::Active,
         load_lease: None,
         attached_at: Instant::now(),
         path_proof_id: (placement == RelayPathPlacement::Validation).then_some(index as u64 + 1),

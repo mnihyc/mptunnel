@@ -47,6 +47,21 @@ pub enum RuntimeError {
     Protocol(&'static str),
 }
 
+/// Carrier failures for which the product relay may preserve queued work and
+/// seek another authenticated path.
+pub(in crate::runtime) fn reliable_path_error_is_migratable(err: &RuntimeError) -> bool {
+    matches!(
+        err,
+        RuntimeError::PathHeartbeatTimeout
+            | RuntimeError::PathOpenTimedOut
+            | RuntimeError::ReliablePathSessionClosed
+            | RuntimeError::Tcp(_)
+            | RuntimeError::Encrypted(_)
+            | RuntimeError::RemoteClosed(_)
+            | RuntimeError::Protocol(_)
+    )
+}
+
 impl From<std::io::Error> for RuntimeError {
     fn from(value: std::io::Error) -> Self {
         Self::Io(value)

@@ -5,8 +5,8 @@
 
 use crate::protocol::PathId;
 use crate::scheduler::{
-    FlowLane, PathScore, PathSnapshot, PathState, QUIC_INITIAL_WINDOW_PACKETS, path_bdp_bytes,
-    path_is_schedulable, path_pto_ms, payload_tx_ms, score_path,
+    PathScore, PathSnapshot, PathState, QUIC_INITIAL_WINDOW_PACKETS, TrafficClass, path_bdp_bytes,
+    path_is_backup, path_is_schedulable, path_pto_ms, payload_tx_ms, score_path,
 };
 use std::collections::VecDeque;
 
@@ -22,7 +22,7 @@ pub enum SchedulingMode {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) struct EnqueueRequest {
     pub(super) flow_id: FlowId,
-    pub(super) lane: FlowLane,
+    pub(super) lane: TrafficClass,
     pub(super) payload_bytes: usize,
     pub(super) remaining_flow_bytes: usize,
     pub(super) duplicate_eligible: bool,
@@ -31,7 +31,7 @@ pub(super) struct EnqueueRequest {
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub(super) struct SchedulerDecision {
     pub(super) flow_id: FlowId,
-    pub(super) scheduled_lane: FlowLane,
+    pub(super) scheduled_lane: TrafficClass,
     pub(super) mode: SchedulingMode,
     pub(super) path_id: PathId,
     pub(super) duplicate_path_id: Option<PathId>,
@@ -158,7 +158,7 @@ impl HeterogeneousScheduler {
         self.path_queues.retain(|queue| queue.path_id != path_id);
     }
 
-    fn lane_index(&mut self, lane: FlowLane) -> usize {
+    fn lane_index(&mut self, lane: TrafficClass) -> usize {
         if let Some(index) = self.lanes.iter().position(|queue| queue.lane == lane) {
             return index;
         }
@@ -199,16 +199,22 @@ impl HeterogeneousScheduler {
     fn scored_paths(
         &self,
         paths: &[PathSnapshot],
-        original_lane: FlowLane,
-        scheduled_lane: FlowLane,
+        original_lane: TrafficClass,
+        scheduled_lane: TrafficClass,
         payload_bytes: usize,
         mode: SchedulingMode,
     ) -> Vec<PathScore> {
+        let available_is_schedulable = paths.iter().copied().any(|path| {
+            path_is_scheduler_candidate(path, original_lane, scheduled_lane)
+                && !path_is_backup(path)
+        });
         let mut scored = paths
             .iter()
-            .filter(|path| original_lane != FlowLane::Throughput || path.policy.bulk_allowed)
+            .copied()
+            .filter(|path| path_is_scheduler_candidate(*path, original_lane, scheduled_lane))
+            .filter(|path| !available_is_schedulable || !path_is_backup(*path))
             .filter_map(|path| {
-                let mut path = *path;
+                let mut path = path;
                 path.queue_bytes = path
                     .queue_bytes
                     .saturating_add(self.queued_path_bytes(path.id));
@@ -238,9 +244,23 @@ impl HeterogeneousScheduler {
     }
 }
 
+pub(super) fn schedulable_capacity_bps(paths: &[PathSnapshot], lane: TrafficClass) -> f64 {
+    let available_is_schedulable = paths
+        .iter()
+        .copied()
+        .any(|path| path_is_schedulable(path, lane) && !path_is_backup(path));
+    paths
+        .iter()
+        .copied()
+        .filter(|path| path_is_schedulable(*path, lane))
+        .filter(|path| !available_is_schedulable || !path_is_backup(*path))
+        .map(|path| path.delivery_rate_bps.max(0.0))
+        .sum()
+}
+
 #[derive(Debug)]
 struct LaneQueue {
-    lane: FlowLane,
+    lane: TrafficClass,
     deficit_bytes: u64,
     flows: VecDeque<FlowQueue>,
 }
@@ -258,14 +278,23 @@ struct PathQueue {
     bytes: u64,
 }
 
-fn priority_order() -> [FlowLane; 5] {
+fn priority_order() -> [TrafficClass; 5] {
     [
-        FlowLane::Control,
-        FlowLane::RealtimeDatagram,
-        FlowLane::Latency,
-        FlowLane::Throughput,
-        FlowLane::Background,
+        TrafficClass::Control,
+        TrafficClass::RealtimeDatagram,
+        TrafficClass::Latency,
+        TrafficClass::Throughput,
+        TrafficClass::Background,
     ]
+}
+
+fn path_is_scheduler_candidate(
+    path: PathSnapshot,
+    original_lane: TrafficClass,
+    scheduled_lane: TrafficClass,
+) -> bool {
+    (original_lane != TrafficClass::Throughput || path.policy.bulk_allowed)
+        && path_is_schedulable(path, scheduled_lane)
 }
 
 fn deficit_charge_bytes(payload_bytes: usize) -> u64 {
@@ -273,7 +302,7 @@ fn deficit_charge_bytes(payload_bytes: usize) -> u64 {
 }
 
 fn scheduling_mode(packet: EnqueueRequest, paths: &[PathSnapshot]) -> SchedulingMode {
-    if packet.lane == FlowLane::Throughput
+    if packet.lane == TrafficClass::Throughput
         && packet.remaining_flow_bytes <= adaptive_tail_avoidance_threshold_bytes(paths, packet)
     {
         SchedulingMode::TailAvoidance
@@ -282,9 +311,9 @@ fn scheduling_mode(packet: EnqueueRequest, paths: &[PathSnapshot]) -> Scheduling
     }
 }
 
-fn scheduled_lane(lane: FlowLane, mode: SchedulingMode) -> FlowLane {
+fn scheduled_lane(lane: TrafficClass, mode: SchedulingMode) -> TrafficClass {
     match (lane, mode) {
-        (FlowLane::Throughput, SchedulingMode::TailAvoidance) => FlowLane::Latency,
+        (TrafficClass::Throughput, SchedulingMode::TailAvoidance) => TrafficClass::Latency,
         _ => lane,
     }
 }
@@ -296,7 +325,10 @@ fn duplicate_path(
     paths: &[PathSnapshot],
 ) -> Option<PathId> {
     if !packet.duplicate_eligible
-        || !matches!(packet.lane, FlowLane::Control | FlowLane::RealtimeDatagram)
+        || !matches!(
+            packet.lane,
+            TrafficClass::Control | TrafficClass::RealtimeDatagram
+        )
     {
         return None;
     }
@@ -344,7 +376,7 @@ fn adaptive_tail_avoidance_threshold_bytes(
     paths
         .iter()
         .copied()
-        .filter(|path| path_is_schedulable(*path, FlowLane::Latency))
+        .filter(|path| path_is_schedulable(*path, TrafficClass::Latency))
         .map(path_bdp_bytes)
         .min()
         .unwrap_or(packet.payload_bytes.max(1))

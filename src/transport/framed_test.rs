@@ -47,8 +47,16 @@ async fn framed_stream_rejects_oversize_inbound_frame_before_allocating_payload(
         ..CodecLimits::default()
     };
     let mut reader = FramedStream::new(reader, limits);
+    let encoded = crate::protocol::codec::encode_frame(
+        &Frame::SessionHello {
+            session_id: SessionId(1),
+        },
+        CodecLimits::default(),
+    )
+    .expect("encode valid frame header");
+    assert!(encoded.len() > limits.max_frame_bytes);
     writer
-        .write_all(&[b'M', b'P', b'T', b'F', 1, 16, 0, 0, 1, 0])
+        .write_all(&encoded[..FRAME_HEADER_LEN])
         .await
         .expect("write header");
 

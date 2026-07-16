@@ -351,7 +351,7 @@ fn quic_initial_full_quantum_sample_does_not_seed_tiny_bulk_rate() {
     assert_eq!(
         measured.delivery_rate_bps.round() as u64,
         startup.delivery_rate_bps.round() as u64,
-        "a single underfed validation quantum must not replace the startup/pacing fallback with a tiny rate"
+        "a single underfed measurement quantum must not replace the startup/pacing fallback with a tiny rate"
     );
 }
 
@@ -411,7 +411,7 @@ fn quic_capacity_evidence_accumulates_across_small_ack_polls() {
             PathMetricDirection::ServerToClient,
         ));
     }
-    let measured = measured.expect("split calibration sample");
+    let measured = measured.expect("split measurement sample");
     assert_eq!(measured.delivery_sample_bytes, sample_bytes);
     assert!(!measured.app_limited);
 
@@ -485,7 +485,7 @@ fn quic_compressed_ack_sample_cannot_jump_beyond_startup_gain() {
     );
 
     assert_eq!(measured.delivery_sample_count, 64);
-    assert!(measured.delivery_rate_bps <= startup.delivery_rate_bps * BBR_DEFAULT_CWND_GAIN);
+    assert!(measured.delivery_rate_bps <= startup.delivery_rate_bps * RELIABLE_PIPE_WINDOW_BDPS);
 }
 
 #[test]

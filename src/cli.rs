@@ -26,23 +26,6 @@ pub struct Cli {
     #[arg(long, global = true, env = "MPTUNNEL_LOG", default_value = "info")]
     pub log_level: String,
 
-    #[arg(
-        long,
-        global = true,
-        env = "MPTUNNEL_SECURITY",
-        value_enum,
-        default_value_t = SecurityArg::Encrypted
-    )]
-    pub security: SecurityArg,
-
-    #[arg(
-        long,
-        global = true,
-        env = "MPTUNNEL_I_UNDERSTAND_THIS_IS_INSECURE",
-        default_value_t = false
-    )]
-    pub i_understand_this_is_insecure: bool,
-
     #[arg(long, global = true, env = "MPTUNNEL_SECRET")]
     pub secret: Option<String>,
 
@@ -86,12 +69,15 @@ pub struct Cli {
 
 impl Cli {
     pub fn into_config(self) -> Result<AppConfig, CliConfigError> {
-        let security = self.security.into_config(
-            self.i_understand_this_is_insecure,
-            self.secret,
-            self.cipher,
-            self.auth_freshness_window_seconds,
+        let secret = SharedSecret::new(
+            self.secret
+                .ok_or(CliConfigError::Security(
+                    crate::config::SecurityPolicyError::MissingSecret,
+                ))?
+                .into_bytes(),
         )?;
+        let security = SecurityConfig::encrypted_with_cipher(secret, self.cipher.into())
+            .with_auth_freshness_window(Duration::from_secs(self.auth_freshness_window_seconds));
         let command = match self.command {
             Command::Client(args) => CommandConfig::Client(args.into_config(security.clone())?),
             Command::Server(args) => CommandConfig::Server(args.into_config(security.clone())?),
@@ -119,7 +105,7 @@ pub struct ManagementArgs {
         env = "MPTUNNEL_MANAGEMENT_LISTEN",
         value_delimiter = ','
     )]
-    pub listen: Vec<SocketAddr>,
+    pub management_listen: Vec<SocketAddr>,
 
     #[arg(
         long = "management-token",
@@ -127,13 +113,31 @@ pub struct ManagementArgs {
         env = "MPTUNNEL_MANAGEMENT_TOKEN"
     )]
     pub token: Option<String>,
+
+    #[arg(
+        long = "management-dashboard",
+        global = true,
+        env = "MPTUNNEL_MANAGEMENT_DASHBOARD",
+        default_value_t = false
+    )]
+    pub dashboard: bool,
+
+    #[arg(
+        long = "management-allow-peer-diagnostics",
+        global = true,
+        env = "MPTUNNEL_MANAGEMENT_ALLOW_PEER_DIAGNOSTICS",
+        default_value_t = false
+    )]
+    pub allow_peer_diagnostics: bool,
 }
 
 impl ManagementArgs {
     fn into_config(self) -> ManagementConfig {
         ManagementConfig {
-            listen: self.listen,
+            listen: self.management_listen,
             token: self.token,
+            dashboard: self.dashboard,
+            allow_peer_diagnostics: self.allow_peer_diagnostics,
         }
     }
 }
@@ -322,12 +326,6 @@ impl ResourceArgs {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
-pub enum SecurityArg {
-    Encrypted,
-    PlaintextLab,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
 pub enum CipherArg {
     #[value(name = "aes-256-gcm", alias = "aes256-gcm")]
     Aes256Gcm,
@@ -339,35 +337,6 @@ impl From<CipherArg> for CipherSuite {
         match value {
             CipherArg::Aes256Gcm => Self::Aes256Gcm,
             CipherArg::Chacha20Poly1305 => Self::Chacha20Poly1305,
-        }
-    }
-}
-
-impl SecurityArg {
-    fn into_config(
-        self,
-        acknowledged: bool,
-        secret: Option<String>,
-        cipher: CipherArg,
-        auth_freshness_window_seconds: u64,
-    ) -> Result<SecurityConfig, CliConfigError> {
-        if matches!(self, Self::PlaintextLab) && !acknowledged {
-            return Err(CliConfigError::PlaintextNotAcknowledged);
-        }
-        let secret = SharedSecret::new(
-            secret
-                .ok_or(CliConfigError::Security(
-                    crate::config::SecurityPolicyError::MissingSecret,
-                ))?
-                .into_bytes(),
-        )?;
-        let cipher = cipher.into();
-        let auth_freshness_window = Duration::from_secs(auth_freshness_window_seconds);
-        match self {
-            Self::Encrypted => Ok(SecurityConfig::encrypted_with_cipher(secret, cipher)
-                .with_auth_freshness_window(auth_freshness_window)),
-            Self::PlaintextLab => Ok(SecurityConfig::plaintext_lab_with_cipher(secret, cipher)
-                .with_auth_freshness_window(auth_freshness_window)),
         }
     }
 }
@@ -735,7 +704,6 @@ pub enum OutboundArg {
 pub enum CliConfigError {
     Config(crate::config::ConfigError),
     Security(crate::config::SecurityPolicyError),
-    PlaintextNotAcknowledged,
     MissingOutboundBindIp,
     MissingUpstreamSocks5,
     MissingUpstreamHttp,
@@ -762,10 +730,6 @@ impl std::fmt::Display for CliConfigError {
         match self {
             Self::Config(err) => write!(f, "{err}"),
             Self::Security(err) => write!(f, "{err}"),
-            Self::PlaintextNotAcknowledged => write!(
-                f,
-                "plaintext lab mode requires --i-understand-this-is-insecure"
-            ),
             Self::MissingOutboundBindIp => {
                 write!(f, "--outbound bind requires --outbound-bind-ip")
             }

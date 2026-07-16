@@ -8,8 +8,8 @@ use super::io::UdpPathConnection;
 use super::metrics::QuicAckPollDiagnostics;
 use super::metrics::UdpPathMetrics;
 use crate::model::capacity::{
-    BBR_DEFAULT_CWND_GAIN, PATH_OPEN_SCORE_BYTES, QUIC_INITIAL_WINDOW_PACKETS,
-    QUIC_TIMER_GRANULARITY, QuicCapacityProofCandidate,
+    PATH_OPEN_SCORE_BYTES, QUIC_INITIAL_WINDOW_PACKETS, QUIC_TIMER_GRANULARITY,
+    QuicCapacityProofCandidate, RELIABLE_PIPE_WINDOW_BDPS,
     RELIABLE_STREAM_STARTUP_PRODUCT_WINDOW_BYTES, quic_capacity_receipt_rate_bps,
     valid_quic_capacity_proof_geometry,
 };
@@ -353,10 +353,12 @@ impl QuicPathMetricTracker {
         } else {
             0
         };
-        let mut publishable_sample_count = timed_non_app_limited_evidence
-            .then_some(congestion.timed_non_app_limited_delivery_sample_count)
-            .unwrap_or(0)
-            .max(u64::from(publishable_sample_bytes > 0));
+        let mut publishable_sample_count = if timed_non_app_limited_evidence {
+            congestion.timed_non_app_limited_delivery_sample_count
+        } else {
+            0
+        }
+        .max(u64::from(publishable_sample_bytes > 0));
         let mut publishable_sample_elapsed = carrier_ack_elapsed.unwrap_or_default();
         if publishable_sample_bytes > 0 {
             self.pending_non_app_limited_sample_bytes = self
@@ -445,7 +447,7 @@ impl QuicPathMetricTracker {
             } else {
                 estimated_rate
             };
-            let bounded_sample = sample_rate.min(current_rate * BBR_DEFAULT_CWND_GAIN);
+            let bounded_sample = sample_rate.min(current_rate * RELIABLE_PIPE_WINDOW_BDPS);
             let candidate_sample_count = self
                 .delivery_sample_count
                 .saturating_add(publishable_sample_count);

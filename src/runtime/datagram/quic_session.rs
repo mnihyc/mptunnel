@@ -6,12 +6,13 @@ use super::policy::{
 use super::{DatagramClientFlow, SentDatagram, datagram_ack_range, datagram_id_is_in_ranges};
 use crate::config::SecurityConfig;
 use crate::model::capacity::{PathRateSample, QUIC_TIMER_GRANULARITY};
+use crate::model::path::CarrierPathInstanceId;
 use crate::mux::MuxLimits;
 use crate::mux::datagram::DatagramFlow;
 use crate::protocol::codec::CodecLimits;
 use crate::protocol::{
-    CloseReason, DatagramFlowId, DatagramId, Frame, OffsetRange, PathId, PathMetrics, SessionId,
-    TargetAddr,
+    CloseReason, DatagramFlowId, DatagramId, Frame, OffsetRange, PathId, PathMetrics, PathUsage,
+    SessionId, TargetAddr, UnderlayProtocol,
 };
 use crate::runtime::error::RuntimeError;
 use crate::runtime::identity::{random_session_id, random_u64};
@@ -24,6 +25,7 @@ use crate::runtime::path::quic::io::{udp_path_finish_stream, udp_path_write_fram
 use crate::runtime::path::{
     ClientPathContext, ClientPathHealth, ClientPathHealthRecord, ClientPathState,
 };
+use crate::runtime::peer_status::{PeerStatusBroker, PeerStatusSnapshotSource};
 #[cfg(test)]
 use crate::transport::SystemCarrierNetworkProvider;
 use crate::transport::{CarrierNetworkProvider, CarrierPathIdentity, PathSpec};
@@ -95,6 +97,7 @@ impl UdpDatagramClientSession {
         .await
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub(in crate::runtime) async fn open_for_session_with_provider(
         path: &PathSpec,
         path_index: usize,
@@ -109,6 +112,7 @@ impl UdpDatagramClientSession {
             tcp: Vec::new(),
             udp: vec![ClientPathHealthRecord::default(); path_index.saturating_add(1)],
         });
+        let peer_status = PeerStatusBroker::new(false);
         let path_session = ClientUdpPathSessionHandle::new(ClientUdpPathSessionRuntime {
             paths: std::sync::Arc::new(vec![path.clone()]),
             config_index: 0,
@@ -124,6 +128,8 @@ impl UdpDatagramClientSession {
             stream_frame_queue: reliable_stream_frame_queue(mux_limits),
             state,
             carrier_network,
+            peer_status,
+            peer_status_snapshot: PeerStatusSnapshotSource::new(Vec::new),
         });
         Self::open_from_udp_session(path_session, path_index, mux_limits, open_deadline).await
     }
@@ -395,6 +401,22 @@ impl UdpDatagramClientSession {
                 Frame::PathMetrics { metrics } if metrics.path_id == self.path_id => {
                     self.observe_remote_path_metrics(metrics);
                 }
+                Frame::PathStatus {
+                    path_id,
+                    sequence,
+                    usage,
+                } => {
+                    apply_client_udp_datagram_path_status(
+                        &self.stream.runtime.state,
+                        self.path_index,
+                        self.stream.path_instance_id,
+                        self.path_id,
+                        path_id,
+                        sequence,
+                        usage,
+                    )
+                    .map_err(|err| DatagramPathSendError::runtime(err, request_acked))?;
+                }
                 Frame::SessionReady => {}
                 Frame::DatagramClose {
                     flow_id: closed_flow_id,
@@ -474,22 +496,44 @@ impl UdpDatagramClientSession {
                 self.stream.runtime.codec_limits,
             )
             .await?;
-            self.stream
-                .frames
-                .recv()
-                .await
-                .ok_or(RuntimeError::ReliablePathSessionClosed)?
+            loop {
+                let frame = self
+                    .stream
+                    .frames
+                    .recv()
+                    .await
+                    .ok_or(RuntimeError::ReliablePathSessionClosed)??;
+                match frame {
+                    Frame::Pong {
+                        nonce: received_nonce,
+                    } if received_nonce == nonce => break Ok(()),
+                    Frame::PathStatus {
+                        path_id,
+                        sequence,
+                        usage,
+                    } => {
+                        apply_client_udp_datagram_path_status(
+                            &self.stream.runtime.state,
+                            self.path_index,
+                            self.stream.path_instance_id,
+                            self.path_id,
+                            path_id,
+                            sequence,
+                            usage,
+                        )?;
+                    }
+                    Frame::SessionReady => {}
+                    Frame::SessionClose { reason } => {
+                        break Err(RuntimeError::RemoteClosed(reason));
+                    }
+                    _ => break Err(RuntimeError::Protocol("unexpected UDP path probe frame")),
+                }
+            }
         };
-        match tokio::time::timeout_at(probe_deadline, ping)
+        tokio::time::timeout_at(probe_deadline, ping)
             .await
-            .map_err(|_| RuntimeError::Protocol("UDP path probe ping timed out"))??
-        {
-            Frame::Pong {
-                nonce: received_nonce,
-            } if received_nonce == nonce => Ok(()),
-            Frame::SessionClose { reason } => Err(RuntimeError::RemoteClosed(reason)),
-            _ => Err(RuntimeError::Protocol("unexpected UDP path probe frame")),
-        }
+            .map_err(|_| RuntimeError::Protocol("UDP path probe ping timed out"))??;
+        Ok(())
     }
 
     pub(in crate::runtime) async fn close_session(&mut self) -> Result<(), RuntimeError> {
@@ -543,10 +587,11 @@ impl UdpDatagramClientSession {
         self.last_feedback_observation = Some(UdpDatagramPathObservation {
             rtt: Duration::from_micros(u64::from(metrics.srtt_us)),
             jitter: Duration::from_micros(u64::from(metrics.jitter_us)),
-            loss_rate: metrics
-                .loss_observed
-                .then(|| (f64::from(metrics.loss_ppm) / 1_000_000.0).clamp(0.0, 1.0))
-                .unwrap_or(0.0),
+            loss_rate: if metrics.loss_observed {
+                (f64::from(metrics.loss_ppm) / 1_000_000.0).clamp(0.0, 1.0)
+            } else {
+                0.0
+            },
             rate_sample: PathRateSample::new(
                 metrics.delivery_rate_bps.max(8) / 8,
                 Duration::from_secs(1),
@@ -586,6 +631,33 @@ impl UdpDatagramClientSession {
         });
     }
 }
+
+fn apply_client_udp_datagram_path_status(
+    state: &ClientPathState,
+    path_index: usize,
+    path_instance_id: CarrierPathInstanceId,
+    expected_path_id: PathId,
+    status_path_id: PathId,
+    sequence: u64,
+    usage: PathUsage,
+) -> Result<bool, RuntimeError> {
+    if status_path_id != expected_path_id {
+        return Err(RuntimeError::Protocol(
+            "QUIC path usage advertisement path mismatch",
+        ));
+    }
+    Ok(state.update_peer_path_usage(
+        UnderlayProtocol::Udp,
+        path_index,
+        path_instance_id,
+        sequence,
+        usage,
+    ))
+}
+
+#[cfg(test)]
+#[path = "quic_session_test.rs"]
+mod tests;
 
 /// Opens the QUIC path stream and records only carrier-open latency here.
 pub(super) async fn open_udp_datagram_session_on_path(

@@ -94,6 +94,7 @@ pub(crate) fn lab_server_response_stream_data(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn lab_sender_service_decision(
     role: &'static str,
     session_id: Option<u64>,
@@ -114,7 +115,7 @@ pub(crate) fn lab_sender_service_decision(
         && role == "server"
         && matches!(
             decision_kind,
-            "primary" | "data" | "data_service" | "data_subflow"
+            "primary" | "data" | "data_service" | "data_path_state"
         )
         && frame_kind == "stream_data"
         && let Some(session_id) = session_id
@@ -123,7 +124,10 @@ pub(crate) fn lab_sender_service_decision(
         let mut counts = counts.lock().expect("lab sender-service counts lock");
         let counts = counts.entry((session_id, stream_id)).or_default();
         counts.record_sender_service_decision(decision_kind, payload_bytes, bulk_rate_evidence);
-        if counts.sender_service_stream_data_decisions % 8192 == 0 {
+        if counts
+            .sender_service_stream_data_decisions
+            .is_multiple_of(8192)
+        {
             conformance_progress = Some((session_id, *counts));
         }
     }
@@ -180,7 +184,7 @@ fn lab_emit_sender_service_counts(
     lab_diagnostic(
         "sender_service_conformance",
         format_args!(
-            "phase={} session_id={} stream_id={} server_response_stream_data_frames={} server_sender_service_stream_data_decisions={} service_decisions={} service_payload_bytes={} service_unproven_decisions={} service_unproven_payload_bytes={} service_mature_decisions={} service_mature_payload_bytes={} subflow_decisions={} subflow_payload_bytes={}",
+            "phase={} session_id={} stream_id={} server_response_stream_data_frames={} server_sender_service_stream_data_decisions={} service_decisions={} service_payload_bytes={} service_unproven_decisions={} service_unproven_payload_bytes={} service_mature_decisions={} service_mature_payload_bytes={} path_state_decisions={} path_state_payload_bytes={}",
             phase,
             session_id,
             stream_id,
@@ -192,8 +196,8 @@ fn lab_emit_sender_service_counts(
             counts.service_unproven_payload_bytes,
             counts.service_mature_decisions,
             counts.service_mature_payload_bytes,
-            counts.subflow_decisions,
-            counts.subflow_payload_bytes,
+            counts.path_state_decisions,
+            counts.path_state_payload_bytes,
         ),
     );
 }
@@ -322,8 +326,8 @@ struct LabSenderServiceCounts {
     service_unproven_payload_bytes: u64,
     service_mature_decisions: u64,
     service_mature_payload_bytes: u64,
-    subflow_decisions: u64,
-    subflow_payload_bytes: u64,
+    path_state_decisions: u64,
+    path_state_payload_bytes: u64,
 }
 
 impl LabSenderServiceCounts {
@@ -356,10 +360,10 @@ impl LabSenderServiceCounts {
                     None => {}
                 }
             }
-            "data_subflow" => {
-                self.subflow_decisions += 1;
-                self.subflow_payload_bytes = self
-                    .subflow_payload_bytes
+            "data_path_state" => {
+                self.path_state_decisions += 1;
+                self.path_state_payload_bytes = self
+                    .path_state_payload_bytes
                     .saturating_add(payload_bytes as u64);
             }
             _ => {}

@@ -1,146 +1,88 @@
 use super::{
-    ReliablePathCommand, TcpCapacityProbeRequest, recv_reliable_path_command,
-    reliable_path_command_channels, reliable_path_command_pending_bytes,
-    reliable_path_effective_frame_lane, reliable_path_frame_uses_priority_queue,
-    reliable_path_stream_ordered_queue_lane, try_recv_reliable_path_command,
+    ReliablePathCommand, recv_reliable_path_command, reliable_path_command_channels,
+    reliable_path_command_pending_bytes, reliable_path_effective_frame_lane,
+    reliable_path_frame_uses_priority_queue, try_recv_reliable_path_command,
 };
-use crate::model::capacity::RELIABLE_STREAM_STARTUP_PRODUCT_WINDOW_BYTES;
-use crate::protocol::{DatagramFlowId, Frame, PathId, ResetReason, SessionId, StreamId};
-use crate::runtime::error::RuntimeError;
-use crate::runtime::path::CarrierCommandLease;
-use crate::runtime::stream::response::{
-    ServerPathLaneTracker, next_server_carrier_path_instance_id,
+use crate::protocol::{
+    DatagramFlowId, Frame, PathId, PathUsage, ResetReason, StreamDemandHint, StreamId, TargetAddr,
 };
-use crate::scheduler::FlowLane;
+use crate::scheduler::TrafficClass;
 use bytes::Bytes;
-use std::sync::Arc;
-use std::time::{Duration, Instant};
-
-fn tcp_probe_tracker_and_lease() -> (Arc<ServerPathLaneTracker>, CarrierCommandLease) {
-    let tracker = Arc::new(ServerPathLaneTracker::default());
-    let lease = tracker
-        .try_reserve_tcp_capacity_probe(SessionId(1), 0)
-        .expect("reserve isolated test session");
-    (tracker, CarrierCommandLease::hold(lease))
-}
-
-fn tcp_probe_session_lease() -> CarrierCommandLease {
-    tcp_probe_tracker_and_lease().1
-}
-
-fn tcp_probe_request(path_id: PathId) -> TcpCapacityProbeRequest {
-    TcpCapacityProbeRequest {
-        path_id,
-        path_instance_id: next_server_carrier_path_instance_id(),
-        train_payload_bytes: 2 * 1024 * 1024,
-        sample_floor_bytes: RELIABLE_STREAM_STARTUP_PRODUCT_WINDOW_BYTES / 2,
-        expires_at: Instant::now() + Duration::from_secs(1),
-    }
-}
-
-#[test]
-fn tcp_capacity_attempt_is_spent_only_after_queue_admission() {
-    let (commands, mut receivers) = reliable_path_command_channels(1);
-    commands
-        .try_enqueue_admitted_frame(
-            Frame::StreamData {
-                stream_id: StreamId(1),
-                offset: 0,
-                payload: Bytes::from_static(b"queued"),
-            },
-            reliable_path_stream_ordered_queue_lane(),
-        )
-        .expect("fill data queue");
-    assert!(matches!(
-        commands.try_enqueue_tcp_capacity_probe(
-            tcp_probe_request(PathId(2)),
-            tcp_probe_session_lease(),
-        ),
-        Err(RuntimeError::SenderServiceBlocked)
-    ));
-    assert!(!commands.tcp_capacity_probe_attempted());
-
-    let queued = try_recv_reliable_path_command(&mut receivers).expect("queued ping");
-    receivers.release_pending_command_bytes(reliable_path_command_pending_bytes(&queued));
-    drop(queued);
-    let (tracker, session_lease) = tcp_probe_tracker_and_lease();
-    commands
-        .try_enqueue_tcp_capacity_probe(tcp_probe_request(PathId(2)), session_lease)
-        .expect("admit exact carrier probe");
-    assert!(commands.tcp_capacity_probe_attempted());
-    assert!(commands.tcp_capacity_probe_active());
-    drop(try_recv_reliable_path_command(&mut receivers).expect("queued probe"));
-    assert!(!commands.tcp_capacity_probe_active());
-    assert!(
-        tracker
-            .try_reserve_tcp_capacity_probe(SessionId(1), 0)
-            .is_some(),
-        "command cancellation releases session ownership before carrier wake"
-    );
-    assert!(matches!(
-        commands.try_enqueue_tcp_capacity_probe(
-            tcp_probe_request(PathId(2)),
-            tcp_probe_session_lease(),
-        ),
-        Err(RuntimeError::SenderServiceBlocked)
-    ));
-}
 
 #[test]
 fn control_and_ack_frames_never_use_throughput_lane() {
     let priority_frames = [
+        (
+            Frame::OpenStream {
+                stream_id: StreamId(1),
+                target: TargetAddr::Domain {
+                    host: "example.test".to_string(),
+                    port: 443,
+                },
+                demand: StreamDemandHint::throughput(),
+            },
+            TrafficClass::Control,
+        ),
+        (
+            Frame::PathStatus {
+                path_id: PathId(1),
+                sequence: 4,
+                usage: PathUsage::Backup,
+            },
+            TrafficClass::Control,
+        ),
         (
             Frame::StreamAck {
                 stream_id: StreamId(1),
                 complete: false,
                 ranges: vec![],
             },
-            FlowLane::Control,
+            TrafficClass::Control,
         ),
         (
             Frame::StreamMaxData {
                 stream_id: StreamId(1),
                 max_offset: 1024,
             },
-            FlowLane::Control,
+            TrafficClass::Control,
         ),
         (
             Frame::StreamFin {
                 stream_id: StreamId(1),
                 final_offset: 64,
             },
-            FlowLane::Control,
+            TrafficClass::Control,
         ),
         (
             Frame::StreamReset {
                 stream_id: StreamId(1),
                 reason: ResetReason::RemoteClosed,
             },
-            FlowLane::Control,
+            TrafficClass::Control,
         ),
         (
             Frame::StreamDetach {
                 stream_id: StreamId(1),
             },
-            FlowLane::Control,
+            TrafficClass::Control,
         ),
         (
             Frame::DatagramFeedback {
                 flow_id: DatagramFlowId(1),
                 received: vec![],
             },
-            FlowLane::RealtimeDatagram,
+            TrafficClass::RealtimeDatagram,
         ),
         (
             Frame::DatagramClose {
                 flow_id: DatagramFlowId(1),
             },
-            FlowLane::Control,
+            TrafficClass::Control,
         ),
     ];
 
     for (frame, expected_lane) in priority_frames {
-        let effective_lane = reliable_path_effective_frame_lane(&frame, FlowLane::Throughput);
+        let effective_lane = reliable_path_effective_frame_lane(&frame, TrafficClass::Throughput);
         assert_eq!(effective_lane, expected_lane);
         assert!(reliable_path_frame_uses_priority_queue(effective_lane));
     }
@@ -157,7 +99,7 @@ async fn terminal_reset_and_close_uses_one_ordered_queue_item() {
                 offset: 0,
                 payload: Bytes::from_static(b"bulk"),
             },
-            FlowLane::Throughput,
+            TrafficClass::Throughput,
         )
         .expect("fill ordered data queue");
 
@@ -165,7 +107,7 @@ async fn terminal_reset_and_close_uses_one_ordered_queue_item() {
         commands.send_stream_ordered_reset_and_close(
             stream_id,
             ResetReason::Refused,
-            FlowLane::Throughput,
+            TrafficClass::Throughput,
         ),
         recv_reliable_path_command(&mut receivers),
     );
@@ -214,7 +156,7 @@ async fn cancelling_waiting_terminal_reset_releases_queue_debt() {
                 offset: 0,
                 payload: Bytes::from_static(b"bulk"),
             },
-            FlowLane::Throughput,
+            TrafficClass::Throughput,
         )
         .expect("fill ordered data queue");
     let queued_bytes = commands.pending_bytes();
@@ -229,7 +171,7 @@ async fn cancelling_waiting_terminal_reset_releases_queue_debt() {
     let mut terminal_send = Box::pin(commands.send_stream_ordered_reset_and_close(
         stream_id,
         ResetReason::Refused,
-        FlowLane::Throughput,
+        TrafficClass::Throughput,
     ));
     tokio::select! {
         biased;

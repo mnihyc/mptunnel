@@ -1,13 +1,13 @@
 use super::*;
 use crate::model::capacity::{
-    BBR_MAX_SEND_QUANTUM_BYTES, UDP_BASELINE_PACKET_PAYLOAD_BYTES,
+    MAX_RELIABLE_SERVICE_QUANTUM_BYTES, UDP_BASELINE_PACKET_PAYLOAD_BYTES,
     reliable_relay_scheduler_quantum_cap,
 };
 use crate::protocol::{DatagramFlowId, DatagramId, PathId, StreamId};
 use crate::runtime::path::commands::{
     reliable_path_command_queue_for_payload, reliable_stream_frame_queue,
 };
-use crate::scheduler::FlowLane;
+use crate::scheduler::TrafficClass;
 use bytes::Bytes;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 
@@ -36,17 +36,17 @@ fn quic_resolution_keeps_all_unique_source_compatible_addresses() {
 fn quic_ordinary_writer_enforces_measurement_ownership() {
     let capacity = Frame::PathCapacityData {
         path_id: PathId(4),
-        calibration_id: 17,
+        measurement_id: 17,
         payload: Bytes::from_static(b"capacity"),
     };
     let finish = Frame::PathCapacityFinish {
         path_id: PathId(4),
-        calibration_id: 17,
+        measurement_id: 17,
         payload_bytes: 8,
     };
     let receipt = Frame::PathCapacityReceipt {
         path_id: PathId(4),
-        calibration_id: 17,
+        measurement_id: 17,
         received_payload_bytes: 8,
     };
     let stream = Frame::StreamData {
@@ -103,7 +103,7 @@ fn quic_product_payload_uses_sender_quantum_not_packet_train_cap() {
     let payload_cap = udp_path_max_stream_payload_bytes(codec_limits, mux_limits);
 
     assert!(
-        payload_cap >= BBR_MAX_SEND_QUANTUM_BYTES,
+        payload_cap >= MAX_RELIABLE_SERVICE_QUANTUM_BYTES,
         "QUIC product dispatch must stay BDP/service-quantum sized; only carrier serialization may split records"
     );
 }
@@ -128,10 +128,10 @@ fn quic_udp_command_queue_tracks_sender_quantum_not_record_size() {
     let product_queue = reliable_path_command_queue(mux_limits);
     let quic_udp_queue = udp_path_command_queue(mux_limits, codec_limits);
     let sender_quantum =
-        reliable_relay_scheduler_quantum_cap(None, FlowLane::Throughput, mux_limits);
+        reliable_relay_scheduler_quantum_cap(None, TrafficClass::Throughput, mux_limits);
     let record_sized_queue = reliable_path_command_queue_for_payload(
         mux_limits,
-        sender_quantum.min(UDP_BASELINE_PACKET_PAYLOAD_BYTES).max(1),
+        sender_quantum.clamp(1, UDP_BASELINE_PACKET_PAYLOAD_BYTES),
     );
 
     assert_eq!(

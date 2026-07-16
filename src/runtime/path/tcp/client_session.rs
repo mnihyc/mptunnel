@@ -1,11 +1,9 @@
 //! Reconnecting reliable TCP actor and connection lifetime orchestration.
 //!
-//! This owner preserves the biased select loop, carrier generation, and the
+//! This owner preserves the biased select loop, reconnect fencing, and the
 //! lifetime coupling between one TCP carrier and all attached product streams.
 
-use super::client_connection::{
-    ClientTcpCarrierConnect, ClientTcpHeartbeatTimeoutDisposition, connect_client_tcp_carrier,
-};
+use super::client_connection::{ClientTcpCarrierConnect, connect_client_tcp_carrier};
 use super::client_receive::handle_client_tcp_path_frame;
 use super::client_state::{ClientTcpPathConnection, ClientTcpPathSessionRuntime};
 use super::client_stream::{
@@ -14,17 +12,10 @@ use super::client_stream::{
     open_client_tcp_stream_on_connection,
 };
 use super::client_writer::handle_connected_client_tcp_command_run;
-#[cfg(test)]
-use crate::config::SecurityConfig;
 #[cfg(feature = "lab-diagnostics")]
 use crate::lab_diagnostics::lab_diagnostic;
-#[cfg(test)]
-use crate::mux::MuxLimits;
-#[cfg(test)]
-use crate::protocol::SessionId;
-#[cfg(test)]
-use crate::protocol::codec::CodecLimits;
-use crate::protocol::{Frame, PathId, PathMetricDirection, StreamId};
+use crate::model::path::{RelayPathKey, next_carrier_path_instance_id};
+use crate::protocol::{Frame, PathId, PathMetricDirection, StreamId, UnderlayProtocol};
 use crate::runtime::error::RuntimeError;
 use crate::runtime::path::commands::{
     ClientTcpOpenResponse, ReliablePathCommand, ReliablePathCommandReceivers,
@@ -33,8 +24,6 @@ use crate::runtime::path::commands::{
 };
 use crate::runtime::path::model::{path_startup_metrics, path_startup_snapshot};
 use crate::runtime::recent_ids::RecentIdCache;
-#[cfg(test)]
-use crate::transport::PathSpec;
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -159,15 +148,14 @@ pub(super) async fn run_client_tcp_path_session(
         let command_may_recv = receivers_open && !request_probe_pending;
 
         let mut drop_connection = false;
+        let connection = state
+            .connection
+            .as_mut()
+            .expect("checked connected TCP path session");
         tokio::select! {
             biased;
             _ = &mut request_probe_cancelled, if request_probe_pending => {
-                state
-                    .connection
-                    .as_mut()
-                    .expect("checked connected TCP path session")
-                    .capacity
-                    .discard_pending_receipt();
+                connection.capacity.discard_pending_receipt();
                 #[cfg(feature = "lab-diagnostics")]
                 lab_diagnostic(
                     "request_tcp_capacity_probe",
@@ -175,12 +163,7 @@ pub(super) async fn run_client_tcp_path_session(
                 );
             }
             _ = &mut request_probe_timer, if request_probe_pending => {
-                state
-                    .connection
-                    .as_mut()
-                    .expect("checked connected TCP path session")
-                    .capacity
-                    .discard_pending_receipt();
+                connection.capacity.discard_pending_receipt();
                 #[cfg(feature = "lab-diagnostics")]
                 lab_diagnostic(
                     "request_tcp_capacity_probe",
@@ -189,7 +172,7 @@ pub(super) async fn run_client_tcp_path_session(
             }
             _ = &mut pending_open_timer, if pending_open_deadline.is_some() => {
                 if let Err(err) = expire_client_tcp_pending_opens(
-                    state.connection.as_mut().expect("checked connected TCP path session"),
+                    connection,
                     &mut state.streams,
                     &mut state.closed_streams,
                 ).await {
@@ -199,12 +182,32 @@ pub(super) async fn run_client_tcp_path_session(
                     drop_connection = true;
                 }
             }
-            frame = state.connection.as_mut().expect("checked connected TCP path session").carrier.frames.recv() => {
+            request_id = connection.peer_status.recv_request() => {
+                if let Some(request_id) = request_id {
+                    let result = async {
+                        connection
+                            .carrier
+                            .writer
+                            .write_frame(&Frame::PeerStatusRequest { request_id })
+                            .await?;
+                        connection.carrier.writer.flush().await?;
+                        Ok::<(), RuntimeError>(())
+                    }
+                    .await;
+                    if let Err(err) = result {
+                        carrier_generation.clear();
+                        fail_client_tcp_streams(&mut state.streams, &err);
+                        eprintln!("warning: TCP peer status request failed: {err}");
+                        drop_connection = true;
+                    }
+                }
+            }
+            frame = connection.carrier.frames.recv() => {
                 match frame {
                     Some(Ok(frame)) => {
                         if let Err(err) = handle_client_tcp_path_frame(
                             frame,
-                            state.connection.as_mut().expect("checked connected TCP path session"),
+                            connection,
                             &mut state.streams,
                             &mut state.closed_streams,
                             &runtime,
@@ -221,10 +224,7 @@ pub(super) async fn run_client_tcp_path_session(
                             let result = handle_connected_client_tcp_command_run(
                                 command,
                                 &mut commands,
-                                state
-                                    .connection
-                                    .as_mut()
-                                    .expect("checked connected TCP path session"),
+                                connection,
                                 &mut state.streams,
                                 &mut state.closed_streams,
                                 &runtime,
@@ -263,7 +263,7 @@ pub(super) async fn run_client_tcp_path_session(
                         let result = handle_connected_client_tcp_command_run(
                             command,
                             &mut commands,
-                            state.connection.as_mut().expect("checked connected TCP path session"),
+                            connection,
                             &mut state.streams,
                             &mut state.closed_streams,
                             &runtime,
@@ -282,32 +282,19 @@ pub(super) async fn run_client_tcp_path_session(
                     }
                     None => {
                         if reliable_path_receivers_closed(&commands) {
-                            if let Some(connection_ref) = state.connection.as_mut() {
-                                let _ = close_client_tcp_path(
-                                    connection_ref,
-                                    PathId(runtime.path_index as u16),
-                                    !state.streams.is_empty(),
-                                )
-                                .await;
-                            }
+                            let _ = close_client_tcp_path(
+                                connection,
+                                PathId(runtime.path_index as u16),
+                                !state.streams.is_empty(),
+                            )
+                            .await;
                             return;
                         }
                     }
                 }
             }
             _ = &mut heartbeat_timer, if !request_probe_pending => {
-                let timeout_disposition = if state.streams.is_empty() {
-                    ClientTcpHeartbeatTimeoutDisposition::FailCarrier
-                } else {
-                    ClientTcpHeartbeatTimeoutDisposition::KeepCarrierAlive
-                };
-                if let Err(err) = state
-                    .connection
-                    .as_mut()
-                    .expect("checked connected TCP path session")
-                    .carrier
-                    .tick_heartbeat(timeout_disposition)
-                    .await
+                if let Err(err) = connection.carrier.tick_heartbeat().await
                 {
                     carrier_generation.clear();
                     fail_client_tcp_streams(&mut state.streams, &err);
@@ -319,6 +306,18 @@ pub(super) async fn run_client_tcp_path_session(
 
         if drop_connection {
             carrier_generation.clear();
+            let path_instance_id = state
+                .connection
+                .as_ref()
+                .expect("connected TCP path being retired")
+                .path_instance_id;
+            runtime.state.mark_path_instance_data_plane_failure(
+                RelayPathKey {
+                    underlay: UnderlayProtocol::Tcp,
+                    index: runtime.path_index,
+                },
+                path_instance_id,
+            );
             state.connection = None;
         }
     }
@@ -336,7 +335,6 @@ async fn handle_disconnected_client_tcp_command(
             observed_carrier_generation: _,
             target,
             lane,
-            role,
             open_deadlines,
             session_commands,
             mut response,
@@ -348,7 +346,7 @@ async fn handle_disconnected_client_tcp_command(
                 ));
                 return;
             }
-            let connect = connect_client_tcp_path(&runtime, open_deadline);
+            let connect = connect_client_tcp_path(runtime, open_deadline);
             tokio::pin!(connect);
             let connect_result = tokio::select! {
                 biased;
@@ -368,7 +366,6 @@ async fn handle_disconnected_client_tcp_command(
                         attempt_id,
                         target,
                         lane,
-                        role,
                         open_deadline,
                         session_commands,
                         response,
@@ -409,10 +406,10 @@ async fn connect_client_tcp_path(
     runtime: &ClientTcpPathSessionRuntime,
     open_deadline: tokio::time::Instant,
 ) -> Result<ClientTcpPathConnection, RuntimeError> {
-    let startup_snapshot = path_startup_snapshot(runtime.path(), runtime.path_index);
+    let mut startup_snapshot = path_startup_snapshot(runtime.path(), runtime.path_index);
     let startup_metrics = path_startup_metrics(
         runtime.path(),
-        runtime.path_index,
+        PathId(runtime.path_index as u16),
         PathMetricDirection::ClientToServer,
     );
     let carrier = connect_client_tcp_carrier(
@@ -429,42 +426,24 @@ async fn connect_client_tcp_path(
         open_deadline,
     )
     .await?;
+    let path_instance_id = next_carrier_path_instance_id();
+    runtime.state.install_peer_path_usage(
+        UnderlayProtocol::Tcp,
+        runtime.path_index,
+        path_instance_id,
+        carrier.peer_usage_sequence,
+        carrier.peer_usage,
+    );
+    startup_snapshot.peer_usage = Some(carrier.peer_usage);
+    let peer_status = runtime.peer_status.register(runtime.session_id);
     Ok(ClientTcpPathConnection::new(
+        path_instance_id,
         startup_snapshot,
         startup_metrics,
         carrier,
+        peer_status,
         runtime.mux_limits,
     ))
-}
-
-#[cfg(test)]
-pub(in crate::runtime) async fn connect_client_tcp_path_for_test(
-    path: &PathSpec,
-    path_index: usize,
-    session_id: SessionId,
-    security: &SecurityConfig,
-    codec_limits: CodecLimits,
-    mux_limits: MuxLimits,
-    open_deadline: tokio::time::Instant,
-) -> Result<(), RuntimeError> {
-    connect_client_tcp_carrier(
-        ClientTcpCarrierConnect {
-            path,
-            path_index,
-            carrier_identity: crate::transport::CarrierPathIdentity {
-                group_ordinal: 0,
-                path_ordinal: path_index,
-            },
-            session_id,
-            security,
-            codec_limits,
-            mux_limits,
-            carrier_network: &crate::transport::SystemCarrierNetworkProvider,
-        },
-        open_deadline,
-    )
-    .await
-    .map(drop)
 }
 
 async fn close_client_tcp_path(

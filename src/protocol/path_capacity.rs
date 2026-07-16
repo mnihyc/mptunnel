@@ -16,7 +16,7 @@ impl PathCapacityReceiveError {
             Self::InvalidData => "invalid path capacity data",
             Self::ReceiptOverflow => "path capacity receipt overflow",
             Self::SessionEnvelopeExceeded => "path capacity data exceeds the session envelope",
-            Self::InterleavedToken => "interleaved path capacity calibration tokens",
+            Self::InterleavedToken => "interleaved path capacity measurement tokens",
             Self::FinishWithoutData => "path capacity finish has no data epoch",
             Self::FinishMismatch => "path capacity finish does not match received data",
         }

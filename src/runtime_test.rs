@@ -11,13 +11,13 @@ use crate::runtime::path::commands::{
 };
 use crate::runtime::path::quic::server::{bind_server_udp_endpoint, run_server_udp_listener};
 use crate::runtime::path::{
-    ServerCarrierPathIdentity, ServerCarrierPathRegistration, ServerStreamOpenRequest,
-    ServerStreamPathAttachment,
+    ServerCarrierPathIdentity, ServerCarrierPathRegistration, ServerLocalPath,
+    ServerLocalPathProperties, ServerStreamOpenRequest, ServerStreamPathAttachment,
 };
 use crate::runtime::relay::lifecycle::{
-    reliable_relay_receive_hole_repair_active, reliable_relay_receive_hole_repair_deadline,
-    reliable_relay_response_stall_watch_bytes, reliable_relay_stall_progress_anchor,
-    reliable_relay_stall_watch_active,
+    reliable_relay_receive_hole_reinjection_active,
+    reliable_relay_receive_hole_reinjection_deadline, reliable_relay_response_stall_watch_bytes,
+    reliable_relay_stall_progress_anchor, reliable_relay_stall_watch_active,
 };
 use crate::runtime::stream::response::{ResponseStreamAttachOutcome, ResponseStreamBinding};
 use crate::transport::Endpoint;
@@ -53,21 +53,6 @@ fn udp_candidate_indices(
         .collect()
 }
 
-fn tcp_bulk_striping_indices(context: &ClientPathContext, payload_bytes: usize) -> Vec<usize> {
-    context
-        .ordered_reliable_bulk_striping_path_keys(payload_bytes)
-        .into_iter()
-        .filter_map(|key| (key.underlay == UnderlayProtocol::Tcp).then_some(key.index))
-        .collect()
-}
-
-fn reliable_bulk_striping_path_keys(
-    context: &ClientPathContext,
-    payload_bytes: usize,
-) -> Vec<RelayPathKey> {
-    context.ordered_reliable_bulk_striping_path_keys(payload_bytes)
-}
-
 async fn recv_emitted_tcp_path_command(
     receivers: &mut ReliablePathCommandReceivers,
 ) -> Option<ReliablePathCommand> {
@@ -76,22 +61,6 @@ async fn recv_emitted_tcp_path_command(
         receivers.release_pending_command_bytes(reliable_path_command_pending_bytes(command));
     }
     command
-}
-
-fn udp_stream_path_indices(
-    context: &ClientPathContext,
-    lane: FlowLane,
-    payload_bytes: usize,
-) -> Vec<usize> {
-    let observations = health_observations(
-        &context
-            .health()
-            .lock()
-            .expect("client path health lock")
-            .udp,
-        Instant::now(),
-    );
-    ordered_reliable_path_indices(&context.udp_paths, &observations, lane, payload_bytes)
 }
 
 fn server_runtime(outbound: OutboundConfig) -> ServerIdentityRuntime {
@@ -344,6 +313,7 @@ async fn spawn_server_path_count(
 ) -> (PathSpec, tokio::task::JoinHandle<Result<(), RuntimeError>>) {
     let path = reserve_tcp_path().await;
     let listener = bind_listener(&path).await.expect("bind");
+    let local_path = ServerLocalPath::new(0, path.clone());
     let handle = tokio::spawn(async move {
         let ServerIdentityRuntime {
             paths,
@@ -355,7 +325,10 @@ async fn spawn_server_path_count(
             for _ in 0..count {
                 let (stream, _) = listener.accept().await.expect("accept");
                 let session_context = paths.clone();
-                sessions.spawn(async move { handle_server_path(stream, session_context).await });
+                let local_path = local_path.clone();
+                sessions.spawn(async move {
+                    handle_server_path(stream, local_path, session_context).await
+                });
             }
             while let Some(session) = sessions.join_next().await {
                 session.map_err(RuntimeError::TaskJoin)??;
@@ -432,12 +405,25 @@ async fn spawn_reliable_relay_heartbeat_blackhole(
             }
             _ => return Err(RuntimeError::Protocol("invalid PATH_JOIN")),
         };
+        match framed.read_frame().await? {
+            Frame::PathStatus {
+                path_id: status_path_id,
+                sequence: 0,
+                ..
+            } if status_path_id == path_id => {}
+            _ => {
+                return Err(RuntimeError::Protocol(
+                    "invalid initial TCP path usage advertisement",
+                ));
+            }
+        }
         let resources = ResourceLimits::default();
         framed.write_frame(&Frame::SessionReady).await?;
         framed
             .write_frame(&Frame::PathStatus {
                 path_id,
-                status: crate::protocol::PathStatus::Active,
+                sequence: 0,
+                usage: crate::protocol::PathUsage::Available,
             })
             .await?;
         framed.flush().await?;
@@ -476,6 +462,20 @@ async fn spawn_reliable_relay_heartbeat_blackhole(
                     stream_id: ack_stream_id,
                     ..
                 } if ack_stream_id == stream_id => {}
+                Frame::PathProofData {
+                    path_id: proof_path_id,
+                    proof_id,
+                    payload,
+                } if proof_path_id == path_id => {
+                    framed
+                        .write_frame(&Frame::PathProofAck {
+                            path_id,
+                            proof_id,
+                            payload_bytes: u32::try_from(payload.len()).unwrap_or(u32::MAX),
+                        })
+                        .await?;
+                    framed.flush().await?;
+                }
                 Frame::PathMetrics { .. } => {}
                 Frame::SessionClose { .. } => return Ok(()),
                 _ => return Err(RuntimeError::Protocol("unexpected heartbeat test frame")),
@@ -492,6 +492,7 @@ async fn spawn_notified_server_path(
     accepted: mpsc::Sender<u8>,
 ) -> tokio::task::JoinHandle<Result<(), RuntimeError>> {
     let listener = bind_listener(&path).await.expect("bind");
+    let local_path = ServerLocalPath::new(0, path.clone());
     tokio::spawn(async move {
         let ServerIdentityRuntime {
             paths,
@@ -500,7 +501,7 @@ async fn spawn_notified_server_path(
         let relay = tokio::spawn(reliable_relay.run());
         let (stream, _) = listener.accept().await.expect("accept");
         let _ = accepted.send(marker).await;
-        let result = handle_server_path(stream, paths).await;
+        let result = handle_server_path(stream, local_path, paths).await;
         relay.abort();
         let _ = relay.await;
         result
@@ -523,9 +524,10 @@ async fn spawn_udp_server_path(
     let endpoint = bind_server_udp_endpoint(&path, &paths)
         .await
         .expect("bind udp path");
+    let local_path = ServerLocalPath::new(0, path.clone());
     let server = tokio::spawn(async move {
         tokio::select! {
-            result = run_server_udp_listener(endpoint, paths) => result,
+            result = run_server_udp_listener(endpoint, local_path, paths) => result,
             result = reliable_relay.run() => result,
         }
     });
@@ -542,10 +544,11 @@ async fn server_udp_listener_accepts_probe_after_noise() {
     let endpoint = bind_server_udp_endpoint(&bind_path, &paths)
         .await
         .expect("bind udp");
+    let local_path = ServerLocalPath::new(0, bind_path.clone());
     let server_addr = endpoint.local_addr().expect("udp server addr");
     let server = tokio::spawn(async move {
         tokio::select! {
-            result = run_server_udp_listener(endpoint, paths) => result,
+            result = run_server_udp_listener(endpoint, local_path, paths) => result,
             result = reliable_relay.run() => result,
         }
     });
@@ -729,13 +732,13 @@ fn reliable_relay_sender_queue_budget_is_resource_gated() {
 }
 
 #[test]
-fn reliable_relay_sender_queue_prioritizes_only_critical_repair_lane() {
+fn reliable_relay_sender_queue_prioritizes_only_critical_reinjection_lane() {
     let mut queue = ReliableRelaySenderQueue::default();
     queue.push_data(Bytes::from_static(b"ordinary"));
-    queue.push_repair(Frame::StreamData {
+    queue.push_reinjection(Frame::StreamData {
         stream_id: StreamId(9),
         offset: 0,
-        payload: Bytes::from_static(b"repair"),
+        payload: Bytes::from_static(b"reinjection"),
     });
 
     let (lane, work) = queue.pop_front().expect("owner data");
@@ -744,21 +747,21 @@ fn reliable_relay_sender_queue_prioritizes_only_critical_repair_lane() {
     assert_eq!(queue.data_bytes(), 0);
 
     queue.push_data(Bytes::from_static(b"ordinary"));
-    queue.push_critical_repair_with_cause(
+    queue.push_critical_reinjection_with_cause(
         Frame::StreamData {
             stream_id: StreamId(9),
             offset: 0,
-            payload: Bytes::from_static(b"repair"),
+            payload: Bytes::from_static(b"reinjection"),
         },
-        RelaySendCause::AckGapRepair,
+        RelaySendCause::AckGapReinjection,
     );
-    let (lane, work) = queue.pop_front().expect("critical repair work");
-    assert_eq!(lane, ReliableWorkClass::Repair);
+    let (lane, work) = queue.pop_front().expect("critical reinjection work");
+    assert_eq!(lane, ReliableWorkClass::Reinjection);
     assert!(matches!(
         work.kind,
-        ReliableRelayQueuedWorkKind::Repair {
+        ReliableRelayQueuedWorkKind::Reinjection {
             frame: Frame::StreamData { .. },
-            cause: RelaySendCause::AckGapRepair,
+            cause: RelaySendCause::AckGapReinjection,
         }
     ));
     assert_eq!(queue.data_bytes(), b"ordinary".len());
@@ -772,7 +775,7 @@ async fn server_response_sender_dispatch_creates_stream_data_from_queued_bytes()
     let path_stream = ReliablePathStream {
         stream_id,
         max_offset: 1024,
-        lane: FlowLane::Throughput,
+        lane: TrafficClass::Throughput,
         underlay: UnderlayProtocol::Tcp,
         max_frame_payload_bytes: reliable_relay_buffer_len(MuxLimits::default()),
         output: ReliablePathStreamOutput::fixed(
@@ -786,14 +789,14 @@ async fn server_response_sender_dispatch_creates_stream_data_from_queued_bytes()
     let mut send_stream = ReliableSendStream::new(stream_id, MuxLimits::default());
     send_stream.update_max_offset(1024);
     let mut sender = ServerResponseSenderService::new(SessionId(7), stream_id);
-    sender.enqueue_data_for_lane(Bytes::from_static(b"response"), FlowLane::Throughput);
+    sender.enqueue_data_for_lane(Bytes::from_static(b"response"), TrafficClass::Throughput);
 
     assert!(sender.queued_send_ready());
     let dispatch = sender
         .dispatch_next(
             &path_stream,
             &mut send_stream,
-            FlowLane::Throughput,
+            TrafficClass::Throughput,
             MuxLimits::default(),
         )
         .expect("dispatch response bytes");
@@ -828,7 +831,7 @@ async fn fixed_response_output_learns_product_rate_from_stream_ack_batches() {
     let path_stream = ReliablePathStream {
         stream_id,
         max_offset: mux_limits.max_stream_window_bytes,
-        lane: FlowLane::Throughput,
+        lane: TrafficClass::Throughput,
         underlay: UnderlayProtocol::Tcp,
         max_frame_payload_bytes: reliable_relay_buffer_len(mux_limits),
         output: ReliablePathStreamOutput::fixed(
@@ -839,15 +842,15 @@ async fn fixed_response_output_learns_product_rate_from_stream_ack_batches() {
         ),
         frames: frame_rx,
     };
-    let startup_snapshot = path_stream.send_path_snapshot(FlowLane::Throughput, 1);
+    let startup_snapshot = path_stream.send_path_snapshot(TrafficClass::Throughput, 1);
     let startup_quantum =
-        adaptive_reliable_relay_chunk_bytes(startup_snapshot, FlowLane::Throughput, mux_limits);
+        adaptive_reliable_relay_chunk_bytes(startup_snapshot, TrafficClass::Throughput, mux_limits);
     let mut send_stream = ReliableSendStream::new(stream_id, mux_limits);
     send_stream.update_max_offset(mux_limits.max_stream_window_bytes);
     let mut sender = ServerResponseSenderService::new(SessionId(52), stream_id);
     sender.enqueue_data_for_lane(
         Bytes::from(vec![0x5a; PATH_OPEN_SCORE_BYTES * 4]),
-        FlowLane::Throughput,
+        TrafficClass::Throughput,
     );
 
     let mut ack_end = 0_u64;
@@ -856,7 +859,7 @@ async fn fixed_response_output_learns_product_rate_from_stream_ack_batches() {
             .dispatch_next(
                 &path_stream,
                 &mut send_stream,
-                FlowLane::Throughput,
+                TrafficClass::Throughput,
                 mux_limits,
             )
             .expect("dispatch fixed response quantum");
@@ -869,7 +872,7 @@ async fn fixed_response_output_learns_product_rate_from_stream_ack_batches() {
     }]);
 
     let learned = path_stream
-        .send_path_snapshot(FlowLane::Throughput, startup_quantum)
+        .send_path_snapshot(TrafficClass::Throughput, startup_quantum)
         .expect("fixed output exposes learned path model");
     assert!(learned.product_progress_rate_bps.is_some());
     assert!(
@@ -877,7 +880,7 @@ async fn fixed_response_output_learns_product_rate_from_stream_ack_batches() {
         "one small ACK batch exposes a rate without graduating product authority"
     );
     assert!(
-        adaptive_reliable_relay_chunk_bytes(Some(learned), FlowLane::Throughput, mux_limits)
+        adaptive_reliable_relay_chunk_bytes(Some(learned), TrafficClass::Throughput, mux_limits)
             >= startup_quantum
     );
 }
@@ -885,7 +888,8 @@ async fn fixed_response_output_learns_product_rate_from_stream_ack_batches() {
 #[test]
 fn client_snapshot_graduates_product_progress_only_at_bulk_sample_floor() {
     let path: PathSpec = "udp://127.0.0.1:1".parse().expect("UDP path");
-    let sample_floor = (BBR_MAX_SEND_QUANTUM_BYTES as u64).max(PATH_OPEN_SCORE_BYTES as u64);
+    let sample_floor =
+        (MAX_RELIABLE_SERVICE_QUANTUM_BYTES as u64).max(PATH_OPEN_SCORE_BYTES as u64);
     let mut observation = ClientPathObservation {
         measured_rate_bps: Some(100_000_000.0),
         product_delivery_rate_bps: Some(100_000_000.0),
@@ -905,7 +909,7 @@ fn client_snapshot_graduates_product_progress_only_at_bulk_sample_floor() {
         carrier_delivery_samples: 1,
         carrier_delivery_sample_bytes: sample_floor - 1,
         carrier_ack_derived_data_seen: true,
-        quic_capacity_product_handoff_complete: true,
+        quic_capacity_product_admission_complete: true,
         quic_capacity_rate_prior_fresh: true,
         ..ClientPathObservation::default()
     };
@@ -945,14 +949,16 @@ fn data_plane_failure_invalidates_durable_product_and_native_window_authority() 
     let before_failure = health.observation_at(Instant::now());
     assert!(path_snapshot(&path, 0, before_failure).has_durable_product_progress);
 
-    health.mark_data_plane_failure(Instant::now(), false);
+    let path_instance_id = crate::model::path::next_carrier_path_instance_id();
+    health.install_peer_usage(path_instance_id, 0, crate::protocol::PathUsage::Available);
+    assert!(health.mark_data_plane_failure(path_instance_id, Instant::now(), false));
     let after_failure = health.observation_at(Instant::now());
     assert_eq!(after_failure.state, SchedulerPathState::Suspect);
     assert!(after_failure.product_delivery_rate_bps.is_none());
     assert_eq!(after_failure.product_delivery_sample_bytes, 0);
     assert!(after_failure.carrier_delivery_rate_bps.is_none());
     assert_eq!(after_failure.carrier_inflight_limit_bytes, 0);
-    assert!(!after_failure.quic_capacity_product_handoff_complete);
+    assert!(!after_failure.quic_capacity_product_admission_complete);
     assert!(!path_snapshot(&path, 0, after_failure).has_durable_product_progress);
 }
 
@@ -963,7 +969,7 @@ fn fixed_output_graduates_fragmented_product_acks_at_exact_sample_floor() {
     let output =
         ReliablePathStreamOutput::fixed(UnderlayProtocol::Udp, PathId(4), commands, mux_limits);
     let sample_bytes =
-        usize::try_from(reliable_subflow_startup_sample_limit_bytes(mux_limits)).unwrap();
+        usize::try_from(reliable_path_startup_sample_limit_bytes(mux_limits)).unwrap();
     let frame = Frame::StreamData {
         stream_id: StreamId(53),
         offset: 0,
@@ -972,7 +978,7 @@ fn fixed_output_graduates_fragmented_product_acks_at_exact_sample_floor() {
     let ReliablePathStreamOutput::Fixed(fixed) = &output else {
         panic!("expected fixed output");
     };
-    fixed.record_owner_flight(&frame);
+    fixed.record_original_flight(&frame);
     let ack_fragment_bytes = MIN_RATE_SAMPLE_BYTES / 2;
     let mut start = 0_u64;
     while start < sample_bytes as u64 {
@@ -984,7 +990,7 @@ fn fixed_output_graduates_fragmented_product_acks_at_exact_sample_floor() {
     }
 
     let snapshot = output
-        .send_path_snapshot(FlowLane::Throughput, 1)
+        .send_path_snapshot(TrafficClass::Throughput, 1)
         .expect("fixed output exposes learned path model");
     assert!(snapshot.product_progress_rate_bps.is_none());
     assert!(snapshot.has_durable_product_progress);
@@ -996,13 +1002,14 @@ fn fixed_response_output_inherits_path_startup_evidence() {
     let (commands, _receivers) = reliable_path_command_channels(64);
     let mut startup = PathSnapshot::new(PathId(9), UnderlayProtocol::Tcp, 20.0, 500_000_000.0);
     startup.pacing_rate_bps = 500_000_000.0;
-    startup.inflight_limit_bytes =
-        bbr_inflight_target_bytes(startup, FlowLane::Throughput, mux_limits).ceil() as u64;
+    startup.data_level_limit_bytes =
+        data_level_service_window_bytes(startup, TrafficClass::Throughput, mux_limits).ceil()
+            as u64;
     startup.confidence = 1.0;
     let output = ReliablePathStreamOutput::fixed_with_snapshot(startup, commands, mux_limits);
 
     let inherited = output
-        .send_path_snapshot(FlowLane::Throughput, 1)
+        .send_path_snapshot(TrafficClass::Throughput, 1)
         .expect("fixed output exposes startup path model");
     let default = PathSnapshot::new(
         PathId(9),
@@ -1016,9 +1023,9 @@ fn fixed_response_output_inherits_path_startup_evidence() {
     assert_eq!(inherited.delivery_rate_bps, startup.delivery_rate_bps);
     assert_eq!(inherited.srtt_ms, startup.srtt_ms);
     assert_eq!(
-        adaptive_reliable_relay_chunk_bytes(Some(inherited), FlowLane::Throughput, mux_limits),
-        adaptive_reliable_relay_chunk_bytes(Some(default), FlowLane::Throughput, mux_limits),
-        "TCP throughput startup uses the BBR feed quantum even before path-rate evidence is measured"
+        adaptive_reliable_relay_chunk_bytes(Some(inherited), TrafficClass::Throughput, mux_limits),
+        adaptive_reliable_relay_chunk_bytes(Some(default), TrafficClass::Throughput, mux_limits),
+        "TCP throughput startup uses the bounded MPP feed quantum before path-rate evidence is measured"
     );
 }
 
@@ -1028,8 +1035,9 @@ fn fixed_response_output_keeps_product_flight_out_of_carrier_flight() {
     let (commands, _receivers) = reliable_path_command_channels(64);
     let mut startup = PathSnapshot::new(PathId(9), UnderlayProtocol::Tcp, 20.0, 500_000_000.0);
     startup.pacing_rate_bps = 500_000_000.0;
-    startup.inflight_limit_bytes =
-        bbr_inflight_target_bytes(startup, FlowLane::Throughput, mux_limits).ceil() as u64;
+    startup.data_level_limit_bytes =
+        data_level_service_window_bytes(startup, TrafficClass::Throughput, mux_limits).ceil()
+            as u64;
     startup.confidence = 1.0;
     let output = ReliablePathStreamOutput::fixed_with_snapshot(startup, commands, mux_limits);
     let frame = Frame::StreamData {
@@ -1040,20 +1048,20 @@ fn fixed_response_output_keeps_product_flight_out_of_carrier_flight() {
     let ReliablePathStreamOutput::Fixed(fixed) = &output else {
         panic!("expected fixed output");
     };
-    fixed.record_owner_flight(&frame);
+    fixed.record_original_flight(&frame);
 
     let snapshot = output
-        .send_path_snapshot(FlowLane::Throughput, PATH_OPEN_SCORE_BYTES)
+        .send_path_snapshot(TrafficClass::Throughput, PATH_OPEN_SCORE_BYTES)
         .expect("fixed output exposes path model");
 
     assert_eq!(snapshot.bytes_in_flight, 0);
     assert_eq!(
-        snapshot.product_bytes_in_flight,
+        snapshot.data_level_bytes_in_flight,
         PATH_OPEN_SCORE_BYTES as u64
     );
     assert!(
-        adaptive_reliable_relay_chunk_bytes(Some(snapshot), FlowLane::Throughput, mux_limits)
-            > BBR_MIN_SEND_QUANTUM_PACKETS * TRANSPORT_MSS_BYTES,
+        adaptive_reliable_relay_chunk_bytes(Some(snapshot), TrafficClass::Throughput, mux_limits)
+            > MIN_RELIABLE_SERVICE_QUANTUM_PACKETS * TRANSPORT_MSS_BYTES,
         "product STREAM_ACK debt must not collapse TCP carrier send quantum to 2*MSS"
     );
 }
@@ -1067,7 +1075,7 @@ async fn server_response_sender_slices_large_reads_to_service_quantum() {
     let path_stream = ReliablePathStream {
         stream_id,
         max_offset: mux_limits.max_stream_window_bytes,
-        lane: FlowLane::Throughput,
+        lane: TrafficClass::Throughput,
         underlay: UnderlayProtocol::Udp,
         max_frame_payload_bytes: reliable_relay_buffer_len(mux_limits),
         output: ReliablePathStreamOutput::fixed(
@@ -1079,21 +1087,24 @@ async fn server_response_sender_slices_large_reads_to_service_quantum() {
         frames: frame_rx,
     };
     let quantum = adaptive_reliable_relay_chunk_bytes(
-        path_stream.send_path_snapshot(FlowLane::Throughput, 1),
-        FlowLane::Throughput,
+        path_stream.send_path_snapshot(TrafficClass::Throughput, 1),
+        TrafficClass::Throughput,
         mux_limits,
     );
     let mut send_stream = ReliableSendStream::new(stream_id, mux_limits);
     send_stream.update_max_offset(mux_limits.max_stream_window_bytes);
     let mut sender = ServerResponseSenderService::new(SessionId(17), stream_id);
     let queued_bytes = mux_limits.max_reliable_relay_chunk_bytes;
-    sender.enqueue_data_for_lane(Bytes::from(vec![0x5a; queued_bytes]), FlowLane::Throughput);
+    sender.enqueue_data_for_lane(
+        Bytes::from(vec![0x5a; queued_bytes]),
+        TrafficClass::Throughput,
+    );
 
     let dispatch = sender
         .dispatch_next(
             &path_stream,
             &mut send_stream,
-            FlowLane::Throughput,
+            TrafficClass::Throughput,
             mux_limits,
         )
         .expect("dispatch first service quantum");
@@ -1114,7 +1125,7 @@ async fn server_response_sender_slices_large_reads_to_service_quantum() {
 }
 
 #[tokio::test]
-async fn server_response_sender_keeps_enqueue_lane_for_remaining_data_after_promotion() {
+async fn server_response_sender_promotes_remaining_data_at_dispatch() {
     let stream_id = StreamId(142);
     let mux_limits = MuxLimits::default();
     let (commands, mut receivers) = reliable_path_command_channels(16);
@@ -1122,7 +1133,7 @@ async fn server_response_sender_keeps_enqueue_lane_for_remaining_data_after_prom
     let path_stream = ReliablePathStream {
         stream_id,
         max_offset: mux_limits.max_stream_window_bytes,
-        lane: FlowLane::Latency,
+        lane: TrafficClass::Latency,
         underlay: UnderlayProtocol::Tcp,
         max_frame_payload_bytes: reliable_relay_buffer_len(mux_limits),
         output: ReliablePathStreamOutput::fixed(
@@ -1137,20 +1148,21 @@ async fn server_response_sender_keeps_enqueue_lane_for_remaining_data_after_prom
     send_stream.update_max_offset(mux_limits.max_stream_window_bytes);
     let mut sender = ServerResponseSenderService::new(SessionId(142), stream_id);
     let latency_quantum = adaptive_reliable_relay_chunk_bytes(
-        path_stream.send_path_snapshot(FlowLane::Latency, 1),
-        FlowLane::Latency,
+        path_stream.send_path_snapshot(TrafficClass::Latency, 1),
+        TrafficClass::Latency,
         mux_limits,
     );
+    let promoted_remainder = latency_quantum * 2;
     sender.enqueue_data_for_lane(
         Bytes::from(vec![0x5a; latency_quantum * 3]),
-        FlowLane::Latency,
+        TrafficClass::Latency,
     );
 
     let first = sender
         .dispatch_next(
             &path_stream,
             &mut send_stream,
-            FlowLane::Latency,
+            TrafficClass::Latency,
             mux_limits,
         )
         .expect("dispatch first latency slice");
@@ -1168,11 +1180,11 @@ async fn server_response_sender_keeps_enqueue_lane_for_remaining_data_after_prom
         .dispatch_next(
             &path_stream,
             &mut send_stream,
-            FlowLane::Throughput,
+            TrafficClass::Throughput,
             mux_limits,
         )
-        .expect("remaining bytes keep enqueue-time latency lane");
-    assert_eq!(second.payload_bytes, latency_quantum);
+        .expect("remaining bytes adopt the promoted dispatch lane");
+    assert_eq!(second.payload_bytes, promoted_remainder);
     assert!(
         matches!(
             recv_emitted_tcp_path_command(&mut receivers).await,
@@ -1180,21 +1192,21 @@ async fn server_response_sender_keeps_enqueue_lane_for_remaining_data_after_prom
                 offset,
                 payload,
                 ..
-            })) if offset == latency_quantum as u64 && payload.len() == latency_quantum
+            })) if offset == latency_quantum as u64 && payload.len() == promoted_remainder
         ),
-        "already-queued latency data must keep its enqueue-time dispatch quantum without splitting OwnerData across carrier priority queues"
+        "staged response bytes must adopt live bulk pacing without splitting OriginalData across carrier priority queues"
     );
 }
 
 #[tokio::test]
-async fn server_response_sender_dispatches_control_before_repair_and_data() {
+async fn server_response_sender_dispatches_control_before_reinjection_and_data() {
     let stream_id = StreamId(47);
     let (commands, mut receivers) = reliable_path_command_channels(4);
     let (_frame_tx, frame_rx) = mpsc::channel(1);
     let path_stream = ReliablePathStream {
         stream_id,
         max_offset: 1024,
-        lane: FlowLane::Throughput,
+        lane: TrafficClass::Throughput,
         underlay: UnderlayProtocol::Tcp,
         max_frame_payload_bytes: reliable_relay_buffer_len(MuxLimits::default()),
         output: ReliablePathStreamOutput::fixed(
@@ -1208,14 +1220,14 @@ async fn server_response_sender_dispatches_control_before_repair_and_data() {
     let mut send_stream = ReliableSendStream::new(stream_id, MuxLimits::default());
     send_stream.update_max_offset(1024);
     let mut sender = ServerResponseSenderService::new(SessionId(47), stream_id);
-    sender.enqueue_data_for_lane(Bytes::from_static(b"ordinary"), FlowLane::Throughput);
+    sender.enqueue_data_for_lane(Bytes::from_static(b"ordinary"), TrafficClass::Throughput);
     assert!(
         sender
-            .enqueue_repair_frame_with_priority(
+            .enqueue_reinjection_frame_with_priority(
                 Frame::StreamData {
                     stream_id,
                     offset: 64,
-                    payload: Bytes::from_static(b"repair"),
+                    payload: Bytes::from_static(b"reinjection"),
                 },
                 MuxLimits::default(),
                 true,
@@ -1232,7 +1244,7 @@ async fn server_response_sender_dispatches_control_before_repair_and_data() {
         .dispatch_next(
             &path_stream,
             &mut send_stream,
-            FlowLane::Throughput,
+            TrafficClass::Throughput,
             MuxLimits::default(),
         )
         .expect("dispatch control");
@@ -1247,15 +1259,15 @@ async fn server_response_sender_dispatches_control_before_repair_and_data() {
         })) if id == stream_id
     ));
 
-    let repair_dispatch = sender
+    let reinjection_dispatch = sender
         .dispatch_next(
             &path_stream,
             &mut send_stream,
-            FlowLane::Throughput,
+            TrafficClass::Throughput,
             MuxLimits::default(),
         )
-        .expect("dispatch repair");
-    assert_eq!(repair_dispatch.lane, ReliableWorkClass::Repair);
+        .expect("dispatch reinjection");
+    assert_eq!(reinjection_dispatch.lane, ReliableWorkClass::Reinjection);
 }
 
 #[tokio::test]
@@ -1266,7 +1278,7 @@ async fn server_response_sender_dispatches_final_fin_after_queued_data() {
     let path_stream = ReliablePathStream {
         stream_id,
         max_offset: 1024,
-        lane: FlowLane::Throughput,
+        lane: TrafficClass::Throughput,
         underlay: UnderlayProtocol::Tcp,
         max_frame_payload_bytes: reliable_relay_buffer_len(MuxLimits::default()),
         output: ReliablePathStreamOutput::fixed(
@@ -1280,7 +1292,7 @@ async fn server_response_sender_dispatches_final_fin_after_queued_data() {
     let mut send_stream = ReliableSendStream::new(stream_id, MuxLimits::default());
     send_stream.update_max_offset(1024);
     let mut sender = ServerResponseSenderService::new(SessionId(49), stream_id);
-    sender.enqueue_data_for_lane(Bytes::from_static(b"ordinary"), FlowLane::Throughput);
+    sender.enqueue_data_for_lane(Bytes::from_static(b"ordinary"), TrafficClass::Throughput);
     sender.enqueue_final_control_frame(Frame::StreamFin {
         stream_id,
         final_offset: b"ordinary".len() as u64,
@@ -1290,7 +1302,7 @@ async fn server_response_sender_dispatches_final_fin_after_queued_data() {
         .dispatch_next(
             &path_stream,
             &mut send_stream,
-            FlowLane::Throughput,
+            TrafficClass::Throughput,
             MuxLimits::default(),
         )
         .expect("dispatch ordinary data first");
@@ -1300,7 +1312,7 @@ async fn server_response_sender_dispatches_final_fin_after_queued_data() {
         .dispatch_next(
             &path_stream,
             &mut send_stream,
-            FlowLane::Throughput,
+            TrafficClass::Throughput,
             MuxLimits::default(),
         )
         .expect("dispatch final FIN after data");
@@ -1334,14 +1346,14 @@ async fn server_response_control_queue_full_is_sender_backpressure() {
                 complete: false,
                 ranges: Vec::new(),
             },
-            FlowLane::Control,
+            TrafficClass::Control,
         )
         .expect("prefill priority queue");
     let (_frame_tx, frame_rx) = mpsc::channel(1);
     let path_stream = ReliablePathStream {
         stream_id,
         max_offset: 1024,
-        lane: FlowLane::Throughput,
+        lane: TrafficClass::Throughput,
         underlay: UnderlayProtocol::Tcp,
         max_frame_payload_bytes: reliable_relay_buffer_len(MuxLimits::default()),
         output: ReliablePathStreamOutput::fixed(
@@ -1365,7 +1377,7 @@ async fn server_response_control_queue_full_is_sender_backpressure() {
         .dispatch_next(
             &path_stream,
             &mut send_stream,
-            FlowLane::Throughput,
+            TrafficClass::Throughput,
             MuxLimits::default(),
         )
         .expect_err("full control queue should be sender-service backpressure");
@@ -1386,7 +1398,7 @@ async fn server_response_sender_keeps_data_queued_when_carrier_rejects() {
     let path_stream = ReliablePathStream {
         stream_id,
         max_offset: 1024,
-        lane: FlowLane::Throughput,
+        lane: TrafficClass::Throughput,
         underlay: UnderlayProtocol::Tcp,
         max_frame_payload_bytes: reliable_relay_buffer_len(MuxLimits::default()),
         output: ReliablePathStreamOutput::fixed(
@@ -1400,7 +1412,7 @@ async fn server_response_sender_keeps_data_queued_when_carrier_rejects() {
     let mut send_stream = ReliableSendStream::new(stream_id, MuxLimits::default());
     send_stream.update_max_offset(1024);
     let mut sender = ServerResponseSenderService::new(SessionId(9), stream_id);
-    sender.enqueue_data_for_lane(Bytes::from_static(b"response"), FlowLane::Throughput);
+    sender.enqueue_data_for_lane(Bytes::from_static(b"response"), TrafficClass::Throughput);
 
     assert_eq!(sender.bytes(), b"response".len());
     assert!(
@@ -1408,7 +1420,7 @@ async fn server_response_sender_keeps_data_queued_when_carrier_rejects() {
             .dispatch_next(
                 &path_stream,
                 &mut send_stream,
-                FlowLane::Throughput,
+                TrafficClass::Throughput,
                 MuxLimits::default()
             )
             .is_err()
@@ -1416,7 +1428,7 @@ async fn server_response_sender_keeps_data_queued_when_carrier_rejects() {
     assert_eq!(sender.bytes(), b"response".len());
     assert_eq!(sender.data_bytes(), b"response".len());
     assert_eq!(send_stream.next_offset(), 0);
-    assert_eq!(send_stream.repair_bytes(), 0);
+    assert_eq!(send_stream.reinjection_bytes(), 0);
 }
 
 #[tokio::test]
@@ -1429,7 +1441,7 @@ async fn server_response_sender_blocks_when_switchable_outputs_detach() {
         UnderlayProtocol::Udp,
         PathId(0),
         commands.clone(),
-        FlowLane::Throughput,
+        TrafficClass::Throughput,
     );
     binding.detach(
         CarrierPathKey {
@@ -1442,7 +1454,7 @@ async fn server_response_sender_blocks_when_switchable_outputs_detach() {
     let path_stream = ReliablePathStream {
         stream_id,
         max_offset: 1024,
-        lane: FlowLane::Throughput,
+        lane: TrafficClass::Throughput,
         underlay: UnderlayProtocol::Udp,
         max_frame_payload_bytes: reliable_relay_buffer_len(MuxLimits::default()),
         output: ReliablePathStreamOutput::Switchable(binding),
@@ -1451,13 +1463,13 @@ async fn server_response_sender_blocks_when_switchable_outputs_detach() {
     let mut send_stream = ReliableSendStream::new(stream_id, MuxLimits::default());
     send_stream.update_max_offset(1024);
     let mut sender = ServerResponseSenderService::new(session_id, stream_id);
-    sender.enqueue_data_for_lane(Bytes::from_static(b"response"), FlowLane::Throughput);
+    sender.enqueue_data_for_lane(Bytes::from_static(b"response"), TrafficClass::Throughput);
 
     let err = sender
         .dispatch_next(
             &path_stream,
             &mut send_stream,
-            FlowLane::Throughput,
+            TrafficClass::Throughput,
             MuxLimits::default(),
         )
         .expect_err("detached switchable output should block, not close product stream");
@@ -1466,7 +1478,7 @@ async fn server_response_sender_blocks_when_switchable_outputs_detach() {
     assert_eq!(sender.bytes(), b"response".len());
     assert_eq!(sender.data_bytes(), b"response".len());
     assert_eq!(send_stream.next_offset(), 0);
-    assert_eq!(send_stream.repair_bytes(), 0);
+    assert_eq!(send_stream.reinjection_bytes(), 0);
 }
 
 #[tokio::test]
@@ -1480,14 +1492,14 @@ async fn server_response_sender_queue_full_is_backpressure_not_path_failure() {
                 offset: 0,
                 payload: Bytes::from_static(b"already queued"),
             },
-            FlowLane::Throughput,
+            TrafficClass::Throughput,
         )
         .expect("prefill carrier data queue");
     let (_frame_tx, frame_rx) = mpsc::channel(1);
     let path_stream = ReliablePathStream {
         stream_id,
         max_offset: 1024,
-        lane: FlowLane::Throughput,
+        lane: TrafficClass::Throughput,
         underlay: UnderlayProtocol::Tcp,
         max_frame_payload_bytes: reliable_relay_buffer_len(MuxLimits::default()),
         output: ReliablePathStreamOutput::fixed(
@@ -1501,13 +1513,13 @@ async fn server_response_sender_queue_full_is_backpressure_not_path_failure() {
     let mut send_stream = ReliableSendStream::new(stream_id, MuxLimits::default());
     send_stream.update_max_offset(1024);
     let mut sender = ServerResponseSenderService::new(SessionId(11), stream_id);
-    sender.enqueue_data_for_lane(Bytes::from_static(b"later"), FlowLane::Throughput);
+    sender.enqueue_data_for_lane(Bytes::from_static(b"later"), TrafficClass::Throughput);
 
     let err = sender
         .dispatch_next(
             &path_stream,
             &mut send_stream,
-            FlowLane::Throughput,
+            TrafficClass::Throughput,
             MuxLimits::default(),
         )
         .expect_err("full carrier queue should be sender-service backpressure");
@@ -1544,7 +1556,7 @@ async fn response_binding_duplicate_live_path_rejects_fresh_output() {
         UnderlayProtocol::Udp,
         PathId(0),
         first_commands,
-        FlowLane::Throughput,
+        TrafficClass::Throughput,
     );
     let (second_commands, mut second_receivers) = reliable_path_command_channels(4);
     assert_eq!(
@@ -1552,8 +1564,7 @@ async fn response_binding_duplicate_live_path_rejects_fresh_output() {
             UnderlayProtocol::Udp,
             PathId(0),
             second_commands,
-            FlowLane::Throughput,
-            StreamOpenRole::Active,
+            TrafficClass::Throughput,
         ),
         ResponseStreamAttachOutcome::RejectedDuplicateLiveOutput
     );
@@ -1562,7 +1573,7 @@ async fn response_binding_duplicate_live_path_rejects_fresh_output() {
     let path_stream = ReliablePathStream {
         stream_id,
         max_offset: 1024,
-        lane: FlowLane::Throughput,
+        lane: TrafficClass::Throughput,
         underlay: UnderlayProtocol::Udp,
         max_frame_payload_bytes: reliable_relay_buffer_len(MuxLimits::default()),
         output: ReliablePathStreamOutput::Switchable(binding),
@@ -1571,13 +1582,16 @@ async fn response_binding_duplicate_live_path_rejects_fresh_output() {
     let mut send_stream = ReliableSendStream::new(stream_id, MuxLimits::default());
     send_stream.update_max_offset(1024);
     let mut sender = ServerResponseSenderService::new(session_id, stream_id);
-    sender.enqueue_data_for_lane(Bytes::from_static(b"same-path-live"), FlowLane::Throughput);
+    sender.enqueue_data_for_lane(
+        Bytes::from_static(b"same-path-live"),
+        TrafficClass::Throughput,
+    );
 
     sender
         .dispatch_next(
             &path_stream,
             &mut send_stream,
-            FlowLane::Throughput,
+            TrafficClass::Throughput,
             MuxLimits::default(),
         )
         .expect("rejecting a duplicate live output must keep the existing output usable");
@@ -1610,7 +1624,7 @@ async fn response_binding_duplicate_closed_path_replaces_output() {
         UnderlayProtocol::Udp,
         PathId(0),
         first_commands,
-        FlowLane::Throughput,
+        TrafficClass::Throughput,
     );
     drop(first_receivers);
 
@@ -1620,17 +1634,20 @@ async fn response_binding_duplicate_closed_path_replaces_output() {
             UnderlayProtocol::Udp,
             PathId(0),
             second_commands,
-            FlowLane::Throughput,
-            StreamOpenRole::Active,
+            TrafficClass::Throughput,
         ),
         ResponseStreamAttachOutcome::ReplacedClosedOutput
     );
+    assert!(matches!(
+        recv_emitted_tcp_path_command(&mut second_receivers).await,
+        Some(ReliablePathCommand::SendFrame(Frame::PathProofData { .. }))
+    ));
 
     let (_frame_tx, frame_rx) = mpsc::channel(1);
     let path_stream = ReliablePathStream {
         stream_id,
         max_offset: 1024,
-        lane: FlowLane::Throughput,
+        lane: TrafficClass::Throughput,
         underlay: UnderlayProtocol::Udp,
         max_frame_payload_bytes: reliable_relay_buffer_len(MuxLimits::default()),
         output: ReliablePathStreamOutput::Switchable(binding),
@@ -1641,14 +1658,14 @@ async fn response_binding_duplicate_closed_path_replaces_output() {
     let mut sender = ServerResponseSenderService::new(session_id, stream_id);
     sender.enqueue_data_for_lane(
         Bytes::from_static(b"same-path-closed"),
-        FlowLane::Throughput,
+        TrafficClass::Throughput,
     );
 
     sender
         .dispatch_next(
             &path_stream,
             &mut send_stream,
-            FlowLane::Throughput,
+            TrafficClass::Throughput,
             MuxLimits::default(),
         )
         .expect("closed same-path output should be replaced by the new carrier output");
@@ -1680,8 +1697,8 @@ fn server_test_bulk_path_metrics(path_id: PathId, delivery_rate_bps: u64) -> Pat
         ecn_observed: false,
         bytes_in_flight: 0,
         queue_bytes: 0,
-        inflight_limit_bytes: BBR_MAX_SEND_QUANTUM_BYTES as u64,
-        inflight_hi_bytes: BBR_MAX_SEND_QUANTUM_BYTES as u64,
+        inflight_limit_bytes: MAX_RELIABLE_SERVICE_QUANTUM_BYTES as u64,
+        inflight_hi_bytes: MAX_RELIABLE_SERVICE_QUANTUM_BYTES as u64,
         confidence_ppm: 1_000_000,
         app_limited: false,
         has_ack_derived_data_sample: true,
@@ -1707,13 +1724,11 @@ fn server_registry_replaced_output_does_not_reuse_cached_bulk_metrics() {
             session_id,
             stream_id,
             target: target.clone(),
-            lane: FlowLane::Throughput,
+            lane: TrafficClass::Throughput,
             attachment: ServerStreamPathAttachment {
                 path_registration: old_path_registration.clone(),
                 commands: old_commands,
                 max_frame_payload_bytes: reliable_relay_buffer_len(MuxLimits::default()),
-                role: StreamOpenRole::Active,
-                initial_metrics: None,
             },
             mux_limits: MuxLimits::default(),
         })
@@ -1733,7 +1748,7 @@ fn server_registry_replaced_output_does_not_reuse_cached_bulk_metrics() {
     );
     assert!(
         binding
-            .sender_path_targets(FlowLane::Throughput, BBR_MAX_SEND_QUANTUM_BYTES)
+            .sender_path_targets(TrafficClass::Throughput, MAX_RELIABLE_SERVICE_QUANTUM_BYTES)
             .first()
             .is_some_and(|entry| entry.observation.has_bulk_rate_evidence)
     );
@@ -1748,13 +1763,11 @@ fn server_registry_replaced_output_does_not_reuse_cached_bulk_metrics() {
                 session_id,
                 stream_id,
                 target: target.clone(),
-                lane: FlowLane::Throughput,
+                lane: TrafficClass::Throughput,
                 attachment: ServerStreamPathAttachment {
                     path_registration: new_path_registration.clone(),
                     commands: new_commands,
                     max_frame_payload_bytes: reliable_relay_buffer_len(MuxLimits::default()),
-                    role: StreamOpenRole::Active,
-                    initial_metrics: None,
                 },
                 mux_limits: MuxLimits::default(),
             },)
@@ -1766,7 +1779,8 @@ fn server_registry_replaced_output_does_not_reuse_cached_bulk_metrics() {
         server_test_bulk_path_metrics(path_id, 300_000_000),
     );
 
-    let targets = binding.sender_path_targets(FlowLane::Throughput, BBR_MAX_SEND_QUANTUM_BYTES);
+    let targets =
+        binding.sender_path_targets(TrafficClass::Throughput, MAX_RELIABLE_SERVICE_QUANTUM_BYTES);
     assert_eq!(targets.len(), 1);
     assert!(
         !targets[0].observation.has_bulk_rate_evidence,
@@ -1791,10 +1805,10 @@ fn carrier_metrics_retire_after_last_publication_lease() {
             ..server_test_bulk_path_metrics(path_id, 200_000_000)
         },
     );
-    assert_eq!(registry.management_snapshot().path_metrics.len(), 1);
+    assert_eq!(registry.management_snapshot().paths.len(), 1);
 
     drop(registration);
-    assert_eq!(registry.management_snapshot().path_metrics.len(), 1);
+    assert_eq!(registry.management_snapshot().paths.len(), 1);
 
     registry.record_local_path_metrics(
         server_carrier_identity(&sampler_registration),
@@ -1805,13 +1819,13 @@ fn carrier_metrics_retire_after_last_publication_lease() {
     );
     drop(sampler_registration);
     assert!(
-        registry.management_snapshot().path_metrics.is_empty(),
+        registry.management_snapshot().paths.is_empty(),
         "cached evidence must retire when the last task lease ends"
     );
 }
 
 #[tokio::test]
-async fn server_response_sender_blocked_admission_does_not_fallback_to_eta_target() {
+async fn server_response_sender_uses_bounded_cross_path_reordering_after_path_loss() {
     let stream_id = StreamId(45);
     let (tcp_commands, _tcp_receivers) = reliable_path_command_channels(4);
     let tcp_commands_for_detach = tcp_commands.clone();
@@ -1820,21 +1834,24 @@ async fn server_response_sender_blocked_admission_does_not_fallback_to_eta_targe
         UnderlayProtocol::Tcp,
         PathId(0),
         tcp_commands,
-        FlowLane::Throughput,
+        TrafficClass::Throughput,
     );
     let (udp_commands, mut udp_receivers) = reliable_path_command_channels(4);
     binding.attach(
         UnderlayProtocol::Udp,
         PathId(1),
         udp_commands,
-        FlowLane::Throughput,
-        StreamOpenRole::Active,
+        TrafficClass::Throughput,
     );
+    assert!(matches!(
+        recv_emitted_tcp_path_command(&mut udp_receivers).await,
+        Some(ReliablePathCommand::SendFrame(Frame::PathProofData { .. }))
+    ));
     let lower_owner_key = CarrierPathKey {
         underlay: UnderlayProtocol::Tcp,
         path_id: PathId(0),
     };
-    binding.record_owner_flight(
+    binding.record_original_flight(
         lower_owner_key,
         &Frame::StreamData {
             stream_id,
@@ -1842,7 +1859,7 @@ async fn server_response_sender_blocked_admission_does_not_fallback_to_eta_targe
             payload: Bytes::from_static(b"x"),
         },
     );
-    binding.record_owner_flight(
+    binding.record_original_flight(
         lower_owner_key,
         &Frame::StreamData {
             stream_id,
@@ -1857,7 +1874,7 @@ async fn server_response_sender_blocked_admission_does_not_fallback_to_eta_targe
     let path_stream = ReliablePathStream {
         stream_id,
         max_offset: 1024,
-        lane: FlowLane::Throughput,
+        lane: TrafficClass::Throughput,
         underlay: UnderlayProtocol::Udp,
         max_frame_payload_bytes: reliable_relay_buffer_len(MuxLimits::default()),
         output: ReliablePathStreamOutput::Switchable(binding),
@@ -1869,41 +1886,43 @@ async fn server_response_sender_blocked_admission_does_not_fallback_to_eta_targe
         .send_data(Bytes::from_static(b"xy"))
         .expect("advance response sender past the lower ACK-hole byte");
     let mut sender = ServerResponseSenderService::new(SessionId(10), stream_id);
-    sender.enqueue_data_for_lane(Bytes::from_static(b"later"), FlowLane::Throughput);
+    sender.enqueue_data_for_lane(Bytes::from_static(b"later"), TrafficClass::Throughput);
 
-    let err = sender
+    let dispatched = sender
         .dispatch_next(
             &path_stream,
             &mut send_stream,
-            FlowLane::Throughput,
+            TrafficClass::Throughput,
             MuxLimits::default(),
         )
-        .expect_err("cross-underlay ordering debt must block ordinary response data");
+        .expect("the live path may carry data within the receiver reorder budget");
 
-    assert!(matches!(err, RuntimeError::SenderServiceBlocked));
-    assert_eq!(sender.bytes(), b"later".len());
-    assert_eq!(sender.data_bytes(), b"later".len());
-    assert_eq!(send_stream.next_offset(), 2);
-    assert!(
-        tokio::time::timeout(
-            Duration::from_millis(20),
-            recv_emitted_tcp_path_command(&mut udp_receivers)
-        )
-        .await
-        .is_err(),
-        "blocked response admission must not send via raw ETA fallback target"
+    assert_eq!(
+        dispatched.selected_path.map(|key| key.underlay),
+        Some(UnderlayProtocol::Udp)
     );
+    assert_eq!(sender.bytes(), 0);
+    assert_eq!(sender.data_bytes(), 0);
+    assert_eq!(send_stream.next_offset(), 2 + b"later".len() as u64);
+    assert!(matches!(
+        recv_emitted_tcp_path_command(&mut udp_receivers).await,
+        Some(ReliablePathCommand::SendFrame(Frame::StreamData {
+            offset: 2,
+            payload,
+            ..
+        })) if payload == Bytes::from_static(b"later")
+    ));
 }
 
 #[tokio::test]
-async fn server_response_sender_dispatches_repair_before_data() {
+async fn server_response_sender_dispatches_reinjection_before_data() {
     let stream_id = StreamId(43);
     let (commands, mut receivers) = reliable_path_command_channels(4);
     let (_frame_tx, frame_rx) = mpsc::channel(1);
     let path_stream = ReliablePathStream {
         stream_id,
         max_offset: 1024,
-        lane: FlowLane::Throughput,
+        lane: TrafficClass::Throughput,
         underlay: UnderlayProtocol::Tcp,
         max_frame_payload_bytes: reliable_relay_buffer_len(MuxLimits::default()),
         output: ReliablePathStreamOutput::fixed(
@@ -1917,14 +1936,14 @@ async fn server_response_sender_dispatches_repair_before_data() {
     let mut send_stream = ReliableSendStream::new(stream_id, MuxLimits::default());
     send_stream.update_max_offset(1024);
     let mut sender = ServerResponseSenderService::new(SessionId(8), stream_id);
-    sender.enqueue_data_for_lane(Bytes::from_static(b"ordinary"), FlowLane::Throughput);
+    sender.enqueue_data_for_lane(Bytes::from_static(b"ordinary"), TrafficClass::Throughput);
     assert!(
         sender
-            .enqueue_repair_frame_with_priority(
+            .enqueue_reinjection_frame_with_priority(
                 Frame::StreamData {
                     stream_id,
                     offset: 64,
-                    payload: Bytes::from_static(b"repair"),
+                    payload: Bytes::from_static(b"reinjection"),
                 },
                 MuxLimits::default(),
                 true,
@@ -1932,15 +1951,15 @@ async fn server_response_sender_dispatches_repair_before_data() {
             .is_some()
     );
 
-    let repair_dispatch = sender
+    let reinjection_dispatch = sender
         .dispatch_next(
             &path_stream,
             &mut send_stream,
-            FlowLane::Throughput,
+            TrafficClass::Throughput,
             MuxLimits::default(),
         )
-        .expect("dispatch repair");
-    assert_eq!(repair_dispatch.lane, ReliableWorkClass::Repair);
+        .expect("dispatch reinjection");
+    assert_eq!(reinjection_dispatch.lane, ReliableWorkClass::Reinjection);
     assert_eq!(send_stream.next_offset(), 0);
     assert!(matches!(
         recv_emitted_tcp_path_command(&mut receivers).await,
@@ -1948,14 +1967,14 @@ async fn server_response_sender_dispatches_repair_before_data() {
             offset: 64,
             payload,
             ..
-        })) if payload == Bytes::from_static(b"repair")
+        })) if payload == Bytes::from_static(b"reinjection")
     ));
 
     let data_dispatch = sender
         .dispatch_next(
             &path_stream,
             &mut send_stream,
-            FlowLane::Throughput,
+            TrafficClass::Throughput,
             MuxLimits::default(),
         )
         .expect("dispatch ordinary data");
@@ -2040,7 +2059,7 @@ fn reliable_path_command_queue_tracks_inflight_budget_not_stream_limit() {
         tcp_path_heartbeat_timeout: crate::config::DEFAULT_TCP_PATH_HEARTBEAT_TIMEOUT,
     };
     let frame_payload =
-        reliable_relay_scheduler_quantum_cap(None, FlowLane::Throughput, mux_limits)
+        reliable_relay_scheduler_quantum_cap(None, TrafficClass::Throughput, mux_limits)
             .min(mux_limits.max_reliable_relay_chunk_bytes)
             .min(mux_limits.max_payload_bytes)
             .max(1);
@@ -2083,7 +2102,7 @@ fn reliable_path_command_queue_tracks_actual_payload_quantum() {
     let packet_payload_queue = reliable_path_command_queue_for_payload(mux_limits, 1200);
 
     let tcp_frame_payload =
-        reliable_relay_scheduler_quantum_cap(None, FlowLane::Throughput, mux_limits)
+        reliable_relay_scheduler_quantum_cap(None, TrafficClass::Throughput, mux_limits)
             .min(mux_limits.max_reliable_relay_chunk_bytes)
             .min(mux_limits.max_payload_bytes)
             .max(1);
@@ -2120,35 +2139,38 @@ fn reliable_flow_demand_promotes_lane_after_runtime_bdp_threshold() {
 
     assert!(
         threshold
-            >= reliable_relay_scheduler_quantum_cap(Some(path), FlowLane::Throughput, mux_limits)
-                as u64
+            >= reliable_relay_scheduler_quantum_cap(
+                Some(path),
+                TrafficClass::Throughput,
+                mux_limits
+            ) as u64
     );
     assert_eq!(high_bdp_threshold, high_bdp);
 
     let small_flow_bytes =
-        (relay_lane_startup_chunk_bytes(FlowLane::Throughput, mux_limits) as u64 / 2).max(1);
+        (relay_lane_startup_chunk_bytes(TrafficClass::Throughput, mux_limits) as u64 / 2).max(1);
     let before = state.refresh(
-        ReliableRelayFlowSignals::new(small_flow_bytes, 0, 0),
+        ReliableRelayFlowSignals::new(small_flow_bytes, 0),
         Some(path),
         mux_limits,
     );
-    assert_eq!(before.lane, FlowLane::Latency);
+    assert_eq!(before.lane, TrafficClass::Latency);
     assert!(!before.promoted_to_throughput);
 
     let after = state.refresh(
-        ReliableRelayFlowSignals::new(threshold, 0, 0),
+        ReliableRelayFlowSignals::new(threshold, 0),
         Some(path),
         mux_limits,
     );
-    assert_eq!(after.lane, FlowLane::Throughput);
+    assert_eq!(after.lane, TrafficClass::Throughput);
     assert!(after.promoted_to_throughput);
 
     let steady = state.refresh(
-        ReliableRelayFlowSignals::new(threshold.saturating_mul(2), 0, 0),
+        ReliableRelayFlowSignals::new(threshold.saturating_mul(2), 0),
         Some(path),
         mux_limits,
     );
-    assert_eq!(steady.lane, FlowLane::Throughput);
+    assert_eq!(steady.lane, TrafficClass::Throughput);
     assert!(!steady.promoted_to_throughput);
 }
 
@@ -2197,7 +2219,7 @@ fn noninterlocked_tcp_writer_run_is_one_feedback_preemption_quantum() {
     let byte_budget = reliable_noninterlocked_tcp_writer_run_budget_bytes(mux_limits);
     let item_budget = reliable_path_command_writer_run_budget_items(mux_limits);
 
-    assert_eq!(byte_budget, BBR_MAX_SEND_QUANTUM_BYTES);
+    assert_eq!(byte_budget, MAX_RELIABLE_SERVICE_QUANTUM_BYTES);
     assert!(!reliable_path_writer_should_coalesce_partial_bulk_run(
         1,
         byte_budget,
@@ -2208,7 +2230,7 @@ fn noninterlocked_tcp_writer_run_is_one_feedback_preemption_quantum() {
 
 #[test]
 fn path_writer_budget_counts_encoded_payload_and_variable_control_frames() {
-    let payload = Bytes::from(vec![0x5a; BBR_MAX_SEND_QUANTUM_BYTES]);
+    let payload = Bytes::from(vec![0x5a; MAX_RELIABLE_SERVICE_QUANTUM_BYTES]);
     let frames = [
         Frame::DatagramData {
             flow_id: DatagramFlowId(1),
@@ -2223,7 +2245,7 @@ fn path_writer_budget_counts_encoded_payload_and_variable_control_frames() {
         },
         Frame::PathCapacityData {
             path_id: PathId(1),
-            calibration_id: 1,
+            measurement_id: 1,
             payload,
         },
     ];
@@ -2231,7 +2253,7 @@ fn path_writer_budget_counts_encoded_payload_and_variable_control_frames() {
     for frame in frames {
         assert!(
             reliable_path_command_writer_run_bytes(&ReliablePathCommand::SendFrame(frame))
-                >= BBR_MAX_SEND_QUANTUM_BYTES + crate::protocol::codec::FRAME_HEADER_LEN,
+                >= MAX_RELIABLE_SERVICE_QUANTUM_BYTES + crate::protocol::codec::FRAME_HEADER_LEN,
         );
     }
     let ack = Frame::StreamAck {
@@ -2256,28 +2278,28 @@ fn capacity_frames_require_explicit_typed_carrier_commands() {
         (
             Frame::PathCapacityData {
                 path_id: PathId(3),
-                calibration_id: 9,
+                measurement_id: 9,
                 payload: Bytes::from_static(b"carrier-capacity"),
             },
-            FlowLane::Throughput,
+            TrafficClass::Throughput,
             b"carrier-capacity".len(),
         ),
         (
             Frame::PathCapacityFinish {
                 path_id: PathId(3),
-                calibration_id: 9,
+                measurement_id: 9,
                 payload_bytes: 16,
             },
-            FlowLane::Throughput,
+            TrafficClass::Throughput,
             0,
         ),
         (
             Frame::PathCapacityReceipt {
                 path_id: PathId(3),
-                calibration_id: 9,
+                measurement_id: 9,
                 received_payload_bytes: 16,
             },
-            FlowLane::Control,
+            TrafficClass::Control,
             0,
         ),
     ];
@@ -2285,7 +2307,7 @@ fn capacity_frames_require_explicit_typed_carrier_commands() {
     for (frame, expected_lane, expected_pacing_bytes) in frames {
         assert!(reliable_path_frame_requires_capacity_command(&frame));
         assert_eq!(
-            reliable_path_effective_frame_lane(&frame, FlowLane::Throughput),
+            reliable_path_effective_frame_lane(&frame, TrafficClass::Throughput),
             expected_lane
         );
         assert_eq!(
@@ -2294,7 +2316,7 @@ fn capacity_frames_require_explicit_typed_carrier_commands() {
         );
         assert_eq!(reliable_stream_frame_extent(&frame), None);
         assert!(matches!(
-            commands.try_enqueue_admitted_frame(frame, FlowLane::Throughput),
+            commands.try_enqueue_admitted_frame(frame, TrafficClass::Throughput),
             Err(RuntimeError::Protocol(_))
         ));
     }
@@ -2397,21 +2419,22 @@ fn reliable_recv_progress_batches_max_data_updates() {
     };
     let mut recv_stream = ReliableRecvStream::new(StreamId(22), mux_limits);
     let mut progress = ReliableRecvProgress::default();
-    let window = reliable_stream_advertised_window_bytes(None, FlowLane::Throughput, mux_limits);
+    let window =
+        reliable_stream_advertised_window_bytes(None, TrafficClass::Throughput, mux_limits);
     let step = reliable_stream_max_data_update_bytes(window, mux_limits);
 
     assert_eq!(step, 1024);
     assert!(progress.should_send_max_data(
         &recv_stream,
         None,
-        FlowLane::Throughput,
+        TrafficClass::Throughput,
         mux_limits,
         false
     ));
     assert!(!progress.should_send_max_data(
         &recv_stream,
         None,
-        FlowLane::Throughput,
+        TrafficClass::Throughput,
         mux_limits,
         false
     ));
@@ -2422,7 +2445,7 @@ fn reliable_recv_progress_batches_max_data_updates() {
     assert!(!progress.should_send_max_data(
         &recv_stream,
         None,
-        FlowLane::Throughput,
+        TrafficClass::Throughput,
         mux_limits,
         false
     ));
@@ -2433,21 +2456,21 @@ fn reliable_recv_progress_batches_max_data_updates() {
     assert!(progress.should_send_max_data(
         &recv_stream,
         None,
-        FlowLane::Throughput,
+        TrafficClass::Throughput,
         mux_limits,
         false
     ));
     assert!(progress.should_send_max_data(
         &recv_stream,
         None,
-        FlowLane::Throughput,
+        TrafficClass::Throughput,
         mux_limits,
         true
     ));
 }
 
 #[test]
-fn reliable_recv_progress_batches_bulk_acks_by_repair_release_cadence() {
+fn reliable_recv_progress_batches_bulk_acks_by_reinjection_release_cadence() {
     let mux_limits = MuxLimits {
         max_ack_ranges: 16,
         max_stream_window_bytes: 64 * 1024,
@@ -2459,25 +2482,41 @@ fn reliable_recv_progress_batches_bulk_acks_by_repair_release_cadence() {
     };
     let mut recv_stream = ReliableRecvStream::new(StreamId(23), mux_limits);
     let mut progress = ReliableRecvProgress::default();
-    let ack_step = reliable_stream_ack_update_bytes(None, FlowLane::Throughput, mux_limits);
+    let ack_step = reliable_stream_ack_update_bytes(None, TrafficClass::Throughput, mux_limits);
 
     assert_eq!(ack_step, mux_limits.max_repair_bytes as u64 / 4);
     recv_stream
         .receive_data(0, Bytes::from(vec![0x11; 1024]))
         .expect("first data");
-    assert!(progress.should_send_ack(&recv_stream, None, FlowLane::Throughput, mux_limits, false,));
+    assert!(progress.should_send_ack(
+        &recv_stream,
+        None,
+        TrafficClass::Throughput,
+        mux_limits,
+        false,
+    ));
 
     recv_stream
         .receive_data(1024, Bytes::from(vec![0x22; 1024]))
         .expect("below ack step");
-    assert!(
-        !progress.should_send_ack(&recv_stream, None, FlowLane::Throughput, mux_limits, false,)
-    );
+    assert!(!progress.should_send_ack(
+        &recv_stream,
+        None,
+        TrafficClass::Throughput,
+        mux_limits,
+        false,
+    ));
 
     recv_stream
         .receive_data(2048, Bytes::from(vec![0x33; ack_step as usize]))
         .expect("past ack step");
-    assert!(progress.should_send_ack(&recv_stream, None, FlowLane::Throughput, mux_limits, false,));
+    assert!(progress.should_send_ack(
+        &recv_stream,
+        None,
+        TrafficClass::Throughput,
+        mux_limits,
+        false,
+    ));
 }
 
 #[test]
@@ -2497,16 +2536,28 @@ fn reliable_recv_progress_acks_reorder_gap_without_waiting_for_bulk_step() {
     recv_stream
         .receive_data(0, Bytes::from(vec![0x11; 1024]))
         .expect("first data");
-    assert!(progress.should_send_ack(&recv_stream, None, FlowLane::Throughput, mux_limits, false,));
+    assert!(progress.should_send_ack(
+        &recv_stream,
+        None,
+        TrafficClass::Throughput,
+        mux_limits,
+        false,
+    ));
 
     recv_stream
         .receive_data(8192, Bytes::from(vec![0x22; 1024]))
         .expect("out-of-order data");
-    assert!(progress.should_send_ack(&recv_stream, None, FlowLane::Throughput, mux_limits, false,));
+    assert!(progress.should_send_ack(
+        &recv_stream,
+        None,
+        TrafficClass::Throughput,
+        mux_limits,
+        false,
+    ));
 }
 
 #[test]
-fn reliable_recv_progress_acks_repair_horizon_advancement() {
+fn reliable_recv_progress_acks_reinjection_horizon_advancement() {
     let mux_limits = MuxLimits {
         max_ack_ranges: 16,
         max_stream_window_bytes: 64 * 1024,
@@ -2525,17 +2576,29 @@ fn reliable_recv_progress_acks_repair_horizon_advancement() {
     recv_stream
         .receive_data(8192, Bytes::from(vec![0x22; 1024]))
         .expect("first tail");
-    assert!(progress.should_send_ack(&recv_stream, None, FlowLane::Throughput, mux_limits, false,));
+    assert!(progress.should_send_ack(
+        &recv_stream,
+        None,
+        TrafficClass::Throughput,
+        mux_limits,
+        false,
+    ));
 
     recv_stream
         .receive_data(9216, Bytes::from(vec![0x33; 1024]))
         .expect("small tail extension");
     assert!(
-        !progress.should_send_ack(&recv_stream, None, FlowLane::Throughput, mux_limits, false,),
+        !progress.should_send_ack(
+            &recv_stream,
+            None,
+            TrafficClass::Throughput,
+            mux_limits,
+            false,
+        ),
         "small same-range horizon movement should be batched"
     );
 
-    let ack_step = reliable_stream_ack_update_bytes(None, FlowLane::Throughput, mux_limits);
+    let ack_step = reliable_stream_ack_update_bytes(None, TrafficClass::Throughput, mux_limits);
     assert!(
         ack_step > 1024,
         "test expects a bulk ACK step larger than one small chunk"
@@ -2544,13 +2607,19 @@ fn reliable_recv_progress_acks_repair_horizon_advancement() {
         .receive_data(10240, Bytes::from(vec![0x44; ack_step as usize]))
         .expect("meaningful tail extension");
     assert!(
-        progress.should_send_ack(&recv_stream, None, FlowLane::Throughput, mux_limits, false,),
-        "meaningful repair horizon advancement must be ACKed even when range count is unchanged"
+        progress.should_send_ack(
+            &recv_stream,
+            None,
+            TrafficClass::Throughput,
+            mux_limits,
+            false,
+        ),
+        "meaningful reinjection horizon advancement must be ACKed even when range count is unchanged"
     );
 }
 
 #[test]
-fn reliable_relay_stall_watch_ignores_idle_streams_and_tracks_repairable_work() {
+fn reliable_relay_stall_watch_ignores_idle_streams_and_tracks_reinjectionable_work() {
     let mux_limits = MuxLimits::default();
     let mut send_stream = ReliableSendStream::new(StreamId(11), mux_limits);
     let mut recv_stream = ReliableRecvStream::new(StreamId(11), mux_limits);
@@ -2559,7 +2628,7 @@ fn reliable_relay_stall_watch_ignores_idle_streams_and_tracks_repairable_work() 
         &send_stream,
         &recv_stream,
         false,
-        FlowLane::Latency,
+        TrafficClass::Latency,
         false,
         mux_limits
     ));
@@ -2567,7 +2636,7 @@ fn reliable_relay_stall_watch_ignores_idle_streams_and_tracks_repairable_work() 
         &send_stream,
         &recv_stream,
         true,
-        FlowLane::Latency,
+        TrafficClass::Latency,
         false,
         mux_limits
     ));
@@ -2579,7 +2648,7 @@ fn reliable_relay_stall_watch_ignores_idle_streams_and_tracks_repairable_work() 
         &send_stream,
         &recv_stream,
         true,
-        FlowLane::Latency,
+        TrafficClass::Latency,
         false,
         mux_limits
     ));
@@ -2588,7 +2657,7 @@ fn reliable_relay_stall_watch_ignores_idle_streams_and_tracks_repairable_work() 
         &send_stream,
         &recv_stream,
         true,
-        FlowLane::Latency,
+        TrafficClass::Latency,
         false,
         mux_limits
     ));
@@ -2596,7 +2665,7 @@ fn reliable_relay_stall_watch_ignores_idle_streams_and_tracks_repairable_work() 
         &send_stream,
         &recv_stream,
         true,
-        FlowLane::Latency,
+        TrafficClass::Latency,
         true,
         mux_limits
     ));
@@ -2608,7 +2677,7 @@ fn reliable_relay_stall_watch_ignores_idle_streams_and_tracks_repairable_work() 
         &send_stream,
         &recv_stream,
         true,
-        FlowLane::Latency,
+        TrafficClass::Latency,
         false,
         mux_limits
     ));
@@ -2616,7 +2685,7 @@ fn reliable_relay_stall_watch_ignores_idle_streams_and_tracks_repairable_work() 
         &send_stream,
         &recv_stream,
         true,
-        FlowLane::Throughput,
+        TrafficClass::Throughput,
         false,
         mux_limits
     ));
@@ -2624,7 +2693,7 @@ fn reliable_relay_stall_watch_ignores_idle_streams_and_tracks_repairable_work() 
         &send_stream,
         &recv_stream,
         false,
-        FlowLane::Throughput,
+        TrafficClass::Throughput,
         true,
         mux_limits
     ));
@@ -2653,14 +2722,14 @@ fn reliable_relay_stall_watch_ignores_idle_streams_and_tracks_repairable_work() 
         &send_stream,
         &recv_stream,
         true,
-        FlowLane::Latency,
+        TrafficClass::Latency,
         false,
         mux_limits
     ));
 }
 
 #[test]
-fn stream_ack_gap_repair_waits_for_persistent_gap_on_reliable_carriers() {
+fn stream_ack_gap_reinjection_waits_for_persistent_gap_on_reliable_carriers() {
     let mux_limits = MuxLimits::default();
     let mut send_stream = ReliableSendStream::new(StreamId(31), mux_limits);
     send_stream
@@ -2678,29 +2747,29 @@ fn stream_ack_gap_repair_waits_for_persistent_gap_on_reliable_carriers() {
     ];
 
     assert!(
-        stream_ack_gap_repair_frames(&send_stream, &ranges, usize::MAX, true, false, false,)
+        stream_ack_gap_reinjection_frames(&send_stream, &ranges, usize::MAX, true, false, false,)
             .is_empty(),
         "a single reliable carrier must not replay product bytes over itself"
     );
     assert!(
-        stream_ack_gap_repair_frames(&send_stream, &ranges, usize::MAX, true, false, true,)
+        stream_ack_gap_reinjection_frames(&send_stream, &ranges, usize::MAX, true, false, true,)
             .is_empty(),
         "a single reliable carrier owns ordinary packet-loss recovery"
     );
     assert!(
-        stream_ack_gap_repair_frames(&send_stream, &ranges, usize::MAX, true, true, false,)
+        stream_ack_gap_reinjection_frames(&send_stream, &ranges, usize::MAX, true, true, false,)
             .is_empty(),
         "fresh multipath ACK gaps wait for persistent product-hole evidence"
     );
-    let persistent_gap_repairs =
-        stream_ack_gap_repair_frames(&send_stream, &ranges, usize::MAX, true, true, true);
+    let persistent_gap_reinjections =
+        stream_ack_gap_reinjection_frames(&send_stream, &ranges, usize::MAX, true, true, true);
     assert_eq!(
-        persistent_gap_repairs.len(),
+        persistent_gap_reinjections.len(),
         1,
-        "multipath repair may reinject authoritative product gaps over another path"
+        "multipath reinjection may reinject authoritative product gaps over another path"
     );
     assert!(matches!(
-        &persistent_gap_repairs[0],
+        &persistent_gap_reinjections[0],
         Frame::StreamData {
             offset: 4,
             payload,
@@ -2708,14 +2777,14 @@ fn stream_ack_gap_repair_waits_for_persistent_gap_on_reliable_carriers() {
         } if payload.as_ref() == b"bbbb"
     ));
     assert!(
-        stream_ack_gap_repair_frames(&send_stream, &ranges, usize::MAX, false, false, false,)
+        stream_ack_gap_reinjection_frames(&send_stream, &ranges, usize::MAX, false, false, false,)
             .is_empty(),
         "non-authoritative ACK snapshots must not infer missing holes"
     );
 }
 
 #[test]
-fn ack_gap_repair_prefers_authoritative_gap_before_frontier_tail() {
+fn ack_gap_reinjection_prefers_authoritative_gap_before_frontier_tail() {
     let mux_limits = MuxLimits::default();
     let mut send_stream = ReliableSendStream::new(StreamId(32), mux_limits);
     send_stream
@@ -2730,11 +2799,12 @@ fn ack_gap_repair_prefers_authoritative_gap_before_frontier_tail() {
 
     let ranges = [OffsetRange { start: 4, end: 12 }];
     let _ = send_stream.apply_ack(&ranges);
-    let repairs = stream_ack_gap_repair_frames(&send_stream, &ranges, usize::MAX, true, true, true);
+    let reinjections =
+        stream_ack_gap_reinjection_frames(&send_stream, &ranges, usize::MAX, true, true, true);
 
-    assert_eq!(repairs.len(), 1);
+    assert_eq!(reinjections.len(), 1);
     assert!(matches!(
-        &repairs[0],
+        &reinjections[0],
         Frame::StreamData {
             offset: 0,
             payload,
@@ -2744,7 +2814,7 @@ fn ack_gap_repair_prefers_authoritative_gap_before_frontier_tail() {
 }
 
 #[test]
-fn ack_gap_repair_ignores_contiguous_unacked_owner_tail() {
+fn ack_gap_reinjection_ignores_contiguous_unacked_original_tail() {
     let mux_limits = MuxLimits::default();
     let mut send_stream = ReliableSendStream::new(StreamId(33), mux_limits);
     send_stream
@@ -2759,11 +2829,12 @@ fn ack_gap_repair_ignores_contiguous_unacked_owner_tail() {
 
     let ranges = [OffsetRange { start: 0, end: 4 }];
     let _ = send_stream.apply_ack(&ranges);
-    let repairs = stream_ack_gap_repair_frames(&send_stream, &ranges, 6, true, true, true);
+    let reinjections =
+        stream_ack_gap_reinjection_frames(&send_stream, &ranges, 6, true, true, true);
 
     assert!(
-        repairs.is_empty(),
-        "contiguous unacked owner tail is retained carrier flight, not ACK-gap repair"
+        reinjections.is_empty(),
+        "contiguous unacked owner tail is retained carrier flight, not ACK-gap reinjection"
     );
 }
 
@@ -2781,7 +2852,7 @@ fn tcp_response_stall_anchor_uses_delivery_progress_not_control_progress() {
             last_delivery,
             &recv_stream,
             true,
-            FlowLane::Latency,
+            TrafficClass::Latency,
             false,
             mux_limits,
         ),
@@ -2800,42 +2871,42 @@ fn tcp_response_stall_anchor_uses_delivery_progress_not_control_progress() {
             last_delivery,
             &recv_stream,
             true,
-            FlowLane::Latency,
+            TrafficClass::Latency,
             false,
             mux_limits,
         ),
         last_delivery
     );
 
-    let repair_progress = control_progress + Duration::from_secs(1);
+    let reinjection_progress = control_progress + Duration::from_secs(1);
     assert_eq!(
         reliable_relay_stall_progress_anchor(
             control_progress,
             last_delivery,
-            repair_progress,
+            reinjection_progress,
             &recv_stream,
             true,
-            FlowLane::Latency,
+            TrafficClass::Latency,
             false,
             mux_limits,
         ),
-        repair_progress
+        reinjection_progress
     );
 }
 
 #[test]
-fn tcp_receive_hole_repair_tracks_buffered_ordering_gap() {
+fn tcp_receive_hole_reinjection_tracks_buffered_ordering_gap() {
     let mux_limits = MuxLimits::default();
     let mut recv_stream = ReliableRecvStream::new(StreamId(14), mux_limits);
 
-    assert!(!reliable_relay_receive_hole_repair_active(
+    assert!(!reliable_relay_receive_hole_reinjection_active(
         &recv_stream,
         true
     ));
     recv_stream
         .receive_data(0, Bytes::from_static(b"head"))
         .expect("initial response data");
-    assert!(!reliable_relay_receive_hole_repair_active(
+    assert!(!reliable_relay_receive_hole_reinjection_active(
         &recv_stream,
         true
     ));
@@ -2844,11 +2915,11 @@ fn tcp_receive_hole_repair_tracks_buffered_ordering_gap() {
         .receive_data(8, Bytes::from_static(b"tail"))
         .expect("out-of-order response data");
     assert!(out_of_order.delivered.is_empty());
-    assert!(reliable_relay_receive_hole_repair_active(
+    assert!(reliable_relay_receive_hole_reinjection_active(
         &recv_stream,
         true
     ));
-    assert!(!reliable_relay_receive_hole_repair_active(
+    assert!(!reliable_relay_receive_hole_reinjection_active(
         &recv_stream,
         false
     ));
@@ -2857,37 +2928,29 @@ fn tcp_receive_hole_repair_tracks_buffered_ordering_gap() {
         .receive_data(4, Bytes::from_static(b"gap!"))
         .expect("hole fill response data");
     assert_eq!(hole_fill.delivered.len(), 2);
-    assert!(!reliable_relay_receive_hole_repair_active(
+    assert!(!reliable_relay_receive_hole_reinjection_active(
         &recv_stream,
         true
     ));
 }
 
 #[test]
-fn tcp_receive_hole_repair_deadline_is_progress_signal_not_path_victim_policy() {
+fn tcp_receive_hole_reinjection_deadline_is_progress_signal_not_path_victim_policy() {
     let now = Instant::now();
     let mut path = PathSnapshot::new(PathId(1), UnderlayProtocol::Tcp, 50.0, 100_000_000.0);
     path.jitter_ms = 5.0;
-    path.inflight_limit_bytes = 1_000_000;
+    path.carrier_inflight_limit_bytes = 1_000_000;
 
-    let deadline =
-        reliable_relay_receive_hole_repair_deadline(now, now - Duration::from_secs(1), Some(path));
+    let deadline = reliable_relay_receive_hole_reinjection_deadline(
+        now,
+        now - Duration::from_secs(1),
+        Some(path),
+    );
 
     assert!(
         deadline > tokio::time::Instant::from_std(now),
-        "receive-hole handling schedules ACK/progress repair; path failure is owned by carrier/stall evidence"
+        "receive-hole handling schedules ACK/progress reinjection; path failure is owned by carrier/stall evidence"
     );
-}
-
-#[test]
-fn tcp_path_lane_classes_separate_latency_from_throughput_opens() {
-    assert!(tcp_path_lane_uses_latency_session(FlowLane::Latency));
-    assert!(tcp_path_lane_uses_latency_session(FlowLane::Control));
-    assert!(tcp_path_lane_uses_latency_session(
-        FlowLane::RealtimeDatagram
-    ));
-    assert!(!tcp_path_lane_uses_latency_session(FlowLane::Throughput));
-    assert!(!tcp_path_lane_uses_latency_session(FlowLane::Background));
 }
 
 #[test]
@@ -2947,13 +3010,11 @@ fn switchable_stream_demand_updates_from_local_sender_metrics() {
             session_id: SessionId(1),
             stream_id: StreamId(7),
             target: target.clone(),
-            lane: FlowLane::Latency,
+            lane: TrafficClass::Latency,
             attachment: ServerStreamPathAttachment {
                 path_registration: path_registration.clone(),
                 commands,
                 max_frame_payload_bytes: reliable_relay_buffer_len(MuxLimits::default()),
-                role: StreamOpenRole::Active,
-                initial_metrics: None,
             },
             mux_limits: MuxLimits::default(),
         })
@@ -2967,16 +3028,16 @@ fn switchable_stream_demand_updates_from_local_sender_metrics() {
         ServerReliableStreamOpen::Rejected => panic!("active stream open should not be rejected"),
     };
     let mut stream = accepted.take_stream();
-    assert_eq!(stream.current_lane(), FlowLane::Latency);
+    assert_eq!(stream.current_lane(), TrafficClass::Latency);
     let ReliablePathStreamOutput::Switchable(binding) = &stream.output else {
         panic!("expected switchable binding");
     };
     let binding = binding.clone();
 
-    stream.set_lane(FlowLane::Throughput);
+    stream.set_lane(TrafficClass::Throughput);
 
-    assert_eq!(stream.current_lane(), FlowLane::Throughput);
-    assert_eq!(binding.lane(), FlowLane::Throughput);
+    assert_eq!(stream.current_lane(), TrafficClass::Throughput);
+    assert_eq!(binding.lane(), TrafficClass::Throughput);
 }
 
 #[test]
@@ -2995,13 +3056,11 @@ fn server_registry_ignores_active_duplicate_same_path_input_without_output_repla
             session_id,
             stream_id,
             target: target.clone(),
-            lane: FlowLane::Throughput,
+            lane: TrafficClass::Throughput,
             attachment: ServerStreamPathAttachment {
                 path_registration: first_path_registration.clone(),
                 commands: first_commands,
                 max_frame_payload_bytes: reliable_relay_buffer_len(MuxLimits::default()),
-                role: StreamOpenRole::Active,
-                initial_metrics: None,
             },
             mux_limits: MuxLimits::default(),
         })
@@ -3019,13 +3078,11 @@ fn server_registry_ignores_active_duplicate_same_path_input_without_output_repla
             session_id,
             stream_id,
             target: target.clone(),
-            lane: FlowLane::Throughput,
+            lane: TrafficClass::Throughput,
             attachment: ServerStreamPathAttachment {
                 path_registration: duplicate_path_registration.clone(),
                 commands: duplicate_commands,
                 max_frame_payload_bytes: reliable_relay_buffer_len(MuxLimits::default()),
-                role: StreamOpenRole::Active,
-                initial_metrics: None,
             },
             mux_limits: MuxLimits::default(),
         })
@@ -3044,13 +3101,22 @@ fn server_response_output_inherits_open_path_startup_metrics() {
         ResourceLimits::default().max_streams,
     ));
     let target = TargetAddr::Ip(SocketAddr::from(([127, 0, 0, 1], 80)));
-    let path_registration =
-        registry.register_carrier_path(SessionId(1), UnderlayProtocol::Tcp, PathId(0));
-    let (commands, _rx) = reliable_path_command_channels(4);
     let path = "tcp://127.0.0.1:10000?srtt-ms=20&rate-mbps=500"
         .parse::<PathSpec>()
         .expect("path spec");
-    let initial_metrics = path_startup_metrics(&path, 0, PathMetricDirection::ServerToClient);
+    let initial_metrics =
+        path_startup_metrics(&path, PathId(0), PathMetricDirection::ServerToClient);
+    let path_registration = registry.register_carrier_path_with_local_properties(
+        SessionId(1),
+        UnderlayProtocol::Tcp,
+        PathId(0),
+        ServerLocalPathProperties {
+            config_ordinal: 0,
+            policy: path.metadata.policy,
+            initial_metrics: Some(initial_metrics),
+        },
+    );
+    let (commands, _rx) = reliable_path_command_channels(4);
     assert!(
         !initial_metrics.app_limited,
         "configured startup rate hints are advisory priors, not app-limited samples"
@@ -3060,13 +3126,11 @@ fn server_response_output_inherits_open_path_startup_metrics() {
             session_id: SessionId(1),
             stream_id: StreamId(8),
             target: target.clone(),
-            lane: FlowLane::Throughput,
+            lane: TrafficClass::Throughput,
             attachment: ServerStreamPathAttachment {
                 path_registration: path_registration.clone(),
                 commands,
                 max_frame_payload_bytes: reliable_relay_buffer_len(MuxLimits::default()),
-                role: StreamOpenRole::Active,
-                initial_metrics: Some(initial_metrics),
             },
             mux_limits: MuxLimits::default(),
         })
@@ -3081,7 +3145,7 @@ fn server_response_output_inherits_open_path_startup_metrics() {
     };
     let stream = accepted.stream();
     let snapshot = stream
-        .send_path_snapshot(FlowLane::Throughput, 1)
+        .send_path_snapshot(TrafficClass::Throughput, 1)
         .expect("switchable output exposes seeded path model");
 
     assert_eq!(snapshot.delivery_rate_bps, default_path_rate_bps());
@@ -3089,16 +3153,16 @@ fn server_response_output_inherits_open_path_startup_metrics() {
     assert!(
         adaptive_reliable_relay_chunk_bytes(
             Some(snapshot),
-            FlowLane::Throughput,
+            TrafficClass::Throughput,
             MuxLimits::default(),
-        ) > BBR_MIN_SEND_QUANTUM_PACKETS * TRANSPORT_MSS_BYTES,
-        "server response bytes keep the bulk feed quantum while startup metrics remain validation-only rate hints"
+        ) > MIN_RELIABLE_SERVICE_QUANTUM_PACKETS * TRANSPORT_MSS_BYTES,
+        "server response bytes keep the bulk feed quantum while startup metrics remain measurement-only rate hints"
     );
 
     let ReliablePathStreamOutput::Switchable(binding) = &stream.output else {
         panic!("expected switchable output");
     };
-    binding.record_owner_flight(
+    binding.record_original_flight(
         CarrierPathKey {
             underlay: UnderlayProtocol::Tcp,
             path_id: PathId(0),
@@ -3110,25 +3174,25 @@ fn server_response_output_inherits_open_path_startup_metrics() {
         },
     );
     let with_product_flight = stream
-        .send_path_snapshot(FlowLane::Throughput, PATH_OPEN_SCORE_BYTES)
+        .send_path_snapshot(TrafficClass::Throughput, PATH_OPEN_SCORE_BYTES)
         .expect("switchable output exposes path model");
     assert_eq!(with_product_flight.bytes_in_flight, 0);
     assert_eq!(
-        with_product_flight.product_bytes_in_flight,
+        with_product_flight.data_level_bytes_in_flight,
         PATH_OPEN_SCORE_BYTES as u64
     );
     assert!(
         adaptive_reliable_relay_chunk_bytes(
             Some(with_product_flight),
-            FlowLane::Throughput,
+            TrafficClass::Throughput,
             MuxLimits::default(),
-        ) > BBR_MIN_SEND_QUANTUM_PACKETS * TRANSPORT_MSS_BYTES,
-        "product flight is admission/repair state, not carrier queue pressure"
+        ) > MIN_RELIABLE_SERVICE_QUANTUM_PACKETS * TRANSPORT_MSS_BYTES,
+        "product flight is admission/reinjection state, not carrier queue pressure"
     );
 }
 
 #[test]
-fn server_reliable_registry_rejects_attach_only_unknown_stream() {
+fn server_reliable_registry_opens_an_unknown_stream_on_any_live_path() {
     let registry = Arc::new(ServerReliableStreamRegistry::new(
         ResourceLimits::default().max_streams,
     ));
@@ -3141,19 +3205,20 @@ fn server_reliable_registry_rejects_attach_only_unknown_stream() {
             session_id: SessionId(1),
             stream_id: StreamId(99),
             target: target.clone(),
-            lane: FlowLane::Throughput,
+            lane: TrafficClass::Throughput,
             attachment: ServerStreamPathAttachment {
                 path_registration: path_registration.clone(),
                 commands,
                 max_frame_payload_bytes: reliable_relay_buffer_len(MuxLimits::default()),
-                role: StreamOpenRole::Validation,
-                initial_metrics: None,
             },
             mux_limits: MuxLimits::default(),
         })
-        .expect("attach-only open should be handled");
-    assert!(matches!(opened, ServerReliableStreamOpen::Rejected));
-    assert_eq!(registry.management_snapshot().active_streams, 0);
+        .expect("neutral stream open should be handled");
+    let _accepted = match opened {
+        ServerReliableStreamOpen::New(accepted) => accepted,
+        _ => panic!("unknown neutral stream must open on its first live path"),
+    };
+    assert_eq!(registry.management_snapshot().active_streams, 1);
 }
 
 #[test]
@@ -3172,13 +3237,11 @@ fn server_reliable_registry_rejects_active_reopen_for_closed_stream() {
             session_id,
             stream_id,
             target: target.clone(),
-            lane: FlowLane::Throughput,
+            lane: TrafficClass::Throughput,
             attachment: ServerStreamPathAttachment {
                 path_registration: first_path_registration.clone(),
                 commands,
                 max_frame_payload_bytes: reliable_relay_buffer_len(MuxLimits::default()),
-                role: StreamOpenRole::Active,
-                initial_metrics: None,
             },
             mux_limits: MuxLimits::default(),
         })
@@ -3197,13 +3260,11 @@ fn server_reliable_registry_rejects_active_reopen_for_closed_stream() {
             session_id,
             stream_id,
             target: target.clone(),
-            lane: FlowLane::Throughput,
+            lane: TrafficClass::Throughput,
             attachment: ServerStreamPathAttachment {
                 path_registration: replacement_path_registration.clone(),
                 commands,
                 max_frame_payload_bytes: reliable_relay_buffer_len(MuxLimits::default()),
-                role: StreamOpenRole::Active,
-                initial_metrics: None,
             },
             mux_limits: MuxLimits::default(),
         })
@@ -3220,15 +3281,14 @@ async fn server_tcp_binding_keeps_tcp_and_udp_paths_with_same_id_separate() {
         UnderlayProtocol::Tcp,
         PathId(0),
         tcp_tx,
-        FlowLane::Latency,
+        TrafficClass::Latency,
     );
     let (udp_tx, mut udp_rx) = reliable_path_command_channels(4);
     binding.attach(
         UnderlayProtocol::Udp,
         PathId(0),
         udp_tx,
-        FlowLane::Throughput,
-        StreamOpenRole::Active,
+        TrafficClass::Throughput,
     );
 
     binding.close_stream(StreamId(7)).await;
@@ -3253,7 +3313,7 @@ async fn server_tcp_binding_keeps_tcp_and_udp_paths_with_same_id_separate() {
 mod datagram;
 #[path = "runtime/tests/integration_test.rs"]
 mod integration;
+#[path = "runtime/tests/peer_status_e2e_test.rs"]
+mod peer_status_e2e;
 #[path = "runtime/tests/security_test.rs"]
 mod security;
-#[path = "runtime/tests/tcp_path_test.rs"]
-mod tcp_path;

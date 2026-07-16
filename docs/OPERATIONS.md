@@ -1,354 +1,296 @@
 # Operations
 
-## Platform Check
+## Platform check
 
-Use the platform command before installing a service or enabling TUN mode:
+Run before installing a service or enabling TUN mode:
 
 ```bash
 mptunnel platform
 ```
 
-It prints the current OS/architecture, expected TUN backend and privileges, whether a device was actually probed, a host-lifecycle hint, and the release target matrix. Only the Linux `/dev/net/tun` report probes current device accessibility; other backends are opened later by their packet-device provider.
+It reports the OS/architecture, expected packet-device backend and privileges,
+host-lifecycle guidance, and release target matrix. Only Linux
+`/dev/net/tun` accessibility is probed immediately; other packet-device
+providers open their device when the runtime starts.
 
-## Maintainability Gate
-
-Run the warning-only line-count check before expanding large modules:
-
-```bash
-scripts/check-line-counts.sh
-```
-
-The threshold is 2,000 lines for tracked source and public documentation files. Files above the threshold should be split by cohesive ownership, with narrow module visibility, instead of accumulating unrelated runtime, test, or documentation concerns in one place.
+`scripts/check-line-counts.sh` is a warning-only developer maintainability
+check, not an operator health check.
 
 ## Privileges
 
-SOCKS5 and HTTP CONNECT ingress can run as an ordinary user when binding unprivileged local ports. Desktop TUN mode needs elevated network privileges because it creates/configures a virtual network device. Android instead requires user-approved `VpnService` consent and an embedding application to establish the device.
+SOCKS5 and HTTP CONNECT ingress need no elevated privilege when bound to normal
+user ports. TUN mode needs host-approved network privileges.
 
-Linux:
+- **Linux**: TUN and route setup need `CAP_NET_ADMIN` or equivalent service
+  capability. Ports below 1024 need `CAP_NET_BIND_SERVICE`.
+- **macOS**: packet-device and route/DNS configuration require an approved
+  privileged service or launchd arrangement.
+- **Windows**: package `wintun.dll` beside `mptunnel.exe`; device and route
+  changes require an elevated process or service wrapper.
+- **Android**: the embedding application obtains user `VpnService` consent,
+  establishes the descriptor, and owns addresses, routes, MTU, revocation, JNI,
+  and service lifecycle.
 
-- TUN backend: `/dev/net/tun` through `tun-rs`.
-- TUN privilege: run with `CAP_NET_ADMIN` or an equivalent service capability.
-- Binding ports below 1024 needs `CAP_NET_BIND_SERVICE`.
+Android hosts must provide both `runtime::PacketDeviceProvider` and
+`transport::CarrierNetworkProvider` to `runtime::run_with_host_providers`.
+Resolve each endpoint on the selected native network and protect or bind every
+TCP and QUIC socket before connect. The packet-device-only entry point uses the
+system carrier network and is not valid for a catch-all Android VPN.
 
-macOS:
-
-- TUN backend: utun through `tun-rs`.
-- TUN and route/DNS configuration require administrator-approved service or launchd setup.
-
-Windows:
-
-- TUN backend: Wintun through `tun-rs`.
-- TUN mode requires Administrator rights and the Wintun driver.
-
-Android embedding:
-
-- `VpnService.Builder.establish()` creates the TUN; the standalone mptunnel binary does not create an Android device.
-- The host implements `runtime::PacketDeviceProvider`, consumes the service's owned descriptor with `runtime::PacketDevice::from_owned_fd`, and also implements `transport::CarrierNetworkProvider`. Its resolver must use the selected Android `Network`, and each TCP/QUIC carrier socket must be protected or bound to that same network before connection. Pass both providers to `runtime::run_with_host_providers`; the packet-device-only entry point uses the system carrier network and is not valid for a catch-all Android VPN.
-- One descriptor is supplied for each configured TUN ingress. The provider transfers descriptor ownership to the runtime, which closes it when the packet device is dropped.
-- VPN permission, addresses, routes, MTU, descriptor revocation, JNI bindings, and application/service lifecycle remain host-owned. The host configuration must agree with the `TunL4Config` used by mptunnel's user-space stack.
-- The Android platform report describes this embedding requirement; it cannot inspect a future or application-owned descriptor.
-
-## Service Mode
-
-Service managers should run `mptunnel` with:
+## Service mode
 
 ```bash
---service-mode --supervise
+mptunnel --service-mode --supervise ...
 ```
 
-`--service-mode` makes process-service intent explicit; it does not register a systemd unit, launchd job, Windows SCM service, or Android component. `--supervise` restarts the runtime after top-level listener/device failures using exponential backoff.
+`--service-mode` declares process intent. It does not install or register a
+systemd unit, launchd job, Windows SCM service, or Android component.
+`--supervise` restarts failed runtime generations with bounded exponential
+backoff.
 
-Supervisor knobs:
+Use the host service manager as the outer process guard. A Windows SCM wrapper
+or native adapter remains required; Android lifecycle callbacks remain owned by
+the embedding application.
 
-- `--restart-backoff-ms` / `MPTUNNEL_RESTART_BACKOFF_MS`
-- `--restart-max-backoff-ms` / `MPTUNNEL_RESTART_MAX_BACKOFF_MS`
-- `--max-restarts` / `MPTUNNEL_MAX_RESTARTS`
+## Config and validation
 
-Use service-manager restart policies as the outer process guard and `--supervise` as the in-process guard for recoverable listener/device failures.
-
-On Windows, run the executable through an SCM-capable wrapper or add a native service adapter; `--service-mode` alone is not an SCM dispatcher or control handler.
-
-On Android, the embedding application and `VpnService` own the outer lifecycle. The in-process supervisor does not replace Android service callbacks, descriptor revocation, or JNI shutdown coordination.
-
-## Dual-Stack Networking
-
-Configure IPv4 and IPv6 listeners explicitly instead of depending on operating-system dual-stack socket defaults:
+The default path is `./config.toml`:
 
 ```bash
-mptunnel client \
-  --listen 127.0.0.1:1080 \
-  --listen '[::1]:1080'
+mptunnel --config ./config.toml --check-config
+mptunnel --config ./config.toml
 ```
 
-`MPTUNNEL_LISTEN` accepts comma-separated socket addresses:
+The graph contains tagged `[[inbounds]]`, `[[outbounds]]`, and optional
+balancers. An inbound selects one outbound or balancer. MPP security and path
+endpoints belong to each MPP inbound/outbound rather than to a global path role.
+
+Use repeated explicit IPv4 and IPv6 listener/bind/resolver values. Do not rely
+on OS-specific dual-stack defaults. Egress DNS strategy and connect timeout
+belong to the outbound that performs resolution and connection.
+
+Use `mptunnel --help` and subcommand help as the complete option and environment
+variable reference. Validate configs in the target binary whenever possible;
+cross-target parsing can also be smoke-tested under Wine.
+
+## Path policy and status
+
+Path URI query values have two different owners. `backup`, `expensive`,
+`bulk-allowed`/`no-bulk`, `probe-only`, and `no-udp` are configured operator
+restrictions for that path runtime; they remain in force until configuration or
+management policy changes them. Rate, RTT, and jitter are startup measurement
+priors that live evidence may replace. Neither category is a persistent
+stream-placement role.
+
+A configured path ordinal is endpoint-local composition identity. The server
+preserves the accepting ordinal with its bound socket or QUIC endpoint; a
+peer-supplied `path_id` is opaque and never indexes local configuration. Client
+and server path lists therefore do not need matching order.
+
+During authenticated setup the peer advertises sequence-zero directional
+`PathUsage::{Available, Backup}`. This is separate from local path health.
+Ordinary scheduling considers available paths first and uses backup paths only
+when no eligible available choice exists. Metrics rank paths within the chosen
+set. The receiver accepts only strictly newer later sequences, but this release has no runtime
+control that originates a post-handshake preference change.
+
+Management path controls change endpoint-local policy or lifecycle. They do not
+rewrite peer usage, forge transport evidence, or assign a fixed data path to a
+stream.
+
+## Management API
+
+Enable HTTP with `[management].listen` or `--management-listen`. Every listener
+requires `[management].token` or `--management-token` and must use a loopback
+address. For remote access, terminate TLS in a same-host reverse proxy or use an
+SSH tunnel; the built-in HTTP server never binds directly to a non-loopback
+address. Enable the embedded page explicitly with `dashboard = true` or
+`--management-dashboard`; a browser then opens `/`.
+
+All data and controls are under `/api/`:
+
+- `GET /api/` returns the authenticated endpoint index and schema identifier.
+- `GET /api/health` is the only public API route.
+- `GET /api/status` returns the complete cached snapshot.
+- `GET /api/paths` returns configured listeners, logical client paths, and live
+  server carrier instances with their actual lifecycle state.
+- `GET /api/traffic` returns monotonic product totals, one-second rates, and
+  five minutes of one-second trend samples.
+- `GET /api/sessions` returns authenticated MPP session ownership; `GET
+  /api/flows` returns the bounded active reliable/datagram product-flow detail.
+- `GET /api/diagnostics` returns local diagnostic capability and typed peer
+  service/index/session selectors.
+- `POST /api/control/path` changes endpoint-local client path lifecycle policy.
+- `POST /api/diagnostics/peer` manually requests a sanitized peer snapshot.
+
+Static page assets and `GET /api/health` are public so the browser and local
+health checks can load before authentication. Every runtime-data and control
+request requires `Authorization: Bearer <token>`. The default page retains it
+only in memory and browser session storage, not a URL or persistent local
+storage. The API has no CORS support and sends restrictive browser security
+headers.
+
+Tokens must contain 16-256 visible ASCII characters. The server rejects
+duplicate authorization/content-type headers, transfer encoding, ambiguous
+content lengths, pipelining, and non-origin request targets.
+
+Forwarded totals are monotonic logical product counters. `to_peer` counts bytes
+or datagrams accepted from the local product source; `from_peer` counts bytes or
+datagrams delivered to the local product destination. They do not grow from carrier retransmission, MPP
+reinjection, or multipath copies. Path delivery rate, queue, and flight remain
+separate current carrier evidence. Numeric identifiers and monotonic byte
+totals are decimal strings so browser clients do not lose 64-bit precision.
+Per-flow detail is capped independently from forwarding capacity; aggregate
+counters remain exact. Diagnostics report both current and cumulative detail
+overflow, and per-session flow counts carry an explicit completeness flag.
+
+Set `allow_peer_diagnostics = true` or
+`--management-allow-peer-diagnostics` only on an endpoint that should answer an
+authenticated peer. The permission is independent of local HTTP and disabled
+by default. Either endpoint may initiate from its own management API; the
+remote endpoint's flag decides whether it returns data. Responses contain only
+per-session path state, usage, and metrics. They exclude endpoints, route
+targets, local tags, credentials, and every other authenticated session. One
+request per session may be in flight, requests time out, and responders admit
+at most one snapshot request per session per second. A rate-limited or
+codec-oversized complete snapshot returns `unavailable`; it is never truncated.
+The dashboard does not poll the peer automatically.
+
+Path control uses `enabled`, `suspect`, `failed`, or `disabled`. Enabling clears
+the operator disable but leaves a path suspect until fresh carrier liveness
+evidence restores it; management never manufactures an active observation.
+
+## Resource envelopes
+
+Leave `[resources]` unset first. These values are safety envelopes, not manual
+transmission modes and not desired memory occupancy.
+
+| Field | Default | Purpose |
+| --- | ---: | --- |
+| `max_frame_bytes` | 1 MiB | hard MPP-frame cap |
+| `max_payload_bytes` | frame minus header room | MPP payload cap |
+| `max_ack_ranges` | 256 | sparse Data ACK range cap |
+| `max_paths` | 64 | registered path cap, not an aggregation target |
+| `max_streams` | 65,536 | logical MPP stream cap |
+| `max_quic_concurrent_bidi_streams` | 65,536 | QUIC stream concurrency envelope |
+| `max_stream_window_bytes` | 64 MiB | per-direction MPP receive window shared across attachments |
+| `max_repair_bytes` | 64 MiB | public compatibility name for retained MPP data available to reinject |
+| `max_reorder_bytes` | 64 MiB | receive-hole and ordering-debt envelope |
+| `max_datagram_queue_bytes` | 16 MiB | MPP datagram burst envelope |
+| `max_path_flight_bytes` | 64 MiB | per-path MPP-flight ceiling |
+| `max_reliable_relay_chunk_bytes` | 512 KiB | local read-buffer ceiling |
+| TCP heartbeat | 10 s / 30 s | idle TCP carrier liveness |
+| outbound connect timeout | 10 s | target/upstream dial bound |
+
+Raise a bound only after diagnostics identify it as the limiting resource.
+Increasing a window cannot authorize a path, prove delivery rate, or force
+aggregation. Data sequence offsets, retained ranges, per-copy flight, transport queues,
+and receive reordering have separate accounting owners.
+
+Native TCP/QUIC congestion windows and flow-control windows are additional
+independent limits. Each MPP direction has independent DSN, Data ACK, and
+`STREAM_MAX_DATA` state. `STREAM_ACK` releases MPP ranges and flight but
+grants no offset; `STREAM_MAX_DATA` grants offsets but acknowledges no byte. A
+native transport ACK does neither at the MPP data level.
+
+## Traffic and failover expectations
+
+MPP may reinject an exact missing data-level range after causal stall/failure
+evidence. Native TCP and QUIC recovery continue independently. Extra traffic
+must therefore be interpreted as:
 
 ```text
-MPTUNNEL_LISTEN=127.0.0.1:1080,[::1]:1080
+wire payload = unique MPP data + native transport retransmission
+             + MPP range reinjection + bounded control/measurement traffic
 ```
 
-When SOCKS5 and HTTP CONNECT ingress run in the same client process, use the HTTP-specific listener flag and keep `--listen`/`--socks5-listen` for SOCKS5:
+An operator should investigate sustained duplicate overhead, long zero-progress
+gaps, or a healthy available path remaining unused under bulk backlog. Do not
+work around these with a fixed path role or a Linux-only eligibility rule.
 
-```bash
-mptunnel client \
-  --socks5-listen 127.0.0.1:1080 \
-  --http-listen 127.0.0.1:8080
-```
+Ordinary reinjection is limited by a cumulative allowance derived from a
+bounded startup floor and unique MPP bytes acknowledged by Data ACK.
+Critical path-failure, persistent authoritative Data ACK gap, and bounded
+live-tail recovery may exceed the remaining allowance by one cause-specific
+event quantum so that budget exhaustion cannot deadlock recovery. Exact
+retained ranges, queue and flight limits, overlap/repeat suppression, and
+alternate-output requirements still apply. Exception bytes remain charged,
+reducing later optional authority. A continuous over-budget stream is therefore
+a defect, not expected failover overhead.
 
-The matching environment variables are `MPTUNNEL_SOCKS5_LISTEN` and `MPTUNNEL_HTTP_LISTEN`.
+The current timers are cause-specific. Exact path-instance failure permits an
+immediate bounded copy, preferring measured survivors but using any eligible
+live survivor when necessary. An authoritative lowest missing Data Sequence
+frontier must persist for three path-local PTO intervals; growth of the ACK
+horizon above it does not restart the timer. A contiguous live tail may send
+one bounded probe after one PTO and waits three PTO before another probe without
+progress. These are MPP recovery policies, not native TCP or QUIC
+retransmission timers.
 
-Local proxy authentication is off by default. To require browser/tool authentication, set both `--proxy-username` and `--proxy-password`; service deployments can use `MPTUNNEL_PROXY_USERNAME` and `MPTUNNEL_PROXY_PASSWORD`. SOCKS5 uses username/password negotiation, and HTTP CONNECT uses Basic proxy authentication.
+MPP datagram feedback confirms target-worker admission, not end-to-end target
+delivery. An alternative-path attempt receives a new flow-local datagram ID;
+operators must therefore allow for duplicate delivery if a delayed first
+attempt and its retry both reach the target.
 
-Server path bindings use the same explicit model through repeated or comma-separated `--bind-path` values, for example `tcp://0.0.0.0:443`, `tcp://[::]:443`, `udp://0.0.0.0:443`, and `udp://[::]:443`.
+Idle TCP heartbeats and authenticated path probes detect reachability. Active
+failover additionally uses exact MPP progress, path-instance lifetime, PTO,
+and queue/flight evidence. A reconnect creates a new physical path instance;
+old flights and evidence cannot be inherited from its numeric path ID. A
+stream attachment incarnation is separate, so detach and reattach
+also cannot inherit ownership merely because the carrier stayed live.
 
-UDP targets are not limited to UDP underlay. mptunnel prefers UDP-target relay over QUIC UDP paths when schedulable UDP paths exist, but it can carry UDP-target datagram flow frames over encrypted TCP underlay as best-effort relay. Use UDP underlay for the lowest latency and fastest packet-level recovery; keep TCP underlay available when reachability is more important than datagram-native behavior.
+The concrete fences differ by direction. Request scheduling uses the physical
+path instance plus `attachment_id`. Response new-data dispatch uses the physical
+path instance plus output incarnation and the response-model generation observed
+during planning; apply revalidates them while reserving queue credit and
+recording the logical path key and stream-unique output incarnation in the exact
+original flight.
 
-## Config File And Management API
+On the response sender, the output carrying the contiguous Data Sequence
+frontier remains governed by the shared MPP receive window and native carrier
+credit. An additional output without durable, unambiguous Data ACK coverage of
+original transmissions is restricted to one bounded startup flight. Reaching
+the startup sample floor unlocks mature additional-path placement. Native TCP
+or QUIC ACK evidence alone does not unlock it, and Data ACK of duplicated bytes
+is not attributed to either copy.
 
-Running `mptunnel` with no arguments reads `./config.toml`. Use `--config PATH` or `-c PATH` to select a different TOML file, and use `--config PATH --check-config` to validate it without opening listeners. The file is role-free and V2Ray-style: `[[inbounds]]` accept SOCKS5, HTTP, TUN, or MPP traffic; `[[outbounds]]` forward to MPP, direct, source-IP bound direct, SOCKS5, HTTP CONNECT, or HTTP CONNECT UDP. Each entry can have a tag. An inbound selects either one outbound with `outbound = "tag"` or one routing balancer with `balancer = "tag"`.
+## Optional Linux telemetry
 
-MPP endpoints and security belong to `protocol = "mpp"` outbounds. Routing balancers reference outbound tags: `combined-mpp` combines MPP outbounds, while `sequence` and `random` select among egress outbounds. DNS resolver policy belongs to the egress outbound that resolves target names, usually as an inline `dns = { ... }` table on that outbound.
+Linux carriers may sample `TCP_INFO` from the exact authenticated socket. The
+adapter reports only fields actually returned by the kernel; missing fields are
+unknown rather than zero. Passive native observations are scheduling evidence,
+not MPP Data ACKs.
 
-## Resource Envelope Guide
+TCP capacity transactions use receiver-confirmed receipts and may combine them
+with exact-socket telemetry. QUIC capacity transactions use fresh native
+packet-ACK-derived evidence with their own expiry. These proof states are not
+interchangeable. MPP Data ACK remains the carrier-neutral delivery authority;
+for response bulk admission, QUIC requires locally sourced ACK-derived carrier
+evidence, while durable unambiguous Data ACK progress may additionally establish
+a per-flow TCP MPP rate.
 
-Leave `[resources]` unset for normal operation. These fields are byte/time
-envelopes for Auto, not manual transmission modes. The sender still adapts from
-live RTT, delivery rate, queue depth, loss, ACK ranges, repair state, and
-carrier credit. Raising an envelope permits more high-BDP or high-concurrency
-work; it does not force mptunnel to fill that memory.
-
-Recommended production ranges:
-
-| Field | Default | Practical range | How it works |
-| --- | ---: | ---: | --- |
-| `max_frame_bytes` | 1 MiB | 1-4 MiB | Hard product-frame safety cap. Keep small unless profiling shows framing overhead. |
-| `max_payload_bytes` | frame minus header room | leave unset | Product payload cap. When omitted in `config.toml`, it derives from `max_frame_bytes`. |
-| `max_ack_ranges` | 256 | 128-1024 | Sparse stream ACK cap. Raise only if diagnostics show ACK range truncation under loss/reorder. |
-| `max_paths` | 64 | 8-64 | Path registry cap. It is not an aggregation target. |
-| `max_streams` | 65,536 | 4096+ | Logical stream registry cap for proxy/TUN fan-out. |
-| `max_stream_window_bytes` | 64 MiB | 64-256 MiB | Product flow-control receive window. Increase for high-BDP paths and many streams. |
-| `max_repair_bytes` | 64 MiB | 64-256 MiB | Repair-cache envelope for MPTCP-like reinjection. Config-file `max_path_flight_bytes` derives from this when omitted. |
-| `max_reorder_bytes` | 64 MiB | 64-256 MiB | Receive-hole/order debt envelope for multipath scheduling. Too high can hide harmful striping; too low can reject useful paths. |
-| `max_datagram_queue_bytes` | 16 MiB | 16-64 MiB | Datagram burst envelope for SOCKS5 UDP, TUN UDP, and realtime traffic. |
-| `max_path_flight_bytes` | 64 MiB | 64-256 MiB | Per-path product-flight ceiling and QUIC send-window resource input. Actual sender flight remains BDP/queue/loss adaptive. |
-| `max_reliable_relay_chunk_bytes` | 512 KiB | 256 KiB-1 MiB | Read-buffer ceiling only. Sender-service quanta follow BBR-style rate-based send-quantum sizing, lane priority, queue/loss state, and this envelope. |
-| TCP heartbeat timers | 10s / 30s | keep default | Idle TCP-path liveness. Active failover uses data-plane stall/PTO/repair evidence. |
-| Outbound connect timeout | 10s | per egress outbound/member | Target or upstream-proxy dial safety. It is scoped to the outbound that owns the connect and does not affect MPP path probing, pacing, or failover. |
-
-Request streams do not immediately fill the 64 MiB stream and repair envelopes.
-Their source queue and ACK-retained repair bytes share a stream-local product
-window that starts at 4 MiB for bulk traffic and grows from exact, unambiguous
-OwnerData ACK turnover within the current Service PTO. The ACK carrier is
-irrelevant; the flight owner must be the exact ordered Service instance or an
-eligible same-family graduated Subflow. Active attachment or reverse-direction
-delivery churn does not move this epoch. An exact committed TCP/QUIC Service
-handoff resets the window, loss without a replacement retains the prior bound,
-and bulk-to-latency demotion closes old read-ahead to the classifier reservoir.
-This is automatic and has no operator knob. `STREAM_ACK` means the peer handed
-bytes to its local target socket, not that the target application consumed them,
-and it never supplies QUIC carrier capacity.
-
-TCP request-path discovery also uses an automatic logical-contention gate. A
-fresh optional-path startup sample and a fresh zero-spend ACK-clock calibration
-require at least two active logical bulk request flows whose exact committed
-Service is TCP; one stream still counts once when attached to several paths,
-because per-path load is occupancy rather than independent demand. Only present
-queued or outstanding request-direction work counts; reverse bytes, idle
-completed uploads, and QUIC-Service flows never do. A begun exact-owner epoch
-may drain after the count falls from two to one. No path-wide completion estimate
-may veto fresh request calibration until
-request-direction, provenance-bound authority exists. Either the exact ACK that
-completes all sealed startup `OwnerData`, or the exact ordered receipt ACK when
-it arrives first, starts the follow-on causal interval. Calibration has one
-explicit exact path-instance owner and a target frozen when that owner is
-claimed. With default envelopes the target is a cumulative, non-refilling
-2 MiB proof, not a pipe-sized transfer; exact-owner, debt, resource, pressure,
-causality, and enqueue-credit guards remain active. After exact ownership, a
-Service-derived provisional rate and pipe may keep an endpoint-only TCP
-candidate from remaining artificially underfilled; a configured candidate
-retains its own capacity hint. The candidate's continuous exact product-ACK
-model replaces the provisional prior at ten exact samples. With one upload, the
-two-flow gate still preserves Service stability instead of serially probing
-optional TCP paths. This is not proof of one-flow aggregation: TCP still needs
-independent attributable evidence, while QUIC requires fresh post-attachment,
-non-app-limited native packet-ACK evidence and never uses product-ACK
-calibration.
-
-The retained clean control for this behavior is Iteration 109, not a production
-capacity promise. With two upload flows and five shaped 500 Mbps, 180 ms,
-1 ms-jitter, zero-loss paths, exact diagnostics-disabled goodput is
-691.368 Mbps multipath and 314.999 Mbps single-path: 2.195x overall, 2.935x in
-the `[9,18)` sink-ACK window, and 2.409x in `[15,18)`. Client transmit shares
-are 37.15%, 33.44%, 4.78%, 10.47%, and 14.17%. Versus the matched Iteration 69
-profile, multipath improves 10.38% overall and 11.77% broad but changes -6.36%
-late; `[9,15)` improves 22.02%, so delivery moved earlier instead of depending
-on a final burst. The single control changes -0.32%, +0.56%, and +3.53%. Do not extrapolate this
-row to one-flow aggregation, QUIC, mixed carriers, real Internet, failover, or
-current MPTCP/Hysteria2 comparisons; those require their own matched cohorts.
-
-TCP response discovery has a separate directional rule. One active sustained
-bulk response may spend the first bounded same-family startup sample. Once a
-measured response Subflow exists, a later cold candidate must project completion
-of its whole startup sample inside the current Service backlog reservoir; a
-sample already bound to an exact epoch may drain. The robust TCP calibration
-median is now a fallback for configured or independently measured candidates.
-Endpoint-only TCP instead installs the proven same-family Service opportunity
-as a temporary typed path-capacity prior after exact drain and moves to ordinary
-bounded Subflow work. Either prior is replaced, not blended, only after ten
-completed ordinary exact-ACK windows and a usable continuous per-flow sample.
-Fragmented callbacks do not count as windows, and QUIC continues to require
-native carrier evidence.
-
-Iterations 118 and 119 are the initial clean one-flow TCP download controls on
-five 500 Mbps, 180 ms, 1 ms-jitter, zero-loss paths. Multipath reached 273.437
-and 263.841 Mbps, or 1.182x and 1.139x the matched single-path rows; their late
-ratios were 1.477x and 1.488x. An exact detached-commit A/B put `7fa7789` at
-235.147 Mbps versus the current 231.579 Mbps single row under the same host
-conditions, so the historical absolute-rate drop was environmental rather than
-a code regression. Iteration 121 retained two-flow aggregation at 488.684 Mbps,
-2.078x that detached single control. Do not extrapolate these shaped TCP rows to
-QUIC, mixed carriers, heterogeneous paths, failover, real Internet, or external
-baseline superiority.
-
-The post-audit final binary adds a stricter calibration ownership bound. While
-an exact TCP calibration prefix is serialized, total ordered tail is limited to
-that prefix plus one Service feed reservoir, clamped to the product envelope;
-Service queue/native flight already included in ETA is not counted twice.
-Iteration 124 reaches 319.401 Mbps overall and 561.482 Mbps final-three-seconds
-against the adjacent 301.301/439.178 Mbps single control. The unsafe pre-cap A/B
-is 346.852/459.599 Mbps. At that point the stability
-tradeoff was explicit: bounded calibration cost 7.9% overall but improved late
-delivery 22.2%. This is an open performance issue, not permission to remove the
-ownership bound.
-
-Iterations 126-128 resolve that early cost for endpoint-only TCP without
-removing the ownership bound. The causal pair eliminates the 5.3-8.8 second,
-4.46 MiB exclusive stage and improves diagnostic goodput from 110.189 to
-175.841 Mbps. The clean adjacent pair reaches 236.774 Mbps multipath versus
-112.274 Mbps single, or 2.109x overall and 2.368x late, with 75.5/24.5% material
-path shares. The adjacent single is much slower than Iteration 122, so use the
-paired ratio rather than cross-epoch absolute rates. Server CPU, peak memory,
-and maximum gap remain higher at 9.398/2.462%, 208.8/134.6 MB, and
-0.599/0.494 seconds for multipath/single.
-
-The Linux TCP carrier samples `TCP_INFO` from the exact authenticated server
-socket. It accepts capability groups supported by the returned kernel prefix;
-missing RTT, flight, queue, loss, pacing, or delivery fields remain unknown.
-Passive samples are pressure/liveness only; only the typed offset-free receipt
-can temporarily authorize optional bulk placement. An actual native delivery
-field is capped at 2x receipt rate, and pacing never becomes capacity authority. Final
-Iteration 153 reaches 172.853 Mbps versus 84.992 Mbps single (`2.034x`); its
-0.504 second gap is a boundary miss, while the Iteration 154 repeat reaches
-182.917 Mbps with a 0.368 second gap. Do not restore the rejected source-only
-cap from Iteration 150: it starved the blocked prefix and fell to `0.844x`.
-TCP prefix recovery instead reinjects one modeled owner flight after one PTO,
-bounded by the feed reservoir. Fat-path recruitment remains inconsistent.
-Upload/client telemetry remains separate because throughput and latency TCP
-sessions must not be collapsed into one path record.
-
-Iteration 135 confirms that the accepted completion gate blocks an obviously
-slow candidate before the Service prior is installed. With lowlat at
-200 Mbps/20 ms and four optionals at 50 Mbps/420 ms/10% loss, multipath/single
-is 182.247/182.777 Mbps and maximum gap is 0.251/0.247 seconds; optional path
-traffic is control-only.
-
-A QUIC bulk stream advertises the configured product receive window, 64 MiB by
-default. This is receiver-memory authority, not the QUIC congestion window or
-path-capacity proof. Before exact feed evidence, response source and emission
-staging remain in the derived 4 MiB reservoir, so advertising memory does not
-bypass bounded admission or native QUIC congestion control. Either substantial
-uniquely owned product `STREAM_ACK` progress or a durable local carrier
-ACK-derived DATA estimate may graduate the current QUIC Service's staging;
-the carrier estimate may be app-limited. Neither authority is carrier capacity
-proof, and same-path latency pressure still prevents graduation. Optional
-Subflows, capacity ranking, and handoff require strict non-app-limited carrier
-proof. A request-side QUIC Validation attachment additionally requires its exact
-fresh path proof. Sustained one-flow bulk demand may run one serialized,
-session-bounded carrier-only capacity train; the exact relay instance must then
-ACK the fixed post-proof product floor from bytes sent after acceptance and
-before expiry. The train's QUIC ACKs own rate and pacing, while product ACKs own
-only durable ordered admission. Because ordinary writers are gated, isolated
-timed train ACKs remain valid even if generic carrier telemetry reports
-application-limited. Probe packets are quarantined from ordinary
-capacity evidence by their send time through the peer receipt boundary;
-ordinary packets sent afterward are eligible immediately. A completed
-handoff's numeric rate prior expires independently of its durable ordered-use
-state so later native evidence can correct it. TCP and QUIC keep separate
-recovery, pacing, and flow-control loops below this unified product policy.
-The desired request train warmup uses the candidate's local native flight window
-and twice the effective Service-rate BDP at the candidate RTT. Its preassigned
-envelope may bound the rate-derived target, but not below native candidate
-flight. It deliberately excludes product flight, queued product bytes, and
-reorder debt; those remain bounded by the shared product window and are not one
-carrier's congestion state.
-
-For a high-bandwidth VPS path, increase `max_stream_window_bytes`,
-`max_repair_bytes`, `max_reorder_bytes`, and `max_path_flight_bytes` together
-instead of only raising the frame or read chunk. For a memory-constrained local
-device, lower the same envelopes together and verify file-download goodput,
-small-request latency, and failover through the management API or lab runs.
-Do not lower `max_path_flight_bytes` below `max_reliable_relay_chunk_bytes`; the
-config validator rejects incoherent envelopes.
-
-The release management API is enabled only when `--management-listen` or `[management].listen` is configured. Keep it on loopback unless an operator network explicitly protects it. Set `--management-token` or `[management].token` for bearer-token authentication. Release endpoints expose JSON status and bounded traffic trends without lab-only component timing. Status includes local inbound tags, listener addresses, route targets, path health, and traffic summaries; local proxy credentials are not exposed. When one process has both local inbounds using MPP outbounds and MPP inbounds using egress outbounds, the API reports a self-contained node snapshot with both service groups:
-
-```bash
-curl -H 'Authorization: Bearer replace-with-token' http://127.0.0.1:7600/status
-curl -H 'Authorization: Bearer replace-with-token' http://127.0.0.1:7600/paths
-```
-
-Client-side path control uses the scheduler-visible path health record:
-
-```bash
-curl -X POST \
-  -H 'Authorization: Bearer replace-with-token' \
-  -H 'Content-Type: application/json' \
-  --data '{"underlay":"udp","index":0,"state":"disabled"}' \
-  http://127.0.0.1:7600/control/path
-```
-
-For node configs with multiple MPP outbounds or balancers, use the configured
-target tag instead of an array index:
-
-```bash
-curl -X POST \
-  -H 'Authorization: Bearer replace-with-token' \
-  -H 'Content-Type: application/json' \
-  --data '{"client_tag":"edge-mpp","underlay":"udp","index":0,"state":"disabled"}' \
-  http://127.0.0.1:7600/control/path
-```
+The adapter is optional. Windows, macOS, Android, unsupported kernels, and
+restricted hosts use the portable fallback and remain correct and eligible.
+No config or topology should require `TCP_INFO` for normal operation.
 
 ## Encryption
 
-Encrypted transport is the default and uses `aes-256-gcm` unless `--cipher chacha20-poly1305` or `MPTUNNEL_CIPHER=chacha20-poly1305` is set on both peers. Cipher suites are not negotiated; client and server must be configured consistently. `--secret` / `MPTUNNEL_SECRET` must be a random UUID or at least 32 bytes of high-entropy secret text. Runtime transport and HMAC keys are derived from that secret with mptunnel-specific context separation. Authenticated session/path control frames carry issue times and are rejected outside `--auth-freshness-window-seconds` / `MPTUNNEL_AUTH_FRESHNESS_WINDOW_SECONDS`, default `300`.
+All MPP paths are encrypted. TCP paths use the MPP record layer, which defaults
+to AES-256-GCM. Configure `chacha20-poly1305` on both peers when appropriate for
+the deployment CPU; the TCP record cipher is not negotiated. QUIC paths use TLS
+1.3 and QUIC packet protection through rustls; the MPP `cipher` setting does not
+select the QUIC TLS cipher suite.
+
+The shared secret must be a random UUID or at least 32 bytes of high-entropy
+text. MPP derives domain-separated transport and authentication keys. Session
+and path authentication issue times are checked against the configured
+freshness window, 300 seconds by default.
 
 ## Packaging
-
-Local release packaging:
 
 ```bash
 scripts/package-release.sh --target x86_64-unknown-linux-musl
 pwsh scripts/package-release.ps1 -Target x86_64-pc-windows-msvc
-```
-
-Each package contains:
-
-- `mptunnel` or `mptunnel.exe`
-- `README.md`
-- `LICENSE`
-- `docs/`
-- Windows only: `wintun.dll` and `WINTUN-LICENSE.txt`
-- a SHA-256 checksum next to the archive
-
-Release archives intentionally do not include `mptunnel-bench`, Docker lab scripts, generated lab results, service templates, or other developer-only tooling. The product binary is built as `--bin mptunnel`.
-
-Windows packaging accepts the x86_64 and aarch64 targets listed below. Both packaging scripts pin Wintun 0.14.1, verify its official archive checksum before use, and select the matching amd64 or arm64 DLL. Packaging verifies the dependency artifact; exercising the Wintun driver and TUN data path still requires a native Windows host.
-
-Linux release artifacts use musl targets, not glibc targets, so they do not depend on a host glibc baseline:
-
-```bash
-scripts/package-release.sh --target x86_64-unknown-linux-musl
-CARGO_TARGET_AARCH64_UNKNOWN_LINUX_MUSL_LINKER=rust-lld \
-  scripts/package-release.sh --target aarch64-unknown-linux-musl
 ```
 
 Release targets:
@@ -360,31 +302,35 @@ Release targets:
 - `x86_64-pc-windows-msvc`
 - `aarch64-pc-windows-msvc`
 
-CI performs a library-only Rust source check for `aarch64-linux-android` with the runner's Android NDK LTS toolchain. This proves that the Rust library and current dependencies compile for that target; it does not build an APK or Android release artifact, provide JNI/service glue, or exercise the `VpnService` TUN data path on a device.
+Each archive contains the product binary, README, license, and docs. Packaging
+emits a sibling SHA-256 checksum. Windows archives also contain the pinned
+architecture-matched Wintun DLL and upstream license. Packaging validates that
+artifact; only a native Windows host can prove Wintun device, route, DNS, and
+service integration.
 
-## Tag Releases
+Linux release archives use musl targets and do not depend on a host glibc
+baseline. CI performs an Android aarch64 library source check with the NDK; it
+does not build an APK or prove device runtime.
 
-GitHub Actions publishes releases from tags that match `v*`, for example:
+## Releases
 
-```bash
-git tag v0.1.0
-git push origin v0.1.0
-```
+Tags matching `v*` run format, clippy, tests, target packages, checksums, and
+GitHub Release publication. Manual workflow dispatch creates artifacts but does
+not publish unless the ref is a tag.
 
-The release workflow runs:
+The release archive does not include the benchmark crate, Docker lab scripts,
+generated results, or lab-only diagnostics. The production binary is built as
+`--bin mptunnel` without the `lab-diagnostics` feature.
 
-- format, clippy, and tests for the product code
-- Linux packages through musl Rust targets
-- macOS and Windows packages through the native packaging scripts
-- artifact upload for all target archives and `.sha256` files
-- GitHub Release publication only when the workflow was triggered by a tag
+## Verification policy
 
-Manual `workflow_dispatch` runs execute the same checks and package jobs, but the publish job is skipped unless the ref is a tag.
+Normal format, clippy, unit, integration, and target checks run on hosts without
+modifying networking. TUN, route, DNS, netem, blackhole, and privileged service
+experiments belong in Docker or a dedicated native test machine.
 
-Benchmarks and Docker lab checks are manual-only processes. They are not part of CI, release checks, package jobs, or tag publication.
+Wine is suitable for Windows executable startup, CLI, and config parsing only.
+Record native Windows integration and real-Internet results as not run when the
+required environment is unavailable; do not substitute Linux Docker evidence.
 
-## Test Policy
-
-Normal build, format, clippy, unit, and integration checks run on the host.
-
-Lab tests that create TUN devices, change routes, alter DNS settings, bind privileged service state, or otherwise mutate host network/device state must run in Docker or an equivalent isolated environment.
+Performance acceptance follows [`docs/LAB.md`](LAB.md). Historical pre-v2 rows
+are regression references, not current release proof.

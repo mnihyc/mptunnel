@@ -9,7 +9,8 @@ use crate::runtime::path::{
     AcceptedServerDatagramFlow, ServerDatagramOpenError, ServerDatagramOpenRequest,
     ServerDatagramPort, ServerDatagramPortBackend, ServerDatagramRequest, ServerStreamPort,
 };
-use crate::scheduler::FlowLane;
+use crate::runtime::telemetry::{ProductFlowLease, RuntimeTelemetry};
+use crate::scheduler::TrafficClass;
 use std::collections::VecDeque;
 use std::future::Future;
 use std::pin::Pin;
@@ -29,6 +30,7 @@ pub(in crate::runtime) struct ServerDatagramService {
     outbound_connect_timeout: Duration,
     mux_limits: MuxLimits,
     reliable_streams: ServerStreamPort,
+    telemetry: RuntimeTelemetry,
 }
 
 impl ServerDatagramService {
@@ -38,6 +40,7 @@ impl ServerDatagramService {
         outbound_connect_timeout: Duration,
         mux_limits: MuxLimits,
         reliable_streams: ServerStreamPort,
+        telemetry: RuntimeTelemetry,
     ) -> ServerDatagramPort {
         ServerDatagramPort::new(Arc::new(Self {
             outbound,
@@ -45,6 +48,7 @@ impl ServerDatagramService {
             outbound_connect_timeout,
             mux_limits,
             reliable_streams,
+            telemetry,
         }))
     }
 }
@@ -73,6 +77,9 @@ impl ServerDatagramPortBackend for ServerDatagramService {
             if let Err(error) = self.outbound.ensure_supports(TargetProtocol::Udp) {
                 return Err(ServerDatagramOpenError::new(error.into()));
             }
+            let telemetry_flow =
+                self.telemetry
+                    .open_datagram_flow(Some(session_id), flow_id, target.clone());
             let realtime_registration = self.reliable_streams.register_realtime_flow(session_id);
             let outbound_socket = match outbound::connect_udp(
                 &self.outbound,
@@ -95,6 +102,7 @@ impl ServerDatagramPortBackend for ServerDatagramService {
                 outbound_socket,
                 commands,
                 self.mux_limits,
+                telemetry_flow,
             );
             Ok(AcceptedServerDatagramFlow::holding(
                 flow_id,
@@ -118,10 +126,13 @@ pub(in crate::runtime) fn spawn_server_datagram_flow_worker(
     mut outbound_socket: outbound::OutboundUdpSocket,
     commands: ReliablePathCommandSender,
     mux_limits: MuxLimits,
+    telemetry_flow: ProductFlowLease,
 ) -> mpsc::Sender<ServerDatagramRequest> {
     let (requests_tx, mut requests_rx) =
         mpsc::channel::<ServerDatagramRequest>(server_datagram_request_queue_len(mux_limits));
     tokio::spawn(async move {
+        let product_counter = telemetry_flow.counter();
+        let mut failed = false;
         let response_buffer_len = mux_limits
             .max_payload_bytes
             .min(OUTBOUND_UDP_RECV_BUFFER_BYTES);
@@ -138,6 +149,7 @@ pub(in crate::runtime) fn spawn_server_datagram_flow_worker(
                     let len = match received {
                         Ok(len) => len,
                         Err(err) => {
+                            failed = true;
                             eprintln!("warning: UDP outbound receive failed: {err}");
                             let _ = try_send_server_datagram_realtime_frame(
                                 &commands,
@@ -160,7 +172,9 @@ pub(in crate::runtime) fn spawn_server_datagram_flow_worker(
                         payload,
                     };
                     match try_send_server_datagram_realtime_frame(&commands, frame) {
-                        Ok(()) => {}
+                        Ok(()) => {
+                            product_counter.record_datagram_to_peer(len as u64);
+                        }
                         Err(RuntimeError::SenderServiceBlocked) => {
                             #[cfg(feature = "lab-diagnostics")]
                             lab_diagnostic(
@@ -174,7 +188,10 @@ pub(in crate::runtime) fn spawn_server_datagram_flow_worker(
                             );
                             continue;
                         }
-                        Err(_) => break,
+                        Err(_) => {
+                            failed = true;
+                            break;
+                        }
                     }
                 }
                 request = requests_rx.recv() => {
@@ -186,6 +203,8 @@ pub(in crate::runtime) fn spawn_server_datagram_flow_worker(
                     }
                     match outbound_socket.send(&request.payload).await {
                         Ok(_) => {
+                            product_counter
+                                .record_datagram_from_peer(request.payload.len() as u64);
                             pending_ttls.push_back((
                                 Instant::now() + Duration::from_millis(u64::from(request.ttl_ms)),
                                 request.ttl_ms,
@@ -199,6 +218,9 @@ pub(in crate::runtime) fn spawn_server_datagram_flow_worker(
                 }
             }
         }
+        if !failed {
+            telemetry_flow.complete();
+        }
     });
     requests_tx
 }
@@ -211,7 +233,7 @@ pub(in crate::runtime) fn try_send_server_datagram_realtime_frame(
         frame,
         Frame::DatagramData { .. } | Frame::DatagramFeedback { .. } | Frame::DatagramClose { .. }
     ));
-    commands.try_enqueue_admitted_frame(frame, FlowLane::RealtimeDatagram)
+    commands.try_enqueue_admitted_frame(frame, TrafficClass::RealtimeDatagram)
 }
 
 fn prune_server_pending_ttls(pending_ttls: &mut VecDeque<(Instant, u32, DatagramId)>) {

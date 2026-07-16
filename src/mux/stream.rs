@@ -10,8 +10,8 @@ pub struct ReliableSendStream {
     stream_id: StreamId,
     next_offset: u64,
     max_offset: u64,
-    repair_bytes: usize,
-    repair_cache: BTreeMap<u64, SentChunk>,
+    reinjection_bytes: usize,
+    reinjection_cache: BTreeMap<u64, SentChunk>,
     limits: MuxLimits,
 }
 
@@ -38,8 +38,8 @@ impl ReliableSendStream {
             stream_id,
             next_offset: 0,
             max_offset: initial_max_offset,
-            repair_bytes: 0,
-            repair_cache: BTreeMap::new(),
+            reinjection_bytes: 0,
+            reinjection_cache: BTreeMap::new(),
             limits,
         }
     }
@@ -56,8 +56,8 @@ impl ReliableSendStream {
         usize::try_from(self.max_offset.saturating_sub(self.next_offset)).unwrap_or(usize::MAX)
     }
 
-    pub fn repair_bytes(&self) -> usize {
-        self.repair_bytes
+    pub fn reinjection_bytes(&self) -> usize {
+        self.reinjection_bytes
     }
 
     pub fn update_max_offset(&mut self, max_offset: u64) {
@@ -90,16 +90,15 @@ impl ReliableSendStream {
                 max: self.max_offset,
             });
         }
-        let new_repair_bytes =
-            self.repair_bytes
-                .checked_add(payload.len())
-                .ok_or(StreamError::RepairCacheFull {
-                    actual: usize::MAX,
-                    limit: self.limits.max_repair_bytes,
-                })?;
-        if new_repair_bytes > self.limits.max_repair_bytes {
-            return Err(StreamError::RepairCacheFull {
-                actual: new_repair_bytes,
+        let new_reinjection_bytes = self.reinjection_bytes.checked_add(payload.len()).ok_or(
+            StreamError::ReinjectionCacheFull {
+                actual: usize::MAX,
+                limit: self.limits.max_repair_bytes,
+            },
+        )?;
+        if new_reinjection_bytes > self.limits.max_repair_bytes {
+            return Err(StreamError::ReinjectionCacheFull {
+                actual: new_reinjection_bytes,
                 limit: self.limits.max_repair_bytes,
             });
         }
@@ -134,22 +133,21 @@ impl ReliableSendStream {
                 max: self.max_offset,
             });
         }
-        let new_repair_bytes =
-            self.repair_bytes
-                .checked_add(payload.len())
-                .ok_or(StreamError::RepairCacheFull {
-                    actual: usize::MAX,
-                    limit: self.limits.max_repair_bytes,
-                })?;
-        if new_repair_bytes > self.limits.max_repair_bytes {
-            return Err(StreamError::RepairCacheFull {
-                actual: new_repair_bytes,
+        let new_reinjection_bytes = self.reinjection_bytes.checked_add(payload.len()).ok_or(
+            StreamError::ReinjectionCacheFull {
+                actual: usize::MAX,
+                limit: self.limits.max_repair_bytes,
+            },
+        )?;
+        if new_reinjection_bytes > self.limits.max_repair_bytes {
+            return Err(StreamError::ReinjectionCacheFull {
+                actual: new_reinjection_bytes,
                 limit: self.limits.max_repair_bytes,
             });
         }
         self.next_offset = end;
-        self.repair_bytes = new_repair_bytes;
-        self.repair_cache.insert(
+        self.reinjection_bytes = new_reinjection_bytes;
+        self.reinjection_cache.insert(
             *offset,
             SentChunk {
                 offset: *offset,
@@ -175,14 +173,14 @@ impl ReliableSendStream {
         if *stream_id != self.stream_id || end != self.next_offset {
             return Err(StreamError::InvalidPreparedFrame);
         }
-        let Some(chunk) = self.repair_cache.remove(offset) else {
+        let Some(chunk) = self.reinjection_cache.remove(offset) else {
             return Err(StreamError::InvalidPreparedFrame);
         };
         if chunk.payload.len() != payload.len() || chunk.offset != *offset {
             return Err(StreamError::InvalidPreparedFrame);
         }
         self.next_offset = *offset;
-        self.repair_bytes = self.repair_bytes.saturating_sub(payload.len());
+        self.reinjection_bytes = self.reinjection_bytes.saturating_sub(payload.len());
         Ok(())
     }
 
@@ -192,22 +190,22 @@ impl ReliableSendStream {
     }
 
     pub fn apply_normalized_ack(&mut self, ranges: &[OffsetRange]) -> AckOutcome {
-        if ranges.is_empty() || self.repair_cache.is_empty() {
+        if ranges.is_empty() || self.reinjection_cache.is_empty() {
             return AckOutcome {
                 released_bytes: 0,
                 released_chunks: 0,
-                remaining_repair_bytes: self.repair_bytes,
+                remaining_reinjection_bytes: self.reinjection_bytes,
             };
         }
 
         let mut released_chunks = 0usize;
-        let previous_repair_bytes = self.repair_bytes;
+        let previous_reinjection_bytes = self.reinjection_bytes;
         let mut released_bytes = 0usize;
         for range in ranges {
             while let Some(offset) =
-                first_overlapping_repair_chunk(&self.repair_cache, range.start, range.end)
+                first_overlapping_reinjection_chunk(&self.reinjection_cache, range.start, range.end)
             {
-                let Some(chunk) = self.repair_cache.remove(&offset) else {
+                let Some(chunk) = self.reinjection_cache.remove(&offset) else {
                     break;
                 };
                 let chunk_start = chunk.offset;
@@ -215,7 +213,7 @@ impl ReliableSendStream {
                 let acked_start = chunk_start.max(range.start);
                 let acked_end = chunk_end.min(range.end);
                 if acked_start >= acked_end {
-                    self.repair_cache.insert(chunk.offset, chunk);
+                    self.reinjection_cache.insert(chunk.offset, chunk);
                     break;
                 }
                 released_bytes = released_bytes.saturating_add(
@@ -226,18 +224,18 @@ impl ReliableSendStream {
                     continue;
                 }
                 if let Some(left) = sent_chunk_slice(&chunk, chunk_start, acked_start) {
-                    self.repair_cache.insert(left.offset, left);
+                    self.reinjection_cache.insert(left.offset, left);
                 }
                 if let Some(right) = sent_chunk_slice(&chunk, acked_end, chunk_end) {
-                    self.repair_cache.insert(right.offset, right);
+                    self.reinjection_cache.insert(right.offset, right);
                 }
             }
         }
-        self.repair_bytes = previous_repair_bytes.saturating_sub(released_bytes);
+        self.reinjection_bytes = previous_reinjection_bytes.saturating_sub(released_bytes);
         AckOutcome {
             released_bytes,
             released_chunks,
-            remaining_repair_bytes: self.repair_bytes,
+            remaining_reinjection_bytes: self.reinjection_bytes,
         }
     }
 
@@ -267,18 +265,18 @@ impl ReliableSendStream {
 
         let mut frames = Vec::new();
         let mut emitted_bytes = 0usize;
-        for chunk in self.repair_cache.values() {
+        for chunk in self.reinjection_cache.values() {
             let chunk_start = chunk.offset;
             let chunk_end = chunk.offset.saturating_add(chunk.payload.len() as u64);
             if chunk_start >= largest_acked_end {
                 break;
             }
-            let repair_end = chunk_end.min(largest_acked_end);
+            let reinjection_end = chunk_end.min(largest_acked_end);
             let mut cursor = chunk_start;
             let mut range_index = ranges.partition_point(|range| range.end <= chunk_start);
             while range_index < ranges.len() {
                 let range = ranges[range_index];
-                if range.start >= repair_end {
+                if range.start >= reinjection_end {
                     break;
                 }
                 if range.start > cursor
@@ -287,26 +285,26 @@ impl ReliableSendStream {
                         self.stream_id,
                         chunk,
                         cursor,
-                        range.start.min(repair_end),
+                        range.start.min(reinjection_end),
                         byte_limit,
                         &mut emitted_bytes,
                     )
                 {
                     return frames;
                 }
-                cursor = cursor.max(range.end).min(repair_end);
-                if cursor >= repair_end {
+                cursor = cursor.max(range.end).min(reinjection_end);
+                if cursor >= reinjection_end {
                     break;
                 }
                 range_index += 1;
             }
-            if cursor < repair_end
+            if cursor < reinjection_end
                 && !push_retransmission_slice(
                     &mut frames,
                     self.stream_id,
                     chunk,
                     cursor,
-                    repair_end,
+                    reinjection_end,
                     byte_limit,
                     &mut emitted_bytes,
                 )
@@ -322,7 +320,7 @@ impl ReliableSendStream {
         ranges: &[OffsetRange],
         byte_limit: usize,
     ) -> Vec<Frame> {
-        if byte_limit == 0 || self.repair_cache.is_empty() {
+        if byte_limit == 0 || self.reinjection_cache.is_empty() {
             return Vec::new();
         }
         let ranges = normalized_offset_ranges(ranges);
@@ -334,7 +332,7 @@ impl ReliableSendStream {
         ranges: &[OffsetRange],
         byte_limit: usize,
     ) -> Vec<Frame> {
-        if byte_limit == 0 || self.repair_cache.is_empty() {
+        if byte_limit == 0 || self.reinjection_cache.is_empty() {
             return Vec::new();
         }
         let Some(largest_acked_end) = ranges.iter().map(|range| range.end).max() else {
@@ -364,7 +362,7 @@ impl ReliableSendStream {
         let mut frames = Vec::new();
         let mut emitted_bytes = 0usize;
         let mut range_index = 0usize;
-        for chunk in self.repair_cache.values() {
+        for chunk in self.reinjection_cache.values() {
             while range_index < ranges.len() {
                 let range = ranges[range_index];
                 if range.end <= chunk.offset {
@@ -419,20 +417,20 @@ fn sent_chunk_slice(chunk: &SentChunk, start: u64, end: u64) -> Option<SentChunk
     })
 }
 
-fn first_overlapping_repair_chunk(
-    repair_cache: &BTreeMap<u64, SentChunk>,
+fn first_overlapping_reinjection_chunk(
+    reinjection_cache: &BTreeMap<u64, SentChunk>,
     start: u64,
     end: u64,
 ) -> Option<u64> {
     if start >= end {
         return None;
     }
-    if let Some((&offset, chunk)) = repair_cache.range(..=start).next_back()
+    if let Some((&offset, chunk)) = reinjection_cache.range(..=start).next_back()
         && chunk.offset.saturating_add(chunk.payload.len() as u64) > start
     {
         return Some(offset);
     }
-    repair_cache
+    reinjection_cache
         .range(start..end)
         .next()
         .map(|(&offset, _)| offset)
@@ -483,7 +481,7 @@ struct SentChunk {
 pub struct AckOutcome {
     pub released_bytes: usize,
     pub released_chunks: usize,
-    pub remaining_repair_bytes: usize,
+    pub remaining_reinjection_bytes: usize,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -624,9 +622,9 @@ impl ReliableRecvStream {
     /// A single ACK frame is only a complete description when all received
     /// ranges fit in `max_ack_ranges`. If the range set has to be truncated we
     /// must mark the frame `complete=false`; otherwise the sender interprets
-    /// omitted higher ranges as real holes and starts product repair. That was
+    /// omitted higher ranges as real holes and starts product reinjection. That was
     /// catastrophic for multipath/QUIC because ordinary reordering produced
-    /// repair storms, extra traffic, and application stalls.
+    /// reinjection storms, extra traffic, and application stalls.
     pub fn ack_frame(&self) -> Frame {
         let all_ranges = self.ack_ranges();
         let range_limit = self.limits.max_ack_ranges.max(1);
@@ -816,7 +814,7 @@ pub enum StreamError {
     EmptyPayload,
     PayloadTooLarge { actual: usize, limit: usize },
     FlowControlBlocked { end: u64, max: u64 },
-    RepairCacheFull { actual: usize, limit: usize },
+    ReinjectionCacheFull { actual: usize, limit: usize },
     ReorderBufferFull { actual: usize, limit: usize },
     TooManyAckRanges { actual: usize, limit: usize },
     OverlappingData,
@@ -834,10 +832,10 @@ impl std::fmt::Display for StreamError {
             Self::FlowControlBlocked { end, max } => {
                 write!(f, "stream offset {end} exceeds max data {max}")
             }
-            Self::RepairCacheFull { actual, limit } => {
+            Self::ReinjectionCacheFull { actual, limit } => {
                 write!(
                     f,
-                    "repair cache would hold {actual} bytes, limit is {limit}"
+                    "reinjection cache would hold {actual} bytes, limit is {limit}"
                 )
             }
             Self::ReorderBufferFull { actual, limit } => {

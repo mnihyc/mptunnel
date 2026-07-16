@@ -40,22 +40,15 @@ pub(crate) struct RelayPathKey {
     pub(crate) index: usize,
 }
 
+/// One product-stream attachment on one physical carrier lifetime.
+///
+/// Both identities are required: carrier evidence is invalid after reconnect,
+/// while stream ownership is invalid after detach and reattach on that carrier.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub(crate) struct RelayPathInstance {
     pub(crate) key: RelayPathKey,
-    pub(crate) id: u64,
-}
-
-/// Attachment-set placement of one carrier instance.
-///
-/// Placement is transport-neutral: TCP and QUIC retain separate carrier
-/// mechanics while request/response policy reasons over the same lifecycle
-/// state. `Active` does not by itself grant ordered product ownership.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum RelayPathPlacement {
-    Active,
-    Repair,
-    Validation,
+    pub(crate) path_instance_id: CarrierPathInstanceId,
+    pub(crate) attachment_id: u64,
 }
 
 /// Exact path-proof authority observed for one carrier attachment.
@@ -84,10 +77,10 @@ pub(crate) fn carrier_path_key_order(
     (left.path_id, left.underlay).cmp(&(right.path_id, right.underlay))
 }
 
-/// Opaque lifetime identity for one physical carrier attachment.
+/// Opaque lifetime identity for one authenticated physical carrier.
 ///
 /// `CarrierPathKey` names a logical path; this value changes when that path is
-/// replaced so evidence and in-flight ownership cannot cross attachment lives.
+/// replaced so evidence cannot cross physical carrier lifetimes.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub(crate) struct CarrierPathInstanceId(u64);
 
@@ -96,7 +89,6 @@ impl CarrierPathInstanceId {
         Self(raw)
     }
 
-    #[cfg(feature = "lab-diagnostics")]
     pub(crate) fn as_u64(self) -> u64 {
         self.0
     }

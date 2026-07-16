@@ -108,6 +108,10 @@ impl UdpPathEndpoint {
 }
 
 impl UdpPathConnection {
+    pub(super) fn is_locally_closed(&self) -> bool {
+        self.connection.is_locally_closed()
+    }
+
     pub(super) async fn open_bi(
         &self,
     ) -> Result<(UdpPathSendStream, UdpPathRecvStream), RuntimeError> {
@@ -273,22 +277,25 @@ pub(super) fn udp_reliable_stream_frame_queue(
 }
 
 pub(super) fn udp_path_frame_finished(err: &RuntimeError) -> bool {
-    match err {
-        RuntimeError::QuicCarrier(quic_transport::QuicCarrierError::Read(_)) => true,
-        RuntimeError::QuicCarrier(quic_transport::QuicCarrierError::UnexpectedEnd) => true,
-        RuntimeError::QuicCarrier(quic_transport::QuicCarrierError::Connection(_)) => true,
-        _ => false,
-    }
+    matches!(
+        err,
+        RuntimeError::QuicCarrier(
+            quic_transport::QuicCarrierError::Read(_)
+                | quic_transport::QuicCarrierError::UnexpectedEnd
+                | quic_transport::QuicCarrierError::Connection(_)
+        )
+    )
 }
 
 fn udp_runtime_error_is_expected_shutdown(err: &RuntimeError) -> bool {
-    match err {
-        RuntimeError::QuicCarrier(quic_transport::QuicCarrierError::Read(_)) => true,
-        RuntimeError::QuicCarrier(quic_transport::QuicCarrierError::UnexpectedEnd) => true,
-        RuntimeError::QuicCarrier(quic_transport::QuicCarrierError::Connection(_)) => true,
-        RuntimeError::RemoteClosed(CloseReason::Normal) => true,
-        _ => false,
-    }
+    matches!(
+        err,
+        RuntimeError::QuicCarrier(
+            quic_transport::QuicCarrierError::Read(_)
+                | quic_transport::QuicCarrierError::UnexpectedEnd
+                | quic_transport::QuicCarrierError::Connection(_)
+        ) | RuntimeError::RemoteClosed(CloseReason::Normal)
+    )
 }
 
 pub(super) fn warn_unexpected_udp_runtime_error(message: &str, err: &RuntimeError) {
@@ -311,7 +318,7 @@ pub(super) fn quic_path_open_error_is_retryable(err: &RuntimeError) -> bool {
 
 pub(super) fn udp_path_command_queue(mux_limits: MuxLimits, _codec_limits: CodecLimits) -> usize {
     // This queue is a sender-service work queue, not a QUIC record-buffer queue.
-    // QUIC reliable streams may split OwnerData into smaller records to reduce
+    // QUIC reliable streams may split OriginalData into smaller records to reduce
     // stream head-of-line burst size, but that packetization detail must not
     // multiply the number of commands admitted above the carrier. Otherwise a
     // 12--32 KiB QUIC record cap would inflate the queue from the logical

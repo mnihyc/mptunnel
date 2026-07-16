@@ -3,13 +3,13 @@
 //! Commands describe carrier work and lifetime fences; queue capacity,
 //! prioritization, and byte accounting remain in `queue`.
 
-use super::ports::{CarrierCommandLease, OpenedReliableCarrierStream};
+use super::ports::OpenedReliableCarrierStream;
 use super::queue::TcpCapacityProbeLease;
 use super::tcp::capacity::RequestTcpCapacityProbeLease;
-use crate::model::path::{CarrierPathInstanceId, RelayPathInstance};
-use crate::protocol::{Frame, PathId, ResetReason, StreamId, StreamOpenRole, TargetAddr};
+use crate::model::path::RelayPathInstance;
+use crate::protocol::{Frame, PathId, ResetReason, StreamId, TargetAddr};
 use crate::runtime::error::RuntimeError;
-use crate::scheduler::FlowLane;
+use crate::scheduler::TrafficClass;
 use std::sync::{
     Arc,
     atomic::{AtomicU8, Ordering},
@@ -36,20 +36,6 @@ pub(in crate::runtime) use super::queue::{
     reliable_path_writer_frame_queue_for_payload,
     reliable_path_writer_should_coalesce_partial_bulk_run,
 };
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(in crate::runtime) enum QuicCapacityProbeOwner {
-    /// Client request discovery is scoped to the exact logical attachment.
-    Request {
-        stream_id: StreamId,
-        path_instance: RelayPathInstance,
-    },
-    /// Server response discovery is scoped to the response binding instance.
-    Response {
-        binding_instance_id: u64,
-        path_instance_id: CarrierPathInstanceId,
-    },
-}
 
 #[derive(Debug)]
 struct CapacityProbeCommandTicketState {
@@ -153,11 +139,12 @@ impl CapacityProbeCommandTicket {
 
 #[derive(Debug)]
 pub(in crate::runtime) struct QuicCapacityProbeCommand {
-    // The command channel is attachment-local. This identity is only a stale
-    // ownership fence; QUIC never interprets product-stream semantics.
-    pub(in crate::runtime) owner: QuicCapacityProbeOwner,
+    // These fields fence the exact request attachment. QUIC never interprets
+    // product-stream semantics.
+    pub(in crate::runtime) stream_id: StreamId,
+    pub(in crate::runtime) path_instance: RelayPathInstance,
     pub(in crate::runtime) path_id: PathId,
-    pub(in crate::runtime) calibration_id: u64,
+    pub(in crate::runtime) measurement_id: u64,
     pub(in crate::runtime) train_payload_bytes: u64,
     pub(in crate::runtime) sample_floor_bytes: u64,
     pub(in crate::runtime) warmup_carrier_bytes: u64,
@@ -169,20 +156,11 @@ pub(in crate::runtime) struct QuicCapacityProbeCommand {
 }
 
 #[derive(Debug, Clone, Copy)]
-pub(in crate::runtime) struct TcpCapacityProbeRequest {
-    pub(in crate::runtime) path_id: PathId,
-    pub(in crate::runtime) path_instance_id: CarrierPathInstanceId,
-    pub(in crate::runtime) train_payload_bytes: u64,
-    pub(in crate::runtime) sample_floor_bytes: u64,
-    pub(in crate::runtime) expires_at: Instant,
-}
-
-#[derive(Debug, Clone, Copy)]
 pub(in crate::runtime) struct RequestTcpCapacityProbeRequest {
     pub(in crate::runtime) stream_id: StreamId,
     pub(in crate::runtime) path_instance: RelayPathInstance,
     pub(in crate::runtime) path_id: PathId,
-    pub(in crate::runtime) calibration_id: u64,
+    pub(in crate::runtime) measurement_id: u64,
     pub(in crate::runtime) train_payload_bytes: u64,
     pub(in crate::runtime) sample_floor_bytes: u64,
     pub(in crate::runtime) warmup_carrier_bytes: u64,
@@ -193,59 +171,30 @@ pub(in crate::runtime) struct RequestTcpCapacityProbeRequest {
     pub(in crate::runtime) expires_at: Instant,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(in crate::runtime) enum TcpCapacityProbeOwner {
-    Request {
-        stream_id: StreamId,
-        path_instance: RelayPathInstance,
-    },
-    Response {
-        path_instance_id: CarrierPathInstanceId,
-    },
-}
-
-#[derive(Debug)]
-pub(in crate::runtime) enum TcpCapacityProbeSessionLeaseOwner {
-    Request(RequestTcpCapacityProbeLease),
-    // Drop order keeps the response reservation until the carrier finishes.
-    Response(#[allow(dead_code)] CarrierCommandLease),
-}
-
-impl TcpCapacityProbeSessionLeaseOwner {
-    pub(in crate::runtime) fn request(&self) -> Option<&RequestTcpCapacityProbeLease> {
-        match self {
-            Self::Request(lease) => Some(lease),
-            Self::Response(_) => None,
-        }
-    }
-}
-
 #[derive(Debug)]
 pub(in crate::runtime) struct TcpCapacityProbeCommand {
-    pub(in crate::runtime) owner: TcpCapacityProbeOwner,
+    pub(in crate::runtime) stream_id: StreamId,
+    pub(in crate::runtime) path_instance: RelayPathInstance,
     pub(in crate::runtime) path_id: PathId,
-    pub(in crate::runtime) calibration_id: u64,
+    pub(in crate::runtime) measurement_id: u64,
     pub(in crate::runtime) train_payload_bytes: u64,
     pub(in crate::runtime) sample_floor_bytes: u64,
     pub(in crate::runtime) warmup_carrier_bytes: u64,
     pub(in crate::runtime) timing_slack_bytes: u64,
     pub(in crate::runtime) required_timed_carrier_bytes: u64,
-    pub(in crate::runtime) baseline_expires_at: Option<Instant>,
-    pub(in crate::runtime) write_expires_at: Option<Instant>,
+    pub(in crate::runtime) baseline_expires_at: Instant,
+    pub(in crate::runtime) write_expires_at: Instant,
     pub(in crate::runtime) expires_at: Instant,
-    pub(in crate::runtime) _session_lease: TcpCapacityProbeSessionLeaseOwner,
+    pub(in crate::runtime) request_lease: RequestTcpCapacityProbeLease,
     pub(in crate::runtime) _lease: TcpCapacityProbeLease,
 }
 
 impl TcpCapacityProbeCommand {
-    pub(in crate::runtime) fn request_lease(&self) -> Option<&RequestTcpCapacityProbeLease> {
-        self._session_lease.request()
+    pub(in crate::runtime) fn request_lease(&self) -> &RequestTcpCapacityProbeLease {
+        &self.request_lease
     }
 
     pub(in crate::runtime) fn valid_request_tcp_train(&self) -> bool {
-        if self.request_lease().is_none() {
-            return false;
-        }
         let measurement_bytes = match self
             .timing_slack_bytes
             .checked_add(self.required_timed_carrier_bytes)
@@ -259,18 +208,14 @@ impl TcpCapacityProbeCommand {
             && self.required_timed_carrier_bytes > 0
             && measurement_bytes >= self.sample_floor_bytes
             && train == Some(self.train_payload_bytes)
-            && self
-                .baseline_expires_at
-                .zip(self.write_expires_at)
-                .is_some_and(|(idle, write)| idle < write && write < self.expires_at)
+            && self.baseline_expires_at < self.write_expires_at
+            && self.write_expires_at < self.expires_at
     }
 }
 
 impl Drop for TcpCapacityProbeCommand {
     fn drop(&mut self) {
-        if let Some(lease) = self.request_lease() {
-            lease.cancel();
-        }
+        self.request_lease.cancel();
     }
 }
 
@@ -294,8 +239,7 @@ pub(in crate::runtime) enum ReliablePathCommand {
         attempt_id: ClientTcpOpenAttemptId,
         observed_carrier_generation: u64,
         target: TargetAddr,
-        lane: FlowLane,
-        role: StreamOpenRole,
+        lane: TrafficClass,
         open_deadlines: ClientTcpOpenDeadlines,
         session_commands: ReliablePathCommandSender,
         response: oneshot::Sender<ClientTcpOpenResponse>,
@@ -360,6 +304,9 @@ pub(in crate::runtime) struct ClientTcpOpenedStream {
     pub(in crate::runtime) open_deadline: tokio::time::Instant,
 }
 
+// This value crosses one one-shot channel. Keeping the success payload inline
+// avoids allocating every successful TCP stream open solely to equalize errors.
+#[allow(clippy::large_enum_variant)]
 pub(in crate::runtime) enum ClientTcpOpenResponse {
     Opened(ClientTcpOpenedStream),
     RejectedWithoutOpen(RuntimeError),

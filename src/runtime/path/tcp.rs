@@ -21,6 +21,3 @@ mod server_evidence;
 mod server_session;
 mod server_stream;
 mod server_writer;
-
-#[cfg(test)]
-pub(in crate::runtime) use client_session::connect_client_tcp_path_for_test;

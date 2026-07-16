@@ -1,12 +1,13 @@
 //! Client QUIC path sessions and reliable stream lifecycle.
 
-use super::client_stream::run_client_udp_stream;
+use super::client_stream::{apply_client_udp_path_status, run_client_udp_stream};
 use super::estimator::UdpPathMetricTracker;
 use super::io::{
     UdpPathConnection, UdpPathEndpoint, UdpPathRecvStream, UdpPathSendStream,
     quic_path_open_error_is_retryable, spawn_quic_path_reader, udp_path_command_queue,
-    udp_path_finish_stream, udp_path_max_stream_payload_bytes, udp_path_read_frame,
-    udp_path_write_frame, udp_reliable_stream_frame_queue, usable_udp_path_socket_addrs,
+    udp_path_max_stream_payload_bytes, udp_path_read_frame, udp_path_write_frame,
+    udp_reliable_stream_frame_queue, usable_udp_path_socket_addrs,
+    warn_unexpected_udp_runtime_error,
 };
 #[cfg(feature = "lab-diagnostics")]
 use super::metrics::log_quic_ack_poll_diagnostics;
@@ -14,18 +15,22 @@ use super::metrics::quic_path_metrics_poll_interval;
 use crate::config::SecurityConfig;
 #[cfg(feature = "lab-diagnostics")]
 use crate::lab_diagnostics::lab_diagnostic;
+use crate::model::path::{CarrierPathInstanceId, RelayPathKey, next_carrier_path_instance_id};
 use crate::mux::MuxLimits;
 use crate::protocol::codec::CodecLimits;
 use crate::protocol::{
-    Frame, PathId, PathMetricDirection, SessionId, StreamId, TargetAddr, UnderlayProtocol,
+    Frame, PathId, PathMetricDirection, PathUsage, SessionId, StreamId, TargetAddr,
+    UnderlayProtocol,
 };
 use crate::runtime::error::RuntimeError;
 use crate::runtime::path::authentication::ClientPathAuthenticationFrames;
 use crate::runtime::path::commands::reliable_path_command_channels;
 use crate::runtime::path::model::path_startup_snapshot;
-use crate::runtime::path::ports::{OpenedReliableCarrierStream, UdpStreamOpenOptions};
+use crate::runtime::path::ports::OpenedReliableCarrierStream;
 use crate::runtime::path::state::ClientPathState;
-use crate::scheduler::{FlowLane, stream_demand_hint_for_lane};
+use crate::runtime::peer_status::{PeerStatusBroker, PeerStatusCarrier, PeerStatusSnapshotSource};
+use crate::scheduler::{TrafficClass, stream_demand_hint_for_traffic_class};
+use crate::transport::quic::QuicCarrierError;
 use crate::transport::{
     CarrierNetworkProvider, CarrierPathIdentity, CarrierResolutionRequest, CarrierSocketRequest,
     PathSpec, interleave_socket_addr_families,
@@ -78,17 +83,11 @@ impl ClientUdpPathSessionHandle {
         }
     }
 
-    #[cfg(test)]
-    pub(in crate::runtime) fn session_id(&self) -> SessionId {
-        self.runtime.session_id
-    }
-
     pub(in crate::runtime) async fn open_stream(
         &self,
         stream_id: StreamId,
         target: TargetAddr,
-        lane: FlowLane,
-        options: UdpStreamOpenOptions,
+        lane: TrafficClass,
         open_deadline: tokio::time::Instant,
     ) -> Result<OpenedReliableCarrierStream, RuntimeError> {
         let open = async {
@@ -98,21 +97,19 @@ impl ClientUdpPathSessionHandle {
                 stream_id,
                 target.clone(),
                 lane,
-                options,
                 self.runtime.clone(),
             )
             .await
             {
                 Ok(stream) => Ok(stream),
                 Err(err) if quic_path_open_error_is_retryable(&err) => {
-                    self.drop_connection().await;
+                    self.drop_failed_connection().await;
                     let connection = self.ensure_connection(open_deadline).await?;
                     open_client_udp_stream_on_connection(
                         connection,
                         stream_id,
                         target,
                         lane,
-                        options,
                         self.runtime.clone(),
                     )
                     .await
@@ -134,7 +131,7 @@ impl ClientUdpPathSessionHandle {
             match open_client_udp_datagram_stream(connection, self.runtime.clone()).await {
                 Ok(stream) => Ok(stream),
                 Err(err) if quic_path_open_error_is_retryable(&err) => {
-                    self.drop_connection().await;
+                    self.drop_failed_connection().await;
                     let connection = self.ensure_connection(open_deadline).await?;
                     open_client_udp_datagram_stream(connection, self.runtime.clone()).await
                 }
@@ -149,21 +146,34 @@ impl ClientUdpPathSessionHandle {
     async fn ensure_connection(
         &self,
         open_deadline: tokio::time::Instant,
-    ) -> Result<UdpPathConnection, RuntimeError> {
+    ) -> Result<ClientUdpCarrierInstance, RuntimeError> {
         let mut current = self.connection.lock().await;
+        if current
+            .as_ref()
+            .is_some_and(|connection| connection.carrier.connection.is_closed())
+        {
+            current.take();
+        }
         if let Some(connection) = current.as_ref() {
-            return Ok(connection.connection.clone());
+            return Ok(connection.carrier.clone());
         }
         let connection = connect_client_udp_path(&self.runtime, open_deadline).await?;
-        let carrier_connection = connection.connection.clone();
+        let carrier = connection.carrier.clone();
         *current = Some(connection);
-        Ok(carrier_connection)
+        Ok(carrier)
     }
 
-    async fn drop_connection(&self) {
+    async fn drop_failed_connection(&self) {
         let mut current = self.connection.lock().await;
         if let Some(connection) = current.take() {
-            connection.connection.close();
+            self.runtime.state.mark_path_instance_data_plane_failure(
+                RelayPathKey {
+                    underlay: UnderlayProtocol::Udp,
+                    index: self.runtime.path_index,
+                },
+                connection.carrier.path_instance_id,
+            );
+            connection.carrier.connection.close();
         }
     }
 }
@@ -181,6 +191,8 @@ pub(in crate::runtime) struct ClientUdpPathSessionRuntime {
     pub(in crate::runtime) stream_frame_queue: usize,
     pub(in crate::runtime) state: Arc<ClientPathState>,
     pub(in crate::runtime) carrier_network: Arc<dyn CarrierNetworkProvider>,
+    pub(in crate::runtime) peer_status: PeerStatusBroker,
+    pub(in crate::runtime) peer_status_snapshot: PeerStatusSnapshotSource,
 }
 
 impl ClientUdpPathSessionRuntime {
@@ -197,17 +209,27 @@ impl ClientUdpPathSessionRuntime {
     }
 }
 
+#[derive(Clone)]
+struct ClientUdpCarrierInstance {
+    connection: UdpPathConnection,
+    path_instance_id: CarrierPathInstanceId,
+}
+
 struct ClientUdpPathConnection {
     _endpoint: UdpPathEndpoint,
-    connection: UdpPathConnection,
+    carrier: ClientUdpCarrierInstance,
     metrics_task: Option<tokio::task::JoinHandle<()>>,
+    control_task: Option<tokio::task::JoinHandle<()>>,
 }
 
 // The metrics loop holds a carrier clone, so the session must retire it explicitly.
 impl Drop for ClientUdpPathConnection {
     fn drop(&mut self) {
-        self.connection.close();
+        self.carrier.connection.close();
         if let Some(task) = self.metrics_task.take() {
+            task.abort();
+        }
+        if let Some(task) = self.control_task.take() {
             task.abort();
         }
     }
@@ -216,6 +238,7 @@ impl Drop for ClientUdpPathConnection {
 fn spawn_client_udp_path_metrics(
     runtime: ClientUdpPathSessionRuntime,
     connection: UdpPathConnection,
+    path_instance_id: CarrierPathInstanceId,
 ) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
         let mut tracker = UdpPathMetricTracker::default();
@@ -223,6 +246,15 @@ fn spawn_client_udp_path_metrics(
         let mut last_metrics_poll_at = None;
         loop {
             if connection.is_closed() {
+                if !connection.is_locally_closed() {
+                    runtime.state.mark_path_instance_data_plane_failure(
+                        RelayPathKey {
+                            underlay: UnderlayProtocol::Udp,
+                            index: runtime.path_index,
+                        },
+                        path_instance_id,
+                    );
+                }
                 return;
             }
             let mut metrics =
@@ -261,6 +293,7 @@ fn spawn_client_udp_path_metrics(
             } else {
                 None
             };
+            let proof_published = published_proof.is_some();
             if let (Some(candidate), Some((_rate_bps, _rate_sample_bytes, _native_tail_rate))) =
                 (capacity_candidate, published_proof)
             {
@@ -271,7 +304,7 @@ fn spawn_client_udp_path_metrics(
                 lab_diagnostic(
                     "request_quic_capacity_proof",
                     format_args!(
-                        "phase=published session_id={} path_index={} calibration_id={} train_bytes={} receipt_rate_bps={} published_rate_bps={} rate_sample_bytes={} rate_source={} proof_validity_ms={} carrier_retired={}",
+                        "phase=published session_id={} path_index={} measurement_id={} train_bytes={} receipt_rate_bps={} published_rate_bps={} rate_sample_bytes={} rate_source={} proof_validity_ms={} carrier_retired={}",
                         runtime.session_id.0,
                         runtime.path_index,
                         candidate.token,
@@ -289,6 +322,13 @@ fn spawn_client_udp_path_metrics(
                     ),
                 );
             }
+            if !proof_published
+                && let Some(token) =
+                    tracker.terminal_capacity_probe_to_retire(capacity_probe, Instant::now())
+            {
+                let _ = connection.retire_capacity_probe(token);
+                tracker.retire_capacity_candidate(token);
+            }
             tokio::time::sleep(quic_path_metrics_poll_interval(metrics)).await;
         }
     })
@@ -299,6 +339,7 @@ pub(in crate::runtime) struct ClientUdpDatagramStream {
     pub(in crate::runtime) frames: mpsc::Receiver<Result<Frame, RuntimeError>>,
     pub(in crate::runtime) runtime: ClientUdpPathSessionRuntime,
     pub(in crate::runtime) path_id: PathId,
+    pub(in crate::runtime) path_instance_id: CarrierPathInstanceId,
 }
 
 async fn connect_client_udp_path(
@@ -383,12 +424,42 @@ async fn connect_client_udp_path(
 
         // Address retry owns only carrier establishment. Authenticate exactly
         // once so a rejected MPP identity is never retried as a DNS decision.
-        perform_client_udp_path_handshake(&connection, runtime).await?;
-        let metrics_task = spawn_client_udp_path_metrics(runtime.clone(), connection.clone());
+        let (peer_usage, control_send, control_recv) =
+            perform_client_udp_path_handshake(&connection, runtime).await?;
+        let path_instance_id = next_carrier_path_instance_id();
+        runtime.state.install_peer_path_usage(
+            UnderlayProtocol::Udp,
+            runtime.path_index,
+            path_instance_id,
+            0,
+            peer_usage,
+        );
+        let metrics_task =
+            spawn_client_udp_path_metrics(runtime.clone(), connection.clone(), path_instance_id);
+        let peer_status = runtime.peer_status.register(runtime.session_id);
+        let control_connection = connection.clone();
+        let control_runtime = runtime.clone();
+        let control_task = tokio::spawn(async move {
+            if let Err(err) = run_client_udp_control_stream(
+                control_send,
+                control_recv,
+                peer_status,
+                control_runtime,
+            )
+            .await
+            {
+                warn_unexpected_udp_runtime_error("client QUIC control stream failed", &err);
+                control_connection.close();
+            }
+        });
         Ok(ClientUdpPathConnection {
             _endpoint: endpoint,
-            connection,
+            carrier: ClientUdpCarrierInstance {
+                connection,
+                path_instance_id,
+            },
             metrics_task: Some(metrics_task),
+            control_task: Some(control_task),
         })
     };
     tokio::time::timeout_at(open_deadline, connect)
@@ -416,7 +487,7 @@ async fn connect_client_udp_addr(
 async fn perform_client_udp_path_handshake(
     connection: &UdpPathConnection,
     runtime: &ClientUdpPathSessionRuntime,
-) -> Result<(), RuntimeError> {
+) -> Result<(PathUsage, UdpPathSendStream, UdpPathRecvStream), RuntimeError> {
     let (mut send, mut recv) = connection.open_bi().await?;
     let path_id = PathId(runtime.path_index as u16);
     let [session_hello, session_auth, path_join] = ClientPathAuthenticationFrames::for_session(
@@ -429,20 +500,33 @@ async fn perform_client_udp_path_handshake(
     udp_path_write_frame(&mut send, &session_hello, runtime.codec_limits).await?;
     udp_path_write_frame(&mut send, &session_auth, runtime.codec_limits).await?;
     udp_path_write_frame(&mut send, &path_join, runtime.codec_limits).await?;
-    udp_path_finish_stream(&mut send)?;
-
+    udp_path_write_frame(
+        &mut send,
+        &Frame::PathStatus {
+            path_id,
+            sequence: 0,
+            usage: if runtime.path().metadata.policy.backup {
+                PathUsage::Backup
+            } else {
+                PathUsage::Available
+            },
+        },
+        runtime.codec_limits,
+    )
+    .await?;
     let mut session_ready = false;
-    let mut path_active = false;
-    while !session_ready || !path_active {
+    let mut peer_usage = None;
+    while !session_ready || peer_usage.is_none() {
         match udp_path_read_frame(&mut recv, runtime.codec_limits).await? {
             Frame::SessionReady => session_ready = true,
             Frame::PathStatus {
-                status: crate::protocol::PathStatus::Active,
-                ..
-            } => path_active = true,
+                path_id: status_path_id,
+                sequence: 0,
+                usage,
+            } if status_path_id == path_id => peer_usage = Some(usage),
             Frame::PathStatus { .. } => {
                 return Err(RuntimeError::Protocol(
-                    "UDP path session did not become active",
+                    "invalid UDP path usage advertisement",
                 ));
             }
             Frame::SessionClose { reason } => return Err(RuntimeError::RemoteClosed(reason)),
@@ -453,35 +537,97 @@ async fn perform_client_udp_path_handshake(
             }
         }
     }
-    Ok(())
+    Ok((
+        peer_usage.expect("path usage checked before handshake completion"),
+        send,
+        recv,
+    ))
+}
+
+enum ClientUdpControlEvent {
+    Frame(Result<Frame, RuntimeError>),
+    Request(Option<u64>),
+}
+
+async fn run_client_udp_control_stream(
+    mut send: UdpPathSendStream,
+    mut recv: UdpPathRecvStream,
+    mut peer_status: PeerStatusCarrier,
+    runtime: ClientUdpPathSessionRuntime,
+) -> Result<(), RuntimeError> {
+    loop {
+        let event = tokio::select! {
+            frame = udp_path_read_frame(&mut recv, runtime.codec_limits) => {
+                ClientUdpControlEvent::Frame(frame)
+            }
+            request_id = peer_status.recv_request() => {
+                ClientUdpControlEvent::Request(request_id)
+            }
+        };
+        let outgoing = match event {
+            ClientUdpControlEvent::Frame(Ok(Frame::PeerStatusRequest { request_id })) => Some(
+                peer_status.response_frame(request_id, runtime.codec_limits, || {
+                    runtime.peer_status_snapshot.snapshot()
+                }),
+            ),
+            ClientUdpControlEvent::Frame(Ok(Frame::PeerStatusResponse {
+                request_id,
+                code,
+                paths,
+            })) => {
+                let _ = peer_status.receive_response(request_id, code, paths);
+                None
+            }
+            ClientUdpControlEvent::Frame(Ok(Frame::SessionClose { reason })) => {
+                return Err(RuntimeError::RemoteClosed(reason));
+            }
+            ClientUdpControlEvent::Frame(Ok(_)) => {
+                return Err(RuntimeError::Protocol(
+                    "unexpected QUIC UDP control stream frame",
+                ));
+            }
+            // Pre-control peers finish the handshake stream; keep their product
+            // connection usable and simply withdraw this diagnostic carrier.
+            ClientUdpControlEvent::Frame(Err(RuntimeError::QuicCarrier(
+                QuicCarrierError::UnexpectedEnd,
+            ))) => return Ok(()),
+            ClientUdpControlEvent::Frame(Err(err)) => return Err(err),
+            ClientUdpControlEvent::Request(Some(request_id)) => {
+                Some(Frame::PeerStatusRequest { request_id })
+            }
+            ClientUdpControlEvent::Request(None) => return Ok(()),
+        };
+        if let Some(frame) = outgoing {
+            udp_path_write_frame(&mut send, &frame, runtime.codec_limits).await?;
+        }
+    }
 }
 
 async fn open_client_udp_stream_on_connection(
-    connection: UdpPathConnection,
+    carrier: ClientUdpCarrierInstance,
     stream_id: StreamId,
     target: TargetAddr,
-    lane: FlowLane,
-    options: UdpStreamOpenOptions,
+    lane: TrafficClass,
     runtime: ClientUdpPathSessionRuntime,
 ) -> Result<OpenedReliableCarrierStream, RuntimeError> {
-    let UdpStreamOpenOptions {
-        wait_for_accept,
-        role,
-    } = options;
-    let (mut send, mut recv) = connection.open_bi().await?;
+    let (mut send, mut recv) = carrier.connection.open_bi().await?;
     let open = Frame::OpenStream {
         stream_id,
         target,
-        demand: stream_demand_hint_for_lane(lane),
-        role,
+        demand: stream_demand_hint_for_traffic_class(lane),
     };
     udp_path_write_frame(&mut send, &open, runtime.codec_limits).await?;
-    let accepted_max_offset = if wait_for_accept {
-        Some(read_client_udp_stream_open_accept(&mut recv, stream_id, runtime.codec_limits).await?)
-    } else {
-        None
-    };
-    let max_offset = udp_stream_open_initial_max_offset(options, accepted_max_offset);
+    let path_id = PathId(runtime.path_index as u16);
+    let max_offset = read_client_udp_stream_open_accept(
+        &mut recv,
+        stream_id,
+        runtime.path_index,
+        carrier.path_instance_id,
+        &runtime.state,
+        path_id,
+        runtime.codec_limits,
+    )
+    .await?;
     let (commands, receivers) = reliable_path_command_channels(udp_path_command_queue(
         runtime.mux_limits,
         runtime.codec_limits,
@@ -494,6 +640,7 @@ async fn open_client_udp_stream_on_connection(
         recv,
         stream_id,
         runtime.path_index,
+        carrier.path_instance_id,
         runtime.codec_limits,
         runtime.mux_limits,
         stream_frame_queue,
@@ -501,8 +648,13 @@ async fn open_client_udp_stream_on_connection(
         receivers,
         frames_tx,
     ));
+    let mut startup = path_startup_snapshot(runtime.path(), runtime.path_index);
+    startup.peer_usage = runtime
+        .state
+        .peer_path_usage(UnderlayProtocol::Udp, runtime.path_index);
     Ok(OpenedReliableCarrierStream {
         stream_id,
+        path_instance_id: carrier.path_instance_id,
         max_offset,
         lane,
         underlay: UnderlayProtocol::Udp,
@@ -510,7 +662,7 @@ async fn open_client_udp_stream_on_connection(
             runtime.codec_limits,
             runtime.mux_limits,
         ),
-        startup: path_startup_snapshot(runtime.path(), runtime.path_index),
+        startup,
         commands,
         mux_limits: runtime.mux_limits,
         frames: frames_rx,
@@ -520,6 +672,10 @@ async fn open_client_udp_stream_on_connection(
 async fn read_client_udp_stream_open_accept(
     recv: &mut UdpPathRecvStream,
     stream_id: StreamId,
+    path_index: usize,
+    path_instance_id: CarrierPathInstanceId,
+    state: &ClientPathState,
+    path_id: PathId,
     codec_limits: CodecLimits,
 ) -> Result<u64, RuntimeError> {
     loop {
@@ -532,7 +688,22 @@ async fn read_client_udp_stream_open_accept(
                 stream_id: reset_stream_id,
                 reason,
             } if reset_stream_id == stream_id => return Err(RuntimeError::RemoteReset(reason)),
-            Frame::PathStatus { .. } | Frame::SessionReady => {}
+            Frame::PathStatus {
+                path_id: status_path_id,
+                sequence,
+                usage,
+            } => {
+                let _ = apply_client_udp_path_status(
+                    state,
+                    path_index,
+                    path_instance_id,
+                    path_id,
+                    status_path_id,
+                    sequence,
+                    usage,
+                )?;
+            }
+            Frame::SessionReady => {}
             Frame::SessionClose { reason } => return Err(RuntimeError::RemoteClosed(reason)),
             _ => {
                 return Err(RuntimeError::Protocol(
@@ -543,31 +714,21 @@ async fn read_client_udp_stream_open_accept(
     }
 }
 
-fn udp_stream_open_initial_max_offset(
-    options: UdpStreamOpenOptions,
-    accepted_max_offset: Option<u64>,
-) -> u64 {
-    if options.wait_for_accept {
-        accepted_max_offset.unwrap_or(0)
-    } else {
-        0
-    }
-}
-
 #[cfg(test)]
 #[path = "client_test.rs"]
 mod tests;
 
 async fn open_client_udp_datagram_stream(
-    connection: UdpPathConnection,
+    carrier: ClientUdpCarrierInstance,
     runtime: ClientUdpPathSessionRuntime,
 ) -> Result<ClientUdpDatagramStream, RuntimeError> {
-    let (send, recv) = connection.open_bi().await?;
+    let (send, recv) = carrier.connection.open_bi().await?;
     let frames = spawn_quic_path_reader(recv, runtime.codec_limits, runtime.stream_frame_queue);
     Ok(ClientUdpDatagramStream {
         send,
         frames,
         path_id: PathId(runtime.path_index as u16),
+        path_instance_id: carrier.path_instance_id,
         runtime,
     })
 }

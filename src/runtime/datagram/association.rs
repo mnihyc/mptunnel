@@ -8,7 +8,8 @@ use crate::model::path::RelayPathKey;
 use crate::protocol::{TargetAddr, UnderlayProtocol};
 use crate::runtime::error::RuntimeError;
 use crate::runtime::path::ClientPathContext;
-use crate::scheduler::FlowLane;
+use crate::runtime::telemetry::{ProductFlowCounter, ProductFlowLease};
+use crate::scheduler::{TrafficClass, path_is_backup};
 use bytes::Bytes;
 use std::time::Duration;
 
@@ -16,6 +17,8 @@ pub(in crate::runtime) struct DatagramClientAssociation {
     context: ClientPathContext,
     udp: Option<Box<UdpDatagramClientAssociation>>,
     tcp: Option<Box<TcpDatagramClientAssociation>>,
+    telemetry_flow: Option<ProductFlowLease>,
+    telemetry_counter: Option<ProductFlowCounter>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -60,7 +63,20 @@ impl DatagramClientAssociation {
             context,
             udp: None,
             tcp: None,
+            telemetry_flow: None,
+            telemetry_counter: None,
         })
+    }
+
+    fn ensure_product_flow(&mut self) {
+        if self.telemetry_counter.is_none() {
+            let flow = self
+                .context
+                .telemetry
+                .open_local_datagram_flow(Some(self.context.session_id));
+            self.telemetry_counter = Some(flow.counter());
+            self.telemetry_flow = Some(flow);
+        }
     }
 
     #[cfg(test)]
@@ -81,6 +97,11 @@ impl DatagramClientAssociation {
         ttl_ms: u32,
         route_hint: Option<RelayPathKey>,
     ) -> Result<Bytes, RuntimeError> {
+        self.ensure_product_flow();
+        self.telemetry_counter
+            .as_ref()
+            .expect("datagram telemetry counter initialized")
+            .record_datagram_to_peer(payload.len() as u64);
         let mut last_retryable_error = None;
         let product_deadline =
             tokio::time::Instant::now() + Duration::from_millis(u64::from(ttl_ms));
@@ -124,7 +145,13 @@ impl DatagramClientAssociation {
                         )
                         .await;
                     match result {
-                        Ok(response) => return Ok(response),
+                        Ok(response) => {
+                            self.telemetry_counter
+                                .as_ref()
+                                .expect("datagram telemetry counter initialized")
+                                .record_datagram_from_peer(response.len() as u64);
+                            return Ok(response);
+                        }
                         Err(DatagramUnderlaySendError::Timeout {
                             path_was_acked,
                             product_attempts,
@@ -181,7 +208,13 @@ impl DatagramClientAssociation {
                         )
                         .await;
                     match result {
-                        Ok(response) => return Ok(response),
+                        Ok(response) => {
+                            self.telemetry_counter
+                                .as_ref()
+                                .expect("datagram telemetry counter initialized")
+                                .record_datagram_from_peer(response.len() as u64);
+                            return Ok(response);
+                        }
                         Err(DatagramUnderlaySendError::Timeout {
                             path_was_acked,
                             product_attempts,
@@ -342,7 +375,14 @@ impl DatagramClientAssociation {
         } else {
             Ok(())
         };
-        udp_result.and(tcp_result)
+        let result = udp_result.and(tcp_result);
+        if result.is_ok() {
+            self.telemetry_counter = None;
+            if let Some(flow) = self.telemetry_flow.take() {
+                flow.complete();
+            }
+        }
+        result
     }
 }
 
@@ -359,7 +399,7 @@ fn datagram_underlay_candidates(
     let mut candidates = Vec::new();
 
     if let Some(path_index) = context
-        .ordered_tcp_path_indices(FlowLane::RealtimeDatagram, payload_bytes)
+        .ordered_tcp_path_indices(TrafficClass::RealtimeDatagram, payload_bytes)
         .first()
         .copied()
     {
@@ -368,7 +408,7 @@ fn datagram_underlay_candidates(
             index: path_index,
         };
         if let Some(eta_ms) =
-            context.reliable_relay_path_eta_ms(key, FlowLane::RealtimeDatagram, payload_bytes)
+            context.reliable_relay_path_eta_ms(key, TrafficClass::RealtimeDatagram, payload_bytes)
             && eta_ms <= freshness_budget_ms
         {
             candidates.push(DatagramUnderlayCandidate { key, eta_ms });
@@ -390,8 +430,15 @@ fn datagram_underlay_candidates(
     }
 
     candidates.sort_by(|left, right| {
-        left.eta_ms
-            .total_cmp(&right.eta_ms)
+        let left_backup = context
+            .reliable_path_snapshot(left.key)
+            .is_some_and(path_is_backup);
+        let right_backup = context
+            .reliable_path_snapshot(right.key)
+            .is_some_and(path_is_backup);
+        left_backup
+            .cmp(&right_backup)
+            .then_with(|| left.eta_ms.total_cmp(&right.eta_ms))
             .then_with(|| {
                 context
                     .relay_path_config_ordinal(left.key)

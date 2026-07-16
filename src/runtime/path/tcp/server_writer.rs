@@ -1,15 +1,13 @@
 //! Serialized output primitives for a server TCP carrier.
 //!
 //! One owner preserves frame order, proof timestamps, batching, and the
-//! exclusive typed-capacity write on TCP's ordered byte stream. The session
-//! actor retains command and lifecycle orchestration.
+//! request-capacity receipts on TCP's ordered byte stream. The session actor
+//! retains command and lifecycle orchestration.
 
 use super::io::{EncryptedTcpWriter, encrypted_framed_peer_closed};
 use super::server_evidence::ServerTcpEvidenceState;
 use crate::protocol::Frame;
 use crate::runtime::error::RuntimeError;
-use crate::runtime::path::commands::TcpCapacityProbeCommand;
-use bytes::Bytes;
 
 pub(super) struct ServerTcpWriter {
     pending_frames: Vec<Frame>,
@@ -79,34 +77,5 @@ impl ServerTcpWriter {
             Err(err) if encrypted_framed_peer_closed(&err) => Ok(false),
             Err(err) => Err(RuntimeError::Encrypted(err)),
         }
-    }
-
-    pub(super) async fn write_capacity_probe(
-        &mut self,
-        probe: &TcpCapacityProbeCommand,
-        max_payload_bytes: usize,
-    ) -> Result<bool, RuntimeError> {
-        let frame_payload_bytes = max_payload_bytes.max(1) as u64;
-        let mut remaining = probe.train_payload_bytes;
-        while remaining > 0 {
-            let payload_bytes = remaining.min(frame_payload_bytes) as usize;
-            if !self
-                .write_frame_unflushed(&Frame::PathCapacityData {
-                    path_id: probe.path_id,
-                    calibration_id: probe.calibration_id,
-                    payload: Bytes::from(vec![0u8; payload_bytes]),
-                })
-                .await?
-            {
-                return Ok(false);
-            }
-            remaining = remaining.saturating_sub(payload_bytes as u64);
-        }
-        self.write_frame(&Frame::PathCapacityFinish {
-            path_id: probe.path_id,
-            calibration_id: probe.calibration_id,
-            payload_bytes: probe.train_payload_bytes,
-        })
-        .await
     }
 }

@@ -12,8 +12,8 @@ use crate::runtime::path::commands::{
     try_recv_reliable_path_priority_command,
 };
 use crate::runtime::path::proof::PathProofTracker;
-use crate::runtime::relay::io::reliable_stream_recv_progress_interval;
-use crate::scheduler::{FlowLane, PathRateScope, PathSnapshot};
+use crate::runtime::stream::reliable_stream_recv_progress_interval;
+use crate::scheduler::{PathRateScope, PathSnapshot, TrafficClass};
 use bytes::Bytes;
 use std::sync::Arc;
 use std::time::Duration;
@@ -31,7 +31,7 @@ fn binding_for_underlay(
         underlay,
         key.path_id,
         commands,
-        FlowLane::Throughput,
+        TrafficClass::Throughput,
     );
     (binding, key)
 }
@@ -54,12 +54,12 @@ fn fixed_stream_ordered_path_proof_follows_earlier_stream_data() {
     let path_id = PathId(3);
     let (commands, mut receivers) = reliable_path_command_channels(4);
     commands
-        .try_enqueue_admitted_frame(stream_data_frame(32), FlowLane::Throughput)
+        .try_enqueue_admitted_frame(stream_data_frame(32), TrafficClass::Throughput)
         .expect("queue earlier stream data");
     let stream = ReliablePathStreamHandle {
         stream_id: StreamId(7),
         max_offset: u64::MAX,
-        lane: FlowLane::Throughput,
+        lane: TrafficClass::Throughput,
         underlay: UnderlayProtocol::Tcp,
         max_frame_payload_bytes: mux_limits.max_payload_bytes,
         output: ReliablePathStreamOutput::fixed(
@@ -71,7 +71,7 @@ fn fixed_stream_ordered_path_proof_follows_earlier_stream_data() {
     };
 
     let proof_id = stream
-        .enqueue_stream_ordered_path_proof(FlowLane::Throughput)
+        .enqueue_stream_ordered_path_proof(TrafficClass::Throughput)
         .expect("queue stream-ordered path proof")
         .expect("fixed output has a carrier path");
 
@@ -123,12 +123,12 @@ fn fixed_priority_path_proof_preserves_attachment_liveness_ordering() {
     let path_id = PathId(4);
     let (commands, mut receivers) = reliable_path_command_channels(4);
     commands
-        .try_enqueue_admitted_frame(stream_data_frame(32), FlowLane::Throughput)
+        .try_enqueue_admitted_frame(stream_data_frame(32), TrafficClass::Throughput)
         .expect("queue earlier stream data");
     let stream = ReliablePathStreamHandle {
         stream_id: StreamId(7),
         max_offset: u64::MAX,
-        lane: FlowLane::Throughput,
+        lane: TrafficClass::Throughput,
         underlay: UnderlayProtocol::Tcp,
         max_frame_payload_bytes: mux_limits.max_payload_bytes,
         output: ReliablePathStreamOutput::fixed(
@@ -167,7 +167,7 @@ fn switchable_stream_ordered_path_proof_keeps_no_fixed_carrier_semantics() {
     let stream = ReliablePathStreamHandle {
         stream_id: StreamId(7),
         max_offset: u64::MAX,
-        lane: FlowLane::Throughput,
+        lane: TrafficClass::Throughput,
         underlay: key.underlay,
         max_frame_payload_bytes: MuxLimits::default().max_payload_bytes,
         output: ReliablePathStreamOutput::Switchable(binding),
@@ -175,7 +175,7 @@ fn switchable_stream_ordered_path_proof_keeps_no_fixed_carrier_semantics() {
 
     assert_eq!(
         stream
-            .enqueue_stream_ordered_path_proof(FlowLane::Throughput)
+            .enqueue_stream_ordered_path_proof(TrafficClass::Throughput)
             .expect("switchable output is a successful no-op"),
         None
     );
@@ -200,7 +200,7 @@ fn tcp_fixed_output_startup_prior_yields_after_persistent_local_delivery_samples
     for _ in 0..RELIABLE_INITIAL_WINDOW_PACKETS {
         let frame = stream_data_frame_at(offset, MIN_RATE_SAMPLE_BYTES as usize);
         let end = offset + reliable_stream_frame_accounted_bytes(&frame) as u64;
-        fixed.record_owner_flight(&frame);
+        fixed.record_original_flight(&frame);
         std::thread::sleep(Duration::from_millis(20));
         fixed.release_normalized_acked_ranges(&[OffsetRange { start: offset, end }]);
         offset = end;
@@ -215,7 +215,7 @@ fn tcp_fixed_output_startup_prior_yields_after_persistent_local_delivery_samples
     assert!(learned_rate < startup_rate * 0.5);
 
     let snapshot = output
-        .send_path_snapshot(FlowLane::Throughput, MIN_RATE_SAMPLE_BYTES as usize)
+        .send_path_snapshot(TrafficClass::Throughput, MIN_RATE_SAMPLE_BYTES as usize)
         .expect("response binding exposes learned path model");
     assert!(
         snapshot.delivery_rate_bps < startup_rate * 0.5,
@@ -225,23 +225,23 @@ fn tcp_fixed_output_startup_prior_yields_after_persistent_local_delivery_samples
 }
 
 #[test]
-fn fixed_output_request_active_snapshot_preserves_send_path_timing() {
+fn fixed_output_request_feedback_snapshot_preserves_send_path_timing() {
     let mux_limits = MuxLimits::default();
     let (commands, _receivers) = reliable_path_command_channels(8);
     let startup = PathSnapshot::new(PathId(9), UnderlayProtocol::Tcp, 123.0, 8_000_000.0);
     let output = ReliablePathStreamOutput::fixed_with_snapshot(startup, commands, mux_limits);
     let send_snapshot = output
-        .send_path_snapshot(FlowLane::Latency, PATH_OPEN_SCORE_BYTES)
+        .send_path_snapshot(TrafficClass::Latency, PATH_OPEN_SCORE_BYTES)
         .expect("fixed output has a send path snapshot");
-    let request_active_snapshot = output
-        .request_active_path_snapshot(FlowLane::Latency)
-        .expect("fixed output has a request Active path snapshot");
+    let request_feedback_snapshot = output
+        .request_feedback_path_snapshot(TrafficClass::Latency)
+        .expect("fixed output has a request-feedback path snapshot");
 
-    assert_eq!(request_active_snapshot.id, send_snapshot.id);
-    assert_eq!(request_active_snapshot.underlay, send_snapshot.underlay);
-    assert_eq!(request_active_snapshot.srtt_ms, send_snapshot.srtt_ms);
+    assert_eq!(request_feedback_snapshot.id, send_snapshot.id);
+    assert_eq!(request_feedback_snapshot.underlay, send_snapshot.underlay);
+    assert_eq!(request_feedback_snapshot.srtt_ms, send_snapshot.srtt_ms);
     assert_eq!(
-        reliable_stream_recv_progress_interval(Some(request_active_snapshot)),
+        reliable_stream_recv_progress_interval(Some(request_feedback_snapshot)),
         reliable_stream_recv_progress_interval(Some(send_snapshot)),
         "fixed-path replay cadence must remain unchanged"
     );

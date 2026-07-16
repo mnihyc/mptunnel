@@ -1,14 +1,17 @@
 use super::{
     AuthNonce, AuthTag, CloseReason, DatagramFlowId, DatagramId, Frame, OffsetRange, PathId,
-    PathMetricDirection, PathMetrics, PathStatus, ResetReason, SessionId, StreamDemandHint,
-    StreamId, StreamOpenRole, TargetAddr, UnderlayProtocol,
+    PathMetricDirection, PathMetrics, PathUsage, PeerPathState, PeerPathStatus, PeerStatusCode,
+    ResetReason, SessionId, StreamDemandHint, StreamId, TargetAddr, UnderlayProtocol,
 };
 use bytes::Bytes;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 
 const MAGIC: &[u8; 4] = b"MPTF";
-const VERSION: u8 = 1;
+const VERSION: u8 = 2;
 pub const FRAME_HEADER_LEN: usize = 10;
+const PATH_METRICS_ENCODED_LEN: usize = 104;
+const PEER_PATH_STATUS_ENCODED_LEN: usize = 2 + PATH_METRICS_ENCODED_LEN;
+const PEER_STATUS_RESPONSE_FIXED_PAYLOAD_LEN: usize = 11;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct CodecLimits {
@@ -27,6 +30,14 @@ impl Default for CodecLimits {
             max_host_bytes: 255,
         }
     }
+}
+
+pub(crate) fn peer_status_response_path_limit(limits: CodecLimits) -> usize {
+    let frame_limit = limits
+        .max_frame_bytes
+        .saturating_sub(FRAME_HEADER_LEN + PEER_STATUS_RESPONSE_FIXED_PAYLOAD_LEN)
+        / PEER_PATH_STATUS_ENCODED_LEN;
+    frame_limit.min(usize::from(u16::MAX))
 }
 
 pub fn encode_frame(frame: &Frame, limits: CodecLimits) -> Result<Vec<u8>, CodecError> {
@@ -113,6 +124,8 @@ fn encoded_payload_capacity_hint(frame: &Frame) -> usize {
             payload.len().saturating_add(16)
         }
         Frame::StreamAck { ranges, .. } => 16usize.saturating_add(ranges.len().saturating_mul(16)),
+        Frame::PeerStatusResponse { paths, .. } => PEER_STATUS_RESPONSE_FIXED_PAYLOAD_LEN
+            .saturating_add(paths.len().saturating_mul(PEER_PATH_STATUS_ENCODED_LEN)),
         Frame::OpenStream { .. } => 128,
         _ => 64,
     }
@@ -245,19 +258,14 @@ fn encode_payload(
             encode_auth_tag(out, *auth_tag);
             Ok(FrameKind::PathJoin)
         }
-        Frame::PathJoinOk {
+        Frame::PathStatus {
             path_id,
-            nonce,
-            auth_tag,
+            sequence,
+            usage,
         } => {
             put_u16(out, path_id.0);
-            encode_nonce(out, *nonce);
-            encode_auth_tag(out, *auth_tag);
-            Ok(FrameKind::PathJoinOk)
-        }
-        Frame::PathStatus { path_id, status } => {
-            put_u16(out, path_id.0);
-            put_u8(out, path_status_to_u8(*status));
+            put_u64(out, *sequence);
+            put_u8(out, path_usage_to_u8(*usage));
             Ok(FrameKind::PathStatus)
         }
         Frame::PathDrain { path_id } => {
@@ -293,33 +301,33 @@ fn encode_payload(
         }
         Frame::PathCapacityData {
             path_id,
-            calibration_id,
+            measurement_id,
             payload,
         } => {
             encode_payload_bytes_len(payload.len(), limits)?;
             put_u16(out, path_id.0);
-            put_u64(out, *calibration_id);
+            put_u64(out, *measurement_id);
             put_u32(out, payload.len() as u32);
             out.extend_from_slice(payload);
             Ok(FrameKind::PathCapacityData)
         }
         Frame::PathCapacityFinish {
             path_id,
-            calibration_id,
+            measurement_id,
             payload_bytes,
         } => {
             put_u16(out, path_id.0);
-            put_u64(out, *calibration_id);
+            put_u64(out, *measurement_id);
             put_u64(out, *payload_bytes);
             Ok(FrameKind::PathCapacityFinish)
         }
         Frame::PathCapacityReceipt {
             path_id,
-            calibration_id,
+            measurement_id,
             received_payload_bytes,
         } => {
             put_u16(out, path_id.0);
-            put_u64(out, *calibration_id);
+            put_u64(out, *measurement_id);
             put_u64(out, *received_payload_bytes);
             Ok(FrameKind::PathCapacityReceipt)
         }
@@ -327,12 +335,10 @@ fn encode_payload(
             stream_id,
             target,
             demand,
-            role,
         } => {
             put_u64(out, stream_id.0);
             encode_target(out, target, limits)?;
             encode_stream_demand_hint(out, *demand);
-            put_u8(out, stream_open_role_to_u8(*role));
             Ok(FrameKind::OpenStream)
         }
         Frame::StreamData {
@@ -430,6 +436,26 @@ fn encode_payload(
             encode_path_metrics(out, *metrics);
             Ok(FrameKind::PathMetrics)
         }
+        Frame::PeerStatusRequest { request_id } => {
+            put_u64(out, *request_id);
+            Ok(FrameKind::PeerStatusRequest)
+        }
+        Frame::PeerStatusResponse {
+            request_id,
+            code,
+            paths,
+        } => {
+            let path_count = u16::try_from(paths.len()).map_err(|_| CodecError::LengthOverflow)?;
+            put_u64(out, *request_id);
+            put_u8(out, peer_status_code_to_u8(*code));
+            put_u16(out, path_count);
+            for path in paths {
+                put_u8(out, peer_path_state_to_u8(path.state));
+                put_u8(out, path_usage_to_u8(path.usage));
+                encode_path_metrics(out, path.metrics);
+            }
+            Ok(FrameKind::PeerStatusResponse)
+        }
         Frame::Ping { nonce } => {
             put_u64(out, *nonce);
             Ok(FrameKind::Ping)
@@ -468,14 +494,10 @@ fn decode_payload(
             issued_at_unix_secs: reader.get_u64()?,
             auth_tag: decode_auth_tag(reader)?,
         }),
-        FrameKind::PathJoinOk => Ok(Frame::PathJoinOk {
-            path_id: PathId(reader.get_u16()?),
-            nonce: decode_nonce(reader)?,
-            auth_tag: decode_auth_tag(reader)?,
-        }),
         FrameKind::PathStatus => Ok(Frame::PathStatus {
             path_id: PathId(reader.get_u16()?),
-            status: path_status_from_u8(reader.get_u8()?)?,
+            sequence: reader.get_u64()?,
+            usage: path_usage_from_u8(reader.get_u8()?)?,
         }),
         FrameKind::PathDrain => Ok(Frame::PathDrain {
             path_id: PathId(reader.get_u16()?),
@@ -501,29 +523,28 @@ fn decode_payload(
         }),
         FrameKind::PathCapacityData => {
             let path_id = PathId(reader.get_u16()?);
-            let calibration_id = reader.get_u64()?;
+            let measurement_id = reader.get_u64()?;
             let payload = reader.get_bytes_u32(limits.max_payload_bytes)?;
             Ok(Frame::PathCapacityData {
                 path_id,
-                calibration_id,
+                measurement_id,
                 payload,
             })
         }
         FrameKind::PathCapacityFinish => Ok(Frame::PathCapacityFinish {
             path_id: PathId(reader.get_u16()?),
-            calibration_id: reader.get_u64()?,
+            measurement_id: reader.get_u64()?,
             payload_bytes: reader.get_u64()?,
         }),
         FrameKind::PathCapacityReceipt => Ok(Frame::PathCapacityReceipt {
             path_id: PathId(reader.get_u16()?),
-            calibration_id: reader.get_u64()?,
+            measurement_id: reader.get_u64()?,
             received_payload_bytes: reader.get_u64()?,
         }),
         FrameKind::OpenStream => Ok(Frame::OpenStream {
             stream_id: StreamId(reader.get_u64()?),
             target: decode_target(reader, limits)?,
             demand: decode_stream_demand_hint(reader)?,
-            role: stream_open_role_from_u8(reader.get_u8()?)?,
         }),
         FrameKind::StreamData => {
             let stream_id = StreamId(reader.get_u64()?);
@@ -605,6 +626,33 @@ fn decode_payload(
         FrameKind::PathMetrics => Ok(Frame::PathMetrics {
             metrics: decode_path_metrics(reader)?,
         }),
+        FrameKind::PeerStatusRequest => Ok(Frame::PeerStatusRequest {
+            request_id: reader.get_u64()?,
+        }),
+        FrameKind::PeerStatusResponse => {
+            let request_id = reader.get_u64()?;
+            let code = peer_status_code_from_u8(reader.get_u8()?)?;
+            let path_count = reader.get_u16()? as usize;
+            let required_path_bytes = path_count
+                .checked_mul(PEER_PATH_STATUS_ENCODED_LEN)
+                .ok_or(CodecError::LengthOverflow)?;
+            if required_path_bytes > reader.remaining() {
+                return Err(CodecError::UnexpectedEof);
+            }
+            let mut paths = Vec::with_capacity(path_count);
+            for _ in 0..path_count {
+                paths.push(PeerPathStatus {
+                    state: peer_path_state_from_u8(reader.get_u8()?)?,
+                    usage: path_usage_from_u8(reader.get_u8()?)?,
+                    metrics: decode_path_metrics(reader)?,
+                });
+            }
+            Ok(Frame::PeerStatusResponse {
+                request_id,
+                code,
+                paths,
+            })
+        }
         FrameKind::Ping => Ok(Frame::Ping {
             nonce: reader.get_u64()?,
         }),
@@ -900,6 +948,10 @@ impl<'a> Reader<'a> {
         }
     }
 
+    fn remaining(&self) -> usize {
+        self.bytes.len() - self.pos
+    }
+
     fn get_u8(&mut self) -> Result<u8, CodecError> {
         Ok(self.get_exact(1)?[0])
     }
@@ -986,7 +1038,7 @@ enum FrameKind {
     Ping = 16,
     Pong = 17,
     SessionAuth = 18,
-    PathJoinOk = 19,
+    // 19 is reserved for the unused PATH_JOIN_OK draft frame.
     PathStatus = 20,
     PathDrain = 21,
     PathClose = 22,
@@ -1001,6 +1053,8 @@ enum FrameKind {
     PathCapacityData = 33,
     PathCapacityFinish = 34,
     PathCapacityReceipt = 35,
+    PeerStatusRequest = 36,
+    PeerStatusResponse = 37,
 }
 
 impl FrameKind {
@@ -1021,7 +1075,6 @@ impl FrameKind {
             16 => Ok(Self::Ping),
             17 => Ok(Self::Pong),
             18 => Ok(Self::SessionAuth),
-            19 => Ok(Self::PathJoinOk),
             20 => Ok(Self::PathStatus),
             21 => Ok(Self::PathDrain),
             22 => Ok(Self::PathClose),
@@ -1034,6 +1087,8 @@ impl FrameKind {
             33 => Ok(Self::PathCapacityData),
             34 => Ok(Self::PathCapacityFinish),
             35 => Ok(Self::PathCapacityReceipt),
+            36 => Ok(Self::PeerStatusRequest),
+            37 => Ok(Self::PeerStatusResponse),
             _ => Err(CodecError::UnknownKind(value)),
         }
     }
@@ -1077,38 +1132,53 @@ fn decode_bool(value: u8) -> Result<bool, CodecError> {
     }
 }
 
-fn path_status_to_u8(value: PathStatus) -> u8 {
+fn path_usage_to_u8(value: PathUsage) -> u8 {
     match value {
-        PathStatus::Active => 1,
-        PathStatus::Suspect => 2,
-        PathStatus::Draining => 3,
-        PathStatus::Failed => 4,
+        PathUsage::Available => 0,
+        PathUsage::Backup => 1,
     }
 }
 
-fn path_status_from_u8(value: u8) -> Result<PathStatus, CodecError> {
+fn path_usage_from_u8(value: u8) -> Result<PathUsage, CodecError> {
     match value {
-        1 => Ok(PathStatus::Active),
-        2 => Ok(PathStatus::Suspect),
-        3 => Ok(PathStatus::Draining),
-        4 => Ok(PathStatus::Failed),
+        0 => Ok(PathUsage::Available),
+        1 => Ok(PathUsage::Backup),
         _ => Err(CodecError::InvalidEnum),
     }
 }
 
-fn stream_open_role_to_u8(value: StreamOpenRole) -> u8 {
+fn peer_status_code_to_u8(value: PeerStatusCode) -> u8 {
     match value {
-        StreamOpenRole::Active => 1,
-        StreamOpenRole::Repair => 2,
-        StreamOpenRole::Validation => 3,
+        PeerStatusCode::Ok => 0,
+        PeerStatusCode::Disabled => 1,
+        PeerStatusCode::Unavailable => 2,
     }
 }
 
-fn stream_open_role_from_u8(value: u8) -> Result<StreamOpenRole, CodecError> {
+fn peer_status_code_from_u8(value: u8) -> Result<PeerStatusCode, CodecError> {
     match value {
-        1 => Ok(StreamOpenRole::Active),
-        2 => Ok(StreamOpenRole::Repair),
-        3 => Ok(StreamOpenRole::Validation),
+        0 => Ok(PeerStatusCode::Ok),
+        1 => Ok(PeerStatusCode::Disabled),
+        2 => Ok(PeerStatusCode::Unavailable),
+        _ => Err(CodecError::InvalidEnum),
+    }
+}
+
+fn peer_path_state_to_u8(value: PeerPathState) -> u8 {
+    match value {
+        PeerPathState::Active => 0,
+        PeerPathState::Suspect => 1,
+        PeerPathState::Draining => 2,
+        PeerPathState::Failed => 3,
+    }
+}
+
+fn peer_path_state_from_u8(value: u8) -> Result<PeerPathState, CodecError> {
+    match value {
+        0 => Ok(PeerPathState::Active),
+        1 => Ok(PeerPathState::Suspect),
+        2 => Ok(PeerPathState::Draining),
+        3 => Ok(PeerPathState::Failed),
         _ => Err(CodecError::InvalidEnum),
     }
 }

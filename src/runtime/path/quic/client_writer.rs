@@ -14,15 +14,16 @@ use crate::protocol::codec::CodecLimits;
 use crate::protocol::{Frame, StreamId, UnderlayProtocol};
 use crate::runtime::error::RuntimeError;
 use crate::runtime::path::commands::{
-    CapacityProbeCommandResolution, QuicCapacityProbeOwner, ReliablePathCommand,
-    ReliablePathCommandReceivers, reliable_path_command_pending_bytes,
-    reliable_path_command_writer_run_budget_bytes, reliable_path_command_writer_run_budget_items,
-    reliable_path_command_writer_run_bytes, reliable_path_frame_requires_capacity_command,
-    try_coalesce_reliable_path_writer_run, try_recv_reliable_path_command,
+    CapacityProbeCommandResolution, ReliablePathCommand, ReliablePathCommandReceivers,
+    reliable_path_command_pending_bytes, reliable_path_command_writer_run_budget_bytes,
+    reliable_path_command_writer_run_budget_items, reliable_path_command_writer_run_bytes,
+    reliable_path_frame_requires_capacity_command, try_coalesce_reliable_path_writer_run,
+    try_recv_reliable_path_command,
 };
 use crate::runtime::path::proof::PathProofTracker;
 use std::time::Instant;
 
+#[allow(clippy::too_many_arguments)]
 pub(super) async fn drain_client_udp_stream_commands(
     first_command: ReliablePathCommand,
     commands: &mut ReliablePathCommandReceivers,
@@ -124,20 +125,9 @@ pub(super) async fn drain_client_udp_stream_commands(
                 continue;
             }
             ReliablePathCommand::SendQuicCapacityProbe(mut probe) => {
-                let QuicCapacityProbeOwner::Request {
-                    stream_id: owner_stream_id,
-                    path_instance,
-                } = probe.owner
-                else {
-                    probe.ticket.cancel();
-                    commands.release_pending_command_bytes(pending_bytes);
-                    return Err(RuntimeError::Protocol(
-                        "client QUIC path received server response capacity command",
-                    ));
-                };
-                if owner_stream_id != stream_id
-                    || path_instance.key.underlay != UnderlayProtocol::Udp
-                    || path_instance.key.index != usize::from(probe.path_id.0)
+                if probe.stream_id != stream_id
+                    || probe.path_instance.key.underlay != UnderlayProtocol::Udp
+                    || probe.path_instance.key.index != usize::from(probe.path_id.0)
                 {
                     probe.ticket.cancel();
                     commands.release_pending_command_bytes(pending_bytes);
@@ -169,7 +159,7 @@ pub(super) async fn drain_client_udp_stream_commands(
                 };
                 commands.release_pending_command_bytes(pending_bytes);
                 let Some(result) = result else {
-                    let _ = send.connection.cancel_capacity_probe(probe.calibration_id);
+                    let _ = send.connection.cancel_capacity_probe(probe.measurement_id);
                     return Ok(false);
                 };
                 if let Err(err) = result {
@@ -182,7 +172,7 @@ pub(super) async fn drain_client_udp_stream_commands(
                 probe.disarm_drop_cancellation();
                 let cancellation_connection = send.connection.clone();
                 let cancellation_ticket = probe.ticket.clone();
-                let cancellation_token = probe.calibration_id;
+                let cancellation_token = probe.measurement_id;
                 tokio::spawn(async move {
                     if cancellation_ticket.resolved().await
                         == CapacityProbeCommandResolution::Cancelled
@@ -192,13 +182,13 @@ pub(super) async fn drain_client_udp_stream_commands(
                 });
                 #[cfg(feature = "lab-diagnostics")]
                 lab_diagnostic(
-                    "request_quic_capacity_calibration",
+                    "request_quic_capacity_measurement",
                     format_args!(
-                        "phase=written stream_id={} path_index={} instance_id={} calibration_id={} train_bytes={}",
+                        "phase=written stream_id={} path_index={} instance_id={} measurement_id={} train_bytes={}",
                         stream_id.0,
-                        path_instance.key.index,
-                        path_instance.id,
-                        probe.calibration_id,
+                        probe.path_instance.key.index,
+                        probe.path_instance.attachment_id,
+                        probe.measurement_id,
                         probe.train_payload_bytes,
                     ),
                 );

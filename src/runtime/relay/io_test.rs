@@ -1,7 +1,24 @@
 use super::*;
-use crate::model::capacity::BBR_MAX_SEND_QUANTUM_BYTES;
+use crate::model::capacity::{
+    MAX_RELIABLE_SERVICE_QUANTUM_BYTES, PATH_OPEN_SCORE_BYTES,
+    QUIC_PERSISTENT_CONGESTION_THRESHOLD, adaptive_reliable_relay_inflight_bytes,
+    adaptive_reliable_relay_reinjection_bytes, reliable_bulk_carrier_feed_quantum_bytes,
+    reliable_relay_buffer_len,
+};
+use crate::model::path::{CarrierPathInstanceId, RelayPathInstance, RelayPathKey};
+use crate::model::timing::{
+    reliable_ack_gap_reinjection_batch_lifetime, transport_pto_from_snapshot,
+};
+use crate::model::work::{
+    reliable_critical_tail_reinjection_limit_bytes,
+    reliable_failed_original_reinjection_limit_bytes,
+    reliable_persistent_ack_gap_reinjection_limit_bytes,
+};
+use crate::mux::MuxLimits;
 use crate::protocol::frame::reliable_stream_frame_extent;
 use crate::protocol::{PathId, StreamId};
+use crate::runtime::stream::reliable_stream_recv_progress_interval;
+use crate::scheduler::TrafficClass;
 
 #[test]
 fn stream_fin_waits_for_final_offset_before_close() {
@@ -26,25 +43,11 @@ fn stream_fin_waits_for_final_offset_before_close() {
 }
 
 #[test]
-fn terminal_fin_replay_requires_sent_fin_and_completed_owner_bytes() {
-    assert!(!stream_terminal_fin_replay_required(
-        false, false, true, 0, 64, 64,
-    ));
-    assert!(!stream_terminal_fin_replay_required(
-        true, true, true, 0, 64, 64,
-    ));
-    assert!(!stream_terminal_fin_replay_required(
-        true, false, false, 0, 64, 64,
-    ));
-    assert!(!stream_terminal_fin_replay_required(
-        true, false, true, 1, 64, 64,
-    ));
-    assert!(!stream_terminal_fin_replay_required(
-        true, false, true, 0, 63, 64,
-    ));
-    assert!(stream_terminal_fin_replay_required(
-        true, false, true, 0, 64, 64,
-    ));
+fn terminal_fin_replay_is_independent_of_payload_ack_progress() {
+    assert!(!stream_terminal_fin_replay_required(false, false, true));
+    assert!(!stream_terminal_fin_replay_required(true, true, true));
+    assert!(!stream_terminal_fin_replay_required(true, false, false));
+    assert!(stream_terminal_fin_replay_required(true, false, true));
 }
 
 #[test]
@@ -60,15 +63,15 @@ fn duplicate_stream_data_below_final_frontier_is_already_delivered() {
 }
 
 #[test]
-fn ack_gap_repair_requires_multipath_alternative_and_persistent_gap() {
-    assert!(!stream_ack_gap_repair_allowed(true, false, true));
-    assert!(!stream_ack_gap_repair_allowed(true, true, false));
-    assert!(stream_ack_gap_repair_allowed(true, true, true));
-    assert!(!stream_ack_gap_repair_allowed(false, true, true));
+fn ack_gap_reinjection_requires_multipath_alternative_and_persistent_gap() {
+    assert!(!stream_ack_gap_reinjection_allowed(true, false, true));
+    assert!(!stream_ack_gap_reinjection_allowed(true, true, false));
+    assert!(stream_ack_gap_reinjection_allowed(true, true, true));
+    assert!(!stream_ack_gap_reinjection_allowed(false, true, true));
 }
 
 #[test]
-fn ack_gap_repair_requires_authoritative_ack_gap_shape() {
+fn ack_gap_reinjection_requires_authoritative_ack_gap_shape() {
     assert!(!stream_ack_ranges_expose_authoritative_gap(
         false,
         &[
@@ -112,232 +115,25 @@ fn ack_gap_repair_requires_authoritative_ack_gap_shape() {
 }
 
 #[test]
-fn fixed_source_staging_keeps_the_existing_owner_tail_reservoir() {
-    let mux_limits = MuxLimits::default();
-    let payload = reliable_bulk_carrier_feed_quantum_bytes(mux_limits);
-    let horizon = bulk_service_horizon_payload_bytes(payload, mux_limits);
-    let reservoir = bulk_service_feed_reservoir_payload_bytes(payload, mux_limits);
-
-    assert_eq!(
-        reliable_relay_source_staging_owner_tail_headroom(
-            ReliableSourceStagingContext {
-                independent: false,
-                service: Some(ReliableSourceServiceStagingContext {
-                    allows_product_envelope: false,
-                    has_latency_pressure: false,
-                    has_feed_evidence: true,
-                }),
-            },
-            FlowLane::Throughput,
-            horizon,
-            0,
-            payload,
-            mux_limits,
-        ),
-        reservoir.saturating_sub(horizon),
-    );
-}
-
-#[test]
-fn proven_response_source_staging_uses_the_configured_product_envelope() {
-    let mut mux_limits = MuxLimits::default();
-    mux_limits.max_path_flight_bytes = 12 * 1024 * 1024;
-    mux_limits.max_reorder_bytes = 16 * 1024 * 1024;
-    mux_limits.max_stream_window_bytes = 20 * 1024 * 1024;
-    let payload = reliable_bulk_carrier_feed_quantum_bytes(mux_limits);
-    let owner_tail = 3 * 1024 * 1024;
-    let raw_queue = payload;
-    let envelope = bulk_service_product_envelope_payload_bytes(payload, mux_limits);
-
-    assert_eq!(
-        reliable_relay_source_staging_owner_tail_headroom(
-            ReliableSourceStagingContext {
-                independent: false,
-                service: Some(ReliableSourceServiceStagingContext {
-                    allows_product_envelope: true,
-                    has_latency_pressure: false,
-                    has_feed_evidence: true,
-                }),
-            },
-            FlowLane::Throughput,
-            owner_tail,
-            raw_queue,
-            payload,
-            mux_limits,
-        ),
-        envelope
-            .saturating_sub(owner_tail)
-            .saturating_sub(raw_queue),
-        "a proven coupled response may fill its configured product envelope"
-    );
-}
-
-#[test]
-fn coupled_source_staging_keeps_the_latency_pressure_horizon() {
-    let mux_limits = MuxLimits::default();
-    let payload = reliable_bulk_carrier_feed_quantum_bytes(mux_limits);
-    let horizon = bulk_service_horizon_payload_bytes(payload, mux_limits);
-
-    assert_eq!(
-        reliable_relay_source_staging_owner_tail_headroom(
-            ReliableSourceStagingContext {
-                independent: false,
-                service: Some(ReliableSourceServiceStagingContext {
-                    allows_product_envelope: true,
-                    has_latency_pressure: true,
-                    has_feed_evidence: true,
-                }),
-            },
-            FlowLane::Throughput,
-            horizon,
-            0,
-            payload,
-            mux_limits,
-        ),
-        0,
-    );
-}
-
-#[test]
-fn mixed_underlay_source_staging_is_independent_from_assigned_owner_tail() {
-    let mux_limits = MuxLimits::default();
-    let payload = reliable_bulk_carrier_feed_quantum_bytes(mux_limits);
-    let horizon = bulk_service_horizon_payload_bytes(payload, mux_limits);
-
-    assert_eq!(
-        reliable_relay_source_staging_owner_tail_headroom(
-            ReliableSourceStagingContext {
-                independent: true,
-                service: None,
-            },
-            FlowLane::Throughput,
-            usize::MAX,
-            0,
-            payload,
-            mux_limits,
-        ),
-        horizon,
-        "assigned owner tail must not consume the independent raw staging reservoir"
-    );
-    assert_eq!(
-        reliable_relay_source_staging_owner_tail_headroom(
-            ReliableSourceStagingContext {
-                independent: true,
-                service: None,
-            },
-            FlowLane::Throughput,
-            usize::MAX,
-            horizon,
-            payload,
-            mux_limits,
-        ),
-        0,
-        "unassigned raw staging remains bounded by its own reservoir"
-    );
-}
-
-#[test]
-fn mixed_underlay_source_staging_uses_mature_raw_reservoir() {
-    let mux_limits = MuxLimits::default();
-    let payload = reliable_bulk_carrier_feed_quantum_bytes(mux_limits);
-    let horizon = bulk_service_horizon_payload_bytes(payload, mux_limits);
-    let reservoir = bulk_service_feed_reservoir_payload_bytes(payload, mux_limits);
-
-    assert_eq!(
-        reliable_relay_source_staging_owner_tail_headroom(
-            ReliableSourceStagingContext {
-                independent: true,
-                service: Some(ReliableSourceServiceStagingContext {
-                    allows_product_envelope: true,
-                    has_latency_pressure: false,
-                    has_feed_evidence: true,
-                }),
-            },
-            FlowLane::Throughput,
-            usize::MAX,
-            horizon,
-            payload,
-            mux_limits,
-        ),
-        reservoir.saturating_sub(horizon),
-        "mature raw staging may use the feed reservoir without borrowing owner-tail credit"
-    );
-}
-
-#[test]
-fn mixed_underlay_source_staging_returns_to_horizon_under_latency_pressure() {
-    let mux_limits = MuxLimits::default();
-    let payload = reliable_bulk_carrier_feed_quantum_bytes(mux_limits);
-    let horizon = bulk_service_horizon_payload_bytes(payload, mux_limits);
-
-    assert_eq!(
-        reliable_relay_source_staging_owner_tail_headroom(
-            ReliableSourceStagingContext {
-                independent: true,
-                service: Some(ReliableSourceServiceStagingContext {
-                    allows_product_envelope: true,
-                    has_latency_pressure: true,
-                    has_feed_evidence: true,
-                }),
-            },
-            FlowLane::Throughput,
-            usize::MAX,
-            horizon.saturating_sub(payload),
-            payload,
-            mux_limits,
-        ),
-        payload,
-        "path-local latency pressure narrows independent raw staging back to the Service horizon"
-    );
-}
-
-#[test]
-fn full_confidence_progress_does_not_unlock_source_staging_without_bulk_evidence() {
-    let mux_limits = MuxLimits::default();
-    let payload = reliable_bulk_carrier_feed_quantum_bytes(mux_limits);
-    let reservoir = bulk_service_feed_reservoir_payload_bytes(payload, mux_limits);
-
-    assert_eq!(
-        reliable_relay_source_staging_owner_tail_headroom(
-            ReliableSourceStagingContext {
-                independent: false,
-                service: Some(ReliableSourceServiceStagingContext {
-                    allows_product_envelope: true,
-                    has_latency_pressure: false,
-                    has_feed_evidence: false,
-                }),
-            },
-            FlowLane::Throughput,
-            0,
-            0,
-            payload,
-            mux_limits,
-        ),
-        reservoir,
-        "product progress may bootstrap the bounded feed reservoir but cannot unlock the product envelope"
-    );
-}
-
-#[test]
 fn authoritative_ack_snapshot_does_not_regress_on_stale_or_incomplete_ack() {
     let mut frontier = 0;
     let mut ranges = Vec::new();
     let mut complete = false;
-    update_repair_authoritative_ack_snapshot(
+    update_reinjection_authoritative_ack_snapshot(
         &mut frontier,
         &mut ranges,
         &mut complete,
         true,
         &[OffsetRange { start: 0, end: 128 }],
     );
-    update_repair_authoritative_ack_snapshot(
+    update_reinjection_authoritative_ack_snapshot(
         &mut frontier,
         &mut ranges,
         &mut complete,
         true,
         &[OffsetRange { start: 0, end: 64 }],
     );
-    update_repair_authoritative_ack_snapshot(
+    update_reinjection_authoritative_ack_snapshot(
         &mut frontier,
         &mut ranges,
         &mut complete,
@@ -354,170 +150,263 @@ fn authoritative_ack_snapshot_does_not_regress_on_stale_or_incomplete_ack() {
 }
 
 #[test]
-fn persistent_ack_gap_repair_limit_uses_critical_event_quantum() {
+fn persistent_ack_gap_reinjection_limit_uses_critical_event_quantum() {
     let limits = MuxLimits::default();
-    let base_limit = BBR_MAX_SEND_QUANTUM_BYTES.min(reliable_relay_buffer_len(limits));
-    let repair_debt = base_limit.saturating_mul(32);
+    let base_limit = MAX_RELIABLE_SERVICE_QUANTUM_BYTES.min(reliable_relay_buffer_len(limits));
+    let reinjection_debt = base_limit.saturating_mul(32);
 
-    let repair_limit = reliable_critical_tail_repair_limit_bytes(base_limit, repair_debt, limits);
+    let reinjection_limit =
+        reliable_critical_tail_reinjection_limit_bytes(base_limit, reinjection_debt, limits);
 
     assert_eq!(
-        repair_limit, base_limit,
-        "persistent ACK-gap repair may bypass optional budget, but one event repairs only one bounded quantum"
+        reinjection_limit, base_limit,
+        "persistent ACK-gap reinjection may bypass optional budget, but one event reinjections only one bounded quantum"
     );
 }
 
 #[test]
-fn persistent_tcp_bulk_ack_gap_repair_uses_one_service_flight() {
+fn persistent_tcp_data_ack_gap_reinjection_uses_one_target_flight() {
     let limits = MuxLimits::default();
     let tcp = PathSnapshot::new(PathId(1), UnderlayProtocol::Tcp, 500.0, 400_000_000.0);
-    let repair_debt = limits.max_repair_bytes;
-    let base_limit = adaptive_reliable_relay_repair_bytes(Some(tcp), FlowLane::Throughput, limits);
-    let service_flight =
-        adaptive_reliable_relay_inflight_bytes(Some(tcp), FlowLane::Throughput, limits);
-    let repair_limit = reliable_persistent_ack_gap_repair_limit_bytes(
+    let reinjection_debt = limits.max_repair_bytes;
+    let base_limit =
+        adaptive_reliable_relay_reinjection_bytes(Some(tcp), TrafficClass::Throughput, limits);
+    let target_flight =
+        adaptive_reliable_relay_inflight_bytes(Some(tcp), TrafficClass::Throughput, limits);
+    let reinjection_limit = reliable_persistent_ack_gap_reinjection_limit_bytes(
         Some(tcp),
         Some(UnderlayProtocol::Tcp),
-        FlowLane::Throughput,
-        repair_debt,
+        TrafficClass::Throughput,
+        reinjection_debt,
         limits,
     );
 
     assert_eq!(
-        repair_limit,
-        reliable_critical_tail_repair_limit_bytes(
-            service_flight.max(base_limit),
-            repair_debt,
+        reinjection_limit,
+        reliable_critical_tail_reinjection_limit_bytes(
+            target_flight.max(base_limit),
+            reinjection_debt,
             limits,
         )
     );
     assert!(
-        repair_limit > base_limit,
-        "a proven bulk TCP owner failure must not refill a large ordered hole one 64 KiB quantum per three-PTO interval"
+        reinjection_limit > base_limit,
+        "a proven bulk TCP original-transmission path failure must not refill a large ordered hole one 64 KiB quantum per three-PTO interval"
     );
 }
 
 #[test]
-fn persistent_tcp_bulk_ack_gap_repair_uses_remaining_service_headroom() {
+fn persistent_tcp_bulk_ack_gap_reinjection_retains_failure_quantum() {
     let limits = MuxLimits::default();
     let mut tcp = PathSnapshot::new(PathId(1), UnderlayProtocol::Tcp, 500.0, 400_000_000.0);
-    let service_flight =
-        adaptive_reliable_relay_inflight_bytes(Some(tcp), FlowLane::Throughput, limits);
+    let target_flight =
+        adaptive_reliable_relay_inflight_bytes(Some(tcp), TrafficClass::Throughput, limits);
+    let base_limit =
+        adaptive_reliable_relay_reinjection_bytes(Some(tcp), TrafficClass::Throughput, limits);
     let remaining = 32 * 1024;
-    tcp.product_bytes_in_flight = service_flight.saturating_sub(remaining) as u64;
+    tcp.data_level_bytes_in_flight = target_flight.saturating_sub(remaining) as u64;
 
     assert_eq!(
-        reliable_persistent_ack_gap_repair_limit_bytes(
+        reliable_persistent_ack_gap_reinjection_limit_bytes(
             Some(tcp),
             Some(UnderlayProtocol::Tcp),
-            FlowLane::Throughput,
+            TrafficClass::Throughput,
             limits.max_repair_bytes,
             limits,
         ),
-        remaining,
-        "a persistent repair event may fill only the selected output's remaining modeled service flight"
+        remaining.max(base_limit),
+        "failure reinjection fills modeled target path headroom without dropping below one bounded quantum"
     );
 
-    tcp.queue_bytes = service_flight as u64;
+    tcp.queue_bytes = target_flight as u64;
     assert_eq!(
-        reliable_persistent_ack_gap_repair_limit_bytes(
+        reliable_persistent_ack_gap_reinjection_limit_bytes(
             Some(tcp),
             Some(UnderlayProtocol::Tcp),
-            FlowLane::Throughput,
+            TrafficClass::Throughput,
             limits.max_repair_bytes,
             limits,
         ),
-        0,
-        "overlapping product/carrier queue debt at the service target blocks another amplified batch"
+        base_limit,
+        "stale alternate-flight debt must not suppress all recovery after a proven TCP original-transmission path failure"
     );
 }
 
 #[test]
-fn persistent_ack_gap_repair_keeps_udp_and_latency_event_bounded() {
+fn failed_original_reinjection_uses_available_target_flight() {
     let limits = MuxLimits::default();
-    let repair_debt = limits.max_repair_bytes;
-    for (underlay, lane) in [
-        (UnderlayProtocol::Udp, FlowLane::Throughput),
-        (UnderlayProtocol::Tcp, FlowLane::Latency),
-    ] {
-        let path = PathSnapshot::new(PathId(1), underlay, 500.0, 400_000_000.0);
-        let base_limit = adaptive_reliable_relay_repair_bytes(Some(path), lane, limits);
+    let mut tcp = PathSnapshot::new(PathId(1), UnderlayProtocol::Tcp, 500.0, 400_000_000.0);
+    let base_limit = reliable_bulk_carrier_feed_quantum_bytes(limits).max(
+        adaptive_reliable_relay_reinjection_bytes(Some(tcp), TrafficClass::Throughput, limits),
+    );
+    let target_flight =
+        adaptive_reliable_relay_inflight_bytes(Some(tcp), TrafficClass::Throughput, limits);
+    tcp.data_level_bytes_in_flight = target_flight as u64;
+    tcp.queue_bytes = target_flight as u64;
+    tcp.carrier_inflight_limit_bytes = PATH_OPEN_SCORE_BYTES as u64;
+    let congested_recovery_flight =
+        adaptive_reliable_relay_inflight_bytes(Some(tcp), TrafficClass::Throughput, limits);
+
+    assert_eq!(
+        reliable_failed_original_reinjection_limit_bytes(
+            Some(tcp),
+            limits.max_repair_bytes,
+            limits,
+        ),
+        reliable_critical_tail_reinjection_limit_bytes(base_limit, limits.max_repair_bytes, limits,),
+        "a full target retains one product work quantum while native congestion gates emission",
+    );
+    assert_eq!(
+        congested_recovery_flight, target_flight,
+        "carrier queue and congestion credit gate emission below MPP; they do not shrink the retained-data recovery window a second time"
+    );
+}
+
+#[test]
+fn failed_original_reinjection_is_transport_neutral_above_native_congestion() {
+    let limits = MuxLimits::default();
+    for underlay in [UnderlayProtocol::Tcp, UnderlayProtocol::Udp] {
+        let path = PathSnapshot::new(PathId(1), underlay, 40.0, 400_000_000.0);
+        let target_flight =
+            adaptive_reliable_relay_inflight_bytes(Some(path), TrafficClass::Throughput, limits);
         assert_eq!(
-            reliable_persistent_ack_gap_repair_limit_bytes(
+            reliable_failed_original_reinjection_limit_bytes(
                 Some(path),
-                Some(underlay),
-                lane,
-                repair_debt,
+                limits.max_repair_bytes,
                 limits,
             ),
-            reliable_critical_tail_repair_limit_bytes(base_limit, repair_debt, limits,),
-            "UDP/QUIC loss recovery and latency traffic retain one bounded product-repair event"
+            reliable_critical_tail_reinjection_limit_bytes(
+                target_flight,
+                limits.max_repair_bytes,
+                limits,
+            ),
+            "product reinjection is unified while each target retains native admission"
         );
     }
 }
 
 #[test]
-fn persistent_ack_gap_repair_limit_ignores_optional_budget_exhaustion() {
+fn ack_gap_reinjection_waits_for_a_persistent_connection_level_gap() {
+    let pto = transport_pto_from_snapshot(None);
+
+    assert_eq!(
+        reliable_ack_gap_reinjection_batch_lifetime(None),
+        pto.saturating_mul(QUIC_PERSISTENT_CONGESTION_THRESHOLD),
+        "native TCP and QUIC recovery run before connection-level reinjection",
+    );
+}
+
+#[test]
+fn persistent_ack_gap_reinjection_keeps_udp_event_bounded() {
     let limits = MuxLimits::default();
-    let base_limit = BBR_MAX_SEND_QUANTUM_BYTES.min(reliable_relay_buffer_len(limits));
+    let reinjection_debt = limits.max_repair_bytes;
+    let path = PathSnapshot::new(PathId(1), UnderlayProtocol::Udp, 500.0, 400_000_000.0);
+    let base_limit =
+        adaptive_reliable_relay_reinjection_bytes(Some(path), TrafficClass::Throughput, limits);
+    assert_eq!(
+        reliable_persistent_ack_gap_reinjection_limit_bytes(
+            Some(path),
+            Some(UnderlayProtocol::Udp),
+            TrafficClass::Throughput,
+            reinjection_debt,
+            limits,
+        ),
+        reliable_critical_tail_reinjection_limit_bytes(base_limit, reinjection_debt, limits,),
+        "QUIC original-transmission path loss retains one bounded product-reinjection event"
+    );
+}
+
+#[test]
+fn persistent_tcp_ack_gap_reinjection_uses_path_model_after_flow_demotes() {
+    let limits = MuxLimits::default();
+    let reinjection_debt = limits.max_repair_bytes;
+    let path = PathSnapshot::new(PathId(1), UnderlayProtocol::Tcp, 500.0, 400_000_000.0);
+    let base_limit =
+        adaptive_reliable_relay_reinjection_bytes(Some(path), TrafficClass::Latency, limits);
+    let target_flight =
+        adaptive_reliable_relay_inflight_bytes(Some(path), TrafficClass::Throughput, limits);
+    let reinjection_limit = reliable_persistent_ack_gap_reinjection_limit_bytes(
+        Some(path),
+        Some(UnderlayProtocol::Tcp),
+        TrafficClass::Latency,
+        reinjection_debt,
+        limits,
+    );
+
+    assert_eq!(
+        reinjection_limit,
+        reliable_critical_tail_reinjection_limit_bytes(
+            target_flight.max(base_limit),
+            reinjection_debt,
+            limits,
+        )
+    );
+    assert!(reinjection_limit > base_limit);
+}
+
+#[test]
+fn persistent_ack_gap_reinjection_limit_ignores_optional_budget_exhaustion() {
+    let limits = MuxLimits::default();
+    let base_limit = MAX_RELIABLE_SERVICE_QUANTUM_BYTES.min(reliable_relay_buffer_len(limits));
     let small_tail = base_limit.saturating_sub(1024).max(1);
 
-    let repair_limit = reliable_critical_tail_repair_limit_bytes(base_limit, small_tail, limits);
+    let reinjection_limit =
+        reliable_critical_tail_reinjection_limit_bytes(base_limit, small_tail, limits);
 
     assert_eq!(
-        repair_limit, small_tail,
-        "persistent ACK-gap repair is correctness repair and must not depend on optional duplicate/probe budget"
+        reinjection_limit, small_tail,
+        "persistent ACK-gap reinjection is correctness reinjection and must not depend on optional duplicate/probe budget"
     );
     assert_eq!(
-        reliable_critical_tail_repair_limit_bytes(
+        reliable_critical_tail_reinjection_limit_bytes(
             limits.max_repair_bytes.saturating_add(base_limit),
             limits.max_repair_bytes.saturating_add(base_limit),
             limits
         ),
         limits.max_repair_bytes.min(limits.max_path_flight_bytes),
-        "persistent ACK-gap repair remains bounded by configured repair/path-flight caps"
+        "persistent ACK-gap reinjection remains bounded by configured reinjection/path-flight caps"
     );
 }
 
 #[test]
-fn final_tail_critical_repair_limit_can_exceed_optional_budget() {
+fn final_tail_critical_reinjection_limit_can_exceed_optional_budget() {
     let limits = MuxLimits::default();
-    let base_limit = BBR_MAX_SEND_QUANTUM_BYTES.min(reliable_relay_buffer_len(limits));
+    let base_limit = MAX_RELIABLE_SERVICE_QUANTUM_BYTES.min(reliable_relay_buffer_len(limits));
     let resource_cap = limits.max_repair_bytes.min(limits.max_path_flight_bytes);
     let small_tail = base_limit.saturating_sub(1024).max(1);
-    let repair_debt = base_limit.saturating_mul(8);
+    let reinjection_debt = base_limit.saturating_mul(8);
 
     assert_eq!(
-        reliable_critical_tail_repair_limit_bytes(base_limit, small_tail, limits),
+        reliable_critical_tail_reinjection_limit_bytes(base_limit, small_tail, limits),
         small_tail,
-        "terminal owner-tail repair may close a retained final tail even after optional repair budget is exhausted"
+        "terminal original-transmission path-tail reinjection may close a retained final tail even after optional reinjection budget is exhausted"
     );
 
     assert_eq!(
-        reliable_critical_tail_repair_limit_bytes(base_limit, repair_debt, limits),
+        reliable_critical_tail_reinjection_limit_bytes(base_limit, reinjection_debt, limits),
         base_limit,
-        "terminal owner-tail repair keeps a bounded critical path for final stream closure"
+        "terminal original-transmission path-tail reinjection keeps a bounded critical path for final stream closure"
     );
     assert_eq!(
-        reliable_critical_tail_repair_limit_bytes(
+        reliable_critical_tail_reinjection_limit_bytes(
             resource_cap.saturating_add(base_limit),
             resource_cap.saturating_add(base_limit),
             limits
         ),
         resource_cap,
-        "critical final-tail repair remains bounded by configured repair resources"
+        "critical final-tail reinjection remains bounded by configured reinjection resources"
     );
 }
 
 #[test]
-fn ack_gap_repair_still_repairs_authoritative_ack_gap() {
+fn ack_gap_reinjection_still_reinjections_authoritative_ack_gap() {
     let limits = MuxLimits::default();
     let mut send_stream = ReliableSendStream::new(StreamId(9), limits);
     send_stream
         .send_data(Bytes::from_static(&[7; 4096]))
         .expect("send stream data");
 
-    let repair_frames = stream_ack_gap_repair_frames(
+    let reinjection_frames = stream_ack_gap_reinjection_frames(
         &send_stream,
         &[
             OffsetRange {
@@ -535,22 +424,22 @@ fn ack_gap_repair_still_repairs_authoritative_ack_gap() {
         true,
     );
 
-    assert_eq!(repair_frames.len(), 1);
+    assert_eq!(reinjection_frames.len(), 1);
     assert_eq!(
-        reliable_stream_frame_extent(&repair_frames[0]),
+        reliable_stream_frame_extent(&reinjection_frames[0]),
         Some((1024, 2048, 1024))
     );
 }
 
 #[test]
-fn final_offset_tail_repair_can_recover_unacked_terminal_tail() {
+fn final_offset_tail_reinjection_can_recover_unacked_terminal_tail() {
     let limits = MuxLimits::default();
     let mut send_stream = ReliableSendStream::new(StreamId(9), limits);
     send_stream
         .send_data(Bytes::from_static(&[7; 4096]))
         .expect("send stream data");
 
-    let repair_frames = stream_final_offset_tail_repair_frames_normalized(
+    let reinjection_frames = stream_final_offset_tail_reinjection_frames_normalized(
         &send_stream,
         &[OffsetRange {
             start: 0,
@@ -561,22 +450,22 @@ fn final_offset_tail_repair_can_recover_unacked_terminal_tail() {
         true,
     );
 
-    assert_eq!(repair_frames.len(), 1);
+    assert_eq!(reinjection_frames.len(), 1);
     assert_eq!(
-        reliable_stream_frame_extent(&repair_frames[0]),
+        reliable_stream_frame_extent(&reinjection_frames[0]),
         Some((1024, 4096, 3072))
     );
 }
 
 #[test]
-fn final_offset_tail_repair_can_use_service_when_no_alternate_survives() {
+fn final_offset_tail_reinjection_can_use_only_available_path() {
     let limits = MuxLimits::default();
     let mut send_stream = ReliableSendStream::new(StreamId(9), limits);
     send_stream
         .send_data(Bytes::from_static(&[7; 4096]))
         .expect("send stream data");
 
-    let repair_frames = stream_final_offset_tail_repair_frames_normalized(
+    let reinjection_frames = stream_final_offset_tail_reinjection_frames_normalized(
         &send_stream,
         &[OffsetRange {
             start: 0,
@@ -587,42 +476,42 @@ fn final_offset_tail_repair_can_use_service_when_no_alternate_survives() {
         true,
     );
 
-    assert_eq!(repair_frames.len(), 1);
+    assert_eq!(reinjection_frames.len(), 1);
     assert_eq!(
-        reliable_stream_frame_extent(&repair_frames[0]),
+        reliable_stream_frame_extent(&reinjection_frames[0]),
         Some((1024, 4096, 3072)),
-        "terminal final-tail RepairData is connection completion traffic and may use the Service survivor after stall evidence"
+        "terminal final-tail reinjection may use the only available path after stall evidence"
     );
 }
 
 #[test]
-fn final_offset_tail_repair_can_recover_tail_with_no_ack_frontier() {
+fn final_offset_tail_reinjection_can_recover_tail_with_no_ack_frontier() {
     let limits = MuxLimits::default();
     let mut send_stream = ReliableSendStream::new(StreamId(9), limits);
     send_stream
         .send_data(Bytes::from_static(&[7; 4096]))
         .expect("send stream data");
 
-    let repair_frames =
-        stream_final_offset_tail_repair_frames_normalized(&send_stream, &[], 4096, true, true);
+    let reinjection_frames =
+        stream_final_offset_tail_reinjection_frames_normalized(&send_stream, &[], 4096, true, true);
 
-    assert_eq!(repair_frames.len(), 1);
+    assert_eq!(reinjection_frames.len(), 1);
     assert_eq!(
-        reliable_stream_frame_extent(&repair_frames[0]),
+        reliable_stream_frame_extent(&reinjection_frames[0]),
         Some((0, 4096, 4096)),
-        "a closed stream with no response ACK frontier must be able to repair the retained owner tail from offset zero"
+        "a closed stream with no response ACK frontier must be able to reinjection the retained original-transmission path tail from offset zero"
     );
 }
 
 #[test]
-fn final_offset_tail_repair_waits_for_persistent_stall_evidence() {
+fn final_offset_tail_reinjection_waits_for_persistent_stall_evidence() {
     let limits = MuxLimits::default();
     let mut send_stream = ReliableSendStream::new(StreamId(9), limits);
     send_stream
         .send_data(Bytes::from_static(&[7; 4096]))
         .expect("send stream data");
 
-    let repair_frames = stream_final_offset_tail_repair_frames_normalized(
+    let reinjection_frames = stream_final_offset_tail_reinjection_frames_normalized(
         &send_stream,
         &[OffsetRange {
             start: 0,
@@ -634,14 +523,14 @@ fn final_offset_tail_repair_waits_for_persistent_stall_evidence() {
     );
 
     assert!(
-        repair_frames.is_empty(),
-        "known final offset is not enough to reinject a contiguous owner tail before persistent stall/failure evidence"
+        reinjection_frames.is_empty(),
+        "known final offset is not enough to reinject a contiguous original-transmission path tail before persistent stall/failure evidence"
     );
 }
 
 #[test]
-fn ack_gap_repair_progress_keeps_growing_hole_identity() {
-    let mut progress = ReliableAckGapRepairProgress::default();
+fn ack_gap_reinjection_progress_keeps_growing_hole_identity() {
+    let mut progress = ReliableAckGapReinjectionProgress::default();
     let first = [
         OffsetRange {
             start: 0,
@@ -664,60 +553,60 @@ fn ack_gap_repair_progress_keeps_growing_hole_identity() {
     ];
     let now = Instant::now();
     let interval = reliable_stream_recv_progress_interval(None);
-    let repair_delay = reliable_ack_gap_repair_delay(None);
+    let reinjection_delay = reliable_ack_gap_reinjection_batch_lifetime(None);
 
-    assert!(!progress.repair_ready_at(
+    assert!(!progress.reinjection_ready_at(
         true,
         &first,
         Some(UnderlayProtocol::Udp),
         true,
-        repair_delay,
+        reinjection_delay,
         now,
     ));
-    assert!(!progress.repair_ready_at(
+    assert!(!progress.reinjection_ready_at(
         true,
         &grown,
         Some(UnderlayProtocol::Udp),
         true,
-        repair_delay,
+        reinjection_delay,
         now + interval,
     ));
     assert!(
-        progress.repair_ready_at(
+        progress.reinjection_ready_at(
             true,
             &grown,
             Some(UnderlayProtocol::Udp),
             true,
-            repair_delay,
-            now + repair_delay,
+            reinjection_delay,
+            now + reinjection_delay,
         ),
         "a growing ACK horizon with the same missing frontier is one persistent hole"
     );
     assert!(
-        progress.repair_ready_at(
+        progress.reinjection_ready_at(
             true,
             &grown,
             Some(UnderlayProtocol::Udp),
             true,
-            repair_delay,
-            now + repair_delay + Duration::from_millis(1),
+            reinjection_delay,
+            now + reinjection_delay + Duration::from_millis(1),
         ),
-        "a ready gap is not throttled until at least one repair frame actually queues"
+        "a ready gap is not throttled until at least one reinjection frame actually queues"
     );
-    progress.record_repair_queued_at(now + repair_delay + Duration::from_millis(1));
-    assert!(!progress.repair_ready_at(
+    progress.record_reinjection_queued_at(now + reinjection_delay + Duration::from_millis(1));
+    assert!(!progress.reinjection_ready_at(
         true,
         &grown,
         Some(UnderlayProtocol::Udp),
         true,
-        repair_delay,
-        now + repair_delay + Duration::from_millis(2),
+        reinjection_delay,
+        now + reinjection_delay + Duration::from_millis(2),
     ));
 }
 
 #[test]
-fn ack_gap_repair_progress_resets_when_frontier_advances() {
-    let mut progress = ReliableAckGapRepairProgress::default();
+fn ack_gap_reinjection_progress_resets_when_frontier_advances() {
+    let mut progress = ReliableAckGapReinjectionProgress::default();
     let first = [
         OffsetRange {
             start: 0,
@@ -739,36 +628,36 @@ fn ack_gap_repair_progress_resets_when_frontier_advances() {
         },
     ];
     let now = Instant::now();
-    let repair_delay = reliable_ack_gap_repair_delay(None);
+    let reinjection_delay = reliable_ack_gap_reinjection_batch_lifetime(None);
 
-    assert!(!progress.repair_ready_at(
+    assert!(!progress.reinjection_ready_at(
         true,
         &first,
         Some(UnderlayProtocol::Udp),
         true,
-        repair_delay,
+        reinjection_delay,
         now,
     ));
-    assert!(!progress.repair_ready_at(
+    assert!(!progress.reinjection_ready_at(
         true,
         &advanced,
         Some(UnderlayProtocol::Udp),
         true,
-        repair_delay,
-        now + repair_delay,
+        reinjection_delay,
+        now + reinjection_delay,
     ));
-    assert!(progress.repair_ready_at(
+    assert!(progress.reinjection_ready_at(
         true,
         &advanced,
         Some(UnderlayProtocol::Udp),
         true,
-        repair_delay,
-        now + repair_delay + repair_delay,
+        reinjection_delay,
+        now + reinjection_delay + reinjection_delay,
     ));
 }
 
 #[test]
-fn ack_gap_repair_waits_for_persistent_gap_on_reliable_carriers() {
+fn ack_gap_reinjection_waits_for_persistent_gap_on_reliable_carriers() {
     let ranges = [
         OffsetRange {
             start: 0,
@@ -780,51 +669,181 @@ fn ack_gap_repair_waits_for_persistent_gap_on_reliable_carriers() {
         },
     ];
     let now = Instant::now();
-    let repair_delay =
+    let reinjection_delay =
         transport_pto_from_snapshot(None).saturating_mul(QUIC_PERSISTENT_CONGESTION_THRESHOLD);
 
     for underlay in [UnderlayProtocol::Tcp, UnderlayProtocol::Udp] {
-        let mut progress = ReliableAckGapRepairProgress::default();
-        assert!(!progress.repair_ready_at(true, &ranges, Some(underlay), true, repair_delay, now,));
-        assert!(!progress.repair_ready_at(
+        let mut progress = ReliableAckGapReinjectionProgress::default();
+        assert!(!progress.reinjection_ready_at(
             true,
             &ranges,
             Some(underlay),
             true,
-            repair_delay,
-            now + repair_delay - Duration::from_millis(1),
+            reinjection_delay,
+            now,
+        ));
+        assert!(!progress.reinjection_ready_at(
+            true,
+            &ranges,
+            Some(underlay),
+            true,
+            reinjection_delay,
+            now + reinjection_delay - Duration::from_millis(1),
         ));
         assert!(
-            progress.repair_ready_at(
+            progress.reinjection_ready_at(
                 true,
                 &ranges,
                 Some(underlay),
                 true,
-                repair_delay,
-                now + repair_delay,
+                reinjection_delay,
+                now + reinjection_delay,
             ),
-            "{underlay:?} product repair should wait for a persistent ordered-stream gap",
+            "{underlay:?} product reinjection should wait for a persistent ordered-stream gap",
         );
-        progress.record_repair_queued_at(now + repair_delay);
-        assert!(!progress.repair_ready_at(
+        progress.record_reinjection_queued_at(now + reinjection_delay);
+        assert!(!progress.reinjection_ready_at(
             true,
             &ranges,
             Some(underlay),
             true,
-            repair_delay,
-            now + repair_delay + Duration::from_millis(1),
+            reinjection_delay,
+            now + reinjection_delay + Duration::from_millis(1),
         ));
-        progress.release_repair_attempt();
+        progress.release_reinjection_attempt();
         assert!(
-            progress.repair_ready_at(
+            progress.reinjection_ready_at(
                 true,
                 &ranges,
                 Some(underlay),
                 true,
-                repair_delay,
-                now + repair_delay + Duration::from_millis(1),
+                reinjection_delay,
+                now + reinjection_delay + Duration::from_millis(1),
             ),
             "cancelling a queued batch makes the already-persistent gap immediately replannable",
         );
     }
+}
+
+#[test]
+fn request_path_staleness_requires_persistent_missing_data_ack_progress() {
+    let path = RelayPathInstance {
+        key: RelayPathKey {
+            underlay: UnderlayProtocol::Tcp,
+            index: 0,
+        },
+        path_instance_id: CarrierPathInstanceId::from_raw(7),
+        attachment_id: 7,
+    };
+    let now = Instant::now();
+    let persistence = Duration::from_millis(300);
+    let mut progress = ReliableRequestPathStaleness::default();
+
+    assert_eq!(
+        progress.stale_path_at(true, Some(path), false, true, persistence, now),
+        None
+    );
+    assert_eq!(
+        progress.stale_path_at(
+            true,
+            Some(path),
+            false,
+            true,
+            persistence,
+            now + persistence - Duration::from_millis(1),
+        ),
+        None
+    );
+    assert_eq!(
+        progress.stale_path_at(
+            true,
+            Some(path),
+            false,
+            true,
+            persistence,
+            now + persistence,
+        ),
+        Some(path)
+    );
+}
+
+#[test]
+fn request_path_staleness_resets_on_exact_data_ack_progress() {
+    let path = RelayPathInstance {
+        key: RelayPathKey {
+            underlay: UnderlayProtocol::Udp,
+            index: 1,
+        },
+        path_instance_id: CarrierPathInstanceId::from_raw(11),
+        attachment_id: 11,
+    };
+    let now = Instant::now();
+    let persistence = Duration::from_millis(200);
+    let mut progress = ReliableRequestPathStaleness::default();
+
+    assert_eq!(
+        progress.stale_path_at(true, Some(path), false, true, persistence, now),
+        None
+    );
+    assert_eq!(
+        progress.stale_path_at(true, Some(path), true, true, persistence, now + persistence,),
+        None
+    );
+    assert_eq!(
+        progress.stale_path_at(
+            true,
+            Some(path),
+            false,
+            true,
+            persistence,
+            now + persistence + persistence - Duration::from_millis(1),
+        ),
+        None
+    );
+    assert_eq!(
+        progress.stale_path_at(
+            true,
+            Some(path),
+            false,
+            true,
+            persistence,
+            now + persistence + persistence,
+        ),
+        Some(path)
+    );
+}
+
+#[test]
+fn partial_data_ack_does_not_erase_request_path_staleness_evidence() {
+    let path = RelayPathInstance {
+        key: RelayPathKey {
+            underlay: UnderlayProtocol::Tcp,
+            index: 2,
+        },
+        path_instance_id: CarrierPathInstanceId::from_raw(13),
+        attachment_id: 13,
+    };
+    let now = Instant::now();
+    let persistence = Duration::from_millis(100);
+    let mut progress = ReliableRequestPathStaleness::default();
+
+    assert_eq!(
+        progress.stale_path_at(true, Some(path), false, true, persistence, now),
+        None
+    );
+    assert_eq!(
+        progress.stale_path_at(false, None, false, false, persistence, now + persistence,),
+        None
+    );
+    assert_eq!(
+        progress.stale_path_at(
+            true,
+            Some(path),
+            false,
+            true,
+            persistence,
+            now + persistence,
+        ),
+        Some(path)
+    );
 }

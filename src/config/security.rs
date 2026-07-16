@@ -2,36 +2,6 @@ use sha2::{Digest, Sha256};
 use uuid::Uuid;
 
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
-pub enum EncryptionMode {
-    #[default]
-    Required,
-    AllowPlaintextLab,
-}
-
-impl EncryptionMode {
-    pub fn permits_plaintext(self) -> bool {
-        matches!(self, Self::AllowPlaintextLab)
-    }
-
-    pub fn plaintext_warning(self) -> Option<&'static str> {
-        self.permits_plaintext().then_some(
-            "plaintext transport is enabled for lab use; internal traffic is not confidential",
-        )
-    }
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum TransportSecurity {
-    Encrypted,
-    Plaintext,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum TransportIntegrity {
-    Authenticated,
-}
-
-#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
 pub enum CipherSuite {
     #[default]
     Aes256Gcm,
@@ -93,34 +63,8 @@ impl std::fmt::Debug for SharedSecret {
     }
 }
 
-pub fn validate_transport_security(
-    mode: EncryptionMode,
-    security: TransportSecurity,
-    integrity: TransportIntegrity,
-    secret: &SharedSecret,
-) -> Result<(), SecurityPolicyError> {
-    if !matches!(integrity, TransportIntegrity::Authenticated) {
-        return Err(SecurityPolicyError::IntegrityRequired);
-    }
-    if secret.as_bytes().len() < SharedSecret::DERIVED_BYTES {
-        return Err(SecurityPolicyError::SecretTooShort {
-            actual: secret.as_bytes().len(),
-            minimum: SharedSecret::DERIVED_BYTES,
-        });
-    }
-    match (mode, security) {
-        (_, TransportSecurity::Encrypted) => Ok(()),
-        (EncryptionMode::AllowPlaintextLab, TransportSecurity::Plaintext) => Ok(()),
-        (EncryptionMode::Required, TransportSecurity::Plaintext) => {
-            Err(SecurityPolicyError::PlaintextRejected)
-        }
-    }
-}
-
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SecurityPolicyError {
-    PlaintextRejected,
-    IntegrityRequired,
     MissingSecret,
     SecretTooShort { actual: usize, minimum: usize },
 }
@@ -128,10 +72,6 @@ pub enum SecurityPolicyError {
 impl std::fmt::Display for SecurityPolicyError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            Self::PlaintextRejected => {
-                write!(f, "plaintext transport requires explicit insecure lab mode")
-            }
-            Self::IntegrityRequired => write!(f, "session/path integrity is required"),
             Self::MissingSecret => write!(f, "shared secret is required"),
             Self::SecretTooShort { actual, minimum } => {
                 write!(

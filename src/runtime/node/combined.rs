@@ -25,6 +25,7 @@ pub(super) async fn run(
             resources,
             path_group_ordinal,
             carrier_network.clone(),
+            management.peer_diagnostics_enabled(),
         )?;
         path_probe_services.push((
             context.clone(),
@@ -45,7 +46,6 @@ pub(super) async fn run(
     for server_config in node.servers {
         let runtime = server::new_identity_runtime_with_metadata(
             server_config.tag,
-            server_config.route_target,
             server_config.bind_paths,
             server_config.outbound,
             server_config.outbound_dns,
@@ -53,6 +53,7 @@ pub(super) async fn run(
             server_config.security,
             server_config.performance,
             resources,
+            management.peer_diagnostics_enabled(),
         );
         let bound = server::bind_paths(&runtime.paths).await?;
         let server::ServerIdentityRuntime {
@@ -64,7 +65,7 @@ pub(super) async fn run(
         server_contexts.push(paths);
     }
 
-    if management.enabled() {
+    if management.http_enabled() {
         spawn_node_management_services(management, client_contexts, server_contexts, &mut services);
     }
 

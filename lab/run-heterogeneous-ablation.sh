@@ -73,12 +73,37 @@ tcp_echo_interval_ms="${TCP_ECHO_INTERVAL_MS:-500}"
 tcp_upload_target_port="${TCP_UPLOAD_TARGET_PORT:-10023}"
 tcp_sink_progress_file="/dev/shm/mptunnel-tcp-sink-progress.json"
 failover_after="${FAILOVER_AFTER_SECONDS:-2}"
-failover_fat_tx_trigger_bytes="${MPTUNNEL_LAB_FAILOVER_FAT_TX_TRIGGER_BYTES:-0}"
+failover_profile="${MPTUNNEL_LAB_FAILOVER_PROFILE:-fat}"
+failover_tx_trigger_bytes="${MPTUNNEL_LAB_FAILOVER_TX_TRIGGER_BYTES:-${MPTUNNEL_LAB_FAILOVER_FAT_TX_TRIGGER_BYTES:-0}}"
+case "$failover_profile" in
+  lowlat)
+    failover_client_address="172.31.10.10"
+    failover_server_address="172.31.10.20"
+    ;;
+  balanced)
+    failover_client_address="172.31.15.10"
+    failover_server_address="172.31.15.20"
+    ;;
+  fat)
+    failover_client_address="172.31.20.10"
+    failover_server_address="172.31.20.20"
+    ;;
+  poor)
+    failover_client_address="172.31.30.10"
+    failover_server_address="172.31.30.20"
+    ;;
+  *)
+    echo "MPTUNNEL_LAB_FAILOVER_PROFILE must be lowlat, balanced, fat, or poor" >&2
+    exit 2
+    ;;
+esac
 failover_trigger_timeout_seconds="${MPTUNNEL_LAB_FAILOVER_TRIGGER_TIMEOUT_SECONDS:-60}"
 failover_trigger_poll_interval_seconds="${MPTUNNEL_LAB_FAILOVER_TRIGGER_POLL_INTERVAL_SECONDS:-0.02}"
 build_product="${BUILD_PRODUCT:-1}"
 build_lab_images="${BUILD_LAB_IMAGES:-1}"
-lab_diagnostics="${MPTUNNEL_LAB_DIAGNOSTICS:-0}"
+# The public diagnostic switch also controls the compile-time feature. Keep the
+# longer legacy name as an override for existing lab invocations.
+lab_diagnostics="${MPTUNNEL_LAB_DIAGNOSTICS:-${MPTUNNEL_LAB_DIAG:-0}}"
 if flag_enabled "$lab_diagnostics"; then
   export MPTUNNEL_LAB_DIAG="${MPTUNNEL_LAB_DIAG:-1}"
 fi
@@ -114,6 +139,16 @@ if flag_enabled "$lab_perf"; then
 else
   log_tail_bytes="${MPTUNNEL_LAB_LOG_TAIL_BYTES:-4000}"
   log_tail_lines="${MPTUNNEL_LAB_LOG_TAIL_LINES:-120}"
+fi
+if [[ ! "$log_tail_bytes" =~ ^[0-9]+$ ]] || (( log_tail_bytes < 1 )); then
+  echo "MPTUNNEL_LAB_LOG_TAIL_BYTES must be a positive integer" >&2
+  exit 2
+fi
+# Embedded tails cross execve's per-string limit before the total ARG_MAX
+# limit. Full diagnostic logs remain available as per-case artifact files.
+if (( log_tail_bytes > 60000 )); then
+  echo "warning: clamping embedded log tail to 60000 bytes; full logs remain in RESULT_DIR" >&2
+  log_tail_bytes=60000
 fi
 case_filter="${CASE_FILTER:-}"
 client_start_settle_seconds="${CLIENT_START_SETTLE_SECONDS:-${CLIENT_SETTLE_SECONDS:-2}}"
@@ -1567,8 +1602,8 @@ apply_netem() {
 }
 
 apply_failover_blackhole() {
-  exec_netem client blackhole-fat
-  exec_netem server blackhole-fat
+  exec_netem client "blackhole-${failover_profile}"
+  exec_netem server "blackhole-${failover_profile}"
 }
 
 mark_client_failover_injection() {
@@ -1576,25 +1611,27 @@ mark_client_failover_injection() {
   exec_in client "python3 -c 'import time; print(time.monotonic())' > '${marker_file}'"
 }
 
-wait_for_tcp_download_failover_trigger() {
+wait_for_tcp_failover_trigger() {
   local case_name="$1"
   local marker_file="$2"
+  local endpoint="$3"
+  local address="$4"
   local trigger_file trigger_output trigger_status
   trigger_file="$(failover_trigger_file_for_case "$case_name")"
   rm -f "$trigger_file"
-  if [[ "$failover_fat_tx_trigger_bytes" == "0" ]]; then
+  if [[ "$failover_tx_trigger_bytes" == "0" ]]; then
     sleep "$failover_after"
   else
     set +e
     trigger_output="$(
-      exec_in server "python3 /workspace/lab/wait_interface_counter.py --address 172.31.20.20 --counter tx_bytes --delta-bytes '${failover_fat_tx_trigger_bytes}' --min-wait '${failover_after}' --timeout '${failover_trigger_timeout_seconds}' --interval '${failover_trigger_poll_interval_seconds}'"
+      exec_in "$endpoint" "python3 /workspace/lab/wait_interface_counter.py --address '${address}' --counter tx_bytes --delta-bytes '${failover_tx_trigger_bytes}' --min-wait '${failover_after}' --timeout '${failover_trigger_timeout_seconds}' --interval '${failover_trigger_poll_interval_seconds}'"
     )"
     trigger_status="$?"
     set -e
     printf '%s\n' "$trigger_output" > "$trigger_file"
     if [[ "$trigger_status" != "0" ]]; then
       case_log_artifacts_summary "$case_name" >/dev/null || true
-      echo "fat-path payload trigger failed for ${case_name}: ${trigger_output}" >&2
+      echo "${failover_profile}-path payload trigger failed for ${case_name}: ${trigger_output}" >&2
       return "$trigger_status"
     fi
   fi
@@ -2600,7 +2637,7 @@ run_matrix_upload_case() {
 }
 
 run_mixed_failover_case() {
-  local case_name="mptunnel_mixed_multipath_failover_blackhole_fat"
+  local case_name="mptunnel_mixed_multipath_failover_blackhole_${failover_profile}"
   local output exit_code
   local telemetry_pid
   local started_file="/tmp/mptunnel-mixed.started"
@@ -2642,13 +2679,13 @@ run_mixed_latency_spike_case() {
 }
 
 run_failover_case() {
-  local case_name="mptunnel_tcp_multipath_failover_blackhole_fat"
+  local case_name="mptunnel_tcp_multipath_failover_blackhole_${failover_profile}"
   local output exit_code
   local telemetry_pid
   local started_file="/tmp/mptunnel-failover.started"
   local failover_marker_file="/tmp/mptunnel-failover.trigger"
   local probe_failover_after="$failover_after"
-  if [[ "$failover_fat_tx_trigger_bytes" != "0" ]]; then
+  if [[ "$failover_tx_trigger_bytes" != "0" ]]; then
     probe_failover_after="-1"
   fi
   start_client "$case_name" "$tcp_all"
@@ -2657,7 +2694,7 @@ run_failover_case() {
   telemetry_pid="$case_telemetry_pid"
   exec_in client "(timeout ${curl_timeout}s python3 /workspace/lab/failover_download_probe.py --label '${case_name}' --proxy 127.0.0.1:${proxy_port} --target 172.31.40.30:8080 --path '${large_http_path}' --failover-after '${probe_failover_after}' --failover-marker-file '${failover_marker_file}' --timeout '${curl_timeout}' --load-duration '${load_duration_seconds}' --parallel-downloads '${bulk_connections}' --started-file '${started_file}' > /tmp/mptunnel-failover.out 2>/tmp/mptunnel-failover.err; echo \$? >/tmp/mptunnel-failover.status) & echo \$! >/tmp/mptunnel-failover.pid"
   exec_in client "deadline=\$((SECONDS + 10)); while [ ! -f '${started_file}' ] && [ \$SECONDS -lt \$deadline ]; do sleep 0.05; done; test -f '${started_file}'"
-  wait_for_tcp_download_failover_trigger "$case_name" "$failover_marker_file"
+  wait_for_tcp_failover_trigger "$case_name" "$failover_marker_file" server "$failover_server_address"
   apply_failover_blackhole
   exec_in client "deadline=\$((SECONDS + ${curl_timeout} + 5)); while [ ! -f /tmp/mptunnel-failover.status ] && [ \$SECONDS -lt \$deadline ]; do sleep 0.5; done; if [ ! -f /tmp/mptunnel-failover.status ]; then echo 124 >/tmp/mptunnel-failover.status; fi"
   stop_case_telemetry "$case_name" "$telemetry_pid"
@@ -2674,20 +2711,25 @@ run_failover_case() {
 }
 
 run_upload_failover_case() {
-  local case_name="mptunnel_tcp_multipath_failover_blackhole_fat_upload"
+  local case_name="mptunnel_tcp_multipath_failover_blackhole_${failover_profile}_upload"
   local output exit_code
   local telemetry_pid observer_started_ns observer_stopped_ns
   local observer_elapsed_seconds observer_freeze_exit_code
   local started_file="/tmp/mptunnel-upload-failover.started"
+  local failover_marker_file="/tmp/mptunnel-upload-failover.trigger"
+  local probe_failover_after="$failover_after"
+  if [[ "$failover_tx_trigger_bytes" != "0" ]]; then
+    probe_failover_after="-1"
+  fi
   start_client "$case_name" "$tcp_all"
   restart_target_tcp_sink
-  exec_in client "rm -f /tmp/mptunnel-upload-failover.out /tmp/mptunnel-upload-failover.status /tmp/mptunnel-upload-failover.pid '${started_file}'"
+  exec_in client "rm -f /tmp/mptunnel-upload-failover.out /tmp/mptunnel-upload-failover.status /tmp/mptunnel-upload-failover.pid '${started_file}' '${failover_marker_file}'"
   start_case_telemetry "$case_name"
   telemetry_pid="$case_telemetry_pid"
   observer_started_ns="$(monotonic_time_ns)"
-  exec_in client "(timeout ${upload_process_timeout_seconds}s python3 /workspace/lab/bulk_upload_probe.py --label '${case_name}' --proxy 127.0.0.1:${proxy_port} --target 172.31.40.30:${tcp_upload_target_port} --failover-after '${failover_after}' --timeout '${curl_timeout}' --load-duration '${load_duration_seconds}' --drain-timeout '${upload_drain_timeout_seconds}' --parallel-uploads '${bulk_connections}' --started-file '${started_file}' > /tmp/mptunnel-upload-failover.out 2>/tmp/mptunnel-upload-failover.err; echo \$? >/tmp/mptunnel-upload-failover.status) & echo \$! >/tmp/mptunnel-upload-failover.pid"
+  exec_in client "(timeout ${upload_process_timeout_seconds}s python3 /workspace/lab/bulk_upload_probe.py --label '${case_name}' --proxy 127.0.0.1:${proxy_port} --target 172.31.40.30:${tcp_upload_target_port} --failover-after '${probe_failover_after}' --failover-marker-file '${failover_marker_file}' --timeout '${curl_timeout}' --load-duration '${load_duration_seconds}' --drain-timeout '${upload_drain_timeout_seconds}' --parallel-uploads '${bulk_connections}' --started-file '${started_file}' > /tmp/mptunnel-upload-failover.out 2>/tmp/mptunnel-upload-failover.err; echo \$? >/tmp/mptunnel-upload-failover.status) & echo \$! >/tmp/mptunnel-upload-failover.pid"
   exec_in client "deadline=\$((SECONDS + 10)); while [ ! -f '${started_file}' ] && [ \$SECONDS -lt \$deadline ]; do sleep 0.05; done; test -f '${started_file}'"
-  sleep "$failover_after"
+  wait_for_tcp_failover_trigger "$case_name" "$failover_marker_file" client "$failover_client_address"
   apply_failover_blackhole
   exec_in client "deadline=\$((SECONDS + ${upload_process_timeout_seconds} + 5)); while [ ! -f /tmp/mptunnel-upload-failover.status ] && [ \$SECONDS -lt \$deadline ]; do sleep 0.5; done; if [ ! -f /tmp/mptunnel-upload-failover.status ]; then echo 124 >/tmp/mptunnel-upload-failover.status; fi"
   set +e
@@ -3262,7 +3304,7 @@ fi
 if should_run_case "mptunnel_mixed_multipath_flapping_links"; then
   run_mixed_flapping_case
 fi
-if should_run_case "mptunnel_mixed_multipath_failover_blackhole_fat"; then
+if should_run_case "mptunnel_mixed_multipath_failover_blackhole_${failover_profile}"; then
   run_mixed_failover_case
 fi
 if should_run_case "mptunnel_mixed_multipath_latency_spike_fat"; then
@@ -3280,10 +3322,10 @@ for matrix_bits in 000 001 010 011 100 101 110 111; do
   fi
 done
 
-if should_run_case "mptunnel_tcp_multipath_failover_blackhole_fat"; then
+if should_run_case "mptunnel_tcp_multipath_failover_blackhole_${failover_profile}"; then
   run_failover_case
 fi
-if should_run_case "mptunnel_tcp_multipath_failover_blackhole_fat_upload"; then
+if should_run_case "mptunnel_tcp_multipath_failover_blackhole_${failover_profile}_upload"; then
   run_upload_failover_case
 fi
 if should_run_case "mptunnel_tcp_multipath_latency_spike_fat"; then

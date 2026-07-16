@@ -1,20 +1,19 @@
 use crate::model::admission::{BulkPathCandidate, bulk_candidates_span_underlays};
 use crate::model::capacity::{
-    BBR_DEFAULT_CWND_GAIN, BBR_MAX_SEND_QUANTUM_BYTES, MAX_PRODUCT_DATAGRAM_PAYLOAD_BYTES,
-    PATH_OPEN_SCORE_BYTES, PathRateSample, QUIC_PERSISTENT_CONGESTION_THRESHOLD,
-    QUIC_TIMER_GRANULARITY, RELIABLE_INITIAL_RTT, RELIABLE_INITIAL_WINDOW_PACKETS,
-    UDP_BASELINE_PACKET_PAYLOAD_BYTES, adaptive_reliable_relay_inflight_bytes,
-    product_delivery_samples_override_startup_prior,
+    MAX_PRODUCT_DATAGRAM_PAYLOAD_BYTES, MAX_RELIABLE_SERVICE_QUANTUM_BYTES, PATH_OPEN_SCORE_BYTES,
+    PathRateSample, QUIC_PERSISTENT_CONGESTION_THRESHOLD, QUIC_TIMER_GRANULARITY,
+    RELIABLE_INITIAL_RTT, RELIABLE_INITIAL_WINDOW_PACKETS, UDP_BASELINE_PACKET_PAYLOAD_BYTES,
+    adaptive_reliable_relay_inflight_bytes, product_delivery_samples_override_startup_prior,
 };
 use crate::model::path::RelayPathKey;
 use crate::model::timing::{
     quic_bulk_proof_freshness_horizon, transport_pto_from_ms, transport_pto_from_snapshot,
 };
 use crate::mux::MuxLimits;
-use crate::protocol::{PathId, PathMetricDirection, PathMetrics, UnderlayProtocol};
+use crate::protocol::{PathId, PathMetricDirection, PathMetrics, PathUsage, UnderlayProtocol};
 use crate::runtime::path::health::ClientPathHealthRecord;
 use crate::scheduler::{
-    self, FlowLane, PathRateScope, PathSnapshot, PathState as SchedulerPathState,
+    self, PathRateScope, PathSnapshot, PathState as SchedulerPathState, TrafficClass,
 };
 use crate::transport::{PathSpec, RateHint};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -41,9 +40,7 @@ impl UdpPathRuntimeModel {
     ) -> Self {
         let ttl_timeout = Duration::from_millis(u64::from(ttl_ms));
         let pto = transport_pto_from_snapshot(Some(snapshot));
-        let pacing_payload_bytes = max_payload_bytes
-            .min(UDP_BASELINE_PACKET_PAYLOAD_BYTES)
-            .max(1);
+        let pacing_payload_bytes = max_payload_bytes.clamp(1, UDP_BASELINE_PACKET_PAYLOAD_BYTES);
         let loss_backoff = datagram_loss_backoff(snapshot, pacing_payload_bytes);
         let min_pacing_rate_bps = datagram_min_pacing_rate_bps(pacing_payload_bytes, pto);
         let pacing_rate_bps = (snapshot.delivery_rate_bps * loss_backoff).max(min_pacing_rate_bps);
@@ -114,9 +111,7 @@ pub(in crate::runtime) fn udp_datagram_payload_limit_bytes(
     path: &PathSpec,
     max_payload_bytes: usize,
 ) -> usize {
-    let protocol_ceiling = max_payload_bytes
-        .min(MAX_PRODUCT_DATAGRAM_PAYLOAD_BYTES)
-        .max(1);
+    let protocol_ceiling = max_payload_bytes.clamp(1, MAX_PRODUCT_DATAGRAM_PAYLOAD_BYTES);
     path.metadata
         .max_datagram_payload_bytes
         .unwrap_or(protocol_ceiling)
@@ -155,10 +150,10 @@ pub(in crate::runtime) fn path_observation_is_idle_for_probe(
 
 pub(in crate::runtime) fn apply_bulk_latency_isolation(
     observations: &mut [ClientPathObservation],
-    lane: FlowLane,
+    lane: TrafficClass,
     mux_limits: MuxLimits,
 ) {
-    if !matches!(lane, FlowLane::Throughput | FlowLane::Background) {
+    if !matches!(lane, TrafficClass::Throughput | TrafficClass::Background) {
         return;
     }
     if !observations
@@ -168,7 +163,7 @@ pub(in crate::runtime) fn apply_bulk_latency_isolation(
         return;
     }
     let isolation_bytes =
-        adaptive_reliable_relay_inflight_bytes(None, FlowLane::Latency, mux_limits) as u64;
+        adaptive_reliable_relay_inflight_bytes(None, TrafficClass::Latency, mux_limits) as u64;
     for observation in observations {
         let latency_flows = u64::from(observation.active_latency_sensitive_flows);
         observation.relay_queue_bytes = observation
@@ -180,7 +175,7 @@ pub(in crate::runtime) fn apply_bulk_latency_isolation(
 pub(in crate::runtime) fn endpoint_only_reliable_startup_should_preserve_configured_order(
     paths: &[PathSpec],
     observations: &[ClientPathObservation],
-    lane: FlowLane,
+    lane: TrafficClass,
 ) -> bool {
     lane.is_latency_sensitive()
         && paths.iter().all(path_is_endpoint_only)
@@ -191,7 +186,7 @@ pub(in crate::runtime) fn endpoint_only_reliable_startup_should_preserve_configu
 pub(in crate::runtime) fn endpoint_only_reliable_startup_should_spread_latency_load(
     paths: &[PathSpec],
     observations: &[ClientPathObservation],
-    lane: FlowLane,
+    lane: TrafficClass,
 ) -> bool {
     lane.is_latency_sensitive()
         && paths.iter().all(path_is_endpoint_only)
@@ -226,7 +221,7 @@ pub(in crate::runtime) fn endpoint_only_startup_has_bulk_load(
 pub(in crate::runtime) fn endpoint_only_reliable_startup_should_spread_bulk_load(
     paths: &[PathSpec],
     observations: &[ClientPathObservation],
-    lane: FlowLane,
+    lane: TrafficClass,
 ) -> bool {
     lane.is_latency_sensitive()
         && paths.iter().all(path_is_endpoint_only)
@@ -238,7 +233,7 @@ pub(in crate::runtime) fn endpoint_only_reliable_startup_should_spread_bulk_load
 pub(in crate::runtime) fn ordered_reliable_path_indices(
     paths: &[PathSpec],
     observations: &[ClientPathObservation],
-    lane: FlowLane,
+    lane: TrafficClass,
     payload_bytes: usize,
 ) -> Vec<usize> {
     reliable_stream_startup_path_scores(paths, observations, lane, payload_bytes)
@@ -250,7 +245,7 @@ pub(in crate::runtime) fn ordered_reliable_path_indices(
 pub(in crate::runtime) fn reliable_stream_startup_path_scores(
     paths: &[PathSpec],
     observations: &[ClientPathObservation],
-    lane: FlowLane,
+    lane: TrafficClass,
     payload_bytes: usize,
 ) -> Vec<(usize, f64)> {
     if endpoint_only_reliable_startup_should_preserve_configured_order(paths, observations, lane) {
@@ -270,7 +265,7 @@ pub(in crate::runtime) fn reliable_stream_startup_path_scores(
 fn reliable_stream_mixed_startup_path_scores(
     paths: &[PathSpec],
     observations: &[ClientPathObservation],
-    lane: FlowLane,
+    lane: TrafficClass,
     payload_bytes: usize,
 ) -> Vec<(usize, f64)> {
     if endpoint_only_reliable_startup_should_preserve_configured_order(paths, observations, lane)
@@ -290,7 +285,7 @@ fn reliable_stream_mixed_startup_path_scores(
 pub(in crate::runtime) fn endpoint_only_reliable_startup_path_scores(
     paths: &[PathSpec],
     observations: &[ClientPathObservation],
-    lane: FlowLane,
+    lane: TrafficClass,
     payload_bytes: usize,
 ) -> Vec<(usize, f64)> {
     let observations = observations
@@ -336,7 +331,7 @@ pub(in crate::runtime) fn path_is_endpoint_only(path: &PathSpec) -> bool {
 pub(in crate::runtime) fn configured_order_path_indices(
     paths: &[PathSpec],
     observations: &[ClientPathObservation],
-    lane: FlowLane,
+    lane: TrafficClass,
     payload_bytes: usize,
 ) -> Vec<usize> {
     configured_order_path_scores(paths, observations, lane, payload_bytes)
@@ -348,24 +343,32 @@ pub(in crate::runtime) fn configured_order_path_indices(
 pub(in crate::runtime) fn configured_order_path_scores(
     paths: &[PathSpec],
     observations: &[ClientPathObservation],
-    lane: FlowLane,
+    lane: TrafficClass,
     payload_bytes: usize,
 ) -> Vec<(usize, f64)> {
-    paths
+    let mut scores = paths
         .iter()
         .enumerate()
         .filter_map(|(index, path)| {
             let observation = observations.get(index).copied().unwrap_or_default();
-            scheduler::score_path(path_snapshot(path, index, observation), lane, payload_bytes)
-                .map(|score| (index, score.eta_ms))
+            let snapshot = path_snapshot(path, index, observation);
+            scheduler::score_path(snapshot, lane, payload_bytes)
+                .map(|score| (index, score.eta_ms, scheduler::path_is_backup(snapshot)))
         })
+        .collect::<Vec<_>>();
+    if scores.iter().any(|(_, _, backup)| !backup) {
+        scores.retain(|(_, _, backup)| !backup);
+    }
+    scores
+        .into_iter()
+        .map(|(index, eta_ms, _)| (index, eta_ms))
         .collect()
 }
 
 pub(in crate::runtime) fn ordered_path_scores_for_ttl(
     paths: &[PathSpec],
     observations: &[ClientPathObservation],
-    lane: FlowLane,
+    lane: TrafficClass,
     payload_bytes: usize,
     ttl_ms: u32,
 ) -> Vec<(usize, f64)> {
@@ -381,7 +384,7 @@ pub(in crate::runtime) fn ordered_path_scores_for_ttl(
 pub(in crate::runtime) fn ordered_path_scores(
     paths: &[PathSpec],
     observations: &[ClientPathObservation],
-    lane: FlowLane,
+    lane: TrafficClass,
     payload_bytes: usize,
 ) -> Vec<(usize, f64)> {
     let mut scores = paths
@@ -389,16 +392,22 @@ pub(in crate::runtime) fn ordered_path_scores(
         .enumerate()
         .filter_map(|(index, path)| {
             let observation = observations.get(index).copied().unwrap_or_default();
-            scheduler::score_path(path_snapshot(path, index, observation), lane, payload_bytes)
-                .map(|score| (index, score.eta_ms))
+            let snapshot = path_snapshot(path, index, observation);
+            scheduler::score_path(snapshot, lane, payload_bytes)
+                .map(|score| (index, score.eta_ms, scheduler::path_is_backup(snapshot)))
         })
         .collect::<Vec<_>>();
     scores.sort_by(|left, right| {
-        left.1
-            .total_cmp(&right.1)
-            .then_with(|| left.0.cmp(&right.0))
+        left.2.cmp(&right.2).then_with(|| {
+            left.1
+                .total_cmp(&right.1)
+                .then_with(|| left.0.cmp(&right.0))
+        })
     });
     scores
+        .into_iter()
+        .map(|(index, eta_ms, _)| (index, eta_ms))
+        .collect()
 }
 
 pub(in crate::runtime) fn reliable_stream_path_candidates(
@@ -406,7 +415,7 @@ pub(in crate::runtime) fn reliable_stream_path_candidates(
     tcp_observations: &[ClientPathObservation],
     udp_paths: &[PathSpec],
     udp_observations: &[ClientPathObservation],
-    lane: FlowLane,
+    lane: TrafficClass,
     payload_bytes: usize,
 ) -> Vec<BulkPathCandidate> {
     let tcp_scores =
@@ -438,8 +447,8 @@ pub(in crate::runtime) fn reliable_stream_path_candidates(
             let observation = udp_observations.get(*index).copied().unwrap_or_default();
             let snapshot = path_snapshot(path, *index, observation);
             let eta_ms = *eta_ms
-                + if matches!(lane, FlowLane::Throughput | FlowLane::Background) {
-                    udp_reliable_stream_loss_repair_penalty_ms(snapshot, payload_bytes)
+                + if matches!(lane, TrafficClass::Throughput | TrafficClass::Background) {
+                    udp_reliable_stream_loss_reinjection_penalty_ms(snapshot, payload_bytes)
                 } else {
                     0.0
                 };
@@ -482,8 +491,8 @@ pub(in crate::runtime) fn reliable_stream_path_candidates(
                 let observation = udp_observations.get(*index).copied().unwrap_or_default();
                 let snapshot = path_snapshot(path, *index, observation);
                 let eta_ms = *eta_ms
-                    + if matches!(lane, FlowLane::Throughput | FlowLane::Background) {
-                        udp_reliable_stream_loss_repair_penalty_ms(snapshot, payload_bytes)
+                    + if matches!(lane, TrafficClass::Throughput | TrafficClass::Background) {
+                        udp_reliable_stream_loss_reinjection_penalty_ms(snapshot, payload_bytes)
                     } else {
                         0.0
                     };
@@ -568,27 +577,15 @@ pub(in crate::runtime) fn path_snapshot(
         .or(observation.measured_jitter_ms)
         .unwrap_or_else(|| f64::from(path.metadata.initial_jitter_ms.unwrap_or(0)));
     let confidence = path_model_confidence(observation);
-    let bdp_bytes = (delivery_rate_bps / 8.0 * srtt_ms.max(1.0) / 1000.0)
-        .ceil()
-        .max(PATH_OPEN_SCORE_BYTES as f64) as u64;
-    let loss = observation
-        .measured_loss_rate
-        .unwrap_or(0.0)
-        .clamp(0.0, 1.0);
-    let min_progress =
-        adaptive_transport_byte_floor_factor(PATH_OPEN_SCORE_BYTES as f64, bdp_bytes.max(1) as f64);
-    let pacing_rate_bps = delivery_rate_bps * (1.0 - loss).max(min_progress);
-    let inflight_limit_bytes = if observation.carrier_inflight_limit_bytes > 0 {
-        observation.carrier_inflight_limit_bytes
-    } else {
-        ((bdp_bytes as f64) * BBR_DEFAULT_CWND_GAIN).ceil() as u64
-    };
-    let inflight_limit_bytes = inflight_limit_bytes.max(PATH_OPEN_SCORE_BYTES as u64);
+    // A missing native pacing sample is unknown, not permission for MPP to run
+    // its own congestion response. Delivery rate is the neutral service prior.
+    let pacing_rate_bps = delivery_rate_bps;
     PathSnapshot {
         id: PathId(index as u16),
         underlay: path.underlay,
         state: observation.state,
         policy: path.metadata.policy,
+        peer_usage: observation.peer_usage,
         srtt_ms,
         jitter_ms,
         delivery_rate_bps,
@@ -597,16 +594,15 @@ pub(in crate::runtime) fn path_snapshot(
         has_durable_product_progress,
         loss_rate: observation.measured_loss_rate.unwrap_or(0.0),
         queue_bytes: observation.carrier_queue_bytes,
-        product_queue_bytes: observation.relay_queue_bytes,
-        bytes_in_flight: observation
-            .relay_bytes_in_flight
-            .saturating_add(observation.carrier_bytes_in_flight),
-        product_bytes_in_flight: observation.relay_bytes_in_flight,
+        data_level_queue_bytes: observation.relay_queue_bytes,
+        bytes_in_flight: observation.carrier_bytes_in_flight,
+        data_level_bytes_in_flight: observation.relay_bytes_in_flight,
         active_flows: observation.active_flows,
         active_latency_sensitive_flows: observation.active_latency_sensitive_flows,
         session_active_latency_sensitive_flows: observation.active_latency_sensitive_flows,
         pacing_rate_bps,
-        inflight_limit_bytes,
+        carrier_inflight_limit_bytes: observation.carrier_inflight_limit_bytes,
+        data_level_limit_bytes: 0,
         confidence,
         app_limited: observation.relay_bytes_in_flight == 0
             && observation.carrier_bytes_in_flight == 0
@@ -628,7 +624,7 @@ pub(in crate::runtime) fn path_startup_snapshot(path: &PathSpec, index: usize) -
 
 pub(in crate::runtime) fn path_startup_metrics(
     path: &PathSpec,
-    index: usize,
+    path_id: PathId,
     direction: PathMetricDirection,
 ) -> PathMetrics {
     let observation = ClientPathObservation {
@@ -637,7 +633,7 @@ pub(in crate::runtime) fn path_startup_metrics(
         ..ClientPathObservation::default()
     };
     path_metrics_from_snapshot(
-        path_snapshot(path, index, observation),
+        path_snapshot(path, usize::from(path_id.0), observation),
         observation,
         direction,
     )
@@ -670,8 +666,8 @@ pub(in crate::runtime) fn path_metrics_from_snapshot(
         ecn_observed: false,
         bytes_in_flight: snapshot.bytes_in_flight,
         queue_bytes: snapshot.queue_bytes,
-        inflight_limit_bytes: snapshot.inflight_limit_bytes,
-        inflight_hi_bytes: snapshot.inflight_limit_bytes,
+        inflight_limit_bytes: snapshot.carrier_inflight_limit_bytes,
+        inflight_hi_bytes: snapshot.carrier_inflight_limit_bytes,
         confidence_ppm: ratio_to_ppm(snapshot.confidence),
         app_limited: snapshot.app_limited,
         has_ack_derived_data_sample,
@@ -705,7 +701,7 @@ pub(in crate::runtime) fn path_model_srtt_ms(
         .unwrap_or_else(|| {
             path.metadata
                 .initial_srtt_ms
-                .map_or_else(|| default_path_srtt_ms(), f64::from)
+                .map_or_else(default_path_srtt_ms, f64::from)
         })
 }
 
@@ -714,7 +710,7 @@ pub(in crate::runtime) fn path_model_confidence(observation: ClientPathObservati
         && observation.carrier_delivery_rate_bps.is_some()
     {
         // One fresh fenced train represents a full multi-packet sample, not
-        // one ordinary ACK. Product handoff durability is modeled separately.
+        // one ordinary ACK. Product admission durability is modeled separately.
         return 1.0;
     }
     let delivery_confidence = (f64::from(
@@ -777,26 +773,26 @@ pub(in crate::runtime) fn path_allows_automatic_bulk_use(path: &PathSpec) -> boo
 fn path_can_be_auto_discovered_for_lane(
     path: &PathSpec,
     observation: ClientPathObservation,
-    lane: FlowLane,
+    lane: TrafficClass,
 ) -> bool {
     observation.state == SchedulerPathState::Active
         && !path.metadata.policy.expensive
         && !path.metadata.policy.backup
         && !path.metadata.policy.probe_only
-        && (!matches!(lane, FlowLane::Throughput | FlowLane::Background)
+        && (!matches!(lane, TrafficClass::Throughput | TrafficClass::Background)
             || path.metadata.policy.bulk_allowed)
 }
 
 fn path_can_be_recovery_candidate_for_lane(
     path: &PathSpec,
     observation: ClientPathObservation,
-    lane: FlowLane,
+    lane: TrafficClass,
 ) -> bool {
     !matches!(
         observation.state,
         SchedulerPathState::Failed | SchedulerPathState::Draining
     ) && !path.metadata.policy.probe_only
-        && (!matches!(lane, FlowLane::Throughput | FlowLane::Background)
+        && (!matches!(lane, TrafficClass::Throughput | TrafficClass::Background)
             || path.metadata.policy.bulk_allowed)
 }
 
@@ -885,7 +881,7 @@ fn client_path_observation_has_durable_product_progress(
     path: &PathSpec,
     observation: ClientPathObservation,
 ) -> bool {
-    (path.underlay == UnderlayProtocol::Udp && observation.quic_capacity_product_handoff_complete)
+    (path.underlay == UnderlayProtocol::Udp && observation.quic_capacity_product_admission_complete)
         || (reliable_product_delivery_samples(path, observation) > 0
             && observation.product_delivery_sample_bytes
                 >= client_path_observation_bulk_sample_floor_bytes(observation))
@@ -912,7 +908,7 @@ fn observation_has_sender_delivery_evidence(observation: ClientPathObservation) 
 fn client_path_observation_bulk_sample_floor_bytes(observation: ClientPathObservation) -> u64 {
     observation
         .carrier_inflight_limit_bytes
-        .max(BBR_MAX_SEND_QUANTUM_BYTES as u64)
+        .max(MAX_RELIABLE_SERVICE_QUANTUM_BYTES as u64)
         .max(PATH_OPEN_SCORE_BYTES as u64)
 }
 
@@ -925,7 +921,7 @@ fn reliable_product_delivery_samples(path: &PathSpec, observation: ClientPathObs
     }
 }
 
-pub(in crate::runtime) fn carrier_diverse_bulk_validation_order(
+pub(in crate::runtime) fn carrier_diverse_path_order(
     candidates: Vec<BulkPathCandidate>,
 ) -> Vec<BulkPathCandidate> {
     if !bulk_candidates_span_underlays(&candidates) {
@@ -957,7 +953,7 @@ pub(in crate::runtime) fn carrier_diverse_bulk_validation_order(
     ordered
 }
 
-pub(in crate::runtime) fn udp_reliable_stream_loss_repair_penalty_ms(
+pub(in crate::runtime) fn udp_reliable_stream_loss_reinjection_penalty_ms(
     snapshot: scheduler::PathSnapshot,
     payload_bytes: usize,
 ) -> f64 {
@@ -970,9 +966,9 @@ pub(in crate::runtime) fn udp_reliable_stream_loss_repair_penalty_ms(
         .max(1.0);
     let bdp_bytes = path_bdp_floor_bytes(snapshot).max(UDP_BASELINE_PACKET_PAYLOAD_BYTES as f64);
     let progress_floor = (UDP_BASELINE_PACKET_PAYLOAD_BYTES as f64 / bdp_bytes).min(1.0);
-    let expected_repairs = fragment_count * loss / (1.0 - loss).max(progress_floor);
-    let repair_rtt_ms = transport_pto_from_snapshot(Some(snapshot)).as_secs_f64() * 1000.0;
-    expected_repairs * repair_rtt_ms
+    let expected_reinjections = fragment_count * loss / (1.0 - loss).max(progress_floor);
+    let reinjection_rtt_ms = transport_pto_from_snapshot(Some(snapshot)).as_secs_f64() * 1000.0;
+    expected_reinjections * reinjection_rtt_ms
 }
 
 pub(in crate::runtime) fn default_path_srtt_ms() -> f64 {
@@ -987,6 +983,7 @@ pub(in crate::runtime) fn default_path_rate_bps() -> f64 {
 pub(in crate::runtime) struct ClientPathObservation {
     pub(in crate::runtime) state: SchedulerPathState,
     pub(in crate::runtime) manual_disabled: bool,
+    pub(in crate::runtime) peer_usage: Option<PathUsage>,
     pub(in crate::runtime) measured_srtt_ms: Option<f64>,
     pub(in crate::runtime) measured_jitter_ms: Option<f64>,
     pub(in crate::runtime) measured_rate_bps: Option<f64>,
@@ -1012,7 +1009,7 @@ pub(in crate::runtime) struct ClientPathObservation {
     pub(in crate::runtime) carrier_app_limited: bool,
     pub(in crate::runtime) carrier_ack_derived_data_seen: bool,
     pub(in crate::runtime) explicit_carrier_capacity_proof: bool,
-    pub(in crate::runtime) quic_capacity_product_handoff_complete: bool,
+    pub(in crate::runtime) quic_capacity_product_admission_complete: bool,
     pub(in crate::runtime) quic_capacity_rate_prior_fresh: bool,
     pub(in crate::runtime) path_proof_success: bool,
 }
@@ -1022,6 +1019,7 @@ impl Default for ClientPathObservation {
         Self {
             state: SchedulerPathState::Suspect,
             manual_disabled: false,
+            peer_usage: None,
             measured_srtt_ms: None,
             measured_jitter_ms: None,
             measured_rate_bps: None,
@@ -1047,7 +1045,7 @@ impl Default for ClientPathObservation {
             carrier_app_limited: true,
             carrier_ack_derived_data_seen: false,
             explicit_carrier_capacity_proof: false,
-            quic_capacity_product_handoff_complete: false,
+            quic_capacity_product_admission_complete: false,
             quic_capacity_rate_prior_fresh: false,
             path_proof_success: false,
         }
@@ -1059,7 +1057,7 @@ pub(super) fn reliable_reservation_should_use_endpoint_only_startup_order(
     tcp_observations: &[ClientPathObservation],
     udp_paths: &[PathSpec],
     udp_observations: &[ClientPathObservation],
-    lane: FlowLane,
+    lane: TrafficClass,
 ) -> bool {
     lane.is_latency_sensitive()
         && (!tcp_paths.is_empty() || !udp_paths.is_empty())

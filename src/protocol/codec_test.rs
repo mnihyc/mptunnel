@@ -6,6 +6,50 @@ fn round_trip(frame: Frame) {
     assert_eq!(decoded, frame);
 }
 
+fn peer_status_metrics(
+    path_id: u16,
+    underlay: UnderlayProtocol,
+    direction: PathMetricDirection,
+) -> PathMetrics {
+    PathMetrics {
+        path_id: PathId(path_id),
+        underlay,
+        direction,
+        metric_epoch: 1_735_689_600,
+        metric_age_us: 5_000,
+        srtt_us: 25_000,
+        rttvar_us: 3_000,
+        jitter_us: 1_200,
+        delivery_rate_bps: 125_000_000,
+        pacing_rate_bps: 150_000_000,
+        loss_ppm: 1_500,
+        ecn_ppm: 25,
+        loss_observed: true,
+        ecn_observed: true,
+        bytes_in_flight: 64 * 1024,
+        queue_bytes: 16 * 1024,
+        inflight_limit_bytes: 512 * 1024,
+        inflight_hi_bytes: 768 * 1024,
+        confidence_ppm: 875_000,
+        app_limited: false,
+        has_ack_derived_data_sample: true,
+        data_sample_count: 9,
+        data_sample_bytes: 512 * 1024,
+    }
+}
+
+fn peer_path_status(state: PeerPathState, usage: PathUsage) -> PeerPathStatus {
+    PeerPathStatus {
+        state,
+        usage,
+        metrics: peer_status_metrics(
+            7,
+            UnderlayProtocol::Tcp,
+            PathMetricDirection::ClientToServer,
+        ),
+    }
+}
+
 #[test]
 fn stream_frames_round_trip() {
     round_trip(Frame::OpenStream {
@@ -15,7 +59,6 @@ fn stream_frames_round_trip() {
             port: 443,
         },
         demand: StreamDemandHint::Throughput,
-        role: StreamOpenRole::Active,
     });
     round_trip(Frame::StreamData {
         stream_id: StreamId(7),
@@ -37,6 +80,71 @@ fn stream_frames_round_trip() {
     round_trip(Frame::StreamDetach {
         stream_id: StreamId(7),
     });
+}
+
+#[test]
+fn open_stream_v2_has_no_attachment_role_field() {
+    let frame = Frame::OpenStream {
+        stream_id: StreamId(0x0102_0304_0506_0708),
+        target: TargetAddr::Ip("192.0.2.1:443".parse().expect("addr")),
+        demand: StreamDemandHint::Throughput,
+    };
+
+    let encoded = encode_frame(&frame, CodecLimits::default()).expect("encode");
+    assert_eq!(
+        encoded,
+        vec![
+            b'M', b'P', b'T', b'F', 2, 7, 0, 0, 0, 16, 1, 2, 3, 4, 5, 6, 7, 8, 2, 192, 0, 2, 1, 1,
+            187, 2,
+        ]
+    );
+    assert_eq!(
+        decode_frame_bytes(Bytes::from(encoded), CodecLimits::default()).expect("decode"),
+        frame
+    );
+}
+
+#[test]
+fn path_usage_round_trips_with_sequence_bounds() {
+    for (sequence, usage) in [(0, PathUsage::Available), (u64::MAX, PathUsage::Backup)] {
+        round_trip(Frame::PathStatus {
+            path_id: PathId(u16::MAX),
+            sequence,
+            usage,
+        });
+    }
+}
+
+#[test]
+fn decoder_rejects_unknown_path_usage() {
+    let mut encoded = encode_frame(
+        &Frame::PathStatus {
+            path_id: PathId(3),
+            sequence: 17,
+            usage: PathUsage::Available,
+        },
+        CodecLimits::default(),
+    )
+    .expect("encode");
+    assert_eq!(encoded.len(), FRAME_HEADER_LEN + 11);
+    *encoded.last_mut().expect("usage byte") = 2;
+
+    assert_eq!(
+        decode_frame_bytes(Bytes::from(encoded), CodecLimits::default()),
+        Err(CodecError::InvalidEnum)
+    );
+}
+
+#[test]
+fn decoder_rejects_v1_frames_after_wire_contract_change() {
+    let mut encoded =
+        encode_frame(&Frame::Ping { nonce: 42 }, CodecLimits::default()).expect("encode");
+    encoded[4] = 1;
+
+    assert_eq!(
+        decode_frame_bytes(Bytes::from(encoded), CodecLimits::default()),
+        Err(CodecError::UnsupportedVersion(1))
+    );
 }
 
 #[test]
@@ -124,14 +232,10 @@ fn control_frames_round_trip_auth_and_path_metrics() {
         issued_at_unix_secs: 1_735_689_600,
         auth_tag,
     });
-    round_trip(Frame::PathJoinOk {
-        path_id: PathId(3),
-        nonce,
-        auth_tag,
-    });
     round_trip(Frame::PathStatus {
         path_id: PathId(3),
-        status: PathStatus::Suspect,
+        sequence: 17,
+        usage: PathUsage::Backup,
     });
     round_trip(Frame::PathDrain { path_id: PathId(3) });
     round_trip(Frame::PathClose {
@@ -188,19 +292,144 @@ fn control_frames_round_trip_auth_and_path_metrics() {
 fn path_capacity_protocol_round_trips_without_product_stream_identity() {
     round_trip(Frame::PathCapacityData {
         path_id: PathId(7),
-        calibration_id: 42,
+        measurement_id: 42,
         payload: Bytes::from_static(b"native-quic-capacity-sample"),
     });
     round_trip(Frame::PathCapacityFinish {
         path_id: PathId(7),
-        calibration_id: 42,
+        measurement_id: 42,
         payload_bytes: 27,
     });
     round_trip(Frame::PathCapacityReceipt {
         path_id: PathId(7),
-        calibration_id: 42,
+        measurement_id: 42,
         received_payload_bytes: 27,
     });
+}
+
+#[test]
+fn peer_status_frames_round_trip_with_bounded_fixed_entries() {
+    round_trip(Frame::PeerStatusRequest {
+        request_id: u64::MAX,
+    });
+
+    let response = Frame::PeerStatusResponse {
+        request_id: 42,
+        code: PeerStatusCode::Ok,
+        paths: vec![
+            peer_path_status(PeerPathState::Active, PathUsage::Available),
+            peer_path_status(PeerPathState::Suspect, PathUsage::Backup),
+            peer_path_status(PeerPathState::Draining, PathUsage::Available),
+            peer_path_status(PeerPathState::Failed, PathUsage::Backup),
+        ],
+    };
+    let encoded = encode_frame(&response, CodecLimits::default()).expect("encode");
+    assert_eq!(encoded[5], 37);
+    assert_eq!(encoded.len(), FRAME_HEADER_LEN + 11 + 4 * 106);
+    assert_eq!(
+        decode_frame_bytes(Bytes::from(encoded), CodecLimits::default()).expect("decode"),
+        response
+    );
+
+    for code in [PeerStatusCode::Disabled, PeerStatusCode::Unavailable] {
+        round_trip(Frame::PeerStatusResponse {
+            request_id: 43,
+            code,
+            paths: Vec::new(),
+        });
+    }
+
+    let request = encode_frame(
+        &Frame::PeerStatusRequest { request_id: 44 },
+        CodecLimits::default(),
+    )
+    .expect("encode");
+    assert_eq!(request[5], 36);
+}
+
+#[test]
+fn peer_status_decoder_rejects_invalid_enums() {
+    let response = Frame::PeerStatusResponse {
+        request_id: 42,
+        code: PeerStatusCode::Ok,
+        paths: vec![peer_path_status(
+            PeerPathState::Active,
+            PathUsage::Available,
+        )],
+    };
+    let encoded = encode_frame(&response, CodecLimits::default()).expect("encode");
+
+    for offset in [
+        FRAME_HEADER_LEN + 8,
+        FRAME_HEADER_LEN + 11,
+        FRAME_HEADER_LEN + 12,
+        FRAME_HEADER_LEN + 15,
+        FRAME_HEADER_LEN + 16,
+    ] {
+        let mut malformed = encoded.clone();
+        malformed[offset] = u8::MAX;
+        assert_eq!(
+            decode_frame_bytes(Bytes::from(malformed), CodecLimits::default()),
+            Err(CodecError::InvalidEnum)
+        );
+    }
+}
+
+#[test]
+fn peer_status_count_is_bounded_before_allocation() {
+    let mut encoded = encode_frame(
+        &Frame::PeerStatusResponse {
+            request_id: 42,
+            code: PeerStatusCode::Ok,
+            paths: Vec::new(),
+        },
+        CodecLimits::default(),
+    )
+    .expect("encode");
+    encoded[FRAME_HEADER_LEN + 9..FRAME_HEADER_LEN + 11].copy_from_slice(&u16::MAX.to_be_bytes());
+
+    assert_eq!(
+        decode_frame_bytes(Bytes::from(encoded), CodecLimits::default()),
+        Err(CodecError::UnexpectedEof)
+    );
+}
+
+#[test]
+fn peer_status_response_limit_follows_the_configured_frame_size() {
+    let fixed_bytes = FRAME_HEADER_LEN + 11;
+    assert_eq!(
+        peer_status_response_path_limit(CodecLimits {
+            max_frame_bytes: fixed_bytes,
+            ..CodecLimits::default()
+        }),
+        0
+    );
+    assert_eq!(
+        peer_status_response_path_limit(CodecLimits {
+            max_frame_bytes: fixed_bytes + 106,
+            ..CodecLimits::default()
+        }),
+        1
+    );
+}
+
+#[test]
+fn peer_status_encoder_rejects_count_overflow() {
+    let paths = vec![
+        peer_path_status(PeerPathState::Active, PathUsage::Available);
+        usize::from(u16::MAX) + 1
+    ];
+    assert_eq!(
+        encode_frame(
+            &Frame::PeerStatusResponse {
+                request_id: 42,
+                code: PeerStatusCode::Ok,
+                paths,
+            },
+            CodecLimits::default(),
+        ),
+        Err(CodecError::LengthOverflow)
+    );
 }
 
 #[test]

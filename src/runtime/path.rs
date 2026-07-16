@@ -22,34 +22,32 @@ mod state;
 pub(in crate::runtime) mod tcp;
 
 pub(in crate::runtime) use commands::{
-    CapacityProbeCommandTicket, QuicCapacityProbeCommand, QuicCapacityProbeOwner,
-    RequestTcpCapacityProbeRequest,
+    CapacityProbeCommandTicket, QuicCapacityProbeCommand, RequestTcpCapacityProbeRequest,
 };
 pub(in crate::runtime) use health::{
     ClientPathHealth, ClientPathHealthRecord, RequestCapacityReconciliationView,
 };
 pub(in crate::runtime) use model::{PathDeliveryStats, UdpPathCandidate};
 pub(in crate::runtime) use ports::{
-    AcceptedServerDatagramFlow, CarrierCommandLease, OpenedReliableCarrierStream,
-    ServerCarrierPathIdentity, ServerCarrierPathMetricSnapshot, ServerCarrierPathRegistration,
-    ServerDatagramOpenError, ServerDatagramOpenRequest, ServerDatagramPort,
-    ServerDatagramPortBackend, ServerDatagramRequest, ServerDatagramSendOutcome,
-    ServerNewStreamPolicy, ServerRealtimeFlowLease, ServerStreamManagementSnapshot,
-    ServerStreamOpenOutcome, ServerStreamOpenRequest, ServerStreamPathAttachment, ServerStreamPort,
-    ServerStreamPortBackend, UdpStreamOpenOptions,
+    AcceptedServerDatagramFlow, OpenedReliableCarrierStream, ServerCarrierPathIdentity,
+    ServerCarrierPathRegistration, ServerCarrierPathStatusSnapshot, ServerDatagramOpenError,
+    ServerDatagramOpenRequest, ServerDatagramPort, ServerDatagramPortBackend,
+    ServerDatagramRequest, ServerDatagramSendOutcome, ServerLocalPathProperties,
+    ServerNewStreamPolicy, ServerRealtimeFlowLease, ServerSessionManagementSnapshot,
+    ServerStreamManagementSnapshot, ServerStreamOpenOutcome, ServerStreamOpenRequest,
+    ServerStreamPathAttachment, ServerStreamPort, ServerStreamPortBackend,
 };
 #[cfg(test)]
 pub(super) use proof::*;
 pub(in crate::runtime) use quic::{
-    RequestQuicCapacityProbeLease, RequestQuicCapacityProductHandoffState,
+    RequestQuicCapacityProbeLease, RequestQuicCapacityProductAdmissionState,
     RequestQuicCapacityReconciliationQuery,
 };
 pub(in crate::runtime) use selection::ReliableRequestTcpPathEvidence;
-pub(in crate::runtime) use server_context::ServerPathContext;
+pub(in crate::runtime) use server_context::{ServerLocalPath, ServerPathContext};
 pub(in crate::runtime) use set::ClientPathContext;
 pub(in crate::runtime) use state::{
-    ClientPathState, RelayPathLoadLease, ReliableTcpRequestBulkFlowRegistration,
-    RequestCapacityProbeCampaignBudget,
+    ClientPathState, RelayPathLoadLease, RequestCapacityProbeCampaignBudget,
 };
 pub(in crate::runtime) use tcp::capacity::{
     RequestTcpCapacityProbeLease, RequestTcpCapacityProofQuery,

@@ -5,21 +5,20 @@
 
 use super::dispatch::{
     emit_planned_response_data_frame, emit_response_frame_from_sender_service,
-    response_frame_has_carrier_credit, response_repair_carrier_lane,
+    response_frame_has_carrier_credit, response_reinjection_carrier_lane,
 };
 use super::multipath::{
-    plan_response_data_payload_with_ordered_debt_impl,
-    preview_response_data_payload_with_ordered_debt,
+    plan_response_data_payload_with_data_ack_outstanding_impl,
+    preview_response_data_payload_with_data_ack_outstanding,
 };
-use super::planner::{choose_response_sender_target, response_dispatch_payload_bytes};
-#[cfg(test)]
-use super::*;
+use super::scheduling::select_response_frame_path;
 use crate::config::MppPerformanceConfig;
 #[cfg(feature = "lab-diagnostics")]
 use crate::lab_diagnostics::{
     lab_diagnostic, lab_diagnostic_event_enabled, lab_perf_record, lab_sender_service_decision,
     lab_server_response_stream_data,
 };
+use crate::model::capacity::adaptive_reliable_relay_chunk_bytes_with_frame_limit;
 use crate::model::multipath::ExtraTrafficLedger;
 use crate::model::path::CarrierPathKey;
 use crate::model::work::ReliableWorkClass;
@@ -33,14 +32,59 @@ use crate::runtime::RuntimeError;
 use crate::runtime::path::commands::reliable_path_effective_frame_lane;
 use crate::runtime::sender::{
     CarrierEmitMode, RelaySendCause, ReliableRelayQueuedWork, ReliableRelayQueuedWorkKind,
-    ReliableRelaySenderQueue, ServerRepairOutputIdentity, reliable_relay_can_read_product_source,
-    reliable_relay_sender_queue_read_budget, sender_extra_traffic_startup_floor_bytes,
-    sender_repair_minimum_useful_attempt_bytes,
+    ReliableRelaySenderQueue, ServerReinjectionOutputIdentity,
+    reliable_relay_can_read_product_source, reliable_relay_sender_queue_read_budget,
+    sender_extra_traffic_startup_floor_bytes, sender_reinjection_minimum_useful_attempt_bytes,
 };
 use crate::runtime::stream::{ReliablePathStream, ReliablePathStreamOutput};
-use crate::scheduler::{FlowLane, PathSnapshot};
+use crate::scheduler::{PathSnapshot, TrafficClass};
 use bytes::Bytes;
 use std::time::Instant;
+
+fn response_data_dispatch_lane(
+    queued_lane: Option<TrafficClass>,
+    current_lane: TrafficClass,
+) -> TrafficClass {
+    // Promotion is current flow evidence, so staged startup bytes must not keep
+    // the stream trapped behind the conservative latency-lane carrier prior.
+    match (queued_lane, current_lane) {
+        (Some(TrafficClass::Throughput), _) | (_, TrafficClass::Throughput) => {
+            TrafficClass::Throughput
+        }
+        (Some(TrafficClass::Background), _) | (_, TrafficClass::Background) => {
+            TrafficClass::Background
+        }
+        (Some(queued_lane), _) => queued_lane,
+        (None, current_lane) => current_lane,
+    }
+}
+
+fn response_dispatch_payload_bytes(
+    path_stream: &ReliablePathStream,
+    send_stream: &ReliableSendStream,
+    relay_lane: TrafficClass,
+    mux_limits: MuxLimits,
+    queued_payload_bytes: usize,
+) -> Option<usize> {
+    let reinjection_credit = mux_limits
+        .max_repair_bytes
+        .saturating_sub(send_stream.reinjection_bytes());
+    if reinjection_credit == 0 {
+        return None;
+    }
+    let snapshot = path_stream.send_path_snapshot(relay_lane, queued_payload_bytes);
+    Some(
+        adaptive_reliable_relay_chunk_bytes_with_frame_limit(
+            snapshot,
+            relay_lane,
+            mux_limits,
+            path_stream.max_frame_payload_bytes,
+        )
+        .min(queued_payload_bytes)
+        .min(reinjection_credit)
+        .max(1),
+    )
+}
 
 #[derive(Debug)]
 /// Current server response sender-service boundary.
@@ -86,37 +130,48 @@ impl ServerResponseSenderService {
         }
     }
 
-    pub(in crate::runtime) fn ack_gap_repair_path_snapshot(
+    pub(in crate::runtime) fn ack_gap_reinjection_path_snapshot(
         &self,
         path_stream: &ReliablePathStream,
         send_stream: &ReliableSendStream,
         normalized_ranges: &[OffsetRange],
         preview_limit: usize,
-    ) -> Option<(ServerRepairOutputIdentity, PathSnapshot)> {
+    ) -> Option<(ServerReinjectionOutputIdentity, PathSnapshot)> {
         let preview = send_stream
             .retransmission_frames_for_normalized_ack_gaps(normalized_ranges, preview_limit.max(1))
             .into_iter()
             .next()?;
+        self.reinjection_path_snapshot_for_frame(
+            path_stream,
+            &preview,
+            RelaySendCause::PersistentAckGapReinjection,
+        )
+    }
+
+    pub(in crate::runtime) fn reinjection_path_snapshot_for_frame(
+        &self,
+        path_stream: &ReliablePathStream,
+        preview: &Frame,
+        cause: RelaySendCause,
+    ) -> Option<(ServerReinjectionOutputIdentity, PathSnapshot)> {
         let ReliablePathStreamOutput::Switchable(binding) = &path_stream.output else {
             return None;
         };
-        let avoid_keys = binding.flight_keys_overlapping_frame(&preview);
-        let lane = response_repair_carrier_lane(&preview);
+        let avoid_keys = binding.flight_keys_overlapping_frame(preview);
+        let lane = response_reinjection_carrier_lane(preview);
         let targets =
-            binding.sender_path_targets(lane, reliable_stream_frame_accounted_bytes(&preview));
-        choose_response_sender_target(
+            binding.sender_path_targets(lane, reliable_stream_frame_accounted_bytes(preview));
+        select_response_frame_path(
             &targets,
             lane,
-            &preview,
+            preview,
             CarrierEmitMode::Classified,
-            binding.mux_limits(),
-            &[],
             &avoid_keys,
-            Some(RelaySendCause::PersistentAckGapRepair),
+            Some(cause),
         )
         .map(|target| {
             (
-                ServerRepairOutputIdentity {
+                ServerReinjectionOutputIdentity {
                     key: target.observation.key,
                     incarnation: target.observation.incarnation,
                 },
@@ -138,37 +193,36 @@ impl ServerResponseSenderService {
         self.queue.data_bytes()
     }
 
-    pub(in crate::runtime) fn release_normalized_acked_repairs(
+    pub(in crate::runtime) fn release_normalized_acked_reinjections(
         &mut self,
         ranges: &[OffsetRange],
     ) -> usize {
-        self.queue.release_normalized_acked_repairs(ranges)
+        self.queue.release_normalized_acked_reinjections(ranges)
     }
 
-    pub(in crate::runtime) fn discard_unusable_live_owner_tail_repairs(
+    pub(in crate::runtime) fn discard_unusable_tail_reinjections(
+        &mut self,
+        path_stream: &ReliablePathStream,
+    ) -> usize {
+        self.queue.discard_unusable_tail_reinjections(|frame| {
+            path_stream.has_tail_reinjection_output_for_frame(frame)
+        })
+    }
+
+    pub(in crate::runtime) fn discard_stale_persistent_ack_gap_reinjections(
         &mut self,
         path_stream: &ReliablePathStream,
     ) -> usize {
         self.queue
-            .discard_unusable_live_owner_tail_repairs(|frame| {
-                path_stream.has_live_owner_tail_repair_output_for_frame(frame)
-            })
-    }
-
-    pub(in crate::runtime) fn discard_stale_persistent_ack_gap_repairs(
-        &mut self,
-        path_stream: &ReliablePathStream,
-    ) -> usize {
-        self.queue
-            .discard_stale_persistent_ack_gap_repairs(|cause| {
+            .discard_stale_persistent_ack_gap_reinjections(|cause| {
                 cause.persistent_server_target().is_none_or(|target| {
                     path_stream.has_output_incarnation(target.key, target.incarnation)
                 }) && cause.persistent_client_target().is_none()
             })
     }
 
-    pub(in crate::runtime) fn persistent_ack_gap_repair_deadline(&self) -> Option<Instant> {
-        self.queue.persistent_ack_gap_repair_deadline()
+    pub(in crate::runtime) fn persistent_ack_gap_reinjection_deadline(&self) -> Option<Instant> {
+        self.queue.persistent_ack_gap_reinjection_deadline()
     }
 
     pub(in crate::runtime) fn extra_traffic_budget_remaining(
@@ -183,29 +237,27 @@ impl ServerResponseSenderService {
             .remaining_bytes()
     }
 
-    pub(in crate::runtime) fn repair_extra_budget_remaining(&self, mux_limits: MuxLimits) -> usize {
-        self.extra_traffic_budget_remaining(mux_limits)
-    }
-
-    pub(in crate::runtime) fn repair_extra_event_budget_remaining(
+    pub(in crate::runtime) fn reinjection_extra_budget_remaining(
         &self,
         mux_limits: MuxLimits,
     ) -> usize {
-        let remaining = self.repair_extra_budget_remaining(mux_limits);
-        if remaining < sender_repair_minimum_useful_attempt_bytes(mux_limits) {
+        self.extra_traffic_budget_remaining(mux_limits)
+    }
+
+    pub(in crate::runtime) fn reinjection_extra_event_budget_remaining(
+        &self,
+        mux_limits: MuxLimits,
+    ) -> usize {
+        let remaining = self.reinjection_extra_budget_remaining(mux_limits);
+        if remaining < sender_reinjection_minimum_useful_attempt_bytes(mux_limits) {
             0
         } else {
             remaining
         }
     }
 
-    #[cfg(test)]
-    pub(in crate::runtime) fn record_owner_progress_for_test(&mut self, bytes: usize) {
-        self.record_owner_progress(bytes);
-    }
-
-    pub(in crate::runtime) fn record_owner_progress(&mut self, bytes: usize) {
-        self.extra_traffic.record_owner_progress(bytes);
+    pub(in crate::runtime) fn record_delivered_data(&mut self, bytes: usize) {
+        self.extra_traffic.record_delivered_data(bytes);
     }
 
     pub(in crate::runtime) fn publish_queue_bytes(&self, path_stream: &ReliablePathStream) {
@@ -216,29 +268,13 @@ impl ServerResponseSenderService {
         self.queue.front().is_some()
     }
 
-    pub(in crate::runtime) fn front_is_data(&self) -> bool {
-        self.queue
-            .front()
-            .is_some_and(|(_, work)| matches!(&work.kind, ReliableRelayQueuedWorkKind::Data(_)))
-    }
-
-    pub(in crate::runtime) fn drain_allows_bounded_source_staging(
-        &self,
-        path_stream: &ReliablePathStream,
-        queued_send_blocked: bool,
-    ) -> bool {
-        queued_send_blocked
-            && self.front_is_data()
-            && path_stream.response_service_handoff_drain_active()
-    }
-
-    pub(in crate::runtime) fn front_has_carrier_credit_with_ordered_owner_debt(
+    pub(in crate::runtime) fn front_has_carrier_credit_with_data_ack_outstanding(
         &self,
         path_stream: &ReliablePathStream,
         send_stream: &ReliableSendStream,
-        relay_lane: FlowLane,
+        relay_lane: TrafficClass,
         mux_limits: MuxLimits,
-        ordered_owner_debt_bytes: usize,
+        data_ack_outstanding_bytes: usize,
     ) -> bool {
         let Some((_, queued)) = self.queue.front() else {
             return false;
@@ -248,31 +284,34 @@ impl ServerResponseSenderService {
                 let (carrier_lane, emit_mode) = if queued.stream_ordered_carrier_emit {
                     (relay_lane, CarrierEmitMode::StreamOrdered)
                 } else {
-                    (FlowLane::Control, CarrierEmitMode::Classified)
+                    (TrafficClass::Control, CarrierEmitMode::Classified)
                 };
                 response_frame_has_carrier_credit(path_stream, frame, carrier_lane, emit_mode, None)
             }
-            ReliableRelayQueuedWorkKind::Data(payload) => response_dispatch_payload_bytes(
-                path_stream,
-                send_stream,
-                queued.data_lane.unwrap_or(relay_lane),
-                mux_limits,
-                payload.len(),
-            )
-            .is_some_and(|payload_bytes| {
-                preview_response_data_payload_with_ordered_debt(
+            ReliableRelayQueuedWorkKind::Data(payload) => {
+                let data_lane = response_data_dispatch_lane(queued.data_lane, relay_lane);
+                response_dispatch_payload_bytes(
                     path_stream,
-                    queued.data_lane.unwrap_or(relay_lane),
-                    send_stream.next_offset(),
-                    payload_bytes,
-                    ordered_owner_debt_bytes,
+                    send_stream,
+                    data_lane,
+                    mux_limits,
+                    payload.len(),
                 )
-            }),
-            ReliableRelayQueuedWorkKind::Repair { frame, cause } => {
+                .is_some_and(|payload_bytes| {
+                    preview_response_data_payload_with_data_ack_outstanding(
+                        path_stream,
+                        data_lane,
+                        send_stream.next_offset(),
+                        payload_bytes,
+                        data_ack_outstanding_bytes,
+                    )
+                })
+            }
+            ReliableRelayQueuedWorkKind::Reinjection { frame, cause } => {
                 response_frame_has_carrier_credit(
                     path_stream,
                     frame,
-                    response_repair_carrier_lane(frame),
+                    response_reinjection_carrier_lane(frame),
                     CarrierEmitMode::Classified,
                     Some(*cause),
                 )
@@ -308,7 +347,7 @@ impl ServerResponseSenderService {
     pub(in crate::runtime) fn enqueue_data_for_lane(
         &mut self,
         payload: Bytes,
-        lane: FlowLane,
+        lane: TrafficClass,
     ) -> u64 {
         self.queue.push_data_for_lane(payload, lane)
     }
@@ -321,7 +360,7 @@ impl ServerResponseSenderService {
         self.queue.push_final_control(frame)
     }
 
-    pub(in crate::runtime) fn enqueue_repair_frame_with_priority(
+    pub(in crate::runtime) fn enqueue_reinjection_frame_with_priority(
         &mut self,
         frame: Frame,
         mux_limits: MuxLimits,
@@ -335,55 +374,52 @@ impl ServerResponseSenderService {
         if !budget.can_spend(payload_bytes) {
             return None;
         }
-        self.extra_traffic.record_repair(payload_bytes);
+        self.extra_traffic.record_reinjection(payload_bytes);
         Some(if critical_priority {
             self.queue
-                .push_critical_repair_with_cause(frame, RelaySendCause::AckGapRepair)
+                .push_critical_reinjection_with_cause(frame, RelaySendCause::AckGapReinjection)
         } else {
-            self.queue.push_repair(frame)
+            self.queue.push_reinjection(frame)
         })
     }
 
-    #[cfg(test)]
-    pub(in crate::runtime) fn enqueue_critical_repair_frame(&mut self, frame: Frame) -> u64 {
-        self.enqueue_critical_repair_frame_with_cause(frame, RelaySendCause::AckGapRepair)
-    }
-
-    pub(in crate::runtime) fn enqueue_critical_tail_repair_frame(
+    pub(in crate::runtime) fn enqueue_critical_tail_reinjection_frame(
         &mut self,
         frame: Frame,
     ) -> Option<u64> {
-        if self.has_queued_repair_overlap(&frame) {
+        if self.has_queued_reinjection_overlap(&frame) {
             return None;
         }
-        Some(
-            self.enqueue_critical_repair_frame_with_cause(frame, RelaySendCause::PathFailureRepair),
-        )
+        Some(self.enqueue_critical_reinjection_frame_with_cause(
+            frame,
+            RelaySendCause::PathFailureReinjection,
+        ))
     }
 
-    pub(in crate::runtime) fn enqueue_critical_repair_frame_with_cause(
+    pub(in crate::runtime) fn enqueue_critical_reinjection_frame_with_cause(
         &mut self,
         frame: Frame,
         cause: RelaySendCause,
     ) -> u64 {
-        debug_assert!(cause.is_repair());
+        debug_assert!(cause.is_reinjection());
         let payload_bytes = reliable_stream_frame_accounted_bytes(&frame);
-        self.extra_traffic.record_repair(payload_bytes);
-        self.queue.push_critical_repair_with_cause(frame, cause)
+        self.extra_traffic.record_reinjection(payload_bytes);
+        self.queue
+            .push_critical_reinjection_with_cause(frame, cause)
     }
 
-    pub(in crate::runtime) fn has_queued_repair_overlap(&self, frame: &Frame) -> bool {
-        self.queue.has_queued_repair_overlap(frame)
+    pub(in crate::runtime) fn has_queued_reinjection_overlap(&self, frame: &Frame) -> bool {
+        self.queue.has_queued_reinjection_overlap(frame)
     }
 
     pub(in crate::runtime) fn dispatch_next(
         &mut self,
         path_stream: &ReliablePathStream,
         send_stream: &mut ReliableSendStream,
-        relay_lane: FlowLane,
+        relay_lane: TrafficClass,
         mux_limits: MuxLimits,
     ) -> Result<ServerResponseDispatch, RuntimeError> {
-        self.dispatch_next_with_ordered_owner_debt(
+        self.dispatch_next_with_data_ack_outstanding(
             path_stream,
             send_stream,
             relay_lane,
@@ -392,13 +428,13 @@ impl ServerResponseSenderService {
         )
     }
 
-    pub(in crate::runtime) fn dispatch_next_with_ordered_owner_debt(
+    pub(in crate::runtime) fn dispatch_next_with_data_ack_outstanding(
         &mut self,
         path_stream: &ReliablePathStream,
         send_stream: &mut ReliableSendStream,
-        relay_lane: FlowLane,
+        relay_lane: TrafficClass,
         mux_limits: MuxLimits,
-        ordered_owner_debt_bytes: usize,
+        data_ack_outstanding_bytes: usize,
     ) -> Result<ServerResponseDispatch, RuntimeError> {
         let (queued_lane, queued) = self
             .queue
@@ -424,10 +460,10 @@ impl ServerResponseSenderService {
                 0
             }
         };
-        let (frame, dispatch_lane_name, repair_cause) = match &queued.kind {
+        let (frame, dispatch_lane_name, reinjection_cause) = match &queued.kind {
             ReliableRelayQueuedWorkKind::Control(frame) => (frame.clone(), "control", None),
             ReliableRelayQueuedWorkKind::Data(payload) => {
-                let data_lane = queued.data_lane.unwrap_or(relay_lane);
+                let data_lane = response_data_dispatch_lane(queued.data_lane, relay_lane);
                 let dispatch_payload_bytes = response_dispatch_payload_bytes(
                     path_stream,
                     send_stream,
@@ -437,12 +473,12 @@ impl ServerResponseSenderService {
                 )
                 .ok_or(RuntimeError::SenderServiceBlocked)?;
                 let (dispatch_payload_bytes, planned) =
-                    plan_response_data_payload_with_ordered_debt_impl(
+                    plan_response_data_payload_with_data_ack_outstanding_impl(
                         path_stream,
                         data_lane,
                         send_stream.next_offset(),
                         dispatch_payload_bytes,
-                        ordered_owner_debt_bytes,
+                        data_ack_outstanding_bytes,
                     )?;
                 let dispatch_payload = payload.slice(..dispatch_payload_bytes);
                 #[cfg(feature = "lab-diagnostics")]
@@ -460,7 +496,7 @@ impl ServerResponseSenderService {
                     frame.clone(),
                     reliable_path_effective_frame_lane(&frame, data_lane),
                 ) {
-                    Ok(outcome) => {
+                    Ok(selected_path) => {
                         let committed = self
                             .queue
                             .commit_front_data_prefix(dispatch_payload_bytes)
@@ -471,7 +507,7 @@ impl ServerResponseSenderService {
                             queued_lane,
                             committed,
                             frame,
-                            outcome.selected_path,
+                            selected_path,
                             "data",
                             enqueue_id,
                             queue_delay_ms,
@@ -483,8 +519,8 @@ impl ServerResponseSenderService {
                     }
                 }
             }
-            ReliableRelayQueuedWorkKind::Repair { frame, cause } => {
-                (frame.clone(), "repair", Some(*cause))
+            ReliableRelayQueuedWorkKind::Reinjection { frame, cause } => {
+                (frame.clone(), "reinjection", Some(*cause))
             }
         };
         let selected_path = match queued_lane {
@@ -492,7 +528,7 @@ impl ServerResponseSenderService {
                 let (carrier_lane, emit_mode) = if queued.stream_ordered_carrier_emit {
                     (relay_lane, CarrierEmitMode::StreamOrdered)
                 } else {
-                    (FlowLane::Control, CarrierEmitMode::Classified)
+                    (TrafficClass::Control, CarrierEmitMode::Classified)
                 };
                 emit_response_frame_from_sender_service(
                     path_stream,
@@ -517,13 +553,13 @@ impl ServerResponseSenderService {
                     return Err(err);
                 }
             },
-            ReliableWorkClass::Repair => emit_response_frame_from_sender_service(
+            ReliableWorkClass::Reinjection => emit_response_frame_from_sender_service(
                 path_stream,
                 frame.clone(),
-                response_repair_carrier_lane(&frame),
+                response_reinjection_carrier_lane(&frame),
                 CarrierEmitMode::Classified,
-                "tail_repair",
-                repair_cause,
+                "tail_reinjection",
+                reinjection_cause,
             )?,
         };
         let (_, committed) = self
@@ -547,7 +583,7 @@ impl ServerResponseSenderService {
     fn finish_dispatched_work(
         &mut self,
         path_stream: &ReliablePathStream,
-        relay_lane: FlowLane,
+        relay_lane: TrafficClass,
         queued_lane: ReliableWorkClass,
         committed: ReliableRelayQueuedWork,
         frame: Frame,
@@ -558,11 +594,11 @@ impl ServerResponseSenderService {
     ) -> Result<ServerResponseDispatch, RuntimeError> {
         #[cfg(feature = "lab-diagnostics")]
         let send_lane = match queued_lane {
-            ReliableWorkClass::Control => FlowLane::Control,
-            ReliableWorkClass::Repair => response_repair_carrier_lane(&frame),
+            ReliableWorkClass::Control => TrafficClass::Control,
+            ReliableWorkClass::Reinjection => response_reinjection_carrier_lane(&frame),
             ReliableWorkClass::Data => reliable_path_effective_frame_lane(
                 &frame,
-                committed.data_lane.unwrap_or(relay_lane),
+                response_data_dispatch_lane(committed.data_lane, relay_lane),
             ),
         };
         #[cfg(feature = "lab-diagnostics")]

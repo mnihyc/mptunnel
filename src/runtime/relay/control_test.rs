@@ -1,50 +1,14 @@
 use super::*;
-use crate::model::path::{RelayPathInstance, RelayPathKey};
-use crate::protocol::{OffsetRange, StreamId, UnderlayProtocol};
+use crate::mux::MuxLimits;
+use crate::protocol::{OffsetRange, StreamId};
 use bytes::Bytes;
 
-fn request_test_path_instance(
-    underlay: UnderlayProtocol,
-    index: usize,
-    id: u64,
-) -> RelayPathInstance {
-    RelayPathInstance {
-        key: RelayPathKey { underlay, index },
-        id,
-    }
-}
-
 #[test]
-fn tcp_request_contention_requires_present_request_work() {
-    let threshold = 256 * 1024;
-    assert!(!reliable_tcp_service_request_bulk_flow_is_active(
-        true, threshold, threshold, 0, 0,
-    ));
-    assert!(reliable_tcp_service_request_bulk_flow_is_active(
-        true, threshold, threshold, 1, 0,
-    ));
-    assert!(!reliable_tcp_service_request_bulk_flow_is_active(
-        true,
-        threshold - 1,
-        threshold,
-        0,
-        1,
-    ));
-    assert!(!reliable_tcp_service_request_bulk_flow_is_active(
-        false, threshold, threshold, 1, 1,
-    ));
-    assert!(reliable_tcp_service_request_bulk_flow_is_active(
-        true, threshold, threshold, 0, 1,
-    ));
-}
-
-#[test]
-fn tcp_request_outstanding_limit_uses_service_reservoir_then_ack_headroom() {
+fn request_outstanding_limit_uses_connection_window_then_ack_headroom() {
     let mux_limits = MuxLimits::default();
     let payload_bytes = 64 * 1024;
     let mut window = RequestOutstandingWindow::new();
-    let tcp = request_test_path_instance(UnderlayProtocol::Tcp, 0, 1);
-    let limit = window.limit_bytes(Some(tcp), FlowLane::Throughput, payload_bytes, mux_limits);
+    let limit = window.limit_bytes(TrafficClass::Throughput, payload_bytes, mux_limits);
     assert_eq!(limit, 4 * 1024 * 1024);
 
     let mut send_stream = ReliableSendStream::new(StreamId(90), mux_limits);
@@ -65,7 +29,7 @@ fn tcp_request_outstanding_limit_uses_service_reservoir_then_ack_headroom() {
     assert_eq!(
         reliable_relay_request_outstanding_headroom_bytes(&send_stream, &sender_queue, limit),
         0,
-        "raw request data and ACK-retained repair bytes share one unique-byte budget"
+        "raw request data and Data-ACK-retained ranges share one unique-byte budget"
     );
     let ack = send_stream.apply_ack(&[OffsetRange {
         start: 0,

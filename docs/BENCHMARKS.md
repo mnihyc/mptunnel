@@ -49,16 +49,21 @@ The current developer profile is `developer-gates-v1`.
 | `file_download_goodput` | large-download goodput | >= 240 Mbps |
 | `aggregation_efficiency` | achieved goodput divided by usable healthy-path capacity | >= 0.70 |
 | `ideal_lab_goodput` | modeled clean-lab aggregate goodput | >= 950 Mbps |
-| `failover_gap` | first repaired delivery gap after path failure | <= 500 ms |
-| `failover_repair` | repaired chunks after path failure | >= 1 |
+| `failover_gap` | first survivor delivery gap after path failure | <= 500 ms |
+| `failover_reinjection` | MPP chunks reinjected after path failure | >= 1 |
 | `chacha20poly1305_cpu` | local AEAD encrypt+decrypt cost | <= 300 core-s/GiB |
 | `aes256gcm_cpu` | local AEAD encrypt+decrypt cost | <= 300 core-s/GiB |
-| `stream_ram_budget` | default stream window+repair+reorder envelope | <= 192 MiB |
+| `stream_ram_budget` | default stream window+retained-data+reorder envelope | <= 192 MiB |
 | `datagram_ram_budget` | default datagram queue budget | <= 16 MiB |
 | `path_flight_budget` | default path flight budget | <= 64 MiB |
 | `lab_hot_path_ram_budget` | modeled hot-path RAM budget for manual lab target | <= 256 MiB |
 
-The CPU gates measure both AES-256-GCM and ChaCha20-Poly1305 because supported machines vary by architecture and hardware acceleration. AES-256-GCM is the production default, while ChaCha20-Poly1305 remains a selectable profile for deployments where it performs better.
+The CPU gates measure the MPP TCP record layer with both AES-256-GCM and
+ChaCha20-Poly1305 because supported machines vary by architecture and hardware
+acceleration. AES-256-GCM is the TCP record-layer default, while
+ChaCha20-Poly1305 remains selectable when both peers use it. QUIC uses its own
+TLS 1.3 cipher-suite selection through rustls and is not measured by these two
+gates.
 
 ## Options
 

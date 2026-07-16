@@ -10,7 +10,7 @@ use crate::mux::MuxLimits;
 use crate::mux::stream::ReliableSendStream;
 use crate::protocol::frame::{reliable_stream_frame_accounted_bytes, reliable_stream_frame_extent};
 use crate::protocol::{Frame, OffsetRange};
-use crate::scheduler::FlowLane;
+use crate::scheduler::TrafficClass;
 use bytes::Bytes;
 use std::collections::VecDeque;
 use std::time::Instant;
@@ -19,21 +19,22 @@ use std::time::Instant;
 pub(in crate::runtime) enum ReliableRelayQueuedWorkKind {
     Control(Frame),
     Data(Bytes),
-    Repair { frame: Frame, cause: RelaySendCause },
+    Reinjection { frame: Frame, cause: RelaySendCause },
 }
 
 #[derive(Debug, Clone)]
 /// Byte-bounded queue for product reliable work awaiting sender admission.
 ///
-/// This is above carrier paths: it is sized by product flow-control and repair
+/// This is above carrier paths: it is sized by product flow-control and
+/// reinjection
 /// envelopes, not by TCP socket buffers or QUIC packet queues. Normal target
 /// bytes remain raw bytes until dispatch, so the sender-service executor owns
-/// the point where bytes become STREAM_DATA. Repair STREAM_DATA enters a
+/// the point where bytes become STREAM_DATA. Reinserted STREAM_DATA enters a
 /// separate lane even though its wire frame kind is still STREAM_DATA.
 pub(in crate::runtime) struct ReliableRelayQueuedWork {
     pub(in crate::runtime) kind: ReliableRelayQueuedWorkKind,
     pub(in crate::runtime) payload_bytes: usize,
-    pub(in crate::runtime) data_lane: Option<FlowLane>,
+    pub(in crate::runtime) data_lane: Option<TrafficClass>,
     pub(in crate::runtime) stream_ordered_carrier_emit: bool,
     #[cfg(feature = "lab-diagnostics")]
     pub(in crate::runtime) enqueue_id: u64,
@@ -48,8 +49,8 @@ pub(in crate::runtime) struct ReliableRelayQueuedWork {
 /// queues must receive only already-admitted frames.
 pub(in crate::runtime) struct ReliableRelaySenderQueue {
     control: VecDeque<ReliableRelayQueuedWork>,
-    critical_repair: VecDeque<ReliableRelayQueuedWork>,
-    repair: VecDeque<ReliableRelayQueuedWork>,
+    critical_reinjection: VecDeque<ReliableRelayQueuedWork>,
+    reinjection: VecDeque<ReliableRelayQueuedWork>,
     data: VecDeque<ReliableRelayQueuedWork>,
     final_control: VecDeque<ReliableRelayQueuedWork>,
     bytes: usize,
@@ -61,8 +62,8 @@ pub(in crate::runtime) struct ReliableRelaySenderQueue {
 impl ReliableRelaySenderQueue {
     pub(in crate::runtime) fn is_empty(&self) -> bool {
         self.control.is_empty()
-            && self.critical_repair.is_empty()
-            && self.repair.is_empty()
+            && self.critical_reinjection.is_empty()
+            && self.reinjection.is_empty()
             && self.data.is_empty()
             && self.final_control.is_empty()
     }
@@ -98,10 +99,14 @@ impl ReliableRelaySenderQueue {
     }
 
     pub(in crate::runtime) fn push_data(&mut self, payload: Bytes) -> u64 {
-        self.push_data_for_lane(payload, FlowLane::Throughput)
+        self.push_data_for_lane(payload, TrafficClass::Throughput)
     }
 
-    pub(in crate::runtime) fn push_data_for_lane(&mut self, payload: Bytes, lane: FlowLane) -> u64 {
+    pub(in crate::runtime) fn push_data_for_lane(
+        &mut self,
+        payload: Bytes,
+        lane: TrafficClass,
+    ) -> u64 {
         let payload_bytes = payload.len();
         self.push_work(
             ReliableWorkClass::Data,
@@ -112,47 +117,47 @@ impl ReliableRelaySenderQueue {
         )
     }
 
-    pub(in crate::runtime) fn push_repair(&mut self, frame: Frame) -> u64 {
-        self.push_repair_with_cause(frame, RelaySendCause::AckGapRepair)
+    pub(in crate::runtime) fn push_reinjection(&mut self, frame: Frame) -> u64 {
+        self.push_reinjection_with_cause(frame, RelaySendCause::AckGapReinjection)
     }
 
-    pub(in crate::runtime) fn push_repair_with_cause(
+    pub(in crate::runtime) fn push_reinjection_with_cause(
         &mut self,
         frame: Frame,
         cause: RelaySendCause,
     ) -> u64 {
-        self.push_repair_with_priority(frame, cause, false)
+        self.push_reinjection_with_priority(frame, cause, false)
     }
 
-    pub(in crate::runtime) fn push_critical_repair_with_cause(
+    pub(in crate::runtime) fn push_critical_reinjection_with_cause(
         &mut self,
         frame: Frame,
         cause: RelaySendCause,
     ) -> u64 {
-        self.push_repair_with_priority(frame, cause, true)
+        self.push_reinjection_with_priority(frame, cause, true)
     }
 
-    fn push_repair_with_priority(
+    fn push_reinjection_with_priority(
         &mut self,
         frame: Frame,
         cause: RelaySendCause,
         critical: bool,
     ) -> u64 {
-        debug_assert!(cause.is_repair());
+        debug_assert!(cause.is_reinjection());
         let payload_bytes = reliable_stream_frame_accounted_bytes(&frame);
         let enqueue_id = self.push_work(
-            ReliableWorkClass::Repair,
-            ReliableRelayQueuedWorkKind::Repair { frame, cause },
+            ReliableWorkClass::Reinjection,
+            ReliableRelayQueuedWorkKind::Reinjection { frame, cause },
             None,
             false,
             payload_bytes,
         );
         if critical {
             let work = self
-                .repair
+                .reinjection
                 .pop_back()
-                .expect("newly pushed repair must exist");
-            self.critical_repair.push_back(work);
+                .expect("newly pushed reinjection must exist");
+            self.critical_reinjection.push_back(work);
         }
         enqueue_id
     }
@@ -161,7 +166,7 @@ impl ReliableRelaySenderQueue {
         &mut self,
         lane: ReliableWorkClass,
         kind: ReliableRelayQueuedWorkKind,
-        data_lane: Option<FlowLane>,
+        data_lane: Option<TrafficClass>,
         final_control: bool,
         payload_bytes: usize,
     ) -> u64 {
@@ -193,7 +198,7 @@ impl ReliableRelaySenderQueue {
             }
             ReliableWorkClass::Control => self.control.push_back(work),
             ReliableWorkClass::Data => self.data.push_back(work),
-            ReliableWorkClass::Repair => self.repair.push_back(work),
+            ReliableWorkClass::Reinjection => self.reinjection.push_back(work),
         }
         enqueue_id
     }
@@ -203,12 +208,12 @@ impl ReliableRelaySenderQueue {
     ) -> Option<(ReliableWorkClass, &ReliableRelayQueuedWork)> {
         if let Some(work) = self.control.front() {
             Some((ReliableWorkClass::Control, work))
-        } else if let Some(work) = self.critical_repair.front() {
-            Some((ReliableWorkClass::Repair, work))
+        } else if let Some(work) = self.critical_reinjection.front() {
+            Some((ReliableWorkClass::Reinjection, work))
         } else if let Some(work) = self.data.front() {
             Some((ReliableWorkClass::Data, work))
-        } else if let Some(work) = self.repair.front() {
-            Some((ReliableWorkClass::Repair, work))
+        } else if let Some(work) = self.reinjection.front() {
+            Some((ReliableWorkClass::Reinjection, work))
         } else {
             self.final_control
                 .front()
@@ -216,28 +221,29 @@ impl ReliableRelaySenderQueue {
         }
     }
 
-    pub(super) fn persistent_ack_gap_repair_deadline(&self) -> Option<Instant> {
-        self.critical_repair
+    pub(super) fn persistent_ack_gap_reinjection_deadline(&self) -> Option<Instant> {
+        self.critical_reinjection
             .iter()
-            .chain(self.repair.iter())
+            .chain(self.reinjection.iter())
             .filter_map(|work| match &work.kind {
-                ReliableRelayQueuedWorkKind::Repair { cause, .. } => {
-                    cause.persistent_ack_gap_repair_deadline()
+                ReliableRelayQueuedWorkKind::Reinjection { cause, .. } => {
+                    cause.persistent_ack_gap_reinjection_deadline()
                 }
                 _ => None,
             })
             .min()
     }
 
-    pub(in crate::runtime) fn has_queued_repair_overlap(&self, frame: &Frame) -> bool {
+    pub(in crate::runtime) fn has_queued_reinjection_overlap(&self, frame: &Frame) -> bool {
         let Some((start, end, _)) = reliable_stream_frame_extent(frame) else {
             return false;
         };
-        self.critical_repair
+        self.critical_reinjection
             .iter()
-            .chain(self.repair.iter())
+            .chain(self.reinjection.iter())
             .any(|work| {
-                let ReliableRelayQueuedWorkKind::Repair { frame: queued, .. } = &work.kind else {
+                let ReliableRelayQueuedWorkKind::Reinjection { frame: queued, .. } = &work.kind
+                else {
                     return false;
                 };
                 let Some((queued_start, queued_end, _)) = reliable_stream_frame_extent(queued)
@@ -248,66 +254,87 @@ impl ReliableRelaySenderQueue {
             })
     }
 
-    pub(in crate::runtime) fn release_normalized_acked_repairs(
+    pub(in crate::runtime) fn release_normalized_acked_reinjections(
         &mut self,
         ranges: &[OffsetRange],
     ) -> usize {
         if ranges.is_empty() {
             return 0;
         }
-        let released = prune_acked_repair_queue(&mut self.critical_repair, ranges)
-            .saturating_add(prune_acked_repair_queue(&mut self.repair, ranges));
+        let released = prune_acked_reinjection_queue(&mut self.critical_reinjection, ranges)
+            .saturating_add(prune_acked_reinjection_queue(&mut self.reinjection, ranges));
         self.bytes = self.bytes.saturating_sub(released);
         released
     }
 
-    pub(in crate::runtime) fn discard_unusable_live_owner_tail_repairs(
+    pub(in crate::runtime) fn discard_unusable_tail_reinjections(
         &mut self,
         usable: impl Fn(&Frame) -> bool,
     ) -> usize {
         let released =
-            discard_unusable_live_owner_tail_repair_queue(&mut self.critical_repair, &usable)
-                .saturating_add(discard_unusable_live_owner_tail_repair_queue(
-                    &mut self.repair,
+            discard_unusable_tail_reinjection_queue(&mut self.critical_reinjection, &usable)
+                .saturating_add(discard_unusable_tail_reinjection_queue(
+                    &mut self.reinjection,
                     &usable,
                 ));
         self.bytes = self.bytes.saturating_sub(released);
         released
     }
 
-    pub(in crate::runtime) fn discard_stale_persistent_ack_gap_repairs(
+    pub(in crate::runtime) fn discard_stale_persistent_ack_gap_reinjections(
         &mut self,
         usable: impl Fn(RelaySendCause) -> bool,
     ) -> usize {
         let now = Instant::now();
-        let released =
-            discard_stale_persistent_ack_gap_repair_queue(&mut self.critical_repair, now, &usable)
-                .saturating_add(discard_stale_persistent_ack_gap_repair_queue(
-                    &mut self.repair,
-                    now,
-                    &usable,
-                ));
+        let released = discard_stale_persistent_ack_gap_reinjection_queue(
+            &mut self.critical_reinjection,
+            now,
+            &usable,
+        )
+        .saturating_add(discard_stale_persistent_ack_gap_reinjection_queue(
+            &mut self.reinjection,
+            now,
+            &usable,
+        ));
         self.bytes = self.bytes.saturating_sub(released);
         released
     }
 
-    pub(super) fn discard_persistent_ack_gap_repair_batch(
+    pub(in crate::runtime) fn discard_resolved_stale_path_reinjections(
+        &mut self,
+        path_is_stale: impl Fn(crate::model::path::RelayPathInstance) -> bool,
+    ) -> usize {
+        let released = discard_resolved_stale_path_reinjection_queue(
+            &mut self.critical_reinjection,
+            &path_is_stale,
+        )
+        .saturating_add(discard_resolved_stale_path_reinjection_queue(
+            &mut self.reinjection,
+            &path_is_stale,
+        ));
+        self.bytes = self.bytes.saturating_sub(released);
+        released
+    }
+
+    pub(super) fn discard_persistent_ack_gap_reinjection_batch(
         &mut self,
         cause: RelaySendCause,
     ) -> usize {
         if !matches!(
             cause,
-            RelaySendCause::PersistentClientAckGapRepair(_)
-                | RelaySendCause::PersistentServerAckGapRepair(_)
+            RelaySendCause::PersistentClientAckGapReinjection(_)
+                | RelaySendCause::PersistentServerAckGapReinjection(_)
         ) {
             return 0;
         }
-        let released =
-            discard_persistent_ack_gap_repair_batch_from_queue(&mut self.critical_repair, cause)
-                .saturating_add(discard_persistent_ack_gap_repair_batch_from_queue(
-                    &mut self.repair,
-                    cause,
-                ));
+        let released = discard_persistent_ack_gap_reinjection_batch_from_queue(
+            &mut self.critical_reinjection,
+            cause,
+        )
+        .saturating_add(discard_persistent_ack_gap_reinjection_batch_from_queue(
+            &mut self.reinjection,
+            cause,
+        ));
         self.bytes = self.bytes.saturating_sub(released);
         released
     }
@@ -317,12 +344,12 @@ impl ReliableRelaySenderQueue {
     ) -> Option<(ReliableWorkClass, ReliableRelayQueuedWork)> {
         let (lane, work) = if let Some(work) = self.control.pop_front() {
             (ReliableWorkClass::Control, work)
-        } else if let Some(work) = self.critical_repair.pop_front() {
-            (ReliableWorkClass::Repair, work)
+        } else if let Some(work) = self.critical_reinjection.pop_front() {
+            (ReliableWorkClass::Reinjection, work)
         } else if let Some(work) = self.data.pop_front() {
             (ReliableWorkClass::Data, work)
-        } else if let Some(work) = self.repair.pop_front() {
-            (ReliableWorkClass::Repair, work)
+        } else if let Some(work) = self.reinjection.pop_front() {
+            (ReliableWorkClass::Reinjection, work)
         } else {
             (ReliableWorkClass::Control, self.final_control.pop_front()?)
         };
@@ -374,18 +401,18 @@ impl ReliableRelaySenderQueue {
     }
 }
 
-fn prune_acked_repair_queue(
+fn prune_acked_reinjection_queue(
     queue: &mut VecDeque<ReliableRelayQueuedWork>,
     ranges: &[OffsetRange],
 ) -> usize {
     let mut released = 0usize;
     let mut retained = VecDeque::with_capacity(queue.len());
     while let Some(work) = queue.pop_front() {
-        let ReliableRelayQueuedWorkKind::Repair { frame, cause } = &work.kind else {
+        let ReliableRelayQueuedWorkKind::Reinjection { frame, cause } = &work.kind else {
             retained.push_back(work);
             continue;
         };
-        let slices = unacked_repair_frame_slices(frame, ranges);
+        let slices = unacked_reinjection_frame_slices(frame, ranges);
         let retained_bytes = slices
             .iter()
             .map(reliable_stream_frame_accounted_bytes)
@@ -394,7 +421,7 @@ fn prune_acked_repair_queue(
         for frame in slices {
             let mut retained_work = work.clone();
             retained_work.payload_bytes = reliable_stream_frame_accounted_bytes(&frame);
-            retained_work.kind = ReliableRelayQueuedWorkKind::Repair {
+            retained_work.kind = ReliableRelayQueuedWorkKind::Reinjection {
                 frame,
                 cause: *cause,
             };
@@ -405,16 +432,16 @@ fn prune_acked_repair_queue(
     released
 }
 
-fn discard_unusable_live_owner_tail_repair_queue(
+fn discard_unusable_tail_reinjection_queue(
     queue: &mut VecDeque<ReliableRelayQueuedWork>,
     usable: &impl Fn(&Frame) -> bool,
 ) -> usize {
     let mut released = 0usize;
     queue.retain(|work| {
-        let ReliableRelayQueuedWorkKind::Repair { frame, cause } = &work.kind else {
+        let ReliableRelayQueuedWorkKind::Reinjection { frame, cause } = &work.kind else {
             return true;
         };
-        let keep = *cause != RelaySendCause::LiveOwnerTailRepair || usable(frame);
+        let keep = *cause != RelaySendCause::TailReinjection || usable(frame);
         if !keep {
             released = released.saturating_add(work.payload_bytes);
         }
@@ -423,22 +450,22 @@ fn discard_unusable_live_owner_tail_repair_queue(
     released
 }
 
-fn discard_stale_persistent_ack_gap_repair_queue(
+fn discard_stale_persistent_ack_gap_reinjection_queue(
     queue: &mut VecDeque<ReliableRelayQueuedWork>,
     now: Instant,
     usable: &impl Fn(RelaySendCause) -> bool,
 ) -> usize {
     let mut released = 0usize;
     queue.retain(|work| {
-        let ReliableRelayQueuedWorkKind::Repair { cause, .. } = &work.kind else {
+        let ReliableRelayQueuedWorkKind::Reinjection { cause, .. } = &work.kind else {
             return true;
         };
         let bound = matches!(
             cause,
-            RelaySendCause::PersistentClientAckGapRepair(_)
-                | RelaySendCause::PersistentServerAckGapRepair(_)
+            RelaySendCause::PersistentClientAckGapReinjection(_)
+                | RelaySendCause::PersistentServerAckGapReinjection(_)
         );
-        let keep = !bound || (!cause.persistent_ack_gap_repair_expired(now) && usable(*cause));
+        let keep = !bound || (!cause.persistent_ack_gap_reinjection_expired(now) && usable(*cause));
         if !keep {
             released = released.saturating_add(work.payload_bytes);
         }
@@ -447,7 +474,28 @@ fn discard_stale_persistent_ack_gap_repair_queue(
     released
 }
 
-fn discard_persistent_ack_gap_repair_batch_from_queue(
+fn discard_resolved_stale_path_reinjection_queue(
+    queue: &mut VecDeque<ReliableRelayQueuedWork>,
+    path_is_stale: &impl Fn(crate::model::path::RelayPathInstance) -> bool,
+) -> usize {
+    let mut released = 0usize;
+    queue.retain(|work| {
+        let keep = !matches!(
+            &work.kind,
+            ReliableRelayQueuedWorkKind::Reinjection {
+                cause: RelaySendCause::StalePathReinjection(path),
+                ..
+            } if !path_is_stale(*path)
+        );
+        if !keep {
+            released = released.saturating_add(work.payload_bytes);
+        }
+        keep
+    });
+    released
+}
+
+fn discard_persistent_ack_gap_reinjection_batch_from_queue(
     queue: &mut VecDeque<ReliableRelayQueuedWork>,
     batch_cause: RelaySendCause,
 ) -> usize {
@@ -455,7 +503,7 @@ fn discard_persistent_ack_gap_repair_batch_from_queue(
     queue.retain(|work| {
         let keep = !matches!(
             &work.kind,
-            ReliableRelayQueuedWorkKind::Repair { cause, .. } if *cause == batch_cause
+            ReliableRelayQueuedWorkKind::Reinjection { cause, .. } if *cause == batch_cause
         );
         if !keep {
             released = released.saturating_add(work.payload_bytes);
@@ -465,7 +513,7 @@ fn discard_persistent_ack_gap_repair_batch_from_queue(
     released
 }
 
-fn unacked_repair_frame_slices(frame: &Frame, ranges: &[OffsetRange]) -> Vec<Frame> {
+fn unacked_reinjection_frame_slices(frame: &Frame, ranges: &[OffsetRange]) -> Vec<Frame> {
     let Frame::StreamData {
         stream_id,
         offset,

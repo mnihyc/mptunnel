@@ -3,7 +3,7 @@ use aes_gcm::{Aes256Gcm, Nonce as AesNonce};
 use chacha20poly1305::{ChaCha20Poly1305, Nonce as ChaChaNonce};
 use mptunnel::config::ResourceLimits;
 use mptunnel::protocol::{PathId, UnderlayProtocol};
-use mptunnel::scheduler::{FlowLane, PathSnapshot};
+use mptunnel::scheduler::{PathSnapshot, TrafficClass};
 use mptunnel::simulator::{Simulator, VirtualPath};
 use serde::Serialize;
 use std::hint::black_box;
@@ -209,9 +209,9 @@ pub fn run_benchmarks(options: BenchmarkOptions) -> Result<BenchmarkReport, Benc
         "ms",
     ));
     gates.push(at_least(
-        "failover_repair",
-        "repaired_chunks",
-        failover.repaired_chunks as f64,
+        "failover_reinjection",
+        "reinjected_chunks",
+        failover.reinjected_chunks as f64,
         1.0,
         "chunks",
     ));
@@ -282,13 +282,13 @@ impl AblationReport {
         out.push_str("rows:\n");
         for row in &self.rows {
             out.push_str(&format!(
-                "  {}: page_p95={:.3} ms, download={:.3} Mbps, aggregation={:.3}, failover_gap={:.3} ms, repaired_chunks={}\n",
+                "  {}: page_p95={:.3} ms, download={:.3} Mbps, aggregation={:.3}, failover_gap={:.3} ms, reinjected_chunks={}\n",
                 row.name,
                 row.page_interactive_p95_ms,
                 row.download_goodput_mbps,
                 row.aggregation_efficiency,
                 row.failover_gap_ms,
-                row.repaired_chunks
+                row.reinjected_chunks
             ));
         }
         out
@@ -307,7 +307,7 @@ pub struct AblationRow {
     pub download_goodput_mbps: f64,
     pub aggregation_efficiency: f64,
     pub failover_gap_ms: f64,
-    pub repaired_chunks: usize,
+    pub reinjected_chunks: usize,
 }
 
 pub fn run_ablation_study() -> AblationReport {
@@ -354,14 +354,10 @@ pub fn run_ablation_study() -> AblationReport {
     }
 }
 
-fn ablation_row(
-    name: &str,
-    path_profile: &str,
-    paths: Vec<VirtualPath>,
-) -> AblationRow {
+fn ablation_row(name: &str, path_profile: &str, paths: Vec<VirtualPath>) -> AblationRow {
     let mut page_simulator = Simulator::new(paths.clone());
     page_simulator
-        .schedule_transfer(FlowLane::Throughput, 128 * MIB, MIB)
+        .schedule_transfer(TrafficClass::Throughput, 128 * MIB, MIB)
         .expect("ablation paths schedule background bulk");
     let page_interactive_p95_ms = page_simulator
         .route_interactive_burst(1024, 20, 5.0)
@@ -371,13 +367,13 @@ fn ablation_row(
 
     let mut download_simulator = Simulator::new(paths.clone());
     let download = download_simulator
-        .schedule_transfer(FlowLane::Throughput, 512 * MIB, MIB)
+        .schedule_transfer(TrafficClass::Throughput, 512 * MIB, MIB)
         .expect("ablation paths schedule file download");
 
     let mut failover_simulator = Simulator::new(failover_paths_for(paths));
     let failover = failover_simulator
-        .schedule_transfer_with_repair(FlowLane::Throughput, 8 * MIB, 256 * 1024, 10.0)
-        .expect("ablation paths schedule repaired transfer");
+        .schedule_transfer_with_reinjection(TrafficClass::Throughput, 8 * MIB, 256 * 1024, 10.0)
+        .expect("ablation paths schedule transfer with reinjection");
 
     AblationRow {
         name: name.to_string(),
@@ -386,7 +382,7 @@ fn ablation_row(
         download_goodput_mbps: download.achieved_goodput_bps() / 1_000_000.0,
         aggregation_efficiency: download.aggregation_efficiency(mbps(1_000.0)),
         failover_gap_ms: failover.failover_gap_ms.unwrap_or(f64::INFINITY),
-        repaired_chunks: failover.repaired_chunks,
+        reinjected_chunks: failover.reinjected_chunks,
     }
 }
 
@@ -442,7 +438,7 @@ struct PageLoadMetrics {
 fn page_load_benchmark() -> PageLoadMetrics {
     let mut simulator = Simulator::new(browser_paths());
     simulator
-        .schedule_transfer(FlowLane::Throughput, 128 * MIB, MIB)
+        .schedule_transfer(TrafficClass::Throughput, 128 * MIB, MIB)
         .expect("benchmark paths schedule bulk warmup");
 
     let start_ms = simulator.now_ms();
@@ -450,7 +446,7 @@ fn page_load_benchmark() -> PageLoadMetrics {
     for _ in 0..4 {
         completions.push(
             simulator
-                .route(FlowLane::Control, 768)
+                .route(TrafficClass::Control, 768)
                 .expect("benchmark paths schedule control")
                 .estimated_completion_ms
                 - start_ms,
@@ -458,7 +454,7 @@ fn page_load_benchmark() -> PageLoadMetrics {
     }
     completions.push(
         simulator
-            .route(FlowLane::Latency, 32 * 1024)
+            .route(TrafficClass::Latency, 32 * 1024)
             .expect("benchmark paths schedule html")
             .estimated_completion_ms
             - start_ms,
@@ -466,7 +462,7 @@ fn page_load_benchmark() -> PageLoadMetrics {
     for _ in 0..72 {
         completions.push(
             simulator
-                .route(FlowLane::Latency, 24 * 1024)
+                .route(TrafficClass::Latency, 24 * 1024)
                 .expect("benchmark paths schedule page object")
                 .estimated_completion_ms
                 - start_ms,
@@ -477,7 +473,7 @@ fn page_load_benchmark() -> PageLoadMetrics {
 
     let mut interactive_simulator = Simulator::new(browser_paths());
     interactive_simulator
-        .schedule_transfer(FlowLane::Throughput, 128 * MIB, MIB)
+        .schedule_transfer(TrafficClass::Throughput, 128 * MIB, MIB)
         .expect("benchmark paths schedule background bulk");
     let interactive_p95_ms = interactive_simulator
         .route_interactive_burst(1024, 20, 5.0)
@@ -499,7 +495,7 @@ struct VideoMetrics {
 fn video_streaming_benchmark() -> VideoMetrics {
     let mut simulator = Simulator::new(browser_paths());
     let first_segment = simulator
-        .schedule_transfer(FlowLane::Throughput, 3 * MIB, 512 * 1024)
+        .schedule_transfer(TrafficClass::Throughput, 3 * MIB, 512 * 1024)
         .expect("benchmark paths schedule first video segment");
     let startup_ms = first_segment.duration_ms();
     let playback_origin_ms = first_segment.completion_ms;
@@ -509,7 +505,7 @@ fn video_streaming_benchmark() -> VideoMetrics {
         let request_at_ms = segment_index as f64 * 1_500.0;
         simulator.advance_to(request_at_ms);
         let segment = simulator
-            .schedule_transfer(FlowLane::Throughput, 3 * MIB, 512 * 1024)
+            .schedule_transfer(TrafficClass::Throughput, 3 * MIB, 512 * 1024)
             .expect("benchmark paths schedule video segment");
         let playback_deadline_ms = playback_origin_ms + segment_index as f64 * 2_000.0;
         if segment.completion_ms > playback_deadline_ms {
@@ -532,7 +528,7 @@ struct DownloadMetrics {
 fn file_download_benchmark() -> DownloadMetrics {
     let mut simulator = Simulator::new(download_paths());
     let transfer = simulator
-        .schedule_transfer(FlowLane::Throughput, 512 * MIB, MIB)
+        .schedule_transfer(TrafficClass::Throughput, 512 * MIB, MIB)
         .expect("benchmark paths schedule file download");
     DownloadMetrics {
         goodput_mbps: transfer.achieved_goodput_bps() / 1_000_000.0,
@@ -543,7 +539,7 @@ fn file_download_benchmark() -> DownloadMetrics {
 fn ideal_lab_benchmark() -> DownloadMetrics {
     let mut simulator = Simulator::new(ideal_lab_paths());
     let transfer = simulator
-        .schedule_transfer(FlowLane::Throughput, 1024 * MIB, MIB)
+        .schedule_transfer(TrafficClass::Throughput, 1024 * MIB, MIB)
         .expect("ideal lab paths schedule file download");
     DownloadMetrics {
         goodput_mbps: transfer.achieved_goodput_bps() / 1_000_000.0,
@@ -554,24 +550,22 @@ fn ideal_lab_benchmark() -> DownloadMetrics {
 #[derive(Debug, Clone, Copy)]
 struct FailoverMetrics {
     gap_ms: f64,
-    repaired_chunks: usize,
+    reinjected_chunks: usize,
 }
 
 fn failover_benchmark() -> FailoverMetrics {
     let primary = PathSnapshot::new(PathId(0), UnderlayProtocol::Udp, 20.0, mbps(120.0));
     let survivor = PathSnapshot::new(PathId(1), UnderlayProtocol::Udp, 80.0, mbps(160.0));
-    let mut simulator = Simulator::new(
-        vec![
-            VirtualPath::new(primary).with_failure_at(70.0),
-            VirtualPath::new(survivor),
-        ],
-    );
+    let mut simulator = Simulator::new(vec![
+        VirtualPath::new(primary).with_failure_at(70.0),
+        VirtualPath::new(survivor),
+    ]);
     let transfer = simulator
-        .schedule_transfer_with_repair(FlowLane::Throughput, 8 * MIB, 256 * 1024, 10.0)
-        .expect("benchmark paths schedule repaired transfer");
+        .schedule_transfer_with_reinjection(TrafficClass::Throughput, 8 * MIB, 256 * 1024, 10.0)
+        .expect("benchmark paths schedule transfer with reinjection");
     FailoverMetrics {
         gap_ms: transfer.failover_gap_ms.unwrap_or(f64::INFINITY),
-        repaired_chunks: transfer.repaired_chunks,
+        reinjected_chunks: transfer.reinjected_chunks,
     }
 }
 

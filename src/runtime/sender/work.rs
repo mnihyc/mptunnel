@@ -2,15 +2,12 @@
 
 use crate::model::capacity::{PATH_OPEN_SCORE_BYTES, reliable_bulk_carrier_feed_quantum_bytes};
 use crate::model::path::{CarrierPathKey, RelayPathInstance, RelayPathKey};
+use crate::model::timing::reliable_ack_gap_reinjection_batch_lifetime;
 use crate::mux::MuxLimits;
 use crate::protocol::Frame;
 use crate::runtime::RuntimeError;
-use crate::runtime::path::commands::{
-    ReliablePathCommandSender, reliable_path_effective_frame_lane,
-    reliable_path_stream_ordered_queue_lane,
-};
-use crate::runtime::relay::io::reliable_ack_gap_repair_delay;
-use crate::scheduler::{FlowLane, PathSnapshot};
+use crate::runtime::path::commands::ReliablePathCommandSender;
+use crate::scheduler::{PathSnapshot, TrafficClass};
 use std::time::Instant;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -20,22 +17,11 @@ pub(in crate::runtime) enum CarrierEmitMode {
 }
 
 impl CarrierEmitMode {
-    pub(in crate::runtime::sender) fn effective_lane(
-        self,
-        frame: &Frame,
-        lane: FlowLane,
-    ) -> FlowLane {
-        match self {
-            Self::Classified => reliable_path_effective_frame_lane(frame, lane),
-            Self::StreamOrdered => reliable_path_stream_ordered_queue_lane(),
-        }
-    }
-
     pub(in crate::runtime::sender) fn try_enqueue_frame(
         self,
         commands: &ReliablePathCommandSender,
         frame: Frame,
-        lane: FlowLane,
+        lane: TrafficClass,
     ) -> Result<(), RuntimeError> {
         match self {
             Self::Classified => commands.try_enqueue_admitted_frame(frame, lane),
@@ -51,7 +37,7 @@ pub(in crate::runtime) fn sender_extra_traffic_startup_floor_bytes(mux_limits: M
         .max(1)
 }
 
-pub(in crate::runtime) fn sender_repair_minimum_useful_attempt_bytes(
+pub(in crate::runtime) fn sender_reinjection_minimum_useful_attempt_bytes(
     mux_limits: MuxLimits,
 ) -> usize {
     PATH_OPEN_SCORE_BYTES
@@ -61,25 +47,25 @@ pub(in crate::runtime) fn sender_repair_minimum_useful_attempt_bytes(
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(in crate::runtime) struct ClientRepairOutputIdentity {
+pub(in crate::runtime) struct ClientReinjectionOutputIdentity {
     pub(in crate::runtime::sender) instance: RelayPathInstance,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(in crate::runtime) struct ServerRepairOutputIdentity {
+pub(in crate::runtime) struct ServerReinjectionOutputIdentity {
     pub(in crate::runtime::sender) key: CarrierPathKey,
     pub(in crate::runtime::sender) incarnation: u64,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(in crate::runtime) struct PersistentClientAckGapBatch {
-    pub(in crate::runtime::sender) target: ClientRepairOutputIdentity,
+    pub(in crate::runtime::sender) target: ClientReinjectionOutputIdentity,
     pub(in crate::runtime::sender) expires_at: Instant,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(in crate::runtime) struct PersistentServerAckGapBatch {
-    pub(in crate::runtime::sender) target: ServerRepairOutputIdentity,
+    pub(in crate::runtime::sender) target: ServerReinjectionOutputIdentity,
     pub(in crate::runtime::sender) expires_at: Instant,
 }
 
@@ -88,13 +74,13 @@ pub(in crate::runtime) enum RelaySendCause {
     StreamData,
     StreamFin,
     RecvProgress,
-    RecvProgressRecovery,
-    AckGapRepair,
-    PersistentAckGapRepair,
-    PersistentClientAckGapRepair(PersistentClientAckGapBatch),
-    PersistentServerAckGapRepair(PersistentServerAckGapBatch),
-    LiveOwnerTailRepair,
-    PathFailureRepair,
+    AckGapReinjection,
+    PersistentAckGapReinjection,
+    PersistentClientAckGapReinjection(PersistentClientAckGapBatch),
+    PersistentServerAckGapReinjection(PersistentServerAckGapBatch),
+    TailReinjection,
+    PathFailureReinjection,
+    StalePathReinjection(RelayPathInstance),
 }
 
 impl RelaySendCause {
@@ -104,99 +90,104 @@ impl RelaySendCause {
             Self::StreamData => "stream_data",
             Self::StreamFin => "stream_fin",
             Self::RecvProgress => "recv_progress",
-            Self::RecvProgressRecovery => "recv_progress_recovery",
-            Self::AckGapRepair => "ack_gap_repair",
-            Self::PersistentAckGapRepair
-            | Self::PersistentClientAckGapRepair(_)
-            | Self::PersistentServerAckGapRepair(_) => "persistent_ack_gap_repair",
-            Self::LiveOwnerTailRepair => "live_owner_tail_repair",
-            Self::PathFailureRepair => "path_failure_repair",
+            Self::AckGapReinjection => "ack_gap_reinjection",
+            Self::PersistentAckGapReinjection
+            | Self::PersistentClientAckGapReinjection(_)
+            | Self::PersistentServerAckGapReinjection(_) => "persistent_ack_gap_reinjection",
+            Self::TailReinjection => "tail_reinjection",
+            Self::PathFailureReinjection => "path_failure_reinjection",
+            Self::StalePathReinjection(_) => "stale_path_reinjection",
         }
     }
 
-    pub(in crate::runtime::sender) fn is_repair(self) -> bool {
+    pub(in crate::runtime::sender) fn is_reinjection(self) -> bool {
         matches!(
             self,
-            Self::AckGapRepair
-                | Self::PersistentAckGapRepair
-                | Self::PersistentClientAckGapRepair(_)
-                | Self::PersistentServerAckGapRepair(_)
-                | Self::LiveOwnerTailRepair
-                | Self::PathFailureRepair
+            Self::AckGapReinjection
+                | Self::PersistentAckGapReinjection
+                | Self::PersistentClientAckGapReinjection(_)
+                | Self::PersistentServerAckGapReinjection(_)
+                | Self::TailReinjection
+                | Self::PathFailureReinjection
+                | Self::StalePathReinjection(_)
         )
     }
 
-    pub(in crate::runtime::sender) fn is_recv_progress(self) -> bool {
-        matches!(self, Self::RecvProgress | Self::RecvProgressRecovery)
-    }
-
-    pub(in crate::runtime::sender) fn is_persistent_ack_gap_repair(self) -> bool {
+    pub(in crate::runtime::sender) fn is_persistent_ack_gap_reinjection(self) -> bool {
         matches!(
             self,
-            Self::PersistentAckGapRepair
-                | Self::PersistentClientAckGapRepair(_)
-                | Self::PersistentServerAckGapRepair(_)
+            Self::PersistentAckGapReinjection
+                | Self::PersistentClientAckGapReinjection(_)
+                | Self::PersistentServerAckGapReinjection(_)
         )
+    }
+
+    pub(in crate::runtime::sender) fn is_ack_gap_reinjection(self) -> bool {
+        matches!(self, Self::AckGapReinjection) || self.is_persistent_ack_gap_reinjection()
     }
 
     pub(in crate::runtime::sender) fn persistent_client_target(self) -> Option<RelayPathInstance> {
         match self {
-            Self::PersistentClientAckGapRepair(batch) => Some(batch.target.instance),
+            Self::PersistentClientAckGapReinjection(batch) => Some(batch.target.instance),
             _ => None,
         }
     }
 
     pub(in crate::runtime::sender) fn persistent_server_target(
         self,
-    ) -> Option<ServerRepairOutputIdentity> {
+    ) -> Option<ServerReinjectionOutputIdentity> {
         match self {
-            Self::PersistentServerAckGapRepair(batch) => Some(batch.target),
+            Self::PersistentServerAckGapReinjection(batch) => Some(batch.target),
             _ => None,
         }
     }
 
-    pub(in crate::runtime::sender) fn persistent_ack_gap_repair_expired(
+    pub(in crate::runtime::sender) fn persistent_ack_gap_reinjection_expired(
         self,
         now: Instant,
     ) -> bool {
         match self {
-            Self::PersistentClientAckGapRepair(batch) => now >= batch.expires_at,
-            Self::PersistentServerAckGapRepair(batch) => now >= batch.expires_at,
+            Self::PersistentClientAckGapReinjection(batch) => now >= batch.expires_at,
+            Self::PersistentServerAckGapReinjection(batch) => now >= batch.expires_at,
             _ => false,
         }
     }
 
-    pub(in crate::runtime::sender) fn persistent_ack_gap_repair_deadline(self) -> Option<Instant> {
+    pub(in crate::runtime::sender) fn persistent_ack_gap_reinjection_deadline(
+        self,
+    ) -> Option<Instant> {
         match self {
-            Self::PersistentClientAckGapRepair(batch) => Some(batch.expires_at),
-            Self::PersistentServerAckGapRepair(batch) => Some(batch.expires_at),
+            Self::PersistentClientAckGapReinjection(batch) => Some(batch.expires_at),
+            Self::PersistentServerAckGapReinjection(batch) => Some(batch.expires_at),
             _ => None,
         }
     }
 
-    pub(in crate::runtime) fn persistent_client_ack_gap_repair(
-        target: ClientRepairOutputIdentity,
+    pub(in crate::runtime) fn persistent_client_ack_gap_reinjection(
+        target: ClientReinjectionOutputIdentity,
         snapshot: PathSnapshot,
     ) -> Self {
-        Self::PersistentClientAckGapRepair(PersistentClientAckGapBatch {
+        Self::PersistentClientAckGapReinjection(PersistentClientAckGapBatch {
             target,
-            expires_at: Instant::now() + reliable_ack_gap_repair_delay(Some(snapshot)),
+            expires_at: Instant::now()
+                + reliable_ack_gap_reinjection_batch_lifetime(Some(snapshot)),
         })
     }
 
-    pub(in crate::runtime) fn persistent_server_ack_gap_repair(
-        target: ServerRepairOutputIdentity,
+    pub(in crate::runtime) fn persistent_server_ack_gap_reinjection(
+        target: ServerReinjectionOutputIdentity,
         snapshot: PathSnapshot,
     ) -> Self {
-        Self::PersistentServerAckGapRepair(PersistentServerAckGapBatch {
+        Self::PersistentServerAckGapReinjection(PersistentServerAckGapBatch {
             target,
-            expires_at: Instant::now() + reliable_ack_gap_repair_delay(Some(snapshot)),
+            expires_at: Instant::now()
+                + reliable_ack_gap_reinjection_batch_lifetime(Some(snapshot)),
         })
     }
 }
 
 #[derive(Debug, Clone, Copy)]
 pub(in crate::runtime) struct RelaySendOutcome {
-    #[cfg_attr(not(any(test, feature = "lab-diagnostics")), allow(dead_code))]
+    #[cfg_attr(not(feature = "lab-diagnostics"), allow(dead_code))]
     pub(in crate::runtime) path_key: RelayPathKey,
 }

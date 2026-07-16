@@ -10,12 +10,15 @@ use crate::config::{
 };
 use crate::outbound::{DnsConfig, OutboundConfig};
 use crate::protocol::{
-    Frame, PathId, ResetReason, SessionId, StreamDemandHint, StreamId, StreamOpenRole, TargetAddr,
+    Frame, PathId, PathUsage, ResetReason, SessionId, StreamDemandHint, StreamId, TargetAddr,
     UnderlayProtocol,
 };
+use crate::runtime::error::RuntimeError;
 use crate::runtime::node::server::{ServerIdentityRuntime, new_identity_runtime};
+use crate::runtime::path::ServerLocalPathProperties;
 use crate::runtime::path::commands::{recv_reliable_path_command, reliable_path_command_channels};
-use crate::scheduler::FlowLane;
+use crate::runtime::peer_status::PeerStatusBroker;
+use crate::scheduler::TrafficClass;
 use crate::transport::encrypted::{EncryptedFramedStream, EncryptedFramedTransportError, PeerRole};
 use bytes::Bytes;
 use std::net::SocketAddr;
@@ -32,16 +35,18 @@ async fn server_tcp_path_input_frame_bypasses_queued_bulk_output() {
             offset: 0,
             payload: Bytes::from_static(b"bulk"),
         },
-        FlowLane::Throughput,
+        TrafficClass::Throughput,
     )
     .expect("fill bulk output command queue");
     let (frame_tx, mut path_frames) = mpsc::channel(1);
+    let broker = PeerStatusBroker::new(false);
+    let mut peer_status = broker.register(SessionId(1));
     frame_tx
         .send(Ok(Frame::Ping { nonce: 7 }))
         .await
         .expect("queue inbound ping");
 
-    match recv_server_tcp_path_event(&mut path_frames, &mut commands_rx)
+    match recv_server_tcp_path_event(&mut path_frames, &mut commands_rx, &mut peer_status)
         .await
         .expect("server path event")
         .expect("event")
@@ -55,6 +60,8 @@ async fn server_tcp_path_input_frame_bypasses_queued_bulk_output() {
 async fn server_tcp_peer_eof_terminates_carrier_cleanly() {
     let (_commands_tx, mut commands_rx) = reliable_path_command_channels(1);
     let (frame_tx, mut path_frames) = mpsc::channel(1);
+    let broker = PeerStatusBroker::new(false);
+    let mut peer_status = broker.register(SessionId(1));
     frame_tx
         .send(Err(EncryptedFramedTransportError::Io(std::io::Error::new(
             std::io::ErrorKind::UnexpectedEof,
@@ -64,7 +71,7 @@ async fn server_tcp_peer_eof_terminates_carrier_cleanly() {
         .expect("queue peer close");
 
     assert!(
-        recv_server_tcp_path_event(&mut path_frames, &mut commands_rx)
+        recv_server_tcp_path_event(&mut path_frames, &mut commands_rx, &mut peer_status)
             .await
             .expect("normal peer close")
             .is_none()
@@ -143,14 +150,17 @@ async fn server_tcp_terminal_reset_precedes_detach_and_preserves_shared_session(
 
     let session_id = SessionId(202);
     let path_id = PathId(0);
-    let path_registration =
-        context
-            .reliable_streams
-            .register_carrier_path(session_id, UnderlayProtocol::Tcp, path_id);
+    let path_registration = context.reliable_streams.register_carrier_path(
+        session_id,
+        UnderlayProtocol::Tcp,
+        path_id,
+        ServerLocalPathProperties::default(),
+    );
     let (commands_tx, commands_rx) = reliable_path_command_channels(8);
     let commands_for_streams = commands_tx.clone();
     let (_path_frames_tx, path_frames) = mpsc::channel(1);
     let evidence = ServerTcpEvidenceState::new(None, None, context.mux_limits);
+    let peer_status = context.peer_status.register(session_id);
     let mut session = ServerTcpPathSession::new(ServerTcpPathAdmission {
         context,
         session_id,
@@ -161,7 +171,28 @@ async fn server_tcp_terminal_reset_precedes_detach_and_preserves_shared_session(
         commands_tx,
         commands_rx,
         evidence,
+        peer_status,
     });
+    session
+        .handle_frame(Frame::PathStatus {
+            path_id,
+            sequence: 1,
+            usage: PathUsage::Backup,
+        })
+        .await
+        .expect("record exact TCP path usage advertisement");
+    assert!(matches!(
+        session
+            .handle_frame(Frame::PathStatus {
+                path_id: PathId(path_id.0 + 1),
+                sequence: 2,
+                usage: PathUsage::Available,
+            })
+            .await,
+        Err(RuntimeError::Protocol(
+            "TCP path usage advertisement path mismatch"
+        ))
+    ));
     let terminal_stream_id = StreamId(301);
     let sibling_stream_id = StreamId(302);
     let target = TargetAddr::Ip(SocketAddr::from(([127, 0, 0, 1], 80)));
@@ -177,12 +208,9 @@ async fn server_tcp_terminal_reset_precedes_detach_and_preserves_shared_session(
                     &open_registration,
                     &open_commands,
                     session_id,
-                    path_id,
-                    None,
                     stream_id,
                     target.clone(),
                     StreamDemandHint::throughput(),
-                    StreamOpenRole::Active,
                 )
                 .await
                 .expect("open shared TCP response stream")
@@ -194,7 +222,7 @@ async fn server_tcp_terminal_reset_precedes_detach_and_preserves_shared_session(
         .send_stream_ordered_reset_and_close(
             terminal_stream_id,
             ResetReason::Refused,
-            FlowLane::Throughput,
+            TrafficClass::Throughput,
         )
         .await
         .expect("queue terminal TCP command");
@@ -229,7 +257,7 @@ async fn server_tcp_terminal_reset_precedes_detach_and_preserves_shared_session(
         max_offset: 4096,
     };
     commands_for_streams
-        .send_stream_ordered_frame(sibling_frame.clone(), FlowLane::Throughput)
+        .send_stream_ordered_frame(sibling_frame.clone(), TrafficClass::Throughput)
         .await
         .expect("queue sibling TCP output");
     let sibling_command = recv_reliable_path_command(&mut session.commands_rx)

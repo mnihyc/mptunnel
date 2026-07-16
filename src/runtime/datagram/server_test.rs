@@ -7,6 +7,7 @@ use crate::runtime::path::{
     ServerDatagramOpenRequest, ServerDatagramRequest, ServerDatagramSendOutcome,
 };
 use crate::runtime::stream::ServerReliableStreamRegistry;
+use crate::runtime::telemetry::RuntimeTelemetry;
 use bytes::Bytes;
 use std::sync::Arc;
 use tokio::net::UdpSocket;
@@ -30,12 +31,14 @@ async fn server_datagram_port_owns_target_connection_and_worker() {
             .expect("target response");
     });
     let streams = Arc::new(ServerReliableStreamRegistry::new(8)).path_port();
+    let telemetry = RuntimeTelemetry::new(8);
     let datagrams = ServerDatagramService::path_port(
         OutboundConfig::Direct,
         DnsConfig::default(),
         Duration::from_secs(1),
         MuxLimits::default(),
         streams,
+        telemetry.clone(),
     );
     let (commands, mut command_rx) = reliable_path_command_channels(8);
     let flow_id = DatagramFlowId(21);
@@ -74,6 +77,13 @@ async fn server_datagram_port_owns_target_connection_and_worker() {
             && response_datagram_id == datagram_id
             && payload == Bytes::from_static(b"response")
     ));
+    let snapshot = telemetry.snapshot();
+    assert_eq!(snapshot.datagram.io.from_peer_bytes, 7);
+    assert_eq!(snapshot.datagram.io.from_peer_packets, 1);
+    assert_eq!(snapshot.datagram.io.to_peer_bytes, 8);
+    assert_eq!(snapshot.datagram.io.to_peer_packets, 1);
+    assert_eq!(snapshot.datagram.flows.opened, 1);
+    assert_eq!(snapshot.datagram.flows.active, 1);
     target_task.await.expect("UDP target task");
 }
 
@@ -89,7 +99,7 @@ async fn datagram_response_queue_full_is_realtime_backpressure() {
                 ttl_ms: 1000,
                 payload: Bytes::from_static(b"queued"),
             },
-            FlowLane::RealtimeDatagram,
+            TrafficClass::RealtimeDatagram,
         )
         .expect("prefill realtime queue");
 
@@ -136,7 +146,7 @@ async fn datagram_close_queue_full_is_realtime_backpressure() {
                 ttl_ms: 1000,
                 payload: Bytes::from_static(b"queued"),
             },
-            FlowLane::RealtimeDatagram,
+            TrafficClass::RealtimeDatagram,
         )
         .expect("prefill realtime queue");
 

@@ -1,20 +1,19 @@
 use super::commands::{
     QuicCapacityProbeCommand, ReliablePathCommand, RequestTcpCapacityProbeRequest,
-    TcpCapacityProbeCommand, TcpCapacityProbeOwner, TcpCapacityProbeRequest,
-    TcpCapacityProbeSessionLeaseOwner,
+    TcpCapacityProbeCommand,
 };
 #[cfg(feature = "lab-diagnostics")]
 use crate::lab_diagnostics::{lab_diagnostic, lab_perf_record};
 use crate::model::capacity::{
-    BBR_MAX_SEND_QUANTUM_BYTES, reliable_relay_buffer_len, reliable_relay_scheduler_quantum_cap,
+    MAX_RELIABLE_SERVICE_QUANTUM_BYTES, reliable_relay_buffer_len,
+    reliable_relay_scheduler_quantum_cap,
 };
 use crate::mux::MuxLimits;
 use crate::protocol::frame::reliable_path_frame_pacing_bytes;
 use crate::protocol::{Frame, ResetReason, StreamId};
 use crate::runtime::error::RuntimeError;
-use crate::runtime::path::ports::CarrierCommandLease;
 use crate::runtime::path::tcp::capacity::RequestTcpCapacityProbeLease;
-use crate::scheduler::FlowLane;
+use crate::scheduler::TrafficClass;
 use std::sync::{
     Arc,
     atomic::{AtomicBool, AtomicU8, AtomicU64, Ordering},
@@ -23,18 +22,16 @@ use std::sync::{
 use std::time::Instant;
 use tokio::sync::{Notify, mpsc};
 
-// Bounded, lane-separated handoff from carrier-neutral scheduling to TCP or
+// Bounded, traffic-class-separated transfer from carrier-neutral scheduling to TCP or
 // QUIC writers. Control keeps independent capacity; a typed carrier probe remains
 // one data-lane command so its token and frozen proof contract cannot split.
 
-const RELIABLE_PATH_PRIORITY_HEADROOM_LANES: [FlowLane; 4] = [
-    FlowLane::Control,
-    FlowLane::Latency,
-    FlowLane::RealtimeDatagram,
-    FlowLane::Background,
+const RELIABLE_PATH_PRIORITY_HEADROOM_LANES: [TrafficClass; 4] = [
+    TrafficClass::Control,
+    TrafficClass::Latency,
+    TrafficClass::RealtimeDatagram,
+    TrafficClass::Background,
 ];
-
-static NEXT_TCP_CAPACITY_CALIBRATION_ID: AtomicU64 = AtomicU64::new(1);
 
 #[derive(Clone)]
 pub(in crate::runtime) struct ReliablePathCommandSender {
@@ -60,12 +57,11 @@ pub(in crate::runtime) struct ReliablePathCommandReceivers {
 #[derive(Debug, Clone, Copy)]
 pub(in crate::runtime) struct ReliablePathCommandQueueSnapshot {
     priority_ready: bool,
-    data_open: bool,
     data_ready: bool,
 }
 
 impl ReliablePathCommandQueueSnapshot {
-    pub(in crate::runtime) fn can_enqueue_lane(self, lane: FlowLane) -> bool {
+    pub(in crate::runtime) fn can_enqueue_lane(self, lane: TrafficClass) -> bool {
         if reliable_path_frame_uses_priority_queue(lane) {
             self.priority_ready
         } else {
@@ -73,16 +69,12 @@ impl ReliablePathCommandQueueSnapshot {
         }
     }
 
-    pub(in crate::runtime) fn can_enqueue_frame(self, frame: &Frame, lane: FlowLane) -> bool {
+    pub(in crate::runtime) fn can_enqueue_frame(self, frame: &Frame, lane: TrafficClass) -> bool {
         self.can_enqueue_lane(reliable_path_effective_frame_lane(frame, lane))
     }
 
     pub(in crate::runtime) fn can_enqueue_stream_ordered_frame(self) -> bool {
         self.can_enqueue_lane(reliable_path_stream_ordered_queue_lane())
-    }
-
-    pub(in crate::runtime) fn data_open(self) -> bool {
-        self.data_open
     }
 }
 
@@ -103,9 +95,9 @@ pub(in crate::runtime) struct ReliablePathFrameReservation<'a> {
     bytes: usize,
     metrics: Arc<ReliablePathCommandQueueMetrics>,
     #[cfg(feature = "lab-diagnostics")]
-    lane: FlowLane,
+    lane: TrafficClass,
     #[cfg(feature = "lab-diagnostics")]
-    effective_lane: FlowLane,
+    effective_lane: TrafficClass,
 }
 
 impl ReliablePathFrameReservation<'_> {
@@ -314,7 +306,6 @@ impl ReliablePathCommandSender {
         let data_open = !self.data.is_closed();
         ReliablePathCommandQueueSnapshot {
             priority_ready: priority_open && self.priority.capacity() > 0,
-            data_open,
             data_ready: data_open && self.data.capacity() > 0,
         }
     }
@@ -370,7 +361,7 @@ impl ReliablePathCommandSender {
     pub(in crate::runtime) async fn send_stream_ordered_frame(
         &self,
         frame: Frame,
-        lane: FlowLane,
+        lane: TrafficClass,
     ) -> Result<(), mpsc::error::SendError<ReliablePathCommand>> {
         self.send_stream_ordered_command(ReliablePathCommand::SendFrame(frame), lane)
             .await
@@ -379,7 +370,7 @@ impl ReliablePathCommandSender {
     pub(in crate::runtime) async fn send_stream_ordered_close(
         &self,
         stream_id: StreamId,
-        lane: FlowLane,
+        lane: TrafficClass,
     ) -> Result<(), mpsc::error::SendError<ReliablePathCommand>> {
         self.send_stream_ordered_command(ReliablePathCommand::CloseStream(stream_id), lane)
             .await
@@ -389,7 +380,7 @@ impl ReliablePathCommandSender {
         &self,
         stream_id: StreamId,
         reason: ResetReason,
-        lane: FlowLane,
+        lane: TrafficClass,
     ) -> Result<(), mpsc::error::SendError<ReliablePathCommand>> {
         self.send_stream_ordered_command(
             ReliablePathCommand::ResetAndCloseStream { stream_id, reason },
@@ -401,7 +392,7 @@ impl ReliablePathCommandSender {
     async fn send_stream_ordered_command(
         &self,
         command: ReliablePathCommand,
-        _lane: FlowLane,
+        _lane: TrafficClass,
     ) -> Result<(), mpsc::error::SendError<ReliablePathCommand>> {
         let pending_bytes = reliable_path_command_pending_bytes(&command);
         #[cfg(feature = "lab-diagnostics")]
@@ -445,7 +436,7 @@ impl ReliablePathCommandSender {
     pub(in crate::runtime) fn try_enqueue_admitted_frame(
         &self,
         frame: Frame,
-        lane: FlowLane,
+        lane: TrafficClass,
     ) -> Result<(), RuntimeError> {
         self.try_enqueue_admitted_frame_with_effective_lane(frame, lane, None)
     }
@@ -460,7 +451,7 @@ impl ReliablePathCommandSender {
     ) -> Result<(), RuntimeError> {
         let pending_bytes = usize::try_from(probe.train_payload_bytes).unwrap_or(usize::MAX);
         #[cfg(feature = "lab-diagnostics")]
-        let calibration_id = probe.calibration_id;
+        let measurement_id = probe.measurement_id;
         let result = match self.data.try_reserve() {
             Ok(permit) => {
                 self.metrics.add_pending_bytes(pending_bytes);
@@ -482,75 +473,19 @@ impl ReliablePathCommandSender {
         lab_diagnostic(
             "path_command_queue_send",
             format_args!(
-                "queue=data command_kind=quic_capacity_probe stream_id=0 lane={:?} effective_lane={:?} pacing_bytes={} wait_ms=0 result={} calibration_id={}",
-                FlowLane::Throughput,
-                FlowLane::Throughput,
+                "queue=data command_kind=quic_capacity_probe stream_id=0 lane={:?} effective_lane={:?} pacing_bytes={} wait_ms=0 result={} measurement_id={}",
+                TrafficClass::Throughput,
+                TrafficClass::Throughput,
                 pending_bytes,
                 match &result {
                     Ok(()) => "queued",
                     Err(RuntimeError::SenderServiceBlocked) => "blocked",
                     Err(_) => "closed",
                 },
-                calibration_id,
+                measurement_id,
             ),
         );
         result
-    }
-
-    /// Reserves one offset-free capacity epoch for this exact TCP carrier.
-    pub(in crate::runtime) fn try_enqueue_tcp_capacity_probe(
-        &self,
-        request: TcpCapacityProbeRequest,
-        session_lease: CarrierCommandLease,
-    ) -> Result<u64, RuntimeError> {
-        let permit = match self.data.try_reserve() {
-            Ok(permit) => permit,
-            Err(tokio::sync::mpsc::error::TrySendError::Full(_)) => {
-                return Err(RuntimeError::SenderServiceBlocked);
-            }
-            Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => {
-                return Err(RuntimeError::ReliablePathSessionClosed);
-            }
-        };
-        // Only admitted queue ownership spends this exact-carrier attempt.
-        let lease = self.metrics.try_reserve_tcp_capacity_probe()?;
-        let pending_bytes = usize::try_from(request.train_payload_bytes).unwrap_or(usize::MAX);
-        let calibration_id = NEXT_TCP_CAPACITY_CALIBRATION_ID.fetch_add(1, Ordering::Relaxed);
-        let probe = TcpCapacityProbeCommand {
-            owner: TcpCapacityProbeOwner::Response {
-                path_instance_id: request.path_instance_id,
-            },
-            path_id: request.path_id,
-            calibration_id,
-            train_payload_bytes: request.train_payload_bytes,
-            sample_floor_bytes: request.sample_floor_bytes,
-            warmup_carrier_bytes: 0,
-            timing_slack_bytes: 0,
-            required_timed_carrier_bytes: request.train_payload_bytes,
-            baseline_expires_at: None,
-            write_expires_at: None,
-            expires_at: request.expires_at,
-            _lease: lease,
-            _session_lease: TcpCapacityProbeSessionLeaseOwner::Response(session_lease),
-        };
-        self.metrics.add_pending_bytes(pending_bytes);
-        permit.send(QueuedReliablePathCommand::new(
-            ReliablePathCommand::SendTcpCapacityProbe(probe),
-            pending_bytes,
-            self.metrics.clone(),
-        ));
-        #[cfg(feature = "lab-diagnostics")]
-        lab_diagnostic(
-            "path_command_queue_send",
-            format_args!(
-                "queue=data command_kind=tcp_capacity_probe stream_id=0 lane={:?} effective_lane={:?} pacing_bytes={} wait_ms=0 result=queued calibration_id={}",
-                FlowLane::Throughput,
-                FlowLane::Throughput,
-                pending_bytes,
-                calibration_id,
-            ),
-        );
-        Ok(calibration_id)
     }
 
     /// Queues one client-to-server TCP carrier proof with no product offset.
@@ -571,21 +506,19 @@ impl ReliablePathCommandSender {
         let lease = self.metrics.try_reserve_tcp_capacity_probe()?;
         let pending_bytes = usize::try_from(request.train_payload_bytes).unwrap_or(usize::MAX);
         let probe = TcpCapacityProbeCommand {
-            owner: TcpCapacityProbeOwner::Request {
-                stream_id: request.stream_id,
-                path_instance: request.path_instance,
-            },
+            stream_id: request.stream_id,
+            path_instance: request.path_instance,
             path_id: request.path_id,
-            calibration_id: request.calibration_id,
+            measurement_id: request.measurement_id,
             train_payload_bytes: request.train_payload_bytes,
             sample_floor_bytes: request.sample_floor_bytes,
             warmup_carrier_bytes: request.warmup_carrier_bytes,
             timing_slack_bytes: request.timing_slack_bytes,
             required_timed_carrier_bytes: request.required_timed_carrier_bytes,
-            baseline_expires_at: Some(request.baseline_expires_at),
-            write_expires_at: Some(request.write_expires_at),
+            baseline_expires_at: request.baseline_expires_at,
+            write_expires_at: request.write_expires_at,
             expires_at: request.expires_at,
-            _session_lease: TcpCapacityProbeSessionLeaseOwner::Request(session_lease),
+            request_lease: session_lease,
             _lease: lease,
         };
         self.metrics.add_pending_bytes(pending_bytes);
@@ -598,36 +531,21 @@ impl ReliablePathCommandSender {
         lab_diagnostic(
             "path_command_queue_send",
             format_args!(
-                "queue=data command_kind=request_tcp_capacity_probe stream_id={} lane={:?} effective_lane={:?} pacing_bytes={} wait_ms=0 result=queued calibration_id={}",
+                "queue=data command_kind=request_tcp_capacity_probe stream_id={} lane={:?} effective_lane={:?} pacing_bytes={} wait_ms=0 result=queued measurement_id={}",
                 request.stream_id.0,
-                FlowLane::Throughput,
-                FlowLane::Throughput,
+                TrafficClass::Throughput,
+                TrafficClass::Throughput,
                 pending_bytes,
-                request.calibration_id,
+                request.measurement_id,
             ),
         );
         Ok(())
     }
 
-    pub(in crate::runtime) fn tcp_capacity_probe_attempted(&self) -> bool {
-        self.metrics
-            .tcp_capacity_probe
-            .attempts
-            .load(Ordering::Acquire)
-            > 0
-    }
-
-    pub(in crate::runtime) fn tcp_capacity_probe_active(&self) -> bool {
-        self.metrics
-            .tcp_capacity_probe
-            .active
-            .load(Ordering::Acquire)
-    }
-
     pub(in crate::runtime) fn try_enqueue_stream_ordered_frame(
         &self,
         frame: Frame,
-        lane: FlowLane,
+        lane: TrafficClass,
     ) -> Result<(), RuntimeError> {
         let reservation = self.try_reserve_admitted_frame_with_effective_lane(
             frame,
@@ -641,7 +559,7 @@ impl ReliablePathCommandSender {
     pub(in crate::runtime) fn try_reserve_stream_ordered_frame(
         &self,
         frame: Frame,
-        lane: FlowLane,
+        lane: TrafficClass,
     ) -> Result<ReliablePathFrameReservation<'_>, RuntimeError> {
         self.try_reserve_admitted_frame_with_effective_lane(
             frame,
@@ -653,8 +571,8 @@ impl ReliablePathCommandSender {
     fn try_enqueue_admitted_frame_with_effective_lane(
         &self,
         frame: Frame,
-        lane: FlowLane,
-        effective_lane_override: Option<FlowLane>,
+        lane: TrafficClass,
+        effective_lane_override: Option<TrafficClass>,
     ) -> Result<(), RuntimeError> {
         let reservation = self.try_reserve_admitted_frame_with_effective_lane(
             frame,
@@ -668,8 +586,8 @@ impl ReliablePathCommandSender {
     fn try_reserve_admitted_frame_with_effective_lane(
         &self,
         frame: Frame,
-        lane: FlowLane,
-        effective_lane_override: Option<FlowLane>,
+        lane: TrafficClass,
+        effective_lane_override: Option<TrafficClass>,
     ) -> Result<ReliablePathFrameReservation<'_>, RuntimeError> {
         if reliable_path_frame_requires_capacity_command(&frame) {
             return Err(RuntimeError::Protocol(
@@ -736,17 +654,24 @@ impl ReliablePathCommandSender {
         })
     }
 
-    pub(in crate::runtime) fn can_enqueue_frame_now(&self, frame: &Frame, lane: FlowLane) -> bool {
+    pub(in crate::runtime) fn can_enqueue_frame_now(
+        &self,
+        frame: &Frame,
+        lane: TrafficClass,
+    ) -> bool {
         let effective_lane = reliable_path_effective_frame_lane(frame, lane);
         self.can_enqueue_lane_now(effective_lane)
     }
 
-    pub(in crate::runtime) fn can_enqueue_stream_ordered_frame_now(&self, lane: FlowLane) -> bool {
+    pub(in crate::runtime) fn can_enqueue_stream_ordered_frame_now(
+        &self,
+        lane: TrafficClass,
+    ) -> bool {
         let _ = lane;
         self.can_enqueue_lane_now(reliable_path_stream_ordered_queue_lane())
     }
 
-    pub(in crate::runtime) fn can_enqueue_lane_now(&self, lane: FlowLane) -> bool {
+    pub(in crate::runtime) fn can_enqueue_lane_now(&self, lane: TrafficClass) -> bool {
         self.queue_snapshot().can_enqueue_lane(lane)
     }
 
@@ -774,24 +699,26 @@ impl ReliablePathCommandSender {
     }
 }
 
-pub(in crate::runtime) fn reliable_path_frame_uses_priority_queue(lane: FlowLane) -> bool {
+pub(in crate::runtime) fn reliable_path_frame_uses_priority_queue(lane: TrafficClass) -> bool {
     lane.is_latency_sensitive()
 }
 
-pub(in crate::runtime) fn reliable_path_stream_ordered_queue_lane() -> FlowLane {
-    FlowLane::Throughput
+pub(in crate::runtime) fn reliable_path_stream_ordered_queue_lane() -> TrafficClass {
+    TrafficClass::Throughput
 }
 
 pub(in crate::runtime) fn reliable_path_effective_frame_lane(
     frame: &Frame,
-    stream_lane: FlowLane,
-) -> FlowLane {
+    stream_lane: TrafficClass,
+) -> TrafficClass {
     match frame {
         Frame::StreamData { .. }
         | Frame::PathCapacityData { .. }
         | Frame::PathCapacityFinish { .. } => stream_lane,
-        Frame::DatagramData { .. } | Frame::DatagramFeedback { .. } => FlowLane::RealtimeDatagram,
-        _ => FlowLane::Control,
+        Frame::DatagramData { .. } | Frame::DatagramFeedback { .. } => {
+            TrafficClass::RealtimeDatagram
+        }
+        _ => TrafficClass::Control,
     }
 }
 
@@ -951,7 +878,7 @@ pub(in crate::runtime) fn reliable_path_command_writer_run_budget_bytes(
     mux_limits: MuxLimits,
 ) -> usize {
     let frame_payload =
-        reliable_relay_scheduler_quantum_cap(None, FlowLane::Throughput, mux_limits)
+        reliable_relay_scheduler_quantum_cap(None, TrafficClass::Throughput, mux_limits)
             .min(mux_limits.max_reliable_relay_chunk_bytes)
             .min(mux_limits.max_payload_bytes)
             .max(1);
@@ -977,7 +904,7 @@ pub(in crate::runtime) fn reliable_path_command_writer_run_budget_bytes(
 pub(in crate::runtime) fn reliable_noninterlocked_tcp_writer_run_budget_bytes(
     mux_limits: MuxLimits,
 ) -> usize {
-    BBR_MAX_SEND_QUANTUM_BYTES
+    MAX_RELIABLE_SERVICE_QUANTUM_BYTES
         .min(reliable_relay_buffer_len(mux_limits))
         .min(mux_limits.max_payload_bytes)
         .max(1)
@@ -1019,7 +946,7 @@ pub(in crate::runtime) fn reliable_path_writer_frame_queue(mux_limits: MuxLimits
 }
 
 fn reliable_path_command_queue_payload(mux_limits: MuxLimits) -> usize {
-    reliable_relay_scheduler_quantum_cap(None, FlowLane::Throughput, mux_limits)
+    reliable_relay_scheduler_quantum_cap(None, TrafficClass::Throughput, mux_limits)
         .min(mux_limits.max_reliable_relay_chunk_bytes)
         .min(mux_limits.max_payload_bytes)
         .max(1)
@@ -1196,7 +1123,6 @@ fn reliable_path_frame_kind(frame: &Frame) -> &'static str {
         Frame::SessionReady => "session_ready",
         Frame::SessionClose { .. } => "session_close",
         Frame::PathJoin { .. } => "path_join",
-        Frame::PathJoinOk { .. } => "path_join_ok",
         Frame::PathStatus { .. } => "path_status",
         Frame::PathDrain { .. } => "path_drain",
         Frame::PathClose { .. } => "path_close",
@@ -1219,6 +1145,8 @@ fn reliable_path_frame_kind(frame: &Frame) -> &'static str {
         Frame::PathMetrics { .. } => "path_metrics",
         Frame::Ping { .. } => "ping",
         Frame::Pong { .. } => "pong",
+        Frame::PeerStatusRequest { .. } => "peer_status_request",
+        Frame::PeerStatusResponse { .. } => "peer_status_response",
     }
 }
 

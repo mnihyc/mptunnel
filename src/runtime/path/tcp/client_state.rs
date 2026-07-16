@@ -6,7 +6,8 @@
 use super::capacity::RequestTcpCapacityProbeLease;
 use super::client_connection::ClientTcpCarrierConnection;
 use crate::config::SecurityConfig;
-use crate::model::capacity::reliable_capacity_calibration_session_limit_bytes;
+use crate::model::capacity::reliable_capacity_measurement_session_limit_bytes;
+use crate::model::path::CarrierPathInstanceId;
 use crate::mux::MuxLimits;
 use crate::protocol::codec::CodecLimits;
 use crate::protocol::path_capacity::{CapacityReceiveTracker, PathCapacityReceiveError};
@@ -14,6 +15,7 @@ use crate::protocol::{PathMetrics, SessionId};
 use crate::runtime::path::commands::TcpCapacityProbeCommand;
 use crate::runtime::path::proof::PathProofTracker;
 use crate::runtime::path::state::ClientPathState;
+use crate::runtime::peer_status::{PeerStatusBroker, PeerStatusCarrier, PeerStatusSnapshotSource};
 use crate::scheduler::PathSnapshot;
 use crate::transport::PathSpec;
 use crate::transport::{CarrierNetworkProvider, CarrierPathIdentity};
@@ -21,24 +23,30 @@ use std::sync::Arc;
 use std::time::Instant;
 
 pub(super) struct ClientTcpPathConnection {
+    pub(super) path_instance_id: CarrierPathInstanceId,
     pub(super) startup_snapshot: PathSnapshot,
     pub(super) startup_metrics: PathMetrics,
     pub(super) carrier: ClientTcpCarrierConnection,
+    pub(super) peer_status: PeerStatusCarrier,
     pub(super) path_proofs: PathProofTracker,
     pub(super) capacity: ClientTcpCapacityState,
 }
 
 impl ClientTcpPathConnection {
     pub(super) fn new(
+        path_instance_id: CarrierPathInstanceId,
         startup_snapshot: PathSnapshot,
         startup_metrics: PathMetrics,
         carrier: ClientTcpCarrierConnection,
+        peer_status: PeerStatusCarrier,
         mux_limits: MuxLimits,
     ) -> Self {
         Self {
+            path_instance_id,
             startup_snapshot,
             startup_metrics,
             carrier,
+            peer_status,
             path_proofs: PathProofTracker::default(),
             capacity: ClientTcpCapacityState::new(mux_limits),
         }
@@ -64,6 +72,8 @@ pub(in crate::runtime) struct ClientTcpPathSessionRuntime {
     pub(in crate::runtime) closed_stream_cache_capacity: usize,
     pub(in crate::runtime) state: Arc<ClientPathState>,
     pub(in crate::runtime) carrier_network: Arc<dyn CarrierNetworkProvider>,
+    pub(in crate::runtime) peer_status: PeerStatusBroker,
+    pub(in crate::runtime) peer_status_snapshot: PeerStatusSnapshotSource,
 }
 
 impl ClientTcpPathSessionRuntime {
@@ -80,7 +90,7 @@ impl ClientTcpPathSessionRuntime {
     }
 }
 
-/// Reliable-only calibration state must not leak into datagram carrier users.
+/// Reliable-only measurement state must not leak into datagram carrier users.
 pub(super) struct ClientTcpCapacityState {
     request_probe: Option<PendingClientTcpCapacityProbe>,
     discarded_request_receipt: Option<DiscardedClientTcpCapacityReceipt>,
@@ -93,7 +103,7 @@ impl ClientTcpCapacityState {
             request_probe: None,
             discarded_request_receipt: None,
             receive: CapacityReceiveTracker::new(
-                reliable_capacity_calibration_session_limit_bytes(mux_limits),
+                reliable_capacity_measurement_session_limit_bytes(mux_limits),
             ),
         }
     }
@@ -107,8 +117,7 @@ impl ClientTcpCapacityState {
     pub(super) fn request_lease(&self) -> Option<RequestTcpCapacityProbeLease> {
         self.request_probe
             .as_ref()
-            .and_then(|pending| pending.probe.request_lease())
-            .cloned()
+            .map(|pending| pending.probe.request_lease().clone())
     }
 
     pub(super) fn has_pending_request(&self) -> bool {
@@ -134,23 +143,23 @@ impl ClientTcpCapacityState {
 
     pub(super) fn record_received_data(
         &mut self,
-        calibration_id: u64,
+        measurement_id: u64,
         payload_bytes: usize,
     ) -> Result<(), PathCapacityReceiveError> {
-        self.receive.record_data(calibration_id, payload_bytes)
+        self.receive.record_data(measurement_id, payload_bytes)
     }
 
     pub(super) fn finish_received_data(
         &mut self,
-        calibration_id: u64,
+        measurement_id: u64,
         declared_bytes: u64,
     ) -> Result<u64, PathCapacityReceiveError> {
-        self.receive.finish(calibration_id, declared_bytes)
+        self.receive.finish(measurement_id, declared_bytes)
     }
 
     pub(super) fn take_request_receipt(
         &mut self,
-        calibration_id: u64,
+        measurement_id: u64,
         received_payload_bytes: u64,
     ) -> ClientTcpRequestReceipt {
         if let Some(pending) = self.request_probe.take() {
@@ -158,7 +167,7 @@ impl ClientTcpCapacityState {
         }
         if self
             .discarded_request_receipt
-            .is_some_and(|discarded| discarded.matches(calibration_id, received_payload_bytes))
+            .is_some_and(|discarded| discarded.matches(measurement_id, received_payload_bytes))
         {
             self.discarded_request_receipt = None;
             ClientTcpRequestReceipt::Discarded
@@ -187,19 +196,19 @@ pub(super) enum ClientTcpRequestReceipt {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) struct DiscardedClientTcpCapacityReceipt {
-    pub(super) calibration_id: u64,
+    pub(super) measurement_id: u64,
     pub(super) train_payload_bytes: u64,
 }
 
 impl DiscardedClientTcpCapacityReceipt {
     fn from_probe(probe: &TcpCapacityProbeCommand) -> Self {
         Self {
-            calibration_id: probe.calibration_id,
+            measurement_id: probe.measurement_id,
             train_payload_bytes: probe.train_payload_bytes,
         }
     }
 
-    pub(super) fn matches(self, calibration_id: u64, received_payload_bytes: u64) -> bool {
-        self.calibration_id == calibration_id && self.train_payload_bytes == received_payload_bytes
+    pub(super) fn matches(self, measurement_id: u64, received_payload_bytes: u64) -> bool {
+        self.measurement_id == measurement_id && self.train_payload_bytes == received_payload_bytes
     }
 }

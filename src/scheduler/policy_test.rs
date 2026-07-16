@@ -14,7 +14,7 @@ fn heterogeneous_links_send_interactive_to_low_latency_path() {
 
     let choice = choose_path(
         &[low_latency, high_bandwidth, unstable],
-        FlowLane::Latency,
+        TrafficClass::Latency,
         2 * 1024,
     );
 
@@ -28,7 +28,7 @@ fn latency_scoring_uses_metrics_not_tcp_udp_family_penalty() {
 
     let choice = choose_path(
         &[lower_latency_tcp, higher_latency_udp],
-        FlowLane::RealtimeDatagram,
+        TrafficClass::RealtimeDatagram,
         512,
     );
 
@@ -49,7 +49,7 @@ fn heterogeneous_links_send_large_bulk_to_high_bandwidth_path() {
 
     let choice = choose_path(
         &[low_latency, high_bandwidth, unstable],
-        FlowLane::Throughput,
+        TrafficClass::Throughput,
         4 * 1024 * 1024,
     );
 
@@ -65,7 +65,7 @@ fn throughput_scoring_accounts_for_active_bulk_flow_sharing() {
 
     let choice = choose_path(
         &[busy_low_latency, independent],
-        FlowLane::Throughput,
+        TrafficClass::Throughput,
         4 * 1024 * 1024,
     );
 
@@ -80,9 +80,27 @@ fn throughput_scoring_does_not_divide_per_flow_goodput_again() {
     measured.pacing_rate_bps = mbps(600.0);
 
     assert_eq!(
-        effective_path_rate_bps(measured, FlowLane::Throughput),
+        effective_path_rate_bps(measured, TrafficClass::Throughput),
         mbps(200.0)
     );
+}
+
+#[test]
+fn completion_scoring_does_not_double_count_overlapping_carrier_and_data_level_work() {
+    let mut carrier_only = PathSnapshot::new(PathId(0), UnderlayProtocol::Tcp, 20.0, mbps(100.0));
+    carrier_only.queue_bytes = 512 * 1024;
+    carrier_only.bytes_in_flight = 512 * 1024;
+
+    let mut overlapping = carrier_only;
+    overlapping.data_level_queue_bytes = 256 * 1024;
+    overlapping.data_level_bytes_in_flight = 768 * 1024;
+
+    let carrier_score =
+        score_path(carrier_only, TrafficClass::Throughput, 64 * 1024).expect("carrier score");
+    let overlapping_score =
+        score_path(overlapping, TrafficClass::Throughput, 64 * 1024).expect("overlapping score");
+
+    assert_eq!(overlapping_score.eta_ms, carrier_score.eta_ms);
 }
 
 #[test]
@@ -93,7 +111,7 @@ fn failed_and_draining_paths_are_not_schedulable() {
     draining.state = PathState::Draining;
     let active = PathSnapshot::new(PathId(2), UnderlayProtocol::Udp, 50.0, mbps(10.0));
 
-    let choice = choose_path(&[failed, draining, active], FlowLane::Latency, 512);
+    let choice = choose_path(&[failed, draining, active], TrafficClass::Latency, 512);
 
     assert_eq!(choice.map(|score| score.path_id), Some(PathId(2)));
 }
@@ -105,10 +123,14 @@ fn latency_sensitive_streams_validate_suspect_low_latency_path() {
     let active_high_latency =
         PathSnapshot::new(PathId(1), UnderlayProtocol::Tcp, 180.0, mbps(100.0));
 
-    let interactive = choose_path(&[low_latency, active_high_latency], FlowLane::Latency, 512);
+    let interactive = choose_path(
+        &[low_latency, active_high_latency],
+        TrafficClass::Latency,
+        512,
+    );
     let bulk = choose_path(
         &[low_latency, active_high_latency],
-        FlowLane::Throughput,
+        TrafficClass::Throughput,
         4 * 1024 * 1024,
     );
 

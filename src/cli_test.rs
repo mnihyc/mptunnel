@@ -1,5 +1,5 @@
 use super::*;
-use crate::config::{CipherSuite, CommandConfig, TransportSecurity};
+use crate::config::{CipherSuite, CommandConfig};
 use clap::Parser;
 
 fn ingress_configs(ingresses: &[LocalIngressConfig]) -> Vec<IngressConfig> {
@@ -25,7 +25,6 @@ fn client_cli_builds_default_socks_config() {
     .expect("parse cli");
     let config = cli.into_config().expect("config");
 
-    assert_eq!(config.security.transport, TransportSecurity::Encrypted);
     assert_eq!(config.security.cipher, CipherSuite::Aes256Gcm);
     assert!(config.check_config);
     assert_eq!(config.service, ServiceConfig::default());
@@ -51,6 +50,33 @@ fn client_cli_builds_default_socks_config() {
         }
         CommandConfig::Server(_) | CommandConfig::Node(_) => panic!("expected client config"),
     }
+}
+
+#[test]
+fn client_cli_enables_dashboard_and_peer_diagnostics_independently() {
+    let cli = Cli::try_parse_from([
+        "mptunnel",
+        "--secret",
+        "0123456789abcdef0123456789abcdef",
+        "--management-listen",
+        "127.0.0.1:7600",
+        "--management-token",
+        "operator-token-123",
+        "--management-dashboard",
+        "--management-allow-peer-diagnostics",
+        "client",
+        "--path",
+        "tcp://127.0.0.1:443",
+    ])
+    .expect("parse CLI");
+    let config = cli.into_config().expect("config");
+
+    assert_eq!(
+        config.management.listen,
+        vec!["127.0.0.1:7600".parse().expect("listen")]
+    );
+    assert!(config.management.dashboard);
+    assert!(config.management.allow_peer_diagnostics);
 }
 
 #[test]
@@ -278,24 +304,6 @@ fn service_supervisor_cli_is_parsed_and_validated() {
 fn platform_command_does_not_require_runtime_secret() {
     let cli = Cli::try_parse_from(["mptunnel", "platform"]).expect("parse cli");
     assert!(matches!(cli.command, Command::Platform(_)));
-}
-
-#[test]
-fn plaintext_lab_mode_requires_acknowledgement() {
-    let cli = Cli::try_parse_from([
-        "mptunnel",
-        "--security",
-        "plaintext-lab",
-        "client",
-        "--path",
-        "tcp://127.0.0.1:443",
-    ])
-    .expect("parse cli");
-
-    assert!(matches!(
-        cli.into_config(),
-        Err(CliConfigError::PlaintextNotAcknowledged)
-    ));
 }
 
 #[test]
@@ -637,7 +645,7 @@ fn mux_memory_limits_are_validated() {
     assert!(matches!(
         cli.into_config(),
         Err(CliConfigError::Config(
-            crate::config::ConfigError::RepairLimitTooSmall
+            crate::config::ConfigError::ReinjectionLimitTooSmall
         ))
     ));
 
@@ -687,7 +695,7 @@ fn mux_memory_limits_are_validated() {
     assert!(matches!(
         cli.into_config(),
         Err(CliConfigError::Config(
-            crate::config::ConfigError::PathFlightLimitExceedsRepairLimit
+            crate::config::ConfigError::PathFlightLimitExceedsReinjectionLimit
         ))
     ));
 

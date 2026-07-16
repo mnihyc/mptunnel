@@ -84,10 +84,10 @@ fn conformance_tracking_is_opt_in_under_an_exact_filter() {
 }
 
 #[test]
-fn data_service_decision_counts_as_server_owner_data() {
+fn data_service_decision_counts_as_server_original_data() {
     let _guard = lab_diag_test_guard();
 
-    for (index, decision_kind) in ["data_service", "data_subflow"].into_iter().enumerate() {
+    for (index, decision_kind) in ["data_service", "data_path_state"].into_iter().enumerate() {
         lab_sender_service_decision(
             "server",
             Some(7),
@@ -112,8 +112,8 @@ fn data_service_decision_counts_as_server_owner_data() {
         .expect("stream counts");
     assert_eq!(counts.service_decisions, 1);
     assert_eq!(counts.service_payload_bytes, 1024);
-    assert_eq!(counts.subflow_decisions, 1);
-    assert_eq!(counts.subflow_payload_bytes, 1024);
+    assert_eq!(counts.path_state_decisions, 1);
+    assert_eq!(counts.path_state_payload_bytes, 1024);
     lab_assert_server_sender_service_balanced(7, 9);
 }
 

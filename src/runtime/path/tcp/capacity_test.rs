@@ -1,48 +1,14 @@
 use super::*;
 use crate::config::{ResourceLimits, SecurityConfig, SharedSecret};
-use crate::model::capacity::reliable_capacity_calibration_session_limit_bytes;
-use crate::model::path::{RelayPathInstance, RelayPathKey};
+use crate::model::capacity::reliable_capacity_measurement_session_limit_bytes;
+use crate::model::path::{CarrierPathInstanceId, RelayPathInstance, RelayPathKey};
 use crate::protocol::StreamId;
-use crate::runtime::path::tcp::metrics::{TcpNativeObservation, TcpSenderMetricTracker};
 use crate::runtime::path::{
     CapacityProbeCommandTicket, ClientPathContext, ClientPathHealthRecord,
     RequestCapacityProbeCampaignBudget,
 };
 use crate::transport::PathSpec;
-use crate::transport::tcp_telemetry::{
-    TcpNativeFlight, TcpNativeLossCounters, TcpNativeRtt, TcpNativeSnapshot,
-};
 use std::sync::Arc;
-
-fn native_observation(
-    path_id: PathId,
-    delivery_rate_bytes_per_second: Option<u64>,
-    pacing_rate_bytes_per_second: Option<u64>,
-    flight: Option<TcpNativeFlight>,
-    app_limited: Option<bool>,
-) -> TcpNativeObservation {
-    let snapshot = TcpNativeSnapshot {
-        rtt: Some(TcpNativeRtt {
-            srtt_us: 20_000,
-            rttvar_us: 2_000,
-        }),
-        flight,
-        notsent_bytes: Some(0),
-        bytes_acked: Some(100),
-        loss: Some(TcpNativeLossCounters {
-            retransmits: 0,
-            data_segments_out: 10,
-        }),
-        pacing_rate_bytes_per_second,
-        delivery_rate_bytes_per_second,
-        app_limited,
-    };
-    TcpSenderMetricTracker::new(snapshot).observe(
-        path_id,
-        PathMetricDirection::ServerToClient,
-        snapshot,
-    )
-}
 
 fn tcp_path_instance(index: usize, id: u64) -> RelayPathInstance {
     RelayPathInstance {
@@ -50,7 +16,8 @@ fn tcp_path_instance(index: usize, id: u64) -> RelayPathInstance {
             underlay: UnderlayProtocol::Tcp,
             index,
         },
-        id,
+        path_instance_id: CarrierPathInstanceId::from_raw(id.max(1)),
+        attachment_id: id,
     }
 }
 
@@ -81,7 +48,7 @@ fn reserve_request_tcp_capacity_for_test(
         path_index,
         token,
         train_bytes,
-        reliable_capacity_calibration_session_limit_bytes(context.mux_limits),
+        reliable_capacity_measurement_session_limit_bytes(context.mux_limits),
     )
 }
 
@@ -239,7 +206,7 @@ fn request_tcp_capacity_campaign_bounds_one_flow_without_spending_later_flow_cre
 #[test]
 fn request_tcp_capacity_path_share_is_cumulative_and_cannot_expand() {
     let context = request_tcp_capacity_test_context(2);
-    let session_limit = reliable_capacity_calibration_session_limit_bytes(context.mux_limits);
+    let session_limit = reliable_capacity_measurement_session_limit_bytes(context.mux_limits);
     let path_share = 8 * 1024 * 1024;
     let half_share = path_share / 2;
 
@@ -317,7 +284,7 @@ fn request_tcp_capacity_path_share_is_cumulative_and_cannot_expand() {
 #[test]
 fn request_tcp_capacity_reservations_are_path_parallel_and_session_bounded() {
     let context = request_tcp_capacity_test_context(3);
-    let session_limit = reliable_capacity_calibration_session_limit_bytes(context.mux_limits);
+    let session_limit = reliable_capacity_measurement_session_limit_bytes(context.mux_limits);
     let first_bytes = session_limit / 2;
     let second_bytes = session_limit - first_bytes;
 
@@ -372,7 +339,7 @@ fn request_tcp_capacity_reservations_are_path_parallel_and_session_bounded() {
 #[test]
 fn request_tcp_capacity_unwritten_refund_is_terminal_and_path_local() {
     let context = request_tcp_capacity_test_context(3);
-    let session_limit = reliable_capacity_calibration_session_limit_bytes(context.mux_limits);
+    let session_limit = reliable_capacity_measurement_session_limit_bytes(context.mux_limits);
     let train_bytes = 1024 * 1024;
     assert_eq!(
         context.request_tcp_capacity_probe_remaining_bytes(),
@@ -574,46 +541,6 @@ fn request_tcp_capacity_authority_expires_without_a_native_rate_prior() {
 }
 
 #[test]
-fn tcp_capacity_proof_requires_exact_fresh_receipt() {
-    let accepted_at = Instant::now();
-    let proof = TcpCapacityProofCandidate {
-        token: 7,
-        train_bytes: 2 * 1024 * 1024,
-        received_bytes: 2 * 1024 * 1024,
-        rate_sample_bytes: 2 * 1024 * 1024,
-        proof_elapsed: Duration::from_millis(400),
-        receipt_rate_bps: 40_000_000,
-        rate_bps: 80_000_000,
-        accepted_at,
-        expires_at: accepted_at + Duration::from_secs(1),
-    };
-    assert!(valid_tcp_capacity_proof_candidate_at(proof, accepted_at));
-    assert!(!valid_tcp_capacity_proof_candidate_at(
-        TcpCapacityProofCandidate {
-            received_bytes: proof.received_bytes - 1,
-            ..proof
-        },
-        accepted_at,
-    ));
-    assert!(!valid_tcp_capacity_proof_candidate_at(
-        proof,
-        proof.expires_at
-    ));
-}
-
-#[test]
-fn tcp_capacity_authority_ignores_pacing_and_bounds_delivery_uplift() {
-    assert_eq!(
-        tcp_capacity_authoritative_rate_bps(10_000_000, 15_000_000),
-        15_000_000
-    );
-    assert_eq!(
-        tcp_capacity_authoritative_rate_bps(10_000_000, 1_000_000_000),
-        20_000_000
-    );
-}
-
-#[test]
 fn portable_request_receipt_uses_exact_rate_and_configured_path_shape() {
     let mut baseline = portable_tcp_receipt_metrics(PathId(2), PathMetricDirection::ClientToServer);
     baseline.srtt_us = 40_000;
@@ -639,74 +566,4 @@ fn portable_request_receipt_uses_exact_rate_and_configured_path_shape() {
     assert_eq!(metrics.data_sample_count, 1);
     assert_eq!(metrics.data_sample_bytes, 2 * 1024 * 1024);
     assert_eq!(metrics.confidence_ppm, 1_000_000);
-}
-
-#[test]
-fn response_receipt_uses_bounded_native_delivery_without_rewriting_native_shape() {
-    let native = native_observation(
-        PathId(4),
-        Some(125_000_000),
-        Some(250_000_000),
-        Some(TcpNativeFlight {
-            snd_mss_bytes: 1_000,
-            unacked_packets: 4,
-            snd_ssthresh_packets: 40,
-            snd_cwnd_packets: 48,
-        }),
-        Some(true),
-    );
-
-    let metrics = response_tcp_capacity_receipt_metrics(
-        PathId(4),
-        4 * 1024 * 1024,
-        100_000_000,
-        None,
-        Some(native),
-    );
-
-    assert_eq!(metrics.delivery_rate_bps, 200_000_000);
-    assert_eq!(metrics.pacing_rate_bps, 200_000_000);
-    assert_eq!(metrics.inflight_limit_bytes, 48_000);
-    assert_eq!(metrics.inflight_hi_bytes, 40_000);
-    assert!(metrics.app_limited);
-}
-
-#[test]
-fn response_receipt_does_not_promote_native_pacing_to_delivery() {
-    let native = native_observation(PathId(6), Some(0), Some(250_000_000), None, None);
-    let metrics = response_tcp_capacity_receipt_metrics(
-        PathId(6),
-        4 * 1024 * 1024,
-        100_000_000,
-        None,
-        Some(native),
-    );
-
-    assert_eq!(metrics.delivery_rate_bps, 100_000_000);
-    assert_eq!(metrics.inflight_limit_bytes, 0);
-    assert!(metrics.app_limited);
-}
-
-#[test]
-fn response_receipt_does_not_treat_configured_rate_as_native_delivery() {
-    let mut baseline = portable_tcp_receipt_metrics(PathId(5), PathMetricDirection::ServerToClient);
-    baseline.delivery_rate_bps = 1_000_000_000;
-    baseline.pacing_rate_bps = 2_000_000_000;
-    baseline.srtt_us = 27_000;
-    baseline.inflight_limit_bytes = 96_000;
-    baseline.app_limited = false;
-
-    let metrics = response_tcp_capacity_receipt_metrics(
-        PathId(5),
-        4 * 1024 * 1024,
-        100_000_000,
-        Some(baseline),
-        None,
-    );
-
-    assert_eq!(metrics.delivery_rate_bps, 100_000_000);
-    assert_eq!(metrics.pacing_rate_bps, 100_000_000);
-    assert_eq!(metrics.srtt_us, baseline.srtt_us);
-    assert_eq!(metrics.inflight_limit_bytes, 0);
-    assert!(metrics.app_limited);
 }

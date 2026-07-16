@@ -39,15 +39,6 @@ pub enum PathMetricDirection {
     ServerToClient,
 }
 
-/// Control-plane attachment role; product Service/Subflow ownership is chosen
-/// independently for each direction after the attachment is live.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum StreamOpenRole {
-    Active,
-    Repair,
-    Validation,
-}
-
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum TargetAddr {
     Domain { host: String, port: u16 },
@@ -91,12 +82,15 @@ impl StreamDemandHint {
     }
 }
 
+/// Receiver-to-sender scheduling preference for one path direction.
+///
+/// This follows the regular/backup semantics established by MPTCP MP_PRIO and
+/// multipath QUIC PATH_STATUS. Path health and attachment proof are local
+/// lifecycle concerns and are deliberately not encoded as usage values.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum PathStatus {
-    Active,
-    Suspect,
-    Draining,
-    Failed,
+pub enum PathUsage {
+    Available,
+    Backup,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -124,6 +118,29 @@ pub struct PathMetrics {
     pub has_ack_derived_data_sample: bool,
     pub data_sample_count: u32,
     pub data_sample_bytes: u64,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PeerStatusCode {
+    Ok,
+    Disabled,
+    Unavailable,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PeerPathState {
+    Active,
+    Suspect,
+    Draining,
+    Failed,
+}
+
+/// One peer-observed path snapshot returned only on an explicit diagnostic request.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PeerPathStatus {
+    pub state: PeerPathState,
+    pub usage: PathUsage,
+    pub metrics: PathMetrics,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -169,14 +186,12 @@ pub enum Frame {
         issued_at_unix_secs: u64,
         auth_tag: AuthTag,
     },
-    PathJoinOk {
-        path_id: PathId,
-        nonce: AuthNonce,
-        auth_tag: AuthTag,
-    },
+    /// Advertises how the receiver wants the peer to use this path for data it
+    /// sends. The monotonically increasing sequence makes reordering explicit.
     PathStatus {
         path_id: PathId,
-        status: PathStatus,
+        sequence: u64,
+        usage: PathUsage,
     },
     PathDrain {
         path_id: PathId,
@@ -195,28 +210,27 @@ pub enum Frame {
         proof_id: u64,
         payload_bytes: u32,
     },
-    // Capacity calibration is carrier traffic with an exact ordered receipt;
+    // Capacity measurement is carrier traffic with an exact ordered receipt;
     // it never consumes or acknowledges product stream offsets.
     PathCapacityData {
         path_id: PathId,
-        calibration_id: u64,
+        measurement_id: u64,
         payload: Bytes,
     },
     PathCapacityFinish {
         path_id: PathId,
-        calibration_id: u64,
+        measurement_id: u64,
         payload_bytes: u64,
     },
     PathCapacityReceipt {
         path_id: PathId,
-        calibration_id: u64,
+        measurement_id: u64,
         received_payload_bytes: u64,
     },
     OpenStream {
         stream_id: StreamId,
         target: TargetAddr,
         demand: StreamDemandHint,
-        role: StreamOpenRole,
     },
     StreamData {
         stream_id: StreamId,
@@ -262,6 +276,14 @@ pub enum Frame {
     },
     PathMetrics {
         metrics: PathMetrics,
+    },
+    PeerStatusRequest {
+        request_id: u64,
+    },
+    PeerStatusResponse {
+        request_id: u64,
+        code: PeerStatusCode,
+        paths: Vec<PeerPathStatus>,
     },
     Ping {
         nonce: u64,
@@ -310,7 +332,6 @@ impl Frame {
             Self::SessionReady => "SESSION_READY",
             Self::SessionClose { .. } => "SESSION_CLOSE",
             Self::PathJoin { .. } => "PATH_JOIN",
-            Self::PathJoinOk { .. } => "PATH_JOIN_OK",
             Self::PathStatus { .. } => "PATH_STATUS",
             Self::PathDrain { .. } => "PATH_DRAIN",
             Self::PathClose { .. } => "PATH_CLOSE",
@@ -331,6 +352,8 @@ impl Frame {
             Self::DatagramClose { .. } => "DGRAM_CLOSE",
             Self::DatagramFeedback { .. } => "DGRAM_FEEDBACK",
             Self::PathMetrics { .. } => "PATH_METRICS",
+            Self::PeerStatusRequest { .. } => "PEER_STATUS_REQUEST",
+            Self::PeerStatusResponse { .. } => "PEER_STATUS_RESPONSE",
             Self::Ping { .. } => "PING",
             Self::Pong { .. } => "PONG",
         }

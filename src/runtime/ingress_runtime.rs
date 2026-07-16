@@ -8,19 +8,18 @@ use crate::ingress::http_connect::{self, HttpConnectError, HttpStatus};
 use crate::ingress::socks5::{self, Socks5Error, Socks5Reply};
 use crate::model::path::RelayPathKey;
 use crate::mux::MuxLimits;
-use crate::protocol::{CloseReason, Frame, PathId, TargetAddr, UnderlayProtocol};
-use crate::runtime::datagram::UdpDatagramClientSession;
+use crate::protocol::{CloseReason, Frame, PathId, PathUsage, TargetAddr, UnderlayProtocol};
+use crate::runtime::datagram::{
+    UdpDatagramClientSession, UdpEdgeCompletion, UdpEdgeLane, UdpEdgeRequest, close_udp_edge_lanes,
+    dispatch_udp_edge_request, finish_udp_edge_completion, udp_edge_completion_queue,
+};
 use crate::runtime::error::RuntimeError;
 use crate::runtime::identity::random_u64;
 use crate::runtime::path::ClientPathContext;
 use crate::runtime::path::authentication::ClientPathAuthenticationFrames;
 use crate::runtime::relay::control::relay_migrating_tcp_stream;
 use crate::runtime::relay::open::{ReliableRelayOpenSpec, open_remote_stream};
-use crate::runtime::tun_l4::{
-    UdpEdgeCompletion, UdpEdgeLane, UdpEdgeRequest, close_udp_edge_lanes,
-    dispatch_udp_edge_request, finish_udp_edge_completion, udp_edge_completion_queue,
-};
-use crate::scheduler::FlowLane;
+use crate::scheduler::TrafficClass;
 use crate::transport::encrypted::{EncryptedFramedStream, PeerRole};
 use crate::transport::tcp::{self, TcpConnectOptions};
 use std::net::{IpAddr, SocketAddr};
@@ -215,19 +214,19 @@ where
     match request.command {
         socks5::Socks5Command::Connect => {
             let target = request.target;
-            let remote = match open_remote_stream(&context, target.clone(), FlowLane::Latency).await
-            {
-                Ok(remote) => remote,
-                Err(err) => {
-                    stream
-                        .write_all(&socks5::connect_reply(
-                            Socks5Reply::GeneralFailure,
-                            SocketAddr::from(([0, 0, 0, 0], 0)),
-                        ))
-                        .await?;
-                    return Err(err);
-                }
-            };
+            let remote =
+                match open_remote_stream(&context, target.clone(), TrafficClass::Latency).await {
+                    Ok(remote) => remote,
+                    Err(err) => {
+                        stream
+                            .write_all(&socks5::connect_reply(
+                                Socks5Reply::GeneralFailure,
+                                SocketAddr::from(([0, 0, 0, 0], 0)),
+                            ))
+                            .await?;
+                        return Err(err);
+                    }
+                };
             let result = async {
                 stream
                     .write_all(&socks5::connect_reply(
@@ -301,7 +300,7 @@ where
         return Err(RuntimeError::Protocol("HTTP proxy authentication failed"));
     }
     let target = request.target;
-    let remote = match open_remote_stream(&context, target.clone(), FlowLane::Latency).await {
+    let remote = match open_remote_stream(&context, target.clone(), TrafficClass::Latency).await {
         Ok(remote) => remote,
         Err(err) => {
             stream
@@ -508,24 +507,34 @@ pub(super) async fn probe_tcp_client_path(
                 session_hello,
                 session_auth,
                 path_join,
+                Frame::PathStatus {
+                    path_id,
+                    sequence: 0,
+                    usage: if path.metadata.policy.backup {
+                        PathUsage::Backup
+                    } else {
+                        PathUsage::Available
+                    },
+                },
                 Frame::Ping { nonce },
             ])
             .await?;
         framed.flush().await?;
 
         let mut session_ready = false;
-        let mut path_active = false;
+        let mut peer_usage_received = false;
         let mut pong_received = false;
-        while !session_ready || !path_active || !pong_received {
+        while !session_ready || !peer_usage_received || !pong_received {
             match framed.read_frame().await? {
                 Frame::SessionReady => session_ready = true,
                 Frame::PathStatus {
-                    status: crate::protocol::PathStatus::Active,
+                    path_id: status_path_id,
+                    sequence: 0,
                     ..
-                } => path_active = true,
+                } if status_path_id == path_id => peer_usage_received = true,
                 Frame::PathStatus { .. } => {
                     return Err(RuntimeError::Protocol(
-                        "TCP path probe did not return active path status",
+                        "TCP path probe returned an invalid usage advertisement",
                     ));
                 }
                 Frame::Pong {

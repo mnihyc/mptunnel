@@ -198,7 +198,7 @@ async fn split_writer_does_not_publish_partial_record_bytes() {
     let (_reader, mut writer) = client.split().expect("split confirmed client");
     let frame = Frame::PathCapacityData {
         path_id: crate::protocol::PathId(1),
-        calibration_id: 7,
+        measurement_id: 7,
         payload: Bytes::from(vec![0; 4096]),
     };
 

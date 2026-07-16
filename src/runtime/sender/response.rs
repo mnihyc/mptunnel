@@ -1,24 +1,15 @@
 //! Response-direction sender ownership.
 //!
-//! The planner ranks captured path evidence into one selection intent. The
-//! multipath transaction maintains shared state, attaches planning-pass
-//! generation fences, and returns an executable plan. The service owns queued
-//! response work;
-//! dispatch alone revalidates the plan and enqueues commands.
+//! The service owns queued connection data. Scheduling ranks immutable live
+//! path observations, and dispatch revalidates one exact identity before the
+//! binding records connection flight and publishes a carrier command.
 
-#[cfg(test)]
-use super::*;
-
-mod admission;
-#[cfg(feature = "lab-diagnostics")]
-mod diagnostics;
 mod dispatch;
 mod multipath;
-mod planner;
-mod quic_capacity;
+mod scheduling;
 mod service;
-mod tcp_capacity;
 #[cfg(test)]
+#[path = "response/test_support_test.rs"]
 pub(super) mod test_support;
 
 pub(in crate::runtime) use dispatch::emit_response_control_frame;

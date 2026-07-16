@@ -8,12 +8,13 @@ use super::{DatagramClientFlow, SentDatagram, datagram_ack_range, datagram_id_is
 use crate::model::capacity::TRANSPORT_TIMER_GRANULARITY;
 use crate::mux::MuxLimits;
 use crate::mux::datagram::DatagramFlow;
-use crate::protocol::{DatagramFlowId, DatagramId, Frame, OffsetRange, PathId, TargetAddr};
+use crate::protocol::{
+    DatagramFlowId, DatagramId, Frame, OffsetRange, PathId, PathUsage, TargetAddr,
+};
 use crate::runtime::error::RuntimeError;
 use crate::runtime::identity::random_session_id;
 use crate::runtime::path::tcp::client_connection::{
-    ClientTcpCarrierConnect, ClientTcpCarrierConnection, ClientTcpHeartbeatTimeoutDisposition,
-    connect_client_tcp_carrier,
+    ClientTcpCarrierConnect, ClientTcpCarrierConnection, connect_client_tcp_carrier,
 };
 use crate::runtime::path::{ClientPathContext, PathDeliveryStats};
 use crate::scheduler::PathSnapshot;
@@ -31,6 +32,7 @@ pub(in crate::runtime) struct TcpDatagramClientSession {
     mux_limits: MuxLimits,
     pub(in crate::runtime) path_index: usize,
     path_id: PathId,
+    peer_usage_sequence: u64,
     path_snapshot: PathSnapshot,
     stats: PathDeliveryStats,
     sent_datagrams: HashMap<(DatagramFlowId, DatagramId), SentDatagram>,
@@ -49,7 +51,7 @@ impl TcpDatagramClientSession {
             .tcp_paths
             .get(path_index)
             .ok_or(RuntimeError::NoSchedulableTcpPath)?;
-        let path_snapshot = context
+        let mut path_snapshot = context
             .tcp_path_snapshot(path_index)
             .ok_or(RuntimeError::NoSchedulableTcpPath)?;
         let session_id = random_session_id()?;
@@ -71,6 +73,8 @@ impl TcpDatagramClientSession {
             open_deadline,
         )
         .await?;
+        path_snapshot.peer_usage = Some(connection.peer_usage);
+        let peer_usage_sequence = connection.peer_usage_sequence;
         Ok(Self {
             connection,
             flows: Vec::new(),
@@ -78,6 +82,7 @@ impl TcpDatagramClientSession {
             mux_limits: context.mux_limits,
             path_index,
             path_id: PathId(path_index as u16),
+            peer_usage_sequence,
             path_snapshot,
             stats: PathDeliveryStats::default(),
             sent_datagrams: HashMap::new(),
@@ -100,9 +105,7 @@ impl TcpDatagramClientSession {
             });
         }
         let setup = async {
-            self.connection
-                .tick_heartbeat(ClientTcpHeartbeatTimeoutDisposition::KeepCarrierAlive)
-                .await?;
+            self.connection.tick_heartbeat().await?;
             self.ensure_flow(target).await
         };
         let flow_id = match tokio::time::timeout_at(fallback_deadline, setup).await {
@@ -379,7 +382,22 @@ impl TcpDatagramClientSession {
                 Frame::Pong { nonce } => {
                     self.connection.clear_matching_heartbeat(nonce);
                 }
-                Frame::PathStatus { .. } | Frame::SessionReady => {}
+                Frame::PathStatus {
+                    path_id,
+                    sequence,
+                    usage,
+                } => {
+                    apply_client_tcp_datagram_path_status(
+                        self.path_id,
+                        path_id,
+                        sequence,
+                        usage,
+                        &mut self.peer_usage_sequence,
+                        &mut self.path_snapshot,
+                    )
+                    .map_err(|err| DatagramPathSendError::runtime(err, request_acked))?;
+                }
+                Frame::SessionReady => {}
                 Frame::PathClose { .. } => {
                     return Err(DatagramPathSendError::runtime(
                         RuntimeError::ReliablePathSessionClosed,
@@ -509,3 +527,28 @@ impl TcpDatagramClientSession {
         });
     }
 }
+
+fn apply_client_tcp_datagram_path_status(
+    expected_path_id: PathId,
+    status_path_id: PathId,
+    sequence: u64,
+    usage: PathUsage,
+    peer_usage_sequence: &mut u64,
+    snapshot: &mut PathSnapshot,
+) -> Result<bool, RuntimeError> {
+    if status_path_id != expected_path_id {
+        return Err(RuntimeError::Protocol(
+            "TCP path usage advertisement path mismatch",
+        ));
+    }
+    if sequence <= *peer_usage_sequence {
+        return Ok(false);
+    }
+    *peer_usage_sequence = sequence;
+    snapshot.peer_usage = Some(usage);
+    Ok(true)
+}
+
+#[cfg(test)]
+#[path = "tcp_session_test.rs"]
+mod tests;

@@ -3,11 +3,10 @@
 //! Formulas consume live evidence and protocol-derived timing; this module owns
 //! no queues, flow lifetimes, carrier I/O, or simulator-only heuristics.
 
-use super::FlowLane;
+use super::TrafficClass;
 use crate::model::path::PathPolicy;
-use crate::protocol::{PathId, UnderlayProtocol};
+use crate::protocol::{PathId, PathUsage, UnderlayProtocol};
 
-const BBR_DEFAULT_CWND_GAIN: f64 = 2.0;
 pub(crate) const QUIC_INITIAL_WINDOW_PACKETS: f64 = 10.0;
 const QUIC_MAX_ACK_DELAY_MS: f64 = 25.0;
 const QUIC_PERSISTENT_CONGESTION_THRESHOLD: f64 = 3.0;
@@ -34,6 +33,9 @@ pub struct PathSnapshot {
     pub underlay: UnderlayProtocol,
     pub state: PathState,
     pub policy: PathPolicy,
+    /// The receiver's directional preference for data sent by this endpoint.
+    /// Local health and endpoint-local policy remain independent inputs.
+    pub peer_usage: Option<PathUsage>,
     pub srtt_ms: f64,
     pub jitter_ms: f64,
     pub delivery_rate_bps: f64,
@@ -43,15 +45,22 @@ pub struct PathSnapshot {
     /// sample threshold; a point rate alone is not admission evidence.
     pub has_durable_product_progress: bool,
     pub loss_rate: f64,
+    /// Bytes waiting in the carrier-owned writer/socket queue.
     pub queue_bytes: u64,
-    pub product_queue_bytes: u64,
+    /// MPP bytes waiting above the carrier queue.
+    pub data_level_queue_bytes: u64,
+    /// Bytes reported in flight by the native carrier.
     pub bytes_in_flight: u64,
-    pub product_bytes_in_flight: u64,
+    /// MPP transmissions awaiting a Data ACK on this path.
+    pub data_level_bytes_in_flight: u64,
     pub active_flows: u32,
     pub active_latency_sensitive_flows: u32,
     pub session_active_latency_sensitive_flows: u32,
     pub pacing_rate_bps: f64,
-    pub inflight_limit_bytes: u64,
+    /// Native carrier congestion-window or inflight credit; zero is unknown.
+    pub carrier_inflight_limit_bytes: u64,
+    /// Explicit MPP per-path scheduling window; zero requests model derivation.
+    pub data_level_limit_bytes: u64,
     pub confidence: f64,
     pub app_limited: bool,
 }
@@ -68,6 +77,7 @@ impl PathSnapshot {
             underlay,
             state: PathState::Active,
             policy: PathPolicy::default(),
+            peer_usage: None,
             srtt_ms,
             jitter_ms: 0.0,
             delivery_rate_bps,
@@ -76,14 +86,15 @@ impl PathSnapshot {
             has_durable_product_progress: false,
             loss_rate: 0.0,
             queue_bytes: 0,
-            product_queue_bytes: 0,
+            data_level_queue_bytes: 0,
             bytes_in_flight: 0,
-            product_bytes_in_flight: 0,
+            data_level_bytes_in_flight: 0,
             active_flows: 0,
             active_latency_sensitive_flows: 0,
             session_active_latency_sensitive_flows: 0,
             pacing_rate_bps: delivery_rate_bps,
-            inflight_limit_bytes: 0,
+            carrier_inflight_limit_bytes: 0,
+            data_level_limit_bytes: 0,
             confidence: 1.0,
             app_limited: false,
         }
@@ -113,49 +124,55 @@ pub struct PathScore {
 
 pub fn choose_path(
     paths: &[PathSnapshot],
-    lane: FlowLane,
+    lane: TrafficClass,
     payload_bytes: usize,
 ) -> Option<PathScore> {
-    paths
-        .iter()
-        .filter_map(|path| score_path(*path, lane, payload_bytes))
-        .min_by(|left, right| left.eta_ms.total_cmp(&right.eta_ms))
+    let choose = |allow_backup: bool| {
+        paths
+            .iter()
+            .filter(|path| allow_backup || !path_is_backup(**path))
+            .filter_map(|path| score_path(*path, lane, payload_bytes))
+            .min_by(|left, right| left.eta_ms.total_cmp(&right.eta_ms))
+    };
+    choose(false).or_else(|| choose(true))
 }
 
-pub fn score_path(path: PathSnapshot, lane: FlowLane, payload_bytes: usize) -> Option<PathScore> {
+/// MPTCP-style backup preference is directional. Local configuration may be
+/// stricter than the peer, so either source can reserve a path as fallback.
+pub fn path_is_backup(path: PathSnapshot) -> bool {
+    path.policy.backup || path.peer_usage == Some(PathUsage::Backup)
+}
+
+pub fn score_path(
+    path: PathSnapshot,
+    lane: TrafficClass,
+    payload_bytes: usize,
+) -> Option<PathScore> {
     if !path_is_schedulable(path, lane) {
         return None;
     }
 
     let rate = effective_path_rate_bps(path, lane);
-    let effective_inflight = if path.inflight_limit_bytes > 0 {
-        let adaptive_ceiling =
-            (path.inflight_limit_bytes as f64 * BBR_DEFAULT_CWND_GAIN).ceil() as u64;
-        path.bytes_in_flight
-            .min(adaptive_ceiling.max(path.inflight_limit_bytes))
-    } else {
-        path.bytes_in_flight
-    };
-    let queued_bits = path
-        .queue_bytes
-        .saturating_add(path.product_queue_bytes)
-        .saturating_add(effective_inflight) as f64
-        * 8.0;
+    // Native flight and MPP Data-ACK flight are overlapping views of the same
+    // pipeline. Summing them invents backlog and acts like a second congestion
+    // controller above TCP/QUIC, so completion uses the larger owned view.
+    let carrier_work = path.queue_bytes.saturating_add(path.bytes_in_flight);
+    let data_level_work = path
+        .data_level_queue_bytes
+        .saturating_add(path.data_level_bytes_in_flight);
+    let queued_bits = carrier_work.max(data_level_work) as f64 * 8.0;
     let payload_bits = payload_bytes as f64 * 8.0;
 
     let mut eta_ms = path.srtt_ms / 2.0;
     eta_ms += queued_bits / rate * 1000.0;
     eta_ms += payload_bits / rate * 1000.0;
     eta_ms += path.jitter_ms;
-    eta_ms += adaptive_loss_repair_penalty_ms(path);
+    eta_ms += adaptive_loss_reinjection_penalty_ms(path);
     eta_ms += adaptive_low_confidence_penalty_ms(path);
     eta_ms += active_flow_penalty_ms(path, lane);
 
     if path.state == PathState::Suspect {
         eta_ms += suspect_penalty_ms(path, lane);
-    }
-    if path.policy.backup {
-        eta_ms += adaptive_backup_penalty_ms(path);
     }
     if path.policy.expensive {
         eta_ms += adaptive_expensive_path_penalty_ms(path, payload_bytes);
@@ -166,25 +183,25 @@ pub fn score_path(path: PathSnapshot, lane: FlowLane, payload_bytes: usize) -> O
     })
 }
 
-fn active_flow_penalty_ms(path: PathSnapshot, lane: FlowLane) -> f64 {
+fn active_flow_penalty_ms(path: PathSnapshot, lane: TrafficClass) -> f64 {
     match lane {
-        FlowLane::Throughput | FlowLane::Background => {
+        TrafficClass::Throughput | TrafficClass::Background => {
             f64::from(path.active_latency_sensitive_flows) * path_pto_ms(path)
         }
-        FlowLane::Control | FlowLane::RealtimeDatagram | FlowLane::Latency => {
+        TrafficClass::Control | TrafficClass::RealtimeDatagram | TrafficClass::Latency => {
             f64::from(path.active_flows) * path_pto_ms(path) / QUIC_INITIAL_WINDOW_PACKETS
         }
     }
 }
 
-fn effective_path_rate_bps(path: PathSnapshot, lane: FlowLane) -> f64 {
+fn effective_path_rate_bps(path: PathSnapshot, lane: TrafficClass) -> f64 {
     let rate = match path.rate_scope {
         PathRateScope::PerFlowGoodput => path.delivery_rate_bps,
         PathRateScope::PathCapacity => path.pacing_rate_bps.max(path.delivery_rate_bps),
     }
     .max(1.0);
     match lane {
-        FlowLane::Throughput | FlowLane::Background
+        TrafficClass::Throughput | TrafficClass::Background
             if matches!(path.rate_scope, PathRateScope::PathCapacity) =>
         {
             let active_bulk_flows = path
@@ -193,31 +210,31 @@ fn effective_path_rate_bps(path: PathSnapshot, lane: FlowLane) -> f64 {
                 .max(1) as f64;
             rate / active_bulk_flows
         }
-        FlowLane::Control
-        | FlowLane::Latency
-        | FlowLane::RealtimeDatagram
-        | FlowLane::Throughput
-        | FlowLane::Background => rate,
+        TrafficClass::Control
+        | TrafficClass::Latency
+        | TrafficClass::RealtimeDatagram
+        | TrafficClass::Throughput
+        | TrafficClass::Background => rate,
     }
 }
 
-pub(crate) fn path_is_schedulable(path: PathSnapshot, lane: FlowLane) -> bool {
+pub(crate) fn path_is_schedulable(path: PathSnapshot, lane: TrafficClass) -> bool {
     if matches!(path.state, PathState::Failed | PathState::Draining) {
         return false;
     }
-    if path.policy.probe_only && lane != FlowLane::Control {
+    if path.policy.probe_only && lane != TrafficClass::Control {
         return false;
     }
-    if lane == FlowLane::Throughput && !path.policy.bulk_allowed {
+    if lane == TrafficClass::Throughput && !path.policy.bulk_allowed {
         return false;
     }
-    if lane == FlowLane::RealtimeDatagram && path.policy.no_udp {
+    if lane == TrafficClass::RealtimeDatagram && path.policy.no_udp {
         return false;
     }
     true
 }
 
-fn suspect_penalty_ms(path: PathSnapshot, lane: FlowLane) -> f64 {
+fn suspect_penalty_ms(path: PathSnapshot, lane: TrafficClass) -> f64 {
     if prefers_low_reorder(lane) {
         0.0
     } else {
@@ -225,26 +242,22 @@ fn suspect_penalty_ms(path: PathSnapshot, lane: FlowLane) -> f64 {
     }
 }
 
-fn prefers_low_reorder(lane: FlowLane) -> bool {
+fn prefers_low_reorder(lane: TrafficClass) -> bool {
     lane.is_latency_sensitive()
 }
 
-fn adaptive_loss_repair_penalty_ms(path: PathSnapshot) -> f64 {
+fn adaptive_loss_reinjection_penalty_ms(path: PathSnapshot) -> f64 {
     let loss = path.loss_rate.clamp(0.0, 1.0);
     if loss <= f64::EPSILON {
         return 0.0;
     }
     let denominator_floor = 1.0 / QUIC_INITIAL_WINDOW_PACKETS;
-    let expected_repairs = loss / (1.0 - loss).max(denominator_floor);
-    expected_repairs * path_pto_ms(path)
+    let expected_reinjections = loss / (1.0 - loss).max(denominator_floor);
+    expected_reinjections * path_pto_ms(path)
 }
 
 fn adaptive_low_confidence_penalty_ms(path: PathSnapshot) -> f64 {
     (1.0 - path.confidence.clamp(0.0, 1.0)) * path_pto_ms(path) / QUIC_INITIAL_WINDOW_PACKETS
-}
-
-fn adaptive_backup_penalty_ms(path: PathSnapshot) -> f64 {
-    path_pto_ms(path)
 }
 
 fn adaptive_expensive_path_penalty_ms(path: PathSnapshot, payload_bytes: usize) -> f64 {
@@ -252,13 +265,14 @@ fn adaptive_expensive_path_penalty_ms(path: PathSnapshot, payload_bytes: usize) 
 }
 
 pub(crate) fn path_bdp_bytes(path: PathSnapshot) -> usize {
-    ((effective_path_rate_bps(path, FlowLane::Throughput) / 8.0) * (path.srtt_ms.max(1.0) / 1000.0))
+    ((effective_path_rate_bps(path, TrafficClass::Throughput) / 8.0)
+        * (path.srtt_ms.max(1.0) / 1000.0))
         .ceil()
         .max(1.0) as usize
 }
 
 pub(crate) fn payload_tx_ms(path: PathSnapshot, payload_bytes: usize) -> f64 {
-    payload_bytes as f64 * 8.0 / effective_path_rate_bps(path, FlowLane::Throughput) * 1000.0
+    payload_bytes as f64 * 8.0 / effective_path_rate_bps(path, TrafficClass::Throughput) * 1000.0
 }
 
 pub(crate) fn path_pto_ms(path: PathSnapshot) -> f64 {

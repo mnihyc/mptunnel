@@ -22,10 +22,16 @@
 # restart_max_backoff_ms = 30000
 # max_restarts = 10
 
-# Optional management API. Disabled when listen is unset.
+# Optional management API. Disabled when listen is unset. HTTP listeners must
+# use loopback addresses and require a token. Expose it remotely only through a
+# same-host TLS reverse proxy or SSH tunnel. Peer diagnostics is an independent
+# responder permission and may be enabled without a local HTTP listener.
 # [management]
 # listen = ["127.0.0.1:7600"]
+# 16-256 visible ASCII characters; use a generated random value.
 # token = "replace-with-operator-token"
+# dashboard = true
+# allow_peer_diagnostics = false
 
 # Optional resource envelopes. These are capacity envelopes for adaptive
 # scheduling, not fixed transmission modes. Leave this whole section unset for
@@ -138,12 +144,10 @@ endpoints = ["tcp://127.0.0.1:7443", "udp://127.0.0.1:7443"]
 [outbounds.security]
 # MPP security is scoped to this MPP outbound, so one node can talk to multiple
 # MPP peers with different secrets.
-# mode = "encrypted"
 secret = "01234567-89ab-cdef-0123-456789abcdef"
 # cipher = "aes-256-gcm"
 # cipher = "chacha20-poly1305"
 # auth_freshness_window_seconds = 300
-# i_understand_this_is_insecure = false
 
 # Uncomment this inbound to make the same process accept MPP paths from other
 # nodes. This is the server-side shape: inbound(mpp) -> outbound(direct).

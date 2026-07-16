@@ -9,6 +9,8 @@
 /.bisect-target/
 /.worktrees/
 /iteration*/
+/output/
+/.playwright-cli/
 /AGENTS.md
 /DESIGN.md
 /PROGRESS.md

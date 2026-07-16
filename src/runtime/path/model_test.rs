@@ -1,6 +1,31 @@
 use super::*;
 
 #[test]
+fn configured_order_startup_excludes_backup_while_available_path_is_schedulable() {
+    let paths = [
+        "tcp://127.0.0.1:10000".parse::<PathSpec>().expect("path"),
+        "tcp://127.0.0.1:10001".parse::<PathSpec>().expect("path"),
+    ];
+    let observations = [
+        ClientPathObservation {
+            state: SchedulerPathState::Active,
+            peer_usage: Some(crate::protocol::PathUsage::Backup),
+            ..ClientPathObservation::default()
+        },
+        ClientPathObservation {
+            state: SchedulerPathState::Active,
+            peer_usage: Some(crate::protocol::PathUsage::Available),
+            ..ClientPathObservation::default()
+        },
+    ];
+
+    assert_eq!(
+        configured_order_path_indices(&paths, &observations, TrafficClass::Latency, 1),
+        vec![1]
+    );
+}
+
+#[test]
 fn automatic_bulk_use_honors_every_operator_policy() {
     let allowed = "tcp://127.0.0.1:10000"
         .parse::<PathSpec>()

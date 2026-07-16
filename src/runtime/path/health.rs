@@ -8,14 +8,16 @@ use super::model::{
 };
 use super::proof::PathProofObservation;
 use super::quic::metrics::UdpPathMetrics;
-use super::quic::{RequestQuicCapacityProductHandoffState, RequestQuicCapacityRecord};
+use super::quic::{RequestQuicCapacityProductAdmissionState, RequestQuicCapacityRecord};
 use super::tcp::capacity::RequestTcpCapacityRecord;
 use super::tcp::metrics::TcpNativeObservation;
 use crate::model::capacity::{
-    BBR_MAX_SEND_QUANTUM_BYTES, PATH_OPEN_SCORE_BYTES, PathRateSample, TcpCapacityProofCandidate,
+    MAX_RELIABLE_SERVICE_QUANTUM_BYTES, PATH_OPEN_SCORE_BYTES, PathRateSample,
+    TcpCapacityProofCandidate,
 };
-use crate::model::path::RelayPathInstance;
-use crate::scheduler::{FlowLane, PathState as SchedulerPathState};
+use crate::model::path::{CarrierPathInstanceId, RelayPathInstance};
+use crate::protocol::PathUsage;
+use crate::scheduler::{PathState as SchedulerPathState, TrafficClass};
 use std::collections::{HashMap, VecDeque};
 use std::time::{Duration, Instant};
 
@@ -29,6 +31,10 @@ pub(in crate::runtime) struct ClientPathHealth {
 pub(in crate::runtime) struct ClientPathHealthRecord {
     pub(in crate::runtime) state: SchedulerPathState,
     pub(in crate::runtime) manual_disabled: bool,
+    data_plane_failure_instance_id: Option<CarrierPathInstanceId>,
+    pub(in crate::runtime) peer_usage: Option<PathUsage>,
+    path_instance_id: Option<CarrierPathInstanceId>,
+    peer_usage_sequence: Option<u64>,
     pub(in crate::runtime) consecutive_failures: u32,
     pub(in crate::runtime) measured_srtt_ms: Option<f64>,
     pub(in crate::runtime) measured_jitter_ms: Option<f64>,
@@ -71,7 +77,7 @@ pub(super) struct RequestQuicCapacityReconciliationObservation {
     pub(super) target: RelayPathInstance,
     pub(super) token: u64,
     pub(super) carrier_proven: bool,
-    pub(super) handoff: RequestQuicCapacityProductHandoffState,
+    pub(super) product_admission: RequestQuicCapacityProductAdmissionState,
 }
 
 /// One lock-coherent carrier-authority view for request reconciliation.
@@ -104,16 +110,16 @@ impl RequestCapacityReconciliationView {
         })
     }
 
-    pub(in crate::runtime) fn quic_handoff_state(
+    pub(in crate::runtime) fn quic_product_admission_state(
         &self,
         target: RelayPathInstance,
         token: u64,
-    ) -> RequestQuicCapacityProductHandoffState {
+    ) -> RequestQuicCapacityProductAdmissionState {
         self.quic
             .filter(|observation| observation.target == target && observation.token == token)
             .map_or(
-                RequestQuicCapacityProductHandoffState::Absent,
-                |observation| observation.handoff,
+                RequestQuicCapacityProductAdmissionState::Absent,
+                |observation| observation.product_admission,
             )
     }
 }
@@ -130,6 +136,10 @@ impl Default for ClientPathHealthRecord {
         Self {
             state: SchedulerPathState::Active,
             manual_disabled: false,
+            data_plane_failure_instance_id: None,
+            peer_usage: None,
+            path_instance_id: None,
+            peer_usage_sequence: None,
             consecutive_failures: 0,
             measured_srtt_ms: None,
             measured_jitter_ms: None,
@@ -169,6 +179,41 @@ impl Default for ClientPathHealthRecord {
 }
 
 impl ClientPathHealthRecord {
+    pub(in crate::runtime) fn install_peer_usage(
+        &mut self,
+        path_instance_id: CarrierPathInstanceId,
+        sequence: u64,
+        usage: PathUsage,
+    ) {
+        if self.path_instance_id != Some(path_instance_id) {
+            self.data_plane_failure_instance_id = None;
+        }
+        self.path_instance_id = Some(path_instance_id);
+        self.peer_usage_sequence = Some(sequence);
+        self.peer_usage = Some(usage);
+        self.mark_liveness_success();
+    }
+
+    pub(in crate::runtime) fn update_peer_usage(
+        &mut self,
+        path_instance_id: CarrierPathInstanceId,
+        sequence: u64,
+        usage: PathUsage,
+    ) -> bool {
+        if self.path_instance_id != Some(path_instance_id) {
+            return false;
+        }
+        if self
+            .peer_usage_sequence
+            .is_some_and(|current| sequence <= current)
+        {
+            return false;
+        }
+        self.peer_usage_sequence = Some(sequence);
+        self.peer_usage = Some(usage);
+        true
+    }
+
     pub(super) fn with_path_proof_limit(limit: usize) -> Self {
         Self {
             successful_path_proof_limit: limit.max(1),
@@ -228,7 +273,7 @@ impl ClientPathHealthRecord {
             && self.carrier_delivery_sample_bytes
                 >= self
                     .carrier_inflight_limit_bytes
-                    .max(BBR_MAX_SEND_QUANTUM_BYTES as u64)
+                    .max(MAX_RELIABLE_SERVICE_QUANTUM_BYTES as u64)
                     .max(PATH_OPEN_SCORE_BYTES as u64)
     }
 
@@ -249,6 +294,7 @@ impl ClientPathHealthRecord {
             return ClientPathObservation {
                 state: SchedulerPathState::Failed,
                 manual_disabled: true,
+                peer_usage: self.peer_usage,
                 measured_srtt_ms: self.measured_srtt_ms,
                 measured_jitter_ms: self.measured_jitter_ms,
                 measured_rate_bps: self.measured_rate_bps,
@@ -274,7 +320,7 @@ impl ClientPathHealthRecord {
                 carrier_app_limited: self.carrier_app_limited,
                 carrier_ack_derived_data_seen: self.carrier_ack_derived_data_seen,
                 explicit_carrier_capacity_proof: false,
-                quic_capacity_product_handoff_complete: false,
+                quic_capacity_product_admission_complete: false,
                 quic_capacity_rate_prior_fresh: false,
                 path_proof_success: self.path_proof_success,
             };
@@ -291,7 +337,7 @@ impl ClientPathHealthRecord {
             .quic_capacity
             .observation_at(now, self.has_durable_native_carrier_window());
         let quic_proof = quic_capacity.proof;
-        let handoff_capacity_prior = quic_capacity.handoff_prior;
+        let product_admission_capacity_prior = quic_capacity.product_admission_prior;
         let proof_rate_bps = tcp_proof
             .map(|proof| proof.rate_bps as f64)
             .or_else(|| quic_proof.map(|proof| proof.rate_bps as f64));
@@ -305,6 +351,7 @@ impl ClientPathHealthRecord {
         ClientPathObservation {
             state,
             manual_disabled: false,
+            peer_usage: self.peer_usage,
             measured_srtt_ms: self.measured_srtt_ms,
             measured_jitter_ms: self.measured_jitter_ms,
             measured_rate_bps: self.measured_rate_bps,
@@ -321,35 +368,44 @@ impl ClientPathHealthRecord {
             carrier_srtt_ms: self.carrier_srtt_ms,
             carrier_rttvar_ms: self.carrier_rttvar_ms,
             carrier_delivery_rate_bps: proof_rate_bps
-                .or_else(|| handoff_capacity_prior.map(|handoff| handoff.rate_bps as f64))
+                .or_else(|| {
+                    product_admission_capacity_prior
+                        .map(|product_admission| product_admission.rate_bps as f64)
+                })
                 .or(self.carrier_delivery_rate_bps),
             carrier_bytes_in_flight: self.carrier_bytes_in_flight,
             carrier_queue_bytes: self.carrier_queue_bytes,
             carrier_inflight_limit_bytes: self.carrier_inflight_limit_bytes,
             carrier_delivery_samples: if explicit_carrier_capacity_proof
-                || handoff_capacity_prior.is_some()
+                || product_admission_capacity_prior.is_some()
             {
                 self.carrier_delivery_samples.max(1)
             } else {
                 self.carrier_delivery_samples
             },
             carrier_delivery_sample_bytes: proof_sample_bytes
-                .or_else(|| handoff_capacity_prior.map(|handoff| handoff.rate_sample_bytes))
+                .or_else(|| {
+                    product_admission_capacity_prior
+                        .map(|product_admission| product_admission.rate_sample_bytes)
+                })
                 .map_or(self.carrier_delivery_sample_bytes, |sample_bytes| {
                     self.carrier_delivery_sample_bytes.max(sample_bytes)
                 }),
             carrier_last_delivery_at: proof_accepted_at
-                .or_else(|| handoff_capacity_prior.map(|handoff| handoff.accepted_at))
+                .or_else(|| {
+                    product_admission_capacity_prior
+                        .map(|product_admission| product_admission.accepted_at)
+                })
                 .or(self.carrier_last_delivery_at),
             carrier_app_limited: !explicit_carrier_capacity_proof
-                && handoff_capacity_prior.is_none()
+                && product_admission_capacity_prior.is_none()
                 && self.carrier_app_limited,
             carrier_ack_derived_data_seen: explicit_carrier_capacity_proof
-                || handoff_capacity_prior.is_some()
+                || product_admission_capacity_prior.is_some()
                 || self.carrier_ack_derived_data_seen,
             explicit_carrier_capacity_proof,
-            quic_capacity_product_handoff_complete: quic_capacity.handoff_complete,
-            quic_capacity_rate_prior_fresh: handoff_capacity_prior.is_some(),
+            quic_capacity_product_admission_complete: quic_capacity.product_admission_complete,
+            quic_capacity_rate_prior_fresh: product_admission_capacity_prior.is_some(),
             path_proof_success: self.path_proof_success,
         }
     }
@@ -412,7 +468,7 @@ impl ClientPathHealthRecord {
         self.failed_until = None;
     }
 
-    pub(in crate::runtime) fn mark_open_success(&mut self, _elapsed: Duration, lane: FlowLane) {
+    pub(in crate::runtime) fn mark_open_success(&mut self, _elapsed: Duration, lane: TrafficClass) {
         self.mark_liveness_success();
         self.active_flows = self.active_flows.saturating_add(1);
         if lane.is_latency_sensitive() {
@@ -421,7 +477,7 @@ impl ClientPathHealthRecord {
         }
     }
 
-    pub(in crate::runtime) fn reserve_load(&mut self, lane: FlowLane) {
+    pub(in crate::runtime) fn reserve_load(&mut self, lane: TrafficClass) {
         self.active_flows = self.active_flows.saturating_add(1);
         if lane.is_latency_sensitive() {
             self.active_latency_sensitive_flows =
@@ -433,7 +489,7 @@ impl ClientPathHealthRecord {
         self.mark_liveness_success();
     }
 
-    pub(in crate::runtime) fn release_load(&mut self, lane: FlowLane) {
+    pub(in crate::runtime) fn release_load(&mut self, lane: TrafficClass) {
         self.active_flows = self.active_flows.saturating_sub(1);
         if lane.is_latency_sensitive() {
             self.active_latency_sensitive_flows =
@@ -441,7 +497,7 @@ impl ClientPathHealthRecord {
         }
     }
 
-    pub(in crate::runtime) fn change_lane_load(&mut self, from: FlowLane, to: FlowLane) {
+    pub(in crate::runtime) fn change_lane_load(&mut self, from: TrafficClass, to: TrafficClass) {
         if from.is_latency_sensitive() && !to.is_latency_sensitive() {
             self.active_latency_sensitive_flows =
                 self.active_latency_sensitive_flows.saturating_sub(1);
@@ -455,9 +511,7 @@ impl ClientPathHealthRecord {
         if self.manual_disabled {
             return;
         }
-        self.state = SchedulerPathState::Active;
-        self.consecutive_failures = 0;
-        self.failed_until = None;
+        self.mark_liveness_success();
         self.delivery_samples = self.delivery_samples.saturating_add(1);
         self.last_delivery_at = Some(Instant::now());
         let sample_bps = sample.rate_bps();
@@ -493,9 +547,7 @@ impl ClientPathHealthRecord {
             .product_delivery_sample_bytes
             .saturating_add(sample.bytes());
         self.product_delivery_rate_bps = Some(sample.rate_bps());
-        self.state = SchedulerPathState::Active;
-        self.consecutive_failures = 0;
-        self.failed_until = None;
+        self.mark_liveness_success();
         self.delivery_samples = self.delivery_samples.saturating_add(1);
         self.last_delivery_at = Some(Instant::now());
         self.measured_rate_bps = Some(sample.rate_bps());
@@ -525,9 +577,7 @@ impl ClientPathHealthRecord {
         if self.manual_disabled {
             return;
         }
-        self.state = SchedulerPathState::Active;
-        self.consecutive_failures = 0;
-        self.failed_until = None;
+        self.mark_liveness_success();
         if metrics.rtt_observed {
             self.carrier_srtt_ms = Some(metrics.srtt.as_secs_f64() * 1000.0);
             self.carrier_rttvar_ms = Some(metrics.rttvar.as_secs_f64() * 1000.0);
@@ -569,9 +619,16 @@ impl ClientPathHealthRecord {
 
     pub(in crate::runtime) fn mark_data_plane_failure(
         &mut self,
+        path_instance_id: CarrierPathInstanceId,
         now: Instant,
         has_schedulable_alternative: bool,
-    ) {
+    ) -> bool {
+        if self.path_instance_id != Some(path_instance_id)
+            || self.data_plane_failure_instance_id == Some(path_instance_id)
+        {
+            return false;
+        }
+        self.data_plane_failure_instance_id = Some(path_instance_id);
         self.consecutive_failures = self.consecutive_failures.saturating_add(1);
         self.relay_bytes_in_flight = 0;
         self.relay_queue_bytes = 0;
@@ -597,6 +654,7 @@ impl ClientPathHealthRecord {
             self.state = SchedulerPathState::Suspect;
             self.failed_until = None;
         }
+        true
     }
 
     pub(in crate::runtime) fn record_relay_send(&mut self, bytes: usize) {

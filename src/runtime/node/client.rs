@@ -30,9 +30,15 @@ pub(super) async fn run(
     // Product sender policy follows the configured path group without becoming
     // carrier-state ownership in `ClientPathContext`.
     let performance = client.performance;
-    let context = new_path_context(&client, resources, 0, carrier_network)?;
+    let context = new_path_context(
+        &client,
+        resources,
+        0,
+        carrier_network,
+        management.peer_diagnostics_enabled(),
+    )?;
     let mut services = tokio::task::JoinSet::new();
-    if management.enabled() {
+    if management.http_enabled() {
         spawn_client_management_services(management, context.clone(), &mut services);
     }
     spawn_ingresses(
@@ -64,14 +70,16 @@ pub(super) fn new_path_context(
     resources: ResourceLimits,
     path_group_ordinal: usize,
     carrier_network: Arc<dyn CarrierNetworkProvider>,
+    allow_peer_diagnostics: bool,
 ) -> Result<ClientPathContext, RuntimeError> {
-    ClientPathContext::new_with_carrier_network(
+    ClientPathContext::new_with_carrier_network_and_peer_diagnostics(
         client.paths.clone(),
         resources,
         client.route_target.clone(),
         client.ingresses.clone(),
         path_group_ordinal,
         carrier_network,
+        allow_peer_diagnostics,
     )
 }
 

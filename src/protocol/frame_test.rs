@@ -1,7 +1,7 @@
 use crate::protocol::frame::{
-    datagram_ack_range, normalized_offset_ranges, reliable_path_frame_pacing_bytes,
-    reliable_stream_frame_accounted_bytes, reliable_stream_frame_extent,
-    stream_ack_contiguous_frontier,
+    datagram_ack_range, normalized_offset_ranges, offset_ranges_not_covered,
+    reliable_path_frame_pacing_bytes, reliable_stream_frame_accounted_bytes,
+    reliable_stream_frame_extent, stream_ack_contiguous_frontier,
 };
 use crate::protocol::{
     DatagramFlowId, DatagramId, Frame, OffsetRange, PathId, ResetReason, StreamId,
@@ -35,6 +35,27 @@ fn offset_range_normalization_sorts_filters_and_merges_adjacency() {
         vec![
             OffsetRange { start: 0, end: 25 },
             OffsetRange { start: 27, end: 30 },
+        ]
+    );
+}
+
+#[test]
+fn offset_range_subtraction_preserves_only_uncovered_intervals() {
+    let ranges = [
+        OffsetRange { start: 0, end: 20 },
+        OffsetRange { start: 30, end: 40 },
+    ];
+    let covered = [
+        OffsetRange { start: 5, end: 10 },
+        OffsetRange { start: 15, end: 35 },
+    ];
+
+    assert_eq!(
+        offset_ranges_not_covered(&ranges, &covered),
+        vec![
+            OffsetRange { start: 0, end: 5 },
+            OffsetRange { start: 10, end: 15 },
+            OffsetRange { start: 35, end: 40 },
         ]
     );
 }
@@ -97,7 +118,7 @@ fn frame_accounting_and_pacing_cover_each_semantic_row() {
             "capacity data",
             Frame::PathCapacityData {
                 path_id,
-                calibration_id: 1,
+                measurement_id: 1,
                 payload: Bytes::from_static(b"probe"),
             },
             1,
@@ -107,7 +128,7 @@ fn frame_accounting_and_pacing_cover_each_semantic_row() {
             "empty capacity data",
             Frame::PathCapacityData {
                 path_id,
-                calibration_id: 1,
+                measurement_id: 1,
                 payload: Bytes::new(),
             },
             1,
@@ -117,7 +138,7 @@ fn frame_accounting_and_pacing_cover_each_semantic_row() {
             "capacity finish",
             Frame::PathCapacityFinish {
                 path_id,
-                calibration_id: 1,
+                measurement_id: 1,
                 payload_bytes: 5,
             },
             1,
@@ -127,7 +148,7 @@ fn frame_accounting_and_pacing_cover_each_semantic_row() {
             "capacity receipt",
             Frame::PathCapacityReceipt {
                 path_id,
-                calibration_id: 1,
+                measurement_id: 1,
                 received_payload_bytes: 5,
             },
             1,

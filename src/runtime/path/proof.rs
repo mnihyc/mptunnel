@@ -8,7 +8,7 @@ use crate::protocol::{Frame, PathId, PathMetricDirection, PathMetrics, UnderlayP
 use crate::runtime::error::RuntimeError;
 use crate::runtime::path::commands::ReliablePathCommandSender;
 use crate::runtime::path::model::{metric_epoch_now, ratio_to_ppm};
-use crate::scheduler::FlowLane;
+use crate::scheduler::TrafficClass;
 use bytes::Bytes;
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -137,7 +137,7 @@ pub(in crate::runtime) fn enqueue_path_proof_frame(
     mux_limits: MuxLimits,
 ) -> Result<u64, RuntimeError> {
     let (proof_id, frame) = allocated_path_proof_data_frame(path_id, mux_limits);
-    commands.try_enqueue_admitted_frame(frame, FlowLane::Control)?;
+    commands.try_enqueue_admitted_frame(frame, TrafficClass::Control)?;
     Ok(proof_id)
 }
 
@@ -145,7 +145,7 @@ pub(in crate::runtime) fn enqueue_stream_ordered_path_proof_frame(
     commands: &ReliablePathCommandSender,
     path_id: PathId,
     mux_limits: MuxLimits,
-    lane: FlowLane,
+    lane: TrafficClass,
 ) -> Result<u64, RuntimeError> {
     let (proof_id, frame) = allocated_path_proof_data_frame(path_id, mux_limits);
     commands.try_enqueue_stream_ordered_frame(frame, lane)?;
@@ -201,7 +201,7 @@ pub(in crate::runtime) fn path_proof_metrics(
 fn path_proof_payload_bytes(mux_limits: MuxLimits) -> usize {
     PATH_OPEN_SCORE_BYTES
         .min(relay_lane_startup_chunk_bytes(
-            FlowLane::Latency,
+            TrafficClass::Latency,
             mux_limits,
         ))
         .min(mux_limits.max_payload_bytes)

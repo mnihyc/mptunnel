@@ -5,7 +5,8 @@
 //! one typed post-enqueue mutation, and never merges TCP and QUIC proof state.
 
 use super::super::queue::ReliableRelaySenderQueue;
-use super::super::work::{ClientRepairOutputIdentity, RelaySendCause};
+use super::super::work::{ClientReinjectionOutputIdentity, RelaySendCause};
+use super::RequestDataAckGapObservation;
 use super::quic_capacity::{RequestQuicCapacityController, RequestQuicCapacityEvent};
 use super::scheduling::{
     BulkRelayFrameRequest, BulkRelayPathChoice, ObservedBulkPathCandidate,
@@ -17,38 +18,38 @@ use super::tcp_capacity::{
 };
 #[cfg(feature = "lab-diagnostics")]
 use crate::lab_diagnostics::lab_diagnostic;
-use crate::model::capacity::PathRateSample;
-use crate::model::multipath::FlowSubflowSet;
-use crate::model::path::{
-    RelayPathInstance, RelayPathKey, RelayPathPlacement, RelayPathProofEpoch,
+use crate::model::capacity::{
+    PATH_OPEN_SCORE_BYTES, PathRateSample, product_delivery_samples_override_startup_prior,
 };
-use crate::model::request::evidence::{
+use crate::model::path::{RelayPathInstance, RelayPathKey, RelayPathProofEpoch};
+use crate::model::request_evidence::{
     RequestOwnerAckProgress, RequestPathRateEvidenceUpdate, RequestPerFlowRateModel,
-    RequestTcpAckTurnoverModel, RequestWindowGrowthEvidence,
-    request_path_rate_coverage_floor_bytes, request_tcp_candidate_turnover_authorized,
+    RequestWindowGrowthEvidence, request_path_rate_coverage_floor_bytes,
 };
 use crate::model::timing::transport_pto_from_snapshot;
 use crate::protocol::frame::{reliable_stream_frame_accounted_bytes, reliable_stream_frame_extent};
 use crate::protocol::{Frame, OffsetRange, StreamId, UnderlayProtocol};
 use crate::runtime::error::RuntimeError;
 use crate::runtime::path::ClientPathContext;
-use crate::runtime::relay::remote::{ReliableRelayRemotePath, ReliableRelayRemoteSet};
 use crate::runtime::stream::request::{
-    RequestAckClockOperation, RequestStartupAdmission, RequestStreamState,
+    RequestAckClockOperation, RequestPathSampleCommit, RequestStreamState,
 };
-use crate::scheduler::{self, FlowLane, PathSnapshot, cyclic_cursor_distance};
+use crate::runtime::stream::{ReliableRelayRemotePath, ReliableRelayRemoteSet};
+use crate::scheduler::{self, PathSnapshot, TrafficClass, cyclic_cursor_distance};
 use std::collections::{HashMap, HashSet};
 use std::time::{Duration, Instant};
 
+#[allow(clippy::too_many_arguments)]
 pub(super) fn observe_request_relay_scheduling(
     context: &ClientPathContext,
     stream_id: StreamId,
     membership_generation: u64,
     remote_paths: &[ReliableRelayRemotePath],
     frame: Option<&Frame>,
-    lane: FlowLane,
+    lane: TrafficClass,
     payload_bytes: usize,
     include_bulk_admission: bool,
+    stale_paths: &HashSet<RelayPathInstance>,
 ) -> RequestRelaySchedulingObservation {
     let path_evidence = context.observe_reliable_request_paths(
         remote_paths.iter().map(|path| {
@@ -72,13 +73,14 @@ pub(super) fn observe_request_relay_scheduling(
             debug_assert_eq!(instance.key, evidence.key);
             RequestRelayPathObservation {
                 instance,
-                placement: path.placement,
-                can_enqueue_frame: frame
-                    .map(|frame| path.stream.can_enqueue_frame_now(frame, lane))
-                    .unwrap_or(true),
-                can_enqueue_stream_lane: frame
-                    .map(|frame| path.stream.can_enqueue_frame_now(frame, path.stream.lane))
-                    .unwrap_or(true),
+                can_enqueue_frame: !stale_paths.contains(&instance)
+                    && frame
+                        .map(|frame| path.stream.can_enqueue_frame_now(frame, lane))
+                        .unwrap_or(true),
+                can_enqueue_stream_lane: !stale_paths.contains(&instance)
+                    && frame
+                        .map(|frame| path.stream.can_enqueue_frame_now(frame, path.stream.lane))
+                        .unwrap_or(true),
                 load_owned: path.has_load_reservation(),
                 shared_snapshot: evidence.shared_snapshot,
                 tcp: evidence.tcp,
@@ -101,43 +103,8 @@ pub(super) fn observe_request_relay_scheduling(
                 config_ordinal: context.relay_path_config_ordinal(candidate.key),
             })
             .collect(),
-        active_tcp_service_bulk_flows: path_evidence.active_tcp_service_bulk_flows,
         latency_pressure: path_evidence.latency_pressure,
     }
-}
-
-fn choose_active_recv_progress_path_position(
-    remotes: &ReliableRelayRemoteSet,
-    frame: &Frame,
-    cause: RelaySendCause,
-) -> Option<usize> {
-    remotes
-        .paths
-        .iter()
-        .enumerate()
-        .rev()
-        .find(|(_, path)| {
-            path.placement == RelayPathPlacement::Active
-                && relay_path_can_enqueue_frame_for_cause_now(path, frame, cause)
-        })
-        .map(|(position, _)| position)
-}
-
-fn choose_repair_recv_progress_path_position(
-    remotes: &ReliableRelayRemoteSet,
-    frame: &Frame,
-    cause: RelaySendCause,
-) -> Option<usize> {
-    remotes
-        .paths
-        .iter()
-        .enumerate()
-        .rev()
-        .find(|(_, path)| {
-            path.placement == RelayPathPlacement::Repair
-                && relay_path_can_enqueue_frame_for_cause_now(path, frame, cause)
-        })
-        .map(|(position, _)| position)
 }
 
 fn relay_path_can_enqueue_frame_for_cause_now(
@@ -200,17 +167,16 @@ struct RequestMultipathTarget {
 #[derive(Debug)]
 enum RequestProductSendMutation {
     None,
-    InstallService,
-    PreserveSubflow,
-    CommitStartup(RequestStartupAdmission),
-    ServiceFence {
-        service: RelayPathInstance,
+    Data,
+    CommitPathSample(RequestPathSampleCommit),
+    MeasurementFence {
+        reference: RelayPathInstance,
         candidate: RelayPathInstance,
         entry_offset: u64,
         foreign_optional_ranges: usize,
         foreign_optional_bytes: u64,
     },
-    OwnerData {
+    OriginalData {
         candidate: RelayPathInstance,
         target_bytes: u64,
         payload_bytes: u64,
@@ -269,41 +235,35 @@ impl RequestMultipathController {
         self.stream_id
     }
 
-    pub(super) fn ack_gap_repair_path_model(
+    pub(super) fn data_ack_gap_reinjection_model(
         &self,
         context: &ClientPathContext,
         remotes: &ReliableRelayRemoteSet,
         preview: &Frame,
-        lane: FlowLane,
-    ) -> (
-        Option<UnderlayProtocol>,
-        Option<PathSnapshot>,
-        Option<(ClientRepairOutputIdentity, PathSnapshot)>,
-    ) {
-        let owner_underlay = self
+        lane: TrafficClass,
+    ) -> RequestDataAckGapObservation {
+        let original_path = self
             .request
             .flights
-            .ordering_owner_underlay_for_frame(preview);
-        let owner_timing_path = self
+            .unique_original_path_for_frame(preview)
+            .filter(|instance| remotes.contains_path_instance(*instance));
+        let original_underlay = self
             .request
             .flights
-            .ordering_owner_keys_for_frame_any_instance(preview)
-            .into_iter()
-            .filter_map(|key| context.reliable_path_snapshot(key))
-            .max_by(|left, right| {
-                transport_pto_from_snapshot(Some(*left))
-                    .cmp(&transport_pto_from_snapshot(Some(*right)))
-            });
+            .original_transmission_underlay_for_frame(preview);
+        // A replacement carrier with the same numeric path key must not lend
+        // its RTT or congestion evidence to an older attachment's flight.
+        let original_path_timing =
+            original_path.and_then(|instance| context.reliable_path_snapshot(instance.key));
         let avoid_keys = self.request.flights.sent_keys_for_frame(preview);
-        let repair_path = self
+        let reinjection_path = self
             .choose_lowest_eta_relay_path(
                 context,
                 remotes,
                 preview,
                 lane,
-                RelaySendCause::PersistentAckGapRepair,
+                RelaySendCause::PersistentAckGapReinjection,
                 &avoid_keys,
-                false,
             )
             .ok()
             .and_then(|position| {
@@ -312,31 +272,34 @@ impl RequestMultipathController {
                 context
                     .relay_path_has_bulk_model_evidence(key.underlay, key.index)
                     .then(|| {
-                        context
-                            .reliable_path_snapshot(key)
-                            .map(|snapshot| (ClientRepairOutputIdentity { instance }, snapshot))
+                        context.reliable_path_snapshot(key).map(|snapshot| {
+                            (ClientReinjectionOutputIdentity { instance }, snapshot)
+                        })
                     })
                     .flatten()
             });
-        (owner_underlay, owner_timing_path, repair_path)
+        RequestDataAckGapObservation {
+            has_live_original_path: original_path.is_some(),
+            original_underlay,
+            original_path_timing,
+            reinjection_target: reinjection_path,
+        }
     }
 
-    pub(super) fn repair_avoid_keys(
+    pub(super) fn reinjection_avoid_keys(
         &self,
         frame: &Frame,
         cause: RelaySendCause,
         remotes: &ReliableRelayRemoteSet,
     ) -> Vec<RelayPathKey> {
         match cause {
-            RelaySendCause::LiveOwnerTailRepair => {
-                self.request.flights.live_owner_tail_repair_owner_keys(
-                    frame,
-                    &remotes.path_instances(),
-                    Duration::ZERO,
-                    Duration::ZERO,
-                )
-            }
-            cause if cause.is_repair() => self.request.flights.sent_keys_for_frame(frame),
+            RelaySendCause::TailReinjection => self.request.flights.tail_reinjection_owner_keys(
+                frame,
+                &remotes.path_instances(),
+                Duration::ZERO,
+                Duration::ZERO,
+            ),
+            cause if cause.is_reinjection() => self.request.flights.sent_keys_for_frame(frame),
             _ => Vec::new(),
         }
     }
@@ -348,28 +311,28 @@ impl RequestMultipathController {
         self.request_owner_capable_instances(remotes)
     }
 
-    pub(super) fn ordering_owner_keys_for_frame(
+    pub(super) fn original_transmission_keys_for_frame(
         &self,
         frame: &Frame,
         live_instances: &[RelayPathInstance],
     ) -> Vec<RelayPathKey> {
         self.request
             .flights
-            .ordering_owner_keys_for_frame(frame, live_instances)
+            .original_transmission_keys_for_frame(frame, live_instances)
     }
 
-    pub(super) fn live_owner_tail_repair_owner_keys(
+    pub(super) fn tail_reinjection_owner_keys(
         &self,
         frame: &Frame,
         live_instances: &[RelayPathInstance],
-        first_repair_after: Duration,
-        repeat_repair_after: Duration,
+        first_reinjection_after: Duration,
+        repeat_reinjection_after: Duration,
     ) -> Vec<RelayPathKey> {
-        self.request.flights.live_owner_tail_repair_owner_keys(
+        self.request.flights.tail_reinjection_owner_keys(
             frame,
             live_instances,
-            first_repair_after,
-            repeat_repair_after,
+            first_reinjection_after,
+            repeat_reinjection_after,
         )
     }
 
@@ -382,32 +345,126 @@ impl RequestMultipathController {
             .latest_unacked_ranges_for_path_instance(instance)
     }
 
-    #[cfg(test)]
-    pub(super) fn failed_path_gap_parts(
+    pub(super) fn earliest_unacked_original_path(
         &self,
-        key: RelayPathKey,
-    ) -> (Vec<RelayPathInstance>, Vec<OffsetRange>) {
-        let instances = self
-            .request
+        remotes: &ReliableRelayRemoteSet,
+    ) -> Option<RelayPathInstance> {
+        self.request
             .flights
-            .ordering_owner_instances()
-            .into_iter()
-            .filter(|instance| instance.key == key)
-            .collect();
-        let ranges = self.request.flights.latest_unacked_ranges_for_path(key);
-        (instances, ranges)
+            .earliest_unacked_original_path()
+            .filter(|instance| remotes.contains_path_instance(*instance))
     }
 
-    pub(super) fn record_missing_owner_repair_attempts(
+    pub(super) fn uncovered_unacked_ranges_for_reinjection(
+        &self,
+        remotes: &ReliableRelayRemoteSet,
+        original_path: RelayPathInstance,
+    ) -> Vec<OffsetRange> {
+        let usable_alternate_paths = remotes
+            .paths
+            .iter()
+            .filter(|path| path.instance() != original_path)
+            .filter(|path| !self.request.stale_paths.contains(&path.instance()))
+            .filter(|path| !path.stream.output_is_terminally_closed())
+            .map(|path| path.instance())
+            .collect::<Vec<_>>();
+        self.request
+            .flights
+            .uncovered_unacked_ranges_for_reinjection(original_path, &usable_alternate_paths)
+    }
+
+    pub(super) fn record_reinjection_attempts(
         &mut self,
         instances: &[RelayPathInstance],
         attempted_at: Instant,
     ) {
         for instance in instances {
             self.request
-                .missing_owner_repair_attempts
+                .reinjection_attempts
                 .insert(*instance, attempted_at);
         }
+    }
+
+    pub(super) fn mark_path_stale(&mut self, instance: RelayPathInstance) -> bool {
+        self.request.stale_paths.insert(instance)
+    }
+
+    pub(super) fn path_is_stale(&self, instance: RelayPathInstance) -> bool {
+        self.request.stale_paths.contains(&instance)
+    }
+
+    pub(super) fn has_reinjection_path(
+        &self,
+        remotes: &ReliableRelayRemoteSet,
+        candidate: RelayPathInstance,
+    ) -> bool {
+        remotes.paths.iter().any(|path| {
+            path.instance() != candidate
+                && !self.request.stale_paths.contains(&path.instance())
+                && !path.stream.output_is_terminally_closed()
+        })
+    }
+
+    pub(super) fn reinjection_path_snapshot(
+        &self,
+        context: &ClientPathContext,
+        remotes: &ReliableRelayRemoteSet,
+        excluded: &[RelayPathInstance],
+    ) -> Option<PathSnapshot> {
+        let choose = |allow_backup: bool| {
+            remotes
+                .paths
+                .iter()
+                .filter(|path| !excluded.contains(&path.instance()))
+                .filter(|path| !self.request.stale_paths.contains(&path.instance()))
+                .filter(|path| !path.stream.output_is_terminally_closed())
+                .filter_map(|path| context.reliable_path_snapshot(path.key()))
+                .filter(|snapshot| allow_backup || !scheduler::path_is_backup(*snapshot))
+                .filter_map(|snapshot| {
+                    scheduler::score_path(snapshot, TrafficClass::Latency, PATH_OPEN_SCORE_BYTES)
+                        .map(|score| (score.eta_ms, snapshot))
+                })
+                .min_by(|left, right| left.0.total_cmp(&right.0))
+                .map(|(_, snapshot)| snapshot)
+        };
+        choose(false).or_else(|| choose(true))
+    }
+
+    pub(super) fn stale_path_reinjection_due(
+        &self,
+        instance: RelayPathInstance,
+        retry_after: Duration,
+    ) -> bool {
+        self.request.stale_paths.contains(&instance)
+            && self
+                .request
+                .reinjection_attempts
+                .get(&instance)
+                .is_none_or(|attempted_at| attempted_at.elapsed() >= retry_after)
+    }
+
+    pub(super) fn stale_paths_requiring_reinjection(
+        &self,
+        remotes: &ReliableRelayRemoteSet,
+        retry_after: Duration,
+    ) -> Vec<RelayPathInstance> {
+        self.request
+            .stale_paths
+            .iter()
+            .copied()
+            .filter(|instance| remotes.contains_path_instance(*instance))
+            .filter(|instance| {
+                self.request
+                    .flights
+                    .has_original_transmission_flights_for_instance(*instance)
+            })
+            .filter(|instance| self.stale_path_reinjection_due(*instance, retry_after))
+            .filter(|instance| {
+                !self
+                    .uncovered_unacked_ranges_for_reinjection(remotes, *instance)
+                    .is_empty()
+            })
+            .collect()
     }
 
     pub(super) fn record_emitted_frame(
@@ -416,33 +473,28 @@ impl RequestMultipathController {
         frame: &Frame,
         cause: RelaySendCause,
     ) -> usize {
-        if cause.is_repair() {
+        if cause.is_reinjection() {
             self.request
                 .flights
-                .record_repair_frame_instance(instance, frame)
+                .record_reinjection_frame_instance(instance, frame)
         } else {
             self.request
                 .flights
-                .record_owner_frame_instance(instance, frame)
+                .record_original_frame_instance(instance, frame)
         }
     }
 
     pub(super) fn record_emit_failure(&mut self, instance: RelayPathInstance) {
-        if self.request.ordered_service == Some(instance) {
-            self.request.ordered_service = None;
-            self.reset_request_subflow_epoch();
-        } else if self
+        if self
             .request
-            .startup
-            .epoch
-            .as_ref()
-            .and_then(FlowSubflowSet::startup_owner_key)
+            .path_sampling
+            .sample()
+            .map(|sample| sample.path())
             == Some(instance)
         {
-            self.request.startup.epoch = None;
-            self.request.startup.clear_path(instance);
-            if let Some(state) = self.request.subflows.get_existing_mut(instance) {
-                state.clear_graduated();
+            self.request.path_sampling.cancel_sample(instance);
+            if let Some(state) = self.request.path_states.get_existing_mut(instance) {
+                state.clear_capacity_admitted();
             }
         }
     }
@@ -455,24 +507,65 @@ impl RequestMultipathController {
         }
     }
 
-    fn try_start_request_tcp_capacity_calibration(
+    fn try_start_request_tcp_capacity_measurement(
         &mut self,
         context: &ClientPathContext,
         remotes: &ReliableRelayRemoteSet,
-        lane: FlowLane,
+        lane: TrafficClass,
     ) {
-        self.tcp_capacity
-            .try_start(self.stream_id, &self.request, context, remotes, lane);
+        let reference = self.request_capacity_reference(context, remotes);
+        self.tcp_capacity.try_start(
+            self.stream_id,
+            &self.request,
+            context,
+            remotes,
+            lane,
+            reference,
+        );
     }
 
-    fn try_start_request_quic_capacity_calibration(
+    fn try_start_request_quic_capacity_measurement(
         &mut self,
         context: &ClientPathContext,
         remotes: &ReliableRelayRemoteSet,
-        lane: FlowLane,
+        lane: TrafficClass,
     ) {
-        self.quic_capacity
-            .try_start(self.stream_id, &self.request, context, remotes, lane);
+        let reference = self.request_capacity_reference(context, remotes);
+        self.quic_capacity.try_start(
+            self.stream_id,
+            &self.request,
+            context,
+            remotes,
+            lane,
+            reference,
+        );
+    }
+
+    fn request_capacity_reference(
+        &self,
+        context: &ClientPathContext,
+        remotes: &ReliableRelayRemoteSet,
+    ) -> Option<(RelayPathInstance, RequestPerFlowRateModel)> {
+        remotes
+            .paths
+            .iter()
+            .filter_map(|path| {
+                let instance = path.instance();
+                let snapshot = context.reliable_path_snapshot(instance.key)?;
+                if snapshot.state != scheduler::PathState::Active {
+                    return None;
+                }
+                let model = self
+                    .request
+                    .path_states
+                    .get(instance)?
+                    .per_flow_rate()
+                    .filter(|model| {
+                        product_delivery_samples_override_startup_prior(model.delivery_samples)
+                    })?;
+                Some((instance, model))
+            })
+            .max_by(|left, right| left.1.rate_bps.total_cmp(&right.1.rate_bps))
     }
 
     fn record_request_per_flow_rate_sample(
@@ -481,13 +574,10 @@ impl RequestMultipathController {
         sample: PathRateSample,
         replace: bool,
     ) {
-        if instance.key.underlay != UnderlayProtocol::Tcp {
-            return;
-        }
         let sample_bps = sample.rate_bps();
         let previous = self
             .request
-            .subflows
+            .path_states
             .get(instance)
             .and_then(|state| state.per_flow_rate());
         let model = if replace {
@@ -505,40 +595,9 @@ impl RequestMultipathController {
             }
         };
         self.request
-            .subflows
+            .path_states
             .get_mut(instance)
             .set_per_flow_rate(model);
-    }
-
-    fn record_request_tcp_ack_turnover_sample(
-        &mut self,
-        context: &ClientPathContext,
-        instance: RelayPathInstance,
-        sample: PathRateSample,
-        sampled_at: Instant,
-        candidate_sample: bool,
-    ) {
-        if instance.key.underlay != UnderlayProtocol::Tcp
-            || (self.request.ordered_service != Some(instance) && !candidate_sample)
-        {
-            return;
-        }
-        let Some(snapshot) = context.reliable_path_snapshot(instance.key) else {
-            return;
-        };
-        let pto = transport_pto_from_snapshot(Some(snapshot));
-        let previous = self
-            .request
-            .subflows
-            .get(instance)
-            .and_then(|state| state.tcp_ack_turnover());
-        if let Some(model) = RequestTcpAckTurnoverModel::observe(previous, sample, pto, sampled_at)
-        {
-            self.request
-                .subflows
-                .get_mut(instance)
-                .set_tcp_ack_turnover(model);
-        }
     }
 
     fn prepare_relay_path_decision(
@@ -546,7 +605,7 @@ impl RequestMultipathController {
         context: &ClientPathContext,
         remotes: &mut ReliableRelayRemoteSet,
         frame: &Frame,
-        lane: FlowLane,
+        lane: TrafficClass,
         cause: RelaySendCause,
     ) -> Result<PreparedRequestMultipathDecision, RuntimeError> {
         if remotes.paths.is_empty() {
@@ -554,7 +613,7 @@ impl RequestMultipathController {
         }
         let membership_generation = remotes.membership_generation();
         let unique_data_payload_bytes = (matches!(frame, Frame::StreamData { .. })
-            && !cause.is_repair())
+            && !cause.is_reinjection())
         .then(|| reliable_stream_frame_accounted_bytes(frame));
         if remotes
             .paths
@@ -564,49 +623,39 @@ impl RequestMultipathController {
         {
             remotes.retry_pending_path_proofs(context);
         }
-        self.retry_request_startup_receipt_proof(context, remotes);
-        if !cause.is_repair()
+        self.retry_request_path_sample_receipt(context, remotes);
+        if !cause.is_reinjection()
             && let Some((offset, _, _)) = reliable_stream_frame_extent(frame)
             && self
                 .request
                 .flights
-                .has_missing_ordering_owner_before_offset(offset, &remotes.path_instances())
+                .has_missing_original_transmission_before_offset(offset, &remotes.path_instances())
         {
             return Err(RuntimeError::SenderServiceBlocked);
         }
         self.next_send_index %= remotes.paths.len();
-        if self
-            .request
-            .ordered_service
-            .is_some_and(|owner| !remotes.contains_path_instance(owner))
-        {
-            self.request.ordered_service = None;
-            self.reset_request_subflow_epoch();
-        }
         self.reconcile_request_path_state(context, remotes);
         if let Some(payload_bytes) = unique_data_payload_bytes {
-            self.try_start_request_tcp_capacity_calibration(context, remotes, lane);
-            self.try_start_request_quic_capacity_calibration(context, remotes, lane);
-            let sealed_owner = self.request.startup.epoch.as_mut().and_then(|epoch| {
-                let owner = epoch.startup_owner_key()?;
-                epoch
-                    .seal_startup_owner_if_next_frame_exceeds_credit(owner, payload_bytes)
-                    .then_some(owner)
-            });
-            if let Some(owner) = sealed_owner {
+            self.try_start_request_tcp_capacity_measurement(context, remotes, lane);
+            self.try_start_request_quic_capacity_measurement(context, remotes, lane);
+            if let Some(path) = self
+                .request
+                .path_sampling
+                .seal_if_next_frame_exceeds_limit(payload_bytes)
+            {
                 #[cfg(feature = "lab-diagnostics")]
                 lab_diagnostic(
-                    "request_startup_receipt",
+                    "request_path_sample",
                     format_args!(
                         "phase=sealed stream_id={} underlay={:?} path_index={} instance_id={} next_payload_bytes={}",
                         self.stream_id.0,
-                        owner.key.underlay,
-                        owner.key.index,
-                        owner.id,
+                        path.key.underlay,
+                        path.key.index,
+                        path.attachment_id,
                         payload_bytes,
                     ),
                 );
-                self.try_enqueue_request_startup_receipt_proof(context, remotes, owner);
+                self.try_enqueue_request_path_sample_receipt(context, remotes, path);
             }
         }
         Ok(PreparedRequestMultipathDecision {
@@ -620,7 +669,7 @@ impl RequestMultipathController {
         context: &ClientPathContext,
         remotes: &mut ReliableRelayRemoteSet,
         frame: &Frame,
-        lane: FlowLane,
+        lane: TrafficClass,
         cause: RelaySendCause,
         avoid_keys: &[RelayPathKey],
     ) -> Result<RequestMultipathPlan, RuntimeError> {
@@ -637,6 +686,7 @@ impl RequestMultipathController {
                 lane,
                 payload_bytes,
                 observe_bulk_admission,
+                &self.request.stale_paths,
             );
             match choose_bulk_relay_path_avoiding(BulkRelayFrameRequest {
                 observation: &relay_observation,
@@ -645,53 +695,38 @@ impl RequestMultipathController {
                 cursor: self.next_send_index,
                 avoid_keys,
                 path_flights: Some(&self.request.flights),
-                ordered_data_owner: self.request.ordered_service_key(),
-                subflow_set: self.request.startup.epoch.as_ref(),
+                path_sample: self.request.path_sampling.sample(),
                 request_state: Some(RequestSchedulingState {
                     operation: self.request.ack_clock_operation,
-                    subflows: &self.request.subflows,
+                    path_states: &self.request.path_states,
                 }),
-                attempted_subflows: Some(&self.request.startup.attempted_subflows),
+                sampled_paths: Some(&self.request.path_sampling.sampled_paths),
             }) {
                 BulkRelayPathChoice::Selected(instance) => {
-                    let key = instance.key;
-                    let product_mutation = if self
-                        .request
-                        .ordered_service_key()
-                        .is_none_or(|owner| owner == key)
-                    {
-                        RequestProductSendMutation::InstallService
-                    } else {
-                        RequestProductSendMutation::PreserveSubflow
-                    };
                     let mut selection = RequestMultipathPlan::new(
                         RequestMultipathTarget {
                             membership_generation: relay_observation.membership_generation,
                             instance,
                         },
-                        product_mutation,
+                        RequestProductSendMutation::Data,
                     );
                     selection.request_load_expectation =
                         observed_request_load_expectation(&relay_observation, instance)?;
                     return Ok(selection);
                 }
-                BulkRelayPathChoice::SelectedStartupSubflow {
-                    service,
-                    candidate,
-                    proof,
-                } => {
+                BulkRelayPathChoice::SelectedPathSample { candidate, proof } => {
                     let payload_bytes = reliable_stream_frame_accounted_bytes(frame);
-                    let admission = self
+                    let sample = self
                         .request
-                        .startup
-                        .plan_admission(context.mux_limits, service, candidate, payload_bytes)
+                        .path_sampling
+                        .plan_sample(context.mux_limits, candidate, payload_bytes)
                         .ok_or(RuntimeError::SenderServiceBlocked)?;
                     return Ok(RequestMultipathPlan {
                         target: RequestMultipathTarget {
                             membership_generation: relay_observation.membership_generation,
                             instance: candidate,
                         },
-                        product_mutation: RequestProductSendMutation::CommitStartup(admission),
+                        product_mutation: RequestProductSendMutation::CommitPathSample(sample),
                         request_load_expectation: observed_request_load_expectation(
                             &relay_observation,
                             candidate,
@@ -699,7 +734,7 @@ impl RequestMultipathController {
                         request_proof_expectation: Some(proof),
                     });
                 }
-                BulkRelayPathChoice::SelectedAckClockCalibration {
+                BulkRelayPathChoice::SelectedAckClockMeasurement {
                     candidate,
                     target_bytes,
                     proof,
@@ -708,10 +743,10 @@ impl RequestMultipathController {
                     let entry_offset = reliable_stream_frame_extent(frame)
                         .map(|(offset, _, _)| offset)
                         .unwrap_or(0);
-                    let service_key = self
+                    let reference_key = self
                         .request
-                        .ordered_service
-                        .map(|service| service.key)
+                        .flights
+                        .oldest_lower_flight_owner_before_offset(entry_offset)
                         .unwrap_or(candidate.key);
                     let (foreign_optional_ranges, foreign_optional_bytes) = if !matches!(
                         self.request.ack_clock_operation,
@@ -719,7 +754,10 @@ impl RequestMultipathController {
                     ) {
                         self.request
                             .flights
-                            .foreign_ordering_owner_debt_before_offset(entry_offset, &[service_key])
+                            .foreign_original_transmission_debt_before_offset(
+                                entry_offset,
+                                &[reference_key],
+                            )
                     } else {
                         (0, 0)
                     };
@@ -728,7 +766,7 @@ impl RequestMultipathController {
                             membership_generation: relay_observation.membership_generation,
                             instance: candidate,
                         },
-                        product_mutation: RequestProductSendMutation::OwnerData {
+                        product_mutation: RequestProductSendMutation::OriginalData {
                             candidate,
                             target_bytes,
                             payload_bytes,
@@ -743,29 +781,31 @@ impl RequestMultipathController {
                         request_proof_expectation: Some(proof),
                     });
                 }
-                BulkRelayPathChoice::SelectedAckClockCalibrationFence { service, candidate } => {
-                    debug_assert_eq!(Some(service), self.request.ordered_service);
+                BulkRelayPathChoice::SelectedAckClockMeasurementFence {
+                    reference,
+                    candidate,
+                } => {
                     let entry_offset = reliable_stream_frame_extent(frame)
                         .map(|(offset, _, _)| offset)
                         .unwrap_or(0);
-                    let (foreign_optional_ranges, foreign_optional_bytes) = if self
-                        .request
-                        .ack_clock_operation
-                        .is_none()
-                    {
-                        self.request
-                            .flights
-                            .foreign_ordering_owner_debt_before_offset(entry_offset, &[service.key])
-                    } else {
-                        (0, 0)
-                    };
+                    let (foreign_optional_ranges, foreign_optional_bytes) =
+                        if self.request.ack_clock_operation.is_none() {
+                            self.request
+                                .flights
+                                .foreign_original_transmission_debt_before_offset(
+                                    entry_offset,
+                                    &[reference.key],
+                                )
+                        } else {
+                            (0, 0)
+                        };
                     return Ok(RequestMultipathPlan {
                         target: RequestMultipathTarget {
                             membership_generation: relay_observation.membership_generation,
-                            instance: service,
+                            instance: reference,
                         },
-                        product_mutation: RequestProductSendMutation::ServiceFence {
-                            service,
+                        product_mutation: RequestProductSendMutation::MeasurementFence {
+                            reference,
                             candidate,
                             entry_offset,
                             foreign_optional_ranges,
@@ -773,7 +813,7 @@ impl RequestMultipathController {
                         },
                         request_load_expectation: observed_request_load_expectation(
                             &relay_observation,
-                            service,
+                            reference,
                         )?,
                         request_proof_expectation: None,
                     });
@@ -800,7 +840,7 @@ impl RequestMultipathController {
                             membership_generation: relay_observation.membership_generation,
                             instance,
                         },
-                        RequestProductSendMutation::InstallService,
+                        RequestProductSendMutation::Data,
                     );
                     selection.request_load_expectation =
                         observed_request_load_expectation(&relay_observation, instance)?;
@@ -808,17 +848,10 @@ impl RequestMultipathController {
                 }
             }
         }
-        let position = self.choose_lowest_eta_relay_path(
-            context,
-            remotes,
-            frame,
-            lane,
-            cause,
-            avoid_keys,
-            prepared.unique_data_payload_bytes.is_some(),
-        )?;
+        let position =
+            self.choose_lowest_eta_relay_path(context, remotes, frame, lane, cause, avoid_keys)?;
         let product_mutation = if prepared.unique_data_payload_bytes.is_some() {
-            RequestProductSendMutation::InstallService
+            RequestProductSendMutation::Data
         } else {
             RequestProductSendMutation::None
         };
@@ -829,10 +862,6 @@ impl RequestMultipathController {
             },
             product_mutation,
         ))
-    }
-
-    fn reset_request_subflow_epoch(&mut self) {
-        self.request.reset_subflow_epoch();
     }
 
     pub(super) fn commit_enqueued_request_product_send(
@@ -846,7 +875,7 @@ impl RequestMultipathController {
     ) {
         let instance = plan.target.instance;
         let mutation = plan.product_mutation;
-        self.commit_request_ack_clock_calibration(&mutation);
+        self.commit_request_ack_clock_measurement(&mutation);
         if !matches!(frame, Frame::StreamData { .. }) {
             debug_assert!(matches!(mutation, RequestProductSendMutation::None));
             self.next_send_index = if path_count == 0 {
@@ -858,16 +887,8 @@ impl RequestMultipathController {
         }
         let sent_bytes = reliable_stream_frame_accounted_bytes(frame);
         match mutation {
-            RequestProductSendMutation::InstallService => {
-                context.record_relay_path_send(
-                    instance.key.underlay,
-                    instance.key.index,
-                    sent_bytes,
-                );
-                self.request.ordered_service = Some(instance);
-            }
-            RequestProductSendMutation::CommitStartup(admission) => {
-                self.request.startup.commit_admission(admission);
+            RequestProductSendMutation::CommitPathSample(sample) => {
+                self.request.path_sampling.commit_sample(sample);
                 context.record_relay_path_send(
                     instance.key.underlay,
                     instance.key.index,
@@ -875,28 +896,27 @@ impl RequestMultipathController {
                 );
                 if self
                     .request
-                    .startup
-                    .epoch
-                    .as_ref()
-                    .and_then(FlowSubflowSet::startup_owner_key)
+                    .path_sampling
+                    .sample()
+                    .map(|sample| sample.path())
                     == Some(instance)
                 {
                     self.request
-                        .startup
+                        .path_sampling
                         .record_first_sent_at(instance, Instant::now());
-                    self.try_enqueue_request_startup_receipt_proof(context, remotes, instance);
+                    self.try_enqueue_request_path_sample_receipt(context, remotes, instance);
                 }
             }
-            RequestProductSendMutation::PreserveSubflow
-            | RequestProductSendMutation::ServiceFence { .. }
-            | RequestProductSendMutation::OwnerData { .. } => {
+            RequestProductSendMutation::Data
+            | RequestProductSendMutation::MeasurementFence { .. }
+            | RequestProductSendMutation::OriginalData { .. } => {
                 context.record_relay_path_send(
                     instance.key.underlay,
                     instance.key.index,
                     sent_bytes,
                 );
             }
-            // Repair data repeats an existing product offset, so enqueue must
+            // Reinjection data repeats an existing product offset, so enqueue must
             // not install or advance unique-data ownership.
             RequestProductSendMutation::None => {}
         }
@@ -907,23 +927,23 @@ impl RequestMultipathController {
         };
     }
 
-    fn commit_request_ack_clock_calibration(&mut self, commit: &RequestProductSendMutation) {
+    fn commit_request_ack_clock_measurement(&mut self, commit: &RequestProductSendMutation) {
         match commit {
-            RequestProductSendMutation::ServiceFence {
-                service,
+            RequestProductSendMutation::MeasurementFence {
+                reference,
                 candidate,
                 entry_offset,
                 foreign_optional_ranges,
                 foreign_optional_bytes,
             } => {
                 let (
-                    service,
+                    reference,
                     candidate,
                     entry_offset,
                     foreign_optional_ranges,
                     foreign_optional_bytes,
                 ) = (
-                    *service,
+                    *reference,
                     *candidate,
                     *entry_offset,
                     *foreign_optional_ranges,
@@ -942,30 +962,32 @@ impl RequestMultipathController {
                     debug_assert_eq!(owner, candidate);
                     return;
                 }
-                debug_assert_eq!(self.request.ordered_service, Some(service));
-                let pending = RequestAckClockOperation::Pending { service, candidate };
+                let pending = RequestAckClockOperation::Pending {
+                    reference,
+                    candidate,
+                };
                 if self.request.ack_clock_operation == Some(pending) {
                     return;
                 }
                 self.request.ack_clock_operation = Some(pending);
                 #[cfg(feature = "lab-diagnostics")]
                 lab_diagnostic(
-                    "ack_clock_calibration",
+                    "ack_clock_measurement",
                     format_args!(
                         "phase=pending_started stream_id={} service_underlay={:?} service_index={} service_instance={} candidate_index={} candidate_instance={} entry_offset={} foreign_optional_ranges={} foreign_optional_bytes={}",
                         self.stream_id.0,
-                        service.key.underlay,
-                        service.key.index,
-                        service.id,
+                        reference.key.underlay,
+                        reference.key.index,
+                        reference.attachment_id,
                         candidate.key.index,
-                        candidate.id,
+                        candidate.attachment_id,
                         entry_offset,
                         foreign_optional_ranges,
                         foreign_optional_bytes,
                     ),
                 );
             }
-            RequestProductSendMutation::OwnerData {
+            RequestProductSendMutation::OriginalData {
                 candidate,
                 target_bytes,
                 payload_bytes,
@@ -1001,16 +1023,16 @@ impl RequestMultipathController {
                             if owner != candidate
                     )
                 }) {
-                    debug_assert!(false, "calibration owner changed before enqueue commit");
+                    debug_assert!(false, "measurement owner changed before enqueue commit");
                     return;
                 }
                 if let Some(RequestAckClockOperation::Pending {
-                    service,
+                    reference,
                     candidate: pending,
                 }) = self.request.ack_clock_operation
                 {
                     debug_assert_eq!(pending, candidate);
-                    debug_assert_eq!(Some(service), self.request.ordered_service);
+                    debug_assert!(reference != candidate);
                 }
                 let beginning = !matches!(
                     self.request.ack_clock_operation,
@@ -1024,9 +1046,9 @@ impl RequestMultipathController {
                     0
                 } else {
                     self.request
-                        .subflows
+                        .path_states
                         .get(candidate)
-                        .and_then(|state| state.ack_clock_calibration_bytes())
+                        .and_then(|state| state.ack_clock_measurement_bytes())
                         .unwrap_or(0)
                 };
                 let spent_bytes = previous_bytes.saturating_add(payload_bytes);
@@ -1034,20 +1056,20 @@ impl RequestMultipathController {
                     candidate,
                     target_bytes,
                 });
-                let candidate_state = self.request.subflows.get_mut(candidate);
-                candidate_state.set_ack_clock_calibration_target(target_bytes);
-                candidate_state.set_ack_clock_calibration_bytes(spent_bytes);
+                let candidate_state = self.request.path_states.get_mut(candidate);
+                candidate_state.set_ack_clock_measurement_target(target_bytes);
+                candidate_state.set_ack_clock_measurement_bytes(spent_bytes);
                 #[cfg(feature = "lab-diagnostics")]
                 {
                     if beginning {
                         lab_diagnostic(
-                            "ack_clock_calibration",
+                            "ack_clock_measurement",
                             format_args!(
                                 "phase=owner_started stream_id={} underlay={:?} path_index={} instance_id={} payload_bytes={} target_bytes={} entry_offset={} foreign_optional_ranges={} foreign_optional_bytes={}",
                                 self.stream_id.0,
                                 candidate.key.underlay,
                                 candidate.key.index,
-                                candidate.id,
+                                candidate.attachment_id,
                                 payload_bytes,
                                 target_bytes,
                                 entry_offset,
@@ -1058,13 +1080,13 @@ impl RequestMultipathController {
                     }
                     if previous_bytes < target_bytes && spent_bytes >= target_bytes {
                         lab_diagnostic(
-                            "ack_clock_calibration",
+                            "ack_clock_measurement",
                             format_args!(
                                 "phase=target_spent stream_id={} underlay={:?} path_index={} instance_id={} spent_bytes={} target_bytes={}",
                                 self.stream_id.0,
                                 candidate.key.underlay,
                                 candidate.key.index,
-                                candidate.id,
+                                candidate.attachment_id,
                                 spent_bytes,
                                 target_bytes,
                             ),
@@ -1073,15 +1095,15 @@ impl RequestMultipathController {
                     static TRACE_COUNT: std::sync::atomic::AtomicU64 =
                         std::sync::atomic::AtomicU64::new(0);
                     let count = TRACE_COUNT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                    if count < 16 || count % 256 == 0 {
+                    if count < 16 || count.is_multiple_of(256) {
                         lab_diagnostic(
-                            "ack_clock_calibration",
+                            "ack_clock_measurement",
                             format_args!(
                                 "phase=selected stream_id={} underlay={:?} path_index={} instance_id={} payload_bytes={} spent_bytes={} target_bytes={}",
                                 self.stream_id.0,
                                 candidate.key.underlay,
                                 candidate.key.index,
-                                candidate.id,
+                                candidate.attachment_id,
                                 payload_bytes,
                                 spent_bytes,
                                 target_bytes,
@@ -1091,58 +1113,57 @@ impl RequestMultipathController {
                 }
             }
             RequestProductSendMutation::None
-            | RequestProductSendMutation::InstallService
-            | RequestProductSendMutation::PreserveSubflow
-            | RequestProductSendMutation::CommitStartup(_) => {}
+            | RequestProductSendMutation::Data
+            | RequestProductSendMutation::CommitPathSample(_) => {}
         }
     }
 
-    fn retry_request_startup_receipt_proof(
+    fn retry_request_path_sample_receipt(
         &mut self,
         context: &ClientPathContext,
         remotes: &ReliableRelayRemoteSet,
     ) {
-        let Some(owner) = self
+        let Some(path_instance) = self
             .request
-            .startup
-            .epoch
-            .as_ref()
-            .and_then(FlowSubflowSet::startup_owner_key)
+            .path_sampling
+            .sample()
+            .map(|sample| sample.path())
         else {
             return;
         };
-        self.try_enqueue_request_startup_receipt_proof(context, remotes, owner);
+        self.try_enqueue_request_path_sample_receipt(context, remotes, path_instance);
     }
 
-    fn try_enqueue_request_startup_receipt_proof(
+    fn try_enqueue_request_path_sample_receipt(
         &mut self,
         context: &ClientPathContext,
         remotes: &ReliableRelayRemoteSet,
-        owner: RelayPathInstance,
+        path_instance: RelayPathInstance,
     ) {
-        if owner.key.underlay != UnderlayProtocol::Tcp {
+        if path_instance.key.underlay != UnderlayProtocol::Tcp {
             return;
         }
         let proof_generation = context
-            .relay_path_proof_generation(owner.key.underlay, owner.key.index)
+            .relay_path_proof_generation(path_instance.key.underlay, path_instance.key.index)
             .unwrap_or(0);
         if self
             .request
-            .startup
-            .receipt_proof(owner)
+            .path_sampling
+            .receipt_proof(path_instance)
             .is_some_and(|(_, generation)| generation == proof_generation)
             || !self
                 .request
-                .startup
-                .epoch
-                .as_ref()
-                .is_some_and(|epoch| epoch.startup_owner_sample_sealed(owner))
+                .path_sampling
+                .sample()
+                .is_some_and(|sample| sample.path() == path_instance && sample.is_sealed())
         {
             return;
         }
-        let Some(path) = remotes.paths.iter().find(|path| {
-            path.instance() == owner && path.placement == RelayPathPlacement::Validation
-        }) else {
+        let Some(path) = remotes
+            .paths
+            .iter()
+            .find(|path| path.instance() == path_instance)
+        else {
             return;
         };
         match path
@@ -1151,17 +1172,17 @@ impl RequestMultipathController {
         {
             Ok(Some(proof_id)) => {
                 self.request
-                    .startup
-                    .set_receipt_proof(owner, (proof_id, proof_generation));
+                    .path_sampling
+                    .set_receipt_proof(path_instance, (proof_id, proof_generation));
                 #[cfg(feature = "lab-diagnostics")]
                 lab_diagnostic(
-                    "request_startup_receipt",
+                    "request_path_sample",
                     format_args!(
                         "phase=queued stream_id={} underlay={:?} path_index={} instance_id={} proof_id={} proof_generation={}",
                         self.stream_id.0,
-                        owner.key.underlay,
-                        owner.key.index,
-                        owner.id,
+                        path_instance.key.underlay,
+                        path_instance.key.index,
+                        path_instance.attachment_id,
                         proof_id,
                         proof_generation,
                     ),
@@ -1170,13 +1191,13 @@ impl RequestMultipathController {
             Ok(None) => {
                 #[cfg(feature = "lab-diagnostics")]
                 lab_diagnostic(
-                    "request_startup_receipt",
+                    "request_path_sample",
                     format_args!(
                         "phase=unsupported stream_id={} underlay={:?} path_index={} instance_id={} proof_generation={}",
                         self.stream_id.0,
-                        owner.key.underlay,
-                        owner.key.index,
-                        owner.id,
+                        path_instance.key.underlay,
+                        path_instance.key.index,
+                        path_instance.attachment_id,
                         proof_generation,
                     ),
                 );
@@ -1184,13 +1205,13 @@ impl RequestMultipathController {
             Err(err) => {
                 #[cfg(feature = "lab-diagnostics")]
                 lab_diagnostic(
-                    "request_startup_receipt",
+                    "request_path_sample",
                     format_args!(
                         "phase=queue_failed stream_id={} underlay={:?} path_index={} instance_id={} proof_generation={} error={}",
                         self.stream_id.0,
-                        owner.key.underlay,
-                        owner.key.index,
-                        owner.id,
+                        path_instance.key.underlay,
+                        path_instance.key.index,
+                        path_instance.attachment_id,
                         proof_generation,
                         err,
                     ),
@@ -1201,7 +1222,7 @@ impl RequestMultipathController {
         }
     }
 
-    fn request_ack_clock_calibration_target_is_sealed(&self, target: RelayPathInstance) -> bool {
+    fn request_ack_clock_measurement_target_is_sealed(&self, target: RelayPathInstance) -> bool {
         self.request
             .ack_clock_operation
             .filter(|operation| {
@@ -1215,31 +1236,31 @@ impl RequestMultipathController {
                     unreachable!("filtered ACK-clock owner operation")
                 };
                 self.request
-                    .subflows
+                    .path_states
                     .get(target)
-                    .and_then(|state| state.ack_clock_calibration_bytes())
+                    .and_then(|state| state.ack_clock_measurement_bytes())
                     .is_some_and(|spent| spent >= target_bytes)
             })
     }
 
-    fn revoke_request_tcp_capacity_calibration(
+    fn revoke_request_tcp_capacity_measurement(
         &mut self,
         target: RelayPathInstance,
         preserve_committed_product: bool,
     ) -> bool {
-        if let Some(state) = self.request.subflows.get_existing_mut(target) {
+        if let Some(state) = self.request.path_states.get_existing_mut(target) {
             state.clear_tcp_capacity_proven();
         }
         self.tcp_capacity.remove(target);
         let product_transaction_preserved = preserve_committed_product
-            && self.request_ack_clock_calibration_target_is_sealed(target);
+            && self.request_ack_clock_measurement_target_is_sealed(target);
         if product_transaction_preserved {
             // Carrier freshness admits a bounded product transaction but does
             // not own it. Once the fixed target is sealed, keep its exact ACK
             // evidence until product proof or a real path lifecycle change.
             return true;
         }
-        if let Some(state) = self.request.subflows.get_existing_mut(target) {
+        if let Some(state) = self.request.path_states.get_existing_mut(target) {
             state.revoke_tcp_capacity();
         }
         if self
@@ -1259,20 +1280,20 @@ impl RequestMultipathController {
                 token: _token,
                 proof,
             } => {
-                let target_state = self.request.subflows.get_mut(target);
+                let target_state = self.request.path_states.get_mut(target);
                 target_state.mark_tcp_capacity_proven();
-                target_state.mark_graduated();
+                target_state.mark_capacity_admitted();
                 target_state
                     .rate_evidence_mut(proof.accepted_at)
                     .seed_ack_boundary(proof.accepted_at);
                 #[cfg(feature = "lab-diagnostics")]
                 lab_diagnostic(
-                    "request_tcp_capacity_calibration",
+                    "request_tcp_capacity_measurement",
                     format_args!(
-                        "phase=carrier_proven stream_id={} path_index={} instance_id={} calibration_id={} train_bytes={} rate_mbps={:.3} proof_ms={}",
+                        "phase=carrier_proven stream_id={} path_index={} instance_id={} measurement_id={} train_bytes={} rate_mbps={:.3} proof_ms={}",
                         self.stream_id.0,
                         target.key.index,
-                        target.id,
+                        target.attachment_id,
                         _token,
                         proof.train_bytes,
                         proof.rate_bps as f64 / 1_000_000.0,
@@ -1283,51 +1304,51 @@ impl RequestMultipathController {
                     ),
                 );
             }
-            RequestTcpCapacityEvent::ProductHandoffComplete {
+            RequestTcpCapacityEvent::ProductAdmissionCommitted {
                 target,
-                calibration,
+                measurement,
             } => {
-                let _token = calibration.token;
-                if let Some(state) = self.request.subflows.get_existing_mut(target) {
+                let _token = measurement.token;
+                if let Some(state) = self.request.path_states.get_existing_mut(target) {
                     state.clear_tcp_capacity_proven();
                 }
                 #[cfg(feature = "lab-diagnostics")]
                 lab_diagnostic(
-                    "request_tcp_capacity_calibration",
+                    "request_tcp_capacity_measurement",
                     format_args!(
-                        "phase=handoff_complete stream_id={} path_index={} instance_id={} calibration_id={}",
-                        self.stream_id.0, target.key.index, target.id, _token,
+                        "phase=product_admission_committed stream_id={} path_index={} instance_id={} measurement_id={}",
+                        self.stream_id.0, target.key.index, target.attachment_id, _token,
                     ),
                 );
-                drop(calibration);
+                drop(measurement);
             }
             RequestTcpCapacityEvent::CarrierAuthorityRetired {
                 target,
-                calibration,
+                measurement,
                 cause,
             } => {
-                let _token = calibration.token;
+                let _token = measurement.token;
                 let natural_expiry = cause == RequestTcpCapacityRetirement::AuthorityExpired;
                 let _product_transaction_preserved =
-                    self.revoke_request_tcp_capacity_calibration(target, natural_expiry);
+                    self.revoke_request_tcp_capacity_measurement(target, natural_expiry);
                 #[cfg(feature = "lab-diagnostics")]
                 match cause {
                     RequestTcpCapacityRetirement::AuthorityExpired => lab_diagnostic(
-                        "request_tcp_capacity_calibration",
+                        "request_tcp_capacity_measurement",
                         format_args!(
-                            "phase=carrier_authority_expired stream_id={} path_index={} instance_id={} calibration_id={} product_transaction_preserved={}",
+                            "phase=carrier_authority_expired stream_id={} path_index={} instance_id={} measurement_id={} product_transaction_preserved={}",
                             self.stream_id.0,
                             target.key.index,
-                            target.id,
+                            target.attachment_id,
                             _token,
                             _product_transaction_preserved,
                         ),
                     ),
                     RequestTcpCapacityRetirement::AuthorityLost => lab_diagnostic(
-                        "request_tcp_capacity_calibration",
+                        "request_tcp_capacity_measurement",
                         format_args!(
-                            "phase=revoked stream_id={} path_index={} instance_id={} calibration_id={} reason=carrier_authority_lost",
-                            self.stream_id.0, target.key.index, target.id, _token,
+                            "phase=revoked stream_id={} path_index={} instance_id={} measurement_id={} reason=carrier_authority_lost",
+                            self.stream_id.0, target.key.index, target.attachment_id, _token,
                         ),
                     ),
                     RequestTcpCapacityRetirement::Detached
@@ -1335,7 +1356,7 @@ impl RequestMultipathController {
                 }
                 // Product authority is retired before lease Drop can enter the
                 // shared path-state lock.
-                drop(calibration);
+                drop(measurement);
             }
         }
     }
@@ -1343,39 +1364,42 @@ impl RequestMultipathController {
     fn apply_request_quic_capacity_event(&mut self, event: RequestQuicCapacityEvent) {
         let (phase, target, _token) = match event {
             RequestQuicCapacityEvent::CarrierProofAccepted { target, token } => {
-                self.request.subflows.get_mut(target).mark_graduated();
-                ("graduated", target, token)
+                self.request
+                    .path_states
+                    .get_mut(target)
+                    .mark_capacity_admitted();
+                ("capacity_admitted", target, token)
             }
-            RequestQuicCapacityEvent::ProductHandoffComplete {
+            RequestQuicCapacityEvent::ProductAdmissionCommitted {
                 target,
-                calibration,
+                measurement,
             } => {
-                let token = calibration.token;
-                drop(calibration);
-                ("handoff_complete", target, token)
+                let token = measurement.token;
+                drop(measurement);
+                ("product_admission_committed", target, token)
             }
-            RequestQuicCapacityEvent::ProductHandoffExpired {
+            RequestQuicCapacityEvent::ProductAdmissionExpired {
                 target,
-                calibration,
+                measurement,
             } => {
-                // Probe credit is transactional and cannot survive a failed
-                // handoff into product-owned evidence.
-                if let Some(state) = self.request.subflows.get_existing_mut(target) {
-                    state.clear_graduated();
+                // Measurement credit is transactional and cannot survive a
+                // failed admission into durable product evidence.
+                if let Some(state) = self.request.path_states.get_existing_mut(target) {
+                    state.clear_capacity_admitted();
                 }
-                let token = calibration.token;
+                let token = measurement.token;
                 // Product authority is gone before lease Drop can enter the
                 // shared path-state lock.
-                drop(calibration);
-                ("handoff_expired", target, token)
+                drop(measurement);
+                ("product_admission_expired", target, token)
             }
         };
         #[cfg(feature = "lab-diagnostics")]
         lab_diagnostic(
-            "request_quic_capacity_calibration",
+            "request_quic_capacity_measurement",
             format_args!(
-                "phase={} stream_id={} path_index={} instance_id={} calibration_id={}",
-                phase, self.stream_id.0, target.key.index, target.id, _token,
+                "phase={} stream_id={} path_index={} instance_id={} measurement_id={}",
+                phase, self.stream_id.0, target.key.index, target.attachment_id, _token,
             ),
         );
         #[cfg(not(feature = "lab-diagnostics"))]
@@ -1390,8 +1414,11 @@ impl RequestMultipathController {
         let membership_generation = remotes.membership_generation();
         if self.request.membership_generation != Some(membership_generation) {
             let live_instances = remotes.path_instances().into_iter().collect::<HashSet<_>>();
-            self.request.startup.retain_live(&live_instances);
-            self.request.subflows.retain_live(&live_instances);
+            self.request.path_sampling.retain_live(&live_instances);
+            self.request.path_states.retain_live(&live_instances);
+            self.request
+                .stale_paths
+                .retain(|instance| live_instances.contains(instance));
             self.request.membership_generation = Some(membership_generation);
         }
         let now = Instant::now();
@@ -1402,20 +1429,20 @@ impl RequestMultipathController {
             quic_query,
             now,
         );
-        let completed_product_handoffs = self
+        let committed_product_admissions = self
             .tcp_capacity
-            .calibrations
+            .measurements
             .keys()
             .copied()
             .filter(|target| {
-                self.request.subflows.get(*target).is_some_and(|state| {
+                self.request.path_states.get(*target).is_some_and(|state| {
                     state.ack_clock_proven() && state.per_flow_rate().is_some()
                 })
             })
             .collect::<HashSet<_>>();
         let tcp_events =
             self.tcp_capacity
-                .reconcile(&reconciliation, remotes, &completed_product_handoffs);
+                .reconcile(&reconciliation, remotes, &committed_product_admissions);
         for event in tcp_events {
             self.apply_request_tcp_capacity_event(event);
         }
@@ -1426,32 +1453,32 @@ impl RequestMultipathController {
             self.apply_request_quic_capacity_event(event);
         }
         if self.request.ack_clock_operation.is_some_and(|operation| {
-            let RequestAckClockOperation::Pending { service, candidate } = operation else {
+            let RequestAckClockOperation::Pending {
+                reference,
+                candidate,
+            } = operation
+            else {
                 return false;
             };
-            self.request.ordered_service != Some(service)
-                || service.key.underlay != UnderlayProtocol::Tcp
-                || self
-                    .request
-                    .subflows
-                    .get(candidate)
-                    .is_some_and(|state| state.ack_clock_proven())
+            self.request
+                .path_states
+                .get(candidate)
+                .is_some_and(|state| state.ack_clock_proven())
                 || !self
                     .request
-                    .subflows
+                    .path_states
                     .get(candidate)
-                    .is_some_and(|state| state.graduated())
-                || !self.request.subflows.get(candidate).is_some_and(|state| {
-                    state.ack_clock_first_window() || state.tcp_capacity_proven()
-                })
+                    .is_some_and(|state| state.capacity_admitted())
+                || !self
+                    .request
+                    .path_states
+                    .get(candidate)
+                    .is_some_and(|state| {
+                        state.ack_clock_first_window() || state.tcp_capacity_proven()
+                    })
+                || !remotes.contains_path_instance(reference)
                 || !remotes.paths.iter().any(|path| {
-                    path.instance() == service && path.placement == RelayPathPlacement::Active
-                })
-                || !remotes.paths.iter().any(|path| {
-                    path.instance() == candidate
-                        && path.placement == RelayPathPlacement::Validation
-                        && path.key().underlay == UnderlayProtocol::Tcp
-                        && path.key().underlay == service.key.underlay
+                    path.instance() == candidate && path.key().underlay == UnderlayProtocol::Tcp
                 })
         }) {
             self.request.ack_clock_operation = None;
@@ -1463,7 +1490,7 @@ impl RequestMultipathController {
         {
             if self
                 .request
-                .subflows
+                .path_states
                 .get(candidate)
                 .is_some_and(|state| state.ack_clock_proven())
             {
@@ -1471,121 +1498,104 @@ impl RequestMultipathController {
             } else {
                 let placement_valid = self
                     .request
-                    .subflows
+                    .path_states
                     .get(candidate)
-                    .is_some_and(|state| state.graduated())
-                    && remotes.paths.iter().any(|path| {
-                        path.instance() == candidate
-                            && path.placement == RelayPathPlacement::Validation
-                    });
+                    .is_some_and(|state| state.capacity_admitted())
+                    && remotes.contains_path_instance(candidate);
                 let transaction_authorized = self
-                    .request_ack_clock_calibration_target_is_sealed(candidate)
-                    || self.request.subflows.get(candidate).is_some_and(|state| {
-                        state.ack_clock_first_window() || state.tcp_capacity_proven()
-                    });
+                    .request_ack_clock_measurement_target_is_sealed(candidate)
+                    || self
+                        .request
+                        .path_states
+                        .get(candidate)
+                        .is_some_and(|state| {
+                            state.ack_clock_first_window() || state.tcp_capacity_proven()
+                        });
                 if !placement_valid || !transaction_authorized {
                     // A sealed AwaitingAck target remains exact-instance state.
                     // Real placement loss or a partial transaction without its
                     // entry proof performs the full abort cleanup.
-                    self.revoke_request_tcp_capacity_calibration(candidate, false);
+                    self.revoke_request_tcp_capacity_measurement(candidate, false);
                 }
             }
         }
-        for instance in self.quic_capacity.native_evidence_targets(
-            context,
-            self.request.ordered_service,
-            remotes,
-            now,
-        ) {
-            self.request.subflows.get_mut(instance).mark_graduated();
-        }
-        let service = self.request.ordered_service.filter(|owner| {
-            remotes.paths.iter().any(|path| {
-                path.instance() == *owner && path.placement == RelayPathPlacement::Active
-            })
-        });
-        if self
-            .request
-            .startup
-            .epoch
-            .as_ref()
-            .is_some_and(|epoch| service.is_none_or(|service| epoch.service_key() != service))
+        for instance in self
+            .quic_capacity
+            .native_evidence_targets(context, remotes, now)
         {
-            self.reset_request_subflow_epoch();
-            return;
+            self.request
+                .path_states
+                .get_mut(instance)
+                .mark_capacity_admitted();
         }
-        let Some(owner) = self
-            .request
-            .startup
-            .epoch
-            .as_ref()
-            .and_then(FlowSubflowSet::startup_owner_key)
-        else {
+        let Some(path_sample) = self.request.path_sampling.sample() else {
             return;
         };
-        if owner.key.underlay != UnderlayProtocol::Tcp {
-            self.reset_request_subflow_epoch();
+        let path_instance = path_sample.path();
+        if !remotes.contains_path_instance(path_instance) {
+            self.request.path_sampling.cancel_sample(path_instance);
             return;
         }
-        if !remotes.paths.iter().any(|path| {
-            path.instance() == owner && path.placement == RelayPathPlacement::Validation
-        }) {
-            self.request.startup.epoch = None;
-            self.request.startup.clear_path(owner);
-            return;
-        }
-        let required_evidence_bytes = self
-            .request
-            .startup
-            .epoch
-            .as_ref()
-            .and_then(|epoch| epoch.startup_owner_sealed_sample_bytes(owner))
-            .unwrap_or(u64::MAX);
-        let receipt_acked_at = self
-            .request
-            .startup
-            .receipt_proof(owner)
-            .and_then(|(proof_id, generation)| {
-                (context.relay_path_proof_generation(owner.key.underlay, owner.key.index)
-                    == Some(generation))
-                .then_some(proof_id)
-            })
-            .and_then(|proof_id| {
-                remotes
-                    .paths
-                    .iter()
-                    .find(|path| path.instance() == owner)
-                    .and_then(|path| {
-                        context.relay_path_fresh_proof_acked_as_of(
-                            owner.key.underlay,
-                            owner.key.index,
-                            proof_id,
-                            path.attached_at,
-                            now,
-                        )
+        let required_evidence_bytes = path_sample.sealed_bytes().unwrap_or(u64::MAX);
+        let receipt_acked_at = (path_instance.key.underlay == UnderlayProtocol::Tcp)
+            .then(|| {
+                self.request
+                    .path_sampling
+                    .receipt_proof(path_instance)
+                    .and_then(|(proof_id, generation)| {
+                        (context.relay_path_proof_generation(
+                            path_instance.key.underlay,
+                            path_instance.key.index,
+                        ) == Some(generation))
+                        .then_some(proof_id)
                     })
-            });
+                    .and_then(|proof_id| {
+                        remotes
+                            .paths
+                            .iter()
+                            .find(|path| path.instance() == path_instance)
+                            .and_then(|path| {
+                                context.relay_path_fresh_proof_acked_as_of(
+                                    path_instance.key.underlay,
+                                    path_instance.key.index,
+                                    proof_id,
+                                    path.attached_at,
+                                    now,
+                                )
+                            })
+                    })
+            })
+            .flatten();
         if let Some(receipt_acked_at) = receipt_acked_at
-            && !self.request.startup.sample_rate_proven(owner)
-            && let Some(first_sent_at) = self.request.startup.first_sent_at(owner)
+            && !self.request.path_sampling.sample_rate_proven(path_instance)
+            && let Some(first_sent_at) = self.request.path_sampling.first_sent_at(path_instance)
             && let Some(sample) = PathRateSample::new(
                 required_evidence_bytes,
                 receipt_acked_at.saturating_duration_since(first_sent_at),
             )
         {
-            self.request.startup.mark_sample_rate_proven(owner);
-            self.request.subflows.get_mut(owner).mark_rate_proven();
-            self.record_request_per_flow_rate_sample(owner, sample, false);
-            context.mark_relay_path_rate_sample(owner.key.underlay, owner.key.index, sample);
+            self.request
+                .path_sampling
+                .mark_sample_rate_proven(path_instance);
+            self.request
+                .path_states
+                .get_mut(path_instance)
+                .mark_rate_proven();
+            self.record_request_per_flow_rate_sample(path_instance, sample, false);
+            context.mark_relay_path_rate_sample(
+                path_instance.key.underlay,
+                path_instance.key.index,
+                sample,
+            );
             #[cfg(feature = "lab-diagnostics")]
             lab_diagnostic(
-                "request_startup_receipt",
+                "request_path_sample",
                 format_args!(
                     "phase=rate_sample stream_id={} underlay={:?} path_index={} instance_id={} evidence_bytes={} elapsed_us={} rate_bps={}",
                     self.stream_id.0,
-                    owner.key.underlay,
-                    owner.key.index,
-                    owner.id,
+                    path_instance.key.underlay,
+                    path_instance.key.index,
+                    path_instance.attachment_id,
                     required_evidence_bytes,
                     receipt_acked_at
                         .saturating_duration_since(first_sent_at)
@@ -1595,152 +1605,107 @@ impl RequestMultipathController {
             );
         }
         if let Some(receipt_acked_at) = receipt_acked_at
-            && self.request.startup.sample_rate_proven(owner)
+            && self.request.path_sampling.sample_rate_proven(path_instance)
             && self
                 .request
-                .subflows
-                .get_mut(owner)
+                .path_states
+                .get_mut(path_instance)
                 .mark_ack_clock_first_window()
         {
             // The ordered receipt follows the sealed startup sample on this
             // exact TCP attachment. Once product flight also drains below, it
-            // is the causal boundary for the first calibration window.
+            // is the causal boundary for the first measurement window.
             self.request
-                .subflows
-                .get_mut(owner)
+                .path_states
+                .get_mut(path_instance)
                 .rate_evidence_mut(receipt_acked_at)
                 .seed_ack_boundary(receipt_acked_at);
         }
-        if self.request.startup.sample_rate_proven(owner)
+        if self.request.path_sampling.sample_rate_proven(path_instance)
             && !self
                 .request
                 .flights
-                .has_ordering_owner_flights_for_instance(owner)
-            && let Some(epoch) = self.request.startup.epoch.as_mut()
+                .has_original_transmission_flights_for_instance(path_instance)
         {
-            let graduated = epoch.graduate_startup_owner(owner);
-            debug_assert!(graduated);
-            self.request.subflows.get_mut(owner).mark_graduated();
-            self.request.startup.clear_receipt_proof(owner);
+            let capacity_admitted = self.request.path_sampling.complete_sample(path_instance);
+            debug_assert!(capacity_admitted);
+            self.request
+                .path_states
+                .get_mut(path_instance)
+                .mark_capacity_admitted();
+            self.request
+                .path_sampling
+                .clear_receipt_proof(path_instance);
             #[cfg(feature = "lab-diagnostics")]
             lab_diagnostic(
-                "request_startup_receipt",
+                "request_path_sample",
                 format_args!(
-                    "phase=graduated stream_id={} underlay={:?} path_index={} instance_id={}",
-                    self.stream_id.0, owner.key.underlay, owner.key.index, owner.id,
+                    "phase=capacity_admitted stream_id={} underlay={:?} path_index={} instance_id={}",
+                    self.stream_id.0,
+                    path_instance.key.underlay,
+                    path_instance.key.index,
+                    path_instance.attachment_id,
                 ),
             );
         }
-    }
-
-    #[cfg(test)]
-    pub(super) fn release_normalized_acked_ranges(
-        &mut self,
-        context: &ClientPathContext,
-        ranges: &[OffsetRange],
-    ) {
-        let _ = self.release_normalized_acked_ranges_with_owner_progress(context, ranges);
     }
 
     /// Releases every exact flight copy and derives one neutral window effect.
     pub(super) fn apply_product_ack(
         &mut self,
         context: &ClientPathContext,
-        remotes: &ReliableRelayRemoteSet,
+        _remotes: &ReliableRelayRemoteSet,
         ranges: &[OffsetRange],
         acked_at: Instant,
-    ) -> RequestWindowGrowthEvidence<RelayPathInstance> {
-        let mut owner_progress =
-            self.release_normalized_acked_ranges_with_owner_progress_at(context, ranges, acked_at);
-        self.request
-            .ordered_service
-            .filter(|service| remotes.contains_path_instance(*service))
-            .map_or(RequestWindowGrowthEvidence::None, |service| {
-                match service.key.underlay {
-                    UnderlayProtocol::Tcp => {
-                        let owner_capable = owner_progress.iter().any(|progress| {
-                            self.request_owner_ack_can_grow_window(
-                                remotes,
-                                Some(service),
-                                progress.instance,
-                            )
-                        });
-                        if !owner_capable {
-                            RequestWindowGrowthEvidence::None
-                        } else {
-                            RequestWindowGrowthEvidence::AckClockTurnover {
-                                service,
-                                turnover_bytes: self.request_tcp_owner_ack_turnover_bytes(
-                                    remotes,
-                                    Some(service),
-                                    acked_at,
-                                ),
-                                observed_at: acked_at,
-                            }
-                        }
-                    }
-                    UnderlayProtocol::Udp => {
-                        owner_progress.retain(|progress| {
-                            self.request_owner_ack_can_grow_window(
-                                remotes,
-                                Some(service),
-                                progress.instance,
-                            )
-                        });
-                        if owner_progress.is_empty() {
-                            RequestWindowGrowthEvidence::None
-                        } else {
-                            let snapshot = context.reliable_path_snapshot(service.key);
-                            RequestWindowGrowthEvidence::OwnerAckCredits {
-                                service,
-                                credits: owner_progress,
-                                growth_interval: transport_pto_from_snapshot(snapshot),
-                                observed_at: acked_at,
-                            }
-                        }
-                    }
-                }
-            })
+    ) -> (
+        RequestWindowGrowthEvidence,
+        smallvec::SmallVec<[RelayPathInstance; 4]>,
+    ) {
+        let bytes = self.request.flights.unique_owner_bytes_acked_by(ranges);
+        let delivered_data =
+            self.release_normalized_acked_ranges_with_delivered_data_at(context, ranges, acked_at);
+        let data_ack_progress_paths = delivered_data
+            .iter()
+            .map(|progress| progress.instance)
+            .collect::<smallvec::SmallVec<[_; 4]>>();
+        for instance in &data_ack_progress_paths {
+            self.request.stale_paths.remove(instance);
+        }
+        let window = if bytes == 0 {
+            RequestWindowGrowthEvidence::None
+        } else {
+            let growth_interval = delivered_data
+                .iter()
+                .filter_map(|progress| context.reliable_path_snapshot(progress.instance.key))
+                .map(|snapshot| transport_pto_from_snapshot(Some(snapshot)))
+                .max()
+                .unwrap_or_else(|| transport_pto_from_snapshot(None));
+            RequestWindowGrowthEvidence::AckCredits {
+                bytes,
+                growth_interval,
+                observed_at: acked_at,
+            }
+        };
+        (window, data_ack_progress_paths)
     }
 
-    #[cfg(test)]
-    fn release_normalized_acked_ranges_with_owner_progress(
-        &mut self,
-        context: &ClientPathContext,
-        ranges: &[OffsetRange],
-    ) -> smallvec::SmallVec<[RequestOwnerAckProgress<RelayPathInstance>; 4]> {
-        self.release_normalized_acked_ranges_with_owner_progress_at(context, ranges, Instant::now())
-    }
-
-    fn release_normalized_acked_ranges_with_owner_progress_at(
+    fn release_normalized_acked_ranges_with_delivered_data_at(
         &mut self,
         context: &ClientPathContext,
         ranges: &[OffsetRange],
         acked_at: Instant,
     ) -> smallvec::SmallVec<[RequestOwnerAckProgress<RelayPathInstance>; 4]> {
-        let startup_owner = self
-            .request
-            .startup
-            .epoch
-            .as_ref()
-            .and_then(FlowSubflowSet::startup_owner_key);
-        let startup_required_bytes = self
-            .request
-            .startup
-            .epoch
-            .as_ref()
-            .and_then(|epoch| {
-                startup_owner.and_then(|owner| epoch.startup_owner_sealed_sample_bytes(owner))
-            })
+        let path_sample = self.request.path_sampling.sample();
+        let sampled_path = path_sample.map(|sample| sample.path());
+        let sample_required_bytes = path_sample
+            .and_then(|sample| sample.sealed_bytes())
             .unwrap_or(u64::MAX);
         let mut ordinary_owner_samples =
             HashMap::<RelayPathInstance, (u64, Instant, Instant)>::new();
-        let mut owner_progress =
+        let mut delivered_data =
             smallvec::SmallVec::<[RequestOwnerAckProgress<RelayPathInstance>; 4]>::new();
         for release in self.request.flights.release_normalized_acked_ranges(ranges) {
-            self.request
-                .missing_owner_repair_attempts
-                .remove(&release.instance);
+            self.request.reinjection_attempts.remove(&release.instance);
             context.release_relay_path_inflight(
                 release.instance.key.underlay,
                 release.instance.key.index,
@@ -1754,27 +1719,26 @@ impl RequestMultipathController {
                     release.sent_at,
                     acked_at,
                 );
-                if let Some(progress) = owner_progress
+                if let Some(progress) = delivered_data
                     .iter_mut()
                     .find(|progress| progress.instance == release.instance)
                 {
                     progress.bytes = progress.bytes.saturating_add(release.bytes);
                 } else {
-                    owner_progress.push(RequestOwnerAckProgress {
+                    delivered_data.push(RequestOwnerAckProgress {
                         instance: release.instance,
                         bytes: release.bytes,
                     });
                 }
             }
-            if release.path_proving
-                && release.instance.key.underlay == UnderlayProtocol::Tcp
-                && startup_owner == Some(release.instance)
-            {
-                self.request
-                    .startup
-                    .record_acked(release.instance, release.bytes, release.sent_at);
+            if release.path_proving && sampled_path == Some(release.instance) {
+                self.request.path_sampling.record_acked(
+                    release.instance,
+                    release.bytes,
+                    release.sent_at,
+                );
             }
-            if release.path_proving && startup_owner != Some(release.instance) {
+            if release.path_proving && sampled_path != Some(release.instance) {
                 let sample = ordinary_owner_samples.entry(release.instance).or_insert((
                     0,
                     release.sent_at,
@@ -1792,62 +1756,68 @@ impl RequestMultipathController {
                     self.stream_id.0,
                     release.instance.key.underlay,
                     release.instance.key.index,
-                    release.instance.id,
+                    release.instance.attachment_id,
                     release.bytes,
                     release.elapsed.as_secs_f64() * 1000.0,
                     release.path_proving,
                 ),
             );
         }
-        if let Some(owner) = startup_owner
-            && owner.key.underlay == UnderlayProtocol::Tcp
-            && let Some((acked_bytes, first_sent_at)) = self.request.startup.acked_sample(owner)
-            && acked_bytes >= startup_required_bytes
+        if let Some(path_instance) = sampled_path
+            && let Some((acked_bytes, first_sent_at)) =
+                self.request.path_sampling.acked_sample(path_instance)
+            && acked_bytes >= sample_required_bytes
             && let Some(sample) = PathRateSample::new(
                 acked_bytes,
                 acked_at.saturating_duration_since(first_sent_at),
             )
-            && self.request.startup.mark_sample_rate_proven(owner)
-        {
-            self.request.subflows.get_mut(owner).mark_rate_proven();
-            self.record_request_per_flow_rate_sample(owner, sample, false);
-            context.mark_relay_path_rate_sample(owner.key.underlay, owner.key.index, sample);
-            if self
+            && self
                 .request
-                .subflows
-                .get_mut(owner)
-                .mark_ack_clock_first_window()
+                .path_sampling
+                .mark_sample_rate_proven(path_instance)
+        {
+            self.request
+                .path_states
+                .get_mut(path_instance)
+                .mark_rate_proven();
+            self.record_request_per_flow_rate_sample(path_instance, sample, false);
+            context.mark_relay_path_rate_sample(
+                path_instance.key.underlay,
+                path_instance.key.index,
+                sample,
+            );
+            if path_instance.key.underlay == UnderlayProtocol::Tcp
+                && self
+                    .request
+                    .path_states
+                    .get_mut(path_instance)
+                    .mark_ack_clock_first_window()
             {
                 // The exact product ACK that completes the sealed TCP startup
-                // owner window is also a causal boundary: every calibration
+                // owner window is also a causal boundary: every measurement
                 // byte selected after this point is post-boundary by
                 // construction. The explicit path receipt remains an
                 // equivalent boundary when it arrives first.
                 self.request
-                    .subflows
-                    .get_mut(owner)
+                    .path_states
+                    .get_mut(path_instance)
                     .rate_evidence_mut(acked_at)
                     .seed_ack_boundary(acked_at);
             }
         }
         for (instance, (bytes, first_sent_at, latest_sent_at)) in ordinary_owner_samples {
-            // TCP lacks carrier-native delivery telemetry, so its product ACK
-            // fallback needs a representative window. QUIC keeps its existing
-            // small product-provenance threshold; carrier ACKs own its rate.
-            let is_ordered_service = self.request.ordered_service == Some(instance);
             let coverage_floor_bytes = request_path_rate_coverage_floor_bytes(
                 instance.key.underlay,
-                is_ordered_service,
                 self.request
-                    .subflows
+                    .path_states
                     .get(instance)
-                    .and_then(|state| state.ack_clock_calibration_target()),
+                    .and_then(|state| state.ack_clock_measurement_target()),
                 context.mux_limits,
             );
-            let (update, has_exact_path_provenance, exact_attributed_bytes) = {
+            let (update, has_exact_path_provenance) = {
                 let evidence = self
                     .request
-                    .subflows
+                    .path_states
                     .get_mut(instance)
                     .rate_evidence_mut(first_sent_at);
                 let update = evidence.observe(
@@ -1856,118 +1826,94 @@ impl RequestMultipathController {
                     latest_sent_at,
                     acked_at,
                     coverage_floor_bytes,
-                    !is_ordered_service,
+                    true,
                 );
-                (
-                    update,
-                    evidence.has_exact_path_provenance(),
-                    evidence.exact_attributed_bytes(),
-                )
+                (update, evidence.has_exact_path_provenance())
             };
             if has_exact_path_provenance {
                 // Exact ownership is enough to establish that this flow used
                 // the path. It is not enough to publish a rate sample.
-                self.request.subflows.get_mut(instance).mark_rate_proven();
+                self.request
+                    .path_states
+                    .get_mut(instance)
+                    .mark_rate_proven();
             }
             if let RequestPathRateEvidenceUpdate::Proven {
                 sample,
                 first_window,
             } = update
             {
-                if instance.key.underlay == UnderlayProtocol::Tcp
-                    && is_ordered_service
-                    && let Some(sample) = sample
-                {
-                    if !first_window {
-                        self.record_request_tcp_ack_turnover_sample(
-                            context, instance, sample, acked_at, false,
-                        );
+                if instance.key.underlay == UnderlayProtocol::Tcp {
+                    if first_window {
+                        self.request
+                            .path_states
+                            .get_mut(instance)
+                            .mark_ack_clock_first_window();
                     }
+                    if let Some(sample) = sample {
+                        let replace_startup_rate = self
+                            .request
+                            .path_states
+                            .get_mut(instance)
+                            .mark_ack_clock_proven();
+                        self.request
+                            .path_states
+                            .get_mut(instance)
+                            .mark_capacity_admitted();
+                        if self
+                            .request
+                            .ack_clock_operation
+                            .is_some_and(|operation| operation.candidate() == instance)
+                        {
+                            self.request.ack_clock_operation = None;
+                        }
+                        self.record_request_per_flow_rate_sample(
+                            instance,
+                            sample,
+                            replace_startup_rate,
+                        );
+                        context.mark_relay_path_ack_clock_rate_sample(
+                            instance.key.underlay,
+                            instance.key.index,
+                            sample,
+                            replace_startup_rate,
+                        );
+                        #[cfg(feature = "lab-diagnostics")]
+                        {
+                            lab_diagnostic(
+                                "ack_clock_measurement",
+                                format_args!(
+                                    "phase=ack_clock_sample stream_id={} underlay={:?} path_index={} instance_id={} evidence_bytes={} sample_elapsed_us={} replace_startup_rate={} rate_bps={}",
+                                    self.stream_id.0,
+                                    instance.key.underlay,
+                                    instance.key.index,
+                                    instance.attachment_id,
+                                    sample.bytes(),
+                                    sample.elapsed().as_micros(),
+                                    replace_startup_rate,
+                                    sample.rate_bps(),
+                                ),
+                            );
+                        }
+                    }
+                } else if let Some(sample) = sample {
+                    self.request
+                        .path_states
+                        .get_mut(instance)
+                        .mark_capacity_admitted();
+                    self.record_request_per_flow_rate_sample(instance, sample, false);
                     context.mark_relay_path_rate_sample(
                         instance.key.underlay,
                         instance.key.index,
                         sample,
                     );
-                    if !first_window {
-                        self.record_request_per_flow_rate_sample(instance, sample, false);
-                    }
-                } else if instance.key.underlay == UnderlayProtocol::Tcp && first_window {
-                    self.request
-                        .subflows
-                        .get_mut(instance)
-                        .mark_ack_clock_first_window();
-                } else if instance.key.underlay == UnderlayProtocol::Tcp
-                    && let Some(sample) = sample
-                {
-                    let replace_startup_rate = self
-                        .request
-                        .subflows
-                        .get_mut(instance)
-                        .mark_ack_clock_proven();
-                    let turnover_authorized = !replace_startup_rate
-                        && self
-                            .request
-                            .subflows
-                            .get(instance)
-                            .and_then(|state| state.ack_clock_calibration_target())
-                            .is_some_and(|target_bytes| {
-                                request_tcp_candidate_turnover_authorized(
-                                    exact_attributed_bytes,
-                                    target_bytes,
-                                    coverage_floor_bytes,
-                                )
-                            });
-                    if turnover_authorized {
-                        self.request
-                            .subflows
-                            .get_mut(instance)
-                            .mark_window_turnover_proven();
-                    }
-                    if self
-                        .request
-                        .ack_clock_operation
-                        .is_some_and(|operation| operation.candidate() == instance)
-                    {
-                        self.request.ack_clock_operation = None;
-                    }
-                    self.record_request_per_flow_rate_sample(
-                        instance,
-                        sample,
-                        replace_startup_rate,
-                    );
-                    self.record_request_tcp_ack_turnover_sample(
-                        context, instance, sample, acked_at, true,
-                    );
-                    context.mark_relay_path_ack_clock_rate_sample(
-                        instance.key.underlay,
-                        instance.key.index,
-                        sample,
-                        replace_startup_rate,
-                    );
-                    #[cfg(feature = "lab-diagnostics")]
-                    {
-                        lab_diagnostic(
-                            "ack_clock_calibration",
-                            format_args!(
-                                "phase=ack_clock_sample stream_id={} underlay={:?} path_index={} instance_id={} evidence_bytes={} sample_elapsed_us={} replace_startup_rate={} rate_bps={}",
-                                self.stream_id.0,
-                                instance.key.underlay,
-                                instance.key.index,
-                                instance.id,
-                                sample.bytes(),
-                                sample.elapsed().as_micros(),
-                                replace_startup_rate,
-                                sample.rate_bps(),
-                            ),
-                        );
-                    }
                 }
             }
         }
-        owner_progress
+        delivered_data
     }
 
-    pub(super) fn discard_unusable_live_owner_tail_repairs(
+    pub(super) fn discard_unusable_tail_reinjections(
         &self,
         sender_queue: &mut ReliableRelaySenderQueue,
         remotes: &ReliableRelayRemoteSet,
@@ -1977,22 +1923,22 @@ impl RequestMultipathController {
             .iter()
             .map(|instance| instance.key)
             .collect::<Vec<_>>();
-        sender_queue.discard_unusable_live_owner_tail_repairs(|frame| {
+        sender_queue.discard_unusable_tail_reinjections(|frame| {
             let owner_keys = self
                 .request
                 .flights
-                .ordering_owner_keys_for_frame(frame, &live_instances);
+                .original_transmission_keys_for_frame(frame, &live_instances);
             !owner_keys.is_empty() && live_keys.iter().any(|key| !owner_keys.contains(key))
         })
     }
 
-    pub(super) fn discard_stale_persistent_ack_gap_repairs(
+    pub(super) fn discard_stale_persistent_ack_gap_reinjections(
         &self,
         sender_queue: &mut ReliableRelaySenderQueue,
         remotes: &ReliableRelayRemoteSet,
     ) -> usize {
         let live_instances = remotes.path_instances();
-        sender_queue.discard_stale_persistent_ack_gap_repairs(|cause| {
+        sender_queue.discard_stale_persistent_ack_gap_reinjections(|cause| {
             cause
                 .persistent_client_target()
                 .is_none_or(|target| live_instances.contains(&target))
@@ -2000,111 +1946,26 @@ impl RequestMultipathController {
         })
     }
 
+    pub(super) fn discard_resolved_stale_path_reinjections(
+        &self,
+        sender_queue: &mut ReliableRelaySenderQueue,
+        remotes: &ReliableRelayRemoteSet,
+    ) -> usize {
+        sender_queue.discard_resolved_stale_path_reinjections(|path| {
+            self.path_is_stale(path) || !remotes.contains_path_instance(path)
+        })
+    }
+
     fn request_owner_capable_instances(
         &self,
         remotes: &ReliableRelayRemoteSet,
     ) -> Vec<RelayPathInstance> {
-        let startup_owner = self
-            .request
-            .startup
-            .epoch
-            .as_ref()
-            .and_then(FlowSubflowSet::startup_owner_key);
         remotes
             .paths
             .iter()
-            .filter(|path| {
-                path.placement != RelayPathPlacement::Validation
-                    || startup_owner == Some(path.instance())
-                    || self
-                        .request
-                        .subflows
-                        .get(path.instance())
-                        .is_some_and(|state| state.graduated())
-                    || self
-                        .request
-                        .flights
-                        .has_ordering_owner_flights_for_instance(path.instance())
-            })
             .map(ReliableRelayRemotePath::instance)
+            .filter(|instance| !self.request.stale_paths.contains(instance))
             .collect()
-    }
-
-    pub(super) fn request_ordered_service_instance(&self) -> Option<RelayPathInstance> {
-        self.request.ordered_service
-    }
-
-    fn request_owner_ack_can_grow_window(
-        &self,
-        remotes: &ReliableRelayRemoteSet,
-        service_instance: Option<RelayPathInstance>,
-        instance: RelayPathInstance,
-    ) -> bool {
-        let Some(service) = service_instance else {
-            return false;
-        };
-        if self.request.ordered_service != Some(service)
-            || !remotes.contains_path_instance(service)
-            || service.key.underlay != instance.key.underlay
-        {
-            return false;
-        }
-        remotes.paths.iter().any(|path| {
-            path.instance() == instance
-                && (instance == service
-                    || (self
-                        .request
-                        .subflows
-                        .get(instance)
-                        .is_some_and(|state| state.graduated())
-                        && (instance.key.underlay == UnderlayProtocol::Udp
-                            || self
-                                .request
-                                .subflows
-                                .get(instance)
-                                .is_some_and(|state| state.ack_clock_proven()))))
-        })
-    }
-
-    fn request_tcp_owner_ack_turnover_bytes(
-        &self,
-        remotes: &ReliableRelayRemoteSet,
-        service_instance: Option<RelayPathInstance>,
-        now: Instant,
-    ) -> usize {
-        let Some(service) = service_instance.filter(|service| {
-            service.key.underlay == UnderlayProtocol::Tcp
-                && self.request.ordered_service == Some(*service)
-                && remotes.contains_path_instance(*service)
-        }) else {
-            return 0;
-        };
-        remotes
-            .paths
-            .iter()
-            .filter_map(|path| {
-                let instance = path.instance();
-                if !self.request_owner_ack_can_grow_window(remotes, Some(service), instance) {
-                    return None;
-                }
-                if instance != service
-                    && !self
-                        .request
-                        .subflows
-                        .get(instance)
-                        .is_some_and(|state| state.window_turnover_proven())
-                {
-                    return None;
-                }
-                self.request
-                    .subflows
-                    .get(instance)
-                    .and_then(|state| state.tcp_ack_turnover())
-                    .filter(|model| model.is_fresh_at(now))
-                    .map(|model| model.turnover_bytes)
-            })
-            .sum::<f64>()
-            .ceil() as usize
     }
 
     pub(super) fn unreported_missing_owner_instances(
@@ -2112,12 +1973,12 @@ impl RequestMultipathController {
         remotes: &ReliableRelayRemoteSet,
         retry_after: Duration,
     ) -> Vec<RelayPathInstance> {
-        let owner_instances = self.request.flights.ordering_owner_instances();
-        self.request
-            .missing_owner_repair_attempts
-            .retain(|instance, _| {
-                owner_instances.contains(instance) && !remotes.contains_path_instance(*instance)
-            });
+        let owner_instances = self.request.flights.original_transmission_instances();
+        self.request.reinjection_attempts.retain(|instance, _| {
+            owner_instances.contains(instance)
+                && (!remotes.contains_path_instance(*instance)
+                    || self.request.stale_paths.contains(instance))
+        });
         let now = Instant::now();
         owner_instances
             .into_iter()
@@ -2125,28 +1986,13 @@ impl RequestMultipathController {
                 !remotes.contains_path_instance(*instance)
                     && self
                         .request
-                        .missing_owner_repair_attempts
+                        .reinjection_attempts
                         .get(instance)
                         .is_none_or(|attempt| {
                             now.saturating_duration_since(*attempt) >= retry_after
                         })
             })
             .collect()
-    }
-
-    #[cfg(test)]
-    pub(super) fn unreported_missing_owner_keys(
-        &mut self,
-        remotes: &ReliableRelayRemoteSet,
-        retry_after: Duration,
-    ) -> Vec<RelayPathKey> {
-        let mut keys = Vec::new();
-        for instance in self.unreported_missing_owner_instances(remotes, retry_after) {
-            if !keys.contains(&instance.key) {
-                keys.push(instance.key);
-            }
-        }
-        keys
     }
 
     pub(super) fn release_all(&mut self, context: &ClientPathContext) {
@@ -2160,25 +2006,14 @@ impl RequestMultipathController {
     }
 
     #[cfg(test)]
-    pub(super) fn age_product_flights_for_test(&mut self, age: Duration) {
-        self.request.flights.age_product_flights_for_test(age);
-    }
-
-    #[cfg(test)]
-    pub(super) fn record_owner_frame_for_test(
+    pub(super) fn record_original_frame_for_test(
         &mut self,
         instance: RelayPathInstance,
         frame: &Frame,
     ) {
         self.request
             .flights
-            .record_owner_frame_instance(instance, frame);
-        self.request.ordered_service = Some(instance);
-    }
-
-    #[cfg(test)]
-    pub(super) fn ordered_data_owner_for_test(&self) -> Option<RelayPathKey> {
-        self.request.ordered_service_key()
+            .record_original_frame_instance(instance, frame);
     }
 
     fn choose_lowest_eta_relay_path(
@@ -2186,51 +2021,29 @@ impl RequestMultipathController {
         context: &ClientPathContext,
         remotes: &ReliableRelayRemoteSet,
         frame: &Frame,
-        lane: FlowLane,
+        lane: TrafficClass,
         cause: RelaySendCause,
         avoid_keys: &[RelayPathKey],
-        ordinary_stream_data: bool,
     ) -> Result<usize, RuntimeError> {
-        let persistent_ack_gap_repair = cause.is_persistent_ack_gap_repair();
+        let ack_gap_reinjection = cause.is_ack_gap_reinjection();
         let required_persistent_target = cause.persistent_client_target();
         let invalid_persistent_target =
-            matches!(cause, RelaySendCause::PersistentServerAckGapRepair(_));
+            matches!(cause, RelaySendCause::PersistentServerAckGapReinjection(_));
         let requires_distinct_output =
-            cause == RelaySendCause::LiveOwnerTailRepair || persistent_ack_gap_repair;
+            cause == RelaySendCause::TailReinjection || ack_gap_reinjection;
         let payload_bytes = reliable_stream_frame_accounted_bytes(frame);
-        if cause == RelaySendCause::RecvProgressRecovery
-            && let Some(position) = choose_repair_recv_progress_path_position(remotes, frame, cause)
-        {
-            return Ok(position);
-        }
-        if cause.is_recv_progress() {
-            if let Some(position) = choose_active_recv_progress_path_position(remotes, frame, cause)
-            {
-                return Ok(position);
-            }
-        }
-        let has_active_path = remotes
-            .paths
-            .iter()
-            .any(|path| path.placement == RelayPathPlacement::Active);
         let ordinary_path_allowed = |path: &ReliableRelayRemotePath| {
-            (!ordinary_stream_data
-                || !has_active_path
-                || path.placement == RelayPathPlacement::Active)
-                && (cause != RelaySendCause::RecvProgressRecovery
-                    || path.placement != RelayPathPlacement::Validation)
-                && (cause != RelaySendCause::LiveOwnerTailRepair
-                    || path.placement != RelayPathPlacement::Validation)
+            !self.request.stale_paths.contains(&path.instance())
                 && !invalid_persistent_target
                 && required_persistent_target.is_none_or(|required| path.instance() == required)
-                && (!persistent_ack_gap_repair
+                && (!ack_gap_reinjection
                     || context
                         .relay_path_has_bulk_model_evidence(path.key().underlay, path.key().index))
         };
         let can_enqueue = |path: &ReliableRelayRemotePath| {
             relay_path_can_enqueue_frame_for_cause_now(path, frame, cause)
         };
-        let choose = |prefer_avoiding: bool| {
+        let choose = |allow_backup: bool, prefer_avoiding: bool| {
             remotes
                 .paths
                 .iter()
@@ -2241,6 +2054,9 @@ impl RequestMultipathController {
                 .filter_map(|(position, path)| {
                     let key = path.key();
                     let snapshot = context.reliable_path_snapshot(key)?;
+                    if !allow_backup && scheduler::path_is_backup(snapshot) {
+                        return None;
+                    }
                     let score = scheduler::score_path(snapshot, lane, payload_bytes)?;
                     Some((
                         position,
@@ -2256,34 +2072,42 @@ impl RequestMultipathController {
                 .map(|(position, _, _)| position)
         };
         let selected = if requires_distinct_output {
-            choose(true)
+            choose(false, true).or_else(|| choose(true, true))
         } else {
-            choose(true).or_else(|| choose(false))
+            choose(false, true)
+                .or_else(|| choose(false, false))
+                .or_else(|| choose(true, true))
+                .or_else(|| choose(true, false))
         };
         if let Some(position) = selected {
             return Ok(position);
         }
-        let distinct_capacity_fallback = remotes
-            .paths
-            .iter()
-            .enumerate()
-            .filter(|(_, path)| ordinary_path_allowed(path))
-            .filter(|(_, path)| can_enqueue(path))
-            .map(|(position, _)| position)
-            .find(|position| !avoid_keys.contains(&remotes.paths[*position].key()));
+        let choose_capacity = |allow_backup: bool, prefer_avoiding: bool| {
+            remotes
+                .paths
+                .iter()
+                .enumerate()
+                .filter(|(_, path)| ordinary_path_allowed(path))
+                .filter(|(_, path)| can_enqueue(path))
+                .filter(|(_, path)| !prefer_avoiding || !avoid_keys.contains(&path.key()))
+                .filter(|(_, path)| {
+                    allow_backup
+                        || context
+                            .reliable_path_snapshot(path.key())
+                            .is_none_or(|snapshot| !scheduler::path_is_backup(snapshot))
+                })
+                .map(|(position, _)| position)
+                .next()
+        };
+        let distinct_capacity_fallback =
+            choose_capacity(false, true).or_else(|| choose_capacity(true, true));
         let capacity_fallback = if requires_distinct_output {
             distinct_capacity_fallback
         } else {
-            distinct_capacity_fallback.or_else(|| {
-                remotes
-                    .paths
-                    .iter()
-                    .enumerate()
-                    .filter(|(_, path)| ordinary_path_allowed(path))
-                    .filter(|(_, path)| can_enqueue(path))
-                    .map(|(position, _)| position)
-                    .next()
-            })
+            choose_capacity(false, true)
+                .or_else(|| choose_capacity(false, false))
+                .or_else(|| choose_capacity(true, true))
+                .or_else(|| choose_capacity(true, false))
         };
         if let Some(position) = capacity_fallback {
             return Ok(position);

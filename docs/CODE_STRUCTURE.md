@@ -1,193 +1,205 @@
 # Code structure rules
 
-This document is the maintained contract for code ownership and dependency
-direction. `RFC.md` defines protocol behavior; `docs/ARCHITECTURE.md` maps the
-owners that implement it. A refactor is complete only when the code, tests, and
-ownership map agree with these rules.
+This is the maintained source-organization contract. `RFC.md` defines protocol
+behavior and `docs/ARCHITECTURE.md` maps current owners.
 
 ## Dependency direction
 
-Each later layer may depend on earlier layers in this list. An earlier layer
-must not import a later one.
+Later layers may depend on earlier layers; earlier layers must not import later
+ones.
 
-1. **Protocol** owns wire values, authentication inputs, frame semantics, range
-   operations, and bounded codecs. It has no runtime tasks or policy.
-2. **Model and scheduler** turn typed immutable inputs into decisions. They have
-   no sockets, channels, locks, platform APIs, or implicit wall clock.
-3. **Transport** adapts framing, encryption, TCP, and Quinn/QUIC mechanics. It
-   does not own product offsets or multipath placement.
-4. **Carrier** owns live TCP and QUIC path actors, carrier command queues, and
-   conversion of native observations into typed evidence.
-5. **Stream and datagram** own product identity, flow control, ordered offsets,
-   exact flights, repair, and atomic placement commits.
-6. **Relay** coordinates ingress or target I/O with product services. It does
-   not redefine carrier evidence or product admission policy.
-7. **Runtime and node composition** construct services, connect ports, and own
-   process lifetime.
+1. **Protocol**: wire values, authentication inputs, frame and range semantics,
+   bounded codec.
+2. **Model and scheduler**: typed immutable evidence and pure decisions.
+3. **Transport**: framing, encryption, TCP, Quinn/QUIC, optional host telemetry.
+4. **Carrier runtime**: live TCP/QUIC actors, command queues, native evidence.
+5. **Stream and datagram runtime**: MPP identity, per-direction offsets,
+   Data ACK and flow control, exact flights, range attribution, reinjection,
+   atomic commits.
+6. **Sender**: work queues, immutable path intents, exact commit, and carrier
+   command publication.
+7. **Relay**: ingress/target I/O, path acquisition, and recovery coordination.
+8. **Node composition**: constructs services, injects ports, owns process life.
 
-On the server, one identity owns one uniquely paired stream registry and target
-relay service. Carrier actors may admit or attach streams, but they do not spawn
-target relays. An accepted-stream lease keeps registry membership alive until
-carrier output has closed; close and late attachment linearize under the
-response binding's output lock. Datagram target policy, sockets, and workers
-belong to the product datagram service; TCP and QUIC carriers keep only neutral
-accepted-flow handles supplied through the injected datagram port.
+Use narrow typed ports when a lower layer reports to a higher owner. Do not
+solve dependency cycles through root re-exports, global preludes, or glob
+imports.
 
-When a lower actor must notify a higher service, define a narrow typed port at
-the lower boundary and inject its implementation from composition. Do not solve
-the dependency by a root re-export, a global prelude, or `use super::*`.
+## Protocol and carrier boundary
 
-## Carrier boundary
+- `OPEN_STREAM` is neutral membership and carries only target plus initial
+  demand; runtime path roles must not be added around it.
+- `PATH_STATUS` is sequenced directional `Available`/`Backup` preference. Local
+  health, validation, draining, and failure remain endpoint-local state.
+- Wire `(underlay, path_id)` is protocol identity, not a local configuration
+  index. Node composition carries accepting-listener policy into the exact
+  carrier registration and response snapshot.
+- `path_instance_id` fences one authenticated physical carrier. Request
+  membership adds `attachment_id`; response membership adds its binding-owned
+  output incarnation, and response new-data dispatch also fences the observed
+  response-model generation. Status, evidence, failure, and flight commits must
+  use the identity owned by their layer rather than reconstructing one from a
+  path index.
+- `TrafficClass` classifies mutable queued work, not links.
+- `PEER_STATUS_REQUEST` and `PEER_STATUS_RESPONSE` are bounded presentation
+  frames on authenticated carrier control channels. Remote status must never
+  enter local scheduling, health, capacity, or failover state.
+- One configured reliable TCP path has one live carrier actor. Priority classes
+  share that actor; extra physical carriers require distinct protocol identity.
+- TCP and QUIC retain independent congestion, pacing, and recovery state.
+- Each reliable-stream direction owns independent DSN, Data ACK, and
+  `STREAM_MAX_DATA` state. `STREAM_ACK` releases MPP ranges but grants no
+  offset; `STREAM_MAX_DATA` grants offsets but acknowledges no range.
+- Only MPP `STREAM_ACK` releases MPP ranges. Native transport ACKs are
+  typed path evidence. TCP receipt/socket evidence and QUIC packet-ACK evidence
+  retain separate proof state and lifetimes.
 
-TCP and QUIC are separate concrete authorities:
-
-- TCP owns socket I/O and relies on kernel TCP congestion and retransmission.
-  Native socket telemetry is optional evidence.
-- QUIC owns Quinn connection I/O, packet ACKs, congestion, pacing, and recovery.
-- Shared path authentication owns only the carrier-neutral HELLO, AUTH, and
-  JOIN transitions. TCP and QUIC retain their own frame I/O and acknowledgements,
-  while the server path context owns replay admission.
-- Neither carrier ACK releases product ranges. Only the product `STREAM_ACK`
-  authority may release the shared exact-flight ledger.
-
-The shared layer consumes carrier-neutral typed snapshots and emits typed,
-identity-fenced intents. A snapshot records direction, evidence provenance,
-freshness, logical path, physical path instance, and relevant generations. An
-intent identifies work and authority; it does not contain a carrier controller.
-TCP and QUIC may share command geometry and result vocabulary, but not mutable
-controller state or proof clocks.
+Shared policy consumes immutable carrier-neutral snapshots and emits
+identity-fenced intents. TCP and QUIC may share result vocabulary and command
+geometry, but never mutable controller state or proof clocks.
 
 ## Observe, decide, apply
 
-Scheduling and ownership changes use three explicit phases:
+1. **Observe** refreshes expiring state and captures one coherent snapshot. It
+   does not reserve work.
+2. **Decide** runs pure available-first eligibility and metric ranking without
+   locks or I/O.
+3. **Apply** revalidates identity, path incarnation, generations, data
+   frontier, evidence, resource limits, and queue pressure before reserving,
+   enqueueing, and publishing one result.
 
-1. **Observe**: the owner refreshes expiring state and creates one coherent,
-   immutable snapshot. Observing must not silently reserve work.
-2. **Decide**: a pure function ranks snapshots and returns an ID-only selection.
-   It takes no runtime lock and performs no I/O.
-3. **Apply**: the lifecycle owner combines that selection with the generations
-   observed for the planning pass. The state owner then reacquires its lock,
-   revalidates identity, generations, evidence, limits, and queue pressure,
-   reserves, enqueues, records exact flight, and publishes one coherent result.
-
-A rejected apply leaves no partial ownership. RAII guards must make cancellation,
-queue drop, timeout, and task exit reconcile reservations exactly.
+A rejected apply leaves no partial ownership. Queue and load accounting must
+balance on enqueue, dequeue, cancellation, receiver drop, timeout, and task
+exit.
 
 ## Modules and directories
 
 A directory is earned by a cohesive aggregate with private invariants and
-normally at least three production children. A small facade around one large
-file is a migration smell, not architecture. Conversely, several substantial
-siblings with one owner may remain a flat directory; depth is not awarded to
-make peer file counts equal.
+normally at least three substantive production children. Do not split files to
+equalize line counts or hide a large owner behind shallow wrappers.
 
-Use these balance checks during review:
+- A production file owns a durable policy, state machine, transaction, or
+  adapter boundary that can be explained without referring to its size.
+- Keep closely coupled phases together when separation would only add
+  forwarding APIs or duplicate state.
+- Normal depth is two domain levels. A third level is reserved for a concrete
+  carrier or directional aggregate such as `path/tcp` or `stream/response`.
+- Name files by ownership (`scheduling`, `evidence`, `session`, `writer`), not
+  by size or chronology. Avoid `core`, `common`, `misc`, and `utils` catch-alls.
+- Use `foo.rs` as the facade for `foo/`; do not add repeated `foo/mod.rs`
+  facades.
+- Production modules must not use `#[path = ...]` wiring.
 
-- A child containing more than about 60 percent of its aggregate is a split or
-  collapse review trigger, not an automatic failure.
-- Line count is never a reason to create a production file. A file should own
-  a durable policy, state machine, transaction, or adapter boundary that can be
-  explained without referring to its size. Keep closely coupled phases in one
-  substantive owner when separating them would only add forwarding APIs.
-- Peer domains should have comparable granularity where responsibilities match.
-  Honest TCP/QUIC or request/response asymmetry is allowed and documented.
-- Normal depth is two domain levels. A third level is reserved for an earned
-  concrete carrier or directional owner. Do not create generic chains such as
-  `service/logic/common/helpers`.
-- Name files for ownership (`planner`, `evidence`, `session`, `writer`), not size
-  or chronology. Avoid catch-all `core`, `common`, `misc`, and `utils` modules.
+The current response split is intentional: sender work is
+`service/scheduling/multipath/dispatch`; binding state is
+`ack_clock/attachment/data_commit/delivery/diagnostics/evidence/session/
+snapshot`. A new child must own an invariant not already covered
+by those modules.
 
-Use the named facade convention: `foo.rs` declares children in `foo/`. Do not
-introduce repeated `foo/mod.rs` facades. Production modules must not depend on
-`#[path = ...]` in the final tree. Test-only sibling wiring may use `#[path]` as
-described below.
+Response new-data planning returns an ID-only target plus model generation.
+`data_commit` revalidates the physical path instance, output incarnation, model
+generation, and queue credit atomically before recording original flight and
+publishing the carrier command. The output carrying the contiguous Data
+Sequence frontier remains governed by the shared receive window and native
+carrier credit. An additional output without durable unambiguous original-data
+Data ACK progress is limited to one bounded startup flight; native carrier ACK
+evidence cannot substitute for that Data ACK gate.
+
+Request stream ownership is split by invariant: `attachment` owns carrier
+membership, `state` owns path evidence and sampling, `flow_control` owns receive
+authority, and `flight` owns exact ranges and copies. Relay owns the transaction
+that acquires or recovers a carrier, and sender only consumes the resulting
+stream-owned set. `stream/feedback` owns connection-level Data ACK/window
+emission logic instantiated independently by both relay directions.
+Generic SOCKS/TUN UDP association workers live in `datagram/edge`; TUN retains
+only packet-device and packet-flow concerns.
+
+Management is split by owned boundary: `management/http` owns bounded HTTP and
+browser policy, `management/schema` owns serialized contracts,
+`management/projection` reads runtime owners, `management/snapshot` owns the
+immutable cache/history, and `management/control` owns explicit path mutations
+plus peer-request selection. `telemetry` owns exact logical product counters.
+`peer_status` owns only manual request correlation; TCP and QUIC carrier actors
+keep their independent control stream and writer lifetimes.
+
+Reinjection consumes exact retained ranges. Ordinary work must pass the
+cumulative extra-traffic budget. Cause-specific critical recovery may bypass
+only the remaining-budget check; event sizing, exact identity, queue/flight
+credit, overlap suppression, and alternate-output requirements remain in force,
+and the bytes are still charged to the ledger.
 
 ## Tests
 
-Keep one owner's tests in a sibling `foo_test.rs`, included by `foo.rs` under
-`#[cfg(test)]`. Split a large test file along the same ownership boundaries as
-production code. Cross-owner scenarios belong in a clearly named test folder
-or crate-level integration test, not in an unrelated owner's unit tests.
+Keep one owner's tests in sibling `foo_test.rs`, included from `foo.rs` under
+`#[cfg(test)]`. Split tests only along the same semantic boundaries as
+production. Cross-owner workflows belong in `src/runtime/tests/` or another
+clearly named integration owner.
 
 Test support must encode a reused domain fixture or invariant. Do not retain a
-helper, wrapper module, or path-checking test for a one-time migration action.
+helper, wrapper, or test for a one-time migration or path-renaming action.
 Test-only `#[path = "foo_test.rs"]` is acceptable; production `#[path]` is not.
 
-## Visibility, imports, and state
+## Visibility and state
 
-- Start private. Widen to `pub(super)` or a named facade export only for a real
-  sibling contract. Keep the crate's public API at deliberate top-level owners.
-- Production imports name their source. Do not use glob imports or
-  `use super::*`; tests may use `super::*` within their owning module.
-- Facades re-export a small named API, never all child implementation details.
-- One state machine has one owner. Splitting files must not split a lock or
-  duplicate state merely to make files smaller.
-- Document non-obvious lock order and the transaction it protects beside the
-  owning state. Do not hold runtime locks across `.await`, blocking I/O, or
-  unbounded computation.
-- A channel owns a specific handoff and its accounting. Enqueue, dequeue,
-  cancellation, receiver drop, and task exit must balance the same byte ledger.
-- Hot packet, frame, and ACK paths should use local state or immutable snapshots,
-  not a session-wide lock on every event.
+- Start private. Widen to `pub(super)` or a deliberate facade export only for
+  a real sibling contract.
+- Production imports name their source. Do not use `use super::*`; an owning
+  test module may.
+- Production facades re-export a small named API, never child implementation
+  details. A `#[cfg(test)]` glob may expose sibling fixtures to a parent test
+  owner; it is not part of the production dependency graph.
+- One state machine has one owner and one synchronization strategy. A file
+  split must not duplicate its lock or copy authoritative state.
+- Document non-obvious lock order and transaction boundaries beside the owner.
+- Do not hold runtime locks across `.await`, blocking I/O, or unbounded work.
+- Hot frame/ACK paths should use actor-local state or immutable snapshots.
 
-## Deleting or simplifying code
+## Simplification rule
 
-Delete code when static inspection proves it unreachable or unused across the
-supported feature and target matrix, and its tests describe no retained
-contract. Remove its tests and exports in the same change.
+Delete code when supported-target inspection proves it unreachable or unused
+and its tests describe no retained contract. Remove its tests, exports, docs,
+and diagnostic names in the same change.
 
-Do not classify these as useless defensive code merely because the happy path
-rarely exercises them: authentication and replay checks, resource bounds,
-logical and physical identity fences, generation checks, exact range ownership,
-rollback, cancellation, and deliberate drop order. Removing such a fence needs
-a protocol argument, a focused regression test, and relevant lab evidence when
-it can affect scheduling or throughput.
+Authentication, replay protection, resource bounds, exact physical identity,
+generation fences, range attribution, rollback, cancellation, and deliberate
+drop order are correctness mechanisms, not optional clutter. Removing one
+requires a protocol argument and focused regression coverage.
 
-Product policy must not encode a lab topology, interface name, fixed benchmark
-rate, or one host's timing. Thresholds come from protocol bounds, configured
-resource limits, or live typed metrics. A performance change is accepted by a
-matched experiment, not by making one recorded row pass.
+Do not encode a lab topology, interface name, benchmark rate, or host timing in
+MPP policy. Thresholds come from protocol bounds, configured resource
+limits, or live typed metrics. A performance patch requires a matched
+experiment and a broader regression matrix.
 
 ## Platform rule
 
-Core protocol, model, scheduling, and ownership code is platform-neutral.
-Platform-specific code is a narrow adapter for a real host facility, such as
-Linux TCP telemetry or packet-device construction. Optional telemetry must have
-a typed portable fallback; it must not become an eligibility requirement.
+Core protocol, model, scheduling, ownership, and relay code is portable.
+Platform-specific code is a narrow adapter for a host facility. Linux
+`TCP_INFO` is optional evidence with a portable no-evidence fallback; it cannot
+be required for path eligibility or correctness.
 
 Packet-device acquisition and carrier-network access are separate host
-capabilities. A carrier-network adapter resolves each configured endpoint on a
-selected native network, then may bind a source address or protect its sockets
-from an Android VPN route before connect. TCP and QUIC consume the same neutral
-host capability but retain separate connection and handshake algorithms;
-neither scheduling policy nor stream state may inspect an interface name, file
-descriptor, or OS network handle.
+capabilities. Keep target `cfg` blocks at adapter boundaries and never branch
+MPP policy by operating system. Windows client/Linux server, Linux, macOS,
+and Android library builds share the same protocol and scheduling model.
 
-Windows client with Linux server, Linux, macOS, and Android are supported design
-targets even when a local lab exercises fewer hosts. Keep target `cfg` blocks at
-adapter boundaries and never branch product policy by operating system.
+## Completion gate
 
-## Migration endpoint
+Structural work is complete only when all of these agree:
 
-Each structural checkpoint should format and compile with default and all
-features without changing behavior. The migration endpoint additionally requires:
-
-- no production glob facade, `use super::*`, or `#[path]` module wiring;
-- ownership documentation and source paths that match the final tree;
-- focused unit tests, full default/all-feature tests, and relevant integration
-  tests;
-- Windows cross-compilation and CLI/config smoke under Wine, plus the available
-  Android and other platform checks (Wine does not prove driver integration);
-- matched single-path baseline rows and multipath aggregation/failover rows for
-  upload and download, latency-sensitive and bulk work, and TCP-only, QUIC-only,
-  and mixed carriers; and
-- comparison with retained historical best rows so a structural or behavioral
-  change cannot silently accept a performance downgrade.
+- source tree and ownership docs contain no stale module or duplicate owner;
+- default and all-feature format, clippy, compile, and test checks pass;
+- supported target checks include Windows and the available Android toolchain;
+- CLI/config smoke works under Wine where native Windows is unavailable, while
+  clearly not claiming Wintun driver proof;
+- matched single-path, multipath aggregation, and failover rows cover upload,
+  download, latency, bulk, TCP, QUIC, and mixed carriers; and
+- current rows are compared with retained historical bests without treating a
+  changed protocol version as directly equivalent.
 
 ## Practice references
 
-- Rust module files: <https://doc.rust-lang.org/book/ch07-05-separating-modules-into-different-files.html>
-- Quinn architecture: <https://github.com/quinn-rs/quinn#overview>
-- rustls connection ownership: <https://github.com/rustls/rustls/tree/main/rustls/src/conn>
-- Tokio runtime ownership: <https://github.com/tokio-rs/tokio/tree/master/tokio/src/runtime>
-- smoltcp protocol layering: <https://github.com/smoltcp-rs/smoltcp/tree/main/src>
+- Rust modules: <https://doc.rust-lang.org/book/ch07-05-separating-modules-into-different-files.html>
+- Quinn: <https://github.com/quinn-rs/quinn#overview>
+- rustls connections: <https://github.com/rustls/rustls/tree/main/rustls/src/conn>
+- Tokio runtime: <https://github.com/tokio-rs/tokio/tree/master/tokio/src/runtime>
+- smoltcp layering: <https://github.com/smoltcp-rs/smoltcp/tree/main/src>

@@ -1,11 +1,11 @@
-//! Typed TCP capacity calibration and receiver-receipt ownership.
+//! Typed TCP capacity measurement and receiver-receipt ownership.
 //!
 //! The train remains a protocol transaction with an exact receipt. Writer
 //! serialization is delegated to `client_writer`; publication stays here.
 
 use super::capacity::{
-    RequestTcpCapacityProbeLease, request_tcp_capacity_receipt_metrics,
-    tcp_capacity_proof_validity, tcp_capacity_receipt_rate_bps,
+    request_tcp_capacity_receipt_metrics, tcp_capacity_proof_validity,
+    tcp_capacity_receipt_rate_bps,
 };
 use super::client_state::{
     ClientTcpCapacityProbeMeasurement, ClientTcpPathConnection, ClientTcpPathSessionRuntime,
@@ -18,7 +18,7 @@ use crate::lab_diagnostics::lab_diagnostic;
 use crate::model::capacity::{TRANSPORT_TIMER_GRANULARITY, TcpCapacityProofCandidate};
 use crate::protocol::{Frame, PathId, PathMetricDirection, UnderlayProtocol};
 use crate::runtime::error::RuntimeError;
-use crate::runtime::path::commands::{TcpCapacityProbeCommand, TcpCapacityProbeOwner};
+use crate::runtime::path::commands::TcpCapacityProbeCommand;
 use bytes::Bytes;
 use std::time::Instant;
 
@@ -35,9 +35,7 @@ pub(super) async fn client_write_tcp_capacity_probe(
     max_payload_bytes: usize,
 ) -> Result<ClientTcpCapacityProbeWriteOutcome, RuntimeError> {
     writer.flush().await?;
-    let Some(baseline_expires_at) = probe.baseline_expires_at else {
-        return Ok(ClientTcpCapacityProbeWriteOutcome::NoWire);
-    };
+    let baseline_expires_at = probe.baseline_expires_at;
     #[cfg(feature = "lab-diagnostics")]
     let baseline_wait_started_at = Instant::now();
     let (proof_started_at, _baseline) =
@@ -49,9 +47,9 @@ pub(super) async fn client_write_tcp_capacity_probe(
     lab_diagnostic(
         "request_tcp_capacity_probe",
         format_args!(
-            "phase=write_boundary_ready path_id={} calibration_id={} wait_ms={} native_queue={} unacked_packets={} notsent_bytes={}",
+            "phase=write_boundary_ready path_id={} measurement_id={} wait_ms={} native_queue={} unacked_packets={} notsent_bytes={}",
             probe.path_id.0,
-            probe.calibration_id,
+            probe.measurement_id,
             baseline_wait_started_at.elapsed().as_millis(),
             _baseline.is_some(),
             _baseline
@@ -60,9 +58,7 @@ pub(super) async fn client_write_tcp_capacity_probe(
             _baseline.map_or(0, |snapshot| snapshot.notsent_bytes),
         ),
     );
-    let Some(write_expires_at) = probe.write_expires_at else {
-        return Ok(ClientTcpCapacityProbeWriteOutcome::NoWire);
-    };
+    let write_expires_at = probe.write_expires_at;
     if Instant::now() >= write_expires_at {
         return Ok(ClientTcpCapacityProbeWriteOutcome::NoWire);
     }
@@ -90,7 +86,7 @@ pub(super) async fn client_write_tcp_capacity_probe(
             writer
                 .write_frame(&Frame::PathCapacityFinish {
                     path_id: probe.path_id,
-                    calibration_id: probe.calibration_id,
+                    measurement_id: probe.measurement_id,
                     payload_bytes: probe.train_payload_bytes,
                 })
                 .await?;
@@ -140,7 +136,7 @@ async fn client_write_tcp_capacity_payload(
         writer
             .write_frame(&Frame::PathCapacityData {
                 path_id: probe.path_id,
-                calibration_id: probe.calibration_id,
+                measurement_id: probe.measurement_id,
                 payload: Bytes::from(vec![0u8; payload_bytes]),
             })
             .await?;
@@ -189,26 +185,26 @@ pub(super) async fn handle_client_tcp_capacity_frame(
     match frame {
         Frame::PathCapacityData {
             path_id: capacity_path_id,
-            calibration_id,
+            measurement_id,
             payload,
         } if capacity_path_id == path_id => connection
             .capacity
-            .record_received_data(calibration_id, payload.len())
+            .record_received_data(measurement_id, payload.len())
             .map_err(Into::into),
         Frame::PathCapacityFinish {
             path_id: capacity_path_id,
-            calibration_id,
+            measurement_id,
             payload_bytes,
         } if capacity_path_id == path_id => {
             let received_payload_bytes = connection
                 .capacity
-                .finish_received_data(calibration_id, payload_bytes)?;
+                .finish_received_data(measurement_id, payload_bytes)?;
             connection
                 .carrier
                 .writer
                 .write_frame(&Frame::PathCapacityReceipt {
                     path_id,
-                    calibration_id,
+                    measurement_id,
                     received_payload_bytes,
                 })
                 .await?;
@@ -217,20 +213,20 @@ pub(super) async fn handle_client_tcp_capacity_frame(
             lab_diagnostic(
                 "tcp_capacity_receipt",
                 format_args!(
-                    "role=client phase=sent path_id={} calibration_id={} received_payload_bytes={}",
-                    path_id.0, calibration_id, received_payload_bytes,
+                    "role=client phase=sent path_id={} measurement_id={} received_payload_bytes={}",
+                    path_id.0, measurement_id, received_payload_bytes,
                 ),
             );
             Ok(())
         }
         Frame::PathCapacityReceipt {
             path_id: receipt_path_id,
-            calibration_id,
+            measurement_id,
             received_payload_bytes,
         } if receipt_path_id == path_id => {
             let pending = match connection
                 .capacity
-                .take_request_receipt(calibration_id, received_payload_bytes)
+                .take_request_receipt(measurement_id, received_payload_bytes)
             {
                 ClientTcpRequestReceipt::Active(pending) => pending,
                 ClientTcpRequestReceipt::Discarded => {
@@ -238,8 +234,8 @@ pub(super) async fn handle_client_tcp_capacity_frame(
                     lab_diagnostic(
                         "request_tcp_capacity_probe",
                         format_args!(
-                            "phase=discarded reason=matched_late_receipt path_index={} calibration_id={} train_bytes={}",
-                            runtime.path_index, calibration_id, received_payload_bytes,
+                            "phase=discarded reason=matched_late_receipt path_index={} measurement_id={} train_bytes={}",
+                            runtime.path_index, measurement_id, received_payload_bytes,
                         ),
                     );
                     return Ok(());
@@ -250,16 +246,9 @@ pub(super) async fn handle_client_tcp_capacity_frame(
                     ));
                 }
             };
-            let TcpCapacityProbeOwner::Request {
-                stream_id,
-                path_instance,
-            } = pending.probe.owner
-            else {
-                return Err(RuntimeError::Protocol(
-                    "client TCP capacity receipt has response ownership",
-                ));
-            };
-            if pending.probe.calibration_id != calibration_id
+            let stream_id = pending.probe.stream_id;
+            let path_instance = pending.probe.path_instance;
+            if pending.probe.measurement_id != measurement_id
                 || pending.probe.train_payload_bytes != received_payload_bytes
                 || path_instance.key.underlay != UnderlayProtocol::Tcp
                 || path_instance.key.index != runtime.path_index
@@ -269,17 +258,14 @@ pub(super) async fn handle_client_tcp_capacity_frame(
                 ));
             }
             if Instant::now() >= pending.probe.expires_at
-                || !pending
-                    .probe
-                    .request_lease()
-                    .is_some_and(RequestTcpCapacityProbeLease::is_current)
+                || !pending.probe.request_lease().is_current()
             {
                 #[cfg(feature = "lab-diagnostics")]
                 lab_diagnostic(
                     "request_tcp_capacity_probe",
                     format_args!(
-                        "phase=discarded reason=stale_matching_receipt path_index={} calibration_id={}",
-                        runtime.path_index, calibration_id,
+                        "phase=discarded reason=stale_matching_receipt path_index={} measurement_id={}",
+                        runtime.path_index, measurement_id,
                     ),
                 );
                 return Ok(());
@@ -308,7 +294,7 @@ pub(super) async fn handle_client_tcp_capacity_frame(
                 .unwrap_or(0);
             // Cold request trains can be smaller than the real path BDP, so
             // native delivery remains diagnostic here. The full typed receipt
-            // is the seed; product ACK evidence replaces it after handoff.
+            // is the seed; product ACK evidence replaces it after product admission.
             let metrics = request_tcp_capacity_receipt_metrics(
                 path_id,
                 received_payload_bytes,
@@ -320,7 +306,7 @@ pub(super) async fn handle_client_tcp_capacity_frame(
             let accepted_at = Instant::now();
             let validity = tcp_capacity_proof_validity(metrics);
             let candidate = TcpCapacityProofCandidate {
-                token: calibration_id,
+                token: measurement_id,
                 train_bytes: pending.probe.train_payload_bytes,
                 received_bytes: received_payload_bytes,
                 rate_sample_bytes: received_payload_bytes,
@@ -352,8 +338,8 @@ pub(super) async fn handle_client_tcp_capacity_frame(
                 lab_diagnostic(
                     "request_tcp_capacity_probe",
                     format_args!(
-                        "phase=discarded reason=proof_publication_rejected path_index={} calibration_id={}",
-                        runtime.path_index, calibration_id,
+                        "phase=discarded reason=proof_publication_rejected path_index={} measurement_id={}",
+                        runtime.path_index, measurement_id,
                     ),
                 );
                 return Ok(());
@@ -362,11 +348,11 @@ pub(super) async fn handle_client_tcp_capacity_frame(
             lab_diagnostic(
                 "request_tcp_capacity_probe",
                 format_args!(
-                    "phase=confirmed stream_id={} path_index={} instance_id={} calibration_id={} train_bytes={} train_wire_bytes={} receipt_elapsed_ms={} receipt_rate_mbps={:.3} published_rate_mbps={:.3} kernel_delivery_rate_mbps={:.3} kernel_pacing_rate_mbps={:.3} srtt_ms={:.3}",
+                    "phase=confirmed stream_id={} path_index={} instance_id={} measurement_id={} train_bytes={} train_wire_bytes={} receipt_elapsed_ms={} receipt_rate_mbps={:.3} published_rate_mbps={:.3} kernel_delivery_rate_mbps={:.3} kernel_pacing_rate_mbps={:.3} srtt_ms={:.3}",
                     stream_id.0,
                     runtime.path_index,
-                    path_instance.id,
-                    calibration_id,
+                    path_instance.attachment_id,
+                    measurement_id,
                     received_payload_bytes,
                     pending.measurement.train_wire_bytes,
                     elapsed.as_millis(),

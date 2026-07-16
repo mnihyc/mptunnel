@@ -56,3 +56,89 @@ fn server_paths_reject_client_source_binding() {
         Err(ConfigError::ServerPathSourceBinding)
     );
 }
+
+#[test]
+fn management_dashboard_requires_an_http_listener() {
+    let config = ManagementConfig {
+        dashboard: true,
+        ..ManagementConfig::default()
+    };
+
+    assert_eq!(
+        config.validate(),
+        Err(ConfigError::ManagementDashboardWithoutListener)
+    );
+}
+
+#[test]
+fn loopback_management_listener_requires_a_token() {
+    let config = ManagementConfig {
+        listen: vec!["127.0.0.1:7600".parse().expect("listen")],
+        ..ManagementConfig::default()
+    };
+
+    assert_eq!(
+        config.validate(),
+        Err(ConfigError::ManagementListenerRequiresToken)
+    );
+}
+
+#[test]
+fn management_listener_rejects_an_empty_token() {
+    let config = ManagementConfig {
+        listen: vec!["127.0.0.1:7600".parse().expect("listen")],
+        token: Some(String::new()),
+        ..ManagementConfig::default()
+    };
+
+    assert_eq!(config.validate(), Err(ConfigError::ManagementTokenEmpty));
+}
+
+#[test]
+fn management_listener_rejects_weak_or_header_unsafe_tokens() {
+    for token in ["short", "sixteen bytes bad ", "sixteen\nbytesbad"] {
+        let config = ManagementConfig {
+            listen: vec!["127.0.0.1:9090".parse().expect("address")],
+            token: Some(token.to_string()),
+            ..ManagementConfig::default()
+        };
+        assert_eq!(config.validate(), Err(ConfigError::ManagementTokenInvalid));
+    }
+}
+
+#[test]
+fn non_loopback_management_listener_is_rejected_even_with_a_token() {
+    let config = ManagementConfig {
+        listen: vec!["0.0.0.0:7600".parse().expect("listen")],
+        token: Some("operator-token-123".to_string()),
+        ..ManagementConfig::default()
+    };
+
+    assert_eq!(
+        config.validate(),
+        Err(ConfigError::ManagementListenerMustBeLoopback)
+    );
+}
+
+#[test]
+fn loopback_management_listener_with_a_token_is_valid() {
+    let config = ManagementConfig {
+        listen: vec!["[::1]:7600".parse().expect("listen")],
+        token: Some("operator-token-123".to_string()),
+        ..ManagementConfig::default()
+    };
+
+    assert_eq!(config.validate(), Ok(()));
+}
+
+#[test]
+fn peer_diagnostics_does_not_require_a_local_http_listener() {
+    let config = ManagementConfig {
+        allow_peer_diagnostics: true,
+        ..ManagementConfig::default()
+    };
+
+    assert_eq!(config.validate(), Ok(()));
+    assert!(!config.http_enabled());
+    assert!(config.peer_diagnostics_enabled());
+}

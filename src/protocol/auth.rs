@@ -4,8 +4,8 @@ use sha2::Sha256;
 
 type HmacSha256 = Hmac<Sha256>;
 
-const SESSION_AUTH_CONTEXT: &[u8] = b"mptunnel session auth v1";
-const PATH_JOIN_CONTEXT: &[u8] = b"mptunnel path join v1";
+const SESSION_AUTH_CONTEXT: &[u8] = b"mptunnel session auth v2";
+const PATH_JOIN_CONTEXT: &[u8] = b"mptunnel path join v2";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct SessionAuthCheck {

@@ -1,48 +1,6 @@
 use super::*;
 
 #[test]
-fn encryption_is_required_by_default() {
-    let mode = EncryptionMode::default();
-    let secret = SharedSecret::new(b"0123456789abcdef0123456789abcdef".to_vec()).expect("secret");
-
-    assert_eq!(
-        validate_transport_security(
-            mode,
-            TransportSecurity::Plaintext,
-            TransportIntegrity::Authenticated,
-            &secret
-        ),
-        Err(SecurityPolicyError::PlaintextRejected)
-    );
-    assert!(
-        validate_transport_security(
-            mode,
-            TransportSecurity::Encrypted,
-            TransportIntegrity::Authenticated,
-            &secret
-        )
-        .is_ok()
-    );
-}
-
-#[test]
-fn plaintext_requires_explicit_lab_mode_warning_and_authenticated_integrity() {
-    let mode = EncryptionMode::AllowPlaintextLab;
-    let secret = SharedSecret::new(b"0123456789abcdef0123456789abcdef".to_vec()).expect("secret");
-
-    assert!(
-        validate_transport_security(
-            mode,
-            TransportSecurity::Plaintext,
-            TransportIntegrity::Authenticated,
-            &secret
-        )
-        .is_ok()
-    );
-    assert!(mode.plaintext_warning().is_some());
-}
-
-#[test]
 fn shared_secret_is_redacted_and_minimum_sized() {
     assert_eq!(
         SharedSecret::new(b"short".to_vec()),

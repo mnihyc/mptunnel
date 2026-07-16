@@ -16,7 +16,7 @@ use super::model::{
 use super::proof::PathProofObservation;
 use super::quic::{
     RequestQuicCapacityProbeLease, RequestQuicCapacityProbeSession,
-    RequestQuicCapacityProductHandoffState, RequestQuicCapacityReconciliationQuery,
+    RequestQuicCapacityProductAdmissionState, RequestQuicCapacityReconciliationQuery,
 };
 use super::set::ClientPathContext;
 use super::tcp::capacity::{
@@ -24,15 +24,15 @@ use super::tcp::capacity::{
 };
 #[cfg(test)]
 use super::*;
-use crate::model::capacity::{PathRateSample, reliable_capacity_calibration_session_limit_bytes};
-use crate::model::path::{RelayPathInstance, RelayPathKey};
-use crate::protocol::{StreamId, UnderlayProtocol};
+use crate::model::capacity::{PathRateSample, reliable_capacity_measurement_session_limit_bytes};
+use crate::model::path::{CarrierPathInstanceId, RelayPathInstance, RelayPathKey};
+use crate::protocol::{PathUsage, StreamId, UnderlayProtocol};
 use crate::runtime::error::RuntimeError;
-use crate::scheduler::FlowLane;
+use crate::scheduler::TrafficClass;
 use std::collections::HashMap;
 use std::sync::{
     Arc, Mutex,
-    atomic::{AtomicU32, AtomicU64, Ordering},
+    atomic::{AtomicU64, Ordering},
 };
 use std::time::{Duration, Instant};
 
@@ -41,7 +41,6 @@ use std::time::{Duration, Instant};
 pub(in crate::runtime) struct ClientPathState {
     health: Mutex<ClientPathHealth>,
     next_reliable_stream_id: Mutex<u64>,
-    active_tcp_service_request_bulk_flows: AtomicU32,
     request_quic_capacity_probe: RequestQuicCapacityProbeSession,
     request_tcp_capacity_probe: RequestTcpCapacityProbeSession,
 }
@@ -53,7 +52,6 @@ impl ClientPathState {
         Arc::new(Self {
             health: Mutex::new(health),
             next_reliable_stream_id: Mutex::new(0),
-            active_tcp_service_request_bulk_flows: AtomicU32::new(0),
             request_quic_capacity_probe: RequestQuicCapacityProbeSession::new(udp_path_count),
             request_tcp_capacity_probe: RequestTcpCapacityProbeSession::new(tcp_path_count),
         })
@@ -61,6 +59,77 @@ impl ClientPathState {
 
     pub(in crate::runtime) fn health(&self) -> &Mutex<ClientPathHealth> {
         &self.health
+    }
+
+    /// Installs the first preference from a newly authenticated carrier. A new
+    /// carrier instance restarts its sequence space at zero.
+    pub(in crate::runtime) fn install_peer_path_usage(
+        &self,
+        underlay: UnderlayProtocol,
+        index: usize,
+        path_instance_id: CarrierPathInstanceId,
+        sequence: u64,
+        usage: PathUsage,
+    ) {
+        let mut health = self.health.lock().expect("client path health lock");
+        let records = match underlay {
+            UnderlayProtocol::Tcp => &mut health.tcp,
+            UnderlayProtocol::Udp => &mut health.udp,
+        };
+        if let Some(record) = records.get_mut(index) {
+            record.install_peer_usage(path_instance_id, sequence, usage);
+        }
+    }
+
+    pub(in crate::runtime) fn update_peer_path_usage(
+        &self,
+        underlay: UnderlayProtocol,
+        index: usize,
+        path_instance_id: CarrierPathInstanceId,
+        sequence: u64,
+        usage: PathUsage,
+    ) -> bool {
+        let mut health = self.health.lock().expect("client path health lock");
+        let records = match underlay {
+            UnderlayProtocol::Tcp => &mut health.tcp,
+            UnderlayProtocol::Udp => &mut health.udp,
+        };
+        records
+            .get_mut(index)
+            .is_some_and(|record| record.update_peer_usage(path_instance_id, sequence, usage))
+    }
+
+    pub(in crate::runtime) fn peer_path_usage(
+        &self,
+        underlay: UnderlayProtocol,
+        index: usize,
+    ) -> Option<PathUsage> {
+        let health = self.health.lock().expect("client path health lock");
+        match underlay {
+            UnderlayProtocol::Tcp => health.tcp.get(index),
+            UnderlayProtocol::Udp => health.udp.get(index),
+        }
+        .and_then(|record| record.peer_usage)
+    }
+
+    /// Publishes an unexpected carrier loss once. Relay cleanup may observe the
+    /// same loss later, so the health record deduplicates repeated reports.
+    pub(in crate::runtime) fn mark_path_instance_data_plane_failure(
+        &self,
+        key: RelayPathKey,
+        path_instance_id: CarrierPathInstanceId,
+    ) -> bool {
+        let now = Instant::now();
+        let mut health = self.health.lock().expect("client path health lock");
+        let records = match key.underlay {
+            UnderlayProtocol::Tcp => &mut health.tcp,
+            UnderlayProtocol::Udp => &mut health.udp,
+        };
+        let has_schedulable_alternative =
+            path_records_have_schedulable_alternative(records, key.index, now);
+        records.get_mut(key.index).is_some_and(|current| {
+            current.mark_data_plane_failure(path_instance_id, now, has_schedulable_alternative)
+        })
     }
 
     pub(in crate::runtime::path) fn request_tcp_capacity_probe_session(
@@ -75,7 +144,7 @@ impl ClientPathState {
         &self.request_quic_capacity_probe
     }
 
-    fn release_relay_path_load(&self, key: RelayPathKey, lane: FlowLane) {
+    fn release_relay_path_load(&self, key: RelayPathKey, lane: TrafficClass) {
         let mut health = self.health.lock().expect("client path health lock");
         let records = match key.underlay {
             UnderlayProtocol::Tcp => &mut health.tcp,
@@ -241,21 +310,21 @@ impl RequestCapacityProbeCampaignBudget {
 
 /// Cancellation-safe ownership of one logical flow's shared path load.
 ///
-/// Initial Active opens acquire a lease before I/O and transfer it with the
-/// attachment. Passive validation acquires one only after unique product bytes
+/// The initial attachment acquires a lease before I/O and transfers it with the
+/// attachment. Additional paths acquire one only after unique product bytes
 /// commit. Dropping any transaction owner rolls the scheduler load back.
 pub(in crate::runtime) struct RelayPathLoadLease {
     state: Arc<ClientPathState>,
     key: RelayPathKey,
-    lane: FlowLane,
+    lane: TrafficClass,
 }
 
 impl RelayPathLoadLease {
-    pub(super) fn new(state: Arc<ClientPathState>, key: RelayPathKey, lane: FlowLane) -> Self {
+    pub(super) fn new(state: Arc<ClientPathState>, key: RelayPathKey, lane: TrafficClass) -> Self {
         Self { state, key, lane }
     }
 
-    pub(in crate::runtime) fn set_recorded_lane(&mut self, lane: FlowLane) {
+    pub(in crate::runtime) fn set_recorded_lane(&mut self, lane: TrafficClass) {
         self.lane = lane;
     }
 
@@ -270,70 +339,6 @@ impl Drop for RelayPathLoadLease {
     }
 }
 
-#[derive(Debug)]
-struct ReliableTcpRequestBulkFlowRegistrationState {
-    path_state: Arc<ClientPathState>,
-    counted: Mutex<bool>,
-}
-
-#[derive(Clone, Debug)]
-pub(in crate::runtime) struct ReliableTcpRequestBulkFlowRegistration {
-    state: Arc<ReliableTcpRequestBulkFlowRegistrationState>,
-}
-
-impl ReliableTcpRequestBulkFlowRegistration {
-    pub(in crate::runtime) fn update(
-        &self,
-        request_bulk_active: bool,
-        service_underlay: Option<UnderlayProtocol>,
-    ) {
-        let counted = request_bulk_active && service_underlay == Some(UnderlayProtocol::Tcp);
-        let mut current = self
-            .state
-            .counted
-            .lock()
-            .expect("TCP-Service request bulk flow registration lock");
-        if *current == counted {
-            return;
-        }
-        if counted {
-            self.state
-                .path_state
-                .active_tcp_service_request_bulk_flows
-                .fetch_update(Ordering::AcqRel, Ordering::Acquire, |count| {
-                    count.checked_add(1)
-                })
-                .expect("TCP-Service request bulk flow count overflow");
-        } else {
-            self.state
-                .path_state
-                .active_tcp_service_request_bulk_flows
-                .fetch_update(Ordering::AcqRel, Ordering::Acquire, |count| {
-                    count.checked_sub(1)
-                })
-                .expect("TCP-Service request bulk flow registration is unbalanced");
-        }
-        *current = counted;
-    }
-}
-
-impl Drop for ReliableTcpRequestBulkFlowRegistrationState {
-    fn drop(&mut self) {
-        let counted = self
-            .counted
-            .get_mut()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
-        if *counted {
-            self.path_state
-                .active_tcp_service_request_bulk_flows
-                .fetch_update(Ordering::AcqRel, Ordering::Acquire, |count| {
-                    count.checked_sub(1)
-                })
-                .expect("TCP-Service request bulk flow registration is unbalanced");
-        }
-    }
-}
-
 impl ClientPathContext {
     pub(in crate::runtime) fn health(&self) -> &Mutex<ClientPathHealth> {
         self.state.health()
@@ -345,13 +350,13 @@ impl ClientPathContext {
 
     pub(in crate::runtime) fn request_quic_capacity_probe_remaining_bytes(&self) -> u64 {
         self.state.request_quic_capacity_probe_remaining_bytes(
-            reliable_capacity_calibration_session_limit_bytes(self.mux_limits),
+            reliable_capacity_measurement_session_limit_bytes(self.mux_limits),
         )
     }
 
     pub(in crate::runtime) fn request_tcp_capacity_probe_remaining_bytes(&self) -> u64 {
         self.state.request_tcp_capacity_probe_remaining_bytes(
-            reliable_capacity_calibration_session_limit_bytes(self.mux_limits),
+            reliable_capacity_measurement_session_limit_bytes(self.mux_limits),
         )
     }
 
@@ -362,7 +367,7 @@ impl ClientPathContext {
         self.state
             .request_quic_capacity_probe_candidate_share_bytes(
                 proposed_path_limit,
-                reliable_capacity_calibration_session_limit_bytes(self.mux_limits),
+                reliable_capacity_measurement_session_limit_bytes(self.mux_limits),
             )
     }
 
@@ -372,7 +377,7 @@ impl ClientPathContext {
     ) -> u64 {
         self.state.request_tcp_capacity_probe_candidate_share_bytes(
             proposed_path_limit,
-            reliable_capacity_calibration_session_limit_bytes(self.mux_limits),
+            reliable_capacity_measurement_session_limit_bytes(self.mux_limits),
         )
     }
 
@@ -384,7 +389,7 @@ impl ClientPathContext {
         self.state.request_quic_capacity_probe_path_remaining_bytes(
             path_index,
             path_limit,
-            reliable_capacity_calibration_session_limit_bytes(self.mux_limits),
+            reliable_capacity_measurement_session_limit_bytes(self.mux_limits),
         )
     }
 
@@ -396,7 +401,7 @@ impl ClientPathContext {
         self.state.request_tcp_capacity_probe_path_remaining_bytes(
             path_index,
             path_limit,
-            reliable_capacity_calibration_session_limit_bytes(self.mux_limits),
+            reliable_capacity_measurement_session_limit_bytes(self.mux_limits),
         )
     }
 
@@ -422,7 +427,7 @@ impl ClientPathContext {
             token,
             train_bytes,
             path_limit_bytes,
-            reliable_capacity_calibration_session_limit_bytes(self.mux_limits),
+            reliable_capacity_measurement_session_limit_bytes(self.mux_limits),
             campaign,
             required_timed_bytes,
             valid_after,
@@ -473,9 +478,9 @@ impl ClientPathContext {
                 target: query.target,
                 token: query.token,
                 carrier_proven: reconciliation.is_some_and(|view| view.carrier_proven),
-                handoff: reconciliation
-                    .map_or(RequestQuicCapacityProductHandoffState::Absent, |view| {
-                        view.handoff
+                product_admission: reconciliation
+                    .map_or(RequestQuicCapacityProductAdmissionState::Absent, |view| {
+                        view.product_admission
                     }),
             }
         });
@@ -486,6 +491,7 @@ impl ClientPathContext {
         }
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub(in crate::runtime) fn try_reserve_request_quic_capacity_probe(
         &self,
         stream_id: StreamId,
@@ -507,35 +513,13 @@ impl ClientPathContext {
             token,
             train_bytes,
             path_limit_bytes,
-            reliable_capacity_calibration_session_limit_bytes(self.mux_limits),
+            reliable_capacity_measurement_session_limit_bytes(self.mux_limits),
             campaign,
             valid_after,
             expires_at,
             proof_validity,
             ticket,
         )
-    }
-
-    #[cfg(test)]
-    pub(in crate::runtime) fn request_quic_capacity_probe_proven_at(
-        &self,
-        path_index: usize,
-        token: u64,
-        now: Instant,
-    ) -> bool {
-        self.state
-            .request_quic_capacity_probe_proven_at(path_index, token, now)
-    }
-
-    #[cfg(test)]
-    pub(in crate::runtime) fn request_quic_capacity_product_handoff_state_at(
-        &self,
-        path_index: usize,
-        token: u64,
-        now: Instant,
-    ) -> RequestQuicCapacityProductHandoffState {
-        self.state
-            .request_quic_capacity_product_handoff_state_at(path_index, token, now)
     }
 
     pub(in crate::runtime) fn allocate_reliable_stream_id(&self) -> Result<StreamId, RuntimeError> {
@@ -551,56 +535,11 @@ impl ClientPathContext {
         Ok(stream_id)
     }
 
-    pub(in crate::runtime) fn reliable_tcp_request_bulk_flow_registration(
-        &self,
-    ) -> ReliableTcpRequestBulkFlowRegistration {
-        ReliableTcpRequestBulkFlowRegistration {
-            state: Arc::new(ReliableTcpRequestBulkFlowRegistrationState {
-                path_state: self.state.clone(),
-                counted: Mutex::new(false),
-            }),
-        }
-    }
-
-    pub(in crate::runtime) fn active_tcp_service_request_bulk_flows(&self) -> u32 {
-        self.state
-            .active_tcp_service_request_bulk_flows
-            .load(Ordering::Acquire)
-    }
-
-    #[cfg(test)]
-    pub(in crate::runtime) fn reserve_tcp_path_load(&self, index: usize, lane: FlowLane) {
-        if let Some(current) = self
-            .state
-            .health
-            .lock()
-            .expect("client path health lock")
-            .tcp
-            .get_mut(index)
-        {
-            current.reserve_load(lane);
-        }
-    }
-
-    #[cfg(test)]
-    pub(in crate::runtime) fn reserve_udp_stream_path_load(&self, index: usize, lane: FlowLane) {
-        if let Some(current) = self
-            .state
-            .health
-            .lock()
-            .expect("client path health lock")
-            .udp
-            .get_mut(index)
-        {
-            current.reserve_load(lane);
-        }
-    }
-
     /// Returns the only owner of the newly published scheduler load.
     pub(in crate::runtime) fn reserve_relay_path_load(
         &self,
         key: RelayPathKey,
-        lane: FlowLane,
+        lane: TrafficClass,
     ) -> Option<RelayPathLoadLease> {
         let mut health = self.state.health.lock().expect("client path health lock");
         let records = match key.underlay {
@@ -616,7 +555,7 @@ impl ClientPathContext {
         &self,
         index: usize,
         elapsed: Duration,
-        lane: FlowLane,
+        lane: TrafficClass,
     ) {
         if let Some(current) = self
             .state
@@ -674,7 +613,7 @@ impl ClientPathContext {
             })
     }
 
-    pub(in crate::runtime) fn release_tcp_path_load(&self, index: usize, lane: FlowLane) {
+    pub(in crate::runtime) fn release_tcp_path_load(&self, index: usize, lane: TrafficClass) {
         if let Some(current) = self
             .state
             .health
@@ -719,26 +658,9 @@ impl ClientPathContext {
         }
     }
 
-    pub(in crate::runtime) fn mark_relay_path_data_plane_failure(
-        &self,
-        underlay: UnderlayProtocol,
-        index: usize,
-    ) {
-        match underlay {
-            UnderlayProtocol::Tcp => self.mark_tcp_path_data_plane_failure(index),
-            UnderlayProtocol::Udp => self.mark_udp_path_data_plane_failure(index),
-        }
-    }
-
-    #[cfg(test)]
-    pub(in crate::runtime) fn release_relay_path_load(
-        &self,
-        underlay: UnderlayProtocol,
-        index: usize,
-        lane: FlowLane,
-    ) {
+    pub(in crate::runtime) fn mark_relay_path_data_plane_failure(&self, path: RelayPathInstance) {
         self.state
-            .release_relay_path_load(RelayPathKey { underlay, index }, lane);
+            .mark_path_instance_data_plane_failure(path.key, path.path_instance_id);
     }
 
     pub(in crate::runtime) fn record_relay_path_send(
@@ -803,8 +725,8 @@ impl ClientPathContext {
         &self,
         underlay: UnderlayProtocol,
         index: usize,
-        from: FlowLane,
-        to: FlowLane,
+        from: TrafficClass,
+        to: TrafficClass,
     ) {
         if from == to {
             return;
@@ -914,19 +836,9 @@ impl ClientPathContext {
         let now = Instant::now();
         let mut health = self.state.health.lock().expect("client path health lock");
         let has_schedulable_alternative =
-            path_records_have_schedulable_alternative(&mut health.tcp, index, now);
+            path_records_have_schedulable_alternative(&health.tcp, index, now);
         if let Some(current) = health.tcp.get_mut(index) {
             current.mark_failure(now, has_schedulable_alternative);
-        }
-    }
-
-    pub(in crate::runtime) fn mark_tcp_path_data_plane_failure(&self, index: usize) {
-        let now = Instant::now();
-        let mut health = self.state.health.lock().expect("client path health lock");
-        let has_schedulable_alternative =
-            path_records_have_schedulable_alternative(&mut health.tcp, index, now);
-        if let Some(current) = health.tcp.get_mut(index) {
-            current.mark_data_plane_failure(now, has_schedulable_alternative);
         }
     }
 
@@ -939,7 +851,7 @@ impl ClientPathContext {
             .udp
             .get_mut(index)
         {
-            current.mark_open_success(elapsed, FlowLane::RealtimeDatagram);
+            current.mark_open_success(elapsed, TrafficClass::RealtimeDatagram);
         }
     }
 
@@ -979,7 +891,7 @@ impl ClientPathContext {
             .udp
             .get_mut(index)
         {
-            current.release_load(FlowLane::RealtimeDatagram);
+            current.release_load(TrafficClass::RealtimeDatagram);
         }
     }
 
@@ -1042,19 +954,9 @@ impl ClientPathContext {
         let now = Instant::now();
         let mut health = self.state.health.lock().expect("client path health lock");
         let has_schedulable_alternative =
-            path_records_have_schedulable_alternative(&mut health.udp, index, now);
+            path_records_have_schedulable_alternative(&health.udp, index, now);
         if let Some(current) = health.udp.get_mut(index) {
             current.mark_failure(now, has_schedulable_alternative);
-        }
-    }
-
-    pub(in crate::runtime) fn mark_udp_path_data_plane_failure(&self, index: usize) {
-        let now = Instant::now();
-        let mut health = self.state.health.lock().expect("client path health lock");
-        let has_schedulable_alternative =
-            path_records_have_schedulable_alternative(&mut health.udp, index, now);
-        if let Some(current) = health.udp.get_mut(index) {
-            current.mark_data_plane_failure(now, has_schedulable_alternative);
         }
     }
 }

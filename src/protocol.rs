@@ -12,6 +12,6 @@ mod types;
 pub(crate) use types::FrameWriteClass;
 pub use types::{
     AuthNonce, AuthTag, CloseReason, DatagramFlowId, DatagramId, Frame, OffsetRange, PathId,
-    PathMetricDirection, PathMetrics, PathStatus, ResetReason, SessionId, StreamDemandHint,
-    StreamId, StreamOpenRole, TargetAddr, UnderlayProtocol,
+    PathMetricDirection, PathMetrics, PathUsage, PeerPathState, PeerPathStatus, PeerStatusCode,
+    ResetReason, SessionId, StreamDemandHint, StreamId, TargetAddr, UnderlayProtocol,
 };

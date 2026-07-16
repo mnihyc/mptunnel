@@ -1,548 +1,357 @@
 use super::super::ResponseStreamBinding;
-use super::super::attachment::{
-    RESPONSE_OWNER_MIXED_SEEN, RESPONSE_OWNER_TCP_SEEN, ResponseStreamAttachOutcome,
-    ResponseStreamOutputEntry,
+use super::super::attachment::{ResponseStreamOutputEntry, ResponseStreamOutputs};
+use super::super::evidence::{
+    ServerPathMetricsEntry, ServerPathMetricsSource, server_output_has_bulk_rate_evidence,
 };
-use super::super::evidence::ServerPathMetricsSource;
 use super::super::next_server_carrier_path_instance_id;
-use super::super::session::ServerPathLaneTracker;
-use super::super::test_support::{mark_test_quic_output_carrier_bulk_proven, output_entry_for_key};
-use super::{server_bulk_output_eta_ms, server_bulk_output_snapshot};
-use crate::model::admission::{
-    ReliableSourceServiceStagingContext, ReliableSourceStagingContext,
-    bulk_service_feed_reservoir_payload_bytes, reliable_relay_source_staging_owner_tail_headroom,
-};
+use super::super::test_support::{stream_data_frame, stream_data_frame_at};
+use super::{server_bulk_output_snapshot, server_output_confidence};
 use crate::model::capacity::{
     PATH_OPEN_SCORE_BYTES, RELIABLE_INITIAL_WINDOW_PACKETS,
-    RELIABLE_STREAM_STARTUP_PRODUCT_WINDOW_BYTES, reliable_bulk_carrier_feed_quantum_bytes,
-    reliable_subflow_startup_sample_limit_bytes,
+    reliable_path_startup_sample_limit_bytes,
 };
-use crate::model::path::CarrierPathKey;
+use crate::model::path::{CarrierPathKey, PathPolicy};
 use crate::mux::MuxLimits;
 use crate::protocol::{
-    PathId, PathMetricDirection, PathMetrics, SessionId, StreamOpenRole, UnderlayProtocol,
+    PathId, PathMetricDirection, PathMetrics, PathUsage, SessionId, UnderlayProtocol,
 };
-use crate::runtime::path::commands::reliable_path_command_channels;
-use crate::runtime::path::model::{default_path_rate_bps, default_path_srtt_ms, metric_epoch_now};
-use crate::scheduler::{FlowLane, PathSnapshot};
-use std::sync::Arc;
-use std::sync::atomic::Ordering;
+use crate::runtime::path::commands::{ReliablePathCommandSender, reliable_path_command_channels};
+use crate::scheduler::{PathRateScope, TrafficClass};
+use std::time::Instant;
 
-#[test]
-fn tcp_response_snapshot_persistent_delivery_samples_override_default_prior() {
-    let (commands, _receivers) = reliable_path_command_channels(8);
-    let prior_rate = default_path_rate_bps();
-    let entry = ResponseStreamOutputEntry {
-        key: CarrierPathKey {
-            underlay: UnderlayProtocol::Tcp,
-            path_id: PathId(0),
-        },
+fn output_entry(
+    key: CarrierPathKey,
+    commands: ReliablePathCommandSender,
+) -> ResponseStreamOutputEntry {
+    ResponseStreamOutputEntry {
+        key,
         path_instance_id: next_server_carrier_path_instance_id(),
+        local_policy: PathPolicy::default(),
         incarnation: 1,
         commands,
-        role: StreamOpenRole::Active,
-        owner_data_in_flight_bytes: 0,
+        original_data_in_flight_bytes: 0,
         bytes_in_flight: 0,
-        product_progress_rate_bps: Some(prior_rate / 10.0),
-        delivery_rate_bps: Some(prior_rate / 10.0),
+        product_progress_rate_bps: None,
+        delivery_rate_bps: None,
         tcp_ack_clock_rate_bps: None,
         tcp_product_rate_evidence: None,
-        tcp_capacity_prior: None,
-        srtt_ms: Some(default_path_srtt_ms()),
-        delivery_samples: RELIABLE_INITIAL_WINDOW_PACKETS as u32,
-        owner_data_acked_bytes: reliable_subflow_startup_sample_limit_bytes(MuxLimits::default()),
+        srtt_ms: None,
+        delivery_samples: 0,
+        original_data_acked_bytes: 0,
         local_path_metrics: None,
         peer_path_metrics: None,
-    };
-
-    let lane_tracker = ServerPathLaneTracker::default();
-    let snapshot = server_bulk_output_snapshot(
-        &entry,
-        0,
-        SessionId(77),
-        FlowLane::Throughput,
-        &lane_tracker,
-        MuxLimits::default(),
-    );
-
-    assert_eq!(snapshot.delivery_rate_bps, prior_rate / 10.0);
-}
-
-#[test]
-fn response_eta_uses_delivered_rate_not_inflated_quic_pacing_rate() {
-    let key = CarrierPathKey {
-        underlay: UnderlayProtocol::Udp,
-        path_id: PathId(2),
-    };
-    let mut baseline = PathSnapshot::new(key.path_id, key.underlay, 100.0, 50_000_000.0);
-    baseline.pacing_rate_bps = 50_000_000.0;
-    baseline.confidence = 1.0;
-
-    let mut inflated_pacing = baseline;
-    inflated_pacing.pacing_rate_bps = 5_000_000_000.0;
-
-    let payload_bytes = 64 * 1024;
-    let baseline_eta = server_bulk_output_eta_ms(
-        key,
-        baseline,
-        Some(key),
-        FlowLane::Throughput,
-        payload_bytes,
-        MuxLimits::default(),
-    );
-    let inflated_eta = server_bulk_output_eta_ms(
-        key,
-        inflated_pacing,
-        Some(key),
-        FlowLane::Throughput,
-        payload_bytes,
-        MuxLimits::default(),
-    );
-
-    assert!(
-        (baseline_eta - inflated_eta).abs() < 0.001,
-        "QUIC pacing is carrier send permission, not delivered product throughput"
-    );
-}
-
-#[test]
-fn response_subflow_eta_uses_owner_quantum_not_service_horizon() {
-    let service = CarrierPathKey {
-        underlay: UnderlayProtocol::Udp,
-        path_id: PathId(0),
-    };
-    let subflow = CarrierPathKey {
-        underlay: UnderlayProtocol::Udp,
-        path_id: PathId(1),
-    };
-    let mut snapshot = PathSnapshot::new(subflow.path_id, subflow.underlay, 80.0, 40_000_000.0);
-    snapshot.confidence = 1.0;
-
-    let eta_ms = server_bulk_output_eta_ms(
-        subflow,
-        snapshot,
-        Some(service),
-        FlowLane::Throughput,
-        64 * 1024,
-        MuxLimits::default(),
-    );
-
-    assert!(
-        eta_ms < 100.0,
-        "Subflow ETA must model the next assigned owner range, not a full Service horizon; got {eta_ms:.3}ms"
-    );
-}
-
-#[test]
-fn response_queue_pressure_is_shared_by_every_carrier_snapshot() {
-    let service = CarrierPathKey {
-        underlay: UnderlayProtocol::Tcp,
-        path_id: PathId(0),
-    };
-    let (service_commands, _service_receivers) = reliable_path_command_channels(8);
-    let binding = ResponseStreamBinding::new(
-        SessionId(42),
-        service.underlay,
-        service.path_id,
-        service_commands,
-        FlowLane::Throughput,
-    );
-    let product_queue_bytes = 48 * 1024;
-    binding.set_sender_queue_bytes(product_queue_bytes);
-
-    let alternate = CarrierPathKey {
-        underlay: UnderlayProtocol::Udp,
-        path_id: PathId(1),
-    };
-    let (alternate_commands, _alternate_receivers) = reliable_path_command_channels(8);
-    assert_eq!(
-        binding.attach(
-            alternate.underlay,
-            alternate.path_id,
-            alternate_commands,
-            FlowLane::Throughput,
-            StreamOpenRole::Validation,
-        ),
-        ResponseStreamAttachOutcome::Attached,
-    );
-
-    let targets = binding.sender_path_targets(FlowLane::Throughput, PATH_OPEN_SCORE_BYTES);
-    assert_eq!(targets.len(), 2);
-    assert!(targets.iter().all(|target| {
-        target.observation.snapshot.product_queue_bytes == product_queue_bytes as u64
-    }));
-}
-
-#[test]
-fn independent_source_staging_requires_live_mixed_owner_underlays() {
-    let (active_commands, active_receivers) = reliable_path_command_channels(8);
-    let binding = ResponseStreamBinding::new(
-        SessionId(42),
-        UnderlayProtocol::Tcp,
-        PathId(0),
-        active_commands,
-        FlowLane::Throughput,
-    );
-    let mut receivers = vec![active_receivers];
-    assert!(!binding.has_live_mixed_owner_underlays());
-    assert!(
-        !binding
-            .relay_read_snapshot(FlowLane::Throughput, PATH_OPEN_SCORE_BYTES)
-            .independent_source_staging
-    );
-    assert_eq!(
-        binding.owner_underlay_history.load(Ordering::Acquire),
-        RESPONSE_OWNER_TCP_SEEN
-    );
-
-    for (path_id, underlay, role, expected, expected_history) in [
-        (
-            1,
-            UnderlayProtocol::Tcp,
-            StreamOpenRole::Validation,
-            false,
-            RESPONSE_OWNER_TCP_SEEN,
-        ),
-        (
-            2,
-            UnderlayProtocol::Udp,
-            StreamOpenRole::Repair,
-            false,
-            RESPONSE_OWNER_TCP_SEEN,
-        ),
-        (
-            3,
-            UnderlayProtocol::Udp,
-            StreamOpenRole::Validation,
-            true,
-            RESPONSE_OWNER_MIXED_SEEN,
-        ),
-    ] {
-        let (commands, output_receivers) = reliable_path_command_channels(8);
-        assert_eq!(
-            binding.attach(
-                underlay,
-                PathId(path_id),
-                commands,
-                FlowLane::Throughput,
-                role,
-            ),
-            ResponseStreamAttachOutcome::Attached,
-        );
-        assert_eq!(
-            binding.has_live_mixed_owner_underlays(),
-            expected,
-            "only a live owner-capable cross-underlay output enables independent raw staging",
-        );
-        assert_eq!(
-            binding
-                .relay_read_snapshot(FlowLane::Throughput, PATH_OPEN_SCORE_BYTES)
-                .independent_source_staging,
-            expected,
-            "the composite relay snapshot must use the same live-family policy",
-        );
-        assert_eq!(
-            binding.owner_underlay_history.load(Ordering::Acquire),
-            expected_history,
-            "Repair-only attachments must retain the single-family fast path",
-        );
-        receivers.push(output_receivers);
+        peer_usage: None,
+        peer_usage_sequence: None,
     }
 }
 
-#[test]
-fn response_relay_read_snapshot_keeps_source_evidence_on_the_ordered_service() {
-    let session_id = SessionId(42);
-    let lane_tracker = Arc::new(ServerPathLaneTracker::default());
-    let service = CarrierPathKey {
-        underlay: UnderlayProtocol::Tcp,
-        path_id: PathId(0),
-    };
-    let (service_commands, _service_receivers) = reliable_path_command_channels(8);
-    let binding = ResponseStreamBinding::new_with_limits_and_tracker(
-        session_id,
-        service.underlay,
-        service.path_id,
-        service_commands,
-        FlowLane::Throughput,
-        MuxLimits::default(),
-        lane_tracker.clone(),
-    );
-    let alternate = CarrierPathKey {
-        underlay: UnderlayProtocol::Udp,
-        path_id: PathId(1),
-    };
-    let (alternate_commands, _alternate_receivers) = reliable_path_command_channels(8);
-    let alternate_commands_for_detach = alternate_commands.clone();
-    assert_eq!(
-        binding.attach(
-            alternate.underlay,
-            alternate.path_id,
-            alternate_commands,
-            FlowLane::Throughput,
-            StreamOpenRole::Validation,
-        ),
-        ResponseStreamAttachOutcome::Attached,
-    );
-    let (latency_commands, _latency_receivers) = reliable_path_command_channels(8);
-    let _alternate_latency_flow = ResponseStreamBinding::new_with_limits_and_tracker(
-        session_id,
-        alternate.underlay,
-        alternate.path_id,
-        latency_commands,
-        FlowLane::Latency,
-        MuxLimits::default(),
-        lane_tracker,
-    );
-    {
-        let mut outputs = binding.outputs.lock().expect("test response outputs lock");
-        let service_entry = outputs
-            .entries
-            .iter_mut()
-            .find(|entry| entry.key == service)
-            .expect("ordered Service output");
-        service_entry.delivery_rate_bps = Some(1_000_000.0);
-        service_entry.srtt_ms = Some(500.0);
-        service_entry.delivery_samples = 1;
-    }
-    binding.update_path_metrics(
-        alternate,
-        PathMetrics {
-            path_id: alternate.path_id,
-            underlay: alternate.underlay,
+fn path_metrics(
+    key: CarrierPathKey,
+    source: ServerPathMetricsSource,
+    srtt_us: u32,
+    delivery_rate_bps: u64,
+    pacing_rate_bps: u64,
+) -> ServerPathMetricsEntry {
+    ServerPathMetricsEntry {
+        source,
+        recorded_at: Instant::now(),
+        capacity_proof: None,
+        metrics: PathMetrics {
+            path_id: key.path_id,
+            underlay: key.underlay,
             direction: PathMetricDirection::ServerToClient,
-            metric_epoch: metric_epoch_now(),
+            metric_epoch: 1,
             metric_age_us: 0,
-            srtt_us: 5_000,
-            rttvar_us: 500,
-            jitter_us: 500,
-            delivery_rate_bps: 1_000_000_000,
-            pacing_rate_bps: 1_000_000_000,
+            srtt_us,
+            rttvar_us: srtt_us / 4,
+            jitter_us: srtt_us / 10,
+            delivery_rate_bps,
+            pacing_rate_bps,
             loss_ppm: 0,
             ecn_ppm: 0,
             loss_observed: false,
             ecn_observed: false,
-            bytes_in_flight: 0,
+            bytes_in_flight: PATH_OPEN_SCORE_BYTES as u64,
             queue_bytes: 0,
-            inflight_limit_bytes: PATH_OPEN_SCORE_BYTES as u64,
-            inflight_hi_bytes: PATH_OPEN_SCORE_BYTES as u64,
+            inflight_limit_bytes: (PATH_OPEN_SCORE_BYTES * 4) as u64,
+            inflight_hi_bytes: (PATH_OPEN_SCORE_BYTES * 4) as u64,
             confidence_ppm: 1_000_000,
             app_limited: false,
             has_ack_derived_data_sample: true,
             data_sample_count: RELIABLE_INITIAL_WINDOW_PACKETS as u32,
-            data_sample_bytes: RELIABLE_STREAM_STARTUP_PRODUCT_WINDOW_BYTES,
+            data_sample_bytes: (PATH_OPEN_SCORE_BYTES * 4) as u64,
         },
-        ServerPathMetricsSource::LocalSender,
-    );
-
-    let before = binding.relay_read_snapshot(FlowLane::Throughput, PATH_OPEN_SCORE_BYTES);
-    assert!(before.send_path.is_some_and(|path| {
-        path.id == alternate.path_id && path.underlay == alternate.underlay
-    }));
-    assert_eq!(
-        before
-            .send_path
-            .expect("faster alternate send path")
-            .active_latency_sensitive_flows,
-        1
-    );
-    before
-        .source_service
-        .expect("live ordered Service snapshot");
-    assert!(
-        binding
-            .sender_path_targets(FlowLane::Throughput, PATH_OPEN_SCORE_BYTES)
-            .into_iter()
-            .find(|target| target.observation.key == service)
-            .is_some_and(|target| !target.observation.has_bulk_rate_evidence)
-    );
-    assert!(before.independent_source_staging);
-
-    {
-        let mut outputs = binding.outputs.lock().expect("test response outputs lock");
-        let service_entry = outputs
-            .entries
-            .iter_mut()
-            .find(|entry| entry.key == service)
-            .expect("ordered Service output");
-        service_entry.product_progress_rate_bps = Some(1_000_000.0);
-        service_entry.owner_data_acked_bytes =
-            reliable_subflow_startup_sample_limit_bytes(binding.mux_limits());
     }
-    let after = binding.relay_read_snapshot(FlowLane::Throughput, PATH_OPEN_SCORE_BYTES);
-    let source = after.source_service.expect("live ordered Service snapshot");
-    assert!(
-        binding
-            .sender_path_targets(FlowLane::Throughput, PATH_OPEN_SCORE_BYTES)
-            .into_iter()
-            .find(|target| target.observation.key == service)
-            .is_some_and(|target| target.observation.has_bulk_rate_evidence)
-    );
-    assert_eq!(source.active_latency_sensitive_flows, 0);
-    assert_eq!(
-        reliable_relay_source_staging_owner_tail_headroom(
-            ReliableSourceStagingContext {
-                independent: after.independent_source_staging,
-                service: Some(ReliableSourceServiceStagingContext {
-                    allows_product_envelope: true,
-                    has_latency_pressure: source.active_latency_sensitive_flows > 0,
-                    has_feed_evidence: source.has_service_feed_evidence,
-                }),
-            },
-            FlowLane::Throughput,
-            0,
-            0,
-            reliable_bulk_carrier_feed_quantum_bytes(MuxLimits::default()),
-            MuxLimits::default(),
-        ),
-        bulk_service_feed_reservoir_payload_bytes(
-            reliable_bulk_carrier_feed_quantum_bytes(MuxLimits::default()),
-            MuxLimits::default(),
-        ),
-        "alternate-path latency pressure must not narrow exact-Service source staging"
-    );
-    binding.detach(alternate, &alternate_commands_for_detach);
-    assert!(
-        !binding
-            .relay_read_snapshot(FlowLane::Throughput, PATH_OPEN_SCORE_BYTES)
-            .independent_source_staging,
-        "mixed-family source staging must end when the alternate family detaches"
-    );
 }
 
 #[test]
-fn udp_product_progress_matures_only_current_service_feed() {
-    let service = CarrierPathKey {
-        underlay: UnderlayProtocol::Udp,
+fn snapshot_projects_exact_command_product_queue_and_data_flight_bytes() {
+    let key = CarrierPathKey {
+        underlay: UnderlayProtocol::Tcp,
         path_id: PathId(0),
     };
-    let (service_commands, _service_receivers) = reliable_path_command_channels(8);
+    let (commands, _receivers) = reliable_path_command_channels(8);
     let binding = ResponseStreamBinding::new(
         SessionId(42),
-        service.underlay,
-        service.path_id,
-        service_commands,
-        FlowLane::Throughput,
+        key.underlay,
+        key.path_id,
+        commands.clone(),
+        TrafficClass::Throughput,
     );
-    {
-        let mut outputs = binding.outputs.lock().expect("test response outputs lock");
-        let service_entry = outputs
-            .entries
-            .iter_mut()
-            .find(|entry| entry.key == service)
-            .expect("ordered Service output");
-        service_entry.product_progress_rate_bps = Some(100_000_000.0);
-        service_entry.delivery_rate_bps = Some(100_000_000.0);
-        service_entry.srtt_ms = Some(20.0);
-        service_entry.delivery_samples = u32::MAX;
-        service_entry.owner_data_acked_bytes = u64::MAX;
-    }
-
-    let read = binding.relay_read_snapshot(FlowLane::Throughput, PATH_OPEN_SCORE_BYTES);
-    let source = read.source_service.expect("live ordered Service snapshot");
-    let send_path = read.send_path.expect("single live Service send snapshot");
-    assert_eq!(send_path.confidence, 1.0);
-    assert!(send_path.product_progress_rate_bps.is_some());
-    assert!(
-        source.has_service_feed_evidence,
-        "substantial uniquely owned product ACKs may release current-Service staging"
-    );
-    assert!(
-        binding
-            .sender_path_targets(FlowLane::Throughput, PATH_OPEN_SCORE_BYTES)
-            .into_iter()
-            .find(|target| target.observation.key == service)
-            .is_some_and(|target| !target.observation.has_bulk_rate_evidence),
-        "product ACK timing must not mint optional QUIC placement authority"
-    );
-}
-
-#[test]
-fn udp_app_limited_carrier_progress_feeds_only_the_current_service() {
-    let mux_limits = MuxLimits::default();
-    let service = CarrierPathKey {
-        underlay: UnderlayProtocol::Udp,
-        path_id: PathId(0),
-    };
-    let (service_commands, _service_receivers) = reliable_path_command_channels(8);
-    let binding = ResponseStreamBinding::new(
-        SessionId(42),
-        service.underlay,
-        service.path_id,
-        service_commands,
-        FlowLane::Throughput,
-    );
-    let mut entry = output_entry_for_key(&binding, service);
-    mark_test_quic_output_carrier_bulk_proven(&mut entry, mux_limits);
-    let metrics = PathMetrics {
-        app_limited: true,
-        ..entry
-            .local_path_metrics
-            .expect("test QUIC sender metrics")
-            .metrics
-    };
-    binding.update_path_metrics(service, metrics, ServerPathMetricsSource::LocalSender);
-
-    let read = binding.relay_read_snapshot(FlowLane::Throughput, PATH_OPEN_SCORE_BYTES);
-    let source = read.source_service.expect("current response Service");
-    assert!(source.has_service_feed_evidence);
+    let frame = stream_data_frame_at(0, 4_096);
+    binding.record_original_flight(key, &frame);
+    commands
+        .try_enqueue_stream_ordered_frame(frame, TrafficClass::Throughput)
+        .expect("test carrier queue accepts data");
+    binding.set_sender_queue_bytes(2_048);
 
     let target = binding
-        .sender_path_targets(FlowLane::Throughput, PATH_OPEN_SCORE_BYTES)
+        .sender_path_targets(TrafficClass::Throughput, PATH_OPEN_SCORE_BYTES)
         .into_iter()
-        .find(|target| target.observation.key == service)
-        .expect("current Service sender target");
-    assert!(target.observation.is_service);
-    assert!(
-        !target.observation.has_bulk_rate_evidence,
-        "an app-limited sample must not authorize optional placement"
+        .next()
+        .expect("live response target");
+    assert_eq!(target.observation.original_data_in_flight_bytes, 4_096);
+    assert_eq!(target.observation.snapshot.queue_bytes, 4_096);
+    assert_eq!(target.observation.snapshot.data_level_queue_bytes, 2_048);
+    assert_eq!(
+        target.observation.snapshot.data_level_bytes_in_flight,
+        4_096
     );
-    assert!(target.observation.has_service_feed_evidence);
-    assert!(!target.observation.has_bulk_rate_evidence);
+}
 
-    let alternate = CarrierPathKey {
-        underlay: UnderlayProtocol::Udp,
+#[test]
+fn tcp_data_ack_goodput_precedes_native_path_capacity() {
+    let key = CarrierPathKey {
+        underlay: UnderlayProtocol::Tcp,
         path_id: PathId(1),
     };
-    let (alternate_commands, _alternate_receivers) = reliable_path_command_channels(8);
-    assert_eq!(
-        binding.attach(
-            alternate.underlay,
-            alternate.path_id,
-            alternate_commands,
-            FlowLane::Throughput,
-            StreamOpenRole::Validation,
-        ),
-        ResponseStreamAttachOutcome::Attached
-    );
-    let mut alternate_entry = binding
-        .outputs
-        .lock()
-        .expect("test response outputs lock")
-        .entries
-        .iter()
-        .find(|entry| entry.key == alternate)
-        .expect("Validation output")
-        .clone();
-    mark_test_quic_output_carrier_bulk_proven(&mut alternate_entry, mux_limits);
-    let alternate_metrics = PathMetrics {
-        app_limited: true,
-        ..alternate_entry
-            .local_path_metrics
-            .expect("alternate QUIC sender metrics")
-            .metrics
-    };
-    binding.update_path_metrics(
-        alternate,
-        alternate_metrics,
+    let (commands, _receivers) = reliable_path_command_channels(8);
+    let mut entry = output_entry(key, commands);
+    entry.product_progress_rate_bps = Some(80_000_000.0);
+    entry.delivery_rate_bps = Some(70_000_000.0);
+    entry.local_path_metrics = Some(path_metrics(
+        key,
         ServerPathMetricsSource::LocalSender,
+        12_000,
+        500_000_000,
+        600_000_000,
+    ));
+
+    let snapshot =
+        server_bulk_output_snapshot(&entry, 0, TrafficClass::Throughput, MuxLimits::default());
+    assert_eq!(snapshot.delivery_rate_bps, 80_000_000.0);
+    assert_eq!(snapshot.rate_scope, PathRateScope::PerFlowGoodput);
+    assert_eq!(snapshot.pacing_rate_bps, 600_000_000.0);
+}
+
+#[test]
+fn quic_native_path_capacity_precedes_product_goodput() {
+    let key = CarrierPathKey {
+        underlay: UnderlayProtocol::Udp,
+        path_id: PathId(2),
+    };
+    let (commands, _receivers) = reliable_path_command_channels(8);
+    let mut entry = output_entry(key, commands);
+    entry.product_progress_rate_bps = Some(80_000_000.0);
+    entry.delivery_rate_bps = Some(70_000_000.0);
+    entry.local_path_metrics = Some(path_metrics(
+        key,
+        ServerPathMetricsSource::LocalSender,
+        14_000,
+        500_000_000,
+        600_000_000,
+    ));
+
+    let snapshot =
+        server_bulk_output_snapshot(&entry, 0, TrafficClass::Throughput, MuxLimits::default());
+    assert_eq!(snapshot.delivery_rate_bps, 500_000_000.0);
+    assert_eq!(snapshot.rate_scope, PathRateScope::PathCapacity);
+    assert_eq!(snapshot.pacing_rate_bps, 600_000_000.0);
+}
+
+#[test]
+fn peer_hint_is_used_only_until_local_evidence_arrives() {
+    let key = CarrierPathKey {
+        underlay: UnderlayProtocol::Udp,
+        path_id: PathId(3),
+    };
+    let (commands, _receivers) = reliable_path_command_channels(8);
+    let mut entry = output_entry(key, commands);
+    entry.peer_path_metrics = Some(path_metrics(
+        key,
+        ServerPathMetricsSource::PeerHint,
+        9_000,
+        330_000_000,
+        440_000_000,
+    ));
+
+    let hinted =
+        server_bulk_output_snapshot(&entry, 0, TrafficClass::Throughput, MuxLimits::default());
+    assert_eq!(hinted.srtt_ms, 9.0);
+    assert_eq!(hinted.delivery_rate_bps, 330_000_000.0);
+
+    entry.local_path_metrics = Some(path_metrics(
+        key,
+        ServerPathMetricsSource::LocalSender,
+        35_000,
+        110_000_000,
+        120_000_000,
+    ));
+    let local =
+        server_bulk_output_snapshot(&entry, 0, TrafficClass::Throughput, MuxLimits::default());
+    assert_eq!(local.srtt_ms, 35.0);
+    assert_eq!(local.delivery_rate_bps, 110_000_000.0);
+
+    entry.local_path_metrics = None;
+    entry.delivery_samples = 1;
+    entry.product_progress_rate_bps = Some(77_000_000.0);
+    entry.srtt_ms = Some(55.0);
+    let learned =
+        server_bulk_output_snapshot(&entry, 0, TrafficClass::Throughput, MuxLimits::default());
+    assert_eq!(learned.srtt_ms, 55.0);
+    assert_eq!(learned.delivery_rate_bps, 77_000_000.0);
+    assert_eq!(learned.rate_scope, PathRateScope::PerFlowGoodput);
+}
+
+#[test]
+fn best_live_path_uses_completion_score_including_command_queue() {
+    let queued_key = CarrierPathKey {
+        underlay: UnderlayProtocol::Tcp,
+        path_id: PathId(4),
+    };
+    let clear_key = CarrierPathKey {
+        underlay: UnderlayProtocol::Tcp,
+        path_id: PathId(5),
+    };
+    let (queued_commands, _queued_receivers) = reliable_path_command_channels(8);
+    let (clear_commands, _clear_receivers) = reliable_path_command_channels(8);
+    let mut queued = output_entry(queued_key, queued_commands.clone());
+    queued.product_progress_rate_bps = Some(400_000_000.0);
+    queued.srtt_ms = Some(5.0);
+    queued.delivery_samples = RELIABLE_INITIAL_WINDOW_PACKETS as u32;
+    queued_commands
+        .try_enqueue_stream_ordered_frame(
+            stream_data_frame(2 * 1024 * 1024),
+            TrafficClass::Throughput,
+        )
+        .expect("test carrier queue accepts data");
+    let mut clear = output_entry(clear_key, clear_commands);
+    clear.product_progress_rate_bps = Some(100_000_000.0);
+    clear.srtt_ms = Some(25.0);
+    clear.delivery_samples = RELIABLE_INITIAL_WINDOW_PACKETS as u32;
+    let outputs = ResponseStreamOutputs {
+        entries: vec![queued, clear],
+        data_level_queue_bytes: 0,
+    };
+
+    let best = outputs
+        .best_live_path_snapshot(
+            TrafficClass::Throughput,
+            PATH_OPEN_SCORE_BYTES,
+            MuxLimits::default(),
+        )
+        .expect("one path is schedulable");
+    assert_eq!(best.id, clear_key.path_id);
+}
+
+#[test]
+fn best_live_path_uses_peer_available_before_faster_backup() {
+    let available_key = CarrierPathKey {
+        underlay: UnderlayProtocol::Tcp,
+        path_id: PathId(9),
+    };
+    let backup_key = CarrierPathKey {
+        underlay: UnderlayProtocol::Udp,
+        path_id: PathId(10),
+    };
+    let (available_commands, _available_receivers) = reliable_path_command_channels(8);
+    let (backup_commands, _backup_receivers) = reliable_path_command_channels(8);
+    let mut available = output_entry(available_key, available_commands);
+    available.product_progress_rate_bps = Some(10_000_000.0);
+    available.srtt_ms = Some(100.0);
+    let mut backup = output_entry(backup_key, backup_commands);
+    backup.product_progress_rate_bps = Some(1_000_000_000.0);
+    backup.srtt_ms = Some(1.0);
+    backup.peer_usage = Some(PathUsage::Backup);
+    let outputs = ResponseStreamOutputs {
+        entries: vec![backup, available],
+        data_level_queue_bytes: 0,
+    };
+
+    let best = outputs
+        .best_live_path_snapshot(
+            TrafficClass::Throughput,
+            PATH_OPEN_SCORE_BYTES,
+            MuxLimits::default(),
+        )
+        .expect("one available path");
+    assert_eq!(best.id, available_key.path_id);
+}
+
+#[test]
+fn confidence_and_durable_progress_use_explicit_sample_thresholds() {
+    let mux_limits = MuxLimits::default();
+    let key = CarrierPathKey {
+        underlay: UnderlayProtocol::Tcp,
+        path_id: PathId(6),
+    };
+    let (commands, _receivers) = reliable_path_command_channels(8);
+    let mut entry = output_entry(key, commands);
+    entry.product_progress_rate_bps = Some(100_000_000.0);
+    entry.delivery_samples = (RELIABLE_INITIAL_WINDOW_PACKETS as u32).saturating_sub(1);
+    assert!(server_output_confidence(&entry) < 1.0);
+    entry.delivery_samples = RELIABLE_INITIAL_WINDOW_PACKETS as u32;
+    assert_eq!(server_output_confidence(&entry), 1.0);
+
+    let sample_floor = reliable_path_startup_sample_limit_bytes(mux_limits);
+    let accounting_slack = (PATH_OPEN_SCORE_BYTES as u64).min(sample_floor / 8);
+    assert!(sample_floor > accounting_slack);
+    entry.original_data_acked_bytes = sample_floor - accounting_slack - 1;
+    let immature = server_bulk_output_snapshot(&entry, 0, TrafficClass::Throughput, mux_limits);
+    assert!(!immature.has_durable_product_progress);
+    assert!(!server_output_has_bulk_rate_evidence(&entry, mux_limits));
+
+    entry.original_data_acked_bytes = sample_floor - accounting_slack;
+    let mature = server_bulk_output_snapshot(&entry, 0, TrafficClass::Throughput, mux_limits);
+    assert!(mature.has_durable_product_progress);
+    assert!(server_output_has_bulk_rate_evidence(&entry, mux_limits));
+}
+
+#[test]
+fn closed_outputs_are_excluded_from_key_and_best_path_snapshots() {
+    let closed_key = CarrierPathKey {
+        underlay: UnderlayProtocol::Tcp,
+        path_id: PathId(7),
+    };
+    let live_key = CarrierPathKey {
+        underlay: UnderlayProtocol::Tcp,
+        path_id: PathId(8),
+    };
+    let (closed_commands, closed_receivers) = reliable_path_command_channels(8);
+    let (live_commands, _live_receivers) = reliable_path_command_channels(8);
+    let mut closed = output_entry(closed_key, closed_commands);
+    closed.product_progress_rate_bps = Some(1_000_000_000.0);
+    closed.srtt_ms = Some(1.0);
+    let mut live = output_entry(live_key, live_commands);
+    live.product_progress_rate_bps = Some(10_000_000.0);
+    live.srtt_ms = Some(100.0);
+    drop(closed_receivers);
+    let outputs = ResponseStreamOutputs {
+        entries: vec![closed, live],
+        data_level_queue_bytes: 0,
+    };
+
+    assert!(
+        outputs
+            .snapshot_for_key(closed_key, TrafficClass::Throughput, MuxLimits::default())
+            .is_none()
     );
-    let alternate_target = binding
-        .sender_path_targets(FlowLane::Throughput, PATH_OPEN_SCORE_BYTES)
-        .into_iter()
-        .find(|target| target.observation.key == alternate)
-        .expect("Validation sender target");
-    assert!(!alternate_target.observation.is_service);
-    assert!(!alternate_target.observation.has_service_feed_evidence);
-    assert!(!alternate_target.observation.has_bulk_rate_evidence);
+    let best = outputs
+        .best_live_path_snapshot(
+            TrafficClass::Throughput,
+            PATH_OPEN_SCORE_BYTES,
+            MuxLimits::default(),
+        )
+        .expect("remaining live path");
+    assert_eq!(best.id, live_key.path_id);
 }

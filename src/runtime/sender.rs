@@ -4,9 +4,6 @@
 //! model vocabulary. Each direction owns its own state machine and dispatch
 //! transaction; neither TCP nor QUIC owns product offsets.
 
-#[cfg(test)]
-use super::*;
-
 mod queue;
 mod request;
 mod response;
@@ -26,8 +23,8 @@ pub(in crate::runtime) use request::{
 pub(in crate::runtime) use response::{ServerResponseSenderService, emit_response_control_frame};
 #[cfg(not(test))]
 pub(in crate::runtime) use work::{
-    CarrierEmitMode, RelaySendCause, ServerRepairOutputIdentity,
-    sender_extra_traffic_startup_floor_bytes, sender_repair_minimum_useful_attempt_bytes,
+    CarrierEmitMode, RelaySendCause, ServerReinjectionOutputIdentity,
+    sender_extra_traffic_startup_floor_bytes, sender_reinjection_minimum_useful_attempt_bytes,
 };
 
 #[cfg(test)]

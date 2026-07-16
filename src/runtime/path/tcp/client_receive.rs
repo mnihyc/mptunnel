@@ -8,7 +8,7 @@ use super::client_state::{ClientTcpPathConnection, ClientTcpPathSessionRuntime};
 use super::client_stream::{
     ClientTcpPathStreamState, expire_client_tcp_pending_opens, handle_client_tcp_stream_frame,
 };
-use crate::protocol::{Frame, PathId, PathMetricDirection, StreamId};
+use crate::protocol::{Frame, PathId, PathMetricDirection, StreamId, UnderlayProtocol};
 use crate::runtime::error::RuntimeError;
 use crate::runtime::path::proof::path_proof_ack_frame;
 use crate::runtime::recent_ids::RecentIdCache;
@@ -101,10 +101,45 @@ pub(super) async fn handle_client_tcp_path_frame(
         }
         Frame::Pong { nonce } => connection.carrier.complete_expected_heartbeat(nonce),
         Frame::PathStatus {
-            status: crate::protocol::PathStatus::Draining | crate::protocol::PathStatus::Failed,
-            ..
-        } => Err(RuntimeError::ReliablePathSessionClosed),
-        Frame::PathStatus { .. } => Ok(()),
+            path_id: status_path_id,
+            sequence,
+            usage,
+        } if status_path_id == path_id => {
+            if runtime.state.update_peer_path_usage(
+                UnderlayProtocol::Tcp,
+                runtime.path_index,
+                connection.path_instance_id,
+                sequence,
+                usage,
+            ) {
+                connection.startup_snapshot.peer_usage = Some(usage);
+            }
+            Ok(())
+        }
+        Frame::PathStatus { .. } => Err(RuntimeError::Protocol(
+            "TCP path usage advertisement path mismatch",
+        )),
+        Frame::PeerStatusRequest { request_id } => {
+            let response =
+                connection
+                    .peer_status
+                    .response_frame(request_id, runtime.codec_limits, || {
+                        runtime.peer_status_snapshot.snapshot()
+                    });
+            connection.carrier.writer.write_frame(&response).await?;
+            connection.carrier.writer.flush().await?;
+            Ok(())
+        }
+        Frame::PeerStatusResponse {
+            request_id,
+            code,
+            paths,
+        } => {
+            let _ = connection
+                .peer_status
+                .receive_response(request_id, code, paths);
+            Ok(())
+        }
         Frame::SessionClose { reason } => Err(RuntimeError::RemoteClosed(reason)),
         Frame::PathDrain { .. } | Frame::PathClose { .. } => {
             Err(RuntimeError::ReliablePathSessionClosed)

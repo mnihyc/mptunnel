@@ -1,206 +1,40 @@
-//! Immutable binding views and scheduler projections over validated evidence.
-//! This module reads source models without reserving capacity or mutating scheduling state.
+//! Immutable response-path observations for connection scheduling.
+//!
+//! This module projects carrier metrics and exact Data-ACK flight into a common
+//! snapshot. It does not reserve queues, assign persistent path roles, or run a
+//! transport congestion controller.
 
 use super::ResponseStreamBinding;
 use super::attachment::{
     ResponseSenderPathTarget, ResponseStreamOutputEntry, ResponseStreamOutputs,
-    response_live_ordered_data_owner, response_outputs_have_live_mixed_owner_underlays,
 };
 use super::evidence::{
-    ServerPathMetricsEntry, ServerPathMetricsSource, server_output_local_path_metrics,
-    server_output_quic_capacity_proof_marker, server_path_metrics_bulk_sample_floor_bytes,
-    server_path_metrics_estimate_rate_bps, server_path_metrics_has_bulk_rate_evidence,
-    server_path_metrics_rate_bps, server_quic_capacity_proof, server_tcp_capacity_proof,
-    server_udp_path_metrics_has_durable_rate_estimate,
+    server_output_has_bulk_rate_evidence, server_output_has_durable_product_ack_progress,
+    server_output_local_path_metrics, server_path_metrics_estimate_rate_bps,
+    server_path_metrics_has_bulk_rate_evidence, server_quic_capacity_proof,
 };
-use super::session::{
-    ResponseServiceHandoffDrainReservation, ResponseSessionState, ServerPathLaneLoad,
-    ServerPathLaneTracker, ServerPathLaneTrackerState,
-};
-use super::subflow::{
-    server_output_accepts_service_capacity_prior, server_output_has_bulk_rate_evidence_with_limits,
-    server_output_has_durable_product_ack_progress, server_output_has_sender_evidence,
-    server_output_has_service_feed_evidence_with_limits,
-};
-use crate::model::admission::bulk_service_horizon_payload_bytes;
-use crate::model::capacity::{
-    PATH_OPEN_SCORE_BYTES, RELIABLE_INITIAL_WINDOW_PACKETS, adaptive_reliable_relay_inflight_bytes,
-    product_delivery_samples_override_startup_prior,
-};
+use crate::model::capacity::{PATH_OPEN_SCORE_BYTES, RELIABLE_INITIAL_WINDOW_PACKETS};
 use crate::model::path::CarrierPathKey;
-use crate::model::response::{ResponsePathObservation, ResponseServiceFamilyLoads};
-use crate::model::timing::transport_pto_from_snapshot;
+use crate::model::response::ResponsePathObservation;
 use crate::mux::MuxLimits;
-use crate::protocol::{SessionId, StreamOpenRole, UnderlayProtocol};
-use crate::runtime::path::model::{
-    default_path_rate_bps, default_path_srtt_ms, udp_reliable_stream_loss_repair_penalty_ms,
-};
-use crate::scheduler::{FlowLane, PathRateScope, PathSnapshot};
+use crate::protocol::{SessionId, UnderlayProtocol};
+use crate::runtime::path::model::{default_path_rate_bps, default_path_srtt_ms};
+use crate::scheduler::{PathRateScope, PathSnapshot, TrafficClass, path_is_backup, score_path};
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
-use std::time::Instant;
 use tokio::sync::Notify;
-
-#[derive(Debug, Clone, Copy)]
-pub(in crate::runtime) struct ResponseSessionSchedulingSnapshot {
-    pub(in crate::runtime) observed_at: Instant,
-    pub(in crate::runtime) generation: u64,
-    pub(in crate::runtime) active_response_flows: u32,
-    pub(in crate::runtime) service_family_loads: ResponseServiceFamilyLoads,
-    pub(in crate::runtime) tcp_capacity_probe_reserved: bool,
-    pub(in crate::runtime) quic_capacity_calibration_reserved: bool,
-    pub(in crate::runtime) quic_capacity_calibration_spent_bytes: u64,
-    pub(in crate::runtime) response_service_handoff_drain:
-        Option<ResponseServiceHandoffDrainReservation>,
-    pub(in crate::runtime) operation_maintenance_due: bool,
-}
-
-#[derive(Debug, Clone, Copy, Default)]
-pub(super) struct ServerResponsePathSchedulingSnapshot {
-    pub(super) path_load: ServerPathLaneLoad,
-    pub(super) session_load: ServerPathLaneLoad,
-    pub(super) quic_capacity_calibration_attempts: u8,
-}
-
-impl ServerPathLaneTrackerState {
-    fn response_path_scheduling_snapshot(
-        &self,
-        session_id: SessionId,
-        path: CarrierPathKey,
-        path_instance_id: crate::model::path::CarrierPathInstanceId,
-        session_load: ServerPathLaneLoad,
-    ) -> ServerResponsePathSchedulingSnapshot {
-        let path_load = self
-            .session(session_id)
-            .map(|session| session.load().response_service_path_load(path))
-            .unwrap_or_default();
-        let quic_capacity_calibration_attempts =
-            self.quic_capacity_calibration_attempts_for_path(session_id, path, path_instance_id);
-        ServerResponsePathSchedulingSnapshot {
-            path_load,
-            session_load,
-            quic_capacity_calibration_attempts,
-        }
-    }
-}
-
-impl ServerPathLaneTracker {
-    pub(super) fn response_scheduling_snapshot(
-        &self,
-        session_id: SessionId,
-    ) -> ResponseSessionSchedulingSnapshot {
-        let state = self.state.lock().expect("server path lane tracker lock");
-        let now = Instant::now();
-        let session = state.session(session_id);
-        let generation = session.map(ResponseSessionState::generation).unwrap_or(0);
-        let active_response_flows = session
-            .map(|session| session.load().active_response_flows())
-            .unwrap_or(0);
-        let service_family_loads = session
-            .map(|session| session.load().service_family_loads())
-            .unwrap_or_default();
-        ResponseSessionSchedulingSnapshot {
-            observed_at: now,
-            generation,
-            active_response_flows,
-            service_family_loads,
-            tcp_capacity_probe_reserved: session
-                .is_some_and(ResponseSessionState::tcp_capacity_probe_reserved),
-            quic_capacity_calibration_reserved: state
-                .quic_capacity_calibration_reserved(session_id),
-            quic_capacity_calibration_spent_bytes: state
-                .quic_capacity_calibration_spent_bytes(session_id),
-            response_service_handoff_drain: state.response_service_handoff_drain(session_id),
-            operation_maintenance_due: state
-                .quic_capacity_calibration_requires_maintenance_at(session_id, now)
-                || state.response_service_handoff_drain_requires_maintenance_at(session_id, now),
-        }
-    }
-
-    pub(super) fn response_path_scheduling_snapshot(
-        &self,
-        session_id: SessionId,
-        path: CarrierPathKey,
-        path_instance_id: crate::model::path::CarrierPathInstanceId,
-    ) -> ServerResponsePathSchedulingSnapshot {
-        let state = self.state.lock().expect("server path lane tracker lock");
-        let session_load = state
-            .session(session_id)
-            .map(|session| session.load().response_service_session_load())
-            .unwrap_or_default();
-        state.response_path_scheduling_snapshot(session_id, path, path_instance_id, session_load)
-    }
-
-    /// Reads one target set under one lock so load and attempt budgets share an epoch.
-    pub(super) fn response_path_scheduling_snapshots(
-        &self,
-        session_id: SessionId,
-        paths: impl IntoIterator<Item = (CarrierPathKey, crate::model::path::CarrierPathInstanceId)>,
-    ) -> Vec<ServerResponsePathSchedulingSnapshot> {
-        let state = self.state.lock().expect("server path lane tracker lock");
-        let session_load = state
-            .session(session_id)
-            .map(|session| session.load().response_service_session_load())
-            .unwrap_or_default();
-        paths
-            .into_iter()
-            .map(|(path, path_instance_id)| {
-                state.response_path_scheduling_snapshot(
-                    session_id,
-                    path,
-                    path_instance_id,
-                    session_load,
-                )
-            })
-            .collect()
-    }
-}
-
-#[derive(Debug, Clone, Copy)]
-pub(in crate::runtime) struct ResponseSourceServiceSnapshot {
-    pub(in crate::runtime) active_latency_sensitive_flows: u32,
-    pub(in crate::runtime) has_service_feed_evidence: bool,
-}
-
-#[derive(Debug, Clone, Copy)]
-pub(in crate::runtime) struct ResponseRelayReadSnapshot {
-    pub(in crate::runtime) send_path: Option<PathSnapshot>,
-    pub(in crate::runtime) source_service: Option<ResponseSourceServiceSnapshot>,
-    pub(in crate::runtime) independent_source_staging: bool,
-}
 
 impl ResponseStreamBinding {
     pub(in crate::runtime) fn send_path_snapshot(
         &self,
-        lane: FlowLane,
+        lane: TrafficClass,
         payload_bytes: usize,
     ) -> Option<PathSnapshot> {
-        self.relay_read_snapshot(lane, payload_bytes).send_path
-    }
-
-    pub(in crate::runtime) fn relay_read_snapshot(
-        &self,
-        lane: FlowLane,
-        payload_bytes: usize,
-    ) -> ResponseRelayReadSnapshot {
-        let may_have_mixed_owner_underlays = self.may_have_mixed_owner_underlays();
         let outputs = self
             .outputs
             .lock()
             .expect("server reliable stream binding lock");
-        let stored_service_key = *self
-            .ordered_data_owner
-            .lock()
-            .expect("server reliable stream ordered data owner lock");
-        outputs.relay_read_snapshot(
-            stored_service_key,
-            may_have_mixed_owner_underlays,
-            self.session_id,
-            &self.lane_tracker,
-            lane,
-            payload_bytes,
-            self.mux_limits,
-        )
+        outputs.best_live_path_snapshot(lane, payload_bytes, self.mux_limits)
     }
 
     pub(in crate::runtime::stream) fn capacity_notifies(&self) -> Vec<Arc<Notify>> {
@@ -218,132 +52,48 @@ impl ResponseStreamBinding {
         self.response_model_generation.load(Ordering::Acquire)
     }
 
-    pub(in crate::runtime) fn response_scheduling_snapshot(
-        &self,
-    ) -> ResponseSessionSchedulingSnapshot {
-        self.lane_tracker
-            .response_scheduling_snapshot(self.session_id)
-    }
-
-    pub(in crate::runtime) fn maintain_response_session_operations(&self) -> bool {
-        let changed = self
-            .lane_tracker
-            .maintain_response_session_operations(self.session_id);
-        if changed {
-            self.notify_update();
-        }
-        changed
-    }
-
     pub(in crate::runtime) fn sender_path_targets(
         &self,
-        lane: FlowLane,
-        payload_bytes: usize,
+        lane: TrafficClass,
+        _payload_bytes: usize,
     ) -> Vec<ResponseSenderPathTarget> {
-        let stored_active_key = self.ordered_data_owner();
         let outputs = self
             .outputs
             .lock()
             .expect("server reliable stream binding lock");
-        let request_active_key = *self
-            .request_active_owner
+        let request_feedback_ingress = *self
+            .request_feedback_ingress
             .lock()
-            .expect("server reliable stream request active owner lock");
-        let active_key = response_live_ordered_data_owner(stored_active_key, &outputs.entries);
-        let response_scheduling = self.lane_tracker.response_path_scheduling_snapshots(
-            self.session_id,
-            outputs
-                .entries
-                .iter()
-                .map(|entry| (entry.key, entry.path_instance_id)),
-        );
+            .expect("server reliable stream request feedback ingress lock");
+
         outputs
             .entries
             .iter()
-            .zip(response_scheduling)
-            .map(|(entry, response_scheduling)| {
-                let command_pending_bytes = entry.commands.pending_bytes();
-                let command_queue = entry.commands.queue_snapshot();
-                let calibration_identity = (entry.key, entry.incarnation);
-                let calibration = outputs
-                    .ack_clock_calibrations
-                    .get(&calibration_identity)
-                    .copied();
-                let response_snapshot = server_bulk_output_snapshot_with_scheduling(
+            .filter(|entry| !entry.commands.is_closed())
+            .map(|entry| {
+                let snapshot = server_bulk_output_snapshot(
                     entry,
-                    outputs.product_queue_bytes,
+                    outputs.data_level_queue_bytes,
                     lane,
                     self.mux_limits,
-                    command_pending_bytes,
-                    response_scheduling,
-                );
-                let snapshot = response_snapshot.path;
-                let is_active = Some(entry.key) == active_key;
-                let has_bulk_rate_evidence =
-                    server_output_has_bulk_rate_evidence_with_limits(entry, self.mux_limits);
-                let has_service_feed_evidence = has_bulk_rate_evidence
-                    || (is_active
-                        && server_output_has_service_feed_evidence_with_limits(
-                            entry,
-                            self.mux_limits,
-                        ));
-                let endpoint_only_service_prior_eligible =
-                    server_output_accepts_service_capacity_prior(entry);
-                #[cfg(feature = "lab-diagnostics")]
-                self.lab_response_service_feed_state(
-                    entry,
-                    snapshot,
-                    lane,
-                    is_active,
-                    has_bulk_rate_evidence,
-                    has_service_feed_evidence,
-                    command_pending_bytes,
                 );
                 ResponseSenderPathTarget {
-                    #[cfg(feature = "lab-diagnostics")]
-                    session_id: self.session_id,
-                    #[cfg(feature = "lab-diagnostics")]
-                    binding_instance_id: self.binding_instance_id,
                     observation: ResponsePathObservation {
                         key: entry.key,
                         path_instance_id: entry.path_instance_id,
                         incarnation: entry.incarnation,
-                        attachment_role: entry.role,
                         snapshot,
-                        owner_data_in_flight_bytes: entry.owner_data_in_flight_bytes,
-                        command_pending_bytes,
-                        eta_ms: server_bulk_output_eta_ms(
-                            entry.key,
-                            snapshot,
-                            active_key,
-                            lane,
-                            payload_bytes,
+                        original_data_in_flight_bytes: entry.original_data_in_flight_bytes,
+                        is_request_feedback: request_feedback_ingress.is_some_and(|ingress| {
+                            ingress.key == entry.key
+                                && ingress.path_instance_id == entry.path_instance_id
+                        }),
+                        has_bulk_rate_evidence: server_output_has_bulk_rate_evidence(
+                            entry,
                             self.mux_limits,
                         ),
-                        is_service: is_active,
-                        is_request_active: Some(entry.key) == request_active_key,
-                        has_sender_evidence: server_output_has_sender_evidence(entry),
-                        has_service_feed_evidence,
-                        has_bulk_rate_evidence,
                     },
-                    command_queue,
-                    tcp_capacity_probe_attempted: entry.commands.tcp_capacity_probe_attempted(),
-                    tcp_capacity_probe_active: entry.commands.tcp_capacity_probe_active(),
-                    endpoint_only_service_prior_eligible,
-                    quic_capacity_proof: server_output_quic_capacity_proof_marker(entry),
-                    quic_capacity_calibration_attempts: response_snapshot
-                        .quic_capacity_calibration_attempts,
-                    ack_clock_calibration_eligible: calibration.is_some(),
-                    ack_clock_calibration_proven: calibration
-                        .is_some_and(|calibration| calibration.proven),
-                    ack_clock_calibration_spent_bytes: calibration
-                        .map_or(0, |calibration| calibration.spent_bytes),
-                    ack_clock_calibration_credit_limit_bytes: calibration
-                        .map_or(0, |calibration| calibration.credit_limit_bytes),
-                    ack_clock_calibration_max_limit_bytes: calibration
-                        .map_or(0, |calibration| calibration.max_limit_bytes),
-                    ack_clock_calibration_active: outputs.active_ack_clock_calibration
-                        == Some(calibration_identity),
+                    command_queue: entry.commands.queue_snapshot(),
                 }
             })
             .collect()
@@ -351,27 +101,6 @@ impl ResponseStreamBinding {
 
     pub(in crate::runtime) fn mux_limits(&self) -> MuxLimits {
         self.mux_limits
-    }
-
-    pub(in crate::runtime) fn active_tcp_ack_clock_calibration_remaining_bytes(
-        &self,
-    ) -> Option<usize> {
-        let outputs = self
-            .outputs
-            .lock()
-            .expect("server reliable stream binding lock");
-        let identity = outputs.active_ack_clock_calibration?;
-        if identity.0.underlay != UnderlayProtocol::Tcp {
-            return None;
-        }
-        let calibration = outputs.ack_clock_calibrations.get(&identity)?;
-        if calibration.proven || calibration.retired {
-            return None;
-        }
-        let remaining = calibration
-            .credit_limit_bytes
-            .saturating_sub(calibration.spent_bytes);
-        (remaining > 0).then(|| usize::try_from(remaining).unwrap_or(usize::MAX))
     }
 
     pub(in crate::runtime) fn session_id(&self) -> SessionId {
@@ -383,385 +112,136 @@ impl ResponseStreamOutputs {
     pub(super) fn snapshot_for_key(
         &self,
         key: CarrierPathKey,
-        session_id: SessionId,
-        lane_tracker: &ServerPathLaneTracker,
-        lane: FlowLane,
+        lane: TrafficClass,
         mux_limits: MuxLimits,
     ) -> Option<PathSnapshot> {
         self.entries
             .iter()
-            .find(|entry| entry.key == key)
+            .find(|entry| entry.key == key && !entry.commands.is_closed())
             .map(|entry| {
-                server_bulk_output_snapshot(
-                    entry,
-                    self.product_queue_bytes,
-                    session_id,
-                    lane,
-                    lane_tracker,
-                    mux_limits,
-                )
+                server_bulk_output_snapshot(entry, self.data_level_queue_bytes, lane, mux_limits)
             })
     }
 
-    pub(super) fn read_backpressure_snapshot(
+    fn best_live_path_snapshot(
         &self,
-        active_key: Option<CarrierPathKey>,
-        session_id: SessionId,
-        lane_tracker: &ServerPathLaneTracker,
-        lane: FlowLane,
+        lane: TrafficClass,
         payload_bytes: usize,
         mux_limits: MuxLimits,
     ) -> Option<PathSnapshot> {
-        if !lane.is_bulk() {
-            return self.entries.last().map(|entry| {
-                server_bulk_output_snapshot(
-                    entry,
-                    self.product_queue_bytes,
-                    session_id,
-                    lane,
-                    lane_tracker,
-                    mux_limits,
-                )
-            });
-        }
-        self.entries
-            .iter()
-            .filter(|entry| {
-                Some(entry.key) == active_key || server_output_has_sender_evidence(entry)
-            })
-            .map(|entry| {
-                let snapshot = server_bulk_output_snapshot(
-                    entry,
-                    self.product_queue_bytes,
-                    session_id,
-                    lane,
-                    lane_tracker,
-                    mux_limits,
-                );
-                let eta_ms = server_bulk_output_eta_ms(
-                    entry.key,
-                    snapshot,
-                    active_key,
-                    lane,
-                    payload_bytes,
-                    mux_limits,
-                );
-                (eta_ms, snapshot)
-            })
-            .min_by(|left, right| left.0.total_cmp(&right.0))
-            .map(|(_, snapshot)| snapshot)
-    }
-
-    pub(super) fn relay_read_snapshot(
-        &self,
-        stored_service_key: Option<CarrierPathKey>,
-        may_have_mixed_owner_underlays: bool,
-        session_id: SessionId,
-        lane_tracker: &ServerPathLaneTracker,
-        lane: FlowLane,
-        payload_bytes: usize,
-        mux_limits: MuxLimits,
-    ) -> ResponseRelayReadSnapshot {
-        let service_key = response_live_ordered_data_owner(stored_service_key, &self.entries);
-        let send_path = self.read_backpressure_snapshot(
-            service_key,
-            session_id,
-            lane_tracker,
-            lane,
-            payload_bytes,
-            mux_limits,
-        );
-        let source_service = service_key.and_then(|key| {
+        let choose = |allow_backup: bool| {
             self.entries
                 .iter()
-                .find(|entry| {
-                    entry.key == key
-                        && entry.role != StreamOpenRole::Repair
-                        && !entry.commands.is_closed()
+                .filter(|entry| !entry.commands.is_closed())
+                .filter_map(|entry| {
+                    let snapshot = server_bulk_output_snapshot(
+                        entry,
+                        self.data_level_queue_bytes,
+                        lane,
+                        mux_limits,
+                    );
+                    (allow_backup || !path_is_backup(snapshot))
+                        .then(|| score_path(snapshot, lane, payload_bytes))
+                        .flatten()
+                        .map(|score| (score.eta_ms, snapshot))
                 })
-                .map(|entry| {
-                    // Source staging needs exact identity, local pressure, and
-                    // proof only. Avoid rebuilding an unused full path model
-                    // while the response outputs lock is held.
-                    let active_latency_sensitive_flows = send_path
-                        .filter(|path| path.id == key.path_id && path.underlay == key.underlay)
-                        .map(|path| path.active_latency_sensitive_flows)
-                        .unwrap_or_else(|| {
-                            lane_tracker
-                                .response_service_snapshot(session_id, key)
-                                .active_latency_sensitive_flows
-                        });
-                    ResponseSourceServiceSnapshot {
-                        active_latency_sensitive_flows,
-                        has_service_feed_evidence:
-                            server_output_has_service_feed_evidence_with_limits(entry, mux_limits),
-                    }
-                })
-        });
-        ResponseRelayReadSnapshot {
-            send_path,
-            source_service,
-            independent_source_staging: may_have_mixed_owner_underlays
-                && response_outputs_have_live_mixed_owner_underlays(&self.entries),
-        }
+                .min_by(|left, right| left.0.total_cmp(&right.0))
+                .map(|(_, snapshot)| snapshot)
+        };
+        choose(false).or_else(|| choose(true))
     }
-}
-
-#[derive(Debug, Clone, Copy)]
-pub(super) struct ResponseBulkOutputSnapshot {
-    pub(super) path: PathSnapshot,
-    pub(super) quic_capacity_calibration_attempts: u8,
 }
 
 pub(super) fn server_bulk_output_snapshot(
     entry: &ResponseStreamOutputEntry,
-    product_queue_bytes: u64,
-    session_id: SessionId,
-    lane: FlowLane,
-    lane_tracker: &ServerPathLaneTracker,
+    data_level_queue_bytes: u64,
+    _lane: TrafficClass,
     mux_limits: MuxLimits,
 ) -> PathSnapshot {
-    server_bulk_output_snapshot_with_command_pending(
-        entry,
-        product_queue_bytes,
-        session_id,
-        lane,
-        lane_tracker,
-        mux_limits,
-        entry.commands.pending_bytes(),
-    )
-    .path
-}
-
-pub(super) fn server_bulk_output_snapshot_with_command_pending(
-    entry: &ResponseStreamOutputEntry,
-    product_queue_bytes: u64,
-    session_id: SessionId,
-    lane: FlowLane,
-    lane_tracker: &ServerPathLaneTracker,
-    mux_limits: MuxLimits,
-    command_pending_bytes: u64,
-) -> ResponseBulkOutputSnapshot {
-    let response_scheduling = lane_tracker.response_path_scheduling_snapshot(
-        session_id,
-        entry.key,
-        entry.path_instance_id,
-    );
-    server_bulk_output_snapshot_with_scheduling(
-        entry,
-        product_queue_bytes,
-        lane,
-        mux_limits,
-        command_pending_bytes,
-        response_scheduling,
-    )
-}
-
-/// Combines output-local evidence with one caller-batched scheduling record.
-pub(super) fn server_bulk_output_snapshot_with_scheduling(
-    entry: &ResponseStreamOutputEntry,
-    product_queue_bytes: u64,
-    lane: FlowLane,
-    mux_limits: MuxLimits,
-    command_pending_bytes: u64,
-    response_scheduling: ServerResponsePathSchedulingSnapshot,
-) -> ResponseBulkOutputSnapshot {
-    let local_carrier_metrics = server_output_local_path_metrics(entry);
-    let peer_hint_metrics = (entry.delivery_samples == 0)
+    let local_metrics = server_output_local_path_metrics(entry);
+    let peer_hint = (entry.delivery_samples == 0)
         .then_some(entry.peer_path_metrics)
         .flatten();
-    let liveness_metrics = local_carrier_metrics.or(peer_hint_metrics);
-    let bulk_rate_metrics = local_carrier_metrics
-        .filter(|path_metrics| server_path_metrics_has_bulk_rate_evidence(*path_metrics));
+    let liveness_metrics = local_metrics.or(peer_hint);
+
     let srtt_ms = liveness_metrics.map_or_else(
-        || entry.srtt_ms.unwrap_or_else(|| default_path_srtt_ms()),
-        |path_metrics| f64::from(path_metrics.metrics.srtt_us.max(1)) / 1000.0,
+        || entry.srtt_ms.unwrap_or_else(default_path_srtt_ms),
+        |metrics| f64::from(metrics.metrics.srtt_us.max(1)) / 1000.0,
     );
-    let jitter_ms = liveness_metrics.map_or(0.0, |path_metrics| {
-        f64::from(path_metrics.metrics.jitter_us) / 1000.0
-    });
+    let jitter_ms =
+        liveness_metrics.map_or(0.0, |metrics| f64::from(metrics.metrics.jitter_us) / 1000.0);
     let loss_rate = liveness_metrics
-        .filter(|path_metrics| path_metrics.metrics.loss_observed)
-        .map_or(0.0, |path_metrics| {
-            f64::from(path_metrics.metrics.loss_ppm) / 1_000_000.0
+        .filter(|metrics| metrics.metrics.loss_observed)
+        .map_or(0.0, |metrics| {
+            f64::from(metrics.metrics.loss_ppm) / 1_000_000.0
         })
         .clamp(0.0, 1.0);
-    let peer_hint_rate_bps = peer_hint_metrics
-        .filter(|path_metrics| !path_metrics.metrics.app_limited)
-        .map(server_path_metrics_rate_bps);
-    let product_owner_rate_bps = (entry.key.underlay == UnderlayProtocol::Tcp)
-        .then_some(entry.product_progress_rate_bps)
-        .flatten()
-        .filter(|_| entry.delivery_samples > 0);
-    // QUIC keeps its carrier bandwidth estimate after placement proof expires.
-    // Use that estimate for pacing/ETA, while `bulk_rate_metrics` remains the
-    // separate authority that may admit or move a whole product flow.
-    let udp_carrier_estimate_bps = if entry.key.underlay == UnderlayProtocol::Udp {
-        local_carrier_metrics
-            .filter(|path_metrics| server_udp_path_metrics_has_durable_rate_estimate(*path_metrics))
-            .map(server_path_metrics_estimate_rate_bps)
-    } else {
-        None
+
+    let product_rate = entry
+        .product_progress_rate_bps
+        .or(entry.delivery_rate_bps)
+        .filter(|rate| rate.is_finite() && *rate > 0.0);
+    // Startup configuration is a prior, not measured carrier capacity. Only
+    // ACK-derived evidence may turn local metrics into a scheduling rate.
+    let native_rate = local_metrics
+        .filter(|metrics| server_path_metrics_has_bulk_rate_evidence(*metrics))
+        .map(server_path_metrics_estimate_rate_bps);
+    let peer_rate = peer_hint
+        .filter(|metrics| !metrics.metrics.app_limited)
+        .map(server_path_metrics_estimate_rate_bps);
+    let (rate_bps, rate_scope) = match entry.key.underlay {
+        UnderlayProtocol::Tcp if product_rate.is_some() => (
+            product_rate.expect("guarded product rate"),
+            PathRateScope::PerFlowGoodput,
+        ),
+        _ if native_rate.is_some() => (
+            native_rate.expect("guarded native rate"),
+            PathRateScope::PathCapacity,
+        ),
+        _ if peer_rate.is_some() => (
+            peer_rate.expect("guarded peer rate"),
+            PathRateScope::PathCapacity,
+        ),
+        _ if product_rate.is_some() => (
+            product_rate.expect("guarded product rate"),
+            PathRateScope::PerFlowGoodput,
+        ),
+        _ => (default_path_rate_bps(), PathRateScope::PathCapacity),
     };
-    let model_rate_bps = bulk_rate_metrics
-        .map(server_path_metrics_rate_bps)
-        .or(udp_carrier_estimate_bps);
-    let (prior_rate_bps, prior_rate_scope) = if let Some(rate_bps) = model_rate_bps {
-        (rate_bps, PathRateScope::PathCapacity)
-    } else if let Some(rate_bps) = peer_hint_rate_bps {
-        (rate_bps, PathRateScope::PathCapacity)
-    } else if let Some(rate_bps) = product_owner_rate_bps {
-        (rate_bps, PathRateScope::PerFlowGoodput)
-    } else {
-        (default_path_rate_bps(), PathRateScope::PathCapacity)
-    };
-    let (rate_bps, rate_scope) = match (
+
+    let mut snapshot = PathSnapshot::new(
+        entry.key.path_id,
         entry.key.underlay,
-        bulk_rate_metrics,
-        entry.delivery_rate_bps,
-        product_owner_rate_bps,
-    ) {
-        (_, Some(path_metrics), _, _) => (
-            server_path_metrics_rate_bps(path_metrics),
-            PathRateScope::PathCapacity,
-        ),
-        (UnderlayProtocol::Udp, None, _, _) => (prior_rate_bps, prior_rate_scope),
-        (UnderlayProtocol::Tcp, None, _, _) if entry.tcp_capacity_prior.is_some() => (
-            entry
-                .tcp_capacity_prior
-                .expect("guarded TCP capacity prior")
-                .rate_bps,
-            PathRateScope::PathCapacity,
-        ),
-        (UnderlayProtocol::Tcp, None, Some(rate), _)
-            if !product_delivery_samples_override_startup_prior(entry.delivery_samples) =>
-        {
-            if rate >= prior_rate_bps {
-                (rate, PathRateScope::PerFlowGoodput)
-            } else {
-                (prior_rate_bps, prior_rate_scope)
-            }
-        }
-        (UnderlayProtocol::Tcp, None, Some(rate), _) => (rate, PathRateScope::PerFlowGoodput),
-        (_, None, None, Some(rate)) => (rate, PathRateScope::PerFlowGoodput),
-        (_, None, None, None) => (prior_rate_bps, prior_rate_scope),
-    };
-    let rate_bps = rate_bps.max(1.0);
-    let mut snapshot = PathSnapshot::new(entry.key.path_id, entry.key.underlay, srtt_ms, rate_bps);
+        srtt_ms,
+        rate_bps.max(1.0),
+    );
     snapshot.rate_scope = rate_scope;
+    snapshot.policy = entry.local_policy;
+    snapshot.peer_usage = entry.peer_usage;
     snapshot.product_progress_rate_bps = entry.product_progress_rate_bps;
     snapshot.has_durable_product_progress =
         server_output_has_durable_product_ack_progress(entry, mux_limits);
     snapshot.jitter_ms = jitter_ms;
     snapshot.loss_rate = loss_rate;
-    if let Some(path_metrics) = local_carrier_metrics {
+    if let Some(metrics) = local_metrics {
         snapshot.pacing_rate_bps =
-            (path_metrics.metrics.pacing_rate_bps.max(1) as f64).max(snapshot.delivery_rate_bps);
-    }
-    if let Some(path_metrics) = liveness_metrics {
-        snapshot.app_limited = path_metrics.metrics.app_limited;
-    }
-    let metric_queue_bytes =
-        local_carrier_metrics.map_or(0, |path_metrics| path_metrics.metrics.queue_bytes);
-    snapshot.queue_bytes = metric_queue_bytes.saturating_add(command_pending_bytes);
-    snapshot.product_queue_bytes = product_queue_bytes;
-    snapshot.bytes_in_flight = match entry.key.underlay {
-        UnderlayProtocol::Udp => {
-            local_carrier_metrics.map_or(0, |path_metrics| path_metrics.metrics.bytes_in_flight)
-        }
-        // TCP does not expose packet-level carrier flight to the product layer.
-        // Product stream ranges waiting for STREAM_ACK remain in
-        // product_bytes_in_flight below; treating them as carrier flight makes
-        // the BBR-style send quantum collapse as soon as the product window is
-        // full even when the kernel TCP stream is healthy.
-        UnderlayProtocol::Tcp => 0,
-    };
-    snapshot.product_bytes_in_flight = entry.bytes_in_flight;
-    snapshot.inflight_limit_bytes = match entry.key.underlay {
-        UnderlayProtocol::Udp => local_carrier_metrics
-            .map_or(0, |path_metrics| path_metrics.metrics.inflight_limit_bytes),
-        UnderlayProtocol::Tcp => {
-            bulk_rate_metrics.map_or(0, |path_metrics| path_metrics.metrics.inflight_limit_bytes)
-        }
-    };
-    snapshot.confidence = server_output_confidence(entry);
-    // Response pressure follows product Service ownership. Control-plane Active
-    // attachment roles intentionally remain unchanged across a whole-flow
-    // handoff and therefore cannot describe the carrier doing response work.
-    let lane_load = response_scheduling.path_load;
-    let session_lane_load = response_scheduling.session_load;
-    snapshot.active_flows = lane_load.active_flows;
-    snapshot.active_latency_sensitive_flows = lane_load.active_latency_sensitive_flows;
-    snapshot.session_active_latency_sensitive_flows =
-        session_lane_load.active_latency_sensitive_flows;
-    let known_bulk_flows = lane_load
-        .active_flows
-        .saturating_sub(lane_load.active_latency_sensitive_flows);
-    if lane.is_bulk() && lane_load.active_latency_sensitive_flows > 0 && known_bulk_flows > 0 {
-        let latency_headroom =
-            adaptive_reliable_relay_inflight_bytes(Some(snapshot), FlowLane::Latency, mux_limits)
-                as u64;
-        let protected_queue =
-            latency_headroom.saturating_mul(u64::from(lane_load.active_latency_sensitive_flows));
-        snapshot.queue_bytes = snapshot.queue_bytes.saturating_add(protected_queue);
-    }
-    ResponseBulkOutputSnapshot {
-        path: snapshot,
-        quic_capacity_calibration_attempts: response_scheduling.quic_capacity_calibration_attempts,
-    }
-}
-
-pub(in crate::runtime) fn server_bulk_output_eta_ms(
-    key: CarrierPathKey,
-    snapshot: PathSnapshot,
-    active_key: Option<CarrierPathKey>,
-    lane: FlowLane,
-    payload_bytes: usize,
-    mux_limits: MuxLimits,
-) -> f64 {
-    let queued_bits = snapshot
-        .queue_bytes
-        .saturating_add(snapshot.product_queue_bytes)
-        .saturating_add(snapshot.bytes_in_flight)
-        .saturating_mul(8) as f64;
-    let scoring_payload_bytes =
-        if lane.is_bulk() && (active_key.is_none() || Some(key) == active_key) {
-            bulk_service_horizon_payload_bytes(payload_bytes, mux_limits)
-        } else {
-            payload_bytes
+            (metrics.metrics.pacing_rate_bps.max(1) as f64).max(snapshot.delivery_rate_bps);
+        snapshot.app_limited = metrics.metrics.app_limited;
+        snapshot.queue_bytes = metrics.metrics.queue_bytes;
+        snapshot.bytes_in_flight = match entry.key.underlay {
+            UnderlayProtocol::Udp => metrics.metrics.bytes_in_flight,
+            // Portable TCP telemetry does not expose packet flight in bytes.
+            UnderlayProtocol::Tcp => 0,
         };
-    let payload_bits = scoring_payload_bytes as f64 * 8.0;
-    let mut eta_ms = snapshot.srtt_ms / 2.0;
-    let effective_rate_bps = snapshot.delivery_rate_bps.max(1.0);
-    eta_ms += (queued_bits + payload_bits) / effective_rate_bps * 1000.0;
-    eta_ms += snapshot.jitter_ms;
-    eta_ms += response_loss_penalty_ms(snapshot);
-    if key.underlay == UnderlayProtocol::Udp && lane.is_bulk() {
-        eta_ms += udp_reliable_stream_loss_repair_penalty_ms(snapshot, payload_bytes);
+        snapshot.carrier_inflight_limit_bytes = metrics.metrics.inflight_limit_bytes;
     }
-    let uncertainty = 1.0 - snapshot.confidence.clamp(0.0, 1.0);
-    let pto_ms = transport_pto_from_snapshot(Some(snapshot)).as_secs_f64() * 1000.0;
-    eta_ms += uncertainty * pto_ms;
-    if Some(key) != active_key {
-        eta_ms += uncertainty * pto_ms;
-        if snapshot.bytes_in_flight > 0 {
-            eta_ms +=
-                (snapshot.bytes_in_flight as f64 * 8.0 / effective_rate_bps.max(1.0)) * 1000.0;
-        }
-    }
-    eta_ms
-}
-
-fn response_loss_penalty_ms(snapshot: PathSnapshot) -> f64 {
-    let loss = snapshot.loss_rate.clamp(0.0, 1.0);
-    if loss <= f64::EPSILON {
-        return 0.0;
-    }
-    let min_progress = PATH_OPEN_SCORE_BYTES as f64
-        / ((snapshot.delivery_rate_bps.max(1.0) / 8.0) * (snapshot.srtt_ms.max(1.0) / 1000.0))
-            .max(PATH_OPEN_SCORE_BYTES as f64);
-    let expected_repairs = loss / (1.0 - loss).max(min_progress);
-    expected_repairs * transport_pto_from_snapshot(Some(snapshot)).as_secs_f64() * 1000.0
+    snapshot.queue_bytes = snapshot
+        .queue_bytes
+        .saturating_add(entry.commands.pending_bytes());
+    snapshot.data_level_queue_bytes = data_level_queue_bytes;
+    snapshot.data_level_bytes_in_flight = entry.bytes_in_flight;
+    snapshot.confidence = server_output_confidence(entry);
+    snapshot
 }
 
 fn confidence_sample_denominator() -> f64 {
@@ -771,54 +251,28 @@ fn confidence_sample_denominator() -> f64 {
 pub(super) fn server_output_confidence(entry: &ResponseStreamOutputEntry) -> f64 {
     let delivery_confidence =
         (f64::from(entry.delivery_samples) / confidence_sample_denominator()).clamp(0.0, 1.0);
-    let metric_confidence = match server_output_local_path_metrics(entry) {
-        Some(
-            path_metrics @ ServerPathMetricsEntry {
-                source: ServerPathMetricsSource::LocalSender,
-                metrics,
-                ..
-            },
-        ) if metrics.has_ack_derived_data_sample
-            || metrics.confidence_ppm > 0
-            || server_quic_capacity_proof(path_metrics).is_some()
-            || server_tcp_capacity_proof(path_metrics).is_some() =>
-        {
-            let capacity_proof = server_quic_capacity_proof(path_metrics);
-            if let Some(proof) = capacity_proof {
-                // Receipt bytes are exact token evidence. Encoder record count
-                // is an integrity check, not a QUIC packet-sample population.
-                let receipt_confidence = (proof.received_bytes as f64
-                    / proof.sample_floor_bytes.max(1) as f64)
-                    .clamp(0.0, 1.0);
-                return delivery_confidence.max(receipt_confidence).clamp(0.0, 1.0);
-            }
-            if let Some(proof) = server_tcp_capacity_proof(path_metrics) {
-                let receipt_confidence =
-                    (proof.received_bytes as f64 / proof.train_bytes.max(1) as f64).clamp(0.0, 1.0);
-                return delivery_confidence.max(receipt_confidence).clamp(0.0, 1.0);
-            }
-            let source_confidence =
-                f64::from(metrics.confidence_ppm).clamp(0.0, 1_000_000.0) / 1_000_000.0;
-            let sample_bytes = metrics.data_sample_bytes;
-            let sample_count = u64::from(metrics.data_sample_count);
-            let sample_floor = server_path_metrics_bulk_sample_floor_bytes(metrics).max(1);
-            let byte_confidence = (sample_bytes as f64 / sample_floor as f64).clamp(0.0, 1.0);
-            let count_confidence =
-                (sample_count as f64 / confidence_sample_denominator()).clamp(0.0, 1.0);
-            let sample_confidence = byte_confidence.min(count_confidence);
-            if metrics.has_ack_derived_data_sample {
-                source_confidence * sample_confidence
-            } else {
-                source_confidence
-            }
-        }
-        Some(ServerPathMetricsEntry {
-            source: ServerPathMetricsSource::PeerHint,
-            ..
-        }) => 0.0,
-        _ => 0.0,
+    let Some(metrics) = server_output_local_path_metrics(entry) else {
+        return delivery_confidence;
     };
-    delivery_confidence.max(metric_confidence).clamp(0.0, 1.0)
+
+    if let Some(proof) = server_quic_capacity_proof(metrics) {
+        let proof_confidence =
+            (proof.received_bytes as f64 / proof.sample_floor_bytes.max(1) as f64).clamp(0.0, 1.0);
+        return delivery_confidence.max(proof_confidence);
+    }
+    let source_confidence =
+        f64::from(metrics.metrics.confidence_ppm).clamp(0.0, 1_000_000.0) / 1_000_000.0;
+    if !metrics.metrics.has_ack_derived_data_sample {
+        return delivery_confidence.max(source_confidence).clamp(0.0, 1.0);
+    }
+    let sample_floor = PATH_OPEN_SCORE_BYTES.max(1) as f64;
+    let byte_confidence = (metrics.metrics.data_sample_bytes as f64 / sample_floor).clamp(0.0, 1.0);
+    let count_confidence = (f64::from(metrics.metrics.data_sample_count)
+        / confidence_sample_denominator())
+    .clamp(0.0, 1.0);
+    delivery_confidence
+        .max(source_confidence * byte_confidence.min(count_confidence))
+        .clamp(0.0, 1.0)
 }
 
 #[cfg(test)]

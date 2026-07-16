@@ -16,7 +16,7 @@ const FRAME_LEN_BYTES: usize = 4;
 const QUIC_RECV_CHUNK_BYTES: usize = 64 * 1024;
 // Carrier recordization limit for length-prefixed STREAM_DATA frames written on
 // an ordered QUIC stream. This must not be confused with the product sender
-// quantum: product scheduling still emits the 64 KiB BBR service quantum, while
+// quantum: MPP scheduling still emits its bounded service quantum, while
 // this writer splits only the serialized records so a lost QUIC packet does not
 // withhold an entire product quantum from the peer.
 const QUIC_STREAM_RECORD_PAYLOAD_BYTES: usize = 10 * 1200;
@@ -82,7 +82,7 @@ pub struct RecvStream {
     // only through cancel-safe read() calls. Otherwise a cancelled frame read
     // can silently drop the already-consumed prefix and desynchronize the
     // length-prefixed mptunnel frame stream, which shows up as random stalls,
-    // repair storms, and bursty zero-throughput intervals on QUIC paths.
+    // reinjection storms, and bursty zero-throughput intervals on QUIC paths.
     read_buffer: BytesMut,
     read_scratch: Vec<u8>,
 }
@@ -157,7 +157,7 @@ pub async fn write_frames(
     // Publish before the awaited write. Quinn can ACK earlier chunks while
     // write_all is flow-controlled; publishing afterward loses attribution for
     // those ACKs. A failed write closes the path, so stale evidence cannot be
-    // reused by a live calibration target.
+    // reused by a live measurement target.
     if delivery_evidence_bytes > 0 {
         send.delivery_evidence_written
             .fetch_add(delivery_evidence_bytes, Ordering::Relaxed);

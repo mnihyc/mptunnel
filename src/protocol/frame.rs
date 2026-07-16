@@ -37,6 +37,45 @@ pub(crate) fn normalize_offset_ranges(mut ranges: Vec<OffsetRange>) -> Vec<Offse
     merged
 }
 
+/// Subtracts one normalized range set from another.
+///
+/// Flight ledgers use this to avoid reinjecting data that is already in flight
+/// on another path; transport recovery remains responsible for those copies.
+pub(crate) fn offset_ranges_not_covered(
+    ranges: &[OffsetRange],
+    covered: &[OffsetRange],
+) -> Vec<OffsetRange> {
+    let mut uncovered = Vec::new();
+    let mut covered_index = 0usize;
+    for range in ranges {
+        let mut cursor = range.start;
+        while covered_index < covered.len() && covered[covered_index].end <= cursor {
+            covered_index += 1;
+        }
+        let mut index = covered_index;
+        while index < covered.len() && covered[index].start < range.end {
+            let known = covered[index];
+            if known.start > cursor
+                && let Some(missing) = OffsetRange::new(cursor, known.start.min(range.end))
+            {
+                uncovered.push(missing);
+            }
+            cursor = cursor.max(known.end).min(range.end);
+            if cursor >= range.end {
+                break;
+            }
+            index += 1;
+        }
+        covered_index = index;
+        if cursor < range.end
+            && let Some(missing) = OffsetRange::new(cursor, range.end)
+        {
+            uncovered.push(missing);
+        }
+    }
+    uncovered
+}
+
 /// Returns the product-byte extent carried by a non-empty stream data frame.
 ///
 /// Datagram and capacity payloads have independent identity and accounting;

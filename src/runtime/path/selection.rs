@@ -7,7 +7,7 @@ use super::set::ClientPathContext;
 #[cfg(feature = "lab-diagnostics")]
 use crate::lab_diagnostics::lab_diagnostic;
 use crate::model::admission::{
-    BulkPathCandidate, bulk_service_horizon_payload_bytes, bulk_striping_admitted_candidates,
+    BulkPathCandidate, bulk_scheduling_horizon_bytes, bulk_striping_admitted_candidates,
 };
 use crate::model::capacity::{PATH_OPEN_SCORE_BYTES, relay_lane_startup_chunk_bytes};
 use crate::model::path::{RelayPathKey, RelayPathProofEpoch};
@@ -16,17 +16,17 @@ use crate::runtime::path::health::ClientPathHealthRecord;
 use crate::runtime::path::model::{
     ClientPathObservation, UdpPathCandidate, UdpPathRuntimeModel, apply_bulk_latency_isolation,
     bulk_candidate_has_bulk_rate_evidence, bulk_candidate_has_fresh_native_carrier_rate_evidence,
-    bulk_path_candidate, carrier_diverse_bulk_validation_order, configured_order_path_indices,
+    bulk_path_candidate, carrier_diverse_path_order, configured_order_path_indices,
     configured_order_path_scores, endpoint_only_reliable_startup_should_preserve_configured_order,
     health_observations, ordered_path_scores, ordered_path_scores_for_ttl,
     ordered_reliable_path_indices, path_allows_automatic_bulk_use, path_can_be_auto_discovered,
     path_is_endpoint_only, path_metrics_from_snapshot, path_snapshot, path_startup_snapshot,
     reliable_reservation_should_use_endpoint_only_startup_order, reliable_stream_path_candidates,
     udp_datagram_payload_limit_bytes, udp_observation_has_datagram_feedback,
-    udp_path_has_realtime_model, udp_reliable_stream_loss_repair_penalty_ms,
+    udp_path_has_realtime_model, udp_reliable_stream_loss_reinjection_penalty_ms,
 };
 use crate::runtime::path::state::RelayPathLoadLease;
-use crate::scheduler::{self, FlowLane, PathSnapshot, PathState as SchedulerPathState};
+use crate::scheduler::{self, PathSnapshot, PathState as SchedulerPathState, TrafficClass};
 use crate::transport::RateHint;
 use smallvec::SmallVec;
 use std::time::Instant;
@@ -54,7 +54,6 @@ pub(in crate::runtime) struct ReliableRequestTcpPathEvidence {
 pub(in crate::runtime) struct ReliableRequestPathBatchObservation {
     pub(in crate::runtime) paths: SmallVec<[ReliableRequestPathEvidence; 4]>,
     pub(in crate::runtime) bulk_candidates: SmallVec<[BulkPathCandidate; 4]>,
-    pub(in crate::runtime) active_tcp_service_bulk_flows: u32,
     pub(in crate::runtime) latency_pressure: bool,
 }
 
@@ -90,7 +89,7 @@ impl ClientPathContext {
 
     pub(in crate::runtime) fn ordered_tcp_path_indices(
         &self,
-        lane: FlowLane,
+        lane: TrafficClass,
         payload_bytes: usize,
     ) -> Vec<usize> {
         let observations = self.tcp_health_observations_for_lane(lane);
@@ -112,7 +111,7 @@ impl ClientPathContext {
     pub(in crate::runtime) fn try_reserve_relay_path_load_if_unchanged(
         &self,
         key: RelayPathKey,
-        lane: FlowLane,
+        lane: TrafficClass,
         expected_active_flows: u32,
         expected_active_latency_sensitive_flows: u32,
     ) -> Option<RelayPathLoadLease> {
@@ -121,9 +120,7 @@ impl ClientPathContext {
             UnderlayProtocol::Tcp => &mut health.tcp,
             UnderlayProtocol::Udp => &mut health.udp,
         };
-        let Some(current) = records.get_mut(key.index) else {
-            return None;
-        };
+        let current = records.get_mut(key.index)?;
         // Topology and carrier credit are revalidated by the sender. This
         // conditional claim fences only the shared load that influenced the
         // score; a still-attached Suspect path remains usable as before.
@@ -139,7 +136,7 @@ impl ClientPathContext {
 
     pub(in crate::runtime) fn reserve_reliable_stream_path(
         &self,
-        lane: FlowLane,
+        lane: TrafficClass,
         payload_bytes: usize,
         excluded: &[RelayPathKey],
     ) -> Option<RelayPathLoadLease> {
@@ -166,16 +163,23 @@ impl ClientPathContext {
             lane,
         ) {
             candidates.sort_by(|left, right| {
-                left.snapshot
-                    .active_latency_sensitive_flows
-                    .cmp(&right.snapshot.active_latency_sensitive_flows)
-                    .then_with(|| left.snapshot.active_flows.cmp(&right.snapshot.active_flows))
-                    .then_with(|| self.relay_path_key_order(left.key, right.key))
+                scheduler::path_is_backup(left.snapshot)
+                    .cmp(&scheduler::path_is_backup(right.snapshot))
+                    .then_with(|| {
+                        left.snapshot
+                            .active_latency_sensitive_flows
+                            .cmp(&right.snapshot.active_latency_sensitive_flows)
+                            .then_with(|| {
+                                left.snapshot.active_flows.cmp(&right.snapshot.active_flows)
+                            })
+                            .then_with(|| self.relay_path_key_order(left.key, right.key))
+                    })
             });
         } else {
             candidates.sort_by(|left, right| {
-                left.eta_ms
-                    .total_cmp(&right.eta_ms)
+                scheduler::path_is_backup(left.snapshot)
+                    .cmp(&scheduler::path_is_backup(right.snapshot))
+                    .then_with(|| left.eta_ms.total_cmp(&right.eta_ms))
                     .then_with(|| self.relay_path_key_order(left.key, right.key))
             });
         }
@@ -184,7 +188,7 @@ impl ClientPathContext {
             lab_diagnostic(
                 "reliable_stream_initial_path_candidate",
                 format_args!(
-                    "lane={:?} payload_bytes={} rank={} path_underlay={:?} path_index={} eta_ms={:.3} state={:?} active_flows={} active_latency_flows={} queue_bytes={} product_queue_bytes={} bytes_in_flight={} inflight_limit={} delivery_rate_bps={:.0} pacing_rate_bps={:.0} app_limited={} liveness_evidence={} path_proof_evidence={} ack_data_evidence={} bulk_rate_evidence={} sender_delivery_evidence={}",
+                    "lane={:?} payload_bytes={} rank={} path_underlay={:?} path_index={} eta_ms={:.3} state={:?} active_flows={} active_latency_flows={} queue_bytes={} data_level_queue_bytes={} bytes_in_flight={} inflight_limit={} delivery_rate_bps={:.0} pacing_rate_bps={:.0} app_limited={} liveness_evidence={} path_proof_evidence={} ack_data_evidence={} bulk_rate_evidence={} sender_delivery_evidence={}",
                     lane,
                     payload_bytes,
                     rank,
@@ -195,9 +199,9 @@ impl ClientPathContext {
                     candidate.snapshot.active_flows,
                     candidate.snapshot.active_latency_sensitive_flows,
                     candidate.snapshot.queue_bytes,
-                    candidate.snapshot.product_queue_bytes,
+                    candidate.snapshot.data_level_queue_bytes,
                     candidate.snapshot.bytes_in_flight,
-                    candidate.snapshot.inflight_limit_bytes,
+                    candidate.snapshot.carrier_inflight_limit_bytes,
                     candidate.snapshot.delivery_rate_bps,
                     candidate.snapshot.pacing_rate_bps,
                     candidate.snapshot.app_limited,
@@ -231,7 +235,7 @@ impl ClientPathContext {
 
     pub(in crate::runtime) fn ordered_reliable_path_keys(
         &self,
-        lane: FlowLane,
+        lane: TrafficClass,
         payload_bytes: usize,
     ) -> Vec<RelayPathKey> {
         let now = Instant::now();
@@ -249,8 +253,9 @@ impl ClientPathContext {
             payload_bytes,
         );
         candidates.sort_by(|left, right| {
-            left.eta_ms
-                .total_cmp(&right.eta_ms)
+            scheduler::path_is_backup(left.snapshot)
+                .cmp(&scheduler::path_is_backup(right.snapshot))
+                .then_with(|| left.eta_ms.total_cmp(&right.eta_ms))
                 .then_with(|| self.relay_path_key_order(left.key, right.key))
         });
         candidates
@@ -259,15 +264,15 @@ impl ClientPathContext {
             .collect()
     }
 
-    pub(in crate::runtime) fn ordered_tcp_repair_path_indices(
+    pub(in crate::runtime) fn ordered_tcp_reinjection_path_indices(
         &self,
         current_path_index: Option<usize>,
-        lane: FlowLane,
+        lane: TrafficClass,
         payload_bytes: usize,
     ) -> Vec<usize> {
         let observations = self.tcp_health_observations_for_lane(lane);
         let scores = ordered_path_scores(&self.tcp_paths, &observations, lane, payload_bytes);
-        if !matches!(lane, FlowLane::Throughput | FlowLane::Background) {
+        if !matches!(lane, TrafficClass::Throughput | TrafficClass::Background) {
             return scores.into_iter().map(|(index, _)| index).collect();
         }
         let current_eta = current_path_index.and_then(|current_path_index| {
@@ -295,10 +300,10 @@ impl ClientPathContext {
             .collect()
     }
 
-    pub(in crate::runtime) fn ordered_udp_stream_repair_path_indices(
+    pub(in crate::runtime) fn ordered_udp_stream_reinjection_path_indices(
         &self,
         current_path_index: Option<usize>,
-        lane: FlowLane,
+        lane: TrafficClass,
         payload_bytes: usize,
     ) -> Vec<usize> {
         let now = Instant::now();
@@ -325,7 +330,7 @@ impl ClientPathContext {
             .into_iter()
             .filter(|(index, _)| Some(*index) != current_path_index)
             .filter(|(index, _)| {
-                !matches!(lane, FlowLane::Throughput | FlowLane::Background)
+                !matches!(lane, TrafficClass::Throughput | TrafficClass::Background)
                     || !observations
                         .iter()
                         .enumerate()
@@ -341,22 +346,22 @@ impl ClientPathContext {
             .collect()
     }
 
-    pub(in crate::runtime) fn ordered_reliable_repair_path_keys(
+    pub(in crate::runtime) fn ordered_reliable_reinjection_path_keys(
         &self,
         current_tcp_path_index: Option<usize>,
         current_udp_path_index: Option<usize>,
-        lane: FlowLane,
+        lane: TrafficClass,
         payload_bytes: usize,
     ) -> Vec<RelayPathKey> {
         let mut candidates = self
-            .ordered_tcp_repair_path_indices(current_tcp_path_index, lane, payload_bytes)
+            .ordered_tcp_reinjection_path_indices(current_tcp_path_index, lane, payload_bytes)
             .into_iter()
             .map(|index| RelayPathKey {
                 underlay: UnderlayProtocol::Tcp,
                 index,
             })
             .chain(
-                self.ordered_udp_stream_repair_path_indices(
+                self.ordered_udp_stream_reinjection_path_indices(
                     current_udp_path_index,
                     lane,
                     payload_bytes,
@@ -369,14 +374,21 @@ impl ClientPathContext {
             )
             .collect::<Vec<_>>();
         candidates.sort_by(|left, right| {
+            let left_backup = self
+                .reliable_path_snapshot(*left)
+                .is_some_and(scheduler::path_is_backup);
+            let right_backup = self
+                .reliable_path_snapshot(*right)
+                .is_some_and(scheduler::path_is_backup);
             let left_eta = self
                 .reliable_relay_path_eta_ms(*left, lane, payload_bytes)
                 .unwrap_or(f64::INFINITY);
             let right_eta = self
                 .reliable_relay_path_eta_ms(*right, lane, payload_bytes)
                 .unwrap_or(f64::INFINITY);
-            left_eta
-                .total_cmp(&right_eta)
+            left_backup
+                .cmp(&right_backup)
+                .then_with(|| left_eta.total_cmp(&right_eta))
                 .then_with(|| self.relay_path_key_order(*left, *right))
         });
         candidates
@@ -397,20 +409,27 @@ impl ClientPathContext {
         .collect()
     }
 
-    pub(in crate::runtime) fn ordered_reliable_bulk_validation_path_keys(
+    pub(in crate::runtime) fn ordered_reliable_unproven_bulk_path_keys(
         &self,
         payload_bytes: usize,
     ) -> Vec<RelayPathKey> {
         let payload_bytes = payload_bytes
             .min(relay_lane_startup_chunk_bytes(
-                FlowLane::Latency,
+                TrafficClass::Latency,
                 self.mux_limits,
             ))
             .max(PATH_OPEN_SCORE_BYTES);
         let mut candidates = self.ordered_reliable_bulk_path_candidates(payload_bytes);
+        if candidates
+            .iter()
+            .any(|candidate| !scheduler::path_is_backup(candidate.snapshot))
+        {
+            candidates.retain(|candidate| !scheduler::path_is_backup(candidate.snapshot));
+        }
         candidates.sort_by(|left, right| {
-            left.eta_ms
-                .total_cmp(&right.eta_ms)
+            scheduler::path_is_backup(left.snapshot)
+                .cmp(&scheduler::path_is_backup(right.snapshot))
+                .then_with(|| left.eta_ms.total_cmp(&right.eta_ms))
                 .then_with(|| self.relay_path_key_order(left.key, right.key))
         });
         let admitted = candidates
@@ -419,7 +438,7 @@ impl ClientPathContext {
                 !candidate.has_bulk_rate_evidence && candidate.snapshot.active_flows == 0
             })
             .collect::<Vec<_>>();
-        carrier_diverse_bulk_validation_order(admitted)
+        carrier_diverse_path_order(admitted)
             .into_iter()
             .map(|candidate| candidate.key)
             .collect()
@@ -446,12 +465,11 @@ impl ClientPathContext {
         tcp_observations: &[ClientPathObservation],
         udp_observations: &[ClientPathObservation],
     ) -> SmallVec<[BulkPathCandidate; 4]> {
-        let scoring_payload_bytes =
-            bulk_service_horizon_payload_bytes(payload_bytes, self.mux_limits);
+        let scoring_payload_bytes = bulk_scheduling_horizon_bytes(payload_bytes, self.mux_limits);
         ordered_path_scores(
             &self.tcp_paths,
-            &tcp_observations,
-            FlowLane::Throughput,
+            tcp_observations,
+            TrafficClass::Throughput,
             scoring_payload_bytes,
         )
         .into_iter()
@@ -473,8 +491,8 @@ impl ClientPathContext {
         .chain(
             ordered_path_scores(
                 &self.udp_paths,
-                &udp_observations,
-                FlowLane::Throughput,
+                udp_observations,
+                TrafficClass::Throughput,
                 scoring_payload_bytes,
             )
             .into_iter()
@@ -487,7 +505,8 @@ impl ClientPathContext {
                         underlay: UnderlayProtocol::Udp,
                         index,
                     },
-                    eta_ms + udp_reliable_stream_loss_repair_penalty_ms(snapshot, payload_bytes),
+                    eta_ms
+                        + udp_reliable_stream_loss_reinjection_penalty_ms(snapshot, payload_bytes),
                     path,
                     observation,
                     snapshot,
@@ -595,16 +614,13 @@ impl ClientPathContext {
         ReliableRequestPathBatchObservation {
             paths,
             bulk_candidates,
-            active_tcp_service_bulk_flows: include_bulk_admission
-                .then(|| self.active_tcp_service_request_bulk_flows())
-                .unwrap_or(0),
             latency_pressure,
         }
     }
 
     pub(in crate::runtime) fn tcp_health_observations_for_lane(
         &self,
-        lane: FlowLane,
+        lane: TrafficClass,
     ) -> Vec<ClientPathObservation> {
         let now = Instant::now();
         let mut observations = health_observations(
@@ -675,7 +691,7 @@ impl ClientPathContext {
     pub(in crate::runtime) fn reliable_relay_path_eta_ms(
         &self,
         key: RelayPathKey,
-        lane: FlowLane,
+        lane: TrafficClass,
         payload_bytes: usize,
     ) -> Option<f64> {
         self.reliable_path_snapshot(key).and_then(|snapshot| {
@@ -750,7 +766,7 @@ impl ClientPathContext {
             return configured_order_path_indices(
                 &self.udp_paths,
                 &observations,
-                FlowLane::RealtimeDatagram,
+                TrafficClass::RealtimeDatagram,
                 payload_bytes,
             )
             .into_iter()
@@ -759,7 +775,7 @@ impl ClientPathContext {
                 let observation = observations.get(path_index).copied()?;
                 let eta_ms = scheduler::score_path(
                     path_snapshot(path, path_index, observation),
-                    FlowLane::RealtimeDatagram,
+                    TrafficClass::RealtimeDatagram,
                     payload_bytes,
                 )?
                 .eta_ms;
@@ -771,7 +787,7 @@ impl ClientPathContext {
         let mut candidates = ordered_path_scores_for_ttl(
             &self.udp_paths,
             &observations,
-            FlowLane::RealtimeDatagram,
+            TrafficClass::RealtimeDatagram,
             payload_bytes,
             ttl_ms,
         )
@@ -828,7 +844,7 @@ impl ClientPathContext {
         }
         let score = scheduler::score_path(
             path_snapshot(path, index, observation),
-            FlowLane::RealtimeDatagram,
+            TrafficClass::RealtimeDatagram,
             payload_bytes,
         )?;
         let freshness_budget_ms = f64::from(ttl_ms);
@@ -854,7 +870,7 @@ impl ClientPathContext {
             .get(index)?
             .observation_at(now);
         let snapshot = path_snapshot(path, index, observation);
-        scheduler::score_path(snapshot, FlowLane::RealtimeDatagram, 1)?;
+        scheduler::score_path(snapshot, TrafficClass::RealtimeDatagram, 1)?;
         Some(UdpPathRuntimeModel::from_snapshot(
             snapshot,
             ttl_ms,

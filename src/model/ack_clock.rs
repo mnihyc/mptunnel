@@ -1,80 +1,27 @@
-//! TCP product-ACK calibration policy.
+//! Request-direction TCP Data ACK sampling limits.
 //!
-//! This model provides bounded product evidence when native TCP telemetry is
-//! unavailable. QUIC packet ACKs remain carrier-owned and never enter here.
+//! A bounded connection-data sample can establish causal delivery evidence
+//! when native TCP telemetry is unavailable. It does not replace TCP congestion
+//! control, recovery, or pacing. QUIC packet ACKs remain carrier-owned.
 
-use super::admission::{
-    BulkExplorationCompletionProjection, bulk_candidate_pipe_bytes,
-    bulk_service_horizon_payload_bytes, bulk_tcp_calibration_completion_projection,
-};
-use crate::model::capacity::{BBR_MAX_SEND_QUANTUM_BYTES, PATH_OPEN_SCORE_BYTES};
+use super::admission::bulk_scheduling_horizon_bytes;
+use crate::model::capacity::{MAX_RELIABLE_SERVICE_QUANTUM_BYTES, PATH_OPEN_SCORE_BYTES};
 use crate::mux::MuxLimits;
-use crate::protocol::UnderlayProtocol;
-use crate::scheduler::PathSnapshot;
 
-#[derive(Debug, Clone, Copy)]
-#[cfg_attr(not(feature = "lab-diagnostics"), allow(dead_code))]
-pub(crate) enum TcpAckClockCalibrationOpportunity {
-    Admit(BulkExplorationCompletionProjection),
-    Retire(BulkExplorationCompletionProjection),
-}
-
-impl TcpAckClockCalibrationOpportunity {
-    #[cfg(feature = "lab-diagnostics")]
-    pub(crate) fn projection(self) -> BulkExplorationCompletionProjection {
-        match self {
-            Self::Admit(projection) | Self::Retire(projection) => projection,
-        }
-    }
-
-    pub(crate) fn is_admitted(self) -> bool {
-        matches!(self, Self::Admit(_))
-    }
-}
-
-/// Decide whether a fresh, zero-spend TCP stage can finish before Service
-/// consumes the ordered reservoir. Begun stages are deliberately not reevaluated.
-pub(crate) fn reliable_tcp_ack_clock_calibration_opportunity(
-    service_snapshot: PathSnapshot,
-    service_eta_ms: f64,
-    candidate_snapshot: PathSnapshot,
-    candidate_eta_ms: f64,
-    authorized_bytes: u64,
-    payload_bytes: usize,
-    mux_limits: MuxLimits,
-) -> TcpAckClockCalibrationOpportunity {
-    debug_assert_eq!(service_snapshot.underlay, UnderlayProtocol::Tcp);
-    debug_assert_eq!(candidate_snapshot.underlay, UnderlayProtocol::Tcp);
-    let projection = bulk_tcp_calibration_completion_projection(
-        service_snapshot,
-        service_eta_ms,
-        candidate_snapshot,
-        candidate_eta_ms,
-        authorized_bytes,
-        payload_bytes,
-        mux_limits,
-    );
-    if projection.completes_within_service_reservoir() {
-        TcpAckClockCalibrationOpportunity::Admit(projection)
-    } else {
-        TcpAckClockCalibrationOpportunity::Retire(projection)
-    }
-}
-
-pub(crate) fn reliable_ack_clock_calibration_limit_bytes(mux_limits: MuxLimits) -> u64 {
-    let resource_ceiling = reliable_ack_clock_calibration_ceiling_bytes(mux_limits);
+pub(crate) fn reliable_ack_clock_measurement_limit_bytes(mux_limits: MuxLimits) -> u64 {
+    let resource_ceiling = reliable_ack_clock_measurement_ceiling_bytes(mux_limits);
     if resource_ceiling == 0 {
         return 0;
     }
-    let service_horizon =
-        bulk_service_horizon_payload_bytes(BBR_MAX_SEND_QUANTUM_BYTES, mux_limits) as u64;
-    service_horizon.min(resource_ceiling)
+    let scheduling_horizon =
+        bulk_scheduling_horizon_bytes(MAX_RELIABLE_SERVICE_QUANTUM_BYTES, mux_limits) as u64;
+    scheduling_horizon.min(resource_ceiling)
 }
 
-pub(crate) fn reliable_ack_clock_calibration_rate_coverage_floor_bytes(
+pub(crate) fn reliable_ack_clock_measurement_rate_coverage_floor_bytes(
     mux_limits: MuxLimits,
 ) -> u64 {
-    let product_limit = reliable_ack_clock_calibration_limit_bytes(mux_limits);
+    let product_limit = reliable_ack_clock_measurement_limit_bytes(mux_limits);
     if product_limit == 0 {
         return 0;
     }
@@ -84,9 +31,9 @@ pub(crate) fn reliable_ack_clock_calibration_rate_coverage_floor_bytes(
         .min(product_limit)
 }
 
-pub(crate) fn reliable_request_ack_clock_calibration_target_bytes(mux_limits: MuxLimits) -> u64 {
-    let base = reliable_ack_clock_calibration_limit_bytes(mux_limits);
-    let ceiling = reliable_ack_clock_calibration_ceiling_bytes(mux_limits);
+pub(crate) fn reliable_request_ack_clock_measurement_target_bytes(mux_limits: MuxLimits) -> u64 {
+    let base = reliable_ack_clock_measurement_limit_bytes(mux_limits);
+    let ceiling = reliable_ack_clock_measurement_ceiling_bytes(mux_limits);
     if base == 0 {
         return 0;
     }
@@ -94,7 +41,7 @@ pub(crate) fn reliable_request_ack_clock_calibration_target_bytes(mux_limits: Mu
     // congestion controller and must not serialize an entire high-BDP pipe.
     // Continuous exact samples mature after admission. Reserve one maximum
     // frame so non-divisible configured geometry can cross the target.
-    let max_payload = BBR_MAX_SEND_QUANTUM_BYTES
+    let max_payload = MAX_RELIABLE_SERVICE_QUANTUM_BYTES
         .min(mux_limits.max_reliable_relay_chunk_bytes)
         .min(mux_limits.max_payload_bytes)
         .min(mux_limits.max_path_flight_bytes)
@@ -110,23 +57,7 @@ pub(crate) fn reliable_request_ack_clock_calibration_target_bytes(mux_limits: Mu
     }
 }
 
-pub(crate) fn reliable_tcp_ack_clock_calibration_initial_limit_bytes(
-    candidate: PathSnapshot,
-    mux_limits: MuxLimits,
-) -> u64 {
-    let product_limit = reliable_ack_clock_calibration_limit_bytes(mux_limits);
-    if product_limit == 0 {
-        return 0;
-    }
-
-    // The first product stage must fit the candidate TCP pipe. This is product
-    // measurement policy above kernel TCP, not a replacement congestion window.
-    bulk_candidate_pipe_bytes(candidate)
-        .max(BBR_MAX_SEND_QUANTUM_BYTES as u64)
-        .min(product_limit)
-}
-
-pub(crate) fn reliable_ack_clock_calibration_ceiling_bytes(mux_limits: MuxLimits) -> u64 {
+pub(crate) fn reliable_ack_clock_measurement_ceiling_bytes(mux_limits: MuxLimits) -> u64 {
     let resource_ceiling = (mux_limits.max_path_flight_bytes as u64)
         .min(mux_limits.max_repair_bytes as u64)
         .min(mux_limits.max_reorder_bytes as u64)

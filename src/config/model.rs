@@ -1,7 +1,4 @@
-use super::security::{
-    CipherSuite, EncryptionMode, SecurityPolicyError, SharedSecret, TransportIntegrity,
-    TransportSecurity, validate_transport_security,
-};
+use super::security::{CipherSuite, SecurityPolicyError, SharedSecret};
 use crate::ingress::{IngressConfig, ProxyAuthConfig};
 use crate::outbound::{DnsConfig, OutboundConfig};
 use crate::protocol::codec::CodecLimits;
@@ -61,12 +58,6 @@ pub struct AppConfig {
 
 impl AppConfig {
     pub fn validate(&self) -> Result<(), ConfigError> {
-        validate_transport_security(
-            self.security.mode,
-            self.security.transport,
-            self.security.integrity,
-            &self.security.secret,
-        )?;
         if self.security.auth_freshness_window.is_zero() {
             return Err(ConfigError::AuthFreshnessWindowZero);
         }
@@ -96,11 +87,19 @@ impl AppConfig {
 pub struct ManagementConfig {
     pub listen: Vec<SocketAddr>,
     pub token: Option<String>,
+    /// Serves the embedded operator UI on the management listener.
+    pub dashboard: bool,
+    /// Allows an authenticated MPP peer to request a sanitized path snapshot.
+    pub allow_peer_diagnostics: bool,
 }
 
 impl ManagementConfig {
-    pub fn enabled(&self) -> bool {
+    pub fn http_enabled(&self) -> bool {
         !self.listen.is_empty()
+    }
+
+    pub fn peer_diagnostics_enabled(&self) -> bool {
+        self.allow_peer_diagnostics
     }
 
     pub fn validate(&self) -> Result<(), ConfigError> {
@@ -110,6 +109,20 @@ impl ManagementConfig {
         if self.token.as_ref().is_some_and(|token| token.is_empty()) {
             return Err(ConfigError::ManagementTokenEmpty);
         }
+        if self.token.as_ref().is_some_and(|token| {
+            !(16..=256).contains(&token.len()) || !token.bytes().all(|byte| byte.is_ascii_graphic())
+        }) {
+            return Err(ConfigError::ManagementTokenInvalid);
+        }
+        if self.dashboard && !self.http_enabled() {
+            return Err(ConfigError::ManagementDashboardWithoutListener);
+        }
+        if self.http_enabled() && self.token.is_none() {
+            return Err(ConfigError::ManagementListenerRequiresToken);
+        }
+        if self.listen.iter().any(|addr| !addr.ip().is_loopback()) {
+            return Err(ConfigError::ManagementListenerMustBeLoopback);
+        }
         Ok(())
     }
 }
@@ -118,14 +131,14 @@ pub const DEFAULT_EXTRA_TRAFFIC_HINT_PERCENT: u16 = 5;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct MppPerformanceConfig {
-    /// Operator hint for adaptive duplicate/probe/repair overhead, in percent.
+    /// Operator hint for adaptive duplicate/probe/reinjection overhead, in percent.
     ///
     /// 5 means the sender may spend roughly 5% extra transport traffic when
-    /// runtime evidence shows that duplicate, repair, or probe work can reduce
+    /// runtime evidence shows that duplicate, reinjection, or probe work can reduce
     /// stalls. The sender enforces this as a hard optional-work budget plus a
     /// small startup floor; it is not a product-data throttle. 100 permits full
     /// duplication in pathological cases, and values above 100 bias toward
-    /// redundant repair under severe instability.
+    /// redundant reinjection under severe instability.
     pub extra_traffic_hint_percent: u16,
 }
 
@@ -242,7 +255,7 @@ impl ResourceLimits {
             return Err(ConfigError::StreamWindowLimitZero);
         }
         if self.max_repair_bytes < self.max_payload_bytes {
-            return Err(ConfigError::RepairLimitTooSmall);
+            return Err(ConfigError::ReinjectionLimitTooSmall);
         }
         if self.max_reorder_bytes < self.max_payload_bytes {
             return Err(ConfigError::ReorderLimitTooSmall);
@@ -260,7 +273,7 @@ impl ResourceLimits {
             return Err(ConfigError::PathFlightLimitTooSmall);
         }
         if self.max_path_flight_bytes > self.max_repair_bytes {
-            return Err(ConfigError::PathFlightLimitExceedsRepairLimit);
+            return Err(ConfigError::PathFlightLimitExceedsReinjectionLimit);
         }
         if self.tcp_path_heartbeat_interval.is_zero() {
             return Err(ConfigError::TcpPathHeartbeatIntervalZero);
@@ -288,9 +301,7 @@ impl From<ResourceLimits> for CodecLimits {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SecurityConfig {
-    pub mode: EncryptionMode,
-    pub transport: TransportSecurity,
-    pub integrity: TransportIntegrity,
+    /// Selects the MPP record cipher used by TCP carriers. QUIC uses TLS 1.3.
     pub cipher: CipherSuite,
     pub secret: SharedSecret,
     pub auth_freshness_window: Duration,
@@ -303,32 +314,10 @@ impl SecurityConfig {
 
     pub fn encrypted_with_cipher(secret: SharedSecret, cipher: CipherSuite) -> Self {
         Self {
-            mode: EncryptionMode::Required,
-            transport: TransportSecurity::Encrypted,
-            integrity: TransportIntegrity::Authenticated,
             cipher,
             secret,
             auth_freshness_window: DEFAULT_AUTH_FRESHNESS_WINDOW,
         }
-    }
-
-    pub fn plaintext_lab(secret: SharedSecret) -> Self {
-        Self::plaintext_lab_with_cipher(secret, CipherSuite::default())
-    }
-
-    pub fn plaintext_lab_with_cipher(secret: SharedSecret, cipher: CipherSuite) -> Self {
-        Self {
-            mode: EncryptionMode::AllowPlaintextLab,
-            transport: TransportSecurity::Plaintext,
-            integrity: TransportIntegrity::Authenticated,
-            cipher,
-            secret,
-            auth_freshness_window: DEFAULT_AUTH_FRESHNESS_WINDOW,
-        }
-    }
-
-    pub fn warning(&self) -> Option<&'static str> {
-        self.mode.plaintext_warning()
     }
 
     pub fn with_auth_freshness_window(mut self, value: Duration) -> Self {
@@ -483,12 +472,6 @@ fn validate_server_config(
 }
 
 fn validate_security_config(security: &SecurityConfig) -> Result<(), ConfigError> {
-    validate_transport_security(
-        security.mode,
-        security.transport,
-        security.integrity,
-        &security.secret,
-    )?;
     if security.auth_freshness_window.is_zero() {
         return Err(ConfigError::AuthFreshnessWindowZero);
     }
@@ -580,13 +563,13 @@ pub enum ConfigError {
     StreamLimitZero,
     QuicBidiStreamLimitZero,
     StreamWindowLimitZero,
-    RepairLimitTooSmall,
+    ReinjectionLimitTooSmall,
     ReorderLimitTooSmall,
     DatagramQueueLimitTooSmall,
     MaxReliableRelayChunkBytesZero,
     MaxReliableRelayChunkExceedsPayloadLimit,
     PathFlightLimitTooSmall,
-    PathFlightLimitExceedsRepairLimit,
+    PathFlightLimitExceedsReinjectionLimit,
     TcpPathHeartbeatIntervalZero,
     TcpPathHeartbeatTimeoutZero,
     TcpPathHeartbeatTimeoutTooSmall,
@@ -616,6 +599,10 @@ pub enum ConfigError {
     ProxyAuthPasswordTooLong,
     ManagementListenPortZero,
     ManagementTokenEmpty,
+    ManagementTokenInvalid,
+    ManagementDashboardWithoutListener,
+    ManagementListenerRequiresToken,
+    ManagementListenerMustBeLoopback,
     NoRuntimeServices,
 }
 
@@ -650,8 +637,11 @@ impl std::fmt::Display for ConfigError {
             Self::StreamWindowLimitZero => {
                 write!(f, "max stream window bytes must be greater than zero")
             }
-            Self::RepairLimitTooSmall => {
-                write!(f, "max repair bytes must be at least max payload bytes")
+            Self::ReinjectionLimitTooSmall => {
+                write!(
+                    f,
+                    "max reinjection bytes must be at least max payload bytes"
+                )
             }
             Self::ReorderLimitTooSmall => {
                 write!(f, "max reorder bytes must be at least max payload bytes")
@@ -677,10 +667,10 @@ impl std::fmt::Display for ConfigError {
             Self::PathFlightLimitTooSmall => {
                 write!(f, "max path flight bytes must be at least one relay chunk")
             }
-            Self::PathFlightLimitExceedsRepairLimit => {
+            Self::PathFlightLimitExceedsReinjectionLimit => {
                 write!(
                     f,
-                    "max path flight bytes must be no greater than max repair bytes"
+                    "max path flight bytes must be no greater than max reinjection bytes"
                 )
             }
             Self::TcpPathHeartbeatIntervalZero => {
@@ -751,6 +741,22 @@ impl std::fmt::Display for ConfigError {
             }
             Self::ManagementTokenEmpty => {
                 write!(f, "management API token must not be empty")
+            }
+            Self::ManagementTokenInvalid => write!(
+                f,
+                "management API token must contain 16-256 visible ASCII characters"
+            ),
+            Self::ManagementDashboardWithoutListener => {
+                write!(
+                    f,
+                    "management dashboard requires at least one listen address"
+                )
+            }
+            Self::ManagementListenerRequiresToken => {
+                write!(f, "management API listeners require a token")
+            }
+            Self::ManagementListenerMustBeLoopback => {
+                write!(f, "management API listeners must use loopback addresses")
             }
             Self::NoRuntimeServices => {
                 write!(

@@ -3,12 +3,12 @@ use crate::config::{
     DEFAULT_OUTBOUND_CONNECT_TIMEOUT, MppPerformanceConfig, ResourceLimits, SecurityConfig,
     SharedSecret,
 };
-use crate::model::capacity::BBR_MAX_SEND_QUANTUM_BYTES;
+use crate::model::capacity::MAX_RELIABLE_SERVICE_QUANTUM_BYTES;
 use crate::mux::MuxLimits;
 use crate::outbound::{DnsConfig, OutboundConfig};
 use crate::protocol::codec::CodecLimits;
 use crate::protocol::{
-    Frame, PathId, ResetReason, SessionId, StreamId, StreamOpenRole, TargetAddr, UnderlayProtocol,
+    Frame, PathId, ResetReason, SessionId, StreamId, TargetAddr, UnderlayProtocol,
 };
 use crate::runtime::error::RuntimeError;
 use crate::runtime::node::server::{ServerIdentityRuntime, new_identity_runtime};
@@ -25,13 +25,14 @@ use crate::runtime::path::quic::io::{
 use crate::runtime::path::quic::server_writer::drain_server_udp_reliable_commands;
 use crate::runtime::path::server_context::ServerPathContext;
 use crate::runtime::path::{
-    ClientPathHealth, ClientPathState, ServerCarrierPathRegistration, ServerStreamOpenOutcome,
-    ServerStreamOpenRequest, ServerStreamPathAttachment,
+    ClientPathHealth, ClientPathState, ServerCarrierPathRegistration, ServerLocalPathProperties,
+    ServerStreamOpenOutcome, ServerStreamOpenRequest, ServerStreamPathAttachment,
 };
+use crate::runtime::peer_status::{PeerStatusBroker, PeerStatusSnapshotSource};
 use crate::runtime::stream::{
     AcceptedServerReliableStream, ReliablePathStreamOutput, ServerReliableStreamRegistry,
 };
-use crate::scheduler::FlowLane;
+use crate::scheduler::TrafficClass;
 use crate::transport::{
     CarrierPathIdentity, CarrierSocket, CarrierSocketRequest, Endpoint as PathEndpoint,
     PathBinding, PathMetadata, PathSpec, SystemCarrierNetworkProvider,
@@ -45,7 +46,7 @@ struct ServerUdpTerminalWriterFixture {
     session_id: SessionId,
     path_id: PathId,
     stream_id: StreamId,
-    path_registration: ServerCarrierPathRegistration,
+    _path_registration: ServerCarrierPathRegistration,
     commands_tx: ReliablePathCommandSender,
     commands_rx: ReliablePathCommandReceivers,
     accepted: AcceptedServerReliableStream,
@@ -86,6 +87,7 @@ impl ServerUdpTerminalWriterFixture {
             session_id,
             UnderlayProtocol::Udp,
             path_id,
+            ServerLocalPathProperties::default(),
         );
         let (commands_tx, commands_rx) = reliable_path_command_channels(8);
         let target = TargetAddr::Ip(SocketAddr::from(([127, 0, 0, 1], 80)));
@@ -95,7 +97,7 @@ impl ServerUdpTerminalWriterFixture {
                 session_id,
                 stream_id,
                 target,
-                lane: FlowLane::Throughput,
+                lane: TrafficClass::Throughput,
                 attachment: ServerStreamPathAttachment {
                     path_registration: path_registration.clone(),
                     commands: commands_tx.clone(),
@@ -103,8 +105,6 @@ impl ServerUdpTerminalWriterFixture {
                         context.codec_limits,
                         context.mux_limits,
                     ),
-                    role: StreamOpenRole::Active,
-                    initial_metrics: None,
                 },
                 mux_limits: context.mux_limits,
             })
@@ -156,6 +156,8 @@ impl ServerUdpTerminalWriterFixture {
                 udp: Vec::new(),
             }),
             carrier_network: Arc::new(SystemCarrierNetworkProvider),
+            peer_status: PeerStatusBroker::new(false),
+            peer_status_snapshot: PeerStatusSnapshotSource::new(Vec::new),
         };
         let client_carrier = CarrierSocket::system(CarrierSocketRequest {
             path: &client_path,
@@ -202,7 +204,7 @@ impl ServerUdpTerminalWriterFixture {
             session_id,
             path_id,
             stream_id,
-            path_registration,
+            _path_registration: path_registration,
             commands_tx,
             commands_rx,
             accepted,
@@ -222,7 +224,7 @@ impl ServerUdpTerminalWriterFixture {
             panic!("expected switchable server response output");
         };
         binding
-            .sender_path_targets(FlowLane::Throughput, BBR_MAX_SEND_QUANTUM_BYTES)
+            .sender_path_targets(TrafficClass::Throughput, MAX_RELIABLE_SERVICE_QUANTUM_BYTES)
             .len()
     }
 }
@@ -235,8 +237,12 @@ async fn reliable_output_guard_detaches_on_abnormal_stream_exit() {
     let session_id = SessionId(201);
     let stream_id = StreamId(301);
     let path_id = PathId(0);
-    let path_registration =
-        streams.register_carrier_path(session_id, UnderlayProtocol::Udp, path_id);
+    let path_registration = streams.register_carrier_path(
+        session_id,
+        UnderlayProtocol::Udp,
+        path_id,
+        ServerLocalPathProperties::default(),
+    );
     let target = TargetAddr::Ip(SocketAddr::from(([127, 0, 0, 1], 80)));
     let (commands, _receivers) = reliable_path_command_channels(8);
     let commands_for_guard = commands.clone();
@@ -245,7 +251,7 @@ async fn reliable_output_guard_detaches_on_abnormal_stream_exit() {
             session_id,
             stream_id,
             target,
-            lane: FlowLane::Throughput,
+            lane: TrafficClass::Throughput,
             attachment: ServerStreamPathAttachment {
                 path_registration: path_registration.clone(),
                 commands,
@@ -253,8 +259,6 @@ async fn reliable_output_guard_detaches_on_abnormal_stream_exit() {
                     CodecLimits::default(),
                     MuxLimits::default(),
                 ),
-                role: StreamOpenRole::Active,
-                initial_metrics: None,
             },
             mux_limits: MuxLimits::default(),
         })
@@ -271,7 +275,7 @@ async fn reliable_output_guard_detaches_on_abnormal_stream_exit() {
     };
     assert_eq!(
         binding
-            .sender_path_targets(FlowLane::Throughput, BBR_MAX_SEND_QUANTUM_BYTES)
+            .sender_path_targets(TrafficClass::Throughput, MAX_RELIABLE_SERVICE_QUANTUM_BYTES)
             .len(),
         1
     );
@@ -286,7 +290,7 @@ async fn reliable_output_guard_detaches_on_abnormal_stream_exit() {
 
     assert!(
         binding
-            .sender_path_targets(FlowLane::Throughput, BBR_MAX_SEND_QUANTUM_BYTES)
+            .sender_path_targets(TrafficClass::Throughput, MAX_RELIABLE_SERVICE_QUANTUM_BYTES)
             .is_empty(),
         "every server QUIC stream exit must detach its response output"
     );
@@ -299,7 +303,11 @@ async fn server_quic_terminal_writer_flushes_reset_then_detaches_and_finishes_st
     assert_eq!(fixture.attached_output_count(), 1);
     fixture
         .commands_tx
-        .send_stream_ordered_reset_and_close(stream_id, ResetReason::Refused, FlowLane::Throughput)
+        .send_stream_ordered_reset_and_close(
+            stream_id,
+            ResetReason::Refused,
+            TrafficClass::Throughput,
+        )
         .await
         .expect("queue server QUIC terminal command");
     let command = recv_reliable_path_command(&mut fixture.commands_rx)
@@ -316,7 +324,6 @@ async fn server_quic_terminal_writer_flushes_reset_then_detaches_and_finishes_st
         fixture.session_id,
         fixture.stream_id,
         fixture.path_id,
-        fixture.path_registration.path_instance_id(),
         &fixture.commands_tx,
         &mut pending_frames,
         &mut path_proofs,
@@ -370,7 +377,7 @@ async fn server_quic_mismatched_terminal_releases_debt_and_guard_fails_closed() 
         .send_stream_ordered_reset_and_close(
             mismatched_stream_id,
             ResetReason::Refused,
-            FlowLane::Throughput,
+            TrafficClass::Throughput,
         )
         .await
         .expect("queue mismatched server QUIC terminal command");
@@ -398,7 +405,6 @@ async fn server_quic_mismatched_terminal_releases_debt_and_guard_fails_closed() 
         fixture.session_id,
         fixture.stream_id,
         fixture.path_id,
-        fixture.path_registration.path_instance_id(),
         &fixture.commands_tx,
         &mut pending_frames,
         &mut path_proofs,

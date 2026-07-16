@@ -1,20 +1,26 @@
 //! Carrier-neutral product work classifications.
 //!
-//! `FlowLane` describes latency versus throughput demand. These types instead
+//! `TrafficClass` describes latency versus throughput demand. These types instead
 //! describe what product work may do to ordered ownership and sender queues.
 
-use crate::protocol::OffsetRange;
+use crate::model::capacity::{
+    adaptive_reliable_relay_inflight_bytes, adaptive_reliable_relay_reinjection_bytes,
+    reliable_bulk_carrier_feed_quantum_bytes,
+};
+use crate::mux::MuxLimits;
+use crate::protocol::{OffsetRange, UnderlayProtocol};
+use crate::scheduler::{PathSnapshot, TrafficClass};
 use std::collections::BTreeMap;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum CarrierWorkKind {
-    OwnerData,
-    RepairData,
+    OriginalData,
+    ReinjectedData,
 }
 
 impl CarrierWorkKind {
-    pub(crate) fn is_ordering_owner(self) -> bool {
-        matches!(self, Self::OwnerData)
+    pub(crate) fn is_original_transmission(self) -> bool {
+        matches!(self, Self::OriginalData)
     }
 }
 
@@ -22,11 +28,93 @@ impl CarrierWorkKind {
 pub(crate) enum ReliableWorkClass {
     Control,
     Data,
-    Repair,
+    Reinjection,
+}
+
+/// Caps one product reinjection event by current debt and configured resource
+/// ceilings; carrier command admission remains the final emission authority.
+pub(crate) fn reliable_critical_tail_reinjection_limit_bytes(
+    event_reinjection_limit: usize,
+    reinjection_debt_bytes: usize,
+    mux_limits: MuxLimits,
+) -> usize {
+    if reinjection_debt_bytes == 0 {
+        return 0;
+    }
+    let resource_cap = mux_limits
+        .max_repair_bytes
+        .min(mux_limits.max_path_flight_bytes)
+        .max(1);
+    reinjection_debt_bytes
+        .min(event_reinjection_limit.max(1))
+        .min(resource_cap)
+}
+
+/// Sizes failover of original product data from the live target's measured
+/// service opportunity without replacing native transport recovery.
+pub(crate) fn reliable_failed_original_reinjection_limit_bytes(
+    path: Option<PathSnapshot>,
+    reinjection_debt_bytes: usize,
+    mux_limits: MuxLimits,
+) -> usize {
+    // Failed-output ranges have already lost their native recovery owner. Keep
+    // one product work quantum available even when the replacement path already
+    // owns a full modeled flight; its TCP/QUIC sender still gates actual emission.
+    let event_limit =
+        adaptive_reliable_relay_reinjection_bytes(path, TrafficClass::Throughput, mux_limits)
+            .max(reliable_bulk_carrier_feed_quantum_bytes(mux_limits));
+    let target_flight =
+        adaptive_reliable_relay_inflight_bytes(path, TrafficClass::Throughput, mux_limits);
+    let existing_target_debt = path.map_or(0, |snapshot| {
+        snapshot
+            .data_level_bytes_in_flight
+            .max(snapshot.data_level_queue_bytes)
+            .max(snapshot.queue_bytes)
+            .min(usize::MAX as u64) as usize
+    });
+    let event_limit = event_limit.max(target_flight.saturating_sub(existing_target_debt));
+    reliable_critical_tail_reinjection_limit_bytes(event_limit, reinjection_debt_bytes, mux_limits)
+}
+
+/// Sizes one persistent Data ACK-gap reinjection from current target service
+/// opportunity while leaving TCP and QUIC recovery carrier-local.
+pub(crate) fn reliable_persistent_ack_gap_reinjection_limit_bytes(
+    path: Option<PathSnapshot>,
+    original_underlay: Option<UnderlayProtocol>,
+    traffic_class: TrafficClass,
+    reinjection_debt_bytes: usize,
+    mux_limits: MuxLimits,
+) -> usize {
+    let event_limit = adaptive_reliable_relay_reinjection_bytes(path, traffic_class, mux_limits);
+    let event_limit = if original_underlay == Some(UnderlayProtocol::Tcp) {
+        let service_flight =
+            adaptive_reliable_relay_inflight_bytes(path, TrafficClass::Throughput, mux_limits);
+        let existing_service_debt = path.map_or(0, |snapshot| {
+            snapshot
+                .data_level_bytes_in_flight
+                .max(snapshot.data_level_queue_bytes)
+                .max(snapshot.queue_bytes)
+                .min(usize::MAX as u64) as usize
+        });
+        event_limit.max(service_flight.saturating_sub(existing_service_debt))
+    } else {
+        event_limit
+    };
+    if event_limit == 0 {
+        return 0;
+    }
+    reliable_critical_tail_reinjection_limit_bytes(event_limit, reinjection_debt_bytes, mux_limits)
+}
+
+pub(crate) fn reliable_critical_tail_reinjection_is_over_budget(
+    budget_remaining: usize,
+    reinjection_limit: usize,
+) -> bool {
+    budget_remaining == 0 && reinjection_limit > 0
 }
 
 /// ACK release must use identical range math in both product directions so
-/// request and response ownership cannot disagree about path-proving bytes.
+/// request and response ledgers cannot disagree about path-proving bytes.
 pub(crate) fn ambiguous_flight_intervals(
     flights: impl IntoIterator<Item = (u64, u64)>,
 ) -> Vec<(u64, u64)> {

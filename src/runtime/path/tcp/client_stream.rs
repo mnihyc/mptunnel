@@ -8,7 +8,7 @@ use crate::lab_diagnostics::{lab_diagnostic, lab_perf_record};
 use crate::model::capacity::reliable_relay_buffer_len;
 #[cfg(feature = "lab-diagnostics")]
 use crate::protocol::frame::reliable_path_frame_pacing_bytes;
-use crate::protocol::{Frame, StreamId, StreamOpenRole, TargetAddr, UnderlayProtocol};
+use crate::protocol::{Frame, StreamId, TargetAddr, UnderlayProtocol};
 use crate::runtime::error::RuntimeError;
 use crate::runtime::path::commands::{
     ClientTcpOpenAttemptId, ClientTcpOpenResponse, ClientTcpOpenedStream, ReliablePathCommand,
@@ -19,7 +19,7 @@ use crate::runtime::path::tcp::client_state::{
     ClientTcpPathConnection, ClientTcpPathSessionRuntime,
 };
 use crate::runtime::recent_ids::RecentIdCache;
-use crate::scheduler::{FlowLane, stream_demand_hint_for_lane};
+use crate::scheduler::{TrafficClass, stream_demand_hint_for_traffic_class};
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
 #[cfg(feature = "lab-diagnostics")]
@@ -89,7 +89,7 @@ pub(super) struct ClientTcpPendingOpen {
     response: oneshot::Sender<ClientTcpOpenResponse>,
     frames: Option<mpsc::Receiver<Result<Frame, RuntimeError>>>,
     session_commands: ReliablePathCommandSender,
-    lane: FlowLane,
+    lane: TrafficClass,
     open_deadline: tokio::time::Instant,
 }
 
@@ -97,8 +97,7 @@ pub(super) struct ClientTcpOpenStreamRequest {
     pub(super) stream_id: StreamId,
     pub(super) attempt_id: ClientTcpOpenAttemptId,
     pub(super) target: TargetAddr,
-    pub(super) lane: FlowLane,
-    pub(super) role: StreamOpenRole,
+    pub(super) lane: TrafficClass,
     pub(super) open_deadline: tokio::time::Instant,
     pub(super) session_commands: ReliablePathCommandSender,
     pub(super) response: oneshot::Sender<ClientTcpOpenResponse>,
@@ -174,7 +173,6 @@ pub(super) async fn open_client_tcp_stream_on_connection(
         attempt_id,
         target,
         lane,
-        role,
         open_deadline,
         session_commands,
         response,
@@ -220,8 +218,7 @@ pub(super) async fn open_client_tcp_stream_on_connection(
             .write_frame(&Frame::OpenStream {
                 stream_id,
                 target,
-                demand: stream_demand_hint_for_lane(lane),
-                role,
+                demand: stream_demand_hint_for_traffic_class(lane),
             })
             .await?;
         connection.carrier.writer.flush().await
@@ -320,42 +317,42 @@ pub(super) async fn handle_client_tcp_stream_frame(
         } => {
             if let Some(state) = streams.get_mut(&stream_id)
                 && state.pending_open.is_some()
+                && let Some(mut pending) = state.pending_open.take()
             {
-                if let Some(mut pending) = state.pending_open.take() {
-                    let open_deadline = pending.open_deadline;
-                    let frames = pending
-                        .frames
-                        .take()
-                        .ok_or(RuntimeError::Protocol("missing TCP stream frame receiver"))?;
-                    let carrier = OpenedReliableCarrierStream {
-                        stream_id,
-                        max_offset,
-                        lane: pending.lane,
-                        underlay: UnderlayProtocol::Tcp,
-                        max_frame_payload_bytes: reliable_relay_buffer_len(runtime.mux_limits),
-                        startup: connection.startup_snapshot,
-                        commands: pending.session_commands,
-                        mux_limits: runtime.mux_limits,
-                        frames,
-                    };
-                    if pending
-                        .response
-                        .send(ClientTcpOpenResponse::Opened(ClientTcpOpenedStream {
-                            carrier,
-                            open_deadline,
-                        }))
-                        .is_err()
-                    {
-                        streams.remove(&stream_id);
-                        closed_streams.insert(stream_id);
-                        let detach = Frame::StreamDetach { stream_id };
-                        connection.carrier.writer.write_frame(&detach).await?;
-                        connection.path_proofs.record_sent_frame(&detach);
-                        connection.carrier.writer.flush().await?;
-                        connection.record_outbound_activity();
-                    }
-                    return Ok(());
+                let open_deadline = pending.open_deadline;
+                let frames = pending
+                    .frames
+                    .take()
+                    .ok_or(RuntimeError::Protocol("missing TCP stream frame receiver"))?;
+                let carrier = OpenedReliableCarrierStream {
+                    stream_id,
+                    path_instance_id: connection.path_instance_id,
+                    max_offset,
+                    lane: pending.lane,
+                    underlay: UnderlayProtocol::Tcp,
+                    max_frame_payload_bytes: reliable_relay_buffer_len(runtime.mux_limits),
+                    startup: connection.startup_snapshot,
+                    commands: pending.session_commands,
+                    mux_limits: runtime.mux_limits,
+                    frames,
+                };
+                if pending
+                    .response
+                    .send(ClientTcpOpenResponse::Opened(ClientTcpOpenedStream {
+                        carrier,
+                        open_deadline,
+                    }))
+                    .is_err()
+                {
+                    streams.remove(&stream_id);
+                    closed_streams.insert(stream_id);
+                    let detach = Frame::StreamDetach { stream_id };
+                    connection.carrier.writer.write_frame(&detach).await?;
+                    connection.path_proofs.record_sent_frame(&detach);
+                    connection.carrier.writer.flush().await?;
+                    connection.record_outbound_activity();
                 }
+                return Ok(());
             }
             route_client_tcp_stream_frame(
                 streams,

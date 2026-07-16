@@ -4,8 +4,6 @@
 
 use super::ResponseStreamBinding;
 use super::ack_clock::apply_response_ack_clock_release_samples;
-#[cfg(test)]
-use super::attachment::ResponseSenderPathTarget;
 use super::attachment::{ResponseDispatchTarget, ResponseStreamOutputs};
 #[cfg(feature = "lab-diagnostics")]
 use crate::lab_diagnostics::lab_diagnostic;
@@ -15,11 +13,13 @@ use crate::model::work::{
     CarrierWorkKind, ambiguous_flight_intervals, flight_interval_bytes, flight_intervals_overlap,
     split_flight_interval_by_ack,
 };
-use crate::protocol::frame::reliable_stream_frame_extent;
-use crate::protocol::{Frame, OffsetRange, StreamOpenRole, UnderlayProtocol};
+use crate::protocol::frame::{
+    normalize_offset_ranges, offset_ranges_not_covered, reliable_stream_frame_extent,
+};
+use crate::protocol::{Frame, OffsetRange, UnderlayProtocol};
 use crate::runtime::RuntimeError;
 use crate::runtime::path::commands::ReliablePathCommandSender;
-use crate::scheduler::{FlowLane, PathSnapshot};
+use crate::scheduler::{PathSnapshot, TrafficClass};
 use std::collections::{BTreeMap, HashMap};
 use std::sync::atomic::Ordering;
 use std::time::{Duration, Instant};
@@ -27,7 +27,7 @@ use std::time::{Duration, Instant};
 /// Product byte range currently assigned to a carrier path.
 ///
 /// STREAM_ACK releases this ledger entry from product flight; carrier ACKs only
-/// update carrier/path evidence and must not release product repair state.
+/// update carrier/path evidence and must not release product reinjection state.
 #[derive(Debug, Clone, Copy)]
 pub(in crate::runtime) struct CarrierPathFlight {
     pub(super) key: CarrierPathKey,
@@ -181,55 +181,44 @@ impl ResponseAckOrderingState {
     pub(super) fn acked_hole_bytes(&self) -> u64 {
         self.acked_holes
             .values()
-            .filter_map(|holes| response_latest_ordering_hole(holes))
+            .filter_map(|holes| response_latest_original_hole(holes))
             .map(|hole| hole.bytes)
             .sum()
     }
 }
 
-pub(in crate::runtime) fn response_latest_ordering_hole(
+pub(in crate::runtime) fn response_latest_original_hole(
     holes: &[CarrierPathAckedHole],
 ) -> Option<&CarrierPathAckedHole> {
     holes
         .iter()
         .rev()
-        .find(|hole| hole.kind.is_ordering_owner())
+        .find(|hole| hole.kind.is_original_transmission())
 }
 
 impl ResponseStreamBinding {
-    pub(in crate::runtime) fn tail_repair_snapshot(
+    pub(in crate::runtime) fn tail_reinjection_snapshot(
         &self,
         ack_frontier: u64,
-        lane: FlowLane,
+        lane: TrafficClass,
     ) -> Option<PathSnapshot> {
-        let owner_key = self
-            .blocking_owner_key_at_or_after(ack_frontier)
-            .or_else(|| self.ordered_data_owner());
+        let owner_key = self.blocking_original_path_key_at_or_after(ack_frontier);
         let outputs = self
             .outputs
             .lock()
             .expect("server reliable stream binding lock");
-        owner_key.and_then(|key| {
-            outputs.snapshot_for_key(
-                key,
-                self.session_id,
-                &self.lane_tracker,
-                lane,
-                self.mux_limits,
-            )
-        })
+        owner_key.and_then(|key| outputs.snapshot_for_key(key, lane, self.mux_limits))
     }
 
-    pub(in crate::runtime) fn tail_repair_owner_underlay(
+    pub(in crate::runtime) fn tail_reinjection_original_underlay(
         &self,
         ack_frontier: u64,
     ) -> Option<UnderlayProtocol> {
-        self.blocking_owner_key_at_or_after(ack_frontier)
-            .or_else(|| self.ordered_data_owner())
+        self.blocking_original_path_key_at_or_after(ack_frontier)
             .map(|key| key.underlay)
     }
 
-    pub(in crate::runtime) fn has_multipath_repair_alternative(&self) -> bool {
+    pub(in crate::runtime) fn has_multipath_reinjection_alternative(&self) -> bool {
         self.outputs
             .lock()
             .expect("server reliable stream binding lock")
@@ -238,7 +227,7 @@ impl ResponseStreamBinding {
             > 1
     }
 
-    pub(in crate::runtime) fn has_repair_output_for_frame(&self, frame: &Frame) -> bool {
+    pub(in crate::runtime) fn has_reinjection_path_for_frame(&self, frame: &Frame) -> bool {
         let avoid_keys = self.flight_keys_overlapping_frame(frame);
         let outputs = self
             .outputs
@@ -250,11 +239,8 @@ impl ResponseStreamBinding {
             .any(|entry| !avoid_keys.contains(&entry.key))
     }
 
-    pub(in crate::runtime) fn has_live_owner_tail_repair_output_for_frame(
-        &self,
-        frame: &Frame,
-    ) -> bool {
-        let owner_keys = self.owner_flight_keys_overlapping_frame(frame);
+    pub(in crate::runtime) fn has_tail_reinjection_output_for_frame(&self, frame: &Frame) -> bool {
+        let owner_keys = self.original_flight_keys_overlapping_frame(frame);
         if owner_keys.is_empty() {
             return false;
         }
@@ -266,7 +252,7 @@ impl ResponseStreamBinding {
             .any(|entry| !owner_keys.contains(&entry.key))
     }
 
-    pub(in crate::runtime) fn has_recent_live_repair_flight_overlap(
+    pub(in crate::runtime) fn has_recent_reinjection_overlap(
         &self,
         frame: &Frame,
         retry_after: Duration,
@@ -287,41 +273,79 @@ impl ResponseStreamBinding {
             .flights
             .lock()
             .expect("server reliable stream flight lock");
-        product_flights_have_recent_repair_overlap(&flights, start, end, now, retry_after, |key| {
-            live_keys.contains(&key)
-        })
+        product_flights_have_recent_reinjection_overlap(
+            &flights,
+            start,
+            end,
+            now,
+            retry_after,
+            |key| live_keys.contains(&key),
+        )
     }
 
-    pub(in crate::runtime) fn has_failed_owner_repair_output_for_frame(
-        &self,
-        frame: &Frame,
-    ) -> bool {
-        let avoid_keys = self.flight_keys_overlapping_frame(frame);
-        if avoid_keys.is_empty() {
-            return false;
-        }
+    /// Returns every unacknowledged OriginalData range whose exact output no
+    /// longer exists, excluding bytes already reinjected on a live output.
+    /// Native recovery remains responsible for ranges whose output is live.
+    pub(in crate::runtime) fn uncovered_failed_original_ranges(&self) -> Vec<OffsetRange> {
         let outputs = self
             .outputs
             .lock()
             .expect("server reliable stream binding lock");
-        let recorded_output_still_live = outputs
+        let live_outputs = outputs
             .entries
             .iter()
-            .any(|entry| avoid_keys.contains(&entry.key));
-        !recorded_output_still_live
-            && outputs
-                .entries
+            .filter(|entry| !entry.commands.is_closed())
+            .map(|entry| (entry.key, entry.incarnation))
+            .collect::<Vec<_>>();
+        if live_outputs.is_empty() {
+            return Vec::new();
+        }
+        let flights = self
+            .flights
+            .lock()
+            .expect("server reliable stream flight lock");
+        let failed_original_ranges = normalize_offset_ranges(
+            flights
                 .iter()
-                .any(|entry| !avoid_keys.contains(&entry.key))
+                .filter_map(|(start, path_flights)| {
+                    let original = path_flights
+                        .iter()
+                        .rev()
+                        .find(|flight| flight.kind.is_original_transmission())?;
+                    (!live_outputs.contains(&(original.key, original.output_incarnation)))
+                        .then_some(OffsetRange {
+                            start: *start,
+                            end: original.end,
+                        })
+                })
+                .collect(),
+        );
+        if failed_original_ranges.is_empty() {
+            return Vec::new();
+        }
+        let live_reinjected_ranges = normalize_offset_ranges(
+            flights
+                .iter()
+                .flat_map(|(start, path_flights)| {
+                    path_flights.iter().filter_map(|flight| {
+                        (flight.kind == CarrierWorkKind::ReinjectedData
+                            && live_outputs.contains(&(flight.key, flight.output_incarnation)))
+                        .then_some(OffsetRange {
+                            start: *start,
+                            end: flight.end,
+                        })
+                    })
+                })
+                .collect(),
+        );
+        offset_ranges_not_covered(&failed_original_ranges, &live_reinjected_ranges)
     }
 
-    pub(in crate::runtime) fn has_unknown_owner_repair_output_for_frame(
+    pub(in crate::runtime) fn has_untracked_data_reinjection_path_for_frame(
         &self,
         frame: &Frame,
     ) -> bool {
-        if !self.flight_keys_overlapping_frame(frame).is_empty()
-            || self.ordered_data_owner().is_some()
-        {
+        if !self.flight_keys_overlapping_frame(frame).is_empty() {
             return false;
         }
         !self
@@ -368,15 +392,6 @@ impl ResponseStreamBinding {
             }
             return;
         }
-        let active_calibration_has_owner_flights = outputs
-            .active_ack_clock_calibration
-            .is_some_and(|(active_key, active_incarnation)| {
-                flights.values().flatten().any(|flight| {
-                    flight.key == active_key
-                        && flight.output_incarnation == active_incarnation
-                        && flight.kind.is_ordering_owner()
-                })
-            });
         drop(flights);
 
         let ordering_update = {
@@ -406,22 +421,18 @@ impl ResponseStreamBinding {
         for (_, release) in released {
             let flight = release.flight;
             let identity = (flight.key, flight.output_incarnation);
-            let stage_authorized_at = outputs
-                .ack_clock_calibrations
-                .get(&identity)
-                .map(|calibration| calibration.stage_authorized_at);
             if let Some(entry) = outputs.entries.iter_mut().find(|entry| {
                 entry.key == flight.key && entry.incarnation == flight.output_incarnation
             }) {
                 entry.bytes_in_flight = entry.bytes_in_flight.saturating_sub(flight.bytes as u64);
-                if flight.kind.is_ordering_owner() {
-                    entry.owner_data_in_flight_bytes = entry
-                        .owner_data_in_flight_bytes
+                if flight.kind.is_original_transmission() {
+                    entry.original_data_in_flight_bytes = entry
+                        .original_data_in_flight_bytes
                         .saturating_sub(flight.bytes as u64);
                 }
                 if release.path_proving {
-                    entry.owner_data_acked_bytes = entry
-                        .owner_data_acked_bytes
+                    entry.original_data_acked_bytes = entry
+                        .original_data_acked_bytes
                         .saturating_add(flight.bytes as u64);
                     let sample = path_samples.entry(identity).or_insert((
                         0_u64,
@@ -430,25 +441,14 @@ impl ResponseStreamBinding {
                         flight.sent_at,
                     ));
                     sample.0 = sample.0.saturating_add(flight.bytes as u64);
-                    if stage_authorized_at
-                        .is_some_and(|authorized_at| flight.sent_at >= authorized_at)
-                    {
-                        sample.1 = sample.1.saturating_add(flight.bytes as u64);
-                    }
+                    sample.1 = sample.1.saturating_add(flight.bytes as u64);
                     sample.2 = sample.2.min(flight.sent_at);
                     sample.3 = sample.3.max(flight.sent_at);
                 }
                 changed = true;
             }
         }
-        apply_response_ack_clock_release_samples(
-            &mut outputs,
-            path_samples,
-            active_calibration_has_owner_flights,
-            now,
-            self.session_id.0,
-            self.binding_instance_id,
-        );
+        apply_response_ack_clock_release_samples(&mut outputs, path_samples, now);
         for hole in ordering_update.newly_contiguous {
             if !hole.path_proving {
                 continue;
@@ -457,62 +457,23 @@ impl ResponseStreamBinding {
                 .entries
                 .iter_mut()
                 .find(|entry| entry.key == hole.key && entry.incarnation == hole.output_incarnation)
+                && hole.end <= ordering_update.contiguous_frontier
             {
-                if hole.end <= ordering_update.contiguous_frontier {
-                    entry.delivery_samples = entry.delivery_samples.saturating_add(1);
-                    changed = true;
-                }
+                entry.delivery_samples = entry.delivery_samples.saturating_add(1);
+                changed = true;
             }
         }
-        // A planner captures this before reading lower flights and path
+        // Scheduling captures this before reading lower flights and path
         // snapshots. Publish it only after both ledgers describe the ACK.
         self.response_model_generation
             .fetch_add(1, Ordering::AcqRel);
         drop(outputs);
         if changed || ordering_update.changed {
-            self.graduate_completed_response_startup_owner();
-            // ACK progress updates path evidence and ordering, but Subflow
-            // admission credit is epoch state. Recreate it only on a semantic
-            // reset or admission-envelope change, not passive membership growth.
             self.notify_update();
         }
     }
 
-    #[cfg(test)]
-    pub(in crate::runtime) fn record_owner_flight_for_target(
-        &self,
-        target: &ResponseSenderPathTarget,
-        frame: &Frame,
-    ) {
-        let observation = target.observation;
-        let Some(commands) = self
-            .outputs
-            .lock()
-            .expect("server reliable stream binding lock")
-            .entries
-            .iter()
-            .find(|entry| {
-                entry.key == observation.key
-                    && entry.path_instance_id == observation.path_instance_id
-                    && entry.incarnation == observation.incarnation
-                    && entry.role == observation.attachment_role
-            })
-            .map(|entry| entry.commands.clone())
-        else {
-            // A stale observe result cannot mutate a replacement output.
-            return;
-        };
-        self.record_product_flight(
-            observation.key,
-            observation.incarnation,
-            observation.attachment_role,
-            &commands,
-            frame,
-            CarrierWorkKind::OwnerData,
-        )
-    }
-
-    pub(super) fn record_validated_owner_flight_with_outputs(
+    pub(super) fn record_validated_original_flight_with_outputs(
         &self,
         outputs: &mut ResponseStreamOutputs,
         target_index: usize,
@@ -526,9 +487,8 @@ impl ResponseStreamBinding {
                 .entries
                 .get_mut(target_index)
                 .expect("validated response output index");
-            debug_assert_ne!(entry.role, StreamOpenRole::Repair);
-            entry.owner_data_in_flight_bytes = entry
-                .owner_data_in_flight_bytes
+            entry.original_data_in_flight_bytes = entry
+                .original_data_in_flight_bytes
                 .saturating_add(bytes as u64);
             entry.bytes_in_flight = entry.bytes_in_flight.saturating_add(bytes as u64);
             (entry.key, entry.incarnation)
@@ -544,20 +504,20 @@ impl ResponseStreamBinding {
                 end,
                 bytes,
                 sent_at: Instant::now(),
-                kind: CarrierWorkKind::OwnerData,
+                kind: CarrierWorkKind::OriginalData,
                 evidence_eligible: true,
             });
         // Keep path counters and the exact range ledger in one published model
-        // generation so a concurrent calibration plan cannot mix the views.
+        // generation so a concurrent measurement plan cannot mix the views.
         self.response_model_generation
             .fetch_add(1, Ordering::AcqRel);
     }
 
-    pub(in crate::runtime) fn try_enqueue_repair_frame_for_target(
+    pub(in crate::runtime) fn try_enqueue_reinjected_frame_for_target(
         &self,
         target: &ResponseDispatchTarget,
         frame: &Frame,
-        lane: FlowLane,
+        lane: TrafficClass,
     ) -> Result<(), RuntimeError> {
         if !self.response_stream_open.load(Ordering::Acquire) {
             return Err(RuntimeError::SenderServiceBlocked);
@@ -573,68 +533,65 @@ impl ResponseStreamBinding {
             entry.key == target.key
                 && entry.path_instance_id == target.path_instance_id
                 && entry.incarnation == target.incarnation
-                && entry.role == target.attachment_role
         }) else {
             return Err(RuntimeError::SenderServiceBlocked);
         };
         let commands = outputs.entries[target_index].commands.clone();
-        commands.try_enqueue_admitted_frame(frame.clone(), lane)?;
+        let command = commands.try_reserve_stream_ordered_frame(frame.clone(), lane)?;
         self.record_product_flight_with_outputs(
             &mut outputs,
             target.key,
             target.incarnation,
-            target.attachment_role,
             &commands,
             frame,
-            CarrierWorkKind::RepairData,
+            CarrierWorkKind::ReinjectedData,
         );
+        command.commit();
         Ok(())
     }
 
     #[cfg(test)]
-    pub(in crate::runtime) fn record_owner_flight(&self, key: CarrierPathKey, frame: &Frame) {
-        let (incarnation, role, commands) = self
+    pub(in crate::runtime) fn record_original_flight(&self, key: CarrierPathKey, frame: &Frame) {
+        let (incarnation, commands) = self
             .outputs
             .lock()
             .expect("server reliable stream binding lock")
             .entries
             .iter()
             .find(|entry| entry.key == key)
-            .map(|entry| (entry.incarnation, entry.role, entry.commands.clone()))
+            .map(|entry| (entry.incarnation, entry.commands.clone()))
             .expect("test owner output must be attached");
         self.record_product_flight(
             key,
             incarnation,
-            role,
             &commands,
             frame,
-            CarrierWorkKind::OwnerData,
+            CarrierWorkKind::OriginalData,
         )
     }
 
     #[cfg(test)]
-    pub(in crate::runtime) fn record_repair_flight(&self, key: CarrierPathKey, frame: &Frame) {
-        let (incarnation, role, commands) = self
+    pub(in crate::runtime) fn record_reinjected_flight(&self, key: CarrierPathKey, frame: &Frame) {
+        let (incarnation, commands) = self
             .outputs
             .lock()
             .expect("server reliable stream binding lock")
             .entries
             .iter()
             .find(|entry| entry.key == key)
-            .map(|entry| (entry.incarnation, entry.role, entry.commands.clone()))
-            .expect("test repair output must be attached");
+            .map(|entry| (entry.incarnation, entry.commands.clone()))
+            .expect("test reinjection output must be attached");
         self.record_product_flight(
             key,
             incarnation,
-            role,
             &commands,
             frame,
-            CarrierWorkKind::RepairData,
+            CarrierWorkKind::ReinjectedData,
         )
     }
 
     #[cfg(test)]
-    pub(in crate::runtime) fn age_repair_flights_for_test(&self, age: Duration) {
+    pub(in crate::runtime) fn age_reinjected_flights_for_test(&self, age: Duration) {
         let sent_at = Instant::now().checked_sub(age).unwrap_or_else(Instant::now);
         let mut flights = self
             .flights
@@ -642,7 +599,7 @@ impl ResponseStreamBinding {
             .expect("server reliable stream flight lock");
         for path_flights in flights.values_mut() {
             for flight in path_flights {
-                if flight.kind == CarrierWorkKind::RepairData {
+                if flight.kind == CarrierWorkKind::ReinjectedData {
                     flight.sent_at = sent_at;
                 }
             }
@@ -654,7 +611,6 @@ impl ResponseStreamBinding {
         &self,
         key: CarrierPathKey,
         output_incarnation: u64,
-        planned_role: StreamOpenRole,
         planned_commands: &ReliablePathCommandSender,
         frame: &Frame,
         kind: CarrierWorkKind,
@@ -667,20 +623,17 @@ impl ResponseStreamBinding {
             &mut outputs,
             key,
             output_incarnation,
-            planned_role,
             planned_commands,
             frame,
             kind,
         );
     }
 
-    #[allow(clippy::too_many_arguments)]
     fn record_product_flight_with_outputs(
         &self,
         outputs: &mut ResponseStreamOutputs,
         key: CarrierPathKey,
         output_incarnation: u64,
-        planned_role: StreamOpenRole,
         planned_commands: &ReliablePathCommandSender,
         frame: &Frame,
         kind: CarrierWorkKind,
@@ -694,17 +647,13 @@ impl ResponseStreamBinding {
             .find(|entry| entry.key == key && entry.commands.same_channel(planned_commands))
         {
             let incarnation_matches = entry.incarnation == output_incarnation;
-            let role_matches = entry.role == planned_role;
-            if kind.is_ordering_owner() {
-                entry.owner_data_in_flight_bytes = entry
-                    .owner_data_in_flight_bytes
+            if kind.is_original_transmission() {
+                entry.original_data_in_flight_bytes = entry
+                    .original_data_in_flight_bytes
                     .saturating_add(bytes as u64);
             }
             entry.bytes_in_flight = entry.bytes_in_flight.saturating_add(bytes as u64);
-            (
-                entry.incarnation,
-                incarnation_matches && role_matches && planned_role != StreamOpenRole::Repair,
-            )
+            (entry.incarnation, incarnation_matches)
         } else {
             (output_incarnation, false)
         };
@@ -745,36 +694,6 @@ impl ResponseStreamBinding {
         }
     }
 
-    pub(super) fn rebind_path_flights_after_live_role_change(
-        &self,
-        key: CarrierPathKey,
-        previous_incarnation: u64,
-        current_incarnation: u64,
-    ) {
-        let mut flights = self
-            .flights
-            .lock()
-            .expect("server reliable stream flight lock");
-        for path_flights in flights.values_mut() {
-            for flight in path_flights.iter_mut().filter(|flight| {
-                flight.key == key && flight.output_incarnation == previous_incarnation
-            }) {
-                flight.output_incarnation = current_incarnation;
-                flight.evidence_eligible = false;
-            }
-        }
-    }
-
-    pub(in crate::runtime) fn lower_flights_before_frame(
-        &self,
-        frame: &Frame,
-    ) -> Vec<CarrierPathFlightDebt> {
-        let Some((offset, _, _)) = reliable_stream_frame_extent(frame) else {
-            return Vec::new();
-        };
-        self.lower_flights_before_offset(offset)
-    }
-
     pub(in crate::runtime) fn flight_keys_overlapping_frame(
         &self,
         frame: &Frame,
@@ -798,7 +717,7 @@ impl ResponseStreamBinding {
         keys
     }
 
-    pub(in crate::runtime) fn owner_flight_keys_overlapping_frame(
+    pub(in crate::runtime) fn original_flight_keys_overlapping_frame(
         &self,
         frame: &Frame,
     ) -> Vec<CarrierPathKey> {
@@ -813,7 +732,7 @@ impl ResponseStreamBinding {
         for (_, path_flights) in flights.range(..end) {
             for flight in path_flights {
                 if flight.end <= start
-                    || !flight.kind.is_ordering_owner()
+                    || !flight.kind.is_original_transmission()
                     || keys.contains(&flight.key)
                 {
                     continue;
@@ -830,16 +749,39 @@ impl ResponseStreamBinding {
     ) -> Vec<CarrierPathFlightDebt> {
         let mut debts = BTreeMap::<u64, CarrierPathFlightDebt>::new();
         {
+            let flights = self
+                .flights
+                .lock()
+                .expect("server reliable stream flight lock");
+            for (flight_offset, path_flights) in flights.range(..offset) {
+                if let Some(original) = path_flights
+                    .iter()
+                    .rev()
+                    .find(|flight| flight.kind.is_original_transmission())
+                {
+                    debts.insert(
+                        *flight_offset,
+                        CarrierPathFlightDebt {
+                            key: original.key,
+                            output_incarnation: original.output_incarnation,
+                            bytes: original.bytes as u64,
+                        },
+                    );
+                }
+            }
+        }
+        {
             let ack_ordering = self
                 .ack_ordering
                 .lock()
                 .expect("server response ACK ordering lock");
             for (hole_offset, holes) in ack_ordering.acked_holes.range(..offset) {
-                if let Some(latest) = response_latest_ordering_hole(holes) {
+                if let Some(latest) = response_latest_original_hole(holes) {
                     debts.insert(
                         *hole_offset,
                         CarrierPathFlightDebt {
                             key: latest.key,
+                            output_incarnation: latest.output_incarnation,
                             bytes: latest.bytes,
                         },
                     );
@@ -849,14 +791,14 @@ impl ResponseStreamBinding {
         debts.into_values().collect()
     }
 
-    fn blocking_owner_key_at_or_after(&self, offset: u64) -> Option<CarrierPathKey> {
+    fn blocking_original_path_key_at_or_after(&self, offset: u64) -> Option<CarrierPathKey> {
         let flights = self
             .flights
             .lock()
             .expect("server reliable stream flight lock");
         for path_flights in flights.values() {
             for flight in path_flights {
-                if flight.kind.is_ordering_owner() && flight.end > offset {
+                if flight.kind.is_original_transmission() && flight.end > offset {
                     return Some(flight.key);
                 }
             }
@@ -901,7 +843,7 @@ pub(in crate::runtime::stream) fn release_carrier_path_flight_ranges(
                         ..flight
                     },
                     path_proving: flight.evidence_eligible
-                        && flight.kind.is_ordering_owner()
+                        && flight.kind.is_original_transmission()
                         && !flight_intervals_overlap(&ambiguous_intervals, acked_start, acked_end),
                 },
             ));
@@ -924,7 +866,7 @@ pub(in crate::runtime::stream) fn release_carrier_path_flight_ranges(
     released
 }
 
-pub(in crate::runtime::stream) fn product_flights_have_recent_repair_overlap(
+pub(in crate::runtime::stream) fn product_flights_have_recent_reinjection_overlap(
     flights: &BTreeMap<u64, Vec<CarrierPathFlight>>,
     start: u64,
     end: u64,
@@ -940,7 +882,7 @@ pub(in crate::runtime::stream) fn product_flights_have_recent_repair_overlap(
             if offset >= end || flight.end <= start {
                 continue;
             }
-            if flight.kind != CarrierWorkKind::RepairData || !live(flight.key) {
+            if flight.kind != CarrierWorkKind::ReinjectedData || !live(flight.key) {
                 continue;
             }
             if now.saturating_duration_since(flight.sent_at) < retry_after {

@@ -1,5 +1,5 @@
 use super::*;
-use crate::config::{CommandConfig, TransportSecurity};
+use crate::config::CommandConfig;
 
 fn ingress_configs(ingresses: &[LocalIngressConfig]) -> Vec<IngressConfig> {
     ingresses
@@ -9,7 +9,7 @@ fn ingress_configs(ingresses: &[LocalIngressConfig]) -> Vec<IngressConfig> {
 }
 
 #[test]
-fn resource_file_config_derives_path_flight_from_repair_envelope() {
+fn resource_file_config_derives_path_flight_from_reinjection_envelope() {
     let limits = ResourceFileConfig {
         max_repair_bytes: Some(128 * 1024 * 1024),
         ..ResourceFileConfig::default()
@@ -38,7 +38,9 @@ fn node_config_toml_uses_inbound_to_mpp_outbound_defaults_and_management() {
         r#"
 [management]
 listen = ["127.0.0.1:7600"]
-token = "operator-token"
+token = "operator-token-123"
+dashboard = true
+allow_peer_diagnostics = true
 
 [[inbounds]]
 protocol = "socks5"
@@ -57,8 +59,9 @@ secret = "0123456789abcdef0123456789abcdef"
     )
     .expect("config");
 
-    assert_eq!(config.security.transport, TransportSecurity::Encrypted);
     assert_eq!(config.management.listen.len(), 1);
+    assert!(config.management.dashboard);
+    assert!(config.management.allow_peer_diagnostics);
     match config.command {
         CommandConfig::Node(node) => {
             assert!(node.servers.is_empty());

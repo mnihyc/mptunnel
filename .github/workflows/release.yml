@@ -61,8 +61,6 @@ jobs:
       - name: Package Unix
         if: matrix.shell == 'bash'
         shell: bash
-        env:
-          CARGO_TARGET_AARCH64_UNKNOWN_LINUX_MUSL_LINKER: rust-lld
         run: scripts/package-release.sh --target "${{ matrix.target }}"
       - name: Package Windows
         if: matrix.shell == 'pwsh'

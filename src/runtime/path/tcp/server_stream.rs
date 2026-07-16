@@ -11,8 +11,7 @@ use crate::model::capacity::{
 #[cfg(feature = "lab-diagnostics")]
 use crate::protocol::frame::stream_ack_contiguous_frontier;
 use crate::protocol::{
-    Frame, PathId, PathMetrics, SessionId, StreamDemandHint, StreamId, StreamOpenRole, TargetAddr,
-    UnderlayProtocol,
+    Frame, PathId, SessionId, StreamDemandHint, StreamId, TargetAddr, UnderlayProtocol,
 };
 use crate::runtime::error::RuntimeError;
 use crate::runtime::path::commands::ReliablePathCommandSender;
@@ -21,7 +20,7 @@ use crate::runtime::path::{
     ServerCarrierPathRegistration, ServerStreamOpenOutcome, ServerStreamOpenRequest,
     ServerStreamPathAttachment,
 };
-use crate::scheduler::flow_lane_from_stream_demand_hint;
+use crate::scheduler::traffic_class_from_stream_demand_hint;
 use std::collections::HashSet;
 
 pub(super) struct ServerTcpStreamState {
@@ -39,21 +38,19 @@ impl ServerTcpStreamState {
         self.attached.is_empty()
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub(super) async fn open(
         &mut self,
         context: &ServerPathContext,
         path_registration: &ServerCarrierPathRegistration,
         commands: &ReliablePathCommandSender,
         session_id: SessionId,
-        path_id: PathId,
-        startup_metrics: Option<PathMetrics>,
         stream_id: StreamId,
         target: TargetAddr,
         demand: StreamDemandHint,
-        role: StreamOpenRole,
     ) -> Result<Option<Frame>, RuntimeError> {
         context.reliable_streams.validate_target(&target)?;
-        let lane = flow_lane_from_stream_demand_hint(demand);
+        let lane = traffic_class_from_stream_demand_hint(demand);
         let response = match context
             .reliable_streams
             .open_or_attach(ServerStreamOpenRequest {
@@ -65,8 +62,6 @@ impl ServerTcpStreamState {
                     path_registration: path_registration.clone(),
                     commands: commands.clone(),
                     max_frame_payload_bytes: reliable_relay_buffer_len(context.mux_limits),
-                    role,
-                    initial_metrics: startup_metrics,
                 },
                 mux_limits: context.mux_limits,
             })
@@ -77,20 +72,7 @@ impl ServerTcpStreamState {
                 None
             }
             ServerStreamOpenOutcome::Existing => {
-                if role != StreamOpenRole::Validation {
-                    self.attached.insert(stream_id);
-                }
-                context
-                    .reliable_streams
-                    .route_frame(
-                        session_id,
-                        stream_id,
-                        Frame::PathStatus {
-                            path_id,
-                            status: crate::protocol::PathStatus::Active,
-                        },
-                    )
-                    .await?;
+                self.attached.insert(stream_id);
                 Some(Frame::StreamMaxData {
                     stream_id,
                     max_offset: reliable_stream_initial_advertised_window_bytes(
@@ -100,7 +82,10 @@ impl ServerTcpStreamState {
                     ),
                 })
             }
-            ServerStreamOpenOutcome::DuplicateLiveIgnored => None,
+            ServerStreamOpenOutcome::DuplicateLiveIgnored => Some(Frame::StreamReset {
+                stream_id,
+                reason: crate::protocol::ResetReason::Refused,
+            }),
             ServerStreamOpenOutcome::Rejected => Some(Frame::StreamReset {
                 stream_id,
                 reason: crate::protocol::ResetReason::Refused,
@@ -112,7 +97,7 @@ impl ServerTcpStreamState {
     pub(super) async fn route_frame(
         &self,
         context: &ServerPathContext,
-        session_id: SessionId,
+        path_registration: &ServerCarrierPathRegistration,
         path_id: PathId,
         stream_id: StreamId,
         frame: Frame,
@@ -139,7 +124,7 @@ impl ServerTcpStreamState {
         }
         context
             .reliable_streams
-            .route_frame(session_id, stream_id, frame)
+            .route_frame(path_registration, stream_id, frame)
             .await?;
         Ok(())
     }

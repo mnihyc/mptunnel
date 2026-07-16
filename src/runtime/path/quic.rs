@@ -5,7 +5,7 @@
 
 mod capacity;
 pub(in crate::runtime) use capacity::{
-    RequestQuicCapacityProbeLease, RequestQuicCapacityProductHandoffState,
+    RequestQuicCapacityProbeLease, RequestQuicCapacityProductAdmissionState,
     RequestQuicCapacityReconciliationQuery,
 };
 pub(in crate::runtime::path) use capacity::{
@@ -23,4 +23,5 @@ mod server_stream;
 mod server_writer;
 
 #[cfg(test)]
+#[path = "quic/estimator_test_support_test.rs"]
 mod estimator_test_support;

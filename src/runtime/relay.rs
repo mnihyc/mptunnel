@@ -14,14 +14,7 @@ pub(super) mod remote;
 mod server;
 
 #[cfg(test)]
-pub(super) use control::*;
-#[cfg(test)]
 pub(super) use flow::*;
 #[cfg(test)]
 pub(super) use io::*;
-#[cfg(any(test, feature = "lab-diagnostics"))]
-pub(in crate::runtime) use remote::ReliableRelayRemotePath;
-pub(in crate::runtime) use remote::ReliableRelayRemoteSet;
 pub(in crate::runtime) use server::ServerReliableRelayService;
-#[cfg(test)]
-pub(in crate::runtime) use server::relay_reliable_stream;

@@ -10,14 +10,14 @@ use crate::model::capacity::{
 };
 use crate::model::path::RelayPathKey;
 use crate::model::timing::{
-    active_path_open_pto_multiplier, active_path_open_serialized_exchanges, path_open_pto,
+    path_open_pto, path_open_pto_multiplier, path_open_serialized_exchanges,
     transport_pto_from_snapshot,
 };
 use crate::mux::datagram::DatagramError;
 use crate::protocol::{TargetAddr, UnderlayProtocol};
 use crate::runtime::error::RuntimeError;
 use crate::runtime::path::ClientPathContext;
-use crate::scheduler::{FlowLane, PathSnapshot};
+use crate::scheduler::{PathSnapshot, TrafficClass};
 use bytes::Bytes;
 use std::time::{Duration, Instant};
 
@@ -37,7 +37,7 @@ impl TcpDatagramClientAssociation {
             return Err(RuntimeError::NoTcpPath);
         }
         let candidates = context.ordered_tcp_path_indices(
-            FlowLane::RealtimeDatagram,
+            TrafficClass::RealtimeDatagram,
             payload_bytes.max(PATH_OPEN_SCORE_BYTES),
         );
         if candidates.is_empty() {
@@ -58,7 +58,7 @@ impl TcpDatagramClientAssociation {
             let eta_ms = context
                 .reliable_relay_path_eta_ms(
                     key,
-                    FlowLane::RealtimeDatagram,
+                    TrafficClass::RealtimeDatagram,
                     payload_bytes.max(PATH_OPEN_SCORE_BYTES),
                 )
                 .unwrap_or(f64::INFINITY);
@@ -80,7 +80,7 @@ impl TcpDatagramClientAssociation {
                     context.mark_tcp_path_open_success(
                         path_index,
                         started_at.elapsed(),
-                        FlowLane::RealtimeDatagram,
+                        TrafficClass::RealtimeDatagram,
                     );
                     return Ok(Self { context, session });
                 }
@@ -120,7 +120,7 @@ impl TcpDatagramClientAssociation {
             let has_tcp_alternative = product_attempts + 1 < attempt_limit
                 && self
                     .context
-                    .ordered_tcp_path_indices(FlowLane::RealtimeDatagram, payload.len())
+                    .ordered_tcp_path_indices(TrafficClass::RealtimeDatagram, payload.len())
                     .into_iter()
                     .any(|path_index| path_index != self.session.path_index);
             let remaining = Duration::from_millis(u64::from(remaining_ttl_ms));
@@ -148,7 +148,7 @@ impl TcpDatagramClientAssociation {
                         self.context
                             .mark_tcp_path_delivery(path_index, self.session.delivery_stats());
                         self.context
-                            .release_tcp_path_load(path_index, FlowLane::RealtimeDatagram);
+                            .release_tcp_path_load(path_index, TrafficClass::RealtimeDatagram);
                         self.context.mark_tcp_path_failure(path_index);
                     }
                     return Ok((response, reusable));
@@ -166,7 +166,7 @@ impl TcpDatagramClientAssociation {
                             );
                             self.context.release_tcp_path_load(
                                 failed_path_index,
-                                FlowLane::RealtimeDatagram,
+                                TrafficClass::RealtimeDatagram,
                             );
                             self.context.mark_tcp_path_failure(failed_path_index);
                         }
@@ -181,7 +181,7 @@ impl TcpDatagramClientAssociation {
                     self.context
                         .mark_tcp_path_delivery(failed_path_index, self.session.delivery_stats());
                     self.context
-                        .release_tcp_path_load(failed_path_index, FlowLane::RealtimeDatagram);
+                        .release_tcp_path_load(failed_path_index, TrafficClass::RealtimeDatagram);
                     self.context.mark_tcp_path_failure(failed_path_index);
                     if has_unattempted_outer_alternative
                         || product_attempts >= attempt_limit
@@ -222,7 +222,7 @@ impl TcpDatagramClientAssociation {
                     self.context
                         .mark_tcp_path_delivery(failed_path_index, self.session.delivery_stats());
                     self.context
-                        .release_tcp_path_load(failed_path_index, FlowLane::RealtimeDatagram);
+                        .release_tcp_path_load(failed_path_index, TrafficClass::RealtimeDatagram);
                     self.context.mark_tcp_path_failure(failed_path_index);
                     if has_unattempted_outer_alternative
                         || product_attempts >= attempt_limit
@@ -257,7 +257,7 @@ impl TcpDatagramClientAssociation {
                     self.context
                         .mark_tcp_path_delivery(failed_path_index, self.session.delivery_stats());
                     self.context
-                        .release_tcp_path_load(failed_path_index, FlowLane::RealtimeDatagram);
+                        .release_tcp_path_load(failed_path_index, TrafficClass::RealtimeDatagram);
                     self.context.mark_tcp_path_failure(failed_path_index);
                     return Err(DatagramUnderlaySendError::Runtime {
                         path_was_acked,
@@ -288,7 +288,7 @@ impl TcpDatagramClientAssociation {
         self.context
             .mark_tcp_path_delivery(self.session.path_index, self.session.delivery_stats());
         self.context
-            .release_tcp_path_load(self.session.path_index, FlowLane::RealtimeDatagram);
+            .release_tcp_path_load(self.session.path_index, TrafficClass::RealtimeDatagram);
         close_result
     }
 }
@@ -325,11 +325,11 @@ pub(in crate::runtime) fn tcp_datagram_path_open_timeout(
     let fresh_carrier_pto = path_open_pto(snapshot, false);
     if has_unattempted_alternative {
         fresh_carrier_pto
-            .saturating_mul(active_path_open_serialized_exchanges(snapshot))
+            .saturating_mul(path_open_serialized_exchanges(snapshot))
             .min(remaining_ttl / 2)
     } else {
         fresh_carrier_pto
-            .saturating_mul(active_path_open_pto_multiplier(snapshot))
+            .saturating_mul(path_open_pto_multiplier(snapshot))
             .min(remaining_ttl)
     }
 }

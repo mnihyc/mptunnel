@@ -1,13 +1,13 @@
-//! TCP capacity calibration and receipt-proof ownership.
+//! TCP capacity measurement and receipt-proof ownership.
 //!
 //! One TCP path owns one exact reservation-to-proof transaction. This module
 //! also converts typed receiver receipts and optional native snapshots into
 //! capacity evidence; socket capture and polling remain in `metrics`.
 
 use super::metrics::TcpNativeObservation;
-pub(in crate::runtime) use crate::model::capacity::TcpCapacityProofCandidate;
 use crate::model::capacity::{
-    BBR_DEFAULT_CWND_GAIN, PATH_OPEN_SCORE_BYTES, RELIABLE_INITIAL_RTT, TRANSPORT_TIMER_GRANULARITY,
+    PATH_OPEN_SCORE_BYTES, RELIABLE_INITIAL_RTT, TRANSPORT_TIMER_GRANULARITY,
+    TcpCapacityProofCandidate, valid_tcp_capacity_proof_candidate_at,
 };
 use crate::model::path::RelayPathInstance;
 use crate::protocol::{PathId, PathMetricDirection, PathMetrics, StreamId, UnderlayProtocol};
@@ -416,9 +416,7 @@ impl ClientPathState {
             return None;
         }
         let mut health = self.health().lock().expect("client path health lock");
-        let Some(record) = health.tcp.get_mut(path_index) else {
-            return None;
-        };
+        let record = health.tcp.get_mut(path_index)?;
         record.maintain(now);
         // Distinct TCP sockets have independent ordering. The path capsule owns
         // exact identity while the session budget bounds their cumulative cost.
@@ -459,22 +457,6 @@ impl ClientPathState {
     }
 }
 
-pub(in crate::runtime) fn valid_tcp_capacity_proof_candidate_at(
-    proof: TcpCapacityProofCandidate,
-    now: Instant,
-) -> bool {
-    proof.token > 0
-        && proof.train_bytes >= PATH_OPEN_SCORE_BYTES as u64
-        && proof.received_bytes == proof.train_bytes
-        && proof.rate_sample_bytes >= PATH_OPEN_SCORE_BYTES as u64
-        && proof.rate_sample_bytes <= proof.train_bytes
-        && !proof.proof_elapsed.is_zero()
-        && proof.receipt_rate_bps > 0
-        && proof.rate_bps >= proof.receipt_rate_bps
-        && proof.accepted_at < proof.expires_at
-        && now < proof.expires_at
-}
-
 pub(in crate::runtime) fn tcp_capacity_receipt_rate_bps(
     sample_bytes: u64,
     elapsed: Duration,
@@ -493,20 +475,6 @@ pub(in crate::runtime) fn tcp_capacity_proof_validity(metrics: PathMetrics) -> D
         .clamp(Duration::from_secs(1), Duration::from_secs(5))
 }
 
-pub(in crate::runtime) fn tcp_capacity_authoritative_rate_bps(
-    receipt_rate_bps: u64,
-    delivery_rate_bps: u64,
-) -> u64 {
-    // The typed receipt rate remains the floor. Native ACK delivery may lift
-    // it by one BBR cwnd gain; pacing alone still proves no delivery.
-    let receipt_uplift = (receipt_rate_bps as f64 * BBR_DEFAULT_CWND_GAIN)
-        .ceil()
-        .clamp(1.0, u64::MAX as f64) as u64;
-    receipt_rate_bps
-        .max(delivery_rate_bps.min(receipt_uplift))
-        .max(1)
-}
-
 pub(in crate::runtime) fn request_tcp_capacity_receipt_metrics(
     path_id: PathId,
     received_bytes: u64,
@@ -515,7 +483,7 @@ pub(in crate::runtime) fn request_tcp_capacity_receipt_metrics(
     native: Option<TcpNativeObservation>,
 ) -> PathMetrics {
     // A cold request train may be below the real BDP. Its full receiver receipt
-    // is the conservative rate seed; product ACKs replace it after handoff.
+    // is the conservative rate seed; product ACKs replace it after product admission.
     tcp_capacity_receipt_metrics(
         path_id,
         PathMetricDirection::ClientToServer,
@@ -523,27 +491,6 @@ pub(in crate::runtime) fn request_tcp_capacity_receipt_metrics(
         receipt_rate_bps,
         baseline,
         native,
-        false,
-    )
-}
-
-pub(in crate::runtime) fn response_tcp_capacity_receipt_metrics(
-    path_id: PathId,
-    received_bytes: u64,
-    receipt_rate_bps: u64,
-    baseline: Option<PathMetrics>,
-    native: Option<TcpNativeObservation>,
-) -> PathMetrics {
-    // Response discovery may use bounded same-socket delivery uplift because
-    // the server owns both the train and the native sender sample.
-    tcp_capacity_receipt_metrics(
-        path_id,
-        PathMetricDirection::ServerToClient,
-        received_bytes,
-        receipt_rate_bps,
-        baseline,
-        native,
-        true,
     )
 }
 
@@ -554,21 +501,14 @@ fn tcp_capacity_receipt_metrics(
     receipt_rate_bps: u64,
     baseline: Option<PathMetrics>,
     native: Option<TcpNativeObservation>,
-    native_delivery_may_uplift: bool,
 ) -> PathMetrics {
-    let native_delivery_rate_bps = native.and_then(TcpNativeObservation::delivery_rate_bps);
     let mut metrics = baseline.unwrap_or_else(|| portable_tcp_receipt_metrics(path_id, direction));
     if let Some(native) = native {
         native.apply_transport_shape(&mut metrics);
         metrics.metric_epoch = metric_epoch_now();
         metrics.metric_age_us = 0;
     }
-    let rate_bps = if native_delivery_may_uplift {
-        tcp_capacity_authoritative_rate_bps(receipt_rate_bps, native_delivery_rate_bps.unwrap_or(0))
-    } else {
-        receipt_rate_bps
-    }
-    .max(1);
+    let rate_bps = receipt_rate_bps.max(1);
     metrics.path_id = path_id;
     metrics.underlay = UnderlayProtocol::Tcp;
     metrics.direction = direction;

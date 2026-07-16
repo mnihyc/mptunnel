@@ -1,9 +1,9 @@
 use super::*;
 use crate::config::{ResourceLimits, SecurityConfig, SharedSecret};
 use crate::model::capacity::{
-    MIN_RATE_SAMPLE_BYTES, PATH_OPEN_SCORE_BYTES, reliable_capacity_calibration_session_limit_bytes,
+    MIN_RATE_SAMPLE_BYTES, PATH_OPEN_SCORE_BYTES, reliable_capacity_measurement_session_limit_bytes,
 };
-use crate::model::path::{RelayPathInstance, RelayPathKey};
+use crate::model::path::{CarrierPathInstanceId, RelayPathInstance, RelayPathKey};
 use crate::protocol::{StreamId, UnderlayProtocol};
 use crate::runtime::path::{
     CapacityProbeCommandTicket, ClientPathContext, ClientPathHealthRecord,
@@ -63,14 +63,15 @@ fn udp_path_instance(index: usize, id: u64) -> RelayPathInstance {
             underlay: UnderlayProtocol::Udp,
             index,
         },
-        id,
+        path_instance_id: CarrierPathInstanceId::from_raw(id.max(1)),
+        attachment_id: id,
     }
 }
 
 #[test]
 fn request_quic_capacity_refund_and_replacement_preserve_frozen_share() {
     let context = request_quic_capacity_test_context(1);
-    let session_limit = reliable_capacity_calibration_session_limit_bytes(context.mux_limits);
+    let session_limit = reliable_capacity_measurement_session_limit_bytes(context.mux_limits);
     let path_share = 8 * 1024 * 1024;
     let provisional_bytes = 1024 * 1024;
     let now = Instant::now();
@@ -181,7 +182,7 @@ fn proof_candidate(
     }
 }
 
-fn install_handoff(
+fn install_product_admission(
     record: &mut ClientPathHealthRecord,
     stream_id: StreamId,
     path_instance: RelayPathInstance,
@@ -201,7 +202,7 @@ fn install_handoff(
         rate_bps: 117_000_000,
         rate_sample_bytes: required_product_sample_bytes,
     });
-    record.quic_capacity.handoff = Some(RequestQuicCapacityProductHandoff {
+    record.quic_capacity.product_admission = Some(RequestQuicCapacityProductAdmission {
         stream_id,
         path_instance,
         token,
@@ -226,7 +227,7 @@ fn exact_post_proof_product_floor_survives_carrier_proof_expiry() {
     let stream_id = StreamId(71);
     let path_instance = udp_path_instance(2, 17);
     let mut record = ClientPathHealthRecord::default();
-    install_handoff(
+    install_product_admission(
         &mut record,
         stream_id,
         path_instance,
@@ -266,8 +267,8 @@ fn exact_post_proof_product_floor_survives_carrier_proof_expiry() {
         before_expiry,
     );
     assert_eq!(
-        record.quic_capacity.handoff_state(41),
-        RequestQuicCapacityProductHandoffState::Pending
+        record.quic_capacity.product_admission_state(41),
+        RequestQuicCapacityProductAdmissionState::Pending
     );
 
     record.quic_capacity.record_product_ack(
@@ -278,37 +279,39 @@ fn exact_post_proof_product_floor_survives_carrier_proof_expiry() {
         before_expiry,
     );
     assert_eq!(
-        record.quic_capacity.handoff_state(41),
-        RequestQuicCapacityProductHandoffState::Complete
+        record.quic_capacity.product_admission_state(41),
+        RequestQuicCapacityProductAdmissionState::Complete
     );
 
     record.maintain(expires_at);
     let observation = record.observation_at(expires_at);
     assert!(!observation.explicit_carrier_capacity_proof);
-    assert!(observation.quic_capacity_product_handoff_complete);
+    assert!(observation.quic_capacity_product_admission_complete);
     assert!(observation.product_delivery_rate_bps.is_none());
     assert_eq!(observation.carrier_delivery_rate_bps, Some(117_000_000.0));
     assert_eq!(
-        record.quic_capacity.handoff_state(41),
-        RequestQuicCapacityProductHandoffState::Complete
+        record.quic_capacity.product_admission_state(41),
+        RequestQuicCapacityProductAdmissionState::Complete
     );
 
-    record.mark_data_plane_failure(Instant::now(), false);
+    let path_instance_id = crate::model::path::next_carrier_path_instance_id();
+    record.install_peer_usage(path_instance_id, 0, crate::protocol::PathUsage::Available);
+    assert!(record.mark_data_plane_failure(path_instance_id, Instant::now(), false));
     assert_eq!(
-        record.quic_capacity.handoff_state(41),
-        RequestQuicCapacityProductHandoffState::Absent
+        record.quic_capacity.product_admission_state(41),
+        RequestQuicCapacityProductAdmissionState::Absent
     );
 }
 
 #[test]
-fn incomplete_product_handoff_expires_with_its_carrier_proof() {
+fn incomplete_product_admission_expires_with_its_carrier_proof() {
     let accepted_at = Instant::now();
     let expires_at = accepted_at + Duration::from_secs(2);
     let required = 247_544;
     let stream_id = StreamId(72);
     let path_instance = udp_path_instance(3, 19);
     let mut record = ClientPathHealthRecord::default();
-    install_handoff(
+    install_product_admission(
         &mut record,
         stream_id,
         path_instance,
@@ -329,29 +332,29 @@ fn incomplete_product_handoff_expires_with_its_carrier_proof() {
         .quic_capacity
         .record_product_ack(stream_id, path_instance, 1, accepted_at, expires_at);
     assert_eq!(
-        record.quic_capacity.handoff_state(42),
-        RequestQuicCapacityProductHandoffState::Pending
+        record.quic_capacity.product_admission_state(42),
+        RequestQuicCapacityProductAdmissionState::Pending
     );
 
     record.maintain(expires_at);
     let observation = record.observation_at(expires_at);
     assert!(!observation.explicit_carrier_capacity_proof);
-    assert!(!observation.quic_capacity_product_handoff_complete);
+    assert!(!observation.quic_capacity_product_admission_complete);
     assert_eq!(
-        record.quic_capacity.handoff_state(42),
-        RequestQuicCapacityProductHandoffState::Absent
+        record.quic_capacity.product_admission_state(42),
+        RequestQuicCapacityProductAdmissionState::Absent
     );
 }
 
 #[test]
-fn completed_handoff_yields_at_the_durable_native_window_floor() {
+fn completed_product_admission_yields_at_the_durable_native_window_floor() {
     let accepted_at = Instant::now();
     let expires_at = accepted_at + Duration::from_secs(2);
     let required = 247_544;
     let stream_id = StreamId(73);
     let path_instance = udp_path_instance(4, 20);
     let mut record = ClientPathHealthRecord::default();
-    install_handoff(
+    install_product_admission(
         &mut record,
         stream_id,
         path_instance,
@@ -378,17 +381,17 @@ fn completed_handoff_yields_at_the_durable_native_window_floor() {
     record.carrier_delivery_sample_bytes = native_window - 1;
 
     let below_floor = record.observation_at(expires_at);
-    assert!(below_floor.quic_capacity_product_handoff_complete);
+    assert!(below_floor.quic_capacity_product_admission_complete);
     assert_eq!(below_floor.carrier_delivery_rate_bps, Some(117_000_000.0));
 
     record.carrier_delivery_sample_bytes = native_window;
     let at_floor = record.observation_at(expires_at);
-    assert!(at_floor.quic_capacity_product_handoff_complete);
+    assert!(at_floor.quic_capacity_product_admission_complete);
     assert_eq!(at_floor.carrier_delivery_rate_bps, Some(native_rate_bps));
 }
 
 #[test]
-fn completed_handoff_rate_prior_expires_without_erasing_product_progress() {
+fn completed_product_admission_rate_prior_expires_without_erasing_product_progress() {
     let accepted_at = Instant::now();
     let expires_at = accepted_at + Duration::from_secs(2);
     let completed_at = accepted_at + Duration::from_secs(1);
@@ -396,7 +399,7 @@ fn completed_handoff_rate_prior_expires_without_erasing_product_progress() {
     let stream_id = StreamId(74);
     let path_instance = udp_path_instance(5, 21);
     let mut record = ClientPathHealthRecord::default();
-    install_handoff(
+    install_product_admission(
         &mut record,
         stream_id,
         path_instance,
@@ -422,13 +425,13 @@ fn completed_handoff_rate_prior_expires_without_erasing_product_progress() {
     record.carrier_delivery_sample_bytes = native_window - 1;
 
     let proof_expired = record.observation_at(expires_at);
-    assert!(proof_expired.quic_capacity_product_handoff_complete);
+    assert!(proof_expired.quic_capacity_product_admission_complete);
     assert!(proof_expired.quic_capacity_rate_prior_fresh);
     assert_eq!(proof_expired.carrier_delivery_rate_bps, Some(117_000_000.0));
 
     let prior_expires_at = completed_at + Duration::from_secs(2);
     let prior_expired = record.observation_at(prior_expires_at);
-    assert!(prior_expired.quic_capacity_product_handoff_complete);
+    assert!(prior_expired.quic_capacity_product_admission_complete);
     assert!(!prior_expired.quic_capacity_rate_prior_fresh);
     assert_eq!(
         prior_expired.carrier_delivery_rate_bps,

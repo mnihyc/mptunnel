@@ -72,6 +72,19 @@ def write_started_file(path):
         handle.write(f"{time.time():.9f}\n")
 
 
+def watch_failover_marker(path, started, state, lock, stop_event):
+    while not stop_event.wait(0.01):
+        try:
+            with open(path, encoding="utf-8") as handle:
+                marker = float(handle.read().strip())
+        except (OSError, ValueError):
+            # Shell redirection creates the marker before writing its timestamp.
+            continue
+        with lock:
+            state["failover_after_s"] = max(0.0, marker - started)
+        return
+
+
 def connect_socks5(proxy, target, deadline):
     proxy_host, proxy_port = split_host_port(proxy)
     target_host, target_port = split_host_port(target)
@@ -351,6 +364,16 @@ def interval_upload(args):
         "probe_errors": [],
     }
     lock = threading.Lock()
+    marker_stop = threading.Event()
+    marker_thread = None
+    if args.failover_marker_file:
+        marker_thread = threading.Thread(
+            target=watch_failover_marker,
+            args=(args.failover_marker_file, started, state, lock, marker_stop),
+            name="failover-marker",
+            daemon=True,
+        )
+        marker_thread.start()
     payload = bytes([index % 251 for index in range(max(1, args.chunk_bytes))])
 
     def worker(stream_index):
@@ -392,6 +415,9 @@ def interval_upload(args):
         thread.start()
     for thread in threads:
         thread.join()
+    marker_stop.set()
+    if marker_thread is not None:
+        marker_thread.join(timeout=0.1)
 
     if any(thread.is_alive() for thread in threads):
         raise RuntimeError("upload worker remained alive after join")
@@ -460,7 +486,10 @@ def interval_upload(args):
         "max_delivery_gap_s": round(aggregate["max_delivery_gap_s"], 6),
         "recovery_gap_s": round(aggregate["recovery_gap_s"], 6),
         "local_recovery_gap_s": round(aggregate["local_recovery_gap_s"], 6),
-        "failover_after_s": args.failover_after,
+        "failover_after_s": round(aggregate["failover_after_s"], 6),
+        "failover_trigger_source": "marker"
+        if args.failover_marker_file
+        else "timer",
     }
     result.update(
         interval_metric_fields(
@@ -483,6 +512,7 @@ def main():
     )
     parser.add_argument("--target", required=True)
     parser.add_argument("--failover-after", type=float, required=True)
+    parser.add_argument("--failover-marker-file")
     parser.add_argument("--timeout", type=float, default=120.0)
     parser.add_argument("--chunk-bytes", type=int, default=64 * 1024)
     parser.add_argument("--load-duration", type=float, default=30.0)

@@ -141,21 +141,18 @@ pub(super) async fn handle_server_udp_datagram_stream(
                 }
             }
             command = recv_reliable_path_command(&mut commands_rx), if command_may_recv => {
-                match command {
-                    Some(command) => {
-                        let result = drain_server_udp_datagram_commands(
-                            command,
-                            &mut commands_rx,
-                            &mut send,
-                            &context,
-                            &mut flows,
-                            &mut pending_frames,
-                        ).await;
-                        if result? {
-                            return Ok(());
-                        }
+                if let Some(command) = command {
+                    let result = drain_server_udp_datagram_commands(
+                        command,
+                        &mut commands_rx,
+                        &mut send,
+                        &context,
+                        &mut flows,
+                        &mut pending_frames,
+                    ).await;
+                    if result? {
+                        return Ok(());
                     }
-                    None => {}
                 }
             }
         }

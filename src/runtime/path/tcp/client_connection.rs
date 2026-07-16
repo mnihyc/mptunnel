@@ -9,7 +9,7 @@ use super::metrics::TcpMetricPublisher;
 use crate::config::SecurityConfig;
 use crate::mux::MuxLimits;
 use crate::protocol::codec::CodecLimits;
-use crate::protocol::{CloseReason, Frame, PathId, SessionId, UnderlayProtocol};
+use crate::protocol::{CloseReason, Frame, PathId, PathUsage, SessionId, UnderlayProtocol};
 use crate::runtime::error::RuntimeError;
 use crate::runtime::identity::random_u64;
 use crate::runtime::path::authentication::ClientPathAuthenticationFrames;
@@ -28,15 +28,11 @@ pub(in crate::runtime) struct ClientTcpCarrierConnection {
     next_heartbeat_at: tokio::time::Instant,
     pending_heartbeat: Option<(u64, tokio::time::Instant)>,
     pub(in crate::runtime) tcp_metrics: Option<TcpMetricPublisher>,
+    pub(in crate::runtime) peer_usage_sequence: u64,
+    pub(in crate::runtime) peer_usage: PathUsage,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(in crate::runtime) enum ClientTcpHeartbeatTimeoutDisposition {
-    FailCarrier,
-    KeepCarrierAlive,
-}
-
-/// Immutable inputs for one concrete TCP carrier generation.
+/// Immutable inputs for one concrete TCP carrier instance.
 pub(in crate::runtime) struct ClientTcpCarrierConnect<'a> {
     pub(in crate::runtime) path: &'a PathSpec,
     pub(in crate::runtime) path_index: usize,
@@ -60,14 +56,13 @@ impl ClientTcpCarrierConnection {
         self.next_heartbeat_at = tokio::time::Instant::now() + self.heartbeat_interval;
     }
 
-    /// Reschedules liveness after carrier activity. Successful local writes
-    /// also call this, so it is timer policy rather than peer-receipt proof.
+    /// Reschedules the idle probe only while no response is outstanding.
+    /// Local writes are not peer evidence and cannot extend a Pong deadline.
     pub(in crate::runtime) fn refresh_liveness(&mut self) {
         refresh_client_tcp_path_liveness_state(
             &mut self.next_heartbeat_at,
             self.heartbeat_interval,
-            &mut self.pending_heartbeat,
-            self.heartbeat_timeout,
+            self.pending_heartbeat.is_some(),
         );
     }
 
@@ -94,9 +89,9 @@ impl ClientTcpCarrierConnection {
     /// Datagram request/response accepts only its matching carrier Pong, but a
     /// stray Pong is unrelated traffic rather than a fatal product response.
     pub(in crate::runtime) fn clear_matching_heartbeat(&mut self, nonce: u64) -> bool {
-        if !self
+        if self
             .pending_heartbeat
-            .is_some_and(|(pending_nonce, _)| pending_nonce == nonce)
+            .is_none_or(|(pending_nonce, _)| pending_nonce != nonce)
         {
             return false;
         }
@@ -104,19 +99,11 @@ impl ClientTcpCarrierConnection {
         true
     }
 
-    pub(in crate::runtime) async fn tick_heartbeat(
-        &mut self,
-        timeout_disposition: ClientTcpHeartbeatTimeoutDisposition,
-    ) -> Result<(), RuntimeError> {
+    pub(in crate::runtime) async fn tick_heartbeat(&mut self) -> Result<(), RuntimeError> {
         let now = tokio::time::Instant::now();
         if let Some((_, deadline)) = self.pending_heartbeat.as_ref()
             && now >= *deadline
         {
-            if timeout_disposition == ClientTcpHeartbeatTimeoutDisposition::KeepCarrierAlive {
-                self.pending_heartbeat = None;
-                self.next_heartbeat_at = now + self.heartbeat_interval;
-                return Ok(());
-            }
             return Err(RuntimeError::PathHeartbeatTimeout);
         }
         if self.pending_heartbeat.is_none() && now >= self.next_heartbeat_at {
@@ -145,8 +132,8 @@ impl ClientTcpCarrierConnection {
     }
 }
 
-/// Establishes TCP, authenticates the MPP session/path, and waits for active
-/// status under one caller-supplied absolute deadline.
+/// Establishes TCP, authenticates the MPP session/path, and exchanges the
+/// endpoints' directional usage preferences under one absolute deadline.
 pub(in crate::runtime) async fn connect_client_tcp_carrier(
     request: ClientTcpCarrierConnect<'_>,
     open_deadline: tokio::time::Instant,
@@ -192,20 +179,32 @@ pub(in crate::runtime) async fn connect_client_tcp_carrier(
         framed
             .write_frames(&authentication_frames.into_array())
             .await?;
+        framed
+            .write_frame(&Frame::PathStatus {
+                path_id,
+                sequence: 0,
+                usage: if path.metadata.policy.backup {
+                    PathUsage::Backup
+                } else {
+                    PathUsage::Available
+                },
+            })
+            .await?;
         framed.flush().await?;
 
         let mut session_ready = false;
-        let mut path_active = false;
-        while !session_ready || !path_active {
+        let mut peer_usage = None;
+        while !session_ready || peer_usage.is_none() {
             match framed.read_frame().await? {
                 Frame::SessionReady => session_ready = true,
                 Frame::PathStatus {
-                    status: crate::protocol::PathStatus::Active,
-                    ..
-                } => path_active = true,
+                    path_id: status_path_id,
+                    sequence: 0,
+                    usage,
+                } if status_path_id == path_id => peer_usage = Some(usage),
                 Frame::PathStatus { .. } => {
                     return Err(RuntimeError::Protocol(
-                        "TCP path session did not become active",
+                        "invalid TCP path usage advertisement",
                     ));
                 }
                 Frame::SessionClose { reason } => return Err(RuntimeError::RemoteClosed(reason)),
@@ -234,6 +233,8 @@ pub(in crate::runtime) async fn connect_client_tcp_carrier(
             next_heartbeat_at: now + mux_limits.tcp_path_heartbeat_interval,
             pending_heartbeat: None,
             tcp_metrics,
+            peer_usage_sequence: 0,
+            peer_usage: peer_usage.expect("path usage checked before carrier creation"),
         })
     };
     tokio::time::timeout_at(open_deadline, connect)
@@ -244,12 +245,9 @@ pub(in crate::runtime) async fn connect_client_tcp_carrier(
 pub(in crate::runtime) fn refresh_client_tcp_path_liveness_state(
     next_heartbeat_at: &mut tokio::time::Instant,
     heartbeat_interval: Duration,
-    pending_heartbeat: &mut Option<(u64, tokio::time::Instant)>,
-    heartbeat_timeout: Duration,
+    heartbeat_pending: bool,
 ) {
-    let now = tokio::time::Instant::now();
-    *next_heartbeat_at = now + heartbeat_interval;
-    if let Some((_, deadline)) = pending_heartbeat.as_mut() {
-        *deadline = now + heartbeat_timeout;
+    if !heartbeat_pending {
+        *next_heartbeat_at = tokio::time::Instant::now() + heartbeat_interval;
     }
 }

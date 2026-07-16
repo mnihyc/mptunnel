@@ -88,7 +88,7 @@ pub(super) async fn run_server_quic_path_metrics(
         if connection.is_closed() {
             return;
         }
-        let mut metrics = connection.tx_metrics(&mut tracker, PathMetricDirection::ServerToClient);
+        let metrics = connection.tx_metrics(&mut tracker, PathMetricDirection::ServerToClient);
         #[cfg(feature = "lab-diagnostics")]
         let metrics_poll_at = Instant::now();
         #[cfg(feature = "lab-diagnostics")]
@@ -105,81 +105,6 @@ pub(super) async fn run_server_quic_path_metrics(
             poll_elapsed,
         );
 
-        let capacity_proof_accepted = metrics.capacity_proof_candidate.is_some_and(|candidate| {
-                let proof_metrics = path_metrics_from_quic_capacity_proof(
-                    path_id,
-                    metrics,
-                    candidate,
-                );
-                if context.reliable_streams.record_local_quic_capacity_proof(
-                    &path_registration,
-                    proof_metrics,
-                    candidate,
-                ) {
-                    tracker.accept_capacity_proof(&mut metrics, candidate);
-                    #[cfg(feature = "lab-diagnostics")]
-                    lab_diagnostic(
-                        "quic_capacity_proof",
-                        format_args!(
-                            "phase=accepted session_id={} path_id={} path_instance_id={} calibration_id={} train_bytes={} sample_floor_bytes={} warmup_bytes={} required_proof_bytes={} written_data_frame_count={} received_bytes={} proof_elapsed_us={} rate_bps={} proof_validity_ms={}",
-                            session_id.0,
-                            path_id.0,
-                            path_instance_id.as_u64(),
-                            candidate.token,
-                            candidate.train_bytes,
-                            candidate.sample_floor_bytes,
-                            candidate.warmup_bytes,
-                            candidate.required_proof_bytes,
-                            candidate.written_data_frame_count,
-                            candidate.received_bytes,
-                            candidate.proof_elapsed.as_micros(),
-                            candidate.rate_bps,
-                            candidate.proof_validity.as_millis(),
-                        ),
-                    );
-                    true
-                } else {
-                    #[cfg(feature = "lab-diagnostics")]
-                    lab_diagnostic(
-                        "quic_capacity_proof",
-                        format_args!(
-                            "phase=rejected session_id={} path_id={} path_instance_id={} calibration_id={} train_bytes={} sample_floor_bytes={} warmup_bytes={} required_proof_bytes={} written_data_frame_count={} received_bytes={} proof_elapsed_us={} rate_bps={}",
-                            session_id.0,
-                            path_id.0,
-                            path_instance_id.as_u64(),
-                            candidate.token,
-                            candidate.train_bytes,
-                            candidate.sample_floor_bytes,
-                            candidate.warmup_bytes,
-                            candidate.required_proof_bytes,
-                            candidate.written_data_frame_count,
-                            candidate.received_bytes,
-                            candidate.proof_elapsed.as_micros(),
-                            candidate.rate_bps,
-                        ),
-                    );
-                    false
-                }
-            });
-        if let Some(token) =
-            tracker.terminal_capacity_probe_to_retire(metrics.capacity_probe, Instant::now())
-        {
-            let _retired = connection.retire_capacity_probe(token);
-            tracker.retire_capacity_candidate(token);
-            #[cfg(feature = "lab-diagnostics")]
-            lab_diagnostic(
-                "quic_capacity_probe_retired",
-                format_args!(
-                    "session_id={} path_id={} path_instance_id={} calibration_id={} proof_accepted={} carrier_retired={}",
-                    session_id.0,
-                    path_id.0,
-                    path_instance_id.as_u64(),
-                    token,
-                    capacity_proof_accepted,
-                    _retired,
-                ),
-            );
-        }
         if quic_path_metrics_should_publish_local_sender(metrics) {
             #[cfg(feature = "lab-diagnostics")]
             if let (Some(carrier_elapsed), Some(rate_elapsed)) = (
@@ -210,12 +135,10 @@ pub(super) async fn run_server_quic_path_metrics(
                     ),
                 );
             }
-            if !capacity_proof_accepted {
-                context.reliable_streams.record_local_path_metrics(
-                    &path_registration,
-                    path_metrics_from_quic_path(path_id, metrics),
-                );
-            }
+            context.reliable_streams.record_local_path_metrics(
+                &path_registration,
+                path_metrics_from_quic_path(path_id, metrics),
+            );
         }
         tokio::time::sleep(quic_path_metrics_poll_interval(metrics)).await;
     }
@@ -276,7 +199,7 @@ pub(super) fn log_quic_ack_poll_diagnostics(
         lab_diagnostic(
             "quic_capacity_ack_poll",
             format_args!(
-                "session_id={} path_id={} path_instance_id={} direction={:?} calibration_id={} phase={:?} write_committed={} train_bytes={} written_bytes={} written_data_frame_count={} sample_floor_bytes={} warmup_bytes={} required_proof_bytes={} native_started_clean={} native_total_acked_bytes={} native_total_ack_count={} native_warmup_acked_bytes={} native_warmup_ack_count={} native_measurement_acked_bytes={} native_measurement_ack_count={} native_timed_measurement_acked_bytes={} native_timed_measurement_ack_count={} native_app_limited_acked_bytes={} native_app_limited_ack_count={} native_timed_elapsed_us={} native_proved_age_us={} receipt_received_bytes={} receipt_elapsed_us={} receipt_rtt_us={} receipt_age_us={} last_authoritative_bif_bytes={} last_authoritative_bif_age_us={} last_authoritative_sent_watermark={} receipt_frozen_sent_watermark={} current_sent_watermark={} proof_validity_ms={} proved_age_us={} attempt_remaining_us={} candidate_emitted={}",
+                "session_id={} path_id={} path_instance_id={} direction={:?} measurement_id={} phase={:?} write_committed={} train_bytes={} written_bytes={} written_data_frame_count={} sample_floor_bytes={} warmup_bytes={} required_proof_bytes={} native_started_clean={} native_total_acked_bytes={} native_total_ack_count={} native_warmup_acked_bytes={} native_warmup_ack_count={} native_measurement_acked_bytes={} native_measurement_ack_count={} native_timed_measurement_acked_bytes={} native_timed_measurement_ack_count={} native_app_limited_acked_bytes={} native_app_limited_ack_count={} native_timed_elapsed_us={} native_proved_age_us={} receipt_received_bytes={} receipt_elapsed_us={} receipt_rtt_us={} receipt_age_us={} last_authoritative_bif_bytes={} last_authoritative_bif_age_us={} last_authoritative_sent_watermark={} receipt_frozen_sent_watermark={} current_sent_watermark={} proof_validity_ms={} proved_age_us={} attempt_remaining_us={} candidate_emitted={}",
                 session_id.0,
                 path_id.0,
                 path_instance_id,
@@ -373,14 +296,6 @@ fn path_metrics_from_quic_path(path_id: PathId, metrics: UdpPathMetrics) -> Path
         data_sample_count: u32::try_from(metrics.delivery_sample_count).unwrap_or(u32::MAX),
         data_sample_bytes: metrics.delivery_sample_bytes,
     }
-}
-
-fn path_metrics_from_quic_capacity_proof(
-    path_id: PathId,
-    metrics: UdpPathMetrics,
-    _candidate: QuicCapacityProofCandidate,
-) -> PathMetrics {
-    path_metrics_from_quic_path(path_id, metrics)
 }
 
 fn duration_to_micros_u32(duration: Duration) -> u32 {

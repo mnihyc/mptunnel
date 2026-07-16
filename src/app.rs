@@ -39,9 +39,6 @@ pub fn run_config_file(invocation: ConfigFileInvocation) -> Result<(), AppError>
 }
 
 fn run_config(config: AppConfig) -> Result<(), AppError> {
-    if let Some(warning) = config.security.warning() {
-        eprintln!("warning: {warning}");
-    }
     if config.check_config {
         return Ok(());
     }

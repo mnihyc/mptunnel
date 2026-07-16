@@ -3,7 +3,6 @@
 //! Only this owner batches commands or interlocks reads with a pending write,
 //! preserving frame order without allowing feedback backpressure to deadlock.
 
-use super::capacity::RequestTcpCapacityProbeLease;
 use super::client_capacity::{ClientTcpCapacityProbeWriteOutcome, client_write_tcp_capacity_probe};
 use super::client_receive::handle_client_tcp_path_frame;
 use super::client_state::{ClientTcpPathConnection, ClientTcpPathSessionRuntime};
@@ -13,7 +12,7 @@ use super::client_stream::{
 };
 #[cfg(feature = "lab-diagnostics")]
 use crate::lab_diagnostics::lab_diagnostic;
-use crate::model::capacity::reliable_capacity_calibration_session_limit_bytes;
+use crate::model::capacity::reliable_capacity_measurement_session_limit_bytes;
 use crate::mux::MuxLimits;
 #[cfg(feature = "lab-diagnostics")]
 use crate::protocol::frame::stream_ack_contiguous_frontier;
@@ -21,17 +20,17 @@ use crate::protocol::{Frame, PathId, StreamId, UnderlayProtocol};
 use crate::runtime::error::RuntimeError;
 use crate::runtime::path::commands::{
     ReliablePathCommand, ReliablePathCommandReceivers, TcpCapacityProbeCommand,
-    TcpCapacityProbeOwner, reliable_path_command_pending_bytes,
-    reliable_path_command_writer_run_budget_bytes, reliable_path_command_writer_run_budget_items,
-    reliable_path_command_writer_run_bytes, reliable_path_frame_requires_capacity_command,
-    reliable_path_writer_frame_queue, try_coalesce_reliable_path_writer_run,
-    try_recv_reliable_path_command,
+    reliable_path_command_pending_bytes, reliable_path_command_writer_run_budget_bytes,
+    reliable_path_command_writer_run_budget_items, reliable_path_command_writer_run_bytes,
+    reliable_path_frame_requires_capacity_command, reliable_path_writer_frame_queue,
+    try_coalesce_reliable_path_writer_run, try_recv_reliable_path_command,
 };
 use crate::runtime::recent_ids::RecentIdCache;
 use std::collections::HashMap;
 use std::time::Instant;
 use tokio::sync::mpsc;
 
+#[allow(clippy::too_many_arguments)]
 pub(super) async fn handle_connected_client_tcp_command_run(
     first_command: ReliablePathCommand,
     commands: &mut ReliablePathCommandReceivers,
@@ -125,19 +124,9 @@ pub(super) async fn handle_connected_client_tcp_command_run(
                 ));
             }
             ReliablePathCommand::SendTcpCapacityProbe(probe) => {
-                let TcpCapacityProbeOwner::Request {
-                    stream_id,
-                    path_instance,
-                } = probe.owner
-                else {
-                    commands.release_pending_command_bytes(pending_bytes);
-                    return Err(RuntimeError::Protocol(
-                        "client TCP path received response capacity command",
-                    ));
-                };
-                let request_current = probe
-                    .request_lease()
-                    .is_some_and(RequestTcpCapacityProbeLease::is_current);
+                let stream_id = probe.stream_id;
+                let path_instance = probe.path_instance;
+                let request_current = probe.request_lease().is_current();
                 let stream_is_attached = streams
                     .get(&stream_id)
                     .is_some_and(|state| state.pending_open.is_none());
@@ -146,9 +135,7 @@ pub(super) async fn handle_connected_client_tcp_command_run(
                     // proof epoch changes, or the product stream may detach
                     // before dequeue. With no carrier bytes, both are normal
                     // canceled transactions rather than shared-path failures.
-                    if let Some(lease) = probe.request_lease() {
-                        lease.refund_if_unwritten();
-                    }
+                    probe.request_lease().refund_if_unwritten();
                     commands.release_pending_command_bytes(pending_bytes);
                     return Ok(());
                 }
@@ -157,7 +144,7 @@ pub(super) async fn handle_connected_client_tcp_command_run(
                     || path_instance.key.index != runtime.path_index
                     || probe.train_payload_bytes < probe.sample_floor_bytes
                     || probe.train_payload_bytes
-                        > reliable_capacity_calibration_session_limit_bytes(mux_limits)
+                        > reliable_capacity_measurement_session_limit_bytes(mux_limits)
                     || !probe.valid_request_tcp_train()
                     || connection.capacity.has_pending_request()
                 {
@@ -179,9 +166,7 @@ pub(super) async fn handle_connected_client_tcp_command_run(
                     return Err(error);
                 }
                 if Instant::now() >= probe.expires_at {
-                    if let Some(lease) = probe.request_lease() {
-                        lease.refund_if_unwritten();
-                    }
+                    probe.request_lease().refund_if_unwritten();
                     commands.release_pending_command_bytes(pending_bytes);
                     return Ok(());
                 }
@@ -199,18 +184,16 @@ pub(super) async fn handle_connected_client_tcp_command_run(
                 connection.record_outbound_activity();
                 match write_outcome {
                     ClientTcpCapacityProbeWriteOutcome::NoWire => {
-                        if let Some(lease) = probe.request_lease() {
-                            lease.refund_if_unwritten();
-                        }
+                        probe.request_lease().refund_if_unwritten();
                         #[cfg(feature = "lab-diagnostics")]
                         lab_diagnostic(
                             "request_tcp_capacity_probe",
                             format_args!(
-                                "phase=discarded reason=no_wire stream_id={} path_index={} instance_id={} calibration_id={}",
+                                "phase=discarded reason=no_wire stream_id={} path_index={} instance_id={} measurement_id={}",
                                 stream_id.0,
                                 runtime.path_index,
-                                path_instance.id,
-                                probe.calibration_id,
+                                path_instance.attachment_id,
+                                probe.measurement_id,
                             ),
                         );
                     }
@@ -219,11 +202,11 @@ pub(super) async fn handle_connected_client_tcp_command_run(
                         lab_diagnostic(
                             "request_tcp_capacity_probe",
                             format_args!(
-                                "phase=sent stream_id={} path_index={} instance_id={} calibration_id={} train_bytes={} train_wire_bytes={} sample_floor_bytes={} warmup_bytes={} timing_slack_bytes={} required_timed_bytes={}",
+                                "phase=sent stream_id={} path_index={} instance_id={} measurement_id={} train_bytes={} train_wire_bytes={} sample_floor_bytes={} warmup_bytes={} timing_slack_bytes={} required_timed_bytes={}",
                                 stream_id.0,
                                 runtime.path_index,
-                                path_instance.id,
-                                probe.calibration_id,
+                                path_instance.attachment_id,
+                                probe.measurement_id,
                                 probe.train_payload_bytes,
                                 measurement.train_wire_bytes,
                                 probe.sample_floor_bytes,
@@ -458,7 +441,7 @@ async fn client_write_tcp_capacity_probe_interlocked(
                     deferred_frames.push(frame);
                 } else {
                     // Continue draining so the peer can read the in-progress
-                    // probe, then fail the carrier and let reliable repair own
+                    // probe, then fail the carrier and let reliable reinjection own
                     // any product frames that could not remain ordered here.
                     deferred_error.get_or_insert(RuntimeError::Protocol(
                         "request TCP capacity feedback interlock overflowed",
@@ -564,7 +547,6 @@ async fn handle_connected_client_tcp_command(
             observed_carrier_generation,
             target,
             lane,
-            role,
             open_deadlines,
             session_commands,
             response,
@@ -576,7 +558,6 @@ async fn handle_connected_client_tcp_command(
                 attempt_id,
                 target,
                 lane,
-                role,
                 open_deadline,
                 session_commands,
                 response,

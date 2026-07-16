@@ -8,7 +8,7 @@ mod scheduling;
 pub use scheduling::{FlowId, SchedulingMode};
 
 use crate::protocol::PathId;
-use crate::scheduler::{FlowLane, PathSnapshot, PathState};
+use crate::scheduler::{PathSnapshot, PathState, TrafficClass};
 use scheduling::{EnqueueRequest, HeterogeneousScheduler};
 use std::collections::BTreeMap;
 
@@ -37,8 +37,8 @@ pub struct SimulatedSend {
     pub flow_id: FlowId,
     pub path_id: PathId,
     pub duplicate_path_id: Option<PathId>,
-    pub lane: FlowLane,
-    pub scheduled_lane: FlowLane,
+    pub lane: TrafficClass,
+    pub scheduled_lane: TrafficClass,
     pub mode: SchedulingMode,
     pub payload_bytes: usize,
     pub queued_bytes_after: u64,
@@ -48,24 +48,24 @@ pub struct SimulatedSend {
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct SimulatedChunkAttempt {
     pub path_id: PathId,
-    pub lane: FlowLane,
+    pub lane: TrafficClass,
     pub payload_bytes: usize,
     pub scheduled_at_ms: f64,
     pub estimated_completion_ms: f64,
-    pub repair_attempt: u32,
+    pub reinjection_attempt: u32,
     pub delivered: bool,
 }
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct SimulatedTransfer {
-    pub lane: FlowLane,
+    pub lane: TrafficClass,
     pub total_bytes: usize,
     pub chunk_bytes: usize,
     pub start_ms: f64,
     pub completion_ms: f64,
     pub start_capacity_bps: f64,
     pub attempts: Vec<SimulatedChunkAttempt>,
-    pub repaired_chunks: usize,
+    pub reinjected_chunks: usize,
     pub failover_gap_ms: Option<f64>,
 }
 
@@ -159,7 +159,7 @@ impl Simulator {
         &self.paths
     }
 
-    pub fn route(&mut self, lane: FlowLane, payload_bytes: usize) -> Option<SimulatedSend> {
+    pub fn route(&mut self, lane: TrafficClass, payload_bytes: usize) -> Option<SimulatedSend> {
         let flow_id = self.allocate_flow_id();
         self.route_flow(
             flow_id,
@@ -173,7 +173,7 @@ impl Simulator {
     pub fn route_flow(
         &mut self,
         flow_id: FlowId,
-        lane: FlowLane,
+        lane: TrafficClass,
         payload_bytes: usize,
         remaining_flow_bytes: usize,
         duplicate_eligible: bool,
@@ -203,7 +203,7 @@ impl Simulator {
 
     pub fn schedule_transfer(
         &mut self,
-        lane: FlowLane,
+        lane: TrafficClass,
         total_bytes: usize,
         chunk_bytes: usize,
     ) -> Option<SimulatedTransfer> {
@@ -211,7 +211,7 @@ impl Simulator {
             return None;
         }
         let start_ms = self.now_ms;
-        let start_capacity_bps = self.healthy_capacity_bps();
+        let start_capacity_bps = self.schedulable_capacity_bps(lane);
         let mut remaining = total_bytes;
         let mut attempts = Vec::new();
         let flow_id = self.allocate_flow_id();
@@ -225,7 +225,7 @@ impl Simulator {
                 payload_bytes,
                 scheduled_at_ms,
                 estimated_completion_ms: send.estimated_completion_ms,
-                repair_attempt: 0,
+                reinjection_attempt: 0,
                 delivered: true,
             });
             remaining -= payload_bytes;
@@ -239,25 +239,25 @@ impl Simulator {
             completion_ms,
             start_capacity_bps,
             attempts,
-            repaired_chunks: 0,
+            reinjected_chunks: 0,
             failover_gap_ms: None,
         })
     }
 
-    pub fn schedule_transfer_with_repair(
+    pub fn schedule_transfer_with_reinjection(
         &mut self,
-        lane: FlowLane,
+        lane: TrafficClass,
         total_bytes: usize,
         chunk_bytes: usize,
-        repair_delay_ms: f64,
+        reinjection_delay_ms: f64,
     ) -> Option<SimulatedTransfer> {
         let start_ms = self.now_ms;
-        let start_capacity_bps = self.healthy_capacity_bps();
+        let start_capacity_bps = self.schedulable_capacity_bps(lane);
         let mut transfer = self.schedule_transfer(lane, total_bytes, chunk_bytes)?;
         transfer.start_capacity_bps = start_capacity_bps;
-        let mut repair_attempt = 0u32;
+        let mut reinjection_attempt = 0u32;
         let mut first_failure_ms = None;
-        let mut repaired_chunks = 0usize;
+        let mut reinjected_chunks = 0usize;
 
         loop {
             let lost = transfer
@@ -278,7 +278,7 @@ impl Simulator {
                 break;
             }
 
-            repair_attempt = repair_attempt.saturating_add(1);
+            reinjection_attempt = reinjection_attempt.saturating_add(1);
             let failure_ms = lost
                 .iter()
                 .map(|(_, fail_at_ms, _)| *fail_at_ms)
@@ -290,7 +290,7 @@ impl Simulator {
                 transfer.attempts[*index].delivered = false;
             }
 
-            self.advance_to(failure_ms + repair_delay_ms.max(0.0));
+            self.advance_to(failure_ms + reinjection_delay_ms.max(0.0));
             for (_, _, payload_bytes) in lost {
                 let scheduled_at_ms = self.now_ms;
                 let send = self.route(lane, payload_bytes)?;
@@ -300,16 +300,16 @@ impl Simulator {
                     payload_bytes,
                     scheduled_at_ms,
                     estimated_completion_ms: send.estimated_completion_ms,
-                    repair_attempt,
+                    reinjection_attempt,
                     delivered: true,
                 });
-                repaired_chunks += 1;
+                reinjected_chunks += 1;
             }
         }
 
         transfer.start_ms = start_ms;
         transfer.completion_ms = transfer_completion_ms(&transfer.attempts).unwrap_or(start_ms);
-        transfer.repaired_chunks = repaired_chunks;
+        transfer.reinjected_chunks = reinjected_chunks;
         transfer.failover_gap_ms =
             first_failure_ms.and_then(|failure_ms| failover_gap_ms(&transfer.attempts, failure_ms));
         Some(transfer)
@@ -324,7 +324,7 @@ impl Simulator {
         let mut sends = Vec::with_capacity(count);
         for _ in 0..count {
             let started_at_ms = self.now_ms;
-            let mut send = self.route(FlowLane::Latency, request_bytes)?;
+            let mut send = self.route(TrafficClass::Latency, request_bytes)?;
             send.estimated_completion_ms -= started_at_ms;
             sends.push(send);
             self.advance_to(started_at_ms + spacing_ms.max(0.0));
@@ -333,11 +333,7 @@ impl Simulator {
     }
 
     pub fn healthy_capacity_bps(&self) -> f64 {
-        self.paths
-            .iter()
-            .filter(|path| matches!(path.snapshot.state, PathState::Active | PathState::Suspect))
-            .map(|path| path.snapshot.delivery_rate_bps.max(0.0))
-            .sum()
+        self.schedulable_capacity_bps(TrafficClass::Throughput)
     }
 
     pub fn advance_to(&mut self, now_ms: f64) {
@@ -386,6 +382,10 @@ impl Simulator {
         self.paths.iter().map(|path| path.snapshot).collect()
     }
 
+    fn schedulable_capacity_bps(&self, lane: TrafficClass) -> f64 {
+        scheduling::schedulable_capacity_bps(&self.path_snapshots(), lane)
+    }
+
     fn allocate_flow_id(&mut self) -> FlowId {
         let flow_id = FlowId(self.next_flow_id);
         self.next_flow_id = self.next_flow_id.saturating_add(1);
@@ -393,8 +393,8 @@ impl Simulator {
     }
 }
 
-fn duplicate_default(lane: FlowLane) -> bool {
-    matches!(lane, FlowLane::Control | FlowLane::RealtimeDatagram)
+fn duplicate_default(lane: TrafficClass) -> bool {
+    matches!(lane, TrafficClass::Control | TrafficClass::RealtimeDatagram)
 }
 
 fn transfer_completion_ms(attempts: &[SimulatedChunkAttempt]) -> Option<f64> {
@@ -416,7 +416,7 @@ fn failover_gap_ms(attempts: &[SimulatedChunkAttempt], failure_ms: f64) -> Optio
         .iter()
         .filter(|attempt| {
             attempt.delivered
-                && attempt.repair_attempt > 0
+                && attempt.reinjection_attempt > 0
                 && attempt.estimated_completion_ms > failure_ms
         })
         .map(|attempt| attempt.estimated_completion_ms)

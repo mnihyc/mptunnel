@@ -43,14 +43,14 @@ async fn quic_measurement_dedicated_writer_round_trips_declared_train() {
                 .expect("read capacity frame");
             let Frame::PathCapacityData {
                 path_id: received_path_id,
-                calibration_id,
+                measurement_id,
                 payload,
             } = frame
             else {
                 panic!("dedicated capacity writer emitted a product frame");
             };
             assert_eq!(received_path_id, path_id);
-            assert_eq!(calibration_id, token);
+            assert_eq!(measurement_id, token);
             received = received.saturating_add(payload.len() as u64);
         }
         assert_eq!(received, train_payload_bytes);
@@ -60,7 +60,7 @@ async fn quic_measurement_dedicated_writer_round_trips_declared_train() {
                 .expect("read capacity finish"),
             Frame::PathCapacityFinish {
                 path_id,
-                calibration_id: token,
+                measurement_id: token,
                 payload_bytes: train_payload_bytes,
             }
         );
@@ -74,7 +74,7 @@ async fn quic_measurement_dedicated_writer_round_trips_declared_train() {
             &mut send,
             &Frame::PathCapacityReceipt {
                 path_id,
-                calibration_id: token,
+                measurement_id: token,
                 received_payload_bytes: received,
             },
             limits,
@@ -109,7 +109,7 @@ async fn quic_measurement_dedicated_writer_round_trips_declared_train() {
             &mut send,
             &Frame::PathCapacityReceipt {
                 path_id,
-                calibration_id: token,
+                measurement_id: token,
                 received_payload_bytes: train_payload_bytes,
             },
             limits,
@@ -151,7 +151,7 @@ async fn quic_measurement_dedicated_writer_round_trips_declared_train() {
             .write_data(
                 &Frame::PathCapacityData {
                     path_id,
-                    calibration_id: token,
+                    measurement_id: token,
                     payload: payload.slice(..payload_bytes),
                 },
                 limits,
@@ -164,7 +164,7 @@ async fn quic_measurement_dedicated_writer_round_trips_declared_train() {
         .finish(
             &Frame::PathCapacityFinish {
                 path_id,
-                calibration_id: token,
+                measurement_id: token,
                 payload_bytes: train_payload_bytes,
             },
             limits,
@@ -188,7 +188,7 @@ async fn quic_measurement_dedicated_writer_round_trips_declared_train() {
         receipt,
         Frame::PathCapacityReceipt {
             path_id,
-            calibration_id: token,
+            measurement_id: token,
             received_payload_bytes: train_payload_bytes,
         }
     );

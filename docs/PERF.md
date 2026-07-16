@@ -1,172 +1,161 @@
-# Performance Diagnostics
+# Performance diagnostics
 
-This project keeps production binaries free of lab-only diagnostics. Internal timing is compiled only with the `lab-diagnostics` feature and is emitted only when the process receives explicit lab environment variables.
+Lab-only timing is compiled with the `lab-diagnostics` feature and emitted only
+when explicitly enabled. Release binaries and packages do not include these
+call sites.
 
-Use this workflow when end-to-end Mbps, latency, or failover rows are not enough to explain where time and resources are spent.
+Use diagnostics to explain a matched performance row, then rerun the same case
+without instrumentation for the accepted measurement.
 
-## Quick Diagnostic Run
-
-Run a normal daily-use diagnostic first. The wrapper builds an optimized diagnostic binary, runs selected Docker lab cases for a fixed duration, samples container CPU/RAM, and extracts per-component timing from client/server logs.
+## Quick run
 
 ```bash
-CASE_FILTER='mptunnel_mixed_single_balanced,mptunnel_udp_stream_single_balanced,mptunnel_mixed_multipath_all,mptunnel_udp_stream_multipath_all' \
+CASE_FILTER='mptunnel_tcp_single_balanced,mptunnel_tcp_multipath_all,mptunnel_udp_stream_single_balanced,mptunnel_reliable_mixed_multipath_all' \
 MPTUNNEL_LAB_LOAD_DURATION_SECONDS=20 \
 BUILD_PRODUCT=1 \
 BUILD_LAB_IMAGES=0 \
 lab/run-perf-diagnostics.sh
 ```
 
-The script prints:
+The wrapper records normal lab JSONL rows, `mptunnel_lab_perf` component
+summaries, container CPU/RAM samples, and bounded client/server logs.
 
-- `results`: normal JSONL lab rows from `lab/run-heterogeneous-ablation.sh`.
-- `component_summary`: parsed `mptunnel_lab_perf` component timing rows.
-- `docker_stats`: sampled Docker CPU/RAM lines for client, server, and target containers.
-
-Use a longer interval when investigating steady-state file-download behavior:
+Run one case at a time when isolating a regression:
 
 ```bash
-CASE_FILTER='mptunnel_mixed_multipath_all,mptunnel_udp_stream_multipath_all' \
-MPTUNNEL_LAB_LOAD_DURATION_SECONDS=60 \
-MPTUNNEL_LAB_PERF_INTERVAL_MS=1000 \
+CASE_FILTER='mptunnel_tcp_multipath_all_upload' \
+MPTUNNEL_LAB_LOAD_DURATION_SECONDS=20 \
 lab/run-perf-diagnostics.sh
 ```
 
-## What Is Measured
+## Component boundaries
 
-Internal component timing is interval and cumulative. Each line starts with `mptunnel_lab_perf` and includes count, bytes, total microseconds, average microseconds, max microseconds, and PID.
+Interpret timings by architectural owner rather than by an obsolete event
+name:
 
-Important component groups:
+- **Transport CPU**: frame encode/decode, AEAD, copying, and Quinn/TCP adapter
+  work.
+- **Socket/carrier wait**: TCP read/write/flush or QUIC stream/datagram wait.
+- **Carrier command queue**: work waiting before a concrete TCP/QUIC writer.
+- **Sender queue**: MPP work waiting for available-first path admission and
+  commit.
+- **MPP range work**: offset allocation, ACK-range application, retained
+  range lookup, reinjection generation, and receive reassembly.
+- **Relay local I/O**: ingress reads, target writes/flushes, and target reads.
+- **Runtime routing**: frame dispatch between carrier, stream registry, sender,
+  relay, and datagram services.
 
-- `transport.tcp.*`: encrypted TCP frame encode/decode, AEAD encrypt/decrypt, socket read/write wait, and flush wait.
-- `runtime.path_queue.*`: queue send time before frames reach path-session writers.
-- `runtime.tcp_reader.queue_send`: time to route encrypted TCP reader output into runtime queues.
-- `runtime.server_stream.route_frame` and `runtime.tcp_stream.route_frame`: per-stream frame routing queue time.
-- `relay.local_read_wait`, `relay.local_write_wait`, `relay.local_flush_wait`: local ingress/egress I/O wait.
-- `relay.copy_local_chunk`: payload copy cost from local socket buffers into frame payloads.
-- `relay.path_recv_frame_wait`: relay wait for a TCP path frame or QUIC UDP path stream frame to arrive.
-- `mux.send_data`, `mux.receive_data`, `mux.apply_ack`, `mux.ack_frames`, `mux.retransmit_*`: reliable-stream bookkeeping, ACK generation, and repair-frame generation.
+Diagnostic identifiers may change when an owner is reorganized. The durable
+correlation keys are direction, stream/flow ID, logical path, physical path
+instance, MPP range, usage sequence, and monotonic timestamp.
 
-Interpretation:
+## Reading a bottleneck
 
-- High `transport.tcp.*.socket_wait` with low CPU components points at TCP carrier/network limits.
-- High `transport.*.encrypt`, `decrypt`, `encode_frame`, or `decode_frame` points at per-frame CPU or allocation cost.
-- High `relay.path_recv_frame_wait` on QUIC UDP path rows now points at QUIC/network wait, remote-side backpressure, or QUIC scheduling/congestion behavior rather than mptunnel overlay pacing.
-- High `runtime.path_queue.*` or route-frame time means internal queues/backpressure are limiting throughput.
-- High `mux.receive_data` or `mux.retransmit_*` under loss means reorder/repair work is the hot path.
+- High socket wait with low CPU and low internal queue delay points to network
+  or native carrier control.
+- High transport encode/encrypt/decode CPU points to frame size, copies, AEAD,
+  or allocation behavior.
+- High carrier-command wait points to writer credit, native flow control, or a
+  blocked carrier actor.
+- High sender wait with idle eligible capacity points to usage filtering,
+  metric provenance, path admission, or stale generation rejection.
+- High receive range/reassembly cost with growing holes points to harmful
+  cross-path ordering or excessive reinjection.
+- High local I/O wait means the ingress/target application may be the limit;
+  carrier throughput is not then the only variable.
+- Traffic growth without receiver-delivery growth points to native
+  retransmission, MPP reinjection, measurement traffic, or accounting error.
 
-## Per-Component Ablation
+TCP and QUIC diagnostics remain separate below the MPP range ledger. Do not
+compare a TCP ACK clock directly to a QUIC packet ACK or use either as proof of
+MPP data-level delivery.
 
-Run one scenario at a time when isolating a regression. Keep the workload duration fixed and compare component summaries before and after each core change.
+## Causal workflow
 
-Normal daily-use rows:
+1. Reproduce one bounded release row and its adjacent control.
+2. State the expected protocol transition: usage selection, data commit,
+   `STREAM_ACK`, window release, reinjection, or carrier recovery.
+3. Run the same case with diagnostics and container stats.
+4. Locate the first missing or delayed transition at its owner.
+5. Make one general code/model correction; do not add a case-specific constant.
+6. Re-run the diagnostic case to prove causality.
+7. Re-run the instrumentation-free matched pair.
+8. Run representative upload/download, single/multipath, TCP/QUIC/mixed,
+   latency, aggregation, failover, and overhead guards.
+
+Stop when evidence answers the hypothesis. Longer duration is useful only when
+the issue is explicitly steady-state, periodic, or tail-distribution behavior.
+
+## Fault diagnostics
 
 ```bash
-CASE_FILTER='mptunnel_mixed_single_balanced,mptunnel_reliable_mixed_single_balanced,mptunnel_udp_stream_single_balanced' \
-MPTUNNEL_LAB_LOAD_DURATION_SECONDS=30 \
-lab/run-perf-diagnostics.sh
-```
-
-Multipath aggregation rows:
-
-```bash
-CASE_FILTER='mptunnel_tcp_multipath_all,mptunnel_reliable_mixed_multipath_all,mptunnel_mixed_multipath_all,mptunnel_udp_stream_multipath_all' \
-MPTUNNEL_LAB_LOAD_DURATION_SECONDS=30 \
-lab/run-perf-diagnostics.sh
-```
-
-Failure and unstable-link rows:
-
-```bash
-CASE_FILTER='mptunnel_mixed_multipath_failover_blackhole_fat,mptunnel_mixed_multipath_latency_spike_fat,mptunnel_mixed_multipath_flapping_links' \
+CASE_FILTER='mptunnel_tcp_multipath_failover_blackhole_fat,mptunnel_tcp_multipath_failover_blackhole_fat_upload,mptunnel_mixed_multipath_flapping_links' \
 MPTUNNEL_LAB_LOAD_DURATION_SECONDS=30 \
 MPTUNNEL_LAB_FLAP_SEED=20260710 \
 lab/run-perf-diagnostics.sh
 ```
 
-Keep `MPTUNNEL_LAB_FLAP_SEED`, the ordered flap modes, hold bounds, and effective
-netem overrides identical for flapping A/B runs. Confirm the embedded
-`flapping.trace_complete` and schedule digest fields before comparing them; seed
-reuse does not fix netem's packet-level random loss, jitter, or Docker command
-latency, so strict comparisons must also inspect the trace's actual application
-offsets.
+Anchor failover to the recorded trigger, not process start. Verify that the
+failed physical path instance stops receiving commits, missing ranges are
+reconciled exactly, an eligible survivor receives bounded reinjection, and
+application delivery resumes. Native TCP/QUIC recovery may continue for copies
+already inside those transports.
 
-Matrix rows:
+For flapping A/B runs, compare the actual trace and transition offsets as well
+as the configured seed.
+
+## Process monitoring
+
+The wrapper samples Docker CPU/RAM. Increase its interval if collection affects
+the case:
 
 ```bash
-CASE_FILTER='mptunnel_matrix_*' \
-MPTUNNEL_LAB_LOAD_DURATION_SECONDS=30 \
+MPTUNNEL_LAB_CONTAINER_STATS_INTERVAL_SECONDS=2 \
 lab/run-perf-diagnostics.sh
 ```
 
-TUN rows:
+Live inspection:
 
 ```bash
-CASE_FILTER='mptunnel_tun_tcp_single_balanced,mptunnel_tun_udp_stream_single_balanced,mptunnel_tun_mixed_multipath_all' \
-MPTUNNEL_LAB_LOAD_DURATION_SECONDS=30 \
-lab/run-perf-diagnostics.sh
+docker compose -f lab/docker-compose.yml exec client \
+  ps -o pid,comm,%cpu,%mem,rss,vsz,etime,args
+docker compose -f lab/docker-compose.yml exec server \
+  ps -o pid,comm,%cpu,%mem,rss,vsz,etime,args
+docker stats --no-stream \
+  $(docker compose -f lab/docker-compose.yml ps -q client server target)
 ```
 
-## Process-Level Monitoring
+## Linux perf
 
-The wrapper samples `docker stats` once per second by default. Adjust the interval if the sampling overhead is too high:
-
-```bash
-MPTUNNEL_PERF_STATS_INTERVAL_SECONDS=2 lab/run-perf-diagnostics.sh
-```
-
-Inspect live process state while a run is active:
-
-```bash
-docker compose -f lab/docker-compose.yml exec client ps -o pid,comm,%cpu,%mem,rss,vsz,etime,args
-docker compose -f lab/docker-compose.yml exec server ps -o pid,comm,%cpu,%mem,rss,vsz,etime,args
-```
-
-For container-level snapshots:
-
-```bash
-docker stats --no-stream $(docker compose -f lab/docker-compose.yml ps -q client server target)
-```
-
-## Linux `perf` / Flamegraph
-
-For symbolized CPU profiles, build the optimized diagnostic binary with frame pointers and debug info. This remains a lab build and is not part of release packaging.
+Linux `perf` is an optional profiler, not a product dependency. Build an
+optimized diagnostic binary with symbols and frame pointers:
 
 ```bash
 RUSTFLAGS='-C force-frame-pointers=yes -C debuginfo=1' \
 MPTUNNEL_LAB_DIAGNOSTICS=1 \
 MPTUNNEL_LAB_PERF=1 \
-CASE_FILTER='mptunnel_mixed_multipath_all' \
+CASE_FILTER='mptunnel_tcp_multipath_all' \
 KEEP_LAB=1 \
 lab/run-heterogeneous-ablation.sh
 ```
 
-Find the host PID of the mptunnel process:
+Find the host PID and record a bounded profile:
 
 ```bash
 container_id="$(docker compose -f lab/docker-compose.yml ps -q client)"
-docker top "$container_id" -eo pid,comm,args | grep mptunnel
-```
-
-Record a CPU profile from the host:
-
-```bash
+docker top "$container_id" -eo pid,comm,args
 perf record -F 99 -g -p <host-pid> -- sleep 20
 perf report
 ```
 
-If `perf` is unavailable or the host denies access to performance counters, keep using `mptunnel_lab_perf` plus Docker stats; those are sufficient to distinguish network wait, internal queue wait, carrier wait, transport CPU, and mux/repair CPU without privileged host changes.
+If counters are unavailable, use component timing and Docker stats. A Linux
+profile cannot prove Windows/macOS/Android CPU behavior, and Linux `TCP_INFO`
+availability cannot be assumed on other targets.
 
-If `cargo flamegraph` is already installed on the machine, it can be used with the same optimized diagnostic build settings. Do not add flamegraph generation to release CI or build scripts.
+## Acceptance
 
-## Methodology
-
-Use one experiment, one reflection, and one core improvement at a time:
-
-1. Run the fixed-duration release or diagnostic row.
-2. Compare mptunnel against direct, VMess, Hysteria2, and MPTCP baselines where the case supports them.
-3. Inspect `component_summary` and Docker stats.
-4. Decide whether the limiting component is carrier wait, queueing, transport CPU, mux repair/reorder, or local I/O.
-5. Make one essential implementation change guided by that bottleneck.
-6. Re-run the same case and then a broader normal/mixed/matrix/failover set to prove the fix did not overfit one condition.
-
-This mirrors the useful lessons from mature transports: MPTCP-style reinjection must be checked against head-of-line cost, Hysteria2-style UDP control must be checked against pacing and loss recovery cost, and BBR/BBRv3-style model changes must be checked against delivered rate, queue growth, and latency instead of final throughput alone.
+An optimization is accepted only when the intended owner gets measurably
+better and no material guard regresses. Report receiver-delivered goodput,
+latency/gaps, traffic overhead, CPU, memory, and path use together. A failed
+attempt is evidence about the model; revert or correct it rather than stacking
+another heuristic over it.

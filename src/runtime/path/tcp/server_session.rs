@@ -5,24 +5,26 @@
 
 use super::io::encrypted_framed_peer_closed;
 use super::server_datagram::{ServerTcpDatagramEffect, ServerTcpDatagramState};
-use super::server_evidence::{ServerTcpEvidenceOutcome, ServerTcpEvidenceState};
+use super::server_evidence::ServerTcpEvidenceState;
 use super::server_stream::ServerTcpStreamState;
 use super::server_writer::ServerTcpWriter;
 #[cfg(feature = "lab-diagnostics")]
 use crate::lab_diagnostics::lab_diagnostic;
-use crate::protocol::{CloseReason, Frame, PathId, ResetReason, SessionId};
+use crate::protocol::{CloseReason, Frame, PathId, PeerPathState, ResetReason, SessionId};
 use crate::runtime::error::RuntimeError;
 use crate::runtime::path::ServerCarrierPathRegistration;
 use crate::runtime::path::commands::{
     ReliablePathCommand, ReliablePathCommandReceivers, ReliablePathCommandSender,
-    TcpCapacityProbeOwner, recv_reliable_path_command,
-    reliable_noninterlocked_tcp_writer_run_budget_bytes, reliable_path_command_pending_bytes,
-    reliable_path_command_writer_run_budget_items, reliable_path_command_writer_run_bytes,
-    reliable_path_frame_requires_capacity_command, reliable_path_receivers_closed,
-    try_coalesce_reliable_path_writer_run, try_recv_reliable_path_command,
+    recv_reliable_path_command, reliable_noninterlocked_tcp_writer_run_budget_bytes,
+    reliable_path_command_pending_bytes, reliable_path_command_writer_run_budget_items,
+    reliable_path_command_writer_run_bytes, reliable_path_frame_requires_capacity_command,
+    reliable_path_receivers_closed, try_coalesce_reliable_path_writer_run,
+    try_recv_reliable_path_command,
 };
 use crate::runtime::path::server_context::ServerPathContext;
+use crate::runtime::peer_status::PeerStatusCarrier;
 use crate::transport::encrypted::EncryptedFramedTransportError;
+#[cfg(feature = "lab-diagnostics")]
 use std::time::Instant;
 use tokio::sync::mpsc;
 
@@ -40,9 +42,10 @@ enum ServerTcpFrameDisposition {
 enum ServerTcpPathEvent {
     Frame(Frame),
     Command(ReliablePathCommand),
+    PeerStatusRequest(u64),
 }
 
-/// Owned handoff from authenticated admission into the long-lived actor.
+/// Owned state transferred from authenticated admission into the long-lived actor.
 pub(super) struct ServerTcpPathAdmission {
     pub(super) context: ServerPathContext,
     pub(super) session_id: SessionId,
@@ -53,6 +56,7 @@ pub(super) struct ServerTcpPathAdmission {
     pub(super) commands_tx: ReliablePathCommandSender,
     pub(super) commands_rx: ReliablePathCommandReceivers,
     pub(super) evidence: ServerTcpEvidenceState,
+    pub(super) peer_status: PeerStatusCarrier,
 }
 
 pub(super) struct ServerTcpPathSession {
@@ -67,6 +71,7 @@ pub(super) struct ServerTcpPathSession {
     commands_tx: ReliablePathCommandSender,
     path_frames: mpsc::Receiver<Result<Frame, EncryptedFramedTransportError>>,
     writer: ServerTcpWriter,
+    peer_status: PeerStatusCarrier,
     path_registration: ServerCarrierPathRegistration,
     context: ServerPathContext,
 }
@@ -84,6 +89,7 @@ impl ServerTcpPathSession {
             commands_tx: admission.commands_tx,
             path_frames: admission.path_frames,
             writer: admission.writer,
+            peer_status: admission.peer_status,
             path_registration: admission.path_registration,
             context: admission.context,
         }
@@ -91,28 +97,12 @@ impl ServerTcpPathSession {
 
     pub(super) async fn run(mut self) -> Result<(), RuntimeError> {
         loop {
-            let event = if let Some(deadline) = self.evidence.response_probe_deadline() {
-                match tokio::time::timeout_at(
-                    deadline,
-                    recv_server_tcp_path_event(&mut self.path_frames, &mut self.commands_rx),
-                )
-                .await
-                {
-                    Ok(event) => event?,
-                    Err(_) => {
-                        self.evidence.log_response_probe_timeout(
-                            self.session_id,
-                            self.path_id,
-                            self.path_registration.path_instance_id(),
-                        );
-                        // A late receipt cannot be attributed after the lease is
-                        // released, so fail-close this exact carrier.
-                        return Ok(());
-                    }
-                }
-            } else {
-                recv_server_tcp_path_event(&mut self.path_frames, &mut self.commands_rx).await?
-            };
+            let event = recv_server_tcp_path_event(
+                &mut self.path_frames,
+                &mut self.commands_rx,
+                &mut self.peer_status,
+            )
+            .await?;
             let Some(event) = event else {
                 return Ok(());
             };
@@ -142,6 +132,15 @@ impl ServerTcpPathSession {
                         return Ok(());
                     }
                 }
+                ServerTcpPathEvent::PeerStatusRequest(request_id) => {
+                    if matches!(
+                        self.write_reply(Frame::PeerStatusRequest { request_id })
+                            .await?,
+                        ServerTcpFrameDisposition::Stop
+                    ) {
+                        return Ok(());
+                    }
+                }
             }
         }
     }
@@ -155,7 +154,6 @@ impl ServerTcpPathSession {
                 stream_id,
                 target,
                 demand,
-                role,
                 ..
             } if !self.draining => {
                 let reply = self
@@ -165,12 +163,9 @@ impl ServerTcpPathSession {
                         &self.path_registration,
                         &self.commands_tx,
                         self.session_id,
-                        self.path_id,
-                        self.evidence.startup_metrics(),
                         stream_id,
                         target,
                         demand,
-                        role,
                     )
                     .await?;
                 self.write_optional_reply(reply).await
@@ -232,7 +227,7 @@ impl ServerTcpPathSession {
                 self.streams
                     .route_frame(
                         &self.context,
-                        self.session_id,
+                        &self.path_registration,
                         self.path_id,
                         stream_id,
                         frame,
@@ -283,42 +278,23 @@ impl ServerTcpPathSession {
                 );
                 Ok(ServerTcpFrameDisposition::Continue)
             }
-            Frame::PathCapacityReceipt {
-                path_id: receipt_path_id,
-                calibration_id,
-                received_payload_bytes,
-            } if receipt_path_id == self.path_id => {
-                match self.evidence.handle_response_capacity_receipt(
-                    &self.context,
-                    &self.path_registration,
-                    self.session_id,
-                    self.path_id,
-                    calibration_id,
-                    received_payload_bytes,
-                )? {
-                    ServerTcpEvidenceOutcome::Handled => Ok(ServerTcpFrameDisposition::Continue),
-                    ServerTcpEvidenceOutcome::SkipCommandPoll => {
-                        Ok(ServerTcpFrameDisposition::SkipCommandPoll)
-                    }
-                }
-            }
             Frame::PathCapacityData {
                 path_id: capacity_path_id,
-                calibration_id,
+                measurement_id,
                 payload,
             } if capacity_path_id == self.path_id => {
                 self.evidence
-                    .handle_request_capacity_data(calibration_id, payload.len())?;
+                    .handle_request_capacity_data(measurement_id, payload.len())?;
                 Ok(ServerTcpFrameDisposition::Continue)
             }
             Frame::PathCapacityFinish {
                 path_id: capacity_path_id,
-                calibration_id,
+                measurement_id,
                 payload_bytes,
             } if capacity_path_id == self.path_id => {
                 let reply = self.evidence.handle_request_capacity_finish(
                     self.path_id,
-                    calibration_id,
+                    measurement_id,
                     payload_bytes,
                 )?;
                 self.write_reply(reply).await
@@ -328,22 +304,48 @@ impl ServerTcpPathSession {
                     .record_peer_metrics(&self.context, &self.path_registration, metrics);
                 Ok(ServerTcpFrameDisposition::Continue)
             }
+            Frame::PathStatus {
+                path_id: status_path_id,
+                sequence,
+                usage,
+            } if status_path_id == self.path_id => {
+                self.context.reliable_streams.record_peer_path_usage(
+                    &self.path_registration,
+                    sequence,
+                    usage,
+                );
+                Ok(ServerTcpFrameDisposition::Continue)
+            }
+            Frame::PathStatus { .. } => Err(RuntimeError::Protocol(
+                "TCP path usage advertisement path mismatch",
+            )),
+            Frame::PeerStatusRequest { request_id } => {
+                let response =
+                    self.peer_status
+                        .response_frame(request_id, self.context.codec_limits, || {
+                            self.context.peer_status_snapshot(self.session_id)
+                        });
+                self.write_reply(response).await
+            }
+            Frame::PeerStatusResponse {
+                request_id,
+                code,
+                paths,
+            } => {
+                let _ = self.peer_status.receive_response(request_id, code, paths);
+                Ok(ServerTcpFrameDisposition::Continue)
+            }
             Frame::PathDrain {
                 path_id: drain_path_id,
             } if drain_path_id == self.path_id => {
                 self.draining = true;
-                if !self
-                    .writer
-                    .write_frame(&Frame::PathStatus {
-                        path_id: self.path_id,
-                        status: crate::protocol::PathStatus::Draining,
-                    })
-                    .await?
-                {
-                    return Ok(ServerTcpFrameDisposition::Stop);
-                }
+                self.path_registration.set_state(PeerPathState::Draining);
                 if self.streams.is_empty() && self.datagrams.is_empty() {
-                    Ok(ServerTcpFrameDisposition::Stop)
+                    self.write_stop_reply(Frame::PathClose {
+                        path_id: self.path_id,
+                        reason: CloseReason::Normal,
+                    })
+                    .await
                 } else {
                     Ok(ServerTcpFrameDisposition::Continue)
                 }
@@ -428,82 +430,12 @@ impl ServerTcpPathSession {
                     ));
                 }
                 ReliablePathCommand::SendTcpCapacityProbe(probe) => {
-                    let TcpCapacityProbeOwner::Response { path_instance_id } = probe.owner else {
-                        self.commands_rx
-                            .release_pending_command_bytes(pending_bytes);
-                        return Err(RuntimeError::Protocol(
-                            "server TCP path received request capacity command",
-                        ));
-                    };
-                    if probe.path_id != self.path_id
-                        || path_instance_id != self.path_registration.path_instance_id()
-                        || probe.train_payload_bytes < probe.sample_floor_bytes
-                        || self.evidence.has_response_probe()
-                    {
-                        self.commands_rx
-                            .release_pending_command_bytes(pending_bytes);
-                        return Err(RuntimeError::Protocol(
-                            "server TCP capacity command does not match idle writer",
-                        ));
-                    }
-                    if !self.writer.write_batch(&mut self.evidence).await? {
-                        return Ok(ServerTcpSessionDisposition::Stop);
-                    }
-                    if Instant::now() >= probe.expires_at {
-                        self.commands_rx
-                            .release_pending_command_bytes(pending_bytes);
-                        return Ok(ServerTcpSessionDisposition::Continue);
-                    }
-                    let started_at = Instant::now();
-                    let wrote = match tokio::time::timeout_at(
-                        tokio::time::Instant::from_std(probe.expires_at),
-                        self.writer.write_capacity_probe(
-                            &probe,
-                            self.context.mux_limits.max_payload_bytes,
-                        ),
-                    )
-                    .await
-                    {
-                        Ok(result) => result?,
-                        Err(_) => {
-                            self.commands_rx
-                                .release_pending_command_bytes(pending_bytes);
-                            #[cfg(feature = "lab-diagnostics")]
-                            lab_diagnostic(
-                                "response_tcp_capacity_probe",
-                                format_args!(
-                                    "phase=rejected reason=send_timeout session_id={} path_id={} path_instance_id={} calibration_id={}",
-                                    self.session_id.0,
-                                    self.path_id.0,
-                                    path_instance_id.as_u64(),
-                                    probe.calibration_id,
-                                ),
-                            );
-                            // Receipt cannot identify a partial train, so close
-                            // the exact carrier instead of releasing it.
-                            return Ok(ServerTcpSessionDisposition::Stop);
-                        }
-                    };
+                    drop(probe);
                     self.commands_rx
                         .release_pending_command_bytes(pending_bytes);
-                    if !wrote {
-                        return Ok(ServerTcpSessionDisposition::Stop);
-                    }
-                    #[cfg(feature = "lab-diagnostics")]
-                    lab_diagnostic(
-                        "response_tcp_capacity_probe",
-                        format_args!(
-                            "phase=sent session_id={} path_id={} path_instance_id={} calibration_id={} train_bytes={} sample_floor_bytes={}",
-                            self.session_id.0,
-                            self.path_id.0,
-                            path_instance_id.as_u64(),
-                            probe.calibration_id,
-                            probe.train_payload_bytes,
-                            probe.sample_floor_bytes,
-                        ),
-                    );
-                    self.evidence.publish_response_probe(probe, started_at);
-                    return Ok(ServerTcpSessionDisposition::Continue);
+                    return Err(RuntimeError::Protocol(
+                        "server TCP path received request capacity command",
+                    ));
                 }
                 ReliablePathCommand::ResetAndCloseStream { stream_id, reason } => {
                     // A TCP session is shared, so retire only this attachment
@@ -669,17 +601,26 @@ impl ServerTcpPathSession {
 async fn recv_server_tcp_path_event(
     path_frames: &mut mpsc::Receiver<Result<Frame, EncryptedFramedTransportError>>,
     commands_rx: &mut ReliablePathCommandReceivers,
+    peer_status: &mut PeerStatusCarrier,
 ) -> Result<Option<ServerTcpPathEvent>, RuntimeError> {
     loop {
         let command_may_recv = !reliable_path_receivers_closed(commands_rx);
         tokio::select! {
             biased;
+            request_id = peer_status.recv_request() => {
+                if let Some(request_id) = request_id {
+                    return Ok(Some(ServerTcpPathEvent::PeerStatusRequest(request_id)));
+                }
+            }
             frame = path_frames.recv() => {
                 return match frame {
                     Some(Ok(frame)) => Ok(Some(ServerTcpPathEvent::Frame(frame))),
                     Some(Err(err)) if encrypted_framed_peer_closed(&err) => Ok(None),
                     Some(Err(err)) => Err(RuntimeError::Encrypted(err)),
-                    None => Err(RuntimeError::ReliablePathSessionClosed),
+                    // The reader task is the sole producer. Exhaustion means
+                    // the carrier is gone; actor drop guards retire its path
+                    // and streams regardless of transport close ordering.
+                    None => Ok(None),
                 };
             }
             command = recv_reliable_path_command(commands_rx), if command_may_recv => {

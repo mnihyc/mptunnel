@@ -11,10 +11,12 @@ mod management;
 mod node;
 mod packet_device;
 mod path;
+mod peer_status;
 mod recent_ids;
 mod relay;
 mod sender;
 mod stream;
+mod telemetry;
 mod tun_l4;
 
 pub use datagram::{client_udp_datagram_round_trip, client_udp_datagram_round_trip_with_provider};
@@ -45,10 +47,10 @@ use crate::protocol::codec::CodecLimits;
 #[cfg(test)]
 use crate::protocol::{
     DatagramFlowId, Frame, OffsetRange, PathId, PathMetricDirection, PathMetrics, SessionId,
-    StreamId, StreamOpenRole, TargetAddr, UnderlayProtocol,
+    StreamId, TargetAddr, UnderlayProtocol,
 };
 #[cfg(test)]
-use crate::scheduler::{self, FlowLane, PathSnapshot, PathState as SchedulerPathState};
+use crate::scheduler::{PathSnapshot, PathState as SchedulerPathState, TrafficClass};
 #[cfg(test)]
 use crate::transport::encrypted::{EncryptedFramedStream, EncryptedFramedTransportError, PeerRole};
 #[cfg(test)]
@@ -102,8 +104,6 @@ use path::tcp::client_connection::*;
 use path::tcp::server::*;
 #[cfg(test)]
 use path::{ClientPathContext, ClientPathHealthRecord, PathDeliveryStats, commands::*, model::*};
-#[cfg(test)]
-use path::{ClientPathHealth, ClientPathState};
 #[cfg(test)]
 use relay::*;
 #[cfg(test)]

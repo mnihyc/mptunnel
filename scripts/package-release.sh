@@ -95,7 +95,7 @@ stage="${dist_dir}/${package}"
 rm -rf "$stage"
 mkdir -p "$stage"
 cp "${target_dir}/${binary}" "$stage/"
-cp README.md LICENSE "$stage/"
+cp README.md RFC.md LICENSE "$stage/"
 cp -R docs "$stage/"
 
 if [[ -n "$wintun_arch" ]]; then

@@ -1,10 +1,10 @@
 use super::super::{
-    ClientRepairOutputIdentity, PersistentClientAckGapBatch, PersistentServerAckGapBatch,
-    ServerRepairOutputIdentity,
+    ClientReinjectionOutputIdentity, PersistentClientAckGapBatch, PersistentServerAckGapBatch,
+    ServerReinjectionOutputIdentity,
 };
 use super::*;
 use crate::model::path::CarrierPathKey;
-use crate::model::path::{RelayPathInstance, RelayPathKey};
+use crate::model::path::{CarrierPathInstanceId, RelayPathInstance, RelayPathKey};
 use crate::mux::MuxLimits;
 use crate::mux::stream::ReliableSendStream;
 use crate::protocol::{PathId, StreamId, UnderlayProtocol};
@@ -48,15 +48,15 @@ fn sender_queue_read_budget_respects_stream_flow_control_credit() {
 }
 
 #[test]
-fn sender_queue_dispatches_owner_data_before_ordinary_repair() {
+fn sender_queue_dispatches_original_data_before_ordinary_reinjection() {
     let stream_id = StreamId(77);
     let mut queue = ReliableRelaySenderQueue::default();
 
     queue.push_data(Bytes::from_static(b"owner"));
-    queue.push_repair(Frame::StreamData {
+    queue.push_reinjection(Frame::StreamData {
         stream_id,
         offset: 0,
-        payload: Bytes::from_static(b"repair"),
+        payload: Bytes::from_static(b"reinjection"),
     });
 
     let (lane, work) = queue
@@ -65,63 +65,65 @@ fn sender_queue_dispatches_owner_data_before_ordinary_repair() {
     assert_eq!(
         lane,
         ReliableWorkClass::Data,
-        "ordinary RepairData must not preempt OwnerData; repair only preempts when explicitly critical"
+        "ordinary ReinjectedData must not preempt OriginalData; reinjection only preempts when explicitly critical"
     );
     assert_eq!(work.payload_bytes, 5);
 }
 
 #[test]
-fn sender_queue_dispatches_critical_repair_before_owner_data() {
+fn sender_queue_dispatches_critical_reinjection_before_original_data() {
     let stream_id = StreamId(78);
     let mut queue = ReliableRelaySenderQueue::default();
 
     queue.push_data(Bytes::from_static(b"owner"));
-    queue.push_critical_repair_with_cause(
+    queue.push_critical_reinjection_with_cause(
         Frame::StreamData {
             stream_id,
             offset: 0,
-            payload: Bytes::from_static(b"repair"),
+            payload: Bytes::from_static(b"reinjection"),
         },
-        RelaySendCause::AckGapRepair,
+        RelaySendCause::AckGapReinjection,
     );
 
-    let (lane, work) = queue.pop_front().expect("critical repair should be queued");
+    let (lane, work) = queue
+        .pop_front()
+        .expect("critical reinjection should be queued");
     assert_eq!(
         lane,
-        ReliableWorkClass::Repair,
-        "critical RepairData closes an active product hole and must preempt later OwnerData"
+        ReliableWorkClass::Reinjection,
+        "critical ReinjectedData closes an active product hole and must preempt later OriginalData"
     );
-    assert_eq!(work.payload_bytes, 6);
+    assert_eq!(work.payload_bytes, b"reinjection".len());
 }
 
 #[test]
-fn sender_queue_trims_and_releases_acked_live_tail_repair() {
+fn sender_queue_trims_and_releases_acked_live_tail_reinjection() {
     let stream_id = StreamId(80);
     let mut queue = ReliableRelaySenderQueue::default();
-    queue.push_critical_repair_with_cause(
+    queue.push_critical_reinjection_with_cause(
         Frame::StreamData {
             stream_id,
             offset: 128,
             payload: Bytes::from_static(&[0x5a; 64]),
         },
-        RelaySendCause::LiveOwnerTailRepair,
+        RelaySendCause::TailReinjection,
     );
 
     assert_eq!(
-        queue.release_normalized_acked_repairs(&[OffsetRange { start: 0, end: 160 }]),
+        queue.release_normalized_acked_reinjections(&[OffsetRange { start: 0, end: 160 }]),
         32,
     );
     assert_eq!(queue.bytes(), 32);
     assert!(matches!(
         queue.front().map(|(_, work)| &work.kind),
-        Some(ReliableRelayQueuedWorkKind::Repair {
+        Some(ReliableRelayQueuedWorkKind::Reinjection {
             frame: Frame::StreamData { offset: 160, payload, .. },
-            cause: RelaySendCause::LiveOwnerTailRepair,
+            cause: RelaySendCause::TailReinjection,
         }) if payload.len() == 32
     ));
 
     assert_eq!(
-        queue.release_normalized_acked_repairs(&[OffsetRange { start: 0, end: 192 }]),
+        queue.release_normalized_acked_reinjections(&[OffsetRange { start: 0, end: 192 }]),
         32,
     );
     assert!(queue.is_empty());
@@ -129,17 +131,17 @@ fn sender_queue_trims_and_releases_acked_live_tail_repair() {
 }
 
 #[test]
-fn sender_queue_discards_only_unusable_live_owner_tail_repair() {
+fn sender_queue_discards_only_unusable_tail_reinjection() {
     let stream_id = StreamId(81);
     let mut queue = ReliableRelaySenderQueue::default();
     for cause in [
-        RelaySendCause::LiveOwnerTailRepair,
-        RelaySendCause::PathFailureRepair,
+        RelaySendCause::TailReinjection,
+        RelaySendCause::PathFailureReinjection,
     ] {
-        queue.push_critical_repair_with_cause(
+        queue.push_critical_reinjection_with_cause(
             Frame::StreamData {
                 stream_id,
-                offset: if cause == RelaySendCause::LiveOwnerTailRepair {
+                offset: if cause == RelaySendCause::TailReinjection {
                     0
                 } else {
                     64
@@ -150,38 +152,36 @@ fn sender_queue_discards_only_unusable_live_owner_tail_repair() {
         );
     }
 
-    assert_eq!(
-        queue.discard_unusable_live_owner_tail_repairs(|_| false),
-        64,
-    );
+    assert_eq!(queue.discard_unusable_tail_reinjections(|_| false), 64,);
     assert_eq!(queue.bytes(), 64);
     assert!(matches!(
         queue.front().map(|(_, work)| &work.kind),
-        Some(ReliableRelayQueuedWorkKind::Repair {
-            cause: RelaySendCause::PathFailureRepair,
+        Some(ReliableRelayQueuedWorkKind::Reinjection {
+            cause: RelaySendCause::PathFailureReinjection,
             ..
         })
     ));
 }
 
 #[test]
-fn sender_queue_discards_stale_bound_repair_without_touching_ordinary_repair() {
+fn sender_queue_discards_stale_bound_reinjection_without_touching_ordinary_reinjection() {
     let stream_id = StreamId(82);
     let mut queue = ReliableRelaySenderQueue::default();
-    let cause = RelaySendCause::PersistentClientAckGapRepair(PersistentClientAckGapBatch {
-        target: ClientRepairOutputIdentity {
+    let cause = RelaySendCause::PersistentClientAckGapReinjection(PersistentClientAckGapBatch {
+        target: ClientReinjectionOutputIdentity {
             instance: RelayPathInstance {
                 key: RelayPathKey {
                     underlay: UnderlayProtocol::Tcp,
                     index: 2,
                 },
-                id: 7,
+                path_instance_id: CarrierPathInstanceId::from_raw(7),
+                attachment_id: 7,
             },
         },
         expires_at: Instant::now() + Duration::from_secs(1),
     });
-    for (offset, cause) in [(0, cause), (64, RelaySendCause::AckGapRepair)] {
-        queue.push_critical_repair_with_cause(
+    for (offset, cause) in [(0, cause), (64, RelaySendCause::AckGapReinjection)] {
+        queue.push_critical_reinjection_with_cause(
             Frame::StreamData {
                 stream_id,
                 offset,
@@ -192,30 +192,30 @@ fn sender_queue_discards_stale_bound_repair_without_touching_ordinary_repair() {
     }
 
     assert_eq!(
-        queue.discard_stale_persistent_ack_gap_repairs(|_| false),
+        queue.discard_stale_persistent_ack_gap_reinjections(|_| false),
         64
     );
     assert_eq!(queue.bytes(), 64);
     assert!(matches!(
         queue.front().map(|(_, work)| &work.kind),
-        Some(ReliableRelayQueuedWorkKind::Repair {
-            cause: RelaySendCause::AckGapRepair,
+        Some(ReliableRelayQueuedWorkKind::Reinjection {
+            cause: RelaySendCause::AckGapReinjection,
             ..
         })
     ));
 }
 
 #[test]
-fn sender_queue_discards_expired_bound_repair_on_live_output() {
+fn sender_queue_discards_expired_bound_reinjection_on_live_output() {
     let mut queue = ReliableRelaySenderQueue::default();
-    queue.push_critical_repair_with_cause(
+    queue.push_critical_reinjection_with_cause(
         Frame::StreamData {
             stream_id: StreamId(83),
             offset: 0,
             payload: Bytes::from_static(&[0x5d; 64]),
         },
-        RelaySendCause::PersistentServerAckGapRepair(PersistentServerAckGapBatch {
-            target: ServerRepairOutputIdentity {
+        RelaySendCause::PersistentServerAckGapReinjection(PersistentServerAckGapBatch {
+            target: ServerReinjectionOutputIdentity {
                 key: CarrierPathKey {
                     underlay: UnderlayProtocol::Udp,
                     path_id: PathId(3),
@@ -226,7 +226,49 @@ fn sender_queue_discards_expired_bound_repair_on_live_output() {
         }),
     );
 
-    assert_eq!(queue.discard_stale_persistent_ack_gap_repairs(|_| true), 64);
+    assert_eq!(
+        queue.discard_stale_persistent_ack_gap_reinjections(|_| true),
+        64
+    );
     assert!(queue.is_empty());
     assert_eq!(queue.bytes(), 0);
+}
+
+#[test]
+fn sender_queue_discards_reinjection_after_exact_path_progress() {
+    let path = RelayPathInstance {
+        key: RelayPathKey {
+            underlay: UnderlayProtocol::Tcp,
+            index: 4,
+        },
+        path_instance_id: CarrierPathInstanceId::from_raw(12),
+        attachment_id: 12,
+    };
+    let mut queue = ReliableRelaySenderQueue::default();
+    for (offset, cause) in [
+        (0, RelaySendCause::StalePathReinjection(path)),
+        (64, RelaySendCause::AckGapReinjection),
+    ] {
+        queue.push_critical_reinjection_with_cause(
+            Frame::StreamData {
+                stream_id: StreamId(84),
+                offset,
+                payload: Bytes::from_static(&[0x5e; 64]),
+            },
+            cause,
+        );
+    }
+
+    assert_eq!(
+        queue.discard_resolved_stale_path_reinjections(|candidate| candidate != path),
+        64
+    );
+    assert_eq!(queue.bytes(), 64);
+    assert!(matches!(
+        queue.front().map(|(_, work)| &work.kind),
+        Some(ReliableRelayQueuedWorkKind::Reinjection {
+            cause: RelaySendCause::AckGapReinjection,
+            ..
+        })
+    ));
 }

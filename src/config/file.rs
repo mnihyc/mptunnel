@@ -118,6 +118,10 @@ struct ManagementFileConfig {
     #[serde(default)]
     listen: Vec<SocketAddr>,
     token: Option<String>,
+    #[serde(default)]
+    dashboard: bool,
+    #[serde(default)]
+    allow_peer_diagnostics: bool,
 }
 
 impl ManagementFileConfig {
@@ -125,6 +129,8 @@ impl ManagementFileConfig {
         ManagementConfig {
             listen: self.listen,
             token: self.token,
+            dashboard: self.dashboard,
+            allow_peer_diagnostics: self.allow_peer_diagnostics,
         }
     }
 }
@@ -207,21 +213,14 @@ impl ResourceFileConfig {
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct SecurityFileConfig {
-    #[serde(default = "default_security_mode")]
-    mode: SecurityMode,
     secret: Option<String>,
     #[serde(default)]
     cipher: CipherFileValue,
-    #[serde(default)]
-    i_understand_this_is_insecure: bool,
     auth_freshness_window_seconds: Option<u64>,
 }
 
 impl SecurityFileConfig {
     fn into_config(self) -> Result<SecurityConfig, ConfigFileError> {
-        if matches!(self.mode, SecurityMode::PlaintextLab) && !self.i_understand_this_is_insecure {
-            return Err(ConfigFileError::PlaintextNotAcknowledged);
-        }
         let secret = SharedSecret::new(
             self.secret
                 .ok_or(ConfigFileError::Security(
@@ -234,24 +233,10 @@ impl SecurityFileConfig {
                 .unwrap_or(DEFAULT_AUTH_FRESHNESS_WINDOW_SECONDS),
         );
         let cipher = self.cipher.into();
-        let config = match self.mode {
-            SecurityMode::Encrypted => SecurityConfig::encrypted_with_cipher(secret, cipher),
-            SecurityMode::PlaintextLab => SecurityConfig::plaintext_lab_with_cipher(secret, cipher),
-        }
-        .with_auth_freshness_window(auth_freshness_window);
+        let config = SecurityConfig::encrypted_with_cipher(secret, cipher)
+            .with_auth_freshness_window(auth_freshness_window);
         Ok(config)
     }
-}
-
-#[derive(Debug, Clone, Copy, Deserialize)]
-#[serde(rename_all = "kebab-case")]
-enum SecurityMode {
-    Encrypted,
-    PlaintextLab,
-}
-
-fn default_security_mode() -> SecurityMode {
-    SecurityMode::Encrypted
 }
 
 #[derive(Debug, Clone, Copy, Default, Deserialize)]
@@ -1277,7 +1262,6 @@ pub enum ConfigFileError {
     Security(SecurityPolicyError),
     Endpoint(EndpointParseError),
     PathSpec(PathSpecParseError),
-    PlaintextNotAcknowledged,
     NoRuntimeServices,
     EmptyTag,
     DuplicateTag(String),
@@ -1336,12 +1320,6 @@ impl std::fmt::Display for ConfigFileError {
             Self::Security(err) => write!(f, "{err}"),
             Self::Endpoint(err) => write!(f, "{err}"),
             Self::PathSpec(err) => write!(f, "{err}"),
-            Self::PlaintextNotAcknowledged => {
-                write!(
-                    f,
-                    "plaintext lab mode requires i_understand_this_is_insecure = true"
-                )
-            }
             Self::NoRuntimeServices => {
                 write!(f, "config must define at least one [[inbounds]] entry")
             }
@@ -1440,8 +1418,7 @@ impl std::error::Error for ConfigFileError {
             Self::Security(err) => Some(err),
             Self::Endpoint(err) => Some(err),
             Self::PathSpec(err) => Some(err),
-            Self::PlaintextNotAcknowledged
-            | Self::NoRuntimeServices
+            Self::NoRuntimeServices
             | Self::EmptyTag
             | Self::DuplicateTag(_)
             | Self::DuplicateInboundTag(_)

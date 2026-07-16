@@ -24,7 +24,7 @@ fn send_stream_keeps_data_until_tunnel_ack() {
         .send_data(Bytes::from_static(b"hello"))
         .expect("send");
 
-    assert_eq!(stream.repair_bytes(), 5);
+    assert_eq!(stream.reinjection_bytes(), 5);
 
     let outcome = stream.apply_ack(&[OffsetRange::new(0, 5).expect("range")]);
     assert_eq!(
@@ -32,14 +32,14 @@ fn send_stream_keeps_data_until_tunnel_ack() {
         AckOutcome {
             released_bytes: 5,
             released_chunks: 1,
-            remaining_repair_bytes: 0
+            remaining_reinjection_bytes: 0
         }
     );
-    assert_eq!(stream.repair_bytes(), 0);
+    assert_eq!(stream.reinjection_bytes(), 0);
 }
 
 #[test]
-fn send_stream_trims_repair_cache_by_ack_subranges() {
+fn send_stream_trims_reinjection_cache_by_ack_subranges() {
     let mut stream = ReliableSendStream::new(StreamId(2), limits());
     stream
         .send_data(Bytes::from_static(b"abcdefgh"))
@@ -51,7 +51,7 @@ fn send_stream_trims_repair_cache_by_ack_subranges() {
         AckOutcome {
             released_bytes: 4,
             released_chunks: 0,
-            remaining_repair_bytes: 4,
+            remaining_reinjection_bytes: 4,
         }
     );
 
@@ -97,7 +97,7 @@ fn send_stream_retransmits_ack_range_holes_before_later_inflight() {
 }
 
 #[test]
-fn send_stream_slices_ack_gap_repairs_to_byte_limit() {
+fn send_stream_slices_ack_gap_reinjections_to_byte_limit() {
     let mut stream = ReliableSendStream::new(StreamId(8), limits());
     stream
         .send_data(Bytes::from_static(b"abcdefgh"))
@@ -119,7 +119,7 @@ fn send_stream_slices_ack_gap_repairs_to_byte_limit() {
 }
 
 #[test]
-fn send_stream_slices_path_failure_repairs_to_byte_limit() {
+fn send_stream_slices_path_failure_reinjections_to_byte_limit() {
     let mut stream = ReliableSendStream::new(StreamId(9), limits());
     stream
         .send_data(Bytes::from_static(b"abcdefgh"))
@@ -135,7 +135,7 @@ fn send_stream_slices_path_failure_repairs_to_byte_limit() {
 }
 
 #[test]
-fn send_stream_repairs_tail_after_ack_frontier() {
+fn send_stream_reinjections_tail_after_ack_frontier() {
     let mut stream = ReliableSendStream::new(StreamId(10), limits());
     for payload in [b"aaaa", b"bbbb", b"cccc"] {
         stream
@@ -165,7 +165,7 @@ fn send_stream_prepares_data_without_taking_ownership_until_commit() {
         .expect("prepare");
 
     assert_eq!(stream.next_offset(), 0);
-    assert_eq!(stream.repair_bytes(), 0);
+    assert_eq!(stream.reinjection_bytes(), 0);
     assert!(matches!(
         &frame,
         Frame::StreamData { offset: 0, payload, .. } if payload.as_ref() == b"hello"
@@ -175,12 +175,12 @@ fn send_stream_prepares_data_without_taking_ownership_until_commit() {
         .commit_prepared_data(&frame)
         .expect("commit prepared frame");
     assert_eq!(stream.next_offset(), 5);
-    assert_eq!(stream.repair_bytes(), 5);
+    assert_eq!(stream.reinjection_bytes(), 5);
     stream
         .rollback_committed_data(&frame)
         .expect("rollback tail frame");
     assert_eq!(stream.next_offset(), 0);
-    assert_eq!(stream.repair_bytes(), 0);
+    assert_eq!(stream.reinjection_bytes(), 0);
     stream
         .commit_prepared_data(&frame)
         .expect("commit prepared frame again");
@@ -206,7 +206,7 @@ fn send_stream_with_explicit_zero_credit_waits_for_peer_max_data() {
 }
 
 #[test]
-fn send_stream_enforces_flow_control_and_repair_limit() {
+fn send_stream_enforces_flow_control_and_reinjection_limit() {
     let mut limit = limits();
     limit.max_stream_window_bytes = 4;
     let mut stream = ReliableSendStream::new(StreamId(1), limit);
@@ -221,7 +221,7 @@ fn send_stream_enforces_flow_control_and_repair_limit() {
     let mut stream = ReliableSendStream::new(StreamId(1), limit);
     assert!(matches!(
         stream.send_data(Bytes::from_static(b"hello")),
-        Err(StreamError::RepairCacheFull { .. })
+        Err(StreamError::ReinjectionCacheFull { .. })
     ));
 }
 
@@ -306,7 +306,7 @@ fn recv_stream_limits_encoded_ack_ranges_without_rejecting_reordering() {
             complete: false,
             ranges: vec![
                 OffsetRange::new(0, 1).expect("contiguous range"),
-                OffsetRange::new(10, 11).expect("first repair-adjacent range"),
+                OffsetRange::new(10, 11).expect("first reinjection-adjacent range"),
                 OffsetRange::new(20, 21).expect("third range"),
                 OffsetRange::new(30, 31).expect("fourth range"),
             ]

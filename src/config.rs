@@ -18,7 +18,4 @@ pub use model::{
     ManagementConfig, MppPerformanceConfig, NodeConfig, ResourceLimits, RouteTarget,
     RouteTargetKind, SecurityConfig, ServerConfig, ServiceConfig,
 };
-pub use security::{
-    CipherSuite, EncryptionMode, SecurityPolicyError, SharedSecret, TransportIntegrity,
-    TransportSecurity,
-};
+pub use security::{CipherSuite, SecurityPolicyError, SharedSecret};

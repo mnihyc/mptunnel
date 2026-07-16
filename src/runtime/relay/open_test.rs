@@ -30,7 +30,7 @@ fn pending_stream_for_test(
             ReliablePathStream {
                 stream_id,
                 max_offset: mux_limits.max_stream_window_bytes,
-                lane: FlowLane::Throughput,
+                lane: TrafficClass::Throughput,
                 underlay,
                 max_frame_payload_bytes: reliable_relay_buffer_len(mux_limits),
                 output: ReliablePathStreamOutput::fixed(
@@ -45,22 +45,6 @@ fn pending_stream_for_test(
         ),
         command_rx,
     )
-}
-
-#[test]
-fn reliable_udp_service_and_repair_attachments_wait_for_peer_acceptance() {
-    assert!(
-        udp_relay_attachment_open_options(StreamOpenRole::Active).wait_for_accept,
-        "an Active attachment is not usable until the peer accepts it"
-    );
-    assert!(
-        udp_relay_attachment_open_options(StreamOpenRole::Repair).wait_for_accept,
-        "a Repair attachment must exist at the peer before correctness repair uses it"
-    );
-    assert!(
-        !udp_relay_attachment_open_options(StreamOpenRole::Validation).wait_for_accept,
-        "Validation remains an optimistic proof attachment"
-    );
 }
 
 #[tokio::test]
@@ -116,7 +100,7 @@ fn dropping_initial_open_attempt_rolls_back_scheduler_load() {
     let mut attempted = Vec::new();
     let attempt = reserve_reliable_initial_open_attempt(
         &context,
-        FlowLane::Throughput,
+        TrafficClass::Throughput,
         PATH_OPEN_SCORE_BYTES,
         &mut attempted,
     )
@@ -146,7 +130,7 @@ fn dropping_pending_attachment_releases_load_before_stream_cleanup() {
         index: 0,
     };
     let lease = context
-        .reserve_relay_path_load(key, FlowLane::Throughput)
+        .reserve_relay_path_load(key, TrafficClass::Throughput)
         .expect("load lease");
     let stream_id = StreamId(94);
     let (opened, mut receivers) = pending_stream_for_test(stream_id, UnderlayProtocol::Udp, 0);
@@ -164,7 +148,7 @@ fn dropping_pending_attachment_releases_load_before_stream_cleanup() {
 }
 
 #[test]
-fn initial_active_open_retry_uses_fresh_stream_id() {
+fn initial_open_retry_uses_fresh_stream_id() {
     let context = ClientPathContext::new(
         vec![
             "tcp://127.0.0.1:10132?srtt-ms=20&rate-mbps=100"
@@ -181,7 +165,7 @@ fn initial_active_open_retry_uses_fresh_stream_id() {
     let mut attempted = Vec::new();
     let first = reserve_reliable_initial_open_attempt(
         &context,
-        FlowLane::Latency,
+        TrafficClass::Latency,
         PATH_OPEN_SCORE_BYTES,
         &mut attempted,
     )
@@ -194,7 +178,7 @@ fn initial_active_open_retry_uses_fresh_stream_id() {
 
     let second = reserve_reliable_initial_open_attempt(
         &context,
-        FlowLane::Latency,
+        TrafficClass::Latency,
         PATH_OPEN_SCORE_BYTES,
         &mut attempted,
     )
@@ -224,7 +208,7 @@ fn retryable_initial_open_failure_cools_path_for_next_attempt() {
         index: 0,
     };
     let failed_lease = context
-        .reserve_reliable_stream_path(FlowLane::Latency, PATH_OPEN_SCORE_BYTES, &[])
+        .reserve_reliable_stream_path(TrafficClass::Latency, PATH_OPEN_SCORE_BYTES, &[])
         .expect("failed-path reservation");
     assert_eq!(failed_lease.key(), failed);
     drop(failed_lease);
@@ -232,48 +216,10 @@ fn retryable_initial_open_failure_cools_path_for_next_attempt() {
 
     assert_eq!(
         context
-            .reserve_reliable_stream_path(FlowLane::Latency, PATH_OPEN_SCORE_BYTES, &[])
+            .reserve_reliable_stream_path(TrafficClass::Latency, PATH_OPEN_SCORE_BYTES, &[])
             .map(|lease| lease.key()),
         Some(RelayPathKey {
             underlay: UnderlayProtocol::Tcp,
-            index: 1,
-        })
-    );
-}
-
-#[test]
-fn optimistic_udp_validation_does_not_clear_active_open_failure() {
-    let context = ClientPathContext::new(
-        vec![
-            "udp://127.0.0.1:10142?srtt-ms=20&rate-mbps=100"
-                .parse()
-                .expect("failed path"),
-            "udp://127.0.0.1:10143?srtt-ms=80&rate-mbps=100"
-                .parse()
-                .expect("survivor path"),
-        ],
-        security(),
-        ResourceLimits::default(),
-    )
-    .expect("context");
-    let failed = RelayPathKey {
-        underlay: UnderlayProtocol::Udp,
-        index: 0,
-    };
-    let failed_lease = context
-        .reserve_reliable_stream_path(FlowLane::Latency, PATH_OPEN_SCORE_BYTES, &[])
-        .expect("failed-path reservation");
-    assert_eq!(failed_lease.key(), failed);
-    drop(failed_lease);
-    mark_reliable_initial_open_retryable_failure(&context, failed);
-    context.mark_udp_stream_reserved_open_success(0, Duration::ZERO, false);
-
-    assert_eq!(
-        context
-            .reserve_reliable_stream_path(FlowLane::Latency, PATH_OPEN_SCORE_BYTES, &[])
-            .map(|lease| lease.key()),
-        Some(RelayPathKey {
-            underlay: UnderlayProtocol::Udp,
             index: 1,
         })
     );

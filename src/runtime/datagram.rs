@@ -14,6 +14,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 mod association;
+mod edge;
 mod policy;
 mod quic;
 mod quic_session;
@@ -22,12 +23,21 @@ mod tcp;
 mod tcp_session;
 
 pub(super) use association::{DatagramClientAssociation, datagram_underlay_candidate_keys};
+pub(super) use edge::{
+    UdpEdgeCompletion, UdpEdgeLane, UdpEdgeRequest, close_udp_edge_lanes,
+    dispatch_udp_edge_request, finish_udp_edge_completion, udp_edge_completion_queue,
+};
 pub(super) use quic_session::UdpDatagramClientSession;
 pub(in crate::runtime) use server::ServerDatagramService;
 
 #[cfg(test)]
 pub(super) use association::{
     datagram_underlay_error_is_retryable, runtime_error_is_datagram_response_timeout,
+};
+#[cfg(test)]
+pub(super) use edge::{
+    udp_edge_lane_limit, udp_edge_lane_spawn_allowed, udp_edge_queue_slots, udp_edge_route_hint,
+    udp_edge_startup_lane_limit,
 };
 #[cfg(test)]
 pub(super) use policy::{
@@ -117,6 +127,7 @@ pub async fn client_udp_datagram_round_trip_with_provider(
     .await
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn client_udp_datagram_round_trip_with_limits(
     path: &PathSpec,
     security: SecurityConfig,

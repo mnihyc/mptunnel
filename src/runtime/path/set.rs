@@ -5,6 +5,7 @@
 
 use super::commands::reliable_stream_frame_queue;
 use super::health::{ClientPathHealth, ClientPathHealthRecord};
+use super::model::{ClientPathObservation, path_metrics_from_snapshot, path_snapshot};
 use super::quic::client::{ClientUdpPathSessionHandle, ClientUdpPathSessionRuntime};
 use super::state::ClientPathState;
 use super::tcp::client::{
@@ -17,15 +18,22 @@ use crate::config::{
 use crate::ingress::ProxyAuthConfig;
 use crate::model::path::RelayPathKey;
 use crate::mux::MuxLimits;
-use crate::protocol::UnderlayProtocol;
 use crate::protocol::codec::CodecLimits;
+use crate::protocol::{
+    PathMetricDirection, PathUsage, PeerPathState, PeerPathStatus, SessionId, UnderlayProtocol,
+};
 use crate::runtime::error::RuntimeError;
 use crate::runtime::identity::random_session_id;
+use crate::runtime::peer_status::{PeerStatusBroker, PeerStatusSnapshotSource};
 use crate::runtime::recent_ids::reliable_closed_stream_cache_capacity;
+use crate::runtime::telemetry::{
+    RuntimeTelemetry, RuntimeTelemetrySnapshot, active_flow_detail_capacity,
+};
 #[cfg(test)]
 use crate::transport::SystemCarrierNetworkProvider;
 use crate::transport::{CarrierNetworkProvider, CarrierPathIdentity, PathSpec};
 use std::sync::Arc;
+use std::time::Instant;
 
 #[derive(Clone)]
 pub struct ClientPathContext {
@@ -45,6 +53,9 @@ pub struct ClientPathContext {
     pub(in crate::runtime) udp_sessions: Arc<Vec<ClientUdpPathSessionHandle>>,
     pub(in crate::runtime) carrier_network: Arc<dyn CarrierNetworkProvider>,
     pub(super) state: Arc<ClientPathState>,
+    pub(in crate::runtime) session_id: SessionId,
+    pub(in crate::runtime) telemetry: RuntimeTelemetry,
+    pub(in crate::runtime) peer_status: PeerStatusBroker,
     pub(in crate::runtime) codec_limits: CodecLimits,
     pub(in crate::runtime) mux_limits: MuxLimits,
     #[cfg(test)]
@@ -52,6 +63,15 @@ pub struct ClientPathContext {
 }
 
 impl ClientPathContext {
+    #[cfg(test)]
+    pub(in crate::runtime) fn peer_path_usage(
+        &self,
+        underlay: UnderlayProtocol,
+        index: usize,
+    ) -> Option<crate::protocol::PathUsage> {
+        self.state.peer_path_usage(underlay, index)
+    }
+
     #[cfg(test)]
     pub fn new(
         paths: Vec<PathSpec>,
@@ -98,6 +118,7 @@ impl ClientPathContext {
         Ok(context)
     }
 
+    #[cfg(test)]
     pub fn new_with_carrier_network(
         paths: Vec<ClientPathConfig>,
         resources: ResourceLimits,
@@ -105,6 +126,26 @@ impl ClientPathContext {
         ingresses: Vec<LocalIngressConfig>,
         path_group_ordinal: usize,
         carrier_network: Arc<dyn CarrierNetworkProvider>,
+    ) -> Result<Self, RuntimeError> {
+        Self::new_with_carrier_network_and_peer_diagnostics(
+            paths,
+            resources,
+            route_target,
+            ingresses,
+            path_group_ordinal,
+            carrier_network,
+            false,
+        )
+    }
+
+    pub(in crate::runtime) fn new_with_carrier_network_and_peer_diagnostics(
+        paths: Vec<ClientPathConfig>,
+        resources: ResourceLimits,
+        route_target: Option<RouteTarget>,
+        ingresses: Vec<LocalIngressConfig>,
+        path_group_ordinal: usize,
+        carrier_network: Arc<dyn CarrierNetworkProvider>,
+        allow_peer_diagnostics: bool,
     ) -> Result<Self, RuntimeError> {
         if paths.len() > u16::MAX as usize {
             return Err(RuntimeError::PathIdOverflow);
@@ -152,6 +193,14 @@ impl ClientPathContext {
         let codec_limits = resources.into();
         let mux_limits = resources.into();
         let session_id = random_session_id()?;
+        let telemetry = RuntimeTelemetry::new(active_flow_detail_capacity(resources.max_streams));
+        let peer_status = PeerStatusBroker::new(allow_peer_diagnostics);
+        let peer_status_snapshot = PeerStatusSnapshotSource::new({
+            let tcp_paths = tcp_paths.clone();
+            let udp_paths = udp_paths.clone();
+            let state = state.clone();
+            move || client_peer_status_snapshot(&tcp_paths, &udp_paths, &state)
+        });
         let tcp_sessions = (0..tcp_paths.len())
             .map(|path_index| {
                 ClientTcpPathSessionHandle::new(ClientTcpPathSessionRuntime {
@@ -173,6 +222,8 @@ impl ClientPathContext {
                     ),
                     state: state.clone(),
                     carrier_network: carrier_network.clone(),
+                    peer_status: peer_status.clone(),
+                    peer_status_snapshot: peer_status_snapshot.clone(),
                 })
             })
             .collect::<Vec<_>>();
@@ -193,6 +244,8 @@ impl ClientPathContext {
                     stream_frame_queue: reliable_stream_frame_queue(mux_limits),
                     state: state.clone(),
                     carrier_network: carrier_network.clone(),
+                    peer_status: peer_status.clone(),
+                    peer_status_snapshot: peer_status_snapshot.clone(),
                 })
             })
             .collect::<Vec<_>>();
@@ -209,6 +262,9 @@ impl ClientPathContext {
             udp_sessions: Arc::new(udp_sessions),
             carrier_network,
             state,
+            session_id,
+            telemetry,
+            peer_status,
             codec_limits,
             mux_limits,
             #[cfg(test)]
@@ -223,6 +279,10 @@ impl ClientPathContext {
         self.tcp_security
             .get(path_index)
             .ok_or(RuntimeError::NoSchedulableTcpPath)
+    }
+
+    pub(in crate::runtime) fn telemetry_snapshot(&self) -> RuntimeTelemetrySnapshot {
+        self.telemetry.snapshot()
     }
 
     pub(in crate::runtime) fn relay_path_config_ordinal(&self, key: RelayPathKey) -> usize {
@@ -252,5 +312,60 @@ impl ClientPathContext {
             .cmp(&self.relay_path_config_ordinal(right))
             .then_with(|| left.index.cmp(&right.index))
             .then_with(|| left.underlay.cmp(&right.underlay))
+    }
+}
+
+fn client_peer_status_snapshot(
+    tcp_paths: &[PathSpec],
+    udp_paths: &[PathSpec],
+    state: &ClientPathState,
+) -> Vec<PeerPathStatus> {
+    let now = Instant::now();
+    let health = state.health().lock().expect("client path health lock");
+    let mut paths = Vec::with_capacity(tcp_paths.len() + udp_paths.len());
+    paths.extend(
+        tcp_paths
+            .iter()
+            .zip(&health.tcp)
+            .enumerate()
+            .map(|(index, (path, record))| {
+                peer_path_status(path, index, record.observation_at(now))
+            }),
+    );
+    paths.extend(
+        udp_paths
+            .iter()
+            .zip(&health.udp)
+            .enumerate()
+            .map(|(index, (path, record))| {
+                peer_path_status(path, index, record.observation_at(now))
+            }),
+    );
+    paths
+}
+
+fn peer_path_status(
+    path: &PathSpec,
+    index: usize,
+    observation: ClientPathObservation,
+) -> PeerPathStatus {
+    let snapshot = path_snapshot(path, index, observation);
+    PeerPathStatus {
+        state: match snapshot.state {
+            crate::scheduler::PathState::Active => PeerPathState::Active,
+            crate::scheduler::PathState::Suspect => PeerPathState::Suspect,
+            crate::scheduler::PathState::Draining => PeerPathState::Draining,
+            crate::scheduler::PathState::Failed => PeerPathState::Failed,
+        },
+        usage: if path.metadata.policy.backup {
+            PathUsage::Backup
+        } else {
+            PathUsage::Available
+        },
+        metrics: path_metrics_from_snapshot(
+            snapshot,
+            observation,
+            PathMetricDirection::ClientToServer,
+        ),
     }
 }

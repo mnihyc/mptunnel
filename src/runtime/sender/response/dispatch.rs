@@ -3,46 +3,36 @@
 //! This module never ranks paths. It resolves a planned identity, asks the
 //! binding to revalidate and commit, and enqueues one carrier command.
 
-use super::multipath::{
-    ResponseDataDispatchIntent, ResponseDataDispatchPlan, ResponseDataDispatchTarget,
-};
-use super::planner::choose_response_sender_target;
-#[cfg(test)]
-use super::*;
+use super::multipath::ResponseDataDispatchTarget;
+use super::scheduling::select_response_frame_path;
 use crate::model::path::CarrierPathKey;
 use crate::protocol::Frame;
 use crate::protocol::frame::reliable_stream_frame_accounted_bytes;
 use crate::runtime::RuntimeError;
 use crate::runtime::path::commands::reliable_path_stream_ordered_queue_lane;
 use crate::runtime::sender::{CarrierEmitMode, RelaySendCause};
-use crate::runtime::stream::response::{
-    ResponseDispatchTarget, ResponseOwnerEnqueueAdmission, record_server_sender_decision,
-};
+use crate::runtime::stream::response::{ResponseDispatchTarget, record_server_sender_decision};
 use crate::runtime::stream::{ReliablePathStream, ReliablePathStreamOutput};
-use crate::scheduler::FlowLane;
+use crate::scheduler::TrafficClass;
 
-pub(super) struct ResponseDataEmitOutcome {
-    pub(super) selected_path: Option<CarrierPathKey>,
-}
-
-pub(super) fn response_repair_carrier_lane(frame: &Frame) -> FlowLane {
+pub(super) fn response_reinjection_carrier_lane(frame: &Frame) -> TrafficClass {
     if matches!(frame, Frame::StreamData { .. }) {
         reliable_path_stream_ordered_queue_lane()
     } else {
-        FlowLane::Control
+        TrafficClass::Control
     }
 }
 
 pub(super) fn response_frame_has_carrier_credit(
     stream: &ReliablePathStream,
     frame: &Frame,
-    lane: FlowLane,
+    lane: TrafficClass,
     emit_mode: CarrierEmitMode,
-    repair_cause: Option<RelaySendCause>,
+    reinjection_cause: Option<RelaySendCause>,
 ) -> bool {
-    let repair = repair_cause.is_some();
-    let lane = if repair {
-        response_repair_carrier_lane(frame)
+    let reinjection = reinjection_cause.is_some();
+    let lane = if reinjection {
+        response_reinjection_carrier_lane(frame)
     } else {
         lane
     };
@@ -55,28 +45,21 @@ pub(super) fn response_frame_has_carrier_credit(
         },
         ReliablePathStreamOutput::Switchable(binding) => {
             let payload_bytes = reliable_stream_frame_accounted_bytes(frame);
-            let lower_flights = if matches!(frame, Frame::StreamData { .. }) && !repair {
-                binding.lower_flights_before_frame(frame)
-            } else {
-                Vec::new()
-            };
-            let avoid_keys = match repair_cause {
-                Some(RelaySendCause::LiveOwnerTailRepair) => {
-                    binding.owner_flight_keys_overlapping_frame(frame)
+            let avoid_keys = match reinjection_cause {
+                Some(RelaySendCause::TailReinjection) => {
+                    binding.original_flight_keys_overlapping_frame(frame)
                 }
                 Some(_) => binding.flight_keys_overlapping_frame(frame),
                 None => Vec::new(),
             };
             let targets = binding.sender_path_targets(lane, payload_bytes);
-            choose_response_sender_target(
+            select_response_frame_path(
                 &targets,
                 lane,
                 frame,
                 emit_mode,
-                binding.mux_limits(),
-                &lower_flights,
                 &avoid_keys,
-                repair_cause,
+                reinjection_cause,
             )
             .is_some()
         }
@@ -85,12 +68,11 @@ pub(super) fn response_frame_has_carrier_credit(
 
 pub(super) fn emit_planned_response_data_frame(
     stream: &ReliablePathStream,
-    planned: ResponseDataDispatchPlan,
+    target: ResponseDataDispatchTarget,
     frame: Frame,
-    lane: FlowLane,
-) -> Result<ResponseDataEmitOutcome, RuntimeError> {
-    let ResponseDataDispatchPlan { primary } = planned;
-    match primary {
+    lane: TrafficClass,
+) -> Result<Option<CarrierPathKey>, RuntimeError> {
+    match target {
         ResponseDataDispatchTarget::Fixed { key } => {
             let ReliablePathStreamOutput::Fixed(fixed) = &stream.output else {
                 return Err(RuntimeError::SenderServiceBlocked);
@@ -98,59 +80,26 @@ pub(super) fn emit_planned_response_data_frame(
             if fixed.key() != key {
                 return Err(RuntimeError::SenderServiceBlocked);
             }
-            CarrierEmitMode::StreamOrdered.try_enqueue_frame(
-                fixed.commands(),
-                frame.clone(),
-                lane,
-            )?;
-            fixed.record_owner_flight(&frame);
-            Ok(ResponseDataEmitOutcome {
-                selected_path: Some(fixed.key()),
-            })
+            let command = fixed
+                .commands()
+                .try_reserve_stream_ordered_frame(frame.clone(), lane)?;
+            fixed.record_original_flight(&frame);
+            command.commit();
+            Ok(Some(fixed.key()))
         }
-        ResponseDataDispatchTarget::Switchable { target, intent } => {
+        ResponseDataDispatchTarget::Switchable {
+            target,
+            expected_model_generation,
+        } => {
             let ReliablePathStreamOutput::Switchable(binding) = &stream.output else {
                 return Err(RuntimeError::SenderServiceBlocked);
             };
-            let decision_reason = match &intent {
-                ResponseDataDispatchIntent::Service => "data_service",
-                ResponseDataDispatchIntent::SubflowAdmission(_) => "data_subflow",
-                ResponseDataDispatchIntent::AckClockCalibration(_) => {
-                    "data_subflow_ack_clock_calibration"
-                }
-                ResponseDataDispatchIntent::ServiceHandoff(_) => "data_service_handoff",
-            };
-            let enqueue_result = match intent {
-                ResponseDataDispatchIntent::Service => binding
-                    .try_enqueue_owner_frame_for_dispatch_target(
-                        &target,
-                        &frame,
-                        lane,
-                        ResponseOwnerEnqueueAdmission::Service,
-                    ),
-                ResponseDataDispatchIntent::SubflowAdmission(request) => binding
-                    .try_enqueue_owner_frame_for_dispatch_target(
-                        &target,
-                        &frame,
-                        lane,
-                        ResponseOwnerEnqueueAdmission::SubflowAdmission(request),
-                    ),
-                ResponseDataDispatchIntent::AckClockCalibration(request) => binding
-                    .try_enqueue_owner_frame_for_dispatch_target(
-                        &target,
-                        &frame,
-                        lane,
-                        ResponseOwnerEnqueueAdmission::AckClockCalibration(request),
-                    ),
-                ResponseDataDispatchIntent::ServiceHandoff(handoff) => binding
-                    .try_enqueue_response_service_handoff_for_dispatch(
-                        &target,
-                        &frame,
-                        lane,
-                        handoff.into_request(&target),
-                    )
-                    .map(|()| None),
-            };
+            let enqueue_result = binding.try_enqueue_data_frame_for_dispatch_target(
+                &target,
+                &frame,
+                lane,
+                expected_model_generation,
+            );
             match enqueue_result {
                 Ok(_) => {}
                 Err(RuntimeError::SenderServiceBlocked) => {
@@ -167,12 +116,10 @@ pub(super) fn emit_planned_response_data_frame(
                 target.key,
                 &frame,
                 lane,
-                decision_reason,
+                "data_completion_time",
                 Some(target.has_bulk_rate_evidence),
             );
-            Ok(ResponseDataEmitOutcome {
-                selected_path: Some(target.key),
-            })
+            Ok(Some(target.key))
         }
     }
 }
@@ -180,44 +127,49 @@ pub(super) fn emit_planned_response_data_frame(
 pub(super) fn emit_response_frame_from_sender_service(
     stream: &ReliablePathStream,
     frame: Frame,
-    lane: FlowLane,
+    lane: TrafficClass,
     emit_mode: CarrierEmitMode,
     reason: &'static str,
-    repair_cause: Option<RelaySendCause>,
+    reinjection_cause: Option<RelaySendCause>,
 ) -> Result<Option<CarrierPathKey>, RuntimeError> {
-    let repair = repair_cause.is_some();
-    let lane = if repair {
-        response_repair_carrier_lane(&frame)
+    let reinjection = reinjection_cause.is_some();
+    if matches!(frame, Frame::StreamData { .. }) && !reinjection {
+        return Err(RuntimeError::Protocol(
+            "new response data requires a generation-fenced dispatch plan",
+        ));
+    }
+    let lane = if reinjection {
+        response_reinjection_carrier_lane(&frame)
     } else {
         lane
     };
-    let emit_mode = if matches!(frame, Frame::StreamData { .. }) && !repair {
+    let emit_mode = if matches!(frame, Frame::StreamData { .. }) && !reinjection {
         CarrierEmitMode::StreamOrdered
     } else {
         emit_mode
     };
     match &stream.output {
         ReliablePathStreamOutput::Fixed(fixed) => {
-            emit_mode.try_enqueue_frame(fixed.commands(), frame.clone(), lane)?;
             if matches!(frame, Frame::StreamData { .. }) {
-                if repair {
-                    fixed.record_repair_flight(&frame);
+                let command = fixed
+                    .commands()
+                    .try_reserve_stream_ordered_frame(frame.clone(), lane)?;
+                if reinjection {
+                    fixed.record_reinjected_flight(&frame);
                 } else {
-                    fixed.record_owner_flight(&frame);
+                    fixed.record_original_flight(&frame);
                 }
+                command.commit();
+            } else {
+                emit_mode.try_enqueue_frame(fixed.commands(), frame, lane)?;
             }
             Ok(Some(fixed.key()))
         }
         ReliablePathStreamOutput::Switchable(binding) => {
             let payload_bytes = reliable_stream_frame_accounted_bytes(&frame);
-            let lower_flights = if matches!(frame, Frame::StreamData { .. }) && !repair {
-                binding.lower_flights_before_frame(&frame)
-            } else {
-                Vec::new()
-            };
-            let avoid_keys = match repair_cause {
-                Some(RelaySendCause::LiveOwnerTailRepair) => {
-                    binding.owner_flight_keys_overlapping_frame(&frame)
+            let avoid_keys = match reinjection_cause {
+                Some(RelaySendCause::TailReinjection) => {
+                    binding.original_flight_keys_overlapping_frame(&frame)
                 }
                 Some(_) => binding.flight_keys_overlapping_frame(&frame),
                 None => Vec::new(),
@@ -229,32 +181,19 @@ pub(super) fn emit_response_frame_from_sender_service(
                     let _ = last_error;
                     return Err(RuntimeError::SenderServiceBlocked);
                 }
-                let Some(target) = choose_response_sender_target(
+                let Some(target) = select_response_frame_path(
                     &targets,
                     lane,
                     &frame,
                     emit_mode,
-                    binding.mux_limits(),
-                    &lower_flights,
                     &avoid_keys,
-                    repair_cause,
+                    reinjection_cause,
                 ) else {
                     return Err(RuntimeError::SenderServiceBlocked);
                 };
                 let dispatch_target = ResponseDispatchTarget::from(&target);
                 let send_result = if matches!(frame, Frame::StreamData { .. }) {
-                    if repair {
-                        binding
-                            .try_enqueue_repair_frame_for_target(&dispatch_target, &frame, lane)
-                            .map(|()| None)
-                    } else {
-                        binding.try_enqueue_owner_frame_for_dispatch_target(
-                            &dispatch_target,
-                            &frame,
-                            lane,
-                            ResponseOwnerEnqueueAdmission::Service,
-                        )
-                    }
+                    binding.try_enqueue_reinjected_frame_for_target(&dispatch_target, &frame, lane)
                 } else {
                     match emit_mode {
                         CarrierEmitMode::Classified => binding
@@ -270,10 +209,9 @@ pub(super) fn emit_response_frame_from_sender_service(
                                 lane,
                             ),
                     }
-                    .map(|()| None)
                 };
                 match send_result {
-                    Ok(_) => {
+                    Ok(()) => {
                         record_server_sender_decision(
                             binding.session_id(),
                             stream.stream_id,
@@ -312,7 +250,7 @@ pub(in crate::runtime) fn emit_response_control_frame(
     emit_response_frame_from_sender_service(
         stream,
         frame,
-        FlowLane::Control,
+        TrafficClass::Control,
         CarrierEmitMode::Classified,
         "control",
         None,

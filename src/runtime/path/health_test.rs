@@ -53,10 +53,12 @@ fn tcp_transport_state_updates_native_rtt_without_rate_authority() {
 
 #[test]
 fn partial_tcp_transport_state_does_not_clear_unknown_fields() {
-    let mut record = ClientPathHealthRecord::default();
-    record.carrier_bytes_in_flight = 64 * 1024;
-    record.carrier_inflight_limit_bytes = 512 * 1024;
-    record.carrier_queue_bytes = 8 * 1024;
+    let mut record = ClientPathHealthRecord {
+        carrier_bytes_in_flight: 64 * 1024,
+        carrier_inflight_limit_bytes: 512 * 1024,
+        carrier_queue_bytes: 8 * 1024,
+        ..ClientPathHealthRecord::default()
+    };
     let snapshot = TcpNativeSnapshot {
         rtt: Some(TcpNativeRtt {
             srtt_us: 30_000,
@@ -96,4 +98,32 @@ fn observation_projects_deadlines_without_applying_lifecycle_transitions() {
     record.maintain(deadline);
     assert_eq!(record.state, SchedulerPathState::Suspect);
     assert_eq!(record.failed_until, None);
+}
+
+#[test]
+fn data_plane_failure_is_published_once_until_liveness_recovers() {
+    let mut record = ClientPathHealthRecord::default();
+    let now = Instant::now();
+    let original = crate::model::path::next_carrier_path_instance_id();
+    record.install_peer_usage(original, 0, PathUsage::Available);
+
+    assert!(record.mark_data_plane_failure(original, now, true));
+    assert!(!record.mark_data_plane_failure(original, now, true));
+
+    // A separate reachability probe may recover logical health, but it must not
+    // make the retired carrier's delayed cleanup count a second time.
+    record.mark_liveness_success();
+    assert!(!record.mark_data_plane_failure(original, now, true));
+
+    assert_eq!(record.state, SchedulerPathState::Active);
+    assert_eq!(record.consecutive_failures, 0);
+
+    let replacement = crate::model::path::next_carrier_path_instance_id();
+    record.install_peer_usage(replacement, 0, PathUsage::Available);
+    assert!(!record.mark_data_plane_failure(original, now, false));
+    assert_eq!(record.state, SchedulerPathState::Active);
+    assert!(record.mark_data_plane_failure(replacement, now, false));
+
+    assert_eq!(record.state, SchedulerPathState::Suspect);
+    assert_eq!(record.consecutive_failures, 1);
 }

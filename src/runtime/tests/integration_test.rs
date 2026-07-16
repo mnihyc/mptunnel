@@ -1,8 +1,49 @@
 use super::*;
 use crate::config::{DEFAULT_OUTBOUND_CONNECT_TIMEOUT, ResourceLimits};
 use crate::outbound::{DnsConfig, OutboundConfig};
+use crate::protocol::PathUsage;
+use crate::runtime::path::ServerLocalPath;
 
 const FULL_STACK_RESPONSE_TIMEOUT: Duration = Duration::from_secs(15);
+
+#[tokio::test(flavor = "multi_thread")]
+async fn mixed_server_listeners_apply_local_policy_independent_of_wire_path_id() {
+    let tcp_path = reserve_tcp_path_with_query("srtt-ms=20&rate-mbps=100").await;
+    let udp_port = reserve_process_unique_udp_port().await;
+    let udp_path = format!("udp://127.0.0.1:{udp_port}?srtt-ms=90&rate-mbps=400&backup=true")
+        .parse::<PathSpec>()
+        .expect("UDP backup path");
+    let server = tokio::spawn(run_server(
+        vec![tcp_path.clone(), udp_path.clone()],
+        OutboundConfig::Direct,
+        DnsConfig::default(),
+        DEFAULT_OUTBOUND_CONNECT_TIMEOUT,
+        security(),
+        MppPerformanceConfig::default(),
+        ResourceLimits::default(),
+        ManagementConfig::default(),
+    ));
+    tokio::time::sleep(Duration::from_millis(20)).await;
+
+    // Reversed client order is intentional. Each underlay emits PathId(0),
+    // while the server UDP listener is configuration ordinal 1.
+    let context = ClientPathContext::new(
+        vec![udp_path, tcp_path],
+        security(),
+        ResourceLimits::default(),
+    )
+    .expect("mixed client context");
+    probe_client_paths(&context, Duration::from_secs(2)).await;
+
+    assert_eq!(
+        context.peer_path_usage(UnderlayProtocol::Udp, 0),
+        Some(PathUsage::Backup),
+        "peer PathId(0) must not select the server's TCP listener policy",
+    );
+
+    server.abort();
+    let _ = server.await;
+}
 
 #[tokio::test]
 async fn path_probe_refreshes_tcp_health_without_stream_load() {
@@ -42,7 +83,7 @@ async fn path_probe_skips_tcp_path_with_active_stream() {
     let path = reserve_tcp_path().await;
     let context =
         ClientPathContext::new(vec![path], security(), ResourceLimits::default()).expect("ctx");
-    context.mark_tcp_path_open_success(0, Duration::from_millis(5), FlowLane::Throughput);
+    context.mark_tcp_path_open_success(0, Duration::from_millis(5), TrafficClass::Throughput);
 
     probe_client_paths(&context, Duration::from_millis(20)).await;
 
@@ -85,7 +126,7 @@ async fn repeated_path_probe_failure_keeps_only_tcp_path_probeable() {
     }
     assert_eq!(
         context
-            .ordered_tcp_path_indices(FlowLane::Latency, 512)
+            .ordered_tcp_path_indices(TrafficClass::Latency, 512)
             .first()
             .copied(),
         Some(0)
@@ -101,7 +142,7 @@ async fn repeated_path_probe_failure_keeps_only_tcp_path_probeable() {
     }
     assert_eq!(
         context
-            .ordered_tcp_path_indices(FlowLane::Latency, 512)
+            .ordered_tcp_path_indices(TrafficClass::Latency, 512)
             .first()
             .copied(),
         Some(0)
@@ -114,6 +155,7 @@ async fn socks5_ingress_relays_tcp_payload_over_encrypted_internal_stream() {
     let (path, server_path) = spawn_server_path(OutboundConfig::Direct).await;
     let context =
         ClientPathContext::new(vec![path], security(), ResourceLimits::default()).expect("ctx");
+    let telemetry_context = context.clone();
     let (mut client, server) = duplex(4096);
     let handler = tokio::spawn(handle_socks5_client_stream(server, context));
 
@@ -152,6 +194,20 @@ async fn socks5_ingress_relays_tcp_payload_over_encrypted_internal_stream() {
     assert_eq!(&payload, b"pong");
 
     handler.await.expect("join").expect("handler");
+    let telemetry = telemetry_context.telemetry_snapshot();
+    assert_eq!(telemetry.reliable.io.to_peer_bytes, 4);
+    assert_eq!(telemetry.reliable.io.from_peer_bytes, 4);
+    assert_eq!(telemetry.reliable.flows.opened, 1);
+    assert_eq!(telemetry.reliable.flows.active, 0);
+    assert_eq!(telemetry.reliable.flows.completed, 1);
+    assert_eq!(telemetry.reliable.flows.failed, 0);
+    assert_eq!(
+        telemetry.active_flow_capacity,
+        crate::runtime::telemetry::active_flow_detail_capacity(
+            ResourceLimits::default().max_streams,
+        )
+    );
+    drop(telemetry_context);
     server_path
         .await
         .expect("server join")
@@ -373,6 +429,8 @@ async fn auto_bulk_tcp_stream_attaches_measured_path_for_large_response() {
     let high_bandwidth_listener = bind_listener(&high_bandwidth_path)
         .await
         .expect("high-bandwidth bind");
+    let low_latency_local_path = ServerLocalPath::new(0, low_latency_path.clone());
+    let high_bandwidth_local_path = ServerLocalPath::new(1, high_bandwidth_path.clone());
     let ServerIdentityRuntime {
         paths: server_context,
         reliable_relay,
@@ -399,7 +457,10 @@ async fn auto_bulk_tcp_stream_attaches_measured_path_for_large_response() {
                     let (stream, _) = accepted.expect("low-latency accept");
                     let _ = low_latency_accepted_tx.try_send(0usize);
                     let session_context = low_latency_context.clone();
-                    sessions.spawn(async move { handle_server_path(stream, session_context).await });
+                    let local_path = low_latency_local_path.clone();
+                    sessions.spawn(async move {
+                        handle_server_path(stream, local_path, session_context).await
+                    });
                 }
             }
         }
@@ -426,7 +487,10 @@ async fn auto_bulk_tcp_stream_attaches_measured_path_for_large_response() {
                     let (stream, _) = accepted.expect("high-bandwidth accept");
                     let _ = accepted_tx.try_send(1usize);
                     let session_context = high_bandwidth_context.clone();
-                    sessions.spawn(async move { handle_server_path(stream, session_context).await });
+                    let local_path = high_bandwidth_local_path.clone();
+                    sessions.spawn(async move {
+                        handle_server_path(stream, local_path, session_context).await
+                    });
                 }
             }
         }
@@ -562,6 +626,8 @@ async fn tcp_stream_migrates_to_survivor_path_after_active_path_failure() {
     let second_path = reserve_tcp_path().await;
     let first_listener = bind_listener(&first_path).await.expect("first bind");
     let second_listener = bind_listener(&second_path).await.expect("second bind");
+    let first_local_path = ServerLocalPath::new(0, first_path.clone());
+    let second_local_path = ServerLocalPath::new(1, second_path.clone());
     let ServerIdentityRuntime {
         paths: server_context,
         reliable_relay,
@@ -570,12 +636,12 @@ async fn tcp_stream_migrates_to_survivor_path_after_active_path_failure() {
     let first_server_context = server_context.clone();
     let first_server = tokio::spawn(async move {
         let (stream, _) = first_listener.accept().await.expect("first accept");
-        handle_server_path(stream, first_server_context).await
+        handle_server_path(stream, first_local_path, first_server_context).await
     });
     let second_server_context = server_context.clone();
     let second_server = tokio::spawn(async move {
         let (stream, _) = second_listener.accept().await.expect("second accept");
-        handle_server_path(stream, second_server_context).await
+        handle_server_path(stream, second_local_path, second_server_context).await
     });
 
     let resources = ResourceLimits {
@@ -653,7 +719,7 @@ async fn tcp_stream_migrates_to_survivor_path_after_active_path_failure() {
 }
 
 #[tokio::test]
-async fn reliable_relay_active_stream_heartbeat_timeout_does_not_abort_stream() {
+async fn reliable_relay_active_stream_heartbeat_timeout_aborts_stale_carrier() {
     let (path, server_path) =
         spawn_reliable_relay_heartbeat_blackhole(Duration::from_millis(500)).await;
     let resources = ResourceLimits {
@@ -662,6 +728,7 @@ async fn reliable_relay_active_stream_heartbeat_timeout_does_not_abort_stream() 
         ..ResourceLimits::default()
     };
     let context = ClientPathContext::new(vec![path], security(), resources).expect("ctx");
+    let health_context = context.clone();
     let (mut client, server) = duplex(4096);
     let mut handler = tokio::spawn(handle_socks5_client_stream(server, context));
 
@@ -686,9 +753,16 @@ async fn reliable_relay_active_stream_heartbeat_timeout_does_not_abort_stream() 
 
     tokio::select! {
         result = &mut handler => {
-            panic!("active stream should not be aborted by heartbeat timeout: {result:?}");
+            panic!("carrier failure must not terminate the recoverable product stream: {result:?}");
         }
         _ = tokio::time::sleep(Duration::from_millis(150)) => {}
+    }
+    {
+        let health = health_context.health().lock().expect("health lock");
+        assert!(matches!(
+            health.tcp[0].state,
+            SchedulerPathState::Suspect | SchedulerPathState::Failed
+        ));
     }
 
     handler.abort();
@@ -700,26 +774,24 @@ async fn reliable_relay_active_stream_heartbeat_timeout_does_not_abort_stream() 
 }
 
 #[test]
-fn tcp_path_activity_extends_pending_heartbeat_deadline() {
+fn tcp_path_activity_does_not_extend_pending_heartbeat_deadline() {
     let before = tokio::time::Instant::now();
     let mut next_heartbeat_at = before;
     let old_deadline = before + Duration::from_millis(1);
-    let mut pending = Some((42, old_deadline));
+    let pending = Some((42, old_deadline));
 
     refresh_client_tcp_path_liveness_state(
         &mut next_heartbeat_at,
         Duration::from_secs(10),
-        &mut pending,
-        Duration::from_secs(30),
+        pending.is_some(),
     );
 
-    assert!(next_heartbeat_at >= before + Duration::from_secs(10));
+    assert_eq!(next_heartbeat_at, before);
     let Some((nonce, deadline)) = pending else {
         panic!("heartbeat should remain pending");
     };
     assert_eq!(nonce, 42);
-    assert!(deadline >= before + Duration::from_secs(30));
-    assert!(deadline > old_deadline);
+    assert_eq!(deadline, old_deadline);
 }
 
 #[tokio::test]
@@ -1136,13 +1208,26 @@ async fn spawn_scripted_tcp_datagram_path(
             Frame::PathJoin { path_id, .. } => path_id,
             _ => return Err(RuntimeError::Protocol("expected PATH_JOIN")),
         };
+        match framed.read_frame().await? {
+            Frame::PathStatus {
+                path_id: status_path_id,
+                sequence: 0,
+                ..
+            } if status_path_id == path_id => {}
+            _ => {
+                return Err(RuntimeError::Protocol(
+                    "invalid initial TCP path usage advertisement",
+                ));
+            }
+        }
         tokio::time::sleep(ready_delay).await;
         framed
             .write_frames(&[
                 Frame::SessionReady,
                 Frame::PathStatus {
                     path_id,
-                    status: crate::protocol::PathStatus::Active,
+                    sequence: 0,
+                    usage: crate::protocol::PathUsage::Available,
                 },
             ])
             .await?;
@@ -1496,6 +1581,7 @@ async fn configured_udp_payload_limit_falls_through_to_tcp_without_emission() {
         ResourceLimits::default(),
     )
     .expect("context");
+    let telemetry_context = context.clone();
     let mut association = DatagramClientAssociation::new(context)
         .await
         .expect("association");
@@ -1513,7 +1599,19 @@ async fn configured_udp_payload_limit_falls_through_to_tcp_without_emission() {
         .await
         .expect("TCP fallback response");
     assert_eq!(response, Bytes::from_static(b"pong"));
+    let telemetry = telemetry_context.telemetry_snapshot();
+    assert_eq!(telemetry.datagram.io.to_peer_bytes, 1_400);
+    assert_eq!(telemetry.datagram.io.to_peer_packets, 1);
+    assert_eq!(telemetry.datagram.io.from_peer_bytes, 4);
+    assert_eq!(telemetry.datagram.io.from_peer_packets, 1);
+    assert_eq!(telemetry.datagram.flows.opened, 1);
+    assert_eq!(telemetry.datagram.flows.active, 1);
     association.close().await.expect("association close");
+    let telemetry = telemetry_context.telemetry_snapshot();
+    assert_eq!(telemetry.datagram.flows.active, 0);
+    assert_eq!(telemetry.datagram.flows.completed, 1);
+    assert_eq!(telemetry.datagram.flows.failed, 0);
+    drop(telemetry_context);
     tcp_server
         .await
         .expect("TCP server join")
@@ -1706,6 +1804,7 @@ async fn server_verifies_auth_sequence_and_rejects_wrong_secret() {
     let server_path = path.clone();
     let server = tokio::spawn(async move {
         let (stream, _) = listener.accept().await.expect("accept");
+        let local_path = ServerLocalPath::new(0, server_path.clone());
         let ServerIdentityRuntime {
             paths,
             reliable_relay: _reliable_relay,
@@ -1720,7 +1819,7 @@ async fn server_verifies_auth_sequence_and_rejects_wrong_secret() {
             MppPerformanceConfig::default(),
             ResourceLimits::default(),
         );
-        handle_server_path(stream, paths).await
+        handle_server_path(stream, local_path, paths).await
     });
 
     let stream = tcp::connect_path(&path, TcpConnectOptions::default())

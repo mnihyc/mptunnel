@@ -154,6 +154,13 @@ impl Connection {
         self.connection.close_reason().is_some()
     }
 
+    pub fn is_locally_closed(&self) -> bool {
+        matches!(
+            self.connection.close_reason(),
+            Some(quinn::ConnectionError::LocallyClosed)
+        )
+    }
+
     pub fn measurement_active(&self) -> bool {
         self.telemetry.measurement_active()
     }

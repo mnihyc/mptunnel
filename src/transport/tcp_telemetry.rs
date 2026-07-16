@@ -75,8 +75,8 @@ impl TcpTelemetrySocket {
     pub(crate) fn capture(socket: &TcpStream) -> io::Result<Option<Self>> {
         #[cfg(target_os = "linux")]
         {
-            return linux::PlatformTcpTelemetrySocket::capture(socket)
-                .map(|platform| Some(Self { platform }));
+            linux::PlatformTcpTelemetrySocket::capture(socket)
+                .map(|platform| Some(Self { platform }))
         }
         #[cfg(not(target_os = "linux"))]
         {
@@ -89,7 +89,7 @@ impl TcpTelemetrySocket {
     pub(crate) fn snapshot(&self) -> io::Result<Option<TcpNativeSnapshot>> {
         #[cfg(target_os = "linux")]
         {
-            return self.platform.snapshot();
+            self.platform.snapshot()
         }
         #[cfg(not(target_os = "linux"))]
         {

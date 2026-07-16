@@ -350,7 +350,7 @@ fn quic_confidence_boundary_discards_inflated_preconfidence_sample() {
     assert!(
         confident.delivery_rate_bps >= expected_rate * 0.95
             && confident.delivery_rate_bps <= expected_rate,
-        "confidence graduation must use the establishing sample, not retain a faster preconfidence outlier: expected~{expected_rate} actual={}",
+        "confidence capacity_admission must use the establishing sample, not retain a faster preconfidence outlier: expected~{expected_rate} actual={}",
         confident.delivery_rate_bps,
     );
 }

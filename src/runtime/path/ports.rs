@@ -2,50 +2,22 @@
 //!
 //! Carriers publish accepted transport state here without constructing stream
 //! policy objects. The stream layer consumes these values and owns offsets,
-//! repair, and attachment behavior.
+//! reinjection, and attachment behavior.
 
 use super::commands::ReliablePathCommandSender;
-use super::tcp::capacity::TcpCapacityProofCandidate;
-use crate::model::capacity::QuicCapacityProofCandidate;
-use crate::model::path::{CarrierPathInstanceId, next_carrier_path_instance_id};
+use crate::model::path::{CarrierPathInstanceId, PathPolicy, next_carrier_path_instance_id};
 use crate::mux::MuxLimits;
 use crate::protocol::{
-    Frame, PathId, PathMetrics, SessionId, StreamId, StreamOpenRole, TargetAddr, UnderlayProtocol,
+    Frame, PathId, PathMetrics, PathUsage, PeerPathState, PeerPathStatus, SessionId, StreamId,
+    TargetAddr, UnderlayProtocol,
 };
 use crate::runtime::error::RuntimeError;
-use crate::scheduler::{FlowLane, PathSnapshot};
+use crate::scheduler::{PathSnapshot, TrafficClass};
 use bytes::Bytes;
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
 use tokio::sync::mpsc;
-
-/// Keeps a higher-layer reservation alive for exactly one queued carrier command.
-///
-/// The carrier only owns the lifetime contract; the reservation's policy and
-/// release behavior remain in the layer that created the guard.
-pub(in crate::runtime) struct CarrierCommandLease {
-    _guard: Box<dyn Send + Sync>,
-}
-
-impl CarrierCommandLease {
-    pub(in crate::runtime) fn hold<T>(guard: T) -> Self
-    where
-        T: Send + Sync + 'static,
-    {
-        Self {
-            _guard: Box::new(guard),
-        }
-    }
-}
-
-impl std::fmt::Debug for CarrierCommandLease {
-    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        formatter
-            .debug_struct("CarrierCommandLease")
-            .finish_non_exhaustive()
-    }
-}
 
 /// Keeps response-lane accounting attached to one target-side datagram flow.
 pub(in crate::runtime) struct ServerRealtimeFlowLease {
@@ -212,18 +184,31 @@ impl std::fmt::Debug for ServerDatagramPort {
 }
 
 #[derive(Debug, Clone, Copy)]
-pub(in crate::runtime) struct ServerCarrierPathMetricSnapshot {
+pub(in crate::runtime) struct ServerCarrierPathStatusSnapshot {
     pub(in crate::runtime) session_id: SessionId,
     pub(in crate::runtime) underlay: UnderlayProtocol,
     pub(in crate::runtime) path_id: PathId,
-    pub(in crate::runtime) metrics: PathMetrics,
-    pub(in crate::runtime) source: &'static str,
+    pub(in crate::runtime) path_instance_id: CarrierPathInstanceId,
+    pub(in crate::runtime) configured_index: usize,
+    pub(in crate::runtime) policy: PathPolicy,
+    pub(in crate::runtime) state: PeerPathState,
+    pub(in crate::runtime) usage: Option<PathUsage>,
+    pub(in crate::runtime) metrics: Option<PathMetrics>,
+    pub(in crate::runtime) source: Option<&'static str>,
+}
+
+#[derive(Debug, Clone, Copy)]
+pub(in crate::runtime) struct ServerSessionManagementSnapshot {
+    pub(in crate::runtime) session_id: SessionId,
+    pub(in crate::runtime) reference_count: u32,
 }
 
 #[derive(Debug)]
 pub(in crate::runtime) struct ServerStreamManagementSnapshot {
+    #[cfg(test)]
     pub(in crate::runtime) active_streams: usize,
-    pub(in crate::runtime) path_metrics: Vec<ServerCarrierPathMetricSnapshot>,
+    pub(in crate::runtime) paths: Vec<ServerCarrierPathStatusSnapshot>,
+    pub(in crate::runtime) sessions: Vec<ServerSessionManagementSnapshot>,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -232,6 +217,15 @@ pub(in crate::runtime) struct ServerCarrierPathIdentity {
     pub(in crate::runtime) underlay: UnderlayProtocol,
     pub(in crate::runtime) path_id: PathId,
     pub(in crate::runtime) path_instance_id: CarrierPathInstanceId,
+}
+
+/// Endpoint-local properties bound to one accepted carrier instance.
+/// These values never cross the wire and are not derived from peer `PathId`.
+#[derive(Debug, Clone, Copy, Default)]
+pub(in crate::runtime) struct ServerLocalPathProperties {
+    pub(in crate::runtime) config_ordinal: usize,
+    pub(in crate::runtime) policy: PathPolicy,
+    pub(in crate::runtime) initial_metrics: Option<PathMetrics>,
 }
 
 #[derive(Clone)]
@@ -243,6 +237,7 @@ struct ServerCarrierPathRegistrationInner {
     backend: Arc<dyn ServerStreamPortBackend>,
     owner_token: usize,
     identity: ServerCarrierPathIdentity,
+    local: ServerLocalPathProperties,
 }
 
 impl ServerCarrierPathRegistration {
@@ -262,6 +257,24 @@ impl ServerCarrierPathRegistration {
         self.inner.identity.path_id
     }
 
+    pub(in crate::runtime) fn local_policy(&self) -> PathPolicy {
+        self.inner.local.policy
+    }
+
+    pub(in crate::runtime) fn local_config_ordinal(&self) -> usize {
+        self.inner.local.config_ordinal
+    }
+
+    pub(in crate::runtime) fn initial_metrics(&self) -> Option<PathMetrics> {
+        self.inner.local.initial_metrics
+    }
+
+    pub(in crate::runtime) fn set_state(&self, state: PeerPathState) {
+        self.inner
+            .backend
+            .set_carrier_path_state(self.inner.identity, state);
+    }
+
     fn belongs_to(&self, port: &ServerStreamPort) -> bool {
         self.inner.owner_token == port.owner_token
     }
@@ -275,6 +288,7 @@ impl std::fmt::Debug for ServerCarrierPathRegistration {
             .field("underlay", &self.underlay())
             .field("path_id", &self.path_id())
             .field("path_instance_id", &self.path_instance_id())
+            .field("local_config_ordinal", &self.local_config_ordinal())
             .finish()
     }
 }
@@ -289,8 +303,6 @@ pub(in crate::runtime) struct ServerStreamPathAttachment {
     pub(in crate::runtime) path_registration: ServerCarrierPathRegistration,
     pub(in crate::runtime) commands: ReliablePathCommandSender,
     pub(in crate::runtime) max_frame_payload_bytes: usize,
-    pub(in crate::runtime) role: StreamOpenRole,
-    pub(in crate::runtime) initial_metrics: Option<PathMetrics>,
 }
 
 /// Carrier request to create or join one server-side product stream.
@@ -298,7 +310,7 @@ pub(in crate::runtime) struct ServerStreamOpenRequest {
     pub(in crate::runtime) session_id: SessionId,
     pub(in crate::runtime) stream_id: StreamId,
     pub(in crate::runtime) target: TargetAddr,
-    pub(in crate::runtime) lane: FlowLane,
+    pub(in crate::runtime) lane: TrafficClass,
     pub(in crate::runtime) attachment: ServerStreamPathAttachment,
     pub(in crate::runtime) mux_limits: MuxLimits,
 }
@@ -327,9 +339,15 @@ type ServerStreamPortFuture<'a, T> =
 pub(in crate::runtime) trait ServerStreamPortBackend: Send + Sync {
     fn owner_token(&self) -> usize;
 
-    fn activate_carrier_path(&self, identity: ServerCarrierPathIdentity);
+    fn activate_carrier_path(
+        &self,
+        identity: ServerCarrierPathIdentity,
+        local: ServerLocalPathProperties,
+    );
 
     fn retire_carrier_path(&self, identity: ServerCarrierPathIdentity);
+
+    fn set_carrier_path_state(&self, identity: ServerCarrierPathIdentity, state: PeerPathState);
 
     fn register_realtime_flow(&self, session_id: SessionId) -> ServerRealtimeFlowLease;
 
@@ -341,7 +359,7 @@ pub(in crate::runtime) trait ServerStreamPortBackend: Send + Sync {
 
     fn route_frame<'a>(
         &'a self,
-        session_id: SessionId,
+        identity: ServerCarrierPathIdentity,
         stream_id: StreamId,
         frame: Frame,
     ) -> ServerStreamPortFuture<'a, ()>;
@@ -357,21 +375,16 @@ pub(in crate::runtime) trait ServerStreamPortBackend: Send + Sync {
 
     fn record_peer_path_metrics(&self, identity: ServerCarrierPathIdentity, metrics: PathMetrics);
 
+    fn record_peer_path_usage(
+        &self,
+        identity: ServerCarrierPathIdentity,
+        sequence: u64,
+        usage: PathUsage,
+    );
+
     fn record_local_path_metrics(&self, identity: ServerCarrierPathIdentity, metrics: PathMetrics);
 
-    fn record_local_quic_capacity_proof(
-        &self,
-        identity: ServerCarrierPathIdentity,
-        metrics: PathMetrics,
-        candidate: QuicCapacityProofCandidate,
-    ) -> bool;
-
-    fn record_local_tcp_capacity_proof(
-        &self,
-        identity: ServerCarrierPathIdentity,
-        metrics: PathMetrics,
-        candidate: TcpCapacityProofCandidate,
-    ) -> bool;
+    fn peer_status_snapshot(&self, session_id: SessionId) -> Vec<PeerPathStatus>;
 
     fn management_snapshot(&self) -> ServerStreamManagementSnapshot;
 }
@@ -425,6 +438,7 @@ impl ServerStreamPort {
         session_id: SessionId,
         underlay: UnderlayProtocol,
         path_id: PathId,
+        local: ServerLocalPathProperties,
     ) -> ServerCarrierPathRegistration {
         let identity = ServerCarrierPathIdentity {
             session_id,
@@ -432,12 +446,13 @@ impl ServerStreamPort {
             path_id,
             path_instance_id: next_carrier_path_instance_id(),
         };
-        self.backend.activate_carrier_path(identity);
+        self.backend.activate_carrier_path(identity, local);
         ServerCarrierPathRegistration {
             inner: Arc::new(ServerCarrierPathRegistrationInner {
                 backend: self.backend.clone(),
                 owner_token: self.owner_token,
                 identity,
+                local,
             }),
         }
     }
@@ -484,11 +499,18 @@ impl ServerStreamPort {
 
     pub(in crate::runtime) async fn route_frame(
         &self,
-        session_id: SessionId,
+        path_registration: &ServerCarrierPathRegistration,
         stream_id: StreamId,
         frame: Frame,
     ) -> Result<(), RuntimeError> {
-        self.backend.route_frame(session_id, stream_id, frame).await
+        if !path_registration.belongs_to(self) {
+            return Err(RuntimeError::Protocol(
+                "reliable path registration does not match stream service",
+            ));
+        }
+        self.backend
+            .route_frame(path_registration.inner.identity, stream_id, frame)
+            .await
     }
 
     pub(in crate::runtime) fn detach_path(
@@ -514,6 +536,18 @@ impl ServerStreamPort {
         }
     }
 
+    pub(in crate::runtime) fn record_peer_path_usage(
+        &self,
+        registration: &ServerCarrierPathRegistration,
+        sequence: u64,
+        usage: PathUsage,
+    ) {
+        if registration.belongs_to(self) {
+            self.backend
+                .record_peer_path_usage(registration.inner.identity, sequence, usage);
+        }
+    }
+
     pub(in crate::runtime) fn record_local_path_metrics(
         &self,
         registration: &ServerCarrierPathRegistration,
@@ -525,32 +559,11 @@ impl ServerStreamPort {
         }
     }
 
-    pub(in crate::runtime) fn record_local_quic_capacity_proof(
+    pub(in crate::runtime) fn peer_status_snapshot(
         &self,
-        registration: &ServerCarrierPathRegistration,
-        metrics: PathMetrics,
-        candidate: QuicCapacityProofCandidate,
-    ) -> bool {
-        registration.belongs_to(self)
-            && self.backend.record_local_quic_capacity_proof(
-                registration.inner.identity,
-                metrics,
-                candidate,
-            )
-    }
-
-    pub(in crate::runtime) fn record_local_tcp_capacity_proof(
-        &self,
-        registration: &ServerCarrierPathRegistration,
-        metrics: PathMetrics,
-        candidate: TcpCapacityProofCandidate,
-    ) -> bool {
-        registration.belongs_to(self)
-            && self.backend.record_local_tcp_capacity_proof(
-                registration.inner.identity,
-                metrics,
-                candidate,
-            )
+        session_id: SessionId,
+    ) -> Vec<PeerPathStatus> {
+        self.backend.peer_status_snapshot(session_id)
     }
 
     pub(in crate::runtime) fn management_snapshot(&self) -> ServerStreamManagementSnapshot {
@@ -561,26 +574,13 @@ impl ServerStreamPort {
 /// Accepted client carrier state before product-stream ownership begins.
 pub(in crate::runtime) struct OpenedReliableCarrierStream {
     pub(in crate::runtime) stream_id: StreamId,
+    pub(in crate::runtime) path_instance_id: CarrierPathInstanceId,
     pub(in crate::runtime) max_offset: u64,
-    pub(in crate::runtime) lane: FlowLane,
+    pub(in crate::runtime) lane: TrafficClass,
     pub(in crate::runtime) underlay: UnderlayProtocol,
     pub(in crate::runtime) max_frame_payload_bytes: usize,
     pub(in crate::runtime) startup: PathSnapshot,
     pub(in crate::runtime) commands: ReliablePathCommandSender,
     pub(in crate::runtime) mux_limits: MuxLimits,
     pub(in crate::runtime) frames: mpsc::Receiver<Result<Frame, RuntimeError>>,
-}
-
-/// QUIC-specific wire-open behavior selected by the relay open transaction.
-#[derive(Debug, Clone, Copy)]
-pub(in crate::runtime) struct UdpStreamOpenOptions {
-    pub(in crate::runtime) wait_for_accept: bool,
-    pub(in crate::runtime) role: StreamOpenRole,
-}
-
-impl UdpStreamOpenOptions {
-    pub(in crate::runtime) const ACTIVE_WAIT: Self = Self {
-        wait_for_accept: true,
-        role: StreamOpenRole::Active,
-    };
 }

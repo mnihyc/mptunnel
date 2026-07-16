@@ -1,0 +1,397 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="color-scheme" content="light">
+  <meta name="description" content="mptunnel operational dashboard">
+  <title>mptunnel dashboard</title>
+  <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='6' fill='%2317252f'/%3E%3Cpath d='M7 21V11h4l5 6 5-6h4v10h-4v-5l-5 6-5-6v5z' fill='%23f4f7f9'/%3E%3C/svg%3E">
+  <link rel="stylesheet" href="/dashboard.css">
+  <script src="/dashboard.js" defer></script>
+</head>
+<body>
+  <a class="skip-link" href="#main-content">Skip to content</a>
+
+  <header class="topbar">
+    <div class="topbar__brand" aria-label="mptunnel dashboard">
+      <span class="brand-mark" aria-hidden="true"></span>
+      <span class="brand-name">mptunnel</span>
+      <span class="brand-surface">Dashboard</span>
+    </div>
+
+    <div class="topbar__status" aria-label="Dashboard connection status">
+      <span id="connection-dot" class="status-dot status-dot--loading" aria-hidden="true"></span>
+      <span id="connection-label">Connecting</span>
+      <span class="topbar__divider" aria-hidden="true"></span>
+      <span id="role-label" class="role-label">--</span>
+      <span id="freshness-label" class="freshness-label">Waiting for status</span>
+    </div>
+
+    <div class="topbar__actions">
+      <button id="access-button" class="button button--quiet" type="button">Access</button>
+      <button id="refresh-button" class="button button--primary" type="button">Refresh</button>
+    </div>
+  </header>
+
+  <nav class="tabs-shell" aria-label="Dashboard sections">
+    <div id="dashboard-tabs" class="tabs" role="tablist" aria-orientation="horizontal">
+      <button id="tab-overview" class="tab is-active" type="button" role="tab"
+              aria-selected="true" aria-controls="panel-overview" tabindex="0"
+              data-tab="overview">Overview</button>
+      <button id="tab-paths" class="tab" type="button" role="tab"
+              aria-selected="false" aria-controls="panel-paths" tabindex="-1"
+              data-tab="paths">Paths <span id="paths-tab-count" class="tab-count">0</span></button>
+      <button id="tab-sessions" class="tab" type="button" role="tab"
+              aria-selected="false" aria-controls="panel-sessions" tabindex="-1"
+              data-tab="sessions">Sessions <span id="sessions-tab-count" class="tab-count">0</span></button>
+      <button id="tab-diagnostics" class="tab" type="button" role="tab"
+              aria-selected="false" aria-controls="panel-diagnostics" tabindex="-1"
+              data-tab="diagnostics">Diagnostics</button>
+    </div>
+  </nav>
+
+  <main id="main-content" class="dashboard" tabindex="-1">
+    <div id="notice" class="notice notice--loading" role="status" aria-live="polite">
+      <span class="notice__indicator" aria-hidden="true"></span>
+      <span id="notice-text">Loading runtime status</span>
+    </div>
+
+    <section id="panel-overview" class="tab-panel" role="tabpanel"
+             aria-labelledby="tab-overview" data-panel="overview">
+      <div class="section-heading">
+        <div>
+          <p class="eyebrow">Runtime overview</p>
+          <h1>Current operation</h1>
+        </div>
+        <p id="overview-timestamp" class="section-meta">No sample</p>
+      </div>
+
+      <div class="kpi-grid" aria-label="Current key metrics">
+        <article class="kpi">
+          <p class="kpi__label">To peer</p>
+          <p id="kpi-to-rate" class="kpi__value">--</p>
+          <p id="kpi-to-total" class="kpi__detail">-- transferred</p>
+        </article>
+        <article class="kpi">
+          <p class="kpi__label">From peer</p>
+          <p id="kpi-from-rate" class="kpi__value">--</p>
+          <p id="kpi-from-total" class="kpi__detail">-- transferred</p>
+        </article>
+        <article class="kpi">
+          <p class="kpi__label">Active flows</p>
+          <p id="kpi-active-flows" class="kpi__value">--</p>
+          <p id="kpi-flow-detail" class="kpi__detail">-- reliable, -- datagram</p>
+        </article>
+        <article class="kpi">
+          <p class="kpi__label">Live paths</p>
+          <p id="kpi-live-paths" class="kpi__value">--</p>
+          <p id="kpi-path-detail" class="kpi__detail">-- configured</p>
+        </article>
+        <article class="kpi">
+          <p class="kpi__label">Queued</p>
+          <p id="kpi-queue" class="kpi__value">--</p>
+          <p id="kpi-flight" class="kpi__detail">-- in flight</p>
+        </article>
+        <article class="kpi">
+          <p class="kpi__label">Path delivery</p>
+          <p id="kpi-path-rate" class="kpi__value">--</p>
+          <p id="kpi-path-pacing" class="kpi__detail">-- pacing</p>
+        </article>
+      </div>
+
+      <div class="chart-grid">
+        <article class="chart-tool" aria-labelledby="traffic-chart-title">
+          <header class="chart-tool__header">
+            <div>
+              <p class="eyebrow">Last five minutes</p>
+              <h2 id="traffic-chart-title">Forwarded traffic</h2>
+            </div>
+            <div class="chart-legend" aria-label="Traffic chart legend">
+              <span><i class="legend-line legend-line--to" aria-hidden="true"></i>To peer</span>
+              <span><i class="legend-line legend-line--from" aria-hidden="true"></i>From peer</span>
+            </div>
+          </header>
+          <div class="canvas-frame">
+            <canvas id="traffic-chart" aria-label="Forwarded traffic rate history"></canvas>
+            <p id="traffic-chart-empty" class="canvas-empty">Waiting for traffic samples</p>
+          </div>
+        </article>
+
+        <article class="chart-tool" aria-labelledby="flows-chart-title">
+          <header class="chart-tool__header">
+            <div>
+              <p class="eyebrow">Last five minutes</p>
+              <h2 id="flows-chart-title">Active flows</h2>
+            </div>
+            <div class="chart-legend" aria-label="Active flows chart legend">
+              <span><i class="legend-line legend-line--flows" aria-hidden="true"></i>Logical flows</span>
+            </div>
+          </header>
+          <div class="canvas-frame">
+            <canvas id="flows-chart" aria-label="Active flow history"></canvas>
+            <p id="flows-chart-empty" class="canvas-empty">Waiting for flow samples</p>
+          </div>
+        </article>
+      </div>
+
+      <div class="overview-grid">
+        <section class="data-section" aria-labelledby="traffic-breakdown-title">
+          <div class="data-section__header">
+            <h2 id="traffic-breakdown-title">Traffic breakdown</h2>
+          </div>
+          <div class="table-wrap">
+            <table class="compact-table">
+              <thead>
+                <tr>
+                  <th scope="col">Class</th>
+                  <th scope="col">To peer</th>
+                  <th scope="col">From peer</th>
+                  <th scope="col">Active</th>
+                  <th scope="col">Completed</th>
+                  <th scope="col">Failed</th>
+                </tr>
+              </thead>
+              <tbody id="traffic-breakdown-body"></tbody>
+            </table>
+          </div>
+        </section>
+
+        <section class="data-section" aria-labelledby="services-title">
+          <div class="data-section__header">
+            <h2 id="services-title">Services</h2>
+          </div>
+          <dl id="services-list" class="metric-list"></dl>
+          <div id="inbounds-wrap" class="inbounds-wrap" hidden>
+            <h3>Local inbounds</h3>
+            <ul id="inbounds-list" class="plain-list"></ul>
+          </div>
+        </section>
+      </div>
+    </section>
+
+    <section id="panel-paths" class="tab-panel" role="tabpanel"
+             aria-labelledby="tab-paths" data-panel="paths" hidden>
+      <div class="section-heading section-heading--controls">
+        <div>
+          <p class="eyebrow">Carrier state</p>
+          <h1>Paths</h1>
+        </div>
+        <div class="filters" aria-label="Path filters">
+          <label>
+            <span>Carrier</span>
+            <select id="path-underlay-filter">
+              <option value="all">All</option>
+              <option value="tcp">TCP</option>
+              <option value="udp">QUIC / UDP</option>
+            </select>
+          </label>
+          <label>
+            <span>State</span>
+            <select id="path-state-filter">
+              <option value="all">All</option>
+              <option value="active">Active</option>
+              <option value="listening">Listening</option>
+              <option value="suspect">Suspect</option>
+              <option value="draining">Draining</option>
+              <option value="failed">Failed</option>
+              <option value="disabled">Disabled</option>
+            </select>
+          </label>
+        </div>
+      </div>
+
+      <div class="data-section data-section--wide">
+        <div class="data-section__header">
+          <h2>Authenticated MPP sessions</h2>
+        </div>
+        <div class="table-wrap table-wrap--records">
+          <table class="records-table">
+            <thead>
+              <tr>
+                <th scope="col">State</th>
+                <th scope="col">Session</th>
+                <th scope="col">Service</th>
+                <th scope="col">Carriers</th>
+                <th scope="col">Reliable flows</th>
+                <th scope="col">Datagram flows</th>
+              </tr>
+            </thead>
+            <tbody id="sessions-body"></tbody>
+          </table>
+        </div>
+        <div id="sessions-empty" class="empty-state" hidden>
+          <h2>No matching sessions</h2>
+          <p>Authenticated client sessions will appear when an MPP service is configured.</p>
+        </div>
+      </div>
+
+      <div class="data-section data-section--wide">
+        <div class="data-section__header">
+          <h2>Path inventory</h2>
+        </div>
+        <div class="table-wrap table-wrap--records">
+          <table class="records-table">
+            <thead>
+              <tr>
+                <th scope="col">State</th>
+                <th scope="col">Path</th>
+                <th scope="col">Service</th>
+                <th scope="col">Carrier</th>
+                <th scope="col">Usage</th>
+                <th scope="col">RTT</th>
+                <th scope="col">Delivery</th>
+                <th scope="col">Loss</th>
+                <th scope="col">Queue</th>
+                <th scope="col">In flight</th>
+                <th scope="col">Flows</th>
+              </tr>
+            </thead>
+            <tbody id="paths-body"></tbody>
+          </table>
+        </div>
+        <div id="paths-empty" class="empty-state" hidden>
+          <h2>No matching paths</h2>
+          <p>Current filters do not match a configured or connected path.</p>
+        </div>
+      </div>
+    </section>
+
+    <section id="panel-sessions" class="tab-panel" role="tabpanel"
+             aria-labelledby="tab-sessions" data-panel="sessions" hidden>
+      <div class="section-heading section-heading--controls">
+        <div>
+          <p class="eyebrow">Logical forwarding</p>
+          <h1>Sessions</h1>
+        </div>
+        <label class="search-field">
+          <span>Filter</span>
+          <input id="session-filter" type="search" inputmode="search"
+                 autocomplete="off" placeholder="Session, target, service">
+        </label>
+      </div>
+
+      <div class="data-section data-section--wide">
+        <div class="table-wrap table-wrap--records">
+          <table class="records-table">
+            <thead>
+              <tr>
+                <th scope="col">Kind</th>
+                <th scope="col">Flow</th>
+                <th scope="col">Service</th>
+                <th scope="col">Session</th>
+                <th scope="col">Target</th>
+                <th scope="col">Age</th>
+                <th scope="col">Idle</th>
+                <th scope="col">To peer</th>
+                <th scope="col">From peer</th>
+              </tr>
+            </thead>
+            <tbody id="flows-body"></tbody>
+          </table>
+        </div>
+        <div id="flows-empty" class="empty-state" hidden>
+          <h2>No matching active flows</h2>
+          <p>Reliable streams and datagram associations will appear while forwarding traffic.</p>
+        </div>
+      </div>
+    </section>
+
+    <section id="panel-diagnostics" class="tab-panel" role="tabpanel"
+             aria-labelledby="tab-diagnostics" data-panel="diagnostics" hidden>
+      <div class="section-heading">
+        <div>
+          <p class="eyebrow">Bounded runtime evidence</p>
+          <h1>Diagnostics</h1>
+        </div>
+      </div>
+
+      <div class="diagnostics-grid">
+        <section class="data-section peer-tool" aria-labelledby="peer-title">
+          <div class="data-section__header data-section__header--actions">
+            <div>
+              <h2 id="peer-title">Peer path status</h2>
+              <p id="peer-capability" class="section-meta">Checking availability</p>
+            </div>
+            <span id="peer-allow-badge" class="badge badge--neutral">Incoming off</span>
+          </div>
+
+          <div class="peer-controls">
+            <label>
+              <span>Peer session</span>
+              <select id="peer-session-select" disabled>
+                <option value="">No connected peer</option>
+              </select>
+            </label>
+            <button id="peer-request-button" class="button button--primary" type="button" disabled>
+              Request status
+            </button>
+          </div>
+
+          <div id="peer-request-state" class="inline-status" role="status" aria-live="polite"></div>
+
+          <div id="peer-result" class="peer-result" hidden>
+            <dl id="peer-result-summary" class="metric-list metric-list--compact"></dl>
+            <div class="table-wrap table-wrap--records">
+              <table class="records-table records-table--peer">
+                <thead>
+                  <tr>
+                    <th scope="col">State</th>
+                    <th scope="col">Path</th>
+                    <th scope="col">Carrier</th>
+                    <th scope="col">Usage</th>
+                    <th scope="col">RTT</th>
+                    <th scope="col">Delivery</th>
+                    <th scope="col">Loss</th>
+                    <th scope="col">Queue</th>
+                    <th scope="col">In flight</th>
+                  </tr>
+                </thead>
+                <tbody id="peer-paths-body"></tbody>
+              </table>
+            </div>
+            <div id="peer-paths-empty" class="empty-state empty-state--compact" hidden>
+              <h3>Peer returned no paths</h3>
+            </div>
+          </div>
+        </section>
+
+        <section class="data-section" aria-labelledby="runtime-diagnostics-title">
+          <div class="data-section__header">
+            <h2 id="runtime-diagnostics-title">Runtime diagnostics</h2>
+          </div>
+          <dl id="diagnostics-metrics" class="metric-list"></dl>
+          <ul id="diagnostics-notes" class="notes-list"></ul>
+        </section>
+      </div>
+    </section>
+  </main>
+
+  <div id="sr-status" class="sr-only" role="status" aria-live="polite"></div>
+
+  <dialog id="auth-dialog" class="auth-dialog" aria-labelledby="auth-title">
+    <form id="auth-form" class="auth-form" method="dialog">
+      <div class="auth-form__heading">
+        <span class="brand-mark" aria-hidden="true"></span>
+        <div>
+          <p class="eyebrow">Management access</p>
+          <h2 id="auth-title">Bearer token</h2>
+        </div>
+      </div>
+      <p id="auth-message" class="auth-message">Enter the token configured for this endpoint.</p>
+      <label>
+        <span>Token</span>
+        <input id="token-input" name="token" type="password" autocomplete="off"
+               spellcheck="false" required>
+      </label>
+      <p id="auth-error" class="form-error" role="alert"></p>
+      <div class="dialog-actions">
+        <button id="forget-token-button" class="button button--danger-quiet" type="button">Forget token</button>
+        <span class="dialog-actions__spacer"></span>
+        <button id="auth-cancel-button" class="button button--quiet" type="button">Cancel</button>
+        <button class="button button--primary" type="submit">Connect</button>
+      </div>
+    </form>
+  </dialog>
+</body>
+</html>

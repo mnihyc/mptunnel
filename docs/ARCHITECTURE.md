@@ -1,418 +1,298 @@
 # Architecture and ownership
 
-This map is the short guide for changing `mptunnel`. `DESIGN.md` records the
-long-running design history; `RFC.md` defines protocol behavior; this document
-names the current code owners and the boundaries that performance work must
-preserve.
+This document maps the current source tree and design choices to the MPP
+protocol model. `RFC.md` is the wire and behavioral specification, and
+`docs/CODE_STRUCTURE.md` defines repository rules.
 
-## Product and carrier layers
+## Layer model
 
 ```text
-ingress (SOCKS5 / HTTP CONNECT / TUN)
-    -> product flow and MPP stream identity
-    -> shared reliable-stream scheduling and offset ownership
-    -> carrier command queue
-       -> TCP writer and kernel TCP congestion control
-       -> QUIC writer and Quinn congestion/recovery over UDP
-    -> peer MPP decoding
-    -> outbound target
+SOCKS5 / HTTP CONNECT / TUN ingress
+    -> MPP stream or datagram identity
+    -> per-direction connection sequencing, flow control, Data ACKs, and reinjection
+    -> carrier-neutral path scheduler and sender queue
+       -> TCP carrier -> kernel TCP congestion control and recovery
+       -> QUIC carrier -> Quinn congestion control and recovery over UDP
+    -> peer data-level reassembly
+    -> target outbound
 ```
 
-The shared MPTUN layer owns product semantics: stream IDs, product offsets,
-ordered delivery, repair, flow lanes, path membership, and cross-carrier
-selection. TCP and QUIC own carrier semantics independently below it. A TCP ACK
-and a QUIC packet ACK are therefore evidence for different controllers; neither
-may release the shared product-range ledger. `STREAM_ACK` releases that ledger.
+MPP unifies TCP and QUIC above their native recovery layers. It does not try to
+make their packet controllers identical:
 
-Mixed TCP+UDP is not a third carrier implementation. It is the shared product
-scheduler comparing immutable evidence from two independent carrier families.
-Cross-family placement must preserve the same product offset and ordering
-contract as same-family multipath placement.
+- TCP owns its byte ACKs, retransmission, congestion control, and socket queues.
+- QUIC owns packet ACKs, loss detection, PTO, pacing, congestion control, and
+  connection migration.
+- MPP owns the stream ID, each direction's offset space, `STREAM_ACK`,
+  each direction's shared receive window, exact range attribution, reinjection
+  across paths, and carrier-neutral scheduling.
 
-Reliable-path admission has exactly four outcomes: `Service`, `Subflow`,
-`ProbeOnly`, and `Standby`. One enum makes contradictory role/work combinations
-unrepresentable. Repair is separately selected `RepairData` work against an
-existing product range; it is not a fifth path role and never grants ownership
-of a new offset.
+A native TCP ACK or QUIC packet ACK is path evidence. It never releases the MPP
+connection-level flight ledger; only a `STREAM_ACK` for the MPP range does.
 
-## Code owners
+## Protocol-v2 model
 
-A source module exists only when it owns a durable capability, state machine,
-or invariant. File size alone is not a boundary: keep small helpers beside the
-behavior they explain, and prefer one cohesive flat module to several shallow
-wrappers that merely pass the same state between them.
+`OPEN_STREAM` contains only `stream_id`, `target`, and initial `demand`. Opening
+or attaching a stream does not assign a persistent primary, validation, or
+recovery role to the path. Every accepted attachment is neutral membership in
+the connection's path set.
 
-- `src/ingress/`: accepts local SOCKS5, HTTP CONNECT, and TUN traffic. It owns
-  ingress parsing, not multipath placement.
-- `src/outbound/`: opens the remote target or upstream proxy. It owns target
-  connection policy, not carrier selection.
-- `src/protocol/`: MPP wire types, authentication, and bounded codecs. A frame
-  being representable here does not make it legal on every carrier or role.
-- `src/runtime/node/`: composes configured client/server identities. Per-group
-  product performance policy is passed explicitly to relay flows; carrier path
-  state neither owns nor silently defaults that policy.
-- `src/runtime/relay/`: owns client and server flow orchestration, carrier open
-  and attach transactions, remote membership, recovery, and target I/O. It does
-  not own product scheduling formulas or carrier congestion control.
-- `src/runtime/stream/request.rs`: owns the serialized request product state:
-  exact offset flights, ordered Service identity, startup epochs, ACK-clock
-  operation, and per-instance evidence. This aggregate stays lock-free because
-  one client relay task mutates it.
-- `src/runtime/sender/request.rs`: is the relay-facing request facade. It owns
-  queue dispatch, carrier command enqueue, load-claim transfer, control output,
-  and recovery orchestration; it does not expose the serialized product state.
-- `src/runtime/sender/request/multipath.rs`: owns the request multipath
-  lifecycle transaction. It captures immutable observations, plans and
-  revalidates one exact-instance intent, and publishes product state only after
-  carrier enqueue succeeds. Failure invalidation, ACK/window effects, and send
-  cursor advancement remain serialized here.
-- `src/runtime/sender/request/scheduling.rs`: owns request path admission and
-  ranking over immutable, handle-free observations. Its choices are
-  carrier-neutral values, not runtime errors or I/O actions. TCP startup and
-  ACK-clock calibration remain distinct from QUIC native capacity below this
-  shared product policy.
-- `src/runtime/sender/request/{tcp_capacity,quic_capacity}.rs`: own separate
-  request-direction carrier capacity transactions. They share product intents,
-  not controller state or proof semantics.
-- `src/runtime/stream/response.rs` and `src/runtime/stream/response/`: own the
-  response binding and its session, evidence, admission, handoff, delivery, and
-  commit invariants. One per-session aggregate serializes shared response state.
-- `src/runtime/sender/response/service.rs`: owns queued response work and source
-  stream mutation. `planner.rs` owns path ranking/admission over one captured
-  target batch; `multipath.rs` serializes session maintenance, concrete TCP and
-  QUIC capacity starts, handoff drain, retirement, planning-pass generation fences,
-  and executable-plan construction; `dispatch.rs` alone revalidates and
-  enqueues carrier commands. The rare large whole-flow handoff record is boxed
-  instead of inflating every per-frame plan.
-- `src/runtime/path/{set,state,selection}.rs`: own configured carrier identity,
-  shared health/load ledgers, carrier-neutral capacity budgets, coherent batch
-  observation, and atomic load reservation. Protocol-specific reservation and
-  proof state is composed here but owned below. The session-shared TCP-Service
-  request-flow count lives in path state and counts each logical stream once,
-  not each attachment.
-- `src/runtime/path/commands.rs`: owns bounded, lane-separated transfer to
-  carrier writers. Queue accounting must balance on enqueue, dequeue,
-  cancellation, and receiver drop.
-- `src/runtime/datagram/`: owns product datagram associations, outbound UDP
-  admission and connections, and target worker lifetime. Carrier actors retain
-  only accepted flow handles obtained through `ServerDatagramPort`.
-- `src/runtime/path/tcp/` and `src/runtime/path/quic/`: own independent carrier
-  actors, I/O, telemetry, recovery, and native capacity evidence. Kernel TCP and
-  Quinn remain their respective congestion and retransmission authorities.
-  Their `capacity.rs` owners contain the complete request reservation, proof,
-  rollback, and carrier-specific handoff lifecycle; TCP stays path-parallel,
-  while QUIC serializes one native measurement epoch per session. Server target
-  work enters through typed stream/datagram ports; carriers do not own outbound
-  policy, target sockets, or target worker tasks.
-- `src/runtime/stream/{handle,registry}.rs`: own carrier-neutral stream handles,
-  server stream lookup, exact carrier-instance attachment, and binding lifetime.
-- `src/model/` and `src/scheduler/`: own carrier-neutral evidence vocabulary,
-  bounded product models, admission, and pure ranking. They do not import live
-  relay, stream, or carrier handles.
-- `src/simulator/`: owns deterministic virtual queues, DRR, tail mode,
-  close-ETA duplication, and shared-bottleneck experiments. It reuses pure
-  production path scoring but none of its queue state is deployed. Runtime
-  senders own real per-flow queues, carrier admission, ownership ledgers, and
-  TCP/QUIC recovery; only end-to-end labs prove those behaviors.
-- `src/transport/`: owns framing/encryption and thin TCP, UDP, and Quinn
-  adapters. Native telemetry is optional capability evidence, not product
-  ownership authority. TCP bounds resolution and staggered dual-stack address
-  attempts with one absolute setup deadline; QUIC keeps a separate handshake
-  race over the same neutral resolver ordering.
+`PATH_STATUS` carries a sequenced, directional `PathUsage` value:
 
-## Mutation contracts
+- `Available`: the receiver permits ordinary use in that direction.
+- `Backup`: the receiver asks the peer to use the path only after available
+  paths cannot carry the work.
 
-Scheduling uses a propose/revalidate/commit pattern. The sender may rank a
-snapshot without holding runtime locks. The owner then rechecks path identity,
-incarnation, model generations, product frontier, proof authority, and the
-ranked pending-byte credit bound before it mutates ownership. Shared carrier
-queue/BIF is pressure rather than binding ownership: it may fall after ranking,
-but growth outside the admitted envelope rejects the proposal.
+This follows the regular/backup preference in MPTCP and multipath QUIC. The
+preference is independent of local health. Local states such as usable,
+suspect, draining, or failed are never serialized as `PathUsage`.
 
-Carrier identity is `(session, underlay, path_id, path_instance_id)`. A reused
-numeric path ID is not enough to inherit flights, leases, or proof from a dead
-connection. Stream attachment role and carrier instance lifetime are separate:
-closing the last product stream must not silently reset a live carrier's
-session-wide probe budget.
+Scheduling first considers eligible `Available` paths. Only when that set has
+no schedulable output does it fall back to eligible `Backup` paths. Within the
+chosen set it ranks live RTT, rate, queue, flight, loss, jitter, confidence,
+and current demand. A configured local `backup` policy may be stricter than the
+peer preference.
 
-The client path context owns one immutable path list and one immutable security
-list. TCP and QUIC session actors carry a stable index into those shared
-allocations rather than cloning endpoint strings and secrets per carrier. The
-index is configuration identity only; live health, queues, proof, and product
-ownership remain in their typed runtime owners.
+`TrafficClass` is endpoint-local, mutable demand classification for queued work. It
+is not a property or role of a link. A stream may move from latency-oriented to
+throughput-oriented work and back as its live demand changes without reopening
+the stream or relabeling a path.
 
-`FlowSubflowSet` owns only Service identity, measured membership, and the one
-unproven startup owner with its frozen cumulative credit. Queue pressure,
-carrier/product flight, and ordering debt are live observations, not copied
-epoch fields. Request startup proof, ACK progress, and rate state are one
-exact-instance evidence record so detach and replacement cannot partially clean
-parallel maps. On the response side, raw product queue bytes belong to the
-stream once and are projected identically into each carrier snapshot; attachment
-does not create a second queue ledger.
+## Source owners
 
-A configured QUIC datagram payload ceiling is a product allocation bound only.
-Quinn owns transport PMTU discovery and packetization; the product layer does
-not infer measured MTU or create probe/ack frame state.
+A module exists when it owns a durable state machine, algorithm, protocol
+boundary, or adapter. File size alone does not earn a module.
 
-Request `STREAM_ACK` advances one ordered product transaction: release unique
-mux bytes, release every exact transmitted copy, and derive exact OwnerData
-evidence. It returns a carrier-neutral source-window effect. The relay owns
-applying that effect and scheduling repair, so it never reconstructs path-owner
-eligibility from partially updated sender state.
+- `src/protocol/`: bounded protocol-v2 codec, wire values, authentication, and
+  range semantics. It owns no sockets or scheduling policy.
+- `src/model/`: carrier-neutral identities, evidence, capacity, admission, ACK
+  clock, connection-flight, and work models. Pure TCP proof candidate
+  validation lives here; TCP runtime owns the measurement transaction.
+- `src/scheduler/`: pure eligibility and completion-time ranking over immutable
+  path snapshots. `src/simulator/` may reuse these formulas but owns only
+  simulator-private queues.
+- `src/transport/`: encryption, framing, endpoint resolution, TCP adapters,
+  Quinn/QUIC adapters, and optional native telemetry. It does not own MPP
+  offsets or path placement.
+- `src/runtime/path/`: configured paths, health and metric publication, path
+  instances, command queues, proofs, selection, and typed ports.
+- `src/runtime/path/tcp/`: TCP connection actors, reads/writes, heartbeats,
+  optional socket evidence, and TCP-specific capacity transactions.
+- `src/runtime/path/quic/`: Quinn connection and stream actors, datagrams,
+  native measurements, and QUIC-specific capacity transactions.
+- `src/runtime/stream/`: MPP stream handles, connection-level receive
+  feedback, client request state and attachments, server registry, response
+  bindings, exact attachment lifetimes, and delivery.
+- `src/runtime/stream/request/`: request `attachment`, `state`, `flow_control`,
+  and `flight` owners behind the narrow `request.rs` facade.
+- `src/runtime/sender/request/`: request queueing, scheduling, capacity intents,
+  multipath commit, and carrier dispatch.
+- `src/runtime/sender/response/`: response `service`, `scheduling`,
+  `multipath`, and `dispatch` phases. The service owns queued work; scheduling
+  is pure; multipath owns lifecycle planning; dispatch revalidates and enqueues.
+- `src/runtime/stream/response/`: response `ack_clock`, `attachment`,
+  `data_commit`, `delivery`, `diagnostics`, `evidence`, `session`,
+  and `snapshot` state. These are the only current response
+  owners; deleted pre-v2 wrapper modules are not part of the current tree.
+- `src/runtime/relay/`: ingress/target I/O, carrier open/attach transactions,
+  failure recovery, and coordination with senders. The stream layer owns the
+  resulting membership set; sender does not import relay state or policy.
+- `src/runtime/datagram/`: MPP datagram associations, feedback, target
+  workers, shared SOCKS/TUN edge workers, and carrier-neutral selection.
+- `src/runtime/telemetry.rs`: exact logical product-byte, packet, and flow
+  accounting at ingress/target relay boundaries. It never counts carrier
+  retransmission, reinjection, or multipath copies.
+- `src/runtime/peer_status.rs`: bounded correlation for manual authenticated
+  peer-status requests. TCP and QUIC actors retain their own writer and metric
+  ownership; the broker owns neither carrier I/O nor scheduling evidence.
+- `src/runtime/management/`: cached typed snapshots, bounded HTTP transport,
+  and embedded-dashboard delivery. Its one-second sampler is the only reader
+  of runtime observability owners on behalf of HTTP requests.
+- `src/ingress/` and `src/outbound/`: local protocol parsing and remote target
+  connection policy respectively. Neither chooses MPP data paths.
+- `src/runtime/node/`: constructs client, server, or combined nodes and injects
+  typed ports between owners. The accepting listener carries its exact local
+  path policy and startup hints into server carrier registration.
 
-The version 1 wire model carries only peer-owned facts. Stream opens contain a
-target, initial demand class, and attachment role; datagram opens contain a
-target. Client ingress identity, server outbound choice, and configured path
-policy remain endpoint-local. `STREAM_FIN` is the sole EOF transition,
-and `PATH_STATUS` carries status only. This avoids parallel wire and runtime
-authorities for state that the peer never consumes.
+## Reliable-stream data flow
 
-QUIC capacity proof is a transaction:
+Request and response directions use different state owners and independent
+sequence, Data ACK, and receive-window state, but the same connection contract.
+For each direction:
 
-1. Reserve one bounded session/path attempt with frozen train geometry and a
-   proof-validity interval distinct from its attempt deadline.
-2. Admit one typed command carrying the exact token, path instance, deadline,
-   validity interval, and invalidatable ownership ticket.
-3. Gate ordinary connection writers and stream bounded token records plus an
-   ordered finish marker without product offsets.
-4. Accumulate one non-interleaved, session-bounded client epoch and require its
-   exact whole-train receipt. Native ACK timing is provisional diagnostics and
-   ordinary product evidence stays independent.
-5. Freeze the full receipt-interval rate and expiry and release the carrier
-   writer gate. A separate sent-time quarantine keeps probe-era ACKs out of
-   generic product evidence through that expiry without blocking new writes.
-6. Commit the exact lease before publishing the marker everywhere, resolve
-   publication separately from cancellation, then retire public token metrics.
+1. The source allocates monotonically increasing data sequence offsets.
+2. Request flight ownership retains the exact attachment identity. Response
+   dispatch revalidates the path instance before enqueue, then records the
+   stream-unique output incarnation only after queue reservation succeeds.
+3. The receiver reassembles by data sequence offset and advances delivery once holes
+   close.
+4. `STREAM_ACK` acknowledges MPP ranges independently of the transport path that
+   delivered the ACK.
+5. The sender releases every recorded copy of an acknowledged range and updates
+   local ACK-clock/admission evidence without changing advertised flow-control
+   credit.
+6. When data-level progress stalls and another path is eligible, the sender may
+   reinject only the missing range under the configured flight and reorder
+   envelopes.
 
-Request-direction discovery uses the symmetric record transaction but keeps a
-separate ownership handoff. Its token owns the session slot, stream, relay
-instance, train budget, attempt deadline, and publication ticket. Receipt time,
-not delayed metrics publication, must precede the attempt deadline; reservation
-cleanup retains that eligible receipt for one proof-validity horizon so the
-publication boundary cannot race it. Publishing the ticket is part of proof
-acceptance, and exact-token cleanup cannot clear a successor session.
+Reinjection is not TCP retransmission or QUIC packet recovery. Native recovery
+continues below it. The range ledger avoids treating a second copy as new
+MPP data and prevents unbounded duplication.
 
-A fenced native tail rate grants only bounded carrier-sized product authority.
-The same stream-local relay instance must then ACK one fixed product floor from
-bytes sent at or after proof acceptance, and the ACK itself must precede proof
-expiry. Completion preserves durable ordered ownership and serializes the next
-train. Its numeric rate prior remains fresh for one proof-validity horizon after
-completion, after which new native evidence may correct it. Expiry, cancellation,
-or association failure erases an incomplete handoff. Product ACK bytes prove
-ordered use only; QUIC packet ACKs still own capacity, pacing, and recovery.
+`STREAM_ACK` and `STREAM_MAX_DATA` are separate signals. Data ACK releases
+MPP ranges and flight but grants no new offset. `STREAM_MAX_DATA` grants a
+new maximum offset but acknowledges no byte. Its receiver-advertised window is
+shared by all attachments in one stream direction; the opposite direction has
+an independent maximum. Carrier windows and congestion windows remain separate
+limits.
 
-Native QUIC measurement uses every carrier byte in the timed measurement epoch
-as its numerator; the required byte count is only a proof floor. Delayed ACKs
-for probe packets remain excluded by sent time from ordinary carrier evidence,
-but the exclusion cutoff is the peer receipt time. The quarantine record lives
-until proof expiry only to catch delayed probe-era ACKs, so ordinary packets
-sent after receipt become eligible immediately.
+Ordinary reinjection consumes a cumulative extra-traffic budget. Critical
+path-failure, persistent authoritative Data ACK gap, and bounded live-tail
+recovery may exceed the remaining cumulative budget only by a cause-specific,
+event-bounded quantum. The exact range must remain unacknowledged and retained;
+overlapping queued copies are suppressed, live-tail and persistent-gap work use
+a distinct output, and all exception bytes remain charged against later
+optional reinjection.
 
-Raw capacity Data/Finish/Receipt records are not generic `SendFrame` work. Data
-and Finish are legal only inside the typed server-to-client QUIC probe command;
-Receipt is generated only by the client-side receiver. This keeps TCP framing,
-peer roles, and ordinary QUIC batching from bypassing the lease and accounting
-contract. Cancellation interrupts a partial probe write and fail-closes that
-connection; abandoning a queued command cancels its ticket and reconciles its
-full logical byte charge. Publication wakes cleanup with a distinct resolution.
+Recovery timing follows the evidence owner: exact path-instance failure is
+immediate, an authoritative lowest missing Data Sequence frontier must persist
+for three path-local PTO intervals, and a contiguous live tail may send one
+bounded probe after one PTO but waits three PTO before repeating without
+progress. Growth of the ACK horizon above the same frontier does not restart
+the timer. These are MPP data-level policies; native TCP and QUIC recovery
+timers remain independent.
 
-## Performance rules
+## Scheduling contract
 
-- Keep product scheduling carrier-neutral; specialize only where the carrier's
-  controller exposes different evidence or mechanics.
-- Batch immutable snapshots and lock once per scheduling pass. Packet/ACK and
-  frame hot paths must not take session-wide locks.
-- Bound queues and retained flight/proof state by existing mux resource limits.
-  A one-item command may represent a large train, so cancellation and drop must
-  still reconcile its full logical byte charge.
-- Keep raw source staging distinct from assigned product flight. Before exact
-  Service feed evidence, a switchable same-family response couples its global
-  owner tail and raw queue inside one derived feed reservoir (4 MiB with
-  defaults). This is a bounded product bootstrap, not a carrier congestion
-  window. A current QUIC Service may graduate source and emission staging from
-  either substantial uniquely owned product `STREAM_ACK` progress or a durable
-  local carrier ACK-derived DATA estimate, even when the latter is app-limited.
-  Neither is optional-path capacity proof; TCP uses its strict product/carrier
-  evidence. After graduation and without same-path latency pressure, either
-  underlay may fill one configured product envelope so its native transport
-  owns the pipe.
-  Mixed-family raw staging stays in a separate bounded reservoir. Request-side
-  source and repair debt share one carrier-neutral product window: it starts at
-  the same 4 MiB reservoir, grows on exact unambiguous OwnerData ACK turnover,
-  and resets only when ordered product ownership commits an exact Service
-  handoff. Active attachment-list churn is not a handoff; temporary Service
-  absence retains the bound, and bulk-to-latency demotion closes it to the
-  classifier reservoir. Those ACKs never set TCP or QUIC carrier capacity.
-- Treat bulk receive credit as receiver-memory authority. TCP and QUIC
-  `STREAM_MAX_DATA` advertise the configured product window independently of
-  path proof; source staging and native carrier congestion control separately
-  bound admitted and network flight. Latency QUIC retains its smaller window.
-- Bound same-family striping inside the configured product, reorder, and stream
-  envelope. Service owns the first horizon; only a strictly measured
-  same-underlay Subflow may use the remaining ordered reservoir, and TCP or QUIC
-  still owns its per-path emission credit. Admission compares the candidate's
-  completion time with the complete Service backlog, while receiver reorder
-  exposure excludes bytes already assigned to Service. Queue and native carrier
-  flight already represented in Service ETA are not charged a second time. The
-  weaker QUIC product-progress/carrier Service-feed predicates do not prove
-  optional capacity or admit a Subflow; QUIC Subflow, handoff, and capacity
-  decisions still require strict non-app-limited local carrier proof. A QUIC
-  request Validation attachment graduates only when its exact path proof and a
-  fresh native packet-ACK sample produced after attachment are both valid. This
-  can reuse capacity established by concurrent carrier traffic but cannot bootstrap
-  an otherwise idle one-flow QUIC candidate from ordered product bytes. Before a
-  high-confidence additional QUIC path has durable product progress, a
-  BBR-style inflight target of `2 * delivery-rate BDP` bounds product reorder
-  exposure; carrier-only pacing/cwnd growth stays below that boundary.
-  Low-confidence QUIC response startup remains separately epoch-bounded and
-  uses native inflight credit, falling back to the delivery-rate target when no
-  native window is available. Datagram goodput may rank datagram paths but never
-  satisfies reliable product durability; data-plane failure invalidates both
-  durable product and native-window authority for the failed association.
-- Open fresh TCP request discovery only under real same-family logical
-  contention. Startup and zero-spend ACK-clock calibration require at least two
-  active logical bulk request flows whose exact committed Service is TCP,
-  counting each stream once regardless of its path attachments. Present queued
-  or outstanding request data is required; reverse bytes, idle completed
-  uploads, QUIC-Service demand, and per-path load cannot substitute for this
-  gate. A begun exact-owner epoch may drain after a two-to-one transition.
-  No path-wide completion estimate may veto fresh request calibration until
-  request-direction, provenance-bound authority exists. The ACK of all exact
-  sealed startup `OwnerData`, or the exact ordered receipt ACK when it arrives
-  first, establishes the candidate's calibration boundary. One explicit
-  exact-instance calibration owner then spends one frozen, cumulative,
-  non-refilling target, 2 MiB with default envelopes. Exact-owner, debt,
-  resource, pressure, and post-boundary causality guards still apply. The
-  target does not expand to a modeled pipe. Instead, exact ownership permits a
-  provisional Service-derived rate and pipe only for an endpoint-only
-  candidate until its continuous product-ACK model reaches ten exact samples,
-  at which point its own model replaces that prior. A configured candidate
-  retains its own capacity hint. This avoids serial probe work stalling the only
-  data-bearing upload while still giving kernel TCP enough bounded exploration
-  credit to leave slow start. QUIC stays outside product-ACK rate calibration:
-  one serialized carrier-only train establishes capacity, then exact
-  post-proof product ACKs establish durable ownership. TCP and QUIC keep
-  independent proof clocks below the shared product window.
-- Size request-side QUIC warmup from candidate-local native flight and the
-  effective competing rate/RTT pipe. Request snapshots carry total flight, so
-  subtract separately tracked product flight before applying the native floor.
-  Product flight is shared ordering state, possibly spanning several carriers,
-  and must not inflate one carrier proof.
-- Response discovery is directional and permits one active sustained bulk
-  response to spend the first bounded same-family startup sample. That first
-  sample is the non-circular discovery bootstrap. After one measured Subflow
-  exists, every later fresh candidate must finish its whole startup sample
-  within the current Service completion reservoir; an already-started exact
-  epoch may finish. This prevents serial cold samples from inserting a slow
-  ordered prefix while retaining one-flow download aggregation.
-- Once Service has strict directional bulk evidence, offset-free carrier
-  discovery runs independently of product Subflow graduation. One session
-  serializes the typed trains; ordinary ETA, native credit, and ordering
-  admission still decide whether a proven carrier receives product.
-- A live discovery lease prevents session reclaim, releases before carrier
-  wake or proof publication, and bounds train send plus receipt with one
-  deadline. A measured cross-family handoff outranks optional TCP discovery.
-- Bulk prevalidation opens the current Service-family candidate set together
-  and permits at most two opens per stream/path, with retry after independent
-  path-health revalidation. Attachment is path management, not capacity proof
-  or permission to place ordered product bytes.
-- After exact response startup drain, endpoint-only TCP may retain the proven
-  same-family Service opportunity as a temporary typed capacity prior and move
-  directly to ordinary bounded Subflow work. Ten ordinary exact-ACK windows
-  replace it with per-flow goodput. Configured or independently measured paths
-  keep staged exact calibration as fallback. While a fallback prefix is
-  serialized, Service owner assignment stops when total ordered tail reaches
-  that prefix plus one Service feed reservoir, clamped to the product envelope,
-  until ACK progress releases credit. Offset-free raw staging does not weaken
-  this ownership limit.
-- Encode large probe trains incrementally. Do not allocate a vector containing
-  every frame or copy the complete train solely for queue admission.
-- Treat time sources explicitly. Carrier ACK timing, scheduler poll timing, and
-  proof validity deadlines are different clocks and cannot be substituted.
-- TCP response goodput counts only exact binding-local `OwnerData`. Its first
-  product ACK establishes the clock; later bytes use a bounded ratio of bytes
-  to continuous ACK wall time so callback bursts cannot discard their silence.
-  A bounded Service opportunity or completed exclusive fallback may install a
-  typed path-capacity prior. Ten completed ordinary exact-ACK windows plus a
-  usable continuous sample atomically replace that prior with per-flow goodput;
-  ACK callbacks alone do not advance the count. QUIC does not use either TCP
-  clock.
-- Linux TCP carriers duplicate the exact authenticated socket descriptor before
-  framing and poll the UAPI `TCP_INFO` prefix in that carrier task. Returned
-  prefix length grades independent RTT, flight, queue, loss, pacing, and
-  delivery capabilities; absent fields remain unknown and do not clear existing
-  state. Passive samples never claim product bytes. A one-shot, offset-free
-  train and exact receipt may temporarily authorize that TCP instance for bulk
-  placement. Only an actual native delivery field may lift that receipt, capped
-  at 2x; pacing is never delivery proof. TCP and QUIC share bounded capacity
-  wire records while retaining separate typed commands, controllers, proof
-  validity, and recovery behavior.
-- Ordered product recovery is connection-level. After one blocking TCP owner
-  PTO, mptunnel may reinject at most one modeled owner flight on another path,
-  capped by the shared feed reservoir. QUIC packet recovery remains native and
-  its product repair stays one bounded quantum.
-- Thresholds must be protocol/resource bounds or derived from live metrics.
-  Lab-specific constants must not become steady-state product policy.
+Scheduling follows observe, decide, apply:
 
-## Evidence and labs
+1. **Observe** captures one immutable snapshot with path key, physical path
+   instance, local health, peer usage, metric provenance, freshness, queue,
+   flight, and relevant generations.
+2. **Decide** runs pure available-first eligibility and metric ranking. It
+   returns identities and bounds, not live handles.
+3. **Apply** revalidates the exact path instance, data frontier, evidence,
+   generations, window, and queue credit before committing and enqueueing.
 
-`lab/run-heterogeneous-ablation.sh` is the main topology runner. `docs/LAB.md`
-defines controls and result semantics; `docs/PERF.md` defines profiling;
-`docs/BENCHMARKS.md` records reference interpretation. Lab families are separate
-evidence tracks: clean release performance, diagnostic causal traces,
-unconstrained ceilings, shaped daily links, faults, real-Internet checks, TUN,
-and TCP-only/UDP-only/mixed variants.
+Failure or cancellation leaves no partial flight, load, or queue reservation.
+RAII claims and explicit rollback balance every enqueue, dequeue, receiver
+drop, timeout, and task exit.
 
-Use a diagnostic row to prove the intended state transition before comparing
-throughput. Use matched, instrumentation-free release rows for performance
-claims. A poor row should first identify the violated ownership, evidence,
-queue, or clock contract; repeating the same row without a new hypothesis is
-not an optimization iteration.
+Latency-sensitive demand prefers completion time and low queue/reorder cost.
+Sustained throughput demand may use several available paths when measured
+delivery opportunity exceeds the ordering and queue cost. A backup path is not
+assigned an additive score penalty; it is considered in the second selection
+set. This keeps preference semantics separate from metric ranking.
 
-The current accepted same-condition TCP request result is Iteration 109. Its
-diagnostics-disabled, exact 18-second upload rows use two logical flows and five
-500 Mbps, 180 ms, 1 ms jitter, zero-loss paths: multipath reaches 691.368 Mbps
-against 314.999 Mbps single-path, or 2.195x overall. The broad `[9,18)` and
-supporting `[15,18)` ratios are 2.935x and 2.409x. Client transmit shares are
-37.15%, 33.44%, 4.78%, 10.47%, and 14.17%. Relative to Iteration 69 under the
-same profile, multipath changes +10.38% overall, +11.77% broad, and -6.36% late;
-the `[9,15)` window improves 22.02%, so the lower late burst reflects earlier
-delivery rather than a hidden aggregate loss. The matched single control changes
--0.32%, +0.56%, and +3.53%. This proves the
-final TCP ownership/calibration model did not silently trade away the retained
-multi-flow aggregation result. It does not prove one-flow striping, QUIC or
-mixed-carrier aggregation, real-Internet performance, failover, or current
-MPTCP/Hysteria2 superiority.
+The immutable snapshot keeps carrier queue/flight separate from MPP
+queue/Data-ACK flight. Those views may overlap, so completion ranking uses their
+maximum rather than their sum. Response ranking removes the connection-wide MPP
+queue shared by every candidate and keeps only exact unique data on the selected
+output as its data-level completion debt.
 
-The current accepted same-condition TCP response result is Iteration 128. Its
-diagnostics-disabled one-flow 18-second pair reaches 236.774 Mbps multipath
-against 112.274 Mbps single, or 2.109x overall and 2.368x in the final three
-seconds; two paths carry 75.5/24.5% of material server bytes. The adjacent slow
-single is the host-epoch control, so this result supersedes the earlier 1.060x
-normalized gain without claiming an absolute wire ceiling. Iterations 126/127
-causally show why: removing a 5.3-8.8 second exclusive endpoint-only
-calibration raises diagnostic goodput 59.6% and starts ordinary alternate work
-immediately after exact startup drain. Server CPU, memory, and gap cost remain
-non-ideal, and QUIC, mixed-carrier, fault, real-Internet, TUN, and
-external-baseline cohorts remain unproven by this row.
+Loss, ECN, jitter, and queue evidence can change ranking and reordering cost.
+It never shrinks an MPP service quantum, creates a congestion window, or paces
+a carrier; native TCP and QUIC remain the only congestion controllers.
 
-The separate Iteration 129 heterogeneous guard reaches 104.531 Mbps multipath
-versus 110.489 Mbps on the adjacent fat single path. It improves substantially
-over preserved one-flow history and reduces first-body/read-gap latency, but
-only low-latency and balanced paths carry material bytes. Iterations 131-134
-proved that serially giving later cold TCP paths ordered startup ownership is
-not the answer: fat-path use becomes material, but read gaps reach
-0.525-1.269 seconds. Those experiments were rejected. The missing boundary is
-carrier-native TCP capacity evidence; product ordering must not be used as a
-surrogate probe clock. QUIC already owns equivalent evidence in its native
-packet-ACK controller and remains separate.
+## Identity and ownership
 
-Iteration 135 verifies the negative boundary with one 200 Mbps, 20 ms Service
-and four 50 Mbps, 420 ms, 10%-loss optional paths. Multipath/single is
-182.247/182.777 Mbps with 0.251/0.247 second maximum gaps, and all slow
-optionals remain control-only. The startup completion gate therefore prevents a
-clearly worse candidate from receiving the temporary Service prior.
+Logical path identity is `(underlay, path_id)`. Physical carrier identity adds
+`path_instance_id`. Evidence, flights, commands, and usage sequences cannot
+cross a reconnect merely because a numeric path ID was reused.
 
-The staged TCP-to-QUIC placement row keeps an attached UDP transport warm while
-management excludes it from scheduling. This isolates proof and ownership from
-connection recovery. Blackhole/reconnect rows remain a separate fault track.
+Stream membership adds a separate incarnation. Request-side scheduling and
+flight ownership carry `(path_instance_id, attachment_id)`. Response new-data
+dispatch carries `(path_instance_id, output_incarnation)` plus the observed
+response-model generation and revalidates all three before queue reservation.
+The committed response flight retains the logical path key plus the
+stream-unique output incarnation; the physical instance was the apply-time
+fence, not a duplicated ledger field. Replacing a carrier invalidates physical
+evidence, while detach and reattach invalidates that stream's ownership even if
+the carrier itself stayed live.
+
+One configured reliable TCP path owns one live carrier actor. `TrafficClass`
+changes queue priority and scheduling demand; it never creates a second hidden
+carrier with the same logical identity. TCP datagram associations use separate
+short-lived sessions and keep their `PATH_STATUS` sequence locally, so they do
+not replace the reliable carrier's physical identity.
+
+The initiator chooses the wire `path_id`; the receiver treats it as opaque.
+Node composition retains the accepting listener's endpoint-local configuration
+ordinal through carrier registration. Startup hints and the full local
+`PathPolicy` come from that listener, never from a peer-ID lookup. Local
+`backup` is additionally advertised as directional `PathUsage`; the remaining
+policy fields stay off wire and apply only to the local sender.
+
+A stream attachment identifies membership and output reachability for one
+exact carrier instance. It does not own the target connection or assign a
+persistent data role. On the server, one session registry owns the target
+stream binding; TCP and QUIC carrier actors attach to that binding through
+typed ports and never create duplicate target relays.
+
+Shared locks protect one coherent aggregate. Scheduling does not hold them
+while doing I/O. Hot frame and ACK paths use local actor state or immutable
+snapshots rather than a session-wide lock for each packet.
+
+The authenticated TCP path session is its control channel. QUIC retains the
+first authenticated bidirectional stream as a connection control stream and
+uses later streams for product flows. Manual peer status uses these existing
+channels symmetrically; it does not create a diagnostic transport or convert
+remote observations into local path evidence.
+
+The response output carrying the contiguous Data Sequence frontier is governed
+by the shared MPP receive window and native carrier credit. An additional
+output without durable, unambiguous Data ACK coverage receives at most one
+bounded startup flight. Exact Data ACK coverage of original transmissions must
+reach the startup sample floor before that additional output uses the mature
+connection-window model. Native TCP ACK or QUIC packet-ACK evidence can
+describe carrier service, but cannot by itself establish MPP progress.
+
+The long-lived reliable-carrier owner publishes an unexpected loss with the
+exact physical instance immediately. Relay cleanup can observe the same loss
+later, but the duplicate remains retired even if a separate reachability probe
+recovers logical path health. A newer authenticated carrier installation
+supersedes older reports, so delayed status or teardown cannot poison its health
+projection. TCP datagram associations report their own attempt failures through
+the association owner rather than claiming another carrier's lifetime.
+
+## Platform boundary
+
+Protocol, models, scheduling, stream ownership, and relay behavior are
+platform-neutral. Target-specific code is limited to host adapters:
+
+- Linux may expose optional `TCP_INFO` evidence through
+  `src/transport/tcp_telemetry/linux.rs`.
+- Other platforms receive the portable `None` capability and continue with
+  MPP Data ACKs, configured hints, and carrier-neutral observations.
+- TUN acquisition and carrier-network selection are injected host
+  capabilities. Android hosts must establish the VPN descriptor and protect or
+  bind carrier sockets outside the catch-all route.
+
+No scheduler eligibility rule may require Linux telemetry, inspect an
+interface name, or branch on the operating system. Windows client with Linux
+server is a primary design target; Linux, macOS, Windows, and the Android
+library target must compile without changing the protocol model.
+
+TCP and QUIC evidence remain typed by provenance. Request TCP capacity uses a
+receiver-confirmed receipt and optional exact-socket telemetry; request QUIC
+capacity uses fresh native packet-ACK-derived evidence and an independent proof
+lifetime. For response bulk readiness, locally sourced ACK-derived carrier
+evidence is authoritative for QUIC, while durable unambiguous Data ACK progress
+may additionally establish a per-flow TCP MPP rate. Peer metric hints do
+not mint either proof.
+
+## Evidence rule
+
+Deterministic simulator and benchmark gates test models, not the deployed
+runtime. Runtime changes require focused tests plus matched end-to-end labs:
+
+- single path against direct and applicable VMess/Hysteria2/MPTCP baselines;
+- multipath aggregation and failover;
+- upload and download;
+- latency-sensitive and sustained bulk demand;
+- TCP-only, QUIC-only, and mixed carriers; and
+- shaped, unconstrained, fault, and separately recorded real-Internet cohorts.
+
+Diagnostics establish causality. Instrumentation-free matched rows establish
+performance. Historical protocol-v1 rows are references only and cannot prove
+protocol-v2 behavior.

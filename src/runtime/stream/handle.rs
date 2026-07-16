@@ -1,11 +1,11 @@
 use super::response::{
-    CarrierPathFlight, ResponseStreamBinding, product_flights_have_recent_repair_overlap,
+    CarrierPathFlight, ResponseStreamBinding, product_flights_have_recent_reinjection_overlap,
     release_carrier_path_flight_ranges,
 };
 use crate::model::capacity::{
     PATH_OPEN_SCORE_BYTES, PathRateSample, RELIABLE_INITIAL_WINDOW_PACKETS,
-    bbr_inflight_target_bytes, product_delivery_samples_override_startup_prior,
-    reliable_subflow_startup_sample_limit_bytes,
+    data_level_service_window_bytes, product_delivery_samples_override_startup_prior,
+    reliable_path_startup_sample_limit_bytes,
 };
 use crate::model::path::CarrierPathKey;
 use crate::model::work::{CarrierWorkKind, ReliableWorkClass};
@@ -25,7 +25,7 @@ use crate::runtime::path::proof::{
     enqueue_path_proof_frame, enqueue_stream_ordered_path_proof_frame,
 };
 use crate::runtime::path::{OpenedReliableCarrierStream, RequestTcpCapacityProbeLease};
-use crate::scheduler::{FlowLane, PathRateScope, PathSnapshot};
+use crate::scheduler::{PathRateScope, PathSnapshot, TrafficClass};
 use std::collections::BTreeMap;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -33,13 +33,13 @@ use tokio::sync::{Notify, mpsc, watch};
 
 /// Product reliable stream handle after an OPEN_STREAM has been accepted.
 ///
-/// The handle owns the stream ID, flow lane, product frame receive queue, and
+/// The handle owns the stream ID, current traffic class, product frame receive queue, and
 /// response output binding for this stream. The carrier is only the emission
-/// target; product offsets and repair semantics stay above TCP/UDP engines.
+/// target; product offsets and reinjection semantics stay above TCP/UDP engines.
 pub(in crate::runtime) struct ReliablePathStream {
     pub(in crate::runtime) stream_id: StreamId,
     pub(in crate::runtime) max_offset: u64,
-    pub(in crate::runtime) lane: FlowLane,
+    pub(in crate::runtime) lane: TrafficClass,
     pub(in crate::runtime) underlay: UnderlayProtocol,
     pub(in crate::runtime) max_frame_payload_bytes: usize,
     pub(in crate::runtime) output: ReliablePathStreamOutput,
@@ -100,52 +100,52 @@ impl ReliablePathStream {
         match &self.output {
             ReliablePathStreamOutput::Fixed(fixed) => fixed
                 .commands()
-                .try_enqueue_admitted_frame(frame, FlowLane::Control),
+                .try_enqueue_admitted_frame(frame, TrafficClass::Control),
             ReliablePathStreamOutput::Switchable(_) => {
                 Err(RuntimeError::Protocol("request relay path is not fixed"))
             }
         }
     }
 
-    pub(in crate::runtime) fn current_lane(&self) -> FlowLane {
+    pub(in crate::runtime) fn current_lane(&self) -> TrafficClass {
         self.output.current_lane(self.lane)
     }
 
     pub(in crate::runtime) fn send_path_snapshot(
         &self,
-        lane: FlowLane,
+        lane: TrafficClass,
         payload_bytes: usize,
     ) -> Option<PathSnapshot> {
         self.output.send_path_snapshot(lane, payload_bytes)
     }
 
-    pub(in crate::runtime) fn tail_repair_snapshot(
+    pub(in crate::runtime) fn tail_reinjection_snapshot(
         &self,
         ack_frontier: u64,
-        lane: FlowLane,
+        lane: TrafficClass,
         payload_bytes: usize,
     ) -> Option<PathSnapshot> {
         self.output
-            .tail_repair_snapshot(ack_frontier, lane)
+            .tail_reinjection_snapshot(ack_frontier, lane)
             .or_else(|| self.send_path_snapshot(lane, payload_bytes))
     }
 
-    pub(in crate::runtime) fn tail_repair_owner_underlay(
+    pub(in crate::runtime) fn tail_reinjection_original_underlay(
         &self,
         ack_frontier: u64,
     ) -> Option<UnderlayProtocol> {
-        self.output.tail_repair_owner_underlay(ack_frontier)
+        self.output.tail_reinjection_original_underlay(ack_frontier)
     }
 
-    pub(in crate::runtime) fn request_active_underlay(&self) -> Option<UnderlayProtocol> {
-        self.output.request_active_underlay()
+    pub(in crate::runtime) fn request_feedback_underlay(&self) -> Option<UnderlayProtocol> {
+        self.output.request_feedback_underlay()
     }
 
-    pub(in crate::runtime) fn request_active_path_snapshot(
+    pub(in crate::runtime) fn request_feedback_path_snapshot(
         &self,
-        lane: FlowLane,
+        lane: TrafficClass,
     ) -> Option<PathSnapshot> {
-        self.output.request_active_path_snapshot(lane)
+        self.output.request_feedback_path_snapshot(lane)
     }
 
     pub(in crate::runtime) fn has_output_incarnation(
@@ -168,11 +168,7 @@ impl ReliablePathStream {
         self.output.capacity_notifies()
     }
 
-    pub(in crate::runtime) fn response_service_handoff_drain_active(&self) -> bool {
-        self.output.response_service_handoff_drain_active()
-    }
-
-    pub(in crate::runtime) fn set_lane(&mut self, lane: FlowLane) {
+    pub(in crate::runtime) fn set_lane(&mut self, lane: TrafficClass) {
         self.lane = lane;
         self.output.set_lane(lane);
     }
@@ -181,47 +177,37 @@ impl ReliablePathStream {
         self.output.release_normalized_acked_ranges(ranges);
     }
 
-    pub(in crate::runtime) fn has_recent_live_repair_flight_overlap(
+    pub(in crate::runtime) fn has_recent_reinjection_overlap(
         &self,
         frame: &Frame,
         retry_after: Duration,
     ) -> bool {
         self.output
-            .has_recent_live_repair_flight_overlap(frame, retry_after)
+            .has_recent_reinjection_overlap(frame, retry_after)
     }
 
-    pub(in crate::runtime) fn has_multipath_repair_alternative(&self) -> bool {
-        self.output.has_multipath_repair_alternative()
+    pub(in crate::runtime) fn has_multipath_reinjection_alternative(&self) -> bool {
+        self.output.has_multipath_reinjection_alternative()
     }
 
-    pub(in crate::runtime) fn has_repair_output_for_frame(&self, frame: &Frame) -> bool {
-        self.output.has_repair_output_for_frame(frame)
+    pub(in crate::runtime) fn has_reinjection_path_for_frame(&self, frame: &Frame) -> bool {
+        self.output.has_reinjection_path_for_frame(frame)
     }
 
-    pub(in crate::runtime) fn has_live_owner_tail_repair_output_for_frame(
+    pub(in crate::runtime) fn has_tail_reinjection_output_for_frame(&self, frame: &Frame) -> bool {
+        self.output.has_tail_reinjection_output_for_frame(frame)
+    }
+
+    pub(in crate::runtime) fn uncovered_failed_original_ranges(&self) -> Vec<OffsetRange> {
+        self.output.uncovered_failed_original_ranges()
+    }
+
+    pub(in crate::runtime) fn has_untracked_data_reinjection_path_for_frame(
         &self,
         frame: &Frame,
     ) -> bool {
         self.output
-            .has_live_owner_tail_repair_output_for_frame(frame)
-    }
-
-    pub(in crate::runtime) fn has_failed_owner_repair_output_for_frame(
-        &self,
-        frame: &Frame,
-    ) -> bool {
-        self.output.has_failed_owner_repair_output_for_frame(frame)
-    }
-
-    pub(in crate::runtime) fn has_unknown_owner_repair_output_for_frame(
-        &self,
-        frame: &Frame,
-    ) -> bool {
-        self.output.has_unknown_owner_repair_output_for_frame(frame)
-    }
-
-    pub(in crate::runtime) fn can_attempt_failed_owner_tail_repair(&self) -> bool {
-        matches!(self.output, ReliablePathStreamOutput::Switchable(_))
+            .has_untracked_data_reinjection_path_for_frame(frame)
     }
 
     pub(in crate::runtime) async fn send_detach(&self) {
@@ -232,7 +218,7 @@ impl ReliablePathStream {
         self.output.close_stream(self.stream_id).await;
     }
 
-    pub(in crate::runtime) async fn close_ordered(&self, lane: FlowLane) {
+    pub(in crate::runtime) async fn close_ordered(&self, lane: TrafficClass) {
         self.output.close_stream_ordered(self.stream_id, lane).await;
     }
 
@@ -246,7 +232,7 @@ impl ReliablePathStream {
 pub(in crate::runtime) struct ReliablePathStreamHandle {
     pub(in crate::runtime) stream_id: StreamId,
     pub(in crate::runtime) max_offset: u64,
-    pub(in crate::runtime) lane: FlowLane,
+    pub(in crate::runtime) lane: TrafficClass,
     pub(in crate::runtime) underlay: UnderlayProtocol,
     pub(in crate::runtime) max_frame_payload_bytes: usize,
     pub(in crate::runtime) output: ReliablePathStreamOutput,
@@ -263,7 +249,7 @@ impl ReliablePathStreamHandle {
 
     pub(in crate::runtime) fn enqueue_stream_ordered_path_proof(
         &self,
-        lane: FlowLane,
+        lane: TrafficClass,
     ) -> Result<Option<u64>, RuntimeError> {
         self.output.enqueue_stream_ordered_path_proof(lane)
     }
@@ -302,14 +288,18 @@ impl ReliablePathStreamHandle {
         }
     }
 
-    pub(in crate::runtime) fn can_enqueue_frame_now(&self, frame: &Frame, lane: FlowLane) -> bool {
+    pub(in crate::runtime) fn can_enqueue_frame_now(
+        &self,
+        frame: &Frame,
+        lane: TrafficClass,
+    ) -> bool {
         self.output.can_enqueue_frame_now(frame, lane)
     }
 
     pub(in crate::runtime) fn can_enqueue_work_lane_now(
         &self,
         work_lane: ReliableWorkClass,
-        relay_lane: FlowLane,
+        relay_lane: TrafficClass,
     ) -> bool {
         self.output
             .can_enqueue_lane_now(reliable_work_lane_to_carrier_lane(work_lane, relay_lane))
@@ -334,7 +324,7 @@ pub(in crate::runtime) enum ReliablePathStreamOutput {
     /// is bound to the currently opened carrier association.
     Fixed(Arc<FixedReliablePathOutput>),
     /// A switchable response binding, used by server-side streams that may send
-    /// later response bytes or repair ranges over another joined carrier path.
+    /// later response bytes or reinjection ranges over another joined carrier path.
     Switchable(Arc<ResponseStreamBinding>),
 }
 
@@ -349,7 +339,7 @@ pub(in crate::runtime) struct FixedReliablePathOutput {
 #[derive(Default)]
 struct FixedReliablePathModel {
     bytes_in_flight: u64,
-    product_queue_bytes: u64,
+    data_level_queue_bytes: u64,
     product_progress_bytes: u64,
     product_progress_rate_bps: Option<f64>,
     delivery_rate_bps: Option<f64>,
@@ -404,7 +394,7 @@ impl FixedReliablePathOutput {
         enqueue_path_proof_frame(&self.commands, self.key.path_id, self.mux_limits)
     }
 
-    fn enqueue_stream_ordered_path_proof(&self, lane: FlowLane) -> Result<u64, RuntimeError> {
+    fn enqueue_stream_ordered_path_proof(&self, lane: TrafficClass) -> Result<u64, RuntimeError> {
         enqueue_stream_ordered_path_proof_frame(
             &self.commands,
             self.key.path_id,
@@ -437,16 +427,16 @@ impl FixedReliablePathOutput {
         snapshot.rate_scope = rate_scope;
         snapshot.product_progress_rate_bps = model.product_progress_rate_bps;
         snapshot.has_durable_product_progress = model.product_progress_bytes
-            >= reliable_subflow_startup_sample_limit_bytes(self.mux_limits);
+            >= reliable_path_startup_sample_limit_bytes(self.mux_limits);
         snapshot.pacing_rate_bps = delivery_rate_bps
             .max(model.product_progress_rate_bps.unwrap_or(0.0))
             .max(1.0);
         snapshot.queue_bytes = self.commands.pending_bytes();
-        snapshot.product_queue_bytes = model.product_queue_bytes;
+        snapshot.data_level_queue_bytes = model.data_level_queue_bytes;
         snapshot.bytes_in_flight = 0;
-        snapshot.product_bytes_in_flight = model.bytes_in_flight;
-        snapshot.inflight_limit_bytes = snapshot.inflight_limit_bytes.max(
-            bbr_inflight_target_bytes(snapshot, FlowLane::Throughput, self.mux_limits)
+        snapshot.data_level_bytes_in_flight = model.bytes_in_flight;
+        snapshot.data_level_limit_bytes = snapshot.data_level_limit_bytes.max(
+            data_level_service_window_bytes(snapshot, TrafficClass::Throughput, self.mux_limits)
                 .ceil()
                 .max(PATH_OPEN_SCORE_BYTES as f64) as u64,
         );
@@ -455,22 +445,22 @@ impl FixedReliablePathOutput {
         .clamp(0.0, 1.0);
         snapshot.confidence = snapshot.confidence.max(learned_confidence);
         snapshot.app_limited = model.bytes_in_flight == 0
-            && model.product_queue_bytes == 0
+            && model.data_level_queue_bytes == 0
             && self.commands.pending_bytes() == 0;
         snapshot
     }
 
     fn set_sender_queue_bytes(&self, bytes: usize) {
         let mut model = self.model.lock().expect("fixed reliable path model lock");
-        model.product_queue_bytes = bytes as u64;
+        model.data_level_queue_bytes = bytes as u64;
     }
 
-    pub(in crate::runtime) fn record_owner_flight(&self, frame: &Frame) {
-        self.record_product_flight(frame, CarrierWorkKind::OwnerData)
+    pub(in crate::runtime) fn record_original_flight(&self, frame: &Frame) {
+        self.record_product_flight(frame, CarrierWorkKind::OriginalData)
     }
 
-    pub(in crate::runtime) fn record_repair_flight(&self, frame: &Frame) {
-        self.record_product_flight(frame, CarrierWorkKind::RepairData)
+    pub(in crate::runtime) fn record_reinjected_flight(&self, frame: &Frame) {
+        self.record_product_flight(frame, CarrierWorkKind::ReinjectedData)
     }
 
     fn record_product_flight(&self, frame: &Frame, kind: CarrierWorkKind) {
@@ -538,12 +528,12 @@ impl FixedReliablePathOutput {
             .saturating_add(released_proven_flights);
     }
 
-    fn has_recent_repair_flight_overlap(&self, frame: &Frame, retry_after: Duration) -> bool {
+    fn has_recent_reinjection_flight_overlap(&self, frame: &Frame, retry_after: Duration) -> bool {
         let Some((start, end, _)) = reliable_stream_frame_extent(frame) else {
             return false;
         };
         let model = self.model.lock().expect("fixed reliable path model lock");
-        product_flights_have_recent_repair_overlap(
+        product_flights_have_recent_reinjection_overlap(
             &model.flights,
             start,
             end,
@@ -595,17 +585,14 @@ impl ReliablePathStreamOutput {
         ))
     }
 
-    pub(in crate::runtime) fn can_enqueue_frame_now(&self, frame: &Frame, lane: FlowLane) -> bool {
+    pub(in crate::runtime) fn can_enqueue_frame_now(
+        &self,
+        frame: &Frame,
+        lane: TrafficClass,
+    ) -> bool {
         match self {
             Self::Fixed(fixed) => fixed.commands().can_enqueue_frame_now(frame, lane),
             Self::Switchable(_) => true,
-        }
-    }
-
-    fn response_service_handoff_drain_active(&self) -> bool {
-        match self {
-            Self::Fixed(_) => false,
-            Self::Switchable(binding) => binding.response_service_handoff_drain_active(),
         }
     }
 
@@ -618,7 +605,7 @@ impl ReliablePathStreamOutput {
 
     fn enqueue_stream_ordered_path_proof(
         &self,
-        lane: FlowLane,
+        lane: TrafficClass,
     ) -> Result<Option<u64>, RuntimeError> {
         match self {
             Self::Fixed(fixed) => fixed.enqueue_stream_ordered_path_proof(lane).map(Some),
@@ -626,7 +613,7 @@ impl ReliablePathStreamOutput {
         }
     }
 
-    pub(in crate::runtime) fn can_enqueue_lane_now(&self, lane: FlowLane) -> bool {
+    pub(in crate::runtime) fn can_enqueue_lane_now(&self, lane: TrafficClass) -> bool {
         match self {
             Self::Fixed(fixed) => fixed.commands().can_enqueue_lane_now(lane),
             Self::Switchable(_) => false,
@@ -669,7 +656,7 @@ impl ReliablePathStreamOutput {
     pub(in crate::runtime) async fn close_stream_ordered(
         &self,
         stream_id: StreamId,
-        lane: FlowLane,
+        lane: TrafficClass,
     ) {
         match self {
             Self::Fixed(fixed) => {
@@ -686,7 +673,7 @@ impl ReliablePathStreamOutput {
         &self,
         stream_id: StreamId,
         reason: ResetReason,
-        lane: FlowLane,
+        lane: TrafficClass,
     ) {
         match self {
             Self::Fixed(fixed) => {
@@ -707,7 +694,7 @@ impl ReliablePathStreamOutput {
         }
     }
 
-    pub(in crate::runtime) fn current_lane(&self, fallback: FlowLane) -> FlowLane {
+    pub(in crate::runtime) fn current_lane(&self, fallback: TrafficClass) -> TrafficClass {
         match self {
             Self::Fixed(_) => fallback,
             Self::Switchable(binding) => binding.lane(),
@@ -716,7 +703,7 @@ impl ReliablePathStreamOutput {
 
     pub(in crate::runtime) fn send_path_snapshot(
         &self,
-        lane: FlowLane,
+        lane: TrafficClass,
         payload_bytes: usize,
     ) -> Option<PathSnapshot> {
         match self {
@@ -729,47 +716,47 @@ impl ReliablePathStreamOutput {
         }
     }
 
-    pub(in crate::runtime) fn tail_repair_snapshot(
+    pub(in crate::runtime) fn tail_reinjection_snapshot(
         &self,
         ack_frontier: u64,
-        lane: FlowLane,
+        lane: TrafficClass,
     ) -> Option<PathSnapshot> {
         match self {
             Self::Fixed(fixed) => {
                 let _ = (ack_frontier, lane);
                 Some(fixed.send_path_snapshot())
             }
-            Self::Switchable(binding) => binding.tail_repair_snapshot(ack_frontier, lane),
+            Self::Switchable(binding) => binding.tail_reinjection_snapshot(ack_frontier, lane),
         }
     }
 
-    pub(in crate::runtime) fn tail_repair_owner_underlay(
+    pub(in crate::runtime) fn tail_reinjection_original_underlay(
         &self,
         ack_frontier: u64,
     ) -> Option<UnderlayProtocol> {
         match self {
             Self::Fixed(fixed) => Some(fixed.key().underlay),
-            Self::Switchable(binding) => binding.tail_repair_owner_underlay(ack_frontier),
+            Self::Switchable(binding) => binding.tail_reinjection_original_underlay(ack_frontier),
         }
     }
 
-    pub(in crate::runtime) fn request_active_underlay(&self) -> Option<UnderlayProtocol> {
+    pub(in crate::runtime) fn request_feedback_underlay(&self) -> Option<UnderlayProtocol> {
         match self {
             Self::Fixed(fixed) => Some(fixed.key().underlay),
-            Self::Switchable(binding) => binding.request_active_underlay(),
+            Self::Switchable(binding) => binding.request_feedback_underlay(),
         }
     }
 
-    pub(in crate::runtime) fn request_active_path_snapshot(
+    pub(in crate::runtime) fn request_feedback_path_snapshot(
         &self,
-        lane: FlowLane,
+        lane: TrafficClass,
     ) -> Option<PathSnapshot> {
         match self {
             Self::Fixed(fixed) => {
                 let _ = lane;
                 Some(fixed.send_path_snapshot())
             }
-            Self::Switchable(binding) => binding.request_active_path_snapshot(lane),
+            Self::Switchable(binding) => binding.request_feedback_path_snapshot(lane),
         }
     }
 
@@ -798,7 +785,7 @@ impl ReliablePathStreamOutput {
         }
     }
 
-    pub(in crate::runtime) fn set_lane(&self, lane: FlowLane) {
+    pub(in crate::runtime) fn set_lane(&self, lane: TrafficClass) {
         if let Self::Switchable(binding) = self {
             binding.set_lane(lane);
         }
@@ -811,71 +798,65 @@ impl ReliablePathStreamOutput {
         }
     }
 
-    pub(in crate::runtime) fn has_recent_live_repair_flight_overlap(
+    pub(in crate::runtime) fn has_recent_reinjection_overlap(
         &self,
         frame: &Frame,
         retry_after: Duration,
     ) -> bool {
         match self {
-            Self::Fixed(fixed) => fixed.has_recent_repair_flight_overlap(frame, retry_after),
-            Self::Switchable(binding) => {
-                binding.has_recent_live_repair_flight_overlap(frame, retry_after)
-            }
+            Self::Fixed(fixed) => fixed.has_recent_reinjection_flight_overlap(frame, retry_after),
+            Self::Switchable(binding) => binding.has_recent_reinjection_overlap(frame, retry_after),
         }
     }
 
-    pub(in crate::runtime) fn has_multipath_repair_alternative(&self) -> bool {
+    pub(in crate::runtime) fn has_multipath_reinjection_alternative(&self) -> bool {
         match self {
             Self::Fixed(_) => false,
-            Self::Switchable(binding) => binding.has_multipath_repair_alternative(),
+            Self::Switchable(binding) => binding.has_multipath_reinjection_alternative(),
         }
     }
 
-    pub(in crate::runtime) fn has_repair_output_for_frame(&self, frame: &Frame) -> bool {
+    pub(in crate::runtime) fn has_reinjection_path_for_frame(&self, frame: &Frame) -> bool {
         match self {
             Self::Fixed(_) => true,
-            Self::Switchable(binding) => binding.has_repair_output_for_frame(frame),
+            Self::Switchable(binding) => binding.has_reinjection_path_for_frame(frame),
         }
     }
 
-    pub(in crate::runtime) fn has_live_owner_tail_repair_output_for_frame(
+    pub(in crate::runtime) fn has_tail_reinjection_output_for_frame(&self, frame: &Frame) -> bool {
+        match self {
+            Self::Fixed(_) => false,
+            Self::Switchable(binding) => binding.has_tail_reinjection_output_for_frame(frame),
+        }
+    }
+
+    pub(in crate::runtime) fn uncovered_failed_original_ranges(&self) -> Vec<OffsetRange> {
+        match self {
+            Self::Fixed(_) => Vec::new(),
+            Self::Switchable(binding) => binding.uncovered_failed_original_ranges(),
+        }
+    }
+
+    pub(in crate::runtime) fn has_untracked_data_reinjection_path_for_frame(
         &self,
         frame: &Frame,
     ) -> bool {
         match self {
             Self::Fixed(_) => false,
-            Self::Switchable(binding) => binding.has_live_owner_tail_repair_output_for_frame(frame),
-        }
-    }
-
-    pub(in crate::runtime) fn has_failed_owner_repair_output_for_frame(
-        &self,
-        frame: &Frame,
-    ) -> bool {
-        match self {
-            Self::Fixed(_) => false,
-            Self::Switchable(binding) => binding.has_failed_owner_repair_output_for_frame(frame),
-        }
-    }
-
-    pub(in crate::runtime) fn has_unknown_owner_repair_output_for_frame(
-        &self,
-        frame: &Frame,
-    ) -> bool {
-        match self {
-            Self::Fixed(_) => false,
-            Self::Switchable(binding) => binding.has_unknown_owner_repair_output_for_frame(frame),
+            Self::Switchable(binding) => {
+                binding.has_untracked_data_reinjection_path_for_frame(frame)
+            }
         }
     }
 }
 
 pub(in crate::runtime) fn reliable_work_lane_to_carrier_lane(
     work_lane: ReliableWorkClass,
-    relay_lane: FlowLane,
-) -> FlowLane {
+    relay_lane: TrafficClass,
+) -> TrafficClass {
     match work_lane {
-        ReliableWorkClass::Control => FlowLane::Control,
-        ReliableWorkClass::Repair => reliable_path_stream_ordered_queue_lane(),
+        ReliableWorkClass::Control => TrafficClass::Control,
+        ReliableWorkClass::Reinjection => reliable_path_stream_ordered_queue_lane(),
         ReliableWorkClass::Data => relay_lane,
     }
 }

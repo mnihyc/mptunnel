@@ -8,11 +8,12 @@ use super::io::{
 };
 #[cfg(feature = "lab-diagnostics")]
 use crate::lab_diagnostics::lab_diagnostic;
-use crate::model::capacity::reliable_capacity_calibration_session_limit_bytes;
+use crate::model::capacity::reliable_capacity_measurement_session_limit_bytes;
+use crate::model::path::CarrierPathInstanceId;
 use crate::mux::MuxLimits;
 use crate::protocol::codec::CodecLimits;
 use crate::protocol::path_capacity::CapacityReceiveTracker;
-use crate::protocol::{Frame, PathId, StreamId};
+use crate::protocol::{Frame, PathId, PathUsage, StreamId, UnderlayProtocol};
 use crate::runtime::error::RuntimeError;
 use crate::runtime::path::commands::{
     ReliablePathCommandReceivers, recv_reliable_path_command, reliable_path_receivers_closed,
@@ -24,11 +25,13 @@ use std::sync::Arc;
 use std::time::Instant;
 use tokio::sync::mpsc;
 
+#[allow(clippy::too_many_arguments)]
 pub(super) async fn run_client_udp_stream(
     mut send: UdpPathSendStream,
     recv: UdpPathRecvStream,
     stream_id: StreamId,
     path_index: usize,
+    path_instance_id: CarrierPathInstanceId,
     codec_limits: CodecLimits,
     mux_limits: MuxLimits,
     reader_queue_size: usize,
@@ -41,7 +44,7 @@ pub(super) async fn run_client_udp_stream(
     let mut pending_frames = Vec::<Frame>::new();
     let mut path_proofs = PathProofTracker::default();
     let mut capacity_receive = CapacityReceiveTracker::new(
-        reliable_capacity_calibration_session_limit_bytes(mux_limits),
+        reliable_capacity_measurement_session_limit_bytes(mux_limits),
     );
     let path_id = PathId(path_index as u16);
     loop {
@@ -53,12 +56,12 @@ pub(super) async fn run_client_udp_stream(
                     match frame {
                         Some(Ok(Frame::PathCapacityReceipt {
                             path_id: receipt_path_id,
-                            calibration_id,
+                            measurement_id,
                             received_payload_bytes,
                         })) => {
                             if receipt_path_id != path_id
                                 || !send.connection.confirm_capacity_probe_receipt(
-                                    calibration_id,
+                                    measurement_id,
                                     received_payload_bytes,
                                     Instant::now(),
                                 )
@@ -72,19 +75,19 @@ pub(super) async fn run_client_udp_stream(
                             lab_diagnostic(
                                 "request_quic_capacity_receipt",
                                 format_args!(
-                                    "phase=confirmed path_id={} stream_id={} calibration_id={} received_payload_bytes={}",
-                                    path_id.0, stream_id.0, calibration_id, received_payload_bytes,
+                                    "phase=confirmed path_id={} stream_id={} measurement_id={} received_payload_bytes={}",
+                                    path_id.0, stream_id.0, measurement_id, received_payload_bytes,
                                 ),
                             );
                         }
                         Some(Ok(Frame::PathCapacityData {
                             path_id: capacity_path_id,
-                            calibration_id,
+                            measurement_id,
                             payload,
                         })) => {
                             if capacity_path_id != path_id
                                 || capacity_receive
-                                    .record_data(calibration_id, payload.len())
+                                    .record_data(measurement_id, payload.len())
                                     .is_err()
                             {
                                 let _ = frames.send(Err(RuntimeError::Protocol(
@@ -95,7 +98,7 @@ pub(super) async fn run_client_udp_stream(
                         }
                         Some(Ok(Frame::PathCapacityFinish {
                             path_id: capacity_path_id,
-                            calibration_id,
+                            measurement_id,
                             payload_bytes,
                         })) => {
                             if capacity_path_id != path_id {
@@ -105,7 +108,7 @@ pub(super) async fn run_client_udp_stream(
                                 return;
                             }
                             let received_payload_bytes = match capacity_receive
-                                .finish(calibration_id, payload_bytes)
+                                .finish(measurement_id, payload_bytes)
                             {
                                 Ok(bytes) => bytes,
                                 Err(err) => {
@@ -116,7 +119,7 @@ pub(super) async fn run_client_udp_stream(
                             if let Err(err) = udp_path_write_capacity_receipt(
                                 &mut send,
                                 path_id,
-                                calibration_id,
+                                measurement_id,
                                 received_payload_bytes,
                                 codec_limits,
                             ).await {
@@ -222,12 +225,12 @@ pub(super) async fn run_client_udp_stream(
                     }
                     Some(Ok(Frame::PathCapacityData {
                         path_id: capacity_path_id,
-                        calibration_id,
+                        measurement_id,
                         payload,
                     })) => {
                         if capacity_path_id != path_id
                             || capacity_receive
-                                .record_data(calibration_id, payload.len())
+                                .record_data(measurement_id, payload.len())
                                 .is_err()
                         {
                             let _ = frames.send(Err(RuntimeError::Protocol(
@@ -239,17 +242,17 @@ pub(super) async fn run_client_udp_stream(
                         lab_diagnostic(
                             "quic_capacity_data_received",
                             format_args!(
-                                "role=client path_id={} stream_id={} calibration_id={} payload_bytes={}",
+                                "role=client path_id={} stream_id={} measurement_id={} payload_bytes={}",
                                 path_id.0,
                                 stream_id.0,
-                                calibration_id,
+                                measurement_id,
                                 payload.len(),
                             ),
                         );
                     }
                     Some(Ok(Frame::PathCapacityFinish {
                         path_id: capacity_path_id,
-                        calibration_id,
+                        measurement_id,
                         payload_bytes,
                     })) => {
                         if capacity_path_id != path_id {
@@ -259,7 +262,7 @@ pub(super) async fn run_client_udp_stream(
                             return;
                         }
                         let received_payload_bytes = match capacity_receive
-                            .finish(calibration_id, payload_bytes)
+                            .finish(measurement_id, payload_bytes)
                         {
                             Ok(bytes) => bytes,
                             Err(err) => {
@@ -270,7 +273,7 @@ pub(super) async fn run_client_udp_stream(
                         if let Err(err) = udp_path_write_capacity_receipt(
                             &mut send,
                             path_id,
-                            calibration_id,
+                            measurement_id,
                             received_payload_bytes,
                             codec_limits,
                         ).await {
@@ -281,10 +284,10 @@ pub(super) async fn run_client_udp_stream(
                         lab_diagnostic(
                             "quic_capacity_receipt",
                             format_args!(
-                                "role=client phase=sent path_id={} stream_id={} calibration_id={} received_payload_bytes={}",
+                                "role=client phase=sent path_id={} stream_id={} measurement_id={} received_payload_bytes={}",
                                 path_id.0,
                                 stream_id.0,
-                                calibration_id,
+                                measurement_id,
                                 received_payload_bytes,
                             ),
                         );
@@ -306,8 +309,21 @@ pub(super) async fn run_client_udp_stream(
                             return;
                         }
                     }
-                    Some(Ok(frame @ Frame::PathStatus { .. })) => {
-                        if frames.send(Ok(frame)).await.is_err() {
+                    Some(Ok(Frame::PathStatus {
+                        path_id: status_path_id,
+                        sequence,
+                        usage,
+                    })) => {
+                        if let Err(err) = apply_client_udp_path_status(
+                            &state,
+                            path_index,
+                            path_instance_id,
+                            path_id,
+                            status_path_id,
+                            sequence,
+                            usage,
+                        ) {
+                            let _ = frames.send(Err(err)).await;
                             return;
                         }
                     }
@@ -353,30 +369,54 @@ pub(super) async fn run_client_udp_stream(
                 }
             }
             command = recv_reliable_path_command(&mut commands), if command_may_recv => {
-                match command {
-                    Some(command) => {
-                        let result = drain_client_udp_stream_commands(
-                            command,
-                            &mut commands,
-                            &mut send,
-                            stream_id,
-                            codec_limits,
-                            mux_limits,
-                            &mut pending_frames,
-                            &mut path_proofs,
-                        ).await;
-                        match result {
-                            Ok(false) => {}
-                            Ok(true) => return,
-                            Err(err) => {
-                                let _ = frames.send(Err(err)).await;
-                                return;
-                            }
+                if let Some(command) = command {
+                    let result = drain_client_udp_stream_commands(
+                        command,
+                        &mut commands,
+                        &mut send,
+                        stream_id,
+                        codec_limits,
+                        mux_limits,
+                        &mut pending_frames,
+                        &mut path_proofs,
+                    ).await;
+                    match result {
+                        Ok(false) => {}
+                        Ok(true) => return,
+                        Err(err) => {
+                            let _ = frames.send(Err(err)).await;
+                            return;
                         }
                     }
-                    None => {}
                 }
             }
         }
     }
 }
+
+pub(super) fn apply_client_udp_path_status(
+    state: &ClientPathState,
+    path_index: usize,
+    path_instance_id: CarrierPathInstanceId,
+    expected_path_id: PathId,
+    status_path_id: PathId,
+    sequence: u64,
+    usage: PathUsage,
+) -> Result<bool, RuntimeError> {
+    if status_path_id != expected_path_id {
+        return Err(RuntimeError::Protocol(
+            "QUIC path usage advertisement path mismatch",
+        ));
+    }
+    Ok(state.update_peer_path_usage(
+        UnderlayProtocol::Udp,
+        path_index,
+        path_instance_id,
+        sequence,
+        usage,
+    ))
+}
+
+#[cfg(test)]
+#[path = "client_stream_test.rs"]
+mod tests;

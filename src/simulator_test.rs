@@ -1,5 +1,5 @@
 use super::*;
-use crate::protocol::UnderlayProtocol;
+use crate::protocol::{PathUsage, UnderlayProtocol};
 use crate::scheduler::PathSnapshot;
 
 fn mbps(value: f64) -> f64 {
@@ -23,10 +23,10 @@ fn simulator_keeps_interactive_traffic_off_bulk_queue() {
     ]);
 
     let bulk = simulator
-        .route(FlowLane::Throughput, 16 * 1024 * 1024)
+        .route(TrafficClass::Throughput, 16 * 1024 * 1024)
         .expect("bulk route");
     let interactive = simulator
-        .route(FlowLane::Latency, 1024)
+        .route(TrafficClass::Latency, 1024)
         .expect("interactive route");
 
     assert_eq!(bulk.path_id, PathId(1));
@@ -44,7 +44,7 @@ fn simulator_failure_injection_removes_dead_path() {
 
     simulator.advance_to(100.0);
     let send = simulator
-        .route(FlowLane::Latency, 512)
+        .route(TrafficClass::Latency, 512)
         .expect("survivor route");
 
     assert_eq!(send.path_id, PathId(1));
@@ -61,13 +61,34 @@ fn simulator_bulk_transfer_tracks_aggregation_efficiency() {
     ]);
 
     let transfer = simulator
-        .schedule_transfer(FlowLane::Throughput, 64 * 1024 * 1024, 1024 * 1024)
+        .schedule_transfer(TrafficClass::Throughput, 64 * 1024 * 1024, 1024 * 1024)
         .expect("bulk transfer");
     let path_bytes = transfer.path_bytes();
 
     assert!(path_bytes.get(&PathId(0)).copied().unwrap_or_default() > 0);
     assert!(path_bytes.get(&PathId(1)).copied().unwrap_or_default() > 0);
     assert_between(transfer.aggregation_efficiency(mbps(1000.0)), 0.70, 1.05);
+}
+
+#[test]
+fn simulator_capacity_excludes_backup_while_available_path_is_schedulable() {
+    let available = PathSnapshot::new(PathId(0), UnderlayProtocol::Udp, 40.0, mbps(100.0));
+    let mut backup = PathSnapshot::new(PathId(1), UnderlayProtocol::Udp, 10.0, mbps(400.0));
+    backup.peer_usage = Some(PathUsage::Backup);
+    let simulator = Simulator::new(vec![VirtualPath::new(available), VirtualPath::new(backup)]);
+
+    assert_eq!(simulator.healthy_capacity_bps(), mbps(100.0));
+}
+
+#[test]
+fn simulator_capacity_uses_backup_when_available_path_cannot_carry_bulk() {
+    let mut available = PathSnapshot::new(PathId(0), UnderlayProtocol::Udp, 20.0, mbps(100.0));
+    available.policy.bulk_allowed = false;
+    let mut backup = PathSnapshot::new(PathId(1), UnderlayProtocol::Udp, 80.0, mbps(400.0));
+    backup.peer_usage = Some(PathUsage::Backup);
+    let simulator = Simulator::new(vec![VirtualPath::new(available), VirtualPath::new(backup)]);
+
+    assert_eq!(simulator.healthy_capacity_bps(), mbps(400.0));
 }
 
 #[test]
@@ -80,17 +101,22 @@ fn simulator_reinjects_failed_chunks_and_reports_failover_gap() {
     ]);
 
     let transfer = simulator
-        .schedule_transfer_with_repair(FlowLane::Throughput, 4 * 1024 * 1024, 256 * 1024, 10.0)
-        .expect("repaired transfer");
+        .schedule_transfer_with_reinjection(
+            TrafficClass::Throughput,
+            4 * 1024 * 1024,
+            256 * 1024,
+            10.0,
+        )
+        .expect("reinjected transfer");
     let gap = transfer.failover_gap_ms.expect("failover gap");
 
-    assert!(transfer.repaired_chunks > 0);
+    assert!(transfer.reinjected_chunks > 0);
     assert_between(gap, 0.0, 500.0);
     assert!(
         transfer
             .attempts
             .iter()
-            .any(|attempt| attempt.repair_attempt > 0 && attempt.path_id == PathId(1))
+            .any(|attempt| attempt.reinjection_attempt > 0 && attempt.path_id == PathId(1))
     );
 }
 
@@ -105,7 +131,7 @@ fn simulator_measures_interactive_p95_under_bulk_load() {
     ]);
 
     simulator
-        .schedule_transfer(FlowLane::Throughput, 64 * 1024 * 1024, 1024 * 1024)
+        .schedule_transfer(TrafficClass::Throughput, 64 * 1024 * 1024, 1024 * 1024)
         .expect("bulk transfer");
     let burst = simulator
         .route_interactive_burst(1024, 20, 5.0)
@@ -126,7 +152,7 @@ fn simulator_reports_bulk_tail_penalty_for_heterogeneous_paths() {
     ]);
 
     let transfer = simulator
-        .schedule_transfer(FlowLane::Throughput, 32 * 1024 * 1024, 512 * 1024)
+        .schedule_transfer(TrafficClass::Throughput, 32 * 1024 * 1024, 512 * 1024)
         .expect("bulk transfer");
 
     assert_between(transfer.bulk_tail_penalty_ms(), 0.0, 250.0);
@@ -139,7 +165,7 @@ fn simulator_duplicates_small_control_packets_when_cheap() {
     let mut simulator = Simulator::new(vec![VirtualPath::new(first), VirtualPath::new(second)]);
 
     let send = simulator
-        .route(FlowLane::Control, 512)
+        .route(TrafficClass::Control, 512)
         .expect("control route");
 
     assert_eq!(send.path_id, PathId(0));
@@ -158,7 +184,7 @@ fn simulator_routes_bulk_tail_in_tail_avoidance_mode() {
     let send = simulator
         .route_flow(
             FlowId(77),
-            FlowLane::Throughput,
+            TrafficClass::Throughput,
             128 * 1024,
             128 * 1024,
             false,
@@ -166,7 +192,7 @@ fn simulator_routes_bulk_tail_in_tail_avoidance_mode() {
         .expect("tail route");
 
     assert_eq!(send.mode, SchedulingMode::TailAvoidance);
-    assert_eq!(send.scheduled_lane, FlowLane::Latency);
+    assert_eq!(send.scheduled_lane, TrafficClass::Latency);
     assert_eq!(send.path_id, PathId(0));
 }
 
@@ -183,7 +209,7 @@ fn simulator_avoids_suspected_shared_bottleneck_path() {
     ]);
 
     let send = simulator
-        .route(FlowLane::Latency, 1024)
+        .route(TrafficClass::Latency, 1024)
         .expect("interactive route");
 
     assert_eq!(send.path_id, PathId(2));

@@ -1,244 +1,164 @@
-# Refactor plan
+# Refactor completion plan
 
-This plan applies the ownership rules in `CODE_STRUCTURE.md` to the current
-tree. It is intentionally ordered by dependency and state ownership. Moving
-files before their contracts are clear would only preserve the existing
-coupling under new paths.
+This document tracks the endpoint of the source reorganization. It is not an
+alternative architecture; `docs/ARCHITECTURE.md` is authoritative for current
+ownership and `RFC.md` is authoritative for protocol behavior.
 
-## Source endpoint status
+## Objective
 
-The ordered source migration is complete through step 11, together with the
-source, test-layout, documentation, and host-build parts of step 12. The final
-tree has no orphan Rust modules, inline test bodies, `mod.rs` facades,
-production wildcard imports, production `#[path]` wiring, stale migration
-trees, or platform branches in protocol/model/scheduler policy. Default and
-all-feature suites and the all-target/all-feature host check pass.
+The refactor is complete when a reader can follow one MPP range from
+ingress through scheduling, one concrete TCP or QUIC carrier, peer reassembly,
+and target delivery without encountering duplicate state machines, stale path
+roles, or transport-specific policy in the shared layer.
 
-The final semantic pass is also complete. It removed unused wire frames and
-product-owned QUIC PMTU state, collapsed path admission to one valid-state enum,
-made repair a separate work decision, reduced subflow epochs to their actual
-membership/startup-credit authority, consolidated request startup evidence,
-and restored response queue pressure to one stream owner. It also moved virtual
-DRR/tail/duplication models under the simulator, consolidated ACK-flight interval
-algebra and TCP path evidence, and made endpoint path/security configuration one
-immutable indexed allocation shared by its sessions. Normal TCP peer departure
-now follows the same carrier-lifetime transition on admission, read, and write.
-This was a model and data-flow cleanup, not another source-tree migration; the
-existing module boundaries remained intact.
+The protocol endpoint is version 2:
 
-External proof remains deliberately separate from source completion. The
-Windows GNU binary builds and its CLI, config, platform report, and
-Windows-client/Linux-server TCP flow work under Wine. Quinn's own Windows UDP
-endpoint fails under Wine before mptunnel code because Wine rejects
-`IPV6_V6ONLY` inspection on an IPv4 socket; native Windows must therefore prove
-QUIC and Wintun. The installed macOS Rust targets cannot pass the dependency
-build without an Apple cross C toolchain/SDK. Historical performance labs are
-also a separate behavior checkpoint and were not substituted with structural
-test results.
+- neutral `OPEN_STREAM(stream_id, target, demand)`;
+- sequenced directional `PathUsage::{Available, Backup}`;
+- local health separate from peer preference;
+- available-first metric scheduling;
+- connection offsets, `STREAM_ACK`, shared receive window, exact range
+  attribution, and bounded reinjection; and
+- separate native TCP and QUIC recovery below the shared connection.
 
-## Balance rule
+## Source endpoint
 
-Balance means comparable responsibility granularity, not equal file counts.
-A directory is justified by a cohesive aggregate with private invariants;
-protocol asymmetry is expected.
+The intended top-level domains are:
 
-- Response stream logic is large and already divided among substantial
-  owners. It earns one flat `runtime/stream/response/` directory, but not
-  deeper `session/`, `quic/`, or `handoff/` directories.
-- TCP and QUIC path directories are concrete carrier implementations with
-  distinct I/O, telemetry, recovery, and actor lifecycles. Their depth is
-  earned even when their file counts differ.
-- Request product state now has one lock-free `stream/request.rs` owner, peer to
-  the response binding. Remaining imbalance is orchestration concentrated in
-  the request sender facade, not a reason to fragment the product aggregate.
-- Request sending keeps one flat capability directory. TCP capacity, QUIC
-  capacity, and request scheduling each own a substantive mechanism; the
-  `sender/request.rs` facade retains serialized preparation and apply. It must
-  shrink by moving whole evidence, dispatch, or repair capabilities, not by
-  creating shallow phase directories or hundred-line helper files.
-- Thin facades, one-off helpers, and directories with no independent invariant
-  are collapsed instead of being retained for visual symmetry.
+```text
+src/
+  protocol/             wire values, authentication, codec, range semantics
+  model/                immutable evidence and bounded MPP models
+  scheduler/            pure eligibility and path scoring
+  transport/            encryption, TCP/QUIC adapters, optional telemetry
+  runtime/
+    path/{tcp,quic}/     concrete carrier actors and native evidence
+    stream/              feedback, request attachments/state, registry,
+                         response bindings
+    sender/{request,response}/
+                         MPP queues, planning, commit, dispatch
+    relay/               I/O orchestration and recovery coordination
+    datagram/            MPP associations and shared edge workers
+    node/                composition
+  ingress/               SOCKS5, HTTP CONNECT, TUN
+  outbound/              direct and upstream proxy connectors
+  simulator/             deterministic model experiments only
+```
 
-## Target boundaries
+Response sender modules are exactly `service`, `scheduling`, `multipath`, and
+`dispatch`. Response binding modules are exactly `ack_clock`, `attachment`,
+`data_commit`, `delivery`, `diagnostics`, `evidence`, `session`,
+and `snapshot`. Deleted pre-v2 wrapper modules are not retained.
 
-### Response stream
+## Ownership checks
 
-Use a substantive `runtime/stream/response.rs` facade with one flat
-`runtime/stream/response/` directory. Its production children own binding,
-session coordination, load, snapshots, evidence, admission, ACK clock,
-delivery, QUIC calibration, handoff, lifecycle, topology, and transaction
-commit. Tests remain sibling `*_test.rs` files at the same level.
+### Protocol and model
 
-Session coordination owns one mutex and one per-session aggregate. TCP probe,
-QUIC calibration, and handoff remain distinct typed operations but share an
-exclusive-operation enum. Carrier-specific proof state is never unified into a
-generic controller.
+- Wire types contain peer-owned facts only.
+- No fixed attachment role exists in a stream open or runtime binding.
+- `PathUsage` sequence handling rejects stale preference updates without
+  changing local health.
+- `TrafficClass` remains mutable work demand and is never stored as a link class.
+- MPP ranges and Data ACK semantics are independent of transport family.
 
-### Request stream
+### Request direction
 
-Use one substantive peer `runtime/stream/request.rs` owner until it has at least
-three independently meaningful children. It owns product offsets, exact
-flights, ACK state, outstanding window, startup epoch, exact-instance evidence,
-and repair provenance. The client relay task already serializes this state, so
-the aggregate stays single-task and lock-free instead of copying the response
-side's mutex design.
+- `runtime/stream/request.rs` is a narrow facade over four serialized owners:
+  `attachment`, `state`, `flow_control`, and `flight`.
+- `attachment` owns carrier membership and attachment lifetimes; `state` owns
+  per-path evidence and sampling; `flow_control` owns the MPP receive window;
+  and `flight` owns exact range/copy accounting.
+- `runtime/sender/request.rs` is the relay-facing facade and dispatch owner.
+- Sender imports no concrete state or policy from relay; relay acquires paths
+  and retries unchanged queued work when attachment is required.
+- Request scheduling consumes snapshots; it does not hold runtime handles.
+- TCP and QUIC capacity transactions stay in separate carrier-specific owners;
+  carrier-neutral proof validation is a pure model function.
+- Reinjection selects missing MPP ranges and does not impersonate native
+  retransmission.
 
-The request binding replaces parallel per-instance maps with one typed subflow
-aggregate and replaces independently optional ACK-clock owner/pending fields
-with one exclusive operation enum. TCP and QUIC capacity controller state does
-not move into this product aggregate.
+### Response direction
 
-### Model, scheduler, and sender
+- One response binding owns target-stream lifetime and neutral attachments.
+- The response service owns queued work once; attachments do not duplicate the
+  source queue ledger.
+- Scheduling is pure, multipath planning captures generations, and dispatch
+  alone performs final revalidation and carrier enqueue.
+- Exact path-instance metrics and peer usage are projected into snapshots.
+- There is no hidden current-path slot that turns attachment order into policy.
 
-Keep request and response as peer directional owners at each earned layer.
-Model owns immutable evidence and intent vocabulary. Scheduler owns pure
-admission and selection over snapshots. Sender owns queues, observation,
-dispatch orchestration, progress, repair, diagnostics, and distinct TCP/QUIC
-capacity controllers.
+### Carriers
 
-Planning returns ID-only, generation-fenced intents without command senders,
-binding handles, or mutable runtime state. Readiness preview must use the same
-pure decision path without reserving probes, drains, or ACK-clock state. Apply
-resolves the exact identity and atomically commits enqueue, exact flight, and
-Service ownership; a failed apply leaves none of them published.
+- TCP and QUIC have separate connection, writer, reader, capacity, and native
+  measurement state.
+- Shared carrier commands contain MPP work and identity, not one
+  transport's congestion state.
+- TCP kernel recovery and QUIC packet recovery remain authoritative below MPP.
+- Linux socket telemetry is an optional adapter; the portable fallback remains
+  operational and eligible.
 
-Request selection stops live runtime owners at the policy boundary. One batch
-path observation uses one health lock and timestamp, then joins exact attachment
-instances, placement, queue readiness, and load ownership without exposing path
-or carrier handles to policy. Shared admission consumes raw candidate evidence;
-TCP and QUIC keep distinct native evidence below that carrier-neutral input.
+### Relay and node
 
-The serialized sender explicitly executes `prepare -> observe -> decide ->
-apply`. Preparation may reconcile lifecycle state and enqueue control evidence,
-but never unique data. A decision carries the observed `RelayPathInstance` and
-complete remote-set membership generation. Apply resolves that identity,
-conditionally claims scheduler load, enqueues the carrier frame as the commit
-point, transfers the lease, and only then publishes request state. Queue credit
-is revalidated by enqueue, so a stale observation cannot partially commit.
-Proof-authorized startup and calibration also carry proof ID, health generation,
-and attachment epoch; apply revalidates that exact authority before claiming
-load or enqueueing unique data.
-
-### Carrier paths
-
-Keep TCP and QUIC actor trees separate beneath the path aggregate. Shared path
-code owns only carrier-neutral identities, health, load, typed evidence, and
-command ports. The shared authentication adapter owns the protocol transition
-and signed frame construction; concrete carriers own the reads, writes, and
-activation response, and the server context owns replay admission. Path code
-must not import product-range ownership from stream or task orchestration from
-relay.
-
-### Relay
-
-Relay owns ingress/target task orchestration, attach/recovery workflows, and
-product I/O. Frame ranges, BDP calculations, ordering predicates, and other
-pure protocol/model functions move to lower owners so carrier and stream code
-do not depend on relay as a utility facade.
-
-Server target relay lifetime is now one flat `runtime/relay/server.rs` owner.
-Each server identity constructs one registry/service pair; TCP and QUIC carrier
-actors submit accepted leases through that pair instead of spawning detached
-target tasks. Shared receive/range primitives remain in `relay/io.rs`. The
-client side keeps two flat owners: `relay/open.rs` executes concrete TCP/QUIC
-reservation, deadline, acceptance, and retry contracts, and owns cleanup until
-an opened stream commits; `relay/remote.rs` owns attachment role/candidate
-policy, in-flight claim exclusion, membership commit/rollback, placement
-ordering, load claims, frame fan-in, and teardown. Carrier-derived PTO timing
-comes directly from `model/timing.rs`; relay I/O does not import the client
-control actor for either policy. Open and remote attachment enqueue fixed
-request control through the reliable stream binding rather than importing the
-request sender. Dependencies run from control to sender, then remote, open, and
-stream; switchable response output remains a distinct placement contract.
-Client relay orchestration keeps one serialized select actor in
-`relay/control.rs`, while `relay/client.rs` owns its durable endpoint/FIN,
-progress/ACK, recovery, and delivery aggregates. Peer STREAM_DATA application
-and STREAM_ACK repair derivation commit through that owner before path policy
-runs. This is one flat substantive module, not a phase directory or collection
-of pass-through helpers.
-
-The opened-stream value is itself the pending attachment transaction: it owns
-both carrier cleanup and an optional scheduler-load lease. Initial and direct
-Active opens acquire the lease before asynchronous I/O; successful Active
-attachment transfers it to the remote path, while Repair/Validation attachment
-drops the temporary lease before publishing membership. Background validation
-opens are explicitly lease-free because attachment alone is not product demand.
-There is no parallel `load_reserved` boolean or manual async rollback matrix.
-
-### Platform
-
-OS conditionals stay at packet-device, platform-reporting, or native telemetry
-adapters. Linux `TCP_INFO` is optional evidence with a portable typed fallback;
-its returned prefix is parsed as independent capabilities, and missing fields
-remain unknown rather than measured zero. Native pacing is not delivery
-authority and must not gate TCP eligibility. Windows client/Linux server is the
-primary cross-platform role pair, while macOS and Android remain explicit design
-and verification targets.
-
-Carrier network access is a narrow host provider beside, not inside,
-packet-device ownership. It receives the configured path and typed client-group
-and path ordinals for both endpoint resolution and raw socket construction,
-allowing platform hosts to keep DNS and connect on one source network or Android
-`Network`. TCP and QUIC retain separate address-attempt and handshake algorithms
-after that shared boundary. No OS type or branch enters model or scheduler state.
+- Relay owns open/attach/recovery transactions, not scheduling equations.
+- Every accepted carrier path is neutral connection membership.
+- Server carriers reach stream/datagram services only through typed ports.
+- Accepting-listener policy is carried into the exact server path instance and
+  is never recovered by indexing local configuration with a peer path ID.
+- Node composition pairs one session registry with one target relay owner.
 
 ## Migration order
 
-1. Replace parallel response session maps with one per-session state aggregate
-   and typed active operation. Preserve behavior and the single mutex.
-2. Move the response mega-test into owner-specific sibling test files, then
-   delete the test facade and unsafe shared inspection helpers.
-3. Normalize response to `response.rs` plus flat `response/*.rs`; remove its
-   production `#[path]` wiring and broad re-export chain.
-4. Move pure frame, range, ordering, capacity, and path-order functions to
-   protocol/model/scheduler owners. Remove path/stream/relay reverse imports.
-5. Move response tests out of the request mega-test and attach them to response
-   admission, selection, capacity, handoff, repair, apply, and service owners.
-6. Complete the peer request product owner: exact flights, outstanding window,
-   startup, ordered Service identity, exclusive ACK-clock operation, and one
-   exact-instance subflow aggregate now live in `stream/request`; keep it
-   lock-free under the client relay task.
-7. Keep separate TCP/QUIC capacity controllers as substantive request children.
-   Request scheduling now consumes immutable observations and returns
-   exact-instance decisions from `sender/request/scheduling.rs`; keep it intact
-   rather than splitting policy phases into shallow files. Remaining work moves
-   attach/fail orchestration to relay ownership and extracts only substantive
-   request evidence, dispatch, or repair capabilities from the facade.
-8. Give response planning coherent observe, decide, typed-intent, and atomic
-   apply contracts. These are phase APIs, not mandatory files: keep them inside
-   admission, selection, handoff, or dispatch until one phase owns an
-   independently meaningful state machine. Make preview side-effect free and
-   move pure capacity and placement arithmetic to model/scheduler owners without
-   changing values.
-9. Split shared path state and command code by identity, health, capacity
-   transactions, load, queue, and writer ownership without merging TCP and QUIC
-   controllers.
-10. Complete client/control relay orchestration after its lower-level utilities
-    have moved out; client durable state and peer data/ACK application now live
-    in `relay/client.rs`, and the server target-relay lifecycle is already owned.
-11. Replace repeated `mod.rs` facades, production glob imports, runtime prelude
-    leakage, and broad re-exports with named contracts.
-12. Move remaining inline tests, update `ARCHITECTURE.md` to the final paths,
-    then run the deferred test, target, Wine, and lab verification matrix.
+1. **Shape and tests**: establish domain facades, move unit tests to `_test.rs`,
+   and delete one-time migration helpers.
+2. **MPP data state**: consolidate exact offsets, ACK effects, windows, and
+   reinjection ledgers under request/response owners.
+3. **Carrier boundary**: separate TCP and QUIC actors and typed evidence from
+   shared scheduling.
+4. **Role removal**: remove stream-open roles and attachment promotion slots;
+   add directional sequenced usage.
+5. **Scheduling**: make both directions available-first and metric-driven over
+   coherent snapshots.
+6. **Documentation**: align RFC, architecture, design, operations, and lab
+   methodology with the source tree.
+7. **Verification**: format, clippy, default/all-feature tests, supported target
+   checks, Wine CLI/config smoke, then bounded representative labs.
 
-The endpoint semantic pass also removed unowned version 1 wire state: ingress
-and outbound copies on open frames, inline stream flags, weighted demand
-snapshots, path-policy echoes, and frames with no producer or transition.
-Endpoint-local policy and live measurements now stay with their actual owners.
+Do not run performance experiments against a half-migrated binary. Compile and
+unit checks begin once the source boundary is coherent; end-to-end labs begin
+after correctness and cross-target checks pass.
 
-## Checkpoint policy
+## Static stale-code gate
 
-Every structural checkpoint must preserve public behavior, format cleanly, and
-pass default and all-feature production checks. Unit and integration tests are
-deliberately deferred until the migration reaches a coherent endpoint, as
-requested. Behavioral fixes found during migration are recorded and applied in
-separate commits with focused tests and relevant lab evidence.
+Before calling the refactor complete, inspect all production modules for:
 
-The response fixed TCP train/validity policy remains unchanged during ownership
-moves. Its high-BDP adequacy is a later behavior checkpoint requiring matched
-100-500 Mbps experiments; a structural commit cannot silently tune it.
+- unused facade exports and dead feature branches;
+- old stream-open role vocabulary or fixed path placement;
+- duplicated MPP queue, flight, window, or path metric state;
+- server target tasks spawned by carrier actors;
+- shared code that assumes Linux telemetry;
+- MPP decisions based on interface names, path indexes, or lab rates;
+- tests embedded in production files instead of sibling `_test.rs`; and
+- source references to deleted modules or diagnostic events.
 
-The final checkpoint requires source tests, supported target builds, Windows
-CLI/config/TCP/QUIC smoke under Wine, native packet-device follow-up where Wine
-cannot provide proof, and matched historical lab comparisons. No performance
-downgrade is accepted as a structural-refactor side effect.
+Delete a stale owner and its tests/docs together. Do not preserve compatibility
+inside unshipped internal APIs.
+
+## Verification matrix
+
+The final verification order is deliberately bounded:
+
+1. `cargo fmt --check` and line-count warning.
+2. `cargo clippy --all-targets --all-features -- -D warnings`.
+3. default and all-feature tests.
+4. Linux/macOS/Windows target checks and available Android library check.
+5. Windows CLI/config smoke under Wine; native Wintun remains a native-host
+   integration test.
+6. About ten representative Docker cases covering direct/single baseline,
+   TCP/QUIC/mixed multipath, upload/download, latency/bulk, aggregation,
+   blackhole failover, and traffic overhead.
+7. Same-profile comparison with protocol-v2 repeats and separately labeled
+   pre-v2 historical bests.
+
+Any material performance downgrade reopens the owning model or data-flow step.
+Do not mask it with a topology-specific threshold or continue repeating a case
+without a new causal hypothesis.

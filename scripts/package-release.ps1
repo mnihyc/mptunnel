@@ -92,6 +92,7 @@ if (Test-Path $Stage) {
 New-Item -ItemType Directory -Force $Stage | Out-Null
 Copy-Item (Join-Path $TargetDir $Binary) $Stage
 Copy-Item README.md $Stage
+Copy-Item RFC.md $Stage
 Copy-Item LICENSE $Stage
 Copy-Item -Recurse docs $Stage
 $WintunArchive = Get-WintunArchive

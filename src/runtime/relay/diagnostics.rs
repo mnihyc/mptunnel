@@ -17,39 +17,43 @@ fn frame_subject(frame: &Frame) -> String {
             "session_id={} path_id={} underlay={underlay:?}",
             session_id.0, path_id.0
         ),
-        Frame::PathJoinOk { path_id, .. }
-        | Frame::PathDrain { path_id }
+        Frame::PathDrain { path_id }
         | Frame::PathProofData { path_id, .. }
         | Frame::PathProofAck { path_id, .. } => format!("path_id={}", path_id.0),
         Frame::PathCapacityData {
             path_id,
-            calibration_id,
+            measurement_id,
             payload,
         } => format!(
-            "path_id={} calibration_id={} payload_len={}",
+            "path_id={} measurement_id={} payload_len={}",
             path_id.0,
-            calibration_id,
+            measurement_id,
             payload.len()
         ),
         Frame::PathCapacityFinish {
             path_id,
-            calibration_id,
+            measurement_id,
             payload_bytes,
         } => format!(
-            "path_id={} calibration_id={} payload_bytes={}",
-            path_id.0, calibration_id, payload_bytes
+            "path_id={} measurement_id={} payload_bytes={}",
+            path_id.0, measurement_id, payload_bytes
         ),
         Frame::PathCapacityReceipt {
             path_id,
-            calibration_id,
+            measurement_id,
             received_payload_bytes,
         } => format!(
-            "path_id={} calibration_id={} received_payload_bytes={}",
-            path_id.0, calibration_id, received_payload_bytes
+            "path_id={} measurement_id={} received_payload_bytes={}",
+            path_id.0, measurement_id, received_payload_bytes
         ),
         Frame::PathStatus {
-            path_id, status, ..
-        } => format!("path_id={} status={status:?}", path_id.0),
+            path_id,
+            sequence,
+            usage,
+        } => format!(
+            "path_id={} sequence={} usage={usage:?}",
+            path_id.0, sequence
+        ),
         Frame::PathClose { path_id, reason } => {
             format!("path_id={} reason={reason:?}", path_id.0)
         }
@@ -104,6 +108,15 @@ fn frame_subject(frame: &Frame) -> String {
         }
         Frame::PathMetrics { metrics } => format!("path_id={}", metrics.path_id.0),
         Frame::Ping { nonce } | Frame::Pong { nonce } => format!("nonce={nonce}"),
+        Frame::PeerStatusRequest { request_id } => format!("request_id={request_id}"),
+        Frame::PeerStatusResponse {
+            request_id,
+            code,
+            paths,
+        } => format!(
+            "request_id={request_id} code={code:?} path_count={}",
+            paths.len()
+        ),
     }
 }
 

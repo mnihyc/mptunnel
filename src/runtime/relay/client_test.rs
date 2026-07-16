@@ -4,7 +4,7 @@ use crate::protocol::UnderlayProtocol;
 use bytes::Bytes;
 
 #[test]
-fn delivery_owner_credits_current_frame_not_released_buffer() {
+fn delivery_attribution_credits_current_frame_not_released_buffer() {
     let path_key = RelayPathKey {
         underlay: UnderlayProtocol::Udp,
         index: 1,

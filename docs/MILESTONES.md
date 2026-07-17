@@ -2,25 +2,32 @@
 
 ## 2026-07-18: v0.1.0 release candidate
 
-Runtime source `46bc6f8` is the release candidate. It adds five-minute logical
+Runtime source `1018992` is the release candidate. It adds five-minute logical
 session retention across complete carrier loss, the completion-driven
 1 s/5 s/30 s/manual dashboard refresh for local and authorized peer status,
 and a capability-gated basic-UDP QUIC adapter for limited Windows environments.
 TCP and QUIC recovery, congestion control, metrics, and MPP policy remain at
-their documented independent boundaries.
+their documented independent boundaries. It also fixes a pre-existing QUIC
+stream-half ownership race: native FIN is distinct from product FIN and frame
+truncation, and the independently writable half remains available for final
+Data ACK and attachment teardown.
 
 The clean final guard completed native TCP and QUIC plus Wine TCP, basic-UDP
 QUIC, aggregation, and balanced-path blackhole cases in both directions. Native
-QUIC measured 254.127/250.831 Mbps on one high-delay path and
-340.048/444.420 Mbps on five; Wine basic-UDP QUIC measured
-67.407/126.886 Mbps on one and 89.043/160.167 Mbps on five. The matched Wine
-balanced-path blackhole completed at 53.130/142.683 Mbps with 2.119/1.851 s
-receiver progress gaps. All uploads were target-confirmed and exact.
+QUIC measured 249.664 Mbps download and 229.762/259.757 Mbps across two upload
+observations on one high-delay path, then 389.138/433.475 Mbps on five. Wine
+basic-UDP QUIC measured 75.418/124.621 Mbps on one and 112.579/159.564 Mbps on
+five. The matched Wine balanced-path blackhole completed at 51.591/153.034
+Mbps with 2.526/2.096 s receiver progress gaps. All uploads were
+target-confirmed and exact.
 
-Local verification passes 905 Rust tests, warnings-denied Linux and Windows
-GNU clippy, Windows-target unit execution under Wine, formatting, and diff
-integrity. The full native cross-platform Release Check and publication remain
-the final gates before this candidate becomes the frozen milestone.
+Local verification passes 912 all-feature Rust tests, warnings-denied clippy,
+Windows-target end-to-end QUIC execution under Wine, formatting, lab contracts,
+shell syntax, and diff integrity. Release Check run `29611283125` passed the
+exact runtime commit across Linux musl x64/ARM64, Windows MSVC x64/ARM64 with
+native tests and static CRT, macOS x64/ARM64, and Android ARM64. Publication of
+the final release-doc commit receives the same gate before this candidate is
+published and frozen.
 
 ## 2026-07-17: matched reference cohort
 

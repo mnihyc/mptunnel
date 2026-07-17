@@ -32,14 +32,14 @@ the rows remain valid historical comparisons for that binary.
 
 | Item | Value |
 | --- | --- |
-| Runtime source commit | `46bc6f84a597fafcfb0d1f4957cf5ecf0464ad72` |
+| Runtime source commit | `1018992ffc5c7e8a857f114027357f27ff360dfd` |
 | Source state | clean |
 | Protocol | MPP v2 |
 | Build | Cargo `release`, no optional features |
 | Linux client/server target | `x86_64-unknown-linux-gnu` |
-| Linux binary SHA-256 | `cf9ab98d29a62d94e9942021f2a3902a92ec3d9c71ce98f518f08cb56ffcbca1` |
+| Linux binary SHA-256 | `c67d921f247ddefb08bbbcdb19cd137f4a43dbbe10a5f716fdf06a091341b701` |
 | Wine client target | `x86_64-pc-windows-gnu` |
-| Windows PE SHA-256 | `ae0089b2fffd065bf9f64d7b5d576f9537fc331b240fecd185098cc1c35a4659` |
+| Windows PE SHA-256 | `b061eb0f24aa6fcc565d43ec54a3233fe7080088887b462edddb4926cfbcbf44` |
 | Wine runtime | Wine 9.0 on the Linux lab host |
 
 The Linux release archives use musl and the Windows release archives use MSVC;
@@ -75,23 +75,24 @@ upload accounting. Five-path rows used five equal copies of that profile.
 
 | Client runtime | Reliable carrier | Paths | Download Mbps | Upload Mbps |
 | --- | --- | ---: | ---: | ---: |
-| Linux native | TCP | 1 | 151.702 | 176.121 |
-| Linux native | QUIC | 1 | 254.127 | 250.831 |
-| Linux native | QUIC | 5 | 340.048 | 444.420 |
-| Windows PE under Wine | TCP portable path | 1 | 159.232 | 172.543 |
-| Windows PE under Wine | QUIC basic UDP | 1 | 67.407 | 126.886 |
-| Windows PE under Wine | QUIC basic UDP | 5 | 89.043 | 160.167 |
+| Linux native | TCP | 1 | 149.935 | 176.483 |
+| Linux native | QUIC | 1 | 249.664 | 229.762; repeat 259.757 |
+| Linux native | QUIC | 5 | 389.138 | 433.475 |
+| Windows PE under Wine | TCP portable path | 1 | 155.780 | 167.349 |
+| Windows PE under Wine | QUIC basic UDP | 1 | 75.418 | 124.621 |
+| Windows PE under Wine | QUIC basic UDP | 5 | 112.579 | 159.564 |
 
 Every row completed, every upload byte accepted by the probe was confirmed by
-the target, and no row had a recovery gap. Native QUIC gained 33.8% download
-and 77.2% upload over its single path. Basic-UDP QUIC under Wine gained 32.1%
-and 26.2%, while remaining substantially slower than native Quinn; the runtime
-prints that expected compatibility-path warning.
+the target, and no row had a recovery gap. Native QUIC gained 55.9% download;
+its upload gain was 66.9% to 88.7% against the two single-path observations.
+Those observations bracket the earlier 250.831 Mbps guard and expose timing
+variance rather than hiding it. Basic-UDP QUIC under Wine gained 49.3%
+download and 28.0% upload, while remaining substantially slower than native
+Quinn; the runtime prints that expected compatibility-path warning.
 
 The matched balanced-path blackhole guard also completed under Wine at
-53.130 Mbps download with a 2.119-second recovery gap and 142.683 Mbps upload
-with a 1.851-second target-observed gap. Its upload exceeds the earlier
-same-condition 134.600 Mbps observation. Download fault rows have varied from
+51.591 Mbps download with a 2.526-second recovery gap and 153.034 Mbps upload
+with a 2.096-second target-observed gap. Download fault rows have varied from
 roughly 47 to 79 Mbps on this host, so a single absolute fault goodput is not a
 release target; completion and the bounded progress gap are the contract.
 

@@ -56,8 +56,14 @@ matched labs showed regressions or no causal benefit.
 - `cargo clippy --all-targets -- -D warnings`: passed.
 - Lab Python tests: 133 passed.
 - Windows GNU all-target check: passed.
+- Windows GNU optimized release link: passed and produced an x86-64 PE binary.
+- Wine 10 smoke: Windows platform reporting, mixed TCP+QUIC client config,
+  SOCKS listener, management listener, static dashboard, authenticated status
+  API, and unauthenticated `401` behavior passed.
 - Optimized release build, formatting, and diff checks: passed.
 
-Linux and Windows are release targets for this milestone. macOS and Android
-remain best-effort CI targets because native Apple and Android NDK toolchains
-were not available in the verification VM.
+Linux and Windows userspace are release targets for this milestone. Native
+Windows Wintun operation, Windows kernel-network throughput/failover, MSVC and
+ARM64 packaging still require their native CI or host. macOS and Android remain
+best-effort CI targets because native Apple and Android NDK toolchains were not
+available in the verification VM.

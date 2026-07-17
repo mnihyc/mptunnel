@@ -40,7 +40,7 @@ pub(in crate::runtime) use ports::{
 pub(super) use proof::*;
 pub(in crate::runtime) use selection::ReliableRequestTcpPathEvidence;
 pub(in crate::runtime) use server_context::{ServerLocalPath, ServerPathContext};
-pub(in crate::runtime) use set::ClientPathContext;
+pub(in crate::runtime) use set::{ClientPathContext, ClientPathRuntimeOptions};
 pub(in crate::runtime) use state::{
     ClientPathState, RelayPathLoadLease, RequestCapacityProbeCampaignBudget,
 };

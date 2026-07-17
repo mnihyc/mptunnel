@@ -5,9 +5,11 @@
   const PEER_ENDPOINT = "/api/diagnostics/peer";
   const EXPECTED_SCHEMA = "mptunnel.management.v2";
   const TOKEN_STORAGE_KEY = "mptunnel.dashboard.bearer";
-  const REFRESH_INTERVAL_MS = 2000;
+  const REFRESH_STORAGE_KEY = "mptunnel.dashboard.refresh-interval-ms";
+  const REFRESH_INTERVALS_MS = [0, 1000, 5000, 30000];
+  const DEFAULT_REFRESH_INTERVAL_MS = 5000;
   const REQUEST_TIMEOUT_MS = 8000;
-  const STALE_AFTER_MS = 6500;
+  const MIN_STALE_AFTER_MS = 6500;
   const MAX_CHART_SAMPLES = 300;
 
   const elements = {
@@ -18,6 +20,7 @@
     roleLabel: byId("role-label"),
     freshnessLabel: byId("freshness-label"),
     refreshButton: byId("refresh-button"),
+    refreshInterval: byId("refresh-interval"),
     accessButton: byId("access-button"),
     srStatus: byId("sr-status"),
     overviewTimestamp: byId("overview-timestamp"),
@@ -75,6 +78,9 @@
   const state = {
     status: null,
     bearerToken: readStoredToken(),
+    refreshIntervalMs: readStoredRefreshInterval(),
+    refreshTimer: null,
+    refreshCycleRunning: false,
     fetching: false,
     peerFetching: false,
     authenticationRequired: false,
@@ -115,6 +121,30 @@
       }
     } catch (_error) {
       // In-memory authentication still works when storage is unavailable.
+    }
+  }
+
+  function normalizeRefreshInterval(value) {
+    if (value === null || value === undefined || value === "") {
+      return DEFAULT_REFRESH_INTERVAL_MS;
+    }
+    const interval = Number(value);
+    return REFRESH_INTERVALS_MS.includes(interval) ? interval : DEFAULT_REFRESH_INTERVAL_MS;
+  }
+
+  function readStoredRefreshInterval() {
+    try {
+      return normalizeRefreshInterval(window.sessionStorage.getItem(REFRESH_STORAGE_KEY));
+    } catch (_error) {
+      return DEFAULT_REFRESH_INTERVAL_MS;
+    }
+  }
+
+  function storeRefreshInterval(interval) {
+    try {
+      window.sessionStorage.setItem(REFRESH_STORAGE_KEY, String(interval));
+    } catch (_error) {
+      // The selected cadence still works for this page when storage is unavailable.
     }
   }
 
@@ -381,15 +411,34 @@
     return payload;
   }
 
+  function refreshBusy() {
+    return state.refreshCycleRunning || state.fetching || state.peerFetching;
+  }
+
+  function peerRequestSupported() {
+    return Boolean(state.status) && Boolean(peerControl().supported) && Boolean(selectedPeerSession());
+  }
+
+  function updateRefreshControls() {
+    const busy = refreshBusy();
+    elements.refreshButton.disabled = busy;
+    if (busy) {
+      elements.refreshButton.setAttribute("aria-busy", "true");
+    } else {
+      elements.refreshButton.removeAttribute("aria-busy");
+    }
+    elements.peerRequestButton.disabled = busy || !peerRequestSupported();
+    elements.peerRequestButton.setAttribute("aria-busy", state.peerFetching ? "true" : "false");
+  }
+
   async function refreshStatus(source) {
-    if (state.fetching) return;
+    if (state.fetching) return false;
     if (!state.bearerToken) {
       handleUnauthorized("Authentication required");
-      return;
+      return false;
     }
     state.fetching = true;
-    elements.refreshButton.disabled = true;
-    elements.refreshButton.setAttribute("aria-busy", "true");
+    updateRefreshControls();
     updateConnectionState();
     try {
       const payload = validateStatus(await requestJson(STATUS_ENDPOINT));
@@ -401,6 +450,7 @@
       if (source === "manual" || source === "auth") {
         announce("Runtime status refreshed");
       }
+      return true;
     } catch (error) {
       state.lastError = error;
       if (error instanceof HttpError && error.status === 401) {
@@ -411,11 +461,26 @@
           announce(error && error.message ? error.message : "Status refresh failed");
         }
       }
+      return false;
     } finally {
       state.fetching = false;
-      elements.refreshButton.disabled = false;
-      elements.refreshButton.removeAttribute("aria-busy");
+      updateRefreshControls();
       updateConnectionState();
+    }
+  }
+
+  async function refreshDashboard(source) {
+    if (refreshBusy()) return;
+    state.refreshCycleRunning = true;
+    updateRefreshControls();
+    try {
+      const refreshed = await refreshStatus(source);
+      if (refreshed && !state.authenticationRequired && peerRequestSupported()) {
+        await requestPeerStatus(source, true);
+      }
+    } finally {
+      state.refreshCycleRunning = false;
+      updateRefreshControls();
     }
   }
 
@@ -462,6 +527,11 @@
     elements.freshnessLabel.textContent = freshness;
   }
 
+  function staleAfterMs() {
+    if (state.refreshIntervalMs === 0) return MIN_STALE_AFTER_MS;
+    return Math.max(MIN_STALE_AFTER_MS, state.refreshIntervalMs * 2);
+  }
+
   function updateConnectionState() {
     const status = state.status;
     if (state.authenticationRequired) {
@@ -489,7 +559,7 @@
     if (state.lastError) {
       setConnection("offline", "Refresh failed", freshness);
       setNotice("offline", "Live refresh failed. Showing the last received runtime sample.", true);
-    } else if (sampleAge > STALE_AFTER_MS) {
+    } else if (sampleAge > staleAfterMs()) {
       setConnection("stale", "Stale", freshness);
       setNotice("stale", "Runtime status is stale. The last received sample remains visible.", true);
     } else if (state.fetching) {
@@ -729,7 +799,7 @@
   }
 
   function peerControl() {
-    return asObject(asObject(state.status.controls).peer_diagnostics);
+    return asObject(asObject(asObject(state.status).controls).peer_diagnostics);
   }
 
   function renderDiagnostics() {
@@ -764,13 +834,12 @@
     }
 
     const supported = Boolean(control.supported) && peerSessions.length > 0;
-    elements.peerRequestButton.disabled = !supported || state.peerFetching;
-    elements.peerRequestButton.setAttribute("aria-busy", state.peerFetching ? "true" : "false");
     if (supported) {
       elements.peerCapability.textContent = peerSessions.length + " authenticated peer " + (peerSessions.length === 1 ? "session" : "sessions");
     } else {
       elements.peerCapability.textContent = control.reason || "No authenticated peer control carrier";
     }
+    updateRefreshControls();
 
     elements.diagnosticsMetrics.replaceChildren();
     appendMetric(elements.diagnosticsMetrics, "Peer sessions", formatCount(peerSessions.length));
@@ -794,7 +863,7 @@
   }
 
   function selectedPeerSession() {
-    return asArray(asObject(state.status.diagnostics).peer_sessions)
+    return asArray(asObject(asObject(state.status).diagnostics).peer_sessions)
       .map(asObject)
       .find(function (session) { return peerSessionKey(session) === state.selectedPeerSessionKey; }) || null;
   }
@@ -867,8 +936,8 @@
     });
   }
 
-  async function requestPeerStatus() {
-    if (state.peerFetching) return;
+  async function requestPeerStatus(source, coordinated) {
+    if (state.peerFetching || state.fetching || (state.refreshCycleRunning && !coordinated)) return;
     const session = selectedPeerSession();
     if (!session) return;
     const payload = {
@@ -878,8 +947,8 @@
     };
 
     state.peerFetching = true;
-    elements.peerRequestButton.disabled = true;
-    elements.peerRequestButton.setAttribute("aria-busy", "true");
+    elements.peerRequestState.setAttribute("aria-live", source === "manual" ? "polite" : "off");
+    updateRefreshControls();
     elements.peerRequestState.className = "inline-status is-loading";
     elements.peerRequestState.textContent = "Requesting current peer path status";
     try {
@@ -892,19 +961,18 @@
       elements.peerRequestState.className = "inline-status";
       elements.peerRequestState.textContent = "Peer response received " + formatRelative(result.received_unix_ms);
       renderSelectedPeerResult();
-      announce("Peer path status received");
-      await refreshStatus("peer");
+      if (source === "manual") announce("Peer path status received");
     } catch (error) {
       if (error instanceof HttpError && error.status === 401) {
         handleUnauthorized("Authentication required for peer diagnostics");
       }
       elements.peerRequestState.className = "inline-status is-error";
       elements.peerRequestState.textContent = error && error.message ? error.message : "Peer diagnostics request failed";
-      announce(elements.peerRequestState.textContent);
+      if (source === "manual") announce(elements.peerRequestState.textContent);
     } finally {
       state.peerFetching = false;
-      elements.peerRequestButton.removeAttribute("aria-busy");
       if (state.status) renderDiagnostics();
+      updateRefreshControls();
     }
   }
 
@@ -1083,12 +1151,65 @@
     );
   }
 
+  function cancelAutoRefresh() {
+    if (state.refreshTimer !== null) {
+      window.clearTimeout(state.refreshTimer);
+      state.refreshTimer = null;
+    }
+  }
+
+  function scheduleAutoRefresh() {
+    cancelAutoRefresh();
+    if (state.refreshIntervalMs === 0) return;
+    state.refreshTimer = window.setTimeout(async function () {
+      state.refreshTimer = null;
+      if (!document.hidden && !state.authenticationRequired) {
+        await refreshDashboard("poll");
+      }
+      scheduleAutoRefresh();
+    }, state.refreshIntervalMs);
+  }
+
+  async function refreshNow(source) {
+    cancelAutoRefresh();
+    try {
+      await refreshDashboard(source);
+    } finally {
+      scheduleAutoRefresh();
+    }
+  }
+
+  async function requestPeerStatusNow() {
+    cancelAutoRefresh();
+    try {
+      await requestPeerStatus("manual", false);
+    } finally {
+      scheduleAutoRefresh();
+    }
+  }
+
+  function selectRefreshInterval(value) {
+    state.refreshIntervalMs = normalizeRefreshInterval(value);
+    elements.refreshInterval.value = String(state.refreshIntervalMs);
+    storeRefreshInterval(state.refreshIntervalMs);
+    scheduleAutoRefresh();
+    updateConnectionState();
+    announce(
+      state.refreshIntervalMs === 0
+        ? "Auto refresh disabled"
+        : "Auto refresh set to " + String(state.refreshIntervalMs / 1000) + " seconds"
+    );
+  }
+
   function bindEvents() {
     Array.from(document.querySelectorAll("[role='tab'][data-tab]")).forEach(function (tab) {
       tab.addEventListener("click", function () { switchTab(tab.dataset.tab, false); });
       tab.addEventListener("keydown", handleTabKeydown);
     });
-    elements.refreshButton.addEventListener("click", function () { refreshStatus("manual"); });
+    elements.refreshButton.addEventListener("click", function () { refreshNow("manual"); });
+    elements.refreshInterval.addEventListener("change", function () {
+      selectRefreshInterval(elements.refreshInterval.value);
+    });
     elements.accessButton.addEventListener("click", function () {
       showAuthDialog(state.bearerToken ? "Replace the bearer token stored for this tab." : "Enter the token configured for this endpoint.");
     });
@@ -1099,7 +1220,7 @@
       state.selectedPeerSessionKey = elements.peerSessionSelect.value;
       renderSelectedPeerResult();
     });
-    elements.peerRequestButton.addEventListener("click", requestPeerStatus);
+    elements.peerRequestButton.addEventListener("click", requestPeerStatusNow);
 
     elements.authForm.addEventListener("submit", function (event) {
       event.preventDefault();
@@ -1113,14 +1234,14 @@
       storeToken(token);
       state.authenticationRequired = false;
       closeAuthDialog();
-      refreshStatus("auth");
+      refreshNow("auth");
     });
     elements.forgetTokenButton.addEventListener("click", function () {
       clearToken();
       state.authenticationRequired = false;
       closeAuthDialog();
       announce("Stored management token removed");
-      refreshStatus("manual");
+      refreshNow("manual");
     });
     elements.authCancelButton.addEventListener("click", closeAuthDialog);
     elements.authDialog.addEventListener("close", function () {
@@ -1133,8 +1254,12 @@
     });
 
     document.addEventListener("visibilitychange", function () {
-      if (!document.hidden && !state.authenticationRequired) {
-        refreshStatus("visibility");
+      if (
+        state.refreshIntervalMs !== 0 &&
+        !document.hidden &&
+        !state.authenticationRequired
+      ) {
+        refreshNow("visibility");
       }
     });
 
@@ -1149,12 +1274,7 @@
     }
   }
 
-  function startPolling() {
-    window.setInterval(function () {
-      if (!document.hidden && !state.authenticationRequired && !state.fetching) {
-        refreshStatus("poll");
-      }
-    }, REFRESH_INTERVAL_MS);
+  function startClock() {
     window.setInterval(function () {
       if (!document.hidden) {
         updateConnectionState();
@@ -1170,10 +1290,11 @@
 
   function initialize() {
     bindEvents();
+    elements.refreshInterval.value = String(state.refreshIntervalMs);
     switchTab("overview", false);
     updateConnectionState();
-    refreshStatus("initial");
-    startPolling();
+    refreshNow("initial");
+    startClock();
   }
 
   initialize();

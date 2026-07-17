@@ -324,3 +324,50 @@ async fn server_stream_try_route_preserves_bounded_backpressure() {
         Ok(ServerStreamFrameRoute::Routed)
     ));
 }
+
+#[tokio::test]
+async fn late_frame_after_relay_exit_does_not_close_shared_carrier() {
+    let registry = Arc::new(ServerReliableStreamRegistry::new(4));
+    let port = registry.path_port();
+    let session_id = SessionId(902);
+    let stream_id = StreamId(34);
+    let registration = port.register_carrier_path(
+        session_id,
+        UnderlayProtocol::Tcp,
+        PathId(0),
+        ServerLocalPathProperties::default(),
+    );
+    let mux_limits = MuxLimits::default();
+    let (commands, _receivers) = reliable_path_command_channels(8);
+    let mut accepted = match registry
+        .open_or_attach(ServerStreamOpenRequest {
+            session_id,
+            stream_id,
+            target: TargetAddr::Ip(SocketAddr::from(([127, 0, 0, 1], 80))),
+            lane: TrafficClass::Latency,
+            attachment: ServerStreamPathAttachment {
+                path_registration: registration.clone(),
+                commands,
+                max_frame_payload_bytes: mux_limits.max_payload_bytes,
+            },
+            mux_limits,
+        })
+        .expect("open response stream")
+    {
+        ServerReliableStreamOpen::New(accepted) => accepted,
+        _ => panic!("expected new response stream"),
+    };
+
+    drop(accepted.take_stream());
+    let late_fin = Frame::StreamFin {
+        stream_id,
+        final_offset: 0,
+    };
+    port.route_frame(&registration, stream_id, late_fin.clone())
+        .await
+        .expect("late frame is scoped to the retired stream");
+    assert!(matches!(
+        port.try_route_frame(&registration, stream_id, late_fin),
+        Ok(ServerStreamFrameRoute::Routed)
+    ));
+}

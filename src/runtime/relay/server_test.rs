@@ -16,6 +16,63 @@ use crate::runtime::stream::response::{
 };
 use bytes::Bytes;
 
+#[tokio::test]
+async fn server_relay_expires_only_after_its_absolute_no_output_interval() {
+    let limits = MuxLimits::default();
+    let stream_id = StreamId(611);
+    let (commands, command_receivers) = reliable_path_command_channels(4);
+    drop(command_receivers);
+    let binding = ResponseStreamBinding::new(
+        SessionId(611),
+        UnderlayProtocol::Tcp,
+        PathId(0),
+        commands,
+        TrafficClass::Latency,
+    );
+    let (frames_tx, frames_rx) = mpsc::channel(1);
+    let path_stream = ReliablePathStream {
+        stream_id,
+        max_offset: limits.max_stream_window_bytes,
+        lane: TrafficClass::Latency,
+        underlay: UnderlayProtocol::Tcp,
+        max_frame_payload_bytes: reliable_relay_buffer_len(limits),
+        output: ReliablePathStreamOutput::Switchable(binding),
+        frames: frames_rx,
+    };
+    let context = ServerReliableRelayContext {
+        outbound: OutboundConfig::Direct,
+        outbound_dns: DnsConfig::default(),
+        outbound_connect_timeout: Duration::from_secs(1),
+        performance: MppPerformanceConfig::default(),
+        mux_limits: limits,
+        session_retention_timeout: Duration::from_millis(100),
+        telemetry: RuntimeTelemetry::new(1),
+    };
+    let (application, relay_side) = tokio::io::duplex(4096);
+    let send_buffer = crate::runtime::stream::SessionSendBuffer::from_limits(limits);
+    let mut relay = Box::pin(relay_reliable_stream(
+        relay_side,
+        path_stream,
+        &context,
+        SessionId(611),
+        send_buffer,
+    ));
+
+    assert!(
+        tokio::time::timeout(Duration::from_millis(30), relay.as_mut())
+            .await
+            .is_err(),
+        "server relay expired before its configured retention interval"
+    );
+    let result = tokio::time::timeout(Duration::from_secs(1), relay.as_mut())
+        .await
+        .expect("server retention expiry");
+    assert!(matches!(result, Err(RuntimeError::SessionRetentionTimeout)));
+
+    drop(application);
+    drop(frames_tx);
+}
+
 fn consume_attachment_path_proof(receivers: &mut ReliablePathCommandReceivers) {
     assert!(matches!(
         try_recv_reliable_path_priority_command(receivers),

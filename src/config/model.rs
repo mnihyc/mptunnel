@@ -26,6 +26,12 @@ pub const DEFAULT_TCP_PATH_HEARTBEAT_INTERVAL: Duration =
     Duration::from_millis(DEFAULT_TCP_PATH_HEARTBEAT_INTERVAL_MS);
 pub const DEFAULT_TCP_PATH_HEARTBEAT_TIMEOUT: Duration =
     Duration::from_millis(DEFAULT_TCP_PATH_HEARTBEAT_TIMEOUT_MS);
+pub const DEFAULT_QUIC_PATH_KEEP_ALIVE_INTERVAL_MS: u64 = 10_000;
+pub const DEFAULT_QUIC_PATH_IDLE_TIMEOUT_MS: u64 = 30_000;
+pub const DEFAULT_QUIC_PATH_KEEP_ALIVE_INTERVAL: Duration =
+    Duration::from_millis(DEFAULT_QUIC_PATH_KEEP_ALIVE_INTERVAL_MS);
+pub const DEFAULT_QUIC_PATH_IDLE_TIMEOUT: Duration =
+    Duration::from_millis(DEFAULT_QUIC_PATH_IDLE_TIMEOUT_MS);
 pub const DEFAULT_RESTART_BACKOFF_MS: u64 = 1_000;
 pub const DEFAULT_RESTART_MAX_BACKOFF_MS: u64 = 30_000;
 pub const DEFAULT_RESTART_BACKOFF: Duration = Duration::from_millis(DEFAULT_RESTART_BACKOFF_MS);
@@ -37,6 +43,9 @@ pub const DEFAULT_AUTH_FRESHNESS_WINDOW: Duration =
 pub const DEFAULT_OUTBOUND_CONNECT_TIMEOUT_MS: u64 = 10_000;
 pub const DEFAULT_OUTBOUND_CONNECT_TIMEOUT: Duration =
     Duration::from_millis(DEFAULT_OUTBOUND_CONNECT_TIMEOUT_MS);
+pub const DEFAULT_SESSION_RETENTION_TIMEOUT_MS: u64 = 300_000;
+pub const DEFAULT_SESSION_RETENTION_TIMEOUT: Duration =
+    Duration::from_millis(DEFAULT_SESSION_RETENTION_TIMEOUT_MS);
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AppConfig {
@@ -45,6 +54,8 @@ pub struct AppConfig {
     pub check_config: bool,
     /// Process supervision behavior, separate from data-plane ownership.
     pub service: ServiceConfig,
+    /// Logical MPP session lifetime across a break-before-make handover.
+    pub session: SessionConfig,
     /// Runtime envelopes shared by product streams, datagram flows, and carriers.
     pub resources: ResourceLimits,
     /// Observation/control plane. It must not become a hidden data-plane owner.
@@ -62,6 +73,7 @@ impl AppConfig {
             return Err(ConfigError::AuthFreshnessWindowZero);
         }
         self.service.validate()?;
+        self.session.validate()?;
         self.resources.validate()?;
         self.management.validate()?;
         match &self.command {
@@ -78,6 +90,30 @@ impl AppConfig {
                     validate_server_config(server, self.resources)?;
                 }
             }
+        }
+        Ok(())
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SessionConfig {
+    /// Maximum interval an established logical stream may have no carrier.
+    /// Healthy idle streams with an authenticated carrier do not consume it.
+    pub retention_timeout: Duration,
+}
+
+impl Default for SessionConfig {
+    fn default() -> Self {
+        Self {
+            retention_timeout: DEFAULT_SESSION_RETENTION_TIMEOUT,
+        }
+    }
+}
+
+impl SessionConfig {
+    pub fn validate(self) -> Result<(), ConfigError> {
+        if self.retention_timeout.is_zero() {
+            return Err(ConfigError::SessionRetentionTimeoutZero);
         }
         Ok(())
     }
@@ -205,6 +241,8 @@ pub struct ResourceLimits {
     pub max_reliable_relay_chunk_bytes: usize,
     pub tcp_path_heartbeat_interval: Duration,
     pub tcp_path_heartbeat_timeout: Duration,
+    pub quic_path_keep_alive_interval: Duration,
+    pub quic_path_idle_timeout: Duration,
 }
 
 impl Default for ResourceLimits {
@@ -224,6 +262,8 @@ impl Default for ResourceLimits {
             max_reliable_relay_chunk_bytes: DEFAULT_MAX_RELIABLE_RELAY_CHUNK_BYTES,
             tcp_path_heartbeat_interval: DEFAULT_TCP_PATH_HEARTBEAT_INTERVAL,
             tcp_path_heartbeat_timeout: DEFAULT_TCP_PATH_HEARTBEAT_TIMEOUT,
+            quic_path_keep_alive_interval: DEFAULT_QUIC_PATH_KEEP_ALIVE_INTERVAL,
+            quic_path_idle_timeout: DEFAULT_QUIC_PATH_IDLE_TIMEOUT,
         }
     }
 }
@@ -283,6 +323,18 @@ impl ResourceLimits {
         }
         if self.tcp_path_heartbeat_timeout < self.tcp_path_heartbeat_interval {
             return Err(ConfigError::TcpPathHeartbeatTimeoutTooSmall);
+        }
+        if self.quic_path_keep_alive_interval.is_zero() {
+            return Err(ConfigError::QuicPathKeepAliveIntervalZero);
+        }
+        if self.quic_path_idle_timeout.is_zero() {
+            return Err(ConfigError::QuicPathIdleTimeoutZero);
+        }
+        if self.quic_path_idle_timeout <= self.quic_path_keep_alive_interval {
+            return Err(ConfigError::QuicPathIdleTimeoutTooSmall);
+        }
+        if self.quic_path_idle_timeout.as_millis() > quinn::VarInt::MAX.into_inner() as u128 {
+            return Err(ConfigError::QuicPathIdleTimeoutTooLarge);
         }
         Ok(())
     }
@@ -573,10 +625,15 @@ pub enum ConfigError {
     TcpPathHeartbeatIntervalZero,
     TcpPathHeartbeatTimeoutZero,
     TcpPathHeartbeatTimeoutTooSmall,
+    QuicPathKeepAliveIntervalZero,
+    QuicPathIdleTimeoutZero,
+    QuicPathIdleTimeoutTooSmall,
+    QuicPathIdleTimeoutTooLarge,
     RestartBackoffZero,
     RestartMaxBackoffZero,
     RestartMaxBackoffTooSmall,
     RestartLimitZero,
+    SessionRetentionTimeoutZero,
     NoIngresses,
     NoListenAddresses,
     TooManyPaths { actual: usize, limit: usize },
@@ -685,6 +742,21 @@ impl std::fmt::Display for ConfigError {
                     "TCP path heartbeat timeout must be at least the heartbeat interval"
                 )
             }
+            Self::QuicPathKeepAliveIntervalZero => {
+                write!(f, "QUIC path keep-alive interval must be greater than zero")
+            }
+            Self::QuicPathIdleTimeoutZero => {
+                write!(f, "QUIC path idle timeout must be greater than zero")
+            }
+            Self::QuicPathIdleTimeoutTooSmall => {
+                write!(
+                    f,
+                    "QUIC path idle timeout must exceed its keep-alive interval"
+                )
+            }
+            Self::QuicPathIdleTimeoutTooLarge => {
+                write!(f, "QUIC path idle timeout exceeds the protocol timer range")
+            }
             Self::RestartBackoffZero => write!(f, "restart backoff must be greater than zero"),
             Self::RestartMaxBackoffZero => {
                 write!(f, "maximum restart backoff must be greater than zero")
@@ -696,6 +768,9 @@ impl std::fmt::Display for ConfigError {
                 )
             }
             Self::RestartLimitZero => write!(f, "max restarts must be greater than zero"),
+            Self::SessionRetentionTimeoutZero => {
+                write!(f, "session retention timeout must be greater than zero")
+            }
             Self::NoIngresses => write!(f, "at least one client ingress is required"),
             Self::NoListenAddresses => {
                 write!(f, "proxy ingress requires at least one listen address")

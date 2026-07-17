@@ -240,6 +240,12 @@ persistent data role. On the server, one session registry owns the target
 stream binding; TCP and QUIC carrier actors attach to that binding through
 typed ports and never create duplicate target relays.
 
+The reliable-stream actor, not a carrier, owns break-before-make retention.
+At zero live attachments it preserves the existing sequence/ACK/FIN state,
+stops source reads, and rotates one reconnect attempt at a time until the
+absolute configured deadline. TCP heartbeat and native QUIC keep-alive/idle
+timers only determine carrier liveness and never reset that logical deadline.
+
 Shared locks protect one coherent aggregate. Scheduling does not hold them
 while doing I/O. Hot frame and ACK paths use local actor state or immutable
 snapshots rather than a session-wide lock for each packet.

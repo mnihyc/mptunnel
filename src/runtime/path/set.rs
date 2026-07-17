@@ -34,7 +34,15 @@ use crate::runtime::telemetry::{
 use crate::transport::SystemCarrierNetworkProvider;
 use crate::transport::{CarrierNetworkProvider, CarrierPathIdentity, PathSpec};
 use std::sync::Arc;
-use std::time::Instant;
+use std::time::{Duration, Instant};
+
+/// Process-owned dependencies shared by every carrier in one client path group.
+pub(in crate::runtime) struct ClientPathRuntimeOptions {
+    pub(in crate::runtime) session_retention_timeout: Duration,
+    pub(in crate::runtime) path_group_ordinal: usize,
+    pub(in crate::runtime) carrier_network: Arc<dyn CarrierNetworkProvider>,
+    pub(in crate::runtime) allow_peer_diagnostics: bool,
+}
 
 #[derive(Clone)]
 pub struct ClientPathContext {
@@ -59,6 +67,8 @@ pub struct ClientPathContext {
     pub(in crate::runtime) peer_status: PeerStatusBroker,
     pub(in crate::runtime) codec_limits: CodecLimits,
     pub(in crate::runtime) mux_limits: MuxLimits,
+    /// RFC 8684 break-before-make lifetime for established logical streams.
+    pub(in crate::runtime) session_retention_timeout: std::time::Duration,
     // All reliable streams share one work-conserving unique-byte memory owner.
     // Per-stream peer windows and per-carrier congestion authority stay separate.
     pub(in crate::runtime) session_send_buffer: SessionSendBuffer,
@@ -131,26 +141,33 @@ impl ClientPathContext {
         path_group_ordinal: usize,
         carrier_network: Arc<dyn CarrierNetworkProvider>,
     ) -> Result<Self, RuntimeError> {
-        Self::new_with_carrier_network_and_peer_diagnostics(
+        Self::new_with_runtime_options(
             paths,
             resources,
             route_target,
             ingresses,
-            path_group_ordinal,
-            carrier_network,
-            false,
+            ClientPathRuntimeOptions {
+                session_retention_timeout: crate::config::DEFAULT_SESSION_RETENTION_TIMEOUT,
+                path_group_ordinal,
+                carrier_network,
+                allow_peer_diagnostics: false,
+            },
         )
     }
 
-    pub(in crate::runtime) fn new_with_carrier_network_and_peer_diagnostics(
+    pub(in crate::runtime) fn new_with_runtime_options(
         paths: Vec<ClientPathConfig>,
         resources: ResourceLimits,
         route_target: Option<RouteTarget>,
         ingresses: Vec<LocalIngressConfig>,
-        path_group_ordinal: usize,
-        carrier_network: Arc<dyn CarrierNetworkProvider>,
-        allow_peer_diagnostics: bool,
+        runtime: ClientPathRuntimeOptions,
     ) -> Result<Self, RuntimeError> {
+        let ClientPathRuntimeOptions {
+            session_retention_timeout,
+            path_group_ordinal,
+            carrier_network,
+            allow_peer_diagnostics,
+        } = runtime;
         if paths.len() > u16::MAX as usize {
             return Err(RuntimeError::PathIdOverflow);
         }
@@ -272,6 +289,7 @@ impl ClientPathContext {
             peer_status,
             codec_limits,
             mux_limits,
+            session_retention_timeout,
             session_send_buffer,
             #[cfg(test)]
             proxy_auth: ProxyAuthConfig::disabled(),

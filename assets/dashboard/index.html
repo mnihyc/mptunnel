@@ -29,6 +29,15 @@
     </div>
 
     <div class="topbar__actions">
+      <label class="refresh-control" for="refresh-interval">
+        <span>Auto refresh</span>
+        <select id="refresh-interval">
+          <option value="1000">1 second</option>
+          <option value="5000" selected>5 seconds</option>
+          <option value="30000">30 seconds</option>
+          <option value="0">Manual only</option>
+        </select>
+      </label>
       <button id="access-button" class="button button--quiet" type="button">Access</button>
       <button id="refresh-button" class="button button--primary" type="button">Refresh</button>
     </div>

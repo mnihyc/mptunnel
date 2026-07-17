@@ -424,7 +424,9 @@ pub(in crate::runtime) fn receive_stream_fin(
                 "conflicting stream FIN final offsets",
             ));
         }
-    } else if final_offset > recv_stream.next_offset() {
+    } else {
+        // The FIN remains pending until its receive progress is published and
+        // the local half-close commits, including across carrier reattachment.
         *pending_final_offset = Some(final_offset);
     }
     Ok(final_offset == recv_stream.next_offset())

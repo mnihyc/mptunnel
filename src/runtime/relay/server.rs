@@ -77,6 +77,7 @@ struct ServerReliableRelayContext {
     outbound_connect_timeout: Duration,
     performance: MppPerformanceConfig,
     mux_limits: MuxLimits,
+    session_retention_timeout: Duration,
     telemetry: RuntimeTelemetry,
 }
 
@@ -96,6 +97,7 @@ impl ServerReliableRelayService {
         outbound_connect_timeout: Duration,
         performance: MppPerformanceConfig,
         mux_limits: MuxLimits,
+        session_retention_timeout: Duration,
         telemetry: RuntimeTelemetry,
     ) -> (Arc<ServerReliableStreamRegistry>, Self) {
         let (registry, accepted) =
@@ -106,6 +108,7 @@ impl ServerReliableRelayService {
             outbound_connect_timeout,
             performance,
             mux_limits,
+            session_retention_timeout,
             telemetry,
         });
         (registry, Self { context, accepted })
@@ -230,8 +233,7 @@ async fn relay_accepted_stream(
     let result = relay_reliable_stream(
         outbound_stream,
         stream,
-        context.mux_limits,
-        context.performance,
+        context.as_ref(),
         session_id,
         session_send_buffer,
     )
@@ -990,11 +992,10 @@ async fn drain_server_response_sender_ready(
 }
 
 // Reliable server response relay
-pub(in crate::runtime) async fn relay_reliable_stream<S>(
+async fn relay_reliable_stream<S>(
     local: S,
     mut path_stream: ReliablePathStream,
-    mux_limits: MuxLimits,
-    performance: MppPerformanceConfig,
+    context: &ServerReliableRelayContext,
     session_id: SessionId,
     session_send_buffer: crate::runtime::stream::SessionSendBuffer,
 ) -> Result<PathDeliveryStats, RuntimeError>
@@ -1010,8 +1011,7 @@ where
     let result = relay_reliable_stream_body(
         local,
         &mut path_stream,
-        mux_limits,
-        performance,
+        context,
         session_id,
         session_send_buffer,
         &mut close,
@@ -1047,8 +1047,7 @@ struct ServerRelayClose {
 async fn relay_reliable_stream_body<S>(
     mut local: S,
     path_stream: &mut ReliablePathStream,
-    mux_limits: MuxLimits,
-    performance: MppPerformanceConfig,
+    context: &ServerReliableRelayContext,
     session_id: SessionId,
     session_send_buffer: crate::runtime::stream::SessionSendBuffer,
     close: &mut ServerRelayClose,
@@ -1056,6 +1055,9 @@ async fn relay_reliable_stream_body<S>(
 where
     S: AsyncRead + AsyncWrite + Unpin,
 {
+    let mux_limits = context.mux_limits;
+    let performance = context.performance;
+    let session_retention_timeout = context.session_retention_timeout;
     let stream_id = path_stream.stream_id;
     #[cfg(not(feature = "lab-diagnostics"))]
     let _ = session_id;
@@ -1094,6 +1096,7 @@ where
     let mut send_buffer_reservation = session_send_buffer.stream_reservation();
     let mut send_buffer_updates = session_send_buffer.subscribe();
     let mut response_sender_retry_at: Option<tokio::time::Instant> = None;
+    let mut no_output_since: Option<Instant> = None;
     let mut last_sender_dispatch_byte_budget =
         relay_lane_startup_chunk_bytes(close.lane, mux_limits)
             .min(path_stream.max_frame_payload_bytes)
@@ -1102,10 +1105,22 @@ where
     #[cfg(feature = "lab-diagnostics")]
     let mut last_reported_budget: Option<(TrafficClass, usize, usize)> = None;
     #[cfg(feature = "lab-diagnostics")]
-    #[cfg(feature = "lab-diagnostics")]
     let mut receive_hole_diagnostics = ServerReceiveHoleDiagnostics::default();
 
     let mut result = loop {
+        let now = Instant::now();
+        let has_live_output = path_stream.has_live_output();
+        if has_live_output {
+            no_output_since = None;
+        } else {
+            let disconnected_at = *no_output_since.get_or_insert(now);
+            if now.saturating_duration_since(disconnected_at) >= session_retention_timeout {
+                break Err(RuntimeError::SessionRetentionTimeout);
+            }
+        }
+        let session_retention_deadline = no_output_since
+            .and_then(|since| since.checked_add(session_retention_timeout))
+            .map(tokio::time::Instant::from_std);
         if stream_terminal_fin_replay_required(
             close.sent,
             terminal_fin_replayed,
@@ -1347,13 +1362,29 @@ where
         } else {
             0
         };
-        let can_read_local = can_read_by_flow && read_budget > 0;
+        // A target socket can stay established while every MPP carrier is down.
+        // Stop reading so ordinary socket backpressure bounds retained response data.
+        let can_read_local = has_live_output && can_read_by_flow && read_budget > 0;
         let can_send_pending_fin = pending_local_fin && response_sender.is_empty() && !close.sent;
 
         // Carrier input and target responses can both remain continuously
         // ready during an upload. Fair polling keeps response progress from
         // being hidden behind an unbounded run of incoming STREAM_DATA.
         tokio::select! {
+        _ = async {
+            match session_retention_deadline {
+                Some(deadline) => tokio::time::sleep_until(deadline).await,
+                None => std::future::pending().await,
+            }
+        }, if no_output_since.is_some() => {
+            // Attachment and expiry can become ready in the same scheduler turn.
+            // A newly authenticated carrier wins over retiring the logical stream.
+            if path_stream.has_live_output() {
+                no_output_since = None;
+                continue;
+            }
+            break Err(RuntimeError::SessionRetentionTimeout);
+        }
         _ = tokio::time::sleep_until(tail_reinjection_deadline), if tail_reinjection_active => {
             let reinjection_outcome = enqueue_reliable_tail_reinjection(
                 &mut response_sender,

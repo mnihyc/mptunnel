@@ -142,3 +142,17 @@ fn peer_diagnostics_does_not_require_a_local_http_listener() {
     assert!(!config.http_enabled());
     assert!(config.peer_diagnostics_enabled());
 }
+
+#[test]
+fn quic_idle_timeout_must_exceed_native_keep_alive() {
+    let limits = ResourceLimits {
+        quic_path_keep_alive_interval: Duration::from_secs(10),
+        quic_path_idle_timeout: Duration::from_secs(10),
+        ..ResourceLimits::default()
+    };
+
+    assert_eq!(
+        limits.validate(),
+        Err(ConfigError::QuicPathIdleTimeoutTooSmall)
+    );
+}

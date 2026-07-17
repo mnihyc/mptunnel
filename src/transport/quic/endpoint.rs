@@ -249,7 +249,7 @@ impl Connection {
 fn server_config(secret: &[u8], mux_limits: MuxLimits) -> Result<ServerConfig, QuicCarrierError> {
     let (cert_der, key_der) = secret_bound_certificate(secret)?;
     let mut config = ServerConfig::with_single_cert(vec![cert_der], key_der.into())?;
-    config.transport = Arc::new(quic_transport_config(mux_limits));
+    config.transport = Arc::new(quic_transport_config(mux_limits)?);
     Ok(config)
 }
 
@@ -263,11 +263,11 @@ fn client_config(secret: &[u8], mux_limits: MuxLimits) -> Result<ClientConfig, Q
     let mut config = ClientConfig::new(Arc::new(
         quinn::crypto::rustls::QuicClientConfig::try_from(config)?,
     ));
-    config.transport_config(Arc::new(quic_transport_config(mux_limits)));
+    config.transport_config(Arc::new(quic_transport_config(mux_limits)?));
     Ok(config)
 }
 
-fn quic_transport_config(mux_limits: MuxLimits) -> TransportConfig {
+fn quic_transport_config(mux_limits: MuxLimits) -> Result<TransportConfig, QuicCarrierError> {
     let stream_receive_window = mux_limits.max_stream_window_bytes.max(1);
     let connection_receive_window = stream_receive_window
         .saturating_add(mux_limits.max_repair_bytes as u64)
@@ -290,8 +290,10 @@ fn quic_transport_config(mux_limits: MuxLimits) -> TransportConfig {
         .max_concurrent_uni_streams(0_u8.into())
         .datagram_receive_buffer_size(Some(mux_limits.max_datagram_queue_bytes))
         .datagram_send_buffer_size(mux_limits.max_datagram_queue_bytes)
+        .max_idle_timeout(Some(mux_limits.quic_path_idle_timeout.try_into()?))
+        .keep_alive_interval(Some(mux_limits.quic_path_keep_alive_interval))
         .congestion_controller_factory(Arc::new(InstrumentedBbrConfig));
-    transport
+    Ok(transport)
 }
 
 fn varint_saturating(value: u64) -> VarInt {

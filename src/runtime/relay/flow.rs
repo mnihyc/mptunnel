@@ -83,6 +83,10 @@ impl ReliableRelayFlowDemandTracker {
         }
     }
 
+    pub(in crate::runtime) fn current_lane(&self) -> TrafficClass {
+        self.current
+    }
+
     pub(in crate::runtime) fn refresh(
         &mut self,
         signals: ReliableRelayFlowSignals,

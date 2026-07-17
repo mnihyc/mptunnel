@@ -771,6 +771,8 @@ fn reliable_relay_sender_queue_budget_is_resource_gated() {
         max_reliable_relay_chunk_bytes: 32 * 1024,
         tcp_path_heartbeat_interval: crate::config::DEFAULT_TCP_PATH_HEARTBEAT_INTERVAL,
         tcp_path_heartbeat_timeout: crate::config::DEFAULT_TCP_PATH_HEARTBEAT_TIMEOUT,
+        quic_path_keep_alive_interval: crate::config::DEFAULT_QUIC_PATH_KEEP_ALIVE_INTERVAL,
+        quic_path_idle_timeout: crate::config::DEFAULT_QUIC_PATH_IDLE_TIMEOUT,
     };
     let send_stream = ReliableSendStream::new(StreamId(9), mux_limits);
     let mut sender_queue = ReliableRelaySenderQueue::default();
@@ -2141,6 +2143,8 @@ fn reliable_stream_frame_queue_tracks_relay_chunk_byte_budget() {
         max_reliable_relay_chunk_bytes: 256 * 1024,
         tcp_path_heartbeat_interval: crate::config::DEFAULT_TCP_PATH_HEARTBEAT_INTERVAL,
         tcp_path_heartbeat_timeout: crate::config::DEFAULT_TCP_PATH_HEARTBEAT_TIMEOUT,
+        quic_path_keep_alive_interval: crate::config::DEFAULT_QUIC_PATH_KEEP_ALIVE_INTERVAL,
+        quic_path_idle_timeout: crate::config::DEFAULT_QUIC_PATH_IDLE_TIMEOUT,
     };
 
     assert_eq!(
@@ -2165,6 +2169,8 @@ fn reliable_stream_frame_queue_tracks_actual_attachment_payload() {
         max_reliable_relay_chunk_bytes: 256 * 1024,
         tcp_path_heartbeat_interval: crate::config::DEFAULT_TCP_PATH_HEARTBEAT_INTERVAL,
         tcp_path_heartbeat_timeout: crate::config::DEFAULT_TCP_PATH_HEARTBEAT_TIMEOUT,
+        quic_path_keep_alive_interval: crate::config::DEFAULT_QUIC_PATH_KEEP_ALIVE_INTERVAL,
+        quic_path_idle_timeout: crate::config::DEFAULT_QUIC_PATH_IDLE_TIMEOUT,
     };
 
     let stream_payload_queue = reliable_stream_frame_queue(mux_limits);
@@ -2193,6 +2199,8 @@ fn reliable_path_and_tcp_command_queues_follow_carrier_backpressure_models() {
         max_reliable_relay_chunk_bytes: 256 * 1024,
         tcp_path_heartbeat_interval: crate::config::DEFAULT_TCP_PATH_HEARTBEAT_INTERVAL,
         tcp_path_heartbeat_timeout: crate::config::DEFAULT_TCP_PATH_HEARTBEAT_TIMEOUT,
+        quic_path_keep_alive_interval: crate::config::DEFAULT_QUIC_PATH_KEEP_ALIVE_INTERVAL,
+        quic_path_idle_timeout: crate::config::DEFAULT_QUIC_PATH_IDLE_TIMEOUT,
     };
     let frame_payload =
         reliable_relay_scheduler_quantum_cap(None, TrafficClass::Throughput, mux_limits)
@@ -2232,6 +2240,8 @@ fn reliable_path_command_queue_tracks_actual_payload_quantum() {
         max_reliable_relay_chunk_bytes: 256 * 1024,
         tcp_path_heartbeat_interval: crate::config::DEFAULT_TCP_PATH_HEARTBEAT_INTERVAL,
         tcp_path_heartbeat_timeout: crate::config::DEFAULT_TCP_PATH_HEARTBEAT_TIMEOUT,
+        quic_path_keep_alive_interval: crate::config::DEFAULT_QUIC_PATH_KEEP_ALIVE_INTERVAL,
+        quic_path_idle_timeout: crate::config::DEFAULT_QUIC_PATH_IDLE_TIMEOUT,
     };
 
     let stream_payload_queue = reliable_path_command_queue(mux_limits);

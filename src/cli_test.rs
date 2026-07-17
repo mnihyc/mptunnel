@@ -28,6 +28,7 @@ fn client_cli_builds_default_socks_config() {
     assert_eq!(config.security.cipher, CipherSuite::Aes256Gcm);
     assert!(config.check_config);
     assert_eq!(config.service, ServiceConfig::default());
+    assert_eq!(config.session, SessionConfig::default());
     assert_eq!(config.resources, ResourceLimits::default());
     match config.command {
         CommandConfig::Client(client) => {
@@ -798,6 +799,83 @@ fn tcp_path_heartbeat_timing_is_validated() {
         cli.into_config(),
         Err(CliConfigError::Config(
             crate::config::ConfigError::TcpPathHeartbeatTimeoutTooSmall
+        ))
+    ));
+}
+
+#[test]
+fn logical_session_retention_and_quic_liveness_are_independently_configurable() {
+    let cli = Cli::try_parse_from([
+        "mptunnel",
+        "--secret",
+        "0123456789abcdef0123456789abcdef",
+        "--session-retention-timeout-ms",
+        "45000",
+        "--quic-path-keep-alive-interval-ms",
+        "3000",
+        "--quic-path-idle-timeout-ms",
+        "12000",
+        "client",
+        "--path",
+        "udp://127.0.0.1:443",
+    ])
+    .expect("parse cli");
+    let config = cli.into_config().expect("config");
+
+    assert_eq!(config.session.retention_timeout, Duration::from_secs(45));
+    assert_eq!(
+        config.resources.quic_path_keep_alive_interval,
+        Duration::from_secs(3)
+    );
+    assert_eq!(
+        config.resources.quic_path_idle_timeout,
+        Duration::from_secs(12)
+    );
+}
+
+#[test]
+fn logical_session_and_quic_liveness_timing_is_validated() {
+    for (args, expected) in [
+        (
+            vec!["--session-retention-timeout-ms", "0"],
+            crate::config::ConfigError::SessionRetentionTimeoutZero,
+        ),
+        (
+            vec!["--quic-path-keep-alive-interval-ms", "0"],
+            crate::config::ConfigError::QuicPathKeepAliveIntervalZero,
+        ),
+        (
+            vec!["--quic-path-idle-timeout-ms", "0"],
+            crate::config::ConfigError::QuicPathIdleTimeoutZero,
+        ),
+    ] {
+        let mut command = vec!["mptunnel", "--secret", "0123456789abcdef0123456789abcdef"];
+        command.extend(args);
+        command.extend(["client", "--path", "udp://127.0.0.1:443"]);
+        let cli = Cli::try_parse_from(command).expect("parse cli");
+        assert!(matches!(
+            cli.into_config(),
+            Err(CliConfigError::Config(actual)) if actual == expected
+        ));
+    }
+
+    let cli = Cli::try_parse_from([
+        "mptunnel",
+        "--secret",
+        "0123456789abcdef0123456789abcdef",
+        "--quic-path-keep-alive-interval-ms",
+        "10000",
+        "--quic-path-idle-timeout-ms",
+        "10000",
+        "client",
+        "--path",
+        "udp://127.0.0.1:443",
+    ])
+    .expect("parse cli");
+    assert!(matches!(
+        cli.into_config(),
+        Err(CliConfigError::Config(
+            crate::config::ConfigError::QuicPathIdleTimeoutTooSmall
         ))
     ));
 }

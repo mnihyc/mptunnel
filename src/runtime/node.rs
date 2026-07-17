@@ -54,6 +54,7 @@ pub async fn run_with_host_providers(
             client::run(
                 client,
                 config.resources,
+                config.session,
                 config.management,
                 packet_devices,
                 carrier_network,
@@ -69,6 +70,7 @@ pub async fn run_with_host_providers(
                 server.security,
                 server.performance,
                 config.resources,
+                config.session,
                 config.management,
             )
             .await
@@ -77,6 +79,7 @@ pub async fn run_with_host_providers(
             combined::run(
                 node,
                 config.resources,
+                config.session,
                 config.management,
                 packet_devices,
                 carrier_network,

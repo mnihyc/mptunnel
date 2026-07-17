@@ -1137,17 +1137,17 @@ impl ServerReliableStreamRegistry {
         };
         #[cfg(feature = "lab-diagnostics")]
         let started = Instant::now();
-        let result = stream
-            .send(Ok(frame))
-            .await
-            .map_err(|_| RuntimeError::ReliablePathSessionClosed);
+        // The relay supervisor retires registry membership after the per-stream
+        // receiver closes. A frame in that interval is stream-local teardown,
+        // not failure of the multiplexed carrier that delivered it.
+        let _ = stream.send(Ok(frame)).await;
         #[cfg(feature = "lab-diagnostics")]
         lab_perf_record(
             "runtime.server_stream.route_frame",
             started.elapsed(),
             bytes,
         );
-        result
+        Ok(())
     }
 
     pub(in crate::runtime) fn try_route_frame(
@@ -1183,9 +1183,9 @@ impl ServerReliableStreamRegistry {
             Err(mpsc::error::TrySendError::Full(Ok(frame))) => {
                 Ok(ServerStreamFrameRoute::Backpressured(frame))
             }
-            Err(mpsc::error::TrySendError::Closed(_)) => {
-                Err(RuntimeError::ReliablePathSessionClosed)
-            }
+            // See `route_frame`: retirement owns this short closed-receiver
+            // interval, and one finished stream must not close its carrier.
+            Err(mpsc::error::TrySendError::Closed(_)) => Ok(ServerStreamFrameRoute::Routed),
             Err(mpsc::error::TrySendError::Full(Err(_))) => {
                 unreachable!("server stream routing only sends successful frames")
             }

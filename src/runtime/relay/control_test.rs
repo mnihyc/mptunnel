@@ -1,7 +1,150 @@
 use super::*;
+use crate::config::{ResourceLimits, SecurityConfig, SharedSecret};
+use crate::model::capacity::reliable_relay_buffer_len;
 use crate::mux::MuxLimits;
-use crate::protocol::{OffsetRange, StreamId};
+use crate::protocol::{OffsetRange, PathId, StreamId, TargetAddr, UnderlayProtocol};
+use crate::runtime::path::commands::reliable_path_command_channels;
+use crate::runtime::stream::{ReliablePathStream, ReliablePathStreamOutput};
+use crate::transport::PathSpec;
 use bytes::Bytes;
+use std::time::Duration;
+use tokio::io::{AsyncReadExt, AsyncWriteExt, duplex};
+use tokio::sync::mpsc;
+
+fn test_security() -> SecurityConfig {
+    SecurityConfig::encrypted(
+        SharedSecret::new(b"0123456789abcdef0123456789abcdef".to_vec()).expect("secret"),
+    )
+}
+
+async fn closed_output_relay(
+    stream_id: StreamId,
+) -> (
+    tokio::io::DuplexStream,
+    tokio::task::JoinHandle<Result<PathDeliveryStats, RuntimeError>>,
+    mpsc::Sender<Result<Frame, RuntimeError>>,
+) {
+    let unused = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("reserve unused endpoint");
+    let unused_addr = unused.local_addr().expect("unused endpoint address");
+    drop(unused);
+    let path = format!("tcp://{unused_addr}")
+        .parse::<PathSpec>()
+        .expect("TCP path");
+    let mut context =
+        ClientPathContext::new(vec![path], test_security(), ResourceLimits::default())
+            .expect("client context");
+    context.session_retention_timeout = Duration::from_millis(100);
+
+    let limits = context.mux_limits;
+    let (commands, command_receivers) = reliable_path_command_channels(4);
+    drop(command_receivers);
+    let (frames_tx, frames_rx) = mpsc::channel(4);
+    let opened = OpenedRemoteStream::pending(
+        ReliablePathStream {
+            stream_id,
+            max_offset: limits.max_stream_window_bytes,
+            lane: TrafficClass::Latency,
+            underlay: UnderlayProtocol::Tcp,
+            max_frame_payload_bytes: reliable_relay_buffer_len(limits),
+            output: ReliablePathStreamOutput::fixed(
+                UnderlayProtocol::Tcp,
+                PathId(0),
+                commands,
+                limits,
+            ),
+            frames: frames_rx,
+        },
+        0,
+    );
+    let (application, relay_side) = duplex(4096);
+    let relay_context = context.clone();
+    let relay = tokio::spawn(async move {
+        relay_migrating_tcp_stream(
+            relay_side,
+            &relay_context,
+            MppPerformanceConfig::default(),
+            ReliableRelayOpenSpec {
+                target: TargetAddr::Ip(unused_addr),
+            },
+            opened,
+        )
+        .await
+    });
+    (application, relay, frames_tx)
+}
+
+async fn assert_absolute_retention_timeout(
+    relay: &mut tokio::task::JoinHandle<Result<PathDeliveryStats, RuntimeError>>,
+) {
+    tokio::time::sleep(Duration::from_millis(30)).await;
+    assert!(
+        !relay.is_finished(),
+        "carrier loss bypassed the retention interval"
+    );
+    let result = tokio::time::timeout(Duration::from_secs(1), relay)
+        .await
+        .expect("retention expiry timeout")
+        .expect("relay task");
+    assert!(matches!(result, Err(RuntimeError::SessionRetentionTimeout)));
+}
+
+#[tokio::test]
+async fn send_first_carrier_loss_enters_absolute_session_retention() {
+    let (mut application, mut relay, frames_tx) = closed_output_relay(StreamId(610)).await;
+
+    application
+        .write_all(b"send-first failure")
+        .await
+        .expect("application write");
+    assert_absolute_retention_timeout(&mut relay).await;
+    drop(frames_tx);
+}
+
+#[tokio::test]
+async fn fin_feedback_carrier_loss_enters_absolute_session_retention() {
+    let (application, mut relay, frames_tx) = closed_output_relay(StreamId(612)).await;
+    frames_tx
+        .send(Ok(Frame::StreamFin {
+            stream_id: StreamId(612),
+            final_offset: 0,
+        }))
+        .await
+        .expect("remote FIN");
+
+    assert_absolute_retention_timeout(&mut relay).await;
+    drop(application);
+    drop(frames_tx);
+}
+
+#[tokio::test]
+async fn retained_in_order_fin_commits_after_reattachment_feedback() {
+    let recv_stream = ReliableRecvStream::new(StreamId(613), MuxLimits::default());
+    let mut state = ClientRelayState::new();
+    assert!(
+        receive_stream_fin(
+            &recv_stream,
+            &mut state.endpoint.pending_remote_fin_offset,
+            0,
+        )
+        .expect("in-order FIN")
+    );
+    assert_eq!(state.endpoint.pending_remote_fin_offset, Some(0));
+
+    let (mut application, mut relay_side) = duplex(64);
+    commit_pending_remote_fin(&mut relay_side, &mut state, &recv_stream, true)
+        .await
+        .expect("commit retained FIN");
+
+    assert!(!state.endpoint.remote_open);
+    assert_eq!(state.endpoint.pending_remote_fin_offset, None);
+    let mut byte = [0u8; 1];
+    assert_eq!(
+        application.read(&mut byte).await.expect("read half-close"),
+        0
+    );
+}
 
 #[test]
 fn request_outstanding_limit_uses_stream_resources_then_exact_ack_headroom() {

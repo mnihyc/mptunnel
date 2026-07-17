@@ -30,6 +30,7 @@ pub enum QuicCarrierError {
     Rcgen(rcgen::Error),
     EmptySecret,
     CapacityFrameOnQuic,
+    IdleTimeoutOutOfRange(quinn::VarIntBoundsExceeded),
 }
 
 impl fmt::Display for QuicCarrierError {
@@ -50,6 +51,9 @@ impl fmt::Display for QuicCarrierError {
             Self::EmptySecret => write!(f, "QUIC carrier shared secret must not be empty"),
             Self::CapacityFrameOnQuic => {
                 write!(f, "PATH_CAPACITY frames are not valid on QUIC carriers")
+            }
+            Self::IdleTimeoutOutOfRange(err) => {
+                write!(f, "QUIC carrier idle timeout is out of range: {err}")
             }
         }
     }
@@ -102,5 +106,11 @@ impl From<quinn::crypto::rustls::NoInitialCipherSuite> for QuicCarrierError {
 impl From<rcgen::Error> for QuicCarrierError {
     fn from(value: rcgen::Error) -> Self {
         Self::Rcgen(value)
+    }
+}
+
+impl From<quinn::VarIntBoundsExceeded> for QuicCarrierError {
+    fn from(value: quinn::VarIntBoundsExceeded) -> Self {
+        Self::IdleTimeoutOutOfRange(value)
     }
 }

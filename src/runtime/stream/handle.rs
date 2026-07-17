@@ -161,6 +161,10 @@ impl ReliablePathStream {
         self.output.subscribe_updates()
     }
 
+    pub(in crate::runtime) fn has_live_output(&self) -> bool {
+        self.output.has_live_output()
+    }
+
     pub(in crate::runtime) fn capacity_notifies(&self) -> Vec<Arc<Notify>> {
         self.output.capacity_notifies()
     }
@@ -561,6 +565,13 @@ impl FixedReliablePathOutput {
 }
 
 impl ReliablePathStreamOutput {
+    fn has_live_output(&self) -> bool {
+        match self {
+            Self::Fixed(fixed) => !fixed.commands().is_closed(),
+            Self::Switchable(binding) => binding.has_live_output(),
+        }
+    }
+
     /// Fixed request outputs die with their carrier command port. Switchable
     /// response outputs remain live while the binding can select another port.
     fn is_terminally_closed(&self) -> bool {

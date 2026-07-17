@@ -1,6 +1,8 @@
 //! Server listener composition; carrier loops remain under `runtime::path`.
 
-use crate::config::{ManagementConfig, MppPerformanceConfig, ResourceLimits, SecurityConfig};
+use crate::config::{
+    ManagementConfig, MppPerformanceConfig, ResourceLimits, SecurityConfig, SessionConfig,
+};
 use crate::outbound::{self, DnsConfig, OutboundConfig, TargetProtocol};
 use crate::protocol::UnderlayProtocol;
 use crate::runtime::datagram::ServerDatagramService;
@@ -33,6 +35,7 @@ pub(in crate::runtime) async fn run(
     security: SecurityConfig,
     performance: MppPerformanceConfig,
     resources: ResourceLimits,
+    session: SessionConfig,
     management: ManagementConfig,
 ) -> Result<(), RuntimeError> {
     let runtime = new_identity_runtime_with_metadata(
@@ -44,6 +47,7 @@ pub(in crate::runtime) async fn run(
         security,
         performance,
         resources,
+        session.retention_timeout,
         management.peer_diagnostics_enabled(),
     );
     let bound = bind_paths(&runtime.paths).await?;
@@ -84,6 +88,7 @@ pub(in crate::runtime) fn new_identity_runtime(
         security,
         performance,
         resources,
+        SessionConfig::default().retention_timeout,
         false,
     )
 }
@@ -98,6 +103,7 @@ pub(super) fn new_identity_runtime_with_metadata(
     security: SecurityConfig,
     performance: MppPerformanceConfig,
     resources: ResourceLimits,
+    session_retention_timeout: Duration,
     allow_peer_diagnostics: bool,
 ) -> ServerIdentityRuntime {
     let mux_limits = resources.into();
@@ -108,6 +114,7 @@ pub(super) fn new_identity_runtime_with_metadata(
         outbound_connect_timeout,
         performance,
         mux_limits,
+        session_retention_timeout,
         telemetry.clone(),
     );
     let stream_target_outbound = outbound.clone();

@@ -69,6 +69,12 @@ Use repeated explicit IPv4 and IPv6 listener/bind/resolver values. Do not rely
 on OS-specific dual-stack defaults. Egress DNS strategy and connect timeout
 belong to the outbound that performs resolution and connection.
 
+`[session].retention_timeout_ms` and
+`--session-retention-timeout-ms` set the absolute time an established logical
+stream may remain without any authenticated carrier. The default is 300,000 ms.
+Retries never extend that deadline. Healthy idle streams with a live carrier do
+not consume it; TCP heartbeat and native QUIC idle timers remain separate.
+
 Use `mptunnel --help` and subcommand help as the complete option and environment
 variable reference. Validate configs in the target binary whenever possible;
 cross-target parsing can also be smoke-tested under Wine.
@@ -154,7 +160,12 @@ targets, local tags, credentials, and every other authenticated session. One
 request per session may be in flight, requests time out, and responders admit
 at most one snapshot request per session per second. A rate-limited or
 codec-oversized complete snapshot returns `unavailable`; it is never truncated.
-The dashboard does not poll the peer automatically.
+The dashboard auto-refresh selector applies one completion-driven cadence to
+both local status and the currently selected peer diagnostic request: 1 s,
+5 s, 30 s, or manual only. It never overlaps cycles. Peer requests occur only
+when the local endpoint advertises a connected diagnostic control session and
+the remote endpoint permits diagnosis; either client or server may be the
+requesting side. Manual mode sends no periodic local or peer request.
 
 Path control uses `enabled`, `suspect`, `failed`, or `disabled`. Enabling clears
 the operator disable but leaves a path suspect until fresh carrier liveness
@@ -180,6 +191,7 @@ transmission modes and not desired memory occupancy.
 | `max_path_flight_bytes` | 64 MiB | per-path MPP-flight ceiling |
 | `max_reliable_relay_chunk_bytes` | 512 KiB | local read-buffer ceiling |
 | TCP heartbeat | 10 s / 30 s | idle TCP carrier liveness |
+| QUIC keep-alive / idle timeout | 10 s / 30 s | native QUIC carrier liveness |
 | outbound connect timeout | 10 s | target/upstream dial bound |
 
 Raise a bound only after diagnostics identify it as the limiting resource.
@@ -235,12 +247,20 @@ delivery. An alternative-path attempt receives a new flow-local datagram ID;
 operators must therefore allow for duplicate delivery if a delayed first
 attempt and its retry both reach the target.
 
-Idle TCP heartbeats and authenticated path probes detect reachability. Active
+Idle TCP heartbeats, native QUIC keep-alives, and authenticated path probes
+detect reachability. Active
 failover additionally uses exact MPP progress, path-instance lifetime, PTO,
 and queue/flight evidence. A reconnect creates a new physical path instance;
 old flights and evidence cannot be inherited from its numeric path ID. A
 stream attachment incarnation is separate, so detach and reattach
 also cannot inherit ownership merely because the carrier stayed live.
+
+When every carrier disappears, an established logical stream retains its MPP
+sequence, Data ACK, receive-window, FIN, and bounded repair/reorder state while
+the client rotates reconnect attempts across configured TCP and QUIC paths.
+Both endpoints stop reading their local product socket so ordinary TCP
+backpressure bounds memory. Reattachment within the session-retention deadline
+continues the same stream; expiry closes both local sockets and registry state.
 
 The concrete fences differ by direction. Request scheduling uses the physical
 path instance plus `attachment_id`. Response new-data dispatch uses the physical

@@ -2,6 +2,7 @@
 
 use crate::config::{
     ClientConfig, LocalIngressConfig, ManagementConfig, MppPerformanceConfig, ResourceLimits,
+    SessionConfig,
 };
 use crate::ingress::IngressConfig;
 use crate::protocol::UnderlayProtocol;
@@ -12,7 +13,7 @@ use crate::runtime::ingress_runtime::{
 };
 use crate::runtime::management::spawn_client_management_services;
 use crate::runtime::packet_device::PacketDeviceProvider;
-use crate::runtime::path::ClientPathContext;
+use crate::runtime::path::{ClientPathContext, ClientPathRuntimeOptions};
 use crate::runtime::tun_l4::run_tun_l4_client;
 use crate::transport::CarrierNetworkProvider;
 use std::sync::Arc;
@@ -21,6 +22,7 @@ use std::time::Duration;
 pub(super) async fn run(
     client: ClientConfig,
     resources: ResourceLimits,
+    session: SessionConfig,
     management: ManagementConfig,
     packet_devices: Arc<dyn PacketDeviceProvider>,
     carrier_network: Arc<dyn CarrierNetworkProvider>,
@@ -33,6 +35,7 @@ pub(super) async fn run(
     let context = new_path_context(
         &client,
         resources,
+        session,
         0,
         carrier_network,
         management.peer_diagnostics_enabled(),
@@ -68,18 +71,22 @@ pub(super) async fn run(
 pub(super) fn new_path_context(
     client: &ClientConfig,
     resources: ResourceLimits,
+    session: SessionConfig,
     path_group_ordinal: usize,
     carrier_network: Arc<dyn CarrierNetworkProvider>,
     allow_peer_diagnostics: bool,
 ) -> Result<ClientPathContext, RuntimeError> {
-    ClientPathContext::new_with_carrier_network_and_peer_diagnostics(
+    ClientPathContext::new_with_runtime_options(
         client.paths.clone(),
         resources,
         client.route_target.clone(),
         client.ingresses.clone(),
-        path_group_ordinal,
-        carrier_network,
-        allow_peer_diagnostics,
+        ClientPathRuntimeOptions {
+            session_retention_timeout: session.retention_timeout,
+            path_group_ordinal,
+            carrier_network,
+            allow_peer_diagnostics,
+        },
     )
 }
 

@@ -1,232 +1,81 @@
-# mptunnel role-free node configuration.
-#
-# Running `mptunnel` without CLI arguments reads ./config.toml. The runtime
-# model follows a V2Ray-style graph:
-#
-#   inbound(socks5/http/tun) -> outbound(mpp)
-#   inbound(mpp)             -> outbound(direct/socks5/http-connect/...)
-#
-# Each inbound and outbound may have a tag. Tags are display/routing names and
-# are the stable hook for policy-based routing. An inbound selects either one
-# outbound by `outbound = "tag"` or one routing balancer by `balancer = "tag"`.
-# Omit both only when there is exactly one valid target in that protocol class.
+# Common client profile. Run `mptunnel --check-config` after replacing the
+# shared secret and endpoint. Server and minimal client profiles live in ./examples.
 
-# log_level = "info"
-# check_config = false
+log_level = "info"
+check_config = false
 
-# Optional service supervision. Leave unset for normal foreground operation.
-# [service]
-# service_mode = false
-# supervise = false
-# restart_backoff_ms = 1000
-# restart_max_backoff_ms = 30000
-# max_restarts = 10
+[service]
+# Supervision owns process generations, never MPP session state.
+service_mode = false
+supervise = false
+restart_backoff_ms = 1000
+restart_max_backoff_ms = 30000
+max_restarts = 10
 
-# Optional management API. Disabled when listen is unset. HTTP listeners must
-# use loopback addresses and require a token. Expose it remotely only through a
-# same-host TLS reverse proxy or SSH tunnel. Peer diagnostics is an independent
-# responder permission and may be enabled without a local HTTP listener.
-# [management]
-# listen = ["127.0.0.1:7600"]
-# 16-256 visible ASCII characters; use a generated random value.
-# token = "replace-with-operator-token"
-# dashboard = true
-# allow_peer_diagnostics = false
+[session]
+# Established streams survive a complete carrier outage for five minutes.
+# Healthy idle streams with an authenticated carrier do not consume this timer.
+retention_timeout_ms = 300000
 
-# Optional resource envelopes. These are capacity envelopes for adaptive
-# scheduling, not fixed transmission modes. Leave this whole section unset for
-# normal deployments. The runtime derives omitted dependent values from the
-# configured parent envelope so operators do not have to tune every field.
-#
-# Performance rule:
-# - Increase byte envelopes only when high-BDP paths or many concurrent flows
-#   need more room. These values are not preallocated per stream.
-# - Decrease them only for constrained devices after checking throughput and
-#   failover with the management API or lab diagnostics.
-# - Do not use these fields to force latency/bulk behavior. Auto scheduling uses
-#   live RTT, delivery rate, queue, loss, ACK, repair, and carrier evidence.
-# [resources]
-# Product frame safety envelope. Recommended: 1 MiB to 4 MiB. Larger values can
-# reduce framing overhead only if scheduler quanta and writers are also healthy.
-# max_frame_bytes = 1048576
-# Defaults to max_frame_bytes - 64-ish header room when omitted after changing
-# max_frame_bytes. Recommended: leave unset unless embedding very large records.
-# max_payload_bytes = 1048512
-# Sparse stream ACK range cap. Recommended: 128 to 1024. Raise only if lossy or
-# heavily reordered paths show truncated ACK range diagnostics.
-# max_ack_ranges = 256
-# Registry caps, not scheduling policy. Recommended: 8 to 64 paths, 4096+
-# streams for proxy/TUN use. Raise only for intentional large fan-out.
-# max_paths = 64
-# max_streams = 65536
-# QUIC transport stream advertisement cap. This is scoped only to MPP over
-# QUIC/UDP and is independent from byte receive windows. By default it follows
-# max_streams so QUIC does not secretly cap proxy/TUN fan-out; lower it only for
-# constrained deployments that intentionally want fewer concurrent QUIC streams.
-# max_quic_concurrent_bidi_streams = 65536
-# Product flow-control window. Recommended: 64 MiB to 256 MiB for high-BDP VPS
-# paths; lower only for memory-constrained clients.
-# max_stream_window_bytes = 67108864
-# Repair and reorder envelopes for MPTCP-like reinjection and receive-hole debt.
-# Recommended: at least one high-BDP path worth of data; 64 MiB is the default.
-# max_repair_bytes = 67108864
-# max_reorder_bytes = 67108864
-# Datagram burst envelope for SOCKS5 UDP/TUN UDP/realtime traffic.
-# Recommended: 16 MiB to 64 MiB for video/game/TUN workloads.
-# max_datagram_queue_bytes = 16777216
-# Per-path product flight envelope used by TCP framed paths and by the QUIC
-# send-window resource profile. When omitted, config-file parsing derives this
-# from max_repair_bytes. Recommended: 64 MiB to 256 MiB on high-BDP paths.
-# It is a ceiling; actual sender flight is still BDP/queue/loss/carrier adaptive.
-# max_path_flight_bytes = 67108864
-# Read-buffer ceiling only. It must not become a fixed scheduler quantum.
-# Recommended: 256 KiB to 1 MiB. Sender-service quanta follow BBR-style
-# send-quantum sizing from live pacing/delivery rate, packet floors, lane
-# priority, queue/loss state, and this envelope.
-# max_reliable_relay_chunk_bytes = 524288
-# Idle TCP-path liveness. Active failover uses data-plane stall/PTO/repair
-# evidence, so these can stay quiet. Recommended: keep defaults unless idle path
-# recovery is too noisy or too slow for your environment.
-# tcp_path_heartbeat_interval_ms = 10000
-# tcp_path_heartbeat_timeout_ms = 30000
+[management]
+# The API is disabled until a loopback listener and a separate operator token
+# are configured. Peer diagnosis is an independent responder permission.
+listen = []
+dashboard = false
+allow_peer_diagnostics = false
+
+[resources]
+# These are bounded capacity envelopes. Live transport metrics choose paths and
+# scheduling; these values do not select a fixed latency or bulk mode.
+max_frame_bytes = 1048576
+max_payload_bytes = 1048512
+max_ack_ranges = 256
+max_paths = 64
+max_streams = 65536
+max_quic_concurrent_bidi_streams = 65536
+max_stream_window_bytes = 67108864
+max_repair_bytes = 67108864
+max_reorder_bytes = 67108864
+max_datagram_queue_bytes = 16777216
+max_path_flight_bytes = 67108864
+max_reliable_relay_chunk_bytes = 524288
+
+# TCP record heartbeats and native QUIC liveness are separate carrier
+# mechanisms. Both remain below the logical session-retention layer.
+tcp_path_heartbeat_interval_ms = 10000
+tcp_path_heartbeat_timeout_ms = 30000
+quic_path_keep_alive_interval_ms = 10000
+quic_path_idle_timeout_ms = 30000
 
 [[inbounds]]
 tag = "local-socks"
 protocol = "socks5"
 listen = ["127.0.0.1:1080"]
 outbound = "edge-mpp"
-# [inbounds.auth]
-# username = "operator"
-# password = "replace-with-password"
 
-# [[inbounds]]
-# tag = "local-http"
-# protocol = "http"
-# listen = ["127.0.0.1:8080"]
-# outbound = "edge-mpp"
-# [inbounds.auth]
-# username = "operator"
-# password = "replace-with-password"
-
-# [[inbounds]]
-# tag = "local-tun"
-# protocol = "tun"
-# outbound = "edge-mpp"
-# name = "mptunnel0"
-# ipv4 = "10.66.0.2"
-# ipv4_prefix = 24
-# ipv4_gateway = "10.66.0.1"
-# ipv6 = "fd00:66::2"
-# ipv6_prefix = 64
-# mtu = 1500
-# disable_ipv4 = false
-# disable_icmp = false
-# dns_resolvers = ["1.1.1.1:53", "[2606:4700:4700::1111]:53"]
-# dns_ttl_ms = 30000
+[[inbounds]]
+tag = "local-http"
+protocol = "http"
+listen = ["127.0.0.1:8080"]
+outbound = "edge-mpp"
 
 [[outbounds]]
 tag = "edge-mpp"
 protocol = "mpp"
-# udp:// uses the production QUIC carrier. There is no UDP engine selector in
-# production config; all UDP optimization work targets QUIC.
-endpoints = ["tcp://127.0.0.1:7443", "udp://127.0.0.1:7443"]
-# path_probe_interval_ms = 10000
-# path_probe_timeout_ms = 2000
-# MPP sender budget for evidence-backed repair copies. `5` permits repair bytes
-# up to roughly 5% of owner progress plus a small startup floor when that work
-# reduces stalls. This is a hard repair budget, not a product-data throttle or
-# named mode; path proof and carrier-capacity measurement use their own bounded
-# transactions. `100` permits repair equal to owner progress in severe moments,
-# and `200` may be useful on very unstable paths.
-# [outbounds.performance]
-# extra_traffic_hint_percent = 5
+# TCP and QUIC/UDP remain independent carriers under one MPP session.
+endpoints = [
+  "tcp://server.example.com:7443",
+  "udp://server.example.com:7443",
+]
+path_probe_interval_ms = 10000
+path_probe_timeout_ms = 2000
+
+[outbounds.performance]
+# Optional repair traffic is evidence-gated and capped by this operator budget.
+extra_traffic_hint_percent = 5
 
 [outbounds.security]
-# MPP security is scoped to this MPP outbound, so one node can talk to multiple
-# MPP peers with different secrets.
 # Intentionally invalid: replace with at least 32 random bytes before use.
 secret = "REPLACE_ME"
-# cipher = "aes-256-gcm"
-# cipher = "chacha20-poly1305"
-# auth_freshness_window_seconds = 300
-
-# Uncomment this inbound to make the same process accept MPP paths from other
-# nodes. This is the server-side shape: inbound(mpp) -> outbound(direct).
-# [[inbounds]]
-# tag = "edge-listener"
-# protocol = "mpp"
-# endpoints = ["tcp://0.0.0.0:7443", "udp://0.0.0.0:7443"]
-# outbound = "direct-egress"
-# [inbounds.performance]
-# extra_traffic_hint_percent = 5
-# [inbounds.security]
-# secret = "REPLACE_ME"
-
-[[outbounds]]
-tag = "direct-egress"
-protocol = "direct"
-# Optional target connect timeout for this egress outbound only. This is a
-# control-plane dial safety budget, not a data-plane pacing/failover parameter.
-# Leave unset unless a specific upstream or private network needs a different
-# setup budget. The default is 10000 ms.
-# connect_timeout_ms = 10000
-# Optional resolver used by this exact egress outbound. Keep DNS policy at the
-# outbound that owns target-name resolution; do not create a broad DNS table
-# detached from a concrete outbound.
-# dns = { resolvers = ["1.1.1.1:53", "8.8.8.8:53", "[2606:4700:4700::1111]:53"], strategy = "ipv4-then-ipv6", timeout_ms = 2000 }
-
-# To chain accepted requests through another proxy, replace or add an egress
-# outbound and point an inbound(mpp).outbound at its tag.
-# [[outbounds]]
-# tag = "socks-chain"
-# protocol = "socks5"
-# proxy = "127.0.0.1:1081"
-# connect_timeout_ms = 10000
-# dns = { strategy = "ipv4-and-ipv6" }
-#
-# [[outbounds]]
-# tag = "http-chain"
-# protocol = "http-connect"
-# proxy = "127.0.0.1:8081"
-# connect_timeout_ms = 10000
-#
-# [[outbounds]]
-# tag = "http-udp-chain"
-# protocol = "http-connect-udp"
-# proxy = "127.0.0.1:8081"
-# connect_timeout_ms = 10000
-#
-# [[outbounds]]
-# tag = "bound-direct"
-# protocol = "direct"
-# bind_ip = "203.0.113.10"
-# connect_timeout_ms = 10000
-
-# Optional outbound routing policy. `sequence` and `random` operate on egress
-# outbounds. `combined-mpp` combines several MPP outbounds into one logical MPP
-# outbound, preserving each member path's own MPP security.
-#
-# To enforce a balancer, point an inbound's `balancer` field at the balancer
-# tag. Local SOCKS5/HTTP/TUN inbounds may point at `combined-mpp` balancers, and
-# MPP inbounds may point at egress `sequence` or `random` balancers.
-# Example:
-#   [[inbounds]]
-#   protocol = "socks5"
-#   listen = ["127.0.0.1:1080"]
-#   balancer = "combined-edge"
-# [routing]
-#
-# [[routing.balancers]]
-# tag = "egress-sequence"
-# strategy = "sequence"
-# outbounds = ["direct-egress", "socks-chain"]
-#
-# [[routing.balancers]]
-# tag = "egress-random"
-# strategy = "random"
-# outbounds = ["socks-chain", "http-chain"]
-#
-# [[routing.balancers]]
-# tag = "combined-edge"
-# strategy = "combined-mpp"
-# outbounds = ["edge-mpp", "backup-edge-mpp"]
+cipher = "aes-256-gcm"
+auth_freshness_window_seconds = 300

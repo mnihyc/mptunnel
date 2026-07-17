@@ -33,6 +33,64 @@ fn resource_file_config_derives_payload_and_chunk_from_frame_envelope() {
 }
 
 #[test]
+fn toml_separates_logical_session_retention_from_carrier_liveness() {
+    let config = load_config_toml_str(
+        r#"
+[session]
+retention_timeout_ms = 45000
+
+[resources]
+tcp_path_heartbeat_interval_ms = 2000
+tcp_path_heartbeat_timeout_ms = 7000
+quic_path_keep_alive_interval_ms = 3000
+quic_path_idle_timeout_ms = 12000
+
+[[inbounds]]
+protocol = "socks5"
+
+[[outbounds]]
+protocol = "mpp"
+endpoints = ["tcp://127.0.0.1:443", "udp://127.0.0.1:443"]
+
+[outbounds.security]
+secret = "0123456789abcdef0123456789abcdef"
+"#,
+    )
+    .expect("config");
+
+    assert_eq!(config.session.retention_timeout, Duration::from_secs(45));
+    assert_eq!(
+        config.resources.tcp_path_heartbeat_timeout,
+        Duration::from_secs(7)
+    );
+    assert_eq!(
+        config.resources.quic_path_keep_alive_interval,
+        Duration::from_secs(3)
+    );
+    assert_eq!(
+        config.resources.quic_path_idle_timeout,
+        Duration::from_secs(12)
+    );
+}
+
+#[test]
+fn repository_root_config_is_one_valid_client_profile_after_secret_replacement() {
+    let contents =
+        include_str!("../../config.toml").replace("REPLACE_ME", "0123456789abcdef0123456789abcdef");
+    let config = load_config_toml_str(&contents).expect("root client config");
+
+    assert_eq!(config.session, SessionConfig::default());
+    assert_eq!(config.resources, ResourceLimits::default());
+    let CommandConfig::Node(node) = config.command else {
+        panic!("root config must build a node graph");
+    };
+    assert_eq!(node.clients.len(), 1);
+    assert!(node.servers.is_empty());
+    assert_eq!(node.clients[0].ingresses.len(), 2);
+    assert_eq!(node.clients[0].paths.len(), 2);
+}
+
+#[test]
 fn node_config_toml_uses_inbound_to_mpp_outbound_defaults_and_management() {
     let config = load_config_toml_str(
         r#"

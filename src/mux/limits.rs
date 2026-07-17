@@ -18,6 +18,8 @@ pub struct MuxLimits {
     pub max_reliable_relay_chunk_bytes: usize,
     pub tcp_path_heartbeat_interval: Duration,
     pub tcp_path_heartbeat_timeout: Duration,
+    pub quic_path_keep_alive_interval: Duration,
+    pub quic_path_idle_timeout: Duration,
 }
 
 impl Default for MuxLimits {
@@ -35,6 +37,8 @@ impl Default for MuxLimits {
             max_reliable_relay_chunk_bytes: crate::config::DEFAULT_MAX_RELIABLE_RELAY_CHUNK_BYTES,
             tcp_path_heartbeat_interval: crate::config::DEFAULT_TCP_PATH_HEARTBEAT_INTERVAL,
             tcp_path_heartbeat_timeout: crate::config::DEFAULT_TCP_PATH_HEARTBEAT_TIMEOUT,
+            quic_path_keep_alive_interval: crate::config::DEFAULT_QUIC_PATH_KEEP_ALIVE_INTERVAL,
+            quic_path_idle_timeout: crate::config::DEFAULT_QUIC_PATH_IDLE_TIMEOUT,
         }
     }
 }
@@ -54,6 +58,8 @@ impl From<ResourceLimits> for MuxLimits {
             max_reliable_relay_chunk_bytes: value.max_reliable_relay_chunk_bytes,
             tcp_path_heartbeat_interval: value.tcp_path_heartbeat_interval,
             tcp_path_heartbeat_timeout: value.tcp_path_heartbeat_timeout,
+            quic_path_keep_alive_interval: value.quic_path_keep_alive_interval,
+            quic_path_idle_timeout: value.quic_path_idle_timeout,
         }
     }
 }

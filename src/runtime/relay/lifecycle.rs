@@ -140,13 +140,6 @@ pub(super) fn reliable_relay_queued_send_blocked_for_retry(
     !sender_queue_empty && sender_retry_at.is_some()
 }
 
-pub(super) fn reliable_relay_should_wait_for_pending_path_recovery(
-    remote_open: bool,
-    pending_additional_path_opens: &HashMap<RelayPathKey, RelayAdditionalPathOpenTask>,
-) -> bool {
-    remote_open && !pending_additional_path_opens.is_empty()
-}
-
 // Keep the relay and stream owners visible across the asynchronous attach boundary.
 #[allow(clippy::too_many_arguments)]
 pub(super) async fn handle_additional_path_open_result(
@@ -167,7 +160,7 @@ pub(super) async fn handle_additional_path_open_result(
             #[cfg(feature = "lab-diagnostics")]
             let lane = opened.stream().lane;
             if matches!(mode, ReliableRelayAttachMode::Recovery)
-                && !reliable_relay_should_open_recovery_path(remotes)
+                && remotes.accepted_path_count() > 1
             {
                 opened.close().await;
                 return None;
@@ -421,6 +414,52 @@ pub(super) fn spawn_reliable_relay_recovery_path_open(
         pending,
         result_tx,
     )
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(super) fn spawn_reliable_relay_disconnected_path_open(
+    context: &ClientPathContext,
+    spec: &ReliableRelayOpenSpec,
+    lane: TrafficClass,
+    remotes: &ReliableRelayRemoteSet,
+    send_stream: &ReliableSendStream,
+    attempted_paths: &mut HashSet<RelayPathKey>,
+    pending: &mut HashMap<RelayPathKey, RelayAdditionalPathOpenTask>,
+    result_tx: &mpsc::Sender<RelayAdditionalPathOpenResult>,
+) -> bool {
+    if !remotes.is_empty() || !pending.is_empty() {
+        return false;
+    }
+    let payload_bytes = reliable_relay_attach_payload_bytes(send_stream, lane, context.mux_limits);
+    let candidates =
+        reliable_relay_reinjection_path_candidates(context, remotes, lane, payload_bytes);
+    let Some(key) = candidates
+        .iter()
+        .copied()
+        .find(|candidate| !attempted_paths.contains(candidate))
+    else {
+        // A complete ranked round gets one PTO of rest before ranking afresh.
+        // Health cooldowns and the shared probe service may change that order.
+        if !candidates.is_empty() {
+            attempted_paths.clear();
+        }
+        return false;
+    };
+    attempted_paths.insert(key);
+    spawn_reliable_relay_path_opens(
+        context,
+        spec,
+        lane,
+        ReliableRelayAttachMode::Recovery,
+        remotes.stream_id(),
+        vec![key],
+        pending,
+        result_tx,
+    )
+}
+
+pub(super) fn reliable_relay_disconnected_retry_delay() -> std::time::Duration {
+    transport_pto_from_snapshot(None)
 }
 
 #[allow(clippy::too_many_arguments)]

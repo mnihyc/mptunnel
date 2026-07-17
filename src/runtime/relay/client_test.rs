@@ -1,4 +1,4 @@
-use super::{ClientRelayDeliveryState, ClientRelayState};
+use super::{ClientRelayDeliveryState, ClientRelayDisconnectedState, ClientRelayState};
 use crate::model::capacity::adaptive_reliable_relay_reinjection_bytes;
 use crate::model::path::RelayPathKey;
 use crate::model::work::reliable_persistent_ack_gap_reinjection_limit_bytes;
@@ -8,6 +8,23 @@ use crate::protocol::{OffsetRange, PathId, StreamId, UnderlayProtocol};
 use crate::runtime::sender::ReliableRelaySenderQueue;
 use crate::scheduler::{PathSnapshot, TrafficClass};
 use bytes::Bytes;
+use std::time::{Duration, Instant};
+
+#[test]
+fn disconnected_retries_never_extend_the_absolute_retention_deadline() {
+    let since = Instant::now();
+    let mut state = ClientRelayDisconnectedState::new(since, tokio::time::Instant::now());
+    let retention = Duration::from_secs(300);
+    let deadline = state.retention_deadline(retention);
+
+    state.retry_after(Duration::from_secs(1));
+    state.retry_after(Duration::from_secs(2));
+
+    assert_eq!(state.since, since);
+    assert_eq!(state.retention_deadline(retention), deadline);
+    assert!(!state.expired(since + retention - Duration::from_millis(1), retention));
+    assert!(state.expired(since + retention, retention));
+}
 
 #[test]
 fn delivery_attribution_credits_current_frame_not_released_buffer() {

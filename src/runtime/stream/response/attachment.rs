@@ -76,6 +76,15 @@ pub(in crate::runtime) struct ResponseStreamOutputs {
 }
 
 impl ResponseStreamBinding {
+    pub(in crate::runtime) fn has_live_output(&self) -> bool {
+        self.outputs
+            .lock()
+            .expect("server reliable stream binding lock")
+            .entries
+            .iter()
+            .any(|entry| !entry.commands.is_closed())
+    }
+
     fn allocate_output_incarnation(&self) -> u64 {
         self.next_output_incarnation.fetch_add(1, Ordering::AcqRel)
     }

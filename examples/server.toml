@@ -6,6 +6,10 @@
 
 log_level = "info"
 
+[session]
+# Keep target sockets available for client carrier reattachment.
+retention_timeout_ms = 300000
+
 # The management API is optional, loopback-only, and requires a separate random
 # operator token when enabled.
 # [management]

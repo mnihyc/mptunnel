@@ -1,7 +1,7 @@
 //! Combined-node composition for multiple client and server identities.
 
 use super::{client, server};
-use crate::config::{ManagementConfig, NodeConfig, ResourceLimits};
+use crate::config::{ManagementConfig, NodeConfig, ResourceLimits, SessionConfig};
 use crate::runtime::error::RuntimeError;
 use crate::runtime::management::spawn_node_management_services;
 use crate::runtime::packet_device::PacketDeviceProvider;
@@ -11,6 +11,7 @@ use std::sync::Arc;
 pub(super) async fn run(
     node: NodeConfig,
     resources: ResourceLimits,
+    session: SessionConfig,
     management: ManagementConfig,
     packet_devices: Arc<dyn PacketDeviceProvider>,
     carrier_network: Arc<dyn CarrierNetworkProvider>,
@@ -23,6 +24,7 @@ pub(super) async fn run(
         let context = client::new_path_context(
             &client_config,
             resources,
+            session,
             path_group_ordinal,
             carrier_network.clone(),
             management.peer_diagnostics_enabled(),
@@ -53,6 +55,7 @@ pub(super) async fn run(
             server_config.security,
             server_config.performance,
             resources,
+            session.retention_timeout,
             management.peer_diagnostics_enabled(),
         );
         let bound = server::bind_paths(&runtime.paths).await?;

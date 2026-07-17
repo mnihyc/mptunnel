@@ -16,6 +16,28 @@ fn alternate_key(underlay: UnderlayProtocol) -> CarrierPathKey {
 }
 
 #[test]
+fn live_output_tracks_real_carrier_receiver_lifetime_and_reattachment() {
+    let (binding, _initial, initial_receivers) = binding_for_underlay(UnderlayProtocol::Tcp);
+    assert!(binding.has_live_output());
+
+    drop(initial_receivers);
+    assert!(!binding.has_live_output());
+
+    let alternate = alternate_key(UnderlayProtocol::Udp);
+    let (commands, _receivers) = reliable_path_command_channels(8);
+    assert_eq!(
+        binding.attach(
+            alternate.underlay,
+            alternate.path_id,
+            commands,
+            TrafficClass::Latency,
+        ),
+        ResponseStreamAttachOutcome::Attached
+    );
+    assert!(binding.has_live_output());
+}
+
+#[test]
 fn neutral_attach_adds_one_output_and_validates_the_carrier() {
     let (binding, initial, _initial_receivers) = binding_for_underlay(UnderlayProtocol::Tcp);
     let alternate = alternate_key(UnderlayProtocol::Udp);

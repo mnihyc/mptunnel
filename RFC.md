@@ -193,8 +193,10 @@ Peer status is diagnostic presentation only. It MUST NOT update scheduler
 evidence, path health, congestion control, flow control, capacity admission,
 or failover decisions. Implementations MUST bound the path count, encoded
 frame, request queue, outstanding requests, and timeout. They SHOULD permit at
-most one outstanding request per session and MUST NOT poll automatically. An
-endpoint SHOULD rate-limit accepted requests per authenticated session and
+most one outstanding request per session. Automatic peer requests MUST occur
+only after an authenticated local operator selects a finite refresh interval;
+manual mode MUST send no periodic requests. An endpoint SHOULD rate-limit
+accepted requests per authenticated session and
 return `UNAVAILABLE` without sampling when the limit is reached. If the complete
 path set cannot fit the codec limit, it MUST return `UNAVAILABLE`; a partial path
 set is forbidden.
@@ -340,7 +342,23 @@ ordered in the same sequence space and may be sent on any live attachment.
 `STREAM_DETACH(stream_id)` removes only that carrier attachment.
 `STREAM_RESET(stream_id, reason)` terminates the reliable stream.
 
-### 6.6 Original transmission and reinjection
+### 6.6 Break-before-make retention
+
+An endpoint MAY retain an established reliable stream for a configured
+absolute interval while it has no live carrier attachment. It preserves that
+stream's data-sequence, Data ACK, receive-window, FIN, repair, and reorder
+state, and MUST stop reading new application bytes while no output exists so
+the configured MPP bounds and application transport backpressure remain
+authoritative.
+
+Reconnect attempts MAY rotate across configured TCP and QUIC paths but MUST
+NOT extend the original no-attachment deadline. A newly authenticated
+attachment resumes the same stream identity. Expiry retires the stream and its
+application socket. Ordinary application idle while a live attachment exists
+is not a no-attachment interval and is governed separately by native carrier
+liveness.
+
+### 6.7 Original transmission and reinjection
 
 Before an original response range is committed, the sender revalidates the
 exact path instance and attachment incarnation. The committed response flight

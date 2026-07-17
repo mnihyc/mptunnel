@@ -44,6 +44,19 @@ fn stream_fin_waits_for_final_offset_before_close() {
 }
 
 #[test]
+fn in_order_stream_fin_remains_pending_until_feedback_commits() {
+    let recv_stream = ReliableRecvStream::new(StreamId(2), MuxLimits::default());
+    let mut pending_final_offset = None;
+
+    assert!(
+        receive_stream_fin(&recv_stream, &mut pending_final_offset, 0)
+            .expect("record in-order fin")
+    );
+    assert_eq!(pending_final_offset, Some(0));
+    assert!(pending_stream_fin_ready(&recv_stream, pending_final_offset));
+}
+
+#[test]
 fn terminal_fin_replay_is_independent_of_payload_ack_progress() {
     assert!(!stream_terminal_fin_replay_required(false, false, true));
     assert!(!stream_terminal_fin_replay_required(true, true, true));

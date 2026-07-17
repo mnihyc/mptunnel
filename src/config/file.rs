@@ -2,9 +2,10 @@ use super::{
     AppConfig, CipherSuite, ClientConfig, ClientPathConfig, CommandConfig, ConfigError,
     DEFAULT_AUTH_FRESHNESS_WINDOW_SECONDS, DEFAULT_OUTBOUND_CONNECT_TIMEOUT_MS,
     DEFAULT_PATH_PROBE_INTERVAL_MS, DEFAULT_PATH_PROBE_TIMEOUT_MS, DEFAULT_RESTART_BACKOFF_MS,
-    DEFAULT_RESTART_MAX_BACKOFF_MS, LocalIngressConfig, ManagementConfig, MppPerformanceConfig,
-    NodeConfig, ResourceLimits, RouteTarget, RouteTargetKind, SecurityConfig, SecurityPolicyError,
-    ServerConfig, ServiceConfig, SharedSecret,
+    DEFAULT_RESTART_MAX_BACKOFF_MS, DEFAULT_SESSION_RETENTION_TIMEOUT_MS, LocalIngressConfig,
+    ManagementConfig, MppPerformanceConfig, NodeConfig, ResourceLimits, RouteTarget,
+    RouteTargetKind, SecurityConfig, SecurityPolicyError, ServerConfig, ServiceConfig,
+    SessionConfig, SharedSecret,
 };
 use crate::ingress::tun::{
     DEFAULT_TUN_DNS_TTL_MS, DEFAULT_TUN_IPV4, DEFAULT_TUN_IPV4_PREFIX, DEFAULT_TUN_MTU, TunL4Config,
@@ -40,6 +41,8 @@ struct FileConfig {
     #[serde(default)]
     service: ServiceFileConfig,
     #[serde(default)]
+    session: SessionFileConfig,
+    #[serde(default)]
     resources: ResourceFileConfig,
     #[serde(default)]
     management: ManagementFileConfig,
@@ -68,6 +71,7 @@ impl FileConfig {
             log_level: self.log_level,
             check_config: self.check_config,
             service: self.service.into_config(),
+            session: self.session.into_config(),
             resources: self.resources.into_limits(),
             management: self.management.into_config(),
             security: representative_security,
@@ -75,6 +79,23 @@ impl FileConfig {
         };
         config.validate()?;
         Ok(config)
+    }
+}
+
+#[derive(Debug, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct SessionFileConfig {
+    retention_timeout_ms: Option<u64>,
+}
+
+impl SessionFileConfig {
+    fn into_config(self) -> SessionConfig {
+        SessionConfig {
+            retention_timeout: Duration::from_millis(
+                self.retention_timeout_ms
+                    .unwrap_or(DEFAULT_SESSION_RETENTION_TIMEOUT_MS),
+            ),
+        }
     }
 }
 
@@ -152,6 +173,8 @@ struct ResourceFileConfig {
     max_reliable_relay_chunk_bytes: Option<usize>,
     tcp_path_heartbeat_interval_ms: Option<u64>,
     tcp_path_heartbeat_timeout_ms: Option<u64>,
+    quic_path_keep_alive_interval_ms: Option<u64>,
+    quic_path_idle_timeout_ms: Option<u64>,
 }
 
 impl ResourceFileConfig {
@@ -205,6 +228,14 @@ impl ResourceFileConfig {
             tcp_path_heartbeat_timeout: Duration::from_millis(
                 self.tcp_path_heartbeat_timeout_ms
                     .unwrap_or(defaults.tcp_path_heartbeat_timeout.as_millis() as u64),
+            ),
+            quic_path_keep_alive_interval: Duration::from_millis(
+                self.quic_path_keep_alive_interval_ms
+                    .unwrap_or(defaults.quic_path_keep_alive_interval.as_millis() as u64),
+            ),
+            quic_path_idle_timeout: Duration::from_millis(
+                self.quic_path_idle_timeout_ms
+                    .unwrap_or(defaults.quic_path_idle_timeout.as_millis() as u64),
             ),
         }
     }

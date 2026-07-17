@@ -248,8 +248,23 @@ h3 {
 }
 
 .topbar__actions {
+  align-items: center;
   justify-content: flex-end;
   gap: 8px;
+}
+
+.refresh-control {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  color: var(--text-muted);
+  font-size: 0.7rem;
+  font-weight: 650;
+  white-space: nowrap;
+}
+
+.refresh-control select {
+  min-width: 96px;
 }
 
 .button {
@@ -496,10 +511,9 @@ h3 {
 }
 
 .kpi__detail {
-  overflow: hidden;
   margin-bottom: 0;
-  text-overflow: ellipsis;
-  white-space: nowrap;
+  line-height: 1.3;
+  overflow-wrap: anywhere;
 }
 
 .chart-grid {
@@ -1130,6 +1144,26 @@ input:disabled {
 }
 
 @media (max-width: 700px) {
+  .topbar {
+    grid-template-columns: 1fr;
+  }
+
+  .topbar__brand,
+  .topbar__actions,
+  .topbar__status {
+    grid-column: 1;
+  }
+
+  .topbar__actions {
+    grid-row: 2;
+    justify-content: flex-start;
+    padding-top: 7px;
+  }
+
+  .topbar__status {
+    grid-row: 3;
+  }
+
   .kpi-grid {
     grid-template-columns: repeat(2, minmax(0, 1fr));
   }
@@ -1240,6 +1274,16 @@ input:disabled {
 
   .topbar__actions {
     gap: 5px;
+  }
+
+  .refresh-control {
+    align-items: flex-start;
+    flex-direction: column;
+    gap: 2px;
+  }
+
+  .refresh-control select {
+    min-width: 92px;
   }
 
   .button {

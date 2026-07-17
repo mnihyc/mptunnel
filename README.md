@@ -107,7 +107,9 @@ mptunnel --secret '<secret>' client \
 
 The client now exposes SOCKS5 on `127.0.0.1:1080` and HTTP CONNECT on
 `127.0.0.1:8080`. TCP and UDP listeners can share a numeric port because
-they are separate transports.
+they are separate transports. Established logical streams are retained for
+five minutes when every carrier is unavailable; change that policy with
+`--session-retention-timeout-ms` or `[session].retention_timeout_ms`.
 
 For repeatable deployments, put the same graph in `config.toml`. Tagged
 `[[inbounds]]` select tagged `[[outbounds]]` or routing balancers; MPP

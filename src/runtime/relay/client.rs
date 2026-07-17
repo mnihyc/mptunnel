@@ -60,6 +60,41 @@ pub(super) struct ClientRelayProgressState {
 pub(super) struct ClientRelayRecoveryState {
     pub(super) pending_additional_path_opens: HashMap<RelayPathKey, RelayAdditionalPathOpenTask>,
     pub(super) excluded_paths: HashSet<RelayPathKey>,
+    pub(super) disconnected: Option<ClientRelayDisconnectedState>,
+}
+
+/// Break-before-make state for one already-established logical stream.
+pub(super) struct ClientRelayDisconnectedState {
+    pub(super) since: Instant,
+    pub(super) retry_at: tokio::time::Instant,
+    pub(super) attempted_paths: HashSet<RelayPathKey>,
+}
+
+impl ClientRelayDisconnectedState {
+    pub(super) fn new(since: Instant, retry_at: tokio::time::Instant) -> Self {
+        Self {
+            since,
+            retry_at,
+            attempted_paths: HashSet::new(),
+        }
+    }
+
+    pub(super) fn expired(&self, now: Instant, retention_timeout: std::time::Duration) -> bool {
+        now.saturating_duration_since(self.since) >= retention_timeout
+    }
+
+    pub(super) fn retention_deadline(
+        &self,
+        retention_timeout: std::time::Duration,
+    ) -> Option<tokio::time::Instant> {
+        self.since
+            .checked_add(retention_timeout)
+            .map(tokio::time::Instant::from_std)
+    }
+
+    pub(super) fn retry_after(&mut self, delay: std::time::Duration) {
+        self.retry_at = tokio::time::Instant::now() + delay;
+    }
 }
 
 #[derive(Default)]
@@ -135,6 +170,7 @@ impl ClientRelayState {
             recovery: ClientRelayRecoveryState {
                 pending_additional_path_opens: HashMap::new(),
                 excluded_paths: HashSet::new(),
+                disconnected: None,
             },
             delivery: ClientRelayDeliveryState::default(),
         }

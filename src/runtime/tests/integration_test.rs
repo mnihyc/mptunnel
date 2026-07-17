@@ -1,10 +1,90 @@
 use super::*;
-use crate::config::{DEFAULT_OUTBOUND_CONNECT_TIMEOUT, ResourceLimits};
+use crate::config::{
+    ClientPathConfig, DEFAULT_OUTBOUND_CONNECT_TIMEOUT, ResourceLimits, SessionConfig,
+};
 use crate::outbound::{DnsConfig, OutboundConfig};
 use crate::protocol::PathUsage;
 use crate::runtime::path::ServerLocalPath;
+use crate::transport::SystemCarrierNetworkProvider;
 
 const FULL_STACK_RESPONSE_TIMEOUT: Duration = Duration::from_secs(15);
+
+fn client_context_with_session_retention(
+    paths: Vec<PathSpec>,
+    resources: ResourceLimits,
+    retention_timeout: Duration,
+) -> ClientPathContext {
+    let paths = paths
+        .into_iter()
+        .map(|spec| ClientPathConfig {
+            spec,
+            security: security(),
+        })
+        .collect();
+    ClientPathContext::new_with_runtime_options(
+        paths,
+        resources,
+        None,
+        Vec::new(),
+        crate::runtime::path::ClientPathRuntimeOptions {
+            session_retention_timeout: retention_timeout,
+            path_group_ordinal: 0,
+            carrier_network: Arc::new(SystemCarrierNetworkProvider),
+            allow_peer_diagnostics: false,
+        },
+    )
+    .expect("client context")
+}
+
+async fn open_socks5_tcp_tunnel<S>(client: &mut S, target_addr: SocketAddr)
+where
+    S: AsyncRead + AsyncWrite + Unpin,
+{
+    client
+        .write_all(&[0x05, 0x01, 0x00])
+        .await
+        .expect("auth request");
+    let mut auth_response = [0u8; 2];
+    client
+        .read_exact(&mut auth_response)
+        .await
+        .expect("auth response");
+    assert_eq!(auth_response, [0x05, 0x00]);
+
+    let mut connect = vec![0x05, 0x01, 0x00, 0x01];
+    match target_addr {
+        SocketAddr::V4(addr) => {
+            connect.extend_from_slice(&addr.ip().octets());
+            connect.extend_from_slice(&addr.port().to_be_bytes());
+        }
+        SocketAddr::V6(_) => panic!("expected IPv4 test target"),
+    }
+    client.write_all(&connect).await.expect("connect request");
+    let mut response = [0u8; 10];
+    client
+        .read_exact(&mut response)
+        .await
+        .expect("connect reply");
+    assert_eq!(response[1], Socks5Reply::Succeeded as u8);
+}
+
+async fn wait_for_tcp_path_detached(context: &ClientPathContext, path_index: usize) {
+    tokio::time::timeout(Duration::from_secs(2), async {
+        loop {
+            let detached = {
+                let health = context.health().lock().expect("health lock");
+                let path = health.tcp.get(path_index).expect("TCP path health");
+                path.active_flows == 0 && path.state != SchedulerPathState::Active
+            };
+            if detached {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("TCP carrier did not detach");
+}
 
 #[tokio::test(flavor = "multi_thread")]
 async fn mixed_server_listeners_apply_local_policy_independent_of_wire_path_id() {
@@ -21,6 +101,7 @@ async fn mixed_server_listeners_apply_local_policy_independent_of_wire_path_id()
         security(),
         MppPerformanceConfig::default(),
         ResourceLimits::default(),
+        SessionConfig::default(),
         ManagementConfig::default(),
     ));
     tokio::time::sleep(Duration::from_millis(20)).await;
@@ -718,8 +799,196 @@ async fn tcp_stream_migrates_to_survivor_path_after_active_path_failure() {
     target.await.expect("target join");
 }
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn live_socks5_stream_survives_five_second_total_outage_and_reattaches_over_quic() {
+    let target_listener = TcpListener::bind("127.0.0.1:0").await.expect("target bind");
+    let target_addr = target_listener.local_addr().expect("target addr");
+    let target = tokio::spawn(async move {
+        let (mut stream, _) = target_listener.accept().await.expect("target accept");
+        let mut first = [0u8; 4];
+        stream
+            .read_exact(&mut first)
+            .await
+            .expect("target first read");
+        assert_eq!(&first, b"ping");
+        stream.write_all(b"pong").await.expect("target first write");
+
+        let mut second = [0u8; 4];
+        stream
+            .read_exact(&mut second)
+            .await
+            .expect("target post-outage read");
+        assert_eq!(&second, b"next");
+        stream
+            .write_all(b"done")
+            .await
+            .expect("target post-outage write");
+        stream.shutdown().await.expect("target shutdown");
+    });
+
+    let tcp_path = reserve_tcp_path_with_query("srtt-ms=10&rate-mbps=100").await;
+    let udp_port = reserve_process_unique_udp_port().await;
+    let udp_path = format!("udp://127.0.0.1:{udp_port}?srtt-ms=120&rate-mbps=100")
+        .parse::<PathSpec>()
+        .expect("QUIC recovery path");
+    let tcp_listener = bind_listener(&tcp_path).await.expect("TCP path bind");
+    let tcp_local_path = ServerLocalPath::new(0, tcp_path.clone());
+    let ServerIdentityRuntime {
+        paths: server_context,
+        reliable_relay,
+    } = server_runtime(OutboundConfig::Direct);
+    let server_relay = tokio::spawn(reliable_relay.run());
+    let tcp_server_context = server_context.clone();
+    let tcp_server = tokio::spawn(async move {
+        let (stream, _) = tcp_listener.accept().await.expect("TCP path accept");
+        handle_server_path(stream, tcp_local_path, tcp_server_context).await
+    });
+
+    let resources = ResourceLimits {
+        tcp_path_heartbeat_interval: Duration::from_secs(60),
+        tcp_path_heartbeat_timeout: Duration::from_secs(60),
+        ..ResourceLimits::default()
+    };
+    let context = ClientPathContext::new(vec![tcp_path, udp_path.clone()], security(), resources)
+        .expect("client context with default session retention");
+    let health_context = context.clone();
+    let ingress_listener = TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("ingress bind");
+    let ingress_addr = ingress_listener.local_addr().expect("ingress addr");
+    let mut handler = tokio::spawn(async move {
+        let (server, _) = ingress_listener.accept().await.expect("ingress accept");
+        handle_socks5_client_stream(server, context).await
+    });
+    let mut client = TcpStream::connect(ingress_addr)
+        .await
+        .expect("ingress client");
+
+    open_socks5_tcp_tunnel(&mut client, target_addr).await;
+    client.write_all(b"ping").await.expect("first payload");
+    let mut first_response = [0u8; 4];
+    client
+        .read_exact(&mut first_response)
+        .await
+        .expect("first response");
+    assert_eq!(&first_response, b"pong");
+
+    tcp_server.abort();
+    let _ = tcp_server.await;
+    client
+        .write_all(b"next")
+        .await
+        .expect("payload buffered during outage");
+    wait_for_tcp_path_detached(&health_context, 0).await;
+
+    tokio::time::sleep(Duration::from_secs(5)).await;
+    assert!(
+        !handler.is_finished(),
+        "logical SOCKS stream closed during the retention window"
+    );
+
+    let udp_endpoint = bind_server_udp_endpoint(&udp_path, &server_context)
+        .await
+        .expect("QUIC recovery bind");
+    let udp_local_path = ServerLocalPath::new(1, udp_path);
+    let udp_server = tokio::spawn(run_server_udp_listener(
+        udp_endpoint,
+        udp_local_path,
+        server_context,
+    ));
+
+    let mut second_response = [0u8; 4];
+    tokio::time::timeout(
+        Duration::from_secs(10),
+        client.read_exact(&mut second_response),
+    )
+    .await
+    .expect("QUIC reattachment timeout")
+    .expect("post-outage response");
+    assert_eq!(&second_response, b"done");
+    client.shutdown().await.expect("client shutdown");
+    tokio::time::timeout(Duration::from_secs(5), &mut handler)
+        .await
+        .expect("handler completion timeout")
+        .expect("handler join")
+        .expect("handler result");
+
+    udp_server.abort();
+    let _ = udp_server.await;
+    server_relay.abort();
+    let _ = server_relay.await;
+    target.await.expect("target join");
+}
+
 #[tokio::test]
-async fn reliable_relay_active_stream_heartbeat_timeout_closes_without_a_survivor() {
+async fn disconnected_logical_stream_expires_at_configured_retention_timeout() {
+    let target_listener = TcpListener::bind("127.0.0.1:0").await.expect("target bind");
+    let target_addr = target_listener.local_addr().expect("target addr");
+    let target = tokio::spawn(async move {
+        let (mut stream, _) = target_listener.accept().await.expect("target accept");
+        let mut request = [0u8; 4];
+        stream.read_exact(&mut request).await.expect("target read");
+        assert_eq!(&request, b"ping");
+        stream.write_all(b"pong").await.expect("target write");
+        std::future::pending::<()>().await;
+    });
+
+    let path = reserve_tcp_path().await;
+    let listener = bind_listener(&path).await.expect("path bind");
+    let local_path = ServerLocalPath::new(0, path.clone());
+    let ServerIdentityRuntime {
+        paths: server_context,
+        reliable_relay,
+    } = server_runtime(OutboundConfig::Direct);
+    let server_relay = tokio::spawn(reliable_relay.run());
+    let server_path = tokio::spawn(async move {
+        let (stream, _) = listener.accept().await.expect("path accept");
+        handle_server_path(stream, local_path, server_context).await
+    });
+
+    let resources = ResourceLimits {
+        tcp_path_heartbeat_interval: Duration::from_secs(60),
+        tcp_path_heartbeat_timeout: Duration::from_secs(60),
+        ..ResourceLimits::default()
+    };
+    let context =
+        client_context_with_session_retention(vec![path], resources, Duration::from_millis(150));
+    let health_context = context.clone();
+    let (mut client, server) = duplex(4096);
+    let mut handler = tokio::spawn(handle_socks5_client_stream(server, context));
+
+    open_socks5_tcp_tunnel(&mut client, target_addr).await;
+    client.write_all(b"ping").await.expect("payload write");
+    let mut response = [0u8; 4];
+    client
+        .read_exact(&mut response)
+        .await
+        .expect("payload read");
+    assert_eq!(&response, b"pong");
+
+    server_path.abort();
+    let _ = server_path.await;
+    wait_for_tcp_path_detached(&health_context, 0).await;
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    assert!(
+        !handler.is_finished(),
+        "logical stream expired before its configured retention timeout"
+    );
+
+    let result = tokio::time::timeout(Duration::from_secs(1), &mut handler)
+        .await
+        .expect("retention expiry timeout")
+        .expect("handler join");
+    assert!(matches!(result, Err(RuntimeError::SessionRetentionTimeout)));
+
+    target.abort();
+    let _ = target.await;
+    server_relay.abort();
+    let _ = server_relay.await;
+}
+
+#[tokio::test]
+async fn reliable_relay_heartbeat_timeout_enters_session_retention_without_a_survivor() {
     let (path, server_path) =
         spawn_reliable_relay_heartbeat_blackhole(Duration::from_millis(500)).await;
     let resources = ResourceLimits {
@@ -727,7 +996,8 @@ async fn reliable_relay_active_stream_heartbeat_timeout_closes_without_a_survivo
         tcp_path_heartbeat_timeout: Duration::from_millis(30),
         ..ResourceLimits::default()
     };
-    let context = ClientPathContext::new(vec![path], security(), resources).expect("ctx");
+    let context =
+        client_context_with_session_retention(vec![path], resources, Duration::from_millis(300));
     let health_context = context.clone();
     let (mut client, server) = duplex(4096);
     let mut handler = tokio::spawn(handle_socks5_client_stream(server, context));
@@ -751,11 +1021,12 @@ async fn reliable_relay_active_stream_heartbeat_timeout_closes_without_a_survivo
     client.read_exact(&mut response).await.expect("reply");
     assert_eq!(response[1], Socks5Reply::Succeeded as u8);
 
-    let result = tokio::time::timeout(Duration::from_millis(150), &mut handler)
-        .await
-        .expect("a stream with no survivor must not stall")
-        .expect("handler join");
-    assert!(matches!(result, Err(RuntimeError::PathHeartbeatTimeout)));
+    assert!(
+        tokio::time::timeout(Duration::from_millis(150), &mut handler)
+            .await
+            .is_err(),
+        "carrier heartbeat loss must not close the logical stream before retention expiry"
+    );
     {
         let health = health_context.health().lock().expect("health lock");
         assert!(matches!(
@@ -763,6 +1034,12 @@ async fn reliable_relay_active_stream_heartbeat_timeout_closes_without_a_survivo
             SchedulerPathState::Suspect | SchedulerPathState::Failed
         ));
     }
+
+    let result = tokio::time::timeout(Duration::from_secs(1), &mut handler)
+        .await
+        .expect("session retention expiry")
+        .expect("handler join");
+    assert!(matches!(result, Err(RuntimeError::SessionRetentionTimeout)));
 
     server_path
         .await
@@ -1328,6 +1605,7 @@ async fn server_runtime_binds_udp_path_and_relays_direct_udp_datagram() {
         security(),
         MppPerformanceConfig::default(),
         ResourceLimits::default(),
+        SessionConfig::default(),
         ManagementConfig::default(),
     ));
     tokio::time::sleep(Duration::from_millis(10)).await;
@@ -1362,6 +1640,7 @@ async fn server_runtime_demuxes_concurrent_udp_peers_on_one_bind_path() {
         security(),
         MppPerformanceConfig::default(),
         ResourceLimits::default(),
+        SessionConfig::default(),
         ManagementConfig::default(),
     ));
     tokio::time::sleep(Duration::from_millis(10)).await;
@@ -1722,6 +2001,7 @@ async fn socks5_udp_associate_does_not_block_fast_datagram_behind_slow_response(
         security(),
         MppPerformanceConfig::default(),
         ResourceLimits::default(),
+        SessionConfig::default(),
         ManagementConfig::default(),
     ));
     tokio::time::sleep(Duration::from_millis(10)).await;

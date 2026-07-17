@@ -53,3 +53,22 @@ fn dashboard_auth_form_cannot_navigate_without_javascript() {
     assert!(DASHBOARD_HTML.contains(r#"<link rel="icon" href="data:image/svg+xml,"#));
     assert!(CONTENT_SECURITY_POLICY.contains("form-action 'none'"));
 }
+
+#[test]
+fn dashboard_auto_refresh_contract_is_bounded_and_includes_peer_status() {
+    assert!(DASHBOARD_HTML.contains(r#"<label class="refresh-control" for="refresh-interval">"#));
+    for option in [
+        r#"<option value="1000">1 second</option>"#,
+        r#"<option value="5000" selected>5 seconds</option>"#,
+        r#"<option value="30000">30 seconds</option>"#,
+        r#"<option value="0">Manual only</option>"#,
+    ] {
+        assert!(DASHBOARD_HTML.contains(option), "missing {option}");
+    }
+    assert!(DASHBOARD_JS.contains("const REFRESH_INTERVALS_MS = [0, 1000, 5000, 30000];"));
+    assert!(DASHBOARD_JS.contains("await refreshDashboard(\"poll\");"));
+    assert!(DASHBOARD_JS.contains("await requestPeerStatus(source, true);"));
+    assert!(DASHBOARD_JS.contains("if (refreshBusy()) return;"));
+    assert!(DASHBOARD_JS.contains("state.refreshTimer = window.setTimeout(async function ()"));
+    assert!(DASHBOARD_JS.contains("state.refreshIntervalMs !== 0"));
+}

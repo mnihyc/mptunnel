@@ -54,10 +54,46 @@ async fn quic_carrier_rejects_wrong_shared_secret_before_product_frames() {
     server_task.await.expect("server task");
 }
 
+#[tokio::test]
+async fn quic_keep_alive_preserves_a_quiet_authenticated_carrier() {
+    let secret = b"0123456789abcdef0123456789abcdef";
+    let mux_limits = MuxLimits {
+        quic_path_keep_alive_interval: Duration::from_millis(20),
+        quic_path_idle_timeout: Duration::from_millis(80),
+        ..MuxLimits::default()
+    };
+    let server = Endpoint::bind_server(
+        "127.0.0.1:0".parse().expect("server addr"),
+        secret,
+        mux_limits,
+    )
+    .await
+    .expect("server endpoint");
+    let server_addr = server.local_addr().expect("server local addr");
+    let accepted = tokio::spawn(async move { server.accept().await.expect("server connection") });
+    let client = Endpoint::bind_client(
+        "127.0.0.1:0".parse().expect("client addr"),
+        secret,
+        mux_limits,
+    )
+    .await
+    .expect("client endpoint");
+    let client_connection = client
+        .connect(server_addr)
+        .await
+        .expect("client connection");
+    let server_connection = accepted.await.expect("accept task");
+
+    tokio::time::sleep(Duration::from_millis(250)).await;
+
+    assert!(!client_connection.is_closed());
+    assert!(!server_connection.is_closed());
+}
+
 #[test]
 fn quic_transport_profile_follows_mux_resource_envelope() {
     let mux_limits = MuxLimits::default();
-    let transport = quic_transport_config(mux_limits);
+    let transport = quic_transport_config(mux_limits).expect("transport config");
     let rendered = format!("{transport:?}");
     let stream_window = mux_limits.max_stream_window_bytes;
     let receive_window = stream_window
@@ -72,6 +108,8 @@ fn quic_transport_profile_follows_mux_resource_envelope() {
     assert!(rendered.contains(&format!("send_window: {send_window}")));
     assert!(rendered.contains(&format!("max_concurrent_bidi_streams: {bidi_streams}")));
     assert!(rendered.contains("max_concurrent_uni_streams: 0"));
+    assert!(rendered.contains("max_idle_timeout: Some(30000)"));
+    assert!(rendered.contains("keep_alive_interval: Some(10s)"));
 }
 
 #[test]
@@ -86,7 +124,7 @@ fn quic_stream_limit_is_independent_from_receive_window_ratio() {
         max_quic_concurrent_bidi_streams: 4096,
         ..MuxLimits::default()
     };
-    let transport = quic_transport_config(mux_limits);
+    let transport = quic_transport_config(mux_limits).expect("transport config");
     let rendered = format!("{transport:?}");
 
     assert!(rendered.contains("max_concurrent_bidi_streams: 4096"));

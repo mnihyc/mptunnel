@@ -4,11 +4,13 @@ use crate::config::{
     DEFAULT_EXTRA_TRAFFIC_HINT_PERCENT, DEFAULT_MAX_QUIC_CONCURRENT_BIDI_STREAMS,
     DEFAULT_MAX_RELIABLE_RELAY_CHUNK_BYTES, DEFAULT_OUTBOUND_CONNECT_TIMEOUT_MS,
     DEFAULT_PATH_FLIGHT_BYTES, DEFAULT_PATH_PROBE_INTERVAL_MS, DEFAULT_PATH_PROBE_TIMEOUT_MS,
+    DEFAULT_QUIC_PATH_IDLE_TIMEOUT_MS, DEFAULT_QUIC_PATH_KEEP_ALIVE_INTERVAL_MS,
     DEFAULT_REORDER_BYTES, DEFAULT_REPAIR_BYTES, DEFAULT_RESTART_BACKOFF_MS,
-    DEFAULT_RESTART_MAX_BACKOFF_MS, DEFAULT_STREAM_WINDOW_BYTES,
-    DEFAULT_TCP_PATH_HEARTBEAT_INTERVAL_MS, DEFAULT_TCP_PATH_HEARTBEAT_TIMEOUT_MS,
-    LocalIngressConfig, ManagementConfig, MppPerformanceConfig, ResourceLimits, SecurityConfig,
-    ServerConfig, ServiceConfig, SharedSecret,
+    DEFAULT_RESTART_MAX_BACKOFF_MS, DEFAULT_SESSION_RETENTION_TIMEOUT_MS,
+    DEFAULT_STREAM_WINDOW_BYTES, DEFAULT_TCP_PATH_HEARTBEAT_INTERVAL_MS,
+    DEFAULT_TCP_PATH_HEARTBEAT_TIMEOUT_MS, LocalIngressConfig, ManagementConfig,
+    MppPerformanceConfig, ResourceLimits, SecurityConfig, ServerConfig, ServiceConfig,
+    SessionConfig, SharedSecret,
 };
 use crate::ingress::tun::{DEFAULT_TUN_DNS_TTL_MS, DEFAULT_TUN_MTU, TunL4Config};
 use crate::ingress::{IngressConfig, ProxyAuthConfig};
@@ -61,6 +63,9 @@ pub struct Cli {
     pub service: ServiceArgs,
 
     #[command(flatten)]
+    pub session: SessionArgs,
+
+    #[command(flatten)]
     pub management: ManagementArgs,
 
     #[command(subcommand)]
@@ -87,6 +92,7 @@ impl Cli {
             log_level: self.log_level,
             check_config: self.check_config,
             service: self.service.into_config(),
+            session: self.session.into_config(),
             resources: self.resources.into_limits(),
             management: self.management.into_config(),
             security,
@@ -94,6 +100,26 @@ impl Cli {
         };
         config.validate()?;
         Ok(config)
+    }
+}
+
+#[derive(Debug, Args)]
+pub struct SessionArgs {
+    /// Retain established logical streams while every carrier path is unavailable.
+    #[arg(
+        long = "session-retention-timeout-ms",
+        global = true,
+        env = "MPTUNNEL_SESSION_RETENTION_TIMEOUT_MS",
+        default_value_t = DEFAULT_SESSION_RETENTION_TIMEOUT_MS
+    )]
+    pub retention_timeout_ms: u64,
+}
+
+impl SessionArgs {
+    fn into_config(self) -> SessionConfig {
+        SessionConfig {
+            retention_timeout: Duration::from_millis(self.retention_timeout_ms),
+        }
     }
 }
 
@@ -302,6 +328,22 @@ pub struct ResourceArgs {
         default_value_t = DEFAULT_TCP_PATH_HEARTBEAT_TIMEOUT_MS
     )]
     pub tcp_path_heartbeat_timeout_ms: u64,
+
+    #[arg(
+        long,
+        global = true,
+        env = "MPTUNNEL_QUIC_PATH_KEEP_ALIVE_INTERVAL_MS",
+        default_value_t = DEFAULT_QUIC_PATH_KEEP_ALIVE_INTERVAL_MS
+    )]
+    pub quic_path_keep_alive_interval_ms: u64,
+
+    #[arg(
+        long,
+        global = true,
+        env = "MPTUNNEL_QUIC_PATH_IDLE_TIMEOUT_MS",
+        default_value_t = DEFAULT_QUIC_PATH_IDLE_TIMEOUT_MS
+    )]
+    pub quic_path_idle_timeout_ms: u64,
 }
 
 impl ResourceArgs {
@@ -321,6 +363,10 @@ impl ResourceArgs {
             max_reliable_relay_chunk_bytes: self.max_reliable_relay_chunk_bytes,
             tcp_path_heartbeat_interval: Duration::from_millis(self.tcp_path_heartbeat_interval_ms),
             tcp_path_heartbeat_timeout: Duration::from_millis(self.tcp_path_heartbeat_timeout_ms),
+            quic_path_keep_alive_interval: Duration::from_millis(
+                self.quic_path_keep_alive_interval_ms,
+            ),
+            quic_path_idle_timeout: Duration::from_millis(self.quic_path_idle_timeout_ms),
         }
     }
 }

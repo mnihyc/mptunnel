@@ -19,9 +19,10 @@ runs from corrupting shared topology.
 
 Each invocation retains `run-manifest.json`, an anonymized effective Compose
 config, redacted product configs with SHA-256 checksums, and before/after qdisc
-and interface-counter snapshots. The case-named client config is the path and
-resource contract for its JSON row; the qdisc snapshot is the effective
-underlay contract. Publish these side artifacts with any benchmark table.
+and interface-counter snapshots. Qdisc snapshots include drop, overlimit, and
+backlog counters. The case-named client config is the path and resource
+contract for its JSON row; the qdisc snapshot is the effective underlay
+contract. Publish these side artifacts with any benchmark table.
 
 ## Evidence cohorts
 
@@ -64,9 +65,13 @@ Five simultaneous client/server path networks model different conditions:
 | `fat` | 180 ms, 500 Mbps, 1% loss |
 | `poor` | 420 ms, 50 Mbps, 10% loss, high jitter |
 
-`lab/configure-netem.sh` owns these profiles. Equal-path and controlled matrix
-variants override them explicitly. The shaped profiles emulate plausible
-conditions; they are not measurements of any named ISP or route.
+`lab/configure-netem.sh` owns these profiles. Its queue limit is derived from
+each profile's rate-delay product, including jitter headroom, so unintended
+queue overflow cannot silently add loss. `MPTUNNEL_LAB_NETEM_LIMIT_PACKETS`
+can override that calculation for an explicit queue experiment. Equal-path and
+controlled matrix variants override the profiles explicitly. The shaped
+profiles emulate plausible conditions; they are not measurements of any named
+ISP or route.
 
 ## Selecting cases
 

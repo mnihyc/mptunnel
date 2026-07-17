@@ -178,6 +178,7 @@ class ResultEnrichmentTests(unittest.TestCase):
             "COMPOSE_VERSION": "2",
             "BASELINE_LOCK_SHA256": "",
             "MPTUNNEL_LAB_FAT_LOSS": "0.00%",
+            "MPTUNNEL_LAB_NETEM_LIMIT_PACKETS": "32768",
             "MPTUNNEL_LAB_FAT_LOSS_API_KEY": "must-not-leak-either",
             "MPTUNNEL_LAB_SECRET": "must-not-leak",
         }
@@ -196,7 +197,10 @@ class ResultEnrichmentTests(unittest.TestCase):
             self.assertTrue(manifest["execution"]["isolate_containers_per_case"])
             self.assertEqual(
                 manifest["safe_environment_overrides"],
-                {"MPTUNNEL_LAB_FAT_LOSS": "0.00%"},
+                {
+                    "MPTUNNEL_LAB_FAT_LOSS": "0.00%",
+                    "MPTUNNEL_LAB_NETEM_LIMIT_PACKETS": "32768",
+                },
             )
             self.assertNotIn("must-not-leak", path.read_text(encoding="utf-8"))
             self.assertEqual(manifest["baseline_lock"]["tools"], baseline_lock["tools"])

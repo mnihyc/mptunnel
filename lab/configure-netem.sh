@@ -23,6 +23,49 @@ print(f"{number}{match.group(2)}")
 PY
 }
 
+netem_limit_packets() {
+  python3 - "$1" "$2" "$3" <<'PY'
+import math
+import re
+import sys
+
+
+def parse_rate_bps(value):
+    match = re.fullmatch(
+        r"([0-9]+(?:\.[0-9]+)?)([kmgt]?)(?:bit|bps)?", value.lower()
+    )
+    if match is None:
+        raise SystemExit(f"unsupported netem rate: {value}")
+    scale = {
+        "": 1,
+        "k": 1_000,
+        "m": 1_000_000,
+        "g": 1_000_000_000,
+        "t": 1_000_000_000_000,
+    }
+    return float(match.group(1)) * scale[match.group(2)]
+
+
+def parse_seconds(value):
+    match = re.fullmatch(r"([0-9]+(?:\.[0-9]+)?)(ns|us|ms|s)", value.lower())
+    if match is None:
+        raise SystemExit(f"unsupported netem duration: {value}")
+    scale = {"ns": 1e-9, "us": 1e-6, "ms": 1e-3, "s": 1.0}
+    return float(match.group(1)) * scale[match.group(2)]
+
+
+rate_bps = parse_rate_bps(sys.argv[1])
+delay_seconds = parse_seconds(sys.argv[2])
+jitter_seconds = parse_seconds(sys.argv[3])
+# Netem's packet limit must hold the emulated delay-rate product. Include a
+# three-sigma jitter horizon and two BDPs of headroom so queue overflow does
+# not become an undocumented loss model.
+horizon_seconds = delay_seconds + 3.0 * jitter_seconds
+bdp_packets = math.ceil(rate_bps * horizon_seconds / 8.0 / 1500.0)
+print(max(1000, 2 * bdp_packets + 256))
+PY
+}
+
 lowlat_rate="${MPTUNNEL_LAB_LOWLAT_RATE:-80mbit}"
 lowlat_delay="${MPTUNNEL_LAB_LOWLAT_DELAY:-20ms}"
 lowlat_jitter="${MPTUNNEL_LAB_LOWLAT_JITTER:-2ms}"
@@ -86,22 +129,32 @@ apply_profile() {
   local delay="$3"
   local jitter="$4"
   local loss="$5"
-  local iface
+  local iface limit_packets
 
   iface="$(interface_for_subnet "$subnet_prefix")"
   if [[ -z "$iface" ]]; then
     return 0
   fi
 
+  limit_packets="${MPTUNNEL_LAB_NETEM_LIMIT_PACKETS:-$(
+    netem_limit_packets "$rate" "$delay" "$jitter"
+  )}"
+  if [[ ! "$limit_packets" =~ ^[1-9][0-9]*$ ]]; then
+    echo "MPTUNNEL_LAB_NETEM_LIMIT_PACKETS must be a positive integer" >&2
+    exit 2
+  fi
+
   case "$jitter" in
     0|0ms|0us|0ns|0s)
       tc qdisc replace dev "$iface" root netem \
+        limit "$limit_packets" \
         rate "$rate" \
         delay "$delay" \
         loss "$loss"
       ;;
     *)
       tc qdisc replace dev "$iface" root netem \
+        limit "$limit_packets" \
         rate "$rate" \
         delay "$delay" "$jitter" distribution normal \
         loss "$loss"
@@ -151,7 +204,7 @@ show_profile() {
     case "$addr" in
       172.31.10.*|172.31.15.*|172.31.16.*|172.31.20.*|172.31.30.*)
         echo "$iface $addr"
-        tc qdisc show dev "$iface"
+        tc -s qdisc show dev "$iface"
         ;;
     esac
   done

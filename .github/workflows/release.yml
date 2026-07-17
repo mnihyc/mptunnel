@@ -118,11 +118,62 @@ jobs:
       - name: Package Windows artifact
         if: matrix.kind == 'windows'
         shell: pwsh
+        env:
+          RUSTFLAGS: -C target-feature=+crt-static
         run: scripts/package-release.ps1 -Target "${{ matrix.target }}"
 
       - name: Run native platform tests
         if: matrix.kind == 'windows' || matrix.kind == 'unix'
+        env:
+          RUSTFLAGS: ${{ matrix.kind == 'windows' && '-C target-feature=+crt-static' || '' }}
         run: cargo test --locked --all-features --target ${{ matrix.target }}
+
+      - name: Verify Unix package manifest and binary
+        if: matrix.kind != 'windows'
+        shell: bash
+        run: |
+          set -euo pipefail
+          target="${{ matrix.target }}"
+          version="$(cargo metadata --locked --no-deps --format-version 1 | jq -r '.packages[0].version')"
+          archive="dist/mptunnel-${version}-${target}.tar.gz"
+          python3 .github/scripts/verify-release-archive.py \
+            --archive "$archive" --target "$target" --version "$version"
+          binary="target/${target}/release/mptunnel"
+          file "$binary"
+          case "$target" in
+            x86_64-*) file "$binary" | grep -Eiq 'x86[-_ ]64|x86-64' ;;
+            aarch64-*) file "$binary" | grep -Eiq 'aarch64|arm64' ;;
+            *) echo "unsupported release architecture: $target" >&2; exit 1 ;;
+          esac
+          if [[ "$target" == *apple-darwin ]]; then
+            otool -L "$binary"
+          else
+            readelf -h "$binary"
+          fi
+
+      - name: Verify Windows package manifest, architecture, and imports
+        if: matrix.kind == 'windows'
+        shell: pwsh
+        run: |
+          $metadata = cargo metadata --locked --no-deps --format-version 1 | ConvertFrom-Json
+          $version = $metadata.packages[0].version
+          $target = "${{ matrix.target }}"
+          $archive = "dist/mptunnel-$version-$target.zip"
+          python .github/scripts/verify-release-archive.py `
+            --archive $archive --target $target --version $version
+          if ($LASTEXITCODE -ne 0) { throw "Release archive verification failed" }
+
+          $binary = "target/$target/release/mptunnel.exe"
+          $inspection = & dumpbin.exe /HEADERS /DEPENDENTS $binary
+          if ($LASTEXITCODE -ne 0) { throw "dumpbin failed for $binary" }
+          $inspection | Write-Output
+          $expectedMachine = if ($target.StartsWith("x86_64-")) { "machine \(x64\)" } else { "machine \(ARM64\)" }
+          if (($inspection -join "`n") -notmatch $expectedMachine) {
+            throw "PE machine type does not match $target"
+          }
+          if (($inspection -join "`n") -match '(?i)(VCRUNTIME|MSVCP|UCRTBASE|api-ms-win-crt-)[^\s]*\.dll') {
+            throw "Windows release unexpectedly depends on the dynamic MSVC/UCRT runtime"
+          }
 
       - name: Verify Unix binary version
         if: matrix.kind != 'android' && matrix.kind != 'windows'

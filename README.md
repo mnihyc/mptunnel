@@ -146,8 +146,9 @@ Runtime data and controls are under `/api/`; only the static page and
 
 Peer path diagnostics are disabled by default. Enable
 `--management-allow-peer-diagnostics` on the endpoint that may answer a
-manual request. The response is scoped to the authenticated MPP session and
-does not expose endpoints, targets, credentials, or other sessions. See
+request. The same 1 s, 5 s, 30 s, or manual-only dashboard cadence refreshes
+local status and the selected authenticated peer without overlapping cycles.
+The response does not expose endpoints, targets, credentials, or other sessions. See
 [Operations](docs/OPERATIONS.md#management-api) for the API contract and
 remote-access guidance.
 

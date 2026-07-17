@@ -349,12 +349,14 @@ Each archive contains the product binary, public configuration examples,
 README, license, security/contribution policy, protocol, and selected operator
 docs. Packaging emits a sibling SHA-256 checksum. Windows archives also contain
 the pinned architecture-matched Wintun DLL and upstream license. Packaging
-validates that artifact; only a native Windows host can prove Wintun device,
-route, DNS, and service integration.
+validates that artifact and links the MSVC C runtime statically; only a native
+Windows host can prove Wintun device, route, DNS, and service integration.
 
 Linux release archives use musl targets and do not depend on a host glibc
 baseline. The Android aarch64 archive is a best-effort shell proxy executable;
 it is not an APK, AAR, `VpnService` integration, or proof of device runtime.
+Release CI inspects each archive's exact file manifest and binary architecture,
+rejects dynamic MSVC/UCRT imports, and requires static linkage for musl builds.
 
 ## Releases
 

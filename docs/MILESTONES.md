@@ -1,28 +1,40 @@
 # Release milestones
 
-## 2026-07-17: v0.1.0 evidence freeze
+## 2026-07-18: v0.1.0 release candidate
 
-The release-facing cohort is preserved in [`docs/PERFORMANCE.md`](PERFORMANCE.md)
-with exact source and binary hashes, baseline versions, topology, completion
-status, target-confirmed upload accounting, failover gaps, Wine comparison, and
-claim limits. The measured runtime source is `c196e22`; subsequent release work
-changes documentation, configuration templates, packaging, and CI rather than
-the Rust data plane.
+Runtime source `46bc6f8` is the release candidate. It adds five-minute logical
+session retention across complete carrier loss, the completion-driven
+1 s/5 s/30 s/manual dashboard refresh for local and authorized peer status,
+and a capability-gated basic-UDP QUIC adapter for limited Windows environments.
+TCP and QUIC recovery, congestion control, metrics, and MPP policy remain at
+their documented independent boundaries.
 
-An isolated Rust 1.96.0 rebuild of `c196e22` reproduced the recorded Linux
-binary SHA-256 exactly. The only later Rust edits are a test-only diagnostics
-import gate and the Android entry in the displayed release-target inventory;
-neither changes forwarding behavior.
+The clean final guard completed native TCP and QUIC plus Wine TCP, basic-UDP
+QUIC, aggregation, and balanced-path blackhole cases in both directions. Native
+QUIC measured 254.127/250.831 Mbps on one high-delay path and
+340.048/444.420 Mbps on five; Wine basic-UDP QUIC measured
+67.407/126.886 Mbps on one and 89.043/160.167 Mbps on five. The matched Wine
+balanced-path blackhole completed at 53.130/142.683 Mbps with 2.119/1.851 s
+receiver progress gaps. All uploads were target-confirmed and exact.
 
-The retained same-condition high-delay rows establish TCP and QUIC aggregation
-in both directions. They also preserve the non-ideal single-path facts: MPP/TCP
-was below the adjacent VMess download control, and the Hysteria2 upload control
-remained a receiver-confirmed lower bound. Raw generated results were retired
-after this compact record was checked against their JSON rows.
+Local verification passes 905 Rust tests, warnings-denied Linux and Windows
+GNU clippy, Windows-target unit execution under Wine, formatting, and diff
+integrity. The full native cross-platform Release Check and publication remain
+the final gates before this candidate becomes the frozen milestone.
 
-Release engineering uses a pinned Rust toolchain, linked native target builds,
-a Cargo/tag/published-version gate, basename-valid checksums, least-privilege
-publication, provenance attestations, and a fresh-download asset check.
+## 2026-07-17: matched reference cohort
+
+The adjacent direct, VMess, Hysteria2, MPTCP, and MPP comparison is preserved
+in [`docs/PERFORMANCE.md`](PERFORMANCE.md) with exact source and binary hashes,
+topology, completion status, target-confirmed upload accounting, and claim
+limits. Its measured runtime source is `c196e22`; it is historical reference
+evidence and is not presented as the final v0.1.0 binary.
+
+The reference high-delay rows establish TCP and QUIC aggregation in both
+directions for that binary. They also preserve the non-ideal single-path facts:
+MPP/TCP was below the adjacent VMess download control, and the Hysteria2 upload
+control remained a receiver-confirmed lower bound. An isolated Rust 1.96.0
+rebuild reproduced the recorded Linux SHA-256 exactly.
 
 ## 2026-07-17: Architecture, dashboard, and multipath performance
 

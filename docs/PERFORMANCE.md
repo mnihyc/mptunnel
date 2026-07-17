@@ -1,11 +1,13 @@
 # Performance evidence for v0.1.0
 
 This report records the release-facing runtime evidence collected on
-2026-07-17. It is intentionally narrower than a claim that `mptunnel` is
+2026-07-17 and 2026-07-18. It separates the earlier matched-baseline cohort
+from the final runtime guard; results are never rebound to a binary that was
+not measured. It is intentionally narrower than a claim that `mptunnel` is
 faster on every network. Results are valid for the stated binaries, workload,
 host, and shaped topology.
 
-## Evidence identity
+## Reference cohort identity
 
 | Item | Value |
 | --- | --- |
@@ -20,18 +22,28 @@ host, and shaped topology.
 | Host | Linux 6.12.90, x86_64, 10 CPUs, 34.1 GB RAM |
 | Container engine | Docker 29.5.2, Compose 5.1.4 |
 
-The measured product Rust sources must remain unchanged for these measurements
-to describe the v0.1.0 runtime. Documentation, packaging, or CI-only commits do
-not change the measured binary behavior. The Linux release archives use musl
-and the Windows release archives use MSVC; neither packaged target is the exact
-benchmark binary identified above.
+This identity belongs only to the adjacent direct, VMess, Hysteria2, MPTCP, and
+MPP reference comparisons below. It predates logical-session retention and the
+Windows QUIC socket capability adapter, so it is not the final v0.1.0 runtime
+identity. An isolated Rust 1.96.0 rebuild reproduced its Linux SHA-256 exactly;
+the rows remain valid historical comparisons for that binary.
 
-Before publication, an isolated rebuild of `c196e22` with the pinned Rust
-1.96.0 toolchain reproduced the Linux SHA-256 above exactly. The later Rust
-source delta only narrows a test-only diagnostics import and lists the Android
-artifact in `mptunnel platform`; Cargo package metadata also changes crate
-identity. No protocol, scheduler, carrier, relay, or runtime data-plane source
-changed after the measured commit.
+## Final runtime identity
+
+| Item | Value |
+| --- | --- |
+| Runtime source commit | `46bc6f84a597fafcfb0d1f4957cf5ecf0464ad72` |
+| Source state | clean |
+| Protocol | MPP v2 |
+| Build | Cargo `release`, no optional features |
+| Linux client/server target | `x86_64-unknown-linux-gnu` |
+| Linux binary SHA-256 | `cf9ab98d29a62d94e9942021f2a3902a92ec3d9c71ce98f518f08cb56ffcbca1` |
+| Wine client target | `x86_64-pc-windows-gnu` |
+| Windows PE SHA-256 | `ae0089b2fffd065bf9f64d7b5d576f9537fc331b240fecd185098cc1c35a4659` |
+| Wine runtime | Wine 9.0 on the Linux lab host |
+
+The Linux release archives use musl and the Windows release archives use MSVC;
+neither packaged target is the exact benchmark binary identified above.
 
 ## Method
 
@@ -55,7 +67,40 @@ These are single observations, not medians or confidence intervals. Timing
 variation remains possible, so the tables are regression evidence rather than
 an SLA.
 
-## Same-condition baselines
+## Final runtime guard
+
+The final zero-loss high-delay guard used the same 500 Mbps, 180 ms one-way,
+20 ms jitter profile, one 10-second reliable flow, and exact target-confirmed
+upload accounting. Five-path rows used five equal copies of that profile.
+
+| Client runtime | Reliable carrier | Paths | Download Mbps | Upload Mbps |
+| --- | --- | ---: | ---: | ---: |
+| Linux native | TCP | 1 | 151.702 | 176.121 |
+| Linux native | QUIC | 1 | 254.127 | 250.831 |
+| Linux native | QUIC | 5 | 340.048 | 444.420 |
+| Windows PE under Wine | TCP portable path | 1 | 159.232 | 172.543 |
+| Windows PE under Wine | QUIC basic UDP | 1 | 67.407 | 126.886 |
+| Windows PE under Wine | QUIC basic UDP | 5 | 89.043 | 160.167 |
+
+Every row completed, every upload byte accepted by the probe was confirmed by
+the target, and no row had a recovery gap. Native QUIC gained 33.8% download
+and 77.2% upload over its single path. Basic-UDP QUIC under Wine gained 32.1%
+and 26.2%, while remaining substantially slower than native Quinn; the runtime
+prints that expected compatibility-path warning.
+
+The matched balanced-path blackhole guard also completed under Wine at
+53.130 Mbps download with a 2.119-second recovery gap and 142.683 Mbps upload
+with a 1.851-second target-observed gap. Its upload exceeds the earlier
+same-condition 134.600 Mbps observation. Download fault rows have varied from
+roughly 47 to 79 Mbps on this host, so a single absolute fault goodput is not a
+release target; completion and the bounded progress gap are the contract.
+
+These current rows guard the final runtime against a release regression. The
+external systems were not rerun in this final abbreviated pass, so baseline
+rankings remain claims about the reference cohort below, not a synthetic merge
+with the current binary.
+
+## Reference same-condition baselines
 
 The high-delay profile used 500 Mbps, 180 ms one-way delay, 20 ms jitter, and
 zero configured loss on each shaped path. Single-path rows used one such path.
@@ -102,7 +147,7 @@ an equal replacement.
 
 Those comparisons are arithmetic over this cohort only.
 
-## Representative Linux matrix
+## Reference Linux matrix
 
 The heterogeneous TCP cohort used these one-way profiles:
 
@@ -128,7 +173,7 @@ The heterogeneous result is evidence that the runtime can use unlike measured
 paths without fixed link classes. It does not isolate latency-sensitive small
 flow behavior; that requires a separate workload cohort.
 
-## Failover
+## Reference failover
 
 The failover case started one TCP reliable flow on the five heterogeneous
 paths, then changed the balanced path to 100% loss after the probe's trigger.
@@ -148,7 +193,7 @@ observation-boundary effects.
 These rows prove bounded recovery in this blackhole case. They do not prove a
 sub-second failover guarantee or every failure mode.
 
-## Windows executable under Wine
+## Reference Windows executable under Wine
 
 The matched Wine cohort ran the exact Windows PE above as the client in the
 same network namespace and used the same native Linux server.
@@ -173,6 +218,10 @@ path. This is useful portable-path evidence, not a native Windows performance
 claim. Wine does not exercise the Windows kernel's `SIO_TCP_INFO`, Wintun, or
 native network scheduling, and this GNU-target PE is not the MSVC release
 artifact.
+
+The final runtime's separate TCP and basic-UDP QUIC results are recorded in
+the final guard above. Wine exercises compatibility behavior, not native
+Windows UDP acceleration or kernel scheduling.
 
 ## Traffic accounting
 

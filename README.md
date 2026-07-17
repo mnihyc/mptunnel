@@ -30,10 +30,11 @@ not compatible with protocol v1.
 
 ## Measured performance
 
-The table below is one controlled Linux Docker cohort, not an Internet-wide
-claim. Each shaped high-bandwidth path was 500 Mbps with 180 ms one-way delay,
-20 ms jitter, and no configured loss. Each row used one 10-second reliable bulk
-flow; multipath rows used five equal paths.
+The table below is one controlled pre-release Linux Docker reference cohort,
+not an Internet-wide claim or a rebinding of old baselines to the final binary.
+Each shaped high-bandwidth path was 500 Mbps with 180 ms one-way delay, 20 ms
+jitter, and no configured loss. Each row used one 10-second reliable bulk flow;
+multipath rows used five equal paths.
 
 | Reliable carrier | Paths | Download | Upload | Multipath gain |
 | --- | ---: | ---: | ---: | ---: |
@@ -48,8 +49,9 @@ VMess measured 172.267/168.776 Mbps. These results show aggregation in this
 specific high-delay topology. They do not imply the same ranking on every
 network.
 
-See [Performance evidence](docs/PERFORMANCE.md) for the full baseline table,
-failover results, Wine comparison, identities, methodology, and limitations.
+See [Performance evidence](docs/PERFORMANCE.md) for the final-runtime guard,
+full historical baseline table, failover results, Wine comparison, exact
+identities, methodology, and limitations.
 
 ## Install
 
@@ -181,7 +183,7 @@ and data flow are in [Architecture](docs/ARCHITECTURE.md).
 | Platform | Release scope |
 | --- | --- |
 | Linux x86_64/aarch64 | Proxy and TUN runtime; Linux x86_64 is the primary end-to-end lab platform. TUN setup requires host network privileges. |
-| Windows x86_64/aarch64 | Proxy runtime and Wintun packaging. A GNU-target Windows PE has TCP and QUIC proxy-path evidence under Wine; native MSVC, Wintun, and native-kernel performance remain to be exercised. |
+| Windows x86_64/aarch64 | Proxy runtime and Wintun packaging. GitHub Actions builds, tests, and packages MSVC x86_64/aarch64; a GNU-target PE has portable TCP and basic-UDP QUIC proxy evidence under Wine. Native Wintun and throughput/failover remain unmeasured. |
 | macOS x86_64/aarch64 | Proxy and packet-device code is built for release; native packet-device integration is best effort and not represented by the Linux lab results. |
 | Android aarch64 | Best-effort shell proxy binary only. The archive is not an APK, AAR, or `VpnService` integration. |
 

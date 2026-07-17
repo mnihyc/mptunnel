@@ -330,11 +330,13 @@ different protocol or old result.
 
 ## Current release evidence
 
-The compact, release-facing v0.1.0 cohort is recorded in
-[`docs/PERFORMANCE.md`](PERFORMANCE.md). It includes exact source and binary
-identity, same-condition direct/VMess/Hysteria2/MPTCP controls, TCP and QUIC
+The compact, release-facing v0.1.0 evidence is recorded in
+[`docs/PERFORMANCE.md`](PERFORMANCE.md). It keeps the final runtime guard and
+its exact identity separate from the earlier same-condition
+direct/VMess/Hysteria2/MPTCP reference cohort. It also records TCP and QUIC
 single/multipath upload and download, heterogeneous paths, blackhole failover,
-Wine execution, and explicit incomplete-result handling.
+Wine execution, and explicit incomplete-result handling without rebinding old
+baselines to a new binary.
 
 Generated `lab/results/` directories are local evidence, not repository
 content. They are removed after their durable method, identities, exact rows,

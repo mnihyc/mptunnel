@@ -508,7 +508,8 @@ impl ServerTcpPathSession {
                         break;
                     }
                 }
-                ReliablePathCommand::OpenStream { .. } => {
+                ReliablePathCommand::PrepareConnection { .. }
+                | ReliablePathCommand::OpenStream { .. } => {
                     if matches!(
                         self.write_batch_interlocked(&mut writer_pending_bytes)
                             .await?,
@@ -517,7 +518,7 @@ impl ServerTcpPathSession {
                         return Ok(ServerTcpSessionDisposition::Stop);
                     }
                     return Err(RuntimeError::Protocol(
-                        "server TCP path received client open command",
+                        "server TCP path received client session command",
                     ));
                 }
                 ReliablePathCommand::CancelTcpOpen { .. } => {

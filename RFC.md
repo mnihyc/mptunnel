@@ -166,6 +166,16 @@ only the directional `Available` or `Backup` preference is advertised.
 
 ### 4.2 Path lifecycle
 
+The first successful authenticated reachability validation of a logical path
+SHOULD retain its transport connection as the durable path instance. This
+avoids repeating transport and MPP authentication before the first product
+stream. TCP and QUIC use separate carrier setup mechanisms but expose the same
+lifecycle contract. Once a durable instance exists, periodic reachability
+probes MUST use an isolated connection or native carrier liveness; they MUST
+NOT disturb product streams. A validation RTT sample MUST cover an
+authenticated request/response exchange and exclude transport connection
+setup.
+
 `PATH_DRAIN(path_id)` requests graceful retirement of an MPP TCP path. No new
 streams SHOULD attach after drain begins. Existing work may finish. The peer
 completes retirement with `PATH_CLOSE(path_id, reason)`. The current QUIC

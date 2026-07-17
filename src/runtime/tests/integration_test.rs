@@ -127,19 +127,31 @@ async fn mixed_server_listeners_apply_local_policy_independent_of_wire_path_id()
 }
 
 #[tokio::test]
-async fn path_probe_refreshes_tcp_health_without_stream_load() {
+async fn initial_path_probe_retains_tcp_carrier_without_stream_load() {
     let (path, server) = spawn_server_path(OutboundConfig::Direct).await;
     let context =
         ClientPathContext::new(vec![path], security(), ResourceLimits::default()).expect("ctx");
 
     probe_client_paths(&context, Duration::from_secs(1)).await;
 
-    server.await.expect("server join").expect("server probe");
-    let health = context.health().lock().expect("health lock");
-    assert_eq!(health.tcp[0].state, SchedulerPathState::Active);
-    assert!(health.tcp[0].measured_srtt_ms.is_some());
-    assert_eq!(health.tcp[0].active_flows, 0);
-    assert_eq!(health.tcp[0].relay_bytes_in_flight, 0);
+    {
+        let health = context.health().lock().expect("health lock");
+        assert_eq!(health.tcp[0].state, SchedulerPathState::Active);
+        assert!(health.tcp[0].measured_srtt_ms.is_some());
+        assert_eq!(health.tcp[0].active_flows, 0);
+        assert_eq!(health.tcp[0].relay_bytes_in_flight, 0);
+    }
+    assert_eq!(
+        context.tcp_sessions[0]
+            .prepare_connection(tokio::time::Instant::now() + Duration::from_secs(1))
+            .await
+            .expect("prepared TCP carrier"),
+        None,
+        "the initial probe must retain the authenticated product carrier",
+    );
+
+    server.abort();
+    let _ = server.await;
 }
 
 #[tokio::test]

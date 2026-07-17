@@ -30,6 +30,13 @@ make their packet controllers identical:
 A native TCP ACK or QUIC packet ACK is path evidence. It never releases the MPP
 connection-level flight ledger; only a `STREAM_ACK` for the MPP range does.
 
+The startup probe for each configured path establishes and retains its first
+authenticated TCP or QUIC carrier for product use. Later reachability probes
+are isolated from that durable instance. TCP and QUIC keep their own handshake
+and liveness mechanics, while the path layer exposes one prepared-connection
+lifecycle and records only the authenticated exchange as RTT, not connection
+setup time.
+
 ## Protocol-v2 model
 
 `OPEN_STREAM` contains only `stream_id`, `target`, and initial `demand`. Opening

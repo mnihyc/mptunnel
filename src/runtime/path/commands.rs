@@ -201,6 +201,10 @@ impl Drop for TcpCapacityProbeCommand {
 }
 
 pub(in crate::runtime) enum ReliablePathCommand {
+    PrepareConnection {
+        open_deadline: tokio::time::Instant,
+        response: oneshot::Sender<Result<Option<Duration>, RuntimeError>>,
+    },
     OpenStream {
         stream_id: StreamId,
         attempt_id: ClientTcpOpenAttemptId,

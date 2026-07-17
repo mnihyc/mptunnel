@@ -247,13 +247,16 @@ delivery. An alternative-path attempt receives a new flow-local datagram ID;
 operators must therefore allow for duplicate delivery if a delayed first
 attempt and its retry both reach the target.
 
-Idle TCP heartbeats, native QUIC keep-alives, and authenticated path probes
-detect reachability. Active
-failover additionally uses exact MPP progress, path-instance lifetime, PTO,
-and queue/flight evidence. A reconnect creates a new physical path instance;
-old flights and evidence cannot be inherited from its numeric path ID. A
-stream attachment incarnation is separate, so detach and reattach
-also cannot inherit ownership merely because the carrier stayed live.
+The first successful startup probe for each configured path retains its
+authenticated TCP or QUIC carrier for product use. Later probes use isolated
+connections; idle TCP heartbeats and native QUIC keep-alives own liveness on
+the retained instance. Together they detect reachability without placing
+diagnostic work in a product stream. Active failover additionally uses exact
+MPP progress, path-instance lifetime, PTO, and queue/flight evidence. A
+reconnect creates a new physical path instance; old flights and evidence
+cannot be inherited from its numeric path ID. A stream attachment incarnation
+is separate, so detach and reattach also cannot inherit ownership merely
+because the carrier stayed live.
 
 When every carrier disappears, an established logical stream retains its MPP
 sequence, Data ACK, receive-window, FIN, and bounded repair/reorder state while

@@ -535,6 +535,10 @@ async fn handle_connected_client_tcp_command(
     flush_after_frame: bool,
 ) -> Result<(), RuntimeError> {
     match command {
+        ReliablePathCommand::PrepareConnection { response, .. } => {
+            let _ = response.send(Ok(None));
+            Ok(())
+        }
         ReliablePathCommand::OpenStream {
             stream_id,
             attempt_id,

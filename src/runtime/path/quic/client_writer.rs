@@ -190,9 +190,10 @@ pub(super) async fn drain_client_udp_stream_commands(
                     false
                 }
             }
-            ReliablePathCommand::OpenStream { .. } => {
+            ReliablePathCommand::PrepareConnection { .. }
+            | ReliablePathCommand::OpenStream { .. } => {
                 return Err(RuntimeError::Protocol(
-                    "client QUIC UDP path stream received open command",
+                    "client QUIC UDP path stream received TCP session command",
                 ));
             }
             ReliablePathCommand::CancelTcpOpen { .. } => {

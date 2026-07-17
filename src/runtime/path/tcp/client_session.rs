@@ -27,6 +27,8 @@ use crate::runtime::recent_ids::RecentIdCache;
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::Duration;
+use tokio::sync::oneshot;
 
 static NEXT_CLIENT_TCP_CARRIER_GENERATION: AtomicU64 = AtomicU64::new(1);
 
@@ -71,6 +73,11 @@ struct ClientTcpPathSessionState {
     closed_streams: RecentIdCache<StreamId>,
 }
 
+struct PreparedClientTcpConnection {
+    response: oneshot::Sender<Result<Option<Duration>, RuntimeError>>,
+    readiness_rtt: Duration,
+}
+
 pub(super) async fn run_client_tcp_path_session(
     runtime: ClientTcpPathSessionRuntime,
     mut commands: ReliablePathCommandReceivers,
@@ -89,9 +96,19 @@ pub(super) async fn run_client_tcp_path_session(
             match recv_reliable_path_command(&mut commands).await {
                 Some(command) => {
                     let pending_bytes = reliable_path_command_pending_bytes(&command);
-                    handle_disconnected_client_tcp_command(command, &runtime, &mut state).await;
+                    let prepared =
+                        handle_disconnected_client_tcp_command(command, &runtime, &mut state).await;
                     if state.connection.is_some() {
                         carrier_generation.establish();
+                    }
+                    if let Some(prepared) = prepared
+                        && prepared
+                            .response
+                            .send(Ok(Some(prepared.readiness_rtt)))
+                            .is_err()
+                    {
+                        carrier_generation.clear();
+                        state.connection = None;
                     }
                     commands.release_pending_command_bytes(pending_bytes);
                 }
@@ -327,8 +344,41 @@ async fn handle_disconnected_client_tcp_command(
     command: ReliablePathCommand,
     runtime: &ClientTcpPathSessionRuntime,
     state: &mut ClientTcpPathSessionState,
-) {
+) -> Option<PreparedClientTcpConnection> {
     match command {
+        ReliablePathCommand::PrepareConnection {
+            open_deadline,
+            mut response,
+        } => {
+            if open_deadline <= tokio::time::Instant::now() {
+                let _ = response.send(Err(RuntimeError::PathOpenTimedOut));
+                return None;
+            }
+            let connect = connect_client_tcp_path(runtime, open_deadline);
+            tokio::pin!(connect);
+            let connect_result = tokio::select! {
+                biased;
+                _ = response.closed() => return None,
+                result = &mut connect => result,
+            };
+            match connect_result {
+                Ok(connected) => {
+                    if response.is_closed() || open_deadline <= tokio::time::Instant::now() {
+                        let _ = response.send(Err(RuntimeError::PathOpenTimedOut));
+                        return None;
+                    }
+                    let readiness_rtt = connected.carrier.readiness_rtt;
+                    state.connection = Some(connected);
+                    return Some(PreparedClientTcpConnection {
+                        response,
+                        readiness_rtt,
+                    });
+                }
+                Err(err) => {
+                    let _ = response.send(Err(err));
+                }
+            }
+        }
         ReliablePathCommand::OpenStream {
             stream_id,
             attempt_id,
@@ -344,13 +394,13 @@ async fn handle_disconnected_client_tcp_command(
                 let _ = response.send(ClientTcpOpenResponse::RejectedWithoutOpen(
                     RuntimeError::PathOpenTimedOut,
                 ));
-                return;
+                return None;
             }
             let connect = connect_client_tcp_path(runtime, open_deadline);
             tokio::pin!(connect);
             let connect_result = tokio::select! {
                 biased;
-                _ = response.closed() => return,
+                _ = response.closed() => return None,
                 result = &mut connect => result,
             };
             match connect_result {
@@ -359,7 +409,7 @@ async fn handle_disconnected_client_tcp_command(
                         let _ = response.send(ClientTcpOpenResponse::RejectedWithoutOpen(
                             RuntimeError::PathOpenTimedOut,
                         ));
-                        return;
+                        return None;
                     }
                     let open = ClientTcpOpenStreamRequest {
                         stream_id,
@@ -397,6 +447,7 @@ async fn handle_disconnected_client_tcp_command(
         | ReliablePathCommand::ResetAndCloseStream { .. }
         | ReliablePathCommand::CloseStream(_) => {}
     }
+    None
 }
 
 async fn connect_client_tcp_path(

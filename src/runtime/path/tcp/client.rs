@@ -17,6 +17,7 @@ use crate::runtime::path::commands::{
 use crate::scheduler::TrafficClass;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 use tokio::sync::oneshot;
 
 pub(in crate::runtime) struct ClientTcpPathSessionHandle {
@@ -114,6 +115,35 @@ impl ClientTcpPathSessionHandle {
                 Err(err)
             }
             ClientTcpOpenResponse::FailedAfterOpen(err) => Err(err),
+        }
+    }
+
+    /// Establishes the durable carrier without creating a product stream.
+    pub(in crate::runtime) async fn prepare_connection(
+        &self,
+        open_deadline: tokio::time::Instant,
+    ) -> Result<Option<Duration>, RuntimeError> {
+        let session = self.ensure_session_slot();
+        let commands = session.commands.clone();
+        let (response_tx, response_rx) = oneshot::channel();
+        tokio::select! {
+            biased;
+            result = commands.send_control(ReliablePathCommand::PrepareConnection {
+                open_deadline,
+                response: response_tx,
+            }) => result.map_err(|_| RuntimeError::ReliablePathSessionClosed)?,
+            _ = tokio::time::sleep_until(open_deadline) => {
+                return Err(RuntimeError::PathOpenTimedOut);
+            }
+        }
+        tokio::select! {
+            biased;
+            response = response_rx => {
+                response.map_err(|_| RuntimeError::ReliablePathSessionClosed)?
+            }
+            _ = tokio::time::sleep_until(open_deadline) => {
+                Err(RuntimeError::PathOpenTimedOut)
+            }
         }
     }
 

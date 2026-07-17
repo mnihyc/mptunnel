@@ -940,6 +940,7 @@ pub(in crate::runtime) fn reliable_path_command_carrier_credit_bytes(
             usize::try_from(probe.train_payload_bytes).unwrap_or(usize::MAX)
         }
         ReliablePathCommand::ResetAndCloseStream { .. }
+        | ReliablePathCommand::PrepareConnection { .. }
         | ReliablePathCommand::OpenStream { .. }
         | ReliablePathCommand::CancelTcpOpen { .. }
         | ReliablePathCommand::CloseStream(_) => 0,
@@ -1283,6 +1284,7 @@ pub(in crate::runtime) fn reliable_path_command_pending_bytes(
             })
         }
         ReliablePathCommand::OpenStream { .. }
+        | ReliablePathCommand::PrepareConnection { .. }
         | ReliablePathCommand::CancelTcpOpen { .. }
         | ReliablePathCommand::CloseStream(_) => 0,
     }
@@ -1308,6 +1310,7 @@ pub(in crate::runtime) fn reliable_path_command_writer_run_bytes(
             .max(1)
         }
         ReliablePathCommand::OpenStream { .. }
+        | ReliablePathCommand::PrepareConnection { .. }
         | ReliablePathCommand::CancelTcpOpen { .. }
         | ReliablePathCommand::CloseStream(_) => 1,
     }
@@ -1317,6 +1320,7 @@ fn reliable_path_command_stream_id(command: &ReliablePathCommand) -> Option<Stre
     match command {
         ReliablePathCommand::SendFrame(frame) => reliable_path_frame_stream_id(frame),
         ReliablePathCommand::SendTcpCapacityProbe(probe) => Some(probe.stream_id),
+        ReliablePathCommand::PrepareConnection { .. } => None,
         ReliablePathCommand::OpenStream { stream_id, .. }
         | ReliablePathCommand::CancelTcpOpen { stream_id, .. }
         | ReliablePathCommand::ResetAndCloseStream { stream_id, .. }
@@ -1340,6 +1344,7 @@ fn reliable_path_frame_stream_id(frame: &Frame) -> Option<StreamId> {
 #[cfg(feature = "lab-diagnostics")]
 fn reliable_path_command_kind(command: &ReliablePathCommand) -> &'static str {
     match command {
+        ReliablePathCommand::PrepareConnection { .. } => "prepare_connection",
         ReliablePathCommand::OpenStream { .. } => "open_stream",
         ReliablePathCommand::CancelTcpOpen { .. } => "cancel_tcp_open",
         ReliablePathCommand::SendFrame(frame) => reliable_path_frame_kind(frame),

@@ -300,9 +300,10 @@ async fn drain_server_udp_datagram_commands(
                 let _ = udp_path_finish_stream(send);
                 true
             }
-            ReliablePathCommand::OpenStream { .. } => {
+            ReliablePathCommand::PrepareConnection { .. }
+            | ReliablePathCommand::OpenStream { .. } => {
                 return Err(RuntimeError::Protocol(
-                    "server QUIC UDP path datagram stream received open command",
+                    "server QUIC UDP datagram stream received client TCP session command",
                 ));
             }
             ReliablePathCommand::CancelTcpOpen { .. } => {

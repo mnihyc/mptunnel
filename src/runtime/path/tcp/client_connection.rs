@@ -17,7 +17,7 @@ use crate::runtime::path::commands::reliable_path_writer_frame_queue;
 use crate::transport::encrypted::{EncryptedFramedStream, EncryptedFramedTransportError, PeerRole};
 use crate::transport::tcp::{self as tcp_transport, TcpConnectOptions};
 use crate::transport::{CarrierNetworkProvider, CarrierPathIdentity, PathSpec};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use tokio::sync::mpsc;
 
 pub(in crate::runtime) struct ClientTcpCarrierConnection {
@@ -30,6 +30,8 @@ pub(in crate::runtime) struct ClientTcpCarrierConnection {
     pub(in crate::runtime) tcp_metrics: Option<TcpMetricPublisher>,
     pub(in crate::runtime) peer_usage_sequence: u64,
     pub(in crate::runtime) peer_usage: PathUsage,
+    /// One authenticated readiness exchange, excluding TCP connection setup.
+    pub(in crate::runtime) readiness_rtt: Duration,
 }
 
 /// Immutable inputs for one concrete TCP carrier instance.
@@ -176,6 +178,7 @@ pub(in crate::runtime) async fn connect_client_tcp_carrier(
             session_id,
         )?;
 
+        let readiness_started_at = Instant::now();
         framed
             .write_frames(&authentication_frames.into_array())
             .await?;
@@ -215,6 +218,7 @@ pub(in crate::runtime) async fn connect_client_tcp_carrier(
                 }
             }
         }
+        let readiness_rtt = readiness_started_at.elapsed();
 
         if let Some(metrics) = tcp_metrics.as_mut() {
             metrics.begin_epoch();
@@ -235,6 +239,7 @@ pub(in crate::runtime) async fn connect_client_tcp_carrier(
             tcp_metrics,
             peer_usage_sequence: 0,
             peer_usage: peer_usage.expect("path usage checked before carrier creation"),
+            readiness_rtt,
         })
     };
     tokio::time::timeout_at(open_deadline, connect)

@@ -463,12 +463,26 @@ pub(super) async fn probe_tcp_client_path(
     path_index: usize,
     timeout: Duration,
 ) -> Result<Duration, RuntimeError> {
+    let durable_path_session = context
+        .tcp_sessions
+        .get(path_index)
+        .ok_or(RuntimeError::NoSchedulableTcpPath)?;
+    let probe_deadline = tokio::time::Instant::now() + timeout;
+    // Retain the first authenticated carrier. Later probes stay isolated from
+    // live product streams, matching the QUIC path lifecycle.
+    if let Some(rtt) = durable_path_session
+        .prepare_connection(probe_deadline)
+        .await?
+    {
+        return Ok(rtt);
+    }
     let path = context
         .tcp_paths
         .get(path_index)
         .ok_or(RuntimeError::NoSchedulableTcpPath)?;
     let security = context.tcp_path_security(path_index)?;
-    let probe_rtt = tokio::time::timeout(timeout, async {
+    let probe_rtt = tokio::time::timeout_at(probe_deadline, async {
+        let connect_timeout = probe_deadline.saturating_duration_since(tokio::time::Instant::now());
         let tcp_stream = tcp::connect_path_with_provider(
             path,
             context.carrier_path_identity(RelayPathKey {
@@ -476,7 +490,7 @@ pub(super) async fn probe_tcp_client_path(
                 index: path_index,
             }),
             TcpConnectOptions {
-                timeout,
+                timeout: connect_timeout,
                 ..TcpConnectOptions::default()
             },
             context.carrier_network.as_ref(),

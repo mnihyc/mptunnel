@@ -25,6 +25,7 @@ rules are documented in:
 - [`docs/CODE_STRUCTURE.md`](docs/CODE_STRUCTURE.md): module and test rules
 - [`docs/OPERATIONS.md`](docs/OPERATIONS.md): deployment and packaging
 - [`docs/LAB.md`](docs/LAB.md): performance proof methodology
+- [`docs/MILESTONES.md`](docs/MILESTONES.md): accepted release milestones
 
 ## Configuration
 

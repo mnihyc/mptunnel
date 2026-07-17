@@ -153,14 +153,21 @@ pub fn score_path(
     }
 
     let rate = effective_path_rate_bps(path, lane);
-    // Native flight and MPP Data-ACK flight are overlapping views of the same
-    // pipeline. Summing them invents backlog and acts like a second congestion
-    // controller above TCP/QUIC, so completion uses the larger owned view.
     let carrier_work = path.queue_bytes.saturating_add(path.bytes_in_flight);
     let data_level_work = path
         .data_level_queue_bytes
         .saturating_add(path.data_level_bytes_in_flight);
-    let queued_bits = carrier_work.max(data_level_work) as f64 * 8.0;
+    // MPTCP ECF compares the ordered Data Sequence completion frontier, for
+    // which native and Data-ACK flight overlap. Independent latency-sensitive
+    // work is not behind another flow's Data ACK; it follows only bytes still
+    // queued above the carrier plus work owned by the native transport.
+    let path_work = match lane {
+        TrafficClass::Throughput | TrafficClass::Background => carrier_work.max(data_level_work),
+        TrafficClass::Control | TrafficClass::RealtimeDatagram | TrafficClass::Latency => {
+            path.data_level_queue_bytes.saturating_add(carrier_work)
+        }
+    };
+    let queued_bits = path_work as f64 * 8.0;
     let payload_bits = payload_bytes as f64 * 8.0;
 
     let mut eta_ms = path.srtt_ms / 2.0;
@@ -197,7 +204,10 @@ fn active_flow_penalty_ms(path: PathSnapshot, lane: TrafficClass) -> f64 {
 fn effective_path_rate_bps(path: PathSnapshot, lane: TrafficClass) -> f64 {
     let rate = match path.rate_scope {
         PathRateScope::PerFlowGoodput => path.delivery_rate_bps,
-        PathRateScope::PathCapacity => path.pacing_rate_bps.max(path.delivery_rate_bps),
+        // Completion predicts achieved service. A congestion controller's
+        // pacing rate is its current send intent and can transiently exceed the
+        // delivered path rate by a large startup gain.
+        PathRateScope::PathCapacity => path.delivery_rate_bps,
     }
     .max(1.0);
     match lane {

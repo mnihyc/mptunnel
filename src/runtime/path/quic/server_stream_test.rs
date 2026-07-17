@@ -40,6 +40,7 @@ use crate::transport::{
 use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::Duration;
+use tokio::sync::mpsc;
 
 struct ServerUdpTerminalWriterFixture {
     context: ServerPathContext,
@@ -315,6 +316,8 @@ async fn server_quic_terminal_writer_flushes_reset_then_detaches_and_finishes_st
         .expect("dequeue server QUIC terminal command");
     let mut pending_frames = Vec::new();
     let mut path_proofs = PathProofTracker::default();
+    let (_carrier_frames_tx, mut carrier_frames) = mpsc::channel(1);
+    let mut deferred_input = None;
 
     let should_close = drain_server_udp_reliable_commands(
         command,
@@ -324,9 +327,12 @@ async fn server_quic_terminal_writer_flushes_reset_then_detaches_and_finishes_st
         fixture.session_id,
         fixture.stream_id,
         fixture.path_id,
+        &fixture._path_registration,
         &fixture.commands_tx,
         &mut pending_frames,
         &mut path_proofs,
+        &mut carrier_frames,
+        &mut deferred_input,
     )
     .await
     .expect("write server QUIC terminal command");
@@ -396,6 +402,8 @@ async fn server_quic_mismatched_terminal_releases_debt_and_guard_fails_closed() 
     let mut server_send = fixture.server_send.take().expect("server QUIC sender");
     let mut pending_frames = Vec::new();
     let mut path_proofs = PathProofTracker::default();
+    let (_carrier_frames_tx, mut carrier_frames) = mpsc::channel(1);
+    let mut deferred_input = None;
 
     let error = drain_server_udp_reliable_commands(
         command,
@@ -405,9 +413,12 @@ async fn server_quic_mismatched_terminal_releases_debt_and_guard_fails_closed() 
         fixture.session_id,
         fixture.stream_id,
         fixture.path_id,
+        &fixture._path_registration,
         &fixture.commands_tx,
         &mut pending_frames,
         &mut path_proofs,
+        &mut carrier_frames,
+        &mut deferred_input,
     )
     .await
     .expect_err("a stream-local QUIC writer must reject another stream's terminal command");

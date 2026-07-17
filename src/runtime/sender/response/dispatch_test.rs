@@ -10,6 +10,7 @@ use crate::runtime::stream::response::{ResponseStreamAttachOutcome, ResponseStre
 use crate::runtime::stream::{ReliablePathStream, ReliablePathStreamOutput};
 use bytes::Bytes;
 use std::sync::Arc;
+use std::time::Duration;
 use tokio::sync::mpsc;
 
 fn data_frame(offset: u64, payload_bytes: usize) -> Frame {
@@ -72,6 +73,18 @@ fn assert_data_command(receivers: &mut ReliablePathCommandReceivers, offset: u64
     ));
 }
 
+fn output_identity(
+    binding: &ResponseStreamBinding,
+    key: crate::model::path::CarrierPathKey,
+) -> (crate::model::path::CarrierPathKey, u64) {
+    binding
+        .sender_path_targets(TrafficClass::Throughput, 1)
+        .into_iter()
+        .find(|target| target.observation.key == key)
+        .map(|target| (key, target.observation.incarnation))
+        .expect("attached response output")
+}
+
 #[test]
 fn fixed_data_commit_records_flight_before_publishing_command() {
     let (commands, mut receivers) = reliable_path_command_channels(1);
@@ -112,8 +125,8 @@ fn switchable_data_commit_publishes_exact_range_and_command() {
     assert_eq!(
         fixture
             .binding
-            .original_flight_keys_overlapping_frame(&frame),
-        vec![fixture.initial]
+            .original_flight_outputs_overlapping_frame(&frame),
+        vec![output_identity(&fixture.binding, fixture.initial)]
     );
     assert_data_command(&mut fixture.initial_receivers, 4096);
 }
@@ -147,7 +160,7 @@ fn stale_model_generation_rejects_without_carrier_publication() {
     assert!(
         fixture
             .binding
-            .original_flight_keys_overlapping_frame(&frame)
+            .original_flight_outputs_overlapping_frame(&frame)
             .is_empty()
     );
     assert!(try_recv_reliable_path_command(&mut fixture.initial_receivers).is_none());
@@ -187,10 +200,85 @@ fn reinjection_prefers_a_path_without_the_original_range() {
     .expect("alternate accepts reinjection");
 
     assert_eq!(selected, Some(alternate));
-    let mut keys = fixture.binding.flight_keys_overlapping_frame(&frame);
-    keys.sort_by_key(|key| key.path_id.0);
-    assert_eq!(keys, vec![fixture.initial, alternate]);
+    let mut outputs = fixture.binding.flight_outputs_overlapping_frame(&frame);
+    outputs.sort_by_key(|(key, _)| key.path_id.0);
+    assert_eq!(
+        outputs,
+        vec![
+            output_identity(&fixture.binding, fixture.initial),
+            output_identity(&fixture.binding, alternate),
+        ]
+    );
     assert_data_command(&mut alternate_receivers, 0);
+    assert!(try_recv_reliable_path_command(&mut fixture.initial_receivers).is_none());
+}
+
+#[test]
+fn aged_repair_history_on_every_alternate_does_not_block_ack_gap_retry() {
+    let mut fixture = switchable_fixture();
+    let first_alternate = crate::model::path::CarrierPathKey {
+        underlay: UnderlayProtocol::Udp,
+        path_id: PathId(1),
+    };
+    let second_alternate = crate::model::path::CarrierPathKey {
+        underlay: UnderlayProtocol::Udp,
+        path_id: PathId(2),
+    };
+    let (first_commands, mut first_receivers) = reliable_path_command_channels(8);
+    let (second_commands, mut second_receivers) = reliable_path_command_channels(8);
+    fixture.binding.attach(
+        first_alternate.underlay,
+        first_alternate.path_id,
+        first_commands,
+        TrafficClass::Throughput,
+    );
+    fixture.binding.attach(
+        second_alternate.underlay,
+        second_alternate.path_id,
+        second_commands,
+        TrafficClass::Throughput,
+    );
+    assert!(matches!(
+        try_recv_reliable_path_priority_command(&mut first_receivers),
+        Some(ReliablePathCommand::SendFrame(Frame::PathProofData { .. }))
+    ));
+    assert!(matches!(
+        try_recv_reliable_path_priority_command(&mut second_receivers),
+        Some(ReliablePathCommand::SendFrame(Frame::PathProofData { .. }))
+    ));
+
+    let frame = data_frame(0, 4096);
+    fixture
+        .binding
+        .record_original_flight(fixture.initial, &frame);
+    fixture
+        .binding
+        .record_reinjected_flight(first_alternate, &frame);
+    fixture
+        .binding
+        .record_reinjected_flight(second_alternate, &frame);
+    fixture
+        .binding
+        .age_reinjected_flights_for_test(Duration::from_secs(1));
+    assert!(
+        !fixture
+            .binding
+            .has_recent_reinjection_overlap(&frame, Duration::from_millis(100),)
+    );
+
+    let selected = emit_response_frame_from_sender_service(
+        &fixture.stream,
+        frame,
+        TrafficClass::Throughput,
+        CarrierEmitMode::Classified,
+        "ack_gap_reinjection",
+        Some(RelaySendCause::AckGapReinjection),
+    )
+    .expect("aged repair history must leave an alternate eligible");
+
+    assert_eq!(selected, Some(first_alternate));
+    assert_data_command(&mut first_receivers, 0);
+    assert!(try_recv_reliable_path_command(&mut second_receivers).is_none());
     assert!(try_recv_reliable_path_command(&mut fixture.initial_receivers).is_none());
 }
 

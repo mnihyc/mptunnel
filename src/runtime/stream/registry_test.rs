@@ -1,16 +1,15 @@
 use super::*;
-use crate::model::capacity::QuicCapacityProofCandidate;
+use crate::model::capacity::{PATH_OPEN_SCORE_BYTES, RELIABLE_INITIAL_WINDOW_PACKETS};
 use crate::model::path::PathPolicy;
 use crate::mux::MuxLimits;
-use crate::protocol::{PathMetricDirection, PathUsage};
+use crate::protocol::{OffsetRange, PathMetricDirection, PathUsage};
 use crate::runtime::path::commands::reliable_path_command_channels;
 use crate::runtime::path::model::metric_epoch_now;
 use crate::runtime::path::{ServerLocalPathProperties, ServerStreamPathAttachment};
 use crate::runtime::stream::response::{ServerPathMetricsEntry, ServerPathMetricsSource};
 use std::net::SocketAddr;
-use std::time::Duration;
 
-fn receipt_test_metrics(path_id: PathId) -> PathMetrics {
+fn native_quic_test_metrics(path_id: PathId) -> PathMetrics {
     PathMetrics {
         path_id,
         underlay: UnderlayProtocol::Udp,
@@ -28,13 +27,13 @@ fn receipt_test_metrics(path_id: PathId) -> PathMetrics {
         ecn_observed: false,
         bytes_in_flight: 0,
         queue_bytes: 0,
-        inflight_limit_bytes: 100,
-        inflight_hi_bytes: 100,
-        confidence_ppm: 0,
-        app_limited: true,
-        has_ack_derived_data_sample: false,
-        data_sample_count: 0,
-        data_sample_bytes: 0,
+        inflight_limit_bytes: (PATH_OPEN_SCORE_BYTES * 4) as u64,
+        inflight_hi_bytes: (PATH_OPEN_SCORE_BYTES * 4) as u64,
+        confidence_ppm: 1_000_000,
+        app_limited: false,
+        has_ack_derived_data_sample: true,
+        data_sample_count: RELIABLE_INITIAL_WINDOW_PACKETS as u32,
+        data_sample_bytes: (PATH_OPEN_SCORE_BYTES * 4) as u64,
     }
 }
 
@@ -62,25 +61,7 @@ fn late_open_and_closed_output_replacement_inherit_path_evidence() {
     );
     let path_instance_id = registration.path_instance_id();
     port.record_peer_path_usage(&registration, 7, PathUsage::Backup);
-    let metrics = receipt_test_metrics(path_id);
-    let accepted_at = Instant::now();
-    let candidate = QuicCapacityProofCandidate {
-        token: 41,
-        train_bytes: 100,
-        sample_floor_bytes: 100,
-        accounting_slack_bytes: 12,
-        warmup_bytes: 0,
-        required_proof_bytes: 88,
-        written_bytes: 100,
-        written_data_frame_count: 1,
-        receipt_confirmed: true,
-        received_bytes: 100,
-        proof_elapsed: Duration::from_millis(10),
-        rate_bps: 80_000,
-        accepted_at,
-        expires_at: accepted_at + Duration::from_secs(1),
-        proof_validity: Duration::from_secs(1),
-    };
+    let metrics = native_quic_test_metrics(path_id);
     registry
         .path_metrics
         .lock()
@@ -91,7 +72,6 @@ fn late_open_and_closed_output_replacement_inherit_path_evidence() {
                 metrics,
                 source: ServerPathMetricsSource::LocalSender,
                 recorded_at: Instant::now(),
-                capacity_proof: Some(candidate),
             },
         );
 
@@ -123,7 +103,7 @@ fn late_open_and_closed_output_replacement_inherit_path_evidence() {
         .sender_path_targets(TrafficClass::Throughput, 1)
         .into_iter()
         .find(|target| target.observation.key.path_id == path_id)
-        .expect("inherited receipt target");
+        .expect("inherited carrier target");
     assert!(inherited.observation.has_bulk_rate_evidence);
     assert_eq!(inherited.observation.snapshot.confidence, 1.0);
     assert_eq!(
@@ -172,7 +152,7 @@ fn late_open_and_closed_output_replacement_inherit_path_evidence() {
         .sender_path_targets(TrafficClass::Throughput, 1)
         .into_iter()
         .find(|target| target.observation.key.path_id == path_id)
-        .expect("replacement receipt target");
+        .expect("replacement carrier target");
     assert!(replacement.observation.has_bulk_rate_evidence);
     assert_eq!(replacement.observation.snapshot.confidence, 1.0);
     assert_eq!(
@@ -201,9 +181,9 @@ fn peer_status_snapshot_is_session_scoped_and_tracks_registration_lifetime() {
     let first_session = SessionId(801);
     let second_session = SessionId(802);
     let path_id = PathId(4);
-    let mut first_metrics = receipt_test_metrics(path_id);
+    let mut first_metrics = native_quic_test_metrics(path_id);
     first_metrics.delivery_rate_bps = 111;
-    let mut second_metrics = receipt_test_metrics(path_id);
+    let mut second_metrics = native_quic_test_metrics(path_id);
     second_metrics.delivery_rate_bps = 222;
     let first = port.register_carrier_path(
         first_session,
@@ -268,4 +248,78 @@ fn peer_status_snapshot_is_session_scoped_and_tracks_registration_lifetime() {
             .delivery_rate_bps,
         222
     );
+}
+
+#[tokio::test]
+async fn server_stream_try_route_preserves_bounded_backpressure() {
+    let registry = Arc::new(ServerReliableStreamRegistry::new(4));
+    let port = registry.path_port();
+    let session_id = SessionId(901);
+    let stream_id = StreamId(33);
+    let path_id = PathId(0);
+    let registration = port.register_carrier_path(
+        session_id,
+        UnderlayProtocol::Tcp,
+        path_id,
+        ServerLocalPathProperties::default(),
+    );
+    let mux_limits = MuxLimits::default();
+    let (commands, _receivers) = reliable_path_command_channels(8);
+    let mut accepted = match registry
+        .open_or_attach(ServerStreamOpenRequest {
+            session_id,
+            stream_id,
+            target: TargetAddr::Ip(SocketAddr::from(([127, 0, 0, 1], 80))),
+            lane: TrafficClass::Throughput,
+            attachment: ServerStreamPathAttachment {
+                path_registration: registration.clone(),
+                commands,
+                max_frame_payload_bytes: mux_limits.max_payload_bytes,
+            },
+            mux_limits,
+        })
+        .expect("open response stream")
+    {
+        ServerReliableStreamOpen::New(accepted) => accepted,
+        _ => panic!("expected new response stream"),
+    };
+    let mut stream = accepted.take_stream();
+    let first = Frame::StreamAck {
+        stream_id,
+        complete: false,
+        ranges: vec![OffsetRange { start: 0, end: 1 }],
+    };
+    assert!(matches!(
+        port.try_route_frame(&registration, stream_id, first.clone()),
+        Ok(ServerStreamFrameRoute::Routed)
+    ));
+    assert_eq!(stream.recv_frame().await.expect("routed frame"), first);
+
+    let mut backpressured = None;
+    for offset in 1..10_000u64 {
+        let frame = Frame::StreamAck {
+            stream_id,
+            complete: false,
+            ranges: vec![OffsetRange {
+                start: offset,
+                end: offset + 1,
+            }],
+        };
+        match port
+            .try_route_frame(&registration, stream_id, frame)
+            .expect("try route frame")
+        {
+            ServerStreamFrameRoute::Routed => {}
+            ServerStreamFrameRoute::Backpressured(frame) => {
+                backpressured = Some(frame);
+                break;
+            }
+        }
+    }
+    let backpressured = backpressured.expect("bounded stream queue must report pressure");
+    let _ = stream.recv_frame().await.expect("release one queue slot");
+    assert!(matches!(
+        port.try_route_frame(&registration, stream_id, backpressured),
+        Ok(ServerStreamFrameRoute::Routed)
+    ));
 }

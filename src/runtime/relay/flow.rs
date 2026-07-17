@@ -11,7 +11,8 @@ use std::time::{Duration, Instant};
 pub(in crate::runtime) struct ReliableRelayFlowSignals {
     sent_offset: u64,
     received_offset: u64,
-    pending_product_bytes: usize,
+    queued_unsent_bytes: usize,
+    data_ack_outstanding_bytes: usize,
 }
 
 impl ReliableRelayFlowSignals {
@@ -19,17 +20,21 @@ impl ReliableRelayFlowSignals {
         Self {
             sent_offset,
             received_offset,
-            pending_product_bytes: 0,
+            queued_unsent_bytes: 0,
+            data_ack_outstanding_bytes: 0,
         }
     }
 
-    /// Pending product work preserves proven demand while transport
-    /// backpressure stops source reads. It is never promotion evidence.
-    pub(in crate::runtime) fn with_pending_product_bytes(
+    /// Unsent queue bytes are current buffered demand. Data-ACK-outstanding
+    /// flight only preserves demand already established by admitted bytes;
+    /// flight alone never promotes throughput.
+    pub(in crate::runtime) fn with_product_work(
         mut self,
-        pending_product_bytes: usize,
+        queued_unsent_bytes: usize,
+        data_ack_outstanding_bytes: usize,
     ) -> Self {
-        self.pending_product_bytes = pending_product_bytes;
+        self.queued_unsent_bytes = queued_unsent_bytes;
+        self.data_ack_outstanding_bytes = data_ack_outstanding_bytes;
         self
     }
 
@@ -103,12 +108,14 @@ impl ReliableRelayFlowDemandTracker {
         let rebalance_interval = reliable_flow_rebalance_interval(path);
         self.last_rebalance_interval = rebalance_interval;
         let threshold = reliable_flow_bulk_threshold_bytes(path, mux_limits);
-        // Poll frequency is not demand. Fresh bytes prove bulk demand, while
-        // already-admitted product work only prevents a proven bulk flow from
-        // being mistaken for idle during transport backpressure.
-        let has_pending_product_work = signals.pending_product_bytes > 0;
+        // Poll frequency is not demand. Fresh bytes establish the demand
+        // epoch; queued product work shows current buffered demand while
+        // transport or data-level credit catches up.
+        let has_queued_unsent_work = signals.queued_unsent_bytes > 0;
+        let has_active_product_work =
+            has_queued_unsent_work || signals.data_ack_outstanding_bytes > 0;
         let idle_gap = product_delta == 0
-            && !has_pending_product_work
+            && !has_active_product_work
             && now.duration_since(self.last_progress_at)
                 >= reliable_flow_interactive_idle_gap(path);
         if idle_gap {
@@ -133,16 +140,26 @@ impl ReliableRelayFlowDemandTracker {
         let rate_proven_bulk = self.product_rate_bps >= rate_threshold;
         let rate_evidence_bytes =
             reliable_flow_rate_bulk_evidence_bytes(path, mux_limits, threshold);
+        let path_open_threshold = reliable_relay_bulk_path_open_threshold_bytes(path, mux_limits);
         let preopen_additional_paths = !idle_gap
             && self.current != TrafficClass::Throughput
-            && self.epoch_bytes >= reliable_relay_bulk_path_open_threshold_bytes(path, mux_limits);
+            && self.epoch_bytes >= path_open_threshold;
         // Reaching the path-sized demand threshold is itself sufficient bulk
         // evidence. Requiring another event or timer here would deadlock the
         // latency startup admission boundary at exactly the same byte offset.
         let byte_proven_bulk = self.epoch_bytes >= threshold;
         let rate_proven_sustained_bulk =
             rate_proven_bulk && self.epoch_bytes >= rate_evidence_bytes;
-        let sustained_bulk = byte_proven_bulk || rate_proven_sustained_bulk;
+        // Following the general-purpose heuristic in RFC 8684 section 3.9.2,
+        // interpret buffered data only in initial-window units. Several
+        // admitted initial windows plus another queued window are sustained
+        // demand without making Data-ACK flight or a residual tail into proof.
+        let queued_demand_floor = PATH_OPEN_SCORE_BYTES
+            .min(reliable_relay_buffer_len(mux_limits))
+            .max(1);
+        let buffered_bulk = signals.queued_unsent_bytes >= queued_demand_floor
+            && self.epoch_bytes >= path_open_threshold;
+        let sustained_bulk = byte_proven_bulk || rate_proven_sustained_bulk || buffered_bulk;
         let lane = if !idle_gap && (self.current == TrafficClass::Throughput || sustained_bulk) {
             TrafficClass::Throughput
         } else {
@@ -166,6 +183,12 @@ impl ReliableRelayFlowDemandTracker {
             observed_bytes,
             #[cfg(feature = "lab-diagnostics")]
             product_rate_bps: self.product_rate_bps,
+            #[cfg(feature = "lab-diagnostics")]
+            byte_proven_bulk,
+            #[cfg(feature = "lab-diagnostics")]
+            rate_proven_sustained_bulk,
+            #[cfg(feature = "lab-diagnostics")]
+            buffered_bulk,
             #[cfg(feature = "lab-diagnostics")]
             rebalance_interval,
         }
@@ -220,6 +243,12 @@ pub(in crate::runtime) struct ReliableRelayFlowDecision {
     pub(in crate::runtime) observed_bytes: u64,
     #[cfg(feature = "lab-diagnostics")]
     pub(in crate::runtime) product_rate_bps: f64,
+    #[cfg(feature = "lab-diagnostics")]
+    pub(in crate::runtime) byte_proven_bulk: bool,
+    #[cfg(feature = "lab-diagnostics")]
+    pub(in crate::runtime) rate_proven_sustained_bulk: bool,
+    #[cfg(feature = "lab-diagnostics")]
+    pub(in crate::runtime) buffered_bulk: bool,
     #[cfg(feature = "lab-diagnostics")]
     pub(in crate::runtime) rebalance_interval: Duration,
 }

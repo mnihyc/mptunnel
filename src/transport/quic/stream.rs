@@ -3,10 +3,10 @@
 use super::{QuicCarrierError, QuicCarrierTelemetry};
 #[cfg(feature = "lab-diagnostics")]
 use crate::lab_diagnostics::lab_perf_record;
+use crate::protocol::Frame;
 use crate::protocol::codec::{
     CodecLimits, decode_frame_bytes, encode_frame_into, encoded_frame_capacity_hint,
 };
-use crate::protocol::{Frame, FrameWriteClass};
 use bytes::BytesMut;
 use quinn::VarInt;
 use std::sync::Arc;
@@ -25,7 +25,6 @@ pub struct SendStream {
     pub(super) stream: quinn::SendStream,
     pub(super) connection: quinn::Connection,
     pub(super) write_backlog: Arc<AtomicU64>,
-    pub(super) delivery_evidence_written: Arc<AtomicU64>,
     pub(super) telemetry: Arc<QuicCarrierTelemetry>,
     pub(super) encode_buffer: Vec<u8>,
 }
@@ -35,6 +34,7 @@ pub struct SendStream {
 pub(super) struct QuicWriteTransaction {
     connection: quinn::Connection,
     write_backlog: Arc<AtomicU64>,
+    send_credit_released: Arc<tokio::sync::Notify>,
     packet_len: u64,
     fail_close: bool,
 }
@@ -43,11 +43,13 @@ impl QuicWriteTransaction {
     pub(super) fn new(
         connection: quinn::Connection,
         write_backlog: Arc<AtomicU64>,
+        send_credit_released: Arc<tokio::sync::Notify>,
         packet_len: u64,
     ) -> Self {
         Self {
             connection,
             write_backlog,
+            send_credit_released,
             packet_len,
             fail_close: true,
         }
@@ -65,6 +67,7 @@ impl Drop for QuicWriteTransaction {
             .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
                 Some(current.saturating_sub(self.packet_len))
             });
+        self.send_credit_released.notify_waiters();
         if self.fail_close {
             self.connection
                 .close(VarInt::from_u32(1), b"cancelled or failed carrier write");
@@ -87,17 +90,6 @@ pub struct RecvStream {
     read_scratch: Vec<u8>,
 }
 
-impl SendStream {
-    pub fn cancel_measurement(&self, token: u64) -> bool {
-        let should_close = self.telemetry.abort_measurement(token);
-        if should_close {
-            self.connection
-                .close(VarInt::from_u32(1), b"cancelled measurement epoch");
-        }
-        should_close
-    }
-}
-
 pub async fn write_frame(
     send: &mut SendStream,
     frame: &Frame,
@@ -114,21 +106,12 @@ pub async fn write_frames(
     if frames.is_empty() {
         return Ok(());
     }
-    let delivery_evidence_bytes = frames.iter().try_fold(0_u64, |total, frame| {
-        let FrameWriteClass::Ordinary {
-            delivery_evidence_bytes,
-        } = frame.write_class()
-        else {
-            return Err(QuicCarrierError::MeasurementRecordRequiresDedicatedWrite);
-        };
-        Ok(total.saturating_add(delivery_evidence_bytes))
-    })?;
-    let _ordinary_write = send.telemetry.enter_ordinary_writer().await;
-    if send.telemetry.measurement_failed_closed() {
-        send.connection
-            .close(VarInt::from_u32(1), b"measurement epoch failed closed");
-        return Err(QuicCarrierError::MeasurementExpired);
+    if frames.iter().any(Frame::is_path_capacity) {
+        return Err(QuicCarrierError::CapacityFrameOnQuic);
     }
+    let delivery_evidence_bytes = frames.iter().fold(0_u64, |total, frame| {
+        total.saturating_add(frame.delivery_evidence_bytes())
+    });
     #[cfg(feature = "lab-diagnostics")]
     let encode_started = std::time::Instant::now();
     let packet_len = {
@@ -159,11 +142,15 @@ pub async fn write_frames(
     // those ACKs. A failed write closes the path, so stale evidence cannot be
     // reused by a live measurement target.
     if delivery_evidence_bytes > 0 {
-        send.delivery_evidence_written
-            .fetch_add(delivery_evidence_bytes, Ordering::Relaxed);
+        send.telemetry
+            .record_delivery_evidence_written(delivery_evidence_bytes);
     }
-    let write_transaction =
-        QuicWriteTransaction::new(transaction_connection, transaction_backlog, packet_len);
+    let write_transaction = QuicWriteTransaction::new(
+        transaction_connection,
+        transaction_backlog,
+        send.telemetry.send_credit_notify(),
+        packet_len,
+    );
     send.stream.write_all(&send.encode_buffer).await?;
     write_transaction.commit();
     #[cfg(feature = "lab-diagnostics")]
@@ -313,17 +300,6 @@ pub async fn read_frame(
 }
 
 pub fn finish_stream(send: &mut SendStream) -> Result<(), QuicCarrierError> {
-    // FIN is application output too. Refuse it while a measurement epoch owns the
-    // connection rather than silently adding unclassified carrier bytes.
-    let _ordinary_write = send
-        .telemetry
-        .try_enter_ordinary_writer()
-        .ok_or(QuicCarrierError::MeasurementActive)?;
-    if send.telemetry.measurement_failed_closed() {
-        send.connection
-            .close(VarInt::from_u32(1), b"measurement epoch failed closed");
-        return Err(QuicCarrierError::MeasurementExpired);
-    }
     Ok(send.stream.finish()?)
 }
 

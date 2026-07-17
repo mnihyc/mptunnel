@@ -293,35 +293,31 @@ pub enum Frame {
     },
 }
 
-/// Separates ordinary product/control traffic from an exclusive measurement.
-///
-/// The protocol model owns this classification because only it knows a frame's
-/// semantic role. Carriers use it to enforce writer ownership without learning
-/// which measurement protocol produced the frame.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum FrameWriteClass {
-    Ordinary { delivery_evidence_bytes: u64 },
-    MeasurementData { payload_bytes: u64 },
-    MeasurementFinish,
-    MeasurementControl,
-}
-
 impl Frame {
-    pub(crate) fn write_class(&self) -> FrameWriteClass {
+    pub(crate) fn is_path_capacity(&self) -> bool {
+        matches!(
+            self,
+            Self::PathCapacityData { .. }
+                | Self::PathCapacityFinish { .. }
+                | Self::PathCapacityReceipt { .. }
+        )
+    }
+
+    pub(crate) fn carrier_credit_bytes(&self) -> u64 {
         match self {
-            Self::PathCapacityData { payload, .. } => FrameWriteClass::MeasurementData {
-                payload_bytes: payload.len() as u64,
-            },
-            Self::PathCapacityFinish { .. } => FrameWriteClass::MeasurementFinish,
-            Self::PathCapacityReceipt { .. } => FrameWriteClass::MeasurementControl,
+            Self::StreamData { payload, .. }
+            | Self::DatagramData { payload, .. }
+            | Self::PathCapacityData { payload, .. } => payload.len() as u64,
+            _ => 0,
+        }
+    }
+
+    pub(crate) fn delivery_evidence_bytes(&self) -> u64 {
+        match self {
             Self::StreamData { payload, .. } | Self::DatagramData { payload, .. } => {
-                FrameWriteClass::Ordinary {
-                    delivery_evidence_bytes: payload.len() as u64,
-                }
+                payload.len() as u64
             }
-            _ => FrameWriteClass::Ordinary {
-                delivery_evidence_bytes: 0,
-            },
+            _ => 0,
         }
     }
 

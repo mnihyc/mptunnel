@@ -1,12 +1,10 @@
 use super::super::next_server_carrier_path_instance_id;
-use super::super::test_support::{
-    binding_for_underlay, output_entry_for_key, test_quic_capacity_proof,
-};
+use super::super::test_support::{binding_for_underlay, output_entry_for_key};
 use super::{
     ServerPathMetricsEntry, ServerPathMetricsSource, server_output_has_bulk_rate_evidence,
     server_output_has_durable_product_ack_progress, server_output_local_path_metrics,
     server_path_metrics_bulk_sample_floor_bytes, server_path_metrics_estimate_rate_bps,
-    server_path_metrics_has_bulk_rate_evidence, server_quic_capacity_proof,
+    server_path_metrics_has_bulk_rate_evidence,
 };
 use crate::model::capacity::{PATH_OPEN_SCORE_BYTES, reliable_path_startup_sample_limit_bytes};
 use crate::model::path::CarrierPathKey;
@@ -48,7 +46,6 @@ fn local_metrics_entry(metrics: PathMetrics) -> ServerPathMetricsEntry {
         metrics,
         source: ServerPathMetricsSource::LocalSender,
         recorded_at: Instant::now(),
-        capacity_proof: None,
     }
 }
 
@@ -184,7 +181,7 @@ fn ack_derived_bulk_evidence_uses_transport_specific_sample_floors() {
         ));
 
         metrics.app_limited = true;
-        assert!(!server_path_metrics_has_bulk_rate_evidence(
+        assert!(server_path_metrics_has_bulk_rate_evidence(
             local_metrics_entry(metrics)
         ));
     }
@@ -219,45 +216,29 @@ fn data_ack_progress_is_tcp_fallback_not_udp_carrier_evidence() {
 }
 
 #[test]
-fn quic_receipt_proof_is_exact_expiring_evidence() {
+fn native_quic_rate_sample_is_expiring_bulk_evidence() {
     let mux_limits = MuxLimits::default();
     let (binding, key, _receivers) = binding_for_underlay(UnderlayProtocol::Udp);
     let mut output = output_entry_for_key(&binding, key);
-    let mut metrics = response_metrics(key);
-    metrics.app_limited = true;
-    metrics.has_ack_derived_data_sample = false;
-    metrics.data_sample_count = 0;
-    metrics.data_sample_bytes = 0;
-    let proof = test_quic_capacity_proof(mux_limits, 41, Duration::from_secs(1));
+    let metrics = response_metrics(key);
     let accepted = ServerPathMetricsEntry {
         metrics,
         source: ServerPathMetricsSource::LocalSender,
         recorded_at: Instant::now(),
-        capacity_proof: Some(proof),
     };
     output.local_path_metrics = Some(accepted);
-    assert_eq!(server_quic_capacity_proof(accepted), Some(proof));
     assert_eq!(
         server_path_metrics_estimate_rate_bps(accepted),
-        proof.rate_bps as f64
+        metrics.delivery_rate_bps as f64
     );
     assert!(server_path_metrics_has_bulk_rate_evidence(accepted));
     assert!(server_output_has_bulk_rate_evidence(&output, mux_limits));
 
-    let proof_validity = Duration::from_secs(1);
-    let accepted_at = Instant::now() - Duration::from_secs(2);
-    let expired = crate::model::capacity::QuicCapacityProofCandidate {
-        accepted_at,
-        expires_at: accepted_at + proof_validity,
-        proof_validity,
-        ..proof
-    };
     let expired_entry = ServerPathMetricsEntry {
-        capacity_proof: Some(expired),
+        recorded_at: Instant::now() - Duration::from_secs(2),
         ..accepted
     };
     output.local_path_metrics = Some(expired_entry);
-    assert!(server_quic_capacity_proof(expired_entry).is_none());
     assert!(!server_path_metrics_has_bulk_rate_evidence(expired_entry));
     assert!(!server_output_has_bulk_rate_evidence(&output, mux_limits));
 }

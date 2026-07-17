@@ -9,9 +9,7 @@ use super::metrics::QuicAckPollDiagnostics;
 use super::metrics::UdpPathMetrics;
 use crate::model::capacity::{
     PATH_OPEN_SCORE_BYTES, QUIC_INITIAL_WINDOW_PACKETS, QUIC_TIMER_GRANULARITY,
-    QuicCapacityProofCandidate, RELIABLE_PIPE_WINDOW_BDPS,
-    RELIABLE_STREAM_STARTUP_PRODUCT_WINDOW_BYTES, quic_capacity_receipt_rate_bps,
-    valid_quic_capacity_proof_geometry,
+    RELIABLE_PIPE_WINDOW_BDPS, RELIABLE_STREAM_STARTUP_PRODUCT_WINDOW_BYTES,
 };
 use crate::model::timing::quic_bulk_proof_freshness_horizon;
 use crate::protocol::PathMetricDirection;
@@ -25,26 +23,6 @@ pub(super) struct UdpPathMetricTracker {
 }
 
 impl UdpPathMetricTracker {
-    pub(super) fn accept_capacity_proof(
-        &mut self,
-        metrics: &mut UdpPathMetrics,
-        candidate: QuicCapacityProofCandidate,
-    ) {
-        self.quic.accept_capacity_proof(metrics, candidate);
-    }
-
-    pub(super) fn retire_capacity_candidate(&mut self, token: u64) {
-        self.quic.retire_capacity_candidate(token);
-    }
-
-    pub(super) fn terminal_capacity_probe_to_retire(
-        &mut self,
-        probe: Option<quic_transport::MeasurementMetrics>,
-        now: Instant,
-    ) -> Option<u64> {
-        self.quic.terminal_capacity_probe_to_retire(probe, now)
-    }
-
     #[cfg(test)]
     pub(super) fn observe(
         &mut self,
@@ -53,17 +31,6 @@ impl UdpPathMetricTracker {
         direction: PathMetricDirection,
     ) -> UdpPathMetrics {
         self.quic.observe(stats, congestion, direction)
-    }
-
-    #[cfg(test)]
-    pub(super) fn observe_at(
-        &mut self,
-        stats: quinn::ConnectionStats,
-        congestion: quic_transport::CongestionMetrics,
-        direction: PathMetricDirection,
-        now: Instant,
-    ) -> UdpPathMetrics {
-        self.quic.observe_at(stats, congestion, direction, now)
     }
 }
 
@@ -80,10 +47,6 @@ struct QuicPathMetricTracker {
     delivery_sample_bytes: u64,
     last_delivery_sample_at: Option<Instant>,
     bulk_proof_expires_at: Option<Instant>,
-    // Carrier snapshots are cumulative and sticky. Remember registry acceptance,
-    // not observation, so a transient publication race may retry the same token.
-    last_accepted_capacity_probe_token: Option<u64>,
-    pending_capacity_proof_candidate: Option<QuicCapacityProofCandidate>,
 }
 
 impl UdpPathConnection {
@@ -99,6 +62,12 @@ impl UdpPathConnection {
 }
 
 impl QuicPathMetricTracker {
+    fn clear_pending_delivery_sample(&mut self) {
+        self.pending_non_app_limited_sample_bytes = 0;
+        self.pending_non_app_limited_sample_count = 0;
+        self.pending_non_app_limited_sample_elapsed = Duration::ZERO;
+    }
+
     fn expire_stale_bulk_proof(&mut self, now: Instant) {
         let proof_is_stale = self
             .bulk_proof_expires_at
@@ -111,132 +80,6 @@ impl QuicPathMetricTracker {
         // the measured rate/sample state for scheduling; `app_limited` and age
         // prevent it from silently renewing the expired right.
         self.bulk_proof_expires_at = None;
-    }
-
-    fn capacity_proof_candidate(
-        &mut self,
-        probe: Option<quic_transport::MeasurementMetrics>,
-        now: Instant,
-    ) -> Option<QuicCapacityProofCandidate> {
-        let probe = probe?;
-        if self.last_accepted_capacity_probe_token == Some(probe.token) {
-            return None;
-        }
-        // Receipt and a committed write atomically terminalize the carrier
-        // epoch. Accepting the same fields in a nonterminal phase hides a broken
-        // carrier transition rather than preserving useful proof.
-        if probe.phase != quic_transport::MeasurementPhase::Complete {
-            return None;
-        }
-        if let Some(candidate) = self
-            .pending_capacity_proof_candidate
-            .filter(|candidate| candidate.token == probe.token)
-        {
-            return (now < candidate.expires_at).then_some(candidate);
-        }
-        if !probe.write_committed
-            || probe.train_payload_bytes == 0
-            || probe.written_payload_bytes != probe.train_payload_bytes
-            || probe.written_data_frame_count == 0
-            || !valid_quic_capacity_proof_geometry(
-                probe.train_payload_bytes,
-                probe.sample_floor_bytes,
-                (PATH_OPEN_SCORE_BYTES as u64).min(probe.sample_floor_bytes / 8),
-                probe.warmup_carrier_bytes,
-                probe.required_timed_carrier_bytes,
-            )
-            || probe.retention.is_zero()
-            || probe.receipt_received_payload_bytes != probe.train_payload_bytes
-        {
-            return None;
-        }
-        let receipt_at = probe.receipt_at?;
-        if probe.confirmed_at != Some(receipt_at) || receipt_at >= probe.expires_at {
-            return None;
-        }
-        let receipt_elapsed = probe.receipt_elapsed.filter(|elapsed| !elapsed.is_zero())?;
-        // Receipt time owns both the service interval and proof lifetime.
-        // Use its full cold-start interval: subtracting an RTT can create an
-        // unstable near-zero denominator, while native timing keeps changing.
-        let proof_elapsed = receipt_elapsed.max(QUIC_TIMER_GRANULARITY);
-        let expires_at = receipt_at.checked_add(probe.retention)?;
-        if now >= expires_at {
-            return None;
-        }
-        let rate_bps = quic_capacity_receipt_rate_bps(probe.train_payload_bytes, proof_elapsed)?;
-        let candidate = QuicCapacityProofCandidate {
-            token: probe.token,
-            train_bytes: probe.train_payload_bytes,
-            sample_floor_bytes: probe.sample_floor_bytes,
-            accounting_slack_bytes: probe
-                .sample_floor_bytes
-                .saturating_sub(probe.required_timed_carrier_bytes),
-            warmup_bytes: probe.warmup_carrier_bytes,
-            required_proof_bytes: probe.required_timed_carrier_bytes,
-            written_bytes: probe.written_payload_bytes,
-            written_data_frame_count: probe.written_data_frame_count,
-            receipt_confirmed: true,
-            received_bytes: probe.receipt_received_payload_bytes,
-            proof_elapsed,
-            rate_bps,
-            accepted_at: receipt_at,
-            expires_at,
-            proof_validity: probe.retention,
-        };
-        // Freeze rate and freshness on first sight. Repeated registry attempts
-        // reuse this exact candidate instead of extending a delayed proof.
-        self.pending_capacity_proof_candidate = Some(candidate);
-        (now < expires_at).then_some(candidate)
-    }
-
-    fn accept_capacity_proof(
-        &mut self,
-        _metrics: &mut UdpPathMetrics,
-        candidate: QuicCapacityProofCandidate,
-    ) {
-        debug_assert_ne!(
-            self.last_accepted_capacity_probe_token,
-            Some(candidate.token)
-        );
-        self.last_accepted_capacity_probe_token = Some(candidate.token);
-        self.pending_capacity_proof_candidate = None;
-    }
-
-    fn terminal_capacity_probe_to_retire(
-        &self,
-        probe: Option<quic_transport::MeasurementMetrics>,
-        now: Instant,
-    ) -> Option<u64> {
-        let probe = probe?;
-        match probe.phase {
-            quic_transport::MeasurementPhase::Expired
-            | quic_transport::MeasurementPhase::Aborted => Some(probe.token),
-            quic_transport::MeasurementPhase::Complete => {
-                if self.last_accepted_capacity_probe_token == Some(probe.token) {
-                    return Some(probe.token);
-                }
-                match self.pending_capacity_proof_candidate {
-                    Some(candidate) if candidate.token == probe.token => {
-                        (now >= candidate.expires_at).then_some(probe.token)
-                    }
-                    // A terminal snapshot that cannot form a proof must not
-                    // retain the exclusive carrier epoch indefinitely.
-                    _ => Some(probe.token),
-                }
-            }
-            quic_transport::MeasurementPhase::Writing
-            | quic_transport::MeasurementPhase::Measuring
-            | quic_transport::MeasurementPhase::AwaitingReceipt => None,
-        }
-    }
-
-    fn retire_capacity_candidate(&mut self, token: u64) {
-        if self
-            .pending_capacity_proof_candidate
-            .is_some_and(|candidate| candidate.token == token)
-        {
-            self.pending_capacity_proof_candidate = None;
-        }
     }
 
     fn observe(
@@ -332,9 +175,8 @@ impl QuicPathMetricTracker {
                 .delivery_evidence_pending_ack_bytes
                 .saturating_sub(delivery_evidence_newly_acked_bytes);
         }
-        // Generic evidence counts product payload only. The connection-wide
-        // pending/flight counters still include an exclusive capacity train so
-        // scheduling cannot treat carrier debt as an empty path.
+        // Product evidence is separate from connection-wide pending/flight
+        // counters, which still include framing and carrier control bytes.
         let carrier_committed_bytes = self
             .delivery_evidence_pending_ack_bytes
             .max(congestion.pending_bytes)
@@ -398,22 +240,16 @@ impl QuicPathMetricTracker {
                         };
                         self.delivery_sample_bytes = next_sample_bytes;
                     }
-                    self.pending_non_app_limited_sample_bytes = 0;
-                    self.pending_non_app_limited_sample_count = 0;
-                    self.pending_non_app_limited_sample_elapsed = Duration::ZERO;
+                    self.clear_pending_delivery_sample();
                 }
             } else {
                 publishable_sample_bytes = self.pending_non_app_limited_sample_bytes;
                 publishable_sample_count = self.pending_non_app_limited_sample_count;
                 publishable_sample_elapsed = self.pending_non_app_limited_sample_elapsed;
-                self.pending_non_app_limited_sample_bytes = 0;
-                self.pending_non_app_limited_sample_count = 0;
-                self.pending_non_app_limited_sample_elapsed = Duration::ZERO;
+                self.clear_pending_delivery_sample();
             }
         } else if publishable_sample_bytes == 0 && self.delivery_evidence_pending_ack_bytes == 0 {
-            self.pending_non_app_limited_sample_bytes = 0;
-            self.pending_non_app_limited_sample_count = 0;
-            self.pending_non_app_limited_sample_elapsed = Duration::ZERO;
+            self.clear_pending_delivery_sample();
         }
 
         let mut latest_delivery_sample_bytes = 0;
@@ -481,13 +317,6 @@ impl QuicPathMetricTracker {
             }
         }
 
-        let bulk_proof_is_fresh = self
-            .bulk_proof_expires_at
-            .is_some_and(|expires_at| now < expires_at);
-        // Bulk eligibility follows a recent full transport window; an idle
-        // connection retains ACK reachability without retaining placement.
-        let app_limited = !bulk_proof_is_fresh;
-
         let estimated_rate = self.delivery_rate_bps.unwrap_or(fallback_rate).max(1.0);
         let delivery_rate_bps = if self.delivery_sample_count < confidence_sample_floor {
             estimated_rate.max(fallback_rate)
@@ -497,7 +326,6 @@ impl QuicPathMetricTracker {
         let pacing_rate_bps = usable_pacing_rate
             .unwrap_or(delivery_rate_bps)
             .max(delivery_rate_bps);
-        let capacity_proof_candidate = self.capacity_proof_candidate(congestion.measurement, now);
         UdpPathMetrics {
             direction,
             srtt: rtt,
@@ -510,7 +338,10 @@ impl QuicPathMetricTracker {
             pending_bytes: usize::try_from(carrier_committed_bytes).unwrap_or(usize::MAX),
             loss_ppm: congestion.loss_ppm,
             ecn_ppm: congestion.ecn_ppm,
-            app_limited,
+            // Preserve Quinn's congestion-controller state. Bulk-rate proof
+            // freshness is a separate timestamp and must not redefine the
+            // standard app-limited signal used to qualify rate samples.
+            app_limited: congestion.app_limited,
             ack_derived_data_seen: self.ack_derived_data_seen,
             delivery_sample_count: self.delivery_sample_count,
             delivery_sample_bytes: self.delivery_sample_bytes,
@@ -520,8 +351,6 @@ impl QuicPathMetricTracker {
             latest_delivery_sample_count,
             latest_carrier_ack_elapsed,
             latest_rate_sample_elapsed,
-            capacity_proof_candidate,
-            capacity_probe: congestion.measurement,
             #[cfg(feature = "lab-diagnostics")]
             ack_poll: QuicAckPollDiagnostics {
                 newly_acked_bytes,
@@ -544,9 +373,6 @@ impl QuicPathMetricTracker {
     }
 }
 
-#[cfg(test)]
-#[path = "estimator_capacity_test.rs"]
-mod capacity_tests;
 #[cfg(test)]
 #[path = "estimator_lifecycle_test.rs"]
 mod lifecycle_tests;

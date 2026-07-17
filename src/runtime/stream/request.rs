@@ -5,7 +5,6 @@
 
 mod attachment;
 mod flight;
-mod flow_control;
 mod state;
 
 pub(in crate::runtime) use attachment::{
@@ -15,9 +14,7 @@ pub(in crate::runtime) use attachment::{
 // Keep inferred result/state types nameable without exposing child modules.
 #[allow(unused_imports)]
 pub(in crate::runtime) use flight::{RequestFlightLedger, RequestPathRelease};
-pub(in crate::runtime) use flow_control::RequestOutstandingWindow;
 #[allow(unused_imports)]
 pub(in crate::runtime) use state::{
-    RequestAckClockOperation, RequestPathSample, RequestPathSampleCommit, RequestPathSamplingState,
-    RequestPathState, RequestPathStates, RequestStreamState,
+    RequestAckClockOperation, RequestPathState, RequestPathStates, RequestStreamState,
 };

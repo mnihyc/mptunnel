@@ -63,7 +63,7 @@ pub(in crate::runtime) struct ResponseStreamBinding {
     session_id: SessionId,
     lane: Mutex<TrafficClass>,
     mux_limits: MuxLimits,
-    _session_registration: ServerSessionRegistration,
+    session_registration: ServerSessionRegistration,
     next_output_incarnation: AtomicU64,
     // Publishes coherent path evidence, exact flights, ACK ordering, and queues.
     response_model_generation: AtomicU64,
@@ -160,7 +160,7 @@ impl ResponseStreamBinding {
             session_id,
             lane: Mutex::new(lane),
             mux_limits,
-            _session_registration: session_registration,
+            session_registration,
             next_output_incarnation: AtomicU64::new(2),
             response_model_generation: AtomicU64::new(0),
             response_stream_open: AtomicBool::new(true),
@@ -195,6 +195,10 @@ impl ResponseStreamBinding {
             ack_ordering: Mutex::new(ResponseAckOrderingState::default()),
             version,
         })
+    }
+
+    pub(in crate::runtime::stream) fn session_send_buffer(&self) -> super::SessionSendBuffer {
+        self.session_registration.send_buffer()
     }
 
     pub(in crate::runtime) fn subscribe_updates(&self) -> watch::Receiver<u64> {

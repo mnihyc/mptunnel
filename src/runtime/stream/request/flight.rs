@@ -68,28 +68,6 @@ impl RequestFlightLedger {
         bytes
     }
 
-    /// Counts acknowledged connection-sequence bytes once, independent of
-    /// duplicate reinjection copies and path-specific delivery attribution.
-    pub(in crate::runtime) fn unique_owner_bytes_acked_by(&self, ranges: &[OffsetRange]) -> usize {
-        let covered = self
-            .flights
-            .iter()
-            .flat_map(|(start, flights)| {
-                flights
-                    .iter()
-                    .filter(|flight| flight.kind.is_original_transmission())
-                    .flat_map(move |flight| {
-                        split_flight_interval_by_ack(*start, flight.end, ranges).acked
-                    })
-            })
-            .map(|(start, end)| OffsetRange { start, end })
-            .collect::<Vec<_>>();
-        normalize_offset_ranges(covered)
-            .into_iter()
-            .map(|range| flight_interval_bytes(range.start, range.end))
-            .sum()
-    }
-
     pub(in crate::runtime) fn release_normalized_acked_ranges(
         &mut self,
         ranges: &[OffsetRange],
@@ -159,19 +137,74 @@ impl RequestFlightLedger {
         released
     }
 
-    pub(in crate::runtime) fn sent_keys_for_frame(&self, frame: &Frame) -> Vec<RelayPathKey> {
+    pub(in crate::runtime) fn sent_instances_for_frame(
+        &self,
+        frame: &Frame,
+    ) -> Vec<RelayPathInstance> {
         let Some((offset, end, _)) = reliable_stream_frame_extent(frame) else {
             return Vec::new();
         };
-        let mut keys = Vec::new();
+        let mut instances = Vec::new();
         if let Some(flights) = self.flights.get(&offset) {
             for flight in flights {
-                if flight.end >= end && !keys.contains(&flight.instance.key) {
-                    keys.push(flight.instance.key);
+                if flight.end >= end && !instances.contains(&flight.instance) {
+                    instances.push(flight.instance);
                 }
             }
         }
-        keys
+        instances
+    }
+
+    /// Exact unique Data Sequence bytes still owned by one attachment. This is
+    /// the portable ordered-stream backlog when native per-socket state is not
+    /// available; reinjection copies never contribute to it.
+    pub(in crate::runtime) fn original_data_in_flight_bytes(
+        &self,
+        instance: RelayPathInstance,
+    ) -> u64 {
+        self.flights
+            .values()
+            .flat_map(|flights| flights.iter())
+            .filter(|flight| flight.instance == instance && flight.kind.is_original_transmission())
+            .fold(0_u64, |bytes, flight| {
+                bytes.saturating_add(flight.bytes as u64)
+            })
+    }
+
+    pub(in crate::runtime) fn has_recent_reinjection_on_instance(
+        &self,
+        frame: &Frame,
+        instance: RelayPathInstance,
+        retry_after: Duration,
+    ) -> bool {
+        let Some((start, end, _)) = reliable_stream_frame_extent(frame) else {
+            return false;
+        };
+        let now = Instant::now();
+        self.flights.range(..end).any(|(offset, flights)| {
+            *offset < end
+                && flights.iter().any(|flight| {
+                    flight.end > start
+                        && flight.instance == instance
+                        && flight.kind == CarrierWorkKind::ReinjectedData
+                        && now.saturating_duration_since(flight.sent_at) < retry_after
+                })
+        })
+    }
+
+    #[cfg(test)]
+    pub(in crate::runtime) fn age_reinjected_flights_for_test(&mut self, elapsed: Duration) {
+        for flights in self.flights.values_mut() {
+            for flight in flights
+                .iter_mut()
+                .filter(|flight| flight.kind == CarrierWorkKind::ReinjectedData)
+            {
+                flight.sent_at = flight
+                    .sent_at
+                    .checked_sub(elapsed)
+                    .unwrap_or(flight.sent_at);
+            }
+        }
     }
 
     pub(in crate::runtime) fn has_missing_original_transmission_before_offset(
@@ -191,10 +224,24 @@ impl RequestFlightLedger {
         frame: &Frame,
         live_instances: &[RelayPathInstance],
     ) -> Vec<RelayPathKey> {
+        let mut keys = Vec::new();
+        for instance in self.original_transmission_instances_for_frame(frame, live_instances) {
+            if !keys.contains(&instance.key) {
+                keys.push(instance.key);
+            }
+        }
+        keys
+    }
+
+    pub(in crate::runtime) fn original_transmission_instances_for_frame(
+        &self,
+        frame: &Frame,
+        live_instances: &[RelayPathInstance],
+    ) -> Vec<RelayPathInstance> {
         let Some((start, end, _)) = reliable_stream_frame_extent(frame) else {
             return Vec::new();
         };
-        let mut owner_keys = Vec::new();
+        let mut owners = Vec::new();
         for (offset, flights) in self.flights.range(..end) {
             if *offset > start {
                 break;
@@ -203,13 +250,13 @@ impl RequestFlightLedger {
                 if flight.kind.is_original_transmission()
                     && flight.end >= end
                     && live_instances.contains(&flight.instance)
-                    && !owner_keys.contains(&flight.instance.key)
+                    && !owners.contains(&flight.instance)
                 {
-                    owner_keys.push(flight.instance.key);
+                    owners.push(flight.instance);
                 }
             }
         }
-        owner_keys
+        owners
     }
 
     pub(in crate::runtime) fn original_transmission_underlay_for_frame(

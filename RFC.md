@@ -379,16 +379,20 @@ The current recovery policy distinguishes three evidence states:
    reinjection on an eligible live alternative. A measured survivor SHOULD be
    preferred, but liveness is sufficient when no measured survivor remains.
 2. An authoritative Data ACK snapshot that exposes the same lowest missing
-   frontier must persist for three path-local probe timeout (PTO) intervals
-   before a target-bound reinjection flight is admitted. Growth of the ACK
-   horizon above that frontier does not reset the persistence interval.
+   frontier must persist for three recovery intervals of the carrier that owns
+   it before a target-bound reinjection flight is admitted. TCP uses its
+   retransmission timeout (RTO); QUIC uses its probe timeout (PTO). Growth of
+   the ACK horizon above that frontier does not reset the persistence interval.
 3. A contiguous live tail with no authoritative gap may send one bounded probe
-   after one PTO; another tail probe requires three PTO without Data ACK
-   progress.
+   after one owner-carrier recovery interval; another tail probe requires three
+   such intervals without Data ACK progress.
 
 These intervals are MPP local policy, not requirements imposed by MPTCP, QUIC,
 or QUIC's definition of persistent congestion. Native TCP and QUIC recovery
-retain their own timers throughout.
+retain their own timers throughout. Request placement stops treating a
+non-progressing original attachment as eligible after four TCP RTOs or three
+QUIC PTOs when another attachment is available; the original carrier remains
+connected and continues native recovery.
 
 ## 7. Scheduling
 

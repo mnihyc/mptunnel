@@ -5,9 +5,7 @@ use super::policy::{
     DatagramPathSendError, datagram_remaining_ttl_ms, datagram_response_deadline_budget,
 };
 use super::tcp_session::TcpDatagramClientSession;
-use crate::model::capacity::{
-    DATAGRAM_FEEDBACK_DELAY_BUDGET, PATH_OPEN_SCORE_BYTES, TRANSPORT_TIMER_GRANULARITY,
-};
+use crate::model::capacity::{DATAGRAM_FEEDBACK_DELAY_BUDGET, TRANSPORT_TIMER_GRANULARITY};
 use crate::model::path::RelayPathKey;
 use crate::model::timing::{
     path_open_pto, path_open_pto_multiplier, path_open_serialized_exchanges,
@@ -36,10 +34,8 @@ impl TcpDatagramClientAssociation {
         if context.tcp_paths.is_empty() {
             return Err(RuntimeError::NoTcpPath);
         }
-        let candidates = context.ordered_tcp_path_indices(
-            TrafficClass::RealtimeDatagram,
-            payload_bytes.max(PATH_OPEN_SCORE_BYTES),
-        );
+        let candidates =
+            context.ordered_tcp_path_indices(TrafficClass::RealtimeDatagram, payload_bytes);
         if candidates.is_empty() {
             return Err(RuntimeError::NoSchedulableTcpPath);
         }
@@ -56,11 +52,7 @@ impl TcpDatagramClientAssociation {
             };
             let snapshot = context.tcp_path_snapshot(path_index);
             let eta_ms = context
-                .reliable_relay_path_eta_ms(
-                    key,
-                    TrafficClass::RealtimeDatagram,
-                    payload_bytes.max(PATH_OPEN_SCORE_BYTES),
-                )
+                .reliable_relay_path_eta_ms(key, TrafficClass::RealtimeDatagram, payload_bytes)
                 .unwrap_or(f64::INFINITY);
             if eta_ms > remaining.as_secs_f64() * 1000.0 {
                 continue;

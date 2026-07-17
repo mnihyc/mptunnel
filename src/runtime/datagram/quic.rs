@@ -188,6 +188,53 @@ impl UdpDatagramClientAssociation {
             ) else {
                 break;
             };
+            #[cfg(feature = "lab-diagnostics")]
+            if let Some(snapshot) = self.context.udp_path_snapshot(path_index) {
+                let now = Instant::now();
+                let (datagram_samples, delivery_samples, carrier_samples, failed_for_ms) = self
+                    .context
+                    .health()
+                    .lock()
+                    .expect("client path health lock")
+                    .udp
+                    .get(path_index)
+                    .map(|record| {
+                        (
+                            record.datagram_feedback_samples,
+                            record.delivery_samples,
+                            record.carrier_delivery_samples,
+                            record
+                                .failed_until
+                                .map(|until| until.saturating_duration_since(now).as_millis())
+                                .unwrap_or(0),
+                        )
+                    })
+                    .unwrap_or_default();
+                lab_diagnostic(
+                    "udp_datagram_path_selected",
+                    format_args!(
+                        "path_index={} payload_bytes={} ttl_ms={} srtt_ms={:.3} jitter_ms={:.3} delivery_mbps={:.3} queue_bytes={} data_level_queue_bytes={} bytes_in_flight={} data_level_bytes_in_flight={} active_flows={} active_latency_flows={} state={:?} datagram_samples={} delivery_samples={} carrier_samples={} failed_for_ms={} last_successful={:?}",
+                        path_index,
+                        payload.len(),
+                        remaining_ttl_ms,
+                        snapshot.srtt_ms,
+                        snapshot.jitter_ms,
+                        snapshot.delivery_rate_bps / 1_000_000.0,
+                        snapshot.queue_bytes,
+                        snapshot.data_level_queue_bytes,
+                        snapshot.bytes_in_flight,
+                        snapshot.data_level_bytes_in_flight,
+                        snapshot.active_flows,
+                        snapshot.active_latency_sensitive_flows,
+                        snapshot.state,
+                        datagram_samples,
+                        delivery_samples,
+                        carrier_samples,
+                        failed_for_ms,
+                        self.last_successful_path,
+                    ),
+                );
+            }
             attempted.insert(path_index);
             product_attempts = product_attempts.saturating_add(1);
             let has_unattempted_internal_alternative = product_attempts < attempt_limit

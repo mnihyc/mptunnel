@@ -6,6 +6,7 @@ import sys
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from result_enrichment import (
     application_payload_bytes,
+    enrich_reproducibility,
     enrich_upload_target_observer,
     enrich_instrumentation,
     enrich_instrumentation_for_scope,
@@ -16,6 +17,28 @@ from result_enrichment import (
 
 
 class ResultEnrichmentTests(unittest.TestCase):
+    def test_reproducibility_metadata_is_normalized(self):
+        row = {}
+
+        enrich_reproducibility(
+            row,
+            json.dumps(
+                {
+                    "source_commit": "0123456789abcdef",
+                    "source_tree_dirty": False,
+                    "mptunnel_build_profile": "release",
+                    "mptunnel_build_features": ["lab-diagnostics", "lab-diagnostics"],
+                    "mptunnel_protocol_version": 2,
+                }
+            ),
+        )
+
+        self.assertEqual(row["source_commit"], "0123456789abcdef")
+        self.assertFalse(row["source_tree_dirty"])
+        self.assertEqual(row["mptunnel_build_profile"], "release")
+        self.assertEqual(row["mptunnel_build_features"], ["lab-diagnostics"])
+        self.assertEqual(row["mptunnel_protocol_version"], 2)
+
     def test_target_observer_exact_snapshot_becomes_primary(self):
         row = {
             "protocol": "tcp-upload",

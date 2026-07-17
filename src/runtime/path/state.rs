@@ -4,20 +4,13 @@
 //! module owns its reservation, proof, and rollback transaction.
 
 use super::commands::CapacityProbeCommandTicket;
-use super::health::{
-    ClientPathHealth, RequestCapacityReconciliationView,
-    RequestQuicCapacityReconciliationObservation,
-};
+use super::health::{ClientPathHealth, RequestCapacityReconciliationView};
 use super::model::{
     PathDeliveryStats, UdpDatagramPathObservation, path_observation_is_idle_for_probe,
     path_records_have_schedulable_alternative,
 };
 #[cfg(test)]
 use super::proof::PathProofObservation;
-use super::quic::{
-    RequestQuicCapacityProbeLease, RequestQuicCapacityProbeSession,
-    RequestQuicCapacityProductAdmissionState, RequestQuicCapacityReconciliationQuery,
-};
 use super::set::ClientPathContext;
 use super::tcp::capacity::{
     RequestTcpCapacityProbeLease, RequestTcpCapacityProbeSession, RequestTcpCapacityProofQuery,
@@ -41,18 +34,15 @@ use std::time::{Duration, Instant};
 pub(in crate::runtime) struct ClientPathState {
     health: Mutex<ClientPathHealth>,
     next_reliable_stream_id: Mutex<u64>,
-    request_quic_capacity_probe: RequestQuicCapacityProbeSession,
     request_tcp_capacity_probe: RequestTcpCapacityProbeSession,
 }
 
 impl ClientPathState {
     pub(in crate::runtime) fn new(health: ClientPathHealth) -> Arc<Self> {
         let tcp_path_count = health.tcp.len();
-        let udp_path_count = health.udp.len();
         Arc::new(Self {
             health: Mutex::new(health),
             next_reliable_stream_id: Mutex::new(0),
-            request_quic_capacity_probe: RequestQuicCapacityProbeSession::new(udp_path_count),
             request_tcp_capacity_probe: RequestTcpCapacityProbeSession::new(tcp_path_count),
         })
     }
@@ -136,12 +126,6 @@ impl ClientPathState {
         &self,
     ) -> &RequestTcpCapacityProbeSession {
         &self.request_tcp_capacity_probe
-    }
-
-    pub(in crate::runtime::path) fn request_quic_capacity_probe_session(
-        &self,
-    ) -> &RequestQuicCapacityProbeSession {
-        &self.request_quic_capacity_probe
     }
 
     fn release_relay_path_load(&self, key: RelayPathKey, lane: TrafficClass) {
@@ -344,31 +328,10 @@ impl ClientPathContext {
         self.state.health()
     }
 
-    pub(in crate::runtime) fn retire_request_quic_capacity_probe_token(&self, token: u64) {
-        self.state.retire_request_quic_capacity_probe_token(token);
-    }
-
-    pub(in crate::runtime) fn request_quic_capacity_probe_remaining_bytes(&self) -> u64 {
-        self.state.request_quic_capacity_probe_remaining_bytes(
-            reliable_capacity_measurement_session_limit_bytes(self.mux_limits),
-        )
-    }
-
     pub(in crate::runtime) fn request_tcp_capacity_probe_remaining_bytes(&self) -> u64 {
         self.state.request_tcp_capacity_probe_remaining_bytes(
             reliable_capacity_measurement_session_limit_bytes(self.mux_limits),
         )
-    }
-
-    pub(in crate::runtime) fn request_quic_capacity_probe_candidate_share_bytes(
-        &self,
-        proposed_path_limit: u64,
-    ) -> u64 {
-        self.state
-            .request_quic_capacity_probe_candidate_share_bytes(
-                proposed_path_limit,
-                reliable_capacity_measurement_session_limit_bytes(self.mux_limits),
-            )
     }
 
     pub(in crate::runtime) fn request_tcp_capacity_probe_candidate_share_bytes(
@@ -377,18 +340,6 @@ impl ClientPathContext {
     ) -> u64 {
         self.state.request_tcp_capacity_probe_candidate_share_bytes(
             proposed_path_limit,
-            reliable_capacity_measurement_session_limit_bytes(self.mux_limits),
-        )
-    }
-
-    pub(in crate::runtime) fn request_quic_capacity_probe_path_remaining_bytes(
-        &self,
-        path_index: usize,
-        path_limit: u64,
-    ) -> u64 {
-        self.state.request_quic_capacity_probe_path_remaining_bytes(
-            path_index,
-            path_limit,
             reliable_capacity_measurement_session_limit_bytes(self.mux_limits),
         )
     }
@@ -440,15 +391,13 @@ impl ClientPathContext {
         &self,
         stream_id: StreamId,
         tcp_queries: impl Iterator<Item = RequestTcpCapacityProofQuery>,
-        quic_query: Option<RequestQuicCapacityReconciliationQuery>,
         now: Instant,
     ) -> RequestCapacityReconciliationView {
         let mut tcp_queries = tcp_queries.peekable();
-        if tcp_queries.peek().is_none() && quic_query.is_none() {
+        if tcp_queries.peek().is_none() {
             return RequestCapacityReconciliationView {
                 observed_at: now,
                 tcp_proofs: HashMap::new(),
-                quic: None,
             };
         }
         let health = self.state.health.lock().expect("client path health lock");
@@ -468,58 +417,10 @@ impl ClientPathContext {
                     .map(|proof| (query.target, proof))
             })
             .collect();
-        let quic = quic_query.map(|query| {
-            let reconciliation = health.udp.get(query.target.key.index).map(|record| {
-                record
-                    .quic_capacity
-                    .reconciliation_at(stream_id, query.target, query.token, now)
-            });
-            RequestQuicCapacityReconciliationObservation {
-                target: query.target,
-                token: query.token,
-                carrier_proven: reconciliation.is_some_and(|view| view.carrier_proven),
-                product_admission: reconciliation
-                    .map_or(RequestQuicCapacityProductAdmissionState::Absent, |view| {
-                        view.product_admission
-                    }),
-            }
-        });
         RequestCapacityReconciliationView {
             observed_at: now,
             tcp_proofs,
-            quic,
         }
-    }
-
-    #[allow(clippy::too_many_arguments)]
-    pub(in crate::runtime) fn try_reserve_request_quic_capacity_probe(
-        &self,
-        stream_id: StreamId,
-        path_index: usize,
-        path_instance: RelayPathInstance,
-        token: u64,
-        train_bytes: u64,
-        path_limit_bytes: u64,
-        campaign: Arc<RequestCapacityProbeCampaignBudget>,
-        valid_after: Instant,
-        expires_at: Instant,
-        proof_validity: Duration,
-        ticket: CapacityProbeCommandTicket,
-    ) -> Option<RequestQuicCapacityProbeLease> {
-        self.state.try_reserve_request_quic_capacity_probe(
-            stream_id,
-            path_index,
-            path_instance,
-            token,
-            train_bytes,
-            path_limit_bytes,
-            reliable_capacity_measurement_session_limit_bytes(self.mux_limits),
-            campaign,
-            valid_after,
-            expires_at,
-            proof_validity,
-            ticket,
-        )
     }
 
     pub(in crate::runtime) fn allocate_reliable_stream_id(&self) -> Result<StreamId, RuntimeError> {
@@ -699,26 +600,6 @@ impl ClientPathContext {
         if let Some(current) = records.get_mut(index) {
             current.release_relay_inflight(bytes);
         }
-    }
-
-    pub(in crate::runtime) fn record_relay_path_product_ack(
-        &self,
-        stream_id: StreamId,
-        path_instance: RelayPathInstance,
-        bytes: usize,
-        sent_at: Instant,
-        acked_at: Instant,
-    ) {
-        if bytes == 0 || path_instance.key.underlay != UnderlayProtocol::Udp {
-            return;
-        }
-        self.state.record_request_quic_capacity_product_ack(
-            stream_id,
-            path_instance,
-            bytes,
-            sent_at,
-            acked_at,
-        );
     }
 
     pub(in crate::runtime) fn change_relay_path_lane_load(

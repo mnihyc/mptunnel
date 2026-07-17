@@ -221,11 +221,14 @@ a defect, not expected failover overhead.
 The current timers are cause-specific. Exact path-instance failure permits an
 immediate bounded copy, preferring measured survivors but using any eligible
 live survivor when necessary. An authoritative lowest missing Data Sequence
-frontier must persist for three path-local PTO intervals; growth of the ACK
-horizon above it does not restart the timer. A contiguous live tail may send
-one bounded probe after one PTO and waits three PTO before another probe without
-progress. These are MPP recovery policies, not native TCP or QUIC
-retransmission timers.
+frontier must persist for three owner-carrier recovery intervals; TCP uses RTO
+and QUIC uses PTO. Growth of the ACK horizon above it does not restart the
+timer. A contiguous live tail may send one bounded probe after one such
+interval and waits three intervals before another probe without progress. A
+request path becomes stale for new placement after four TCP RTOs or three QUIC
+PTOs without exact Data ACK progress when another attachment exists; this does
+not terminate native recovery. These are MPP recovery policies, not native TCP
+or QUIC retransmission timers.
 
 MPP datagram feedback confirms target-worker admission, not end-to-end target
 delivery. An alternative-path attempt receives a new flow-local datagram ID;
@@ -262,9 +265,10 @@ unknown rather than zero. Passive native observations are scheduling evidence,
 not MPP Data ACKs.
 
 TCP capacity transactions use receiver-confirmed receipts and may combine them
-with exact-socket telemetry. QUIC capacity transactions use fresh native
-packet-ACK-derived evidence with their own expiry. These proof states are not
-interchangeable. MPP Data ACK remains the carrier-neutral delivery authority;
+with exact-socket telemetry. QUIC publishes fresh native packet-ACK-derived
+evidence with an explicit expiry and relies on its native congestion controller
+for send credit; it has no separate MPP calibration transaction. These proof
+states are not interchangeable. MPP Data ACK remains the carrier-neutral delivery authority;
 for response bulk admission, QUIC requires locally sourced ACK-derived carrier
 evidence, while durable unambiguous Data ACK progress may additionally establish
 a per-flow TCP MPP rate.

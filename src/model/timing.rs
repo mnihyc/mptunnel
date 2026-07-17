@@ -11,22 +11,73 @@ use crate::protocol::UnderlayProtocol;
 use crate::scheduler::PathSnapshot;
 use std::time::Duration;
 
+const TCP_MIN_RETRANSMISSION_TIMEOUT: Duration = Duration::from_millis(200);
+const TCP_INITIAL_RETRANSMISSION_TIMEOUT: Duration = Duration::from_secs(1);
+const MPTCP_STALE_LOSS_COUNT: u32 = 4;
+const DATA_ACK_GAP_PERSISTENCE_INTERVALS: u32 = 3;
+
 pub(crate) fn transport_pto_from_ms(srtt_ms: f64, rttvar_ms: f64) -> Duration {
     let srtt = Duration::from_secs_f64(srtt_ms.max(0.0) / 1000.0);
     let rttvar = Duration::from_secs_f64(rttvar_ms.max(0.0) / 1000.0);
     srtt + (rttvar * 4).max(QUIC_TIMER_GRANULARITY) + QUIC_MAX_ACK_DELAY
 }
 
-/// Product reinjection waits one PTO derived from the path that still owns the
-/// original range; native TCP and QUIC recovery continue below this timer.
-pub(crate) fn reliable_relay_tail_reinjection_delay(path: Option<PathSnapshot>) -> Duration {
-    transport_pto_from_snapshot(path)
+pub(crate) fn tcp_retransmission_timeout_from_ms(srtt_ms: f64, rttvar_ms: f64) -> Duration {
+    let srtt = Duration::from_secs_f64(srtt_ms.max(0.0) / 1000.0);
+    let rttvar = Duration::from_secs_f64(rttvar_ms.max(0.0) / 1000.0);
+    (srtt + (rttvar * 4).max(QUIC_TIMER_GRANULARITY)).max(TCP_MIN_RETRANSMISSION_TIMEOUT)
 }
 
-/// One connection-level ACK-gap observation remains valid for the carrier's
-/// persistent-congestion horizon. Native recovery continues independently.
-pub(crate) fn reliable_ack_gap_reinjection_batch_lifetime(path: Option<PathSnapshot>) -> Duration {
-    transport_pto_from_snapshot(path).saturating_mul(QUIC_PERSISTENT_CONGESTION_THRESHOLD)
+pub(crate) fn tcp_retransmission_timeout_from_snapshot(path: Option<PathSnapshot>) -> Duration {
+    path.map(|path| {
+        let srtt_ms = path.srtt_ms.max(1.0);
+        let rttvar_ms = path.jitter_ms.max(srtt_ms / 8.0);
+        tcp_retransmission_timeout_from_ms(srtt_ms, rttvar_ms)
+    })
+    .unwrap_or(TCP_INITIAL_RETRANSMISSION_TIMEOUT)
+}
+
+/// Data-level retransmission follows the recovery clock of the carrier that
+/// owns the missing range. It is distinct from declaring that carrier stale.
+pub(crate) fn reliable_data_retransmission_interval(
+    underlay: Option<UnderlayProtocol>,
+    path: Option<PathSnapshot>,
+) -> Duration {
+    match underlay.or_else(|| path.map(|path| path.underlay)) {
+        Some(UnderlayProtocol::Tcp) => tcp_retransmission_timeout_from_snapshot(path),
+        Some(UnderlayProtocol::Udp) | None => transport_pto_from_snapshot(path),
+    }
+}
+
+/// Repeated recovery intervals without exact data progress make a path stale
+/// for new assignments. Existing carrier recovery continues independently.
+pub(crate) fn reliable_path_stale_interval(
+    underlay: Option<UnderlayProtocol>,
+    path: Option<PathSnapshot>,
+) -> Duration {
+    let interval = reliable_data_retransmission_interval(underlay, path);
+    match underlay.or_else(|| path.map(|path| path.underlay)) {
+        Some(UnderlayProtocol::Tcp) => interval.saturating_mul(MPTCP_STALE_LOSS_COUNT),
+        Some(UnderlayProtocol::Udp) | None => {
+            interval.saturating_mul(QUIC_PERSISTENT_CONGESTION_THRESHOLD)
+        }
+    }
+}
+
+/// Product reinjection waits for a persistent Data ACK gap rather than racing
+/// a transient carrier recovery episode.
+pub(crate) fn reliable_data_ack_gap_persistence_interval(
+    underlay: Option<UnderlayProtocol>,
+    path: Option<PathSnapshot>,
+) -> Duration {
+    reliable_data_retransmission_interval(underlay, path)
+        .saturating_mul(DATA_ACK_GAP_PERSISTENCE_INTERVALS)
+}
+
+/// Product reinjection waits one carrier recovery interval derived from the
+/// path that still owns the original range.
+pub(crate) fn reliable_relay_tail_reinjection_delay(path: Option<PathSnapshot>) -> Duration {
+    reliable_data_retransmission_interval(None, path)
 }
 
 /// Backoff for retrying a product sender whose bounded carrier queue is full.
@@ -36,11 +87,18 @@ pub(crate) fn sender_service_retry_delay(path: Option<PathSnapshot>) -> Duration
         .min(QUIC_MAX_ACK_DELAY)
 }
 
-pub(crate) fn quic_bulk_proof_freshness_horizon(srtt: Duration, rttvar: Duration) -> Duration {
-    // A rate proof loses placement rights at the same three-PTO boundary where
-    // QUIC declares persistent congestion; reachability evidence is separate.
+pub(crate) fn transport_rate_sample_freshness_horizon(
+    srtt: Duration,
+    rttvar: Duration,
+) -> Duration {
+    // A rate sample loses placement rights at the same three-PTO boundary where
+    // a carrier stops treating prior delivery as current path behavior.
     transport_pto_from_ms(srtt.as_secs_f64() * 1000.0, rttvar.as_secs_f64() * 1000.0)
         .saturating_mul(QUIC_PERSISTENT_CONGESTION_THRESHOLD)
+}
+
+pub(crate) fn quic_bulk_proof_freshness_horizon(srtt: Duration, rttvar: Duration) -> Duration {
+    transport_rate_sample_freshness_horizon(srtt, rttvar)
 }
 
 pub(crate) fn transport_pto_from_snapshot(path: Option<PathSnapshot>) -> Duration {
@@ -79,11 +137,12 @@ pub(crate) fn persistent_congestion_pto_backoff_multiplier() -> u32 {
     })
 }
 
-pub(crate) fn path_open_serialized_exchanges(path: Option<PathSnapshot>) -> u32 {
-    match path.map(|snapshot| snapshot.underlay) {
-        Some(UnderlayProtocol::Udp) => 2,
-        Some(UnderlayProtocol::Tcp) | None => 3,
-    }
+pub(crate) fn path_open_serialized_exchanges(_path: Option<PathSnapshot>) -> u32 {
+    // Both carriers perform three serialized network exchanges before a new
+    // product stream is usable: transport establishment, authenticated path
+    // join, and product stream acceptance. QUIC removes TCP head-of-line
+    // recovery; it does not remove these application handshakes.
+    3
 }
 
 pub(crate) fn default_transport_pto() -> Duration {
@@ -92,3 +151,7 @@ pub(crate) fn default_transport_pto() -> Duration {
         RELIABLE_INITIAL_RTT.as_secs_f64() * 1000.0 / 2.0,
     )
 }
+
+#[cfg(test)]
+#[path = "timing_test.rs"]
+mod tests;

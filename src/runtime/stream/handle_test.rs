@@ -1,40 +1,18 @@
-use super::super::response::ResponseStreamBinding;
 use super::{ReliablePathStreamHandle, ReliablePathStreamOutput};
 use crate::model::capacity::{
     MIN_RATE_SAMPLE_BYTES, PATH_OPEN_SCORE_BYTES, RELIABLE_INITIAL_WINDOW_PACKETS,
 };
-use crate::model::path::CarrierPathKey;
 use crate::mux::MuxLimits;
 use crate::protocol::frame::reliable_stream_frame_accounted_bytes;
-use crate::protocol::{Frame, OffsetRange, PathId, SessionId, StreamId, UnderlayProtocol};
+use crate::protocol::{Frame, OffsetRange, PathId, ResetReason, StreamId, UnderlayProtocol};
 use crate::runtime::path::commands::{
     ReliablePathCommand, reliable_path_command_channels, try_recv_reliable_path_command,
     try_recv_reliable_path_priority_command,
 };
-use crate::runtime::path::proof::PathProofTracker;
 use crate::runtime::stream::reliable_stream_recv_progress_interval;
 use crate::scheduler::{PathRateScope, PathSnapshot, TrafficClass};
 use bytes::Bytes;
-use std::sync::Arc;
 use std::time::Duration;
-
-fn binding_for_underlay(
-    underlay: UnderlayProtocol,
-) -> (Arc<ResponseStreamBinding>, CarrierPathKey) {
-    let (commands, _receivers) = reliable_path_command_channels(8);
-    let key = CarrierPathKey {
-        underlay,
-        path_id: PathId(0),
-    };
-    let binding = ResponseStreamBinding::new(
-        SessionId(42),
-        underlay,
-        key.path_id,
-        commands,
-        TrafficClass::Throughput,
-    );
-    (binding, key)
-}
 
 fn stream_data_frame(payload_len: usize) -> Frame {
     stream_data_frame_at(0, payload_len)
@@ -46,75 +24,6 @@ fn stream_data_frame_at(offset: u64, payload_len: usize) -> Frame {
         offset,
         payload: Bytes::from(vec![0x5a; payload_len]),
     }
-}
-
-#[test]
-fn fixed_stream_ordered_path_proof_follows_earlier_stream_data() {
-    let mux_limits = MuxLimits::default();
-    let path_id = PathId(3);
-    let (commands, mut receivers) = reliable_path_command_channels(4);
-    commands
-        .try_enqueue_admitted_frame(stream_data_frame(32), TrafficClass::Throughput)
-        .expect("queue earlier stream data");
-    let stream = ReliablePathStreamHandle {
-        stream_id: StreamId(7),
-        max_offset: u64::MAX,
-        lane: TrafficClass::Throughput,
-        underlay: UnderlayProtocol::Tcp,
-        max_frame_payload_bytes: mux_limits.max_payload_bytes,
-        output: ReliablePathStreamOutput::fixed(
-            UnderlayProtocol::Tcp,
-            path_id,
-            commands,
-            mux_limits,
-        ),
-    };
-
-    let proof_id = stream
-        .enqueue_stream_ordered_path_proof(TrafficClass::Throughput)
-        .expect("queue stream-ordered path proof")
-        .expect("fixed output has a carrier path");
-
-    assert!(
-        try_recv_reliable_path_priority_command(&mut receivers).is_none(),
-        "stream-ordered proof must not enter the priority queue"
-    );
-    assert!(matches!(
-        try_recv_reliable_path_command(&mut receivers),
-        Some(ReliablePathCommand::SendFrame(Frame::StreamData { .. }))
-    ));
-    let proof_frame = match try_recv_reliable_path_command(&mut receivers) {
-        Some(ReliablePathCommand::SendFrame(frame)) => {
-            let Frame::PathProofData {
-                path_id: queued_path_id,
-                proof_id: queued_proof_id,
-                payload,
-            } = &frame
-            else {
-                panic!("stream-ordered proof must follow earlier product data");
-            };
-            assert_eq!(*queued_path_id, path_id);
-            assert_eq!(*queued_proof_id, proof_id);
-            assert!(!payload.is_empty());
-            frame
-        }
-        _ => panic!("stream-ordered proof must follow earlier product data"),
-    };
-    let payload_len = match &proof_frame {
-        Frame::PathProofData { payload, .. } => payload.len(),
-        _ => unreachable!("matched path proof frame above"),
-    };
-    let mut tracker = PathProofTracker::default();
-    tracker.record_sent_frame(&proof_frame);
-    let observation = tracker
-        .acknowledge(
-            path_id,
-            proof_id,
-            u32::try_from(payload_len).expect("test proof payload length fits u32"),
-        )
-        .expect("consumed ordered proof is tracked for acknowledgement");
-    assert_eq!(observation.proof_id, proof_id);
-    assert_eq!(observation.bytes, payload_len as u64);
 }
 
 #[test]
@@ -161,24 +70,30 @@ fn fixed_priority_path_proof_preserves_attachment_liveness_ordering() {
     ));
 }
 
-#[test]
-fn switchable_stream_ordered_path_proof_keeps_no_fixed_carrier_semantics() {
-    let (binding, key) = binding_for_underlay(UnderlayProtocol::Tcp);
-    let stream = ReliablePathStreamHandle {
-        stream_id: StreamId(7),
-        max_offset: u64::MAX,
-        lane: TrafficClass::Throughput,
-        underlay: key.underlay,
-        max_frame_payload_bytes: MuxLimits::default().max_payload_bytes,
-        output: ReliablePathStreamOutput::Switchable(binding),
-    };
+#[tokio::test]
+async fn fixed_output_publishes_terminal_reset_as_one_ordered_transaction() {
+    let mux_limits = MuxLimits::default();
+    let stream_id = StreamId(8);
+    let (commands, mut receivers) = reliable_path_command_channels(1);
+    let output =
+        ReliablePathStreamOutput::fixed(UnderlayProtocol::Tcp, PathId(4), commands, mux_limits);
 
-    assert_eq!(
-        stream
-            .enqueue_stream_ordered_path_proof(TrafficClass::Throughput)
-            .expect("switchable output is a successful no-op"),
-        None
-    );
+    output
+        .reset_and_close_stream_ordered(
+            stream_id,
+            ResetReason::RemoteClosed,
+            TrafficClass::Throughput,
+        )
+        .await;
+
+    assert!(matches!(
+        try_recv_reliable_path_command(&mut receivers),
+        Some(ReliablePathCommand::ResetAndCloseStream {
+            stream_id: received,
+            reason: ResetReason::RemoteClosed,
+        }) if received == stream_id
+    ));
+    assert!(try_recv_reliable_path_command(&mut receivers).is_none());
 }
 
 #[test]

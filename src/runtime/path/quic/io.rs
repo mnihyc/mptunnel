@@ -9,12 +9,15 @@ use crate::runtime::path::commands::{
     reliable_path_command_queue, reliable_stream_frame_queue_for_payload,
 };
 use crate::runtime::path::proof::PathProofTracker;
+use crate::runtime::path::send_credit::{
+    CarrierSendCredit, CarrierSendCreditSnapshot, CarrierSendCreditSource,
+};
 use crate::runtime::path::server_context::ServerPathContext;
 use crate::transport::PathSpec;
 use crate::transport::quic as quic_transport;
 use crate::transport::udp::UdpTransportError;
 use std::net::{IpAddr, SocketAddr};
-use std::time::Instant;
+use std::sync::Arc;
 use tokio::net::lookup_host;
 use tokio::sync::mpsc;
 
@@ -26,18 +29,33 @@ pub(in crate::runtime) struct UdpPathEndpoint {
 #[derive(Debug, Clone)]
 pub(in crate::runtime) struct UdpPathConnection {
     pub(super) connection: quic_transport::Connection,
+    send_credit: CarrierSendCredit,
+}
+
+#[derive(Debug)]
+struct QuicCarrierSendCreditSource {
+    connection: quic_transport::Connection,
+}
+
+impl CarrierSendCreditSource for QuicCarrierSendCreditSource {
+    fn snapshot(&self) -> CarrierSendCreditSnapshot {
+        let snapshot = self.connection.send_credit_snapshot();
+        CarrierSendCreditSnapshot {
+            limit_bytes: snapshot.limit_bytes,
+            committed_bytes: snapshot.committed_bytes,
+            closed: snapshot.closed,
+        }
+    }
+
+    fn notify(&self) -> Arc<tokio::sync::Notify> {
+        self.connection.send_credit_notify()
+    }
 }
 
 #[derive(Debug)]
 pub(in crate::runtime) struct UdpPathSendStream {
     stream: quic_transport::SendStream,
     pub(super) connection: UdpPathConnection,
-}
-
-impl UdpPathSendStream {
-    pub(super) fn transport_stream_mut(&mut self) -> &mut quic_transport::SendStream {
-        &mut self.stream
-    }
 }
 
 #[derive(Debug)]
@@ -89,16 +107,13 @@ impl UdpPathEndpoint {
         &self,
         remote_addr: SocketAddr,
     ) -> Result<UdpPathConnection, RuntimeError> {
-        Ok(UdpPathConnection {
-            connection: self.endpoint.connect(remote_addr).await?,
-        })
+        Ok(UdpPathConnection::new(
+            self.endpoint.connect(remote_addr).await?,
+        ))
     }
 
     pub(super) async fn accept(&self) -> Option<UdpPathConnection> {
-        self.endpoint
-            .accept()
-            .await
-            .map(|connection| UdpPathConnection { connection })
+        self.endpoint.accept().await.map(UdpPathConnection::new)
     }
 
     #[cfg(test)]
@@ -108,8 +123,27 @@ impl UdpPathEndpoint {
 }
 
 impl UdpPathConnection {
+    fn new(connection: quic_transport::Connection) -> Self {
+        let send_credit = CarrierSendCredit::new(Arc::new(QuicCarrierSendCreditSource {
+            connection: connection.clone(),
+        }));
+        Self {
+            connection,
+            send_credit,
+        }
+    }
+
+    pub(super) fn send_credit(&self) -> CarrierSendCredit {
+        self.send_credit.clone()
+    }
+
     pub(super) fn is_locally_closed(&self) -> bool {
         self.connection.is_locally_closed()
+    }
+
+    #[cfg(feature = "lab-diagnostics")]
+    pub(super) fn close_reason(&self) -> Option<String> {
+        self.connection.close_reason()
     }
 
     pub(super) async fn open_bi(
@@ -142,34 +176,12 @@ impl UdpPathConnection {
         self.connection.close();
     }
 
-    pub(super) fn capacity_probe_active(&self) -> bool {
-        self.connection.measurement_active()
-    }
-
-    pub(super) async fn wait_for_capacity_probe_release(&self) {
-        self.connection.wait_for_measurement_release().await;
-    }
-
     pub(super) fn is_closed(&self) -> bool {
         self.connection.is_closed()
     }
 
-    pub(super) fn retire_capacity_probe(&self, token: u64) -> bool {
-        self.connection.retire_measurement(token)
-    }
-
-    pub(super) fn cancel_capacity_probe(&self, token: u64) -> bool {
-        self.connection.cancel_measurement(token)
-    }
-
-    pub(super) fn confirm_capacity_probe_receipt(
-        &self,
-        token: u64,
-        received_payload_bytes: u64,
-        received_at: Instant,
-    ) -> bool {
-        self.connection
-            .confirm_measurement_receipt(token, received_payload_bytes, received_at)
+    pub(super) fn rtt(&self) -> std::time::Duration {
+        self.connection.rtt()
     }
 }
 
@@ -185,7 +197,7 @@ pub(in crate::runtime) async fn udp_path_write_frame(
     frame: &Frame,
     codec_limits: CodecLimits,
 ) -> Result<(), RuntimeError> {
-    ensure_quic_ordinary_frames(std::slice::from_ref(frame))?;
+    ensure_quic_data_plane_frames(std::slice::from_ref(frame))?;
     quic_transport::write_frame(&mut send.stream, frame, codec_limits).await?;
     Ok(())
 }
@@ -195,20 +207,15 @@ async fn udp_path_write_frames(
     frames: &[Frame],
     codec_limits: CodecLimits,
 ) -> Result<(), RuntimeError> {
-    ensure_quic_ordinary_frames(frames)?;
+    ensure_quic_data_plane_frames(frames)?;
     quic_transport::write_frames(&mut send.stream, frames, codec_limits).await?;
     Ok(())
 }
 
-fn ensure_quic_ordinary_frames(frames: &[Frame]) -> Result<(), RuntimeError> {
-    if frames.iter().any(|frame| {
-        !matches!(
-            frame.write_class(),
-            crate::protocol::FrameWriteClass::Ordinary { .. }
-        )
-    }) {
+fn ensure_quic_data_plane_frames(frames: &[Frame]) -> Result<(), RuntimeError> {
+    if frames.iter().any(Frame::is_path_capacity) {
         return Err(RuntimeError::Protocol(
-            "QUIC measurement records require the dedicated writer",
+            "PATH_CAPACITY frames are not valid on QUIC carriers",
         ));
     }
     Ok(())
@@ -227,21 +234,69 @@ pub(super) async fn flush_udp_frame_batch(
     Ok(())
 }
 
-pub(super) async fn flush_udp_frame_batch_with_path_proofs(
+pub(super) async fn flush_udp_frame_batch_with_path_proofs_interlocked<F>(
     send: &mut UdpPathSendStream,
     frames: &mut Vec<Frame>,
     codec_limits: CodecLimits,
     path_proofs: &mut PathProofTracker,
-) -> Result<(), RuntimeError> {
+    carrier_frames: &mut mpsc::Receiver<Result<Frame, RuntimeError>>,
+    deferred_input: &mut Option<Result<Frame, RuntimeError>>,
+    try_route_frame: F,
+) -> Result<usize, RuntimeError>
+where
+    F: FnMut(Frame) -> Result<Option<Frame>, RuntimeError>,
+{
     if frames.is_empty() {
-        return Ok(());
+        return Ok(0);
     }
-    udp_path_write_frames(send, frames, codec_limits).await?;
+    debug_assert!(deferred_input.is_none());
+    let write = udp_path_write_frames(send, frames, codec_limits);
+    let (write_result, routed_frames) = await_udp_write_while_routing_stream_frames(
+        write,
+        carrier_frames,
+        deferred_input,
+        try_route_frame,
+    )
+    .await;
+    write_result?;
     for frame in frames.iter() {
         path_proofs.record_sent_frame(frame);
     }
     frames.clear();
-    Ok(())
+    Ok(routed_frames)
+}
+
+async fn await_udp_write_while_routing_stream_frames<W, T, F>(
+    write: W,
+    carrier_frames: &mut mpsc::Receiver<Result<Frame, RuntimeError>>,
+    deferred_input: &mut Option<Result<Frame, RuntimeError>>,
+    mut try_route_frame: F,
+) -> (T, usize)
+where
+    W: std::future::Future<Output = T>,
+    F: FnMut(Frame) -> Result<Option<Frame>, RuntimeError>,
+{
+    tokio::pin!(write);
+    let mut routed_frames = 0usize;
+    loop {
+        tokio::select! {
+            biased;
+            result = &mut write => return (result, routed_frames),
+            incoming = carrier_frames.recv(), if deferred_input.is_none() => {
+                match incoming {
+                    Some(Ok(frame)) => match try_route_frame(frame) {
+                        Ok(None) => routed_frames = routed_frames.saturating_add(1),
+                        Ok(Some(frame)) => *deferred_input = Some(Ok(frame)),
+                        Err(err) => *deferred_input = Some(Err(err)),
+                    },
+                    Some(Err(err)) => *deferred_input = Some(Err(err)),
+                    None => {
+                        *deferred_input = Some(Err(RuntimeError::ReliablePathSessionClosed));
+                    }
+                }
+            }
+        }
+    }
 }
 
 pub(in crate::runtime) fn udp_path_finish_stream(
@@ -388,6 +443,11 @@ pub(super) fn spawn_quic_path_reader(
             let frame = match received {
                 Ok(frame) => Ok(frame),
                 Err(err) if udp_path_frame_finished(&err) => {
+                    #[cfg(feature = "lab-diagnostics")]
+                    crate::lab_diagnostics::lab_diagnostic(
+                        "quic_path_reader_terminal",
+                        format_args!("error={err}"),
+                    );
                     Err(RuntimeError::ReliablePathSessionClosed)
                 }
                 Err(err) => Err(err),

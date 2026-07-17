@@ -106,11 +106,12 @@ Data ACK progress is limited to one bounded startup flight; native carrier ACK
 evidence cannot substitute for that Data ACK gate.
 
 Request stream ownership is split by invariant: `attachment` owns carrier
-membership, `state` owns path evidence and sampling, `flow_control` owns receive
-authority, and `flight` owns exact ranges and copies. Relay owns the transaction
-that acquires or recovers a carrier, and sender only consumes the resulting
-stream-owned set. `stream/feedback` owns connection-level Data ACK/window
-emission logic instantiated independently by both relay directions.
+membership, `state` owns path delivery evidence and admission, and `flight`
+owns exact ranges and copies. The shared mux stream model owns receive-window
+authority. Relay owns the transaction that acquires or recovers a carrier, and
+sender only consumes the resulting stream-owned set. `stream/feedback` owns
+connection-level Data ACK/window emission logic instantiated independently by
+both relay directions.
 Generic SOCKS/TUN UDP association workers live in `datagram/edge`; TUN retains
 only packet-device and packet-flow concerns.
 

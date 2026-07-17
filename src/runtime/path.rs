@@ -16,14 +16,13 @@ pub(super) mod proof;
 mod queue;
 pub(in crate::runtime) mod quic;
 mod selection;
+mod send_credit;
 mod server_context;
 mod set;
 mod state;
 pub(in crate::runtime) mod tcp;
 
-pub(in crate::runtime) use commands::{
-    CapacityProbeCommandTicket, QuicCapacityProbeCommand, RequestTcpCapacityProbeRequest,
-};
+pub(in crate::runtime) use commands::{CapacityProbeCommandTicket, RequestTcpCapacityProbeRequest};
 pub(in crate::runtime) use health::{
     ClientPathHealth, ClientPathHealthRecord, RequestCapacityReconciliationView,
 };
@@ -34,15 +33,11 @@ pub(in crate::runtime) use ports::{
     ServerDatagramOpenRequest, ServerDatagramPort, ServerDatagramPortBackend,
     ServerDatagramRequest, ServerDatagramSendOutcome, ServerLocalPathProperties,
     ServerNewStreamPolicy, ServerRealtimeFlowLease, ServerSessionManagementSnapshot,
-    ServerStreamManagementSnapshot, ServerStreamOpenOutcome, ServerStreamOpenRequest,
-    ServerStreamPathAttachment, ServerStreamPort, ServerStreamPortBackend,
+    ServerStreamFrameRoute, ServerStreamManagementSnapshot, ServerStreamOpenOutcome,
+    ServerStreamOpenRequest, ServerStreamPathAttachment, ServerStreamPort, ServerStreamPortBackend,
 };
 #[cfg(test)]
 pub(super) use proof::*;
-pub(in crate::runtime) use quic::{
-    RequestQuicCapacityProbeLease, RequestQuicCapacityProductAdmissionState,
-    RequestQuicCapacityReconciliationQuery,
-};
 pub(in crate::runtime) use selection::ReliableRequestTcpPathEvidence;
 pub(in crate::runtime) use server_context::{ServerLocalPath, ServerPathContext};
 pub(in crate::runtime) use set::ClientPathContext;

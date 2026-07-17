@@ -79,12 +79,13 @@ boundary, or adapter. File size alone does not earn a module.
 - `src/runtime/path/tcp/`: TCP connection actors, reads/writes, heartbeats,
   optional socket evidence, and TCP-specific capacity transactions.
 - `src/runtime/path/quic/`: Quinn connection and stream actors, datagrams,
-  native measurements, and QUIC-specific capacity transactions.
+  native measurements, and native congestion-window publication.
 - `src/runtime/stream/`: MPP stream handles, connection-level receive
   feedback, client request state and attachments, server registry, response
   bindings, exact attachment lifetimes, and delivery.
-- `src/runtime/stream/request/`: request `attachment`, `state`, `flow_control`,
-  and `flight` owners behind the narrow `request.rs` facade.
+- `src/runtime/stream/request/`: request `attachment`, `state`, and `flight`
+  owners behind the narrow `request.rs` facade. MPP receive-window authority
+  remains in the shared mux stream model.
 - `src/runtime/sender/request/`: request queueing, scheduling, capacity intents,
   multipath commit, and carrier dispatch.
 - `src/runtime/sender/response/`: response `service`, `scheduling`,
@@ -156,10 +157,13 @@ optional reinjection.
 
 Recovery timing follows the evidence owner: exact path-instance failure is
 immediate, an authoritative lowest missing Data Sequence frontier must persist
-for three path-local PTO intervals, and a contiguous live tail may send one
-bounded probe after one PTO but waits three PTO before repeating without
-progress. Growth of the ACK horizon above the same frontier does not restart
-the timer. These are MPP data-level policies; native TCP and QUIC recovery
+for three owner-carrier recovery intervals, and a contiguous live tail may send
+one bounded probe after one such interval but waits three intervals before
+repeating without progress. TCP uses RTO while QUIC uses PTO. Growth of the ACK
+horizon above the same frontier does not restart the timer. A request carrier
+with no exact Data ACK progress becomes stale for new placement after four TCP
+RTOs or three QUIC PTOs when an alternative exists, without stopping its native
+recovery. These are MPP data-level policies; native TCP and QUIC recovery
 timers remain independent.
 
 ## Scheduling contract

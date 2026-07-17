@@ -84,7 +84,7 @@ fn stale_attachment_or_model_generation_cannot_commit() {
     assert!(
         fixture
             .binding
-            .original_flight_keys_overlapping_frame(&frame)
+            .original_flight_outputs_overlapping_frame(&frame)
             .is_empty()
     );
     assert!(try_recv_reliable_path_command(&mut fixture.receivers).is_none());
@@ -111,7 +111,7 @@ fn full_carrier_queue_rolls_back_without_publishing_flight() {
     assert!(
         fixture
             .binding
-            .original_flight_keys_overlapping_frame(&frame)
+            .original_flight_outputs_overlapping_frame(&frame)
             .is_empty()
     );
     let filler = try_recv_reliable_path_command(&mut fixture.receivers)
@@ -137,8 +137,8 @@ fn successful_commit_publishes_exact_flight_before_carrier_work() {
     assert_eq!(
         fixture
             .binding
-            .original_flight_keys_overlapping_frame(&frame),
-        vec![fixture.key]
+            .original_flight_outputs_overlapping_frame(&frame),
+        vec![(fixture.key, fixture.target.incarnation)]
     );
     let outputs = fixture
         .binding

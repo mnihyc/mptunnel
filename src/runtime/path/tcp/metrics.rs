@@ -47,6 +47,9 @@ pub(in crate::runtime) struct TcpNativeObservation {
     inflight_hi_bytes: Option<u64>,
     delivery_rate_bps: Option<u64>,
     pacing_rate_bps: Option<u64>,
+    newly_acked_bytes: Option<u64>,
+    #[cfg(any(test, feature = "lab-diagnostics"))]
+    acked_bytes_since_epoch: Option<u64>,
     loss_ppm: Option<u32>,
     loss_observed: Option<bool>,
     confidence_ppm: Option<u32>,
@@ -94,8 +97,21 @@ impl TcpNativeObservation {
         self.pacing_rate_bps
     }
 
+    pub(in crate::runtime) fn newly_acked_bytes(self) -> Option<u64> {
+        self.newly_acked_bytes
+    }
+
+    #[cfg(any(test, feature = "lab-diagnostics"))]
+    pub(in crate::runtime) fn acked_bytes_since_epoch(self) -> Option<u64> {
+        self.acked_bytes_since_epoch
+    }
+
     pub(in crate::runtime) fn app_limited(self) -> Option<bool> {
         self.app_limited
+    }
+
+    pub(in crate::runtime) fn delivery_window_covered(self) -> bool {
+        self.confidence_ppm == Some(1_000_000)
     }
 
     pub(in crate::runtime) fn has_flight(self) -> bool {
@@ -216,6 +232,11 @@ impl TcpMetricPublisher {
         })
     }
 
+    /// Next adaptive same-socket sample chosen from the latest native RTT.
+    pub(in crate::runtime) fn next_observation_at(&self) -> Instant {
+        self.next_sample_at
+    }
+
     pub(in crate::runtime) fn maybe_observe(
         &mut self,
         path_id: PathId,
@@ -253,6 +274,8 @@ impl TcpMetricPublisher {
 #[derive(Debug)]
 pub(in crate::runtime) struct TcpSenderMetricTracker {
     bytes_acked_baseline: Option<u64>,
+    previous_bytes_acked: Option<u64>,
+    delivery_window_floor_bytes: u64,
     loss: Option<TcpLossTracker>,
 }
 
@@ -267,8 +290,18 @@ struct TcpLossTracker {
 
 impl TcpSenderMetricTracker {
     pub(in crate::runtime) fn new(baseline: TcpNativeSnapshot) -> Self {
+        let delivery_window_floor_bytes = baseline
+            .flight
+            .map(|flight| {
+                u64::from(flight.snd_cwnd_packets)
+                    .saturating_mul(u64::from(flight.snd_mss_bytes.max(1)))
+            })
+            .unwrap_or(PATH_OPEN_SCORE_BYTES as u64)
+            .max(PATH_OPEN_SCORE_BYTES as u64);
         Self {
             bytes_acked_baseline: baseline.bytes_acked,
+            previous_bytes_acked: baseline.bytes_acked,
+            delivery_window_floor_bytes,
             loss: baseline.loss.map(|previous| TcpLossTracker {
                 previous,
                 sent_segments: 0,
@@ -325,17 +358,20 @@ impl TcpSenderMetricTracker {
                 .then(|| ratio_to_ppm(tracker.retransmits as f64 / tracker.sent_segments as f64))
         });
         let loss_observed = loss_ppm.map(|_| true);
-        let sample_floor = inflight_limit_bytes
-            .unwrap_or(PATH_OPEN_SCORE_BYTES as u64)
-            .max(PATH_OPEN_SCORE_BYTES as u64);
-        let confidence_ppm =
-            self.bytes_acked_baseline
-                .zip(current.bytes_acked)
-                .map(|(baseline, current)| {
-                    ratio_to_ppm(
-                        current.saturating_sub(baseline) as f64 / sample_floor.max(1) as f64,
-                    )
-                });
+        let acked_bytes_since_epoch = self
+            .bytes_acked_baseline
+            .zip(current.bytes_acked)
+            .map(|(baseline, current)| current.saturating_sub(baseline));
+        let confidence_ppm = acked_bytes_since_epoch.map(|acked_bytes| {
+            ratio_to_ppm(acked_bytes as f64 / self.delivery_window_floor_bytes.max(1) as f64)
+        });
+        let newly_acked_bytes = match (self.previous_bytes_acked, current.bytes_acked) {
+            (Some(previous), Some(current)) => Some(current.saturating_sub(previous)),
+            (None, Some(_)) | (_, None) => None,
+        };
+        if current.bytes_acked.is_some() {
+            self.previous_bytes_acked = current.bytes_acked;
+        }
 
         TcpNativeObservation {
             path_id,
@@ -353,6 +389,9 @@ impl TcpSenderMetricTracker {
                 .pacing_rate_bytes_per_second
                 .filter(|rate| *rate != u64::MAX)
                 .map(bytes_per_second_to_bits),
+            newly_acked_bytes,
+            #[cfg(any(test, feature = "lab-diagnostics"))]
+            acked_bytes_since_epoch,
             loss_ppm,
             loss_observed,
             confidence_ppm,

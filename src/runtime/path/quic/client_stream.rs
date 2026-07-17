@@ -1,18 +1,13 @@
 //! Client QUIC reliable-stream receive and control loop.
 
-use super::capacity::udp_path_write_capacity_receipt;
 use super::client_writer::drain_client_udp_stream_commands;
 use super::io::{
     UdpPathRecvStream, UdpPathSendStream, spawn_quic_path_reader, udp_path_finish_stream,
     udp_path_write_frame,
 };
-#[cfg(feature = "lab-diagnostics")]
-use crate::lab_diagnostics::lab_diagnostic;
-use crate::model::capacity::reliable_capacity_measurement_session_limit_bytes;
 use crate::model::path::CarrierPathInstanceId;
 use crate::mux::MuxLimits;
 use crate::protocol::codec::CodecLimits;
-use crate::protocol::path_capacity::CapacityReceiveTracker;
 use crate::protocol::{Frame, PathId, PathUsage, StreamId, UnderlayProtocol};
 use crate::runtime::error::RuntimeError;
 use crate::runtime::path::commands::{
@@ -22,7 +17,6 @@ use crate::runtime::path::commands::{
 use crate::runtime::path::proof::{PathProofTracker, path_proof_ack_frame};
 use crate::runtime::path::state::ClientPathState;
 use std::sync::Arc;
-use std::time::Instant;
 use tokio::sync::mpsc;
 
 #[allow(clippy::too_many_arguments)]
@@ -40,120 +34,35 @@ pub(super) async fn run_client_udp_stream(
     frames: mpsc::Sender<Result<Frame, RuntimeError>>,
 ) {
     let mut carrier_frames = spawn_quic_path_reader(recv, codec_limits, reader_queue_size);
-    let mut deferred_capacity_frames = std::collections::VecDeque::<Frame>::new();
     let mut pending_frames = Vec::<Frame>::new();
     let mut path_proofs = PathProofTracker::default();
-    let mut capacity_receive = CapacityReceiveTracker::new(
-        reliable_capacity_measurement_session_limit_bytes(mux_limits),
-    );
+    let mut deferred_input = None;
     let path_id = PathId(path_index as u16);
     loop {
-        if send.connection.capacity_probe_active() {
-            let release_connection = send.connection.clone();
-            tokio::select! {
-                biased;
-                frame = carrier_frames.recv() => {
-                    match frame {
-                        Some(Ok(Frame::PathCapacityReceipt {
-                            path_id: receipt_path_id,
-                            measurement_id,
-                            received_payload_bytes,
-                        })) => {
-                            if receipt_path_id != path_id
-                                || !send.connection.confirm_capacity_probe_receipt(
-                                    measurement_id,
-                                    received_payload_bytes,
-                                    Instant::now(),
-                                )
-                            {
-                                let _ = frames.send(Err(RuntimeError::Protocol(
-                                    "invalid client QUIC capacity receipt",
-                                ))).await;
-                                return;
-                            }
-                            #[cfg(feature = "lab-diagnostics")]
-                            lab_diagnostic(
-                                "request_quic_capacity_receipt",
-                                format_args!(
-                                    "phase=confirmed path_id={} stream_id={} measurement_id={} received_payload_bytes={}",
-                                    path_id.0, stream_id.0, measurement_id, received_payload_bytes,
-                                ),
-                            );
-                        }
-                        Some(Ok(Frame::PathCapacityData {
-                            path_id: capacity_path_id,
-                            measurement_id,
-                            payload,
-                        })) => {
-                            if capacity_path_id != path_id
-                                || capacity_receive
-                                    .record_data(measurement_id, payload.len())
-                                    .is_err()
-                            {
-                                let _ = frames.send(Err(RuntimeError::Protocol(
-                                    "invalid simultaneous client QUIC capacity data",
-                                ))).await;
-                                return;
-                            }
-                        }
-                        Some(Ok(Frame::PathCapacityFinish {
-                            path_id: capacity_path_id,
-                            measurement_id,
-                            payload_bytes,
-                        })) => {
-                            if capacity_path_id != path_id {
-                                let _ = frames.send(Err(RuntimeError::Protocol(
-                                    "simultaneous client QUIC capacity finish path mismatch",
-                                ))).await;
-                                return;
-                            }
-                            let received_payload_bytes = match capacity_receive
-                                .finish(measurement_id, payload_bytes)
-                            {
-                                Ok(bytes) => bytes,
-                                Err(err) => {
-                                    let _ = frames.send(Err(err.into())).await;
-                                    return;
-                                }
-                            };
-                            if let Err(err) = udp_path_write_capacity_receipt(
-                                &mut send,
-                                path_id,
-                                measurement_id,
-                                received_payload_bytes,
-                                codec_limits,
-                            ).await {
-                                let _ = frames.send(Err(err)).await;
-                                return;
-                            }
-                        }
-                        Some(Ok(frame)) => {
-                            if deferred_capacity_frames.len() >= reader_queue_size {
-                                let _ = frames.send(Err(RuntimeError::Protocol(
-                                    "client QUIC capacity receipt defer queue exceeded",
-                                ))).await;
-                                return;
-                            }
-                            deferred_capacity_frames.push_back(frame);
-                        }
-                        Some(Err(err)) => {
-                            let _ = frames.send(Err(err)).await;
-                            return;
-                        }
-                        None => {
-                            let _ = frames.send(Err(RuntimeError::ReliablePathSessionClosed)).await;
-                            return;
-                        }
-                    }
-                }
-                _ = release_connection.wait_for_capacity_probe_release() => {}
-            }
-            continue;
-        }
         let command_may_recv = !reliable_path_receivers_closed(&commands);
         if !command_may_recv {
             let _ = udp_path_finish_stream(&mut send);
             return;
+        }
+        if let Some(input) = deferred_input.take() {
+            if let Err(err) = handle_client_udp_stream_input(
+                input,
+                &mut send,
+                stream_id,
+                path_index,
+                path_instance_id,
+                path_id,
+                codec_limits,
+                &state,
+                &mut path_proofs,
+                &frames,
+            )
+            .await
+            {
+                let _ = frames.send(Err(err)).await;
+                return;
+            }
+            continue;
         }
         if let Some(command) = try_recv_reliable_path_priority_command(&mut commands) {
             let result = drain_client_udp_stream_commands(
@@ -165,6 +74,9 @@ pub(super) async fn run_client_udp_stream(
                 mux_limits,
                 &mut pending_frames,
                 &mut path_proofs,
+                &mut carrier_frames,
+                &frames,
+                &mut deferred_input,
             )
             .await;
             match result {
@@ -179,172 +91,22 @@ pub(super) async fn run_client_udp_stream(
         }
         tokio::select! {
             biased;
-            frame = async {
-                match deferred_capacity_frames.pop_front() {
-                    Some(frame) => Some(Ok::<Frame, RuntimeError>(frame)),
-                    None => carrier_frames.recv().await,
-                }
-            } => {
-                match frame {
-                    Some(Ok(Frame::Ping { nonce })) => {
-                        if let Err(err) = udp_path_write_frame(&mut send, &Frame::Pong { nonce }, codec_limits).await {
-                            let _ = frames.send(Err(err)).await;
-                            return;
-                        }
-                    }
-                    Some(Ok(Frame::PathProofData {
-                        path_id: proof_path_id,
-                        proof_id,
-                        payload,
-                    })) if proof_path_id == path_id => {
-                        if let Err(err) = udp_path_write_frame(
-                            &mut send,
-                            &path_proof_ack_frame(path_id, proof_id, payload.len()),
-                            codec_limits,
-                        ).await {
-                            let _ = frames.send(Err(err)).await;
-                            return;
-                        }
-                    }
-                    Some(Ok(Frame::PathProofAck {
-                        path_id: proof_path_id,
-                        proof_id,
-                        payload_bytes,
-                    })) if proof_path_id == path_id => {
-                        if let Some(observation) =
-                            path_proofs.acknowledge(path_id, proof_id, payload_bytes)
-                            && let Some(record) = state
-                                .health()
-                                .lock()
-                                .expect("client path health lock")
-                                .udp
-                                .get_mut(path_index)
-                        {
-                            record.mark_path_proof_success(observation);
-                        }
-                    }
-                    Some(Ok(Frame::PathCapacityData {
-                        path_id: capacity_path_id,
-                        measurement_id,
-                        payload,
-                    })) => {
-                        if capacity_path_id != path_id
-                            || capacity_receive
-                                .record_data(measurement_id, payload.len())
-                                .is_err()
-                        {
-                            let _ = frames.send(Err(RuntimeError::Protocol(
-                                "invalid QUIC capacity data epoch",
-                            ))).await;
-                            return;
-                        }
-                        #[cfg(feature = "lab-diagnostics")]
-                        lab_diagnostic(
-                            "quic_capacity_data_received",
-                            format_args!(
-                                "role=client path_id={} stream_id={} measurement_id={} payload_bytes={}",
-                                path_id.0,
-                                stream_id.0,
-                                measurement_id,
-                                payload.len(),
-                            ),
-                        );
-                    }
-                    Some(Ok(Frame::PathCapacityFinish {
-                        path_id: capacity_path_id,
-                        measurement_id,
-                        payload_bytes,
-                    })) => {
-                        if capacity_path_id != path_id {
-                            let _ = frames.send(Err(RuntimeError::Protocol(
-                                "QUIC capacity finish path mismatch",
-                            ))).await;
-                            return;
-                        }
-                        let received_payload_bytes = match capacity_receive
-                            .finish(measurement_id, payload_bytes)
-                        {
-                            Ok(bytes) => bytes,
-                            Err(err) => {
-                                let _ = frames.send(Err(err.into())).await;
-                                return;
-                            }
-                        };
-                        if let Err(err) = udp_path_write_capacity_receipt(
-                            &mut send,
-                            path_id,
-                            measurement_id,
-                            received_payload_bytes,
-                            codec_limits,
-                        ).await {
-                            let _ = frames.send(Err(err)).await;
-                            return;
-                        }
-                        #[cfg(feature = "lab-diagnostics")]
-                        lab_diagnostic(
-                            "quic_capacity_receipt",
-                            format_args!(
-                                "role=client phase=sent path_id={} stream_id={} measurement_id={} received_payload_bytes={}",
-                                path_id.0,
-                                stream_id.0,
-                                measurement_id,
-                                received_payload_bytes,
-                            ),
-                        );
-                    }
-                    Some(Ok(Frame::PathCapacityReceipt { .. })) => {
-                        let _ = frames.send(Err(RuntimeError::Protocol(
-                            "client QUIC path received server capacity receipt",
-                        ))).await;
-                        return;
-                    }
-                    Some(Ok(frame @ (Frame::StreamData { stream_id: received_stream_id, .. }
-                        | Frame::StreamAck { stream_id: received_stream_id, .. }
-                        | Frame::StreamMaxData { stream_id: received_stream_id, .. }
-                        | Frame::StreamFin { stream_id: received_stream_id, .. }
-                        | Frame::StreamReset { stream_id: received_stream_id, .. })))
-                        if received_stream_id == stream_id =>
-                    {
-                        if frames.send(Ok(frame)).await.is_err() {
-                            return;
-                        }
-                    }
-                    Some(Ok(Frame::PathStatus {
-                        path_id: status_path_id,
-                        sequence,
-                        usage,
-                    })) => {
-                        if let Err(err) = apply_client_udp_path_status(
-                            &state,
-                            path_index,
-                            path_instance_id,
-                            path_id,
-                            status_path_id,
-                            sequence,
-                            usage,
-                        ) {
-                            let _ = frames.send(Err(err)).await;
-                            return;
-                        }
-                    }
-                    Some(Ok(Frame::SessionClose { reason })) => {
-                        let _ = frames.send(Err(RuntimeError::RemoteClosed(reason))).await;
-                        return;
-                    }
-                    Some(Ok(_)) => {
-                        let _ = frames
-                            .send(Err(RuntimeError::Protocol("unexpected QUIC UDP path reliable stream frame")))
-                            .await;
-                        return;
-                    }
-                    Some(Err(err)) => {
-                        let _ = frames.send(Err(err)).await;
-                        return;
-                    }
-                    None => {
-                        let _ = frames.send(Err(RuntimeError::ReliablePathSessionClosed)).await;
-                        return;
-                    }
+            frame = carrier_frames.recv() => {
+                let input = frame.unwrap_or(Err(RuntimeError::ReliablePathSessionClosed));
+                if let Err(err) = handle_client_udp_stream_input(
+                    input,
+                    &mut send,
+                    stream_id,
+                    path_index,
+                    path_instance_id,
+                    path_id,
+                    codec_limits,
+                    &state,
+                    &mut path_proofs,
+                    &frames,
+                ).await {
+                    let _ = frames.send(Err(err)).await;
+                    return;
                 }
                 if let Some(command) = try_recv_reliable_path_command(&mut commands) {
                     let result = drain_client_udp_stream_commands(
@@ -356,6 +118,9 @@ pub(super) async fn run_client_udp_stream(
                             mux_limits,
                             &mut pending_frames,
                             &mut path_proofs,
+                            &mut carrier_frames,
+                            &frames,
+                            &mut deferred_input,
                         )
                     .await;
                     match result {
@@ -379,6 +144,9 @@ pub(super) async fn run_client_udp_stream(
                         mux_limits,
                         &mut pending_frames,
                         &mut path_proofs,
+                        &mut carrier_frames,
+                        &frames,
+                        &mut deferred_input,
                     ).await;
                     match result {
                         Ok(false) => {}
@@ -392,6 +160,108 @@ pub(super) async fn run_client_udp_stream(
             }
         }
     }
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn handle_client_udp_stream_input(
+    input: Result<Frame, RuntimeError>,
+    send: &mut UdpPathSendStream,
+    stream_id: StreamId,
+    path_index: usize,
+    path_instance_id: CarrierPathInstanceId,
+    path_id: PathId,
+    codec_limits: CodecLimits,
+    state: &ClientPathState,
+    path_proofs: &mut PathProofTracker,
+    frames: &mpsc::Sender<Result<Frame, RuntimeError>>,
+) -> Result<(), RuntimeError> {
+    match input? {
+        Frame::Ping { nonce } => {
+            udp_path_write_frame(send, &Frame::Pong { nonce }, codec_limits).await?;
+        }
+        Frame::PathProofData {
+            path_id: proof_path_id,
+            proof_id,
+            payload,
+        } if proof_path_id == path_id => {
+            udp_path_write_frame(
+                send,
+                &path_proof_ack_frame(path_id, proof_id, payload.len()),
+                codec_limits,
+            )
+            .await?;
+        }
+        Frame::PathProofAck {
+            path_id: proof_path_id,
+            proof_id,
+            payload_bytes,
+        } if proof_path_id == path_id => {
+            if let Some(observation) = path_proofs.acknowledge(path_id, proof_id, payload_bytes)
+                && let Some(record) = state
+                    .health()
+                    .lock()
+                    .expect("client path health lock")
+                    .udp
+                    .get_mut(path_index)
+            {
+                record.mark_path_proof_success(observation);
+            }
+        }
+        Frame::PathCapacityData { .. }
+        | Frame::PathCapacityFinish { .. }
+        | Frame::PathCapacityReceipt { .. } => {
+            return Err(RuntimeError::Protocol(
+                "PATH_CAPACITY frames are not valid on QUIC carriers",
+            ));
+        }
+        frame @ (Frame::StreamData {
+            stream_id: received_stream_id,
+            ..
+        }
+        | Frame::StreamAck {
+            stream_id: received_stream_id,
+            ..
+        }
+        | Frame::StreamMaxData {
+            stream_id: received_stream_id,
+            ..
+        }
+        | Frame::StreamFin {
+            stream_id: received_stream_id,
+            ..
+        }
+        | Frame::StreamReset {
+            stream_id: received_stream_id,
+            ..
+        }) if received_stream_id == stream_id => {
+            frames
+                .send(Ok(frame))
+                .await
+                .map_err(|_| RuntimeError::ReliablePathSessionClosed)?;
+        }
+        Frame::PathStatus {
+            path_id: status_path_id,
+            sequence,
+            usage,
+        } => {
+            apply_client_udp_path_status(
+                state,
+                path_index,
+                path_instance_id,
+                path_id,
+                status_path_id,
+                sequence,
+                usage,
+            )?;
+        }
+        Frame::SessionClose { reason } => return Err(RuntimeError::RemoteClosed(reason)),
+        _ => {
+            return Err(RuntimeError::Protocol(
+                "unexpected QUIC UDP path reliable stream frame",
+            ));
+        }
+    }
+    Ok(())
 }
 
 pub(super) fn apply_client_udp_path_status(

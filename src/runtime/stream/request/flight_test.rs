@@ -67,6 +67,33 @@ fn duplicate_data_ack_releases_original_and_reinjected_flights_without_path_proo
 }
 
 #[test]
+fn frame_history_and_original_ownership_are_exact_attachment_instances() {
+    let original = path(UnderlayProtocol::Tcp, 0, 3);
+    let replacement = path(UnderlayProtocol::Tcp, 0, 4);
+    let repair = path(UnderlayProtocol::Udp, 1, 5);
+    let frame = data_frame(0, 4096);
+    let mut ledger = RequestFlightLedger::default();
+    ledger.record_original_frame_instance(original, &frame);
+    ledger.record_reinjection_frame_instance(repair, &frame);
+
+    assert_eq!(
+        ledger.sent_instances_for_frame(&frame),
+        vec![original, repair],
+        "history preserves the exact attachments that carried the frame",
+    );
+    assert_eq!(
+        ledger.original_transmission_instances_for_frame(&frame, &[original, replacement, repair],),
+        vec![original],
+    );
+    assert!(
+        ledger
+            .original_transmission_instances_for_frame(&frame, &[replacement, repair])
+            .is_empty(),
+        "a reconnect with the same logical key cannot inherit original-flight ownership",
+    );
+}
+
+#[test]
 fn an_unambiguous_partial_owner_ack_retains_and_proves_the_suffix() {
     let owner = path(UnderlayProtocol::Tcp, 0, 3);
     let mut ledger = RequestFlightLedger::default();

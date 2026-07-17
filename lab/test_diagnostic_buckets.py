@@ -208,17 +208,23 @@ class DiagnosticBucketTests(unittest.TestCase):
             "mptunnel_lab_diag ts_ms=1 event=server_response_stream_data_frame "
             "session_id=7 stream_id=9 offset=0 payload_bytes=64"
         )
-        decision = (
+        decisions = [
             "mptunnel_lab_diag ts_ms=1 event=sender_service_decision role=server "
-            "session_id=7 stream_id=9 decision_kind=data_service "
+            f"session_id=7 stream_id=9 decision_kind={kind} "
             "frame_kind=stream_data payload_bytes=64"
-        )
+            for kind in ("data_service", "data_completion_time")
+        ]
         summary = (
             "mptunnel_lab_diag ts_ms=1 event=sender_service_conformance "
             "session_id=8 stream_id=10 server_response_stream_data_frames=5 "
             "server_sender_service_stream_data_decisions=5"
         )
-        logs = [("server", "\n".join([frame] * 10 + [decision] * 9 + [summary]))]
+        logs = [
+            (
+                "server",
+                "\n".join([frame] * 10 + [decisions[0]] * 4 + [decisions[1]] * 5 + [summary]),
+            )
+        ]
         metrics = collect_metrics(row, logs, {})
 
         self.assertEqual(metrics["server_response_stream_data_frames"], 10)

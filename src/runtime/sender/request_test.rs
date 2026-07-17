@@ -80,6 +80,7 @@ fn request_dispatch_preserves_classified_and_stream_ordered_queues() {
         Frame::Ping { nonce: 1 },
         TrafficClass::Control,
         CarrierEmitMode::Classified,
+        false,
     )
     .expect("classified control uses the priority queue");
     assert!(matches!(
@@ -88,6 +89,7 @@ fn request_dispatch_preserves_classified_and_stream_ordered_queues() {
             Frame::Ping { nonce: 2 },
             TrafficClass::Control,
             CarrierEmitMode::Classified,
+            false,
         ),
         Err(RuntimeError::SenderServiceBlocked)
     ));
@@ -96,6 +98,7 @@ fn request_dispatch_preserves_classified_and_stream_ordered_queues() {
         Frame::Ping { nonce: 3 },
         TrafficClass::Control,
         CarrierEmitMode::StreamOrdered,
+        false,
     )
     .expect("stream-ordered control uses the data queue");
 
@@ -127,6 +130,7 @@ fn request_dispatch_rejects_switchable_response_output() {
             Frame::Ping { nonce: 1 },
             TrafficClass::Control,
             CarrierEmitMode::Classified,
+            false,
         ),
         Err(RuntimeError::Protocol("request relay path is not fixed"))
     ));
@@ -141,7 +145,7 @@ async fn client_ack_gap_model_separates_owner_transport_from_reinjection_output(
         "udp://127.0.0.1:10262?srtt-ms=5&rate-mbps=500",
     ]);
     let (tcp_commands, _tcp_receivers) = reliable_path_command_channels(8);
-    let (udp_commands, _udp_receivers) = reliable_path_command_channels(1);
+    let (udp_commands, mut udp_receivers) = reliable_path_command_channels(1);
     let (proof_only_commands, mut proof_only_receivers) = reliable_path_command_channels(8);
     let mut remotes = ReliableRelayRemoteSet::new(
         opened_test_relay_stream_with_underlay(
@@ -152,6 +156,7 @@ async fn client_ack_gap_model_separates_owner_transport_from_reinjection_output(
         ),
         8,
     );
+    consume_client_path_proof_for_test(&mut udp_receivers);
     remotes.attach_candidate(opened_test_relay_stream_with_underlay(
         stream_id,
         UnderlayProtocol::Tcp,
@@ -276,11 +281,23 @@ async fn client_ack_gap_model_separates_owner_transport_from_reinjection_output(
         .expect("fill the modeled reinjection output after sizing");
     let bound_cause =
         RelaySendCause::persistent_client_ack_gap_reinjection(reinjection_target, reinjection_path);
+    sender
+        .send_reinjection_frame(&context, &mut remotes, blocked.clone(), bound_cause)
+        .await
+        .expect("bound repair uses headroom independent of fresh data");
     assert!(matches!(
-        sender
-            .send_reinjection_frame(&context, &mut remotes, blocked.clone(), bound_cause,)
-            .await,
-        Err(RuntimeError::SenderServiceBlocked)
+        try_recv_reliable_path_command(&mut udp_receivers),
+        Some(ReliablePathCommand::SendFrame(Frame::StreamData {
+            ref payload,
+            ..
+        })) if payload.len() == 4096
+    ));
+    assert!(matches!(
+        try_recv_reliable_path_command(&mut udp_receivers),
+        Some(ReliablePathCommand::SendFrame(Frame::StreamData {
+            ref payload,
+            ..
+        })) if payload.as_ref() == b"busy"
     ));
     assert!(
         try_recv_reliable_path_command(&mut proof_only_receivers).is_none(),

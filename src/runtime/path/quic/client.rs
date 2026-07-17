@@ -23,8 +23,10 @@ use crate::protocol::{
     UnderlayProtocol,
 };
 use crate::runtime::error::RuntimeError;
+use crate::runtime::identity::random_session_id;
 use crate::runtime::path::authentication::ClientPathAuthenticationFrames;
 use crate::runtime::path::commands::reliable_path_command_channels;
+use crate::runtime::path::health::{ClientPathHealth, ClientPathHealthRecord};
 use crate::runtime::path::model::path_startup_snapshot;
 use crate::runtime::path::ports::OpenedReliableCarrierStream;
 use crate::runtime::path::state::ClientPathState;
@@ -39,7 +41,9 @@ use futures::StreamExt;
 use futures::stream::FuturesUnordered;
 use std::collections::VecDeque;
 use std::sync::Arc;
-use std::time::{Duration, Instant};
+use std::time::Duration;
+#[cfg(feature = "lab-diagnostics")]
+use std::time::Instant;
 use tokio::sync::Mutex as AsyncMutex;
 
 // RFC 8305's default keeps a blackholed family from monopolizing setup without
@@ -81,6 +85,26 @@ impl ClientUdpPathSessionHandle {
             runtime,
             connection: Arc::new(AsyncMutex::new(None)),
         }
+    }
+
+    pub(in crate::runtime) fn transient_probe(&self) -> Result<Self, RuntimeError> {
+        let mut runtime = self.runtime.clone();
+        runtime.session_id = random_session_id()?;
+        runtime.state = ClientPathState::new(ClientPathHealth {
+            tcp: Vec::new(),
+            udp: vec![ClientPathHealthRecord::default(); runtime.paths.len()],
+        });
+        runtime.peer_status = PeerStatusBroker::new(false);
+        runtime.peer_status_snapshot = PeerStatusSnapshotSource::new(Vec::new);
+        Ok(Self::new(runtime))
+    }
+
+    pub(in crate::runtime) async fn prepare_connection(
+        &self,
+        open_deadline: tokio::time::Instant,
+    ) -> Result<Option<Duration>, RuntimeError> {
+        let (carrier, newly_connected) = self.ensure_connection_with_status(open_deadline).await?;
+        Ok(newly_connected.then(|| carrier.connection.rtt()))
     }
 
     pub(in crate::runtime) async fn open_stream(
@@ -147,6 +171,13 @@ impl ClientUdpPathSessionHandle {
         &self,
         open_deadline: tokio::time::Instant,
     ) -> Result<ClientUdpCarrierInstance, RuntimeError> {
+        Ok(self.ensure_connection_with_status(open_deadline).await?.0)
+    }
+
+    async fn ensure_connection_with_status(
+        &self,
+        open_deadline: tokio::time::Instant,
+    ) -> Result<(ClientUdpCarrierInstance, bool), RuntimeError> {
         let mut current = self.connection.lock().await;
         if current
             .as_ref()
@@ -155,12 +186,12 @@ impl ClientUdpPathSessionHandle {
             current.take();
         }
         if let Some(connection) = current.as_ref() {
-            return Ok(connection.carrier.clone());
+            return Ok((connection.carrier.clone(), false));
         }
         let connection = connect_client_udp_path(&self.runtime, open_deadline).await?;
         let carrier = connection.carrier.clone();
         *current = Some(connection);
-        Ok(carrier)
+        Ok((carrier, true))
     }
 
     async fn drop_failed_connection(&self) {
@@ -246,6 +277,20 @@ fn spawn_client_udp_path_metrics(
         let mut last_metrics_poll_at = None;
         loop {
             if connection.is_closed() {
+                #[cfg(feature = "lab-diagnostics")]
+                lab_diagnostic(
+                    "quic_carrier_closed",
+                    format_args!(
+                        "session_id={} path_index={} path_instance_id={:?} locally_closed={} reason={}",
+                        runtime.session_id.0,
+                        runtime.path_index,
+                        path_instance_id,
+                        connection.is_locally_closed(),
+                        connection
+                            .close_reason()
+                            .unwrap_or_else(|| "unknown".to_string()),
+                    ),
+                );
                 if !connection.is_locally_closed() {
                     runtime.state.mark_path_instance_data_plane_failure(
                         RelayPathKey {
@@ -257,10 +302,7 @@ fn spawn_client_udp_path_metrics(
                 }
                 return;
             }
-            let mut metrics =
-                connection.tx_metrics(&mut tracker, PathMetricDirection::ClientToServer);
-            let capacity_candidate = metrics.capacity_proof_candidate;
-            let capacity_probe = metrics.capacity_probe;
+            let metrics = connection.tx_metrics(&mut tracker, PathMetricDirection::ClientToServer);
             #[cfg(feature = "lab-diagnostics")]
             let metrics_poll_at = Instant::now();
             #[cfg(feature = "lab-diagnostics")]
@@ -276,7 +318,7 @@ fn spawn_client_udp_path_metrics(
                 metrics,
                 poll_elapsed,
             );
-            let published_proof = if let Some(record) = runtime
+            if let Some(record) = runtime
                 .state
                 .health()
                 .lock()
@@ -285,49 +327,6 @@ fn spawn_client_udp_path_metrics(
                 .get_mut(runtime.path_index)
             {
                 record.mark_quic_path_metrics(metrics);
-                capacity_candidate
-                    .zip(capacity_probe)
-                    .and_then(|(candidate, probe)| {
-                        record.accept_request_quic_capacity_proof(candidate, probe, Instant::now())
-                    })
-            } else {
-                None
-            };
-            let proof_published = published_proof.is_some();
-            if let (Some(candidate), Some((_rate_bps, _rate_sample_bytes, _native_tail_rate))) =
-                (capacity_candidate, published_proof)
-            {
-                tracker.accept_capacity_proof(&mut metrics, candidate);
-                let _retired = connection.retire_capacity_probe(candidate.token);
-                tracker.retire_capacity_candidate(candidate.token);
-                #[cfg(feature = "lab-diagnostics")]
-                lab_diagnostic(
-                    "request_quic_capacity_proof",
-                    format_args!(
-                        "phase=published session_id={} path_index={} measurement_id={} train_bytes={} receipt_rate_bps={} published_rate_bps={} rate_sample_bytes={} rate_source={} proof_validity_ms={} carrier_retired={}",
-                        runtime.session_id.0,
-                        runtime.path_index,
-                        candidate.token,
-                        candidate.train_bytes,
-                        candidate.rate_bps,
-                        _rate_bps,
-                        _rate_sample_bytes,
-                        if _native_tail_rate {
-                            "native_tail"
-                        } else {
-                            "receipt_lower_bound"
-                        },
-                        candidate.proof_validity.as_millis(),
-                        _retired,
-                    ),
-                );
-            }
-            if !proof_published
-                && let Some(token) =
-                    tracker.terminal_capacity_probe_to_retire(capacity_probe, Instant::now())
-            {
-                let _ = connection.retire_capacity_probe(token);
-                tracker.retire_capacity_candidate(token);
             }
             tokio::time::sleep(quic_path_metrics_poll_interval(metrics)).await;
         }

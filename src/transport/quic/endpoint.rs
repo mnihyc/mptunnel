@@ -14,7 +14,7 @@ use sha2::{Digest, Sha256};
 use std::net::SocketAddr;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::time::Instant;
+use tokio::sync::Notify;
 
 const QUIC_CERT_DNS_NAME: &str = "mptunnel.invalid";
 const ED25519_PKCS8_PREFIX: &[u8] = &[
@@ -29,7 +29,6 @@ pub struct Endpoint {
 pub struct Connection {
     connection: quinn::Connection,
     write_backlog: Arc<AtomicU64>,
-    delivery_evidence_written: Arc<AtomicU64>,
     telemetry: Arc<QuicCarrierTelemetry>,
 }
 
@@ -111,7 +110,6 @@ impl Connection {
         Self {
             connection,
             write_backlog: Arc::new(AtomicU64::new(0)),
-            delivery_evidence_written: Arc::new(AtomicU64::new(0)),
             telemetry,
         }
     }
@@ -123,7 +121,6 @@ impl Connection {
                 stream: send,
                 connection: self.connection.clone(),
                 write_backlog: self.write_backlog.clone(),
-                delivery_evidence_written: self.delivery_evidence_written.clone(),
                 telemetry: self.telemetry.clone(),
                 encode_buffer: Vec::new(),
             },
@@ -138,7 +135,6 @@ impl Connection {
                 stream: send,
                 connection: self.connection.clone(),
                 write_backlog: self.write_backlog.clone(),
-                delivery_evidence_written: self.delivery_evidence_written.clone(),
                 telemetry: self.telemetry.clone(),
                 encode_buffer: Vec::new(),
             },
@@ -148,6 +144,7 @@ impl Connection {
 
     pub fn close(&self) {
         self.connection.close(VarInt::from_u32(0), b"closed");
+        self.telemetry.send_credit_notify().notify_waiters();
     }
 
     pub fn is_closed(&self) -> bool {
@@ -161,16 +158,19 @@ impl Connection {
         )
     }
 
-    pub fn measurement_active(&self) -> bool {
-        self.telemetry.measurement_active()
-    }
-
-    pub async fn wait_for_measurement_release(&self) {
-        self.telemetry.wait_for_measurement_release().await;
+    #[cfg(feature = "lab-diagnostics")]
+    pub fn close_reason(&self) -> Option<String> {
+        self.connection
+            .close_reason()
+            .map(|reason| reason.to_string())
     }
 
     pub fn stats(&self) -> quinn::ConnectionStats {
         self.connection.stats()
+    }
+
+    pub fn rtt(&self) -> std::time::Duration {
+        self.connection.rtt()
     }
 
     pub fn congestion_metrics(&self) -> CongestionMetrics {
@@ -186,7 +186,7 @@ impl Connection {
             // Quinn creates a fresh controller for a cross-address migration.
             // Existing streams still hold the old write gate, so fail this
             // carrier instead of publishing split ownership from two epochs.
-            self.telemetry.mark_measurement_failed_closed();
+            self.telemetry.send_credit_notify().notify_waiters();
             self.connection.close(
                 VarInt::from_u32(1),
                 b"QUIC congestion controller ownership changed",
@@ -204,56 +204,45 @@ impl Connection {
             non_app_limited_acked_bytes: snapshot.non_app_limited_acked_bytes,
             timed_non_app_limited_acked_bytes: snapshot.timed_non_app_limited_acked_bytes,
             non_app_limited_ack_elapsed: snapshot.non_app_limited_ack_elapsed,
-            delivery_evidence_written_bytes: self.delivery_evidence_written.load(Ordering::Relaxed),
+            delivery_evidence_written_bytes: self.telemetry.delivery_evidence_written_bytes(),
             delivery_sample_count: snapshot.delivery_sample_count,
             non_app_limited_delivery_sample_count: snapshot.non_app_limited_delivery_sample_count,
             timed_non_app_limited_delivery_sample_count: snapshot
                 .timed_non_app_limited_delivery_sample_count,
             app_limited: snapshot.app_limited,
-            measurement: snapshot.measurement,
         }
     }
 
-    pub fn cancel_measurement(&self, token: u64) -> bool {
-        let should_close = self.telemetry.abort_measurement(token);
-        if should_close {
-            self.connection
-                .close(VarInt::from_u32(1), b"cancelled measurement epoch");
-        }
-        should_close
-    }
-
-    pub fn retire_measurement(&self, token: u64) -> bool {
-        self.telemetry.retire_measurement(token)
-    }
-
-    pub fn confirm_measurement_receipt(
-        &self,
-        token: u64,
-        received_payload_bytes: u64,
-        received_at: Instant,
-    ) -> bool {
-        let current_telemetry = self
-            .connection
-            .congestion_state()
+    pub fn send_credit_snapshot(&self) -> super::CarrierSendCreditSnapshot {
+        let controller = self.connection.congestion_state();
+        let metrics = controller.metrics();
+        let current_telemetry = controller
             .into_any()
             .downcast::<InstrumentedController>()
             .expect("QUIC carrier must use the instrumented congestion controller")
             .telemetry
             .clone();
-        if !Arc::ptr_eq(&current_telemetry, &self.telemetry) {
+        let ownership_changed = !Arc::ptr_eq(&current_telemetry, &self.telemetry);
+        if ownership_changed {
+            self.telemetry.send_credit_notify().notify_waiters();
             self.connection.close(
                 VarInt::from_u32(1),
                 b"QUIC congestion controller ownership changed",
             );
-            return false;
         }
-        self.telemetry.confirm_measurement_receipt(
-            token,
-            received_payload_bytes,
-            received_at,
-            self.connection.rtt(),
-        )
+        let committed_bytes = current_telemetry
+            .delivery_evidence_pending_ack_bytes()
+            .max(self.write_backlog.load(Ordering::Acquire))
+            .max(current_telemetry.bytes_in_flight().unwrap_or(0));
+        super::CarrierSendCreditSnapshot {
+            limit_bytes: metrics.congestion_window,
+            committed_bytes,
+            closed: ownership_changed || self.is_closed(),
+        }
+    }
+
+    pub fn send_credit_notify(&self) -> Arc<Notify> {
+        self.telemetry.send_credit_notify()
     }
 }
 

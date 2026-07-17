@@ -93,10 +93,20 @@ apply_profile() {
     return 0
   fi
 
-  tc qdisc replace dev "$iface" root netem \
-    rate "$rate" \
-    delay "$delay" "$jitter" distribution normal \
-    loss "$loss"
+  case "$jitter" in
+    0|0ms|0us|0ns|0s)
+      tc qdisc replace dev "$iface" root netem \
+        rate "$rate" \
+        delay "$delay" \
+        loss "$loss"
+      ;;
+    *)
+      tc qdisc replace dev "$iface" root netem \
+        rate "$rate" \
+        delay "$delay" "$jitter" distribution normal \
+        loss "$loss"
+      ;;
+  esac
 }
 
 apply_profile_all() {

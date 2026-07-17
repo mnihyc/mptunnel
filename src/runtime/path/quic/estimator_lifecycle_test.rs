@@ -36,7 +36,10 @@ fn quic_bulk_proof_deadline_does_not_shrink_with_falling_rtt() {
         PathMetricDirection::ServerToClient,
         proof_at + smaller_horizon,
     );
-    assert!(!still_fresh.app_limited);
+    assert!(
+        still_fresh.app_limited,
+        "an idle carrier remains app-limited even while its independent bulk proof is fresh"
+    );
     assert_eq!(still_fresh.bulk_proof_expires_at, Some(frozen_deadline));
 
     let expired = tracker.observe_at(
@@ -131,7 +134,8 @@ fn quic_bulk_proof_is_fresh_inside_persistent_congestion_horizon() {
     );
     assert_eq!(fresh.delivery_sample_count, proven.delivery_sample_count);
     assert_eq!(fresh.delivery_sample_bytes, proven.delivery_sample_bytes);
-    assert!(!fresh.app_limited);
+    assert!(fresh.app_limited);
+    assert!(fresh.bulk_proof_expires_at.is_some());
 }
 
 #[test]
@@ -435,15 +439,13 @@ fn quic_app_limited_duplicate_ack_counts_as_ack_data_seen_not_bulk_rate() {
         .quic
         .observe(stats, congestion, PathMetricDirection::ServerToClient);
     stats.frame_rx.acks = 1;
-    let app_limited = tracker.quic.observe(
-        stats,
-        with_acked_bytes(
-            with_delivery_evidence_written(congestion, 32 * 1024),
-            32 * 1024,
-            1,
-        ),
-        PathMetricDirection::ServerToClient,
-    );
+    let mut duplicate_ack = with_delivery_evidence_written(congestion, 32 * 1024);
+    duplicate_ack.newly_acked_bytes = Some(32 * 1024);
+    duplicate_ack.delivery_sample_count = 1;
+    let app_limited =
+        tracker
+            .quic
+            .observe(stats, duplicate_ack, PathMetricDirection::ServerToClient);
     assert!(app_limited.ack_derived_data_seen);
     assert_eq!(app_limited.delivery_sample_count, 0);
     assert!(app_limited.app_limited);

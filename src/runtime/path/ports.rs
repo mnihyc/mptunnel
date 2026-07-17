@@ -323,6 +323,11 @@ pub(in crate::runtime) enum ServerStreamOpenOutcome {
     Rejected,
 }
 
+pub(in crate::runtime) enum ServerStreamFrameRoute {
+    Routed,
+    Backpressured(Frame),
+}
+
 #[derive(Debug, Clone, Copy)]
 pub(in crate::runtime) enum ServerNewStreamPolicy {
     Submit,
@@ -363,6 +368,13 @@ pub(in crate::runtime) trait ServerStreamPortBackend: Send + Sync {
         stream_id: StreamId,
         frame: Frame,
     ) -> ServerStreamPortFuture<'a, ()>;
+
+    fn try_route_frame(
+        &self,
+        identity: ServerCarrierPathIdentity,
+        stream_id: StreamId,
+        frame: Frame,
+    ) -> Result<ServerStreamFrameRoute, RuntimeError>;
 
     fn detach_path(
         &self,
@@ -511,6 +523,21 @@ impl ServerStreamPort {
         self.backend
             .route_frame(path_registration.inner.identity, stream_id, frame)
             .await
+    }
+
+    pub(in crate::runtime) fn try_route_frame(
+        &self,
+        path_registration: &ServerCarrierPathRegistration,
+        stream_id: StreamId,
+        frame: Frame,
+    ) -> Result<ServerStreamFrameRoute, RuntimeError> {
+        if !path_registration.belongs_to(self) {
+            return Err(RuntimeError::Protocol(
+                "reliable path registration does not match stream service",
+            ));
+        }
+        self.backend
+            .try_route_frame(path_registration.inner.identity, stream_id, frame)
     }
 
     pub(in crate::runtime) fn detach_path(

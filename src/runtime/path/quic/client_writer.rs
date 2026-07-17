@@ -1,27 +1,25 @@
 //! Client QUIC reliable-stream command writer.
 
-use super::capacity::{
-    quic_capacity_command_drop_reason, quic_capacity_start_rejection_reason,
-    udp_path_write_capacity_probe,
-};
 use super::io::{
-    UdpPathSendStream, flush_udp_frame_batch_with_path_proofs, udp_path_finish_stream,
+    UdpPathSendStream, flush_udp_frame_batch_with_path_proofs_interlocked, udp_path_finish_stream,
 };
 #[cfg(feature = "lab-diagnostics")]
 use crate::lab_diagnostics::lab_diagnostic;
 use crate::mux::MuxLimits;
 use crate::protocol::codec::CodecLimits;
-use crate::protocol::{Frame, StreamId, UnderlayProtocol};
+use crate::protocol::{Frame, StreamId};
 use crate::runtime::error::RuntimeError;
 use crate::runtime::path::commands::{
-    CapacityProbeCommandResolution, ReliablePathCommand, ReliablePathCommandReceivers,
+    ReliablePathCommand, ReliablePathCommandReceivers, reliable_path_command_carrier_credit_bytes,
     reliable_path_command_pending_bytes, reliable_path_command_writer_run_budget_bytes,
     reliable_path_command_writer_run_budget_items, reliable_path_command_writer_run_bytes,
     reliable_path_frame_requires_capacity_command, try_coalesce_reliable_path_writer_run,
     try_recv_reliable_path_command,
 };
 use crate::runtime::path::proof::PathProofTracker;
+#[cfg(feature = "lab-diagnostics")]
 use std::time::Instant;
+use tokio::sync::mpsc;
 
 #[allow(clippy::too_many_arguments)]
 pub(super) async fn drain_client_udp_stream_commands(
@@ -33,7 +31,11 @@ pub(super) async fn drain_client_udp_stream_commands(
     mux_limits: MuxLimits,
     pending_frames: &mut Vec<Frame>,
     path_proofs: &mut PathProofTracker,
+    carrier_frames: &mut mpsc::Receiver<Result<Frame, RuntimeError>>,
+    stream_frames: &mpsc::Sender<Result<Frame, RuntimeError>>,
+    deferred_input: &mut Option<Result<Frame, RuntimeError>>,
 ) -> Result<bool, RuntimeError> {
+    debug_assert!(deferred_input.is_none());
     #[cfg(feature = "lab-diagnostics")]
     let drain_started = Instant::now();
     let byte_budget = reliable_path_command_writer_run_budget_bytes(mux_limits);
@@ -42,6 +44,8 @@ pub(super) async fn drain_client_udp_stream_commands(
     pending_frames.clear();
     let mut sent_bytes = 0usize;
     let mut sent_items = 0usize;
+    let mut pending_frame_command_bytes = 0usize;
+    let mut pending_frame_carrier_credit_bytes = 0usize;
 
     loop {
         let Some(command) = next_command
@@ -60,8 +64,20 @@ pub(super) async fn drain_client_udp_stream_commands(
             {
                 continue;
             }
-            flush_udp_frame_batch_with_path_proofs(send, pending_frames, codec_limits, path_proofs)
-                .await?;
+            flush_client_udp_frame_batch(
+                send,
+                pending_frames,
+                codec_limits,
+                path_proofs,
+                commands,
+                &mut pending_frame_command_bytes,
+                &mut pending_frame_carrier_credit_bytes,
+                stream_id,
+                carrier_frames,
+                stream_frames,
+                deferred_input,
+            )
+            .await?;
             #[cfg(feature = "lab-diagnostics")]
             lab_diagnostic(
                 "path_writer_drain",
@@ -81,27 +97,38 @@ pub(super) async fn drain_client_udp_stream_commands(
             return Ok(false);
         };
         let pending_bytes = reliable_path_command_pending_bytes(&command);
+        let carrier_credit_bytes = reliable_path_command_carrier_credit_bytes(&command);
         let writer_run_bytes = reliable_path_command_writer_run_bytes(&command);
         let should_close = match command {
             ReliablePathCommand::SendFrame(frame)
                 if reliable_path_frame_requires_capacity_command(&frame) =>
             {
-                commands.release_pending_command_bytes(pending_bytes);
+                commands.release_pending_command_accounting(pending_bytes, carrier_credit_bytes);
                 return Err(RuntimeError::Protocol(
                     "client QUIC path received an untyped capacity frame",
                 ));
             }
             ReliablePathCommand::SendFrame(frame) => {
                 pending_frames.push(frame);
-                commands.release_pending_command_bytes(pending_bytes);
+                pending_frame_command_bytes =
+                    pending_frame_command_bytes.saturating_add(pending_bytes);
+                pending_frame_carrier_credit_bytes =
+                    pending_frame_carrier_credit_bytes.saturating_add(carrier_credit_bytes);
                 sent_bytes = sent_bytes.saturating_add(writer_run_bytes);
                 sent_items = sent_items.saturating_add(1);
                 if sent_bytes >= byte_budget || sent_items >= item_budget {
-                    flush_udp_frame_batch_with_path_proofs(
+                    flush_client_udp_frame_batch(
                         send,
                         pending_frames,
                         codec_limits,
                         path_proofs,
+                        commands,
+                        &mut pending_frame_command_bytes,
+                        &mut pending_frame_carrier_credit_bytes,
+                        stream_id,
+                        carrier_frames,
+                        stream_frames,
+                        deferred_input,
                     )
                     .await?;
                     #[cfg(feature = "lab-diagnostics")]
@@ -124,94 +151,31 @@ pub(super) async fn drain_client_udp_stream_commands(
                 }
                 continue;
             }
-            ReliablePathCommand::SendQuicCapacityProbe(mut probe) => {
-                if probe.stream_id != stream_id
-                    || probe.path_instance.key.underlay != UnderlayProtocol::Udp
-                    || probe.path_instance.key.index != usize::from(probe.path_id.0)
-                {
-                    probe.ticket.cancel();
-                    commands.release_pending_command_bytes(pending_bytes);
-                    return Err(RuntimeError::Protocol(
-                        "client QUIC capacity command owner does not match writer",
-                    ));
-                }
-                flush_udp_frame_batch_with_path_proofs(
-                    send,
-                    pending_frames,
-                    codec_limits,
-                    path_proofs,
-                )
-                .await?;
-                if quic_capacity_command_drop_reason(&probe, Instant::now()).is_some() {
-                    probe.ticket.cancel();
-                    commands.release_pending_command_bytes(pending_bytes);
-                    return Ok(false);
-                }
-                let result = {
-                    let write =
-                        udp_path_write_capacity_probe(send, &probe, codec_limits, mux_limits);
-                    tokio::pin!(write);
-                    tokio::select! {
-                        biased;
-                        _ = probe.ticket.cancelled() => None,
-                        result = &mut write => Some(result),
-                    }
-                };
-                commands.release_pending_command_bytes(pending_bytes);
-                let Some(result) = result else {
-                    let _ = send.connection.cancel_capacity_probe(probe.measurement_id);
-                    return Ok(false);
-                };
-                if let Err(err) = result {
-                    if quic_capacity_start_rejection_reason(&err).is_some() {
-                        probe.ticket.cancel();
-                        return Ok(false);
-                    }
-                    return Err(err);
-                }
-                probe.disarm_drop_cancellation();
-                let cancellation_connection = send.connection.clone();
-                let cancellation_ticket = probe.ticket.clone();
-                let cancellation_token = probe.measurement_id;
-                tokio::spawn(async move {
-                    if cancellation_ticket.resolved().await
-                        == CapacityProbeCommandResolution::Cancelled
-                    {
-                        let _ = cancellation_connection.cancel_capacity_probe(cancellation_token);
-                    }
-                });
-                #[cfg(feature = "lab-diagnostics")]
-                lab_diagnostic(
-                    "request_quic_capacity_measurement",
-                    format_args!(
-                        "phase=written stream_id={} path_index={} instance_id={} measurement_id={} train_bytes={}",
-                        stream_id.0,
-                        probe.path_instance.key.index,
-                        probe.path_instance.attachment_id,
-                        probe.measurement_id,
-                        probe.train_payload_bytes,
-                    ),
-                );
-                return Ok(false);
-            }
             ReliablePathCommand::SendTcpCapacityProbe(_) => {
-                commands.release_pending_command_bytes(pending_bytes);
+                commands.release_pending_command_accounting(pending_bytes, carrier_credit_bytes);
                 return Err(RuntimeError::Protocol(
                     "client QUIC path received TCP capacity command",
                 ));
             }
             ReliablePathCommand::ResetAndCloseStream { .. } => {
-                commands.release_pending_command_bytes(pending_bytes);
+                commands.release_pending_command_accounting(pending_bytes, carrier_credit_bytes);
                 return Err(RuntimeError::Protocol(
                     "client QUIC path received server terminal command",
                 ));
             }
             ReliablePathCommand::CloseStream(close_stream_id) => {
-                flush_udp_frame_batch_with_path_proofs(
+                flush_client_udp_frame_batch(
                     send,
                     pending_frames,
                     codec_limits,
                     path_proofs,
+                    commands,
+                    &mut pending_frame_command_bytes,
+                    &mut pending_frame_carrier_credit_bytes,
+                    stream_id,
+                    carrier_frames,
+                    stream_frames,
+                    deferred_input,
                 )
                 .await?;
                 if close_stream_id == stream_id {
@@ -232,7 +196,7 @@ pub(super) async fn drain_client_udp_stream_commands(
                 ));
             }
         };
-        commands.release_pending_command_bytes(pending_bytes);
+        commands.release_pending_command_accounting(pending_bytes, carrier_credit_bytes);
         if should_close {
             #[cfg(feature = "lab-diagnostics")]
             lab_diagnostic(
@@ -252,10 +216,25 @@ pub(super) async fn drain_client_udp_stream_commands(
             );
             return Ok(true);
         }
+        if deferred_input.is_some() {
+            return Ok(false);
+        }
         sent_items = sent_items.saturating_add(1);
         if sent_bytes >= byte_budget || sent_items >= item_budget {
-            flush_udp_frame_batch_with_path_proofs(send, pending_frames, codec_limits, path_proofs)
-                .await?;
+            flush_client_udp_frame_batch(
+                send,
+                pending_frames,
+                codec_limits,
+                path_proofs,
+                commands,
+                &mut pending_frame_command_bytes,
+                &mut pending_frame_carrier_credit_bytes,
+                stream_id,
+                carrier_frames,
+                stream_frames,
+                deferred_input,
+            )
+            .await?;
             #[cfg(feature = "lab-diagnostics")]
             lab_diagnostic(
                 "path_writer_drain",
@@ -273,6 +252,77 @@ pub(super) async fn drain_client_udp_stream_commands(
                 ),
             );
             return Ok(false);
+        }
+    }
+}
+
+// The borrowed writer, queues, and accounting owners remain explicit across the await.
+#[allow(clippy::too_many_arguments)]
+async fn flush_client_udp_frame_batch(
+    send: &mut UdpPathSendStream,
+    pending_frames: &mut Vec<Frame>,
+    codec_limits: CodecLimits,
+    path_proofs: &mut PathProofTracker,
+    commands: &ReliablePathCommandReceivers,
+    pending_frame_command_bytes: &mut usize,
+    pending_frame_carrier_credit_bytes: &mut usize,
+    stream_id: StreamId,
+    carrier_frames: &mut mpsc::Receiver<Result<Frame, RuntimeError>>,
+    stream_frames: &mpsc::Sender<Result<Frame, RuntimeError>>,
+    deferred_input: &mut Option<Result<Frame, RuntimeError>>,
+) -> Result<(), RuntimeError> {
+    let result = flush_udp_frame_batch_with_path_proofs_interlocked(
+        send,
+        pending_frames,
+        codec_limits,
+        path_proofs,
+        carrier_frames,
+        deferred_input,
+        |frame| try_route_client_udp_stream_frame_during_write(frame, stream_id, stream_frames),
+    )
+    .await;
+    commands.release_pending_command_accounting(
+        std::mem::take(pending_frame_command_bytes),
+        std::mem::take(pending_frame_carrier_credit_bytes),
+    );
+    let _routed_frames = result?;
+    #[cfg(feature = "lab-diagnostics")]
+    if _routed_frames > 0 || deferred_input.is_some() {
+        lab_diagnostic(
+            "client_quic_write_feedback_interlock",
+            format_args!(
+                "stream_id={} routed_frames={} deferred_frames={}",
+                stream_id.0,
+                _routed_frames,
+                usize::from(deferred_input.is_some()),
+            ),
+        );
+    }
+    Ok(())
+}
+
+fn try_route_client_udp_stream_frame_during_write(
+    frame: Frame,
+    stream_id: StreamId,
+    stream_frames: &mpsc::Sender<Result<Frame, RuntimeError>>,
+) -> Result<Option<Frame>, RuntimeError> {
+    let received_stream_id = match &frame {
+        Frame::StreamData { stream_id, .. }
+        | Frame::StreamAck { stream_id, .. }
+        | Frame::StreamMaxData { stream_id, .. }
+        | Frame::StreamFin { stream_id, .. }
+        | Frame::StreamReset { stream_id, .. } => *stream_id,
+        _ => return Ok(Some(frame)),
+    };
+    if received_stream_id != stream_id {
+        return Ok(Some(frame));
+    }
+    match stream_frames.try_send(Ok(frame)) {
+        Ok(()) => Ok(None),
+        Err(mpsc::error::TrySendError::Full(Ok(frame))) => Ok(Some(frame)),
+        Err(mpsc::error::TrySendError::Closed(_)) => Err(RuntimeError::ReliablePathSessionClosed),
+        Err(mpsc::error::TrySendError::Full(Err(_))) => {
+            unreachable!("client QUIC interlock only routes successful frames")
         }
     }
 }

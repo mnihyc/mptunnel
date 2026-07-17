@@ -7,22 +7,13 @@ use std::fmt;
 
 mod congestion;
 mod endpoint;
-mod measurement;
-mod measurement_writer;
 mod stream;
 
-pub use congestion::CongestionMetrics;
+pub use congestion::{CarrierSendCreditSnapshot, CongestionMetrics};
 pub use endpoint::{Connection, Endpoint};
-pub use measurement::{MeasurementMetrics, MeasurementPhase, MeasurementSpec};
-pub use measurement_writer::{MeasurementEpoch, begin_measurement, write_measurement_control};
 pub use stream::{RecvStream, SendStream, finish_stream, read_frame, write_frame, write_frames};
 
 use congestion::{InstrumentedBbrConfig, InstrumentedController, QuicCarrierTelemetry};
-use measurement::QuicMeasurementState;
-use stream::{
-    QuicWriteTransaction, encode_quic_length_prefixed_frame, quic_encoded_frame_capacity_hint,
-};
-
 #[derive(Debug)]
 pub enum QuicCarrierError {
     Io(std::io::Error),
@@ -38,12 +29,7 @@ pub enum QuicCarrierError {
     QuinnCrypto(quinn::crypto::rustls::NoInitialCipherSuite),
     Rcgen(rcgen::Error),
     EmptySecret,
-    InvalidMeasurement,
-    MeasurementRecordRequiresDedicatedWrite,
-    MeasurementBusy,
-    MeasurementNotIdle,
-    MeasurementExpired,
-    MeasurementActive,
+    CapacityFrameOnQuic,
 }
 
 impl fmt::Display for QuicCarrierError {
@@ -62,16 +48,9 @@ impl fmt::Display for QuicCarrierError {
             Self::QuinnCrypto(err) => write!(f, "QUIC carrier crypto config failed: {err}"),
             Self::Rcgen(err) => write!(f, "QUIC carrier certificate generation failed: {err}"),
             Self::EmptySecret => write!(f, "QUIC carrier shared secret must not be empty"),
-            Self::InvalidMeasurement => write!(f, "invalid QUIC measurement specification"),
-            Self::MeasurementRecordRequiresDedicatedWrite => {
-                write!(f, "QUIC measurement record used the wrong writer")
+            Self::CapacityFrameOnQuic => {
+                write!(f, "PATH_CAPACITY frames are not valid on QUIC carriers")
             }
-            Self::MeasurementBusy => write!(f, "QUIC measurement result is still owned"),
-            Self::MeasurementNotIdle => {
-                write!(f, "QUIC measurement requires a quiescent carrier writer")
-            }
-            Self::MeasurementExpired => write!(f, "QUIC measurement expired"),
-            Self::MeasurementActive => write!(f, "QUIC measurement owns the write epoch"),
         }
     }
 }

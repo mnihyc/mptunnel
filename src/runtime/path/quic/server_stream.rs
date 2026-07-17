@@ -1,19 +1,12 @@
 //! Server reliable-stream lifecycle over a QUIC carrier path.
 
-use super::capacity::udp_path_write_capacity_receipt;
 use super::io::{
     UdpPathRecvStream, UdpPathSendStream, spawn_quic_path_reader, udp_path_command_queue,
     udp_path_finish_stream, udp_path_max_stream_payload_bytes, udp_path_write_frame,
     udp_reliable_stream_frame_queue,
 };
 use super::server_writer::drain_server_udp_reliable_commands;
-#[cfg(feature = "lab-diagnostics")]
-use crate::lab_diagnostics::lab_diagnostic;
-use crate::model::capacity::{
-    reliable_capacity_measurement_session_limit_bytes,
-    reliable_stream_initial_advertised_window_bytes,
-};
-use crate::protocol::path_capacity::CapacityReceiveTracker;
+use crate::model::capacity::reliable_stream_initial_advertised_window_bytes;
 use crate::protocol::{
     Frame, PathId, PathMetricDirection, ResetReason, SessionId, StreamId, TargetAddr,
     UnderlayProtocol,
@@ -199,13 +192,12 @@ async fn run_server_udp_reliable_stream_loop(
         spawn_quic_path_reader(recv, context.codec_limits, carrier_frame_queue);
     let mut pending_frames = Vec::<Frame>::new();
     let mut path_proofs = PathProofTracker::default();
-    let mut capacity_receive = CapacityReceiveTracker::new(
-        reliable_capacity_measurement_session_limit_bytes(context.mux_limits),
-    );
-
+    let mut deferred_input = None;
     loop {
         let command_may_recv = !reliable_path_receivers_closed(&commands_rx);
-        if let Some(command) = try_recv_reliable_path_priority_command(&mut commands_rx) {
+        if deferred_input.is_none()
+            && let Some(command) = try_recv_reliable_path_priority_command(&mut commands_rx)
+        {
             let result = drain_server_udp_reliable_commands(
                 command,
                 &mut commands_rx,
@@ -214,9 +206,12 @@ async fn run_server_udp_reliable_stream_loop(
                 session_id,
                 stream_id,
                 path_id,
+                &path_registration,
                 &commands_tx,
                 &mut pending_frames,
                 &mut path_proofs,
+                &mut carrier_frames,
+                &mut deferred_input,
             )
             .await;
             if result? {
@@ -226,7 +221,12 @@ async fn run_server_udp_reliable_stream_loop(
         }
         tokio::select! {
             biased;
-            frame = carrier_frames.recv() => {
+            frame = async {
+                match deferred_input.take() {
+                    Some(input) => Some(input),
+                    None => carrier_frames.recv().await,
+                }
+            } => {
                 match frame {
                     Some(Ok(frame @ (Frame::StreamData { stream_id: received_stream_id, .. }
                         | Frame::StreamAck { stream_id: received_stream_id, .. }
@@ -384,53 +384,12 @@ async fn run_server_udp_reliable_stream_loop(
                             );
                         }
                     }
-                    Some(Ok(Frame::PathCapacityData {
-                        path_id: capacity_path_id,
-                        measurement_id,
-                        payload,
-                    })) => {
-                        if capacity_path_id != path_id
-                            || capacity_receive
-                                .record_data(measurement_id, payload.len())
-                                .is_err()
-                        {
-                            return Err(RuntimeError::Protocol(
-                                "invalid server QUIC request capacity data epoch",
-                            ));
-                        }
-                    }
-                    Some(Ok(Frame::PathCapacityFinish {
-                        path_id: capacity_path_id,
-                        measurement_id,
-                        payload_bytes,
-                    })) => {
-                        if capacity_path_id != path_id {
-                            return Err(RuntimeError::Protocol(
-                                "server QUIC request capacity finish path mismatch",
-                            ));
-                        }
-                        let received_payload_bytes =
-                            capacity_receive.finish(measurement_id, payload_bytes)?;
-                        udp_path_write_capacity_receipt(
-                            &mut send,
-                            path_id,
-                            measurement_id,
-                            received_payload_bytes,
-                            context.codec_limits,
-                        ).await?;
-                        #[cfg(feature = "lab-diagnostics")]
-                        lab_diagnostic(
-                            "request_quic_capacity_receipt",
-                            format_args!(
-                                "phase=sent session_id={} path_id={} path_instance_id={} stream_id={} measurement_id={} received_payload_bytes={}",
-                                session_id.0,
-                                path_id.0,
-                                path_registration.path_instance_id().as_u64(),
-                                stream_id.0,
-                                measurement_id,
-                                received_payload_bytes,
-                            ),
-                        );
+                    Some(Ok(Frame::PathCapacityData { .. }
+                        | Frame::PathCapacityFinish { .. }
+                        | Frame::PathCapacityReceipt { .. })) => {
+                        return Err(RuntimeError::Protocol(
+                            "PATH_CAPACITY frames are not valid on QUIC carriers",
+                        ));
                     }
                     Some(Ok(Frame::SessionClose { reason })) => return Err(RuntimeError::RemoteClosed(reason)),
                     Some(Ok(frame)) => {
@@ -463,9 +422,12 @@ async fn run_server_udp_reliable_stream_loop(
                         session_id,
                         stream_id,
                         path_id,
+                        &path_registration,
                         &commands_tx,
                         &mut pending_frames,
                         &mut path_proofs,
+                        &mut carrier_frames,
+                        &mut deferred_input,
                     )
                     .await?;
                     if result {
@@ -483,9 +445,12 @@ async fn run_server_udp_reliable_stream_loop(
                         session_id,
                         stream_id,
                         path_id,
+                        &path_registration,
                         &commands_tx,
                         &mut pending_frames,
                         &mut path_proofs,
+                        &mut carrier_frames,
+                        &mut deferred_input,
                     ).await;
                     if result? {
                         return Ok(());

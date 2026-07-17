@@ -8,7 +8,7 @@ use super::client_state::{ClientTcpPathConnection, ClientTcpPathSessionRuntime};
 use super::client_stream::{
     ClientTcpPathStreamState, expire_client_tcp_pending_opens, handle_client_tcp_stream_frame,
 };
-use crate::protocol::{Frame, PathId, PathMetricDirection, StreamId, UnderlayProtocol};
+use crate::protocol::{Frame, PathId, StreamId, UnderlayProtocol};
 use crate::runtime::error::RuntimeError;
 use crate::runtime::path::proof::path_proof_ack_frame;
 use crate::runtime::recent_ids::RecentIdCache;
@@ -24,6 +24,18 @@ pub(super) async fn handle_client_tcp_path_frame(
     connection.carrier.refresh_liveness();
     expire_client_tcp_pending_opens(connection, streams, closed_streams).await?;
     let path_id = PathId(runtime.path_index as u16);
+    match &frame {
+        Frame::PathCapacityData { .. }
+        | Frame::PathCapacityFinish { .. }
+        | Frame::PathCapacityReceipt { .. } => {}
+        Frame::PathProofAck {
+            path_id: proof_path_id,
+            ..
+        } if *proof_path_id == path_id => {
+            runtime.observe_sender_transport_state(connection, true);
+        }
+        _ => runtime.observe_sender_transport_state(connection, false),
+    }
     match frame {
         frame @ (Frame::StreamMaxData { .. }
         | Frame::StreamReset { .. }
@@ -65,32 +77,15 @@ pub(super) async fn handle_client_tcp_path_frame(
                 connection
                     .path_proofs
                     .acknowledge(path_id, proof_id, payload_bytes)
-            {
-                let transport_state =
-                    connection
-                        .carrier
-                        .tcp_metrics
-                        .as_mut()
-                        .and_then(|publisher| {
-                            publisher.maybe_observe(
-                                path_id,
-                                PathMetricDirection::ClientToServer,
-                                true,
-                            )
-                        });
-                if let Some(record) = runtime
+                && let Some(record) = runtime
                     .state
                     .health()
                     .lock()
                     .expect("client path health lock")
                     .tcp
                     .get_mut(runtime.path_index)
-                {
-                    record.mark_path_proof_success(observation);
-                    if let Some(metrics) = transport_state {
-                        record.mark_tcp_transport_state(metrics);
-                    }
-                }
+            {
+                record.mark_path_proof_success(observation);
             }
             Ok(())
         }

@@ -57,8 +57,6 @@ fn quic_loss_unknown_is_not_reported_as_observed_zero() {
         latest_delivery_sample_count: 0,
         latest_carrier_ack_elapsed: None,
         latest_rate_sample_elapsed: None,
-        capacity_proof_candidate: None,
-        capacity_probe: None,
         #[cfg(feature = "lab-diagnostics")]
         ack_poll: QuicAckPollDiagnostics::default(),
     };
@@ -71,58 +69,6 @@ fn quic_loss_unknown_is_not_reported_as_observed_zero() {
     assert!(!path_metrics.ecn_observed);
     assert_eq!(path_metrics.bytes_in_flight, 128 * 1024);
     assert_eq!(path_metrics.queue_bytes, 128 * 1024);
-}
-
-#[test]
-fn quic_active_capacity_probe_uses_bounded_quarter_rtt_poll_cadence() {
-    let now = Instant::now();
-    let required_bytes = 240 * 1024_u64;
-    let metrics_for = |phase, rtt: Duration| {
-        let mut stats = quinn::ConnectionStats::default();
-        stats.path.rtt = rtt;
-        stats.path.cwnd = 256 * 1024;
-        stats.path.current_mtu = 1400;
-        let mut probe = capacity_probe_metrics(45, now, 0, required_bytes, 0, 0, None);
-        probe.phase = phase;
-        UdpPathMetricTracker::default().observe_at(
-            stats,
-            with_capacity_probe(quic_congestion(256 * 1024, None), probe),
-            PathMetricDirection::ServerToClient,
-            now,
-        )
-    };
-
-    for phase in [
-        quic_transport::MeasurementPhase::Writing,
-        quic_transport::MeasurementPhase::Measuring,
-        quic_transport::MeasurementPhase::AwaitingReceipt,
-        quic_transport::MeasurementPhase::Complete,
-    ] {
-        assert_eq!(
-            quic_path_metrics_poll_interval(metrics_for(phase, Duration::from_millis(80))),
-            Duration::from_millis(20),
-            "phase {phase:?} must be polled faster than idle PTO cadence"
-        );
-    }
-    assert_eq!(
-        quic_path_metrics_poll_interval(metrics_for(
-            quic_transport::MeasurementPhase::Complete,
-            Duration::from_millis(400),
-        )),
-        QUIC_MAX_ACK_DELAY
-    );
-    assert_eq!(
-        quic_path_metrics_poll_interval(metrics_for(
-            quic_transport::MeasurementPhase::Measuring,
-            Duration::from_millis(2),
-        )),
-        QUIC_TIMER_GRANULARITY
-    );
-    let expired = metrics_for(
-        quic_transport::MeasurementPhase::Expired,
-        Duration::from_millis(80),
-    );
-    assert!(quic_path_metrics_poll_interval(expired) > Duration::from_millis(20));
 }
 
 #[test]
@@ -149,8 +95,6 @@ fn quic_server_metrics_publish_ack_data_seen_even_when_app_limited() {
         latest_delivery_sample_count: 0,
         latest_carrier_ack_elapsed: None,
         latest_rate_sample_elapsed: None,
-        capacity_proof_candidate: None,
-        capacity_probe: None,
         #[cfg(feature = "lab-diagnostics")]
         ack_poll: QuicAckPollDiagnostics::default(),
     };

@@ -1,5 +1,36 @@
 use super::*;
 
+#[tokio::test]
+async fn native_ack_releases_non_consuming_product_send_credit() {
+    let telemetry = QuicCarrierTelemetry::default();
+    telemetry.record_delivery_evidence_written(64 * 1024);
+    assert_eq!(telemetry.delivery_evidence_written_bytes(), 64 * 1024);
+    assert_eq!(telemetry.delivery_evidence_pending_ack_bytes(), 64 * 1024);
+    assert_eq!(
+        telemetry.delivery_evidence_pending_ack_bytes(),
+        64 * 1024,
+        "send-credit reads must not consume ACK evidence"
+    );
+
+    let notify = telemetry.send_credit_notify();
+    let notified = notify.notified();
+    tokio::pin!(notified);
+    telemetry.publish_ack_batch(
+        QuicAckTelemetryTotals {
+            acked_bytes: 16 * 1024,
+            sample_count: 1,
+            ..QuicAckTelemetryTotals::default()
+        },
+        48 * 1024,
+        false,
+    );
+    tokio::time::timeout(Duration::from_secs(1), &mut notified)
+        .await
+        .expect("native ACK wakes carrier send-credit waiters");
+    assert_eq!(telemetry.delivery_evidence_pending_ack_bytes(), 48 * 1024);
+    assert_eq!(telemetry.bytes_in_flight(), Some(48 * 1024));
+}
+
 #[test]
 fn quic_ack_snapshot_keeps_non_app_limited_classification_coherent() {
     const BATCHES: u64 = 20_000;

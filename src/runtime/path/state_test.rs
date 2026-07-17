@@ -197,26 +197,12 @@ fn peer_path_usage_is_directional_and_sequence_ordered_per_underlay() {
 }
 
 #[test]
-fn request_capacity_budgets_share_policy_but_not_protocol_spend() {
-    let paths = vec![
-        "tcp://127.0.0.1:12810"
-            .parse::<PathSpec>()
-            .expect("TCP path"),
-        "udp://127.0.0.1:12811"
-            .parse::<PathSpec>()
-            .expect("QUIC path"),
-    ];
-    let security = SecurityConfig::encrypted(
-        SharedSecret::new(b"0123456789abcdef0123456789abcdef".to_vec())
-            .expect("mixed capacity test secret"),
-    );
-    let context = ClientPathContext::new(paths, security, ResourceLimits::default())
-        .expect("mixed capacity test context");
+fn request_tcp_capacity_budget_tracks_session_path_and_campaign_spend() {
+    let context = tcp_path_test_context(1);
     let session_limit = reliable_capacity_measurement_session_limit_bytes(context.mux_limits);
     let train_bytes = 1024 * 1024;
     let path_share = 8 * 1024 * 1024;
     let tcp_campaign = Arc::new(RequestCapacityProbeCampaignBudget::default());
-    let quic_campaign = RequestCapacityProbeCampaignBudget::default();
 
     let now = Instant::now();
     let tcp = context
@@ -242,21 +228,11 @@ fn request_capacity_budgets_share_policy_but_not_protocol_spend() {
         session_limit - train_bytes
     );
     assert_eq!(
-        context.request_quic_capacity_probe_remaining_bytes(),
-        session_limit,
-        "TCP spend must not debit QUIC's native proof controller"
-    );
-    assert_eq!(
-        context.request_quic_capacity_probe_path_remaining_bytes(0, path_share),
-        path_share
+        context.request_tcp_capacity_probe_path_remaining_bytes(0, path_share),
+        path_share - train_bytes
     );
     assert_eq!(
         tcp_campaign.remaining_bytes(path_share),
         path_share - train_bytes
-    );
-    assert_eq!(
-        quic_campaign.remaining_bytes(path_share),
-        path_share,
-        "TCP flow spend must not debit a QUIC flow campaign"
     );
 }

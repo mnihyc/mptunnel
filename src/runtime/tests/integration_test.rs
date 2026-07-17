@@ -719,7 +719,7 @@ async fn tcp_stream_migrates_to_survivor_path_after_active_path_failure() {
 }
 
 #[tokio::test]
-async fn reliable_relay_active_stream_heartbeat_timeout_aborts_stale_carrier() {
+async fn reliable_relay_active_stream_heartbeat_timeout_closes_without_a_survivor() {
     let (path, server_path) =
         spawn_reliable_relay_heartbeat_blackhole(Duration::from_millis(500)).await;
     let resources = ResourceLimits {
@@ -751,12 +751,11 @@ async fn reliable_relay_active_stream_heartbeat_timeout_aborts_stale_carrier() {
     client.read_exact(&mut response).await.expect("reply");
     assert_eq!(response[1], Socks5Reply::Succeeded as u8);
 
-    tokio::select! {
-        result = &mut handler => {
-            panic!("carrier failure must not terminate the recoverable product stream: {result:?}");
-        }
-        _ = tokio::time::sleep(Duration::from_millis(150)) => {}
-    }
+    let result = tokio::time::timeout(Duration::from_millis(150), &mut handler)
+        .await
+        .expect("a stream with no survivor must not stall")
+        .expect("handler join");
+    assert!(matches!(result, Err(RuntimeError::PathHeartbeatTimeout)));
     {
         let health = health_context.health().lock().expect("health lock");
         assert!(matches!(
@@ -765,8 +764,6 @@ async fn reliable_relay_active_stream_heartbeat_timeout_aborts_stale_carrier() {
         ));
     }
 
-    handler.abort();
-    let _ = handler.await;
     server_path
         .await
         .expect("server join")

@@ -165,6 +165,7 @@ async fn product_stall_preserves_an_existing_multipath_attachment_set() {
     assert!(!reliable_relay_product_stall_should_try_alternate_attach(
         &remotes
     ));
+    assert!(!reliable_relay_should_open_recovery_path(&remotes));
     assert_eq!(remotes.path_instances(), membership);
 }
 
@@ -186,39 +187,44 @@ async fn product_stall_on_a_sole_carrier_requests_an_alternative() {
     assert!(reliable_relay_product_stall_should_try_alternate_attach(
         &remotes
     ));
+    assert!(reliable_relay_should_open_recovery_path(&remotes));
     assert!(!reliable_relay_product_stall_preserves_attached_path_set(
         &remotes
     ));
 }
 
 #[test]
-fn path_loss_completion_requires_fully_drained_connection_state() {
-    let send_stream = ReliableSendStream::new(StreamId(3), MuxLimits::default());
-    let recv_stream = ReliableRecvStream::new(StreamId(3), MuxLimits::default());
-    let sender_queue = ReliableRelaySenderQueue::default();
-    let delivered = PathDeliveryStats {
-        payload_bytes: 1,
-        ..PathDeliveryStats::default()
+fn asynchronous_recovery_open_selects_one_non_excluded_path() {
+    let tcp0 = RelayPathKey {
+        underlay: UnderlayProtocol::Tcp,
+        index: 0,
     };
+    let tcp1 = RelayPathKey {
+        underlay: UnderlayProtocol::Tcp,
+        index: 1,
+    };
+    let udp0 = RelayPathKey {
+        underlay: UnderlayProtocol::Udp,
+        index: 0,
+    };
+    let pending = HashMap::new();
 
-    assert!(reliable_relay_can_finish_after_path_loss(
-        false,
-        false,
-        None,
-        &send_stream,
-        &recv_stream,
-        &sender_queue,
-        delivered,
-    ));
-    assert!(!reliable_relay_can_finish_after_path_loss(
-        false,
-        true,
-        None,
-        &send_stream,
-        &recv_stream,
-        &sender_queue,
-        delivered,
-    ));
+    assert_eq!(
+        reliable_relay_recovery_path_open_candidates(
+            vec![tcp0, tcp1, udp0],
+            &HashSet::new(),
+            &pending,
+        ),
+        vec![tcp0],
+    );
+    assert_eq!(
+        reliable_relay_recovery_path_open_candidates(
+            vec![tcp0, tcp1, udp0],
+            &HashSet::from([tcp0]),
+            &pending,
+        ),
+        vec![tcp1],
+    );
 }
 
 #[test]

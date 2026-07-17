@@ -72,6 +72,9 @@ fn native_tcp_metrics_are_post_handshake_and_keep_kernel_units_explicit() {
 
     assert_eq!(observation.delivery_rate_bps(), Some(100_000_000));
     assert_eq!(observation.pacing_rate_bps(), Some(200_000_000));
+    assert_eq!(observation.newly_acked_bytes(), Some(300_000));
+    assert_eq!(observation.acked_bytes_since_epoch(), Some(300_000));
+    assert!(observation.delivery_window_covered());
     assert_eq!(metrics.delivery_rate_bps, 100_000_000);
     assert_eq!(metrics.pacing_rate_bps, 200_000_000);
     assert_eq!(metrics.bytes_in_flight, 3 * 1_460);
@@ -83,6 +86,49 @@ fn native_tcp_metrics_are_post_handshake_and_keep_kernel_units_explicit() {
     assert!(!metrics.has_ack_derived_data_sample);
     assert!(metrics.loss_observed);
     assert!(!metrics.app_limited);
+}
+
+#[test]
+fn slow_start_cwnd_growth_does_not_move_the_delivery_epoch_floor() {
+    let baseline = snapshot();
+    let current = TcpNativeSnapshot {
+        flight: Some(TcpNativeFlight {
+            snd_cwnd_packets: 300,
+            ..baseline.flight.expect("flight baseline")
+        }),
+        bytes_acked: baseline.bytes_acked.map(|value| value + 64 * 1024),
+        app_limited: Some(false),
+        ..baseline
+    };
+    let observation = TcpSenderMetricTracker::new(baseline).observe(
+        PathId(0),
+        PathMetricDirection::ClientToServer,
+        current,
+    );
+
+    assert!(observation.delivery_window_covered());
+    assert!(
+        observation.acked_bytes_since_epoch().unwrap_or(0)
+            < observation.flight().expect("current flight").1,
+        "the proof covers the frozen epoch even while the live cwnd grows"
+    );
+}
+
+#[test]
+fn repeated_native_poll_without_ack_progress_has_no_fresh_bytes() {
+    let baseline = snapshot();
+    let current = TcpNativeSnapshot {
+        bytes_acked: baseline.bytes_acked.map(|value| value + 300_000),
+        app_limited: Some(false),
+        ..baseline
+    };
+    let mut tracker = TcpSenderMetricTracker::new(baseline);
+    let first = tracker.observe(PathId(0), PathMetricDirection::ClientToServer, current);
+    let repeated = tracker.observe(PathId(0), PathMetricDirection::ClientToServer, current);
+
+    assert_eq!(first.newly_acked_bytes(), Some(300_000));
+    assert_eq!(repeated.newly_acked_bytes(), Some(0));
+    assert_eq!(repeated.acked_bytes_since_epoch(), Some(300_000));
 }
 
 #[test]

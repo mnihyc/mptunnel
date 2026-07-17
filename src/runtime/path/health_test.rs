@@ -36,11 +36,55 @@ fn request_tcp_native_observation(path_index: usize) -> TcpNativeObservation {
 }
 
 #[test]
+fn quic_bulk_proof_deadline_survives_a_later_app_limited_poll() {
+    let now = Instant::now();
+    let deadline = now + Duration::from_secs(2);
+    let mut record = ClientPathHealthRecord::default();
+    record.mark_quic_path_metrics(UdpPathMetrics {
+        direction: PathMetricDirection::ClientToServer,
+        srtt: Duration::from_millis(180),
+        rttvar: Duration::from_millis(20),
+        rtt_observed: true,
+        delivery_rate_bps: 200_000_000.0,
+        pacing_rate_bps: 250_000_000.0,
+        inflight_hi: 4 * 1024 * 1024,
+        bytes_in_flight: 0,
+        pending_bytes: 0,
+        loss_ppm: Some(0),
+        ecn_ppm: Some(0),
+        app_limited: true,
+        ack_derived_data_seen: true,
+        delivery_sample_count: 10,
+        delivery_sample_bytes: 512 * 1024,
+        last_delivery_sample_at: Some(now),
+        bulk_proof_expires_at: Some(deadline),
+        latest_delivery_sample_bytes: 0,
+        latest_delivery_sample_count: 0,
+        latest_carrier_ack_elapsed: None,
+        latest_rate_sample_elapsed: None,
+        #[cfg(feature = "lab-diagnostics")]
+        ack_poll: crate::runtime::path::quic::metrics::QuicAckPollDiagnostics::default(),
+    });
+
+    let fresh = record.observation_at(now + Duration::from_secs(1));
+    assert!(fresh.carrier_app_limited);
+    assert_eq!(fresh.carrier_bulk_proof_expires_at, Some(deadline));
+    assert_eq!(
+        record
+            .observation_at(deadline)
+            .carrier_bulk_proof_expires_at,
+        None
+    );
+}
+
+#[test]
 fn tcp_transport_state_updates_native_rtt_without_rate_authority() {
     let mut record = ClientPathHealthRecord::default();
+    let path_instance_id = crate::model::path::next_carrier_path_instance_id();
+    record.install_peer_usage(path_instance_id, 0, PathUsage::Available);
     let observation = request_tcp_native_observation(2);
 
-    record.mark_tcp_transport_state(observation);
+    assert!(record.mark_tcp_transport_state(path_instance_id, observation));
 
     assert_eq!(record.carrier_srtt_ms, Some(180.0));
     assert_eq!(record.carrier_rttvar_ms, Some(10.0));
@@ -52,6 +96,103 @@ fn tcp_transport_state_updates_native_rtt_without_rate_authority() {
 }
 
 #[test]
+fn tcp_transport_state_retains_non_app_limited_ack_window_without_data_ack_authority() {
+    let baseline = TcpNativeSnapshot {
+        rtt: Some(TcpNativeRtt {
+            srtt_us: 180_000,
+            rttvar_us: 10_000,
+        }),
+        flight: Some(TcpNativeFlight {
+            snd_mss_bytes: 1_024,
+            unacked_packets: 128,
+            snd_ssthresh_packets: 512,
+            snd_cwnd_packets: 512,
+        }),
+        notsent_bytes: Some(4_096),
+        bytes_acked: Some(100),
+        loss: Some(TcpNativeLossCounters {
+            retransmits: 0,
+            data_segments_out: 10,
+        }),
+        pacing_rate_bytes_per_second: Some(31_250_000),
+        delivery_rate_bytes_per_second: Some(25_000_000),
+        app_limited: Some(false),
+    };
+    let current = TcpNativeSnapshot {
+        bytes_acked: Some(100 + 1024 * 1024),
+        ..baseline
+    };
+    let observation = TcpSenderMetricTracker::new(baseline).observe(
+        PathId(0),
+        PathMetricDirection::ClientToServer,
+        current,
+    );
+    let path_instance_id = crate::model::path::next_carrier_path_instance_id();
+    let mut record = ClientPathHealthRecord::default();
+    record.install_peer_usage(path_instance_id, 0, PathUsage::Available);
+
+    assert!(record.mark_tcp_transport_state(path_instance_id, observation));
+
+    assert_eq!(record.carrier_delivery_rate_bps, Some(200_000_000.0));
+    assert_eq!(record.carrier_pacing_rate_bps, Some(250_000_000.0));
+    assert_eq!(record.carrier_delivery_samples, 1);
+    assert_eq!(record.carrier_delivery_sample_bytes, 1024 * 1024);
+    assert!(record.carrier_delivery_window_covered);
+    assert!(record.carrier_last_delivery_at.is_some());
+    assert!(!record.carrier_app_limited);
+    assert!(!record.carrier_ack_derived_data_seen);
+
+    let app_limited_current = TcpNativeSnapshot {
+        bytes_acked: current.bytes_acked.map(|bytes| bytes + 512 * 1024),
+        delivery_rate_bytes_per_second: Some(1_000_000),
+        pacing_rate_bytes_per_second: Some(2_000_000),
+        app_limited: Some(true),
+        ..current
+    };
+    let app_limited = TcpSenderMetricTracker::new(current).observe(
+        PathId(0),
+        PathMetricDirection::ClientToServer,
+        app_limited_current,
+    );
+    assert!(record.mark_tcp_transport_state(path_instance_id, app_limited));
+    assert_eq!(record.carrier_delivery_rate_bps, Some(200_000_000.0));
+    assert_eq!(record.carrier_pacing_rate_bps, Some(250_000_000.0));
+    assert_eq!(record.carrier_delivery_samples, 1);
+    assert_eq!(record.carrier_delivery_sample_bytes, 1024 * 1024);
+    assert!(!record.carrier_app_limited);
+}
+
+#[test]
+fn replacement_tcp_carrier_rejects_stale_native_observation_and_clears_credit() {
+    let original = crate::model::path::next_carrier_path_instance_id();
+    let replacement = crate::model::path::next_carrier_path_instance_id();
+    let mut record = ClientPathHealthRecord {
+        carrier_delivery_rate_bps: Some(200_000_000.0),
+        carrier_pacing_rate_bps: Some(250_000_000.0),
+        carrier_bytes_in_flight: 128 * 1024,
+        carrier_inflight_limit_bytes: 512 * 1024,
+        carrier_delivery_samples: 3,
+        carrier_delivery_sample_bytes: 1024 * 1024,
+        carrier_delivery_window_covered: true,
+        carrier_last_delivery_at: Some(Instant::now()),
+        carrier_app_limited: false,
+        ..ClientPathHealthRecord::default()
+    };
+    record.install_peer_usage(original, 0, PathUsage::Available);
+    record.install_peer_usage(replacement, 0, PathUsage::Available);
+
+    assert_eq!(record.carrier_delivery_rate_bps, None);
+    assert_eq!(record.carrier_pacing_rate_bps, None);
+    assert_eq!(record.carrier_bytes_in_flight, 0);
+    assert_eq!(record.carrier_inflight_limit_bytes, 0);
+    assert_eq!(record.carrier_delivery_samples, 0);
+    assert!(!record.carrier_delivery_window_covered);
+    assert_eq!(record.carrier_last_delivery_at, None);
+    assert!(!record.mark_tcp_transport_state(original, request_tcp_native_observation(0)));
+    assert_eq!(record.carrier_srtt_ms, None);
+}
+
+#[test]
 fn partial_tcp_transport_state_does_not_clear_unknown_fields() {
     let mut record = ClientPathHealthRecord {
         carrier_bytes_in_flight: 64 * 1024,
@@ -59,6 +200,8 @@ fn partial_tcp_transport_state_does_not_clear_unknown_fields() {
         carrier_queue_bytes: 8 * 1024,
         ..ClientPathHealthRecord::default()
     };
+    let path_instance_id = crate::model::path::next_carrier_path_instance_id();
+    record.install_peer_usage(path_instance_id, 0, PathUsage::Available);
     let snapshot = TcpNativeSnapshot {
         rtt: Some(TcpNativeRtt {
             srtt_us: 30_000,
@@ -72,7 +215,7 @@ fn partial_tcp_transport_state_does_not_clear_unknown_fields() {
         snapshot,
     );
 
-    record.mark_tcp_transport_state(observation);
+    assert!(record.mark_tcp_transport_state(path_instance_id, observation));
 
     assert_eq!(record.carrier_srtt_ms, Some(30.0));
     assert_eq!(record.carrier_bytes_in_flight, 64 * 1024);

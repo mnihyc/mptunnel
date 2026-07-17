@@ -2,7 +2,7 @@
 
 use crate::model::capacity::{PATH_OPEN_SCORE_BYTES, reliable_bulk_carrier_feed_quantum_bytes};
 use crate::model::path::{CarrierPathKey, RelayPathInstance, RelayPathKey};
-use crate::model::timing::reliable_ack_gap_reinjection_batch_lifetime;
+use crate::model::timing::reliable_data_retransmission_interval;
 use crate::mux::MuxLimits;
 use crate::protocol::Frame;
 use crate::runtime::RuntimeError;
@@ -170,7 +170,7 @@ impl RelaySendCause {
         Self::PersistentClientAckGapReinjection(PersistentClientAckGapBatch {
             target,
             expires_at: Instant::now()
-                + reliable_ack_gap_reinjection_batch_lifetime(Some(snapshot)),
+                + reliable_data_retransmission_interval(None, Some(snapshot)),
         })
     }
 
@@ -181,7 +181,7 @@ impl RelaySendCause {
         Self::PersistentServerAckGapReinjection(PersistentServerAckGapBatch {
             target,
             expires_at: Instant::now()
-                + reliable_ack_gap_reinjection_batch_lifetime(Some(snapshot)),
+                + reliable_data_retransmission_interval(None, Some(snapshot)),
         })
     }
 }

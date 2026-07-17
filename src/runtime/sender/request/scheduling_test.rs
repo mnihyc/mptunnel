@@ -3,9 +3,10 @@ use super::{
     ObservedOrdinaryPathChoice, RequestRelayPathObservation, RequestRelaySchedulingObservation,
     RequestSchedulingState, choose_bulk_relay_path_for_extent_avoiding,
     choose_observed_ordinary_data_path, observed_request_ack_clock_measurement_transaction,
+    relay_path_snapshot_for_bulk_choice,
 };
 use crate::model::admission::BulkPathCandidate;
-use crate::model::capacity::reliable_path_startup_sample_limit_bytes;
+use crate::model::capacity::reliable_bulk_carrier_feed_quantum_bytes;
 use crate::model::path::{
     CarrierPathInstanceId, RelayPathInstance, RelayPathKey, RelayPathProofEpoch,
 };
@@ -14,13 +15,11 @@ use crate::mux::MuxLimits;
 use crate::protocol::{Frame, PathId, PathUsage, StreamId, UnderlayProtocol};
 use crate::runtime::path::ReliableRequestTcpPathEvidence;
 use crate::runtime::stream::request::{
-    RequestAckClockOperation, RequestFlightLedger, RequestPathSample, RequestPathSamplingState,
-    RequestPathStates,
+    RequestAckClockOperation, RequestFlightLedger, RequestPathStates,
 };
 use crate::scheduler::{self, PathSnapshot, PathState, TrafficClass};
 use bytes::Bytes;
 use smallvec::SmallVec;
-use std::collections::HashSet;
 use std::time::Instant;
 
 const PAYLOAD_BYTES: usize = 16 * 1024;
@@ -63,6 +62,7 @@ fn observed_path(
             },
         ),
         has_bulk_model_evidence: true,
+        has_fresh_native_carrier_rate_evidence: false,
         fresh_proof: Some(RelayPathProofEpoch {
             proof_id: id_for_proof(instance),
             proof_generation: 0,
@@ -135,7 +135,7 @@ impl RequestEvidence {
     fn prove_rate(mut self, instances: impl IntoIterator<Item = RelayPathInstance>) -> Self {
         for instance in instances {
             let state = self.path_states.get_mut(instance);
-            state.mark_rate_proven();
+            state.mark_product_delivery_proven();
             state.mark_capacity_admitted();
         }
         self
@@ -157,6 +157,29 @@ impl RequestEvidence {
         self
     }
 
+    fn prove_quic_product_delivery(mut self, instance: RelayPathInstance) -> Self {
+        let state = self.path_states.get_mut(instance);
+        state.mark_product_delivery_proven();
+        state.mark_capacity_admitted();
+        self
+    }
+
+    fn with_per_flow_rate(
+        mut self,
+        instance: RelayPathInstance,
+        rate_bps: f64,
+        delivery_samples: u32,
+    ) -> Self {
+        let state = self.path_states.get_mut(instance);
+        state.mark_capacity_admitted();
+        state.mark_ack_clock_proven();
+        state.set_per_flow_rate(RequestPerFlowRateModel {
+            rate_bps,
+            delivery_samples,
+        });
+        self
+    }
+
     fn pending_measurement(
         mut self,
         reference: RelayPathInstance,
@@ -166,6 +189,13 @@ impl RequestEvidence {
             reference,
             candidate,
         });
+        let state = self.path_states.get_mut(candidate);
+        state.mark_capacity_admitted();
+        state.mark_ack_clock_first_window();
+        self
+    }
+
+    fn admit_ack_clock_candidate(mut self, candidate: RelayPathInstance) -> Self {
         let state = self.path_states.get_mut(candidate);
         state.mark_capacity_admitted();
         state.mark_ack_clock_first_window();
@@ -184,8 +214,6 @@ fn choose_bulk(
     observation: &RequestRelaySchedulingObservation,
     flights: &RequestFlightLedger,
     evidence: Option<&RequestEvidence>,
-    path_sample: Option<RequestPathSample>,
-    sampled_paths: Option<&HashSet<RelayPathInstance>>,
 ) -> BulkRelayPathChoice {
     choose_bulk_relay_path_for_extent_avoiding(BulkRelayPathRequest {
         observation,
@@ -193,11 +221,9 @@ fn choose_bulk(
         offset: PAYLOAD_BYTES as u64,
         payload_bytes: PAYLOAD_BYTES,
         cursor: 0,
-        avoid_keys: &[],
+        avoid_instances: &[],
         path_flights: Some(flights),
-        path_sample,
         request_state: evidence.map(RequestEvidence::state),
-        sampled_paths,
     })
 }
 
@@ -222,7 +248,7 @@ fn ordinary_data_chooses_lowest_eta_independent_of_attachment_order() {
             ObservedOrdinaryPathChoice::Selected(fast),
         );
         assert_eq!(
-            choose_bulk(&observation, &no_flights, None, None, None),
+            choose_bulk(&observation, &no_flights, None),
             BulkRelayPathChoice::Selected(fast),
             "attachment order must not become scheduling authority",
         );
@@ -273,7 +299,7 @@ fn ordinary_data_avoidance_ranks_only_within_available_paths() {
             TrafficClass::Throughput,
             PAYLOAD_BYTES,
             0,
-            &[available.key],
+            &[available],
         ),
         ObservedOrdinaryPathChoice::Selected(available),
         "reuse avoidance cannot promote a peer Backup over a schedulable Available path",
@@ -294,7 +320,7 @@ fn ordinary_data_avoidance_ranks_only_within_available_paths() {
             TrafficClass::Throughput,
             PAYLOAD_BYTES,
             0,
-            &[available.key],
+            &[available],
         ),
         ObservedOrdinaryPathChoice::Selected(available),
         "reuse avoidance cannot promote a locally configured Backup either",
@@ -354,76 +380,154 @@ fn exact_lower_flight_owner_continues_within_measured_hysteresis() {
     let evidence = RequestEvidence::default().prove_rate([owner, challenger]);
 
     assert_eq!(
-        choose_bulk(&observation, &flights, Some(&evidence), None, None),
+        choose_bulk(&observation, &flights, Some(&evidence)),
         BulkRelayPathChoice::Selected(owner),
         "the exact lower-flight owner should remain the lead inside measured jitter",
     );
 }
 
 #[test]
-fn path_sample_is_bounded_and_does_not_open_a_second_candidate() {
-    let reference = instance(UnderlayProtocol::Udp, 0, 40);
-    let candidate = instance(UnderlayProtocol::Tcp, 0, 41);
-    let second_candidate = instance(UnderlayProtocol::Udp, 1, 42);
+fn immature_per_flow_rate_does_not_replace_durable_tcp_capacity() {
+    let path_instance = instance(UnderlayProtocol::Tcp, 0, 35);
+    let mut path = observed_path(path_instance, 180.0, 200_000_000.0);
+    path.tcp
+        .as_mut()
+        .expect("TCP evidence")
+        .startup_snapshot
+        .delivery_rate_bps = 1_000_000.0;
+    let observation = scheduling_observation([path]);
+    let immature = RequestEvidence::default().with_per_flow_rate(path_instance, 3_000_000.0, 1);
+
+    let retained = relay_path_snapshot_for_bulk_choice(
+        &observation,
+        path_instance,
+        Some(path_instance.key),
+        Some(immature.state()),
+        true,
+    )
+    .expect("retained capacity snapshot");
+    assert_eq!(retained.delivery_rate_bps, 200_000_000.0);
+    assert_eq!(
+        retained.rate_scope,
+        crate::scheduler::PathRateScope::PathCapacity
+    );
+
+    let mature = RequestEvidence::default().with_per_flow_rate(path_instance, 3_000_000.0, 10);
+    let measured = relay_path_snapshot_for_bulk_choice(
+        &observation,
+        path_instance,
+        Some(path_instance.key),
+        Some(mature.state()),
+        true,
+    )
+    .expect("mature per-flow snapshot");
+    assert_eq!(measured.delivery_rate_bps, 3_000_000.0);
+    assert_eq!(
+        measured.rate_scope,
+        crate::scheduler::PathRateScope::PerFlowGoodput
+    );
+}
+
+#[test]
+fn quic_request_snapshot_publishes_native_service_window() {
+    let path_instance = instance(UnderlayProtocol::Udp, 0, 36);
+    let mut path = observed_path(path_instance, 180.0, 2_000_000.0);
+    let native_window = 2 * 1024 * 1024;
+    let shared = path.shared_snapshot.as_mut().expect("shared snapshot");
+    shared.carrier_inflight_limit_bytes = native_window;
+    shared.app_limited = true;
+    let observation = scheduling_observation([path]);
+
+    let snapshot = relay_path_snapshot_for_bulk_choice(
+        &observation,
+        path_instance,
+        Some(path_instance.key),
+        None,
+        true,
+    )
+    .expect("QUIC request snapshot");
+
+    assert_eq!(
+        snapshot.data_level_limit_bytes,
+        native_window + reliable_bulk_carrier_feed_quantum_bytes(MuxLimits::default()) as u64,
+    );
+    assert_eq!(snapshot.delivery_rate_bps, 2_000_000.0);
+}
+
+#[test]
+fn tcp_request_snapshot_publishes_native_service_window() {
+    let path_instance = instance(UnderlayProtocol::Tcp, 0, 39);
+    let mut path = observed_path(path_instance, 180.0, 2_000_000.0);
+    let native_window = 2 * 1024 * 1024;
+    let shared = path.shared_snapshot.as_mut().expect("shared snapshot");
+    shared.carrier_inflight_limit_bytes = native_window;
+    shared.app_limited = true;
+    let observation = scheduling_observation([path]);
+
+    let snapshot = relay_path_snapshot_for_bulk_choice(
+        &observation,
+        path_instance,
+        Some(path_instance.key),
+        None,
+        true,
+    )
+    .expect("TCP request snapshot");
+
+    assert_eq!(
+        snapshot.data_level_limit_bytes,
+        native_window + reliable_bulk_carrier_feed_quantum_bytes(MuxLimits::default()) as u64,
+        "TCP request scheduling must feed the native window without replacing socket backpressure",
+    );
+    assert_eq!(snapshot.delivery_rate_bps, 2_000_000.0);
+}
+
+#[test]
+fn open_app_limited_quic_window_precedes_blocked_lead_without_inventing_rate() {
+    let reference = instance(UnderlayProtocol::Udp, 0, 37);
+    let candidate = instance(UnderlayProtocol::Udp, 1, 38);
+    let mut reference_path = observed_path(reference, 40.0, 400_000_000.0);
+    let reference_snapshot = reference_path
+        .shared_snapshot
+        .as_mut()
+        .expect("reference snapshot");
+    reference_snapshot.app_limited = true;
+    reference_snapshot.queue_bytes = reference_snapshot.carrier_inflight_limit_bytes;
+    let mut candidate_path = observed_path(candidate, 40.0, 1_000_000.0);
+    candidate_path
+        .shared_snapshot
+        .as_mut()
+        .expect("candidate snapshot")
+        .app_limited = true;
+    let observation = scheduling_observation([reference_path, candidate_path]);
+    let flights = original_flights(reference);
+    let evidence = RequestEvidence::default().prove_rate([reference, candidate]);
+
+    assert_eq!(
+        choose_bulk(&observation, &flights, Some(&evidence)),
+        BulkRelayPathChoice::Selected(candidate),
+        "an open native window is send opportunity while an app-limited delivery rate is only a lower bound",
+    );
+}
+
+#[test]
+fn blocked_validated_quic_path_does_not_serialize_an_independent_quic_path() {
+    let reference = instance(UnderlayProtocol::Tcp, 0, 40);
+    let candidate = instance(UnderlayProtocol::Udp, 1, 41);
+    let second_candidate = instance(UnderlayProtocol::Udp, 2, 42);
     let reference_path = observed_path(reference, 20.0, 200_000_000.0);
     let mut candidate_path = observed_path(candidate, 30.0, 150_000_000.0);
     candidate_path.has_bulk_model_evidence = false;
+    candidate_path.can_enqueue_frame = false;
     let flights = original_flights(reference);
     let evidence = RequestEvidence::default().prove_rate([reference]);
 
-    let initial = scheduling_observation([reference_path, candidate_path]);
-    assert!(matches!(
-        choose_bulk(&initial, &flights, Some(&evidence), None, None),
-        BulkRelayPathChoice::SelectedPathSample {
-            candidate: selected,
-            ..
-        } if selected == candidate
-    ));
-
-    let mut sampling = RequestPathSamplingState::default();
-    let commit = sampling
-        .plan_sample(MuxLimits::default(), candidate, PAYLOAD_BYTES)
-        .expect("initial bounded sample");
-    sampling.commit_sample(commit);
-    let active_sample = sampling.sample().expect("active sample");
     let mut second_path = observed_path(second_candidate, 1.0, 1_000_000_000.0);
     second_path.has_bulk_model_evidence = false;
     let with_second = scheduling_observation([reference_path, candidate_path, second_path]);
-    assert!(matches!(
-        choose_bulk(
-            &with_second,
-            &flights,
-            Some(&evidence),
-            Some(active_sample),
-            Some(&sampling.sampled_paths),
-        ),
-        BulkRelayPathChoice::SelectedPathSample {
-            candidate: selected,
-            ..
-        } if selected == candidate
-    ));
-
-    let mut sealed = RequestPathSamplingState::default();
-    let limit = usize::try_from(reliable_path_startup_sample_limit_bytes(
-        MuxLimits::default(),
-    ))
-    .expect("sample limit fits usize");
-    let commit = sealed
-        .plan_sample(MuxLimits::default(), candidate, limit)
-        .expect("full bounded sample");
-    sealed.commit_sample(commit);
-    let sealed_sample = sealed.sample().expect("sealed sample");
-    assert!(sealed_sample.is_sealed());
     assert_eq!(
-        choose_bulk(
-            &with_second,
-            &flights,
-            Some(&evidence),
-            Some(sealed_sample),
-            Some(&sealed.sampled_paths),
-        ),
-        BulkRelayPathChoice::Selected(reference),
-        "an exhausted sample must neither grow nor transfer to another unproven path",
+        choose_bulk(&with_second, &flights, Some(&evidence)),
+        BulkRelayPathChoice::Selected(second_candidate),
+        "one blocked validated carrier must not serialize another independently admitted QUIC path",
     );
 }
 
@@ -440,14 +544,74 @@ fn measured_cross_tcp_quic_path_can_join_bulk_scheduling() {
         .prove_tcp_capacity([tcp_candidate]);
 
     assert_eq!(
-        choose_bulk(&observation, &flights, Some(&evidence), None, None),
+        choose_bulk(&observation, &flights, Some(&evidence)),
         BulkRelayPathChoice::Selected(tcp_candidate),
         "transport family must not override receiver-proven capacity",
     );
 }
 
 #[test]
-fn unproven_extra_path_is_used_only_as_a_bounded_sample() {
+fn exact_quic_data_ack_progress_joins_normal_bulk_scheduling() {
+    let reference = instance(UnderlayProtocol::Udp, 0, 54);
+    let candidate = instance(UnderlayProtocol::Udp, 1, 55);
+    let reference_path = observed_path(reference, 100.0, 20_000_000.0);
+    let mut candidate_path = observed_path(candidate, 5.0, 800_000_000.0);
+    candidate_path.has_bulk_model_evidence = false;
+    let observation = scheduling_observation([reference_path, candidate_path]);
+    let flights = original_flights(reference);
+    let evidence = RequestEvidence::default()
+        .prove_rate([reference])
+        .prove_quic_product_delivery(candidate);
+
+    assert_eq!(
+        choose_bulk(&observation, &flights, Some(&evidence)),
+        BulkRelayPathChoice::Selected(candidate),
+        "exact QUIC product delivery must enter normal completion-based scheduling",
+    );
+}
+
+#[test]
+fn blocked_frontier_owner_remains_the_baseline_while_another_path_sends() {
+    let reference = instance(UnderlayProtocol::Udp, 0, 52);
+    let candidate = instance(UnderlayProtocol::Udp, 1, 53);
+    let mut reference_path = observed_path(reference, 40.0, 200_000_000.0);
+    reference_path.can_enqueue_frame = false;
+    let candidate_path = observed_path(candidate, 20.0, 400_000_000.0);
+    let observation = scheduling_observation([reference_path, candidate_path]);
+    let flights = original_flights(reference);
+    let evidence = RequestEvidence::default().prove_rate([reference, candidate]);
+
+    assert_eq!(
+        choose_bulk(&observation, &flights, Some(&evidence)),
+        BulkRelayPathChoice::Selected(candidate),
+        "a full congestion window on the ordered frontier must not idle another eligible path",
+    );
+}
+
+#[test]
+fn data_level_full_frontier_owner_remains_the_baseline_while_another_path_sends() {
+    let reference = instance(UnderlayProtocol::Tcp, 0, 56);
+    let candidate = instance(UnderlayProtocol::Udp, 1, 57);
+    let mut reference_path = observed_path(reference, 40.0, 200_000_000.0);
+    reference_path
+        .shared_snapshot
+        .as_mut()
+        .expect("reference snapshot")
+        .data_level_bytes_in_flight = MuxLimits::default().max_path_flight_bytes as u64;
+    let candidate_path = observed_path(candidate, 20.0, 400_000_000.0);
+    let observation = scheduling_observation([reference_path, candidate_path]);
+    let flights = original_flights(reference);
+    let evidence = RequestEvidence::default().prove_rate([reference, candidate]);
+
+    assert_eq!(
+        choose_bulk(&observation, &flights, Some(&evidence)),
+        BulkRelayPathChoice::Selected(candidate),
+        "a product-window-full DSN owner remains the ECF baseline instead of blocking every path",
+    );
+}
+
+#[test]
+fn validated_quic_extra_path_uses_ordinary_scheduling() {
     let reference = instance(UnderlayProtocol::Tcp, 0, 60);
     let candidate = instance(UnderlayProtocol::Udp, 0, 61);
     let reference_path = observed_path(reference, 40.0, 200_000_000.0);
@@ -459,7 +623,7 @@ fn unproven_extra_path_is_used_only_as_a_bounded_sample() {
     let without_proof = scheduling_observation([reference_path, candidate_path]);
 
     assert_eq!(
-        choose_bulk(&without_proof, &flights, Some(&evidence), None, None),
+        choose_bulk(&without_proof, &flights, Some(&evidence)),
         BulkRelayPathChoice::Selected(reference),
     );
 
@@ -469,13 +633,131 @@ fn unproven_extra_path_is_used_only_as_a_bounded_sample() {
         attached_at: Instant::now(),
     });
     let with_proof = scheduling_observation([reference_path, candidate_path]);
+    assert_eq!(
+        choose_bulk(&with_proof, &flights, Some(&evidence)),
+        BulkRelayPathChoice::Selected(candidate),
+        "a validated QUIC path should carry ordinary bounded data without a calibration transaction",
+    );
+}
+
+#[test]
+fn validated_tcp_extra_path_uses_ordinary_scheduling() {
+    let reference = instance(UnderlayProtocol::Tcp, 0, 62);
+    let candidate = instance(UnderlayProtocol::Tcp, 1, 63);
+    let reference_path = observed_path(reference, 40.0, 200_000_000.0);
+    let mut candidate_path = observed_path(candidate, 1.0, 1_000_000_000.0);
+    candidate_path.has_bulk_model_evidence = false;
+    candidate_path.fresh_proof = None;
+    let flights = original_flights(reference);
+    let evidence = RequestEvidence::default().prove_rate([reference]);
+    let without_proof = scheduling_observation([reference_path, candidate_path]);
+
+    assert_eq!(
+        choose_bulk(&without_proof, &flights, Some(&evidence)),
+        BulkRelayPathChoice::Selected(reference),
+    );
+
+    candidate_path.fresh_proof = Some(RelayPathProofEpoch {
+        proof_id: id_for_proof(candidate),
+        proof_generation: 0,
+        attached_at: Instant::now(),
+    });
+    let with_proof = scheduling_observation([reference_path, candidate_path]);
+    assert_eq!(
+        choose_bulk(&with_proof, &flights, Some(&evidence)),
+        BulkRelayPathChoice::Selected(candidate),
+        "a validated TCP path should carry ordinary bounded data under native TCP send credit",
+    );
+}
+
+#[test]
+fn backup_quic_path_waits_until_ordinary_scheduling_can_admit_it() {
+    let reference = instance(UnderlayProtocol::Udp, 0, 66);
+    let candidate = instance(UnderlayProtocol::Udp, 1, 67);
+    let reference_path = observed_path(reference, 40.0, 200_000_000.0);
+    let mut candidate_path = observed_path(candidate, 10.0, 400_000_000.0);
+    candidate_path.has_bulk_model_evidence = false;
+    candidate_path
+        .shared_snapshot
+        .as_mut()
+        .expect("candidate snapshot")
+        .policy
+        .backup = true;
+    let flights = original_flights(reference);
+    let evidence = RequestEvidence::default().prove_rate([reference]);
+    let backup = scheduling_observation([reference_path, candidate_path]);
+    assert_eq!(
+        choose_bulk(&backup, &flights, Some(&evidence)),
+        BulkRelayPathChoice::Selected(reference),
+    );
+
+    candidate_path
+        .shared_snapshot
+        .as_mut()
+        .expect("candidate snapshot")
+        .policy
+        .backup = false;
+    candidate_path.has_bulk_model_evidence = true;
+    candidate_path.has_fresh_native_carrier_rate_evidence = true;
+    let native = scheduling_observation([reference_path, candidate_path]);
+    assert_eq!(
+        choose_bulk(&native, &flights, Some(&evidence)),
+        BulkRelayPathChoice::Selected(candidate),
+    );
+}
+
+#[test]
+fn unavailable_quic_path_does_not_block_tcp_ack_clock_measurement() {
+    let reference = instance(UnderlayProtocol::Udp, 0, 68);
+    let quic_startup = instance(UnderlayProtocol::Udp, 1, 69);
+    let tcp_candidate = instance(UnderlayProtocol::Tcp, 0, 70);
+    let reference_path = observed_path(reference, 40.0, 200_000_000.0);
+    let mut startup_path = observed_path(quic_startup, 40.0, 100_000_000.0);
+    startup_path.has_bulk_model_evidence = false;
+    startup_path.can_enqueue_frame = false;
+    let candidate_path = observed_path(tcp_candidate, 40.0, 200_000_000.0);
+    let observation = scheduling_observation([reference_path, startup_path, candidate_path]);
+    let flights = original_flights(reference);
+    let evidence = RequestEvidence::default()
+        .prove_rate([reference])
+        .admit_ack_clock_candidate(tcp_candidate);
     assert!(matches!(
-        choose_bulk(&with_proof, &flights, Some(&evidence), None, None),
-        BulkRelayPathChoice::SelectedPathSample {
+        choose_bulk(&observation, &flights, Some(&evidence)),
+        BulkRelayPathChoice::SelectedAckClockMeasurement {
+            candidate,
+            ..
+        } if candidate == tcp_candidate
+    ));
+}
+
+#[test]
+fn tcp_product_ack_clock_is_only_a_native_capacity_fallback() {
+    let reference = instance(UnderlayProtocol::Tcp, 0, 64);
+    let candidate = instance(UnderlayProtocol::Tcp, 1, 65);
+    let reference_path = observed_path(reference, 40.0, 200_000_000.0);
+    let candidate_path = observed_path(candidate, 1.0, 1_000_000_000.0);
+    let flights = original_flights(reference);
+    let evidence = RequestEvidence::default()
+        .prove_rate([reference])
+        .admit_ack_clock_candidate(candidate);
+
+    let without_native_capacity = scheduling_observation([reference_path, candidate_path]);
+    assert!(matches!(
+        choose_bulk(&without_native_capacity, &flights, Some(&evidence)),
+        BulkRelayPathChoice::SelectedAckClockMeasurement {
             candidate: selected,
             ..
         } if selected == candidate
     ));
+
+    let mut native_candidate_path = candidate_path;
+    native_candidate_path.has_fresh_native_carrier_rate_evidence = true;
+    let with_native_capacity = scheduling_observation([reference_path, native_candidate_path]);
+    assert_eq!(
+        choose_bulk(&with_native_capacity, &flights, Some(&evidence)),
+        BulkRelayPathChoice::Selected(candidate),
+        "native TCP delivery evidence must suppress redundant product calibration",
+    );
 }
 
 #[test]
@@ -505,7 +787,7 @@ fn ack_clock_transaction_fences_exact_reference_and_candidate_instances() {
         Some(candidate),
     );
     assert_eq!(
-        choose_bulk(&observation, &flights, Some(&exact), None, None),
+        choose_bulk(&observation, &flights, Some(&exact)),
         BulkRelayPathChoice::SelectedAckClockMeasurementFence {
             reference,
             candidate,
@@ -524,7 +806,7 @@ fn ack_clock_transaction_fences_exact_reference_and_candidate_instances() {
         None,
     );
     assert_eq!(
-        choose_bulk(&observation, &flights, Some(&stale), None, None),
+        choose_bulk(&observation, &flights, Some(&stale)),
         BulkRelayPathChoice::Selected(reference),
         "a transaction from an earlier attachment must not fence this attachment",
     );

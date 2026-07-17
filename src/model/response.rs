@@ -18,6 +18,13 @@ pub(crate) struct ResponsePathObservation {
     pub(crate) path_instance_id: CarrierPathInstanceId,
     pub(crate) incarnation: u64,
     pub(crate) snapshot: PathSnapshot,
+    /// Bytes already accepted by the native TCP/QUIC sender queue. MPP command
+    /// backlog remains in `snapshot.queue_bytes` for completion scoring, but it
+    /// must not make a priority reinjection look native-busy.
+    pub(crate) native_queue_bytes: u64,
+    /// Bytes removed from the command queues but not yet handed to the ordered
+    /// carrier. Priority repair cannot overtake this private writer backlog.
+    pub(crate) writer_pending_bytes: u64,
     /// Exact connection-data bytes assigned to this path and awaiting Data ACK.
     pub(crate) original_data_in_flight_bytes: u64,
     /// Exact request ingress preferred for path-neutral stream feedback.

@@ -4,24 +4,16 @@
 //! binding to revalidate and commit, and enqueues one carrier command.
 
 use super::multipath::ResponseDataDispatchTarget;
+use super::response_reinjection_avoid_outputs;
 use super::scheduling::select_response_frame_path;
 use crate::model::path::CarrierPathKey;
 use crate::protocol::Frame;
 use crate::protocol::frame::reliable_stream_frame_accounted_bytes;
 use crate::runtime::RuntimeError;
-use crate::runtime::path::commands::reliable_path_stream_ordered_queue_lane;
 use crate::runtime::sender::{CarrierEmitMode, RelaySendCause};
 use crate::runtime::stream::response::{ResponseDispatchTarget, record_server_sender_decision};
 use crate::runtime::stream::{ReliablePathStream, ReliablePathStreamOutput};
 use crate::scheduler::TrafficClass;
-
-pub(super) fn response_reinjection_carrier_lane(frame: &Frame) -> TrafficClass {
-    if matches!(frame, Frame::StreamData { .. }) {
-        reliable_path_stream_ordered_queue_lane()
-    } else {
-        TrafficClass::Control
-    }
-}
 
 pub(super) fn response_frame_has_carrier_credit(
     stream: &ReliablePathStream,
@@ -31,34 +23,33 @@ pub(super) fn response_frame_has_carrier_credit(
     reinjection_cause: Option<RelaySendCause>,
 ) -> bool {
     let reinjection = reinjection_cause.is_some();
-    let lane = if reinjection {
-        response_reinjection_carrier_lane(frame)
-    } else {
-        lane
-    };
     match &stream.output {
-        ReliablePathStreamOutput::Fixed(fixed) => match emit_mode {
-            CarrierEmitMode::Classified => fixed.commands().can_enqueue_frame_now(frame, lane),
-            CarrierEmitMode::StreamOrdered => {
-                fixed.commands().can_enqueue_stream_ordered_frame_now(lane)
+        ReliablePathStreamOutput::Fixed(fixed) => {
+            if reinjection {
+                fixed.commands().can_enqueue_reinjection_frame_now(frame)
+            } else {
+                match emit_mode {
+                    CarrierEmitMode::Classified => {
+                        fixed.commands().can_enqueue_frame_now(frame, lane)
+                    }
+                    CarrierEmitMode::StreamOrdered => {
+                        fixed.commands().can_enqueue_stream_ordered_frame_now(lane)
+                    }
+                }
             }
-        },
+        }
         ReliablePathStreamOutput::Switchable(binding) => {
             let payload_bytes = reliable_stream_frame_accounted_bytes(frame);
-            let avoid_keys = match reinjection_cause {
-                Some(RelaySendCause::TailReinjection) => {
-                    binding.original_flight_keys_overlapping_frame(frame)
-                }
-                Some(_) => binding.flight_keys_overlapping_frame(frame),
-                None => Vec::new(),
-            };
+            let avoid_outputs = reinjection_cause.map_or_else(Vec::new, |cause| {
+                response_reinjection_avoid_outputs(binding, frame, cause)
+            });
             let targets = binding.sender_path_targets(lane, payload_bytes);
             select_response_frame_path(
                 &targets,
                 lane,
                 frame,
                 emit_mode,
-                &avoid_keys,
+                &avoid_outputs,
                 reinjection_cause,
             )
             .is_some()
@@ -138,11 +129,6 @@ pub(super) fn emit_response_frame_from_sender_service(
             "new response data requires a generation-fenced dispatch plan",
         ));
     }
-    let lane = if reinjection {
-        response_reinjection_carrier_lane(&frame)
-    } else {
-        lane
-    };
     let emit_mode = if matches!(frame, Frame::StreamData { .. }) && !reinjection {
         CarrierEmitMode::StreamOrdered
     } else {
@@ -151,9 +137,15 @@ pub(super) fn emit_response_frame_from_sender_service(
     match &stream.output {
         ReliablePathStreamOutput::Fixed(fixed) => {
             if matches!(frame, Frame::StreamData { .. }) {
-                let command = fixed
-                    .commands()
-                    .try_reserve_stream_ordered_frame(frame.clone(), lane)?;
+                let command = if reinjection {
+                    fixed
+                        .commands()
+                        .try_reserve_reinjection_frame(frame.clone(), lane)?
+                } else {
+                    fixed
+                        .commands()
+                        .try_reserve_stream_ordered_frame(frame.clone(), lane)?
+                };
                 if reinjection {
                     fixed.record_reinjected_flight(&frame);
                 } else {
@@ -167,13 +159,9 @@ pub(super) fn emit_response_frame_from_sender_service(
         }
         ReliablePathStreamOutput::Switchable(binding) => {
             let payload_bytes = reliable_stream_frame_accounted_bytes(&frame);
-            let avoid_keys = match reinjection_cause {
-                Some(RelaySendCause::TailReinjection) => {
-                    binding.original_flight_keys_overlapping_frame(&frame)
-                }
-                Some(_) => binding.flight_keys_overlapping_frame(&frame),
-                None => Vec::new(),
-            };
+            let avoid_outputs = reinjection_cause.map_or_else(Vec::new, |cause| {
+                response_reinjection_avoid_outputs(binding, &frame, cause)
+            });
             let mut last_error = None;
             loop {
                 let targets = binding.sender_path_targets(lane, payload_bytes);
@@ -186,7 +174,7 @@ pub(super) fn emit_response_frame_from_sender_service(
                     lane,
                     &frame,
                     emit_mode,
-                    &avoid_keys,
+                    &avoid_outputs,
                     reinjection_cause,
                 ) else {
                     return Err(RuntimeError::SenderServiceBlocked);

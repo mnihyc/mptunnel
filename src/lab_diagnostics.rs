@@ -115,7 +115,7 @@ pub(crate) fn lab_sender_service_decision(
         && role == "server"
         && matches!(
             decision_kind,
-            "primary" | "data" | "data_service" | "data_path_state"
+            "primary" | "data" | "data_service" | "data_path_state" | "data_completion_time"
         )
         && frame_kind == "stream_data"
         && let Some(session_id) = session_id

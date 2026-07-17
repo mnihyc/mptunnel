@@ -463,6 +463,20 @@ impl ReliableRelayRemoteSet {
     }
 
     pub(in crate::runtime) async fn close_all(&mut self) {
+        for path in self.take_paths_for_close() {
+            path.stream.send_detach().await;
+            path.stream.close().await;
+        }
+    }
+
+    /// Successful retirement follows ordered FIN work on every carrier.
+    pub(in crate::runtime) async fn close_all_ordered(&mut self) {
+        for path in self.take_paths_for_close() {
+            path.stream.detach_and_close_ordered().await;
+        }
+    }
+
+    fn take_paths_for_close(&mut self) -> Vec<ReliableRelayRemotePath> {
         if !self.paths.is_empty() {
             self.membership_generation = self.membership_generation.wrapping_add(1);
         }
@@ -472,10 +486,7 @@ impl ReliableRelayRemoteSet {
         for path in &mut paths {
             path.depublish_load();
         }
-        for path in paths {
-            path.stream.send_detach().await;
-            path.stream.close().await;
-        }
+        paths
     }
 
     pub(in crate::runtime) async fn fail_path_instance(

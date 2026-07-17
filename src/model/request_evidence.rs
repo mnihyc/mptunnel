@@ -7,7 +7,7 @@ use super::ack_clock::reliable_ack_clock_measurement_rate_coverage_floor_bytes;
 use super::capacity::{PATH_OPEN_SCORE_BYTES, PathRateSample};
 use crate::mux::MuxLimits;
 use crate::protocol::UnderlayProtocol;
-use std::time::{Duration, Instant};
+use std::time::Instant;
 
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct RequestPathRateEvidence {
@@ -36,18 +36,6 @@ pub(crate) struct RequestPerFlowRateModel {
 pub(crate) struct RequestOwnerAckProgress<I> {
     pub(crate) instance: I,
     pub(crate) bytes: usize,
-}
-
-/// Connection-level acknowledgement evidence for the request source window.
-/// Path-specific delivery models remain below this connection-level signal.
-#[derive(Debug, Clone, Copy)]
-pub(crate) enum RequestWindowGrowthEvidence {
-    None,
-    AckCredits {
-        bytes: usize,
-        growth_interval: Duration,
-        observed_at: Instant,
-    },
 }
 
 impl RequestPathRateEvidence {

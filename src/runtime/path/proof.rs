@@ -141,17 +141,6 @@ pub(in crate::runtime) fn enqueue_path_proof_frame(
     Ok(proof_id)
 }
 
-pub(in crate::runtime) fn enqueue_stream_ordered_path_proof_frame(
-    commands: &ReliablePathCommandSender,
-    path_id: PathId,
-    mux_limits: MuxLimits,
-    lane: TrafficClass,
-) -> Result<u64, RuntimeError> {
-    let (proof_id, frame) = allocated_path_proof_data_frame(path_id, mux_limits);
-    commands.try_enqueue_stream_ordered_frame(frame, lane)?;
-    Ok(proof_id)
-}
-
 pub(in crate::runtime) fn path_proof_metrics(
     path_id: PathId,
     underlay: UnderlayProtocol,

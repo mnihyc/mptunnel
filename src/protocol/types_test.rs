@@ -9,7 +9,7 @@ fn offset_ranges_must_be_non_empty() {
 }
 
 #[test]
-fn peer_status_frames_are_ordinary_control_traffic() {
+fn peer_status_frames_have_no_capacity_or_delivery_debt() {
     let frames = [
         Frame::PeerStatusRequest { request_id: 1 },
         Frame::PeerStatusResponse {
@@ -22,11 +22,8 @@ fn peer_status_frames_are_ordinary_control_traffic() {
     assert_eq!(frames[0].kind_name(), "PEER_STATUS_REQUEST");
     assert_eq!(frames[1].kind_name(), "PEER_STATUS_RESPONSE");
     for frame in frames {
-        assert_eq!(
-            frame.write_class(),
-            FrameWriteClass::Ordinary {
-                delivery_evidence_bytes: 0,
-            }
-        );
+        assert!(!frame.is_path_capacity());
+        assert_eq!(frame.carrier_credit_bytes(), 0);
+        assert_eq!(frame.delivery_evidence_bytes(), 0);
     }
 }

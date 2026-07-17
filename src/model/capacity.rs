@@ -40,70 +40,6 @@ pub(crate) const RELIABLE_STREAM_STARTUP_PRODUCT_WINDOW_BYTES: u64 = 512 * 1024;
 pub(crate) const RELIABLE_UDP_MIN_PRODUCT_WINDOW_BYTES: u64 = 512 * 1024;
 pub(crate) const CAPACITY_TIMING_SLACK_BYTES: u64 = MAX_RELIABLE_SERVICE_QUANTUM_BYTES as u64;
 
-/// Immutable evidence for one exact QUIC capacity train.
-///
-/// The model owns this record's geometry; QUIC runtime code owns how evidence
-/// is gathered and validated.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) struct QuicCapacityProofCandidate {
-    pub(crate) token: u64,
-    pub(crate) train_bytes: u64,
-    pub(crate) sample_floor_bytes: u64,
-    pub(crate) accounting_slack_bytes: u64,
-    pub(crate) warmup_bytes: u64,
-    pub(crate) required_proof_bytes: u64,
-    pub(crate) written_bytes: u64,
-    pub(crate) written_data_frame_count: u64,
-    pub(crate) receipt_confirmed: bool,
-    pub(crate) received_bytes: u64,
-    pub(crate) proof_elapsed: Duration,
-    pub(crate) rate_bps: u64,
-    pub(crate) accepted_at: Instant,
-    pub(crate) expires_at: Instant,
-    pub(crate) proof_validity: Duration,
-}
-
-/// Validates carrier-proof safety without reimplementing sender train policy.
-///
-/// Warmup plus the strict proof window is the evidence minimum. A sender may
-/// append bounded timing guard bytes; the reservation owner separately enforces
-/// the session envelope before any carrier command is admitted.
-pub(crate) fn valid_quic_capacity_proof_geometry(
-    train_bytes: u64,
-    sample_floor_bytes: u64,
-    accounting_slack_bytes: u64,
-    warmup_bytes: u64,
-    required_proof_bytes: u64,
-) -> bool {
-    let expected_slack = (PATH_OPEN_SCORE_BYTES as u64).min(sample_floor_bytes / 8);
-    let expected_required = sample_floor_bytes.checked_sub(accounting_slack_bytes);
-    let minimum_train = warmup_bytes
-        .checked_add(required_proof_bytes)
-        .map(|bytes| bytes.max(sample_floor_bytes));
-    train_bytes > 0
-        && sample_floor_bytes > 0
-        && required_proof_bytes > 0
-        && accounting_slack_bytes == expected_slack
-        && expected_required == Some(required_proof_bytes)
-        && minimum_train.is_some_and(|minimum| train_bytes >= minimum)
-}
-
-/// Converts an exact QUIC train receipt into its bounded integer rate.
-///
-/// The carrier timer floor prevents sub-granularity timestamps from creating
-/// an unstable denominator; callers still own proof freshness and eligibility.
-pub(crate) fn quic_capacity_receipt_rate_bps(
-    train_bytes: u64,
-    proof_elapsed: Duration,
-) -> Option<u64> {
-    if train_bytes == 0 || proof_elapsed.is_zero() {
-        return None;
-    }
-    let rate = train_bytes as f64 * 8.0 / proof_elapsed.max(QUIC_TIMER_GRANULARITY).as_secs_f64();
-    rate.is_finite()
-        .then_some(rate.round().max(1.0).min(u64::MAX as f64) as u64)
-}
-
 /// Immutable evidence for one exact TCP capacity train.
 ///
 /// The model owns this cross-layer measurement evidence; TCP runtime code owns
@@ -158,13 +94,11 @@ pub(crate) fn reliable_path_startup_sample_limit_bytes(mux_limits: MuxLimits) ->
         .min(configured_envelope)
 }
 
-/// Bounds unique data assigned to an additional path before Data ACK evidence.
+/// Bounds unique DSN assignment to a path before Data ACK evidence.
 ///
-/// The path carrying the contiguous data frontier is governed by the negotiated
-/// connection window and native carrier credit. Applying this limit there would
-/// create a second congestion window above TCP or QUIC. An additional unproven
-/// path is different: its range can become a receive-side hole, so one bounded
-/// startup flight is enough to establish path-local Data ACK evidence first.
+/// One bounded startup flight is enough to establish path-local Data ACK
+/// evidence. The current frontier owner avoids cross-path reorder penalties,
+/// but still uses this floor inside its modeled carrier service window.
 pub(crate) fn reliable_unproven_path_startup_flight_limit_bytes(mux_limits: MuxLimits) -> u64 {
     let configured_envelope = (mux_limits.max_path_flight_bytes as u64)
         .min(mux_limits.max_repair_bytes as u64)
@@ -345,10 +279,20 @@ pub(crate) fn adaptive_reliable_relay_inflight_bytes(
             .max(floor);
     };
 
-    // This is a data-level service/reorder window, not another congestion
-    // controller. Native TCP/QUIC credit and queue backpressure remain below it.
-    let target = data_level_service_window_bytes(path, lane, mux_limits);
-    (target.ceil() as usize).clamp(floor, cap)
+    // This is a Data Sequence service window, not another congestion controller
+    // or a reservation of native send credit. It bounds unique ordered work
+    // accepted above the carrier; TCP/QUIC still enforce actual packet flight,
+    // recovery, pacing, and writer backpressure. An app-limited product sample
+    // must not clamp a larger native window that is available to drain work.
+    let modeled =
+        (data_level_service_window_bytes(path, lane, mux_limits).ceil() as usize).clamp(floor, cap);
+    if !lane.is_bulk() || path.carrier_inflight_limit_bytes == 0 {
+        return modeled;
+    }
+    let carrier_limit = usize::try_from(path.carrier_inflight_limit_bytes).unwrap_or(usize::MAX);
+    let native_feed =
+        carrier_limit.saturating_add(reliable_bulk_carrier_feed_quantum_bytes(mux_limits));
+    modeled.max(native_feed).min(cap)
 }
 
 pub(crate) fn reliable_relay_sender_dispatch_budget(

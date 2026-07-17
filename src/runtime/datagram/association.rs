@@ -3,7 +3,6 @@
 use super::policy::{DatagramTimeoutAction, datagram_remaining_ttl_ms, datagram_timeout_action};
 use super::quic::UdpDatagramClientAssociation;
 use super::tcp::TcpDatagramClientAssociation;
-use crate::model::capacity::PATH_OPEN_SCORE_BYTES;
 use crate::model::path::RelayPathKey;
 use crate::protocol::{TargetAddr, UnderlayProtocol};
 use crate::runtime::error::RuntimeError;
@@ -107,6 +106,8 @@ impl DatagramClientAssociation {
             tokio::time::Instant::now() + Duration::from_millis(u64::from(ttl_ms));
         let mut remaining_product_attempts = 2usize;
         let mut candidates = datagram_underlay_candidates(&self.context, payload.len(), ttl_ms);
+        #[cfg(feature = "lab-diagnostics")]
+        let requested_route_hint = route_hint;
         if let Some(route_hint) = route_hint
             && let Some(position) = candidates
                 .iter()
@@ -133,6 +134,21 @@ impl DatagramClientAssociation {
             } else {
                 remaining_product_attempts
             };
+            #[cfg(feature = "lab-diagnostics")]
+            crate::lab_diagnostics::lab_diagnostic(
+                "datagram_underlay_selected",
+                format_args!(
+                    "path_underlay={:?} path_index={} eta_ms={:.3} payload_bytes={} ttl_ms={} position={} candidate_count={} route_hint={:?}",
+                    candidate.key.underlay,
+                    candidate.key.index,
+                    candidate.eta_ms,
+                    payload.len(),
+                    remaining_ttl_ms,
+                    position,
+                    candidate_count,
+                    requested_route_hint,
+                ),
+            );
             match candidate.key.underlay {
                 UnderlayProtocol::Tcp => {
                     let result = self
@@ -394,7 +410,6 @@ fn datagram_underlay_candidates(
     if ttl_ms == 0 {
         return Vec::new();
     }
-    let payload_bytes = payload_bytes.max(PATH_OPEN_SCORE_BYTES);
     let freshness_budget_ms = f64::from(ttl_ms);
     let mut candidates = Vec::new();
 

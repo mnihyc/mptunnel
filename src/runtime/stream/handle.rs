@@ -16,14 +16,11 @@ use crate::protocol::frame::reliable_stream_frame_extent;
 use crate::protocol::{Frame, OffsetRange, ResetReason, StreamId, UnderlayProtocol};
 use crate::runtime::RuntimeError;
 use crate::runtime::path::commands::{
-    QuicCapacityProbeCommand, ReliablePathCommand, ReliablePathCommandSender,
-    RequestTcpCapacityProbeRequest, reliable_path_stream_ordered_queue_lane,
+    ReliablePathCommand, ReliablePathCommandSender, RequestTcpCapacityProbeRequest,
 };
 #[cfg(test)]
 use crate::runtime::path::model::{default_path_rate_bps, default_path_srtt_ms};
-use crate::runtime::path::proof::{
-    enqueue_path_proof_frame, enqueue_stream_ordered_path_proof_frame,
-};
+use crate::runtime::path::proof::enqueue_path_proof_frame;
 use crate::runtime::path::{OpenedReliableCarrierStream, RequestTcpCapacityProbeLease};
 use crate::scheduler::{PathRateScope, PathSnapshot, TrafficClass};
 use std::collections::BTreeMap;
@@ -222,6 +219,16 @@ impl ReliablePathStream {
         self.output.close_stream_ordered(self.stream_id, lane).await;
     }
 
+    pub(in crate::runtime) async fn reset_and_close_ordered(
+        &self,
+        reason: ResetReason,
+        lane: TrafficClass,
+    ) {
+        self.output
+            .reset_and_close_stream_ordered(self.stream_id, reason, lane)
+            .await;
+    }
+
     /// Retires a client-opened stream that never transferred into product
     /// ownership. The carrier mailbox makes this cancellation-safe for Drop.
     pub(in crate::runtime) fn retire_uncommitted(self) -> Result<(), RuntimeError> {
@@ -243,29 +250,34 @@ impl ReliablePathStreamHandle {
         self.output.send_stream_detach(self.stream_id).await;
     }
 
-    pub(in crate::runtime) fn enqueue_path_proof(&self) -> Result<Option<u64>, RuntimeError> {
-        self.output.enqueue_path_proof()
-    }
-
-    pub(in crate::runtime) fn enqueue_stream_ordered_path_proof(
-        &self,
-        lane: TrafficClass,
-    ) -> Result<Option<u64>, RuntimeError> {
-        self.output.enqueue_stream_ordered_path_proof(lane)
-    }
-
-    pub(in crate::runtime) fn try_enqueue_request_quic_capacity_probe(
-        &self,
-        probe: QuicCapacityProbeCommand,
-    ) -> Result<(), RuntimeError> {
+    /// Preserve STREAM_FIN ordering during successful product retirement.
+    pub(in crate::runtime) async fn detach_and_close_ordered(&self) {
         match &self.output {
             ReliablePathStreamOutput::Fixed(fixed) => {
-                fixed.commands().try_enqueue_quic_capacity_probe(probe)
+                let _ = fixed
+                    .commands()
+                    .send_stream_ordered_frame(
+                        Frame::StreamDetach {
+                            stream_id: self.stream_id,
+                        },
+                        self.lane,
+                    )
+                    .await;
+                let _ = fixed
+                    .commands()
+                    .send_stream_ordered_close(self.stream_id, self.lane)
+                    .await;
             }
-            ReliablePathStreamOutput::Switchable(_) => Err(RuntimeError::Protocol(
-                "request QUIC capacity probe requires a fixed client output",
-            )),
+            ReliablePathStreamOutput::Switchable(binding) => {
+                binding
+                    .close_stream_ordered(self.stream_id, self.lane)
+                    .await;
+            }
         }
+    }
+
+    pub(in crate::runtime) fn enqueue_path_proof(&self) -> Result<Option<u64>, RuntimeError> {
+        self.output.enqueue_path_proof()
     }
 
     pub(in crate::runtime) fn try_enqueue_request_tcp_capacity_probe(
@@ -294,6 +306,19 @@ impl ReliablePathStreamHandle {
         lane: TrafficClass,
     ) -> bool {
         self.output.can_enqueue_frame_now(frame, lane)
+    }
+
+    pub(in crate::runtime) fn can_enqueue_reinjection_frame_now(&self, frame: &Frame) -> bool {
+        self.output.can_enqueue_reinjection_frame_now(frame)
+    }
+
+    /// Carrier work already removed from this stream's command queues but not
+    /// yet handed off by the ordered writer. Priority repair cannot overtake it.
+    pub(in crate::runtime) fn ordered_writer_pending_bytes(&self) -> Option<u64> {
+        match &self.output {
+            ReliablePathStreamOutput::Fixed(fixed) => Some(fixed.commands().writer_pending_bytes()),
+            ReliablePathStreamOutput::Switchable(_) => None,
+        }
     }
 
     pub(in crate::runtime) fn can_enqueue_work_lane_now(
@@ -392,15 +417,6 @@ impl FixedReliablePathOutput {
 
     fn enqueue_path_proof(&self) -> Result<u64, RuntimeError> {
         enqueue_path_proof_frame(&self.commands, self.key.path_id, self.mux_limits)
-    }
-
-    fn enqueue_stream_ordered_path_proof(&self, lane: TrafficClass) -> Result<u64, RuntimeError> {
-        enqueue_stream_ordered_path_proof_frame(
-            &self.commands,
-            self.key.path_id,
-            self.mux_limits,
-            lane,
-        )
     }
 
     fn send_path_snapshot(&self) -> PathSnapshot {
@@ -596,19 +612,16 @@ impl ReliablePathStreamOutput {
         }
     }
 
-    fn enqueue_path_proof(&self) -> Result<Option<u64>, RuntimeError> {
+    pub(in crate::runtime) fn can_enqueue_reinjection_frame_now(&self, frame: &Frame) -> bool {
         match self {
-            Self::Fixed(fixed) => fixed.enqueue_path_proof().map(Some),
-            Self::Switchable(_) => Ok(None),
+            Self::Fixed(fixed) => fixed.commands().can_enqueue_reinjection_frame_now(frame),
+            Self::Switchable(_) => true,
         }
     }
 
-    fn enqueue_stream_ordered_path_proof(
-        &self,
-        lane: TrafficClass,
-    ) -> Result<Option<u64>, RuntimeError> {
+    fn enqueue_path_proof(&self) -> Result<Option<u64>, RuntimeError> {
         match self {
-            Self::Fixed(fixed) => fixed.enqueue_stream_ordered_path_proof(lane).map(Some),
+            Self::Fixed(fixed) => fixed.enqueue_path_proof().map(Some),
             Self::Switchable(_) => Ok(None),
         }
     }
@@ -623,7 +636,7 @@ impl ReliablePathStreamOutput {
     pub(in crate::runtime) fn capacity_notifies(&self) -> Vec<Arc<Notify>> {
         match self {
             Self::Fixed(fixed) if !fixed.commands().is_closed() => {
-                vec![fixed.commands().capacity_notify()]
+                fixed.commands().capacity_notifies()
             }
             Self::Fixed(_) => Vec::new(),
             Self::Switchable(binding) => binding.capacity_notifies(),
@@ -679,11 +692,7 @@ impl ReliablePathStreamOutput {
             Self::Fixed(fixed) => {
                 let _ = fixed
                     .commands()
-                    .send_stream_ordered_frame(Frame::StreamReset { stream_id, reason }, lane)
-                    .await;
-                let _ = fixed
-                    .commands()
-                    .send_stream_ordered_close(stream_id, lane)
+                    .send_stream_ordered_reset_and_close(stream_id, reason, lane)
                     .await;
             }
             Self::Switchable(binding) => {
@@ -856,8 +865,7 @@ pub(in crate::runtime) fn reliable_work_lane_to_carrier_lane(
 ) -> TrafficClass {
     match work_lane {
         ReliableWorkClass::Control => TrafficClass::Control,
-        ReliableWorkClass::Reinjection => reliable_path_stream_ordered_queue_lane(),
-        ReliableWorkClass::Data => relay_lane,
+        ReliableWorkClass::Data | ReliableWorkClass::Reinjection => relay_lane,
     }
 }
 

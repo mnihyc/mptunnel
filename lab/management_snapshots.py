@@ -55,9 +55,11 @@ with open("/proc/net/dev", encoding="ascii") as handle:
 
 result = {"interfaces": interfaces}
 try:
-    with urllib.request.urlopen(
-        f"http://127.0.0.1:{int(sys.argv[1])}/diagnostics", timeout=2.0
-    ) as response:
+    request = urllib.request.Request(
+        f"http://127.0.0.1:{int(sys.argv[1])}/api/diagnostics",
+        headers={"Authorization": f"Bearer {sys.argv[2]}"},
+    )
+    with urllib.request.urlopen(request, timeout=2.0) as response:
         result["management"] = json.load(response)
 except Exception as error:
     result["management_error"] = f"{type(error).__name__}: {error}"
@@ -116,7 +118,7 @@ def wait_for_stop_or_deadline(
     return True
 
 
-def container_snapshot(container_id: str, port: int) -> dict[str, object] | None:
+def container_snapshot(container_id: str, port: int, token: str) -> dict[str, object] | None:
     try:
         result = run(
             [
@@ -127,6 +129,7 @@ def container_snapshot(container_id: str, port: int) -> dict[str, object] | None
                 "-c",
                 CONTAINER_SNAPSHOT_SCRIPT,
                 str(port),
+                token,
             ]
         )
     except subprocess.TimeoutExpired:
@@ -156,7 +159,7 @@ def sample(args: argparse.Namespace) -> int:
             for service, container_id in ids.items():
                 if should_stop():
                     break
-                payload = container_snapshot(container_id, args.port)
+                payload = container_snapshot(container_id, args.port, args.token)
                 if payload is None:
                     continue
                 row = {
@@ -182,6 +185,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--stop-file")
     parser.add_argument("--interval", type=float, default=1.0)
     parser.add_argument("--port", type=int, default=17600)
+    parser.add_argument("--token", required=True)
     parser.add_argument("--services", nargs="+", default=["client", "server"])
     return parser
 

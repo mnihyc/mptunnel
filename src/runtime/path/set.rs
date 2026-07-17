@@ -26,6 +26,7 @@ use crate::runtime::error::RuntimeError;
 use crate::runtime::identity::random_session_id;
 use crate::runtime::peer_status::{PeerStatusBroker, PeerStatusSnapshotSource};
 use crate::runtime::recent_ids::reliable_closed_stream_cache_capacity;
+use crate::runtime::stream::SessionSendBuffer;
 use crate::runtime::telemetry::{
     RuntimeTelemetry, RuntimeTelemetrySnapshot, active_flow_detail_capacity,
 };
@@ -58,6 +59,9 @@ pub struct ClientPathContext {
     pub(in crate::runtime) peer_status: PeerStatusBroker,
     pub(in crate::runtime) codec_limits: CodecLimits,
     pub(in crate::runtime) mux_limits: MuxLimits,
+    // All reliable streams share one work-conserving unique-byte memory owner.
+    // Per-stream peer windows and per-carrier congestion authority stay separate.
+    pub(in crate::runtime) session_send_buffer: SessionSendBuffer,
     #[cfg(test)]
     pub(in crate::runtime) proxy_auth: ProxyAuthConfig,
 }
@@ -192,6 +196,7 @@ impl ClientPathContext {
         });
         let codec_limits = resources.into();
         let mux_limits = resources.into();
+        let session_send_buffer = SessionSendBuffer::from_limits(mux_limits);
         let session_id = random_session_id()?;
         let telemetry = RuntimeTelemetry::new(active_flow_detail_capacity(resources.max_streams));
         let peer_status = PeerStatusBroker::new(allow_peer_diagnostics);
@@ -267,6 +272,7 @@ impl ClientPathContext {
             peer_status,
             codec_limits,
             mux_limits,
+            session_send_buffer,
             #[cfg(test)]
             proxy_auth: ProxyAuthConfig::disabled(),
         })

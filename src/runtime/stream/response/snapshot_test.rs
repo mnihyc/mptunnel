@@ -8,14 +8,17 @@ use super::super::test_support::{stream_data_frame, stream_data_frame_at};
 use super::{server_bulk_output_snapshot, server_output_confidence};
 use crate::model::capacity::{
     PATH_OPEN_SCORE_BYTES, RELIABLE_INITIAL_WINDOW_PACKETS,
-    reliable_path_startup_sample_limit_bytes,
+    reliable_bulk_carrier_feed_quantum_bytes, reliable_path_startup_sample_limit_bytes,
 };
 use crate::model::path::{CarrierPathKey, PathPolicy};
 use crate::mux::MuxLimits;
 use crate::protocol::{
     PathId, PathMetricDirection, PathMetrics, PathUsage, SessionId, UnderlayProtocol,
 };
-use crate::runtime::path::commands::{ReliablePathCommandSender, reliable_path_command_channels};
+use crate::runtime::path::commands::{
+    ReliablePathCommandSender, reliable_path_command_channels, reliable_path_command_pending_bytes,
+    try_recv_reliable_path_command,
+};
 use crate::scheduler::{PathRateScope, TrafficClass};
 use std::time::Instant;
 
@@ -55,7 +58,6 @@ fn path_metrics(
     ServerPathMetricsEntry {
         source,
         recorded_at: Instant::now(),
-        capacity_proof: None,
         metrics: PathMetrics {
             path_id: key.path_id,
             underlay: key.underlay,
@@ -90,7 +92,7 @@ fn snapshot_projects_exact_command_product_queue_and_data_flight_bytes() {
         underlay: UnderlayProtocol::Tcp,
         path_id: PathId(0),
     };
-    let (commands, _receivers) = reliable_path_command_channels(8);
+    let (commands, mut receivers) = reliable_path_command_channels(8);
     let binding = ResponseStreamBinding::new(
         SessionId(42),
         key.underlay,
@@ -111,12 +113,32 @@ fn snapshot_projects_exact_command_product_queue_and_data_flight_bytes() {
         .next()
         .expect("live response target");
     assert_eq!(target.observation.original_data_in_flight_bytes, 4_096);
+    assert_eq!(target.observation.native_queue_bytes, 0);
+    assert_eq!(target.observation.writer_pending_bytes, 0);
     assert_eq!(target.observation.snapshot.queue_bytes, 4_096);
     assert_eq!(target.observation.snapshot.data_level_queue_bytes, 2_048);
     assert_eq!(
         target.observation.snapshot.data_level_bytes_in_flight,
         4_096
     );
+
+    let command = try_recv_reliable_path_command(&mut receivers).expect("dequeue carrier frame");
+    let target = binding
+        .sender_path_targets(TrafficClass::Throughput, PATH_OPEN_SCORE_BYTES)
+        .into_iter()
+        .next()
+        .expect("live response target");
+    assert_eq!(target.observation.writer_pending_bytes, 4_096);
+    assert_eq!(target.observation.snapshot.queue_bytes, 4_096);
+
+    receivers.release_pending_command_bytes(reliable_path_command_pending_bytes(&command));
+    let target = binding
+        .sender_path_targets(TrafficClass::Throughput, PATH_OPEN_SCORE_BYTES)
+        .into_iter()
+        .next()
+        .expect("live response target");
+    assert_eq!(target.observation.writer_pending_bytes, 0);
+    assert_eq!(target.observation.snapshot.queue_bytes, 0);
 }
 
 #[test]
@@ -142,6 +164,7 @@ fn tcp_data_ack_goodput_precedes_native_path_capacity() {
     assert_eq!(snapshot.delivery_rate_bps, 80_000_000.0);
     assert_eq!(snapshot.rate_scope, PathRateScope::PerFlowGoodput);
     assert_eq!(snapshot.pacing_rate_bps, 600_000_000.0);
+    assert_eq!(snapshot.bytes_in_flight, PATH_OPEN_SCORE_BYTES as u64);
 }
 
 #[test]
@@ -167,6 +190,38 @@ fn quic_native_path_capacity_precedes_product_goodput() {
     assert_eq!(snapshot.delivery_rate_bps, 500_000_000.0);
     assert_eq!(snapshot.rate_scope, PathRateScope::PathCapacity);
     assert_eq!(snapshot.pacing_rate_bps, 600_000_000.0);
+    assert_eq!(snapshot.data_level_limit_bytes, 1_750_000);
+}
+
+#[test]
+fn quic_app_limited_snapshot_retains_native_feed_window() {
+    let key = CarrierPathKey {
+        underlay: UnderlayProtocol::Udp,
+        path_id: PathId(2),
+    };
+    let (commands, _receivers) = reliable_path_command_channels(8);
+    let mut entry = output_entry(key, commands);
+    let mut metrics = path_metrics(
+        key,
+        ServerPathMetricsSource::LocalSender,
+        425_000,
+        25_000_000,
+        175_000_000,
+    );
+    metrics.metrics.inflight_limit_bytes = 32 * 1024 * 1024;
+    metrics.metrics.inflight_hi_bytes = metrics.metrics.inflight_limit_bytes;
+    metrics.metrics.app_limited = true;
+    entry.local_path_metrics = Some(metrics);
+
+    let mux_limits = MuxLimits::default();
+    let snapshot = server_bulk_output_snapshot(&entry, 0, TrafficClass::Throughput, mux_limits);
+    assert_eq!(
+        snapshot.data_level_limit_bytes,
+        32 * 1024 * 1024
+            + u64::try_from(reliable_bulk_carrier_feed_quantum_bytes(mux_limits))
+                .expect("feed quantum fits u64"),
+        "an app-limited QUIC delivery sample must not clamp Quinn's native window",
+    );
 }
 
 #[test]

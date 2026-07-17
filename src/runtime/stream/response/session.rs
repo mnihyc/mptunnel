@@ -4,42 +4,74 @@
 //! realtime flow refers to it. Scheduling, path metrics, and probe state have
 //! separate owners and must not be stored here.
 
+use super::super::send_buffer::SessionSendBuffer;
+use crate::mux::MuxLimits;
 use crate::protocol::SessionId;
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
-#[derive(Debug, Default)]
+#[derive(Debug)]
 pub(in crate::runtime) struct ServerSessionTracker {
-    references: Mutex<HashMap<SessionId, u32>>,
+    send_buffer_limit_bytes: usize,
+    sessions: Mutex<HashMap<SessionId, ServerSessionEntry>>,
+}
+
+#[derive(Debug)]
+struct ServerSessionEntry {
+    references: u32,
+    send_buffer: SessionSendBuffer,
+}
+
+impl Default for ServerSessionTracker {
+    fn default() -> Self {
+        Self::from_limits(MuxLimits::default())
+    }
 }
 
 impl ServerSessionTracker {
-    pub(in crate::runtime::stream) fn attach_session(&self, session_id: SessionId) {
-        let mut references = self.references.lock().expect("server session tracker lock");
-        let count = references.entry(session_id).or_default();
-        *count = count
+    pub(in crate::runtime::stream) fn from_limits(limits: MuxLimits) -> Self {
+        Self {
+            send_buffer_limit_bytes: SessionSendBuffer::from_limits(limits).limit_bytes(),
+            sessions: Mutex::new(HashMap::new()),
+        }
+    }
+
+    pub(in crate::runtime::stream) fn attach_session(
+        &self,
+        session_id: SessionId,
+    ) -> SessionSendBuffer {
+        let mut sessions = self.sessions.lock().expect("server session tracker lock");
+        let entry = sessions
+            .entry(session_id)
+            .or_insert_with(|| ServerSessionEntry {
+                references: 0,
+                send_buffer: SessionSendBuffer::new(self.send_buffer_limit_bytes),
+            });
+        entry.references = entry
+            .references
             .checked_add(1)
             .expect("server session reference count overflow");
+        entry.send_buffer.clone()
     }
 
     pub(in crate::runtime::stream) fn detach_session(&self, session_id: SessionId) {
-        let mut references = self.references.lock().expect("server session tracker lock");
-        let count = references
+        let mut sessions = self.sessions.lock().expect("server session tracker lock");
+        let entry = sessions
             .get_mut(&session_id)
             .expect("detached unregistered server session");
-        *count -= 1;
-        if *count == 0 {
-            references.remove(&session_id);
+        entry.references -= 1;
+        if entry.references == 0 {
+            sessions.remove(&session_id);
         }
     }
 
     pub(in crate::runtime::stream) fn management_snapshot(&self) -> Vec<(SessionId, u32)> {
         let mut sessions = self
-            .references
+            .sessions
             .lock()
             .expect("server session tracker lock")
             .iter()
-            .map(|(session_id, references)| (*session_id, *references))
+            .map(|(session_id, entry)| (*session_id, entry.references))
             .collect::<Vec<_>>();
         sessions.sort_unstable_by_key(|(session_id, _)| *session_id);
         sessions
@@ -47,11 +79,11 @@ impl ServerSessionTracker {
 
     #[cfg(test)]
     pub(super) fn reference_count(&self, session_id: SessionId) -> u32 {
-        self.references
+        self.sessions
             .lock()
             .expect("server session tracker lock")
             .get(&session_id)
-            .copied()
+            .map(|entry| entry.references)
             .unwrap_or(0)
     }
 }
@@ -60,6 +92,7 @@ impl ServerSessionTracker {
 pub(in crate::runtime) struct ServerSessionRegistration {
     tracker: Arc<ServerSessionTracker>,
     session_id: SessionId,
+    send_buffer: SessionSendBuffer,
 }
 
 impl ServerSessionRegistration {
@@ -67,11 +100,16 @@ impl ServerSessionRegistration {
         tracker: Arc<ServerSessionTracker>,
         session_id: SessionId,
     ) -> Self {
-        tracker.attach_session(session_id);
+        let send_buffer = tracker.attach_session(session_id);
         Self {
             tracker,
             session_id,
+            send_buffer,
         }
+    }
+
+    pub(in crate::runtime::stream) fn send_buffer(&self) -> SessionSendBuffer {
+        self.send_buffer.clone()
     }
 }
 

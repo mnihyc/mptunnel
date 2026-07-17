@@ -16,11 +16,11 @@ use crate::runtime::path::health::ClientPathHealthRecord;
 use crate::runtime::path::model::{
     ClientPathObservation, UdpPathCandidate, UdpPathRuntimeModel, apply_bulk_latency_isolation,
     bulk_candidate_has_bulk_rate_evidence, bulk_candidate_has_fresh_native_carrier_rate_evidence,
-    bulk_path_candidate, carrier_diverse_path_order, configured_order_path_indices,
-    configured_order_path_scores, endpoint_only_reliable_startup_should_preserve_configured_order,
-    health_observations, ordered_path_scores, ordered_path_scores_for_ttl,
-    ordered_reliable_path_indices, path_allows_automatic_bulk_use, path_can_be_auto_discovered,
-    path_is_endpoint_only, path_metrics_from_snapshot, path_snapshot, path_startup_snapshot,
+    bulk_path_candidate, configured_order_path_indices, configured_order_path_scores,
+    endpoint_only_reliable_startup_should_preserve_configured_order, health_observations,
+    ordered_path_scores, ordered_path_scores_for_ttl, ordered_reliable_path_indices,
+    path_allows_automatic_bulk_use, path_can_be_auto_discovered, path_is_endpoint_only,
+    path_metrics_from_snapshot, path_snapshot, path_startup_snapshot,
     reliable_reservation_should_use_endpoint_only_startup_order, reliable_stream_path_candidates,
     udp_datagram_payload_limit_bytes, udp_observation_has_datagram_feedback,
     udp_path_has_realtime_model, udp_reliable_stream_loss_reinjection_penalty_ms,
@@ -38,6 +38,7 @@ pub(in crate::runtime) struct ReliableRequestPathEvidence {
     pub(in crate::runtime) shared_snapshot: Option<PathSnapshot>,
     pub(in crate::runtime) tcp: Option<ReliableRequestTcpPathEvidence>,
     pub(in crate::runtime) has_bulk_model_evidence: bool,
+    pub(in crate::runtime) has_fresh_native_carrier_rate_evidence: bool,
     pub(in crate::runtime) fresh_proof: Option<RelayPathProofEpoch>,
     pub(in crate::runtime) config_ordinal: usize,
 }
@@ -438,7 +439,7 @@ impl ClientPathContext {
                 !candidate.has_bulk_rate_evidence && candidate.snapshot.active_flows == 0
             })
             .collect::<Vec<_>>();
-        carrier_diverse_path_order(admitted)
+        admitted
             .into_iter()
             .map(|candidate| candidate.key)
             .collect()
@@ -582,6 +583,7 @@ impl ClientPathContext {
                         shared_snapshot: None,
                         tcp: None,
                         has_bulk_model_evidence: false,
+                        has_fresh_native_carrier_rate_evidence: false,
                         fresh_proof: None,
                         config_ordinal: self.relay_path_config_ordinal(key),
                     };
@@ -606,6 +608,16 @@ impl ClientPathContext {
                     }),
                     has_bulk_model_evidence: include_bulk_admission
                         && bulk_candidate_has_bulk_rate_evidence(path, observation),
+                    has_fresh_native_carrier_rate_evidence: include_bulk_admission
+                        && fresh_proof.is_some()
+                        && proof.is_some_and(|proof| {
+                            bulk_candidate_has_fresh_native_carrier_rate_evidence(
+                                path,
+                                observation,
+                                proof.attached_at,
+                                now,
+                            )
+                        }),
                     fresh_proof,
                     config_ordinal: self.relay_path_config_ordinal(key),
                 }
@@ -911,41 +923,6 @@ impl ClientPathContext {
                     .unwrap_or(false)
             }
         }
-    }
-
-    pub(in crate::runtime) fn relay_path_has_native_bulk_model_evidence_since(
-        &self,
-        underlay: UnderlayProtocol,
-        index: usize,
-        valid_after: Instant,
-    ) -> bool {
-        self.relay_path_has_native_bulk_model_evidence_as_of(
-            underlay,
-            index,
-            valid_after,
-            Instant::now(),
-        )
-    }
-
-    pub(in crate::runtime) fn relay_path_has_native_bulk_model_evidence_as_of(
-        &self,
-        underlay: UnderlayProtocol,
-        index: usize,
-        valid_after: Instant,
-        now: Instant,
-    ) -> bool {
-        if underlay != UnderlayProtocol::Udp {
-            return false;
-        }
-        let health = self.state.health().lock().expect("client path health lock");
-        health
-            .udp
-            .get(index)
-            .map(|record| {
-                let observation = record.observation_at(now);
-                bulk_candidate_has_fresh_native_carrier_rate_evidence(observation, valid_after, now)
-            })
-            .unwrap_or(false)
     }
 
     pub(in crate::runtime) fn relay_path_has_fresh_proof(

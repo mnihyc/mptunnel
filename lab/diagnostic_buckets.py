@@ -201,7 +201,13 @@ def collect_metrics(
                 and parsed.get("role") == "server"
                 and parsed.get("frame_kind") == "stream_data"
                 and parsed.get("decision_kind")
-                in {"primary", "data", "data_service", "data_subflow"}
+                in {
+                    "primary",
+                    "data",
+                    "data_service",
+                    "data_path_state",
+                    "data_completion_time",
+                }
             ):
                 sender_decisions += 1
             elif event == "sender_service_conformance":

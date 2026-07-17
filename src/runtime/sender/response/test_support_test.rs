@@ -31,6 +31,8 @@ pub(in crate::runtime::sender) fn response_target(
             path_instance_id: next_server_carrier_path_instance_id(),
             incarnation: u64::from(path_id.0) + 1,
             snapshot,
+            native_queue_bytes: 0,
+            writer_pending_bytes: 0,
             original_data_in_flight_bytes: bytes_in_flight,
             is_request_feedback: request_feedback,
             has_bulk_rate_evidence: true,

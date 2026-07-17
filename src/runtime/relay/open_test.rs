@@ -59,6 +59,29 @@ async fn relay_attach_open_timeout_bounds_pending_connection_setup() {
 }
 
 #[test]
+fn cold_quic_attachment_budget_covers_serialized_setup_exchanges() {
+    let path = "udp://127.0.0.1:11095"
+        .parse::<PathSpec>()
+        .expect("UDP path");
+    let context =
+        ClientPathContext::new(vec![path], security(), ResourceLimits::default()).expect("context");
+    context.mark_udp_path_probe_success(0, Duration::from_millis(180));
+    let key = RelayPathKey {
+        underlay: UnderlayProtocol::Udp,
+        index: 0,
+    };
+    let snapshot = context.reliable_path_snapshot(key);
+    let timeouts = reliable_relay_attach_open_timeouts(&context, key);
+
+    assert_eq!(timeouts.live, transport_pto_from_snapshot(snapshot));
+    assert_eq!(
+        timeouts.setup,
+        path_open_pto(snapshot, true).saturating_mul(path_open_serialized_exchanges(snapshot)),
+    );
+    assert!(timeouts.setup > timeouts.live);
+}
+
+#[test]
 fn dropped_pending_attachment_queues_detach_and_local_close() {
     let stream_id = StreamId(92);
     let (opened, mut receivers) = pending_stream_for_test(stream_id, UnderlayProtocol::Udp, 0);

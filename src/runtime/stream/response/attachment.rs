@@ -520,6 +520,13 @@ impl ResponseSenderPathTarget {
     pub(in crate::runtime) fn can_enqueue_stream_ordered_frame(&self) -> bool {
         self.command_queue.can_enqueue_stream_ordered_frame()
     }
+
+    pub(in crate::runtime) fn can_enqueue_reinjection_frame(
+        &self,
+        frame: &crate::protocol::Frame,
+    ) -> bool {
+        self.command_queue.can_enqueue_reinjection_frame(frame)
+    }
 }
 
 /// ID-only apply target retained after ranking. The binding resolves the exact

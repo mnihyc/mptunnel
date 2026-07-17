@@ -351,10 +351,11 @@ impl ClientPathHealthRecord {
         ) {
             return false;
         }
-        // Socket RTT, queue, and cwnd remain diagnostics. The expiring receipt
-        // proof, and later product ACKs, retain delivery-rate authority.
+        // The receipt owns this explicit measurement epoch. Same-socket native
+        // telemetry is retained separately as TCP transport state and never
+        // becomes an MPP Data ACK.
         if let Some(native_transport_state) = native_transport_state {
-            self.mark_tcp_transport_state(native_transport_state);
+            self.mark_tcp_transport_state(path_instance.path_instance_id, native_transport_state);
         }
         true
     }

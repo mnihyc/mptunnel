@@ -1,7 +1,7 @@
-//! Request-side TCP and QUIC capacity transaction geometry.
+//! Request-side TCP capacity transaction geometry.
 //!
-//! TCP uses typed receiver receipts with optional native telemetry; QUIC uses
-//! native packet-ACK evidence. They share only bounded geometry and deadlines.
+//! QUIC uses native congestion control and bounded ordinary product samples;
+//! only TCP needs an explicit receiver-confirmed capacity transaction.
 
 use super::capacity::{
     CAPACITY_TIMING_SLACK_BYTES, PATH_OPEN_SCORE_BYTES, RELIABLE_PIPE_WINDOW_BDPS,
@@ -20,19 +20,6 @@ use std::time::Duration;
 mod tests;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) struct RequestQuicCapacityMeasurementGeometry {
-    pub(crate) train_bytes: u64,
-    pub(crate) sample_floor_bytes: u64,
-    pub(crate) accounting_slack_bytes: u64,
-    pub(crate) timing_slack_bytes: u64,
-    pub(crate) desired_warmup_carrier_bytes: u64,
-    pub(crate) warmup_carrier_bytes: u64,
-    pub(crate) required_timed_carrier_bytes: u64,
-    pub(crate) reference_rate_bps: u64,
-    pub(crate) candidate_carrier_flight_bytes: u64,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct RequestTcpCapacityMeasurementGeometry {
     pub(crate) train_bytes: u64,
     pub(crate) sample_floor_bytes: u64,
@@ -42,67 +29,6 @@ pub(crate) struct RequestTcpCapacityMeasurementGeometry {
     pub(crate) required_timed_carrier_bytes: u64,
     pub(crate) reference_rate_bps: u64,
     pub(crate) candidate_carrier_flight_bytes: u64,
-}
-
-pub(crate) fn request_quic_capacity_measurement_geometry(
-    candidate: PathSnapshot,
-    reference_rate_bps: f64,
-    mux_limits: MuxLimits,
-    train_envelope_bytes: u64,
-) -> Option<RequestQuicCapacityMeasurementGeometry> {
-    // A cold QUIC carrier must grow far enough to compete with the measured
-    // reference path before its final timed window can represent bulk capacity.
-    if !reference_rate_bps.is_finite() || reference_rate_bps <= 0.0 {
-        return None;
-    }
-    let sample_floor = reliable_path_startup_sample_limit_bytes(mux_limits);
-    let accounting_slack = (PATH_OPEN_SCORE_BYTES as u64).min(sample_floor / 8);
-    let required_timed_carrier_bytes = sample_floor.saturating_sub(accounting_slack).max(1);
-    let timing_slack_bytes = CAPACITY_TIMING_SLACK_BYTES;
-    let measurement_window_bytes = required_timed_carrier_bytes.checked_add(timing_slack_bytes)?;
-    let competing_rate_bdp =
-        (reference_rate_bps / 8.0 * candidate.srtt_ms.max(1.0) / 1_000.0).ceil() as u64;
-    let competing_rate_pipe =
-        ((competing_rate_bdp as f64) * RELIABLE_PIPE_WINDOW_BDPS).ceil() as u64;
-    // Carrier flight is reported independently from MPP Data-ACK flight. Only
-    // the native carrier view can size this transport measurement epoch.
-    let candidate_carrier_flight_bytes = candidate.bytes_in_flight;
-    // MPP flight is shared ordering debt and may belong to other paths, so it
-    // cannot size one candidate's native congestion-control transaction.
-    let desired_warmup_carrier_bytes = candidate
-        .carrier_inflight_limit_bytes
-        .max(candidate_carrier_flight_bytes)
-        .max(competing_rate_pipe);
-    let train_envelope_bytes = train_envelope_bytes.min(
-        reliable_capacity_measurement_session_limit_bytes(mux_limits),
-    );
-    let warmup_carrier_bytes = desired_warmup_carrier_bytes
-        .min(train_envelope_bytes.checked_sub(measurement_window_bytes)?);
-    if warmup_carrier_bytes
-        < candidate
-            .carrier_inflight_limit_bytes
-            .max(candidate_carrier_flight_bytes)
-    {
-        return None;
-    }
-    // Keep one pacing quantum of trailing measurement credit. The application
-    // receipt can race the final delayed transport ACK; untimed/late bytes must
-    // not consume the strict window before earlier timed ACKs reach the poller.
-    let train_bytes = warmup_carrier_bytes.checked_add(measurement_window_bytes)?;
-    if train_bytes > train_envelope_bytes {
-        return None;
-    }
-    Some(RequestQuicCapacityMeasurementGeometry {
-        train_bytes: train_bytes.max(sample_floor),
-        sample_floor_bytes: sample_floor,
-        accounting_slack_bytes: accounting_slack,
-        timing_slack_bytes,
-        desired_warmup_carrier_bytes,
-        warmup_carrier_bytes,
-        required_timed_carrier_bytes,
-        reference_rate_bps: reference_rate_bps.ceil() as u64,
-        candidate_carrier_flight_bytes,
-    })
 }
 
 pub(crate) fn request_capacity_stable_candidate_share_bytes(
@@ -121,8 +47,7 @@ pub(crate) fn request_tcp_capacity_measurement_geometry(
     mux_limits: MuxLimits,
     train_envelope_bytes: u64,
 ) -> Option<RequestTcpCapacityMeasurementGeometry> {
-    // TCP and QUIC share competing-pipe sizing, but not proof mechanics: TCP
-    // seeds from a full receiver-confirmed train and never truncates warmup.
+    // TCP seeds from a full receiver-confirmed train and never truncates warmup.
     if candidate.underlay != UnderlayProtocol::Tcp
         || !product_delivery_samples_override_startup_prior(reference_model.delivery_samples)
         || !reference_model.rate_bps.is_finite()
@@ -178,7 +103,7 @@ pub(crate) fn request_tcp_capacity_candidate_can_start_receipt(candidate: PathSn
         && candidate.session_active_latency_sensitive_flows == 0
 }
 
-pub(crate) fn request_quic_capacity_slow_start_rounds(train_bytes: u64) -> u32 {
+pub(crate) fn request_capacity_slow_start_rounds(train_bytes: u64) -> u32 {
     let mut rounds = 1_u32;
     let mut window_bytes = PATH_OPEN_SCORE_BYTES as u64;
     let mut cumulative_bytes = window_bytes;
@@ -202,28 +127,12 @@ pub(crate) fn request_tcp_capacity_measurement_lease(
     // Ordinary loss can delay any cold congestion-growth round. Budget each
     // modeled round with the candidate PTO instead of assuming lossless
     // SRTT-paced doubling; this remains a deadline, so success finishes early.
-    let growth = pto.saturating_mul(request_quic_capacity_slow_start_rounds(train_bytes));
+    let growth = pto.saturating_mul(request_capacity_slow_start_rounds(train_bytes));
     let reference_transfer =
         Duration::from_secs_f64(train_bytes as f64 * 8.0 / reference_rate_bps.max(1) as f64);
     // One PTO lets prior unsent control drain; the trailing PTO covers the
     // final typed receipt and ordinary recovery without a fixed margin.
     pto.saturating_add(growth.max(reference_transfer))
-        .saturating_add(pto)
-        .max(Duration::from_secs(1))
-}
-
-pub(crate) fn request_quic_capacity_measurement_lease(
-    candidate: PathSnapshot,
-    train_bytes: u64,
-) -> Duration {
-    let pto = transport_pto_from_snapshot(Some(candidate));
-    let srtt = Duration::from_secs_f64(candidate.srtt_ms.max(1.0) / 1_000.0);
-    // The train intentionally starts on a cold QUIC congestion controller.
-    // Budget the ACK-clock rounds needed to grow the RFC 9002 initial window;
-    // half a PTO protects an RTT estimate that still comes from path proof.
-    let modeled_round_trip = srtt.max(pto.div_f64(2.0));
-    modeled_round_trip
-        .saturating_mul(request_quic_capacity_slow_start_rounds(train_bytes))
         .saturating_add(pto)
         .max(Duration::from_secs(1))
 }

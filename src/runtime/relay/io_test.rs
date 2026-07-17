@@ -7,7 +7,8 @@ use crate::model::capacity::{
 };
 use crate::model::path::{CarrierPathInstanceId, RelayPathInstance, RelayPathKey};
 use crate::model::timing::{
-    reliable_ack_gap_reinjection_batch_lifetime, transport_pto_from_snapshot,
+    reliable_data_ack_gap_persistence_interval, reliable_data_retransmission_interval,
+    transport_pto_from_snapshot,
 };
 use crate::model::work::{
     reliable_critical_tail_reinjection_limit_bytes,
@@ -150,6 +151,70 @@ fn authoritative_ack_snapshot_does_not_regress_on_stale_or_incomplete_ack() {
 }
 
 #[test]
+fn authoritative_gap_persistence_ignores_an_older_complete_snapshot() {
+    let mut frontier = 0;
+    let mut ranges = Vec::new();
+    let mut complete = false;
+    let current = [
+        OffsetRange {
+            start: 0,
+            end: 4096,
+        },
+        OffsetRange {
+            start: 8192,
+            end: 16_384,
+        },
+    ];
+    let stale = [
+        OffsetRange {
+            start: 0,
+            end: 2048,
+        },
+        OffsetRange {
+            start: 8192,
+            end: 12_288,
+        },
+    ];
+    let now = Instant::now();
+    let persistence = Duration::from_millis(300);
+    let mut progress = ReliableAckGapReinjectionProgress::default();
+
+    update_reinjection_authoritative_ack_snapshot(
+        &mut frontier,
+        &mut ranges,
+        &mut complete,
+        true,
+        &current,
+    );
+    assert!(!progress.reinjection_ready_at(
+        complete,
+        &ranges,
+        Some(UnderlayProtocol::Tcp),
+        true,
+        persistence,
+        now,
+    ));
+
+    update_reinjection_authoritative_ack_snapshot(
+        &mut frontier,
+        &mut ranges,
+        &mut complete,
+        true,
+        &stale,
+    );
+    assert_eq!(frontier, 4096);
+    assert_eq!(ranges.as_slice(), current.as_slice());
+    assert!(progress.reinjection_ready_at(
+        complete,
+        &ranges,
+        Some(UnderlayProtocol::Tcp),
+        true,
+        persistence,
+        now + persistence,
+    ));
+}
+
+#[test]
 fn persistent_ack_gap_reinjection_limit_uses_critical_event_quantum() {
     let limits = MuxLimits::default();
     let base_limit = MAX_RELIABLE_SERVICE_QUANTUM_BYTES.min(reliable_relay_buffer_len(limits));
@@ -286,13 +351,23 @@ fn failed_original_reinjection_is_transport_neutral_above_native_congestion() {
 }
 
 #[test]
-fn ack_gap_reinjection_waits_for_a_persistent_connection_level_gap() {
-    let pto = transport_pto_from_snapshot(None);
-
+fn ack_gap_reinjection_waits_for_a_persistent_carrier_recovery_gap() {
     assert_eq!(
-        reliable_ack_gap_reinjection_batch_lifetime(None),
-        pto.saturating_mul(QUIC_PERSISTENT_CONGESTION_THRESHOLD),
-        "native TCP and QUIC recovery run before connection-level reinjection",
+        reliable_data_retransmission_interval(Some(UnderlayProtocol::Tcp), None),
+        Duration::from_secs(1),
+    );
+    assert_eq!(
+        reliable_data_retransmission_interval(Some(UnderlayProtocol::Udp), None),
+        transport_pto_from_snapshot(None),
+        "TCP data-level recovery and QUIC PTO must not share one timer formula",
+    );
+    assert_eq!(
+        reliable_data_ack_gap_persistence_interval(Some(UnderlayProtocol::Tcp), None),
+        Duration::from_secs(3),
+    );
+    assert_eq!(
+        reliable_data_ack_gap_persistence_interval(Some(UnderlayProtocol::Udp), None),
+        transport_pto_from_snapshot(None).saturating_mul(3),
     );
 }
 
@@ -553,7 +628,8 @@ fn ack_gap_reinjection_progress_keeps_growing_hole_identity() {
     ];
     let now = Instant::now();
     let interval = reliable_stream_recv_progress_interval(None);
-    let reinjection_delay = reliable_ack_gap_reinjection_batch_lifetime(None);
+    let reinjection_delay =
+        reliable_data_ack_gap_persistence_interval(Some(UnderlayProtocol::Udp), None);
 
     assert!(!progress.reinjection_ready_at(
         true,
@@ -628,7 +704,8 @@ fn ack_gap_reinjection_progress_resets_when_frontier_advances() {
         },
     ];
     let now = Instant::now();
-    let reinjection_delay = reliable_ack_gap_reinjection_batch_lifetime(None);
+    let reinjection_delay =
+        reliable_data_ack_gap_persistence_interval(Some(UnderlayProtocol::Udp), None);
 
     assert!(!progress.reinjection_ready_at(
         true,

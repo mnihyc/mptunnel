@@ -5,12 +5,13 @@
 
 use super::dispatch::{
     emit_planned_response_data_frame, emit_response_frame_from_sender_service,
-    response_frame_has_carrier_credit, response_reinjection_carrier_lane,
+    response_frame_has_carrier_credit,
 };
 use super::multipath::{
     plan_response_data_payload_with_data_ack_outstanding_impl,
     preview_response_data_payload_with_data_ack_outstanding,
 };
+use super::response_reinjection_avoid_outputs;
 use super::scheduling::select_response_frame_path;
 use crate::config::MppPerformanceConfig;
 #[cfg(feature = "lab-diagnostics")]
@@ -157,8 +158,8 @@ impl ServerResponseSenderService {
         let ReliablePathStreamOutput::Switchable(binding) = &path_stream.output else {
             return None;
         };
-        let avoid_keys = binding.flight_keys_overlapping_frame(preview);
-        let lane = response_reinjection_carrier_lane(preview);
+        let avoid_outputs = response_reinjection_avoid_outputs(binding, preview, cause);
+        let lane = path_stream.current_lane();
         let targets =
             binding.sender_path_targets(lane, reliable_stream_frame_accounted_bytes(preview));
         select_response_frame_path(
@@ -166,7 +167,7 @@ impl ServerResponseSenderService {
             lane,
             preview,
             CarrierEmitMode::Classified,
-            &avoid_keys,
+            &avoid_outputs,
             Some(cause),
         )
         .map(|target| {
@@ -311,7 +312,7 @@ impl ServerResponseSenderService {
                 response_frame_has_carrier_credit(
                     path_stream,
                     frame,
-                    response_reinjection_carrier_lane(frame),
+                    relay_lane,
                     CarrierEmitMode::Classified,
                     Some(*cause),
                 )
@@ -556,7 +557,7 @@ impl ServerResponseSenderService {
             ReliableWorkClass::Reinjection => emit_response_frame_from_sender_service(
                 path_stream,
                 frame.clone(),
-                response_reinjection_carrier_lane(&frame),
+                relay_lane,
                 CarrierEmitMode::Classified,
                 "tail_reinjection",
                 reinjection_cause,
@@ -595,7 +596,7 @@ impl ServerResponseSenderService {
         #[cfg(feature = "lab-diagnostics")]
         let send_lane = match queued_lane {
             ReliableWorkClass::Control => TrafficClass::Control,
-            ReliableWorkClass::Reinjection => response_reinjection_carrier_lane(&frame),
+            ReliableWorkClass::Reinjection => relay_lane,
             ReliableWorkClass::Data => reliable_path_effective_frame_lane(
                 &frame,
                 response_data_dispatch_lane(committed.data_lane, relay_lane),

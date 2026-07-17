@@ -21,7 +21,6 @@ use crate::protocol::{OffsetRange, StreamId};
 use crate::runtime::error::RuntimeError;
 use crate::runtime::path::{ClientPathContext, PathDeliveryStats};
 use crate::runtime::sender::{RelaySendCause, ReliableRelaySenderQueue, RequestSenderService};
-use crate::runtime::stream::request::RequestOutstandingWindow;
 use crate::runtime::stream::{ReliableRecvProgress, ReliableRelayRemoteSet};
 use crate::scheduler::{PathSnapshot, TrafficClass};
 use bytes::Bytes;
@@ -60,7 +59,6 @@ pub(super) struct ClientRelayProgressState {
 
 pub(super) struct ClientRelayRecoveryState {
     pub(super) pending_additional_path_opens: HashMap<RelayPathKey, RelayAdditionalPathOpenTask>,
-    pub(super) additional_path_open_attempts: HashMap<RelayPathKey, u8>,
     pub(super) excluded_paths: HashSet<RelayPathKey>,
 }
 
@@ -136,15 +134,29 @@ impl ClientRelayState {
             },
             recovery: ClientRelayRecoveryState {
                 pending_additional_path_opens: HashMap::new(),
-                additional_path_open_attempts: HashMap::new(),
                 excluded_paths: HashSet::new(),
             },
             delivery: ClientRelayDeliveryState::default(),
         }
     }
 
-    pub(super) fn is_finished(&self, sender_queue_empty: bool) -> bool {
-        !self.endpoint.local_open && !self.endpoint.remote_open && sender_queue_empty
+    /// Product-stream completion is stricter than carrier queue acceptance.
+    /// Retire only after both FIN directions and all Data Sequence state drain.
+    pub(super) fn is_finished(
+        &self,
+        send_stream: &ReliableSendStream,
+        recv_stream: &ReliableRecvStream,
+        sender_queue: &ReliableRelaySenderQueue,
+    ) -> bool {
+        !self.endpoint.local_open
+            && !self.endpoint.remote_open
+            && !self.endpoint.pending_local_fin
+            && self.endpoint.local_fin_sent
+            && self.endpoint.terminal_fin_replayed
+            && self.endpoint.pending_remote_fin_offset.is_none()
+            && sender_queue.is_empty()
+            && send_stream.reinjection_bytes() == 0
+            && recv_stream.reorder_bytes() == 0
     }
 
     pub(super) fn record_local_eof(&mut self) {
@@ -182,14 +194,6 @@ impl ClientRelayState {
     pub(super) fn record_recv_progress_sent(&mut self, sent: bool) {
         if sent {
             self.progress.last_recv_progress_sent_at = Instant::now();
-        }
-    }
-
-    pub(super) fn record_stream_progress_sent(&mut self, sent: bool) {
-        if sent {
-            let now = Instant::now();
-            self.progress.last_recv_progress_sent_at = now;
-            self.progress.last_stream_at = now;
         }
     }
 
@@ -329,7 +333,6 @@ pub(super) struct ClientStreamAckContext<'a> {
     pub(super) context: &'a ClientPathContext,
     pub(super) remotes: &'a ReliableRelayRemoteSet,
     pub(super) send_stream: &'a mut ReliableSendStream,
-    pub(super) outstanding_window: &'a mut RequestOutstandingWindow,
     pub(super) path_snapshot: Option<PathSnapshot>,
     pub(super) relay_lane: TrafficClass,
 }
@@ -394,7 +397,7 @@ pub(super) fn apply_client_stream_ack(
     stream_id: StreamId,
     complete: bool,
     ranges: Vec<OffsetRange>,
-) {
+) -> usize {
     #[cfg(not(feature = "lab-diagnostics"))]
     let _ = stream_id;
     let ClientStreamAckContext {
@@ -404,7 +407,6 @@ pub(super) fn apply_client_stream_ack(
         context,
         remotes,
         send_stream,
-        outstanding_window,
         path_snapshot,
         relay_lane,
     } = ack_context;
@@ -422,25 +424,12 @@ pub(super) fn apply_client_stream_ack(
         sender.apply_request_product_ack(context, remotes, send_stream, &normalized_ranges);
     let data_ack_progress_paths = ack_outcome.data_ack_progress_paths;
     let ack = ack_outcome.mux;
-    outstanding_window.apply_growth_evidence(ack_outcome.window, relay_lane, context.mux_limits);
     sender_queue.release_normalized_acked_reinjections(&normalized_ranges);
     let base_reinjection_limit =
         adaptive_reliable_relay_reinjection_bytes(path_snapshot, relay_lane, context.mux_limits);
     let reinjection_event_budget =
         sender.reinjection_extra_event_budget_remaining(context.mux_limits);
     let has_multipath_reinjection_alternative = remotes.path_keys().len() > 1;
-    let reinjection = sender.data_ack_gap_reinjection_model(
-        context,
-        remotes,
-        send_stream,
-        &normalized_ranges,
-        base_reinjection_limit,
-        relay_lane,
-    );
-    let has_live_original_path = reinjection.has_live_original_path;
-    let original_underlay = reinjection.original_underlay;
-    let original_path_timing = reinjection.original_path_timing;
-    let reinjection_target = reinjection.reinjection_target;
     update_request_path_staleness(
         state,
         sender,
@@ -451,6 +440,20 @@ pub(super) fn apply_client_stream_ack(
         &data_ack_progress_paths,
         stream_id,
     );
+    let authoritative_ack_complete = state.progress.last_send_ack_complete;
+    let authoritative_ack_ranges = state.progress.last_send_ack_ranges.as_slice();
+    let reinjection = sender.data_ack_gap_reinjection_model(
+        context,
+        remotes,
+        send_stream,
+        authoritative_ack_ranges,
+        base_reinjection_limit,
+        relay_lane,
+    );
+    let has_live_original_path = reinjection.has_live_original_path;
+    let original_underlay = reinjection.original_underlay;
+    let original_path_timing = reinjection.original_path_timing;
+    let reinjection_target = reinjection.reinjection_target;
     let generic_original_underlay = (!has_live_original_path)
         .then_some(
             original_path_timing
@@ -460,8 +463,8 @@ pub(super) fn apply_client_stream_ack(
         )
         .flatten();
     let ack_gap_reinjection_ready = state.progress.ack_gap_reinjection.reinjection_ready(
-        complete,
-        &normalized_ranges,
+        authoritative_ack_complete,
+        authoritative_ack_ranges,
         generic_original_underlay,
         has_multipath_reinjection_alternative && !has_live_original_path,
         (!has_live_original_path)
@@ -471,6 +474,9 @@ pub(super) fn apply_client_stream_ack(
     let persistent_ack_gap_reinjection_ready =
         ack_gap_reinjection_ready && reinjection_target.is_some();
     let reinjection_path = reinjection_target.map(|(_, snapshot)| snapshot);
+    // Ordinary ACK evidence repairs at most the earliest adaptive quantum.
+    // Only persistent evidence with a measured target may refill more of that
+    // target's service flight.
     let reinjection_limit = if persistent_ack_gap_reinjection_ready {
         reliable_persistent_ack_gap_reinjection_limit_bytes(
             reinjection_path,
@@ -491,9 +497,9 @@ pub(super) fn apply_client_stream_ack(
     };
     let reinjection_frames = stream_ack_gap_reinjection_frames_normalized(
         send_stream,
-        &normalized_ranges,
+        authoritative_ack_ranges,
         reinjection_limit,
-        complete,
+        authoritative_ack_complete,
         has_multipath_reinjection_alternative,
         persistent_ack_gap_reinjection_ready,
     );
@@ -561,9 +567,8 @@ pub(super) fn apply_client_stream_ack(
             .ack_gap_reinjection
             .record_reinjection_queued();
     }
-    #[cfg(not(feature = "lab-diagnostics"))]
-    let _ = ack;
     state.progress.last_stream_at = Instant::now();
+    ack.released_bytes
 }
 
 #[cfg(test)]

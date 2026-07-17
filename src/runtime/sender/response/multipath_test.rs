@@ -151,6 +151,76 @@ fn full_connection_receive_window_blocks_every_path() {
 }
 
 #[test]
+fn replacement_gets_bounded_progress_without_inheriting_old_flight() {
+    let (binding, initial, initial_receivers) = switchable_binding(MuxLimits::default());
+    let old_incarnation = binding.sender_path_targets(TrafficClass::Throughput, 4096)[0]
+        .observation
+        .incarnation;
+    binding.record_original_flight(initial, &data_frame(0, 4096));
+    drop(initial_receivers);
+
+    let (replacement_commands, _replacement_receivers) = reliable_path_command_channels(8);
+    assert_eq!(
+        binding.attach(
+            initial.underlay,
+            initial.path_id,
+            replacement_commands,
+            TrafficClass::Throughput,
+        ),
+        crate::runtime::stream::response::ResponseStreamAttachOutcome::ReplacedClosedOutput
+    );
+    let stream = stream_with_output(ReliablePathStreamOutput::Switchable(binding.clone()));
+
+    let first = plan_response_data_dispatch_with_data_ack_outstanding_impl(
+        &stream,
+        TrafficClass::Throughput,
+        4096,
+        4096,
+        4096,
+    )
+    .expect("replacement receives bounded work while the old range remains debt");
+    assert!(matches!(
+        first,
+        ResponseDataDispatchTarget::Switchable { target, .. }
+            if target.key == initial && target.incarnation != old_incarnation
+    ));
+
+    binding.release_normalized_acked_ranges(&[crate::protocol::OffsetRange {
+        start: 0,
+        end: 2048,
+    }]);
+    let partial = plan_response_data_dispatch_with_data_ack_outstanding_impl(
+        &stream,
+        TrafficClass::Throughput,
+        4096,
+        4096,
+        2048,
+    )
+    .expect("partial Data ACK does not create stop-and-wait failover");
+    assert!(matches!(
+        partial,
+        ResponseDataDispatchTarget::Switchable { target, .. }
+            if target.key == initial && target.incarnation != old_incarnation
+    ));
+
+    binding.release_normalized_acked_ranges(&[crate::protocol::OffsetRange {
+        start: 2048,
+        end: 4096,
+    }]);
+    assert!(
+        plan_response_data_dispatch_with_data_ack_outstanding_impl(
+            &stream,
+            TrafficClass::Throughput,
+            4096,
+            4096,
+            0,
+        )
+        .is_ok(),
+        "full Data ACK retirement removes the old incarnation's ordering debt",
+    );
+}
+
+#[test]
 fn readiness_preview_does_not_mutate_generation_or_queue() {
     let (binding, _initial, _receivers) = switchable_binding(MuxLimits::default());
     let stream = stream_with_output(ReliablePathStreamOutput::Switchable(binding.clone()));

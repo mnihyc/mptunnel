@@ -21,6 +21,18 @@ fn range(start: u64, end: u64) -> OffsetRange {
     OffsetRange::new(start, end).expect("valid test range")
 }
 
+fn output_identity(
+    binding: &super::super::ResponseStreamBinding,
+    key: CarrierPathKey,
+) -> (CarrierPathKey, u64) {
+    binding
+        .sender_path_targets(TrafficClass::Throughput, 1)
+        .into_iter()
+        .find(|target| target.observation.key == key)
+        .map(|target| (key, target.observation.incarnation))
+        .expect("attached response output")
+}
+
 #[test]
 fn data_ack_hole_advances_only_after_the_prefix_arrives() {
     let path = key(UnderlayProtocol::Tcp, 0);
@@ -100,7 +112,7 @@ fn exact_original_data_ack_releases_output_flight_and_progress() {
     drop(outputs);
     assert!(
         binding
-            .original_flight_keys_overlapping_frame(&frame)
+            .original_flight_outputs_overlapping_frame(&frame)
             .is_empty()
     );
 }
@@ -189,17 +201,19 @@ fn reinjection_does_not_replace_the_original_path_identity() {
         commands,
         TrafficClass::Throughput,
     );
+    let original_output = output_identity(&binding, original);
+    let alternate_output = output_identity(&binding, alternate);
     let frame = stream_data_frame_at(0, 4096);
     binding.record_original_flight(original, &frame);
     binding.record_reinjected_flight(alternate, &frame);
 
     assert_eq!(
-        binding.original_flight_keys_overlapping_frame(&frame),
-        vec![original]
+        binding.original_flight_outputs_overlapping_frame(&frame),
+        vec![original_output]
     );
-    let mut all = binding.flight_keys_overlapping_frame(&frame);
-    all.sort_by_key(|candidate| candidate.path_id.0);
-    assert_eq!(all, vec![original, alternate]);
+    let mut all = binding.flight_outputs_overlapping_frame(&frame);
+    all.sort_by_key(|(candidate, _)| candidate.path_id.0);
+    assert_eq!(all, vec![original_output, alternate_output]);
 }
 
 #[test]
@@ -241,4 +255,37 @@ fn failed_output_reinjection_covers_all_interleaved_original_ranges() {
         vec![range(8192, 12288)],
         "path failure must recover every remaining range owned by that output, not only the first DSN record before a live-path record"
     );
+}
+
+#[test]
+fn blocking_flight_cannot_inherit_a_replacement_output_snapshot() {
+    let (binding, original, original_receivers) = binding_for_underlay(UnderlayProtocol::Tcp);
+    let alternate = key(UnderlayProtocol::Udp, 1);
+    let (alternate_commands, _alternate_receivers) = reliable_path_command_channels(8);
+    binding.attach(
+        alternate.underlay,
+        alternate.path_id,
+        alternate_commands,
+        TrafficClass::Throughput,
+    );
+    binding.record_original_flight(original, &stream_data_frame_at(0, 4096));
+    drop(original_receivers);
+    let (replacement_commands, _replacement_receivers) = reliable_path_command_channels(8);
+    assert_eq!(
+        binding.attach(
+            original.underlay,
+            original.path_id,
+            replacement_commands,
+            TrafficClass::Throughput,
+        ),
+        super::super::attachment::ResponseStreamAttachOutcome::ReplacedClosedOutput
+    );
+
+    assert!(
+        binding
+            .tail_reinjection_snapshot(0, TrafficClass::Throughput)
+            .is_none(),
+        "an old OriginalData flight must not borrow timing from a replacement carrier"
+    );
+    assert!(binding.has_multipath_reinjection_alternative());
 }

@@ -12,16 +12,16 @@ use super::server_writer::ServerTcpWriter;
 use crate::lab_diagnostics::lab_diagnostic;
 use crate::protocol::{CloseReason, Frame, PathId, PeerPathState, ResetReason, SessionId};
 use crate::runtime::error::RuntimeError;
-use crate::runtime::path::ServerCarrierPathRegistration;
 use crate::runtime::path::commands::{
     ReliablePathCommand, ReliablePathCommandReceivers, ReliablePathCommandSender,
-    recv_reliable_path_command, reliable_noninterlocked_tcp_writer_run_budget_bytes,
-    reliable_path_command_pending_bytes, reliable_path_command_writer_run_budget_items,
+    recv_reliable_path_command, reliable_path_command_pending_bytes,
+    reliable_path_command_writer_run_budget_bytes, reliable_path_command_writer_run_budget_items,
     reliable_path_command_writer_run_bytes, reliable_path_frame_requires_capacity_command,
     reliable_path_receivers_closed, try_coalesce_reliable_path_writer_run,
     try_recv_reliable_path_command,
 };
 use crate::runtime::path::server_context::ServerPathContext;
+use crate::runtime::path::{ServerCarrierPathRegistration, ServerStreamFrameRoute};
 use crate::runtime::peer_status::PeerStatusCarrier;
 use crate::transport::encrypted::EncryptedFramedTransportError;
 #[cfg(feature = "lab-diagnostics")]
@@ -43,6 +43,7 @@ enum ServerTcpPathEvent {
     Frame(Frame),
     Command(ReliablePathCommand),
     PeerStatusRequest(u64),
+    SenderObservationDue,
 }
 
 /// Owned state transferred from authenticated admission into the long-lived actor.
@@ -70,6 +71,7 @@ pub(super) struct ServerTcpPathSession {
     commands_rx: ReliablePathCommandReceivers,
     commands_tx: ReliablePathCommandSender,
     path_frames: mpsc::Receiver<Result<Frame, EncryptedFramedTransportError>>,
+    deferred_input: Option<Frame>,
     writer: ServerTcpWriter,
     peer_status: PeerStatusCarrier,
     path_registration: ServerCarrierPathRegistration,
@@ -88,6 +90,7 @@ impl ServerTcpPathSession {
             commands_rx: admission.commands_rx,
             commands_tx: admission.commands_tx,
             path_frames: admission.path_frames,
+            deferred_input: None,
             writer: admission.writer,
             peer_status: admission.peer_status,
             path_registration: admission.path_registration,
@@ -97,12 +100,17 @@ impl ServerTcpPathSession {
 
     pub(super) async fn run(mut self) -> Result<(), RuntimeError> {
         loop {
-            let event = recv_server_tcp_path_event(
-                &mut self.path_frames,
-                &mut self.commands_rx,
-                &mut self.peer_status,
-            )
-            .await?;
+            let event = if let Some(frame) = self.deferred_input.take() {
+                Some(ServerTcpPathEvent::Frame(frame))
+            } else {
+                recv_server_tcp_path_event(
+                    &mut self.path_frames,
+                    &mut self.commands_rx,
+                    &mut self.peer_status,
+                    self.evidence.next_sender_observation_at(),
+                )
+                .await?
+            };
             let Some(event) = event else {
                 return Ok(());
             };
@@ -141,6 +149,7 @@ impl ServerTcpPathSession {
                         return Ok(());
                     }
                 }
+                ServerTcpPathEvent::SenderObservationDue => {}
             }
         }
     }
@@ -365,14 +374,14 @@ impl ServerTcpPathSession {
     ) -> Result<ServerTcpSessionDisposition, RuntimeError> {
         #[cfg(feature = "lab-diagnostics")]
         let drain_started = Instant::now();
-        let byte_budget =
-            reliable_noninterlocked_tcp_writer_run_budget_bytes(self.context.mux_limits);
+        let byte_budget = reliable_path_command_writer_run_budget_bytes(self.context.mux_limits);
         let item_budget = reliable_path_command_writer_run_budget_items(self.context.mux_limits);
         let mut next_command = Some(first_command);
         self.writer.clear_batch();
         let mut sent_bytes = 0usize;
         let mut sent_items = 0usize;
         let mut wrote_frame = false;
+        let mut writer_pending_bytes = 0usize;
 
         loop {
             let Some(command) = next_command
@@ -411,8 +420,7 @@ impl ServerTcpPathSession {
                 ReliablePathCommand::SendFrame(frame) => {
                     let is_stream_detach = matches!(&frame, Frame::StreamDetach { .. });
                     self.writer.push_frame(frame);
-                    self.commands_rx
-                        .release_pending_command_bytes(pending_bytes);
+                    writer_pending_bytes = writer_pending_bytes.saturating_add(pending_bytes);
                     wrote_frame = true;
                     sent_bytes = sent_bytes.saturating_add(writer_run_bytes);
                     sent_items = sent_items.saturating_add(1);
@@ -420,14 +428,6 @@ impl ServerTcpPathSession {
                         break;
                     }
                     continue;
-                }
-                ReliablePathCommand::SendQuicCapacityProbe(probe) => {
-                    probe.ticket.cancel();
-                    self.commands_rx
-                        .release_pending_command_bytes(pending_bytes);
-                    return Err(RuntimeError::Protocol(
-                        "server TCP path received QUIC capacity command",
-                    ));
                 }
                 ReliablePathCommand::SendTcpCapacityProbe(probe) => {
                     drop(probe);
@@ -442,12 +442,15 @@ impl ServerTcpPathSession {
                     // after its reset has entered the ordered carrier writer.
                     self.writer
                         .push_frame(Frame::StreamReset { stream_id, reason });
-                    self.commands_rx
-                        .release_pending_command_bytes(pending_bytes);
+                    writer_pending_bytes = writer_pending_bytes.saturating_add(pending_bytes);
                     wrote_frame = true;
                     sent_bytes = sent_bytes.saturating_add(writer_run_bytes);
                     sent_items = sent_items.saturating_add(1);
-                    if !self.writer.write_batch(&mut self.evidence).await? {
+                    if matches!(
+                        self.write_batch_interlocked(&mut writer_pending_bytes)
+                            .await?,
+                        ServerTcpSessionDisposition::Stop
+                    ) {
                         return Ok(ServerTcpSessionDisposition::Stop);
                     }
                     self.streams.detach(
@@ -467,9 +470,16 @@ impl ServerTcpPathSession {
                             .await?;
                         return Ok(ServerTcpSessionDisposition::Stop);
                     }
+                    if self.deferred_input.is_some() {
+                        break;
+                    }
                 }
                 ReliablePathCommand::CloseStream(stream_id) => {
-                    if !self.writer.write_batch(&mut self.evidence).await? {
+                    if matches!(
+                        self.write_batch_interlocked(&mut writer_pending_bytes)
+                            .await?,
+                        ServerTcpSessionDisposition::Stop
+                    ) {
                         return Ok(ServerTcpSessionDisposition::Stop);
                     }
                     self.streams.detach(
@@ -494,9 +504,16 @@ impl ServerTcpPathSession {
                     self.commands_rx
                         .release_pending_command_bytes(pending_bytes);
                     sent_items = sent_items.saturating_add(1);
+                    if self.deferred_input.is_some() {
+                        break;
+                    }
                 }
                 ReliablePathCommand::OpenStream { .. } => {
-                    if !self.writer.write_batch(&mut self.evidence).await? {
+                    if matches!(
+                        self.write_batch_interlocked(&mut writer_pending_bytes)
+                            .await?,
+                        ServerTcpSessionDisposition::Stop
+                    ) {
                         return Ok(ServerTcpSessionDisposition::Stop);
                     }
                     return Err(RuntimeError::Protocol(
@@ -504,7 +521,11 @@ impl ServerTcpPathSession {
                     ));
                 }
                 ReliablePathCommand::CancelTcpOpen { .. } => {
-                    if !self.writer.write_batch(&mut self.evidence).await? {
+                    if matches!(
+                        self.write_batch_interlocked(&mut writer_pending_bytes)
+                            .await?,
+                        ServerTcpSessionDisposition::Stop
+                    ) {
                         return Ok(ServerTcpSessionDisposition::Stop);
                     }
                     return Err(RuntimeError::Protocol(
@@ -517,7 +538,13 @@ impl ServerTcpPathSession {
             }
         }
 
-        if !self.writer.write_batch(&mut self.evidence).await? {
+        if self.deferred_input.is_none()
+            && matches!(
+                self.write_batch_interlocked(&mut writer_pending_bytes)
+                    .await?,
+                ServerTcpSessionDisposition::Stop
+            )
+        {
             return Ok(ServerTcpSessionDisposition::Stop);
         }
 
@@ -541,6 +568,82 @@ impl ServerTcpPathSession {
             return Ok(ServerTcpSessionDisposition::Stop);
         }
         Ok(ServerTcpSessionDisposition::Continue)
+    }
+
+    async fn write_batch_interlocked(
+        &mut self,
+        writer_pending_bytes: &mut usize,
+    ) -> Result<ServerTcpSessionDisposition, RuntimeError> {
+        debug_assert!(self.deferred_input.is_none());
+        let mut routed_frames = 0usize;
+        let write_result = {
+            let write = self.writer.write_batch(&mut self.evidence);
+            tokio::pin!(write);
+            loop {
+                tokio::select! {
+                    biased;
+                    result = &mut write => break result?,
+                    incoming = self.path_frames.recv(), if self.deferred_input.is_none() => {
+                        let frame = match incoming {
+                            Some(Ok(frame)) => frame,
+                            Some(Err(err)) if encrypted_framed_peer_closed(&err) => {
+                                return Ok(ServerTcpSessionDisposition::Stop);
+                            }
+                            Some(Err(err)) => return Err(RuntimeError::Encrypted(err)),
+                            None => return Ok(ServerTcpSessionDisposition::Stop),
+                        };
+                        let stream_id = match &frame {
+                            Frame::StreamData { stream_id, .. }
+                            | Frame::StreamAck { stream_id, .. }
+                            | Frame::StreamMaxData { stream_id, .. }
+                            | Frame::StreamFin { stream_id, .. }
+                            | Frame::StreamReset { stream_id, .. } => Some(*stream_id),
+                            _ => None,
+                        };
+                        match stream_id {
+                            Some(stream_id) => match self.streams.try_route_frame(
+                                &self.context,
+                                &self.path_registration,
+                                self.path_id,
+                                stream_id,
+                                frame,
+                            )? {
+                                ServerStreamFrameRoute::Routed => {
+                                    routed_frames = routed_frames.saturating_add(1);
+                                }
+                                ServerStreamFrameRoute::Backpressured(frame) => {
+                                    self.deferred_input = Some(frame);
+                                }
+                            },
+                            None => self.deferred_input = Some(frame),
+                        }
+                    }
+                }
+            }
+        };
+        if write_result && *writer_pending_bytes > 0 {
+            self.evidence
+                .observe_after_write(&self.context, &self.path_registration, self.path_id);
+            self.commands_rx
+                .release_pending_command_bytes(std::mem::take(writer_pending_bytes));
+        }
+        #[cfg(feature = "lab-diagnostics")]
+        if routed_frames > 0 || self.deferred_input.is_some() {
+            lab_diagnostic(
+                "server_tcp_write_feedback_interlock",
+                format_args!(
+                    "path_id={} routed_frames={} deferred_frames={}",
+                    self.path_id.0,
+                    routed_frames,
+                    usize::from(self.deferred_input.is_some()),
+                ),
+            );
+        }
+        if write_result {
+            Ok(ServerTcpSessionDisposition::Continue)
+        } else {
+            Ok(ServerTcpSessionDisposition::Stop)
+        }
     }
 
     async fn apply_datagram_effect(
@@ -602,7 +705,17 @@ async fn recv_server_tcp_path_event(
     path_frames: &mut mpsc::Receiver<Result<Frame, EncryptedFramedTransportError>>,
     commands_rx: &mut ReliablePathCommandReceivers,
     peer_status: &mut PeerStatusCarrier,
+    sender_observation_at: Option<std::time::Instant>,
 ) -> Result<Option<ServerTcpPathEvent>, RuntimeError> {
+    let sender_observation_timer = async move {
+        match sender_observation_at {
+            Some(deadline) => {
+                tokio::time::sleep_until(tokio::time::Instant::from_std(deadline)).await;
+            }
+            None => std::future::pending::<()>().await,
+        }
+    };
+    tokio::pin!(sender_observation_timer);
     loop {
         let command_may_recv = !reliable_path_receivers_closed(commands_rx);
         tokio::select! {
@@ -629,6 +742,9 @@ async fn recv_server_tcp_path_event(
                     None if reliable_path_receivers_closed(commands_rx) => return Ok(None),
                     None => continue,
                 }
+            }
+            _ = &mut sender_observation_timer => {
+                return Ok(Some(ServerTcpPathEvent::SenderObservationDue));
             }
         }
     }

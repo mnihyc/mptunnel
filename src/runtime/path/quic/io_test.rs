@@ -10,6 +10,7 @@ use crate::runtime::path::commands::{
 use crate::scheduler::TrafficClass;
 use bytes::Bytes;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
+use tokio::sync::{mpsc, oneshot};
 
 #[test]
 fn quic_resolution_keeps_all_unique_source_compatible_addresses() {
@@ -33,7 +34,7 @@ fn quic_resolution_keeps_all_unique_source_compatible_addresses() {
 }
 
 #[test]
-fn quic_ordinary_writer_enforces_measurement_ownership() {
+fn quic_writer_rejects_tcp_capacity_frames() {
     let capacity = Frame::PathCapacityData {
         path_id: PathId(4),
         measurement_id: 17,
@@ -63,17 +64,17 @@ fn quic_ordinary_writer_enforces_measurement_ownership() {
 
     for frame in [&capacity, &finish, &receipt] {
         assert!(matches!(
-            ensure_quic_ordinary_frames(std::slice::from_ref(frame)),
+            ensure_quic_data_plane_frames(std::slice::from_ref(frame)),
             Err(RuntimeError::Protocol(
-                "QUIC measurement records require the dedicated writer"
+                "PATH_CAPACITY frames are not valid on QUIC carriers"
             ))
         ));
     }
-    assert!(ensure_quic_ordinary_frames(&[stream.clone(), datagram.clone()]).is_ok());
+    assert!(ensure_quic_data_plane_frames(&[stream.clone(), datagram.clone()]).is_ok());
     assert!(matches!(
-        ensure_quic_ordinary_frames(&[stream, capacity, datagram]),
+        ensure_quic_data_plane_frames(&[stream, capacity, datagram]),
         Err(RuntimeError::Protocol(
-            "QUIC measurement records require the dedicated writer"
+            "PATH_CAPACITY frames are not valid on QUIC carriers"
         ))
     ));
 
@@ -83,17 +84,10 @@ fn quic_ordinary_writer_enforces_measurement_ownership() {
             offset: 0,
             payload: Bytes::from_static(b"stream"),
         }
-        .write_class(),
-        crate::protocol::FrameWriteClass::Ordinary {
-            delivery_evidence_bytes: 6,
-        }
+        .delivery_evidence_bytes(),
+        6
     );
-    assert_eq!(
-        Frame::Ping { nonce: 1 }.write_class(),
-        crate::protocol::FrameWriteClass::Ordinary {
-            delivery_evidence_bytes: 0,
-        }
-    );
+    assert_eq!(Frame::Ping { nonce: 1 }.delivery_evidence_bytes(), 0);
 }
 
 #[test]
@@ -142,4 +136,69 @@ fn quic_udp_command_queue_tracks_sender_quantum_not_record_size() {
         quic_udp_queue, record_sized_queue,
         "carrier packet/record sizing must not inflate the command queue"
     );
+}
+
+#[tokio::test]
+async fn quic_write_wait_routes_stream_feedback_before_an_ordering_barrier() {
+    let (input_tx, mut input_rx) = mpsc::channel(4);
+    let (release_write, write_released) = oneshot::channel::<()>();
+    let (routed_signal, routed) = oneshot::channel::<()>();
+    let (barrier_signal, barrier) = oneshot::channel::<()>();
+
+    let task = tokio::spawn(async move {
+        let mut routed_signal = Some(routed_signal);
+        let mut barrier_signal = Some(barrier_signal);
+        let mut deferred_input = None;
+        let (write_result, routed_frames) = await_udp_write_while_routing_stream_frames(
+            async move {
+                write_released.await.expect("release simulated QUIC write");
+                17usize
+            },
+            &mut input_rx,
+            &mut deferred_input,
+            |frame| match frame {
+                Frame::StreamAck { .. } => {
+                    if let Some(signal) = routed_signal.take() {
+                        let _ = signal.send(());
+                    }
+                    Ok(None)
+                }
+                frame => {
+                    if let Some(signal) = barrier_signal.take() {
+                        let _ = signal.send(());
+                    }
+                    Ok(Some(frame))
+                }
+            },
+        )
+        .await;
+        (write_result, routed_frames, deferred_input)
+    });
+
+    input_tx
+        .send(Ok(Frame::StreamAck {
+            stream_id: StreamId(8),
+            complete: false,
+            ranges: Vec::new(),
+        }))
+        .await
+        .expect("queue stream feedback");
+    routed.await.expect("route stream feedback during write");
+    input_tx
+        .send(Ok(Frame::Ping { nonce: 9 }))
+        .await
+        .expect("queue ordering barrier");
+    barrier.await.expect("defer ordering barrier during write");
+    assert!(
+        !task.is_finished(),
+        "an ordering barrier must not cancel the in-flight QUIC write"
+    );
+    release_write
+        .send(())
+        .expect("complete simulated QUIC write");
+
+    let (write_result, routed_frames, deferred_input) = task.await.expect("join write wait");
+    assert_eq!(write_result, 17);
+    assert_eq!(routed_frames, 1);
+    assert!(matches!(deferred_input, Some(Ok(Frame::Ping { nonce: 9 }))));
 }

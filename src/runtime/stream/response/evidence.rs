@@ -6,12 +6,11 @@ use super::attachment::ResponseStreamOutputEntry;
 #[cfg(feature = "lab-diagnostics")]
 use crate::lab_diagnostics::lab_diagnostic;
 use crate::model::capacity::{
-    PATH_OPEN_SCORE_BYTES, QuicCapacityProofCandidate,
-    RELIABLE_STREAM_STARTUP_PRODUCT_WINDOW_BYTES, quic_capacity_receipt_rate_bps,
-    reliable_path_startup_sample_limit_bytes, valid_quic_capacity_proof_geometry,
+    PATH_OPEN_SCORE_BYTES, RELIABLE_STREAM_STARTUP_PRODUCT_WINDOW_BYTES,
+    reliable_path_startup_sample_limit_bytes,
 };
 use crate::model::path::{CarrierPathInstanceId, CarrierPathKey};
-use crate::model::timing::quic_bulk_proof_freshness_horizon;
+use crate::model::timing::transport_rate_sample_freshness_horizon;
 use crate::protocol::{PathMetricDirection, PathMetrics, UnderlayProtocol};
 use std::sync::atomic::Ordering;
 use std::time::{Duration, Instant};
@@ -29,31 +28,6 @@ pub(in crate::runtime) struct ServerPathMetricsEntry {
     // Metric age is measured at the source; residence time closes the gap when
     // the local idle publisher is delayed after this snapshot is installed.
     pub(in crate::runtime::stream) recorded_at: Instant,
-    // Only the exact capacity transaction creates this marker. Ordinary metric
-    // refreshes may carry it to the fixed deadline but cannot mint a new proof.
-    pub(in crate::runtime::stream) capacity_proof: Option<QuicCapacityProofCandidate>,
-}
-
-fn well_formed_quic_capacity_proof_candidate(proof: QuicCapacityProofCandidate) -> bool {
-    valid_quic_capacity_proof_geometry(
-        proof.train_bytes,
-        proof.sample_floor_bytes,
-        proof.accounting_slack_bytes,
-        proof.warmup_bytes,
-        proof.required_proof_bytes,
-    ) && proof.receipt_confirmed
-        && proof.written_bytes == proof.train_bytes
-        && proof.written_data_frame_count > 0
-        && proof.received_bytes == proof.train_bytes
-        && !proof.proof_elapsed.is_zero()
-        && quic_capacity_receipt_rate_bps(proof.train_bytes, proof.proof_elapsed)
-            .is_some_and(|raw_rate| proof.rate_bps > 0 && proof.rate_bps <= raw_rate)
-        && !proof.proof_validity.is_zero()
-        && proof.accepted_at.checked_add(proof.proof_validity) == Some(proof.expires_at)
-}
-
-fn valid_quic_capacity_proof_candidate_at(proof: QuicCapacityProofCandidate, now: Instant) -> bool {
-    well_formed_quic_capacity_proof_candidate(proof) && proof.expires_at > now
 }
 
 pub(super) fn server_output_local_path_metrics(
@@ -66,24 +40,8 @@ pub(super) fn server_output_local_path_metrics(
             && path_metrics.metrics.path_id == entry.key.path_id
     })
 }
-pub(super) fn server_quic_capacity_proof(
-    path_metrics: ServerPathMetricsEntry,
-) -> Option<QuicCapacityProofCandidate> {
-    let proof = path_metrics.capacity_proof?;
-    (path_metrics.source == ServerPathMetricsSource::LocalSender
-        && path_metrics.metrics.underlay == UnderlayProtocol::Udp
-        && valid_quic_capacity_proof_candidate_at(proof, Instant::now()))
-    .then_some(proof)
-}
-
 pub(super) fn server_path_metrics_estimate_rate_bps(path_metrics: ServerPathMetricsEntry) -> f64 {
-    path_metrics
-        .capacity_proof
-        .filter(|proof| well_formed_quic_capacity_proof_candidate(*proof))
-        .map_or_else(
-            || path_metrics.metrics.delivery_rate_bps.max(1) as f64,
-            |proof| proof.rate_bps.max(1) as f64,
-        )
+    path_metrics.metrics.delivery_rate_bps.max(1) as f64
 }
 
 pub(super) fn server_path_metrics_bulk_sample_floor_bytes(metrics: PathMetrics) -> u64 {
@@ -108,20 +66,18 @@ pub(super) fn server_path_metrics_bulk_sample_floor_bytes(metrics: PathMetrics) 
 pub(super) fn server_path_metrics_has_bulk_rate_evidence(
     path_metrics: ServerPathMetricsEntry,
 ) -> bool {
-    if server_quic_capacity_proof(path_metrics).is_some() {
-        return true;
-    }
     let sample_floor = server_path_metrics_bulk_sample_floor_bytes(path_metrics.metrics);
     let packet_accounting_slack = (PATH_OPEN_SCORE_BYTES as u64).min(sample_floor / 8);
     let effective_metric_age = Duration::from_micros(u64::from(path_metrics.metrics.metric_age_us))
         .saturating_add(Instant::now().saturating_duration_since(path_metrics.recorded_at));
-    let native_bulk_proof_is_eligible = !path_metrics.metrics.app_limited
-        && (path_metrics.metrics.underlay != UnderlayProtocol::Udp
-            || effective_metric_age
-                < quic_bulk_proof_freshness_horizon(
-                    Duration::from_micros(u64::from(path_metrics.metrics.srtt_us.max(1))),
-                    Duration::from_micros(u64::from(path_metrics.metrics.rttvar_us)),
-                ));
+    // `app_limited` describes the current carrier instant. The sample timestamp
+    // and accumulated non-app-limited ACK evidence own the lifetime of the last
+    // qualified delivery rate, so a later idle instant must not invalidate it.
+    let native_bulk_proof_is_eligible = effective_metric_age
+        < transport_rate_sample_freshness_horizon(
+            Duration::from_micros(u64::from(path_metrics.metrics.srtt_us.max(1))),
+            Duration::from_micros(u64::from(path_metrics.metrics.rttvar_us)),
+        );
     path_metrics.source == ServerPathMetricsSource::LocalSender
         // Source expiry is authoritative; age is defense in depth if an idle
         // refresh is delayed or reordered before response scheduling observes it.
@@ -248,7 +204,6 @@ impl ResponseStreamBinding {
                 metrics,
                 source,
                 recorded_at: Instant::now(),
-                capacity_proof: None,
             },
             true,
         );
@@ -280,17 +235,15 @@ impl ResponseStreamBinding {
         &self,
         key: CarrierPathKey,
         path_instance_id: Option<CarrierPathInstanceId>,
-        mut path_metrics: ServerPathMetricsEntry,
+        path_metrics: ServerPathMetricsEntry,
         notify: bool,
     ) -> (bool, bool) {
         let mut outputs = self
             .outputs
             .lock()
             .expect("server reliable stream binding lock");
-        let now = Instant::now();
         let source = path_metrics.source;
         let metrics = path_metrics.metrics;
-        let explicit_quic_capacity_proof = path_metrics.capacity_proof.is_some();
         let mut matched = false;
         let mut changed = false;
         for entry in &mut outputs.entries {
@@ -302,15 +255,9 @@ impl ResponseStreamBinding {
                     ServerPathMetricsSource::LocalSender => &mut entry.local_path_metrics,
                     ServerPathMetricsSource::PeerHint => &mut entry.peer_path_metrics,
                 };
-                if !explicit_quic_capacity_proof {
-                    path_metrics.capacity_proof = current
-                        .and_then(|previous| previous.capacity_proof)
-                        .filter(|proof| proof.expires_at > now);
-                }
                 let scheduling_changed = current.is_none_or(|previous| {
                     previous.source != source
                         || !server_path_metrics_scheduling_equivalent(previous.metrics, metrics)
-                        || previous.capacity_proof != path_metrics.capacity_proof
                 });
                 *current = Some(path_metrics);
                 changed |= scheduling_changed;

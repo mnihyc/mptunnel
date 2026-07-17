@@ -63,16 +63,17 @@ and `snapshot`. Deleted pre-v2 wrapper modules are not retained.
 
 ### Request direction
 
-- `runtime/stream/request.rs` is a narrow facade over four serialized owners:
-  `attachment`, `state`, `flow_control`, and `flight`.
+- `runtime/stream/request.rs` is a narrow facade over three serialized owners:
+  `attachment`, `state`, and `flight`.
 - `attachment` owns carrier membership and attachment lifetimes; `state` owns
-  per-path evidence and sampling; `flow_control` owns the MPP receive window;
-  and `flight` owns exact range/copy accounting.
+  per-path delivery evidence and admission; `flight` owns exact range/copy
+  accounting. The shared mux stream model owns the MPP receive window.
 - `runtime/sender/request.rs` is the relay-facing facade and dispatch owner.
 - Sender imports no concrete state or policy from relay; relay acquires paths
   and retries unchanged queued work when attachment is required.
 - Request scheduling consumes snapshots; it does not hold runtime handles.
-- TCP and QUIC capacity transactions stay in separate carrier-specific owners;
+- TCP fallback capacity measurement stays in its carrier-specific owner. QUIC
+  paths publish native congestion state and use ordinary bounded MPP admission;
   carrier-neutral proof validation is a pure model function.
 - Reinjection selects missing MPP ranges and does not impersonate native
   retransmission.

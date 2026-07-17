@@ -84,10 +84,13 @@ fn conformance_tracking_is_opt_in_under_an_exact_filter() {
 }
 
 #[test]
-fn data_service_decision_counts_as_server_original_data() {
+fn every_original_data_dispatch_reason_counts_for_conformance() {
     let _guard = lab_diag_test_guard();
 
-    for (index, decision_kind) in ["data_service", "data_path_state"].into_iter().enumerate() {
+    for (index, decision_kind) in ["data_service", "data_path_state", "data_completion_time"]
+        .into_iter()
+        .enumerate()
+    {
         lab_sender_service_decision(
             "server",
             Some(7),
@@ -101,7 +104,7 @@ fn data_service_decision_counts_as_server_original_data() {
         lab_server_response_stream_data(7, 9, (index as u64) * 1024, 1024);
     }
 
-    assert_eq!(lab_sender_service_counts_for_test(7, 9), (2, 2));
+    assert_eq!(lab_sender_service_counts_for_test(7, 9), (3, 3));
     let counts = LAB_SENDER_SERVICE_COUNTS
         .get()
         .expect("sender-service counts")

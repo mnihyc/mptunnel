@@ -19,10 +19,18 @@ class ManagementSnapshotTests(unittest.TestCase):
             ["docker"], 0, stdout=json.dumps(payload), stderr=""
         )
 
-        with mock.patch.object(management_snapshots, "run", return_value=completed):
-            snapshot = management_snapshots.container_snapshot("container-id", 17600)
+        with mock.patch.object(
+            management_snapshots, "run", return_value=completed
+        ) as run_mock:
+            snapshot = management_snapshots.container_snapshot(
+                "container-id", 17600, "lab-management-token"
+            )
 
         self.assertEqual(snapshot, payload)
+        command = run_mock.call_args.args[0]
+        self.assertIn("/api/diagnostics", command[5])
+        self.assertIn("Authorization", command[5])
+        self.assertEqual(command[-2:], ["17600", "lab-management-token"])
 
     def test_sample_records_each_service_once_before_stop(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -37,9 +45,11 @@ class ManagementSnapshotTests(unittest.TestCase):
                 case="equal-fat",
                 interval=1.0,
                 port=17600,
+                token="lab-management-token",
             )
 
-            def fake_snapshot(container_id, port):
+            def fake_snapshot(container_id, port, token):
+                self.assertEqual(token, "lab-management-token")
                 if container_id == "server-id":
                     stop_file.touch()
                 return {"management": {"role": container_id}, "interfaces": {}}

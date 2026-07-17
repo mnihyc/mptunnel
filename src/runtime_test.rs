@@ -30,6 +30,75 @@ fn security() -> SecurityConfig {
     )
 }
 
+#[derive(Default)]
+struct CountingCarrierNetworkProvider {
+    socket_count: std::sync::atomic::AtomicUsize,
+    socket_identities: std::sync::Mutex<Vec<crate::transport::CarrierPathIdentity>>,
+}
+
+impl CountingCarrierNetworkProvider {
+    fn socket_count(&self) -> usize {
+        self.socket_count.load(std::sync::atomic::Ordering::Acquire)
+    }
+
+    fn socket_identities(&self) -> Vec<crate::transport::CarrierPathIdentity> {
+        self.socket_identities
+            .lock()
+            .expect("socket identities lock")
+            .clone()
+    }
+}
+
+impl crate::transport::CarrierNetworkProvider for CountingCarrierNetworkProvider {
+    fn resolve<'a>(
+        &'a self,
+        request: crate::transport::CarrierResolutionRequest<'a>,
+    ) -> crate::transport::CarrierResolutionFuture<'a> {
+        <crate::transport::SystemCarrierNetworkProvider as crate::transport::CarrierNetworkProvider>::resolve(
+            &crate::transport::SystemCarrierNetworkProvider,
+            request,
+        )
+    }
+
+    fn create_socket(
+        &self,
+        request: crate::transport::CarrierSocketRequest<'_>,
+    ) -> std::io::Result<crate::transport::CarrierSocket> {
+        self.socket_count
+            .fetch_add(1, std::sync::atomic::Ordering::AcqRel);
+        self.socket_identities
+            .lock()
+            .expect("socket identities lock")
+            .push(request.identity);
+        crate::transport::CarrierSocket::system(request)
+    }
+}
+
+async fn ping_client_udp_stream(
+    stream: &mut crate::runtime::path::quic::client::ClientUdpDatagramStream,
+) {
+    let nonce = random_u64().expect("probe nonce");
+    crate::runtime::path::quic::io::udp_path_write_frame(
+        &mut stream.send,
+        &Frame::Ping { nonce },
+        stream.runtime.codec_limits,
+    )
+    .await
+    .expect("write UDP stream ping");
+    loop {
+        match stream.frames.recv().await.expect("UDP stream response") {
+            Ok(Frame::Pong {
+                nonce: received_nonce,
+            }) if received_nonce == nonce => break,
+            Ok(Frame::SessionReady | Frame::PathStatus { .. }) => {}
+            Ok(frame) => panic!("unexpected UDP stream frame: {frame:?}"),
+            Err(err) => panic!("UDP stream failed before pong: {err}"),
+        }
+    }
+    crate::runtime::path::quic::io::udp_path_finish_stream(&mut stream.send)
+        .expect("finish UDP ping stream");
+}
+
 fn server_carrier_identity(
     registration: &ServerCarrierPathRegistration,
 ) -> ServerCarrierPathIdentity {
@@ -579,7 +648,70 @@ async fn server_udp_listener_accepts_probe_after_noise() {
         .ping_until(tokio::time::Instant::now() + Duration::from_secs(2))
         .await
         .expect("udp ping");
-    let _ = session.close_session().await;
+    session.close().await.expect("finish UDP probe stream");
+
+    server.abort();
+    let _ = server.await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn udp_probe_prepares_cold_carrier_then_isolates_live_validation() {
+    let (path, server) = spawn_udp_server_path(OutboundConfig::Direct).await;
+    let resources = ResourceLimits::default();
+    let provider = Arc::new(CountingCarrierNetworkProvider::default());
+    let context = ClientPathContext::new_with_carrier_network(
+        vec![crate::config::ClientPathConfig {
+            spec: path,
+            security: security(),
+        }],
+        resources,
+        None,
+        Vec::new(),
+        5,
+        provider.clone(),
+    )
+    .expect("client path context");
+
+    probe_udp_client_path(&context, 0, Duration::from_secs(2))
+        .await
+        .expect("prepare cold UDP path");
+    assert_eq!(provider.socket_count(), 1);
+
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
+    let mut product_stream = context.udp_sessions[0]
+        .open_datagram_stream(deadline)
+        .await
+        .expect("open durable UDP carrier stream");
+    let product_instance = product_stream.path_instance_id;
+    ping_client_udp_stream(&mut product_stream).await;
+    assert_eq!(provider.socket_count(), 1);
+
+    probe_udp_client_path(&context, 0, Duration::from_secs(2))
+        .await
+        .expect("isolated UDP path probe");
+    assert_eq!(provider.socket_count(), 2);
+    assert_eq!(
+        provider.socket_identities(),
+        vec![
+            crate::transport::CarrierPathIdentity {
+                group_ordinal: 5,
+                path_ordinal: 0,
+            },
+            crate::transport::CarrierPathIdentity {
+                group_ordinal: 5,
+                path_ordinal: 0,
+            },
+        ],
+    );
+
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
+    let mut reused_stream = context.udp_sessions[0]
+        .open_datagram_stream(deadline)
+        .await
+        .expect("reuse durable UDP carrier");
+    assert_eq!(reused_stream.path_instance_id, product_instance);
+    assert_eq!(provider.socket_count(), 2);
+    ping_client_udp_stream(&mut reused_stream).await;
 
     server.abort();
     let _ = server.await;
@@ -886,7 +1018,7 @@ async fn fixed_response_output_learns_product_rate_from_stream_ack_batches() {
 }
 
 #[test]
-fn client_snapshot_graduates_product_progress_only_at_bulk_sample_floor() {
+fn client_snapshot_separates_product_progress_from_native_carrier_evidence() {
     let path: PathSpec = "udp://127.0.0.1:1".parse().expect("UDP path");
     let sample_floor =
         (MAX_RELIABLE_SERVICE_QUANTUM_BYTES as u64).max(PATH_OPEN_SCORE_BYTES as u64);
@@ -904,29 +1036,27 @@ fn client_snapshot_graduates_product_progress_only_at_bulk_sample_floor() {
     assert!(!point_rate.has_durable_product_progress);
     assert!(!bulk_candidate_has_bulk_rate_evidence(&path, observation));
 
-    let handed_off_observation = ClientPathObservation {
+    let mut native_observation = ClientPathObservation {
         carrier_delivery_rate_bps: Some(117_000_000.0),
         carrier_delivery_samples: 1,
         carrier_delivery_sample_bytes: sample_floor - 1,
         carrier_ack_derived_data_seen: true,
-        quic_capacity_product_admission_complete: true,
-        quic_capacity_rate_prior_fresh: true,
+        carrier_app_limited: false,
+        carrier_bulk_proof_expires_at: Some(Instant::now() + Duration::from_secs(1)),
         ..ClientPathObservation::default()
     };
-    let handed_off = path_snapshot(&path, 0, handed_off_observation);
-    assert!(handed_off.has_durable_product_progress);
+    assert!(!bulk_candidate_has_bulk_rate_evidence(
+        &path,
+        native_observation
+    ));
+    native_observation.carrier_delivery_sample_bytes = sample_floor;
+    let native = path_snapshot(&path, 0, native_observation);
+    assert!(!native.has_durable_product_progress);
     assert!(bulk_candidate_has_bulk_rate_evidence(
         &path,
-        handed_off_observation
+        native_observation
     ));
-    assert_eq!(path_model_confidence(handed_off_observation), 1.0);
-
-    let stale_rate_prior = ClientPathObservation {
-        quic_capacity_rate_prior_fresh: false,
-        ..handed_off_observation
-    };
-    assert!(path_snapshot(&path, 0, stale_rate_prior).has_durable_product_progress);
-    assert!(path_model_confidence(stale_rate_prior) < 1.0);
+    assert!(path_model_confidence(native_observation) < 1.0);
 
     observation.product_delivery_sample_bytes = sample_floor;
     let durable = path_snapshot(&path, 0, observation);
@@ -958,7 +1088,9 @@ fn data_plane_failure_invalidates_durable_product_and_native_window_authority() 
     assert_eq!(after_failure.product_delivery_sample_bytes, 0);
     assert!(after_failure.carrier_delivery_rate_bps.is_none());
     assert_eq!(after_failure.carrier_inflight_limit_bytes, 0);
-    assert!(!after_failure.quic_capacity_product_admission_complete);
+    assert_eq!(after_failure.carrier_delivery_samples, 0);
+    assert_eq!(after_failure.carrier_delivery_sample_bytes, 0);
+    assert!(!after_failure.carrier_ack_derived_data_seen);
     assert!(!path_snapshot(&path, 0, after_failure).has_durable_product_progress);
 }
 
@@ -2043,7 +2175,7 @@ fn reliable_stream_frame_queue_tracks_actual_attachment_payload() {
 }
 
 #[test]
-fn reliable_path_command_queue_tracks_inflight_budget_not_stream_limit() {
+fn reliable_path_and_tcp_command_queues_follow_carrier_backpressure_models() {
     let mux_limits = MuxLimits {
         max_payload_bytes: 1024 * 1024,
         max_ack_ranges: 256,
@@ -2214,18 +2346,12 @@ fn path_writer_coalesces_partial_bulk_run_without_delaying_full_or_empty_runs() 
 }
 
 #[test]
-fn noninterlocked_tcp_writer_run_is_one_feedback_preemption_quantum() {
+fn carrier_writer_run_batches_multiple_product_service_quanta() {
     let mux_limits = MuxLimits::default();
-    let byte_budget = reliable_noninterlocked_tcp_writer_run_budget_bytes(mux_limits);
-    let item_budget = reliable_path_command_writer_run_budget_items(mux_limits);
+    let byte_budget = reliable_path_command_writer_run_budget_bytes(mux_limits);
 
-    assert_eq!(byte_budget, MAX_RELIABLE_SERVICE_QUANTUM_BYTES);
-    assert!(!reliable_path_writer_should_coalesce_partial_bulk_run(
-        1,
-        byte_budget,
-        byte_budget,
-        item_budget,
-    ));
+    assert!(byte_budget > MAX_RELIABLE_SERVICE_QUANTUM_BYTES);
+    assert!(byte_budget <= mux_limits.max_payload_bytes);
 }
 
 #[test]

@@ -1,5 +1,7 @@
 use crate::model::path::RelayPathInstance;
-use crate::model::timing::reliable_ack_gap_reinjection_batch_lifetime;
+use crate::model::timing::{
+    reliable_data_ack_gap_persistence_interval, reliable_path_stale_interval,
+};
 use crate::mux::stream::{ReliableRecvStream, ReliableSendStream};
 use crate::protocol::frame::{normalize_offset_ranges, stream_ack_contiguous_frontier};
 use crate::protocol::{Frame, OffsetRange, UnderlayProtocol};
@@ -158,7 +160,7 @@ impl ReliableRequestPathStaleness {
             candidate,
             candidate_made_progress,
             has_reinjection_path,
-            reliable_ack_gap_reinjection_batch_lifetime(path),
+            reliable_path_stale_interval(candidate.map(|path| path.key.underlay), path),
             Instant::now(),
         )
     }
@@ -215,7 +217,7 @@ impl ReliableAckGapReinjectionProgress {
         // TCP retransmission and QUIC packet recovery remain transport-local.
         // Connection-level reinjection requires the same persistent DSN gap.
         let progress_interval = original_underlay
-            .map(|_| reliable_ack_gap_reinjection_batch_lifetime(path))
+            .map(|underlay| reliable_data_ack_gap_persistence_interval(Some(underlay), path))
             .unwrap_or_default();
         self.reinjection_ready_at(
             complete,

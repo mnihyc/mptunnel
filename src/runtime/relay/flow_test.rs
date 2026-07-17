@@ -56,7 +56,7 @@ fn historical_bulk_volume_does_not_override_live_idleness() {
 }
 
 #[test]
-fn pending_product_work_preserves_but_cannot_create_bulk_demand() {
+fn pending_product_work_preserves_but_cannot_alone_create_bulk_demand() {
     let limits = MuxLimits::default();
     let bulk_bytes = reliable_flow_bulk_threshold_bytes(None, limits).max(
         reliable_flow_rate_bulk_evidence_bytes(None, limits, u64::MAX),
@@ -71,7 +71,7 @@ fn pending_product_work_preserves_but_cannot_create_bulk_demand() {
     bulk.last_progress_at = Instant::now() - reliable_flow_interactive_idle_gap(None);
     let backpressured = bulk.refresh(
         ReliableRelayFlowSignals::new(bulk_bytes, 0)
-            .with_pending_product_bytes(reliable_relay_buffer_len(limits)),
+            .with_product_work(0, reliable_relay_buffer_len(limits)),
         None,
         limits,
     );
@@ -87,8 +87,7 @@ fn pending_product_work_preserves_but_cannot_create_bulk_demand() {
     let mut latency = ReliableRelayFlowDemandTracker::new();
     latency.last_progress_at = Instant::now() - reliable_flow_interactive_idle_gap(None);
     let recovery_only = latency.refresh(
-        ReliableRelayFlowSignals::new(0, 0)
-            .with_pending_product_bytes(reliable_relay_buffer_len(limits)),
+        ReliableRelayFlowSignals::new(0, 0).with_product_work(0, reliable_relay_buffer_len(limits)),
         None,
         limits,
     );
@@ -189,6 +188,19 @@ fn initial_window_response_stays_latency_and_does_not_preopen_additional_paths()
         !decision.preopen_additional_paths,
         "one initial window is ordinary short-flow traffic, not enough to open an additional bulk path"
     );
+
+    let mut queued = ReliableRelayFlowDemandTracker::new();
+    let queued_decision = queued.refresh(
+        ReliableRelayFlowSignals::new(PATH_OPEN_SCORE_BYTES as u64, 0)
+            .with_product_work(reliable_relay_buffer_len(limits), 0),
+        None,
+        limits,
+    );
+    assert_eq!(
+        queued_decision.lane,
+        TrafficClass::Latency,
+        "one queued initial window remains ordinary short-flow traffic"
+    );
 }
 
 #[test]
@@ -213,6 +225,54 @@ fn additional_path_preparation_uses_an_amortized_bulk_floor() {
     assert_eq!(decision.lane, TrafficClass::Latency);
     assert!(!decision.promoted_to_throughput);
     assert!(decision.preopen_additional_paths);
+
+    let mut outstanding = ReliableRelayFlowDemandTracker::new();
+    let outstanding_decision = outstanding.refresh(
+        ReliableRelayFlowSignals::new(path_open_floor, 0)
+            .with_product_work(0, reliable_relay_buffer_len(limits)),
+        None,
+        limits,
+    );
+    assert_eq!(
+        outstanding_decision.lane,
+        TrafficClass::Latency,
+        "Data-ACK-outstanding flight cannot promote throughput"
+    );
+
+    let mut residual = ReliableRelayFlowDemandTracker::new();
+    let residual_decision = residual.refresh(
+        ReliableRelayFlowSignals::new(path_open_floor, 0).with_product_work(1, 0),
+        None,
+        limits,
+    );
+    assert_eq!(
+        residual_decision.lane,
+        TrafficClass::Latency,
+        "one residual queued byte is not buffered bulk demand"
+    );
+
+    let queued_window = PATH_OPEN_SCORE_BYTES.min(reliable_relay_buffer_len(limits));
+    let mut below_window = ReliableRelayFlowDemandTracker::new();
+    let below_window_decision = below_window.refresh(
+        ReliableRelayFlowSignals::new(path_open_floor, 0)
+            .with_product_work(queued_window.saturating_sub(1), 0),
+        None,
+        limits,
+    );
+    assert_eq!(below_window_decision.lane, TrafficClass::Latency);
+
+    for mut queued in [
+        ReliableRelayFlowDemandTracker::new(),
+        ReliableRelayFlowDemandTracker::new(),
+    ] {
+        let queued_decision = queued.refresh(
+            ReliableRelayFlowSignals::new(path_open_floor, 0).with_product_work(queued_window, 0),
+            None,
+            limits,
+        );
+        assert_eq!(queued_decision.lane, TrafficClass::Throughput);
+        assert!(queued_decision.promoted_to_throughput);
+    }
 }
 
 #[test]

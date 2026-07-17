@@ -49,6 +49,93 @@ fn bulk_striping_excludes_backup_while_available_candidate_is_schedulable() {
 }
 
 #[test]
+fn validated_quic_path_remains_available_before_rate_matures() {
+    let proven = candidate(0, 100.0, 180.0, 200.0);
+    let mut validated = candidate(1, 200.0, 180.0, 1.0);
+    validated.has_path_proof_evidence = true;
+    validated.has_ack_data_evidence = false;
+    validated.has_bulk_rate_evidence = false;
+    validated.has_sender_delivery_evidence = false;
+
+    let admitted = bulk_striping_admitted_candidates(
+        [proven, validated],
+        64 * 1024,
+        MuxLimits::default(),
+        |left, right| left.index.cmp(&right.index),
+    );
+
+    assert_eq!(
+        admitted
+            .iter()
+            .map(|candidate| candidate.key.index)
+            .collect::<Vec<_>>(),
+        vec![0, 1],
+        "QUIC path validation permits ordinary startup data while native congestion control and the MPP reorder window bound flight"
+    );
+}
+
+#[test]
+fn validated_tcp_path_remains_available_before_rate_matures() {
+    let mut proven = candidate(0, 100.0, 180.0, 200.0);
+    proven.key.underlay = UnderlayProtocol::Tcp;
+    proven.snapshot.underlay = UnderlayProtocol::Tcp;
+    let mut validated = candidate(1, 200.0, 180.0, 1.0);
+    validated.key.underlay = UnderlayProtocol::Tcp;
+    validated.snapshot.underlay = UnderlayProtocol::Tcp;
+    validated.has_path_proof_evidence = true;
+    validated.has_ack_data_evidence = false;
+    validated.has_bulk_rate_evidence = false;
+    validated.has_sender_delivery_evidence = false;
+
+    let admitted = bulk_striping_admitted_candidates(
+        [proven, validated],
+        64 * 1024,
+        MuxLimits::default(),
+        |left, right| left.index.cmp(&right.index),
+    );
+
+    assert_eq!(
+        admitted
+            .iter()
+            .map(|candidate| candidate.key.index)
+            .collect::<Vec<_>>(),
+        vec![0, 1],
+        "TCP path validation permits bounded product startup while native TCP owns congestion and recovery"
+    );
+}
+
+#[test]
+fn validated_quic_path_remains_available_beside_active_unmeasured_work() {
+    let mut active = candidate(0, 100.0, 180.0, 1.0);
+    active.key.underlay = UnderlayProtocol::Tcp;
+    active.snapshot.underlay = UnderlayProtocol::Tcp;
+    active.has_bulk_rate_evidence = false;
+    active.has_sender_delivery_evidence = false;
+    active.snapshot.active_flows = 1;
+
+    let mut validated = candidate(1, 200.0, 180.0, 1.0);
+    validated.has_path_proof_evidence = true;
+    validated.has_ack_data_evidence = false;
+    validated.has_bulk_rate_evidence = false;
+    validated.has_sender_delivery_evidence = false;
+
+    let admitted = bulk_striping_admitted_candidates(
+        [active, validated],
+        64 * 1024,
+        MuxLimits::default(),
+        |left, right| left.index.cmp(&right.index),
+    );
+
+    assert_eq!(
+        admitted
+            .iter()
+            .map(|candidate| candidate.key)
+            .collect::<Vec<_>>(),
+        vec![active.key, validated.key],
+    );
+}
+
+#[test]
 fn bulk_admission_allows_same_underlay_candidate_that_beats_lead_next_quantum() {
     let admitted = bulk_striping_admitted_paths(
         vec![
@@ -86,18 +173,34 @@ fn same_underlay_candidate_with_sub_quantum_debt_still_gets_one_service_quantum(
 }
 
 #[test]
-fn cross_underlay_bulk_admission_rejects_candidate_outside_completion_horizon() {
+fn global_discovery_defers_ecf_for_every_underlay() {
+    let mut best = candidate(0, 1000.0, 250.0, 300.0);
+    best.snapshot.confidence = 1.0;
     let mut cross_underlay = candidate(1, 5000.0, 260.0, 250.0);
     cross_underlay.key.underlay = UnderlayProtocol::Tcp;
     cross_underlay.snapshot.underlay = UnderlayProtocol::Tcp;
-    let admitted = bulk_striping_admitted_paths(
-        vec![candidate(0, 1000.0, 250.0, 300.0), cross_underlay],
-        64 * 1024,
-        MuxLimits::default(),
-    );
+    cross_underlay.snapshot.confidence = 1.0;
+    let admitted =
+        bulk_striping_admitted_paths(vec![best, cross_underlay], 64 * 1024, MuxLimits::default());
 
-    assert_eq!(admitted.len(), 1);
-    assert_eq!(admitted[0].key.index, 0);
+    assert_eq!(admitted.len(), 2);
+    assert_eq!(
+        bulk_candidate_admission_suppression_with_completion_backlog(
+            BulkAdmissionCheck {
+                best_snapshot: best.snapshot,
+                best_eta_ms: best.eta_ms,
+                candidate_snapshot: cross_underlay.snapshot,
+                candidate_eta_ms: cross_underlay.eta_ms,
+                payload_bytes: 64 * 1024,
+                mux_limits: MuxLimits::default(),
+                position: BulkCandidatePosition::AdditionalPath,
+                stream_ordering_debt_bytes: 0,
+            },
+            0,
+        ),
+        Some("ecf_no_completion_gain"),
+        "the directional sender applies ECF with its exact completion backlog",
+    );
 }
 
 #[test]
@@ -116,6 +219,157 @@ fn active_tcp_product_inflight_limit_is_model_based() {
 
     assert!(limit < mux_limits.max_path_flight_bytes as u64);
     assert_eq!(limit, 625_000);
+}
+
+#[test]
+fn explicit_data_level_service_window_preserves_bounded_carrier_feed_headroom() {
+    let mut candidate = PathSnapshot::new(PathId(1), UnderlayProtocol::Udp, 80.0, mbps(1.0));
+    candidate.has_durable_product_progress = true;
+    candidate.data_level_limit_bytes = 1_000_000;
+
+    let limit = bulk_product_inflight_limit_bytes(
+        candidate,
+        64 * 1024,
+        MuxLimits::default(),
+        BulkCandidatePosition::AdditionalPath,
+    );
+
+    assert_eq!(
+        limit, 1_000_000,
+        "admission must honor the capacity model's already-bounded carrier feed window"
+    );
+}
+
+#[test]
+fn tcp_frontier_owner_obeys_data_sequence_service_window() {
+    let mux_limits = MuxLimits {
+        max_path_flight_bytes: 64 * 1024 * 1024,
+        max_reorder_bytes: 64 * 1024 * 1024,
+        max_stream_window_bytes: 64 * 1024 * 1024,
+        ..MuxLimits::default()
+    };
+    let payload = 64 * 1024;
+    let mut active = candidate(0, 10.0, 50.0, 80.0);
+    active.key.underlay = UnderlayProtocol::Tcp;
+    active.snapshot.underlay = UnderlayProtocol::Tcp;
+    active.snapshot.carrier_inflight_limit_bytes = 512 * 1024;
+    active.snapshot.bytes_in_flight = 256 * 1024;
+    active.snapshot.queue_bytes = 256 * 1024;
+    let service_window = 1024 * 1024_u64;
+    active.snapshot.has_durable_product_progress = true;
+    active.snapshot.data_level_limit_bytes = service_window;
+    active.snapshot.data_level_bytes_in_flight = service_window - payload as u64;
+
+    assert_eq!(
+        bulk_candidate_admission_suppression_with_ordering_debt(BulkAdmissionCheck {
+            best_snapshot: active.snapshot,
+            best_eta_ms: active.eta_ms,
+            candidate_snapshot: active.snapshot,
+            candidate_eta_ms: active.eta_ms,
+            payload_bytes: payload,
+            mux_limits,
+            position: BulkCandidatePosition::FirstPath,
+            stream_ordering_debt_bytes: 0,
+        }),
+        None,
+        "the contiguous TCP owner remains schedulable within measured service credit"
+    );
+
+    active.snapshot.data_level_bytes_in_flight = service_window;
+    assert_eq!(
+        bulk_candidate_admission_suppression_with_ordering_debt(BulkAdmissionCheck {
+            best_snapshot: active.snapshot,
+            best_eta_ms: active.eta_ms,
+            candidate_snapshot: active.snapshot,
+            candidate_eta_ms: active.eta_ms,
+            payload_bytes: payload,
+            mux_limits,
+            position: BulkCandidatePosition::FirstPath,
+            stream_ordering_debt_bytes: 0,
+        }),
+        Some("inflight_limit"),
+        "contiguous ownership cannot mint Data Sequence credit beyond the service window"
+    );
+
+    active.snapshot.has_durable_product_progress = true;
+    active.snapshot.data_level_limit_bytes = service_window * 2;
+    assert_eq!(
+        bulk_candidate_admission_suppression_with_ordering_debt(BulkAdmissionCheck {
+            best_snapshot: active.snapshot,
+            best_eta_ms: active.eta_ms,
+            candidate_snapshot: active.snapshot,
+            candidate_eta_ms: active.eta_ms,
+            payload_bytes: payload,
+            mux_limits,
+            position: BulkCandidatePosition::FirstPath,
+            stream_ordering_debt_bytes: 0,
+        }),
+        None,
+        "measured Data ACK service growth must reopen placement without reclassifying the path"
+    );
+}
+
+#[test]
+fn quic_frontier_owner_obeys_data_sequence_service_window() {
+    let mux_limits = MuxLimits {
+        max_path_flight_bytes: 64 * 1024 * 1024,
+        max_reorder_bytes: 64 * 1024 * 1024,
+        max_stream_window_bytes: 64 * 1024 * 1024,
+        ..MuxLimits::default()
+    };
+    let payload = 64 * 1024;
+    let mut active = candidate(0, 10.0, 50.0, 80.0);
+    let service_window = 1024 * 1024_u64;
+    active.snapshot.has_durable_product_progress = true;
+    active.snapshot.data_level_limit_bytes = service_window;
+    active.snapshot.data_level_bytes_in_flight = service_window - payload as u64;
+
+    assert_eq!(
+        bulk_candidate_admission_suppression_with_ordering_debt(BulkAdmissionCheck {
+            best_snapshot: active.snapshot,
+            best_eta_ms: active.eta_ms,
+            candidate_snapshot: active.snapshot,
+            candidate_eta_ms: active.eta_ms,
+            payload_bytes: payload,
+            mux_limits,
+            position: BulkCandidatePosition::FirstPath,
+            stream_ordering_debt_bytes: 0,
+        }),
+        None,
+        "the contiguous QUIC owner may feed within its data-level service window"
+    );
+
+    active.snapshot.data_level_bytes_in_flight = service_window;
+    assert_eq!(
+        bulk_candidate_admission_suppression_with_ordering_debt(BulkAdmissionCheck {
+            best_snapshot: active.snapshot,
+            best_eta_ms: active.eta_ms,
+            candidate_snapshot: active.snapshot,
+            candidate_eta_ms: active.eta_ms,
+            payload_bytes: payload,
+            mux_limits,
+            position: BulkCandidatePosition::FirstPath,
+            stream_ordering_debt_bytes: 0,
+        }),
+        Some("inflight_limit"),
+        "native QUIC backpressure and Data Sequence ownership remain separate bounded resources"
+    );
+
+    active.snapshot.data_level_limit_bytes = service_window * 2;
+    assert_eq!(
+        bulk_candidate_admission_suppression_with_ordering_debt(BulkAdmissionCheck {
+            best_snapshot: active.snapshot,
+            best_eta_ms: active.eta_ms,
+            candidate_snapshot: active.snapshot,
+            candidate_eta_ms: active.eta_ms,
+            payload_bytes: payload,
+            mux_limits,
+            position: BulkCandidatePosition::FirstPath,
+            stream_ordering_debt_bytes: 0,
+        }),
+        None,
+        "measured Data ACK service growth must reopen QUIC placement without fixed path classification"
+    );
 }
 
 #[test]
@@ -353,200 +607,6 @@ fn active_tcp_service_with_latency_pressure_caps_total_owner_credit() {
 }
 
 #[test]
-fn app_limited_service_progress_uses_product_envelope_for_clear_frontier_owner() {
-    let mux_limits = MuxLimits {
-        max_path_flight_bytes: 64 * 1024 * 1024,
-        max_reorder_bytes: 64 * 1024 * 1024,
-        ..MuxLimits::default()
-    };
-    let payload = 64 * 1024;
-    let mut active = PathSnapshot::new(PathId(1), UnderlayProtocol::Tcp, 333.0, mbps(0.351));
-    active.pacing_rate_bps = mbps(0.351);
-    active.product_progress_rate_bps = Some(mbps(0.288));
-    active.data_level_bytes_in_flight = 3_670_016;
-    active.data_level_queue_bytes = 512 * 1024;
-    active.queue_bytes = 0;
-    active.carrier_inflight_limit_bytes = 0;
-    active.confidence = 1.0;
-    active.app_limited = true;
-
-    assert_eq!(
-        bulk_candidate_admission_suppression(
-            active,
-            73_038.285,
-            active,
-            73_038.285,
-            payload,
-            mux_limits,
-            BulkCandidatePosition::FirstPath,
-        ),
-        None,
-        "app-limited product progress must not shrink a clear-frontier leading path owner below the product envelope"
-    );
-}
-
-#[test]
-fn app_limited_udp_service_progress_does_not_shrink_below_startup_headroom() {
-    let mux_limits = MuxLimits {
-        max_path_flight_bytes: 64 * 1024 * 1024,
-        max_reorder_bytes: 64 * 1024 * 1024,
-        ..MuxLimits::default()
-    };
-    let payload = 64 * 1024;
-    let observed_rate_bps = mbps(57.0);
-    let mut active = PathSnapshot::new(PathId(0), UnderlayProtocol::Udp, 60.0, observed_rate_bps);
-    active.pacing_rate_bps = mbps(1_500.0);
-    active.delivery_rate_bps = observed_rate_bps;
-    active.product_progress_rate_bps = Some(observed_rate_bps);
-    active.app_limited = true;
-    active.data_level_bytes_in_flight =
-        bulk_pipe_window_bytes(bulk_rate_bdp_bytes(observed_rate_bps, active.srtt_ms));
-
-    assert_eq!(
-        bulk_candidate_admission_suppression(
-            active,
-            10.0,
-            active,
-            10.0,
-            payload,
-            mux_limits,
-            BulkCandidatePosition::FirstPath,
-        ),
-        None,
-        "an app-limited active leading path path should not be shrunk below startup headroom; additional paths and ordering-debt paths own the receive-hole risk"
-    );
-}
-
-#[test]
-fn active_udp_service_under_latency_pressure_keeps_bounded_headroom_after_failover() {
-    let mux_limits = MuxLimits {
-        max_path_flight_bytes: 64 * 1024 * 1024,
-        max_reorder_bytes: 64 * 1024 * 1024,
-        ..MuxLimits::default()
-    };
-    let payload = 64 * 1024;
-    let mut active = PathSnapshot::new(PathId(0), UnderlayProtocol::Udp, 47.643, mbps(71.713));
-    active.pacing_rate_bps = mbps(73.287);
-    active.data_level_bytes_in_flight = 2_049_152;
-    active.data_level_queue_bytes = 458_752;
-    active.queue_bytes = 14_600;
-    active.carrier_inflight_limit_bytes = 30_570;
-    active.active_latency_sensitive_flows = 1;
-    active.confidence = 1.0;
-    active.app_limited = true;
-
-    assert_eq!(
-        bulk_candidate_admission_suppression(
-            active,
-            398.634,
-            active,
-            398.634,
-            payload,
-            mux_limits,
-            BulkCandidatePosition::FirstPath,
-        ),
-        None,
-        "latency pressure must keep the leading path preemptible, but not suppress a measured active UDP leading path with only bounded post-failover feed debt"
-    );
-}
-
-#[test]
-fn tiny_app_limited_service_progress_uses_stable_service_horizon() {
-    let mux_limits = MuxLimits {
-        max_path_flight_bytes: 64 * 1024 * 1024,
-        max_reorder_bytes: 64 * 1024 * 1024,
-        ..MuxLimits::default()
-    };
-    let payload = 64 * 1024;
-    let mut active = PathSnapshot::new(PathId(0), UnderlayProtocol::Tcp, 333.0, mbps(0.351));
-    active.pacing_rate_bps = mbps(0.351);
-    active.delivery_rate_bps = mbps(0.351);
-    active.product_progress_rate_bps = Some(mbps(0.351));
-    active.data_level_bytes_in_flight = 1_048_576;
-    active.data_level_queue_bytes = 0;
-    active.queue_bytes = 0;
-    active.app_limited = true;
-    active.confidence = 0.1;
-
-    assert_eq!(
-        bulk_candidate_admission_suppression(
-            active,
-            72_439.0,
-            active,
-            72_439.0,
-            payload,
-            mux_limits,
-            BulkCandidatePosition::FirstPath,
-        ),
-        None,
-        "tiny app-limited progress is not bulk-rate proof, but the clear-frontier leading path owner may still use the stable service horizon because it cannot create a cross-path stream hole"
-    );
-}
-
-#[test]
-fn pre_progress_service_startup_uses_stable_service_horizon() {
-    let mux_limits = MuxLimits {
-        max_path_flight_bytes: 64 * 1024 * 1024,
-        max_reorder_bytes: 64 * 1024 * 1024,
-        ..MuxLimits::default()
-    };
-    let payload = 64 * 1024;
-    let mut active = PathSnapshot::new(PathId(0), UnderlayProtocol::Tcp, 333.0, mbps(0.351));
-    active.pacing_rate_bps = mbps(0.351);
-    active.delivery_rate_bps = mbps(0.351);
-    active.product_progress_rate_bps = None;
-    active.data_level_bytes_in_flight = 1_048_576;
-    active.app_limited = true;
-
-    assert_eq!(
-        bulk_candidate_admission_suppression(
-            active,
-            72_439.0,
-            active,
-            72_439.0,
-            payload,
-            mux_limits,
-            BulkCandidatePosition::FirstPath,
-        ),
-        None,
-        "before product progress exists, a clear-frontier leading path owner should still get the stable service horizon; sender credit and stream flow control remain the safety gates"
-    );
-}
-
-#[test]
-fn sub_quantum_service_tail_uses_stable_service_horizon_under_latency_pressure() {
-    let mux_limits = MuxLimits {
-        max_path_flight_bytes: 64 * 1024 * 1024,
-        max_reorder_bytes: 64 * 1024 * 1024,
-        ..MuxLimits::default()
-    };
-    let payload = 1_896;
-    let mut active = PathSnapshot::new(PathId(1), UnderlayProtocol::Tcp, 333.0, mbps(0.351));
-    active.pacing_rate_bps = mbps(0.351);
-    active.delivery_rate_bps = mbps(0.351);
-    active.product_progress_rate_bps = Some(mbps(0.351));
-    active.data_level_bytes_in_flight = 773_728;
-    active.data_level_queue_bytes = payload as u64;
-    active.active_latency_sensitive_flows = 1;
-    active.app_limited = true;
-    active.confidence = 0.0;
-
-    assert_eq!(
-        bulk_candidate_admission_suppression(
-            active,
-            8_870.050,
-            active,
-            8_870.050,
-            payload,
-            mux_limits,
-            BulkCandidatePosition::FirstPath,
-        ),
-        None,
-        "a tiny tail payload must not shrink the active leading path horizon below the normal feed quantum and deadlock stream completion under latency pressure"
-    );
-}
-
-#[test]
 fn active_udp_owner_with_clear_frontier_uses_product_envelope_not_carrier_cwnd() {
     let mux_limits = MuxLimits {
         max_path_flight_bytes: 32 * 1024 * 1024,
@@ -745,7 +805,7 @@ fn cross_underlay_product_inflight_limit_is_bdp_modeled() {
         candidate,
         64 * 1024,
         mux_limits,
-        BulkCandidatePosition::AdditionalCrossUnderlay,
+        BulkCandidatePosition::AdditionalPath,
     );
 
     assert!(limit < mux_limits.max_path_flight_bytes as u64);
@@ -753,18 +813,47 @@ fn cross_underlay_product_inflight_limit_is_bdp_modeled() {
 }
 
 #[test]
-fn same_underlay_candidate_must_not_join_only_because_reorder_budget_can_absorb_gap() {
-    let admitted = bulk_striping_admitted_paths(
-        vec![
-            candidate(0, 2958.0, 80.0, 180.0),
-            candidate(1, 3202.0, 180.0, 220.0),
-        ],
-        64 * 1024,
-        MuxLimits::default(),
-    );
+fn product_inflight_model_uses_delivery_not_transient_pacing_gain() {
+    let mux_limits = MuxLimits::default();
+    let mut candidate = PathSnapshot::new(PathId(0), UnderlayProtocol::Udp, 360.0, mbps(20.0));
+    candidate.pacing_rate_bps = mbps(700.0);
+    candidate.has_durable_product_progress = true;
 
-    assert_eq!(admitted.len(), 1);
-    assert_eq!(admitted[0].key.index, 0);
+    assert_eq!(
+        bulk_product_inflight_limit_bytes(
+            candidate,
+            64 * 1024,
+            mux_limits,
+            BulkCandidatePosition::AdditionalPath,
+        ),
+        1_800_000,
+    );
+}
+
+#[test]
+fn global_same_underlay_eligibility_defers_completion_to_the_stream_scheduler() {
+    let mut best = candidate(0, 2958.0, 80.0, 180.0);
+    let mut alternate = candidate(1, 3202.0, 180.0, 220.0);
+    best.snapshot.confidence = 1.0;
+    alternate.snapshot.confidence = 1.0;
+    let admitted =
+        bulk_striping_admitted_paths(vec![best, alternate], 64 * 1024, MuxLimits::default());
+
+    assert_eq!(admitted.len(), 2);
+    assert_eq!(
+        bulk_candidate_admission_suppression_with_ordering_debt(BulkAdmissionCheck {
+            best_snapshot: best.snapshot,
+            best_eta_ms: best.eta_ms,
+            candidate_snapshot: alternate.snapshot,
+            candidate_eta_ms: alternate.eta_ms,
+            payload_bytes: 64 * 1024,
+            mux_limits: MuxLimits::default(),
+            position: BulkCandidatePosition::AdditionalPath,
+            stream_ordering_debt_bytes: 0,
+        }),
+        Some("ecf_no_completion_gain"),
+        "the sender still applies ECF once it owns the exact stream backlog",
+    );
 }
 
 #[test]
@@ -782,12 +871,12 @@ fn bulk_admission_rejects_candidate_that_would_exceed_product_inflight_limit() {
 }
 
 #[test]
-fn additional_path_reorder_budget_is_not_floored_to_product_inflight_limit() {
+fn additional_path_uses_the_shared_stream_reorder_envelope() {
     let best = candidate(0, 100.0, 50.0, 500.0);
     let mut extra = candidate(1, 100.0, 50.0, 50.0);
-    extra.snapshot.confidence = 1.0;
+    extra.snapshot.confidence = 0.1;
     extra.snapshot.carrier_inflight_limit_bytes = MuxLimits::default().max_path_flight_bytes as u64;
-    extra.snapshot.bytes_in_flight = 1024 * 1024;
+    extra.snapshot.bytes_in_flight = 128 * 1024;
 
     assert_eq!(
         bulk_candidate_admission_suppression(
@@ -797,57 +886,15 @@ fn additional_path_reorder_budget_is_not_floored_to_product_inflight_limit() {
             extra.eta_ms,
             64 * 1024,
             MuxLimits::default(),
-            BulkCandidatePosition::AdditionalCrossUnderlay,
+            BulkCandidatePosition::AdditionalPath,
         ),
-        Some("reorder_budget")
+        None,
+        "per-path flight is bounded independently from the shared stream reorder envelope",
     );
 }
 
 #[test]
-fn high_confidence_quic_window_needs_product_progress_before_expanding_product_authority() {
-    let mux_limits = MuxLimits::default();
-    let payload_bytes = 64 * 1024;
-    let mut proof_only = PathSnapshot::new(PathId(1), UnderlayProtocol::Udp, 360.0, mbps(18.0));
-    proof_only.pacing_rate_bps = mbps(500.0);
-
-    let receipt_rate_inflight_target =
-        bulk_same_underlay_product_authority_bytes(proof_only, payload_bytes, mux_limits);
-    assert_eq!(receipt_rate_inflight_target, 1_620_000);
-
-    proof_only.carrier_inflight_limit_bytes = 7 * 1024 * 1024;
-    assert_eq!(
-        bulk_same_underlay_product_authority_bytes(proof_only, payload_bytes, mux_limits),
-        receipt_rate_inflight_target,
-        "strict carrier pacing is not product authority with or without a native window"
-    );
-    assert!(receipt_rate_inflight_target < proof_only.carrier_inflight_limit_bytes);
-
-    proof_only.confidence = 0.1;
-    assert_eq!(
-        bulk_same_underlay_product_authority_bytes(proof_only, payload_bytes, mux_limits),
-        proof_only.carrier_inflight_limit_bytes,
-        "the explicit startup epoch retains its native-window allowance"
-    );
-
-    proof_only.confidence = 1.0;
-    proof_only.product_progress_rate_bps = Some(mbps(18.0));
-    assert_eq!(
-        bulk_same_underlay_product_authority_bytes(proof_only, payload_bytes, mux_limits),
-        receipt_rate_inflight_target,
-        "one exact product ACK is not yet durable window authority"
-    );
-
-    proof_only.has_durable_product_progress = true;
-    proof_only.product_progress_rate_bps = None;
-    assert_eq!(
-        bulk_same_underlay_product_authority_bytes(proof_only, payload_bytes, mux_limits),
-        proof_only.carrier_inflight_limit_bytes,
-        "durable product bytes may couple the native window without a point rate"
-    );
-}
-
-#[test]
-fn quic_same_underlay_separates_candidate_credit_from_stream_reorder_envelope() {
+fn same_underlay_data_ack_debt_does_not_reconsume_released_carrier_credit() {
     let mux_limits = MuxLimits {
         max_path_flight_bytes: 64 * 1024 * 1024,
         max_reorder_bytes: 64 * 1024 * 1024,
@@ -855,53 +902,58 @@ fn quic_same_underlay_separates_candidate_credit_from_stream_reorder_envelope() 
         ..MuxLimits::default()
     };
     let payload_bytes = 64 * 1024;
-    let mut proof_only = PathSnapshot::new(PathId(1), UnderlayProtocol::Udp, 180.0, mbps(18.3));
-    proof_only.confidence = 0.2;
-    proof_only.carrier_inflight_limit_bytes = 8_835_877;
+    let best = candidate(0, 100.0, 180.0, 500.0);
+    let mut extra = candidate(1, 200.0, 180.0, 18.3);
+    extra.snapshot.confidence = 0.2;
+    extra.snapshot.app_limited = true;
+    extra.snapshot.carrier_inflight_limit_bytes = 244_376;
+    extra.snapshot.bytes_in_flight = 0;
+    extra.snapshot.queue_bytes = 0;
+    extra.snapshot.data_level_bytes_in_flight = 262_144;
 
-    assert!(bulk_candidate_within_reorder_budget(
-        proof_only,
-        payload_bytes,
-        mux_limits,
-        BulkCandidatePosition::AdditionalSameUnderlay,
-        16_580_396,
-    ));
-
-    proof_only.data_level_bytes_in_flight = proof_only.carrier_inflight_limit_bytes;
-    assert!(
-        !bulk_candidate_within_reorder_budget(
-            proof_only,
+    assert_eq!(
+        bulk_candidate_admission_suppression_with_ordering_debt(BulkAdmissionCheck {
+            best_snapshot: best.snapshot,
+            best_eta_ms: best.eta_ms,
+            candidate_snapshot: extra.snapshot,
+            candidate_eta_ms: extra.eta_ms,
             payload_bytes,
             mux_limits,
-            BulkCandidatePosition::AdditionalSameUnderlay,
-            0,
-        ),
-        "foreign debt no longer consumes local credit, but candidate-owned bytes still do"
+            position: BulkCandidatePosition::AdditionalPath,
+            stream_ordering_debt_bytes: 0,
+        }),
+        None,
+        "Data-ACK-pending bytes must not consume a congestion window already released by native ACKs"
     );
 
-    proof_only.data_level_bytes_in_flight = 0;
-    assert!(
-        !bulk_candidate_within_reorder_budget(
-            proof_only,
+    assert_eq!(
+        bulk_candidate_admission_suppression_with_ordering_debt(BulkAdmissionCheck {
+            best_snapshot: best.snapshot,
+            best_eta_ms: best.eta_ms,
+            candidate_snapshot: extra.snapshot,
+            candidate_eta_ms: extra.eta_ms,
             payload_bytes,
             mux_limits,
-            BulkCandidatePosition::AdditionalSameUnderlay,
-            mux_limits.max_reorder_bytes as u64,
-        ),
-        "local credit does not permit the aggregate receive hole to exceed its stream envelope"
+            position: BulkCandidatePosition::AdditionalPath,
+            stream_ordering_debt_bytes: mux_limits.max_reorder_bytes as u64,
+        }),
+        Some("reorder_budget"),
+        "released carrier credit cannot exceed the connection-wide receive-hole envelope"
     );
 }
 
 #[test]
-fn app_limited_tcp_active_path_uses_service_headroom_until_backpressured() {
+fn cached_tcp_send_window_does_not_mint_data_sequence_credit() {
     let best = candidate(0, 100.0, 50.0, 500.0);
     let mut active = candidate(0, 100.0, 50.0, 0.35);
     active.snapshot.underlay = UnderlayProtocol::Tcp;
     active.snapshot.confidence = 0.1;
     active.snapshot.app_limited = true;
-    active.snapshot.bytes_in_flight = 8 * 1024 * 1024;
+    active.snapshot.carrier_inflight_limit_bytes = 512 * 1024;
+    active.snapshot.bytes_in_flight = 256 * 1024;
+    active.snapshot.queue_bytes = 256 * 1024;
     active.snapshot.data_level_bytes_in_flight = 8 * 1024 * 1024;
-    active.snapshot.product_progress_rate_bps = Some(mbps(1_000.0));
+    active.snapshot.product_progress_rate_bps = None;
 
     assert_eq!(
         bulk_candidate_admission_suppression(
@@ -913,7 +965,8 @@ fn app_limited_tcp_active_path_uses_service_headroom_until_backpressured() {
             MuxLimits::default(),
             BulkCandidatePosition::FirstPath,
         ),
-        None
+        Some("inflight_limit"),
+        "cached native telemetry may rank a path but cannot authorize unique Data Sequence bytes"
     );
 }
 
@@ -944,85 +997,6 @@ fn tcp_active_service_under_bulk_demand_is_not_starved_by_latency_pressure_flag(
 }
 
 #[test]
-fn tcp_active_service_partial_quantum_does_not_shrink_feed_window() {
-    let payload = 45_536;
-    let mut active = PathSnapshot::new(PathId(0), UnderlayProtocol::Tcp, 333.0, mbps(0.351));
-    active.pacing_rate_bps = mbps(0.351);
-    active.data_level_bytes_in_flight = 686_088;
-    active.data_level_queue_bytes = payload as u64;
-    active.product_progress_rate_bps = Some(mbps(0.351));
-    active.confidence = 0.1;
-    active.app_limited = true;
-
-    assert_eq!(
-        bulk_candidate_admission_suppression(
-            active,
-            41_548.284,
-            active,
-            41_548.284,
-            payload,
-            MuxLimits::default(),
-            BulkCandidatePosition::FirstPath,
-        ),
-        None,
-        "a partial local read quantum must not reduce the active leading path owner feed window below the stable service horizon"
-    );
-}
-
-#[test]
-fn tcp_active_service_startup_uses_stable_service_horizon_before_bulk_samples() {
-    let payload = 64 * 1024;
-    let mut active = PathSnapshot::new(PathId(0), UnderlayProtocol::Tcp, 333.0, mbps(0.351));
-    active.pacing_rate_bps = mbps(0.351);
-    active.data_level_bytes_in_flight = 906_488;
-    active.data_level_queue_bytes = 393_216;
-    active.product_progress_rate_bps = Some(mbps(0.351));
-    active.confidence = 0.1;
-    active.app_limited = true;
-
-    assert_eq!(
-        bulk_candidate_admission_suppression(
-            active,
-            57_439.409,
-            active,
-            57_439.409,
-            payload,
-            MuxLimits::default(),
-            BulkCandidatePosition::FirstPath,
-        ),
-        None,
-        "a clear-frontier leading path owner should ramp within the stable service horizon instead of being trapped below a tiny startup feedback window"
-    );
-}
-
-#[test]
-fn tcp_active_service_startup_allows_pipe_headroom_over_service_horizon() {
-    let payload = 64 * 1024;
-    let mut active = PathSnapshot::new(PathId(0), UnderlayProtocol::Tcp, 333.0, mbps(0.351));
-    active.pacing_rate_bps = mbps(0.351);
-    active.queue_bytes = 262_144;
-    active.data_level_bytes_in_flight = 1_561_848;
-    active.data_level_queue_bytes = 393_216;
-    active.product_progress_rate_bps = Some(mbps(0.351));
-    active.confidence = 0.1;
-    active.app_limited = true;
-
-    assert_eq!(
-        bulk_candidate_admission_suppression(
-            active,
-            63_418.447,
-            active,
-            63_418.447,
-            payload,
-            MuxLimits::default(),
-            BulkCandidatePosition::FirstPath,
-        ),
-        None,
-        "active leading path feed may use rate/RTT pipe headroom above the preemptible service horizon so a healthy path can leave startup"
-    );
-}
-
-#[test]
 fn tcp_active_service_app_limited_progress_does_not_shrink_below_startup_headroom() {
     let payload = 64 * 1024;
     let mut active = PathSnapshot::new(PathId(0), UnderlayProtocol::Tcp, 333.0, mbps(9.522));
@@ -1046,33 +1020,6 @@ fn tcp_active_service_app_limited_progress_does_not_shrink_below_startup_headroo
         ),
         None,
         "app-limited progress on the leading path owner is ACK-clock visibility, not a reason to shrink the leading path feed below startup headroom"
-    );
-}
-
-#[test]
-fn tcp_active_service_clear_frontier_uses_product_envelope_not_modeled_bdp_cap() {
-    let payload = 64 * 1024;
-    let mut active = PathSnapshot::new(PathId(0), UnderlayProtocol::Tcp, 333.0, mbps(25.404));
-    active.pacing_rate_bps = mbps(25.404);
-    active.delivery_rate_bps = mbps(25.404);
-    active.product_progress_rate_bps = Some(mbps(25.404));
-    active.data_level_bytes_in_flight = 4_128_768;
-    active.data_level_queue_bytes = 458_752;
-    active.confidence = 1.0;
-    active.app_limited = true;
-
-    assert_eq!(
-        bulk_candidate_admission_suppression(
-            active,
-            971.380,
-            active,
-            971.380,
-            payload,
-            MuxLimits::default(),
-            BulkCandidatePosition::FirstPath,
-        ),
-        None,
-        "clear-frontier leading path owner admission should be bounded by product resource envelopes, not a low modeled BDP cap created by prior starvation"
     );
 }
 
@@ -1218,6 +1165,7 @@ fn product_inflight_limit_is_modeled_limit_capped_by_configured_ceiling() {
     let best = candidate(0, 100.0, 50.0, 500.0);
     let mut constrained = candidate(1, 100.1, 50.0, 10.0);
     constrained.snapshot.confidence = 1.0;
+    constrained.snapshot.has_durable_product_progress = true;
     constrained.snapshot.carrier_inflight_limit_bytes = 64 * 1024;
     constrained.snapshot.bytes_in_flight = 128 * 1024;
 
@@ -1229,7 +1177,7 @@ fn product_inflight_limit_is_modeled_limit_capped_by_configured_ceiling() {
             constrained.eta_ms,
             16 * 1024,
             MuxLimits::default(),
-            BulkCandidatePosition::AdditionalCrossUnderlay,
+            BulkCandidatePosition::AdditionalPath,
         ),
         Some("inflight_limit")
     );
@@ -1330,7 +1278,7 @@ fn udp_single_flow_lead_uses_product_gate_not_carrier_queue_gate() {
 }
 
 #[test]
-fn udp_cross_underlay_extra_path_uses_carrier_queue_gate() {
+fn udp_cross_underlay_does_not_reuse_cached_native_credit_as_data_level_gate() {
     let best = candidate(0, 100.0, 50.0, 500.0);
     let mut extra = candidate(1, 100.0, 50.0, 500.0);
     extra.snapshot.confidence = 1.0;
@@ -1345,9 +1293,10 @@ fn udp_cross_underlay_extra_path_uses_carrier_queue_gate() {
             extra.eta_ms,
             64 * 1024,
             MuxLimits::default(),
-            BulkCandidatePosition::AdditionalCrossUnderlay,
+            BulkCandidatePosition::AdditionalPath,
         ),
-        Some("inflight_limit")
+        None,
+        "a cached congestion window is feed geometry, not MPP Data Sequence authority"
     );
 }
 
@@ -1380,14 +1329,14 @@ fn udp_active_path_without_carrier_limit_uses_modeled_credit() {
             startup.eta_ms,
             64 * 1024,
             MuxLimits::default(),
-            BulkCandidatePosition::AdditionalCrossUnderlay,
+            BulkCandidatePosition::AdditionalPath,
         ),
         Some("inflight_limit")
     );
 }
 
 #[test]
-fn same_underlay_extra_path_uses_ack_clocked_budget_not_tiny_probe_budget() {
+fn additional_path_uses_shared_reorder_envelope_not_probe_confidence() {
     let best = candidate(0, 100.0, 50.0, 500.0);
     let mut extra = candidate(1, 50.0, 50.0, 50.0);
     extra.snapshot.confidence = 0.1;
@@ -1401,26 +1350,15 @@ fn same_underlay_extra_path_uses_ack_clocked_budget_not_tiny_probe_budget() {
             extra.eta_ms,
             64 * 1024,
             MuxLimits::default(),
-            BulkCandidatePosition::AdditionalSameUnderlay,
+            BulkCandidatePosition::AdditionalPath,
         ),
-        None
-    );
-    assert_eq!(
-        bulk_candidate_admission_suppression(
-            best.snapshot,
-            best.eta_ms,
-            extra.snapshot,
-            extra.eta_ms,
-            64 * 1024,
-            MuxLimits::default(),
-            BulkCandidatePosition::AdditionalCrossUnderlay,
-        ),
-        Some("reorder_budget")
+        None,
+        "confidence affects completion evidence, not the connection-wide reorder resource",
     );
 }
 
 #[test]
-fn tcp_path_state_uses_global_reorder_envelope_not_its_local_pipe_budget() {
+fn tcp_path_uses_separate_path_flight_and_connection_reorder_windows() {
     let mux_limits = MuxLimits {
         max_path_flight_bytes: 64 * 1024 * 1024,
         max_reorder_bytes: 64 * 1024 * 1024,
@@ -1443,7 +1381,7 @@ fn tcp_path_state_uses_global_reorder_envelope_not_its_local_pipe_budget() {
             candidate_eta_ms: extra.eta_ms,
             payload_bytes,
             mux_limits,
-            position: BulkCandidatePosition::AdditionalSameUnderlay,
+            position: BulkCandidatePosition::AdditionalPath,
             stream_ordering_debt_bytes: 40 * 1024 * 1024,
         }),
         None,
@@ -1459,7 +1397,7 @@ fn tcp_path_state_uses_global_reorder_envelope_not_its_local_pipe_budget() {
             candidate_eta_ms: extra.eta_ms,
             payload_bytes,
             mux_limits,
-            position: BulkCandidatePosition::AdditionalSameUnderlay,
+            position: BulkCandidatePosition::AdditionalPath,
             stream_ordering_debt_bytes: 0,
         }),
         Some("inflight_limit"),
@@ -1475,7 +1413,7 @@ fn tcp_path_state_uses_global_reorder_envelope_not_its_local_pipe_budget() {
             candidate_eta_ms: extra.eta_ms,
             payload_bytes,
             mux_limits,
-            position: BulkCandidatePosition::AdditionalSameUnderlay,
+            position: BulkCandidatePosition::AdditionalPath,
             stream_ordering_debt_bytes: 64 * 1024 * 1024,
         }),
         Some("reorder_budget"),
@@ -1484,7 +1422,62 @@ fn tcp_path_state_uses_global_reorder_envelope_not_its_local_pipe_budget() {
 }
 
 #[test]
-fn same_underlay_startup_probe_is_not_rejected_by_app_limited_completion_horizon() {
+fn cold_tcp_same_underlay_candidate_uses_bounded_startup_flight_with_an_existing_hole() {
+    let mut lead = candidate(0, 1_530_000.0, 50.0, 0.35);
+    let mut extra = candidate(1, 3_060_000.0, 50.0, 0.35);
+    lead.snapshot.underlay = UnderlayProtocol::Tcp;
+    extra.snapshot.underlay = UnderlayProtocol::Tcp;
+    lead.snapshot.confidence = 0.1;
+    lead.snapshot.app_limited = true;
+    extra.snapshot.confidence = 0.1;
+    extra.snapshot.app_limited = true;
+
+    assert_eq!(
+        bulk_candidate_admission_suppression_with_ordering_debt(BulkAdmissionCheck {
+            best_snapshot: lead.snapshot,
+            best_eta_ms: lead.eta_ms,
+            candidate_snapshot: extra.snapshot,
+            candidate_eta_ms: extra.eta_ms,
+            payload_bytes: 64 * 1024,
+            mux_limits: MuxLimits::default(),
+            position: BulkCandidatePosition::AdditionalPath,
+            stream_ordering_debt_bytes: 512 * 1024,
+        }),
+        None,
+        "an unmeasured candidate can acquire only its separately bounded startup service"
+    );
+}
+
+#[test]
+fn app_limited_tcp_path_can_join_when_it_beats_lead_completion() {
+    let mut lead = candidate(0, 1_061.5, 180.0, 192.5);
+    let mut extra = candidate(1, 1_094.8, 180.0, 23.0);
+    lead.snapshot.underlay = UnderlayProtocol::Tcp;
+    extra.snapshot.underlay = UnderlayProtocol::Tcp;
+    extra.snapshot.confidence = 1.0;
+    extra.snapshot.app_limited = true;
+    extra.snapshot.has_durable_product_progress = true;
+    extra.snapshot.data_level_limit_bytes = 3 * 1024 * 1024;
+    extra.snapshot.data_level_bytes_in_flight = 2 * 1024 * 1024;
+
+    assert_eq!(
+        bulk_candidate_admission_suppression_with_ordering_debt(BulkAdmissionCheck {
+            best_snapshot: lead.snapshot,
+            best_eta_ms: lead.eta_ms,
+            candidate_snapshot: extra.snapshot,
+            candidate_eta_ms: extra.eta_ms,
+            payload_bytes: 64 * 1024,
+            mux_limits: MuxLimits::default(),
+            position: BulkCandidatePosition::AdditionalPath,
+            stream_ordering_debt_bytes: 28 * 1024 * 1024,
+        }),
+        None,
+        "an app-limited lower-bound estimate remains usable when it conservatively beats lead completion",
+    );
+}
+
+#[test]
+fn cold_quic_same_underlay_candidate_uses_bounded_startup_flight_with_an_existing_hole() {
     let mut lead = candidate(0, 1_530_000.0, 50.0, 0.35);
     let mut extra = candidate(1, 3_060_000.0, 50.0, 0.35);
     lead.snapshot.confidence = 0.1;
@@ -1500,10 +1493,36 @@ fn same_underlay_startup_probe_is_not_rejected_by_app_limited_completion_horizon
             candidate_eta_ms: extra.eta_ms,
             payload_bytes: 64 * 1024,
             mux_limits: MuxLimits::default(),
-            position: BulkCandidatePosition::AdditionalSameUnderlay,
+            position: BulkCandidatePosition::AdditionalPath,
+            stream_ordering_debt_bytes: 512 * 1024,
+        }),
+        None,
+        "QUIC startup service remains bounded while Quinn owns native congestion"
+    );
+}
+
+#[test]
+fn additional_quic_path_cannot_exceed_measured_data_level_service_window() {
+    let lead = candidate(0, 100.0, 360.0, 100.0);
+    let mut extra = candidate(1, 110.0, 360.0, 20.0);
+    extra.snapshot.pacing_rate_bps = mbps(700.0);
+    extra.snapshot.app_limited = true;
+    extra.snapshot.data_level_limit_bytes = 1_800_000;
+    extra.snapshot.data_level_bytes_in_flight = 1_800_000;
+
+    assert_eq!(
+        bulk_candidate_admission_suppression_with_ordering_debt(BulkAdmissionCheck {
+            best_snapshot: lead.snapshot,
+            best_eta_ms: lead.eta_ms,
+            candidate_snapshot: extra.snapshot,
+            candidate_eta_ms: extra.eta_ms,
+            payload_bytes: 64 * 1024,
+            mux_limits: MuxLimits::default(),
+            position: BulkCandidatePosition::AdditionalPath,
             stream_ordering_debt_bytes: 0,
         }),
-        None
+        Some("inflight_limit"),
+        "transient QUIC pacing gain must not mint unbounded Data Sequence ownership",
     );
 }
 
@@ -1524,7 +1543,7 @@ fn same_underlay_low_confidence_sender_samples_remain_startup_admissible() {
             candidate_eta_ms: extra.eta_ms,
             payload_bytes: 64 * 1024,
             mux_limits: MuxLimits::default(),
-            position: BulkCandidatePosition::AdditionalSameUnderlay,
+            position: BulkCandidatePosition::AdditionalPath,
             stream_ordering_debt_bytes: 0,
         }),
         None
@@ -1547,10 +1566,10 @@ fn same_underlay_clear_frontier_still_requires_completion_gain_after_bulk_proof(
             candidate_eta_ms: extra.eta_ms,
             payload_bytes: 64 * 1024,
             mux_limits: MuxLimits::default(),
-            position: BulkCandidatePosition::AdditionalSameUnderlay,
+            position: BulkCandidatePosition::AdditionalPath,
             stream_ordering_debt_bytes: 0,
         }),
-        Some("same_underlay_no_completion_gain")
+        Some("ecf_no_completion_gain")
     );
     assert_eq!(
         bulk_candidate_admission_suppression_with_ordering_debt(BulkAdmissionCheck {
@@ -1560,10 +1579,10 @@ fn same_underlay_clear_frontier_still_requires_completion_gain_after_bulk_proof(
             candidate_eta_ms: extra.eta_ms,
             payload_bytes: 64 * 1024,
             mux_limits: MuxLimits::default(),
-            position: BulkCandidatePosition::AdditionalSameUnderlay,
+            position: BulkCandidatePosition::AdditionalPath,
             stream_ordering_debt_bytes: 512 * 1024,
         }),
-        Some("same_underlay_no_completion_gain")
+        Some("ecf_no_completion_gain")
     );
 }
 
@@ -1581,12 +1600,12 @@ fn request_ordering_debt_does_not_mint_service_completion_backlog() {
         candidate_eta_ms: extra.eta_ms,
         payload_bytes: 64 * 1024,
         mux_limits: MuxLimits::default(),
-        position: BulkCandidatePosition::AdditionalSameUnderlay,
+        position: BulkCandidatePosition::AdditionalPath,
         stream_ordering_debt_bytes: 8 * 1024 * 1024,
     };
     assert_eq!(
         bulk_candidate_admission_suppression_with_ordering_debt(check),
-        Some("same_underlay_no_completion_gain"),
+        Some("ecf_no_completion_gain"),
         "a lower receive hole cannot extend leading path's completion deadline and authorize more later-offset request work"
     );
 }
@@ -1607,10 +1626,10 @@ fn bulk_rate_proven_same_underlay_path_must_beat_lead_next_quantum() {
             candidate_eta_ms: extra.eta_ms,
             payload_bytes: 64 * 1024,
             mux_limits: MuxLimits::default(),
-            position: BulkCandidatePosition::AdditionalSameUnderlay,
+            position: BulkCandidatePosition::AdditionalPath,
             stream_ordering_debt_bytes: 0,
         }),
-        Some("same_underlay_no_completion_gain")
+        Some("ecf_no_completion_gain")
     );
 }
 
@@ -1631,13 +1650,13 @@ fn bulk_backlog_admits_same_underlay_path_that_finishes_before_service_tail() {
                 candidate_eta_ms: extra.eta_ms,
                 payload_bytes: 64 * 1024,
                 mux_limits: MuxLimits::default(),
-                position: BulkCandidatePosition::AdditionalSameUnderlay,
-                stream_ordering_debt_bytes: 0,
+                position: BulkCandidatePosition::AdditionalPath,
+                stream_ordering_debt_bytes: 512 * 1024,
             },
             32 * 1024 * 1024,
         ),
         None,
-        "a proven path that completes before the lower leading path backlog adds bulk capacity without extending the hole"
+        "a proven path that completes before the lower leading path backlog adds bulk capacity without extending the existing hole"
     );
 }
 
@@ -1659,12 +1678,12 @@ fn bulk_backlog_does_not_double_count_service_carrier_flight() {
                 candidate_eta_ms: extra.eta_ms,
                 payload_bytes: 64 * 1024,
                 mux_limits: MuxLimits::default(),
-                position: BulkCandidatePosition::AdditionalSameUnderlay,
+                position: BulkCandidatePosition::AdditionalPath,
                 stream_ordering_debt_bytes: 0,
             },
             32 * 1024 * 1024,
         ),
-        Some("same_underlay_no_completion_gain"),
+        Some("ecf_no_completion_gain"),
         "carrier flight already present in leading path ETA cannot extend the completion deadline twice"
     );
 }
@@ -1684,7 +1703,7 @@ fn cross_underlay_path_can_join_only_when_it_beats_lead_next_quantum() {
             extra.eta_ms,
             512 * 1024,
             MuxLimits::default(),
-            BulkCandidatePosition::AdditionalCrossUnderlay,
+            BulkCandidatePosition::AdditionalPath,
         ),
         None
     );
@@ -1692,7 +1711,8 @@ fn cross_underlay_path_can_join_only_when_it_beats_lead_next_quantum() {
 
 #[test]
 fn cross_underlay_path_is_rejected_when_it_cannot_beat_lead_next_quantum() {
-    let best = candidate(0, 500.0, 50.0, 500.0);
+    let mut best = candidate(0, 500.0, 50.0, 500.0);
+    best.snapshot.confidence = 1.0;
     let mut extra = candidate(1, 620.0, 250.0, 500.0);
     extra.snapshot.confidence = 1.0;
 
@@ -1704,9 +1724,9 @@ fn cross_underlay_path_is_rejected_when_it_cannot_beat_lead_next_quantum() {
             extra.eta_ms,
             512 * 1024,
             MuxLimits::default(),
-            BulkCandidatePosition::AdditionalCrossUnderlay,
+            BulkCandidatePosition::AdditionalPath,
         ),
-        Some("cross_underlay_no_completion_gain")
+        Some("ecf_no_completion_gain")
     );
 }
 
@@ -1724,7 +1744,7 @@ fn bounded_stream_ordering_debt_uses_completion_and_reorder_limits() {
             candidate_eta_ms: extra.eta_ms,
             payload_bytes: 64 * 1024,
             mux_limits: MuxLimits::default(),
-            position: BulkCandidatePosition::AdditionalCrossUnderlay,
+            position: BulkCandidatePosition::AdditionalPath,
             stream_ordering_debt_bytes: 4 * 1024 * 1024,
         },),
         None
@@ -1733,8 +1753,10 @@ fn bounded_stream_ordering_debt_uses_completion_and_reorder_limits() {
 
 #[test]
 fn active_path_with_ordering_debt_must_still_beat_lead_completion_horizon() {
-    let best = candidate(0, 10.0, 10.0, 1000.0);
-    let active_with_debt = candidate(1, 100.0, 10.0, 1000.0);
+    let mut best = candidate(0, 10.0, 10.0, 1000.0);
+    let mut active_with_debt = candidate(1, 100.0, 10.0, 1000.0);
+    best.snapshot.confidence = 1.0;
+    active_with_debt.snapshot.confidence = 1.0;
     let payload = 32 * 1024;
 
     assert_eq!(
@@ -1771,7 +1793,7 @@ fn bulk_admission_rejects_saturated_best_candidate() {
 }
 
 #[test]
-fn low_confidence_cross_underlay_candidate_outside_eta_path_state_set_is_suppressed() {
+fn low_confidence_additional_path_remains_a_bounded_startup_candidate() {
     let mut best = candidate(0, 1000.0, 180.0, 500.0);
     best.snapshot.confidence = 1.0;
     let mut uncertain = candidate(1, 1350.0, 180.0, 500.0);
@@ -1782,6 +1804,6 @@ fn low_confidence_cross_underlay_candidate_outside_eta_path_state_set_is_suppres
     let admitted =
         bulk_striping_admitted_paths(vec![best, uncertain], 64 * 1024, MuxLimits::default());
 
-    assert_eq!(admitted.len(), 1);
-    assert_eq!(admitted[0].key.index, 0);
+    assert_eq!(admitted.len(), 2);
+    assert_eq!(admitted[1].key.index, 1);
 }

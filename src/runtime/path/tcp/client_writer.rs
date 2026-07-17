@@ -116,13 +116,6 @@ pub(super) async fn handle_connected_client_tcp_command_run(
                 }
                 continue;
             }
-            ReliablePathCommand::SendQuicCapacityProbe(probe) => {
-                probe.ticket.cancel();
-                commands.release_pending_command_bytes(pending_bytes);
-                return Err(RuntimeError::Protocol(
-                    "client TCP path received QUIC capacity command",
-                ));
-            }
             ReliablePathCommand::SendTcpCapacityProbe(probe) => {
                 let stream_id = probe.stream_id;
                 let path_instance = probe.path_instance;
@@ -285,6 +278,7 @@ pub(super) async fn handle_connected_client_tcp_command_run(
     if wrote_frame {
         connection.carrier.writer.flush().await?;
     }
+    runtime.observe_sender_transport_state(connection, false);
     Ok(())
 }
 
@@ -597,12 +591,6 @@ async fn handle_connected_client_tcp_command(
             }
             connection.record_outbound_activity();
             Ok(())
-        }
-        ReliablePathCommand::SendQuicCapacityProbe(probe) => {
-            probe.ticket.cancel();
-            Err(RuntimeError::Protocol(
-                "client TCP path received QUIC capacity command",
-            ))
         }
         ReliablePathCommand::SendTcpCapacityProbe(_) => Err(RuntimeError::Protocol(
             "client TCP path received server capacity command",

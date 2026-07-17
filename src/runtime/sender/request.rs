@@ -1,8 +1,8 @@
 //! Request-direction sender ownership.
 //!
 //! One serialized service owns request offsets, exact-path evidence, and the
-//! observe/intent/apply scheduling cycle. TCP receipt measurement and QUIC
-//! packet-ACK measurement remain distinct mechanisms below that product state.
+//! observe/intent/apply scheduling cycle. TCP keeps its portable fallback;
+//! QUIC path use is gated by validation and native writer backpressure.
 
 use self::multipath::RequestMultipathController;
 use super::queue::{ReliableRelayQueuedWorkKind, ReliableRelaySenderQueue};
@@ -19,7 +19,6 @@ use crate::model::capacity::{
 };
 use crate::model::multipath::ExtraTrafficLedger;
 use crate::model::path::{RelayPathInstance, RelayPathKey};
-use crate::model::request_evidence::RequestWindowGrowthEvidence;
 use crate::model::timing::reliable_relay_tail_reinjection_delay;
 use crate::model::work::{
     reliable_critical_tail_reinjection_limit_bytes,
@@ -43,7 +42,6 @@ use bytes::Bytes;
 use std::time::{Duration, Instant};
 
 mod multipath;
-mod quic_capacity;
 mod scheduling;
 mod tcp_capacity;
 #[cfg(test)]
@@ -85,7 +83,6 @@ pub(in crate::runtime) enum ClientQueuedDispatch {
 
 pub(in crate::runtime) struct RequestProductAckOutcome {
     pub(in crate::runtime) mux: AckOutcome,
-    pub(in crate::runtime) window: RequestWindowGrowthEvidence,
     pub(in crate::runtime) data_ack_progress_paths: smallvec::SmallVec<[RelayPathInstance; 4]>,
 }
 
@@ -242,12 +239,11 @@ impl RequestSenderService {
             self.record_delivered_data(mux.released_bytes);
         }
         let acked_at = Instant::now();
-        let (window, data_ack_progress_paths) = self
+        let data_ack_progress_paths = self
             .multipath
             .apply_product_ack(context, remotes, ranges, acked_at);
         RequestProductAckOutcome {
             mux,
-            window,
             data_ack_progress_paths,
         }
     }
@@ -556,11 +552,18 @@ impl RequestSenderService {
         request_lane: Option<TrafficClass>,
     ) -> Result<RelaySendOutcome, RuntimeError> {
         let sent_frame = frame.clone();
-        let avoid_keys = self
-            .multipath
-            .reinjection_avoid_keys(&sent_frame, cause, remotes);
+        let avoid_instances =
+            self.multipath
+                .reinjection_avoid_instances(&sent_frame, cause, remotes);
         let instance = self
-            .emit_relay_frame(context, remotes, frame, cause, &avoid_keys, request_lane)
+            .emit_relay_frame(
+                context,
+                remotes,
+                frame,
+                cause,
+                &avoid_instances,
+                request_lane,
+            )
             .await?;
         let path_key = instance.key;
         let payload_bytes = self
@@ -576,7 +579,7 @@ impl RequestSenderService {
         remotes: &mut ReliableRelayRemoteSet,
         frame: Frame,
         cause: RelaySendCause,
-        avoid_keys: &[RelayPathKey],
+        avoid_instances: &[RelayPathInstance],
         request_lane: Option<TrafficClass>,
     ) -> Result<RelayPathInstance, RuntimeError> {
         let mut last_error = None;
@@ -590,7 +593,6 @@ impl RequestSenderService {
                 // Capacity and closure are different scheduling facts. Retire
                 // a dead carrier before fallback can hide its owner debt.
                 last_error = Some(RuntimeError::ReliablePathSessionClosed);
-                self.multipath.record_emit_failure(instance);
                 self.fail_client_path_instance(context, remotes, instance)
                     .await;
                 self.multipath.normalize_cursor(remotes.paths.len());
@@ -608,7 +610,7 @@ impl RequestSenderService {
                 &frame,
                 selection_lane,
                 cause,
-                avoid_keys,
+                avoid_instances,
             ) {
                 Ok(plan) => plan,
                 Err(RuntimeError::SenderServiceBlocked) => {
@@ -636,6 +638,21 @@ impl RequestSenderService {
                         instance.attachment_id,
                     ),
                 );
+                return Err(RuntimeError::SenderServiceBlocked);
+            }
+            let failure_recovery = matches!(
+                cause,
+                RelaySendCause::PathFailureReinjection | RelaySendCause::StalePathReinjection(_)
+            );
+            if cause.is_reinjection()
+                && !failure_recovery
+                && !self.multipath.ordered_reinjection_carrier_ready(
+                    context,
+                    &remotes.paths[position],
+                    &frame,
+                    cause,
+                )
+            {
                 return Err(RuntimeError::SenderServiceBlocked);
             }
             let (lane, emit_mode) = if matches!(cause, RelaySendCause::StreamFin) {
@@ -678,6 +695,7 @@ impl RequestSenderService {
                 frame.clone(),
                 lane,
                 emit_mode,
+                cause.is_reinjection(),
             ) {
                 Ok(()) => {
                     if let Some(claim) = request_load_claim {
@@ -697,7 +715,6 @@ impl RequestSenderService {
                     }
                     self.multipath.commit_enqueued_request_product_send(
                         context,
-                        remotes,
                         &frame,
                         plan,
                         position,
@@ -710,7 +727,6 @@ impl RequestSenderService {
                 }
                 Err(err) => {
                     last_error = Some(err);
-                    self.multipath.record_emit_failure(instance);
                     self.fail_client_path_instance(context, remotes, instance)
                         .await;
                     self.multipath.normalize_cursor(remotes.paths.len());
@@ -1093,8 +1109,9 @@ fn emit_request_frame_with_mode(
     frame: Frame,
     lane: TrafficClass,
     emit_mode: CarrierEmitMode,
+    reinjection: bool,
 ) -> Result<(), RuntimeError> {
-    emit_fixed_request_output(&stream.output, frame, lane, emit_mode)
+    emit_fixed_request_output(&stream.output, frame, lane, emit_mode, reinjection)
 }
 
 fn emit_fixed_request_output(
@@ -1102,8 +1119,12 @@ fn emit_fixed_request_output(
     frame: Frame,
     lane: TrafficClass,
     emit_mode: CarrierEmitMode,
+    reinjection: bool,
 ) -> Result<(), RuntimeError> {
     match output {
+        ReliablePathStreamOutput::Fixed(fixed) if reinjection => {
+            fixed.commands().try_enqueue_reinjection_frame(frame, lane)
+        }
         ReliablePathStreamOutput::Fixed(fixed) => {
             emit_mode.try_enqueue_frame(fixed.commands(), frame, lane)
         }

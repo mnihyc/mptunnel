@@ -5,14 +5,13 @@
 //! stalls open and attach replacement carriers.
 
 use super::open::{
-    ReliableRelayOpenSpec, open_remote_stream_on_preselected_tcp_path,
-    open_remote_stream_on_preselected_udp_path, relay_path_open_error_is_retryable,
-    relay_path_open_with_deadline, reliable_relay_attach_open_timeouts,
+    ReliableRelayOpenSpec, open_remote_stream_for_relay_path, relay_path_open_error_is_retryable,
 };
 use super::remote::{
     ReliableRelayAttachMode, attach_reliable_relay_paths,
     attach_reliable_relay_paths_with_claims_and_recovery_exclusions,
-    reliable_relay_additional_path_open_payload_bytes,
+    reliable_relay_additional_path_open_payload_bytes, reliable_relay_attach_payload_bytes,
+    reliable_relay_reinjection_path_candidates,
 };
 #[cfg(feature = "lab-diagnostics")]
 use crate::lab_diagnostics::lab_diagnostic;
@@ -21,9 +20,8 @@ use crate::model::path::{RelayPathInstance, RelayPathKey};
 use crate::model::timing::transport_pto_from_snapshot;
 use crate::mux::MuxLimits;
 use crate::mux::stream::{ReliableRecvStream, ReliableSendStream};
-use crate::protocol::{StreamId, UnderlayProtocol};
+use crate::protocol::{Frame, StreamId, UnderlayProtocol};
 use crate::runtime::error::RuntimeError;
-use crate::runtime::path::commands::ClientTcpOpenDeadlines;
 use crate::runtime::path::{ClientPathContext, PathDeliveryStats};
 use crate::runtime::sender::{ReliableRelaySenderQueue, RequestSenderService};
 use crate::runtime::stream::{
@@ -128,24 +126,6 @@ pub(super) fn maybe_mark_live_relay_path_delivery(
     );
 }
 
-pub(super) fn reliable_relay_can_finish_after_path_loss(
-    local_open: bool,
-    remote_open: bool,
-    pending_remote_fin_offset: Option<u64>,
-    send_stream: &ReliableSendStream,
-    recv_stream: &ReliableRecvStream,
-    sender_queue: &ReliableRelaySenderQueue,
-    stats: PathDeliveryStats,
-) -> bool {
-    !local_open
-        && !remote_open
-        && pending_remote_fin_offset.is_none()
-        && sender_queue.is_empty()
-        && send_stream.reinjection_bytes() == 0
-        && recv_stream.reorder_bytes() == 0
-        && stats.payload_bytes > 0
-}
-
 pub(super) fn reliable_relay_can_send_pending_fin(
     pending_local_fin: bool,
     sender_queue_empty: bool,
@@ -167,21 +147,61 @@ pub(super) fn reliable_relay_should_wait_for_pending_path_recovery(
     remote_open && !pending_additional_path_opens.is_empty()
 }
 
+// Keep the relay and stream owners visible across the asynchronous attach boundary.
+#[allow(clippy::too_many_arguments)]
 pub(super) async fn handle_additional_path_open_result(
     context: &ClientPathContext,
     stream_id: StreamId,
     remotes: &mut ReliableRelayRemoteSet,
     send_stream: &mut ReliableSendStream,
+    resend_fin: bool,
     additional_path_open: RelayAdditionalPathOpenResult,
     pending_count: usize,
     last_stream_progress_at: &mut Instant,
-) -> bool {
+) -> Option<ReliableRelayAttachMode> {
     #[cfg(not(feature = "lab-diagnostics"))]
     let _ = (stream_id, pending_count);
+    let mode = additional_path_open.mode;
     match additional_path_open.result {
         Ok(opened) => {
             #[cfg(feature = "lab-diagnostics")]
             let lane = opened.stream().lane;
+            if matches!(mode, ReliableRelayAttachMode::Recovery)
+                && !reliable_relay_should_open_recovery_path(remotes)
+            {
+                opened.close().await;
+                return None;
+            }
+            if resend_fin
+                && let Err(err) =
+                    opened
+                        .stream()
+                        .try_enqueue_request_control_frame(Frame::StreamFin {
+                            stream_id,
+                            final_offset: send_stream.next_offset(),
+                        })
+            {
+                opened.close().await;
+                context.mark_relay_path_failure(
+                    additional_path_open.key.underlay,
+                    additional_path_open.key.index,
+                );
+                #[cfg(not(feature = "lab-diagnostics"))]
+                let _ = err;
+                #[cfg(feature = "lab-diagnostics")]
+                lab_diagnostic(
+                    "relay_additional_path_open_attach_control_failed",
+                    format_args!(
+                        "stream_id={} path_underlay={:?} path_index={} mode={:?} error={}",
+                        stream_id.0,
+                        additional_path_open.key.underlay,
+                        additional_path_open.key.index,
+                        mode,
+                        err,
+                    ),
+                );
+                return None;
+            }
             match remotes.attach_candidate(opened) {
                 ReliableRelayAttachOutcome::Attached => {
                     send_stream.update_max_offset(remotes.max_offset());
@@ -197,7 +217,7 @@ pub(super) async fn handle_additional_path_open_result(
                             pending_count,
                         ),
                     );
-                    true
+                    Some(mode)
                 }
                 ReliableRelayAttachOutcome::RejectedDuplicate => {
                     #[cfg(feature = "lab-diagnostics")]
@@ -212,13 +232,13 @@ pub(super) async fn handle_additional_path_open_result(
                             pending_count,
                         ),
                     );
-                    false
+                    None
                 }
             }
         }
         Err(err) if relay_path_open_error_is_retryable(additional_path_open.key.underlay, &err) => {
-            // Preserve global health fencing. The second stream-local attempt
-            // becomes eligible only after independent proof reactivates path.
+            // Preserve global health fencing. A later open becomes eligible
+            // only after independent path evidence reactivates the carrier.
             context.mark_relay_path_failure(
                 additional_path_open.key.underlay,
                 additional_path_open.key.index,
@@ -234,7 +254,7 @@ pub(super) async fn handle_additional_path_open_result(
                     err,
                 ),
             );
-            false
+            None
         }
         Err(err) => {
             context.mark_relay_path_failure(
@@ -254,16 +274,19 @@ pub(super) async fn handle_additional_path_open_result(
                     err,
                 ),
             );
-            false
+            None
         }
     }
 }
 
+// Keep the relay and stream owners visible across the asynchronous attach boundary.
+#[allow(clippy::too_many_arguments)]
 pub(super) async fn drain_completed_additional_path_opens(
     context: &ClientPathContext,
     stream_id: StreamId,
     remotes: &mut ReliableRelayRemoteSet,
     send_stream: &mut ReliableSendStream,
+    resend_fin: bool,
     pending: &mut HashMap<RelayPathKey, RelayAdditionalPathOpenTask>,
     additional_path_open_rx: &mut mpsc::Receiver<RelayAdditionalPathOpenResult>,
     last_stream_progress_at: &mut Instant,
@@ -281,11 +304,13 @@ pub(super) async fn drain_completed_additional_path_opens(
             stream_id,
             remotes,
             send_stream,
+            resend_fin,
             additional_path_open,
             pending.len(),
             last_stream_progress_at,
         )
-        .await;
+        .await
+        .is_some();
     }
     attached
 }
@@ -317,6 +342,7 @@ fn reliable_relay_live_delivery_sample_bytes(mux_limits: MuxLimits) -> u64 {
 
 pub(super) struct RelayAdditionalPathOpenResult {
     pub(super) key: RelayPathKey,
+    pub(super) mode: ReliableRelayAttachMode,
     pub(super) result: Result<OpenedRemoteStream, RuntimeError>,
 }
 
@@ -326,8 +352,6 @@ pub(super) struct RelayAdditionalPathOpenTask {
     handle: tokio::task::JoinHandle<()>,
 }
 
-const MAX_ADDITIONAL_PATH_OPEN_ATTEMPTS_PER_PATH: u8 = 2;
-
 #[allow(clippy::too_many_arguments)]
 pub(super) fn spawn_reliable_relay_additional_path_opens(
     context: &ClientPathContext,
@@ -336,7 +360,6 @@ pub(super) fn spawn_reliable_relay_additional_path_opens(
     remotes: &ReliableRelayRemoteSet,
     send_stream: &ReliableSendStream,
     pending: &mut HashMap<RelayPathKey, RelayAdditionalPathOpenTask>,
-    attempts: &mut HashMap<RelayPathKey, u8>,
     result_tx: &mpsc::Sender<RelayAdditionalPathOpenResult>,
 ) -> bool {
     if !lane.is_bulk() {
@@ -350,10 +373,67 @@ pub(super) fn spawn_reliable_relay_additional_path_opens(
         reliable_relay_additional_path_open_payload_bytes(send_stream, context.mux_limits);
     let candidates =
         reliable_relay_additional_path_open_candidates(context, remotes, lane, payload_bytes);
-    let candidates = reliable_relay_bounded_path_open_candidates(candidates, pending, attempts);
+    let candidates = reliable_relay_bounded_path_open_candidates(candidates, pending);
     if candidates.is_empty() {
         return false;
     }
+    spawn_reliable_relay_path_opens(
+        context,
+        spec,
+        lane,
+        ReliableRelayAttachMode::BulkStriping,
+        stream_id,
+        candidates,
+        pending,
+        result_tx,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(super) fn spawn_reliable_relay_recovery_path_open(
+    context: &ClientPathContext,
+    spec: &ReliableRelayOpenSpec,
+    lane: TrafficClass,
+    remotes: &ReliableRelayRemoteSet,
+    send_stream: &ReliableSendStream,
+    recovery_excluded_paths: &HashSet<RelayPathKey>,
+    pending: &mut HashMap<RelayPathKey, RelayAdditionalPathOpenTask>,
+    result_tx: &mpsc::Sender<RelayAdditionalPathOpenResult>,
+) -> bool {
+    if !reliable_relay_should_open_recovery_path(remotes) || !pending.is_empty() {
+        return false;
+    }
+    let payload_bytes = reliable_relay_attach_payload_bytes(send_stream, lane, context.mux_limits);
+    let candidates =
+        reliable_relay_reinjection_path_candidates(context, remotes, lane, payload_bytes);
+    let candidates =
+        reliable_relay_recovery_path_open_candidates(candidates, recovery_excluded_paths, pending);
+    if candidates.is_empty() {
+        return false;
+    }
+    spawn_reliable_relay_path_opens(
+        context,
+        spec,
+        lane,
+        ReliableRelayAttachMode::Recovery,
+        remotes.stream_id(),
+        candidates,
+        pending,
+        result_tx,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn spawn_reliable_relay_path_opens(
+    context: &ClientPathContext,
+    spec: &ReliableRelayOpenSpec,
+    lane: TrafficClass,
+    mode: ReliableRelayAttachMode,
+    stream_id: StreamId,
+    candidates: Vec<RelayPathKey>,
+    pending: &mut HashMap<RelayPathKey, RelayAdditionalPathOpenTask>,
+    result_tx: &mpsc::Sender<RelayAdditionalPathOpenResult>,
+) -> bool {
     let mut spawned = false;
     for key in candidates {
         match key.underlay {
@@ -361,54 +441,15 @@ pub(super) fn spawn_reliable_relay_additional_path_opens(
             UnderlayProtocol::Udp if context.udp_paths.get(key.index).is_some() => {}
             _ => continue,
         }
-        let attempt = attempts.entry(key).or_default();
-        *attempt = attempt.saturating_add(1);
         let context = context.clone();
         let target = spec.target.clone();
         let result_tx = result_tx.clone();
         let handle = tokio::spawn(async move {
-            let open_timeouts = reliable_relay_attach_open_timeouts(&context, key);
-            let open_started_at = tokio::time::Instant::now();
-            let result = match key.underlay {
-                UnderlayProtocol::Tcp => {
-                    let open_deadlines = ClientTcpOpenDeadlines::from_timeouts(
-                        open_started_at,
-                        open_timeouts.live,
-                        open_timeouts.setup,
-                    );
-
-                    relay_path_open_with_deadline(
-                        open_deadlines.setup,
-                        open_remote_stream_on_preselected_tcp_path(
-                            &context,
-                            stream_id,
-                            target,
-                            lane,
-                            key.index,
-                            open_deadlines,
-                        ),
-                    )
-                    .await
-                }
-                UnderlayProtocol::Udp => {
-                    let open_deadline = open_started_at + open_timeouts.setup;
-                    relay_path_open_with_deadline(
-                        open_deadline,
-                        open_remote_stream_on_preselected_udp_path(
-                            &context,
-                            stream_id,
-                            target,
-                            lane,
-                            key.index,
-                            open_deadline,
-                        ),
-                    )
-                    .await
-                }
-            };
-            let message = RelayAdditionalPathOpenResult { key, result };
+            let result =
+                open_remote_stream_for_relay_path(&context, stream_id, target, lane, key).await;
+            let message = RelayAdditionalPathOpenResult { key, mode, result };
             if let Err(err) = result_tx.send(message).await {
-                let RelayAdditionalPathOpenResult { key, result } = err.0;
+                let RelayAdditionalPathOpenResult { key, result, .. } = err.0;
                 #[cfg(not(feature = "lab-diagnostics"))]
                 let _ = key;
                 if let Ok(opened) = result {
@@ -502,16 +543,11 @@ fn prefer_current_underlay_additional_path_open_candidate(
 fn reliable_relay_bounded_path_open_candidates(
     candidates: Vec<RelayPathKey>,
     pending: &HashMap<RelayPathKey, RelayAdditionalPathOpenTask>,
-    attempts: &HashMap<RelayPathKey, u8>,
 ) -> Vec<RelayPathKey> {
     let mut selected = Vec::new();
     let mut selected_underlay = None;
     for candidate in candidates {
-        if pending.contains_key(&candidate)
-            || attempts.get(&candidate).copied().unwrap_or(0)
-                >= MAX_ADDITIONAL_PATH_OPEN_ATTEMPTS_PER_PATH
-            || selected.contains(&candidate)
-        {
+        if pending.contains_key(&candidate) || selected.contains(&candidate) {
             continue;
         }
         let underlay = *selected_underlay.get_or_insert(candidate.underlay);
@@ -521,6 +557,20 @@ fn reliable_relay_bounded_path_open_candidates(
         selected.push(candidate);
     }
     selected
+}
+
+fn reliable_relay_recovery_path_open_candidates(
+    candidates: Vec<RelayPathKey>,
+    recovery_excluded_paths: &HashSet<RelayPathKey>,
+    pending: &HashMap<RelayPathKey, RelayAdditionalPathOpenTask>,
+) -> Vec<RelayPathKey> {
+    let candidates = candidates
+        .into_iter()
+        .filter(|key| !recovery_excluded_paths.contains(key))
+        .collect::<Vec<_>>();
+    let mut candidates = reliable_relay_bounded_path_open_candidates(candidates, pending);
+    candidates.truncate(1);
+    candidates
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -627,6 +677,12 @@ pub(in crate::runtime) fn reliable_relay_product_stall_preserves_attached_path_s
 }
 
 pub(in crate::runtime) fn reliable_relay_product_stall_should_try_alternate_attach(
+    remotes: &ReliableRelayRemoteSet,
+) -> bool {
+    reliable_relay_should_open_recovery_path(remotes)
+}
+
+pub(in crate::runtime) fn reliable_relay_should_open_recovery_path(
     remotes: &ReliableRelayRemoteSet,
 ) -> bool {
     remotes.accepted_path_count() <= 1 && !remotes.is_empty()

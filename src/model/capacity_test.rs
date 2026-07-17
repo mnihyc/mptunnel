@@ -1,70 +1,19 @@
 use super::{
-    MAX_RELIABLE_SERVICE_QUANTUM_BYTES, PATH_OPEN_SCORE_BYTES, QUIC_TIMER_GRANULARITY,
-    RELIABLE_INITIAL_RTT, RELIABLE_PIPE_WINDOW_BDPS, TcpCapacityProofCandidate,
-    adaptive_reliable_relay_chunk_bytes, adaptive_reliable_relay_chunk_bytes_with_frame_limit,
-    adaptive_reliable_relay_inflight_bytes, min_reliable_pipe_bytes,
-    quic_capacity_receipt_rate_bps, reliable_relay_buffer_len,
+    MAX_RELIABLE_SERVICE_QUANTUM_BYTES, PATH_OPEN_SCORE_BYTES, RELIABLE_INITIAL_RTT,
+    RELIABLE_PIPE_WINDOW_BDPS, TcpCapacityProofCandidate, adaptive_reliable_relay_chunk_bytes,
+    adaptive_reliable_relay_chunk_bytes_with_frame_limit, adaptive_reliable_relay_inflight_bytes,
+    min_reliable_pipe_bytes, reliable_bulk_carrier_feed_quantum_bytes, reliable_relay_buffer_len,
     reliable_relay_scheduler_quantum_cap, reliable_relay_sender_dispatch_budget,
     reliable_startup_bdp_bytes, reliable_startup_send_quantum_bytes,
     reliable_stream_ack_update_bytes, reliable_stream_advertised_window_bytes,
     reliable_stream_initial_advertised_window_bytes, reliable_stream_max_data_update_bytes,
-    valid_quic_capacity_proof_geometry, valid_tcp_capacity_proof_candidate_at,
+    valid_tcp_capacity_proof_candidate_at,
 };
 use crate::mux::MuxLimits;
 use crate::protocol::codec::CodecLimits;
 use crate::protocol::{PathId, UnderlayProtocol};
 use crate::scheduler::{PathSnapshot, TrafficClass};
 use std::time::{Duration, Instant};
-
-#[test]
-fn quic_receipt_rate_rejects_empty_evidence() {
-    assert_eq!(
-        quic_capacity_receipt_rate_bps(0, QUIC_TIMER_GRANULARITY),
-        None
-    );
-    assert_eq!(quic_capacity_receipt_rate_bps(1, Duration::ZERO), None);
-}
-
-#[test]
-fn quic_receipt_rate_applies_timer_granularity_and_nearest_rounding() {
-    assert_eq!(
-        quic_capacity_receipt_rate_bps(1, Duration::from_micros(1)),
-        Some(8_000)
-    );
-    assert_eq!(
-        quic_capacity_receipt_rate_bps(1, Duration::from_millis(3)),
-        Some(2_667)
-    );
-}
-
-#[test]
-fn quic_receipt_rate_saturates_to_the_evidence_type() {
-    assert_eq!(
-        quic_capacity_receipt_rate_bps(u64::MAX, QUIC_TIMER_GRANULARITY),
-        Some(u64::MAX)
-    );
-}
-
-#[test]
-fn quic_capacity_geometry_accepts_a_bounded_policy_tail() {
-    assert!(valid_quic_capacity_proof_geometry(838, 500, 62, 400, 438));
-    assert!(
-        valid_quic_capacity_proof_geometry(900, 500, 62, 400, 438),
-        "timing guard bytes may follow the complete proof minimum"
-    );
-    assert!(
-        !valid_quic_capacity_proof_geometry(837, 500, 62, 400, 438),
-        "the train cannot underfill warmup plus strict proof"
-    );
-    assert!(
-        !valid_quic_capacity_proof_geometry(900, 500, 0, 400, 500),
-        "accounting slack remains fixed by the sample floor"
-    );
-    assert!(
-        !valid_quic_capacity_proof_geometry(900, 500, 62, 400, 1),
-        "one byte cannot satisfy a representative sample floor"
-    );
-}
 
 #[test]
 fn data_level_budgets_expand_for_bulk_without_second_congestion_feedback() {
@@ -216,18 +165,65 @@ fn product_progress_does_not_downshift_source_read_below_carrier_evidence() {
 }
 
 #[test]
-fn udp_source_read_startup_can_fill_reliable_carrier_without_double_cwnd() {
+fn quic_source_read_window_preserves_native_congestion_window_authority() {
     let mux_limits = MuxLimits::default();
-    let mut path = PathSnapshot::new(PathId(0), UnderlayProtocol::Udp, 50.0, 4_000_000_000.0);
-    path.pacing_rate_bps = 4_000_000_000.0;
-    path.carrier_inflight_limit_bytes = mux_limits.max_path_flight_bytes as u64;
+    let mut path = PathSnapshot::new(PathId(0), UnderlayProtocol::Udp, 425.0, 25_000_000.0);
+    path.pacing_rate_bps = 175_000_000.0;
+    path.carrier_inflight_limit_bytes = 32 * 1024 * 1024;
+    path.app_limited = true;
 
     let inflight =
         adaptive_reliable_relay_inflight_bytes(Some(path), TrafficClass::Throughput, mux_limits);
 
-    let expected = ((path.delivery_rate_bps / 8.0) * (path.srtt_ms / 1000.0) * 2.0) as usize;
+    let modeled = ((path.delivery_rate_bps / 8.0) * (path.srtt_ms / 1000.0) * 2.0) as usize;
+    let expected = (path.carrier_inflight_limit_bytes as usize)
+        .saturating_add(reliable_bulk_carrier_feed_quantum_bytes(mux_limits));
     assert_eq!(inflight, expected);
+    assert!(
+        inflight > modeled.saturating_add(reliable_bulk_carrier_feed_quantum_bytes(mux_limits)),
+        "an app-limited product sample must not become a second QUIC congestion window",
+    );
     assert!(inflight < mux_limits.max_path_flight_bytes);
+}
+
+#[test]
+fn cold_quic_path_gets_one_service_quantum_beyond_native_window() {
+    let mux_limits = MuxLimits::default();
+    let mut path = PathSnapshot::new(PathId(0), UnderlayProtocol::Udp, 360.0, 1_000_000.0);
+    path.carrier_inflight_limit_bytes = 2 * 1024 * 1024;
+
+    let inflight =
+        adaptive_reliable_relay_inflight_bytes(Some(path), TrafficClass::Throughput, mux_limits);
+
+    assert_eq!(
+        inflight,
+        2 * 1024 * 1024 + reliable_bulk_carrier_feed_quantum_bytes(mux_limits),
+        "startup can keep Quinn fed without exposing the configured 64 MiB ceiling",
+    );
+}
+
+#[test]
+fn tcp_source_read_window_preserves_native_congestion_window_authority() {
+    let mux_limits = MuxLimits::default();
+    let path = PathSnapshot::new(PathId(0), UnderlayProtocol::Tcp, 425.0, 25_000_000.0);
+    let modeled =
+        adaptive_reliable_relay_inflight_bytes(Some(path), TrafficClass::Throughput, mux_limits);
+    let mut with_cached_native_window = path;
+    with_cached_native_window.carrier_inflight_limit_bytes = 32 * 1024 * 1024;
+
+    let with_headroom = adaptive_reliable_relay_inflight_bytes(
+        Some(with_cached_native_window),
+        TrafficClass::Throughput,
+        mux_limits,
+    );
+    let expected = (with_cached_native_window.carrier_inflight_limit_bytes as usize)
+        .saturating_add(reliable_bulk_carrier_feed_quantum_bytes(mux_limits));
+    assert_eq!(
+        with_headroom, expected,
+        "TCP_INFO supplies feed geometry while the socket retains native send authority",
+    );
+    assert!(with_headroom > modeled);
+    assert!(with_headroom < mux_limits.max_path_flight_bytes);
 }
 
 #[test]

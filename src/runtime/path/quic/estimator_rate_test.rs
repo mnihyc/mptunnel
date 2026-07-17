@@ -104,7 +104,10 @@ fn quic_zero_span_ack_batch_proves_reachability_without_rate() {
     assert_eq!(untimed.delivery_sample_bytes, 0);
     assert_eq!(untimed.delivery_sample_count, 0);
     assert_eq!(untimed.delivery_rate_bps, startup.delivery_rate_bps);
-    assert!(untimed.app_limited);
+    assert!(
+        !untimed.app_limited,
+        "the native non-app-limited flag is independent of whether an ACK batch has a usable clock span"
+    );
 }
 
 #[test]
@@ -247,7 +250,7 @@ fn quic_unknown_capacity_ack_sample_does_not_create_bulk_evidence() {
         unknown_capacity.delivery_rate_bps.round() as u64,
         default_path_rate_bps().round() as u64
     );
-    assert!(unknown_capacity.app_limited);
+    assert!(!unknown_capacity.app_limited);
 }
 
 #[test]
@@ -295,15 +298,12 @@ fn quic_app_limited_low_ack_sample_does_not_poison_delivery_rate() {
         .quic
         .observe(stats, congestion, PathMetricDirection::ServerToClient);
     stats.frame_rx.acks = 1;
-    let app_limited = tracker.quic.observe(
-        stats,
-        with_acked_bytes(
-            with_delivery_evidence_written(congestion, 32 * 1024),
-            32 * 1024,
-            1,
-        ),
-        PathMetricDirection::ServerToClient,
-    );
+    let mut low_ack = with_delivery_evidence_written(congestion, 32 * 1024);
+    low_ack.newly_acked_bytes = Some(32 * 1024);
+    low_ack.delivery_sample_count = 1;
+    let app_limited = tracker
+        .quic
+        .observe(stats, low_ack, PathMetricDirection::ServerToClient);
 
     assert_eq!(app_limited.delivery_sample_count, 0);
     assert!(app_limited.last_delivery_sample_at.is_none());
@@ -379,14 +379,15 @@ fn quic_poll_retains_non_app_limited_ack_bytes_after_later_idle_ack() {
 
     assert_eq!(measured.delivery_sample_bytes, sample_bytes);
     assert!(measured.delivery_sample_count >= QUIC_INITIAL_WINDOW_PACKETS as u64);
+    assert!(measured.app_limited);
     assert!(
-        !measured.app_limited,
+        measured.bulk_proof_expires_at.is_some(),
         "a later idle ACK flag must not erase non-app-limited bytes accumulated before the metrics poll"
     );
 }
 
 #[test]
-fn quic_capacity_evidence_accumulates_across_small_ack_polls() {
+fn quic_bulk_rate_evidence_accumulates_across_small_ack_polls() {
     let mut tracker = UdpPathMetricTracker::default();
     let sample_bytes = RELIABLE_STREAM_STARTUP_PRODUCT_WINDOW_BYTES / 2;
     let chunk_bytes = sample_bytes / 8;
@@ -420,9 +421,10 @@ fn quic_capacity_evidence_accumulates_across_small_ack_polls() {
         with_delivery_evidence_written(congestion, sample_bytes),
         PathMetricDirection::ServerToClient,
     );
+    assert!(idle.app_limited);
     assert!(
-        !idle.app_limited,
-        "an idle metrics poll inside the 3-PTO horizon must preserve capacity evidence"
+        idle.bulk_proof_expires_at.is_some(),
+        "an idle metrics poll inside the proof horizon must preserve bulk rate evidence without redefining app-limited"
     );
 }
 
@@ -459,7 +461,7 @@ fn quic_ack_after_prior_data_send_counts_as_ack_data_seen() {
         "QUIC ACK-derived data evidence must survive normal TX/ACK timing; it cannot require TX and ACK in the same metrics poll"
     );
     assert_eq!(ack_after_send.delivery_sample_count, 0);
-    assert!(ack_after_send.app_limited);
+    assert!(!ack_after_send.app_limited);
 }
 
 #[test]

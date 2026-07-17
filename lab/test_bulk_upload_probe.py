@@ -124,6 +124,7 @@ def probe_args(server, parallel_uploads=1):
         proxy=None,
         target=f"{host}:{port}",
         failover_after=-1,
+        failover_marker_file=None,
         timeout=1.0,
         chunk_bytes=4096,
         load_duration=0.08,

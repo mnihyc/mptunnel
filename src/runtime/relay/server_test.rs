@@ -6,8 +6,7 @@ use crate::protocol::frame::stream_ack_contiguous_frontier;
 use crate::protocol::{PathId, PathMetricDirection, PathMetrics};
 use crate::runtime::path::commands::{
     ReliablePathCommand, ReliablePathCommandReceivers, reliable_path_command_channels,
-    reliable_path_stream_ordered_queue_lane, try_recv_reliable_path_command,
-    try_recv_reliable_path_priority_command,
+    try_recv_reliable_path_command, try_recv_reliable_path_priority_command,
 };
 use crate::runtime::path::model::metric_epoch_now;
 use crate::runtime::relay::io::stream_ack_ranges_expose_authoritative_gap;
@@ -22,6 +21,38 @@ fn consume_attachment_path_proof(receivers: &mut ReliablePathCommandReceivers) {
         try_recv_reliable_path_priority_command(receivers),
         Some(ReliablePathCommand::SendFrame(Frame::PathProofData { .. }))
     ));
+}
+
+fn record_server_delivery_evidence(binding: &ResponseStreamBinding, key: CarrierPathKey) {
+    binding.update_path_metrics(
+        key,
+        PathMetrics {
+            path_id: key.path_id,
+            underlay: key.underlay,
+            direction: PathMetricDirection::ServerToClient,
+            metric_epoch: metric_epoch_now(),
+            metric_age_us: 0,
+            srtt_us: 40_000,
+            rttvar_us: 5_000,
+            jitter_us: 5_000,
+            delivery_rate_bps: 100_000_000,
+            pacing_rate_bps: 100_000_000,
+            loss_ppm: 0,
+            ecn_ppm: 0,
+            loss_observed: false,
+            ecn_observed: false,
+            bytes_in_flight: 0,
+            queue_bytes: 0,
+            inflight_limit_bytes: 0,
+            inflight_hi_bytes: 0,
+            confidence_ppm: 1_000_000,
+            app_limited: false,
+            has_ack_derived_data_sample: true,
+            data_sample_count: 1,
+            data_sample_bytes: 65_536,
+        },
+        ServerPathMetricsSource::LocalSender,
+    );
 }
 
 #[test]
@@ -392,10 +423,12 @@ async fn latency_tail_reinjection_dispatches_suffix_on_distinct_reinjection_with
         _ => panic!("expected the nonterminal 64-byte reinjected suffix"),
     };
     assert!(try_recv_reliable_path_command(&mut original_receivers).is_none());
-    assert_eq!(
-        binding.original_flight_keys_overlapping_frame(&reinjection_frame),
-        vec![original_key],
-        "reinjection must preserve original-flight attribution",
+    let original_outputs = binding.original_flight_outputs_overlapping_frame(&reinjection_frame);
+    assert_eq!(original_outputs.len(), 1);
+    assert_eq!(original_outputs[0].0, original_key);
+    assert!(
+        binding.has_output_incarnation(original_outputs[0].0, original_outputs[0].1),
+        "reinjection must preserve the exact original-output attribution",
     );
     assert!(path_stream.has_recent_reinjection_overlap(
         &reinjection_frame,
@@ -404,7 +437,7 @@ async fn latency_tail_reinjection_dispatches_suffix_on_distinct_reinjection_with
 }
 
 #[test]
-fn sparse_authoritative_ack_does_not_skip_lower_gap_for_live_tail_reinjection() {
+fn sparse_authoritative_ack_reinjects_the_lowest_live_path_gap() {
     let limits = MuxLimits::default();
     let stream_id = StreamId(119);
     let original_key = CarrierPathKey {
@@ -433,6 +466,7 @@ fn sparse_authoritative_ack_does_not_skip_lower_gap_for_live_tail_reinjection() 
         ),
         ResponseStreamAttachOutcome::Attached
     );
+    record_server_delivery_evidence(&binding, reinjection_key);
 
     let (_frame_tx, frame_rx) = mpsc::channel(1);
     let path_stream = ReliablePathStream {
@@ -492,12 +526,9 @@ fn sparse_authoritative_ack_does_not_skip_lower_gap_for_live_tail_reinjection() 
         64,
     );
 
-    assert_eq!(
-        outcome.queued, 0,
-        "the live-tail timer must not skip an authoritative lower ACK gap"
-    );
+    assert_eq!(outcome.queued, 1);
     assert!(!outcome.pending);
-    assert_eq!(response_sender.bytes(), 0);
+    assert_eq!(response_sender.bytes(), 64);
 }
 
 #[tokio::test]
@@ -606,15 +637,12 @@ async fn sparse_ack_failed_original_reinjection_starts_at_lowest_hole() {
 }
 
 #[test]
-fn tail_reinjection_repeats_after_persistent_delay_without_progress() {
+fn tail_reinjection_repeats_after_one_recovery_interval_without_progress() {
     let last_progress = Instant::now();
     let last_reinjection = last_progress + transport_pto_from_snapshot(None);
     let deadline = reliable_relay_tail_reinjection_deadline(last_progress, last_reinjection, None);
-    let expected = tokio::time::Instant::from_std(
-        last_reinjection
-            + transport_pto_from_snapshot(None)
-                .saturating_mul(QUIC_PERSISTENT_CONGESTION_THRESHOLD),
-    );
+    let expected =
+        tokio::time::Instant::from_std(last_reinjection + transport_pto_from_snapshot(None));
 
     assert_eq!(deadline, expected);
 }
@@ -758,7 +786,6 @@ fn failed_original_tail_reinjection_is_immediate_after_original_path_detaches() 
         ),
         ResponseStreamAttachOutcome::Attached
     );
-
     let (_frame_tx, frame_rx) = mpsc::channel(1);
     let path_stream = ReliablePathStream {
         stream_id,
@@ -829,44 +856,18 @@ fn failed_original_tail_reinjection_retry_uses_single_pto_not_persistent_backoff
 }
 
 #[test]
-fn live_tcp_bulk_tail_reinjection_uses_one_bounded_original_flight() {
+fn live_tail_reinjection_is_one_product_quantum_for_every_underlay() {
     let limits = MuxLimits::default();
-    let path = PathSnapshot::new(PathId(3), UnderlayProtocol::Tcp, 180.0, 500_000_000.0);
-    let base =
-        adaptive_reliable_relay_reinjection_bytes(Some(path), TrafficClass::Throughput, limits);
-    let reinjection_debt = limits.max_repair_bytes;
-    let reinjection_limit = reliable_tail_reinjection_limit_bytes(
-        Some(path),
-        Some(UnderlayProtocol::Tcp),
-        TrafficClass::Throughput,
-        reinjection_debt,
-        limits,
-    );
-
-    assert!(reinjection_limit > base);
-    assert!(
-        reinjection_limit <= bulk_scheduling_window_bytes(base, limits),
-        "one-PTO TCP reinjection must remain inside the ordered feed reservoir"
-    );
-}
-
-#[test]
-fn live_quic_tail_reinjection_remains_one_product_quantum() {
-    let limits = MuxLimits::default();
-    let path = PathSnapshot::new(PathId(3), UnderlayProtocol::Udp, 180.0, 500_000_000.0);
-    let base =
-        adaptive_reliable_relay_reinjection_bytes(Some(path), TrafficClass::Throughput, limits);
-    assert_eq!(
-        reliable_tail_reinjection_limit_bytes(
-            Some(path),
-            Some(UnderlayProtocol::Udp),
-            TrafficClass::Throughput,
-            limits.max_repair_bytes,
-            limits,
-        ),
-        base,
-        "QUIC keeps packet recovery below the shared product reinjection boundary"
-    );
+    for underlay in [UnderlayProtocol::Tcp, UnderlayProtocol::Udp] {
+        let path = PathSnapshot::new(PathId(3), underlay, 180.0, 500_000_000.0);
+        let base =
+            adaptive_reliable_relay_reinjection_bytes(Some(path), TrafficClass::Throughput, limits);
+        assert_eq!(
+            reliable_critical_tail_reinjection_limit_bytes(base, limits.max_repair_bytes, limits,),
+            base,
+            "live-tail recovery must not synthesize a transport-sized flight above native recovery",
+        );
+    }
 }
 
 #[test]
@@ -1974,7 +1975,146 @@ fn stale_live_reinjection_flight_does_not_block_terminal_tail_retry() {
 }
 
 #[tokio::test]
-async fn persistent_tail_reinjection_waits_when_distinct_alternate_lacks_queue_credit() {
+async fn live_tail_reinjection_uses_repair_headroom_before_new_data() {
+    let limits = MuxLimits::default();
+    let stream_id = StreamId(127);
+    let original_key = CarrierPathKey {
+        underlay: UnderlayProtocol::Tcp,
+        path_id: PathId(0),
+    };
+    let reinjection_key = CarrierPathKey {
+        underlay: UnderlayProtocol::Tcp,
+        path_id: PathId(1),
+    };
+    let (original_commands, _original_receivers) = reliable_path_command_channels(8);
+    let binding = ResponseStreamBinding::new(
+        SessionId(127),
+        original_key.underlay,
+        original_key.path_id,
+        original_commands,
+        TrafficClass::Throughput,
+    );
+    let (reinjection_commands, mut reinjection_receivers) = reliable_path_command_channels(1);
+    let reinjection_commands_for_fill = reinjection_commands.clone();
+    assert_eq!(
+        binding.attach(
+            reinjection_key.underlay,
+            reinjection_key.path_id,
+            reinjection_commands,
+            TrafficClass::Throughput,
+        ),
+        ResponseStreamAttachOutcome::Attached
+    );
+    consume_attachment_path_proof(&mut reinjection_receivers);
+    reinjection_commands_for_fill
+        .try_enqueue_admitted_frame(
+            Frame::StreamData {
+                stream_id,
+                offset: 4096,
+                payload: Bytes::from_static(b"queued"),
+            },
+            TrafficClass::Throughput,
+        )
+        .expect("test setup fills alternate data queue");
+
+    let (_frame_tx, frame_rx) = mpsc::channel(1);
+    let path_stream = ReliablePathStream {
+        stream_id,
+        max_offset: u64::MAX,
+        lane: TrafficClass::Throughput,
+        underlay: original_key.underlay,
+        max_frame_payload_bytes: reliable_relay_buffer_len(limits),
+        output: ReliablePathStreamOutput::Switchable(binding.clone()),
+        frames: frame_rx,
+    };
+    let mut send_stream =
+        ReliableSendStream::new_with_initial_max_offset(stream_id, limits, u64::MAX);
+    let frame = send_stream
+        .prepare_data(Bytes::from(vec![0x55; 4096]))
+        .expect("prepare original-transmission path data");
+    send_stream
+        .commit_prepared_data(&frame)
+        .expect("commit original-transmission path data");
+    binding.record_original_flight(original_key, &frame);
+    let ack_ranges = [OffsetRange {
+        start: 0,
+        end: 1024,
+    }];
+    let _ = send_stream.apply_ack(&ack_ranges);
+
+    let mut response_sender = ServerResponseSenderService::new_with_performance(
+        SessionId(127),
+        stream_id,
+        MppPerformanceConfig {
+            extra_traffic_hint_percent: 5,
+        },
+    );
+    response_sender.record_delivered_data(1024);
+    response_sender.enqueue_data_for_lane(
+        Bytes::from_static(b"new response data"),
+        TrafficClass::Throughput,
+    );
+
+    let outcome = enqueue_reliable_tail_reinjection(
+        &mut response_sender,
+        &path_stream,
+        stream_id,
+        &send_stream,
+        &ack_ranges,
+        true,
+        None,
+        TrafficClass::Throughput,
+        limits,
+        MppPerformanceConfig {
+            extra_traffic_hint_percent: 5,
+        },
+        path_stream.max_frame_payload_bytes,
+        1024,
+    );
+
+    assert_eq!(outcome.queued, 1);
+    assert!(!outcome.pending);
+    let data_ack_outstanding_bytes = send_stream.reinjection_bytes();
+    let dispatch = response_sender
+        .dispatch_next_with_data_ack_outstanding(
+            &path_stream,
+            &mut send_stream,
+            TrafficClass::Throughput,
+            limits,
+            data_ack_outstanding_bytes,
+        )
+        .expect("repair remains dispatchable despite a full fresh-data queue");
+    assert_eq!(dispatch.lane, ReliableWorkClass::Reinjection);
+    assert_eq!(dispatch.selected_path, Some(reinjection_key));
+    assert!(matches!(
+        try_recv_reliable_path_command(&mut reinjection_receivers),
+        Some(ReliablePathCommand::SendFrame(Frame::StreamData {
+            offset: 1024,
+            ..
+        }))
+    ));
+    assert!(matches!(
+        try_recv_reliable_path_command(&mut reinjection_receivers),
+        Some(ReliablePathCommand::SendFrame(Frame::StreamData {
+            offset: 4096,
+            ..
+        }))
+    ));
+
+    let dispatch = response_sender
+        .dispatch_next_with_data_ack_outstanding(
+            &path_stream,
+            &mut send_stream,
+            TrafficClass::Throughput,
+            limits,
+            data_ack_outstanding_bytes,
+        )
+        .expect("new data follows the dispatched repair");
+    assert_eq!(dispatch.lane, ReliableWorkClass::Data);
+}
+
+#[tokio::test]
+async fn persistent_tail_reinjection_waits_when_distinct_alternate_lacks_repair_headroom() {
     let limits = MuxLimits::default();
     let stream_id = StreamId(124);
     let original_key = CarrierPathKey {
@@ -2058,7 +2198,7 @@ async fn persistent_tail_reinjection_waits_when_distinct_alternate_lacks_queue_c
     assert_eq!(outcome.queued, 1);
 
     reinjection_commands_for_fill
-        .try_enqueue_admitted_frame(
+        .try_enqueue_reinjection_frame(
             Frame::StreamData {
                 stream_id,
                 offset: 4096,
@@ -2066,7 +2206,7 @@ async fn persistent_tail_reinjection_waits_when_distinct_alternate_lacks_queue_c
             },
             TrafficClass::Throughput,
         )
-        .expect("test setup fills alternate data queue");
+        .expect("test setup fills alternate repair headroom");
 
     let dispatch = response_sender.dispatch_next_with_data_ack_outstanding(
         &path_stream,
@@ -2176,15 +2316,15 @@ async fn final_tail_reinjection_uses_original_path_when_alternate_lacks_credit()
     }
 
     reinjection_commands_for_fill
-        .try_enqueue_admitted_frame(
+        .try_enqueue_reinjection_frame(
             Frame::StreamData {
                 stream_id,
                 offset: 192,
                 payload: Bytes::from_static(b"queued"),
             },
-            reliable_path_stream_ordered_queue_lane(),
+            TrafficClass::Latency,
         )
-        .expect("test setup fills alternate data queue");
+        .expect("test setup fills alternate repair headroom");
 
     response_sender
         .dispatch_next_with_data_ack_outstanding(
@@ -2594,7 +2734,7 @@ fn failed_original_tail_reinjection_is_not_blocked_by_optional_budget() {
 }
 
 #[test]
-fn persistent_ack_gap_tail_timer_does_not_duplicate_ack_gap_controller() {
+fn ack_gap_timer_retransmission_is_not_optional_traffic() {
     let limits = MuxLimits::default();
     let stream_id = StreamId(102);
     let original_key = CarrierPathKey {
@@ -2623,6 +2763,7 @@ fn persistent_ack_gap_tail_timer_does_not_duplicate_ack_gap_controller() {
         ),
         ResponseStreamAttachOutcome::Attached
     );
+    record_server_delivery_evidence(&binding, reinjection_key);
 
     let (_frame_tx, frame_rx) = mpsc::channel(1);
     let path_stream = ReliablePathStream {
@@ -2699,11 +2840,159 @@ fn persistent_ack_gap_tail_timer_does_not_duplicate_ack_gap_controller() {
         4096,
     );
 
-    assert_eq!(
-        outcome.queued, 0,
-        "persistent ACK gaps are reinjected by the ACK-gap controller; the tail timer must not duplicate live-original-transmission path gap reinjection"
-    );
+    assert_eq!(outcome.queued, 1);
     assert!(!outcome.pending);
+}
+
+#[test]
+fn ordinary_ack_gap_timer_repairs_one_quantum_before_measured_persistent_refill() {
+    let limits = MuxLimits::default();
+    let stream_id = StreamId(103);
+    let original_key = CarrierPathKey {
+        underlay: UnderlayProtocol::Tcp,
+        path_id: PathId(0),
+    };
+    let reinjection_key = CarrierPathKey {
+        underlay: UnderlayProtocol::Tcp,
+        path_id: PathId(1),
+    };
+    let (original_commands, _original_receivers) = reliable_path_command_channels(8);
+    let binding = ResponseStreamBinding::new(
+        SessionId(103),
+        original_key.underlay,
+        original_key.path_id,
+        original_commands,
+        TrafficClass::Throughput,
+    );
+    let (reinjection_commands, mut reinjection_receivers) = reliable_path_command_channels(8);
+    assert_eq!(
+        binding.attach(
+            reinjection_key.underlay,
+            reinjection_key.path_id,
+            reinjection_commands,
+            TrafficClass::Throughput,
+        ),
+        ResponseStreamAttachOutcome::Attached
+    );
+    consume_attachment_path_proof(&mut reinjection_receivers);
+    record_server_delivery_evidence(&binding, reinjection_key);
+
+    let (_frame_tx, frame_rx) = mpsc::channel(1);
+    let path_stream = ReliablePathStream {
+        stream_id,
+        max_offset: u64::MAX,
+        lane: TrafficClass::Throughput,
+        underlay: original_key.underlay,
+        max_frame_payload_bytes: reliable_relay_buffer_len(limits),
+        output: ReliablePathStreamOutput::Switchable(binding.clone()),
+        frames: frame_rx,
+    };
+    let mut send_stream =
+        ReliableSendStream::new_with_initial_max_offset(stream_id, limits, u64::MAX);
+    let quantum = MAX_RELIABLE_SERVICE_QUANTUM_BYTES;
+    let frame = send_stream
+        .prepare_data(Bytes::from(vec![0x51; quantum * 9]))
+        .expect("prepare sparse ACK-gap flight");
+    send_stream
+        .commit_prepared_data(&frame)
+        .expect("commit sparse ACK-gap flight");
+    binding.record_original_flight(original_key, &frame);
+    let ack_ranges = [
+        OffsetRange {
+            start: 0,
+            end: quantum as u64,
+        },
+        OffsetRange {
+            start: (quantum * 2) as u64,
+            end: (quantum * 3) as u64,
+        },
+        OffsetRange {
+            start: (quantum * 4) as u64,
+            end: (quantum * 5) as u64,
+        },
+        OffsetRange {
+            start: (quantum * 6) as u64,
+            end: (quantum * 7) as u64,
+        },
+        OffsetRange {
+            start: (quantum * 8) as u64,
+            end: (quantum * 9) as u64,
+        },
+    ];
+    let _ = send_stream.apply_ack(&ack_ranges);
+    let modeled_path = PathSnapshot::new(PathId(1), UnderlayProtocol::Tcp, 500.0, 400_000_000.0);
+    let base_limit = adaptive_reliable_relay_chunk_bytes_with_frame_limit(
+        Some(modeled_path),
+        TrafficClass::Throughput,
+        limits,
+        path_stream.max_frame_payload_bytes,
+    )
+    .max(adaptive_reliable_relay_reinjection_bytes(
+        Some(modeled_path),
+        TrafficClass::Throughput,
+        limits,
+    ));
+    assert_eq!(base_limit, quantum);
+
+    let mut response_sender = ServerResponseSenderService::new_with_performance(
+        SessionId(103),
+        stream_id,
+        MppPerformanceConfig {
+            extra_traffic_hint_percent: 5,
+        },
+    );
+    let outcome = enqueue_reliable_tail_reinjection(
+        &mut response_sender,
+        &path_stream,
+        stream_id,
+        &send_stream,
+        &ack_ranges,
+        true,
+        Some(modeled_path),
+        TrafficClass::Throughput,
+        limits,
+        MppPerformanceConfig {
+            extra_traffic_hint_percent: 5,
+        },
+        path_stream.max_frame_payload_bytes,
+        quantum as u64,
+    );
+
+    assert_eq!(
+        outcome.queued, 1,
+        "the ordinary timer must repair only the frontier gap, not every sparse hole"
+    );
+    assert_eq!(response_sender.bytes(), base_limit);
+    let persistent_limit = reliable_persistent_ack_gap_reinjection_limit_bytes(
+        Some(modeled_path),
+        Some(UnderlayProtocol::Tcp),
+        TrafficClass::Throughput,
+        send_stream.reinjection_bytes(),
+        limits,
+    );
+    assert!(
+        persistent_limit > base_limit,
+        "persistent measured-path evidence may refill a larger target service flight"
+    );
+    let data_ack_outstanding_bytes = send_stream.reinjection_bytes();
+    let dispatch = response_sender
+        .dispatch_next_with_data_ack_outstanding(
+            &path_stream,
+            &mut send_stream,
+            TrafficClass::Throughput,
+            limits,
+            data_ack_outstanding_bytes,
+        )
+        .expect("frontier repair dispatch");
+    assert_eq!(dispatch.selected_path, Some(reinjection_key));
+    assert!(matches!(
+        try_recv_reliable_path_command(&mut reinjection_receivers),
+        Some(ReliablePathCommand::SendFrame(Frame::StreamData {
+            offset,
+            payload,
+            ..
+        })) if offset == quantum as u64 && payload.len() == quantum
+    ));
 }
 
 #[test]
@@ -2805,10 +3094,13 @@ fn persistent_tail_reinjection_preserves_original_flight_attribution() {
         offset: 1024,
         payload: Bytes::from_static(&[0]),
     };
-    assert_eq!(
-        binding.original_flight_keys_overlapping_frame(&first_unacknowledged_byte),
-        vec![original_key],
-        "reinjection must not rewrite original-flight attribution",
+    let original_outputs =
+        binding.original_flight_outputs_overlapping_frame(&first_unacknowledged_byte);
+    assert_eq!(original_outputs.len(), 1);
+    assert_eq!(original_outputs[0].0, original_key);
+    assert!(
+        binding.has_output_incarnation(original_outputs[0].0, original_outputs[0].1),
+        "reinjection must not rewrite exact original-output attribution",
     );
 }
 

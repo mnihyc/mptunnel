@@ -3,12 +3,14 @@ use super::response::{
     ResponseStreamAttachOutcome, ResponseStreamBinding, ServerPathMetricsEntry,
     ServerPathMetricsSource, ServerSessionRegistration, ServerSessionTracker,
 };
+use super::send_buffer::SessionSendBuffer;
 #[cfg(test)]
 use crate::config::ResourceLimits;
 #[cfg(feature = "lab-diagnostics")]
 use crate::lab_diagnostics::{lab_diagnostic, lab_perf_record};
 use crate::model::capacity::reliable_stream_initial_advertised_window_bytes;
 use crate::model::path::{CarrierPathInstanceId, CarrierPathKey};
+use crate::mux::MuxLimits;
 #[cfg(feature = "lab-diagnostics")]
 use crate::protocol::frame::reliable_path_frame_pacing_bytes;
 use crate::protocol::{
@@ -23,8 +25,9 @@ use crate::runtime::path::commands::{
 };
 use crate::runtime::path::{
     ServerCarrierPathIdentity, ServerCarrierPathStatusSnapshot, ServerNewStreamPolicy,
-    ServerRealtimeFlowLease, ServerSessionManagementSnapshot, ServerStreamManagementSnapshot,
-    ServerStreamOpenOutcome, ServerStreamOpenRequest, ServerStreamPort, ServerStreamPortBackend,
+    ServerRealtimeFlowLease, ServerSessionManagementSnapshot, ServerStreamFrameRoute,
+    ServerStreamManagementSnapshot, ServerStreamOpenOutcome, ServerStreamOpenRequest,
+    ServerStreamPort, ServerStreamPortBackend,
 };
 use crate::runtime::recent_ids::{RecentIdCache, reliable_closed_stream_cache_capacity};
 use crate::scheduler::TrafficClass;
@@ -101,6 +104,7 @@ pub(in crate::runtime) struct AcceptedServerReliableStream {
     session_id: SessionId,
     target: TargetAddr,
     stream: Option<ReliablePathStream>,
+    session_send_buffer: SessionSendBuffer,
     retirement: Arc<AcceptedServerReliableStreamRetirementInner>,
     supervised: bool,
 }
@@ -226,6 +230,10 @@ impl AcceptedServerReliableStream {
         self.stream.take().expect("accepted reliable stream")
     }
 
+    pub(in crate::runtime) fn session_send_buffer(&self) -> SessionSendBuffer {
+        self.session_send_buffer.clone()
+    }
+
     pub(in crate::runtime) fn supervise(&mut self) -> AcceptedServerReliableStreamRetirement {
         debug_assert!(!self.supervised, "accepted stream already supervised");
         self.supervised = true;
@@ -283,10 +291,11 @@ impl ServerReliableStreamRegistry {
     #[cfg(test)]
     pub(in crate::runtime) fn new(max_streams: usize) -> Self {
         let (accepted, _receiver) = mpsc::unbounded_channel();
-        Self::with_accept_sender(max_streams, accepted)
+        Self::with_accept_sender(max_streams, accepted, MuxLimits::default())
     }
 
     /// Creates the registry and its uniquely paired relay receiver together.
+    #[cfg(test)]
     pub(in crate::runtime) fn new_accepting(
         max_streams: usize,
     ) -> (
@@ -295,7 +304,29 @@ impl ServerReliableStreamRegistry {
     ) {
         let (accepted, receiver) = mpsc::unbounded_channel();
         (
-            Arc::new(Self::with_accept_sender(max_streams, accepted)),
+            Arc::new(Self::with_accept_sender(
+                max_streams,
+                accepted,
+                MuxLimits::default(),
+            )),
+            receiver,
+        )
+    }
+
+    /// Production constructor whose session buffer follows configured limits.
+    pub(in crate::runtime) fn new_accepting_with_limits(
+        limits: MuxLimits,
+    ) -> (
+        Arc<Self>,
+        mpsc::UnboundedReceiver<AcceptedServerReliableStream>,
+    ) {
+        let (accepted, receiver) = mpsc::unbounded_channel();
+        (
+            Arc::new(Self::with_accept_sender(
+                limits.max_streams,
+                accepted,
+                limits,
+            )),
             receiver,
         )
     }
@@ -337,6 +368,7 @@ impl ServerReliableStreamRegistry {
     fn with_accept_sender(
         max_streams: usize,
         accepted: mpsc::UnboundedSender<AcceptedServerReliableStream>,
+        limits: MuxLimits,
     ) -> Self {
         Self {
             max_streams,
@@ -348,11 +380,13 @@ impl ServerReliableStreamRegistry {
             closed_streams: Mutex::new(RecentIdCache::new(reliable_closed_stream_cache_capacity(
                 max_streams,
             ))),
-            session_tracker: Arc::new(ServerSessionTracker::default()),
+            session_tracker: Arc::new(ServerSessionTracker::from_limits(limits)),
         }
     }
 
     /// Hands an admitted stream to this registry's paired target-relay service.
+    // Channel rejection returns the admitted stream without allocating or losing ownership.
+    #[allow(clippy::result_large_err)]
     pub(in crate::runtime) fn submit_accepted(
         &self,
         accepted: AcceptedServerReliableStream,
@@ -518,6 +552,7 @@ impl ServerReliableStreamRegistry {
         session_id: SessionId,
         target: TargetAddr,
         stream: ReliablePathStream,
+        session_send_buffer: SessionSendBuffer,
     ) -> AcceptedServerReliableStream {
         let stream_id = stream.stream_id;
         let close_output = stream.output.clone();
@@ -525,6 +560,7 @@ impl ServerReliableStreamRegistry {
             session_id,
             target,
             stream: Some(stream),
+            session_send_buffer,
             retirement: Arc::new(AcceptedServerReliableStreamRetirementInner {
                 registry: self.clone(),
                 session_id,
@@ -792,6 +828,7 @@ impl ServerReliableStreamRegistry {
             path_instance_id,
             local_policy,
         );
+        let session_send_buffer = binding.session_send_buffer();
         if let Some(metrics) = initial_metrics {
             binding.install_stored_path_metrics_for_instance(
                 CarrierPathKey { underlay, path_id },
@@ -834,9 +871,12 @@ impl ServerReliableStreamRegistry {
             output: ReliablePathStreamOutput::Switchable(binding),
             frames: frames_rx,
         };
-        Ok(ServerReliableStreamOpen::New(
-            self.accepted_stream(session_id, target, stream),
-        ))
+        Ok(ServerReliableStreamOpen::New(self.accepted_stream(
+            session_id,
+            target,
+            stream,
+            session_send_buffer,
+        )))
     }
 
     pub(in crate::runtime) fn record_path_metrics(
@@ -950,14 +990,10 @@ impl ServerReliableStreamRegistry {
         let metrics = PathMetrics { path_id, ..metrics };
         let mut path_metrics = self.path_metrics.lock().expect("server path metrics lock");
         let previous = path_metrics.get(&instance_key).copied();
-        let capacity_proof = previous
-            .and_then(|previous| previous.capacity_proof)
-            .filter(|proof| proof.expires_at > Instant::now());
         let entry = ServerPathMetricsEntry {
             metrics,
             source,
             recorded_at: Instant::now(),
-            capacity_proof,
         };
         // One registry slot cannot represent both directions. Preserve local
         // sender authority for future attachments; peer hints still update each
@@ -1021,7 +1057,6 @@ impl ServerReliableStreamRegistry {
                 metrics: PathMetrics { path_id, ..metrics },
                 source: ServerPathMetricsSource::LocalSender,
                 recorded_at: Instant::now(),
-                capacity_proof: stored.and_then(|entry| entry.capacity_proof),
             }),
             None => stored,
         }
@@ -1039,15 +1074,6 @@ impl ServerReliableStreamRegistry {
             .expect("server path metrics lock")
             .get(&(session_id, underlay, path_id, path_instance_id))
             .copied()
-            .map(|mut entry| {
-                if entry
-                    .capacity_proof
-                    .is_some_and(|proof| proof.expires_at <= Instant::now())
-                {
-                    entry.capacity_proof = None;
-                }
-                entry
-            })
     }
 
     pub(in crate::runtime) fn detach_path(
@@ -1114,19 +1140,61 @@ impl ServerReliableStreamRegistry {
         result
     }
 
-    async fn route_frame_from_path(
+    pub(in crate::runtime) fn try_route_frame(
+        &self,
+        session_id: SessionId,
+        stream_id: StreamId,
+        frame: Frame,
+    ) -> Result<ServerStreamFrameRoute, RuntimeError> {
+        let stream = {
+            let streams = self
+                .streams
+                .lock()
+                .expect("server reliable stream registry lock");
+            streams
+                .get(&(session_id, stream_id))
+                .map(|entry| entry.frames.clone())
+        };
+        let Some(stream) = stream else {
+            #[cfg(feature = "lab-diagnostics")]
+            lab_diagnostic(
+                "server_stream_unknown_frame_drop",
+                format_args!(
+                    "session_id={} stream_id={} frame_kind={}",
+                    session_id.0,
+                    stream_id.0,
+                    frame.kind_name(),
+                ),
+            );
+            return Ok(ServerStreamFrameRoute::Routed);
+        };
+        match stream.try_send(Ok(frame)) {
+            Ok(()) => Ok(ServerStreamFrameRoute::Routed),
+            Err(mpsc::error::TrySendError::Full(Ok(frame))) => {
+                Ok(ServerStreamFrameRoute::Backpressured(frame))
+            }
+            Err(mpsc::error::TrySendError::Closed(_)) => {
+                Err(RuntimeError::ReliablePathSessionClosed)
+            }
+            Err(mpsc::error::TrySendError::Full(Err(_))) => {
+                unreachable!("server stream routing only sends successful frames")
+            }
+        }
+    }
+
+    fn record_request_feedback_ingress_from_path(
         &self,
         identity: ServerCarrierPathIdentity,
         stream_id: StreamId,
-        frame: Frame,
-    ) -> Result<(), RuntimeError> {
+        frame: &Frame,
+    ) {
         let ServerCarrierPathIdentity {
             session_id,
             underlay,
             path_id,
             path_instance_id,
         } = identity;
-        if matches!(&frame, Frame::StreamData { .. } | Frame::StreamFin { .. })
+        if matches!(frame, Frame::StreamData { .. } | Frame::StreamFin { .. })
             && let Some(binding) = self
                 .streams
                 .lock()
@@ -1141,7 +1209,27 @@ impl ServerReliableStreamRegistry {
                 path_instance_id,
             );
         }
-        self.route_frame(session_id, stream_id, frame).await
+    }
+
+    async fn route_frame_from_path(
+        &self,
+        identity: ServerCarrierPathIdentity,
+        stream_id: StreamId,
+        frame: Frame,
+    ) -> Result<(), RuntimeError> {
+        self.record_request_feedback_ingress_from_path(identity, stream_id, &frame);
+        self.route_frame(identity.session_id, stream_id, frame)
+            .await
+    }
+
+    fn try_route_frame_from_path(
+        &self,
+        identity: ServerCarrierPathIdentity,
+        stream_id: StreamId,
+        frame: Frame,
+    ) -> Result<ServerStreamFrameRoute, RuntimeError> {
+        self.record_request_feedback_ingress_from_path(identity, stream_id, &frame);
+        self.try_route_frame(identity.session_id, stream_id, frame)
     }
 
     pub(in crate::runtime) fn close(&self, session_id: SessionId, stream_id: StreamId) {
@@ -1231,6 +1319,16 @@ impl ServerStreamPortBackend for ServerReliableStreamPortBackend {
             self.registry
                 .route_frame_from_path(identity, stream_id, frame),
         )
+    }
+
+    fn try_route_frame(
+        &self,
+        identity: ServerCarrierPathIdentity,
+        stream_id: StreamId,
+        frame: Frame,
+    ) -> Result<ServerStreamFrameRoute, RuntimeError> {
+        self.registry
+            .try_route_frame_from_path(identity, stream_id, frame)
     }
 
     fn detach_path(

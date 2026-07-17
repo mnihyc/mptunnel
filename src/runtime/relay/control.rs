@@ -11,16 +11,15 @@ use super::io::{
 use super::lifecycle::{
     attach_reliable_relay_paths_with_recovery_exclusions, cancel_pending_additional_path_opens,
     drain_completed_additional_path_opens, handle_additional_path_open_result,
-    recover_reliable_relay_after_path_failure, reliable_relay_can_finish_after_path_loss,
-    reliable_relay_can_send_pending_fin, reliable_relay_lane_changed,
-    reliable_relay_product_stall_deadline,
+    recover_reliable_relay_after_path_failure, reliable_relay_can_send_pending_fin,
+    reliable_relay_lane_changed, reliable_relay_product_stall_deadline,
     reliable_relay_product_stall_preserves_attached_path_set,
     reliable_relay_product_stall_should_try_alternate_attach,
     reliable_relay_queued_send_blocked_for_retry, reliable_relay_receive_hole_reinjection_active,
     reliable_relay_receive_hole_reinjection_deadline,
     reliable_relay_should_wait_for_pending_path_recovery, reliable_relay_stall_progress_anchor,
     reliable_relay_stall_watch_active, spawn_reliable_relay_additional_path_opens,
-    switch_reliable_relay_to_best_path,
+    spawn_reliable_relay_recovery_path_open, switch_reliable_relay_to_best_path,
 };
 use super::open::{ReliableRelayOpenSpec, relay_error_is_tcp_path_failure};
 use super::remote::ReliableRelayAttachMode;
@@ -46,7 +45,6 @@ use crate::runtime::sender::{
     RequestSenderService, reliable_relay_can_read_product_source,
     reliable_relay_sender_queue_limit, reliable_relay_sender_queue_read_budget,
 };
-use crate::runtime::stream::request::RequestOutstandingWindow;
 use crate::runtime::stream::{
     OpenedRemoteStream, ReliableRelayRemoteFrame, ReliableRelayRemotePath, ReliableRelayRemoteSet,
     wait_for_carrier_capacity_notifies,
@@ -79,6 +77,29 @@ fn reliable_relay_request_outstanding_headroom_bytes(
     )
 }
 
+fn reliable_relay_request_outstanding_limit_bytes(
+    lane: crate::scheduler::TrafficClass,
+    payload_bytes: usize,
+    mux_limits: crate::mux::MuxLimits,
+) -> usize {
+    let stream_window = usize::try_from(mux_limits.max_stream_window_bytes).unwrap_or(usize::MAX);
+    let resource_ceiling = mux_limits
+        .max_repair_bytes
+        .min(mux_limits.max_reorder_bytes)
+        .min(stream_window)
+        .max(1);
+    if lane.is_bulk() {
+        // Per-stream peer flow control remains path-independent. A separate
+        // session owner bounds aggregate unique source bytes across streams.
+        resource_ceiling
+    } else {
+        reliable_relay_buffer_len(mux_limits)
+            .min(resource_ceiling)
+            .max(payload_bytes.min(resource_ceiling))
+            .max(1)
+    }
+}
+
 pub(in crate::runtime) async fn relay_migrating_tcp_stream<S>(
     local: S,
     context: &ClientPathContext,
@@ -107,10 +128,11 @@ where
     let mut buf = bytes::BytesMut::with_capacity(chunk_size);
     let mut state = ClientRelayState::new();
     let mut sender = RequestSenderService::new_with_performance(stream_id, performance);
-    let mut request_outstanding_window = RequestOutstandingWindow::new();
     let mut flow_demand = ReliableRelayFlowDemandTracker::new();
     let mut request_flow_demand = ReliableRelayFlowDemandTracker::new();
     let mut sender_queue = ReliableRelaySenderQueue::default();
+    let mut send_buffer_reservation = context.session_send_buffer.stream_reservation();
+    let mut send_buffer_updates = context.session_send_buffer.subscribe();
     let (additional_path_open_tx, mut additional_path_open_rx) = mpsc::channel(
         context
             .tcp_paths
@@ -123,7 +145,7 @@ where
     #[cfg(feature = "lab-diagnostics")]
     let mut last_reported_read_block: Option<(usize, usize, usize, usize, usize)> = None;
     let result = loop {
-        if state.is_finished(sender_queue.is_empty()) {
+        if state.is_finished(&send_stream, &recv_stream, &sender_queue) {
             break Ok(state.delivery.total);
         }
         let timing_path_snapshot =
@@ -135,11 +157,7 @@ where
                     .saturating_add(sender_queue.data_bytes() as u64),
                 recv_stream.next_offset(),
             )
-            .with_pending_product_bytes(
-                sender_queue
-                    .data_bytes()
-                    .saturating_add(send_stream.reinjection_bytes()),
-            ),
+            .with_product_work(sender_queue.data_bytes(), send_stream.reinjection_bytes()),
             timing_path_snapshot,
             context.mux_limits,
         );
@@ -148,11 +166,8 @@ where
             .next_offset()
             .saturating_add(sender_queue.data_bytes() as u64);
         let request_demand_update = request_flow_demand.refresh(
-            ReliableRelayFlowSignals::new(request_observed_bytes, 0).with_pending_product_bytes(
-                sender_queue
-                    .data_bytes()
-                    .saturating_add(send_stream.reinjection_bytes()),
-            ),
+            ReliableRelayFlowSignals::new(request_observed_bytes, 0)
+                .with_product_work(sender_queue.data_bytes(), send_stream.reinjection_bytes()),
             timing_path_snapshot,
             context.mux_limits,
         );
@@ -174,12 +189,15 @@ where
             lab_diagnostic(
                 "client_request_lane_changed",
                 format_args!(
-                    "stream_id={} previous={:?} lane={:?} observed_bytes={} product_rate_mbps={:.3} relay_lane={:?}",
+                    "stream_id={} previous={:?} lane={:?} observed_bytes={} product_rate_mbps={:.3} byte_proven={} rate_proven={} buffered_data={} relay_lane={:?}",
                     stream_id.0,
                     request_demand_update.previous_lane,
                     request_lane,
                     request_demand_update.observed_bytes,
                     request_demand_update.product_rate_bps / 1_000_000.0,
+                    request_demand_update.byte_proven_bulk,
+                    request_demand_update.rate_proven_sustained_bulk,
+                    request_demand_update.buffered_bulk,
                     relay_lane,
                 ),
             );
@@ -218,13 +236,16 @@ where
             lab_diagnostic(
                 "client_stream_lane_changed",
                 format_args!(
-                    "stream_id={} previous={:?} lane={:?} sent_offset={} received_offset={} reinjection_bytes={}",
+                    "stream_id={} previous={:?} lane={:?} sent_offset={} received_offset={} reinjection_bytes={} byte_proven={} rate_proven={} buffered_data={}",
                     stream_id.0,
                     demand_update.previous_lane,
                     relay_lane,
                     send_stream.next_offset(),
                     recv_stream.next_offset(),
                     send_stream.reinjection_bytes(),
+                    demand_update.byte_proven_bulk,
+                    demand_update.rate_proven_sustained_bulk,
+                    demand_update.buffered_bulk,
                 ),
             );
             for key in remotes.load_owned_path_keys() {
@@ -256,7 +277,6 @@ where
                 &remotes,
                 &send_stream,
                 &mut state.recovery.pending_additional_path_opens,
-                &mut state.recovery.additional_path_open_attempts,
                 &additional_path_open_tx,
             ) {
                 state.progress.last_stream_at = Instant::now();
@@ -286,7 +306,6 @@ where
                     &remotes,
                     &send_stream,
                     &mut state.recovery.pending_additional_path_opens,
-                    &mut state.recovery.additional_path_open_attempts,
                     &additional_path_open_tx,
                 ) {
                     state.progress.last_stream_at = Instant::now();
@@ -317,8 +336,11 @@ where
         );
         let adaptive_inflight =
             adaptive_reliable_relay_inflight_bytes(path_snapshot, relay_lane, context.mux_limits);
-        let request_outstanding_limit =
-            request_outstanding_window.limit_bytes(relay_lane, adaptive_chunk, context.mux_limits);
+        let request_outstanding_limit = reliable_relay_request_outstanding_limit_bytes(
+            relay_lane,
+            adaptive_chunk,
+            context.mux_limits,
+        );
         let sender_queue_limit =
             reliable_relay_sender_queue_limit(context.mux_limits, adaptive_inflight);
         let source_read_ceiling = reliable_relay_buffer_len(context.mux_limits)
@@ -339,11 +361,15 @@ where
             lab_diagnostic(
                 "client_relay_budget",
                 format_args!(
-                    "stream_id={} lane={:?} chunk_bytes={} inflight_bytes={} path_snapshot={}",
+                    "stream_id={} lane={:?} chunk_bytes={} inflight_bytes={} request_outstanding_limit_bytes={} session_send_buffer_used_bytes={} session_send_buffer_limit_bytes={} attached_paths={} path_snapshot={}",
                     stream_id.0,
                     relay_lane,
                     adaptive_chunk,
                     adaptive_inflight,
+                    request_outstanding_limit,
+                    context.session_send_buffer.used_bytes(),
+                    context.session_send_buffer.limit_bytes(),
+                    remotes.accepted_path_count(),
                     path_snapshot.is_some(),
                 ),
             );
@@ -494,119 +520,49 @@ where
 
         tokio::select! {
             _ = tokio::time::sleep_until(receive_hole_reinjection_deadline), if receive_hole_reinjection_active => {
-                match attach_reliable_relay_paths_with_recovery_exclusions(
+                let recovery_path_open_spawned = spawn_reliable_relay_recovery_path_open(
                     context,
                     &spec,
                     relay_lane,
-                    &mut remotes,
+                    &remotes,
                     &send_stream,
-                    !state.endpoint.local_open,
-                    ReliableRelayAttachMode::Recovery,
-                    &mut state.recovery.excluded_paths,
-                    &state.recovery.pending_additional_path_opens,
-                )
-                .await
+                    &state.recovery.excluded_paths,
+                    &mut state.recovery.pending_additional_path_opens,
+                    &additional_path_open_tx,
+                );
+                state.progress.receive_hole_reinjection_attempts =
+                    state.progress.receive_hole_reinjection_attempts.saturating_add(1);
+                match sender
+                    .send_recv_progress(
+                        &mut remotes,
+                        context,
+                        &recv_stream,
+                        &mut state.progress.recv_progress,
+                        RelayRecvProgressSend::new(path_snapshot, relay_lane, true),
+                    )
+                    .await
                 {
-                    Ok(attached) if attached > 0 => {
+                    Ok(sent) => state.record_recv_progress_sent(sent),
+                    Err(err) if reliable_path_error_is_migratable(&err) => {
                         state.progress.sender_retry_at = None;
-                        send_stream.update_max_offset(remotes.max_offset());
-                        match sender
-                            .send_recv_progress(
-                                &mut remotes,
-                                context,
-                                &recv_stream,
-                                &mut state.progress.recv_progress,
-                                RelayRecvProgressSend::new(path_snapshot, relay_lane, true),
-                            )
-                            .await
-                        {
-                            Ok(sent) => state.record_stream_progress_sent(sent),
-                            Err(err) if reliable_path_error_is_migratable(&err) => {}
-                            Err(err) => break Err(err),
-                        }
-                        state.progress.last_receive_hole_reinjection_at = Instant::now();
-                        state.progress.receive_hole_reinjection_attempts = 0;
-                        continue;
                     }
-                    Ok(_) => {
-                        state.progress.receive_hole_reinjection_attempts =
-                            state.progress.receive_hole_reinjection_attempts.saturating_add(1);
-                        match sender
-                            .send_recv_progress(
-                                &mut remotes,
-                                context,
-                                &recv_stream,
-                                &mut state.progress.recv_progress,
-                                RelayRecvProgressSend::new(path_snapshot, relay_lane, true),
-                            )
-                            .await
-                        {
-                            Ok(sent) => state.record_stream_progress_sent(sent),
-                            Err(err) if reliable_path_error_is_migratable(&err) => {
-                                match attach_reliable_relay_paths_with_recovery_exclusions(
-                                    context,
-                                    &spec,
-                                    relay_lane,
-                                    &mut remotes,
-                                    &send_stream,
-                                    !state.endpoint.local_open,
-                                    ReliableRelayAttachMode::Recovery,
-                                    &mut state.recovery.excluded_paths,
-                                    &state.recovery.pending_additional_path_opens,
-                                )
-                                .await
-                                {
-                                    Ok(attached) if attached > 0 => {
-                                        state.progress.sender_retry_at = None;
-                                        send_stream.update_max_offset(remotes.max_offset());
-                                        match sender
-                                            .send_recv_progress(
-                                                &mut remotes,
-                                                context,
-                                                &recv_stream,
-                                                &mut state.progress.recv_progress,
-                                                RelayRecvProgressSend::new(
-                                                    path_snapshot,
-                                                    relay_lane,
-                                                    true,
-                                                ),
-                                            )
-                                            .await
-                                        {
-                                            Ok(sent) => state.record_recv_progress_sent(sent),
-                                            Err(recovery_err)
-                                                if reliable_path_error_is_migratable(
-                                                    &recovery_err,
-                                                ) => {}
-                                            Err(recovery_err) => break Err(recovery_err),
-                                        }
-                                        state.progress.last_stream_at = Instant::now();
-                                    }
-                                    Ok(_) => {}
-                                    Err(err) => break Err(err),
-                                }
-                            }
-                            Err(err) => break Err(err),
-                        }
-                        #[cfg(feature = "lab-diagnostics")]
-                        lab_diagnostic(
-                            "receive_hole_reinjection_signal",
-                            format_args!(
-                                "stream_id={} lane={:?} reorder_bytes={} attempts={} action=ack_progress_only",
-                                stream_id.0,
-                                relay_lane,
-                                recv_stream.reorder_bytes(),
-                                state.progress.receive_hole_reinjection_attempts,
-                            ),
-                        );
-                        state.progress.last_receive_hole_reinjection_at = Instant::now();
-                    }
-                    Err(err) if remotes.is_empty() => break Err(err),
-                    Err(err) => {
-                        eprintln!("warning: reliable receive-hole reinjection failed: {err}");
-                        state.progress.last_receive_hole_reinjection_at = Instant::now();
-                    }
+                    Err(err) => break Err(err),
                 }
+                #[cfg(feature = "lab-diagnostics")]
+                lab_diagnostic(
+                    "receive_hole_reinjection_signal",
+                    format_args!(
+                        "stream_id={} lane={:?} reorder_bytes={} attempts={} recovery_path_open_spawned={} action=ack_progress_existing_paths",
+                        stream_id.0,
+                        relay_lane,
+                        recv_stream.reorder_bytes(),
+                        state.progress.receive_hole_reinjection_attempts,
+                        recovery_path_open_spawned,
+                    ),
+                );
+                #[cfg(not(feature = "lab-diagnostics"))]
+                let _ = recovery_path_open_spawned;
+                state.progress.last_receive_hole_reinjection_at = Instant::now();
             }
             _ = tokio::time::sleep_until(stall_deadline), if stall_watch_active => {
                 let queued_existing_tail_reinjection = sender.enqueue_tail_reinjection(
@@ -1100,35 +1056,65 @@ where
                     continue;
                 };
                 state.recovery.pending_additional_path_opens.remove(&additional_path_open.key);
-                if handle_additional_path_open_result(
+                let attached_mode = handle_additional_path_open_result(
                     context,
                     stream_id,
                     &mut remotes,
                     &mut send_stream,
+                    !state.endpoint.local_open,
                     additional_path_open,
                     state.recovery.pending_additional_path_opens.len(),
                     &mut state.progress.last_stream_at,
                 )
-                .await
-                {
+                .await;
+                if attached_mode.is_some() {
                     state.progress.sender_retry_at = None;
+                }
+                if matches!(attached_mode, Some(ReliableRelayAttachMode::Recovery)) {
+                    match sender.send_recv_progress(
+                        &mut remotes,
+                        context,
+                        &recv_stream,
+                        &mut state.progress.recv_progress,
+                        RelayRecvProgressSend::new(path_snapshot, relay_lane, true),
+                    )
+                    .await
+                    {
+                        Ok(sent) => state.record_recv_progress_sent(sent),
+                        Err(err) if reliable_path_error_is_migratable(&err) => {
+                            state.progress.sender_retry_at = None;
+                        }
+                        Err(err) => break Err(err),
+                    }
                 }
             }
             read = async {
                 let read_budget = prospective_read_budget;
+                let permit = context
+                    .session_send_buffer
+                    .reserve(&mut send_buffer_updates, read_budget)
+                    .await;
+                let reserved_read_budget = permit.bytes();
                 #[cfg(feature = "lab-diagnostics")]
                 let read_started = Instant::now();
-                let result = read_reliable_relay_payload(&mut local, &mut buf, read_budget).await;
+                let result = read_reliable_relay_payload(
+                    &mut local,
+                    &mut buf,
+                    reserved_read_budget,
+                )
+                .await;
                 #[cfg(feature = "lab-diagnostics")]
                 if let Ok((read, _)) = &result {
                     lab_perf_record("relay.local_read_wait", read_started.elapsed(), *read);
                 }
-                result
+                (result, permit)
             }, if can_read_local => {
+                let (read, permit) = read;
                 let (read, payload) = match read {
                     Ok(read) => read,
                     Err(err) => break Err(RuntimeError::Io(err)),
                 };
+                permit.retain(&mut send_buffer_reservation, read);
                 if read == 0 {
                     state.record_local_eof();
                 } else {
@@ -1171,10 +1157,24 @@ where
                         }
                         let read = tokio::select! {
                             biased;
-                            read = read_reliable_relay_payload(&mut local, &mut buf, next_read_budget) => read,
+                            read = async {
+                                let permit = context
+                                    .session_send_buffer
+                                    .reserve(&mut send_buffer_updates, next_read_budget)
+                                    .await;
+                                let result = read_reliable_relay_payload(
+                                    &mut local,
+                                    &mut buf,
+                                    permit.bytes(),
+                                )
+                                .await;
+                                (result, permit)
+                            } => read,
                             _ = std::future::ready(()) => break,
                         };
+                        let (read, permit) = read;
                         let (read, payload) = read.map_err(RuntimeError::Io)?;
+                        permit.retain(&mut send_buffer_reservation, read);
                         if read == 0 {
                             state.record_local_eof();
                             break;
@@ -1234,29 +1234,13 @@ where
                                 continue;
                             }
                             Ok(_) => {
-                                if reliable_relay_can_finish_after_path_loss(
-                                    state.endpoint.local_open,
-                                    state.endpoint.remote_open,
-                                    state.endpoint.pending_remote_fin_offset,
-                                    &send_stream,
-                                    &recv_stream,
-                                    &sender_queue,
-                                    state.delivery.total,
-                                ) {
+                                if state.is_finished(&send_stream, &recv_stream, &sender_queue) {
                                     break Ok(state.delivery.total);
                                 }
                                 break Err(err);
                             }
                             Err(_attach_err) => {
-                                if reliable_relay_can_finish_after_path_loss(
-                                    state.endpoint.local_open,
-                                    state.endpoint.remote_open,
-                                    state.endpoint.pending_remote_fin_offset,
-                                    &send_stream,
-                                    &recv_stream,
-                                    &sender_queue,
-                                    state.delivery.total,
-                                ) {
+                                if state.is_finished(&send_stream, &recv_stream, &sender_queue) {
                                     break Ok(state.delivery.total);
                                 }
                                 break Err(err);
@@ -1264,15 +1248,7 @@ where
                         }
                     }
                     Err(err) => {
-                        if reliable_relay_can_finish_after_path_loss(
-                            state.endpoint.local_open,
-                            state.endpoint.remote_open,
-                            state.endpoint.pending_remote_fin_offset,
-                            &send_stream,
-                            &recv_stream,
-                            &sender_queue,
-                            state.delivery.total,
-                        ) {
+                        if state.is_finished(&send_stream, &recv_stream, &sender_queue) {
                             break Ok(state.delivery.total);
                         }
                         break Err(err);
@@ -1282,6 +1258,19 @@ where
                 let frame = match frame {
                     Ok(frame) => frame,
                     Err(err) if reliable_path_error_is_migratable(&err) => {
+                        #[cfg(feature = "lab-diagnostics")]
+                        lab_diagnostic(
+                            "client_path_frame_error",
+                            format_args!(
+                                "stream_id={} path_underlay={:?} path_index={} path_instance_id={:?} attachment_id={} error={}",
+                                stream_id.0,
+                                instance.key.underlay,
+                                instance.key.index,
+                                instance.path_instance_id,
+                                instance.attachment_id,
+                                err,
+                            ),
+                        );
                         sender
                             .fail_client_path_instance(context, &mut remotes, instance)
                             .await;
@@ -1366,15 +1355,7 @@ where
                                         );
                                         continue;
                                     }
-                                    if reliable_relay_can_finish_after_path_loss(
-                                        state.endpoint.local_open,
-                                        state.endpoint.remote_open,
-                                        state.endpoint.pending_remote_fin_offset,
-                                        &send_stream,
-                                        &recv_stream,
-                                        &sender_queue,
-                                        state.delivery.total,
-                                    ) {
+                                    if state.is_finished(&send_stream, &recv_stream, &sender_queue) {
                                         break Ok(state.delivery.total);
                                     }
                                     break Err(err);
@@ -1397,15 +1378,7 @@ where
                                         );
                                         continue;
                                     }
-                                    if reliable_relay_can_finish_after_path_loss(
-                                        state.endpoint.local_open,
-                                        state.endpoint.remote_open,
-                                        state.endpoint.pending_remote_fin_offset,
-                                        &send_stream,
-                                        &recv_stream,
-                                        &sender_queue,
-                                        state.delivery.total,
-                                    ) {
+                                    if state.is_finished(&send_stream, &recv_stream, &sender_queue) {
                                         break Ok(state.delivery.total);
                                     }
                                     break Err(err);
@@ -1496,7 +1469,7 @@ where
                         complete,
                         ranges,
                     } if ack_stream_id == stream_id => {
-                        apply_client_stream_ack(
+                        let released_bytes = apply_client_stream_ack(
                             ClientStreamAckContext {
                                 state: &mut state,
                                 sender: &mut sender,
@@ -1504,7 +1477,6 @@ where
                                 context,
                                 remotes: &remotes,
                                 send_stream: &mut send_stream,
-                                outstanding_window: &mut request_outstanding_window,
                                 path_snapshot,
                                 relay_lane,
                             },
@@ -1512,6 +1484,7 @@ where
                             complete,
                             ranges,
                         );
+                        send_buffer_reservation.release(released_bytes);
                         if reliable_relay_can_send_pending_fin(
                             state.endpoint.pending_local_fin,
                             sender_queue.is_empty(),
@@ -1654,6 +1627,7 @@ where
         stream_id,
         &mut remotes,
         &mut send_stream,
+        !state.endpoint.local_open,
         &mut state.recovery.pending_additional_path_opens,
         &mut additional_path_open_rx,
         &mut state.progress.last_stream_at,
@@ -1674,9 +1648,13 @@ where
             context.mark_relay_path_delivery(key.underlay, key.index, path_stats);
         }
     }
-    // Success and failure both end logical stream ownership. Leaving sibling
-    // carrier entries installed after one-path failure poisons later reuse.
-    remotes.close_all().await;
+    // Successful teardown stays behind ordered FIN work. Failure teardown may
+    // preempt queued data so dead attachments do not poison later reuse.
+    if result.is_ok() {
+        remotes.close_all_ordered().await;
+    } else {
+        remotes.close_all().await;
+    }
     #[cfg(feature = "lab-diagnostics")]
     lab_diagnostic(
         "client_relay_result",

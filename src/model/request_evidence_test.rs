@@ -115,31 +115,3 @@ fn request_rate_samples_use_causal_ack_windows_and_the_slower_clock() {
         RequestPathRateEvidenceUpdate::Proven { sample: None, .. }
     ));
 }
-
-#[test]
-fn request_window_growth_evidence_is_connection_level_ack_credit() {
-    let observed_at = Instant::now();
-    let growth_interval = Duration::from_millis(75);
-    let evidence = RequestWindowGrowthEvidence::AckCredits {
-        bytes: 32 * 1024,
-        growth_interval,
-        observed_at,
-    };
-
-    match evidence {
-        RequestWindowGrowthEvidence::AckCredits {
-            bytes,
-            growth_interval: interval,
-            observed_at: observed,
-        } => {
-            assert_eq!(bytes, 32 * 1024);
-            assert_eq!(interval, growth_interval);
-            assert_eq!(observed, observed_at);
-        }
-        RequestWindowGrowthEvidence::None => panic!("ACK credits must remain available"),
-    }
-    assert!(matches!(
-        RequestWindowGrowthEvidence::None,
-        RequestWindowGrowthEvidence::None
-    ));
-}

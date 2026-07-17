@@ -13,10 +13,12 @@ use crate::runtime::error::RuntimeError;
 use crate::runtime::path::ServerCarrierPathRegistration;
 use crate::runtime::path::proof::{PathProofTracker, path_proof_ack_frame, path_proof_metrics};
 use crate::runtime::path::server_context::ServerPathContext;
+use std::time::Instant;
 
 pub(super) struct ServerTcpEvidenceState {
     tcp_metrics: Option<TcpMetricPublisher>,
     local_metrics: Option<PathMetrics>,
+    sender_refresh_pending: bool,
     path_proofs: PathProofTracker,
     request_capacity_receive: CapacityReceiveTracker,
 }
@@ -30,6 +32,7 @@ impl ServerTcpEvidenceState {
         Self {
             tcp_metrics,
             local_metrics,
+            sender_refresh_pending: false,
             path_proofs: PathProofTracker::default(),
             request_capacity_receive: CapacityReceiveTracker::new(
                 reliable_capacity_measurement_session_limit_bytes(mux_limits),
@@ -43,14 +46,52 @@ impl ServerTcpEvidenceState {
         path_registration: &ServerCarrierPathRegistration,
         path_id: PathId,
     ) {
-        if let Some(metrics) = self
-            .tcp_metrics
-            .as_mut()
-            .and_then(|publisher| {
-                publisher.maybe_observe(path_id, PathMetricDirection::ServerToClient, false)
-            })
-            .and_then(super::metrics::TcpNativeObservation::complete_path_metrics)
-        {
+        self.observe_sender(context, path_registration, path_id, false);
+    }
+
+    /// Kernel ACK progress does not wake the carrier actor. Poll only while a
+    /// prior write can leave scheduler-visible native sender debt behind.
+    pub(super) fn next_sender_observation_at(&self) -> Option<Instant> {
+        if !self.sender_refresh_pending {
+            return None;
+        }
+        self.tcp_metrics
+            .as_ref()
+            .map(TcpMetricPublisher::next_observation_at)
+    }
+
+    /// Publishes the same-socket state reached by a completed writer handoff.
+    /// Writer debt is released only after this observation, so scheduling never
+    /// sees a pre-write idle sample between the private batch and TCP queues.
+    pub(super) fn observe_after_write(
+        &mut self,
+        context: &ServerPathContext,
+        path_registration: &ServerCarrierPathRegistration,
+        path_id: PathId,
+    ) {
+        self.sender_refresh_pending = self.tcp_metrics.is_some();
+        self.observe_sender(context, path_registration, path_id, true);
+    }
+
+    fn observe_sender(
+        &mut self,
+        context: &ServerPathContext,
+        path_registration: &ServerCarrierPathRegistration,
+        path_id: PathId,
+        force: bool,
+    ) {
+        let Some(observation) = self.tcp_metrics.as_mut().and_then(|publisher| {
+            publisher.maybe_observe(path_id, PathMetricDirection::ServerToClient, force)
+        }) else {
+            return;
+        };
+        self.sender_refresh_pending = observation
+            .flight()
+            .is_some_and(|(bytes_in_flight, _, _)| bytes_in_flight > 0)
+            || observation
+                .queue_bytes()
+                .is_some_and(|queue_bytes| queue_bytes > 0);
+        if let Some(metrics) = observation.complete_path_metrics() {
             self.local_metrics = Some(metrics);
             context
                 .reliable_streams

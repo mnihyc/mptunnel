@@ -20,15 +20,14 @@ use tokio::sync::oneshot;
 pub(in crate::runtime) use super::queue::ReliablePathCommandSender;
 pub(in crate::runtime) use super::queue::{
     ReliablePathCommandQueueSnapshot, ReliablePathCommandReceivers, recv_reliable_path_command,
-    reliable_noninterlocked_tcp_writer_run_budget_bytes, reliable_path_command_channels,
-    reliable_path_command_pending_bytes, reliable_path_command_queue,
-    reliable_path_command_writer_run_budget_bytes, reliable_path_command_writer_run_budget_items,
-    reliable_path_command_writer_run_bytes, reliable_path_effective_frame_lane,
-    reliable_path_frame_requires_capacity_command, reliable_path_receivers_closed,
-    reliable_path_stream_ordered_queue_lane, reliable_path_writer_frame_queue,
-    reliable_stream_frame_queue, reliable_stream_frame_queue_for_payload,
-    try_coalesce_reliable_path_writer_run, try_recv_reliable_path_command,
-    try_recv_reliable_path_priority_command,
+    reliable_path_command_carrier_credit_bytes, reliable_path_command_channels,
+    reliable_path_command_channels_with_send_credit, reliable_path_command_pending_bytes,
+    reliable_path_command_queue, reliable_path_command_writer_run_budget_bytes,
+    reliable_path_command_writer_run_budget_items, reliable_path_command_writer_run_bytes,
+    reliable_path_effective_frame_lane, reliable_path_frame_requires_capacity_command,
+    reliable_path_receivers_closed, reliable_path_writer_frame_queue, reliable_stream_frame_queue,
+    reliable_stream_frame_queue_for_payload, try_coalesce_reliable_path_writer_run,
+    try_recv_reliable_path_command, try_recv_reliable_path_priority_command,
 };
 #[cfg(test)]
 pub(in crate::runtime) use super::queue::{
@@ -137,24 +136,6 @@ impl CapacityProbeCommandTicket {
     }
 }
 
-#[derive(Debug)]
-pub(in crate::runtime) struct QuicCapacityProbeCommand {
-    // These fields fence the exact request attachment. QUIC never interprets
-    // product-stream semantics.
-    pub(in crate::runtime) stream_id: StreamId,
-    pub(in crate::runtime) path_instance: RelayPathInstance,
-    pub(in crate::runtime) path_id: PathId,
-    pub(in crate::runtime) measurement_id: u64,
-    pub(in crate::runtime) train_payload_bytes: u64,
-    pub(in crate::runtime) sample_floor_bytes: u64,
-    pub(in crate::runtime) warmup_carrier_bytes: u64,
-    pub(in crate::runtime) required_timed_carrier_bytes: u64,
-    pub(in crate::runtime) proof_validity: Duration,
-    pub(in crate::runtime) expires_at: Instant,
-    pub(in crate::runtime) ticket: CapacityProbeCommandTicket,
-    pub(in crate::runtime) cancel_on_drop: bool,
-}
-
 #[derive(Debug, Clone, Copy)]
 pub(in crate::runtime) struct RequestTcpCapacityProbeRequest {
     pub(in crate::runtime) stream_id: StreamId,
@@ -219,20 +200,6 @@ impl Drop for TcpCapacityProbeCommand {
     }
 }
 
-impl QuicCapacityProbeCommand {
-    pub(in crate::runtime) fn disarm_drop_cancellation(&mut self) {
-        self.cancel_on_drop = false;
-    }
-}
-
-impl Drop for QuicCapacityProbeCommand {
-    fn drop(&mut self) {
-        if self.cancel_on_drop {
-            self.ticket.cancel();
-        }
-    }
-}
-
 pub(in crate::runtime) enum ReliablePathCommand {
     OpenStream {
         stream_id: StreamId,
@@ -249,7 +216,6 @@ pub(in crate::runtime) enum ReliablePathCommand {
         attempt_id: ClientTcpOpenAttemptId,
     },
     SendFrame(Frame),
-    SendQuicCapacityProbe(QuicCapacityProbeCommand),
     SendTcpCapacityProbe(TcpCapacityProbeCommand),
     ResetAndCloseStream {
         stream_id: StreamId,

@@ -3,14 +3,6 @@
 //! QUIC packet-ACK evidence stays native to this carrier. Sender policy only
 //! consumes typed path evidence and never treats it as TCP socket telemetry.
 
-mod capacity;
-pub(in crate::runtime) use capacity::{
-    RequestQuicCapacityProbeLease, RequestQuicCapacityProductAdmissionState,
-    RequestQuicCapacityReconciliationQuery,
-};
-pub(in crate::runtime::path) use capacity::{
-    RequestQuicCapacityProbeSession, RequestQuicCapacityRecord,
-};
 pub(in crate::runtime) mod client;
 mod client_stream;
 mod client_writer;

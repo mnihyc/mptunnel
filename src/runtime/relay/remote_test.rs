@@ -12,7 +12,8 @@ use crate::runtime::error::RuntimeError;
 use crate::runtime::path::ClientPathContext;
 use crate::runtime::path::commands::{
     ReliablePathCommand, ReliablePathCommandReceivers, recv_reliable_path_command,
-    reliable_path_command_channels, try_recv_reliable_path_priority_command,
+    reliable_path_command_channels, reliable_path_command_pending_bytes,
+    try_recv_reliable_path_priority_command,
 };
 use crate::runtime::stream::{OpenedRemoteStream, ReliablePathStream, ReliablePathStreamOutput};
 use crate::scheduler::TrafficClass;
@@ -334,6 +335,78 @@ async fn close_depublishes_load_before_carrier_cleanup_waits() {
         remotes.path_position_at_generation(generation, instance),
         None
     );
+}
+
+#[tokio::test]
+async fn successful_close_preserves_fin_detach_close_order() {
+    let stream_id = StreamId(96);
+    let mux_limits = MuxLimits::default();
+    let (commands, mut receivers) = reliable_path_command_channels(4);
+    let (_frames_tx, frames_rx) = mpsc::channel(1);
+    let opened = OpenedRemoteStream::pending(
+        ReliablePathStream {
+            stream_id,
+            max_offset: mux_limits.max_stream_window_bytes,
+            lane: TrafficClass::Throughput,
+            underlay: UnderlayProtocol::Tcp,
+            max_frame_payload_bytes: reliable_relay_buffer_len(mux_limits),
+            output: ReliablePathStreamOutput::fixed(
+                UnderlayProtocol::Tcp,
+                PathId(0),
+                commands.clone(),
+                mux_limits,
+            ),
+            frames: frames_rx,
+        },
+        0,
+    );
+    let mut remotes = ReliableRelayRemoteSet::new(opened, 1);
+    if let Some(setup) = try_recv_reliable_path_priority_command(&mut receivers) {
+        receivers.release_pending_command_bytes(reliable_path_command_pending_bytes(&setup));
+    }
+
+    commands
+        .send_stream_ordered_frame(
+            Frame::StreamFin {
+                stream_id,
+                final_offset: 0,
+            },
+            TrafficClass::Throughput,
+        )
+        .await
+        .expect("queue FIN replay");
+    remotes.close_all_ordered().await;
+
+    let first = recv_reliable_path_command(&mut receivers)
+        .await
+        .expect("FIN replay");
+    assert!(matches!(
+        &first,
+        ReliablePathCommand::SendFrame(Frame::StreamFin {
+            stream_id: received,
+            ..
+        }) if *received == stream_id
+    ));
+    receivers.release_pending_command_bytes(reliable_path_command_pending_bytes(&first));
+
+    let second = recv_reliable_path_command(&mut receivers)
+        .await
+        .expect("ordered detach");
+    assert!(matches!(
+        &second,
+        ReliablePathCommand::SendFrame(Frame::StreamDetach { stream_id: received })
+            if *received == stream_id
+    ));
+    receivers.release_pending_command_bytes(reliable_path_command_pending_bytes(&second));
+
+    let third = recv_reliable_path_command(&mut receivers)
+        .await
+        .expect("ordered close");
+    assert!(matches!(
+        &third,
+        ReliablePathCommand::CloseStream(received) if *received == stream_id
+    ));
+    receivers.release_pending_command_bytes(reliable_path_command_pending_bytes(&third));
 }
 
 #[test]

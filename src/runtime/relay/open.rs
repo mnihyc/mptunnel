@@ -261,7 +261,14 @@ pub(in crate::runtime) fn reliable_relay_attach_open_timeouts(
             // join, and product open. A live association owns only the last.
             path_open_pto(snapshot, false).saturating_mul(path_open_serialized_exchanges(snapshot))
         }
-        UnderlayProtocol::Udp => live,
+        UnderlayProtocol::Udp => {
+            // A cold QUIC attachment owns transport establishment, path
+            // authentication, and product stream acceptance. Native RTT
+            // evidence prices those serialized exchanges without relying on
+            // periodic probes to keep a product connection prewarmed.
+            path_open_pto(snapshot, context.reliable_path_rtt_is_observed(key))
+                .saturating_mul(path_open_serialized_exchanges(snapshot))
+        }
     };
     ReliableRelayAttachOpenTimeouts {
         live,

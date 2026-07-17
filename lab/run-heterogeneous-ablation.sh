@@ -115,6 +115,7 @@ container_stats_interval="${MPTUNNEL_LAB_CONTAINER_STATS_INTERVAL_SECONDS:-1}"
 management_snapshots="${MPTUNNEL_LAB_MANAGEMENT_SNAPSHOTS:-0}"
 management_snapshot_interval="${MPTUNNEL_LAB_MANAGEMENT_SNAPSHOT_INTERVAL_SECONDS:-1}"
 management_snapshot_port="${MPTUNNEL_LAB_MANAGEMENT_PORT:-17600}"
+management_token="${MPTUNNEL_LAB_MANAGEMENT_TOKEN:-mptunnel-lab-management-token}"
 management_control="${MPTUNNEL_LAB_MANAGEMENT_CONTROL:-0}"
 handoff_initial_wait_seconds="${MPTUNNEL_LAB_HANDOFF_INITIAL_WAIT_SECONDS:-10}"
 handoff_calibration_wait_seconds="${MPTUNNEL_LAB_HANDOFF_CALIBRATION_WAIT_SECONDS:-10}"
@@ -140,6 +141,40 @@ else
   log_tail_bytes="${MPTUNNEL_LAB_LOG_TAIL_BYTES:-4000}"
   log_tail_lines="${MPTUNNEL_LAB_LOG_TAIL_LINES:-120}"
 fi
+mptunnel_protocol_version="$(sed -nE 's/^const VERSION: u8 = ([0-9]+);$/\1/p' src/protocol/codec.rs)"
+if [[ ! "$mptunnel_protocol_version" =~ ^[1-9][0-9]*$ ]]; then
+  echo "unable to determine the MPP wire protocol version" >&2
+  exit 2
+fi
+source_commit="$(git rev-parse --verify HEAD)"
+if [[ -n "$(git status --porcelain --untracked-files=normal -- .)" ]]; then
+  source_tree_dirty=true
+else
+source_tree_dirty=false
+fi
+if flag_enabled "$lab_diagnostics"; then
+  mptunnel_build_features='["lab-diagnostics"]'
+else
+  mptunnel_build_features='[]'
+fi
+result_reproducibility="$(
+  SOURCE_COMMIT="$source_commit" \
+  SOURCE_TREE_DIRTY="$source_tree_dirty" \
+  MPTUNNEL_BUILD_FEATURES="$mptunnel_build_features" \
+  MPTUNNEL_PROTOCOL_VERSION="$mptunnel_protocol_version" \
+    python3 - <<'PY'
+import json
+import os
+
+print(json.dumps({
+    "source_commit": os.environ["SOURCE_COMMIT"],
+    "source_tree_dirty": os.environ["SOURCE_TREE_DIRTY"] == "true",
+    "mptunnel_build_profile": "release",
+    "mptunnel_build_features": json.loads(os.environ["MPTUNNEL_BUILD_FEATURES"]),
+    "mptunnel_protocol_version": int(os.environ["MPTUNNEL_PROTOCOL_VERSION"]),
+}, separators=(",", ":"), sort_keys=True))
+PY
+)"
 if [[ ! "$log_tail_bytes" =~ ^[0-9]+$ ]] || (( log_tail_bytes < 1 )); then
   echo "MPTUNNEL_LAB_LOG_TAIL_BYTES must be a positive integer" >&2
   exit 2
@@ -428,7 +463,10 @@ management_config_toml() {
     echo "MPTUNNEL_LAB_MANAGEMENT_PORT must be an integer from 1 through 65535" >&2
     return 2
   fi
-  printf '[management]\nlisten = ["127.0.0.1:%s"]\n' "$management_snapshot_port"
+  local token_json
+  token_json="$(toml_string "$management_token")"
+  printf '[management]\nlisten = ["127.0.0.1:%s"]\ntoken = %s\n' \
+    "$management_snapshot_port" "$token_json"
 }
 
 server_config_toml() {
@@ -754,6 +792,7 @@ start_case_telemetry() {
       --stop-file "$stop_file" \
       --interval "$management_snapshot_interval" \
       --port "$management_snapshot_port" \
+      --token "$management_token" \
       >/dev/null 2>&1 &
     case_management_pid="$!"
   fi
@@ -860,6 +899,7 @@ append_row_with_telemetry() {
     TELEMETRY="$telemetry_json" \
     LOG_ARTIFACTS="$log_artifacts_json" \
     MPTCP_EVIDENCE="$mptcp_evidence_json" \
+    RESULT_REPRODUCIBILITY="$result_reproducibility" \
     LAB_SCRIPT_DIR="$script_dir" \
     python3 - "$case_name" <<'PY' >> "$result_file"
 import json
@@ -920,6 +960,8 @@ if log_artifacts or row.get("status") not in ("ok", "loss"):
         row["diagnostic_failure_buckets"] = analyze_row(row, log_artifacts, telemetry)
     except Exception as exc:
         row["diagnostic_failure_buckets_error"] = str(exc)
+from result_enrichment import enrich_reproducibility
+enrich_reproducibility(row, os.environ["RESULT_REPRODUCIBILITY"])
 print(json.dumps(row, sort_keys=True))
 PY
 }
@@ -928,16 +970,23 @@ append_skipped_result() {
   local case_name="$1"
   local protocol="$2"
   local reason="$3"
-  CASE_NAME="$case_name" PROTOCOL="$protocol" REASON="$reason" python3 - <<'PY' >> "$result_file"
+  CASE_NAME="$case_name" PROTOCOL="$protocol" REASON="$reason" \
+    RESULT_REPRODUCIBILITY="$result_reproducibility" LAB_SCRIPT_DIR="$script_dir" \
+    python3 - <<'PY' >> "$result_file"
 import json
 import os
+import sys
 
-print(json.dumps({
+row = {
     "case": os.environ["CASE_NAME"],
     "protocol": os.environ["PROTOCOL"],
     "status": "skipped",
     "reason": os.environ["REASON"],
-}, sort_keys=True))
+}
+sys.path.insert(0, os.environ["LAB_SCRIPT_DIR"])
+from result_enrichment import enrich_reproducibility
+enrich_reproducibility(row, os.environ["RESULT_REPRODUCIBILITY"])
+print(json.dumps(row, sort_keys=True))
 PY
 }
 
@@ -966,6 +1015,7 @@ append_download_probe_result() {
 	  LOG_TAIL_BYTES="$log_tail_bytes" \
 	  TELEMETRY="$(case_telemetry_summary "$case_name")" \
 	  LOG_ARTIFACTS="$(case_log_artifacts_summary "$case_name")" \
+	  RESULT_REPRODUCIBILITY="$result_reproducibility" \
 	  LAB_SCRIPT_DIR="$script_dir" \
 	  python3 - "$case_name" <<'PY' >> "$result_file"
 import json
@@ -1036,6 +1086,8 @@ if log_artifacts or row.get("status") not in ("ok", "loss"):
         row["diagnostic_failure_buckets"] = analyze_row(row, log_artifacts, telemetry)
     except Exception as exc:
         row["diagnostic_failure_buckets_error"] = str(exc)
+from result_enrichment import enrich_reproducibility
+enrich_reproducibility(row, os.environ["RESULT_REPRODUCIBILITY"])
 print(json.dumps(row, sort_keys=True))
 PY
 }
@@ -1083,7 +1135,10 @@ control_client_path_state() {
   local underlay="$1"
   local index="$2"
   local state="$3"
-  exec_in client "curl -fsS --max-time 5 -X POST -H 'Content-Type: application/json' --data '{\"underlay\":\"${underlay}\",\"index\":${index},\"state\":\"${state}\"}' 'http://127.0.0.1:${management_snapshot_port}/control/path'"
+  local authorization payload
+  printf -v authorization '%q' "Authorization: Bearer ${management_token}"
+  printf -v payload '%q' "{\"underlay\":\"${underlay}\",\"index\":${index},\"state\":\"${state}\"}"
+  exec_in client "curl -fsS --max-time 5 -X POST -H 'Content-Type: application/json' -H ${authorization} --data ${payload} 'http://127.0.0.1:${management_snapshot_port}/api/control/path'"
 }
 
 run_staged_exact_receipt_handoff_case() {
@@ -1165,7 +1220,7 @@ run_staged_exact_receipt_handoff_case() {
     if (( restore_client_status == 0 && restore_server_status == 0 )); then
       activation_log_offset="$(exec_in server "stat -c %s /tmp/mptunnel-server.log")"
       set +e
-      activate_output="$(control_client_path_state udp 0 active 2>&1)"
+      activate_output="$(control_client_path_state udp 0 enabled 2>&1)"
       activate_status="$?"
       set -e
     else
@@ -1296,6 +1351,7 @@ append_upload_probe_result() {
 	  LOG_TAIL_BYTES="$log_tail_bytes" \
 	  TELEMETRY="$(case_telemetry_summary "$case_name")" \
 	  LOG_ARTIFACTS="$(case_log_artifacts_summary "$case_name")" \
+	  RESULT_REPRODUCIBILITY="$result_reproducibility" \
 	  LAB_SCRIPT_DIR="$script_dir" \
 	  python3 - "$case_name" <<'PY' >> "$result_file"
 import json
@@ -1394,6 +1450,8 @@ if log_artifacts or row.get("status") not in ("ok", "loss"):
         row["diagnostic_failure_buckets"] = analyze_row(row, log_artifacts, telemetry)
     except Exception as exc:
         row["diagnostic_failure_buckets_error"] = str(exc)
+from result_enrichment import enrich_reproducibility
+enrich_reproducibility(row, os.environ["RESULT_REPRODUCIBILITY"])
 print(json.dumps(row, sort_keys=True))
 PY
 }
@@ -2307,6 +2365,7 @@ append_mixed_probe_result() {
   LOG_ARTIFACTS="$(case_log_artifacts_summary "$case_name")" \
   FLAPPING_METADATA="$flapping_metadata_json" \
   PROBE_STDERR="$probe_stderr" \
+  RESULT_REPRODUCIBILITY="$result_reproducibility" \
   LAB_SCRIPT_DIR="$script_dir" \
   python3 - "$case_name" <<'PY' >> "$result_file"
 import json
@@ -2392,6 +2451,8 @@ if log_artifacts or row.get("status") not in ("ok", "loss"):
         row["diagnostic_failure_buckets"] = analyze_row(row, log_artifacts, telemetry)
     except Exception as exc:
         row["diagnostic_failure_buckets_error"] = str(exc)
+from result_enrichment import enrich_reproducibility
+enrich_reproducibility(row, os.environ["RESULT_REPRODUCIBILITY"])
 print(json.dumps(row, sort_keys=True))
 PY
 }

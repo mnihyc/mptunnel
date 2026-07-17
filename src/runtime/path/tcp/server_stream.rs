@@ -17,8 +17,8 @@ use crate::runtime::error::RuntimeError;
 use crate::runtime::path::commands::ReliablePathCommandSender;
 use crate::runtime::path::server_context::ServerPathContext;
 use crate::runtime::path::{
-    ServerCarrierPathRegistration, ServerStreamOpenOutcome, ServerStreamOpenRequest,
-    ServerStreamPathAttachment,
+    ServerCarrierPathRegistration, ServerStreamFrameRoute, ServerStreamOpenOutcome,
+    ServerStreamOpenRequest, ServerStreamPathAttachment,
 };
 use crate::scheduler::traffic_class_from_stream_demand_hint;
 use std::collections::HashSet;
@@ -127,6 +127,39 @@ impl ServerTcpStreamState {
             .route_frame(path_registration, stream_id, frame)
             .await?;
         Ok(())
+    }
+
+    pub(super) fn try_route_frame(
+        &self,
+        context: &ServerPathContext,
+        path_registration: &ServerCarrierPathRegistration,
+        path_id: PathId,
+        stream_id: StreamId,
+        frame: Frame,
+    ) -> Result<ServerStreamFrameRoute, RuntimeError> {
+        #[cfg(not(feature = "lab-diagnostics"))]
+        let _ = path_id;
+        #[cfg(feature = "lab-diagnostics")]
+        if let Frame::StreamAck {
+            complete, ranges, ..
+        } = &frame
+        {
+            lab_diagnostic(
+                "server_tcp_stream_ack_ingress",
+                format_args!(
+                    "stream_id={} path_id={} complete={} ranges={} frontier={} largest_end={}",
+                    stream_id.0,
+                    path_id.0,
+                    complete,
+                    ranges.len(),
+                    stream_ack_contiguous_frontier(ranges),
+                    ranges.last().map_or(0, |range| range.end),
+                ),
+            );
+        }
+        context
+            .reliable_streams
+            .try_route_frame(path_registration, stream_id, frame)
     }
 
     pub(super) fn detach(

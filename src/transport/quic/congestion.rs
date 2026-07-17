@@ -1,10 +1,10 @@
 //! Native QUIC congestion and ACK instrumentation.
 
-use super::{MeasurementMetrics, QuicMeasurementState};
 use std::any::Any;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering, fence};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
+use tokio::sync::Notify;
 
 #[derive(Debug, Clone, Copy)]
 pub struct CongestionMetrics {
@@ -23,7 +23,13 @@ pub struct CongestionMetrics {
     pub non_app_limited_delivery_sample_count: u64,
     pub timed_non_app_limited_delivery_sample_count: u64,
     pub app_limited: bool,
-    pub measurement: Option<MeasurementMetrics>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CarrierSendCreditSnapshot {
+    pub limit_bytes: u64,
+    pub committed_bytes: u64,
+    pub closed: bool,
 }
 
 #[derive(Debug, Default)]
@@ -47,8 +53,10 @@ pub(super) struct QuicCarrierTelemetry {
     ack_snapshot_cursor: Mutex<QuicAckTelemetryTotals>,
     sent_bytes: AtomicU64,
     lost_bytes: AtomicU64,
+    delivery_evidence_written_bytes: AtomicU64,
+    delivery_evidence_pending_ack_bytes: AtomicU64,
+    send_credit_released: Arc<Notify>,
     app_limited: AtomicBool,
-    pub(super) measurement: QuicMeasurementState,
 }
 
 #[derive(Debug, Default, Clone, Copy)]
@@ -74,7 +82,6 @@ pub(super) struct QuicCarrierTelemetrySnapshot {
     pub(super) timed_non_app_limited_delivery_sample_count: u64,
     pub(super) loss_ppm: Option<u32>,
     pub(super) app_limited: bool,
-    pub(super) measurement: Option<MeasurementMetrics>,
 }
 
 pub(super) struct InstrumentedController {
@@ -99,6 +106,39 @@ impl std::fmt::Debug for InstrumentedController {
 }
 
 impl QuicCarrierTelemetry {
+    pub(super) fn record_delivery_evidence_written(&self, bytes: u64) {
+        if bytes == 0 {
+            return;
+        }
+        self.delivery_evidence_written_bytes
+            .fetch_add(bytes, Ordering::Relaxed);
+        self.delivery_evidence_pending_ack_bytes
+            .fetch_add(bytes, Ordering::Release);
+    }
+
+    pub(super) fn delivery_evidence_written_bytes(&self) -> u64 {
+        self.delivery_evidence_written_bytes.load(Ordering::Acquire)
+    }
+
+    pub(super) fn delivery_evidence_pending_ack_bytes(&self) -> u64 {
+        self.delivery_evidence_pending_ack_bytes
+            .load(Ordering::Acquire)
+    }
+
+    pub(super) fn send_credit_notify(&self) -> Arc<Notify> {
+        self.send_credit_released.clone()
+    }
+
+    pub(super) fn bytes_in_flight(&self) -> Option<u64> {
+        self.bytes_in_flight_authoritative
+            .load(Ordering::Acquire)
+            .then(|| self.bytes_in_flight.load(Ordering::Relaxed))
+            .filter(|_| {
+                fence(Ordering::Acquire);
+                self.bytes_in_flight_authoritative.load(Ordering::Relaxed)
+            })
+    }
+
     fn ack_totals(&self) -> QuicAckTelemetryTotals {
         loop {
             let before = self.ack_snapshot_sequence.load(Ordering::Acquire);
@@ -164,14 +204,7 @@ impl QuicCarrierTelemetry {
             let ratio = (lost_bytes as f64 / sent_bytes as f64).clamp(0.0, 1.0);
             (ratio * 1_000_000.0).round() as u32
         });
-        let bytes_in_flight = self
-            .bytes_in_flight_authoritative
-            .load(Ordering::Acquire)
-            .then(|| self.bytes_in_flight.load(Ordering::Relaxed))
-            .filter(|_| {
-                fence(Ordering::Acquire);
-                self.bytes_in_flight_authoritative.load(Ordering::Relaxed)
-            });
+        let bytes_in_flight = self.bytes_in_flight();
         QuicCarrierTelemetrySnapshot {
             bytes_in_flight,
             newly_acked_bytes: (newly_acked_bytes > 0).then_some(newly_acked_bytes),
@@ -186,7 +219,6 @@ impl QuicCarrierTelemetry {
             timed_non_app_limited_delivery_sample_count,
             loss_ppm,
             app_limited: self.app_limited.load(Ordering::Relaxed),
-            measurement: self.measurement_snapshot(),
         }
     }
     fn add_sent(&self, bytes: u64) {
@@ -226,6 +258,14 @@ impl QuicCarrierTelemetry {
         self.bytes_in_flight_authoritative
             .store(true, Ordering::Release);
         self.app_limited.store(app_limited, Ordering::Relaxed);
+        if totals.acked_bytes > 0 {
+            let _ = self.delivery_evidence_pending_ack_bytes.fetch_update(
+                Ordering::AcqRel,
+                Ordering::Acquire,
+                |pending| Some(pending.saturating_sub(totals.acked_bytes)),
+            );
+        }
+        self.send_credit_released.notify_waiters();
     }
 
     fn add_lost(&self, lost_bytes: u64) {
@@ -236,11 +276,8 @@ impl QuicCarrierTelemetry {
                 Ordering::Relaxed,
                 |current| Some(current.saturating_sub(lost_bytes)),
             );
+            self.send_credit_released.notify_waiters();
         }
-    }
-
-    pub(super) fn sent_watermark(&self) -> u64 {
-        self.sent_bytes.load(Ordering::Acquire)
     }
 }
 impl InstrumentedController {
@@ -285,21 +322,6 @@ impl InstrumentedController {
             self.ack_batch_latest_non_app_limited_sent
                 .map_or(sent, |latest| latest.max(sent)),
         );
-    }
-
-    pub(super) fn route_ack_telemetry(
-        &mut self,
-        now: Instant,
-        sent: Instant,
-        bytes: u64,
-        app_limited: bool,
-    ) {
-        if !self
-            .telemetry
-            .accumulate_measurement_ack(now, sent, bytes, app_limited)
-        {
-            self.accumulate_ack_telemetry(sent, bytes, app_limited);
-        }
     }
 
     pub(super) fn finish_ack_telemetry(&mut self, now: Instant, in_flight: u64, app_limited: bool) {
@@ -404,10 +426,7 @@ impl quinn::congestion::Controller for InstrumentedController {
         app_limited: bool,
         rtt: &quinn_proto::RttEstimator,
     ) {
-        // A deliberate epoch owns a connection-wide write epoch. Its ACKs
-        // remain token evidence even when Quinn observes an empty app buffer,
-        // and must never also become product delivery evidence.
-        self.route_ack_telemetry(now, sent, bytes, app_limited);
+        self.accumulate_ack_telemetry(sent, bytes, app_limited);
         self.inner.on_ack(now, sent, bytes, app_limited, rtt);
     }
 
@@ -419,7 +438,6 @@ impl quinn::congestion::Controller for InstrumentedController {
         largest_packet_num_acked: Option<u64>,
     ) {
         self.finish_ack_telemetry(now, in_flight, app_limited);
-        self.telemetry.finish_measurement_ack_batch(now, in_flight);
         self.inner
             .on_end_acks(now, in_flight, app_limited, largest_packet_num_acked);
     }

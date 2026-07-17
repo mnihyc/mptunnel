@@ -11,8 +11,8 @@ use crate::mux::MuxLimits;
 use crate::mux::datagram::DatagramFlow;
 use crate::protocol::codec::CodecLimits;
 use crate::protocol::{
-    CloseReason, DatagramFlowId, DatagramId, Frame, OffsetRange, PathId, PathMetrics, PathUsage,
-    SessionId, TargetAddr, UnderlayProtocol,
+    DatagramFlowId, DatagramId, Frame, OffsetRange, PathId, PathMetrics, PathUsage, SessionId,
+    TargetAddr, UnderlayProtocol,
 };
 use crate::runtime::error::RuntimeError;
 use crate::runtime::identity::{random_session_id, random_u64};
@@ -533,19 +533,6 @@ impl UdpDatagramClientSession {
         tokio::time::timeout_at(probe_deadline, ping)
             .await
             .map_err(|_| RuntimeError::Protocol("UDP path probe ping timed out"))??;
-        Ok(())
-    }
-
-    pub(in crate::runtime) async fn close_session(&mut self) -> Result<(), RuntimeError> {
-        udp_path_write_frame(
-            &mut self.stream.send,
-            &Frame::SessionClose {
-                reason: CloseReason::Normal,
-            },
-            self.stream.runtime.codec_limits,
-        )
-        .await?;
-        let _ = udp_path_finish_stream(&mut self.stream.send);
         Ok(())
     }
 

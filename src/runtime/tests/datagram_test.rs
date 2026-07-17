@@ -264,6 +264,28 @@ fn mixed_datagram_underlay_uses_udp_when_udp_eta_is_better() {
 }
 
 #[test]
+fn realtime_underlay_scoring_uses_the_actual_datagram_size() {
+    let low_latency_udp = "udp://127.0.0.1:10152?srtt-ms=20&rate-mbps=1"
+        .parse::<PathSpec>()
+        .expect("udp path");
+    let bulk_capacity_tcp = "tcp://127.0.0.1:10153?srtt-ms=80&rate-mbps=100"
+        .parse::<PathSpec>()
+        .expect("tcp path");
+    let context = ClientPathContext::new(
+        vec![low_latency_udp, bulk_capacity_tcp],
+        security(),
+        ResourceLimits::default(),
+    )
+    .expect("context");
+
+    assert_eq!(
+        DatagramClientAssociation::select_underlay(&context, 512, DEFAULT_SOCKS5_UDP_TTL_MS),
+        Some(UnderlayProtocol::Udp),
+        "completion scoring must not replace a realtime packet with a bulk probe quantum"
+    );
+}
+
+#[test]
 fn udp_freshness_filter_rejects_paths_that_cannot_fit_ttl() {
     let high_latency_path = "udp://127.0.0.1:10023?srtt-ms=1000&rate-mbps=1"
         .parse::<PathSpec>()
@@ -1208,8 +1230,6 @@ fn quic_path_metrics_feed_path_model_without_fake_bulk_evidence() {
             latest_delivery_sample_count: 0,
             latest_carrier_ack_elapsed: None,
             latest_rate_sample_elapsed: None,
-            capacity_proof_candidate: None,
-            capacity_probe: None,
             #[cfg(feature = "lab-diagnostics")]
             ack_poll: QuicAckPollDiagnostics::default(),
         });
@@ -1245,13 +1265,11 @@ fn quic_path_metrics_feed_path_model_without_fake_bulk_evidence() {
             delivery_sample_count: 2,
             delivery_sample_bytes: 512 * 1024,
             last_delivery_sample_at: Some(now),
-            bulk_proof_expires_at: None,
+            bulk_proof_expires_at: Some(now + Duration::from_secs(1)),
             latest_delivery_sample_bytes: 512 * 1024,
             latest_delivery_sample_count: 2,
             latest_carrier_ack_elapsed: Some(Duration::from_millis(20)),
             latest_rate_sample_elapsed: Some(Duration::from_millis(20)),
-            capacity_proof_candidate: None,
-            capacity_probe: None,
             #[cfg(feature = "lab-diagnostics")]
             ack_poll: QuicAckPollDiagnostics::default(),
         });

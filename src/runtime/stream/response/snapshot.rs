@@ -11,9 +11,11 @@ use super::attachment::{
 use super::evidence::{
     server_output_has_bulk_rate_evidence, server_output_has_durable_product_ack_progress,
     server_output_local_path_metrics, server_path_metrics_estimate_rate_bps,
-    server_path_metrics_has_bulk_rate_evidence, server_quic_capacity_proof,
+    server_path_metrics_has_bulk_rate_evidence,
 };
-use crate::model::capacity::{PATH_OPEN_SCORE_BYTES, RELIABLE_INITIAL_WINDOW_PACKETS};
+use crate::model::capacity::{
+    PATH_OPEN_SCORE_BYTES, RELIABLE_INITIAL_WINDOW_PACKETS, adaptive_reliable_relay_inflight_bytes,
+};
 use crate::model::path::CarrierPathKey;
 use crate::model::response::ResponsePathObservation;
 use crate::mux::MuxLimits;
@@ -44,7 +46,7 @@ impl ResponseStreamBinding {
             .entries
             .iter()
             .filter(|entry| !entry.commands.is_closed())
-            .map(|entry| entry.commands.capacity_notify())
+            .flat_map(|entry| entry.commands.capacity_notifies())
             .collect()
     }
 
@@ -83,6 +85,8 @@ impl ResponseStreamBinding {
                         path_instance_id: entry.path_instance_id,
                         incarnation: entry.incarnation,
                         snapshot,
+                        native_queue_bytes: server_output_native_queue_bytes(entry),
+                        writer_pending_bytes: entry.commands.writer_pending_bytes(),
                         original_data_in_flight_bytes: entry.original_data_in_flight_bytes,
                         is_request_feedback: request_feedback_ingress.is_some_and(|ingress| {
                             ingress.key == entry.key
@@ -108,7 +112,29 @@ impl ResponseStreamBinding {
     }
 }
 
+fn server_output_native_queue_bytes(entry: &ResponseStreamOutputEntry) -> u64 {
+    server_output_local_path_metrics(entry).map_or(0, |metrics| metrics.metrics.queue_bytes)
+}
+
 impl ResponseStreamOutputs {
+    pub(super) fn snapshot_for_instance(
+        &self,
+        key: CarrierPathKey,
+        incarnation: u64,
+        lane: TrafficClass,
+        mux_limits: MuxLimits,
+    ) -> Option<PathSnapshot> {
+        self.entries
+            .iter()
+            .find(|entry| {
+                entry.key == key && entry.incarnation == incarnation && !entry.commands.is_closed()
+            })
+            .map(|entry| {
+                server_bulk_output_snapshot(entry, self.data_level_queue_bytes, lane, mux_limits)
+            })
+    }
+
+    #[cfg(test)]
     pub(super) fn snapshot_for_key(
         &self,
         key: CarrierPathKey,
@@ -155,7 +181,7 @@ impl ResponseStreamOutputs {
 pub(super) fn server_bulk_output_snapshot(
     entry: &ResponseStreamOutputEntry,
     data_level_queue_bytes: u64,
-    _lane: TrafficClass,
+    lane: TrafficClass,
     mux_limits: MuxLimits,
 ) -> PathSnapshot {
     let local_metrics = server_output_local_path_metrics(entry);
@@ -228,11 +254,9 @@ pub(super) fn server_bulk_output_snapshot(
             (metrics.metrics.pacing_rate_bps.max(1) as f64).max(snapshot.delivery_rate_bps);
         snapshot.app_limited = metrics.metrics.app_limited;
         snapshot.queue_bytes = metrics.metrics.queue_bytes;
-        snapshot.bytes_in_flight = match entry.key.underlay {
-            UnderlayProtocol::Udp => metrics.metrics.bytes_in_flight,
-            // Portable TCP telemetry does not expose packet flight in bytes.
-            UnderlayProtocol::Tcp => 0,
-        };
+        // Native flight ranks carrier completion; exact queue/send-credit checks
+        // remain the separate admission authority at command publication.
+        snapshot.bytes_in_flight = metrics.metrics.bytes_in_flight;
         snapshot.carrier_inflight_limit_bytes = metrics.metrics.inflight_limit_bytes;
     }
     snapshot.queue_bytes = snapshot
@@ -241,6 +265,12 @@ pub(super) fn server_bulk_output_snapshot(
     snapshot.data_level_queue_bytes = data_level_queue_bytes;
     snapshot.data_level_bytes_in_flight = entry.bytes_in_flight;
     snapshot.confidence = server_output_confidence(entry);
+    snapshot.data_level_limit_bytes = u64::try_from(adaptive_reliable_relay_inflight_bytes(
+        Some(snapshot),
+        lane,
+        mux_limits,
+    ))
+    .unwrap_or(u64::MAX);
     snapshot
 }
 
@@ -255,11 +285,6 @@ pub(super) fn server_output_confidence(entry: &ResponseStreamOutputEntry) -> f64
         return delivery_confidence;
     };
 
-    if let Some(proof) = server_quic_capacity_proof(metrics) {
-        let proof_confidence =
-            (proof.received_bytes as f64 / proof.sample_floor_bytes.max(1) as f64).clamp(0.0, 1.0);
-        return delivery_confidence.max(proof_confidence);
-    }
     let source_confidence =
         f64::from(metrics.metrics.confidence_ppm).clamp(0.0, 1_000_000.0) / 1_000_000.0;
     if !metrics.metrics.has_ack_derived_data_sample {

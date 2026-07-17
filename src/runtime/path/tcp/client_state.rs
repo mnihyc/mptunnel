@@ -6,12 +6,14 @@
 use super::capacity::RequestTcpCapacityProbeLease;
 use super::client_connection::ClientTcpCarrierConnection;
 use crate::config::SecurityConfig;
+#[cfg(feature = "lab-diagnostics")]
+use crate::lab_diagnostics::lab_diagnostic;
 use crate::model::capacity::reliable_capacity_measurement_session_limit_bytes;
 use crate::model::path::CarrierPathInstanceId;
 use crate::mux::MuxLimits;
 use crate::protocol::codec::CodecLimits;
 use crate::protocol::path_capacity::{CapacityReceiveTracker, PathCapacityReceiveError};
-use crate::protocol::{PathMetrics, SessionId};
+use crate::protocol::{PathId, PathMetricDirection, PathMetrics, SessionId};
 use crate::runtime::path::commands::TcpCapacityProbeCommand;
 use crate::runtime::path::proof::PathProofTracker;
 use crate::runtime::path::state::ClientPathState;
@@ -87,6 +89,54 @@ impl ClientTcpPathSessionRuntime {
         self.security
             .get(self.config_index)
             .expect("TCP session security inventory matches its index")
+    }
+
+    pub(super) fn observe_sender_transport_state(
+        &self,
+        connection: &mut ClientTcpPathConnection,
+        force: bool,
+    ) {
+        let path_id = PathId(self.path_index as u16);
+        let Some(observation) = connection
+            .carrier
+            .tcp_metrics
+            .as_mut()
+            .and_then(|publisher| {
+                publisher.maybe_observe(path_id, PathMetricDirection::ClientToServer, force)
+            })
+        else {
+            return;
+        };
+        #[cfg(feature = "lab-diagnostics")]
+        {
+            let (bytes_in_flight, inflight_limit_bytes, _) =
+                observation.flight().unwrap_or_default();
+            lab_diagnostic(
+                "tcp_sender_metrics",
+                format_args!(
+                    "path_index={} newly_acked_bytes={} acked_bytes_since_epoch={} delivery_rate_mbps={:.3} pacing_rate_mbps={:.3} bytes_in_flight={} inflight_limit={} queue_bytes={} app_limited={}",
+                    self.path_index,
+                    observation.newly_acked_bytes().unwrap_or(0),
+                    observation.acked_bytes_since_epoch().unwrap_or(0),
+                    observation.delivery_rate_bps().unwrap_or(0) as f64 / 1_000_000.0,
+                    observation.pacing_rate_bps().unwrap_or(0) as f64 / 1_000_000.0,
+                    bytes_in_flight,
+                    inflight_limit_bytes,
+                    observation.queue_bytes().unwrap_or(0),
+                    observation.app_limited().unwrap_or(true),
+                ),
+            );
+        }
+        if let Some(record) = self
+            .state
+            .health()
+            .lock()
+            .expect("client path health lock")
+            .tcp
+            .get_mut(self.path_index)
+        {
+            record.mark_tcp_transport_state(connection.path_instance_id, observation);
+        }
     }
 }
 

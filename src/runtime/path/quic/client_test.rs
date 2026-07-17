@@ -22,6 +22,54 @@ fn address_retry_fits_alternates_inside_short_budget() {
 }
 
 #[test]
+fn transient_probe_preserves_network_identity_but_isolates_session_state() {
+    let path: PathSpec = "udp://127.0.0.1:443".parse().expect("UDP path");
+    let security = SecurityConfig::encrypted(
+        crate::config::SharedSecret::new(b"0123456789abcdef0123456789abcdef".to_vec())
+            .expect("secret"),
+    );
+    let state = ClientPathState::new(ClientPathHealth {
+        tcp: Vec::new(),
+        udp: vec![ClientPathHealthRecord::default()],
+    });
+    let runtime = ClientUdpPathSessionRuntime {
+        paths: Arc::new(vec![path]),
+        config_index: 0,
+        path_index: 0,
+        carrier_identity: CarrierPathIdentity {
+            group_ordinal: 7,
+            path_ordinal: 11,
+        },
+        session_id: SessionId(17),
+        security: Arc::new(vec![security]),
+        codec_limits: CodecLimits::default(),
+        mux_limits: MuxLimits::default(),
+        stream_frame_queue: 8,
+        state: state.clone(),
+        carrier_network: Arc::new(crate::transport::SystemCarrierNetworkProvider),
+        peer_status: PeerStatusBroker::new(true),
+        peer_status_snapshot: PeerStatusSnapshotSource::new(Vec::new),
+    };
+    let durable = ClientUdpPathSessionHandle::new(runtime);
+    let probe = durable.transient_probe().expect("transient probe handle");
+
+    assert_ne!(probe.runtime.session_id, durable.runtime.session_id);
+    assert_eq!(
+        probe.runtime.carrier_identity,
+        durable.runtime.carrier_identity
+    );
+    assert_eq!(probe.runtime.config_index, durable.runtime.config_index);
+    assert_eq!(probe.runtime.path_index, durable.runtime.path_index);
+    assert!(Arc::ptr_eq(&probe.runtime.paths, &durable.runtime.paths));
+    assert!(Arc::ptr_eq(
+        &probe.runtime.security,
+        &durable.runtime.security
+    ));
+    assert!(!Arc::ptr_eq(&probe.runtime.state, &state));
+    assert!(!Arc::ptr_eq(&probe.connection, &durable.connection));
+}
+
+#[test]
 fn stream_open_path_status_uses_carrier_instance_and_sequence_fences() {
     let state = ClientPathState::new(ClientPathHealth {
         tcp: Vec::new(),

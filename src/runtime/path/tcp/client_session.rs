@@ -391,9 +391,6 @@ async fn handle_disconnected_client_tcp_command(
                 }
             }
         }
-        ReliablePathCommand::SendQuicCapacityProbe(probe) => {
-            probe.ticket.cancel();
-        }
         ReliablePathCommand::SendTcpCapacityProbe(_) => {}
         ReliablePathCommand::CancelTcpOpen { .. }
         | ReliablePathCommand::SendFrame(_)

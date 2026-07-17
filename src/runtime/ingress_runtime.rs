@@ -564,13 +564,23 @@ pub(super) async fn probe_udp_client_path(
     path_index: usize,
     timeout: Duration,
 ) -> Result<Duration, RuntimeError> {
-    let path_session = context
+    let durable_path_session = context
         .udp_sessions
         .get(path_index)
-        .cloned()
         .ok_or(RuntimeError::NoSchedulableUdpPath)?;
     let probe_deadline = tokio::time::Instant::now() + timeout;
+    // Cold validation prepares the authenticated product carrier and takes its
+    // RTT from QUIC. Later probes are isolated from that durable connection.
+    if let Some(rtt) = durable_path_session
+        .prepare_connection(probe_deadline)
+        .await?
+    {
+        return Ok(rtt);
+    }
+    let path_session = durable_path_session.transient_probe()?;
     let probe_rtt = tokio::time::timeout_at(probe_deadline, async {
+        // A timed probe owns a distinct authenticated QUIC connection. Its
+        // cancellation must never reset product streams on the live path.
         let mut session = UdpDatagramClientSession::open_from_udp_session(
             path_session,
             path_index,
@@ -581,7 +591,7 @@ pub(super) async fn probe_udp_client_path(
         let ping_started_at = Instant::now();
         session.ping_until(probe_deadline).await?;
         let probe_rtt = ping_started_at.elapsed();
-        let _ = session.close_session().await;
+        session.close().await?;
         Ok::<Duration, RuntimeError>(probe_rtt)
     })
     .await

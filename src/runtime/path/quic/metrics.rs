@@ -2,10 +2,7 @@ use super::estimator::UdpPathMetricTracker;
 use super::io::UdpPathConnection;
 #[cfg(feature = "lab-diagnostics")]
 use crate::lab_diagnostics::lab_diagnostic;
-use crate::model::capacity::{
-    QUIC_INITIAL_WINDOW_PACKETS, QUIC_MAX_ACK_DELAY, QUIC_TIMER_GRANULARITY,
-    QuicCapacityProofCandidate,
-};
+use crate::model::capacity::{QUIC_INITIAL_WINDOW_PACKETS, QUIC_TIMER_GRANULARITY};
 use crate::model::timing::transport_pto_from_ms;
 #[cfg(feature = "lab-diagnostics")]
 use crate::protocol::SessionId;
@@ -13,7 +10,6 @@ use crate::protocol::{PathId, PathMetricDirection, PathMetrics, UnderlayProtocol
 use crate::runtime::path::ServerCarrierPathRegistration;
 use crate::runtime::path::model::{metric_epoch_now, ratio_to_ppm};
 use crate::runtime::path::server_context::ServerPathContext;
-use crate::transport::quic as quic_transport;
 use std::time::{Duration, Instant};
 
 #[cfg(feature = "lab-diagnostics")]
@@ -48,6 +44,8 @@ pub(in crate::runtime) struct UdpPathMetrics {
     pub(in crate::runtime) pending_bytes: usize,
     pub(in crate::runtime) loss_ppm: Option<u32>,
     pub(in crate::runtime) ecn_ppm: Option<u32>,
+    /// Native QUIC congestion-controller app-limited state. Placement-proof
+    /// freshness remains independent in `bulk_proof_expires_at`.
     pub(in crate::runtime) app_limited: bool,
     pub(in crate::runtime) ack_derived_data_seen: bool,
     pub(in crate::runtime) delivery_sample_count: u64,
@@ -65,8 +63,6 @@ pub(in crate::runtime) struct UdpPathMetrics {
     pub(in crate::runtime) latest_carrier_ack_elapsed: Option<Duration>,
     #[cfg_attr(not(feature = "lab-diagnostics"), allow(dead_code))]
     pub(in crate::runtime) latest_rate_sample_elapsed: Option<Duration>,
-    pub(in crate::runtime) capacity_proof_candidate: Option<QuicCapacityProofCandidate>,
-    pub(in crate::runtime) capacity_probe: Option<quic_transport::MeasurementMetrics>,
     #[cfg(feature = "lab-diagnostics")]
     pub(in crate::runtime) ack_poll: QuicAckPollDiagnostics,
 }
@@ -160,7 +156,6 @@ pub(super) fn log_quic_ack_poll_diagnostics(
     if ack.newly_acked_bytes > 0
         || ack.delivery_evidence_written_delta > 0
         || ack.pending_sample_bytes > 0
-        || metrics.capacity_probe.is_some()
     {
         lab_diagnostic(
             "quic_carrier_ack_poll",
@@ -191,69 +186,6 @@ pub(super) fn log_quic_ack_poll_diagnostics(
                         .saturating_duration_since(Instant::now())
                         .as_micros())
                     .unwrap_or(0),
-            ),
-        );
-    }
-    if let Some(probe) = metrics.capacity_probe {
-        let now = Instant::now();
-        lab_diagnostic(
-            "quic_capacity_ack_poll",
-            format_args!(
-                "session_id={} path_id={} path_instance_id={} direction={:?} measurement_id={} phase={:?} write_committed={} train_bytes={} written_bytes={} written_data_frame_count={} sample_floor_bytes={} warmup_bytes={} required_proof_bytes={} native_started_clean={} native_total_acked_bytes={} native_total_ack_count={} native_warmup_acked_bytes={} native_warmup_ack_count={} native_measurement_acked_bytes={} native_measurement_ack_count={} native_timed_measurement_acked_bytes={} native_timed_measurement_ack_count={} native_app_limited_acked_bytes={} native_app_limited_ack_count={} native_timed_elapsed_us={} native_proved_age_us={} receipt_received_bytes={} receipt_elapsed_us={} receipt_rtt_us={} receipt_age_us={} last_authoritative_bif_bytes={} last_authoritative_bif_age_us={} last_authoritative_sent_watermark={} receipt_frozen_sent_watermark={} current_sent_watermark={} proof_validity_ms={} proved_age_us={} attempt_remaining_us={} candidate_emitted={}",
-                session_id.0,
-                path_id.0,
-                path_instance_id,
-                metrics.direction,
-                probe.token,
-                probe.phase,
-                probe.write_committed,
-                probe.train_payload_bytes,
-                probe.written_payload_bytes,
-                probe.written_data_frame_count,
-                probe.sample_floor_bytes,
-                probe.warmup_carrier_bytes,
-                probe.required_timed_carrier_bytes,
-                probe.started_clean,
-                probe.total_acked_carrier_bytes,
-                probe.total_ack_sample_count,
-                probe.warmup_acked_carrier_bytes,
-                probe.warmup_ack_sample_count,
-                probe.measurement_acked_carrier_bytes,
-                probe.measurement_ack_sample_count,
-                probe.timed_measurement_acked_carrier_bytes,
-                probe.timed_measurement_ack_sample_count,
-                probe.app_limited_acked_carrier_bytes,
-                probe.app_limited_ack_sample_count,
-                probe
-                    .timed_measurement_ack_elapsed
-                    .unwrap_or_default()
-                    .as_micros(),
-                probe
-                    .native_threshold_at
-                    .map(|confirmed_at| now.saturating_duration_since(confirmed_at).as_micros())
-                    .unwrap_or(0),
-                probe.receipt_received_payload_bytes,
-                probe.receipt_elapsed.unwrap_or_default().as_micros(),
-                probe.receipt_rtt.unwrap_or_default().as_micros(),
-                probe
-                    .receipt_at
-                    .map(|receipt_at| now.saturating_duration_since(receipt_at).as_micros())
-                    .unwrap_or(0),
-                probe.last_authoritative_in_flight.unwrap_or(0),
-                probe
-                    .last_authoritative_in_flight_at
-                    .map(|observed_at| now.saturating_duration_since(observed_at).as_micros())
-                    .unwrap_or(0),
-                probe.last_authoritative_sent_watermark.unwrap_or(0),
-                probe.receipt_frozen_sent_watermark.unwrap_or(0),
-                probe.current_sent_watermark,
-                probe.retention.as_millis(),
-                probe
-                    .confirmed_at
-                    .map(|confirmed_at| now.saturating_duration_since(confirmed_at).as_micros())
-                    .unwrap_or(0),
-                probe.expires_at.saturating_duration_since(now).as_micros(),
-                metrics.capacity_proof_candidate.is_some(),
             ),
         );
     }
@@ -303,19 +235,6 @@ fn duration_to_micros_u32(duration: Duration) -> u32 {
 }
 
 pub(super) fn quic_path_metrics_poll_interval(metrics: UdpPathMetrics) -> Duration {
-    if metrics.capacity_probe.is_some_and(|probe| {
-        matches!(
-            probe.phase,
-            quic_transport::MeasurementPhase::Writing
-                | quic_transport::MeasurementPhase::Measuring
-                | quic_transport::MeasurementPhase::AwaitingReceipt
-                | quic_transport::MeasurementPhase::Complete
-        )
-    }) {
-        // Receipt and retirement are short-lived control transitions. Poll at
-        // quarter RTT, bounded by timer precision and QUIC's max ACK delay.
-        return (metrics.srtt / 4).clamp(QUIC_TIMER_GRANULARITY, QUIC_MAX_ACK_DELAY);
-    }
     if metrics.app_limited {
         transport_pto_from_ms(
             metrics.srtt.as_secs_f64() * 1000.0,

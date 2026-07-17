@@ -46,10 +46,15 @@ async fn server_tcp_path_input_frame_bypasses_queued_bulk_output() {
         .await
         .expect("queue inbound ping");
 
-    match recv_server_tcp_path_event(&mut path_frames, &mut commands_rx, &mut peer_status)
-        .await
-        .expect("server path event")
-        .expect("event")
+    match recv_server_tcp_path_event(
+        &mut path_frames,
+        &mut commands_rx,
+        &mut peer_status,
+        Some(std::time::Instant::now()),
+    )
+    .await
+    .expect("server path event")
+    .expect("event")
     {
         ServerTcpPathEvent::Frame(Frame::Ping { nonce }) => assert_eq!(nonce, 7),
         _ => panic!("expected inbound frame before queued bulk output"),
@@ -71,11 +76,36 @@ async fn server_tcp_peer_eof_terminates_carrier_cleanly() {
         .expect("queue peer close");
 
     assert!(
-        recv_server_tcp_path_event(&mut path_frames, &mut commands_rx, &mut peer_status)
+        recv_server_tcp_path_event(&mut path_frames, &mut commands_rx, &mut peer_status, None)
             .await
             .expect("normal peer close")
             .is_none()
     );
+}
+
+#[tokio::test]
+async fn server_tcp_native_sender_deadline_wakes_an_idle_actor() {
+    let (_commands_tx, mut commands_rx) = reliable_path_command_channels(1);
+    let (_frame_tx, mut path_frames) = mpsc::channel(1);
+    let broker = PeerStatusBroker::new(false);
+    let mut peer_status = broker.register(SessionId(1));
+    let deadline = std::time::Instant::now();
+
+    let event = tokio::time::timeout(
+        Duration::from_secs(1),
+        recv_server_tcp_path_event(
+            &mut path_frames,
+            &mut commands_rx,
+            &mut peer_status,
+            Some(deadline),
+        ),
+    )
+    .await
+    .expect("native sender observation deadline")
+    .expect("server path event")
+    .expect("open carrier");
+
+    assert!(matches!(event, ServerTcpPathEvent::SenderObservationDue));
 }
 
 #[tokio::test]
@@ -251,6 +281,7 @@ async fn server_tcp_terminal_reset_precedes_detach_and_preserves_shared_session(
         "terminal detach must preserve the sibling stream on the shared TCP session"
     );
     assert_eq!(commands_for_streams.pending_bytes(), 0);
+    assert_eq!(commands_for_streams.writer_pending_bytes(), 0);
 
     let sibling_frame = Frame::StreamMaxData {
         stream_id: sibling_stream_id,
@@ -277,6 +308,7 @@ async fn server_tcp_terminal_reset_precedes_detach_and_preserves_shared_session(
             .expect("read sibling TCP output"),
         sibling_frame
     );
+    assert_eq!(commands_for_streams.writer_pending_bytes(), 0);
 
     let detach_context = session.context.clone();
     let detach_commands = session.commands_tx.clone();

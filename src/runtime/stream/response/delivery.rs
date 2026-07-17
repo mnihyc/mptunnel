@@ -202,20 +202,22 @@ impl ResponseStreamBinding {
         ack_frontier: u64,
         lane: TrafficClass,
     ) -> Option<PathSnapshot> {
-        let owner_key = self.blocking_original_path_key_at_or_after(ack_frontier);
+        let owner = self.blocking_original_path_at_or_after(ack_frontier);
         let outputs = self
             .outputs
             .lock()
             .expect("server reliable stream binding lock");
-        owner_key.and_then(|key| outputs.snapshot_for_key(key, lane, self.mux_limits))
+        owner.and_then(|(key, incarnation)| {
+            outputs.snapshot_for_instance(key, incarnation, lane, self.mux_limits)
+        })
     }
 
     pub(in crate::runtime) fn tail_reinjection_original_underlay(
         &self,
         ack_frontier: u64,
     ) -> Option<UnderlayProtocol> {
-        self.blocking_original_path_key_at_or_after(ack_frontier)
-            .map(|key| key.underlay)
+        self.blocking_original_path_at_or_after(ack_frontier)
+            .map(|(key, _)| key.underlay)
     }
 
     pub(in crate::runtime) fn has_multipath_reinjection_alternative(&self) -> bool {
@@ -223,12 +225,15 @@ impl ResponseStreamBinding {
             .lock()
             .expect("server reliable stream binding lock")
             .entries
-            .len()
+            .iter()
+            .filter(|entry| !entry.commands.is_closed())
+            .take(2)
+            .count()
             > 1
     }
 
     pub(in crate::runtime) fn has_reinjection_path_for_frame(&self, frame: &Frame) -> bool {
-        let avoid_keys = self.flight_keys_overlapping_frame(frame);
+        let avoid_outputs = self.flight_outputs_overlapping_frame(frame);
         let outputs = self
             .outputs
             .lock()
@@ -236,12 +241,12 @@ impl ResponseStreamBinding {
         outputs
             .entries
             .iter()
-            .any(|entry| !avoid_keys.contains(&entry.key))
+            .any(|entry| !avoid_outputs.contains(&(entry.key, entry.incarnation)))
     }
 
     pub(in crate::runtime) fn has_tail_reinjection_output_for_frame(&self, frame: &Frame) -> bool {
-        let owner_keys = self.original_flight_keys_overlapping_frame(frame);
-        if owner_keys.is_empty() {
+        let owner_outputs = self.original_flight_outputs_overlapping_frame(frame);
+        if owner_outputs.is_empty() {
             return false;
         }
         self.outputs
@@ -249,7 +254,7 @@ impl ResponseStreamBinding {
             .expect("server reliable stream binding lock")
             .entries
             .iter()
-            .any(|entry| !owner_keys.contains(&entry.key))
+            .any(|entry| !owner_outputs.contains(&(entry.key, entry.incarnation)))
     }
 
     pub(in crate::runtime) fn has_recent_reinjection_overlap(
@@ -345,7 +350,7 @@ impl ResponseStreamBinding {
         &self,
         frame: &Frame,
     ) -> bool {
-        if !self.flight_keys_overlapping_frame(frame).is_empty() {
+        if !self.flight_outputs_overlapping_frame(frame).is_empty() {
             return false;
         }
         !self
@@ -357,7 +362,7 @@ impl ResponseStreamBinding {
     }
 
     pub(in crate::runtime) fn release_normalized_acked_ranges(&self, ranges: &[OffsetRange]) {
-        self.release_normalized_acked_ranges_at(ranges, Instant::now());
+        self.release_normalized_acked_ranges_at(ranges, Instant::now())
     }
 
     pub(super) fn release_normalized_acked_ranges_at(&self, ranges: &[OffsetRange], now: Instant) {
@@ -537,7 +542,7 @@ impl ResponseStreamBinding {
             return Err(RuntimeError::SenderServiceBlocked);
         };
         let commands = outputs.entries[target_index].commands.clone();
-        let command = commands.try_reserve_stream_ordered_frame(frame.clone(), lane)?;
+        let command = commands.try_reserve_reinjection_frame(frame.clone(), lane)?;
         self.record_product_flight_with_outputs(
             &mut outputs,
             target.key,
@@ -694,10 +699,10 @@ impl ResponseStreamBinding {
         }
     }
 
-    pub(in crate::runtime) fn flight_keys_overlapping_frame(
+    pub(in crate::runtime) fn flight_outputs_overlapping_frame(
         &self,
         frame: &Frame,
-    ) -> Vec<CarrierPathKey> {
+    ) -> Vec<(CarrierPathKey, u64)> {
         let Some((start, end, _)) = reliable_stream_frame_extent(frame) else {
             return Vec::new();
         };
@@ -705,22 +710,23 @@ impl ResponseStreamBinding {
             .flights
             .lock()
             .expect("server reliable stream flight lock");
-        let mut keys = Vec::new();
+        let mut outputs = Vec::new();
         for (_, path_flights) in flights.range(..end) {
             for flight in path_flights {
-                if flight.end <= start || keys.contains(&flight.key) {
+                let output = (flight.key, flight.output_incarnation);
+                if flight.end <= start || outputs.contains(&output) {
                     continue;
                 }
-                keys.push(flight.key);
+                outputs.push(output);
             }
         }
-        keys
+        outputs
     }
 
-    pub(in crate::runtime) fn original_flight_keys_overlapping_frame(
+    pub(in crate::runtime) fn original_flight_outputs_overlapping_frame(
         &self,
         frame: &Frame,
-    ) -> Vec<CarrierPathKey> {
+    ) -> Vec<(CarrierPathKey, u64)> {
         let Some((start, end, _)) = reliable_stream_frame_extent(frame) else {
             return Vec::new();
         };
@@ -728,19 +734,20 @@ impl ResponseStreamBinding {
             .flights
             .lock()
             .expect("server reliable stream flight lock");
-        let mut keys = Vec::new();
+        let mut outputs = Vec::new();
         for (_, path_flights) in flights.range(..end) {
             for flight in path_flights {
+                let output = (flight.key, flight.output_incarnation);
                 if flight.end <= start
                     || !flight.kind.is_original_transmission()
-                    || keys.contains(&flight.key)
+                    || outputs.contains(&output)
                 {
                     continue;
                 }
-                keys.push(flight.key);
+                outputs.push(output);
             }
         }
-        keys
+        outputs
     }
 
     pub(in crate::runtime) fn lower_flights_before_offset(
@@ -791,7 +798,10 @@ impl ResponseStreamBinding {
         debts.into_values().collect()
     }
 
-    fn blocking_original_path_key_at_or_after(&self, offset: u64) -> Option<CarrierPathKey> {
+    pub(in crate::runtime) fn blocking_original_path_at_or_after(
+        &self,
+        offset: u64,
+    ) -> Option<(CarrierPathKey, u64)> {
         let flights = self
             .flights
             .lock()
@@ -799,7 +809,7 @@ impl ResponseStreamBinding {
         for path_flights in flights.values() {
             for flight in path_flights {
                 if flight.kind.is_original_transmission() && flight.end > offset {
-                    return Some(flight.key);
+                    return Some((flight.key, flight.output_incarnation));
                 }
             }
         }

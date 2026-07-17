@@ -112,13 +112,37 @@ async fn handle_server_udp_connection(
             result = &mut control, if control_active => {
                 match result {
                     Ok(()) => control_active = false,
-                    Err(err) => break Err(err),
+                    Err(err) => {
+                        #[cfg(feature = "lab-diagnostics")]
+                        crate::lab_diagnostics::lab_diagnostic(
+                            "server_quic_connection_loop_exit",
+                            format_args!(
+                                "session_id={} path_id={} cause=control error={}",
+                                session_id.0,
+                                path_id.0,
+                                err,
+                            ),
+                        );
+                        break Err(err);
+                    }
                 }
             }
             accepted = connection.accept_bi() => {
                 let (send, recv) = match accepted {
                     Ok(stream) => stream,
-                    Err(err) => break Err(err),
+                    Err(err) => {
+                        #[cfg(feature = "lab-diagnostics")]
+                        crate::lab_diagnostics::lab_diagnostic(
+                            "server_quic_connection_loop_exit",
+                            format_args!(
+                                "session_id={} path_id={} cause=accept error={}",
+                                session_id.0,
+                                path_id.0,
+                                err,
+                            ),
+                        );
+                        break Err(err);
+                    }
                 };
                 let context = context.clone();
                 let path_registration = path_registration.clone();

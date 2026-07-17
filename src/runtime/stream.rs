@@ -9,6 +9,7 @@ mod handle;
 mod registry;
 pub(in crate::runtime) mod request;
 pub(in crate::runtime) mod response;
+mod send_buffer;
 
 pub(in crate::runtime) use feedback::{
     ReliableRecvProgress, reliable_relay_recv_progress_resend_active,
@@ -30,3 +31,4 @@ pub(in crate::runtime) use request::{
     OpenedRemoteStream, ReliableRelayAttachOutcome, ReliableRelayRemoteFrame,
     ReliableRelayRemotePath, ReliableRelayRemoteSet,
 };
+pub(in crate::runtime) use send_buffer::SessionSendBuffer;

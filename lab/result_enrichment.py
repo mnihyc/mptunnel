@@ -11,6 +11,44 @@ def _flag_enabled(value: Any) -> bool:
     return str(value).lower() in {"1", "true", "yes"}
 
 
+def enrich_reproducibility(row: dict[str, Any], metadata_value: Any) -> None:
+    """Attach the product source and wire-contract identity used by a lab run."""
+
+    metadata = (
+        json.loads(metadata_value) if isinstance(metadata_value, str) else metadata_value
+    )
+    if not isinstance(metadata, dict):
+        raise ValueError("reproducibility metadata must be an object")
+
+    source_commit = metadata.get("source_commit")
+    build_profile = metadata.get("mptunnel_build_profile")
+    protocol_version = metadata.get("mptunnel_protocol_version")
+    source_tree_dirty = metadata.get("source_tree_dirty")
+    build_features = metadata.get("mptunnel_build_features")
+    if not isinstance(source_commit, str) or not source_commit:
+        raise ValueError("source_commit must be a non-empty string")
+    if not isinstance(build_profile, str) or not build_profile:
+        raise ValueError("mptunnel_build_profile must be a non-empty string")
+    if (
+        isinstance(protocol_version, bool)
+        or not isinstance(protocol_version, int)
+        or protocol_version < 1
+    ):
+        raise ValueError("mptunnel_protocol_version must be a positive integer")
+    if not isinstance(source_tree_dirty, bool):
+        raise ValueError("source_tree_dirty must be a boolean")
+    if not isinstance(build_features, list) or not all(
+        isinstance(feature, str) and feature for feature in build_features
+    ):
+        raise ValueError("mptunnel_build_features must be a string array")
+
+    row["source_commit"] = source_commit
+    row["source_tree_dirty"] = source_tree_dirty
+    row["mptunnel_build_profile"] = build_profile
+    row["mptunnel_build_features"] = sorted(set(build_features))
+    row["mptunnel_protocol_version"] = protocol_version
+
+
 def enrich_instrumentation(
     row: dict[str, Any],
     lab_diag_value: Any,

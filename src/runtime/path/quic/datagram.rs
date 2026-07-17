@@ -11,11 +11,12 @@ use crate::protocol::{DatagramFlowId, Frame, SessionId, TargetAddr};
 use crate::runtime::error::RuntimeError;
 use crate::runtime::path::commands::{
     ReliablePathCommand, ReliablePathCommandReceivers, ReliablePathCommandSender,
-    recv_reliable_path_command, reliable_path_command_channels,
-    reliable_path_command_pending_bytes, reliable_path_command_writer_run_budget_bytes,
-    reliable_path_command_writer_run_budget_items, reliable_path_command_writer_run_bytes,
-    reliable_path_frame_requires_capacity_command, reliable_path_receivers_closed,
-    try_coalesce_reliable_path_writer_run, try_recv_reliable_path_command,
+    recv_reliable_path_command, reliable_path_command_carrier_credit_bytes,
+    reliable_path_command_channels_with_send_credit, reliable_path_command_pending_bytes,
+    reliable_path_command_writer_run_budget_bytes, reliable_path_command_writer_run_budget_items,
+    reliable_path_command_writer_run_bytes, reliable_path_frame_requires_capacity_command,
+    reliable_path_receivers_closed, try_coalesce_reliable_path_writer_run,
+    try_recv_reliable_path_command,
 };
 use crate::runtime::path::server_context::ServerPathContext;
 use crate::runtime::path::{
@@ -37,10 +38,10 @@ pub(super) async fn handle_server_udp_datagram_stream(
     context: ServerPathContext,
     stream_context: ServerUdpDatagramStreamContext,
 ) -> Result<(), RuntimeError> {
-    let (commands_tx, mut commands_rx) = reliable_path_command_channels(udp_path_command_queue(
-        context.mux_limits,
-        context.codec_limits,
-    ));
+    let (commands_tx, mut commands_rx) = reliable_path_command_channels_with_send_credit(
+        udp_path_command_queue(context.mux_limits, context.codec_limits),
+        send.connection.send_credit(),
+    );
     let mut send = send;
     let mut carrier_frames = spawn_quic_path_reader(
         recv,
@@ -175,6 +176,8 @@ async fn drain_server_udp_datagram_commands(
     pending_frames.clear();
     let mut sent_bytes = 0usize;
     let mut sent_items = 0usize;
+    let mut pending_frame_command_bytes = 0usize;
+    let mut pending_frame_carrier_credit_bytes = 0usize;
 
     loop {
         let Some(command) = next_command
@@ -193,7 +196,15 @@ async fn drain_server_udp_datagram_commands(
             {
                 continue;
             }
-            flush_udp_frame_batch(send, pending_frames, context.codec_limits).await?;
+            flush_server_udp_datagram_frame_batch(
+                send,
+                pending_frames,
+                context.codec_limits,
+                commands,
+                &mut pending_frame_command_bytes,
+                &mut pending_frame_carrier_credit_bytes,
+            )
+            .await?;
             #[cfg(feature = "lab-diagnostics")]
             lab_diagnostic(
                 "path_writer_drain",
@@ -212,12 +223,13 @@ async fn drain_server_udp_datagram_commands(
             return Ok(false);
         };
         let pending_bytes = reliable_path_command_pending_bytes(&command);
+        let carrier_credit_bytes = reliable_path_command_carrier_credit_bytes(&command);
         let writer_run_bytes = reliable_path_command_writer_run_bytes(&command);
         let should_close = match command {
             ReliablePathCommand::SendFrame(frame)
                 if reliable_path_frame_requires_capacity_command(&frame) =>
             {
-                commands.release_pending_command_bytes(pending_bytes);
+                commands.release_pending_command_accounting(pending_bytes, carrier_credit_bytes);
                 return Err(RuntimeError::Protocol(
                     "server QUIC datagram writer received capacity data",
                 ));
@@ -227,11 +239,22 @@ async fn drain_server_udp_datagram_commands(
                     flows.retain(|flow| flow.flow_id() != flow_id);
                 }
                 pending_frames.push(frame);
-                commands.release_pending_command_bytes(pending_bytes);
+                pending_frame_command_bytes =
+                    pending_frame_command_bytes.saturating_add(pending_bytes);
+                pending_frame_carrier_credit_bytes =
+                    pending_frame_carrier_credit_bytes.saturating_add(carrier_credit_bytes);
                 sent_bytes = sent_bytes.saturating_add(writer_run_bytes);
                 sent_items = sent_items.saturating_add(1);
                 if sent_bytes >= byte_budget || sent_items >= item_budget {
-                    flush_udp_frame_batch(send, pending_frames, context.codec_limits).await?;
+                    flush_server_udp_datagram_frame_batch(
+                        send,
+                        pending_frames,
+                        context.codec_limits,
+                        commands,
+                        &mut pending_frame_command_bytes,
+                        &mut pending_frame_carrier_credit_bytes,
+                    )
+                    .await?;
                     #[cfg(feature = "lab-diagnostics")]
                     lab_diagnostic(
                         "path_writer_drain",
@@ -251,27 +274,28 @@ async fn drain_server_udp_datagram_commands(
                 }
                 continue;
             }
-            ReliablePathCommand::SendQuicCapacityProbe(probe) => {
-                probe.ticket.cancel();
-                commands.release_pending_command_bytes(pending_bytes);
-                return Err(RuntimeError::Protocol(
-                    "server QUIC datagram writer received reliable capacity command",
-                ));
-            }
             ReliablePathCommand::SendTcpCapacityProbe(_) => {
-                commands.release_pending_command_bytes(pending_bytes);
+                commands.release_pending_command_accounting(pending_bytes, carrier_credit_bytes);
                 return Err(RuntimeError::Protocol(
                     "server QUIC datagram writer received TCP capacity command",
                 ));
             }
             ReliablePathCommand::ResetAndCloseStream { .. } => {
-                commands.release_pending_command_bytes(pending_bytes);
+                commands.release_pending_command_accounting(pending_bytes, carrier_credit_bytes);
                 return Err(RuntimeError::Protocol(
                     "server QUIC datagram writer received reliable terminal command",
                 ));
             }
             ReliablePathCommand::CloseStream(_) => {
-                flush_udp_frame_batch(send, pending_frames, context.codec_limits).await?;
+                flush_server_udp_datagram_frame_batch(
+                    send,
+                    pending_frames,
+                    context.codec_limits,
+                    commands,
+                    &mut pending_frame_command_bytes,
+                    &mut pending_frame_carrier_credit_bytes,
+                )
+                .await?;
                 let _ = udp_path_finish_stream(send);
                 true
             }
@@ -286,7 +310,7 @@ async fn drain_server_udp_datagram_commands(
                 ));
             }
         };
-        commands.release_pending_command_bytes(pending_bytes);
+        commands.release_pending_command_accounting(pending_bytes, carrier_credit_bytes);
         if should_close {
             #[cfg(feature = "lab-diagnostics")]
             lab_diagnostic(
@@ -307,7 +331,15 @@ async fn drain_server_udp_datagram_commands(
         }
         sent_items = sent_items.saturating_add(1);
         if sent_bytes >= byte_budget || sent_items >= item_budget {
-            flush_udp_frame_batch(send, pending_frames, context.codec_limits).await?;
+            flush_server_udp_datagram_frame_batch(
+                send,
+                pending_frames,
+                context.codec_limits,
+                commands,
+                &mut pending_frame_command_bytes,
+                &mut pending_frame_carrier_credit_bytes,
+            )
+            .await?;
             #[cfg(feature = "lab-diagnostics")]
             lab_diagnostic(
                 "path_writer_drain",
@@ -326,6 +358,22 @@ async fn drain_server_udp_datagram_commands(
             return Ok(false);
         }
     }
+}
+
+async fn flush_server_udp_datagram_frame_batch(
+    send: &mut UdpPathSendStream,
+    pending_frames: &mut Vec<Frame>,
+    codec_limits: crate::protocol::codec::CodecLimits,
+    commands: &ReliablePathCommandReceivers,
+    pending_frame_command_bytes: &mut usize,
+    pending_frame_carrier_credit_bytes: &mut usize,
+) -> Result<(), RuntimeError> {
+    let result = flush_udp_frame_batch(send, pending_frames, codec_limits).await;
+    commands.release_pending_command_accounting(
+        std::mem::take(pending_frame_command_bytes),
+        std::mem::take(pending_frame_carrier_credit_bytes),
+    );
+    result
 }
 
 async fn open_server_udp_datagram_flow(

@@ -82,6 +82,11 @@ jobs:
         shell: bash
         run: rustup target add "${{ matrix.target }}"
 
+      - name: Install Rust binary inspection tools
+        if: matrix.kind == 'windows'
+        shell: bash
+        run: rustup component add llvm-tools-preview
+
       - name: Install musl C compiler
         if: matrix.kind == 'musl'
         shell: bash
@@ -162,10 +167,13 @@ jobs:
           if ($LASTEXITCODE -ne 0) { throw "Release archive verification failed" }
 
           $binary = "target/$target/release/mptunnel.exe"
-          $inspection = & dumpbin.exe /HEADERS /DEPENDENTS $binary
-          if ($LASTEXITCODE -ne 0) { throw "dumpbin failed for $binary" }
+          $hostTarget = rustc --print host-tuple
+          $llvmReadobj = Join-Path (rustc --print sysroot) "lib/rustlib/$hostTarget/bin/llvm-readobj.exe"
+          if (-not (Test-Path -PathType Leaf $llvmReadobj)) { throw "llvm-readobj not found at $llvmReadobj" }
+          $inspection = & $llvmReadobj --file-headers --coff-imports $binary
+          if ($LASTEXITCODE -ne 0) { throw "llvm-readobj failed for $binary" }
           $inspection | Write-Output
-          $expectedMachine = if ($target.StartsWith("x86_64-")) { "machine \(x64\)" } else { "machine \(ARM64\)" }
+          $expectedMachine = if ($target.StartsWith("x86_64-")) { "(?m)^Arch: x86_64$" } else { "(?m)^Arch: aarch64$" }
           if (($inspection -join "`n") -notmatch $expectedMachine) {
             throw "PE machine type does not match $target"
           }

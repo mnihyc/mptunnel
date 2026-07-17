@@ -1,6 +1,6 @@
 # Release milestones
 
-## 2026-07-18: v0.1.0 release candidate
+## 2026-07-18: v0.1.0 public release (frozen)
 
 Runtime source `1018992` is the release candidate. It adds five-minute logical
 session retention across complete carrier loss, the completion-driven
@@ -25,9 +25,17 @@ Local verification passes 912 all-feature Rust tests, warnings-denied clippy,
 Windows-target end-to-end QUIC execution under Wine, formatting, lab contracts,
 shell syntax, and diff integrity. Release Check run `29611283125` passed the
 exact runtime commit across Linux musl x64/ARM64, Windows MSVC x64/ARM64 with
-native tests and static CRT, macOS x64/ARM64, and Android ARM64. Publication of
-the final release-doc commit receives the same gate before this candidate is
-published and frozen.
+native tests and static CRT, macOS x64/ARM64, and Android ARM64. Final Release
+Check run `29612375287` passed the same exact inventory for release-doc commit
+`965f282`.
+
+Annotated tag `v0.1.0` resolves to
+`965f28280313c3b3cc8ca4ece6339d2a8c2c46bb`. Release run `29612988937`
+published the non-draft [mptunnel 0.1.0 release](https://github.com/mnihyc/mptunnel/releases/tag/v0.1.0)
+with seven platform archives, seven adjacent checksum files, `SHA256SUMS`, and
+`version.json`. A fresh download passed every checksum, and `version.json`
+records the exact tag, commit, version, and Rust 1.96.0 toolchain. This tag and
+its evidence are immutable; later development belongs to a later release.
 
 ## 2026-07-17: matched reference cohort
 

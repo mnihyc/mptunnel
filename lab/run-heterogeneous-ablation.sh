@@ -43,6 +43,10 @@ else
 fi
 result_file="$(normalize_lab_result_path "${RESULT_FILE:-$result_dir/heterogeneous-$timestamp.jsonl}")"
 object_mib="${MPTUNNEL_LAB_OBJECT_MIB:-1024}"
+if [[ ! "$object_mib" =~ ^[1-9][0-9]*$ ]]; then
+  echo "MPTUNNEL_LAB_OBJECT_MIB must be a positive integer" >&2
+  exit 2
+fi
 large_http_path="${MPTUNNEL_LAB_LARGE_HTTP_PATH:-/large.bin}"
 small_http_path="${MPTUNNEL_LAB_SMALL_HTTP_PATH:-/small.bin}"
 small_object_kib="${MPTUNNEL_LAB_SMALL_OBJECT_KIB:-32}"
@@ -55,6 +59,9 @@ server_port="${SERVER_PORT:-7443}"
 baseline_vmess_port="${BASELINE_VMESS_PORT:-18443}"
 baseline_hysteria2_port="${BASELINE_HYSTERIA2_PORT:-18444}"
 baseline_mptcp_port="${BASELINE_MPTCP_PORT:-18081}"
+baseline_lock_file="$script_dir/baseline-lock.json"
+baseline_lock_sha256="$(sha256sum "$baseline_lock_file" | awk '{print $1}')"
+baseline_tool_command="env MPTUNNEL_LAB_BASELINE_LOCK_SHA256=${baseline_lock_sha256} bash /workspace/lab/baseline-tools.sh"
 curl_timeout="${CURL_TIMEOUT_SECONDS:-120}"
 upload_process_timeout_seconds="$(
   LOAD_DURATION_SECONDS="$load_duration_seconds" \
@@ -422,6 +429,7 @@ write_run_manifest() {
   RESULT_REPRODUCIBILITY="$result_reproducibility" \
   RESULT_FILE="$result_file" \
   CASE_FILTER_VALUE="$case_filter" \
+  OBJECT_MIB="$object_mib" \
   LOAD_DURATION_SECONDS="$load_duration_seconds" \
   UPLOAD_DRAIN_TIMEOUT_SECONDS="$upload_drain_timeout_seconds" \
   BULK_CONNECTIONS="$bulk_connections" \
@@ -445,6 +453,8 @@ write_run_manifest() {
   HOST_MEMORY_BYTES="$(awk '/^MemTotal:/ {print $2 * 1024}' /proc/meminfo)" \
   DOCKER_VERSION="$(docker version --format '{{.Client.Version}}')" \
   COMPOSE_VERSION="$(docker compose version --short)" \
+  BASELINE_LOCK_FILE="$script_dir/baseline-lock.json" \
+  BASELINE_LOCK_SHA256="$baseline_lock_sha256" \
   LAB_SCRIPT_DIR="$script_dir" \
     python3 - "$result_dir/run-manifest.json" <<'PY'
 import os
@@ -1079,6 +1089,7 @@ append_row_with_telemetry() {
   local protocol="${3:-}"
   local mptunnel_row="${4:-0}"
   local mptcp_evidence_json="${5:-}"
+  local baseline_identity_json="${6:-}"
   local telemetry_json log_artifacts_json
   telemetry_json="$(case_telemetry_summary "$case_name")"
   log_artifacts_json="$(case_log_artifacts_summary "$case_name")"
@@ -1091,6 +1102,7 @@ append_row_with_telemetry() {
     TELEMETRY="$telemetry_json" \
     LOG_ARTIFACTS="$log_artifacts_json" \
     MPTCP_EVIDENCE="$mptcp_evidence_json" \
+    BASELINE_IDENTITY="$baseline_identity_json" \
     RESULT_REPRODUCIBILITY="$result_reproducibility" \
     LAB_SCRIPT_DIR="$script_dir" \
     python3 - "$case_name" <<'PY' >> "$result_file"
@@ -1154,6 +1166,8 @@ if log_artifacts or row.get("status") not in ("ok", "loss"):
         row["diagnostic_failure_buckets_error"] = str(exc)
 from result_enrichment import enrich_reproducibility
 enrich_reproducibility(row, os.environ["RESULT_REPRODUCIBILITY"])
+from result_enrichment import enrich_baseline_identity
+enrich_baseline_identity(row, os.environ.get("BASELINE_IDENTITY", ""))
 print(json.dumps(row, sort_keys=True))
 PY
 }
@@ -1189,6 +1203,7 @@ append_download_probe_result() {
   local probe_stderr="$4"
   local mptunnel_row="${5:-1}"
   local fallback_protocol="${6:-tcp}"
+  local baseline_identity_json="${7:-}"
   local client_log server_log
 
   client_log="$(exec_in client "for file in /tmp/mptunnel-client-*.log; do [ -f \"\$file\" ] || continue; echo \"== \$(basename \"\$file\") ==\"; tail -n '${log_tail_lines}' \"\$file\"; done | tail -c '${log_tail_bytes}'" 2>/dev/null || true)"
@@ -1208,6 +1223,7 @@ append_download_probe_result() {
 	  TELEMETRY="$(case_telemetry_summary "$case_name")" \
 	  LOG_ARTIFACTS="$(case_log_artifacts_summary "$case_name")" \
 	  RESULT_REPRODUCIBILITY="$result_reproducibility" \
+	  BASELINE_IDENTITY="$baseline_identity_json" \
 	  LAB_SCRIPT_DIR="$script_dir" \
 	  python3 - "$case_name" <<'PY' >> "$result_file"
 import json
@@ -1280,6 +1296,8 @@ if log_artifacts or row.get("status") not in ("ok", "loss"):
         row["diagnostic_failure_buckets_error"] = str(exc)
 from result_enrichment import enrich_reproducibility
 enrich_reproducibility(row, os.environ["RESULT_REPRODUCIBILITY"])
+from result_enrichment import enrich_baseline_identity
+enrich_baseline_identity(row, os.environ.get("BASELINE_IDENTITY", ""))
 print(json.dumps(row, sort_keys=True))
 PY
 }
@@ -1520,6 +1538,7 @@ append_upload_probe_result() {
   local observer_elapsed_seconds="${7:-}"
   local observer_freeze_exit_code="${8:-0}"
   local mptcp_evidence_json="${9:-}"
+  local baseline_identity_json="${10:-}"
   local client_log server_log target_sink_observer
 
   client_log="$(exec_in client "for file in /tmp/mptunnel-client-*.log; do [ -f \"\$file\" ] || continue; echo \"== \$(basename \"\$file\") ==\"; tail -n '${log_tail_lines}' \"\$file\"; done | tail -c '${log_tail_bytes}'" 2>/dev/null || true)"
@@ -1544,6 +1563,7 @@ append_upload_probe_result() {
 	  TELEMETRY="$(case_telemetry_summary "$case_name")" \
 	  LOG_ARTIFACTS="$(case_log_artifacts_summary "$case_name")" \
 	  RESULT_REPRODUCIBILITY="$result_reproducibility" \
+	  BASELINE_IDENTITY="$baseline_identity_json" \
 	  LAB_SCRIPT_DIR="$script_dir" \
 	  python3 - "$case_name" <<'PY' >> "$result_file"
 import json
@@ -1644,6 +1664,8 @@ if log_artifacts or row.get("status") not in ("ok", "loss"):
         row["diagnostic_failure_buckets_error"] = str(exc)
 from result_enrichment import enrich_reproducibility
 enrich_reproducibility(row, os.environ["RESULT_REPRODUCIBILITY"])
+from result_enrichment import enrich_baseline_identity
+enrich_baseline_identity(row, os.environ.get("BASELINE_IDENTITY", ""))
 print(json.dumps(row, sort_keys=True))
 PY
 }
@@ -2312,6 +2334,7 @@ run_baseline_download_probe_case() {
   local case_name="$1"
   local protocol="$2"
   local proxy_port_arg="$3"
+  local baseline_identity_json="${4:-}"
   local out_file="/tmp/mptunnel-baseline-${case_name}.out"
   local err_file="/tmp/mptunnel-baseline-${case_name}.err"
   local output probe_stderr exit_code
@@ -2326,9 +2349,9 @@ run_baseline_download_probe_case() {
   probe_stderr="$(exec_in client "tail -n 80 '${err_file}' 2>/dev/null | tail -c 4000 || true")"
   set -e
   if [[ -n "$output" ]]; then
-    append_row_with_telemetry "$case_name" "$output" "$protocol"
+    append_row_with_telemetry "$case_name" "$output" "$protocol" 0 "" "$baseline_identity_json"
   else
-    append_download_probe_result "$case_name" "$exit_code" "" "$probe_stderr" 0 "$protocol"
+    append_download_probe_result "$case_name" "$exit_code" "" "$probe_stderr" 0 "$protocol" "$baseline_identity_json"
   fi
 }
 
@@ -2336,6 +2359,7 @@ run_baseline_upload_probe_case() {
   local case_name="$1"
   local protocol="$2"
   local proxy_port_arg="$3"
+  local baseline_identity_json="${4:-}"
   local out_file="/tmp/mptunnel-baseline-upload-${case_name}.out"
   local err_file="/tmp/mptunnel-baseline-upload-${case_name}.err"
   local output probe_stderr exit_code
@@ -2356,13 +2380,56 @@ run_baseline_upload_probe_case() {
   output="$(exec_in client "cat '${out_file}' 2>/dev/null || true")"
   probe_stderr="$(exec_in client "tail -n 80 '${err_file}' 2>/dev/null | tail -c 4000 || true")"
   set -e
-  append_upload_probe_result "$case_name" "$exit_code" "$output" "$probe_stderr" 0 "${protocol}-upload" "$observer_elapsed_seconds" "$observer_freeze_exit_code"
+  append_upload_probe_result "$case_name" "$exit_code" "$output" "$probe_stderr" 0 "${protocol}-upload" "$observer_elapsed_seconds" "$observer_freeze_exit_code" "" "$baseline_identity_json"
 }
 
 ensure_baseline_tool() {
   local service="$1"
   local tool="$2"
-  exec_in "$service" "bash /workspace/lab/baseline-tools.sh 'ensure-${tool}'"
+  exec_in "$service" "$baseline_tool_command 'ensure-${tool}'"
+}
+
+capture_baseline_identity() {
+  local tool="$1"
+  local client_identity server_identity
+  client_identity="$(exec_in client "$baseline_tool_command 'identity-${tool}'")"
+  server_identity="$(exec_in server "$baseline_tool_command 'identity-${tool}'")"
+  CLIENT_IDENTITY="$client_identity" SERVER_IDENTITY="$server_identity" TOOL="$tool" \
+  BASELINE_LOCK_FILE="$baseline_lock_file" BASELINE_LOCK_SHA256="$baseline_lock_sha256" \
+  LAB_SCRIPT_DIR="$script_dir" \
+    python3 - <<'PY'
+import json
+import os
+import sys
+
+tool = os.environ["TOOL"]
+client = json.loads(os.environ["CLIENT_IDENTITY"])
+server = json.loads(os.environ["SERVER_IDENTITY"])
+lock_path = os.environ["BASELINE_LOCK_FILE"]
+lock_sha256 = os.environ["BASELINE_LOCK_SHA256"]
+sys.path.insert(0, os.environ["LAB_SCRIPT_DIR"])
+from result_enrichment import load_baseline_lock
+locked_tool = load_baseline_lock(lock_path, lock_sha256)["tools"][tool]
+if client.get("tool") != tool or server.get("tool") != tool:
+    raise ValueError("baseline endpoint identity names do not match")
+for endpoint in (client, server):
+    architecture = endpoint.get("architecture")
+    asset = locked_tool["assets"].get(architecture, {})
+    if endpoint.get("release") != locked_tool["release"]:
+        raise ValueError("baseline endpoint release does not match the run lock")
+    if (
+        endpoint.get("asset_name") != asset.get("name")
+        or endpoint.get("asset_sha256") != asset.get("sha256")
+    ):
+        raise ValueError("baseline endpoint asset does not match the run lock")
+identity = {
+    "tool": tool,
+    "lock_sha256": lock_sha256,
+    "client": client,
+    "server": server,
+}
+print(json.dumps(identity, separators=(",", ":"), sort_keys=True))
+PY
 }
 
 run_vmess_baseline_case() {
@@ -2376,8 +2443,8 @@ run_vmess_baseline_case() {
   fi
   exec_in server "bash /workspace/lab/baseline-tools.sh write-xray-server '${baseline_uuid}' '${server_ip}' '${baseline_vmess_port}'"
   exec_in client "bash /workspace/lab/baseline-tools.sh write-xray-client '${baseline_uuid}' '${server_ip}' '${baseline_vmess_port}' 127.0.0.1 '${baseline_proxy_port}'"
-  exec_in server "bash /workspace/lab/baseline-tools.sh run-xray-server >/tmp/mptunnel-baseline-vmess-server.log 2>&1 & echo \$! >/tmp/mptunnel-baseline-vmess-server.pid"
-  exec_in client "bash /workspace/lab/baseline-tools.sh run-xray-client >/tmp/mptunnel-baseline-vmess-client.log 2>&1 & echo \$! >/tmp/mptunnel-baseline-vmess-client.pid"
+  exec_in server "$baseline_tool_command run-xray-server >/tmp/mptunnel-baseline-vmess-server.log 2>&1 & echo \$! >/tmp/mptunnel-baseline-vmess-server.pid"
+  exec_in client "$baseline_tool_command run-xray-client >/tmp/mptunnel-baseline-vmess-client.log 2>&1 & echo \$! >/tmp/mptunnel-baseline-vmess-client.pid"
   sleep 1
   if ! exec_in server "kill -0 \$(cat /tmp/mptunnel-baseline-vmess-server.pid)" || \
      ! exec_in client "kill -0 \$(cat /tmp/mptunnel-baseline-vmess-client.pid)"; then
@@ -2385,7 +2452,13 @@ run_vmess_baseline_case() {
     stop_baselines
     return 0
   fi
-  run_baseline_download_probe_case "$case_name" "vmess" "$baseline_proxy_port"
+  local baseline_identity_json
+  if ! baseline_identity_json="$(capture_baseline_identity xray)"; then
+    append_skipped_result "$case_name" "vmess" "could not verify the running xray executables"
+    stop_baselines
+    return 0
+  fi
+  run_baseline_download_probe_case "$case_name" "vmess" "$baseline_proxy_port" "$baseline_identity_json"
   stop_baselines
 }
 
@@ -2400,8 +2473,8 @@ run_vmess_baseline_upload_case() {
   fi
   exec_in server "bash /workspace/lab/baseline-tools.sh write-xray-server '${baseline_uuid}' '${server_ip}' '${baseline_vmess_port}'"
   exec_in client "bash /workspace/lab/baseline-tools.sh write-xray-client '${baseline_uuid}' '${server_ip}' '${baseline_vmess_port}' 127.0.0.1 '${baseline_proxy_port}'"
-  exec_in server "bash /workspace/lab/baseline-tools.sh run-xray-server >/tmp/mptunnel-baseline-vmess-server.log 2>&1 & echo \$! >/tmp/mptunnel-baseline-vmess-server.pid"
-  exec_in client "bash /workspace/lab/baseline-tools.sh run-xray-client >/tmp/mptunnel-baseline-vmess-client.log 2>&1 & echo \$! >/tmp/mptunnel-baseline-vmess-client.pid"
+  exec_in server "$baseline_tool_command run-xray-server >/tmp/mptunnel-baseline-vmess-server.log 2>&1 & echo \$! >/tmp/mptunnel-baseline-vmess-server.pid"
+  exec_in client "$baseline_tool_command run-xray-client >/tmp/mptunnel-baseline-vmess-client.log 2>&1 & echo \$! >/tmp/mptunnel-baseline-vmess-client.pid"
   sleep 1
   if ! exec_in server "kill -0 \$(cat /tmp/mptunnel-baseline-vmess-server.pid)" || \
      ! exec_in client "kill -0 \$(cat /tmp/mptunnel-baseline-vmess-client.pid)"; then
@@ -2409,7 +2482,13 @@ run_vmess_baseline_upload_case() {
     stop_baselines
     return 0
   fi
-  run_baseline_upload_probe_case "$case_name" "vmess" "$baseline_proxy_port"
+  local baseline_identity_json
+  if ! baseline_identity_json="$(capture_baseline_identity xray)"; then
+    append_skipped_result "$case_name" "vmess-upload" "could not verify the running xray executables"
+    stop_baselines
+    return 0
+  fi
+  run_baseline_upload_probe_case "$case_name" "vmess" "$baseline_proxy_port" "$baseline_identity_json"
   stop_baselines
 }
 
@@ -2427,8 +2506,8 @@ run_hysteria2_baseline_case() {
     return 0
   fi
   exec_in client "bash /workspace/lab/baseline-tools.sh write-hysteria-client '${baseline_uuid}' '${server_ip}' '${baseline_hysteria2_port}' 127.0.0.1 '${baseline_proxy_port}'"
-  exec_in server "bash /workspace/lab/baseline-tools.sh run-hysteria-server >/tmp/mptunnel-baseline-hysteria-server.log 2>&1 & echo \$! >/tmp/mptunnel-baseline-hysteria-server.pid"
-  exec_in client "bash /workspace/lab/baseline-tools.sh run-hysteria-client >/tmp/mptunnel-baseline-hysteria-client.log 2>&1 & echo \$! >/tmp/mptunnel-baseline-hysteria-client.pid"
+  exec_in server "$baseline_tool_command run-hysteria-server >/tmp/mptunnel-baseline-hysteria-server.log 2>&1 & echo \$! >/tmp/mptunnel-baseline-hysteria-server.pid"
+  exec_in client "$baseline_tool_command run-hysteria-client >/tmp/mptunnel-baseline-hysteria-client.log 2>&1 & echo \$! >/tmp/mptunnel-baseline-hysteria-client.pid"
   sleep 1
   if ! exec_in server "kill -0 \$(cat /tmp/mptunnel-baseline-hysteria-server.pid)" || \
      ! exec_in client "kill -0 \$(cat /tmp/mptunnel-baseline-hysteria-client.pid)"; then
@@ -2436,7 +2515,13 @@ run_hysteria2_baseline_case() {
     stop_baselines
     return 0
   fi
-  run_baseline_download_probe_case "$case_name" "hysteria2" "$baseline_proxy_port"
+  local baseline_identity_json
+  if ! baseline_identity_json="$(capture_baseline_identity hysteria2)"; then
+    append_skipped_result "$case_name" "hysteria2" "could not verify the running hysteria2 executables"
+    stop_baselines
+    return 0
+  fi
+  run_baseline_download_probe_case "$case_name" "hysteria2" "$baseline_proxy_port" "$baseline_identity_json"
   stop_baselines
 }
 
@@ -2454,8 +2539,8 @@ run_hysteria2_baseline_upload_case() {
     return 0
   fi
   exec_in client "bash /workspace/lab/baseline-tools.sh write-hysteria-client '${baseline_uuid}' '${server_ip}' '${baseline_hysteria2_port}' 127.0.0.1 '${baseline_proxy_port}'"
-  exec_in server "bash /workspace/lab/baseline-tools.sh run-hysteria-server >/tmp/mptunnel-baseline-hysteria-server.log 2>&1 & echo \$! >/tmp/mptunnel-baseline-hysteria-server.pid"
-  exec_in client "bash /workspace/lab/baseline-tools.sh run-hysteria-client >/tmp/mptunnel-baseline-hysteria-client.log 2>&1 & echo \$! >/tmp/mptunnel-baseline-hysteria-client.pid"
+  exec_in server "$baseline_tool_command run-hysteria-server >/tmp/mptunnel-baseline-hysteria-server.log 2>&1 & echo \$! >/tmp/mptunnel-baseline-hysteria-server.pid"
+  exec_in client "$baseline_tool_command run-hysteria-client >/tmp/mptunnel-baseline-hysteria-client.log 2>&1 & echo \$! >/tmp/mptunnel-baseline-hysteria-client.pid"
   sleep 1
   if ! exec_in server "kill -0 \$(cat /tmp/mptunnel-baseline-hysteria-server.pid)" || \
      ! exec_in client "kill -0 \$(cat /tmp/mptunnel-baseline-hysteria-client.pid)"; then
@@ -2463,7 +2548,13 @@ run_hysteria2_baseline_upload_case() {
     stop_baselines
     return 0
   fi
-  run_baseline_upload_probe_case "$case_name" "hysteria2" "$baseline_proxy_port"
+  local baseline_identity_json
+  if ! baseline_identity_json="$(capture_baseline_identity hysteria2)"; then
+    append_skipped_result "$case_name" "hysteria2-upload" "could not verify the running hysteria2 executables"
+    stop_baselines
+    return 0
+  fi
+  run_baseline_upload_probe_case "$case_name" "hysteria2" "$baseline_proxy_port" "$baseline_identity_json"
   stop_baselines
 }
 

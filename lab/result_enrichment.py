@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
 import math
 import re
@@ -16,6 +17,7 @@ _SAFE_RUN_OVERRIDE = re.compile(
     r"PATH_FLIGHT_BYTES|RELIABLE_RELAY_CHUNK_BYTES)|"
     r"MPTUNNEL_TCP_PATH_HEARTBEAT_(?:INTERVAL|TIMEOUT)_MS|"
     r"PATH_PROBE_(?:INTERVAL|TIMEOUT)_MS|"
+    r"MPTUNNEL_LAB_OBJECT_MIB|"
     r"MPTUNNEL_LAB_(?:(?:LOWLAT|BALANCED|MILDLOSS|FAT|POOR)_"
     r"(?:RATE|DELAY|JITTER|LOSS)|IDEAL_LOSS|MATRIX_(?:GOOD|POOR)_"
     r"(?:RATE|DELAY|JITTER|LOSS)|BLACKHOLE_LOSS|SPIKE_"
@@ -25,6 +27,125 @@ _SAFE_RUN_OVERRIDE = re.compile(
 
 def _flag_enabled(value: Any) -> bool:
     return str(value).lower() in {"1", "true", "yes"}
+
+
+def load_baseline_lock(
+    path: str | Path, expected_sha256: str | None = None
+) -> dict[str, Any]:
+    payload = Path(path).read_bytes()
+    if (
+        expected_sha256 is not None
+        and hashlib.sha256(payload).hexdigest() != expected_sha256
+    ):
+        raise ValueError("baseline lock SHA-256 does not match the frozen invocation")
+    lock = json.loads(payload)
+    if not isinstance(lock, dict) or lock.get("schema_version") != 1:
+        raise ValueError("baseline lock schema_version must be 1")
+    tools = lock.get("tools")
+    if not isinstance(tools, dict) or set(tools) != {"hysteria2", "xray"}:
+        raise ValueError("baseline lock must contain hysteria2 and xray")
+    for name, tool in tools.items():
+        if not isinstance(tool, dict):
+            raise ValueError(f"baseline tool {name} must be an object")
+        if not isinstance(tool.get("release"), str) or not tool["release"]:
+            raise ValueError(f"baseline tool {name} must have a release")
+        source = tool.get("source")
+        release_path = f"/releases/tag/{tool['release']}"
+        if (
+            not isinstance(source, str)
+            or not source.startswith("https://github.com/")
+            or not source.endswith(release_path)
+        ):
+            raise ValueError(f"baseline tool {name} must have a GitHub source")
+        repository_url = source[: -len(release_path)]
+        assets = tool.get("assets")
+        if not isinstance(assets, dict) or set(assets) != {"amd64", "arm64"}:
+            raise ValueError(f"baseline tool {name} must lock amd64 and arm64")
+        for architecture, asset in assets.items():
+            if not isinstance(asset, dict):
+                raise ValueError(
+                    f"baseline asset {name}/{architecture} must be an object"
+                )
+            asset_name = asset.get("name")
+            if (
+                not isinstance(asset_name, str)
+                or re.fullmatch(r"[A-Za-z0-9._+-]+", asset_name) is None
+            ):
+                raise ValueError(
+                    f"baseline asset {name}/{architecture} must have a name"
+                )
+            url = asset.get("url")
+            download_url = (
+                f"{repository_url}/releases/download/{tool['release']}/{asset_name}"
+            )
+            if not isinstance(url, str) or url != download_url:
+                raise ValueError(
+                    f"baseline asset {name}/{architecture} must have a URL"
+                )
+            digest = asset.get("sha256")
+            if (
+                not isinstance(digest, str)
+                or re.fullmatch(r"[0-9a-f]{64}", digest) is None
+            ):
+                raise ValueError(
+                    f"baseline asset {name}/{architecture} must have a lowercase SHA-256"
+                )
+    return lock
+
+
+def enrich_baseline_identity(row: dict[str, Any], identity_value: Any) -> None:
+    """Attach the verified external executables observed for one result row."""
+
+    if identity_value in (None, ""):
+        return
+    identity = (
+        json.loads(identity_value)
+        if isinstance(identity_value, str)
+        else identity_value
+    )
+    if not isinstance(identity, dict) or set(identity) != {
+        "tool",
+        "lock_sha256",
+        "client",
+        "server",
+    }:
+        raise ValueError(
+            "baseline identity must contain tool, lock_sha256, client, and server"
+        )
+    if identity["tool"] not in {"xray", "hysteria2"}:
+        raise ValueError("baseline identity has an unsupported tool")
+    if re.fullmatch(r"[0-9a-f]{64}", identity["lock_sha256"]) is None:
+        raise ValueError("baseline identity lock_sha256 must be a SHA-256 digest")
+    required = {
+        "tool",
+        "release",
+        "architecture",
+        "asset_name",
+        "asset_sha256",
+        "executable_name",
+        "executable_sha256",
+        "executable_provenance",
+        "version_output",
+        "verified",
+    }
+    for role in ("client", "server"):
+        endpoint = identity[role]
+        if not isinstance(endpoint, dict) or not required.issubset(endpoint):
+            raise ValueError(f"baseline {role} identity is incomplete")
+        if endpoint["tool"] != identity["tool"] or endpoint["verified"] is not True:
+            raise ValueError(f"baseline {role} identity is not verified")
+        for field in ("asset_sha256", "executable_sha256"):
+            if re.fullmatch(r"[0-9a-f]{64}", endpoint[field]) is None:
+                raise ValueError(f"baseline {role} {field} must be a SHA-256 digest")
+        if identity["tool"] == "xray":
+            member_digest = endpoint.get("archive_member_sha256")
+            if member_digest != endpoint["executable_sha256"]:
+                raise ValueError(f"baseline {role} xray archive member does not match")
+        elif endpoint["asset_sha256"] != endpoint["executable_sha256"]:
+            raise ValueError(f"baseline {role} hysteria asset does not match")
+    if identity["client"]["release"] != identity["server"]["release"]:
+        raise ValueError("baseline endpoint releases do not match")
+    row["baseline_identity"] = identity
 
 
 def enrich_reproducibility(row: dict[str, Any], metadata_value: Any) -> None:
@@ -100,6 +221,8 @@ def write_run_manifest(
         and "SECRET" not in key
         and "TOKEN" not in key
     }
+    lock_sha256 = env["BASELINE_LOCK_SHA256"]
+    baseline_lock = load_baseline_lock(env["BASELINE_LOCK_FILE"], lock_sha256)
     manifest = {
         "schema_version": 1,
         "created_utc": datetime.now(timezone.utc).isoformat(),
@@ -107,6 +230,7 @@ def write_run_manifest(
         "case_filter": env["CASE_FILTER_VALUE"],
         "product": json.loads(env["RESULT_REPRODUCIBILITY"]),
         "workload": {
+            "object_mib": int(env["OBJECT_MIB"]),
             "load_duration_seconds": float(env["LOAD_DURATION_SECONDS"]),
             "upload_drain_timeout_seconds": float(
                 env["UPLOAD_DRAIN_TIMEOUT_SECONDS"]
@@ -140,6 +264,11 @@ def write_run_manifest(
         },
         "safe_environment_overrides": dict(sorted(overrides.items())),
         "compose_config": "compose-config.yaml",
+        "baseline_lock": {
+            "file": "lab/baseline-lock.json",
+            "sha256": lock_sha256,
+            **baseline_lock,
+        },
     }
     Path(path).write_text(
         json.dumps(manifest, indent=2, sort_keys=True) + "\n", encoding="utf-8"

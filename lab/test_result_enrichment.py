@@ -1,4 +1,5 @@
 import json
+import hashlib
 import tempfile
 import unittest
 from pathlib import Path
@@ -7,6 +8,7 @@ import sys
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from result_enrichment import (
     application_payload_bytes,
+    enrich_baseline_identity,
     enrich_reproducibility,
     enrich_upload_target_observer,
     enrich_instrumentation,
@@ -19,6 +21,64 @@ from result_enrichment import (
 
 
 class ResultEnrichmentTests(unittest.TestCase):
+    def test_external_baseline_identity_requires_verified_endpoint_binaries(self):
+        endpoint = {
+            "tool": "xray",
+            "release": "v1",
+            "architecture": "amd64",
+            "asset_name": "xray.zip",
+            "asset_sha256": "a" * 64,
+            "archive_member_sha256": "b" * 64,
+            "executable_name": "xray",
+            "executable_sha256": "b" * 64,
+            "executable_provenance": "locked_archive_member",
+            "version_output": "Xray 1",
+            "verified": True,
+        }
+        identity = {
+            "tool": "xray",
+            "lock_sha256": "d" * 64,
+            "client": endpoint,
+            "server": endpoint,
+        }
+        row = {}
+
+        enrich_baseline_identity(row, identity)
+
+        self.assertEqual(row["baseline_identity"], identity)
+        invalid = json.loads(json.dumps(identity))
+        invalid["server"]["executable_sha256"] = "c" * 64
+        with self.assertRaisesRegex(ValueError, "archive member does not match"):
+            enrich_baseline_identity({}, invalid)
+
+    def test_baseline_lock_rejects_assets_from_another_repository(self):
+        from result_enrichment import load_baseline_lock
+
+        tools = {}
+        for name in ("hysteria2", "xray"):
+            tools[name] = {
+                "release": "v1",
+                "source": f"https://github.com/example/{name}/releases/tag/v1",
+                "assets": {
+                    architecture: {
+                        "name": f"{name}-{architecture}",
+                        "sha256": digest * 64,
+                        "url": f"https://github.com/example/{name}/releases/download/v1/{name}-{architecture}",
+                    }
+                    for architecture, digest in (("amd64", "a"), ("arm64", "b"))
+                },
+            }
+        tools["xray"]["assets"]["amd64"][
+            "url"
+        ] = "https://github.com/another/repository/releases/download/v1/xray-amd64"
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "baseline-lock.json"
+            path.write_text(
+                json.dumps({"schema_version": 1, "tools": tools}), encoding="utf-8"
+            )
+            with self.assertRaisesRegex(ValueError, "must have a URL"):
+                load_baseline_lock(path)
+
     def test_reproducibility_metadata_is_normalized(self):
         row = {}
 
@@ -67,10 +127,29 @@ class ResultEnrichmentTests(unittest.TestCase):
             enrich_reproducibility({}, metadata)
 
     def test_run_manifest_records_inputs_without_secrets(self):
+        baseline_lock = {
+            "schema_version": 1,
+            "tools": {
+                name: {
+                    "release": "v1",
+                    "source": f"https://github.com/example/{name}/releases/tag/v1",
+                    "assets": {
+                        architecture: {
+                            "name": f"{name}-{architecture}",
+                            "sha256": digest * 64,
+                            "url": f"https://github.com/example/{name}/releases/download/v1/{name}-{architecture}",
+                        }
+                        for architecture, digest in (("amd64", "a"), ("arm64", "b"))
+                    },
+                }
+                for name in ("hysteria2", "xray")
+            },
+        }
         environment = {
             "RESULT_FILE": "lab/results/example/results.jsonl",
             "CASE_FILTER_VALUE": "mptunnel_tcp_*",
             "RESULT_REPRODUCIBILITY": json.dumps({"source_commit": "abc"}),
+            "OBJECT_MIB": "4096",
             "LOAD_DURATION_SECONDS": "10",
             "UPLOAD_DRAIN_TIMEOUT_SECONDS": "5",
             "BULK_CONNECTIONS": "1",
@@ -97,21 +176,34 @@ class ResultEnrichmentTests(unittest.TestCase):
             "HOST_MEMORY_BYTES": "4096",
             "DOCKER_VERSION": "1",
             "COMPOSE_VERSION": "2",
+            "BASELINE_LOCK_SHA256": "",
             "MPTUNNEL_LAB_FAT_LOSS": "0.00%",
             "MPTUNNEL_LAB_FAT_LOSS_API_KEY": "must-not-leak-either",
             "MPTUNNEL_LAB_SECRET": "must-not-leak",
         }
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / "manifest.json"
+            baseline_lock_path = Path(directory) / "baseline-lock.json"
+            baseline_lock_path.write_text(json.dumps(baseline_lock), encoding="utf-8")
+            environment["BASELINE_LOCK_FILE"] = str(baseline_lock_path)
+            environment["BASELINE_LOCK_SHA256"] = hashlib.sha256(
+                baseline_lock_path.read_bytes()
+            ).hexdigest()
             manifest = write_run_manifest(path, environment)
 
             self.assertEqual(manifest["workload"]["bulk_connections"], 1)
+            self.assertEqual(manifest["workload"]["object_mib"], 4096)
             self.assertTrue(manifest["execution"]["isolate_containers_per_case"])
             self.assertEqual(
                 manifest["safe_environment_overrides"],
                 {"MPTUNNEL_LAB_FAT_LOSS": "0.00%"},
             )
             self.assertNotIn("must-not-leak", path.read_text(encoding="utf-8"))
+            self.assertEqual(manifest["baseline_lock"]["tools"], baseline_lock["tools"])
+            self.assertEqual(
+                manifest["baseline_lock"]["sha256"],
+                environment["BASELINE_LOCK_SHA256"],
+            )
 
     def test_target_observer_exact_snapshot_becomes_primary(self):
         row = {

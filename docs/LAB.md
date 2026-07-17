@@ -98,6 +98,17 @@ Useful families include:
 The runner source is the authoritative case list. Case names are public lab
 identifiers, not runtime algorithms or diagnostic event names.
 
+Xray and Hysteria2 releases, asset URLs, architectures, and SHA-256 digests are
+pinned in `lab/baseline-lock.json`; no mutable `latest` URL is resolved. The
+runner freezes that lock by SHA-256 for the full invocation. Each external
+baseline launch verifies its artifact, Xray is atomically re-extracted from its
+verified archive, and each accepted result row records the frozen-lock digest,
+executable hash, version output, architecture, and client/server identity
+actually observed. `run-manifest.json` embeds the same complete lock. Update the
+lock only as an explicit benchmark-cohort change, then run the baseline and
+candidate adjacently. The MPTCP baseline uses the lab host's kernel and therefore
+requires separate subflow evidence rather than a downloaded-tool identity.
+
 ### Windows executable under Wine
 
 The runner can execute the Windows GNU client under Wine inside the same

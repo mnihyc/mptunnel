@@ -88,6 +88,62 @@ class RunnerContractTests(unittest.TestCase):
         self.assertIn('normalize_lab_result_path "run-${timestamp}-$$"', SCRIPT)
         self.assertIn(': > "$result_dir/config-sha256.txt"', SCRIPT)
 
+    def test_external_baseline_rows_record_verified_running_executables(self):
+        capture = SCRIPT.split("capture_baseline_identity() {", 1)[1].split(
+            "\n}\n\nrun_vmess_baseline_case()", 1
+        )[0]
+
+        self.assertIn("identity-${tool}", capture)
+        self.assertIn("BASELINE_LOCK_SHA256", capture)
+        wrappers = (
+            (
+                "run_vmess_baseline_case() {",
+                "run_vmess_baseline_upload_case() {",
+                "capture_baseline_identity xray",
+                'run_baseline_download_probe_case "$case_name" "vmess" "$baseline_proxy_port" "$baseline_identity_json"',
+            ),
+            (
+                "run_vmess_baseline_upload_case() {",
+                "run_hysteria2_baseline_case() {",
+                "capture_baseline_identity xray",
+                'run_baseline_upload_probe_case "$case_name" "vmess" "$baseline_proxy_port" "$baseline_identity_json"',
+            ),
+            (
+                "run_hysteria2_baseline_case() {",
+                "run_hysteria2_baseline_upload_case() {",
+                "capture_baseline_identity hysteria2",
+                'run_baseline_download_probe_case "$case_name" "hysteria2" "$baseline_proxy_port" "$baseline_identity_json"',
+            ),
+            (
+                "run_hysteria2_baseline_upload_case() {",
+                "configure_mptcp_endpoints() {",
+                "capture_baseline_identity hysteria2",
+                'run_baseline_upload_probe_case "$case_name" "hysteria2" "$baseline_proxy_port" "$baseline_identity_json"',
+            ),
+        )
+        for start, end, capture_call, probe_call in wrappers:
+            body = SCRIPT.split(start, 1)[1].split(end, 1)[0]
+            self.assertIn(capture_call, body)
+            self.assertIn(probe_call, body)
+        download_probe = SCRIPT.split("run_baseline_download_probe_case() {", 1)[
+            1
+        ].split("\n}\n\nrun_baseline_upload_probe_case()", 1)[0]
+        upload_probe = SCRIPT.split("run_baseline_upload_probe_case() {", 1)[1].split(
+            "\n}\n\nensure_baseline_tool()", 1
+        )[0]
+        self.assertIn(
+            'append_row_with_telemetry "$case_name" "$output" "$protocol" 0 "" "$baseline_identity_json"',
+            download_probe,
+        )
+        self.assertIn(
+            'append_download_probe_result "$case_name" "$exit_code" "" "$probe_stderr" 0 "$protocol" "$baseline_identity_json"',
+            download_probe,
+        )
+        self.assertIn(
+            '"$observer_freeze_exit_code" "" "$baseline_identity_json"',
+            upload_probe,
+        )
+
     def test_wine_shutdown_waits_before_reusing_the_proxy_port(self):
         stop = SCRIPT.split("stop_client() {", 1)[1].split("\n}", 1)[0]
 

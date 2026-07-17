@@ -1,4 +1,5 @@
 import json
+import tempfile
 import unittest
 from pathlib import Path
 import sys
@@ -13,6 +14,7 @@ from result_enrichment import (
     enrich_traffic_overhead,
     is_exact_upload_measurement,
     is_proven_upload_measurement,
+    write_run_manifest,
 )
 
 
@@ -29,6 +31,12 @@ class ResultEnrichmentTests(unittest.TestCase):
                     "mptunnel_build_profile": "release",
                     "mptunnel_build_features": ["lab-diagnostics", "lab-diagnostics"],
                     "mptunnel_protocol_version": 2,
+                    "mptunnel_client_runtime": "wine",
+                    "mptunnel_client_runtime_version": "wine-9.0",
+                    "mptunnel_client_target": "x86_64-pc-windows-gnu",
+                    "mptunnel_client_sha256": "a" * 64,
+                    "mptunnel_server_target": "x86_64-unknown-linux-gnu",
+                    "mptunnel_server_sha256": "b" * 64,
                 }
             ),
         )
@@ -38,6 +46,72 @@ class ResultEnrichmentTests(unittest.TestCase):
         self.assertEqual(row["mptunnel_build_profile"], "release")
         self.assertEqual(row["mptunnel_build_features"], ["lab-diagnostics"])
         self.assertEqual(row["mptunnel_protocol_version"], 2)
+        self.assertEqual(row["mptunnel_client_runtime"], "wine")
+        self.assertEqual(row["mptunnel_client_runtime_version"], "wine-9.0")
+        self.assertEqual(row["mptunnel_client_target"], "x86_64-pc-windows-gnu")
+        self.assertEqual(row["mptunnel_client_sha256"], "a" * 64)
+        self.assertEqual(row["mptunnel_server_target"], "x86_64-unknown-linux-gnu")
+        self.assertEqual(row["mptunnel_server_sha256"], "b" * 64)
+
+    def test_reproducibility_rejects_partial_runtime_identity(self):
+        metadata = {
+            "source_commit": "0123456789abcdef",
+            "source_tree_dirty": False,
+            "mptunnel_build_profile": "release",
+            "mptunnel_build_features": [],
+            "mptunnel_protocol_version": 2,
+            "mptunnel_client_runtime": "wine",
+        }
+
+        with self.assertRaisesRegex(ValueError, "runtime identity must be complete"):
+            enrich_reproducibility({}, metadata)
+
+    def test_run_manifest_records_inputs_without_secrets(self):
+        environment = {
+            "RESULT_FILE": "lab/results/example/results.jsonl",
+            "CASE_FILTER_VALUE": "mptunnel_tcp_*",
+            "RESULT_REPRODUCIBILITY": json.dumps({"source_commit": "abc"}),
+            "LOAD_DURATION_SECONDS": "10",
+            "UPLOAD_DRAIN_TIMEOUT_SECONDS": "5",
+            "BULK_CONNECTIONS": "1",
+            "FAILOVER_AFTER_SECONDS": "2",
+            "FAILOVER_PROFILE": "fat",
+            "FAILOVER_TX_TRIGGER_BYTES": "2097152",
+            "ISOLATE_CASES_VALUE": "1",
+            "ISOLATE_CONTAINERS_VALUE": "1",
+            "CLIENT_SETTLE_SECONDS": "2",
+            "CLIENT_START_TIMEOUT_SECONDS": "15",
+            "LAB_DIAGNOSTICS_VALUE": "0",
+            "LAB_PERF_VALUE": "0",
+            "CONTAINER_STATS_VALUE": "1",
+            "MANAGEMENT_SNAPSHOTS_VALUE": "0",
+            "USE_PATH_HINTS_VALUE": "0",
+            "CLIENT_CONTAINER_ID": "client-id",
+            "SERVER_CONTAINER_ID": "server-id",
+            "TARGET_CONTAINER_ID": "target-id",
+            "CLIENT_IMAGE_ID": "client-image",
+            "SERVER_IMAGE_ID": "server-image",
+            "TARGET_IMAGE_ID": "target-image",
+            "HOST_KERNEL": "Linux test",
+            "HOST_CPU_COUNT": "2",
+            "HOST_MEMORY_BYTES": "4096",
+            "DOCKER_VERSION": "1",
+            "COMPOSE_VERSION": "2",
+            "MPTUNNEL_LAB_FAT_LOSS": "0.00%",
+            "MPTUNNEL_LAB_FAT_LOSS_API_KEY": "must-not-leak-either",
+            "MPTUNNEL_LAB_SECRET": "must-not-leak",
+        }
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "manifest.json"
+            manifest = write_run_manifest(path, environment)
+
+            self.assertEqual(manifest["workload"]["bulk_connections"], 1)
+            self.assertTrue(manifest["execution"]["isolate_containers_per_case"])
+            self.assertEqual(
+                manifest["safe_environment_overrides"],
+                {"MPTUNNEL_LAB_FAT_LOSS": "0.00%"},
+            )
+            self.assertNotIn("must-not-leak", path.read_text(encoding="utf-8"))
 
     def test_target_observer_exact_snapshot_becomes_primary(self):
         row = {

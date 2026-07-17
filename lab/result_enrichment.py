@@ -4,7 +4,23 @@ from __future__ import annotations
 
 import json
 import math
-from typing import Any
+import re
+from datetime import datetime, timezone
+from pathlib import Path
+from typing import Any, Mapping
+
+
+_SAFE_RUN_OVERRIDE = re.compile(
+    r"(?:MPTUNNEL_MAX_(?:FRAME_BYTES|PAYLOAD_BYTES|ACK_RANGES|PATHS|STREAMS|"
+    r"STREAM_WINDOW_BYTES|REPAIR_BYTES|REORDER_BYTES|DATAGRAM_QUEUE_BYTES|"
+    r"PATH_FLIGHT_BYTES|RELIABLE_RELAY_CHUNK_BYTES)|"
+    r"MPTUNNEL_TCP_PATH_HEARTBEAT_(?:INTERVAL|TIMEOUT)_MS|"
+    r"PATH_PROBE_(?:INTERVAL|TIMEOUT)_MS|"
+    r"MPTUNNEL_LAB_(?:(?:LOWLAT|BALANCED|MILDLOSS|FAT|POOR)_"
+    r"(?:RATE|DELAY|JITTER|LOSS)|IDEAL_LOSS|MATRIX_(?:GOOD|POOR)_"
+    r"(?:RATE|DELAY|JITTER|LOSS)|BLACKHOLE_LOSS|SPIKE_"
+    r"(?:FAT|LOWLAT|BALANCED|POOR)_(?:RATE|DELAY|JITTER|LOSS)|USE_PATH_HINTS))"
+)
 
 
 def _flag_enabled(value: Any) -> bool:
@@ -47,6 +63,88 @@ def enrich_reproducibility(row: dict[str, Any], metadata_value: Any) -> None:
     row["mptunnel_build_profile"] = build_profile
     row["mptunnel_build_features"] = sorted(set(build_features))
     row["mptunnel_protocol_version"] = protocol_version
+
+    runtime_fields = (
+        "mptunnel_client_runtime",
+        "mptunnel_client_runtime_version",
+        "mptunnel_client_target",
+        "mptunnel_client_sha256",
+        "mptunnel_server_target",
+        "mptunnel_server_sha256",
+    )
+    present_runtime_fields = [field for field in runtime_fields if field in metadata]
+    if present_runtime_fields and len(present_runtime_fields) != len(runtime_fields):
+        raise ValueError("client/server runtime identity must be complete when present")
+    if present_runtime_fields:
+        for field in runtime_fields:
+            value = metadata[field]
+            if not isinstance(value, str) or not value:
+                raise ValueError(f"{field} must be a non-empty string")
+        for field in ("mptunnel_client_sha256", "mptunnel_server_sha256"):
+            if re.fullmatch(r"[0-9a-f]{64}", metadata[field]) is None:
+                raise ValueError(f"{field} must be a lowercase SHA-256 digest")
+        for field in runtime_fields:
+            row[field] = metadata[field]
+
+
+def write_run_manifest(
+    path: str | Path, environment: Mapping[str, str]
+) -> dict[str, Any]:
+    """Persist safe run inputs that are shared by every row in one invocation."""
+
+    env = environment
+    overrides = {
+        key: value
+        for key, value in env.items()
+        if _SAFE_RUN_OVERRIDE.fullmatch(key)
+        and "SECRET" not in key
+        and "TOKEN" not in key
+    }
+    manifest = {
+        "schema_version": 1,
+        "created_utc": datetime.now(timezone.utc).isoformat(),
+        "result_file": env["RESULT_FILE"],
+        "case_filter": env["CASE_FILTER_VALUE"],
+        "product": json.loads(env["RESULT_REPRODUCIBILITY"]),
+        "workload": {
+            "load_duration_seconds": float(env["LOAD_DURATION_SECONDS"]),
+            "upload_drain_timeout_seconds": float(
+                env["UPLOAD_DRAIN_TIMEOUT_SECONDS"]
+            ),
+            "bulk_connections": int(env["BULK_CONNECTIONS"]),
+            "failover_after_seconds": float(env["FAILOVER_AFTER_SECONDS"]),
+            "failover_profile": env["FAILOVER_PROFILE"],
+            "failover_tx_trigger_bytes": int(env["FAILOVER_TX_TRIGGER_BYTES"]),
+        },
+        "execution": {
+            "isolate_cases": env["ISOLATE_CASES_VALUE"] == "1",
+            "isolate_containers_per_case": env["ISOLATE_CONTAINERS_VALUE"] == "1",
+            "client_settle_seconds": float(env["CLIENT_SETTLE_SECONDS"]),
+            "client_start_timeout_seconds": int(env["CLIENT_START_TIMEOUT_SECONDS"]),
+            "lab_diagnostics": env["LAB_DIAGNOSTICS_VALUE"],
+            "lab_perf": env["LAB_PERF_VALUE"],
+            "container_stats": env["CONTAINER_STATS_VALUE"],
+            "management_snapshots": env["MANAGEMENT_SNAPSHOTS_VALUE"],
+            "use_path_hints": env["USE_PATH_HINTS_VALUE"] == "1",
+        },
+        "containers": {
+            role: {"image_id": env[f"{role.upper()}_IMAGE_ID"]}
+            for role in ("client", "server", "target")
+        },
+        "host": {
+            "kernel": env["HOST_KERNEL"],
+            "cpu_count": int(env["HOST_CPU_COUNT"]),
+            "memory_bytes": int(float(env["HOST_MEMORY_BYTES"])),
+            "docker_version": env["DOCKER_VERSION"],
+            "compose_version": env["COMPOSE_VERSION"],
+        },
+        "safe_environment_overrides": dict(sorted(overrides.items())),
+        "compose_config": "compose-config.yaml",
+    }
+    Path(path).write_text(
+        json.dumps(manifest, indent=2, sort_keys=True) + "\n", encoding="utf-8"
+    )
+    return manifest
 
 
 def enrich_instrumentation(

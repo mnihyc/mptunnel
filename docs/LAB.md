@@ -12,8 +12,16 @@ lab/run-heterogeneous-ablation.sh
 
 The runner builds the product on the host and confines `tc`, routes, interface
 changes, blackholes, and TUN work to Docker namespaces. It writes JSONL and
-per-case artifacts under `lab/results/`, which is ignored generated evidence.
-One lab lock prevents concurrent Compose runs from corrupting shared topology.
+per-case artifacts to a unique invocation directory under `lab/results/`,
+which is ignored generated evidence. Named `RESULT_DIR` values remain
+available for deliberate cohorts. One lab lock prevents concurrent Compose
+runs from corrupting shared topology.
+
+Each invocation retains `run-manifest.json`, an anonymized effective Compose
+config, redacted product configs with SHA-256 checksums, and before/after qdisc
+and interface-counter snapshots. The case-named client config is the path and
+resource contract for its JSON row; the qdisc snapshot is the effective
+underlay contract. Publish these side artifacts with any benchmark table.
 
 ## Evidence cohorts
 
@@ -89,6 +97,27 @@ Useful families include:
 
 The runner source is the authoritative case list. Case names are public lab
 identifiers, not runtime algorithms or diagnostic event names.
+
+### Windows executable under Wine
+
+The runner can execute the Windows GNU client under Wine inside the same
+Docker network namespace as the native client. This preserves the netem,
+probe, receiver-accounting, and container-telemetry contract while exercising
+the portable Windows socket path. Build the opt-in client image and select the
+runtime in one invocation:
+
+```bash
+MPTUNNEL_LAB_CLIENT_RUNTIME=wine \
+MPTUNNEL_LAB_INSTALL_WINE=1 \
+BUILD_LAB_IMAGES=1 \
+CASE_FILTER='mptunnel_tcp_single_cross_continent_high_bandwidth,mptunnel_tcp_multipath_equal_fat' \
+lab/run-heterogeneous-ablation.sh
+```
+
+Every row records the client runtime/version, client and server targets, and
+both binary hashes. Wine cases support proxy-based workloads; TUN cases remain
+native-only. Wine proves behavior of the Windows executable and portable
+fallback, not Wintun, native Windows kernel scheduling, or `SIO_TCP_INFO`.
 
 ## Representative release matrix
 

@@ -3,6 +3,8 @@ services:
     build:
       context: ..
       dockerfile: lab/docker/Dockerfile
+      args:
+        MPTUNNEL_LAB_INSTALL_WINE: ${MPTUNNEL_LAB_INSTALL_WINE:-0}
     cpus: 2
     init: true
     cap_add:

@@ -5,6 +5,12 @@ from pathlib import Path
 SCRIPT = (Path(__file__).resolve().parent / "run-heterogeneous-ablation.sh").read_text(
     encoding="utf-8"
 )
+COMPOSE = (Path(__file__).resolve().parent / "docker-compose.yml").read_text(
+    encoding="utf-8"
+)
+DOCKERFILE = (Path(__file__).resolve().parent / "docker" / "Dockerfile").read_text(
+    encoding="utf-8"
+)
 
 
 class RunnerContractTests(unittest.TestCase):
@@ -13,6 +19,89 @@ class RunnerContractTests(unittest.TestCase):
 
         self.assertIn('if flag_enabled "$lab_diagnostics"; then', build_function)
         self.assertIn("--features lab-diagnostics", build_function)
+
+    def test_wine_runtime_is_opt_in_and_client_only(self):
+        build_function = SCRIPT.split("build_mptunnel_binary() {", 1)[1].split(
+            "\n}", 1
+        )[0]
+        client_command = SCRIPT.split("client_mptunnel_command() {", 1)[1].split(
+            "\n}", 1
+        )[0]
+        server_start = SCRIPT.split("start_server() {", 1)[1].split("\n}", 1)[0]
+
+        self.assertIn('MPTUNNEL_LAB_CLIENT_RUNTIME:-native', SCRIPT)
+        self.assertIn('target "$client_target"', build_function)
+        self.assertIn("WINEPREFIX=%q wine %q", client_command)
+        self.assertIn("/workspace/target/release/mptunnel", server_start)
+        self.assertIn("MPTUNNEL_LAB_INSTALL_WINE", COMPOSE)
+        self.assertIn('MPTUNNEL_LAB_INSTALL_WINE=0', DOCKERFILE)
+
+    def test_wine_results_record_runtime_and_binary_identity(self):
+        provenance = SCRIPT.split("refresh_result_reproducibility() {", 1)[1].split(
+            "\n}", 1
+        )[0]
+
+        self.assertIn('"mptunnel_client_runtime"', provenance)
+        self.assertIn('"mptunnel_client_runtime_version"', provenance)
+        self.assertIn('"mptunnel_client_sha256"', provenance)
+        self.assertIn('"mptunnel_server_sha256"', provenance)
+        self.assertIn("prepare_client_runtime", SCRIPT)
+
+    def test_wine_runtime_excludes_tun_or_rejects_explicit_selection(self):
+        selector = SCRIPT.split("should_run_case() {", 1)[1].split("\n}", 1)[0]
+        validation = SCRIPT.split(
+            "validate_client_runtime_case_filter() {", 1
+        )[1].split("\n}", 1)[0]
+
+        self.assertIn('"$case_name" == mptunnel_tun_*', selector)
+        self.assertIn("Wine client runtime cannot run TUN case", validation)
+        self.assertIn("validate_client_runtime_case_filter", SCRIPT)
+
+    def test_proxy_client_waits_for_listener_and_reports_early_exit(self):
+        readiness = SCRIPT.split("wait_for_client_proxy() {", 1)[1].split(
+            "\n}", 1
+        )[0]
+        start = SCRIPT.split("start_client_with_netem() {", 1)[1].split(
+            "\n}", 1
+        )[0]
+
+        self.assertIn("/proc/net/tcp /proc/net/tcp6", readiness)
+        self.assertIn('kill -0 \\"\\$pid\\"', readiness)
+        self.assertIn("tail -n 80", readiness)
+        self.assertIn("wait_for_client_proxy", start)
+
+    def test_release_artifacts_retain_configs_qdisc_and_run_inputs(self):
+        config = SCRIPT.split("persist_redacted_config() {", 1)[1].split(
+            "\n}", 1
+        )[0]
+        telemetry = SCRIPT.split("start_case_telemetry() {", 1)[1].split(
+            "\n}", 1
+        )[0]
+
+        self.assertIn("write_run_manifest(sys.argv[1], os.environ)", SCRIPT)
+        self.assertIn("compose-config.yaml", SCRIPT)
+        self.assertIn("secret|token", config)
+        self.assertIn("record_config_checksum", config)
+        self.assertIn("config-sha256.txt", SCRIPT)
+        self.assertIn("retain_active_client_config_for_case", telemetry)
+        self.assertIn("capture_qdisc_snapshot", telemetry)
+        self.assertIn('normalize_lab_result_path "run-${timestamp}-$$"', SCRIPT)
+        self.assertIn(': > "$result_dir/config-sha256.txt"', SCRIPT)
+
+    def test_wine_shutdown_waits_before_reusing_the_proxy_port(self):
+        stop = SCRIPT.split("stop_client() {", 1)[1].split("\n}", 1)[0]
+
+        self.assertIn("wineserver -k", stop)
+        self.assertIn("wineserver -w", stop)
+        self.assertIn("timeout ${client_start_timeout_seconds}s", stop)
+
+    def test_wine_initialization_is_bounded(self):
+        prepare = SCRIPT.split("prepare_client_runtime() {", 1)[1].split(
+            "\n}", 1
+        )[0]
+
+        self.assertIn("timeout ${client_start_timeout_seconds}s", prepare)
+        self.assertIn("timed out initializing the Wine client runtime", prepare)
 
     def test_direct_and_product_mixed_rows_have_explicit_scope(self):
         self.assertIn(

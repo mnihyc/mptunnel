@@ -350,9 +350,13 @@ Normal format, clippy, unit, integration, and target checks run on hosts without
 modifying networking. TUN, route, DNS, netem, blackhole, and privileged service
 experiments belong in Docker or a dedicated native test machine.
 
-Wine is suitable for Windows executable startup, CLI, and config parsing only.
-Record native Windows integration and real-Internet results as not run when the
-required environment is unavailable; do not substitute Linux Docker evidence.
+Wine inside the shaped Docker client namespace can validate the Windows GNU
+executable's portable proxy behavior, throughput, aggregation, and failover.
+Keep that cohort labeled Linux/Wine: it does not validate Wintun, native
+Windows kernel scheduling, `SIO_TCP_INFO`, or native-host/real-Internet
+performance. Wine outside the shaped namespace remains suitable only for
+userspace startup, CLI, and configuration validation; neither form substitutes
+for the native Windows gates.
 
 Performance acceptance follows [`docs/LAB.md`](LAB.md). Historical pre-v2 rows
 are regression references, not current release proof.

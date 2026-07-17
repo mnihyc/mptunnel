@@ -35,8 +35,12 @@ if ! flock -n "$lab_lock_fd"; then
 fi
 
 compose_file="${COMPOSE_FILE:-lab/docker-compose.yml}"
-result_dir="$(normalize_lab_result_path "${RESULT_DIR:-lab/results}")"
 timestamp="$(date -u +%Y%m%dT%H%M%SZ)"
+if [[ -n "${RESULT_DIR:-}" ]]; then
+  result_dir="$(normalize_lab_result_path "$RESULT_DIR")"
+else
+  result_dir="$(normalize_lab_result_path "run-${timestamp}-$$")"
+fi
 result_file="$(normalize_lab_result_path "${RESULT_FILE:-$result_dir/heterogeneous-$timestamp.jsonl}")"
 object_mib="${MPTUNNEL_LAB_OBJECT_MIB:-1024}"
 large_http_path="${MPTUNNEL_LAB_LARGE_HTTP_PATH:-/large.bin}"
@@ -101,6 +105,25 @@ failover_trigger_timeout_seconds="${MPTUNNEL_LAB_FAILOVER_TRIGGER_TIMEOUT_SECOND
 failover_trigger_poll_interval_seconds="${MPTUNNEL_LAB_FAILOVER_TRIGGER_POLL_INTERVAL_SECONDS:-0.02}"
 build_product="${BUILD_PRODUCT:-1}"
 build_lab_images="${BUILD_LAB_IMAGES:-1}"
+client_runtime="${MPTUNNEL_LAB_CLIENT_RUNTIME:-native}"
+wine_prefix="${MPTUNNEL_LAB_WINE_PREFIX:-/tmp/mptunnel-wine}"
+printf -v wine_prefix_shell '%q' "$wine_prefix"
+case "$client_runtime" in
+  native)
+    client_target="$(rustc -vV | sed -n 's/^host: //p')"
+    client_binary_host="target/release/mptunnel"
+    client_binary_container="/workspace/target/release/mptunnel"
+    ;;
+  wine)
+    client_target="x86_64-pc-windows-gnu"
+    client_binary_host="target/${client_target}/release/mptunnel.exe"
+    client_binary_container="/workspace/${client_binary_host}"
+    ;;
+  *)
+    echo "MPTUNNEL_LAB_CLIENT_RUNTIME must be native or wine" >&2
+    exit 2
+    ;;
+esac
 # The public diagnostic switch also controls the compile-time feature. Keep the
 # longer legacy name as an override for existing lab invocations.
 lab_diagnostics="${MPTUNNEL_LAB_DIAGNOSTICS:-${MPTUNNEL_LAB_DIAG:-0}}"
@@ -150,31 +173,14 @@ source_commit="$(git rev-parse --verify HEAD)"
 if [[ -n "$(git status --porcelain --untracked-files=normal -- .)" ]]; then
   source_tree_dirty=true
 else
-source_tree_dirty=false
+  source_tree_dirty=false
 fi
 if flag_enabled "$lab_diagnostics"; then
   mptunnel_build_features='["lab-diagnostics"]'
 else
   mptunnel_build_features='[]'
 fi
-result_reproducibility="$(
-  SOURCE_COMMIT="$source_commit" \
-  SOURCE_TREE_DIRTY="$source_tree_dirty" \
-  MPTUNNEL_BUILD_FEATURES="$mptunnel_build_features" \
-  MPTUNNEL_PROTOCOL_VERSION="$mptunnel_protocol_version" \
-    python3 - <<'PY'
-import json
-import os
-
-print(json.dumps({
-    "source_commit": os.environ["SOURCE_COMMIT"],
-    "source_tree_dirty": os.environ["SOURCE_TREE_DIRTY"] == "true",
-    "mptunnel_build_profile": "release",
-    "mptunnel_build_features": json.loads(os.environ["MPTUNNEL_BUILD_FEATURES"]),
-    "mptunnel_protocol_version": int(os.environ["MPTUNNEL_PROTOCOL_VERSION"]),
-}, separators=(",", ":"), sort_keys=True))
-PY
-)"
+result_reproducibility=""
 if [[ ! "$log_tail_bytes" =~ ^[0-9]+$ ]] || (( log_tail_bytes < 1 )); then
   echo "MPTUNNEL_LAB_LOG_TAIL_BYTES must be a positive integer" >&2
   exit 2
@@ -188,6 +194,11 @@ fi
 case_filter="${CASE_FILTER:-}"
 client_start_settle_seconds="${CLIENT_START_SETTLE_SECONDS:-${CLIENT_SETTLE_SECONDS:-2}}"
 client_stop_settle_seconds="${CLIENT_STOP_SETTLE_SECONDS:-${CLIENT_SETTLE_SECONDS:-2}}"
+client_start_timeout_seconds="${MPTUNNEL_LAB_CLIENT_START_TIMEOUT_SECONDS:-15}"
+if [[ ! "$client_start_timeout_seconds" =~ ^[1-9][0-9]*$ ]]; then
+  echo "MPTUNNEL_LAB_CLIENT_START_TIMEOUT_SECONDS must be a positive integer" >&2
+  exit 2
+fi
 isolate_cases="${ISOLATE_CASES:-1}"
 isolate_containers="${ISOLATE_CONTAINERS_PER_CASE:-1}"
 if [[ -n "${MPTUNNEL_LAB_SECRET:-}" ]]; then
@@ -226,6 +237,7 @@ active_telemetry_pid=""
 case_telemetry_pid=""
 case_management_pid=""
 active_mptcp_evidence_case=""
+active_client_config_artifact=""
 
 scale_lab_netem_value() {
   python3 - "$1" "$2" <<'PY'
@@ -327,11 +339,121 @@ exec_netem() {
 }
 
 build_mptunnel_binary() {
+  local -a feature_args=()
   if flag_enabled "$lab_diagnostics"; then
-    cargo build --release --bin mptunnel --features lab-diagnostics
-  else
-    cargo build --release --bin mptunnel
+    feature_args=(--features lab-diagnostics)
   fi
+  cargo build --release --bin mptunnel "${feature_args[@]}"
+  if [[ "$client_runtime" == "wine" ]]; then
+    cargo build --release --target "$client_target" --bin mptunnel "${feature_args[@]}"
+  fi
+}
+
+client_mptunnel_command() {
+  if [[ "$client_runtime" == "wine" ]]; then
+    printf 'env WINEDEBUG=-all WINEPREFIX=%q wine %q' \
+      "$wine_prefix" "$client_binary_container"
+  else
+    printf '%q' "$client_binary_container"
+  fi
+}
+
+prepare_client_runtime() {
+  if [[ "$client_runtime" != "wine" ]]; then
+    return 0
+  fi
+  exec_in client "command -v wine >/dev/null || { echo 'Wine client runtime requires MPTUNNEL_LAB_INSTALL_WINE=1 when building the lab image' >&2; exit 2; }; test -x '$client_binary_container'"
+  exec_in client "if [ ! -d ${wine_prefix_shell}/drive_c ]; then if ! timeout ${client_start_timeout_seconds}s env WINEDEBUG=-all WINEPREFIX=${wine_prefix_shell} wineboot --init >/tmp/mptunnel-wineboot.log 2>&1; then echo 'timed out initializing the Wine client runtime' >&2; tail -n 80 /tmp/mptunnel-wineboot.log >&2 || true; exit 1; fi; if ! timeout ${client_start_timeout_seconds}s env WINEDEBUG=-all WINEPREFIX=${wine_prefix_shell} wineserver -w; then echo 'timed out waiting for Wine initialization to stop' >&2; exit 1; fi; fi"
+}
+
+refresh_result_reproducibility() {
+  local server_target server_sha256 client_sha256 runtime_version
+  server_target="$(rustc -vV | sed -n 's/^host: //p')"
+  server_sha256="$(sha256sum target/release/mptunnel | awk '{print $1}')"
+  client_sha256="$(sha256sum "$client_binary_host" | awk '{print $1}')"
+  runtime_version="$client_runtime"
+  if [[ "$client_runtime" == "wine" ]]; then
+    runtime_version="$(exec_in client 'wine --version 2>/dev/null')"
+  fi
+  result_reproducibility="$(
+    SOURCE_COMMIT="$source_commit" \
+    SOURCE_TREE_DIRTY="$source_tree_dirty" \
+    MPTUNNEL_BUILD_FEATURES="$mptunnel_build_features" \
+    MPTUNNEL_PROTOCOL_VERSION="$mptunnel_protocol_version" \
+    MPTUNNEL_CLIENT_RUNTIME="$client_runtime" \
+    MPTUNNEL_CLIENT_RUNTIME_VERSION="$runtime_version" \
+    MPTUNNEL_CLIENT_TARGET="$client_target" \
+    MPTUNNEL_CLIENT_SHA256="$client_sha256" \
+    MPTUNNEL_SERVER_TARGET="$server_target" \
+    MPTUNNEL_SERVER_SHA256="$server_sha256" \
+      python3 - <<'PY'
+import json
+import os
+
+print(json.dumps({
+    "source_commit": os.environ["SOURCE_COMMIT"],
+    "source_tree_dirty": os.environ["SOURCE_TREE_DIRTY"] == "true",
+    "mptunnel_build_profile": "release",
+    "mptunnel_build_features": json.loads(os.environ["MPTUNNEL_BUILD_FEATURES"]),
+    "mptunnel_protocol_version": int(os.environ["MPTUNNEL_PROTOCOL_VERSION"]),
+    "mptunnel_client_runtime": os.environ["MPTUNNEL_CLIENT_RUNTIME"],
+    "mptunnel_client_runtime_version": os.environ["MPTUNNEL_CLIENT_RUNTIME_VERSION"],
+    "mptunnel_client_target": os.environ["MPTUNNEL_CLIENT_TARGET"],
+    "mptunnel_client_sha256": os.environ["MPTUNNEL_CLIENT_SHA256"],
+    "mptunnel_server_target": os.environ["MPTUNNEL_SERVER_TARGET"],
+    "mptunnel_server_sha256": os.environ["MPTUNNEL_SERVER_SHA256"],
+}, separators=(",", ":"), sort_keys=True))
+PY
+  )"
+}
+
+write_run_manifest() {
+  local client_container_id server_container_id target_container_id
+  local client_image_id server_image_id target_image_id
+  client_container_id="$(compose ps -q client)"
+  server_container_id="$(compose ps -q server)"
+  target_container_id="$(compose ps -q target)"
+  client_image_id="$(docker inspect -f '{{.Image}}' "$client_container_id")"
+  server_image_id="$(docker inspect -f '{{.Image}}' "$server_container_id")"
+  target_image_id="$(docker inspect -f '{{.Image}}' "$target_container_id")"
+  compose config | REPO_ROOT="$repo_root" python3 -c \
+    'import os, sys; sys.stdout.write(sys.stdin.read().replace(os.environ["REPO_ROOT"], "."))' \
+    > "$result_dir/compose-config.yaml"
+  RESULT_REPRODUCIBILITY="$result_reproducibility" \
+  RESULT_FILE="$result_file" \
+  CASE_FILTER_VALUE="$case_filter" \
+  LOAD_DURATION_SECONDS="$load_duration_seconds" \
+  UPLOAD_DRAIN_TIMEOUT_SECONDS="$upload_drain_timeout_seconds" \
+  BULK_CONNECTIONS="$bulk_connections" \
+  FAILOVER_AFTER_SECONDS="$failover_after" \
+  FAILOVER_PROFILE="$failover_profile" \
+  FAILOVER_TX_TRIGGER_BYTES="$failover_tx_trigger_bytes" \
+  ISOLATE_CASES_VALUE="$isolate_cases" \
+  ISOLATE_CONTAINERS_VALUE="$isolate_containers" \
+  CLIENT_SETTLE_SECONDS="$client_start_settle_seconds" \
+  CLIENT_START_TIMEOUT_SECONDS="$client_start_timeout_seconds" \
+  LAB_DIAGNOSTICS_VALUE="$lab_diagnostics" \
+  LAB_PERF_VALUE="$lab_perf" \
+  CONTAINER_STATS_VALUE="$container_stats" \
+  MANAGEMENT_SNAPSHOTS_VALUE="$management_snapshots" \
+  USE_PATH_HINTS_VALUE="${MPTUNNEL_LAB_USE_PATH_HINTS:-0}" \
+  CLIENT_IMAGE_ID="$client_image_id" \
+  SERVER_IMAGE_ID="$server_image_id" \
+  TARGET_IMAGE_ID="$target_image_id" \
+  HOST_KERNEL="$(uname -srmo)" \
+  HOST_CPU_COUNT="$(nproc)" \
+  HOST_MEMORY_BYTES="$(awk '/^MemTotal:/ {print $2 * 1024}' /proc/meminfo)" \
+  DOCKER_VERSION="$(docker version --format '{{.Client.Version}}')" \
+  COMPOSE_VERSION="$(docker compose version --short)" \
+  LAB_SCRIPT_DIR="$script_dir" \
+    python3 - "$result_dir/run-manifest.json" <<'PY'
+import os
+import sys
+sys.path.insert(0, os.environ["LAB_SCRIPT_DIR"])
+from result_enrichment import write_run_manifest
+
+write_run_manifest(sys.argv[1], os.environ)
+PY
 }
 
 toml_string() {
@@ -449,10 +571,56 @@ write_in() {
   printf '%s' "$content" | compose exec -T "$service" bash -lc "cat > $quoted_path"
 }
 
+record_config_checksum() {
+  local artifact_name="$1"
+  local output="$result_dir/$artifact_name"
+  local checksum checksum_file checksum_tmp
+  checksum="$(sha256sum "$output" | awk '{print $1}')"
+  checksum_file="$result_dir/config-sha256.txt"
+  checksum_tmp="${checksum_file}.tmp"
+  awk -v name="$artifact_name" '$2 != name' "$checksum_file" > "$checksum_tmp"
+  printf '%s  %s\n' "$checksum" "$artifact_name" >> "$checksum_tmp"
+  mv "$checksum_tmp" "$checksum_file"
+}
+
+persist_redacted_config() {
+  local service="$1"
+  local source_path="$2"
+  local artifact_name="$3"
+  local output="$result_dir/$artifact_name"
+  exec_in "$service" "sed -E 's/^(secret|token) = .*/\1 = \"<redacted>\"/' '$source_path'" > "$output"
+  record_config_checksum "$artifact_name"
+}
+
+retain_active_client_config_for_case() {
+  local case_name="$1"
+  local artifact_name output
+  if [[ -z "$active_client_config_artifact" || ! -f "$active_client_config_artifact" ]]; then
+    return 0
+  fi
+  artifact_name="config-client-$(case_artifact_name "$case_name").toml"
+  output="$result_dir/$artifact_name"
+  if [[ "$active_client_config_artifact" != "$output" ]]; then
+    cp "$active_client_config_artifact" "$output"
+  fi
+  record_config_checksum "$artifact_name"
+}
+
 validate_mptunnel_config_in() {
   local service="$1"
   local path="$2"
-  exec_in "$service" "/workspace/target/release/mptunnel --config '$path' --check-config"
+  local command="/workspace/target/release/mptunnel"
+  if [[ "$service" == "client" ]]; then
+    command="$(client_mptunnel_command)"
+  fi
+  exec_in "$service" "$command --config '$path' --check-config"
+}
+
+wait_for_client_proxy() {
+  local log_path="$1"
+  local port_hex
+  printf -v port_hex '%04X' "$proxy_port"
+  exec_in client "pid=\$(cat /tmp/mptunnel-client.pid); deadline=\$((SECONDS + $client_start_timeout_seconds)); while ! awk -v port=':${port_hex}' '\$2 ~ port \"\$\" && \$4 == \"0A\" { found=1 } END { exit !found }' /proc/net/tcp /proc/net/tcp6; do if ! kill -0 \"\$pid\" >/dev/null 2>&1; then echo 'mptunnel client exited before the SOCKS listener became ready' >&2; tail -n 80 '$log_path' >&2 || true; exit 1; fi; if [ \$SECONDS -ge \$deadline ]; then echo 'timed out waiting for the mptunnel SOCKS listener' >&2; tail -n 80 '$log_path' >&2 || true; exit 1; fi; sleep 0.05; done"
 }
 
 management_config_toml() {
@@ -729,6 +897,26 @@ netdev_snapshot_file_for_case() {
   printf '%s/netdev-%s-%s.json' "$result_dir" "$(case_artifact_name "$case_name")" "$phase"
 }
 
+qdisc_snapshot_file_for_case() {
+  local case_name="$1"
+  local phase="$2"
+  printf '%s/qdisc-%s-%s.txt' "$result_dir" "$(case_artifact_name "$case_name")" "$phase"
+}
+
+capture_qdisc_snapshot() {
+  local case_name="$1"
+  local phase="$2"
+  local output tmp service
+  output="$(qdisc_snapshot_file_for_case "$case_name" "$phase")"
+  tmp="${output}.tmp"
+  : > "$tmp"
+  for service in client server target; do
+    printf '[%s]\n' "$service" >> "$tmp"
+    exec_netem "$service" show >> "$tmp"
+  done
+  mv "$tmp" "$output"
+}
+
 failover_trigger_file_for_case() {
   local case_name="$1"
   printf '%s/failover-trigger-%s.json' "$result_dir" "$(case_artifact_name "$case_name")"
@@ -761,6 +949,8 @@ start_case_telemetry() {
   local case_name="$1"
   case_telemetry_pid=""
   case_management_pid=""
+  retain_active_client_config_for_case "$case_name"
+  capture_qdisc_snapshot "$case_name" before
   if ! telemetry_enabled && ! management_snapshots_enabled; then
     return 0
   fi
@@ -804,6 +994,7 @@ stop_case_telemetry() {
   local case_name="$1"
   local sampler_pid="${2:-}"
   if ! telemetry_enabled && ! management_snapshots_enabled; then
+    capture_qdisc_snapshot "$case_name" after
     return 0
   fi
   touch "$(telemetry_stop_file_for_case "$case_name")" >/dev/null 2>&1 || true
@@ -819,6 +1010,7 @@ stop_case_telemetry() {
       --compose-file "$compose_file" \
       > "$(netdev_snapshot_file_for_case "$case_name" after)" 2>/dev/null || true
   fi
+  capture_qdisc_snapshot "$case_name" after
   if [[ "$active_telemetry_case" == "$case_name" ]]; then
     active_telemetry_case=""
     active_telemetry_pid=""
@@ -1529,6 +1721,13 @@ stop_baselines() {
 
 stop_client() {
   stop_process client /tmp/mptunnel-client.pid
+  if [[ "$client_runtime" == "wine" ]]; then
+    if ! exec_in client "WINEDEBUG=-all WINEPREFIX=${wine_prefix_shell} wineserver -k >/dev/null 2>&1 || true; timeout ${client_start_timeout_seconds}s env WINEDEBUG=-all WINEPREFIX=${wine_prefix_shell} wineserver -w" >/dev/null 2>&1; then
+      exec_in client "pkill -KILL -x wineserver >/dev/null 2>&1 || true" \
+        >/dev/null 2>&1 || true
+    fi
+  fi
+  active_client_config_artifact=""
   sleep "$client_stop_settle_seconds"
 }
 
@@ -1872,19 +2071,56 @@ should_run_case() {
   local case_name="$1"
   local pattern
 
-  if [[ -z "$case_filter" ]]; then
-    return 0
+  if [[ -n "$case_filter" ]]; then
+    IFS=',' read -r -a patterns <<< "$case_filter"
+    local selected=0
+    for pattern in "${patterns[@]}"; do
+      # CASE_FILTER supports shell-style globs, for example mptunnel_mixed_*.
+      # shellcheck disable=SC2254
+      case "$case_name" in
+        $pattern) selected=1; break ;;
+      esac
+    done
+    if [[ "$selected" != "1" ]]; then
+      return 1
+    fi
   fi
 
+  if [[ "$client_runtime" == "wine" && "$case_name" == mptunnel_tun_* ]]; then
+    return 1
+  fi
+  return 0
+}
+
+validate_client_runtime_case_filter() {
+  if [[ "$client_runtime" != "wine" || -z "$case_filter" ]]; then
+    return 0
+  fi
+  local pattern tun_case
+  local -a tun_cases=(
+    mptunnel_tun_tcp_single_low_latency
+    mptunnel_tun_tcp_single_balanced
+    mptunnel_tun_udp_stream_single_low_latency
+    mptunnel_tun_udp_stream_single_balanced
+    mptunnel_tun_mixed_multipath_all
+    mptunnel_tun_tcp_single_low_latency_upload
+    mptunnel_tun_tcp_single_balanced_upload
+    mptunnel_tun_udp_stream_single_low_latency_upload
+    mptunnel_tun_udp_stream_single_balanced_upload
+    mptunnel_tun_mixed_multipath_all_upload
+  )
   IFS=',' read -r -a patterns <<< "$case_filter"
   for pattern in "${patterns[@]}"; do
-    # CASE_FILTER supports shell-style globs, for example mptunnel_mixed_*.
-    # shellcheck disable=SC2254
-    case "$case_name" in
-      $pattern) return 0 ;;
-    esac
+    for tun_case in "${tun_cases[@]}"; do
+      # shellcheck disable=SC2254
+      case "$tun_case" in
+        $pattern)
+          echo "Wine client runtime cannot run TUN case selected by CASE_FILTER: $tun_case" >&2
+          return 2
+          ;;
+      esac
+    done
   done
-  return 1
 }
 
 restart_target_tcp_sink() {
@@ -1934,6 +2170,7 @@ start_server() {
   local config_path="/tmp/mptunnel-server.toml"
   write_in server "$config_path" "$(server_config_toml)"
   validate_mptunnel_config_in server "$config_path"
+  persist_redacted_config server "$config_path" config-server.toml
   exec_in server "\
     $(mptunnel_lab_env_prefix server) \
     /workspace/target/release/mptunnel --config '${config_path}' \
@@ -1954,6 +2191,7 @@ start_client_with_netem() {
       compose down --remove-orphans >/dev/null 2>&1 || true
       compose up -d --remove-orphans >/dev/null
     fi
+    prepare_client_runtime
     apply_netem "$netem_mode"
     start_target_services
     start_server
@@ -1962,12 +2200,18 @@ start_client_with_netem() {
     apply_netem "$netem_mode"
   fi
   local config_path="/tmp/mptunnel-client-${profile}.toml"
+  local client_command
+  client_command="$(client_mptunnel_command)"
   write_in client "$config_path" "$(socks_client_config_toml "$path_args")"
   validate_mptunnel_config_in client "$config_path"
+  persist_redacted_config client "$config_path" \
+    "config-client-$(case_artifact_name "$profile").toml"
+  active_client_config_artifact="$result_dir/config-client-$(case_artifact_name "$profile").toml"
   exec_in client "\
     $(mptunnel_lab_env_prefix client) \
-    /workspace/target/release/mptunnel --config '${config_path}' \
+    ${client_command} --config '${config_path}' \
       >/tmp/mptunnel-client-${profile}.log 2>&1 & echo \$! >/tmp/mptunnel-client.pid"
+  wait_for_client_proxy "/tmp/mptunnel-client-${profile}.log"
   sleep "$client_start_settle_seconds"
   exec_in client "kill -0 \$(cat /tmp/mptunnel-client.pid)"
 }
@@ -1979,6 +2223,10 @@ start_client() {
 }
 
 start_tun_client() {
+  if [[ "$client_runtime" != "native" ]]; then
+    echo "TUN lab cases require MPTUNNEL_LAB_CLIENT_RUNTIME=native" >&2
+    return 2
+  fi
   local profile="$1"
   shift
   local path_args="$*"
@@ -1998,6 +2246,9 @@ start_tun_client() {
   local config_path="/tmp/mptunnel-client-${profile}.toml"
   write_in client "$config_path" "$(tun_client_config_toml "$path_args")"
   validate_mptunnel_config_in client "$config_path"
+  persist_redacted_config client "$config_path" \
+    "config-client-$(case_artifact_name "$profile").toml"
+  active_client_config_artifact="$result_dir/config-client-$(case_artifact_name "$profile").toml"
   exec_in client "\
     $(mptunnel_lab_env_prefix client) \
     /workspace/target/release/mptunnel --config '${config_path}' \
@@ -2867,8 +3118,10 @@ run_upload_latency_spike_case() {
   apply_netem apply
 }
 
+validate_client_runtime_case_filter
 mkdir -p "$result_dir"
 : > "$result_file"
+: > "$result_dir/config-sha256.txt"
 
 docker compose version >/dev/null
 if [[ "$build_product" == "1" ]]; then
@@ -2879,6 +3132,9 @@ if [[ "$build_lab_images" == "1" ]]; then
 fi
 compose up -d --remove-orphans
 trap cleanup EXIT
+prepare_client_runtime
+refresh_result_reproducibility
+write_run_manifest
 
 start_target_services
 apply_netem apply

@@ -240,6 +240,13 @@ persistent data role. On the server, one session registry owns the target
 stream binding; TCP and QUIC carrier actors attach to that binding through
 typed ports and never create duplicate target relays.
 
+A bidirectional QUIC stream has independent send and receive ownership. Native
+FIN on one half neither completes the MPP stream nor substitutes for product
+`STREAM_FIN` or `STREAM_DETACH`; the actor retains the writable half for final
+Data ACK and teardown frames. Terminal product frames are processed before a
+following clean carrier EOF, while an EOF inside a protocol frame remains a
+visible truncation error.
+
 The reliable-stream actor, not a carrier, owns break-before-make retention.
 At zero live attachments it preserves the existing sequence/ACK/FIN state,
 stops source reads, and rotates one reconnect attempt at a time until the

@@ -138,6 +138,17 @@ fn quic_udp_command_queue_tracks_sender_quantum_not_record_size() {
     );
 }
 
+#[test]
+fn quic_clean_stream_finish_is_distinct_from_truncated_frame() {
+    let clean = RuntimeError::QuicCarrier(quic_transport::QuicCarrierError::StreamFinished);
+    let truncated = RuntimeError::QuicCarrier(quic_transport::QuicCarrierError::UnexpectedEnd);
+
+    assert!(udp_path_input_finished(&clean));
+    assert!(!udp_path_frame_finished(&clean));
+    assert!(!udp_path_input_finished(&truncated));
+    assert!(!udp_path_frame_finished(&truncated));
+}
+
 #[tokio::test]
 async fn quic_write_wait_routes_stream_feedback_before_an_ordering_barrier() {
     let (input_tx, mut input_rx) = mpsc::channel(4);

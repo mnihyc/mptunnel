@@ -1357,9 +1357,12 @@ async fn http_connect_ingress_rejects_missing_basic_proxy_auth() {
 async fn http_connect_ingress_relays_tcp_payload_over_udp_stream_path() {
     let (target_addr, target) = spawn_echo_target().await;
     let (path, server_path) = spawn_udp_server_path(OutboundConfig::Direct).await;
-    let context =
-        ClientPathContext::new(vec![path], security(), ResourceLimits::default()).expect("ctx");
-    let (mut client, server) = duplex(4096);
+    let context = client_context_with_session_retention(
+        vec![path],
+        ResourceLimits::default(),
+        Duration::from_secs(2),
+    );
+    let (mut client, server) = duplex(1);
     let handler = tokio::spawn(handle_http_connect_client_stream(server, context));
 
     client
@@ -1374,14 +1377,21 @@ async fn http_connect_ingress_relays_tcp_payload_over_udp_stream_path() {
 
     client.write_all(b"ping").await.expect("payload write");
     client.shutdown().await.expect("client shutdown");
+    // Hold product delivery so the QUIC actor observes peer FIN and clean EOF
+    // before the relay can publish final receive feedback.
+    target.await.expect("target join");
+    tokio::time::sleep(Duration::from_millis(50)).await;
     let mut payload = [0u8; 4];
     client.read_exact(&mut payload).await.expect("payload read");
     assert_eq!(&payload, b"pong");
 
-    handler.await.expect("join").expect("handler");
+    tokio::time::timeout(FULL_STACK_RESPONSE_TIMEOUT, handler)
+        .await
+        .expect("handler timeout")
+        .expect("join")
+        .expect("handler");
     server_path.abort();
     let _ = server_path.await;
-    target.await.expect("target join");
 }
 
 async fn open_socks5_udp_associate<S>(control_client: &mut S) -> SocketAddr

@@ -3,7 +3,7 @@
 use super::client_writer::drain_client_udp_stream_commands;
 use super::io::{
     UdpPathRecvStream, UdpPathSendStream, spawn_quic_path_reader, udp_path_finish_stream,
-    udp_path_write_frame,
+    udp_path_input_finished, udp_path_write_frame,
 };
 use crate::model::path::CarrierPathInstanceId;
 use crate::mux::MuxLimits;
@@ -36,7 +36,11 @@ pub(super) async fn run_client_udp_stream(
     let mut carrier_frames = spawn_quic_path_reader(recv, codec_limits, reader_queue_size);
     let mut pending_frames = Vec::<Frame>::new();
     let mut path_proofs = PathProofTracker::default();
-    let mut deferred_input = None;
+    let mut deferred_input: Option<Result<Frame, RuntimeError>> = None;
+    // A peer FIN closes only the QUIC receive half. Final Data ACK and local
+    // FIN work must retain this actor's independent send half.
+    let mut carrier_input_open = true;
+    let mut product_terminal_received = false;
     let path_id = PathId(path_index as u16);
     loop {
         let command_may_recv = !reliable_path_receivers_closed(&commands);
@@ -45,6 +49,16 @@ pub(super) async fn run_client_udp_stream(
             return;
         }
         if let Some(input) = deferred_input.take() {
+            if input.as_ref().is_err_and(udp_path_input_finished) {
+                if !product_terminal_received {
+                    let _ = frames
+                        .send(Err(RuntimeError::ReliablePathSessionClosed))
+                        .await;
+                }
+                carrier_input_open = false;
+                continue;
+            }
+            product_terminal_received |= client_udp_product_terminal(&input, stream_id);
             if let Err(err) = handle_client_udp_stream_input(
                 input,
                 &mut send,
@@ -77,6 +91,7 @@ pub(super) async fn run_client_udp_stream(
                 &mut carrier_frames,
                 &frames,
                 &mut deferred_input,
+                carrier_input_open,
             )
             .await;
             match result {
@@ -91,8 +106,18 @@ pub(super) async fn run_client_udp_stream(
         }
         tokio::select! {
             biased;
-            frame = carrier_frames.recv() => {
+            frame = carrier_frames.recv(), if carrier_input_open => {
                 let input = frame.unwrap_or(Err(RuntimeError::ReliablePathSessionClosed));
+                if input.as_ref().is_err_and(udp_path_input_finished) {
+                    if !product_terminal_received {
+                        let _ = frames
+                            .send(Err(RuntimeError::ReliablePathSessionClosed))
+                            .await;
+                    }
+                    carrier_input_open = false;
+                    continue;
+                }
+                product_terminal_received |= client_udp_product_terminal(&input, stream_id);
                 if let Err(err) = handle_client_udp_stream_input(
                     input,
                     &mut send,
@@ -121,6 +146,7 @@ pub(super) async fn run_client_udp_stream(
                             &mut carrier_frames,
                             &frames,
                             &mut deferred_input,
+                            carrier_input_open,
                         )
                     .await;
                     match result {
@@ -147,6 +173,7 @@ pub(super) async fn run_client_udp_stream(
                         &mut carrier_frames,
                         &frames,
                         &mut deferred_input,
+                        carrier_input_open,
                     ).await;
                     match result {
                         Ok(false) => {}
@@ -160,6 +187,19 @@ pub(super) async fn run_client_udp_stream(
             }
         }
     }
+}
+
+fn client_udp_product_terminal(input: &Result<Frame, RuntimeError>, stream_id: StreamId) -> bool {
+    matches!(
+        input,
+        Ok(Frame::StreamFin {
+            stream_id: terminal_stream_id,
+            ..
+        } | Frame::StreamReset {
+            stream_id: terminal_stream_id,
+            ..
+        }) if *terminal_stream_id == stream_id
+    )
 }
 
 #[allow(clippy::too_many_arguments)]

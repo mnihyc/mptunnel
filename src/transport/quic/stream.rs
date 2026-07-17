@@ -289,8 +289,14 @@ pub async fn read_frame(
             .stream
             .read(&mut recv.read_scratch[..])
             .await
-            .map_err(QuicCarrierError::Read)?
-            .ok_or(QuicCarrierError::UnexpectedEnd)?;
+            .map_err(QuicCarrierError::Read)?;
+        let Some(read) = read else {
+            return if recv.read_buffer.is_empty() {
+                Err(QuicCarrierError::StreamFinished)
+            } else {
+                Err(QuicCarrierError::UnexpectedEnd)
+            };
+        };
         if read == 0 {
             return Err(QuicCarrierError::UnexpectedEnd);
         }

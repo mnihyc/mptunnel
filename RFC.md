@@ -342,6 +342,13 @@ ordered in the same sequence space and may be sent on any live attachment.
 `STREAM_DETACH(stream_id)` removes only that carrier attachment.
 `STREAM_RESET(stream_id, reason)` terminates the reliable stream.
 
+A native QUIC stream FIN closes only that carrier byte-stream direction. It
+MUST NOT be interpreted as `STREAM_FIN`, `STREAM_DETACH`, or completion of the
+MPP stream. The independently writable direction remains available until
+attachment teardown for outstanding `STREAM_ACK`, `STREAM_FIN`, and
+`STREAM_DETACH` frames. A native FIN at a frame boundary is a clean carrier
+half-close; a native FIN inside an MPP frame is a truncation error.
+
 ### 6.6 Break-before-make retention
 
 An endpoint MAY retain an established reliable stream for a configured

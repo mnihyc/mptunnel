@@ -588,7 +588,7 @@ async fn run_client_udp_control_stream(
             // Pre-control peers finish the handshake stream; keep their product
             // connection usable and simply withdraw this diagnostic carrier.
             ClientUdpControlEvent::Frame(Err(RuntimeError::QuicCarrier(
-                QuicCarrierError::UnexpectedEnd,
+                QuicCarrierError::StreamFinished,
             ))) => return Ok(()),
             ClientUdpControlEvent::Frame(Err(err)) => return Err(err),
             ClientUdpControlEvent::Request(Some(request_id)) => {

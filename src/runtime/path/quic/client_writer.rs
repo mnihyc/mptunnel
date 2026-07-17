@@ -1,7 +1,8 @@
 //! Client QUIC reliable-stream command writer.
 
 use super::io::{
-    UdpPathSendStream, flush_udp_frame_batch_with_path_proofs_interlocked, udp_path_finish_stream,
+    UdpPathSendStream, flush_udp_frame_batch_with_path_proofs,
+    flush_udp_frame_batch_with_path_proofs_interlocked, udp_path_finish_stream,
 };
 #[cfg(feature = "lab-diagnostics")]
 use crate::lab_diagnostics::lab_diagnostic;
@@ -34,6 +35,7 @@ pub(super) async fn drain_client_udp_stream_commands(
     carrier_frames: &mut mpsc::Receiver<Result<Frame, RuntimeError>>,
     stream_frames: &mpsc::Sender<Result<Frame, RuntimeError>>,
     deferred_input: &mut Option<Result<Frame, RuntimeError>>,
+    carrier_input_open: bool,
 ) -> Result<bool, RuntimeError> {
     debug_assert!(deferred_input.is_none());
     #[cfg(feature = "lab-diagnostics")]
@@ -76,6 +78,7 @@ pub(super) async fn drain_client_udp_stream_commands(
                 carrier_frames,
                 stream_frames,
                 deferred_input,
+                carrier_input_open,
             )
             .await?;
             #[cfg(feature = "lab-diagnostics")]
@@ -129,6 +132,7 @@ pub(super) async fn drain_client_udp_stream_commands(
                         carrier_frames,
                         stream_frames,
                         deferred_input,
+                        carrier_input_open,
                     )
                     .await?;
                     #[cfg(feature = "lab-diagnostics")]
@@ -176,6 +180,7 @@ pub(super) async fn drain_client_udp_stream_commands(
                     carrier_frames,
                     stream_frames,
                     deferred_input,
+                    carrier_input_open,
                 )
                 .await?;
                 if close_stream_id == stream_id {
@@ -233,6 +238,7 @@ pub(super) async fn drain_client_udp_stream_commands(
                 carrier_frames,
                 stream_frames,
                 deferred_input,
+                carrier_input_open,
             )
             .await?;
             #[cfg(feature = "lab-diagnostics")]
@@ -270,17 +276,24 @@ async fn flush_client_udp_frame_batch(
     carrier_frames: &mut mpsc::Receiver<Result<Frame, RuntimeError>>,
     stream_frames: &mpsc::Sender<Result<Frame, RuntimeError>>,
     deferred_input: &mut Option<Result<Frame, RuntimeError>>,
+    carrier_input_open: bool,
 ) -> Result<(), RuntimeError> {
-    let result = flush_udp_frame_batch_with_path_proofs_interlocked(
-        send,
-        pending_frames,
-        codec_limits,
-        path_proofs,
-        carrier_frames,
-        deferred_input,
-        |frame| try_route_client_udp_stream_frame_during_write(frame, stream_id, stream_frames),
-    )
-    .await;
+    let result = if carrier_input_open {
+        flush_udp_frame_batch_with_path_proofs_interlocked(
+            send,
+            pending_frames,
+            codec_limits,
+            path_proofs,
+            carrier_frames,
+            deferred_input,
+            |frame| try_route_client_udp_stream_frame_during_write(frame, stream_id, stream_frames),
+        )
+        .await
+    } else {
+        flush_udp_frame_batch_with_path_proofs(send, pending_frames, codec_limits, path_proofs)
+            .await
+            .map(|()| 0)
+    };
     commands.release_pending_command_accounting(
         std::mem::take(pending_frame_command_bytes),
         std::mem::take(pending_frame_carrier_credit_bytes),
@@ -309,9 +322,20 @@ fn try_route_client_udp_stream_frame_during_write(
     let received_stream_id = match &frame {
         Frame::StreamData { stream_id, .. }
         | Frame::StreamAck { stream_id, .. }
-        | Frame::StreamMaxData { stream_id, .. }
-        | Frame::StreamFin { stream_id, .. }
-        | Frame::StreamReset { stream_id, .. } => *stream_id,
+        | Frame::StreamMaxData { stream_id, .. } => *stream_id,
+        // Terminal frames change receive-half ownership. Defer them to the
+        // outer stream loop so clean QUIC EOF cannot overtake that transition.
+        Frame::StreamFin {
+            stream_id: terminal_stream_id,
+            ..
+        }
+        | Frame::StreamReset {
+            stream_id: terminal_stream_id,
+            ..
+        } if *terminal_stream_id == stream_id => {
+            return Ok(Some(frame));
+        }
+        Frame::StreamFin { stream_id, .. } | Frame::StreamReset { stream_id, .. } => *stream_id,
         _ => return Ok(Some(frame)),
     };
     if received_stream_id != stream_id {
@@ -326,3 +350,7 @@ fn try_route_client_udp_stream_frame_during_write(
         }
     }
 }
+
+#[cfg(test)]
+#[path = "client_writer_test.rs"]
+mod tests;

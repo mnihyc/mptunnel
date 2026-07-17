@@ -234,6 +234,23 @@ pub(super) async fn flush_udp_frame_batch(
     Ok(())
 }
 
+pub(super) async fn flush_udp_frame_batch_with_path_proofs(
+    send: &mut UdpPathSendStream,
+    frames: &mut Vec<Frame>,
+    codec_limits: CodecLimits,
+    path_proofs: &mut PathProofTracker,
+) -> Result<(), RuntimeError> {
+    if frames.is_empty() {
+        return Ok(());
+    }
+    udp_path_write_frames(send, frames, codec_limits).await?;
+    for frame in frames.iter() {
+        path_proofs.record_sent_frame(frame);
+    }
+    frames.clear();
+    Ok(())
+}
+
 pub(super) async fn flush_udp_frame_batch_with_path_proofs_interlocked<F>(
     send: &mut UdpPathSendStream,
     frames: &mut Vec<Frame>,
@@ -266,7 +283,7 @@ where
     Ok(routed_frames)
 }
 
-async fn await_udp_write_while_routing_stream_frames<W, T, F>(
+pub(super) async fn await_udp_write_while_routing_stream_frames<W, T, F>(
     write: W,
     carrier_frames: &mut mpsc::Receiver<Result<Frame, RuntimeError>>,
     deferred_input: &mut Option<Result<Frame, RuntimeError>>,
@@ -336,9 +353,15 @@ pub(super) fn udp_path_frame_finished(err: &RuntimeError) -> bool {
         err,
         RuntimeError::QuicCarrier(
             quic_transport::QuicCarrierError::Read(_)
-                | quic_transport::QuicCarrierError::UnexpectedEnd
                 | quic_transport::QuicCarrierError::Connection(_)
         )
+    )
+}
+
+pub(super) fn udp_path_input_finished(err: &RuntimeError) -> bool {
+    matches!(
+        err,
+        RuntimeError::QuicCarrier(quic_transport::QuicCarrierError::StreamFinished)
     )
 }
 
@@ -347,7 +370,7 @@ fn udp_runtime_error_is_expected_shutdown(err: &RuntimeError) -> bool {
         err,
         RuntimeError::QuicCarrier(
             quic_transport::QuicCarrierError::Read(_)
-                | quic_transport::QuicCarrierError::UnexpectedEnd
+                | quic_transport::QuicCarrierError::StreamFinished
                 | quic_transport::QuicCarrierError::Connection(_)
         ) | RuntimeError::RemoteClosed(CloseReason::Normal)
     )
@@ -442,6 +465,7 @@ pub(super) fn spawn_quic_path_reader(
             };
             let frame = match received {
                 Ok(frame) => Ok(frame),
+                Err(err) if udp_path_input_finished(&err) => Err(err),
                 Err(err) if udp_path_frame_finished(&err) => {
                     #[cfg(feature = "lab-diagnostics")]
                     crate::lab_diagnostics::lab_diagnostic(

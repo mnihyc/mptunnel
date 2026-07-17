@@ -123,6 +123,7 @@ pub(super) async fn handle_server_udp_datagram_stream(
                     }
                     Some(Ok(Frame::SessionClose { reason })) => return Err(RuntimeError::RemoteClosed(reason)),
                     Some(Ok(_)) => return Err(RuntimeError::Protocol("unexpected server QUIC UDP path datagram stream frame")),
+                    Some(Err(err)) if super::io::udp_path_input_finished(&err) => return Ok(()),
                     Some(Err(RuntimeError::ReliablePathSessionClosed)) | None => return Ok(()),
                     Some(Err(err)) => return Err(err),
                 }

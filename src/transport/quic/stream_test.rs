@@ -111,6 +111,11 @@ async fn quic_carrier_round_trips_product_frames() {
         .expect("response timeout")
         .expect("client read pong");
     assert_eq!(response, Frame::Pong { nonce: 42 });
+    let finished = timeout(Duration::from_secs(5), read_frame(&mut recv, limits))
+        .await
+        .expect("stream finish timeout")
+        .expect_err("server finished its QUIC send half");
+    assert!(matches!(finished, QuicCarrierError::StreamFinished));
     let _ = client_done_tx.send(());
 
     server_task.await.expect("server task");

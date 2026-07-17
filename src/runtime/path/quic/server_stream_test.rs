@@ -1,9 +1,13 @@
-use super::ServerUdpReliableOutputDetachGuard;
+use super::{
+    ServerUdpReliableOutputDetachGuard, ServerUdpReliableStreamLoop,
+    run_server_udp_reliable_stream_loop,
+};
 use crate::config::{
     DEFAULT_OUTBOUND_CONNECT_TIMEOUT, MppPerformanceConfig, ResourceLimits, SecurityConfig,
     SharedSecret,
 };
 use crate::model::capacity::MAX_RELIABLE_SERVICE_QUANTUM_BYTES;
+use crate::model::path::next_carrier_path_instance_id;
 use crate::mux::MuxLimits;
 use crate::outbound::{DnsConfig, OutboundConfig};
 use crate::protocol::codec::CodecLimits;
@@ -13,20 +17,24 @@ use crate::protocol::{
 use crate::runtime::error::RuntimeError;
 use crate::runtime::node::server::{ServerIdentityRuntime, new_identity_runtime};
 use crate::runtime::path::commands::{
-    ReliablePathCommandReceivers, ReliablePathCommandSender, recv_reliable_path_command,
-    reliable_path_command_channels, reliable_path_command_pending_bytes,
+    ReliablePathCommand, ReliablePathCommandReceivers, ReliablePathCommandSender,
+    recv_reliable_path_command, reliable_path_command_channels,
+    reliable_path_command_pending_bytes,
 };
 use crate::runtime::path::proof::PathProofTracker;
 use crate::runtime::path::quic::client::ClientUdpPathSessionRuntime;
+use crate::runtime::path::quic::client_stream::run_client_udp_stream;
 use crate::runtime::path::quic::io::{
     UdpPathConnection, UdpPathEndpoint, UdpPathRecvStream, UdpPathSendStream,
-    udp_path_max_stream_payload_bytes, udp_path_read_frame, udp_path_write_frame,
+    udp_path_finish_stream, udp_path_max_stream_payload_bytes, udp_path_read_frame,
+    udp_path_write_frame,
 };
 use crate::runtime::path::quic::server_writer::drain_server_udp_reliable_commands;
 use crate::runtime::path::server_context::ServerPathContext;
 use crate::runtime::path::{
-    ClientPathHealth, ClientPathState, ServerCarrierPathRegistration, ServerLocalPathProperties,
-    ServerStreamOpenOutcome, ServerStreamOpenRequest, ServerStreamPathAttachment,
+    ClientPathHealth, ClientPathHealthRecord, ClientPathState, ServerCarrierPathRegistration,
+    ServerLocalPathProperties, ServerStreamOpenOutcome, ServerStreamOpenRequest,
+    ServerStreamPathAttachment,
 };
 use crate::runtime::peer_status::{PeerStatusBroker, PeerStatusSnapshotSource};
 use crate::runtime::stream::{
@@ -47,14 +55,15 @@ struct ServerUdpTerminalWriterFixture {
     session_id: SessionId,
     path_id: PathId,
     stream_id: StreamId,
+    target: TargetAddr,
     _path_registration: ServerCarrierPathRegistration,
     commands_tx: ReliablePathCommandSender,
-    commands_rx: ReliablePathCommandReceivers,
+    commands_rx: Option<ReliablePathCommandReceivers>,
     accepted: AcceptedServerReliableStream,
     server_send: Option<UdpPathSendStream>,
-    client_recv: UdpPathRecvStream,
-    _client_send: UdpPathSendStream,
-    _server_recv: UdpPathRecvStream,
+    client_recv: Option<UdpPathRecvStream>,
+    client_send: Option<UdpPathSendStream>,
+    server_recv: Option<UdpPathRecvStream>,
     _server_endpoint: UdpPathEndpoint,
     _client_endpoint: UdpPathEndpoint,
     _server_connection: UdpPathConnection,
@@ -97,7 +106,7 @@ impl ServerUdpTerminalWriterFixture {
             .open_or_attach(ServerStreamOpenRequest {
                 session_id,
                 stream_id,
-                target,
+                target: target.clone(),
                 lane: TrafficClass::Throughput,
                 attachment: ServerStreamPathAttachment {
                     path_registration: path_registration.clone(),
@@ -205,14 +214,15 @@ impl ServerUdpTerminalWriterFixture {
             session_id,
             path_id,
             stream_id,
+            target,
             _path_registration: path_registration,
             commands_tx,
-            commands_rx,
+            commands_rx: Some(commands_rx),
             accepted,
             server_send: Some(server_send),
-            client_recv,
-            _client_send: client_send,
-            _server_recv: server_recv,
+            client_recv: Some(client_recv),
+            client_send: Some(client_send),
+            server_recv: Some(server_recv),
             _server_endpoint: server_endpoint,
             _client_endpoint: client_endpoint,
             _server_connection: server_connection,
@@ -311,9 +321,14 @@ async fn server_quic_terminal_writer_flushes_reset_then_detaches_and_finishes_st
         )
         .await
         .expect("queue server QUIC terminal command");
-    let command = recv_reliable_path_command(&mut fixture.commands_rx)
-        .await
-        .expect("dequeue server QUIC terminal command");
+    let command = recv_reliable_path_command(
+        fixture
+            .commands_rx
+            .as_mut()
+            .expect("server QUIC command receivers"),
+    )
+    .await
+    .expect("dequeue server QUIC terminal command");
     let mut pending_frames = Vec::new();
     let mut path_proofs = PathProofTracker::default();
     let (_carrier_frames_tx, mut carrier_frames) = mpsc::channel(1);
@@ -321,7 +336,10 @@ async fn server_quic_terminal_writer_flushes_reset_then_detaches_and_finishes_st
 
     let should_close = drain_server_udp_reliable_commands(
         command,
-        &mut fixture.commands_rx,
+        fixture
+            .commands_rx
+            .as_mut()
+            .expect("server QUIC command receivers"),
         fixture.server_send.as_mut().expect("server QUIC sender"),
         &fixture.context,
         fixture.session_id,
@@ -346,7 +364,10 @@ async fn server_quic_terminal_writer_flushes_reset_then_detaches_and_finishes_st
     assert_eq!(
         tokio::time::timeout(
             Duration::from_secs(5),
-            udp_path_read_frame(&mut fixture.client_recv, fixture.context.codec_limits),
+            udp_path_read_frame(
+                fixture.client_recv.as_mut().expect("client QUIC receiver"),
+                fixture.context.codec_limits,
+            ),
         )
         .await
         .expect("server QUIC reset timeout")
@@ -364,7 +385,10 @@ async fn server_quic_terminal_writer_flushes_reset_then_detaches_and_finishes_st
     assert!(
         tokio::time::timeout(
             Duration::from_secs(5),
-            udp_path_read_frame(&mut fixture.client_recv, fixture.context.codec_limits),
+            udp_path_read_frame(
+                fixture.client_recv.as_mut().expect("client QUIC receiver"),
+                fixture.context.codec_limits,
+            ),
         )
         .await
         .expect("server QUIC finish timeout")
@@ -387,9 +411,14 @@ async fn server_quic_mismatched_terminal_releases_debt_and_guard_fails_closed() 
         )
         .await
         .expect("queue mismatched server QUIC terminal command");
-    let command = recv_reliable_path_command(&mut fixture.commands_rx)
-        .await
-        .expect("dequeue mismatched server QUIC terminal command");
+    let command = recv_reliable_path_command(
+        fixture
+            .commands_rx
+            .as_mut()
+            .expect("server QUIC command receivers"),
+    )
+    .await
+    .expect("dequeue mismatched server QUIC terminal command");
     let command_debt = reliable_path_command_pending_bytes(&command) as u64;
     assert_eq!(fixture.commands_tx.pending_bytes(), command_debt);
     let output_guard = ServerUdpReliableOutputDetachGuard {
@@ -407,7 +436,10 @@ async fn server_quic_mismatched_terminal_releases_debt_and_guard_fails_closed() 
 
     let error = drain_server_udp_reliable_commands(
         command,
-        &mut fixture.commands_rx,
+        fixture
+            .commands_rx
+            .as_mut()
+            .expect("server QUIC command receivers"),
         &mut server_send,
         &fixture.context,
         fixture.session_id,
@@ -439,11 +471,281 @@ async fn server_quic_mismatched_terminal_releases_debt_and_guard_fails_closed() 
     assert!(
         tokio::time::timeout(
             Duration::from_secs(5),
-            udp_path_read_frame(&mut fixture.client_recv, fixture.context.codec_limits),
+            udp_path_read_frame(
+                fixture.client_recv.as_mut().expect("client QUIC receiver"),
+                fixture.context.codec_limits,
+            ),
         )
         .await
         .expect("failed server QUIC stream close timeout")
         .is_err(),
         "dropping the failed stream-local writer must fail the QUIC stream closed"
     );
+}
+
+#[tokio::test]
+async fn client_quic_terminal_input_keeps_feedback_writer_until_owner_close() {
+    let stream_id = StreamId(405);
+    let mut fixture = ServerUdpTerminalWriterFixture::open(stream_id).await;
+    let client_send = fixture.client_send.take().expect("client QUIC sender");
+    let client_recv = fixture.client_recv.take().expect("client QUIC receiver");
+    let mut server_send = fixture.server_send.take().expect("server QUIC sender");
+    let mut server_recv = fixture.server_recv.take().expect("server QUIC receiver");
+    let (commands_tx, commands_rx) = reliable_path_command_channels(8);
+    let (frames_tx, mut frames_rx) = mpsc::channel(8);
+    let state = ClientPathState::new(ClientPathHealth {
+        tcp: Vec::new(),
+        udp: vec![ClientPathHealthRecord::default()],
+    });
+    let codec_limits = fixture.context.codec_limits;
+    let mux_limits = fixture.context.mux_limits;
+    let actor = tokio::spawn(run_client_udp_stream(
+        client_send,
+        client_recv,
+        stream_id,
+        0,
+        next_carrier_path_instance_id(),
+        codec_limits,
+        mux_limits,
+        8,
+        state,
+        commands_rx,
+        frames_tx,
+    ));
+
+    assert_eq!(
+        udp_path_read_frame(&mut server_recv, codec_limits)
+            .await
+            .expect("read client opener"),
+        Frame::Ping { nonce: 1 },
+    );
+    udp_path_write_frame(
+        &mut server_send,
+        &Frame::StreamFin {
+            stream_id,
+            final_offset: 0,
+        },
+        codec_limits,
+    )
+    .await
+    .expect("write terminal product FIN");
+    udp_path_finish_stream(&mut server_send).expect("finish server send half");
+    assert!(matches!(
+        frames_rx.recv().await,
+        Some(Ok(Frame::StreamFin {
+            stream_id: received_stream_id,
+            final_offset: 0,
+        })) if received_stream_id == stream_id
+    ));
+
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    commands_tx
+        .send_control(ReliablePathCommand::SendFrame(Frame::StreamAck {
+            stream_id,
+            complete: true,
+            ranges: Vec::new(),
+        }))
+        .await
+        .expect("client writer remains after peer send-half finish");
+    assert!(matches!(
+        udp_path_read_frame(&mut server_recv, codec_limits).await,
+        Ok(Frame::StreamAck {
+            stream_id: ack_stream_id,
+            complete: true,
+            ..
+        }) if ack_stream_id == stream_id
+    ));
+    commands_tx
+        .send_stream_ordered_close(stream_id, TrafficClass::Throughput)
+        .await
+        .expect("close retained client writer");
+    tokio::time::timeout(Duration::from_secs(5), actor)
+        .await
+        .expect("client actor close timeout")
+        .expect("client actor join");
+    assert!(!fixture._client_connection.is_closed());
+}
+
+#[tokio::test]
+async fn client_quic_clean_eof_reports_attachment_failure_then_allows_detach() {
+    let stream_id = StreamId(407);
+    let mut fixture = ServerUdpTerminalWriterFixture::open(stream_id).await;
+    let client_send = fixture.client_send.take().expect("client QUIC sender");
+    let client_recv = fixture.client_recv.take().expect("client QUIC receiver");
+    let mut server_send = fixture.server_send.take().expect("server QUIC sender");
+    let mut server_recv = fixture.server_recv.take().expect("server QUIC receiver");
+    let (commands_tx, commands_rx) = reliable_path_command_channels(8);
+    let (frames_tx, mut frames_rx) = mpsc::channel(8);
+    let state = ClientPathState::new(ClientPathHealth {
+        tcp: Vec::new(),
+        udp: vec![ClientPathHealthRecord::default()],
+    });
+    let codec_limits = fixture.context.codec_limits;
+    let actor = tokio::spawn(run_client_udp_stream(
+        client_send,
+        client_recv,
+        stream_id,
+        0,
+        next_carrier_path_instance_id(),
+        codec_limits,
+        fixture.context.mux_limits,
+        8,
+        state,
+        commands_rx,
+        frames_tx,
+    ));
+
+    assert_eq!(
+        udp_path_read_frame(&mut server_recv, codec_limits)
+            .await
+            .expect("read client opener"),
+        Frame::Ping { nonce: 1 },
+    );
+    udp_path_finish_stream(&mut server_send).expect("finish server send half");
+    assert!(matches!(
+        frames_rx.recv().await,
+        Some(Err(RuntimeError::ReliablePathSessionClosed))
+    ));
+
+    commands_tx
+        .send_stream_ordered_frame(Frame::StreamDetach { stream_id }, TrafficClass::Throughput)
+        .await
+        .expect("queue detach after peer clean EOF");
+    commands_tx
+        .send_stream_ordered_close(stream_id, TrafficClass::Throughput)
+        .await
+        .expect("close retained client writer");
+    assert_eq!(
+        udp_path_read_frame(&mut server_recv, codec_limits)
+            .await
+            .expect("read client detach"),
+        Frame::StreamDetach { stream_id },
+    );
+    assert!(matches!(
+        udp_path_read_frame(&mut server_recv, codec_limits).await,
+        Err(RuntimeError::QuicCarrier(
+            crate::transport::quic::QuicCarrierError::StreamFinished
+        ))
+    ));
+    tokio::time::timeout(Duration::from_secs(5), actor)
+        .await
+        .expect("client actor close timeout")
+        .expect("client actor join");
+    assert!(!fixture._client_connection.is_closed());
+}
+
+#[tokio::test]
+async fn server_quic_ordered_close_drains_peer_until_stream_detach() {
+    let stream_id = StreamId(406);
+    let mut fixture = ServerUdpTerminalWriterFixture::open(stream_id).await;
+    let mut product_stream = fixture.accepted.take_stream();
+    let server_send = fixture.server_send.take().expect("server QUIC sender");
+    let server_recv = fixture.server_recv.take().expect("server QUIC receiver");
+    let commands_rx = fixture
+        .commands_rx
+        .take()
+        .expect("server QUIC command receivers");
+    let context = fixture.context.clone();
+    let path_registration = fixture._path_registration.clone();
+    let commands_tx = fixture.commands_tx.clone();
+    let target = fixture.target.clone();
+    fixture
+        .commands_tx
+        .send_stream_ordered_frame(
+            Frame::StreamFin {
+                stream_id,
+                final_offset: 0,
+            },
+            TrafficClass::Throughput,
+        )
+        .await
+        .expect("queue server product FIN");
+    fixture
+        .commands_tx
+        .send_stream_ordered_close(stream_id, TrafficClass::Throughput)
+        .await
+        .expect("queue server ordered close");
+    let actor = tokio::spawn(run_server_udp_reliable_stream_loop(
+        server_send,
+        server_recv,
+        ServerUdpReliableStreamLoop {
+            context,
+            session_id: fixture.session_id,
+            path_id: fixture.path_id,
+            path_registration,
+            stream_id,
+            target,
+            commands_tx,
+            commands_rx,
+        },
+    ));
+
+    let client_recv = fixture.client_recv.as_mut().expect("client QUIC receiver");
+    let first = udp_path_read_frame(client_recv, fixture.context.codec_limits)
+        .await
+        .expect("read server terminal response");
+    let terminal = if first == (Frame::Pong { nonce: 1 }) {
+        udp_path_read_frame(client_recv, fixture.context.codec_limits)
+            .await
+            .expect("read server product FIN")
+    } else {
+        first
+    };
+    assert!(matches!(
+        terminal,
+        Frame::StreamFin {
+            stream_id: received_stream_id,
+            final_offset: 0,
+        } if received_stream_id == stream_id
+    ));
+    assert!(matches!(
+        udp_path_read_frame(client_recv, fixture.context.codec_limits).await,
+        Err(RuntimeError::QuicCarrier(
+            crate::transport::quic::QuicCarrierError::StreamFinished
+        ))
+    ));
+
+    let client_send = fixture.client_send.as_mut().expect("client QUIC sender");
+    udp_path_write_frame(
+        client_send,
+        &Frame::StreamAck {
+            stream_id,
+            complete: true,
+            ranges: Vec::new(),
+        },
+        fixture.context.codec_limits,
+    )
+    .await
+    .expect("write final feedback after server send-half finish");
+    assert!(matches!(
+        tokio::time::timeout(Duration::from_secs(5), product_stream.recv_frame()).await,
+        Ok(Ok(Frame::StreamAck {
+            stream_id: ack_stream_id,
+            complete: true,
+            ..
+        })) if ack_stream_id == stream_id
+    ));
+    udp_path_write_frame(
+        client_send,
+        &Frame::StreamDetach { stream_id },
+        fixture.context.codec_limits,
+    )
+    .await
+    .expect("detach server terminal drain");
+    udp_path_finish_stream(client_send).expect("finish client send half");
+
+    tokio::time::timeout(Duration::from_secs(5), actor)
+        .await
+        .expect("server terminal drain timeout")
+        .expect("server actor join")
+        .expect("server actor result");
+    let ReliablePathStreamOutput::Switchable(binding) = &product_stream.output else {
+        panic!("expected switchable server response output");
+    };
+    assert!(
+        binding
+            .sender_path_targets(TrafficClass::Throughput, MAX_RELIABLE_SERVICE_QUANTUM_BYTES)
+            .is_empty()
+    );
+    assert!(!fixture._server_connection.is_closed());
 }

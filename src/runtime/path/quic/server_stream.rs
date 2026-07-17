@@ -193,7 +193,132 @@ async fn run_server_udp_reliable_stream_loop(
     let mut pending_frames = Vec::<Frame>::new();
     let mut path_proofs = PathProofTracker::default();
     let mut deferred_input = None;
+    let mut terminal_drain_deadline = None;
     loop {
+        // Finishing the server send half must not STOP the client's final
+        // feedback. Drain the independent receive half to explicit detach.
+        if let Some(deadline) = terminal_drain_deadline {
+            let input = tokio::time::timeout_at(deadline, async {
+                match deferred_input.take() {
+                    Some(input) => Some(input),
+                    None => carrier_frames.recv().await,
+                }
+            })
+            .await;
+            match input {
+                Err(_) | Ok(None) => return Ok(()),
+                Ok(Some(Ok(Frame::StreamDetach {
+                    stream_id: detach_stream_id,
+                }))) if detach_stream_id == stream_id => return Ok(()),
+                Ok(Some(Ok(Frame::StreamDetach { .. }))) => {
+                    return Err(RuntimeError::Protocol(
+                        "QUIC UDP terminal drain stream mismatch",
+                    ));
+                }
+                Ok(Some(Ok(
+                    frame @ (Frame::StreamData {
+                        stream_id: received_stream_id,
+                        ..
+                    }
+                    | Frame::StreamAck {
+                        stream_id: received_stream_id,
+                        ..
+                    }
+                    | Frame::StreamMaxData {
+                        stream_id: received_stream_id,
+                        ..
+                    }
+                    | Frame::StreamFin {
+                        stream_id: received_stream_id,
+                        ..
+                    }
+                    | Frame::StreamReset {
+                        stream_id: received_stream_id,
+                        ..
+                    }),
+                ))) if received_stream_id == stream_id => {
+                    context
+                        .reliable_streams
+                        .route_frame(&path_registration, stream_id, frame)
+                        .await?;
+                }
+                Ok(Some(Ok(
+                    Frame::StreamData { .. }
+                    | Frame::StreamAck { .. }
+                    | Frame::StreamMaxData { .. }
+                    | Frame::StreamFin { .. }
+                    | Frame::StreamReset { .. },
+                ))) => {
+                    return Err(RuntimeError::Protocol(
+                        "QUIC UDP terminal drain stream mismatch",
+                    ));
+                }
+                Ok(Some(Ok(Frame::PathMetrics { metrics }))) if metrics.path_id == path_id => {
+                    context
+                        .reliable_streams
+                        .record_peer_path_metrics(&path_registration, metrics);
+                }
+                Ok(Some(Ok(Frame::PathStatus {
+                    path_id: status_path_id,
+                    sequence,
+                    usage,
+                }))) if status_path_id == path_id => {
+                    context.reliable_streams.record_peer_path_usage(
+                        &path_registration,
+                        sequence,
+                        usage,
+                    );
+                }
+                Ok(Some(Ok(Frame::PathProofAck {
+                    path_id: proof_path_id,
+                    proof_id,
+                    payload_bytes,
+                }))) if proof_path_id == path_id => {
+                    if let Some(observation) =
+                        path_proofs.acknowledge(path_id, proof_id, payload_bytes)
+                        && let Some(metrics) = path_proof_metrics(
+                            path_id,
+                            UnderlayProtocol::Udp,
+                            PathMetricDirection::ServerToClient,
+                            observation,
+                        )
+                    {
+                        context.reliable_streams.record_local_path_metrics(
+                            &path_registration,
+                            metrics,
+                            false,
+                        );
+                    }
+                }
+                // These requests can already be deferred behind the terminal
+                // write. The send half is finished, so no reply is possible.
+                Ok(Some(Ok(Frame::Ping { .. }))) => {}
+                Ok(Some(Ok(Frame::PathProofData {
+                    path_id: proof_path_id,
+                    ..
+                }))) if proof_path_id == path_id => {}
+                Ok(Some(Ok(Frame::SessionClose { reason }))) => {
+                    return Err(RuntimeError::RemoteClosed(reason));
+                }
+                Ok(Some(Ok(
+                    Frame::PathCapacityData { .. }
+                    | Frame::PathCapacityFinish { .. }
+                    | Frame::PathCapacityReceipt { .. },
+                ))) => {
+                    return Err(RuntimeError::Protocol(
+                        "PATH_CAPACITY frames are not valid on QUIC carriers",
+                    ));
+                }
+                Ok(Some(Ok(_))) => {
+                    return Err(RuntimeError::Protocol(
+                        "unexpected server QUIC UDP terminal drain frame",
+                    ));
+                }
+                Ok(Some(Err(err))) if super::io::udp_path_input_finished(&err) => return Ok(()),
+                Ok(Some(Err(RuntimeError::ReliablePathSessionClosed))) => return Ok(()),
+                Ok(Some(Err(err))) => return Err(err),
+            }
+        }
         let command_may_recv = !reliable_path_receivers_closed(&commands_rx);
         if deferred_input.is_none()
             && let Some(command) = try_recv_reliable_path_priority_command(&mut commands_rx)
@@ -215,7 +340,8 @@ async fn run_server_udp_reliable_stream_loop(
             )
             .await;
             if result? {
-                return Ok(());
+                terminal_drain_deadline =
+                    Some(tokio::time::Instant::now() + context.mux_limits.quic_path_idle_timeout);
             }
             continue;
         }
@@ -401,6 +527,16 @@ async fn run_server_udp_reliable_stream_loop(
                         );
                         return Err(RuntimeError::Protocol("unexpected server QUIC UDP path reliable stream frame"));
                     }
+                    Some(Err(err)) if super::io::udp_path_input_finished(&err) => {
+                        context.reliable_streams.detach_path(
+                            session_id,
+                            stream_id,
+                            UnderlayProtocol::Udp,
+                            path_id,
+                            &commands_tx,
+                        );
+                        return Ok(());
+                    }
                     Some(Err(RuntimeError::ReliablePathSessionClosed)) | None => {
                         context.reliable_streams.detach_path(
                             session_id,
@@ -432,7 +568,10 @@ async fn run_server_udp_reliable_stream_loop(
                     )
                     .await?;
                     if result {
-                        return Ok(());
+                        terminal_drain_deadline = Some(
+                            tokio::time::Instant::now()
+                                + context.mux_limits.quic_path_idle_timeout,
+                        );
                     }
                 }
             }
@@ -454,7 +593,10 @@ async fn run_server_udp_reliable_stream_loop(
                         &mut deferred_input,
                     ).await;
                     if result? {
-                        return Ok(());
+                        terminal_drain_deadline = Some(
+                            tokio::time::Instant::now()
+                                + context.mux_limits.quic_path_idle_timeout,
+                        );
                     }
                 }
             }

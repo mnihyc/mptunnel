@@ -1,82 +1,118 @@
-name: ci
+name: CI
 
 on:
   push:
+    branches:
+      - "**"
   pull_request:
 
-jobs:
-  host-checks:
-    name: host checks (${{ matrix.os }})
-    runs-on: ${{ matrix.os }}
-    strategy:
-      fail-fast: false
-      matrix:
-        os:
-          - ubuntu-latest
-          - macos-latest
-          - windows-latest
-    steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
-        with:
-          components: rustfmt, clippy
-      - name: Format
-        if: runner.os == 'Linux'
-        run: cargo fmt --check
-      - name: Maintainability line-count warning
-        if: runner.os == 'Linux'
-        run: scripts/check-line-counts.sh
-      - name: Clippy
-        run: cargo clippy --all-targets -- -D warnings
-      - name: Test
-        run: cargo test
-      - name: Build product binary
-        run: cargo build --bin mptunnel
+permissions:
+  contents: read
 
-  target-checks:
-    name: target check (${{ matrix.target }})
+jobs:
+  quality:
+    name: Source quality
+    uses: ./.github/workflows/release-quality-gate.yml
+
+  linked-build:
+    name: Build ${{ matrix.target }}
+    needs: quality
     runs-on: ${{ matrix.os }}
+    timeout-minutes: 90
     strategy:
       fail-fast: false
       matrix:
         include:
-          - os: ubuntu-latest
+          - os: ubuntu-24.04
             target: x86_64-unknown-linux-musl
-          - os: ubuntu-latest
+            kind: musl
+          - os: ubuntu-24.04-arm
             target: aarch64-unknown-linux-musl
-          - os: macos-latest
-            target: x86_64-apple-darwin
-          - os: macos-latest
-            target: aarch64-apple-darwin
-          - os: windows-latest
+            kind: musl
+          - os: windows-2025
             target: x86_64-pc-windows-msvc
-          - os: windows-latest
+            kind: windows
+          - os: windows-11-arm
             target: aarch64-pc-windows-msvc
+            kind: windows
+          - os: macos-15-intel
+            target: x86_64-apple-darwin
+            kind: unix
+          - os: macos-15
+            target: aarch64-apple-darwin
+            kind: unix
           - os: ubuntu-24.04
             target: aarch64-linux-android
-            android: true
+            kind: android
     steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
+      - name: Checkout
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
         with:
-          targets: ${{ matrix.target }}
-      - name: Configure Android NDK
-        if: matrix.android
+          persist-credentials: false
+
+      - name: Install Rust target
+        shell: bash
+        run: rustup target add "${{ matrix.target }}"
+
+      - name: Install musl C compiler
+        if: matrix.kind == 'musl'
+        shell: bash
+        env:
+          CC_ENV: ${{ matrix.target == 'x86_64-unknown-linux-musl' && 'x86_64_unknown_linux_musl' || 'aarch64_unknown_linux_musl' }}
+        run: |
+          sudo apt-get update
+          sudo apt-get install --yes musl-tools
+          echo "CC_${CC_ENV}=musl-gcc" >> "$GITHUB_ENV"
+
+      - name: Install pinned Android NDK
+        if: matrix.kind == 'android'
         shell: bash
         run: |
-          : "${ANDROID_NDK_ROOT:?GitHub runner did not provide an Android NDK}"
-          toolchain="$ANDROID_NDK_ROOT/toolchains/llvm/prebuilt/linux-x86_64/bin"
-          cc="$toolchain/aarch64-linux-android21-clang"
+          ndk_version="27.3.13750724"
+          sdkmanager="${ANDROID_HOME}/cmdline-tools/latest/bin/sdkmanager"
+          "$sdkmanager" "ndk;${ndk_version}"
+          toolchain="${ANDROID_HOME}/ndk/${ndk_version}/toolchains/llvm/prebuilt/linux-x86_64/bin"
+          cc="${toolchain}/aarch64-linux-android21-clang"
           test -x "$cc"
-          test -x "$toolchain/llvm-ar"
           {
-            echo "CC_aarch64_linux_android=$cc"
-            echo "AR_aarch64_linux_android=$toolchain/llvm-ar"
             echo "CARGO_TARGET_AARCH64_LINUX_ANDROID_LINKER=$cc"
+            echo "CC_aarch64_linux_android=$cc"
+            echo "AR_aarch64_linux_android=${toolchain}/llvm-ar"
           } >> "$GITHUB_ENV"
-      - name: Check product target
-        if: ${{ !matrix.android }}
-        run: cargo check --target ${{ matrix.target }} --bin mptunnel
-      - name: Check Android library source
-        if: matrix.android
-        run: cargo check --target ${{ matrix.target }} --lib
+
+      - name: Build linked artifact
+        run: cargo build --locked --release --target ${{ matrix.target }} --bin mptunnel
+
+      - name: Run native platform tests
+        if: matrix.kind == 'windows' || matrix.kind == 'unix'
+        run: cargo test --locked --all-features --target ${{ matrix.target }}
+
+      - name: Verify Unix binary version
+        if: matrix.kind != 'android' && matrix.kind != 'windows'
+        shell: bash
+        run: |
+          binary="target/${{ matrix.target }}/release/mptunnel"
+          version="$(cargo metadata --locked --no-deps --format-version 1 | python3 -c 'import json,sys; print(json.load(sys.stdin)["packages"][0]["version"])')"
+          test "$("$binary" --version)" = "mptunnel ${version}"
+
+      - name: Verify Windows binary version
+        if: matrix.kind == 'windows'
+        shell: pwsh
+        run: |
+          $metadata = cargo metadata --locked --no-deps --format-version 1 | ConvertFrom-Json
+          $binary = "target/${{ matrix.target }}/release/mptunnel.exe"
+          $actual = & $binary --version
+          $expected = "mptunnel $($metadata.packages[0].version)"
+          if ($actual -ne $expected) {
+              throw "Expected '$expected', got '$actual'"
+          }
+
+      - name: Inspect Unix binary format
+        if: matrix.kind == 'musl' || matrix.kind == 'unix' || matrix.kind == 'android'
+        shell: bash
+        run: file target/${{ matrix.target }}/release/mptunnel
+
+      - name: Require static musl linkage
+        if: matrix.kind == 'musl'
+        shell: bash
+        run: file target/${{ matrix.target }}/release/mptunnel | grep -E 'statically linked|static-pie linked'

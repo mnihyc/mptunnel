@@ -3,7 +3,7 @@
 
 use super::ResponseStreamBinding;
 use super::attachment::ResponseStreamOutputEntry;
-#[cfg(feature = "lab-diagnostics")]
+#[cfg(all(test, feature = "lab-diagnostics"))]
 use crate::lab_diagnostics::lab_diagnostic;
 use crate::model::capacity::{
     PATH_OPEN_SCORE_BYTES, RELIABLE_STREAM_STARTUP_PRODUCT_WINDOW_BYTES,

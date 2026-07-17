@@ -326,63 +326,23 @@ Nominal path-rate sums are context, not measured available capacity. External
 baseline absence must be reported as unavailable, not silently replaced by a
 different protocol or old result.
 
-## Current protocol-v2 assessment (2026-07-16)
+## Current release evidence
 
-The latest bounded release matrix is
-`lab/results/protocol-v2-layer-ownership-release18-r1-20260716/`. Its current
-code and wire contract are protocol v2; older `iteration*` directories are not
-part of this assessment.
+The compact, release-facing v0.1.0 cohort is recorded in
+[`docs/PERFORMANCE.md`](PERFORMANCE.md). It includes exact source and binary
+identity, same-condition direct/VMess/Hysteria2/MPTCP controls, TCP and QUIC
+single/multipath upload and download, heterogeneous paths, blackhole failover,
+Wine execution, and explicit incomplete-result handling.
 
-The matrix proves that the product basically carries traffic and that multiple
-carriers can contribute. Equal-fat TCP, QUIC, and mixed download rows reached
-158.942, 216.568, and 170.341 Mbps respectively. Their upload rows delivered
-106.351, 202.582, and 271.143 Mbps of receiver-observed progress, but those
-upload results ended with incomplete positive accounting and are lower bounds,
-not exact ratios. The mixed blackhole row resumed reliable bulk with a
-0.169-second maximum read gap; its interactive survivor gap was 0.709 seconds.
-One of four unreliable datagrams was lost, so the row is not an ideal realtime
-failover result.
+Generated `lab/results/` directories are local evidence, not repository
+content. They are removed after their durable method, identities, exact rows,
+and limitations are recorded. Old protocol-v1 `iteration*` directories are not
+current regression evidence and are not retained for a public release.
 
-The two-flow single-TCP row in that short matrix was an outlier and must not be
-used as a stable carrier comparison. The separate one-flow matched control in
-`lab/results/protocol-v2-single-carrier-matched8-r1-20260716/` measured direct
-TCP 17.236 Mbps, VMess TCP 38.180 Mbps, MPP-over-TCP 18.873 Mbps, and
-MPP-over-QUIC 66.094 Mbps. Repeated 18-second protocol-v2 TCP rows reached about
-110-122 Mbps. This is functional and not MPP-window or CPU limited, but the TCP
-startup/ramp is still weaker than the adjacent proxy control.
-
-The retained 300.517/300.619 Mbps protocol-v1 TCP rows are not a reproducible
-source-code guard. The checksum-matched historical `7fa7789` executable reached
-110.321 Mbps when rerun in the current unseeded 1% loss epoch, while its adjacent
-then-current `709d15f` executable reached 121.009 Mbps. The latest protocol-v2
-row reached 122.312 Mbps in the same current environment. This A/B rules out the
-source migration as the cause of the full historical spread; it does not make
-the present TCP result ideal. Random netem loss and the native TCP congestion
-ramp remain material experimental variables, so future historical comparison
-must include an adjacent old executable or a packet-loss schedule that is
-actually reproducible.
-
-Rust tests, strict developer gates, Linux release packaging, Linux musl target
-checks, Windows GNU cross-build, and Wine CLI/config startup pass. macOS/MSVC
-checks stop at missing platform SDK headers and Android stops at the absent NDK;
-Wine cannot exercise Wintun. The current matrix has direct, VMess, and
-Hysteria2 controls but no same-condition MPTCP result, and no real-Internet
-cohort has been run. The resulting verdict is a controlled Linux/Windows-proxy
-release candidate, not a general availability release for all documented
-platforms and network conditions.
-
-## Historical pre-v2 results
-
-Directories named `lab/results/iteration*` contain protocol-v1/role-based
-experiments. Some captured strong aggregation and useful negative findings, so
-they remain regression references. They must always be labeled pre-v2 and
-cannot establish current release behavior.
-
-Tracked historical comparisons belong in `docs/BENCHMARKS.md` and the result
-manifests. When comparing a current row to one of those records, show both the
-matched current control ratio and the historical absolute value. A protocol
-change does not justify silently losing the earlier capability; a mismatch
-starts a root-cause investigation.
+A historical absolute result must never replace a matched current control. If a
+new row materially weakens a retained capability, reproduce it beside its
+single-path or external control, identify the owning state transition, and
+correct the model before accepting the downgrade.
 
 ## Iteration rule
 

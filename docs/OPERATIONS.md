@@ -323,22 +323,26 @@ Release targets:
 - `aarch64-apple-darwin`
 - `x86_64-pc-windows-msvc`
 - `aarch64-pc-windows-msvc`
+- `aarch64-linux-android`
 
-Each archive contains the product binary, README, license, and docs. Packaging
-emits a sibling SHA-256 checksum. Windows archives also contain the pinned
-architecture-matched Wintun DLL and upstream license. Packaging validates that
-artifact; only a native Windows host can prove Wintun device, route, DNS, and
-service integration.
+Each archive contains the product binary, public configuration examples,
+README, license, security/contribution policy, protocol, and selected operator
+docs. Packaging emits a sibling SHA-256 checksum. Windows archives also contain
+the pinned architecture-matched Wintun DLL and upstream license. Packaging
+validates that artifact; only a native Windows host can prove Wintun device,
+route, DNS, and service integration.
 
 Linux release archives use musl targets and do not depend on a host glibc
-baseline. CI performs an Android aarch64 library source check with the NDK; it
-does not build an APK or prove device runtime.
+baseline. The Android aarch64 archive is a best-effort shell proxy executable;
+it is not an APK, AAR, `VpnService` integration, or proof of device runtime.
 
 ## Releases
 
-Tags matching `v*` run format, clippy, tests, target packages, checksums, and
-GitHub Release publication. Manual workflow dispatch creates artifacts but does
-not publish unless the ref is a tag.
+Stable tags must exactly match the `Cargo.toml` version and be newer than every
+published stable release. A tag runs format, clippy, Rust and lab-contract
+tests, seven linked native/NDK target builds, packaging, checksums, provenance
+attestation, GitHub Release publication, and a fresh-download asset check.
+`Release Check` validates a proposed tag without publishing.
 
 The release archive does not include the benchmark crate, Docker lab scripts,
 generated results, or lab-only diagnostics. The production binary is built as
@@ -358,5 +362,6 @@ performance. Wine outside the shaped namespace remains suitable only for
 userspace startup, CLI, and configuration validation; neither form substitutes
 for the native Windows gates.
 
-Performance acceptance follows [`docs/LAB.md`](LAB.md). Historical pre-v2 rows
-are regression references, not current release proof.
+Performance acceptance follows [`docs/LAB.md`](LAB.md). The compact current
+release evidence is [`docs/PERFORMANCE.md`](PERFORMANCE.md); generated historical
+result directories are not current proof and are not repository content.

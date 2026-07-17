@@ -181,7 +181,8 @@ be required for path eligibility or correctness.
 Packet-device acquisition and carrier-network access are separate host
 capabilities. Keep target `cfg` blocks at adapter boundaries and never branch
 MPP policy by operating system. Windows client/Linux server, Linux, macOS,
-and Android library builds share the same protocol and scheduling model.
+and Android compatibility builds share the same protocol and scheduling model;
+Android VPN lifecycle and protected-socket integration remain host-owned.
 
 ## Completion gate
 

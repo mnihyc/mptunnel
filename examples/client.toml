@@ -1,0 +1,30 @@
+# Generate one random secret and replace REPLACE_ME in both client.toml and
+# server.toml before use. Keep that shared secret private.
+#
+# Linux/macOS: openssl rand -hex 32
+# PowerShell:   [guid]::NewGuid().ToString()
+
+log_level = "info"
+
+# The management API is optional, loopback-only, and requires a separate random
+# operator token when enabled.
+# [management]
+# listen = ["127.0.0.1:7600"]
+# token = "replace-with-a-random-operator-token"
+# dashboard = true
+
+[[inbounds]]
+tag = "local-socks"
+protocol = "socks5"
+listen = ["127.0.0.1:1080"]
+outbound = "remote-mpp"
+
+[[outbounds]]
+tag = "remote-mpp"
+protocol = "mpp"
+# Replace server.example.com with the server's reachable name or address.
+# TCP and QUIC/UDP remain separate carriers under one MPP data-level session.
+endpoints = ["tcp://server.example.com:7443", "udp://server.example.com:7443"]
+
+[outbounds.security]
+secret = "REPLACE_ME"

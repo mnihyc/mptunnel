@@ -45,6 +45,12 @@ pub const RELEASE_TARGETS: &[ReleaseTarget] = &[
         arch: "aarch64",
         artifact_ext: "zip",
     },
+    ReleaseTarget {
+        triple: "aarch64-linux-android",
+        os: "android",
+        arch: "aarch64",
+        artifact_ext: "tar.gz",
+    },
 ];
 
 #[derive(Debug, Clone, PartialEq, Eq)]

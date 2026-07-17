@@ -144,7 +144,8 @@ endpoints = ["tcp://127.0.0.1:7443", "udp://127.0.0.1:7443"]
 [outbounds.security]
 # MPP security is scoped to this MPP outbound, so one node can talk to multiple
 # MPP peers with different secrets.
-secret = "01234567-89ab-cdef-0123-456789abcdef"
+# Intentionally invalid: replace with at least 32 random bytes before use.
+secret = "REPLACE_ME"
 # cipher = "aes-256-gcm"
 # cipher = "chacha20-poly1305"
 # auth_freshness_window_seconds = 300
@@ -159,7 +160,7 @@ secret = "01234567-89ab-cdef-0123-456789abcdef"
 # [inbounds.performance]
 # extra_traffic_hint_percent = 5
 # [inbounds.security]
-# secret = "01234567-89ab-cdef-0123-456789abcdef"
+# secret = "REPLACE_ME"
 
 [[outbounds]]
 tag = "direct-egress"

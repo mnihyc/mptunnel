@@ -1,5 +1,29 @@
 # Release milestones
 
+## 2026-07-17: v0.1.0 evidence freeze
+
+The release-facing cohort is preserved in [`docs/PERFORMANCE.md`](PERFORMANCE.md)
+with exact source and binary hashes, baseline versions, topology, completion
+status, target-confirmed upload accounting, failover gaps, Wine comparison, and
+claim limits. The measured runtime source is `c196e22`; subsequent release work
+changes documentation, configuration templates, packaging, and CI rather than
+the Rust data plane.
+
+An isolated Rust 1.96.0 rebuild of `c196e22` reproduced the recorded Linux
+binary SHA-256 exactly. The only later Rust edits are a test-only diagnostics
+import gate and the Android entry in the displayed release-target inventory;
+neither changes forwarding behavior.
+
+The retained same-condition high-delay rows establish TCP and QUIC aggregation
+in both directions. They also preserve the non-ideal single-path facts: MPP/TCP
+was below the adjacent VMess download control, and the Hysteria2 upload control
+remained a receiver-confirmed lower bound. Raw generated results were retired
+after this compact record was checked against their JSON rows.
+
+Release engineering uses a pinned Rust toolchain, linked native target builds,
+a Cargo/tag/published-version gate, basename-valid checksums, least-privilege
+publication, provenance attestations, and a fresh-download asset check.
+
 ## 2026-07-17: Architecture, dashboard, and multipath performance
 
 This milestone establishes the first release-ready MPP v2 implementation under
@@ -115,7 +139,8 @@ it is recorded as steady-session evidence, not substituted for the cold result.
 
 ### Verification and limits
 
-- Reproducible local artifacts: `./lab/results/windows-wine-portable-r10/`.
+- The original generated artifact directory was retired after the release-facing
+  evidence and its limitations were retained in `docs/PERFORMANCE.md`.
 - `cargo test --all-targets`: 882 passed.
 - `cargo clippy --all-targets -- -D warnings`: passed.
 - Windows GNU all-target check and optimized release link: passed.

@@ -18,4 +18,9 @@ fn platform_report_contains_current_platform_and_targets() {
             .iter()
             .any(|target| { target.os == "windows" && target.arch == "aarch64" })
     );
+    assert!(
+        RELEASE_TARGETS
+            .iter()
+            .any(|target| target.triple == "aarch64-linux-android")
+    );
 }

@@ -1,0 +1,45 @@
+name: Release Quality Gate
+
+on:
+  workflow_call:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  checks:
+    name: Format, lint, and test
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    steps:
+      - name: Checkout
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          persist-credentials: false
+
+      - name: Toolchain identity
+        run: |
+          rustc --version --verbose
+          cargo --version
+
+      - name: Format
+        run: cargo fmt --all -- --check
+
+      - name: Maintainability line-count report
+        run: scripts/check-line-counts.sh
+
+      - name: Clippy
+        run: cargo clippy --locked --all-targets --all-features -- -D warnings
+
+      - name: Rust tests
+        run: cargo test --locked --all-features
+
+      - name: Lab contract tests
+        run: python3 -m unittest discover --start-directory lab --pattern 'test_*.py'
+
+      - name: Shell syntax
+        run: find lab scripts -type f -name '*.sh' -print0 | xargs -0 -n1 bash -n
+
+      - name: Release version gate self-test
+        run: python3 .github/scripts/check-release-version-gate.py --self-test

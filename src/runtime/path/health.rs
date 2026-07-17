@@ -54,6 +54,7 @@ pub(in crate::runtime) struct ClientPathHealthRecord {
     pub(in crate::runtime) carrier_bytes_in_flight: u64,
     pub(in crate::runtime) carrier_queue_bytes: u64,
     pub(in crate::runtime) carrier_inflight_limit_bytes: u64,
+    pub(in crate::runtime) native_drain_observed: bool,
     pub(in crate::runtime) carrier_delivery_samples: u32,
     pub(in crate::runtime) carrier_delivery_sample_bytes: u64,
     pub(in crate::runtime) carrier_delivery_window_covered: bool,
@@ -128,6 +129,7 @@ impl Default for ClientPathHealthRecord {
             carrier_bytes_in_flight: 0,
             carrier_queue_bytes: 0,
             carrier_inflight_limit_bytes: 0,
+            native_drain_observed: false,
             carrier_delivery_samples: 0,
             carrier_delivery_sample_bytes: 0,
             carrier_delivery_window_covered: false,
@@ -221,14 +223,19 @@ impl ClientPathHealthRecord {
             return false;
         }
         self.mark_liveness_success();
+        self.native_drain_observed = observation.has_native_drain_evidence();
         // TCP owns congestion and delivery measurement. MPP retains these
         // same-socket samples for ranking without turning them into Data ACKs.
-        if let Some((srtt_us, rttvar_us)) = observation.rtt() {
+        if let Some(srtt_us) = observation.srtt_us() {
             self.carrier_srtt_ms = Some(f64::from(srtt_us.max(1)) / 1_000.0);
+        }
+        if let Some(rttvar_us) = observation.rttvar_us() {
             self.carrier_rttvar_ms = Some(f64::from(rttvar_us) / 1_000.0);
         }
-        if let Some((bytes_in_flight, inflight_limit_bytes, _)) = observation.flight() {
+        if let Some(bytes_in_flight) = observation.bytes_in_flight() {
             self.carrier_bytes_in_flight = bytes_in_flight;
+        }
+        if let Some(inflight_limit_bytes) = observation.inflight_limit_bytes() {
             self.carrier_inflight_limit_bytes = inflight_limit_bytes;
         }
         if let Some(queue_bytes) = observation.queue_bytes() {
@@ -614,6 +621,7 @@ impl ClientPathHealthRecord {
         self.carrier_bytes_in_flight = 0;
         self.carrier_queue_bytes = 0;
         self.carrier_inflight_limit_bytes = 0;
+        self.native_drain_observed = false;
         self.carrier_delivery_samples = 0;
         self.carrier_delivery_sample_bytes = 0;
         self.carrier_delivery_window_covered = false;

@@ -134,6 +134,7 @@ pub(super) async fn run_server_quic_path_metrics(
             context.reliable_streams.record_local_path_metrics(
                 &path_registration,
                 path_metrics_from_quic_path(path_id, metrics),
+                false,
             );
         }
         tokio::time::sleep(quic_path_metrics_poll_interval(metrics)).await;

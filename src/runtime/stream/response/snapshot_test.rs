@@ -57,6 +57,7 @@ fn path_metrics(
 ) -> ServerPathMetricsEntry {
     ServerPathMetricsEntry {
         source,
+        native_drain_observed: false,
         recorded_at: Instant::now(),
         metrics: PathMetrics {
             path_id: key.path_id,

@@ -86,6 +86,8 @@ impl ResponseStreamBinding {
                         incarnation: entry.incarnation,
                         snapshot,
                         native_queue_bytes: server_output_native_queue_bytes(entry),
+                        native_drain_observed: server_output_local_path_metrics(entry)
+                            .is_some_and(|metrics| metrics.native_drain_observed),
                         writer_pending_bytes: entry.commands.writer_pending_bytes(),
                         original_data_in_flight_bytes: entry.original_data_in_flight_bytes,
                         is_request_feedback: request_feedback_ingress.is_some_and(|ingress| {

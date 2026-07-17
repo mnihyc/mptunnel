@@ -477,6 +477,13 @@ rate after the durable startup floor. Peer metric hints remain advisory.
 Optional native telemetry may refine estimates. It MUST have a portable
 fallback and MUST NOT be an eligibility requirement.
 
+When native TCP send credit is unavailable, a Data ACK rate MUST NOT be
+treated as a synthetic TCP congestion window. An unproven path receives one
+bounded startup flight. After durable original-data progress, the portable
+sender uses the configured product resource envelope, shared receive/reorder
+limits, completion-time ranking, and socket backpressure; TCP still owns
+packet flight, pacing, congestion response, and recovery.
+
 ## 9. Datagrams
 
 `OPEN_DGRAM_FLOW(flow_id, target)` creates an MPP datagram association.
@@ -621,12 +628,23 @@ platform-neutral. Platform-specific code is limited to host adapters such as
 packet-device acquisition, socket binding or protection, and optional native
 TCP telemetry.
 
-Linux TCP telemetry is an optional adapter. Windows, macOS, and Android use
-portable MPP Data ACK and transport observations when that adapter is absent.
-No scheduling decision may branch on the operating system. A Windows client
-with a Linux server is a primary target, but Wine currently proves only Windows
-CLI/configuration behavior; native packet-device and network integration remain
-separate release evidence.
+Native TCP telemetry is an optional capability adapter: Linux and Android use
+the stable `TCP_INFO` UAPI prefix, macOS uses `TCP_CONNECTION_INFO`, and
+supported Windows versions use `SIO_TCP_INFO`. Every field is independently
+optional and normalized at the adapter boundary; absent host fields MUST remain
+unknown rather than becoming measured zero or delivery authority. Portable MPP
+Data ACK observations remain available when native inspection is unsupported or
+fails. Missing native send credit selects the capability-based portable rule in
+Section 8; it does not select an operating-system policy. No scheduling
+decision may branch on the operating system. A Windows client with a Linux
+server is a primary target, but Wine currently proves only
+Windows CLI/configuration and portable TCP behavior; native packet-device and
+network integration remain separate release evidence.
+
+A native TCP drain decision MUST require both exact bytes in flight and the
+unsent sender queue from the same snapshot. A partial RTT or congestion-window
+shape remains useful for ranking and service credit, but reinjection MUST use
+exact MPP product-flight ownership until both native drain counters are known.
 
 ## 14. Required Invariants
 

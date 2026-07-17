@@ -1,4 +1,4 @@
-//! Linux implementation of optional native TCP telemetry.
+//! Linux UAPI implementation shared by Linux and Android kernels.
 
 use super::{TcpNativeFlight, TcpNativeLossCounters, TcpNativeRtt, TcpNativeSnapshot};
 use std::io;
@@ -6,6 +6,7 @@ use std::os::fd::{AsFd, AsRawFd, OwnedFd};
 use tokio::net::TcpStream;
 
 pub(super) const TCP_INFO_V4_9_PREFIX_BYTES: usize = 168;
+const TCP_INFINITE_SSTHRESH: u32 = 0x7fff_ffff;
 
 #[derive(Debug)]
 pub(super) struct PlatformTcpTelemetrySocket {
@@ -64,13 +65,21 @@ pub(super) fn parse_tcp_info_prefix(bytes: &[u8], returned: usize) -> Option<Tcp
 
     let rtt = (available >= 76).then(|| TcpNativeRtt {
         srtt_us: u32_at(68),
-        rttvar_us: u32_at(72),
+        rttvar_us: Some(u32_at(72)),
     });
-    let flight = (available >= 84).then(|| TcpNativeFlight {
-        snd_mss_bytes: u32_at(16),
-        unacked_packets: u32_at(24),
-        snd_ssthresh_packets: u32_at(76),
-        snd_cwnd_packets: u32_at(80),
+    let flight = (available >= 84).then(|| {
+        let mss = u64::from(u32_at(16).max(1));
+        let ssthresh_packets = u32_at(76);
+        let inflight_limit_bytes = u64::from(u32_at(80)).saturating_mul(mss);
+        TcpNativeFlight {
+            bytes_in_flight: Some(u64::from(u32_at(24)).saturating_mul(mss)),
+            inflight_limit_bytes,
+            inflight_hi_bytes: Some(if ssthresh_packets >= TCP_INFINITE_SSTHRESH {
+                inflight_limit_bytes
+            } else {
+                u64::from(ssthresh_packets).saturating_mul(mss)
+            }),
+        }
     });
     let loss = (available >= 160).then(|| TcpNativeLossCounters {
         retransmits: u32_at(100),

@@ -57,7 +57,10 @@ fn parser_exposes_only_counter_groups_present_in_the_returned_prefix() {
     assert_eq!(rtt_only.flight, None);
 
     let flight = parse_tcp_info_prefix(&bytes, 84).expect("flight prefix");
-    assert_eq!(flight.flight.expect("flight group").snd_mss_bytes, 1_460);
+    assert_eq!(
+        flight.flight.expect("flight group").inflight_limit_bytes,
+        10 * 1_460
+    );
     assert_eq!(flight.pacing_rate_bytes_per_second, None);
 
     let pacing = parse_tcp_info_prefix(&bytes, 112).expect("pacing prefix");
@@ -81,11 +84,29 @@ fn parser_exposes_only_counter_groups_present_in_the_returned_prefix() {
 
     let parsed = parse_tcp_info_prefix(&bytes, 168).expect("complete v4.9 prefix");
     assert_eq!(parsed.app_limited, Some(true));
-    assert_eq!(parsed.flight.expect("flight group").snd_mss_bytes, 1460);
+    assert_eq!(
+        parsed.flight.expect("flight group").bytes_in_flight,
+        Some(3 * 1_460)
+    );
     assert_eq!(parsed.rtt.expect("RTT group").srtt_us, 20_000);
     assert_eq!(parsed.pacing_rate_bytes_per_second, Some(10_000_000));
     assert_eq!(parsed.bytes_acked, Some(123_456));
     assert_eq!(parsed.delivery_rate_bytes_per_second, Some(8_000_000));
+}
+
+#[test]
+fn parser_normalizes_unbounded_ssthresh_to_current_cwnd() {
+    let mut bytes = [0u8; TCP_INFO_V4_9_PREFIX_BYTES];
+    bytes[16..20].copy_from_slice(&1_460u32.to_ne_bytes());
+    bytes[76..80].copy_from_slice(&0x7fff_ffffu32.to_ne_bytes());
+    bytes[80..84].copy_from_slice(&10u32.to_ne_bytes());
+
+    let flight = parse_tcp_info_prefix(&bytes, 84)
+        .expect("flight prefix")
+        .flight
+        .expect("flight group");
+    assert_eq!(flight.inflight_limit_bytes, 10 * 1_460);
+    assert_eq!(flight.inflight_hi_bytes, Some(10 * 1_460));
 }
 
 #[tokio::test]

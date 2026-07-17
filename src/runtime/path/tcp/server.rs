@@ -87,7 +87,7 @@ pub(in crate::runtime) async fn handle_server_path(
         .record_peer_path_usage(&path_registration, 0, peer_usage);
     context
         .reliable_streams
-        .record_local_path_metrics(&path_registration, local_metrics);
+        .record_local_path_metrics(&path_registration, local_metrics, false);
     let local_usage = local_path.advertised_usage();
     framed
         .write_frames(&[

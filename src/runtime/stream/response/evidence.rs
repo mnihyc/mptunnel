@@ -25,6 +25,7 @@ pub(in crate::runtime) enum ServerPathMetricsSource {
 pub(in crate::runtime) struct ServerPathMetricsEntry {
     pub(in crate::runtime::stream) metrics: PathMetrics,
     pub(in crate::runtime::stream) source: ServerPathMetricsSource,
+    pub(in crate::runtime::stream) native_drain_observed: bool,
     // Metric age is measured at the source; residence time closes the gap when
     // the local idle publisher is delayed after this snapshot is installed.
     pub(in crate::runtime::stream) recorded_at: Instant,
@@ -161,6 +162,7 @@ impl ResponseStreamBinding {
             .fetch_add(1, Ordering::AcqRel);
     }
 
+    #[cfg(test)]
     pub(in crate::runtime) fn update_path_metrics_for_instance(
         &self,
         key: CarrierPathKey,
@@ -190,6 +192,7 @@ impl ResponseStreamBinding {
         self.update_path_metrics_matching(key, None, metrics, source);
     }
 
+    #[cfg(test)]
     fn update_path_metrics_matching(
         &self,
         key: CarrierPathKey,
@@ -203,6 +206,7 @@ impl ResponseStreamBinding {
             ServerPathMetricsEntry {
                 metrics,
                 source,
+                native_drain_observed: false,
                 recorded_at: Instant::now(),
             },
             true,
@@ -257,6 +261,7 @@ impl ResponseStreamBinding {
                 };
                 let scheduling_changed = current.is_none_or(|previous| {
                     previous.source != source
+                        || previous.native_drain_observed != path_metrics.native_drain_observed
                         || !server_path_metrics_scheduling_equivalent(previous.metrics, metrics)
                 });
                 *current = Some(path_metrics);

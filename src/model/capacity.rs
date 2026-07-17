@@ -286,6 +286,18 @@ pub(crate) fn adaptive_reliable_relay_inflight_bytes(
     // must not clamp a larger native window that is available to drain work.
     let modeled =
         (data_level_service_window_bytes(path, lane, mux_limits).ceil() as usize).clamp(floor, cap);
+    if lane.is_bulk()
+        && path.underlay == UnderlayProtocol::Tcp
+        && path.carrier_inflight_limit_bytes == 0
+        && path.has_durable_product_progress
+    {
+        // Without native TCP send credit, a Data ACK rate is completion
+        // evidence but not a congestion window. After one bounded product
+        // proof, let the shared stream/reorder windows and socket backpressure
+        // govern service instead of feeding an app-limited rate back into a
+        // second per-path window.
+        return cap;
+    }
     if !lane.is_bulk() || path.carrier_inflight_limit_bytes == 0 {
         return modeled;
     }

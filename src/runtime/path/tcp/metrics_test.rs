@@ -5,13 +5,12 @@ fn snapshot() -> TcpNativeSnapshot {
     TcpNativeSnapshot {
         rtt: Some(TcpNativeRtt {
             srtt_us: 20_000,
-            rttvar_us: 2_000,
+            rttvar_us: Some(2_000),
         }),
         flight: Some(TcpNativeFlight {
-            snd_mss_bytes: 1_460,
-            unacked_packets: 2,
-            snd_ssthresh_packets: u32::MAX,
-            snd_cwnd_packets: 10,
+            bytes_in_flight: Some(2 * 1_460),
+            inflight_limit_bytes: 10 * 1_460,
+            inflight_hi_bytes: Some(10 * 1_460),
         }),
         notsent_bytes: Some(4_096),
         bytes_acked: Some(100),
@@ -25,9 +24,9 @@ fn snapshot() -> TcpNativeSnapshot {
     }
 }
 
-fn sender_queue_snapshot(unacked_packets: u32, notsent_bytes: u32) -> TcpSenderQueueSnapshot {
+fn sender_queue_snapshot(bytes_in_flight: u64, notsent_bytes: u32) -> TcpSenderQueueSnapshot {
     TcpSenderQueueSnapshot {
-        unacked_packets: Some(unacked_packets),
+        bytes_in_flight: Some(bytes_in_flight),
         notsent_bytes,
     }
 }
@@ -49,9 +48,9 @@ fn native_tcp_metrics_are_post_handshake_and_keep_kernel_units_explicit() {
     let current = TcpNativeSnapshot {
         app_limited: Some(false),
         flight: Some(TcpNativeFlight {
-            unacked_packets: 3,
-            snd_cwnd_packets: 20,
-            ..baseline.flight.expect("flight baseline")
+            bytes_in_flight: Some(3 * 1_460),
+            inflight_limit_bytes: 20 * 1_460,
+            inflight_hi_bytes: Some(20 * 1_460),
         }),
         bytes_acked: baseline.bytes_acked.map(|value| value + 300_000),
         notsent_bytes: Some(8_192),
@@ -93,7 +92,8 @@ fn slow_start_cwnd_growth_does_not_move_the_delivery_epoch_floor() {
     let baseline = snapshot();
     let current = TcpNativeSnapshot {
         flight: Some(TcpNativeFlight {
-            snd_cwnd_packets: 300,
+            inflight_limit_bytes: 300 * 1_460,
+            inflight_hi_bytes: Some(300 * 1_460),
             ..baseline.flight.expect("flight baseline")
         }),
         bytes_acked: baseline.bytes_acked.map(|value| value + 64 * 1024),
@@ -184,7 +184,7 @@ fn partial_rtt_snapshot_applies_available_timing() {
     let snapshot = TcpNativeSnapshot {
         rtt: Some(TcpNativeRtt {
             srtt_us: 30_000,
-            rttvar_us: 3_000,
+            rttvar_us: Some(3_000),
         }),
         ..TcpNativeSnapshot::default()
     };
@@ -204,6 +204,38 @@ fn partial_rtt_snapshot_applies_available_timing() {
 
     assert_eq!(metrics.srtt_us, 30_000);
     assert_eq!(observation.complete_path_metrics(), None);
+}
+
+#[test]
+fn native_drain_evidence_requires_exact_flight_and_unsent_queue() {
+    let complete_snapshot = snapshot();
+    let complete = TcpSenderMetricTracker::new(complete_snapshot).observe(
+        PathId(2),
+        PathMetricDirection::ServerToClient,
+        complete_snapshot,
+    );
+    assert!(complete.has_native_drain_evidence());
+
+    for partial_snapshot in [
+        TcpNativeSnapshot {
+            notsent_bytes: None,
+            ..complete_snapshot
+        },
+        TcpNativeSnapshot {
+            flight: complete_snapshot.flight.map(|flight| TcpNativeFlight {
+                bytes_in_flight: None,
+                ..flight
+            }),
+            ..complete_snapshot
+        },
+    ] {
+        let partial = TcpSenderMetricTracker::new(partial_snapshot).observe(
+            PathId(2),
+            PathMetricDirection::ServerToClient,
+            partial_snapshot,
+        );
+        assert!(!partial.has_native_drain_evidence());
+    }
 }
 
 #[test]

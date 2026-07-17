@@ -212,11 +212,16 @@ descriptor with `VpnService`, implements `runtime::PacketDeviceProvider` and
 `transport::CarrierNetworkProvider`, and protects or binds every carrier socket
 to the selected Android network so it does not re-enter the catch-all VPN.
 
-Protocol and scheduling are portable. Linux has an optional exact-socket
-`TCP_INFO` adapter; Windows, macOS, Android, and unsupported Linux kernels use
-the portable no-native-evidence path. Native telemetry is never required for
-correctness or eligibility. Windows client with Linux server is a primary
-target, not yet a native integration claim.
+Protocol and scheduling are portable. Exact-socket TCP telemetry adapters use
+`TCP_INFO` on Linux/Android, `TCP_CONNECTION_INFO` on macOS, and
+`SIO_TCP_INFO` on supported Windows versions. Each adapter exposes only native
+fields that the host actually supplies; missing fields remain unknown. Native
+telemetry is never required for correctness or eligibility, and an unavailable
+adapter keeps startup work bounded, then uses durable Data ACK progress, shared
+MPP resource windows, and socket backpressure without inventing a TCP
+congestion window. It also prints an explicit performance warning. Windows
+client with Linux server is a primary target, not yet a native
+network-integration claim.
 
 ## Security
 

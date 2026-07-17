@@ -10,13 +10,12 @@ fn request_tcp_native_observation(path_index: usize) -> TcpNativeObservation {
     let snapshot = TcpNativeSnapshot {
         rtt: Some(TcpNativeRtt {
             srtt_us: 180_000,
-            rttvar_us: 10_000,
+            rttvar_us: Some(10_000),
         }),
         flight: Some(TcpNativeFlight {
-            snd_mss_bytes: 1_024,
-            unacked_packets: 64,
-            snd_ssthresh_packets: 512,
-            snd_cwnd_packets: 512,
+            bytes_in_flight: Some(64 * 1_024),
+            inflight_limit_bytes: 512 * 1_024,
+            inflight_hi_bytes: Some(512 * 1_024),
         }),
         notsent_bytes: Some(0),
         bytes_acked: Some(100),
@@ -90,6 +89,7 @@ fn tcp_transport_state_updates_native_rtt_without_rate_authority() {
     assert_eq!(record.carrier_rttvar_ms, Some(10.0));
     assert_eq!(record.carrier_bytes_in_flight, 64 * 1024);
     assert_eq!(record.carrier_inflight_limit_bytes, 512 * 1024);
+    assert!(record.native_drain_observed);
     assert_eq!(record.carrier_delivery_rate_bps, None);
     assert_eq!(record.carrier_delivery_samples, 0);
     assert!(!record.carrier_ack_derived_data_seen);
@@ -100,13 +100,12 @@ fn tcp_transport_state_retains_non_app_limited_ack_window_without_data_ack_autho
     let baseline = TcpNativeSnapshot {
         rtt: Some(TcpNativeRtt {
             srtt_us: 180_000,
-            rttvar_us: 10_000,
+            rttvar_us: Some(10_000),
         }),
         flight: Some(TcpNativeFlight {
-            snd_mss_bytes: 1_024,
-            unacked_packets: 128,
-            snd_ssthresh_packets: 512,
-            snd_cwnd_packets: 512,
+            bytes_in_flight: Some(128 * 1_024),
+            inflight_limit_bytes: 512 * 1_024,
+            inflight_hi_bytes: Some(512 * 1_024),
         }),
         notsent_bytes: Some(4_096),
         bytes_acked: Some(100),
@@ -198,6 +197,7 @@ fn partial_tcp_transport_state_does_not_clear_unknown_fields() {
         carrier_bytes_in_flight: 64 * 1024,
         carrier_inflight_limit_bytes: 512 * 1024,
         carrier_queue_bytes: 8 * 1024,
+        native_drain_observed: true,
         ..ClientPathHealthRecord::default()
     };
     let path_instance_id = crate::model::path::next_carrier_path_instance_id();
@@ -205,7 +205,7 @@ fn partial_tcp_transport_state_does_not_clear_unknown_fields() {
     let snapshot = TcpNativeSnapshot {
         rtt: Some(TcpNativeRtt {
             srtt_us: 30_000,
-            rttvar_us: 3_000,
+            rttvar_us: Some(3_000),
         }),
         ..TcpNativeSnapshot::default()
     };
@@ -221,6 +221,7 @@ fn partial_tcp_transport_state_does_not_clear_unknown_fields() {
     assert_eq!(record.carrier_bytes_in_flight, 64 * 1024);
     assert_eq!(record.carrier_inflight_limit_bytes, 512 * 1024);
     assert_eq!(record.carrier_queue_bytes, 8 * 1024);
+    assert!(!record.native_drain_observed);
 }
 
 #[test]

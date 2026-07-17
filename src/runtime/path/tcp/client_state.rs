@@ -109,8 +109,8 @@ impl ClientTcpPathSessionRuntime {
         };
         #[cfg(feature = "lab-diagnostics")]
         {
-            let (bytes_in_flight, inflight_limit_bytes, _) =
-                observation.flight().unwrap_or_default();
+            let bytes_in_flight = observation.bytes_in_flight().unwrap_or(0);
+            let inflight_limit_bytes = observation.inflight_limit_bytes().unwrap_or(0);
             lab_diagnostic(
                 "tcp_sender_metrics",
                 format_args!(

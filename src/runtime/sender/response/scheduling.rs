@@ -361,9 +361,7 @@ fn ordered_carrier_reinjection_ready(target: &ResponseSenderPathTarget) -> bool 
         return false;
     }
     match observation.key.underlay {
-        crate::protocol::UnderlayProtocol::Tcp
-            if observation.snapshot.carrier_inflight_limit_bytes > 0 =>
-        {
+        crate::protocol::UnderlayProtocol::Tcp if observation.native_drain_observed => {
             observation.snapshot.bytes_in_flight == 0 && observation.native_queue_bytes == 0
         }
         crate::protocol::UnderlayProtocol::Tcp | crate::protocol::UnderlayProtocol::Udp => {

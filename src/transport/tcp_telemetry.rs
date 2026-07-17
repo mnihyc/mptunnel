@@ -6,23 +6,26 @@
 use std::io;
 use tokio::net::TcpStream;
 
-#[cfg(target_os = "linux")]
+#[cfg(target_os = "macos")]
+mod apple;
+#[cfg(any(target_os = "linux", target_os = "android"))]
 mod linux;
+#[cfg(windows)]
+mod windows;
 
 /// Coherent RTT fields available from one native snapshot.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct TcpNativeRtt {
     pub(crate) srtt_us: u32,
-    pub(crate) rttvar_us: u32,
+    pub(crate) rttvar_us: Option<u32>,
 }
 
-/// Coherent congestion-flight fields available from one native snapshot.
+/// Congestion-flight fields normalized to bytes at the platform boundary.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct TcpNativeFlight {
-    pub(crate) snd_mss_bytes: u32,
-    pub(crate) unacked_packets: u32,
-    pub(crate) snd_ssthresh_packets: u32,
-    pub(crate) snd_cwnd_packets: u32,
+    pub(crate) bytes_in_flight: Option<u64>,
+    pub(crate) inflight_limit_bytes: u64,
+    pub(crate) inflight_hi_bytes: Option<u64>,
 }
 
 /// Counters that must advance together to produce a loss-rate observation.
@@ -48,7 +51,6 @@ pub(crate) struct TcpNativeSnapshot {
     pub(crate) app_limited: Option<bool>,
 }
 
-#[cfg(target_os = "linux")]
 impl TcpNativeSnapshot {
     pub(crate) fn has_evidence(self) -> bool {
         self.rtt.is_some()
@@ -65,20 +67,39 @@ impl TcpNativeSnapshot {
 /// Owns a duplicate of the carrier socket when native telemetry is supported.
 #[derive(Debug)]
 pub(crate) struct TcpTelemetrySocket {
-    #[cfg(target_os = "linux")]
+    #[cfg(target_os = "macos")]
+    platform: apple::PlatformTcpTelemetrySocket,
+    #[cfg(any(target_os = "linux", target_os = "android"))]
     platform: linux::PlatformTcpTelemetrySocket,
+    #[cfg(windows)]
+    platform: windows::PlatformTcpTelemetrySocket,
 }
 
 impl TcpTelemetrySocket {
     /// Distinguishes an unsupported host from failure to capture a supported
     /// native socket. Either outcome remains optional to carrier operation.
     pub(crate) fn capture(socket: &TcpStream) -> io::Result<Option<Self>> {
-        #[cfg(target_os = "linux")]
+        #[cfg(target_os = "macos")]
+        {
+            apple::PlatformTcpTelemetrySocket::capture(socket)
+                .map(|platform| Some(Self { platform }))
+        }
+        #[cfg(any(target_os = "linux", target_os = "android"))]
         {
             linux::PlatformTcpTelemetrySocket::capture(socket)
                 .map(|platform| Some(Self { platform }))
         }
-        #[cfg(not(target_os = "linux"))]
+        #[cfg(windows)]
+        {
+            windows::PlatformTcpTelemetrySocket::capture(socket)
+                .map(|platform| Some(Self { platform }))
+        }
+        #[cfg(not(any(
+            target_os = "macos",
+            target_os = "linux",
+            target_os = "android",
+            windows
+        )))]
         {
             let _ = socket;
             Ok(None)
@@ -87,11 +108,24 @@ impl TcpTelemetrySocket {
 
     /// Returns `None` when the host exposes no understood native counter group.
     pub(crate) fn snapshot(&self) -> io::Result<Option<TcpNativeSnapshot>> {
-        #[cfg(target_os = "linux")]
+        #[cfg(target_os = "macos")]
         {
             self.platform.snapshot()
         }
-        #[cfg(not(target_os = "linux"))]
+        #[cfg(any(target_os = "linux", target_os = "android"))]
+        {
+            self.platform.snapshot()
+        }
+        #[cfg(windows)]
+        {
+            self.platform.snapshot()
+        }
+        #[cfg(not(any(
+            target_os = "macos",
+            target_os = "linux",
+            target_os = "android",
+            windows
+        )))]
         {
             let _ = self;
             Ok(None)
@@ -99,6 +133,6 @@ impl TcpTelemetrySocket {
     }
 }
 
-#[cfg(all(test, target_os = "linux"))]
+#[cfg(all(test, any(target_os = "linux", target_os = "android")))]
 #[path = "tcp_telemetry/linux_test.rs"]
 mod tests;

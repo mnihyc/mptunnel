@@ -884,18 +884,25 @@ impl ServerReliableStreamRegistry {
         identity: ServerCarrierPathIdentity,
         metrics: PathMetrics,
     ) {
-        self.record_path_metrics_with_source(identity, metrics, ServerPathMetricsSource::PeerHint);
+        self.record_path_metrics_with_source(
+            identity,
+            metrics,
+            ServerPathMetricsSource::PeerHint,
+            false,
+        );
     }
 
     pub(in crate::runtime) fn record_local_path_metrics(
         &self,
         identity: ServerCarrierPathIdentity,
         metrics: PathMetrics,
+        native_drain_observed: bool,
     ) {
         self.record_path_metrics_with_source(
             identity,
             metrics,
             ServerPathMetricsSource::LocalSender,
+            native_drain_observed,
         );
     }
 
@@ -972,6 +979,7 @@ impl ServerReliableStreamRegistry {
         identity: ServerCarrierPathIdentity,
         metrics: PathMetrics,
         source: ServerPathMetricsSource,
+        native_drain_observed: bool,
     ) {
         let ServerCarrierPathIdentity {
             session_id,
@@ -993,6 +1001,7 @@ impl ServerReliableStreamRegistry {
         let entry = ServerPathMetricsEntry {
             metrics,
             source,
+            native_drain_observed,
             recorded_at: Instant::now(),
         };
         // One registry slot cannot represent both directions. Preserve local
@@ -1039,7 +1048,7 @@ impl ServerReliableStreamRegistry {
         };
         let key = CarrierPathKey { underlay, path_id };
         for binding in bindings {
-            binding.update_path_metrics_for_instance(key, path_instance_id, metrics, source);
+            binding.install_stored_path_metrics_for_instance(key, path_instance_id, entry);
         }
     }
 
@@ -1056,6 +1065,7 @@ impl ServerReliableStreamRegistry {
             Some(metrics) => Some(ServerPathMetricsEntry {
                 metrics: PathMetrics { path_id, ..metrics },
                 source: ServerPathMetricsSource::LocalSender,
+                native_drain_observed: false,
                 recorded_at: Instant::now(),
             }),
             None => stored,
@@ -1357,8 +1367,14 @@ impl ServerStreamPortBackend for ServerReliableStreamPortBackend {
             .record_peer_path_usage(identity, sequence, usage);
     }
 
-    fn record_local_path_metrics(&self, identity: ServerCarrierPathIdentity, metrics: PathMetrics) {
-        self.registry.record_local_path_metrics(identity, metrics);
+    fn record_local_path_metrics(
+        &self,
+        identity: ServerCarrierPathIdentity,
+        metrics: PathMetrics,
+        native_drain_observed: bool,
+    ) {
+        self.registry
+            .record_local_path_metrics(identity, metrics, native_drain_observed);
     }
 
     fn peer_status_snapshot(&self, session_id: SessionId) -> Vec<PeerPathStatus> {

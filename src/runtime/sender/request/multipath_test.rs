@@ -439,9 +439,10 @@ async fn unbound_reinjection_requires_an_idle_tcp_carrier() {
         health.tcp[busy.key.index].carrier_bytes_in_flight = 64 * 1024;
         health.tcp[busy.key.index].carrier_queue_bytes = 8 * 1024;
         health.tcp[busy.key.index].carrier_inflight_limit_bytes = 512 * 1024;
+        health.tcp[busy.key.index].native_drain_observed = true;
     }
     let frame = data_frame(stream_id, 0, 4096);
-    let controller = RequestMultipathController::new(stream_id);
+    let mut controller = RequestMultipathController::new(stream_id);
     let selected = controller
         .choose_lowest_eta_relay_path(
             &context,
@@ -476,6 +477,28 @@ async fn unbound_reinjection_requires_an_idle_tcp_carrier() {
         ),
         Err(RuntimeError::SenderServiceBlocked)
     ));
+
+    controller.record_original_frame_for_test(busy, &frame);
+    {
+        let mut health = context.health().lock().expect("path health lock");
+        health.tcp[busy.key.index].carrier_bytes_in_flight = 0;
+        health.tcp[busy.key.index].carrier_queue_bytes = 0;
+        health.tcp[busy.key.index].native_drain_observed = false;
+    }
+    assert!(
+        matches!(
+            controller.choose_lowest_eta_relay_path(
+                &context,
+                &remotes,
+                &frame,
+                TrafficClass::Throughput,
+                bound_cause,
+                &[original],
+            ),
+            Err(RuntimeError::SenderServiceBlocked)
+        ),
+        "partial native TCP shape must use exact product flight instead of treating missing drain counters as zero"
+    );
 }
 
 #[tokio::test]

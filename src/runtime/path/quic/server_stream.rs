@@ -381,6 +381,7 @@ async fn run_server_udp_reliable_stream_loop(
                             context.reliable_streams.record_local_path_metrics(
                                 &path_registration,
                                 metrics,
+                                false,
                             );
                         }
                     }

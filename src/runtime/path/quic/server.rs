@@ -90,7 +90,7 @@ async fn handle_server_udp_connection(
         .record_peer_path_usage(&path_registration, 0, peer_usage);
     context
         .reliable_streams
-        .record_local_path_metrics(&path_registration, local_metrics);
+        .record_local_path_metrics(&path_registration, local_metrics, false);
     let peer_status = context.peer_status.register(session_id);
     let control = run_server_udp_control_stream(
         control_send,

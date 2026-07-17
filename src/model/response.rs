@@ -22,6 +22,8 @@ pub(crate) struct ResponsePathObservation {
     /// backlog remains in `snapshot.queue_bytes` for completion scoring, but it
     /// must not make a priority reinjection look native-busy.
     pub(crate) native_queue_bytes: u64,
+    /// Exact native flight and unsent-queue counters were both observed.
+    pub(crate) native_drain_observed: bool,
     /// Bytes removed from the command queues but not yet handed to the ordered
     /// carrier. Priority repair cannot overtake this private writer backlog.
     pub(crate) writer_pending_bytes: u64,

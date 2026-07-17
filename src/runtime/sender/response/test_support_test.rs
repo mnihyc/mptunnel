@@ -32,6 +32,7 @@ pub(in crate::runtime::sender) fn response_target(
             incarnation: u64::from(path_id.0) + 1,
             snapshot,
             native_queue_bytes: 0,
+            native_drain_observed: inflight_limit_bytes > 0,
             writer_pending_bytes: 0,
             original_data_in_flight_bytes: bytes_in_flight,
             is_request_feedback: request_feedback,

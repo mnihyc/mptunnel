@@ -11,6 +11,7 @@ use crate::protocol::path_capacity::CapacityReceiveTracker;
 use crate::protocol::{Frame, PathId, PathMetricDirection, PathMetrics, UnderlayProtocol};
 use crate::runtime::error::RuntimeError;
 use crate::runtime::path::ServerCarrierPathRegistration;
+use crate::runtime::path::model::metric_epoch_now;
 use crate::runtime::path::proof::{PathProofTracker, path_proof_ack_frame, path_proof_metrics};
 use crate::runtime::path::server_context::ServerPathContext;
 use std::time::Instant;
@@ -18,6 +19,7 @@ use std::time::Instant;
 pub(super) struct ServerTcpEvidenceState {
     tcp_metrics: Option<TcpMetricPublisher>,
     local_metrics: Option<PathMetrics>,
+    native_drain_observed: bool,
     sender_refresh_pending: bool,
     path_proofs: PathProofTracker,
     request_capacity_receive: CapacityReceiveTracker,
@@ -32,6 +34,7 @@ impl ServerTcpEvidenceState {
         Self {
             tcp_metrics,
             local_metrics,
+            native_drain_observed: false,
             sender_refresh_pending: false,
             path_proofs: PathProofTracker::default(),
             request_capacity_receive: CapacityReceiveTracker::new(
@@ -86,17 +89,21 @@ impl ServerTcpEvidenceState {
             return;
         };
         self.sender_refresh_pending = observation
-            .flight()
-            .is_some_and(|(bytes_in_flight, _, _)| bytes_in_flight > 0)
+            .bytes_in_flight()
+            .is_some_and(|bytes_in_flight| bytes_in_flight > 0)
             || observation
                 .queue_bytes()
                 .is_some_and(|queue_bytes| queue_bytes > 0);
-        if let Some(metrics) = observation.complete_path_metrics() {
-            self.local_metrics = Some(metrics);
-            context
-                .reliable_streams
-                .record_local_path_metrics(path_registration, metrics);
-        }
+        self.native_drain_observed = observation.has_native_drain_evidence();
+        let Some(metrics) = merge_local_tcp_metrics(self.local_metrics, observation) else {
+            return;
+        };
+        self.local_metrics = Some(metrics);
+        context.reliable_streams.record_local_path_metrics(
+            path_registration,
+            metrics,
+            self.native_drain_observed,
+        );
     }
 
     pub(super) fn record_sent_frame(&mut self, frame: &Frame) {
@@ -131,9 +138,11 @@ impl ServerTcpEvidenceState {
             )
         {
             self.local_metrics = Some(metrics);
-            context
-                .reliable_streams
-                .record_local_path_metrics(path_registration, metrics);
+            context.reliable_streams.record_local_path_metrics(
+                path_registration,
+                metrics,
+                self.native_drain_observed,
+            );
         }
     }
 
@@ -174,3 +183,24 @@ impl ServerTcpEvidenceState {
             .record_peer_path_metrics(path_registration, metrics);
     }
 }
+
+fn merge_local_tcp_metrics(
+    current: Option<PathMetrics>,
+    observation: super::metrics::TcpNativeObservation,
+) -> Option<PathMetrics> {
+    if let Some(metrics) = observation.complete_path_metrics() {
+        return Some(metrics);
+    }
+    if !observation.has_transport_shape() {
+        return None;
+    }
+    let mut metrics = current?;
+    observation.apply_transport_shape(&mut metrics);
+    metrics.metric_epoch = metric_epoch_now();
+    metrics.metric_age_us = 0;
+    Some(metrics)
+}
+
+#[cfg(test)]
+#[path = "server_evidence_test.rs"]
+mod tests;

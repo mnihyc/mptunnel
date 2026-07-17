@@ -67,3 +67,62 @@ Windows Wintun operation, Windows kernel-network throughput/failover, MSVC and
 ARM64 packaging still require their native CI or host. macOS and Android remain
 best-effort CI targets because native Apple and Android NDK toolchains were not
 available in the verification VM.
+
+## 2026-07-17: Platform TCP telemetry and portable Windows capacity
+
+This milestone adds capability-isolated native TCP telemetry for every stated
+host family and removes the reproduced portable TCP multipath capacity
+regression without changing native TCP or QUIC congestion control.
+
+### Retained model
+
+- Linux and Android consume the stable `TCP_INFO` prefix, macOS consumes the
+  stable `TCP_CONNECTION_INFO` prefix, and Windows uses `SIO_TCP_INFO` version
+  0. Missing fields remain unknown; partial RTT/window shape remains useful.
+- Native telemetry is optional and never grants eligibility. Its absence emits
+  one explicit warning and selects a capability rule, not an OS-specific rule.
+- Partial native window shape never proves an idle TCP carrier. Drain-based
+  reinjection requires exact flight and unsent-queue counters from one snapshot
+  and otherwise uses exact MPP product flight.
+- A portable TCP path receives one bounded startup flight. After durable
+  original Data ACK progress, its product service uses the configured resource
+  envelope plus shared stream/reorder limits and socket backpressure. The Data
+  ACK rate ranks completion but is not a replacement congestion window.
+
+The alternative attachment-order patch was rejected. Linux native reached
+263.187 Mbps with the same initial first-path debt that appeared in the failed
+Wine runs; disabling Linux native telemetry reproduced Wine at 34.757 Mbps.
+The causal difference was the persistent 512 KiB product feedback window.
+
+### Matched evidence
+
+All rows use the same five 500 Mbps, 180 ms plus jitter paths and a 10-second
+single-flow release-profile load. Upload accounting is target-confirmed and
+exact.
+
+| Case | Before | Retained result |
+| --- | ---: | ---: |
+| Wine portable five-TCP upload, cold | 33.791 / 34.809 Mbps | 267.187 / 272.654 Mbps |
+| Wine portable one-TCP upload, cold | 158.335 Mbps | 182.160 Mbps |
+| Wine portable five-TCP download, cold | 241.031 Mbps | 258.692 Mbps |
+| Wine portable one-TCP download, cold | n/a | 137.627 Mbps |
+| Linux native five-TCP upload, cold | 263.187 Mbps | 286.313 Mbps |
+
+The retained cold Wine upload used all five interfaces, with 58-83 MB sent per
+path, completed without a recovery gap, and exceeded its matched single path.
+A second transfer on the established five-path session reached 589.635 Mbps;
+it is recorded as steady-session evidence, not substituted for the cold result.
+
+### Verification and limits
+
+- Reproducible local artifacts: `./lab/results/windows-wine-portable-r10/`.
+- `cargo test --all-targets`: 882 passed.
+- `cargo clippy --all-targets -- -D warnings`: passed.
+- Windows GNU all-target check and optimized release link: passed.
+- Linux optimized release build: passed.
+- macOS and Android telemetry sources compiled against their target Rust
+  standard libraries; native loopback FFI tests are target-gated for CI.
+- Wine rejects `SIO_TCP_INFO` with Winsock error 10045. It therefore proves
+  portable Windows executable behavior, both-direction TCP aggregation, exact
+  delivery, and the explicit warning, but cannot prove the native Windows
+  socket API. Native Windows CI owns that loopback test.

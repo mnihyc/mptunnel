@@ -131,6 +131,44 @@ fn unknown_path_startup_inflight_uses_default_bdp_not_configured_ceiling() {
 }
 
 #[test]
+fn unproven_portable_tcp_keeps_bounded_startup_service() {
+    let mux_limits = MuxLimits::default();
+    let path = PathSnapshot::new(PathId(0), UnderlayProtocol::Tcp, 360.0, 3_200_000.0);
+
+    let inflight =
+        adaptive_reliable_relay_inflight_bytes(Some(path), TrafficClass::Throughput, mux_limits);
+
+    assert!(inflight < mux_limits.max_path_flight_bytes);
+    assert_eq!(inflight, reliable_relay_buffer_len(mux_limits));
+}
+
+#[test]
+fn proven_portable_tcp_uses_product_resource_ceiling() {
+    let mux_limits = MuxLimits::default();
+    let mut path = PathSnapshot::new(PathId(0), UnderlayProtocol::Tcp, 360.0, 3_200_000.0);
+    path.product_progress_rate_bps = Some(3_200_000.0);
+    path.has_durable_product_progress = true;
+    path.app_limited = true;
+
+    let inflight =
+        adaptive_reliable_relay_inflight_bytes(Some(path), TrafficClass::Throughput, mux_limits);
+
+    assert_eq!(inflight, mux_limits.max_path_flight_bytes);
+}
+
+#[test]
+fn portable_tcp_latency_service_remains_bounded() {
+    let mux_limits = MuxLimits::default();
+    let mut path = PathSnapshot::new(PathId(0), UnderlayProtocol::Tcp, 360.0, 3_200_000.0);
+    path.has_durable_product_progress = true;
+
+    let inflight =
+        adaptive_reliable_relay_inflight_bytes(Some(path), TrafficClass::Latency, mux_limits);
+
+    assert!(inflight < mux_limits.max_path_flight_bytes);
+}
+
+#[test]
 fn carrier_inflight_evidence_does_not_cap_product_source_read_horizon() {
     let mux_limits = MuxLimits::default();
     let mut path = PathSnapshot::new(PathId(0), UnderlayProtocol::Udp, 80.0, 4_000_000_000.0);

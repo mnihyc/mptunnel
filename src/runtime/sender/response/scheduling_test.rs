@@ -535,41 +535,45 @@ fn tcp_reinjection_waits_for_native_unacknowledged_flight_to_drain() {
 }
 
 #[test]
-fn portable_tcp_reinjection_uses_exact_product_flight_when_native_state_is_unknown() {
-    let mut tcp = response_target(1, UnderlayProtocol::Tcp, 5.0, 0, 0, false);
-    tcp.observation.original_data_in_flight_bytes = 64 * 1024;
-    tcp.observation.snapshot.data_level_bytes_in_flight = 64 * 1024;
+fn tcp_reinjection_uses_product_flight_without_complete_native_drain_evidence() {
     let frame = Frame::StreamFin {
         stream_id: StreamId(9),
         final_offset: 1024,
     };
 
-    assert!(
-        select_response_frame_path(
-            std::slice::from_ref(&tcp),
-            TrafficClass::Throughput,
-            &frame,
-            CarrierEmitMode::StreamOrdered,
-            &[],
-            Some(RelaySendCause::AckGapReinjection),
-        )
-        .is_none(),
-        "unknown native TCP state cannot be treated as measured idle while product flight remains",
-    );
-    tcp.observation.original_data_in_flight_bytes = 0;
-    tcp.observation.snapshot.data_level_bytes_in_flight = 0;
-    assert!(
-        select_response_frame_path(
-            &[tcp],
-            TrafficClass::Throughput,
-            &frame,
-            CarrierEmitMode::StreamOrdered,
-            &[],
-            Some(RelaySendCause::AckGapReinjection),
-        )
-        .is_some(),
-        "portable TCP repair becomes eligible after exact product flight drains",
-    );
+    for carrier_limit in [0, 16 * 1024 * 1024] {
+        let mut tcp = response_target(1, UnderlayProtocol::Tcp, 5.0, 0, carrier_limit, false);
+        tcp.observation.native_drain_observed = false;
+        tcp.observation.original_data_in_flight_bytes = 64 * 1024;
+        tcp.observation.snapshot.data_level_bytes_in_flight = 64 * 1024;
+
+        assert!(
+            select_response_frame_path(
+                std::slice::from_ref(&tcp),
+                TrafficClass::Throughput,
+                &frame,
+                CarrierEmitMode::StreamOrdered,
+                &[],
+                Some(RelaySendCause::AckGapReinjection),
+            )
+            .is_none(),
+            "missing native drain counters cannot be treated as measured idle while product flight remains",
+        );
+        tcp.observation.original_data_in_flight_bytes = 0;
+        tcp.observation.snapshot.data_level_bytes_in_flight = 0;
+        assert!(
+            select_response_frame_path(
+                &[tcp],
+                TrafficClass::Throughput,
+                &frame,
+                CarrierEmitMode::StreamOrdered,
+                &[],
+                Some(RelaySendCause::AckGapReinjection),
+            )
+            .is_some(),
+            "TCP repair becomes eligible after exact product flight drains",
+        );
+    }
 }
 
 #[test]

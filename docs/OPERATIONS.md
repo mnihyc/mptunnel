@@ -257,12 +257,23 @@ the startup sample floor unlocks mature additional-path placement. Native TCP
 or QUIC ACK evidence alone does not unlock it, and Data ACK of duplicated bytes
 is not attributed to either copy.
 
-## Optional Linux telemetry
+## Optional native TCP telemetry
 
-Linux carriers may sample `TCP_INFO` from the exact authenticated socket. The
-adapter reports only fields actually returned by the kernel; missing fields are
-unknown rather than zero. Passive native observations are scheduling evidence,
-not MPP Data ACKs.
+TCP carriers may sample the exact authenticated socket through a host adapter:
+
+- Linux and Android use the stable `TCP_INFO` UAPI prefix. Newer kernels expose
+  RTT, congestion flight/window, sender queue, ACK, loss, pacing, and delivery
+  counters; a shorter returned prefix exposes only the groups it contains.
+- macOS uses `TCP_CONNECTION_INFO` for RTT and congestion-window shape. Its
+  socket-buffer occupancy is not reported as exact network flight.
+- Windows uses `SIO_TCP_INFO` version 0 for RTT, bytes in flight, and congestion
+  window. This API requires Windows 10 version 1703 or Windows Server 2016 and
+  does not expose RTT variance or cumulatively acknowledged bytes in version 0.
+
+Every native field is optional and missing fields are unknown rather than zero.
+Passive native observations are scheduling evidence, not MPP Data ACKs.
+Native drain-based reinjection requires both exact bytes in flight and the
+unsent queue from one snapshot; otherwise it waits on exact MPP product flight.
 
 TCP capacity transactions use receiver-confirmed receipts and may combine them
 with exact-socket telemetry. QUIC publishes fresh native packet-ACK-derived
@@ -273,9 +284,16 @@ for response bulk admission, QUIC requires locally sourced ACK-derived carrier
 evidence, while durable unambiguous Data ACK progress may additionally establish
 a per-flow TCP MPP rate.
 
-The adapter is optional. Windows, macOS, Android, unsupported kernels, and
-restricted hosts use the portable fallback and remain correct and eligible.
-No config or topology should require `TCP_INFO` for normal operation.
+The adapter is optional. Older systems, unsupported kernels, restricted hosts,
+and compatibility layers that reject the socket query use the portable fallback
+and remain correct and eligible. Unproven paths retain one bounded startup
+flight; after durable original-data progress, shared MPP flow-control/reorder
+limits and the configured resource envelope govern product work while the
+socket writer supplies native backpressure. Data ACK rate remains completion
+evidence, not a replacement TCP congestion window. The process prints one
+explicit warning that high-bandwidth, high-latency multipath may be slower
+without native TCP send credit. No config or topology may require native
+telemetry for normal operation.
 
 ## Encryption
 

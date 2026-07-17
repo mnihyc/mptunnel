@@ -394,7 +394,12 @@ pub(in crate::runtime) trait ServerStreamPortBackend: Send + Sync {
         usage: PathUsage,
     );
 
-    fn record_local_path_metrics(&self, identity: ServerCarrierPathIdentity, metrics: PathMetrics);
+    fn record_local_path_metrics(
+        &self,
+        identity: ServerCarrierPathIdentity,
+        metrics: PathMetrics,
+        native_drain_observed: bool,
+    );
 
     fn peer_status_snapshot(&self, session_id: SessionId) -> Vec<PeerPathStatus>;
 
@@ -579,10 +584,14 @@ impl ServerStreamPort {
         &self,
         registration: &ServerCarrierPathRegistration,
         metrics: PathMetrics,
+        native_drain_observed: bool,
     ) {
         if registration.belongs_to(self) {
-            self.backend
-                .record_local_path_metrics(registration.inner.identity, metrics);
+            self.backend.record_local_path_metrics(
+                registration.inner.identity,
+                metrics,
+                native_drain_observed,
+            );
         }
     }
 

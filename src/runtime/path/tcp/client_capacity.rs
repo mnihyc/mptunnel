@@ -47,13 +47,13 @@ pub(super) async fn client_write_tcp_capacity_probe(
     lab_diagnostic(
         "request_tcp_capacity_probe",
         format_args!(
-            "phase=write_boundary_ready path_id={} measurement_id={} wait_ms={} native_queue={} unacked_packets={} notsent_bytes={}",
+            "phase=write_boundary_ready path_id={} measurement_id={} wait_ms={} native_queue={} bytes_in_flight={} notsent_bytes={}",
             probe.path_id.0,
             probe.measurement_id,
             baseline_wait_started_at.elapsed().as_millis(),
             _baseline.is_some(),
             _baseline
-                .and_then(|snapshot| snapshot.unacked_packets)
+                .and_then(|snapshot| snapshot.bytes_in_flight)
                 .unwrap_or(0),
             _baseline.map_or(0, |snapshot| snapshot.notsent_bytes),
         ),

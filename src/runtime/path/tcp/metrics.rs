@@ -9,6 +9,7 @@ use crate::runtime::path::model::{metric_epoch_now, ratio_to_ppm};
 use crate::transport::tcp_telemetry::{
     TcpNativeLossCounters, TcpNativeSnapshot, TcpTelemetrySocket,
 };
+use std::sync::Once;
 use std::time::{Duration, Instant};
 use tokio::net::TcpStream;
 
@@ -18,7 +19,7 @@ const TCP_METRIC_MAX_INTERVAL: Duration = Duration::from_millis(250);
 /// Exact same-socket sender queue used to establish a receipt-rate baseline.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(in crate::runtime) struct TcpSenderQueueSnapshot {
-    pub(in crate::runtime) unacked_packets: Option<u32>,
+    pub(in crate::runtime) bytes_in_flight: Option<u64>,
     pub(in crate::runtime) notsent_bytes: u32,
 }
 
@@ -73,6 +74,18 @@ impl TcpNativeObservation {
         Some((self.srtt_us?, self.rttvar_us?))
     }
 
+    pub(in crate::runtime) fn rttvar_us(self) -> Option<u32> {
+        self.rttvar_us
+    }
+
+    pub(in crate::runtime) fn bytes_in_flight(self) -> Option<u64> {
+        self.bytes_in_flight
+    }
+
+    pub(in crate::runtime) fn inflight_limit_bytes(self) -> Option<u64> {
+        self.inflight_limit_bytes
+    }
+
     pub(in crate::runtime) fn flight(self) -> Option<(u64, u64, u64)> {
         Some((
             self.bytes_in_flight?,
@@ -118,16 +131,37 @@ impl TcpNativeObservation {
         self.inflight_limit_bytes.is_some() && self.inflight_hi_bytes.is_some()
     }
 
+    pub(in crate::runtime) fn has_transport_shape(self) -> bool {
+        self.srtt_us.is_some()
+            || self.rttvar_us.is_some()
+            || self.bytes_in_flight.is_some()
+            || self.queue_bytes.is_some()
+            || self.inflight_limit_bytes.is_some()
+            || self.inflight_hi_bytes.is_some()
+            || self.loss_ppm.is_some()
+            || self.app_limited.is_some()
+    }
+
+    pub(in crate::runtime) fn has_native_drain_evidence(self) -> bool {
+        self.bytes_in_flight.is_some() && self.queue_bytes.is_some()
+    }
+
     /// Applies only capabilities this snapshot actually contains.
     pub(in crate::runtime) fn apply_transport_shape(self, metrics: &mut PathMetrics) {
-        if let Some((srtt_us, rttvar_us)) = self.rtt() {
+        if let Some(srtt_us) = self.srtt_us {
             metrics.srtt_us = srtt_us.max(1);
+        }
+        if let Some(rttvar_us) = self.rttvar_us {
             metrics.rttvar_us = rttvar_us;
             metrics.jitter_us = rttvar_us;
         }
-        if let Some((bytes_in_flight, inflight_limit_bytes, inflight_hi_bytes)) = self.flight() {
+        if let Some(bytes_in_flight) = self.bytes_in_flight {
             metrics.bytes_in_flight = bytes_in_flight;
+        }
+        if let Some(inflight_limit_bytes) = self.inflight_limit_bytes {
             metrics.inflight_limit_bytes = inflight_limit_bytes;
+        }
+        if let Some(inflight_hi_bytes) = self.inflight_hi_bytes {
             metrics.inflight_hi_bytes = inflight_hi_bytes;
         }
         if let Some(queue_bytes) = self.queue_bytes {
@@ -204,9 +238,12 @@ impl TcpMetricPublisher {
                 tracker: None,
                 next_sample_at: Instant::now(),
             }),
-            Ok(None) => None,
+            Ok(None) => {
+                warn_portable_tcp_capacity_fallback(None);
+                None
+            }
             Err(error) => {
-                eprintln!("warning: native TCP telemetry capture failed: {error}");
+                warn_portable_tcp_capacity_fallback(Some(&error));
                 None
             }
         }
@@ -214,12 +251,23 @@ impl TcpMetricPublisher {
 
     /// Starts the cumulative sender epoch after authenticated readiness bytes.
     pub(in crate::runtime) fn begin_epoch(&mut self) {
-        self.tracker = self
-            .socket
-            .snapshot()
-            .ok()
-            .flatten()
-            .map(TcpSenderMetricTracker::new);
+        self.tracker = match self.socket.snapshot() {
+            Ok(Some(snapshot)) if snapshot.flight.is_some() => {
+                Some(TcpSenderMetricTracker::new(snapshot))
+            }
+            Ok(Some(snapshot)) => {
+                warn_portable_tcp_capacity_fallback(None);
+                Some(TcpSenderMetricTracker::new(snapshot))
+            }
+            Ok(None) => {
+                warn_portable_tcp_capacity_fallback(None);
+                None
+            }
+            Err(error) => {
+                warn_portable_tcp_capacity_fallback(Some(&error));
+                None
+            }
+        };
         self.next_sample_at = Instant::now();
     }
 
@@ -227,7 +275,7 @@ impl TcpMetricPublisher {
     pub(in crate::runtime) fn sender_queue_snapshot(&self) -> Option<TcpSenderQueueSnapshot> {
         let snapshot = self.socket.snapshot().ok().flatten()?;
         Some(TcpSenderQueueSnapshot {
-            unacked_packets: snapshot.flight.map(|flight| flight.unacked_packets),
+            bytes_in_flight: snapshot.flight.and_then(|flight| flight.bytes_in_flight),
             notsent_bytes: snapshot.notsent_bytes?,
         })
     }
@@ -270,6 +318,16 @@ impl TcpMetricPublisher {
     }
 }
 
+fn warn_portable_tcp_capacity_fallback(error: Option<&std::io::Error>) {
+    static WARN_ONCE: Once = Once::new();
+    WARN_ONCE.call_once(|| {
+        eprintln!(
+            "warning: native TCP flight telemetry unavailable{}; multipath uses the portable Data ACK capacity fallback and may have lower throughput on high-bandwidth, high-latency links",
+            error.map_or(String::new(), |error| format!(" ({error})")),
+        );
+    });
+}
+
 /// Deltas one exact TCP sender from a post-authentication baseline.
 #[derive(Debug)]
 pub(in crate::runtime) struct TcpSenderMetricTracker {
@@ -292,10 +350,7 @@ impl TcpSenderMetricTracker {
     pub(in crate::runtime) fn new(baseline: TcpNativeSnapshot) -> Self {
         let delivery_window_floor_bytes = baseline
             .flight
-            .map(|flight| {
-                u64::from(flight.snd_cwnd_packets)
-                    .saturating_mul(u64::from(flight.snd_mss_bytes.max(1)))
-            })
+            .map(|flight| flight.inflight_limit_bytes)
             .unwrap_or(PATH_OPEN_SCORE_BYTES as u64)
             .max(PATH_OPEN_SCORE_BYTES as u64);
         Self {
@@ -318,22 +373,19 @@ impl TcpSenderMetricTracker {
     ) -> TcpNativeObservation {
         let (srtt_us, rttvar_us) = current
             .rtt
-            .map(|rtt| (Some(rtt.srtt_us), Some(rtt.rttvar_us)))
+            .map(|rtt| (Some(rtt.srtt_us), rtt.rttvar_us))
             .unwrap_or((None, None));
         let (bytes_in_flight, inflight_limit_bytes, inflight_hi_bytes) = current
             .flight
             .map(|flight| {
-                let mss = u64::from(flight.snd_mss_bytes.max(1));
-                let inflight_limit_bytes = u64::from(flight.snd_cwnd_packets).saturating_mul(mss);
-                let inflight_hi_bytes = if flight.snd_ssthresh_packets == u32::MAX {
-                    inflight_limit_bytes
-                } else {
-                    u64::from(flight.snd_ssthresh_packets).saturating_mul(mss)
-                };
                 (
-                    Some(u64::from(flight.unacked_packets).saturating_mul(mss)),
-                    Some(inflight_limit_bytes),
-                    Some(inflight_hi_bytes),
+                    flight.bytes_in_flight,
+                    Some(flight.inflight_limit_bytes),
+                    Some(
+                        flight
+                            .inflight_hi_bytes
+                            .unwrap_or(flight.inflight_limit_bytes),
+                    ),
                 )
             })
             .unwrap_or((None, None, None));

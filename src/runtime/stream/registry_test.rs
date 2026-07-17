@@ -71,6 +71,7 @@ fn late_open_and_closed_output_replacement_inherit_path_evidence() {
             ServerPathMetricsEntry {
                 metrics,
                 source: ServerPathMetricsSource::LocalSender,
+                native_drain_observed: false,
                 recorded_at: Instant::now(),
             },
         );
@@ -208,7 +209,7 @@ fn peer_status_snapshot_is_session_scoped_and_tracks_registration_lifetime() {
             initial_metrics: Some(second_metrics),
         },
     );
-    port.record_local_path_metrics(&first, first_metrics);
+    port.record_local_path_metrics(&first, first_metrics, false);
 
     let paths = port.peer_status_snapshot(first_session);
     assert_eq!(paths.len(), 1);

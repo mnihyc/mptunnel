@@ -686,6 +686,16 @@ impl ClientPathContext {
         }
     }
 
+    pub(in crate::runtime) fn tcp_native_drain_observed(&self, index: usize) -> bool {
+        self.state
+            .health()
+            .lock()
+            .expect("client path health lock")
+            .tcp
+            .get(index)
+            .is_some_and(|record| record.native_drain_observed)
+    }
+
     pub(in crate::runtime) fn reliable_path_rtt_is_observed(&self, key: RelayPathKey) -> bool {
         let health = self.state.health().lock().expect("client path health lock");
         let record = match key.underlay {

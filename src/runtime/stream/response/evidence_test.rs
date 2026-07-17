@@ -45,6 +45,7 @@ fn local_metrics_entry(metrics: PathMetrics) -> ServerPathMetricsEntry {
     ServerPathMetricsEntry {
         metrics,
         source: ServerPathMetricsSource::LocalSender,
+        native_drain_observed: false,
         recorded_at: Instant::now(),
     }
 }
@@ -224,6 +225,7 @@ fn native_quic_rate_sample_is_expiring_bulk_evidence() {
     let accepted = ServerPathMetricsEntry {
         metrics,
         source: ServerPathMetricsSource::LocalSender,
+        native_drain_observed: false,
         recorded_at: Instant::now(),
     };
     output.local_path_metrics = Some(accepted);

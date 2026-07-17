@@ -1877,6 +1877,7 @@ fn server_registry_replaced_output_does_not_reuse_cached_bulk_metrics() {
     registry.record_local_path_metrics(
         server_carrier_identity(&old_path_registration),
         server_test_bulk_path_metrics(path_id, 200_000_000),
+        false,
     );
     assert!(
         binding
@@ -1909,6 +1910,7 @@ fn server_registry_replaced_output_does_not_reuse_cached_bulk_metrics() {
     registry.record_local_path_metrics(
         server_carrier_identity(&old_path_registration),
         server_test_bulk_path_metrics(path_id, 300_000_000),
+        false,
     );
 
     let targets =
@@ -1936,6 +1938,7 @@ fn carrier_metrics_retire_after_last_publication_lease() {
             underlay: UnderlayProtocol::Udp,
             ..server_test_bulk_path_metrics(path_id, 200_000_000)
         },
+        false,
     );
     assert_eq!(registry.management_snapshot().paths.len(), 1);
 
@@ -1948,6 +1951,7 @@ fn carrier_metrics_retire_after_last_publication_lease() {
             underlay: UnderlayProtocol::Udp,
             ..server_test_bulk_path_metrics(path_id, 300_000_000)
         },
+        false,
     );
     drop(sampler_registration);
     assert!(

@@ -1599,8 +1599,8 @@ impl RequestMultipathController {
 
         let snapshot = context.reliable_path_snapshot(path.key());
         if path.key().underlay == UnderlayProtocol::Tcp
+            && context.tcp_native_drain_observed(path.key().index)
             && let Some(snapshot) = snapshot
-            && snapshot.carrier_inflight_limit_bytes > 0
         {
             return snapshot.bytes_in_flight == 0 && snapshot.queue_bytes == 0;
         }

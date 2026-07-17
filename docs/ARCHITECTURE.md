@@ -198,6 +198,13 @@ Loss, ECN, jitter, and queue evidence can change ranking and reordering cost.
 It never shrinks an MPP service quantum, creates a congestion window, or paces
 a carrier; native TCP and QUIC remain the only congestion controllers.
 
+Portable TCP follows the same boundary. Before exact product progress, one
+bounded startup flight limits exploration. Once original Data ACK coverage is
+durable, the shared receive/reorder windows and configured resource envelope
+bound MPP work while writer/socket backpressure bounds carrier acceptance. The
+measured Data ACK rate ranks completion but is not fed back as a replacement
+TCP congestion window.
+
 ## Identity and ownership
 
 Logical path identity is `(underlay, path_id)`. Physical carrier identity adds
@@ -264,15 +271,21 @@ the association owner rather than claiming another carrier's lifetime.
 Protocol, models, scheduling, stream ownership, and relay behavior are
 platform-neutral. Target-specific code is limited to host adapters:
 
-- Linux may expose optional `TCP_INFO` evidence through
-  `src/transport/tcp_telemetry/linux.rs`.
-- Other platforms receive the portable `None` capability and continue with
-  MPP Data ACKs, configured hints, and carrier-neutral observations.
+- Linux and Android use the stable `TCP_INFO` UAPI prefix, macOS uses
+  `TCP_CONNECTION_INFO`, and supported Windows versions use `SIO_TCP_INFO`.
+  These adapters live under `src/transport/tcp_telemetry/` and normalize native
+  units without inventing unavailable counters.
+- Every native field is independently optional. Unsupported APIs, truncated
+  records, and restricted hosts continue with MPP Data ACKs, configured hints,
+  and carrier-neutral observations.
+- Native TCP drain shortcuts require exact flight and unsent-queue counters
+  from the same snapshot. Partial Windows/macOS window shape still informs
+  service capacity, while reinjection uses exact MPP product flight.
 - TUN acquisition and carrier-network selection are injected host
   capabilities. Android hosts must establish the VPN descriptor and protect or
   bind carrier sockets outside the catch-all route.
 
-No scheduler eligibility rule may require Linux telemetry, inspect an
+No scheduler eligibility rule may require native telemetry, inspect an
 interface name, or branch on the operating system. Windows client with Linux
 server is a primary design target; Linux, macOS, Windows, and the Android
 library target must compile without changing the protocol model.

@@ -103,7 +103,7 @@ boundary, or adapter. File size alone does not earn a module.
 - `src/runtime/telemetry.rs`: exact logical product-byte, packet, and flow
   accounting at ingress/target relay boundaries. It never counts carrier
   retransmission, reinjection, or multipath copies.
-- `src/runtime/peer_status.rs`: bounded correlation for manual authenticated
+- `src/runtime/peer_status.rs`: bounded correlation for authenticated
   peer-status requests. TCP and QUIC actors retain their own writer and metric
   ownership; the broker owns neither carrier I/O nor scheduling evidence.
 - `src/runtime/management/`: cached typed snapshots, bounded HTTP transport,
@@ -252,7 +252,7 @@ snapshots rather than a session-wide lock for each packet.
 
 The authenticated TCP path session is its control channel. QUIC retains the
 first authenticated bidirectional stream as a connection control stream and
-uses later streams for product flows. Manual peer status uses these existing
+uses later streams for product flows. Peer status uses these existing
 channels symmetrically; it does not create a diagnostic transport or convert
 remote observations into local path evidence.
 
@@ -287,6 +287,10 @@ platform-neutral. Target-specific code is limited to host adapters:
 - Native TCP drain shortcuts require exact flight and unsent-queue counters
   from the same snapshot. Partial Windows/macOS window shape still informs
   service capacity, while reinjection uses exact MPP product flight.
+- Quinn's native UDP adapter remains the normal QUIC socket owner. A Windows
+  host that reports unsupported optional Winsock facilities may use a basic
+  datagram adapter without ECN, GSO, or GRO. This changes host I/O capability,
+  not QUIC recovery/congestion ownership or any MPP scheduling rule.
 - TUN acquisition and carrier-network selection are injected host
   capabilities. Android hosts must establish the VPN descriptor and protect or
   bind carrier sockets outside the catch-all route.

@@ -1,14 +1,15 @@
 //! QUIC endpoint, connection, authentication, and transport configuration.
 
+use super::socket::endpoint_from_udp_socket;
+#[cfg(windows)]
+use super::socket::{bind_client_udp_socket, bind_server_udp_socket};
 use super::{
     CongestionMetrics, InstrumentedBbrConfig, InstrumentedController, QuicCarrierError,
     QuicCarrierTelemetry, RecvStream, SendStream,
 };
 use crate::mux::MuxLimits;
 use crate::transport::CarrierSocket;
-use quinn::{
-    ClientConfig, Endpoint as QuinnEndpoint, EndpointConfig, ServerConfig, TransportConfig, VarInt,
-};
+use quinn::{ClientConfig, Endpoint as QuinnEndpoint, ServerConfig, TransportConfig, VarInt};
 use rustls::pki_types::{CertificateDer, PrivatePkcs8KeyDer, ServerName, UnixTime};
 use sha2::{Digest, Sha256};
 use std::net::SocketAddr;
@@ -38,7 +39,13 @@ impl Endpoint {
         secret: &[u8],
         mux_limits: MuxLimits,
     ) -> Result<Self, QuicCarrierError> {
+        #[cfg(not(windows))]
         let endpoint = QuinnEndpoint::server(server_config(secret, mux_limits)?, addr)?;
+        #[cfg(windows)]
+        let endpoint = {
+            let socket = bind_server_udp_socket(addr)?;
+            endpoint_from_udp_socket(socket, Some(server_config(secret, mux_limits)?))?
+        };
         Ok(Self { endpoint })
     }
 
@@ -47,7 +54,13 @@ impl Endpoint {
         secret: &[u8],
         mux_limits: MuxLimits,
     ) -> Result<Self, QuicCarrierError> {
+        #[cfg(not(windows))]
         let mut endpoint = QuinnEndpoint::client(addr)?;
+        #[cfg(windows)]
+        let mut endpoint = {
+            let socket = bind_client_udp_socket(addr)?;
+            endpoint_from_udp_socket(socket, None)?
+        };
         endpoint.set_default_client_config(client_config(secret, mux_limits)?);
         Ok(Self { endpoint })
     }
@@ -58,14 +71,7 @@ impl Endpoint {
         secret: &[u8],
         mux_limits: MuxLimits,
     ) -> Result<Self, QuicCarrierError> {
-        let runtime = quinn::default_runtime()
-            .ok_or_else(|| std::io::Error::other("no async runtime found"))?;
-        let mut endpoint = QuinnEndpoint::new(
-            EndpointConfig::default(),
-            None,
-            socket.into_udp_socket()?,
-            runtime,
-        )?;
+        let mut endpoint = endpoint_from_udp_socket(socket.into_udp_socket()?, None)?;
         endpoint.set_default_client_config(client_config(secret, mux_limits)?);
         Ok(Self { endpoint })
     }

@@ -181,7 +181,7 @@ and data flow are in [Architecture](docs/ARCHITECTURE.md).
 | Platform | Release scope |
 | --- | --- |
 | Linux x86_64/aarch64 | Proxy and TUN runtime; Linux x86_64 is the primary end-to-end lab platform. TUN setup requires host network privileges. |
-| Windows x86_64/aarch64 | Proxy runtime and Wintun packaging. A GNU-target Windows PE has proxy-path evidence under Wine; native MSVC, Wintun, and native-kernel performance remain to be exercised. |
+| Windows x86_64/aarch64 | Proxy runtime and Wintun packaging. A GNU-target Windows PE has TCP and QUIC proxy-path evidence under Wine; native MSVC, Wintun, and native-kernel performance remain to be exercised. |
 | macOS x86_64/aarch64 | Proxy and packet-device code is built for release; native packet-device integration is best effort and not represented by the Linux lab results. |
 | Android aarch64 | Best-effort shell proxy binary only. The archive is not an APK, AAR, or `VpnService` integration. |
 
@@ -196,6 +196,12 @@ Native TCP telemetry is adapted per platform: `TCP_INFO` on Linux/Android,
 it. Correctness does not depend on telemetry. When it is unavailable,
 `mptunnel` uses portable Data ACK and socket-backpressure evidence and prints
 a performance warning; high-bandwidth, high-delay upload may be slower.
+
+QUIC normally uses Quinn's native UDP adapter. On Windows compatibility layers
+that lack optional ECN or segmentation socket features, `mptunnel` falls back
+to basic datagram I/O and prints a separate performance warning. Quinn still
+owns QUIC congestion control, packet recovery, and timeouts; native Windows
+uses the optimized adapter when its socket capabilities are available.
 
 ## Security and limitations
 

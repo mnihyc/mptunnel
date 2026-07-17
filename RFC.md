@@ -178,7 +178,7 @@ not wire values.
 
 ### 4.3 Peer diagnostics
 
-An endpoint MAY manually send `PEER_STATUS_REQUEST(request_id)` on an
+An endpoint MAY send `PEER_STATUS_REQUEST(request_id)` on an
 authenticated path control channel. The peer answers on the same channel with
 `PEER_STATUS_RESPONSE(request_id, code, paths)`, where `code` is `OK`,
 `DISABLED`, or `UNAVAILABLE`. A non-`OK` response MUST contain no paths.
@@ -646,6 +646,14 @@ platform-neutral. Platform-specific code is limited to host adapters such as
 packet-device acquisition, socket binding or protection, and optional native
 TCP telemetry.
 
+QUIC packet recovery, congestion control, and timeouts remain transport-owned
+when a host lacks optional UDP facilities. An implementation MAY replace its
+optimized UDP adapter with basic datagram I/O when capability probing reports
+unsupported ECN, packet-info, or segmentation facilities. That adapter choice
+MUST NOT change MPP path eligibility, scheduling, sequencing, Data ACK, or
+reinjection policy, and an implementation SHOULD report the expected
+performance reduction to the operator.
+
 Native TCP telemetry is an optional capability adapter: Linux and Android use
 the stable `TCP_INFO` UAPI prefix, macOS uses `TCP_CONNECTION_INFO`, and
 supported Windows versions use `SIO_TCP_INFO`. Every field is independently
@@ -655,9 +663,9 @@ Data ACK observations remain available when native inspection is unsupported or
 fails. Missing native send credit selects the capability-based portable rule in
 Section 8; it does not select an operating-system policy. No scheduling
 decision may branch on the operating system. A Windows client with a Linux
-server is a primary target, but Wine currently proves only
-Windows CLI/configuration and portable TCP behavior; native packet-device and
-network integration remain separate release evidence.
+server is a primary target. Wine can prove CLI/configuration and portable TCP
+or basic-UDP QUIC proxy behavior, but native packet-device, optimized socket,
+and network integration remain separate release evidence.
 
 A native TCP drain decision MUST require both exact bytes in flight and the
 unsent sender queue from the same snapshot. A partial RTT or congestion-window

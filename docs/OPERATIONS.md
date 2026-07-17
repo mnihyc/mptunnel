@@ -127,7 +127,7 @@ All data and controls are under `/api/`:
 - `GET /api/diagnostics` returns local diagnostic capability and typed peer
   service/index/session selectors.
 - `POST /api/control/path` changes endpoint-local client path lifecycle policy.
-- `POST /api/diagnostics/peer` manually requests a sanitized peer snapshot.
+- `POST /api/diagnostics/peer` requests a sanitized peer snapshot.
 
 Static page assets and `GET /api/health` are public so the browser and local
 health checks can load before authentication. Every runtime-data and control
@@ -315,6 +315,22 @@ explicit warning that high-bandwidth, high-latency multipath may be slower
 without native TCP send credit. No config or topology may require native
 telemetry for normal operation.
 
+## QUIC UDP capability fallback
+
+QUIC uses Quinn's native UDP adapter when the host provides its expected socket
+facilities. On Windows compatibility layers that reject optional ECN or
+segmentation features with an unsupported-capability error, endpoint creation
+falls back to one-datagram send and receive without ECN, GSO, or GRO. The
+process prints this choice once because throughput and CPU efficiency may be
+lower. Quinn continues to own QUIC congestion control, packet recovery, and
+timeouts. Other socket errors remain fatal rather than silently selecting the
+fallback.
+
+This path makes proxy operation possible on limited Windows environments; it
+does not prove native MSVC performance, Wintun, source-address selection on a
+multihomed wildcard listener, or native kernel integration. Bind a specific
+address when source-address selection matters.
+
 ## Encryption
 
 All MPP paths are encrypted. TCP paths use the MPP record layer, which defaults
@@ -377,12 +393,13 @@ modifying networking. TUN, route, DNS, netem, blackhole, and privileged service
 experiments belong in Docker or a dedicated native test machine.
 
 Wine inside the shaped Docker client namespace can validate the Windows GNU
-executable's portable proxy behavior, throughput, aggregation, and failover.
+executable's portable TCP and basic-UDP QUIC proxy behavior, throughput,
+aggregation, and failover.
 Keep that cohort labeled Linux/Wine: it does not validate Wintun, native
-Windows kernel scheduling, `SIO_TCP_INFO`, or native-host/real-Internet
-performance. Wine outside the shaped namespace remains suitable only for
-userspace startup, CLI, and configuration validation; neither form substitutes
-for the native Windows gates.
+Windows kernel scheduling, `SIO_TCP_INFO`, the optimized native QUIC UDP
+adapter, or native-host/real-Internet performance. Wine outside the shaped
+namespace remains suitable only for userspace startup, CLI, and configuration
+validation; neither form substitutes for the native Windows gates.
 
 Performance acceptance follows [`docs/LAB.md`](LAB.md). The compact current
 release evidence is [`docs/PERFORMANCE.md`](PERFORMANCE.md); generated historical

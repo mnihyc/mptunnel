@@ -126,14 +126,16 @@ runtime in one invocation:
 MPTUNNEL_LAB_CLIENT_RUNTIME=wine \
 MPTUNNEL_LAB_INSTALL_WINE=1 \
 BUILD_LAB_IMAGES=1 \
-CASE_FILTER='mptunnel_tcp_single_cross_continent_high_bandwidth,mptunnel_tcp_multipath_equal_fat' \
+CASE_FILTER='mptunnel_tcp_single_cross_continent_high_bandwidth,mptunnel_udp_stream_single_cross_continent_high_bandwidth,mptunnel_udp_stream_multipath_equal_fat' \
 lab/run-heterogeneous-ablation.sh
 ```
 
 Every row records the client runtime/version, client and server targets, and
-both binary hashes. Wine cases support proxy-based workloads; TUN cases remain
-native-only. Wine proves behavior of the Windows executable and portable
-fallback, not Wintun, native Windows kernel scheduling, or `SIO_TCP_INFO`.
+both binary hashes. Wine cases support TCP and QUIC proxy workloads; TUN cases
+remain native-only. On limited Winsock implementations, QUIC uses the explicit
+basic-UDP compatibility adapter and records its warning. Wine proves behavior
+of the Windows executable and portable fallbacks, not Wintun, native Windows
+kernel scheduling, `SIO_TCP_INFO`, or the optimized native QUIC UDP adapter.
 
 ## Representative release matrix
 

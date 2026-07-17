@@ -7,6 +7,7 @@ use std::fmt;
 
 mod congestion;
 mod endpoint;
+mod socket;
 mod stream;
 
 pub use congestion::{CarrierSendCreditSnapshot, CongestionMetrics};

@@ -58,6 +58,11 @@ Shared policy consumes immutable carrier-neutral snapshots and emits
 identity-fenced intents. TCP and QUIC may share result vocabulary and command
 geometry, but never mutable controller state or proof clocks.
 
+`transport/quic/socket` owns UDP construction and host capability adaptation.
+It first delegates to Quinn's native adapter; a target-gated basic datagram
+adapter may handle unsupported optional socket facilities, but cannot own QUIC
+recovery or introduce platform-specific MPP policy.
+
 ## Observe, decide, apply
 
 1. **Observe** refreshes expiring state and captures one coherent snapshot. It
@@ -120,7 +125,7 @@ browser policy, `management/schema` owns serialized contracts,
 `management/projection` reads runtime owners, `management/snapshot` owns the
 immutable cache/history, and `management/control` owns explicit path mutations
 plus peer-request selection. `telemetry` owns exact logical product counters.
-`peer_status` owns only manual request correlation; TCP and QUIC carrier actors
+`peer_status` owns only request correlation; TCP and QUIC carrier actors
 keep their independent control stream and writer lifetimes.
 
 Reinjection consumes exact retained ranges. Ordinary work must pass the

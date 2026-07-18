@@ -234,6 +234,16 @@ carrier with the same logical identity. TCP datagram associations use separate
 short-lived sessions and keep their `PATH_STATUS` sequence locally, so they do
 not replace the reliable carrier's physical identity.
 
+Datagram failover keeps timing ownership below the carrier-neutral association.
+TCP and QUIC each derive a modeled pre-feedback response timeout from their own
+observations. If another ranked attempt remains, the association reserves it by
+ending the first attempt without feedback after one such timeout; the final
+attempt retains a three-timeout loss-tolerance budget. QUIC's attempted-path
+set and TCP's replacement opener both exclude the configured path already used
+by the request. Matching datagram feedback moves the request to admitted state,
+extends response waiting to the absolute product TTL, and makes cross-carrier
+replay terminal.
+
 The initiator chooses the wire `path_id`; the receiver treats it as opaque.
 Node composition retains the accepting listener's endpoint-local configuration
 ordinal through carrier registration. Startup hints and the full local
@@ -298,6 +308,9 @@ platform-neutral. Target-specific code is limited to host adapters:
 - Every native field is independently optional. Unsupported APIs, truncated
   records, and restricted hosts continue with MPP Data ACKs, configured hints,
   and carrier-neutral observations.
+- Retransmission counters retain their native unit: segments on Linux/Android
+  and bytes on Windows/macOS. Diagnostics may compare advancement on one exact
+  socket instance, but the value is never a cross-platform rate or MPP Data ACK.
 - Native TCP drain shortcuts require exact flight and unsent-queue counters
   from the same snapshot. Partial Windows/macOS window shape still informs
   service capacity, while reinjection uses exact MPP product flight.

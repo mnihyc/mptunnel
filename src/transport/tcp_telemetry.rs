@@ -45,6 +45,11 @@ pub(crate) struct TcpNativeSnapshot {
     pub(crate) flight: Option<TcpNativeFlight>,
     pub(crate) notsent_bytes: Option<u32>,
     pub(crate) bytes_acked: Option<u64>,
+    /// Opaque monotonic retransmission evidence for this exact socket.
+    ///
+    /// Platforms report either segments or bytes, so only advancement is
+    /// comparable. Runtime policy must not interpret the magnitude.
+    pub(crate) retransmission_counter: Option<u64>,
     pub(crate) loss: Option<TcpNativeLossCounters>,
     pub(crate) pacing_rate_bytes_per_second: Option<u64>,
     pub(crate) delivery_rate_bytes_per_second: Option<u64>,
@@ -57,6 +62,7 @@ impl TcpNativeSnapshot {
             || self.flight.is_some()
             || self.notsent_bytes.is_some()
             || self.bytes_acked.is_some()
+            || self.retransmission_counter.is_some()
             || self.loss.is_some()
             || self.pacing_rate_bytes_per_second.is_some()
             || self.delivery_rate_bytes_per_second.is_some()

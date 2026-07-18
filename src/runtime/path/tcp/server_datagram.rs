@@ -3,7 +3,7 @@
 //! The carrier owns flow membership and wire replies; accepted target workers
 //! and their policy lifetime arrive through the neutral datagram port.
 
-use crate::protocol::frame::datagram_ack_range;
+use crate::protocol::frame::datagram_feedback_range;
 use crate::protocol::{DatagramFlowId, DatagramId, Frame, SessionId, TargetAddr};
 use crate::runtime::error::RuntimeError;
 use crate::runtime::path::commands::ReliablePathCommandSender;
@@ -96,8 +96,8 @@ impl ServerTcpDatagramState {
             payload,
         }) {
             ServerDatagramSendOutcome::Accepted => {
-                let received = datagram_ack_range(datagram_id)
-                    .ok_or(RuntimeError::Protocol("datagram ACK range overflow"))?;
+                let received = datagram_feedback_range(datagram_id)
+                    .ok_or(RuntimeError::Protocol("datagram feedback range overflow"))?;
                 ServerTcpDatagramEffect::Reply(Frame::DatagramFeedback {
                     flow_id,
                     received: vec![received],

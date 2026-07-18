@@ -28,12 +28,12 @@ struct DatagramUnderlayCandidate {
 
 pub(in crate::runtime) enum DatagramUnderlaySendError {
     Timeout {
-        path_was_acked: bool,
+        feedback_received: bool,
         product_attempts: usize,
         source: RuntimeError,
     },
     Runtime {
-        path_was_acked: bool,
+        feedback_received: bool,
         product_attempts: usize,
         source: RuntimeError,
     },
@@ -169,14 +169,14 @@ impl DatagramClientAssociation {
                             return Ok(response);
                         }
                         Err(DatagramUnderlaySendError::Timeout {
-                            path_was_acked,
+                            feedback_received,
                             product_attempts,
                             source,
                         }) => {
                             remaining_product_attempts =
                                 remaining_product_attempts.saturating_sub(product_attempts);
                             match datagram_timeout_action(
-                                path_was_acked,
+                                feedback_received,
                                 has_unattempted_alternative && remaining_product_attempts > 0,
                             ) {
                                 DatagramTimeoutAction::RetryAlternative => {
@@ -188,10 +188,12 @@ impl DatagramClientAssociation {
                             }
                         }
                         Err(DatagramUnderlaySendError::Runtime {
-                            path_was_acked,
+                            feedback_received,
                             product_attempts,
                             source,
-                        }) if !path_was_acked && datagram_underlay_error_is_retryable(&source) => {
+                        }) if !feedback_received
+                            && datagram_underlay_error_is_retryable(&source) =>
+                        {
                             remaining_product_attempts =
                                 remaining_product_attempts.saturating_sub(product_attempts);
                             if !has_unattempted_alternative || remaining_product_attempts == 0 {
@@ -232,14 +234,14 @@ impl DatagramClientAssociation {
                             return Ok(response);
                         }
                         Err(DatagramUnderlaySendError::Timeout {
-                            path_was_acked,
+                            feedback_received,
                             product_attempts,
                             source,
                         }) => {
                             remaining_product_attempts =
                                 remaining_product_attempts.saturating_sub(product_attempts);
                             match datagram_timeout_action(
-                                path_was_acked,
+                                feedback_received,
                                 has_unattempted_alternative && remaining_product_attempts > 0,
                             ) {
                                 DatagramTimeoutAction::RetryAlternative => {
@@ -251,10 +253,12 @@ impl DatagramClientAssociation {
                             }
                         }
                         Err(DatagramUnderlaySendError::Runtime {
-                            path_was_acked,
+                            feedback_received,
                             product_attempts,
                             source,
-                        }) if !path_was_acked && datagram_underlay_error_is_retryable(&source) => {
+                        }) if !feedback_received
+                            && datagram_underlay_error_is_retryable(&source) =>
+                        {
                             remaining_product_attempts =
                                 remaining_product_attempts.saturating_sub(product_attempts);
                             if !has_unattempted_alternative || remaining_product_attempts == 0 {
@@ -298,7 +302,7 @@ impl DatagramClientAssociation {
             .udp
             .as_mut()
             .ok_or(DatagramUnderlaySendError::Runtime {
-                path_was_acked: false,
+                feedback_received: false,
                 product_attempts: 0,
                 source: RuntimeError::NoSchedulableUdpPath,
             })?;
@@ -327,10 +331,11 @@ impl DatagramClientAssociation {
                     payload.len(),
                     product_deadline,
                     has_unattempted_outer_alternative,
+                    None,
                 )
                 .await
                 .map_err(|source| DatagramUnderlaySendError::Runtime {
-                    path_was_acked: false,
+                    feedback_received: false,
                     product_attempts: 0,
                     source,
                 })?,
@@ -339,7 +344,7 @@ impl DatagramClientAssociation {
         let remaining_ttl_ms = datagram_remaining_ttl_ms(product_deadline);
         if remaining_ttl_ms == 0 {
             return Err(DatagramUnderlaySendError::Timeout {
-                path_was_acked: false,
+                feedback_received: false,
                 product_attempts: 0,
                 source: RuntimeError::DatagramResponseTimedOut,
             });
@@ -349,7 +354,7 @@ impl DatagramClientAssociation {
                 .tcp
                 .as_mut()
                 .ok_or(DatagramUnderlaySendError::Runtime {
-                    path_was_acked: false,
+                    feedback_received: false,
                     product_attempts: 0,
                     source: RuntimeError::NoSchedulableTcpPath,
                 })?;

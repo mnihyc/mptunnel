@@ -49,6 +49,7 @@ pub(in crate::runtime) struct TcpNativeObservation {
     delivery_rate_bps: Option<u64>,
     pacing_rate_bps: Option<u64>,
     newly_acked_bytes: Option<u64>,
+    retransmission_advanced: Option<bool>,
     #[cfg(any(test, feature = "lab-diagnostics"))]
     acked_bytes_since_epoch: Option<u64>,
     loss_ppm: Option<u32>,
@@ -112,6 +113,13 @@ impl TcpNativeObservation {
 
     pub(in crate::runtime) fn newly_acked_bytes(self) -> Option<u64> {
         self.newly_acked_bytes
+    }
+
+    /// Reports a native recovery edge without assigning meaning to the
+    /// platform-specific retransmission counter's unit.
+    #[cfg(any(feature = "lab-diagnostics", test))]
+    pub(in crate::runtime) fn retransmission_advanced(self) -> Option<bool> {
+        self.retransmission_advanced
     }
 
     #[cfg(any(test, feature = "lab-diagnostics"))]
@@ -333,6 +341,7 @@ fn warn_portable_tcp_capacity_fallback(error: Option<&std::io::Error>) {
 pub(in crate::runtime) struct TcpSenderMetricTracker {
     bytes_acked_baseline: Option<u64>,
     previous_bytes_acked: Option<u64>,
+    previous_retransmission_counter: Option<u64>,
     delivery_window_floor_bytes: u64,
     loss: Option<TcpLossTracker>,
 }
@@ -356,6 +365,7 @@ impl TcpSenderMetricTracker {
         Self {
             bytes_acked_baseline: baseline.bytes_acked,
             previous_bytes_acked: baseline.bytes_acked,
+            previous_retransmission_counter: baseline.retransmission_counter,
             delivery_window_floor_bytes,
             loss: baseline.loss.map(|previous| TcpLossTracker {
                 previous,
@@ -424,6 +434,16 @@ impl TcpSenderMetricTracker {
         if current.bytes_acked.is_some() {
             self.previous_bytes_acked = current.bytes_acked;
         }
+        let retransmission_advanced = match (
+            self.previous_retransmission_counter,
+            current.retransmission_counter,
+        ) {
+            (Some(previous), Some(current)) => Some(current != previous),
+            (None, Some(_)) | (_, None) => None,
+        };
+        if current.retransmission_counter.is_some() {
+            self.previous_retransmission_counter = current.retransmission_counter;
+        }
 
         TcpNativeObservation {
             path_id,
@@ -442,6 +462,7 @@ impl TcpSenderMetricTracker {
                 .filter(|rate| *rate != u64::MAX)
                 .map(bytes_per_second_to_bits),
             newly_acked_bytes,
+            retransmission_advanced,
             #[cfg(any(test, feature = "lab-diagnostics"))]
             acked_bytes_since_epoch,
             loss_ppm,

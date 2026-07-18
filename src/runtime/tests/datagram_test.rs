@@ -1,6 +1,6 @@
 use super::*;
 use crate::config::ResourceLimits;
-use crate::protocol::PathMetricDirection;
+use crate::protocol::{PathMetricDirection, PathUsage};
 #[cfg(feature = "lab-diagnostics")]
 use crate::runtime::path::quic::metrics::QuicAckPollDiagnostics;
 use crate::runtime::path::quic::metrics::UdpPathMetrics;
@@ -483,7 +483,7 @@ fn datagram_response_timeout_is_terminal_product_expiry() {
 }
 
 #[test]
-fn unacked_datagram_timeout_retries_unattempted_alternative_before_product_feedback() {
+fn datagram_without_feedback_retries_unattempted_alternative_before_product_expiry() {
     assert_eq!(
         datagram_timeout_action(false, true),
         DatagramTimeoutAction::RetryAlternative
@@ -664,8 +664,11 @@ fn udp_response_budget_tracks_live_loss_model() {
     let stable_model = context
         .udp_path_runtime_model(0, DEFAULT_SOCKS5_UDP_TTL_MS)
         .expect("stable model");
-    let stable_budget =
-        datagram_response_deadline_budget(stable_model.response_timeout, DEFAULT_SOCKS5_UDP_TTL_MS);
+    let stable_budget = datagram_response_deadline_budget(
+        stable_model.response_timeout,
+        DEFAULT_SOCKS5_UDP_TTL_MS,
+        false,
+    );
     assert!(stable_budget >= QUIC_TIMER_GRANULARITY);
 
     context.mark_udp_path_feedback(
@@ -681,8 +684,11 @@ fn udp_response_budget_tracks_live_loss_model() {
     let lossy_model = context
         .udp_path_runtime_model(0, DEFAULT_SOCKS5_UDP_TTL_MS)
         .expect("lossy model");
-    let lossy_budget =
-        datagram_response_deadline_budget(lossy_model.response_timeout, DEFAULT_SOCKS5_UDP_TTL_MS);
+    let lossy_budget = datagram_response_deadline_budget(
+        lossy_model.response_timeout,
+        DEFAULT_SOCKS5_UDP_TTL_MS,
+        false,
+    );
     assert!(lossy_budget > stable_budget);
     assert!(lossy_budget > Duration::from_millis(500));
 }
@@ -690,18 +696,27 @@ fn udp_response_budget_tracks_live_loss_model() {
 #[test]
 fn datagram_response_deadline_budget_scales_from_ttl_slack_and_response_model() {
     let high_rtt_timeout = Duration::from_millis(900);
-    let budget = datagram_response_deadline_budget(high_rtt_timeout, DEFAULT_SOCKS5_UDP_TTL_MS);
-    let low_rtt_budget =
-        datagram_response_deadline_budget(Duration::from_millis(50), DEFAULT_SOCKS5_UDP_TTL_MS);
-    assert!(budget > low_rtt_budget);
+    let budget =
+        datagram_response_deadline_budget(high_rtt_timeout, DEFAULT_SOCKS5_UDP_TTL_MS, false);
+    let low_rtt_budget = datagram_response_deadline_budget(
+        Duration::from_millis(50),
+        DEFAULT_SOCKS5_UDP_TTL_MS,
+        false,
+    );
+    assert_eq!(budget, Duration::from_millis(2_700));
+    assert_eq!(low_rtt_budget, Duration::from_millis(150));
     assert!(budget < Duration::from_millis(DEFAULT_SOCKS5_UDP_TTL_MS.into()));
 
-    let tight_ttl_budget = datagram_response_deadline_budget(high_rtt_timeout, 1_000);
+    let tight_ttl_budget = datagram_response_deadline_budget(high_rtt_timeout, 1_000, false);
     assert_eq!(tight_ttl_budget, Duration::from_millis(1_000));
+
+    let alternative_budget =
+        datagram_response_deadline_budget(high_rtt_timeout, DEFAULT_SOCKS5_UDP_TTL_MS, true);
+    assert_eq!(alternative_budget, high_rtt_timeout);
 }
 
 #[test]
-fn tcp_datagram_response_timeout_uses_tcp_rto_budget() {
+fn tcp_datagram_response_timeout_uses_tcp_path_response_model() {
     let mut high_rtt_tcp =
         PathSnapshot::new(PathId(0), UnderlayProtocol::Tcp, 250.0, 200_000_000.0);
     high_rtt_tcp.jitter_ms = 20.0;
@@ -1205,34 +1220,39 @@ fn quic_path_metrics_feed_path_model_without_fake_bulk_evidence() {
     let context =
         ClientPathContext::new(vec![path], security(), ResourceLimits::default()).expect("context");
     let now = Instant::now();
+    let path_instance_id = crate::model::path::next_carrier_path_instance_id();
 
     {
         let mut health = context.health().lock().expect("health lock");
-        health.udp[0].mark_quic_path_metrics(UdpPathMetrics {
-            direction: PathMetricDirection::ClientToServer,
-            srtt: Duration::from_millis(42),
-            rttvar: Duration::from_millis(7),
-            rtt_observed: true,
-            delivery_rate_bps: 300_000_000.0,
-            pacing_rate_bps: 300_000_000.0,
-            inflight_hi: 512 * 1024,
-            bytes_in_flight: 48 * 1024,
-            pending_bytes: 64 * 1024,
-            loss_ppm: None,
-            ecn_ppm: None,
-            app_limited: true,
-            ack_derived_data_seen: false,
-            delivery_sample_count: 0,
-            delivery_sample_bytes: 0,
-            last_delivery_sample_at: None,
-            bulk_proof_expires_at: None,
-            latest_delivery_sample_bytes: 0,
-            latest_delivery_sample_count: 0,
-            latest_carrier_ack_elapsed: None,
-            latest_rate_sample_elapsed: None,
-            #[cfg(feature = "lab-diagnostics")]
-            ack_poll: QuicAckPollDiagnostics::default(),
-        });
+        health.udp[0].install_peer_usage(path_instance_id, 0, PathUsage::Available);
+        health.udp[0].mark_quic_path_metrics(
+            path_instance_id,
+            UdpPathMetrics {
+                direction: PathMetricDirection::ClientToServer,
+                srtt: Duration::from_millis(42),
+                rttvar: Duration::from_millis(7),
+                rtt_observed: true,
+                delivery_rate_bps: 300_000_000.0,
+                pacing_rate_bps: 300_000_000.0,
+                inflight_hi: 512 * 1024,
+                bytes_in_flight: 48 * 1024,
+                pending_bytes: 64 * 1024,
+                loss_ppm: None,
+                ecn_ppm: None,
+                app_limited: true,
+                ack_derived_data_seen: false,
+                delivery_sample_count: 0,
+                delivery_sample_bytes: 0,
+                last_delivery_sample_at: None,
+                bulk_proof_expires_at: None,
+                latest_delivery_sample_bytes: 0,
+                latest_delivery_sample_count: 0,
+                latest_carrier_ack_elapsed: None,
+                latest_rate_sample_elapsed: None,
+                #[cfg(feature = "lab-diagnostics")]
+                ack_poll: QuicAckPollDiagnostics::default(),
+            },
+        );
     }
 
     let snapshot = context.udp_path_snapshot(0).expect("snapshot");
@@ -1248,31 +1268,34 @@ fn quic_path_metrics_feed_path_model_without_fake_bulk_evidence() {
 
     {
         let mut health = context.health().lock().expect("health lock");
-        health.udp[0].mark_quic_path_metrics(UdpPathMetrics {
-            direction: PathMetricDirection::ClientToServer,
-            srtt: Duration::from_millis(42),
-            rttvar: Duration::from_millis(7),
-            rtt_observed: true,
-            delivery_rate_bps: 300_000_000.0,
-            pacing_rate_bps: 300_000_000.0,
-            inflight_hi: 512 * 1024,
-            bytes_in_flight: 48 * 1024,
-            pending_bytes: 64 * 1024,
-            loss_ppm: Some(0),
-            ecn_ppm: None,
-            app_limited: false,
-            ack_derived_data_seen: true,
-            delivery_sample_count: 2,
-            delivery_sample_bytes: 512 * 1024,
-            last_delivery_sample_at: Some(now),
-            bulk_proof_expires_at: Some(now + Duration::from_secs(1)),
-            latest_delivery_sample_bytes: 512 * 1024,
-            latest_delivery_sample_count: 2,
-            latest_carrier_ack_elapsed: Some(Duration::from_millis(20)),
-            latest_rate_sample_elapsed: Some(Duration::from_millis(20)),
-            #[cfg(feature = "lab-diagnostics")]
-            ack_poll: QuicAckPollDiagnostics::default(),
-        });
+        health.udp[0].mark_quic_path_metrics(
+            path_instance_id,
+            UdpPathMetrics {
+                direction: PathMetricDirection::ClientToServer,
+                srtt: Duration::from_millis(42),
+                rttvar: Duration::from_millis(7),
+                rtt_observed: true,
+                delivery_rate_bps: 300_000_000.0,
+                pacing_rate_bps: 300_000_000.0,
+                inflight_hi: 512 * 1024,
+                bytes_in_flight: 48 * 1024,
+                pending_bytes: 64 * 1024,
+                loss_ppm: Some(0),
+                ecn_ppm: None,
+                app_limited: false,
+                ack_derived_data_seen: true,
+                delivery_sample_count: 2,
+                delivery_sample_bytes: 512 * 1024,
+                last_delivery_sample_at: Some(now),
+                bulk_proof_expires_at: Some(now + Duration::from_secs(1)),
+                latest_delivery_sample_bytes: 512 * 1024,
+                latest_delivery_sample_count: 2,
+                latest_carrier_ack_elapsed: Some(Duration::from_millis(20)),
+                latest_rate_sample_elapsed: Some(Duration::from_millis(20)),
+                #[cfg(feature = "lab-diagnostics")]
+                ack_poll: QuicAckPollDiagnostics::default(),
+            },
+        );
     }
 
     let snapshot = context.udp_path_snapshot(0).expect("snapshot");

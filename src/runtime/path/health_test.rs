@@ -19,6 +19,7 @@ fn request_tcp_native_observation(path_index: usize) -> TcpNativeObservation {
         }),
         notsent_bytes: Some(0),
         bytes_acked: Some(100),
+        retransmission_counter: Some(0),
         loss: Some(TcpNativeLossCounters {
             retransmits: 0,
             data_segments_out: 10,
@@ -34,12 +35,8 @@ fn request_tcp_native_observation(path_index: usize) -> TcpNativeObservation {
     )
 }
 
-#[test]
-fn quic_bulk_proof_deadline_survives_a_later_app_limited_poll() {
-    let now = Instant::now();
-    let deadline = now + Duration::from_secs(2);
-    let mut record = ClientPathHealthRecord::default();
-    record.mark_quic_path_metrics(UdpPathMetrics {
+fn request_quic_path_metrics(now: Instant, deadline: Instant) -> UdpPathMetrics {
+    UdpPathMetrics {
         direction: PathMetricDirection::ClientToServer,
         srtt: Duration::from_millis(180),
         rttvar: Duration::from_millis(20),
@@ -63,7 +60,17 @@ fn quic_bulk_proof_deadline_survives_a_later_app_limited_poll() {
         latest_rate_sample_elapsed: None,
         #[cfg(feature = "lab-diagnostics")]
         ack_poll: crate::runtime::path::quic::metrics::QuicAckPollDiagnostics::default(),
-    });
+    }
+}
+
+#[test]
+fn quic_bulk_proof_deadline_survives_a_later_app_limited_poll() {
+    let now = Instant::now();
+    let deadline = now + Duration::from_secs(2);
+    let mut record = ClientPathHealthRecord::default();
+    let path_instance_id = crate::model::path::next_carrier_path_instance_id();
+    record.install_peer_usage(path_instance_id, 0, PathUsage::Available);
+    record.mark_quic_path_metrics(path_instance_id, request_quic_path_metrics(now, deadline));
 
     let fresh = record.observation_at(now + Duration::from_secs(1));
     assert!(fresh.carrier_app_limited);
@@ -74,6 +81,41 @@ fn quic_bulk_proof_deadline_survives_a_later_app_limited_poll() {
             .carrier_bulk_proof_expires_at,
         None
     );
+}
+
+#[test]
+fn stale_quic_metrics_cannot_overwrite_a_reconnected_carrier() {
+    let now = Instant::now();
+    let mut record = ClientPathHealthRecord::default();
+    let stale_instance = crate::model::path::next_carrier_path_instance_id();
+    let live_instance = crate::model::path::next_carrier_path_instance_id();
+    record.install_peer_usage(live_instance, 0, PathUsage::Available);
+
+    record.mark_quic_path_metrics(
+        stale_instance,
+        request_quic_path_metrics(now, now + Duration::from_secs(2)),
+    );
+    assert_eq!(record.carrier_delivery_rate_bps, None);
+    assert_eq!(record.carrier_bulk_proof_expires_at, None);
+}
+
+#[test]
+fn terminal_carrier_failure_rejects_delayed_native_metrics() {
+    let now = Instant::now();
+    let mut record = ClientPathHealthRecord::default();
+    let path_instance_id = crate::model::path::next_carrier_path_instance_id();
+    record.install_peer_usage(path_instance_id, 0, PathUsage::Available);
+    assert!(record.mark_data_plane_failure(path_instance_id, now, true));
+
+    record.mark_quic_path_metrics(
+        path_instance_id,
+        request_quic_path_metrics(now, now + Duration::from_secs(2)),
+    );
+    assert!(!record.mark_tcp_transport_state(path_instance_id, request_tcp_native_observation(0),));
+
+    assert_eq!(record.state, SchedulerPathState::Failed);
+    assert_eq!(record.carrier_srtt_ms, None);
+    assert_eq!(record.carrier_delivery_rate_bps, None);
 }
 
 #[test]
@@ -109,6 +151,7 @@ fn tcp_transport_state_retains_non_app_limited_ack_window_without_data_ack_autho
         }),
         notsent_bytes: Some(4_096),
         bytes_acked: Some(100),
+        retransmission_counter: Some(0),
         loss: Some(TcpNativeLossCounters {
             retransmits: 0,
             data_segments_out: 10,

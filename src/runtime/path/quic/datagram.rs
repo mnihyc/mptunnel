@@ -6,7 +6,7 @@ use super::io::{
 };
 #[cfg(feature = "lab-diagnostics")]
 use crate::lab_diagnostics::lab_diagnostic;
-use crate::protocol::frame::datagram_ack_range;
+use crate::protocol::frame::datagram_feedback_range;
 use crate::protocol::{DatagramFlowId, Frame, SessionId, TargetAddr};
 use crate::runtime::error::RuntimeError;
 use crate::runtime::path::commands::{
@@ -90,8 +90,8 @@ pub(super) async fn handle_server_udp_datagram_stream(
                             .ok_or(RuntimeError::Protocol("unknown QUIC UDP path datagram flow"))?;
                         match flow.try_send(ServerDatagramRequest { datagram_id, ttl_ms, payload }) {
                             ServerDatagramSendOutcome::Accepted => {
-                                let received = datagram_ack_range(datagram_id)
-                                    .ok_or(RuntimeError::Protocol("datagram ACK range overflow"))?;
+                                let received = datagram_feedback_range(datagram_id)
+                                    .ok_or(RuntimeError::Protocol("datagram feedback range overflow"))?;
                                 udp_path_write_frame(
                                     &mut send,
                                     &Frame::DatagramFeedback {

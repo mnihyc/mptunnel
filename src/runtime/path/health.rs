@@ -219,7 +219,7 @@ impl ClientPathHealthRecord {
         path_instance_id: CarrierPathInstanceId,
         observation: TcpNativeObservation,
     ) -> bool {
-        if self.manual_disabled || self.path_instance_id != Some(path_instance_id) {
+        if !self.accepts_native_carrier_observation(path_instance_id) {
             return false;
         }
         self.mark_liveness_success();
@@ -535,8 +535,12 @@ impl ClientPathHealthRecord {
         });
     }
 
-    pub(in crate::runtime) fn mark_quic_path_metrics(&mut self, metrics: UdpPathMetrics) {
-        if self.manual_disabled {
+    pub(in crate::runtime) fn mark_quic_path_metrics(
+        &mut self,
+        path_instance_id: CarrierPathInstanceId,
+        metrics: UdpPathMetrics,
+    ) {
+        if !self.accepts_native_carrier_observation(path_instance_id) {
             return;
         }
         self.mark_liveness_success();
@@ -562,6 +566,12 @@ impl ClientPathHealthRecord {
             .saturating_sub(metrics.bytes_in_flight) as u64;
         self.carrier_inflight_limit_bytes = metrics.inflight_hi as u64;
         self.carrier_app_limited = metrics.app_limited;
+    }
+
+    fn accepts_native_carrier_observation(&self, path_instance_id: CarrierPathInstanceId) -> bool {
+        !self.manual_disabled
+            && self.path_instance_id == Some(path_instance_id)
+            && self.data_plane_failure_instance_id != Some(path_instance_id)
     }
 
     pub(in crate::runtime) fn mark_failure(

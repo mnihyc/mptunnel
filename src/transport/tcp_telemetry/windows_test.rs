@@ -12,6 +12,7 @@ fn tcp_info_v0_preserves_only_documented_windows_evidence() {
         BytesInFlight: 128 * 1024,
         Cwnd: 512 * 1024,
         BytesOut: 2 * 1024 * 1024,
+        BytesRetrans: 64 * 1024,
         ..TCP_INFO_v0::default()
     };
 
@@ -23,6 +24,7 @@ fn tcp_info_v0_preserves_only_documented_windows_evidence() {
     assert_eq!(flight.bytes_in_flight, Some(128 * 1024));
     assert_eq!(flight.inflight_limit_bytes, 512 * 1024);
     assert_eq!(snapshot.bytes_acked, None);
+    assert_eq!(snapshot.retransmission_counter, Some(64 * 1024));
 }
 
 #[tokio::test]

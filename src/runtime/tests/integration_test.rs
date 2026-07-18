@@ -1468,8 +1468,16 @@ async fn send_socks5_udp_ping(relay_addr: SocketAddr, target_addr: SocketAddr) {
 #[derive(Debug, Clone, Copy)]
 enum ScriptedTcpDatagramAction {
     FeedbackThenClose,
+    FeedbackThenRespond,
     CloseBeforeFeedback,
     FeedbackThenHold,
+    HoldWithoutFeedback,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct ScriptedTcpDatagramEmission {
+    ttl_ms: u32,
+    received_at: Instant,
 }
 
 async fn spawn_scripted_tcp_datagram_path(
@@ -1477,7 +1485,7 @@ async fn spawn_scripted_tcp_datagram_path(
     action: ScriptedTcpDatagramAction,
 ) -> (
     PathSpec,
-    oneshot::Receiver<u32>,
+    oneshot::Receiver<ScriptedTcpDatagramEmission>,
     tokio::task::JoinHandle<Result<(), RuntimeError>>,
 ) {
     let path = reserve_tcp_path().await;
@@ -1537,15 +1545,40 @@ async fn spawn_scripted_tcp_datagram_path(
                     ttl_ms,
                     ..
                 } => {
-                    let _ = ttl_tx.send(ttl_ms);
+                    let _ = ttl_tx.send(ScriptedTcpDatagramEmission {
+                        ttl_ms,
+                        received_at: Instant::now(),
+                    });
                     match action {
                         ScriptedTcpDatagramAction::CloseBeforeFeedback => return Ok(()),
+                        ScriptedTcpDatagramAction::HoldWithoutFeedback => {
+                            tokio::time::sleep(Duration::from_secs(2)).await;
+                            return Ok(());
+                        }
+                        ScriptedTcpDatagramAction::FeedbackThenRespond => {
+                            framed
+                                .write_frames(&[
+                                    Frame::DatagramFeedback {
+                                        flow_id,
+                                        received: vec![datagram_feedback_range(datagram_id)?],
+                                    },
+                                    Frame::DatagramData {
+                                        flow_id,
+                                        datagram_id,
+                                        ttl_ms,
+                                        payload: Bytes::from_static(b"pong"),
+                                    },
+                                ])
+                                .await?;
+                            framed.flush().await?;
+                            return Ok(());
+                        }
                         ScriptedTcpDatagramAction::FeedbackThenClose
                         | ScriptedTcpDatagramAction::FeedbackThenHold => {
                             framed
                                 .write_frame(&Frame::DatagramFeedback {
                                     flow_id,
-                                    received: vec![datagram_ack_range(datagram_id)?],
+                                    received: vec![datagram_feedback_range(datagram_id)?],
                                 })
                                 .await?;
                             framed.flush().await?;
@@ -1789,7 +1822,7 @@ async fn tcp_datagram_feedback_then_carrier_close_does_not_replay() {
         )
         .await;
     assert!(result.is_err());
-    assert!(ttl_rx.await.expect("scripted emission") > 0);
+    assert!(ttl_rx.await.expect("scripted emission").ttl_ms > 0);
     scripted
         .await
         .expect("scripted join")
@@ -1799,8 +1832,148 @@ async fn tcp_datagram_feedback_then_carrier_close_does_not_replay() {
         tokio::time::timeout(Duration::from_millis(150), target.recv_from(&mut packet))
             .await
             .is_err(),
-        "an acknowledged request must not be emitted on the fallback path"
+        "a request with admission feedback must not be emitted on the fallback path"
     );
+    fallback.abort();
+    let _ = fallback.await;
+}
+
+#[tokio::test]
+async fn tcp_datagram_no_feedback_releases_an_alternative_after_one_response_timeout() {
+    let target = UdpSocket::bind("127.0.0.1:0").await.expect("target bind");
+    let target_addr = target.local_addr().expect("target address");
+    let (mut first_path, first_emission, first) = spawn_scripted_tcp_datagram_path(
+        Duration::ZERO,
+        ScriptedTcpDatagramAction::HoldWithoutFeedback,
+    )
+    .await;
+    first_path.metadata.initial_srtt_ms = Some(200);
+    first_path.metadata.initial_jitter_ms = Some(25);
+    first_path.metadata.initial_rate = RateHint::BitsPerSecond(100_000_000);
+    let (mut fallback_path, fallback_emission, fallback) = spawn_scripted_tcp_datagram_path(
+        Duration::ZERO,
+        ScriptedTcpDatagramAction::FeedbackThenRespond,
+    )
+    .await;
+    fallback_path.metadata.initial_srtt_ms = Some(400);
+    fallback_path.metadata.initial_jitter_ms = Some(50);
+    fallback_path.metadata.initial_rate = RateHint::BitsPerSecond(100_000_000);
+    let context = ClientPathContext::new(
+        vec![first_path, fallback_path],
+        security(),
+        ResourceLimits::default(),
+    )
+    .expect("context");
+    let ttl_ms = 2_500;
+    let response_timeout = tcp_datagram_response_timeout(
+        context.tcp_path_snapshot(0).expect("first path snapshot"),
+        None,
+        None,
+        ttl_ms,
+    );
+    assert_eq!(
+        context.ordered_tcp_path_indices(TrafficClass::RealtimeDatagram, 4),
+        vec![0, 1]
+    );
+    let mut association = DatagramClientAssociation::new(context)
+        .await
+        .expect("association");
+
+    let response = association
+        .send_to_fresh_datagram_with_route_hint(
+            TargetAddr::Ip(target_addr),
+            Bytes::from_static(b"ping"),
+            ttl_ms,
+            None,
+        )
+        .await
+        .expect("fallback response");
+    assert_eq!(response, Bytes::from_static(b"pong"));
+    let emission = first_emission.await.expect("first emission");
+    let fallback_emission = fallback_emission.await.expect("fallback emission");
+    let elapsed_after_emission = fallback_emission
+        .received_at
+        .duration_since(emission.received_at);
+    assert!(
+        elapsed_after_emission + Duration::from_millis(100) >= response_timeout,
+        "fallback occurred before the modeled response timeout: elapsed={elapsed_after_emission:?} model={response_timeout:?}"
+    );
+    assert!(
+        elapsed_after_emission < response_timeout.saturating_mul(2),
+        "fallback retained the final-attempt tolerance budget: elapsed={elapsed_after_emission:?} model={response_timeout:?}"
+    );
+
+    drop(association);
+    first.abort();
+    let _ = first.await;
+    fallback
+        .await
+        .expect("fallback join")
+        .expect("fallback path");
+}
+
+#[tokio::test]
+async fn tcp_datagram_feedback_extends_wait_to_product_ttl_without_replay() {
+    let target = UdpSocket::bind("127.0.0.1:0").await.expect("target bind");
+    let target_addr = target.local_addr().expect("target address");
+    let (mut first_path, first_emission, first) = spawn_scripted_tcp_datagram_path(
+        Duration::ZERO,
+        ScriptedTcpDatagramAction::FeedbackThenHold,
+    )
+    .await;
+    first_path.metadata.initial_srtt_ms = Some(50);
+    first_path.metadata.initial_jitter_ms = Some(10);
+    first_path.metadata.initial_rate = RateHint::BitsPerSecond(100_000_000);
+    let (mut fallback_path, fallback) = spawn_server_path(OutboundConfig::Direct).await;
+    fallback_path.metadata.initial_srtt_ms = Some(400);
+    fallback_path.metadata.initial_jitter_ms = Some(50);
+    fallback_path.metadata.initial_rate = RateHint::BitsPerSecond(100_000_000);
+    let context = ClientPathContext::new(
+        vec![first_path, fallback_path],
+        security(),
+        ResourceLimits::default(),
+    )
+    .expect("context");
+    let ttl_ms = 900;
+    let response_timeout = tcp_datagram_response_timeout(
+        context.tcp_path_snapshot(0).expect("first path snapshot"),
+        None,
+        None,
+        ttl_ms,
+    );
+    let mut association = DatagramClientAssociation::new(context)
+        .await
+        .expect("association");
+
+    let result = association
+        .send_to_fresh_datagram_with_route_hint(
+            TargetAddr::Ip(target_addr),
+            Bytes::from_static(b"ping"),
+            ttl_ms,
+            None,
+        )
+        .await;
+    assert!(result.is_err());
+    let emission = first_emission.await.expect("first emission");
+    let elapsed_after_emission = emission.received_at.elapsed();
+    assert!(
+        elapsed_after_emission > response_timeout.saturating_mul(3),
+        "admission feedback did not extend response waiting beyond the attempt budget: elapsed={elapsed_after_emission:?} model={response_timeout:?}"
+    );
+    assert!(
+        elapsed_after_emission >= Duration::from_millis(650),
+        "admission feedback did not preserve the original product TTL: {elapsed_after_emission:?}"
+    );
+    let mut packet = [0u8; 16];
+    assert!(
+        tokio::time::timeout(Duration::from_millis(100), target.recv_from(&mut packet))
+            .await
+            .is_err(),
+        "a request with admission feedback must not be replayed"
+    );
+
+    first.abort();
+    let _ = first.await;
     fallback.abort();
     let _ = fallback.await;
 }
@@ -1842,8 +2015,8 @@ async fn tcp_datagram_runtime_fallback_emits_at_most_twice() {
         )
         .await;
     assert!(result.is_err());
-    assert!(first_ttl.await.expect("first emission") > 0);
-    assert!(second_ttl.await.expect("second emission") > 0);
+    assert!(first_ttl.await.expect("first emission").ttl_ms > 0);
+    assert!(second_ttl.await.expect("second emission").ttl_ms > 0);
     first.await.expect("first join").expect("first path");
     second.await.expect("second join").expect("second path");
     let mut packet = [0u8; 16];
@@ -1942,7 +2115,7 @@ async fn tcp_datagram_setup_consumes_the_original_absolute_ttl() {
         )
         .await;
     assert!(result.is_err());
-    let emitted_ttl = ttl_rx.await.expect("emitted TTL");
+    let emitted_ttl = ttl_rx.await.expect("emitted TTL").ttl_ms;
     assert!(
         emitted_ttl < 850,
         "carrier setup must be deducted from DGRAM_DATA TTL, got {emitted_ttl} ms"

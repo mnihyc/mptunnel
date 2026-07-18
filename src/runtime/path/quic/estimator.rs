@@ -47,6 +47,8 @@ struct QuicPathMetricTracker {
     delivery_sample_bytes: u64,
     last_delivery_sample_at: Option<Instant>,
     bulk_proof_expires_at: Option<Instant>,
+    #[cfg(feature = "lab-diagnostics")]
+    last_lost_bytes: Option<u64>,
 }
 
 impl UdpPathConnection {
@@ -102,6 +104,14 @@ impl QuicPathMetricTracker {
             .delivery_evidence_written_bytes
             .saturating_sub(self.last_delivery_evidence_written_bytes);
         self.last_delivery_evidence_written_bytes = congestion.delivery_evidence_written_bytes;
+        #[cfg(feature = "lab-diagnostics")]
+        let newly_lost_bytes = {
+            let delta = self
+                .last_lost_bytes
+                .map_or(0, |previous| congestion.lost_bytes.saturating_sub(previous));
+            self.last_lost_bytes = Some(congestion.lost_bytes);
+            delta
+        };
         self.delivery_evidence_pending_ack_bytes = self
             .delivery_evidence_pending_ack_bytes
             .saturating_add(delivery_evidence_delta);
@@ -353,6 +363,7 @@ impl QuicPathMetricTracker {
             latest_rate_sample_elapsed,
             #[cfg(feature = "lab-diagnostics")]
             ack_poll: QuicAckPollDiagnostics {
+                newly_lost_bytes,
                 newly_acked_bytes,
                 non_app_limited_acked_bytes,
                 timed_non_app_limited_acked_bytes,

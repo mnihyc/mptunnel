@@ -65,6 +65,7 @@ fn parser_exposes_only_counter_groups_present_in_the_returned_prefix() {
 
     let pacing = parse_tcp_info_prefix(&bytes, 112).expect("pacing prefix");
     assert_eq!(pacing.pacing_rate_bytes_per_second, Some(10_000_000));
+    assert_eq!(pacing.retransmission_counter, Some(7));
     assert_eq!(pacing.bytes_acked, None);
 
     let acked = parse_tcp_info_prefix(&bytes, 128).expect("ACK prefix");
@@ -91,6 +92,7 @@ fn parser_exposes_only_counter_groups_present_in_the_returned_prefix() {
     assert_eq!(parsed.rtt.expect("RTT group").srtt_us, 20_000);
     assert_eq!(parsed.pacing_rate_bytes_per_second, Some(10_000_000));
     assert_eq!(parsed.bytes_acked, Some(123_456));
+    assert_eq!(parsed.retransmission_counter, Some(7));
     assert_eq!(parsed.delivery_rate_bytes_per_second, Some(8_000_000));
 }
 

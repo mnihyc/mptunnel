@@ -4,7 +4,7 @@ use super::policy::{
     DatagramPathSendError, datagram_remaining_ttl_ms, datagram_response_deadline_budget,
 };
 use super::tcp::tcp_datagram_response_timeout;
-use super::{DatagramClientFlow, SentDatagram, datagram_ack_range, datagram_id_is_in_ranges};
+use super::{DatagramClientFlow, SentDatagram, datagram_feedback_range, datagram_id_is_in_ranges};
 use crate::model::capacity::TRANSPORT_TIMER_GRANULARITY;
 use crate::mux::MuxLimits;
 use crate::mux::datagram::DatagramFlow;
@@ -98,6 +98,7 @@ impl TcpDatagramClientSession {
         payload: Bytes,
         fallback_deadline: tokio::time::Instant,
         product_deadline: tokio::time::Instant,
+        has_unattempted_alternative: bool,
     ) -> Result<Bytes, DatagramPathSendError> {
         if payload.len() > self.mux_limits.max_payload_bytes {
             return Err(DatagramPathSendError::PayloadLimitExceeded {
@@ -114,7 +115,7 @@ impl TcpDatagramClientSession {
             Err(_) => {
                 self.connection_usable = false;
                 return Err(DatagramPathSendError::Timeout {
-                    path_was_acked: false,
+                    feedback_received: false,
                     response_timeout: Duration::ZERO,
                 });
             }
@@ -122,7 +123,7 @@ impl TcpDatagramClientSession {
         let ttl_ms = datagram_remaining_ttl_ms(product_deadline);
         if ttl_ms == 0 {
             return Err(DatagramPathSendError::Timeout {
-                path_was_acked: false,
+                feedback_received: false,
                 response_timeout: Duration::ZERO,
             });
         }
@@ -163,10 +164,13 @@ impl TcpDatagramClientSession {
         };
         let request_key = (flow_id, request_datagram_id);
         let sent_at = Instant::now();
-        let mut request_acked = false;
-        let response_budget = datagram_response_deadline_budget(response_timeout, ttl_ms)
-            .max(response_timeout)
-            .min(fallback_deadline.saturating_duration_since(tokio::time::Instant::now()));
+        let mut feedback_received = false;
+        let response_budget = datagram_response_deadline_budget(
+            response_timeout,
+            ttl_ms,
+            has_unattempted_alternative,
+        )
+        .min(fallback_deadline.saturating_duration_since(tokio::time::Instant::now()));
         let mut response_deadline = sent_at + response_budget;
         let product_response_deadline = product_deadline.into_std();
         self.sent_datagrams.insert(
@@ -193,7 +197,7 @@ impl TcpDatagramClientSession {
                 self.sent_datagrams.remove(&request_key);
                 self.connection_usable = false;
                 return Err(DatagramPathSendError::Timeout {
-                    path_was_acked: false,
+                    feedback_received: false,
                     response_timeout,
                 });
             }
@@ -206,18 +210,18 @@ impl TcpDatagramClientSession {
                 lab_diagnostic(
                     "tcp_datagram_response_timeout",
                     format_args!(
-                        "path_id={} path_index={} flow_id={} datagram_id={} response_timeout_ms={} response_budget_ms={} request_acked={}",
+                        "path_id={} path_index={} flow_id={} datagram_id={} response_timeout_ms={} response_budget_ms={} feedback_received={}",
                         self.path_id.0,
                         self.path_index,
                         flow_id.0,
                         request_datagram_id.0,
                         response_timeout.as_millis(),
                         response_budget.as_millis(),
-                        request_acked,
+                        feedback_received,
                     ),
                 );
                 return Err(DatagramPathSendError::Timeout {
-                    path_was_acked: request_acked,
+                    feedback_received,
                     response_timeout,
                 });
             }
@@ -228,13 +232,13 @@ impl TcpDatagramClientSession {
                 Ok(Some(Err(err))) => {
                     return Err(DatagramPathSendError::runtime(
                         RuntimeError::Encrypted(err),
-                        request_acked,
+                        feedback_received,
                     ));
                 }
                 Ok(None) => {
                     return Err(DatagramPathSendError::runtime(
                         RuntimeError::ReliablePathSessionClosed,
-                        request_acked,
+                        feedback_received,
                     ));
                 }
                 Err(_) => {
@@ -243,18 +247,18 @@ impl TcpDatagramClientSession {
                     lab_diagnostic(
                         "tcp_datagram_response_timeout",
                         format_args!(
-                            "path_id={} path_index={} flow_id={} datagram_id={} response_timeout_ms={} response_budget_ms={} request_acked={}",
+                            "path_id={} path_index={} flow_id={} datagram_id={} response_timeout_ms={} response_budget_ms={} feedback_received={}",
                             self.path_id.0,
                             self.path_index,
                             flow_id.0,
                             request_datagram_id.0,
                             response_timeout.as_millis(),
                             response_budget.as_millis(),
-                            request_acked,
+                            feedback_received,
                         ),
                     );
                     return Err(DatagramPathSendError::Timeout {
-                        path_was_acked: request_acked,
+                        feedback_received,
                         response_timeout,
                     });
                 }
@@ -265,11 +269,11 @@ impl TcpDatagramClientSession {
                     if flow_id == request_key.0
                         && datagram_id_is_in_ranges(request_datagram_id, &received)
                     {
-                        request_acked = true;
+                        feedback_received = true;
                         response_deadline = product_response_deadline;
                     }
                     self.handle_datagram_feedback(flow_id, &received)
-                        .map_err(|err| DatagramPathSendError::runtime(err, request_acked))?;
+                        .map_err(|err| DatagramPathSendError::runtime(err, feedback_received))?;
                 }
                 Frame::DatagramData {
                     flow_id: response_flow_id,
@@ -278,14 +282,14 @@ impl TcpDatagramClientSession {
                     ..
                 } if response_flow_id == flow_id && datagram_id == request_datagram_id => {
                     let now = Instant::now();
-                    let lost = self.expire_unacked_datagrams(now);
+                    let lost = self.expire_datagrams_without_feedback(now);
                     if let Some(sent) = self.sent_datagrams.remove(&request_key) {
                         self.observe_datagram_response(sent, now, lost);
                     }
                     let feedback = Frame::DatagramFeedback {
                         flow_id,
                         received: vec![
-                            datagram_ack_range(datagram_id)
+                            datagram_feedback_range(datagram_id)
                                 .map_err(|err| DatagramPathSendError::runtime(err, true))?,
                         ],
                     };
@@ -308,18 +312,17 @@ impl TcpDatagramClientSession {
                     datagram_id,
                     ..
                 } if response_flow_id == flow_id => {
-                    let feedback =
-                        Frame::DatagramFeedback {
-                            flow_id,
-                            received: vec![datagram_ack_range(datagram_id).map_err(|err| {
-                                DatagramPathSendError::runtime(err, request_acked)
-                            })?],
-                        };
+                    let feedback = Frame::DatagramFeedback {
+                        flow_id,
+                        received: vec![datagram_feedback_range(datagram_id).map_err(|err| {
+                            DatagramPathSendError::runtime(err, feedback_received)
+                        })?],
+                    };
                     let send_feedback = async {
                         self.connection.writer.write_frame(&feedback).await?;
                         self.connection.writer.flush().await
                     };
-                    let io_deadline = if request_acked {
+                    let io_deadline = if feedback_received {
                         product_deadline
                     } else {
                         fallback_deadline
@@ -329,13 +332,13 @@ impl TcpDatagramClientSession {
                         Ok(Err(err)) => {
                             return Err(DatagramPathSendError::runtime(
                                 RuntimeError::Encrypted(err),
-                                request_acked,
+                                feedback_received,
                             ));
                         }
                         Err(_) => {
                             self.connection_usable = false;
                             return Err(DatagramPathSendError::Timeout {
-                                path_was_acked: request_acked,
+                                feedback_received,
                                 response_timeout,
                             });
                         }
@@ -346,7 +349,7 @@ impl TcpDatagramClientSession {
                 } if closed_flow_id == flow_id => {
                     return Err(DatagramPathSendError::runtime(
                         RuntimeError::Protocol("TCP datagram flow closed"),
-                        request_acked,
+                        feedback_received,
                     ));
                 }
                 Frame::Ping { nonce } => {
@@ -357,7 +360,7 @@ impl TcpDatagramClientSession {
                             .await?;
                         self.connection.writer.flush().await
                     };
-                    let io_deadline = if request_acked {
+                    let io_deadline = if feedback_received {
                         product_deadline
                     } else {
                         fallback_deadline
@@ -367,13 +370,13 @@ impl TcpDatagramClientSession {
                         Ok(Err(err)) => {
                             return Err(DatagramPathSendError::runtime(
                                 RuntimeError::Encrypted(err),
-                                request_acked,
+                                feedback_received,
                             ));
                         }
                         Err(_) => {
                             self.connection_usable = false;
                             return Err(DatagramPathSendError::Timeout {
-                                path_was_acked: request_acked,
+                                feedback_received,
                                 response_timeout,
                             });
                         }
@@ -395,25 +398,25 @@ impl TcpDatagramClientSession {
                         &mut self.peer_usage_sequence,
                         &mut self.path_snapshot,
                     )
-                    .map_err(|err| DatagramPathSendError::runtime(err, request_acked))?;
+                    .map_err(|err| DatagramPathSendError::runtime(err, feedback_received))?;
                 }
                 Frame::SessionReady => {}
                 Frame::PathClose { .. } => {
                     return Err(DatagramPathSendError::runtime(
                         RuntimeError::ReliablePathSessionClosed,
-                        request_acked,
+                        feedback_received,
                     ));
                 }
                 Frame::SessionClose { reason } => {
                     return Err(DatagramPathSendError::runtime(
                         RuntimeError::RemoteClosed(reason),
-                        request_acked,
+                        feedback_received,
                     ));
                 }
                 _ => {
                     return Err(DatagramPathSendError::runtime(
                         RuntimeError::Protocol("unexpected TCP datagram frame"),
-                        request_acked,
+                        feedback_received,
                     ));
                 }
             }
@@ -477,8 +480,8 @@ impl TcpDatagramClientSession {
         ranges: &[OffsetRange],
     ) -> Result<(), RuntimeError> {
         let now = Instant::now();
-        self.expire_unacked_datagrams(now);
-        let acked_keys = self
+        self.expire_datagrams_without_feedback(now);
+        let feedback_keys = self
             .sent_datagrams
             .keys()
             .copied()
@@ -486,7 +489,7 @@ impl TcpDatagramClientSession {
                 *pending_flow_id == flow_id && datagram_id_is_in_ranges(*datagram_id, ranges)
             })
             .collect::<Vec<_>>();
-        for key in acked_keys {
+        for key in feedback_keys {
             if let Some(sent) = self.sent_datagrams.remove(&key) {
                 self.observe_datagram_response(sent, now, 0);
             }
@@ -494,7 +497,7 @@ impl TcpDatagramClientSession {
         Ok(())
     }
 
-    fn expire_unacked_datagrams(&mut self, now: Instant) -> u64 {
+    fn expire_datagrams_without_feedback(&mut self, now: Instant) -> u64 {
         let expired = self
             .sent_datagrams
             .iter()

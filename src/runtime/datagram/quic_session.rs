@@ -3,7 +3,7 @@
 use super::policy::{
     DatagramPathSendError, datagram_remaining_ttl_ms, datagram_response_deadline_budget,
 };
-use super::{DatagramClientFlow, SentDatagram, datagram_ack_range, datagram_id_is_in_ranges};
+use super::{DatagramClientFlow, SentDatagram, datagram_feedback_range, datagram_id_is_in_ranges};
 use crate::config::SecurityConfig;
 use crate::model::capacity::{PathRateSample, QUIC_TIMER_GRANULARITY};
 use crate::model::path::CarrierPathInstanceId;
@@ -165,6 +165,7 @@ impl UdpDatagramClientSession {
         fallback_deadline: tokio::time::Instant,
         product_deadline: tokio::time::Instant,
         response_timeout: Duration,
+        has_unattempted_alternative: bool,
     ) -> Result<Bytes, DatagramPathSendError> {
         let flow_id =
             match tokio::time::timeout_at(fallback_deadline, self.ensure_flow(target)).await {
@@ -172,7 +173,7 @@ impl UdpDatagramClientSession {
                 Ok(Err(err)) => return Err(DatagramPathSendError::runtime(err, false)),
                 Err(_) => {
                     return Err(DatagramPathSendError::Timeout {
-                        path_was_acked: false,
+                        feedback_received: false,
                         response_timeout,
                     });
                 }
@@ -180,7 +181,7 @@ impl UdpDatagramClientSession {
         let ttl_ms = datagram_remaining_ttl_ms(product_deadline);
         if ttl_ms == 0 {
             return Err(DatagramPathSendError::Timeout {
-                path_was_acked: false,
+                feedback_received: false,
                 response_timeout,
             });
         }
@@ -221,9 +222,13 @@ impl UdpDatagramClientSession {
         let request_key = (flow_id, request_datagram_id);
         self.last_feedback_observation = None;
         let request_started_at = Instant::now();
-        let mut request_acked = false;
-        let response_budget = datagram_response_deadline_budget(response_timeout, ttl_ms)
-            .min(fallback_deadline.saturating_duration_since(tokio::time::Instant::now()));
+        let mut feedback_received = false;
+        let response_budget = datagram_response_deadline_budget(
+            response_timeout,
+            ttl_ms,
+            has_unattempted_alternative,
+        )
+        .min(fallback_deadline.saturating_duration_since(tokio::time::Instant::now()));
         let mut response_deadline = request_started_at + response_budget;
         let product_response_deadline = product_deadline.into_std();
 
@@ -250,7 +255,7 @@ impl UdpDatagramClientSession {
             Err(_) => {
                 self.sent_datagrams.remove(&request_key);
                 return Err(DatagramPathSendError::Timeout {
-                    path_was_acked: false,
+                    feedback_received: false,
                     response_timeout,
                 });
             }
@@ -263,19 +268,19 @@ impl UdpDatagramClientSession {
                 lab_diagnostic(
                     "udp_datagram_response_timeout",
                     format_args!(
-                        "path_id={} path_index={} flow_id={} datagram_id={} response_timeout_ms={} response_budget_ms={} request_acked={}",
+                        "path_id={} path_index={} flow_id={} datagram_id={} response_timeout_ms={} response_budget_ms={} feedback_received={}",
                         self.path_id.0,
                         self.path_index,
                         flow_id.0,
                         request_datagram_id.0,
                         response_timeout.as_millis(),
                         response_budget.as_millis(),
-                        request_acked,
+                        feedback_received,
                     ),
                 );
                 self.sent_datagrams.remove(&request_key);
                 return Err(DatagramPathSendError::Timeout {
-                    path_was_acked: request_acked,
+                    feedback_received,
                     response_timeout,
                 });
             }
@@ -283,12 +288,12 @@ impl UdpDatagramClientSession {
             let received = match tokio::time::timeout(wait_for, self.stream.frames.recv()).await {
                 Ok(Some(Ok(frame))) => frame,
                 Ok(Some(Err(err))) => {
-                    return Err(DatagramPathSendError::runtime(err, request_acked));
+                    return Err(DatagramPathSendError::runtime(err, feedback_received));
                 }
                 Ok(None) => {
                     return Err(DatagramPathSendError::runtime(
                         RuntimeError::ReliablePathSessionClosed,
-                        request_acked,
+                        feedback_received,
                     ));
                 }
                 Err(_) => {
@@ -296,19 +301,19 @@ impl UdpDatagramClientSession {
                     lab_diagnostic(
                         "udp_datagram_response_timeout",
                         format_args!(
-                            "path_id={} path_index={} flow_id={} datagram_id={} response_timeout_ms={} response_budget_ms={} request_acked={}",
+                            "path_id={} path_index={} flow_id={} datagram_id={} response_timeout_ms={} response_budget_ms={} feedback_received={}",
                             self.path_id.0,
                             self.path_index,
                             flow_id.0,
                             request_datagram_id.0,
                             response_timeout.as_millis(),
                             response_budget.as_millis(),
-                            request_acked,
+                            feedback_received,
                         ),
                     );
                     self.sent_datagrams.remove(&request_key);
                     return Err(DatagramPathSendError::Timeout {
-                        path_was_acked: request_acked,
+                        feedback_received,
                         response_timeout,
                     });
                 }
@@ -318,11 +323,11 @@ impl UdpDatagramClientSession {
                     if flow_id == request_key.0
                         && datagram_id_is_in_ranges(request_datagram_id, &received)
                     {
-                        request_acked = true;
+                        feedback_received = true;
                         response_deadline = product_response_deadline;
                     }
                     self.handle_datagram_feedback(flow_id, &received)
-                        .map_err(|err| DatagramPathSendError::runtime(err, request_acked))?;
+                        .map_err(|err| DatagramPathSendError::runtime(err, feedback_received))?;
                 }
                 Frame::DatagramData {
                     flow_id: response_flow_id,
@@ -330,14 +335,14 @@ impl UdpDatagramClientSession {
                     payload,
                     ..
                 } if response_flow_id == flow_id && datagram_id == request_datagram_id => {
-                    let request_ack = datagram_ack_range(request_datagram_id)
+                    let request_feedback_range = datagram_feedback_range(request_datagram_id)
                         .map_err(|err| DatagramPathSendError::runtime(err, true))?;
-                    self.handle_datagram_feedback(flow_id, &[request_ack])
+                    self.handle_datagram_feedback(flow_id, &[request_feedback_range])
                         .map_err(|err| DatagramPathSendError::runtime(err, true))?;
                     let feedback = Frame::DatagramFeedback {
                         flow_id,
                         received: vec![
-                            datagram_ack_range(datagram_id)
+                            datagram_feedback_range(datagram_id)
                                 .map_err(|err| DatagramPathSendError::runtime(err, true))?,
                         ],
                     };
@@ -364,14 +369,13 @@ impl UdpDatagramClientSession {
                     datagram_id,
                     ..
                 } if response_flow_id == flow_id => {
-                    let feedback =
-                        Frame::DatagramFeedback {
-                            flow_id,
-                            received: vec![datagram_ack_range(datagram_id).map_err(|err| {
-                                DatagramPathSendError::runtime(err, request_acked)
-                            })?],
-                        };
-                    let io_deadline = if request_acked {
+                    let feedback = Frame::DatagramFeedback {
+                        flow_id,
+                        received: vec![datagram_feedback_range(datagram_id).map_err(|err| {
+                            DatagramPathSendError::runtime(err, feedback_received)
+                        })?],
+                    };
+                    let io_deadline = if feedback_received {
                         product_deadline
                     } else {
                         fallback_deadline
@@ -388,11 +392,11 @@ impl UdpDatagramClientSession {
                     {
                         Ok(Ok(())) => {}
                         Ok(Err(err)) => {
-                            return Err(DatagramPathSendError::runtime(err, request_acked));
+                            return Err(DatagramPathSendError::runtime(err, feedback_received));
                         }
                         Err(_) => {
                             return Err(DatagramPathSendError::Timeout {
-                                path_was_acked: request_acked,
+                                feedback_received,
                                 response_timeout,
                             });
                         }
@@ -415,7 +419,7 @@ impl UdpDatagramClientSession {
                         sequence,
                         usage,
                     )
-                    .map_err(|err| DatagramPathSendError::runtime(err, request_acked))?;
+                    .map_err(|err| DatagramPathSendError::runtime(err, feedback_received))?;
                 }
                 Frame::SessionReady => {}
                 Frame::DatagramClose {
@@ -423,19 +427,19 @@ impl UdpDatagramClientSession {
                 } if closed_flow_id == flow_id => {
                     return Err(DatagramPathSendError::runtime(
                         RuntimeError::Protocol("datagram flow closed"),
-                        request_acked,
+                        feedback_received,
                     ));
                 }
                 Frame::SessionClose { reason } => {
                     return Err(DatagramPathSendError::runtime(
                         RuntimeError::RemoteClosed(reason),
-                        request_acked,
+                        feedback_received,
                     ));
                 }
                 _ => {
                     return Err(DatagramPathSendError::runtime(
                         RuntimeError::Protocol("unexpected UDP datagram frame"),
-                        request_acked,
+                        feedback_received,
                     ));
                 }
             }
@@ -552,8 +556,8 @@ impl UdpDatagramClientSession {
         ranges: &[OffsetRange],
     ) -> Result<(), RuntimeError> {
         let now = Instant::now();
-        let lost = self.expire_unacked_datagrams(now);
-        let acked_keys = self
+        let lost = self.expire_datagrams_without_feedback(now);
+        let feedback_keys = self
             .sent_datagrams
             .keys()
             .copied()
@@ -562,9 +566,9 @@ impl UdpDatagramClientSession {
             })
             .collect::<Vec<_>>();
 
-        for key in acked_keys {
+        for key in feedback_keys {
             if let Some(sent) = self.sent_datagrams.remove(&key) {
-                self.observe_datagram_ack(sent, now, lost);
+                self.observe_datagram_feedback(sent, now, lost);
             }
         }
         Ok(())
@@ -586,7 +590,7 @@ impl UdpDatagramClientSession {
         });
     }
 
-    fn expire_unacked_datagrams(&mut self, now: Instant) -> u64 {
+    fn expire_datagrams_without_feedback(&mut self, now: Instant) -> u64 {
         let expired = self
             .sent_datagrams
             .iter()
@@ -601,7 +605,7 @@ impl UdpDatagramClientSession {
         lost
     }
 
-    fn observe_datagram_ack(&mut self, sent: SentDatagram, now: Instant, lost: u64) {
+    fn observe_datagram_feedback(&mut self, sent: SentDatagram, now: Instant, lost: u64) {
         let rtt = now.duration_since(sent.sent_at).max(QUIC_TIMER_GRANULARITY);
         let jitter = self
             .last_datagram_rtt

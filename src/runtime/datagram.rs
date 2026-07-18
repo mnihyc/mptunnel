@@ -6,7 +6,7 @@ use crate::model::timing::default_transport_pto;
 use crate::mux::MuxLimits;
 use crate::mux::datagram::{DatagramError, DatagramFlow};
 use crate::protocol::codec::CodecLimits;
-use crate::protocol::frame::datagram_ack_range as protocol_datagram_ack_range;
+use crate::protocol::frame::datagram_feedback_range as protocol_datagram_feedback_range;
 use crate::protocol::{DatagramFlowId, DatagramId, OffsetRange, TargetAddr};
 use crate::transport::{CarrierNetworkProvider, PathSpec, SystemCarrierNetworkProvider};
 use bytes::Bytes;
@@ -71,11 +71,11 @@ pub(super) struct SentDatagram {
     pub(super) ttl: Duration,
 }
 
-pub(in crate::runtime) fn datagram_ack_range(
+pub(in crate::runtime) fn datagram_feedback_range(
     datagram_id: DatagramId,
 ) -> Result<OffsetRange, RuntimeError> {
-    protocol_datagram_ack_range(datagram_id)
-        .ok_or(RuntimeError::Protocol("datagram ACK range overflow"))
+    protocol_datagram_feedback_range(datagram_id)
+        .ok_or(RuntimeError::Protocol("datagram feedback range overflow"))
 }
 
 pub(super) fn datagram_id_is_in_ranges(datagram_id: DatagramId, ranges: &[OffsetRange]) -> bool {
@@ -171,6 +171,7 @@ async fn client_udp_datagram_round_trip_with_limits(
             product_deadline,
             product_deadline,
             default_transport_pto().min(Duration::from_millis(u64::from(ttl_ms))),
+            false,
         )
         .await
         .map_err(|err| match err {

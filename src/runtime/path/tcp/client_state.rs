@@ -111,13 +111,27 @@ impl ClientTcpPathSessionRuntime {
         {
             let bytes_in_flight = observation.bytes_in_flight().unwrap_or(0);
             let inflight_limit_bytes = observation.inflight_limit_bytes().unwrap_or(0);
+            if observation.retransmission_advanced() == Some(true) {
+                lab_diagnostic(
+                    "tcp_native_retransmission",
+                    format_args!(
+                        "session_id={} path_index={} path_instance_id={} direction={:?}",
+                        self.session_id.0,
+                        self.path_index,
+                        connection.path_instance_id.as_u64(),
+                        observation.direction(),
+                    ),
+                );
+            }
             lab_diagnostic(
                 "tcp_sender_metrics",
                 format_args!(
-                    "path_index={} newly_acked_bytes={} acked_bytes_since_epoch={} delivery_rate_mbps={:.3} pacing_rate_mbps={:.3} bytes_in_flight={} inflight_limit={} queue_bytes={} app_limited={}",
+                    "path_index={} path_instance_id={} newly_acked_bytes={} acked_bytes_since_epoch={} retransmission_advanced={:?} delivery_rate_mbps={:.3} pacing_rate_mbps={:.3} bytes_in_flight={} inflight_limit={} queue_bytes={} app_limited={}",
                     self.path_index,
+                    connection.path_instance_id.as_u64(),
                     observation.newly_acked_bytes().unwrap_or(0),
                     observation.acked_bytes_since_epoch().unwrap_or(0),
+                    observation.retransmission_advanced(),
                     observation.delivery_rate_bps().unwrap_or(0) as f64 / 1_000_000.0,
                     observation.pacing_rate_bps().unwrap_or(0) as f64 / 1_000_000.0,
                     bytes_in_flight,

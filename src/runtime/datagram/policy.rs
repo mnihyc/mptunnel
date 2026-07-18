@@ -7,6 +7,7 @@ use std::time::Duration;
 pub(in crate::runtime) fn datagram_response_deadline_budget(
     response_timeout: Duration,
     ttl_ms: u32,
+    has_unattempted_alternative: bool,
 ) -> Duration {
     let ttl_budget = datagram_useful_ttl_budget(ttl_ms);
     if ttl_budget.is_zero() {
@@ -15,9 +16,15 @@ pub(in crate::runtime) fn datagram_response_deadline_budget(
     let response_timeout = response_timeout
         .max(TRANSPORT_TIMER_GRANULARITY)
         .min(ttl_budget);
-    response_timeout
-        .saturating_mul(DATAGRAM_RESPONSE_DEADLINE_MULTIPLIER)
-        .min(ttl_budget)
+    if has_unattempted_alternative {
+        // One modeled pre-feedback response timeout leaves the remaining product
+        // deadline for another path. The final attempt keeps the larger budget.
+        response_timeout
+    } else {
+        response_timeout
+            .saturating_mul(DATAGRAM_RESPONSE_DEADLINE_MULTIPLIER)
+            .min(ttl_budget)
+    }
 }
 
 fn datagram_useful_ttl_budget(ttl_ms: u32) -> Duration {
@@ -41,19 +48,19 @@ pub(in crate::runtime) enum DatagramPathSendError {
         limit: usize,
     },
     Timeout {
-        path_was_acked: bool,
+        feedback_received: bool,
         response_timeout: Duration,
     },
     Runtime {
-        path_was_acked: bool,
+        feedback_received: bool,
         source: RuntimeError,
     },
 }
 
 impl DatagramPathSendError {
-    pub(in crate::runtime) fn runtime(source: RuntimeError, path_was_acked: bool) -> Self {
+    pub(in crate::runtime) fn runtime(source: RuntimeError, feedback_received: bool) -> Self {
         Self::Runtime {
-            path_was_acked,
+            feedback_received,
             source,
         }
     }
@@ -66,10 +73,10 @@ pub(in crate::runtime) enum DatagramTimeoutAction {
 }
 
 pub(in crate::runtime) fn datagram_timeout_action(
-    path_was_acked: bool,
+    feedback_received: bool,
     has_unattempted_alternative: bool,
 ) -> DatagramTimeoutAction {
-    if !path_was_acked && has_unattempted_alternative {
+    if !feedback_received && has_unattempted_alternative {
         DatagramTimeoutAction::RetryAlternative
     } else {
         DatagramTimeoutAction::TerminalProductExpiry

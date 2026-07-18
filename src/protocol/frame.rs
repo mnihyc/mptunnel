@@ -5,8 +5,8 @@
 
 use crate::protocol::{DatagramId, Frame, OffsetRange};
 
-/// Maps one datagram identity to its single-item acknowledgement range.
-pub(crate) fn datagram_ack_range(datagram_id: DatagramId) -> Option<OffsetRange> {
+/// Maps one datagram identity to its single-item admission-feedback range.
+pub(crate) fn datagram_feedback_range(datagram_id: DatagramId) -> Option<OffsetRange> {
     let end = datagram_id.0.checked_add(1)?;
     OffsetRange::new(datagram_id.0, end)
 }

@@ -13,6 +13,7 @@ pub(super) fn quic_congestion(
         pending_bytes: 0,
         pacing_rate_bps,
         loss_ppm: None,
+        lost_bytes: 0,
         ecn_ppm: None,
         newly_acked_bytes: None,
         non_app_limited_acked_bytes: None,

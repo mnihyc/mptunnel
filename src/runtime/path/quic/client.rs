@@ -314,7 +314,7 @@ fn spawn_client_udp_path_metrics(
             log_quic_ack_poll_diagnostics(
                 runtime.session_id,
                 PathId(runtime.path_index as u16),
-                0,
+                path_instance_id.as_u64(),
                 metrics,
                 poll_elapsed,
             );
@@ -326,7 +326,7 @@ fn spawn_client_udp_path_metrics(
                 .udp
                 .get_mut(runtime.path_index)
             {
-                record.mark_quic_path_metrics(metrics);
+                record.mark_quic_path_metrics(path_instance_id, metrics);
             }
             tokio::time::sleep(quic_path_metrics_poll_interval(metrics)).await;
         }

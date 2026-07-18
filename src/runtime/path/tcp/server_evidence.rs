@@ -5,6 +5,8 @@
 //! publication.
 
 use super::metrics::TcpMetricPublisher;
+#[cfg(feature = "lab-diagnostics")]
+use crate::lab_diagnostics::lab_diagnostic;
 use crate::model::capacity::reliable_capacity_measurement_session_limit_bytes;
 use crate::mux::MuxLimits;
 use crate::protocol::path_capacity::CapacityReceiveTracker;
@@ -88,6 +90,40 @@ impl ServerTcpEvidenceState {
         }) else {
             return;
         };
+        #[cfg(feature = "lab-diagnostics")]
+        {
+            if observation.retransmission_advanced() == Some(true) {
+                lab_diagnostic(
+                    "tcp_native_retransmission",
+                    format_args!(
+                        "session_id={} path_index={} path_instance_id={} direction={:?}",
+                        path_registration.session_id().0,
+                        path_id.0,
+                        path_registration.path_instance_id().as_u64(),
+                        observation.direction(),
+                    ),
+                );
+            }
+            lab_diagnostic(
+                "tcp_sender_metrics",
+                format_args!(
+                    "session_id={} path_index={} path_instance_id={} direction={:?} newly_acked_bytes={} acked_bytes_since_epoch={} retransmission_advanced={:?} delivery_rate_mbps={:.3} pacing_rate_mbps={:.3} bytes_in_flight={} inflight_limit={} queue_bytes={} app_limited={}",
+                    path_registration.session_id().0,
+                    path_id.0,
+                    path_registration.path_instance_id().as_u64(),
+                    observation.direction(),
+                    observation.newly_acked_bytes().unwrap_or(0),
+                    observation.acked_bytes_since_epoch().unwrap_or(0),
+                    observation.retransmission_advanced(),
+                    observation.delivery_rate_bps().unwrap_or(0) as f64 / 1_000_000.0,
+                    observation.pacing_rate_bps().unwrap_or(0) as f64 / 1_000_000.0,
+                    observation.bytes_in_flight().unwrap_or(0),
+                    observation.inflight_limit_bytes().unwrap_or(0),
+                    observation.queue_bytes().unwrap_or(0),
+                    observation.app_limited().unwrap_or(true),
+                ),
+            );
+        }
         self.sender_refresh_pending = observation
             .bytes_in_flight()
             .is_some_and(|bytes_in_flight| bytes_in_flight > 0)

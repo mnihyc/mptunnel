@@ -30,12 +30,19 @@ impl TcpDatagramClientAssociation {
         payload_bytes: usize,
         product_deadline: tokio::time::Instant,
         has_unattempted_alternative: bool,
+        excluded_path_index: Option<usize>,
     ) -> Result<Self, RuntimeError> {
         if context.tcp_paths.is_empty() {
             return Err(RuntimeError::NoTcpPath);
         }
-        let candidates =
-            context.ordered_tcp_path_indices(TrafficClass::RealtimeDatagram, payload_bytes);
+        // When recovery reserved a distinct ranked path, reopening the failed
+        // path would spend that alternative's product time. Initial and
+        // single-path opens pass no exclusion.
+        let candidates = context
+            .ordered_tcp_path_indices(TrafficClass::RealtimeDatagram, payload_bytes)
+            .into_iter()
+            .filter(|path_index| Some(*path_index) != excluded_path_index)
+            .collect::<Vec<_>>();
         if candidates.is_empty() {
             return Err(RuntimeError::NoSchedulableTcpPath);
         }
@@ -104,7 +111,7 @@ impl TcpDatagramClientAssociation {
             let remaining_ttl_ms = datagram_remaining_ttl_ms(product_deadline);
             if remaining_ttl_ms == 0 || product_attempts >= attempt_limit {
                 return Err(DatagramUnderlaySendError::Timeout {
-                    path_was_acked: false,
+                    feedback_received: false,
                     product_attempts,
                     source: RuntimeError::DatagramResponseTimedOut,
                 });
@@ -121,6 +128,8 @@ impl TcpDatagramClientAssociation {
             } else {
                 remaining
             };
+            let has_unattempted_alternative =
+                has_unattempted_outer_alternative || has_tcp_alternative;
             let attempt_deadline = tokio::time::Instant::now() + attempt_budget;
             product_attempts = product_attempts.saturating_add(1);
             match self
@@ -130,6 +139,7 @@ impl TcpDatagramClientAssociation {
                     payload.clone(),
                     attempt_deadline,
                     product_deadline,
+                    has_unattempted_alternative,
                 )
                 .await
             {
@@ -146,10 +156,10 @@ impl TcpDatagramClientAssociation {
                     return Ok((response, reusable));
                 }
                 Err(DatagramPathSendError::Timeout {
-                    path_was_acked,
+                    feedback_received,
                     response_timeout: _,
                 }) => {
-                    if path_was_acked {
+                    if feedback_received {
                         if !self.session.connection_usable {
                             let failed_path_index = self.session.path_index;
                             self.context.mark_tcp_path_delivery(
@@ -163,7 +173,7 @@ impl TcpDatagramClientAssociation {
                             self.context.mark_tcp_path_failure(failed_path_index);
                         }
                         return Err(DatagramUnderlaySendError::Timeout {
-                            path_was_acked,
+                            feedback_received,
                             product_attempts,
                             source: RuntimeError::DatagramResponseTimedOut,
                         });
@@ -180,7 +190,7 @@ impl TcpDatagramClientAssociation {
                         || tokio::time::Instant::now() >= retry_deadline
                     {
                         return Err(DatagramUnderlaySendError::Timeout {
-                            path_was_acked,
+                            feedback_received,
                             product_attempts,
                             source: RuntimeError::DatagramResponseTimedOut,
                         });
@@ -190,6 +200,7 @@ impl TcpDatagramClientAssociation {
                         payload.len(),
                         product_deadline,
                         false,
+                        has_tcp_alternative.then_some(failed_path_index),
                     )
                     .await
                     {
@@ -198,7 +209,7 @@ impl TcpDatagramClientAssociation {
                         }
                         Err(_) => {
                             return Err(DatagramUnderlaySendError::Timeout {
-                                path_was_acked,
+                                feedback_received,
                                 product_attempts,
                                 source: RuntimeError::DatagramResponseTimedOut,
                             });
@@ -206,9 +217,9 @@ impl TcpDatagramClientAssociation {
                     }
                 }
                 Err(DatagramPathSendError::Runtime {
-                    path_was_acked,
+                    feedback_received,
                     source,
-                }) if !path_was_acked && tcp_datagram_error_is_path_retryable(&source) => {
+                }) if !feedback_received && tcp_datagram_error_is_path_retryable(&source) => {
                     let failed_path_index = self.session.path_index;
                     self.session.connection_usable = false;
                     self.context
@@ -221,7 +232,7 @@ impl TcpDatagramClientAssociation {
                         || tokio::time::Instant::now() >= retry_deadline
                     {
                         return Err(DatagramUnderlaySendError::Runtime {
-                            path_was_acked,
+                            feedback_received,
                             product_attempts,
                             source,
                         });
@@ -231,17 +242,18 @@ impl TcpDatagramClientAssociation {
                         payload.len(),
                         product_deadline,
                         false,
+                        has_tcp_alternative.then_some(failed_path_index),
                     )
                     .await
                     .map_err(|source| DatagramUnderlaySendError::Runtime {
-                        path_was_acked: false,
+                        feedback_received: false,
                         product_attempts,
                         source,
                     })?;
                     self.session = replacement.session;
                 }
                 Err(DatagramPathSendError::Runtime {
-                    path_was_acked,
+                    feedback_received,
                     source,
                 }) => {
                     let failed_path_index = self.session.path_index;
@@ -252,14 +264,14 @@ impl TcpDatagramClientAssociation {
                         .release_tcp_path_load(failed_path_index, TrafficClass::RealtimeDatagram);
                     self.context.mark_tcp_path_failure(failed_path_index);
                     return Err(DatagramUnderlaySendError::Runtime {
-                        path_was_acked,
+                        feedback_received,
                         product_attempts,
                         source,
                     });
                 }
                 Err(DatagramPathSendError::PayloadLimitExceeded { limit }) => {
                     return Err(DatagramUnderlaySendError::Runtime {
-                        path_was_acked: false,
+                        feedback_received: false,
                         product_attempts,
                         source: RuntimeError::Datagram(DatagramError::PayloadTooLarge {
                             actual: payload.len(),
@@ -272,7 +284,7 @@ impl TcpDatagramClientAssociation {
     }
 
     fn adaptive_retry_budget(&self, ttl_ms: u32) -> Duration {
-        datagram_response_deadline_budget(self.session.response_timeout(ttl_ms), ttl_ms)
+        datagram_response_deadline_budget(self.session.response_timeout(ttl_ms), ttl_ms, false)
     }
 
     pub(in crate::runtime) async fn close(&mut self) -> Result<(), RuntimeError> {

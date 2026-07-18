@@ -49,6 +49,16 @@ Diagnostic identifiers may change when an owner is reorganized. The durable
 correlation keys are direction, stream/flow ID, logical path, physical path
 instance, MPP range, usage sequence, and monotonic timestamp.
 
+For product datagrams, `tcp_datagram_response_timeout` and
+`udp_datagram_response_timeout` report both the carrier-derived response model
+and the applied attempt budget. With an unattempted alternative, the first
+attempt without feedback uses one modeled response timeout; the final attempt
+may use three. A same-family fallback must select a different configured path.
+Matching feedback extends waiting to the absolute product TTL and forbids
+replay. An external UDP timeout with no MPP response-timeout event can therefore
+be carrier setup delay or an admitted request whose response was lost; it is
+not evidence that the pre-feedback retry timer failed.
+
 ## Reading a bottleneck
 
 - High socket wait with low CPU and low internal queue delay points to network
@@ -69,6 +79,19 @@ instance, MPP range, usage sequence, and monotonic timestamp.
 TCP and QUIC diagnostics remain separate below the MPP range ledger. Do not
 compare a TCP ACK clock directly to a QUIC packet ACK or use either as proof of
 MPP data-level delivery.
+
+`tcp_native_retransmission` reports only that an opaque counter advanced on one
+physical socket; Linux/Android count segments while Windows/macOS count bytes.
+`quic_carrier_ack_poll newly_lost_bytes=...` reports Quinn's packet-loss
+declaration since the preceding poll. Both are carrier-wide timing evidence,
+not proof that a particular MPP range was lost. Correlate them with the exact
+`path_instance_id` and authoritative Data ACK history before forming a
+hypothesis; they do not independently trigger product reinjection.
+TCP observations run at carrier actor sampling points. A blocked socket write
+can delay the logged edge, so its timestamp is a latest-observation bound, not
+the native retransmission instant. `retransmission_advanced=None` means the
+counter was unavailable or not yet comparable; it is distinct from
+`Some(false)`.
 
 ## Causal workflow
 
@@ -100,6 +123,10 @@ failed physical path instance stops receiving commits, missing ranges are
 reconciled exactly, an eligible survivor receives bounded reinjection, and
 application delivery resumes. Native TCP/QUIC recovery may continue for copies
 already inside those transports.
+
+Metrics publishers must also carry the physical instance. A delayed poll from
+an obsolete carrier is discarded rather than allowed to refresh or overwrite
+the replacement carrier's health record.
 
 For flapping A/B runs, compare the actual trace and transition offsets as well
 as the configured seed.

@@ -418,8 +418,12 @@ pub(super) fn update_request_path_staleness(
     lab_diagnostic(
         "request_path_stale",
         format_args!(
-            "stream_id={} path_underlay={:?} path_index={} path_instance={}",
-            stream_id.0, stale_path.key.underlay, stale_path.key.index, stale_path.attachment_id,
+            "stream_id={} path_underlay={:?} path_index={} path_instance_id={} attachment_id={}",
+            stream_id.0,
+            stale_path.key.underlay,
+            stale_path.key.index,
+            stale_path.path_instance_id.as_u64(),
+            stale_path.attachment_id,
         ),
     );
     #[cfg(not(feature = "lab-diagnostics"))]

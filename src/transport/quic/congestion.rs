@@ -13,6 +13,8 @@ pub struct CongestionMetrics {
     pub pending_bytes: u64,
     pub pacing_rate_bps: Option<u64>,
     pub loss_ppm: Option<u32>,
+    /// Cumulative bytes declared lost by Quinn's native recovery controller.
+    pub lost_bytes: u64,
     pub ecn_ppm: Option<u32>,
     pub newly_acked_bytes: Option<u64>,
     pub non_app_limited_acked_bytes: Option<u64>,
@@ -81,6 +83,7 @@ pub(super) struct QuicCarrierTelemetrySnapshot {
     pub(super) non_app_limited_delivery_sample_count: u64,
     pub(super) timed_non_app_limited_delivery_sample_count: u64,
     pub(super) loss_ppm: Option<u32>,
+    pub(super) lost_bytes: u64,
     pub(super) app_limited: bool,
 }
 
@@ -218,6 +221,7 @@ impl QuicCarrierTelemetry {
             non_app_limited_delivery_sample_count,
             timed_non_app_limited_delivery_sample_count,
             loss_ppm,
+            lost_bytes,
             app_limited: self.app_limited.load(Ordering::Relaxed),
         }
     }

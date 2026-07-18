@@ -523,17 +523,31 @@ packet flight, pacing, congestion response, and recovery.
 
 `OPEN_DGRAM_FLOW(flow_id, target)` creates an MPP datagram association.
 `DGRAM_DATA(flow_id, datagram_id, ttl_ms, payload)` carries one datagram.
-`DGRAM_FEEDBACK(flow_id, received)` acknowledges datagram IDs as half-open
+`DGRAM_FEEDBACK(flow_id, received)` reports datagram IDs admitted as half-open
 ranges. `DGRAM_CLOSE(flow_id)` closes the association.
 
 Datagrams do not use the reliable stream data sequence space. Selection and
 failover MAY compare TCP and QUIC carrier observations, but a datagram MUST be
 dropped when its remaining TTL cannot cover the selected path estimate.
 `DGRAM_FEEDBACK` means that an attempt was admitted to the target worker; it is
-not an end-to-end delivery ACK. The current runtime assigns a new flow-local
-`datagram_id` to an alternative-path attempt and provides no cross-path
-exactly-once guarantee. A delayed first attempt and its retry may both reach the
-target.
+not an end-to-end delivery ACK.
+
+Before feedback, one request is limited to two product attempts. When a ranked,
+unattempted alternative remains, the first attempt waits one modeled response
+timeout derived from that carrier's observations, then MAY retry on the
+alternative while TTL remains. An alternative attempt MUST use a configured
+path not already used by this request; reopening the same path is not an
+alternative. The final or only attempt uses three modeled response timeouts,
+capped by the absolute product TTL, to tolerate ordinary loss without unbounded
+replay. TCP and QUIC derive their response estimates independently; this
+product rule does not replace native recovery.
+
+After matching `DGRAM_FEEDBACK`, the sender MUST NOT replay the request on
+another carrier because target processing may already have begun. It may wait
+for the response until the absolute product TTL. An alternative-path attempt
+receives a new flow-local `datagram_id`; there is no cross-path exactly-once
+guarantee before feedback, so a delayed first attempt and its retry may both
+reach the target.
 
 ## 10. Wire Format
 

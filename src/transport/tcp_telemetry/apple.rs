@@ -8,6 +8,8 @@ use tokio::net::TcpStream;
 
 const TCP_CONNECTION_INFO_MIN_BYTES: usize =
     offset_of!(libc::tcp_connection_info, tcpi_rttvar) + size_of::<u32>();
+const TCP_CONNECTION_INFO_RETRANSMISSION_BYTES: usize =
+    offset_of!(libc::tcp_connection_info, tcpi_txretransmitbytes) + size_of::<u64>();
 const XNU_UNBOUNDED_SSTHRESH_BYTES: u32 = 65_535 << 14;
 
 #[derive(Debug)]
@@ -43,14 +45,18 @@ impl PlatformTcpTelemetrySocket {
         }
         // Older XNU versions expose a shorter suffix, while the RTT and window
         // prefix consumed below has remained stable.
-        if usize::try_from(returned).unwrap_or(0) < TCP_CONNECTION_INFO_MIN_BYTES {
+        let available = usize::try_from(returned).unwrap_or(0);
+        if available < TCP_CONNECTION_INFO_MIN_BYTES {
             return Ok(None);
         }
-        Ok(snapshot_from_connection_info(&info))
+        Ok(snapshot_from_connection_info(&info, available))
     }
 }
 
-fn snapshot_from_connection_info(info: &libc::tcp_connection_info) -> Option<TcpNativeSnapshot> {
+fn snapshot_from_connection_info(
+    info: &libc::tcp_connection_info,
+    available: usize,
+) -> Option<TcpNativeSnapshot> {
     let inflight_limit_bytes = u64::from(info.tcpi_snd_cwnd);
     let flight = (inflight_limit_bytes > 0).then_some(TcpNativeFlight {
         // `tcpi_snd_sbbytes` is total socket-buffer occupancy, not exact
@@ -74,6 +80,10 @@ fn snapshot_from_connection_info(info: &libc::tcp_connection_info) -> Option<Tcp
         flight,
         notsent_bytes: None,
         bytes_acked: None,
+        // XNU reports retransmitted bytes; only counter advancement crosses
+        // the platform boundary.
+        retransmission_counter: (available >= TCP_CONNECTION_INFO_RETRANSMISSION_BYTES)
+            .then_some(info.tcpi_txretransmitbytes),
         loss: None,
         pacing_rate_bytes_per_second: None,
         delivery_rate_bytes_per_second: None,

@@ -34,6 +34,25 @@ fn quic_stats_feed_sender_side_udp_path_metrics() {
     assert!(!measured.app_limited);
 }
 
+#[cfg(feature = "lab-diagnostics")]
+#[test]
+fn quic_loss_declaration_is_reported_once_per_native_counter_advance() {
+    let mut tracker = UdpPathMetricTracker::default();
+    let mut congestion = quic_congestion(4 * 1024 * 1024, Some(500_000_000));
+    let stats = quinn::ConnectionStats::default();
+    congestion.lost_bytes = 1_000;
+
+    let baseline = tracker.observe(stats, congestion, PathMetricDirection::ServerToClient);
+    assert_eq!(baseline.ack_poll.newly_lost_bytes, 0);
+
+    congestion.lost_bytes = 2_400;
+    let advanced = tracker.observe(stats, congestion, PathMetricDirection::ServerToClient);
+    assert_eq!(advanced.ack_poll.newly_lost_bytes, 1_400);
+
+    let repeated = tracker.observe(stats, congestion, PathMetricDirection::ServerToClient);
+    assert_eq!(repeated.ack_poll.newly_lost_bytes, 0);
+}
+
 #[test]
 fn quic_delivery_rate_uses_carrier_ack_elapsed_not_metrics_poll_phase() {
     let sample_bytes = RELIABLE_STREAM_STARTUP_PRODUCT_WINDOW_BYTES / 2;

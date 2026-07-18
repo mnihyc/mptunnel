@@ -245,7 +245,12 @@ or QUIC retransmission timers.
 MPP datagram feedback confirms target-worker admission, not end-to-end target
 delivery. An alternative-path attempt receives a new flow-local datagram ID;
 operators must therefore allow for duplicate delivery if a delayed first
-attempt and its retry both reach the target.
+attempt and its retry both reach the target. Before feedback, the runtime makes
+at most two product attempts. A ranked alternative is tried after one modeled
+response timeout; the final or only attempt keeps three such timeouts, capped by
+the absolute TTL. After feedback, the request is never replayed and its response
+may be awaited until that TTL, so an abrupt blackhole can still lose an
+admitted UDP response rather than duplicate a target operation.
 
 The first successful startup probe for each configured path retains its
 authenticated TCP or QUIC carrier for product use. Later probes use isolated

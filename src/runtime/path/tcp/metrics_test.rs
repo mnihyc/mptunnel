@@ -14,6 +14,7 @@ fn snapshot() -> TcpNativeSnapshot {
         }),
         notsent_bytes: Some(4_096),
         bytes_acked: Some(100),
+        retransmission_counter: Some(10),
         loss: Some(TcpNativeLossCounters {
             retransmits: 10,
             data_segments_out: 20,
@@ -53,6 +54,7 @@ fn native_tcp_metrics_are_post_handshake_and_keep_kernel_units_explicit() {
             inflight_hi_bytes: Some(20 * 1_460),
         }),
         bytes_acked: baseline.bytes_acked.map(|value| value + 300_000),
+        retransmission_counter: Some(12),
         notsent_bytes: Some(8_192),
         loss: Some(TcpNativeLossCounters {
             retransmits: 12,
@@ -72,6 +74,7 @@ fn native_tcp_metrics_are_post_handshake_and_keep_kernel_units_explicit() {
     assert_eq!(observation.delivery_rate_bps(), Some(100_000_000));
     assert_eq!(observation.pacing_rate_bps(), Some(200_000_000));
     assert_eq!(observation.newly_acked_bytes(), Some(300_000));
+    assert_eq!(observation.retransmission_advanced(), Some(true));
     assert_eq!(observation.acked_bytes_since_epoch(), Some(300_000));
     assert!(observation.delivery_window_covered());
     assert_eq!(metrics.delivery_rate_bps, 100_000_000);
@@ -127,7 +130,9 @@ fn repeated_native_poll_without_ack_progress_has_no_fresh_bytes() {
     let repeated = tracker.observe(PathId(0), PathMetricDirection::ClientToServer, current);
 
     assert_eq!(first.newly_acked_bytes(), Some(300_000));
+    assert_eq!(first.retransmission_advanced(), Some(false));
     assert_eq!(repeated.newly_acked_bytes(), Some(0));
+    assert_eq!(repeated.retransmission_advanced(), Some(false));
     assert_eq!(repeated.acked_bytes_since_epoch(), Some(300_000));
 }
 

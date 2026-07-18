@@ -15,6 +15,7 @@ use std::time::{Duration, Instant};
 #[cfg(feature = "lab-diagnostics")]
 #[derive(Debug, Clone, Copy, Default)]
 pub(in crate::runtime) struct QuicAckPollDiagnostics {
+    pub(in crate::runtime) newly_lost_bytes: u64,
     pub(in crate::runtime) newly_acked_bytes: u64,
     pub(in crate::runtime) non_app_limited_acked_bytes: u64,
     pub(in crate::runtime) timed_non_app_limited_acked_bytes: u64,
@@ -154,19 +155,21 @@ pub(super) fn log_quic_ack_poll_diagnostics(
     poll_elapsed: Duration,
 ) {
     let ack = metrics.ack_poll;
-    if ack.newly_acked_bytes > 0
+    if ack.newly_lost_bytes > 0
+        || ack.newly_acked_bytes > 0
         || ack.delivery_evidence_written_delta > 0
         || ack.pending_sample_bytes > 0
     {
         lab_diagnostic(
             "quic_carrier_ack_poll",
             format_args!(
-                "session_id={} path_id={} path_instance_id={} direction={:?} poll_elapsed_us={} newly_acked_bytes={} non_app_limited_acked_bytes={} timed_non_app_limited_acked_bytes={} ack_elapsed_us={} sample_count={} non_app_limited_sample_count={} timed_non_app_limited_sample_count={} carrier_app_limited={} evidence_written_delta={} evidence_newly_acked_bytes={} evidence_pending_ack_bytes={} pending_sample_bytes={} pending_sample_count={} pending_sample_elapsed_us={} proof_expires_in_us={}",
+                "session_id={} path_id={} path_instance_id={} direction={:?} poll_elapsed_us={} newly_lost_bytes={} newly_acked_bytes={} non_app_limited_acked_bytes={} timed_non_app_limited_acked_bytes={} ack_elapsed_us={} sample_count={} non_app_limited_sample_count={} timed_non_app_limited_sample_count={} carrier_app_limited={} evidence_written_delta={} evidence_newly_acked_bytes={} evidence_pending_ack_bytes={} pending_sample_bytes={} pending_sample_count={} pending_sample_elapsed_us={} proof_expires_in_us={}",
                 session_id.0,
                 path_id.0,
                 path_instance_id,
                 metrics.direction,
                 poll_elapsed.as_micros(),
+                ack.newly_lost_bytes,
                 ack.newly_acked_bytes,
                 ack.non_app_limited_acked_bytes,
                 ack.timed_non_app_limited_acked_bytes,

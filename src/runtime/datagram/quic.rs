@@ -108,7 +108,7 @@ impl UdpDatagramClientAssociation {
     ) -> Result<Bytes, DatagramUnderlaySendError> {
         if payload.len() > self.context.mux_limits.max_payload_bytes {
             return Err(DatagramUnderlaySendError::Runtime {
-                path_was_acked: false,
+                feedback_received: false,
                 product_attempts: 0,
                 source: RuntimeError::Datagram(DatagramError::PayloadTooLarge {
                     actual: payload.len(),
@@ -161,7 +161,7 @@ impl UdpDatagramClientAssociation {
                 );
             }
             return Err(DatagramUnderlaySendError::Runtime {
-                path_was_acked: false,
+                feedback_received: false,
                 product_attempts: 0,
                 source: RuntimeError::NoSchedulableUdpPath,
             });
@@ -175,7 +175,7 @@ impl UdpDatagramClientAssociation {
             let remaining_ttl_ms = datagram_remaining_ttl_ms(product_deadline);
             if remaining_ttl_ms == 0 || product_attempts >= attempt_limit {
                 return Err(DatagramUnderlaySendError::Timeout {
-                    path_was_acked: false,
+                    feedback_received: false,
                     product_attempts,
                     source: RuntimeError::DatagramResponseTimedOut,
                 });
@@ -279,11 +279,11 @@ impl UdpDatagramClientAssociation {
                     last_retryable_error = Some(source);
                 }
                 Err(DatagramPathSendError::Timeout {
-                    path_was_acked,
+                    feedback_received,
                     response_timeout,
                 }) => {
                     match datagram_timeout_action(
-                        path_was_acked,
+                        feedback_received,
                         has_unattempted_internal_alternative,
                     ) {
                         DatagramTimeoutAction::RetryAlternative => {
@@ -297,7 +297,7 @@ impl UdpDatagramClientAssociation {
                             last_retryable_error = Some(RuntimeError::DatagramResponseTimedOut);
                             #[cfg(feature = "lab-diagnostics")]
                             lab_diagnostic(
-                                "udp_datagram_unacked_timeout_retry_alternative",
+                                "udp_datagram_no_feedback_timeout_retry_alternative",
                                 format_args!(
                                     "path_index={} response_timeout_ms={} ttl_ms={}",
                                     path_index,
@@ -308,7 +308,7 @@ impl UdpDatagramClientAssociation {
                             continue;
                         }
                         DatagramTimeoutAction::TerminalProductExpiry => {
-                            if path_was_acked {
+                            if feedback_received {
                                 self.context.mark_udp_path_feedback(
                                     path_index,
                                     UdpDatagramPathObservation {
@@ -330,13 +330,13 @@ impl UdpDatagramClientAssociation {
                         }
                     }
                     return Err(DatagramUnderlaySendError::Timeout {
-                        path_was_acked,
+                        feedback_received,
                         product_attempts,
                         source: RuntimeError::DatagramResponseTimedOut,
                     });
                 }
                 Err(DatagramPathSendError::Runtime {
-                    path_was_acked,
+                    feedback_received,
                     source,
                 }) if udp_datagram_error_is_path_retryable(&source) => {
                     self.remove_path(path_index);
@@ -346,9 +346,9 @@ impl UdpDatagramClientAssociation {
                         remaining_ttl_ms,
                     );
                     self.context.mark_udp_path_failure(path_index);
-                    if path_was_acked || !has_unattempted_internal_alternative {
+                    if feedback_received || !has_unattempted_internal_alternative {
                         return Err(DatagramUnderlaySendError::Runtime {
-                            path_was_acked,
+                            feedback_received,
                             product_attempts,
                             source,
                         });
@@ -356,11 +356,11 @@ impl UdpDatagramClientAssociation {
                     last_retryable_error = Some(source);
                 }
                 Err(DatagramPathSendError::Runtime {
-                    path_was_acked,
+                    feedback_received,
                     source,
                 }) => {
                     return Err(DatagramUnderlaySendError::Runtime {
-                        path_was_acked,
+                        feedback_received,
                         product_attempts,
                         source,
                     });
@@ -368,7 +368,7 @@ impl UdpDatagramClientAssociation {
             }
         }
         Err(DatagramUnderlaySendError::Runtime {
-            path_was_acked: false,
+            feedback_received: false,
             product_attempts,
             source: last_retryable_error.unwrap_or(RuntimeError::NoSchedulableUdpPath),
         })
@@ -564,7 +564,7 @@ impl UdpDatagramClientAssociation {
         let ttl_ms = datagram_remaining_ttl_ms(product_deadline);
         if ttl_ms == 0 {
             return Err(DatagramPathSendError::Timeout {
-                path_was_acked: false,
+                feedback_received: false,
                 response_timeout: Duration::ZERO,
             });
         }
@@ -605,7 +605,7 @@ impl UdpDatagramClientAssociation {
         let position = match self.ensure_path_session(path_index, open_deadline).await {
             Err(RuntimeError::PathOpenTimedOut) if setup_owns_remaining_product_budget => {
                 return Err(DatagramPathSendError::Timeout {
-                    path_was_acked: false,
+                    feedback_received: false,
                     response_timeout,
                 });
             }
@@ -623,7 +623,7 @@ impl UdpDatagramClientAssociation {
             .is_err()
             {
                 return Err(DatagramPathSendError::Timeout {
-                    path_was_acked: false,
+                    feedback_received: false,
                     response_timeout,
                 });
             }
@@ -635,6 +635,7 @@ impl UdpDatagramClientAssociation {
                     fallback_deadline,
                     product_deadline,
                     response_timeout,
+                    has_unattempted_alternative,
                 )
                 .await;
             let observation = path.session.take_feedback_observation();
@@ -659,10 +660,10 @@ impl UdpDatagramClientAssociation {
                 Ok(response)
             }
             Err(DatagramPathSendError::Timeout {
-                path_was_acked,
+                feedback_received,
                 response_timeout,
             }) => Err(DatagramPathSendError::Timeout {
-                path_was_acked,
+                feedback_received,
                 response_timeout,
             }),
             Err(err) => Err(err),

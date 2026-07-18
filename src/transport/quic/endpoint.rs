@@ -205,6 +205,7 @@ impl Connection {
             pending_bytes: self.write_backlog.load(Ordering::Relaxed),
             pacing_rate_bps: metrics.pacing_rate,
             loss_ppm: snapshot.loss_ppm,
+            lost_bytes: snapshot.lost_bytes,
             ecn_ppm: None,
             newly_acked_bytes: snapshot.newly_acked_bytes,
             non_app_limited_acked_bytes: snapshot.non_app_limited_acked_bytes,

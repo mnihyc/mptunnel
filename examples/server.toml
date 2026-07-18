@@ -29,3 +29,39 @@ secret = "REPLACE_ME"
 [[outbounds]]
 tag = "direct-egress"
 protocol = "direct"
+# bind_ip = "192.0.2.10" # Replace with an address assigned to this server.
+# System DNS is used by default. Uncomment to use explicit dual-stack DNS.
+# dns = { resolvers = ["1.1.1.1:53", "[2606:4700:4700::1111]:53"], strategy = "ipv4-and-ipv6", timeout_ms = 1500 }
+
+# To relay through SOCKS5, change the MPP inbound selector above to
+# `outbound = "socks5-egress"`, then uncomment this complete block.
+# [[outbounds]]
+# tag = "socks5-egress"
+# protocol = "socks5"
+# proxy = "127.0.0.1:1080"
+# connect_timeout_ms = 10000
+# Target domains are resolved by the no-auth upstream SOCKS5 proxy.
+
+# Plain HTTP CONNECT relays TCP. CONNECT-UDP relays TCP and UDP when supported
+# by the upstream proxy; choose one protocol and a unique tag.
+# [[outbounds]]
+# tag = "http-egress"
+# protocol = "http-connect"
+# proxy = "127.0.0.1:8080"
+# connect_timeout_ms = 10000
+
+# [[outbounds]]
+# tag = "http-connect-udp-egress"
+# protocol = "http-connect-udp"
+# proxy = "127.0.0.1:8080"
+# connect_timeout_ms = 10000
+
+# For ordered direct-to-relay fallback, uncomment the SOCKS5 block, replace
+# `outbound = "direct-egress"` above with `balancer = "egress-fallback"`, and
+# uncomment this routing block. An inbound must not set both selectors.
+# [routing]
+#
+# [[routing.balancers]]
+# tag = "egress-fallback"
+# strategy = "sequence"
+# outbounds = ["direct-egress", "socks5-egress"]

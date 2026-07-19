@@ -1,6 +1,6 @@
 # Release milestones
 
-## 2026-07-20: v0.1.1 release candidate
+## 2026-07-20: v0.1.1 public release (frozen)
 
 ### Category
 
@@ -55,8 +55,17 @@ the exact-commit release CI gate.
 - Windows GNU all-target check and optimized release link: passed.
 - Linux musl x86_64 package manifest, static linkage, version, and checksum:
   passed.
-- Release commit, native multi-platform CI, tag, and publication: pending. No
-  release is permitted unless those exact-source gates pass.
+- Commit `faee89db1edd2891e9e6f2d5d20edf6656daa438` passed Release Check run
+  `29694990256`, candidate CI run `29694990625`, and default-branch CI run
+  `29695430587`. Together they covered source quality, native Windows and
+  macOS tests, Linux musl x86_64/ARM64, Windows MSVC x86_64/ARM64 with static
+  CRT, macOS x86_64/ARM64, Android ARM64, and the exact merged package
+  inventory.
+- Annotated tag `v0.1.1` resolves to that commit. Release run `29695888627`
+  published seven platform archives, seven adjacent checksum files,
+  `SHA256SUMS`, and `version.json`. A separate fresh download verified every
+  checksum and the exact 16-asset inventory; `version.json` records the tag,
+  commit, version 0.1.1, and Rust 1.96.0. The release and tag are immutable.
 
 ## 2026-07-18: ordered ACK and carrier detach correction (v0.1.1 candidate)
 

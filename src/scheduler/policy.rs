@@ -40,6 +40,9 @@ pub struct PathSnapshot {
     pub jitter_ms: f64,
     pub delivery_rate_bps: f64,
     pub rate_scope: PathRateScope,
+    /// Qualified native carrier delivery capacity, when distinct from the
+    /// product flow's completion rate.
+    pub carrier_delivery_rate_bps: Option<f64>,
     pub product_progress_rate_bps: Option<f64>,
     /// Exact product ACK accounting satisfies the transport-specific durable
     /// sample threshold; a point rate alone is not admission evidence.
@@ -82,6 +85,7 @@ impl PathSnapshot {
             jitter_ms: 0.0,
             delivery_rate_bps,
             rate_scope: PathRateScope::PathCapacity,
+            carrier_delivery_rate_bps: None,
             product_progress_rate_bps: None,
             has_durable_product_progress: false,
             loss_rate: 0.0,

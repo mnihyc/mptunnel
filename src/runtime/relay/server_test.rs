@@ -5,8 +5,7 @@ use crate::model::timing::transport_pto_from_snapshot;
 use crate::protocol::frame::stream_ack_contiguous_frontier;
 use crate::protocol::{PathId, PathMetricDirection, PathMetrics};
 use crate::runtime::path::commands::{
-    ReliablePathCommand, ReliablePathCommandReceivers, reliable_path_command_channels,
-    try_recv_reliable_path_command, try_recv_reliable_path_priority_command,
+    ReliablePathCommand, reliable_path_command_channels, try_recv_reliable_path_command,
 };
 use crate::runtime::path::model::metric_epoch_now;
 use crate::runtime::relay::io::stream_ack_ranges_expose_authoritative_gap;
@@ -15,6 +14,14 @@ use crate::runtime::stream::response::{
     ResponseStreamAttachOutcome, ResponseStreamBinding, ServerPathMetricsSource,
 };
 use bytes::Bytes;
+
+fn tail_recovery_candidate(start: u64, sent_at: Instant) -> ReliableRelayTailRecoveryCandidate {
+    ReliableRelayTailRecoveryCandidate::Untracked {
+        start,
+        end: start + 64,
+        sent_at,
+    }
+}
 
 #[tokio::test]
 async fn server_relay_expires_only_after_its_absolute_no_output_interval() {
@@ -37,7 +44,7 @@ async fn server_relay_expires_only_after_its_absolute_no_output_interval() {
         underlay: UnderlayProtocol::Tcp,
         max_frame_payload_bytes: reliable_relay_buffer_len(limits),
         output: ReliablePathStreamOutput::Switchable(binding),
-        frames: frames_rx,
+        frames: frames_rx.into(),
     };
     let context = ServerReliableRelayContext {
         outbound: OutboundConfig::Direct,
@@ -71,13 +78,6 @@ async fn server_relay_expires_only_after_its_absolute_no_output_interval() {
 
     drop(application);
     drop(frames_tx);
-}
-
-fn consume_attachment_path_proof(receivers: &mut ReliablePathCommandReceivers) {
-    assert!(matches!(
-        try_recv_reliable_path_priority_command(receivers),
-        Some(ReliablePathCommand::SendFrame(Frame::PathProofData { .. }))
-    ));
 }
 
 fn record_server_delivery_evidence(binding: &ResponseStreamBinding, key: CarrierPathKey) {
@@ -206,7 +206,7 @@ fn tail_stall_reinjection_retransmits_same_frontier_only_after_stall_evidence() 
         underlay: UnderlayProtocol::Tcp,
         max_frame_payload_bytes: reliable_relay_buffer_len(MuxLimits::default()),
         output: ReliablePathStreamOutput::Switchable(binding.clone()),
-        frames: frame_rx,
+        frames: frame_rx.into(),
     };
     let frame = Frame::StreamData {
         stream_id,
@@ -336,12 +336,68 @@ fn contiguous_ack_frontier_lag_is_tail_guard_not_reinjection_debt() {
 }
 
 #[test]
+fn incomplete_ack_chunks_extend_an_established_authoritative_snapshot() {
+    let limits = MuxLimits::default();
+    let mut send_stream =
+        ReliableSendStream::new_with_initial_max_offset(StreamId(312), limits, u64::MAX);
+    for value in [0x11, 0x22, 0x33] {
+        send_stream
+            .send_data(Bytes::from(vec![value; 1024]))
+            .expect("send response data");
+    }
+
+    let mut authoritative_ranges = Vec::new();
+    let mut authoritative_complete = false;
+    let complete_prefix = [OffsetRange {
+        start: 0,
+        end: 1024,
+    }];
+    send_stream.apply_normalized_ack(&complete_prefix);
+    update_reinjection_authoritative_ack_snapshot(
+        &mut authoritative_ranges,
+        &mut authoritative_complete,
+        true,
+        &complete_prefix,
+    );
+
+    let incomplete_progress = [OffsetRange {
+        start: 1024,
+        end: 3072,
+    }];
+    send_stream.apply_normalized_ack(&incomplete_progress);
+    update_reinjection_authoritative_ack_snapshot(
+        &mut authoritative_ranges,
+        &mut authoritative_complete,
+        false,
+        &incomplete_progress,
+    );
+
+    assert_eq!(
+        authoritative_ranges,
+        [OffsetRange {
+            start: 0,
+            end: 3072,
+        }]
+    );
+    assert!(authoritative_complete);
+    assert_eq!(send_stream.data_ack_frontier(), 3072);
+    assert_eq!(
+        reliable_relay_current_data_ack_outstanding_bytes(
+            TrafficClass::Throughput,
+            &send_stream,
+            send_stream.data_ack_frontier(),
+        ),
+        0,
+        "positive incomplete ACK chunks must not leave stale tail-guard debt",
+    );
+}
+
+#[test]
 fn tail_reinjection_uses_single_pto_stall_timeout() {
-    let last_progress = Instant::now();
-    let last_reinjection = last_progress - Duration::from_secs(1);
-    let deadline = reliable_relay_tail_reinjection_deadline(last_progress, last_reinjection, None);
+    let original_sent_at = Instant::now();
+    let deadline = reliable_relay_tail_reinjection_deadline(original_sent_at, None, None);
     let expected =
-        tokio::time::Instant::from_std(last_progress + transport_pto_from_snapshot(None));
+        tokio::time::Instant::from_std(original_sent_at + transport_pto_from_snapshot(None));
 
     assert_eq!(deadline, expected);
 }
@@ -396,7 +452,6 @@ async fn latency_tail_reinjection_dispatches_suffix_on_distinct_reinjection_with
         ),
         ResponseStreamAttachOutcome::Attached
     );
-    consume_attachment_path_proof(&mut reinjection_receivers);
     let (_frame_tx, frame_rx) = mpsc::channel(1);
     let path_stream = ReliablePathStream {
         stream_id,
@@ -405,7 +460,7 @@ async fn latency_tail_reinjection_dispatches_suffix_on_distinct_reinjection_with
         underlay: original_key.underlay,
         max_frame_payload_bytes: reliable_relay_buffer_len(limits),
         output: ReliablePathStreamOutput::Switchable(binding.clone()),
-        frames: frame_rx,
+        frames: frame_rx.into(),
     };
     let mut send_stream =
         ReliableSendStream::new_with_initial_max_offset(stream_id, limits, u64::MAX);
@@ -533,7 +588,7 @@ fn sparse_authoritative_ack_reinjects_the_lowest_live_path_gap() {
         underlay: original_key.underlay,
         max_frame_payload_bytes: reliable_relay_buffer_len(limits),
         output: ReliablePathStreamOutput::Switchable(binding.clone()),
-        frames: frame_rx,
+        frames: frame_rx.into(),
     };
     let mut send_stream =
         ReliableSendStream::new_with_initial_max_offset(stream_id, limits, u64::MAX);
@@ -618,7 +673,6 @@ async fn sparse_ack_failed_original_reinjection_starts_at_lowest_hole() {
         ),
         ResponseStreamAttachOutcome::Attached
     );
-    consume_attachment_path_proof(&mut reinjection_receivers);
     let (_frame_tx, frame_rx) = mpsc::channel(1);
     let path_stream = ReliablePathStream {
         stream_id,
@@ -627,7 +681,7 @@ async fn sparse_ack_failed_original_reinjection_starts_at_lowest_hole() {
         underlay: original_key.underlay,
         max_frame_payload_bytes: reliable_relay_buffer_len(limits),
         output: ReliablePathStreamOutput::Switchable(binding.clone()),
-        frames: frame_rx,
+        frames: frame_rx.into(),
     };
     let mut send_stream =
         ReliableSendStream::new_with_initial_max_offset(stream_id, limits, u64::MAX);
@@ -695,13 +749,223 @@ async fn sparse_ack_failed_original_reinjection_starts_at_lowest_hole() {
 
 #[test]
 fn tail_reinjection_repeats_after_one_recovery_interval_without_progress() {
-    let last_progress = Instant::now();
-    let last_reinjection = last_progress + transport_pto_from_snapshot(None);
-    let deadline = reliable_relay_tail_reinjection_deadline(last_progress, last_reinjection, None);
+    let original_sent_at = Instant::now();
+    let last_reinjection = original_sent_at + transport_pto_from_snapshot(None);
+    let deadline =
+        reliable_relay_tail_reinjection_deadline(original_sent_at, Some(last_reinjection), None);
     let expected =
         tokio::time::Instant::from_std(last_reinjection + transport_pto_from_snapshot(None));
 
     assert_eq!(deadline, expected);
+}
+
+#[test]
+fn tail_reinjection_deadline_does_not_move_with_metrics_for_the_same_gap() {
+    let original_sent_at = Instant::now();
+    let fast_snapshot = PathSnapshot::new(PathId(1), UnderlayProtocol::Tcp, 20.0, 1.0);
+    let slow_snapshot = PathSnapshot::new(PathId(1), UnderlayProtocol::Tcp, 800.0, 1.0);
+    let mut timer = ReliableRelayTailReinjectionTimer::default();
+
+    let candidate = tail_recovery_candidate(0, original_sent_at);
+    let armed = timer.observe(
+        Some(candidate),
+        original_sent_at,
+        Some(fast_snapshot),
+        false,
+    );
+    let refreshed = timer.observe(
+        Some(candidate),
+        original_sent_at,
+        Some(slow_snapshot),
+        false,
+    );
+
+    assert_eq!(refreshed, armed);
+}
+
+#[test]
+fn data_ack_recovery_deadline_shortens_but_does_not_postpone_tail_timer() {
+    let original_sent_at = Instant::now();
+    let slow_snapshot = PathSnapshot::new(PathId(1), UnderlayProtocol::Tcp, 800.0, 1.0);
+    let mut timer = ReliableRelayTailReinjectionTimer::default();
+    let candidate = tail_recovery_candidate(0, original_sent_at);
+
+    let generic_deadline = timer.observe(
+        Some(candidate),
+        original_sent_at,
+        Some(slow_snapshot),
+        false,
+    );
+    let recovery_deadline = original_sent_at + Duration::from_millis(200);
+    assert!(tokio::time::Instant::from_std(recovery_deadline) < generic_deadline);
+
+    timer.arm_recovery_deadline(candidate, recovery_deadline);
+    assert_eq!(
+        timer.observe(
+            Some(candidate),
+            original_sent_at,
+            Some(slow_snapshot),
+            false,
+        ),
+        tokio::time::Instant::from_std(recovery_deadline)
+    );
+
+    timer.arm_recovery_deadline(candidate, original_sent_at + Duration::from_millis(300));
+    assert_eq!(
+        timer.observe(
+            Some(candidate),
+            original_sent_at,
+            Some(slow_snapshot),
+            false,
+        ),
+        tokio::time::Instant::from_std(recovery_deadline)
+    );
+}
+
+#[test]
+fn tail_reinjection_timer_clears_without_an_authoritative_candidate() {
+    let sent_at = Instant::now();
+    let mut timer = ReliableRelayTailReinjectionTimer::default();
+    let _ = timer.observe(
+        Some(tail_recovery_candidate(0, sent_at)),
+        sent_at,
+        None,
+        false,
+    );
+    assert!(timer.candidate.is_some());
+    assert!(timer.deadline.is_some());
+
+    let _ = timer.observe(None, sent_at, None, false);
+
+    assert_eq!(timer.candidate, None);
+    assert_eq!(timer.deadline, None);
+    assert_eq!(timer.last_attempt_at, None);
+}
+
+#[test]
+fn tail_reinjection_candidate_uses_the_latest_flight_or_data_ack_progress_time() {
+    let first_original_sent_at = Instant::now();
+    let first_snapshot = PathSnapshot::new(PathId(1), UnderlayProtocol::Tcp, 20.0, 1.0);
+    let next_snapshot = PathSnapshot::new(PathId(1), UnderlayProtocol::Tcp, 800.0, 1.0);
+    let mut timer = ReliableRelayTailReinjectionTimer::default();
+    let first_deadline = timer.observe(
+        Some(tail_recovery_candidate(0, first_original_sent_at)),
+        first_original_sent_at,
+        Some(first_snapshot),
+        false,
+    );
+
+    let next_original_sent_at = first_original_sent_at + Duration::from_secs(1);
+    let next_candidate = tail_recovery_candidate(64, next_original_sent_at);
+    let progress_deadline = timer.observe(
+        Some(next_candidate),
+        next_original_sent_at,
+        Some(next_snapshot),
+        false,
+    );
+    assert!(progress_deadline > first_deadline);
+
+    let attempted_at = next_original_sent_at + Duration::from_secs(1);
+    timer.record_attempt_at(attempted_at);
+    let attempt_deadline = timer.observe(
+        Some(next_candidate),
+        next_original_sent_at,
+        Some(first_snapshot),
+        false,
+    );
+    assert_eq!(
+        attempt_deadline,
+        reliable_relay_tail_reinjection_deadline(
+            next_original_sent_at,
+            Some(attempted_at),
+            Some(first_snapshot),
+        )
+    );
+}
+
+#[test]
+fn new_original_flight_does_not_inherit_pre_send_data_ack_stall_time() {
+    let data_ack_progress_at = Instant::now();
+    let original_sent_at = data_ack_progress_at + Duration::from_millis(250);
+    let mut timer = ReliableRelayTailReinjectionTimer::default();
+    let deadline = timer.observe(
+        Some(tail_recovery_candidate(0, original_sent_at)),
+        data_ack_progress_at,
+        None,
+        false,
+    );
+
+    assert_eq!(
+        deadline,
+        tokio::time::Instant::from_std(original_sent_at + transport_pto_from_snapshot(None)),
+        "recovery time begins when the blocking range exists, not when the stream last had no data",
+    );
+}
+
+#[test]
+fn data_ack_progress_rearms_live_path_recovery_for_an_old_original_flight() {
+    let original_sent_at = Instant::now() - Duration::from_secs(2);
+    let data_ack_progress_at = Instant::now();
+    let mut timer = ReliableRelayTailReinjectionTimer::default();
+    let deadline = timer.observe(
+        Some(tail_recovery_candidate(64, original_sent_at)),
+        data_ack_progress_at,
+        None,
+        false,
+    );
+
+    assert_eq!(
+        deadline,
+        tokio::time::Instant::from_std(data_ack_progress_at + transport_pto_from_snapshot(None)),
+        "live-path Data ACK progress starts a new connection-level recovery interval"
+    );
+}
+
+#[test]
+fn failed_original_retry_keeps_pacing_across_ack_progress() {
+    let original_sent_at = Instant::now() - Duration::from_secs(2);
+    let attempted_at = Instant::now();
+    let mut timer = ReliableRelayTailReinjectionTimer::default();
+    let _ = timer.observe(
+        Some(tail_recovery_candidate(0, original_sent_at)),
+        original_sent_at,
+        None,
+        true,
+    );
+    timer.record_attempt_at(attempted_at);
+
+    let deadline = timer.observe(
+        Some(tail_recovery_candidate(64, original_sent_at)),
+        attempted_at,
+        None,
+        true,
+    );
+
+    assert_eq!(
+        deadline,
+        tokio::time::Instant::from_std(attempted_at + transport_pto_from_snapshot(None)),
+        "ACK progress on a failed carrier must not trigger an unpaced retry cascade"
+    );
+}
+
+#[test]
+fn empty_tail_reinjection_scan_retries_after_one_recovery_interval() {
+    let sent_at = Instant::now();
+    let mut timer = ReliableRelayTailReinjectionTimer::default();
+    let candidate = tail_recovery_candidate(0, sent_at);
+    let _ = timer.observe(Some(candidate), sent_at, None, false);
+
+    let scan_started_at = Instant::now();
+    timer.record_scan();
+    let retry_deadline = timer.observe(Some(candidate), sent_at, None, false);
+
+    assert!(
+        retry_deadline
+            >= tokio::time::Instant::from_std(
+                scan_started_at + reliable_relay_tail_reinjection_delay(None),
+            ),
+        "an empty scan remains time-wakeable when carrier capacity changes without a model update",
+    );
 }
 
 #[test]
@@ -789,7 +1053,7 @@ fn live_tail_reinjection_timer_uses_blocking_original_snapshot() {
         underlay: original_key.underlay,
         max_frame_payload_bytes: reliable_relay_buffer_len(limits),
         output: ReliablePathStreamOutput::Switchable(binding.clone()),
-        frames: frame_rx,
+        frames: frame_rx.into(),
     };
     let original_frame = Frame::StreamData {
         stream_id,
@@ -851,7 +1115,7 @@ fn failed_original_tail_reinjection_is_immediate_after_original_path_detaches() 
         underlay: failover_key.underlay,
         max_frame_payload_bytes: reliable_relay_buffer_len(limits),
         output: ReliablePathStreamOutput::Switchable(binding.clone()),
-        frames: frame_rx,
+        frames: frame_rx.into(),
     };
     let mut send_stream =
         ReliableSendStream::new_with_initial_max_offset(stream_id, limits, u64::MAX);
@@ -869,20 +1133,18 @@ fn failed_original_tail_reinjection_is_immediate_after_original_path_detaches() 
     }];
     let _ = send_stream.apply_ack(&ack_ranges);
 
-    let last_progress = Instant::now();
-    let last_reinjection = last_progress - Duration::from_secs(1);
-    let generic_deadline =
-        reliable_relay_tail_reinjection_deadline(last_progress, last_reinjection, None);
+    let original_sent_at = Instant::now();
+    let generic_deadline = reliable_relay_tail_reinjection_deadline(original_sent_at, None, None);
     let failover_deadline = reliable_relay_effective_tail_reinjection_deadline(
-        last_progress,
-        last_reinjection,
+        original_sent_at,
+        None,
         None,
         reliable_failed_original_tail_reinjection_ready(&path_stream, &send_stream),
     );
 
     assert_eq!(
         failover_deadline,
-        tokio::time::Instant::from_std(last_progress),
+        tokio::time::Instant::from_std(original_sent_at),
         "detached-original-transmission path tail reinjection should not wait a generic PTO before failing over"
     );
     assert!(
@@ -893,13 +1155,13 @@ fn failed_original_tail_reinjection_is_immediate_after_original_path_detaches() 
 
 #[test]
 fn failed_original_tail_reinjection_retry_uses_single_pto_not_persistent_backoff() {
-    let last_progress = Instant::now();
-    let last_reinjection = last_progress + Duration::from_millis(1);
+    let original_sent_at = Instant::now();
+    let last_reinjection = original_sent_at + Duration::from_millis(1);
     let slow_stale_original = PathSnapshot::new(PathId(9), UnderlayProtocol::Tcp, 20.0, 1.0);
 
     let deadline = reliable_relay_effective_tail_reinjection_deadline(
-        last_progress,
-        last_reinjection,
+        original_sent_at,
+        Some(last_reinjection),
         Some(slow_stale_original),
         true,
     );
@@ -952,7 +1214,7 @@ fn live_tail_stall_reinjection_is_not_queued_even_with_optional_budget() {
         underlay: UnderlayProtocol::Tcp,
         max_frame_payload_bytes: reliable_relay_buffer_len(limits),
         output: ReliablePathStreamOutput::fixed(UnderlayProtocol::Tcp, PathId(0), commands, limits),
-        frames: frame_rx,
+        frames: frame_rx.into(),
     };
     let mut send_stream =
         ReliableSendStream::new_with_initial_max_offset(stream_id, limits, u64::MAX);
@@ -987,8 +1249,8 @@ fn live_tail_stall_reinjection_is_not_queued_even_with_optional_budget() {
     );
     assert!(!outcome.pending);
     assert!(
-        outcome.record_as_reinjection_attempt(),
-        "an empty tail-reinjection scan must still advance the retry timer"
+        !outcome.has_reinjection_attempt(),
+        "an empty scan must wait for carrier-state change without rewriting the recovery clock"
     );
 }
 
@@ -1030,7 +1292,7 @@ fn failed_original_tail_reinjection_uses_remaining_output_after_persistent_stall
         underlay: failover_key.underlay,
         max_frame_payload_bytes: reliable_relay_buffer_len(limits),
         output: ReliablePathStreamOutput::Switchable(binding.clone()),
-        frames: frame_rx,
+        frames: frame_rx.into(),
     };
     let mut send_stream =
         ReliableSendStream::new_with_initial_max_offset(stream_id, limits, u64::MAX);
@@ -1119,7 +1381,7 @@ fn failed_original_tail_reinjection_queues_one_bounded_target_flight() {
         underlay: failover_key.underlay,
         max_frame_payload_bytes: reliable_relay_buffer_len(limits),
         output: ReliablePathStreamOutput::Switchable(binding.clone()),
-        frames: frame_rx,
+        frames: frame_rx.into(),
     };
     let mut send_stream =
         ReliableSendStream::new_with_initial_max_offset(stream_id, limits, u64::MAX);
@@ -1217,7 +1479,7 @@ fn unknown_original_tail_reinjection_uses_remaining_output_after_persistent_stal
         underlay: failover_key.underlay,
         max_frame_payload_bytes: reliable_relay_buffer_len(limits),
         output: ReliablePathStreamOutput::Switchable(binding.clone()),
-        frames: frame_rx,
+        frames: frame_rx.into(),
     };
     let mut send_stream =
         ReliableSendStream::new_with_initial_max_offset(stream_id, limits, u64::MAX);
@@ -1296,7 +1558,6 @@ async fn unknown_original_tail_reinjection_dispatches_as_path_failure_reinjectio
         ),
         ResponseStreamAttachOutcome::Attached
     );
-    consume_attachment_path_proof(&mut failover_receivers);
     binding.detach(original_key, &original_commands);
 
     let (_frame_tx, frame_rx) = mpsc::channel(1);
@@ -1307,7 +1568,7 @@ async fn unknown_original_tail_reinjection_dispatches_as_path_failure_reinjectio
         underlay: failover_key.underlay,
         max_frame_payload_bytes: reliable_relay_buffer_len(limits),
         output: ReliablePathStreamOutput::Switchable(binding),
-        frames: frame_rx,
+        frames: frame_rx.into(),
     };
     let mut send_stream =
         ReliableSendStream::new_with_initial_max_offset(stream_id, limits, u64::MAX);
@@ -1409,7 +1670,7 @@ fn live_original_without_data_ack_waits_for_authoritative_gap() {
         underlay: reinjection_key.underlay,
         max_frame_payload_bytes: reliable_relay_buffer_len(limits),
         output: ReliablePathStreamOutput::Switchable(binding.clone()),
-        frames: frame_rx,
+        frames: frame_rx.into(),
     };
     let mut send_stream =
         ReliableSendStream::new_with_initial_max_offset(stream_id, limits, u64::MAX);
@@ -1491,7 +1752,7 @@ fn live_original_without_data_ack_does_not_probe_prefix() {
         underlay: reinjection_key.underlay,
         max_frame_payload_bytes: reliable_relay_buffer_len(limits),
         output: ReliablePathStreamOutput::Switchable(binding.clone()),
-        frames: frame_rx,
+        frames: frame_rx.into(),
     };
     let mut send_stream =
         ReliableSendStream::new_with_initial_max_offset(stream_id, limits, u64::MAX);
@@ -1581,7 +1842,7 @@ fn unknown_original_tail_reinjection_without_ack_frontier_waits() {
         underlay: failover_key.underlay,
         max_frame_payload_bytes: reliable_relay_buffer_len(limits),
         output: ReliablePathStreamOutput::Switchable(binding),
-        frames: frame_rx,
+        frames: frame_rx.into(),
     };
     let mut send_stream =
         ReliableSendStream::new_with_initial_max_offset(stream_id, limits, u64::MAX);
@@ -1663,7 +1924,7 @@ fn failed_original_tail_reinjection_does_not_duplicate_queued_reinjection_range(
         underlay: failover_key.underlay,
         max_frame_payload_bytes: reliable_relay_buffer_len(limits),
         output: ReliablePathStreamOutput::Switchable(binding.clone()),
-        frames: frame_rx,
+        frames: frame_rx.into(),
     };
     let mut send_stream =
         ReliableSendStream::new_with_initial_max_offset(stream_id, limits, u64::MAX);
@@ -1775,7 +2036,7 @@ fn tail_reinjection_treats_live_inflight_reinjection_as_pending() {
         underlay: original_key.underlay,
         max_frame_payload_bytes: reliable_relay_buffer_len(limits),
         output: ReliablePathStreamOutput::Switchable(binding.clone()),
-        frames: frame_rx,
+        frames: frame_rx.into(),
     };
     let mut send_stream =
         ReliableSendStream::new_with_initial_max_offset(stream_id, limits, u64::MAX);
@@ -1874,7 +2135,7 @@ fn persistent_tail_reinjection_waits_when_live_reinjection_copy_is_in_flight() {
         underlay: original_key.underlay,
         max_frame_payload_bytes: reliable_relay_buffer_len(limits),
         output: ReliablePathStreamOutput::Switchable(binding.clone()),
-        frames: frame_rx,
+        frames: frame_rx.into(),
     };
     let mut send_stream =
         ReliableSendStream::new_with_initial_max_offset(stream_id, limits, u64::MAX);
@@ -1968,7 +2229,7 @@ fn stale_live_reinjection_flight_does_not_block_terminal_tail_retry() {
         underlay: original_key.underlay,
         max_frame_payload_bytes: reliable_relay_buffer_len(limits),
         output: ReliablePathStreamOutput::Switchable(binding.clone()),
-        frames: frame_rx,
+        frames: frame_rx.into(),
     };
     let mut send_stream =
         ReliableSendStream::new_with_initial_max_offset(stream_id, limits, u64::MAX);
@@ -2062,7 +2323,8 @@ async fn live_tail_reinjection_uses_repair_headroom_before_new_data() {
         ),
         ResponseStreamAttachOutcome::Attached
     );
-    consume_attachment_path_proof(&mut reinjection_receivers);
+    binding.mark_output_path_proven_for_test(original_key);
+    binding.mark_output_path_proven_for_test(reinjection_key);
     reinjection_commands_for_fill
         .try_enqueue_admitted_frame(
             Frame::StreamData {
@@ -2082,7 +2344,7 @@ async fn live_tail_reinjection_uses_repair_headroom_before_new_data() {
         underlay: original_key.underlay,
         max_frame_payload_bytes: reliable_relay_buffer_len(limits),
         output: ReliablePathStreamOutput::Switchable(binding.clone()),
-        frames: frame_rx,
+        frames: frame_rx.into(),
     };
     let mut send_stream =
         ReliableSendStream::new_with_initial_max_offset(stream_id, limits, u64::MAX);
@@ -2210,7 +2472,7 @@ async fn persistent_tail_reinjection_waits_when_distinct_alternate_lacks_repair_
         underlay: original_key.underlay,
         max_frame_payload_bytes: reliable_relay_buffer_len(limits),
         output: ReliablePathStreamOutput::Switchable(binding.clone()),
-        frames: frame_rx,
+        frames: frame_rx.into(),
     };
     let mut send_stream =
         ReliableSendStream::new_with_initial_max_offset(stream_id, limits, u64::MAX);
@@ -2331,7 +2593,7 @@ async fn final_tail_reinjection_uses_original_path_when_alternate_lacks_credit()
         underlay: original_key.underlay,
         max_frame_payload_bytes: reliable_relay_buffer_len(limits),
         output: ReliablePathStreamOutput::Switchable(binding.clone()),
-        frames: frame_rx,
+        frames: frame_rx.into(),
     };
     let mut send_stream =
         ReliableSendStream::new_with_initial_max_offset(stream_id, limits, u64::MAX);
@@ -2431,7 +2693,7 @@ async fn final_tail_reinjection_uses_only_available_path() {
         underlay: original_key.underlay,
         max_frame_payload_bytes: reliable_relay_buffer_len(limits),
         output: ReliablePathStreamOutput::Switchable(binding.clone()),
-        frames: frame_rx,
+        frames: frame_rx.into(),
     };
     let mut send_stream =
         ReliableSendStream::new_with_initial_max_offset(stream_id, limits, u64::MAX);
@@ -2525,7 +2787,6 @@ async fn failed_original_reinjection_without_ack_frontier_starts_at_zero() {
         ),
         ResponseStreamAttachOutcome::Attached
     );
-    consume_attachment_path_proof(&mut failover_receivers);
 
     let (_frame_tx, frame_rx) = mpsc::channel(1);
     let path_stream = ReliablePathStream {
@@ -2535,7 +2796,7 @@ async fn failed_original_reinjection_without_ack_frontier_starts_at_zero() {
         underlay: failover_key.underlay,
         max_frame_payload_bytes: reliable_relay_buffer_len(limits),
         output: ReliablePathStreamOutput::Switchable(binding.clone()),
-        frames: frame_rx,
+        frames: frame_rx.into(),
     };
     let mut send_stream =
         ReliableSendStream::new_with_initial_max_offset(stream_id, limits, u64::MAX);
@@ -2639,7 +2900,7 @@ fn live_original_tail_without_ack_frontier_does_not_reinjection_on_alternate() {
         underlay: original_key.underlay,
         max_frame_payload_bytes: reliable_relay_buffer_len(limits),
         output: ReliablePathStreamOutput::Switchable(binding),
-        frames: frame_rx,
+        frames: frame_rx.into(),
     };
     let mut send_stream =
         ReliableSendStream::new_with_initial_max_offset(stream_id, limits, u64::MAX);
@@ -2721,7 +2982,7 @@ fn failed_original_tail_reinjection_is_not_blocked_by_optional_budget() {
         underlay: failover_key.underlay,
         max_frame_payload_bytes: reliable_relay_buffer_len(limits),
         output: ReliablePathStreamOutput::Switchable(binding.clone()),
-        frames: frame_rx,
+        frames: frame_rx.into(),
     };
     let mut send_stream =
         ReliableSendStream::new_with_initial_max_offset(stream_id, limits, u64::MAX);
@@ -2830,7 +3091,7 @@ fn ack_gap_timer_retransmission_is_not_optional_traffic() {
         underlay: original_key.underlay,
         max_frame_payload_bytes: reliable_relay_buffer_len(limits),
         output: ReliablePathStreamOutput::Switchable(binding.clone()),
-        frames: frame_rx,
+        frames: frame_rx.into(),
     };
     let mut send_stream =
         ReliableSendStream::new_with_initial_max_offset(stream_id, limits, u64::MAX);
@@ -2902,7 +3163,7 @@ fn ack_gap_timer_retransmission_is_not_optional_traffic() {
 }
 
 #[test]
-fn ordinary_ack_gap_timer_repairs_one_quantum_before_measured_persistent_refill() {
+fn ordinary_and_persistent_ack_gap_recovery_use_one_quantum() {
     let limits = MuxLimits::default();
     let stream_id = StreamId(103);
     let original_key = CarrierPathKey {
@@ -2931,7 +3192,6 @@ fn ordinary_ack_gap_timer_repairs_one_quantum_before_measured_persistent_refill(
         ),
         ResponseStreamAttachOutcome::Attached
     );
-    consume_attachment_path_proof(&mut reinjection_receivers);
     record_server_delivery_evidence(&binding, reinjection_key);
 
     let (_frame_tx, frame_rx) = mpsc::channel(1);
@@ -2942,7 +3202,7 @@ fn ordinary_ack_gap_timer_repairs_one_quantum_before_measured_persistent_refill(
         underlay: original_key.underlay,
         max_frame_payload_bytes: reliable_relay_buffer_len(limits),
         output: ReliablePathStreamOutput::Switchable(binding.clone()),
-        frames: frame_rx,
+        frames: frame_rx.into(),
     };
     let mut send_stream =
         ReliableSendStream::new_with_initial_max_offset(stream_id, limits, u64::MAX);
@@ -3020,17 +3280,12 @@ fn ordinary_ack_gap_timer_repairs_one_quantum_before_measured_persistent_refill(
         "the ordinary timer must repair only the frontier gap, not every sparse hole"
     );
     assert_eq!(response_sender.bytes(), base_limit);
-    let persistent_limit = reliable_persistent_ack_gap_reinjection_limit_bytes(
-        Some(modeled_path),
-        Some(UnderlayProtocol::Tcp),
-        TrafficClass::Throughput,
+    let persistent_limit = reliable_critical_tail_reinjection_limit_bytes(
+        base_limit,
         send_stream.reinjection_bytes(),
         limits,
     );
-    assert!(
-        persistent_limit > base_limit,
-        "persistent measured-path evidence may refill a larger target service flight"
-    );
+    assert_eq!(persistent_limit, base_limit);
     let data_ack_outstanding_bytes = send_stream.reinjection_bytes();
     let dispatch = response_sender
         .dispatch_next_with_data_ack_outstanding(
@@ -3091,7 +3346,7 @@ fn persistent_tail_reinjection_preserves_original_flight_attribution() {
         underlay: original_key.underlay,
         max_frame_payload_bytes: reliable_relay_buffer_len(limits),
         output: ReliablePathStreamOutput::Switchable(binding.clone()),
-        frames: frame_rx,
+        frames: frame_rx.into(),
     };
     let mut send_stream =
         ReliableSendStream::new_with_initial_max_offset(stream_id, limits, u64::MAX);

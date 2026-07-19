@@ -1,41 +1,34 @@
-//! One TCP carrier session for product datagram request/response.
+//! One product-datagram attachment to the shared TCP path actor.
 
-use super::policy::{
-    DatagramPathSendError, datagram_remaining_ttl_ms, datagram_response_deadline_budget,
-};
+use super::policy::{DatagramPathSendError, datagram_remaining_ttl_ms};
 use super::tcp::tcp_datagram_response_timeout;
-use super::{DatagramClientFlow, SentDatagram, datagram_feedback_range, datagram_id_is_in_ranges};
+use super::{
+    DatagramClientFlow, DatagramSessionEvent, ReceivedDatagram, SentDatagram, SentDatagramEvidence,
+    datagram_feedback_range, datagram_id_is_in_ranges,
+};
 use crate::model::capacity::TRANSPORT_TIMER_GRANULARITY;
+use crate::model::path::CarrierPathInstanceId;
 use crate::mux::MuxLimits;
-use crate::mux::datagram::DatagramFlow;
-use crate::protocol::{
-    DatagramFlowId, DatagramId, Frame, OffsetRange, PathId, PathUsage, TargetAddr,
-};
+use crate::protocol::{DatagramFlowId, DatagramId, Frame, OffsetRange, TargetAddr};
 use crate::runtime::error::RuntimeError;
-use crate::runtime::identity::random_session_id;
-use crate::runtime::path::tcp::client_connection::{
-    ClientTcpCarrierConnect, ClientTcpCarrierConnection, connect_client_tcp_carrier,
-};
+use crate::runtime::path::tcp::client::{ClientTcpDatagramAttachment, ClientTcpDatagramInbound};
 use crate::runtime::path::{ClientPathContext, PathDeliveryStats};
 use crate::scheduler::PathSnapshot;
 use bytes::Bytes;
-use std::collections::HashMap;
 use std::time::{Duration, Instant};
 
 #[cfg(feature = "lab-diagnostics")]
 use crate::lab_diagnostics::lab_diagnostic;
 
 pub(in crate::runtime) struct TcpDatagramClientSession {
-    connection: ClientTcpCarrierConnection,
+    context: ClientPathContext,
+    attachment: ClientTcpDatagramAttachment,
     flows: Vec<DatagramClientFlow>,
-    next_flow_id: u64,
     mux_limits: MuxLimits,
     pub(in crate::runtime) path_index: usize,
-    path_id: PathId,
-    peer_usage_sequence: u64,
-    path_snapshot: PathSnapshot,
+    initial_path_snapshot: PathSnapshot,
     stats: PathDeliveryStats,
-    sent_datagrams: HashMap<(DatagramFlowId, DatagramId), SentDatagram>,
+    sent_datagrams: SentDatagramEvidence,
     last_datagram_rtt: Option<Duration>,
     response_rttvar: Option<Duration>,
     pub(in crate::runtime) connection_usable: bool,
@@ -47,132 +40,79 @@ impl TcpDatagramClientSession {
         path_index: usize,
         open_deadline: tokio::time::Instant,
     ) -> Result<Self, RuntimeError> {
-        let path = context
+        context
             .tcp_paths
             .get(path_index)
             .ok_or(RuntimeError::NoSchedulableTcpPath)?;
-        let mut path_snapshot = context
+        let initial_path_snapshot = context
             .tcp_path_snapshot(path_index)
             .ok_or(RuntimeError::NoSchedulableTcpPath)?;
-        let session_id = random_session_id()?;
-        let security = context.tcp_path_security(path_index)?;
-        let connection = connect_client_tcp_carrier(
-            ClientTcpCarrierConnect {
-                path,
-                path_index,
-                carrier_identity: context.carrier_path_identity(crate::model::path::RelayPathKey {
-                    underlay: crate::protocol::UnderlayProtocol::Tcp,
-                    index: path_index,
-                }),
-                session_id,
-                security,
-                codec_limits: context.codec_limits,
-                mux_limits: context.mux_limits,
-                carrier_network: context.carrier_network.as_ref(),
-            },
-            open_deadline,
-        )
-        .await?;
-        path_snapshot.peer_usage = Some(connection.peer_usage);
-        let peer_usage_sequence = connection.peer_usage_sequence;
+        let frame_queue = (context.mux_limits.max_datagram_queue_bytes
+            / context.mux_limits.max_payload_bytes.max(1))
+        .max(1);
+        let attachment = context
+            .tcp_sessions
+            .get(path_index)
+            .ok_or(RuntimeError::NoSchedulableTcpPath)?
+            .open_datagram_attachment(open_deadline, frame_queue)
+            .await?;
         Ok(Self {
-            connection,
+            context: context.clone(),
+            attachment,
             flows: Vec::new(),
-            next_flow_id: 0,
             mux_limits: context.mux_limits,
             path_index,
-            path_id: PathId(path_index as u16),
-            peer_usage_sequence,
-            path_snapshot,
+            initial_path_snapshot,
             stats: PathDeliveryStats::default(),
-            sent_datagrams: HashMap::new(),
+            sent_datagrams: SentDatagramEvidence::new(context.mux_limits),
             last_datagram_rtt: None,
             response_rttvar: None,
             connection_usable: true,
         })
     }
 
+    pub(in crate::runtime) fn attachment_id(&self) -> u64 {
+        self.attachment.id()
+    }
+
+    pub(in crate::runtime) fn path_instance_id(&self) -> CarrierPathInstanceId {
+        self.attachment.path_instance_id()
+    }
+
     pub(in crate::runtime) async fn send_to(
         &mut self,
         target: TargetAddr,
+        flow_id: DatagramFlowId,
+        datagram_id: DatagramId,
         payload: Bytes,
         fallback_deadline: tokio::time::Instant,
         product_deadline: tokio::time::Instant,
-        has_unattempted_alternative: bool,
-    ) -> Result<Bytes, DatagramPathSendError> {
+    ) -> Result<(), DatagramPathSendError> {
         if payload.len() > self.mux_limits.max_payload_bytes {
             return Err(DatagramPathSendError::PayloadLimitExceeded {
                 limit: self.mux_limits.max_payload_bytes,
             });
         }
-        let setup = async {
-            self.connection.tick_heartbeat().await?;
-            self.ensure_flow(target).await
-        };
-        let flow_id = match tokio::time::timeout_at(fallback_deadline, setup).await {
-            Ok(Ok(flow_id)) => flow_id,
-            Ok(Err(err)) => return Err(DatagramPathSendError::runtime(err, false)),
-            Err(_) => {
+        match self.ensure_flow(flow_id, target, fallback_deadline).await {
+            Ok(()) => {}
+            Err(RuntimeError::ReliablePathSessionClosed) => {
                 self.connection_usable = false;
-                return Err(DatagramPathSendError::Timeout {
-                    feedback_received: false,
-                    response_timeout: Duration::ZERO,
-                });
-            }
-        };
-        let ttl_ms = datagram_remaining_ttl_ms(product_deadline);
-        if ttl_ms == 0 {
-            return Err(DatagramPathSendError::Timeout {
-                feedback_received: false,
-                response_timeout: Duration::ZERO,
-            });
-        }
-        let response_timeout = self.response_timeout(ttl_ms);
-        let frame = {
-            let flow = self
-                .flows
-                .iter_mut()
-                .find(|flow| flow.flow_id == flow_id)
-                .ok_or_else(|| {
-                    DatagramPathSendError::runtime(
-                        RuntimeError::Protocol("missing TCP datagram flow"),
-                        false,
-                    )
-                })?;
-            flow.flow.enqueue(0, ttl_ms, payload).map_err(|err| {
-                DatagramPathSendError::runtime(RuntimeError::Datagram(err), false)
-            })?;
-            flow.flow.pop_frame(0).ok_or_else(|| {
-                DatagramPathSendError::runtime(
-                    RuntimeError::Protocol("datagram expired before TCP send"),
-                    false,
-                )
-            })?
-        };
-        let (request_datagram_id, request_len) = match &frame {
-            Frame::DatagramData {
-                datagram_id,
-                payload,
-                ..
-            } => (*datagram_id, payload.len()),
-            _ => {
                 return Err(DatagramPathSendError::runtime(
-                    RuntimeError::Protocol("unexpected queued datagram frame"),
-                    false,
+                    RuntimeError::ReliablePathSessionClosed,
                 ));
             }
-        };
-        let request_key = (flow_id, request_datagram_id);
+            Err(RuntimeError::PathOpenTimedOut) => return Err(DatagramPathSendError::Timeout),
+            Err(err) => return Err(DatagramPathSendError::runtime(err)),
+        }
+
+        let ttl_ms = datagram_remaining_ttl_ms(product_deadline);
+        if ttl_ms == 0 {
+            return Err(DatagramPathSendError::Timeout);
+        }
+        let request_len = payload.len();
+        let request_key = (flow_id, datagram_id);
         let sent_at = Instant::now();
-        let mut feedback_received = false;
-        let response_budget = datagram_response_deadline_budget(
-            response_timeout,
-            ttl_ms,
-            has_unattempted_alternative,
-        )
-        .min(fallback_deadline.saturating_duration_since(tokio::time::Instant::now()));
-        let mut response_deadline = sent_at + response_budget;
-        let product_response_deadline = product_deadline.into_std();
+        self.expire_datagrams_without_feedback(sent_at);
         self.sent_datagrams.insert(
             request_key,
             SentDatagram {
@@ -181,289 +121,153 @@ impl TcpDatagramClientSession {
                 ttl: Duration::from_millis(u64::from(ttl_ms)),
             },
         );
-        let write_request = async {
-            self.connection.writer.write_frame(&frame).await?;
-            self.connection.writer.flush().await
+        let frame = Frame::DatagramData {
+            flow_id,
+            datagram_id,
+            ttl_ms,
+            payload,
         };
-        match tokio::time::timeout_at(fallback_deadline, write_request).await {
-            Ok(Ok(())) => {}
-            Ok(Err(err)) => {
-                return Err(DatagramPathSendError::runtime(
-                    RuntimeError::Encrypted(err),
-                    false,
-                ));
-            }
-            Err(_) => {
-                self.sent_datagrams.remove(&request_key);
-                self.connection_usable = false;
-                return Err(DatagramPathSendError::Timeout {
-                    feedback_received: false,
-                    response_timeout,
-                });
-            }
-        }
-        loop {
-            let now = Instant::now();
-            if now >= response_deadline {
-                self.sent_datagrams.remove(&request_key);
+        match self
+            .attachment
+            .send_frame(frame, fallback_deadline, Some(product_deadline))
+            .await
+        {
+            Ok(()) => {
                 #[cfg(feature = "lab-diagnostics")]
                 lab_diagnostic(
-                    "tcp_datagram_response_timeout",
+                    "tcp_datagram_request_written",
                     format_args!(
-                        "path_id={} path_index={} flow_id={} datagram_id={} response_timeout_ms={} response_budget_ms={} feedback_received={}",
-                        self.path_id.0,
-                        self.path_index,
-                        flow_id.0,
-                        request_datagram_id.0,
-                        response_timeout.as_millis(),
-                        response_budget.as_millis(),
-                        feedback_received,
+                        "path_index={} flow_id={} datagram_id={} payload_bytes={}",
+                        self.path_index, flow_id.0, datagram_id.0, request_len,
                     ),
                 );
-                return Err(DatagramPathSendError::Timeout {
-                    feedback_received,
-                    response_timeout,
-                });
+                Ok(())
             }
-            let wait_for = response_deadline.saturating_duration_since(now);
-            let received = match tokio::time::timeout(wait_for, self.connection.frames.recv()).await
-            {
-                Ok(Some(Ok(frame))) => frame,
-                Ok(Some(Err(err))) => {
-                    return Err(DatagramPathSendError::runtime(
-                        RuntimeError::Encrypted(err),
-                        feedback_received,
-                    ));
-                }
-                Ok(None) => {
-                    return Err(DatagramPathSendError::runtime(
-                        RuntimeError::ReliablePathSessionClosed,
-                        feedback_received,
-                    ));
-                }
-                Err(_) => {
-                    self.sent_datagrams.remove(&request_key);
-                    #[cfg(feature = "lab-diagnostics")]
-                    lab_diagnostic(
-                        "tcp_datagram_response_timeout",
-                        format_args!(
-                            "path_id={} path_index={} flow_id={} datagram_id={} response_timeout_ms={} response_budget_ms={} feedback_received={}",
-                            self.path_id.0,
-                            self.path_index,
-                            flow_id.0,
-                            request_datagram_id.0,
-                            response_timeout.as_millis(),
-                            response_budget.as_millis(),
-                            feedback_received,
-                        ),
-                    );
-                    return Err(DatagramPathSendError::Timeout {
-                        feedback_received,
-                        response_timeout,
-                    });
-                }
-            };
-            self.connection.refresh_liveness();
-            match received {
-                Frame::DatagramFeedback { flow_id, received } => {
-                    if flow_id == request_key.0
-                        && datagram_id_is_in_ranges(request_datagram_id, &received)
-                    {
-                        feedback_received = true;
-                        response_deadline = product_response_deadline;
-                    }
-                    self.handle_datagram_feedback(flow_id, &received)
-                        .map_err(|err| DatagramPathSendError::runtime(err, feedback_received))?;
-                }
-                Frame::DatagramData {
-                    flow_id: response_flow_id,
-                    datagram_id,
-                    payload,
-                    ..
-                } if response_flow_id == flow_id && datagram_id == request_datagram_id => {
-                    let now = Instant::now();
-                    let lost = self.expire_datagrams_without_feedback(now);
-                    if let Some(sent) = self.sent_datagrams.remove(&request_key) {
-                        self.observe_datagram_response(sent, now, lost);
-                    }
-                    let feedback = Frame::DatagramFeedback {
-                        flow_id,
-                        received: vec![
-                            datagram_feedback_range(datagram_id)
-                                .map_err(|err| DatagramPathSendError::runtime(err, true))?,
-                        ],
-                    };
-                    let send_feedback = async {
-                        self.connection.writer.write_frame(&feedback).await?;
-                        self.connection.writer.flush().await
-                    };
-                    if !matches!(
-                        tokio::time::timeout_at(product_deadline, send_feedback).await,
-                        Ok(Ok(()))
-                    ) {
-                        self.connection_usable = false;
-                    }
-                    self.stats.record_payload_bytes(request_len);
-                    self.stats.record_payload_bytes(payload.len());
-                    return Ok(payload);
-                }
-                Frame::DatagramData {
-                    flow_id: response_flow_id,
-                    datagram_id,
-                    ..
-                } if response_flow_id == flow_id => {
-                    let feedback = Frame::DatagramFeedback {
-                        flow_id,
-                        received: vec![datagram_feedback_range(datagram_id).map_err(|err| {
-                            DatagramPathSendError::runtime(err, feedback_received)
-                        })?],
-                    };
-                    let send_feedback = async {
-                        self.connection.writer.write_frame(&feedback).await?;
-                        self.connection.writer.flush().await
-                    };
-                    let io_deadline = if feedback_received {
-                        product_deadline
-                    } else {
-                        fallback_deadline
-                    };
-                    match tokio::time::timeout_at(io_deadline, send_feedback).await {
-                        Ok(Ok(())) => {}
-                        Ok(Err(err)) => {
-                            return Err(DatagramPathSendError::runtime(
-                                RuntimeError::Encrypted(err),
-                                feedback_received,
-                            ));
-                        }
-                        Err(_) => {
-                            self.connection_usable = false;
-                            return Err(DatagramPathSendError::Timeout {
-                                feedback_received,
-                                response_timeout,
-                            });
-                        }
-                    }
-                }
-                Frame::DatagramClose {
-                    flow_id: closed_flow_id,
-                } if closed_flow_id == flow_id => {
-                    return Err(DatagramPathSendError::runtime(
-                        RuntimeError::Protocol("TCP datagram flow closed"),
-                        feedback_received,
-                    ));
-                }
-                Frame::Ping { nonce } => {
-                    let send_pong = async {
-                        self.connection
-                            .writer
-                            .write_frame(&Frame::Pong { nonce })
-                            .await?;
-                        self.connection.writer.flush().await
-                    };
-                    let io_deadline = if feedback_received {
-                        product_deadline
-                    } else {
-                        fallback_deadline
-                    };
-                    match tokio::time::timeout_at(io_deadline, send_pong).await {
-                        Ok(Ok(())) => {}
-                        Ok(Err(err)) => {
-                            return Err(DatagramPathSendError::runtime(
-                                RuntimeError::Encrypted(err),
-                                feedback_received,
-                            ));
-                        }
-                        Err(_) => {
-                            self.connection_usable = false;
-                            return Err(DatagramPathSendError::Timeout {
-                                feedback_received,
-                                response_timeout,
-                            });
-                        }
-                    }
-                }
-                Frame::Pong { nonce } => {
-                    self.connection.clear_matching_heartbeat(nonce);
-                }
-                Frame::PathStatus {
-                    path_id,
-                    sequence,
-                    usage,
-                } => {
-                    apply_client_tcp_datagram_path_status(
-                        self.path_id,
-                        path_id,
-                        sequence,
-                        usage,
-                        &mut self.peer_usage_sequence,
-                        &mut self.path_snapshot,
-                    )
-                    .map_err(|err| DatagramPathSendError::runtime(err, feedback_received))?;
-                }
-                Frame::SessionReady => {}
-                Frame::PathClose { .. } => {
-                    return Err(DatagramPathSendError::runtime(
-                        RuntimeError::ReliablePathSessionClosed,
-                        feedback_received,
-                    ));
-                }
-                Frame::SessionClose { reason } => {
-                    return Err(DatagramPathSendError::runtime(
-                        RuntimeError::RemoteClosed(reason),
-                        feedback_received,
-                    ));
-                }
-                _ => {
-                    return Err(DatagramPathSendError::runtime(
-                        RuntimeError::Protocol("unexpected TCP datagram frame"),
-                        feedback_received,
-                    ));
-                }
+            Err(RuntimeError::ReliablePathSessionClosed) => {
+                self.sent_datagrams.remove(&request_key);
+                self.connection_usable = false;
+                Err(DatagramPathSendError::runtime(
+                    RuntimeError::ReliablePathSessionClosed,
+                ))
+            }
+            Err(RuntimeError::PathOpenTimedOut) => {
+                self.sent_datagrams.remove(&request_key);
+                Err(DatagramPathSendError::Timeout)
+            }
+            Err(err) => {
+                self.sent_datagrams.remove(&request_key);
+                Err(DatagramPathSendError::runtime(err))
             }
         }
     }
 
-    async fn ensure_flow(&mut self, target: TargetAddr) -> Result<DatagramFlowId, RuntimeError> {
-        if let Some(flow) = self.flows.iter().find(|flow| flow.target == target) {
-            return Ok(flow.flow_id);
-        }
-        let flow_id = DatagramFlowId(self.next_flow_id);
-        self.next_flow_id = self
-            .next_flow_id
-            .checked_add(1)
-            .ok_or(RuntimeError::Protocol("TCP datagram flow id overflow"))?;
-        self.connection
-            .writer
-            .write_frame(&Frame::OpenDatagramFlow {
+    pub(in crate::runtime) async fn next_frame(
+        &mut self,
+    ) -> Result<ClientTcpDatagramInbound, RuntimeError> {
+        self.attachment.next_frame().await
+    }
+
+    pub(in crate::runtime) async fn handle_frame(
+        &mut self,
+        inbound: ClientTcpDatagramInbound,
+    ) -> Result<DatagramSessionEvent, RuntimeError> {
+        let ClientTcpDatagramInbound { frame, received_at } = inbound;
+        match frame {
+            Frame::DatagramFeedback { flow_id, received } => {
+                self.handle_datagram_feedback(flow_id, &received)?;
+                Ok(DatagramSessionEvent::Feedback { flow_id, received })
+            }
+            Frame::DatagramData {
                 flow_id,
-                target: target.clone(),
-            })
+                datagram_id,
+                ttl_ms,
+                payload,
+            } => {
+                if ttl_ms == 0 {
+                    return Err(RuntimeError::Protocol(
+                        "expired TCP response datagram received",
+                    ));
+                }
+                let Some(expires_at) = received_tcp_datagram_expires_at(received_at, ttl_ms) else {
+                    return Ok(DatagramSessionEvent::Control);
+                };
+                self.stats.record_payload_bytes(payload.len());
+                Ok(DatagramSessionEvent::Received(ReceivedDatagram {
+                    flow_id,
+                    datagram_id,
+                    expires_at,
+                    payload,
+                }))
+            }
+            Frame::DatagramClose { .. } => Err(RuntimeError::Protocol("TCP datagram flow closed")),
+            _ => Err(RuntimeError::Protocol(
+                "unexpected shared TCP datagram frame",
+            )),
+        }
+    }
+
+    pub(in crate::runtime) async fn acknowledge(
+        &mut self,
+        flow_id: DatagramFlowId,
+        datagram_id: DatagramId,
+        write_deadline: tokio::time::Instant,
+    ) -> Result<(), RuntimeError> {
+        self.attachment
+            .send_frame(
+                Frame::DatagramFeedback {
+                    flow_id,
+                    received: vec![datagram_feedback_range(datagram_id)?],
+                },
+                write_deadline,
+                None,
+            )
+            .await
+    }
+
+    pub(in crate::runtime) fn has_flow(&self, flow_id: DatagramFlowId) -> bool {
+        self.flows.iter().any(|flow| flow.flow_id == flow_id)
+    }
+
+    async fn ensure_flow(
+        &mut self,
+        flow_id: DatagramFlowId,
+        target: TargetAddr,
+        open_deadline: tokio::time::Instant,
+    ) -> Result<(), RuntimeError> {
+        if let Some(flow) = self.flows.iter().find(|flow| flow.flow_id == flow_id) {
+            return if flow.target == target {
+                Ok(())
+            } else {
+                Err(RuntimeError::Protocol("TCP datagram flow target changed"))
+            };
+        }
+        if self.flows.iter().any(|flow| flow.target == target) {
+            return Err(RuntimeError::Protocol(
+                "TCP datagram target rebound to another flow",
+            ));
+        }
+        self.attachment
+            .open_flow(flow_id, target.clone(), open_deadline)
             .await?;
-        self.connection.writer.flush().await?;
-        self.flows.push(DatagramClientFlow {
-            target,
-            flow: DatagramFlow::new(flow_id, self.mux_limits),
-            flow_id,
-        });
-        Ok(flow_id)
+        self.flows.push(DatagramClientFlow { target, flow_id });
+        Ok(())
     }
 
     pub(in crate::runtime) async fn close(&mut self) -> Result<(), RuntimeError> {
-        for flow in &self.flows {
-            self.connection
-                .writer
-                .write_frame(&Frame::DatagramClose {
-                    flow_id: flow.flow_id,
-                })
-                .await?;
-        }
+        let close_deadline =
+            tokio::time::Instant::now() + self.mux_limits.tcp_path_heartbeat_timeout;
+        let result = self.attachment.close(close_deadline).await;
         self.flows.clear();
-        self.connection.close(self.path_id).await
+        result
     }
 
     pub(in crate::runtime) fn response_timeout(&self, ttl_ms: u32) -> Duration {
+        let snapshot = self
+            .context
+            .tcp_path_snapshot(self.path_index)
+            .unwrap_or(self.initial_path_snapshot);
         tcp_datagram_response_timeout(
-            self.path_snapshot,
+            snapshot,
             self.last_datagram_rtt,
             self.response_rttvar,
             ttl_ms,
@@ -491,28 +295,17 @@ impl TcpDatagramClientSession {
             .collect::<Vec<_>>();
         for key in feedback_keys {
             if let Some(sent) = self.sent_datagrams.remove(&key) {
-                self.observe_datagram_response(sent, now, 0);
+                self.observe_datagram_response(sent, now);
             }
         }
         Ok(())
     }
 
     fn expire_datagrams_without_feedback(&mut self, now: Instant) -> u64 {
-        let expired = self
-            .sent_datagrams
-            .iter()
-            .filter_map(|(key, sent)| {
-                (now.duration_since(sent.sent_at) >= sent.ttl).then_some(*key)
-            })
-            .collect::<Vec<_>>();
-        let lost = expired.len() as u64;
-        for key in expired {
-            self.sent_datagrams.remove(&key);
-        }
-        lost
+        self.sent_datagrams.expire(now)
     }
 
-    fn observe_datagram_response(&mut self, sent: SentDatagram, now: Instant, _lost: u64) {
+    fn observe_datagram_response(&mut self, sent: SentDatagram, now: Instant) {
         let rtt = now
             .duration_since(sent.sent_at)
             .max(TRANSPORT_TIMER_GRANULARITY);
@@ -531,25 +324,12 @@ impl TcpDatagramClientSession {
     }
 }
 
-fn apply_client_tcp_datagram_path_status(
-    expected_path_id: PathId,
-    status_path_id: PathId,
-    sequence: u64,
-    usage: PathUsage,
-    peer_usage_sequence: &mut u64,
-    snapshot: &mut PathSnapshot,
-) -> Result<bool, RuntimeError> {
-    if status_path_id != expected_path_id {
-        return Err(RuntimeError::Protocol(
-            "TCP path usage advertisement path mismatch",
-        ));
-    }
-    if sequence <= *peer_usage_sequence {
-        return Ok(false);
-    }
-    *peer_usage_sequence = sequence;
-    snapshot.peer_usage = Some(usage);
-    Ok(true)
+fn received_tcp_datagram_expires_at(
+    received_at: tokio::time::Instant,
+    ttl_ms: u32,
+) -> Option<tokio::time::Instant> {
+    let expires_at = received_at + Duration::from_millis(u64::from(ttl_ms));
+    (expires_at > tokio::time::Instant::now()).then_some(expires_at)
 }
 
 #[cfg(test)]

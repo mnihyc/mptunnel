@@ -51,11 +51,6 @@ async fn terminal_reset_captures_current_outputs_and_rejects_late_attach() {
         ),
         ResponseStreamAttachOutcome::Attached,
     );
-    let proof = recv_reliable_path_command(&mut second_receivers)
-        .await
-        .expect("attached output path proof");
-    second_receivers.release_pending_command_bytes(reliable_path_command_pending_bytes(&proof));
-
     binding
         .reset_and_close_stream_ordered(stream_id, ResetReason::Refused, TrafficClass::Throughput)
         .await;

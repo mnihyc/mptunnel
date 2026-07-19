@@ -8,16 +8,30 @@ use super::commands::ReliablePathCommandSender;
 use crate::model::path::{CarrierPathInstanceId, PathPolicy, next_carrier_path_instance_id};
 use crate::mux::MuxLimits;
 use crate::protocol::{
-    Frame, PathId, PathMetrics, PathUsage, PeerPathState, PeerPathStatus, SessionId, StreamId,
-    TargetAddr, UnderlayProtocol,
+    Frame, OffsetRange, PathId, PathMetrics, PathUsage, PeerPathState, PeerPathStatus, SessionId,
+    StreamId, TargetAddr, UnderlayProtocol,
 };
 use crate::runtime::error::RuntimeError;
+use crate::runtime::path::proof::{PathProofObservation, allocated_path_proof_data_frame};
 use crate::scheduler::{PathSnapshot, TrafficClass};
 use bytes::Bytes;
 use std::future::Future;
 use std::pin::Pin;
-use std::sync::Arc;
-use tokio::sync::mpsc;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Weak};
+use tokio::sync::{mpsc, oneshot};
+
+/// A positive-ACK, non-application-limited delivery sample for one carrier.
+///
+/// Product ACK evidence remains stream-owned. This sample only describes the
+/// transport capacity observed by the exact carrier instance that published it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(in crate::runtime) struct CarrierDeliveryRateSample {
+    pub(in crate::runtime) delivery_rate_bps: u64,
+    pub(in crate::runtime) sample_count: u32,
+    pub(in crate::runtime) sample_bytes: u64,
+    pub(in crate::runtime) delivery_window_covered: bool,
+}
 
 /// Keeps response-lane accounting attached to one target-side datagram flow.
 pub(in crate::runtime) struct ServerRealtimeFlowLease {
@@ -42,6 +56,23 @@ pub(in crate::runtime) struct ServerDatagramRequest {
     pub(in crate::runtime) payload: Bytes,
 }
 
+pub(in crate::runtime) enum ServerDatagramWorkerMessage {
+    Attach {
+        commands: ReliablePathCommandSender,
+        attachment: Weak<()>,
+        attached: oneshot::Sender<()>,
+    },
+    Request {
+        request: ServerDatagramRequest,
+        commands: ReliablePathCommandSender,
+        attachment: Weak<()>,
+        admission: oneshot::Sender<Result<ServerDatagramSendOutcome, RuntimeError>>,
+    },
+    ResponseFeedback {
+        received: Vec<OffsetRange>,
+    },
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(in crate::runtime) enum ServerDatagramSendOutcome {
     Accepted,
@@ -52,20 +83,26 @@ pub(in crate::runtime) enum ServerDatagramSendOutcome {
 /// Accepted target worker plus the higher-layer accounting it keeps alive.
 pub(in crate::runtime) struct AcceptedServerDatagramFlow {
     flow_id: crate::protocol::DatagramFlowId,
-    requests: mpsc::Sender<ServerDatagramRequest>,
-    _realtime_registration: ServerRealtimeFlowLease,
+    requests: mpsc::Sender<ServerDatagramWorkerMessage>,
+    commands: ReliablePathCommandSender,
+    route_lifetime: Arc<()>,
+    _attachment: Box<dyn Send + Sync>,
 }
 
 impl AcceptedServerDatagramFlow {
     pub(in crate::runtime) fn holding(
         flow_id: crate::protocol::DatagramFlowId,
-        requests: mpsc::Sender<ServerDatagramRequest>,
-        realtime_registration: ServerRealtimeFlowLease,
+        requests: mpsc::Sender<ServerDatagramWorkerMessage>,
+        commands: ReliablePathCommandSender,
+        route_lifetime: Arc<()>,
+        attachment: impl Send + Sync + 'static,
     ) -> Self {
         Self {
             flow_id,
             requests,
-            _realtime_registration: realtime_registration,
+            commands,
+            route_lifetime,
+            _attachment: Box::new(attachment),
         }
     }
 
@@ -73,15 +110,32 @@ impl AcceptedServerDatagramFlow {
         self.flow_id
     }
 
-    pub(in crate::runtime) fn try_send(
+    pub(in crate::runtime) async fn send(
         &self,
         request: ServerDatagramRequest,
-    ) -> ServerDatagramSendOutcome {
-        match self.requests.try_send(request) {
-            Ok(()) => ServerDatagramSendOutcome::Accepted,
-            Err(mpsc::error::TrySendError::Full(_)) => ServerDatagramSendOutcome::Full,
-            Err(mpsc::error::TrySendError::Closed(_)) => ServerDatagramSendOutcome::Closed,
+    ) -> Result<ServerDatagramSendOutcome, RuntimeError> {
+        let (admission, admitted) = oneshot::channel();
+        match self
+            .requests
+            .try_send(ServerDatagramWorkerMessage::Request {
+                request,
+                commands: self.commands.clone(),
+                attachment: Arc::downgrade(&self.route_lifetime),
+                admission,
+            }) {
+            Ok(()) => match admitted.await {
+                Ok(result) => result,
+                Err(_) => Ok(ServerDatagramSendOutcome::Closed),
+            },
+            Err(mpsc::error::TrySendError::Full(_)) => Ok(ServerDatagramSendOutcome::Full),
+            Err(mpsc::error::TrySendError::Closed(_)) => Ok(ServerDatagramSendOutcome::Closed),
         }
+    }
+
+    pub(in crate::runtime) fn acknowledge_response(&self, received: Vec<OffsetRange>) {
+        let _ = self
+            .requests
+            .try_send(ServerDatagramWorkerMessage::ResponseFeedback { received });
     }
 }
 
@@ -97,34 +151,15 @@ impl std::fmt::Debug for AcceptedServerDatagramFlow {
 /// Target-open failure plus any registered flow accounting awaiting close.
 pub(in crate::runtime) struct ServerDatagramOpenError {
     error: RuntimeError,
-    _realtime_registration: Option<ServerRealtimeFlowLease>,
 }
 
 impl ServerDatagramOpenError {
     pub(in crate::runtime) fn new(error: RuntimeError) -> Self {
-        Self {
-            error,
-            _realtime_registration: None,
-        }
-    }
-
-    pub(in crate::runtime) fn holding(
-        error: RuntimeError,
-        realtime_registration: ServerRealtimeFlowLease,
-    ) -> Self {
-        Self {
-            error,
-            _realtime_registration: Some(realtime_registration),
-        }
+        Self { error }
     }
 
     pub(in crate::runtime) fn into_error(self) -> RuntimeError {
         self.error
-    }
-
-    /// A registered flow must publish its close before releasing accounting.
-    pub(in crate::runtime) fn requires_close(&self) -> bool {
-        self._realtime_registration.is_some()
     }
 }
 
@@ -238,6 +273,24 @@ struct ServerCarrierPathRegistrationInner {
     owner_token: usize,
     identity: ServerCarrierPathIdentity,
     local: ServerLocalPathProperties,
+    validation: Arc<AtomicBool>,
+}
+
+/// Validation authority detached from carrier-registration lifetime.
+#[derive(Clone)]
+pub(in crate::runtime) struct ServerPathValidation {
+    path_id: PathId,
+    validated: Arc<AtomicBool>,
+}
+
+impl ServerPathValidation {
+    pub(in crate::runtime) fn challenge(&self, mux_limits: MuxLimits) -> Option<Frame> {
+        if self.validated.load(Ordering::Acquire) {
+            return None;
+        }
+        let (_, frame) = allocated_path_proof_data_frame(self.path_id, mux_limits);
+        Some(frame)
+    }
 }
 
 impl ServerCarrierPathRegistration {
@@ -267,6 +320,25 @@ impl ServerCarrierPathRegistration {
 
     pub(in crate::runtime) fn initial_metrics(&self) -> Option<PathMetrics> {
         self.inner.local.initial_metrics
+    }
+
+    /// Returns a fresh challenge until this carrier instance is validated.
+    pub(in crate::runtime) fn path_validation_challenge(
+        &self,
+        mux_limits: MuxLimits,
+    ) -> Option<Frame> {
+        self.path_validation().challenge(mux_limits)
+    }
+
+    pub(in crate::runtime) fn path_validation(&self) -> ServerPathValidation {
+        ServerPathValidation {
+            path_id: self.path_id(),
+            validated: self.inner.validation.clone(),
+        }
+    }
+
+    fn mark_path_validated(&self) {
+        self.inner.validation.store(true, Ordering::Release);
     }
 
     pub(in crate::runtime) fn set_state(&self, state: PeerPathState) {
@@ -378,12 +450,9 @@ pub(in crate::runtime) trait ServerStreamPortBackend: Send + Sync {
 
     fn detach_path(
         &self,
-        session_id: SessionId,
+        identity: ServerCarrierPathIdentity,
         stream_id: StreamId,
-        underlay: UnderlayProtocol,
-        path_id: PathId,
-        commands: &ReliablePathCommandSender,
-    );
+    ) -> Result<(), RuntimeError>;
 
     fn record_peer_path_metrics(&self, identity: ServerCarrierPathIdentity, metrics: PathMetrics);
 
@@ -399,6 +468,13 @@ pub(in crate::runtime) trait ServerStreamPortBackend: Send + Sync {
         identity: ServerCarrierPathIdentity,
         metrics: PathMetrics,
         native_drain_observed: bool,
+        delivery_rate_sample: Option<CarrierDeliveryRateSample>,
+    );
+
+    fn record_path_proof_success(
+        &self,
+        identity: ServerCarrierPathIdentity,
+        observation: PathProofObservation,
     );
 
     fn peer_status_snapshot(&self, session_id: SessionId) -> Vec<PeerPathStatus>;
@@ -470,6 +546,7 @@ impl ServerStreamPort {
                 owner_token: self.owner_token,
                 identity,
                 local,
+                validation: Arc::new(AtomicBool::new(false)),
             }),
         }
     }
@@ -547,14 +624,16 @@ impl ServerStreamPort {
 
     pub(in crate::runtime) fn detach_path(
         &self,
-        session_id: SessionId,
+        path_registration: &ServerCarrierPathRegistration,
         stream_id: StreamId,
-        underlay: UnderlayProtocol,
-        path_id: PathId,
-        commands: &ReliablePathCommandSender,
-    ) {
+    ) -> Result<(), RuntimeError> {
+        if !path_registration.belongs_to(self) {
+            return Err(RuntimeError::Protocol(
+                "reliable path registration does not match stream service",
+            ));
+        }
         self.backend
-            .detach_path(session_id, stream_id, underlay, path_id, commands);
+            .detach_path(path_registration.inner.identity, stream_id)
     }
 
     pub(in crate::runtime) fn record_peer_path_metrics(
@@ -586,12 +665,40 @@ impl ServerStreamPort {
         metrics: PathMetrics,
         native_drain_observed: bool,
     ) {
+        self.record_local_path_metrics_with_delivery_rate_sample(
+            registration,
+            metrics,
+            native_drain_observed,
+            None,
+        );
+    }
+
+    pub(in crate::runtime) fn record_local_path_metrics_with_delivery_rate_sample(
+        &self,
+        registration: &ServerCarrierPathRegistration,
+        metrics: PathMetrics,
+        native_drain_observed: bool,
+        delivery_rate_sample: Option<CarrierDeliveryRateSample>,
+    ) {
         if registration.belongs_to(self) {
             self.backend.record_local_path_metrics(
                 registration.inner.identity,
                 metrics,
                 native_drain_observed,
+                delivery_rate_sample,
             );
+        }
+    }
+
+    pub(in crate::runtime) fn record_path_proof_success(
+        &self,
+        registration: &ServerCarrierPathRegistration,
+        observation: PathProofObservation,
+    ) {
+        if registration.belongs_to(self) {
+            registration.mark_path_validated();
+            self.backend
+                .record_path_proof_success(registration.inner.identity, observation);
         }
     }
 

@@ -274,6 +274,27 @@ async fn route_client_tcp_stream_frame(
     Ok(())
 }
 
+pub(super) fn client_tcp_inbound_frame_retires_attachment(frame: &Frame) -> bool {
+    // FIN declares the final Data Sequence offset; repair below that offset may
+    // still arrive on this carrier until the relay explicitly closes it.
+    matches!(frame, Frame::StreamReset { .. })
+}
+
+async fn route_client_tcp_lifecycle_frame(
+    streams: &mut HashMap<StreamId, ClientTcpPathStreamState>,
+    closed_streams: &mut RecentIdCache<StreamId>,
+    stream_id: StreamId,
+    frame: Frame,
+) -> Result<(), RuntimeError> {
+    let retires_attachment = client_tcp_inbound_frame_retires_attachment(&frame);
+    let result = route_client_tcp_stream_frame(streams, closed_streams, stream_id, frame).await;
+    if result.is_ok() && retires_attachment {
+        streams.remove(&stream_id);
+        closed_streams.insert(stream_id);
+    }
+    result
+}
+
 pub(super) fn fail_client_tcp_streams(
     streams: &mut HashMap<StreamId, ClientTcpPathStreamState>,
     reason: &RuntimeError,
@@ -380,18 +401,13 @@ pub(super) async fn handle_client_tcp_stream_frame(
                     ));
                 return Ok(());
             }
-            let result = route_client_tcp_stream_frame(
+            route_client_tcp_lifecycle_frame(
                 streams,
                 closed_streams,
                 stream_id,
                 Frame::StreamReset { stream_id, reason },
             )
-            .await;
-            if result.is_ok() {
-                streams.remove(&stream_id);
-                closed_streams.insert(stream_id);
-            }
-            result
+            .await
         }
         Frame::StreamData {
             stream_id,
@@ -431,7 +447,7 @@ pub(super) async fn handle_client_tcp_stream_frame(
             stream_id,
             final_offset,
         } => {
-            let result = route_client_tcp_stream_frame(
+            route_client_tcp_lifecycle_frame(
                 streams,
                 closed_streams,
                 stream_id,
@@ -440,12 +456,7 @@ pub(super) async fn handle_client_tcp_stream_frame(
                     final_offset,
                 },
             )
-            .await;
-            if result.is_ok() {
-                streams.remove(&stream_id);
-                closed_streams.insert(stream_id);
-            }
-            result
+            .await
         }
         Frame::StreamDetach { stream_id } => {
             streams.remove(&stream_id);

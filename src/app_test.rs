@@ -56,3 +56,22 @@ fn config_file_invocation_accepts_false_check_config_override() {
         })
     );
 }
+
+#[test]
+fn config_file_version_and_help_are_cli_meta_actions() {
+    for flag in ["--version", "-V", "--help", "-h"] {
+        let args = vec![
+            OsString::from("mptunnel"),
+            OsString::from("--config"),
+            OsString::from("edge.toml"),
+            OsString::from(flag),
+        ];
+        assert!(config_file_meta_action_requested(&args), "flag={flag}");
+    }
+
+    let runtime_args = vec![
+        OsString::from("mptunnel"),
+        OsString::from("--config=edge.toml"),
+    ];
+    assert!(!config_file_meta_action_requested(&runtime_args));
+}

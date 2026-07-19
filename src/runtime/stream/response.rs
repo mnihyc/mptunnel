@@ -20,10 +20,12 @@ use crate::scheduler::TrafficClass;
 #[cfg(test)]
 pub(in crate::runtime) use attachment::next_server_carrier_path_instance_id;
 pub(in crate::runtime) use attachment::{
-    ResponseDispatchTarget, ResponseSenderPathTarget, ResponseStreamAttachOutcome,
+    ResponseDispatchTarget, ResponseOutputAttachment, ResponseOutputAttachmentState,
+    ResponseSenderPathTarget, ResponseStreamAttachOutcome,
 };
 use attachment::{ResponseStreamOutputEntry, ResponseStreamOutputs};
 use delivery::ResponseAckOrderingState;
+pub(in crate::runtime) use delivery::ResponseDataAckRecoveryCandidate;
 pub(super) use delivery::{
     CarrierPathFlight, product_flights_have_recent_reinjection_overlap,
     release_carrier_path_flight_ranges,
@@ -156,6 +158,7 @@ impl ResponseStreamBinding {
         let (version, _) = watch::channel(0);
         let key = CarrierPathKey { underlay, path_id };
         let session_registration = ServerSessionRegistration::new(session_tracker, session_id);
+        let load_registration = commands.register_flow(lane);
         Arc::new(Self {
             session_id,
             lane: Mutex::new(lane),
@@ -165,12 +168,14 @@ impl ResponseStreamBinding {
             response_model_generation: AtomicU64::new(0),
             response_stream_open: AtomicBool::new(true),
             outputs: Mutex::new(ResponseStreamOutputs {
+                detaching: Vec::new(),
                 entries: vec![ResponseStreamOutputEntry {
                     key,
                     path_instance_id,
                     local_policy,
                     incarnation: 1,
                     commands,
+                    load_registration,
                     original_data_in_flight_bytes: 0,
                     bytes_in_flight: 0,
                     product_progress_rate_bps: None,
@@ -184,6 +189,7 @@ impl ResponseStreamBinding {
                     peer_path_metrics: None,
                     peer_usage: None,
                     peer_usage_sequence: None,
+                    path_proof: None,
                 }],
                 data_level_queue_bytes: 0,
             }),
@@ -212,6 +218,9 @@ impl ResponseStreamBinding {
                 .lock()
                 .expect("server reliable stream binding lock");
             self.response_stream_open.store(false, Ordering::Release);
+            for entry in outputs.entries.iter().chain(&outputs.detaching) {
+                entry.load_registration.deactivate();
+            }
             outputs
                 .entries
                 .iter()
@@ -227,6 +236,20 @@ impl ResponseStreamBinding {
                 .send_control(ReliablePathCommand::CloseStream(stream_id))
                 .await;
         }
+    }
+
+    pub(in crate::runtime) async fn reset_and_close_stream(
+        &self,
+        stream_id: StreamId,
+        reason: ResetReason,
+    ) {
+        let outputs = self.begin_close();
+        futures::future::join_all(outputs.into_iter().map(|commands| async move {
+            let _ = commands
+                .send_control(ReliablePathCommand::ResetAndCloseStream { stream_id, reason })
+                .await;
+        }))
+        .await;
     }
 
     pub(in crate::runtime) async fn close_stream_ordered(

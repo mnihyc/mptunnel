@@ -1,299 +1,237 @@
-//! TCP datagram carrier selection and recovery.
+//! TCP carrier attachments for one product datagram association.
 
-use super::association::{DatagramUnderlaySendError, runtime_error_is_datagram_response_timeout};
-use super::policy::{
-    DatagramPathSendError, datagram_remaining_ttl_ms, datagram_response_deadline_budget,
-};
+use super::DatagramSessionEvent;
+use super::association::{DatagramPathSend, runtime_error_is_datagram_response_timeout};
+use super::policy::DatagramPathSendError;
 use super::tcp_session::TcpDatagramClientSession;
 use crate::model::capacity::{DATAGRAM_FEEDBACK_DELAY_BUDGET, TRANSPORT_TIMER_GRANULARITY};
-use crate::model::path::RelayPathKey;
 use crate::model::timing::{
     path_open_pto, path_open_pto_multiplier, path_open_serialized_exchanges,
     transport_pto_from_snapshot,
 };
-use crate::mux::datagram::DatagramError;
-use crate::protocol::{TargetAddr, UnderlayProtocol};
+use crate::protocol::{DatagramFlowId, DatagramId};
 use crate::runtime::error::RuntimeError;
 use crate::runtime::path::ClientPathContext;
+use crate::runtime::path::tcp::client::ClientTcpDatagramInbound;
 use crate::scheduler::{PathSnapshot, TrafficClass};
-use bytes::Bytes;
 use std::time::{Duration, Instant};
 
 pub(in crate::runtime) struct TcpDatagramClientAssociation {
     context: ClientPathContext,
-    pub(in crate::runtime) session: TcpDatagramClientSession,
+    paths: Vec<TcpDatagramClientSession>,
 }
 
 impl TcpDatagramClientAssociation {
-    pub(in crate::runtime) async fn open_best(
-        context: ClientPathContext,
-        payload_bytes: usize,
-        product_deadline: tokio::time::Instant,
-        has_unattempted_alternative: bool,
-        excluded_path_index: Option<usize>,
-    ) -> Result<Self, RuntimeError> {
-        if context.tcp_paths.is_empty() {
-            return Err(RuntimeError::NoTcpPath);
+    pub(in crate::runtime) fn new(context: ClientPathContext) -> Self {
+        Self {
+            context,
+            paths: Vec::new(),
         }
-        // When recovery reserved a distinct ranked path, reopening the failed
-        // path would spend that alternative's product time. Initial and
-        // single-path opens pass no exclusion.
-        let candidates = context
-            .ordered_tcp_path_indices(TrafficClass::RealtimeDatagram, payload_bytes)
-            .into_iter()
-            .filter(|path_index| Some(*path_index) != excluded_path_index)
-            .collect::<Vec<_>>();
-        if candidates.is_empty() {
+    }
+
+    pub(super) async fn send_to_path(
+        &mut self,
+        path_index: usize,
+        send: DatagramPathSend,
+    ) -> Result<(), DatagramPathSendError> {
+        let DatagramPathSend {
+            target,
+            flow_id,
+            datagram_id,
+            payload,
+            setup_deadline,
+            product_deadline,
+            ..
+        } = send;
+        let position = self
+            .ensure_path(path_index, payload.len(), setup_deadline)
+            .await
+            .map_err(DatagramPathSendError::runtime)?;
+        let result = self.paths[position]
+            .send_to(
+                target,
+                flow_id,
+                datagram_id,
+                payload,
+                setup_deadline,
+                product_deadline,
+            )
+            .await;
+        if result.is_err() && !self.paths[position].connection_usable {
+            self.remove_path(path_index, false);
+        }
+        result
+    }
+
+    async fn ensure_path(
+        &mut self,
+        path_index: usize,
+        payload_bytes: usize,
+        setup_deadline: tokio::time::Instant,
+    ) -> Result<usize, RuntimeError> {
+        if let Some(position) = self
+            .paths
+            .iter()
+            .position(|session| session.path_index == path_index)
+        {
+            return Ok(position);
+        }
+        if self.context.tcp_paths.get(path_index).is_none() {
             return Err(RuntimeError::NoSchedulableTcpPath);
         }
-        let candidate_count = candidates.len();
-        let mut last_retryable_error = None;
-        for (position, path_index) in candidates.into_iter().enumerate() {
-            let remaining = product_deadline.saturating_duration_since(tokio::time::Instant::now());
-            if remaining.is_zero() {
-                break;
-            }
-            let key = RelayPathKey {
-                underlay: UnderlayProtocol::Tcp,
-                index: path_index,
-            };
-            let snapshot = context.tcp_path_snapshot(path_index);
-            let eta_ms = context
-                .reliable_relay_path_eta_ms(key, TrafficClass::RealtimeDatagram, payload_bytes)
-                .unwrap_or(f64::INFINITY);
-            if eta_ms > remaining.as_secs_f64() * 1000.0 {
-                continue;
-            }
-            let path_budget = tcp_datagram_path_open_timeout(
-                snapshot,
-                has_unattempted_alternative || position + 1 < candidate_count,
-                remaining,
-            );
-            if path_budget.is_zero() {
-                break;
-            }
-            let open_deadline = tokio::time::Instant::now() + path_budget;
-            let started_at = Instant::now();
-            match TcpDatagramClientSession::open(&context, path_index, open_deadline).await {
-                Ok(session) => {
-                    context.mark_tcp_path_open_success(
-                        path_index,
-                        started_at.elapsed(),
-                        TrafficClass::RealtimeDatagram,
-                    );
-                    return Ok(Self { context, session });
-                }
-                Err(err) if tcp_datagram_error_is_path_retryable(&err) => {
-                    context.mark_tcp_path_failure(path_index);
-                    last_retryable_error = Some(err);
-                }
-                Err(err) => return Err(err),
-            }
+        let key = crate::model::path::RelayPathKey {
+            underlay: crate::protocol::UnderlayProtocol::Tcp,
+            index: path_index,
+        };
+        let remaining = setup_deadline.saturating_duration_since(tokio::time::Instant::now());
+        let eta_ms = self
+            .context
+            .reliable_relay_path_eta_ms(key, TrafficClass::RealtimeDatagram, payload_bytes)
+            .unwrap_or(f64::INFINITY);
+        if remaining.is_zero() || eta_ms > remaining.as_secs_f64() * 1000.0 {
+            return Err(RuntimeError::PathOpenTimedOut);
         }
-        Err(last_retryable_error.unwrap_or(RuntimeError::NoSchedulableTcpPath))
-    }
-
-    pub(in crate::runtime) async fn send_to_with_carrier_recovery(
-        &mut self,
-        target: TargetAddr,
-        payload: Bytes,
-        product_deadline: tokio::time::Instant,
-        attempt_limit: usize,
-        has_unattempted_outer_alternative: bool,
-    ) -> Result<(Bytes, bool), DatagramUnderlaySendError> {
-        let initial_ttl_ms = datagram_remaining_ttl_ms(product_deadline);
-        let retry_deadline = tokio::time::Instant::now()
-            + self
-                .adaptive_retry_budget(initial_ttl_ms)
-                .min(product_deadline.saturating_duration_since(tokio::time::Instant::now()));
-        let mut product_attempts = 0usize;
-        loop {
-            let remaining_ttl_ms = datagram_remaining_ttl_ms(product_deadline);
-            if remaining_ttl_ms == 0 || product_attempts >= attempt_limit {
-                return Err(DatagramUnderlaySendError::Timeout {
-                    feedback_received: false,
-                    product_attempts,
-                    source: RuntimeError::DatagramResponseTimedOut,
-                });
+        let started_at = Instant::now();
+        match TcpDatagramClientSession::open(&self.context, path_index, setup_deadline).await {
+            Ok(session) => {
+                self.context.mark_tcp_path_open_success(
+                    path_index,
+                    started_at.elapsed(),
+                    TrafficClass::RealtimeDatagram,
+                );
+                self.paths.push(session);
+                Ok(self.paths.len() - 1)
             }
-            let has_tcp_alternative = product_attempts + 1 < attempt_limit
-                && self
-                    .context
-                    .ordered_tcp_path_indices(TrafficClass::RealtimeDatagram, payload.len())
-                    .into_iter()
-                    .any(|path_index| path_index != self.session.path_index);
-            let remaining = Duration::from_millis(u64::from(remaining_ttl_ms));
-            let attempt_budget = if has_unattempted_outer_alternative || has_tcp_alternative {
-                remaining / 2
-            } else {
-                remaining
-            };
-            let has_unattempted_alternative =
-                has_unattempted_outer_alternative || has_tcp_alternative;
-            let attempt_deadline = tokio::time::Instant::now() + attempt_budget;
-            product_attempts = product_attempts.saturating_add(1);
-            match self
-                .session
-                .send_to(
-                    target.clone(),
-                    payload.clone(),
-                    attempt_deadline,
-                    product_deadline,
-                    has_unattempted_alternative,
-                )
-                .await
-            {
-                Ok(response) => {
-                    let reusable = self.session.connection_usable;
-                    if !reusable {
-                        let path_index = self.session.path_index;
-                        self.context
-                            .mark_tcp_path_delivery(path_index, self.session.delivery_stats());
-                        self.context
-                            .release_tcp_path_load(path_index, TrafficClass::RealtimeDatagram);
-                        self.context.mark_tcp_path_failure(path_index);
-                    }
-                    return Ok((response, reusable));
+            Err(error) => {
+                if tcp_datagram_error_is_path_retryable(&error) {
+                    self.context.mark_tcp_path_failure(path_index);
                 }
-                Err(DatagramPathSendError::Timeout {
-                    feedback_received,
-                    response_timeout: _,
-                }) => {
-                    if feedback_received {
-                        if !self.session.connection_usable {
-                            let failed_path_index = self.session.path_index;
-                            self.context.mark_tcp_path_delivery(
-                                failed_path_index,
-                                self.session.delivery_stats(),
-                            );
-                            self.context.release_tcp_path_load(
-                                failed_path_index,
-                                TrafficClass::RealtimeDatagram,
-                            );
-                            self.context.mark_tcp_path_failure(failed_path_index);
-                        }
-                        return Err(DatagramUnderlaySendError::Timeout {
-                            feedback_received,
-                            product_attempts,
-                            source: RuntimeError::DatagramResponseTimedOut,
-                        });
-                    }
-                    let failed_path_index = self.session.path_index;
-                    self.session.connection_usable = false;
-                    self.context
-                        .mark_tcp_path_delivery(failed_path_index, self.session.delivery_stats());
-                    self.context
-                        .release_tcp_path_load(failed_path_index, TrafficClass::RealtimeDatagram);
-                    self.context.mark_tcp_path_failure(failed_path_index);
-                    if has_unattempted_outer_alternative
-                        || product_attempts >= attempt_limit
-                        || tokio::time::Instant::now() >= retry_deadline
-                    {
-                        return Err(DatagramUnderlaySendError::Timeout {
-                            feedback_received,
-                            product_attempts,
-                            source: RuntimeError::DatagramResponseTimedOut,
-                        });
-                    }
-                    match Self::open_best(
-                        self.context.clone(),
-                        payload.len(),
-                        product_deadline,
-                        false,
-                        has_tcp_alternative.then_some(failed_path_index),
-                    )
-                    .await
-                    {
-                        Ok(replacement) => {
-                            self.session = replacement.session;
-                        }
-                        Err(_) => {
-                            return Err(DatagramUnderlaySendError::Timeout {
-                                feedback_received,
-                                product_attempts,
-                                source: RuntimeError::DatagramResponseTimedOut,
-                            });
-                        }
-                    }
-                }
-                Err(DatagramPathSendError::Runtime {
-                    feedback_received,
-                    source,
-                }) if !feedback_received && tcp_datagram_error_is_path_retryable(&source) => {
-                    let failed_path_index = self.session.path_index;
-                    self.session.connection_usable = false;
-                    self.context
-                        .mark_tcp_path_delivery(failed_path_index, self.session.delivery_stats());
-                    self.context
-                        .release_tcp_path_load(failed_path_index, TrafficClass::RealtimeDatagram);
-                    self.context.mark_tcp_path_failure(failed_path_index);
-                    if has_unattempted_outer_alternative
-                        || product_attempts >= attempt_limit
-                        || tokio::time::Instant::now() >= retry_deadline
-                    {
-                        return Err(DatagramUnderlaySendError::Runtime {
-                            feedback_received,
-                            product_attempts,
-                            source,
-                        });
-                    }
-                    let replacement = Self::open_best(
-                        self.context.clone(),
-                        payload.len(),
-                        product_deadline,
-                        false,
-                        has_tcp_alternative.then_some(failed_path_index),
-                    )
-                    .await
-                    .map_err(|source| DatagramUnderlaySendError::Runtime {
-                        feedback_received: false,
-                        product_attempts,
-                        source,
-                    })?;
-                    self.session = replacement.session;
-                }
-                Err(DatagramPathSendError::Runtime {
-                    feedback_received,
-                    source,
-                }) => {
-                    let failed_path_index = self.session.path_index;
-                    self.session.connection_usable = false;
-                    self.context
-                        .mark_tcp_path_delivery(failed_path_index, self.session.delivery_stats());
-                    self.context
-                        .release_tcp_path_load(failed_path_index, TrafficClass::RealtimeDatagram);
-                    self.context.mark_tcp_path_failure(failed_path_index);
-                    return Err(DatagramUnderlaySendError::Runtime {
-                        feedback_received,
-                        product_attempts,
-                        source,
-                    });
-                }
-                Err(DatagramPathSendError::PayloadLimitExceeded { limit }) => {
-                    return Err(DatagramUnderlaySendError::Runtime {
-                        feedback_received: false,
-                        product_attempts,
-                        source: RuntimeError::Datagram(DatagramError::PayloadTooLarge {
-                            actual: payload.len(),
-                            limit,
-                        }),
-                    });
-                }
+                Err(error)
             }
         }
     }
 
-    fn adaptive_retry_budget(&self, ttl_ms: u32) -> Duration {
-        datagram_response_deadline_budget(self.session.response_timeout(ttl_ms), ttl_ms, false)
+    pub(in crate::runtime) fn feedback_timeout(&self, path_index: usize, ttl_ms: u32) -> Duration {
+        self.paths
+            .iter()
+            .find(|session| session.path_index == path_index)
+            .map(|session| session.response_timeout(ttl_ms))
+            .or_else(|| {
+                self.context
+                    .tcp_path_snapshot(path_index)
+                    .map(|snapshot| tcp_datagram_response_timeout(snapshot, None, None, ttl_ms))
+            })
+            .unwrap_or_else(|| Duration::from_millis(u64::from(ttl_ms)))
     }
 
     pub(in crate::runtime) async fn close(&mut self) -> Result<(), RuntimeError> {
-        let close_result = self.session.close().await;
+        let mut close_error = None;
+        while let Some(mut session) = self.paths.pop() {
+            let path_index = session.path_index;
+            let result = session.close().await;
+            self.context.mark_tcp_path_delivery_for_instance(
+                path_index,
+                session.path_instance_id(),
+                session.delivery_stats(),
+            );
+            self.context
+                .release_tcp_path_load(path_index, TrafficClass::RealtimeDatagram);
+            if close_error.is_none() {
+                close_error = result.err();
+            }
+        }
+        close_error.map_or(Ok(()), Err)
+    }
+
+    pub(in crate::runtime) fn has_open_path(&self) -> bool {
+        !self.paths.is_empty()
+    }
+
+    pub(in crate::runtime) async fn next_frame(
+        &mut self,
+    ) -> Result<(usize, Result<ClientTcpDatagramInbound, RuntimeError>), RuntimeError> {
+        if self.paths.is_empty() {
+            return Err(RuntimeError::NoSchedulableTcpPath);
+        }
+        let reads = self.paths.iter_mut().map(|session| {
+            let path_index = session.path_index;
+            Box::pin(async move { (path_index, session.next_frame().await) })
+        });
+        let ((path_index, frame), _, _) = futures::future::select_all(reads).await;
+        Ok((path_index, frame))
+    }
+
+    pub(in crate::runtime) async fn handle_frame(
+        &mut self,
+        path_index: usize,
+        frame: ClientTcpDatagramInbound,
+    ) -> Result<DatagramSessionEvent, RuntimeError> {
+        let position = self
+            .paths
+            .iter()
+            .position(|session| session.path_index == path_index)
+            .ok_or(RuntimeError::NoSchedulableTcpPath)?;
+        let result = self.paths[position].handle_frame(frame).await;
+        if result.is_err() {
+            self.remove_path(path_index, false);
+        }
+        result
+    }
+
+    pub(in crate::runtime) async fn acknowledge(
+        &mut self,
+        path_index: usize,
+        attachment_id: u64,
+        flow_id: DatagramFlowId,
+        datagram_id: DatagramId,
+        write_deadline: tokio::time::Instant,
+    ) -> Result<(), RuntimeError> {
+        let session = self
+            .paths
+            .iter_mut()
+            .find(|session| {
+                session.path_index == path_index && session.attachment_id() == attachment_id
+            })
+            .ok_or(RuntimeError::NoSchedulableTcpPath)?;
+        session
+            .acknowledge(flow_id, datagram_id, write_deadline)
+            .await
+    }
+
+    pub(in crate::runtime) fn attachment_id(&self, path_index: usize) -> Option<u64> {
+        self.paths
+            .iter()
+            .find(|session| session.path_index == path_index)
+            .map(TcpDatagramClientSession::attachment_id)
+    }
+
+    pub(in crate::runtime) fn has_flow(&self, flow_id: DatagramFlowId) -> bool {
+        self.paths.iter().any(|session| session.has_flow(flow_id))
+    }
+
+    pub(in crate::runtime) fn handle_receive_error(&mut self, path_index: usize) {
+        self.remove_path(path_index, false);
+    }
+
+    fn remove_path(&mut self, path_index: usize, failed: bool) {
+        let Some(position) = self
+            .paths
+            .iter()
+            .position(|session| session.path_index == path_index)
+        else {
+            return;
+        };
+        let session = self.paths.swap_remove(position);
+        self.context.mark_tcp_path_delivery_for_instance(
+            path_index,
+            session.path_instance_id(),
+            session.delivery_stats(),
+        );
         self.context
-            .mark_tcp_path_delivery(self.session.path_index, self.session.delivery_stats());
-        self.context
-            .release_tcp_path_load(self.session.path_index, TrafficClass::RealtimeDatagram);
-        close_result
+            .release_tcp_path_load(path_index, TrafficClass::RealtimeDatagram);
+        if failed {
+            self.context.mark_tcp_path_failure(path_index);
+        }
     }
 }
 

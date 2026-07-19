@@ -3,7 +3,7 @@ use crate::mux::MuxLimits;
 use crate::protocol::{Frame, PathId, SessionId, StreamId, UnderlayProtocol};
 use crate::runtime::path::commands::{
     ReliablePathCommand, ReliablePathCommandReceivers, reliable_path_command_channels,
-    try_recv_reliable_path_command, try_recv_reliable_path_priority_command,
+    try_recv_reliable_path_command,
 };
 use crate::runtime::sender::response::multipath::plan_response_data_dispatch;
 use crate::runtime::stream::response::{ResponseStreamAttachOutcome, ResponseStreamBinding};
@@ -30,7 +30,7 @@ fn stream_with_output(output: ReliablePathStreamOutput) -> ReliablePathStream {
         underlay: UnderlayProtocol::Tcp,
         max_frame_payload_bytes: MuxLimits::default().max_payload_bytes,
         output,
-        frames,
+        frames: frames.into(),
     }
 }
 
@@ -107,6 +107,29 @@ fn fixed_data_commit_records_flight_before_publishing_command() {
 }
 
 #[test]
+fn fixed_latency_data_dispatch_overtakes_queued_bulk() {
+    let (commands, mut receivers) = reliable_path_command_channels(1);
+    commands
+        .try_enqueue_admitted_frame(data_frame(4096, 1024), TrafficClass::Throughput)
+        .expect("queue bulk response data");
+    let stream = stream_with_output(ReliablePathStreamOutput::fixed(
+        UnderlayProtocol::Tcp,
+        PathId(4),
+        commands,
+        MuxLimits::default(),
+    ));
+    let frame = data_frame(0, 128);
+    let plan = plan_response_data_dispatch(&stream, TrafficClass::Latency, 0, 128)
+        .expect("latency response has priority capacity");
+
+    emit_planned_response_data_frame(&stream, plan, frame, TrafficClass::Latency)
+        .expect("dispatch latency response data");
+
+    assert_data_command(&mut receivers, 0);
+    assert_data_command(&mut receivers, 4096);
+}
+
+#[test]
 fn switchable_data_commit_publishes_exact_range_and_command() {
     let mut fixture = switchable_fixture();
     let frame = data_frame(4096, 1536);
@@ -167,6 +190,59 @@ fn stale_model_generation_rejects_without_carrier_publication() {
 }
 
 #[test]
+fn closed_carrier_queue_cannot_overtake_ordered_detach() {
+    let fixture = switchable_fixture();
+    let alternate = crate::model::path::CarrierPathKey {
+        underlay: UnderlayProtocol::Udp,
+        path_id: PathId(9),
+    };
+    let (alternate_commands, _alternate_receivers) = reliable_path_command_channels(8);
+    fixture.binding.attach(
+        alternate.underlay,
+        alternate.path_id,
+        alternate_commands,
+        TrafficClass::Throughput,
+    );
+
+    let original = data_frame(0, 1024);
+    fixture
+        .binding
+        .record_original_flight(fixture.initial, &original);
+    let initial_identity = output_identity(&fixture.binding, fixture.initial);
+    let next = data_frame(1024, 1024);
+    let initial_target = fixture
+        .binding
+        .sender_path_targets(TrafficClass::Throughput, 1024)
+        .into_iter()
+        .find(|target| target.observation.key == fixture.initial)
+        .expect("initial response target");
+    let plan = ResponseDataDispatchTarget::Switchable {
+        target: ResponseDispatchTarget::from(&initial_target),
+        expected_model_generation: fixture.binding.response_model_generation(),
+    };
+
+    drop(fixture.initial_receivers);
+    assert!(matches!(
+        emit_planned_response_data_frame(&fixture.stream, plan, next, TrafficClass::Throughput,),
+        Err(RuntimeError::SenderServiceBlocked)
+    ));
+
+    assert!(
+        fixture
+            .binding
+            .has_output_incarnation(initial_identity.0, initial_identity.1),
+        "dispatch must leave ownership for the carrier's ordered detach event"
+    );
+    assert!(
+        fixture
+            .binding
+            .uncovered_failed_original_ranges()
+            .is_empty(),
+        "queue closure alone must not convert accepted ACK order into failed work"
+    );
+}
+
+#[test]
 fn reinjection_prefers_a_path_without_the_original_range() {
     let mut fixture = switchable_fixture();
     let alternate = crate::model::path::CarrierPathKey {
@@ -180,10 +256,7 @@ fn reinjection_prefers_a_path_without_the_original_range() {
         alternate_commands,
         TrafficClass::Throughput,
     );
-    assert!(matches!(
-        try_recv_reliable_path_priority_command(&mut alternate_receivers),
-        Some(ReliablePathCommand::SendFrame(Frame::PathProofData { .. }))
-    ));
+    fixture.binding.mark_output_path_proven_for_test(alternate);
     let frame = data_frame(0, 4096);
     fixture
         .binding
@@ -238,14 +311,12 @@ fn aged_repair_history_on_every_alternate_does_not_block_ack_gap_retry() {
         second_commands,
         TrafficClass::Throughput,
     );
-    assert!(matches!(
-        try_recv_reliable_path_priority_command(&mut first_receivers),
-        Some(ReliablePathCommand::SendFrame(Frame::PathProofData { .. }))
-    ));
-    assert!(matches!(
-        try_recv_reliable_path_priority_command(&mut second_receivers),
-        Some(ReliablePathCommand::SendFrame(Frame::PathProofData { .. }))
-    ));
+    fixture
+        .binding
+        .mark_output_path_proven_for_test(first_alternate);
+    fixture
+        .binding
+        .mark_output_path_proven_for_test(second_alternate);
 
     let frame = data_frame(0, 4096);
     fixture

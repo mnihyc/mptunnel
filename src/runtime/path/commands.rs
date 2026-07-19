@@ -6,8 +6,9 @@
 use super::ports::OpenedReliableCarrierStream;
 use super::queue::TcpCapacityProbeLease;
 use super::tcp::capacity::RequestTcpCapacityProbeLease;
-use crate::model::path::RelayPathInstance;
-use crate::protocol::{Frame, PathId, ResetReason, StreamId, TargetAddr};
+use super::tcp::client::ClientTcpDatagramInbound;
+use crate::model::path::{CarrierPathInstanceId, RelayPathInstance};
+use crate::protocol::{DatagramFlowId, Frame, PathId, ResetReason, StreamId, TargetAddr};
 use crate::runtime::error::RuntimeError;
 use crate::scheduler::TrafficClass;
 use std::sync::{
@@ -15,19 +16,20 @@ use std::sync::{
     atomic::{AtomicU8, Ordering},
 };
 use std::time::{Duration, Instant};
-use tokio::sync::oneshot;
+use tokio::sync::{mpsc, oneshot};
 
-pub(in crate::runtime) use super::queue::ReliablePathCommandSender;
 pub(in crate::runtime) use super::queue::{
     ReliablePathCommandQueueSnapshot, ReliablePathCommandReceivers, recv_reliable_path_command,
-    reliable_path_command_carrier_credit_bytes, reliable_path_command_channels,
-    reliable_path_command_channels_with_send_credit, reliable_path_command_pending_bytes,
+    reliable_path_command_channels, reliable_path_command_pending_bytes,
     reliable_path_command_queue, reliable_path_command_writer_run_budget_bytes,
     reliable_path_command_writer_run_budget_items, reliable_path_command_writer_run_bytes,
     reliable_path_effective_frame_lane, reliable_path_frame_requires_capacity_command,
     reliable_path_receivers_closed, reliable_path_writer_frame_queue, reliable_stream_frame_queue,
     reliable_stream_frame_queue_for_payload, try_coalesce_reliable_path_writer_run,
     try_recv_reliable_path_command, try_recv_reliable_path_priority_command,
+};
+pub(in crate::runtime) use super::queue::{
+    ReliablePathCommandSender, ReliablePathLoadRegistration,
 };
 #[cfg(test)]
 pub(in crate::runtime) use super::queue::{
@@ -218,6 +220,31 @@ pub(in crate::runtime) enum ReliablePathCommand {
     CancelTcpOpen {
         stream_id: StreamId,
         attempt_id: ClientTcpOpenAttemptId,
+    },
+    OpenDatagramAttachment {
+        attachment_id: u64,
+        frames: mpsc::Sender<Result<ClientTcpDatagramInbound, RuntimeError>>,
+        failure: oneshot::Sender<()>,
+        open_deadline: tokio::time::Instant,
+        response: oneshot::Sender<Result<CarrierPathInstanceId, RuntimeError>>,
+    },
+    OpenDatagramFlow {
+        attachment_id: u64,
+        flow_id: DatagramFlowId,
+        target: TargetAddr,
+        open_deadline: tokio::time::Instant,
+        response: oneshot::Sender<Result<(), RuntimeError>>,
+    },
+    SendDatagramFrame {
+        attachment_id: u64,
+        frame: Frame,
+        write_deadline: tokio::time::Instant,
+        expires_at: Option<tokio::time::Instant>,
+        response: oneshot::Sender<Result<(), RuntimeError>>,
+    },
+    CloseDatagramAttachment {
+        attachment_id: u64,
+        response: Option<oneshot::Sender<Result<(), RuntimeError>>>,
     },
     SendFrame(Frame),
     SendTcpCapacityProbe(TcpCapacityProbeCommand),

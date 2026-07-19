@@ -35,6 +35,7 @@ if ($Target -match "^x86_64-.*-windows-") {
 
 $RepoRoot = (Resolve-Path (Join-Path $PSScriptRoot "..")).Path
 $OriginalLocation = Get-Location
+$OriginalRustFlags = $env:RUSTFLAGS
 
 function Get-WintunArchive {
     $CacheDir = Join-Path "target" "release-dependencies"
@@ -89,6 +90,11 @@ try {
     Set-Location $RepoRoot
 
     if (-not $NoBuild) {
+        if ([string]::IsNullOrWhiteSpace($env:RUSTFLAGS)) {
+            $env:RUSTFLAGS = "-C target-feature=+crt-static"
+        } elseif (-not $env:RUSTFLAGS.Contains("+crt-static")) {
+            $env:RUSTFLAGS = "$env:RUSTFLAGS -C target-feature=+crt-static"
+        }
         cargo build --locked --profile $Profile --target $Target --bin mptunnel
         if ($LASTEXITCODE -ne 0) {
             throw "cargo build failed for $Target"
@@ -123,7 +129,7 @@ try {
     $Package = "mptunnel-$Version-$Target"
     $DistDir = "dist"
     $Stage = Join-Path $DistDir $Package
-    $ReleaseFiles = @("README.md", "RFC.md", "LICENSE", "SECURITY.md", "CONTRIBUTING.md", "config.toml")
+    $ReleaseFiles = @("README.md", "RFC.md", "LICENSE", "THIRD_PARTY_LICENSES.html", "SECURITY.md", "CONTRIBUTING.md", "config.toml")
     $ReleaseDocs = @("docs/ARCHITECTURE.md", "docs/OPERATIONS.md", "docs/PERFORMANCE.md")
     $ReleaseExamples = @("examples/client.toml", "examples/server.toml")
     $ReleaseAssets = @("docs/assets/dashboard.png")
@@ -161,5 +167,6 @@ try {
     "$Hash  $ArchiveName" | Set-Content -Encoding ascii $Checksum
     Write-Output $Archive
 } finally {
+    $env:RUSTFLAGS = $OriginalRustFlags
     Set-Location $OriginalLocation
 }

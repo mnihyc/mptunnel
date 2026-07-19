@@ -4,6 +4,7 @@
 //! lifecycle and typed capacity receipts to their respective state owners.
 
 use super::client_capacity::handle_client_tcp_capacity_frame;
+use super::client_datagram::ClientTcpDatagramState;
 use super::client_state::{ClientTcpPathConnection, ClientTcpPathSessionRuntime};
 use super::client_stream::{
     ClientTcpPathStreamState, expire_client_tcp_pending_opens, handle_client_tcp_stream_frame,
@@ -19,6 +20,7 @@ pub(super) async fn handle_client_tcp_path_frame(
     connection: &mut ClientTcpPathConnection,
     streams: &mut HashMap<StreamId, ClientTcpPathStreamState>,
     closed_streams: &mut RecentIdCache<StreamId>,
+    datagrams: &mut ClientTcpDatagramState,
     runtime: &ClientTcpPathSessionRuntime,
 ) -> Result<(), RuntimeError> {
     connection.carrier.refresh_liveness();
@@ -46,6 +48,9 @@ pub(super) async fn handle_client_tcp_path_frame(
             handle_client_tcp_stream_frame(frame, connection, streams, closed_streams, runtime)
                 .await
         }
+        frame @ (Frame::DatagramData { .. }
+        | Frame::DatagramFeedback { .. }
+        | Frame::DatagramClose { .. }) => datagrams.route_inbound(frame),
         Frame::Ping { nonce } => {
             connection
                 .carrier

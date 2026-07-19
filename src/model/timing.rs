@@ -14,7 +14,6 @@ use std::time::Duration;
 const TCP_MIN_RETRANSMISSION_TIMEOUT: Duration = Duration::from_millis(200);
 const TCP_INITIAL_RETRANSMISSION_TIMEOUT: Duration = Duration::from_secs(1);
 const MPTCP_STALE_LOSS_COUNT: u32 = 4;
-const DATA_ACK_GAP_PERSISTENCE_INTERVALS: u32 = 3;
 
 pub(crate) fn transport_pto_from_ms(srtt_ms: f64, rttvar_ms: f64) -> Duration {
     let srtt = Duration::from_secs_f64(srtt_ms.max(0.0) / 1000.0);
@@ -49,6 +48,72 @@ pub(crate) fn reliable_data_retransmission_interval(
     }
 }
 
+/// Data ACK gaps use the carrier's established time-threshold loss model:
+/// TCP RACK uses 5/4 SRTT and QUIC uses the RFC 9002 default 9/8 SRTT.
+pub(crate) fn reliable_data_ack_loss_delay(
+    underlay: Option<UnderlayProtocol>,
+    path: Option<PathSnapshot>,
+) -> Option<Duration> {
+    let path = path?;
+    let multiplier = match underlay.unwrap_or(path.underlay) {
+        UnderlayProtocol::Tcp => 5.0 / 4.0,
+        UnderlayProtocol::Udp => 9.0 / 8.0,
+    };
+    let delay_ms = (path.srtt_ms.max(1.0) * multiplier).max(1.0);
+    delay_ms
+        .is_finite()
+        .then(|| Duration::from_secs_f64(delay_ms / 1000.0))
+}
+
+/// An authoritative later Data ACK may repair one bounded range only after the
+/// original flight is time-threshold lost and an alternate can beat recovery.
+pub(crate) fn reliable_data_ack_gap_reinjection_deadline(
+    original_assignment_at: Option<std::time::Instant>,
+    underlay: Option<UnderlayProtocol>,
+    original_path: Option<PathSnapshot>,
+    alternate_completion: Option<Duration>,
+) -> Option<std::time::Instant> {
+    let original_assignment_at = original_assignment_at?;
+    let loss_delay = reliable_data_ack_loss_delay(underlay, original_path)?;
+    let alternate_completion = alternate_completion?;
+    if alternate_completion >= reliable_data_retransmission_interval(underlay, original_path) {
+        return None;
+    }
+    original_assignment_at.checked_add(loss_delay)
+}
+
+/// Without a later ACK, connection-level recovery waits for the owning
+/// carrier's RTO/PTO. Silence alone is not a RACK or QUIC loss declaration.
+pub(crate) fn reliable_data_ack_recovery_deadline(
+    original_assignment_at: Option<std::time::Instant>,
+    underlay: Option<UnderlayProtocol>,
+    original_path: Option<PathSnapshot>,
+    alternate_completion: Option<Duration>,
+) -> Option<std::time::Instant> {
+    let original_assignment_at = original_assignment_at?;
+    let recovery_interval = reliable_data_retransmission_interval(underlay, original_path);
+    if alternate_completion? >= recovery_interval {
+        return None;
+    }
+    original_assignment_at.checked_add(recovery_interval)
+}
+
+pub(crate) fn reliable_data_ack_gap_reinjection_ready(
+    original_assignment_at: Option<std::time::Instant>,
+    underlay: Option<UnderlayProtocol>,
+    original_path: Option<PathSnapshot>,
+    alternate_completion: Option<Duration>,
+    now: std::time::Instant,
+) -> bool {
+    reliable_data_ack_gap_reinjection_deadline(
+        original_assignment_at,
+        underlay,
+        original_path,
+        alternate_completion,
+    )
+    .is_some_and(|deadline| now >= deadline)
+}
+
 /// Repeated recovery intervals without exact data progress make a path stale
 /// for new assignments. Existing carrier recovery continues independently.
 pub(crate) fn reliable_path_stale_interval(
@@ -62,16 +127,6 @@ pub(crate) fn reliable_path_stale_interval(
             interval.saturating_mul(QUIC_PERSISTENT_CONGESTION_THRESHOLD)
         }
     }
-}
-
-/// Product reinjection waits for a persistent Data ACK gap rather than racing
-/// a transient carrier recovery episode.
-pub(crate) fn reliable_data_ack_gap_persistence_interval(
-    underlay: Option<UnderlayProtocol>,
-    path: Option<PathSnapshot>,
-) -> Duration {
-    reliable_data_retransmission_interval(underlay, path)
-        .saturating_mul(DATA_ACK_GAP_PERSISTENCE_INTERVALS)
 }
 
 /// Product reinjection waits one carrier recovery interval derived from the

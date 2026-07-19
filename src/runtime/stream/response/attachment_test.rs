@@ -2,9 +2,9 @@ use super::super::next_server_carrier_path_instance_id;
 use super::super::test_support::{binding_for_underlay, output_entry_for_key, stream_data_frame};
 use super::ResponseStreamAttachOutcome;
 use crate::model::path::CarrierPathKey;
-use crate::protocol::{Frame, OffsetRange, PathId, PathUsage, UnderlayProtocol};
+use crate::protocol::{OffsetRange, PathId, PathUsage, UnderlayProtocol};
 use crate::runtime::path::commands::{
-    ReliablePathCommand, reliable_path_command_channels, try_recv_reliable_path_priority_command,
+    reliable_path_command_channels, try_recv_reliable_path_priority_command,
 };
 use crate::scheduler::TrafficClass;
 
@@ -38,7 +38,25 @@ fn live_output_tracks_real_carrier_receiver_lifetime_and_reattachment() {
 }
 
 #[test]
-fn neutral_attach_adds_one_output_and_validates_the_carrier() {
+fn output_load_registration_tracks_lane_change_and_withdrawal() {
+    let (binding, key, _receivers) = binding_for_underlay(UnderlayProtocol::Tcp);
+    let entry = output_entry_for_key(&binding, key);
+    assert_eq!(entry.commands.active_flow_counts(), (1, 0));
+
+    binding.set_lane(TrafficClass::Latency);
+    assert_eq!(entry.commands.active_flow_counts(), (1, 1));
+
+    let incarnation = binding
+        .begin_path_detach(key, entry.path_instance_id)
+        .expect("attached output begins withdrawal");
+    assert_eq!(entry.commands.active_flow_counts(), (0, 0));
+
+    binding.complete_path_detach(key, entry.path_instance_id, incarnation);
+    assert_eq!(entry.commands.active_flow_counts(), (0, 0));
+}
+
+#[test]
+fn neutral_attach_adds_one_output_without_publishing_protocol_frames() {
     let (binding, initial, _initial_receivers) = binding_for_underlay(UnderlayProtocol::Tcp);
     let alternate = alternate_key(UnderlayProtocol::Udp);
     let (commands, mut receivers) = reliable_path_command_channels(8);
@@ -59,14 +77,7 @@ fn neutral_attach_adds_one_output_and_validates_the_carrier() {
     assert!(outputs.entries.iter().any(|entry| entry.key == alternate));
     drop(outputs);
     assert_eq!(binding.lane(), TrafficClass::Latency);
-    assert!(matches!(
-        try_recv_reliable_path_priority_command(&mut receivers),
-        Some(ReliablePathCommand::SendFrame(Frame::PathProofData {
-            path_id,
-            payload,
-            ..
-        })) if path_id == alternate.path_id && !payload.is_empty()
-    ));
+    assert!(try_recv_reliable_path_priority_command(&mut receivers).is_none());
 }
 
 #[test]
@@ -132,11 +143,7 @@ fn duplicate_live_output_preserves_identity_and_rejects_a_different_channel() {
         ),
         ResponseStreamAttachOutcome::Attached
     );
-    let proof = try_recv_reliable_path_priority_command(&mut receivers);
-    assert!(matches!(
-        proof,
-        Some(ReliablePathCommand::SendFrame(Frame::PathProofData { .. }))
-    ));
+    assert!(try_recv_reliable_path_priority_command(&mut receivers).is_none());
     let before = output_entry_for_key(&binding, key);
 
     assert_eq!(

@@ -32,9 +32,9 @@ use crate::runtime::path::quic::io::{
 use crate::runtime::path::quic::server_writer::drain_server_udp_reliable_commands;
 use crate::runtime::path::server_context::ServerPathContext;
 use crate::runtime::path::{
-    ClientPathHealth, ClientPathHealthRecord, ClientPathState, ServerCarrierPathRegistration,
-    ServerLocalPathProperties, ServerStreamOpenOutcome, ServerStreamOpenRequest,
-    ServerStreamPathAttachment,
+    ClientPathHealth, ClientPathHealthRecord, ClientPathState, PathProofObservation,
+    ServerCarrierPathRegistration, ServerLocalPathProperties, ServerStreamOpenOutcome,
+    ServerStreamOpenRequest, ServerStreamPathAttachment,
 };
 use crate::runtime::peer_status::{PeerStatusBroker, PeerStatusSnapshotSource};
 use crate::runtime::stream::{
@@ -47,7 +47,7 @@ use crate::transport::{
 };
 use std::net::SocketAddr;
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use tokio::sync::mpsc;
 
 struct ServerUdpTerminalWriterFixture {
@@ -98,6 +98,17 @@ impl ServerUdpTerminalWriterFixture {
             UnderlayProtocol::Udp,
             path_id,
             ServerLocalPathProperties::default(),
+        );
+        let proof_elapsed = Duration::from_millis(1);
+        context.reliable_streams.record_path_proof_success(
+            &path_registration,
+            PathProofObservation {
+                proof_id: 1,
+                elapsed: proof_elapsed,
+                sent_at: Instant::now()
+                    .checked_sub(proof_elapsed)
+                    .expect("test validation instant"),
+            },
         );
         let (commands_tx, commands_rx) = reliable_path_command_channels(8);
         let target = TargetAddr::Ip(SocketAddr::from(([127, 0, 0, 1], 80)));
@@ -256,7 +267,6 @@ async fn reliable_output_guard_detaches_on_abnormal_stream_exit() {
     );
     let target = TargetAddr::Ip(SocketAddr::from(([127, 0, 0, 1], 80)));
     let (commands, _receivers) = reliable_path_command_channels(8);
-    let commands_for_guard = commands.clone();
     let outcome = streams
         .open_or_attach(ServerStreamOpenRequest {
             session_id,
@@ -276,14 +286,14 @@ async fn reliable_output_guard_detaches_on_abnormal_stream_exit() {
         .await
         .expect("open UDP response stream");
     assert_eq!(outcome, ServerStreamOpenOutcome::New);
-    let accepted = accepted_rx
+    let mut accepted = accepted_rx
         .recv()
         .await
         .expect("receive accepted UDP response stream");
-    let stream = accepted.stream();
-    let ReliablePathStreamOutput::Switchable(binding) = &stream.output else {
+    let ReliablePathStreamOutput::Switchable(binding) = &accepted.stream().output else {
         panic!("expected switchable response output");
     };
+    let binding = binding.clone();
     assert_eq!(
         binding
             .sender_path_targets(TrafficClass::Throughput, MAX_RELIABLE_SERVICE_QUANTUM_BYTES)
@@ -293,11 +303,17 @@ async fn reliable_output_guard_detaches_on_abnormal_stream_exit() {
 
     drop(ServerUdpReliableOutputDetachGuard {
         streams,
-        session_id,
+        path_registration,
         stream_id,
-        path_id,
-        commands: commands_for_guard,
     });
+
+    let mut stream = accepted.take_stream();
+    assert!(
+        tokio::time::timeout(Duration::from_millis(25), stream.recv_frame())
+            .await
+            .is_err(),
+        "detach lifecycle should apply before waiting for the next product frame"
+    );
 
     assert!(
         binding
@@ -342,11 +358,9 @@ async fn server_quic_terminal_writer_flushes_reset_then_detaches_and_finishes_st
             .expect("server QUIC command receivers"),
         fixture.server_send.as_mut().expect("server QUIC sender"),
         &fixture.context,
-        fixture.session_id,
         fixture.stream_id,
         fixture.path_id,
         &fixture._path_registration,
-        &fixture.commands_tx,
         &mut pending_frames,
         &mut path_proofs,
         &mut carrier_frames,
@@ -377,8 +391,21 @@ async fn server_quic_terminal_writer_flushes_reset_then_detaches_and_finishes_st
             reason: ResetReason::Refused,
         }
     );
+    let ReliablePathStreamOutput::Switchable(binding) = &fixture.accepted.stream().output else {
+        panic!("expected switchable server response output");
+    };
+    let binding = binding.clone();
+    let mut product_stream = fixture.accepted.take_stream();
+    assert!(
+        tokio::time::timeout(Duration::from_millis(25), product_stream.recv_frame())
+            .await
+            .is_err(),
+        "terminal detach should apply before waiting for another product frame"
+    );
     assert_eq!(
-        fixture.attached_output_count(),
+        binding
+            .sender_path_targets(TrafficClass::Throughput, MAX_RELIABLE_SERVICE_QUANTUM_BYTES)
+            .len(),
         0,
         "the matching terminal writer detaches its exact response output"
     );
@@ -423,10 +450,8 @@ async fn server_quic_mismatched_terminal_releases_debt_and_guard_fails_closed() 
     assert_eq!(fixture.commands_tx.pending_bytes(), command_debt);
     let output_guard = ServerUdpReliableOutputDetachGuard {
         streams: fixture.context.reliable_streams.clone(),
-        session_id: fixture.session_id,
+        path_registration: fixture._path_registration.clone(),
         stream_id: fixture.stream_id,
-        path_id: fixture.path_id,
-        commands: fixture.commands_tx.clone(),
     };
     let mut server_send = fixture.server_send.take().expect("server QUIC sender");
     let mut pending_frames = Vec::new();
@@ -442,11 +467,9 @@ async fn server_quic_mismatched_terminal_releases_debt_and_guard_fails_closed() 
             .expect("server QUIC command receivers"),
         &mut server_send,
         &fixture.context,
-        fixture.session_id,
         fixture.stream_id,
         fixture.path_id,
         &fixture._path_registration,
-        &fixture.commands_tx,
         &mut pending_frames,
         &mut path_proofs,
         &mut carrier_frames,
@@ -461,10 +484,23 @@ async fn server_quic_mismatched_terminal_releases_debt_and_guard_fails_closed() 
     ));
     assert_eq!(fixture.commands_tx.pending_bytes(), 0);
     assert!(pending_frames.is_empty());
+    let ReliablePathStreamOutput::Switchable(binding) = &fixture.accepted.stream().output else {
+        panic!("expected switchable server response output");
+    };
+    let binding = binding.clone();
     drop(output_guard);
     drop(server_send);
+    let mut product_stream = fixture.accepted.take_stream();
+    assert!(
+        tokio::time::timeout(Duration::from_millis(25), product_stream.recv_frame())
+            .await
+            .is_err(),
+        "guard detach should apply before waiting for another product frame"
+    );
     assert_eq!(
-        fixture.attached_output_count(),
+        binding
+            .sender_path_targets(TrafficClass::Throughput, MAX_RELIABLE_SERVICE_QUANTUM_BYTES)
+            .len(),
         0,
         "the enclosing stream guard detaches the actual attachment on writer failure"
     );
@@ -677,6 +713,7 @@ async fn server_quic_ordered_close_drains_peer_until_stream_detach() {
             target,
             commands_tx,
             commands_rx,
+            path_proofs: PathProofTracker::default(),
         },
     ));
 

@@ -7,15 +7,15 @@ layers.
 
 The shared Multipath Proxy Protocol (MPP) data layer provides directional data
 sequence numbers, Data ACKs, flow control, measured path selection,
-cross-path reinjection, and failover. The current wire format is MPP v2 and is
-not compatible with protocol v1.
+cross-path reinjection, and failover. The current wire format is MPP v3 and is
+not compatible with protocol v1 or v2.
 
-> **Release status:** v0.1.0 is an initial release. The protocol is custom and
+> **Release status:** v0.1.1 is an initial release. The protocol is custom and
 > has not received an independent security audit. Review the
 > [security and platform limitations](#security-and-limitations) before
 > exposing a deployment.
 
-## Why mptunnel
+## Features
 
 - Aggregate healthy paths for sustained reliable traffic without assigning a
   permanent role to a link.
@@ -30,34 +30,28 @@ not compatible with protocol v1.
 
 ## Measured performance
 
-The table below is one controlled pre-release Linux Docker reference cohort,
-not an Internet-wide claim or a rebinding of old baselines to the final binary.
-Each shaped high-bandwidth path was 500 Mbps with 180 ms one-way delay, 20 ms
-jitter, and no configured loss. Each row used one 10-second reliable bulk flow;
-multipath rows used five equal paths.
+The table below is from the v0.1.1 release gate. The Windows binary ran under
+Wine against a native Linux server. Each shaped path was 500 Mbps with 180 ms
+one-way delay and no configured loss; multipath rows used five equal paths.
+Results are specific to this topology and are not an Internet-speed guarantee.
 
 | Reliable carrier | Paths | Download | Upload | Multipath gain |
 | --- | ---: | ---: | ---: | ---: |
-| MPP over TCP | 1 | 159.142 Mbps | 167.440 Mbps | - |
-| MPP over TCP | 5 | 246.717 Mbps | 268.819 Mbps | +55.0% / +60.5% |
-| MPP over QUIC | 1 | 208.399 Mbps | 235.062 Mbps | - |
-| MPP over QUIC | 5 | 326.844 Mbps | 430.732 Mbps | +56.8% / +83.2% |
+| MPP over TCP | 1 | 140.624 Mbps | 168.241 Mbps | - |
+| MPP over TCP | 5 | 210.973 Mbps | 289.208 Mbps | +50.0% / +71.9% |
 
-In the same cohort, five-path MPTCP measured 97.120 Mbps download and
-148.929 Mbps upload; single-path direct TCP measured 171.006/168.156 Mbps and
-VMess measured 172.267/168.776 Mbps. These results show aggregation in this
-specific high-delay topology. They do not imply the same ranking on every
-network.
+The same release candidate reached 438.729 Mbps for a native Linux mixed
+TCP+QUIC upload. In balanced-path blackhole tests, native Linux resumed
+download in 0.363 seconds and destination upload in 0.778 seconds; the Windows
+binary under Wine measured 0.278 and 1.471 seconds respectively.
 
-See [Performance evidence](docs/PERFORMANCE.md) for the final-runtime guard,
-full historical baseline table, failover results, Wine comparison, exact
-identities, methodology, and limitations.
+See [Performance evidence](docs/PERFORMANCE.md) for methodology, representative
+measurements, failover results, and limitations.
 
 ## Install
 
 Download the archive for your platform and its adjacent checksum from
-[Releases](https://github.com/mnihyc/mptunnel/releases). Release archives are
-produced for:
+[Releases](../../releases). Release archives are produced for:
 
 - Linux x86_64 and aarch64 using musl
 - Windows x86_64 and aarch64 using MSVC
@@ -67,7 +61,7 @@ produced for:
 Verify an archive before extracting it:
 
 ```bash
-sha256sum -c mptunnel-0.1.0-x86_64-unknown-linux-musl.tar.gz.sha256
+sha256sum -c mptunnel-0.1.1-x86_64-unknown-linux-musl.tar.gz.sha256
 ```
 
 On macOS, use `shasum -a 256 -c <checksum-file>`. On Windows, compare
@@ -150,9 +144,9 @@ Peer path diagnostics are disabled by default. Enable
 `--management-allow-peer-diagnostics` on the endpoint that may answer a
 request. The same 1 s, 5 s, 30 s, or manual-only dashboard cadence refreshes
 local status and the selected authenticated peer without overlapping cycles.
-The response does not expose endpoints, targets, credentials, or other sessions. See
-[Operations](docs/OPERATIONS.md#management-api) for the API contract and
-remote-access guidance.
+The response does not expose endpoints, targets, credentials, or other
+sessions. See [Operations](docs/OPERATIONS.md#management-api) for the API
+contract and remote-access guidance.
 
 ## Protocol model
 
@@ -196,14 +190,14 @@ before enabling TUN.
 Native TCP telemetry is adapted per platform: `TCP_INFO` on Linux/Android,
 `TCP_CONNECTION_INFO` on macOS, and `SIO_TCP_INFO` where Windows provides
 it. Correctness does not depend on telemetry. When it is unavailable,
-`mptunnel` uses portable Data ACK and socket-backpressure evidence and prints
-a performance warning; high-bandwidth, high-delay upload may be slower.
+`mptunnel` uses portable Data ACK and socket-backpressure evidence and logs the
+selected telemetry mode.
 
 QUIC normally uses Quinn's native UDP adapter. On Windows compatibility layers
 that lack optional ECN or segmentation socket features, `mptunnel` falls back
-to basic datagram I/O and prints a separate performance warning. Quinn still
-owns QUIC congestion control, packet recovery, and timeouts; native Windows
-uses the optimized adapter when its socket capabilities are available.
+to basic datagram I/O and logs the compatibility fallback. Quinn still owns
+QUIC congestion control, packet recovery, and timeouts; native Windows uses the
+optimized adapter when its socket capabilities are available.
 
 ## Security and limitations
 

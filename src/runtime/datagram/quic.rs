@@ -1,30 +1,24 @@
 //! QUIC datagram path selection, pacing, and failover.
 
+use super::DatagramSessionEvent;
 use super::UDP_PATH_HANDSHAKE_TIMEOUT;
-use super::association::{DatagramUnderlaySendError, runtime_error_is_datagram_response_timeout};
-use super::policy::{
-    DatagramPathSendError, DatagramTimeoutAction, datagram_remaining_ttl_ms,
-    datagram_timeout_action,
-};
+use super::association::{DatagramPathSend, runtime_error_is_datagram_response_timeout};
+use super::policy::{DatagramPathSendError, datagram_remaining_ttl_ms};
 use super::quic_session::{UdpDatagramClientSession, open_udp_datagram_session_on_path};
 use crate::model::capacity::{QUIC_PERSISTENT_CONGESTION_THRESHOLD, QUIC_TIMER_GRANULARITY};
 use crate::model::timing::default_transport_pto;
-use crate::mux::datagram::DatagramError;
-use crate::protocol::TargetAddr;
+use crate::protocol::{DatagramFlowId, DatagramId, Frame};
 use crate::runtime::error::RuntimeError;
 use crate::runtime::path::model::{
-    UdpDatagramPathObservation, UdpPathRuntimeModel, path_is_endpoint_only,
-    udp_observation_has_datagram_feedback,
+    UdpPathRuntimeModel, path_is_endpoint_only, udp_observation_has_datagram_feedback,
 };
 use crate::runtime::path::{ClientPathContext, UdpPathCandidate};
 use crate::scheduler::{PathSnapshot, path_within_adaptive_lead_hysteresis};
 use crate::transport::RateHint;
-use bytes::Bytes;
 use std::collections::{HashMap, HashSet};
+use std::future::Future;
+use std::pin::Pin;
 use std::time::{Duration, Instant};
-
-#[cfg(feature = "lab-diagnostics")]
-use crate::lab_diagnostics::lab_diagnostic;
 
 pub(in crate::runtime) struct UdpDatagramClientAssociation {
     pub(in crate::runtime) context: ClientPathContext,
@@ -98,286 +92,64 @@ impl UdpDatagramClientAssociation {
         }
     }
 
-    pub(in crate::runtime) async fn send_to(
+    pub(super) async fn send_to_path_index(
         &mut self,
-        target: TargetAddr,
-        payload: Bytes,
-        product_deadline: tokio::time::Instant,
-        attempt_limit: usize,
-        has_unattempted_outer_alternative: bool,
-    ) -> Result<Bytes, DatagramUnderlaySendError> {
-        if payload.len() > self.context.mux_limits.max_payload_bytes {
-            return Err(DatagramUnderlaySendError::Runtime {
-                feedback_received: false,
-                product_attempts: 0,
-                source: RuntimeError::Datagram(DatagramError::PayloadTooLarge {
-                    actual: payload.len(),
-                    limit: self.context.mux_limits.max_payload_bytes,
-                }),
-            });
-        }
-        let ttl_ms = datagram_remaining_ttl_ms(product_deadline);
-        let candidates = self
-            .context
-            .ordered_udp_path_candidates_for_ttl(payload.len(), ttl_ms);
-        if candidates.is_empty() {
-            #[cfg(feature = "lab-diagnostics")]
+        path_index: usize,
+        send: DatagramPathSend,
+    ) -> Result<(), DatagramPathSendError> {
+        let product_deadline = send.product_deadline;
+        let result = self.send_to_path(path_index, send).await;
+        match result {
+            Ok(()) => {
+                self.last_successful_path = Some(path_index);
+                Ok(())
+            }
+            Err(DatagramPathSendError::Runtime(source))
+                if udp_datagram_error_is_path_retryable(&source) =>
             {
-                let now = Instant::now();
-                let observations = self
-                    .context
-                    .health()
-                    .lock()
-                    .expect("client path health lock")
-                    .udp
-                    .iter()
-                    .enumerate()
-                    .map(|(index, record)| {
-                        let observation = record.observation_at(now);
-                        format!(
-                            "{}:{:?}:srtt={:?}:rate={:?}:carrier_rate={:?}:flows={}:failed={:?}",
-                            index,
-                            observation.state,
-                            observation.measured_srtt_ms,
-                            observation.measured_rate_bps,
-                            observation.carrier_delivery_rate_bps,
-                            observation.active_flows,
-                            record.failed_until.map(|deadline| deadline
-                                .saturating_duration_since(now)
-                                .as_millis())
-                        )
-                    })
-                    .collect::<Vec<_>>()
-                    .join(",");
-                lab_diagnostic(
-                    "udp_datagram_no_candidates",
-                    format_args!(
-                        "udp_paths={} payload_bytes={} ttl_ms={} observations={}",
-                        self.context.udp_paths.len(),
-                        payload.len(),
-                        ttl_ms,
-                        observations
-                    ),
-                );
-            }
-            return Err(DatagramUnderlaySendError::Runtime {
-                feedback_received: false,
-                product_attempts: 0,
-                source: RuntimeError::NoSchedulableUdpPath,
-            });
-        }
-
-        self.prune_suppressed_paths();
-        let mut attempted = HashSet::new();
-        let mut product_attempts = 0usize;
-        let mut last_retryable_error = None;
-        loop {
-            let remaining_ttl_ms = datagram_remaining_ttl_ms(product_deadline);
-            if remaining_ttl_ms == 0 || product_attempts >= attempt_limit {
-                return Err(DatagramUnderlaySendError::Timeout {
-                    feedback_received: false,
-                    product_attempts,
-                    source: RuntimeError::DatagramResponseTimedOut,
-                });
-            }
-            let Some(path_index) = self.select_path_candidate(
-                &candidates,
-                &attempted,
-                payload.len(),
-                remaining_ttl_ms,
-            ) else {
-                break;
-            };
-            #[cfg(feature = "lab-diagnostics")]
-            if let Some(snapshot) = self.context.udp_path_snapshot(path_index) {
-                let now = Instant::now();
-                let (datagram_samples, delivery_samples, carrier_samples, failed_for_ms) = self
-                    .context
-                    .health()
-                    .lock()
-                    .expect("client path health lock")
-                    .udp
-                    .get(path_index)
-                    .map(|record| {
-                        (
-                            record.datagram_feedback_samples,
-                            record.delivery_samples,
-                            record.carrier_delivery_samples,
-                            record
-                                .failed_until
-                                .map(|until| until.saturating_duration_since(now).as_millis())
-                                .unwrap_or(0),
-                        )
-                    })
-                    .unwrap_or_default();
-                lab_diagnostic(
-                    "udp_datagram_path_selected",
-                    format_args!(
-                        "path_index={} payload_bytes={} ttl_ms={} srtt_ms={:.3} jitter_ms={:.3} delivery_mbps={:.3} queue_bytes={} data_level_queue_bytes={} bytes_in_flight={} data_level_bytes_in_flight={} active_flows={} active_latency_flows={} state={:?} datagram_samples={} delivery_samples={} carrier_samples={} failed_for_ms={} last_successful={:?}",
-                        path_index,
-                        payload.len(),
-                        remaining_ttl_ms,
-                        snapshot.srtt_ms,
-                        snapshot.jitter_ms,
-                        snapshot.delivery_rate_bps / 1_000_000.0,
-                        snapshot.queue_bytes,
-                        snapshot.data_level_queue_bytes,
-                        snapshot.bytes_in_flight,
-                        snapshot.data_level_bytes_in_flight,
-                        snapshot.active_flows,
-                        snapshot.active_latency_sensitive_flows,
-                        snapshot.state,
-                        datagram_samples,
-                        delivery_samples,
-                        carrier_samples,
-                        failed_for_ms,
-                        self.last_successful_path,
-                    ),
-                );
-            }
-            attempted.insert(path_index);
-            product_attempts = product_attempts.saturating_add(1);
-            let has_unattempted_internal_alternative = product_attempts < attempt_limit
-                && candidates
-                    .iter()
-                    .any(|candidate| !attempted.contains(&candidate.path_index));
-            let has_unattempted_alternative =
-                has_unattempted_outer_alternative || has_unattempted_internal_alternative;
-            let remaining = Duration::from_millis(u64::from(remaining_ttl_ms));
-            let fallback_deadline = if has_unattempted_alternative {
-                tokio::time::Instant::now() + remaining / 2
-            } else {
-                product_deadline
-            };
-            match self
-                .send_to_path(
+                self.remove_path(path_index);
+                self.suppress_path_after_carrier_failure(
                     path_index,
-                    target.clone(),
-                    payload.clone(),
-                    fallback_deadline,
-                    product_deadline,
-                    has_unattempted_alternative,
-                )
-                .await
-            {
-                Ok(response) => {
-                    self.last_successful_path = Some(path_index);
-                    return Ok(response);
-                }
-                Err(DatagramPathSendError::PayloadLimitExceeded { limit }) => {
-                    let source = RuntimeError::Datagram(DatagramError::PayloadTooLarge {
-                        actual: payload.len(),
-                        limit,
-                    });
-                    product_attempts = product_attempts.saturating_sub(1);
-                    if !has_unattempted_internal_alternative {
-                        return Err(DatagramUnderlaySendError::PayloadLimitExceeded {
-                            product_attempts,
-                            source,
-                        });
-                    }
-                    last_retryable_error = Some(source);
-                }
-                Err(DatagramPathSendError::Timeout {
-                    feedback_received,
-                    response_timeout,
-                }) => {
-                    match datagram_timeout_action(
-                        feedback_received,
-                        has_unattempted_internal_alternative,
-                    ) {
-                        DatagramTimeoutAction::RetryAlternative => {
-                            self.remove_path(path_index);
-                            self.suppress_path_after_timeout(
-                                path_index,
-                                response_timeout,
-                                remaining_ttl_ms,
-                            );
-                            self.context.mark_udp_path_failure(path_index);
-                            last_retryable_error = Some(RuntimeError::DatagramResponseTimedOut);
-                            #[cfg(feature = "lab-diagnostics")]
-                            lab_diagnostic(
-                                "udp_datagram_no_feedback_timeout_retry_alternative",
-                                format_args!(
-                                    "path_index={} response_timeout_ms={} ttl_ms={}",
-                                    path_index,
-                                    response_timeout.as_millis(),
-                                    remaining_ttl_ms
-                                ),
-                            );
-                            continue;
-                        }
-                        DatagramTimeoutAction::TerminalProductExpiry => {
-                            if feedback_received {
-                                self.context.mark_udp_path_feedback(
-                                    path_index,
-                                    UdpDatagramPathObservation {
-                                        rtt: response_timeout,
-                                        jitter: Duration::ZERO,
-                                        loss_rate: 1.0,
-                                        rate_sample: None,
-                                    },
-                                );
-                            } else {
-                                self.remove_path(path_index);
-                                self.suppress_path_after_timeout(
-                                    path_index,
-                                    response_timeout,
-                                    remaining_ttl_ms,
-                                );
-                                self.context.mark_udp_path_failure(path_index);
-                            }
-                        }
-                    }
-                    return Err(DatagramUnderlaySendError::Timeout {
-                        feedback_received,
-                        product_attempts,
-                        source: RuntimeError::DatagramResponseTimedOut,
-                    });
-                }
-                Err(DatagramPathSendError::Runtime {
-                    feedback_received,
-                    source,
-                }) if udp_datagram_error_is_path_retryable(&source) => {
-                    self.remove_path(path_index);
-                    self.suppress_path_after_timeout(
-                        path_index,
-                        default_transport_pto(),
-                        remaining_ttl_ms,
-                    );
-                    self.context.mark_udp_path_failure(path_index);
-                    if feedback_received || !has_unattempted_internal_alternative {
-                        return Err(DatagramUnderlaySendError::Runtime {
-                            feedback_received,
-                            product_attempts,
-                            source,
-                        });
-                    }
-                    last_retryable_error = Some(source);
-                }
-                Err(DatagramPathSendError::Runtime {
-                    feedback_received,
-                    source,
-                }) => {
-                    return Err(DatagramUnderlaySendError::Runtime {
-                        feedback_received,
-                        product_attempts,
-                        source,
-                    });
-                }
+                    default_transport_pto(),
+                    datagram_remaining_ttl_ms(product_deadline),
+                );
+                self.context.mark_udp_path_failure(path_index);
+                Err(DatagramPathSendError::runtime(source))
             }
+            Err(error) => Err(error),
         }
-        Err(DatagramUnderlaySendError::Runtime {
-            feedback_received: false,
-            product_attempts,
-            source: last_retryable_error.unwrap_or(RuntimeError::NoSchedulableUdpPath),
-        })
     }
 
-    fn path_session_is_open(&self, path_index: usize) -> bool {
-        self.paths
-            .iter()
-            .any(|path| path.session.path_index == path_index)
+    pub(in crate::runtime) fn feedback_timeout(&self, path_index: usize, ttl_ms: u32) -> Duration {
+        self.context
+            .udp_path_runtime_model(path_index, ttl_ms)
+            .map(|model| model.response_timeout)
+            .unwrap_or_else(|| Duration::from_millis(u64::from(ttl_ms)))
+    }
+
+    pub(in crate::runtime) fn ranked_path_candidates(
+        &mut self,
+        payload_bytes: usize,
+        ttl_ms: u32,
+    ) -> Vec<UdpPathCandidate> {
+        self.prune_suppressed_paths();
+        let candidates = self
+            .context
+            .ordered_udp_path_candidates_for_ttl(payload_bytes, ttl_ms);
+        let mut attempted = HashSet::new();
+        let mut ranked = Vec::with_capacity(candidates.len());
+        while let Some(path_index) =
+            self.select_path_candidate(&candidates, &attempted, payload_bytes, ttl_ms)
+        {
+            attempted.insert(path_index);
+            if let Some(candidate) = candidates
+                .iter()
+                .find(|candidate| candidate.path_index == path_index)
+            {
+                ranked.push(*candidate);
+            }
+        }
+        ranked
     }
 
     pub(in crate::runtime) async fn close(&mut self) -> Result<(), RuntimeError> {
@@ -399,6 +171,78 @@ impl UdpDatagramClientAssociation {
             Some(err) => Err(err),
             None => Ok(()),
         }
+    }
+
+    pub(in crate::runtime) fn has_open_path(&self) -> bool {
+        !self.paths.is_empty()
+    }
+
+    pub(in crate::runtime) async fn next_frame(
+        &mut self,
+    ) -> Result<(usize, Result<Frame, RuntimeError>), RuntimeError> {
+        if self.paths.is_empty() {
+            return Err(RuntimeError::NoSchedulableUdpPath);
+        }
+        let waits = self
+            .paths
+            .iter_mut()
+            .map(|path| {
+                let path_index = path.session.path_index;
+                Box::pin(async move { (path_index, path.session.next_frame().await) })
+                    as Pin<
+                        Box<dyn Future<Output = (usize, Result<Frame, RuntimeError>)> + Send + '_>,
+                    >
+            })
+            .collect::<Vec<_>>();
+        let (event, _, remaining) = futures::future::select_all(waits).await;
+        drop(remaining);
+        Ok(event)
+    }
+
+    pub(in crate::runtime) async fn handle_frame(
+        &mut self,
+        path_index: usize,
+        frame: Frame,
+    ) -> Result<DatagramSessionEvent, RuntimeError> {
+        let Some(position) = self
+            .paths
+            .iter()
+            .position(|path| path.session.path_index == path_index)
+        else {
+            return Ok(DatagramSessionEvent::Control);
+        };
+        let result = self.paths[position].session.handle_frame(frame).await;
+        if let Some(observation) = self.paths[position].session.take_feedback_observation() {
+            self.context.mark_udp_path_feedback(path_index, observation);
+        }
+        if result.is_err() {
+            self.remove_path(path_index);
+            self.context.mark_udp_path_failure(path_index);
+        }
+        result
+    }
+
+    pub(in crate::runtime) async fn acknowledge(
+        &mut self,
+        path_index: usize,
+        flow_id: DatagramFlowId,
+        datagram_id: DatagramId,
+    ) -> Result<(), RuntimeError> {
+        let path = self
+            .paths
+            .iter_mut()
+            .find(|path| path.session.path_index == path_index)
+            .ok_or(RuntimeError::NoSchedulableUdpPath)?;
+        path.session.acknowledge(flow_id, datagram_id).await
+    }
+
+    pub(in crate::runtime) fn has_flow(&self, flow_id: DatagramFlowId) -> bool {
+        self.paths.iter().any(|path| path.session.has_flow(flow_id))
+    }
+
+    pub(in crate::runtime) fn handle_receive_error(&mut self, path_index: usize) {
+        self.remove_path(path_index);
+        self.context.mark_udp_path_failure(path_index);
     }
 
     pub(in crate::runtime) fn select_path_candidate(
@@ -503,14 +347,14 @@ impl UdpDatagramClientAssociation {
             .map(|candidate| candidate.path_index)
     }
 
-    pub(in crate::runtime) fn suppress_path_after_timeout(
+    pub(in crate::runtime) fn suppress_path_after_carrier_failure(
         &mut self,
         path_index: usize,
-        response_timeout: Duration,
+        recovery_interval: Duration,
         ttl_ms: u32,
     ) {
         let ttl = Duration::from_millis(u64::from(ttl_ms));
-        let duration = response_timeout
+        let duration = recovery_interval
             .max(QUIC_TIMER_GRANULARITY)
             .saturating_mul(QUIC_PERSISTENT_CONGESTION_THRESHOLD)
             .min(ttl);
@@ -555,31 +399,30 @@ impl UdpDatagramClientAssociation {
     async fn send_to_path(
         &mut self,
         path_index: usize,
-        target: TargetAddr,
-        payload: Bytes,
-        fallback_deadline: tokio::time::Instant,
-        product_deadline: tokio::time::Instant,
-        has_unattempted_alternative: bool,
-    ) -> Result<Bytes, DatagramPathSendError> {
+        send: DatagramPathSend,
+    ) -> Result<(), DatagramPathSendError> {
+        let DatagramPathSend {
+            target,
+            flow_id,
+            datagram_id,
+            payload,
+            setup_deadline: fallback_deadline,
+            product_deadline,
+            has_unattempted_alternative,
+        } = send;
         let ttl_ms = datagram_remaining_ttl_ms(product_deadline);
         if ttl_ms == 0 {
-            return Err(DatagramPathSendError::Timeout {
-                feedback_received: false,
-                response_timeout: Duration::ZERO,
-            });
+            return Err(DatagramPathSendError::Timeout);
         }
         let model = self
             .context
             .udp_path_runtime_model(path_index, ttl_ms)
-            .ok_or_else(|| {
-                DatagramPathSendError::runtime(RuntimeError::NoSchedulableUdpPath, false)
-            })?;
+            .ok_or_else(|| DatagramPathSendError::runtime(RuntimeError::NoSchedulableUdpPath))?;
         if !model.accepts_payload(payload.len()) {
             return Err(DatagramPathSendError::PayloadLimitExceeded {
                 limit: model.max_payload_bytes,
             });
         }
-        let path_session_was_open = self.path_session_is_open(path_index);
         let association_had_open_path = !self.paths.is_empty();
         let open_started_at = tokio::time::Instant::now();
         let handshake_timeout = udp_datagram_path_open_timeout(
@@ -590,30 +433,13 @@ impl UdpDatagramClientAssociation {
         )
         .min(fallback_deadline.saturating_duration_since(open_started_at));
         let open_deadline = (open_started_at + handshake_timeout).min(fallback_deadline);
-        let setup_owns_remaining_product_budget = !association_had_open_path
-            && !has_unattempted_alternative
-            && fallback_deadline == product_deadline
-            && product_deadline.saturating_duration_since(open_started_at)
-                <= UDP_PATH_HANDSHAKE_TIMEOUT;
-        let response_timeout = udp_datagram_first_response_timeout(
-            path_session_was_open,
-            association_had_open_path,
-            has_unattempted_alternative,
-            model,
-            ttl_ms,
-        );
-        let position = match self.ensure_path_session(path_index, open_deadline).await {
-            Err(RuntimeError::PathOpenTimedOut) if setup_owns_remaining_product_budget => {
-                return Err(DatagramPathSendError::Timeout {
-                    feedback_received: false,
-                    response_timeout,
-                });
-            }
-            result => result.map_err(|err| DatagramPathSendError::runtime(err, false))?,
-        };
+        let position = self
+            .ensure_path_session(path_index, open_deadline)
+            .await
+            .map_err(DatagramPathSendError::runtime)?;
         let (observation_path_index, observation, result, connection_usable) = {
             let path = self.paths.get_mut(position).ok_or_else(|| {
-                DatagramPathSendError::runtime(RuntimeError::NoSchedulableUdpPath, false)
+                DatagramPathSendError::runtime(RuntimeError::NoSchedulableUdpPath)
             })?;
             if tokio::time::timeout_at(
                 fallback_deadline,
@@ -622,20 +448,17 @@ impl UdpDatagramClientAssociation {
             .await
             .is_err()
             {
-                return Err(DatagramPathSendError::Timeout {
-                    feedback_received: false,
-                    response_timeout,
-                });
+                return Err(DatagramPathSendError::Timeout);
             }
             let result = path
                 .session
                 .send_to(
                     target,
+                    flow_id,
+                    datagram_id,
                     payload,
                     fallback_deadline,
                     product_deadline,
-                    response_timeout,
-                    has_unattempted_alternative,
                 )
                 .await;
             let observation = path.session.take_feedback_observation();
@@ -652,20 +475,20 @@ impl UdpDatagramClientAssociation {
         }
 
         match result {
-            Ok(response) => {
+            Ok(()) => {
                 if !connection_usable {
                     self.remove_path(path_index);
                     self.context.mark_udp_path_failure(path_index);
                 }
-                Ok(response)
+                Ok(())
             }
-            Err(DatagramPathSendError::Timeout {
-                feedback_received,
-                response_timeout,
-            }) => Err(DatagramPathSendError::Timeout {
-                feedback_received,
-                response_timeout,
-            }),
+            Err(DatagramPathSendError::Timeout) => {
+                if !connection_usable {
+                    self.remove_path(path_index);
+                    self.context.mark_udp_path_failure(path_index);
+                }
+                Err(DatagramPathSendError::Timeout)
+            }
             Err(err) => Err(err),
         }
     }
@@ -739,18 +562,4 @@ pub(in crate::runtime) fn udp_datagram_path_open_timeout(
         .max(QUIC_TIMER_GRANULARITY)
         .min(UDP_PATH_HANDSHAKE_TIMEOUT)
         .min(ttl_timeout)
-}
-
-pub(in crate::runtime) fn udp_datagram_first_response_timeout(
-    path_session_was_open: bool,
-    association_had_open_path: bool,
-    has_unattempted_alternative: bool,
-    model: UdpPathRuntimeModel,
-    ttl_ms: u32,
-) -> Duration {
-    if path_session_was_open || association_had_open_path {
-        return model.response_timeout;
-    }
-    udp_datagram_path_open_timeout(false, has_unattempted_alternative, model, ttl_ms)
-        .max(model.response_timeout)
 }

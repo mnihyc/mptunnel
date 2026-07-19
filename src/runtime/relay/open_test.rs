@@ -39,7 +39,7 @@ fn pending_stream_for_test(
                     commands,
                     mux_limits,
                 ),
-                frames: frames_rx,
+                frames: frames_rx.into(),
             },
             path_index,
         ),

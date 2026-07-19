@@ -1,7 +1,7 @@
 use super::test_support::*;
 use super::*;
 use crate::config::ResourceLimits;
-use crate::model::work::{ReliableWorkClass, reliable_persistent_ack_gap_reinjection_limit_bytes};
+use crate::model::work::{ReliableWorkClass, reliable_critical_tail_reinjection_limit_bytes};
 use crate::protocol::{PathId, SessionId};
 use crate::runtime::path::commands::{
     ReliablePathCommand, recv_reliable_path_command, reliable_path_command_channels,
@@ -246,19 +246,22 @@ async fn client_ack_gap_model_separates_owner_transport_from_reinjection_output(
     );
     let (reinjection_target, reinjection_path) =
         reinjection_path.expect("distinct reinjection path");
-    assert!(
-        reliable_persistent_ack_gap_reinjection_limit_bytes(
-            Some(reinjection_path),
-            original_underlay,
-            TrafficClass::Throughput,
+    assert_eq!(
+        reliable_critical_tail_reinjection_limit_bytes(
+            adaptive_reliable_relay_reinjection_bytes(
+                Some(reinjection_path),
+                TrafficClass::Throughput,
+                limits,
+            ),
             limits.max_repair_bytes,
             limits,
-        ) > adaptive_reliable_relay_reinjection_bytes(
+        ),
+        adaptive_reliable_relay_reinjection_bytes(
             Some(reinjection_path),
             TrafficClass::Throughput,
             limits,
         ),
-        "TCP owner persistence controls amplification even when QUIC carries the reinjection"
+        "the original carrier type must not amplify persistent Data ACK-gap recovery"
     );
 
     seed_client_bulk_evidence_for_test(
@@ -301,7 +304,7 @@ async fn client_ack_gap_model_separates_owner_transport_from_reinjection_output(
     ));
     assert!(
         try_recv_reliable_path_command(&mut proof_only_receivers).is_none(),
-        "an amplified batch stays bound to the modeled output instead of switching to another proven output"
+        "a persistent repair stays bound to the modeled output instead of switching to another proven output"
     );
 
     let replacement = remotes

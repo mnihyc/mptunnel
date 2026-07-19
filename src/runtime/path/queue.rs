@@ -8,12 +8,11 @@ use crate::mux::MuxLimits;
 use crate::protocol::frame::reliable_path_frame_pacing_bytes;
 use crate::protocol::{Frame, ResetReason, StreamId};
 use crate::runtime::error::RuntimeError;
-use crate::runtime::path::send_credit::{CarrierSendCredit, CarrierSendCreditError};
 use crate::runtime::path::tcp::capacity::RequestTcpCapacityProbeLease;
 use crate::runtime::recent_ids::RecentIdCache;
 use crate::scheduler::TrafficClass;
 use std::sync::{
-    Arc,
+    Arc, Mutex,
     atomic::{AtomicBool, AtomicU8, AtomicU64, Ordering},
 };
 #[cfg(feature = "lab-diagnostics")]
@@ -53,7 +52,63 @@ pub(in crate::runtime) struct ReliablePathCommandReceivers {
     closed_streams: RecentIdCache<StreamId>,
     metrics: Arc<ReliablePathCommandQueueMetrics>,
     dequeued_unreleased_bytes: AtomicU64,
-    dequeued_unreleased_carrier_credit_bytes: AtomicU64,
+}
+
+/// Live logical-flow load for one ordered carrier writer queue.
+///
+/// TCP multiplexed streams share this registration domain. Native QUIC streams
+/// use separate writer queues, so independent QUIC streams do not create false
+/// head-of-line pressure for each other.
+#[derive(Debug, Clone)]
+pub(in crate::runtime) struct ReliablePathLoadRegistration {
+    inner: Arc<ReliablePathLoadRegistrationInner>,
+}
+
+#[derive(Debug)]
+struct ReliablePathLoadRegistrationInner {
+    metrics: Arc<ReliablePathCommandQueueMetrics>,
+    lane: Mutex<Option<TrafficClass>>,
+}
+
+impl ReliablePathLoadRegistration {
+    pub(in crate::runtime) fn set_lane(&self, lane: TrafficClass) {
+        let mut current = self.lane();
+        let Some(previous) = *current else {
+            return;
+        };
+        if previous == lane {
+            return;
+        }
+        self.inner.metrics.change_flow_lane(previous, lane);
+        *current = Some(lane);
+    }
+
+    pub(in crate::runtime) fn deactivate(&self) {
+        let mut current = self.lane();
+        if let Some(lane) = current.take() {
+            self.inner.metrics.release_flow(lane);
+        }
+    }
+
+    fn lane(&self) -> std::sync::MutexGuard<'_, Option<TrafficClass>> {
+        self.inner
+            .lane
+            .lock()
+            .expect("reliable path load registration lock")
+    }
+}
+
+impl Drop for ReliablePathLoadRegistrationInner {
+    fn drop(&mut self) {
+        let lane = self
+            .lane
+            .get_mut()
+            .expect("reliable path load registration lock")
+            .take();
+        if let Some(lane) = lane {
+            self.metrics.release_flow(lane);
+        }
+    }
 }
 
 /// Immutable queue readiness captured at an observe boundary. Policy may rank
@@ -63,7 +118,6 @@ pub(in crate::runtime) struct ReliablePathCommandQueueSnapshot {
     priority_ready: bool,
     reinjection_ready: bool,
     data_ready: bool,
-    carrier_data_ready: bool,
 }
 
 impl ReliablePathCommandQueueSnapshot {
@@ -76,13 +130,12 @@ impl ReliablePathCommandQueueSnapshot {
     }
 
     pub(in crate::runtime) fn can_enqueue_lane(self, lane: TrafficClass) -> bool {
-        self.queue_ready(lane) && self.carrier_data_ready
+        self.queue_ready(lane)
     }
 
     pub(in crate::runtime) fn can_enqueue_frame(self, frame: &Frame, lane: TrafficClass) -> bool {
         let effective_lane = reliable_path_effective_frame_lane(frame, lane);
         self.queue_ready(effective_lane)
-            && (reliable_path_frame_carrier_credit_bytes(frame) == 0 || self.carrier_data_ready)
     }
 
     pub(in crate::runtime) fn can_enqueue_stream_ordered_frame(self) -> bool {
@@ -90,8 +143,8 @@ impl ReliablePathCommandQueueSnapshot {
     }
 
     pub(in crate::runtime) fn can_enqueue_reinjection_frame(self, frame: &Frame) -> bool {
+        let _ = frame;
         self.reinjection_ready
-            && (reliable_path_frame_carrier_credit_bytes(frame) == 0 || self.carrier_data_ready)
     }
 }
 
@@ -102,6 +155,7 @@ impl ReliablePathCommandQueueSnapshot {
 #[derive(Debug, Clone, Copy)]
 enum ReliablePathRetirementCommand {
     RetireAcceptedStream(StreamId),
+    RetireDatagramAttachment(u64),
 }
 
 /// Holds queue capacity without publishing a frame. Response transactions use
@@ -110,9 +164,7 @@ pub(in crate::runtime) struct ReliablePathFrameReservation<'a> {
     permit: Option<mpsc::Permit<'a, QueuedReliablePathCommand>>,
     frame: Option<Frame>,
     bytes: usize,
-    carrier_credit_bytes: usize,
     metrics: Arc<ReliablePathCommandQueueMetrics>,
-    carrier_credit_reserved: bool,
     #[cfg(feature = "lab-diagnostics")]
     lane: TrafficClass,
     #[cfg(feature = "lab-diagnostics")]
@@ -132,7 +184,6 @@ impl ReliablePathFrameReservation<'_> {
         )
         .unwrap_or(StreamId(0));
         self.metrics.add_pending_bytes(self.bytes);
-        self.carrier_credit_reserved = false;
         self.permit
             .take()
             .expect("reserved reliable path queue permit")
@@ -141,7 +192,6 @@ impl ReliablePathFrameReservation<'_> {
                     self.frame.take().expect("reserved reliable path frame"),
                 ),
                 self.bytes,
-                self.carrier_credit_bytes,
                 self.metrics.clone(),
             ));
         #[cfg(feature = "lab-diagnostics")]
@@ -160,21 +210,13 @@ impl ReliablePathFrameReservation<'_> {
     }
 }
 
-impl Drop for ReliablePathFrameReservation<'_> {
-    fn drop(&mut self) {
-        if self.carrier_credit_reserved {
-            self.metrics
-                .release_carrier_credit(self.carrier_credit_bytes as u64);
-        }
-    }
-}
-
 #[derive(Debug, Default)]
 struct ReliablePathCommandQueueMetrics {
     pending_bytes: AtomicU64,
     writer_pending_bytes: AtomicU64,
+    /// Upper/lower 32 bits hold total and latency-sensitive live flows.
+    flow_counts: AtomicU64,
     capacity_released: Arc<Notify>,
-    carrier_send_credit: Option<CarrierSendCredit>,
     tcp_capacity_probe: TcpCapacityProbeLeaseState,
 }
 
@@ -202,7 +244,6 @@ impl Drop for TcpCapacityProbeLease {
 struct QueuedReliablePathCommand {
     command: Option<ReliablePathCommand>,
     accounted_bytes: usize,
-    carrier_credit_bytes: usize,
     metrics: Arc<ReliablePathCommandQueueMetrics>,
 }
 
@@ -210,28 +251,23 @@ impl QueuedReliablePathCommand {
     fn new(
         command: ReliablePathCommand,
         accounted_bytes: usize,
-        carrier_credit_bytes: usize,
         metrics: Arc<ReliablePathCommandQueueMetrics>,
     ) -> Self {
         Self {
             command: Some(command),
             accounted_bytes,
-            carrier_credit_bytes,
             metrics,
         }
     }
 
-    fn into_parts(mut self) -> (ReliablePathCommand, usize, usize) {
+    fn into_parts(mut self) -> (ReliablePathCommand, usize) {
         // Dequeue transfers the byte charge to the receiver. It remains visible
         // until the writer hands the command to carrier/product accounting.
         let accounted_bytes = self.accounted_bytes;
-        let carrier_credit_bytes = self.carrier_credit_bytes;
         self.accounted_bytes = 0;
-        self.carrier_credit_bytes = 0;
         (
             self.command.take().expect("queued reliable path command"),
             accounted_bytes,
-            carrier_credit_bytes,
         )
     }
 
@@ -240,36 +276,77 @@ impl QueuedReliablePathCommand {
     }
 
     fn into_rejected_command(mut self) -> ReliablePathCommand {
-        if self.accounted_bytes > 0 || self.carrier_credit_bytes > 0 {
-            self.metrics.release_accounted_bytes(
-                self.accounted_bytes as u64,
-                self.carrier_credit_bytes as u64,
-            );
+        if self.accounted_bytes > 0 {
+            self.metrics
+                .release_accounted_bytes(self.accounted_bytes as u64);
         }
         self.accounted_bytes = 0;
-        self.carrier_credit_bytes = 0;
         self.command.take().expect("queued reliable path command")
     }
 }
 
 impl Drop for QueuedReliablePathCommand {
     fn drop(&mut self) {
-        if self.accounted_bytes > 0 || self.carrier_credit_bytes > 0 {
-            self.metrics.release_accounted_bytes(
-                self.accounted_bytes as u64,
-                self.carrier_credit_bytes as u64,
-            );
+        if self.accounted_bytes > 0 {
+            self.metrics
+                .release_accounted_bytes(self.accounted_bytes as u64);
         }
     }
 }
 
 impl ReliablePathCommandQueueMetrics {
+    fn update_flow_counts(&self, update: impl Fn(u32, u32) -> (u32, u32)) {
+        let _ = self
+            .flow_counts
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |current| {
+                let active = (current >> 32) as u32;
+                let latency = current as u32;
+                let (active, latency) = update(active, latency);
+                Some((u64::from(active) << 32) | u64::from(latency.min(active)))
+            });
+        self.capacity_released.notify_waiters();
+    }
+
+    fn register_flow(&self, lane: TrafficClass) {
+        self.update_flow_counts(|active, latency| {
+            (
+                active.saturating_add(1),
+                latency.saturating_add(u32::from(lane.is_latency_sensitive())),
+            )
+        });
+    }
+
+    fn release_flow(&self, lane: TrafficClass) {
+        self.update_flow_counts(|active, latency| {
+            (
+                active.saturating_sub(1),
+                latency.saturating_sub(u32::from(lane.is_latency_sensitive())),
+            )
+        });
+    }
+
+    fn change_flow_lane(&self, previous: TrafficClass, lane: TrafficClass) {
+        self.update_flow_counts(|active, latency| {
+            let latency = match (previous.is_latency_sensitive(), lane.is_latency_sensitive()) {
+                (true, false) => latency.saturating_sub(1),
+                (false, true) => latency.saturating_add(1),
+                _ => latency,
+            };
+            (active, latency)
+        });
+    }
+
+    fn flow_counts(&self) -> (u32, u32) {
+        let counts = self.flow_counts.load(Ordering::Acquire);
+        ((counts >> 32) as u32, counts as u32)
+    }
+
     fn add_pending_bytes(&self, bytes: usize) {
         self.pending_bytes
             .fetch_add(bytes as u64, Ordering::Relaxed);
     }
 
-    fn release_accounted_bytes(&self, pending_bytes: u64, carrier_credit_bytes: u64) {
+    fn release_accounted_bytes(&self, pending_bytes: u64) {
         if pending_bytes > 0 {
             let _ =
                 self.pending_bytes
@@ -277,7 +354,6 @@ impl ReliablePathCommandQueueMetrics {
                         Some(current.saturating_sub(pending_bytes))
                     });
         }
-        self.release_carrier_credit(carrier_credit_bytes);
         self.capacity_released.notify_waiters();
     }
 
@@ -294,28 +370,6 @@ impl ReliablePathCommandQueueMetrics {
                 |current| Some(current.saturating_sub(bytes)),
             );
         }
-    }
-
-    fn try_reserve_carrier_credit(&self, bytes: usize) -> Result<(), RuntimeError> {
-        self.carrier_send_credit
-            .as_ref()
-            .map_or(Ok(()), |credit| match credit.try_reserve(bytes) {
-                Ok(()) => Ok(()),
-                Err(CarrierSendCreditError::Blocked) => Err(RuntimeError::SenderServiceBlocked),
-                Err(CarrierSendCreditError::Closed) => Err(RuntimeError::ReliablePathSessionClosed),
-            })
-    }
-
-    fn release_carrier_credit(&self, bytes: u64) {
-        if let Some(credit) = &self.carrier_send_credit {
-            credit.release(bytes);
-        }
-    }
-
-    fn carrier_data_ready(&self) -> bool {
-        self.carrier_send_credit
-            .as_ref()
-            .is_none_or(CarrierSendCredit::can_reserve_quantum)
     }
 
     #[cfg_attr(not(any(test, feature = "lab-diagnostics")), allow(dead_code))]
@@ -357,13 +411,11 @@ impl ReliablePathCommandQueueMetrics {
 
 impl ReliablePathCommandReceivers {
     fn take_queued_command(&self, command: QueuedReliablePathCommand) -> ReliablePathCommand {
-        let (command, accounted_bytes, carrier_credit_bytes) = command.into_parts();
+        let (command, accounted_bytes) = command.into_parts();
         self.dequeued_unreleased_bytes
             .fetch_add(accounted_bytes as u64, Ordering::Relaxed);
         self.metrics
             .add_writer_pending_bytes(accounted_bytes as u64);
-        self.dequeued_unreleased_carrier_credit_bytes
-            .fetch_add(carrier_credit_bytes as u64, Ordering::Relaxed);
         command
     }
 
@@ -374,8 +426,8 @@ impl ReliablePathCommandReceivers {
         if reliable_path_command_stream_id(queued.command())
             .is_some_and(|stream_id| self.closed_streams.contains(&stream_id))
         {
-            // The envelope owns queue bytes and native carrier credit until it
-            // is accepted by a writer, so dropping it reconciles both charges.
+            // The envelope owns queue bytes until a writer accepts it, so
+            // dropping the stale command reconciles the charge.
             return None;
         }
         let command = self.take_queued_command(queued);
@@ -394,38 +446,17 @@ impl ReliablePathCommandReceivers {
     }
 
     pub(in crate::runtime) fn release_pending_command_bytes(&self, bytes: usize) {
-        debug_assert!(
-            self.metrics.carrier_send_credit.is_none(),
-            "credit-aware writer must release queue and carrier accounting separately"
-        );
-        self.release_pending_command_accounting(bytes, 0);
-    }
-
-    pub(in crate::runtime) fn release_pending_command_accounting(
-        &self,
-        pending_bytes: usize,
-        carrier_credit_bytes: usize,
-    ) {
-        let requested_pending = pending_bytes as u64;
+        let requested_pending = bytes as u64;
         let previous_pending = self
             .dequeued_unreleased_bytes
             .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
                 Some(current.saturating_sub(requested_pending))
             })
             .expect("dequeued byte update always succeeds");
-        let requested_credit = carrier_credit_bytes as u64;
-        let previous_credit = self
-            .dequeued_unreleased_carrier_credit_bytes
-            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
-                Some(current.saturating_sub(requested_credit))
-            })
-            .expect("dequeued carrier-credit update always succeeds");
         self.metrics
             .release_writer_pending_bytes(previous_pending.min(requested_pending));
-        self.metrics.release_accounted_bytes(
-            previous_pending.min(requested_pending),
-            previous_credit.min(requested_credit),
-        );
+        self.metrics
+            .release_accounted_bytes(previous_pending.min(requested_pending));
     }
 
     #[cfg(feature = "lab-diagnostics")]
@@ -439,16 +470,29 @@ impl Drop for ReliablePathCommandReceivers {
         // Queued envelopes reconcile themselves. This covers a command already
         // removed from mpsc when a writer exits through an async error path.
         let outstanding = self.dequeued_unreleased_bytes.swap(0, Ordering::Relaxed);
-        let outstanding_credit = self
-            .dequeued_unreleased_carrier_credit_bytes
-            .swap(0, Ordering::Relaxed);
         self.metrics.release_writer_pending_bytes(outstanding);
-        self.metrics
-            .release_accounted_bytes(outstanding, outstanding_credit);
+        self.metrics.release_accounted_bytes(outstanding);
     }
 }
 
 impl ReliablePathCommandSender {
+    pub(in crate::runtime) fn register_flow(
+        &self,
+        lane: TrafficClass,
+    ) -> ReliablePathLoadRegistration {
+        self.metrics.register_flow(lane);
+        ReliablePathLoadRegistration {
+            inner: Arc::new(ReliablePathLoadRegistrationInner {
+                metrics: self.metrics.clone(),
+                lane: Mutex::new(Some(lane)),
+            }),
+        }
+    }
+
+    pub(in crate::runtime) fn active_flow_counts(&self) -> (u32, u32) {
+        self.metrics.flow_counts()
+    }
+
     pub(in crate::runtime) fn queue_snapshot(&self) -> ReliablePathCommandQueueSnapshot {
         let priority_open = !self.priority.is_closed();
         let data_open = !self.data.is_closed();
@@ -456,7 +500,6 @@ impl ReliablePathCommandSender {
             priority_ready: priority_open && self.priority.capacity() > 0,
             reinjection_ready: !self.reinjection.is_closed() && self.reinjection.capacity() > 0,
             data_ready: data_open && self.data.capacity() > 0,
-            carrier_data_ready: self.metrics.carrier_data_ready(),
         }
     }
 
@@ -467,6 +510,17 @@ impl ReliablePathCommandSender {
         self.retirement
             .send(ReliablePathRetirementCommand::RetireAcceptedStream(
                 stream_id,
+            ))
+            .map_err(|_| RuntimeError::ReliablePathSessionClosed)
+    }
+
+    pub(in crate::runtime) fn retire_datagram_attachment(
+        &self,
+        attachment_id: u64,
+    ) -> Result<(), RuntimeError> {
+        self.retirement
+            .send(ReliablePathRetirementCommand::RetireDatagramAttachment(
+                attachment_id,
             ))
             .map_err(|_| RuntimeError::ReliablePathSessionClosed)
     }
@@ -485,7 +539,6 @@ impl ReliablePathCommandSender {
             .control
             .send(QueuedReliablePathCommand::new(
                 command,
-                0,
                 0,
                 self.metrics.clone(),
             ))
@@ -518,6 +571,33 @@ impl ReliablePathCommandSender {
             .await
     }
 
+    pub(in crate::runtime) async fn send_datagram_frame(
+        &self,
+        attachment_id: u64,
+        frame: Frame,
+        write_deadline: tokio::time::Instant,
+        expires_at: Option<tokio::time::Instant>,
+        response: tokio::sync::oneshot::Sender<Result<(), RuntimeError>>,
+    ) -> Result<(), mpsc::error::SendError<ReliablePathCommand>> {
+        let command = ReliablePathCommand::SendDatagramFrame {
+            attachment_id,
+            frame,
+            write_deadline,
+            expires_at,
+            response,
+        };
+        let pending_bytes = reliable_path_command_pending_bytes(&command);
+        self.metrics.add_pending_bytes(pending_bytes);
+        self.priority
+            .send(QueuedReliablePathCommand::new(
+                command,
+                pending_bytes,
+                self.metrics.clone(),
+            ))
+            .await
+            .map_err(|err| mpsc::error::SendError(err.0.into_rejected_command()))
+    }
+
     pub(in crate::runtime) async fn send_stream_ordered_close(
         &self,
         stream_id: StreamId,
@@ -546,7 +626,6 @@ impl ReliablePathCommandSender {
         _lane: TrafficClass,
     ) -> Result<(), mpsc::error::SendError<ReliablePathCommand>> {
         let pending_bytes = reliable_path_command_pending_bytes(&command);
-        let carrier_credit_bytes = reliable_path_command_carrier_credit_bytes(&command);
         #[cfg(feature = "lab-diagnostics")]
         let command_kind = reliable_path_command_kind(&command);
         #[cfg(feature = "lab-diagnostics")]
@@ -556,38 +635,15 @@ impl ReliablePathCommandSender {
         let queue = &self.data;
         #[cfg(feature = "lab-diagnostics")]
         let started = Instant::now();
-        let result = if carrier_credit_bytes == 0 {
-            self.metrics.add_pending_bytes(pending_bytes);
-            queue
-                .send(QueuedReliablePathCommand::new(
-                    command,
-                    pending_bytes,
-                    0,
-                    self.metrics.clone(),
-                ))
-                .await
-                .map_err(|err| mpsc::error::SendError(err.0.into_rejected_command()))
-        } else {
-            match queue.reserve().await {
-                Ok(permit) => match self
-                    .metrics
-                    .try_reserve_carrier_credit(carrier_credit_bytes)
-                {
-                    Ok(()) => {
-                        self.metrics.add_pending_bytes(pending_bytes);
-                        permit.send(QueuedReliablePathCommand::new(
-                            command,
-                            pending_bytes,
-                            carrier_credit_bytes,
-                            self.metrics.clone(),
-                        ));
-                        Ok(())
-                    }
-                    Err(_) => Err(mpsc::error::SendError(command)),
-                },
-                Err(_) => Err(mpsc::error::SendError(command)),
-            }
-        };
+        self.metrics.add_pending_bytes(pending_bytes);
+        let result = queue
+            .send(QueuedReliablePathCommand::new(
+                command,
+                pending_bytes,
+                self.metrics.clone(),
+            ))
+            .await
+            .map_err(|err| mpsc::error::SendError(err.0.into_rejected_command()));
         #[cfg(feature = "lab-diagnostics")]
         {
             let elapsed = started.elapsed();
@@ -613,7 +669,51 @@ impl ReliablePathCommandSender {
         frame: Frame,
         lane: TrafficClass,
     ) -> Result<(), RuntimeError> {
-        self.try_enqueue_admitted_frame_with_effective_lane(frame, lane, None)
+        let reservation = self.try_reserve_admitted_frame(frame, lane)?;
+        reservation.commit();
+        Ok(())
+    }
+
+    /// Reserves the frame's traffic-class queue before a response transaction
+    /// publishes its matching Data Sequence ownership.
+    pub(in crate::runtime) fn try_reserve_admitted_frame(
+        &self,
+        frame: Frame,
+        lane: TrafficClass,
+    ) -> Result<ReliablePathFrameReservation<'_>, RuntimeError> {
+        self.try_reserve_admitted_frame_with_effective_lane(frame, lane, None)
+    }
+
+    /// Waits for bounded queue capacity without extending the product deadline.
+    /// Registering the wakeup before each admission attempt prevents a queue
+    /// release from being lost between the two.
+    #[cfg(test)]
+    pub(in crate::runtime) async fn enqueue_admitted_frame_until(
+        &self,
+        frame: Frame,
+        lane: TrafficClass,
+        deadline: tokio::time::Instant,
+    ) -> Result<(), RuntimeError> {
+        loop {
+            let mut capacity_wait = Box::pin(self.capacity_notify().notified_owned());
+            capacity_wait.as_mut().enable();
+
+            match self.try_enqueue_admitted_frame(frame.clone(), lane) {
+                Ok(()) => return Ok(()),
+                Err(RuntimeError::SenderServiceBlocked) => {}
+                Err(error) => return Err(error),
+            }
+            if tokio::time::Instant::now() >= deadline {
+                return Err(RuntimeError::SenderServiceBlocked);
+            }
+
+            tokio::select! {
+                _ = capacity_wait => {}
+                _ = tokio::time::sleep_until(deadline) => {
+                    return Err(RuntimeError::SenderServiceBlocked);
+                }
+            }
+        }
     }
 
     /// Queues one client-to-server TCP carrier proof with no product offset.
@@ -633,7 +733,6 @@ impl ReliablePathCommandSender {
         };
         let lease = self.metrics.try_reserve_tcp_capacity_probe()?;
         let pending_bytes = usize::try_from(request.train_payload_bytes).unwrap_or(usize::MAX);
-        self.metrics.try_reserve_carrier_credit(pending_bytes)?;
         let probe = TcpCapacityProbeCommand {
             stream_id: request.stream_id,
             path_instance: request.path_instance,
@@ -653,7 +752,6 @@ impl ReliablePathCommandSender {
         self.metrics.add_pending_bytes(pending_bytes);
         permit.send(QueuedReliablePathCommand::new(
             ReliablePathCommand::SendTcpCapacityProbe(probe),
-            pending_bytes,
             pending_bytes,
             self.metrics.clone(),
         ));
@@ -699,8 +797,7 @@ impl ReliablePathCommandSender {
     }
 
     /// Reserves carrier work for a repeated Data Sequence range. Reinjection is
-    /// drained after latency/control traffic but before fresh bulk data, while
-    /// the carrier's native send-credit owner remains the final admission gate.
+    /// drained after latency/control traffic but before fresh bulk data.
     pub(in crate::runtime) fn try_reserve_reinjection_frame(
         &self,
         frame: Frame,
@@ -722,21 +819,6 @@ impl ReliablePathCommandSender {
         lane: TrafficClass,
     ) -> Result<(), RuntimeError> {
         let reservation = self.try_reserve_reinjection_frame(frame, lane)?;
-        reservation.commit();
-        Ok(())
-    }
-
-    fn try_enqueue_admitted_frame_with_effective_lane(
-        &self,
-        frame: Frame,
-        lane: TrafficClass,
-        effective_lane_override: Option<TrafficClass>,
-    ) -> Result<(), RuntimeError> {
-        let reservation = self.try_reserve_admitted_frame_with_effective_lane(
-            frame,
-            lane,
-            effective_lane_override,
-        )?;
         reservation.commit();
         Ok(())
     }
@@ -773,7 +855,6 @@ impl ReliablePathCommandSender {
             ));
         }
         let bytes = reliable_path_frame_pacing_bytes(&frame);
-        let carrier_credit_bytes = reliable_path_frame_carrier_credit_bytes(&frame);
         #[cfg(feature = "lab-diagnostics")]
         let frame_kind = reliable_path_frame_kind(&frame);
         #[cfg(feature = "lab-diagnostics")]
@@ -810,16 +891,11 @@ impl ReliablePathCommandSender {
                 return Err(error);
             }
         };
-        self.metrics
-            .try_reserve_carrier_credit(carrier_credit_bytes)?;
         Ok(ReliablePathFrameReservation {
             permit: Some(permit),
             frame: Some(frame),
             bytes,
-            carrier_credit_bytes,
             metrics: self.metrics.clone(),
-            carrier_credit_reserved: carrier_credit_bytes > 0
-                && self.metrics.carrier_send_credit.is_some(),
             #[cfg(feature = "lab-diagnostics")]
             lane,
             #[cfg(feature = "lab-diagnostics")]
@@ -858,11 +934,7 @@ impl ReliablePathCommandSender {
     }
 
     pub(in crate::runtime) fn capacity_notifies(&self) -> Vec<Arc<Notify>> {
-        let mut notifies = vec![self.capacity_notify()];
-        if let Some(credit) = &self.metrics.carrier_send_credit {
-            notifies.push(credit.notify());
-        }
-        notifies
+        vec![self.capacity_notify()]
     }
 
     #[cfg_attr(not(any(test, feature = "lab-diagnostics")), allow(dead_code))]
@@ -927,42 +999,8 @@ pub(in crate::runtime) fn reliable_path_frame_requires_capacity_command(frame: &
     )
 }
 
-fn reliable_path_frame_carrier_credit_bytes(frame: &Frame) -> usize {
-    usize::try_from(frame.carrier_credit_bytes()).unwrap_or(usize::MAX)
-}
-
-pub(in crate::runtime) fn reliable_path_command_carrier_credit_bytes(
-    command: &ReliablePathCommand,
-) -> usize {
-    match command {
-        ReliablePathCommand::SendFrame(frame) => reliable_path_frame_carrier_credit_bytes(frame),
-        ReliablePathCommand::SendTcpCapacityProbe(probe) => {
-            usize::try_from(probe.train_payload_bytes).unwrap_or(usize::MAX)
-        }
-        ReliablePathCommand::ResetAndCloseStream { .. }
-        | ReliablePathCommand::PrepareConnection { .. }
-        | ReliablePathCommand::OpenStream { .. }
-        | ReliablePathCommand::CancelTcpOpen { .. }
-        | ReliablePathCommand::CloseStream(_) => 0,
-    }
-}
-
 pub(in crate::runtime) fn reliable_path_command_channels(
     queue: usize,
-) -> (ReliablePathCommandSender, ReliablePathCommandReceivers) {
-    reliable_path_command_channels_inner(queue, None)
-}
-
-pub(in crate::runtime) fn reliable_path_command_channels_with_send_credit(
-    queue: usize,
-    send_credit: CarrierSendCredit,
-) -> (ReliablePathCommandSender, ReliablePathCommandReceivers) {
-    reliable_path_command_channels_inner(queue, Some(send_credit))
-}
-
-fn reliable_path_command_channels_inner(
-    queue: usize,
-    carrier_send_credit: Option<CarrierSendCredit>,
 ) -> (ReliablePathCommandSender, ReliablePathCommandReceivers) {
     let queue = queue.max(1);
     let (retirement_tx, retirement_rx) = mpsc::unbounded_channel();
@@ -971,10 +1009,7 @@ fn reliable_path_command_channels_inner(
     let reinjection_queue = reliable_path_priority_headroom_frames().min(queue).max(1);
     let (reinjection_tx, reinjection_rx) = mpsc::channel(reinjection_queue);
     let (data_tx, data_rx) = mpsc::channel(queue);
-    let metrics = Arc::new(ReliablePathCommandQueueMetrics {
-        carrier_send_credit,
-        ..ReliablePathCommandQueueMetrics::default()
-    });
+    let metrics = Arc::new(ReliablePathCommandQueueMetrics::default());
     (
         ReliablePathCommandSender {
             retirement: retirement_tx,
@@ -998,7 +1033,6 @@ fn reliable_path_command_channels_inner(
             ),
             metrics,
             dequeued_unreleased_bytes: AtomicU64::new(0),
-            dequeued_unreleased_carrier_credit_bytes: AtomicU64::new(0),
         },
     )
 }
@@ -1266,6 +1300,12 @@ fn begin_reliable_path_retirement(
             receivers.pending_retirement_close = Some(stream_id);
             ReliablePathCommand::SendFrame(Frame::StreamDetach { stream_id })
         }
+        ReliablePathRetirementCommand::RetireDatagramAttachment(attachment_id) => {
+            ReliablePathCommand::CloseDatagramAttachment {
+                attachment_id,
+                response: None,
+            }
+        }
     }
 }
 
@@ -1273,7 +1313,10 @@ pub(in crate::runtime) fn reliable_path_command_pending_bytes(
     command: &ReliablePathCommand,
 ) -> usize {
     match command {
-        ReliablePathCommand::SendFrame(frame) => reliable_path_frame_pacing_bytes(frame),
+        ReliablePathCommand::SendFrame(frame)
+        | ReliablePathCommand::SendDatagramFrame { frame, .. } => {
+            reliable_path_frame_pacing_bytes(frame)
+        }
         ReliablePathCommand::SendTcpCapacityProbe(probe) => {
             usize::try_from(probe.train_payload_bytes).unwrap_or(usize::MAX)
         }
@@ -1286,6 +1329,9 @@ pub(in crate::runtime) fn reliable_path_command_pending_bytes(
         ReliablePathCommand::OpenStream { .. }
         | ReliablePathCommand::PrepareConnection { .. }
         | ReliablePathCommand::CancelTcpOpen { .. }
+        | ReliablePathCommand::OpenDatagramAttachment { .. }
+        | ReliablePathCommand::OpenDatagramFlow { .. }
+        | ReliablePathCommand::CloseDatagramAttachment { .. }
         | ReliablePathCommand::CloseStream(_) => 0,
     }
 }
@@ -1294,7 +1340,8 @@ pub(in crate::runtime) fn reliable_path_command_writer_run_bytes(
     command: &ReliablePathCommand,
 ) -> usize {
     match command {
-        ReliablePathCommand::SendFrame(frame) => {
+        ReliablePathCommand::SendFrame(frame)
+        | ReliablePathCommand::SendDatagramFrame { frame, .. } => {
             crate::protocol::codec::encoded_frame_capacity_hint(frame).max(1)
         }
         ReliablePathCommand::SendTcpCapacityProbe(probe) => {
@@ -1312,6 +1359,9 @@ pub(in crate::runtime) fn reliable_path_command_writer_run_bytes(
         ReliablePathCommand::OpenStream { .. }
         | ReliablePathCommand::PrepareConnection { .. }
         | ReliablePathCommand::CancelTcpOpen { .. }
+        | ReliablePathCommand::OpenDatagramAttachment { .. }
+        | ReliablePathCommand::OpenDatagramFlow { .. }
+        | ReliablePathCommand::CloseDatagramAttachment { .. }
         | ReliablePathCommand::CloseStream(_) => 1,
     }
 }
@@ -1319,6 +1369,10 @@ pub(in crate::runtime) fn reliable_path_command_writer_run_bytes(
 fn reliable_path_command_stream_id(command: &ReliablePathCommand) -> Option<StreamId> {
     match command {
         ReliablePathCommand::SendFrame(frame) => reliable_path_frame_stream_id(frame),
+        ReliablePathCommand::SendDatagramFrame { .. }
+        | ReliablePathCommand::OpenDatagramAttachment { .. }
+        | ReliablePathCommand::OpenDatagramFlow { .. }
+        | ReliablePathCommand::CloseDatagramAttachment { .. } => None,
         ReliablePathCommand::SendTcpCapacityProbe(probe) => Some(probe.stream_id),
         ReliablePathCommand::PrepareConnection { .. } => None,
         ReliablePathCommand::OpenStream { stream_id, .. }
@@ -1347,6 +1401,10 @@ fn reliable_path_command_kind(command: &ReliablePathCommand) -> &'static str {
         ReliablePathCommand::PrepareConnection { .. } => "prepare_connection",
         ReliablePathCommand::OpenStream { .. } => "open_stream",
         ReliablePathCommand::CancelTcpOpen { .. } => "cancel_tcp_open",
+        ReliablePathCommand::OpenDatagramAttachment { .. } => "open_datagram_attachment",
+        ReliablePathCommand::OpenDatagramFlow { .. } => "open_datagram_flow",
+        ReliablePathCommand::SendDatagramFrame { frame, .. } => reliable_path_frame_kind(frame),
+        ReliablePathCommand::CloseDatagramAttachment { .. } => "close_datagram_attachment",
         ReliablePathCommand::SendFrame(frame) => reliable_path_frame_kind(frame),
         ReliablePathCommand::SendTcpCapacityProbe(_) => "tcp_capacity_probe",
         ReliablePathCommand::ResetAndCloseStream { .. } => "reset_and_close_stream",

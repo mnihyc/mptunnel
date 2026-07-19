@@ -3,7 +3,7 @@ use crate::config::{
     ClientPathConfig, DEFAULT_OUTBOUND_CONNECT_TIMEOUT, ResourceLimits, SessionConfig,
 };
 use crate::outbound::{DnsConfig, OutboundConfig};
-use crate::protocol::PathUsage;
+use crate::protocol::{DatagramFlowId, DatagramId, PathUsage, SessionId};
 use crate::runtime::path::ServerLocalPath;
 use crate::transport::SystemCarrierNetworkProvider;
 
@@ -417,48 +417,52 @@ async fn socks5_ingress_rejects_wrong_username_password_auth() {
 
 #[tokio::test]
 async fn socks5_ingress_relays_tcp_payload_over_udp_stream_path() {
-    let (target_addr, target) = spawn_echo_target().await;
-    let (path, server_path) = spawn_udp_server_path(OutboundConfig::Direct).await;
-    let context =
-        ClientPathContext::new(vec![path], security(), ResourceLimits::default()).expect("ctx");
-    let (mut client, server) = duplex(4096);
-    let handler = tokio::spawn(handle_socks5_client_stream(server, context));
+    tokio::time::timeout(Duration::from_secs(10), async {
+        let (target_addr, target) = spawn_echo_target().await;
+        let (path, server_path) = spawn_udp_server_path(OutboundConfig::Direct).await;
+        let context =
+            ClientPathContext::new(vec![path], security(), ResourceLimits::default()).expect("ctx");
+        let (mut client, server) = duplex(4096);
+        let handler = tokio::spawn(handle_socks5_client_stream(server, context));
 
-    client
-        .write_all(&[0x05, 0x01, 0x00])
-        .await
-        .expect("auth request");
-    let mut auth_response = [0u8; 2];
-    client
-        .read_exact(&mut auth_response)
-        .await
-        .expect("auth response");
-    assert_eq!(auth_response, [0x05, 0x00]);
+        client
+            .write_all(&[0x05, 0x01, 0x00])
+            .await
+            .expect("auth request");
+        let mut auth_response = [0u8; 2];
+        client
+            .read_exact(&mut auth_response)
+            .await
+            .expect("auth response");
+        assert_eq!(auth_response, [0x05, 0x00]);
 
-    let mut connect = vec![0x05, 0x01, 0x00, 0x01];
-    match target_addr {
-        SocketAddr::V4(addr) => {
-            connect.extend_from_slice(&addr.ip().octets());
-            connect.extend_from_slice(&addr.port().to_be_bytes());
+        let mut connect = vec![0x05, 0x01, 0x00, 0x01];
+        match target_addr {
+            SocketAddr::V4(addr) => {
+                connect.extend_from_slice(&addr.ip().octets());
+                connect.extend_from_slice(&addr.port().to_be_bytes());
+            }
+            SocketAddr::V6(_) => panic!("expected IPv4 test target"),
         }
-        SocketAddr::V6(_) => panic!("expected IPv4 test target"),
-    }
-    client.write_all(&connect).await.expect("connect");
+        client.write_all(&connect).await.expect("connect");
 
-    let mut response = [0u8; 10];
-    client.read_exact(&mut response).await.expect("reply");
-    assert_eq!(response[1], Socks5Reply::Succeeded as u8);
+        let mut response = [0u8; 10];
+        client.read_exact(&mut response).await.expect("reply");
+        assert_eq!(response[1], Socks5Reply::Succeeded as u8);
 
-    client.write_all(b"ping").await.expect("payload write");
-    client.shutdown().await.expect("client shutdown");
-    let mut payload = [0u8; 4];
-    client.read_exact(&mut payload).await.expect("payload read");
-    assert_eq!(&payload, b"pong");
+        client.write_all(b"ping").await.expect("payload write");
+        client.shutdown().await.expect("client shutdown");
+        let mut payload = [0u8; 4];
+        client.read_exact(&mut payload).await.expect("payload read");
+        assert_eq!(&payload, b"pong");
 
-    handler.await.expect("join").expect("handler");
-    server_path.abort();
-    let _ = server_path.await;
-    target.await.expect("target join");
+        handler.await.expect("join").expect("handler");
+        server_path.abort();
+        let _ = server_path.await;
+        target.await.expect("target join");
+    })
+    .await
+    .expect("UDP stream relay integration deadline");
 }
 
 #[tokio::test]
@@ -1367,43 +1371,47 @@ async fn http_connect_ingress_rejects_missing_basic_proxy_auth() {
 
 #[tokio::test]
 async fn http_connect_ingress_relays_tcp_payload_over_udp_stream_path() {
-    let (target_addr, target) = spawn_echo_target().await;
-    let (path, server_path) = spawn_udp_server_path(OutboundConfig::Direct).await;
-    let context = client_context_with_session_retention(
-        vec![path],
-        ResourceLimits::default(),
-        Duration::from_secs(2),
-    );
-    let (mut client, server) = duplex(1);
-    let handler = tokio::spawn(handle_http_connect_client_stream(server, context));
+    tokio::time::timeout(Duration::from_secs(10), async {
+        let (target_addr, target) = spawn_echo_target().await;
+        let (path, server_path) = spawn_udp_server_path(OutboundConfig::Direct).await;
+        let context = client_context_with_session_retention(
+            vec![path],
+            ResourceLimits::default(),
+            Duration::from_secs(2),
+        );
+        let (mut client, server) = duplex(1);
+        let handler = tokio::spawn(handle_http_connect_client_stream(server, context));
 
-    client
-        .write_all(
-            format!("CONNECT {target_addr} HTTP/1.1\r\nHost: {target_addr}\r\n\r\n").as_bytes(),
-        )
-        .await
-        .expect("request");
-    let mut response = vec![0u8; http_connect::success_response().len()];
-    client.read_exact(&mut response).await.expect("response");
-    assert_eq!(response, http_connect::success_response());
+        client
+            .write_all(
+                format!("CONNECT {target_addr} HTTP/1.1\r\nHost: {target_addr}\r\n\r\n").as_bytes(),
+            )
+            .await
+            .expect("request");
+        let mut response = vec![0u8; http_connect::success_response().len()];
+        client.read_exact(&mut response).await.expect("response");
+        assert_eq!(response, http_connect::success_response());
 
-    client.write_all(b"ping").await.expect("payload write");
-    client.shutdown().await.expect("client shutdown");
-    // Hold product delivery so the QUIC actor observes peer FIN and clean EOF
-    // before the relay can publish final receive feedback.
-    target.await.expect("target join");
-    tokio::time::sleep(Duration::from_millis(50)).await;
-    let mut payload = [0u8; 4];
-    client.read_exact(&mut payload).await.expect("payload read");
-    assert_eq!(&payload, b"pong");
+        client.write_all(b"ping").await.expect("payload write");
+        client.shutdown().await.expect("client shutdown");
+        // Hold product delivery so the QUIC actor observes peer FIN and clean EOF
+        // before the relay can publish final receive feedback.
+        target.await.expect("target join");
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        let mut payload = [0u8; 4];
+        client.read_exact(&mut payload).await.expect("payload read");
+        assert_eq!(&payload, b"pong");
 
-    tokio::time::timeout(FULL_STACK_RESPONSE_TIMEOUT, handler)
-        .await
-        .expect("handler timeout")
-        .expect("join")
-        .expect("handler");
-    server_path.abort();
-    let _ = server_path.await;
+        tokio::time::timeout(FULL_STACK_RESPONSE_TIMEOUT, handler)
+            .await
+            .expect("handler timeout")
+            .expect("join")
+            .expect("handler");
+        server_path.abort();
+        let _ = server_path.await;
+    })
+    .await
+    .expect("HTTP CONNECT UDP stream relay integration deadline");
 }
 
 async fn open_socks5_udp_associate<S>(control_client: &mut S) -> SocketAddr
@@ -1476,8 +1484,10 @@ enum ScriptedTcpDatagramAction {
 
 #[derive(Debug, Clone, Copy)]
 struct ScriptedTcpDatagramEmission {
+    session_id: SessionId,
+    flow_id: DatagramFlowId,
+    datagram_id: DatagramId,
     ttl_ms: u32,
-    received_at: Instant,
 }
 
 async fn spawn_scripted_tcp_datagram_path(
@@ -1502,9 +1512,10 @@ async fn spawn_scripted_tcp_datagram_path(
             security.cipher,
         )
         .expect("initialize encrypted stream");
-        if !matches!(framed.read_frame().await?, Frame::SessionHello { .. }) {
-            return Err(RuntimeError::Protocol("expected SESSION_HELLO"));
-        }
+        let session_id = match framed.read_frame().await? {
+            Frame::SessionHello { session_id } => session_id,
+            _ => return Err(RuntimeError::Protocol("expected SESSION_HELLO")),
+        };
         if !matches!(framed.read_frame().await?, Frame::SessionAuth { .. }) {
             return Err(RuntimeError::Protocol("expected SESSION_AUTH"));
         }
@@ -1546,8 +1557,10 @@ async fn spawn_scripted_tcp_datagram_path(
                     ..
                 } => {
                     let _ = ttl_tx.send(ScriptedTcpDatagramEmission {
+                        session_id,
+                        flow_id,
+                        datagram_id,
                         ttl_ms,
-                        received_at: Instant::now(),
                     });
                     match action {
                         ScriptedTcpDatagramAction::CloseBeforeFeedback => return Ok(()),
@@ -1556,6 +1569,7 @@ async fn spawn_scripted_tcp_datagram_path(
                             return Ok(());
                         }
                         ScriptedTcpDatagramAction::FeedbackThenRespond => {
+                            let response_datagram_id = DatagramId(41);
                             framed
                                 .write_frames(&[
                                     Frame::DatagramFeedback {
@@ -1564,14 +1578,39 @@ async fn spawn_scripted_tcp_datagram_path(
                                     },
                                     Frame::DatagramData {
                                         flow_id,
-                                        datagram_id,
+                                        // Each endpoint owns an independent datagram ID space.
+                                        datagram_id: response_datagram_id,
                                         ttl_ms,
                                         payload: Bytes::from_static(b"pong"),
                                     },
                                 ])
                                 .await?;
                             framed.flush().await?;
-                            return Ok(());
+                            loop {
+                                match framed.read_frame().await? {
+                                    Frame::DatagramFeedback {
+                                        flow_id: feedback_flow_id,
+                                        received,
+                                    } if feedback_flow_id == flow_id
+                                        && received.iter().any(|range| {
+                                            response_datagram_id.0 >= range.start
+                                                && response_datagram_id.0 < range.end
+                                        }) =>
+                                    {
+                                        return Ok(());
+                                    }
+                                    Frame::Ping { nonce } => {
+                                        framed.write_frame(&Frame::Pong { nonce }).await?;
+                                        framed.flush().await?;
+                                    }
+                                    Frame::PathMetrics { .. } => {}
+                                    _ => {
+                                        return Err(RuntimeError::Protocol(
+                                            "unexpected scripted TCP response feedback frame",
+                                        ));
+                                    }
+                                }
+                            }
                         }
                         ScriptedTcpDatagramAction::FeedbackThenClose
                         | ScriptedTcpDatagramAction::FeedbackThenHold => {
@@ -1599,6 +1638,95 @@ async fn spawn_scripted_tcp_datagram_path(
         }
     });
     (path, ttl_rx, task)
+}
+
+async fn receive_association_datagram(
+    association: &mut DatagramClientAssociation,
+) -> (TargetAddr, Bytes) {
+    tokio::time::timeout(FULL_STACK_RESPONSE_TIMEOUT, async {
+        loop {
+            let event = association
+                .next_carrier_frame()
+                .await
+                .expect("next datagram carrier frame");
+            match association
+                .handle_carrier_frame(event)
+                .await
+                .expect("handle datagram carrier frame")
+            {
+                DatagramClientReceive::Deliver {
+                    target,
+                    payload,
+                    receipt,
+                } => {
+                    association
+                        .acknowledge_received(receipt)
+                        .await
+                        .expect("acknowledge received datagram");
+                    return (target, payload);
+                }
+                DatagramClientReceive::Duplicate(receipt) => association
+                    .acknowledge_received(receipt)
+                    .await
+                    .expect("acknowledge duplicate datagram"),
+                DatagramClientReceive::Control => {}
+            }
+        }
+    })
+    .await
+    .expect("receive independent datagram timeout")
+}
+
+async fn process_next_association_control(association: &mut DatagramClientAssociation) {
+    let event = tokio::time::timeout(
+        FULL_STACK_RESPONSE_TIMEOUT,
+        association.next_carrier_frame(),
+    )
+    .await
+    .expect("datagram control frame timeout")
+    .expect("next datagram control frame");
+    assert!(matches!(
+        association
+            .handle_carrier_frame(event)
+            .await
+            .expect("handle datagram control frame"),
+        DatagramClientReceive::Control
+    ));
+}
+
+#[tokio::test]
+async fn tcp_datagram_send_and_receive_use_independent_direction_ids() {
+    let target = UdpSocket::bind("127.0.0.1:0").await.expect("target bind");
+    let target_addr = target.local_addr().expect("target address");
+    let (path, emission, scripted) = spawn_scripted_tcp_datagram_path(
+        Duration::ZERO,
+        ScriptedTcpDatagramAction::FeedbackThenRespond,
+    )
+    .await;
+    let context =
+        ClientPathContext::new(vec![path], security(), ResourceLimits::default()).expect("context");
+    let mut association = DatagramClientAssociation::new(context)
+        .await
+        .expect("association");
+
+    association
+        .send_to_fresh_datagram_with_route_hint(
+            TargetAddr::Ip(target_addr),
+            Bytes::from_static(b"ping"),
+            1_000,
+            None,
+        )
+        .await
+        .expect("local datagram send");
+    assert!(emission.await.expect("scripted emission").ttl_ms > 0);
+    let (response_target, response) = receive_association_datagram(&mut association).await;
+    assert_eq!(response_target, TargetAddr::Ip(target_addr));
+    assert_eq!(response, Bytes::from_static(b"pong"));
+
+    scripted
+        .await
+        .expect("scripted join")
+        .expect("scripted path");
 }
 
 #[tokio::test]
@@ -1783,6 +1911,9 @@ async fn socks5_udp_associate_relays_datagram_over_encrypted_tcp_path() {
         assert_eq!(health.tcp[0].state, SchedulerPathState::Active);
         assert!(health.udp.is_empty());
     }
+    // The path actor intentionally retains its shared carrier until the final
+    // context owner exits; release the inspection clone before joining it.
+    drop(health_context);
     server_path
         .await
         .expect("server join")
@@ -1791,7 +1922,7 @@ async fn socks5_udp_associate_relays_datagram_over_encrypted_tcp_path() {
 }
 
 #[tokio::test]
-async fn tcp_datagram_feedback_then_carrier_close_does_not_replay() {
+async fn tcp_datagram_feedback_then_carrier_close_cancels_retry() {
     let target = UdpSocket::bind("127.0.0.1:0").await.expect("target bind");
     let target_addr = target.local_addr().expect("target address");
     let (scripted_path, ttl_rx, scripted) = spawn_scripted_tcp_datagram_path(
@@ -1810,7 +1941,7 @@ async fn tcp_datagram_feedback_then_carrier_close_does_not_replay() {
         .await
         .expect("association");
 
-    let result = association
+    association
         .send_to_fresh_datagram_with_route_hint(
             TargetAddr::Ip(target_addr),
             Bytes::from_static(b"ping"),
@@ -1820,9 +1951,18 @@ async fn tcp_datagram_feedback_then_carrier_close_does_not_replay() {
                 index: 0,
             }),
         )
-        .await;
-    assert!(result.is_err());
+        .await
+        .expect("local datagram send");
     assert!(ttl_rx.await.expect("scripted emission").ttl_ms > 0);
+    process_next_association_control(&mut association).await;
+    assert!(
+        association.next_retry_deadline().is_none(),
+        "admission feedback must release the retained datagram"
+    );
+    association
+        .retry_due_datagram()
+        .await
+        .expect("no-op retry after feedback");
     scripted
         .await
         .expect("scripted join")
@@ -1839,7 +1979,7 @@ async fn tcp_datagram_feedback_then_carrier_close_does_not_replay() {
 }
 
 #[tokio::test]
-async fn tcp_datagram_no_feedback_releases_an_alternative_after_one_response_timeout() {
+async fn tcp_datagram_no_feedback_reinjects_same_identity_on_alternative() {
     let target = UdpSocket::bind("127.0.0.1:0").await.expect("target bind");
     let target_addr = target.local_addr().expect("target address");
     let (mut first_path, first_emission, first) = spawn_scripted_tcp_datagram_path(
@@ -1852,7 +1992,7 @@ async fn tcp_datagram_no_feedback_releases_an_alternative_after_one_response_tim
     first_path.metadata.initial_rate = RateHint::BitsPerSecond(100_000_000);
     let (mut fallback_path, fallback_emission, fallback) = spawn_scripted_tcp_datagram_path(
         Duration::ZERO,
-        ScriptedTcpDatagramAction::FeedbackThenRespond,
+        ScriptedTcpDatagramAction::FeedbackThenHold,
     )
     .await;
     fallback_path.metadata.initial_srtt_ms = Some(400);
@@ -1865,21 +2005,17 @@ async fn tcp_datagram_no_feedback_releases_an_alternative_after_one_response_tim
     )
     .expect("context");
     let ttl_ms = 2_500;
-    let response_timeout = tcp_datagram_response_timeout(
-        context.tcp_path_snapshot(0).expect("first path snapshot"),
-        None,
-        None,
-        ttl_ms,
-    );
     assert_eq!(
         context.ordered_tcp_path_indices(TrafficClass::RealtimeDatagram, 4),
         vec![0, 1]
     );
+    let expected_session_id = context.session_id;
+    let health_context = context.clone();
     let mut association = DatagramClientAssociation::new(context)
         .await
         .expect("association");
 
-    let response = association
+    association
         .send_to_fresh_datagram_with_route_hint(
             TargetAddr::Ip(target_addr),
             Bytes::from_static(b"ping"),
@@ -1887,33 +2023,41 @@ async fn tcp_datagram_no_feedback_releases_an_alternative_after_one_response_tim
             None,
         )
         .await
-        .expect("fallback response");
-    assert_eq!(response, Bytes::from_static(b"pong"));
+        .expect("local datagram send");
     let emission = first_emission.await.expect("first emission");
+    assert_eq!(emission.session_id, expected_session_id);
+    let retry_at = association
+        .next_retry_deadline()
+        .expect("missing feedback retry deadline");
+    tokio::time::sleep_until(retry_at).await;
+    association
+        .retry_due_datagram()
+        .await
+        .expect("retry due datagram");
     let fallback_emission = fallback_emission.await.expect("fallback emission");
-    let elapsed_after_emission = fallback_emission
-        .received_at
-        .duration_since(emission.received_at);
+    assert_eq!(fallback_emission.session_id, expected_session_id);
+    assert_eq!(fallback_emission.flow_id, emission.flow_id);
+    assert_eq!(fallback_emission.datagram_id, emission.datagram_id);
+    process_next_association_control(&mut association).await;
     assert!(
-        elapsed_after_emission + Duration::from_millis(100) >= response_timeout,
-        "fallback occurred before the modeled response timeout: elapsed={elapsed_after_emission:?} model={response_timeout:?}"
+        association.next_retry_deadline().is_none(),
+        "fallback feedback must release the retained datagram"
     );
-    assert!(
-        elapsed_after_emission < response_timeout.saturating_mul(2),
-        "fallback retained the final-attempt tolerance budget: elapsed={elapsed_after_emission:?} model={response_timeout:?}"
-    );
+    {
+        let health = health_context.health().lock().expect("health lock");
+        assert_eq!(health.tcp[0].consecutive_failures, 0);
+        assert!(health.tcp[0].failed_until.is_none());
+    }
 
     drop(association);
     first.abort();
     let _ = first.await;
-    fallback
-        .await
-        .expect("fallback join")
-        .expect("fallback path");
+    fallback.abort();
+    let _ = fallback.await;
 }
 
 #[tokio::test]
-async fn tcp_datagram_feedback_extends_wait_to_product_ttl_without_replay() {
+async fn tcp_datagram_send_does_not_wait_for_feedback_or_target_response() {
     let target = UdpSocket::bind("127.0.0.1:0").await.expect("target bind");
     let target_addr = target.local_addr().expect("target address");
     let (mut first_path, first_emission, first) = spawn_scripted_tcp_datagram_path(
@@ -1935,35 +2079,34 @@ async fn tcp_datagram_feedback_extends_wait_to_product_ttl_without_replay() {
     )
     .expect("context");
     let ttl_ms = 900;
-    let response_timeout = tcp_datagram_response_timeout(
-        context.tcp_path_snapshot(0).expect("first path snapshot"),
-        None,
-        None,
-        ttl_ms,
-    );
     let mut association = DatagramClientAssociation::new(context)
         .await
         .expect("association");
+    let started_at = Instant::now();
 
-    let result = association
+    association
         .send_to_fresh_datagram_with_route_hint(
             TargetAddr::Ip(target_addr),
             Bytes::from_static(b"ping"),
             ttl_ms,
             None,
         )
-        .await;
-    assert!(result.is_err());
-    let emission = first_emission.await.expect("first emission");
-    let elapsed_after_emission = emission.received_at.elapsed();
+        .await
+        .expect("local datagram send");
+    let _ = first_emission.await.expect("first emission");
     assert!(
-        elapsed_after_emission > response_timeout.saturating_mul(3),
-        "admission feedback did not extend response waiting beyond the attempt budget: elapsed={elapsed_after_emission:?} model={response_timeout:?}"
+        started_at.elapsed() < Duration::from_millis(450),
+        "local send completion must not wait for peer feedback or the product TTL"
     );
+    process_next_association_control(&mut association).await;
     assert!(
-        elapsed_after_emission >= Duration::from_millis(650),
-        "admission feedback did not preserve the original product TTL: {elapsed_after_emission:?}"
+        association.next_retry_deadline().is_none(),
+        "admission feedback must release the retained datagram"
     );
+    association
+        .retry_due_datagram()
+        .await
+        .expect("no-op retry after feedback");
     let mut packet = [0u8; 16];
     assert!(
         tokio::time::timeout(Duration::from_millis(100), target.recv_from(&mut packet))
@@ -1979,22 +2122,16 @@ async fn tcp_datagram_feedback_extends_wait_to_product_ttl_without_replay() {
 }
 
 #[tokio::test]
-async fn tcp_datagram_runtime_fallback_emits_at_most_twice() {
-    let target = UdpSocket::bind("127.0.0.1:0").await.expect("target bind");
-    let target_addr = target.local_addr().expect("target address");
+async fn tcp_datagram_carrier_failure_reinjects_on_fallback() {
+    let (target_addr, target) = spawn_udp_echo_target().await;
     let (first_path, first_ttl, first) = spawn_scripted_tcp_datagram_path(
         Duration::ZERO,
         ScriptedTcpDatagramAction::CloseBeforeFeedback,
     )
     .await;
-    let (second_path, second_ttl, second) = spawn_scripted_tcp_datagram_path(
-        Duration::ZERO,
-        ScriptedTcpDatagramAction::CloseBeforeFeedback,
-    )
-    .await;
-    let (third_path, third) = spawn_server_path(OutboundConfig::Direct).await;
+    let (fallback_path, fallback) = spawn_server_path(OutboundConfig::Direct).await;
     let context = ClientPathContext::new(
-        vec![first_path, second_path, third_path],
+        vec![first_path, fallback_path],
         security(),
         ResourceLimits::default(),
     )
@@ -2003,7 +2140,7 @@ async fn tcp_datagram_runtime_fallback_emits_at_most_twice() {
         .await
         .expect("association");
 
-    let result = association
+    association
         .send_to_fresh_datagram_with_route_hint(
             TargetAddr::Ip(target_addr),
             Bytes::from_static(b"ping"),
@@ -2013,21 +2150,43 @@ async fn tcp_datagram_runtime_fallback_emits_at_most_twice() {
                 index: 0,
             }),
         )
-        .await;
-    assert!(result.is_err());
+        .await
+        .expect("local datagram send");
     assert!(first_ttl.await.expect("first emission").ttl_ms > 0);
-    assert!(second_ttl.await.expect("second emission").ttl_ms > 0);
     first.await.expect("first join").expect("first path");
-    second.await.expect("second join").expect("second path");
-    let mut packet = [0u8; 16];
+    let carrier_event = tokio::time::timeout(
+        FULL_STACK_RESPONSE_TIMEOUT,
+        association.next_carrier_frame(),
+    )
+    .await
+    .expect("carrier failure frame timeout")
+    .expect("carrier failure frame");
     assert!(
-        tokio::time::timeout(Duration::from_millis(150), target.recv_from(&mut packet))
+        association
+            .handle_carrier_frame(carrier_event)
             .await
             .is_err(),
-        "a third product emission must not reach the final carrier"
+        "the closed carrier must report a receive failure"
     );
-    third.abort();
-    let _ = third.await;
+    let retry_at = association
+        .next_retry_deadline()
+        .expect("carrier failure retry deadline");
+    assert!(retry_at <= tokio::time::Instant::now());
+    association
+        .retry_due_datagram()
+        .await
+        .expect("carrier failure reinjection");
+    let (response_target, response) = receive_association_datagram(&mut association).await;
+    assert_eq!(response_target, TargetAddr::Ip(target_addr));
+    assert_eq!(response, Bytes::from_static(b"pong"));
+
+    association.close().await.expect("association close");
+    drop(association);
+    fallback
+        .await
+        .expect("fallback join")
+        .expect("fallback path");
+    target.await.expect("target join");
 }
 
 #[tokio::test]
@@ -2057,7 +2216,7 @@ async fn configured_udp_payload_limit_falls_through_to_tcp_without_emission() {
         .await
         .expect("association");
 
-    let response = association
+    association
         .send_to_fresh_datagram_with_route_hint(
             TargetAddr::Ip(target_addr),
             Bytes::from(vec![7u8; 1_400]),
@@ -2068,7 +2227,9 @@ async fn configured_udp_payload_limit_falls_through_to_tcp_without_emission() {
             }),
         )
         .await
-        .expect("TCP fallback response");
+        .expect("TCP fallback local send");
+    let (response_target, response) = receive_association_datagram(&mut association).await;
+    assert_eq!(response_target, TargetAddr::Ip(target_addr));
     assert_eq!(response, Bytes::from_static(b"pong"));
     let telemetry = telemetry_context.telemetry_snapshot();
     assert_eq!(telemetry.datagram.io.to_peer_bytes, 1_400);
@@ -2083,6 +2244,7 @@ async fn configured_udp_payload_limit_falls_through_to_tcp_without_emission() {
     assert_eq!(telemetry.datagram.flows.completed, 1);
     assert_eq!(telemetry.datagram.flows.failed, 0);
     drop(telemetry_context);
+    drop(association);
     tcp_server
         .await
         .expect("TCP server join")
@@ -2106,23 +2268,23 @@ async fn tcp_datagram_setup_consumes_the_original_absolute_ttl() {
         .expect("association");
     let started_at = Instant::now();
 
-    let result = association
+    association
         .send_to_fresh_datagram_with_route_hint(
             TargetAddr::Ip(target_addr),
             Bytes::from_static(b"ping"),
             1_000,
             None,
         )
-        .await;
-    assert!(result.is_err());
+        .await
+        .expect("local datagram send after carrier setup");
     let emitted_ttl = ttl_rx.await.expect("emitted TTL").ttl_ms;
     assert!(
         emitted_ttl < 850,
         "carrier setup must be deducted from DGRAM_DATA TTL, got {emitted_ttl} ms"
     );
     assert!(
-        started_at.elapsed() < Duration::from_millis(1_200),
-        "carrier setup and response wait must share one product expiry"
+        started_at.elapsed() < Duration::from_millis(850),
+        "local send completion must not wait out the remaining product TTL"
     );
     scripted.abort();
     let _ = scripted.await;
@@ -2157,7 +2319,7 @@ async fn tcp_datagram_carrier_setup_uses_remaining_ttl_for_same_family_fallback(
         .expect("association");
     let ttl_ms = 2_500;
     let started_at = Instant::now();
-    let response = association
+    association
         .send_to_fresh_datagram_with_route_hint(
             TargetAddr::Ip(target_addr),
             Bytes::from_static(b"ping"),
@@ -2168,7 +2330,9 @@ async fn tcp_datagram_carrier_setup_uses_remaining_ttl_for_same_family_fallback(
             }),
         )
         .await
-        .expect("fallback response");
+        .expect("fallback local send");
+    let (response_target, response) = receive_association_datagram(&mut association).await;
+    assert_eq!(response_target, TargetAddr::Ip(target_addr));
     assert_eq!(response, Bytes::from_static(b"pong"));
     assert!(
         started_at.elapsed() < Duration::from_millis(u64::from(ttl_ms)),
@@ -2176,6 +2340,7 @@ async fn tcp_datagram_carrier_setup_uses_remaining_ttl_for_same_family_fallback(
     );
 
     association.close().await.expect("association close");
+    drop(association);
     blackhole.await.expect("blackhole join");
     server_path
         .await

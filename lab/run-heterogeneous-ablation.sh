@@ -350,9 +350,9 @@ build_mptunnel_binary() {
   if flag_enabled "$lab_diagnostics"; then
     feature_args=(--features lab-diagnostics)
   fi
-  cargo build --release --bin mptunnel "${feature_args[@]}"
+  cargo build --release --locked --bin mptunnel "${feature_args[@]}"
   if [[ "$client_runtime" == "wine" ]]; then
-    cargo build --release --target "$client_target" --bin mptunnel "${feature_args[@]}"
+    cargo build --release --locked --target "$client_target" --bin mptunnel "${feature_args[@]}"
   fi
 }
 

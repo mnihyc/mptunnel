@@ -29,7 +29,7 @@ fn fixed_fixture(queue_capacity: usize, limits: MuxLimits) -> FixedFixture {
             commands.clone(),
             limits,
         ),
-        frames,
+        frames: frames.into(),
     };
     FixedFixture {
         stream,
@@ -211,7 +211,7 @@ fn published_product_queue_is_shared_stream_state() {
         underlay: UnderlayProtocol::Tcp,
         max_frame_payload_bytes: limits.max_payload_bytes,
         output: ReliablePathStreamOutput::Switchable(binding.clone()),
-        frames,
+        frames: frames.into(),
     };
     let mut sender = ServerResponseSenderService::new(SessionId(31), StreamId(31));
     sender.enqueue_data_for_lane(Bytes::from_static(b"queued"), TrafficClass::Throughput);

@@ -100,6 +100,8 @@ async fn quic_carrier_round_trips_product_frames() {
     .expect("client endpoint");
     let connection = client.connect(server_addr).await.expect("client connect");
     let (mut send, mut recv) = connection.open_bi().await.expect("client stream");
+    send.set_priority(1).expect("set QUIC stream priority");
+    assert_eq!(send.priority().expect("read QUIC stream priority"), 1);
     write_frame(&mut send, &Frame::Ping { nonce: 42 }, limits)
         .await
         .expect("client write ping");
@@ -121,7 +123,7 @@ async fn quic_carrier_round_trips_product_frames() {
     server_task.await.expect("server task");
 }
 #[tokio::test]
-async fn stopped_quic_write_fail_closes_and_releases_backlog() {
+async fn stopped_quic_stream_write_keeps_the_shared_connection_available() {
     let secret = b"0123456789abcdef0123456789abcdef";
     let limits = CodecLimits::default();
     let mux_limits = MuxLimits::default();
@@ -143,6 +145,19 @@ async fn stopped_quic_write_fail_closes_and_releases_backlog() {
             Frame::Ping { nonce: 1 }
         );
         recv.stream.stop(stop_code).expect("stop client writer");
+        let (mut send, mut recv) = connection
+            .accept_bi()
+            .await
+            .expect("accept replacement stream");
+        assert_eq!(
+            read_frame(&mut recv, limits)
+                .await
+                .expect("read replacement"),
+            Frame::Ping { nonce: 2 }
+        );
+        write_frame(&mut send, &Frame::Pong { nonce: 2 }, limits)
+            .await
+            .expect("write replacement response");
         let _ = timeout(Duration::from_secs(5), client_done_rx).await;
     });
 
@@ -189,7 +204,19 @@ async fn stopped_quic_write_fail_closes_and_releases_backlog() {
     let metrics = connection.congestion_metrics();
     assert_eq!(metrics.pending_bytes, 0);
     assert_eq!(metrics.delivery_evidence_written_bytes, payload_len);
-    assert!(connection.is_closed());
+    assert!(!connection.is_closed());
+
+    let (mut replacement_send, mut replacement_recv) =
+        connection.open_bi().await.expect("open replacement stream");
+    write_frame(&mut replacement_send, &Frame::Ping { nonce: 2 }, limits)
+        .await
+        .expect("write replacement request");
+    assert_eq!(
+        read_frame(&mut replacement_recv, limits)
+            .await
+            .expect("read replacement response"),
+        Frame::Pong { nonce: 2 }
+    );
 
     let _ = client_done_tx.send(());
     server_task.await.expect("server task");

@@ -95,6 +95,7 @@ pub(in crate::runtime) struct RequestDataAckGapObservation {
     pub(in crate::runtime) original_path_timing: Option<PathSnapshot>,
     pub(in crate::runtime) reinjection_target:
         Option<(ClientReinjectionOutputIdentity, PathSnapshot)>,
+    pub(in crate::runtime) reinjection_completion: Option<Duration>,
 }
 
 #[derive(Debug)]

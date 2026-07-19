@@ -18,6 +18,7 @@ use crate::outbound::{DnsConfig, DnsIpStrategy, OutboundConfig};
 use crate::transport::{Endpoint, PathSpec};
 use clap::{Args, Parser, Subcommand, ValueEnum};
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
+use std::path::PathBuf;
 use std::time::Duration;
 
 #[derive(Debug, Parser)]
@@ -25,6 +26,10 @@ use std::time::Duration;
 #[command(about = "Encrypted multipath proxy and tunnel")]
 #[command(version)]
 pub struct Cli {
+    /// Load the complete runtime configuration from a TOML file.
+    #[arg(short = 'c', long = "config", global = true, value_name = "FILE")]
+    pub config_file: Option<PathBuf>,
+
     #[arg(long, global = true, env = "MPTUNNEL_LOG", default_value = "info")]
     pub log_level: String,
 

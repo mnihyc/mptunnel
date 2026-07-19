@@ -4,7 +4,7 @@
 //! identity. The response binding revalidates that identity and the connection
 //! flight generation before publishing the carrier command.
 
-use super::scheduling::select_response_data_path;
+use super::scheduling::select_response_data_path_with_payload;
 use crate::model::path::CarrierPathKey;
 use crate::model::work::ReliableWorkClass;
 use crate::runtime::RuntimeError;
@@ -40,6 +40,7 @@ pub(super) fn plan_response_data_dispatch(
     )
 }
 
+#[cfg(test)]
 pub(super) fn plan_response_data_dispatch_with_data_ack_outstanding_impl(
     stream: &ReliablePathStream,
     relay_lane: TrafficClass,
@@ -47,13 +48,33 @@ pub(super) fn plan_response_data_dispatch_with_data_ack_outstanding_impl(
     payload_bytes: usize,
     data_ack_outstanding_bytes: usize,
 ) -> Result<ResponseDataDispatchTarget, RuntimeError> {
+    plan_response_data_payload_with_data_ack_outstanding_impl(
+        stream,
+        relay_lane,
+        next_offset,
+        payload_bytes,
+        data_ack_outstanding_bytes,
+    )
+    .map(|(_, target)| target)
+}
+
+pub(super) fn plan_response_data_payload_with_data_ack_outstanding_impl(
+    stream: &ReliablePathStream,
+    relay_lane: TrafficClass,
+    next_offset: u64,
+    payload_bytes: usize,
+    data_ack_outstanding_bytes: usize,
+) -> Result<(usize, ResponseDataDispatchTarget), RuntimeError> {
     match &stream.output {
         ReliablePathStreamOutput::Fixed(fixed) => {
             let lane = reliable_work_lane_to_carrier_lane(ReliableWorkClass::Data, relay_lane);
-            if !fixed.commands().can_enqueue_stream_ordered_frame_now(lane) {
+            if !fixed.commands().can_enqueue_lane_now(lane) {
                 return Err(RuntimeError::SenderServiceBlocked);
             }
-            Ok(ResponseDataDispatchTarget::Fixed { key: fixed.key() })
+            Ok((
+                payload_bytes,
+                ResponseDataDispatchTarget::Fixed { key: fixed.key() },
+            ))
         }
         ReliablePathStreamOutput::Switchable(binding) => {
             // Read the generation before the observation. Any concurrent model
@@ -62,7 +83,7 @@ pub(super) fn plan_response_data_dispatch_with_data_ack_outstanding_impl(
             let expected_model_generation = binding.response_model_generation();
             let lower_flights = binding.lower_flights_before_offset(next_offset);
             let targets = binding.sender_path_targets(relay_lane, payload_bytes);
-            let target = select_response_data_path(
+            let selection = select_response_data_path_with_payload(
                 &targets,
                 relay_lane,
                 payload_bytes,
@@ -71,10 +92,13 @@ pub(super) fn plan_response_data_dispatch_with_data_ack_outstanding_impl(
                 data_ack_outstanding_bytes,
             )
             .ok_or(RuntimeError::SenderServiceBlocked)?;
-            Ok(ResponseDataDispatchTarget::Switchable {
-                target: target.into(),
-                expected_model_generation,
-            })
+            Ok((
+                selection.payload_bytes,
+                ResponseDataDispatchTarget::Switchable {
+                    target: selection.target.into(),
+                    expected_model_generation,
+                },
+            ))
         }
     }
 }
@@ -88,7 +112,7 @@ pub(super) fn preview_response_data_payload_with_data_ack_outstanding(
     payload_bytes: usize,
     data_ack_outstanding_bytes: usize,
 ) -> bool {
-    plan_response_data_dispatch_with_data_ack_outstanding_impl(
+    plan_response_data_payload_with_data_ack_outstanding_impl(
         path_stream,
         relay_lane,
         next_offset,
@@ -96,23 +120,6 @@ pub(super) fn preview_response_data_payload_with_data_ack_outstanding(
         data_ack_outstanding_bytes,
     )
     .is_ok()
-}
-
-pub(super) fn plan_response_data_payload_with_data_ack_outstanding_impl(
-    path_stream: &ReliablePathStream,
-    relay_lane: TrafficClass,
-    next_offset: u64,
-    payload_bytes: usize,
-    data_ack_outstanding_bytes: usize,
-) -> Result<(usize, ResponseDataDispatchTarget), RuntimeError> {
-    plan_response_data_dispatch_with_data_ack_outstanding_impl(
-        path_stream,
-        relay_lane,
-        next_offset,
-        payload_bytes,
-        data_ack_outstanding_bytes,
-    )
-    .map(|planned| (payload_bytes, planned))
 }
 
 #[cfg(test)]

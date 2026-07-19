@@ -10,6 +10,7 @@ use crate::model::capacity::{PATH_OPEN_SCORE_BYTES, reliable_path_startup_sample
 use crate::model::path::CarrierPathKey;
 use crate::mux::MuxLimits;
 use crate::protocol::{PathId, PathMetricDirection, PathMetrics, UnderlayProtocol};
+use crate::runtime::path::CarrierDeliveryRateSample;
 use crate::runtime::path::model::metric_epoch_now;
 use std::time::{Duration, Instant};
 
@@ -46,6 +47,7 @@ fn local_metrics_entry(metrics: PathMetrics) -> ServerPathMetricsEntry {
         metrics,
         source: ServerPathMetricsSource::LocalSender,
         native_drain_observed: false,
+        carrier_delivery_rate_sample: None,
         recorded_at: Instant::now(),
     }
 }
@@ -162,14 +164,17 @@ fn response_bulk_evidence_rejects_peer_wrong_direction_and_foreign_path_metrics(
 }
 
 #[test]
-fn ack_derived_bulk_evidence_uses_transport_specific_sample_floors() {
+fn ack_derived_bulk_evidence_requires_native_window_coverage() {
     for underlay in [UnderlayProtocol::Tcp, UnderlayProtocol::Udp] {
         let key = CarrierPathKey {
             underlay,
             path_id: PathId(11),
         };
         let mut metrics = response_metrics(key);
+        metrics.inflight_hi_bytes = 1_500_000;
+        metrics.inflight_limit_bytes = 2_012_844;
         let sample_floor = server_path_metrics_bulk_sample_floor_bytes(metrics);
+        assert_eq!(sample_floor, metrics.inflight_limit_bytes);
         let accounting_slack = (PATH_OPEN_SCORE_BYTES as u64).min(sample_floor / 8);
         metrics.data_sample_bytes = sample_floor.saturating_sub(accounting_slack + 1);
         assert!(!server_path_metrics_has_bulk_rate_evidence(
@@ -226,6 +231,7 @@ fn native_quic_rate_sample_is_expiring_bulk_evidence() {
         metrics,
         source: ServerPathMetricsSource::LocalSender,
         native_drain_observed: false,
+        carrier_delivery_rate_sample: None,
         recorded_at: Instant::now(),
     };
     output.local_path_metrics = Some(accepted);
@@ -243,6 +249,36 @@ fn native_quic_rate_sample_is_expiring_bulk_evidence() {
     output.local_path_metrics = Some(expired_entry);
     assert!(!server_path_metrics_has_bulk_rate_evidence(expired_entry));
     assert!(!server_output_has_bulk_rate_evidence(&output, mux_limits));
+}
+
+#[test]
+fn retained_native_tcp_sample_is_carrier_capacity_not_product_ack_evidence() {
+    let key = CarrierPathKey {
+        underlay: UnderlayProtocol::Tcp,
+        path_id: PathId(0),
+    };
+    let mut metrics = response_metrics(key);
+    metrics.delivery_rate_bps = 6_000_000;
+    metrics.app_limited = true;
+    metrics.has_ack_derived_data_sample = false;
+    metrics.data_sample_count = 0;
+    metrics.data_sample_bytes = 0;
+    let entry = ServerPathMetricsEntry {
+        metrics,
+        source: ServerPathMetricsSource::LocalSender,
+        native_drain_observed: true,
+        carrier_delivery_rate_sample: Some(CarrierDeliveryRateSample {
+            delivery_rate_bps: 80_000_000,
+            sample_count: 8,
+            sample_bytes: 512 * 1024,
+            delivery_window_covered: true,
+        }),
+        recorded_at: Instant::now(),
+    };
+
+    assert!(server_path_metrics_has_bulk_rate_evidence(entry));
+    assert_eq!(server_path_metrics_estimate_rate_bps(entry), 80_000_000.0);
+    assert!(!entry.metrics.has_ack_derived_data_sample);
 }
 
 #[test]

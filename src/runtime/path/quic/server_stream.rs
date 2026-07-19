@@ -8,8 +8,7 @@ use super::io::{
 use super::server_writer::drain_server_udp_reliable_commands;
 use crate::model::capacity::reliable_stream_initial_advertised_window_bytes;
 use crate::protocol::{
-    Frame, PathId, PathMetricDirection, ResetReason, SessionId, StreamId, TargetAddr,
-    UnderlayProtocol,
+    Frame, PathId, ResetReason, SessionId, StreamId, TargetAddr, UnderlayProtocol,
 };
 use crate::runtime::error::RuntimeError;
 use crate::runtime::path::commands::{
@@ -17,7 +16,7 @@ use crate::runtime::path::commands::{
     reliable_path_command_channels, reliable_path_receivers_closed, try_recv_reliable_path_command,
     try_recv_reliable_path_priority_command,
 };
-use crate::runtime::path::proof::{PathProofTracker, path_proof_ack_frame, path_proof_metrics};
+use crate::runtime::path::proof::{PathProofTracker, path_proof_ack_frame};
 use crate::runtime::path::server_context::ServerPathContext;
 use crate::runtime::path::{
     ServerCarrierPathRegistration, ServerStreamOpenOutcome, ServerStreamOpenRequest,
@@ -36,22 +35,46 @@ pub(super) struct ServerUdpReliableStreamContext {
 
 struct ServerUdpReliableOutputDetachGuard {
     streams: ServerStreamPort,
-    session_id: SessionId,
+    path_registration: ServerCarrierPathRegistration,
     stream_id: StreamId,
-    path_id: PathId,
-    commands: ReliablePathCommandSender,
 }
 
 impl Drop for ServerUdpReliableOutputDetachGuard {
     fn drop(&mut self) {
-        self.streams.detach_path(
-            self.session_id,
-            self.stream_id,
-            UnderlayProtocol::Udp,
-            self.path_id,
-            &self.commands,
-        );
+        let _ = self
+            .streams
+            .detach_path(&self.path_registration, self.stream_id);
     }
+}
+
+async fn write_udp_stream_accept(
+    send: &mut UdpPathSendStream,
+    context: &ServerPathContext,
+    path_registration: &ServerCarrierPathRegistration,
+    stream_id: StreamId,
+    lane: TrafficClass,
+    path_proofs: &mut PathProofTracker,
+) -> Result<(), RuntimeError> {
+    udp_path_write_frame(
+        send,
+        &Frame::StreamMaxData {
+            stream_id,
+            max_offset: reliable_stream_initial_advertised_window_bytes(
+                UnderlayProtocol::Udp,
+                lane,
+                context.mux_limits,
+            ),
+        },
+        context.codec_limits,
+    )
+    .await?;
+
+    let Some(challenge) = path_registration.path_validation_challenge(context.mux_limits) else {
+        return Ok(());
+    };
+    udp_path_write_frame(send, &challenge, context.codec_limits).await?;
+    path_proofs.record_sent_frame(&challenge);
+    Ok(())
 }
 
 pub(super) async fn handle_server_udp_reliable_stream(
@@ -76,11 +99,10 @@ pub(super) async fn handle_server_udp_reliable_stream(
     ));
     let _output_detach_guard = ServerUdpReliableOutputDetachGuard {
         streams: context.reliable_streams.clone(),
-        session_id,
+        path_registration: path_registration.clone(),
         stream_id,
-        path_id,
-        commands: commands_tx.clone(),
     };
+    let mut path_proofs = PathProofTracker::default();
     match context
         .reliable_streams
         .open_or_attach(ServerStreamOpenRequest {
@@ -102,17 +124,13 @@ pub(super) async fn handle_server_udp_reliable_stream(
     {
         ServerStreamOpenOutcome::New => {}
         ServerStreamOpenOutcome::Existing => {
-            udp_path_write_frame(
+            write_udp_stream_accept(
                 &mut send,
-                &Frame::StreamMaxData {
-                    stream_id,
-                    max_offset: reliable_stream_initial_advertised_window_bytes(
-                        UnderlayProtocol::Udp,
-                        lane,
-                        context.mux_limits,
-                    ),
-                },
-                context.codec_limits,
+                &context,
+                &path_registration,
+                stream_id,
+                lane,
+                &mut path_proofs,
             )
             .await?;
         }
@@ -155,6 +173,7 @@ pub(super) async fn handle_server_udp_reliable_stream(
             target: duplicate_open_target,
             commands_tx,
             commands_rx,
+            path_proofs,
         },
     )
     .await
@@ -169,6 +188,7 @@ struct ServerUdpReliableStreamLoop {
     target: TargetAddr,
     commands_tx: ReliablePathCommandSender,
     commands_rx: ReliablePathCommandReceivers,
+    path_proofs: PathProofTracker,
 }
 
 async fn run_server_udp_reliable_stream_loop(
@@ -185,13 +205,13 @@ async fn run_server_udp_reliable_stream_loop(
         target,
         commands_tx,
         mut commands_rx,
+        mut path_proofs,
     } = stream_context;
     let carrier_frame_queue =
         udp_reliable_stream_frame_queue(context.codec_limits, context.mux_limits);
     let mut carrier_frames =
         spawn_quic_path_reader(recv, context.codec_limits, carrier_frame_queue);
     let mut pending_frames = Vec::<Frame>::new();
-    let mut path_proofs = PathProofTracker::default();
     let mut deferred_input = None;
     let mut terminal_drain_deadline = None;
     loop {
@@ -276,18 +296,12 @@ async fn run_server_udp_reliable_stream_loop(
                 }))) if proof_path_id == path_id => {
                     if let Some(observation) =
                         path_proofs.acknowledge(path_id, proof_id, payload_bytes)
-                        && let Some(metrics) = path_proof_metrics(
-                            path_id,
-                            UnderlayProtocol::Udp,
-                            PathMetricDirection::ServerToClient,
-                            observation,
-                        )
                     {
-                        context.reliable_streams.record_local_path_metrics(
-                            &path_registration,
-                            metrics,
-                            false,
-                        );
+                        // QUIC owns congestion and capacity evidence; this frame
+                        // validates only the response direction of the carrier.
+                        context
+                            .reliable_streams
+                            .record_path_proof_success(&path_registration, observation);
                     }
                 }
                 // These requests can already be deferred behind the terminal
@@ -328,11 +342,9 @@ async fn run_server_udp_reliable_stream_loop(
                 &mut commands_rx,
                 &mut send,
                 &context,
-                session_id,
                 stream_id,
                 path_id,
                 &path_registration,
-                &commands_tx,
                 &mut pending_frames,
                 &mut path_proofs,
                 &mut carrier_frames,
@@ -369,13 +381,10 @@ async fn run_server_udp_reliable_stream_loop(
                     Some(Ok(Frame::StreamDetach { stream_id: detach_stream_id }))
                         if detach_stream_id == stream_id =>
                     {
-                        context.reliable_streams.detach_path(
-                            session_id,
-                            stream_id,
-                            UnderlayProtocol::Udp,
-                            path_id,
-                            &commands_tx,
-                        );
+                        context
+                            .reliable_streams
+                            .detach_path(&path_registration, stream_id)
+                            ?;
                         let _ = udp_path_finish_stream(&mut send);
                         return Ok(());
                     }
@@ -393,6 +402,7 @@ async fn run_server_udp_reliable_stream_loop(
                     })) if open_stream_id == stream_id && open_target == target =>
                     {
                         let updated_lane = traffic_class_from_stream_demand_hint(open_demand);
+                        send.set_traffic_class(updated_lane)?;
                         match context
                             .reliable_streams
                             .attach_existing(ServerStreamOpenRequest {
@@ -413,17 +423,13 @@ async fn run_server_udp_reliable_stream_loop(
                             .await?
                         {
                             ServerStreamOpenOutcome::Existing => {
-                                udp_path_write_frame(
+                                write_udp_stream_accept(
                                     &mut send,
-                                    &Frame::StreamMaxData {
-                                        stream_id,
-                                        max_offset: reliable_stream_initial_advertised_window_bytes(
-                                            UnderlayProtocol::Udp,
-                                            updated_lane,
-                                            context.mux_limits,
-                                        ),
-                                    },
-                                    context.codec_limits,
+                                    &context,
+                                    &path_registration,
+                                    stream_id,
+                                    updated_lane,
+                                    &mut path_proofs,
                                 )
                                 .await?;
                             }
@@ -497,18 +503,12 @@ async fn run_server_udp_reliable_stream_loop(
                     })) if proof_path_id == path_id => {
                         if let Some(observation) =
                             path_proofs.acknowledge(path_id, proof_id, payload_bytes)
-                            && let Some(metrics) = path_proof_metrics(
-                                path_id,
-                                UnderlayProtocol::Udp,
-                                PathMetricDirection::ServerToClient,
-                                observation,
-                            )
                         {
-                            context.reliable_streams.record_local_path_metrics(
-                                &path_registration,
-                                metrics,
-                                false,
-                            );
+                            // QUIC owns congestion and capacity evidence; this
+                            // frame validates only the response direction.
+                            context
+                                .reliable_streams
+                                .record_path_proof_success(&path_registration, observation);
                         }
                     }
                     Some(Ok(Frame::PathCapacityData { .. }
@@ -528,23 +528,17 @@ async fn run_server_udp_reliable_stream_loop(
                         return Err(RuntimeError::Protocol("unexpected server QUIC UDP path reliable stream frame"));
                     }
                     Some(Err(err)) if super::io::udp_path_input_finished(&err) => {
-                        context.reliable_streams.detach_path(
-                            session_id,
-                            stream_id,
-                            UnderlayProtocol::Udp,
-                            path_id,
-                            &commands_tx,
-                        );
+                        context
+                            .reliable_streams
+                            .detach_path(&path_registration, stream_id)
+                            ?;
                         return Ok(());
                     }
                     Some(Err(RuntimeError::ReliablePathSessionClosed)) | None => {
-                        context.reliable_streams.detach_path(
-                            session_id,
-                            stream_id,
-                            UnderlayProtocol::Udp,
-                            path_id,
-                            &commands_tx,
-                        );
+                        context
+                            .reliable_streams
+                            .detach_path(&path_registration, stream_id)
+                            ?;
                         return Ok(());
                     }
                     Some(Err(err)) => return Err(err),
@@ -556,11 +550,9 @@ async fn run_server_udp_reliable_stream_loop(
                         &mut commands_rx,
                         &mut send,
                         &context,
-                        session_id,
                         stream_id,
                         path_id,
                         &path_registration,
-                        &commands_tx,
                         &mut pending_frames,
                         &mut path_proofs,
                         &mut carrier_frames,
@@ -582,11 +574,9 @@ async fn run_server_udp_reliable_stream_loop(
                         &mut commands_rx,
                         &mut send,
                         &context,
-                        session_id,
                         stream_id,
                         path_id,
                         &path_registration,
-                        &commands_tx,
                         &mut pending_frames,
                         &mut path_proofs,
                         &mut carrier_frames,

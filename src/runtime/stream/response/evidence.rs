@@ -6,12 +6,13 @@ use super::attachment::ResponseStreamOutputEntry;
 #[cfg(all(test, feature = "lab-diagnostics"))]
 use crate::lab_diagnostics::lab_diagnostic;
 use crate::model::capacity::{
-    PATH_OPEN_SCORE_BYTES, RELIABLE_STREAM_STARTUP_PRODUCT_WINDOW_BYTES,
+    MAX_RELIABLE_SERVICE_QUANTUM_BYTES, PATH_OPEN_SCORE_BYTES,
     reliable_path_startup_sample_limit_bytes,
 };
 use crate::model::path::{CarrierPathInstanceId, CarrierPathKey};
 use crate::model::timing::transport_rate_sample_freshness_horizon;
 use crate::protocol::{PathMetricDirection, PathMetrics, UnderlayProtocol};
+use crate::runtime::path::CarrierDeliveryRateSample;
 use std::sync::atomic::Ordering;
 use std::time::{Duration, Instant};
 
@@ -26,6 +27,7 @@ pub(in crate::runtime) struct ServerPathMetricsEntry {
     pub(in crate::runtime::stream) metrics: PathMetrics,
     pub(in crate::runtime::stream) source: ServerPathMetricsSource,
     pub(in crate::runtime::stream) native_drain_observed: bool,
+    pub(in crate::runtime::stream) carrier_delivery_rate_sample: Option<CarrierDeliveryRateSample>,
     // Metric age is measured at the source; residence time closes the gap when
     // the local idle publisher is delayed after this snapshot is installed.
     pub(in crate::runtime::stream) recorded_at: Instant,
@@ -42,31 +44,30 @@ pub(super) fn server_output_local_path_metrics(
     })
 }
 pub(super) fn server_path_metrics_estimate_rate_bps(path_metrics: ServerPathMetricsEntry) -> f64 {
+    if server_carrier_delivery_rate_sample_has_bulk_evidence(path_metrics)
+        && let Some(sample) = path_metrics.carrier_delivery_rate_sample
+    {
+        return sample.delivery_rate_bps.max(1) as f64;
+    }
     path_metrics.metrics.delivery_rate_bps.max(1) as f64
 }
 
 pub(super) fn server_path_metrics_bulk_sample_floor_bytes(metrics: PathMetrics) -> u64 {
-    let carrier_floor = metrics
+    // Completion scheduling may trust a rate only after ACK evidence covers
+    // the native congestion window. TCP and QUIC acquire that evidence
+    // differently, but neither may be frozen by a scheduler-limited sample.
+    metrics
         .inflight_hi_bytes
         .max(metrics.inflight_limit_bytes)
-        .max(PATH_OPEN_SCORE_BYTES as u64);
-    match metrics.underlay {
-        UnderlayProtocol::Tcp => carrier_floor,
-        UnderlayProtocol::Udp => {
-            let minimum_meaningful_sample = (PATH_OPEN_SCORE_BYTES as u64).saturating_mul(4);
-            let startup_capacity_admission_sample = RELIABLE_STREAM_STARTUP_PRODUCT_WINDOW_BYTES
-                .saturating_div(2)
-                .max(minimum_meaningful_sample);
-            carrier_floor
-                .max(minimum_meaningful_sample)
-                .min(startup_capacity_admission_sample)
-        }
-    }
+        .max(PATH_OPEN_SCORE_BYTES as u64)
 }
 
 pub(super) fn server_path_metrics_has_bulk_rate_evidence(
     path_metrics: ServerPathMetricsEntry,
 ) -> bool {
+    if server_carrier_delivery_rate_sample_has_bulk_evidence(path_metrics) {
+        return true;
+    }
     let sample_floor = server_path_metrics_bulk_sample_floor_bytes(path_metrics.metrics);
     let packet_accounting_slack = (PATH_OPEN_SCORE_BYTES as u64).min(sample_floor / 8);
     let effective_metric_age = Duration::from_micros(u64::from(path_metrics.metrics.metric_age_us))
@@ -90,6 +91,23 @@ pub(super) fn server_path_metrics_has_bulk_rate_evidence(
             .data_sample_bytes
             .saturating_add(packet_accounting_slack)
             >= sample_floor
+}
+
+fn server_carrier_delivery_rate_sample_has_bulk_evidence(
+    path_metrics: ServerPathMetricsEntry,
+) -> bool {
+    let Some(sample) = path_metrics.carrier_delivery_rate_sample else {
+        return false;
+    };
+    // The native tracker freezes the congestion-window coverage threshold at
+    // the start of its delivery epoch. Requiring a later, larger live cwnd here
+    // would make successful slow-start evidence revoke itself as cwnd grows.
+    let sample_floor =
+        (MAX_RELIABLE_SERVICE_QUANTUM_BYTES as u64).max(PATH_OPEN_SCORE_BYTES as u64);
+    sample.delivery_rate_bps > 0
+        && sample.sample_count > 0
+        && sample.delivery_window_covered
+        && sample.sample_bytes >= sample_floor
 }
 
 pub(super) fn server_output_has_durable_product_ack_progress(
@@ -207,6 +225,7 @@ impl ResponseStreamBinding {
                 metrics,
                 source,
                 native_drain_observed: false,
+                carrier_delivery_rate_sample: None,
                 recorded_at: Instant::now(),
             },
             true,
@@ -246,8 +265,6 @@ impl ResponseStreamBinding {
             .outputs
             .lock()
             .expect("server reliable stream binding lock");
-        let source = path_metrics.source;
-        let metrics = path_metrics.metrics;
         let mut matched = false;
         let mut changed = false;
         for entry in &mut outputs.entries {
@@ -255,17 +272,7 @@ impl ResponseStreamBinding {
                 && path_instance_id.is_none_or(|instance| entry.path_instance_id == instance)
             {
                 matched = true;
-                let current = match source {
-                    ServerPathMetricsSource::LocalSender => &mut entry.local_path_metrics,
-                    ServerPathMetricsSource::PeerHint => &mut entry.peer_path_metrics,
-                };
-                let scheduling_changed = current.is_none_or(|previous| {
-                    previous.source != source
-                        || previous.native_drain_observed != path_metrics.native_drain_observed
-                        || !server_path_metrics_scheduling_equivalent(previous.metrics, metrics)
-                });
-                *current = Some(path_metrics);
-                changed |= scheduling_changed;
+                changed |= install_path_metrics_entry(entry, path_metrics);
             }
         }
         if changed {
@@ -278,6 +285,25 @@ impl ResponseStreamBinding {
         }
         (matched, changed)
     }
+}
+
+pub(super) fn install_path_metrics_entry(
+    entry: &mut ResponseStreamOutputEntry,
+    path_metrics: ServerPathMetricsEntry,
+) -> bool {
+    let source = path_metrics.source;
+    let current = match source {
+        ServerPathMetricsSource::LocalSender => &mut entry.local_path_metrics,
+        ServerPathMetricsSource::PeerHint => &mut entry.peer_path_metrics,
+    };
+    let scheduling_changed = current.is_none_or(|previous| {
+        previous.source != source
+            || previous.native_drain_observed != path_metrics.native_drain_observed
+            || previous.carrier_delivery_rate_sample != path_metrics.carrier_delivery_rate_sample
+            || !server_path_metrics_scheduling_equivalent(previous.metrics, path_metrics.metrics)
+    });
+    *current = Some(path_metrics);
+    scheduling_changed
 }
 
 fn server_path_metrics_scheduling_equivalent(

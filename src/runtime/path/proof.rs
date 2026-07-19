@@ -1,13 +1,9 @@
 #[cfg(feature = "lab-diagnostics")]
 use crate::lab_diagnostics::lab_diagnostic;
-use crate::model::capacity::{
-    PATH_OPEN_SCORE_BYTES, QUIC_TIMER_GRANULARITY, relay_lane_startup_chunk_bytes,
-};
 use crate::mux::MuxLimits;
-use crate::protocol::{Frame, PathId, PathMetricDirection, PathMetrics, UnderlayProtocol};
+use crate::protocol::{Frame, PathId};
 use crate::runtime::error::RuntimeError;
 use crate::runtime::path::commands::ReliablePathCommandSender;
-use crate::runtime::path::model::{metric_epoch_now, ratio_to_ppm};
 use crate::scheduler::TrafficClass;
 use bytes::Bytes;
 use std::collections::HashMap;
@@ -15,11 +11,11 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 static NEXT_PATH_PROOF_ID: AtomicU64 = AtomicU64::new(1);
+const PATH_PROOF_TOKEN_BYTES: usize = 8;
 
 #[derive(Debug, Clone, Copy)]
 pub(in crate::runtime) struct PathProofObservation {
     pub(in crate::runtime) proof_id: u64,
-    pub(in crate::runtime) bytes: u64,
     pub(in crate::runtime) elapsed: Duration,
     pub(in crate::runtime) sent_at: Instant,
 }
@@ -101,14 +97,16 @@ impl PathProofTracker {
         );
         (bytes > 0).then_some(PathProofObservation {
             proof_id,
-            bytes: u64::from(bytes),
             elapsed: pending.sent_at.elapsed(),
             sent_at: pending.sent_at,
         })
     }
 }
 
-fn allocated_path_proof_data_frame(path_id: PathId, mux_limits: MuxLimits) -> (u64, Frame) {
+pub(in crate::runtime) fn allocated_path_proof_data_frame(
+    path_id: PathId,
+    mux_limits: MuxLimits,
+) -> (u64, Frame) {
     let payload_bytes = path_proof_payload_bytes(mux_limits);
     let proof_id = NEXT_PATH_PROOF_ID.fetch_add(1, Ordering::Relaxed);
     let frame = Frame::PathProofData {
@@ -141,62 +139,11 @@ pub(in crate::runtime) fn enqueue_path_proof_frame(
     Ok(proof_id)
 }
 
-pub(in crate::runtime) fn path_proof_metrics(
-    path_id: PathId,
-    underlay: UnderlayProtocol,
-    direction: PathMetricDirection,
-    observation: PathProofObservation,
-) -> Option<PathMetrics> {
-    if observation.bytes == 0 {
-        return None;
-    }
-    let rate_bps = (observation.bytes as f64 * 8.0
-        / observation
-            .elapsed
-            .max(QUIC_TIMER_GRANULARITY)
-            .as_secs_f64())
-    .max(1.0)
-    .round() as u64;
-    let srtt_us = duration_to_micros_u32(observation.elapsed);
-    Some(PathMetrics {
-        path_id,
-        underlay,
-        direction,
-        metric_epoch: metric_epoch_now(),
-        metric_age_us: 0,
-        srtt_us,
-        rttvar_us: 0,
-        jitter_us: 0,
-        delivery_rate_bps: rate_bps,
-        pacing_rate_bps: rate_bps,
-        loss_ppm: 0,
-        ecn_ppm: 0,
-        loss_observed: false,
-        ecn_observed: false,
-        bytes_in_flight: 0,
-        queue_bytes: 0,
-        inflight_limit_bytes: 0,
-        inflight_hi_bytes: 0,
-        confidence_ppm: ratio_to_ppm(
-            observation.bytes as f64 / (PATH_OPEN_SCORE_BYTES.max(1) as f64),
-        ),
-        app_limited: true,
-        has_ack_derived_data_sample: false,
-        data_sample_count: 0,
-        data_sample_bytes: 0,
-    })
-}
-
 fn path_proof_payload_bytes(mux_limits: MuxLimits) -> usize {
-    PATH_OPEN_SCORE_BYTES
-        .min(relay_lane_startup_chunk_bytes(
-            TrafficClass::Latency,
-            mux_limits,
-        ))
+    // Reachability validation is a challenge/response, not a capacity sample.
+    // Eight bytes matches QUIC PATH_CHALLENGE while the authenticated carrier
+    // continues to own MTU discovery, congestion control, and loss recovery.
+    PATH_PROOF_TOKEN_BYTES
         .min(mux_limits.max_payload_bytes)
         .max(1)
-}
-
-fn duration_to_micros_u32(duration: Duration) -> u32 {
-    u32::try_from(duration.as_micros()).unwrap_or(u32::MAX)
 }

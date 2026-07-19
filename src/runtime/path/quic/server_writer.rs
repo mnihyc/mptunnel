@@ -5,11 +5,10 @@ use super::io::{
 };
 #[cfg(feature = "lab-diagnostics")]
 use crate::lab_diagnostics::lab_diagnostic;
-use crate::protocol::{Frame, PathId, SessionId, StreamId, UnderlayProtocol};
+use crate::protocol::{Frame, PathId, StreamId};
 use crate::runtime::error::RuntimeError;
 use crate::runtime::path::commands::{
-    ReliablePathCommand, ReliablePathCommandReceivers, ReliablePathCommandSender,
-    reliable_path_command_carrier_credit_bytes, reliable_path_command_pending_bytes,
+    ReliablePathCommand, ReliablePathCommandReceivers, reliable_path_command_pending_bytes,
     reliable_path_command_writer_run_budget_bytes, reliable_path_command_writer_run_budget_items,
     reliable_path_command_writer_run_bytes, reliable_path_frame_requires_capacity_command,
     try_coalesce_reliable_path_writer_run, try_recv_reliable_path_command,
@@ -27,11 +26,9 @@ pub(super) async fn drain_server_udp_reliable_commands(
     commands: &mut ReliablePathCommandReceivers,
     send: &mut UdpPathSendStream,
     context: &ServerPathContext,
-    session_id: SessionId,
     stream_id: StreamId,
     path_id: PathId,
     path_registration: &ServerCarrierPathRegistration,
-    commands_tx: &ReliablePathCommandSender,
     pending_frames: &mut Vec<Frame>,
     path_proofs: &mut PathProofTracker,
     carrier_frames: &mut mpsc::Receiver<Result<Frame, RuntimeError>>,
@@ -47,7 +44,6 @@ pub(super) async fn drain_server_udp_reliable_commands(
     let mut sent_bytes = 0usize;
     let mut sent_items = 0usize;
     let mut pending_frame_command_bytes = 0usize;
-    let mut pending_frame_carrier_credit_bytes = 0usize;
 
     loop {
         let Some(command) = next_command
@@ -73,7 +69,6 @@ pub(super) async fn drain_server_udp_reliable_commands(
                 path_proofs,
                 commands,
                 &mut pending_frame_command_bytes,
-                &mut pending_frame_carrier_credit_bytes,
                 path_id,
                 stream_id,
                 context,
@@ -102,14 +97,13 @@ pub(super) async fn drain_server_udp_reliable_commands(
             return Ok(false);
         };
         let pending_bytes = reliable_path_command_pending_bytes(&command);
-        let carrier_credit_bytes = reliable_path_command_carrier_credit_bytes(&command);
         let writer_run_bytes = reliable_path_command_writer_run_bytes(&command);
         let mut pending_released_by_batch = false;
         let should_close = match command {
             ReliablePathCommand::SendFrame(frame)
                 if reliable_path_frame_requires_capacity_command(&frame) =>
             {
-                commands.release_pending_command_accounting(pending_bytes, carrier_credit_bytes);
+                commands.release_pending_command_bytes(pending_bytes);
                 return Err(RuntimeError::Protocol(
                     "server QUIC path received an untyped capacity frame",
                 ));
@@ -118,8 +112,6 @@ pub(super) async fn drain_server_udp_reliable_commands(
                 pending_frames.push(frame);
                 pending_frame_command_bytes =
                     pending_frame_command_bytes.saturating_add(pending_bytes);
-                pending_frame_carrier_credit_bytes =
-                    pending_frame_carrier_credit_bytes.saturating_add(carrier_credit_bytes);
                 sent_bytes = sent_bytes.saturating_add(writer_run_bytes);
                 sent_items = sent_items.saturating_add(1);
                 if sent_bytes >= byte_budget || sent_items >= item_budget {
@@ -130,7 +122,6 @@ pub(super) async fn drain_server_udp_reliable_commands(
                         path_proofs,
                         commands,
                         &mut pending_frame_command_bytes,
-                        &mut pending_frame_carrier_credit_bytes,
                         path_id,
                         stream_id,
                         context,
@@ -161,7 +152,7 @@ pub(super) async fn drain_server_udp_reliable_commands(
                 continue;
             }
             ReliablePathCommand::SendTcpCapacityProbe(_) => {
-                commands.release_pending_command_accounting(pending_bytes, carrier_credit_bytes);
+                commands.release_pending_command_bytes(pending_bytes);
                 return Err(RuntimeError::Protocol(
                     "server QUIC path received TCP capacity command",
                 ));
@@ -171,8 +162,7 @@ pub(super) async fn drain_server_udp_reliable_commands(
                 reason,
             } => {
                 if reset_stream_id != stream_id {
-                    commands
-                        .release_pending_command_accounting(pending_bytes, carrier_credit_bytes);
+                    commands.release_pending_command_bytes(pending_bytes);
                     return Err(RuntimeError::Protocol(
                         "server QUIC terminal command stream does not match writer",
                     ));
@@ -187,8 +177,6 @@ pub(super) async fn drain_server_udp_reliable_commands(
                 sent_items = sent_items.saturating_add(1);
                 pending_frame_command_bytes =
                     pending_frame_command_bytes.saturating_add(pending_bytes);
-                pending_frame_carrier_credit_bytes =
-                    pending_frame_carrier_credit_bytes.saturating_add(carrier_credit_bytes);
                 flush_server_udp_frame_batch(
                     send,
                     pending_frames,
@@ -196,7 +184,6 @@ pub(super) async fn drain_server_udp_reliable_commands(
                     path_proofs,
                     commands,
                     &mut pending_frame_command_bytes,
-                    &mut pending_frame_carrier_credit_bytes,
                     path_id,
                     stream_id,
                     context,
@@ -206,13 +193,9 @@ pub(super) async fn drain_server_udp_reliable_commands(
                 )
                 .await?;
                 pending_released_by_batch = true;
-                context.reliable_streams.detach_path(
-                    session_id,
-                    stream_id,
-                    UnderlayProtocol::Udp,
-                    path_id,
-                    commands_tx,
-                );
+                context
+                    .reliable_streams
+                    .detach_path(path_registration, stream_id)?;
                 let _ = udp_path_finish_stream(send);
                 true
             }
@@ -224,7 +207,6 @@ pub(super) async fn drain_server_udp_reliable_commands(
                     path_proofs,
                     commands,
                     &mut pending_frame_command_bytes,
-                    &mut pending_frame_carrier_credit_bytes,
                     path_id,
                     stream_id,
                     context,
@@ -234,13 +216,9 @@ pub(super) async fn drain_server_udp_reliable_commands(
                 )
                 .await?;
                 if close_stream_id == stream_id {
-                    context.reliable_streams.detach_path(
-                        session_id,
-                        stream_id,
-                        UnderlayProtocol::Udp,
-                        path_id,
-                        commands_tx,
-                    );
+                    context
+                        .reliable_streams
+                        .detach_path(path_registration, stream_id)?;
                     let _ = udp_path_finish_stream(send);
                     true
                 } else {
@@ -248,7 +226,11 @@ pub(super) async fn drain_server_udp_reliable_commands(
                 }
             }
             ReliablePathCommand::PrepareConnection { .. }
-            | ReliablePathCommand::OpenStream { .. } => {
+            | ReliablePathCommand::OpenStream { .. }
+            | ReliablePathCommand::OpenDatagramAttachment { .. }
+            | ReliablePathCommand::OpenDatagramFlow { .. }
+            | ReliablePathCommand::SendDatagramFrame { .. }
+            | ReliablePathCommand::CloseDatagramAttachment { .. } => {
                 return Err(RuntimeError::Protocol(
                     "server QUIC UDP path stream received client TCP session command",
                 ));
@@ -260,7 +242,7 @@ pub(super) async fn drain_server_udp_reliable_commands(
             }
         };
         if !pending_released_by_batch {
-            commands.release_pending_command_accounting(pending_bytes, carrier_credit_bytes);
+            commands.release_pending_command_bytes(pending_bytes);
         }
         if should_close {
             #[cfg(feature = "lab-diagnostics")]
@@ -294,7 +276,6 @@ pub(super) async fn drain_server_udp_reliable_commands(
                 path_proofs,
                 commands,
                 &mut pending_frame_command_bytes,
-                &mut pending_frame_carrier_credit_bytes,
                 path_id,
                 stream_id,
                 context,
@@ -334,7 +315,6 @@ async fn flush_server_udp_frame_batch(
     path_proofs: &mut PathProofTracker,
     commands: &ReliablePathCommandReceivers,
     pending_frame_command_bytes: &mut usize,
-    pending_frame_carrier_credit_bytes: &mut usize,
     _path_id: PathId,
     stream_id: StreamId,
     context: &ServerPathContext,
@@ -359,10 +339,7 @@ async fn flush_server_udp_frame_batch(
         },
     )
     .await;
-    commands.release_pending_command_accounting(
-        std::mem::take(pending_frame_command_bytes),
-        std::mem::take(pending_frame_carrier_credit_bytes),
-    );
+    commands.release_pending_command_bytes(std::mem::take(pending_frame_command_bytes));
     let _routed_frames = result?;
     #[cfg(feature = "lab-diagnostics")]
     if _routed_frames > 0 || deferred_input.is_some() {

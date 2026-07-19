@@ -56,12 +56,19 @@ fn enqueue(
     frame: &Frame,
     generation: u64,
 ) -> Result<(), RuntimeError> {
-    fixture.binding.try_enqueue_data_frame_for_dispatch_target(
-        target,
-        frame,
-        TrafficClass::Throughput,
-        generation,
-    )
+    enqueue_on_lane(fixture, target, frame, TrafficClass::Throughput, generation)
+}
+
+fn enqueue_on_lane(
+    fixture: &Fixture,
+    target: &ResponseDispatchTarget,
+    frame: &Frame,
+    lane: TrafficClass,
+    generation: u64,
+) -> Result<(), RuntimeError> {
+    fixture
+        .binding
+        .try_enqueue_data_frame_for_dispatch_target(target, frame, lane, generation)
 }
 
 #[test]
@@ -169,5 +176,42 @@ fn successful_commit_publishes_exact_flight_before_carrier_work() {
             offset: 4096,
             ..
         }))
+    ));
+}
+
+#[test]
+fn latency_data_commit_is_not_blocked_behind_queued_bulk() {
+    let mut fixture = fixture(1);
+    let bulk = stream_data_frame_at(4096, 1024);
+    fixture
+        .commands
+        .try_enqueue_admitted_frame(bulk, TrafficClass::Throughput)
+        .expect("fill bulk queue");
+    let latency = stream_data_frame_at(0, 128);
+    let generation = fixture.binding.response_model_generation();
+
+    enqueue_on_lane(
+        &fixture,
+        &fixture.target,
+        &latency,
+        TrafficClass::Latency,
+        generation,
+    )
+    .expect("latency response uses independent priority capacity");
+
+    let first =
+        try_recv_reliable_path_command(&mut fixture.receivers).expect("latency response command");
+    assert!(matches!(
+        &first,
+        ReliablePathCommand::SendFrame(Frame::StreamData { offset: 0, .. })
+    ));
+    fixture
+        .receivers
+        .release_pending_command_bytes(reliable_path_command_pending_bytes(&first));
+    let second =
+        try_recv_reliable_path_command(&mut fixture.receivers).expect("queued bulk command");
+    assert!(matches!(
+        second,
+        ReliablePathCommand::SendFrame(Frame::StreamData { offset: 4096, .. })
     ));
 }

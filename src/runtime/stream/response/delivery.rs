@@ -39,6 +39,19 @@ pub(in crate::runtime) struct CarrierPathFlight {
     pub(super) evidence_eligible: bool,
 }
 
+/// Lowest original Data Sequence flight currently blocking cumulative delivery.
+///
+/// Recovery keeps the complete flight identity so ACK progress, attachment
+/// replacement, and metric refresh cannot accidentally share one timer epoch.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(in crate::runtime) struct ResponseDataAckRecoveryCandidate {
+    pub(in crate::runtime) start: u64,
+    pub(in crate::runtime) end: u64,
+    pub(in crate::runtime) key: CarrierPathKey,
+    pub(in crate::runtime) output_incarnation: u64,
+    pub(in crate::runtime) sent_at: Instant,
+}
+
 impl CarrierPathFlight {
     pub(in crate::runtime::stream) fn fixed_output(
         key: CarrierPathKey,
@@ -216,8 +229,22 @@ impl ResponseStreamBinding {
         &self,
         ack_frontier: u64,
     ) -> Option<UnderlayProtocol> {
-        self.blocking_original_path_at_or_after(ack_frontier)
-            .map(|(key, _)| key.underlay)
+        self.data_ack_recovery_candidate(ack_frontier)
+            .map(|candidate| candidate.key.underlay)
+    }
+
+    pub(in crate::runtime) fn data_ack_recovery_candidate(
+        &self,
+        ack_frontier: u64,
+    ) -> Option<ResponseDataAckRecoveryCandidate> {
+        self.blocking_original_flight_at_or_after(ack_frontier)
+            .map(|(start, flight)| ResponseDataAckRecoveryCandidate {
+                start,
+                end: flight.end,
+                key: flight.key,
+                output_incarnation: flight.output_incarnation,
+                sent_at: flight.sent_at,
+            })
     }
 
     pub(in crate::runtime) fn has_multipath_reinjection_alternative(&self) -> bool {
@@ -238,10 +265,9 @@ impl ResponseStreamBinding {
             .outputs
             .lock()
             .expect("server reliable stream binding lock");
-        outputs
-            .entries
-            .iter()
-            .any(|entry| !avoid_outputs.contains(&(entry.key, entry.incarnation)))
+        outputs.entries.iter().any(|entry| {
+            !entry.commands.is_closed() && !avoid_outputs.contains(&(entry.key, entry.incarnation))
+        })
     }
 
     pub(in crate::runtime) fn has_tail_reinjection_output_for_frame(&self, frame: &Frame) -> bool {
@@ -254,7 +280,10 @@ impl ResponseStreamBinding {
             .expect("server reliable stream binding lock")
             .entries
             .iter()
-            .any(|entry| !owner_outputs.contains(&(entry.key, entry.incarnation)))
+            .any(|entry| {
+                !entry.commands.is_closed()
+                    && !owner_outputs.contains(&(entry.key, entry.incarnation))
+            })
     }
 
     pub(in crate::runtime) fn has_recent_reinjection_overlap(
@@ -266,14 +295,17 @@ impl ResponseStreamBinding {
             return false;
         };
         let now = Instant::now();
-        let live_keys = self
+        let outputs = self
             .outputs
             .lock()
-            .expect("server reliable stream binding lock")
+            .expect("server reliable stream binding lock");
+        let live_keys = outputs
             .entries
             .iter()
+            .chain(outputs.detaching.iter())
             .map(|entry| entry.key)
             .collect::<Vec<_>>();
+        drop(outputs);
         let flights = self
             .flights
             .lock()
@@ -296,15 +328,23 @@ impl ResponseStreamBinding {
             .outputs
             .lock()
             .expect("server reliable stream binding lock");
-        let live_outputs = outputs
+        let available_outputs = outputs
             .entries
             .iter()
             .filter(|entry| !entry.commands.is_closed())
             .map(|entry| (entry.key, entry.incarnation))
             .collect::<Vec<_>>();
-        if live_outputs.is_empty() {
+        if available_outputs.is_empty() {
             return Vec::new();
         }
+        // A detaching output remains the authoritative owner until this actor
+        // applies its ordered detach event after all preceding ACKs.
+        let actor_attached_outputs = outputs
+            .entries
+            .iter()
+            .chain(outputs.detaching.iter())
+            .map(|entry| (entry.key, entry.incarnation))
+            .collect::<Vec<_>>();
         let flights = self
             .flights
             .lock()
@@ -317,7 +357,7 @@ impl ResponseStreamBinding {
                         .iter()
                         .rev()
                         .find(|flight| flight.kind.is_original_transmission())?;
-                    (!live_outputs.contains(&(original.key, original.output_incarnation)))
+                    (!actor_attached_outputs.contains(&(original.key, original.output_incarnation)))
                         .then_some(OffsetRange {
                             start: *start,
                             end: original.end,
@@ -334,7 +374,7 @@ impl ResponseStreamBinding {
                 .flat_map(|(start, path_flights)| {
                     path_flights.iter().filter_map(|flight| {
                         (flight.kind == CarrierWorkKind::ReinjectedData
-                            && live_outputs.contains(&(flight.key, flight.output_incarnation)))
+                            && available_outputs.contains(&(flight.key, flight.output_incarnation)))
                         .then_some(OffsetRange {
                             start: *start,
                             end: flight.end,
@@ -802,14 +842,22 @@ impl ResponseStreamBinding {
         &self,
         offset: u64,
     ) -> Option<(CarrierPathKey, u64)> {
+        self.blocking_original_flight_at_or_after(offset)
+            .map(|(_, flight)| (flight.key, flight.output_incarnation))
+    }
+
+    fn blocking_original_flight_at_or_after(
+        &self,
+        offset: u64,
+    ) -> Option<(u64, CarrierPathFlight)> {
         let flights = self
             .flights
             .lock()
             .expect("server reliable stream flight lock");
-        for path_flights in flights.values() {
+        for (start, path_flights) in flights.iter() {
             for flight in path_flights {
                 if flight.kind.is_original_transmission() && flight.end > offset {
-                    return Some((flight.key, flight.output_incarnation));
+                    return Some((*start, *flight));
                 }
             }
         }

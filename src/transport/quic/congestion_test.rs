@@ -1,7 +1,89 @@
 use super::*;
+use quinn::congestion::Controller as _;
+
+#[derive(Clone)]
+struct FixedPacingController(u64);
+
+impl quinn::congestion::Controller for FixedPacingController {
+    fn on_congestion_event(
+        &mut self,
+        _now: Instant,
+        _sent: Instant,
+        _is_persistent_congestion: bool,
+        _lost_bytes: u64,
+    ) {
+    }
+
+    fn on_mtu_update(&mut self, _new_mtu: u16) {}
+
+    fn window(&self) -> u64 {
+        12_000
+    }
+
+    fn pacing_rate(&self) -> Option<u64> {
+        Some(self.0)
+    }
+
+    fn clone_box(&self) -> Box<dyn quinn::congestion::Controller> {
+        Box::new(self.clone())
+    }
+
+    fn initial_window(&self) -> u64 {
+        self.window()
+    }
+
+    fn into_any(self: Box<Self>) -> Box<dyn Any> {
+        self
+    }
+}
+
+#[test]
+fn instrumented_controller_forwards_pacing_rate_through_clones() {
+    const RATE: u64 = 12_345_678;
+    let controller = InstrumentedController::new(
+        Box::new(FixedPacingController(RATE)),
+        Arc::new(QuicCarrierTelemetry::default()),
+    );
+
+    assert_eq!(controller.pacing_rate(), Some(RATE));
+    assert_eq!(controller.clone_box().pacing_rate(), Some(RATE));
+}
+
+#[test]
+fn instrumented_controller_preserves_bbr_packet_delivery_state() {
+    let base = Instant::now();
+    let (mut controller, _) = test_instrumented_controller(base);
+
+    let state = controller
+        .on_packet_sent(base, 1200, 0, 7, false)
+        .expect("BBR packet delivery state");
+
+    assert_eq!(state.delivered, 0);
+    assert_eq!(state.delivered_time, base);
+    assert_eq!(state.first_sent_time, base);
+    assert_eq!(state.packet_number, 7);
+    assert!(!state.app_limited);
+    assert_eq!(state.tx_in_flight, 1200);
+}
 
 #[tokio::test]
-async fn native_ack_releases_non_consuming_product_send_credit() {
+async fn first_unacknowledged_product_write_wakes_idle_metrics() {
+    let telemetry = QuicCarrierTelemetry::default();
+    let activity = telemetry.delivery_activity_notify();
+    let started = activity.notified();
+    tokio::pin!(started);
+    started.as_mut().enable();
+
+    telemetry.record_delivery_evidence_written(64 * 1024);
+
+    tokio::time::timeout(Duration::from_secs(1), &mut started)
+        .await
+        .expect("idle QUIC metrics wake when product delivery becomes active");
+    assert_eq!(telemetry.delivery_evidence_pending_ack_bytes(), 64 * 1024);
+}
+
+#[test]
+fn native_ack_reconciles_pending_delivery_evidence() {
     let telemetry = QuicCarrierTelemetry::default();
     telemetry.record_delivery_evidence_written(64 * 1024);
     assert_eq!(telemetry.delivery_evidence_written_bytes(), 64 * 1024);
@@ -12,9 +94,6 @@ async fn native_ack_releases_non_consuming_product_send_credit() {
         "send-credit reads must not consume ACK evidence"
     );
 
-    let notify = telemetry.send_credit_notify();
-    let notified = notify.notified();
-    tokio::pin!(notified);
     telemetry.publish_ack_batch(
         QuicAckTelemetryTotals {
             acked_bytes: 16 * 1024,
@@ -24,9 +103,6 @@ async fn native_ack_releases_non_consuming_product_send_credit() {
         48 * 1024,
         false,
     );
-    tokio::time::timeout(Duration::from_secs(1), &mut notified)
-        .await
-        .expect("native ACK wakes carrier send-credit waiters");
     assert_eq!(telemetry.delivery_evidence_pending_ack_bytes(), 48 * 1024);
     assert_eq!(telemetry.bytes_in_flight(), Some(48 * 1024));
 }

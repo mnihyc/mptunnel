@@ -4,8 +4,8 @@ use crate::model::capacity::{DATAGRAM_RESPONSE_DEADLINE_MULTIPLIER, TRANSPORT_TI
 use crate::runtime::error::RuntimeError;
 use std::time::Duration;
 
-pub(in crate::runtime) fn datagram_response_deadline_budget(
-    response_timeout: Duration,
+pub(in crate::runtime) fn datagram_feedback_retry_budget(
+    feedback_timeout: Duration,
     ttl_ms: u32,
     has_unattempted_alternative: bool,
 ) -> Duration {
@@ -13,15 +13,15 @@ pub(in crate::runtime) fn datagram_response_deadline_budget(
     if ttl_budget.is_zero() {
         return ttl_budget;
     }
-    let response_timeout = response_timeout
+    let feedback_timeout = feedback_timeout
         .max(TRANSPORT_TIMER_GRANULARITY)
         .min(ttl_budget);
     if has_unattempted_alternative {
         // One modeled pre-feedback response timeout leaves the remaining product
         // deadline for another path. The final attempt keeps the larger budget.
-        response_timeout
+        feedback_timeout
     } else {
-        response_timeout
+        feedback_timeout
             .saturating_mul(DATAGRAM_RESPONSE_DEADLINE_MULTIPLIER)
             .min(ttl_budget)
     }
@@ -44,41 +44,13 @@ pub(in crate::runtime) fn datagram_remaining_ttl_ms(expires_at: tokio::time::Ins
 }
 
 pub(in crate::runtime) enum DatagramPathSendError {
-    PayloadLimitExceeded {
-        limit: usize,
-    },
-    Timeout {
-        feedback_received: bool,
-        response_timeout: Duration,
-    },
-    Runtime {
-        feedback_received: bool,
-        source: RuntimeError,
-    },
+    PayloadLimitExceeded { limit: usize },
+    Timeout,
+    Runtime(RuntimeError),
 }
 
 impl DatagramPathSendError {
-    pub(in crate::runtime) fn runtime(source: RuntimeError, feedback_received: bool) -> Self {
-        Self::Runtime {
-            feedback_received,
-            source,
-        }
-    }
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(in crate::runtime) enum DatagramTimeoutAction {
-    RetryAlternative,
-    TerminalProductExpiry,
-}
-
-pub(in crate::runtime) fn datagram_timeout_action(
-    feedback_received: bool,
-    has_unattempted_alternative: bool,
-) -> DatagramTimeoutAction {
-    if !feedback_received && has_unattempted_alternative {
-        DatagramTimeoutAction::RetryAlternative
-    } else {
-        DatagramTimeoutAction::TerminalProductExpiry
+    pub(in crate::runtime) fn runtime(source: RuntimeError) -> Self {
+        Self::Runtime(source)
     }
 }

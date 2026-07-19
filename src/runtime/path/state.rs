@@ -19,7 +19,7 @@ use super::tcp::capacity::{
 use super::*;
 use crate::model::capacity::{PathRateSample, reliable_capacity_measurement_session_limit_bytes};
 use crate::model::path::{CarrierPathInstanceId, RelayPathInstance, RelayPathKey};
-use crate::protocol::{PathUsage, StreamId, UnderlayProtocol};
+use crate::protocol::{DatagramFlowId, PathUsage, StreamId, UnderlayProtocol};
 use crate::runtime::error::RuntimeError;
 use crate::scheduler::TrafficClass;
 use std::collections::HashMap;
@@ -34,6 +34,7 @@ use std::time::{Duration, Instant};
 pub(in crate::runtime) struct ClientPathState {
     health: Mutex<ClientPathHealth>,
     next_reliable_stream_id: Mutex<u64>,
+    next_datagram_flow_id: Mutex<u64>,
     request_tcp_capacity_probe: RequestTcpCapacityProbeSession,
 }
 
@@ -43,6 +44,7 @@ impl ClientPathState {
         Arc::new(Self {
             health: Mutex::new(health),
             next_reliable_stream_id: Mutex::new(0),
+            next_datagram_flow_id: Mutex::new(0),
             request_tcp_capacity_probe: RequestTcpCapacityProbeSession::new(tcp_path_count),
         })
     }
@@ -436,6 +438,22 @@ impl ClientPathContext {
         Ok(stream_id)
     }
 
+    /// Allocates one data-level flow identity shared by every carrier retry.
+    pub(in crate::runtime) fn allocate_datagram_flow_id(
+        &self,
+    ) -> Result<DatagramFlowId, RuntimeError> {
+        let mut next = self
+            .state
+            .next_datagram_flow_id
+            .lock()
+            .expect("client datagram flow ID lock");
+        let flow_id = DatagramFlowId(*next);
+        *next = next
+            .checked_add(1)
+            .ok_or(RuntimeError::Protocol("datagram flow ID overflow"))?;
+        Ok(flow_id)
+    }
+
     /// Returns the only owner of the newly published scheduler load.
     pub(in crate::runtime) fn reserve_relay_path_load(
         &self,
@@ -710,6 +728,27 @@ impl ClientPathContext {
             .get_mut(index)
         {
             current.mark_product_delivery(sample);
+        }
+    }
+
+    pub(in crate::runtime) fn mark_tcp_path_delivery_for_instance(
+        &self,
+        index: usize,
+        path_instance_id: CarrierPathInstanceId,
+        stats: PathDeliveryStats,
+    ) {
+        let Some(sample) = stats.rate_sample() else {
+            return;
+        };
+        if let Some(current) = self
+            .state
+            .health
+            .lock()
+            .expect("client path health lock")
+            .tcp
+            .get_mut(index)
+        {
+            current.mark_product_delivery_for_instance(path_instance_id, sample);
         }
     }
 

@@ -1,6 +1,7 @@
 use super::client::{
     ClientRelayDisconnectedState, ClientRelayState, ClientStreamAckContext,
-    apply_client_stream_ack, apply_client_stream_data, update_request_path_staleness,
+    apply_client_stream_ack, apply_client_stream_data, evaluate_client_data_ack_reinjection,
+    update_request_path_staleness,
 };
 use super::diagnostics::log_unexpected_stream_relay_frame;
 use super::flow::{ReliableRelayFlowDemandTracker, ReliableRelayFlowSignals};
@@ -36,9 +37,9 @@ use crate::model::capacity::{
 use crate::model::timing::sender_service_retry_delay;
 use crate::model::timing::transport_pto_from_snapshot;
 use crate::mux::stream::{ReliableRecvStream, ReliableSendStream};
-use crate::protocol::Frame;
 #[cfg(feature = "lab-diagnostics")]
 use crate::protocol::frame::reliable_path_frame_pacing_bytes;
+use crate::protocol::{Frame, ResetReason};
 use crate::runtime::error::{RuntimeError, reliable_path_error_is_migratable};
 use crate::runtime::path::commands::reliable_stream_frame_queue;
 use crate::runtime::path::{ClientPathContext, PathDeliveryStats};
@@ -83,6 +84,21 @@ where
         state.record_remote_finished();
     }
     Ok(())
+}
+
+fn record_final_recv_progress_enqueue(
+    state: &mut ClientRelayState,
+    sent: bool,
+    path: Option<crate::scheduler::PathSnapshot>,
+) {
+    state.record_recv_progress_sent(sent);
+    if !sent {
+        // Forced final feedback always has work. A false result means every
+        // carrier control queue was full, so keep FIN pending and retry on
+        // writer capacity or the bounded sender retry timer.
+        state.progress.sender_retry_at =
+            Some(tokio::time::Instant::now() + sender_service_retry_delay(path));
+    }
 }
 
 pub(in crate::runtime) fn reliable_relay_client_dispatch_payload_limit(
@@ -268,8 +284,8 @@ where
                             .await
                         {
                             Ok(sent) => {
-                                state.record_recv_progress_sent(sent);
-                                true
+                                record_final_recv_progress_enqueue(&mut state, sent, path_snapshot);
+                                sent
                             }
                             Err(err) if reliable_path_error_is_migratable(&err) => false,
                             Err(err) => break Err(err),
@@ -305,6 +321,23 @@ where
         } else {
             state.recovery.disconnected = None;
         }
+        if !state.recovery.pending_additional_path_opens.is_empty()
+            && drain_completed_additional_path_opens(
+                context,
+                stream_id,
+                &mut remotes,
+                &mut send_stream,
+                !state.endpoint.local_open,
+                &mut state.recovery.pending_additional_path_opens,
+                &mut additional_path_open_rx,
+                &mut state.progress.last_stream_at,
+            )
+            .await
+        {
+            // Membership changes precede the next immutable scheduling view.
+            state.progress.sender_retry_at = None;
+            send_stream.update_max_offset(remotes.max_offset());
+        }
         let timing_path_snapshot =
             remotes.lowest_eta_path_snapshot(context, TrafficClass::Latency, PATH_OPEN_SCORE_BYTES);
         let demand_update = flow_demand.refresh(
@@ -314,7 +347,12 @@ where
                     .saturating_add(sender_queue.data_bytes() as u64),
                 recv_stream.next_offset(),
             )
-            .with_product_work(sender_queue.data_bytes(), send_stream.reinjection_bytes()),
+            .with_product_work(
+                sender_queue.data_bytes(),
+                send_stream
+                    .reinjection_bytes()
+                    .saturating_add(recv_stream.reorder_bytes()),
+            ),
             timing_path_snapshot,
             context.mux_limits,
         );
@@ -393,13 +431,14 @@ where
             lab_diagnostic(
                 "client_stream_lane_changed",
                 format_args!(
-                    "stream_id={} previous={:?} lane={:?} sent_offset={} received_offset={} reinjection_bytes={} byte_proven={} rate_proven={} buffered_data={}",
+                    "stream_id={} previous={:?} lane={:?} sent_offset={} received_offset={} reinjection_bytes={} reorder_bytes={} byte_proven={} rate_proven={} buffered_data={}",
                     stream_id.0,
                     demand_update.previous_lane,
                     relay_lane,
                     send_stream.next_offset(),
                     recv_stream.next_offset(),
                     send_stream.reinjection_bytes(),
+                    recv_stream.reorder_bytes(),
                     demand_update.byte_proven_bulk,
                     demand_update.rate_proven_sustained_bulk,
                     demand_update.buffered_bulk,
@@ -568,6 +607,7 @@ where
             state.progress.last_recv_progress_sent_at
                 + reliable_stream_recv_progress_interval(path_snapshot),
         );
+        let data_ack_reinjection_at = state.progress.data_ack_reinjection_at;
         if state
             .progress
             .sender_retry_at
@@ -591,13 +631,19 @@ where
             sender_queue.is_empty(),
             state.progress.sender_retry_at,
         );
+        let pending_remote_fin_ready =
+            pending_stream_fin_ready(&recv_stream, state.endpoint.pending_remote_fin_offset);
+        let final_feedback_retry_blocked = pending_remote_fin_ready
+            && !remotes.is_empty()
+            && state.progress.sender_retry_at.is_some();
+        let carrier_retry_blocked = queued_send_blocked || final_feedback_retry_blocked;
         let queued_send_ready =
             !sender_queue.is_empty() && !queued_send_blocked && !inbound_frame_ready;
         let queued_send_retry_deadline = state
             .progress
             .sender_retry_at
             .unwrap_or_else(tokio::time::Instant::now);
-        let carrier_capacity_notifies = if queued_send_blocked {
+        let carrier_capacity_notifies = if carrier_retry_blocked {
             remotes
                 .paths
                 .iter()
@@ -678,6 +724,40 @@ where
         }
 
         tokio::select! {
+            _ = std::future::ready(()), if pending_remote_fin_ready
+                && !remotes.is_empty()
+                && state.progress.sender_retry_at.is_none() => {
+                let feedback_published = match sender
+                    .send_recv_progress(
+                        &mut remotes,
+                        context,
+                        &recv_stream,
+                        &mut state.progress.recv_progress,
+                        RelayRecvProgressSend::new(path_snapshot, relay_lane, true),
+                    )
+                    .await
+                {
+                    Ok(sent) => {
+                        record_final_recv_progress_enqueue(&mut state, sent, path_snapshot);
+                        sent
+                    }
+                    Err(err) if reliable_path_error_is_migratable(&err) => {
+                        state.progress.sender_retry_at = None;
+                        continue;
+                    }
+                    Err(err) => break Err(err),
+                };
+                if let Err(err) = commit_pending_remote_fin(
+                    &mut local,
+                    &mut state,
+                    &recv_stream,
+                    feedback_published && !remotes.is_empty(),
+                )
+                .await
+                {
+                    break Err(err);
+                }
+            }
             _ = tokio::time::sleep_until(receive_hole_reinjection_deadline), if receive_hole_reinjection_active => {
                 let recovery_path_open_spawned = spawn_reliable_relay_recovery_path_open(
                     context,
@@ -722,6 +802,34 @@ where
                 #[cfg(not(feature = "lab-diagnostics"))]
                 let _ = recovery_path_open_spawned;
                 state.progress.last_receive_hole_reinjection_at = Instant::now();
+            }
+            _ = wait_for_optional_deadline(data_ack_reinjection_at), if data_ack_reinjection_at.is_some() => {
+                state.progress.data_ack_reinjection_at = None;
+                let reinjection = evaluate_client_data_ack_reinjection(
+                    &mut state,
+                    &mut sender,
+                    &mut sender_queue,
+                    context,
+                    &remotes,
+                    &send_stream,
+                    path_snapshot,
+                    relay_lane,
+                    stream_id,
+                );
+                #[cfg(feature = "lab-diagnostics")]
+                lab_diagnostic(
+                    "data_ack_loss_timer",
+                    format_args!(
+                        "stream_id={} reinjection_frames={} ack_gap_reinjection_ready={} multipath_reinjection_alternative={} next_deadline_armed={}",
+                        stream_id.0,
+                        reinjection.frame_count,
+                        reinjection.persistent_ready,
+                        reinjection.has_multipath_alternative,
+                        state.progress.data_ack_reinjection_at.is_some(),
+                    ),
+                );
+                #[cfg(not(feature = "lab-diagnostics"))]
+                let _ = reinjection;
             }
             _ = tokio::time::sleep_until(stall_deadline), if stall_watch_active => {
                 let queued_existing_tail_reinjection = sender.enqueue_tail_reinjection(
@@ -773,114 +881,42 @@ where
                     continue;
                 }
                 if reliable_relay_product_stall_should_try_alternate_attach(&remotes) {
-                    match attach_reliable_relay_paths_with_recovery_exclusions(
+                    // Path establishment must not stop the live relay from
+                    // consuming data or ACKs on its existing carrier.
+                    let recovery_open_spawned = spawn_reliable_relay_recovery_path_open(
                         context,
                         &spec,
                         relay_lane,
-                        &mut remotes,
+                        &remotes,
                         &send_stream,
-                        !state.endpoint.local_open,
-                        ReliableRelayAttachMode::Recovery,
-                        &mut state.recovery.excluded_paths,
-                        &state.recovery.pending_additional_path_opens,
-                    )
-                    .await
-                    {
-                        Ok(attached) if attached > 0 => {
-                            state.progress.sender_retry_at = None;
-                            send_stream.update_max_offset(remotes.max_offset());
-                            if sender.enqueue_tail_reinjection(
-                                &mut sender_queue,
-                                context,
-                                &remotes,
-                                &send_stream,
-                                &state.progress.last_send_ack_ranges,
-                                state.progress.last_send_ack_complete,
-                                state.progress.last_send_ack_frontier,
-                                relay_lane,
-                            ) {
-                                state.progress.sender_retry_at = None;
-                            }
-                            match sender
-                                .send_recv_progress(
-                                    &mut remotes,
-                                    context,
-                                    &recv_stream,
-                                    &mut state.progress.recv_progress,
-                                    RelayRecvProgressSend::new(path_snapshot, relay_lane, true),
-                                )
-                                .await
-                            {
-                                Ok(sent) => state.record_recv_progress_sent(sent),
-                                Err(err) if reliable_path_error_is_migratable(&err) => {
-                                    state.progress.sender_retry_at = None;
-                                }
-                                Err(err) => break Err(err),
-                            }
-                            state.progress.last_stream_at = Instant::now();
-                            state.progress.last_response_stall_reinjection_at = Instant::now();
-                            state.progress.last_product_stall_attempt_at = Some(Instant::now());
-                            #[cfg(feature = "lab-diagnostics")]
-                            lab_diagnostic(
-                                "client_product_stall_attached_alternate",
-                                format_args!(
-                                    "stream_id={} active_underlay={:?} attached_paths={} reinjection_bytes={} sent_offset={}",
-                                    stream_id.0,
-                                    path_snapshot.map(|snapshot| snapshot.underlay),
-                                    remotes.path_keys().len(),
-                                    send_stream.reinjection_bytes(),
-                                    send_stream.next_offset(),
-                                ),
-                            );
-                            continue;
-                        }
-                        Ok(_) => {
-                            #[cfg(feature = "lab-diagnostics")]
-                            lab_diagnostic(
-                                "client_product_stall_attach_alternate_unavailable",
-                                format_args!(
-                                    "stream_id={} active_underlay={:?} reinjection_bytes={} sent_offset={} cause=no_candidate",
-                                    stream_id.0,
-                                    path_snapshot.map(|snapshot| snapshot.underlay),
-                                    send_stream.reinjection_bytes(),
-                                    send_stream.next_offset(),
-                                ),
-                            );
-                        }
-                        Err(err) => {
-                            #[cfg(not(feature = "lab-diagnostics"))]
-                            let _ = &err;
-                            #[cfg(feature = "lab-diagnostics")]
-                            lab_diagnostic(
-                                "client_product_stall_attach_alternate_unavailable",
-                                format_args!(
-                                    "stream_id={} active_underlay={:?} reinjection_bytes={} sent_offset={} cause=attach_error error={}",
-                                    stream_id.0,
-                                    path_snapshot.map(|snapshot| snapshot.underlay),
-                                    send_stream.reinjection_bytes(),
-                                    send_stream.next_offset(),
-                                    err,
-                                ),
-                            );
-                        }
+                        &state.recovery.excluded_paths,
+                        &mut state.recovery.pending_additional_path_opens,
+                        &additional_path_open_tx,
+                    );
+                    let attempted_at = Instant::now();
+                    #[cfg(feature = "lab-diagnostics")]
+                    lab_diagnostic(
+                        if recovery_open_spawned {
+                            "client_product_stall_alternate_open_spawned"
+                        } else {
+                            "client_product_stall_keeps_sole_carrier"
+                        },
+                        format_args!(
+                            "stream_id={} active_underlay={:?} attached_paths={} pending_opens={} reinjection_bytes={} sent_offset={} cause=product_stall_only",
+                            stream_id.0,
+                            path_snapshot.map(|snapshot| snapshot.underlay),
+                            remotes.path_keys().len(),
+                            state.recovery.pending_additional_path_opens.len(),
+                            send_stream.reinjection_bytes(),
+                            send_stream.next_offset(),
+                        ),
+                    );
+                    state.progress.last_response_stall_reinjection_at = attempted_at;
+                    state.progress.last_product_stall_attempt_at = Some(attempted_at);
+                    if recovery_open_spawned {
+                        state.progress.last_stream_at = attempted_at;
                     }
-                    if remotes.path_keys().len() <= 1 && !remotes.is_empty() {
-                        #[cfg(feature = "lab-diagnostics")]
-                        lab_diagnostic(
-                            "client_product_stall_keeps_sole_carrier",
-                            format_args!(
-                                "stream_id={} active_underlay={:?} reinjection_bytes={} sent_offset={} cause=avoid_same_path_reopen",
-                                stream_id.0,
-                                path_snapshot.map(|snapshot| snapshot.underlay),
-                                send_stream.reinjection_bytes(),
-                                send_stream.next_offset(),
-                            ),
-                        );
-                        state.progress.last_response_stall_reinjection_at = Instant::now();
-                        state.progress.last_stream_at = Instant::now();
-                        state.progress.last_product_stall_attempt_at = Some(Instant::now());
-                        continue;
-                    }
+                    continue;
                 }
                 match sender.send_recv_progress(
                     &mut remotes,
@@ -1217,11 +1253,11 @@ where
                     tokio::task::yield_now().await;
                 }
             }
-            _ = tokio::time::sleep_until(queued_send_retry_deadline), if queued_send_blocked => {
+            _ = tokio::time::sleep_until(queued_send_retry_deadline), if carrier_retry_blocked => {
                 state.progress.sender_retry_at = None;
                 continue;
             }
-            _ = wait_for_carrier_capacity_notifies(carrier_capacity_notifies), if queued_send_blocked && has_carrier_capacity_notify => {
+            _ = wait_for_carrier_capacity_notifies(carrier_capacity_notifies), if carrier_retry_blocked && has_carrier_capacity_notify => {
                 state.progress.sender_retry_at = None;
                 continue;
             }
@@ -1246,6 +1282,18 @@ where
                     state.progress.sender_retry_at = None;
                 }
                 if matches!(attached_mode, Some(ReliableRelayAttachMode::Recovery)) {
+                    if sender.enqueue_tail_reinjection(
+                        &mut sender_queue,
+                        context,
+                        &remotes,
+                        &send_stream,
+                        &state.progress.last_send_ack_ranges,
+                        state.progress.last_send_ack_complete,
+                        state.progress.last_send_ack_frontier,
+                        relay_lane,
+                    ) {
+                        state.progress.sender_retry_at = None;
+                    }
                     match sender.send_recv_progress(
                         &mut remotes,
                         context,
@@ -1261,6 +1309,9 @@ where
                         }
                         Err(err) => break Err(err),
                     }
+                    let attempted_at = Instant::now();
+                    state.progress.last_response_stall_reinjection_at = attempted_at;
+                    state.progress.last_product_stall_attempt_at = Some(attempted_at);
                 }
             }
             read = async {
@@ -1548,8 +1599,12 @@ where
                             .await
                             {
                                 Ok(sent) => {
-                                    state.record_recv_progress_sent(sent);
-                                    true
+                                    record_final_recv_progress_enqueue(
+                                        &mut state,
+                                        sent,
+                                        path_snapshot,
+                                    );
+                                    sent
                                 }
                                 Err(err) if reliable_path_error_is_migratable(&err) => false,
                                 Err(err) => break Err(err),
@@ -1679,8 +1734,12 @@ where
                             .await
                             {
                                 Ok(sent) => {
-                                    state.record_recv_progress_sent(sent);
-                                    true
+                                    record_final_recv_progress_enqueue(
+                                        &mut state,
+                                        sent,
+                                        path_snapshot,
+                                    );
+                                    sent
                                 }
                                 Err(err) if reliable_path_error_is_migratable(&err) => false,
                                 Err(err) => break Err(err),
@@ -1764,12 +1823,13 @@ where
             context.mark_relay_path_delivery(key.underlay, key.index, path_stats);
         }
     }
-    // Successful teardown stays behind ordered FIN work. Failure teardown may
-    // preempt queued data so dead attachments do not poison later reuse.
-    if result.is_ok() {
-        remotes.close_all_ordered().await;
-    } else {
-        remotes.close_all().await;
+    // Successful teardown stays behind ordered FIN work. A failed local
+    // product socket is terminal, while carrier failures retain detach-only
+    // semantics so the logical stream can survive path recovery.
+    match &result {
+        Ok(_) => remotes.close_all_ordered().await,
+        Err(RuntimeError::Io(_)) => remotes.reset_all(ResetReason::RemoteClosed).await,
+        Err(_) => remotes.close_all().await,
     }
     #[cfg(feature = "lab-diagnostics")]
     lab_diagnostic(

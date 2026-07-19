@@ -4,6 +4,10 @@
 //! connection, stream, receive, capacity, and writer state remain with their
 //! runtime owners.
 
+use super::client_datagram::ClientTcpDatagramOpenCancellation;
+pub(in crate::runtime) use super::client_datagram::{
+    ClientTcpDatagramAttachment, ClientTcpDatagramInbound,
+};
 use super::client_session::run_client_tcp_path_session;
 pub(in crate::runtime) use super::client_state::ClientTcpPathSessionRuntime;
 use super::client_stream::{ClientTcpOpenCancellation, next_client_tcp_open_attempt_id};
@@ -116,6 +120,55 @@ impl ClientTcpPathSessionHandle {
             }
             ClientTcpOpenResponse::FailedAfterOpen(err) => Err(err),
         }
+    }
+
+    /// Registers a product-datagram route on this path's existing TCP actor.
+    pub(in crate::runtime) async fn open_datagram_attachment(
+        &self,
+        open_deadline: tokio::time::Instant,
+        frame_queue: usize,
+    ) -> Result<ClientTcpDatagramAttachment, RuntimeError> {
+        let session = self.ensure_session_slot();
+        let commands = session.commands.clone();
+        let channels = ClientTcpDatagramAttachment::channel(frame_queue);
+        let attachment_id = channels.attachment_id;
+        let (response_tx, response_rx) = oneshot::channel();
+        tokio::select! {
+            biased;
+            result = commands.send_control(ReliablePathCommand::OpenDatagramAttachment {
+                attachment_id,
+                frames: channels.frames_tx,
+                failure: channels.failure_tx,
+                open_deadline,
+                response: response_tx,
+            }) => result.map_err(|_| RuntimeError::ReliablePathSessionClosed)?,
+            _ = tokio::time::sleep_until(open_deadline) => {
+                return Err(RuntimeError::PathOpenTimedOut);
+            }
+        }
+        // The close uses the same FIFO control queue as the open. If this
+        // future is cancelled after admission, the actor still retires the
+        // exact attachment after processing its open command.
+        let mut cancellation =
+            ClientTcpDatagramOpenCancellation::new(commands.clone(), attachment_id);
+        let path_instance_id = tokio::select! {
+            biased;
+            response = response_rx => {
+                response.map_err(|_| RuntimeError::ReliablePathSessionClosed)??
+            }
+            _ = tokio::time::sleep_until(open_deadline) => {
+                return Err(RuntimeError::PathOpenTimedOut);
+            }
+        };
+        let attachment = ClientTcpDatagramAttachment::new(
+            attachment_id,
+            path_instance_id,
+            commands,
+            channels.frames_rx,
+            channels.failure_rx,
+        );
+        cancellation.disarm();
+        Ok(attachment)
     }
 
     /// Establishes the durable carrier without creating a product stream.

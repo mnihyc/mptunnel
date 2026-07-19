@@ -4,10 +4,12 @@
 //! preserving frame order without allowing feedback backpressure to deadlock.
 
 use super::client_capacity::{ClientTcpCapacityProbeWriteOutcome, client_write_tcp_capacity_probe};
+use super::client_datagram::ClientTcpDatagramState;
 use super::client_receive::handle_client_tcp_path_frame;
 use super::client_state::{ClientTcpPathConnection, ClientTcpPathSessionRuntime};
 use super::client_stream::{
-    ClientTcpOpenStreamRequest, ClientTcpPathStreamState, open_client_tcp_stream_on_connection,
+    ClientTcpOpenStreamRequest, ClientTcpPathStreamState,
+    client_tcp_inbound_frame_retires_attachment, open_client_tcp_stream_on_connection,
     remove_matching_client_tcp_open,
 };
 #[cfg(feature = "lab-diagnostics")]
@@ -30,6 +32,13 @@ use std::collections::HashMap;
 use std::time::Instant;
 use tokio::sync::mpsc;
 
+#[derive(Clone, Copy)]
+struct ClientTcpCommandOptions {
+    carrier_generation: u64,
+    stream_frame_queue: usize,
+    flush_after_frame: bool,
+}
+
 #[allow(clippy::too_many_arguments)]
 pub(super) async fn handle_connected_client_tcp_command_run(
     first_command: ReliablePathCommand,
@@ -37,6 +46,7 @@ pub(super) async fn handle_connected_client_tcp_command_run(
     connection: &mut ClientTcpPathConnection,
     streams: &mut HashMap<StreamId, ClientTcpPathStreamState>,
     closed_streams: &mut RecentIdCache<StreamId>,
+    datagrams: &mut ClientTcpDatagramState,
     runtime: &ClientTcpPathSessionRuntime,
     carrier_generation: u64,
     stream_frame_queue: usize,
@@ -52,6 +62,7 @@ pub(super) async fn handle_connected_client_tcp_command_run(
     let mut sent_bytes = 0usize;
     let mut sent_items = 0usize;
     let mut wrote_frame = false;
+    let mut terminal_stream_id = None;
 
     loop {
         let Some(command) = next_command
@@ -151,6 +162,7 @@ pub(super) async fn handle_connected_client_tcp_command_run(
                     pending_frames,
                     streams,
                     closed_streams,
+                    datagrams,
                     runtime,
                 )
                 .await
@@ -169,6 +181,7 @@ pub(super) async fn handle_connected_client_tcp_command_run(
                     mux_limits.max_payload_bytes,
                     streams,
                     closed_streams,
+                    datagrams,
                     mux_limits,
                 )
                 .await;
@@ -217,17 +230,24 @@ pub(super) async fn handle_connected_client_tcp_command_run(
                         connection,
                         streams,
                         closed_streams,
+                        datagrams,
                         runtime,
                     )
                     .await?;
                 }
                 return Ok(());
             }
-            ReliablePathCommand::ResetAndCloseStream { .. } => {
+            ReliablePathCommand::ResetAndCloseStream { stream_id, reason } => {
+                pending_frames.push(Frame::StreamReset { stream_id, reason });
                 commands.release_pending_command_bytes(pending_bytes);
-                return Err(RuntimeError::Protocol(
-                    "client TCP path received server terminal command",
-                ));
+                wrote_frame = true;
+                #[cfg(feature = "lab-diagnostics")]
+                {
+                    sent_bytes = sent_bytes.saturating_add(writer_run_bytes);
+                    sent_items = sent_items.saturating_add(1);
+                }
+                terminal_stream_id = Some(stream_id);
+                break;
             }
             command => {
                 flush_client_tcp_frame_batch(
@@ -235,6 +255,7 @@ pub(super) async fn handle_connected_client_tcp_command_run(
                     pending_frames,
                     streams,
                     closed_streams,
+                    datagrams,
                     runtime,
                 )
                 .await?;
@@ -243,9 +264,12 @@ pub(super) async fn handle_connected_client_tcp_command_run(
                     connection,
                     streams,
                     closed_streams,
-                    carrier_generation,
-                    stream_frame_queue,
-                    false,
+                    datagrams,
+                    ClientTcpCommandOptions {
+                        carrier_generation,
+                        stream_frame_queue,
+                        flush_after_frame: false,
+                    },
                 )
                 .await?;
                 commands.release_pending_command_bytes(pending_bytes);
@@ -257,8 +281,21 @@ pub(super) async fn handle_connected_client_tcp_command_run(
         }
     }
 
-    flush_client_tcp_frame_batch(connection, pending_frames, streams, closed_streams, runtime)
-        .await?;
+    flush_client_tcp_frame_batch(
+        connection,
+        pending_frames,
+        streams,
+        closed_streams,
+        datagrams,
+        runtime,
+    )
+    .await?;
+    if let Some(stream_id) = terminal_stream_id {
+        // TCP sessions are shared: terminal product state retires only this
+        // stream after its reset is committed to the carrier writer.
+        streams.remove(&stream_id);
+        closed_streams.insert(stream_id);
+    }
 
     #[cfg(feature = "lab-diagnostics")]
     lab_diagnostic(
@@ -287,6 +324,7 @@ async fn flush_client_tcp_frame_batch(
     frames: &mut Vec<Frame>,
     streams: &mut HashMap<StreamId, ClientTcpPathStreamState>,
     closed_streams: &mut RecentIdCache<StreamId>,
+    datagrams: &mut ClientTcpDatagramState,
     runtime: &ClientTcpPathSessionRuntime,
 ) -> Result<(), RuntimeError> {
     if frames.is_empty() {
@@ -307,11 +345,12 @@ async fn flush_client_tcp_frame_batch(
                 incoming = connection.carrier.frames.recv(), if deferred_frame.is_none() => {
                     match incoming {
                         Some(Ok(frame)) => {
-                            match try_route_client_tcp_stream_frame_during_write(
+                            match try_route_client_tcp_frame_during_write(
                                 frame,
                                 streams,
                                 closed_streams,
-                            ) {
+                                datagrams,
+                            )? {
                                 ClientTcpWriteFrameRoute::Routed => {
                                     routed_frames = routed_frames.saturating_add(1);
                                 }
@@ -367,7 +406,15 @@ async fn flush_client_tcp_frame_batch(
         );
     }
     if let Some(frame) = deferred_frame {
-        handle_client_tcp_path_frame(frame, connection, streams, closed_streams, runtime).await?;
+        handle_client_tcp_path_frame(
+            frame,
+            connection,
+            streams,
+            closed_streams,
+            datagrams,
+            runtime,
+        )
+        .await?;
     }
     Ok(())
 }
@@ -378,6 +425,7 @@ async fn client_write_tcp_capacity_probe_interlocked(
     max_payload_bytes: usize,
     streams: &mut HashMap<StreamId, ClientTcpPathStreamState>,
     closed_streams: &mut RecentIdCache<StreamId>,
+    datagrams: &mut ClientTcpDatagramState,
     mux_limits: MuxLimits,
 ) -> Result<(ClientTcpCapacityProbeWriteOutcome, Vec<Frame>), RuntimeError> {
     let write = client_write_tcp_capacity_probe(
@@ -417,11 +465,12 @@ async fn client_write_tcp_capacity_probe_interlocked(
                     continue;
                 }
                 if !defer_all {
-                    match try_route_client_tcp_stream_frame_during_write(
+                    match try_route_client_tcp_frame_during_write(
                         frame,
                         streams,
                         closed_streams,
-                    ) {
+                        datagrams,
+                    )? {
                         ClientTcpWriteFrameRoute::Routed => {
                             routed_frames = routed_frames.saturating_add(1);
                             continue;
@@ -467,11 +516,19 @@ enum ClientTcpWriteFrameRoute {
     Barrier(Frame),
 }
 
-fn try_route_client_tcp_stream_frame_during_write(
+fn try_route_client_tcp_frame_during_write(
     frame: Frame,
     streams: &mut HashMap<StreamId, ClientTcpPathStreamState>,
     closed_streams: &mut RecentIdCache<StreamId>,
-) -> ClientTcpWriteFrameRoute {
+    datagrams: &mut ClientTcpDatagramState,
+) -> Result<ClientTcpWriteFrameRoute, RuntimeError> {
+    if matches!(
+        &frame,
+        Frame::DatagramData { .. } | Frame::DatagramFeedback { .. } | Frame::DatagramClose { .. }
+    ) {
+        datagrams.route_inbound(frame)?;
+        return Ok(ClientTcpWriteFrameRoute::Routed);
+    }
     let stream_id = match &frame {
         Frame::StreamMaxData { stream_id, .. }
         | Frame::StreamReset { stream_id, .. }
@@ -483,41 +540,43 @@ fn try_route_client_tcp_stream_frame_during_write(
                 .get(stream_id)
                 .is_some_and(|state| state.pending_open.is_some())
             {
-                return ClientTcpWriteFrameRoute::Barrier(Frame::StreamDetach {
+                return Ok(ClientTcpWriteFrameRoute::Barrier(Frame::StreamDetach {
                     stream_id: *stream_id,
-                });
+                }));
             }
             streams.remove(stream_id);
             closed_streams.insert(*stream_id);
-            return ClientTcpWriteFrameRoute::Routed;
+            return Ok(ClientTcpWriteFrameRoute::Routed);
         }
-        _ => return ClientTcpWriteFrameRoute::Barrier(frame),
+        _ => return Ok(ClientTcpWriteFrameRoute::Barrier(frame)),
     };
     if streams
         .get(&stream_id)
         .is_some_and(|state| state.pending_open.is_some())
     {
-        return ClientTcpWriteFrameRoute::Barrier(frame);
+        return Ok(ClientTcpWriteFrameRoute::Barrier(frame));
     }
-    let closes_stream = matches!(&frame, Frame::StreamReset { .. } | Frame::StreamFin { .. });
+    let retires_attachment = client_tcp_inbound_frame_retires_attachment(&frame);
     let Some(state) = streams.get_mut(&stream_id) else {
         closed_streams.insert(stream_id);
-        return ClientTcpWriteFrameRoute::Routed;
+        return Ok(ClientTcpWriteFrameRoute::Routed);
     };
     let send_result = state.frames.try_send(Ok(frame));
     match send_result {
         Ok(()) => {
-            if closes_stream {
+            if retires_attachment {
                 streams.remove(&stream_id);
                 closed_streams.insert(stream_id);
             }
-            ClientTcpWriteFrameRoute::Routed
+            Ok(ClientTcpWriteFrameRoute::Routed)
         }
-        Err(mpsc::error::TrySendError::Full(Ok(frame))) => ClientTcpWriteFrameRoute::Barrier(frame),
+        Err(mpsc::error::TrySendError::Full(Ok(frame))) => {
+            Ok(ClientTcpWriteFrameRoute::Barrier(frame))
+        }
         Err(mpsc::error::TrySendError::Closed(_)) => {
             streams.remove(&stream_id);
             closed_streams.insert(stream_id);
-            ClientTcpWriteFrameRoute::Routed
+            Ok(ClientTcpWriteFrameRoute::Routed)
         }
         Err(mpsc::error::TrySendError::Full(Err(_))) => {
             unreachable!("client TCP interlock only routes successful frames")
@@ -530,10 +589,14 @@ async fn handle_connected_client_tcp_command(
     connection: &mut ClientTcpPathConnection,
     streams: &mut HashMap<StreamId, ClientTcpPathStreamState>,
     closed_streams: &mut RecentIdCache<StreamId>,
-    carrier_generation: u64,
-    stream_frame_queue: usize,
-    flush_after_frame: bool,
+    datagrams: &mut ClientTcpDatagramState,
+    options: ClientTcpCommandOptions,
 ) -> Result<(), RuntimeError> {
+    let ClientTcpCommandOptions {
+        carrier_generation,
+        stream_frame_queue,
+        flush_after_frame,
+    } = options;
     match command {
         ReliablePathCommand::PrepareConnection { response, .. } => {
             let _ = response.send(Ok(None));
@@ -580,6 +643,108 @@ async fn handle_connected_client_tcp_command(
             connection.record_outbound_activity();
             Ok(())
         }
+        ReliablePathCommand::OpenDatagramAttachment {
+            attachment_id,
+            frames,
+            failure,
+            open_deadline,
+            response,
+        } => {
+            if response.is_closed() || open_deadline <= tokio::time::Instant::now() {
+                let _ = response.send(Err(RuntimeError::PathOpenTimedOut));
+                return Ok(());
+            }
+            if let Err(err) = datagrams.attach(attachment_id, frames, failure) {
+                let _ = response.send(Err(err));
+                return Ok(());
+            }
+            if response.send(Ok(connection.path_instance_id)).is_err() {
+                datagrams.remove_attachment(attachment_id);
+            }
+            Ok(())
+        }
+        ReliablePathCommand::OpenDatagramFlow {
+            attachment_id,
+            flow_id,
+            target,
+            open_deadline,
+            response,
+        } => {
+            if response.is_closed() || open_deadline <= tokio::time::Instant::now() {
+                let _ = response.send(Err(RuntimeError::PathOpenTimedOut));
+                return Ok(());
+            }
+            let should_write = match datagrams.validate_open_flow(attachment_id, flow_id, &target) {
+                Ok(should_write) => should_write,
+                Err(err) => {
+                    let _ = response.send(Err(err));
+                    return Ok(());
+                }
+            };
+            if should_write {
+                let frame = Frame::OpenDatagramFlow {
+                    flow_id,
+                    target: target.clone(),
+                };
+                connection.carrier.writer.write_frame(&frame).await?;
+                connection.carrier.writer.flush().await?;
+                connection.path_proofs.record_sent_frame(&frame);
+                connection.record_outbound_activity();
+                datagrams.commit_open_flow(attachment_id, flow_id, target);
+            }
+            let _ = response.send(Ok(()));
+            Ok(())
+        }
+        ReliablePathCommand::SendDatagramFrame {
+            attachment_id,
+            frame,
+            write_deadline,
+            expires_at,
+            response,
+        } => {
+            if response.is_closed() || write_deadline <= tokio::time::Instant::now() {
+                let _ = response.send(Err(RuntimeError::PathOpenTimedOut));
+                return Ok(());
+            }
+            if let Err(err) = datagrams.validate_outbound(attachment_id, &frame) {
+                let _ = response.send(Err(err));
+                return Ok(());
+            }
+            let frame = match refresh_client_tcp_datagram_ttl(frame, expires_at) {
+                Ok(frame) => frame,
+                Err(err) => {
+                    let _ = response.send(Err(err));
+                    return Ok(());
+                }
+            };
+            connection.carrier.writer.write_frame(&frame).await?;
+            connection.carrier.writer.flush().await?;
+            connection.path_proofs.record_sent_frame(&frame);
+            connection.record_outbound_activity();
+            let _ = response.send(Ok(()));
+            Ok(())
+        }
+        ReliablePathCommand::CloseDatagramAttachment {
+            attachment_id,
+            response,
+        } => {
+            let flow_ids = datagrams.attachment_flow_ids(attachment_id);
+            let wrote_close = !flow_ids.is_empty();
+            for flow_id in flow_ids {
+                let frame = Frame::DatagramClose { flow_id };
+                connection.carrier.writer.write_frame(&frame).await?;
+                connection.path_proofs.record_sent_frame(&frame);
+            }
+            if wrote_close {
+                connection.carrier.writer.flush().await?;
+                connection.record_outbound_activity();
+            }
+            datagrams.remove_attachment(attachment_id);
+            if let Some(response) = response {
+                let _ = response.send(Ok(()));
+            }
+            Ok(())
+        }
         ReliablePathCommand::SendFrame(frame)
             if reliable_path_frame_requires_capacity_command(&frame) =>
         {
@@ -599,15 +764,58 @@ async fn handle_connected_client_tcp_command(
         ReliablePathCommand::SendTcpCapacityProbe(_) => Err(RuntimeError::Protocol(
             "client TCP path received server capacity command",
         )),
-        ReliablePathCommand::ResetAndCloseStream { .. } => Err(RuntimeError::Protocol(
-            "client TCP path received server terminal command",
-        )),
+        ReliablePathCommand::ResetAndCloseStream { stream_id, reason } => {
+            let reset = Frame::StreamReset { stream_id, reason };
+            connection.carrier.writer.write_frame(&reset).await?;
+            connection.path_proofs.record_sent_frame(&reset);
+            connection.carrier.writer.flush().await?;
+            connection.record_outbound_activity();
+            streams.remove(&stream_id);
+            closed_streams.insert(stream_id);
+            Ok(())
+        }
         ReliablePathCommand::CloseStream(stream_id) => {
             streams.remove(&stream_id);
             closed_streams.insert(stream_id);
             Ok(())
         }
     }
+}
+
+fn refresh_client_tcp_datagram_ttl(
+    frame: Frame,
+    expires_at: Option<tokio::time::Instant>,
+) -> Result<Frame, RuntimeError> {
+    let (flow_id, datagram_id, payload) = match frame {
+        Frame::DatagramData {
+            flow_id,
+            datagram_id,
+            ttl_ms: _,
+            payload,
+        } => (flow_id, datagram_id, payload),
+        frame => {
+            if expires_at.is_some() {
+                return Err(RuntimeError::Protocol(
+                    "TCP datagram feedback carried a product deadline",
+                ));
+            }
+            return Ok(frame);
+        }
+    };
+    let expires_at = expires_at.ok_or(RuntimeError::Protocol(
+        "TCP datagram data omitted its product deadline",
+    ))?;
+    let remaining = expires_at.saturating_duration_since(tokio::time::Instant::now());
+    if remaining.is_zero() {
+        return Err(RuntimeError::PathOpenTimedOut);
+    }
+    let ttl_ms = remaining.as_millis().max(1).min(u128::from(u32::MAX)) as u32;
+    Ok(Frame::DatagramData {
+        flow_id,
+        datagram_id,
+        ttl_ms,
+        payload,
+    })
 }
 
 #[cfg(test)]

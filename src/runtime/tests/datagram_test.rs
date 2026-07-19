@@ -1,6 +1,7 @@
 use super::*;
 use crate::config::ResourceLimits;
 use crate::protocol::{PathMetricDirection, PathUsage};
+use crate::runtime::path::PathProofObservation;
 #[cfg(feature = "lab-diagnostics")]
 use crate::runtime::path::quic::metrics::QuicAckPollDiagnostics;
 use crate::runtime::path::quic::metrics::UdpPathMetrics;
@@ -359,13 +360,13 @@ fn udp_association_suppression_prefers_survivor_without_dead_ending() {
         Some(0)
     );
 
-    association.suppress_path_after_timeout(0, Duration::from_millis(250), 1000);
+    association.suppress_path_after_carrier_failure(0, Duration::from_millis(250), 1000);
     assert_eq!(
         association.select_path_candidate(&candidates, &HashSet::new(), 512, 1000),
         Some(1)
     );
 
-    association.suppress_path_after_timeout(1, Duration::from_millis(250), 1000);
+    association.suppress_path_after_carrier_failure(1, Duration::from_millis(250), 1000);
     assert_eq!(
         association.select_path_candidate(&candidates, &HashSet::new(), 512, 1000),
         Some(0)
@@ -404,7 +405,7 @@ fn udp_association_keeps_successful_path_within_hysteresis_until_suppressed() {
         Some(0)
     );
 
-    association.suppress_path_after_timeout(0, Duration::from_millis(250), 1000);
+    association.suppress_path_after_carrier_failure(0, Duration::from_millis(250), 1000);
     assert_eq!(
         association.select_path_candidate(&candidates, &HashSet::new(), 512, 1000),
         Some(1)
@@ -480,22 +481,6 @@ fn datagram_response_timeout_is_terminal_product_expiry() {
     assert!(tcp_datagram_error_is_path_retryable(
         &RuntimeError::PathOpenTimedOut
     ));
-}
-
-#[test]
-fn datagram_without_feedback_retries_unattempted_alternative_before_product_expiry() {
-    assert_eq!(
-        datagram_timeout_action(false, true),
-        DatagramTimeoutAction::RetryAlternative
-    );
-    assert_eq!(
-        datagram_timeout_action(true, true),
-        DatagramTimeoutAction::TerminalProductExpiry
-    );
-    assert_eq!(
-        datagram_timeout_action(false, false),
-        DatagramTimeoutAction::TerminalProductExpiry
-    );
 }
 
 #[test]
@@ -603,34 +588,6 @@ fn udp_path_open_timeout_uses_adaptive_multipath_startup_budget() {
 }
 
 #[test]
-fn udp_first_datagram_response_uses_startup_budget_for_cold_association() {
-    let mut model = UdpPathRuntimeModel {
-        pacing_rate_bps: 1.0,
-        response_timeout: Duration::from_millis(65),
-        max_payload_bytes: MAX_PRODUCT_DATAGRAM_PAYLOAD_BYTES,
-    };
-
-    assert_eq!(
-        udp_datagram_first_response_timeout(false, false, true, model, DEFAULT_SOCKS5_UDP_TTL_MS),
-        Duration::from_millis(65)
-    );
-    assert_eq!(
-        udp_datagram_first_response_timeout(true, false, true, model, DEFAULT_SOCKS5_UDP_TTL_MS),
-        Duration::from_millis(65)
-    );
-    assert_eq!(
-        udp_datagram_first_response_timeout(false, true, true, model, DEFAULT_SOCKS5_UDP_TTL_MS),
-        Duration::from_millis(65)
-    );
-
-    model.response_timeout = Duration::from_millis(300);
-    assert_eq!(
-        udp_datagram_first_response_timeout(false, false, false, model, DEFAULT_SOCKS5_UDP_TTL_MS),
-        UDP_PATH_HANDSHAKE_TIMEOUT
-    );
-}
-
-#[test]
 fn udp_runtime_model_backs_off_response_timeout_after_loss() {
     let stable = PathSnapshot::new(PathId(0), UnderlayProtocol::Udp, 80.0, 30_000_000.0);
     let mut lossy = stable;
@@ -664,7 +621,7 @@ fn udp_response_budget_tracks_live_loss_model() {
     let stable_model = context
         .udp_path_runtime_model(0, DEFAULT_SOCKS5_UDP_TTL_MS)
         .expect("stable model");
-    let stable_budget = datagram_response_deadline_budget(
+    let stable_budget = datagram_feedback_retry_budget(
         stable_model.response_timeout,
         DEFAULT_SOCKS5_UDP_TTL_MS,
         false,
@@ -684,7 +641,7 @@ fn udp_response_budget_tracks_live_loss_model() {
     let lossy_model = context
         .udp_path_runtime_model(0, DEFAULT_SOCKS5_UDP_TTL_MS)
         .expect("lossy model");
-    let lossy_budget = datagram_response_deadline_budget(
+    let lossy_budget = datagram_feedback_retry_budget(
         lossy_model.response_timeout,
         DEFAULT_SOCKS5_UDP_TTL_MS,
         false,
@@ -694,24 +651,20 @@ fn udp_response_budget_tracks_live_loss_model() {
 }
 
 #[test]
-fn datagram_response_deadline_budget_scales_from_ttl_slack_and_response_model() {
+fn datagram_feedback_retry_budget_scales_from_ttl_slack_and_path_model() {
     let high_rtt_timeout = Duration::from_millis(900);
-    let budget =
-        datagram_response_deadline_budget(high_rtt_timeout, DEFAULT_SOCKS5_UDP_TTL_MS, false);
-    let low_rtt_budget = datagram_response_deadline_budget(
-        Duration::from_millis(50),
-        DEFAULT_SOCKS5_UDP_TTL_MS,
-        false,
-    );
+    let budget = datagram_feedback_retry_budget(high_rtt_timeout, DEFAULT_SOCKS5_UDP_TTL_MS, false);
+    let low_rtt_budget =
+        datagram_feedback_retry_budget(Duration::from_millis(50), DEFAULT_SOCKS5_UDP_TTL_MS, false);
     assert_eq!(budget, Duration::from_millis(2_700));
     assert_eq!(low_rtt_budget, Duration::from_millis(150));
     assert!(budget < Duration::from_millis(DEFAULT_SOCKS5_UDP_TTL_MS.into()));
 
-    let tight_ttl_budget = datagram_response_deadline_budget(high_rtt_timeout, 1_000, false);
+    let tight_ttl_budget = datagram_feedback_retry_budget(high_rtt_timeout, 1_000, false);
     assert_eq!(tight_ttl_budget, Duration::from_millis(1_000));
 
     let alternative_budget =
-        datagram_response_deadline_budget(high_rtt_timeout, DEFAULT_SOCKS5_UDP_TTL_MS, true);
+        datagram_feedback_retry_budget(high_rtt_timeout, DEFAULT_SOCKS5_UDP_TTL_MS, true);
     assert_eq!(alternative_budget, high_rtt_timeout);
 }
 
@@ -739,125 +692,15 @@ fn tcp_datagram_response_timeout_uses_tcp_path_response_model() {
 }
 
 #[test]
-fn udp_edge_lane_limit_scales_with_realtime_response_model() {
-    let low_latency = "udp://127.0.0.1:10184?srtt-ms=20&jitter-ms=0&rate-mbps=30"
-        .parse::<PathSpec>()
-        .expect("low-latency path");
-    let high_rtt = "udp://127.0.0.1:10185?srtt-ms=180&jitter-ms=20&rate-mbps=300"
-        .parse::<PathSpec>()
-        .expect("high-rtt path");
-    let low_context =
-        ClientPathContext::new(vec![low_latency], security(), ResourceLimits::default())
-            .expect("low context");
-    let high_context = ClientPathContext::new(
-        vec![high_rtt.clone()],
-        security(),
-        ResourceLimits::default(),
-    )
-    .expect("high context");
-
-    let low_limit = udp_edge_lane_limit(&low_context);
-    let high_limit = udp_edge_lane_limit(&high_context);
-    assert!(low_limit >= QUIC_PERSISTENT_CONGESTION_THRESHOLD as usize);
-    assert!(high_limit >= low_limit);
-    assert!(high_limit <= udp_edge_queue_slots(&high_context));
-
-    let capped_resources = ResourceLimits {
-        max_datagram_queue_bytes: ResourceLimits::default().max_payload_bytes * 3,
-        ..ResourceLimits::default()
-    };
-    let capped_context = ClientPathContext::new(vec![high_rtt], security(), capped_resources)
-        .expect("capped context");
-    assert_eq!(udp_edge_lane_limit(&capped_context), 3);
-}
-
-#[test]
-fn udp_edge_lane_startup_ramps_after_success_feedback() {
-    let paths = vec![
-        "udp://127.0.0.1:10180".parse().expect("first path"),
-        "udp://127.0.0.1:10181".parse().expect("second path"),
-        "udp://127.0.0.1:10182".parse().expect("third path"),
-    ];
-    let context =
-        ClientPathContext::new(paths, security(), ResourceLimits::default()).expect("context");
-
-    assert!(udp_edge_lane_limit(&context) > udp_edge_startup_lane_limit(&context));
-    assert_eq!(udp_edge_startup_lane_limit(&context), 2);
-    assert!(udp_edge_lane_spawn_allowed(0, 0, &context));
-    assert!(udp_edge_lane_spawn_allowed(1, 0, &context));
-    assert!(!udp_edge_lane_spawn_allowed(2, 0, &context));
-    assert!(udp_edge_lane_spawn_allowed(2, 1, &context));
-}
-
-#[test]
-fn udp_edge_lane_startup_uses_tcp_datagram_carriers_too() {
-    let paths = vec![
-        "tcp://127.0.0.1:10186?srtt-ms=20&jitter-ms=0&rate-mbps=30"
-            .parse()
-            .expect("first tcp path"),
-        "tcp://127.0.0.1:10187?srtt-ms=25&jitter-ms=0&rate-mbps=30"
-            .parse()
-            .expect("second tcp path"),
-    ];
-    let context =
-        ClientPathContext::new(paths, security(), ResourceLimits::default()).expect("context");
-
-    assert!(udp_edge_lane_limit(&context) > 1);
-    assert_eq!(udp_edge_startup_lane_limit(&context), 2);
-    assert!(udp_edge_lane_spawn_allowed(0, 0, &context));
-    assert!(udp_edge_lane_spawn_allowed(1, 0, &context));
-    assert!(!udp_edge_lane_spawn_allowed(2, 0, &context));
-}
-
-#[test]
-fn udp_edge_route_hint_avoids_pending_lane_carrier_when_alternative_exists() {
-    let paths = vec![
-        "udp://127.0.0.1:10188?srtt-ms=20&jitter-ms=0&rate-mbps=30"
-            .parse()
-            .expect("first udp path"),
-        "tcp://127.0.0.1:10189?srtt-ms=25&jitter-ms=0&rate-mbps=30"
-            .parse()
-            .expect("tcp path"),
-        "udp://127.0.0.1:10190?srtt-ms=30&jitter-ms=0&rate-mbps=30"
-            .parse()
-            .expect("second udp path"),
-    ];
-    let context =
-        ClientPathContext::new(paths, security(), ResourceLimits::default()).expect("context");
-    let first = RelayPathKey {
-        underlay: UnderlayProtocol::Udp,
-        index: 0,
-    };
-    let second = RelayPathKey {
-        underlay: UnderlayProtocol::Tcp,
-        index: 0,
-    };
-
-    assert_eq!(
-        udp_edge_route_hint(
-            &context,
-            512,
-            DEFAULT_SOCKS5_UDP_TTL_MS,
-            std::iter::once(first),
-        ),
-        Some(second)
-    );
-}
-
-#[test]
-fn udp_edge_lane_startup_respects_queue_capacity() {
+fn udp_edge_association_queue_is_bounded_by_resource_bytes() {
     let path = "udp://127.0.0.1:10183".parse().expect("path");
     let resources = ResourceLimits {
-        max_datagram_queue_bytes: ResourceLimits::default().max_payload_bytes,
+        max_datagram_queue_bytes: ResourceLimits::default().max_payload_bytes * 3,
         ..ResourceLimits::default()
     };
     let context = ClientPathContext::new(vec![path], security(), resources).expect("context");
 
-    assert_eq!(udp_edge_queue_slots(&context), 1);
-    assert_eq!(udp_edge_startup_lane_limit(&context), 1);
-    assert!(udp_edge_lane_spawn_allowed(0, 0, &context));
-    assert!(!udp_edge_lane_spawn_allowed(1, 0, &context));
-    assert!(udp_edge_lane_spawn_allowed(1, 1, &context));
+    assert_eq!(udp_edge_queue_slots(&context), 3);
 }
 
 #[test]
@@ -1091,6 +934,42 @@ fn endpoint_only_tcp_open_reservations_spread_concurrent_streams_without_probe_n
     assert_eq!(health.tcp[1].active_flows, 0);
     assert_eq!(health.tcp[0].relay_bytes_in_flight, 0);
     assert_eq!(health.tcp[1].relay_bytes_in_flight, 0);
+}
+
+#[test]
+fn endpoint_only_mixed_reservation_prefers_proven_low_rtt_over_unproven_idle_path() {
+    let context = ClientPathContext::new(
+        vec![
+            "tcp://127.0.0.1:10173"
+                .parse::<PathSpec>()
+                .expect("TCP path"),
+            "udp://127.0.0.1:10174"
+                .parse::<PathSpec>()
+                .expect("UDP path"),
+        ],
+        security(),
+        ResourceLimits::default(),
+    )
+    .expect("context");
+
+    let first = context
+        .reserve_reliable_stream_path(TrafficClass::Latency, PATH_OPEN_SCORE_BYTES, &[])
+        .expect("first reservation");
+    assert_eq!(first.key().underlay, UnderlayProtocol::Tcp);
+    context.mark_relay_path_proof_observation(
+        UnderlayProtocol::Tcp,
+        0,
+        PathProofObservation {
+            proof_id: 1,
+            elapsed: Duration::from_millis(40),
+            sent_at: Instant::now(),
+        },
+    );
+
+    let second = context
+        .reserve_reliable_stream_path(TrafficClass::Latency, PATH_OPEN_SCORE_BYTES, &[])
+        .expect("second reservation");
+    assert_eq!(second.key().underlay, UnderlayProtocol::Tcp);
 }
 
 #[test]

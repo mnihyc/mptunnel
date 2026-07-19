@@ -12,7 +12,7 @@ use super::multipath::{
     preview_response_data_payload_with_data_ack_outstanding,
 };
 use super::response_reinjection_avoid_outputs;
-use super::scheduling::select_response_frame_path;
+use super::scheduling::{response_completion_snapshot, select_response_frame_path};
 use crate::config::MppPerformanceConfig;
 #[cfg(feature = "lab-diagnostics")]
 use crate::lab_diagnostics::{
@@ -37,10 +37,11 @@ use crate::runtime::sender::{
     reliable_relay_can_read_product_source, reliable_relay_sender_queue_read_budget,
     sender_extra_traffic_startup_floor_bytes, sender_reinjection_minimum_useful_attempt_bytes,
 };
+use crate::runtime::stream::response::ResponseSenderPathTarget;
 use crate::runtime::stream::{ReliablePathStream, ReliablePathStreamOutput};
-use crate::scheduler::{PathSnapshot, TrafficClass};
+use crate::scheduler::{self, PathSnapshot, TrafficClass};
 use bytes::Bytes;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 fn response_data_dispatch_lane(
     queued_lane: Option<TrafficClass>,
@@ -111,6 +112,13 @@ pub(in crate::runtime) struct ServerResponseDispatch {
     pub(in crate::runtime) selected_path: Option<CarrierPathKey>,
 }
 
+#[derive(Debug, Clone, Copy)]
+pub(in crate::runtime) struct ServerAckGapReinjectionTarget {
+    pub(in crate::runtime) identity: ServerReinjectionOutputIdentity,
+    pub(in crate::runtime) snapshot: PathSnapshot,
+    pub(in crate::runtime) completion: Duration,
+}
+
 impl ServerResponseSenderService {
     #[cfg(test)]
     pub(in crate::runtime) fn new(session_id: SessionId, stream_id: StreamId) -> Self {
@@ -137,16 +145,33 @@ impl ServerResponseSenderService {
         send_stream: &ReliableSendStream,
         normalized_ranges: &[OffsetRange],
         preview_limit: usize,
-    ) -> Option<(ServerReinjectionOutputIdentity, PathSnapshot)> {
+    ) -> Option<ServerAckGapReinjectionTarget> {
         let preview = send_stream
             .retransmission_frames_for_normalized_ack_gaps(normalized_ranges, preview_limit.max(1))
             .into_iter()
             .next()?;
-        self.reinjection_path_snapshot_for_frame(
+        let target = self.reinjection_path_target_for_frame(
             path_stream,
             &preview,
             RelaySendCause::PersistentAckGapReinjection,
-        )
+        )?;
+        let lane = path_stream.current_lane();
+        let score = scheduler::score_path(
+            response_completion_snapshot(&target),
+            lane,
+            reliable_stream_frame_accounted_bytes(&preview),
+        )?;
+        if !score.eta_ms.is_finite() {
+            return None;
+        }
+        Some(ServerAckGapReinjectionTarget {
+            identity: ServerReinjectionOutputIdentity {
+                key: target.observation.key,
+                incarnation: target.observation.incarnation,
+            },
+            snapshot: target.observation.snapshot,
+            completion: Duration::from_secs_f64(score.eta_ms.max(0.0) / 1000.0),
+        })
     }
 
     pub(in crate::runtime) fn reinjection_path_snapshot_for_frame(
@@ -155,6 +180,24 @@ impl ServerResponseSenderService {
         preview: &Frame,
         cause: RelaySendCause,
     ) -> Option<(ServerReinjectionOutputIdentity, PathSnapshot)> {
+        self.reinjection_path_target_for_frame(path_stream, preview, cause)
+            .map(|target| {
+                (
+                    ServerReinjectionOutputIdentity {
+                        key: target.observation.key,
+                        incarnation: target.observation.incarnation,
+                    },
+                    target.observation.snapshot,
+                )
+            })
+    }
+
+    fn reinjection_path_target_for_frame(
+        &self,
+        path_stream: &ReliablePathStream,
+        preview: &Frame,
+        cause: RelaySendCause,
+    ) -> Option<ResponseSenderPathTarget> {
         let ReliablePathStreamOutput::Switchable(binding) = &path_stream.output else {
             return None;
         };
@@ -170,15 +213,6 @@ impl ServerResponseSenderService {
             &avoid_outputs,
             Some(cause),
         )
-        .map(|target| {
-            (
-                ServerReinjectionOutputIdentity {
-                    key: target.observation.key,
-                    incarnation: target.observation.incarnation,
-                },
-                target.observation.snapshot,
-            )
-        })
     }
 
     pub(in crate::runtime) fn is_empty(&self) -> bool {

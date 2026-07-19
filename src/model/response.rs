@@ -18,19 +18,18 @@ pub(crate) struct ResponsePathObservation {
     pub(crate) path_instance_id: CarrierPathInstanceId,
     pub(crate) incarnation: u64,
     pub(crate) snapshot: PathSnapshot,
-    /// Bytes already accepted by the native TCP/QUIC sender queue. MPP command
-    /// backlog remains in `snapshot.queue_bytes` for completion scoring, but it
-    /// must not make a priority reinjection look native-busy.
+    /// Bytes already accepted by the native TCP/QUIC sender queue.
     pub(crate) native_queue_bytes: u64,
     /// Exact native flight and unsent-queue counters were both observed.
     pub(crate) native_drain_observed: bool,
-    /// Bytes removed from the command queues but not yet handed to the ordered
-    /// carrier. Priority repair cannot overtake this private writer backlog.
+    /// Bytes removed from command queues but not yet handed to the carrier.
     pub(crate) writer_pending_bytes: u64,
     /// Exact connection-data bytes assigned to this path and awaiting Data ACK.
     pub(crate) original_data_in_flight_bytes: u64,
     /// Exact request ingress preferred for path-neutral stream feedback.
     pub(crate) is_request_feedback: bool,
+    #[cfg(test)]
+    pub(crate) has_path_proof_evidence: bool,
     pub(crate) has_bulk_rate_evidence: bool,
 }
 

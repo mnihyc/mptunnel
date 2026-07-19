@@ -2,6 +2,7 @@ use super::*;
 use crate::outbound::{DnsConfig, OutboundConfig};
 use crate::runtime::path::commands::{
     ReliablePathCommand, recv_reliable_path_command, reliable_path_command_channels,
+    reliable_path_command_pending_bytes,
 };
 use crate::runtime::path::{
     ServerDatagramOpenRequest, ServerDatagramRequest, ServerDatagramSendOutcome,
@@ -11,6 +12,63 @@ use crate::runtime::telemetry::RuntimeTelemetry;
 use bytes::Bytes;
 use std::sync::Arc;
 use tokio::net::UdpSocket;
+use tokio::sync::oneshot;
+
+fn test_server_datagram_port(telemetry: RuntimeTelemetry) -> ServerDatagramPort {
+    test_server_datagram_port_with_retention(telemetry, Duration::from_secs(60))
+}
+
+fn test_server_datagram_port_with_retention(
+    telemetry: RuntimeTelemetry,
+    retention: Duration,
+) -> ServerDatagramPort {
+    ServerDatagramService::path_port(
+        OutboundConfig::Direct,
+        DnsConfig::default(),
+        Duration::from_secs(1),
+        retention,
+        MuxLimits::default(),
+        Arc::new(ServerReliableStreamRegistry::new(8)).path_port(),
+        telemetry,
+    )
+}
+
+async fn await_test_signal(signal: oneshot::Receiver<()>, context: &str) {
+    tokio::time::timeout(Duration::from_secs(1), signal)
+        .await
+        .expect(context)
+        .expect(context);
+}
+
+async fn await_datagram_to_peer_packets(
+    telemetry: &RuntimeTelemetry,
+    expected: u64,
+    context: &str,
+) {
+    tokio::time::timeout(Duration::from_secs(1), async {
+        loop {
+            if telemetry.snapshot().datagram.io.to_peer_packets >= expected {
+                return;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect(context);
+}
+
+async fn await_active_datagram_flows(telemetry: &RuntimeTelemetry, expected: u64, context: &str) {
+    tokio::time::timeout(Duration::from_secs(1), async {
+        loop {
+            if telemetry.snapshot().datagram.flows.active == expected {
+                return;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect(context);
+}
 
 #[tokio::test]
 async fn server_datagram_port_owns_target_connection_and_worker() {
@@ -30,16 +88,8 @@ async fn server_datagram_port_owns_target_connection_and_worker() {
             .await
             .expect("target response");
     });
-    let streams = Arc::new(ServerReliableStreamRegistry::new(8)).path_port();
     let telemetry = RuntimeTelemetry::new(8);
-    let datagrams = ServerDatagramService::path_port(
-        OutboundConfig::Direct,
-        DnsConfig::default(),
-        Duration::from_secs(1),
-        MuxLimits::default(),
-        streams,
-        telemetry.clone(),
-    );
+    let datagrams = test_server_datagram_port(telemetry.clone());
     let (commands, mut command_rx) = reliable_path_command_channels(8);
     let flow_id = DatagramFlowId(21);
     let datagram_id = DatagramId(22);
@@ -54,11 +104,13 @@ async fn server_datagram_port_owns_target_connection_and_worker() {
         .expect("open target-side datagram flow");
 
     assert_eq!(
-        flow.try_send(ServerDatagramRequest {
+        flow.send(ServerDatagramRequest {
             datagram_id,
             ttl_ms: 1_000,
             payload: Bytes::from_static(b"request"),
-        }),
+        })
+        .await
+        .expect("admit target request"),
         ServerDatagramSendOutcome::Accepted,
     );
     assert!(matches!(
@@ -71,10 +123,11 @@ async fn server_datagram_port_owns_target_connection_and_worker() {
         Some(ReliablePathCommand::SendFrame(Frame::DatagramData {
             flow_id: response_flow_id,
             datagram_id: response_datagram_id,
-            ttl_ms: 1_000,
+            ttl_ms,
             payload,
         })) if response_flow_id == flow_id
-            && response_datagram_id == datagram_id
+            && response_datagram_id == DatagramId(0)
+            && ttl_ms > 0
             && payload == Bytes::from_static(b"response")
     ));
     let snapshot = telemetry.snapshot();
@@ -85,6 +138,741 @@ async fn server_datagram_port_owns_target_connection_and_worker() {
     assert_eq!(snapshot.datagram.flows.opened, 1);
     assert_eq!(snapshot.datagram.flows.active, 1);
     target_task.await.expect("UDP target task");
+}
+
+#[tokio::test]
+async fn distinct_client_datagrams_are_admitted_without_waiting_for_target_data() {
+    let target = UdpSocket::bind("127.0.0.1:0")
+        .await
+        .expect("bind UDP target");
+    let target_addr = target.local_addr().expect("UDP target address");
+    let (first_seen, first_seen_rx) = oneshot::channel();
+    let (second_seen, second_seen_rx) = oneshot::channel();
+    let target_task = tokio::spawn(async move {
+        let mut payload = [0_u8; 64];
+        let (first_len, _) = target
+            .recv_from(&mut payload)
+            .await
+            .expect("first target request");
+        assert_eq!(&payload[..first_len], b"first-request");
+        let _ = first_seen.send(());
+
+        let (second_len, _) = target
+            .recv_from(&mut payload)
+            .await
+            .expect("second target request");
+        assert_eq!(&payload[..second_len], b"second-request");
+        let _ = second_seen.send(());
+    });
+
+    let telemetry = RuntimeTelemetry::new(8);
+    let datagrams = test_server_datagram_port(telemetry.clone());
+    let (commands, _command_rx) = reliable_path_command_channels(8);
+    let flow = datagrams
+        .open(ServerDatagramOpenRequest {
+            session_id: SessionId(25),
+            flow_id: DatagramFlowId(26),
+            target: TargetAddr::Ip(target_addr),
+            commands,
+        })
+        .await
+        .expect("open target-side datagram flow");
+
+    assert_eq!(
+        flow.send(ServerDatagramRequest {
+            datagram_id: DatagramId(70),
+            ttl_ms: 1_000,
+            payload: Bytes::from_static(b"first-request"),
+        })
+        .await
+        .expect("admit first request"),
+        ServerDatagramSendOutcome::Accepted,
+    );
+    await_test_signal(first_seen_rx, "first request observation timeout").await;
+    assert_eq!(
+        flow.send(ServerDatagramRequest {
+            datagram_id: DatagramId(71),
+            ttl_ms: 1_000,
+            payload: Bytes::from_static(b"second-request"),
+        })
+        .await
+        .expect("admit second request"),
+        ServerDatagramSendOutcome::Accepted,
+    );
+    await_test_signal(second_seen_rx, "second request observation timeout").await;
+    target_task.await.expect("UDP target task");
+
+    let snapshot = telemetry.snapshot();
+    assert_eq!(snapshot.datagram.io.from_peer_packets, 2);
+    assert_eq!(snapshot.datagram.io.to_peer_packets, 0);
+}
+
+#[tokio::test]
+async fn one_client_datagram_forwards_all_target_datagrams_with_direction_local_ids() {
+    let target = UdpSocket::bind("127.0.0.1:0")
+        .await
+        .expect("bind UDP target");
+    let target_addr = target.local_addr().expect("UDP target address");
+    let (request_seen, request_seen_rx) = oneshot::channel();
+    let (release_responses, release_responses_rx) = oneshot::channel();
+    let target_task = tokio::spawn(async move {
+        let mut payload = [0_u8; 64];
+        let (len, peer) = target
+            .recv_from(&mut payload)
+            .await
+            .expect("target request");
+        assert_eq!(&payload[..len], b"request-with-two-responses");
+        let _ = request_seen.send(());
+        release_responses_rx
+            .await
+            .expect("release target responses");
+        target
+            .send_to(b"first-response", peer)
+            .await
+            .expect("first target response");
+        target
+            .send_to(b"second-response", peer)
+            .await
+            .expect("second target response");
+    });
+
+    let telemetry = RuntimeTelemetry::new(8);
+    let datagrams = test_server_datagram_port(telemetry.clone());
+    let (commands, mut command_rx) = reliable_path_command_channels(8);
+    let flow_id = DatagramFlowId(28);
+    let flow = datagrams
+        .open(ServerDatagramOpenRequest {
+            session_id: SessionId(27),
+            flow_id,
+            target: TargetAddr::Ip(target_addr),
+            commands,
+        })
+        .await
+        .expect("open target-side datagram flow");
+
+    assert_eq!(
+        flow.send(ServerDatagramRequest {
+            datagram_id: DatagramId(90),
+            ttl_ms: 1_000,
+            payload: Bytes::from_static(b"request-with-two-responses"),
+        })
+        .await
+        .expect("admit target request"),
+        ServerDatagramSendOutcome::Accepted,
+    );
+    await_test_signal(request_seen_rx, "target request observation timeout").await;
+    release_responses
+        .send(())
+        .expect("release target responses");
+
+    assert!(matches!(
+        tokio::time::timeout(Duration::from_secs(1), recv_reliable_path_command(&mut command_rx))
+            .await
+            .expect("first target response timeout"),
+        Some(ReliablePathCommand::SendFrame(Frame::DatagramData {
+            flow_id: response_flow_id,
+            datagram_id: DatagramId(0),
+            payload,
+            ..
+        })) if response_flow_id == flow_id
+            && payload == Bytes::from_static(b"first-response")
+    ));
+    assert!(matches!(
+        tokio::time::timeout(Duration::from_secs(1), recv_reliable_path_command(&mut command_rx))
+            .await
+            .expect("second target response timeout"),
+        Some(ReliablePathCommand::SendFrame(Frame::DatagramData {
+            flow_id: response_flow_id,
+            datagram_id: DatagramId(1),
+            payload,
+            ..
+        })) if response_flow_id == flow_id
+            && payload == Bytes::from_static(b"second-response")
+    ));
+    target_task.await.expect("UDP target task");
+
+    let snapshot = telemetry.snapshot();
+    assert_eq!(snapshot.datagram.io.from_peer_packets, 1);
+    assert_eq!(snapshot.datagram.io.to_peer_packets, 2);
+}
+
+#[tokio::test]
+async fn delayed_target_datagram_after_later_request_is_not_mislabeled() {
+    let target = UdpSocket::bind("127.0.0.1:0")
+        .await
+        .expect("bind UDP target");
+    let target_addr = target.local_addr().expect("UDP target address");
+    let (first_seen, first_seen_rx) = oneshot::channel();
+    let (second_seen, second_seen_rx) = oneshot::channel();
+    let (release_response, release_response_rx) = oneshot::channel();
+    let target_task = tokio::spawn(async move {
+        let mut payload = [0_u8; 64];
+        let (first_len, peer) = target
+            .recv_from(&mut payload)
+            .await
+            .expect("first target request");
+        assert_eq!(&payload[..first_len], b"first-request");
+        let _ = first_seen.send(());
+
+        let (second_len, second_peer) = target
+            .recv_from(&mut payload)
+            .await
+            .expect("second target request");
+        assert_eq!(second_peer, peer);
+        assert_eq!(&payload[..second_len], b"second-request");
+        let _ = second_seen.send(());
+
+        release_response_rx
+            .await
+            .expect("release delayed target response");
+        target
+            .send_to(b"delayed-first-response", peer)
+            .await
+            .expect("delayed target response");
+    });
+
+    let telemetry = RuntimeTelemetry::new(8);
+    let datagrams = test_server_datagram_port(telemetry);
+    let (commands, mut command_rx) = reliable_path_command_channels(8);
+    let flow_id = DatagramFlowId(30);
+    let flow = datagrams
+        .open(ServerDatagramOpenRequest {
+            session_id: SessionId(29),
+            flow_id,
+            target: TargetAddr::Ip(target_addr),
+            commands,
+        })
+        .await
+        .expect("open target-side datagram flow");
+
+    assert_eq!(
+        flow.send(ServerDatagramRequest {
+            datagram_id: DatagramId(100),
+            ttl_ms: 1_000,
+            payload: Bytes::from_static(b"first-request"),
+        })
+        .await
+        .expect("admit first request"),
+        ServerDatagramSendOutcome::Accepted,
+    );
+    await_test_signal(first_seen_rx, "first request observation timeout").await;
+    assert_eq!(
+        flow.send(ServerDatagramRequest {
+            datagram_id: DatagramId(101),
+            ttl_ms: 1_000,
+            payload: Bytes::from_static(b"second-request"),
+        })
+        .await
+        .expect("admit second request"),
+        ServerDatagramSendOutcome::Accepted,
+    );
+    await_test_signal(second_seen_rx, "second request observation timeout").await;
+    release_response
+        .send(())
+        .expect("release delayed target response");
+
+    assert!(matches!(
+        tokio::time::timeout(Duration::from_secs(1), recv_reliable_path_command(&mut command_rx))
+            .await
+            .expect("delayed target response timeout"),
+        Some(ReliablePathCommand::SendFrame(Frame::DatagramData {
+            flow_id: response_flow_id,
+            datagram_id: DatagramId(0),
+            payload,
+            ..
+        })) if response_flow_id == flow_id
+            && payload == Bytes::from_static(b"delayed-first-response")
+    ));
+    target_task.await.expect("UDP target task");
+}
+
+#[tokio::test]
+async fn same_client_datagram_across_attachments_is_forwarded_once() {
+    let target = UdpSocket::bind("127.0.0.1:0")
+        .await
+        .expect("bind UDP target");
+    let target_addr = target.local_addr().expect("UDP target address");
+    let (request_seen, request_seen_rx) = oneshot::channel();
+    let (release_response, release_response_rx) = oneshot::channel();
+    let target_task = tokio::spawn(async move {
+        let mut payload = [0_u8; 64];
+        let (len, peer) = target
+            .recv_from(&mut payload)
+            .await
+            .expect("target request");
+        assert_eq!(&payload[..len], b"same-request");
+        let _ = request_seen.send(());
+        release_response_rx.await.expect("release target response");
+        target
+            .send_to(b"same-response", peer)
+            .await
+            .expect("target response");
+        assert!(
+            tokio::time::timeout(Duration::from_millis(50), target.recv_from(&mut payload))
+                .await
+                .is_err(),
+            "cross-carrier retry must not execute the target twice"
+        );
+    });
+
+    let telemetry = RuntimeTelemetry::new(8);
+    let datagrams = test_server_datagram_port(telemetry.clone());
+    let (commands_a, mut command_rx_a) = reliable_path_command_channels(8);
+    let (commands_b, mut command_rx_b) = reliable_path_command_channels(8);
+    let session_id = SessionId(30);
+    let flow_id = DatagramFlowId(31);
+    let datagram_id = DatagramId(32);
+    let target = TargetAddr::Ip(target_addr);
+    let flow_a = datagrams
+        .open(ServerDatagramOpenRequest {
+            session_id,
+            flow_id,
+            target: target.clone(),
+            commands: commands_a,
+        })
+        .await
+        .expect("open first carrier attachment");
+    let flow_b = datagrams
+        .open(ServerDatagramOpenRequest {
+            session_id,
+            flow_id,
+            target,
+            commands: commands_b,
+        })
+        .await
+        .expect("open retry carrier attachment");
+
+    assert_eq!(
+        flow_a
+            .send(ServerDatagramRequest {
+                datagram_id,
+                ttl_ms: 1_000,
+                payload: Bytes::from_static(b"same-request"),
+            })
+            .await
+            .expect("admit first carrier request"),
+        ServerDatagramSendOutcome::Accepted,
+    );
+    await_test_signal(request_seen_rx, "target request observation timeout").await;
+    assert_eq!(
+        flow_b
+            .send(ServerDatagramRequest {
+                datagram_id,
+                ttl_ms: 900,
+                payload: Bytes::from_static(b"same-request"),
+            })
+            .await
+            .expect("admit retry carrier request"),
+        ServerDatagramSendOutcome::Accepted,
+    );
+    release_response.send(()).expect("release target response");
+
+    assert!(matches!(
+        tokio::time::timeout(Duration::from_secs(1), recv_reliable_path_command(&mut command_rx_b))
+            .await
+            .expect("retry response timeout"),
+        Some(ReliablePathCommand::SendFrame(Frame::DatagramData {
+            flow_id: response_flow_id,
+            datagram_id: response_datagram_id,
+            payload,
+            ..
+        })) if response_flow_id == flow_id
+            && response_datagram_id == DatagramId(0)
+            && payload == Bytes::from_static(b"same-response")
+    ));
+    assert!(
+        tokio::time::timeout(
+            Duration::from_millis(20),
+            recv_reliable_path_command(&mut command_rx_a),
+        )
+        .await
+        .is_err(),
+        "the response should use the most recently admitted carrier"
+    );
+    target_task.await.expect("target task");
+    let snapshot = telemetry.snapshot();
+    assert_eq!(snapshot.datagram.io.from_peer_packets, 1);
+    assert_eq!(snapshot.datagram.io.to_peer_packets, 1);
+}
+
+#[tokio::test]
+async fn cached_server_datagram_replay_preserves_direction_local_id() {
+    let target = UdpSocket::bind("127.0.0.1:0")
+        .await
+        .expect("bind UDP target");
+    let target_addr = target.local_addr().expect("UDP target address");
+    let target_task = tokio::spawn(async move {
+        let mut payload = [0_u8; 64];
+        let (len, peer) = target
+            .recv_from(&mut payload)
+            .await
+            .expect("target request");
+        assert_eq!(&payload[..len], b"cached-request");
+        target
+            .send_to(b"cached-response", peer)
+            .await
+            .expect("target response");
+    });
+
+    let telemetry = RuntimeTelemetry::new(8);
+    let datagrams = test_server_datagram_port(telemetry.clone());
+    let (commands_a, mut command_rx_a) = reliable_path_command_channels(8);
+    let (commands_b, mut command_rx_b) = reliable_path_command_channels(8);
+    let session_id = SessionId(40);
+    let flow_id = DatagramFlowId(41);
+    let datagram_id = DatagramId(42);
+    let target = TargetAddr::Ip(target_addr);
+    let flow_a = datagrams
+        .open(ServerDatagramOpenRequest {
+            session_id,
+            flow_id,
+            target: target.clone(),
+            commands: commands_a,
+        })
+        .await
+        .expect("open first carrier attachment");
+
+    assert_eq!(
+        flow_a
+            .send(ServerDatagramRequest {
+                datagram_id,
+                ttl_ms: 1_000,
+                payload: Bytes::from_static(b"cached-request"),
+            })
+            .await
+            .expect("admit first request"),
+        ServerDatagramSendOutcome::Accepted,
+    );
+    let first = tokio::time::timeout(
+        Duration::from_secs(1),
+        recv_reliable_path_command(&mut command_rx_a),
+    )
+    .await
+    .expect("first response timeout");
+    let first_response_id = match first {
+        Some(ReliablePathCommand::SendFrame(Frame::DatagramData {
+            datagram_id,
+            payload,
+            ..
+        })) if payload == Bytes::from_static(b"cached-response") => datagram_id,
+        _ => panic!("unexpected first target response"),
+    };
+    assert_eq!(first_response_id, DatagramId(0));
+
+    let _flow_b = datagrams
+        .open(ServerDatagramOpenRequest {
+            session_id,
+            flow_id,
+            target,
+            commands: commands_b,
+        })
+        .await
+        .expect("open retry carrier attachment");
+    assert!(matches!(
+        tokio::time::timeout(Duration::from_secs(1), recv_reliable_path_command(&mut command_rx_b))
+            .await
+            .expect("cached response timeout"),
+        Some(ReliablePathCommand::SendFrame(Frame::DatagramData {
+            flow_id: response_flow_id,
+            datagram_id: response_datagram_id,
+            payload,
+            ..
+        })) if response_flow_id == flow_id
+            && response_datagram_id == first_response_id
+            && payload == Bytes::from_static(b"cached-response")
+    ));
+    target_task.await.expect("target task");
+    let snapshot = telemetry.snapshot();
+    assert_eq!(snapshot.datagram.io.from_peer_packets, 1);
+    assert_eq!(snapshot.datagram.io.to_peer_packets, 1);
+}
+
+#[tokio::test]
+async fn same_client_datagram_id_with_different_payload_is_rejected() {
+    let target = UdpSocket::bind("127.0.0.1:0")
+        .await
+        .expect("bind UDP target");
+    let target_addr = target.local_addr().expect("UDP target address");
+    let (request_seen, request_seen_rx) = oneshot::channel();
+    let (check_duplicate, check_duplicate_rx) = oneshot::channel();
+    let target_task = tokio::spawn(async move {
+        let mut payload = [0_u8; 64];
+        let (len, _) = target
+            .recv_from(&mut payload)
+            .await
+            .expect("target request");
+        assert_eq!(&payload[..len], b"original-payload");
+        let _ = request_seen.send(());
+        check_duplicate_rx
+            .await
+            .expect("check for duplicate target request");
+        assert!(
+            tokio::time::timeout(Duration::from_millis(50), target.recv_from(&mut payload))
+                .await
+                .is_err(),
+            "payload-mismatched retry must not execute the target"
+        );
+    });
+
+    let telemetry = RuntimeTelemetry::new(8);
+    let datagrams = test_server_datagram_port(telemetry.clone());
+    let (commands_a, _command_rx_a) = reliable_path_command_channels(8);
+    let (commands_b, _command_rx_b) = reliable_path_command_channels(8);
+    let session_id = SessionId(45);
+    let flow_id = DatagramFlowId(46);
+    let datagram_id = DatagramId(47);
+    let target = TargetAddr::Ip(target_addr);
+    let flow_a = datagrams
+        .open(ServerDatagramOpenRequest {
+            session_id,
+            flow_id,
+            target: target.clone(),
+            commands: commands_a,
+        })
+        .await
+        .expect("open first carrier attachment");
+    let flow_b = datagrams
+        .open(ServerDatagramOpenRequest {
+            session_id,
+            flow_id,
+            target,
+            commands: commands_b,
+        })
+        .await
+        .expect("open second carrier attachment");
+
+    assert_eq!(
+        flow_a
+            .send(ServerDatagramRequest {
+                datagram_id,
+                ttl_ms: 1_000,
+                payload: Bytes::from_static(b"original-payload"),
+            })
+            .await
+            .expect("admit original request"),
+        ServerDatagramSendOutcome::Accepted,
+    );
+    await_test_signal(request_seen_rx, "target request observation timeout").await;
+    let error = flow_b
+        .send(ServerDatagramRequest {
+            datagram_id,
+            ttl_ms: 900,
+            payload: Bytes::from_static(b"different-payload"),
+        })
+        .await
+        .expect_err("payload-mismatched datagram ID reuse must fail");
+    assert!(matches!(
+        error,
+        RuntimeError::Protocol("datagram ID reused with a different payload")
+    ));
+    check_duplicate
+        .send(())
+        .expect("check for duplicate target request");
+    target_task.await.expect("UDP target task");
+
+    let snapshot = telemetry.snapshot();
+    assert_eq!(snapshot.datagram.io.from_peer_packets, 1);
+}
+
+#[tokio::test]
+async fn cached_target_datagram_is_delivered_when_live_route_capacity_returns() {
+    let target = UdpSocket::bind("127.0.0.1:0")
+        .await
+        .expect("bind UDP target");
+    let target_addr = target.local_addr().expect("UDP target address");
+    let (request_seen, request_seen_rx) = oneshot::channel();
+    let (release_response, release_response_rx) = oneshot::channel();
+    let target_task = tokio::spawn(async move {
+        let mut payload = [0_u8; 64];
+        let (len, peer) = target
+            .recv_from(&mut payload)
+            .await
+            .expect("target request");
+        assert_eq!(&payload[..len], b"capacity-request");
+        let _ = request_seen.send(());
+        release_response_rx.await.expect("release target response");
+        target
+            .send_to(b"cached-until-capacity", peer)
+            .await
+            .expect("target response");
+    });
+
+    let telemetry = RuntimeTelemetry::new(8);
+    let datagrams = test_server_datagram_port(telemetry.clone());
+    let (commands, mut command_rx) = reliable_path_command_channels(1);
+    let flow_id = DatagramFlowId(48);
+    let flow = datagrams
+        .open(ServerDatagramOpenRequest {
+            session_id: SessionId(47),
+            flow_id,
+            target: TargetAddr::Ip(target_addr),
+            commands: commands.clone(),
+        })
+        .await
+        .expect("open target-side datagram flow");
+    assert_eq!(
+        flow.send(ServerDatagramRequest {
+            datagram_id: DatagramId(49),
+            ttl_ms: 1_000,
+            payload: Bytes::from_static(b"capacity-request"),
+        })
+        .await
+        .expect("admit target request"),
+        ServerDatagramSendOutcome::Accepted,
+    );
+    await_test_signal(request_seen_rx, "target request observation timeout").await;
+
+    commands
+        .try_enqueue_admitted_frame(
+            Frame::DatagramData {
+                flow_id,
+                datagram_id: DatagramId(900),
+                ttl_ms: 1_000,
+                payload: Bytes::from_static(b"queue-filler"),
+            },
+            TrafficClass::RealtimeDatagram,
+        )
+        .expect("fill live response route");
+    release_response.send(()).expect("release target response");
+    await_datagram_to_peer_packets(&telemetry, 1, "target response was not cached").await;
+    tokio::task::yield_now().await;
+
+    let filler = recv_reliable_path_command(&mut command_rx)
+        .await
+        .expect("queued route filler");
+    assert!(matches!(
+        &filler,
+        ReliablePathCommand::SendFrame(Frame::DatagramData {
+            datagram_id: DatagramId(900),
+            payload,
+            ..
+        }) if payload == &Bytes::from_static(b"queue-filler")
+    ));
+    command_rx.release_pending_command_bytes(reliable_path_command_pending_bytes(&filler));
+
+    assert!(matches!(
+        tokio::time::timeout(
+            Duration::from_secs(1),
+            recv_reliable_path_command(&mut command_rx),
+        )
+        .await
+        .expect("cached target response capacity wakeup"),
+        Some(ReliablePathCommand::SendFrame(Frame::DatagramData {
+            flow_id: response_flow_id,
+            datagram_id: DatagramId(0),
+            payload,
+            ..
+        })) if response_flow_id == flow_id
+            && payload == Bytes::from_static(b"cached-until-capacity")
+    ));
+    target_task.await.expect("UDP target task");
+}
+
+#[tokio::test]
+async fn attachment_drop_starts_full_retention_and_target_traffic_does_not_extend_it() {
+    let retention = Duration::from_millis(200);
+    let target = Arc::new(
+        UdpSocket::bind("127.0.0.1:0")
+            .await
+            .expect("bind UDP target"),
+    );
+    let target_addr = target.local_addr().expect("UDP target address");
+    let target_receiver = target.clone();
+    let (peer_tx, peer_rx) = oneshot::channel();
+    let target_task = tokio::spawn(async move {
+        let mut payload = [0_u8; 64];
+        let (len, peer) = target_receiver
+            .recv_from(&mut payload)
+            .await
+            .expect("initial target request");
+        assert_eq!(&payload[..len], b"initial-request");
+        let _ = peer_tx.send(peer);
+    });
+
+    let telemetry = RuntimeTelemetry::new(8);
+    let datagrams = test_server_datagram_port_with_retention(telemetry.clone(), retention);
+    let (commands, _command_rx) = reliable_path_command_channels(8);
+    let session_id = SessionId(50);
+    let flow_id = DatagramFlowId(51);
+    let target_address = TargetAddr::Ip(target_addr);
+    let flow = datagrams
+        .open(ServerDatagramOpenRequest {
+            session_id,
+            flow_id,
+            target: target_address.clone(),
+            commands,
+        })
+        .await
+        .expect("open target-side datagram flow");
+    assert_eq!(
+        flow.send(ServerDatagramRequest {
+            datagram_id: DatagramId(52),
+            ttl_ms: 1_000,
+            payload: Bytes::from_static(b"initial-request"),
+        })
+        .await
+        .expect("admit initial target request"),
+        ServerDatagramSendOutcome::Accepted,
+    );
+    let peer = tokio::time::timeout(Duration::from_secs(1), peer_rx)
+        .await
+        .expect("initial target request timeout")
+        .expect("initial target peer");
+    target_task.await.expect("UDP target task");
+
+    tokio::time::sleep(retention + Duration::from_millis(20)).await;
+    assert_eq!(
+        flow.send(ServerDatagramRequest {
+            datagram_id: DatagramId(53),
+            ttl_ms: 1_000,
+            payload: Bytes::from_static(b"post-timer-request"),
+        })
+        .await
+        .expect("admit request after original retention timer"),
+        ServerDatagramSendOutcome::Accepted,
+    );
+    tokio::time::sleep(Duration::from_millis(120)).await;
+    let dropped_at = tokio::time::Instant::now();
+    drop(flow);
+
+    tokio::time::sleep_until(dropped_at + Duration::from_millis(30)).await;
+    target
+        .send_to(b"detached-target-traffic-one", peer)
+        .await
+        .expect("first detached target datagram");
+    await_datagram_to_peer_packets(&telemetry, 1, "first detached target datagram timeout").await;
+
+    tokio::time::sleep_until(dropped_at + Duration::from_millis(100)).await;
+    target
+        .send_to(b"detached-target-traffic-two", peer)
+        .await
+        .expect("second detached target datagram");
+    await_datagram_to_peer_packets(&telemetry, 2, "second detached target datagram timeout").await;
+
+    tokio::time::sleep_until(dropped_at + Duration::from_millis(140)).await;
+    let retained = telemetry.snapshot();
+    assert_eq!(retained.datagram.flows.opened, 1);
+    assert_eq!(retained.datagram.flows.active, 1);
+
+    tokio::time::sleep_until(dropped_at + Duration::from_millis(260)).await;
+    await_active_datagram_flows(&telemetry, 0, "detached datagram flow did not expire").await;
+    let expired = telemetry.snapshot();
+    assert_eq!(expired.datagram.flows.opened, 1);
+    assert_eq!(expired.datagram.flows.completed, 1);
+
+    let (replacement_commands, _replacement_command_rx) = reliable_path_command_channels(8);
+    let _replacement = datagrams
+        .open(ServerDatagramOpenRequest {
+            session_id,
+            flow_id,
+            target: target_address,
+            commands: replacement_commands,
+        })
+        .await
+        .expect("open replacement after retained flow expiry");
+    let replacement = telemetry.snapshot();
+    assert_eq!(replacement.datagram.flows.opened, 2);
+    assert_eq!(replacement.datagram.flows.active, 1);
 }
 
 #[tokio::test]
@@ -132,6 +920,58 @@ async fn datagram_response_queue_full_is_realtime_backpressure() {
         .is_err(),
         "blocked datagram response must not enqueue another frame"
     );
+}
+
+#[tokio::test]
+async fn datagram_response_waits_for_queue_capacity_before_its_deadline() {
+    let flow_id = DatagramFlowId(14);
+    let (commands, mut command_rx) = reliable_path_command_channels(1);
+    commands
+        .try_enqueue_admitted_frame(
+            Frame::DatagramData {
+                flow_id,
+                datagram_id: DatagramId(1),
+                ttl_ms: 1_000,
+                payload: Bytes::from_static(b"queued"),
+            },
+            TrafficClass::RealtimeDatagram,
+        )
+        .expect("prefill realtime queue");
+
+    let waiting_commands = commands.clone();
+    let waiting = tokio::spawn(async move {
+        send_server_datagram_realtime_frame_until(
+            &waiting_commands,
+            Frame::DatagramData {
+                flow_id,
+                datagram_id: DatagramId(2),
+                ttl_ms: 1_000,
+                payload: Bytes::from_static(b"later"),
+            },
+            tokio::time::Instant::now() + Duration::from_secs(1),
+        )
+        .await
+    });
+    tokio::task::yield_now().await;
+    assert!(!waiting.is_finished());
+
+    let queued = recv_reliable_path_command(&mut command_rx)
+        .await
+        .expect("first queued response");
+    command_rx.release_pending_command_bytes(reliable_path_command_pending_bytes(&queued));
+    tokio::time::timeout(Duration::from_millis(200), waiting)
+        .await
+        .expect("queue capacity wakeup")
+        .expect("response admission task")
+        .expect("response admitted before deadline");
+    assert!(matches!(
+        recv_reliable_path_command(&mut command_rx).await,
+        Some(ReliablePathCommand::SendFrame(Frame::DatagramData {
+            datagram_id: DatagramId(2),
+            payload,
+            ..
+        })) if payload == Bytes::from_static(b"later")
+    ));
 }
 
 #[tokio::test]

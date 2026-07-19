@@ -1,44 +1,13 @@
 use super::{
-    ReliablePathCommand, recv_reliable_path_command, reliable_path_command_carrier_credit_bytes,
-    reliable_path_command_channels, reliable_path_command_channels_with_send_credit,
+    ReliablePathCommand, recv_reliable_path_command, reliable_path_command_channels,
     reliable_path_command_pending_bytes, reliable_path_effective_frame_lane,
     reliable_path_frame_uses_priority_queue, try_recv_reliable_path_command,
 };
 use crate::protocol::{
     DatagramFlowId, Frame, PathId, PathUsage, ResetReason, StreamDemandHint, StreamId, TargetAddr,
 };
-use crate::runtime::path::send_credit::{
-    CarrierSendCredit, CarrierSendCreditSnapshot, CarrierSendCreditSource,
-};
 use crate::scheduler::TrafficClass;
 use bytes::Bytes;
-use std::sync::{
-    Arc,
-    atomic::{AtomicBool, AtomicU64, Ordering},
-};
-use tokio::sync::Notify;
-
-#[derive(Debug, Default)]
-struct TestCarrierSendCreditSource {
-    limit_bytes: AtomicU64,
-    committed_bytes: AtomicU64,
-    closed: AtomicBool,
-    notify: Arc<Notify>,
-}
-
-impl CarrierSendCreditSource for TestCarrierSendCreditSource {
-    fn snapshot(&self) -> CarrierSendCreditSnapshot {
-        CarrierSendCreditSnapshot {
-            limit_bytes: self.limit_bytes.load(Ordering::Acquire),
-            committed_bytes: self.committed_bytes.load(Ordering::Acquire),
-            closed: self.closed.load(Ordering::Acquire),
-        }
-    }
-
-    fn notify(&self) -> Arc<Notify> {
-        self.notify.clone()
-    }
-}
 
 fn stream_data_frame(stream_id: u64, bytes: usize) -> Frame {
     Frame::StreamData {
@@ -46,6 +15,36 @@ fn stream_data_frame(stream_id: u64, bytes: usize) -> Frame {
         offset: 0,
         payload: Bytes::from(vec![0; bytes]),
     }
+}
+
+fn datagram_data_frame(datagram_id: u64, bytes: usize) -> Frame {
+    Frame::DatagramData {
+        flow_id: DatagramFlowId(1),
+        datagram_id: crate::protocol::DatagramId(datagram_id),
+        ttl_ms: 1_000,
+        payload: Bytes::from(vec![0; bytes]),
+    }
+}
+
+#[test]
+fn ordered_writer_flow_load_tracks_lane_changes_and_lifetime() {
+    let (commands, _receivers) = reliable_path_command_channels(1);
+    assert_eq!(commands.active_flow_counts(), (0, 0));
+
+    let throughput = commands.register_flow(TrafficClass::Throughput);
+    let latency = commands.register_flow(TrafficClass::Latency);
+    assert_eq!(commands.active_flow_counts(), (2, 1));
+
+    throughput.set_lane(TrafficClass::Latency);
+    assert_eq!(commands.active_flow_counts(), (2, 2));
+
+    latency.deactivate();
+    assert_eq!(commands.active_flow_counts(), (1, 1));
+    drop(latency);
+    assert_eq!(commands.active_flow_counts(), (1, 1));
+
+    drop(throughput);
+    assert_eq!(commands.active_flow_counts(), (0, 0));
 }
 
 #[test]
@@ -185,16 +184,10 @@ async fn terminal_reset_and_close_uses_one_ordered_queue_item() {
 }
 
 #[tokio::test]
-async fn control_close_discards_stale_stream_data_and_releases_carrier_credit() {
+async fn control_close_discards_stale_stream_data_and_releases_queue_bytes() {
     let closed_stream = StreamId(20);
     let live_stream = StreamId(21);
-    let source = Arc::new(TestCarrierSendCreditSource::default());
-    source.limit_bytes.store(128 * 1024, Ordering::Release);
-    let credit = CarrierSendCredit::new(source);
-    let (commands, mut receivers) =
-        reliable_path_command_channels_with_send_credit(4, credit.clone());
-    let (observer, _observer_receivers) =
-        reliable_path_command_channels_with_send_credit(1, credit);
+    let (commands, mut receivers) = reliable_path_command_channels(4);
 
     commands
         .try_enqueue_stream_ordered_frame(
@@ -208,8 +201,6 @@ async fn control_close_discards_stale_stream_data_and_releases_carrier_credit() 
             TrafficClass::Throughput,
         )
         .expect("queue live sibling data");
-    assert!(!observer.can_enqueue_stream_ordered_frame_now(TrafficClass::Throughput));
-
     commands
         .send_control(ReliablePathCommand::CloseStream(closed_stream))
         .await
@@ -227,14 +218,12 @@ async fn control_close_discards_stale_stream_data_and_releases_carrier_credit() 
         ReliablePathCommand::SendFrame(Frame::StreamData { stream_id, .. })
             if *stream_id == live_stream
     ));
-    assert!(
-        observer.can_enqueue_stream_ordered_frame_now(TrafficClass::Throughput),
-        "discarding stale data must return its native carrier reservation"
+    assert_eq!(
+        commands.pending_bytes(),
+        reliable_path_command_pending_bytes(&live) as u64,
+        "discarding stale data must return its queue byte charge"
     );
-    receivers.release_pending_command_accounting(
-        reliable_path_command_pending_bytes(&live),
-        reliable_path_command_carrier_credit_bytes(&live),
-    );
+    receivers.release_pending_command_bytes(reliable_path_command_pending_bytes(&live));
     assert_eq!(commands.pending_bytes(), 0);
 }
 
@@ -286,37 +275,65 @@ async fn cancelling_waiting_terminal_reset_releases_queue_debt() {
 }
 
 #[tokio::test]
-async fn connection_scoped_credit_is_shared_across_stream_queues() {
-    let source = Arc::new(TestCarrierSendCreditSource::default());
-    source.limit_bytes.store(14_600, Ordering::Release);
-    let credit = CarrierSendCredit::new(source);
-    let (first, mut first_rx) = reliable_path_command_channels_with_send_credit(4, credit.clone());
-    let (second, _second_rx) = reliable_path_command_channels_with_send_credit(4, credit);
+async fn deadline_admission_wakes_after_queue_release() {
+    let (commands, mut receivers) = reliable_path_command_channels(1);
+    commands
+        .try_enqueue_admitted_frame(datagram_data_frame(1, 512), TrafficClass::RealtimeDatagram)
+        .expect("fill realtime queue");
 
-    first
-        .try_enqueue_stream_ordered_frame(
-            stream_data_frame(10, 64 * 1024),
-            TrafficClass::Throughput,
-        )
-        .expect("first stream reserves the open native window");
-    assert!(!second.can_enqueue_stream_ordered_frame_now(TrafficClass::Throughput));
+    let waiting_commands = commands.clone();
+    let waiting = tokio::spawn(async move {
+        waiting_commands
+            .enqueue_admitted_frame_until(
+                datagram_data_frame(2, 512),
+                TrafficClass::RealtimeDatagram,
+                tokio::time::Instant::now() + std::time::Duration::from_secs(1),
+            )
+            .await
+    });
+    tokio::task::yield_now().await;
+    assert!(!waiting.is_finished());
+
+    let first = recv_reliable_path_command(&mut receivers)
+        .await
+        .expect("first realtime datagram");
+    receivers.release_pending_command_bytes(reliable_path_command_pending_bytes(&first));
+    tokio::time::timeout(std::time::Duration::from_millis(200), waiting)
+        .await
+        .expect("queue admission wakeup")
+        .expect("admission task")
+        .expect("realtime datagram admission");
+    let datagram = recv_reliable_path_command(&mut receivers)
+        .await
+        .expect("admitted realtime datagram");
     assert!(matches!(
-        second.try_enqueue_stream_ordered_frame(
-            stream_data_frame(11, 64 * 1024),
-            TrafficClass::Throughput,
-        ),
+        datagram,
+        ReliablePathCommand::SendFrame(Frame::DatagramData {
+            datagram_id: crate::protocol::DatagramId(2),
+            ..
+        })
+    ));
+}
+
+#[tokio::test]
+async fn deadline_admission_expires_when_priority_headroom_stays_full() {
+    let (commands, _receivers) = reliable_path_command_channels(1);
+    commands
+        .try_enqueue_admitted_frame(datagram_data_frame(2, 512), TrafficClass::RealtimeDatagram)
+        .expect("fill bounded realtime queue");
+
+    let result = commands
+        .enqueue_admitted_frame_until(
+            datagram_data_frame(3, 512),
+            TrafficClass::RealtimeDatagram,
+            tokio::time::Instant::now() + std::time::Duration::from_millis(20),
+        )
+        .await;
+
+    assert!(matches!(
+        result,
         Err(crate::runtime::RuntimeError::SenderServiceBlocked)
     ));
-
-    let command = recv_reliable_path_command(&mut first_rx)
-        .await
-        .expect("first credited frame");
-    assert!(!second.can_enqueue_stream_ordered_frame_now(TrafficClass::Throughput));
-    first_rx.release_pending_command_accounting(
-        reliable_path_command_pending_bytes(&command),
-        reliable_path_command_carrier_credit_bytes(&command),
-    );
-    assert!(second.can_enqueue_stream_ordered_frame_now(TrafficClass::Throughput));
 }
 
 #[test]
@@ -363,59 +380,4 @@ fn reinjection_headroom_is_bounded() {
         commands.try_enqueue_reinjection_frame(second, TrafficClass::Throughput),
         Err(crate::runtime::RuntimeError::SenderServiceBlocked)
     ));
-}
-
-#[test]
-fn reinjection_still_requires_native_carrier_credit() {
-    let source = Arc::new(TestCarrierSendCreditSource::default());
-    source.limit_bytes.store(64 * 1024, Ordering::Release);
-    source.committed_bytes.store(64 * 1024, Ordering::Release);
-    let (commands, _receivers) =
-        reliable_path_command_channels_with_send_credit(4, CarrierSendCredit::new(source));
-    let repair = stream_data_frame(44, 4096);
-
-    assert!(!commands.can_enqueue_reinjection_frame_now(&repair));
-    assert!(matches!(
-        commands.try_enqueue_reinjection_frame(repair, TrafficClass::Throughput),
-        Err(crate::runtime::RuntimeError::SenderServiceBlocked)
-    ));
-}
-
-#[test]
-fn dropped_atomic_frame_reservation_returns_carrier_credit() {
-    let source = Arc::new(TestCarrierSendCreditSource::default());
-    source.limit_bytes.store(64 * 1024, Ordering::Release);
-    let credit = CarrierSendCredit::new(source);
-    let (first, _first_rx) = reliable_path_command_channels_with_send_credit(4, credit.clone());
-    let (second, _second_rx) = reliable_path_command_channels_with_send_credit(4, credit);
-
-    let reservation = first
-        .try_reserve_stream_ordered_frame(
-            stream_data_frame(20, 64 * 1024),
-            TrafficClass::Throughput,
-        )
-        .expect("reserve queue and carrier credit");
-    assert!(!second.can_enqueue_stream_ordered_frame_now(TrafficClass::Throughput));
-    drop(reservation);
-    assert!(second.can_enqueue_stream_ordered_frame_now(TrafficClass::Throughput));
-}
-
-#[test]
-fn zero_byte_control_remains_admissible_when_native_data_window_is_closed() {
-    let source = Arc::new(TestCarrierSendCreditSource::default());
-    source.limit_bytes.store(64 * 1024, Ordering::Release);
-    source.committed_bytes.store(64 * 1024, Ordering::Release);
-    let (commands, _receivers) =
-        reliable_path_command_channels_with_send_credit(4, CarrierSendCredit::new(source));
-    let ack = Frame::StreamAck {
-        stream_id: StreamId(30),
-        complete: false,
-        ranges: Vec::new(),
-    };
-
-    assert!(commands.can_enqueue_frame_now(&ack, TrafficClass::Control));
-    commands
-        .try_enqueue_admitted_frame(ack, TrafficClass::Control)
-        .expect("control does not consume carrier data credit");
-    assert!(!commands.can_enqueue_stream_ordered_frame_now(TrafficClass::Throughput));
 }

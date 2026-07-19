@@ -1,8 +1,7 @@
 # Architecture and ownership
 
 This document maps the current source tree and design choices to the MPP
-protocol model. `RFC.md` is the wire and behavioral specification, and
-`docs/CODE_STRUCTURE.md` defines repository rules.
+protocol model. `RFC.md` is the wire and behavioral specification.
 
 ## Layer model
 
@@ -37,7 +36,7 @@ and liveness mechanics, while the path layer exposes one prepared-connection
 lifecycle and records only the authenticated exchange as RTT, not connection
 setup time.
 
-## Protocol-v2 model
+## Protocol-v3 model
 
 `OPEN_STREAM` contains only `stream_id`, `target`, and initial `demand`. Opening
 or attaching a stream does not assign a persistent primary, validation, or
@@ -70,7 +69,7 @@ the stream or relabeling a path.
 A module exists when it owns a durable state machine, algorithm, protocol
 boundary, or adapter. File size alone does not earn a module.
 
-- `src/protocol/`: bounded protocol-v2 codec, wire values, authentication, and
+- `src/protocol/`: bounded protocol-v3 codec, wire values, authentication, and
   range semantics. It owns no sockets or scheduling policy.
 - `src/model/`: carrier-neutral identities, evidence, capacity, admission, ACK
   clock, connection-flight, and work models. Pure TCP proof candidate
@@ -83,7 +82,8 @@ boundary, or adapter. File size alone does not earn a module.
   offsets or path placement.
 - `src/runtime/path/`: configured paths, health and metric publication, path
   instances, command queues, proofs, selection, and typed ports.
-- `src/runtime/path/tcp/`: TCP connection actors, reads/writes, heartbeats,
+- `src/runtime/path/tcp/`: one shared actor per configured TCP path, including
+  path control, streams, datagrams, the single reader/writer, heartbeats,
   optional socket evidence, and TCP-specific capacity transactions.
 - `src/runtime/path/quic/`: Quinn connection and stream actors, datagrams,
   native measurements, and native congestion-window publication.
@@ -101,7 +101,7 @@ boundary, or adapter. File size alone does not earn a module.
 - `src/runtime/stream/response/`: response `ack_clock`, `attachment`,
   `data_commit`, `delivery`, `diagnostics`, `evidence`, `session`,
   and `snapshot` state. These are the only current response
-  owners; deleted pre-v2 wrapper modules are not part of the current tree.
+  owners; deleted legacy wrapper modules are not part of the current tree.
 - `src/runtime/relay/`: ingress/target I/O, carrier open/attach transactions,
   failure recovery, and coordination with senders. The stream layer owns the
   resulting membership set; sender does not import relay state or policy.
@@ -162,16 +162,16 @@ overlapping queued copies are suppressed, live-tail and persistent-gap work use
 a distinct output, and all exception bytes remain charged against later
 optional reinjection.
 
-Recovery timing follows the evidence owner: exact path-instance failure is
-immediate, an authoritative lowest missing Data Sequence frontier must persist
-for three owner-carrier recovery intervals, and a contiguous live tail may send
-one bounded probe after one such interval but waits three intervals before
-repeating without progress. TCP uses RTO while QUIC uses PTO. Growth of the ACK
-horizon above the same frontier does not restart the timer. A request carrier
-with no exact Data ACK progress becomes stale for new placement after four TCP
-RTOs or three QUIC PTOs when an alternative exists, without stopping its native
-recovery. These are MPP data-level policies; native TCP and QUIC recovery
-timers remain independent.
+Recovery timing follows the evidence owner. Exact path-instance failure is
+immediate. A complete Data ACK establishes gaps; positive partial ACK ranges
+may extend that state but cannot infer omitted ranges. Fragmented request
+feedback waits one owner RTO/PTO from first authoritative gap observation.
+Response feedback may use a later-ACK TCP RACK 5/4-SRTT or QUIC 9/8-SRTT time
+threshold, while ACK silence waits the owner RTO/PTO. A contiguous live tail
+may send one bounded probe per recovery interval without progress. A request
+carrier with no exact Data ACK progress becomes stale for new placement after
+four TCP RTOs or three QUIC PTOs when an alternative exists, without stopping
+its native recovery.
 
 ## Scheduling contract
 
@@ -228,21 +228,27 @@ fence, not a duplicated ledger field. Replacing a carrier invalidates physical
 evidence, while detach and reattach invalidates that stream's ownership even if
 the carrier itself stayed live.
 
-One configured reliable TCP path owns one live carrier actor. `TrafficClass`
-changes queue priority and scheduling demand; it never creates a second hidden
-carrier with the same logical identity. TCP datagram associations use separate
-short-lived sessions and keep their `PATH_STATUS` sequence locally, so they do
-not replace the reliable carrier's physical identity.
+One configured TCP path owns at most one live carrier actor and physical
+instance. That actor multiplexes path control, reliable-stream attachments, and
+datagram-flow attachments through one encrypted reader/writer and one
+`PATH_STATUS` sequence. `TrafficClass` changes priority and demand only.
+Product close or detach removes only its route or attachment; the actor alone
+owns path and session close.
 
 Datagram failover keeps timing ownership below the carrier-neutral association.
 TCP and QUIC each derive a modeled pre-feedback response timeout from their own
 observations. If another ranked attempt remains, the association reserves it by
 ending the first attempt without feedback after one such timeout; the final
 attempt retains a three-timeout loss-tolerance budget. QUIC's attempted-path
-set and TCP's replacement opener both exclude the configured path already used
-by the request. Matching datagram feedback moves the request to admitted state,
-extends response waiting to the absolute product TTL, and makes cross-carrier
-replay terminal.
+set and the TCP attachment opener both exclude the configured path already used
+by the request. The carrier-neutral association allocates one
+`(session_id, flow_id, direction, datagram_id)` request identity before
+selection and preserves it for every carrier attempt. The server target worker
+owns an independent response-ID space and replay state. The server registry
+attaches attempts to one target socket and actor, suppresses duplicate target
+execution, and keeps a bounded response replay for the retry carrier. Matching
+datagram feedback moves the request to admitted state, extends response waiting
+to the absolute product TTL, and makes further cross-carrier replay terminal.
 
 The initiator chooses the wire `path_id`; the receiver treats it as opaque.
 Node composition retains the accepting listener's endpoint-local configuration
@@ -256,6 +262,14 @@ exact carrier instance. It does not own the target connection or assign a
 persistent data role. On the server, one session registry owns the target
 stream binding; TCP and QUIC carrier actors attach to that binding through
 typed ports and never create duplicate target relays.
+
+A product `STREAM_FIN` declares a final Data Sequence offset and remains
+pending until the contiguous receive frontier reaches it. An offset behind any
+received data is invalid, and later data cannot extend beyond an accepted final
+offset. FIN does not remove the TCP or QUIC attachment, and post-FIN repair
+below that offset remains valid.
+`STREAM_DETACH` removes one attachment; `STREAM_RESET` terminates the logical
+stream. Native TCP EOF terminates its physical carrier.
 
 A bidirectional QUIC stream has independent send and receive ownership. Native
 FIN on one half neither completes the MPP stream nor substitutes for product
@@ -274,11 +288,12 @@ Shared locks protect one coherent aggregate. Scheduling does not hold them
 while doing I/O. Hot frame and ACK paths use local actor state or immutable
 snapshots rather than a session-wide lock for each packet.
 
-The authenticated TCP path session is its control channel. QUIC retains the
-first authenticated bidirectional stream as a connection control stream and
-uses later streams for product flows. Peer status uses these existing
-channels symmetrically; it does not create a diagnostic transport or convert
-remote observations into local path evidence.
+The single authenticated TCP connection multiplexes path-control,
+reliable-stream, and datagram frames. QUIC retains the first authenticated
+bidirectional stream as a connection control stream and uses later streams for
+product flows. Peer status uses these existing channels symmetrically; it does
+not create a diagnostic transport or convert remote observations into local
+path evidence.
 
 The response output carrying the contiguous Data Sequence frontier is governed
 by the shared MPP receive window and native carrier credit. An additional
@@ -288,13 +303,13 @@ reach the startup sample floor before that additional output uses the mature
 connection-window model. Native TCP ACK or QUIC packet-ACK evidence can
 describe carrier service, but cannot by itself establish MPP progress.
 
-The long-lived reliable-carrier owner publishes an unexpected loss with the
-exact physical instance immediately. Relay cleanup can observe the same loss
-later, but the duplicate remains retired even if a separate reachability probe
-recovers logical path health. A newer authenticated carrier installation
-supersedes older reports, so delayed status or teardown cannot poison its health
-projection. TCP datagram associations report their own attempt failures through
-the association owner rather than claiming another carrier's lifetime.
+The long-lived path actor publishes loss for its exact physical instance.
+Relay cleanup can observe the same loss later, but the duplicate remains
+retired even if a separate reachability probe recovers logical path health. A
+newer authenticated carrier installation supersedes older reports, so delayed
+status or teardown cannot poison its health projection. A TCP datagram
+association owns attempt timeout, retry, and attachment release; it does not
+create, close, or independently report loss for a second physical TCP carrier.
 
 ## Platform boundary
 
@@ -340,7 +355,7 @@ not mint either proof.
 Deterministic simulator and benchmark gates test models, not the deployed
 runtime. Runtime changes require focused tests plus matched end-to-end labs:
 
-- single path against direct and applicable VMess/Hysteria2/MPTCP baselines;
+- single-path controls under the same topology and traffic conditions;
 - multipath aggregation and failover;
 - upload and download;
 - latency-sensitive and sustained bulk demand;
@@ -348,5 +363,5 @@ runtime. Runtime changes require focused tests plus matched end-to-end labs:
 - shaped, unconstrained, fault, and separately recorded real-Internet cohorts.
 
 Diagnostics establish causality. Instrumentation-free matched rows establish
-performance. Historical protocol-v1 rows are references only and cannot prove
-protocol-v2 behavior.
+performance. Historical rows from incompatible wire versions are references
+only and cannot prove protocol-v3 behavior.

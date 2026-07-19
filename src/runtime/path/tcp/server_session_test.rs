@@ -15,14 +15,14 @@ use crate::protocol::{
 };
 use crate::runtime::error::RuntimeError;
 use crate::runtime::node::server::{ServerIdentityRuntime, new_identity_runtime};
-use crate::runtime::path::ServerLocalPathProperties;
 use crate::runtime::path::commands::{recv_reliable_path_command, reliable_path_command_channels};
+use crate::runtime::path::{PathProofObservation, ServerLocalPathProperties};
 use crate::runtime::peer_status::PeerStatusBroker;
 use crate::scheduler::TrafficClass;
 use crate::transport::encrypted::{EncryptedFramedStream, EncryptedFramedTransportError, PeerRole};
 use bytes::Bytes;
 use std::net::SocketAddr;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::mpsc;
 
@@ -186,6 +186,17 @@ async fn server_tcp_terminal_reset_precedes_detach_and_preserves_shared_session(
         path_id,
         ServerLocalPathProperties::default(),
     );
+    let proof_elapsed = Duration::from_millis(1);
+    context.reliable_streams.record_path_proof_success(
+        &path_registration,
+        PathProofObservation {
+            proof_id: 1,
+            elapsed: proof_elapsed,
+            sent_at: Instant::now()
+                .checked_sub(proof_elapsed)
+                .expect("test validation instant"),
+        },
+    );
     let (commands_tx, commands_rx) = reliable_path_command_channels(8);
     let commands_for_streams = commands_tx.clone();
     let (_path_frames_tx, path_frames) = mpsc::channel(1);
@@ -311,14 +322,14 @@ async fn server_tcp_terminal_reset_precedes_detach_and_preserves_shared_session(
     assert_eq!(commands_for_streams.writer_pending_bytes(), 0);
 
     let detach_context = session.context.clone();
-    let detach_commands = session.commands_tx.clone();
-    session.streams.detach(
-        &detach_context,
-        &detach_commands,
-        session_id,
-        path_id,
-        sibling_stream_id,
-    );
+    session
+        .streams
+        .detach(
+            &detach_context,
+            &session.path_registration,
+            sibling_stream_id,
+        )
+        .expect("detach sibling TCP stream");
     assert!(
         session.streams.is_empty(),
         "the terminal command must have removed only its own TCP attachment"

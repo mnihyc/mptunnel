@@ -9,10 +9,8 @@ use crate::runtime::path::commands::{
     reliable_path_command_queue, reliable_stream_frame_queue_for_payload,
 };
 use crate::runtime::path::proof::PathProofTracker;
-use crate::runtime::path::send_credit::{
-    CarrierSendCredit, CarrierSendCreditSnapshot, CarrierSendCreditSource,
-};
 use crate::runtime::path::server_context::ServerPathContext;
+use crate::scheduler::TrafficClass;
 use crate::transport::PathSpec;
 use crate::transport::quic as quic_transport;
 use crate::transport::udp::UdpTransportError;
@@ -29,38 +27,36 @@ pub(in crate::runtime) struct UdpPathEndpoint {
 #[derive(Debug, Clone)]
 pub(in crate::runtime) struct UdpPathConnection {
     pub(super) connection: quic_transport::Connection,
-    send_credit: CarrierSendCredit,
-}
-
-#[derive(Debug)]
-struct QuicCarrierSendCreditSource {
-    connection: quic_transport::Connection,
-}
-
-impl CarrierSendCreditSource for QuicCarrierSendCreditSource {
-    fn snapshot(&self) -> CarrierSendCreditSnapshot {
-        let snapshot = self.connection.send_credit_snapshot();
-        CarrierSendCreditSnapshot {
-            limit_bytes: snapshot.limit_bytes,
-            committed_bytes: snapshot.committed_bytes,
-            closed: snapshot.closed,
-        }
-    }
-
-    fn notify(&self) -> Arc<tokio::sync::Notify> {
-        self.connection.send_credit_notify()
-    }
 }
 
 #[derive(Debug)]
 pub(in crate::runtime) struct UdpPathSendStream {
     stream: quic_transport::SendStream,
-    pub(super) connection: UdpPathConnection,
 }
 
 #[derive(Debug)]
 pub(in crate::runtime) struct UdpPathRecvStream {
     stream: quic_transport::RecvStream,
+}
+
+const QUIC_DEFAULT_STREAM_PRIORITY: i32 = 0;
+const QUIC_LATENCY_STREAM_PRIORITY: i32 = 1;
+
+fn quic_stream_priority(lane: TrafficClass) -> i32 {
+    if lane.is_latency_sensitive() {
+        QUIC_LATENCY_STREAM_PRIORITY
+    } else {
+        QUIC_DEFAULT_STREAM_PRIORITY
+    }
+}
+
+impl UdpPathSendStream {
+    /// QUIC stream priority orders locally buffered streams only. Quinn still
+    /// owns connection flow control, congestion control, pacing, and recovery.
+    pub(super) fn set_traffic_class(&self, lane: TrafficClass) -> Result<(), RuntimeError> {
+        self.stream.set_priority(quic_stream_priority(lane))?;
+        Ok(())
+    }
 }
 
 impl UdpPathEndpoint {
@@ -124,17 +120,11 @@ impl UdpPathEndpoint {
 
 impl UdpPathConnection {
     fn new(connection: quic_transport::Connection) -> Self {
-        let send_credit = CarrierSendCredit::new(Arc::new(QuicCarrierSendCreditSource {
-            connection: connection.clone(),
-        }));
-        Self {
-            connection,
-            send_credit,
-        }
+        Self { connection }
     }
 
-    pub(super) fn send_credit(&self) -> CarrierSendCredit {
-        self.send_credit.clone()
+    pub(super) fn delivery_activity_notify(&self) -> Arc<tokio::sync::Notify> {
+        self.connection.delivery_activity_notify()
     }
 
     pub(super) fn is_locally_closed(&self) -> bool {
@@ -151,10 +141,7 @@ impl UdpPathConnection {
     ) -> Result<(UdpPathSendStream, UdpPathRecvStream), RuntimeError> {
         let (send, recv) = self.connection.open_bi().await?;
         Ok((
-            UdpPathSendStream {
-                stream: send,
-                connection: self.clone(),
-            },
+            UdpPathSendStream { stream: send },
             UdpPathRecvStream { stream: recv },
         ))
     }
@@ -164,10 +151,7 @@ impl UdpPathConnection {
     ) -> Result<(UdpPathSendStream, UdpPathRecvStream), RuntimeError> {
         let (send, recv) = self.connection.accept_bi().await?;
         Ok((
-            UdpPathSendStream {
-                stream: send,
-                connection: self.clone(),
-            },
+            UdpPathSendStream { stream: send },
             UdpPathRecvStream { stream: recv },
         ))
     }

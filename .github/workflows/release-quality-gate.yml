@@ -23,6 +23,13 @@ jobs:
           rustc --version --verbose
           cargo --version
 
+      - name: Verify third-party license notices
+        run: |
+          cargo install --locked cargo-about --version 0.9.1 --features cli
+          git ls-files --error-unmatch THIRD_PARTY_LICENSES.html
+          scripts/generate-third-party-licenses.sh
+          git diff --exit-code -- THIRD_PARTY_LICENSES.html
+
       - name: Format
         run: cargo fmt --all -- --check
 

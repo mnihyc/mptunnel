@@ -27,13 +27,6 @@ pub struct CongestionMetrics {
     pub app_limited: bool,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct CarrierSendCreditSnapshot {
-    pub limit_bytes: u64,
-    pub committed_bytes: u64,
-    pub closed: bool,
-}
-
 #[derive(Debug, Default)]
 pub(super) struct InstrumentedBbrConfig;
 
@@ -57,7 +50,7 @@ pub(super) struct QuicCarrierTelemetry {
     lost_bytes: AtomicU64,
     delivery_evidence_written_bytes: AtomicU64,
     delivery_evidence_pending_ack_bytes: AtomicU64,
-    send_credit_released: Arc<Notify>,
+    delivery_activity_started: Arc<Notify>,
     app_limited: AtomicBool,
 }
 
@@ -115,21 +108,28 @@ impl QuicCarrierTelemetry {
         }
         self.delivery_evidence_written_bytes
             .fetch_add(bytes, Ordering::Relaxed);
-        self.delivery_evidence_pending_ack_bytes
+        let pending_before = self
+            .delivery_evidence_pending_ack_bytes
             .fetch_add(bytes, Ordering::Release);
+        if pending_before == 0 {
+            // Wake a metrics task that may be waiting on the idle PTO. Further
+            // writes remain timer-sampled while product bytes are unacknowledged.
+            self.delivery_activity_started.notify_waiters();
+        }
     }
 
     pub(super) fn delivery_evidence_written_bytes(&self) -> u64 {
         self.delivery_evidence_written_bytes.load(Ordering::Acquire)
     }
 
+    #[cfg(test)]
     pub(super) fn delivery_evidence_pending_ack_bytes(&self) -> u64 {
         self.delivery_evidence_pending_ack_bytes
             .load(Ordering::Acquire)
     }
 
-    pub(super) fn send_credit_notify(&self) -> Arc<Notify> {
-        self.send_credit_released.clone()
+    pub(super) fn delivery_activity_notify(&self) -> Arc<Notify> {
+        self.delivery_activity_started.clone()
     }
 
     pub(super) fn bytes_in_flight(&self) -> Option<u64> {
@@ -269,7 +269,6 @@ impl QuicCarrierTelemetry {
                 |pending| Some(pending.saturating_sub(totals.acked_bytes)),
             );
         }
-        self.send_credit_released.notify_waiters();
     }
 
     fn add_lost(&self, lost_bytes: u64) {
@@ -280,7 +279,6 @@ impl QuicCarrierTelemetry {
                 Ordering::Relaxed,
                 |current| Some(current.saturating_sub(lost_bytes)),
             );
-            self.send_credit_released.notify_waiters();
         }
     }
 }
@@ -422,6 +420,18 @@ impl quinn::congestion::Controller for InstrumentedController {
         self.inner.on_sent(now, bytes, last_packet_number);
     }
 
+    fn on_packet_sent(
+        &mut self,
+        now: Instant,
+        bytes: u16,
+        prior_in_flight: u64,
+        packet_number: u64,
+        app_limited: bool,
+    ) -> Option<quinn::congestion::PacketDeliveryState> {
+        self.inner
+            .on_packet_sent(now, bytes, prior_in_flight, packet_number, app_limited)
+    }
+
     fn on_ack(
         &mut self,
         now: Instant,
@@ -432,6 +442,20 @@ impl quinn::congestion::Controller for InstrumentedController {
     ) {
         self.accumulate_ack_telemetry(sent, bytes, app_limited);
         self.inner.on_ack(now, sent, bytes, app_limited, rtt);
+    }
+
+    fn on_ack_with_packet_state(
+        &mut self,
+        now: Instant,
+        sent: Instant,
+        bytes: u64,
+        app_limited: bool,
+        packet_state: Option<quinn::congestion::PacketDeliveryState>,
+        rtt: &quinn_proto::RttEstimator,
+    ) {
+        self.accumulate_ack_telemetry(sent, bytes, app_limited);
+        self.inner
+            .on_ack_with_packet_state(now, sent, bytes, app_limited, packet_state, rtt);
     }
 
     fn on_end_acks(
@@ -468,6 +492,10 @@ impl quinn::congestion::Controller for InstrumentedController {
 
     fn metrics(&self) -> quinn::congestion::ControllerMetrics {
         self.inner.metrics()
+    }
+
+    fn pacing_rate(&self) -> Option<u64> {
+        self.inner.pacing_rate()
     }
 
     fn clone_box(&self) -> Box<dyn quinn::congestion::Controller> {

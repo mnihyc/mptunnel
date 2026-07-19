@@ -1,18 +1,18 @@
 use super::response::{
-    CarrierPathFlight, ResponseStreamBinding, product_flights_have_recent_reinjection_overlap,
-    release_carrier_path_flight_ranges,
+    CarrierPathFlight, ResponseDataAckRecoveryCandidate, ResponseStreamBinding,
+    product_flights_have_recent_reinjection_overlap, release_carrier_path_flight_ranges,
 };
 use crate::model::capacity::{
     PATH_OPEN_SCORE_BYTES, PathRateSample, RELIABLE_INITIAL_WINDOW_PACKETS,
     data_level_service_window_bytes, product_delivery_samples_override_startup_prior,
     reliable_path_startup_sample_limit_bytes,
 };
-use crate::model::path::CarrierPathKey;
+use crate::model::path::{CarrierPathInstanceId, CarrierPathKey};
 use crate::model::work::{CarrierWorkKind, ReliableWorkClass};
 use crate::mux::MuxLimits;
 #[cfg(test)]
 use crate::protocol::PathId;
-use crate::protocol::frame::reliable_stream_frame_extent;
+use crate::protocol::frame::{normalize_offset_ranges, reliable_stream_frame_extent};
 use crate::protocol::{Frame, OffsetRange, ResetReason, StreamId, UnderlayProtocol};
 use crate::runtime::RuntimeError;
 use crate::runtime::path::commands::{
@@ -23,7 +23,7 @@ use crate::runtime::path::model::{default_path_rate_bps, default_path_srtt_ms};
 use crate::runtime::path::proof::enqueue_path_proof_frame;
 use crate::runtime::path::{OpenedReliableCarrierStream, RequestTcpCapacityProbeLease};
 use crate::scheduler::{PathRateScope, PathSnapshot, TrafficClass};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, VecDeque};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 use tokio::sync::{Notify, mpsc, watch};
@@ -40,7 +40,136 @@ pub(in crate::runtime) struct ReliablePathStream {
     pub(in crate::runtime) underlay: UnderlayProtocol,
     pub(in crate::runtime) max_frame_payload_bytes: usize,
     pub(in crate::runtime) output: ReliablePathStreamOutput,
-    pub(in crate::runtime) frames: mpsc::Receiver<Result<Frame, RuntimeError>>,
+    pub(in crate::runtime) frames: ReliablePathStreamInput,
+}
+
+/// Ordered input consumed by one product-stream actor.
+///
+/// Client streams receive carrier frames directly. Server streams share one
+/// queue for frames and attachment lifecycle so a following path detach cannot
+/// overtake ACK processing already accepted from that carrier.
+pub(in crate::runtime) enum ReliablePathStreamInput {
+    Carrier(mpsc::Receiver<Result<Frame, RuntimeError>>),
+    Server {
+        events: mpsc::Receiver<ServerReliableStreamEvent>,
+        pending: VecDeque<ServerReliableStreamEvent>,
+    },
+}
+
+pub(in crate::runtime) enum ServerReliableStreamEvent {
+    Frame(Frame),
+    PathDetached {
+        key: CarrierPathKey,
+        path_instance_id: CarrierPathInstanceId,
+        output_incarnation: u64,
+    },
+}
+
+impl From<mpsc::Receiver<Result<Frame, RuntimeError>>> for ReliablePathStreamInput {
+    fn from(frames: mpsc::Receiver<Result<Frame, RuntimeError>>) -> Self {
+        Self::Carrier(frames)
+    }
+}
+
+impl ReliablePathStreamInput {
+    pub(in crate::runtime::stream) fn server(
+        events: mpsc::Receiver<ServerReliableStreamEvent>,
+    ) -> Self {
+        Self::Server {
+            events,
+            pending: VecDeque::new(),
+        }
+    }
+
+    fn into_carrier_frames(self) -> mpsc::Receiver<Result<Frame, RuntimeError>> {
+        match self {
+            Self::Carrier(frames) => frames,
+            Self::Server { .. } => {
+                unreachable!("server stream input cannot become a fixed carrier receiver")
+            }
+        }
+    }
+}
+
+/// Coalesces only state-like feedback before the next data or lifecycle event.
+///
+/// Complete Data ACK snapshots can arrive out of order on different paths, so
+/// their monotonic received ranges are unioned instead of choosing by arrival
+/// order. Deltas remain explicitly incomplete. MAX_DATA is monotonic, so only
+/// its greatest advertised offset needs to reach the actor.
+#[derive(Debug, Default)]
+struct ServerFeedbackBatch {
+    complete_stream_id: Option<StreamId>,
+    complete_ranges: Vec<OffsetRange>,
+    delta_stream_id: Option<StreamId>,
+    delta_ranges: Vec<OffsetRange>,
+    max_data: Option<(StreamId, u64)>,
+}
+
+impl ServerFeedbackBatch {
+    fn accepts(frame: &Frame) -> bool {
+        matches!(frame, Frame::StreamAck { .. } | Frame::StreamMaxData { .. })
+    }
+
+    fn push(&mut self, frame: Frame) {
+        match frame {
+            Frame::StreamAck {
+                stream_id,
+                complete: true,
+                ranges,
+            } => {
+                self.complete_stream_id.get_or_insert(stream_id);
+                self.complete_ranges.extend(ranges);
+            }
+            Frame::StreamAck {
+                stream_id,
+                complete: false,
+                ranges,
+            } => {
+                self.delta_stream_id.get_or_insert(stream_id);
+                self.delta_ranges.extend(ranges);
+            }
+            Frame::StreamMaxData {
+                stream_id,
+                max_offset,
+            } => {
+                if self
+                    .max_data
+                    .is_none_or(|(_, current)| max_offset >= current)
+                {
+                    self.max_data = Some((stream_id, max_offset));
+                }
+            }
+            _ => unreachable!("feedback batch accepts only ACK and MAX_DATA"),
+        }
+    }
+
+    fn into_frames(self) -> VecDeque<Frame> {
+        let mut frames = VecDeque::with_capacity(3);
+        // Positive delta coverage is released before the complete union drives
+        // gap inference, so one batch cannot infer against bytes it also ACKs.
+        if let Some(stream_id) = self.delta_stream_id {
+            frames.push_back(Frame::StreamAck {
+                stream_id,
+                complete: false,
+                ranges: normalize_offset_ranges(self.delta_ranges),
+            });
+        }
+        if let Some(stream_id) = self.complete_stream_id {
+            frames.push_back(Frame::StreamAck {
+                stream_id,
+                complete: true,
+                ranges: normalize_offset_ranges(self.complete_ranges),
+            });
+        }
+        if let Some((stream_id, max_offset)) = self.max_data {
+            frames.push_back(Frame::StreamMaxData {
+                stream_id,
+                max_offset,
+            });
+        }
+        frames
+    }
 }
 
 impl ReliablePathStream {
@@ -57,7 +186,7 @@ impl ReliablePathStream {
                 opened.commands,
                 opened.mux_limits,
             ),
-            frames: opened.frames,
+            frames: opened.frames.into(),
         }
     }
 
@@ -76,15 +205,73 @@ impl ReliablePathStream {
                 max_frame_payload_bytes: self.max_frame_payload_bytes,
                 output: self.output,
             },
-            self.frames,
+            self.frames.into_carrier_frames(),
         )
     }
 
     pub(in crate::runtime) async fn recv_frame(&mut self) -> Result<Frame, RuntimeError> {
-        match self.frames.recv().await {
-            Some(Ok(frame)) => Ok(frame),
-            Some(Err(err)) => Err(err),
-            None => Err(RuntimeError::ReliablePathSessionClosed),
+        loop {
+            match &mut self.frames {
+                ReliablePathStreamInput::Carrier(frames) => {
+                    return match frames.recv().await {
+                        Some(Ok(frame)) => Ok(frame),
+                        Some(Err(err)) => Err(err),
+                        None => Err(RuntimeError::ReliablePathSessionClosed),
+                    };
+                }
+                ReliablePathStreamInput::Server { events, pending } => {
+                    let (event, received_from_channel) = match pending.pop_front() {
+                        Some(event) => (Some(event), false),
+                        None => (events.recv().await, true),
+                    };
+                    match event {
+                        Some(ServerReliableStreamEvent::Frame(frame))
+                            if received_from_channel && ServerFeedbackBatch::accepts(&frame) =>
+                        {
+                            let mut batch = ServerFeedbackBatch::default();
+                            batch.push(frame);
+                            // Collapse only the backlog visible at entry. Producers
+                            // may continue publishing on other runtime workers; an
+                            // unbounded try-recv loop must not become actor work.
+                            let queued_feedback = events.len();
+                            for _ in 0..queued_feedback {
+                                match events.try_recv() {
+                                    Ok(ServerReliableStreamEvent::Frame(frame))
+                                        if ServerFeedbackBatch::accepts(&frame) =>
+                                    {
+                                        batch.push(frame);
+                                    }
+                                    Ok(boundary) => {
+                                        pending.push_back(boundary);
+                                        break;
+                                    }
+                                    Err(mpsc::error::TryRecvError::Empty)
+                                    | Err(mpsc::error::TryRecvError::Disconnected) => break,
+                                }
+                            }
+                            let mut frames = batch.into_frames();
+                            let first = frames
+                                .pop_front()
+                                .expect("a feedback batch contains at least one frame");
+                            while let Some(frame) = frames.pop_back() {
+                                pending.push_front(ServerReliableStreamEvent::Frame(frame));
+                            }
+                            return Ok(first);
+                        }
+                        Some(ServerReliableStreamEvent::Frame(frame)) => return Ok(frame),
+                        Some(ServerReliableStreamEvent::PathDetached {
+                            key,
+                            path_instance_id,
+                            output_incarnation,
+                        }) => self.output.complete_path_detach(
+                            key,
+                            path_instance_id,
+                            output_incarnation,
+                        ),
+                        None => return Err(RuntimeError::ReliablePathSessionClosed),
+                    }
+                }
+            }
         }
     }
 
@@ -132,6 +319,13 @@ impl ReliablePathStream {
         ack_frontier: u64,
     ) -> Option<UnderlayProtocol> {
         self.output.tail_reinjection_original_underlay(ack_frontier)
+    }
+
+    pub(in crate::runtime) fn data_ack_recovery_candidate(
+        &self,
+        ack_frontier: u64,
+    ) -> Option<ResponseDataAckRecoveryCandidate> {
+        self.output.data_ack_recovery_candidate(ack_frontier)
     }
 
     pub(in crate::runtime) fn request_feedback_underlay(&self) -> Option<UnderlayProtocol> {
@@ -278,6 +472,14 @@ impl ReliablePathStreamHandle {
                     .await;
             }
         }
+    }
+
+    /// A failed product endpoint is terminal; reset it ahead of queued payload
+    /// so the peer does not retain or reinject a stream that cannot recover.
+    pub(in crate::runtime) async fn reset_and_close(&self, reason: ResetReason) {
+        self.output
+            .reset_and_close_stream(self.stream_id, reason)
+            .await;
     }
 
     pub(in crate::runtime) fn enqueue_path_proof(&self) -> Result<Option<u64>, RuntimeError> {
@@ -677,6 +879,24 @@ impl ReliablePathStreamOutput {
         }
     }
 
+    pub(in crate::runtime) async fn reset_and_close_stream(
+        &self,
+        stream_id: StreamId,
+        reason: ResetReason,
+    ) {
+        match self {
+            Self::Fixed(fixed) => {
+                let _ = fixed
+                    .commands()
+                    .send_control(ReliablePathCommand::ResetAndCloseStream { stream_id, reason })
+                    .await;
+            }
+            Self::Switchable(binding) => {
+                binding.reset_and_close_stream(stream_id, reason).await;
+            }
+        }
+    }
+
     pub(in crate::runtime) async fn close_stream_ordered(
         &self,
         stream_id: StreamId,
@@ -760,6 +980,16 @@ impl ReliablePathStreamOutput {
         }
     }
 
+    pub(in crate::runtime) fn data_ack_recovery_candidate(
+        &self,
+        ack_frontier: u64,
+    ) -> Option<ResponseDataAckRecoveryCandidate> {
+        match self {
+            Self::Fixed(_) => None,
+            Self::Switchable(binding) => binding.data_ack_recovery_candidate(ack_frontier),
+        }
+    }
+
     pub(in crate::runtime) fn request_feedback_underlay(&self) -> Option<UnderlayProtocol> {
         match self {
             Self::Fixed(fixed) => Some(fixed.key().underlay),
@@ -788,6 +1018,17 @@ impl ReliablePathStreamOutput {
         match self {
             Self::Fixed(_) => false,
             Self::Switchable(binding) => binding.has_output_incarnation(key, incarnation),
+        }
+    }
+
+    fn complete_path_detach(
+        &self,
+        key: CarrierPathKey,
+        path_instance_id: CarrierPathInstanceId,
+        output_incarnation: u64,
+    ) {
+        if let Self::Switchable(binding) = self {
+            binding.complete_path_detach(key, path_instance_id, output_incarnation);
         }
     }
 

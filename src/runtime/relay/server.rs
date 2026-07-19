@@ -30,13 +30,16 @@ use crate::model::capacity::{
     reliable_relay_sender_dispatch_budget, reliable_stream_advertised_window_bytes,
     reliable_stream_initial_advertised_window_bytes,
 };
-use crate::model::timing::{reliable_relay_tail_reinjection_delay, sender_service_retry_delay};
+use crate::model::timing::{
+    reliable_data_ack_gap_reinjection_ready, reliable_data_ack_recovery_deadline,
+    reliable_data_retransmission_interval, reliable_relay_tail_reinjection_delay,
+    sender_service_retry_delay,
+};
 use crate::model::work::ReliableWorkClass;
 use crate::model::work::{
     reliable_critical_tail_reinjection_is_over_budget,
     reliable_critical_tail_reinjection_limit_bytes,
     reliable_failed_original_reinjection_limit_bytes,
-    reliable_persistent_ack_gap_reinjection_limit_bytes,
 };
 use crate::mux::MuxLimits;
 use crate::mux::stream::{ReliableRecvStream, ReliableSendStream};
@@ -56,6 +59,7 @@ use crate::runtime::sender::{
     RelaySendCause, ServerResponseSenderService, emit_response_control_frame,
     reliable_relay_sender_queue_limit,
 };
+use crate::runtime::stream::response::ResponseDataAckRecoveryCandidate;
 use crate::runtime::stream::{
     AcceptedServerReliableStream, AcceptedServerReliableStreamRetirement, ReliablePathStream,
     ReliableRecvProgress, ServerReliableStreamRegistry, reliable_relay_recv_progress_resend_active,
@@ -213,17 +217,19 @@ async fn relay_accepted_stream(
     };
     let outbound_stream = ObservedProductIo::new(outbound_stream, telemetry_flow.counter());
 
-    if let Err(err) = emit_response_control_frame(
-        accepted.stream(),
-        Frame::StreamMaxData {
-            stream_id,
-            max_offset: reliable_stream_initial_advertised_window_bytes(
-                accepted.stream().underlay,
-                accepted.stream().lane,
-                context.mux_limits,
-            ),
-        },
-    ) {
+    if accepted.accept_opening_path().await.is_err()
+        && let Err(err) = emit_response_control_frame(
+            accepted.stream(),
+            Frame::StreamMaxData {
+                stream_id,
+                max_offset: reliable_stream_initial_advertised_window_bytes(
+                    accepted.stream().underlay,
+                    accepted.stream().lane,
+                    context.mux_limits,
+                ),
+            },
+        )
+    {
         accepted.close().await;
         return Err(err);
     }
@@ -305,31 +311,135 @@ fn reliable_relay_current_data_ack_outstanding_bytes(
 }
 
 fn reliable_relay_tail_reinjection_deadline(
-    last_progress_at: Instant,
-    last_reinjection_at: Instant,
+    data_ack_progress_at: Instant,
+    last_attempt_at: Option<Instant>,
     path: Option<PathSnapshot>,
 ) -> tokio::time::Instant {
     let stall_timeout = reliable_relay_tail_reinjection_delay(path);
-    if last_reinjection_at > last_progress_at {
-        return tokio::time::Instant::from_std(last_reinjection_at + stall_timeout);
-    }
-    tokio::time::Instant::from_std(last_progress_at + stall_timeout)
+    let recovery_anchor = last_attempt_at.map_or(data_ack_progress_at, |attempted_at| {
+        attempted_at.max(data_ack_progress_at)
+    });
+    tokio::time::Instant::from_std(recovery_anchor + stall_timeout)
 }
 
 fn reliable_relay_effective_tail_reinjection_deadline(
-    last_progress_at: Instant,
-    last_reinjection_at: Instant,
+    data_ack_progress_at: Instant,
+    last_attempt_at: Option<Instant>,
     path: Option<PathSnapshot>,
     failed_original_tail_reinjection_ready: bool,
 ) -> tokio::time::Instant {
     if failed_original_tail_reinjection_ready {
-        let stall_timeout = reliable_relay_tail_reinjection_delay(None);
-        if last_reinjection_at <= last_progress_at {
-            return tokio::time::Instant::from_std(last_progress_at);
-        }
-        return tokio::time::Instant::from_std(last_reinjection_at + stall_timeout);
+        return last_attempt_at.map_or_else(
+            || tokio::time::Instant::from_std(data_ack_progress_at),
+            |attempted_at| {
+                tokio::time::Instant::from_std(
+                    attempted_at + reliable_relay_tail_reinjection_delay(None),
+                )
+            },
+        );
     }
-    reliable_relay_tail_reinjection_deadline(last_progress_at, last_reinjection_at, path)
+    reliable_relay_tail_reinjection_deadline(data_ack_progress_at, last_attempt_at, path)
+}
+
+/// One retransmission deadline for the current lowest unacknowledged range.
+///
+/// Carrier metric refreshes may refine the next recovery interval, but they
+/// cannot postpone a timer that was already armed for the same Data ACK gap.
+#[derive(Debug, Default)]
+struct ReliableRelayTailReinjectionTimer {
+    candidate: Option<ReliableRelayTailRecoveryCandidate>,
+    deadline: Option<tokio::time::Instant>,
+    last_attempt_at: Option<Instant>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ReliableRelayTailRecoveryCandidate {
+    Tracked(ResponseDataAckRecoveryCandidate),
+    Untracked {
+        start: u64,
+        end: u64,
+        sent_at: Instant,
+    },
+}
+
+impl ReliableRelayTailRecoveryCandidate {
+    fn sent_at(self) -> Instant {
+        match self {
+            Self::Tracked(candidate) => candidate.sent_at,
+            Self::Untracked { sent_at, .. } => sent_at,
+        }
+    }
+}
+
+impl ReliableRelayTailReinjectionTimer {
+    fn arm_recovery_deadline(
+        &mut self,
+        candidate: ReliableRelayTailRecoveryCandidate,
+        deadline: Instant,
+    ) {
+        let deadline = tokio::time::Instant::from_std(deadline);
+        if self.candidate != Some(candidate) {
+            self.candidate = Some(candidate);
+            self.deadline = Some(deadline);
+            return;
+        }
+        self.deadline = Some(
+            self.deadline
+                .map_or(deadline, |current| current.min(deadline)),
+        );
+    }
+
+    fn observe(
+        &mut self,
+        candidate: Option<ReliableRelayTailRecoveryCandidate>,
+        data_ack_progress_at: Instant,
+        path: Option<PathSnapshot>,
+        failed_original_ready: bool,
+    ) -> tokio::time::Instant {
+        let Some(candidate) = candidate else {
+            self.candidate = None;
+            self.deadline = None;
+            self.last_attempt_at = None;
+            return tokio::time::Instant::now() + reliable_relay_tail_reinjection_delay(path);
+        };
+        let candidate_changed = self.candidate != Some(candidate);
+        if candidate_changed {
+            self.candidate = Some(candidate);
+            self.deadline = None;
+        }
+        // A range cannot be stalled before it is assigned to a carrier. Data
+        // ACK progress after that assignment starts a fresh recovery interval.
+        // Native TCP or QUIC recovery retains ownership below this clock.
+        let recovery_progress_at = data_ack_progress_at.max(candidate.sent_at());
+        // Retain the last attempt across candidates to prevent a repair burst.
+        let candidate = reliable_relay_effective_tail_reinjection_deadline(
+            recovery_progress_at,
+            self.last_attempt_at,
+            path,
+            failed_original_ready,
+        );
+        if failed_original_ready {
+            // Confirmed failure may shorten an already armed live-path timer.
+            let deadline = self
+                .deadline
+                .map_or(candidate, |current| current.min(candidate));
+            self.deadline = Some(deadline);
+            return deadline;
+        }
+        *self.deadline.get_or_insert(candidate)
+    }
+
+    fn record_scan(&mut self) {
+        // Carrier capacity has a separate wake channel from attachment/model
+        // updates. Pace an empty eligibility scan by one recovery interval so
+        // a transiently busy alternate cannot permanently disarm this gap.
+        self.record_attempt_at(Instant::now());
+    }
+
+    fn record_attempt_at(&mut self, attempted_at: Instant) {
+        self.deadline = None;
+        self.last_attempt_at = Some(attempted_at);
+    }
 }
 
 // Server receive-hole diagnostics
@@ -663,10 +773,10 @@ struct TailReinjectionEnqueueOutcome {
     pending: bool,
 }
 
+#[cfg(test)]
 impl TailReinjectionEnqueueOutcome {
-    fn record_as_reinjection_attempt(self) -> bool {
-        let _ = self;
-        true
+    fn has_reinjection_attempt(self) -> bool {
+        self.queued > 0 || self.pending
     }
 }
 
@@ -742,9 +852,8 @@ fn enqueue_reliable_tail_reinjection(
             && path_stream.has_multipath_reinjection_alternative()
         {
             // A generic timeout proves only that the lowest product gap is
-            // blocking delivery. Repair one adaptive quantum here; the ACK-gap
-            // controller below may refill a larger measured service flight only
-            // after persistent-path evidence selects an explicit target.
+            // blocking delivery. Repair one adaptive quantum here; persistent
+            // evidence may bypass optional traffic budget but does not enlarge it.
             let gap_limit = reliable_critical_tail_reinjection_limit_bytes(
                 base_reinjection_limit,
                 send_stream.reinjection_bytes(),
@@ -1082,10 +1191,10 @@ where
     let mut ack_gap_reinjection = ReliableAckGapReinjectionProgress::default();
     let mut last_recv_progress_sent_at = Instant::now();
     let mut last_send_ack_progress_at = Instant::now();
-    let mut last_tail_reinjection_at = Instant::now();
     let mut last_send_ack_frontier = 0_u64;
     let mut last_send_ack_ranges = Vec::<OffsetRange>::new();
     let mut last_send_ack_complete = false;
+    let mut tail_reinjection_timer = ReliableRelayTailReinjectionTimer::default();
     let mut flow_demand =
         ReliableRelayFlowDemandTracker::with_initial_lane(path_stream.current_lane());
     let mut output_updates = path_stream.subscribe_output_updates();
@@ -1166,7 +1275,9 @@ where
             )
             .with_product_work(
                 response_sender.data_bytes(),
-                send_stream.reinjection_bytes(),
+                send_stream
+                    .reinjection_bytes()
+                    .saturating_add(recv_stream.reorder_bytes()),
             ),
             classifier_path,
             mux_limits,
@@ -1178,13 +1289,14 @@ where
             lab_diagnostic(
                 "server_stream_lane_changed",
                 format_args!(
-                    "stream_id={} previous={:?} lane={:?} sent_offset={} received_offset={} reinjection_bytes={} byte_proven={} rate_proven={} buffered_data={}",
+                    "stream_id={} previous={:?} lane={:?} sent_offset={} received_offset={} reinjection_bytes={} reorder_bytes={} byte_proven={} rate_proven={} buffered_data={}",
                     stream_id.0,
                     previous_lane,
                     relay_lane,
                     send_stream.next_offset(),
                     recv_stream.next_offset(),
                     send_stream.reinjection_bytes(),
+                    recv_stream.reorder_bytes(),
                     demand_update.byte_proven_bulk,
                     demand_update.rate_proven_sustained_bulk,
                     demand_update.buffered_bulk,
@@ -1201,6 +1313,9 @@ where
             relay_lane_startup_chunk_bytes(relay_lane, mux_limits)
                 .min(path_stream.max_frame_payload_bytes),
         );
+        let data_ack_recovery_candidate = path_stream
+            .data_ack_recovery_candidate(last_send_ack_frontier)
+            .map(ReliableRelayTailRecoveryCandidate::Tracked);
         let request_feedback_path_snapshot = path_stream.request_feedback_path_snapshot(relay_lane);
         let request_feedback_underlay = request_feedback_path_snapshot
             .map(|snapshot| snapshot.underlay)
@@ -1228,14 +1343,21 @@ where
             tail_reinjection_candidate,
             failed_original_tail_reinjection_ready,
         );
+        let data_ack_recovery_candidate = tail_reinjection_active.then(|| {
+            data_ack_recovery_candidate.unwrap_or(ReliableRelayTailRecoveryCandidate::Untracked {
+                start: last_send_ack_frontier,
+                end: send_stream.next_offset(),
+                sent_at: last_send_ack_progress_at,
+            })
+        });
         let data_ack_outstanding_bytes = reliable_relay_current_data_ack_outstanding_bytes(
             relay_lane,
             &send_stream,
             last_send_ack_frontier,
         );
-        let tail_reinjection_deadline = reliable_relay_effective_tail_reinjection_deadline(
+        let tail_reinjection_deadline = tail_reinjection_timer.observe(
+            data_ack_recovery_candidate,
             last_send_ack_progress_at,
-            last_tail_reinjection_at,
             tail_reinjection_path_snapshot,
             failed_original_tail_reinjection_ready,
         );
@@ -1386,7 +1508,7 @@ where
             break Err(RuntimeError::SessionRetentionTimeout);
         }
         _ = tokio::time::sleep_until(tail_reinjection_deadline), if tail_reinjection_active => {
-            let reinjection_outcome = enqueue_reliable_tail_reinjection(
+            let _ = enqueue_reliable_tail_reinjection(
                 &mut response_sender,
                 path_stream,
                 stream_id,
@@ -1400,9 +1522,7 @@ where
                 path_stream.max_frame_payload_bytes,
                 last_send_ack_frontier,
             );
-            if reinjection_outcome.record_as_reinjection_attempt() {
-                last_tail_reinjection_at = Instant::now();
-            }
+            tail_reinjection_timer.record_scan();
             let data_ack_outstanding_bytes = reliable_relay_current_data_ack_outstanding_bytes(
                 relay_lane,
                 &send_stream,
@@ -1451,6 +1571,11 @@ where
                 } if received_stream_id == stream_id && remote_open => {
                     #[cfg(feature = "lab-diagnostics")]
                     let payload_len = payload.len();
+                    super::io::validate_stream_data_final_offset(
+                        pending_remote_fin_offset,
+                        offset,
+                        payload.len(),
+                    )?;
                     #[cfg(feature = "lab-diagnostics")]
                     let mux_started = Instant::now();
                     let outcome = recv_stream.receive_data(offset, payload)?;
@@ -1537,18 +1662,21 @@ where
                         stream_ack_contiguous_frontier(&normalized_ranges);
                     let previous_ack_frontier = last_send_ack_frontier;
                     update_reinjection_authoritative_ack_snapshot(
-                        &mut last_send_ack_frontier,
                         &mut last_send_ack_ranges,
                         &mut last_send_ack_complete,
                         complete,
                         &normalized_ranges,
                     );
+                    // Positive ACK chunks release bytes even when their range
+                    // list is incomplete. Only the complete snapshot above may
+                    // authorize gap inference; flow control follows the exact
+                    // lowest outstanding Data Sequence offset.
+                    last_send_ack_frontier = send_stream.data_ack_frontier();
                     let authoritative_ack_complete = last_send_ack_complete;
                     let authoritative_ack_ranges = last_send_ack_ranges.as_slice();
                     let ack_made_progress = last_send_ack_frontier > previous_ack_frontier;
                     if ack_made_progress {
                         last_send_ack_progress_at = Instant::now();
-                        last_tail_reinjection_at = last_send_ack_progress_at;
                     }
                     let base_reinjection_limit = adaptive_reliable_relay_reinjection_bytes(
                         send_path_snapshot,
@@ -1559,33 +1687,73 @@ where
                         response_sender.reinjection_extra_event_budget_remaining(mux_limits);
                     let has_multipath_reinjection_alternative =
                         path_stream.has_multipath_reinjection_alternative();
-                    let reinjection_original_underlay = path_stream
-                        .tail_reinjection_original_underlay(last_send_ack_frontier);
-                    let ack_gap_reinjection_ready = ack_gap_reinjection.reinjection_ready(
-                        authoritative_ack_complete,
-                        authoritative_ack_ranges,
-                        reinjection_original_underlay,
-                        has_multipath_reinjection_alternative,
-                        tail_reinjection_path_snapshot,
-                    );
-                    let reinjection_target = ack_gap_reinjection_ready
-                        .then(|| {
+                    let ack_gap_original_flight =
+                        path_stream.data_ack_recovery_candidate(last_send_ack_frontier);
+                    let reinjection_original_underlay = ack_gap_original_flight
+                        .map(|candidate| candidate.key.underlay)
+                        .or_else(|| {
+                            path_stream
+                                .tail_reinjection_original_underlay(last_send_ack_frontier)
+                        });
+                    let reinjection_target =
+                        has_multipath_reinjection_alternative.then(|| {
                             response_sender.ack_gap_reinjection_path_snapshot(
                                 path_stream,
                                 &send_stream,
                                 authoritative_ack_ranges,
                                 base_reinjection_limit,
                             )
+                        });
+                    let reinjection_target = reinjection_target.flatten();
+                    // Later ACKs use the time-threshold loss check below. A
+                    // retained timer represents silence, so it waits RTO/PTO.
+                    let data_ack_recovery_deadline =
+                        stream_ack_ranges_expose_authoritative_gap(
+                            authoritative_ack_complete,
+                            authoritative_ack_ranges,
+                        )
+                        .then(|| {
+                            reliable_data_ack_recovery_deadline(
+                                ack_gap_original_flight.map(|candidate| candidate.sent_at),
+                                reinjection_original_underlay,
+                                tail_reinjection_path_snapshot,
+                                reinjection_target.map(|target| target.completion),
+                            )
                         })
                         .flatten();
+                    if let (Some(candidate), Some(deadline)) =
+                        (ack_gap_original_flight, data_ack_recovery_deadline)
+                    {
+                        tail_reinjection_timer.arm_recovery_deadline(
+                            ReliableRelayTailRecoveryCandidate::Tracked(candidate),
+                            deadline,
+                        );
+                    }
+                    let reinjection_observed_at = Instant::now();
+                    let measured_reinjection_ready =
+                        reliable_data_ack_gap_reinjection_ready(
+                            ack_gap_original_flight.map(|candidate| candidate.sent_at),
+                            reinjection_original_underlay,
+                            tail_reinjection_path_snapshot,
+                            reinjection_target.map(|target| target.completion),
+                            reinjection_observed_at,
+                        );
+                    let reinjection_retry_after = reliable_data_retransmission_interval(
+                        reinjection_original_underlay,
+                        tail_reinjection_path_snapshot,
+                    );
+                    let ack_gap_reinjection_ready = ack_gap_reinjection.reinjection_ready(
+                        authoritative_ack_complete,
+                        authoritative_ack_ranges,
+                        has_multipath_reinjection_alternative,
+                        measured_reinjection_ready,
+                        reinjection_retry_after,
+                    );
                     let persistent_ack_gap_reinjection_ready =
                         ack_gap_reinjection_ready && reinjection_target.is_some();
-                    let reinjection_path = reinjection_target.map(|(_, snapshot)| snapshot);
                     let reinjection_limit = if persistent_ack_gap_reinjection_ready {
-                        reliable_persistent_ack_gap_reinjection_limit_bytes(
-                            reinjection_path,
-                            reinjection_path.and(reinjection_original_underlay),
-                            relay_lane,
+                        reliable_critical_tail_reinjection_limit_bytes(
+                            base_reinjection_limit,
                             send_stream.reinjection_bytes(),
                             mux_limits,
                         )
@@ -1593,11 +1761,11 @@ where
                         base_reinjection_limit.min(reinjection_event_budget)
                     };
                     let ack_gap_reinjection_cause = if persistent_ack_gap_reinjection_ready {
-                        let (target, snapshot) = reinjection_target
+                        let target = reinjection_target
                             .expect("persistent reinjection requires a measured output");
                         RelaySendCause::persistent_server_ack_gap_reinjection(
-                            target,
-                            snapshot,
+                            target.identity,
+                            target.snapshot,
                         )
                     } else {
                         RelaySendCause::AckGapReinjection
@@ -1970,7 +2138,7 @@ where
                     ),
                 );
                 if reinjection_count > 0 {
-                    last_tail_reinjection_at = Instant::now();
+                    tail_reinjection_timer.record_attempt_at(Instant::now());
                 }
             }
             if response_sender.queued_send_ready() {

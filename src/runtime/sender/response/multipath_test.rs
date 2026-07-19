@@ -26,7 +26,7 @@ fn stream_with_output(output: ReliablePathStreamOutput) -> ReliablePathStream {
         underlay: UnderlayProtocol::Tcp,
         max_frame_payload_bytes: MuxLimits::default().max_payload_bytes,
         output,
-        frames,
+        frames: frames.into(),
     }
 }
 
@@ -54,7 +54,7 @@ fn switchable_binding(
 }
 
 #[test]
-fn fixed_output_plan_requires_stream_ordered_queue_credit() {
+fn fixed_output_plan_uses_the_data_traffic_class_queue() {
     let (commands, mut receivers) = reliable_path_command_channels(1);
     let stream = stream_with_output(ReliablePathStreamOutput::fixed(
         UnderlayProtocol::Tcp,
@@ -77,11 +77,15 @@ fn fixed_output_plan_requires_stream_ordered_queue_credit() {
 
     commands
         .try_enqueue_stream_ordered_frame(data_frame(1024, 1024), TrafficClass::Throughput)
-        .expect("fill the only queue slot");
+        .expect("fill the bulk queue slot");
     assert!(matches!(
         plan_response_data_dispatch(&stream, TrafficClass::Throughput, 0, 1024),
         Err(RuntimeError::SenderServiceBlocked)
     ));
+    assert!(
+        plan_response_data_dispatch(&stream, TrafficClass::Latency, 0, 1024).is_ok(),
+        "latency response data retains independent priority capacity",
+    );
     assert!(
         crate::runtime::path::commands::try_recv_reliable_path_command(&mut receivers).is_some()
     );
@@ -104,6 +108,8 @@ fn switchable_plan_uses_completion_time_not_attachment_order() {
         ),
         crate::runtime::stream::response::ResponseStreamAttachOutcome::Attached
     );
+    binding.mark_output_path_proven_for_test(initial);
+    binding.mark_output_path_proven_for_test(alternate);
     binding.set_output_product_model_for_test(initial, 10_000_000.0, 100.0);
     binding.set_output_product_model_for_test(alternate, 500_000_000.0, 10.0);
     let stream = stream_with_output(ReliablePathStreamOutput::Switchable(binding));
@@ -239,8 +245,8 @@ fn readiness_preview_does_not_mutate_generation_or_queue() {
     let after = binding.sender_path_targets(TrafficClass::Throughput, 4096);
     assert_eq!(before.len(), after.len());
     assert_eq!(
-        before[0].can_enqueue_stream_ordered_frame(),
-        after[0].can_enqueue_stream_ordered_frame()
+        before[0].can_enqueue_stream_data(TrafficClass::Throughput),
+        after[0].can_enqueue_stream_data(TrafficClass::Throughput)
     );
 }
 

@@ -9,18 +9,14 @@ use crate::runtime::error::RuntimeError;
 use crate::runtime::path::commands::ReliablePathCommandSender;
 use crate::runtime::path::server_context::ServerPathContext;
 use crate::runtime::path::{
-    AcceptedServerDatagramFlow, ServerDatagramOpenError, ServerDatagramOpenRequest,
-    ServerDatagramRequest, ServerDatagramSendOutcome,
+    AcceptedServerDatagramFlow, ServerDatagramOpenRequest, ServerDatagramRequest,
+    ServerDatagramSendOutcome,
 };
 
 pub(super) enum ServerTcpDatagramEffect {
     None,
     Reply(Frame),
     ReplyAndSkipCommandPoll(Frame),
-    ReplyThenError {
-        frame: Frame,
-        failure: ServerDatagramOpenError,
-    },
 }
 
 pub(super) struct ServerTcpDatagramState {
@@ -63,19 +59,13 @@ impl ServerTcpDatagramState {
             .await
         {
             Ok(flow) => flow,
-            Err(failure) if !failure.requires_close() => return Err(failure.into_error()),
-            Err(failure) => {
-                return Ok(ServerTcpDatagramEffect::ReplyThenError {
-                    frame: Frame::DatagramClose { flow_id },
-                    failure,
-                });
-            }
+            Err(failure) => return Err(failure.into_error()),
         };
         self.flows.push(flow);
         Ok(ServerTcpDatagramEffect::None)
     }
 
-    pub(super) fn handle_data(
+    pub(super) async fn handle_data(
         &mut self,
         flow_id: DatagramFlowId,
         datagram_id: DatagramId,
@@ -90,11 +80,14 @@ impl ServerTcpDatagramState {
             .iter()
             .find(|flow| flow.flow_id() == flow_id)
             .ok_or(RuntimeError::Protocol("unknown TCP datagram flow"))?;
-        let effect = match flow.try_send(ServerDatagramRequest {
-            datagram_id,
-            ttl_ms,
-            payload,
-        }) {
+        let effect = match flow
+            .send(ServerDatagramRequest {
+                datagram_id,
+                ttl_ms,
+                payload,
+            })
+            .await?
+        {
             ServerDatagramSendOutcome::Accepted => {
                 let received = datagram_feedback_range(datagram_id)
                     .ok_or(RuntimeError::Protocol("datagram feedback range overflow"))?;
@@ -113,6 +106,20 @@ impl ServerTcpDatagramState {
             }
         };
         Ok(effect)
+    }
+
+    pub(super) fn handle_feedback(
+        &self,
+        flow_id: DatagramFlowId,
+        received: Vec<crate::protocol::OffsetRange>,
+    ) -> Result<(), RuntimeError> {
+        let flow = self
+            .flows
+            .iter()
+            .find(|flow| flow.flow_id() == flow_id)
+            .ok_or(RuntimeError::Protocol("unknown TCP datagram flow feedback"))?;
+        flow.acknowledge_response(received);
+        Ok(())
     }
 
     pub(super) fn remove(&mut self, flow_id: DatagramFlowId) {

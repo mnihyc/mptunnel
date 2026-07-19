@@ -1,11 +1,12 @@
 [package]
 name = "mptunnel"
-version = "0.1.0"
+version = "0.1.1"
 edition = "2024"
 description = "Encrypted multipath proxy and tunnel"
 license = "Apache-2.0"
 readme = "README.md"
 repository = "https://github.com/mnihyc/mptunnel"
+publish = false
 rust-version = "1.96"
 keywords = ["multipath", "proxy", "quic", "tunnel"]
 categories = ["network-programming"]
@@ -46,3 +47,6 @@ libc = "0.2"
 
 [target.'cfg(windows)'.dependencies]
 windows-sys = { version = "0.61", features = ["Win32_Networking_WinSock", "Win32_System_IO"] }
+
+[patch.crates-io]
+quinn-proto = { path = "third_party/quinn-proto-0.11.15" }

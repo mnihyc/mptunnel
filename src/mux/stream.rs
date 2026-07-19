@@ -60,6 +60,17 @@ impl ReliableSendStream {
         self.reinjection_bytes
     }
 
+    /// Lowest Data Sequence offset not yet acknowledged by the peer.
+    ///
+    /// Incomplete STREAM_ACK chunks are still affirmative delivery evidence.
+    /// Deriving this frontier from the remaining send cache lets those chunks
+    /// release connection credit without treating them as complete gap reports.
+    pub(crate) fn data_ack_frontier(&self) -> u64 {
+        self.reinjection_cache
+            .first_key_value()
+            .map_or(self.next_offset, |(offset, _)| *offset)
+    }
+
     pub fn update_max_offset(&mut self, max_offset: u64) {
         self.max_offset = self.max_offset.max(max_offset);
     }

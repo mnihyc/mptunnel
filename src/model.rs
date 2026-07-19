@@ -7,6 +7,7 @@
 pub(crate) mod ack_clock;
 pub(crate) mod admission;
 pub(crate) mod capacity;
+pub(crate) mod datagram;
 pub(crate) mod multipath;
 pub(crate) mod path;
 pub(crate) mod request_capacity;

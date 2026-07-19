@@ -4,6 +4,7 @@
 //! lifetime coupling between one TCP carrier and all attached product streams.
 
 use super::client_connection::{ClientTcpCarrierConnect, connect_client_tcp_carrier};
+use super::client_datagram::ClientTcpDatagramState;
 use super::client_receive::handle_client_tcp_path_frame;
 use super::client_state::{ClientTcpPathConnection, ClientTcpPathSessionRuntime};
 use super::client_stream::{
@@ -71,6 +72,7 @@ struct ClientTcpPathSessionState {
     connection: Option<ClientTcpPathConnection>,
     streams: HashMap<StreamId, ClientTcpPathStreamState>,
     closed_streams: RecentIdCache<StreamId>,
+    datagrams: ClientTcpDatagramState,
 }
 
 struct PreparedClientTcpConnection {
@@ -88,6 +90,10 @@ pub(super) async fn run_client_tcp_path_session(
         connection: None,
         streams: HashMap::new(),
         closed_streams: RecentIdCache::new(runtime.closed_stream_cache_capacity),
+        datagrams: ClientTcpDatagramState::new(
+            runtime.mux_limits.max_streams,
+            runtime.closed_stream_cache_capacity,
+        ),
     };
     let mut pending_frames = Vec::<Frame>::new();
 
@@ -108,6 +114,7 @@ pub(super) async fn run_client_tcp_path_session(
                             .is_err()
                     {
                         carrier_generation.clear();
+                        state.datagrams.clear();
                         state.connection = None;
                     }
                     commands.release_pending_command_bytes(pending_bytes);
@@ -136,7 +143,7 @@ pub(super) async fn run_client_tcp_path_session(
                 let _ = close_client_tcp_path(
                     connection_ref,
                     PathId(runtime.path_index as u16),
-                    !state.streams.is_empty(),
+                    !state.streams.is_empty() || !state.datagrams.is_empty(),
                 )
                 .await;
             }
@@ -194,7 +201,7 @@ pub(super) async fn run_client_tcp_path_session(
                     &mut state.closed_streams,
                 ).await {
                     carrier_generation.clear();
-                    fail_client_tcp_streams(&mut state.streams, &err);
+                    fail_client_tcp_products(&mut state.streams, &mut state.datagrams, &err);
                     eprintln!("warning: TCP pending stream cleanup failed: {err}");
                     drop_connection = true;
                 }
@@ -213,7 +220,7 @@ pub(super) async fn run_client_tcp_path_session(
                     .await;
                     if let Err(err) = result {
                         carrier_generation.clear();
-                        fail_client_tcp_streams(&mut state.streams, &err);
+                        fail_client_tcp_products(&mut state.streams, &mut state.datagrams, &err);
                         eprintln!("warning: TCP peer status request failed: {err}");
                         drop_connection = true;
                     }
@@ -227,12 +234,13 @@ pub(super) async fn run_client_tcp_path_session(
                             connection,
                             &mut state.streams,
                             &mut state.closed_streams,
+                            &mut state.datagrams,
                             &runtime,
                         )
                         .await
                         {
                             carrier_generation.clear();
-                            fail_client_tcp_streams(&mut state.streams, &err);
+                            fail_client_tcp_products(&mut state.streams, &mut state.datagrams, &err);
                             eprintln!("warning: TCP path session frame handling failed: {err}");
                             drop_connection = true;
                         } else if command_may_recv
@@ -244,6 +252,7 @@ pub(super) async fn run_client_tcp_path_session(
                                 connection,
                                 &mut state.streams,
                                 &mut state.closed_streams,
+                                &mut state.datagrams,
                                 &runtime,
                                 carrier_generation.current,
                                 runtime.stream_frame_queue,
@@ -253,7 +262,7 @@ pub(super) async fn run_client_tcp_path_session(
                             .await;
                             if let Err(err) = result {
                                 carrier_generation.clear();
-                                fail_client_tcp_streams(&mut state.streams, &err);
+                                fail_client_tcp_products(&mut state.streams, &mut state.datagrams, &err);
                                 eprintln!("warning: TCP path session command failed: {err}");
                                 drop_connection = true;
                             }
@@ -262,14 +271,14 @@ pub(super) async fn run_client_tcp_path_session(
                     Some(Err(err)) => {
                         let err = RuntimeError::Encrypted(err);
                         carrier_generation.clear();
-                        fail_client_tcp_streams(&mut state.streams, &err);
+                        fail_client_tcp_products(&mut state.streams, &mut state.datagrams, &err);
                         eprintln!("warning: TCP path session read failed: {err}");
                         drop_connection = true;
                     }
                     None => {
                         let err = RuntimeError::ReliablePathSessionClosed;
                         carrier_generation.clear();
-                        fail_client_tcp_streams(&mut state.streams, &err);
+                        fail_client_tcp_products(&mut state.streams, &mut state.datagrams, &err);
                         drop_connection = true;
                     }
                 }
@@ -283,6 +292,7 @@ pub(super) async fn run_client_tcp_path_session(
                             connection,
                             &mut state.streams,
                             &mut state.closed_streams,
+                            &mut state.datagrams,
                             &runtime,
                             carrier_generation.current,
                             runtime.stream_frame_queue,
@@ -292,7 +302,7 @@ pub(super) async fn run_client_tcp_path_session(
                         .await;
                         if let Err(err) = result {
                             carrier_generation.clear();
-                            fail_client_tcp_streams(&mut state.streams, &err);
+                            fail_client_tcp_products(&mut state.streams, &mut state.datagrams, &err);
                             eprintln!("warning: TCP path session command failed: {err}");
                             drop_connection = true;
                         }
@@ -302,7 +312,7 @@ pub(super) async fn run_client_tcp_path_session(
                             let _ = close_client_tcp_path(
                                 connection,
                                 PathId(runtime.path_index as u16),
-                                !state.streams.is_empty(),
+                                !state.streams.is_empty() || !state.datagrams.is_empty(),
                             )
                             .await;
                             return;
@@ -314,7 +324,7 @@ pub(super) async fn run_client_tcp_path_session(
                 if let Err(err) = connection.carrier.tick_heartbeat().await
                 {
                     carrier_generation.clear();
-                    fail_client_tcp_streams(&mut state.streams, &err);
+                    fail_client_tcp_products(&mut state.streams, &mut state.datagrams, &err);
                     eprintln!("warning: TCP path heartbeat failed: {err}");
                     drop_connection = true;
                 }
@@ -441,6 +451,56 @@ async fn handle_disconnected_client_tcp_command(
                 }
             }
         }
+        ReliablePathCommand::OpenDatagramAttachment {
+            attachment_id,
+            frames,
+            failure,
+            open_deadline,
+            mut response,
+        } => {
+            if response.is_closed() || open_deadline <= tokio::time::Instant::now() {
+                let _ = response.send(Err(RuntimeError::PathOpenTimedOut));
+                return None;
+            }
+            let connect = connect_client_tcp_path(runtime, open_deadline);
+            tokio::pin!(connect);
+            let connect_result = tokio::select! {
+                biased;
+                _ = response.closed() => return None,
+                result = &mut connect => result,
+            };
+            match connect_result {
+                Ok(connected) => {
+                    if response.is_closed() || open_deadline <= tokio::time::Instant::now() {
+                        let _ = response.send(Err(RuntimeError::PathOpenTimedOut));
+                        return None;
+                    }
+                    let path_instance_id = connected.path_instance_id;
+                    if let Err(err) = state.datagrams.attach(attachment_id, frames, failure) {
+                        let _ = response.send(Err(err));
+                        return None;
+                    }
+                    state.connection = Some(connected);
+                    if response.send(Ok(path_instance_id)).is_err() {
+                        state.datagrams.remove_attachment(attachment_id);
+                    }
+                }
+                Err(err) => {
+                    let _ = response.send(Err(err));
+                }
+            }
+        }
+        ReliablePathCommand::OpenDatagramFlow { response, .. } => {
+            let _ = response.send(Err(RuntimeError::ReliablePathSessionClosed));
+        }
+        ReliablePathCommand::SendDatagramFrame { response, .. } => {
+            let _ = response.send(Err(RuntimeError::ReliablePathSessionClosed));
+        }
+        ReliablePathCommand::CloseDatagramAttachment { response, .. } => {
+            if let Some(response) = response {
+                let _ = response.send(Ok(()));
+            }
+        }
         ReliablePathCommand::SendTcpCapacityProbe(_) => {}
         ReliablePathCommand::CancelTcpOpen { .. }
         | ReliablePathCommand::SendFrame(_)
@@ -448,6 +508,15 @@ async fn handle_disconnected_client_tcp_command(
         | ReliablePathCommand::CloseStream(_) => {}
     }
     None
+}
+
+fn fail_client_tcp_products(
+    streams: &mut HashMap<StreamId, ClientTcpPathStreamState>,
+    datagrams: &mut ClientTcpDatagramState,
+    error: &RuntimeError,
+) {
+    fail_client_tcp_streams(streams, error);
+    datagrams.clear();
 }
 
 async fn connect_client_tcp_path(

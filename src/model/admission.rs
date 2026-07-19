@@ -133,7 +133,8 @@ pub(crate) fn bulk_striping_admitted_paths(
         };
         // Global discovery has no stream backlog. Defer ECF to the directional
         // sender, which owns the exact lower-offset tail for every carrier.
-        let suppression = bulk_candidate_resource_suppression(check);
+        let suppression =
+            bulk_candidate_resource_suppression(check, candidate.has_bulk_rate_evidence);
         if suppression.is_none() {
             selected.push(candidate);
         } else {
@@ -170,6 +171,10 @@ pub(crate) fn bulk_striping_admitted_paths(
                         payload_bytes,
                         mux_limits,
                         position,
+                        bulk_path_has_completion_evidence(
+                            candidate.snapshot,
+                            candidate.has_bulk_rate_evidence,
+                        ),
                     ),
                     bulk_scheduler_inflight_debt_bytes(candidate.snapshot, position),
                     candidate.snapshot.queue_bytes,
@@ -261,26 +266,37 @@ pub(crate) fn bulk_candidate_admission_suppression(
 pub(crate) fn bulk_candidate_admission_suppression_with_ordering_debt(
     check: BulkAdmissionCheck,
 ) -> Option<&'static str> {
-    bulk_candidate_admission_suppression_with_completion_backlog(check, 0)
+    bulk_candidate_admission_suppression_with_completion_backlog(check, 0, true)
 }
 
 pub(crate) fn bulk_candidate_admission_suppression_with_completion_backlog(
     check: BulkAdmissionCheck,
     completion_backlog_bytes: u64,
+    has_bulk_rate_evidence: bool,
 ) -> Option<&'static str> {
+    let has_qualified_bulk_rate =
+        bulk_path_has_completion_evidence(check.candidate_snapshot, has_bulk_rate_evidence);
+    if let Some(reason) = bulk_candidate_resource_suppression(check, has_qualified_bulk_rate) {
+        return Some(reason);
+    }
     // Ordering debt bounds receive-hole resources; it does not prove that the
     // leading path has an independent lower backlog. Response policy supplies
     // that product backlog explicitly when it owns one.
-    if let Some(reason) =
-        bulk_additional_path_completion_suppression(check, completion_backlog_bytes)
-    {
+    if let Some(reason) = bulk_additional_path_completion_suppression(
+        check,
+        completion_backlog_bytes,
+        has_qualified_bulk_rate,
+    ) {
         return Some(reason);
     }
-    bulk_candidate_resource_suppression(check)
+    None
 }
 
-fn bulk_candidate_resource_suppression(check: BulkAdmissionCheck) -> Option<&'static str> {
-    if !bulk_candidate_within_inflight_limit(check) {
+fn bulk_candidate_resource_suppression(
+    check: BulkAdmissionCheck,
+    has_qualified_bulk_rate: bool,
+) -> Option<&'static str> {
+    if !bulk_candidate_within_inflight_limit(check, has_qualified_bulk_rate) {
         return Some("inflight_limit");
     }
     if !bulk_candidate_within_reorder_budget(
@@ -289,6 +305,7 @@ fn bulk_candidate_resource_suppression(check: BulkAdmissionCheck) -> Option<&'st
         check.mux_limits,
         check.position,
         check.stream_ordering_debt_bytes,
+        has_qualified_bulk_rate,
     ) {
         return Some("reorder_budget");
     }
@@ -313,11 +330,12 @@ fn bulk_candidate_resource_suppression(check: BulkAdmissionCheck) -> Option<&'st
 fn bulk_additional_path_completion_suppression(
     check: BulkAdmissionCheck,
     completion_backlog_bytes: u64,
+    has_qualified_bulk_rate: bool,
 ) -> Option<&'static str> {
     if check.position != BulkCandidatePosition::AdditionalPath {
         return None;
     }
-    if !bulk_path_has_completion_evidence(check.candidate_snapshot) {
+    if !has_qualified_bulk_rate {
         return None;
     }
     // For a full bulk backlog, compare the candidate with the leading path
@@ -344,10 +362,22 @@ fn bulk_additional_path_completion_suppression(
     None
 }
 
-fn bulk_path_has_completion_evidence(candidate: PathSnapshot) -> bool {
-    // ECF applies after a candidate has a complete delivery sample. Before
-    // that, only its bounded startup service can acquire transport evidence.
-    !candidate.app_limited && candidate.confidence >= 1.0
+fn bulk_path_has_completion_evidence(
+    candidate: PathSnapshot,
+    has_bulk_rate_evidence: bool,
+) -> bool {
+    // An idle native carrier's rate is a lower bound while send-window credit
+    // remains available; let that credit reacquire bulk service instead of
+    // feeding scheduler-induced idleness back into ECF. Portable paths and
+    // carriers under latency pressure keep the conservative boundary.
+    let acquiring_native_capacity = bulk_path_acquiring_native_capacity(candidate);
+    has_bulk_rate_evidence && candidate.confidence >= 1.0 && !acquiring_native_capacity
+}
+
+fn bulk_path_acquiring_native_capacity(candidate: PathSnapshot) -> bool {
+    candidate.app_limited
+        && candidate.carrier_inflight_limit_bytes > 0
+        && !bulk_path_has_latency_pressure(candidate)
 }
 
 fn bulk_completion_horizon_applies(check: BulkAdmissionCheck) -> bool {
@@ -393,17 +423,37 @@ pub(crate) fn bulk_completion_horizon_ms_with_ordering_debt(
     best_eta_ms.max(0.0) + best_payload_tx_ms + absorption_ms
 }
 
-fn bulk_candidate_within_inflight_limit(check: BulkAdmissionCheck) -> bool {
+fn bulk_candidate_within_inflight_limit(
+    check: BulkAdmissionCheck,
+    has_qualified_bulk_rate: bool,
+) -> bool {
     let candidate = check.candidate_snapshot;
     let payload_bytes = check.payload_bytes;
     let mux_limits = check.mux_limits;
     let position = check.position;
-    // Contiguous Data Sequence ownership removes cross-path reorder debt; it
-    // does not mint more path service credit. Every TCP/QUIC carrier therefore
-    // uses the same measured data-level window while native congestion,
-    // recovery, pacing, and socket backpressure remain authoritative below it.
-    let inflight_limit =
-        bulk_product_inflight_limit_bytes(candidate, payload_bytes, mux_limits, position);
+    if bulk_path_has_latency_pressure(candidate) {
+        let inflight_limit = bulk_product_inflight_limit_bytes(
+            candidate,
+            payload_bytes,
+            mux_limits,
+            position,
+            has_qualified_bulk_rate,
+        );
+        let committed = bulk_scheduler_inflight_debt_bytes(candidate, position);
+        return committed.saturating_add(payload_bytes as u64) <= inflight_limit
+            || committed < inflight_limit;
+    }
+
+    // Native TCP or QUIC credit governs packet emission. This independent
+    // product-service window bounds how much ordered Data Sequence work MPP
+    // may assign before product ACKs prove that the carrier drained it.
+    let inflight_limit = bulk_product_inflight_limit_bytes(
+        candidate,
+        payload_bytes,
+        mux_limits,
+        position,
+        has_qualified_bulk_rate,
+    );
     let committed = bulk_scheduler_inflight_debt_bytes(candidate, position);
     bulk_quantum_granular_limit_allows(committed, payload_bytes, inflight_limit, position)
 }
@@ -428,11 +478,16 @@ fn bulk_product_inflight_limit_bytes(
     candidate: PathSnapshot,
     payload_bytes: usize,
     mux_limits: MuxLimits,
-    position: BulkCandidatePosition,
+    _position: BulkCandidatePosition,
+    has_qualified_bulk_rate: bool,
 ) -> u64 {
     let configured_ceiling = mux_limits.max_path_flight_bytes as u64;
     let payload_floor = payload_bytes as u64;
-    let bdp = bulk_path_bdp_bytes(candidate);
+    let bdp = if bulk_path_has_latency_pressure(candidate) {
+        bulk_latency_pressure_bdp_bytes(candidate)
+    } else {
+        bulk_path_bdp_bytes(candidate)
+    };
     let bdp_limit = bulk_pipe_window_bytes(bdp).max(payload_floor);
     let modeled_limit = if candidate.data_level_limit_bytes > 0 {
         // The runtime capacity model has already bounded this product-layer
@@ -442,17 +497,24 @@ fn bulk_product_inflight_limit_bytes(
     } else {
         bdp_limit
     };
-    let modeled_limit = if !candidate.has_durable_product_progress {
-        modeled_limit.max(reliable_unproven_path_startup_flight_limit_bytes(
-            mux_limits,
-        ))
+    let modeled_limit = if !has_qualified_bulk_rate {
+        // Positive Data ACK attribution proves liveness, not capacity. Let the
+        // native congestion window acquire a complete rate sample; a cold path
+        // without native state retains only the bounded startup window.
+        modeled_limit.max(bulk_unproven_path_flight_limit_bytes(candidate, mux_limits))
     } else {
         modeled_limit
     }
     .min(configured_ceiling.max(payload_floor));
-    if bulk_first_path_has_latency_pressure(candidate, position) {
-        let service_horizon = bulk_scheduling_horizon_bytes(payload_bytes, mux_limits) as u64;
-        return modeled_limit.min(service_horizon.max(payload_floor));
+    if bulk_path_has_latency_pressure(candidate) {
+        let latency_limit = if has_qualified_bulk_rate {
+            bulk_latency_pressure_bdp_bytes(candidate)
+        } else {
+            reliable_unproven_path_startup_flight_limit_bytes(mux_limits)
+        }
+        .max(payload_floor)
+        .min(configured_ceiling.max(payload_floor));
+        return modeled_limit.min(latency_limit);
     }
     modeled_limit
 }
@@ -463,18 +525,42 @@ fn bulk_candidate_within_reorder_budget(
     mux_limits: MuxLimits,
     position: BulkCandidatePosition,
     stream_ordering_debt_bytes: u64,
+    has_qualified_bulk_rate: bool,
 ) -> bool {
     if position == BulkCandidatePosition::AdditionalPath {
-        // Native carrier congestion windows are enforced below MPP. At the
-        // Data Sequence layer, every candidate and lower-offset owner consumes
-        // the same connection-wide reorder/window envelope.
+        // Native carrier congestion windows bound each path below MPP. The
+        // product service window may be larger than an app-limited rate BDP;
+        // clamping it again here would prevent TCP/QUIC from growing that pipe.
+        // The connection-wide envelope still bounds the complete receive hole.
         let candidate_product_debt = bulk_product_reorder_debt_bytes(candidate);
-        return bulk_quantum_granular_limit_allows(
+        let measured_budget = bulk_reorder_budget_bytes(candidate, payload_bytes, mux_limits);
+        let acquisition_budget = if has_qualified_bulk_rate {
+            candidate.data_level_limit_bytes
+        } else {
+            // QUIC/TCP congestion credit bounds Startup below MPP. Keeping the
+            // product window in step lets that native controller finish its
+            // capacity search without granting completion-time authority.
+            candidate
+                .data_level_limit_bytes
+                .max(bulk_unproven_path_flight_limit_bytes(candidate, mux_limits))
+        };
+        let path_budget = measured_budget
+            .max(acquisition_budget)
+            .min(mux_limits.max_path_flight_bytes as u64)
+            .max(payload_bytes as u64);
+        let within_path_budget = bulk_quantum_granular_limit_allows(
+            candidate_product_debt,
+            payload_bytes,
+            path_budget,
+            position,
+        );
+        let within_stream_envelope = bulk_quantum_granular_limit_allows(
             candidate_product_debt.saturating_add(stream_ordering_debt_bytes),
             payload_bytes,
             bulk_stream_reorder_envelope_bytes(payload_bytes, mux_limits),
             position,
         );
+        return within_path_budget && within_stream_envelope;
     }
     let admission_budget = bulk_admission_reorder_budget_bytes_for_ordering_debt(
         candidate,
@@ -489,6 +575,15 @@ fn bulk_candidate_within_reorder_budget(
         admission_budget,
         position,
     )
+}
+
+fn bulk_unproven_path_flight_limit_bytes(candidate: PathSnapshot, mux_limits: MuxLimits) -> u64 {
+    candidate
+        .carrier_inflight_limit_bytes
+        .max(reliable_unproven_path_startup_flight_limit_bytes(
+            mux_limits,
+        ))
+        .min(mux_limits.max_path_flight_bytes as u64)
 }
 
 fn bulk_reorder_absorption_ms(
@@ -532,7 +627,19 @@ fn bulk_first_path_has_latency_pressure(
     candidate: PathSnapshot,
     position: BulkCandidatePosition,
 ) -> bool {
-    position == BulkCandidatePosition::FirstPath && bulk_latency_pressure_flows(candidate) > 0
+    position == BulkCandidatePosition::FirstPath && bulk_path_has_latency_pressure(candidate)
+}
+
+fn bulk_path_has_latency_pressure(candidate: PathSnapshot) -> bool {
+    bulk_latency_pressure_flows(candidate) > 0
+}
+
+fn bulk_latency_pressure_bdp_bytes(candidate: PathSnapshot) -> u64 {
+    let rate = candidate
+        .carrier_delivery_rate_bps
+        .filter(|rate| rate.is_finite() && *rate > 0.0)
+        .unwrap_or_else(|| bulk_effective_rate_bps(candidate));
+    bulk_rate_bdp_bytes(rate, candidate.srtt_ms)
 }
 
 fn bulk_latency_pressure_flows(candidate: PathSnapshot) -> u32 {

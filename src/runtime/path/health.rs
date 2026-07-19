@@ -498,6 +498,16 @@ impl ClientPathHealthRecord {
         self.mark_delivery(sample);
     }
 
+    pub(in crate::runtime) fn mark_product_delivery_for_instance(
+        &mut self,
+        path_instance_id: CarrierPathInstanceId,
+        sample: PathRateSample,
+    ) {
+        if self.accepts_native_carrier_observation(path_instance_id) {
+            self.mark_product_delivery(sample);
+        }
+    }
+
     pub(in crate::runtime) fn mark_product_delivery_replacing_rate(
         &mut self,
         sample: PathRateSample,

@@ -8,6 +8,7 @@ pub(in crate::runtime) mod capacity;
 pub(in crate::runtime) mod client;
 mod client_capacity;
 pub(in crate::runtime) mod client_connection;
+mod client_datagram;
 mod client_receive;
 mod client_session;
 mod client_state;

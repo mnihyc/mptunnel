@@ -88,19 +88,6 @@ impl ClientTcpCarrierConnection {
         Ok(())
     }
 
-    /// Datagram request/response accepts only its matching carrier Pong, but a
-    /// stray Pong is unrelated traffic rather than a fatal product response.
-    pub(in crate::runtime) fn clear_matching_heartbeat(&mut self, nonce: u64) -> bool {
-        if self
-            .pending_heartbeat
-            .is_none_or(|(pending_nonce, _)| pending_nonce != nonce)
-        {
-            return false;
-        }
-        self.pending_heartbeat = None;
-        true
-    }
-
     pub(in crate::runtime) async fn tick_heartbeat(&mut self) -> Result<(), RuntimeError> {
         let now = tokio::time::Instant::now();
         if let Some((_, deadline)) = self.pending_heartbeat.as_ref()
@@ -117,6 +104,8 @@ impl ClientTcpCarrierConnection {
         Ok(())
     }
 
+    /// Closes a session-owning reliable carrier. Datagram-only attachments send
+    /// `PATH_CLOSE` directly because they must not terminate shared session state.
     pub(in crate::runtime) async fn close(&mut self, path_id: PathId) -> Result<(), RuntimeError> {
         self.writer
             .write_frame(&Frame::PathClose {

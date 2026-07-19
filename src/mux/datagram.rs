@@ -138,6 +138,7 @@ pub enum DatagramError {
     EmptyPayload,
     PayloadTooLarge { actual: usize, limit: usize },
     QueueFull { actual: usize, limit: usize },
+    FlowLimitExceeded { limit: usize },
     DatagramIdOverflow,
 }
 
@@ -153,6 +154,9 @@ impl std::fmt::Display for DatagramError {
                     f,
                     "datagram queue would hold {actual} bytes, limit is {limit}"
                 )
+            }
+            Self::FlowLimitExceeded { limit } => {
+                write!(f, "datagram flow limit of {limit} reached")
             }
             Self::DatagramIdOverflow => write!(f, "datagram id space is exhausted"),
         }

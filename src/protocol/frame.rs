@@ -122,6 +122,7 @@ pub(crate) fn reliable_path_frame_pacing_bytes(frame: &Frame) -> usize {
 ///
 /// ACK completeness controls what omitted higher ranges imply, not the prefix
 /// stated by ranges that are present, so it is deliberately not an input here.
+#[cfg_attr(not(any(test, feature = "lab-diagnostics")), allow(dead_code))]
 pub(crate) fn stream_ack_contiguous_frontier(ranges: &[OffsetRange]) -> u64 {
     ranges
         .first()

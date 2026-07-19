@@ -17,7 +17,7 @@ use crate::runtime::path::authentication::ServerPathAuthentication;
 use crate::runtime::path::server_context::{ServerLocalPath, ServerPathContext};
 use crate::runtime::path::{ServerCarrierPathRegistration, ServerLocalPathProperties};
 use crate::runtime::peer_status::PeerStatusCarrier;
-use crate::scheduler::traffic_class_from_stream_demand_hint;
+use crate::scheduler::{TrafficClass, traffic_class_from_stream_demand_hint};
 use crate::transport::PathSpec;
 use crate::transport::quic::QuicCarrierError;
 
@@ -190,6 +190,7 @@ async fn accept_server_udp_path_handshake(
     RuntimeError,
 > {
     let (mut send, mut recv) = connection.accept_bi().await?;
+    send.set_traffic_class(TrafficClass::Control)?;
     let authentication = ServerPathAuthentication::from_session_hello(
         &context.security,
         udp_path_read_frame(&mut recv, context.codec_limits).await?,
@@ -317,6 +318,7 @@ async fn handle_server_udp_bidi_stream(
             ..
         } => {
             let lane = traffic_class_from_stream_demand_hint(demand);
+            send.set_traffic_class(lane)?;
             handle_server_udp_reliable_stream(
                 send,
                 recv,
@@ -335,6 +337,7 @@ async fn handle_server_udp_bidi_stream(
         Frame::OpenDatagramFlow {
             flow_id, target, ..
         } => {
+            send.set_traffic_class(TrafficClass::RealtimeDatagram)?;
             handle_server_udp_datagram_stream(
                 send,
                 recv,
@@ -348,6 +351,7 @@ async fn handle_server_udp_bidi_stream(
             .await
         }
         Frame::Ping { nonce } => {
+            send.set_traffic_class(TrafficClass::Control)?;
             udp_path_write_frame(&mut send, &Frame::Pong { nonce }, context.codec_limits).await?;
             udp_path_finish_stream(&mut send)?;
             Ok(())

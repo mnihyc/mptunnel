@@ -118,6 +118,23 @@ fn exact_original_data_ack_releases_output_flight_and_progress() {
 }
 
 #[test]
+fn data_ack_recovery_candidate_uses_the_blocking_original_flight_identity() {
+    let (binding, path, _receivers) = binding_for_underlay(UnderlayProtocol::Tcp);
+    let before = Instant::now();
+    binding.record_original_flight(path, &stream_data_frame_at(4096, 4096));
+    let after = Instant::now();
+
+    let candidate = binding
+        .data_ack_recovery_candidate(4096)
+        .expect("blocking original flight");
+    assert_eq!(candidate.start, 4096);
+    assert_eq!(candidate.end, 8192);
+    assert_eq!(candidate.key, path);
+    assert!(candidate.sent_at >= before && candidate.sent_at <= after);
+    assert_eq!(binding.data_ack_recovery_candidate(8192), None);
+}
+
+#[test]
 fn out_of_order_data_ack_exposes_exact_lower_path_debt() {
     let (binding, path, _receivers) = binding_for_underlay(UnderlayProtocol::Tcp);
     binding.record_original_flight(path, &stream_data_frame_at(4096, 4096));
@@ -220,15 +237,14 @@ fn reinjection_does_not_replace_the_original_path_identity() {
 fn failed_output_reinjection_covers_all_interleaved_original_ranges() {
     let (binding, failed, _receivers) = binding_for_underlay(UnderlayProtocol::Tcp);
     let alternate = key(UnderlayProtocol::Udp, 1);
-    let failed_commands = binding
+    let failed_path_instance_id = binding
         .outputs
         .lock()
         .expect("test response outputs lock")
         .entries
         .first()
         .expect("initial output")
-        .commands
-        .clone();
+        .path_instance_id;
     let (alternate_commands, _alternate_receivers) = reliable_path_command_channels(8);
     binding.attach(
         alternate.underlay,
@@ -243,7 +259,7 @@ fn failed_output_reinjection_covers_all_interleaved_original_ranges() {
     binding.record_original_flight(failed, &failed_first);
     binding.record_original_flight(alternate, &alternate_first);
     binding.record_original_flight(failed, &failed_second);
-    binding.detach(failed, &failed_commands);
+    binding.detach_path_instance(failed, failed_path_instance_id);
 
     assert_eq!(
         binding.uncovered_failed_original_ranges(),

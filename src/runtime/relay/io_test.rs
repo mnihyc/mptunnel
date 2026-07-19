@@ -1,23 +1,18 @@
 use super::*;
 use crate::model::capacity::{
     MAX_RELIABLE_SERVICE_QUANTUM_BYTES, PATH_OPEN_SCORE_BYTES,
-    QUIC_PERSISTENT_CONGESTION_THRESHOLD, adaptive_reliable_relay_inflight_bytes,
-    adaptive_reliable_relay_reinjection_bytes, reliable_bulk_carrier_feed_quantum_bytes,
-    reliable_relay_buffer_len,
+    adaptive_reliable_relay_inflight_bytes, adaptive_reliable_relay_reinjection_bytes,
+    reliable_bulk_carrier_feed_quantum_bytes, reliable_relay_buffer_len,
 };
 use crate::model::path::{CarrierPathInstanceId, RelayPathInstance, RelayPathKey};
-use crate::model::timing::{
-    reliable_data_ack_gap_persistence_interval, reliable_data_retransmission_interval,
-    transport_pto_from_snapshot,
-};
+use crate::model::timing::{reliable_data_retransmission_interval, transport_pto_from_snapshot};
 use crate::model::work::{
     reliable_critical_tail_reinjection_limit_bytes,
     reliable_failed_original_reinjection_limit_bytes,
-    reliable_persistent_ack_gap_reinjection_limit_bytes,
 };
 use crate::mux::MuxLimits;
 use crate::protocol::frame::reliable_stream_frame_extent;
-use crate::protocol::{PathId, StreamId};
+use crate::protocol::{PathId, StreamId, UnderlayProtocol};
 use crate::runtime::stream::reliable_stream_recv_progress_interval;
 use crate::scheduler::TrafficClass;
 
@@ -41,6 +36,35 @@ fn stream_fin_waits_for_final_offset_before_close() {
         .expect("tail data");
 
     assert!(pending_stream_fin_ready(&recv_stream, pending_final_offset));
+}
+
+#[test]
+fn stream_fin_rejects_final_offset_behind_reordered_data() {
+    let mut recv_stream = ReliableRecvStream::new(StreamId(405), MuxLimits::default());
+    recv_stream
+        .receive_data(8, Bytes::from_static(b"tail"))
+        .expect("buffer reordered data");
+    let mut pending_final_offset = None;
+
+    assert!(matches!(
+        receive_stream_fin(&recv_stream, &mut pending_final_offset, 10),
+        Err(RuntimeError::Protocol(
+            "stream FIN final offset is behind received data"
+        ))
+    ));
+    assert_eq!(pending_final_offset, None);
+}
+
+#[test]
+fn pending_stream_fin_rejects_data_beyond_final_offset() {
+    assert!(validate_stream_data_final_offset(Some(10), 8, 2).is_ok());
+    assert!(matches!(
+        validate_stream_data_final_offset(Some(10), 8, 3),
+        Err(RuntimeError::Protocol(
+            "stream data exceeds declared final offset"
+        ))
+    ));
+    assert!(validate_stream_data_final_offset(None, u64::MAX, usize::MAX).is_ok());
 }
 
 #[test]
@@ -129,26 +153,22 @@ fn ack_gap_reinjection_requires_authoritative_ack_gap_shape() {
 }
 
 #[test]
-fn authoritative_ack_snapshot_does_not_regress_on_stale_or_incomplete_ack() {
-    let mut frontier = 0;
+fn authoritative_ack_snapshot_merges_positive_incomplete_delta_without_regressing() {
     let mut ranges = Vec::new();
     let mut complete = false;
     update_reinjection_authoritative_ack_snapshot(
-        &mut frontier,
         &mut ranges,
         &mut complete,
         true,
         &[OffsetRange { start: 0, end: 128 }],
     );
     update_reinjection_authoritative_ack_snapshot(
-        &mut frontier,
         &mut ranges,
         &mut complete,
         true,
         &[OffsetRange { start: 0, end: 64 }],
     );
     update_reinjection_authoritative_ack_snapshot(
-        &mut frontier,
         &mut ranges,
         &mut complete,
         false,
@@ -158,14 +178,40 @@ fn authoritative_ack_snapshot_does_not_regress_on_stale_or_incomplete_ack() {
         }],
     );
 
-    assert_eq!(frontier, 128);
-    assert_eq!(ranges, vec![OffsetRange { start: 0, end: 128 }]);
+    assert_eq!(
+        ranges,
+        vec![
+            OffsetRange { start: 0, end: 128 },
+            OffsetRange {
+                start: 192,
+                end: 256,
+            },
+        ]
+    );
     assert!(complete);
 }
 
 #[test]
+fn incomplete_ack_cannot_establish_gap_authority() {
+    let mut ranges = Vec::new();
+    let mut complete = false;
+
+    update_reinjection_authoritative_ack_snapshot(
+        &mut ranges,
+        &mut complete,
+        false,
+        &[OffsetRange {
+            start: 192,
+            end: 256,
+        }],
+    );
+
+    assert!(ranges.is_empty());
+    assert!(!complete);
+}
+
+#[test]
 fn authoritative_gap_persistence_ignores_an_older_complete_snapshot() {
-    let mut frontier = 0;
     let mut ranges = Vec::new();
     let mut complete = false;
     let current = [
@@ -192,35 +238,15 @@ fn authoritative_gap_persistence_ignores_an_older_complete_snapshot() {
     let persistence = Duration::from_millis(300);
     let mut progress = ReliableAckGapReinjectionProgress::default();
 
-    update_reinjection_authoritative_ack_snapshot(
-        &mut frontier,
-        &mut ranges,
-        &mut complete,
-        true,
-        &current,
-    );
-    assert!(!progress.reinjection_ready_at(
-        complete,
-        &ranges,
-        Some(UnderlayProtocol::Tcp),
-        true,
-        persistence,
-        now,
-    ));
+    update_reinjection_authoritative_ack_snapshot(&mut ranges, &mut complete, true, &current);
+    assert!(!progress.reinjection_ready_at(complete, &ranges, true, false, persistence, now,));
 
-    update_reinjection_authoritative_ack_snapshot(
-        &mut frontier,
-        &mut ranges,
-        &mut complete,
-        true,
-        &stale,
-    );
-    assert_eq!(frontier, 4096);
+    update_reinjection_authoritative_ack_snapshot(&mut ranges, &mut complete, true, &stale);
     assert_eq!(ranges.as_slice(), current.as_slice());
     assert!(progress.reinjection_ready_at(
         complete,
         &ranges,
-        Some(UnderlayProtocol::Tcp),
+        true,
         true,
         persistence,
         now + persistence,
@@ -239,74 +265,6 @@ fn persistent_ack_gap_reinjection_limit_uses_critical_event_quantum() {
     assert_eq!(
         reinjection_limit, base_limit,
         "persistent ACK-gap reinjection may bypass optional budget, but one event reinjections only one bounded quantum"
-    );
-}
-
-#[test]
-fn persistent_tcp_data_ack_gap_reinjection_uses_one_target_flight() {
-    let limits = MuxLimits::default();
-    let tcp = PathSnapshot::new(PathId(1), UnderlayProtocol::Tcp, 500.0, 400_000_000.0);
-    let reinjection_debt = limits.max_repair_bytes;
-    let base_limit =
-        adaptive_reliable_relay_reinjection_bytes(Some(tcp), TrafficClass::Throughput, limits);
-    let target_flight =
-        adaptive_reliable_relay_inflight_bytes(Some(tcp), TrafficClass::Throughput, limits);
-    let reinjection_limit = reliable_persistent_ack_gap_reinjection_limit_bytes(
-        Some(tcp),
-        Some(UnderlayProtocol::Tcp),
-        TrafficClass::Throughput,
-        reinjection_debt,
-        limits,
-    );
-
-    assert_eq!(
-        reinjection_limit,
-        reliable_critical_tail_reinjection_limit_bytes(
-            target_flight.max(base_limit),
-            reinjection_debt,
-            limits,
-        )
-    );
-    assert!(
-        reinjection_limit > base_limit,
-        "a proven bulk TCP original-transmission path failure must not refill a large ordered hole one 64 KiB quantum per three-PTO interval"
-    );
-}
-
-#[test]
-fn persistent_tcp_bulk_ack_gap_reinjection_retains_failure_quantum() {
-    let limits = MuxLimits::default();
-    let mut tcp = PathSnapshot::new(PathId(1), UnderlayProtocol::Tcp, 500.0, 400_000_000.0);
-    let target_flight =
-        adaptive_reliable_relay_inflight_bytes(Some(tcp), TrafficClass::Throughput, limits);
-    let base_limit =
-        adaptive_reliable_relay_reinjection_bytes(Some(tcp), TrafficClass::Throughput, limits);
-    let remaining = 32 * 1024;
-    tcp.data_level_bytes_in_flight = target_flight.saturating_sub(remaining) as u64;
-
-    assert_eq!(
-        reliable_persistent_ack_gap_reinjection_limit_bytes(
-            Some(tcp),
-            Some(UnderlayProtocol::Tcp),
-            TrafficClass::Throughput,
-            limits.max_repair_bytes,
-            limits,
-        ),
-        remaining.max(base_limit),
-        "failure reinjection fills modeled target path headroom without dropping below one bounded quantum"
-    );
-
-    tcp.queue_bytes = target_flight as u64;
-    assert_eq!(
-        reliable_persistent_ack_gap_reinjection_limit_bytes(
-            Some(tcp),
-            Some(UnderlayProtocol::Tcp),
-            TrafficClass::Throughput,
-            limits.max_repair_bytes,
-            limits,
-        ),
-        base_limit,
-        "stale alternate-flight debt must not suppress all recovery after a proven TCP original-transmission path failure"
     );
 }
 
@@ -364,7 +322,7 @@ fn failed_original_reinjection_is_transport_neutral_above_native_congestion() {
 }
 
 #[test]
-fn ack_gap_reinjection_waits_for_a_persistent_carrier_recovery_gap() {
+fn data_retransmission_keeps_tcp_and_quic_recovery_clocks_separate() {
     assert_eq!(
         reliable_data_retransmission_interval(Some(UnderlayProtocol::Tcp), None),
         Duration::from_secs(1),
@@ -374,62 +332,6 @@ fn ack_gap_reinjection_waits_for_a_persistent_carrier_recovery_gap() {
         transport_pto_from_snapshot(None),
         "TCP data-level recovery and QUIC PTO must not share one timer formula",
     );
-    assert_eq!(
-        reliable_data_ack_gap_persistence_interval(Some(UnderlayProtocol::Tcp), None),
-        Duration::from_secs(3),
-    );
-    assert_eq!(
-        reliable_data_ack_gap_persistence_interval(Some(UnderlayProtocol::Udp), None),
-        transport_pto_from_snapshot(None).saturating_mul(3),
-    );
-}
-
-#[test]
-fn persistent_ack_gap_reinjection_keeps_udp_event_bounded() {
-    let limits = MuxLimits::default();
-    let reinjection_debt = limits.max_repair_bytes;
-    let path = PathSnapshot::new(PathId(1), UnderlayProtocol::Udp, 500.0, 400_000_000.0);
-    let base_limit =
-        adaptive_reliable_relay_reinjection_bytes(Some(path), TrafficClass::Throughput, limits);
-    assert_eq!(
-        reliable_persistent_ack_gap_reinjection_limit_bytes(
-            Some(path),
-            Some(UnderlayProtocol::Udp),
-            TrafficClass::Throughput,
-            reinjection_debt,
-            limits,
-        ),
-        reliable_critical_tail_reinjection_limit_bytes(base_limit, reinjection_debt, limits,),
-        "QUIC original-transmission path loss retains one bounded product-reinjection event"
-    );
-}
-
-#[test]
-fn persistent_tcp_ack_gap_reinjection_uses_path_model_after_flow_demotes() {
-    let limits = MuxLimits::default();
-    let reinjection_debt = limits.max_repair_bytes;
-    let path = PathSnapshot::new(PathId(1), UnderlayProtocol::Tcp, 500.0, 400_000_000.0);
-    let base_limit =
-        adaptive_reliable_relay_reinjection_bytes(Some(path), TrafficClass::Latency, limits);
-    let target_flight =
-        adaptive_reliable_relay_inflight_bytes(Some(path), TrafficClass::Throughput, limits);
-    let reinjection_limit = reliable_persistent_ack_gap_reinjection_limit_bytes(
-        Some(path),
-        Some(UnderlayProtocol::Tcp),
-        TrafficClass::Latency,
-        reinjection_debt,
-        limits,
-    );
-
-    assert_eq!(
-        reinjection_limit,
-        reliable_critical_tail_reinjection_limit_bytes(
-            target_flight.max(base_limit),
-            reinjection_debt,
-            limits,
-        )
-    );
-    assert!(reinjection_limit > base_limit);
 }
 
 #[test]
@@ -642,21 +544,14 @@ fn ack_gap_reinjection_progress_keeps_growing_hole_identity() {
     let now = Instant::now();
     let interval = reliable_stream_recv_progress_interval(None);
     let reinjection_delay =
-        reliable_data_ack_gap_persistence_interval(Some(UnderlayProtocol::Udp), None);
+        reliable_data_retransmission_interval(Some(UnderlayProtocol::Udp), None);
 
-    assert!(!progress.reinjection_ready_at(
-        true,
-        &first,
-        Some(UnderlayProtocol::Udp),
-        true,
-        reinjection_delay,
-        now,
-    ));
+    assert!(!progress.reinjection_ready_at(true, &first, true, false, reinjection_delay, now,));
     assert!(!progress.reinjection_ready_at(
         true,
         &grown,
-        Some(UnderlayProtocol::Udp),
         true,
+        false,
         reinjection_delay,
         now + interval,
     ));
@@ -664,29 +559,26 @@ fn ack_gap_reinjection_progress_keeps_growing_hole_identity() {
         progress.reinjection_ready_at(
             true,
             &grown,
-            Some(UnderlayProtocol::Udp),
+            true,
             true,
             reinjection_delay,
             now + reinjection_delay,
         ),
-        "a growing ACK horizon with the same missing frontier is one persistent hole"
+        "a growing ACK horizon with the same missing frontier is one persistent gap"
     );
-    assert!(
-        progress.reinjection_ready_at(
-            true,
-            &grown,
-            Some(UnderlayProtocol::Udp),
-            true,
-            reinjection_delay,
-            now + reinjection_delay + Duration::from_millis(1),
-        ),
-        "a ready gap is not throttled until at least one reinjection frame actually queues"
-    );
+    assert!(progress.reinjection_ready_at(
+        true,
+        &grown,
+        true,
+        true,
+        reinjection_delay,
+        now + reinjection_delay + Duration::from_millis(1),
+    ));
     progress.record_reinjection_queued_at(now + reinjection_delay + Duration::from_millis(1));
     assert!(!progress.reinjection_ready_at(
         true,
         &grown,
-        Some(UnderlayProtocol::Udp),
+        true,
         true,
         reinjection_delay,
         now + reinjection_delay + Duration::from_millis(2),
@@ -694,7 +586,7 @@ fn ack_gap_reinjection_progress_keeps_growing_hole_identity() {
 }
 
 #[test]
-fn ack_gap_reinjection_progress_resets_when_frontier_advances() {
+fn ack_gap_reinjection_progress_resets_repeat_suppression_when_frontier_advances() {
     let mut progress = ReliableAckGapReinjectionProgress::default();
     let first = [
         OffsetRange {
@@ -718,36 +610,78 @@ fn ack_gap_reinjection_progress_resets_when_frontier_advances() {
     ];
     let now = Instant::now();
     let reinjection_delay =
-        reliable_data_ack_gap_persistence_interval(Some(UnderlayProtocol::Udp), None);
+        reliable_data_retransmission_interval(Some(UnderlayProtocol::Udp), None);
 
-    assert!(!progress.reinjection_ready_at(
+    assert!(!progress.reinjection_ready_at(true, &first, true, false, reinjection_delay, now,));
+    assert!(progress.reinjection_ready_at(
         true,
         &first,
-        Some(UnderlayProtocol::Udp),
         true,
-        reinjection_delay,
-        now,
-    ));
-    assert!(!progress.reinjection_ready_at(
-        true,
-        &advanced,
-        Some(UnderlayProtocol::Udp),
         true,
         reinjection_delay,
         now + reinjection_delay,
     ));
+    progress.record_reinjection_queued_at(now + reinjection_delay);
     assert!(progress.reinjection_ready_at(
         true,
         &advanced,
-        Some(UnderlayProtocol::Udp),
+        true,
         true,
         reinjection_delay,
-        now + reinjection_delay + reinjection_delay,
+        now + reinjection_delay + Duration::from_millis(1),
     ));
 }
 
 #[test]
-fn ack_gap_reinjection_waits_for_persistent_gap_on_reliable_carriers() {
+fn ack_gap_recovery_timer_cannot_be_postponed_for_the_same_frontier() {
+    let mut progress = ReliableAckGapReinjectionProgress::default();
+    let first = [
+        OffsetRange {
+            start: 0,
+            end: 1024,
+        },
+        OffsetRange {
+            start: 4096,
+            end: 8192,
+        },
+    ];
+    let advanced = [
+        OffsetRange {
+            start: 0,
+            end: 2048,
+        },
+        OffsetRange {
+            start: 4096,
+            end: 8192,
+        },
+    ];
+    let now = Instant::now();
+    let first_deadline = now + Duration::from_millis(100);
+    let later_deadline = now + Duration::from_millis(200);
+
+    assert_eq!(
+        progress.arm_recovery_deadline(true, &first, true, Some(first_deadline)),
+        Some(first_deadline),
+    );
+    assert_eq!(
+        progress.arm_recovery_deadline(true, &first, true, Some(later_deadline)),
+        Some(first_deadline),
+        "metric refresh cannot postpone an armed loss timer",
+    );
+    assert_eq!(
+        progress.arm_recovery_deadline(true, &first, true, None),
+        Some(first_deadline),
+        "a partial observation cannot disarm established loss evidence",
+    );
+    assert_eq!(
+        progress.arm_recovery_deadline(true, &advanced, true, Some(later_deadline)),
+        Some(later_deadline),
+        "an advanced Data ACK frontier arms a new flight timer",
+    );
+}
+
+#[test]
+fn ack_gap_reinjection_requires_measured_loss_and_suppresses_repeat_attempts() {
     let ranges = [
         OffsetRange {
             start: 0,
@@ -759,60 +693,29 @@ fn ack_gap_reinjection_waits_for_persistent_gap_on_reliable_carriers() {
         },
     ];
     let now = Instant::now();
-    let reinjection_delay =
-        transport_pto_from_snapshot(None).saturating_mul(QUIC_PERSISTENT_CONGESTION_THRESHOLD);
+    let reinjection_delay = Duration::from_millis(300);
 
-    for underlay in [UnderlayProtocol::Tcp, UnderlayProtocol::Udp] {
-        let mut progress = ReliableAckGapReinjectionProgress::default();
-        assert!(!progress.reinjection_ready_at(
-            true,
-            &ranges,
-            Some(underlay),
-            true,
-            reinjection_delay,
-            now,
-        ));
-        assert!(!progress.reinjection_ready_at(
-            true,
-            &ranges,
-            Some(underlay),
-            true,
-            reinjection_delay,
-            now + reinjection_delay - Duration::from_millis(1),
-        ));
-        assert!(
-            progress.reinjection_ready_at(
-                true,
-                &ranges,
-                Some(underlay),
-                true,
-                reinjection_delay,
-                now + reinjection_delay,
-            ),
-            "{underlay:?} product reinjection should wait for a persistent ordered-stream gap",
-        );
-        progress.record_reinjection_queued_at(now + reinjection_delay);
-        assert!(!progress.reinjection_ready_at(
-            true,
-            &ranges,
-            Some(underlay),
-            true,
-            reinjection_delay,
-            now + reinjection_delay + Duration::from_millis(1),
-        ));
-        progress.release_reinjection_attempt();
-        assert!(
-            progress.reinjection_ready_at(
-                true,
-                &ranges,
-                Some(underlay),
-                true,
-                reinjection_delay,
-                now + reinjection_delay + Duration::from_millis(1),
-            ),
-            "cancelling a queued batch makes the already-persistent gap immediately replannable",
-        );
-    }
+    let mut progress = ReliableAckGapReinjectionProgress::default();
+    assert!(!progress.reinjection_ready_at(true, &ranges, true, false, reinjection_delay, now,));
+    assert!(progress.reinjection_ready_at(true, &ranges, true, true, reinjection_delay, now,));
+    progress.record_reinjection_queued_at(now);
+    assert!(!progress.reinjection_ready_at(
+        true,
+        &ranges,
+        true,
+        true,
+        reinjection_delay,
+        now + Duration::from_millis(1),
+    ));
+    progress.release_reinjection_attempt();
+    assert!(progress.reinjection_ready_at(
+        true,
+        &ranges,
+        true,
+        true,
+        reinjection_delay,
+        now + Duration::from_millis(1),
+    ));
 }
 
 #[test]

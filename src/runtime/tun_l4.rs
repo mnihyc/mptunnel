@@ -256,7 +256,6 @@ pub(super) async fn handle_tun_udp_flow(
                         payload: Bytes::from(payload),
                         ttl_ms,
                         metadata: key,
-                        route_hint: None,
                     },
                 )
                 .is_err()
@@ -269,23 +268,24 @@ pub(super) async fn handle_tun_udp_flow(
                     break Err(RuntimeError::Protocol("TUN UDP completion channel closed"));
                 };
                 finish_udp_edge_completion(&mut lanes, &completion);
-                match completion.result {
-                    Ok(response) => {
+                match completion {
+                    UdpEdgeCompletion::Received { metadata, payload, .. } => {
                         responses
                             .send(TunUdpResponse {
-                                payload: response,
-                                source: completion.metadata.remote,
-                                destination: completion.metadata.local,
+                                payload,
+                                source: metadata.remote,
+                                destination: metadata.local,
                             })
                             .await
                             .map_err(|_| RuntimeError::Protocol("TUN UDP response channel closed"))?;
                     }
-                    Err(err) => {
+                    UdpEdgeCompletion::Sent { metadata, result: Err(err), .. } => {
                         eprintln!(
                             "warning: TUN UDP datagram {} -> {} failed: {err}",
-                            completion.metadata.local, completion.metadata.remote
+                            metadata.local, metadata.remote
                         );
                     }
+                    UdpEdgeCompletion::Sent { result: Ok(()), .. } => {}
                 }
             }
             else => break Ok(()),

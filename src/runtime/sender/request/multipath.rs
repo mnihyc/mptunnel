@@ -240,10 +240,12 @@ impl RequestMultipathController {
         preview: &Frame,
         lane: TrafficClass,
     ) -> RequestDataAckGapObservation {
-        let original_path = self
+        let original_flight = self
             .request
             .flights
-            .unique_original_path_for_frame(preview)
+            .unique_original_flight_for_frame(preview);
+        let original_path = original_flight
+            .map(|(instance, _)| instance)
             .filter(|instance| remotes.contains_path_instance(*instance));
         let original_underlay = self
             .request
@@ -271,20 +273,30 @@ impl RequestMultipathController {
             .and_then(|position| {
                 let key = remotes.paths[position].key();
                 let instance = remotes.paths[position].instance();
-                context
-                    .relay_path_has_bulk_model_evidence(key.underlay, key.index)
-                    .then(|| {
-                        context.reliable_path_snapshot(key).map(|snapshot| {
-                            (ClientReinjectionOutputIdentity { instance }, snapshot)
-                        })
-                    })
-                    .flatten()
+                if !context.relay_path_has_bulk_model_evidence(key.underlay, key.index) {
+                    return None;
+                }
+                let snapshot = context.reliable_path_snapshot(key)?;
+                let score = scheduler::score_path(
+                    snapshot,
+                    lane,
+                    reliable_stream_frame_accounted_bytes(preview),
+                )?;
+                score.eta_ms.is_finite().then(|| {
+                    (
+                        ClientReinjectionOutputIdentity { instance },
+                        snapshot,
+                        Duration::from_secs_f64(score.eta_ms.max(0.0) / 1000.0),
+                    )
+                })
             });
         RequestDataAckGapObservation {
             has_live_original_path: original_path.is_some(),
             original_underlay,
             original_path_timing,
-            reinjection_target: reinjection_path,
+            reinjection_target: reinjection_path
+                .map(|(identity, snapshot, _)| (identity, snapshot)),
+            reinjection_completion: reinjection_path.map(|(_, _, completion)| completion),
         }
     }
 
@@ -1620,8 +1632,7 @@ impl RequestMultipathController {
         avoid_instances: &[RelayPathInstance],
     ) -> Result<usize, RuntimeError> {
         let ack_gap_reinjection = cause.is_ack_gap_reinjection();
-        let requires_measured_reinjection_target =
-            matches!(cause, RelaySendCause::PersistentAckGapReinjection);
+        let requires_measured_reinjection_target = cause.is_persistent_ack_gap_reinjection();
         let required_persistent_target = cause.persistent_client_target();
         let invalid_persistent_target =
             matches!(cause, RelaySendCause::PersistentServerAckGapReinjection(_));
@@ -1640,8 +1651,9 @@ impl RequestMultipathController {
                     || context
                         .relay_path_has_bulk_model_evidence(path.key().underlay, path.key().index))
         };
+        let busy_reinjection_allowed = failure_recovery || requires_measured_reinjection_target;
         let carrier_reinjection_ready = |path: &ReliableRelayRemotePath, require_idle: bool| {
-            (!require_idle && failure_recovery)
+            (!require_idle && busy_reinjection_allowed)
                 || self.ordered_reinjection_carrier_ready(context, path, frame, cause)
         };
         let can_enqueue = |path: &ReliableRelayRemotePath| {
@@ -1686,8 +1698,7 @@ impl RequestMultipathController {
                     .or_else(|| choose(true, false, require_idle))
             }
         };
-        let selected = choose_ranked(true)
-            .or_else(|| failure_recovery.then(|| choose_ranked(false)).flatten());
+        let selected = choose_ranked(!busy_reinjection_allowed);
         if let Some(position) = selected {
             return Ok(position);
         }
@@ -1720,11 +1731,7 @@ impl RequestMultipathController {
                     .or_else(|| choose_capacity(true, false, require_idle))
             }
         };
-        let capacity_fallback = choose_capacity_fallback(true).or_else(|| {
-            failure_recovery
-                .then(|| choose_capacity_fallback(false))
-                .flatten()
-        });
+        let capacity_fallback = choose_capacity_fallback(!busy_reinjection_allowed);
         if let Some(position) = capacity_fallback {
             return Ok(position);
         }

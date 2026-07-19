@@ -29,34 +29,51 @@ pub struct SendStream {
     pub(super) encode_buffer: Vec<u8>,
 }
 
+impl SendStream {
+    /// Delegates stream scheduling to Quinn; congestion control remains
+    /// connection-wide and is not bypassed by a higher stream priority.
+    pub fn set_priority(&self, priority: i32) -> Result<(), QuicCarrierError> {
+        self.stream.set_priority(priority)?;
+        Ok(())
+    }
+
+    #[cfg(test)]
+    pub(super) fn priority(&self) -> Result<i32, QuicCarrierError> {
+        Ok(self.stream.priority()?)
+    }
+}
+
 // Quinn writes can consume a prefix before cancellation. Fail the whole path
 // so record framing never resumes from an ambiguous carrier-stream offset.
 pub(super) struct QuicWriteTransaction {
     connection: quinn::Connection,
     write_backlog: Arc<AtomicU64>,
-    send_credit_released: Arc<tokio::sync::Notify>,
     packet_len: u64,
-    fail_close: bool,
+    close_if_cancelled: bool,
 }
 
 impl QuicWriteTransaction {
     pub(super) fn new(
         connection: quinn::Connection,
         write_backlog: Arc<AtomicU64>,
-        send_credit_released: Arc<tokio::sync::Notify>,
         packet_len: u64,
     ) -> Self {
         Self {
             connection,
             write_backlog,
-            send_credit_released,
             packet_len,
-            fail_close: true,
+            close_if_cancelled: true,
         }
     }
 
-    pub(super) fn commit(mut self) {
-        self.fail_close = false;
+    pub(super) fn complete(mut self) {
+        self.close_if_cancelled = false;
+    }
+
+    pub(super) fn fail_stream(mut self) {
+        // Connection-wide ACK generations overlap across shared streams, so a
+        // stream-local terminal error must not reset their cumulative state.
+        self.close_if_cancelled = false;
     }
 }
 
@@ -67,10 +84,9 @@ impl Drop for QuicWriteTransaction {
             .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
                 Some(current.saturating_sub(self.packet_len))
             });
-        self.send_credit_released.notify_waiters();
-        if self.fail_close {
+        if self.close_if_cancelled {
             self.connection
-                .close(VarInt::from_u32(1), b"cancelled or failed carrier write");
+                .close(VarInt::from_u32(1), b"cancelled carrier write");
         }
     }
 }
@@ -139,20 +155,23 @@ pub async fn write_frames(
     send.write_backlog.fetch_add(packet_len, Ordering::Relaxed);
     // Publish before the awaited write. Quinn can ACK earlier chunks while
     // write_all is flow-controlled; publishing afterward loses attribution for
-    // those ACKs. A failed write closes the path, so stale evidence cannot be
-    // reused by a live measurement target.
+    // those ACKs. The evidence is connection-wide because native ACKs from
+    // concurrent streams cannot be attributed back to one product write.
     if delivery_evidence_bytes > 0 {
         send.telemetry
             .record_delivery_evidence_written(delivery_evidence_bytes);
     }
-    let write_transaction = QuicWriteTransaction::new(
-        transaction_connection,
-        transaction_backlog,
-        send.telemetry.send_credit_notify(),
-        packet_len,
-    );
-    send.stream.write_all(&send.encode_buffer).await?;
-    write_transaction.commit();
+    let write_transaction =
+        QuicWriteTransaction::new(transaction_connection, transaction_backlog, packet_len);
+    if let Err(err) = send.stream.write_all(&send.encode_buffer).await {
+        // STOP_SENDING/ClosedStream is local to this QUIC stream. The stream
+        // task retires it, while unrelated product streams keep using the same
+        // carrier connection. Only cancellation leaves framing ambiguous on a
+        // still-live stream and is handled by the transaction guard's Drop.
+        write_transaction.fail_stream();
+        return Err(err.into());
+    }
+    write_transaction.complete();
     #[cfg(feature = "lab-diagnostics")]
     lab_perf_record(
         "transport.quic.write_frames_wait",

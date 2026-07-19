@@ -1,7 +1,11 @@
-use super::handle::{ReliablePathStream, ReliablePathStreamOutput};
+use super::handle::{
+    ReliablePathStream, ReliablePathStreamInput, ReliablePathStreamOutput,
+    ServerReliableStreamEvent,
+};
 use super::response::{
-    ResponseStreamAttachOutcome, ResponseStreamBinding, ServerPathMetricsEntry,
-    ServerPathMetricsSource, ServerSessionRegistration, ServerSessionTracker,
+    ResponseOutputAttachment, ResponseOutputAttachmentState, ResponseStreamAttachOutcome,
+    ResponseStreamBinding, ServerPathMetricsEntry, ServerPathMetricsSource,
+    ServerSessionRegistration, ServerSessionTracker,
 };
 use super::send_buffer::SessionSendBuffer;
 #[cfg(test)]
@@ -21,13 +25,14 @@ use crate::runtime::RuntimeError;
 #[cfg(test)]
 use crate::runtime::path::ServerCarrierPathRegistration;
 use crate::runtime::path::commands::{
-    ReliablePathCommandSender, reliable_stream_frame_queue_for_payload,
+    ReliablePathCommand, ReliablePathCommandSender, reliable_stream_frame_queue_for_payload,
 };
+use crate::runtime::path::proof::PathProofObservation;
 use crate::runtime::path::{
-    ServerCarrierPathIdentity, ServerCarrierPathStatusSnapshot, ServerNewStreamPolicy,
-    ServerRealtimeFlowLease, ServerSessionManagementSnapshot, ServerStreamFrameRoute,
-    ServerStreamManagementSnapshot, ServerStreamOpenOutcome, ServerStreamOpenRequest,
-    ServerStreamPort, ServerStreamPortBackend,
+    CarrierDeliveryRateSample, ServerCarrierPathIdentity, ServerCarrierPathStatusSnapshot,
+    ServerNewStreamPolicy, ServerPathValidation, ServerRealtimeFlowLease,
+    ServerSessionManagementSnapshot, ServerStreamFrameRoute, ServerStreamManagementSnapshot,
+    ServerStreamOpenOutcome, ServerStreamOpenRequest, ServerStreamPort, ServerStreamPortBackend,
 };
 use crate::runtime::recent_ids::{RecentIdCache, reliable_closed_stream_cache_capacity};
 use crate::scheduler::TrafficClass;
@@ -73,7 +78,7 @@ impl std::fmt::Debug for ServerReliableStreamRegistry {
 
 struct ServerReliableStreamEntry {
     target: TargetAddr,
-    frames: mpsc::Sender<Result<Frame, RuntimeError>>,
+    events: mpsc::Sender<ServerReliableStreamEvent>,
     binding: Arc<ResponseStreamBinding>,
 }
 
@@ -87,10 +92,44 @@ struct ServerPathUsageEntry {
 struct ServerRegisteredPath {
     local: crate::runtime::path::ServerLocalPathProperties,
     state: PeerPathState,
+    path_proof: Option<PathProofObservation>,
+}
+
+fn queue_ordered_path_detach(
+    events: mpsc::Sender<ServerReliableStreamEvent>,
+    binding: Arc<ResponseStreamBinding>,
+    key: CarrierPathKey,
+    path_instance_id: CarrierPathInstanceId,
+    output_incarnation: u64,
+) {
+    let event = ServerReliableStreamEvent::PathDetached {
+        key,
+        path_instance_id,
+        output_incarnation,
+    };
+    match events.try_send(event) {
+        Ok(()) => {}
+        Err(mpsc::error::TrySendError::Full(event)) => {
+            if let Ok(runtime) = tokio::runtime::Handle::try_current() {
+                runtime.spawn(async move {
+                    if events.send(event).await.is_err() {
+                        binding.complete_path_detach(key, path_instance_id, output_incarnation);
+                    }
+                });
+            } else if events.blocking_send(event).is_err() {
+                // With no async caller available, blocking preserves FIFO. A
+                // closed receiver has no actor left to observe the transition.
+                binding.complete_path_detach(key, path_instance_id, output_incarnation);
+            }
+        }
+        Err(mpsc::error::TrySendError::Closed(_)) => {
+            binding.complete_path_detach(key, path_instance_id, output_incarnation);
+        }
+    }
 }
 
 pub(in crate::runtime) enum ServerReliableStreamOpen {
-    New(AcceptedServerReliableStream),
+    New(Box<AcceptedServerReliableStream>),
     Existing,
     DuplicateLiveIgnored,
     Rejected,
@@ -104,9 +143,16 @@ pub(in crate::runtime) struct AcceptedServerReliableStream {
     session_id: SessionId,
     target: TargetAddr,
     stream: Option<ReliablePathStream>,
+    opening: AcceptedServerReliableStreamOpening,
     session_send_buffer: SessionSendBuffer,
     retirement: Arc<AcceptedServerReliableStreamRetirementInner>,
     supervised: bool,
+}
+
+struct AcceptedServerReliableStreamOpening {
+    path_validation: ServerPathValidation,
+    commands: ReliablePathCommandSender,
+    mux_limits: MuxLimits,
 }
 
 struct AcceptedServerReliableStreamRetirementInner {
@@ -232,6 +278,39 @@ impl AcceptedServerReliableStream {
 
     pub(in crate::runtime) fn session_send_buffer(&self) -> SessionSendBuffer {
         self.session_send_buffer.clone()
+    }
+
+    /// Publishes OPEN acceptance and then carrier validation on the same
+    /// ordered command channel. A QUIC product stream must never observe the
+    /// path challenge while it is still waiting for STREAM_MAX_DATA.
+    pub(in crate::runtime) async fn accept_opening_path(&self) -> Result<(), RuntimeError> {
+        let stream = self.stream();
+        self.opening
+            .commands
+            .send_control(ReliablePathCommand::SendFrame(Frame::StreamMaxData {
+                stream_id: stream.stream_id,
+                max_offset: reliable_stream_initial_advertised_window_bytes(
+                    stream.underlay,
+                    stream.lane,
+                    self.opening.mux_limits,
+                ),
+            }))
+            .await
+            .map_err(|_| RuntimeError::ReliablePathSessionClosed)?;
+
+        let Some(challenge) = self
+            .opening
+            .path_validation
+            .challenge(self.opening.mux_limits)
+        else {
+            return Ok(());
+        };
+        self.opening
+            .commands
+            .send_control(ReliablePathCommand::SendFrame(challenge))
+            .await
+            .map_err(|_| RuntimeError::ReliablePathSessionClosed)?;
+        Ok(())
     }
 
     pub(in crate::runtime) fn supervise(&mut self) -> AcceptedServerReliableStreamRetirement {
@@ -552,6 +631,7 @@ impl ServerReliableStreamRegistry {
         session_id: SessionId,
         target: TargetAddr,
         stream: ReliablePathStream,
+        opening: AcceptedServerReliableStreamOpening,
         session_send_buffer: SessionSendBuffer,
     ) -> AcceptedServerReliableStream {
         let stream_id = stream.stream_id;
@@ -560,6 +640,7 @@ impl ServerReliableStreamRegistry {
             session_id,
             target,
             stream: Some(stream),
+            opening,
             session_send_buffer,
             retirement: Arc::new(AcceptedServerReliableStreamRetirementInner {
                 registry: self.clone(),
@@ -596,6 +677,7 @@ impl ServerReliableStreamRegistry {
                 ServerRegisteredPath {
                     local,
                     state: PeerPathState::Active,
+                    path_proof: None,
                 },
             )
             .is_none();
@@ -642,7 +724,7 @@ impl ServerReliableStreamRegistry {
             .expect("server path usage lock")
             .remove(&(session_id, underlay, path_id, path_instance_id));
         let key = CarrierPathKey { underlay, path_id };
-        let bindings = {
+        let stream_inputs = {
             let streams = self
                 .streams
                 .lock()
@@ -650,12 +732,16 @@ impl ServerReliableStreamRegistry {
             streams
                 .iter()
                 .filter_map(|((entry_session_id, _), entry)| {
-                    (*entry_session_id == session_id).then_some(entry.binding.clone())
+                    (*entry_session_id == session_id)
+                        .then_some((entry.events.clone(), entry.binding.clone()))
                 })
                 .collect::<Vec<_>>()
         };
-        for binding in bindings {
-            binding.detach_path_instance(key, path_instance_id);
+        for (events, binding) in stream_inputs {
+            let Some(output_incarnation) = binding.begin_path_detach(key, path_instance_id) else {
+                continue;
+            };
+            queue_ordered_path_detach(events, binding, key, path_instance_id, output_incarnation);
         }
         if removed.is_some() {
             self.session_tracker.detach_session(session_id);
@@ -688,9 +774,9 @@ impl ServerReliableStreamRegistry {
             .streams
             .lock()
             .expect("server reliable stream registry lock");
-        // Resolve stored proof after taking the stream membership lock. A path
-        // proof published while this opener waited must be inherited rather
-        // than missed by a stale pre-lock metrics copy.
+        // Resolve stored evidence after taking the stream membership lock. An
+        // update published while this opener waited must either be inherited
+        // here or observe the newly published binding afterward.
         let initial_metrics = self.initial_path_metrics(
             session_id,
             underlay,
@@ -699,18 +785,26 @@ impl ServerReliableStreamRegistry {
             initial_metrics,
         );
         let initial_usage = self.stored_path_usage(session_id, underlay, path_id, path_instance_id);
+        let initial_path_proof =
+            self.initial_path_proof(session_id, underlay, path_id, path_instance_id);
         if let Some(entry) = streams.get_mut(&(session_id, stream_id)) {
             if entry.target != target {
                 return Err(RuntimeError::Protocol(
                     "reliable stream migration target does not match original stream",
                 ));
             }
-            let attach_outcome = entry.binding.attach_with_path_instance(
-                underlay,
-                path_id,
-                path_instance_id,
-                local_policy,
-                commands,
+            let attach_outcome = entry.binding.attach_output(
+                ResponseOutputAttachment {
+                    key: CarrierPathKey { underlay, path_id },
+                    path_instance_id,
+                    local_policy,
+                    commands,
+                    state: ResponseOutputAttachmentState {
+                        metrics: initial_metrics,
+                        peer_usage: initial_usage.map(|usage| (usage.sequence, usage.usage)),
+                        path_proof: initial_path_proof,
+                    },
+                },
                 lane,
             );
             if matches!(
@@ -750,31 +844,6 @@ impl ServerReliableStreamRegistry {
                 );
                 return Ok(ServerReliableStreamOpen::DuplicateLiveIgnored);
             }
-            if !matches!(
-                attach_outcome,
-                ResponseStreamAttachOutcome::RejectedDuplicateLiveOutput
-                    | ResponseStreamAttachOutcome::RejectedClosedStream
-            ) && let Some(metrics) = initial_metrics
-            {
-                entry.binding.install_stored_path_metrics_for_instance(
-                    CarrierPathKey { underlay, path_id },
-                    path_instance_id,
-                    metrics,
-                );
-            }
-            if !matches!(
-                attach_outcome,
-                ResponseStreamAttachOutcome::RejectedDuplicateLiveOutput
-                    | ResponseStreamAttachOutcome::RejectedClosedStream
-            ) && let Some(usage) = initial_usage
-            {
-                entry.binding.update_peer_path_usage_for_instance(
-                    CarrierPathKey { underlay, path_id },
-                    path_instance_id,
-                    usage.sequence,
-                    usage.usage,
-                );
-            }
             entry.binding.record_request_feedback_ingress(
                 CarrierPathKey { underlay, path_id },
                 path_instance_id,
@@ -813,10 +882,12 @@ impl ServerReliableStreamRegistry {
             ));
         }
 
-        let (frames_tx, frames_rx) = mpsc::channel(reliable_stream_frame_queue_for_payload(
+        let (events_tx, events_rx) = mpsc::channel(reliable_stream_frame_queue_for_payload(
             mux_limits,
             max_frame_payload_bytes,
         ));
+        let opening_path_validation = path_registration.path_validation();
+        let opening_commands = commands.clone();
         let binding = ResponseStreamBinding::new_with_limits_tracker_and_path_instance(
             session_id,
             underlay,
@@ -844,11 +915,18 @@ impl ServerReliableStreamRegistry {
                 usage.usage,
             );
         }
+        if let Some(observation) = initial_path_proof {
+            binding.mark_path_proof_success_for_instance(
+                CarrierPathKey { underlay, path_id },
+                path_instance_id,
+                observation,
+            );
+        }
         streams.insert(
             (session_id, stream_id),
             ServerReliableStreamEntry {
                 target: target.clone(),
-                frames: frames_tx,
+                events: events_tx,
                 binding: binding.clone(),
             },
         );
@@ -869,13 +947,20 @@ impl ServerReliableStreamRegistry {
             underlay,
             max_frame_payload_bytes,
             output: ReliablePathStreamOutput::Switchable(binding),
-            frames: frames_rx,
+            frames: ReliablePathStreamInput::server(events_rx),
         };
-        Ok(ServerReliableStreamOpen::New(self.accepted_stream(
-            session_id,
-            target,
-            stream,
-            session_send_buffer,
+        Ok(ServerReliableStreamOpen::New(Box::new(
+            self.accepted_stream(
+                session_id,
+                target,
+                stream,
+                AcceptedServerReliableStreamOpening {
+                    path_validation: opening_path_validation,
+                    commands: opening_commands,
+                    mux_limits,
+                },
+                session_send_buffer,
+            ),
         )))
     }
 
@@ -889,21 +974,87 @@ impl ServerReliableStreamRegistry {
             metrics,
             ServerPathMetricsSource::PeerHint,
             false,
+            None,
         );
     }
 
+    #[cfg(test)]
     pub(in crate::runtime) fn record_local_path_metrics(
         &self,
         identity: ServerCarrierPathIdentity,
         metrics: PathMetrics,
         native_drain_observed: bool,
     ) {
+        self.record_local_path_metrics_with_delivery_rate_sample(
+            identity,
+            metrics,
+            native_drain_observed,
+            None,
+        );
+    }
+
+    fn record_local_path_metrics_with_delivery_rate_sample(
+        &self,
+        identity: ServerCarrierPathIdentity,
+        metrics: PathMetrics,
+        native_drain_observed: bool,
+        delivery_rate_sample: Option<CarrierDeliveryRateSample>,
+    ) {
         self.record_path_metrics_with_source(
             identity,
             metrics,
             ServerPathMetricsSource::LocalSender,
             native_drain_observed,
+            delivery_rate_sample,
         );
+    }
+
+    pub(in crate::runtime) fn record_path_proof_success(
+        &self,
+        identity: ServerCarrierPathIdentity,
+        observation: PathProofObservation,
+    ) {
+        let ServerCarrierPathIdentity {
+            session_id,
+            underlay,
+            path_id,
+            path_instance_id,
+        } = identity;
+        let instance_key = (session_id, underlay, path_id, path_instance_id);
+        let changed = {
+            let mut registered = self
+                .registered_path_instances
+                .lock()
+                .expect("server active path instance lock");
+            let Some(path) = registered.get_mut(&instance_key) else {
+                return;
+            };
+            if path.path_proof.is_some() {
+                false
+            } else {
+                path.path_proof = Some(observation);
+                true
+            }
+        };
+        if !changed {
+            return;
+        }
+        let bindings = {
+            let streams = self
+                .streams
+                .lock()
+                .expect("server reliable stream registry lock");
+            streams
+                .iter()
+                .filter_map(|((entry_session_id, _), entry)| {
+                    (*entry_session_id == session_id).then_some(entry.binding.clone())
+                })
+                .collect::<Vec<_>>()
+        };
+        let key = CarrierPathKey { underlay, path_id };
+        for binding in bindings {
+            binding.mark_path_proof_success_for_instance(key, path_instance_id, observation);
+        }
     }
 
     pub(in crate::runtime) fn record_peer_path_usage(
@@ -974,12 +1125,27 @@ impl ServerReliableStreamRegistry {
             .copied()
     }
 
+    fn initial_path_proof(
+        &self,
+        session_id: SessionId,
+        underlay: UnderlayProtocol,
+        path_id: PathId,
+        path_instance_id: CarrierPathInstanceId,
+    ) -> Option<PathProofObservation> {
+        self.registered_path_instances
+            .lock()
+            .expect("server active path instance lock")
+            .get(&(session_id, underlay, path_id, path_instance_id))
+            .and_then(|path| path.path_proof)
+    }
+
     fn record_path_metrics_with_source(
         &self,
         identity: ServerCarrierPathIdentity,
         metrics: PathMetrics,
         source: ServerPathMetricsSource,
         native_drain_observed: bool,
+        delivery_rate_sample: Option<CarrierDeliveryRateSample>,
     ) {
         let ServerCarrierPathIdentity {
             session_id,
@@ -1002,6 +1168,7 @@ impl ServerReliableStreamRegistry {
             metrics,
             source,
             native_drain_observed,
+            carrier_delivery_rate_sample: delivery_rate_sample,
             recorded_at: Instant::now(),
         };
         // One registry slot cannot represent both directions. Preserve local
@@ -1061,14 +1228,18 @@ impl ServerReliableStreamRegistry {
         initial_metrics: Option<PathMetrics>,
     ) -> Option<ServerPathMetricsEntry> {
         let stored = self.stored_path_metrics(session_id, underlay, path_id, path_instance_id);
-        match initial_metrics {
-            Some(metrics) => Some(ServerPathMetricsEntry {
-                metrics: PathMetrics { path_id, ..metrics },
-                source: ServerPathMetricsSource::LocalSender,
-                native_drain_observed: false,
-                recorded_at: Instant::now(),
-            }),
-            None => stored,
+        let initial = initial_metrics.map(|metrics| ServerPathMetricsEntry {
+            metrics: PathMetrics { path_id, ..metrics },
+            source: ServerPathMetricsSource::LocalSender,
+            native_drain_observed: false,
+            carrier_delivery_rate_sample: None,
+            recorded_at: Instant::now(),
+        });
+        match stored {
+            Some(metrics) if metrics.source == ServerPathMetricsSource::LocalSender => {
+                Some(metrics)
+            }
+            _ => initial.or(stored),
         }
     }
 
@@ -1088,21 +1259,51 @@ impl ServerReliableStreamRegistry {
 
     pub(in crate::runtime) fn detach_path(
         &self,
+        identity: ServerCarrierPathIdentity,
+        stream_id: StreamId,
+    ) -> Result<(), RuntimeError> {
+        let input = {
+            let streams = self
+                .streams
+                .lock()
+                .expect("server reliable stream registry lock");
+            streams
+                .get(&(identity.session_id, stream_id))
+                .map(|entry| (entry.events.clone(), entry.binding.clone()))
+        };
+        let Some((events, binding)) = input else {
+            return Ok(());
+        };
+        // Path lifecycle shares the actor queue with frames. This preserves
+        // ACK-before-detach order while retaining immediate genuine failover.
+        let key = CarrierPathKey {
+            underlay: identity.underlay,
+            path_id: identity.path_id,
+        };
+        let Some(output_incarnation) = binding.begin_path_detach(key, identity.path_instance_id)
+        else {
+            return Ok(());
+        };
+        queue_ordered_path_detach(
+            events,
+            binding,
+            key,
+            identity.path_instance_id,
+            output_incarnation,
+        );
+        Ok(())
+    }
+
+    fn stream_events(
+        &self,
         session_id: SessionId,
         stream_id: StreamId,
-        underlay: UnderlayProtocol,
-        path_id: PathId,
-        commands: &ReliablePathCommandSender,
-    ) {
-        if let Some(binding) = self
-            .streams
+    ) -> Option<mpsc::Sender<ServerReliableStreamEvent>> {
+        self.streams
             .lock()
             .expect("server reliable stream registry lock")
             .get(&(session_id, stream_id))
-            .map(|entry| entry.binding.clone())
-        {
-            binding.detach(CarrierPathKey { underlay, path_id }, commands);
-        }
+            .map(|entry| entry.events.clone())
     }
 
     pub(in crate::runtime) async fn route_frame(
@@ -1113,16 +1314,8 @@ impl ServerReliableStreamRegistry {
     ) -> Result<(), RuntimeError> {
         #[cfg(feature = "lab-diagnostics")]
         let bytes = reliable_path_frame_pacing_bytes(&frame);
-        let stream = {
-            let streams = self
-                .streams
-                .lock()
-                .expect("server reliable stream registry lock");
-            streams
-                .get(&(session_id, stream_id))
-                .map(|entry| entry.frames.clone())
-        };
-        let Some(stream) = stream else {
+        let events = self.stream_events(session_id, stream_id);
+        let Some(events) = events else {
             #[cfg(feature = "lab-diagnostics")]
             lab_diagnostic(
                 "server_stream_unknown_frame_drop",
@@ -1140,7 +1333,7 @@ impl ServerReliableStreamRegistry {
         // The relay supervisor retires registry membership after the per-stream
         // receiver closes. A frame in that interval is stream-local teardown,
         // not failure of the multiplexed carrier that delivered it.
-        let _ = stream.send(Ok(frame)).await;
+        let _ = events.send(ServerReliableStreamEvent::Frame(frame)).await;
         #[cfg(feature = "lab-diagnostics")]
         lab_perf_record(
             "runtime.server_stream.route_frame",
@@ -1156,16 +1349,8 @@ impl ServerReliableStreamRegistry {
         stream_id: StreamId,
         frame: Frame,
     ) -> Result<ServerStreamFrameRoute, RuntimeError> {
-        let stream = {
-            let streams = self
-                .streams
-                .lock()
-                .expect("server reliable stream registry lock");
-            streams
-                .get(&(session_id, stream_id))
-                .map(|entry| entry.frames.clone())
-        };
-        let Some(stream) = stream else {
+        let events = self.stream_events(session_id, stream_id);
+        let Some(events) = events else {
             #[cfg(feature = "lab-diagnostics")]
             lab_diagnostic(
                 "server_stream_unknown_frame_drop",
@@ -1178,16 +1363,18 @@ impl ServerReliableStreamRegistry {
             );
             return Ok(ServerStreamFrameRoute::Routed);
         };
-        match stream.try_send(Ok(frame)) {
+        match events.try_send(ServerReliableStreamEvent::Frame(frame)) {
             Ok(()) => Ok(ServerStreamFrameRoute::Routed),
-            Err(mpsc::error::TrySendError::Full(Ok(frame))) => {
+            Err(mpsc::error::TrySendError::Full(ServerReliableStreamEvent::Frame(frame))) => {
                 Ok(ServerStreamFrameRoute::Backpressured(frame))
             }
             // See `route_frame`: retirement owns this short closed-receiver
             // interval, and one finished stream must not close its carrier.
             Err(mpsc::error::TrySendError::Closed(_)) => Ok(ServerStreamFrameRoute::Routed),
-            Err(mpsc::error::TrySendError::Full(Err(_))) => {
-                unreachable!("server stream routing only sends successful frames")
+            Err(mpsc::error::TrySendError::Full(ServerReliableStreamEvent::PathDetached {
+                ..
+            })) => {
+                unreachable!("server frame routing only sends frame events")
             }
         }
     }
@@ -1297,6 +1484,7 @@ impl ServerStreamPortBackend for ServerReliableStreamPortBackend {
         Box::pin(async move {
             match registry.open_or_attach(request)? {
                 ServerReliableStreamOpen::New(accepted) => {
+                    let accepted = *accepted;
                     match new_stream_policy {
                         ServerNewStreamPolicy::Submit => {
                             if let Err(accepted) = registry.submit_accepted(accepted) {
@@ -1343,14 +1531,10 @@ impl ServerStreamPortBackend for ServerReliableStreamPortBackend {
 
     fn detach_path(
         &self,
-        session_id: SessionId,
+        identity: ServerCarrierPathIdentity,
         stream_id: StreamId,
-        underlay: UnderlayProtocol,
-        path_id: PathId,
-        commands: &ReliablePathCommandSender,
-    ) {
-        self.registry
-            .detach_path(session_id, stream_id, underlay, path_id, commands);
+    ) -> Result<(), RuntimeError> {
+        self.registry.detach_path(identity, stream_id)
     }
 
     fn record_peer_path_metrics(&self, identity: ServerCarrierPathIdentity, metrics: PathMetrics) {
@@ -1372,9 +1556,24 @@ impl ServerStreamPortBackend for ServerReliableStreamPortBackend {
         identity: ServerCarrierPathIdentity,
         metrics: PathMetrics,
         native_drain_observed: bool,
+        delivery_rate_sample: Option<CarrierDeliveryRateSample>,
     ) {
         self.registry
-            .record_local_path_metrics(identity, metrics, native_drain_observed);
+            .record_local_path_metrics_with_delivery_rate_sample(
+                identity,
+                metrics,
+                native_drain_observed,
+                delivery_rate_sample,
+            );
+    }
+
+    fn record_path_proof_success(
+        &self,
+        identity: ServerCarrierPathIdentity,
+        observation: PathProofObservation,
+    ) {
+        self.registry
+            .record_path_proof_success(identity, observation);
     }
 
     fn peer_status_snapshot(&self, session_id: SessionId) -> Vec<PeerPathStatus> {

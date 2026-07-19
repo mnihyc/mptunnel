@@ -10,7 +10,7 @@ mod endpoint;
 mod socket;
 mod stream;
 
-pub use congestion::{CarrierSendCreditSnapshot, CongestionMetrics};
+pub use congestion::CongestionMetrics;
 pub use endpoint::{Connection, Endpoint};
 pub use stream::{RecvStream, SendStream, finish_stream, read_frame, write_frame, write_frames};
 

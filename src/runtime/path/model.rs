@@ -302,17 +302,25 @@ fn endpoint_only_startup_observation_for_scoring(
     if observation_has_sender_delivery_evidence(observation) {
         return observation;
     }
+    let validated_timing = observation_has_validated_rtt_evidence(observation).then_some((
+        observation.measured_srtt_ms,
+        observation.measured_jitter_ms,
+        observation.carrier_srtt_ms,
+        observation.carrier_rttvar_ms,
+    ));
     ClientPathObservation {
-        measured_srtt_ms: None,
-        measured_jitter_ms: None,
+        // Path validation qualifies timing independently from delivery rate.
+        // Keep capacity unknown until sender delivery evidence exists.
+        measured_srtt_ms: validated_timing.and_then(|timing| timing.0),
+        measured_jitter_ms: validated_timing.and_then(|timing| timing.1),
         measured_rate_bps: None,
         measured_loss_rate: None,
         delivery_samples: 0,
         product_delivery_rate_bps: None,
         product_delivery_sample_bytes: 0,
         last_delivery_at: None,
-        carrier_srtt_ms: None,
-        carrier_rttvar_ms: None,
+        carrier_srtt_ms: validated_timing.and_then(|timing| timing.2),
+        carrier_rttvar_ms: validated_timing.and_then(|timing| timing.3),
         carrier_delivery_rate_bps: None,
         carrier_pacing_rate_bps: None,
         carrier_delivery_samples: 0,
@@ -595,6 +603,7 @@ pub(in crate::runtime) fn path_snapshot(
         jitter_ms,
         delivery_rate_bps,
         rate_scope,
+        carrier_delivery_rate_bps: carrier_capacity_rate_bps,
         product_progress_rate_bps,
         has_durable_product_progress,
         loss_rate: observation.measured_loss_rate.unwrap_or(0.0),
@@ -1074,6 +1083,17 @@ pub(super) fn reliable_reservation_should_use_endpoint_only_startup_order(
         && tcp_paths.iter().chain(udp_paths).all(path_is_endpoint_only)
         && !paths_have_sender_delivery_evidence(tcp_paths, tcp_observations)
         && !paths_have_sender_delivery_evidence(udp_paths, udp_observations)
+        && !tcp_observations
+            .iter()
+            .any(|observation| observation.path_proof_success)
+        && !udp_observations
+            .iter()
+            .any(|observation| observation.path_proof_success)
+}
+
+fn observation_has_validated_rtt_evidence(observation: ClientPathObservation) -> bool {
+    observation.path_proof_success
+        && (observation.measured_srtt_ms.is_some() || observation.carrier_srtt_ms.is_some())
 }
 
 fn paths_have_sender_delivery_evidence(

@@ -1,6 +1,6 @@
 use super::{
     ClientTcpOpenCancellation, ClientTcpPathStreamState, remove_matching_client_tcp_open,
-    route_client_tcp_stream_frame,
+    route_client_tcp_lifecycle_frame, route_client_tcp_stream_frame,
 };
 use crate::protocol::{Frame, StreamId};
 use crate::runtime::path::commands::{
@@ -79,7 +79,7 @@ async fn client_tcp_path_ignores_late_frames_for_recently_closed_stream() {
     let mut closed_streams = RecentIdCache::new(8);
     drop(frames_rx);
 
-    route_client_tcp_stream_frame(
+    route_client_tcp_lifecycle_frame(
         &mut streams,
         &mut closed_streams,
         stream_id,
@@ -170,7 +170,7 @@ async fn client_tcp_path_routes_inflight_receive_frames_to_live_stream() {
         "routing a frame must preserve the live stream owner"
     );
 
-    route_client_tcp_stream_frame(
+    route_client_tcp_lifecycle_frame(
         &mut streams,
         &mut closed_streams,
         stream_id,
@@ -183,6 +183,35 @@ async fn client_tcp_path_routes_inflight_receive_frames_to_live_stream() {
     .expect("FIN routes before cleanup");
     assert!(
         streams.contains_key(&stream_id),
-        "plain routing alone does not apply terminal cleanup"
+        "FIN must preserve the attachment until the relay explicitly closes it"
     );
+    assert!(!closed_streams.contains(&stream_id));
+    assert!(matches!(
+        frames_rx.recv().await.expect("routed FIN").expect("frame"),
+        Frame::StreamFin {
+            final_offset: 8,
+            ..
+        }
+    ));
+
+    route_client_tcp_stream_frame(
+        &mut streams,
+        &mut closed_streams,
+        stream_id,
+        Frame::StreamData {
+            stream_id,
+            offset: 4,
+            payload: Bytes::from_static(b"tail"),
+        },
+    )
+    .await
+    .expect("repair below the final offset still routes");
+    assert!(matches!(
+        frames_rx
+            .recv()
+            .await
+            .expect("routed post-FIN repair")
+            .expect("frame"),
+        Frame::StreamData { offset: 4, payload, .. } if &payload[..] == b"tail"
+    ));
 }

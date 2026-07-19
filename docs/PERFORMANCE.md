@@ -1,4 +1,49 @@
-# Performance evidence for v0.1.0
+# Performance evidence
+
+## v0.1.1 release gate
+
+The v0.1.1 gate used MPP v3 release builds without optional features. The
+native Linux binary SHA-256 was
+`8f356f47421ad96e7b9795010573a011ab3215fa3fa713977de79b3d1427c140`;
+the Windows GNU PE used by Wine was
+`978595cea97666c719ed221f76839246f253af3d30e0497b2907cbd911a2a40f`.
+Every row in this section records those exact binaries. Native Windows
+execution remains a separate CI and deployment concern; Wine proves the
+portable protocol path, not Windows kernel scheduling or `SIO_TCP_INFO`.
+
+The high-bandwidth throughput profile used 500 Mbps, 180 ms one-way delay,
+zero configured loss, one reliable flow, and no configured path hints. The
+Wine cohort used an 8-second load and 256 MiB object. Upload rows were confirmed
+by the target.
+
+| Wine client case | Paths | Download Mbps | Upload Mbps |
+| --- | ---: | ---: | ---: |
+| TCP | 1 | 140.624 | 168.241 |
+| TCP | 5 | 210.973 | 289.208 |
+| Mixed TCP+QUIC | 2 | 125.445 | 158.004 |
+
+Five-path Wine TCP improved over its matched single path by 50.0% download and
+71.9% upload. The native Linux mixed TCP+QUIC equal-path upload reached 438.729
+Mbps with exact accounting and 3.689% endpoint traffic excess.
+
+The mixed latency workload combined one 500 Mbps, 180 ms bulk path with one
+80 Mbps, 20 ms latency path. Two native Linux runs retained 339.5--339.8 Mbps
+bulk goodput and zero UDP loss. UDP p95 was 73.4--74.1 ms; interactive p95 was
+75.4/94.4 ms. These observations are regression evidence, not an SLA.
+
+Balanced-path blackhole recovery remained bounded:
+
+| Client runtime | Download recovery | Destination upload recovery | Upload excess |
+| --- | ---: | ---: | ---: |
+| Linux native | 0.363 s | 0.778 s | 1.484% |
+| Windows PE under Wine 9.0 | 0.278 s | 1.471 s | 5.347% |
+
+The Windows client printed one warning per process that native TCP flight
+telemetry was unavailable and the portable Data ACK capacity fallback was in
+use. All cases completed. Artifacts were retained locally under the named
+`v011-final-*` result cohorts until release evidence was recorded.
+
+## Historical v0.1.0 evidence
 
 This report records the release-facing runtime evidence collected on
 2026-07-17 and 2026-07-18. It separates the earlier matched-baseline cohort
@@ -276,7 +321,8 @@ accounting, and case selection.
 - native Windows kernel, Wintun, macOS, or Android VPN performance;
 - performance of the Linux musl and Windows MSVC release artifacts;
 - TUN throughput in this release cohort;
-- latency-sensitive and realtime behavior under simultaneous bulk load;
+- latency-sensitive behavior beyond the recorded mixed workload, including
+  application-specific realtime traffic;
 - exact transport wire expansion; or
 - security of the custom MPP protocol.
 

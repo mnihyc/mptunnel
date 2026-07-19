@@ -205,6 +205,7 @@ impl ActiveProductFlow {
 struct RuntimeTelemetryInner {
     started_at: Instant,
     active_flow_capacity: usize,
+    #[cfg(test)]
     next_local_datagram_flow_id: AtomicU64,
     next_registration_id: AtomicU64,
     active_flow_record_overflow: AtomicU64,
@@ -253,6 +254,7 @@ impl RuntimeTelemetry {
             inner: Arc::new(RuntimeTelemetryInner {
                 started_at: Instant::now(),
                 active_flow_capacity,
+                #[cfg(test)]
                 next_local_datagram_flow_id: AtomicU64::new(0),
                 next_registration_id: AtomicU64::new(1),
                 active_flow_record_overflow: AtomicU64::new(0),
@@ -293,6 +295,7 @@ impl RuntimeTelemetry {
     }
 
     /// Local display identities avoid adding entropy or I/O failure to forwarding.
+    #[cfg(test)]
     pub(crate) fn open_local_datagram_flow(
         &self,
         session_id: Option<SessionId>,

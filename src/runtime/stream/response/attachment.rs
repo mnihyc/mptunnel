@@ -3,17 +3,21 @@
 
 use super::ResponseStreamBinding;
 use super::ack_clock::ResponseAckClockRateEvidence;
-use super::evidence::ServerPathMetricsEntry;
+use super::evidence::{ServerPathMetricsEntry, install_path_metrics_entry};
 #[cfg(feature = "lab-diagnostics")]
 use crate::lab_diagnostics::lab_diagnostic;
 #[cfg(test)]
 use crate::model::path::next_carrier_path_instance_id;
 use crate::model::path::{CarrierPathInstanceId, CarrierPathKey, PathPolicy};
 use crate::model::response::ResponsePathObservation;
-use crate::protocol::{Frame, PathId, PathUsage, UnderlayProtocol};
+#[cfg(test)]
+use crate::protocol::PathId;
+use crate::protocol::{Frame, PathUsage, UnderlayProtocol};
 use crate::runtime::RuntimeError;
-use crate::runtime::path::commands::{ReliablePathCommandQueueSnapshot, ReliablePathCommandSender};
-use crate::runtime::path::proof::enqueue_path_proof_frame;
+use crate::runtime::path::commands::{
+    ReliablePathCommandQueueSnapshot, ReliablePathCommandSender, ReliablePathLoadRegistration,
+};
+use crate::runtime::path::proof::PathProofObservation;
 use crate::scheduler::{PathSnapshot, TrafficClass};
 use std::sync::atomic::Ordering;
 
@@ -30,6 +34,48 @@ pub(in crate::runtime) enum ResponseStreamAttachOutcome {
     RejectedClosedStream,
 }
 
+/// Path evidence installed in the same transaction that publishes an output.
+#[derive(Debug, Clone, Copy, Default)]
+pub(in crate::runtime) struct ResponseOutputAttachmentState {
+    pub(in crate::runtime::stream) metrics: Option<ServerPathMetricsEntry>,
+    pub(in crate::runtime::stream) peer_usage: Option<(u64, PathUsage)>,
+    pub(in crate::runtime::stream) path_proof: Option<PathProofObservation>,
+}
+
+/// Complete output membership transaction for one carrier instance.
+pub(in crate::runtime) struct ResponseOutputAttachment {
+    pub(in crate::runtime::stream) key: CarrierPathKey,
+    pub(in crate::runtime::stream) path_instance_id: CarrierPathInstanceId,
+    pub(in crate::runtime::stream) local_policy: PathPolicy,
+    pub(in crate::runtime::stream) commands: ReliablePathCommandSender,
+    pub(in crate::runtime::stream) state: ResponseOutputAttachmentState,
+}
+
+fn apply_attachment_state(
+    entry: &mut ResponseStreamOutputEntry,
+    state: ResponseOutputAttachmentState,
+) -> bool {
+    let mut changed = state
+        .metrics
+        .is_some_and(|metrics| install_path_metrics_entry(entry, metrics));
+    if let Some((sequence, usage)) = state.peer_usage
+        && entry
+            .peer_usage_sequence
+            .is_none_or(|current| sequence > current)
+    {
+        changed |= entry.peer_usage != Some(usage) || entry.peer_usage_sequence != Some(sequence);
+        entry.peer_usage_sequence = Some(sequence);
+        entry.peer_usage = Some(usage);
+    }
+    if entry.path_proof.is_none()
+        && let Some(observation) = state.path_proof
+    {
+        entry.path_proof = Some(observation);
+        changed = true;
+    }
+    changed
+}
+
 /// One carrier output attached to a response stream.
 ///
 /// It owns carrier command access and sender-evidence fields for this stream on
@@ -41,6 +87,8 @@ pub(in crate::runtime) struct ResponseStreamOutputEntry {
     pub(super) local_policy: PathPolicy,
     pub(super) incarnation: u64,
     pub(super) commands: ReliablePathCommandSender,
+    /// Keeps this stream visible to the exact ordered writer queue it can use.
+    pub(super) load_registration: ReliablePathLoadRegistration,
     /// Unacknowledged unique OriginalData assigned to this response output.
     /// Reinjection copies remain in `bytes_in_flight` but never enter this counter.
     pub(super) original_data_in_flight_bytes: u64,
@@ -66,9 +114,14 @@ pub(in crate::runtime) struct ResponseStreamOutputEntry {
     /// carrier instance. It is independent of local path health.
     pub(super) peer_usage: Option<PathUsage>,
     pub(super) peer_usage_sequence: Option<u64>,
+    /// Monotonic response-direction proof for this physical carrier instance.
+    pub(super) path_proof: Option<PathProofObservation>,
 }
 
 pub(in crate::runtime) struct ResponseStreamOutputs {
+    /// Outputs withdrawn from scheduling but still owned by the stream actor.
+    /// Their flights remain live until the ordered detach event is applied.
+    pub(super) detaching: Vec<ResponseStreamOutputEntry>,
     pub(super) entries: Vec<ResponseStreamOutputEntry>,
     /// Offset-free sender-service staging belongs to the response stream, not
     /// to any carrier output.
@@ -108,27 +161,33 @@ impl ResponseStreamBinding {
             .map_or_else(next_server_carrier_path_instance_id, |entry| {
                 entry.path_instance_id
             });
-        self.attach_with_path_instance(
-            underlay,
-            path_id,
-            path_instance_id,
-            PathPolicy::default(),
-            commands,
+        self.attach_output(
+            ResponseOutputAttachment {
+                key,
+                path_instance_id,
+                local_policy: PathPolicy::default(),
+                commands,
+                state: ResponseOutputAttachmentState::default(),
+            },
             lane,
         )
     }
 
-    pub(in crate::runtime::stream) fn attach_with_path_instance(
+    pub(in crate::runtime::stream) fn attach_output(
         &self,
-        underlay: UnderlayProtocol,
-        path_id: PathId,
-        path_instance_id: CarrierPathInstanceId,
-        local_policy: PathPolicy,
-        commands: ReliablePathCommandSender,
+        attachment: ResponseOutputAttachment,
         lane: TrafficClass,
     ) -> ResponseStreamAttachOutcome {
+        let ResponseOutputAttachment {
+            key,
+            path_instance_id,
+            local_policy,
+            commands,
+            state: attachment_state,
+        } = attachment;
+        #[cfg(feature = "lab-diagnostics")]
+        let CarrierPathKey { underlay, path_id } = key;
         let mut current_lane = self.lane.lock().expect("server reliable stream lane lock");
-        let proof_commands = commands.clone();
         let mut outputs = self
             .outputs
             .lock()
@@ -138,7 +197,6 @@ impl ResponseStreamBinding {
         if !self.response_stream_open.load(Ordering::Acquire) {
             return ResponseStreamAttachOutcome::RejectedClosedStream;
         }
-        let key = CarrierPathKey { underlay, path_id };
         let mut replaced_closed = false;
         let mut replaced_incarnation = None;
         let existing_position = outputs.entries.iter().position(|entry| entry.key == key);
@@ -162,13 +220,19 @@ impl ResponseStreamBinding {
                 if same_channel {
                     let lane_changed = *current_lane != lane;
                     *current_lane = lane;
+                    let evidence_changed = apply_attachment_state(entry, attachment_state);
                     if lane_changed {
+                        for output in outputs.entries.iter().chain(&outputs.detaching) {
+                            output.load_registration.set_lane(lane);
+                        }
+                    }
+                    if lane_changed || evidence_changed {
                         self.response_model_generation
                             .fetch_add(1, Ordering::AcqRel);
                     }
                     drop(outputs);
                     drop(current_lane);
-                    if lane_changed {
+                    if lane_changed || evidence_changed {
                         self.notify_update();
                     }
                     return ResponseStreamAttachOutcome::Attached;
@@ -176,14 +240,16 @@ impl ResponseStreamBinding {
                 return ResponseStreamAttachOutcome::RejectedDuplicateLiveOutput;
             }
         }
-        let entry = if let Some(position) = existing_position {
+        let mut entry = if let Some(position) = existing_position {
             let mut entry = outputs.entries.remove(position);
             if entry.commands.is_closed() {
                 replaced_incarnation = Some(entry.incarnation);
                 entry.path_instance_id = path_instance_id;
                 entry.local_policy = local_policy;
                 entry.incarnation = self.allocate_output_incarnation();
+                entry.load_registration.deactivate();
                 entry.commands = commands;
+                entry.load_registration = entry.commands.register_flow(lane);
                 entry.original_data_in_flight_bytes = 0;
                 entry.bytes_in_flight = 0;
                 entry.product_progress_rate_bps = None;
@@ -197,6 +263,7 @@ impl ResponseStreamBinding {
                 entry.peer_path_metrics = None;
                 entry.peer_usage = None;
                 entry.peer_usage_sequence = None;
+                entry.path_proof = None;
                 replaced_closed = true;
                 #[cfg(feature = "lab-diagnostics")]
                 lab_diagnostic(
@@ -221,12 +288,14 @@ impl ResponseStreamBinding {
             }
             entry
         } else {
+            let load_registration = commands.register_flow(lane);
             ResponseStreamOutputEntry {
                 key,
                 path_instance_id,
                 local_policy,
                 incarnation: self.allocate_output_incarnation(),
                 commands,
+                load_registration,
                 original_data_in_flight_bytes: 0,
                 bytes_in_flight: 0,
                 product_progress_rate_bps: None,
@@ -240,9 +309,14 @@ impl ResponseStreamBinding {
                 peer_path_metrics: None,
                 peer_usage: None,
                 peer_usage_sequence: None,
+                path_proof: None,
             }
         };
+        apply_attachment_state(&mut entry, attachment_state);
         outputs.entries.push(entry);
+        for output in outputs.entries.iter().chain(&outputs.detaching) {
+            output.load_registration.set_lane(lane);
+        }
         if let Some(incarnation) = replaced_incarnation {
             self.invalidate_path_flight_evidence(key, incarnation);
         }
@@ -251,8 +325,6 @@ impl ResponseStreamBinding {
             .fetch_add(1, Ordering::AcqRel);
         drop(outputs);
         drop(current_lane);
-        // Path proof is independent of why the product stream attached.
-        let _ = enqueue_path_proof_frame(&proof_commands, path_id, self.mux_limits);
         self.notify_update();
         if replaced_closed {
             ResponseStreamAttachOutcome::ReplacedClosedOutput
@@ -270,6 +342,13 @@ impl ResponseStreamBinding {
         let changed = *current_lane != lane;
         if changed {
             *current_lane = lane;
+            let outputs = self
+                .outputs
+                .lock()
+                .expect("server reliable stream binding lock");
+            for entry in outputs.entries.iter().chain(&outputs.detaching) {
+                entry.load_registration.set_lane(lane);
+            }
             self.response_model_generation
                 .fetch_add(1, Ordering::AcqRel);
         }
@@ -279,6 +358,7 @@ impl ResponseStreamBinding {
         }
     }
 
+    #[cfg(test)]
     pub(in crate::runtime) fn detach(
         &self,
         key: CarrierPathKey,
@@ -287,6 +367,52 @@ impl ResponseStreamBinding {
         self.detach_matching_output(key, |entry| entry.commands.same_channel(commands));
     }
 
+    /// Withdraws a carrier from placement without yet declaring its flights
+    /// failed. The stream actor completes the detach after earlier input.
+    pub(in crate::runtime) fn begin_path_detach(
+        &self,
+        key: CarrierPathKey,
+        path_instance_id: CarrierPathInstanceId,
+    ) -> Option<u64> {
+        let mut outputs = self
+            .outputs
+            .lock()
+            .expect("server reliable stream binding lock");
+        if let Some(entry) = outputs
+            .detaching
+            .iter()
+            .find(|entry| entry.key == key && entry.path_instance_id == path_instance_id)
+        {
+            return Some(entry.incarnation);
+        }
+        let position = outputs
+            .entries
+            .iter()
+            .position(|entry| entry.key == key && entry.path_instance_id == path_instance_id)?;
+        let entry = outputs.entries.remove(position);
+        entry.load_registration.deactivate();
+        let output_incarnation = entry.incarnation;
+        outputs.detaching.push(entry);
+        self.clear_request_feedback_ingress_if(key, path_instance_id);
+        self.response_model_generation
+            .fetch_add(1, Ordering::AcqRel);
+        drop(outputs);
+        self.notify_update();
+        Some(output_incarnation)
+    }
+
+    pub(in crate::runtime) fn complete_path_detach(
+        &self,
+        key: CarrierPathKey,
+        path_instance_id: CarrierPathInstanceId,
+        output_incarnation: u64,
+    ) {
+        self.detach_matching_output(key, |entry| {
+            entry.path_instance_id == path_instance_id && entry.incarnation == output_incarnation
+        });
+    }
+
+    #[cfg(test)]
     pub(in crate::runtime) fn detach_path_instance(
         &self,
         key: CarrierPathKey,
@@ -304,17 +430,24 @@ impl ResponseStreamBinding {
             .outputs
             .lock()
             .expect("server reliable stream binding lock");
-        let removed = outputs
-            .entries
-            .iter()
-            .find(|entry| entry.key == key && matches(entry))
-            .map(|entry| (entry.incarnation, entry.path_instance_id));
-        outputs
-            .entries
-            .retain(|entry| entry.key != key || !matches(entry));
-        if let Some((incarnation, path_instance_id)) = removed {
-            self.invalidate_path_flight_evidence(key, incarnation);
-            self.clear_request_feedback_ingress_if(key, path_instance_id);
+        let mut removed = Vec::new();
+        let mut retain = |entry: &ResponseStreamOutputEntry| {
+            let remove = entry.key == key && matches(entry);
+            if remove {
+                entry.load_registration.deactivate();
+                removed.push((entry.incarnation, entry.path_instance_id));
+            }
+            !remove
+        };
+        outputs.entries.retain(&mut retain);
+        outputs.detaching.retain(&mut retain);
+        if !removed.is_empty() {
+            for (incarnation, _) in &removed {
+                self.invalidate_path_flight_evidence(key, *incarnation);
+            }
+            for (_, path_instance_id) in &removed {
+                self.clear_request_feedback_ingress_if(key, *path_instance_id);
+            }
             self.response_model_generation
                 .fetch_add(1, Ordering::AcqRel);
             drop(outputs);
@@ -430,16 +563,74 @@ impl ResponseStreamBinding {
         true
     }
 
+    pub(in crate::runtime::stream) fn mark_path_proof_success_for_instance(
+        &self,
+        key: CarrierPathKey,
+        path_instance_id: CarrierPathInstanceId,
+        observation: PathProofObservation,
+    ) -> bool {
+        let changed = {
+            let mut outputs = self
+                .outputs
+                .lock()
+                .expect("server reliable stream binding lock");
+            let Some(entry) = outputs
+                .entries
+                .iter_mut()
+                .find(|entry| entry.key == key && entry.path_instance_id == path_instance_id)
+            else {
+                return false;
+            };
+            if entry.path_proof.is_some() {
+                false
+            } else {
+                entry.path_proof = Some(observation);
+                self.response_model_generation
+                    .fetch_add(1, Ordering::AcqRel);
+                true
+            }
+        };
+        if changed {
+            self.notify_update();
+        }
+        changed
+    }
+
+    #[cfg(test)]
+    pub(in crate::runtime) fn mark_output_path_proven_for_test(&self, key: CarrierPathKey) {
+        let path_instance_id = self
+            .outputs
+            .lock()
+            .expect("server reliable stream binding lock")
+            .entries
+            .iter()
+            .find(|entry| entry.key == key)
+            .map(|entry| entry.path_instance_id)
+            .expect("test output path");
+        assert!(self.mark_path_proof_success_for_instance(
+            key,
+            path_instance_id,
+            PathProofObservation {
+                proof_id: 1,
+                elapsed: std::time::Duration::from_micros(1),
+                sent_at: std::time::Instant::now(),
+            },
+        ));
+    }
+
     pub(in crate::runtime) fn has_output_incarnation(
         &self,
         key: CarrierPathKey,
         incarnation: u64,
     ) -> bool {
-        self.outputs
+        let outputs = self
+            .outputs
             .lock()
-            .expect("server reliable stream binding lock")
+            .expect("server reliable stream binding lock");
+        outputs
             .entries
             .iter()
+            .chain(outputs.detaching.iter())
             .any(|entry| entry.key == key && entry.incarnation == incarnation)
     }
 
@@ -528,6 +719,10 @@ impl ResponseSenderPathTarget {
 
     pub(in crate::runtime) fn can_enqueue_stream_ordered_frame(&self) -> bool {
         self.command_queue.can_enqueue_stream_ordered_frame()
+    }
+
+    pub(in crate::runtime) fn can_enqueue_stream_data(&self, lane: TrafficClass) -> bool {
+        self.command_queue.can_enqueue_lane(lane)
     }
 
     pub(in crate::runtime) fn can_enqueue_reinjection_frame(

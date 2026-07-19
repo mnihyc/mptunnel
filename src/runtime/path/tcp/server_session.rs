@@ -177,7 +177,12 @@ impl ServerTcpPathSession {
                         demand,
                     )
                     .await?;
-                self.write_optional_reply(reply).await
+                let accepted = matches!(&reply, Some(Frame::StreamMaxData { .. }));
+                let disposition = self.write_optional_reply(reply).await?;
+                if !accepted || matches!(disposition, ServerTcpFrameDisposition::Stop) {
+                    return Ok(disposition);
+                }
+                self.write_path_validation().await
             }
             Frame::OpenStream { stream_id, .. } => {
                 self.write_reply(Frame::StreamReset {
@@ -210,12 +215,29 @@ impl ServerTcpPathSession {
                 ttl_ms,
                 payload,
             } => {
+                #[cfg(feature = "lab-diagnostics")]
+                lab_diagnostic(
+                    "server_tcp_datagram_request_received",
+                    format_args!(
+                        "session_id={} path_id={} flow_id={} datagram_id={} payload_bytes={} ttl_ms={}",
+                        self.session_id.0,
+                        self.path_id.0,
+                        flow_id.0,
+                        datagram_id.0,
+                        payload.len(),
+                        ttl_ms,
+                    ),
+                );
                 let effect = self
                     .datagrams
-                    .handle_data(flow_id, datagram_id, ttl_ms, payload)?;
+                    .handle_data(flow_id, datagram_id, ttl_ms, payload)
+                    .await?;
                 self.apply_datagram_effect(effect).await
             }
-            Frame::DatagramFeedback { .. } => Ok(ServerTcpFrameDisposition::Continue),
+            Frame::DatagramFeedback { flow_id, received } => {
+                self.datagrams.handle_feedback(flow_id, received)?;
+                Ok(ServerTcpFrameDisposition::Continue)
+            }
             Frame::DatagramClose { flow_id } => {
                 self.datagrams.remove(flow_id);
                 if self.draining && self.streams.is_empty() && self.datagrams.is_empty() {
@@ -245,13 +267,8 @@ impl ServerTcpPathSession {
                 Ok(ServerTcpFrameDisposition::Continue)
             }
             Frame::StreamDetach { stream_id } => {
-                self.streams.detach(
-                    &self.context,
-                    &self.commands_tx,
-                    self.session_id,
-                    self.path_id,
-                    stream_id,
-                );
+                self.streams
+                    .detach(&self.context, &self.path_registration, stream_id)?;
                 if self.draining && self.streams.is_empty() && self.datagrams.is_empty() {
                     self.write_stop_reply(Frame::PathClose {
                         path_id: self.path_id,
@@ -453,13 +470,8 @@ impl ServerTcpPathSession {
                     ) {
                         return Ok(ServerTcpSessionDisposition::Stop);
                     }
-                    self.streams.detach(
-                        &self.context,
-                        &self.commands_tx,
-                        self.session_id,
-                        self.path_id,
-                        stream_id,
-                    );
+                    self.streams
+                        .detach(&self.context, &self.path_registration, stream_id)?;
                     if self.draining && self.streams.is_empty() && self.datagrams.is_empty() {
                         let _ = self
                             .writer
@@ -482,13 +494,8 @@ impl ServerTcpPathSession {
                     ) {
                         return Ok(ServerTcpSessionDisposition::Stop);
                     }
-                    self.streams.detach(
-                        &self.context,
-                        &self.commands_tx,
-                        self.session_id,
-                        self.path_id,
-                        stream_id,
-                    );
+                    self.streams
+                        .detach(&self.context, &self.path_registration, stream_id)?;
                     if self.draining && self.streams.is_empty() && self.datagrams.is_empty() {
                         let _ = self
                             .writer
@@ -509,7 +516,11 @@ impl ServerTcpPathSession {
                     }
                 }
                 ReliablePathCommand::PrepareConnection { .. }
-                | ReliablePathCommand::OpenStream { .. } => {
+                | ReliablePathCommand::OpenStream { .. }
+                | ReliablePathCommand::OpenDatagramAttachment { .. }
+                | ReliablePathCommand::OpenDatagramFlow { .. }
+                | ReliablePathCommand::SendDatagramFrame { .. }
+                | ReliablePathCommand::CloseDatagramAttachment { .. } => {
                     if matches!(
                         self.write_batch_interlocked(&mut writer_pending_bytes)
                             .await?,
@@ -661,14 +672,6 @@ impl ServerTcpPathSession {
                     Ok(ServerTcpFrameDisposition::Stop)
                 }
             }
-            ServerTcpDatagramEffect::ReplyThenError { frame, failure } => {
-                let wrote = self.writer.write_frame(&frame).await?;
-                if wrote {
-                    Err(failure.into_error())
-                } else {
-                    Ok(ServerTcpFrameDisposition::Stop)
-                }
-            }
         }
     }
 
@@ -680,6 +683,20 @@ impl ServerTcpPathSession {
             Some(frame) => self.write_reply(frame).await,
             None => Ok(ServerTcpFrameDisposition::Continue),
         }
+    }
+
+    async fn write_path_validation(&mut self) -> Result<ServerTcpFrameDisposition, RuntimeError> {
+        let Some(challenge) = self
+            .path_registration
+            .path_validation_challenge(self.context.mux_limits)
+        else {
+            return Ok(ServerTcpFrameDisposition::Continue);
+        };
+        if !self.writer.write_frame(&challenge).await? {
+            return Ok(ServerTcpFrameDisposition::Stop);
+        }
+        self.evidence.record_sent_frame(&challenge);
+        Ok(ServerTcpFrameDisposition::Continue)
     }
 
     async fn write_reply(

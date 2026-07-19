@@ -13,6 +13,20 @@ use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 use tokio::sync::{mpsc, oneshot};
 
 #[test]
+fn quic_stream_priority_uses_only_default_and_latency_levels() {
+    for lane in [
+        TrafficClass::Control,
+        TrafficClass::Latency,
+        TrafficClass::RealtimeDatagram,
+    ] {
+        assert_eq!(quic_stream_priority(lane), QUIC_LATENCY_STREAM_PRIORITY);
+    }
+    for lane in [TrafficClass::Throughput, TrafficClass::Background] {
+        assert_eq!(quic_stream_priority(lane), QUIC_DEFAULT_STREAM_PRIORITY);
+    }
+}
+
+#[test]
 fn quic_resolution_keeps_all_unique_source_compatible_addresses() {
     let v4_first = SocketAddr::from(([192, 0, 2, 10], 443));
     let v6 = SocketAddr::from(([0x2001, 0xdb8, 0, 0, 0, 0, 0, 10], 443));

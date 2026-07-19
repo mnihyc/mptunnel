@@ -81,7 +81,11 @@ pub(super) async fn run_server_quic_path_metrics(
     let mut tracker = UdpPathMetricTracker::default();
     #[cfg(feature = "lab-diagnostics")]
     let mut last_metrics_poll_at = None;
+    let delivery_activity = connection.delivery_activity_notify();
     loop {
+        let activity_started = delivery_activity.notified();
+        tokio::pin!(activity_started);
+        activity_started.as_mut().enable();
         if connection.is_closed() {
             return;
         }
@@ -138,7 +142,14 @@ pub(super) async fn run_server_quic_path_metrics(
                 false,
             );
         }
-        tokio::time::sleep(quic_path_metrics_poll_interval(metrics)).await;
+        tokio::select! {
+            _ = tokio::time::sleep(quic_path_metrics_poll_interval(metrics)) => {}
+            _ = &mut activity_started => {
+                // A write transition starts an ACK-clock sample; sampling at
+                // the write instant would only republish pre-delivery state.
+                tokio::time::sleep(quic_path_metrics_ack_interval(metrics)).await;
+            }
+        }
     }
 }
 
@@ -163,12 +174,19 @@ pub(super) fn log_quic_ack_poll_diagnostics(
         lab_diagnostic(
             "quic_carrier_ack_poll",
             format_args!(
-                "session_id={} path_id={} path_instance_id={} direction={:?} poll_elapsed_us={} newly_lost_bytes={} newly_acked_bytes={} non_app_limited_acked_bytes={} timed_non_app_limited_acked_bytes={} ack_elapsed_us={} sample_count={} non_app_limited_sample_count={} timed_non_app_limited_sample_count={} carrier_app_limited={} evidence_written_delta={} evidence_newly_acked_bytes={} evidence_pending_ack_bytes={} pending_sample_bytes={} pending_sample_count={} pending_sample_elapsed_us={} proof_expires_in_us={}",
+                "session_id={} path_id={} path_instance_id={} direction={:?} poll_elapsed_us={} srtt_us={} rttvar_us={} congestion_window_bytes={} bytes_in_flight={} pending_bytes={} pacing_rate_bps={} loss_ppm={} newly_lost_bytes={} newly_acked_bytes={} non_app_limited_acked_bytes={} timed_non_app_limited_acked_bytes={} ack_elapsed_us={} sample_count={} non_app_limited_sample_count={} timed_non_app_limited_sample_count={} carrier_app_limited={} evidence_written_delta={} evidence_newly_acked_bytes={} evidence_pending_ack_bytes={} pending_sample_bytes={} pending_sample_count={} pending_sample_elapsed_us={} proof_expires_in_us={}",
                 session_id.0,
                 path_id.0,
                 path_instance_id,
                 metrics.direction,
                 poll_elapsed.as_micros(),
+                metrics.srtt.as_micros(),
+                metrics.rttvar.as_micros(),
+                metrics.inflight_hi,
+                metrics.bytes_in_flight,
+                metrics.pending_bytes,
+                metrics.pacing_rate_bps.round() as u64,
+                metrics.loss_ppm.unwrap_or(0),
                 ack.newly_lost_bytes,
                 ack.newly_acked_bytes,
                 ack.non_app_limited_acked_bytes,
@@ -239,14 +257,19 @@ fn duration_to_micros_u32(duration: Duration) -> u32 {
 }
 
 pub(super) fn quic_path_metrics_poll_interval(metrics: UdpPathMetrics) -> Duration {
-    if metrics.app_limited {
+    let carrier_is_active = metrics.bytes_in_flight > 0 || metrics.pending_bytes > 0;
+    if metrics.app_limited && !carrier_is_active {
         transport_pto_from_ms(
             metrics.srtt.as_secs_f64() * 1000.0,
             metrics.rttvar.as_secs_f64() * 1000.0,
         )
     } else {
-        (metrics.srtt / 2).max(QUIC_TIMER_GRANULARITY)
+        quic_path_metrics_ack_interval(metrics)
     }
+}
+
+pub(super) fn quic_path_metrics_ack_interval(metrics: UdpPathMetrics) -> Duration {
+    (metrics.srtt / 2).max(QUIC_TIMER_GRANULARITY)
 }
 
 #[cfg(test)]

@@ -918,7 +918,7 @@ async fn server_response_sender_dispatch_creates_stream_data_from_queued_bytes()
             commands,
             MuxLimits::default(),
         ),
-        frames: frame_rx,
+        frames: frame_rx.into(),
     };
     let mut send_stream = ReliableSendStream::new(stream_id, MuxLimits::default());
     send_stream.update_max_offset(1024);
@@ -974,7 +974,7 @@ async fn fixed_response_output_learns_product_rate_from_stream_ack_batches() {
             commands,
             mux_limits,
         ),
-        frames: frame_rx,
+        frames: frame_rx.into(),
     };
     let startup_snapshot = path_stream.send_path_snapshot(TrafficClass::Throughput, 1);
     let startup_quantum =
@@ -1218,7 +1218,7 @@ async fn server_response_sender_slices_large_reads_to_service_quantum() {
             commands,
             mux_limits,
         ),
-        frames: frame_rx,
+        frames: frame_rx.into(),
     };
     let quantum = adaptive_reliable_relay_chunk_bytes(
         path_stream.send_path_snapshot(TrafficClass::Throughput, 1),
@@ -1276,7 +1276,7 @@ async fn server_response_sender_promotes_remaining_data_at_dispatch() {
             commands,
             mux_limits,
         ),
-        frames: frame_rx,
+        frames: frame_rx.into(),
     };
     let mut send_stream = ReliableSendStream::new(stream_id, mux_limits);
     send_stream.update_max_offset(mux_limits.max_stream_window_bytes);
@@ -1349,7 +1349,7 @@ async fn server_response_sender_dispatches_control_before_reinjection_and_data()
             commands,
             MuxLimits::default(),
         ),
-        frames: frame_rx,
+        frames: frame_rx.into(),
     };
     let mut send_stream = ReliableSendStream::new(stream_id, MuxLimits::default());
     send_stream.update_max_offset(1024);
@@ -1421,7 +1421,7 @@ async fn server_response_sender_dispatches_final_fin_after_queued_data() {
             commands,
             MuxLimits::default(),
         ),
-        frames: frame_rx,
+        frames: frame_rx.into(),
     };
     let mut send_stream = ReliableSendStream::new(stream_id, MuxLimits::default());
     send_stream.update_max_offset(1024);
@@ -1496,7 +1496,7 @@ async fn server_response_control_queue_full_is_sender_backpressure() {
             commands,
             MuxLimits::default(),
         ),
-        frames: frame_rx,
+        frames: frame_rx.into(),
     };
     let mut send_stream = ReliableSendStream::new(stream_id, MuxLimits::default());
     send_stream.update_max_offset(1024);
@@ -1541,7 +1541,7 @@ async fn server_response_sender_keeps_data_queued_when_carrier_rejects() {
             commands,
             MuxLimits::default(),
         ),
-        frames: frame_rx,
+        frames: frame_rx.into(),
     };
     let mut send_stream = ReliableSendStream::new(stream_id, MuxLimits::default());
     send_stream.update_max_offset(1024);
@@ -1592,7 +1592,7 @@ async fn server_response_sender_blocks_when_switchable_outputs_detach() {
         underlay: UnderlayProtocol::Udp,
         max_frame_payload_bytes: reliable_relay_buffer_len(MuxLimits::default()),
         output: ReliablePathStreamOutput::Switchable(binding),
-        frames: frame_rx,
+        frames: frame_rx.into(),
     };
     let mut send_stream = ReliableSendStream::new(stream_id, MuxLimits::default());
     send_stream.update_max_offset(1024);
@@ -1642,7 +1642,7 @@ async fn server_response_sender_queue_full_is_backpressure_not_path_failure() {
             commands,
             MuxLimits::default(),
         ),
-        frames: frame_rx,
+        frames: frame_rx.into(),
     };
     let mut send_stream = ReliableSendStream::new(stream_id, MuxLimits::default());
     send_stream.update_max_offset(1024);
@@ -1711,7 +1711,7 @@ async fn response_binding_duplicate_live_path_rejects_fresh_output() {
         underlay: UnderlayProtocol::Udp,
         max_frame_payload_bytes: reliable_relay_buffer_len(MuxLimits::default()),
         output: ReliablePathStreamOutput::Switchable(binding),
-        frames: frame_rx,
+        frames: frame_rx.into(),
     };
     let mut send_stream = ReliableSendStream::new(stream_id, MuxLimits::default());
     send_stream.update_max_offset(1024);
@@ -1772,11 +1772,6 @@ async fn response_binding_duplicate_closed_path_replaces_output() {
         ),
         ResponseStreamAttachOutcome::ReplacedClosedOutput
     );
-    assert!(matches!(
-        recv_emitted_tcp_path_command(&mut second_receivers).await,
-        Some(ReliablePathCommand::SendFrame(Frame::PathProofData { .. }))
-    ));
-
     let (_frame_tx, frame_rx) = mpsc::channel(1);
     let path_stream = ReliablePathStream {
         stream_id,
@@ -1785,7 +1780,7 @@ async fn response_binding_duplicate_closed_path_replaces_output() {
         underlay: UnderlayProtocol::Udp,
         max_frame_payload_bytes: reliable_relay_buffer_len(MuxLimits::default()),
         output: ReliablePathStreamOutput::Switchable(binding),
-        frames: frame_rx,
+        frames: frame_rx.into(),
     };
     let mut send_stream = ReliableSendStream::new(stream_id, MuxLimits::default());
     send_stream.update_max_offset(1024);
@@ -1981,10 +1976,6 @@ async fn server_response_sender_uses_bounded_cross_path_reordering_after_path_lo
         udp_commands,
         TrafficClass::Throughput,
     );
-    assert!(matches!(
-        recv_emitted_tcp_path_command(&mut udp_receivers).await,
-        Some(ReliablePathCommand::SendFrame(Frame::PathProofData { .. }))
-    ));
     let lower_owner_key = CarrierPathKey {
         underlay: UnderlayProtocol::Tcp,
         path_id: PathId(0),
@@ -2016,7 +2007,7 @@ async fn server_response_sender_uses_bounded_cross_path_reordering_after_path_lo
         underlay: UnderlayProtocol::Udp,
         max_frame_payload_bytes: reliable_relay_buffer_len(MuxLimits::default()),
         output: ReliablePathStreamOutput::Switchable(binding),
-        frames: frame_rx,
+        frames: frame_rx.into(),
     };
     let mut send_stream = ReliableSendStream::new(stream_id, MuxLimits::default());
     send_stream.update_max_offset(1024);
@@ -2069,7 +2060,7 @@ async fn server_response_sender_dispatches_reinjection_before_data() {
             commands,
             MuxLimits::default(),
         ),
-        frames: frame_rx,
+        frames: frame_rx.into(),
     };
     let mut send_stream = ReliableSendStream::new(stream_id, MuxLimits::default());
     send_stream.update_max_offset(1024);
@@ -3094,7 +3085,7 @@ fn tcp_receive_hole_reinjection_deadline_is_progress_signal_not_path_victim_poli
 }
 
 #[test]
-fn acked_udp_datagram_timeout_suppresses_path_for_next_realtime_packet() {
+fn observed_udp_datagram_loss_prefers_alternative_for_next_realtime_packet() {
     let resources = ResourceLimits::default();
     let context = ClientPathContext::new(
         vec![
@@ -3132,7 +3123,7 @@ fn acked_udp_datagram_timeout_suppresses_path_for_next_realtime_packet() {
     assert_eq!(
         association.select_path_candidate(&candidates, &HashSet::new(), payload_bytes, ttl_ms),
         Some(1),
-        "an ACKed datagram response timeout is data-plane evidence; the next realtime packet should use the alternate path"
+        "explicit carrier delivery loss should move the next realtime packet to the alternate path"
     );
 }
 

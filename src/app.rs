@@ -1,6 +1,7 @@
 use crate::cli::{Cli, CliConfigError, Command};
 use crate::config::{AppConfig, ConfigFileError, DEFAULT_CONFIG_PATH};
 use clap::Parser;
+use clap::error::ErrorKind;
 use std::ffi::{OsStr, OsString};
 use std::path::PathBuf;
 use std::time::Duration;
@@ -11,6 +12,20 @@ pub fn build_config(cli: Cli) -> Result<AppConfig, CliConfigError> {
 
 pub fn run_from_env() -> Result<(), AppError> {
     let args = std::env::args_os().collect::<Vec<_>>();
+    if config_file_meta_action_requested(&args) {
+        return match Cli::try_parse_from(args) {
+            Err(error)
+                if matches!(
+                    error.kind(),
+                    ErrorKind::DisplayHelp | ErrorKind::DisplayVersion
+                ) =>
+            {
+                error.print().map_err(AppError::CliOutput)
+            }
+            Err(error) => Err(AppError::Cli(error)),
+            Ok(cli) => run(cli),
+        };
+    }
     if let Some(config_file) = config_file_from_args(&args)? {
         return run_config_file(config_file);
     }
@@ -43,6 +58,7 @@ fn run_config(config: AppConfig) -> Result<(), AppError> {
         return Ok(());
     }
 
+    eprintln!("mptunnel {} starting", env!("CARGO_PKG_VERSION"));
     let runtime = tokio::runtime::Builder::new_multi_thread()
         .worker_threads(runtime_worker_threads())
         .enable_all()
@@ -111,6 +127,21 @@ fn config_file_from_args(args: &[OsString]) -> Result<Option<ConfigFileInvocatio
     Ok(config_path.map(|path| ConfigFileInvocation { path, check_config }))
 }
 
+fn config_file_meta_action_requested(args: &[OsString]) -> bool {
+    let has_config = args.iter().skip(1).any(|arg| {
+        arg == OsStr::new("--config")
+            || arg == OsStr::new("-c")
+            || arg.to_str().is_some_and(|arg| arg.starts_with("--config="))
+    });
+    has_config
+        && args.iter().skip(1).any(|arg| {
+            arg == OsStr::new("--help")
+                || arg == OsStr::new("-h")
+                || arg == OsStr::new("--version")
+                || arg == OsStr::new("-V")
+        })
+}
+
 fn parse_bool_flag(value: &str) -> Option<bool> {
     match value {
         "1" | "true" | "yes" | "on" => Some(true),
@@ -161,6 +192,8 @@ fn next_restart_backoff(current: Duration, max: Duration) -> Duration {
 
 #[derive(Debug)]
 pub enum AppError {
+    Cli(clap::Error),
+    CliOutput(std::io::Error),
     Config(CliConfigError),
     ConfigFile(ConfigFileError),
     ConfigFileArgumentMissing,
@@ -184,6 +217,8 @@ impl From<crate::runtime::RuntimeError> for AppError {
 impl std::fmt::Display for AppError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
+            Self::Cli(err) => write!(f, "{err}"),
+            Self::CliOutput(err) => write!(f, "failed to write CLI output: {err}"),
             Self::Config(err) => write!(f, "{err}"),
             Self::ConfigFile(err) => write!(f, "{err}"),
             Self::ConfigFileArgumentMissing => write!(f, "--config requires a file path"),

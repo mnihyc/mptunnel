@@ -295,6 +295,7 @@ impl RequestFlightLedger {
         owner_keys
     }
 
+    #[cfg(test)]
     pub(in crate::runtime) fn unique_original_path_for_frame(
         &self,
         frame: &Frame,
@@ -303,14 +304,43 @@ impl RequestFlightLedger {
         self.unique_original_path_for_range(OffsetRange { start, end })
     }
 
+    /// Returns exact ownership and its latest send epoch in one ledger pass.
+    /// The latest adjacent flight is conservative when an ACK gap spans writes.
+    pub(in crate::runtime) fn unique_original_flight_for_frame(
+        &self,
+        frame: &Frame,
+    ) -> Option<(RelayPathInstance, Instant)> {
+        let (start, end, _) = reliable_stream_frame_extent(frame)?;
+        self.unique_original_flight_for_range(OffsetRange { start, end })
+    }
+
+    #[cfg(test)]
+    pub(in crate::runtime) fn unique_original_sent_at_for_frame(
+        &self,
+        frame: &Frame,
+    ) -> Option<Instant> {
+        self.unique_original_flight_for_frame(frame)
+            .map(|(_, sent_at)| sent_at)
+    }
+
+    #[cfg(test)]
     pub(in crate::runtime) fn unique_original_path_for_range(
         &self,
         range: OffsetRange,
     ) -> Option<RelayPathInstance> {
+        self.unique_original_flight_for_range(range)
+            .map(|(owner, _)| owner)
+    }
+
+    fn unique_original_flight_for_range(
+        &self,
+        range: OffsetRange,
+    ) -> Option<(RelayPathInstance, Instant)> {
         if range.is_empty() {
             return None;
         }
         let mut owner = None;
+        let mut latest_sent_at = None;
         let mut covered = Vec::new();
         for (start, flights) in self.flights.range(..range.end) {
             for flight in flights {
@@ -321,6 +351,10 @@ impl RequestFlightLedger {
                     return None;
                 }
                 owner = Some(flight.instance);
+                latest_sent_at = Some(
+                    latest_sent_at
+                        .map_or(flight.sent_at, |latest: Instant| latest.max(flight.sent_at)),
+                );
                 covered.push(OffsetRange {
                     start: (*start).max(range.start),
                     end: flight.end.min(range.end),
@@ -329,7 +363,7 @@ impl RequestFlightLedger {
         }
         let covered = normalize_offset_ranges(covered);
         if covered.len() == 1 && covered[0] == range {
-            owner
+            owner.zip(latest_sent_at)
         } else {
             None
         }

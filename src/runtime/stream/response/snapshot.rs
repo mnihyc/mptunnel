@@ -24,6 +24,7 @@ use crate::runtime::path::model::{default_path_rate_bps, default_path_srtt_ms};
 use crate::scheduler::{PathRateScope, PathSnapshot, TrafficClass, path_is_backup, score_path};
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
+use std::time::Duration;
 use tokio::sync::Notify;
 
 impl ResponseStreamBinding {
@@ -94,6 +95,8 @@ impl ResponseStreamBinding {
                             ingress.key == entry.key
                                 && ingress.path_instance_id == entry.path_instance_id
                         }),
+                        #[cfg(test)]
+                        has_path_proof_evidence: entry.path_proof.is_some(),
                         has_bulk_rate_evidence: server_output_has_bulk_rate_evidence(
                             entry,
                             self.mux_limits,
@@ -192,9 +195,27 @@ pub(super) fn server_bulk_output_snapshot(
         .flatten();
     let liveness_metrics = local_metrics.or(peer_hint);
 
-    let srtt_ms = liveness_metrics.map_or_else(
-        || entry.srtt_ms.unwrap_or_else(default_path_srtt_ms),
-        |metrics| f64::from(metrics.metrics.srtt_us.max(1)) / 1000.0,
+    let proof_rtt = entry.path_proof.filter(|observation| {
+        let proof_acked_at = observation
+            .sent_at
+            .checked_add(observation.elapsed)
+            .unwrap_or(observation.sent_at);
+        local_metrics.is_none_or(|metrics| metrics.recorded_at < proof_acked_at)
+    });
+    let srtt_ms = proof_rtt.map_or_else(
+        || {
+            liveness_metrics.map_or_else(
+                || entry.srtt_ms.unwrap_or_else(default_path_srtt_ms),
+                |metrics| f64::from(metrics.metrics.srtt_us.max(1)) / 1000.0,
+            )
+        },
+        |observation| {
+            observation
+                .elapsed
+                .max(Duration::from_micros(1))
+                .as_secs_f64()
+                * 1000.0
+        },
     );
     let jitter_ms =
         liveness_metrics.map_or(0.0, |metrics| f64::from(metrics.metrics.jitter_us) / 1000.0);
@@ -214,6 +235,22 @@ pub(super) fn server_bulk_output_snapshot(
     let native_rate = local_metrics
         .filter(|metrics| server_path_metrics_has_bulk_rate_evidence(*metrics))
         .map(server_path_metrics_estimate_rate_bps);
+    let native_startup_rate = local_metrics
+        .filter(|metrics| !server_path_metrics_has_bulk_rate_evidence(*metrics))
+        .filter(|metrics| {
+            metrics
+                .metrics
+                .inflight_limit_bytes
+                .max(metrics.metrics.inflight_hi_bytes)
+                > 0
+        })
+        .map(|metrics| {
+            metrics
+                .metrics
+                .pacing_rate_bps
+                .max(metrics.metrics.delivery_rate_bps)
+                .max(1) as f64
+        });
     let peer_rate = peer_hint
         .filter(|metrics| !metrics.metrics.app_limited)
         .map(server_path_metrics_estimate_rate_bps);
@@ -224,6 +261,13 @@ pub(super) fn server_bulk_output_snapshot(
         ),
         _ if native_rate.is_some() => (
             native_rate.expect("guarded native rate"),
+            PathRateScope::PathCapacity,
+        ),
+        // During transport Startup, pacing ranks paths with available native
+        // congestion credit but never grants completion-time authority. A
+        // window-covering ACK sample replaces it with delivery rate above.
+        _ if native_startup_rate.is_some() => (
+            native_startup_rate.expect("guarded native startup rate"),
             PathRateScope::PathCapacity,
         ),
         _ if peer_rate.is_some() => (
@@ -244,8 +288,12 @@ pub(super) fn server_bulk_output_snapshot(
         rate_bps.max(1.0),
     );
     snapshot.rate_scope = rate_scope;
+    snapshot.carrier_delivery_rate_bps = native_rate;
     snapshot.policy = entry.local_policy;
     snapshot.peer_usage = entry.peer_usage;
+    let (active_flows, active_latency_sensitive_flows) = entry.commands.active_flow_counts();
+    snapshot.active_flows = active_flows;
+    snapshot.active_latency_sensitive_flows = active_latency_sensitive_flows;
     snapshot.product_progress_rate_bps = entry.product_progress_rate_bps;
     snapshot.has_durable_product_progress =
         server_output_has_durable_product_ack_progress(entry, mux_limits);

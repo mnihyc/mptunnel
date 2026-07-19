@@ -8,7 +8,7 @@ use crate::model::capacity::{
     reliable_bulk_carrier_feed_quantum_bytes,
 };
 use crate::mux::MuxLimits;
-use crate::protocol::{OffsetRange, UnderlayProtocol};
+use crate::protocol::OffsetRange;
 use crate::scheduler::{PathSnapshot, TrafficClass};
 use std::collections::BTreeMap;
 
@@ -73,36 +73,6 @@ pub(crate) fn reliable_failed_original_reinjection_limit_bytes(
             .min(usize::MAX as u64) as usize
     });
     let event_limit = event_limit.max(target_flight.saturating_sub(existing_target_debt));
-    reliable_critical_tail_reinjection_limit_bytes(event_limit, reinjection_debt_bytes, mux_limits)
-}
-
-/// Sizes one persistent Data ACK-gap reinjection from current target service
-/// opportunity while leaving TCP and QUIC recovery carrier-local.
-pub(crate) fn reliable_persistent_ack_gap_reinjection_limit_bytes(
-    path: Option<PathSnapshot>,
-    original_underlay: Option<UnderlayProtocol>,
-    traffic_class: TrafficClass,
-    reinjection_debt_bytes: usize,
-    mux_limits: MuxLimits,
-) -> usize {
-    let event_limit = adaptive_reliable_relay_reinjection_bytes(path, traffic_class, mux_limits);
-    let event_limit = if original_underlay == Some(UnderlayProtocol::Tcp) {
-        let service_flight =
-            adaptive_reliable_relay_inflight_bytes(path, TrafficClass::Throughput, mux_limits);
-        let existing_service_debt = path.map_or(0, |snapshot| {
-            snapshot
-                .data_level_bytes_in_flight
-                .max(snapshot.data_level_queue_bytes)
-                .max(snapshot.queue_bytes)
-                .min(usize::MAX as u64) as usize
-        });
-        event_limit.max(service_flight.saturating_sub(existing_service_debt))
-    } else {
-        event_limit
-    };
-    if event_limit == 0 {
-        return 0;
-    }
     reliable_critical_tail_reinjection_limit_bytes(event_limit, reinjection_debt_bytes, mux_limits)
 }
 

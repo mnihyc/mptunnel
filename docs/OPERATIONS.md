@@ -13,9 +13,6 @@ host-lifecycle guidance, and release target matrix. Only Linux
 `/dev/net/tun` accessibility is probed immediately; other packet-device
 providers open their device when the runtime starts.
 
-`scripts/check-line-counts.sh` is a warning-only developer maintainability
-check, not an operator health check.
-
 ## Privileges
 
 SOCKS5 and HTTP CONNECT ingress need no elevated privilege when bound to normal
@@ -97,8 +94,8 @@ During authenticated setup the peer advertises sequence-zero directional
 `PathUsage::{Available, Backup}`. This is separate from local path health.
 Ordinary scheduling considers available paths first and uses backup paths only
 when no eligible available choice exists. Metrics rank paths within the chosen
-set. The receiver accepts only strictly newer later sequences, but this release has no runtime
-control that originates a post-handshake preference change.
+set. The receiver accepts only strictly newer later sequences, but this release
+has no runtime control that originates a post-handshake preference change.
 
 Management path controls change endpoint-local policy or lifecycle. They do not
 rewrite peer usage, forge transport evidence, or assign a fixed data path to a
@@ -116,7 +113,7 @@ address. Enable the embedded page explicitly with `dashboard = true` or
 All data and controls are under `/api/`:
 
 - `GET /api/` returns the authenticated endpoint index and schema identifier.
-- `GET /api/health` is the only public API route.
+- `GET /api/health` is the only unauthenticated API route.
 - `GET /api/status` returns the complete cached snapshot.
 - `GET /api/paths` returns configured listeners, logical client paths, and live
   server carrier instances with their actual lifecycle state.
@@ -129,8 +126,8 @@ All data and controls are under `/api/`:
 - `POST /api/control/path` changes endpoint-local client path lifecycle policy.
 - `POST /api/diagnostics/peer` requests a sanitized peer snapshot.
 
-Static page assets and `GET /api/health` are public so the browser and local
-health checks can load before authentication. Every runtime-data and control
+Static page assets and `GET /api/health` are unauthenticated so the browser and
+local health checks can load before authentication. Every runtime-data and control
 request requires `Authorization: Bearer <token>`. The default page retains it
 only in memory and browser session storage, not a URL or persistent local
 storage. The API has no CORS support and sends restrictive browser security
@@ -185,7 +182,7 @@ transmission modes and not desired memory occupancy.
 | `max_streams` | 65,536 | logical MPP stream cap |
 | `max_quic_concurrent_bidi_streams` | 65,536 | QUIC stream concurrency envelope |
 | `max_stream_window_bytes` | 64 MiB | per-direction MPP receive window shared across attachments |
-| `max_repair_bytes` | 64 MiB | public compatibility name for retained MPP data available to reinject |
+| `max_repair_bytes` | 64 MiB | retained MPP data available for reinjection |
 | `max_reorder_bytes` | 64 MiB | receive-hole and ordering-debt envelope |
 | `max_datagram_queue_bytes` | 16 MiB | MPP datagram burst envelope |
 | `max_path_flight_bytes` | 64 MiB | per-path MPP-flight ceiling |
@@ -232,25 +229,25 @@ a defect, not expected failover overhead.
 
 The current timers are cause-specific. Exact path-instance failure permits an
 immediate bounded copy, preferring measured survivors but using any eligible
-live survivor when necessary. An authoritative lowest missing Data Sequence
-frontier must persist for three owner-carrier recovery intervals; TCP uses RTO
-and QUIC uses PTO. Growth of the ACK horizon above it does not restart the
-timer. A contiguous live tail may send one bounded probe after one such
-interval and waits three intervals before another probe without progress. A
-request path becomes stale for new placement after four TCP RTOs or three QUIC
-PTOs without exact Data ACK progress when another attachment exists; this does
-not terminate native recovery. These are MPP recovery policies, not native TCP
-or QUIC retransmission timers.
+live survivor when necessary. Complete Data ACKs establish missing ranges;
+positive partial ACK ranges may extend established state but cannot infer an
+omission. Fragmented request feedback waits one owner RTO/PTO from first
+authoritative gap observation. Response feedback may use a later-ACK TCP RACK
+5/4-SRTT or QUIC 9/8-SRTT time threshold; ACK silence waits owner RTO/PTO. A
+contiguous live tail may send one bounded probe per recovery interval without
+progress. A request path becomes stale for new placement after four TCP RTOs
+or three QUIC PTOs without exact Data ACK progress when another attachment
+exists; this does not terminate native recovery.
 
 MPP datagram feedback confirms target-worker admission, not end-to-end target
-delivery. An alternative-path attempt receives a new flow-local datagram ID;
-operators must therefore allow for duplicate delivery if a delayed first
-attempt and its retry both reach the target. Before feedback, the runtime makes
-at most two product attempts. A ranked alternative is tried after one modeled
-response timeout; the final or only attempt keeps three such timeouts, capped by
-the absolute TTL. After feedback, the request is never replayed and its response
-may be awaited until that TTL, so an abrupt blackhole can still lose an
-admitted UDP response rather than duplicate a target operation.
+delivery. Before feedback, the runtime makes at most two product attempts. Both
+attempts retain the same session, flow, and datagram identity; the shared server
+flow forwards that identity to the target at most once and replays a bounded
+cached response to the retry carrier. A ranked alternative is tried after one
+modeled response timeout; the final or only attempt keeps three such timeouts,
+capped by the absolute TTL. After feedback, the request is never replayed and
+its response may be awaited until that TTL. The guarantee is at-most-once target
+forwarding within retained MPP state, not end-to-end exactly-once UDP delivery.
 
 The first successful startup probe for each configured path retains its
 authenticated TCP or QUIC carrier for product use. Later probes use isolated

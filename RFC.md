@@ -1,4 +1,4 @@
-# MPTunnel Multipath Proxy Protocol (MPP) Version 2
+# MPTunnel Multipath Proxy Protocol (MPP) Version 3
 
 ## Status
 
@@ -14,8 +14,9 @@ usage model of
 It does not replace the congestion controller or loss recovery of either TCP
 or QUIC.
 
-Protocol version 2 is wire-incompatible with version 1. A peer MUST reject a
-frame header carrying any unsupported version.
+Protocol version 3 changes datagram identity semantics and is incompatible with
+versions 1 and 2. A peer MUST reject a frame header carrying any unsupported
+version.
 
 ## 1. Scope
 
@@ -177,10 +178,14 @@ authenticated request/response exchange and exclude transport connection
 setup.
 
 `PATH_DRAIN(path_id)` requests graceful retirement of an MPP TCP path. No new
-streams SHOULD attach after drain begins. Existing work may finish. The peer
-completes retirement with `PATH_CLOSE(path_id, reason)`. The current QUIC
-implementation retires the QUIC connection through its native lifecycle and
-does not exchange these two MPP frames.
+streams or datagram flows SHOULD attach after drain begins. Existing work may
+finish. One live TCP path is one authenticated connection actor shared by path
+control, reliable-stream attachments, and datagram-flow attachments. Product
+FIN, detach, reset, or `DGRAM_CLOSE` retires only the affected product state;
+path and session lifecycle own physical carrier retirement. The peer completes
+retirement with `PATH_CLOSE(path_id, reason)`. The current QUIC implementation
+retires the QUIC connection through its native lifecycle and does not exchange
+these two MPP frames.
 
 Local states such as active, suspect, draining, failed, disabled, and cooldown
 are endpoint-local health. Except for `PATH_DRAIN` and `PATH_CLOSE`, they are
@@ -231,7 +236,7 @@ strictly greater than the last accepted sequence for that instance. A stale
 or duplicate sequence MUST NOT change scheduling state. A new authenticated
 instance restarts at zero.
 
-The current protocol-v2 runtime emits only the authenticated sequence-zero
+The current protocol-v3 runtime emits only the authenticated sequence-zero
 status derived from listener policy. Receive paths retain the higher-sequence
 fence, but no management or scheduler action currently originates a later
 status. Dynamic peer-preference control therefore remains reserved until a
@@ -347,10 +352,16 @@ local constraints, not alternate MPP receive windows.
 
 ### 6.5 Completion and reset
 
-`STREAM_FIN(stream_id, final_offset)` declares the final data sequence offset. FIN is
-ordered in the same sequence space and may be sent on any live attachment.
+`STREAM_FIN(stream_id, final_offset)` declares the final data sequence offset
+and may be sent on any live attachment. A receiver rejects an offset behind
+any received data or one that conflicts with an earlier FIN. Once FIN is
+accepted, later data MUST NOT extend beyond its final offset. Otherwise FIN
+remains pending until the contiguous receive frontier reaches `final_offset`.
+Matching duplicates are idempotent, and data or reinjection below the final
+offset remains valid. `STREAM_FIN` does not remove an attachment.
 `STREAM_DETACH(stream_id)` removes only that carrier attachment.
-`STREAM_RESET(stream_id, reason)` terminates the reliable stream.
+`STREAM_RESET(stream_id, reason)` terminates the reliable stream. Native TCP
+EOF terminates the physical carrier and is not per-stream FIN or detach.
 
 A native QUIC stream FIN closes only that carrier byte-stream direction. It
 MUST NOT be interpreted as `STREAM_FIN`, `STREAM_DETACH`, or completion of the
@@ -413,14 +424,17 @@ The current recovery policy distinguishes three evidence states:
 1. Failure of the exact original path instance permits immediate bounded
    reinjection on an eligible live alternative. A measured survivor SHOULD be
    preferred, but liveness is sufficient when no measured survivor remains.
-2. An authoritative Data ACK snapshot that exposes the same lowest missing
-   frontier must persist for three recovery intervals of the carrier that owns
-   it before a target-bound reinjection flight is admitted. TCP uses its
-   retransmission timeout (RTO); QUIC uses its probe timeout (PTO). Growth of
-   the ACK horizon above that frontier does not reset the persistence interval.
+2. A complete Data ACK snapshot may establish omitted ranges. Later positive
+   partial ACK ranges extend that state but cannot establish omissions by
+   themselves. Request feedback may be fragmented across paths, so its same
+   lowest missing frontier waits one owner-carrier RTO/PTO from first
+   authoritative observation. For response feedback, a later ACK event may
+   authorize one bounded repair after the original flight exceeds TCP RACK's
+   5/4-SRTT or QUIC's 9/8-SRTT time threshold, provided the alternative can
+   complete before the owner RTO/PTO. ACK silence alone waits RTO/PTO.
 3. A contiguous live tail with no authoritative gap may send one bounded probe
-   after one owner-carrier recovery interval; another tail probe requires three
-   such intervals without Data ACK progress.
+   after one owner-carrier recovery interval. Another repair requires another
+   recovery interval without Data ACK progress.
 
 These intervals are MPP local policy, not requirements imposed by MPTCP, QUIC,
 or QUIC's definition of persistent congestion. Native TCP and QUIC recovery
@@ -526,11 +540,21 @@ packet flight, pacing, congestion response, and recovery.
 `DGRAM_FEEDBACK(flow_id, received)` reports datagram IDs admitted as half-open
 ranges. `DGRAM_CLOSE(flow_id)` closes the association.
 
-Datagrams do not use the reliable stream data sequence space. Selection and
-failover MAY compare TCP and QUIC carrier observations, but a datagram MUST be
-dropped when its remaining TTL cannot cover the selected path estimate.
-`DGRAM_FEEDBACK` means that an attempt was admitted to the target worker; it is
-not an end-to-end delivery ACK.
+Datagrams do not use the reliable stream data sequence space. Datagram identity
+is `(session_id, flow_id, direction, datagram_id)`. Direction is implicit in
+authenticated frame travel and is not encoded. Client-to-server requests and
+server-to-client responses have independent ID spaces; equal numeric IDs in
+opposite directions are distinct. TCP and QUIC copies or retries of one
+directional datagram MUST preserve its ID and payload. A flow ID binds to one
+target for its retained lifetime; reuse of that binding with a different target
+or payload is a protocol violation.
+
+Selection and failover MAY compare TCP and QUIC carrier observations, but a
+datagram MUST be dropped when its remaining TTL cannot cover the selected path
+estimate. `DGRAM_FEEDBACK` acknowledges directional `DGRAM_DATA` admitted by
+the peer. Request feedback stops request replay and records the response route.
+Response feedback permits cached response replay to retire. It is not an
+end-to-end target delivery acknowledgement.
 
 Before feedback, one request is limited to two product attempts. When a ranked,
 unattempted alternative remains, the first attempt waits one modeled response
@@ -542,12 +566,22 @@ capped by the absolute product TTL, to tolerate ordinary loss without unbounded
 replay. TCP and QUIC derive their response estimates independently; this
 product rule does not replace native recovery.
 
-After matching `DGRAM_FEEDBACK`, the sender MUST NOT replay the request on
-another carrier because target processing may already have begun. It may wait
-for the response until the absolute product TTL. An alternative-path attempt
-receives a new flow-local `datagram_id`; there is no cross-path exactly-once
-guarantee before feedback, so a delayed first attempt and its retry may both
-reach the target.
+After matching request-direction `DGRAM_FEEDBACK`, the sender MUST NOT replay
+the request on another carrier because target processing may already have
+begun. It may wait for the response until the absolute product TTL. Before
+feedback, an alternative-path attempt preserves the same data-level identity. The receiver
+MUST forward that identity to the target at most once, update the response route
+when a carrier copy is admitted, and retain a bounded response replay until
+feedback or expiry. This is at-most-once target forwarding within the retained
+MPP session; it is not an end-to-end exactly-once guarantee.
+
+Multiple bounded request identities may be outstanding on one flow. Target
+responses use an independent reverse-direction ID space and need not correlate
+one-to-one with requests. A duplicate request identity updates its response
+route without duplicate target forwarding; a fresh request identity is
+admitted independently. `DGRAM_CLOSE` detaches that carrier's flow binding.
+Another carrier may reattach the same session, flow, and target during the
+configured retention interval.
 
 ## 10. Wire Format
 
@@ -555,7 +589,7 @@ Every frame starts with a fixed ten-byte header:
 
 ```text
 0..4   magic          ASCII "MPTF"
-4      version        2
+4      version        3
 5      frame kind     u8
 6..10  payload length u32, network byte order
 ```
@@ -564,6 +598,10 @@ All multibyte integers use network byte order. A decoder MUST reject invalid
 magic, unsupported version, unknown kind, truncated or trailing bytes, invalid
 enum values, a range entry whose start is not less than its end, zero target
 ports, and configured size limit violations.
+
+The MPP frame version is independent of the encrypted TCP record encoding. The
+record envelope remains version 2; peers still reject any unsupported frame
+version after decryption.
 
 The assigned frame kinds are:
 
@@ -694,9 +732,8 @@ Data ACK observations remain available when native inspection is unsupported or
 fails. Missing native send credit selects the capability-based portable rule in
 Section 8; it does not select an operating-system policy. No scheduling
 decision may branch on the operating system. A Windows client with a Linux
-server is a primary target. Wine can prove CLI/configuration and portable TCP
-or basic-UDP QUIC proxy behavior, but native packet-device, optimized socket,
-and network integration remain separate release evidence.
+server is a primary target. Native packet-device, optimized socket, and network
+integration remain platform-specific release evidence.
 
 A native TCP drain decision MUST require both exact bytes in flight and the
 unsent sender queue from the same snapshot. A partial RTT or congestion-window
@@ -721,3 +758,5 @@ A conforming implementation preserves all of these invariants:
 11. No fixed attachment role determines where future data must be sent.
 12. Optional platform telemetry never becomes a correctness dependency.
 13. Path-instance lifetime and stream attachment incarnation are separate fences.
+14. One datagram keeps one session/flow/datagram identity across carrier retries,
+    and the receiver never executes that identity twice within retained state.

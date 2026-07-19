@@ -303,15 +303,6 @@ impl Frame {
         )
     }
 
-    pub(crate) fn carrier_credit_bytes(&self) -> u64 {
-        match self {
-            Self::StreamData { payload, .. }
-            | Self::DatagramData { payload, .. }
-            | Self::PathCapacityData { payload, .. } => payload.len() as u64,
-            _ => 0,
-        }
-    }
-
     pub(crate) fn delivery_evidence_bytes(&self) -> u64 {
         match self {
             Self::StreamData { payload, .. } | Self::DatagramData { payload, .. } => {

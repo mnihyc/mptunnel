@@ -2,14 +2,14 @@
 
 use super::RuntimeError;
 use crate::config::{ResourceLimits, SecurityConfig};
-use crate::model::timing::default_transport_pto;
 use crate::mux::MuxLimits;
-use crate::mux::datagram::{DatagramError, DatagramFlow};
+use crate::mux::datagram::DatagramError;
 use crate::protocol::codec::CodecLimits;
 use crate::protocol::frame::datagram_feedback_range as protocol_datagram_feedback_range;
 use crate::protocol::{DatagramFlowId, DatagramId, OffsetRange, TargetAddr};
 use crate::transport::{CarrierNetworkProvider, PathSpec, SystemCarrierNetworkProvider};
 use bytes::Bytes;
+use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -22,7 +22,9 @@ mod server;
 mod tcp;
 mod tcp_session;
 
-pub(super) use association::{DatagramClientAssociation, datagram_underlay_candidate_keys};
+pub(super) use association::DatagramClientAssociation;
+#[cfg(test)]
+pub(super) use association::DatagramClientReceive;
 pub(super) use edge::{
     UdpEdgeCompletion, UdpEdgeLane, UdpEdgeRequest, close_udp_edge_lanes,
     dispatch_udp_edge_request, finish_udp_edge_completion, udp_edge_completion_queue,
@@ -35,18 +37,13 @@ pub(super) use association::{
     datagram_underlay_error_is_retryable, runtime_error_is_datagram_response_timeout,
 };
 #[cfg(test)]
-pub(super) use edge::{
-    udp_edge_lane_limit, udp_edge_lane_spawn_allowed, udp_edge_queue_slots, udp_edge_route_hint,
-    udp_edge_startup_lane_limit,
-};
+pub(super) use edge::udp_edge_queue_slots;
 #[cfg(test)]
-pub(super) use policy::{
-    DatagramTimeoutAction, datagram_response_deadline_budget, datagram_timeout_action,
-};
+pub(super) use policy::datagram_feedback_retry_budget;
 #[cfg(test)]
 pub(super) use quic::{
     UdpDatagramClientAssociation, udp_datagram_error_is_path_retryable,
-    udp_datagram_first_response_timeout, udp_datagram_path_open_timeout,
+    udp_datagram_path_open_timeout,
 };
 #[cfg(test)]
 pub(super) use tcp::{
@@ -59,8 +56,24 @@ pub(in crate::runtime) const UDP_PATH_HANDSHAKE_TIMEOUT: Duration = Duration::fr
 /// Associates one product destination with its framed datagram flow.
 pub(super) struct DatagramClientFlow {
     pub(super) target: TargetAddr,
-    pub(super) flow: DatagramFlow,
     pub(super) flow_id: DatagramFlowId,
+}
+
+/// One peer-originated datagram, independent of any locally sent datagram.
+pub(super) struct ReceivedDatagram {
+    pub(super) flow_id: DatagramFlowId,
+    pub(super) datagram_id: DatagramId,
+    pub(super) expires_at: tokio::time::Instant,
+    pub(super) payload: Bytes,
+}
+
+pub(super) enum DatagramSessionEvent {
+    Control,
+    Feedback {
+        flow_id: DatagramFlowId,
+        received: Vec<OffsetRange>,
+    },
+    Received(ReceivedDatagram),
 }
 
 /// Retains only the delivery evidence shared by TCP and QUIC sessions.
@@ -69,6 +82,74 @@ pub(super) struct SentDatagram {
     pub(super) sent_at: Instant,
     pub(super) bytes: usize,
     pub(super) ttl: Duration,
+}
+
+pub(super) struct SentDatagramEvidence {
+    entries: HashMap<(DatagramFlowId, DatagramId), SentDatagram>,
+    bytes: usize,
+    max_entries: usize,
+    max_bytes: usize,
+}
+
+impl SentDatagramEvidence {
+    pub(super) fn new(limits: MuxLimits) -> Self {
+        Self {
+            entries: HashMap::new(),
+            bytes: 0,
+            max_entries: limits
+                .max_streams
+                .min(limits.max_datagram_queue_bytes.saturating_div(64))
+                .max(limits.max_ack_ranges)
+                .max(1),
+            max_bytes: limits.max_datagram_queue_bytes,
+        }
+    }
+
+    pub(super) fn insert(&mut self, key: (DatagramFlowId, DatagramId), sent: SentDatagram) {
+        if sent.bytes > self.max_bytes {
+            return;
+        }
+        if let Some(previous) = self.entries.insert(key, sent) {
+            self.bytes = self.bytes.saturating_sub(previous.bytes);
+        }
+        self.bytes = self.bytes.saturating_add(sent.bytes);
+        while self.entries.len() > self.max_entries || self.bytes > self.max_bytes {
+            let Some(oldest) = self
+                .entries
+                .iter()
+                .min_by_key(|(_, sent)| sent.sent_at)
+                .map(|(key, _)| *key)
+            else {
+                break;
+            };
+            self.remove(&oldest);
+        }
+    }
+
+    pub(super) fn remove(&mut self, key: &(DatagramFlowId, DatagramId)) -> Option<SentDatagram> {
+        let sent = self.entries.remove(key)?;
+        self.bytes = self.bytes.saturating_sub(sent.bytes);
+        Some(sent)
+    }
+
+    pub(super) fn keys(&self) -> impl Iterator<Item = &(DatagramFlowId, DatagramId)> {
+        self.entries.keys()
+    }
+
+    pub(super) fn expire(&mut self, now: Instant) -> u64 {
+        let expired = self
+            .entries
+            .iter()
+            .filter_map(|(key, sent)| {
+                (now.duration_since(sent.sent_at) >= sent.ttl).then_some(*key)
+            })
+            .collect::<Vec<_>>();
+        let lost = expired.len() as u64;
+        for key in expired {
+            self.remove(&key);
+        }
+        lost
+    }
 }
 
 pub(in crate::runtime) fn datagram_feedback_range(
@@ -164,26 +245,37 @@ async fn client_udp_datagram_round_trip_with_limits(
     if tokio::time::Instant::now() >= product_deadline {
         return Err(RuntimeError::DatagramResponseTimedOut);
     }
-    let response = session
+    session
         .send_to(
             target,
+            DatagramFlowId(0),
+            DatagramId(0),
             payload,
             product_deadline,
             product_deadline,
-            default_transport_pto().min(Duration::from_millis(u64::from(ttl_ms))),
-            false,
         )
         .await
         .map_err(|err| match err {
-            policy::DatagramPathSendError::Runtime { source, .. } => source,
+            policy::DatagramPathSendError::Runtime(source) => source,
             policy::DatagramPathSendError::PayloadLimitExceeded { limit } => {
                 RuntimeError::Datagram(DatagramError::PayloadTooLarge {
                     actual: payload_len,
                     limit,
                 })
             }
-            policy::DatagramPathSendError::Timeout { .. } => RuntimeError::DatagramResponseTimedOut,
+            policy::DatagramPathSendError::Timeout => RuntimeError::DatagramResponseTimedOut,
         })?;
+    let response = loop {
+        let frame = tokio::time::timeout_at(product_deadline, session.next_frame())
+            .await
+            .map_err(|_| RuntimeError::DatagramResponseTimedOut)??;
+        if let DatagramSessionEvent::Received(response) = session.handle_frame(frame).await? {
+            session
+                .acknowledge(response.flow_id, response.datagram_id)
+                .await?;
+            break response.payload;
+        }
+    };
     session.close().await?;
     Ok(response)
 }

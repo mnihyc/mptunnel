@@ -197,6 +197,7 @@ fn global_discovery_defers_ecf_for_every_underlay() {
                 stream_ordering_debt_bytes: 0,
             },
             0,
+            true,
         ),
         Some("ecf_no_completion_gain"),
         "the directional sender applies ECF with its exact completion backlog",
@@ -215,6 +216,7 @@ fn active_tcp_product_inflight_limit_is_model_based() {
         64 * 1024,
         mux_limits,
         BulkCandidatePosition::FirstPath,
+        true,
     );
 
     assert!(limit < mux_limits.max_path_flight_bytes as u64);
@@ -232,6 +234,7 @@ fn explicit_data_level_service_window_preserves_bounded_carrier_feed_headroom() 
         64 * 1024,
         MuxLimits::default(),
         BulkCandidatePosition::AdditionalPath,
+        true,
     );
 
     assert_eq!(
@@ -291,7 +294,7 @@ fn tcp_frontier_owner_obeys_data_sequence_service_window() {
         "contiguous ownership cannot mint Data Sequence credit beyond the service window"
     );
 
-    active.snapshot.has_durable_product_progress = true;
+    active.snapshot.data_level_bytes_in_flight = service_window;
     active.snapshot.data_level_limit_bytes = service_window * 2;
     assert_eq!(
         bulk_candidate_admission_suppression_with_ordering_debt(BulkAdmissionCheck {
@@ -373,7 +376,7 @@ fn quic_frontier_owner_obeys_data_sequence_service_window() {
 }
 
 #[test]
-fn active_tcp_with_same_path_latency_pressure_uses_preemptible_service_horizon() {
+fn active_tcp_with_same_path_latency_pressure_uses_one_measured_bdp() {
     let mux_limits = MuxLimits {
         max_path_flight_bytes: 32 * 1024 * 1024,
         ..MuxLimits::default()
@@ -386,14 +389,82 @@ fn active_tcp_with_same_path_latency_pressure_uses_preemptible_service_horizon()
         payload,
         mux_limits,
         BulkCandidatePosition::FirstPath,
+        true,
     );
 
     assert_eq!(
         limit,
-        bulk_scheduling_horizon_bytes(payload, mux_limits) as u64
+        bulk_path_bdp_bytes(candidate),
+        "qualified delivery and RTT evidence bound bulk handed to the ordered carrier"
     );
     assert!(limit < bulk_pipe_window_bytes(bulk_path_bdp_bytes(candidate)));
     assert!(limit >= payload as u64);
+}
+
+#[test]
+fn same_path_latency_pressure_applies_to_an_additional_ordering_path() {
+    let mux_limits = MuxLimits {
+        max_path_flight_bytes: 32 * 1024 * 1024,
+        ..MuxLimits::default()
+    };
+    let mut candidate = PathSnapshot::new(PathId(0), UnderlayProtocol::Tcp, 40.0, mbps(80.0));
+    candidate.active_latency_sensitive_flows = 1;
+    let payload = 64 * 1024;
+
+    assert_eq!(
+        bulk_product_inflight_limit_bytes(
+            candidate,
+            payload,
+            mux_limits,
+            BulkCandidatePosition::AdditionalPath,
+            true,
+        ),
+        bulk_path_bdp_bytes(candidate),
+        "ordering position must not disable load protection on the same ordered carrier"
+    );
+}
+
+#[test]
+fn latency_pressure_uses_carrier_capacity_instead_of_app_limited_product_rate() {
+    let mux_limits = MuxLimits::default();
+    let mut candidate = PathSnapshot::new(PathId(0), UnderlayProtocol::Tcp, 40.0, mbps(8.0));
+    candidate.rate_scope = crate::scheduler::PathRateScope::PerFlowGoodput;
+    candidate.carrier_delivery_rate_bps = Some(mbps(80.0));
+    candidate.product_progress_rate_bps = Some(mbps(8.0));
+    candidate.active_latency_sensitive_flows = 1;
+    let payload = 64 * 1024;
+
+    assert_eq!(
+        bulk_product_inflight_limit_bytes(
+            candidate,
+            payload,
+            mux_limits,
+            BulkCandidatePosition::AdditionalPath,
+            true,
+        ),
+        bulk_rate_bdp_bytes(mbps(80.0), 40.0),
+        "the shared writer window must not feed its own app-limited product rate back into capacity"
+    );
+}
+
+#[test]
+fn latency_pressure_keeps_the_bounded_startup_window_until_rate_is_qualified() {
+    let mux_limits = MuxLimits::default();
+    let mut candidate = PathSnapshot::new(PathId(0), UnderlayProtocol::Tcp, 40.0, mbps(1.0));
+    candidate.active_latency_sensitive_flows = 1;
+    let payload = 64 * 1024;
+
+    assert_eq!(
+        bulk_product_inflight_limit_bytes(
+            candidate,
+            payload,
+            mux_limits,
+            BulkCandidatePosition::AdditionalPath,
+            false,
+        ),
+        reliable_unproven_path_startup_flight_limit_bytes(mux_limits),
+        "an immature point rate must not collapse the portable startup window"
+    );
 }
 
 #[test]
@@ -410,6 +481,7 @@ fn active_tcp_with_session_only_latency_pressure_keeps_service_owner_reservoir()
         payload,
         mux_limits,
         BulkCandidatePosition::FirstPath,
+        true,
     );
 
     assert!(
@@ -434,9 +506,9 @@ fn bulk_service_horizon_is_geometric_mean_not_full_envelope() {
 fn active_tcp_with_same_path_latency_pressure_rejects_hidden_command_backlog() {
     let best = candidate(0, 100.0, 50.0, 500.0);
     let mut active = PathSnapshot::new(PathId(0), UnderlayProtocol::Tcp, 672.0, mbps(100.0));
-    active.queue_bytes = 8 * 1024 * 1024;
-    active.data_level_bytes_in_flight = 8 * 1024 * 1024;
-    active.product_progress_rate_bps = Some(mbps(1_000.0));
+    active.queue_bytes = 9 * 1024 * 1024;
+    active.data_level_bytes_in_flight = 9 * 1024 * 1024;
+    active.product_progress_rate_bps = Some(mbps(10.0));
     active.active_latency_sensitive_flows = 1;
 
     assert_eq!(
@@ -528,6 +600,7 @@ fn active_service_same_path_backlog_is_not_reorder_debt() {
             mux_limits,
             BulkCandidatePosition::FirstPath,
             0,
+            true,
         ),
         "same-path queued bytes are feed/backpressure debt, not cross-path reorder debt"
     );
@@ -561,18 +634,21 @@ fn active_tcp_service_with_clear_frontier_uses_product_envelope_for_reorder_budg
     active.data_level_bytes_in_flight = 341_200;
     active.app_limited = true;
 
+    let check = BulkAdmissionCheck {
+        best_snapshot: active,
+        best_eta_ms: 50_018.062,
+        candidate_snapshot: active,
+        candidate_eta_ms: 50_018.062,
+        payload_bytes: payload,
+        mux_limits,
+        position: BulkCandidatePosition::FirstPath,
+        stream_ordering_debt_bytes: 0,
+    };
+
     assert_eq!(
-        bulk_candidate_admission_suppression(
-            active,
-            50_018.062,
-            active,
-            50_018.062,
-            payload,
-            mux_limits,
-            BulkCandidatePosition::FirstPath,
-        ),
+        bulk_candidate_admission_suppression_with_completion_backlog(check, 0, false),
         None,
-        "a clear-frontier leading path owner must not lose lead eligibility because the reorder gate reuses a tiny app-limited BDP budget"
+        "a clear-frontier owner without a window-qualified sample retains bounded acquisition credit"
     );
 }
 
@@ -721,7 +797,7 @@ fn active_udp_with_latency_pressure_caps_total_owner_credit() {
         max_reorder_bytes: 64 * 1024 * 1024,
         ..MuxLimits::default()
     };
-    let mut candidate = PathSnapshot::new(PathId(0), UnderlayProtocol::Udp, 1000.0, mbps(500.0));
+    let mut candidate = PathSnapshot::new(PathId(0), UnderlayProtocol::Udp, 40.0, mbps(500.0));
     candidate.pacing_rate_bps = mbps(2_000.0);
     candidate.product_progress_rate_bps = Some(mbps(10.0));
     candidate.data_level_bytes_in_flight = 8 * 1024 * 1024;
@@ -806,6 +882,7 @@ fn cross_underlay_product_inflight_limit_is_bdp_modeled() {
         64 * 1024,
         mux_limits,
         BulkCandidatePosition::AdditionalPath,
+        true,
     );
 
     assert!(limit < mux_limits.max_path_flight_bytes as u64);
@@ -825,6 +902,7 @@ fn product_inflight_model_uses_delivery_not_transient_pacing_gain() {
             64 * 1024,
             mux_limits,
             BulkCandidatePosition::AdditionalPath,
+            true,
         ),
         1_800_000,
     );
@@ -871,7 +949,7 @@ fn bulk_admission_rejects_candidate_that_would_exceed_product_inflight_limit() {
 }
 
 #[test]
-fn additional_path_uses_the_shared_stream_reorder_envelope() {
+fn additional_path_uses_a_measured_reorder_allowance_inside_the_stream_envelope() {
     let best = candidate(0, 100.0, 50.0, 500.0);
     let mut extra = candidate(1, 100.0, 50.0, 50.0);
     extra.snapshot.confidence = 0.1;
@@ -889,7 +967,7 @@ fn additional_path_uses_the_shared_stream_reorder_envelope() {
             BulkCandidatePosition::AdditionalPath,
         ),
         None,
-        "per-path flight is bounded independently from the shared stream reorder envelope",
+        "a bounded additional-path flight fits its measured reordering allowance",
     );
 }
 
@@ -1161,13 +1239,13 @@ fn lead_path_with_large_cross_path_hole_uses_reorder_budget() {
 }
 
 #[test]
-fn product_inflight_limit_is_modeled_limit_capped_by_configured_ceiling() {
+fn unproven_product_inflight_limit_is_modeled_limit_capped_by_configured_ceiling() {
     let best = candidate(0, 100.0, 50.0, 500.0);
     let mut constrained = candidate(1, 100.1, 50.0, 10.0);
     constrained.snapshot.confidence = 1.0;
-    constrained.snapshot.has_durable_product_progress = true;
     constrained.snapshot.carrier_inflight_limit_bytes = 64 * 1024;
-    constrained.snapshot.bytes_in_flight = 128 * 1024;
+    constrained.snapshot.bytes_in_flight = 1024 * 1024;
+    constrained.snapshot.data_level_bytes_in_flight = 1024 * 1024;
 
     assert_eq!(
         bulk_candidate_admission_suppression(
@@ -1284,6 +1362,7 @@ fn udp_cross_underlay_does_not_reuse_cached_native_credit_as_data_level_gate() {
     extra.snapshot.confidence = 1.0;
     extra.snapshot.carrier_inflight_limit_bytes = 512 * 1024;
     extra.snapshot.bytes_in_flight = 512 * 1024;
+    extra.snapshot.data_level_bytes_in_flight = 64 * 1024;
 
     assert_eq!(
         bulk_candidate_admission_suppression(
@@ -1336,11 +1415,11 @@ fn udp_active_path_without_carrier_limit_uses_modeled_credit() {
 }
 
 #[test]
-fn additional_path_uses_shared_reorder_envelope_not_probe_confidence() {
+fn additional_path_reorder_allowance_does_not_depend_on_probe_confidence() {
     let best = candidate(0, 100.0, 50.0, 500.0);
     let mut extra = candidate(1, 50.0, 50.0, 50.0);
     extra.snapshot.confidence = 0.1;
-    extra.snapshot.bytes_in_flight = 512 * 1024;
+    extra.snapshot.bytes_in_flight = 384 * 1024;
 
     assert_eq!(
         bulk_candidate_admission_suppression(
@@ -1353,12 +1432,149 @@ fn additional_path_uses_shared_reorder_envelope_not_probe_confidence() {
             BulkCandidatePosition::AdditionalPath,
         ),
         None,
-        "confidence affects completion evidence, not the connection-wide reorder resource",
+        "confidence affects completion evidence, not the measured reordering allowance",
     );
 }
 
 #[test]
-fn tcp_path_uses_separate_path_flight_and_connection_reorder_windows() {
+fn durable_progress_without_qualified_rate_keeps_the_discovery_window() {
+    let best = candidate(0, 700.0, 50.0, 80.0);
+    let mut extra = candidate(1, 100.0, 180.0, 0.351);
+    extra.snapshot.has_durable_product_progress = true;
+    extra.snapshot.confidence = 1.0;
+    extra.snapshot.app_limited = false;
+    extra.snapshot.data_level_limit_bytes = 64 * 1024;
+    extra.snapshot.data_level_bytes_in_flight = 448 * 1024;
+    let check = BulkAdmissionCheck {
+        best_snapshot: best.snapshot,
+        best_eta_ms: best.eta_ms,
+        candidate_snapshot: extra.snapshot,
+        candidate_eta_ms: extra.eta_ms,
+        payload_bytes: 64 * 1024,
+        mux_limits: MuxLimits::default(),
+        position: BulkCandidatePosition::AdditionalPath,
+        stream_ordering_debt_bytes: 0,
+    };
+
+    assert_eq!(
+        bulk_candidate_resource_suppression(check, false),
+        None,
+        "a positive Data ACK must not shrink the acquisition window before rate qualification"
+    );
+    assert_eq!(
+        bulk_candidate_resource_suppression(check, true),
+        Some("inflight_limit"),
+        "qualified capacity evidence may replace the discovery floor with the measured service window"
+    );
+}
+
+#[test]
+fn unqualified_path_can_fill_native_window_without_completion_authority() {
+    let lead = candidate(0, 100.0, 20.0, 80.0);
+    let mut extra = candidate(1, 2_000.0, 180.0, 0.351);
+    extra.snapshot.confidence = 1.0;
+    extra.snapshot.app_limited = false;
+    extra.snapshot.carrier_inflight_limit_bytes = 2 * 1024 * 1024;
+    extra.snapshot.data_level_limit_bytes = 2 * 1024 * 1024;
+    extra.snapshot.data_level_bytes_in_flight = 1024 * 1024;
+    let mut check = BulkAdmissionCheck {
+        best_snapshot: lead.snapshot,
+        best_eta_ms: lead.eta_ms,
+        candidate_snapshot: extra.snapshot,
+        candidate_eta_ms: extra.eta_ms,
+        payload_bytes: 64 * 1024,
+        mux_limits: MuxLimits::default(),
+        position: BulkCandidatePosition::AdditionalPath,
+        stream_ordering_debt_bytes: 0,
+    };
+
+    assert_eq!(
+        bulk_candidate_admission_suppression_with_completion_backlog(check, 0, false),
+        None,
+        "an unqualified path may use native congestion credit to finish measuring its pipe"
+    );
+    check.candidate_snapshot.data_level_bytes_in_flight = 2 * 1024 * 1024;
+    assert_eq!(
+        bulk_candidate_admission_suppression_with_completion_backlog(check, 0, false),
+        Some("inflight_limit"),
+        "native acquisition credit remains a bounded product flight window"
+    );
+}
+
+#[test]
+fn app_limited_rate_does_not_reclamp_the_product_service_window() {
+    let lead = candidate(0, 2_000.0, 180.0, 200.0);
+    let mut extra = candidate(1, 500.0, 400.0, 5.0);
+    extra.snapshot.confidence = 1.0;
+    extra.snapshot.app_limited = true;
+    extra.snapshot.has_durable_product_progress = true;
+    extra.snapshot.carrier_inflight_limit_bytes = 2 * 1024 * 1024;
+    extra.snapshot.data_level_limit_bytes = 2 * 1024 * 1024;
+    extra.snapshot.data_level_bytes_in_flight = 1024 * 1024;
+
+    assert_eq!(
+        bulk_candidate_admission_suppression_with_completion_backlog(
+            BulkAdmissionCheck {
+                best_snapshot: lead.snapshot,
+                best_eta_ms: lead.eta_ms,
+                candidate_snapshot: extra.snapshot,
+                candidate_eta_ms: extra.eta_ms,
+                payload_bytes: 64 * 1024,
+                mux_limits: MuxLimits::default(),
+                position: BulkCandidatePosition::AdditionalPath,
+                stream_ordering_debt_bytes: 8 * 1024 * 1024,
+            },
+            16 * 1024 * 1024,
+            true,
+        ),
+        None,
+        "an app-limited delivery sample is not a second congestion window",
+    );
+}
+
+#[test]
+fn app_limited_native_path_reacquires_service_unless_latency_is_active() {
+    let lead = candidate(0, 400.0, 40.0, 400.0);
+    let mut extra = candidate(1, 800.0, 180.0, 20.0);
+    extra.snapshot.confidence = 1.0;
+    extra.snapshot.app_limited = true;
+    extra.snapshot.carrier_inflight_limit_bytes = 2 * 1024 * 1024;
+    let check = BulkAdmissionCheck {
+        best_snapshot: lead.snapshot,
+        best_eta_ms: lead.eta_ms,
+        candidate_snapshot: extra.snapshot,
+        candidate_eta_ms: extra.eta_ms,
+        payload_bytes: 64 * 1024,
+        mux_limits: MuxLimits::default(),
+        position: BulkCandidatePosition::AdditionalPath,
+        stream_ordering_debt_bytes: 0,
+    };
+
+    assert_eq!(
+        bulk_candidate_admission_suppression_with_completion_backlog(check, 0, false),
+        None,
+        "an immature rate sample must leave bounded acquisition available"
+    );
+    assert_eq!(
+        bulk_candidate_admission_suppression_with_completion_backlog(check, 0, true),
+        None,
+        "an idle bulk carrier must be allowed to reacquire native service credit"
+    );
+
+    let mut latency_check = check;
+    latency_check.candidate_snapshot.active_flows = 2;
+    latency_check
+        .candidate_snapshot
+        .active_latency_sensitive_flows = 1;
+    assert_eq!(
+        bulk_candidate_admission_suppression_with_completion_backlog(latency_check, 0, true),
+        Some("ecf_no_completion_gain"),
+        "an idle carrier sharing latency traffic retains the conservative ECF boundary"
+    );
+}
+
+#[test]
+fn tcp_path_uses_product_service_and_connection_reorder_windows() {
     let mux_limits = MuxLimits {
         max_path_flight_bytes: 64 * 1024 * 1024,
         max_reorder_bytes: 64 * 1024 * 1024,
@@ -1371,6 +1587,7 @@ fn tcp_path_uses_separate_path_flight_and_connection_reorder_windows() {
     extra.snapshot.underlay = UnderlayProtocol::Tcp;
     extra.snapshot.confidence = 0.5;
     extra.snapshot.app_limited = true;
+    extra.snapshot.has_durable_product_progress = true;
     let payload_bytes = 64 * 1024;
 
     assert_eq!(
@@ -1385,7 +1602,22 @@ fn tcp_path_uses_separate_path_flight_and_connection_reorder_windows() {
             stream_ordering_debt_bytes: 40 * 1024 * 1024,
         }),
         None,
-        "foreign lower-owner debt consumes the stream reorder resource, not this candidate's 2*BDP pipe allowance"
+        "foreign lower-path debt must not consume this path's independent measured allowance"
+    );
+
+    assert_eq!(
+        bulk_candidate_admission_suppression_with_ordering_debt(BulkAdmissionCheck {
+            best_snapshot: best.snapshot,
+            best_eta_ms: best.eta_ms,
+            candidate_snapshot: extra.snapshot,
+            candidate_eta_ms: extra.eta_ms,
+            payload_bytes,
+            mux_limits,
+            position: BulkCandidatePosition::AdditionalPath,
+            stream_ordering_debt_bytes: 4 * 1024 * 1024,
+        }),
+        None,
+        "an additional TCP path still receives enough measured reorder credit to aggregate"
     );
 
     extra.snapshot.data_level_bytes_in_flight = 24 * 1024 * 1024;
@@ -1402,6 +1634,22 @@ fn tcp_path_uses_separate_path_flight_and_connection_reorder_windows() {
         }),
         Some("inflight_limit"),
         "the independent candidate-local BDP gate must still bound its own pipe"
+    );
+
+    extra.snapshot.data_level_limit_bytes = 64 * 1024 * 1024;
+    assert_eq!(
+        bulk_candidate_admission_suppression_with_ordering_debt(BulkAdmissionCheck {
+            best_snapshot: best.snapshot,
+            best_eta_ms: best.eta_ms,
+            candidate_snapshot: extra.snapshot,
+            candidate_eta_ms: extra.eta_ms,
+            payload_bytes,
+            mux_limits,
+            position: BulkCandidatePosition::AdditionalPath,
+            stream_ordering_debt_bytes: 0,
+        }),
+        None,
+        "a portable TCP product window must not be collapsed to an app-limited rate BDP"
     );
 
     extra.snapshot.data_level_bytes_in_flight = 1024 * 1024;
@@ -1449,7 +1697,7 @@ fn cold_tcp_same_underlay_candidate_uses_bounded_startup_flight_with_an_existing
 }
 
 #[test]
-fn app_limited_tcp_path_can_join_when_it_beats_lead_completion() {
+fn app_limited_tcp_path_does_not_expand_a_large_existing_hole() {
     let mut lead = candidate(0, 1_061.5, 180.0, 192.5);
     let mut extra = candidate(1, 1_094.8, 180.0, 23.0);
     lead.snapshot.underlay = UnderlayProtocol::Tcp;
@@ -1471,8 +1719,8 @@ fn app_limited_tcp_path_can_join_when_it_beats_lead_completion() {
             position: BulkCandidatePosition::AdditionalPath,
             stream_ordering_debt_bytes: 28 * 1024 * 1024,
         }),
-        None,
-        "an app-limited lower-bound estimate remains usable when it conservatively beats lead completion",
+        Some("ecf_no_completion_gain"),
+        "completion ranking cannot authorize tens of megabytes of later data behind a lower-offset owner",
     );
 }
 
@@ -1654,6 +1902,7 @@ fn bulk_backlog_admits_same_underlay_path_that_finishes_before_service_tail() {
                 stream_ordering_debt_bytes: 512 * 1024,
             },
             32 * 1024 * 1024,
+            true,
         ),
         None,
         "a proven path that completes before the lower leading path backlog adds bulk capacity without extending the existing hole"
@@ -1682,6 +1931,7 @@ fn bulk_backlog_does_not_double_count_service_carrier_flight() {
                 stream_ordering_debt_bytes: 0,
             },
             32 * 1024 * 1024,
+            true,
         ),
         Some("ecf_no_completion_gain"),
         "carrier flight already present in leading path ETA cannot extend the completion deadline twice"
@@ -1693,6 +1943,7 @@ fn cross_underlay_path_can_join_only_when_it_beats_lead_next_quantum() {
     let best = candidate(0, 500.0, 50.0, 500.0);
     let mut extra = candidate(1, 504.0, 250.0, 500.0);
     extra.snapshot.confidence = 1.0;
+    extra.snapshot.has_durable_product_progress = true;
     extra.snapshot.bytes_in_flight = 8 * 1024 * 1024;
 
     assert_eq!(

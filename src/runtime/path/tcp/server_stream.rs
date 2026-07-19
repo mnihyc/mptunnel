@@ -165,18 +165,12 @@ impl ServerTcpStreamState {
     pub(super) fn detach(
         &mut self,
         context: &ServerPathContext,
-        commands: &ReliablePathCommandSender,
-        session_id: SessionId,
-        path_id: PathId,
+        path_registration: &ServerCarrierPathRegistration,
         stream_id: StreamId,
-    ) {
+    ) -> Result<(), RuntimeError> {
         self.attached.remove(&stream_id);
-        context.reliable_streams.detach_path(
-            session_id,
-            stream_id,
-            UnderlayProtocol::Tcp,
-            path_id,
-            commands,
-        );
+        context
+            .reliable_streams
+            .detach_path(path_registration, stream_id)
     }
 }

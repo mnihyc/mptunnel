@@ -391,7 +391,6 @@ where
                         payload: datagram.payload,
                         ttl_ms: DEFAULT_SOCKS5_UDP_TTL_MS,
                         metadata: peer,
-                        route_hint: None,
                     },
                 )
                 .is_err()
@@ -404,22 +403,23 @@ where
                     break Err(RuntimeError::Protocol("SOCKS5 UDP completion channel closed"));
                 };
                 finish_udp_edge_completion(&mut lanes, &completion);
-                match completion.result {
-                    Ok(response) => {
-                        let response_packet = match socks5::udp_datagram(&completion.target, &response) {
+                match completion {
+                    UdpEdgeCompletion::Received { target, metadata, payload } => {
+                        let response_packet = match socks5::udp_datagram(&target, &payload) {
                             Ok(packet) => packet,
                             Err(err) => break Err(RuntimeError::Socks5(err)),
                         };
-                        if let Err(err) = relay_socket.send_to(&response_packet, completion.metadata).await {
+                        if let Err(err) = relay_socket.send_to(&response_packet, metadata).await {
                             break Err(RuntimeError::Io(err));
                         }
                     }
-                    Err(err) => {
+                    UdpEdgeCompletion::Sent { target, result: Err(err), .. } => {
                         eprintln!(
                             "warning: SOCKS5 UDP datagram to {:?} failed: {err}",
-                            completion.target
+                            target
                         );
                     }
+                    UdpEdgeCompletion::Sent { result: Ok(()), .. } => {}
                 }
             }
         }

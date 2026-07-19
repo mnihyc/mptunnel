@@ -171,7 +171,7 @@ package="mptunnel-${version}-${target}"
 dist_dir="dist"
 stage="${dist_dir}/${package}"
 
-release_files=(README.md RFC.md LICENSE SECURITY.md CONTRIBUTING.md config.toml)
+release_files=(README.md RFC.md LICENSE THIRD_PARTY_LICENSES.html SECURITY.md CONTRIBUTING.md config.toml)
 release_docs=(docs/ARCHITECTURE.md docs/OPERATIONS.md docs/PERFORMANCE.md)
 release_examples=(examples/client.toml examples/server.toml)
 release_assets=(docs/assets/dashboard.png)

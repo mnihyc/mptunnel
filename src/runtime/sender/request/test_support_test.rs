@@ -5,7 +5,7 @@
 
 use crate::config::{ResourceLimits, SecurityConfig, SharedSecret};
 use crate::model::capacity::PathRateSample;
-use crate::model::capacity::{PATH_OPEN_SCORE_BYTES, reliable_relay_buffer_len};
+use crate::model::capacity::reliable_relay_buffer_len;
 use crate::model::path::{RelayPathInstance, RelayPathKey};
 use crate::mux::MuxLimits;
 use crate::protocol::{Frame, PathId, StreamId, UnderlayProtocol};
@@ -74,7 +74,7 @@ pub(super) fn opened_test_relay_stream_with_underlay(
                 commands,
                 MuxLimits::default(),
             ),
-            frames: frame_rx,
+            frames: frame_rx.into(),
         },
         path_index,
     )
@@ -120,7 +120,6 @@ pub(super) fn mark_client_path_proof_fresh_for_test(
         instance.key.index,
         PathProofObservation {
             proof_id,
-            bytes: PATH_OPEN_SCORE_BYTES as u64,
             elapsed,
             sent_at: Instant::now(),
         },

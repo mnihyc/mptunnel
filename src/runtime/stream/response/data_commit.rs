@@ -50,7 +50,9 @@ impl ResponseStreamBinding {
         let target_commands = outputs.entries[target_index].commands.clone();
         // Reservation is the only fallible mutation. Exact range ownership is
         // visible before the carrier can dequeue the committed command.
-        let command = target_commands.try_reserve_stream_ordered_frame(frame.clone(), lane)?;
+        // STREAM_DATA carries an explicit offset, so independent streams may
+        // retain their traffic-class priority without changing byte ordering.
+        let command = target_commands.try_reserve_admitted_frame(frame.clone(), lane)?;
         self.record_validated_original_flight_with_outputs(&mut outputs, target_index, frame);
         command.commit();
         Ok(())

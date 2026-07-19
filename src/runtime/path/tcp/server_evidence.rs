@@ -10,17 +10,18 @@ use crate::lab_diagnostics::lab_diagnostic;
 use crate::model::capacity::reliable_capacity_measurement_session_limit_bytes;
 use crate::mux::MuxLimits;
 use crate::protocol::path_capacity::CapacityReceiveTracker;
-use crate::protocol::{Frame, PathId, PathMetricDirection, PathMetrics, UnderlayProtocol};
+use crate::protocol::{Frame, PathId, PathMetricDirection, PathMetrics};
 use crate::runtime::error::RuntimeError;
-use crate::runtime::path::ServerCarrierPathRegistration;
 use crate::runtime::path::model::metric_epoch_now;
-use crate::runtime::path::proof::{PathProofTracker, path_proof_ack_frame, path_proof_metrics};
+use crate::runtime::path::proof::{PathProofTracker, path_proof_ack_frame};
 use crate::runtime::path::server_context::ServerPathContext;
+use crate::runtime::path::{CarrierDeliveryRateSample, ServerCarrierPathRegistration};
 use std::time::Instant;
 
 pub(super) struct ServerTcpEvidenceState {
     tcp_metrics: Option<TcpMetricPublisher>,
     local_metrics: Option<PathMetrics>,
+    delivery_rate_sample: Option<CarrierDeliveryRateSample>,
     native_drain_observed: bool,
     sender_refresh_pending: bool,
     path_proofs: PathProofTracker,
@@ -36,6 +37,7 @@ impl ServerTcpEvidenceState {
         Self {
             tcp_metrics,
             local_metrics,
+            delivery_rate_sample: None,
             native_drain_observed: false,
             sender_refresh_pending: false,
             path_proofs: PathProofTracker::default(),
@@ -130,16 +132,42 @@ impl ServerTcpEvidenceState {
             || observation
                 .queue_bytes()
                 .is_some_and(|queue_bytes| queue_bytes > 0);
+        self.observe_delivery_rate_sample(observation);
         self.native_drain_observed = observation.has_native_drain_evidence();
         let Some(metrics) = merge_local_tcp_metrics(self.local_metrics, observation) else {
             return;
         };
         self.local_metrics = Some(metrics);
-        context.reliable_streams.record_local_path_metrics(
-            path_registration,
-            metrics,
-            self.native_drain_observed,
-        );
+        context
+            .reliable_streams
+            .record_local_path_metrics_with_delivery_rate_sample(
+                path_registration,
+                metrics,
+                self.native_drain_observed,
+                self.delivery_rate_sample,
+            );
+    }
+
+    fn observe_delivery_rate_sample(&mut self, observation: super::metrics::TcpNativeObservation) {
+        if observation.app_limited() != Some(false) {
+            return;
+        }
+        let Some(sample_bytes) = observation.newly_acked_bytes().filter(|bytes| *bytes > 0) else {
+            return;
+        };
+        let Some(delivery_rate_bps) = observation.delivery_rate_bps() else {
+            return;
+        };
+        let previous = self.delivery_rate_sample;
+        self.delivery_rate_sample = Some(CarrierDeliveryRateSample {
+            delivery_rate_bps,
+            sample_count: previous.map_or(1, |sample| sample.sample_count.saturating_add(1)),
+            sample_bytes: previous.map_or(sample_bytes, |sample| {
+                sample.sample_bytes.saturating_add(sample_bytes)
+            }),
+            delivery_window_covered: observation.delivery_window_covered()
+                || previous.is_some_and(|sample| sample.delivery_window_covered),
+        });
     }
 
     pub(super) fn record_sent_frame(&mut self, frame: &Frame) {
@@ -166,19 +194,12 @@ impl ServerTcpEvidenceState {
         if let Some(observation) = self
             .path_proofs
             .acknowledge(path_id, proof_id, payload_bytes)
-            && let Some(metrics) = path_proof_metrics(
-                path_id,
-                UnderlayProtocol::Tcp,
-                PathMetricDirection::ServerToClient,
-                observation,
-            )
         {
-            self.local_metrics = Some(metrics);
-            context.reliable_streams.record_local_path_metrics(
-                path_registration,
-                metrics,
-                self.native_drain_observed,
-            );
+            // Validation establishes carrier liveness only. Native TCP telemetry
+            // and product ACKs retain ownership of transport scheduling evidence.
+            context
+                .reliable_streams
+                .record_path_proof_success(path_registration, observation);
         }
     }
 

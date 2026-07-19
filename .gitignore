@@ -1,5 +1,7 @@
 /target/
 /lab/benchmarks/target/
+/third_party/*/target/
+/third_party/*/Cargo.lock
 /dist/
 /lab/results/
 **/__pycache__/

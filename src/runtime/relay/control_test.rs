@@ -3,7 +3,10 @@ use crate::config::{ResourceLimits, SecurityConfig, SharedSecret};
 use crate::model::capacity::reliable_relay_buffer_len;
 use crate::mux::MuxLimits;
 use crate::protocol::{OffsetRange, PathId, StreamId, TargetAddr, UnderlayProtocol};
-use crate::runtime::path::commands::reliable_path_command_channels;
+use crate::runtime::path::commands::{
+    ReliablePathCommand, ReliablePathCommandReceivers, recv_reliable_path_command,
+    reliable_path_command_channels,
+};
 use crate::runtime::stream::{ReliablePathStream, ReliablePathStreamOutput};
 use crate::transport::PathSpec;
 use bytes::Bytes;
@@ -54,7 +57,7 @@ async fn closed_output_relay(
                 commands,
                 limits,
             ),
-            frames: frames_rx,
+            frames: frames_rx.into(),
         },
         0,
     );
@@ -73,6 +76,71 @@ async fn closed_output_relay(
         .await
     });
     (application, relay, frames_tx)
+}
+
+async fn blocked_feedback_relay(
+    stream_id: StreamId,
+) -> (
+    tokio::io::DuplexStream,
+    tokio::task::JoinHandle<Result<PathDeliveryStats, RuntimeError>>,
+    mpsc::Sender<Result<Frame, RuntimeError>>,
+    ReliablePathCommandReceivers,
+) {
+    let unused = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("reserve unused endpoint");
+    let unused_addr = unused.local_addr().expect("unused endpoint address");
+    drop(unused);
+    let path = format!("tcp://{unused_addr}")
+        .parse::<PathSpec>()
+        .expect("TCP path");
+    let context = ClientPathContext::new(vec![path], test_security(), ResourceLimits::default())
+        .expect("client context");
+    let limits = context.mux_limits;
+    let (commands, command_receivers) = reliable_path_command_channels(1);
+    commands
+        .try_enqueue_admitted_frame(
+            Frame::StreamAck {
+                stream_id,
+                complete: false,
+                ranges: Vec::new(),
+            },
+            TrafficClass::Control,
+        )
+        .expect("fill carrier control queue");
+    let (frames_tx, frames_rx) = mpsc::channel(4);
+    let opened = OpenedRemoteStream::pending(
+        ReliablePathStream {
+            stream_id,
+            max_offset: limits.max_stream_window_bytes,
+            lane: TrafficClass::Latency,
+            underlay: UnderlayProtocol::Tcp,
+            max_frame_payload_bytes: reliable_relay_buffer_len(limits),
+            output: ReliablePathStreamOutput::fixed(
+                UnderlayProtocol::Tcp,
+                PathId(0),
+                commands,
+                limits,
+            ),
+            frames: frames_rx.into(),
+        },
+        0,
+    );
+    let (application, relay_side) = duplex(4096);
+    let relay_context = context.clone();
+    let relay = tokio::spawn(async move {
+        relay_migrating_tcp_stream(
+            relay_side,
+            &relay_context,
+            MppPerformanceConfig::default(),
+            ReliableRelayOpenSpec {
+                target: TargetAddr::Ip(unused_addr),
+            },
+            opened,
+        )
+        .await
+    });
+    (application, relay, frames_tx, command_receivers)
 }
 
 async fn assert_absolute_retention_timeout(
@@ -144,6 +212,55 @@ async fn retained_in_order_fin_commits_after_reattachment_feedback() {
         application.read(&mut byte).await.expect("read half-close"),
         0
     );
+}
+
+#[tokio::test]
+async fn final_feedback_backpressure_keeps_fin_pending_until_ack_is_queued() {
+    let stream_id = StreamId(614);
+    let (mut application, relay, frames_tx, mut command_receivers) =
+        blocked_feedback_relay(stream_id).await;
+    frames_tx
+        .send(Ok(Frame::StreamFin {
+            stream_id,
+            final_offset: 0,
+        }))
+        .await
+        .expect("remote FIN");
+
+    let mut byte = [0_u8; 1];
+    assert!(
+        tokio::time::timeout(Duration::from_millis(50), application.read(&mut byte))
+            .await
+            .is_err(),
+        "remote FIN committed before its final Data ACK entered a carrier queue"
+    );
+
+    assert!(matches!(
+        recv_reliable_path_command(&mut command_receivers).await,
+        Some(ReliablePathCommand::SendFrame(Frame::StreamAck { .. }))
+    ));
+    assert!(matches!(
+        tokio::time::timeout(
+            Duration::from_secs(1),
+            recv_reliable_path_command(&mut command_receivers),
+        )
+        .await
+        .expect("final feedback enqueue deadline"),
+        Some(ReliablePathCommand::SendFrame(Frame::StreamAck {
+            stream_id: ack_stream_id,
+            complete: true,
+            ..
+        })) if ack_stream_id == stream_id
+    ));
+    assert_eq!(
+        tokio::time::timeout(Duration::from_secs(1), application.read(&mut byte))
+            .await
+            .expect("remote half-close deadline")
+            .expect("application read"),
+        0
+    );
+
+    relay.abort();
 }
 
 #[test]

@@ -7,13 +7,13 @@ use crate::model::capacity::{
 use crate::model::path::RelayPathKey;
 use crate::mux::MuxLimits;
 use crate::mux::stream::ReliableSendStream;
-use crate::protocol::{Frame, PathId, StreamId, UnderlayProtocol};
+use crate::protocol::{Frame, PathId, ResetReason, StreamId, UnderlayProtocol};
 use crate::runtime::error::RuntimeError;
 use crate::runtime::path::ClientPathContext;
 use crate::runtime::path::commands::{
     ReliablePathCommand, ReliablePathCommandReceivers, recv_reliable_path_command,
     reliable_path_command_channels, reliable_path_command_pending_bytes,
-    try_recv_reliable_path_priority_command,
+    try_recv_reliable_path_command, try_recv_reliable_path_priority_command,
 };
 use crate::runtime::stream::{OpenedRemoteStream, ReliablePathStream, ReliablePathStreamOutput};
 use crate::scheduler::TrafficClass;
@@ -67,7 +67,7 @@ fn opened_stream(
                     commands,
                     mux_limits,
                 ),
-                frames: frames_rx,
+                frames: frames_rx.into(),
             },
             path_index,
         ),
@@ -309,7 +309,7 @@ async fn close_depublishes_load_before_carrier_cleanup_waits() {
                 commands,
                 mux_limits,
             ),
-            frames: frames_rx,
+            frames: frames_rx.into(),
         },
         0,
     )
@@ -356,7 +356,7 @@ async fn successful_close_preserves_fin_detach_close_order() {
                 commands.clone(),
                 mux_limits,
             ),
-            frames: frames_rx,
+            frames: frames_rx.into(),
         },
         0,
     );
@@ -407,6 +407,63 @@ async fn successful_close_preserves_fin_detach_close_order() {
         ReliablePathCommand::CloseStream(received) if *received == stream_id
     ));
     receivers.release_pending_command_bytes(reliable_path_command_pending_bytes(&third));
+}
+
+#[tokio::test]
+async fn terminal_product_failure_resets_before_queued_payload() {
+    let stream_id = StreamId(97);
+    let mux_limits = MuxLimits::default();
+    let (commands, mut receivers) = reliable_path_command_channels(4);
+    let (_frames_tx, frames_rx) = mpsc::channel(1);
+    let opened = OpenedRemoteStream::pending(
+        ReliablePathStream {
+            stream_id,
+            max_offset: mux_limits.max_stream_window_bytes,
+            lane: TrafficClass::Throughput,
+            underlay: UnderlayProtocol::Tcp,
+            max_frame_payload_bytes: reliable_relay_buffer_len(mux_limits),
+            output: ReliablePathStreamOutput::fixed(
+                UnderlayProtocol::Tcp,
+                PathId(0),
+                commands.clone(),
+                mux_limits,
+            ),
+            frames: frames_rx.into(),
+        },
+        0,
+    );
+    let mut remotes = ReliableRelayRemoteSet::new(opened, 1);
+    if let Some(setup) = try_recv_reliable_path_priority_command(&mut receivers) {
+        receivers.release_pending_command_bytes(reliable_path_command_pending_bytes(&setup));
+    }
+
+    commands
+        .send_stream_ordered_frame(
+            Frame::StreamData {
+                stream_id,
+                offset: 0,
+                payload: Bytes::from_static(b"stale after product failure"),
+            },
+            TrafficClass::Throughput,
+        )
+        .await
+        .expect("queue stale payload");
+    remotes.reset_all(ResetReason::RemoteClosed).await;
+
+    let terminal = recv_reliable_path_command(&mut receivers)
+        .await
+        .expect("terminal reset");
+    assert!(matches!(
+        terminal,
+        ReliablePathCommand::ResetAndCloseStream {
+            stream_id: received,
+            reason: ResetReason::RemoteClosed,
+        } if received == stream_id
+    ));
+    assert!(
+        try_recv_reliable_path_command(&mut receivers).is_none(),
+        "payload queued before a terminal reset must not reach the carrier writer"
+    );
 }
 
 #[test]

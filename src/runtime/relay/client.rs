@@ -6,15 +6,18 @@
 
 use super::io::{
     ReliableAckGapReinjectionProgress, ReliableRequestPathStaleness,
-    stream_ack_gap_reinjection_frames_normalized, update_reinjection_authoritative_ack_snapshot,
-    write_delivered_payloads,
+    stream_ack_gap_reinjection_frames_normalized, stream_ack_ranges_expose_authoritative_gap,
+    update_reinjection_authoritative_ack_snapshot, write_delivered_payloads,
 };
 use super::lifecycle::{RelayAdditionalPathOpenTask, maybe_mark_live_relay_path_delivery};
 #[cfg(feature = "lab-diagnostics")]
 use crate::lab_diagnostics::{lab_diagnostic, lab_perf_record};
 use crate::model::capacity::adaptive_reliable_relay_reinjection_bytes;
 use crate::model::path::{RelayPathInstance, RelayPathKey};
-use crate::model::work::reliable_persistent_ack_gap_reinjection_limit_bytes;
+use crate::model::timing::{
+    reliable_data_ack_recovery_deadline, reliable_data_retransmission_interval,
+};
+use crate::model::work::reliable_critical_tail_reinjection_limit_bytes;
 use crate::mux::stream::{ReliableRecvStream, ReliableSendStream};
 use crate::protocol::frame::normalize_offset_ranges;
 use crate::protocol::{OffsetRange, StreamId};
@@ -52,6 +55,7 @@ pub(super) struct ClientRelayProgressState {
     pub(super) last_send_ack_frontier: u64,
     pub(super) last_send_ack_ranges: Vec<OffsetRange>,
     pub(super) last_send_ack_complete: bool,
+    pub(super) data_ack_reinjection_at: Option<tokio::time::Instant>,
     pub(super) sender_retry_at: Option<tokio::time::Instant>,
     #[cfg(feature = "lab-diagnostics")]
     last_reported_receive_hole: Option<(u64, usize, usize, u64)>,
@@ -163,6 +167,7 @@ impl ClientRelayState {
                 last_send_ack_frontier: 0,
                 last_send_ack_ranges: Vec::new(),
                 last_send_ack_complete: false,
+                data_ack_reinjection_at: None,
                 sender_retry_at: None,
                 #[cfg(feature = "lab-diagnostics")]
                 last_reported_receive_hole: None,
@@ -282,6 +287,11 @@ where
     let _ = stream_id;
     let previous_remote_offset = recv_stream.next_offset();
     let payload_len = payload.len();
+    super::io::validate_stream_data_final_offset(
+        state.endpoint.pending_remote_fin_offset,
+        offset,
+        payload_len,
+    )?;
     #[cfg(feature = "lab-diagnostics")]
     let mux_started = Instant::now();
     let outcome = recv_stream
@@ -430,56 +440,34 @@ pub(super) fn update_request_path_staleness(
     let _ = stream_id;
 }
 
-/// Commits one peer ACK and derives reinjection work in the same ownership step, so
-/// ACK evidence and queued recovery cannot diverge across select iterations.
-pub(super) fn apply_client_stream_ack(
-    ack_context: ClientStreamAckContext<'_>,
+#[derive(Debug, Default)]
+#[cfg_attr(not(feature = "lab-diagnostics"), allow(dead_code))]
+pub(super) struct ClientDataAckReinjectionOutcome {
+    pub(super) frame_count: usize,
+    pub(super) persistent_ready: bool,
+    pub(super) has_multipath_alternative: bool,
+}
+
+/// Evaluates retained Data ACK evidence. Request feedback may be fragmented
+/// across paths, so portable recovery requires one RTO/PTO of the same gap.
+#[allow(clippy::too_many_arguments)]
+#[cfg_attr(not(feature = "lab-diagnostics"), allow(unused_variables))]
+pub(super) fn evaluate_client_data_ack_reinjection(
+    state: &mut ClientRelayState,
+    sender: &mut RequestSenderService,
+    sender_queue: &mut ReliableRelaySenderQueue,
+    context: &ClientPathContext,
+    remotes: &ReliableRelayRemoteSet,
+    send_stream: &ReliableSendStream,
+    path_snapshot: Option<PathSnapshot>,
+    relay_lane: TrafficClass,
     stream_id: StreamId,
-    complete: bool,
-    ranges: Vec<OffsetRange>,
-) -> usize {
-    #[cfg(not(feature = "lab-diagnostics"))]
-    let _ = stream_id;
-    let ClientStreamAckContext {
-        state,
-        sender,
-        sender_queue,
-        context,
-        remotes,
-        send_stream,
-        path_snapshot,
-        relay_lane,
-    } = ack_context;
-    let normalized_ranges = normalize_offset_ranges(ranges);
-    update_reinjection_authoritative_ack_snapshot(
-        &mut state.progress.last_send_ack_frontier,
-        &mut state.progress.last_send_ack_ranges,
-        &mut state.progress.last_send_ack_complete,
-        complete,
-        &normalized_ranges,
-    );
-    #[cfg(feature = "lab-diagnostics")]
-    let previous_reinjection_bytes = send_stream.reinjection_bytes();
-    let ack_outcome =
-        sender.apply_request_product_ack(context, remotes, send_stream, &normalized_ranges);
-    let data_ack_progress_paths = ack_outcome.data_ack_progress_paths;
-    let ack = ack_outcome.mux;
-    sender_queue.release_normalized_acked_reinjections(&normalized_ranges);
+) -> ClientDataAckReinjectionOutcome {
     let base_reinjection_limit =
         adaptive_reliable_relay_reinjection_bytes(path_snapshot, relay_lane, context.mux_limits);
     let reinjection_event_budget =
         sender.reinjection_extra_event_budget_remaining(context.mux_limits);
     let has_multipath_reinjection_alternative = remotes.path_keys().len() > 1;
-    update_request_path_staleness(
-        state,
-        sender,
-        sender_queue,
-        context,
-        remotes,
-        send_stream,
-        &data_ack_progress_paths,
-        stream_id,
-    );
     let authoritative_ack_complete = state.progress.last_send_ack_complete;
     let authoritative_ack_ranges = state.progress.last_send_ack_ranges.as_slice();
     let reinjection = sender.data_ack_gap_reinjection_model(
@@ -491,37 +479,47 @@ pub(super) fn apply_client_stream_ack(
         relay_lane,
     );
     let has_live_original_path = reinjection.has_live_original_path;
-    let original_underlay = reinjection.original_underlay;
     let original_path_timing = reinjection.original_path_timing;
     let reinjection_target = reinjection.reinjection_target;
-    let generic_original_underlay = (!has_live_original_path)
-        .then_some(
-            original_path_timing
-                .map(|snapshot| snapshot.underlay)
-                .or(original_underlay)
-                .or(path_snapshot.map(|snapshot| snapshot.underlay)),
-        )
+    let ack_gap_original_underlay = original_path_timing
+        .map(|snapshot| snapshot.underlay)
+        .or(reinjection.original_underlay)
+        .or(path_snapshot.map(|snapshot| snapshot.underlay));
+    let observed_at = Instant::now();
+    let candidate_recovery_deadline = has_live_original_path
+        .then(|| {
+            reliable_data_ack_recovery_deadline(
+                Some(observed_at),
+                ack_gap_original_underlay,
+                original_path_timing,
+                reinjection.reinjection_completion,
+            )
+        })
         .flatten();
+    let recovery_deadline = state.progress.ack_gap_reinjection.arm_recovery_deadline(
+        authoritative_ack_complete,
+        authoritative_ack_ranges,
+        has_multipath_reinjection_alternative,
+        candidate_recovery_deadline,
+    );
+    let measured_reinjection_ready = candidate_recovery_deadline.is_some()
+        && recovery_deadline.is_some_and(|deadline| observed_at >= deadline);
+    let reinjection_retry_after =
+        reliable_data_retransmission_interval(ack_gap_original_underlay, original_path_timing);
     let ack_gap_reinjection_ready = state.progress.ack_gap_reinjection.reinjection_ready(
         authoritative_ack_complete,
         authoritative_ack_ranges,
-        generic_original_underlay,
-        has_multipath_reinjection_alternative && !has_live_original_path,
-        (!has_live_original_path)
-            .then_some(original_path_timing)
-            .flatten(),
+        has_multipath_reinjection_alternative,
+        measured_reinjection_ready,
+        reinjection_retry_after,
     );
     let persistent_ack_gap_reinjection_ready =
         ack_gap_reinjection_ready && reinjection_target.is_some();
-    let reinjection_path = reinjection_target.map(|(_, snapshot)| snapshot);
-    // Ordinary ACK evidence repairs at most the earliest adaptive quantum.
-    // Only persistent evidence with a measured target may refill more of that
-    // target's service flight.
+    // Persistent authoritative evidence may bypass optional duplicate budget,
+    // but a missing, failed, or declared-stale owner has separate recovery.
     let reinjection_limit = if persistent_ack_gap_reinjection_ready {
-        reliable_persistent_ack_gap_reinjection_limit_bytes(
-            reinjection_path,
-            reinjection_path.and(original_underlay),
-            relay_lane,
+        reliable_critical_tail_reinjection_limit_bytes(
+            base_reinjection_limit,
             send_stream.reinjection_bytes(),
             context.mux_limits,
         )
@@ -543,31 +541,9 @@ pub(super) fn apply_client_stream_ack(
         has_multipath_reinjection_alternative,
         persistent_ack_gap_reinjection_ready,
     );
+    let frame_count = reinjection_frames.len();
     let persistent_ack_gap_reinjection =
         persistent_ack_gap_reinjection_ready && !reinjection_frames.is_empty();
-    #[cfg(feature = "lab-diagnostics")]
-    lab_diagnostic(
-        "stream_ack_received",
-        format_args!(
-            "stream_id={} complete={} ranges={} largest_end={} released_bytes={} reinjection_bytes_before={} reinjection_bytes_after={} reinjection_frames={} reinjection_kind={} active_underlay={:?} multipath_reinjection_alternative={} ack_gap_reinjection_ready={}",
-            stream_id.0,
-            complete,
-            normalized_ranges.len(),
-            normalized_ranges
-                .iter()
-                .map(|range| range.end)
-                .max()
-                .unwrap_or(0),
-            ack.released_bytes,
-            previous_reinjection_bytes,
-            ack.remaining_reinjection_bytes,
-            reinjection_frames.len(),
-            "ack_gap",
-            path_snapshot.map(|snapshot| snapshot.underlay),
-            has_multipath_reinjection_alternative,
-            persistent_ack_gap_reinjection_ready,
-        ),
-    );
     let mut queued_persistent_ack_gap_reinjection = false;
     for frame in reinjection_frames {
         let queued = if sender_queue.has_queued_reinjection_overlap(&frame) {
@@ -607,6 +583,111 @@ pub(super) fn apply_client_stream_ack(
             .ack_gap_reinjection
             .record_reinjection_queued();
     }
+    let timer_active = stream_ack_ranges_expose_authoritative_gap(
+        authoritative_ack_complete,
+        authoritative_ack_ranges,
+    ) && has_multipath_reinjection_alternative
+        && recovery_deadline.is_some();
+    let repeat_deadline = state
+        .progress
+        .ack_gap_reinjection
+        .repeat_reinjection_deadline(reinjection_retry_after);
+    let next_deadline = recovery_deadline
+        .map(|deadline| repeat_deadline.map_or(deadline, |repeat| deadline.max(repeat)));
+    state.progress.data_ack_reinjection_at = timer_active
+        .then_some(next_deadline)
+        .flatten()
+        .filter(|deadline| *deadline > observed_at)
+        .map(tokio::time::Instant::from_std);
+
+    ClientDataAckReinjectionOutcome {
+        frame_count,
+        persistent_ready: persistent_ack_gap_reinjection_ready,
+        has_multipath_alternative: has_multipath_reinjection_alternative,
+    }
+}
+
+/// Commits one peer ACK and derives reinjection work in the same ownership step, so
+/// ACK evidence and queued recovery cannot diverge across select iterations.
+pub(super) fn apply_client_stream_ack(
+    ack_context: ClientStreamAckContext<'_>,
+    stream_id: StreamId,
+    complete: bool,
+    ranges: Vec<OffsetRange>,
+) -> usize {
+    #[cfg(not(feature = "lab-diagnostics"))]
+    let _ = stream_id;
+    let ClientStreamAckContext {
+        state,
+        sender,
+        sender_queue,
+        context,
+        remotes,
+        send_stream,
+        path_snapshot,
+        relay_lane,
+    } = ack_context;
+    let normalized_ranges = normalize_offset_ranges(ranges);
+    update_reinjection_authoritative_ack_snapshot(
+        &mut state.progress.last_send_ack_ranges,
+        &mut state.progress.last_send_ack_complete,
+        complete,
+        &normalized_ranges,
+    );
+    #[cfg(feature = "lab-diagnostics")]
+    let previous_reinjection_bytes = send_stream.reinjection_bytes();
+    let ack_outcome =
+        sender.apply_request_product_ack(context, remotes, send_stream, &normalized_ranges);
+    state.progress.last_send_ack_frontier = send_stream.data_ack_frontier();
+    let data_ack_progress_paths = ack_outcome.data_ack_progress_paths;
+    let ack = ack_outcome.mux;
+    sender_queue.release_normalized_acked_reinjections(&normalized_ranges);
+    update_request_path_staleness(
+        state,
+        sender,
+        sender_queue,
+        context,
+        remotes,
+        send_stream,
+        &data_ack_progress_paths,
+        stream_id,
+    );
+    let reinjection = evaluate_client_data_ack_reinjection(
+        state,
+        sender,
+        sender_queue,
+        context,
+        remotes,
+        send_stream,
+        path_snapshot,
+        relay_lane,
+        stream_id,
+    );
+    #[cfg(not(feature = "lab-diagnostics"))]
+    let _ = reinjection;
+    #[cfg(feature = "lab-diagnostics")]
+    lab_diagnostic(
+        "stream_ack_received",
+        format_args!(
+            "stream_id={} complete={} ranges={} largest_end={} released_bytes={} reinjection_bytes_before={} reinjection_bytes_after={} reinjection_frames={} reinjection_kind={} active_underlay={:?} multipath_reinjection_alternative={} ack_gap_reinjection_ready={}",
+            stream_id.0,
+            complete,
+            normalized_ranges.len(),
+            normalized_ranges
+                .iter()
+                .map(|range| range.end)
+                .max()
+                .unwrap_or(0),
+            ack.released_bytes,
+            previous_reinjection_bytes,
+            ack.remaining_reinjection_bytes,
+            reinjection.frame_count,
+            "ack_gap",
+            path_snapshot.map(|snapshot| snapshot.underlay),
+            reinjection.has_multipath_alternative,
+            reinjection.persistent_ready,
+        ),
+    );
     state.progress.last_stream_at = Instant::now();
     ack.released_bytes
 }

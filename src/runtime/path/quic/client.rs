@@ -11,7 +11,7 @@ use super::io::{
 };
 #[cfg(feature = "lab-diagnostics")]
 use super::metrics::log_quic_ack_poll_diagnostics;
-use super::metrics::quic_path_metrics_poll_interval;
+use super::metrics::{quic_path_metrics_ack_interval, quic_path_metrics_poll_interval};
 use crate::config::SecurityConfig;
 #[cfg(feature = "lab-diagnostics")]
 use crate::lab_diagnostics::lab_diagnostic;
@@ -275,7 +275,11 @@ fn spawn_client_udp_path_metrics(
         let mut tracker = UdpPathMetricTracker::default();
         #[cfg(feature = "lab-diagnostics")]
         let mut last_metrics_poll_at = None;
+        let delivery_activity = connection.delivery_activity_notify();
         loop {
+            let activity_started = delivery_activity.notified();
+            tokio::pin!(activity_started);
+            activity_started.as_mut().enable();
             if connection.is_closed() {
                 #[cfg(feature = "lab-diagnostics")]
                 lab_diagnostic(
@@ -328,7 +332,12 @@ fn spawn_client_udp_path_metrics(
             {
                 record.mark_quic_path_metrics(path_instance_id, metrics);
             }
-            tokio::time::sleep(quic_path_metrics_poll_interval(metrics)).await;
+            tokio::select! {
+                _ = tokio::time::sleep(quic_path_metrics_poll_interval(metrics)) => {}
+                _ = &mut activity_started => {
+                    tokio::time::sleep(quic_path_metrics_ack_interval(metrics)).await;
+                }
+            }
         }
     })
 }
@@ -488,6 +497,7 @@ async fn perform_client_udp_path_handshake(
     runtime: &ClientUdpPathSessionRuntime,
 ) -> Result<(PathUsage, UdpPathSendStream, UdpPathRecvStream), RuntimeError> {
     let (mut send, mut recv) = connection.open_bi().await?;
+    send.set_traffic_class(TrafficClass::Control)?;
     let path_id = PathId(runtime.path_index as u16);
     let [session_hello, session_auth, path_join] = ClientPathAuthenticationFrames::for_session(
         runtime.security(),
@@ -610,6 +620,7 @@ async fn open_client_udp_stream_on_connection(
     runtime: ClientUdpPathSessionRuntime,
 ) -> Result<OpenedReliableCarrierStream, RuntimeError> {
     let (mut send, mut recv) = carrier.connection.open_bi().await?;
+    send.set_traffic_class(lane)?;
     let open = Frame::OpenStream {
         stream_id,
         target,
@@ -722,6 +733,7 @@ async fn open_client_udp_datagram_stream(
     runtime: ClientUdpPathSessionRuntime,
 ) -> Result<ClientUdpDatagramStream, RuntimeError> {
     let (send, recv) = carrier.connection.open_bi().await?;
+    send.set_traffic_class(TrafficClass::RealtimeDatagram)?;
     let frames = spawn_quic_path_reader(recv, runtime.codec_limits, runtime.stream_frame_queue);
     Ok(ClientUdpDatagramStream {
         send,

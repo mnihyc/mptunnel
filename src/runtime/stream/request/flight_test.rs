@@ -2,6 +2,7 @@ use super::RequestFlightLedger;
 use crate::model::path::{CarrierPathInstanceId, RelayPathInstance, RelayPathKey};
 use crate::protocol::{Frame, OffsetRange, StreamId, UnderlayProtocol};
 use bytes::Bytes;
+use std::time::Instant;
 
 fn data_frame(offset: u64, len: usize) -> Frame {
     Frame::StreamData {
@@ -281,5 +282,29 @@ fn original_path_requires_one_instance_to_cover_the_complete_range() {
         ledger.unique_original_path_for_frame(&replacement_overlap),
         None,
         "overlapping ownership from another attachment is ambiguous"
+    );
+}
+
+#[test]
+fn original_send_epoch_is_latest_covering_flight_and_requires_unique_ownership() {
+    let owner = path(UnderlayProtocol::Tcp, 0, 3);
+    let replacement = path(UnderlayProtocol::Tcp, 0, 4);
+    let mut ledger = RequestFlightLedger::default();
+    ledger.record_original_frame_instance(owner, &data_frame(0, 2048));
+    let second_record_started = Instant::now();
+    ledger.record_original_frame_instance(owner, &data_frame(2048, 2048));
+    let second_record_finished = Instant::now();
+
+    let sent_at = ledger
+        .unique_original_sent_at_for_frame(&data_frame(0, 4096))
+        .expect("one attachment owns the complete frame");
+    assert!(sent_at >= second_record_started);
+    assert!(sent_at <= second_record_finished);
+
+    ledger.record_original_frame_instance(replacement, &data_frame(1024, 1024));
+    assert_eq!(
+        ledger.unique_original_sent_at_for_frame(&data_frame(0, 4096)),
+        None,
+        "ambiguous original ownership has no recovery epoch",
     );
 }

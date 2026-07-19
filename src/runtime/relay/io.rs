@@ -1,10 +1,8 @@
 use crate::model::path::RelayPathInstance;
-use crate::model::timing::{
-    reliable_data_ack_gap_persistence_interval, reliable_path_stale_interval,
-};
+use crate::model::timing::reliable_path_stale_interval;
 use crate::mux::stream::{ReliableRecvStream, ReliableSendStream};
-use crate::protocol::frame::{normalize_offset_ranges, stream_ack_contiguous_frontier};
-use crate::protocol::{Frame, OffsetRange, UnderlayProtocol};
+use crate::protocol::frame::normalize_offset_ranges;
+use crate::protocol::{Frame, OffsetRange};
 use crate::runtime::error::RuntimeError;
 use crate::scheduler::PathSnapshot;
 use bytes::Bytes;
@@ -39,13 +37,15 @@ pub(in crate::runtime) fn stream_ack_ranges_expose_authoritative_gap(
 }
 
 pub(in crate::runtime) fn update_reinjection_authoritative_ack_snapshot(
-    stored_frontier: &mut u64,
     stored_ranges: &mut Vec<OffsetRange>,
     stored_complete: &mut bool,
     complete: bool,
     ranges: &[OffsetRange],
 ) {
-    if !complete {
+    // An incomplete frame cannot establish the omitted ranges, but every
+    // listed range is still monotonic positive ACK evidence. Once a complete
+    // snapshot exists, merge later deltas so a filled gap cannot remain lost.
+    if !complete && !*stored_complete {
         return;
     }
     let mut merged = if *stored_complete {
@@ -55,9 +55,8 @@ pub(in crate::runtime) fn update_reinjection_authoritative_ack_snapshot(
     };
     merged.extend_from_slice(ranges);
     merged = normalize_offset_ranges(merged);
-    *stored_frontier = (*stored_frontier).max(stream_ack_contiguous_frontier(&merged));
     *stored_ranges = merged;
-    *stored_complete = true;
+    *stored_complete |= complete;
 }
 
 #[cfg(test)]
@@ -132,7 +131,7 @@ pub(in crate::runtime) fn stream_final_offset_tail_reinjection_frames_normalized
 #[derive(Debug, Default)]
 pub(in crate::runtime) struct ReliableAckGapReinjectionProgress {
     first_gap_start: Option<u64>,
-    first_seen_at: Option<Instant>,
+    recovery_deadline: Option<Instant>,
     last_reinjection_at: Option<Instant>,
 }
 
@@ -206,25 +205,43 @@ impl ReliableRequestPathStaleness {
 }
 
 impl ReliableAckGapReinjectionProgress {
+    pub(in crate::runtime) fn arm_recovery_deadline(
+        &mut self,
+        complete: bool,
+        normalized_ranges: &[OffsetRange],
+        has_multipath_reinjection_alternative: bool,
+        candidate: Option<Instant>,
+    ) -> Option<Instant> {
+        if !self.retain_gap_identity(
+            complete,
+            normalized_ranges,
+            has_multipath_reinjection_alternative,
+        ) {
+            return None;
+        }
+        if let Some(candidate) = candidate {
+            self.recovery_deadline = Some(
+                self.recovery_deadline
+                    .map_or(candidate, |deadline| deadline.min(candidate)),
+            );
+        }
+        self.recovery_deadline
+    }
+
     pub(in crate::runtime) fn reinjection_ready(
         &mut self,
         complete: bool,
         normalized_ranges: &[OffsetRange],
-        original_underlay: Option<UnderlayProtocol>,
         has_multipath_reinjection_alternative: bool,
-        path: Option<PathSnapshot>,
+        measured_reinjection_ready: bool,
+        retry_after: Duration,
     ) -> bool {
-        // TCP retransmission and QUIC packet recovery remain transport-local.
-        // Connection-level reinjection requires the same persistent DSN gap.
-        let progress_interval = original_underlay
-            .map(|underlay| reliable_data_ack_gap_persistence_interval(Some(underlay), path))
-            .unwrap_or_default();
         self.reinjection_ready_at(
             complete,
             normalized_ranges,
-            original_underlay,
             has_multipath_reinjection_alternative,
-            progress_interval,
+            measured_reinjection_ready,
+            retry_after,
             Instant::now(),
         )
     }
@@ -233,40 +250,23 @@ impl ReliableAckGapReinjectionProgress {
         &mut self,
         complete: bool,
         normalized_ranges: &[OffsetRange],
-        active_underlay: Option<UnderlayProtocol>,
         has_multipath_reinjection_alternative: bool,
-        progress_interval: Duration,
+        measured_reinjection_ready: bool,
+        retry_after: Duration,
         now: Instant,
     ) -> bool {
-        if !complete {
-            self.clear();
+        if !self.retain_gap_identity(
+            complete,
+            normalized_ranges,
+            has_multipath_reinjection_alternative,
+        ) {
             return false;
         }
-        if active_underlay.is_none() {
-            self.clear();
-            return false;
-        }
-        if !has_multipath_reinjection_alternative {
-            self.clear();
-            return false;
-        }
-        let Some(first_gap) = normalized_stream_ack_first_gap(normalized_ranges) else {
-            self.clear();
-            return false;
-        };
-        if self.first_gap_start != Some(first_gap.0) {
-            self.first_gap_start = Some(first_gap.0);
-            self.first_seen_at = Some(now);
-            self.last_reinjection_at = None;
-            return false;
-        }
-        if self.first_seen_at.is_none_or(|first_seen_at| {
-            now.saturating_duration_since(first_seen_at) < progress_interval
-        }) {
+        if !measured_reinjection_ready {
             return false;
         }
         if self.last_reinjection_at.is_some_and(|last_reinjection_at| {
-            now.saturating_duration_since(last_reinjection_at) < progress_interval
+            now.saturating_duration_since(last_reinjection_at) < retry_after
         }) {
             return false;
         }
@@ -287,10 +287,40 @@ impl ReliableAckGapReinjectionProgress {
         self.last_reinjection_at = None;
     }
 
+    pub(in crate::runtime) fn repeat_reinjection_deadline(
+        &self,
+        retry_after: Duration,
+    ) -> Option<Instant> {
+        self.last_reinjection_at
+            .and_then(|attempt| attempt.checked_add(retry_after))
+    }
+
     fn clear(&mut self) {
         self.first_gap_start = None;
-        self.first_seen_at = None;
+        self.recovery_deadline = None;
         self.last_reinjection_at = None;
+    }
+
+    fn retain_gap_identity(
+        &mut self,
+        complete: bool,
+        normalized_ranges: &[OffsetRange],
+        has_multipath_reinjection_alternative: bool,
+    ) -> bool {
+        if !complete || !has_multipath_reinjection_alternative {
+            self.clear();
+            return false;
+        }
+        let Some(first_gap) = normalized_stream_ack_first_gap(normalized_ranges) else {
+            self.clear();
+            return false;
+        };
+        if self.first_gap_start != Some(first_gap.0) {
+            self.first_gap_start = Some(first_gap.0);
+            self.recovery_deadline = None;
+            self.last_reinjection_at = None;
+        }
+        true
     }
 }
 
@@ -413,9 +443,9 @@ pub(in crate::runtime) fn receive_stream_fin(
     pending_final_offset: &mut Option<u64>,
     final_offset: u64,
 ) -> Result<bool, RuntimeError> {
-    if final_offset < recv_stream.next_offset() {
+    if final_offset < recv_stream.ack_range_summary().largest_end {
         return Err(RuntimeError::Protocol(
-            "stream FIN final offset is behind delivered data",
+            "stream FIN final offset is behind received data",
         ));
     }
     if let Some(existing) = *pending_final_offset {
@@ -432,6 +462,27 @@ pub(in crate::runtime) fn receive_stream_fin(
     Ok(final_offset == recv_stream.next_offset())
 }
 
+pub(in crate::runtime) fn validate_stream_data_final_offset(
+    pending_final_offset: Option<u64>,
+    offset: u64,
+    payload_len: usize,
+) -> Result<(), RuntimeError> {
+    let Some(final_offset) = pending_final_offset else {
+        return Ok(());
+    };
+    let payload_len = u64::try_from(payload_len)
+        .map_err(|_| RuntimeError::Protocol("stream data length exceeds offset space"))?;
+    let end = offset
+        .checked_add(payload_len)
+        .ok_or(RuntimeError::Protocol("stream data range overflows"))?;
+    if end > final_offset {
+        return Err(RuntimeError::Protocol(
+            "stream data exceeds declared final offset",
+        ));
+    }
+    Ok(())
+}
+
 pub(in crate::runtime) fn stream_data_range_already_delivered(
     recv_stream: &ReliableRecvStream,
     offset: u64,
@@ -444,7 +495,7 @@ pub(in crate::runtime) fn pending_stream_fin_ready(
     recv_stream: &ReliableRecvStream,
     pending_final_offset: Option<u64>,
 ) -> bool {
-    pending_final_offset.is_some_and(|final_offset| recv_stream.next_offset() >= final_offset)
+    pending_final_offset.is_some_and(|final_offset| recv_stream.next_offset() == final_offset)
 }
 
 pub(in crate::runtime) fn stream_terminal_fin_replay_required(

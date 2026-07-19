@@ -150,7 +150,6 @@ impl Connection {
 
     pub fn close(&self) {
         self.connection.close(VarInt::from_u32(0), b"closed");
-        self.telemetry.send_credit_notify().notify_waiters();
     }
 
     pub fn is_closed(&self) -> bool {
@@ -190,9 +189,8 @@ impl Connection {
             .clone();
         if !Arc::ptr_eq(&current_telemetry, &self.telemetry) {
             // Quinn creates a fresh controller for a cross-address migration.
-            // Existing streams still hold the old write gate, so fail this
-            // carrier instead of publishing split ownership from two epochs.
-            self.telemetry.send_credit_notify().notify_waiters();
+            // Existing streams still publish through the old telemetry owner,
+            // so fail this carrier instead of reporting split metric epochs.
             self.connection.close(
                 VarInt::from_u32(1),
                 b"QUIC congestion controller ownership changed",
@@ -220,36 +218,8 @@ impl Connection {
         }
     }
 
-    pub fn send_credit_snapshot(&self) -> super::CarrierSendCreditSnapshot {
-        let controller = self.connection.congestion_state();
-        let metrics = controller.metrics();
-        let current_telemetry = controller
-            .into_any()
-            .downcast::<InstrumentedController>()
-            .expect("QUIC carrier must use the instrumented congestion controller")
-            .telemetry
-            .clone();
-        let ownership_changed = !Arc::ptr_eq(&current_telemetry, &self.telemetry);
-        if ownership_changed {
-            self.telemetry.send_credit_notify().notify_waiters();
-            self.connection.close(
-                VarInt::from_u32(1),
-                b"QUIC congestion controller ownership changed",
-            );
-        }
-        let committed_bytes = current_telemetry
-            .delivery_evidence_pending_ack_bytes()
-            .max(self.write_backlog.load(Ordering::Acquire))
-            .max(current_telemetry.bytes_in_flight().unwrap_or(0));
-        super::CarrierSendCreditSnapshot {
-            limit_bytes: metrics.congestion_window,
-            committed_bytes,
-            closed: ownership_changed || self.is_closed(),
-        }
-    }
-
-    pub fn send_credit_notify(&self) -> Arc<Notify> {
-        self.telemetry.send_credit_notify()
+    pub fn delivery_activity_notify(&self) -> Arc<Notify> {
+        self.telemetry.delivery_activity_notify()
     }
 }
 

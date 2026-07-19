@@ -23,7 +23,6 @@ fn peer_status_frames_have_no_capacity_or_delivery_debt() {
     assert_eq!(frames[1].kind_name(), "PEER_STATUS_RESPONSE");
     for frame in frames {
         assert!(!frame.is_path_capacity());
-        assert_eq!(frame.carrier_credit_bytes(), 0);
         assert_eq!(frame.delivery_evidence_bytes(), 0);
     }
 }

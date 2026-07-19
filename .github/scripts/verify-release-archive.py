@@ -15,6 +15,7 @@ COMMON_FILES = {
     "README.md",
     "RFC.md",
     "SECURITY.md",
+    "THIRD_PARTY_LICENSES.html",
     "config.toml",
     "docs/ARCHITECTURE.md",
     "docs/OPERATIONS.md",

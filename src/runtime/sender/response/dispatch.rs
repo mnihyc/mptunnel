@@ -73,7 +73,7 @@ pub(super) fn emit_planned_response_data_frame(
             }
             let command = fixed
                 .commands()
-                .try_reserve_stream_ordered_frame(frame.clone(), lane)?;
+                .try_reserve_admitted_frame(frame.clone(), lane)?;
             fixed.record_original_flight(&frame);
             command.commit();
             Ok(Some(fixed.key()))
@@ -96,10 +96,10 @@ pub(super) fn emit_planned_response_data_frame(
                 Err(RuntimeError::SenderServiceBlocked) => {
                     return Err(RuntimeError::SenderServiceBlocked);
                 }
-                Err(_) => {
-                    binding.detach_path_instance(target.key, target.path_instance_id);
-                    return Err(RuntimeError::SenderServiceBlocked);
-                }
+                // Carrier registration retirement owns ordered detach. Removing
+                // a closed queue here could overtake ACKs already accepted by
+                // the reliable-stream actor.
+                Err(_) => return Err(RuntimeError::SenderServiceBlocked),
             }
             record_server_sender_decision(
                 binding.session_id(),
@@ -216,10 +216,9 @@ pub(super) fn emit_response_frame_from_sender_service(
                     }
                     Err(err) => {
                         last_error = Some(err);
-                        binding.detach_path_instance(
-                            target.observation.key,
-                            target.observation.path_instance_id,
-                        );
+                        // A closed command queue is already unschedulable.
+                        // Carrier retirement orders its detach behind accepted
+                        // stream input; dispatch must not mutate ownership.
                     }
                 }
             }

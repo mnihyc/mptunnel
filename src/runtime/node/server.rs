@@ -130,6 +130,7 @@ pub(super) fn new_identity_runtime_with_metadata(
         outbound,
         outbound_dns,
         outbound_connect_timeout,
+        session_retention_timeout,
         mux_limits,
         reliable_stream_port.clone(),
         telemetry.clone(),

@@ -1,5 +1,105 @@
 # Release milestones
 
+## 2026-07-20: v0.1.1 release candidate
+
+### Category
+
+Release-blocking performance, recovery, and platform verification.
+
+### Retained model
+
+Request-side Data ACK feedback can arrive as fragmented positive ranges. A
+complete snapshot must first establish an authoritative gap, and that gap must
+remain unchanged for one owner-carrier RTO/PTO measured from first observation
+before one bounded cross-path repair. Backdating this clock to the original
+send made ordinary cross-path reordering look lost and reduced a matched mixed
+upload from 421.5 to 357.6 Mbps. The corrected model reached 438.729 Mbps.
+
+Response-side later ACK events retain the established TCP RACK 5/4-SRTT and
+QUIC 9/8-SRTT time thresholds; ACK silence waits for the owner RTO/PTO. Both
+directions require exact retained flight, an authoritative gap, a live
+alternate predicted to complete sooner, a bounded repair quantum, and repeat
+suppression. Moving the response silence clock to first gap observation was
+rejected: a small latency improvement accompanied repeatable 2.821/4.293-second
+upload recovery gaps and a 68.2 Mbps repeat.
+
+### Exact-binary evidence
+
+The native Linux release binary SHA-256 is
+`8f356f47421ad96e7b9795010573a011ab3215fa3fa713977de79b3d1427c140`.
+It measured:
+
+- 438.729 Mbps mixed TCP+QUIC upload with exact receiver accounting and 3.689%
+  endpoint traffic excess;
+- 339.5--339.8 Mbps bulk goodput with zero UDP loss in two mixed latency runs,
+  with 73.4--74.1 ms UDP p95 and 75.4/94.4 ms interactive p95; and
+- 0.363-second download and 0.778-second destination upload recovery in the
+  balanced blackhole case, with exact accounting and 1.484% traffic excess.
+
+The Windows GNU PE SHA-256 is
+`978595cea97666c719ed221f76839246f253af3d30e0497b2907cbd911a2a40f`.
+Under Wine 9 against the exact Linux server, one TCP path measured
+140.624/168.241 Mbps download/upload and five measured
+210.973/289.208 Mbps. Balanced blackhole recovery was 0.278 seconds download
+and 1.471 seconds at the upload destination. Every process emitted one explicit
+portable TCP telemetry warning. Wine proves the portable protocol and binary;
+native Windows scheduling, `SIO_TCP_INFO`, and MSVC packaging remain owned by
+the exact-commit release CI gate.
+
+### Verification state
+
+- `cargo fmt --all -- --check`: passed.
+- `cargo clippy --locked --all-targets --all-features -- -D warnings`: passed.
+- `cargo test --locked --all-features`: 982 passed.
+- Lab contract tests: 145 passed.
+- Windows GNU all-target check and optimized release link: passed.
+- Linux musl x86_64 package manifest, static linkage, version, and checksum:
+  passed.
+- Release commit, native multi-platform CI, tag, and publication: pending. No
+  release is permitted unless those exact-source gates pass.
+
+## 2026-07-18: ordered ACK and carrier detach correction (v0.1.1 candidate)
+
+### Category
+
+Correctness and tail-latency regression.
+
+### Finding
+
+A carrier could enqueue positive Data ACKs and then synchronously remove its
+response attachment before the reliable-stream actor applied those ACKs. The
+failed-path recovery rule consequently treated an already delivered 32,971-byte
+response as uncovered work and reinjected the complete response. TCP and QUIC
+shared the same lifecycle-ordering defect.
+
+### Retained model
+
+Carrier frames and attachment lifecycle now enter one ordered per-stream actor
+queue. Detach immediately withdraws the exact carrier incarnation from new
+placement, but in-flight ownership remains attached until the actor consumes
+all preceding input and applies the detach event. A replacement carrier cannot
+inherit or be removed by the retired incarnation. Genuine failed-original
+recovery remains immediate after the ordered transition.
+
+The live-path recovery clock also starts no earlier than the blocking original
+flight's send time, so a new flight cannot inherit pre-send Data ACK stall time.
+
+### Evidence
+
+- `cargo test --locked --all-targets --all-features`: 956 passed.
+- `cargo clippy --locked --all-targets --all-features -- -D warnings`: passed.
+- `cargo check --locked --target x86_64-pc-windows-gnu --all-features`: passed.
+- The same-condition causal run in
+  `lab/results/v011-two-phase-detach-causal-20260718/` delivered 320.956 Mbps,
+  20/20 interactive requests, 29/29 small responses, and 89/89 datagrams. It
+  recorded no failed-original or queued reinjection, and both previously
+  affected response streams applied 14,600, 29,200, and 32,971-byte ACK
+  frontiers before teardown.
+- The non-instrumented release run in
+  `lab/results/v011-two-phase-detach-release-20260718/` delivered 319.566 Mbps,
+  20/20 interactive requests, and 91/91 datagrams. Interactive and datagram p95
+  latency were 88.858 ms and 50.874 ms respectively.
+
 ## 2026-07-18: v0.1.0 public release (frozen)
 
 Runtime source `1018992` is the release candidate. It adds five-minute logical

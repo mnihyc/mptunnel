@@ -347,6 +347,24 @@ def bulk_worker(args, started_at, interactive_ready, bulk_ready, result):
                 else:
                     complete_requests += 1
         elapsed = time.monotonic() - started_at
+        if last_body_s is not None:
+            terminal_gap = max(0.0, elapsed - last_body_s)
+            if terminal_gap > max_read_gap_s:
+                max_read_gap_s = terminal_gap
+                max_gap_start_s = last_body_s
+                max_gap_end_s = elapsed
+                max_gap_start_bytes = bytes_read
+                max_gap_end_bytes = bytes_read
+            if (
+                args.failover_after >= 0
+                and elapsed >= args.failover_after
+                and terminal_gap > recovery_gap_s
+            ):
+                recovery_gap_s = terminal_gap
+                recovery_gap_start_s = last_body_s
+                recovery_gap_end_s = elapsed
+                recovery_gap_start_bytes = bytes_read
+                recovery_gap_end_bytes = bytes_read
         fixed_complete = (
             last_content_length is None
             or complete_requests > 0

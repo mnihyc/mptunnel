@@ -6,7 +6,7 @@ on:
       candidate_tag:
         description: Stable tag to validate without publishing
         required: true
-        default: v0.1.0
+        default: v0.1.1
         type: string
 
 permissions:
@@ -152,6 +152,14 @@ jobs:
             otool -L "$binary"
           else
             readelf -h "$binary"
+          fi
+          if [[ "${{ matrix.kind }}" != android ]]; then
+            actual="$("$binary" --version)"
+            expected="mptunnel $version"
+            [[ "$actual" == "$expected" ]] || {
+              echo "expected '$expected', got '$actual'" >&2
+              exit 1
+            }
           fi
 
       - name: Verify Windows package manifest, architecture, and imports

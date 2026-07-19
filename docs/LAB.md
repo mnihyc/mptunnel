@@ -45,8 +45,8 @@ Do not combine these cohorts in one performance claim:
   inventory, time window, and runner. Record it as not run when those inputs do
   not exist.
 
-Protocol-v1/pre-v2 results are historical references only. Current performance
-claims require fresh protocol-v2 matched rows.
+Protocol-v1/pre-v3 results are historical references only. Current performance
+claims require fresh protocol-v3 matched rows.
 
 ## Topology
 
@@ -259,7 +259,7 @@ reinjection.
 
 ## Path and scheduling evidence
 
-Protocol-v2 diagnostics should be interpreted at the RFC boundary:
+Protocol-v3 diagnostics should be interpreted at the RFC boundary:
 
 - stream open proves neutral attachment, not path rank;
 - `PATH_STATUS` sequence and `Available`/`Backup` value prove peer preference,
@@ -330,7 +330,7 @@ different protocol or old result.
 
 ## Current release evidence
 
-The compact, release-facing v0.1.0 evidence is recorded in
+The compact, release-facing v0.1.1 evidence is recorded in
 [`docs/PERFORMANCE.md`](PERFORMANCE.md). It keeps the final runtime guard and
 its exact identity separate from the earlier same-condition
 direct/VMess/Hysteria2/MPTCP reference cohort. It also records TCP and QUIC

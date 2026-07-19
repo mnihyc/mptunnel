@@ -70,6 +70,24 @@ fn send_stream_trims_reinjection_cache_by_ack_subranges() {
 }
 
 #[test]
+fn send_stream_data_ack_frontier_advances_across_incomplete_ack_chunks() {
+    let mut stream = ReliableSendStream::new(StreamId(3), limits());
+    for payload in [b"aaaa", b"bbbb", b"cccc", b"dddd"] {
+        stream
+            .send_data(Bytes::copy_from_slice(payload))
+            .expect("send");
+    }
+
+    // ACK framing completeness controls gap inference, not positive delivery.
+    stream.apply_normalized_ack(&[OffsetRange { start: 8, end: 16 }]);
+    assert_eq!(stream.data_ack_frontier(), 0);
+    stream.apply_normalized_ack(&[OffsetRange { start: 0, end: 4 }]);
+    assert_eq!(stream.data_ack_frontier(), 4);
+    stream.apply_normalized_ack(&[OffsetRange { start: 4, end: 8 }]);
+    assert_eq!(stream.data_ack_frontier(), 16);
+}
+
+#[test]
 fn send_stream_retransmits_ack_range_holes_before_later_inflight() {
     let mut stream = ReliableSendStream::new(StreamId(7), limits());
     for payload in [b"aaaa", b"bbbb", b"cccc", b"dddd"] {

@@ -11,12 +11,11 @@ use crate::protocol::{DatagramFlowId, Frame, SessionId, TargetAddr};
 use crate::runtime::error::RuntimeError;
 use crate::runtime::path::commands::{
     ReliablePathCommand, ReliablePathCommandReceivers, ReliablePathCommandSender,
-    recv_reliable_path_command, reliable_path_command_carrier_credit_bytes,
-    reliable_path_command_channels_with_send_credit, reliable_path_command_pending_bytes,
-    reliable_path_command_writer_run_budget_bytes, reliable_path_command_writer_run_budget_items,
-    reliable_path_command_writer_run_bytes, reliable_path_frame_requires_capacity_command,
-    reliable_path_receivers_closed, try_coalesce_reliable_path_writer_run,
-    try_recv_reliable_path_command,
+    recv_reliable_path_command, reliable_path_command_channels,
+    reliable_path_command_pending_bytes, reliable_path_command_writer_run_budget_bytes,
+    reliable_path_command_writer_run_budget_items, reliable_path_command_writer_run_bytes,
+    reliable_path_frame_requires_capacity_command, reliable_path_receivers_closed,
+    try_coalesce_reliable_path_writer_run, try_recv_reliable_path_command,
 };
 use crate::runtime::path::server_context::ServerPathContext;
 use crate::runtime::path::{
@@ -38,10 +37,10 @@ pub(super) async fn handle_server_udp_datagram_stream(
     context: ServerPathContext,
     stream_context: ServerUdpDatagramStreamContext,
 ) -> Result<(), RuntimeError> {
-    let (commands_tx, mut commands_rx) = reliable_path_command_channels_with_send_credit(
-        udp_path_command_queue(context.mux_limits, context.codec_limits),
-        send.connection.send_credit(),
-    );
+    let (commands_tx, mut commands_rx) = reliable_path_command_channels(udp_path_command_queue(
+        context.mux_limits,
+        context.codec_limits,
+    ));
     let mut send = send;
     let mut carrier_frames = spawn_quic_path_reader(
         recv,
@@ -81,6 +80,18 @@ pub(super) async fn handle_server_udp_datagram_stream(
                         if ttl_ms == 0 {
                             return Err(RuntimeError::Protocol("expired QUIC UDP path datagram received"));
                         }
+                        #[cfg(feature = "lab-diagnostics")]
+                        lab_diagnostic(
+                            "server_udp_datagram_request_received",
+                            format_args!(
+                                "session_id={} flow_id={} datagram_id={} payload_bytes={} ttl_ms={}",
+                                stream_context.session_id.0,
+                                flow_id.0,
+                                datagram_id.0,
+                                payload.len(),
+                                ttl_ms,
+                            ),
+                        );
                         let flow_index = flows
                             .iter()
                             .position(|flow| flow.flow_id() == flow_id)
@@ -88,7 +99,10 @@ pub(super) async fn handle_server_udp_datagram_stream(
                         let flow = flows
                             .get(flow_index)
                             .ok_or(RuntimeError::Protocol("unknown QUIC UDP path datagram flow"))?;
-                        match flow.try_send(ServerDatagramRequest { datagram_id, ttl_ms, payload }) {
+                        match flow
+                            .send(ServerDatagramRequest { datagram_id, ttl_ms, payload })
+                            .await?
+                        {
                             ServerDatagramSendOutcome::Accepted => {
                                 let received = datagram_feedback_range(datagram_id)
                                     .ok_or(RuntimeError::Protocol("datagram feedback range overflow"))?;
@@ -100,6 +114,16 @@ pub(super) async fn handle_server_udp_datagram_stream(
                                     },
                                     context.codec_limits,
                                 ).await?;
+                                #[cfg(feature = "lab-diagnostics")]
+                                lab_diagnostic(
+                                    "server_udp_datagram_feedback_written",
+                                    format_args!(
+                                        "session_id={} flow_id={} datagram_id={}",
+                                        stream_context.session_id.0,
+                                        flow_id.0,
+                                        datagram_id.0,
+                                    ),
+                                );
                             }
                             ServerDatagramSendOutcome::Full => {
                                 eprintln!("warning: QUIC UDP path datagram worker queue full; dropping request");
@@ -110,7 +134,13 @@ pub(super) async fn handle_server_udp_datagram_stream(
                             }
                         }
                     }
-                    Some(Ok(Frame::DatagramFeedback { .. })) => {}
+                    Some(Ok(Frame::DatagramFeedback { flow_id, received })) => {
+                        let flow = flows
+                            .iter()
+                            .find(|flow| flow.flow_id() == flow_id)
+                            .ok_or(RuntimeError::Protocol("unknown QUIC datagram flow feedback"))?;
+                        flow.acknowledge_response(received);
+                    }
                     Some(Ok(Frame::DatagramClose { flow_id })) => {
                         flows.retain(|flow| flow.flow_id() != flow_id);
                         if flows.is_empty() {
@@ -178,7 +208,6 @@ async fn drain_server_udp_datagram_commands(
     let mut sent_bytes = 0usize;
     let mut sent_items = 0usize;
     let mut pending_frame_command_bytes = 0usize;
-    let mut pending_frame_carrier_credit_bytes = 0usize;
 
     loop {
         let Some(command) = next_command
@@ -203,7 +232,6 @@ async fn drain_server_udp_datagram_commands(
                 context.codec_limits,
                 commands,
                 &mut pending_frame_command_bytes,
-                &mut pending_frame_carrier_credit_bytes,
             )
             .await?;
             #[cfg(feature = "lab-diagnostics")]
@@ -224,13 +252,12 @@ async fn drain_server_udp_datagram_commands(
             return Ok(false);
         };
         let pending_bytes = reliable_path_command_pending_bytes(&command);
-        let carrier_credit_bytes = reliable_path_command_carrier_credit_bytes(&command);
         let writer_run_bytes = reliable_path_command_writer_run_bytes(&command);
         let should_close = match command {
             ReliablePathCommand::SendFrame(frame)
                 if reliable_path_frame_requires_capacity_command(&frame) =>
             {
-                commands.release_pending_command_accounting(pending_bytes, carrier_credit_bytes);
+                commands.release_pending_command_bytes(pending_bytes);
                 return Err(RuntimeError::Protocol(
                     "server QUIC datagram writer received capacity data",
                 ));
@@ -242,8 +269,6 @@ async fn drain_server_udp_datagram_commands(
                 pending_frames.push(frame);
                 pending_frame_command_bytes =
                     pending_frame_command_bytes.saturating_add(pending_bytes);
-                pending_frame_carrier_credit_bytes =
-                    pending_frame_carrier_credit_bytes.saturating_add(carrier_credit_bytes);
                 sent_bytes = sent_bytes.saturating_add(writer_run_bytes);
                 sent_items = sent_items.saturating_add(1);
                 if sent_bytes >= byte_budget || sent_items >= item_budget {
@@ -253,7 +278,6 @@ async fn drain_server_udp_datagram_commands(
                         context.codec_limits,
                         commands,
                         &mut pending_frame_command_bytes,
-                        &mut pending_frame_carrier_credit_bytes,
                     )
                     .await?;
                     #[cfg(feature = "lab-diagnostics")]
@@ -276,13 +300,13 @@ async fn drain_server_udp_datagram_commands(
                 continue;
             }
             ReliablePathCommand::SendTcpCapacityProbe(_) => {
-                commands.release_pending_command_accounting(pending_bytes, carrier_credit_bytes);
+                commands.release_pending_command_bytes(pending_bytes);
                 return Err(RuntimeError::Protocol(
                     "server QUIC datagram writer received TCP capacity command",
                 ));
             }
             ReliablePathCommand::ResetAndCloseStream { .. } => {
-                commands.release_pending_command_accounting(pending_bytes, carrier_credit_bytes);
+                commands.release_pending_command_bytes(pending_bytes);
                 return Err(RuntimeError::Protocol(
                     "server QUIC datagram writer received reliable terminal command",
                 ));
@@ -294,14 +318,17 @@ async fn drain_server_udp_datagram_commands(
                     context.codec_limits,
                     commands,
                     &mut pending_frame_command_bytes,
-                    &mut pending_frame_carrier_credit_bytes,
                 )
                 .await?;
                 let _ = udp_path_finish_stream(send);
                 true
             }
             ReliablePathCommand::PrepareConnection { .. }
-            | ReliablePathCommand::OpenStream { .. } => {
+            | ReliablePathCommand::OpenStream { .. }
+            | ReliablePathCommand::OpenDatagramAttachment { .. }
+            | ReliablePathCommand::OpenDatagramFlow { .. }
+            | ReliablePathCommand::SendDatagramFrame { .. }
+            | ReliablePathCommand::CloseDatagramAttachment { .. } => {
                 return Err(RuntimeError::Protocol(
                     "server QUIC UDP datagram stream received client TCP session command",
                 ));
@@ -312,7 +339,7 @@ async fn drain_server_udp_datagram_commands(
                 ));
             }
         };
-        commands.release_pending_command_accounting(pending_bytes, carrier_credit_bytes);
+        commands.release_pending_command_bytes(pending_bytes);
         if should_close {
             #[cfg(feature = "lab-diagnostics")]
             lab_diagnostic(
@@ -339,7 +366,6 @@ async fn drain_server_udp_datagram_commands(
                 context.codec_limits,
                 commands,
                 &mut pending_frame_command_bytes,
-                &mut pending_frame_carrier_credit_bytes,
             )
             .await?;
             #[cfg(feature = "lab-diagnostics")]
@@ -368,13 +394,9 @@ async fn flush_server_udp_datagram_frame_batch(
     codec_limits: crate::protocol::codec::CodecLimits,
     commands: &ReliablePathCommandReceivers,
     pending_frame_command_bytes: &mut usize,
-    pending_frame_carrier_credit_bytes: &mut usize,
 ) -> Result<(), RuntimeError> {
     let result = flush_udp_frame_batch(send, pending_frames, codec_limits).await;
-    commands.release_pending_command_accounting(
-        std::mem::take(pending_frame_command_bytes),
-        std::mem::take(pending_frame_carrier_credit_bytes),
-    );
+    commands.release_pending_command_bytes(std::mem::take(pending_frame_command_bytes));
     result
 }
 
@@ -412,16 +434,7 @@ async fn open_server_udp_datagram_flow(
         .await
     {
         Ok(flow) => flow,
-        Err(failure) if !failure.requires_close() => return Err(failure.into_error()),
-        Err(failure) => {
-            udp_path_write_frame(
-                send,
-                &Frame::DatagramClose { flow_id },
-                context.codec_limits,
-            )
-            .await?;
-            return Err(failure.into_error());
-        }
+        Err(failure) => return Err(failure.into_error()),
     };
     flows.push(flow);
     Ok(())

@@ -385,7 +385,7 @@ async fn repair_waits_for_writer_dequeued_bytes_to_flush() {
 }
 
 #[tokio::test]
-async fn unbound_reinjection_requires_an_idle_tcp_carrier() {
+async fn unbound_reinjection_requires_idle_but_measured_recovery_may_use_busy() {
     let context = client_test_context_with_paths(&[
         "udp://127.0.0.1:10251?srtt-ms=20&rate-mbps=200",
         "tcp://127.0.0.1:10252?srtt-ms=2&rate-mbps=1000",
@@ -442,7 +442,7 @@ async fn unbound_reinjection_requires_an_idle_tcp_carrier() {
         health.tcp[busy.key.index].native_drain_observed = true;
     }
     let frame = data_frame(stream_id, 0, 4096);
-    let mut controller = RequestMultipathController::new(stream_id);
+    let controller = RequestMultipathController::new(stream_id);
     let selected = controller
         .choose_lowest_eta_relay_path(
             &context,
@@ -459,6 +459,7 @@ async fn unbound_reinjection_requires_an_idle_tcp_carrier() {
         "unbound repair must not queue behind native flight on a faster TCP carrier",
     );
 
+    seed_client_bulk_evidence_for_test(&context, busy.key);
     let busy_snapshot = context
         .reliable_path_snapshot(busy.key)
         .expect("busy TCP snapshot");
@@ -466,39 +467,17 @@ async fn unbound_reinjection_requires_an_idle_tcp_carrier() {
         ClientReinjectionOutputIdentity { instance: busy },
         busy_snapshot,
     );
-    assert!(matches!(
-        controller.choose_lowest_eta_relay_path(
+    let selected = controller
+        .choose_lowest_eta_relay_path(
             &context,
             &remotes,
             &frame,
             TrafficClass::Throughput,
             bound_cause,
             &[original],
-        ),
-        Err(RuntimeError::SenderServiceBlocked)
-    ));
-
-    controller.record_original_frame_for_test(busy, &frame);
-    {
-        let mut health = context.health().lock().expect("path health lock");
-        health.tcp[busy.key.index].carrier_bytes_in_flight = 0;
-        health.tcp[busy.key.index].carrier_queue_bytes = 0;
-        health.tcp[busy.key.index].native_drain_observed = false;
-    }
-    assert!(
-        matches!(
-            controller.choose_lowest_eta_relay_path(
-                &context,
-                &remotes,
-                &frame,
-                TrafficClass::Throughput,
-                bound_cause,
-                &[original],
-            ),
-            Err(RuntimeError::SenderServiceBlocked)
-        ),
-        "partial native TCP shape must use exact product flight instead of treating missing drain counters as zero"
-    );
+        )
+        .expect("the measured recovery decision admits bounded repair on a busy carrier");
+    assert_eq!(remotes.paths[selected].instance(), busy);
 }
 
 #[tokio::test]

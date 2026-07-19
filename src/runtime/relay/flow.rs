@@ -12,7 +12,7 @@ pub(in crate::runtime) struct ReliableRelayFlowSignals {
     sent_offset: u64,
     received_offset: u64,
     queued_unsent_bytes: usize,
-    data_ack_outstanding_bytes: usize,
+    pending_delivery_bytes: usize,
 }
 
 impl ReliableRelayFlowSignals {
@@ -21,20 +21,20 @@ impl ReliableRelayFlowSignals {
             sent_offset,
             received_offset,
             queued_unsent_bytes: 0,
-            data_ack_outstanding_bytes: 0,
+            pending_delivery_bytes: 0,
         }
     }
 
-    /// Unsent queue bytes are current buffered demand. Data-ACK-outstanding
-    /// flight only preserves demand already established by admitted bytes;
-    /// flight alone never promotes throughput.
+    /// Unsent queue bytes are buffered demand. Unacknowledged or reordered
+    /// bytes preserve established demand while delivery is still in progress;
+    /// pending delivery alone never promotes throughput.
     pub(in crate::runtime) fn with_product_work(
         mut self,
         queued_unsent_bytes: usize,
-        data_ack_outstanding_bytes: usize,
+        pending_delivery_bytes: usize,
     ) -> Self {
         self.queued_unsent_bytes = queued_unsent_bytes;
-        self.data_ack_outstanding_bytes = data_ack_outstanding_bytes;
+        self.pending_delivery_bytes = pending_delivery_bytes;
         self
     }
 
@@ -116,8 +116,7 @@ impl ReliableRelayFlowDemandTracker {
         // epoch; queued product work shows current buffered demand while
         // transport or data-level credit catches up.
         let has_queued_unsent_work = signals.queued_unsent_bytes > 0;
-        let has_active_product_work =
-            has_queued_unsent_work || signals.data_ack_outstanding_bytes > 0;
+        let has_active_product_work = has_queued_unsent_work || signals.pending_delivery_bytes > 0;
         let idle_gap = product_delta == 0
             && !has_active_product_work
             && now.duration_since(self.last_progress_at)

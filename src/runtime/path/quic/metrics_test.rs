@@ -1,6 +1,59 @@
 use super::super::estimator_test_support::*;
 use super::*;
 
+fn quic_metrics_for_polling() -> UdpPathMetrics {
+    UdpPathMetrics {
+        direction: PathMetricDirection::ServerToClient,
+        srtt: Duration::from_millis(180),
+        rttvar: Duration::from_millis(45),
+        rtt_observed: true,
+        delivery_rate_bps: 500_000_000.0,
+        pacing_rate_bps: 500_000_000.0,
+        inflight_hi: 4 * 1024 * 1024,
+        bytes_in_flight: 0,
+        pending_bytes: 0,
+        loss_ppm: None,
+        ecn_ppm: None,
+        app_limited: true,
+        ack_derived_data_seen: false,
+        delivery_sample_count: 0,
+        delivery_sample_bytes: 0,
+        last_delivery_sample_at: None,
+        bulk_proof_expires_at: None,
+        latest_delivery_sample_bytes: 0,
+        latest_delivery_sample_count: 0,
+        latest_carrier_ack_elapsed: None,
+        latest_rate_sample_elapsed: None,
+        #[cfg(feature = "lab-diagnostics")]
+        ack_poll: QuicAckPollDiagnostics::default(),
+    }
+}
+
+#[test]
+fn idle_app_limited_quic_path_polls_on_transport_pto() {
+    let metrics = quic_metrics_for_polling();
+    assert_eq!(
+        quic_path_metrics_poll_interval(metrics),
+        transport_pto_from_ms(180.0, 45.0)
+    );
+}
+
+#[test]
+fn active_app_limited_quic_path_polls_on_ack_clock() {
+    let expected = Duration::from_millis(90);
+    assert_eq!(
+        quic_path_metrics_ack_interval(quic_metrics_for_polling()),
+        expected
+    );
+    let mut pending = quic_metrics_for_polling();
+    pending.pending_bytes = 64 * 1024;
+    assert_eq!(quic_path_metrics_poll_interval(pending), expected);
+
+    let mut in_flight = quic_metrics_for_polling();
+    in_flight.bytes_in_flight = 64 * 1024;
+    assert_eq!(quic_path_metrics_poll_interval(in_flight), expected);
+}
+
 #[test]
 fn quic_product_data_accepted_by_quinn_counts_as_queue_until_ack() {
     let mut tracker = UdpPathMetricTracker::default();

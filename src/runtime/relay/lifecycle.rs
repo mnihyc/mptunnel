@@ -366,7 +366,7 @@ pub(super) fn spawn_reliable_relay_additional_path_opens(
         reliable_relay_additional_path_open_payload_bytes(send_stream, context.mux_limits);
     let candidates =
         reliable_relay_additional_path_open_candidates(context, remotes, lane, payload_bytes);
-    let candidates = reliable_relay_bounded_path_open_candidates(candidates, pending);
+    let candidates = reliable_relay_available_path_open_candidates(candidates, pending);
     if candidates.is_empty() {
         return false;
     }
@@ -579,20 +579,18 @@ fn prefer_current_underlay_additional_path_open_candidate(
     candidates
 }
 
-fn reliable_relay_bounded_path_open_candidates(
+fn reliable_relay_available_path_open_candidates(
     candidates: Vec<RelayPathKey>,
     pending: &HashMap<RelayPathKey, RelayAdditionalPathOpenTask>,
 ) -> Vec<RelayPathKey> {
     let mut selected = Vec::new();
-    let mut selected_underlay = None;
     for candidate in candidates {
         if pending.contains_key(&candidate) || selected.contains(&candidate) {
             continue;
         }
-        let underlay = *selected_underlay.get_or_insert(candidate.underlay);
-        if candidate.underlay != underlay {
-            continue;
-        }
+        // TCP and QUIC carrier actors own independent stream-open handshakes.
+        // Once bulk demand is established, starting both transports together
+        // avoids an artificial cross-transport round trip.
         selected.push(candidate);
     }
     selected
@@ -607,7 +605,7 @@ fn reliable_relay_recovery_path_open_candidates(
         .into_iter()
         .filter(|key| !recovery_excluded_paths.contains(key))
         .collect::<Vec<_>>();
-    let mut candidates = reliable_relay_bounded_path_open_candidates(candidates, pending);
+    let mut candidates = reliable_relay_available_path_open_candidates(candidates, pending);
     candidates.truncate(1);
     candidates
 }

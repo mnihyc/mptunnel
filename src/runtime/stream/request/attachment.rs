@@ -9,7 +9,7 @@ use crate::model::capacity::reliable_relay_buffer_len;
 use crate::model::path::next_carrier_path_instance_id;
 use crate::model::path::{CarrierPathInstanceId, RelayPathInstance, RelayPathKey};
 use crate::mux::MuxLimits;
-use crate::protocol::{Frame, StreamId, UnderlayProtocol};
+use crate::protocol::{Frame, ResetReason, StreamId, UnderlayProtocol};
 use crate::runtime::error::RuntimeError;
 use crate::runtime::path::{ClientPathContext, RelayPathLoadLease};
 use crate::runtime::stream::{ReliablePathStream, ReliablePathStreamHandle};
@@ -402,11 +402,6 @@ impl ReliableRelayRemoteSet {
         tokio::spawn(async move {
             let mut product_terminal_received = false;
             while let Some(frame) = frames.recv().await {
-                if product_terminal_received
-                    && matches!(&frame, Err(RuntimeError::ReliablePathSessionClosed))
-                {
-                    return;
-                }
                 product_terminal_received |= matches!(
                     &frame,
                     Ok(Frame::StreamFin { .. } | Frame::StreamReset { .. })
@@ -467,6 +462,17 @@ impl ReliableRelayRemoteSet {
             path.stream.send_detach().await;
             path.stream.close().await;
         }
+    }
+
+    /// Product endpoint failure is terminal across every attachment. A reset
+    /// prevents retention and reinjection while carrier-only failures continue
+    /// to use detach and preserve the logical stream for path recovery.
+    pub(in crate::runtime) async fn reset_all(&mut self, reason: ResetReason) {
+        let paths = self.take_paths_for_close();
+        futures::future::join_all(paths.into_iter().map(|path| async move {
+            path.stream.reset_and_close(reason).await;
+        }))
+        .await;
     }
 
     /// Successful retirement follows ordered FIN work on every carrier.
@@ -543,3 +549,7 @@ impl ReliableRelayRemoteSet {
         path.load_lease = Some(lease);
     }
 }
+
+#[cfg(test)]
+#[path = "attachment_test.rs"]
+mod tests;

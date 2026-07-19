@@ -1,6 +1,7 @@
-use super::{ClientTcpWriteFrameRoute, try_route_client_tcp_stream_frame_during_write};
-use crate::protocol::{CloseReason, Frame, OffsetRange, StreamId};
+use super::{ClientTcpWriteFrameRoute, try_route_client_tcp_frame_during_write};
+use crate::protocol::{CloseReason, Frame, OffsetRange, ResetReason, StreamId};
 use crate::runtime::path::commands::ClientTcpOpenAttemptId;
+use crate::runtime::path::tcp::client_datagram::ClientTcpDatagramState;
 use crate::runtime::path::tcp::client_stream::ClientTcpPathStreamState;
 use crate::runtime::recent_ids::RecentIdCache;
 use bytes::Bytes;
@@ -20,6 +21,7 @@ fn tcp_write_interlock_routes_ready_feedback_and_stops_at_backpressure() {
         },
     )]);
     let mut closed_streams = RecentIdCache::new(4);
+    let mut datagrams = ClientTcpDatagramState::new(4, 4);
     let ack = Frame::StreamAck {
         stream_id,
         complete: false,
@@ -27,12 +29,13 @@ fn tcp_write_interlock_routes_ready_feedback_and_stops_at_backpressure() {
     };
 
     assert!(matches!(
-        try_route_client_tcp_stream_frame_during_write(
+        try_route_client_tcp_frame_during_write(
             ack.clone(),
             &mut streams,
             &mut closed_streams,
+            &mut datagrams,
         ),
-        ClientTcpWriteFrameRoute::Routed
+        Ok(ClientTcpWriteFrameRoute::Routed)
     ));
     assert!(matches!(
         frame_rx.try_recv().expect("routed ACK"),
@@ -51,22 +54,26 @@ fn tcp_write_interlock_routes_ready_feedback_and_stops_at_backpressure() {
         payload: Bytes::from_static(b"response"),
     };
     assert!(matches!(
-        try_route_client_tcp_stream_frame_during_write(
+        try_route_client_tcp_frame_during_write(
             response.clone(),
             &mut streams,
             &mut closed_streams,
+            &mut datagrams,
         ),
-        ClientTcpWriteFrameRoute::Barrier(frame) if frame == response
+        Ok(ClientTcpWriteFrameRoute::Barrier(frame)) if frame == response
     ));
     assert!(matches!(
-        try_route_client_tcp_stream_frame_during_write(
+        try_route_client_tcp_frame_during_write(
             Frame::SessionClose {
                 reason: CloseReason::Normal,
             },
             &mut streams,
             &mut closed_streams,
+            &mut datagrams,
         ),
-        ClientTcpWriteFrameRoute::Barrier(Frame::SessionClose { .. })
+        Ok(ClientTcpWriteFrameRoute::Barrier(
+            Frame::SessionClose { .. }
+        ))
     ));
 
     assert!(matches!(
@@ -78,16 +85,60 @@ fn tcp_write_interlock_routes_ready_feedback_and_stops_at_backpressure() {
         final_offset: 8,
     };
     assert!(matches!(
-        try_route_client_tcp_stream_frame_during_write(
+        try_route_client_tcp_frame_during_write(
             fin.clone(),
             &mut streams,
             &mut closed_streams,
+            &mut datagrams,
         ),
-        ClientTcpWriteFrameRoute::Routed
+        Ok(ClientTcpWriteFrameRoute::Routed)
     ));
     assert!(matches!(
         frame_rx.try_recv().expect("routed FIN"),
         Ok(frame) if frame == fin
     ));
+    assert!(
+        streams.contains_key(&stream_id),
+        "FIN must not retire the route needed by final-offset repair"
+    );
+    assert!(!closed_streams.contains(&stream_id));
+
+    let repair = Frame::StreamData {
+        stream_id,
+        offset: 4,
+        payload: Bytes::from_static(b"tail"),
+    };
+    assert!(matches!(
+        try_route_client_tcp_frame_during_write(
+            repair.clone(),
+            &mut streams,
+            &mut closed_streams,
+            &mut datagrams,
+        ),
+        Ok(ClientTcpWriteFrameRoute::Routed)
+    ));
+    assert!(matches!(
+        frame_rx.try_recv().expect("post-FIN repair"),
+        Ok(frame) if frame == repair
+    ));
+
+    let reset = Frame::StreamReset {
+        stream_id,
+        reason: ResetReason::RemoteClosed,
+    };
+    assert!(matches!(
+        try_route_client_tcp_frame_during_write(
+            reset.clone(),
+            &mut streams,
+            &mut closed_streams,
+            &mut datagrams,
+        ),
+        Ok(ClientTcpWriteFrameRoute::Routed)
+    ));
+    assert!(matches!(
+        frame_rx.try_recv().expect("routed reset"),
+        Ok(frame) if frame == reset
+    ));
     assert!(!streams.contains_key(&stream_id));
+    assert!(closed_streams.contains(&stream_id));
 }

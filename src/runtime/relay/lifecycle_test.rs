@@ -1,7 +1,9 @@
 use super::*;
-use crate::protocol::PathId;
+use crate::config::{ResourceLimits, SecurityConfig, SharedSecret};
+use crate::protocol::{PathId, TargetAddr};
 use crate::runtime::path::commands::{ReliablePathCommandSender, reliable_path_command_channels};
 use crate::runtime::stream::{ReliablePathStream, ReliablePathStreamOutput};
+use crate::transport::PathSpec;
 use std::time::Duration;
 
 fn test_stream(
@@ -24,7 +26,7 @@ fn test_stream(
             commands,
             MuxLimits::default(),
         ),
-        frames: frames_rx,
+        frames: frames_rx.into(),
     }
 }
 
@@ -49,6 +51,29 @@ fn pending_fin_waits_for_the_ordered_sender_queue() {
     assert!(reliable_relay_can_send_pending_fin(true, true));
     assert!(!reliable_relay_can_send_pending_fin(true, false));
     assert!(!reliable_relay_can_send_pending_fin(false, true));
+}
+
+#[test]
+fn bulk_path_opens_do_not_serialize_tcp_and_quic() {
+    let candidates = vec![
+        RelayPathKey {
+            underlay: UnderlayProtocol::Tcp,
+            index: 1,
+        },
+        RelayPathKey {
+            underlay: UnderlayProtocol::Udp,
+            index: 0,
+        },
+        RelayPathKey {
+            underlay: UnderlayProtocol::Udp,
+            index: 1,
+        },
+    ];
+
+    assert_eq!(
+        reliable_relay_available_path_open_candidates(candidates.clone(), &HashMap::new()),
+        candidates,
+    );
 }
 
 #[test]
@@ -191,6 +216,60 @@ async fn product_stall_on_a_sole_carrier_requests_an_alternative() {
     assert!(!reliable_relay_product_stall_preserves_attached_path_set(
         &remotes
     ));
+}
+
+#[tokio::test]
+async fn product_stall_recovery_open_is_owned_by_a_pending_task() {
+    let security = SecurityConfig::encrypted(
+        SharedSecret::new(b"0123456789abcdef0123456789abcdef".to_vec()).expect("secret"),
+    );
+    let context = ClientPathContext::new(
+        [
+            "tcp://127.0.0.1:11171",
+            "udp://127.0.0.1:11172?srtt-ms=180&rate-mbps=500",
+        ]
+        .into_iter()
+        .map(|path| path.parse::<PathSpec>().expect("test path"))
+        .collect(),
+        security,
+        ResourceLimits::default(),
+    )
+    .expect("client context");
+    let (commands, _receivers) = reliable_path_command_channels(1);
+    let opened = OpenedRemoteStream::pending(
+        test_stream(
+            StreamId(2),
+            UnderlayProtocol::Tcp,
+            0,
+            commands,
+            TrafficClass::Latency,
+        ),
+        0,
+    );
+    let remotes = ReliableRelayRemoteSet::new(opened, 4);
+    let send_stream = ReliableSendStream::new(StreamId(2), context.mux_limits);
+    let spec = ReliableRelayOpenSpec {
+        target: TargetAddr::Ip("127.0.0.1:9".parse().expect("test target")),
+    };
+    let mut pending = HashMap::new();
+    let (result_tx, _result_rx) = mpsc::channel(1);
+
+    assert!(spawn_reliable_relay_recovery_path_open(
+        &context,
+        &spec,
+        TrafficClass::Latency,
+        &remotes,
+        &send_stream,
+        &HashSet::new(),
+        &mut pending,
+        &result_tx,
+    ));
+    assert_eq!(pending.len(), 1);
+    assert!(pending.contains_key(&RelayPathKey {
+        underlay: UnderlayProtocol::Udp,
+        index: 0,
+    }));
+    cancel_pending_additional_path_opens(StreamId(2), &mut pending);
 }
 
 #[test]

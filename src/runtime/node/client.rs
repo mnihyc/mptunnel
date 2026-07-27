@@ -8,8 +8,9 @@ use crate::platform::{PacketDeviceConfig, PacketDeviceProvider};
 use crate::protocol::UnderlayProtocol;
 use crate::runtime::error::RuntimeError;
 use crate::runtime::ingress_runtime::{
-    probe_tcp_client_path, probe_udp_client_path, run_http_connect_client_ingress,
-    run_socks5_client_ingress, run_tcp_forward_client_ingress, run_udp_forward_client_ingress,
+    probe_tcp_client_path, probe_udp_client_path, spawn_http_connect_client_ingress,
+    spawn_socks5_client_ingress, spawn_tcp_forward_client_ingress,
+    spawn_udp_forward_client_ingress,
 };
 use crate::runtime::path::{ClientPathContext, ClientPathRuntimeOptions};
 use crate::runtime::product_policy::ClientIngressRouter;
@@ -35,14 +36,14 @@ pub(super) fn new_path_context(
     )
 }
 
-pub(super) fn spawn_ingresses(
+pub(super) async fn spawn_ingresses(
     ingresses: Vec<LocalIngressConfig>,
     mux_limits: MuxLimits,
     router: ClientIngressRouter,
     packet_devices: Arc<dyn PacketDeviceProvider>,
     readiness: &RuntimeReadinessBarrier,
     tasks: &mut tokio::task::JoinSet<Result<(), RuntimeError>>,
-) {
+) -> Result<(), RuntimeError> {
     for ingress in ingresses {
         let router = router.clone();
         let inbound = ingress
@@ -54,7 +55,7 @@ pub(super) fn spawn_ingresses(
             .and_then(|tag| {
                 crate::product::InboundId::parse(tag)
                     .map_err(|_| RuntimeError::Protocol("local inbound has an invalid routing tag"))
-            });
+            })?;
         match ingress.config {
             IngressConfig::Socks5 {
                 listen,
@@ -62,18 +63,17 @@ pub(super) fn spawn_ingresses(
                 admission,
             } => {
                 let ingress_readiness = readiness.require("SOCKS5 ingress listeners");
-                tasks.spawn(async move {
-                    run_socks5_client_ingress(
-                        listen,
-                        mux_limits,
-                        router,
-                        inbound?,
-                        proxy_auth,
-                        admission,
-                        ingress_readiness,
-                    )
-                    .await
-                });
+                spawn_socks5_client_ingress(
+                    listen,
+                    mux_limits,
+                    router,
+                    inbound,
+                    proxy_auth,
+                    admission,
+                    ingress_readiness,
+                    tasks,
+                )
+                .await?;
             }
             IngressConfig::HttpConnect {
                 listen,
@@ -81,37 +81,33 @@ pub(super) fn spawn_ingresses(
                 admission,
             } => {
                 let ingress_readiness = readiness.require("HTTP CONNECT ingress listeners");
-                tasks.spawn(async move {
-                    run_http_connect_client_ingress(
-                        listen,
-                        router,
-                        inbound?,
-                        proxy_auth,
-                        admission,
-                        ingress_readiness,
-                    )
-                    .await
-                });
+                spawn_http_connect_client_ingress(
+                    listen,
+                    router,
+                    inbound,
+                    proxy_auth,
+                    admission,
+                    ingress_readiness,
+                    tasks,
+                )
+                .await?;
             }
             IngressConfig::TcpForward(config) => {
                 let ingress_readiness = readiness.require("TCP port-forward ingress listeners");
-                tasks.spawn(async move {
-                    run_tcp_forward_client_ingress(config, router, inbound?, ingress_readiness)
-                        .await
-                });
+                spawn_tcp_forward_client_ingress(config, router, inbound, ingress_readiness, tasks)
+                    .await?;
             }
             IngressConfig::UdpForward(config) => {
                 let ingress_readiness = readiness.require("UDP port-forward ingress listeners");
-                tasks.spawn(async move {
-                    run_udp_forward_client_ingress(
-                        config,
-                        mux_limits,
-                        router,
-                        inbound?,
-                        ingress_readiness,
-                    )
-                    .await
-                });
+                spawn_udp_forward_client_ingress(
+                    config,
+                    mux_limits,
+                    router,
+                    inbound,
+                    ingress_readiness,
+                    tasks,
+                )
+                .await?;
             }
             IngressConfig::TunL4(tun) => {
                 let packet_devices = packet_devices.clone();
@@ -128,12 +124,13 @@ pub(super) fn spawn_ingresses(
                             mtu: tun.mtu,
                         })
                         .map_err(RuntimeError::TunDevice)?;
-                    run_tun_l4_client(tun, mux_limits, router, inbound?, device, ingress_readiness)
+                    run_tun_l4_client(tun, mux_limits, router, inbound, device, ingress_readiness)
                         .await
                 });
             }
         }
     }
+    Ok(())
 }
 
 pub(super) fn spawn_path_probe_service(

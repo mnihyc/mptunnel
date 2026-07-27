@@ -115,7 +115,7 @@ pub(in crate::runtime) async fn run(
     if management.http_enabled() {
         let management_readiness = readiness.require("management listeners");
         let product_telemetry = paths.telemetry.clone();
-        spawn_node_management_services(
+        if let Err(error) = spawn_node_management_services(
             management,
             Vec::new(),
             vec![paths],
@@ -128,7 +128,12 @@ pub(in crate::runtime) async fn run(
             generation.clone(),
             management_readiness,
             &mut services,
-        );
+        )
+        .await
+        {
+            super::retire_runtime_services(&mut services).await;
+            return Err(error);
+        }
     }
     readiness.seal();
     let result = super::supervise_runtime_services(

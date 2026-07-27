@@ -39,7 +39,7 @@ const SAMPLE_INTERVAL: Duration = Duration::from_secs(1);
     clippy::too_many_arguments,
     reason = "the generation composition boundary explicitly transfers each independent Product owner"
 )]
-pub(super) fn spawn_node_management_services(
+pub(super) async fn spawn_node_management_services(
     config: ManagementConfig,
     clients: Vec<ClientPathContext>,
     servers: Vec<ServerPathContext>,
@@ -52,7 +52,7 @@ pub(super) fn spawn_node_management_services(
     generation: RuntimeGenerationControl,
     readiness: RequiredServiceReadiness,
     services: &mut tokio::task::JoinSet<Result<(), RuntimeError>>,
-) {
+) -> Result<(), RuntimeError> {
     let state = ManagementState::new("node");
     let target = ManagementTarget {
         clients,
@@ -66,18 +66,19 @@ pub(super) fn spawn_node_management_services(
         product_admission,
         generation,
     };
-    spawn_management_services(config, target, readiness, services);
+    spawn_management_services(config, target, readiness, services).await
 }
 
-fn spawn_management_services(
+async fn spawn_management_services(
     config: ManagementConfig,
     target: ManagementTarget,
     readiness: RequiredServiceReadiness,
     services: &mut tokio::task::JoinSet<Result<(), RuntimeError>>,
-) {
+) -> Result<(), RuntimeError> {
     target.refresh_sample_snapshot();
-    services.spawn(run_sampler(target.clone()));
-    services.spawn(http::run_listeners(config, target, readiness));
+    http::spawn_listeners(config, target.clone(), readiness, services).await?;
+    services.spawn(run_sampler(target));
+    Ok(())
 }
 
 async fn run_sampler(target: ManagementTarget) -> Result<(), RuntimeError> {

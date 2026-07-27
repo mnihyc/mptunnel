@@ -26,7 +26,12 @@ use support::{
 const OPERATOR_TOKEN: &str = "daily-use-operator-token";
 const PROCESS_START_TIMEOUT: Duration = Duration::from_secs(10);
 
-fn reject_runtime_config(socks: SocketAddr, management: SocketAddr, generation: u64) -> String {
+fn reject_runtime_config(socks: &[SocketAddr], management: SocketAddr, generation: u64) -> String {
+    let socks = socks
+        .iter()
+        .map(|address| format!("\"{address}\""))
+        .collect::<Vec<_>>()
+        .join(", ");
     format!(
         r#"
 log_level = "warn"
@@ -40,7 +45,7 @@ allow_peer_diagnostics = false
 [[inbounds]]
 tag = "local-socks"
 protocol = "socks5"
-listen = ["{socks}"]
+listen = [{socks}]
 
 [routing]
 generation = {generation}
@@ -68,11 +73,10 @@ fn packaged_no_args_restart_loads_the_edited_default_config() {
     let directory = TestDirectory::new("default-config-restart");
     directory.write("operator-token.key", OPERATOR_TOKEN);
     let original_socks = unused_loopback_addr();
-    let replacement_socks = unused_loopback_addr();
     let management = unused_loopback_addr();
     let config_path = directory.write(
         "config.toml",
-        &reject_runtime_config(original_socks, management, 1),
+        &reject_runtime_config(&[original_socks], management, 1),
     );
 
     let mut first = MptunnelProcess::spawn_without_args(
@@ -87,9 +91,13 @@ fn packaged_no_args_restart_loads_the_edited_default_config() {
     );
     first.stop();
 
+    // Allocate the future listener only after the first process has stopped.
+    // On Darwin, a released port-0 reservation can otherwise be selected as
+    // an ephemeral source port by the readiness probe before the restart.
+    let replacement_socks = unused_loopback_addr();
     fs::write(
         &config_path,
-        reject_runtime_config(replacement_socks, management, 2),
+        reject_runtime_config(&[replacement_socks], management, 2),
     )
     .expect("edit default config between packaged process runs");
 
@@ -122,11 +130,15 @@ fn packaged_management_api_validates_applies_persists_and_reloads_one_generation
     let _network = network_test_guard();
     let directory = TestDirectory::new("config-api");
     directory.write("operator-token.key", OPERATOR_TOKEN);
-    let original_socks = unused_loopback_addr();
-    let replacement_socks = unused_loopback_addr();
+    let retained_socks = unused_loopback_addr();
+    let retired_socks = unused_loopback_addr();
     let management = unused_loopback_addr();
-    let original = reject_runtime_config(original_socks, management, 1);
-    let candidate = reject_runtime_config(replacement_socks, management, 2);
+    let original = reject_runtime_config(&[retained_socks, retired_socks], management, 1);
+    let candidate = reject_runtime_config(&[retained_socks], management, 2).replacen(
+        "dashboard = false",
+        "dashboard = true",
+        1,
+    );
     let config_path = directory.write("config.toml", &original);
     assert_check_config_ok(&config_path);
 
@@ -147,6 +159,18 @@ fn packaged_management_api_validates_applies_persists_and_reloads_one_generation
         management,
         OPERATOR_TOKEN,
         PROCESS_START_TIMEOUT,
+    );
+    wait_for_tcp(
+        &mut process,
+        retained_socks,
+        PROCESS_START_TIMEOUT,
+        "retained SOCKS5 listener",
+    );
+    wait_for_tcp(
+        &mut process,
+        retired_socks,
+        PROCESS_START_TIMEOUT,
+        "pre-reload SOCKS5 listener",
     );
 
     let unauthorized_health = http_request(management, "GET", "/api/v1/health", None, &[], &[])
@@ -312,24 +336,29 @@ fn packaged_management_api_validates_applies_persists_and_reloads_one_generation
 
     wait_for_tcp(
         &mut process,
-        replacement_socks,
+        retained_socks,
         PROCESS_START_TIMEOUT,
-        "replacement SOCKS5 listener",
+        "reloaded SOCKS5 listener",
     );
     wait_for_tcp_closed(
         &mut process,
-        original_socks,
+        retired_socks,
         PROCESS_START_TIMEOUT,
-        "original SOCKS5 listener",
+        "retired SOCKS5 listener",
     );
-    let (_stream, reply) = socks5_connect(
-        replacement_socks,
-        SocksTarget::Domain("blocked.example", 443),
-    )
-    .expect("reloaded SOCKS5 reject response");
+    let (_stream, reply) =
+        socks5_connect(retained_socks, SocksTarget::Domain("blocked.example", 443))
+            .expect("reloaded SOCKS5 reject response");
     assert_eq!(
         reply, 0x02,
         "reject route must return connection-not-allowed"
+    );
+    let dashboard =
+        http_request(management, "GET", "/", None, &[], &[]).expect("reloaded dashboard response");
+    assert_eq!(dashboard.status, 200);
+    assert!(
+        String::from_utf8_lossy(&dashboard.body).contains("<title>mptunnel dashboard</title>"),
+        "candidate dashboard setting must become observable after activation"
     );
     assert_eq!(
         fs::read_to_string(&config_path).expect("persisted canonical config"),

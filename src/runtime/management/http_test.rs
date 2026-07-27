@@ -186,9 +186,16 @@ async fn management_bind_failure_fails_the_startup_barrier() {
         allow_peer_diagnostics: false,
     };
 
-    run_listeners(config, health_target(generation.clone()), readiness)
-        .await
-        .expect_err("occupied listener must fail");
+    let mut services = tokio::task::JoinSet::new();
+    spawn_listeners(
+        config,
+        health_target(generation.clone()),
+        readiness,
+        &mut services,
+    )
+    .await
+    .expect_err("occupied listener must fail");
+    assert!(services.is_empty());
     assert_eq!(generation.status().phase, RuntimeGenerationPhase::Failed);
 }
 

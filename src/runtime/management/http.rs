@@ -46,46 +46,36 @@ struct HttpSettings {
     dashboard: bool,
 }
 
-pub(super) async fn run_listeners(
+pub(super) async fn spawn_listeners(
     config: ManagementConfig,
     target: ManagementTarget,
     readiness: RequiredServiceReadiness,
+    services: &mut tokio::task::JoinSet<Result<(), RuntimeError>>,
 ) -> Result<(), RuntimeError> {
     let settings = Arc::new(HttpSettings {
         token: config.token,
         dashboard: config.dashboard,
     });
     let capacity = Arc::new(Semaphore::new(CONNECTION_LIMIT));
-    let mut listeners = tokio::task::JoinSet::new();
+    let mut bound = Vec::with_capacity(config.listen.len());
     for listen in config.listen {
-        let listener = TcpListener::bind(listen).await?;
-        listeners.spawn(run_listener(
+        bound.push(TcpListener::bind(listen).await?);
+    }
+    if bound.is_empty() {
+        return Err(RuntimeError::Protocol(
+            "management API has no listen addresses",
+        ));
+    }
+    for listener in bound {
+        services.spawn(run_listener(
             listener,
             target.clone(),
             settings.clone(),
             capacity.clone(),
         ));
     }
-    if listeners.is_empty() {
-        return Err(RuntimeError::Protocol(
-            "management API has no listen addresses",
-        ));
-    }
     readiness.ready();
-    let result = if let Some(result) = listeners.join_next().await {
-        match result {
-            Ok(Ok(())) => Err(RuntimeError::Protocol("management listener exited")),
-            Ok(Err(err)) => Err(err),
-            Err(err) => Err(RuntimeError::TaskJoin(err)),
-        }
-    } else {
-        Err(RuntimeError::Protocol(
-            "management API has no listen addresses",
-        ))
-    };
-    listeners.abort_all();
-    while listeners.join_next().await.is_some() {}
-    result
+    Ok(())
 }
 
 async fn run_listener(

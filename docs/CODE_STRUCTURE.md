@@ -132,6 +132,13 @@ plus peer-request selection. `telemetry` owns exact logical product counters.
 `peer_status` owns only request correlation; TCP and QUIC carrier actors
 keep their independent control stream and writer lifetimes.
 
+Management and local-ingress listener futures remain direct children of their
+generation service. Do not move listening sockets into a nested spawned task:
+the generation supervisor's completed join is the exact socket-retirement
+boundary before a replacement generation binds. Accepted connections remain
+independent bounded tasks so listener ownership does not serialize data-plane
+work.
+
 DNS has exactly two layers: `src/product/dns.rs` compiles immutable tagged
 policy and `src/dns.rs` owns generation-scoped runtime state and sockets.
 Outbounds may inject a proved direct/bind DNS connector, but must not create a

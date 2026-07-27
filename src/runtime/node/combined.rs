@@ -136,14 +136,19 @@ pub(super) async fn run(
             "node local inbounds are missing Product policy",
         ))?;
         let router = ClientIngressRouter::new(policy, outbound_registry.clone())?;
-        client::spawn_ingresses(
+        if let Err(error) = client::spawn_ingresses(
             local_ingresses,
             resources.into(),
             router,
             packet_devices.clone(),
             &readiness,
             &mut services,
-        );
+        )
+        .await
+        {
+            super::retire_runtime_services(&mut services).await;
+            return Err(error);
+        }
     }
 
     let mut server_contexts = Vec::with_capacity(servers.len());
@@ -213,7 +218,7 @@ pub(super) async fn run(
 
     if management.http_enabled() {
         let management_readiness = readiness.require("management listeners");
-        spawn_node_management_services(
+        if let Err(error) = spawn_node_management_services(
             management,
             client_contexts,
             server_contexts,
@@ -226,7 +231,12 @@ pub(super) async fn run(
             generation.clone(),
             management_readiness,
             &mut services,
-        );
+        )
+        .await
+        {
+            super::retire_runtime_services(&mut services).await;
+            return Err(error);
+        }
     }
 
     if services.is_empty() {

@@ -143,7 +143,11 @@ where
     }
 }
 
-pub(super) async fn run_socks5_client_ingress(
+#[allow(
+    clippy::too_many_arguments,
+    reason = "the listener composition boundary transfers each independent Product owner"
+)]
+pub(super) async fn spawn_socks5_client_ingress(
     listen: Vec<SocketAddr>,
     mux_limits: MuxLimits,
     router: ClientIngressRouter,
@@ -151,6 +155,7 @@ pub(super) async fn run_socks5_client_ingress(
     proxy_auth: ProxyAuthConfig,
     admission: LocalIngressAdmissionConfig,
     readiness: RequiredServiceReadiness,
+    services: &mut tokio::task::JoinSet<Result<(), RuntimeError>>,
 ) -> Result<(), RuntimeError> {
     let mut bound = Vec::with_capacity(listen.len());
     for addr in listen {
@@ -161,20 +166,19 @@ pub(super) async fn run_socks5_client_ingress(
             "SOCKS5 ingress has no listener tasks",
         ));
     }
-    readiness.ready();
     let admission = LocalIngressAdmission::new(admission);
-    let mut listeners = tokio::task::JoinSet::new();
     for listener in bound {
         let router = router.clone();
         let inbound = inbound.clone();
         let proxy_auth = proxy_auth.clone();
         let admission = admission.clone();
-        listeners.spawn(async move {
+        services.spawn(async move {
             run_socks5_client_listener(listener, mux_limits, router, inbound, proxy_auth, admission)
                 .await
         });
     }
-    wait_for_ingress_listener_failure(listeners, "SOCKS5").await
+    readiness.ready();
+    Ok(())
 }
 
 async fn run_socks5_client_listener(
@@ -239,13 +243,14 @@ async fn run_socks5_client_listener(
     }
 }
 
-pub(super) async fn run_http_connect_client_ingress(
+pub(super) async fn spawn_http_connect_client_ingress(
     listen: Vec<SocketAddr>,
     router: ClientIngressRouter,
     inbound: InboundId,
     proxy_auth: ProxyAuthConfig,
     admission: LocalIngressAdmissionConfig,
     readiness: RequiredServiceReadiness,
+    services: &mut tokio::task::JoinSet<Result<(), RuntimeError>>,
 ) -> Result<(), RuntimeError> {
     let mut bound = Vec::with_capacity(listen.len());
     for addr in listen {
@@ -256,19 +261,18 @@ pub(super) async fn run_http_connect_client_ingress(
             "HTTP CONNECT ingress has no listener tasks",
         ));
     }
-    readiness.ready();
     let admission = LocalIngressAdmission::new(admission);
-    let mut listeners = tokio::task::JoinSet::new();
     for listener in bound {
         let router = router.clone();
         let inbound = inbound.clone();
         let proxy_auth = proxy_auth.clone();
         let admission = admission.clone();
-        listeners.spawn(async move {
+        services.spawn(async move {
             run_http_connect_client_listener(listener, router, inbound, proxy_auth, admission).await
         });
     }
-    wait_for_ingress_listener_failure(listeners, "HTTP CONNECT").await
+    readiness.ready();
+    Ok(())
 }
 
 async fn run_http_connect_client_listener(
@@ -329,11 +333,12 @@ async fn run_http_connect_client_listener(
     }
 }
 
-pub(super) async fn run_tcp_forward_client_ingress(
+pub(super) async fn spawn_tcp_forward_client_ingress(
     config: TcpForwardConfig,
     router: ClientIngressRouter,
     inbound: InboundId,
     readiness: RequiredServiceReadiness,
+    services: &mut tokio::task::JoinSet<Result<(), RuntimeError>>,
 ) -> Result<(), RuntimeError> {
     let (listen, target, max_connections) = config.into_parts();
     let mut bound = Vec::with_capacity(listen.len());
@@ -348,10 +353,8 @@ pub(super) async fn run_tcp_forward_client_ingress(
 
     let target = Arc::new(target.into_target());
     let connection_slots = Arc::new(Semaphore::new(max_connections));
-    readiness.ready();
-    let mut listeners = tokio::task::JoinSet::new();
     for listener in bound {
-        listeners.spawn(run_tcp_forward_client_listener(
+        services.spawn(run_tcp_forward_client_listener(
             listener,
             target.clone(),
             router.clone(),
@@ -359,7 +362,8 @@ pub(super) async fn run_tcp_forward_client_ingress(
             connection_slots.clone(),
         ));
     }
-    wait_for_ingress_listener_failure(listeners, "TCP port-forward").await
+    readiness.ready();
+    Ok(())
 }
 
 pub(super) async fn run_tcp_forward_client_listener(
@@ -445,12 +449,13 @@ where
     relay_opened_tcp(stream, opened).await
 }
 
-pub(super) async fn run_udp_forward_client_ingress(
+pub(super) async fn spawn_udp_forward_client_ingress(
     config: UdpForwardConfig,
     mux_limits: MuxLimits,
     router: ClientIngressRouter,
     inbound: InboundId,
     readiness: RequiredServiceReadiness,
+    services: &mut tokio::task::JoinSet<Result<(), RuntimeError>>,
 ) -> Result<(), RuntimeError> {
     let (listen, target, max_associations, idle_timeout, datagram_ttl_ms) = config.into_parts();
     let mut bound = Vec::with_capacity(listen.len());
@@ -465,10 +470,8 @@ pub(super) async fn run_udp_forward_client_ingress(
 
     let target = Arc::new(target.into_target());
     let association_slots = Arc::new(Semaphore::new(max_associations));
-    readiness.ready();
-    let mut listeners = tokio::task::JoinSet::new();
     for socket in bound {
-        listeners.spawn(run_udp_forward_client_socket(
+        services.spawn(run_udp_forward_client_socket(
             socket,
             target.clone(),
             mux_limits,
@@ -479,7 +482,8 @@ pub(super) async fn run_udp_forward_client_ingress(
             datagram_ttl_ms,
         ));
     }
-    wait_for_ingress_listener_failure(listeners, "UDP port-forward").await
+    readiness.ready();
+    Ok(())
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -711,28 +715,6 @@ fn expire_udp_forward_associations(
         associations.remove(&peer);
         remove_udp_edge_lane(lanes, &UdpForwardLaneKey { peer, generation });
     }
-}
-
-pub(super) async fn wait_for_ingress_listener_failure(
-    mut listeners: tokio::task::JoinSet<Result<(), RuntimeError>>,
-    ingress: &'static str,
-) -> Result<(), RuntimeError> {
-    let result = if let Some(result) = listeners.join_next().await {
-        match result {
-            Ok(Ok(())) => Err(RuntimeError::Protocol("client ingress listener exited")),
-            Ok(Err(err)) => Err(err),
-            Err(err) => Err(RuntimeError::TaskJoin(err)),
-        }
-    } else {
-        Err(RuntimeError::Protocol(match ingress {
-            "SOCKS5" => "SOCKS5 ingress has no listener tasks",
-            "HTTP CONNECT" => "HTTP CONNECT ingress has no listener tasks",
-            _ => "client ingress has no listener tasks",
-        }))
-    };
-    listeners.abort_all();
-    while listeners.join_next().await.is_some() {}
-    result
 }
 
 #[cfg(test)]

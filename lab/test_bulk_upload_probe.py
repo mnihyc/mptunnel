@@ -18,50 +18,95 @@ from bulk_upload_probe import (
 )
 
 
-class ScriptedAckHandler(socketserver.BaseRequestHandler):
-    def handle(self):
-        with self.server.results_lock:
-            stream_index = len(self.server.stream_totals)
-            self.server.stream_totals.append(None)
-            action = self.server.actions[stream_index]
+class ManualClock:
+    def __init__(self):
+        self.now = 0.0
 
-        total = 0
-        while True:
-            data = self.request.recv(1024 * 1024)
-            if not data:
-                break
-            total += len(data)
+    def __call__(self):
+        return self.now
 
-        with self.server.results_lock:
-            self.server.stream_totals[stream_index] = total
+    def finish_load(self, load_duration):
+        self.now = max(self.now, load_duration)
 
-        if action == "exact":
-            response = f"ACK {total}\nOK {total}\n"
-        elif action == "progress":
-            response = f"ACK {max(1, total // 3)}\n"
-        elif action == "mismatched-final":
-            confirmed = max(1, total // 2)
+
+class ScriptedAckSocket:
+    def __init__(self, action, clock, load_duration):
+        self.action = action
+        self.clock = clock
+        self.load_duration = load_duration
+        self.total = 0
+        self.response = bytearray()
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, _exc_type, _exc, _traceback):
+        return False
+
+    def setblocking(self, blocking):
+        if blocking:
+            raise AssertionError("scripted upload socket must stay nonblocking")
+
+    def send(self, data):
+        if self.total:
+            raise AssertionError("logical load must finish after one accepted write")
+        sent = len(data)
+        self.total = sent
+        self.clock.finish_load(self.load_duration)
+        return sent
+
+    def shutdown(self, how):
+        if how != socket.SHUT_WR:
+            raise AssertionError(f"unexpected shutdown direction: {how}")
+        if self.action == "exact":
+            response = f"ACK {self.total}\nOK {self.total}\n"
+        elif self.action == "progress":
+            response = f"ACK {max(1, self.total // 3)}\n"
+        elif self.action == "mismatched-final":
+            confirmed = max(1, self.total // 2)
             response = f"ACK {confirmed}\nOK {confirmed}\n"
-        elif action == "decreasing":
-            response = f"ACK {total}\nACK {max(0, total - 1)}\nOK {total}\n"
-        elif action == "none":
+        elif self.action == "decreasing":
+            response = (
+                f"ACK {self.total}\n"
+                f"ACK {max(0, self.total - 1)}\n"
+                f"OK {self.total}\n"
+            )
+        elif self.action == "none":
             response = ""
         else:
-            raise AssertionError(f"unknown action: {action}")
+            raise AssertionError(f"unknown action: {self.action}")
+        self.response.extend(response.encode("ascii"))
 
-        if response:
-            self.request.sendall(response.encode("ascii"))
+    def recv(self, size):
+        if not self.response:
+            return b""
+        read_size = min(size, 3)
+        data = bytes(self.response[:read_size])
+        del self.response[:read_size]
+        return data
 
 
-class ScriptedAckServer(socketserver.ThreadingMixIn, socketserver.TCPServer):
-    allow_reuse_address = True
-    daemon_threads = True
+class ScriptedAckTransport:
+    def __init__(self, action, load_duration):
+        self.action = action
+        self.clock = ManualClock()
+        self.load_duration = load_duration
+        self.socket = None
 
-    def __init__(self, actions):
-        super().__init__(("127.0.0.1", 0), ScriptedAckHandler)
-        self.actions = actions
-        self.results_lock = threading.Lock()
-        self.stream_totals = []
+    def connect(self, _args, _deadline):
+        if self.socket is not None:
+            raise AssertionError("unexpected scripted upload connection")
+        self.socket = ScriptedAckSocket(
+            self.action,
+            self.clock,
+            self.load_duration,
+        )
+        return self.socket
+
+    @staticmethod
+    def select(readers, writers, _errors, _timeout):
+        readable = [sock for sock in readers if sock.response]
+        return readable, list(writers), []
 
 
 class SlowSocksHandler(socketserver.BaseRequestHandler):
@@ -79,23 +124,6 @@ class SlowSocksServer(socketserver.ThreadingMixIn, socketserver.TCPServer):
         super().__init__(("127.0.0.1", 0), SlowSocksHandler)
         self.handshake_started = threading.Event()
         self.release_handshake = threading.Event()
-
-
-@contextmanager
-def scripted_ack_server(actions):
-    server = ScriptedAckServer(actions)
-    thread = threading.Thread(
-        target=server.serve_forever,
-        kwargs={"poll_interval": 0.01},
-        daemon=True,
-    )
-    thread.start()
-    try:
-        yield server
-    finally:
-        server.shutdown()
-        server.server_close()
-        thread.join(timeout=1.0)
 
 
 @contextmanager
@@ -135,34 +163,56 @@ def probe_args(server, parallel_uploads=1):
     )
 
 
+def scripted_upload(action):
+    args = probe_args(SimpleNamespace(server_address=("127.0.0.1", 9)))
+    transport = ScriptedAckTransport(action, args.load_duration)
+    # Hosted contract tests validate accounting semantics, not scheduler speed.
+    # Keep the canonical logical deadlines unchanged while removing wall-clock
+    # and kernel scheduling from the exact ACK/EOF transition.
+    with (
+        mock.patch(
+            "bulk_upload_probe.connect_target",
+            side_effect=transport.connect,
+        ),
+        mock.patch(
+            "bulk_upload_probe.select.select",
+            side_effect=transport.select,
+        ),
+        mock.patch(
+            "bulk_upload_probe.time.monotonic",
+            side_effect=transport.clock,
+        ),
+    ):
+        result = interval_upload(args)
+    return result, transport.socket.total
+
+
 class BulkUploadProbeTests(unittest.TestCase):
     def assert_v2_accounting(self, result):
         self.assertEqual(result["upload_metric_version"], 2)
         self.assertEqual(result["upload_accounting_source"], "target_sink_ack")
 
     def test_exact_final_confirmation_is_ok(self):
-        with scripted_ack_server(["exact"]) as server:
-            result = interval_upload(probe_args(server))
+        result, stream_total = scripted_upload("exact")
 
         self.assert_v2_accounting(result)
         self.assertEqual(result["status"], "ok")
-        self.assertEqual(result["bytes"], server.stream_totals[0])
-        self.assertEqual(result["local_accepted_bytes"], server.stream_totals[0])
+        self.assertEqual(result["bytes"], stream_total)
+        self.assertEqual(result["local_accepted_bytes"], stream_total)
         self.assertEqual(result["complete_streams"], 1)
         self.assertEqual(result["failed_streams"], 0)
         self.assertEqual(result["upload_probe_errors"], [])
         self.assertTrue(result["upload_ack_accounting_valid"])
 
     def test_progress_without_final_confirmation_is_loss(self):
-        with scripted_ack_server(["progress"]) as server:
-            result = interval_upload(probe_args(server))
+        result, stream_total = scripted_upload("progress")
 
-        confirmed = max(1, server.stream_totals[0] // 3)
+        confirmed = max(1, stream_total // 3)
         expected_goodput = confirmed * 8 / result["time_s"] / 1_000_000
         self.assert_v2_accounting(result)
         self.assertEqual(result["status"], "loss")
         self.assertEqual(result["bytes"], confirmed)
-        self.assertEqual(result["local_accepted_bytes"], server.stream_totals[0])
+        self.assertEqual(result["local_accepted_bytes"], stream_total)
         self.assertLess(result["bytes"], result["local_accepted_bytes"])
         self.assertAlmostEqual(
             result["upload_goodput_mbps"], expected_goodput, delta=0.01
@@ -173,8 +223,7 @@ class BulkUploadProbeTests(unittest.TestCase):
         self.assertTrue(result["upload_ack_accounting_valid"])
 
     def test_no_receiver_confirmation_is_fail(self):
-        with scripted_ack_server(["none"]) as server:
-            result = interval_upload(probe_args(server))
+        result, _stream_total = scripted_upload("none")
 
         self.assert_v2_accounting(result)
         self.assertEqual(result["status"], "fail")
@@ -187,10 +236,9 @@ class BulkUploadProbeTests(unittest.TestCase):
         self.assertTrue(result["upload_ack_accounting_valid"])
 
     def test_final_total_must_exactly_match_local_acceptance(self):
-        with scripted_ack_server(["mismatched-final"]) as server:
-            result = interval_upload(probe_args(server))
+        result, stream_total = scripted_upload("mismatched-final")
 
-        confirmed = max(1, server.stream_totals[0] // 2)
+        confirmed = max(1, stream_total // 2)
         self.assert_v2_accounting(result)
         self.assertEqual(result["status"], "loss")
         self.assertEqual(result["bytes"], confirmed)
@@ -200,12 +248,11 @@ class BulkUploadProbeTests(unittest.TestCase):
         self.assertTrue(result["upload_ack_accounting_valid"])
 
     def test_non_monotonic_progress_cannot_become_complete(self):
-        with scripted_ack_server(["decreasing"]) as server:
-            result = interval_upload(probe_args(server))
+        result, stream_total = scripted_upload("decreasing")
 
         self.assert_v2_accounting(result)
         self.assertEqual(result["status"], "loss")
-        self.assertEqual(result["bytes"], server.stream_totals[0])
+        self.assertEqual(result["bytes"], stream_total)
         self.assertEqual(result["complete_streams"], 0)
         self.assertEqual(result["failed_streams"], 1)
         self.assertFalse(result["upload_ack_accounting_valid"])
@@ -214,11 +261,44 @@ class BulkUploadProbeTests(unittest.TestCase):
         self.assertIn("acknowledgement decreased", result["upload_probe_errors"][0])
 
     def test_parallel_streams_aggregate_receiver_confirmations(self):
-        with scripted_ack_server(["exact", "progress"]) as server:
-            result = interval_upload(probe_args(server, parallel_uploads=2))
-
-        exact_total, progress_total = server.stream_totals
+        args = probe_args(
+            SimpleNamespace(server_address=("127.0.0.1", 9)),
+            parallel_uploads=2,
+        )
+        exact_total = args.chunk_bytes
+        progress_total = args.chunk_bytes
         expected_confirmed = exact_total + max(1, progress_total // 3)
+
+        def deterministic_stream(
+            _args,
+            _started,
+            _load_deadline,
+            _drain_deadline,
+            state,
+            lock,
+            _payload,
+        ):
+            exact = threading.current_thread().name == "upload-worker-0"
+            confirmed = exact_total if exact else max(1, progress_total // 3)
+            with lock:
+                state["bytes"] += confirmed
+                state["local_accepted_bytes"] += args.chunk_bytes
+                state["streams_with_delivery"] += 1
+                state["interval_bytes"][0] = (
+                    state["interval_bytes"].get(0, 0) + confirmed
+                )
+            return {
+                "complete": exact,
+                "confirmed_bytes": confirmed,
+                "local_accepted_bytes": args.chunk_bytes,
+            }
+
+        with mock.patch(
+            "bulk_upload_probe.upload_one_stream",
+            side_effect=deterministic_stream,
+        ):
+            result = interval_upload(args)
+
         self.assert_v2_accounting(result)
         self.assertEqual(result["status"], "loss")
         self.assertEqual(result["bytes"], expected_confirmed)

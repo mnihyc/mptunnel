@@ -18,9 +18,9 @@ use std::thread;
 use std::time::{Duration, Instant};
 use support::{
     MptunnelProcess, SocksTarget, TestDirectory, check_config, http_request, join_thread,
-    socks5_connect, socks5_round_trip, spawn_closing_proxy, spawn_echo_socks5_proxy,
-    spawn_tcp_echo, unused_loopback_addr, wait_for_ready_management, wait_for_tcp,
-    wait_for_tcp_closed,
+    network_test_guard, socks5_connect, socks5_round_trip, spawn_closing_proxy,
+    spawn_echo_socks5_proxy, spawn_tcp_echo, unused_loopback_addr, wait_for_ready_management,
+    wait_for_tcp, wait_for_tcp_closed,
 };
 
 const OPERATOR_TOKEN: &str = "daily-use-operator-token";
@@ -29,7 +29,7 @@ const PROCESS_START_TIMEOUT: Duration = Duration::from_secs(10);
 fn reject_runtime_config(socks: SocketAddr, management: SocketAddr, generation: u64) -> String {
     format!(
         r#"
-log_level = "error"
+log_level = "warn"
 
 [management]
 listen = ["{management}"]
@@ -64,6 +64,7 @@ fn assert_check_config_ok(path: &Path) {
 
 #[test]
 fn packaged_no_args_restart_loads_the_edited_default_config() {
+    let _network = network_test_guard();
     let directory = TestDirectory::new("default-config-restart");
     directory.write("operator-token.key", OPERATOR_TOKEN);
     let original_socks = unused_loopback_addr();
@@ -118,6 +119,7 @@ fn packaged_no_args_restart_loads_the_edited_default_config() {
 
 #[test]
 fn packaged_management_api_validates_applies_persists_and_reloads_one_generation() {
+    let _network = network_test_guard();
     let directory = TestDirectory::new("config-api");
     directory.write("operator-token.key", OPERATOR_TOKEN);
     let original_socks = unused_loopback_addr();
@@ -500,6 +502,7 @@ target = "direct-default"
 
 #[test]
 fn packaged_routing_exercises_reject_proxy_failover_mpp_and_direct_egress() {
+    let _network = network_test_guard();
     let directory = TestDirectory::new("routing");
     let mpp = unused_loopback_addr();
     let socks = unused_loopback_addr();

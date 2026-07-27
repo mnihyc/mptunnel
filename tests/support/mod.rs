@@ -4,10 +4,13 @@ use std::net::{Ipv4Addr, Shutdown, SocketAddr, TcpListener, TcpStream};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Output, Stdio};
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Mutex, MutexGuard};
 use std::thread;
 use std::time::{Duration, Instant};
 
 static TEST_SEQUENCE: AtomicU64 = AtomicU64::new(0);
+static ISSUED_LOOPBACK_ADDRESSES: Mutex<Vec<SocketAddr>> = Mutex::new(Vec::new());
+static NETWORK_ACCEPTANCE: Mutex<()> = Mutex::new(());
 
 const IO_TIMEOUT: Duration = Duration::from_secs(5);
 
@@ -138,10 +141,31 @@ impl Drop for MptunnelProcess {
 }
 
 pub fn unused_loopback_addr() -> SocketAddr {
-    TcpListener::bind((Ipv4Addr::LOCALHOST, 0))
-        .expect("reserve loopback port")
-        .local_addr()
-        .expect("reserved loopback address")
+    let mut duplicate_reservations = Vec::new();
+    loop {
+        let reservation =
+            TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).expect("reserve loopback port");
+        let address = reservation.local_addr().expect("reserved loopback address");
+        let mut issued = ISSUED_LOOPBACK_ADDRESSES
+            .lock()
+            .expect("acceptance-test port ledger");
+        if !issued.contains(&address) {
+            issued.push(address);
+            return address;
+        }
+        drop(issued);
+        // Keep a recycled port occupied until the kernel selects one that this
+        // acceptance-test process has not already assigned.
+        duplicate_reservations.push(reservation);
+    }
+}
+
+pub fn network_test_guard() -> MutexGuard<'static, ()> {
+    // Released port-0 reservations cannot be handed atomically to a child
+    // process, so socket-owning acceptance scenarios must not race each other.
+    NETWORK_ACCEPTANCE
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
 }
 
 pub fn wait_for_tcp(

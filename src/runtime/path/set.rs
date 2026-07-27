@@ -11,13 +11,12 @@ use super::state::ClientPathState;
 use super::tcp::client::{
     ClientTcpPathSessionHandle, ClientTcpPathSessionRuntime, tcp_session_command_queue,
 };
-use crate::config::{
-    ClientPathConfig, LocalIngressConfig, ResourceLimits, RouteTarget, SecurityConfig,
-};
+use crate::config::{ClientPathConfig, ClientSecurityConfig, RouteTarget};
 #[cfg(test)]
 use crate::ingress::ProxyAuthConfig;
 use crate::model::path::RelayPathKey;
 use crate::mux::MuxLimits;
+use crate::performance::ResourceLimits;
 use crate::protocol::codec::CodecLimits;
 use crate::protocol::{
     PathMetricDirection, PathUsage, PeerPathState, PeerPathStatus, SessionId, UnderlayProtocol,
@@ -27,11 +26,12 @@ use crate::runtime::identity::random_session_id;
 use crate::runtime::peer_status::{PeerStatusBroker, PeerStatusSnapshotSource};
 use crate::runtime::recent_ids::reliable_closed_stream_cache_capacity;
 use crate::runtime::stream::SessionSendBuffer;
-use crate::runtime::telemetry::{
-    RuntimeTelemetry, RuntimeTelemetrySnapshot, active_flow_detail_capacity,
-};
+use crate::runtime::telemetry::{ProductFlowScope, RuntimeTelemetry};
+#[cfg(test)]
+use crate::runtime::telemetry::{RuntimeTelemetrySnapshot, active_flow_detail_capacity};
 #[cfg(test)]
 use crate::transport::SystemCarrierNetworkProvider;
+use crate::transport::encrypted::TcpClientTlsConfig;
 use crate::transport::{CarrierNetworkProvider, CarrierPathIdentity, PathSpec};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -46,10 +46,9 @@ pub(in crate::runtime) struct ClientPathRuntimeOptions {
 
 #[derive(Clone)]
 pub struct ClientPathContext {
-    // Configuration ownership: local inbounds and route target describe which
-    // product flows this client accepts and which MPP outbound/balancer they use.
+    // The route target identifies this MPP outbound. Local inbound inventory
+    // is generation-owned and deliberately absent from carrier context.
     pub(in crate::runtime) route_target: Option<RouteTarget>,
-    pub(in crate::runtime) ingresses: Arc<Vec<LocalIngressConfig>>,
     // Carrier ownership: path specs, per-path security, and live sessions belong
     // to the MPP session's carrier path registry, not to individual streams.
     pub(in crate::runtime) tcp_paths: Arc<Vec<PathSpec>>,
@@ -57,7 +56,8 @@ pub struct ClientPathContext {
     pub(in crate::runtime) tcp_path_ordinals: Arc<Vec<usize>>,
     pub(in crate::runtime) udp_path_ordinals: Arc<Vec<usize>>,
     pub(in crate::runtime) path_group_ordinal: usize,
-    pub(in crate::runtime) tcp_security: Arc<Vec<SecurityConfig>>,
+    pub(in crate::runtime) tcp_security: Arc<Vec<ClientSecurityConfig>>,
+    pub(in crate::runtime) tcp_tls: Arc<Vec<TcpClientTlsConfig>>,
     pub(in crate::runtime) tcp_sessions: Arc<Vec<ClientTcpPathSessionHandle>>,
     pub(in crate::runtime) udp_sessions: Arc<Vec<ClientUdpPathSessionHandle>>,
     pub(in crate::runtime) carrier_network: Arc<dyn CarrierNetworkProvider>,
@@ -89,7 +89,7 @@ impl ClientPathContext {
     #[cfg(test)]
     pub fn new(
         paths: Vec<PathSpec>,
-        security: SecurityConfig,
+        security: ClientSecurityConfig,
         resources: ResourceLimits,
     ) -> Result<Self, RuntimeError> {
         Self::new_with_proxy_auth(paths, security, resources, ProxyAuthConfig::disabled())
@@ -98,18 +98,19 @@ impl ClientPathContext {
     #[cfg(test)]
     pub fn new_with_proxy_auth(
         paths: Vec<PathSpec>,
-        security: SecurityConfig,
+        security: ClientSecurityConfig,
         resources: ResourceLimits,
         proxy_auth: ProxyAuthConfig,
     ) -> Result<Self, RuntimeError> {
         let paths = paths
             .into_iter()
             .map(|spec| ClientPathConfig {
+                tls: crate::transport::encrypted::test_client_tls_config(),
                 spec,
                 security: security.clone(),
             })
             .collect();
-        Self::new_with_path_configs_and_target(paths, resources, proxy_auth, None, Vec::new())
+        Self::new_with_path_configs_and_target(paths, resources, proxy_auth, None)
     }
 
     #[cfg(test)]
@@ -118,13 +119,11 @@ impl ClientPathContext {
         resources: ResourceLimits,
         proxy_auth: ProxyAuthConfig,
         route_target: Option<RouteTarget>,
-        ingresses: Vec<LocalIngressConfig>,
     ) -> Result<Self, RuntimeError> {
         let mut context = Self::new_with_carrier_network(
             paths,
             resources,
             route_target,
-            ingresses,
             0,
             Arc::new(SystemCarrierNetworkProvider),
         )?;
@@ -137,7 +136,6 @@ impl ClientPathContext {
         paths: Vec<ClientPathConfig>,
         resources: ResourceLimits,
         route_target: Option<RouteTarget>,
-        ingresses: Vec<LocalIngressConfig>,
         path_group_ordinal: usize,
         carrier_network: Arc<dyn CarrierNetworkProvider>,
     ) -> Result<Self, RuntimeError> {
@@ -145,7 +143,6 @@ impl ClientPathContext {
             paths,
             resources,
             route_target,
-            ingresses,
             ClientPathRuntimeOptions {
                 session_retention_timeout: crate::config::DEFAULT_SESSION_RETENTION_TIMEOUT,
                 path_group_ordinal,
@@ -155,12 +152,29 @@ impl ClientPathContext {
         )
     }
 
+    #[cfg(test)]
     pub(in crate::runtime) fn new_with_runtime_options(
         paths: Vec<ClientPathConfig>,
         resources: ResourceLimits,
         route_target: Option<RouteTarget>,
-        ingresses: Vec<LocalIngressConfig>,
         runtime: ClientPathRuntimeOptions,
+    ) -> Result<Self, RuntimeError> {
+        let telemetry = RuntimeTelemetry::new(active_flow_detail_capacity(resources.max_streams));
+        Self::new_with_runtime_options_and_telemetry(
+            paths,
+            resources,
+            route_target,
+            runtime,
+            telemetry,
+        )
+    }
+
+    pub(in crate::runtime) fn new_with_runtime_options_and_telemetry(
+        paths: Vec<ClientPathConfig>,
+        resources: ResourceLimits,
+        route_target: Option<RouteTarget>,
+        runtime: ClientPathRuntimeOptions,
+        telemetry: RuntimeTelemetry,
     ) -> Result<Self, RuntimeError> {
         let ClientPathRuntimeOptions {
             session_retention_timeout,
@@ -174,21 +188,29 @@ impl ClientPathContext {
         let mut tcp_paths = Vec::new();
         let mut tcp_path_ordinals = Vec::new();
         let mut tcp_security = Vec::new();
+        let mut tcp_tls = Vec::new();
         let mut udp_paths = Vec::new();
         let mut udp_path_ordinals = Vec::new();
         let mut udp_security = Vec::new();
+        let mut udp_tls = Vec::new();
         for (ordinal, path) in paths.into_iter().enumerate() {
-            let ClientPathConfig { spec, security } = path;
+            let ClientPathConfig {
+                spec,
+                security,
+                tls,
+            } = path;
             match spec.underlay {
                 UnderlayProtocol::Tcp => {
                     tcp_path_ordinals.push(ordinal);
                     tcp_paths.push(spec);
                     tcp_security.push(security);
+                    tcp_tls.push(tls);
                 }
                 UnderlayProtocol::Udp => {
                     udp_path_ordinals.push(ordinal);
                     udp_paths.push(spec);
                     udp_security.push(security);
+                    udp_tls.push(tls);
                 }
             }
         }
@@ -197,9 +219,11 @@ impl ClientPathContext {
         let tcp_paths = Arc::new(tcp_paths);
         let tcp_path_ordinals = Arc::new(tcp_path_ordinals);
         let tcp_security = Arc::new(tcp_security);
+        let tcp_tls = Arc::new(tcp_tls);
         let udp_paths = Arc::new(udp_paths);
         let udp_path_ordinals = Arc::new(udp_path_ordinals);
         let udp_security = Arc::new(udp_security);
+        let udp_tls = Arc::new(udp_tls);
         let path_proof_limit = resources.max_streams.saturating_mul(2).max(1);
         let state = ClientPathState::new(ClientPathHealth {
             tcp: vec![
@@ -215,7 +239,6 @@ impl ClientPathContext {
         let mux_limits = resources.into();
         let session_send_buffer = SessionSendBuffer::from_limits(mux_limits);
         let session_id = random_session_id()?;
-        let telemetry = RuntimeTelemetry::new(active_flow_detail_capacity(resources.max_streams));
         let peer_status = PeerStatusBroker::new(allow_peer_diagnostics);
         let peer_status_snapshot = PeerStatusSnapshotSource::new({
             let tcp_paths = tcp_paths.clone();
@@ -235,6 +258,7 @@ impl ClientPathContext {
                     },
                     session_id,
                     security: tcp_security.clone(),
+                    tls: tcp_tls.clone(),
                     codec_limits,
                     mux_limits,
                     command_queue: tcp_session_command_queue(resources),
@@ -260,7 +284,12 @@ impl ClientPathContext {
                         path_ordinal: udp_path_ordinals[path_index],
                     },
                     session_id,
+                    candidate_selector: crate::transport::quic::QuicCandidateSelector::derive(
+                        udp_security[path_index].credential.id().as_str(),
+                        udp_security[path_index].credential.secret().as_bytes(),
+                    ),
                     security: udp_security.clone(),
+                    tls: udp_tls.clone(),
                     codec_limits,
                     mux_limits,
                     stream_frame_queue: reliable_stream_frame_queue(mux_limits),
@@ -273,13 +302,13 @@ impl ClientPathContext {
             .collect::<Vec<_>>();
         Ok(Self {
             route_target,
-            ingresses: Arc::new(ingresses),
             tcp_paths,
             udp_paths,
             tcp_path_ordinals,
             udp_path_ordinals,
             path_group_ordinal,
             tcp_security,
+            tcp_tls,
             tcp_sessions: Arc::new(tcp_sessions),
             udp_sessions: Arc::new(udp_sessions),
             carrier_network,
@@ -299,14 +328,34 @@ impl ClientPathContext {
     pub(in crate::runtime) fn tcp_path_security(
         &self,
         path_index: usize,
-    ) -> Result<&SecurityConfig, RuntimeError> {
+    ) -> Result<&ClientSecurityConfig, RuntimeError> {
         self.tcp_security
             .get(path_index)
             .ok_or(RuntimeError::NoSchedulableTcpPath)
     }
 
+    pub(in crate::runtime) fn tcp_path_tls(
+        &self,
+        path_index: usize,
+    ) -> Result<&TcpClientTlsConfig, RuntimeError> {
+        self.tcp_tls
+            .get(path_index)
+            .ok_or(RuntimeError::NoSchedulableTcpPath)
+    }
+
+    #[cfg(test)]
     pub(in crate::runtime) fn telemetry_snapshot(&self) -> RuntimeTelemetrySnapshot {
         self.telemetry.snapshot()
+    }
+
+    /// Clone one already-built MPP context with flow-local Product identity.
+    ///
+    /// Carrier registries remain shared; only the lightweight telemetry handle
+    /// differs, so selection never duplicates path/session state.
+    pub(in crate::runtime) fn with_product_flow_scope(&self, scope: ProductFlowScope) -> Self {
+        let mut scoped = self.clone();
+        scoped.telemetry = self.telemetry.scoped(scope);
+        scoped
     }
 
     pub(in crate::runtime) fn relay_path_config_ordinal(&self, key: RelayPathKey) -> usize {

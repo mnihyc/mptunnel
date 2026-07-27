@@ -11,7 +11,25 @@ use crate::runtime::path::{
     PathProofObservation, ServerLocalPathProperties, ServerStreamPathAttachment,
 };
 use std::net::SocketAddr;
+use std::sync::Barrier;
 use std::time::{Duration, Instant};
+
+fn constrained_registry(
+    max_streams: usize,
+    max_paths_per_session: usize,
+) -> Arc<ServerReliableStreamRegistry> {
+    let (accepted, _accepted_rx) = mpsc::unbounded_channel();
+    let limits = MuxLimits {
+        max_streams,
+        ..MuxLimits::default()
+    };
+    Arc::new(ServerReliableStreamRegistry::with_accept_sender(
+        max_streams,
+        max_paths_per_session,
+        accepted,
+        limits,
+    ))
+}
 
 fn path_proof_observation(proof_id: u64, elapsed: Duration) -> PathProofObservation {
     PathProofObservation {
@@ -51,6 +69,386 @@ fn native_quic_test_metrics(path_id: PathId) -> PathMetrics {
     }
 }
 
+#[test]
+fn carrier_admission_enforces_logical_identity_and_cross_carrier_session_cap() {
+    let registry = constrained_registry(8, 2);
+    let port = registry.path_port();
+    let session_id = SessionId(600);
+    let tcp = port
+        .register_carrier_path(
+            session_id,
+            UnderlayProtocol::Tcp,
+            PathId(0),
+            ServerLocalPathProperties::default(),
+            PrincipalPermit::for_test("test-peer"),
+        )
+        .expect("first TCP carrier");
+    let duplicate = port.register_carrier_path(
+        session_id,
+        UnderlayProtocol::Tcp,
+        PathId(0),
+        ServerLocalPathProperties::default(),
+        PrincipalPermit::for_test("test-peer"),
+    );
+    assert!(
+        duplicate
+            .expect_err("same logical carrier must be unique")
+            .to_string()
+            .contains("duplicate server logical carrier path")
+    );
+    let udp = port
+        .register_carrier_path(
+            session_id,
+            UnderlayProtocol::Udp,
+            PathId(0),
+            ServerLocalPathProperties::default(),
+            PrincipalPermit::for_test("test-peer"),
+        )
+        .expect("second carrier across QUIC underlay");
+    let over_limit = port.register_carrier_path(
+        session_id,
+        UnderlayProtocol::Tcp,
+        PathId(1),
+        ServerLocalPathProperties::default(),
+        PrincipalPermit::for_test("test-peer"),
+    );
+    assert!(
+        over_limit
+            .expect_err("cross-carrier session limit")
+            .to_string()
+            .contains("server session carrier path limit reached")
+    );
+
+    drop(tcp);
+    let replacement = port
+        .register_carrier_path(
+            session_id,
+            UnderlayProtocol::Tcp,
+            PathId(1),
+            ServerLocalPathProperties::default(),
+            PrincipalPermit::for_test("test-peer"),
+        )
+        .expect("dropping one carrier recovers the per-session slot");
+    assert_eq!(port.management_snapshot().paths.len(), 2);
+    drop(replacement);
+    drop(udp);
+    assert!(port.management_snapshot().sessions.is_empty());
+}
+
+#[test]
+fn failed_global_and_session_admission_roll_back_and_recover_exactly() {
+    let path_bounded = constrained_registry(2, 1);
+    let path_port = path_bounded.path_port();
+    let first = path_port
+        .register_carrier_path(
+            SessionId(610),
+            UnderlayProtocol::Tcp,
+            PathId(0),
+            Default::default(),
+            PrincipalPermit::for_test("first"),
+        )
+        .expect("first global path");
+    let second = path_port
+        .register_carrier_path(
+            SessionId(611),
+            UnderlayProtocol::Tcp,
+            PathId(0),
+            Default::default(),
+            PrincipalPermit::for_test("second"),
+        )
+        .expect("second global path");
+    assert!(
+        path_port
+            .register_carrier_path(
+                SessionId(612),
+                UnderlayProtocol::Tcp,
+                PathId(0),
+                Default::default(),
+                PrincipalPermit::for_test("third"),
+            )
+            .expect_err("global carrier ceiling")
+            .to_string()
+            .contains("server global carrier path limit reached")
+    );
+    drop(first);
+    let recovered = path_port
+        .register_carrier_path(
+            SessionId(612),
+            UnderlayProtocol::Tcp,
+            PathId(0),
+            Default::default(),
+            PrincipalPermit::for_test("third"),
+        )
+        .expect("global path slot recovers after exact drop");
+    drop(recovered);
+    drop(second);
+
+    let session_bounded = constrained_registry(2, 4);
+    let session_port = session_bounded.path_port();
+    let first = session_port
+        .register_carrier_path(
+            SessionId(620),
+            UnderlayProtocol::Tcp,
+            PathId(0),
+            Default::default(),
+            PrincipalPermit::for_test("first"),
+        )
+        .expect("first authenticated session");
+    let second = session_port
+        .register_carrier_path(
+            SessionId(621),
+            UnderlayProtocol::Tcp,
+            PathId(0),
+            Default::default(),
+            PrincipalPermit::for_test("second"),
+        )
+        .expect("second authenticated session");
+    assert!(
+        session_port
+            .register_carrier_path(
+                SessionId(622),
+                UnderlayProtocol::Tcp,
+                PathId(0),
+                Default::default(),
+                PrincipalPermit::for_test("third"),
+            )
+            .expect_err("authenticated session ceiling")
+            .to_string()
+            .contains("server authenticated session limit reached")
+    );
+    assert_eq!(
+        session_port.management_snapshot().paths.len(),
+        2,
+        "failed session admission must roll back its carrier reservation"
+    );
+    drop(first);
+    let recovered = session_port
+        .register_carrier_path(
+            SessionId(622),
+            UnderlayProtocol::Tcp,
+            PathId(0),
+            Default::default(),
+            PrincipalPermit::for_test("third"),
+        )
+        .expect("authenticated session slot recovers after final reference drops");
+    drop(recovered);
+    drop(second);
+    assert!(session_port.management_snapshot().sessions.is_empty());
+}
+
+#[test]
+fn stale_carrier_retirement_cannot_release_its_replacement() {
+    let registry = constrained_registry(2, 1);
+    let port = registry.path_port();
+    let session_id = SessionId(630);
+    let first = port
+        .register_carrier_path(
+            session_id,
+            UnderlayProtocol::Udp,
+            PathId(0),
+            Default::default(),
+            PrincipalPermit::for_test("test-peer"),
+        )
+        .expect("first carrier generation");
+    let stale_identity = ServerCarrierPathIdentity {
+        session_id,
+        underlay: first.underlay(),
+        path_id: first.path_id(),
+        path_instance_id: first.path_instance_id(),
+    };
+    drop(first);
+    let replacement = port
+        .register_carrier_path(
+            session_id,
+            UnderlayProtocol::Udp,
+            PathId(0),
+            Default::default(),
+            PrincipalPermit::for_test("test-peer"),
+        )
+        .expect("replacement carrier generation");
+
+    registry.retire_carrier_path(stale_identity);
+    let snapshot = port.management_snapshot();
+    assert_eq!(snapshot.paths.len(), 1);
+    assert_eq!(
+        snapshot.paths[0].path_instance_id,
+        replacement.path_instance_id(),
+        "stale retirement must be an exact-instance no-op"
+    );
+    assert!(
+        port.register_carrier_path(
+            session_id,
+            UnderlayProtocol::Udp,
+            PathId(0),
+            Default::default(),
+            PrincipalPermit::for_test("test-peer"),
+        )
+        .expect_err("replacement still owns the logical identity")
+        .to_string()
+        .contains("duplicate server logical carrier path")
+    );
+}
+
+#[tokio::test]
+async fn reconnect_waits_for_bounded_ordered_retirement_under_backpressure() {
+    let registry = constrained_registry(1, 1);
+    let port = registry.path_port();
+    let session_id = SessionId(640);
+    let stream_id = StreamId(1);
+    let registration = port
+        .register_carrier_path(
+            session_id,
+            UnderlayProtocol::Tcp,
+            PathId(0),
+            Default::default(),
+            PrincipalPermit::for_test("test-peer"),
+        )
+        .expect("initial carrier");
+    let (commands, _receivers) = reliable_path_command_channels(8);
+    let mut accepted = match registry
+        .open_or_attach(ServerStreamOpenRequest {
+            session_id,
+            stream_id,
+            target: TargetAddr::Ip(SocketAddr::from(([127, 0, 0, 1], 80))),
+            lane: TrafficClass::Throughput,
+            attachment: ServerStreamPathAttachment {
+                path_registration: registration.clone(),
+                commands,
+                max_frame_payload_bytes: MuxLimits::default().max_payload_bytes,
+            },
+            mux_limits: MuxLimits::default(),
+        })
+        .expect("open response stream")
+    {
+        ServerReliableStreamOpen::New(accepted) => accepted,
+        _ => panic!("expected new response stream"),
+    };
+    let mut stream = accepted.take_stream();
+    let key = CarrierPathKey {
+        underlay: registration.underlay(),
+        path_id: registration.path_id(),
+    };
+    let output_incarnation = match &stream.output {
+        ReliablePathStreamOutput::Switchable(binding) => {
+            binding
+                .sender_path_targets(TrafficClass::Throughput, 1)
+                .first()
+                .expect("response output")
+                .observation
+                .incarnation
+        }
+        ReliablePathStreamOutput::Fixed(_) => panic!("expected switchable response output"),
+    };
+    let mut backpressured = false;
+    for offset in 0..10_000u64 {
+        let frame = Frame::StreamAck {
+            stream_id,
+            complete: false,
+            ranges: vec![OffsetRange {
+                start: offset,
+                end: offset + 1,
+            }],
+        };
+        if matches!(
+            port.try_route_frame(&registration, stream_id, frame)
+                .expect("route ACK"),
+            ServerStreamFrameRoute::Backpressured(_)
+        ) {
+            backpressured = true;
+            break;
+        }
+    }
+    assert!(backpressured, "test must saturate the ordered actor queue");
+
+    port.detach_path(&registration, stream_id)
+        .expect("first explicit detach");
+    port.detach_path(&registration, stream_id)
+        .expect("replayed explicit detach shares pending lifecycle");
+    drop(registration);
+    assert!(
+        port.register_carrier_path(
+            session_id,
+            UnderlayProtocol::Tcp,
+            PathId(0),
+            Default::default(),
+            PrincipalPermit::for_test("test-peer"),
+        )
+        .expect_err("retiring logical carrier retains its bounded admission slot")
+        .to_string()
+        .contains("duplicate server logical carrier path")
+    );
+
+    tokio::time::timeout(Duration::from_secs(1), async {
+        while stream.has_output_incarnation(key, output_incarnation) {
+            // Once PathDetached is applied recv_frame waits for another
+            // product frame; a short cancellation exposes the state change.
+            let _ = tokio::time::timeout(Duration::from_millis(10), stream.recv_frame()).await;
+        }
+    })
+    .await
+    .expect("the one ordered detach must drain through actor backpressure");
+    tokio::time::timeout(Duration::from_secs(1), async {
+        while !port.management_snapshot().paths.is_empty() {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("ordered retirement must finish after queue capacity recovers");
+    let replacement = port
+        .register_carrier_path(
+            session_id,
+            UnderlayProtocol::Tcp,
+            PathId(0),
+            Default::default(),
+            PrincipalPermit::for_test("test-peer"),
+        )
+        .expect("reconnect after ordered retirement");
+    drop(replacement);
+}
+
+#[test]
+fn parallel_carrier_admission_and_drop_has_no_lock_order_deadlock() {
+    const WORKERS: usize = 8;
+    const ITERATIONS: usize = 200;
+    let registry = constrained_registry(WORKERS, 1);
+    let barrier = Arc::new(Barrier::new(WORKERS + 1));
+    let (done_tx, done_rx) = std::sync::mpsc::channel();
+    let mut workers = Vec::new();
+    for worker in 0..WORKERS {
+        let registry = registry.clone();
+        let barrier = barrier.clone();
+        let done_tx = done_tx.clone();
+        workers.push(std::thread::spawn(move || {
+            let port = registry.path_port();
+            barrier.wait();
+            for _ in 0..ITERATIONS {
+                let registration = port
+                    .register_carrier_path(
+                        SessionId(700 + worker as u64),
+                        UnderlayProtocol::Tcp,
+                        PathId(0),
+                        Default::default(),
+                        PrincipalPermit::for_test("test-peer"),
+                    )
+                    .expect("parallel exact carrier admission");
+                drop(registration);
+            }
+            done_tx.send(()).expect("completion receiver");
+        }));
+    }
+    drop(done_tx);
+    barrier.wait();
+    for _ in 0..WORKERS {
+        done_rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("parallel carrier admission must not deadlock");
+    }
+    for worker in workers {
+        worker.join().expect("carrier admission worker");
+    }
+    assert!(registry.path_port().management_snapshot().paths.is_empty());
+}
+
 #[tokio::test]
 async fn new_stream_acceptance_precedes_validation_on_its_opening_carrier() {
     let registry = Arc::new(ServerReliableStreamRegistry::new(4));
@@ -58,7 +456,7 @@ async fn new_stream_acceptance_precedes_validation_on_its_opening_carrier() {
     let session_id = SessionId(700);
     let stream_id = StreamId(8);
     let path_id = PathId(2);
-    let registration = port.register_carrier_path(
+    let registration = port.register_test_carrier_path(
         session_id,
         UnderlayProtocol::Udp,
         path_id,
@@ -85,6 +483,11 @@ async fn new_stream_acceptance_precedes_validation_on_its_opening_carrier() {
         _ => panic!("expected new response stream"),
     };
 
+    assert_eq!(
+        accepted.stream().max_offset,
+        0,
+        "OPEN_STREAM alone must not manufacture reverse-direction send credit"
+    );
     accepted
         .accept_opening_path()
         .await
@@ -114,7 +517,7 @@ async fn new_stream_acceptance_precedes_validation_on_its_opening_carrier() {
 fn unacknowledged_carrier_validation_can_be_retried() {
     let registry = Arc::new(ServerReliableStreamRegistry::new(1));
     let port = registry.path_port();
-    let registration = port.register_carrier_path(
+    let registration = port.register_test_carrier_path(
         SessionId(699),
         UnderlayProtocol::Tcp,
         PathId(1),
@@ -150,7 +553,7 @@ fn accepted_stream_does_not_extend_carrier_registration_lifetime() {
     let registry = Arc::new(ServerReliableStreamRegistry::new(1));
     let port = registry.path_port();
     let session_id = SessionId(698);
-    let registration = port.register_carrier_path(
+    let registration = port.register_test_carrier_path(
         session_id,
         UnderlayProtocol::Tcp,
         PathId(1),
@@ -203,7 +606,7 @@ fn late_open_and_closed_output_replacement_inherit_path_evidence() {
     startup_metrics.has_ack_derived_data_sample = false;
     startup_metrics.data_sample_count = 0;
     startup_metrics.data_sample_bytes = 0;
-    let registration = port.register_carrier_path(
+    let registration = port.register_test_carrier_path(
         session_id,
         UnderlayProtocol::Udp,
         path_id,
@@ -370,7 +773,7 @@ fn replacement_carrier_does_not_inherit_retired_path_proof() {
     let stream_id = StreamId(10);
     let path_id = PathId(4);
     let target = TargetAddr::Ip(SocketAddr::from(([127, 0, 0, 1], 80)));
-    let first_registration = port.register_carrier_path(
+    let first_registration = port.register_test_carrier_path(
         session_id,
         UnderlayProtocol::Udp,
         path_id,
@@ -410,7 +813,7 @@ fn replacement_carrier_does_not_inherit_retired_path_proof() {
 
     let first_instance = first_registration.path_instance_id();
     drop(first_registration);
-    let replacement_registration = port.register_carrier_path(
+    let replacement_registration = port.register_test_carrier_path(
         session_id,
         UnderlayProtocol::Udp,
         path_id,
@@ -480,7 +883,7 @@ fn peer_status_snapshot_is_session_scoped_and_tracks_registration_lifetime() {
     first_metrics.delivery_rate_bps = 111;
     let mut second_metrics = native_quic_test_metrics(path_id);
     second_metrics.delivery_rate_bps = 222;
-    let first = port.register_carrier_path(
+    let first = port.register_test_carrier_path(
         first_session,
         UnderlayProtocol::Udp,
         path_id,
@@ -493,7 +896,7 @@ fn peer_status_snapshot_is_session_scoped_and_tracks_registration_lifetime() {
             initial_metrics: Some(first_metrics),
         },
     );
-    let _second = port.register_carrier_path(
+    let _second = port.register_test_carrier_path(
         second_session,
         UnderlayProtocol::Udp,
         path_id,
@@ -552,7 +955,7 @@ async fn server_stream_try_route_preserves_bounded_backpressure() {
     let session_id = SessionId(901);
     let stream_id = StreamId(33);
     let path_id = PathId(0);
-    let registration = port.register_carrier_path(
+    let registration = port.register_test_carrier_path(
         session_id,
         UnderlayProtocol::Tcp,
         path_id,
@@ -619,6 +1022,119 @@ async fn server_stream_try_route_preserves_bounded_backpressure() {
     ));
 }
 
+#[tokio::test]
+async fn routed_request_data_updates_feedback_ingress_on_the_same_stream_event_snapshot() {
+    let registry = Arc::new(ServerReliableStreamRegistry::new(4));
+    let port = registry.path_port();
+    let session_id = SessionId(905);
+    let stream_id = StreamId(37);
+    let mux_limits = MuxLimits::default();
+    let tcp = port.register_test_carrier_path(
+        session_id,
+        UnderlayProtocol::Tcp,
+        PathId(0),
+        ServerLocalPathProperties::default(),
+    );
+    let udp = port.register_test_carrier_path(
+        session_id,
+        UnderlayProtocol::Udp,
+        PathId(1),
+        ServerLocalPathProperties::default(),
+    );
+    let target = TargetAddr::Ip(SocketAddr::from(([127, 0, 0, 1], 80)));
+    let (tcp_commands, _tcp_receivers) = reliable_path_command_channels(8);
+    let mut accepted = match registry
+        .open_or_attach(ServerStreamOpenRequest {
+            session_id,
+            stream_id,
+            target: target.clone(),
+            lane: TrafficClass::Throughput,
+            attachment: ServerStreamPathAttachment {
+                path_registration: tcp.clone(),
+                commands: tcp_commands,
+                max_frame_payload_bytes: mux_limits.max_payload_bytes,
+            },
+            mux_limits,
+        })
+        .expect("open response stream")
+    {
+        ServerReliableStreamOpen::New(accepted) => accepted,
+        _ => panic!("expected new response stream"),
+    };
+    let mut stream = accepted.take_stream();
+    let (udp_commands, _udp_receivers) = reliable_path_command_channels(8);
+    assert!(matches!(
+        registry
+            .open_or_attach(ServerStreamOpenRequest {
+                session_id,
+                stream_id,
+                target,
+                lane: TrafficClass::Throughput,
+                attachment: ServerStreamPathAttachment {
+                    path_registration: udp.clone(),
+                    commands: udp_commands,
+                    max_frame_payload_bytes: mux_limits.max_payload_bytes,
+                },
+                mux_limits,
+            })
+            .expect("attach QUIC response output"),
+        ServerReliableStreamOpen::Existing
+    ));
+    assert_eq!(
+        stream.request_feedback_underlay(),
+        Some(UnderlayProtocol::Udp),
+        "the latest accepted request ingress starts as the return-path hint"
+    );
+
+    let ack = Frame::StreamAck {
+        stream_id,
+        complete: false,
+        ranges: vec![OffsetRange { start: 0, end: 1 }],
+    };
+    port.route_frame(&tcp, stream_id, ack.clone())
+        .await
+        .expect("route feedback frame");
+    assert_eq!(stream.recv_frame().await.expect("receive feedback"), ack);
+    assert_eq!(
+        stream.request_feedback_underlay(),
+        Some(UnderlayProtocol::Udp),
+        "response feedback must not claim request-data ingress"
+    );
+
+    let data = Frame::StreamData {
+        stream_id,
+        offset: 0,
+        payload: bytes::Bytes::from_static(b"request"),
+    };
+    assert!(matches!(
+        port.try_route_frame(&tcp, stream_id, data.clone()),
+        Ok(ServerStreamFrameRoute::Routed)
+    ));
+    assert_eq!(
+        stream.recv_frame().await.expect("receive request data"),
+        data
+    );
+    assert_eq!(
+        stream.request_feedback_underlay(),
+        Some(UnderlayProtocol::Tcp),
+        "the route snapshot must account the exact carrier that supplied request data"
+    );
+
+    let fin = Frame::StreamFin {
+        stream_id,
+        final_offset: 7,
+    };
+    port.route_frame(&udp, stream_id, fin.clone())
+        .await
+        .expect("route request FIN");
+    assert_eq!(stream.recv_frame().await.expect("receive request FIN"), fin);
+    assert_eq!(
+        stream.request_feedback_underlay(),
+        Some(UnderlayProtocol::Udp),
+        "request FIN updates the return-path hint through the same route snapshot"
+    );
+}
+
 #[test]
 fn full_actor_queue_keeps_detach_fifo_without_runtime_context() {
     let session_id = SessionId(904);
@@ -653,7 +1169,7 @@ fn full_actor_queue_keeps_detach_fifo_without_runtime_context() {
         .expect("fill actor queue");
     assert_eq!(
         binding.begin_path_detach(key, path_instance_id),
-        Some(output_incarnation)
+        Some(ResponsePathDetachOutcome::Begun(output_incarnation))
     );
 
     let barrier = Arc::new(std::sync::Barrier::new(2));
@@ -697,7 +1213,7 @@ async fn queued_ack_precedes_following_path_detach_at_stream_actor() {
     let port = registry.path_port();
     let session_id = SessionId(903);
     let stream_id = StreamId(35);
-    let registration = port.register_carrier_path(
+    let registration = port.register_test_carrier_path(
         session_id,
         UnderlayProtocol::Tcp,
         PathId(0),
@@ -784,7 +1300,7 @@ async fn late_frame_after_relay_exit_does_not_close_shared_carrier() {
     let port = registry.path_port();
     let session_id = SessionId(902);
     let stream_id = StreamId(34);
-    let registration = port.register_carrier_path(
+    let registration = port.register_test_carrier_path(
         session_id,
         UnderlayProtocol::Tcp,
         PathId(0),

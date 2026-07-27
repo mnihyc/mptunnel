@@ -12,7 +12,7 @@ use super::io::{
 #[cfg(feature = "lab-diagnostics")]
 use super::metrics::log_quic_ack_poll_diagnostics;
 use super::metrics::{quic_path_metrics_ack_interval, quic_path_metrics_poll_interval};
-use crate::config::SecurityConfig;
+use crate::config::ClientSecurityConfig;
 #[cfg(feature = "lab-diagnostics")]
 use crate::lab_diagnostics::lab_diagnostic;
 use crate::model::path::{CarrierPathInstanceId, RelayPathKey, next_carrier_path_instance_id};
@@ -32,7 +32,8 @@ use crate::runtime::path::ports::OpenedReliableCarrierStream;
 use crate::runtime::path::state::ClientPathState;
 use crate::runtime::peer_status::{PeerStatusBroker, PeerStatusCarrier, PeerStatusSnapshotSource};
 use crate::scheduler::{TrafficClass, stream_demand_hint_for_traffic_class};
-use crate::transport::quic::QuicCarrierError;
+use crate::transport::encrypted::TcpClientTlsConfig;
+use crate::transport::quic::{QuicCandidateSelector, QuicCarrierError};
 use crate::transport::{
     CarrierNetworkProvider, CarrierPathIdentity, CarrierResolutionRequest, CarrierSocketRequest,
     PathSpec, interleave_socket_addr_families,
@@ -113,6 +114,7 @@ impl ClientUdpPathSessionHandle {
         target: TargetAddr,
         lane: TrafficClass,
         open_deadline: tokio::time::Instant,
+        advertised_recv_max_offset: u64,
     ) -> Result<OpenedReliableCarrierStream, RuntimeError> {
         let open = async {
             let connection = self.ensure_connection(open_deadline).await?;
@@ -121,6 +123,7 @@ impl ClientUdpPathSessionHandle {
                 stream_id,
                 target.clone(),
                 lane,
+                advertised_recv_max_offset,
                 self.runtime.clone(),
             )
             .await
@@ -134,6 +137,7 @@ impl ClientUdpPathSessionHandle {
                         stream_id,
                         target,
                         lane,
+                        advertised_recv_max_offset,
                         self.runtime.clone(),
                     )
                     .await
@@ -216,7 +220,9 @@ pub(in crate::runtime) struct ClientUdpPathSessionRuntime {
     pub(in crate::runtime) path_index: usize,
     pub(in crate::runtime) carrier_identity: CarrierPathIdentity,
     pub(in crate::runtime) session_id: SessionId,
-    pub(in crate::runtime) security: Arc<Vec<SecurityConfig>>,
+    pub(in crate::runtime) security: Arc<Vec<ClientSecurityConfig>>,
+    pub(in crate::runtime) candidate_selector: QuicCandidateSelector,
+    pub(in crate::runtime) tls: Arc<Vec<TcpClientTlsConfig>>,
     pub(in crate::runtime) codec_limits: CodecLimits,
     pub(in crate::runtime) mux_limits: MuxLimits,
     pub(in crate::runtime) stream_frame_queue: usize,
@@ -233,10 +239,16 @@ impl ClientUdpPathSessionRuntime {
             .expect("UDP session path inventory matches its index")
     }
 
-    pub(in crate::runtime) fn security(&self) -> &SecurityConfig {
+    pub(in crate::runtime) fn security(&self) -> &ClientSecurityConfig {
         self.security
             .get(self.config_index)
             .expect("UDP session security inventory matches its index")
+    }
+
+    pub(in crate::runtime) fn tls(&self) -> &TcpClientTlsConfig {
+        self.tls
+            .get(self.config_index)
+            .expect("UDP session TLS identity inventory matches its index")
     }
 }
 
@@ -617,6 +629,7 @@ async fn open_client_udp_stream_on_connection(
     stream_id: StreamId,
     target: TargetAddr,
     lane: TrafficClass,
+    advertised_recv_max_offset: u64,
     runtime: ClientUdpPathSessionRuntime,
 ) -> Result<OpenedReliableCarrierStream, RuntimeError> {
     let (mut send, mut recv) = carrier.connection.open_bi().await?;
@@ -627,6 +640,18 @@ async fn open_client_udp_stream_on_connection(
         demand: stream_demand_hint_for_traffic_class(lane),
     };
     udp_path_write_frame(&mut send, &open, runtime.codec_limits).await?;
+    // Initial opens publish the logical receive owner's starting credit.
+    // Attachments pass zero so accepting another carrier cannot widen the one
+    // shared receive window.
+    udp_path_write_frame(
+        &mut send,
+        &Frame::StreamMaxData {
+            stream_id,
+            max_offset: advertised_recv_max_offset,
+        },
+        runtime.codec_limits,
+    )
+    .await?;
     let path_id = PathId(runtime.path_index as u16);
     let max_offset = read_client_udp_stream_open_accept(
         &mut recv,
@@ -732,7 +757,7 @@ async fn open_client_udp_datagram_stream(
     carrier: ClientUdpCarrierInstance,
     runtime: ClientUdpPathSessionRuntime,
 ) -> Result<ClientUdpDatagramStream, RuntimeError> {
-    let (send, recv) = carrier.connection.open_bi().await?;
+    let (mut send, recv) = carrier.connection.open_bi().await?;
     send.set_traffic_class(TrafficClass::RealtimeDatagram)?;
     let frames = spawn_quic_path_reader(recv, runtime.codec_limits, runtime.stream_frame_queue);
     Ok(ClientUdpDatagramStream {

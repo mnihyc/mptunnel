@@ -353,15 +353,18 @@ async fn request_product_ack_preserves_exact_data_ack_progress_path() {
     let mut sender = RequestSenderService::new(stream_id);
     sender.record_original_frame_for_test(owner, &frame);
 
-    let outcome = sender.apply_request_product_ack(
-        &context,
-        &remotes,
-        &mut send_stream,
-        &[OffsetRange {
+    let ack = crate::mux::stream::validate_stream_ack(
+        true,
+        vec![OffsetRange {
             start: 0,
             end: 4096,
         }],
-    );
+        send_stream.next_offset(),
+    )
+    .expect("ACK assigned request data");
+    let outcome = sender
+        .apply_request_product_ack(&context, &remotes, &mut send_stream, &ack)
+        .expect("ACK does not exceed retained send chunks");
 
     assert_eq!(outcome.data_ack_progress_paths.as_slice(), &[owner]);
     assert_eq!(outcome.mux.released_bytes, 4096);
@@ -395,7 +398,7 @@ async fn client_recv_progress_backpressure_is_retryable_not_stream_fatal() {
         .send_recv_progress(
             &mut remotes,
             &context,
-            &recv_stream,
+            &mut recv_stream,
             &mut progress,
             RelayRecvProgressSend::new(None, TrafficClass::Throughput, false),
         )
@@ -412,7 +415,7 @@ async fn client_recv_progress_backpressure_is_retryable_not_stream_fatal() {
         .send_recv_progress(
             &mut remotes,
             &context,
-            &recv_stream,
+            &mut recv_stream,
             &mut progress,
             RelayRecvProgressSend::new(None, TrafficClass::Throughput, false),
         )
@@ -427,6 +430,74 @@ async fn client_recv_progress_backpressure_is_retryable_not_stream_fatal() {
         try_recv_reliable_path_priority_command(&mut receivers),
         Some(ReliablePathCommand::SendFrame(Frame::StreamAck { .. }))
     ));
+}
+
+#[tokio::test]
+async fn client_max_data_credit_commits_only_after_control_queue_accepts_it() {
+    let stream_id = StreamId(97);
+    let context = client_test_context();
+    let (commands, mut receivers) = reliable_path_command_channels(1);
+    commands
+        .try_enqueue_admitted_frame(
+            Frame::StreamAck {
+                stream_id,
+                complete: false,
+                ranges: Vec::new(),
+            },
+            TrafficClass::Control,
+        )
+        .expect("prefill priority queue");
+    let mut remotes =
+        ReliableRelayRemoteSet::new(opened_test_relay_stream(stream_id, 0, commands), 4);
+    let mut recv_stream =
+        ReliableRecvStream::new_with_initial_max_offset(stream_id, MuxLimits::default(), 0);
+    let mut progress = ReliableRecvProgress::default();
+    let mut sender = RequestSenderService::new(stream_id);
+
+    let sent = sender
+        .send_recv_progress(
+            &mut remotes,
+            &context,
+            &mut recv_stream,
+            &mut progress,
+            RelayRecvProgressSend::new(None, TrafficClass::Throughput, false),
+        )
+        .await
+        .expect("blocked MAX_DATA publication is retryable");
+
+    assert!(!sent);
+    assert_eq!(
+        recv_stream.published_max_offset(),
+        0,
+        "credit must remain unavailable until the frame is queued"
+    );
+    assert!(matches!(
+        try_recv_reliable_path_priority_command(&mut receivers),
+        Some(ReliablePathCommand::SendFrame(Frame::StreamAck { .. }))
+    ));
+
+    let retried = sender
+        .send_recv_progress(
+            &mut remotes,
+            &context,
+            &mut recv_stream,
+            &mut progress,
+            RelayRecvProgressSend::new(None, TrafficClass::Throughput, false),
+        )
+        .await
+        .expect("MAX_DATA publication should retry once capacity returns");
+
+    assert!(retried);
+    let Some(ReliablePathCommand::SendFrame(Frame::StreamMaxData {
+        stream_id: published_stream_id,
+        max_offset,
+    })) = try_recv_reliable_path_priority_command(&mut receivers)
+    else {
+        panic!("retry must enqueue STREAM_MAX_DATA");
+    };
+    assert_eq!(published_stream_id, stream_id);
+    assert_eq!(recv_stream.published_max_offset(), max_offset);
+    assert!(max_offset > 0);
 }
 
 #[tokio::test]
@@ -471,7 +542,7 @@ async fn client_recv_progress_uses_available_control_queue_instead_of_full_low_e
         .send_recv_progress(
             &mut remotes,
             &context,
-            &recv_stream,
+            &mut recv_stream,
             &mut progress,
             RelayRecvProgressSend::new(None, TrafficClass::Throughput, false),
         )
@@ -529,7 +600,7 @@ async fn client_recv_progress_uses_lowest_eta_attached_path() {
         .send_recv_progress(
             &mut remotes,
             &context,
-            &recv_stream,
+            &mut recv_stream,
             &mut progress,
             RelayRecvProgressSend::new(None, TrafficClass::Throughput, false),
         )
@@ -584,7 +655,7 @@ async fn client_recv_progress_uses_metrics_not_attachment_order() {
         .send_recv_progress(
             &mut remotes,
             &context,
-            &recv_stream,
+            &mut recv_stream,
             &mut progress,
             RelayRecvProgressSend::new(None, TrafficClass::Latency, true),
         )

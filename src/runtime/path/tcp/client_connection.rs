@@ -6,15 +6,17 @@
 
 use super::io::{EncryptedTcpWriter, spawn_encrypted_tcp_reader};
 use super::metrics::TcpMetricPublisher;
-use crate::config::SecurityConfig;
+use crate::config::ClientSecurityConfig;
 use crate::mux::MuxLimits;
 use crate::protocol::codec::CodecLimits;
-use crate::protocol::{CloseReason, Frame, PathId, PathUsage, SessionId, UnderlayProtocol};
+use crate::protocol::{CloseReason, Frame, PathId, PathUsage, SessionId};
 use crate::runtime::error::RuntimeError;
 use crate::runtime::identity::random_u64;
-use crate::runtime::path::authentication::ClientPathAuthenticationFrames;
 use crate::runtime::path::commands::reliable_path_writer_frame_queue;
-use crate::transport::encrypted::{EncryptedFramedStream, EncryptedFramedTransportError, PeerRole};
+use crate::runtime::path::tcp::admission::ClientTcpPathAuthentication;
+use crate::transport::encrypted::{
+    EncryptedFramedStream, EncryptedFramedTransportError, TcpClientTlsConfig,
+};
 use crate::transport::tcp::{self as tcp_transport, TcpConnectOptions};
 use crate::transport::{CarrierNetworkProvider, CarrierPathIdentity, PathSpec};
 use std::time::{Duration, Instant};
@@ -40,7 +42,8 @@ pub(in crate::runtime) struct ClientTcpCarrierConnect<'a> {
     pub(in crate::runtime) path_index: usize,
     pub(in crate::runtime) carrier_identity: CarrierPathIdentity,
     pub(in crate::runtime) session_id: SessionId,
-    pub(in crate::runtime) security: &'a SecurityConfig,
+    pub(in crate::runtime) security: &'a ClientSecurityConfig,
+    pub(in crate::runtime) tls: &'a TcpClientTlsConfig,
     pub(in crate::runtime) codec_limits: CodecLimits,
     pub(in crate::runtime) mux_limits: MuxLimits,
     pub(in crate::runtime) carrier_network: &'a dyn CarrierNetworkProvider,
@@ -135,6 +138,7 @@ pub(in crate::runtime) async fn connect_client_tcp_carrier(
         carrier_identity,
         session_id,
         security,
+        tls,
         codec_limits,
         mux_limits,
         carrier_network,
@@ -152,35 +156,30 @@ pub(in crate::runtime) async fn connect_client_tcp_carrier(
         )
         .await?;
         let mut tcp_metrics = TcpMetricPublisher::capture(&tcp_stream);
-        let mut framed = EncryptedFramedStream::with_cipher_suite(
-            tcp_stream,
-            security.secret.as_bytes(),
-            PeerRole::Client,
-            codec_limits,
-            security.cipher,
-        )?;
+        let mut framed = EncryptedFramedStream::connect(tcp_stream, tls, codec_limits).await?;
         let path_id = PathId(path_index as u16);
-        let authentication_frames = ClientPathAuthenticationFrames::for_session(
-            security,
-            path_id,
-            UnderlayProtocol::Tcp,
-            session_id,
-        )?;
+        let tls_exporter = framed.tcp_admission_exporter()?;
+        let (admission_prelude, path_join) =
+            ClientTcpPathAuthentication::for_session(security, path_id, session_id, &tls_exporter)?
+                .into_parts();
 
         let readiness_started_at = Instant::now();
         framed
-            .write_frames(&authentication_frames.into_array())
-            .await?;
-        framed
-            .write_frame(&Frame::PathStatus {
-                path_id,
-                sequence: 0,
-                usage: if path.metadata.policy.backup {
-                    PathUsage::Backup
-                } else {
-                    PathUsage::Available
-                },
-            })
+            .write_tcp_admission(
+                &admission_prelude,
+                &[
+                    path_join,
+                    Frame::PathStatus {
+                        path_id,
+                        sequence: 0,
+                        usage: if path.metadata.policy.backup {
+                            PathUsage::Backup
+                        } else {
+                            PathUsage::Available
+                        },
+                    },
+                ],
+            )
             .await?;
         framed.flush().await?;
 

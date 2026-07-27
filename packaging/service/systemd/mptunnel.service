@@ -1,0 +1,32 @@
+[Unit]
+Description=MPTUNNEL encrypted multipath proxy and tunnel
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+Type=simple
+User=mptunnel
+Group=mptunnel
+ExecStart=/usr/local/bin/mptunnel --config /etc/mptunnel/config.toml
+Restart=on-failure
+RestartSec=2s
+TimeoutStopSec=30s
+KillSignal=SIGTERM
+UMask=0077
+LimitNOFILE=1048576
+
+# Managed TUN and listeners below port 1024 need these capabilities. Remove
+# both lines for a proxy-only deployment that uses unprivileged ports.
+AmbientCapabilities=CAP_NET_ADMIN CAP_NET_BIND_SERVICE
+CapabilityBoundingSet=CAP_NET_ADMIN CAP_NET_BIND_SERVICE
+NoNewPrivileges=true
+
+PrivateTmp=true
+ProtectHome=true
+ProtectSystem=full
+ReadWritePaths=/etc/mptunnel
+StateDirectory=mptunnel
+RuntimeDirectory=mptunnel
+
+[Install]
+WantedBy=multi-user.target

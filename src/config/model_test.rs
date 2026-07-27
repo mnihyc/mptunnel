@@ -1,5 +1,148 @@
 use super::*;
 
+fn managed_tun(route_mode: crate::platform::RouteMode) -> crate::ingress::tun::TunL4Config {
+    use crate::ingress::tun::{ManagedVpnConfig, ManagedVpnPlatformConfig, TunHostConfig};
+
+    crate::ingress::tun::TunL4Config {
+        host: TunHostConfig::Managed(ManagedVpnConfig {
+            route_mode,
+            excludes: Vec::new(),
+            local_lan: false,
+            dns_capture_servers: vec!["10.88.0.53".parse().expect("DNS capture server")],
+            platform: ManagedVpnPlatformConfig::default(),
+        }),
+        ..crate::ingress::tun::TunL4Config::default()
+    }
+}
+
+#[test]
+fn external_tun_is_the_non_mutating_default() {
+    let tun = crate::ingress::tun::TunL4Config::default();
+
+    assert!(tun.managed_vpn().is_none());
+    assert!(tun.managed_dns_capture_servers().is_empty());
+    assert_eq!(tun.compile_managed_vpn().expect("compile"), None);
+}
+
+#[test]
+fn managed_full_tun_compiles_portable_platform_config() {
+    let mut tun = managed_tun(crate::platform::RouteMode::Full);
+    tun.name = None;
+    let managed = tun.managed_vpn().expect("managed");
+    assert_eq!(
+        tun.managed_dns_capture_servers(),
+        managed.dns_capture_servers
+    );
+
+    let platform = tun
+        .compile_managed_vpn()
+        .expect("compile")
+        .expect("managed config");
+    assert_eq!(
+        platform.addresses(),
+        &["10.88.0.1/24".parse().expect("address")]
+    );
+    assert_eq!(platform.route_mode(), &crate::platform::RouteMode::Full);
+    assert_eq!(
+        platform.dns().expect("DNS").servers(),
+        &["10.88.0.53".parse::<std::net::IpAddr>().expect("DNS")]
+    );
+}
+
+#[test]
+fn managed_vpn_compile_excludes_platform_identity_and_linux_tuning() {
+    let mut tun = managed_tun(crate::platform::RouteMode::Full);
+    tun.name = Some("host/adapter/owned/name".to_string());
+    let baseline = tun
+        .compile_managed_vpn()
+        .expect("portable compile")
+        .expect("managed config");
+    let crate::ingress::tun::TunHostConfig::Managed(managed) = &mut tun.host else {
+        panic!("managed host");
+    };
+    managed.platform.linux = Some(
+        crate::platform::LinuxPolicyConfig::new(
+            51_900,
+            10_100,
+            10_101,
+            crate::platform::LinuxSocketMark::new(0x1234).expect("socket mark"),
+        )
+        .expect("Linux tuning"),
+    );
+
+    assert_eq!(
+        tun.compile_managed_vpn()
+            .expect("portable compile with tuning")
+            .expect("managed config"),
+        baseline,
+        "portable desired state must not absorb platform identity or Linux RPDB tuning"
+    );
+}
+
+#[test]
+fn managed_full_tun_requires_local_dns_capture() {
+    let mut tun = managed_tun(crate::platform::RouteMode::Full);
+    let crate::ingress::tun::TunHostConfig::Managed(managed) = &mut tun.host else {
+        panic!("managed host");
+    };
+    managed.dns_capture_servers.clear();
+
+    assert!(matches!(
+        validate_tun_l4(&tun),
+        Err(ConfigError::ManagedVpn(message))
+            if message.contains("full VPN requires at least one DNS capture server")
+    ));
+}
+
+#[test]
+fn managed_tun_rejects_external_dns_and_gateway_fields() {
+    let mut tun = managed_tun(crate::platform::RouteMode::Full);
+    tun.dns_resolvers = vec!["1.1.1.1:53".parse().expect("resolver")];
+    assert!(matches!(
+        validate_tun_l4(&tun),
+        Err(ConfigError::ManagedVpn(message))
+            if message.contains("cannot set external TUN dns_resolvers")
+    ));
+
+    tun.dns_resolvers.clear();
+    tun.ipv4_gateway = Some("10.88.0.254".parse().expect("gateway"));
+    assert!(matches!(
+        validate_tun_l4(&tun),
+        Err(ConfigError::ManagedVpn(message))
+            if message.contains("external/manual TUN IPv4 gateway")
+    ));
+}
+
+#[test]
+fn managed_tun_uses_platform_family_validation() {
+    let mut tun = managed_tun(crate::platform::RouteMode::Split(vec![
+        "2001:db8::/32".parse().expect("include"),
+    ]));
+    let crate::ingress::tun::TunHostConfig::Managed(managed) = &mut tun.host else {
+        panic!("managed host");
+    };
+    managed.dns_capture_servers.clear();
+
+    assert!(matches!(
+        validate_tun_l4(&tun),
+        Err(ConfigError::ManagedVpn(message))
+            if message.contains("no configured TUN address of the same family")
+    ));
+}
+
+#[test]
+fn node_rejects_multiple_managed_tun_owners() {
+    let ingress = |tag: &str| LocalIngressConfig {
+        tag: Some(tag.to_string()),
+        config: IngressConfig::TunL4(managed_tun(crate::platform::RouteMode::Full)),
+    };
+
+    assert_eq!(
+        validate_local_ingresses(&[ingress("tun-a"), ingress("tun-b")]),
+        Err(ConfigError::MultipleManagedTunInbounds { actual: 2 })
+    );
+}
+
 #[test]
 fn extra_traffic_hint_default_is_five_percent() {
     assert_eq!(
@@ -9,7 +152,7 @@ fn extra_traffic_hint_default_is_five_percent() {
 }
 
 #[test]
-fn udp_paths_reject_unknown_query_parameters() {
+fn udp_path_configuration_is_strict_and_requires_sni_identity() {
     let default_path = "udp://127.0.0.1:443"
         .parse::<PathSpec>()
         .expect("default udp path parses");
@@ -28,31 +171,54 @@ fn udp_paths_reject_unknown_query_parameters() {
             .parse::<PathSpec>()
             .is_err()
     );
+
+    let security = ClientSecurityConfig::for_test(
+        SharedSecret::new(b"0123456789abcdef0123456789abcdef".to_vec())
+            .expect("test shared secret"),
+    );
+    let outbound = MppOutboundConfig {
+        security: security.clone(),
+        paths: vec![ClientPathConfig {
+            spec: default_path,
+            security,
+            tls: crate::transport::encrypted::test_client_tls_config_for_server_name("127.0.0.1"),
+        }],
+        path_probe_interval: DEFAULT_PATH_PROBE_INTERVAL,
+        path_probe_timeout: DEFAULT_PATH_PROBE_TIMEOUT,
+        performance: MppPerformanceConfig::default(),
+    };
+    assert_eq!(
+        validate_mpp_outbound(&outbound, ResourceLimits::default()),
+        Err(ConfigError::QuicTlsServerNameRequiresDns)
+    );
 }
 
 #[test]
 fn server_paths_reject_client_source_binding() {
-    let security = SecurityConfig::encrypted(
+    let security = ServerSecurityConfig::for_test(
         SharedSecret::new(b"0123456789abcdef0123456789abcdef".to_vec())
             .expect("test shared secret"),
     );
-    let server = ServerConfig {
+    let server = MppInboundConfig {
         tag: None,
-        route_target: None,
+        route_target: RouteTarget {
+            kind: RouteTargetKind::Outbound,
+            tag: "direct".to_string(),
+        },
+        dns_plan: None,
         bind_paths: vec![
             "tcp://127.0.0.1:443?source-ip=127.0.0.1"
                 .parse()
                 .expect("server path"),
         ],
         security,
-        outbound: OutboundConfig::Direct,
-        outbound_dns: DnsConfig::default(),
-        outbound_connect_timeout: DEFAULT_OUTBOUND_CONNECT_TIMEOUT,
+        tls: crate::transport::encrypted::test_server_tls_config(),
+        destination_acl: ServerDestinationAclConfig::default(),
         performance: MppPerformanceConfig::default(),
     };
 
     assert_eq!(
-        validate_server_config(&server, ResourceLimits::default()),
+        validate_mpp_inbound(&server, ResourceLimits::default()),
         Err(ConfigError::ServerPathSourceBinding)
     );
 }
@@ -153,6 +319,39 @@ fn quic_idle_timeout_must_exceed_native_keep_alive() {
 
     assert_eq!(
         limits.validate(),
-        Err(ConfigError::QuicPathIdleTimeoutTooSmall)
+        Err(crate::performance::ResourceLimitError::QuicPathIdleTimeoutTooSmall)
     );
+}
+
+#[test]
+fn app_config_maps_engine_resource_errors_to_product_config_errors() {
+    assert_eq!(
+        ConfigError::from(crate::performance::ResourceLimitError::QuicPathIdleTimeoutTooSmall),
+        ConfigError::QuicPathIdleTimeoutTooSmall
+    );
+}
+
+#[test]
+fn default_dns_policy_is_explicit_system_resolution() {
+    let compiled = DnsPolicyConfig::default().compile().expect("default DNS");
+    assert!(compiled.uses_system_resolution());
+    assert!(!compiled.is_encrypted_only());
+    assert!(compiled.bootstrap_endpoints().next().is_none());
+}
+
+#[test]
+fn dns_runtime_bounds_are_validated_by_the_product_owner() {
+    let mut config = DnsPolicyConfig::default();
+    config.spec.plans[0].limits.max_inflight = 0;
+    assert!(matches!(
+        config.compile(),
+        Err(crate::product::DnsCompileError::InvalidPlanLimits(_))
+    ));
+
+    let mut config = DnsPolicyConfig::default();
+    config.spec.plans[0].limits.positive_ttl_cap = Duration::ZERO;
+    assert!(matches!(
+        config.compile(),
+        Err(crate::product::DnsCompileError::InvalidPlanLimits(_))
+    ));
 }

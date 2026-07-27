@@ -7,7 +7,8 @@ use bytes::Bytes;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 
 const MAGIC: &[u8; 4] = b"MPTF";
-const VERSION: u8 = 3;
+const VERSION: u8 = 4;
+const MAX_CREDENTIAL_ID_BYTES: usize = 64;
 pub const FRAME_HEADER_LEN: usize = 10;
 const PATH_METRICS_ENCODED_LEN: usize = 104;
 const PEER_PATH_STATUS_ENCODED_LEN: usize = 2 + PATH_METRICS_ENCODED_LEN;
@@ -32,7 +33,7 @@ impl Default for CodecLimits {
     }
 }
 
-pub(crate) fn peer_status_response_path_limit(limits: CodecLimits) -> usize {
+pub fn peer_status_response_path_limit(limits: CodecLimits) -> usize {
     let frame_limit = limits
         .max_frame_bytes
         .saturating_sub(FRAME_HEADER_LEN + PEER_STATUS_RESPONSE_FIXED_PAYLOAD_LEN)
@@ -111,7 +112,7 @@ pub fn encode_frame_into(
     Ok(())
 }
 
-pub(crate) fn encoded_frame_capacity_hint(frame: &Frame) -> usize {
+pub fn encoded_frame_capacity_hint(frame: &Frame) -> usize {
     FRAME_HEADER_LEN.saturating_add(encoded_payload_capacity_hint(frame))
 }
 
@@ -227,11 +228,13 @@ fn encode_payload(
         }
         Frame::SessionAuth {
             session_id,
+            credential_id,
             nonce,
             issued_at_unix_secs,
             auth_tag,
         } => {
             put_u64(out, session_id.0);
+            encode_credential_id(out, credential_id)?;
             encode_nonce(out, *nonce);
             put_u64(out, *issued_at_unix_secs);
             encode_auth_tag(out, *auth_tag);
@@ -244,6 +247,7 @@ fn encode_payload(
         }
         Frame::PathJoin {
             session_id,
+            credential_id,
             path_id,
             underlay,
             nonce,
@@ -251,6 +255,7 @@ fn encode_payload(
             auth_tag,
         } => {
             put_u64(out, session_id.0);
+            encode_credential_id(out, credential_id)?;
             put_u16(out, path_id.0);
             put_u8(out, underlay_to_u8(*underlay));
             encode_nonce(out, *nonce);
@@ -478,6 +483,7 @@ fn decode_payload(
         }),
         FrameKind::SessionAuth => Ok(Frame::SessionAuth {
             session_id: SessionId(reader.get_u64()?),
+            credential_id: decode_credential_id(reader)?,
             nonce: decode_nonce(reader)?,
             issued_at_unix_secs: reader.get_u64()?,
             auth_tag: decode_auth_tag(reader)?,
@@ -488,6 +494,7 @@ fn decode_payload(
         }),
         FrameKind::PathJoin => Ok(Frame::PathJoin {
             session_id: SessionId(reader.get_u64()?),
+            credential_id: decode_credential_id(reader)?,
             path_id: PathId(reader.get_u16()?),
             underlay: underlay_from_u8(reader.get_u8()?)?,
             nonce: decode_nonce(reader)?,
@@ -754,6 +761,46 @@ fn encode_host(
     out.extend_from_slice(host.as_bytes());
     put_u16(out, port);
     Ok(())
+}
+
+fn encode_credential_id(out: &mut Vec<u8>, credential_id: &str) -> Result<(), CodecError> {
+    if !credential_id_is_canonical(credential_id) {
+        return Err(CodecError::InvalidCredentialId);
+    }
+    put_u8(
+        out,
+        u8::try_from(credential_id.len()).map_err(|_| CodecError::LengthOverflow)?,
+    );
+    out.extend_from_slice(credential_id.as_bytes());
+    Ok(())
+}
+
+fn decode_credential_id(reader: &mut Reader<'_>) -> Result<String, CodecError> {
+    let length = reader.get_u8()? as usize;
+    if length > MAX_CREDENTIAL_ID_BYTES {
+        return Err(CodecError::InvalidCredentialId);
+    }
+    let value = std::str::from_utf8(reader.get_exact(length)?)
+        .map_err(|_| CodecError::InvalidUtf8)?
+        .to_owned();
+    if !credential_id_is_canonical(&value) {
+        return Err(CodecError::InvalidCredentialId);
+    }
+    Ok(value)
+}
+
+fn credential_id_is_canonical(value: &str) -> bool {
+    if value.is_empty() || value.len() > MAX_CREDENTIAL_ID_BYTES {
+        return false;
+    }
+    let mut bytes = value.bytes();
+    let Some(first) = bytes.next() else {
+        return false;
+    };
+    (first.is_ascii_lowercase() || first.is_ascii_digit())
+        && bytes.all(|byte| {
+            byte.is_ascii_lowercase() || byte.is_ascii_digit() || matches!(byte, b'.' | b'_' | b'-')
+        })
 }
 
 fn encode_nonce(out: &mut Vec<u8>, nonce: AuthNonce) {
@@ -1233,6 +1280,7 @@ pub enum CodecError {
     HostTooLong { actual: usize, limit: usize },
     TooManyAckRanges { actual: usize, limit: usize },
     InvalidUtf8,
+    InvalidCredentialId,
     InvalidEnum,
     InvalidRange,
     InvalidPort,
@@ -1260,6 +1308,7 @@ impl std::fmt::Display for CodecError {
                 write!(f, "ACK has {actual} ranges, limit is {limit}")
             }
             Self::InvalidUtf8 => write!(f, "string field is not valid UTF-8"),
+            Self::InvalidCredentialId => write!(f, "invalid credential ID"),
             Self::InvalidEnum => write!(f, "invalid enum value"),
             Self::InvalidRange => write!(f, "invalid offset range"),
             Self::InvalidPort => write!(f, "port must be in 1..=65535"),

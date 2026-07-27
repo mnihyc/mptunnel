@@ -18,7 +18,6 @@ cargo fmt --all -- --check
 cargo clippy --locked --all-targets --all-features -- -D warnings
 cargo test --locked --all-features
 python3 -m unittest discover --start-directory lab --pattern 'test_*.py'
-scripts/check-line-counts.sh
 ```
 
 Keep production modules aligned with [the source structure rules](docs/CODE_STRUCTURE.md).

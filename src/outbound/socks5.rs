@@ -1,9 +1,11 @@
-use crate::outbound::{OutboundError, validate_target};
+use crate::outbound::{OutboundError, ProxyCredentials, validate_target};
 use crate::protocol::TargetAddr;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 
 const VERSION: u8 = 0x05;
 const METHOD_NO_AUTH: u8 = 0x00;
+const METHOD_USERNAME_PASSWORD: u8 = 0x02;
+const USERNAME_PASSWORD_VERSION: u8 = 0x01;
 const CMD_CONNECT: u8 = 0x01;
 const CMD_UDP_ASSOCIATE: u8 = 0x03;
 const ATYP_IPV4: u8 = 0x01;
@@ -12,6 +14,25 @@ const ATYP_IPV6: u8 = 0x04;
 
 pub fn no_auth_greeting() -> [u8; 3] {
     [VERSION, 0x01, METHOD_NO_AUTH]
+}
+
+pub fn username_password_greeting() -> [u8; 3] {
+    [VERSION, 0x01, METHOD_USERNAME_PASSWORD]
+}
+
+pub fn username_password_request(credentials: &ProxyCredentials) -> Vec<u8> {
+    let username = credentials.username().as_bytes();
+    let password = credentials.password().as_bytes();
+    debug_assert!(!username.is_empty() && username.len() <= u8::MAX as usize);
+    debug_assert!(!password.is_empty() && password.len() <= u8::MAX as usize);
+
+    let mut request = Vec::with_capacity(3 + username.len() + password.len());
+    request.push(USERNAME_PASSWORD_VERSION);
+    request.push(username.len() as u8);
+    request.extend_from_slice(username);
+    request.push(password.len() as u8);
+    request.extend_from_slice(password);
+    request
 }
 
 pub fn connect_request(target: &TargetAddr) -> Result<Vec<u8>, OutboundError> {
@@ -32,6 +53,19 @@ pub fn parse_method_selection(input: &[u8]) -> Result<Socks5MethodSelection, Soc
         return Err(Socks5ClientError::UnsupportedVersion(input[0]));
     }
     Ok(Socks5MethodSelection { method: input[1] })
+}
+
+pub fn parse_username_password_reply(input: &[u8]) -> Result<(), Socks5ClientError> {
+    if input.len() < 2 {
+        return Err(Socks5ClientError::Incomplete);
+    }
+    if input[0] != USERNAME_PASSWORD_VERSION {
+        return Err(Socks5ClientError::UnsupportedAuthVersion(input[0]));
+    }
+    if input[1] != 0 {
+        return Err(Socks5ClientError::AuthenticationRejected);
+    }
+    Ok(())
 }
 
 pub fn parse_connect_reply(input: &[u8]) -> Result<Socks5ConnectReply, Socks5ClientError> {
@@ -160,6 +194,8 @@ pub struct Socks5ConnectReply {
 pub enum Socks5ClientError {
     Incomplete,
     UnsupportedVersion(u8),
+    UnsupportedAuthVersion(u8),
+    AuthenticationRejected,
     UnsupportedAddressType(u8),
     InvalidReservedByte,
     InvalidDomain,
@@ -172,6 +208,15 @@ impl std::fmt::Display for Socks5ClientError {
             Self::Incomplete => write!(f, "incomplete SOCKS5 response"),
             Self::UnsupportedVersion(version) => {
                 write!(f, "unsupported SOCKS version {version}")
+            }
+            Self::UnsupportedAuthVersion(version) => {
+                write!(
+                    f,
+                    "unsupported SOCKS5 username/password auth version {version}"
+                )
+            }
+            Self::AuthenticationRejected => {
+                write!(f, "SOCKS5 proxy rejected username/password authentication")
             }
             Self::UnsupportedAddressType(atyp) => {
                 write!(f, "unsupported SOCKS5 address type {atyp}")

@@ -3,6 +3,7 @@
 //! The carrier owns flow membership and wire replies; accepted target workers
 //! and their policy lifetime arrive through the neutral datagram port.
 
+use crate::product::PrincipalPermit;
 use crate::protocol::frame::datagram_feedback_range;
 use crate::protocol::{DatagramFlowId, DatagramId, Frame, SessionId, TargetAddr};
 use crate::runtime::error::RuntimeError;
@@ -37,6 +38,7 @@ impl ServerTcpDatagramState {
         context: &ServerPathContext,
         commands: &ReliablePathCommandSender,
         session_id: SessionId,
+        principal_permit: PrincipalPermit,
         flow_id: DatagramFlowId,
         target: TargetAddr,
     ) -> Result<ServerTcpDatagramEffect, RuntimeError> {
@@ -52,6 +54,7 @@ impl ServerTcpDatagramState {
             .datagrams
             .open(ServerDatagramOpenRequest {
                 session_id,
+                principal_permit,
                 flow_id,
                 target,
                 commands: commands.clone(),
@@ -97,7 +100,12 @@ impl ServerTcpDatagramState {
                 })
             }
             ServerDatagramSendOutcome::Full => {
-                eprintln!("warning: TCP datagram worker queue full; dropping request");
+                crate::observability::process_event!(
+                    Warn,
+                    "tcp_datagram",
+                    "worker_queue_full",
+                    "TCP datagram worker queue full; dropping request"
+                );
                 ServerTcpDatagramEffect::None
             }
             ServerDatagramSendOutcome::Closed => {

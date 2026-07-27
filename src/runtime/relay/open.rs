@@ -6,7 +6,10 @@
 
 #[cfg(feature = "lab-diagnostics")]
 use crate::lab_diagnostics::lab_diagnostic;
-use crate::model::capacity::PATH_OPEN_SCORE_BYTES;
+use crate::model::capacity::{
+    PATH_OPEN_SCORE_BYTES, RELIABLE_STREAM_ATTACHMENT_ACCEPT_MAX_OFFSET,
+    reliable_stream_initial_advertised_window_bytes,
+};
 use crate::model::path::RelayPathKey;
 use crate::model::timing::{
     path_open_pto, path_open_serialized_exchanges, path_open_timeout, transport_pto_from_snapshot,
@@ -97,6 +100,11 @@ async fn open_reliable_initial_attempt(
                 lane,
                 key.index,
                 open_deadlines,
+                reliable_stream_initial_advertised_window_bytes(
+                    key.underlay,
+                    lane,
+                    context.mux_limits,
+                ),
             )
             .await
             {
@@ -131,6 +139,11 @@ async fn open_reliable_initial_attempt(
                     lane,
                     key.index,
                     open_deadline,
+                    reliable_stream_initial_advertised_window_bytes(
+                        key.underlay,
+                        lane,
+                        context.mux_limits,
+                    ),
                 ),
             )
             .await
@@ -218,6 +231,7 @@ pub(in crate::runtime) async fn open_remote_stream_on_path(
         lane,
         path_index,
         open_deadlines,
+        RELIABLE_STREAM_ATTACHMENT_ACCEPT_MAX_OFFSET,
     )
     .await;
     match open_result {
@@ -299,6 +313,7 @@ pub(in crate::runtime) async fn open_remote_stream_on_preselected_tcp_path(
     lane: TrafficClass,
     path_index: usize,
     open_deadlines: ClientTcpOpenDeadlines,
+    advertised_recv_max_offset: u64,
 ) -> Result<OpenedRemoteStream, RuntimeError> {
     #[cfg(feature = "lab-diagnostics")]
     lab_diagnostic(
@@ -317,7 +332,13 @@ pub(in crate::runtime) async fn open_remote_stream_on_preselected_tcp_path(
         .tcp_sessions
         .get(path_index)
         .ok_or(RuntimeError::NoSchedulableTcpPath)?
-        .open_stream_with_deadlines(stream_id, target, lane, open_deadlines)
+        .open_stream_with_deadlines(
+            stream_id,
+            target,
+            lane,
+            open_deadlines,
+            advertised_recv_max_offset,
+        )
         .await?;
     let pending = OpenedRemoteStream::from_opened_carrier(opened.carrier, path_index);
     tokio::time::timeout_at(
@@ -370,6 +391,7 @@ pub(in crate::runtime) async fn open_remote_stream_on_udp_path(
             lane,
             path_index,
             open_deadline,
+            RELIABLE_STREAM_ATTACHMENT_ACCEPT_MAX_OFFSET,
         ),
     )
     .await
@@ -418,6 +440,7 @@ pub(in crate::runtime) async fn open_remote_stream_on_preselected_udp_path(
     lane: TrafficClass,
     path_index: usize,
     open_deadline: tokio::time::Instant,
+    advertised_recv_max_offset: u64,
 ) -> Result<OpenedRemoteStream, RuntimeError> {
     #[cfg(feature = "lab-diagnostics")]
     lab_diagnostic(
@@ -436,7 +459,13 @@ pub(in crate::runtime) async fn open_remote_stream_on_preselected_udp_path(
         .udp_sessions
         .get(path_index)
         .ok_or(RuntimeError::NoSchedulableUdpPath)?
-        .open_stream(stream_id, target, lane, open_deadline)
+        .open_stream(
+            stream_id,
+            target,
+            lane,
+            open_deadline,
+            advertised_recv_max_offset,
+        )
         .await?;
     let pending = OpenedRemoteStream::from_opened_carrier(carrier, path_index);
     let elapsed = started_at.elapsed();

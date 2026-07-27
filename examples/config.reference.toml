@@ -1,0 +1,516 @@
+# Exhaustive configuration reference with one runnable common-client profile.
+# Active values expose local SOCKS5 and HTTP CONNECT through one TCP/QUIC MPP
+# peer. Commented blocks cover every other supported TOML shape without
+# opening extra listeners. Create the referenced credential file, replace the
+# example endpoint and TLS material, then run:
+#
+#   mptunnel --config ./config.toml --check-config
+#
+# Minimal client and server profiles live in ./examples. Unknown TOML keys are
+# rejected. `mptunnel platform` reports host integration support; it is a
+# command, not a TOML setting.
+
+# off, error, warn, info, debug, or trace. Records are bounded, redacted, and
+# rate-limited per lifecycle/fault call site. Set MPTUNNEL_LOG_FORMAT=json for
+# newline-delimited JSON; structured text is the default.
+log_level = "info"
+check_config = false
+
+# Global named credentials are referenced by MPP inbounds and outbounds.
+# File references are resolved relative to this TOML document. Environment
+# references use: secret = { from = "environment", name = "MPTUNNEL_HOME_KEY" }.
+[[credentials]]
+id = "home-2026"
+principal = "home"
+secret = { from = "file", path = "mpp-credential.key" }
+# expires_at_unix_secs = 1798761600
+# revoked = false
+# revocation_grace_seconds = 30
+
+# Optional named users for local SOCKS5 and HTTP CONNECT authentication.
+# Login names and passwords are protocol credentials; `principal` is the
+# stable Product identity used by routing and admission. Passwords are never
+# accepted inline.
+# [[local_users]]
+# id = "phone-login"
+# principal = "family"
+# username = "mobile-user"
+# password = { from = "file", path = "local-proxy-password.key" }
+
+[service]
+# Supervision owns process generations, never MPP session state.
+service_mode = false
+supervise = false
+restart_backoff_ms = 1000
+restart_max_backoff_ms = 30000
+# Omit max_restarts for unlimited in-process restart attempts.
+max_restarts = 10
+
+[session]
+# Established streams survive a complete carrier outage for five minutes.
+# Healthy idle streams with an authenticated carrier do not consume this timer.
+retention_timeout_ms = 300000
+
+[management]
+# The API is disabled while listen is empty. To enable it, replace listen with
+# one or more loopback addresses and reference a separate 16..=256 byte
+# visible-ASCII operator-token file. Dashboard serving requires the API; peer
+# diagnosis is an independent, symmetric permission for authenticated MPP peers.
+listen = []
+# token = { from = "file", path = "management-token.key" }
+dashboard = false
+allow_peer_diagnostics = false
+# With a nonempty listener and token, this file is also the operator profile:
+#   mptunnel --config ./config.toml status
+#   mptunnel --config ./config.toml dns status
+#   mptunnel --config ./config.toml dns explain example.com
+# `route explain` and `doctor` also load this strict file without starting the
+# runtime. See docs/OPERATIONS.md for their typed inputs and exit behavior.
+
+[resources]
+# These are bounded capacity envelopes. Live transport metrics choose paths and
+# scheduling; these values do not select a fixed latency or bulk mode.
+max_frame_bytes = 1048576
+max_payload_bytes = 1048512
+max_ack_ranges = 256
+max_paths = 64
+max_streams = 65536
+max_quic_concurrent_bidi_streams = 65536
+max_stream_window_bytes = 67108864
+max_repair_bytes = 67108864
+max_reorder_bytes = 67108864
+max_datagram_queue_bytes = 16777216
+max_path_flight_bytes = 67108864
+max_reliable_relay_chunk_bytes = 524288
+
+# TCP record heartbeats and native QUIC liveness are separate carrier
+# mechanisms. Both remain below the logical session-retention layer.
+tcp_path_heartbeat_interval_ms = 10000
+tcp_path_heartbeat_timeout_ms = 30000
+quic_path_keep_alive_interval_ms = 10000
+quic_path_idle_timeout_ms = 30000
+
+# Product admission is a separate open/control-time owner. These limits do not
+# derive from, resize, or feed Core MPP path/session/stream/queue budgets.
+# Established permits do no per-byte or per-packet accounting.
+[admission]
+max_live_flows = 4096
+max_concurrent_work = 512
+max_live_flows_per_principal = 1024
+max_live_flows_per_outbound = 3072
+max_connects_per_outbound = 256
+max_live_flows_per_target = 256
+max_connects_per_target = 32
+max_dns_work = 128
+
+# DNS is one global tagged policy. Routes and MPP server inbounds may select a
+# plan by ID; exact rules win over the longest matching suffix, then default.
+[dns]
+generation = 1
+default_plan = "system"
+# There is never an implicit host-resolver escape path. Define a tagged
+# `transport = "system"` upstream explicitly when that behavior is wanted.
+system_fallback = false
+
+[[dns.upstreams]]
+id = "system"
+transport = "system"
+
+[[dns.plans]]
+id = "system"
+upstreams = ["system"]
+ip_strategy = "ipv4-and-ipv6"
+security = "allow-plaintext"
+upstream_strategy = "ordered"
+# For plans with at least two upstreams, use `upstream_strategy = "race"` and
+# set `fallback_delay_ms` (zero races all upstreams immediately).
+# fallback_delay_ms = 50
+expected_cidrs = []
+lookup_timeout_ms = 5000
+cache_capacity = 4096
+max_inflight = 64
+max_answers = 64
+positive_ttl_cap_ms = 300000
+negative_ttl_cap_ms = 30000
+stale_if_error_ms = 30000
+prefetch_max_ms = 30000
+
+# Encrypted upstream example. `bootstrap` is always a literal IP socket;
+# `server_name` authenticates TLS and is also the DoH authority. Custom DoH
+# ports are preserved. Use `transport = "tls"` for DoT or
+# `transport = "quic"` for DoQ (both without `path`). Direct and source-bound
+# leaves support DoQ; stream proxy/MPP DNS egress supports TCP/DoT/DoH.
+# [[dns.upstreams]]
+# id = "secure"
+# transport = "https"
+# bootstrap = "1.1.1.1:443"
+# server_name = "cloudflare-dns.com"
+# path = "/dns-query"
+# egress_outbound = "edge-mpp"
+#
+# `egress_outbound` is optional. When present, DNS TCP/DoT/DoH uses that
+# named MPP, SOCKS5, HTTP CONNECT, HTTPS CONNECT, or direct leaf. DoQ and
+# plaintext UDP require a native direct/source-bound leaf.
+#
+# [[dns.plans]]
+# id = "secure"
+# upstreams = ["secure"]
+# security = "require-encrypted"
+#
+# FakeDNS applies only to captured A/AAAA wire queries. Dial-time resolution
+# still obtains real addresses from the selected plan. Synthetic addresses are
+# never reassigned to another domain in one generation; expired/unknown
+# recovery fails closed. IPv4 must be inside 198.18.0.0/15 and IPv6 inside
+# fc00::/7 so a fake pool cannot shadow public destinations. Managed split VPN
+# includes must cover every configured pool and excludes may not overlap one;
+# an external/manual TUN operator owns the equivalent routes.
+# [dns.fake_dns]
+# ipv4_pool = "198.18.0.0/16"
+# ipv6_pool = "fd00:4d50::/112"
+# max_entries = 4096
+# answer_ttl_ms = 30000
+# recovery_ttl_ms = 120000
+#
+# [[dns.rules]]
+# id = "private-zone"
+# suffix = "corp.example"
+# plan = "system"
+# explanation = "private names use the host resolver"
+#
+# Exact immutable host overrides never leak unmatched record types upstream.
+# [[dns.hosts]]
+# name = "router.home.arpa"
+# addresses = ["192.168.1.1", "fd00::1"]
+
+[[inbounds]]
+tag = "local-socks"
+protocol = "socks5"
+# Repeat addresses for explicit IPv4/IPv6 listeners, for example
+# listen = ["127.0.0.1:1080", "[::1]:1080"]. An empty list defaults to IPv4
+# loopback port 1080.
+listen = ["127.0.0.1:1080"]
+# New flows are assigned by the ordered rules in `[routing]` below.
+# users = ["phone-login"]
+
+[inbounds.admission]
+# Product connection-open limits; these do not derive from MPP Core limits.
+max_connections = 1024
+max_connections_per_source = 256
+max_connections_per_principal = 512
+handshake_timeout_ms = 10000
+
+[[inbounds]]
+tag = "local-http"
+protocol = "http-connect"
+# An empty list defaults to IPv4 loopback port 8080.
+listen = ["127.0.0.1:8080"]
+# users = ["phone-login"]
+
+# Optional fixed-target local port forwards. Unlike proxy listeners, `listen`
+# and `target` are required and port zero is rejected. Each accepted flow uses
+# the normal routing, DNS, destination-ACL, outbound, and balancer pipeline.
+#
+# [[inbounds]]
+# tag = "local-tcp-forward"
+# protocol = "tcp-forward"
+# listen = ["127.0.0.1:8443"]
+# target = "service.example:443"
+# max_connections = 1024
+#
+# [[inbounds]]
+# tag = "local-udp-forward"
+# protocol = "udp-forward"
+# listen = ["127.0.0.1:5353"]
+# target = "resolver.example:53"
+# max_associations = 1024
+# idle_timeout_ms = 60000
+# datagram_ttl_ms = 30000
+
+# Optional TUN ingress. It uses the same routing policy as local proxy
+# inbounds. Omitting `host` is explicit external/manual mode: MPTUNNEL opens
+# the device, while the operator owns host routes and DNS.
+# [[inbounds]]
+# tag = "local-tun"
+# protocol = "tun"
+# name = "mptun0"
+# ipv4 = "10.88.0.1"
+# disable_ipv4 = false
+# ipv4_prefix = 24
+# ipv4_gateway = "10.88.0.254"
+# ipv6 = "fd00:88::1"
+# ipv6_prefix = 64
+# mtu = 1500
+# disable_icmp = false
+# dns_resolvers = ["1.1.1.1:53", "[2606:4700:4700::1111]:53"]
+# dns_ttl_ms = 5000
+#
+# To run IPv6-only, set disable_ipv4 = true and remove ipv4 and ipv4_gateway.
+# At least one IP family is required; IPv6 requires an MTU of at least 1280.
+#
+# On a supported host MPTUNNEL can instead own the interface, routes, endpoint
+# bypass, DNS publication, and cleanup transactionally. Full mode requires at
+# least one local DNS capture address and an encrypted, non-system DNS plan.
+# `dns_resolvers` and `ipv4_gateway` are external/manual fields and must remain
+# unset in this mode. Android `VpnService` lifecycle stays host-provided and
+# therefore uses external mode.
+#
+# [inbounds.host]
+# mode = "managed"
+# route_mode = "full" # Or "split" with nonempty include_cidrs.
+# include_cidrs = []
+# exclude_cidrs = []
+# local_lan = true
+# dns_capture_servers = ["10.88.0.53", "fd00:88::53"]
+#
+# Optional Linux-only RPDB tuning is nested below the portable VPN policy.
+# Omit this table for validated platform defaults.
+# [inbounds.host.linux]
+# route_table = 51820
+# native_rule_priority = 9999
+# capture_rule_priority = 10000
+# socket_mark = 0x4d505455
+
+[[outbounds]]
+tag = "edge-mpp"
+protocol = "mpp"
+# TCP and QUIC/UDP remain independent carriers under one MPP session.
+endpoints = [
+  "tcp://server.example.com:7443",
+  "udp://server.example.com:7443",
+]
+# IPv6 literals use brackets: tcp://[2001:db8::10]:7443.
+#
+# Carrier URI query reference (startup hints are replaced by live evidence;
+# policy flags remain operator constraints):
+#   source-ip=<IP>
+#   srtt-ms=<u32>
+#   jitter-ms=<u32>
+#   rate-bps|rate-kbps|rate-mbps=<u64>, or rate=unknown|unlimited
+#   datagram-payload-limit=512..65000
+#   backup, expensive, bulk-allowed, probe-only, no-udp
+# Boolean flags may omit a value or use canonical true/false. Server bind
+# paths reject `source-ip`, and udp:// paths cannot set no-udp=true.
+path_probe_interval_ms = 10000
+path_probe_timeout_ms = 2000
+
+[outbounds.performance]
+# Optional repair traffic is evidence-gated and capped by this operator budget.
+extra_traffic_hint_percent = 5
+
+[outbounds.security]
+credential = "home-2026"
+# TLS identity is independent from the MPP authentication credential and is
+# shared by the TCP and QUIC carriers in this path group. A path group with a
+# QUIC endpoint requires a DNS TLS identity because H3 authority is bound to
+# SNI; the carrier endpoint itself may still be a literal IP address.
+tls_server_name = "server.example.com"
+tls_pinned_certificate_file = "REPLACE_WITH_SERVER_CERT.pem"
+auth_freshness_window_seconds = 300
+
+[routing]
+generation = 1
+
+# Destination authorization is independent from route selection and runs both
+# before and after resolution. Restricted address space is denied unless an
+# explicit matching rule uses `allow-restricted`.
+# [routing.destination_acl]
+#
+# [[routing.destination_acl.rules]]
+# id = "allow-home-service"
+# effect = "allow-restricted"
+# domain_exact = ["router.home.arpa"]
+# destination_cidrs = ["192.168.1.0/24"]
+# destination_ports = [443]
+# networks = ["tcp"]
+# stages = ["pre-resolution", "post-resolution"]
+
+# Route fields are strict and match only attributes available on every live
+# ingress: domain exact/suffix/keyword/regex or signed domain sets,
+# destination/source CIDRs, destination/source ports, TCP/UDP, inbound,
+# principal, and pre/post-resolution stage. Nonempty categories are ANDed;
+# values inside one category are ORed. Unknown fields fail configuration load.
+#
+# Optional signed domain/GeoIP rule sets are loaded and verified as one atomic
+# routing generation. Publisher keys are public Ed25519 keys encoded as base64.
+# Every set pins its signed ID, publisher, and minimum accepted revision so an
+# otherwise valid older artifact cannot be substituted during reload.
+#
+# [[routing.rule_set_publishers]]
+# id = "official"
+# ed25519_public_key_base64 = "REPLACE_WITH_32_BYTE_ED25519_PUBLIC_KEY_BASE64"
+#
+# [[routing.rule_sets]]
+# id = "geo-public"
+# publisher = "official"
+# minimum_revision = 42
+# file = "rules/geo-public.ruleset.json"
+#
+# Rule-set domains are ORed with a rule's explicit domain fields; rule-set
+# networks are ORed with `destination_cidrs`. The two categories remain ANDed
+# with every other nonempty match category.
+# [[routing.rules]]
+# id = "signed-policy"
+# domain_rule_sets = ["geo-public"]
+# destination_rule_sets = ["geo-public"]
+# stages = ["post-resolution"]
+# action = "outbound"
+# target = "edge-mpp"
+# explanation = "route signed domain and network policy through the edge"
+
+[[routing.rules]]
+id = "default"
+action = "outbound"
+target = "edge-mpp"
+traffic_intent = "interactive"
+explanation = "route local proxy traffic through the primary MPP outbound"
+
+# A second independent MPP leaf can join the edge-gateway routing example
+# below; it keeps its own session, carrier set, and performance policy.
+# [[outbounds]]
+# tag = "edge-mpp-secondary"
+# protocol = "mpp"
+# endpoints = [
+#   "tcp://secondary.example.com:7443?backup=true&expensive=true",
+#   "udp://secondary.example.com:7443?backup=true&expensive=true",
+# ]
+# path_probe_interval_ms = 10000
+# path_probe_timeout_ms = 2000
+#
+# [outbounds.performance]
+# extra_traffic_hint_percent = 5
+#
+# [outbounds.security]
+# credential = "secondary-2026"
+# tls_server_name = "secondary.example.com"
+# tls_pinned_certificate_file = "secondary-server-cert.pem"
+# auth_freshness_window_seconds = 300
+
+# Optional server-side MPP inbound
+#
+# Uncomment this block and one egress below to run a symmetric node. An MPP
+# inbound selects one native egress leaf with outbound, or one native gateway
+# balancer. It cannot select an MPP outbound or set both selectors.
+# [[inbounds]]
+# tag = "mpp-listener"
+# protocol = "mpp"
+# endpoints = [
+#   "tcp://0.0.0.0:7443",
+#   "udp://0.0.0.0:7443",
+# ]
+# outbound = "direct-egress"
+# balancer = "egress-fallback" # Alternative: remove outbound before enabling.
+#
+# [inbounds.performance]
+# extra_traffic_hint_percent = 5
+#
+# [inbounds.security]
+# credentials = ["home-2026"]
+# tls_certificate_chain_file = "server-cert-chain.pem"
+# tls_private_key_file = "server-private-key.pem"
+# auth_freshness_window_seconds = 300
+# authentication_timeout_ms = 5000
+# max_pending_authentications = 1024
+#
+# Server-side destination authorization is scoped to this MPP inbound and
+# defaults to denying restricted address space.
+# [inbounds.destination_acl]
+# generation = 1
+#
+# [[inbounds.destination_acl.rules]]
+# id = "allow-private-service"
+# effect = "allow-restricted"
+# destination_cidrs = ["10.0.0.0/8"]
+# destination_ports = [443, "8000-8999"]
+# networks = ["tcp", "udp"]
+# stages = ["pre-resolution", "post-resolution"]
+
+# Server egress leaves
+#
+# Direct egress uses the DNS plan selected globally or by the accepting MPP
+# inbound. Omit bind_ip to let the OS select a source address; set it to bind
+# all target and selected DNS connections to one local source IP.
+# [[outbounds]]
+# tag = "direct-egress"
+# protocol = "direct"
+# bind_ip = "192.0.2.10"
+# connect_timeout_ms = 10000
+#
+# Relay through SOCKS5. TCP CONNECT and UDP ASSOCIATE are supported when the
+# upstream implements them. MPTUNNEL resolves domains through the selected DNS
+# plan and sends the authorized IP target to the proxy.
+# [[outbounds]]
+# tag = "socks5-egress"
+# protocol = "socks5"
+# proxy = "127.0.0.1:1080"
+# connect_timeout_ms = 10000
+#
+# [outbounds.auth]
+# username = "upstream-user"
+# password = { from = "file", path = "upstream-proxy-password.key" }
+#
+# Plain HTTP CONNECT carries TCP targets and supports the same referenced
+# authentication table. MPTUNNEL resolves and authorizes the IP target before
+# opening the proxy tunnel.
+# [[outbounds]]
+# tag = "http-egress"
+# protocol = "http-connect"
+# proxy = "127.0.0.1:8080"
+# connect_timeout_ms = 10000
+#
+# HTTPS CONNECT authenticates the upstream proxy with WebPKI. An optional CA
+# file adds private roots; it does not disable hostname verification.
+# [[outbounds]]
+# tag = "https-egress"
+# protocol = "https-connect"
+# proxy = "127.0.0.1:8443"
+# tls_server_name = "proxy.example.com"
+# tls_ca_certificate_file = "private-proxy-ca.pem"
+# connect_timeout_ms = 10000
+#
+# [outbounds.auth]
+# username = "upstream-user"
+# password = { from = "file", path = "upstream-proxy-password.key" }
+
+# Routing policies
+#
+# Local SOCKS5/HTTP/TUN rules may select an MPP gateway. An MPP inbound may
+# instead select a native-egress gateway. Balancers contain leaf outbounds
+# only; gateways cannot be nested.
+# [routing]
+#
+# An MPP gateway chooses one independent MPP outbound once per new flow. It
+# never merges carrier paths from separate sessions. Selection uses only
+# Product-owned probe/open/flow outcomes; it cannot inspect MPP PathScheduler
+# state or carrier metrics.
+# [[routing.balancers]]
+# tag = "edge-gateway"
+# strategy = "least-latency"
+# Old latency remains observable but stops ranking after this age.
+# freshness_ttl_ms = 30000
+# members = [
+#   { outbound = "edge-mpp", weight = 3, mode = "enabled" },
+#   { outbound = "edge-mpp-secondary", weight = 1, mode = "enabled" },
+# ]
+# health = { failure_threshold = 3, recovery_threshold = 2, initial_backoff_ms = 1000, maximum_backoff_ms = 60000 }
+# stickiness = { key = "destination", ttl_ms = 60000, capacity = 4096 }
+# probe = { target = "192.0.2.1:443", interval_ms = 10000, timeout_ms = 2000 }
+#
+# `ordered-failover` tries enabled members in configured order. Every member
+# retry shares one total open deadline and occurs only before flow commit.
+# [[routing.balancers]]
+# tag = "egress-fallback"
+# strategy = "ordered-failover"
+# members = [{ outbound = "direct-egress" }, { outbound = "socks5-egress" }]
+#
+# Strategies are `manual`, `ordered-failover`, `round-robin`, `random`,
+# `weighted-random`, `least-latency`, and `least-load`. `manual` requires
+# `manual_member`. `manual_member` on an automatic strategy is an initial
+# operator pin that can be cleared through the management action API.
+#
+# Stickiness keys are `destination` and `principal`. Member modes are
+# `enabled`, `draining`, and `disabled`; draining and disabled members receive
+# no new flows. An active probe target must be a literal IP authority and every
+# member of that gateway must support TCP. Probes are globally bounded and
+# separately accounted from user flows. After a target connection or datagram
+# association commits, MPTUNNEL reports its outcome but never transparently
+# replays the flow through another gateway member.

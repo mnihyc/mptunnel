@@ -1,0 +1,29 @@
+{
+  "schema_version": 2,
+  "registry_revision": "2026-07-27.f0-v2",
+  "change_id": "example-diagnostic-instrumentation-change",
+  "impact_status": "affected",
+  "uncertainty": "bounded",
+  "rationale": "Example declaration for a change confined to opt-in lab diagnostics.",
+  "changed_paths": [
+    "src/lab_diagnostics.rs"
+  ],
+  "impact_scopes": [
+    "diagnostic-instrumentation"
+  ],
+  "affected": [
+    {
+      "cell_id": "diagnostic.instrumentation",
+      "metrics": [
+        "diagnostic_cpu_overhead_pct",
+        "diagnostic_event_drop_pct",
+        "diagnostic_memory_overhead_bytes"
+      ]
+    }
+  ],
+  "quick_triage": {
+    "status": "not_run",
+    "artifact_sha256": []
+  },
+  "acceptance_evidence": []
+}

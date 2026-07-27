@@ -1,16 +1,31 @@
 use crate::model::path::RelayPathInstance;
 use crate::model::timing::reliable_path_stale_interval;
-use crate::mux::stream::{ReliableRecvStream, ReliableSendStream};
+use crate::mux::stream::{
+    ReceiveOutcome, ReliableRecvStream, ReliableSendStream, StreamError, ValidatedStreamAck,
+    validate_stream_ack,
+};
 use crate::protocol::frame::normalize_offset_ranges;
-use crate::protocol::{Frame, OffsetRange};
+use crate::protocol::{Frame, OffsetRange, StreamId};
 use crate::runtime::error::RuntimeError;
 use crate::scheduler::PathSnapshot;
 use bytes::Bytes;
+use smallvec::SmallVec;
 use std::time::{Duration, Instant};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 
 // Relay I/O orchestrates reads, writes, and feedback timing. It observes queue
 // counters but delegates product admission limits to their policy modules.
+
+/// Starts one relay ACK transaction by freezing its send-assignment extent.
+///
+/// Both client and server actors call this before touching any ACK-owned state.
+pub(in crate::runtime) fn begin_reliable_stream_ack(
+    send_stream: &ReliableSendStream,
+    complete: bool,
+    ranges: Vec<OffsetRange>,
+) -> Result<ValidatedStreamAck, StreamError> {
+    validate_stream_ack(complete, ranges, send_stream.next_offset())
+}
 
 pub(in crate::runtime) fn stream_ack_gap_reinjection_allowed(
     complete: bool,
@@ -36,27 +51,66 @@ pub(in crate::runtime) fn stream_ack_ranges_expose_authoritative_gap(
             .is_some_and(|first| first.start > 0 || ranges.len() > 1)
 }
 
-pub(in crate::runtime) fn update_reinjection_authoritative_ack_snapshot(
-    stored_ranges: &mut Vec<OffsetRange>,
-    stored_complete: &mut bool,
-    complete: bool,
-    ranges: &[OffsetRange],
-) {
-    // An incomplete frame cannot establish the omitted ranges, but every
-    // listed range is still monotonic positive ACK evidence. Once a complete
-    // snapshot exists, merge later deltas so a filled gap cannot remain lost.
-    if !complete && !*stored_complete {
-        return;
+/// Monotonic negative ACK authority retained by one logical stream.
+///
+/// Positive ACK evidence is applied directly to cache and flight ledgers. This
+/// snapshot is narrower: it authorizes recovery for omissions only through the
+/// assigned DSN horizon captured by a complete ACK transaction. Incomplete
+/// deltas may fill an existing authoritative gap, but cannot extend that
+/// horizon to data assigned after the snapshot.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub(in crate::runtime) struct AuthoritativeStreamAckSnapshot {
+    ranges: Vec<OffsetRange>,
+    horizon: Option<u64>,
+}
+
+impl AuthoritativeStreamAckSnapshot {
+    pub(in crate::runtime) fn complete(&self) -> bool {
+        self.horizon.is_some()
     }
-    let mut merged = if *stored_complete {
-        std::mem::take(stored_ranges)
-    } else {
-        Vec::new()
-    };
-    merged.extend_from_slice(ranges);
-    merged = normalize_offset_ranges(merged);
-    *stored_ranges = merged;
-    *stored_complete |= complete;
+
+    pub(in crate::runtime) fn ranges(&self) -> &[OffsetRange] {
+        &self.ranges
+    }
+
+    pub(in crate::runtime) fn horizon(&self) -> Option<u64> {
+        self.horizon
+    }
+
+    pub(in crate::runtime) fn has_unacknowledged_extent(&self, frontier: u64) -> bool {
+        self.horizon.is_some_and(|horizon| frontier < horizon)
+    }
+
+    fn update(&mut self, ack: &ValidatedStreamAck) {
+        if !ack.complete() && self.horizon.is_none() {
+            return;
+        }
+
+        if ack.complete() {
+            self.horizon = Some(self.horizon.map_or(ack.assigned_end(), |horizon| {
+                horizon.max(ack.assigned_end())
+            }));
+        }
+        let horizon = self
+            .horizon
+            .expect("complete ACK authority must have an assigned horizon");
+        let mut merged = std::mem::take(&mut self.ranges);
+        merged.extend(ack.ranges().iter().filter_map(|range| {
+            let end = range.end.min(horizon);
+            (range.start < end).then_some(OffsetRange {
+                start: range.start,
+                end,
+            })
+        }));
+        self.ranges = normalize_offset_ranges(merged);
+    }
+}
+
+pub(in crate::runtime) fn update_reinjection_authoritative_ack_snapshot(
+    stored: &mut AuthoritativeStreamAckSnapshot,
+    ack: &ValidatedStreamAck,
+) {
+    stored.update(ack);
 }
 
 #[cfg(test)]
@@ -436,6 +490,265 @@ where
         }
     }
     Ok(total_bytes)
+}
+
+/// Frames removed from one bounded relay-input queue in a single ready-only
+/// turn. Payload ownership stays in the original items, so collecting a batch
+/// never copies stream bytes or erases ingress-path metadata.
+pub(in crate::runtime) struct ReadyStreamDataBatch<T> {
+    // One frame is the normal latency-sensitive path and stays inline. A
+    // stream that observes a real ready backlog grows this storage once and
+    // reuses it for the rest of the relay lifetime.
+    items: SmallVec<[T; 1]>,
+    payload_bytes: usize,
+    // Match the existing write_delivered_payloads vectored-write span. Larger
+    // batches grow once per relay and retain their allocation.
+    delivered: SmallVec<[Bytes; 8]>,
+}
+
+impl<T> ReadyStreamDataBatch<T> {
+    pub(in crate::runtime) fn new() -> Self {
+        Self {
+            items: SmallVec::new(),
+            payload_bytes: 0,
+            delivered: SmallVec::new(),
+        }
+    }
+
+    pub(in crate::runtime) fn len(&self) -> usize {
+        self.items.len()
+    }
+
+    #[cfg(any(test, feature = "lab-diagnostics"))]
+    pub(in crate::runtime) fn payload_bytes(&self) -> usize {
+        self.payload_bytes
+    }
+
+    fn prepare_collect(&mut self) {
+        debug_assert!(self.items.is_empty());
+        debug_assert!(self.delivered.is_empty());
+        self.payload_bytes = 0;
+    }
+
+    #[cfg(test)]
+    fn item_capacity(&self) -> usize {
+        self.items.capacity()
+    }
+
+    #[cfg(test)]
+    fn items_spilled(&self) -> bool {
+        self.items.spilled()
+    }
+
+    #[cfg(test)]
+    fn delivered_spilled(&self) -> bool {
+        self.delivered.spilled()
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+pub(in crate::runtime) struct ReadyStreamDataBatchBounds {
+    pub(in crate::runtime) stream_id: StreamId,
+    pub(in crate::runtime) receive_frontier: u64,
+    pub(in crate::runtime) receive_limit: u64,
+    pub(in crate::runtime) payload_limit: usize,
+    pub(in crate::runtime) ready_items: usize,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(in crate::runtime) enum ReadyStreamDataDirection {
+    ClientDownload,
+    ServerUpload,
+}
+
+impl ReadyStreamDataDirection {
+    #[cfg(feature = "lab-diagnostics")]
+    fn metric(self) -> &'static str {
+        match self {
+            Self::ClientDownload => "relay.ready_stream_data_batch.client_download",
+            Self::ServerUpload => "relay.ready_stream_data_batch.server_upload",
+        }
+    }
+
+    #[cfg(feature = "lab-diagnostics")]
+    fn label(self) -> &'static str {
+        match self {
+            Self::ClientDownload => "client_download",
+            Self::ServerUpload => "server_upload",
+        }
+    }
+}
+
+/// Collects only the exact in-order STREAM_DATA backlog visible after the
+/// first dequeue. `ready_items` must be a queue-length snapshot taken at entry.
+///
+/// The caller supplies a borrowed frame view so attributed client items and
+/// server registry items retain their native ownership shape. The first
+/// non-data or non-contiguous item is returned unchanged as an ordering
+/// boundary.
+pub(in crate::runtime) fn collect_ready_stream_data_batch<T, N, V>(
+    batch: &mut ReadyStreamDataBatch<T>,
+    first: T,
+    bounds: ReadyStreamDataBatchBounds,
+    mut try_next: N,
+    view: V,
+) -> Option<T>
+where
+    N: FnMut() -> Option<T>,
+    V: Fn(&T) -> Option<(StreamId, u64, usize)>,
+{
+    let ReadyStreamDataBatchBounds {
+        stream_id,
+        receive_frontier,
+        receive_limit,
+        payload_limit,
+        ready_items,
+    } = bounds;
+    batch.prepare_collect();
+    let Some((first_stream_id, first_offset, first_payload_bytes)) = view(&first) else {
+        batch.items.push(first);
+        return None;
+    };
+    let first_end = first_offset.checked_add(first_payload_bytes as u64);
+    let first_is_eligible = first_stream_id == stream_id
+        && first_offset == receive_frontier
+        && first_payload_bytes > 0
+        && first_payload_bytes <= payload_limit
+        && first_end.is_some_and(|end| end <= receive_limit);
+    batch.items.push(first);
+    if !first_is_eligible {
+        batch.payload_bytes = first_payload_bytes;
+        return None;
+    }
+    let mut payload_bytes = first_payload_bytes;
+    let mut expected_offset = first_end.expect("eligible STREAM_DATA has an end offset");
+    let mut deferred = None;
+
+    for _ in 0..ready_items {
+        let Some(next) = try_next() else {
+            break;
+        };
+        let Some((next_stream_id, next_offset, next_payload_bytes)) = view(&next) else {
+            deferred = Some(next);
+            break;
+        };
+        let next_total = payload_bytes.checked_add(next_payload_bytes);
+        let next_end = next_offset.checked_add(next_payload_bytes as u64);
+        let eligible = next_stream_id == stream_id
+            && next_offset == expected_offset
+            && next_payload_bytes > 0
+            && next_total.is_some_and(|total| total <= payload_limit)
+            && next_end.is_some_and(|end| end <= receive_limit);
+        if !eligible {
+            deferred = Some(next);
+            break;
+        }
+        payload_bytes = next_total.expect("eligible ready batch payload is bounded");
+        expected_offset = next_end.expect("eligible STREAM_DATA has an end offset");
+        batch.items.push(next);
+    }
+
+    batch.payload_bytes = payload_bytes;
+    deferred
+}
+
+/// Applies each original frame to the RFC receive state, then performs one
+/// vectored local write/flush transaction for all bytes released by the ready
+/// batch. The per-frame callback preserves role-specific state and path
+/// attribution while payload buffers are moved, never copied.
+pub(in crate::runtime) async fn apply_and_write_ready_stream_data_batch<S, T, A>(
+    local: &mut S,
+    recv_stream: &mut ReliableRecvStream,
+    batch: &mut ReadyStreamDataBatch<T>,
+    direction: ReadyStreamDataDirection,
+    flush_empty: bool,
+    mut apply: A,
+) -> Result<usize, RuntimeError>
+where
+    S: AsyncWrite + Unpin,
+    A: FnMut(&mut ReliableRecvStream, T) -> Result<ReceiveOutcome, RuntimeError>,
+{
+    #[cfg(not(feature = "lab-diagnostics"))]
+    let _ = direction;
+    #[cfg(feature = "lab-diagnostics")]
+    let batch_started = Instant::now();
+    let source_frames = batch.len();
+    #[cfg(feature = "lab-diagnostics")]
+    let source_payload_bytes = batch.payload_bytes();
+    let mut apply_error = None;
+    {
+        let items = &mut batch.items;
+        let delivered = &mut batch.delivered;
+        for item in items.drain(..) {
+            let outcome = match apply(recv_stream, item) {
+                Ok(outcome) => outcome,
+                Err(err) => {
+                    apply_error = Some(err);
+                    break;
+                }
+            };
+            delivered.extend(outcome.delivered);
+        }
+    }
+
+    #[cfg(feature = "lab-diagnostics")]
+    let write_started = Instant::now();
+    let delivered_bytes = match write_delivered_payloads(local, batch.delivered.as_slice()).await {
+        Ok(delivered_bytes) => delivered_bytes,
+        Err(err) => {
+            batch.delivered.clear();
+            batch.payload_bytes = 0;
+            return Err(RuntimeError::Io(err));
+        }
+    };
+    #[cfg(feature = "lab-diagnostics")]
+    crate::lab_diagnostics::lab_perf_record(
+        "relay.local_write_wait",
+        write_started.elapsed(),
+        delivered_bytes,
+    );
+    if !batch.delivered.is_empty() || (flush_empty && apply_error.is_none()) {
+        #[cfg(feature = "lab-diagnostics")]
+        let flush_started = Instant::now();
+        if let Err(err) = local.flush().await {
+            batch.delivered.clear();
+            batch.payload_bytes = 0;
+            return Err(RuntimeError::Io(err));
+        }
+        #[cfg(feature = "lab-diagnostics")]
+        crate::lab_diagnostics::lab_perf_record(
+            "relay.local_flush_wait",
+            flush_started.elapsed(),
+            0,
+        );
+    }
+    if source_frames > 1 && apply_error.is_none() {
+        #[cfg(feature = "lab-diagnostics")]
+        {
+            crate::lab_diagnostics::lab_perf_record(
+                direction.metric(),
+                batch_started.elapsed(),
+                delivered_bytes,
+            );
+            crate::lab_diagnostics::lab_diagnostic(
+                "relay_ready_stream_data_batch",
+                format_args!(
+                    "direction={} source_frames={} source_payload_bytes={} delivered_bytes={}",
+                    direction.label(),
+                    source_frames,
+                    source_payload_bytes,
+                    delivered_bytes,
+                ),
+            );
+        }
+    }
+
+    batch.delivered.clear();
+    batch.payload_bytes = 0;
+    if let Some(err) = apply_error {
+        return Err(err);
+    }
+    Ok(delivered_bytes)
 }
 
 pub(in crate::runtime) fn receive_stream_fin(

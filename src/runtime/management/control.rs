@@ -20,19 +20,7 @@ impl ManagementTarget {
         let request = serde_json::from_slice::<PathControlRequest>(body).map_err(|_| {
             ManagementHttpError::new(400, "Bad Request", "invalid path control JSON body")
         })?;
-        let context = match self {
-            Self::Client { context, .. } => {
-                select_control_client_context(std::slice::from_ref(context), &request)?
-            }
-            Self::Node { clients, .. } => select_control_client_context(clients, &request)?,
-            Self::Server { .. } => {
-                return Err(ManagementHttpError::new(
-                    409,
-                    "Conflict",
-                    "path control requires a local inbound service with an MPP outbound",
-                ));
-            }
-        };
+        let context = select_control_client_context(&self.clients, &request)?;
         let underlay = parse_underlay(&request.underlay)?;
         let state = parse_control_state(&request.state)?;
         set_client_path_state(context, underlay, request.index, state)?;
@@ -289,53 +277,28 @@ fn select_peer_status_broker(
         ));
     }
     let mut candidates = Vec::new();
-    match target {
-        ManagementTarget::Client { context, .. } => candidates.extend(peer_broker_candidates(
+    for (index, context) in target.clients.iter().enumerate() {
+        candidates.extend(peer_broker_candidates(
             &context.peer_status,
             "mpp_outbound",
-            0,
+            index,
             context
                 .route_target
                 .as_ref()
                 .map(|target| target.tag.clone()),
             request,
             requested_session,
-        )),
-        ManagementTarget::Server { context, .. } => candidates.extend(peer_broker_candidates(
+        ));
+    }
+    for (index, context) in target.servers.iter().enumerate() {
+        candidates.extend(peer_broker_candidates(
             &context.peer_status,
             "mpp_inbound",
-            0,
+            index,
             context.tag.clone(),
             request,
             requested_session,
-        )),
-        ManagementTarget::Node {
-            clients, servers, ..
-        } => {
-            for (index, context) in clients.iter().enumerate() {
-                candidates.extend(peer_broker_candidates(
-                    &context.peer_status,
-                    "mpp_outbound",
-                    index,
-                    context
-                        .route_target
-                        .as_ref()
-                        .map(|target| target.tag.clone()),
-                    request,
-                    requested_session,
-                ));
-            }
-            for (index, context) in servers.iter().enumerate() {
-                candidates.extend(peer_broker_candidates(
-                    &context.peer_status,
-                    "mpp_inbound",
-                    index,
-                    context.tag.clone(),
-                    request,
-                    requested_session,
-                ));
-            }
-        }
+        ));
     }
     match candidates.as_slice() {
         [selected] => Ok(PeerStatusSelection {

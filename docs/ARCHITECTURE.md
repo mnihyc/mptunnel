@@ -3,11 +3,18 @@
 This document maps the current source tree and design choices to the MPP
 protocol model. `RFC.md` is the wire and behavioral specification.
 
+The clean Product/Core ownership boundary and remaining work are specified in
+`./docs/PRODUCT_PLAN.md` and `./docs/PERFORMANCE_PLAN.md`. Internal owners
+remain modules in one application package; `crates/` contains only the pinned
+Quinn source mirror required by Cargo's path override.
+
 ## Layer model
 
 ```text
 SOCKS5 / HTTP CONNECT / TUN ingress
-    -> MPP stream or datagram identity
+    -> canonical Product flow + routing/DNS/admission
+    -> optional Product gateway -> one outbound leaf
+    -> MPP stream or datagram identity (for an MPP leaf)
     -> per-direction connection sequencing, flow control, Data ACKs, and reinjection
     -> carrier-neutral path scheduler and sender queue
        -> TCP carrier -> kernel TCP congestion control and recovery
@@ -36,7 +43,7 @@ and liveness mechanics, while the path layer exposes one prepared-connection
 lifecycle and records only the authenticated exchange as RTT, not connection
 setup time.
 
-## Protocol-v3 model
+## Protocol-v4 model
 
 `OPEN_STREAM` contains only `stream_id`, `target`, and initial `demand`. Opening
 or attaching a stream does not assign a persistent primary, validation, or
@@ -69,7 +76,7 @@ the stream or relabeling a path.
 A module exists when it owns a durable state machine, algorithm, protocol
 boundary, or adapter. File size alone does not earn a module.
 
-- `src/protocol/`: bounded protocol-v3 codec, wire values, authentication, and
+- `src/protocol/`: bounded protocol-v4 codec, wire values, authentication, and
   range semantics. It owns no sockets or scheduling policy.
 - `src/model/`: carrier-neutral identities, evidence, capacity, admission, ACK
   clock, connection-flight, and work models. Pure TCP proof candidate
@@ -78,8 +85,10 @@ boundary, or adapter. File size alone does not earn a module.
   path snapshots. `src/simulator/` may reuse these formulas but owns only
   simulator-private queues.
 - `src/transport/`: encryption, framing, endpoint resolution, TCP adapters,
-  Quinn/QUIC adapters, and optional native telemetry. It does not own MPP
-  offsets or path placement.
+  the HTTP/3 presentation, its pre-parser candidate gate, the RFC 9297 adapter
+  over Quinn/QUIC, and optional native telemetry. Product credential authority
+  supplies the gate verifier; transport owns the opaque selector and parser
+  boundary. Neither owns MPP offsets or path placement.
 - `src/runtime/path/`: configured paths, health and metric publication, path
   instances, command queues, proofs, selection, and typed ports.
 - `src/runtime/path/tcp/`: one shared actor per configured TCP path, including
@@ -114,8 +123,30 @@ boundary, or adapter. File size alone does not earn a module.
   peer-status requests. TCP and QUIC actors retain their own writer and metric
   ownership; the broker owns neither carrier I/O nor scheduling evidence.
 - `src/runtime/management/`: cached typed snapshots, bounded HTTP transport,
-  and embedded-dashboard delivery. Its one-second sampler is the only reader
-  of runtime observability owners on behalf of HTTP requests.
+  explicit action controls, and embedded-dashboard delivery. Its one-second
+  sampler is the only reader of runtime observability owners on behalf of HTTP
+  requests. Gateway status reads detached Product snapshots, not carrier
+  metrics.
+- `src/product/dns.rs`: strict tagged DNS upstreams and plans,
+  exact/longest-suffix/default selection, encryption and recursion checks, and
+  bounded per-generation policy facts, including reserved-range FakeDNS pool
+  validation. It owns no sockets or caches.
+- `src/dns.rs`: the single DNS runtime owner. Each immutable generation owns
+  per-plan cache/coalescing limits, one total lookup deadline, and protected
+  literal-bootstrap UDP/TCP/DoT/DoH/DoQ connections. It also owns bounded
+  FakeDNS leases; a synthetic address is never reassigned to another domain in
+  the generation, and TUN recovers the domain once before routing. Named
+  stream DNS egress is injected by the outbound registry and never falls back
+  to direct; DoQ remains a direct/source-bound QUIC leaf and never enters the
+  MPP path scheduler.
+- `src/product/gateway.rs`: pure new-flow gateway selection, stickiness,
+  Product-owned health hysteresis/circuit state, drain/manual policy, and
+  counters. It cannot import scheduler, carrier, runtime, DNS, or platform
+  state.
+- `src/runtime/gateway.rs` and `src/runtime/outbound_registry.rs`: generation
+  ownership, bounded active probes, passive open/flow outcomes, total-deadline
+  pre-commit retries, and leaf opening. A committed flow remains bound to its
+  selected leaf and is never replayed because a later outcome is unhealthy.
 - `src/ingress/` and `src/outbound/`: local protocol parsing and remote target
   connection policy respectively. Neither chooses MPP data paths.
 - `src/runtime/node/`: constructs client, server, or combined nodes and injects
@@ -152,7 +183,10 @@ MPP ranges and flight but grants no new offset. `STREAM_MAX_DATA` grants a
 new maximum offset but acknowledges no byte. Its receiver-advertised window is
 shared by all attachments in one stream direction; the opposite direction has
 an independent maximum. Carrier windows and congestion windows remain separate
-limits.
+limits. Initial open publishes the logical receive owner's starting credit.
+Later TCP or QUIC attachments are accepted with a zero maximum, which is
+credit-neutral because senders retain the greatest advertised offset; path
+demand can never widen the shared window.
 
 Ordinary reinjection consumes a cumulative extra-traffic budget. Critical
 path-failure, persistent authoritative Data ACK gap, and bounded live-tail
@@ -271,11 +305,23 @@ below that offset remains valid.
 `STREAM_DETACH` removes one attachment; `STREAM_RESET` terminates the logical
 stream. Native TCP EOF terminates its physical carrier.
 
-A bidirectional QUIC stream has independent send and receive ownership. Native
-FIN on one half neither completes the MPP stream nor substitutes for product
-`STREAM_FIN` or `STREAM_DETACH`; the actor retains the writable half for final
-Data ACK and teardown frames. Terminal product frames are processed before a
-following clean carrier EOF, while an EOF inside a protocol frame remains a
+Each logical QUIC carrier stream is a full-duplex HTTP/3 `POST /` request.
+The gate requires HTTPS, authority equal to the negotiated TLS SNI, exactly
+`/` without a query, and the canonical encrypted selector supplied by Product
+credential authority before request DATA enters the bounded accepted queue or
+MPP parser. QUIC path groups therefore require a DNS TLS identity, although
+their carrier endpoints may be literal IP addresses. The first accepted
+selector is connection-latched; later requests must match it while full
+`SESSION_AUTH` and `PATH_JOIN` remain mandatory. This narrows parser exposure
+but does not make H3 a cover protocol or prevent source-aware transport
+fingerprinting.
+
+Request and response DATA directions retain independent send and receive
+ownership. HTTP/3 end-of-stream on one direction neither completes the MPP
+stream nor substitutes for product `STREAM_FIN` or `STREAM_DETACH`; the actor
+retains the writable response/request direction for final Data ACK and
+teardown frames. Terminal product frames are processed before a following
+clean DATA-stream EOF, while EOF inside a length-prefixed MPP record remains a
 visible truncation error.
 
 The reliable-stream actor, not a carrier, owns break-before-make retention.
@@ -289,11 +335,30 @@ while doing I/O. Hot frame and ACK paths use local actor state or immutable
 snapshots rather than a session-wide lock for each packet.
 
 The single authenticated TCP connection multiplexes path-control,
-reliable-stream, and datagram frames. QUIC retains the first authenticated
-bidirectional stream as a connection control stream and uses later streams for
-product flows. Peer status uses these existing channels symmetrically; it does
-not create a diagnostic transport or convert remote observations into local
-path evidence.
+reliable-stream, and datagram frames. QUIC applies the selector gate, then
+retains the first fully authenticated request stream as a connection-control
+stream and uses later selector-matched requests for product flows. All
+reliable bytes use H3 DATA; only
+`DGRAM_DATA` uses RFC 9297 native QUIC DATAGRAM, associated by Quarter Stream
+ID with its request stream. Reliable `OPEN_DGRAM_FLOW`, `DGRAM_CLOSE`, and
+`DGRAM_FEEDBACK` preserve association lifecycle and feedback without putting
+unrelated UDP payloads behind one reliable control stream. Peer status uses
+the existing reliable DATA channels symmetrically; it does not create a
+diagnostic transport or convert remote observations into local path evidence.
+
+The H3 request queue, QUIC concurrent bidirectional-stream credit, native
+datagram routes, active inner flow IDs, pending pre-route packets, reassembly
+count, and all retained native bytes are configured bounds. The server H3
+driver resolves requests in one task and applies bounded-channel backpressure;
+it does not spawn one pre-admission task per request. At runtime, the
+connection authentication permit is acquired before its connection task is
+spawned. After authentication, concurrent product stream actors cannot exceed
+the transport's
+`min(max_quic_concurrent_bidi_streams, max_streams)` per connection. The bound
+is per configured carrier connection and therefore multiplies across the
+configured path count; it is not a process-global stream limit. Listener and
+connection loops reap completed child tasks before accepting more work so
+completed-task outputs cannot accumulate under sustained churn.
 
 The response output carrying the contiguous Data Sequence frontier is governed
 by the shared MPP receive window and native carrier credit. An additional
@@ -336,6 +401,10 @@ platform-neutral. Target-specific code is limited to host adapters:
 - TUN acquisition and carrier-network selection are injected host
   capabilities. Android hosts must establish the VPN descriptor and protect or
   bind carrier sockets outside the catch-all route.
+- `src/platform/` owns packet-device construction and managed-VPN generation
+  adapters, including target selection and Linux host preparation/publication.
+  Generic node and TUN runtime code consumes only the resulting platform
+  providers and opaque packet device.
 
 No scheduler eligibility rule may require native telemetry, inspect an
 interface name, or branch on the operating system. Windows client with Linux
@@ -364,4 +433,4 @@ runtime. Runtime changes require focused tests plus matched end-to-end labs:
 
 Diagnostics establish causality. Instrumentation-free matched rows establish
 performance. Historical rows from incompatible wire versions are references
-only and cannot prove protocol-v3 behavior.
+only and cannot prove protocol-v4 behavior.

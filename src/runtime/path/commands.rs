@@ -213,6 +213,7 @@ pub(in crate::runtime) enum ReliablePathCommand {
         observed_carrier_generation: u64,
         target: TargetAddr,
         lane: TrafficClass,
+        advertised_recv_max_offset: u64,
         open_deadlines: ClientTcpOpenDeadlines,
         session_commands: ReliablePathCommandSender,
         response: oneshot::Sender<ClientTcpOpenResponse>,

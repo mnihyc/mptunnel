@@ -3,13 +3,13 @@ use super::{
     run_server_udp_reliable_stream_loop,
 };
 use crate::config::{
-    DEFAULT_OUTBOUND_CONNECT_TIMEOUT, MppPerformanceConfig, ResourceLimits, SecurityConfig,
-    SharedSecret,
+    ClientSecurityConfig, DEFAULT_OUTBOUND_CONNECT_TIMEOUT, MppPerformanceConfig, ResourceLimits,
+    ServerSecurityConfig, SharedSecret,
 };
 use crate::model::capacity::MAX_RELIABLE_SERVICE_QUANTUM_BYTES;
 use crate::model::path::next_carrier_path_instance_id;
 use crate::mux::MuxLimits;
-use crate::outbound::{DnsConfig, OutboundConfig};
+use crate::outbound::OutboundConfig;
 use crate::protocol::codec::CodecLimits;
 use crate::protocol::{
     Frame, PathId, ResetReason, SessionId, StreamId, TargetAddr, UnderlayProtocol,
@@ -72,17 +72,16 @@ struct ServerUdpTerminalWriterFixture {
 
 impl ServerUdpTerminalWriterFixture {
     async fn open(stream_id: StreamId) -> Self {
-        let security = SecurityConfig::encrypted(
-            SharedSecret::new(b"0123456789abcdef0123456789abcdef".to_vec())
-                .expect("test shared secret"),
-        );
+        let shared_secret = SharedSecret::new(b"0123456789abcdef0123456789abcdef".to_vec())
+            .expect("test shared secret");
+        let security = ServerSecurityConfig::for_test(shared_secret.clone());
+        let client_security = ClientSecurityConfig::for_test(shared_secret);
         let ServerIdentityRuntime {
             paths: mut context,
             reliable_relay: _,
         } = new_identity_runtime(
             Vec::new(),
             OutboundConfig::Direct,
-            DnsConfig::default(),
             DEFAULT_OUTBOUND_CONNECT_TIMEOUT,
             security,
             MppPerformanceConfig::default(),
@@ -93,7 +92,7 @@ impl ServerUdpTerminalWriterFixture {
         context.reliable_streams = registry.path_port();
         let session_id = SessionId(401);
         let path_id = PathId(0);
-        let path_registration = context.reliable_streams.register_carrier_path(
+        let path_registration = context.reliable_streams.register_test_carrier_path(
             session_id,
             UnderlayProtocol::Udp,
             path_id,
@@ -168,7 +167,12 @@ impl ServerUdpTerminalWriterFixture {
                 path_ordinal: 0,
             },
             session_id,
-            security: Arc::new(vec![context.security.clone()]),
+            candidate_selector: crate::transport::quic::QuicCandidateSelector::derive(
+                client_security.credential.id().as_str(),
+                client_security.credential.secret().as_bytes(),
+            ),
+            security: Arc::new(vec![client_security]),
+            tls: Arc::new(vec![crate::transport::encrypted::test_client_tls_config()]),
             codec_limits: context.codec_limits,
             mux_limits: context.mux_limits,
             stream_frame_queue: 8,
@@ -259,7 +263,7 @@ async fn reliable_output_guard_detaches_on_abnormal_stream_exit() {
     let session_id = SessionId(201);
     let stream_id = StreamId(301);
     let path_id = PathId(0);
-    let path_registration = streams.register_carrier_path(
+    let path_registration = streams.register_test_carrier_path(
         session_id,
         UnderlayProtocol::Udp,
         path_id,
@@ -565,7 +569,9 @@ async fn client_quic_terminal_input_keeps_feedback_writer_until_owner_close() {
     )
     .await
     .expect("write terminal product FIN");
-    udp_path_finish_stream(&mut server_send).expect("finish server send half");
+    udp_path_finish_stream(&mut server_send)
+        .await
+        .expect("finish server send half");
     assert!(matches!(
         frames_rx.recv().await,
         Some(Ok(Frame::StreamFin {
@@ -637,7 +643,9 @@ async fn client_quic_clean_eof_reports_attachment_failure_then_allows_detach() {
             .expect("read client opener"),
         Frame::Ping { nonce: 1 },
     );
-    udp_path_finish_stream(&mut server_send).expect("finish server send half");
+    udp_path_finish_stream(&mut server_send)
+        .await
+        .expect("finish server send half");
     assert!(matches!(
         frames_rx.recv().await,
         Some(Err(RuntimeError::ReliablePathSessionClosed))
@@ -769,7 +777,9 @@ async fn server_quic_ordered_close_drains_peer_until_stream_detach() {
     )
     .await
     .expect("detach server terminal drain");
-    udp_path_finish_stream(client_send).expect("finish client send half");
+    udp_path_finish_stream(client_send)
+        .await
+        .expect("finish client send half");
 
     tokio::time::timeout(Duration::from_secs(5), actor)
         .await

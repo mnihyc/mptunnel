@@ -196,7 +196,7 @@ pub(super) async fn drain_server_udp_reliable_commands(
                 context
                     .reliable_streams
                     .detach_path(path_registration, stream_id)?;
-                let _ = udp_path_finish_stream(send);
+                let _ = udp_path_finish_stream(send).await;
                 true
             }
             ReliablePathCommand::CloseStream(close_stream_id) => {
@@ -219,7 +219,7 @@ pub(super) async fn drain_server_udp_reliable_commands(
                     context
                         .reliable_streams
                         .detach_path(path_registration, stream_id)?;
-                    let _ = udp_path_finish_stream(send);
+                    let _ = udp_path_finish_stream(send).await;
                     true
                 } else {
                     false

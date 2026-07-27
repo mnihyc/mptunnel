@@ -1,5 +1,108 @@
 # Performance evidence
 
+## v0.1.2 Core-frozen release-candidate cohort
+
+### Exact measured identity
+
+This protocol-v4 cohort used the exact no-optional-feature release-profile
+GNU/Linux executable below for both client and server. Rebuilding was disabled
+between these rows. The executable freezes the Core credit fix, but it is not
+the eventual tagged binary: later Product-only routing, logging, and doctor
+changes do not alter the RFC/Core algorithm, yet they do change the complete
+program identity. The tagged executable must receive its own representative
+release guard after the whole program is frozen.
+
+| Item | Value |
+| --- | --- |
+| Version | `mptunnel 0.1.2` |
+| Protocol | MPP v4 |
+| Carrier presentation | `tcp-tls13-no-alpn+quic-h3-post-data-rfc9297` |
+| Build | Cargo `release`, no optional features |
+| Client/server target | `x86_64-unknown-linux-gnu` |
+| Client/server binary SHA-256 | `d46eaf6a530c57cbe8802d6d9574c5b0afb406c65df5717e724e775e68e2374e` |
+| Core-frozen build-input manifest SHA-256 | `12caf8a531e8c7175f45e1f0343f1235c4433977d9d495eb2e5854731a1640f4` |
+| Recorded base commit | `692c6f396dbdc0e526208e0f926b57fc1affdb86` |
+| Toolchain | Rust/Cargo 1.96.0 |
+
+The working tree was dirty while the release was being assembled. Non-build
+documentation and workflow edits changed the whole-tree snapshot between the
+QUIC upload rows
+(`c39b5af5c1b412a51cc079909aa09116792d9d8f8402accf05e8dd0374c8b019`
+and
+`ceb20f75832b7d6079f3ae106a4688ec549e712efcdbcc950bafe9dcadf18b40`)
+and the representative guards
+(`536fbca862253c187bdf072c5341115dd3548bd0b13f6d98be2f9995a242e75b`).
+The build-input identity and measured binary stayed unchanged.
+
+These host snapshots fail the formal acceptance rule because the source tree
+was dirty. CPU-frequency and thermal telemetry were unavailable; the two QUIC
+upload snapshots also saw one unrelated running container. The rows are
+therefore descriptive Core-frozen candidate guards, not clean-host or
+tagged-binary acceptance evidence. They may establish the stated
+protocol-correctness and path-use observations, but they do not establish broad
+competitive performance.
+
+### Equal-path representative rows
+
+Each case used five shaped paths at 500 Mbps, 180 ms one-way delay, 20 ms
+jitter, and no configured loss. The workload used two concurrent flows for 30
+seconds. Upload goodput is receiver-confirmed; a canonical upload has the
+normal one-second drain, while a diagnostic completion rerun changes only the
+drain to ten seconds and is not throughput-acceptance evidence.
+
+| Carrier and direction | Goodput | Receiver result | Observed carrier use |
+| --- | ---: | --- | --- |
+| TCP download | 799.384 Mbps | 2/2 requests complete; 2,997,778,416 bytes | all five paths, 13.398%--24.626% each |
+| QUIC download | 712.382 Mbps | 2/2 requests complete; 2,672,113,520 bytes | all five paths, 15.225%--22.640% each |
+| QUIC upload, canonical drain | 747.305 Mbps lower bound | 2,933,751,030 of 2,964,193,280 locally accepted bytes confirmed; 1.027% pending | all five paths, 9.117%--26.550% each |
+| TCP upload, canonical drain | 559.969 Mbps lower bound | 2,198,809,919 of 2,210,201,600 locally accepted bytes confirmed; 0.515% pending | two sustained owners carried 49.596% and 48.758%; the other three carried 1.647% combined |
+
+Download path shares are approximate receive shares and upload path shares are
+approximate transmit shares from case-boundary client-interface counters. They
+show material path use but are not exact wire-expansion measurements.
+
+The QUIC upload guard follows the shared-stream credit fix: accepting a later
+attachment is credit-neutral, and only the logical receive owner grants more
+credit. Both streams continued delivering, all five carriers contributed, no
+maximum-data violation occurred, and the probe reported no errors. Its runner
+status is `loss` only because 30,442,250 bytes remained in the delivery
+pipeline when the canonical one-second drain ended; it does not mean the
+shaped network configured loss. The two target connection totals were
+1,460,929,402 and 1,472,821,628 bytes, and corresponding server receive
+counters differed from the client transmit counters by only 709--816 bytes.
+
+With the diagnostic ten-second drain, the same QUIC case returned `ok` at
+756.809 Mbps: all 3,017,867,264 locally accepted bytes were confirmed, the two
+final connection totals were 1,490,026,496 and 1,527,840,768 bytes, and all
+five paths again contributed 13.602%--25.492%. This exact completion supports
+the credit/lifecycle diagnosis; its extended drain is not a replacement
+acceptance setting.
+
+The canonical TCP upload likewise ended with a bounded delivery tail of
+11,391,681 bytes, or 0.515% of local acceptance, and no probe error. Its
+ten-second-drain diagnostic returned `ok` at 567.291 Mbps with all
+2,230,910,976 locally accepted bytes target-confirmed. Nearly all carrier
+traffic still belonged to two paths, at 49.170% and 48.499%. Because this was
+two concurrent uploads, it demonstrates sustained aggregate use by two
+logical owners; it does **not** demonstrate that one TCP stream was striped
+materially across five paths.
+
+These rows establish the corrected credit invariant, exact eventual delivery
+in the diagnostic drain, material all-five use for QUIC upload and both
+download cases, and honest two-owner TCP upload aggregation in this topology.
+They are not adjacent matched comparisons against V2Ray/Xray, Hysteria2,
+MPTCP, or Multipath QUIC. No fresh v4 fault row is part of this Core-frozen
+guard, so the historical v0.1.1 failover results below are not silently
+transferred to v4. Broad competitive and failover claims still require the
+clean, repeated, matched cells specified by the performance plan, and tagged
+release claims require a guard of the eventual tagged executable.
+
+One observation is never a performance verdict. In particular, an isolated
+throughput movement of roughly five percent is ordinary run-to-run noise
+unless repeated paired evidence and causal counters prove otherwise. Five
+percent is neither a pass margin nor a failure cap, and there is no universal
+percentage gate.
+
 ## v0.1.1 release gate
 
 The v0.1.1 gate used MPP v3 release builds without optional features. The

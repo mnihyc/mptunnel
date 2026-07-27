@@ -6,13 +6,16 @@
 
 use super::super::send_buffer::SessionSendBuffer;
 use crate::mux::MuxLimits;
+use crate::product::PrincipalPermit;
 use crate::protocol::SessionId;
+use crate::runtime::RuntimeError;
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
 #[derive(Debug)]
 pub(in crate::runtime) struct ServerSessionTracker {
     send_buffer_limit_bytes: usize,
+    max_sessions: usize,
     sessions: Mutex<HashMap<SessionId, ServerSessionEntry>>,
 }
 
@@ -20,20 +23,53 @@ pub(in crate::runtime) struct ServerSessionTracker {
 struct ServerSessionEntry {
     references: u32,
     send_buffer: SessionSendBuffer,
+    principal_permit: PrincipalPermit,
 }
 
 impl Default for ServerSessionTracker {
     fn default() -> Self {
-        Self::from_limits(MuxLimits::default())
+        let limits = MuxLimits::default();
+        Self::from_limits(limits, limits.max_streams)
     }
 }
 
 impl ServerSessionTracker {
-    pub(in crate::runtime::stream) fn from_limits(limits: MuxLimits) -> Self {
+    pub(in crate::runtime::stream) fn from_limits(limits: MuxLimits, max_sessions: usize) -> Self {
         Self {
             send_buffer_limit_bytes: SessionSendBuffer::from_limits(limits).limit_bytes(),
+            max_sessions,
             sessions: Mutex::new(HashMap::new()),
         }
+    }
+
+    pub(in crate::runtime::stream) fn attach_authenticated_session(
+        &self,
+        session_id: SessionId,
+        principal_permit: &PrincipalPermit,
+    ) -> Result<SessionSendBuffer, RuntimeError> {
+        let mut sessions = self.sessions.lock().expect("server session tracker lock");
+        if !sessions.contains_key(&session_id) && sessions.len() >= self.max_sessions {
+            return Err(RuntimeError::Protocol(
+                "server authenticated session limit reached",
+            ));
+        }
+        let entry = sessions
+            .entry(session_id)
+            .or_insert_with(|| ServerSessionEntry {
+                references: 0,
+                send_buffer: SessionSendBuffer::new(self.send_buffer_limit_bytes),
+                principal_permit: principal_permit.clone(),
+            });
+        if !entry.principal_permit.same_principal(principal_permit) {
+            return Err(RuntimeError::AuthenticationRejected(
+                "session principal changed across carrier paths",
+            ));
+        }
+        entry.references = entry
+            .references
+            .checked_add(1)
+            .expect("server session reference count overflow");
+        Ok(entry.send_buffer.clone())
     }
 
     pub(in crate::runtime::stream) fn attach_session(
@@ -42,11 +78,8 @@ impl ServerSessionTracker {
     ) -> SessionSendBuffer {
         let mut sessions = self.sessions.lock().expect("server session tracker lock");
         let entry = sessions
-            .entry(session_id)
-            .or_insert_with(|| ServerSessionEntry {
-                references: 0,
-                send_buffer: SessionSendBuffer::new(self.send_buffer_limit_bytes),
-            });
+            .get_mut(&session_id)
+            .expect("product flow attached before authenticated carrier");
         entry.references = entry
             .references
             .checked_add(1)

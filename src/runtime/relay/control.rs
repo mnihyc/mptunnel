@@ -1,13 +1,14 @@
 use super::client::{
     ClientRelayDisconnectedState, ClientRelayState, ClientStreamAckContext,
-    apply_client_stream_ack, apply_client_stream_data, evaluate_client_data_ack_reinjection,
+    apply_client_stream_ack, apply_client_stream_data_state, evaluate_client_data_ack_reinjection,
     update_request_path_staleness,
 };
 use super::diagnostics::log_unexpected_stream_relay_frame;
 use super::flow::{ReliableRelayFlowDemandTracker, ReliableRelayFlowSignals};
 use super::io::{
-    pending_stream_fin_ready, read_reliable_relay_payload, receive_stream_fin,
-    resize_reliable_relay_buffer, stream_data_range_already_delivered,
+    ReadyStreamDataBatchBounds, ReadyStreamDataDirection, apply_and_write_ready_stream_data_batch,
+    collect_ready_stream_data_batch, pending_stream_fin_ready, read_reliable_relay_payload,
+    receive_stream_fin, resize_reliable_relay_buffer, stream_data_range_already_delivered,
     stream_terminal_fin_replay_required,
 };
 use super::lifecycle::{
@@ -26,17 +27,18 @@ use super::lifecycle::{
 };
 use super::open::{ReliableRelayOpenSpec, relay_error_is_tcp_path_failure};
 use super::remote::ReliableRelayAttachMode;
-use crate::config::MppPerformanceConfig;
 #[cfg(feature = "lab-diagnostics")]
 use crate::lab_diagnostics::{lab_diagnostic, lab_perf_flush, lab_perf_record};
 use crate::model::capacity::{
     PATH_OPEN_SCORE_BYTES, adaptive_reliable_relay_chunk_bytes,
     adaptive_reliable_relay_chunk_bytes_with_frame_limit, adaptive_reliable_relay_inflight_bytes,
     reliable_relay_buffer_len, reliable_relay_sender_dispatch_budget,
+    reliable_stream_initial_advertised_window_bytes,
 };
 use crate::model::timing::sender_service_retry_delay;
 use crate::model::timing::transport_pto_from_snapshot;
 use crate::mux::stream::{ReliableRecvStream, ReliableSendStream};
+use crate::performance::MppPerformanceConfig;
 #[cfg(feature = "lab-diagnostics")]
 use crate::protocol::frame::reliable_path_frame_pacing_bytes;
 use crate::protocol::{Frame, ResetReason};
@@ -57,6 +59,7 @@ use crate::runtime::stream::{
 };
 use crate::runtime::telemetry::ObservedProductIo;
 use crate::scheduler::TrafficClass;
+use std::future::Future;
 use std::time::Instant;
 use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt};
 use tokio::sync::mpsc;
@@ -143,6 +146,62 @@ fn reliable_relay_request_outstanding_limit_bytes(
     }
 }
 
+#[derive(Debug, Clone, Copy)]
+struct ClientOpportunisticReadBounds {
+    sender_dispatch_byte_budget: usize,
+    sender_dispatch_item_budget: usize,
+    sender_queue_limit: usize,
+    source_read_ceiling: usize,
+    request_outstanding_limit: usize,
+}
+
+fn reliable_relay_client_opportunistic_read_budget(
+    completed_reads: usize,
+    send_stream: &ReliableSendStream,
+    sender_queue: &ReliableRelaySenderQueue,
+    bounds: ClientOpportunisticReadBounds,
+) -> usize {
+    if completed_reads >= bounds.sender_dispatch_item_budget
+        || !reliable_relay_can_read_product_source(
+            true,
+            false,
+            send_stream,
+            sender_queue,
+            bounds.sender_queue_limit,
+        )
+    {
+        return 0;
+    }
+
+    reliable_relay_sender_queue_read_budget(
+        send_stream,
+        sender_queue,
+        bounds.sender_queue_limit,
+        bounds.source_read_ceiling,
+    )
+    .min(
+        bounds
+            .sender_dispatch_byte_budget
+            .saturating_sub(sender_queue.data_bytes()),
+    )
+    .min(reliable_relay_request_outstanding_headroom_bytes(
+        send_stream,
+        sender_queue,
+        bounds.request_outstanding_limit,
+    ))
+}
+
+async fn ready_at_entry<F>(future: F) -> Option<F::Output>
+where
+    F: Future,
+{
+    tokio::select! {
+        biased;
+        output = future => Some(output),
+        _ = std::future::ready(()) => None,
+    }
+}
+
 pub(in crate::runtime) async fn relay_migrating_tcp_stream<S>(
     local: S,
     context: &ClientPathContext,
@@ -153,6 +212,11 @@ pub(in crate::runtime) async fn relay_migrating_tcp_stream<S>(
 where
     S: AsyncRead + AsyncWrite + Unpin,
 {
+    let initial_recv_max_offset = reliable_stream_initial_advertised_window_bytes(
+        remote.stream().underlay,
+        remote.stream().lane,
+        context.mux_limits,
+    );
     let mut remotes =
         ReliableRelayRemoteSet::new(remote, reliable_stream_frame_queue(context.mux_limits));
     let stream_id = remotes.stream_id();
@@ -165,7 +229,11 @@ where
     let mut send_stream =
         ReliableSendStream::new_with_initial_max_offset(stream_id, context.mux_limits, 0);
     send_stream.update_max_offset(remotes.max_offset());
-    let mut recv_stream = ReliableRecvStream::new(stream_id, context.mux_limits);
+    let mut recv_stream = ReliableRecvStream::new_with_initial_max_offset(
+        stream_id,
+        context.mux_limits,
+        initial_recv_max_offset,
+    );
     let chunk_size =
         adaptive_reliable_relay_chunk_bytes(None, TrafficClass::Latency, context.mux_limits);
     let mut buf = bytes::BytesMut::with_capacity(chunk_size);
@@ -174,6 +242,8 @@ where
     let mut flow_demand = ReliableRelayFlowDemandTracker::new();
     let mut request_flow_demand = ReliableRelayFlowDemandTracker::new();
     let mut sender_queue = ReliableRelaySenderQueue::default();
+    let mut deferred_remote_frame = None::<ReliableRelayRemoteFrame>;
+    let mut ready_remote_data = super::io::ReadyStreamDataBatch::new();
     let mut send_buffer_reservation = context.session_send_buffer.stream_reservation();
     let mut send_buffer_updates = context.session_send_buffer.subscribe();
     let (additional_path_open_tx, mut additional_path_open_rx) = mpsc::channel(
@@ -277,7 +347,7 @@ where
                             .send_recv_progress(
                                 &mut remotes,
                                 context,
-                                &recv_stream,
+                                &mut recv_stream,
                                 &mut state.progress.recv_progress,
                                 RelayRecvProgressSend::new(path_snapshot, relay_lane, true),
                             )
@@ -518,7 +588,12 @@ where
             )
             .await
             {
-                eprintln!("warning: reliable auto path attachment failed: {err}");
+                crate::observability::process_event!(
+                    Warn,
+                    "reliable_relay",
+                    "auto_path_attachment_failed",
+                    "reliable auto path attachment failed: {err}"
+                );
             } else {
                 state.progress.last_stream_at = Instant::now();
             }
@@ -626,7 +701,7 @@ where
         if sender.discard_resolved_stale_path_reinjections(&mut sender_queue, &remotes) > 0 {
             state.progress.sender_retry_at = None;
         }
-        let inbound_frame_ready = remotes.has_buffered_frame();
+        let inbound_frame_ready = deferred_remote_frame.is_some() || remotes.has_buffered_frame();
         let queued_send_blocked = reliable_relay_queued_send_blocked_for_retry(
             sender_queue.is_empty(),
             state.progress.sender_retry_at,
@@ -731,7 +806,7 @@ where
                     .send_recv_progress(
                         &mut remotes,
                         context,
-                        &recv_stream,
+                        &mut recv_stream,
                         &mut state.progress.recv_progress,
                         RelayRecvProgressSend::new(path_snapshot, relay_lane, true),
                     )
@@ -775,7 +850,7 @@ where
                     .send_recv_progress(
                         &mut remotes,
                         context,
-                        &recv_stream,
+                        &mut recv_stream,
                         &mut state.progress.recv_progress,
                         RelayRecvProgressSend::new(path_snapshot, relay_lane, true),
                     )
@@ -837,8 +912,9 @@ where
                     context,
                     &remotes,
                     &send_stream,
-                    &state.progress.last_send_ack_ranges,
-                    state.progress.last_send_ack_complete,
+                    state.progress.last_send_ack.ranges(),
+                    state.progress.last_send_ack.complete(),
+                    state.progress.last_send_ack.horizon(),
                     state.progress.last_send_ack_frontier,
                     relay_lane,
                 );
@@ -851,7 +927,7 @@ where
                     match sender.send_recv_progress(
                         &mut remotes,
                         context,
-                        &recv_stream,
+                        &mut recv_stream,
                         &mut state.progress.recv_progress,
                         RelayRecvProgressSend::new(path_snapshot, relay_lane, true),
                     )
@@ -921,7 +997,7 @@ where
                 match sender.send_recv_progress(
                     &mut remotes,
                     context,
-                    &recv_stream,
+                    &mut recv_stream,
                     &mut state.progress.recv_progress,
                     RelayRecvProgressSend::new(path_snapshot, relay_lane, true),
                 )
@@ -952,7 +1028,7 @@ where
                                     .send_recv_progress(
                                         &mut remotes,
                                         context,
-                                        &recv_stream,
+                                        &mut recv_stream,
                                         &mut state.progress.recv_progress,
                                         RelayRecvProgressSend::new(
                                             path_snapshot,
@@ -999,7 +1075,7 @@ where
                 match sender.send_recv_progress(
                     &mut remotes,
                     context,
-                    &recv_stream,
+                    &mut recv_stream,
                     &mut state.progress.recv_progress,
                     RelayRecvProgressSend::new(path_snapshot, relay_lane, true),
                 )
@@ -1287,8 +1363,9 @@ where
                         context,
                         &remotes,
                         &send_stream,
-                        &state.progress.last_send_ack_ranges,
-                        state.progress.last_send_ack_complete,
+                        state.progress.last_send_ack.ranges(),
+                        state.progress.last_send_ack.complete(),
+                        state.progress.last_send_ack.horizon(),
                         state.progress.last_send_ack_frontier,
                         relay_lane,
                     ) {
@@ -1297,7 +1374,7 @@ where
                     match sender.send_recv_progress(
                         &mut remotes,
                         context,
-                        &recv_stream,
+                        &mut recv_stream,
                         &mut state.progress.recv_progress,
                         RelayRecvProgressSend::new(path_snapshot, relay_lane, true),
                     )
@@ -1360,30 +1437,23 @@ where
                     );
                     sender_queue.push_data(payload);
                     let mut opportunistic_reads = 1usize;
-                    while state.endpoint.local_open
-                        && !relay_lane.is_bulk()
-                        && opportunistic_reads < sender_dispatch_item_budget
-                        && reliable_relay_can_read_product_source(
-                            state.endpoint.local_open,
-                            false,
+                    while state.endpoint.local_open {
+                        let next_read_budget = reliable_relay_client_opportunistic_read_budget(
+                            opportunistic_reads,
                             &send_stream,
                             &sender_queue,
-                            sender_queue_limit,
-                        )
-                        && sender_queue.data_bytes() < sender_dispatch_byte_budget
-                    {
-                        let next_read_budget = reliable_relay_sender_queue_read_budget(
-                            &send_stream,
-                            &sender_queue,
-                            sender_queue_limit,
-                            source_read_ceiling,
+                            ClientOpportunisticReadBounds {
+                                sender_dispatch_byte_budget,
+                                sender_dispatch_item_budget,
+                                sender_queue_limit,
+                                source_read_ceiling,
+                                request_outstanding_limit,
+                            },
                         );
                         if next_read_budget == 0 {
                             break;
                         }
-                        let read = tokio::select! {
-                            biased;
-                            read = async {
+                        let Some(read) = ready_at_entry(async {
                                 let permit = context
                                     .session_send_buffer
                                     .reserve(&mut send_buffer_updates, next_read_budget)
@@ -1395,8 +1465,10 @@ where
                                 )
                                 .await;
                                 (result, permit)
-                            } => read,
-                            _ = std::future::ready(()) => break,
+                            })
+                            .await
+                        else {
+                            break;
                         };
                         let (read, permit) = read;
                         let (read, payload) = read.map_err(RuntimeError::Io)?;
@@ -1427,7 +1499,10 @@ where
             frame = async {
                 #[cfg(feature = "lab-diagnostics")]
                 let recv_started = Instant::now();
-                let result = remotes.recv_frame().await;
+                let result = match deferred_remote_frame.take() {
+                    Some(frame) => Ok(frame),
+                    None => remotes.recv_frame().await,
+                };
                 #[cfg(feature = "lab-diagnostics")]
                 if let Ok(ReliableRelayRemoteFrame { frame: Ok(frame), .. }) = &result {
                     lab_perf_record(
@@ -1520,8 +1595,11 @@ where
                             }
                             Ok(None) => {}
                             Err(err) => {
-                                eprintln!(
-                                    "warning: reliable path-error survivor recovery failed: {err}"
+                                crate::observability::process_event!(
+                                    Warn,
+                                    "reliable_relay",
+                                    "survivor_recovery_failed",
+                                    "reliable path-error survivor recovery failed: {err}"
                                 );
                             }
                         }
@@ -1536,25 +1614,91 @@ where
                         offset,
                         payload,
                     } if received_stream_id == stream_id && state.endpoint.remote_open => {
-                        let data_effect = match apply_client_stream_data(
-                            &mut state,
-                            context,
+                        let ready_items = if recv_stream.reorder_bytes() == 0 {
+                            remotes.ready_frame_count()
+                        } else {
+                            0
+                        };
+                        let receive_limit = state
+                            .endpoint
+                            .pending_remote_fin_offset
+                            .unwrap_or(u64::MAX)
+                            .min(recv_stream.published_max_offset());
+                        let payload_limit = reliable_relay_buffer_len(context.mux_limits)
+                            .min(remotes.max_frame_payload_bytes(context.mux_limits))
+                            .max(1);
+                        let first = ReliableRelayRemoteFrame {
+                            instance,
+                            frame: Ok(Frame::StreamData {
+                                stream_id: received_stream_id,
+                                offset,
+                                payload,
+                            }),
+                        };
+                        let deferred = collect_ready_stream_data_batch(
+                            &mut ready_remote_data,
+                            first,
+                            ReadyStreamDataBatchBounds {
+                                stream_id,
+                                receive_frontier: recv_stream.next_offset(),
+                                receive_limit,
+                                payload_limit,
+                                ready_items,
+                            },
+                            || remotes.try_recv_frame(),
+                            |item| match &item.frame {
+                                Ok(Frame::StreamData {
+                                    stream_id,
+                                    offset,
+                                    payload,
+                                }) => Some((*stream_id, *offset, payload.len())),
+                                _ => None,
+                            },
+                        );
+                        debug_assert!(deferred_remote_frame.is_none());
+                        deferred_remote_frame = deferred;
+                        let mut data_effect = None;
+                        let write = apply_and_write_ready_stream_data_batch(
                             &mut local,
                             &mut recv_stream,
-                            stream_id,
-                            path_key,
-                            offset,
-                            payload,
+                            &mut ready_remote_data,
+                            ReadyStreamDataDirection::ClientDownload,
+                            true,
+                            |recv_stream, item| {
+                                let ReliableRelayRemoteFrame { instance, frame } = item;
+                                let frame = frame?;
+                                let Frame::StreamData {
+                                    stream_id: received_stream_id,
+                                    offset,
+                                    payload,
+                                } = frame
+                                else {
+                                    unreachable!("ready data batch contains only STREAM_DATA");
+                                };
+                                debug_assert_eq!(received_stream_id, stream_id);
+                                let (effect, outcome) = apply_client_stream_data_state(
+                                    &mut state,
+                                    context,
+                                    recv_stream,
+                                    stream_id,
+                                    instance.key,
+                                    offset,
+                                    payload,
+                                )?;
+                                data_effect = Some(effect);
+                                Ok(outcome)
+                            },
                         )
-                        .await
-                        {
-                            Ok(effect) => effect,
-                            Err(err) => break Err(err),
-                        };
+                        .await;
+                        if let Err(err) = write {
+                            break Err(err);
+                        }
+                        let data_effect =
+                            data_effect.expect("ready data batch contains its first frame");
                         match sender.send_recv_progress(
                             &mut remotes,
                             context,
-                            &recv_stream,
+                            &mut recv_stream,
                             &mut state.progress.recv_progress,
                             RelayRecvProgressSend::new(path_snapshot, relay_lane, false),
                         )
@@ -1592,7 +1736,7 @@ where
                             let feedback_published = match sender.send_recv_progress(
                                 &mut remotes,
                                 context,
-                                &recv_stream,
+                                &mut recv_stream,
                                 &mut state.progress.recv_progress,
                                 RelayRecvProgressSend::new(path_snapshot, relay_lane, true),
                             )
@@ -1626,7 +1770,7 @@ where
                         complete,
                         ranges,
                     } if ack_stream_id == stream_id => {
-                        let released_bytes = apply_client_stream_ack(
+                        let released_bytes = match apply_client_stream_ack(
                             ClientStreamAckContext {
                                 state: &mut state,
                                 sender: &mut sender,
@@ -1640,7 +1784,10 @@ where
                             stream_id,
                             complete,
                             ranges,
-                        );
+                        ) {
+                            Ok(released_bytes) => released_bytes,
+                            Err(err) => break Err(err.into()),
+                        };
                         send_buffer_reservation.release(released_bytes);
                         if reliable_relay_can_send_pending_fin(
                             state.endpoint.pending_local_fin,
@@ -1727,7 +1874,7 @@ where
                             let feedback_published = match sender.send_recv_progress(
                                 &mut remotes,
                                 context,
-                                &recv_stream,
+                                &mut recv_stream,
                                 &mut state.progress.recv_progress,
                                 RelayRecvProgressSend::new(path_snapshot, relay_lane, true),
                             )
@@ -1772,7 +1919,7 @@ where
                             .send_recv_progress(
                                 &mut remotes,
                                 context,
-                                &recv_stream,
+                                &mut recv_stream,
                                 &mut state.progress.recv_progress,
                                 RelayRecvProgressSend::new(path_snapshot, relay_lane, true),
                             )

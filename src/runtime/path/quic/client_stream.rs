@@ -35,7 +35,7 @@ pub(super) async fn run_client_udp_stream(
 ) {
     let mut carrier_frames = spawn_quic_path_reader(recv, codec_limits, reader_queue_size);
     let mut pending_frames = Vec::<Frame>::new();
-    let mut path_proofs = PathProofTracker::default();
+    let mut path_proofs = PathProofTracker::from_limits(mux_limits);
     let mut deferred_input: Option<Result<Frame, RuntimeError>> = None;
     // A peer FIN closes only the QUIC receive half. Final Data ACK and local
     // FIN work must retain this actor's independent send half.
@@ -45,7 +45,7 @@ pub(super) async fn run_client_udp_stream(
     loop {
         let command_may_recv = !reliable_path_receivers_closed(&commands);
         if !command_may_recv {
-            let _ = udp_path_finish_stream(&mut send);
+            let _ = udp_path_finish_stream(&mut send).await;
             return;
         }
         if let Some(input) = deferred_input.take() {

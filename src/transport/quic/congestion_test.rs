@@ -50,7 +50,78 @@ fn instrumented_controller_forwards_pacing_rate_through_clones() {
 }
 
 #[test]
-fn instrumented_controller_preserves_bbr_packet_delivery_state() {
+fn same_path_clone_preserves_telemetry_epoch() {
+    let telemetry = Arc::new(QuicCarrierTelemetry::default());
+    let controller =
+        InstrumentedController::new(Box::new(FixedPacingController(1)), telemetry.clone());
+    let cloned = controller
+        .clone_box()
+        .into_any()
+        .downcast::<InstrumentedController>()
+        .expect("instrumented clone");
+
+    assert!(Arc::ptr_eq(&cloned.telemetry, &telemetry));
+    assert!(Arc::ptr_eq(
+        &cloned.path_telemetry,
+        &controller.path_telemetry
+    ));
+    assert_eq!(
+        cloned.path_telemetry.path_epoch,
+        controller.path_telemetry.path_epoch
+    );
+}
+
+#[test]
+fn fresh_network_path_keeps_owner_and_isolates_stale_callbacks() {
+    let base = Instant::now();
+    let telemetry = Arc::new(QuicCarrierTelemetry::default());
+    let inner = quinn::congestion::ControllerFactory::build(
+        Arc::new(quinn::congestion::BbrConfig::default()),
+        base,
+        1200,
+    );
+    let mut old = InstrumentedController::new(inner, telemetry.clone());
+    let old_epoch = old.path_telemetry.path_epoch;
+    telemetry.record_delivery_evidence_written(1200);
+
+    let mut fresh = old
+        .fresh_path_box(base + Duration::from_secs(1), 1400)
+        .expect("instrumented controller supports fresh paths")
+        .into_any()
+        .downcast::<InstrumentedController>()
+        .expect("fresh instrumented controller");
+
+    assert!(Arc::ptr_eq(&fresh.telemetry, &telemetry));
+    assert!(!Arc::ptr_eq(&fresh.path_telemetry, &old.path_telemetry));
+    assert_eq!(fresh.path_telemetry.path_epoch, old_epoch + 1);
+
+    old.accumulate_ack_telemetry(base, 1200, false);
+    old.finish_ack_telemetry(base + Duration::from_millis(10), 0, false);
+    old.on_congestion_event(base + Duration::from_millis(10), base, false, 1200);
+
+    let before_current_ack = fresh.snapshot();
+    assert_eq!(before_current_ack.path_epoch, old_epoch + 1);
+    assert_eq!(before_current_ack.newly_acked_bytes, None);
+    assert_eq!(before_current_ack.lost_bytes, 0);
+    assert_eq!(before_current_ack.bytes_in_flight, None);
+    assert_eq!(
+        telemetry.delivery_evidence_pending_ack_bytes(),
+        1200,
+        "a retired path callback cannot consume current delivery evidence"
+    );
+
+    fresh.accumulate_ack_telemetry(base + Duration::from_secs(1), 1200, false);
+    fresh.finish_ack_telemetry(
+        base + Duration::from_secs(1) + Duration::from_millis(10),
+        0,
+        false,
+    );
+    assert_eq!(fresh.snapshot().newly_acked_bytes, Some(1200));
+    assert_eq!(telemetry.delivery_evidence_pending_ack_bytes(), 0);
+}
+
+#[test]
+fn instrumented_controller_preserves_compact_bbr_delivery_state() {
     let base = Instant::now();
     let (mut controller, _) = test_instrumented_controller(base);
 
@@ -60,10 +131,7 @@ fn instrumented_controller_preserves_bbr_packet_delivery_state() {
 
     assert_eq!(state.delivered, 0);
     assert_eq!(state.delivered_time, base);
-    assert_eq!(state.first_sent_time, base);
-    assert_eq!(state.packet_number, 7);
-    assert!(!state.app_limited);
-    assert_eq!(state.tx_in_flight, 1200);
+    assert_eq!(state.send_elapsed_ns, 0);
 }
 
 #[tokio::test]
@@ -85,6 +153,7 @@ async fn first_unacknowledged_product_write_wakes_idle_metrics() {
 #[test]
 fn native_ack_reconciles_pending_delivery_evidence() {
     let telemetry = QuicCarrierTelemetry::default();
+    let path_telemetry = telemetry.allocate_path_telemetry();
     telemetry.record_delivery_evidence_written(64 * 1024);
     assert_eq!(telemetry.delivery_evidence_written_bytes(), 64 * 1024);
     assert_eq!(telemetry.delivery_evidence_pending_ack_bytes(), 64 * 1024);
@@ -94,7 +163,7 @@ fn native_ack_reconciles_pending_delivery_evidence() {
         "send-credit reads must not consume ACK evidence"
     );
 
-    telemetry.publish_ack_batch(
+    path_telemetry.publish_ack_batch(
         QuicAckTelemetryTotals {
             acked_bytes: 16 * 1024,
             sample_count: 1,
@@ -103,8 +172,9 @@ fn native_ack_reconciles_pending_delivery_evidence() {
         48 * 1024,
         false,
     );
+    telemetry.reconcile_delivery_evidence_ack(path_telemetry.path_epoch, 16 * 1024);
     assert_eq!(telemetry.delivery_evidence_pending_ack_bytes(), 48 * 1024);
-    assert_eq!(telemetry.bytes_in_flight(), Some(48 * 1024));
+    assert_eq!(path_telemetry.bytes_in_flight(), Some(48 * 1024));
 }
 
 #[test]
@@ -114,7 +184,7 @@ fn quic_ack_snapshot_keeps_non_app_limited_classification_coherent() {
     const NON_APP_ACKS_PER_BATCH: u64 = 2;
     const ACKS_PER_BATCH: u64 = 3;
     const ELAPSED_PER_BATCH: Duration = Duration::from_micros(7);
-    let telemetry = Arc::new(QuicCarrierTelemetry::default());
+    let telemetry = QuicCarrierTelemetry::default().allocate_path_telemetry();
     let writer = {
         let telemetry = telemetry.clone();
         std::thread::spawn(move || {
@@ -236,19 +306,16 @@ fn quic_ack_snapshot_keeps_non_app_limited_classification_coherent() {
         ELAPSED_PER_BATCH * (BATCHES / 2) as u32
     );
 }
-fn test_instrumented_controller(
-    base: Instant,
-) -> (InstrumentedController, Arc<QuicCarrierTelemetry>) {
+fn test_instrumented_controller(base: Instant) -> (InstrumentedController, Arc<QuicPathTelemetry>) {
     let telemetry = Arc::new(QuicCarrierTelemetry::default());
     let inner = quinn::congestion::ControllerFactory::build(
         Arc::new(quinn::congestion::BbrConfig::default()),
         base,
         1200,
     );
-    (
-        InstrumentedController::new(inner, telemetry.clone()),
-        telemetry,
-    )
+    let controller = InstrumentedController::new(inner, telemetry);
+    let path_telemetry = controller.path_telemetry.clone();
+    (controller, path_telemetry)
 }
 #[test]
 fn quic_first_ack_batch_excludes_path_rtt_and_app_limited_idle() {

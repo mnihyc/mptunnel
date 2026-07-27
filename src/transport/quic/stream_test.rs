@@ -1,7 +1,7 @@
 use super::super::Endpoint;
 use super::*;
 use crate::mux::MuxLimits;
-use crate::protocol::StreamId;
+use crate::protocol::{DatagramFlowId, DatagramId, StreamId, TargetAddr};
 use bytes::Bytes;
 use std::time::Duration;
 use tokio::time::timeout;
@@ -59,14 +59,244 @@ fn quic_writer_splits_large_stream_data_below_product_scheduler() {
     }
 }
 
+fn encoded_h3_records(frames: &[Frame], limits: CodecLimits) -> Bytes {
+    let mut packet = Vec::new();
+    for frame in frames {
+        encode_length_prefixed_frame(frame, limits, &mut packet).expect("encode H3 record");
+    }
+    Bytes::from(packet)
+}
+
+#[test]
+fn ready_h3_stream_data_decode_is_zero_copy_for_one_record() {
+    let limits = CodecLimits::default();
+    let payload = Bytes::from_static(b"one contiguous record");
+    let mut pending = encoded_h3_records(
+        &[Frame::StreamData {
+            stream_id: StreamId(7),
+            offset: 11,
+            payload: payload.clone(),
+        }],
+        limits,
+    );
+    let encoded_frame_len =
+        u32::from_be_bytes([pending[0], pending[1], pending[2], pending[3]]) as usize;
+    let payload_start = FRAME_LEN_BYTES + encoded_frame_len - payload.len();
+    let encoded_payload_ptr = pending.slice(payload_start..).as_ptr();
+
+    let decoded = decode_ready_h3_frame(&mut pending, limits)
+        .expect("decode ready record")
+        .expect("complete record");
+    let Frame::StreamData {
+        stream_id,
+        offset,
+        payload: decoded_payload,
+    } = decoded
+    else {
+        panic!("record must remain STREAM_DATA");
+    };
+    assert_eq!(stream_id, StreamId(7));
+    assert_eq!(offset, 11);
+    assert_eq!(decoded_payload, payload);
+    assert_eq!(decoded_payload.as_ptr(), encoded_payload_ptr);
+    assert!(pending.is_empty());
+}
+
+#[test]
+fn ready_h3_stream_data_coalesces_adjacent_records_from_one_chunk() {
+    let limits = CodecLimits::default();
+    let mut pending = encoded_h3_records(
+        &[
+            Frame::StreamData {
+                stream_id: StreamId(9),
+                offset: 100,
+                payload: Bytes::from_static(b"abc"),
+            },
+            Frame::StreamData {
+                stream_id: StreamId(9),
+                offset: 103,
+                payload: Bytes::from_static(b"defg"),
+            },
+            Frame::StreamData {
+                stream_id: StreamId(9),
+                offset: 107,
+                payload: Bytes::from_static(b"hij"),
+            },
+        ],
+        limits,
+    );
+
+    assert_eq!(
+        decode_ready_h3_frame(&mut pending, limits).expect("decode ready batch"),
+        Some(Frame::StreamData {
+            stream_id: StreamId(9),
+            offset: 100,
+            payload: Bytes::from_static(b"abcdefghij"),
+        })
+    );
+    assert!(pending.is_empty());
+}
+
+#[test]
+fn ready_h3_stream_data_stops_at_semantic_and_codec_boundaries() {
+    let limits = CodecLimits::default();
+    let boundaries = [
+        Frame::Ping { nonce: 1 },
+        Frame::StreamFin {
+            stream_id: StreamId(9),
+            final_offset: 3,
+        },
+        Frame::StreamData {
+            stream_id: StreamId(9),
+            offset: 4,
+            payload: Bytes::from_static(b"gap"),
+        },
+        Frame::StreamData {
+            stream_id: StreamId(10),
+            offset: 3,
+            payload: Bytes::from_static(b"other"),
+        },
+    ];
+    for boundary in boundaries {
+        let first = Frame::StreamData {
+            stream_id: StreamId(9),
+            offset: 0,
+            payload: Bytes::from_static(b"abc"),
+        };
+        let mut pending = encoded_h3_records(&[first.clone(), boundary.clone()], limits);
+        assert_eq!(
+            decode_ready_h3_frame(&mut pending, limits).expect("decode first record"),
+            Some(first)
+        );
+        assert_eq!(
+            decode_ready_h3_frame(&mut pending, limits).expect("decode preserved boundary"),
+            Some(boundary)
+        );
+        assert!(pending.is_empty());
+    }
+
+    for bounded_limits in [
+        CodecLimits {
+            max_payload_bytes: 4,
+            ..limits
+        },
+        CodecLimits {
+            max_frame_bytes: 33,
+            ..limits
+        },
+    ] {
+        let first = Frame::StreamData {
+            stream_id: StreamId(9),
+            offset: 0,
+            payload: Bytes::from_static(b"abc"),
+        };
+        let second = Frame::StreamData {
+            stream_id: StreamId(9),
+            offset: 3,
+            payload: Bytes::from_static(b"de"),
+        };
+        let mut pending = encoded_h3_records(&[first.clone(), second.clone()], bounded_limits);
+        assert_eq!(
+            decode_ready_h3_frame(&mut pending, bounded_limits)
+                .expect("decode frame below aggregate limit"),
+            Some(first)
+        );
+        assert_eq!(
+            decode_ready_h3_frame(&mut pending, bounded_limits)
+                .expect("decode record preserved by aggregate limit"),
+            Some(second)
+        );
+        assert!(pending.is_empty());
+    }
+}
+
+#[test]
+fn native_flow_registry_bounds_live_state_without_exhausting_on_churn() {
+    let target = TargetAddr::Ip("127.0.0.1:53".parse().expect("target"));
+    let mut registry = DatagramFlowRegistry::new(2);
+
+    // The global allocator is monotonic, so long-lived sequential churn
+    // coalesces into bounded seen-ID ranges while only live flows consume the
+    // concurrency limit.
+    for value in 0..100_u64 {
+        let flow_id = DatagramFlowId(value);
+        registry
+            .apply_transitions(&[Frame::OpenDatagramFlow {
+                flow_id,
+                target: target.clone(),
+            }])
+            .expect("open one live flow");
+        assert_eq!(registry.active.len(), 1);
+        assert!(registry.seen_ranges.len() <= registry.max_seen_ranges);
+        registry
+            .apply_transitions(&[Frame::DatagramClose { flow_id }])
+            .expect("reliably close flow");
+        assert!(registry.active.is_empty());
+    }
+
+    // A delayed, previously unseen allocation can fill a sparse gap and
+    // coalesce it; an actually closed identity cannot be reopened.
+    for value in [102_u64, 104, 103] {
+        let flow_id = DatagramFlowId(value);
+        registry
+            .apply_transitions(&[Frame::OpenDatagramFlow {
+                flow_id,
+                target: target.clone(),
+            }])
+            .expect("out-of-order unseen flow remains valid");
+        registry
+            .apply_transitions(&[Frame::DatagramClose { flow_id }])
+            .expect("close sparse flow");
+    }
+
+    registry
+        .apply_transitions(&[
+            Frame::OpenDatagramFlow {
+                flow_id: DatagramFlowId(200),
+                target: target.clone(),
+            },
+            Frame::OpenDatagramFlow {
+                flow_id: DatagramFlowId(201),
+                target: target.clone(),
+            },
+        ])
+        .expect("fill the live-flow bound");
+    assert!(matches!(
+        registry.apply_transitions(&[Frame::OpenDatagramFlow {
+            flow_id: DatagramFlowId(202),
+            target: target.clone(),
+        }]),
+        Err(QuicCarrierError::NativeDatagramFlowsExhausted)
+    ));
+    registry
+        .apply_transitions(&[Frame::DatagramClose {
+            flow_id: DatagramFlowId(200),
+        }])
+        .expect("release one live flow");
+    registry
+        .apply_transitions(&[Frame::OpenDatagramFlow {
+            flow_id: DatagramFlowId(202),
+            target: target.clone(),
+        }])
+        .expect("a new flow may consume the released live slot");
+
+    assert!(matches!(
+        registry.apply_transitions(&[Frame::OpenDatagramFlow {
+            flow_id: DatagramFlowId(50),
+            target,
+        }]),
+        Err(QuicCarrierError::InvalidNativeDatagram(_))
+    ));
+}
+
 #[tokio::test]
 async fn quic_carrier_round_trips_product_frames() {
-    let secret = b"0123456789abcdef0123456789abcdef";
     let limits = CodecLimits::default();
     let mux_limits = MuxLimits::default();
     let server = Endpoint::bind_server(
         "127.0.0.1:0".parse().expect("server addr"),
-        secret,
+        &crate::transport::encrypted::test_server_tls_config(),
+        super::super::test_candidate_verifier(),
         mux_limits,
     )
     .await
@@ -84,7 +314,9 @@ async fn quic_carrier_round_trips_product_frames() {
                 write_frame(&mut send, &Frame::Pong { nonce }, limits)
                     .await
                     .expect("server write pong");
-                finish_stream(&mut send).expect("server finish stream");
+                finish_stream(&mut send)
+                    .await
+                    .expect("server finish stream");
             }
             frame => panic!("unexpected frame: {frame:?}"),
         }
@@ -93,7 +325,8 @@ async fn quic_carrier_round_trips_product_frames() {
 
     let client = Endpoint::bind_client(
         "127.0.0.1:0".parse().expect("client addr"),
-        secret,
+        &crate::transport::encrypted::test_client_tls_config(),
+        super::super::test_candidate_selector(),
         mux_limits,
     )
     .await
@@ -107,7 +340,9 @@ async fn quic_carrier_round_trips_product_frames() {
         .expect("client write ping");
     assert_eq!(connection.congestion_metrics().pending_bytes, 0);
     assert!(!connection.is_closed());
-    finish_stream(&mut send).expect("client finish stream");
+    finish_stream(&mut send)
+        .await
+        .expect("client finish stream");
     let response = timeout(Duration::from_secs(5), read_frame(&mut recv, limits))
         .await
         .expect("response timeout")
@@ -124,13 +359,12 @@ async fn quic_carrier_round_trips_product_frames() {
 }
 #[tokio::test]
 async fn stopped_quic_stream_write_keeps_the_shared_connection_available() {
-    let secret = b"0123456789abcdef0123456789abcdef";
     let limits = CodecLimits::default();
     let mux_limits = MuxLimits::default();
-    let stop_code = VarInt::from_u32(37);
     let server = Endpoint::bind_server(
         "127.0.0.1:0".parse().expect("server addr"),
-        secret,
+        &crate::transport::encrypted::test_server_tls_config(),
+        super::super::test_candidate_verifier(),
         mux_limits,
     )
     .await
@@ -144,7 +378,10 @@ async fn stopped_quic_stream_write_keeps_the_shared_connection_available() {
             read_frame(&mut recv, limits).await.expect("read opener"),
             Frame::Ping { nonce: 1 }
         );
-        recv.stream.stop(stop_code).expect("stop client writer");
+        // Dropping an unread H3 receive half exercises the normal receiver
+        // abandonment path and emits QUIC STOP_SENDING without relying on
+        // h3-quinn's non-cancel-safe test-only stop wrapper.
+        drop(recv);
         let (mut send, mut recv) = connection
             .accept_bi()
             .await
@@ -163,7 +400,8 @@ async fn stopped_quic_stream_write_keeps_the_shared_connection_available() {
 
     let client = Endpoint::bind_client(
         "127.0.0.1:0".parse().expect("client addr"),
-        secret,
+        &crate::transport::encrypted::test_client_tls_config(),
+        super::super::test_candidate_selector(),
         mux_limits,
     )
     .await
@@ -176,34 +414,19 @@ async fn stopped_quic_stream_write_keeps_the_shared_connection_available() {
     assert_eq!(connection.congestion_metrics().pending_bytes, 0);
     assert!(!connection.is_closed());
 
-    assert_eq!(
-        timeout(Duration::from_secs(5), send.stream.stopped())
-            .await
-            .expect("STOP_SENDING timeout")
-            .expect("connection remains available"),
-        Some(stop_code)
-    );
-    let payload = Bytes::from_static(b"monotonic delivery evidence");
-    let payload_len = payload.len() as u64;
-    let err = write_frame(
-        &mut send,
-        &Frame::StreamData {
-            stream_id: StreamId(9),
-            offset: 0,
-            payload,
-        },
-        limits,
-    )
+    let err = timeout(Duration::from_secs(5), async {
+        loop {
+            match write_frame(&mut send, &Frame::Ping { nonce: 99 }, limits).await {
+                Ok(()) => tokio::task::yield_now().await,
+                Err(err) => break err,
+            }
+        }
+    })
     .await
-    .expect_err("stopped stream write must fail");
-
-    assert!(matches!(
-        err,
-        QuicCarrierError::Write(quinn::WriteError::Stopped(code)) if code == stop_code
-    ));
+    .expect("HTTP/3 request cancellation timeout");
+    assert!(matches!(err, QuicCarrierError::H3Stream(_)));
     let metrics = connection.congestion_metrics();
     assert_eq!(metrics.pending_bytes, 0);
-    assert_eq!(metrics.delivery_evidence_written_bytes, payload_len);
     assert!(!connection.is_closed());
 
     let (mut replacement_send, mut replacement_recv) =
@@ -224,7 +447,6 @@ async fn stopped_quic_stream_write_keeps_the_shared_connection_available() {
 
 #[tokio::test]
 async fn cancelled_quic_write_fail_closes_and_releases_backlog() {
-    let secret = b"0123456789abcdef0123456789abcdef";
     let limits = CodecLimits::default();
     let mux_limits = MuxLimits {
         max_stream_window_bytes: 4 * 1024,
@@ -237,7 +459,8 @@ async fn cancelled_quic_write_fail_closes_and_releases_backlog() {
     };
     let server = Endpoint::bind_server(
         "127.0.0.1:0".parse().expect("server addr"),
-        secret,
+        &crate::transport::encrypted::test_server_tls_config(),
+        super::super::test_candidate_verifier(),
         mux_limits,
     )
     .await
@@ -259,7 +482,8 @@ async fn cancelled_quic_write_fail_closes_and_releases_backlog() {
 
     let client = Endpoint::bind_client(
         "127.0.0.1:0".parse().expect("client addr"),
-        secret,
+        &crate::transport::encrypted::test_client_tls_config(),
+        super::super::test_candidate_selector(),
         mux_limits,
     )
     .await
@@ -317,12 +541,12 @@ async fn cancelled_quic_write_fail_closes_and_releases_backlog() {
 
 #[tokio::test]
 async fn quic_carrier_batches_multiple_product_frames_per_write() {
-    let secret = b"0123456789abcdef0123456789abcdef";
     let limits = CodecLimits::default();
     let mux_limits = MuxLimits::default();
     let server = Endpoint::bind_server(
         "127.0.0.1:0".parse().expect("server addr"),
-        secret,
+        &crate::transport::encrypted::test_server_tls_config(),
+        super::super::test_candidate_verifier(),
         mux_limits,
     )
     .await
@@ -343,7 +567,8 @@ async fn quic_carrier_batches_multiple_product_frames_per_write() {
 
     let client = Endpoint::bind_client(
         "127.0.0.1:0".parse().expect("client addr"),
-        secret,
+        &crate::transport::encrypted::test_client_tls_config(),
+        super::super::test_candidate_selector(),
         mux_limits,
     )
     .await
@@ -357,7 +582,136 @@ async fn quic_carrier_batches_multiple_product_frames_per_write() {
     )
     .await
     .expect("client write batch");
-    finish_stream(&mut send).expect("client finish stream");
+    finish_stream(&mut send)
+        .await
+        .expect("client finish stream");
+    timeout(Duration::from_secs(5), server_task)
+        .await
+        .expect("server task timeout")
+        .expect("server task");
+}
+
+#[tokio::test]
+async fn native_http_datagram_fragments_preserve_identity_without_reliable_hol() {
+    let limits = CodecLimits::default();
+    let mux_limits = MuxLimits::default();
+    let flow_id = DatagramFlowId(7);
+    let request_id = DatagramId(11);
+    let response_id = DatagramId(12);
+    let target = TargetAddr::Ip("127.0.0.1:53".parse().expect("target"));
+    let request_payload = Bytes::from(vec![0x5a; 60_000]);
+    let response_payload = Bytes::from_static(b"native response");
+    let (client_done_tx, client_done_rx) = tokio::sync::oneshot::channel();
+
+    let server = Endpoint::bind_server(
+        "127.0.0.1:0".parse().expect("server addr"),
+        &crate::transport::encrypted::test_server_tls_config(),
+        super::super::test_candidate_verifier(),
+        mux_limits,
+    )
+    .await
+    .expect("server endpoint");
+    let server_addr = server.local_addr().expect("server local addr");
+    let expected_request = request_payload.clone();
+    let expected_response = response_payload.clone();
+    let server_task = tokio::spawn(async move {
+        let connection = server.accept().await.expect("accepted connection");
+        let (mut send, mut recv) = connection.accept_bi().await.expect("accepted request");
+        assert_eq!(
+            read_frame(&mut recv, limits)
+                .await
+                .expect("read reliable open"),
+            Frame::OpenDatagramFlow { flow_id, target }
+        );
+
+        let mut saw_native = false;
+        let mut saw_reliable_ping = false;
+        while !saw_native || !saw_reliable_ping {
+            match read_frame(&mut recv, limits)
+                .await
+                .expect("read mixed traffic")
+            {
+                Frame::DatagramData {
+                    flow_id: received_flow,
+                    datagram_id,
+                    ttl_ms,
+                    payload,
+                } => {
+                    assert_eq!(received_flow, flow_id);
+                    assert_eq!(datagram_id, request_id);
+                    assert!(ttl_ms > 0 && ttl_ms <= 5_000);
+                    assert_eq!(payload, expected_request);
+                    saw_native = true;
+                }
+                Frame::Ping { nonce: 99 } => saw_reliable_ping = true,
+                frame => panic!("unexpected mixed HTTP/3 frame: {frame:?}"),
+            }
+        }
+
+        write_frame(
+            &mut send,
+            &Frame::DatagramData {
+                flow_id,
+                datagram_id: response_id,
+                ttl_ms: 5_000,
+                payload: expected_response,
+            },
+            limits,
+        )
+        .await
+        .expect("write native response");
+        let _ = timeout(Duration::from_secs(5), client_done_rx).await;
+    });
+
+    let client = Endpoint::bind_client(
+        "127.0.0.1:0".parse().expect("client addr"),
+        &crate::transport::encrypted::test_client_tls_config(),
+        super::super::test_candidate_selector(),
+        mux_limits,
+    )
+    .await
+    .expect("client endpoint");
+    let connection = client.connect(server_addr).await.expect("client connect");
+    let (mut send, mut recv) = connection.open_bi().await.expect("client request");
+    write_frames(
+        &mut send,
+        &[
+            Frame::OpenDatagramFlow {
+                flow_id,
+                target: TargetAddr::Ip("127.0.0.1:53".parse().expect("target")),
+            },
+            Frame::DatagramData {
+                flow_id,
+                datagram_id: request_id,
+                ttl_ms: 5_000,
+                payload: request_payload,
+            },
+            Frame::Ping { nonce: 99 },
+        ],
+        limits,
+    )
+    .await
+    .expect("write reliable open, native payload, and independent control");
+
+    match timeout(Duration::from_secs(5), read_frame(&mut recv, limits))
+        .await
+        .expect("native response timeout")
+        .expect("native response")
+    {
+        Frame::DatagramData {
+            flow_id: received_flow,
+            datagram_id,
+            ttl_ms,
+            payload,
+        } => {
+            assert_eq!(received_flow, flow_id);
+            assert_eq!(datagram_id, response_id);
+            assert!(ttl_ms > 0 && ttl_ms <= 5_000);
+            assert_eq!(payload, response_payload);
+        }
+        frame => panic!("unexpected native response frame: {frame:?}"),
+    }
+    let _ = client_done_tx.send(());
     timeout(Duration::from_secs(5), server_task)
         .await
         .expect("server task timeout")

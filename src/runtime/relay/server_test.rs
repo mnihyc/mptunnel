@@ -2,8 +2,11 @@ use super::*;
 use crate::model::capacity::MAX_RELIABLE_SERVICE_QUANTUM_BYTES;
 use crate::model::path::CarrierPathKey;
 use crate::model::timing::transport_pto_from_snapshot;
+use crate::mux::stream::validate_stream_ack;
+use crate::outbound::OutboundConfig;
 use crate::protocol::frame::stream_ack_contiguous_frontier;
 use crate::protocol::{PathId, PathMetricDirection, PathMetrics};
+use crate::runtime::outbound_registry::{RuntimeOutboundLeaf, RuntimeOutboundRegistry};
 use crate::runtime::path::commands::{
     ReliablePathCommand, reliable_path_command_channels, try_recv_reliable_path_command,
 };
@@ -46,12 +49,34 @@ async fn server_relay_expires_only_after_its_absolute_no_output_interval() {
         output: ReliablePathStreamOutput::Switchable(binding),
         frames: frames_rx.into(),
     };
+    let id = crate::product::OutboundId::parse("test-direct").expect("outbound");
+    let outbound_registry = RuntimeOutboundRegistry::compile(
+        [RuntimeOutboundLeaf::Local {
+            id: id.clone(),
+            config: OutboundConfig::Direct,
+            connect_timeout: Duration::from_secs(1),
+            native_sockets: Arc::new(crate::transport::SystemNativeSocketConfigurator),
+        }],
+        &[],
+        crate::runtime::outbound_registry::test_dns_generation(),
+    )
+    .expect("registry");
+    let outbound_selector = outbound_registry
+        .selector_for_target(&crate::config::RouteTarget {
+            kind: crate::config::RouteTargetKind::Outbound,
+            tag: id.as_str().to_string(),
+        })
+        .expect("selector");
     let context = ServerReliableRelayContext {
-        outbound: OutboundConfig::Direct,
-        outbound_dns: DnsConfig::default(),
-        outbound_connect_timeout: Duration::from_secs(1),
+        outbound_registry,
+        outbound_selector,
+        dns_plan: None,
+        destination_policy: Arc::new(
+            crate::outbound::ServerDestinationPolicy::allow_restricted_for_test(),
+        ),
         performance: MppPerformanceConfig::default(),
         mux_limits: limits,
+        max_paths_per_session: crate::performance::ResourceLimits::default().max_paths,
         session_retention_timeout: Duration::from_millis(100),
         telemetry: RuntimeTelemetry::new(1),
     };
@@ -336,50 +361,56 @@ fn contiguous_ack_frontier_lag_is_tail_guard_not_reinjection_debt() {
 }
 
 #[test]
-fn incomplete_ack_chunks_extend_an_established_authoritative_snapshot() {
+fn incomplete_ack_chunks_after_a_snapshot_do_not_extend_its_negative_authority() {
     let limits = MuxLimits::default();
     let mut send_stream =
         ReliableSendStream::new_with_initial_max_offset(StreamId(312), limits, u64::MAX);
-    for value in [0x11, 0x22, 0x33] {
-        send_stream
-            .send_data(Bytes::from(vec![value; 1024]))
-            .expect("send response data");
-    }
+    send_stream
+        .send_data(Bytes::from(vec![0x11; 1024]))
+        .expect("send response data before snapshot");
 
-    let mut authoritative_ranges = Vec::new();
-    let mut authoritative_complete = false;
+    let mut authoritative = AuthoritativeStreamAckSnapshot::default();
     let complete_prefix = [OffsetRange {
         start: 0,
         end: 1024,
     }];
-    send_stream.apply_normalized_ack(&complete_prefix);
-    update_reinjection_authoritative_ack_snapshot(
-        &mut authoritative_ranges,
-        &mut authoritative_complete,
-        true,
-        &complete_prefix,
-    );
+    let complete_ack =
+        validate_stream_ack(true, complete_prefix.to_vec(), send_stream.next_offset())
+            .expect("complete prefix stays within assigned data");
+    send_stream
+        .apply_validated_ack(&complete_ack)
+        .expect("complete ACK fits retained send chunks");
+    update_reinjection_authoritative_ack_snapshot(&mut authoritative, &complete_ack);
 
+    for value in [0x22, 0x33] {
+        send_stream
+            .send_data(Bytes::from(vec![value; 1024]))
+            .expect("send response data after snapshot");
+    }
     let incomplete_progress = [OffsetRange {
         start: 1024,
         end: 3072,
     }];
-    send_stream.apply_normalized_ack(&incomplete_progress);
-    update_reinjection_authoritative_ack_snapshot(
-        &mut authoritative_ranges,
-        &mut authoritative_complete,
+    let incomplete_ack = validate_stream_ack(
         false,
-        &incomplete_progress,
-    );
+        incomplete_progress.to_vec(),
+        send_stream.next_offset(),
+    )
+    .expect("incomplete progress stays within assigned data");
+    send_stream
+        .apply_validated_ack(&incomplete_ack)
+        .expect("incomplete ACK fits retained send chunks");
+    update_reinjection_authoritative_ack_snapshot(&mut authoritative, &incomplete_ack);
 
     assert_eq!(
-        authoritative_ranges,
-        [OffsetRange {
+        authoritative.ranges(),
+        &[OffsetRange {
             start: 0,
-            end: 3072,
+            end: 1024,
         }]
     );
-    assert!(authoritative_complete);
+    assert!(authoritative.complete());
+    assert_eq!(authoritative.horizon(), Some(1024));
     assert_eq!(send_stream.data_ack_frontier(), 3072);
     assert_eq!(
         reliable_relay_current_data_ack_outstanding_bytes(

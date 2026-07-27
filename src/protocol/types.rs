@@ -170,6 +170,7 @@ pub enum Frame {
     },
     SessionAuth {
         session_id: SessionId,
+        credential_id: String,
         nonce: AuthNonce,
         issued_at_unix_secs: u64,
         auth_tag: AuthTag,
@@ -180,6 +181,7 @@ pub enum Frame {
     },
     PathJoin {
         session_id: SessionId,
+        credential_id: String,
         path_id: PathId,
         underlay: UnderlayProtocol,
         nonce: AuthNonce,
@@ -294,7 +296,7 @@ pub enum Frame {
 }
 
 impl Frame {
-    pub(crate) fn is_path_capacity(&self) -> bool {
+    pub fn is_path_capacity(&self) -> bool {
         matches!(
             self,
             Self::PathCapacityData { .. }
@@ -303,7 +305,7 @@ impl Frame {
         )
     }
 
-    pub(crate) fn delivery_evidence_bytes(&self) -> u64 {
+    pub fn delivery_evidence_bytes(&self) -> u64 {
         match self {
             Self::StreamData { payload, .. } | Self::DatagramData { payload, .. } => {
                 payload.len() as u64
@@ -312,7 +314,7 @@ impl Frame {
         }
     }
 
-    pub(crate) fn kind_name(&self) -> &'static str {
+    pub fn kind_name(&self) -> &'static str {
         match self {
             Self::SessionHello { .. } => "SESSION_HELLO",
             Self::SessionAuth { .. } => "SESSION_AUTH",

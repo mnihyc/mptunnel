@@ -5,7 +5,7 @@ use super::{
     DatagramClientFlow, DatagramSessionEvent, ReceivedDatagram, SentDatagram, SentDatagramEvidence,
     datagram_feedback_range, datagram_id_is_in_ranges,
 };
-use crate::config::SecurityConfig;
+use crate::config::ClientSecurityConfig;
 use crate::model::capacity::{PathRateSample, QUIC_TIMER_GRANULARITY};
 use crate::model::path::CarrierPathInstanceId;
 use crate::mux::MuxLimits;
@@ -28,6 +28,7 @@ use crate::runtime::path::{
 use crate::runtime::peer_status::{PeerStatusBroker, PeerStatusSnapshotSource};
 #[cfg(test)]
 use crate::transport::SystemCarrierNetworkProvider;
+use crate::transport::encrypted::TcpClientTlsConfig;
 use crate::transport::{CarrierNetworkProvider, CarrierPathIdentity, PathSpec};
 use bytes::Bytes;
 use std::time::{Duration, Instant};
@@ -54,7 +55,7 @@ impl UdpDatagramClientSession {
     pub(in crate::runtime) async fn open(
         path: &PathSpec,
         path_index: usize,
-        security: SecurityConfig,
+        security: ClientSecurityConfig,
         codec_limits: CodecLimits,
         mux_limits: MuxLimits,
         handshake_timeout: Duration,
@@ -64,6 +65,7 @@ impl UdpDatagramClientSession {
             path,
             path_index,
             security,
+            crate::transport::encrypted::test_client_tls_config(),
             codec_limits,
             mux_limits,
             open_deadline,
@@ -72,10 +74,15 @@ impl UdpDatagramClientSession {
         .await
     }
 
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "the carrier constructor keeps security, limits, deadline, and host ownership explicit"
+    )]
     pub(in crate::runtime) async fn open_with_provider(
         path: &PathSpec,
         path_index: usize,
-        security: SecurityConfig,
+        security: ClientSecurityConfig,
+        tls: TcpClientTlsConfig,
         codec_limits: CodecLimits,
         mux_limits: MuxLimits,
         open_deadline: tokio::time::Instant,
@@ -87,6 +94,7 @@ impl UdpDatagramClientSession {
             path_index,
             session_id,
             security,
+            tls,
             codec_limits,
             mux_limits,
             open_deadline,
@@ -100,7 +108,8 @@ impl UdpDatagramClientSession {
         path: &PathSpec,
         path_index: usize,
         session_id: SessionId,
-        security: SecurityConfig,
+        security: ClientSecurityConfig,
+        tls: TcpClientTlsConfig,
         codec_limits: CodecLimits,
         mux_limits: MuxLimits,
         open_deadline: tokio::time::Instant,
@@ -120,7 +129,12 @@ impl UdpDatagramClientSession {
                 path_ordinal: path_index,
             },
             session_id,
+            candidate_selector: crate::transport::quic::QuicCandidateSelector::derive(
+                security.credential.id().as_str(),
+                security.credential.secret().as_bytes(),
+            ),
             security: std::sync::Arc::new(vec![security]),
+            tls: std::sync::Arc::new(vec![tls]),
             codec_limits,
             mux_limits,
             stream_frame_queue: reliable_stream_frame_queue(mux_limits),
@@ -367,7 +381,7 @@ impl UdpDatagramClientSession {
             .await?;
         }
         self.flows.clear();
-        let _ = udp_path_finish_stream(&mut self.stream.send);
+        let _ = udp_path_finish_stream(&mut self.stream.send).await;
         Ok(())
     }
 

@@ -1,5 +1,5 @@
 use crate::mux::MuxLimits;
-use crate::protocol::frame::normalized_offset_ranges;
+use crate::protocol::frame::{normalize_offset_ranges, normalized_offset_ranges};
 use crate::protocol::{Frame, OffsetRange, StreamId};
 use bytes::Bytes;
 use smallvec::SmallVec;
@@ -60,6 +60,11 @@ impl ReliableSendStream {
         self.reinjection_bytes
     }
 
+    #[cfg(test)]
+    pub(crate) fn reinjection_chunks(&self) -> usize {
+        self.reinjection_cache.len()
+    }
+
     /// Lowest Data Sequence offset not yet acknowledged by the peer.
     ///
     /// Incomplete STREAM_ACK chunks are still affirmative delivery evidence.
@@ -113,6 +118,18 @@ impl ReliableSendStream {
                 limit: self.limits.max_repair_bytes,
             });
         }
+        let new_reinjection_chunks = self.reinjection_cache.len().checked_add(1).ok_or(
+            StreamError::TooManyReinjectionCacheChunks {
+                actual: usize::MAX,
+                limit: self.limits.max_reinjection_cache_chunks,
+            },
+        )?;
+        if new_reinjection_chunks > self.limits.max_reinjection_cache_chunks {
+            return Err(StreamError::TooManyReinjectionCacheChunks {
+                actual: new_reinjection_chunks,
+                limit: self.limits.max_reinjection_cache_chunks,
+            });
+        }
 
         let offset = self.next_offset;
         Ok(Frame::StreamData {
@@ -156,6 +173,18 @@ impl ReliableSendStream {
                 limit: self.limits.max_repair_bytes,
             });
         }
+        let new_reinjection_chunks = self.reinjection_cache.len().checked_add(1).ok_or(
+            StreamError::TooManyReinjectionCacheChunks {
+                actual: usize::MAX,
+                limit: self.limits.max_reinjection_cache_chunks,
+            },
+        )?;
+        if new_reinjection_chunks > self.limits.max_reinjection_cache_chunks {
+            return Err(StreamError::TooManyReinjectionCacheChunks {
+                actual: new_reinjection_chunks,
+                limit: self.limits.max_reinjection_cache_chunks,
+            });
+        }
         self.next_offset = end;
         self.reinjection_bytes = new_reinjection_bytes;
         self.reinjection_cache.insert(
@@ -195,18 +224,47 @@ impl ReliableSendStream {
         Ok(())
     }
 
-    pub fn apply_ack(&mut self, ranges: &[OffsetRange]) -> AckOutcome {
-        let ranges = normalized_offset_ranges(ranges);
-        self.apply_normalized_ack(&ranges)
+    pub fn apply_ack(&mut self, ranges: &[OffsetRange]) -> Result<AckOutcome, StreamError> {
+        let ack = validate_stream_ack(false, ranges.to_vec(), self.next_offset)?;
+        self.apply_validated_ack(&ack)
     }
 
-    pub fn apply_normalized_ack(&mut self, ranges: &[OffsetRange]) -> AckOutcome {
+    /// Applies ACK evidence that was validated against one immutable send
+    /// assignment horizon.
+    ///
+    /// Data may be assigned after validation while an ACK transaction is
+    /// retained for later use. The validated ranges remain safe because they
+    /// cannot extend beyond `assigned_end`.
+    pub(crate) fn apply_validated_ack(
+        &mut self,
+        ack: &ValidatedStreamAck,
+    ) -> Result<AckOutcome, StreamError> {
+        debug_assert!(ack.assigned_end <= self.next_offset);
+        self.apply_normalized_ack(ack.ranges())
+    }
+
+    fn apply_normalized_ack(&mut self, ranges: &[OffsetRange]) -> Result<AckOutcome, StreamError> {
         if ranges.is_empty() || self.reinjection_cache.is_empty() {
-            return AckOutcome {
+            return Ok(AckOutcome {
                 released_bytes: 0,
                 released_chunks: 0,
                 remaining_reinjection_bytes: self.reinjection_bytes,
-            };
+            });
+        }
+
+        // One normalized ACK interval can split at most one retained chunk, so
+        // the O(1) conservative bound covers the normal hot path. Only a cache
+        // already close to its node ceiling pays for the exact read-only
+        // preview needed to accept ACKs that also release enough chunks.
+        let conservative_chunks = self.reinjection_cache.len().saturating_add(ranges.len());
+        if conservative_chunks > self.limits.max_reinjection_cache_chunks {
+            let actual = reinjection_chunk_count_after_ack(&self.reinjection_cache, ranges);
+            if actual > self.limits.max_reinjection_cache_chunks {
+                return Err(StreamError::TooManyReinjectionCacheChunks {
+                    actual,
+                    limit: self.limits.max_reinjection_cache_chunks,
+                });
+            }
         }
 
         let mut released_chunks = 0usize;
@@ -243,11 +301,11 @@ impl ReliableSendStream {
             }
         }
         self.reinjection_bytes = previous_reinjection_bytes.saturating_sub(released_bytes);
-        AckOutcome {
+        Ok(AckOutcome {
             released_bytes,
             released_chunks,
             remaining_reinjection_bytes: self.reinjection_bytes,
-        }
+        })
     }
 
     pub fn retransmission_frames_for_ack_gaps(
@@ -447,6 +505,47 @@ fn first_overlapping_reinjection_chunk(
         .map(|(&offset, _)| offset)
 }
 
+fn reinjection_chunk_count_after_ack(
+    reinjection_cache: &BTreeMap<u64, SentChunk>,
+    ranges: &[OffsetRange],
+) -> usize {
+    reinjection_cache
+        .values()
+        .try_fold(0usize, |total, chunk| {
+            total.checked_add(unacked_segments_after_ranges(chunk, ranges))
+        })
+        .unwrap_or(usize::MAX)
+}
+
+fn unacked_segments_after_ranges(chunk: &SentChunk, ranges: &[OffsetRange]) -> usize {
+    let chunk_start = chunk.offset;
+    let chunk_end = chunk
+        .offset
+        .saturating_add(u64::try_from(chunk.payload.len()).unwrap_or(u64::MAX));
+    let mut cursor = chunk_start;
+    let mut segments = 0usize;
+    let mut range_index = ranges.partition_point(|range| range.end <= chunk_start);
+
+    while range_index < ranges.len() {
+        let range = ranges[range_index];
+        if range.start >= chunk_end {
+            break;
+        }
+        if range.start > cursor {
+            segments = segments.saturating_add(1);
+        }
+        cursor = cursor.max(range.end).min(chunk_end);
+        if cursor >= chunk_end {
+            break;
+        }
+        range_index += 1;
+    }
+    if cursor < chunk_end {
+        segments = segments.saturating_add(1);
+    }
+    segments
+}
+
 fn push_retransmission_slice(
     frames: &mut Vec<Frame>,
     stream_id: StreamId,
@@ -495,10 +594,71 @@ pub struct AckOutcome {
     pub remaining_reinjection_bytes: usize,
 }
 
+/// Canonical peer ACK evidence tied to the send extent that existed when its
+/// transaction began.
+///
+/// Construction validates every original range before normalization. This is
+/// deliberate: normalization discards empty/inverted ranges and can merge an
+/// invalid crossing range into otherwise valid evidence.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct ValidatedStreamAck {
+    complete: bool,
+    ranges: Vec<OffsetRange>,
+    assigned_end: u64,
+}
+
+impl ValidatedStreamAck {
+    pub(crate) fn complete(&self) -> bool {
+        self.complete
+    }
+
+    pub(crate) fn ranges(&self) -> &[OffsetRange] {
+        &self.ranges
+    }
+
+    /// Exclusive DSN horizon assigned at the start of this ACK transaction.
+    pub(crate) fn assigned_end(&self) -> u64 {
+        self.assigned_end
+    }
+}
+
+/// Validates and canonicalizes one peer ACK without mutating stream state.
+///
+/// Callers must capture `assigned_end` exactly once from
+/// `ReliableSendStream::next_offset()` before changing cache, flight, queue,
+/// reservation, or recovery evidence.
+pub(crate) fn validate_stream_ack(
+    complete: bool,
+    ranges: Vec<OffsetRange>,
+    assigned_end: u64,
+) -> Result<ValidatedStreamAck, StreamError> {
+    for range in &ranges {
+        if range.start >= range.end {
+            return Err(StreamError::InvalidAckRange {
+                start: range.start,
+                end: range.end,
+            });
+        }
+        if range.end > assigned_end {
+            return Err(StreamError::AckRangeBeyondAssigned {
+                start: range.start,
+                end: range.end,
+                assigned_end,
+            });
+        }
+    }
+    Ok(ValidatedStreamAck {
+        complete,
+        ranges: normalize_offset_ranges(ranges),
+        assigned_end,
+    })
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ReliableRecvStream {
     stream_id: StreamId,
     next_offset: u64,
+    published_max_offset: u64,
     reorder_bytes: usize,
     buffered: BTreeMap<u64, RecvChunk>,
     received_ranges: RangeSet,
@@ -506,10 +666,28 @@ pub struct ReliableRecvStream {
 }
 
 impl ReliableRecvStream {
+    #[cfg(test)]
     pub fn new(stream_id: StreamId, limits: MuxLimits) -> Self {
+        // Unit tests that exercise ordering/ACK mechanics begin with a complete
+        // local window. Production actors must use the explicit constructor
+        // below so peer-visible credit cannot be manufactured accidentally.
+        Self::new_with_initial_max_offset(stream_id, limits, limits.max_stream_window_bytes)
+    }
+
+    /// Create a receive stream with the greatest peer-visible product credit
+    /// already committed by the caller.
+    ///
+    /// Production owners must start at zero unless an opening/control frame
+    /// carrying `initial_max_offset` was successfully queued.
+    pub(crate) fn new_with_initial_max_offset(
+        stream_id: StreamId,
+        limits: MuxLimits,
+        initial_max_offset: u64,
+    ) -> Self {
         Self {
             stream_id,
             next_offset: 0,
+            published_max_offset: initial_max_offset,
             reorder_bytes: 0,
             buffered: BTreeMap::new(),
             received_ranges: RangeSet::default(),
@@ -521,8 +699,24 @@ impl ReliableRecvStream {
         self.next_offset
     }
 
+    pub(crate) fn published_max_offset(&self) -> u64 {
+        self.published_max_offset
+    }
+
+    /// Commits a successfully queued STREAM_MAX_DATA ceiling.
+    ///
+    /// Credit is connection-level and monotonic across path changes.
+    pub(crate) fn commit_max_data(&mut self, max_offset: u64) {
+        self.published_max_offset = self.published_max_offset.max(max_offset);
+    }
+
     pub fn reorder_bytes(&self) -> usize {
         self.reorder_bytes
+    }
+
+    #[cfg(test)]
+    pub(crate) fn reorder_chunks(&self) -> usize {
+        self.buffered.len()
     }
 
     pub fn receive_data(
@@ -542,12 +736,28 @@ impl ReliableRecvStream {
         let end = offset
             .checked_add(payload.len() as u64)
             .ok_or(StreamError::OffsetOverflow)?;
+        if end > self.published_max_offset {
+            return Err(StreamError::FlowControlViolation {
+                end,
+                max: self.published_max_offset,
+            });
+        }
         if self.received_ranges.covers(offset, end) {
             return Ok(ReceiveOutcome::default());
         }
         let missing_ranges = self.received_ranges.uncovered_ranges(offset, end);
         if missing_ranges.is_empty() {
             return Ok(ReceiveOutcome::default());
+        }
+        let conservative_receive_ranges = self.received_ranges.len().saturating_add(1);
+        if conservative_receive_ranges > self.limits.max_retained_receive_ranges {
+            let actual = self.received_ranges.range_count_after_insert(offset, end);
+            if actual > self.limits.max_retained_receive_ranges {
+                return Err(StreamError::TooManyReceiveRanges {
+                    actual,
+                    limit: self.limits.max_retained_receive_ranges,
+                });
+            }
         }
         if offset == self.next_offset
             && missing_ranges.len() == 1
@@ -585,9 +795,20 @@ impl ReliableRecvStream {
                 limit: self.limits.max_reorder_bytes,
             });
         }
+        let conservative_reorder_chunks = self.buffered.len().saturating_add(missing_ranges.len());
+        if conservative_reorder_chunks > self.limits.max_reorder_buffer_chunks {
+            let actual = self.reorder_chunk_count_after_receive(&missing_ranges);
+            if actual > self.limits.max_reorder_buffer_chunks {
+                return Err(StreamError::TooManyReorderBufferChunks {
+                    actual,
+                    limit: self.limits.max_reorder_buffer_chunks,
+                });
+            }
+        }
 
         self.received_ranges.insert(offset, end);
         self.reorder_bytes = new_reorder_bytes;
+        let mut delivered = SmallVec::new();
         for range in missing_ranges {
             let start = usize::try_from(range.start.saturating_sub(offset)).unwrap_or(usize::MAX);
             let stop = usize::try_from(range.end.saturating_sub(offset)).unwrap_or(usize::MAX);
@@ -595,22 +816,57 @@ impl ReliableRecvStream {
             if start >= stop {
                 continue;
             }
-            self.buffered.insert(
-                range.start,
-                RecvChunk {
-                    payload: payload.slice(start..stop),
-                },
-            );
-        }
-
-        let mut delivered = SmallVec::new();
-        while let Some(chunk) = self.buffered.remove(&self.next_offset) {
-            self.reorder_bytes = self.reorder_bytes.saturating_sub(chunk.payload.len());
-            self.next_offset = self.next_offset.saturating_add(chunk.payload.len() as u64);
-            delivered.push(chunk.payload);
+            let chunk = RecvChunk {
+                payload: payload.slice(start..stop),
+            };
+            if range.start == self.next_offset {
+                self.reorder_bytes = self.reorder_bytes.saturating_sub(chunk.payload.len());
+                self.next_offset = self
+                    .next_offset
+                    .saturating_add(u64::try_from(chunk.payload.len()).unwrap_or(u64::MAX));
+                delivered.push(chunk.payload);
+                while let Some(chunk) = self.buffered.remove(&self.next_offset) {
+                    self.reorder_bytes = self.reorder_bytes.saturating_sub(chunk.payload.len());
+                    self.next_offset = self
+                        .next_offset
+                        .saturating_add(u64::try_from(chunk.payload.len()).unwrap_or(u64::MAX));
+                    delivered.push(chunk.payload);
+                }
+            } else {
+                let previous = self.buffered.insert(range.start, chunk);
+                debug_assert!(previous.is_none());
+            }
         }
 
         Ok(ReceiveOutcome { delivered })
+    }
+
+    fn reorder_chunk_count_after_receive(&self, missing_ranges: &[OffsetRange]) -> usize {
+        let mut retained = self.buffered.len().saturating_add(missing_ranges.len());
+        let mut cursor = self.next_offset;
+        let mut missing_index = 0usize;
+
+        loop {
+            while missing_index < missing_ranges.len()
+                && missing_ranges[missing_index].end <= cursor
+            {
+                missing_index += 1;
+            }
+            if missing_index < missing_ranges.len() && missing_ranges[missing_index].start == cursor
+            {
+                cursor = missing_ranges[missing_index].end;
+                missing_index += 1;
+                retained = retained.saturating_sub(1);
+                continue;
+            }
+            let Some(chunk) = self.buffered.get(&cursor) else {
+                break;
+            };
+            cursor = cursor.saturating_add(u64::try_from(chunk.payload.len()).unwrap_or(u64::MAX));
+            retained = retained.saturating_sub(1);
+        }
+
+        retained
     }
 
     pub fn ack_ranges(&self) -> Vec<OffsetRange> {
@@ -731,6 +987,41 @@ struct RangeSet {
 }
 
 impl RangeSet {
+    fn len(&self) -> usize {
+        self.ranges.len()
+    }
+
+    /// Return the exact retained-node count after inserting one range without
+    /// mutating the tree. This is only needed at the configured ceiling; the
+    /// normal receive path uses the O(1) `len + 1` upper bound.
+    fn range_count_after_insert(&self, start: u64, end: u64) -> usize {
+        if start >= end {
+            return self.ranges.len();
+        }
+
+        let mut merged_end = end;
+        let mut removed = 0usize;
+        let mut lower_bound = std::ops::Bound::Included(start);
+        if let Some((&previous_start, &previous_end)) = self.ranges.range(..=start).next_back()
+            && previous_end >= start
+        {
+            merged_end = merged_end.max(previous_end);
+            removed = 1;
+            lower_bound = std::ops::Bound::Excluded(previous_start);
+        }
+        for (&range_start, &range_end) in
+            self.ranges.range((lower_bound, std::ops::Bound::Unbounded))
+        {
+            if range_start > merged_end {
+                break;
+            }
+            removed = removed.saturating_add(1);
+            merged_end = merged_end.max(range_end);
+        }
+
+        self.ranges.len().saturating_sub(removed).saturating_add(1)
+    }
+
     fn insert(&mut self, start: u64, end: u64) {
         if start >= end {
             return;
@@ -823,11 +1114,51 @@ impl RangeSet {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum StreamError {
     EmptyPayload,
-    PayloadTooLarge { actual: usize, limit: usize },
-    FlowControlBlocked { end: u64, max: u64 },
-    ReinjectionCacheFull { actual: usize, limit: usize },
-    ReorderBufferFull { actual: usize, limit: usize },
-    TooManyAckRanges { actual: usize, limit: usize },
+    PayloadTooLarge {
+        actual: usize,
+        limit: usize,
+    },
+    FlowControlBlocked {
+        end: u64,
+        max: u64,
+    },
+    FlowControlViolation {
+        end: u64,
+        max: u64,
+    },
+    ReinjectionCacheFull {
+        actual: usize,
+        limit: usize,
+    },
+    TooManyReinjectionCacheChunks {
+        actual: usize,
+        limit: usize,
+    },
+    ReorderBufferFull {
+        actual: usize,
+        limit: usize,
+    },
+    TooManyReorderBufferChunks {
+        actual: usize,
+        limit: usize,
+    },
+    TooManyReceiveRanges {
+        actual: usize,
+        limit: usize,
+    },
+    TooManyAckRanges {
+        actual: usize,
+        limit: usize,
+    },
+    InvalidAckRange {
+        start: u64,
+        end: u64,
+    },
+    AckRangeBeyondAssigned {
+        start: u64,
+        end: u64,
+        assigned_end: u64,
+    },
     OverlappingData,
     OffsetOverflow,
     InvalidPreparedFrame,
@@ -843,10 +1174,22 @@ impl std::fmt::Display for StreamError {
             Self::FlowControlBlocked { end, max } => {
                 write!(f, "stream offset {end} exceeds max data {max}")
             }
+            Self::FlowControlViolation { end, max } => {
+                write!(
+                    f,
+                    "received stream offset {end} exceeds published max data {max}"
+                )
+            }
             Self::ReinjectionCacheFull { actual, limit } => {
                 write!(
                     f,
                     "reinjection cache would hold {actual} bytes, limit is {limit}"
+                )
+            }
+            Self::TooManyReinjectionCacheChunks { actual, limit } => {
+                write!(
+                    f,
+                    "reinjection cache would hold {actual} chunks, limit is {limit}"
                 )
             }
             Self::ReorderBufferFull { actual, limit } => {
@@ -855,8 +1198,33 @@ impl std::fmt::Display for StreamError {
                     "reorder buffer would hold {actual} bytes, limit is {limit}"
                 )
             }
+            Self::TooManyReorderBufferChunks { actual, limit } => {
+                write!(
+                    f,
+                    "reorder buffer would hold {actual} chunks, limit is {limit}"
+                )
+            }
+            Self::TooManyReceiveRanges { actual, limit } => {
+                write!(
+                    f,
+                    "stream would retain {actual} receive ranges, limit is {limit}"
+                )
+            }
             Self::TooManyAckRanges { actual, limit } => {
                 write!(f, "stream has {actual} ACK ranges, limit is {limit}")
+            }
+            Self::InvalidAckRange { start, end } => {
+                write!(f, "stream ACK range {start}..{end} is empty or inverted")
+            }
+            Self::AckRangeBeyondAssigned {
+                start,
+                end,
+                assigned_end,
+            } => {
+                write!(
+                    f,
+                    "stream ACK range {start}..{end} exceeds assigned data end {assigned_end}"
+                )
             }
             Self::OverlappingData => write!(f, "stream data overlaps an existing range"),
             Self::OffsetOverflow => write!(f, "stream offset overflow"),
@@ -872,3 +1240,7 @@ impl std::error::Error for StreamError {}
 #[cfg(test)]
 #[path = "stream_test.rs"]
 mod tests;
+
+#[cfg(test)]
+#[path = "recv_flow_control_test.rs"]
+mod recv_flow_control_tests;

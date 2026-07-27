@@ -3,11 +3,25 @@ use std::net::SocketAddr;
 
 const MAX_HEADER_BYTES: usize = 64 * 1024;
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 pub struct ConnectRequest {
     pub target: TargetAddr,
     pub header_len: usize,
     pub proxy_authorization: Option<String>,
+}
+
+impl std::fmt::Debug for ConnectRequest {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("ConnectRequest")
+            .field("target", &self.target)
+            .field("header_len", &self.header_len)
+            .field(
+                "proxy_authorization",
+                &self.proxy_authorization.as_ref().map(|_| "<redacted>"),
+            )
+            .finish()
+    }
 }
 
 pub fn parse_connect_request(input: &[u8]) -> Result<ConnectRequest, HttpConnectError> {
@@ -51,6 +65,7 @@ pub fn error_response(status: HttpStatus) -> &'static [u8] {
     match status {
         HttpStatus::BadRequest => b"HTTP/1.1 400 Bad Request\r\nContent-Length: 0\r\n\r\n",
         HttpStatus::BadGateway => b"HTTP/1.1 502 Bad Gateway\r\nContent-Length: 0\r\n\r\n",
+        HttpStatus::Forbidden => b"HTTP/1.1 403 Forbidden\r\nContent-Length: 0\r\n\r\n",
         HttpStatus::MethodNotAllowed => {
             b"HTTP/1.1 405 Method Not Allowed\r\nContent-Length: 0\r\n\r\n"
         }
@@ -118,6 +133,7 @@ fn parse_authority(authority: &str) -> Result<TargetAddr, HttpConnectError> {
 pub enum HttpStatus {
     BadRequest,
     BadGateway,
+    Forbidden,
     MethodNotAllowed,
     ProxyAuthenticationRequired,
 }

@@ -1,20 +1,36 @@
-# Generate one random secret and replace REPLACE_ME in both client.toml and
-# server.toml before use. Keep that shared secret private.
+# Generate one random credential into ./mpp-credential.key and transfer that
+# file securely to both endpoints. Keep it outside source control.
 #
-# Linux/macOS: openssl rand -hex 32
-# PowerShell:   [guid]::NewGuid().ToString()
+# Linux/macOS: umask 077; openssl rand -hex 32 > mpp-credential.key
+# PowerShell:   (New-Guid).Guid | Set-Content -NoNewline mpp-credential.key
 
 log_level = "info"
+
+[[credentials]]
+id = "home-2026"
+principal = "home"
+secret = { from = "file", path = "mpp-credential.key" }
 
 [session]
 # Keep target sockets available for client carrier reattachment.
 retention_timeout_ms = 300000
 
+[dns]
+default_plan = "system"
+
+[[dns.upstreams]]
+id = "system"
+transport = "system"
+
+[[dns.plans]]
+id = "system"
+upstreams = ["system"]
+
 # The management API is optional, loopback-only, and requires a separate random
 # operator token when enabled.
 # [management]
 # listen = ["127.0.0.1:7600"]
-# token = "replace-with-a-random-operator-token"
+# token = { from = "file", path = "management-token.key" }
 # dashboard = true
 
 [[inbounds]]
@@ -22,16 +38,19 @@ tag = "mpp-listener"
 protocol = "mpp"
 endpoints = ["tcp://0.0.0.0:7443", "udp://0.0.0.0:7443"]
 outbound = "direct-egress"
+dns_plan = "system"
 
 [inbounds.security]
-secret = "REPLACE_ME"
+credentials = ["home-2026"]
+tls_certificate_chain_file = "server-cert-chain.pem"
+tls_private_key_file = "server-private-key.pem"
 
 [[outbounds]]
 tag = "direct-egress"
 protocol = "direct"
 # bind_ip = "192.0.2.10" # Replace with an address assigned to this server.
-# System DNS is used by default. Uncomment to use explicit dual-stack DNS.
-# dns = { resolvers = ["1.1.1.1:53", "[2606:4700:4700::1111]:53"], strategy = "ipv4-and-ipv6", timeout_ms = 1500 }
+# Replace the global `system` upstream with tagged UDP/TCP/DoT/DoH/DoQ upstreams
+# for explicit or encrypted resolution.
 
 # To relay through SOCKS5, change the MPP inbound selector above to
 # `outbound = "socks5-egress"`, then uncomment this complete block.
@@ -40,19 +59,14 @@ protocol = "direct"
 # protocol = "socks5"
 # proxy = "127.0.0.1:1080"
 # connect_timeout_ms = 10000
-# Target domains are resolved by the no-auth upstream SOCKS5 proxy.
+# Target domains are resolved through the selected MPTUNNEL DNS plan; the
+# authorized IP target is then sent to the no-auth upstream SOCKS5 proxy.
 
-# Plain HTTP CONNECT relays TCP. CONNECT-UDP relays TCP and UDP when supported
-# by the upstream proxy; choose one protocol and a unique tag.
+# Plain HTTP CONNECT relays TCP. Use SOCKS5 when an upstream proxy must relay
+# both TCP and UDP.
 # [[outbounds]]
 # tag = "http-egress"
 # protocol = "http-connect"
-# proxy = "127.0.0.1:8080"
-# connect_timeout_ms = 10000
-
-# [[outbounds]]
-# tag = "http-connect-udp-egress"
-# protocol = "http-connect-udp"
 # proxy = "127.0.0.1:8080"
 # connect_timeout_ms = 10000
 
@@ -63,5 +77,7 @@ protocol = "direct"
 #
 # [[routing.balancers]]
 # tag = "egress-fallback"
-# strategy = "sequence"
-# outbounds = ["direct-egress", "socks5-egress"]
+# strategy = "ordered-failover"
+# members = [{ outbound = "direct-egress" }, { outbound = "socks5-egress" }]
+# health = { failure_threshold = 3, recovery_threshold = 2, initial_backoff_ms = 1000, maximum_backoff_ms = 60000 }
+# probe = { target = "192.0.2.1:443", interval_ms = 10000, timeout_ms = 2000 }

@@ -1,10 +1,10 @@
 use super::{ServerTcpEvidenceState, merge_local_tcp_metrics};
 use crate::config::{
-    DEFAULT_OUTBOUND_CONNECT_TIMEOUT, MppPerformanceConfig, ResourceLimits, SecurityConfig,
+    DEFAULT_OUTBOUND_CONNECT_TIMEOUT, MppPerformanceConfig, ResourceLimits, ServerSecurityConfig,
     SharedSecret,
 };
 use crate::mux::MuxLimits;
-use crate::outbound::{DnsConfig, OutboundConfig};
+use crate::outbound::OutboundConfig;
 use crate::protocol::{PathId, PathMetricDirection, PathMetrics, UnderlayProtocol};
 use crate::runtime::node::server::{ServerIdentityRuntime, new_identity_runtime};
 use crate::runtime::path::ServerLocalPathProperties;
@@ -145,7 +145,7 @@ fn server_retains_qualified_native_delivery_across_later_app_limited_polls() {
 
 #[test]
 fn path_proof_ack_validates_without_overwriting_native_metrics() {
-    let security = SecurityConfig::encrypted(
+    let security = ServerSecurityConfig::for_test(
         SharedSecret::new(b"0123456789abcdef0123456789abcdef".to_vec())
             .expect("test shared secret"),
     );
@@ -155,7 +155,6 @@ fn path_proof_ack_validates_without_overwriting_native_metrics() {
     } = new_identity_runtime(
         Vec::new(),
         OutboundConfig::Direct,
-        DnsConfig::default(),
         DEFAULT_OUTBOUND_CONNECT_TIMEOUT,
         security,
         MppPerformanceConfig::default(),
@@ -163,7 +162,7 @@ fn path_proof_ack_validates_without_overwriting_native_metrics() {
     );
     let session_id = crate::protocol::SessionId(41);
     let path_id = PathId(2);
-    let registration = context.reliable_streams.register_carrier_path(
+    let registration = context.reliable_streams.register_test_carrier_path(
         session_id,
         UnderlayProtocol::Tcp,
         path_id,

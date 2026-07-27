@@ -343,3 +343,45 @@ async fn server_input_does_not_coalesce_feedback_across_path_detach() {
         second_ack
     );
 }
+
+#[tokio::test]
+async fn ready_server_input_never_crosses_a_path_detach_lifecycle_boundary() {
+    let first_data = stream_data_frame_at(0, 16);
+    let second_data = stream_data_frame_at(16, 16);
+    let (events, events_rx) = mpsc::channel(4);
+    for event in [
+        ServerReliableStreamEvent::Frame(first_data.clone()),
+        ServerReliableStreamEvent::PathDetached {
+            key: CarrierPathKey {
+                underlay: UnderlayProtocol::Tcp,
+                path_id: PathId(0),
+            },
+            path_instance_id: CarrierPathInstanceId::from_raw(5),
+            output_incarnation: 5,
+        },
+        ServerReliableStreamEvent::Frame(second_data.clone()),
+    ] {
+        events.try_send(event).expect("queue server stream event");
+    }
+
+    let mut stream = server_stream_with_events(events_rx);
+    assert_eq!(stream.ready_frame_count(), 3);
+    assert_eq!(
+        stream
+            .try_recv_frame()
+            .expect("first data is already queued")
+            .expect("first data frame"),
+        first_data
+    );
+    assert!(
+        stream.try_recv_frame().is_none(),
+        "ready-only drain must stop with path detach still ordered"
+    );
+    assert_eq!(
+        stream
+            .recv_frame()
+            .await
+            .expect("ordinary receive processes detach before later data"),
+        second_data
+    );
+}

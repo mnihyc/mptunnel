@@ -8,6 +8,7 @@ pub(super) fn quic_congestion(
     pacing_rate_bps: Option<u64>,
 ) -> quic_transport::CongestionMetrics {
     quic_transport::CongestionMetrics {
+        path_epoch: 1,
         congestion_window,
         bytes_in_flight: Some(0),
         pending_bytes: 0,

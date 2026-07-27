@@ -1,8 +1,35 @@
 # Docker lab
 
-The lab is manual developer infrastructure. It is not compiled into the release
-binary, included in packages, or run by CI. Its thresholds and topology never
-become production policy.
+The lab is developer performance infrastructure. It is not compiled into the
+release binary or included in packages. Generic hosted CI runs only its
+contract/unit tests and deterministic benchmark-crate tests; it does not run
+the Docker topology. Its thresholds and topology never become production
+policy.
+
+## F0 evidence contracts
+
+The hosted release-quality gate validates the versioned impact registry, runs
+the declaration, immutable-ledger, evidence-bundle, and host-snapshot unit
+tests, and runs deterministic benchmark and observation-trace replay tests:
+
+```bash
+python3 lab/validate_performance_declaration.py --check-registry
+python3 -m unittest discover --start-directory lab --pattern 'test_*.py'
+cargo test --locked --manifest-path lab/benchmarks/Cargo.toml
+```
+
+These checks establish schema and deterministic behavior. They are not runtime
+performance evidence and cannot accept a candidate, update a champion, or
+support a competitive claim.
+
+Runtime performance evidence is collected deliberately on a controlled local
+host; there is no generic or self-hosted GitHub workflow that pretends hosted
+runner measurements are comparable. Before accepting a candidate, capture an
+anonymized host snapshot with `--require-valid`, validate the tracked
+declaration with `--phase acceptance`, and run the declared parent and
+candidate on the same host and topology. Seal the complete repeated artifacts
+with `lab/evidence_bundle.py`. Incomplete coverage, an invalid host, or a
+declaration/diff mismatch fails closed.
 
 Run from the repository root:
 
@@ -10,9 +37,16 @@ Run from the repository root:
 lab/run-heterogeneous-ablation.sh
 ```
 
+With no `CASE_FILTER`, the runner traverses its current registered cases.
+Optional external or kernel-dependent baselines that are unavailable are
+recorded as `status: "skipped"` and do not make the final status check fail.
+Rejected experiments are removed from the registry rather than retained as
+permanent skip-only cases.
+
 The runner builds the product on the host and confines `tc`, routes, interface
 changes, blackholes, and TUN work to Docker namespaces. It writes JSONL and
-per-case artifacts to a unique invocation directory under `lab/results/`,
+per-case artifacts to a unique invocation directory under
+`.tmp/lab/results/`,
 which is ignored generated evidence. Named `RESULT_DIR` values remain
 available for deliberate cohorts. One lab lock prevents concurrent Compose
 runs from corrupting shared topology.
@@ -45,8 +79,8 @@ Do not combine these cohorts in one performance claim:
   inventory, time window, and runner. Record it as not run when those inputs do
   not exist.
 
-Protocol-v1/pre-v3 results are historical references only. Current performance
-claims require fresh protocol-v3 matched rows.
+Pre-v4 results are historical references only. Current performance claims
+require fresh protocol-v4 matched rows.
 
 ## Topology
 
@@ -259,7 +293,7 @@ reinjection.
 
 ## Path and scheduling evidence
 
-Protocol-v3 diagnostics should be interpreted at the RFC boundary:
+Protocol-v4 diagnostics should be interpreted at the RFC boundary:
 
 - stream open proves neutral attachment, not path rank;
 - `PATH_STATUS` sequence and `Available`/`Backup` value prove peer preference,
@@ -304,13 +338,16 @@ lab/run-heterogeneous-ablation.sh
 
 Diagnostics establish a causal sequence and component bottleneck. Re-run the
 same matched cases without `lab-diagnostics`, verbose logs, or frequent
-management sampling before making a throughput claim. See `docs/PERF.md`.
+management sampling before making a throughput claim. See
+`docs/PERFORMANCE_DIAGNOSTICS.md`.
 
 ## Result interpretation
 
 `status: "ok"` means the case contract completed. `status: "loss"` is valid
 lossy/incomplete evidence but not an exact throughput ratio. `status: "fail"`
-means setup, contract, or zero-progress failure.
+means setup, contract, or zero-progress failure. `status: "skipped"` means an
+optional external or kernel-dependent baseline was unavailable; it is explicit
+missing evidence, not a passing comparison and not a product-case failure.
 
 Report at least:
 
@@ -330,15 +367,16 @@ different protocol or old result.
 
 ## Current release evidence
 
-The compact, release-facing v0.1.1 evidence is recorded in
-[`docs/PERFORMANCE.md`](PERFORMANCE.md). It keeps the final runtime guard and
-its exact identity separate from the earlier same-condition
-direct/VMess/Hysteria2/MPTCP reference cohort. It also records TCP and QUIC
-single/multipath upload and download, heterogeneous paths, blackhole failover,
-Wine execution, and explicit incomplete-result handling without rebinding old
-baselines to a new binary.
+The compact, release-candidate v0.1.2 evidence is recorded in
+[`docs/PERFORMANCE.md`](PERFORMANCE.md). It identifies the exact Core-frozen
+no-feature candidate and build inputs, records targeted TCP/QUIC five-path
+guards, and discloses the dirty-tree host-validity failure. Product-only edits
+after that cohort change the complete binary identity, so the eventual tagged
+binary still requires its own guard. The same document preserves the v0.1.1
+and v0.1.0 cohorts as historical references without rebinding their competitor
+or failover results to protocol v4.
 
-Generated `lab/results/` directories are local evidence, not repository
+Generated `.tmp/lab/results/` directories are local evidence, not repository
 content. They are removed after their durable method, identities, exact rows,
 and limitations are recorded. Old protocol-v1 `iteration*` directories are not
 current regression evidence and are not retained for a public release.
@@ -347,6 +385,12 @@ A historical absolute result must never replace a matched current control. If a
 new row materially weakens a retained capability, reproduce it beside its
 single-path or external control, identify the owning state transition, and
 correct the model before accepting the downgrade.
+
+An isolated throughput change around five percent is ordinary run-to-run noise
+unless repeated adjacent pairs and causal evidence establish otherwise. It is
+not a pass margin, regression cap, or universal gate. Apply the paired evidence
+method in `docs/PERFORMANCE_PLAN.md`; do not convert one convenient percentage
+into laboratory or production policy.
 
 ## Iteration rule
 
@@ -363,6 +407,6 @@ question.
 Summarize saved results with:
 
 ```bash
-python3 lab/summarize-results.py lab/results/<result>.jsonl
-python3 lab/summarize-results.py --format json lab/results/<result>.jsonl
+python3 lab/summarize-results.py .tmp/lab/results/<result>.jsonl
+python3 lab/summarize-results.py --format json .tmp/lab/results/<result>.jsonl
 ```

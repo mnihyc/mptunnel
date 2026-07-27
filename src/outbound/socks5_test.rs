@@ -37,3 +37,20 @@ fn parses_method_selection_and_connect_reply() {
     );
     assert_eq!(reply.consumed, 10);
 }
+
+#[test]
+fn builds_and_parses_username_password_authentication() {
+    let credentials = ProxyCredentials::new("alice".to_string(), "correct horse".to_string())
+        .expect("credentials");
+
+    assert_eq!(username_password_greeting(), [0x05, 0x01, 0x02]);
+    assert_eq!(
+        username_password_request(&credentials),
+        b"\x01\x05alice\x0dcorrect horse"
+    );
+    assert!(parse_username_password_reply(&[0x01, 0x00]).is_ok());
+    assert!(matches!(
+        parse_username_password_reply(&[0x01, 0x01]),
+        Err(Socks5ClientError::AuthenticationRejected)
+    ));
+}

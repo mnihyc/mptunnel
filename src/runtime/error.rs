@@ -43,8 +43,15 @@ pub enum RuntimeError {
     SenderServiceBlocked,
     ReliablePathSessionClosed,
     SessionRetentionTimeout,
+    ProductPolicy(String),
+    GatewayStatePoisoned,
+    GatewayUnavailable(String),
+    DestinationDenied(String),
     RemoteReset(ResetReason),
     RemoteClosed(CloseReason),
+    AuthenticationRejected(&'static str),
+    CredentialAdmission(crate::product::CredentialAdmissionError),
+    ProductAdmission(crate::product::ProductAdmissionError),
     Protocol(&'static str),
 }
 
@@ -206,8 +213,21 @@ impl std::fmt::Display for RuntimeError {
                     "session retention timeout expired without an available path"
                 )
             }
+            Self::ProductPolicy(error) => write!(f, "product policy error: {error}"),
+            Self::GatewayStatePoisoned => write!(f, "product gateway state lock is poisoned"),
+            Self::GatewayUnavailable(error) => write!(f, "product gateway unavailable: {error}"),
+            Self::DestinationDenied(error) => write!(f, "destination denied: {error}"),
             Self::RemoteReset(reason) => write!(f, "remote reset stream: {reason:?}"),
             Self::RemoteClosed(reason) => write!(f, "remote closed session: {reason:?}"),
+            Self::AuthenticationRejected(message) => {
+                write!(f, "authentication rejected: {message}")
+            }
+            Self::CredentialAdmission(error) => {
+                write!(f, "credential admission rejected: {error}")
+            }
+            Self::ProductAdmission(error) => {
+                write!(f, "Product resource admission rejected: {error}")
+            }
             Self::Protocol(message) => write!(f, "protocol error: {message}"),
         }
     }
@@ -244,8 +264,15 @@ impl std::error::Error for RuntimeError {
             | Self::SenderServiceBlocked
             | Self::ReliablePathSessionClosed
             | Self::SessionRetentionTimeout
+            | Self::ProductPolicy(_)
+            | Self::GatewayStatePoisoned
+            | Self::GatewayUnavailable(_)
+            | Self::DestinationDenied(_)
             | Self::RemoteReset(_)
             | Self::RemoteClosed(_)
+            | Self::AuthenticationRejected(_)
+            | Self::CredentialAdmission(_)
+            | Self::ProductAdmission(_)
             | Self::Protocol(_) => None,
         }
     }

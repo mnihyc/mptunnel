@@ -4,13 +4,15 @@ on:
   workflow_dispatch:
     inputs:
       candidate_tag:
-        description: Stable tag to validate without publishing
+        description: Unpublished stable tag to validate without publishing
         required: true
-        default: v0.1.1
         type: string
 
 permissions:
   contents: read
+
+env:
+  PYTHONPYCACHEPREFIX: .tmp/python-cache
 
 jobs:
   quality:
@@ -22,7 +24,7 @@ jobs:
     runs-on: ubuntu-24.04
     steps:
       - name: Checkout
-        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
 
@@ -31,16 +33,24 @@ jobs:
           CANDIDATE_TAG: ${{ inputs.candidate_tag }}
           GH_TOKEN: ${{ github.token }}
         run: |
+          mkdir -p .tmp/ci/version
           gh api --paginate "repos/${GITHUB_REPOSITORY}/releases" \
-            --jq '.[] | select(.draft == false) | .tag_name' > known-tags.txt
+            --jq '.[] | select(.draft == false) | .tag_name' \
+            > .tmp/ci/version/published-tags.txt
+          grep --fixed-strings --line-regexp --invert-match "$CANDIDATE_TAG" \
+            .tmp/ci/version/published-tags.txt \
+            > .tmp/ci/version/known-tags.txt || true
           gh api --paginate "repos/${GITHUB_REPOSITORY}/git/matching-refs/tags" \
-            --jq '.[].ref | sub("^refs/tags/"; "")' >> known-tags.txt
-          sort -u -o known-tags.txt known-tags.txt
+            --jq '.[].ref | sub("^refs/tags/"; "")' > .tmp/ci/version/repository-tags.txt
+          grep --fixed-strings --line-regexp --invert-match "$CANDIDATE_TAG" \
+            .tmp/ci/version/repository-tags.txt \
+            >> .tmp/ci/version/known-tags.txt || true
+          sort -u -o .tmp/ci/version/known-tags.txt .tmp/ci/version/known-tags.txt
           package_version="$(cargo metadata --locked --no-deps --format-version 1 | jq -r '.packages[0].version')"
-          python3 .github/scripts/check-release-version-gate.py \
+          python3 packaging/tools/check_release_version_gate.py \
             --candidate-tag "$CANDIDATE_TAG" \
             --package-version "$package_version" \
-            --known-tags-file known-tags.txt
+            --known-tags-file .tmp/ci/version/known-tags.txt
 
   package:
     name: Package ${{ matrix.target }}
@@ -74,7 +84,7 @@ jobs:
             kind: android
     steps:
       - name: Checkout
-        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
 
@@ -122,14 +132,14 @@ jobs:
       - name: Package Unix artifact
         if: matrix.kind != 'windows'
         shell: bash
-        run: scripts/package-release.sh --target "${{ matrix.target }}"
+        run: packaging/package-release.sh --target "${{ matrix.target }}"
 
       - name: Package Windows artifact
         if: matrix.kind == 'windows'
         shell: pwsh
         env:
           RUSTFLAGS: -C target-feature=+crt-static
-        run: scripts/package-release.ps1 -Target "${{ matrix.target }}"
+        run: packaging/package-release.ps1 -Target "${{ matrix.target }}"
 
       - name: Verify Unix package manifest and binary
         if: matrix.kind != 'windows'
@@ -138,9 +148,14 @@ jobs:
           set -euo pipefail
           target="${{ matrix.target }}"
           version="$(cargo metadata --locked --no-deps --format-version 1 | jq -r '.packages[0].version')"
-          archive="dist/mptunnel-${version}-${target}.tar.gz"
-          python3 .github/scripts/verify-release-archive.py \
-            --archive "$archive" --target "$target" --version "$version"
+          archive_name="$(
+            python3 packaging/tools/release_contract.py target \
+              --target "$target" |
+              jq -r .archive_name
+          )"
+          archive=".tmp/release/dist/${archive_name}"
+          python3 packaging/tools/verify_release_archive.py \
+            --archive "$archive" --target "$target"
           binary="target/${target}/release/mptunnel"
           file "$binary"
           case "$target" in
@@ -149,7 +164,51 @@ jobs:
             *) echo "unsupported release architecture: $target" >&2; exit 1 ;;
           esac
           if [[ "$target" == *apple-darwin ]]; then
-            otool -L "$binary"
+            inspection="$(otool -L "$binary")"
+            printf '%s\n' "$inspection"
+            mkdir -p .tmp/ci
+            dependencies=.tmp/ci/native-dependencies.txt
+            printf '%s\n' "$inspection" |
+              tail -n +2 |
+              sed -E 's/^[[:space:]]+([^[:space:]]+).*/\1/' \
+              > "$dependencies"
+            [[ -s "$dependencies" ]] || {
+              echo "macOS release dependency table is unexpectedly empty" >&2
+              exit 1
+            }
+            while IFS= read -r dependency; do
+              case "$dependency" in
+                /usr/lib/*|/System/Library/Frameworks/*|/System/Library/PrivateFrameworks/*)
+                  ;;
+                *)
+                  echo "macOS release has a non-system dependency: $dependency" >&2
+                  exit 1
+                  ;;
+              esac
+            done < "$dependencies"
+          elif [[ "${{ matrix.kind }}" == android ]]; then
+            readelf -h "$binary"
+            inspection="$(readelf -d "$binary")"
+            printf '%s\n' "$inspection"
+            mkdir -p .tmp/ci
+            dependencies=.tmp/ci/native-dependencies.txt
+            printf '%s\n' "$inspection" |
+              sed -n 's/.*Shared library: \[\([^]]*\)\].*/\1/p' \
+              > "$dependencies"
+            [[ -s "$dependencies" ]] || {
+              echo "Android release dependency table is unexpectedly empty" >&2
+              exit 1
+            }
+            while IFS= read -r dependency; do
+              case "$dependency" in
+                libc.so|libdl.so|liblog.so|libm.so|libandroid.so)
+                  ;;
+                *)
+                  echo "Android release has a non-NDK/system dependency: $dependency" >&2
+                  exit 1
+                  ;;
+              esac
+            done < "$dependencies"
           else
             readelf -h "$binary"
           fi
@@ -169,9 +228,10 @@ jobs:
           $metadata = cargo metadata --locked --no-deps --format-version 1 | ConvertFrom-Json
           $version = $metadata.packages[0].version
           $target = "${{ matrix.target }}"
-          $archive = "dist/mptunnel-$version-$target.zip"
-          python .github/scripts/verify-release-archive.py `
-            --archive $archive --target $target --version $version
+          $contract = python packaging/tools/release_contract.py target --target $target | ConvertFrom-Json
+          $archive = Join-Path ".tmp/release/dist" $contract.archive_name
+          python packaging/tools/verify_release_archive.py `
+            --archive $archive --target $target
           if ($LASTEXITCODE -ne 0) { throw "Release archive verification failed" }
 
           $binary = "target/$target/release/mptunnel.exe"
@@ -185,8 +245,64 @@ jobs:
           if (($inspection -join "`n") -notmatch $expectedMachine) {
             throw "PE machine type does not match $target"
           }
-          if (($inspection -join "`n") -match '(?i)(VCRUNTIME|MSVCP|UCRTBASE|api-ms-win-crt-)[^\s]*\.dll') {
+          if (($inspection -join "`n") -match '(?i)(VCRUNTIME|MSVCP|MSVCRT|MSVCR[0-9]+|UCRTBASE|api-ms-win-crt-)[^\s]*\.dll') {
             throw "Windows release unexpectedly depends on the dynamic MSVC/UCRT runtime"
+          }
+          $allowedSystemDlls = @(
+            "ADVAPI32.DLL",
+            "BCRYPT.DLL",
+            "BCRYPTPRIMITIVES.DLL",
+            "CABINET.DLL",
+            "CFGMGR32.DLL",
+            "COMBASE.DLL",
+            "COMCTL32.DLL",
+            "COMDLG32.DLL",
+            "CRYPT32.DLL",
+            "DNSAPI.DLL",
+            "GDI32.DLL",
+            "IMM32.DLL",
+            "IPHLPAPI.DLL",
+            "KERNEL32.DLL",
+            "KERNELBASE.DLL",
+            "MSWSOCK.DLL",
+            "NETAPI32.DLL",
+            "NCRYPT.DLL",
+            "NORMALIZ.DLL",
+            "NTDLL.DLL",
+            "OLE32.DLL",
+            "OLEAUT32.DLL",
+            "POWRPROF.DLL",
+            "PSAPI.DLL",
+            "RPCRT4.DLL",
+            "SECUR32.DLL",
+            "SETUPAPI.DLL",
+            "SHELL32.DLL",
+            "SHLWAPI.DLL",
+            "USER32.DLL",
+            "USERENV.DLL",
+            "VERSION.DLL",
+            "WINHTTP.DLL",
+            "WINMM.DLL",
+            "WINTRUST.DLL",
+            "WS2_32.DLL",
+            "WTSAPI32.DLL"
+          )
+          $inspectionText = $inspection -join "`n"
+          $imports = [regex]::Matches(
+            $inspectionText,
+            '(?im)^\s*Name:\s+([^\s]+\.dll)\s*$'
+          ) | ForEach-Object { $_.Groups[1].Value.ToUpperInvariant() }
+          if ($imports.Count -eq 0) {
+            throw "Windows release import table is unexpectedly empty"
+          }
+          if ($imports -contains "WINTUN.DLL") {
+            throw "Wintun must remain a bundled runtime-loaded DLL, not a PE import"
+          }
+          foreach ($import in $imports) {
+            $isApiSet = $import -match '^(API-MS-WIN-(?!CRT-)|EXT-MS-WIN-)[A-Z0-9_-]+\.DLL$'
+            if (-not $isApiSet -and $allowedSystemDlls -notcontains $import) {
+              throw "Windows release has a non-system import: $import"
+            }
           }
 
           $actual = & $binary --version
@@ -198,55 +314,40 @@ jobs:
         shell: bash
         run: file target/${{ matrix.target }}/release/mptunnel | grep -E 'statically linked|static-pie linked'
 
-      - name: Upload package proof
+      - name: Upload ephemeral package proof
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: release-check-${{ matrix.target }}
           path: |
-            dist/*.tar.gz
-            dist/*.zip
-            dist/*.sha256
+            .tmp/release/dist/*.tar.gz
+            .tmp/release/dist/*.zip
           if-no-files-found: error
           retention-days: 1
           compression-level: 0
+          include-hidden-files: true
 
   inventory:
     name: Merged release inventory
     needs: package
     runs-on: ubuntu-24.04
     steps:
-      - name: Download package proofs
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Download ephemeral package proofs
         uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
         with:
-          path: artifacts
+          path: .tmp/ci/artifacts
           merge-multiple: true
 
-      - name: Verify checksums and exact asset set
-        env:
-          CANDIDATE_TAG: ${{ inputs.candidate_tag }}
+      - name: Verify normalized public inventory and checksums
         run: |
           set -euo pipefail
-          while IFS= read -r checksum; do
-            (cd artifacts && sha256sum --check "$(basename "$checksum")")
-          done < <(find artifacts -maxdepth 1 -type f -name '*.sha256' | sort)
-
-          version="${CANDIDATE_TAG#v}"
-          targets=(
-            x86_64-unknown-linux-musl
-            aarch64-unknown-linux-musl
-            x86_64-pc-windows-msvc
-            aarch64-pc-windows-msvc
-            x86_64-apple-darwin
-            aarch64-apple-darwin
-            aarch64-linux-android
-          )
-          : > expected-assets.txt
-          for target in "${targets[@]}"; do
-            extension="tar.gz"
-            if [[ "$target" == *windows* ]]; then extension="zip"; fi
-            archive="mptunnel-${version}-${target}.${extension}"
-            printf '%s\n%s\n' "$archive" "${archive}.sha256" >> expected-assets.txt
-          done
-          sort -o expected-assets.txt expected-assets.txt
-          find artifacts -maxdepth 1 -type f -printf '%f\n' | sort > actual-assets.txt
-          diff -u expected-assets.txt actual-assets.txt
+          python3 packaging/tools/release_contract.py verify-assets \
+            --directory .tmp/ci/artifacts
+          python3 packaging/tools/release_contract.py write-checksums \
+            --directory .tmp/ci/artifacts
+          python3 packaging/tools/release_contract.py verify-assets \
+            --directory .tmp/ci/artifacts --with-checksums

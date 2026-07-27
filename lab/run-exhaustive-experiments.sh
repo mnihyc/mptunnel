@@ -5,10 +5,13 @@ script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 repo_root="$(cd "$script_dir/.." && pwd)"
 cd "$repo_root"
 source "$script_dir/result-paths.sh"
+mkdir -p .tmp/python-cache .tmp/system
+export PYTHONPYCACHEPREFIX="$repo_root/.tmp/python-cache"
+export TMPDIR="$repo_root/.tmp/system"
 
 profile="${EXPERIMENT_PROFILE:-standard}"
 timestamp="$(date -u +%Y%m%dT%H%M%SZ)"
-result_root="$(normalize_lab_result_path "${RESULT_ROOT:-lab/results/exhaustive-${timestamp}}")"
+result_root="$(normalize_lab_result_path "${RESULT_ROOT:-exhaustive-${timestamp}}")"
 
 case "$profile" in
   smoke)
@@ -85,7 +88,7 @@ for load_duration in "${load_durations[@]}"; do
           FAILOVER_AFTER_SECONDS="$failover_after" \
           CURL_TIMEOUT_SECONDS="$curl_timeout" \
           CASE_FILTER="$case_filter" \
-          MPTUNNEL_LAB_FAIL_ON_BAD_STATUS="${MPTUNNEL_LAB_FAIL_ON_BAD_STATUS:-0}" \
+          MPTUNNEL_LAB_FAIL_ON_BAD_STATUS="${MPTUNNEL_LAB_FAIL_ON_BAD_STATUS:-1}" \
           RESULT_FILE="$result_file" \
           "$script_dir/run-heterogeneous-ablation.sh"
         first_run=0

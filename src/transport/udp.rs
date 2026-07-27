@@ -1,5 +1,8 @@
 use crate::protocol::UnderlayProtocol;
-use crate::transport::{Endpoint, PathSpec};
+use crate::transport::{
+    Endpoint, NativeEgressPurpose, NativeSocketConfigurator, NativeSocketRequest, PathSpec,
+    SystemNativeSocketConfigurator,
+};
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::time::Duration;
 use tokio::net::{UdpSocket, lookup_host};
@@ -38,6 +41,21 @@ pub async fn connect_endpoint(
     endpoint: &Endpoint,
     options: UdpConnectOptions,
 ) -> Result<UdpSocket, UdpTransportError> {
+    connect_endpoint_with_configurator(
+        endpoint,
+        options,
+        NativeEgressPurpose::Target,
+        &SystemNativeSocketConfigurator,
+    )
+    .await
+}
+
+pub async fn connect_endpoint_with_configurator(
+    endpoint: &Endpoint,
+    options: UdpConnectOptions,
+    purpose: NativeEgressPurpose,
+    configurator: &dyn NativeSocketConfigurator,
+) -> Result<UdpSocket, UdpTransportError> {
     let addrs = resolve_endpoint(endpoint).await?;
     let mut last_error = None;
     for addr in addrs {
@@ -46,7 +64,7 @@ pub async fn connect_endpoint(
         {
             continue;
         }
-        match connect_addr(addr, options).await {
+        match connect_addr_with_configurator(addr, options, purpose, configurator).await {
             Ok(socket) => return Ok(socket),
             Err(err) => last_error = Some(err),
         }
@@ -76,12 +94,36 @@ pub async fn connect_addr(
     addr: SocketAddr,
     options: UdpConnectOptions,
 ) -> Result<UdpSocket, UdpTransportError> {
+    connect_addr_with_configurator(
+        addr,
+        options,
+        NativeEgressPurpose::Target,
+        &SystemNativeSocketConfigurator,
+    )
+    .await
+}
+
+pub async fn connect_addr_with_configurator(
+    addr: SocketAddr,
+    options: UdpConnectOptions,
+    purpose: NativeEgressPurpose,
+    configurator: &dyn NativeSocketConfigurator,
+) -> Result<UdpSocket, UdpTransportError> {
     let local_addr = match options.source_ip {
         Some(source_ip) => SocketAddr::new(source_ip, 0),
         None if addr.is_ipv4() => SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), 0),
         None => SocketAddr::new(IpAddr::V6(Ipv6Addr::UNSPECIFIED), 0),
     };
-    let socket = UdpSocket::bind(local_addr).await?;
+    let socket = std::net::UdpSocket::bind(local_addr)?;
+    socket.set_nonblocking(true)?;
+    configurator.configure_udp(
+        &socket,
+        NativeSocketRequest {
+            remote_addr: addr,
+            purpose,
+        },
+    )?;
+    let socket = UdpSocket::from_std(socket)?;
     timeout(options.timeout, socket.connect(addr))
         .await
         .map_err(|_| UdpTransportError::ConnectTimedOut(addr))??;

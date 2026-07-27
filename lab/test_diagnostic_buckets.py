@@ -5,7 +5,13 @@ from tempfile import TemporaryDirectory
 import sys
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-from diagnostic_buckets import analyze_row, collect_metrics, dominant_bucket, score_buckets
+from diagnostic_buckets import (
+    OBSERVED_DIAGNOSTIC_EVENTS,
+    analyze_row,
+    collect_metrics,
+    dominant_bucket,
+    score_buckets,
+)
 
 
 def base_metrics():
@@ -21,17 +27,25 @@ def base_metrics():
         "receive_hole_significant": False,
         "receive_hole_max_ratio": None,
         "receive_hole_max_bytes": 0,
-        "stream_ordering_debt_max_bytes": 0,
-        "selected_underlays": {},
         "repair_bytes_after_max": None,
         "repair_debt_has_hole_evidence": False,
-        "udp_datagram_timeouts": 0,
         "reliable_stream_open_timeouts": 0,
         "path_queue_control_max_ms": 0,
     }
 
 
 class DiagnosticBucketTests(unittest.TestCase):
+    def test_consumed_diagnostic_events_exist_in_production_sources(self):
+        source_root = Path(__file__).resolve().parent.parent / "src"
+        production_source = "\n".join(
+            path.read_text(encoding="utf-8")
+            for path in source_root.rglob("*.rs")
+            if "_test" not in path.name
+        )
+
+        for event in OBSERVED_DIAGNOSTIC_EVENTS:
+            self.assertIn(event, production_source)
+
     def test_artifact_and_matching_tail_are_not_double_counted(self):
         line = "mptunnel_lab_diag ts_ms=1 event=receive_hole reorder_bytes=524288\n"
         with TemporaryDirectory() as directory:
@@ -142,7 +156,6 @@ class DiagnosticBucketTests(unittest.TestCase):
         self.assertEqual(metrics["reliable_stream_open_timeouts"], 0)
         self.assertIsNone(metrics["receive_hole_events"])
         self.assertIsNone(metrics["server_sender_conformance_delta"])
-        self.assertIsNone(metrics["candidate_reasons"])
         score_buckets(row, metrics)
 
     def test_wildcard_filter_keeps_zero_counts_observed(self):
@@ -155,26 +168,6 @@ class DiagnosticBucketTests(unittest.TestCase):
 
         self.assertEqual(metrics["receive_hole_events"], 0)
         self.assertEqual(metrics["server_sender_conformance_delta"], 0)
-        self.assertEqual(metrics["candidate_reasons"], {})
-
-    def test_candidate_only_filter_does_not_compare_excluded_receive_holes(self):
-        row = {
-            "status": "ok",
-            "lab_diagnostics_enabled": True,
-            "lab_diagnostic_events": ["server_bulk_output_candidate"],
-        }
-        logs = [
-            (
-                "server",
-                "mptunnel_lab_diag ts_ms=1 event=server_bulk_output_candidate "
-                "reason=ordered_owner_tail_debt stream_ordering_debt=1048576\n",
-            )
-        ]
-        metrics = collect_metrics(row, logs, {})
-
-        self.assertIsNone(metrics["receive_hole_events"])
-        scores, _ = score_buckets(row, metrics)
-        self.assertEqual(scores.get("harmful_admission", 0), 0)
 
     def test_conformance_only_filter_uses_summary_event(self):
         row = {

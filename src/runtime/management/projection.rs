@@ -5,20 +5,23 @@
 //! locks or mutable carrier state.
 
 use super::ManagementTarget;
+use super::gateway::collect_gateway_statuses;
 use super::schema::{
+    ManagementAdmission, ManagementAdmissionLimits, ManagementAdmissionRejections,
     ManagementControlStatus, ManagementControls, ManagementDiagnostics, ManagementFlowStatus,
-    ManagementIngressStatus, ManagementIo, ManagementPathStatus, ManagementPeerPathStatus,
-    ManagementPeerSession, ManagementPeerStatusResult, ManagementServices, ManagementSnapshot,
-    ManagementSummary, NumericIo, SCHEMA, metric_direction_name, path_state_name, path_usage_name,
-    peer_path_state_name, peer_status_code_name, underlay_name,
+    ManagementIngressStatus, ManagementIo, ManagementOutboundStatus, ManagementPathStatus,
+    ManagementPeerPathStatus, ManagementPeerSession, ManagementPeerStatusResult,
+    ManagementServices, ManagementSnapshot, ManagementSummary, NumericIo, SCHEMA,
+    metric_direction_name, path_state_name, path_usage_name, peer_path_state_name,
+    peer_status_code_name, underlay_name,
 };
 use super::snapshot::{SessionInventory, TelemetryAggregate, unix_millis};
-use crate::ingress::IngressConfig;
+use crate::product::Network;
 use crate::protocol::{PeerPathState, TargetAddr, UnderlayProtocol};
 use crate::runtime::path::model::path_snapshot;
 use crate::runtime::path::{ClientPathContext, ClientPathHealthRecord, ServerPathContext};
 use crate::runtime::peer_status::{PeerStatusBroker, PeerStatusResult};
-use crate::runtime::telemetry::{ActiveProductFlowSnapshot, ProductFlowId};
+use crate::runtime::telemetry::{ActiveProductFlowSnapshot, ProductFlowId, ProductFlowOriginKind};
 use crate::scheduler::{PathSnapshot, PathState as SchedulerPathState};
 use crate::transport::PathSpec;
 use std::collections::BTreeMap;
@@ -34,140 +37,96 @@ pub(super) fn collect_snapshot(
     let mut services = ManagementServices::default();
     let mut summary = NumericSummary::default();
     let mut paths = Vec::new();
-    let mut local_inbounds = Vec::new();
     let mut telemetry = TelemetryAggregate::default();
     let mut session_inventory = SessionInventory::default();
-    let peer_diagnostics_allowed;
     let mut peer_sessions = Vec::new();
     let mut peer_results = Vec::new();
 
-    match target {
-        ManagementTarget::Client { context, .. } => {
-            services.mpp_outbounds = 1;
-            services.local_inbounds = context.ingresses.len();
-            collect_client(
-                context,
-                0,
-                &mut summary,
-                &mut paths,
-                &mut telemetry,
-                &mut session_inventory,
-                &mut local_inbounds,
-                now,
+    services.mpp_outbounds = target.clients.len();
+    services.mpp_inbounds = target.servers.len();
+    services.local_inbounds = target.inventory.local_inbounds.len();
+    services.outbounds = target.inventory.outbounds.len();
+    services.local_outbounds = target
+        .inventory
+        .outbounds
+        .iter()
+        .filter(|outbound| outbound.protocol != "mpp")
+        .count();
+    services.configured_path_listeners = target
+        .servers
+        .iter()
+        .map(|context| context.server_paths.len())
+        .sum();
+    let gateways = match collect_gateway_statuses(target.gateway_control.as_ref()) {
+        Ok(gateways) => gateways,
+        Err(error) => {
+            crate::observability::process_event!(
+                Warn,
+                "management",
+                "gateway_snapshot_unavailable",
+                "gateway management snapshot unavailable: {error:?}"
             );
-            peer_diagnostics_allowed = context.peer_status.allows_incoming();
-            let tag = context
-                .route_target
-                .as_ref()
-                .map(|target| target.tag.clone());
-            peer_sessions.extend(service_peer_sessions(
-                &context.peer_status,
-                "mpp_outbound",
-                0,
-                tag.clone(),
-            ));
-            peer_results.extend(latest_peer_results(
-                &context.peer_status,
-                "mpp_outbound",
-                0,
-                tag,
-            ));
+            Vec::new()
         }
-        ManagementTarget::Server { context, .. } => {
-            services.mpp_inbounds = 1;
-            services.configured_path_listeners = context.server_paths.len();
-            collect_server(
-                context,
-                0,
-                &mut summary,
-                &mut paths,
-                &mut telemetry,
-                &mut session_inventory,
-                now,
-            );
-            peer_diagnostics_allowed = context.peer_status.allows_incoming();
-            peer_sessions.extend(service_peer_sessions(
-                &context.peer_status,
-                "mpp_inbound",
-                0,
-                context.tag.clone(),
-            ));
-            peer_results.extend(latest_peer_results(
-                &context.peer_status,
-                "mpp_inbound",
-                0,
-                context.tag.clone(),
-            ));
-        }
-        ManagementTarget::Node {
-            clients, servers, ..
-        } => {
-            services.mpp_outbounds = clients.len();
-            services.mpp_inbounds = servers.len();
-            services.local_inbounds = clients.iter().map(|context| context.ingresses.len()).sum();
-            services.configured_path_listeners = servers
-                .iter()
-                .map(|context| context.server_paths.len())
-                .sum();
-            for (index, context) in clients.iter().enumerate() {
-                collect_client(
-                    context,
-                    index,
-                    &mut summary,
-                    &mut paths,
-                    &mut telemetry,
-                    &mut session_inventory,
-                    &mut local_inbounds,
-                    now,
-                );
-                let tag = context
-                    .route_target
-                    .as_ref()
-                    .map(|target| target.tag.clone());
-                peer_sessions.extend(service_peer_sessions(
-                    &context.peer_status,
-                    "mpp_outbound",
-                    index,
-                    tag.clone(),
-                ));
-                peer_results.extend(latest_peer_results(
-                    &context.peer_status,
-                    "mpp_outbound",
-                    index,
-                    tag,
-                ));
-            }
-            for (index, context) in servers.iter().enumerate() {
-                collect_server(
-                    context,
-                    index,
-                    &mut summary,
-                    &mut paths,
-                    &mut telemetry,
-                    &mut session_inventory,
-                    now,
-                );
-                peer_sessions.extend(service_peer_sessions(
-                    &context.peer_status,
-                    "mpp_inbound",
-                    index,
-                    context.tag.clone(),
-                ));
-                peer_results.extend(latest_peer_results(
-                    &context.peer_status,
-                    "mpp_inbound",
-                    index,
-                    context.tag.clone(),
-                ));
-            }
-            peer_diagnostics_allowed = clients
-                .iter()
-                .any(|context| context.peer_status.allows_incoming())
-                || servers
-                    .iter()
-                    .any(|context| context.peer_status.allows_incoming());
-        }
+    };
+    services.gateway_balancers = gateways.len();
+    for (index, context) in target.clients.iter().enumerate() {
+        collect_client(
+            context,
+            index,
+            &mut summary,
+            &mut paths,
+            &mut session_inventory,
+            now,
+        );
+        let tag = context
+            .route_target
+            .as_ref()
+            .map(|target| target.tag.clone());
+        peer_sessions.extend(service_peer_sessions(
+            &context.peer_status,
+            "mpp_outbound",
+            index,
+            tag.clone(),
+        ));
+        peer_results.extend(latest_peer_results(
+            &context.peer_status,
+            "mpp_outbound",
+            index,
+            tag,
+        ));
     }
+    for (index, context) in target.servers.iter().enumerate() {
+        collect_server(
+            context,
+            index,
+            &mut summary,
+            &mut paths,
+            &mut session_inventory,
+            now,
+        );
+        peer_sessions.extend(service_peer_sessions(
+            &context.peer_status,
+            "mpp_inbound",
+            index,
+            context.tag.clone(),
+        ));
+        peer_results.extend(latest_peer_results(
+            &context.peer_status,
+            "mpp_inbound",
+            index,
+            context.tag.clone(),
+        ));
+    }
+    telemetry.add(target.product_telemetry.snapshot(), now);
+    let peer_diagnostics_allowed = target
+        .clients
+        .iter()
+        .any(|context| context.peer_status.allows_incoming())
+        || target
+            .servers
+            .iter()
+            .any(|context| context.peer_status.allows_incoming());
     peer_sessions.sort_unstable_by(|left, right| {
         left.service
             .cmp(right.service)
@@ -192,13 +151,24 @@ pub(super) fn collect_snapshot(
     let controls = ManagementControls {
         path: ManagementControlStatus {
             supported: services.mpp_outbounds > 0,
-            endpoint: (services.mpp_outbounds > 0).then_some("POST /api/control/path"),
+            endpoint: (services.mpp_outbounds > 0).then_some("POST /api/v1/actions/path"),
             reason: (services.mpp_outbounds == 0)
                 .then_some("path control requires a local inbound service with an MPP outbound"),
         },
+        gateway: ManagementControlStatus {
+            supported: target.gateway_control.is_some(),
+            endpoint: target
+                .gateway_control
+                .is_some()
+                .then_some("POST /api/v1/gateways/actions"),
+            reason: target
+                .gateway_control
+                .is_none()
+                .then_some("gateway control requires a configured Product balancer"),
+        },
         peer_diagnostics: ManagementControlStatus {
             supported: !peer_sessions.is_empty(),
-            endpoint: (!peer_sessions.is_empty()).then_some("POST /api/diagnostics/peer"),
+            endpoint: (!peer_sessions.is_empty()).then_some("POST /api/v1/diagnostics/peer"),
             reason: peer_sessions
                 .is_empty()
                 .then_some("no authenticated peer control carrier is currently available"),
@@ -219,13 +189,42 @@ pub(super) fn collect_snapshot(
     let traffic = telemetry.traffic();
     let mut flows = std::mem::take(&mut telemetry.flows);
     flows.sort_unstable_by(|left, right| {
-        left.service
-            .cmp(right.service)
-            .then_with(|| left.service_index.cmp(&right.service_index))
+        left.inbound
+            .cmp(&right.inbound)
             .then_with(|| left.session_id.cmp(&right.session_id))
             .then_with(|| left.flow_id.cmp(&right.flow_id))
     });
     let sessions = session_inventory.finish(&flows, telemetry.active_flow_overflow == 0);
+    let admission = management_admission(target.product_admission.snapshot());
+    let local_inbounds = target
+        .inventory
+        .local_inbounds
+        .iter()
+        .enumerate()
+        .map(|(service_index, inbound)| ManagementIngressStatus {
+            service_index,
+            tag: inbound.tag.clone(),
+            protocol: inbound.protocol,
+            listen: inbound.listen.clone(),
+            name: inbound.name.clone(),
+            target: inbound.target.clone(),
+            auth_required: inbound.auth_required,
+        })
+        .collect();
+    let outbounds = target
+        .inventory
+        .outbounds
+        .iter()
+        .map(|outbound| ManagementOutboundStatus {
+            tag: outbound.id.as_str().to_string(),
+            protocol: outbound.protocol,
+            networks: outbound
+                .networks
+                .iter()
+                .map(|network| network_name(*network))
+                .collect(),
+        })
+        .collect();
 
     ManagementSnapshot {
         schema: SCHEMA,
@@ -235,13 +234,50 @@ pub(super) fn collect_snapshot(
         uptime_ms: uptime.as_millis().min(u64::MAX as u128) as u64,
         services,
         local_inbounds,
+        outbounds,
         summary,
+        admission,
         traffic,
+        gateways,
         paths,
         sessions,
         flows,
         diagnostics,
         controls,
+    }
+}
+
+fn management_admission(snapshot: crate::product::ProductAdmissionSnapshot) -> ManagementAdmission {
+    let limits = snapshot.limits;
+    let rejections = snapshot.rejections;
+    ManagementAdmission {
+        owner_generation: snapshot.owner_generation.to_string(),
+        live_flows: snapshot.live_flows,
+        concurrent_work: snapshot.concurrent_work,
+        dns_work: snapshot.dns_work,
+        tracked_principals: snapshot.principals.len(),
+        tracked_outbounds: snapshot.outbounds.len(),
+        tracked_targets: snapshot.targets.len(),
+        limits: ManagementAdmissionLimits {
+            max_live_flows: limits.max_live_flows,
+            max_concurrent_work: limits.max_concurrent_work,
+            max_live_flows_per_principal: limits.max_live_flows_per_principal,
+            max_live_flows_per_outbound: limits.max_live_flows_per_outbound,
+            max_connects_per_outbound: limits.max_connects_per_outbound,
+            max_live_flows_per_target: limits.max_live_flows_per_target,
+            max_connects_per_target: limits.max_connects_per_target,
+            max_dns_work: limits.max_dns_work,
+        },
+        rejections: ManagementAdmissionRejections {
+            global_live_flows: rejections.global_live_flows.to_string(),
+            principal_live_flows: rejections.principal_live_flows.to_string(),
+            outbound_live_flows: rejections.outbound_live_flows.to_string(),
+            target_live_flows: rejections.target_live_flows.to_string(),
+            global_concurrent_work: rejections.global_concurrent_work.to_string(),
+            outbound_connects: rejections.outbound_connects.to_string(),
+            target_connects: rejections.target_connects.to_string(),
+            dns_work: rejections.dns_work.to_string(),
+        },
     }
 }
 
@@ -430,9 +466,7 @@ fn collect_client(
     service_index: usize,
     summary: &mut NumericSummary,
     paths: &mut Vec<ManagementPathStatus>,
-    telemetry: &mut TelemetryAggregate,
     sessions: &mut SessionInventory,
-    local_inbounds: &mut Vec<ManagementIngressStatus>,
     now: Instant,
 ) {
     let tag = context
@@ -461,31 +495,6 @@ fn collect_client(
             .saturating_add(context.udp_paths.len()),
     );
     let health = context.health().lock().expect("client path health lock");
-    local_inbounds.extend(context.ingresses.iter().map(|ingress| {
-        let (protocol, listen, name, auth_required) = match &ingress.config {
-            IngressConfig::Socks5 { listen, proxy_auth } => (
-                "socks5",
-                listen.iter().map(ToString::to_string).collect(),
-                None,
-                proxy_auth.is_required(),
-            ),
-            IngressConfig::HttpConnect { listen, proxy_auth } => (
-                "http",
-                listen.iter().map(ToString::to_string).collect(),
-                None,
-                proxy_auth.is_required(),
-            ),
-            IngressConfig::TunL4(tun) => ("tun", Vec::new(), tun.name.clone(), false),
-        };
-        ManagementIngressStatus {
-            service_index,
-            tag: ingress.tag.clone(),
-            protocol,
-            listen,
-            name,
-            auth_required,
-        }
-    }));
     paths.extend(client_path_set(
         &context.tcp_paths,
         &health.tcp,
@@ -507,13 +516,6 @@ fn collect_client(
         now,
     ));
     drop(health);
-    telemetry.add(
-        "mpp_outbound",
-        service_index,
-        tag,
-        context.telemetry_snapshot(),
-        now,
-    );
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -598,9 +600,8 @@ fn collect_server(
     service_index: usize,
     summary: &mut NumericSummary,
     paths: &mut Vec<ManagementPathStatus>,
-    telemetry: &mut TelemetryAggregate,
     sessions: &mut SessionInventory,
-    now: Instant,
+    _now: Instant,
 ) {
     summary.configured_path_count = summary
         .configured_path_count
@@ -722,33 +723,35 @@ fn collect_server(
             last_delivery_age_ms: metrics.map(|metrics| u64::from(metrics.metric_age_us) / 1_000),
         });
     }
-    telemetry.add(
-        "mpp_inbound",
-        service_index,
-        tag,
-        context.telemetry_snapshot(),
-        now,
-    );
 }
 
-pub(super) fn flow_status(
-    service: &'static str,
-    service_index: usize,
-    service_tag: Option<String>,
-    flow: ActiveProductFlowSnapshot,
-    now: Instant,
-) -> ManagementFlowStatus {
-    let (flow_kind, flow_id) = match flow.flow_id {
-        ProductFlowId::Reliable(id) => ("reliable", id.0.to_string()),
-        ProductFlowId::Datagram(id) => ("datagram", id.0.to_string()),
+pub(super) fn flow_status(flow: ActiveProductFlowSnapshot, now: Instant) -> ManagementFlowStatus {
+    let flow_kind = match flow.flow_id {
+        ProductFlowId::Reliable(_) | ProductFlowId::NativeReliable => "reliable",
+        ProductFlowId::Datagram(_) | ProductFlowId::NativeDatagram => "datagram",
     };
+    let (inbound_kind, inbound) = flow.origin.as_ref().map_or((None, None), |origin| {
+        let kind = match origin.kind {
+            ProductFlowOriginKind::LocalInbound => "local",
+            ProductFlowOriginKind::MppInbound => "mpp",
+        };
+        (Some(kind), Some(origin.inbound.as_str().to_string()))
+    });
+    let selection = flow.selection.as_ref();
     ManagementFlowStatus {
-        service,
-        service_index,
-        service_tag,
         session_id: flow.session_id.map(|id| id.0.to_string()),
         flow_kind,
-        flow_id,
+        flow_id: flow.display_id.to_string(),
+        network: network_name(flow.network),
+        inbound_kind,
+        inbound,
+        outbound: selection.map(|selection| selection.outbound.as_str().to_string()),
+        balancer: selection
+            .and_then(|selection| selection.balancer.as_ref())
+            .map(|balancer| balancer.as_str().to_string()),
+        balancer_member: selection
+            .and_then(|selection| selection.member.as_ref())
+            .map(|member| member.as_str().to_string()),
         target: flow.target.as_ref().map(target_name),
         age_ms: now
             .saturating_duration_since(flow.started_at)
@@ -764,6 +767,13 @@ pub(super) fn flow_status(
             from_peer_bytes: flow.io.from_peer_bytes,
             from_peer_packets: flow.io.from_peer_packets,
         }),
+    }
+}
+
+const fn network_name(network: Network) -> &'static str {
+    match network {
+        Network::Tcp => "tcp",
+        Network::Udp => "udp",
     }
 }
 

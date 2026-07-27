@@ -36,6 +36,7 @@ impl UdpPathMetricTracker {
 
 #[derive(Debug, Default)]
 struct QuicPathMetricTracker {
+    path_epoch: Option<u64>,
     last_delivery_evidence_written_bytes: u64,
     delivery_evidence_pending_ack_bytes: u64,
     delivery_rate_bps: Option<f64>,
@@ -64,6 +65,29 @@ impl UdpPathConnection {
 }
 
 impl QuicPathMetricTracker {
+    fn enter_path_epoch(&mut self, congestion: quic_transport::CongestionMetrics) {
+        match self.path_epoch {
+            None => {
+                self.path_epoch = Some(congestion.path_epoch);
+            }
+            Some(path_epoch) if path_epoch == congestion.path_epoch => {}
+            Some(_) => {
+                // A new network path has a fresh congestion model. Retaining
+                // delivery rate, confidence, pending evidence, or placement
+                // proof across that boundary would let the old path authorize
+                // traffic on an unmeasured one.
+                *self = Self {
+                    path_epoch: Some(congestion.path_epoch),
+                    last_delivery_evidence_written_bytes: congestion
+                        .delivery_evidence_written_bytes,
+                    #[cfg(feature = "lab-diagnostics")]
+                    last_lost_bytes: Some(congestion.lost_bytes),
+                    ..Self::default()
+                };
+            }
+        }
+    }
+
     fn clear_pending_delivery_sample(&mut self) {
         self.pending_non_app_limited_sample_bytes = 0;
         self.pending_non_app_limited_sample_count = 0;
@@ -100,6 +124,7 @@ impl QuicPathMetricTracker {
         direction: PathMetricDirection,
         now: Instant,
     ) -> UdpPathMetrics {
+        self.enter_path_epoch(congestion);
         let delivery_evidence_delta = congestion
             .delivery_evidence_written_bytes
             .saturating_sub(self.last_delivery_evidence_written_bytes);

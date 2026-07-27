@@ -16,10 +16,8 @@ use std::time::Instant;
 use tokio::net::TcpStream;
 use tokio::sync::mpsc;
 
-pub(in crate::runtime) type EncryptedTcpReader =
-    EncryptedFramedReader<tokio::io::ReadHalf<TcpStream>>;
-pub(in crate::runtime) type EncryptedTcpWriter =
-    EncryptedFramedWriter<tokio::io::WriteHalf<TcpStream>>;
+pub(in crate::runtime) type EncryptedTcpReader = EncryptedFramedReader<TcpStream>;
+pub(in crate::runtime) type EncryptedTcpWriter = EncryptedFramedWriter<TcpStream>;
 
 /// Decouples socket reads from actor work while preserving frame order and the
 /// first terminal transport error.

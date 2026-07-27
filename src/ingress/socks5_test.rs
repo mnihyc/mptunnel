@@ -24,6 +24,9 @@ fn parses_username_password_auth_request() {
     assert_eq!(consumed, input.len());
     assert_eq!(request.username, "user");
     assert_eq!(request.password, "secret");
+    let debug = format!("{request:?}");
+    assert!(!debug.contains("\"user\""));
+    assert!(!debug.contains("\"secret\""));
 }
 
 #[test]

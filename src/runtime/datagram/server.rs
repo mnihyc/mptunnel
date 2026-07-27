@@ -2,9 +2,11 @@
 
 use crate::model::datagram::{DatagramAdmission, DatagramPayloadIdentity, DatagramReceiveWindow};
 use crate::mux::MuxLimits;
-use crate::outbound::{self, DnsConfig, OutboundConfig, TargetProtocol};
+use crate::outbound::{self, ServerDestinationPolicy};
+use crate::product::{DnsPlanId, Network};
 use crate::protocol::{DatagramFlowId, DatagramId, Frame, OffsetRange, SessionId, TargetAddr};
 use crate::runtime::error::RuntimeError;
+use crate::runtime::outbound_registry::{OutboundSelector, RuntimeOutboundRegistry};
 use crate::runtime::path::commands::ReliablePathCommandSender;
 use crate::runtime::path::{
     AcceptedServerDatagramFlow, ServerDatagramOpenError, ServerDatagramOpenRequest,
@@ -35,9 +37,10 @@ type ServerDatagramFlowRegistry =
 
 /// Composition-owned UDP target policy and session-level flow registry.
 pub(in crate::runtime) struct ServerDatagramService {
-    outbound: OutboundConfig,
-    outbound_dns: DnsConfig,
-    outbound_connect_timeout: Duration,
+    outbound_registry: RuntimeOutboundRegistry,
+    outbound_selector: OutboundSelector,
+    dns_plan: Option<DnsPlanId>,
+    destination_policy: Arc<ServerDestinationPolicy>,
     session_retention_timeout: Duration,
     mux_limits: MuxLimits,
     reliable_streams: ServerStreamPort,
@@ -73,20 +76,34 @@ impl Drop for ServerDatagramAttachment {
     }
 }
 
+pub(in crate::runtime) struct ServerDatagramServiceConfig {
+    pub(in crate::runtime) outbound_registry: RuntimeOutboundRegistry,
+    pub(in crate::runtime) outbound_selector: OutboundSelector,
+    pub(in crate::runtime) dns_plan: Option<DnsPlanId>,
+    pub(in crate::runtime) destination_policy: Arc<ServerDestinationPolicy>,
+    pub(in crate::runtime) session_retention_timeout: Duration,
+    pub(in crate::runtime) mux_limits: MuxLimits,
+    pub(in crate::runtime) reliable_streams: ServerStreamPort,
+    pub(in crate::runtime) telemetry: RuntimeTelemetry,
+}
+
 impl ServerDatagramService {
-    pub(in crate::runtime) fn path_port(
-        outbound: OutboundConfig,
-        outbound_dns: DnsConfig,
-        outbound_connect_timeout: Duration,
-        session_retention_timeout: Duration,
-        mux_limits: MuxLimits,
-        reliable_streams: ServerStreamPort,
-        telemetry: RuntimeTelemetry,
-    ) -> ServerDatagramPort {
+    pub(in crate::runtime) fn path_port(config: ServerDatagramServiceConfig) -> ServerDatagramPort {
+        let ServerDatagramServiceConfig {
+            outbound_registry,
+            outbound_selector,
+            dns_plan,
+            destination_policy,
+            session_retention_timeout,
+            mux_limits,
+            reliable_streams,
+            telemetry,
+        } = config;
         ServerDatagramPort::new(Arc::new(Self {
-            outbound,
-            outbound_dns,
-            outbound_connect_timeout,
+            outbound_registry,
+            outbound_selector,
+            dns_plan,
+            destination_policy,
             session_retention_timeout,
             mux_limits,
             reliable_streams,
@@ -157,15 +174,21 @@ impl ServerDatagramPortBackend for ServerDatagramService {
         Box::pin(async move {
             let ServerDatagramOpenRequest {
                 session_id,
+                principal_permit,
                 flow_id,
                 target,
                 commands,
             } = request;
+            let principal_destination_policy = self
+                .destination_policy
+                .for_principal(principal_permit.principal().clone());
             outbound::validate_target(&target)
                 .map_err(|error| ServerDatagramOpenError::new(error.into()))?;
-            self.outbound
-                .ensure_supports(TargetProtocol::Udp)
-                .map_err(|error| ServerDatagramOpenError::new(error.into()))?;
+            principal_destination_policy
+                .authorize_pre(Network::Udp, &target)
+                .map_err(|error| {
+                    ServerDatagramOpenError::new(RuntimeError::DestinationDenied(error.to_string()))
+                })?;
 
             let key = (session_id, flow_id);
             let slot = self
@@ -174,24 +197,36 @@ impl ServerDatagramPortBackend for ServerDatagramService {
             let worker = slot
                 .worker
                 .get_or_try_init(|| async {
-                    let outbound_socket = outbound::connect_udp(
-                        &self.outbound,
-                        &self.outbound_dns,
-                        &target,
-                        self.outbound_connect_timeout,
-                    )
-                    .await
-                    .map_err(RuntimeError::OutboundConnect)?;
-                    let telemetry_flow = self.telemetry.open_datagram_flow(
-                        Some(session_id),
-                        flow_id,
-                        target.clone(),
-                    );
+                    let opened = self
+                        .outbound_registry
+                        .open_udp(
+                            &self.outbound_selector,
+                            &target,
+                            self.dns_plan.as_ref(),
+                            &principal_destination_policy,
+                        )
+                        .await?;
+                    let crate::runtime::outbound_registry::OpenedUdpOutbound::Local {
+                        socket: outbound_socket,
+                        _gateway_lease,
+                        _product_flow,
+                    } = opened
+                    else {
+                        return Err(RuntimeError::Protocol(
+                            "MPP inbound cannot route UDP to an MPP outbound",
+                        ));
+                    };
+                    let telemetry_flow = self
+                        .telemetry
+                        .scoped(_product_flow.scope().clone())
+                        .open_datagram_flow(Some(session_id), flow_id, target.clone());
                     let realtime_registration =
                         self.reliable_streams.register_realtime_flow(session_id);
                     Ok::<_, RuntimeError>(spawn_server_datagram_flow_worker(
                         key,
                         outbound_socket,
+                        _gateway_lease,
+                        _product_flow,
                         self.mux_limits,
                         self.session_retention_timeout,
                         telemetry_flow,
@@ -287,6 +322,8 @@ impl ServerDatagramFlowState {
 fn spawn_server_datagram_flow_worker(
     key: ServerDatagramFlowKey,
     mut outbound_socket: outbound::OutboundUdpSocket,
+    mut gateway_lease: Option<crate::runtime::gateway::GatewayFlowLease>,
+    product_flow: crate::runtime::outbound_registry::OpenedProductFlow,
     mux_limits: MuxLimits,
     session_retention_timeout: Duration,
     telemetry_flow: ProductFlowLease,
@@ -297,8 +334,9 @@ fn spawn_server_datagram_flow_worker(
     let (requests_tx, mut requests_rx) =
         mpsc::channel(server_datagram_request_queue_len(mux_limits));
     tokio::spawn(async move {
+        let _product_flow = product_flow;
         let product_counter = telemetry_flow.counter();
-        let mut failed = false;
+        let mut failure = None;
         let response_buffer_len = mux_limits
             .max_payload_bytes
             .min(OUTBOUND_UDP_RECV_BUFFER_BYTES);
@@ -348,6 +386,18 @@ fn spawn_server_datagram_flow_worker(
                                 &product_counter,
                             )
                             .await;
+                            if let Err(error) = result.as_ref()
+                                && let Some(lease) = gateway_lease.as_mut()
+                                && let Err(feedback) =
+                                    lease.completed(Some(error.to_string()))
+                            {
+                                crate::observability::process_event!(
+                                    Warn,
+                                    "udp_gateway",
+                                    "server_flow_failure_feedback_failed",
+                                    "gateway server UDP flow-failure feedback failed: {feedback}"
+                                );
+                            }
                             let _ = admission.send(result);
                         }
                         ServerDatagramWorkerMessage::ResponseFeedback { received } => {
@@ -365,8 +415,13 @@ fn spawn_server_datagram_flow_worker(
                     let len = match received {
                         Ok(len) => len,
                         Err(err) => {
-                            failed = true;
-                            eprintln!("warning: UDP outbound receive failed: {err}");
+                            failure = Some(err.to_string());
+                            crate::observability::process_event!(
+                                Warn,
+                                "udp_outbound",
+                                "receive_failed",
+                                "UDP outbound receive failed: {err}"
+                            );
                             send_server_datagram_close_to_routes(key.1, &state.routes);
                             break;
                         }
@@ -376,7 +431,7 @@ fn spawn_server_datagram_flow_worker(
                     state.next_response_id = match state.next_response_id.checked_add(1) {
                         Some(next) => next,
                         None => {
-                            failed = true;
+                            failure = Some("server UDP response ID exhausted".to_string());
                             send_server_datagram_close_to_routes(key.1, &state.routes);
                             break;
                         }
@@ -435,7 +490,17 @@ fn spawn_server_datagram_flow_worker(
             ServerDatagramService::remove_flow_slot_if_current(&registry, key, &slot);
         }
         drop(realtime_registration);
-        if !failed {
+        if let Some(lease) = gateway_lease.as_mut()
+            && let Err(error) = lease.completed(failure.clone())
+        {
+            crate::observability::process_event!(
+                Warn,
+                "udp_gateway",
+                "flow_outcome_feedback_failed",
+                "gateway UDP flow-outcome feedback failed: {error}"
+            );
+        }
+        if failure.is_none() {
             telemetry_flow.complete();
         }
     });

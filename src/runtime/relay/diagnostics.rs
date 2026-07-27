@@ -125,8 +125,11 @@ pub(in crate::runtime) fn log_unexpected_stream_relay_frame(
     expected: StreamId,
     frame: &Frame,
 ) {
-    eprintln!(
-        "warning: unexpected {kind} stream relay frame: expected_stream_id={} frame_kind={} {}",
+    crate::observability::process_event!(
+        Warn,
+        "reliable_relay",
+        "unexpected_frame",
+        "unexpected {kind} stream relay frame: expected_stream_id={} frame_kind={} {}",
         expected.0,
         frame.kind_name(),
         frame_subject(frame)

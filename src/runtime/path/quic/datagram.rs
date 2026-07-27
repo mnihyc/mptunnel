@@ -6,6 +6,7 @@ use super::io::{
 };
 #[cfg(feature = "lab-diagnostics")]
 use crate::lab_diagnostics::lab_diagnostic;
+use crate::product::PrincipalPermit;
 use crate::protocol::frame::datagram_feedback_range;
 use crate::protocol::{DatagramFlowId, Frame, SessionId, TargetAddr};
 use crate::runtime::error::RuntimeError;
@@ -27,6 +28,7 @@ use std::time::Instant;
 
 pub(super) struct ServerUdpDatagramStreamContext {
     pub(super) session_id: SessionId,
+    pub(super) principal_permit: PrincipalPermit,
     pub(super) flow_id: DatagramFlowId,
     pub(super) target: TargetAddr,
 }
@@ -55,6 +57,7 @@ pub(super) async fn handle_server_udp_datagram_stream(
         &mut send,
         &mut flows,
         stream_context.session_id,
+        stream_context.principal_permit.clone(),
         stream_context.flow_id,
         stream_context.target,
     )
@@ -72,6 +75,7 @@ pub(super) async fn handle_server_udp_datagram_stream(
                             &mut send,
                             &mut flows,
                             stream_context.session_id,
+                            stream_context.principal_permit.clone(),
                             flow_id,
                             target,
                         ).await?;
@@ -126,7 +130,12 @@ pub(super) async fn handle_server_udp_datagram_stream(
                                 );
                             }
                             ServerDatagramSendOutcome::Full => {
-                                eprintln!("warning: QUIC UDP path datagram worker queue full; dropping request");
+                                crate::observability::process_event!(
+                                    Warn,
+                                    "quic_datagram",
+                                    "worker_queue_full",
+                                    "QUIC UDP path datagram worker queue full; dropping request"
+                                );
                             }
                             ServerDatagramSendOutcome::Closed => {
                                 flows.retain(|flow| flow.flow_id() != flow_id);
@@ -144,7 +153,7 @@ pub(super) async fn handle_server_udp_datagram_stream(
                     Some(Ok(Frame::DatagramClose { flow_id })) => {
                         flows.retain(|flow| flow.flow_id() != flow_id);
                         if flows.is_empty() {
-                            let _ = udp_path_finish_stream(&mut send);
+                            let _ = udp_path_finish_stream(&mut send).await;
                             return Ok(());
                         }
                     }
@@ -320,7 +329,7 @@ async fn drain_server_udp_datagram_commands(
                     &mut pending_frame_command_bytes,
                 )
                 .await?;
-                let _ = udp_path_finish_stream(send);
+                let _ = udp_path_finish_stream(send).await;
                 true
             }
             ReliablePathCommand::PrepareConnection { .. }
@@ -400,12 +409,17 @@ async fn flush_server_udp_datagram_frame_batch(
     result
 }
 
+#[allow(
+    clippy::too_many_arguments,
+    reason = "the session actor passes borrowed queue state and authenticated flow identity without allocation"
+)]
 async fn open_server_udp_datagram_flow(
     context: &ServerPathContext,
     commands_tx: &ReliablePathCommandSender,
     send: &mut UdpPathSendStream,
     flows: &mut Vec<AcceptedServerDatagramFlow>,
     session_id: SessionId,
+    principal_permit: PrincipalPermit,
     flow_id: DatagramFlowId,
     target: TargetAddr,
 ) -> Result<(), RuntimeError> {
@@ -427,6 +441,7 @@ async fn open_server_udp_datagram_flow(
         .datagrams
         .open(ServerDatagramOpenRequest {
             session_id,
+            principal_permit,
             flow_id,
             target,
             commands: commands_tx.clone(),

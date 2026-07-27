@@ -62,8 +62,11 @@ fn wrap_udp_socket(
         Ok(socket) => Ok(socket),
         Err(err) if unsupported_winsock_capability(&err) => {
             PORTABLE_UDP_WARNING.call_once(|| {
-                eprintln!(
-                    "warning: native Windows QUIC UDP features are unavailable ({err}); \
+                crate::observability::process_event!(
+                    Warn,
+                    "quic",
+                    "portable_udp_fallback",
+                    "native Windows QUIC UDP features are unavailable ({err}); \
                      using portable UDP without ECN or segmentation offload; \
                      QUIC performance may be reduced"
                 );
@@ -116,8 +119,11 @@ impl PortableUdpSocket {
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         if now.saturating_duration_since(*last_error) >= LOG_INTERVAL {
             *last_error = now;
-            eprintln!(
-                "warning: portable QUIC UDP send failed: {err}; destination={}, bytes={}",
+            crate::observability::process_event!(
+                Warn,
+                "quic",
+                "udp_send_failed",
+                "portable QUIC UDP send failed: {err}; destination={}, bytes={}",
                 transmit.destination,
                 transmit.contents.len()
             );

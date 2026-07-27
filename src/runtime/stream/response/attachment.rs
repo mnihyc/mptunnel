@@ -34,6 +34,12 @@ pub(in crate::runtime) enum ResponseStreamAttachOutcome {
     RejectedClosedStream,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(in crate::runtime) enum ResponsePathDetachOutcome {
+    Begun(u64),
+    Pending(u64),
+}
+
 /// Path evidence installed in the same transaction that publishes an output.
 #[derive(Debug, Clone, Copy, Default)]
 pub(in crate::runtime) struct ResponseOutputAttachmentState {
@@ -196,6 +202,17 @@ impl ResponseStreamBinding {
         // flag. An attach either enters that snapshot or observes closure.
         if !self.response_stream_open.load(Ordering::Acquire) {
             return ResponseStreamAttachOutcome::RejectedClosedStream;
+        }
+        if outputs
+            .detaching
+            .iter()
+            .any(|entry| entry.key == key && entry.path_instance_id == path_instance_id)
+        {
+            // The ordered detach still owns this exact carrier incarnation.
+            // Refusing reattachment until the actor consumes that boundary
+            // prevents authenticated reconnect churn from accumulating
+            // detaching entries and one waiter task per retry.
+            return ResponseStreamAttachOutcome::RejectedDuplicateLiveOutput;
         }
         let mut replaced_closed = false;
         let mut replaced_incarnation = None;
@@ -373,7 +390,7 @@ impl ResponseStreamBinding {
         &self,
         key: CarrierPathKey,
         path_instance_id: CarrierPathInstanceId,
-    ) -> Option<u64> {
+    ) -> Option<ResponsePathDetachOutcome> {
         let mut outputs = self
             .outputs
             .lock()
@@ -383,7 +400,7 @@ impl ResponseStreamBinding {
             .iter()
             .find(|entry| entry.key == key && entry.path_instance_id == path_instance_id)
         {
-            return Some(entry.incarnation);
+            return Some(ResponsePathDetachOutcome::Pending(entry.incarnation));
         }
         let position = outputs
             .entries
@@ -398,7 +415,7 @@ impl ResponseStreamBinding {
             .fetch_add(1, Ordering::AcqRel);
         drop(outputs);
         self.notify_update();
-        Some(output_incarnation)
+        Some(ResponsePathDetachOutcome::Begun(output_incarnation))
     }
 
     pub(in crate::runtime) fn complete_path_detach(

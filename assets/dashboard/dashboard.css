@@ -624,6 +624,53 @@ h3 {
   width: 100%;
 }
 
+.gateway-list {
+  display: grid;
+  gap: 12px;
+}
+
+.gateway-card__header {
+  align-items: flex-start;
+}
+
+.gateway-card__header .section-meta {
+  margin-top: 3px;
+  text-align: left;
+}
+
+.records-table--gateways {
+  min-width: 1280px;
+}
+
+.gateway-actions {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  justify-content: flex-end;
+  gap: 5px;
+}
+
+.gateway-actions--member {
+  min-width: 230px;
+}
+
+.button--small {
+  min-width: 0;
+  min-height: 28px;
+  padding: 4px 8px;
+  font-size: 0.68rem;
+}
+
+.gateway-error {
+  color: var(--red);
+}
+
+.gateway-action-state {
+  margin-top: 12px;
+  border: 1px solid transparent;
+  border-radius: var(--radius);
+}
+
 .tab-panel > .data-section + .data-section {
   margin-top: 12px;
 }

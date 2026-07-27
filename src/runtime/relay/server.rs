@@ -11,13 +11,14 @@ use super::flow::{
 #[cfg(feature = "lab-diagnostics")]
 use super::io::normalized_stream_ack_first_gap;
 use super::io::{
-    ReliableAckGapReinjectionProgress, pending_stream_fin_ready, read_reliable_relay_payload,
-    receive_stream_fin, resize_reliable_relay_buffer, stream_ack_gap_reinjection_frames_normalized,
-    stream_ack_ranges_expose_authoritative_gap, stream_data_range_already_delivered,
-    stream_final_offset_tail_reinjection_frames_normalized, stream_terminal_fin_replay_required,
-    update_reinjection_authoritative_ack_snapshot, write_delivered_payloads,
+    AuthoritativeStreamAckSnapshot, ReadyStreamDataBatchBounds, ReadyStreamDataDirection,
+    ReliableAckGapReinjectionProgress, apply_and_write_ready_stream_data_batch,
+    begin_reliable_stream_ack, collect_ready_stream_data_batch, pending_stream_fin_ready,
+    read_reliable_relay_payload, receive_stream_fin, resize_reliable_relay_buffer,
+    stream_ack_gap_reinjection_frames_normalized, stream_ack_ranges_expose_authoritative_gap,
+    stream_data_range_already_delivered, stream_final_offset_tail_reinjection_frames_normalized,
+    stream_terminal_fin_replay_required, update_reinjection_authoritative_ack_snapshot,
 };
-use crate::config::MppPerformanceConfig;
 #[cfg(feature = "lab-diagnostics")]
 use crate::lab_diagnostics::{
     lab_assert_server_sender_service_balanced, lab_diagnostic, lab_perf_flush, lab_perf_record,
@@ -43,8 +44,9 @@ use crate::model::work::{
 };
 use crate::mux::MuxLimits;
 use crate::mux::stream::{ReliableRecvStream, ReliableSendStream};
-use crate::outbound;
-use crate::outbound::{DnsConfig, OutboundConfig};
+use crate::outbound::{OutboundTcpStream, ServerDestinationPolicy};
+use crate::performance::MppPerformanceConfig;
+use crate::product::DnsPlanId;
 #[cfg(feature = "lab-diagnostics")]
 use crate::protocol::frame::reliable_path_frame_pacing_bytes;
 #[cfg(feature = "lab-diagnostics")]
@@ -54,6 +56,9 @@ use crate::protocol::frame::{
 };
 use crate::protocol::{Frame, OffsetRange, ResetReason, SessionId, StreamId, UnderlayProtocol};
 use crate::runtime::RuntimeError;
+use crate::runtime::outbound_registry::{
+    OpenedTcpOutbound, OutboundSelector, RuntimeOutboundRegistry, finish_gateway_flow,
+};
 use crate::runtime::path::PathDeliveryStats;
 use crate::runtime::sender::{
     RelaySendCause, ServerResponseSenderService, emit_response_control_frame,
@@ -74,15 +79,16 @@ use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt};
 use tokio::sync::mpsc;
 use tokio::task::{Id, JoinError, JoinSet};
 
-#[derive(Debug)]
-struct ServerReliableRelayContext {
-    outbound: OutboundConfig,
-    outbound_dns: DnsConfig,
-    outbound_connect_timeout: Duration,
-    performance: MppPerformanceConfig,
-    mux_limits: MuxLimits,
-    session_retention_timeout: Duration,
-    telemetry: RuntimeTelemetry,
+pub(in crate::runtime) struct ServerReliableRelayContext {
+    pub(in crate::runtime) outbound_registry: RuntimeOutboundRegistry,
+    pub(in crate::runtime) outbound_selector: OutboundSelector,
+    pub(in crate::runtime) dns_plan: Option<DnsPlanId>,
+    pub(in crate::runtime) destination_policy: Arc<ServerDestinationPolicy>,
+    pub(in crate::runtime) performance: MppPerformanceConfig,
+    pub(in crate::runtime) mux_limits: MuxLimits,
+    pub(in crate::runtime) max_paths_per_session: usize,
+    pub(in crate::runtime) session_retention_timeout: Duration,
+    pub(in crate::runtime) telemetry: RuntimeTelemetry,
 }
 
 /// Runs target relays independently of TCP and QUIC carrier actors.
@@ -96,25 +102,13 @@ pub(in crate::runtime) struct ServerReliableRelayService {
 
 impl ServerReliableRelayService {
     pub(in crate::runtime) fn new(
-        outbound: OutboundConfig,
-        outbound_dns: DnsConfig,
-        outbound_connect_timeout: Duration,
-        performance: MppPerformanceConfig,
-        mux_limits: MuxLimits,
-        session_retention_timeout: Duration,
-        telemetry: RuntimeTelemetry,
+        context: ServerReliableRelayContext,
     ) -> (Arc<ServerReliableStreamRegistry>, Self) {
-        let (registry, accepted) =
-            ServerReliableStreamRegistry::new_accepting_with_limits(mux_limits);
-        let context = Arc::new(ServerReliableRelayContext {
-            outbound,
-            outbound_dns,
-            outbound_connect_timeout,
-            performance,
-            mux_limits,
-            session_retention_timeout,
-            telemetry,
-        });
+        let (registry, accepted) = ServerReliableStreamRegistry::new_accepting_with_limits(
+            context.mux_limits,
+            context.max_paths_per_session,
+        );
+        let context = Arc::new(context);
         (registry, Self { context, accepted })
     }
 
@@ -178,14 +172,29 @@ fn finish_relay_task(
     });
     match result {
         Ok((_, Ok(()))) => {}
-        Ok((_, Err(err))) => eprintln!("warning: server reliable stream failed: {err}"),
-        Err(err) => eprintln!("warning: server reliable stream task failed: {err}"),
+        Ok((_, Err(err))) => crate::observability::process_event!(
+            Warn,
+            "reliable_relay",
+            "server_stream_failed",
+            "server reliable stream failed: {err}"
+        ),
+        Err(err) => crate::observability::process_event!(
+            Warn,
+            "reliable_relay",
+            "server_stream_task_failed",
+            "server reliable stream task failed: {err}"
+        ),
     }
 }
 
 fn report_relay_cleanup_task(result: Result<(), JoinError>) {
     if let Err(err) = result {
-        eprintln!("warning: server reliable stream cleanup task failed: {err}");
+        crate::observability::process_event!(
+            Warn,
+            "reliable_relay",
+            "server_cleanup_task_failed",
+            "server reliable stream cleanup task failed: {err}"
+        );
     }
 }
 
@@ -196,27 +205,36 @@ async fn relay_accepted_stream(
     let session_id = accepted.session_id();
     let stream_id = accepted.stream().stream_id;
     let target = accepted.target().clone();
-    let telemetry_flow =
-        context
-            .telemetry
-            .open_reliable_flow(Some(session_id), stream_id, target.clone());
-    let outbound_stream = match outbound::connect_tcp(
-        &context.outbound,
-        &context.outbound_dns,
-        &target,
-        context.outbound_connect_timeout,
-    )
-    .await
+    let principal_destination_policy = context
+        .destination_policy
+        .for_principal(accepted.principal_permit().principal().clone());
+    let outbound_stream = match context
+        .outbound_registry
+        .open_tcp(
+            &context.outbound_selector,
+            &target,
+            context.dns_plan.as_ref(),
+            TrafficClass::Latency,
+            &principal_destination_policy,
+        )
+        .await
     {
         Ok(stream) => stream,
         Err(err) => {
             let lane = accepted.stream().current_lane();
             accepted.reject(ResetReason::Refused, lane).await;
-            return Err(RuntimeError::OutboundConnect(err));
+            return Err(err);
         }
     };
-    let outbound_stream = ObservedProductIo::new(outbound_stream, telemetry_flow.counter());
-
+    let product_scope = match &outbound_stream {
+        OpenedTcpOutbound::Mpp { _product_flow, .. }
+        | OpenedTcpOutbound::Local { _product_flow, .. } => _product_flow.scope().clone(),
+    };
+    let telemetry_flow = context.telemetry.scoped(product_scope).open_reliable_flow(
+        Some(session_id),
+        stream_id,
+        target.clone(),
+    );
     if accepted.accept_opening_path().await.is_err()
         && let Err(err) = emit_response_control_frame(
             accepted.stream(),
@@ -236,15 +254,49 @@ async fn relay_accepted_stream(
 
     let session_send_buffer = accepted.session_send_buffer();
     let stream = accepted.take_stream();
-    let result = relay_reliable_stream(
-        outbound_stream,
-        stream,
-        context.as_ref(),
-        session_id,
-        session_send_buffer,
-    )
-    .await
-    .map(|_| ());
+    // Resolve the Product connector variant once, before entering the relay
+    // loop. Direct and plain-proxy traffic therefore retains a concrete
+    // TcpStream on the steady data path with no per-read/write enum dispatch.
+    let counter = telemetry_flow.counter();
+    let result = match outbound_stream {
+        OpenedTcpOutbound::Local {
+            stream: OutboundTcpStream::Plain(outbound_stream),
+            mut _gateway_lease,
+            _product_flow,
+        } => {
+            let result = relay_reliable_stream(
+                ObservedProductIo::new(outbound_stream, counter),
+                stream,
+                context.as_ref(),
+                session_id,
+                session_send_buffer,
+            )
+            .await
+            .map(|_| ());
+            finish_gateway_flow(&mut _gateway_lease, &result);
+            result
+        }
+        OpenedTcpOutbound::Local {
+            stream: OutboundTcpStream::Tls(outbound_stream),
+            mut _gateway_lease,
+            _product_flow,
+        } => {
+            let result = relay_reliable_stream(
+                ObservedProductIo::new(*outbound_stream, counter),
+                stream,
+                context.as_ref(),
+                session_id,
+                session_send_buffer,
+            )
+            .await
+            .map(|_| ());
+            finish_gateway_flow(&mut _gateway_lease, &result);
+            result
+        }
+        OpenedTcpOutbound::Mpp { .. } => Err(RuntimeError::Protocol(
+            "MPP inbound cannot route TCP to an MPP outbound",
+        )),
+    };
     // The relay function closes carrier output on every ordinary return. The
     // accepted guard can now retire registry membership without a second close.
     accepted.mark_closed().await;
@@ -552,7 +604,7 @@ impl RequestTcpSparseAckProgress {
 #[allow(clippy::too_many_arguments)]
 fn enqueue_tcp_recv_progress(
     response_sender: &mut ServerResponseSenderService,
-    recv_stream: &ReliableRecvStream,
+    recv_stream: &mut ReliableRecvStream,
     progress: &mut ReliableRecvProgress,
     sparse_ack_progress: &mut RequestTcpSparseAckProgress,
     path: Option<PathSnapshot>,
@@ -584,8 +636,10 @@ fn enqueue_tcp_recv_progress(
     }
     if progress.should_send_max_data(recv_stream, path, lane, mux_limits, force_max_data) {
         let advertised_window = reliable_stream_advertised_window_bytes(path, lane, mux_limits);
+        let max_offset = recv_stream.max_data_offset_with_window(advertised_window);
         response_sender
             .enqueue_control_frame(recv_stream.max_data_frame_with_window(advertised_window));
+        recv_stream.commit_max_data(max_offset);
         sent_any = true;
     }
     sent_any
@@ -781,13 +835,14 @@ impl TailReinjectionEnqueueOutcome {
 }
 
 #[allow(clippy::too_many_arguments)]
-fn enqueue_reliable_tail_reinjection(
+fn enqueue_reliable_tail_reinjection_with_ack_horizon(
     response_sender: &mut ServerResponseSenderService,
     path_stream: &ReliablePathStream,
     #[cfg_attr(not(feature = "lab-diagnostics"), allow(unused_variables))] stream_id: StreamId,
     send_stream: &ReliableSendStream,
     last_send_ack_ranges: &[OffsetRange],
     last_send_ack_complete: bool,
+    last_send_ack_horizon: Option<u64>,
     tail_reinjection_path_snapshot: Option<PathSnapshot>,
     relay_lane: TrafficClass,
     mux_limits: MuxLimits,
@@ -885,7 +940,12 @@ fn enqueue_reliable_tail_reinjection(
                 blocked_frontier_offset = gap_blocked_offset;
             }
         }
-        if reinjection_frames.is_empty() && last_send_ack_complete && last_send_ack_frontier > 0 {
+        if reinjection_frames.is_empty()
+            && last_send_ack_complete
+            && last_send_ack_horizon.is_some_and(|horizon| last_send_ack_frontier < horizon)
+        {
+            let last_send_ack_horizon =
+                last_send_ack_horizon.expect("complete ACK tail requires a snapshot horizon");
             let tail_limit = reliable_critical_tail_reinjection_limit_bytes(
                 base_reinjection_limit,
                 send_stream.reinjection_bytes(),
@@ -894,7 +954,7 @@ fn enqueue_reliable_tail_reinjection(
             let tail_source_frames = send_stream.retransmission_frames_for_ranges(
                 &[OffsetRange {
                     start: last_send_ack_frontier,
-                    end: send_stream.next_offset(),
+                    end: last_send_ack_horizon,
                 }],
                 tail_limit,
             );
@@ -920,6 +980,7 @@ fn enqueue_reliable_tail_reinjection(
                 last_send_ack_ranges,
                 last_send_ack_frontier,
             )
+            && last_send_ack_horizon.is_some_and(|horizon| last_send_ack_frontier < horizon)
             && path_stream.has_multipath_reinjection_alternative()
         {
             // A live carrier still owns native recovery. One MPP quantum is
@@ -930,8 +991,14 @@ fn enqueue_reliable_tail_reinjection(
                 send_stream.reinjection_bytes(),
                 mux_limits,
             );
-            let tail_source_frames = send_stream
-                .retransmission_frames_after_ack_frontier(last_send_ack_ranges, tail_limit);
+            let tail_source_frames = send_stream.retransmission_frames_for_ranges(
+                &[OffsetRange {
+                    start: last_send_ack_frontier,
+                    end: last_send_ack_horizon
+                        .expect("authoritative tail requires a snapshot horizon"),
+                }],
+                tail_limit,
+            );
             let (tail_reinjection_frames, tail_reinjection_blocked_offset) =
                 prefix_live_reinjection_frames_with_carrier_credit(
                     response_sender,
@@ -1006,6 +1073,39 @@ fn enqueue_reliable_tail_reinjection(
         queued: reinjection_count,
         pending: reinjection_pending,
     }
+}
+
+#[cfg(test)]
+#[allow(clippy::too_many_arguments)]
+fn enqueue_reliable_tail_reinjection(
+    response_sender: &mut ServerResponseSenderService,
+    path_stream: &ReliablePathStream,
+    stream_id: StreamId,
+    send_stream: &ReliableSendStream,
+    last_send_ack_ranges: &[OffsetRange],
+    last_send_ack_complete: bool,
+    tail_reinjection_path_snapshot: Option<PathSnapshot>,
+    relay_lane: TrafficClass,
+    mux_limits: MuxLimits,
+    performance: MppPerformanceConfig,
+    max_frame_payload_bytes: usize,
+    last_send_ack_frontier: u64,
+) -> TailReinjectionEnqueueOutcome {
+    enqueue_reliable_tail_reinjection_with_ack_horizon(
+        response_sender,
+        path_stream,
+        stream_id,
+        send_stream,
+        last_send_ack_ranges,
+        last_send_ack_complete,
+        last_send_ack_complete.then_some(send_stream.next_offset()),
+        tail_reinjection_path_snapshot,
+        relay_lane,
+        mux_limits,
+        performance,
+        max_frame_payload_bytes,
+        last_send_ack_frontier,
+    )
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1172,7 +1272,16 @@ where
     let _ = session_id;
     let mut send_stream = ReliableSendStream::new_with_initial_max_offset(stream_id, mux_limits, 0);
     send_stream.update_max_offset(path_stream.max_offset);
-    let mut recv_stream = ReliableRecvStream::new(stream_id, mux_limits);
+    let initial_recv_max_offset = reliable_stream_initial_advertised_window_bytes(
+        path_stream.underlay,
+        path_stream.lane,
+        mux_limits,
+    );
+    let mut recv_stream = ReliableRecvStream::new_with_initial_max_offset(
+        stream_id,
+        mux_limits,
+        initial_recv_max_offset,
+    );
     let chunk_size = adaptive_reliable_relay_chunk_bytes_with_frame_limit(
         None,
         TrafficClass::Latency,
@@ -1192,8 +1301,7 @@ where
     let mut last_recv_progress_sent_at = Instant::now();
     let mut last_send_ack_progress_at = Instant::now();
     let mut last_send_ack_frontier = 0_u64;
-    let mut last_send_ack_ranges = Vec::<OffsetRange>::new();
-    let mut last_send_ack_complete = false;
+    let mut last_send_ack = AuthoritativeStreamAckSnapshot::default();
     let mut tail_reinjection_timer = ReliableRelayTailReinjectionTimer::default();
     let mut flow_demand =
         ReliableRelayFlowDemandTracker::with_initial_lane(path_stream.current_lane());
@@ -1202,6 +1310,8 @@ where
         path_stream.has_multipath_reinjection_alternative();
     let mut response_sender =
         ServerResponseSenderService::new_with_performance(session_id, stream_id, performance);
+    let mut deferred_path_frame = None::<Result<Frame, RuntimeError>>;
+    let mut ready_path_data = super::io::ReadyStreamDataBatch::new();
     let mut send_buffer_reservation = session_send_buffer.stream_reservation();
     let mut send_buffer_updates = session_send_buffer.subscribe();
     let mut response_sender_retry_at: Option<tokio::time::Instant> = None;
@@ -1329,14 +1439,14 @@ where
         let failed_original_tail_reinjection_ready =
             reliable_failed_original_tail_reinjection_ready(path_stream, &send_stream);
         let tail_reinjection_candidate = has_tail_reinjection_alternative
-            && last_send_ack_frontier < send_stream.next_offset()
+            && last_send_ack.has_unacknowledged_extent(last_send_ack_frontier)
             && (stream_ack_is_authoritative_contiguous_prefix(
-                last_send_ack_complete,
-                &last_send_ack_ranges,
+                last_send_ack.complete(),
+                last_send_ack.ranges(),
                 last_send_ack_frontier,
             ) || stream_ack_ranges_expose_authoritative_gap(
-                last_send_ack_complete,
-                &last_send_ack_ranges,
+                last_send_ack.complete(),
+                last_send_ack.ranges(),
             ));
         let tail_reinjection_active = reliable_relay_tail_reinjection_timer_active(
             send_stream.reinjection_bytes(),
@@ -1508,14 +1618,15 @@ where
             break Err(RuntimeError::SessionRetentionTimeout);
         }
         _ = tokio::time::sleep_until(tail_reinjection_deadline), if tail_reinjection_active => {
-            let _ = enqueue_reliable_tail_reinjection(
+            let _ = enqueue_reliable_tail_reinjection_with_ack_horizon(
                 &mut response_sender,
                 path_stream,
-                stream_id,
-                &send_stream,
-                &last_send_ack_ranges,
-                last_send_ack_complete,
-                tail_reinjection_path_snapshot,
+                    stream_id,
+                    &send_stream,
+                    last_send_ack.ranges(),
+                    last_send_ack.complete(),
+                    last_send_ack.horizon(),
+                    tail_reinjection_path_snapshot,
                 relay_lane,
                 mux_limits,
                 performance,
@@ -1550,7 +1661,10 @@ where
         frame = async {
             #[cfg(feature = "lab-diagnostics")]
             let recv_started = Instant::now();
-            let result = path_stream.recv_frame().await;
+            let result = match deferred_path_frame.take() {
+                Some(frame) => frame,
+                None => path_stream.recv_frame().await,
+            };
             #[cfg(feature = "lab-diagnostics")]
             if let Ok(frame) = &result {
                 lab_perf_record(
@@ -1569,45 +1683,96 @@ where
                     offset,
                     payload,
                 } if received_stream_id == stream_id && remote_open => {
-                    #[cfg(feature = "lab-diagnostics")]
-                    let payload_len = payload.len();
-                    super::io::validate_stream_data_final_offset(
-                        pending_remote_fin_offset,
+                    let ready_items = if recv_stream.reorder_bytes() == 0 {
+                        path_stream.ready_frame_count()
+                    } else {
+                        0
+                    };
+                    let receive_limit = pending_remote_fin_offset
+                        .unwrap_or(u64::MAX)
+                        .min(recv_stream.published_max_offset());
+                    let payload_limit = reliable_relay_buffer_len(mux_limits)
+                        .min(path_stream.max_frame_payload_bytes)
+                        .max(1);
+                    let first = Ok(Frame::StreamData {
+                        stream_id: received_stream_id,
                         offset,
-                        payload.len(),
-                    )?;
-                    #[cfg(feature = "lab-diagnostics")]
-                    let mux_started = Instant::now();
-                    let outcome = recv_stream.receive_data(offset, payload)?;
-                    #[cfg(feature = "lab-diagnostics")]
-                    lab_perf_record("mux.receive_data", mux_started.elapsed(), payload_len);
-                    let delivered = outcome.delivered;
-                    #[cfg(feature = "lab-diagnostics")]
-                    receive_hole_diagnostics.observe(
-                        stream_id,
-                        &recv_stream,
-                        delivered.iter().map(|chunk| chunk.len()).sum(),
+                        payload,
+                    });
+                    let deferred = collect_ready_stream_data_batch(
+                        &mut ready_path_data,
+                        first,
+                        ReadyStreamDataBatchBounds {
+                            stream_id,
+                            receive_frontier: recv_stream.next_offset(),
+                            receive_limit,
+                            payload_limit,
+                            ready_items,
+                        },
+                        || path_stream.try_recv_frame(),
+                        |item| match item {
+                            Ok(Frame::StreamData {
+                                stream_id,
+                                offset,
+                                payload,
+                            }) => Some((*stream_id, *offset, payload.len())),
+                            _ => None,
+                        },
                     );
-                    for chunk in delivered.iter() {
-                        stats.record_payload_bytes(chunk.len());
-                    }
-                    #[cfg(feature = "lab-diagnostics")]
-                    let write_started = Instant::now();
-                    let written = write_delivered_payloads(&mut local, delivered.as_slice()).await?;
-                    #[cfg(feature = "lab-diagnostics")]
-                    lab_perf_record("relay.local_write_wait", write_started.elapsed(), written);
-                    #[cfg(not(feature = "lab-diagnostics"))]
-                    let _ = written;
-                    if !delivered.is_empty() {
-                        #[cfg(feature = "lab-diagnostics")]
-                        let flush_started = Instant::now();
-                        local.flush().await?;
-                        #[cfg(feature = "lab-diagnostics")]
-                        lab_perf_record("relay.local_flush_wait", flush_started.elapsed(), 0);
-                    }
+                    debug_assert!(deferred_path_frame.is_none());
+                    deferred_path_frame = deferred;
+                    apply_and_write_ready_stream_data_batch(
+                        &mut local,
+                        &mut recv_stream,
+                        &mut ready_path_data,
+                        ReadyStreamDataDirection::ServerUpload,
+                        false,
+                        |recv_stream, item| {
+                            let frame = item?;
+                            let Frame::StreamData {
+                                stream_id: received_stream_id,
+                                offset,
+                                payload,
+                            } = frame
+                            else {
+                                unreachable!("ready data batch contains only STREAM_DATA");
+                            };
+                            debug_assert_eq!(received_stream_id, stream_id);
+                            let payload_len = payload.len();
+                            super::io::validate_stream_data_final_offset(
+                                pending_remote_fin_offset,
+                                offset,
+                                payload_len,
+                            )?;
+                            #[cfg(feature = "lab-diagnostics")]
+                            let mux_started = Instant::now();
+                            let outcome = recv_stream.receive_data(offset, payload)?;
+                            #[cfg(feature = "lab-diagnostics")]
+                            lab_perf_record(
+                                "mux.receive_data",
+                                mux_started.elapsed(),
+                                payload_len,
+                            );
+                            #[cfg(feature = "lab-diagnostics")]
+                            receive_hole_diagnostics.observe(
+                                stream_id,
+                                recv_stream,
+                                outcome
+                                    .delivered
+                                    .iter()
+                                    .map(|chunk| chunk.len())
+                                    .sum(),
+                            );
+                            for chunk in outcome.delivered.iter() {
+                                stats.record_payload_bytes(chunk.len());
+                            }
+                            Ok(outcome)
+                        },
+                    )
+                    .await?;
                     if enqueue_tcp_recv_progress(
                         &mut response_sender,
-                        &recv_stream,
+                        &mut recv_stream,
                         &mut recv_progress,
                         &mut request_sparse_ack_progress,
                         request_feedback_path_snapshot,
@@ -1622,7 +1787,7 @@ where
                     if pending_stream_fin_ready(&recv_stream, pending_remote_fin_offset) {
                         if enqueue_tcp_recv_progress(
                             &mut response_sender,
-                            &recv_stream,
+                            &mut recv_stream,
                             &mut recv_progress,
                             &mut request_sparse_ack_progress,
                             request_feedback_path_snapshot,
@@ -1643,37 +1808,46 @@ where
                     complete,
                     ranges,
                 } if ack_stream_id == stream_id => {
-                    let normalized_ranges = normalize_offset_ranges(ranges);
+                    // Freeze the assigned DSN horizon and validate every
+                    // original range before any cache, flight, queue,
+                    // reservation, or recovery-evidence mutation.
+                    let validated_ack =
+                        match begin_reliable_stream_ack(&send_stream, complete, ranges) {
+                            Ok(ack) => ack,
+                            Err(err) => break Err(err.into()),
+                        };
+                    let normalized_ranges = validated_ack.ranges();
                     #[cfg(feature = "lab-diagnostics")]
                     let mux_started = Instant::now();
-                    let ack = send_stream.apply_normalized_ack(&normalized_ranges);
+                    let ack = match send_stream.apply_validated_ack(&validated_ack) {
+                        Ok(ack) => ack,
+                        Err(err) => break Err(err.into()),
+                    };
                     if ack.released_bytes > 0 {
                         response_sender.record_delivered_data(ack.released_bytes);
                         send_buffer_reservation.release(ack.released_bytes);
                     }
                     #[cfg(feature = "lab-diagnostics")]
                     lab_perf_record("mux.apply_ack", mux_started.elapsed(), ack.released_bytes);
-                    path_stream.release_normalized_acked_ranges(&normalized_ranges);
-                    response_sender.release_normalized_acked_reinjections(&normalized_ranges);
+                    path_stream.release_normalized_acked_ranges(normalized_ranges);
+                    response_sender.release_normalized_acked_reinjections(normalized_ranges);
                     #[cfg(feature = "lab-diagnostics")]
                     let largest_ack_end = normalized_ranges.last().map_or(0, |range| range.end);
                     #[cfg(feature = "lab-diagnostics")]
                     let incoming_ack_frontier =
-                        stream_ack_contiguous_frontier(&normalized_ranges);
+                        stream_ack_contiguous_frontier(normalized_ranges);
                     let previous_ack_frontier = last_send_ack_frontier;
                     update_reinjection_authoritative_ack_snapshot(
-                        &mut last_send_ack_ranges,
-                        &mut last_send_ack_complete,
-                        complete,
-                        &normalized_ranges,
+                        &mut last_send_ack,
+                        &validated_ack,
                     );
                     // Positive ACK chunks release bytes even when their range
                     // list is incomplete. Only the complete snapshot above may
                     // authorize gap inference; flow control follows the exact
                     // lowest outstanding Data Sequence offset.
                     last_send_ack_frontier = send_stream.data_ack_frontier();
-                    let authoritative_ack_complete = last_send_ack_complete;
-                    let authoritative_ack_ranges = last_send_ack_ranges.as_slice();
+                    let authoritative_ack_complete = last_send_ack.complete();
+                    let authoritative_ack_ranges = last_send_ack.ranges();
                     let ack_made_progress = last_send_ack_frontier > previous_ack_frontier;
                     if ack_made_progress {
                         last_send_ack_progress_at = Instant::now();
@@ -1940,7 +2114,7 @@ where
                     )? {
                         if enqueue_tcp_recv_progress(
                             &mut response_sender,
-                            &recv_stream,
+                            &mut recv_stream,
                             &mut recv_progress,
                             &mut request_sparse_ack_progress,
                             request_feedback_path_snapshot,
@@ -1970,7 +2144,7 @@ where
                 {
                     if enqueue_tcp_recv_progress(
                         &mut response_sender,
-                        &recv_stream,
+                        &mut recv_stream,
                         &mut recv_progress,
                         &mut request_sparse_ack_progress,
                         request_feedback_path_snapshot,
@@ -2032,7 +2206,7 @@ where
             let final_tail_reinjection_ready = reliable_final_tail_reinjection_ready(
                 close.sent || pending_local_fin,
                 &send_stream,
-                &last_send_ack_ranges,
+                last_send_ack.ranges(),
                 last_send_ack_frontier,
                 tail_reinjection_deadline,
                 tokio::time::Instant::now(),
@@ -2049,7 +2223,7 @@ where
                     close.sent,
                     pending_local_fin,
                     send_stream.reinjection_bytes(),
-                    last_send_ack_ranges.len(),
+                    last_send_ack.ranges().len(),
                     last_send_ack_frontier,
                     send_stream.next_offset(),
                     response_sender.bytes(),
@@ -2073,7 +2247,7 @@ where
                     path_stream,
                     stream_final_offset_tail_reinjection_frames_normalized(
                         &send_stream,
-                        &last_send_ack_ranges,
+                        last_send_ack.ranges(),
                         reinjection_limit,
                         true,
                         true,
@@ -2186,7 +2360,7 @@ where
             ) => {
             if enqueue_tcp_recv_progress(
                 &mut response_sender,
-                &recv_stream,
+                &mut recv_stream,
                 &mut recv_progress,
                 &mut request_sparse_ack_progress,
                 request_feedback_path_snapshot,

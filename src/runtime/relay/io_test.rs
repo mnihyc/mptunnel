@@ -11,10 +11,439 @@ use crate::model::work::{
     reliable_failed_original_reinjection_limit_bytes,
 };
 use crate::mux::MuxLimits;
+use crate::mux::stream::validate_stream_ack;
 use crate::protocol::frame::reliable_stream_frame_extent;
 use crate::protocol::{PathId, StreamId, UnderlayProtocol};
 use crate::runtime::stream::reliable_stream_recv_progress_interval;
 use crate::scheduler::TrafficClass;
+use std::collections::VecDeque;
+use std::io::IoSlice;
+use std::pin::Pin;
+use std::task::{Context, Poll};
+use tokio::io::AsyncWrite;
+
+#[derive(Default)]
+struct VectoredWriteProbe {
+    bytes: Vec<u8>,
+    scalar_writes: usize,
+    vectored_writes: usize,
+    flushes: usize,
+}
+
+impl AsyncWrite for VectoredWriteProbe {
+    fn poll_write(
+        mut self: Pin<&mut Self>,
+        _cx: &mut Context<'_>,
+        buf: &[u8],
+    ) -> Poll<std::io::Result<usize>> {
+        self.scalar_writes = self.scalar_writes.saturating_add(1);
+        self.bytes.extend_from_slice(buf);
+        Poll::Ready(Ok(buf.len()))
+    }
+
+    fn poll_flush(mut self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+        self.flushes = self.flushes.saturating_add(1);
+        Poll::Ready(Ok(()))
+    }
+
+    fn poll_shutdown(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+        Poll::Ready(Ok(()))
+    }
+
+    fn poll_write_vectored(
+        mut self: Pin<&mut Self>,
+        _cx: &mut Context<'_>,
+        bufs: &[IoSlice<'_>],
+    ) -> Poll<std::io::Result<usize>> {
+        self.vectored_writes = self.vectored_writes.saturating_add(1);
+        let written = bufs.iter().map(|slice| slice.len()).sum();
+        for slice in bufs {
+            self.bytes.extend_from_slice(slice);
+        }
+        Poll::Ready(Ok(written))
+    }
+
+    fn is_write_vectored(&self) -> bool {
+        true
+    }
+}
+
+fn attributed_stream_data(
+    path: RelayPathInstance,
+    stream_id: StreamId,
+    offset: u64,
+    payload: &'static [u8],
+) -> (RelayPathInstance, Frame) {
+    (
+        path,
+        Frame::StreamData {
+            stream_id,
+            offset,
+            payload: Bytes::from_static(payload),
+        },
+    )
+}
+
+fn attributed_stream_data_extent(
+    item: &(RelayPathInstance, Frame),
+) -> Option<(StreamId, u64, usize)> {
+    match &item.1 {
+        Frame::StreamData {
+            stream_id,
+            offset,
+            payload,
+        } => Some((*stream_id, *offset, payload.len())),
+        _ => None,
+    }
+}
+
+#[tokio::test]
+async fn ready_stream_data_batch_preserves_attribution_boundaries_and_vectored_delivery() {
+    let stream_id = StreamId(700);
+    let tcp_path = RelayPathInstance {
+        key: RelayPathKey {
+            underlay: UnderlayProtocol::Tcp,
+            index: 0,
+        },
+        path_instance_id: CarrierPathInstanceId::from_raw(70),
+        attachment_id: 700,
+    };
+    let udp_path = RelayPathInstance {
+        key: RelayPathKey {
+            underlay: UnderlayProtocol::Udp,
+            index: 1,
+        },
+        path_instance_id: CarrierPathInstanceId::from_raw(71),
+        attachment_id: 701,
+    };
+    let first = attributed_stream_data(tcp_path, stream_id, 0, b"abcd");
+    let mut queued = VecDeque::from([
+        attributed_stream_data(udp_path, stream_id, 4, b"efgh"),
+        attributed_stream_data(tcp_path, stream_id, 8, b"ijkl"),
+        (
+            udp_path,
+            Frame::StreamFin {
+                stream_id,
+                final_offset: 12,
+            },
+        ),
+        attributed_stream_data(tcp_path, stream_id, 12, b"must-not-cross-fin"),
+    ]);
+    let ready_items = queued.len();
+    let mut batch = ReadyStreamDataBatch::new();
+    let deferred = collect_ready_stream_data_batch(
+        &mut batch,
+        first,
+        ReadyStreamDataBatchBounds {
+            stream_id,
+            receive_frontier: 0,
+            receive_limit: 12,
+            payload_limit: 12,
+            ready_items,
+        },
+        || queued.pop_front(),
+        attributed_stream_data_extent,
+    );
+
+    assert_eq!(batch.len(), 3);
+    assert_eq!(batch.payload_bytes(), 12);
+    assert!(
+        batch.items_spilled(),
+        "a real multi-frame batch grows reusable item storage once"
+    );
+    let retained_item_capacity = batch.item_capacity();
+    assert!(matches!(
+        deferred,
+        Some((
+            path,
+            Frame::StreamFin {
+                stream_id: received_stream_id,
+                final_offset: 12,
+            },
+        )) if path == udp_path && received_stream_id == stream_id
+    ));
+    assert_eq!(
+        queued.len(),
+        1,
+        "the collector must stop polling at the first boundary"
+    );
+
+    let mut recv_stream = ReliableRecvStream::new(stream_id, MuxLimits::default());
+    let mut writer = VectoredWriteProbe::default();
+    let mut observed_paths = Vec::new();
+    let written = apply_and_write_ready_stream_data_batch(
+        &mut writer,
+        &mut recv_stream,
+        &mut batch,
+        ReadyStreamDataDirection::ClientDownload,
+        false,
+        |recv_stream, (path, frame)| {
+            observed_paths.push(path);
+            let Frame::StreamData {
+                stream_id: received_stream_id,
+                offset,
+                payload,
+            } = frame
+            else {
+                unreachable!("collector admitted only STREAM_DATA");
+            };
+            assert_eq!(received_stream_id, stream_id);
+            recv_stream
+                .receive_data(offset, payload)
+                .map_err(RuntimeError::Stream)
+        },
+    )
+    .await
+    .expect("apply and write ready data");
+
+    assert_eq!(observed_paths, vec![tcp_path, udp_path, tcp_path]);
+    assert_eq!(recv_stream.next_offset(), 12);
+    assert_eq!(written, 12);
+    assert_eq!(writer.bytes, b"abcdefghijkl");
+    assert_eq!(writer.scalar_writes, 0);
+    assert_eq!(writer.vectored_writes, 1);
+    assert_eq!(writer.flushes, 1);
+    assert!(batch.items_spilled());
+    assert_eq!(batch.item_capacity(), retained_item_capacity);
+    assert!(
+        !batch.delivered_spilled(),
+        "the existing eight-iovec span keeps this delivered batch inline"
+    );
+
+    let first = attributed_stream_data(udp_path, stream_id, 12, b"mnop");
+    let mut queued = VecDeque::from([attributed_stream_data(tcp_path, stream_id, 16, b"qrst")]);
+    let deferred = collect_ready_stream_data_batch(
+        &mut batch,
+        first,
+        ReadyStreamDataBatchBounds {
+            stream_id,
+            receive_frontier: 12,
+            receive_limit: 20,
+            payload_limit: 8,
+            ready_items: queued.len(),
+        },
+        || queued.pop_front(),
+        attributed_stream_data_extent,
+    );
+    assert!(deferred.is_none());
+    assert_eq!(
+        batch.item_capacity(),
+        retained_item_capacity,
+        "later batches reuse the relay-lifetime allocation"
+    );
+    apply_and_write_ready_stream_data_batch(
+        &mut writer,
+        &mut recv_stream,
+        &mut batch,
+        ReadyStreamDataDirection::ServerUpload,
+        false,
+        |recv_stream, (_, frame)| {
+            let Frame::StreamData {
+                offset, payload, ..
+            } = frame
+            else {
+                unreachable!("collector admitted only STREAM_DATA");
+            };
+            recv_stream
+                .receive_data(offset, payload)
+                .map_err(RuntimeError::Stream)
+        },
+    )
+    .await
+    .expect("reuse batch for server-upload direction");
+    assert_eq!(recv_stream.next_offset(), 20);
+    assert_eq!(writer.bytes, b"abcdefghijklmnopqrst");
+    assert_eq!(writer.scalar_writes, 0);
+    assert_eq!(writer.vectored_writes, 2);
+    assert_eq!(writer.flushes, 2);
+
+    let first = attributed_stream_data(tcp_path, stream_id, 20, b"uvwx");
+    let mut queued = VecDeque::from([attributed_stream_data(udp_path, stream_id, 24, b"yz12")]);
+    let deferred = collect_ready_stream_data_batch(
+        &mut batch,
+        first,
+        ReadyStreamDataBatchBounds {
+            stream_id,
+            receive_frontier: 20,
+            receive_limit: 28,
+            payload_limit: 8,
+            ready_items: queued.len(),
+        },
+        || queued.pop_front(),
+        attributed_stream_data_extent,
+    );
+    assert!(deferred.is_none());
+    let mut applied = 0usize;
+    let error = apply_and_write_ready_stream_data_batch(
+        &mut writer,
+        &mut recv_stream,
+        &mut batch,
+        ReadyStreamDataDirection::ServerUpload,
+        false,
+        |recv_stream, (_, frame)| {
+            applied = applied.saturating_add(1);
+            if applied == 2 {
+                return Err(RuntimeError::Protocol("synthetic later-frame failure"));
+            }
+            let Frame::StreamData {
+                offset, payload, ..
+            } = frame
+            else {
+                unreachable!("collector admitted only STREAM_DATA");
+            };
+            recv_stream
+                .receive_data(offset, payload)
+                .map_err(RuntimeError::Stream)
+        },
+    )
+    .await
+    .expect_err("later apply failure remains terminal");
+    assert!(matches!(
+        error,
+        RuntimeError::Protocol("synthetic later-frame failure")
+    ));
+    assert_eq!(
+        recv_stream.next_offset(),
+        24,
+        "only successfully applied prefix state commits"
+    );
+    assert_eq!(
+        writer.bytes, b"abcdefghijklmnopqrstuvwx",
+        "already committed receive state is written before surfacing a later error"
+    );
+    assert_eq!(writer.scalar_writes, 1);
+    assert_eq!(writer.vectored_writes, 2);
+    assert_eq!(writer.flushes, 3);
+}
+
+#[test]
+fn ready_stream_data_batch_stops_at_every_geometry_and_resource_boundary() {
+    #[derive(Clone, Copy)]
+    struct Case {
+        name: &'static str,
+        next_stream_id: StreamId,
+        next_offset: u64,
+        next_payload: &'static [u8],
+        receive_limit: u64,
+        payload_limit: usize,
+    }
+
+    let stream_id = StreamId(701);
+    let path = RelayPathInstance {
+        key: RelayPathKey {
+            underlay: UnderlayProtocol::Udp,
+            index: 0,
+        },
+        path_instance_id: CarrierPathInstanceId::from_raw(72),
+        attachment_id: 702,
+    };
+    for case in [
+        Case {
+            name: "gap",
+            next_stream_id: stream_id,
+            next_offset: 5,
+            next_payload: b"efgh",
+            receive_limit: u64::MAX,
+            payload_limit: 64,
+        },
+        Case {
+            name: "overlap",
+            next_stream_id: stream_id,
+            next_offset: 3,
+            next_payload: b"efgh",
+            receive_limit: u64::MAX,
+            payload_limit: 64,
+        },
+        Case {
+            name: "different stream",
+            next_stream_id: StreamId(702),
+            next_offset: 4,
+            next_payload: b"efgh",
+            receive_limit: u64::MAX,
+            payload_limit: 64,
+        },
+        Case {
+            name: "empty payload",
+            next_stream_id: stream_id,
+            next_offset: 4,
+            next_payload: b"",
+            receive_limit: u64::MAX,
+            payload_limit: 64,
+        },
+        Case {
+            name: "flow or FIN limit",
+            next_stream_id: stream_id,
+            next_offset: 4,
+            next_payload: b"efgh",
+            receive_limit: 7,
+            payload_limit: 64,
+        },
+        Case {
+            name: "byte limit",
+            next_stream_id: stream_id,
+            next_offset: 4,
+            next_payload: b"efgh",
+            receive_limit: u64::MAX,
+            payload_limit: 7,
+        },
+    ] {
+        let first = attributed_stream_data(path, stream_id, 0, b"abcd");
+        let mut queued = VecDeque::from([attributed_stream_data(
+            path,
+            case.next_stream_id,
+            case.next_offset,
+            case.next_payload,
+        )]);
+        let mut batch = ReadyStreamDataBatch::new();
+        let deferred = collect_ready_stream_data_batch(
+            &mut batch,
+            first,
+            ReadyStreamDataBatchBounds {
+                stream_id,
+                receive_frontier: 0,
+                receive_limit: case.receive_limit,
+                payload_limit: case.payload_limit,
+                ready_items: queued.len(),
+            },
+            || queued.pop_front(),
+            attributed_stream_data_extent,
+        );
+        assert_eq!(batch.len(), 1, "{}", case.name);
+        assert!(deferred.is_some(), "{}", case.name);
+        assert!(
+            !batch.items_spilled(),
+            "single-frame boundary path must stay allocation-free: {}",
+            case.name
+        );
+    }
+
+    let first = attributed_stream_data(path, stream_id, 0, b"abcd");
+    let mut queued = VecDeque::from([
+        attributed_stream_data(path, stream_id, 4, b"efgh"),
+        attributed_stream_data(path, stream_id, 8, b"ijkl"),
+    ]);
+    let mut batch = ReadyStreamDataBatch::new();
+    let deferred = collect_ready_stream_data_batch(
+        &mut batch,
+        first,
+        ReadyStreamDataBatchBounds {
+            stream_id,
+            receive_frontier: 0,
+            receive_limit: u64::MAX,
+            payload_limit: 64,
+            ready_items: 1,
+        },
+        || queued.pop_front(),
+        attributed_stream_data_extent,
+    );
+    assert_eq!(batch.len(), 2, "item snapshot admits only one extra frame");
+    assert!(deferred.is_none());
+    assert_eq!(
+        queued.len(),
+        1,
+        "items beyond the entry snapshot must not be polled"
+    );
+}
 
 #[test]
 fn stream_fin_waits_for_final_offset_before_close() {
@@ -153,67 +582,115 @@ fn ack_gap_reinjection_requires_authoritative_ack_gap_shape() {
 }
 
 #[test]
+fn shared_relay_ack_transaction_rejects_extent_before_stream_mutation() {
+    let mut send_stream = ReliableSendStream::new(StreamId(77), MuxLimits::default());
+    send_stream
+        .send_data(Bytes::from_static(b"abcdefgh"))
+        .expect("send assigned relay bytes");
+    let before = send_stream.clone();
+
+    let rejected =
+        begin_reliable_stream_ack(&send_stream, true, vec![OffsetRange { start: 4, end: 9 }]);
+
+    assert!(matches!(
+        rejected,
+        Err(StreamError::AckRangeBeyondAssigned {
+            start: 4,
+            end: 9,
+            assigned_end: 8,
+        })
+    ));
+    assert_eq!(send_stream, before);
+}
+
+#[test]
 fn authoritative_ack_snapshot_merges_positive_incomplete_delta_without_regressing() {
-    let mut ranges = Vec::new();
-    let mut complete = false;
-    update_reinjection_authoritative_ack_snapshot(
-        &mut ranges,
-        &mut complete,
+    let mut snapshot = AuthoritativeStreamAckSnapshot::default();
+    let complete = validate_stream_ack(
         true,
-        &[OffsetRange { start: 0, end: 128 }],
-    );
-    update_reinjection_authoritative_ack_snapshot(
-        &mut ranges,
-        &mut complete,
-        true,
-        &[OffsetRange { start: 0, end: 64 }],
-    );
-    update_reinjection_authoritative_ack_snapshot(
-        &mut ranges,
-        &mut complete,
+        vec![
+            OffsetRange { start: 0, end: 64 },
+            OffsetRange {
+                start: 96,
+                end: 128,
+            },
+        ],
+        128,
+    )
+    .expect("complete ACK is within its assigned horizon");
+    update_reinjection_authoritative_ack_snapshot(&mut snapshot, &complete);
+    let filled_gap = validate_stream_ack(false, vec![OffsetRange { start: 64, end: 96 }], 256)
+        .expect("positive delta is within the later assigned extent");
+    update_reinjection_authoritative_ack_snapshot(&mut snapshot, &filled_gap);
+    let after_snapshot = validate_stream_ack(
         false,
-        &[OffsetRange {
+        vec![OffsetRange {
             start: 192,
             end: 256,
         }],
-    );
+        256,
+    )
+    .expect("positive delta is within the later assigned extent");
+    update_reinjection_authoritative_ack_snapshot(&mut snapshot, &after_snapshot);
 
-    assert_eq!(
-        ranges,
-        vec![
-            OffsetRange { start: 0, end: 128 },
-            OffsetRange {
-                start: 192,
-                end: 256,
-            },
-        ]
-    );
-    assert!(complete);
+    assert_eq!(snapshot.ranges(), &[OffsetRange { start: 0, end: 128 }]);
+    assert!(snapshot.complete());
+    assert_eq!(snapshot.horizon(), Some(128));
 }
 
 #[test]
 fn incomplete_ack_cannot_establish_gap_authority() {
-    let mut ranges = Vec::new();
-    let mut complete = false;
-
-    update_reinjection_authoritative_ack_snapshot(
-        &mut ranges,
-        &mut complete,
+    let mut snapshot = AuthoritativeStreamAckSnapshot::default();
+    let incomplete = validate_stream_ack(
         false,
-        &[OffsetRange {
+        vec![OffsetRange {
             start: 192,
             end: 256,
         }],
-    );
+        256,
+    )
+    .expect("positive ACK is within assigned data");
+    update_reinjection_authoritative_ack_snapshot(&mut snapshot, &incomplete);
 
-    assert!(ranges.is_empty());
-    assert!(!complete);
+    assert!(snapshot.ranges().is_empty());
+    assert!(!snapshot.complete());
+    assert_eq!(snapshot.horizon(), None);
+}
+
+#[test]
+fn empty_complete_ack_retains_only_its_captured_assignment_horizon() {
+    let mut snapshot = AuthoritativeStreamAckSnapshot::default();
+    let empty =
+        validate_stream_ack(true, Vec::new(), 128).expect("empty complete ACK is well formed");
+    update_reinjection_authoritative_ack_snapshot(&mut snapshot, &empty);
+
+    assert!(snapshot.complete());
+    assert!(snapshot.ranges().is_empty());
+    assert_eq!(snapshot.horizon(), Some(128));
+    assert!(snapshot.has_unacknowledged_extent(0));
+    assert!(!snapshot.has_unacknowledged_extent(128));
+
+    let later_positive = validate_stream_ack(
+        false,
+        vec![OffsetRange {
+            start: 128,
+            end: 256,
+        }],
+        256,
+    )
+    .expect("later positive ACK stays within newly assigned data");
+    update_reinjection_authoritative_ack_snapshot(&mut snapshot, &later_positive);
+    assert_eq!(
+        snapshot.horizon(),
+        Some(128),
+        "an incomplete delta cannot make the old complete snapshot omit newly assigned bytes"
+    );
+    assert!(snapshot.ranges().is_empty());
 }
 
 #[test]
 fn authoritative_gap_persistence_ignores_an_older_complete_snapshot() {
-    let mut ranges = Vec::new();
-    let mut complete = false;
+    let mut snapshot = AuthoritativeStreamAckSnapshot::default();
     let current = [
         OffsetRange {
             start: 0,
@@ -238,14 +715,26 @@ fn authoritative_gap_persistence_ignores_an_older_complete_snapshot() {
     let persistence = Duration::from_millis(300);
     let mut progress = ReliableAckGapReinjectionProgress::default();
 
-    update_reinjection_authoritative_ack_snapshot(&mut ranges, &mut complete, true, &current);
-    assert!(!progress.reinjection_ready_at(complete, &ranges, true, false, persistence, now,));
+    let current_ack = validate_stream_ack(true, current.to_vec(), 16_384)
+        .expect("current ACK fits assigned extent");
+    update_reinjection_authoritative_ack_snapshot(&mut snapshot, &current_ack);
+    assert!(!progress.reinjection_ready_at(
+        snapshot.complete(),
+        snapshot.ranges(),
+        true,
+        false,
+        persistence,
+        now,
+    ));
 
-    update_reinjection_authoritative_ack_snapshot(&mut ranges, &mut complete, true, &stale);
-    assert_eq!(ranges.as_slice(), current.as_slice());
+    let stale_ack =
+        validate_stream_ack(true, stale.to_vec(), 12_288).expect("stale ACK fits its old horizon");
+    update_reinjection_authoritative_ack_snapshot(&mut snapshot, &stale_ack);
+    assert_eq!(snapshot.ranges(), current.as_slice());
+    assert_eq!(snapshot.horizon(), Some(16_384));
     assert!(progress.reinjection_ready_at(
-        complete,
-        &ranges,
+        snapshot.complete(),
+        snapshot.ranges(),
         true,
         true,
         persistence,

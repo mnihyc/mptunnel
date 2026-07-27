@@ -48,6 +48,9 @@
       <button id="tab-overview" class="tab is-active" type="button" role="tab"
               aria-selected="true" aria-controls="panel-overview" tabindex="0"
               data-tab="overview">Overview</button>
+      <button id="tab-gateways" class="tab" type="button" role="tab"
+              aria-selected="false" aria-controls="panel-gateways" tabindex="-1"
+              data-tab="gateways">Gateways <span id="gateways-tab-count" class="tab-count">0</span></button>
       <button id="tab-paths" class="tab" type="button" role="tab"
               aria-selected="false" aria-controls="panel-paths" tabindex="-1"
               data-tab="paths">Paths <span id="paths-tab-count" class="tab-count">0</span></button>
@@ -175,8 +178,32 @@
             <h3>Local inbounds</h3>
             <ul id="inbounds-list" class="plain-list"></ul>
           </div>
+          <div id="outbounds-wrap" class="inbounds-wrap" hidden>
+            <h3>Outbounds</h3>
+            <ul id="outbounds-list" class="plain-list"></ul>
+          </div>
         </section>
       </div>
+    </section>
+
+    <section id="panel-gateways" class="tab-panel" role="tabpanel"
+             aria-labelledby="tab-gateways" data-panel="gateways" hidden>
+      <div class="section-heading">
+        <div>
+          <p class="eyebrow">Product egress</p>
+          <h1>Gateways</h1>
+        </div>
+        <p class="section-meta">Failover occurs before flow commit. Actions affect this runtime
+          generation; edit configuration to persist them.</p>
+      </div>
+
+      <div id="gateway-list" class="gateway-list"></div>
+      <div id="gateways-empty" class="data-section empty-state" hidden>
+        <h2>No gateway balancers configured</h2>
+        <p>Routes currently select leaf outbounds directly.</p>
+      </div>
+      <div id="gateway-action-state" class="inline-status gateway-action-state"
+           role="status" aria-live="polite"></div>
     </section>
 
     <section id="panel-paths" class="tab-panel" role="tabpanel"
@@ -287,7 +314,8 @@
               <tr>
                 <th scope="col">Kind</th>
                 <th scope="col">Flow</th>
-                <th scope="col">Service</th>
+                <th scope="col">Origin</th>
+                <th scope="col">Egress</th>
                 <th scope="col">Session</th>
                 <th scope="col">Target</th>
                 <th scope="col">Age</th>

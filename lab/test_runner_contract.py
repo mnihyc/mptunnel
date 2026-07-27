@@ -11,9 +11,76 @@ COMPOSE = (Path(__file__).resolve().parent / "docker-compose.yml").read_text(
 DOCKERFILE = (Path(__file__).resolve().parent / "docker" / "Dockerfile").read_text(
     encoding="utf-8"
 )
+BASELINE_TOOLS = (
+    Path(__file__).resolve().parent / "baseline-tools.sh"
+).read_text(encoding="utf-8")
+EXHAUSTIVE = (
+    Path(__file__).resolve().parent / "run-exhaustive-experiments.sh"
+).read_text(encoding="utf-8")
 
 
 class RunnerContractTests(unittest.TestCase):
+    def test_only_optional_baselines_can_emit_skipped_rows(self):
+        optional_protocols = (
+            '"vmess"',
+            '"vmess-upload"',
+            '"hysteria2"',
+            '"hysteria2-upload"',
+            '"$protocol"',
+            '"mptcp"',
+            '"mptcp-upload"',
+        )
+        skip_calls = [
+            line.strip()
+            for line in SCRIPT.splitlines()
+            if 'append_skipped_result "$case_name"' in line
+        ]
+
+        self.assertGreater(len(skip_calls), 0)
+        for call in skip_calls:
+            self.assertTrue(
+                any(protocol in call for protocol in optional_protocols),
+                f"non-optional case emits a skipped row: {call}",
+            )
+        self.assertIn('{"ok", "loss", "skipped"}', SCRIPT)
+        skipped = SCRIPT.split("append_skipped_result() {", 1)[1].split(
+            "\n}", 1
+        )[0]
+        self.assertIn("MPTUNNEL_LAB_REQUIRE_COMPETITOR_BASELINES", SCRIPT)
+        self.assertIn("baseline_vmess_*|baseline_hysteria2_*", skipped)
+        self.assertIn('status="fail"', skipped)
+        self.assertIn(
+            'MPTUNNEL_LAB_FAIL_ON_BAD_STATUS:-1',
+            EXHAUSTIVE,
+        )
+
+    def test_current_wire_and_resource_contract_is_explicit(self):
+        provenance = SCRIPT.split("refresh_result_reproducibility() {", 1)[1].split(
+            "\n}", 1
+        )[0]
+        resources = SCRIPT.split("resource_config_toml() {", 1)[1].split(
+            "\n}", 1
+        )[0]
+
+        self.assertIn("MPTUNNEL_CARRIER_PRESENTATION", provenance)
+        self.assertIn("mptunnel_carrier_presentation", provenance)
+        self.assertIn("lab evidence supports only MPP wire protocol", SCRIPT)
+        for name in (
+            "MPTUNNEL_MAX_QUIC_CONCURRENT_BIDI_STREAMS",
+            "MPTUNNEL_MAX_REINJECTION_CACHE_CHUNKS",
+            "MPTUNNEL_MAX_REORDER_BUFFER_CHUNKS",
+            "MPTUNNEL_MAX_RETAINED_RECEIVE_RANGES",
+            "MPTUNNEL_QUIC_PATH_KEEP_ALIVE_INTERVAL_MS",
+            "MPTUNNEL_QUIC_PATH_IDLE_TIMEOUT_MS",
+        ):
+            self.assertIn(name, resources)
+
+        self.assertIn(".tmp/lab/baselines", BASELINE_TOOLS)
+        self.assertNotIn(
+            'MPTUNNEL_LAB_BASELINE_DIR:-/tmp/',
+            BASELINE_TOOLS,
+        )
+
     def test_diagnostic_build_uses_shared_truthy_parser(self):
         build_function = SCRIPT.split("build_mptunnel_binary() {", 1)[1].split("\n}", 1)[0]
 
@@ -87,6 +154,28 @@ class RunnerContractTests(unittest.TestCase):
         self.assertIn("capture_qdisc_snapshot", telemetry)
         self.assertIn('normalize_lab_result_path "run-${timestamp}-$$"', SCRIPT)
         self.assertIn(': > "$result_dir/config-sha256.txt"', SCRIPT)
+
+    def test_versioned_host_snapshot_is_captured_before_result_identity(self):
+        capture = SCRIPT.split("capture_host_snapshot() {", 1)[1].split(
+            "\n}", 1
+        )[0]
+        provenance = SCRIPT.split("refresh_result_reproducibility() {", 1)[1].split(
+            "\n}", 1
+        )[0]
+        startup = SCRIPT.split("prepare_client_runtime\n", 1)[1]
+
+        self.assertIn('host_snapshot_file="$result_dir/host-snapshot.json"', SCRIPT)
+        self.assertIn("host_snapshot.py", capture)
+        self.assertIn("--exclude-container-id", capture)
+        self.assertIn("MPTUNNEL_LAB_REQUIRE_VALID_HOST", (
+            Path(__file__).resolve().parent / "host_snapshot.py"
+        ).read_text(encoding="utf-8"))
+        self.assertIn("load_host_reproducibility", provenance)
+        self.assertLess(
+            startup.index("capture_host_snapshot"),
+            startup.index("refresh_result_reproducibility"),
+        )
+        self.assertIn("HOST_SNAPSHOT_SHA256", SCRIPT)
 
     def test_external_baseline_rows_record_verified_running_executables(self):
         capture = SCRIPT.split("capture_baseline_identity() {", 1)[1].split(

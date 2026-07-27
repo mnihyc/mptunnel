@@ -12,7 +12,9 @@ use crate::runtime::telemetry::{ProductFlowLifecycleSnapshot, ProductIoSnapshot}
 use crate::scheduler::PathState as SchedulerPathState;
 use serde::Serialize;
 
-pub(super) const SCHEMA: &str = "mptunnel.management.v2";
+use super::gateway::ManagementGatewayStatus;
+
+pub(super) const SCHEMA: &str = "mptunnel.management.v4";
 
 #[derive(Debug, Clone, Serialize)]
 pub(super) struct ManagementSnapshot {
@@ -23,8 +25,11 @@ pub(super) struct ManagementSnapshot {
     pub(super) uptime_ms: u64,
     pub(super) services: ManagementServices,
     pub(super) local_inbounds: Vec<ManagementIngressStatus>,
+    pub(super) outbounds: Vec<ManagementOutboundStatus>,
     pub(super) summary: ManagementSummary,
+    pub(super) admission: ManagementAdmission,
     pub(super) traffic: ManagementTraffic,
+    pub(super) gateways: Vec<ManagementGatewayStatus>,
     pub(super) paths: Vec<ManagementPathStatus>,
     pub(super) sessions: Vec<ManagementSessionStatus>,
     pub(super) flows: Vec<ManagementFlowStatus>,
@@ -33,11 +38,58 @@ pub(super) struct ManagementSnapshot {
 }
 
 #[derive(Debug, Clone, Default, Serialize)]
+pub(super) struct ManagementAdmission {
+    pub(super) owner_generation: String,
+    pub(super) live_flows: usize,
+    pub(super) concurrent_work: usize,
+    pub(super) dns_work: usize,
+    pub(super) tracked_principals: usize,
+    pub(super) tracked_outbounds: usize,
+    pub(super) tracked_targets: usize,
+    pub(super) limits: ManagementAdmissionLimits,
+    pub(super) rejections: ManagementAdmissionRejections,
+}
+
+#[derive(Debug, Clone, Default, Serialize)]
+pub(super) struct ManagementAdmissionLimits {
+    pub(super) max_live_flows: usize,
+    pub(super) max_concurrent_work: usize,
+    pub(super) max_live_flows_per_principal: usize,
+    pub(super) max_live_flows_per_outbound: usize,
+    pub(super) max_connects_per_outbound: usize,
+    pub(super) max_live_flows_per_target: usize,
+    pub(super) max_connects_per_target: usize,
+    pub(super) max_dns_work: usize,
+}
+
+#[derive(Debug, Clone, Default, Serialize)]
+pub(super) struct ManagementAdmissionRejections {
+    pub(super) global_live_flows: String,
+    pub(super) principal_live_flows: String,
+    pub(super) outbound_live_flows: String,
+    pub(super) target_live_flows: String,
+    pub(super) global_concurrent_work: String,
+    pub(super) outbound_connects: String,
+    pub(super) target_connects: String,
+    pub(super) dns_work: String,
+}
+
+#[derive(Debug, Clone, Default, Serialize)]
 pub(super) struct ManagementServices {
     pub(super) mpp_outbounds: usize,
     pub(super) mpp_inbounds: usize,
     pub(super) local_inbounds: usize,
+    pub(super) local_outbounds: usize,
+    pub(super) outbounds: usize,
+    pub(super) gateway_balancers: usize,
     pub(super) configured_path_listeners: usize,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub(super) struct ManagementOutboundStatus {
+    pub(super) tag: String,
+    pub(super) protocol: &'static str,
+    pub(super) networks: Vec<&'static str>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -49,6 +101,8 @@ pub(super) struct ManagementIngressStatus {
     pub(super) listen: Vec<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(super) name: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(super) target: Option<String>,
     pub(super) auth_required: bool,
 }
 
@@ -235,14 +289,21 @@ pub(super) struct ManagementSessionStatus {
 
 #[derive(Debug, Clone, Serialize)]
 pub(super) struct ManagementFlowStatus {
-    pub(super) service: &'static str,
-    pub(super) service_index: usize,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub(super) service_tag: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(super) session_id: Option<String>,
     pub(super) flow_kind: &'static str,
     pub(super) flow_id: String,
+    pub(super) network: &'static str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(super) inbound_kind: Option<&'static str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(super) inbound: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(super) outbound: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(super) balancer: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(super) balancer_member: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(super) target: Option<String>,
     pub(super) age_ms: u64,
@@ -312,6 +373,7 @@ pub(super) struct ManagementPeerPathStatus {
 #[derive(Debug, Clone, Default, Serialize)]
 pub(super) struct ManagementControls {
     pub(super) path: ManagementControlStatus,
+    pub(super) gateway: ManagementControlStatus,
     pub(super) peer_diagnostics: ManagementControlStatus,
 }
 

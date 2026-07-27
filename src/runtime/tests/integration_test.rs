@@ -1,13 +1,408 @@
 use super::*;
 use crate::config::{
-    ClientPathConfig, DEFAULT_OUTBOUND_CONNECT_TIMEOUT, ResourceLimits, SessionConfig,
+    ClientPathConfig, DEFAULT_OUTBOUND_CONNECT_TIMEOUT, ResourceLimits, ServerDestinationAclConfig,
+    SessionConfig,
 };
-use crate::outbound::{DnsConfig, OutboundConfig};
+use crate::outbound::OutboundConfig;
 use crate::protocol::{DatagramFlowId, DatagramId, PathUsage, SessionId};
 use crate::runtime::path::ServerLocalPath;
 use crate::transport::SystemCarrierNetworkProvider;
 
 const FULL_STACK_RESPONSE_TIMEOUT: Duration = Duration::from_secs(15);
+
+fn local_proxy_auth() -> crate::ingress::ProxyAuthConfig {
+    let user = crate::ingress::LocalProxyUser::new(
+        "operator".to_string(),
+        crate::product::PrincipalId::parse("daily-user").expect("principal"),
+        "operator".to_string(),
+        "secret".to_string(),
+    )
+    .expect("local proxy user");
+    crate::ingress::ProxyAuthConfig::required([user]).expect("proxy auth")
+}
+
+fn local_port_forward_router() -> crate::runtime::product_policy::ClientIngressRouter {
+    local_port_forward_runtime().0
+}
+
+fn local_port_forward_runtime() -> (
+    crate::runtime::product_policy::ClientIngressRouter,
+    crate::runtime::telemetry::RuntimeTelemetry,
+) {
+    let outbound = crate::product::OutboundId::parse("local-direct").expect("outbound ID");
+    let policy = crate::config::ProductPolicyConfig {
+        generation: 1,
+        routes: vec![crate::product::RouteRuleSpec::new(
+            crate::product::RuleId::parse("default").expect("route rule ID"),
+            crate::product::RouteMatchSpec::default(),
+            crate::product::RouteAction::new(
+                crate::product::EgressAction::Outbound(outbound.clone()),
+                None,
+                crate::product::TrafficIntent::Interactive,
+            ),
+        )],
+        destination_acl: vec![crate::product::AclRuleSpec::new(
+            crate::product::RuleId::parse("allow-local-test-target").expect("ACL rule ID"),
+            crate::product::RouteMatchSpec::default(),
+            crate::product::AclEffect::AllowRestricted,
+        )],
+    };
+    let telemetry = crate::runtime::telemetry::RuntimeTelemetry::generation_owner(8);
+    let registry = crate::runtime::outbound_registry::RuntimeOutboundRegistryShell::compile(
+        [
+            crate::runtime::outbound_registry::RuntimeOutboundLeaf::Local {
+                id: outbound,
+                config: OutboundConfig::Direct,
+                connect_timeout: Duration::from_secs(2),
+                native_sockets: Arc::new(crate::transport::SystemNativeSocketConfigurator),
+            },
+        ],
+        &[],
+    )
+    .expect("local outbound registry")
+    .with_product_telemetry(telemetry.clone())
+    .with_dns(crate::runtime::outbound_registry::test_dns_generation());
+    (
+        crate::runtime::product_policy::ClientIngressRouter::new(&policy, registry)
+            .expect("local ingress router"),
+        telemetry,
+    )
+}
+
+fn port_forward_inbound() -> crate::product::InboundId {
+    crate::product::InboundId::parse("local-forward").expect("inbound ID")
+}
+
+fn test_server_destination_acl() -> ServerDestinationAclConfig {
+    ServerDestinationAclConfig {
+        generation: 1,
+        rules: vec![crate::product::AclRuleSpec::new(
+            crate::product::RuleId::parse("test-allow-restricted").expect("test rule ID"),
+            crate::product::RouteMatchSpec::default(),
+            crate::product::AclEffect::AllowRestricted,
+        )],
+    }
+}
+
+#[tokio::test]
+async fn fixed_tcp_forward_streams_through_the_product_outbound_pipeline() {
+    let target_listener = TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind TCP target");
+    let target_address = target_listener.local_addr().expect("TCP target address");
+    let (target_received_tx, target_received_rx) = oneshot::channel();
+    let (target_release_tx, target_release_rx) = oneshot::channel();
+    let target = tokio::spawn(async move {
+        let (mut stream, _) = target_listener
+            .accept()
+            .await
+            .expect("accept target stream");
+        let mut request = [0u8; 4];
+        stream
+            .read_exact(&mut request)
+            .await
+            .expect("read target request");
+        assert_eq!(&request, b"ping");
+        target_received_tx
+            .send(())
+            .expect("signal target request received");
+        target_release_rx.await.expect("release target response");
+        stream.write_all(b"pong").await.expect("write target reply");
+        stream.shutdown().await.expect("target shutdown");
+    });
+
+    let forward_listener = TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind TCP forward");
+    let forward_address = forward_listener.local_addr().expect("TCP forward address");
+    let (router, telemetry) = local_port_forward_runtime();
+    let forward = tokio::spawn(run_tcp_forward_client_listener(
+        forward_listener,
+        Arc::new(TargetAddr::Domain {
+            host: "localhost".to_string(),
+            port: target_address.port(),
+        }),
+        router,
+        port_forward_inbound(),
+        Arc::new(tokio::sync::Semaphore::new(1)),
+    ));
+
+    let mut client = TcpStream::connect(forward_address)
+        .await
+        .expect("connect TCP forward");
+    client
+        .write_all(b"ping")
+        .await
+        .expect("write client request");
+    target_received_rx.await.expect("target request signal");
+    let active = telemetry.snapshot();
+    assert_eq!(active.reliable.flows.opened, 1);
+    assert_eq!(active.reliable.flows.active, 1);
+    assert_eq!(active.reliable.io.to_peer_bytes, 4);
+    assert_eq!(active.active_flows.len(), 1);
+    assert_eq!(active.active_flows[0].display_id, 1);
+    assert_eq!(
+        active.active_flows[0]
+            .origin
+            .as_ref()
+            .expect("flow origin")
+            .inbound
+            .as_str(),
+        "local-forward"
+    );
+    assert_eq!(
+        active.active_flows[0]
+            .selection
+            .as_ref()
+            .expect("flow selection")
+            .outbound
+            .as_str(),
+        "local-direct"
+    );
+    assert_eq!(
+        active.active_flows[0]
+            .target
+            .as_ref()
+            .expect("original target")
+            .authority(),
+        format!("localhost:{}", target_address.port())
+    );
+
+    let mut overloaded = TcpStream::connect(forward_address)
+        .await
+        .expect("connect overloaded TCP client");
+    let mut overload_probe = [0u8; 1];
+    let overload_result =
+        tokio::time::timeout(Duration::from_secs(1), overloaded.read(&mut overload_probe))
+            .await
+            .expect("overloaded connection must be shed without waiting");
+    assert!(
+        matches!(overload_result, Ok(0) | Err(_)),
+        "overloaded connection unexpectedly remained open"
+    );
+
+    target_release_tx.send(()).expect("release target response");
+    let mut reply = [0u8; 4];
+    tokio::time::timeout(Duration::from_secs(2), client.read_exact(&mut reply))
+        .await
+        .expect("TCP forward response timeout")
+        .expect("read TCP forward response");
+    assert_eq!(&reply, b"pong");
+
+    target.await.expect("target task");
+    drop(client);
+    tokio::time::timeout(Duration::from_secs(2), async {
+        loop {
+            if telemetry.snapshot().reliable.flows.active == 0 {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("native TCP telemetry retirement");
+    let completed = telemetry.snapshot();
+    assert_eq!(completed.reliable.io.to_peer_bytes, 4);
+    assert_eq!(completed.reliable.io.from_peer_bytes, 4);
+    assert_eq!(completed.reliable.flows.completed, 1);
+    assert_eq!(completed.reliable.flows.failed, 0);
+    forward.abort();
+    let _ = forward.await;
+}
+
+#[tokio::test]
+async fn fixed_udp_forward_preserves_two_source_response_mappings() {
+    let target_socket = UdpSocket::bind("127.0.0.1:0")
+        .await
+        .expect("bind UDP target");
+    let target_address = target_socket.local_addr().expect("UDP target address");
+    let target = tokio::spawn(async move {
+        let mut packet = [0u8; 64];
+        let first = target_socket
+            .recv_from(&mut packet)
+            .await
+            .expect("first target receive");
+        let first_payload = packet[..first.0].to_vec();
+        let second = target_socket
+            .recv_from(&mut packet)
+            .await
+            .expect("second target receive");
+        let second_payload = packet[..second.0].to_vec();
+
+        let mut second_reply = b"reply:".to_vec();
+        second_reply.extend_from_slice(&second_payload);
+        target_socket
+            .send_to(&second_reply, second.1)
+            .await
+            .expect("second target reply");
+        let mut first_reply = b"reply:".to_vec();
+        first_reply.extend_from_slice(&first_payload);
+        target_socket
+            .send_to(&first_reply, first.1)
+            .await
+            .expect("first target reply");
+    });
+
+    let forward_socket = UdpSocket::bind("127.0.0.1:0")
+        .await
+        .expect("bind UDP forward");
+    let forward_address = forward_socket.local_addr().expect("UDP forward address");
+    let (router, telemetry) = local_port_forward_runtime();
+    let forward = tokio::spawn(run_udp_forward_client_socket(
+        forward_socket,
+        Arc::new(TargetAddr::Ip(target_address)),
+        MuxLimits::default(),
+        router,
+        port_forward_inbound(),
+        Arc::new(tokio::sync::Semaphore::new(2)),
+        Duration::from_secs(5),
+        30_000,
+    ));
+    let first_client = UdpSocket::bind("127.0.0.1:0")
+        .await
+        .expect("bind first UDP client");
+    let second_client = UdpSocket::bind("127.0.0.1:0")
+        .await
+        .expect("bind second UDP client");
+    first_client
+        .send_to(b"first", forward_address)
+        .await
+        .expect("first forward request");
+    second_client
+        .send_to(b"second", forward_address)
+        .await
+        .expect("second forward request");
+
+    let mut first_reply = [0u8; 64];
+    let first_length =
+        tokio::time::timeout(Duration::from_secs(2), first_client.recv(&mut first_reply))
+            .await
+            .expect("first response timeout")
+            .expect("first response");
+    let mut second_reply = [0u8; 64];
+    let second_length = tokio::time::timeout(
+        Duration::from_secs(2),
+        second_client.recv(&mut second_reply),
+    )
+    .await
+    .expect("second response timeout")
+    .expect("second response");
+    assert_eq!(&first_reply[..first_length], b"reply:first");
+    assert_eq!(&second_reply[..second_length], b"reply:second");
+
+    let snapshot = telemetry.snapshot();
+    assert_eq!(snapshot.datagram.flows.opened, 2);
+    assert_eq!(snapshot.datagram.flows.active, 2);
+    assert_eq!(snapshot.datagram.io.to_peer_packets, 2);
+    assert_eq!(snapshot.datagram.io.to_peer_bytes, 11);
+    assert_eq!(snapshot.datagram.io.from_peer_packets, 2);
+    assert_eq!(snapshot.datagram.io.from_peer_bytes, 23);
+    assert!(
+        snapshot.active_flows.iter().all(|flow| {
+            flow.origin
+                .as_ref()
+                .is_some_and(|origin| origin.inbound.as_str() == "local-forward")
+                && flow
+                    .selection
+                    .as_ref()
+                    .is_some_and(|selection| selection.outbound.as_str() == "local-direct")
+        }),
+        "every native UDP association retains immutable Product attribution"
+    );
+
+    target.await.expect("target task");
+    forward.abort();
+    let _ = forward.await;
+}
+
+#[tokio::test]
+async fn fixed_udp_forward_bounds_associations_and_reclaims_idle_sources() {
+    let target_socket = UdpSocket::bind("127.0.0.1:0")
+        .await
+        .expect("bind UDP target");
+    let target_address = target_socket.local_addr().expect("UDP target address");
+    let forward_socket = UdpSocket::bind("127.0.0.1:0")
+        .await
+        .expect("bind UDP forward");
+    let forward_address = forward_socket.local_addr().expect("UDP forward address");
+    let forward = tokio::spawn(run_udp_forward_client_socket(
+        forward_socket,
+        Arc::new(TargetAddr::Ip(target_address)),
+        MuxLimits::default(),
+        local_port_forward_router(),
+        port_forward_inbound(),
+        Arc::new(tokio::sync::Semaphore::new(1)),
+        Duration::from_millis(120),
+        30_000,
+    ));
+    let first_client = UdpSocket::bind("127.0.0.1:0")
+        .await
+        .expect("bind first UDP client");
+    let second_client = UdpSocket::bind("127.0.0.1:0")
+        .await
+        .expect("bind second UDP client");
+    let mut packet = [0u8; 64];
+
+    first_client
+        .send_to(b"first", forward_address)
+        .await
+        .expect("first forward request");
+    let (first_length, first_outbound) =
+        tokio::time::timeout(Duration::from_secs(2), target_socket.recv_from(&mut packet))
+            .await
+            .expect("first target timeout")
+            .expect("first target request");
+    assert_eq!(&packet[..first_length], b"first");
+    target_socket
+        .send_to(b"first-reply", first_outbound)
+        .await
+        .expect("first target reply");
+    let first_reply_length =
+        tokio::time::timeout(Duration::from_secs(2), first_client.recv(&mut packet))
+            .await
+            .expect("first reply timeout")
+            .expect("first reply");
+    assert_eq!(&packet[..first_reply_length], b"first-reply");
+
+    second_client
+        .send_to(b"blocked", forward_address)
+        .await
+        .expect("blocked forward request");
+    assert!(
+        tokio::time::timeout(
+            Duration::from_millis(40),
+            target_socket.recv_from(&mut packet)
+        )
+        .await
+        .is_err(),
+        "a second source must not exceed the configured association cap"
+    );
+
+    tokio::time::sleep(Duration::from_millis(120)).await;
+    second_client
+        .send_to(b"after-idle", forward_address)
+        .await
+        .expect("post-idle forward request");
+    let (second_length, second_outbound) =
+        tokio::time::timeout(Duration::from_secs(2), target_socket.recv_from(&mut packet))
+            .await
+            .expect("post-idle target timeout")
+            .expect("post-idle target request");
+    assert_eq!(&packet[..second_length], b"after-idle");
+    target_socket
+        .send_to(b"second-reply", second_outbound)
+        .await
+        .expect("second target reply");
+    let second_reply_length =
+        tokio::time::timeout(Duration::from_secs(2), second_client.recv(&mut packet))
+            .await
+            .expect("second reply timeout")
+            .expect("second reply");
+    assert_eq!(&packet[..second_reply_length], b"second-reply");
+
+    forward.abort();
+    let _ = forward.await;
+}
 
 fn client_context_with_session_retention(
     paths: Vec<PathSpec>,
@@ -17,6 +412,7 @@ fn client_context_with_session_retention(
     let paths = paths
         .into_iter()
         .map(|spec| ClientPathConfig {
+            tls: crate::transport::encrypted::test_client_tls_config(),
             spec,
             security: security(),
         })
@@ -25,7 +421,6 @@ fn client_context_with_session_retention(
         paths,
         resources,
         None,
-        Vec::new(),
         crate::runtime::path::ClientPathRuntimeOptions {
             session_retention_timeout: retention_timeout,
             path_group_ordinal: 0,
@@ -96,13 +491,15 @@ async fn mixed_server_listeners_apply_local_policy_independent_of_wire_path_id()
     let server = tokio::spawn(run_server(
         vec![tcp_path.clone(), udp_path.clone()],
         OutboundConfig::Direct,
-        DnsConfig::default(),
         DEFAULT_OUTBOUND_CONNECT_TIMEOUT,
-        security(),
+        test_server_destination_acl(),
+        server_security(),
+        crate::transport::encrypted::test_server_tls_config(),
         MppPerformanceConfig::default(),
         ResourceLimits::default(),
         SessionConfig::default(),
         ManagementConfig::default(),
+        None,
     ));
     tokio::time::sleep(Duration::from_millis(20)).await;
 
@@ -316,7 +713,7 @@ async fn socks5_ingress_accepts_configured_username_password_auth() {
         vec![path],
         security(),
         ResourceLimits::default(),
-        ProxyAuthConfig::required("operator".to_string(), "secret".to_string()),
+        local_proxy_auth(),
     )
     .expect("ctx");
     let (mut client, server) = duplex(4096);
@@ -381,7 +778,7 @@ async fn socks5_ingress_rejects_wrong_username_password_auth() {
         Vec::new(),
         security(),
         ResourceLimits::default(),
-        ProxyAuthConfig::required("operator".to_string(), "secret".to_string()),
+        local_proxy_auth(),
     )
     .expect("ctx");
     let (mut client, server) = duplex(1024);
@@ -675,6 +1072,20 @@ async fn auto_bulk_tcp_stream_attaches_measured_path_for_large_response() {
     }
 
     handler.await.expect("handler join").expect("handler");
+    tokio::time::timeout(Duration::from_secs(2), async {
+        loop {
+            let released = {
+                let health = health_context.health().lock().expect("health lock");
+                health.tcp[0].active_flows == 0 && health.tcp[1].active_flows == 0
+            };
+            if released {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("reliable path load leases were not released");
     {
         let health = health_context.health().lock().expect("health lock");
         assert_eq!(health.tcp[0].active_flows, 0);
@@ -1156,7 +1567,7 @@ async fn socks5_ingress_schedules_tcp_stream_to_best_configured_path() {
 async fn socks5_ingress_starts_reliable_auto_latency_first() {
     let (target_addr, target) = spawn_echo_target().await;
     let no_bulk_low_latency_path =
-        reserve_tcp_path_with_query("srtt-ms=10&rate-mbps=1000&no-bulk").await;
+        reserve_tcp_path_with_query("srtt-ms=10&rate-mbps=1000&bulk-allowed=false").await;
     let bulk_allowed_path = reserve_tcp_path_with_query("srtt-ms=120&rate-mbps=100").await;
     let (accepted_tx, mut accepted_rx) = mpsc::channel(2);
     let low_latency_server = spawn_notified_server_path(
@@ -1312,7 +1723,7 @@ async fn http_connect_ingress_accepts_configured_basic_proxy_auth() {
         vec![path],
         security(),
         ResourceLimits::default(),
-        ProxyAuthConfig::required("operator".to_string(), "secret".to_string()),
+        local_proxy_auth(),
     )
     .expect("ctx");
     let (mut client, server) = duplex(4096);
@@ -1351,7 +1762,7 @@ async fn http_connect_ingress_rejects_missing_basic_proxy_auth() {
         Vec::new(),
         security(),
         ResourceLimits::default(),
-        ProxyAuthConfig::required("operator".to_string(), "secret".to_string()),
+        local_proxy_auth(),
     )
     .expect("ctx");
     let (mut client, server) = duplex(1024);
@@ -1452,10 +1863,11 @@ where
     ))
 }
 
-async fn send_socks5_udp_ping(relay_addr: SocketAddr, target_addr: SocketAddr) {
-    let udp_client = UdpSocket::bind("127.0.0.1:0")
-        .await
-        .expect("udp client bind");
+async fn send_socks5_udp_ping(
+    udp_client: &UdpSocket,
+    relay_addr: SocketAddr,
+    target_addr: SocketAddr,
+) {
     let request = socks5::udp_datagram(&TargetAddr::Ip(target_addr), b"ping").expect("udp request");
     udp_client
         .send_to(&request, relay_addr)
@@ -1503,26 +1915,33 @@ async fn spawn_scripted_tcp_datagram_path(
     let (ttl_tx, ttl_rx) = oneshot::channel();
     let task = tokio::spawn(async move {
         let (stream, _) = listener.accept().await?;
-        let security = security();
-        let mut framed = EncryptedFramedStream::with_cipher_suite(
+        let mut framed = EncryptedFramedStream::accept(
             stream,
-            security.secret.as_bytes(),
-            PeerRole::Server,
+            &crate::transport::encrypted::test_server_tls_config(),
             CodecLimits::default(),
-            security.cipher,
         )
+        .await
         .expect("initialize encrypted stream");
-        let session_id = match framed.read_frame().await? {
-            Frame::SessionHello { session_id } => session_id,
-            _ => return Err(RuntimeError::Protocol("expected SESSION_HELLO")),
-        };
-        if !matches!(framed.read_frame().await?, Frame::SessionAuth { .. }) {
-            return Err(RuntimeError::Protocol("expected SESSION_AUTH"));
-        }
-        let path_id = match framed.read_frame().await? {
-            Frame::PathJoin { path_id, .. } => path_id,
-            _ => return Err(RuntimeError::Protocol("expected PATH_JOIN")),
-        };
+        let security = ServerSecurityConfig::for_test(
+            SharedSecret::new(b"0123456789abcdef0123456789abcdef".to_vec())
+                .expect("scripted server secret"),
+        );
+        let exporter = framed.tcp_admission_exporter()?;
+        let encoded = framed.read_tcp_admission().await?;
+        let authenticated = crate::runtime::path::tcp::admission::authenticate_prelude(
+            &security,
+            crate::runtime::path::authentication::ProductCredentialAdmission::from_security(
+                &security,
+            ),
+            &encoded,
+            &exporter,
+        )?
+        .ok_or(RuntimeError::Protocol("invalid TCP admission prelude"))?;
+        let joined = authenticated
+            .authenticate_path_join(UnderlayProtocol::Tcp, framed.read_frame().await?)?
+            .ok_or(RuntimeError::Protocol("invalid PATH_JOIN"))?;
+        let session_id = joined.session_id;
+        let path_id = joined.path_id;
         match framed.read_frame().await? {
             Frame::PathStatus {
                 path_id: status_path_id,
@@ -1737,6 +2156,7 @@ async fn udp_datagram_path_relays_direct_udp_target() {
     let response = client_udp_datagram_round_trip(
         &path,
         security(),
+        crate::transport::encrypted::test_client_tls_config(),
         ResourceLimits::default(),
         TargetAddr::Ip(target_addr),
         Bytes::from_static(b"ping"),
@@ -1754,14 +2174,18 @@ async fn udp_datagram_path_relays_direct_udp_target() {
 #[tokio::test]
 async fn udp_datagram_path_relays_upstream_socks5_udp_target() {
     let (proxy, proxy_task) = spawn_socks5_udp_proxy_once().await;
-    let (path, server) = spawn_udp_server_path(OutboundConfig::Socks5 { proxy }).await;
+    let (path, server) = spawn_udp_server_path(OutboundConfig::Socks5(
+        crate::outbound::ProxyConfig::new(proxy, None),
+    ))
+    .await;
 
     let response = client_udp_datagram_round_trip(
         &path,
         security(),
+        crate::transport::encrypted::test_client_tls_config(),
         ResourceLimits::default(),
         TargetAddr::Domain {
-            host: "example.com".to_string(),
+            host: "localhost".to_string(),
             port: 53,
         },
         Bytes::from_static(b"ping"),
@@ -1783,19 +2207,22 @@ async fn server_runtime_binds_udp_path_and_relays_direct_udp_datagram() {
     let server = tokio::spawn(run_server(
         vec![path.clone()],
         OutboundConfig::Direct,
-        DnsConfig::default(),
         DEFAULT_OUTBOUND_CONNECT_TIMEOUT,
-        security(),
+        test_server_destination_acl(),
+        server_security(),
+        crate::transport::encrypted::test_server_tls_config(),
         MppPerformanceConfig::default(),
         ResourceLimits::default(),
         SessionConfig::default(),
         ManagementConfig::default(),
+        None,
     ));
     tokio::time::sleep(Duration::from_millis(10)).await;
 
     let response = client_udp_datagram_round_trip(
         &path,
         security(),
+        crate::transport::encrypted::test_client_tls_config(),
         ResourceLimits::default(),
         TargetAddr::Ip(target_addr),
         Bytes::from_static(b"ping"),
@@ -1818,19 +2245,22 @@ async fn server_runtime_demuxes_concurrent_udp_peers_on_one_bind_path() {
     let server = tokio::spawn(run_server(
         vec![path.clone()],
         OutboundConfig::Direct,
-        DnsConfig::default(),
         DEFAULT_OUTBOUND_CONNECT_TIMEOUT,
-        security(),
+        test_server_destination_acl(),
+        server_security(),
+        crate::transport::encrypted::test_server_tls_config(),
         MppPerformanceConfig::default(),
         ResourceLimits::default(),
         SessionConfig::default(),
         ManagementConfig::default(),
+        None,
     ));
     tokio::time::sleep(Duration::from_millis(10)).await;
 
     let first = client_udp_datagram_round_trip(
         &path,
         security(),
+        crate::transport::encrypted::test_client_tls_config(),
         ResourceLimits::default(),
         TargetAddr::Ip(first_target_addr),
         Bytes::from_static(b"ping"),
@@ -1839,6 +2269,7 @@ async fn server_runtime_demuxes_concurrent_udp_peers_on_one_bind_path() {
     let second = client_udp_datagram_round_trip(
         &path,
         security(),
+        crate::transport::encrypted::test_client_tls_config(),
         ResourceLimits::default(),
         TargetAddr::Ip(second_target_addr),
         Bytes::from_static(b"ping"),
@@ -1871,8 +2302,11 @@ async fn socks5_udp_associate_relays_datagram_over_udp_path() {
     let handler = tokio::spawn(handle_socks5_client_stream(control_server, context));
 
     let relay_addr = open_socks5_udp_associate(&mut control_client).await;
+    let udp_client = UdpSocket::bind("127.0.0.1:0")
+        .await
+        .expect("UDP association client bind");
     for _ in 0..2 {
-        send_socks5_udp_ping(relay_addr, target_addr).await;
+        send_socks5_udp_ping(&udp_client, relay_addr, target_addr).await;
     }
     control_client.shutdown().await.expect("control shutdown");
 
@@ -1900,8 +2334,11 @@ async fn socks5_udp_associate_relays_datagram_over_encrypted_tcp_path() {
     let handler = tokio::spawn(handle_socks5_client_stream(control_server, context));
 
     let relay_addr = open_socks5_udp_associate(&mut control_client).await;
+    let udp_client = UdpSocket::bind("127.0.0.1:0")
+        .await
+        .expect("UDP association client bind");
     for _ in 0..2 {
-        send_socks5_udp_ping(relay_addr, target_addr).await;
+        send_socks5_udp_ping(&udp_client, relay_addr, target_addr).await;
     }
     control_client.shutdown().await.expect("control shutdown");
 
@@ -2356,13 +2793,15 @@ async fn socks5_udp_associate_does_not_block_fast_datagram_behind_slow_response(
     let server = tokio::spawn(run_server(
         vec![path.clone()],
         OutboundConfig::Direct,
-        DnsConfig::default(),
         DEFAULT_OUTBOUND_CONNECT_TIMEOUT,
-        security(),
+        test_server_destination_acl(),
+        server_security(),
+        crate::transport::encrypted::test_server_tls_config(),
         MppPerformanceConfig::default(),
         ResourceLimits::default(),
         SessionConfig::default(),
         ManagementConfig::default(),
+        None,
     ));
     tokio::time::sleep(Duration::from_millis(10)).await;
     let context =
@@ -2435,7 +2874,7 @@ async fn socks5_udp_associate_does_not_block_fast_datagram_behind_slow_response(
 }
 
 #[tokio::test]
-async fn server_verifies_auth_sequence_and_rejects_wrong_secret() {
+async fn tcp_server_rejects_wrong_secret_without_a_credential_or_protocol_oracle() {
     let path = reserve_tcp_path().await;
     let listener = bind_listener(&path).await.expect("bind");
     let server_path = path.clone();
@@ -2448,9 +2887,8 @@ async fn server_verifies_auth_sequence_and_rejects_wrong_secret() {
         } = new_identity_runtime(
             vec![server_path],
             OutboundConfig::Direct,
-            DnsConfig::default(),
             DEFAULT_OUTBOUND_CONNECT_TIMEOUT,
-            SecurityConfig::encrypted(
+            ServerSecurityConfig::for_test(
                 SharedSecret::new(b"fedcba9876543210fedcba9876543210".to_vec()).expect("secret"),
             ),
             MppPerformanceConfig::default(),
@@ -2462,25 +2900,44 @@ async fn server_verifies_auth_sequence_and_rejects_wrong_secret() {
     let stream = tcp::connect_path(&path, TcpConnectOptions::default())
         .await
         .expect("connect");
-    let mut client = EncryptedFramedStream::new(
+    let client_security = ClientSecurityConfig::for_test(
+        SharedSecret::new(b"0123456789abcdef0123456789abcdef".to_vec()).expect("secret"),
+    );
+    let mut client = EncryptedFramedStream::connect(
         stream,
-        b"0123456789abcdef",
-        PeerRole::Client,
+        &crate::transport::encrypted::test_client_tls_config(),
         CodecLimits::default(),
     )
-    .expect("initialize encrypted stream");
+    .await
+    .expect("initialize TLS stream");
+    let exporter = client
+        .tcp_admission_exporter()
+        .expect("client TLS exporter");
+    let (prelude, path_join) =
+        crate::runtime::path::tcp::admission::ClientTcpPathAuthentication::for_new_session(
+            &client_security,
+            PathId(0),
+            &exporter,
+        )
+        .expect("TCP authentication")
+        .into_parts();
     client
-        .write_frame(&Frame::SessionHello {
-            session_id: SessionId(1),
-        })
+        .write_tcp_admission(&prelude, &[path_join])
         .await
         .expect("write");
     client.flush().await.expect("flush");
 
-    assert!(matches!(
-        server.await.expect("join"),
-        Err(RuntimeError::Encrypted(
-            EncryptedFramedTransportError::Crypto
-        ))
-    ));
+    let rejection = client.read_frame().await;
+    assert!(
+        matches!(
+            &rejection,
+            Err(crate::transport::encrypted::EncryptedFramedTransportError::Io(error))
+                if error.kind() == std::io::ErrorKind::UnexpectedEof
+        ),
+        "wrong-secret admission must close before any application frame: {rejection:?}"
+    );
+    server
+        .await
+        .expect("join")
+        .expect("uniform public rejection");
 }

@@ -1,5 +1,5 @@
 use super::*;
-use crate::config::{ResourceLimits, SecurityConfig, SharedSecret};
+use crate::config::{ClientSecurityConfig, ResourceLimits, SharedSecret};
 use crate::protocol::{PathId, TargetAddr};
 use crate::runtime::path::commands::{ReliablePathCommandSender, reliable_path_command_channels};
 use crate::runtime::stream::{ReliablePathStream, ReliablePathStreamOutput};
@@ -220,7 +220,7 @@ async fn product_stall_on_a_sole_carrier_requests_an_alternative() {
 
 #[tokio::test]
 async fn product_stall_recovery_open_is_owned_by_a_pending_task() {
-    let security = SecurityConfig::encrypted(
+    let security = ClientSecurityConfig::for_test(
         SharedSecret::new(b"0123456789abcdef0123456789abcdef".to_vec()).expect("secret"),
     );
     let context = ClientPathContext::new(

@@ -6,13 +6,11 @@
 #[cfg(feature = "lab-diagnostics")]
 use crate::lab_diagnostics::lab_diagnostic;
 use crate::model::capacity::{
-    reliable_relay_buffer_len, reliable_stream_initial_advertised_window_bytes,
+    RELIABLE_STREAM_ATTACHMENT_ACCEPT_MAX_OFFSET, reliable_relay_buffer_len,
 };
 #[cfg(feature = "lab-diagnostics")]
 use crate::protocol::frame::stream_ack_contiguous_frontier;
-use crate::protocol::{
-    Frame, PathId, SessionId, StreamDemandHint, StreamId, TargetAddr, UnderlayProtocol,
-};
+use crate::protocol::{Frame, PathId, SessionId, StreamDemandHint, StreamId, TargetAddr};
 use crate::runtime::error::RuntimeError;
 use crate::runtime::path::commands::ReliablePathCommandSender;
 use crate::runtime::path::server_context::ServerPathContext;
@@ -49,7 +47,9 @@ impl ServerTcpStreamState {
         target: TargetAddr,
         demand: StreamDemandHint,
     ) -> Result<Option<Frame>, RuntimeError> {
-        context.reliable_streams.validate_target(&target)?;
+        context
+            .reliable_streams
+            .validate_target(path_registration, &target)?;
         let lane = traffic_class_from_stream_demand_hint(demand);
         let response = match context
             .reliable_streams
@@ -75,11 +75,9 @@ impl ServerTcpStreamState {
                 self.attached.insert(stream_id);
                 Some(Frame::StreamMaxData {
                     stream_id,
-                    max_offset: reliable_stream_initial_advertised_window_bytes(
-                        UnderlayProtocol::Tcp,
-                        lane,
-                        context.mux_limits,
-                    ),
+                    // This frame accepts an attachment; it does not create a
+                    // second receive window for the logical stream.
+                    max_offset: RELIABLE_STREAM_ATTACHMENT_ACCEPT_MAX_OFFSET,
                 })
             }
             ServerStreamOpenOutcome::DuplicateLiveIgnored => Some(Frame::StreamReset {

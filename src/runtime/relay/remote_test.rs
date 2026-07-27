@@ -1,5 +1,5 @@
 use super::*;
-use crate::config::{ResourceLimits, SecurityConfig, SharedSecret};
+use crate::config::{ClientSecurityConfig, ResourceLimits, SharedSecret};
 use crate::model::capacity::{
     PATH_OPEN_SCORE_BYTES, adaptive_reliable_relay_chunk_bytes, relay_lane_startup_chunk_bytes,
     reliable_relay_buffer_len,
@@ -23,8 +23,8 @@ use std::collections::HashSet;
 use std::time::Duration;
 use tokio::sync::mpsc;
 
-fn security() -> SecurityConfig {
-    SecurityConfig::encrypted(
+fn security() -> ClientSecurityConfig {
+    ClientSecurityConfig::for_test(
         SharedSecret::new(b"0123456789abcdef0123456789abcdef".to_vec()).expect("secret"),
     )
 }

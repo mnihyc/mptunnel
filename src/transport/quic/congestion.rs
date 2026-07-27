@@ -8,6 +8,8 @@ use tokio::sync::Notify;
 
 #[derive(Debug, Clone, Copy)]
 pub struct CongestionMetrics {
+    /// Monotonic identity of the current network-path congestion model.
+    pub path_epoch: u64,
     pub congestion_window: u64,
     pub bytes_in_flight: Option<u64>,
     pub pending_bytes: u64,
@@ -32,6 +34,16 @@ pub(super) struct InstrumentedBbrConfig;
 
 #[derive(Debug, Default)]
 pub(super) struct QuicCarrierTelemetry {
+    next_path_epoch: AtomicU64,
+    current_path_epoch: AtomicU64,
+    delivery_evidence_written_bytes: AtomicU64,
+    delivery_evidence_pending_ack_bytes: AtomicU64,
+    delivery_activity_started: Arc<Notify>,
+}
+
+#[derive(Debug, Default)]
+struct QuicPathTelemetry {
+    path_epoch: u64,
     bytes_in_flight: AtomicU64,
     bytes_in_flight_authoritative: AtomicBool,
     // Quinn invokes congestion callbacks through one mutable controller. The
@@ -48,9 +60,6 @@ pub(super) struct QuicCarrierTelemetry {
     ack_snapshot_cursor: Mutex<QuicAckTelemetryTotals>,
     sent_bytes: AtomicU64,
     lost_bytes: AtomicU64,
-    delivery_evidence_written_bytes: AtomicU64,
-    delivery_evidence_pending_ack_bytes: AtomicU64,
-    delivery_activity_started: Arc<Notify>,
     app_limited: AtomicBool,
 }
 
@@ -67,6 +76,7 @@ struct QuicAckTelemetryTotals {
 
 #[derive(Debug, Clone, Copy)]
 pub(super) struct QuicCarrierTelemetrySnapshot {
+    pub(super) path_epoch: u64,
     pub(super) bytes_in_flight: Option<u64>,
     pub(super) newly_acked_bytes: Option<u64>,
     pub(super) non_app_limited_acked_bytes: Option<u64>,
@@ -83,6 +93,7 @@ pub(super) struct QuicCarrierTelemetrySnapshot {
 pub(super) struct InstrumentedController {
     inner: Box<dyn quinn::congestion::Controller>,
     pub(super) telemetry: Arc<QuicCarrierTelemetry>,
+    path_telemetry: Arc<QuicPathTelemetry>,
     ack_batch_acked_bytes: u64,
     ack_batch_non_app_limited_acked_bytes: u64,
     ack_batch_sample_count: u64,
@@ -132,6 +143,34 @@ impl QuicCarrierTelemetry {
         self.delivery_activity_started.clone()
     }
 
+    fn allocate_path_telemetry(&self) -> Arc<QuicPathTelemetry> {
+        let previous = self
+            .next_path_epoch
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |epoch| {
+                epoch.checked_add(1)
+            })
+            .expect("QUIC path epoch exhausted");
+        let path_epoch = previous + 1;
+        self.current_path_epoch.store(path_epoch, Ordering::Release);
+        Arc::new(QuicPathTelemetry {
+            path_epoch,
+            ..QuicPathTelemetry::default()
+        })
+    }
+
+    fn reconcile_delivery_evidence_ack(&self, path_epoch: u64, acked_bytes: u64) {
+        if acked_bytes == 0 || self.current_path_epoch.load(Ordering::Acquire) != path_epoch {
+            return;
+        }
+        let _ = self.delivery_evidence_pending_ack_bytes.fetch_update(
+            Ordering::AcqRel,
+            Ordering::Acquire,
+            |pending| Some(pending.saturating_sub(acked_bytes)),
+        );
+    }
+}
+
+impl QuicPathTelemetry {
     pub(super) fn bytes_in_flight(&self) -> Option<u64> {
         self.bytes_in_flight_authoritative
             .load(Ordering::Acquire)
@@ -209,6 +248,7 @@ impl QuicCarrierTelemetry {
         });
         let bytes_in_flight = self.bytes_in_flight();
         QuicCarrierTelemetrySnapshot {
+            path_epoch: self.path_epoch,
             bytes_in_flight,
             newly_acked_bytes: (newly_acked_bytes > 0).then_some(newly_acked_bytes),
             non_app_limited_acked_bytes: (non_app_limited_acked_bytes > 0)
@@ -262,13 +302,6 @@ impl QuicCarrierTelemetry {
         self.bytes_in_flight_authoritative
             .store(true, Ordering::Release);
         self.app_limited.store(app_limited, Ordering::Relaxed);
-        if totals.acked_bytes > 0 {
-            let _ = self.delivery_evidence_pending_ack_bytes.fetch_update(
-                Ordering::AcqRel,
-                Ordering::Acquire,
-                |pending| Some(pending.saturating_sub(totals.acked_bytes)),
-            );
-        }
     }
 
     fn add_lost(&self, lost_bytes: u64) {
@@ -287,9 +320,19 @@ impl InstrumentedController {
         inner: Box<dyn quinn::congestion::Controller>,
         telemetry: Arc<QuicCarrierTelemetry>,
     ) -> Self {
+        let path_telemetry = telemetry.allocate_path_telemetry();
+        Self::for_path(inner, telemetry, path_telemetry)
+    }
+
+    fn for_path(
+        inner: Box<dyn quinn::congestion::Controller>,
+        telemetry: Arc<QuicCarrierTelemetry>,
+        path_telemetry: Arc<QuicPathTelemetry>,
+    ) -> Self {
         Self {
             inner,
             telemetry,
+            path_telemetry,
             ack_batch_acked_bytes: 0,
             ack_batch_non_app_limited_acked_bytes: 0,
             ack_batch_sample_count: 0,
@@ -299,6 +342,10 @@ impl InstrumentedController {
             last_non_app_limited_ack: None,
             non_app_limited_sent_high_watermark: None,
         }
+    }
+
+    pub(super) fn snapshot(&self) -> QuicCarrierTelemetrySnapshot {
+        self.path_telemetry.snapshot()
     }
 
     fn accumulate_ack_telemetry(&mut self, sent: Instant, bytes: u64, app_limited: bool) {
@@ -385,8 +432,10 @@ impl InstrumentedController {
                     }),
             );
         }
-        self.telemetry
+        self.path_telemetry
             .publish_ack_batch(totals, in_flight, app_limited);
+        self.telemetry
+            .reconcile_delivery_evidence_ack(self.path_telemetry.path_epoch, totals.acked_bytes);
     }
 }
 
@@ -406,7 +455,11 @@ impl quinn::congestion::ControllerFactory for InstrumentedBbrConfig {
         // overload weaker/shared paths. BBR's delivery-rate/RTT model is the
         // stable production default for feeding the product multipath scheduler;
         // QUIC still owns packet pacing, loss recovery, and bytes in flight.
-        let inner = Arc::new(quinn::congestion::BbrConfig::default()).build(now, current_mtu);
+        let inner = quinn::congestion::ControllerFactory::build(
+            Arc::new(quinn::congestion::BbrConfig::default()),
+            now,
+            current_mtu,
+        );
         Box::new(InstrumentedController::new(
             inner,
             Arc::new(QuicCarrierTelemetry::default()),
@@ -416,7 +469,7 @@ impl quinn::congestion::ControllerFactory for InstrumentedBbrConfig {
 
 impl quinn::congestion::Controller for InstrumentedController {
     fn on_sent(&mut self, now: Instant, bytes: u64, last_packet_number: u64) {
-        self.telemetry.add_sent(bytes);
+        self.path_telemetry.add_sent(bytes);
         self.inner.on_sent(now, bytes, last_packet_number);
     }
 
@@ -450,12 +503,20 @@ impl quinn::congestion::Controller for InstrumentedController {
         sent: Instant,
         bytes: u64,
         app_limited: bool,
+        packet_number: u64,
         packet_state: Option<quinn::congestion::PacketDeliveryState>,
         rtt: &quinn_proto::RttEstimator,
     ) {
         self.accumulate_ack_telemetry(sent, bytes, app_limited);
-        self.inner
-            .on_ack_with_packet_state(now, sent, bytes, app_limited, packet_state, rtt);
+        self.inner.on_ack_with_packet_state(
+            now,
+            sent,
+            bytes,
+            app_limited,
+            packet_number,
+            packet_state,
+            rtt,
+        );
     }
 
     fn on_end_acks(
@@ -477,7 +538,7 @@ impl quinn::congestion::Controller for InstrumentedController {
         is_persistent_congestion: bool,
         lost_bytes: u64,
     ) {
-        self.telemetry.add_lost(lost_bytes);
+        self.path_telemetry.add_lost(lost_bytes);
         self.inner
             .on_congestion_event(now, sent, is_persistent_congestion, lost_bytes);
     }
@@ -502,6 +563,7 @@ impl quinn::congestion::Controller for InstrumentedController {
         Box::new(Self {
             inner: self.inner.clone_box(),
             telemetry: self.telemetry.clone(),
+            path_telemetry: self.path_telemetry.clone(),
             ack_batch_acked_bytes: self.ack_batch_acked_bytes,
             ack_batch_non_app_limited_acked_bytes: self.ack_batch_non_app_limited_acked_bytes,
             ack_batch_sample_count: self.ack_batch_sample_count,
@@ -511,6 +573,27 @@ impl quinn::congestion::Controller for InstrumentedController {
             last_non_app_limited_ack: self.last_non_app_limited_ack,
             non_app_limited_sent_high_watermark: self.non_app_limited_sent_high_watermark,
         })
+    }
+
+    fn fresh_path_box(
+        &self,
+        now: Instant,
+        current_mtu: u16,
+    ) -> Option<Box<dyn quinn::congestion::Controller>> {
+        // InstrumentedBbrConfig is the sole production constructor for this
+        // wrapper, so a fresh path always starts a fresh BBR model. Only the
+        // connection-scoped evidence owner survives the network transition.
+        let inner = quinn::congestion::ControllerFactory::build(
+            Arc::new(quinn::congestion::BbrConfig::default()),
+            now,
+            current_mtu,
+        );
+        let path_telemetry = self.telemetry.allocate_path_telemetry();
+        Some(Box::new(Self::for_path(
+            inner,
+            self.telemetry.clone(),
+            path_telemetry,
+        )))
     }
 
     fn initial_window(&self) -> u64 {

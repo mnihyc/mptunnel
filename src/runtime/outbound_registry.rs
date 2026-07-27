@@ -1,0 +1,2258 @@
+//! Unified Product outbound registry.
+//!
+//! Selection, pre-commit gateway failover, and connector opening happen once
+//! per Product flow. The returned concrete branch is then pinned for the flow
+//! lifetime and no routing or gateway decision enters payload forwarding.
+
+use crate::config::{
+    DEFAULT_OUTBOUND_CONNECT_TIMEOUT, GatewayBalancerConfig, RouteTarget, RouteTargetKind,
+};
+use crate::dns::{
+    DirectDnsBackendFactory, DnsBackendError, DnsBackendFactory, DnsGeneration,
+    DnsNativeSocketPolicy, DnsQueryBackend, DnsRuntimeError, DnsTcpConnectFuture, DnsTcpConnector,
+    DnsTcpStream, DohDnsBackend, RoutedTcpDnsBackend,
+};
+use crate::outbound::{
+    self, DestinationAuthorizer, OutboundConfig, OutboundTcpStream, OutboundUdpSocket,
+};
+use crate::performance::MppPerformanceConfig;
+use crate::product::{
+    AuthorizedTarget, BalancerId, CompiledDnsPlan, CompiledDnsUpstream, DnsEgressSpec, DnsPlanId,
+    EgressAction, FlowContext, GatewayMemberMode, Network, NetworkSet, OutboundId,
+    PendingProductFlow, ProductAdmission, ProductFlowLease as ProductAdmissionLease,
+    ProductOutboundFlow, ProtocolTarget,
+};
+use crate::protocol::TargetAddr;
+use crate::runtime::error::RuntimeError;
+use crate::runtime::gateway::{ClientGatewayRuntime, GatewayFlowLease, GatewayRuntimeSnapshot};
+use crate::runtime::path::ClientPathContext;
+use crate::runtime::relay::open::{ReliableRelayOpenSpec, open_remote_stream};
+use crate::runtime::stream::OpenedRemoteStream;
+use crate::runtime::telemetry::{
+    ObservedProductIo, ProductFlowCounter, ProductFlowLease as RuntimeProductFlowLease,
+    ProductFlowOriginKind, ProductFlowScope, RuntimeTelemetry,
+};
+use crate::scheduler::TrafficClass;
+use crate::transport::NativeSocketConfigurator;
+use std::collections::HashMap;
+use std::net::{IpAddr, SocketAddr};
+use std::sync::{Arc, OnceLock};
+use std::time::Duration;
+use tokio::io::{AsyncRead, AsyncWrite};
+
+const MAX_CONCURRENT_GATEWAY_PROBES: usize = 4;
+
+fn gateway_probe_permits() -> Arc<tokio::sync::Semaphore> {
+    static PERMITS: OnceLock<Arc<tokio::sync::Semaphore>> = OnceLock::new();
+    PERMITS
+        .get_or_init(|| Arc::new(tokio::sync::Semaphore::new(MAX_CONCURRENT_GATEWAY_PROBES)))
+        .clone()
+}
+
+#[derive(Clone)]
+pub(in crate::runtime) struct RuntimeOutboundRegistry {
+    shell: RuntimeOutboundRegistryShell,
+    dns: DnsGeneration,
+}
+
+#[derive(Clone)]
+pub(in crate::runtime) struct RuntimeOutboundRegistryShell {
+    leaves: Arc<HashMap<OutboundId, Arc<RuntimeOutboundLeaf>>>,
+    balancers: Arc<HashMap<BalancerId, ClientGatewayRuntime>>,
+    product_admission: ProductAdmission,
+    product_telemetry: RuntimeTelemetry,
+}
+
+#[derive(Clone)]
+pub(in crate::runtime) struct GatewayRuntimeControl {
+    balancers: Arc<HashMap<BalancerId, ClientGatewayRuntime>>,
+}
+
+#[derive(Debug, Clone)]
+pub(in crate::runtime) struct NamedGatewayRuntimeSnapshot {
+    pub(in crate::runtime) id: BalancerId,
+    pub(in crate::runtime) runtime: GatewayRuntimeSnapshot,
+}
+
+/// DNS factory over the already-validated native subset of the outbound
+/// registry. It exists only while an immutable DNS generation is compiled.
+pub(in crate::runtime) struct RuntimeOutboundDnsBackendFactory {
+    shell: RuntimeOutboundRegistryShell,
+    direct_policy: DnsNativeSocketPolicy,
+}
+
+#[derive(Clone)]
+struct LocalOutboundDnsTcpConnector {
+    config: OutboundConfig,
+    connect_timeout: Duration,
+    native_sockets: Arc<dyn NativeSocketConfigurator>,
+}
+
+impl DnsTcpConnector for LocalOutboundDnsTcpConnector {
+    fn connect(&self, bootstrap: SocketAddr, timeout: Duration) -> DnsTcpConnectFuture {
+        let config = self.config.clone();
+        let timeout = timeout.min(self.connect_timeout);
+        let native_sockets = self.native_sockets.clone();
+        Box::pin(async move {
+            outbound::connect_tcp_literal_target_with_configurator(
+                &config,
+                bootstrap,
+                timeout,
+                native_sockets.as_ref(),
+            )
+            .await
+            .map(|stream| Box::new(stream) as DnsTcpStream)
+            .map_err(|error| match error {
+                outbound::OutboundConnectError::ConnectTimeout
+                | outbound::OutboundConnectError::ProxyTimeout => DnsBackendError::Timeout,
+                error => DnsBackendError::Failed(error.to_string()),
+            })
+        })
+    }
+}
+
+#[derive(Clone)]
+struct MppOutboundDnsTcpConnector {
+    context: ClientPathContext,
+    performance: MppPerformanceConfig,
+}
+
+impl DnsTcpConnector for MppOutboundDnsTcpConnector {
+    fn connect(&self, bootstrap: SocketAddr, timeout: Duration) -> DnsTcpConnectFuture {
+        const DNS_MPP_RELAY_BUFFER_BYTES: usize = 64 * 1024;
+
+        let context = self.context.clone();
+        let performance = self.performance;
+        Box::pin(async move {
+            let target = TargetAddr::Ip(bootstrap);
+            let remote = tokio::time::timeout(
+                timeout,
+                open_remote_stream(&context, target.clone(), TrafficClass::Latency),
+            )
+            .await
+            .map_err(|_| DnsBackendError::Timeout)?
+            .map_err(|error| DnsBackendError::Failed(error.to_string()))?;
+            let (dns_side, relay_side) = tokio::io::duplex(DNS_MPP_RELAY_BUFFER_BYTES);
+            tokio::spawn({
+                let context = context.clone();
+                async move {
+                    let _ = crate::runtime::relay::control::relay_migrating_tcp_stream(
+                        relay_side,
+                        &context,
+                        performance,
+                        ReliableRelayOpenSpec { target },
+                        remote,
+                    )
+                    .await;
+                }
+            });
+            Ok(Box::new(dns_side) as DnsTcpStream)
+        })
+    }
+}
+
+// Leaves are allocated once behind `Arc` during generation compilation.
+// Boxing only the MPP variant would add an extra steady selection dereference
+// without reducing any per-flow allocation.
+#[allow(clippy::large_enum_variant)]
+pub(in crate::runtime) enum RuntimeOutboundLeaf {
+    Mpp {
+        id: OutboundId,
+        context: ClientPathContext,
+        performance: MppPerformanceConfig,
+    },
+    Local {
+        id: OutboundId,
+        config: OutboundConfig,
+        connect_timeout: Duration,
+        native_sockets: Arc<dyn NativeSocketConfigurator>,
+    },
+}
+
+impl RuntimeOutboundLeaf {
+    pub(in crate::runtime) const fn id(&self) -> &OutboundId {
+        match self {
+            Self::Mpp { id, .. } | Self::Local { id, .. } => id,
+        }
+    }
+
+    pub(in crate::runtime) fn networks(&self) -> NetworkSet {
+        match self {
+            Self::Mpp { .. } => NetworkSet::TCP_UDP,
+            Self::Local { config, .. } if config.supports_udp_targets() => NetworkSet::TCP_UDP,
+            Self::Local { .. } => NetworkSet::TCP,
+        }
+    }
+
+    const fn is_local(&self) -> bool {
+        matches!(self, Self::Local { .. })
+    }
+
+    const fn open_timeout(&self) -> Duration {
+        match self {
+            Self::Mpp { .. } => DEFAULT_OUTBOUND_CONNECT_TIMEOUT,
+            Self::Local {
+                connect_timeout, ..
+            } => *connect_timeout,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(in crate::runtime) enum OutboundSelector {
+    Leaf(OutboundId),
+    Balancer(BalancerId),
+}
+
+// This is the one-time handoff into a concrete relay branch. Boxing the MPP
+// side would add one heap allocation to every selected MPP flow.
+#[allow(clippy::large_enum_variant)]
+pub(in crate::runtime) enum OpenedTcpOutbound {
+    Mpp {
+        context: ClientPathContext,
+        performance: MppPerformanceConfig,
+        remote: OpenedRemoteStream,
+        spec: ReliableRelayOpenSpec,
+        _gateway_lease: Option<GatewayFlowLease>,
+        _product_flow: OpenedProductFlow,
+    },
+    Local {
+        stream: OutboundTcpStream,
+        _gateway_lease: Option<GatewayFlowLease>,
+        _product_flow: OpenedProductFlow,
+    },
+}
+
+// This is consumed before the payload loop; keep it allocation-free per flow.
+#[allow(clippy::large_enum_variant)]
+pub(in crate::runtime) enum OpenedUdpOutbound {
+    Mpp {
+        context: ClientPathContext,
+        target: TargetAddr,
+        traffic_class: TrafficClass,
+        gateway_lease: Option<GatewayFlowLease>,
+        product_flow: OpenedProductFlow,
+    },
+    Local {
+        socket: OutboundUdpSocket,
+        _gateway_lease: Option<GatewayFlowLease>,
+        _product_flow: OpenedProductFlow,
+    },
+}
+
+struct ProductLeafOpen<'a> {
+    authorized: &'a [AuthorizedTarget],
+    dns_plan: Option<&'a DnsPlanId>,
+    traffic_class: TrafficClass,
+    deadline: tokio::time::Instant,
+    gateway_lease: Option<GatewayFlowLease>,
+    scope: ProductFlowScope,
+    observe_native: bool,
+}
+
+/// Product ownership retained for the lifetime of one concrete opened branch.
+///
+/// Admission and runtime observation have independent lifecycles but share the
+/// same immutable route identity. Server MPP flows retain only admission here
+/// because their existing MPP boundary is the sole traffic observer.
+pub(in crate::runtime) struct OpenedProductFlow {
+    scope: ProductFlowScope,
+    admission: Option<ProductAdmissionLease>,
+    runtime: Option<RuntimeProductFlowLease>,
+}
+
+impl OpenedProductFlow {
+    fn new(
+        scope: ProductFlowScope,
+        telemetry: Option<&RuntimeTelemetry>,
+        network: Network,
+    ) -> Self {
+        let runtime = telemetry.map(|telemetry| match network {
+            Network::Tcp => telemetry.open_native_reliable_flow(scope.clone()),
+            Network::Udp => telemetry.open_native_datagram_flow(scope.clone()),
+        });
+        Self {
+            scope,
+            admission: None,
+            runtime,
+        }
+    }
+
+    pub(in crate::runtime) fn scope(&self) -> &ProductFlowScope {
+        &self.scope
+    }
+
+    pub(in crate::runtime) fn runtime_counter(&self) -> Option<ProductFlowCounter> {
+        self.runtime.as_ref().map(RuntimeProductFlowLease::counter)
+    }
+
+    pub(in crate::runtime) fn complete_runtime(&mut self) {
+        if let Some(runtime) = self.runtime.take() {
+            runtime.complete();
+        }
+    }
+
+    fn attach_admission(&mut self, admission: ProductAdmissionLease) {
+        assert!(
+            self.admission.replace(admission).is_none(),
+            "Product flow admission attached more than once"
+        );
+    }
+}
+
+impl OpenedTcpOutbound {
+    pub(in crate::runtime) fn with_product_flow(
+        mut self,
+        product_flow: ProductAdmissionLease,
+    ) -> Self {
+        let owner = match &mut self {
+            Self::Mpp { _product_flow, .. } | Self::Local { _product_flow, .. } => _product_flow,
+        };
+        owner.attach_admission(product_flow);
+        self
+    }
+}
+
+impl OpenedUdpOutbound {
+    pub(in crate::runtime) fn with_product_flow(
+        mut self,
+        product_flow: ProductAdmissionLease,
+    ) -> Self {
+        let owner = match &mut self {
+            Self::Mpp { product_flow, .. } => product_flow,
+            Self::Local { _product_flow, .. } => _product_flow,
+        };
+        owner.attach_admission(product_flow);
+        self
+    }
+}
+
+pub(in crate::runtime) async fn relay_opened_tcp<S>(
+    local: S,
+    opened: OpenedTcpOutbound,
+) -> Result<(), RuntimeError>
+where
+    S: AsyncRead + AsyncWrite + Unpin,
+{
+    match opened {
+        OpenedTcpOutbound::Mpp {
+            context,
+            performance,
+            remote,
+            spec,
+            mut _gateway_lease,
+            _product_flow,
+        } => {
+            let result = crate::runtime::relay::control::relay_migrating_tcp_stream(
+                local,
+                &context,
+                performance,
+                spec,
+                remote,
+            )
+            .await
+            .map(|_| ());
+            finish_gateway_flow(&mut _gateway_lease, &result);
+            result?;
+        }
+        OpenedTcpOutbound::Local {
+            stream,
+            mut _gateway_lease,
+            mut _product_flow,
+        } => {
+            let counter = _product_flow
+                .runtime_counter()
+                .ok_or(RuntimeError::Protocol(
+                    "local Product TCP flow is missing its runtime observer",
+                ))?;
+            let mut local = ObservedProductIo::new(local, counter);
+            let result = match stream {
+                OutboundTcpStream::Plain(mut remote) => {
+                    tokio::io::copy_bidirectional(&mut local, &mut remote)
+                        .await
+                        .map(|_| ())
+                        .map_err(RuntimeError::from)
+                }
+                OutboundTcpStream::Tls(mut remote) => {
+                    tokio::io::copy_bidirectional(&mut local, remote.as_mut())
+                        .await
+                        .map(|_| ())
+                        .map_err(RuntimeError::from)
+                }
+            };
+            finish_gateway_flow(&mut _gateway_lease, &result);
+            if result.is_ok() {
+                _product_flow.complete_runtime();
+            }
+            result?;
+        }
+    }
+    Ok(())
+}
+
+pub(in crate::runtime) fn finish_gateway_flow(
+    lease: &mut Option<GatewayFlowLease>,
+    outcome: &Result<(), RuntimeError>,
+) {
+    let Some(lease) = lease.as_mut() else {
+        return;
+    };
+    let error = outcome.as_ref().err().map(ToString::to_string);
+    if let Err(feedback) = lease.completed(error) {
+        crate::observability::process_event!(
+            Warn,
+            "gateway",
+            "flow_outcome_feedback_failed",
+            "gateway flow-outcome feedback failed: {feedback}"
+        );
+    }
+}
+
+impl RuntimeOutboundRegistry {
+    #[cfg(test)]
+    pub(in crate::runtime) fn compile(
+        leaves: impl IntoIterator<Item = RuntimeOutboundLeaf>,
+        balancer_configs: &[GatewayBalancerConfig],
+        dns: DnsGeneration,
+    ) -> Result<Self, RuntimeError> {
+        Ok(RuntimeOutboundRegistryShell::compile(leaves, balancer_configs)?.with_dns(dns))
+    }
+
+    pub(in crate::runtime) fn selector_for_action(
+        &self,
+        action: &EgressAction,
+    ) -> Result<OutboundSelector, RuntimeError> {
+        self.shell.selector_for_action(action)
+    }
+
+    pub(in crate::runtime) const fn dns(&self) -> &DnsGeneration {
+        &self.dns
+    }
+
+    pub(in crate::runtime) fn product_admission(&self) -> &ProductAdmission {
+        self.shell.product_admission()
+    }
+
+    pub(in crate::runtime) fn gateway_control(&self) -> GatewayRuntimeControl {
+        GatewayRuntimeControl {
+            balancers: self.shell.balancers.clone(),
+        }
+    }
+
+    pub(in crate::runtime) fn try_admit_product_flow(
+        &self,
+        flow: &FlowContext,
+    ) -> Result<PendingProductFlow, RuntimeError> {
+        self.shell
+            .product_admission()
+            .try_admit_flow(flow.principal().clone(), flow.target().clone())
+            .map_err(RuntimeError::ProductAdmission)
+    }
+
+    pub(in crate::runtime) fn spawn_gateway_probe_services(
+        &self,
+        services: &mut tokio::task::JoinSet<Result<(), RuntimeError>>,
+    ) {
+        let permits = gateway_probe_permits();
+        for (id, runtime) in self.shell.balancers.iter() {
+            let Some(policy) = runtime.probe_policy().cloned() else {
+                continue;
+            };
+            services.spawn(run_gateway_probe_service(
+                self.clone(),
+                id.clone(),
+                runtime.clone(),
+                policy,
+                permits.clone(),
+            ));
+        }
+    }
+
+    /// One absolute transaction deadline shared by DNS, post-resolution route
+    /// groups, gateway members, and MPP path attempts for a Product flow.
+    pub(in crate::runtime) fn flow_open_deadline(&self) -> tokio::time::Instant {
+        let timeout = self
+            .shell
+            .leaves
+            .values()
+            .map(|leaf| leaf.open_timeout())
+            .max()
+            .unwrap_or(DEFAULT_OUTBOUND_CONNECT_TIMEOUT);
+        tokio::time::Instant::now() + timeout
+    }
+
+    pub(in crate::runtime) fn selector_for_target(
+        &self,
+        target: &RouteTarget,
+    ) -> Result<OutboundSelector, RuntimeError> {
+        self.shell.selector_for_target(target)
+    }
+
+    /// Proves the server-side no-chaining invariant at runtime assembly.
+    ///
+    /// Configuration validation performs the same check, but server services
+    /// retain this defense so a hand-built runtime cannot forward one MPP
+    /// session into another MPP session.
+    pub(in crate::runtime) fn ensure_native_selector(
+        &self,
+        selector: &OutboundSelector,
+    ) -> Result<(), RuntimeError> {
+        self.shell.ensure_native_selector(selector)
+    }
+
+    pub(in crate::runtime) async fn open_tcp(
+        &self,
+        selector: &OutboundSelector,
+        target: &TargetAddr,
+        dns_plan: Option<&DnsPlanId>,
+        traffic_class: TrafficClass,
+        authorizer: &dyn DestinationAuthorizer,
+    ) -> Result<OpenedTcpOutbound, RuntimeError> {
+        let deadline = self.flow_open_deadline();
+        let flow = authorizer
+            .flow(Network::Tcp, target)
+            .map_err(|error| RuntimeError::DestinationDenied(error.to_string()))?;
+        let pending = self.try_admit_product_flow(&flow)?;
+        let authorized = outbound::resolve_authorized_target_before(
+            &self.dns,
+            dns_plan,
+            authorizer,
+            Network::Tcp,
+            target,
+            deadline,
+        )
+        .await?;
+        let (opened, outbound) = self
+            .open_authorized_tcp_for_origin(
+                &pending,
+                selector,
+                &authorized,
+                dns_plan,
+                traffic_class,
+                deadline,
+                ProductFlowOriginKind::MppInbound,
+                false,
+            )
+            .await?;
+        Ok(opened.with_product_flow(pending.commit(outbound)))
+    }
+
+    pub(in crate::runtime) async fn open_udp(
+        &self,
+        selector: &OutboundSelector,
+        target: &TargetAddr,
+        dns_plan: Option<&DnsPlanId>,
+        authorizer: &dyn DestinationAuthorizer,
+    ) -> Result<OpenedUdpOutbound, RuntimeError> {
+        let deadline = self.flow_open_deadline();
+        let flow = authorizer
+            .flow(Network::Udp, target)
+            .map_err(|error| RuntimeError::DestinationDenied(error.to_string()))?;
+        let pending = self.try_admit_product_flow(&flow)?;
+        let authorized = outbound::resolve_authorized_target_before(
+            &self.dns,
+            dns_plan,
+            authorizer,
+            Network::Udp,
+            target,
+            deadline,
+        )
+        .await?;
+        let (opened, outbound) = self
+            .open_authorized_udp_for_origin(
+                &pending,
+                selector,
+                &authorized,
+                dns_plan,
+                TrafficClass::RealtimeDatagram,
+                deadline,
+                ProductFlowOriginKind::MppInbound,
+                false,
+            )
+            .await?;
+        Ok(opened.with_product_flow(pending.commit(outbound)))
+    }
+
+    pub(in crate::runtime) async fn open_authorized_tcp(
+        &self,
+        pending: &PendingProductFlow,
+        selector: &OutboundSelector,
+        authorized: &[AuthorizedTarget],
+        dns_plan: Option<&DnsPlanId>,
+        traffic_class: TrafficClass,
+        deadline: tokio::time::Instant,
+    ) -> Result<(OpenedTcpOutbound, ProductOutboundFlow), RuntimeError> {
+        self.open_authorized_tcp_for_origin(
+            pending,
+            selector,
+            authorized,
+            dns_plan,
+            traffic_class,
+            deadline,
+            ProductFlowOriginKind::LocalInbound,
+            true,
+        )
+        .await
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn open_authorized_tcp_for_origin(
+        &self,
+        pending: &PendingProductFlow,
+        selector: &OutboundSelector,
+        authorized: &[AuthorizedTarget],
+        dns_plan: Option<&DnsPlanId>,
+        traffic_class: TrafficClass,
+        deadline: tokio::time::Instant,
+        origin_kind: ProductFlowOriginKind,
+        observe_native: bool,
+    ) -> Result<(OpenedTcpOutbound, ProductOutboundFlow), RuntimeError> {
+        let protocol_target = authorized_protocol_target(authorized, Network::Tcp)?;
+        let principal = authorized
+            .first()
+            .expect("authorized protocol target requires one address")
+            .flow()
+            .principal();
+        match selector {
+            OutboundSelector::Leaf(id) => {
+                let leaf = self.shell.require_leaf(id, Network::Tcp)?;
+                let scope = product_flow_scope(authorized, origin_kind, leaf.id(), None)?;
+                let connect = pending
+                    .try_begin_connect(leaf.id().clone())
+                    .map_err(RuntimeError::ProductAdmission)?;
+                let opened = self
+                    .open_authorized_tcp_leaf(
+                        leaf,
+                        ProductLeafOpen {
+                            authorized,
+                            dns_plan,
+                            traffic_class,
+                            deadline,
+                            gateway_lease: None,
+                            scope,
+                            observe_native,
+                        },
+                    )
+                    .await?;
+                Ok((opened, connect.connected()))
+            }
+            OutboundSelector::Balancer(id) => {
+                let runtime = self.shell.require_balancer(id)?;
+                let attempt_limit = runtime.member_count();
+                let mut excluded = Vec::with_capacity(attempt_limit);
+                let mut last_error = None;
+                for _ in 0..attempt_limit {
+                    ensure_before_deadline(deadline)?;
+                    let binding = match runtime.select_for_principal(
+                        Network::Tcp,
+                        &protocol_target,
+                        Some(principal),
+                        &excluded,
+                    ) {
+                        Ok(binding) => binding,
+                        Err(error) => return Err(last_error.unwrap_or(error)),
+                    };
+                    let handle = binding.handle;
+                    let leaf = self
+                        .shell
+                        .require_leaf(runtime.member_id(handle)?, Network::Tcp)?;
+                    let scope = product_flow_scope(authorized, origin_kind, leaf.id(), Some(id))?;
+                    let connect = match pending.try_begin_connect(leaf.id().clone()) {
+                        Ok(connect) => connect,
+                        Err(error) => {
+                            excluded.push(handle);
+                            last_error = Some(RuntimeError::ProductAdmission(error));
+                            continue;
+                        }
+                    };
+                    match self
+                        .open_authorized_tcp_leaf(
+                            leaf,
+                            ProductLeafOpen {
+                                authorized,
+                                dns_plan,
+                                traffic_class,
+                                deadline,
+                                gateway_lease: Some(binding.lease),
+                                scope,
+                                observe_native,
+                            },
+                        )
+                        .await
+                    {
+                        Ok(opened) => return Ok((opened, connect.connected())),
+                        Err(error) => {
+                            excluded.push(handle);
+                            last_error = Some(error);
+                        }
+                    }
+                }
+                Err(last_error.unwrap_or_else(|| {
+                    RuntimeError::GatewayUnavailable(
+                        "gateway has no TCP member attempts".to_string(),
+                    )
+                }))
+            }
+        }
+    }
+
+    pub(in crate::runtime) async fn open_authorized_udp(
+        &self,
+        pending: &PendingProductFlow,
+        selector: &OutboundSelector,
+        authorized: &[AuthorizedTarget],
+        dns_plan: Option<&DnsPlanId>,
+        traffic_class: TrafficClass,
+        deadline: tokio::time::Instant,
+    ) -> Result<(OpenedUdpOutbound, ProductOutboundFlow), RuntimeError> {
+        self.open_authorized_udp_for_origin(
+            pending,
+            selector,
+            authorized,
+            dns_plan,
+            traffic_class,
+            deadline,
+            ProductFlowOriginKind::LocalInbound,
+            true,
+        )
+        .await
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn open_authorized_udp_for_origin(
+        &self,
+        pending: &PendingProductFlow,
+        selector: &OutboundSelector,
+        authorized: &[AuthorizedTarget],
+        dns_plan: Option<&DnsPlanId>,
+        traffic_class: TrafficClass,
+        deadline: tokio::time::Instant,
+        origin_kind: ProductFlowOriginKind,
+        observe_native: bool,
+    ) -> Result<(OpenedUdpOutbound, ProductOutboundFlow), RuntimeError> {
+        let protocol_target = authorized_protocol_target(authorized, Network::Udp)?;
+        let principal = authorized
+            .first()
+            .expect("authorized protocol target requires one address")
+            .flow()
+            .principal();
+        match selector {
+            OutboundSelector::Leaf(id) => {
+                let leaf = self.shell.require_leaf(id, Network::Udp)?;
+                let scope = product_flow_scope(authorized, origin_kind, leaf.id(), None)?;
+                let connect = pending
+                    .try_begin_connect(leaf.id().clone())
+                    .map_err(RuntimeError::ProductAdmission)?;
+                let opened = self
+                    .open_authorized_udp_leaf(
+                        leaf,
+                        ProductLeafOpen {
+                            authorized,
+                            dns_plan,
+                            traffic_class,
+                            deadline,
+                            gateway_lease: None,
+                            scope,
+                            observe_native,
+                        },
+                    )
+                    .await?;
+                Ok((opened, connect.connected()))
+            }
+            OutboundSelector::Balancer(id) => {
+                let runtime = self.shell.require_balancer(id)?;
+                let attempt_limit = runtime.member_count();
+                let mut excluded = Vec::with_capacity(attempt_limit);
+                let mut last_error = None;
+                for _ in 0..attempt_limit {
+                    ensure_before_deadline(deadline)?;
+                    let binding = match runtime.select_for_principal(
+                        Network::Udp,
+                        &protocol_target,
+                        Some(principal),
+                        &excluded,
+                    ) {
+                        Ok(binding) => binding,
+                        Err(error) => return Err(last_error.unwrap_or(error)),
+                    };
+                    let handle = binding.handle;
+                    let leaf = self
+                        .shell
+                        .require_leaf(runtime.member_id(handle)?, Network::Udp)?;
+                    let scope = product_flow_scope(authorized, origin_kind, leaf.id(), Some(id))?;
+                    let connect = match pending.try_begin_connect(leaf.id().clone()) {
+                        Ok(connect) => connect,
+                        Err(error) => {
+                            excluded.push(handle);
+                            last_error = Some(RuntimeError::ProductAdmission(error));
+                            continue;
+                        }
+                    };
+                    match self
+                        .open_authorized_udp_leaf(
+                            leaf,
+                            ProductLeafOpen {
+                                authorized,
+                                dns_plan,
+                                traffic_class,
+                                deadline,
+                                gateway_lease: Some(binding.lease),
+                                scope,
+                                observe_native,
+                            },
+                        )
+                        .await
+                    {
+                        Ok(opened) => return Ok((opened, connect.connected())),
+                        Err(error) => {
+                            excluded.push(handle);
+                            last_error = Some(error);
+                        }
+                    }
+                }
+                Err(last_error.unwrap_or_else(|| {
+                    RuntimeError::GatewayUnavailable(
+                        "gateway has no UDP member attempts".to_string(),
+                    )
+                }))
+            }
+        }
+    }
+
+    async fn open_authorized_tcp_leaf(
+        &self,
+        leaf: Arc<RuntimeOutboundLeaf>,
+        request: ProductLeafOpen<'_>,
+    ) -> Result<OpenedTcpOutbound, RuntimeError> {
+        let ProductLeafOpen {
+            authorized,
+            dns_plan,
+            traffic_class,
+            deadline,
+            mut gateway_lease,
+            scope,
+            observe_native,
+        } = request;
+        let opened: Result<OpenedTcpOutbound, RuntimeError> = async {
+            match leaf.as_ref() {
+                RuntimeOutboundLeaf::Mpp {
+                    context,
+                    performance,
+                    ..
+                } => {
+                    let context = context.with_product_flow_scope(scope.clone());
+                    let mut last_error = None;
+                    for authorized_target in authorized {
+                        let target = authorized_literal_target(authorized_target, Network::Tcp)?;
+                        let remote = match tokio::time::timeout_at(
+                            deadline,
+                            open_remote_stream(&context, target.clone(), traffic_class),
+                        )
+                        .await
+                        {
+                            Ok(Ok(remote)) => remote,
+                            Ok(Err(error)) => {
+                                last_error = Some(error);
+                                continue;
+                            }
+                            Err(_) => {
+                                return Err(RuntimeError::OutboundConnect(
+                                    outbound::OutboundConnectError::ConnectTimeout,
+                                ));
+                            }
+                        };
+                        return Ok(OpenedTcpOutbound::Mpp {
+                            context: context.clone(),
+                            performance: *performance,
+                            remote,
+                            spec: ReliableRelayOpenSpec { target },
+                            _gateway_lease: None,
+                            _product_flow: OpenedProductFlow::new(
+                                scope.clone(),
+                                None,
+                                Network::Tcp,
+                            ),
+                        });
+                    }
+                    Err(last_error.unwrap_or_else(|| {
+                        RuntimeError::OutboundConnect(
+                            outbound::OutboundConnectError::NoAuthorizedAddresses,
+                        )
+                    }))
+                }
+                RuntimeOutboundLeaf::Local {
+                    config,
+                    connect_timeout,
+                    native_sockets,
+                    ..
+                } => {
+                    let stream = outbound::connect_tcp_authorized_with_configurator(
+                        config,
+                        &self.dns,
+                        dns_plan,
+                        authorized,
+                        leaf_deadline(deadline, *connect_timeout)?,
+                        native_sockets.as_ref(),
+                    )
+                    .await?;
+                    Ok(OpenedTcpOutbound::Local {
+                        stream,
+                        _gateway_lease: None,
+                        _product_flow: OpenedProductFlow::new(
+                            scope.clone(),
+                            observe_native.then_some(&self.shell.product_telemetry),
+                            Network::Tcp,
+                        ),
+                    })
+                }
+            }
+        }
+        .await;
+        let opened = match opened {
+            Ok(opened) => opened,
+            Err(error) => {
+                if let Some(lease) = gateway_lease.as_mut()
+                    && let Err(feedback) = lease.failed(error.to_string())
+                {
+                    crate::observability::process_event!(
+                        Warn,
+                        "gateway",
+                        "open_failure_feedback_failed",
+                        "gateway open-failure feedback failed: {feedback}"
+                    );
+                }
+                return Err(error);
+            }
+        };
+        if let Some(lease) = gateway_lease.as_mut() {
+            lease.opened()?;
+        }
+        Ok(match opened {
+            OpenedTcpOutbound::Mpp {
+                context,
+                performance,
+                remote,
+                spec,
+                _product_flow,
+                ..
+            } => OpenedTcpOutbound::Mpp {
+                context,
+                performance,
+                remote,
+                spec,
+                _gateway_lease: gateway_lease,
+                _product_flow,
+            },
+            OpenedTcpOutbound::Local {
+                stream,
+                _product_flow,
+                ..
+            } => OpenedTcpOutbound::Local {
+                stream,
+                _gateway_lease: gateway_lease,
+                _product_flow,
+            },
+        })
+    }
+
+    async fn open_authorized_udp_leaf(
+        &self,
+        leaf: Arc<RuntimeOutboundLeaf>,
+        request: ProductLeafOpen<'_>,
+    ) -> Result<OpenedUdpOutbound, RuntimeError> {
+        let ProductLeafOpen {
+            authorized,
+            dns_plan,
+            traffic_class,
+            deadline,
+            mut gateway_lease,
+            scope,
+            observe_native,
+        } = request;
+        match leaf.as_ref() {
+            RuntimeOutboundLeaf::Mpp { context, .. } => {
+                let first = authorized.first().ok_or_else(|| {
+                    RuntimeError::OutboundConnect(
+                        outbound::OutboundConnectError::NoAuthorizedAddresses,
+                    )
+                })?;
+                let target = authorized_literal_target(first, Network::Udp)?;
+                ensure_before_deadline(deadline)?;
+                Ok(OpenedUdpOutbound::Mpp {
+                    context: context.with_product_flow_scope(scope.clone()),
+                    target,
+                    traffic_class,
+                    gateway_lease,
+                    product_flow: OpenedProductFlow::new(scope, None, Network::Udp),
+                })
+            }
+            RuntimeOutboundLeaf::Local {
+                config,
+                connect_timeout,
+                native_sockets,
+                ..
+            } => {
+                let socket = match outbound::connect_udp_authorized_with_configurator(
+                    config,
+                    &self.dns,
+                    dns_plan,
+                    authorized,
+                    leaf_deadline(deadline, *connect_timeout)?,
+                    native_sockets.as_ref(),
+                )
+                .await
+                {
+                    Ok(socket) => socket,
+                    Err(error) => {
+                        if let Some(lease) = gateway_lease.as_mut() {
+                            lease.failed(error.to_string())?;
+                        }
+                        return Err(error.into());
+                    }
+                };
+                if let Some(lease) = gateway_lease.as_mut() {
+                    lease.opened()?;
+                }
+                Ok(OpenedUdpOutbound::Local {
+                    socket,
+                    _gateway_lease: gateway_lease,
+                    _product_flow: OpenedProductFlow::new(
+                        scope,
+                        observe_native.then_some(&self.shell.product_telemetry),
+                        Network::Udp,
+                    ),
+                })
+            }
+        }
+    }
+}
+
+async fn run_gateway_probe_service(
+    registry: RuntimeOutboundRegistry,
+    id: BalancerId,
+    runtime: ClientGatewayRuntime,
+    policy: crate::product::GatewayProbePolicy,
+    permits: Arc<tokio::sync::Semaphore>,
+) -> Result<(), RuntimeError> {
+    let mut ticker = tokio::time::interval(policy.interval);
+    ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    loop {
+        ticker.tick().await;
+        for member in runtime.members() {
+            let permit = permits.clone().acquire_owned().await.map_err(|_| {
+                RuntimeError::ProductPolicy(
+                    "gateway active-probe concurrency owner closed".to_string(),
+                )
+            })?;
+            let Some(mut lease) = runtime.begin_active_probe(member)? else {
+                continue;
+            };
+            let result = registry
+                .probe_gateway_member(member, &policy.target, policy.timeout)
+                .await;
+            let feedback = match &result {
+                Ok(()) => lease.succeeded(),
+                Err(error) => lease.failed(error.to_string()),
+            };
+            feedback?;
+            if let Err(error) = result {
+                crate::observability::process_event!(
+                    Warn,
+                    "gateway",
+                    "active_probe_failed",
+                    "gateway active probe failed: balancer={} member={} error={error}",
+                    id.as_str(),
+                    member.as_str(),
+                );
+            }
+            drop(permit);
+        }
+    }
+}
+
+impl RuntimeOutboundRegistry {
+    async fn probe_gateway_member(
+        &self,
+        member: &OutboundId,
+        target: &ProtocolTarget,
+        timeout: Duration,
+    ) -> Result<(), RuntimeError> {
+        let address = SocketAddr::new(
+            target.ip().ok_or_else(|| {
+                RuntimeError::ProductPolicy(
+                    "validated gateway probe target is not a literal IP".to_string(),
+                )
+            })?,
+            target.port().get(),
+        );
+        let leaf = self.shell.require_leaf(member, Network::Tcp)?;
+        let probe = async {
+            match leaf.as_ref() {
+                RuntimeOutboundLeaf::Mpp { context, .. } => {
+                    let opened =
+                        open_remote_stream(context, TargetAddr::Ip(address), TrafficClass::Latency)
+                            .await?;
+                    opened.close().await;
+                    Ok(())
+                }
+                RuntimeOutboundLeaf::Local {
+                    config,
+                    native_sockets,
+                    ..
+                } => {
+                    let stream = outbound::connect_tcp_literal_target_with_configurator(
+                        config,
+                        address,
+                        timeout,
+                        native_sockets.as_ref(),
+                    )
+                    .await?;
+                    drop(stream);
+                    Ok(())
+                }
+            }
+        };
+        tokio::time::timeout(timeout, probe).await.map_err(|_| {
+            RuntimeError::OutboundConnect(outbound::OutboundConnectError::ConnectTimeout)
+        })?
+    }
+}
+
+impl GatewayRuntimeControl {
+    pub(in crate::runtime) fn is_empty(&self) -> bool {
+        self.balancers.is_empty()
+    }
+
+    pub(in crate::runtime) fn snapshots(
+        &self,
+    ) -> Result<Vec<NamedGatewayRuntimeSnapshot>, RuntimeError> {
+        let mut balancers = self.balancers.iter().collect::<Vec<_>>();
+        balancers.sort_unstable_by_key(|(id, _)| *id);
+        balancers
+            .into_iter()
+            .map(|(id, runtime)| {
+                Ok(NamedGatewayRuntimeSnapshot {
+                    id: id.clone(),
+                    runtime: runtime.snapshot()?,
+                })
+            })
+            .collect()
+    }
+
+    pub(in crate::runtime) fn set_member_mode(
+        &self,
+        balancer: &BalancerId,
+        member: &OutboundId,
+        mode: GatewayMemberMode,
+    ) -> Result<(), RuntimeError> {
+        self.require_balancer(balancer)?
+            .set_member_mode(member, mode)
+    }
+
+    pub(in crate::runtime) fn set_manual_member(
+        &self,
+        balancer: &BalancerId,
+        member: Option<&OutboundId>,
+    ) -> Result<(), RuntimeError> {
+        self.require_balancer(balancer)?.set_manual_member(member)
+    }
+
+    fn require_balancer(&self, id: &BalancerId) -> Result<&ClientGatewayRuntime, RuntimeError> {
+        self.balancers.get(id).ok_or_else(|| {
+            RuntimeError::GatewayUnavailable(format!("gateway {} is not configured", id.as_str()))
+        })
+    }
+}
+
+impl RuntimeOutboundRegistryShell {
+    pub(in crate::runtime) fn compile(
+        leaves: impl IntoIterator<Item = RuntimeOutboundLeaf>,
+        balancer_configs: &[GatewayBalancerConfig],
+    ) -> Result<Self, RuntimeError> {
+        let mut leaf_map = HashMap::new();
+        for leaf in leaves {
+            let id = leaf.id().clone();
+            if leaf_map.insert(id, Arc::new(leaf)).is_some() {
+                return Err(RuntimeError::ProductPolicy(
+                    "duplicate runtime outbound leaf".to_string(),
+                ));
+            }
+        }
+
+        let mut balancers = HashMap::new();
+        for config in balancer_configs {
+            for member in &config.spec.members {
+                let Some(leaf) = leaf_map.get(&member.id) else {
+                    return Err(RuntimeError::ProductPolicy(format!(
+                        "gateway member {} has no runtime outbound leaf",
+                        member.id.as_str()
+                    )));
+                };
+                if member.networks != leaf.networks() {
+                    return Err(RuntimeError::ProductPolicy(format!(
+                        "gateway member {} capability differs from runtime leaf",
+                        member.id.as_str()
+                    )));
+                }
+            }
+            if balancers
+                .insert(config.id.clone(), ClientGatewayRuntime::compile(config)?)
+                .is_some()
+            {
+                return Err(RuntimeError::ProductPolicy(
+                    "duplicate runtime gateway balancer".to_string(),
+                ));
+            }
+        }
+        Ok(Self {
+            leaves: Arc::new(leaf_map),
+            balancers: Arc::new(balancers),
+            product_admission: ProductAdmission::default(),
+            product_telemetry: RuntimeTelemetry::new(
+                crate::runtime::telemetry::MAX_ACTIVE_FLOW_DETAIL_RECORDS,
+            ),
+        })
+    }
+
+    pub(in crate::runtime) fn with_product_admission(
+        mut self,
+        product_admission: ProductAdmission,
+    ) -> Self {
+        self.product_admission = product_admission;
+        self
+    }
+
+    pub(in crate::runtime) fn with_product_telemetry(
+        mut self,
+        product_telemetry: RuntimeTelemetry,
+    ) -> Self {
+        self.product_telemetry = product_telemetry;
+        self
+    }
+
+    pub(in crate::runtime) fn product_admission(&self) -> &ProductAdmission {
+        &self.product_admission
+    }
+
+    pub(in crate::runtime) fn with_dns(self, dns: DnsGeneration) -> RuntimeOutboundRegistry {
+        RuntimeOutboundRegistry { shell: self, dns }
+    }
+
+    pub(in crate::runtime) fn dns_backend_factory(
+        &self,
+        native_sockets: Arc<dyn NativeSocketConfigurator>,
+    ) -> RuntimeOutboundDnsBackendFactory {
+        RuntimeOutboundDnsBackendFactory {
+            shell: self.clone(),
+            direct_policy: DnsNativeSocketPolicy::direct(native_sockets),
+        }
+    }
+
+    pub(in crate::runtime) fn selector_for_action(
+        &self,
+        action: &EgressAction,
+    ) -> Result<OutboundSelector, RuntimeError> {
+        match action {
+            EgressAction::Outbound(id) if self.leaves.contains_key(id) => {
+                Ok(OutboundSelector::Leaf(id.clone()))
+            }
+            EgressAction::Balancer(id) if self.balancers.contains_key(id) => {
+                Ok(OutboundSelector::Balancer(id.clone()))
+            }
+            EgressAction::Outbound(id) => Err(RuntimeError::ProductPolicy(format!(
+                "route selected unavailable outbound {}",
+                id.as_str()
+            ))),
+            EgressAction::Balancer(id) => Err(RuntimeError::ProductPolicy(format!(
+                "route selected unavailable gateway {}",
+                id.as_str()
+            ))),
+            EgressAction::Direct => Err(RuntimeError::ProductPolicy(
+                "direct route must select a tagged direct outbound".to_string(),
+            )),
+            EgressAction::Reject | EgressAction::Drop => Err(RuntimeError::ProductPolicy(
+                "terminal route cannot open an outbound".to_string(),
+            )),
+        }
+    }
+
+    pub(in crate::runtime) fn selector_for_target(
+        &self,
+        target: &RouteTarget,
+    ) -> Result<OutboundSelector, RuntimeError> {
+        match target.kind {
+            RouteTargetKind::Outbound => OutboundId::parse(&target.tag)
+                .map(OutboundSelector::Leaf)
+                .map_err(|error| RuntimeError::ProductPolicy(error.to_string())),
+            RouteTargetKind::Balancer => BalancerId::parse(&target.tag)
+                .map(OutboundSelector::Balancer)
+                .map_err(|error| RuntimeError::ProductPolicy(error.to_string())),
+        }
+        .and_then(|selector| {
+            let present = match &selector {
+                OutboundSelector::Leaf(id) => self.leaves.contains_key(id),
+                OutboundSelector::Balancer(id) => self.balancers.contains_key(id),
+            };
+            present.then_some(selector).ok_or_else(|| {
+                RuntimeError::ProductPolicy(format!(
+                    "route target {} has no runtime binding",
+                    target.tag
+                ))
+            })
+        })
+    }
+
+    /// Proves the server-side no-chaining invariant at runtime assembly.
+    ///
+    /// Configuration validation performs the same check, but server services
+    /// retain this defense so a hand-built runtime cannot forward one MPP
+    /// session into another MPP session.
+    pub(in crate::runtime) fn ensure_native_selector(
+        &self,
+        selector: &OutboundSelector,
+    ) -> Result<(), RuntimeError> {
+        let ensure_leaf = |id: &OutboundId| {
+            let leaf = self.leaves.get(id).ok_or_else(|| {
+                RuntimeError::ProductPolicy(format!("outbound {} is unavailable", id.as_str()))
+            })?;
+            if leaf.is_local() {
+                Ok(())
+            } else {
+                Err(RuntimeError::ProductPolicy(
+                    "MPP inbound egress cannot select an MPP outbound".to_string(),
+                ))
+            }
+        };
+        match selector {
+            OutboundSelector::Leaf(id) => ensure_leaf(id),
+            OutboundSelector::Balancer(id) => {
+                let runtime = self.require_balancer(id)?;
+                for member in runtime.members() {
+                    ensure_leaf(member)?;
+                }
+                Ok(())
+            }
+        }
+    }
+
+    fn require_leaf(
+        &self,
+        id: &OutboundId,
+        network: Network,
+    ) -> Result<Arc<RuntimeOutboundLeaf>, RuntimeError> {
+        let leaf = self.leaves.get(id).cloned().ok_or_else(|| {
+            RuntimeError::ProductPolicy(format!("outbound {} is unavailable", id.as_str()))
+        })?;
+        if !leaf.networks().contains(network) {
+            return Err(RuntimeError::GatewayUnavailable(format!(
+                "outbound {} does not support {network}",
+                id.as_str()
+            )));
+        }
+        Ok(leaf)
+    }
+
+    fn require_balancer(&self, id: &BalancerId) -> Result<&ClientGatewayRuntime, RuntimeError> {
+        self.balancers.get(id).ok_or_else(|| {
+            RuntimeError::ProductPolicy(format!("gateway {} is unavailable", id.as_str()))
+        })
+    }
+}
+
+impl DnsBackendFactory for RuntimeOutboundDnsBackendFactory {
+    fn build_backend(
+        &self,
+        plan: &CompiledDnsPlan,
+        upstream: &CompiledDnsUpstream,
+    ) -> Result<Arc<dyn DnsQueryBackend>, DnsRuntimeError> {
+        let DnsEgressSpec::Outbound(id) = upstream.egress() else {
+            return DirectDnsBackendFactory::build_backend_with_policy(
+                plan,
+                upstream,
+                self.direct_policy.clone(),
+            );
+        };
+        let leaf =
+            self.shell
+                .leaves
+                .get(id)
+                .ok_or_else(|| DnsRuntimeError::MissingEgressConnector {
+                    upstream: upstream.id().clone(),
+                    outbound: id.clone(),
+                })?;
+        let connector: Arc<dyn DnsTcpConnector> = match leaf.as_ref() {
+            RuntimeOutboundLeaf::Local {
+                config: OutboundConfig::Direct,
+                native_sockets,
+                ..
+            } => {
+                return DirectDnsBackendFactory::build_backend_with_policy(
+                    plan,
+                    upstream,
+                    DnsNativeSocketPolicy::direct(native_sockets.clone()),
+                );
+            }
+            RuntimeOutboundLeaf::Local {
+                config: OutboundConfig::BindSourceIp(source_ip),
+                native_sockets,
+                ..
+            } => {
+                return DirectDnsBackendFactory::build_backend_with_policy(
+                    plan,
+                    upstream,
+                    DnsNativeSocketPolicy::bind_source(native_sockets.clone(), *source_ip),
+                );
+            }
+            RuntimeOutboundLeaf::Local {
+                config,
+                connect_timeout,
+                native_sockets,
+                ..
+            } => {
+                let independent = config
+                    .native_proxy_endpoint()
+                    .is_some_and(|endpoint| endpoint.host.parse::<IpAddr>().is_ok());
+                if !independent {
+                    return Err(DnsRuntimeError::RecursiveEgressConnector {
+                        upstream: upstream.id().clone(),
+                        outbound: id.clone(),
+                    });
+                }
+                Arc::new(LocalOutboundDnsTcpConnector {
+                    config: config.clone(),
+                    connect_timeout: *connect_timeout,
+                    native_sockets: native_sockets.clone(),
+                })
+            }
+            RuntimeOutboundLeaf::Mpp {
+                context,
+                performance,
+                ..
+            } => {
+                let independent = context
+                    .tcp_paths
+                    .iter()
+                    .chain(context.udp_paths.iter())
+                    .all(|path| path.endpoint.host.parse::<IpAddr>().is_ok());
+                if !independent {
+                    return Err(DnsRuntimeError::RecursiveEgressConnector {
+                        upstream: upstream.id().clone(),
+                        outbound: id.clone(),
+                    });
+                }
+                Arc::new(MppOutboundDnsTcpConnector {
+                    context: context.clone(),
+                    performance: *performance,
+                })
+            }
+        };
+        match upstream.endpoint() {
+            crate::product::DnsUpstreamEndpoint::Tcp { .. }
+            | crate::product::DnsUpstreamEndpoint::Tls { .. } => {
+                RoutedTcpDnsBackend::compile_with_connector(plan, upstream, connector)
+                    .map(|backend| Arc::new(backend) as Arc<dyn DnsQueryBackend>)
+            }
+            crate::product::DnsUpstreamEndpoint::Https { .. } => {
+                DohDnsBackend::compile_with_connector(plan, upstream, connector)
+                    .map(|backend| Arc::new(backend) as Arc<dyn DnsQueryBackend>)
+            }
+            _ => Err(DnsRuntimeError::UnsupportedEgressTransport {
+                upstream: upstream.id().clone(),
+                outbound: id.clone(),
+            }),
+        }
+    }
+}
+
+fn authorized_protocol_target(
+    authorized: &[AuthorizedTarget],
+    network: Network,
+) -> Result<ProtocolTarget, RuntimeError> {
+    let first = authorized.first().ok_or_else(|| {
+        RuntimeError::OutboundConnect(outbound::OutboundConnectError::NoAuthorizedAddresses)
+    })?;
+    let generation = first.acl_generation();
+    let flow = first.flow();
+    if flow.network() != network
+        || authorized
+            .iter()
+            .any(|target| target.acl_generation() != generation || target.flow() != flow)
+    {
+        return Err(RuntimeError::DestinationDenied(
+            "authorized connector targets do not belong to one Product flow".to_string(),
+        ));
+    }
+    Ok(flow.target().clone())
+}
+
+fn product_flow_scope(
+    authorized: &[AuthorizedTarget],
+    origin_kind: ProductFlowOriginKind,
+    outbound: &OutboundId,
+    balancer: Option<&BalancerId>,
+) -> Result<ProductFlowScope, RuntimeError> {
+    let flow = authorized.first().ok_or_else(|| {
+        RuntimeError::OutboundConnect(outbound::OutboundConnectError::NoAuthorizedAddresses)
+    })?;
+    Ok(ProductFlowScope::from_flow(
+        origin_kind,
+        flow.flow(),
+        outbound.clone(),
+        balancer.cloned(),
+    ))
+}
+
+fn authorized_literal_target(
+    authorized: &AuthorizedTarget,
+    network: Network,
+) -> Result<TargetAddr, RuntimeError> {
+    if authorized.flow().network() != network {
+        return Err(RuntimeError::DestinationDenied(
+            "authorized connector target has the wrong network".to_string(),
+        ));
+    }
+    Ok(TargetAddr::Ip(SocketAddr::new(
+        authorized.address(),
+        authorized.flow().target().port().get(),
+    )))
+}
+
+fn ensure_before_deadline(deadline: tokio::time::Instant) -> Result<(), RuntimeError> {
+    if tokio::time::Instant::now() >= deadline {
+        return Err(RuntimeError::OutboundConnect(
+            outbound::OutboundConnectError::ConnectTimeout,
+        ));
+    }
+    Ok(())
+}
+
+fn leaf_deadline(
+    transaction_deadline: tokio::time::Instant,
+    leaf_timeout: Duration,
+) -> Result<tokio::time::Instant, RuntimeError> {
+    ensure_before_deadline(transaction_deadline)?;
+    Ok(transaction_deadline.min(tokio::time::Instant::now() + leaf_timeout))
+}
+
+#[cfg(test)]
+pub(in crate::runtime) fn test_dns_generation() -> DnsGeneration {
+    DnsGeneration::from_test_answers(HashMap::from([(
+        "localhost".to_string(),
+        vec![
+            std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST),
+            std::net::IpAddr::V6(std::net::Ipv6Addr::LOCALHOST),
+        ],
+    )]))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::config::{ClientSecurityConfig, ResourceLimits, SharedSecret};
+    use crate::outbound::{HttpsProxyConfig, ProxyConfig};
+    use crate::product::{
+        CompiledDnsPolicy, DnsIpStrategy, DnsOutboundCapabilitySpec, DnsPlanId, DnsPlanSpec,
+        DnsPolicySpec, DnsUpstreamEndpoint, DnsUpstreamId, DnsUpstreamSpec, GatewayBalancerSpec,
+        GatewayMemberSpec, GatewayStrategy, ProductAdmissionConfig, ProductAdmissionRejection,
+    };
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::net::{TcpListener, UdpSocket};
+
+    fn local_leaf(id: &str, config: OutboundConfig) -> RuntimeOutboundLeaf {
+        RuntimeOutboundLeaf::Local {
+            id: OutboundId::parse(id).expect("outbound ID"),
+            config,
+            connect_timeout: Duration::from_millis(250),
+            native_sockets: Arc::new(crate::transport::SystemNativeSocketConfigurator),
+        }
+    }
+
+    fn selector(registry: &RuntimeOutboundRegistry, id: &str) -> OutboundSelector {
+        registry
+            .selector_for_target(&RouteTarget {
+                kind: RouteTargetKind::Outbound,
+                tag: id.to_string(),
+            })
+            .expect("outbound selector")
+    }
+
+    fn registry_with_product_admission(
+        leaves: impl IntoIterator<Item = RuntimeOutboundLeaf>,
+        admission: ProductAdmission,
+    ) -> RuntimeOutboundRegistry {
+        RuntimeOutboundRegistryShell::compile(leaves, &[])
+            .expect("outbound shell")
+            .with_product_admission(admission)
+            .with_dns(test_dns_generation())
+    }
+
+    fn one_flow_admission() -> ProductAdmission {
+        ProductAdmission::new(ProductAdmissionConfig {
+            max_live_flows: 1,
+            max_concurrent_work: 1,
+            max_live_flows_per_principal: 1,
+            max_live_flows_per_outbound: 1,
+            max_connects_per_outbound: 1,
+            max_live_flows_per_target: 1,
+            max_connects_per_target: 1,
+            max_dns_work: 1,
+        })
+        .expect("one-flow Product admission")
+    }
+
+    #[tokio::test]
+    async fn runtime_product_admission_precedes_target_io_and_recovers_after_close() {
+        let first_target = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("first target");
+        let first_address = first_target.local_addr().expect("first target address");
+        let second_target = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("second target");
+        let second_address = second_target.local_addr().expect("second target address");
+        let admission = one_flow_admission();
+        let registry = registry_with_product_admission(
+            [local_leaf("direct", OutboundConfig::Direct)],
+            admission.clone(),
+        );
+        let selector = selector(&registry, "direct");
+        let policy = crate::outbound::ServerDestinationPolicy::allow_restricted_for_test()
+            .test_principal_policy();
+
+        let first = registry
+            .open_tcp(
+                &selector,
+                &TargetAddr::Ip(first_address),
+                None,
+                TrafficClass::Latency,
+                &policy,
+            )
+            .await
+            .expect("first admitted TCP flow");
+        assert_eq!(admission.snapshot().live_flows, 1);
+        assert!(matches!(
+            registry
+                .open_tcp(
+                    &selector,
+                    &TargetAddr::Ip(second_address),
+                    None,
+                    TrafficClass::Latency,
+                    &policy,
+                )
+                .await,
+            Err(RuntimeError::ProductAdmission(error))
+                if error.rejection() == ProductAdmissionRejection::GlobalLiveFlows
+        ));
+        assert!(
+            tokio::time::timeout(Duration::from_millis(50), second_target.accept())
+                .await
+                .is_err(),
+            "rejected flow reached target I/O"
+        );
+
+        drop(first);
+        assert_eq!(admission.snapshot().live_flows, 0);
+        let recovered = registry
+            .open_tcp(
+                &selector,
+                &TargetAddr::Ip(second_address),
+                None,
+                TrafficClass::Latency,
+                &policy,
+            )
+            .await
+            .expect("admission recovered after close");
+        second_target.accept().await.expect("recovered target I/O");
+        drop(recovered);
+        let snapshot = admission.snapshot();
+        assert_eq!(snapshot.live_flows, 0);
+        assert_eq!(snapshot.concurrent_work, 0);
+        assert!(snapshot.principals.is_empty());
+        assert!(snapshot.outbounds.is_empty());
+        assert!(snapshot.targets.is_empty());
+    }
+
+    #[tokio::test]
+    async fn cancelled_outbound_open_releases_every_product_counter() {
+        let proxy = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("SOCKS proxy listener");
+        let proxy_address = proxy.local_addr().expect("SOCKS proxy address");
+        let admission = one_flow_admission();
+        let registry = registry_with_product_admission(
+            [local_leaf(
+                "proxy",
+                OutboundConfig::Socks5(ProxyConfig::new(
+                    proxy_address.to_string().parse().expect("proxy endpoint"),
+                    None,
+                )),
+            )],
+            admission.clone(),
+        );
+        let selector = selector(&registry, "proxy");
+        let policy = crate::outbound::ServerDestinationPolicy::allow_restricted_for_test()
+            .test_principal_policy();
+        let opener = tokio::spawn(async move {
+            registry
+                .open_tcp(
+                    &selector,
+                    &TargetAddr::Ip("192.0.2.1:443".parse().expect("target")),
+                    None,
+                    TrafficClass::Latency,
+                    &policy,
+                )
+                .await
+        });
+        let (_stalled_proxy_stream, _) = proxy.accept().await.expect("proxy open reached");
+        let snapshot = admission.snapshot();
+        assert_eq!(snapshot.live_flows, 1);
+        assert_eq!(snapshot.concurrent_work, 1);
+        assert_eq!(snapshot.outbounds[0].connecting, 1);
+        assert_eq!(snapshot.targets[0].connecting, 1);
+
+        opener.abort();
+        match opener.await {
+            Err(error) if error.is_cancelled() => {}
+            Err(error) => panic!("open task failed instead of cancelling: {error}"),
+            Ok(_) => panic!("open task completed instead of cancelling"),
+        }
+        let snapshot = admission.snapshot();
+        assert_eq!(snapshot.live_flows, 0);
+        assert_eq!(snapshot.concurrent_work, 0);
+        assert!(snapshot.principals.is_empty());
+        assert!(snapshot.outbounds.is_empty());
+        assert!(snapshot.targets.is_empty());
+    }
+
+    #[tokio::test]
+    async fn local_only_registry_opens_concrete_tcp_and_udp_without_mpp_context() {
+        let tcp_target = TcpListener::bind("127.0.0.1:0").await.expect("TCP bind");
+        let tcp_addr = tcp_target.local_addr().expect("TCP address");
+        let tcp_server = tokio::spawn(async move {
+            let (mut stream, _) = tcp_target.accept().await.expect("TCP accept");
+            let mut payload = [0_u8; 4];
+            stream.read_exact(&mut payload).await.expect("TCP read");
+            assert_eq!(&payload, b"ping");
+            stream.write_all(b"pong").await.expect("TCP write");
+        });
+        let udp_target = UdpSocket::bind("127.0.0.1:0").await.expect("UDP bind");
+        let udp_addr = udp_target.local_addr().expect("UDP address");
+        let udp_server = tokio::spawn(async move {
+            let mut payload = [0_u8; 4];
+            let (length, peer) = udp_target.recv_from(&mut payload).await.expect("UDP read");
+            assert_eq!(&payload[..length], b"ping");
+            udp_target.send_to(b"pong", peer).await.expect("UDP write");
+        });
+        let telemetry = RuntimeTelemetry::generation_owner(8);
+        let registry = RuntimeOutboundRegistryShell::compile(
+            [local_leaf("direct", OutboundConfig::Direct)],
+            &[],
+        )
+        .expect("registry")
+        .with_product_telemetry(telemetry.clone())
+        .with_dns(test_dns_generation());
+        let selector = selector(&registry, "direct");
+        let policy = crate::outbound::ServerDestinationPolicy::allow_restricted_for_test()
+            .test_principal_policy();
+
+        let OpenedTcpOutbound::Local {
+            stream: OutboundTcpStream::Plain(mut tcp),
+            ..
+        } = registry
+            .open_tcp(
+                &selector,
+                &TargetAddr::Ip(tcp_addr),
+                None,
+                TrafficClass::Latency,
+                &policy,
+            )
+            .await
+            .expect("local TCP")
+        else {
+            panic!("expected a concrete native TCP stream");
+        };
+        tcp.write_all(b"ping").await.expect("TCP request");
+        let mut response = [0_u8; 4];
+        tcp.read_exact(&mut response).await.expect("TCP response");
+        assert_eq!(&response, b"pong");
+
+        let OpenedUdpOutbound::Local {
+            socket: OutboundUdpSocket::Direct(udp),
+            ..
+        } = registry
+            .open_udp(&selector, &TargetAddr::Ip(udp_addr), None, &policy)
+            .await
+            .expect("local UDP")
+        else {
+            panic!("expected a concrete native UDP socket");
+        };
+        udp.send(b"ping").await.expect("UDP request");
+        let length = udp.recv(&mut response).await.expect("UDP response");
+        assert_eq!(&response[..length], b"pong");
+        assert_eq!(
+            telemetry.snapshot().io,
+            crate::runtime::telemetry::ProductIoSnapshot::default(),
+            "server MPP-to-native connectors must not add a second native observer"
+        );
+        tcp_server.await.expect("TCP task");
+        udp_server.await.expect("UDP task");
+    }
+
+    #[tokio::test]
+    async fn gateway_retries_a_failed_leaf_before_committing_the_flow() {
+        let unavailable_proxy = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("proxy reservation");
+        let unavailable_proxy_addr = unavailable_proxy.local_addr().expect("proxy address");
+        drop(unavailable_proxy);
+        let target = TcpListener::bind("127.0.0.1:0").await.expect("target bind");
+        let target_addr = target.local_addr().expect("target address");
+        let first = OutboundId::parse("failed-proxy").expect("outbound ID");
+        let second = OutboundId::parse("working-direct").expect("outbound ID");
+        let balancer_id = BalancerId::parse("native-failover").expect("balancer ID");
+        let balancers = [GatewayBalancerConfig {
+            id: balancer_id.clone(),
+            generation: 1,
+            spec: GatewayBalancerSpec::new(
+                GatewayStrategy::OrderedFailover,
+                vec![
+                    GatewayMemberSpec::new(first, 1, NetworkSet::TCP_UDP),
+                    GatewayMemberSpec::new(second, 1, NetworkSet::TCP_UDP),
+                ],
+            ),
+        }];
+        let registry = RuntimeOutboundRegistry::compile(
+            [
+                local_leaf(
+                    "failed-proxy",
+                    OutboundConfig::Socks5(ProxyConfig::new(
+                        unavailable_proxy_addr
+                            .to_string()
+                            .parse()
+                            .expect("proxy endpoint"),
+                        None,
+                    )),
+                ),
+                local_leaf("working-direct", OutboundConfig::Direct),
+            ],
+            &balancers,
+            test_dns_generation(),
+        )
+        .expect("registry");
+        let policy = crate::outbound::ServerDestinationPolicy::allow_restricted_for_test()
+            .test_principal_policy();
+        let opened = registry
+            .open_tcp(
+                &OutboundSelector::Balancer(balancer_id),
+                &TargetAddr::Ip(target_addr),
+                None,
+                TrafficClass::Latency,
+                &policy,
+            )
+            .await
+            .expect("bounded pre-commit failover");
+        let OpenedTcpOutbound::Local {
+            _gateway_lease: Some(_),
+            _product_flow,
+            ..
+        } = opened
+        else {
+            panic!("gateway failover must return the working native member");
+        };
+        assert_eq!(
+            _product_flow.scope().selection.outbound.as_str(),
+            "working-direct"
+        );
+        assert_eq!(
+            _product_flow
+                .scope()
+                .selection
+                .balancer
+                .as_ref()
+                .map(BalancerId::as_str),
+            Some("native-failover")
+        );
+        assert_eq!(
+            _product_flow
+                .scope()
+                .selection
+                .member
+                .as_ref()
+                .map(OutboundId::as_str),
+            Some("working-direct")
+        );
+        target.accept().await.expect("direct target accepted");
+    }
+
+    #[test]
+    fn server_native_selector_rejects_mpp_chaining_at_runtime_assembly() {
+        let context = ClientPathContext::new(
+            vec!["udp://127.0.0.1:7443".parse().expect("path")],
+            ClientSecurityConfig::for_test(
+                SharedSecret::new(b"0123456789abcdef0123456789abcdef".to_vec()).expect("secret"),
+            ),
+            ResourceLimits::default(),
+        )
+        .expect("MPP context");
+        let id = OutboundId::parse("another-mpp").expect("outbound ID");
+        let registry = RuntimeOutboundRegistry::compile(
+            [RuntimeOutboundLeaf::Mpp {
+                id: id.clone(),
+                context,
+                performance: MppPerformanceConfig::default(),
+            }],
+            &[],
+            test_dns_generation(),
+        )
+        .expect("registry");
+        assert!(matches!(
+            registry.ensure_native_selector(&OutboundSelector::Leaf(id)),
+            Err(RuntimeError::ProductPolicy(message))
+                if message.contains("cannot select an MPP outbound")
+        ));
+    }
+
+    fn named_dns_policy_for(
+        outbound: OutboundId,
+        endpoint: DnsUpstreamEndpoint,
+        networks: NetworkSet,
+    ) -> Arc<CompiledDnsPolicy> {
+        let upstream = DnsUpstreamId::parse("named-upstream").expect("upstream ID");
+        let plan = DnsPlanId::parse("default").expect("plan ID");
+        let mut plan_spec = DnsPlanSpec::new(plan.clone(), vec![upstream.clone()]);
+        plan_spec.ip_strategy = DnsIpStrategy::Ipv4Only;
+        Arc::new(
+            CompiledDnsPolicy::compile(
+                1,
+                DnsPolicySpec {
+                    upstreams: vec![DnsUpstreamSpec {
+                        id: upstream.clone(),
+                        endpoint,
+                        egress: DnsEgressSpec::Outbound(outbound.clone()),
+                    }],
+                    outbound_capabilities: vec![DnsOutboundCapabilitySpec::new(
+                        outbound, networks, true,
+                    )],
+                    plans: vec![plan_spec],
+                    rules: Vec::new(),
+                    hosts: Vec::new(),
+                    fake_dns: None,
+                    default_plan: plan,
+                },
+            )
+            .expect("named DNS policy"),
+        )
+    }
+
+    fn named_udp_dns_policy(outbound: OutboundId) -> Arc<CompiledDnsPolicy> {
+        named_dns_policy_for(
+            outbound,
+            DnsUpstreamEndpoint::Udp {
+                bootstrap: "1.1.1.1:53".parse().expect("bootstrap"),
+            },
+            NetworkSet::TCP_UDP,
+        )
+    }
+
+    fn named_tcp_dns_policy(outbound: OutboundId, bootstrap: SocketAddr) -> Arc<CompiledDnsPolicy> {
+        named_dns_policy_for(
+            outbound,
+            DnsUpstreamEndpoint::Tcp { bootstrap },
+            NetworkSet::TCP,
+        )
+    }
+
+    #[test]
+    fn named_dns_egress_accepts_only_dns_independent_native_leaves() {
+        let bind_id = OutboundId::parse("bound-direct").expect("outbound ID");
+        let shell = RuntimeOutboundRegistryShell::compile(
+            [local_leaf(
+                bind_id.as_str(),
+                OutboundConfig::BindSourceIp(std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST)),
+            )],
+            &[],
+        )
+        .expect("shell");
+        let factory =
+            shell.dns_backend_factory(Arc::new(crate::transport::SystemNativeSocketConfigurator));
+        DnsGeneration::compile_with_factory(named_udp_dns_policy(bind_id), &factory)
+            .expect("named bind-source DNS connector");
+
+        let proxy_id = OutboundId::parse("proxy").expect("outbound ID");
+        let shell = RuntimeOutboundRegistryShell::compile(
+            [local_leaf(
+                proxy_id.as_str(),
+                OutboundConfig::Socks5(ProxyConfig::new(
+                    "127.0.0.1:1080".parse().expect("proxy endpoint"),
+                    None,
+                )),
+            )],
+            &[],
+        )
+        .expect("shell");
+        let factory =
+            shell.dns_backend_factory(Arc::new(crate::transport::SystemNativeSocketConfigurator));
+        assert!(matches!(
+            DnsGeneration::compile_with_factory(named_udp_dns_policy(proxy_id.clone()), &factory),
+            Err(DnsRuntimeError::UnsupportedEgressTransport { outbound, .. })
+                if outbound == proxy_id
+        ));
+    }
+
+    #[test]
+    fn routed_tcp_dot_and_doh_compile_for_literal_proxy_control_endpoints() {
+        let configs = [
+            (
+                "socks",
+                OutboundConfig::Socks5(ProxyConfig::new(
+                    "127.0.0.1:1080".parse().expect("SOCKS endpoint"),
+                    None,
+                )),
+                DnsUpstreamEndpoint::Tcp {
+                    bootstrap: "192.0.2.53:53".parse().expect("TCP bootstrap"),
+                },
+            ),
+            (
+                "http",
+                OutboundConfig::HttpConnect(ProxyConfig::new(
+                    "127.0.0.1:8080".parse().expect("HTTP endpoint"),
+                    None,
+                )),
+                DnsUpstreamEndpoint::Tls {
+                    bootstrap: "192.0.2.53:853".parse().expect("DoT bootstrap"),
+                    server_name: crate::product::DomainName::parse("resolver.example")
+                        .expect("DoT identity"),
+                },
+            ),
+            (
+                "https",
+                OutboundConfig::HttpsConnect(Box::new(
+                    HttpsProxyConfig::new(
+                        ProxyConfig::new("127.0.0.1:8443".parse().expect("HTTPS endpoint"), None),
+                        Some("proxy.example".to_string()),
+                        Vec::new(),
+                    )
+                    .expect("HTTPS proxy"),
+                )),
+                DnsUpstreamEndpoint::Https {
+                    bootstrap: "192.0.2.53:443".parse().expect("DoH bootstrap"),
+                    server_name: crate::product::DomainName::parse("resolver.example")
+                        .expect("DoH identity"),
+                    path: "/dns-query".to_string(),
+                },
+            ),
+        ];
+        for (tag, config, endpoint) in configs {
+            let id = OutboundId::parse(tag).expect("outbound ID");
+            let shell =
+                RuntimeOutboundRegistryShell::compile([local_leaf(id.as_str(), config)], &[])
+                    .expect("shell");
+            let factory = shell
+                .dns_backend_factory(Arc::new(crate::transport::SystemNativeSocketConfigurator));
+            DnsGeneration::compile_with_factory(
+                named_dns_policy_for(id, endpoint, NetworkSet::TCP),
+                &factory,
+            )
+            .unwrap_or_else(|error| panic!("{tag} routed DNS did not compile: {error}"));
+        }
+    }
+
+    #[test]
+    fn routed_dns_rejects_proxy_and_mpp_control_hostnames_at_runtime_assembly() {
+        let proxy_id = OutboundId::parse("named-proxy").expect("outbound ID");
+        let shell = RuntimeOutboundRegistryShell::compile(
+            [local_leaf(
+                proxy_id.as_str(),
+                OutboundConfig::Socks5(ProxyConfig::new(
+                    "proxy.example:1080".parse().expect("proxy endpoint"),
+                    None,
+                )),
+            )],
+            &[],
+        )
+        .expect("shell");
+        let factory =
+            shell.dns_backend_factory(Arc::new(crate::transport::SystemNativeSocketConfigurator));
+        assert!(matches!(
+            DnsGeneration::compile_with_factory(
+                named_tcp_dns_policy(
+                    proxy_id.clone(),
+                    "192.0.2.53:53".parse().expect("bootstrap")
+                ),
+                &factory,
+            ),
+            Err(DnsRuntimeError::RecursiveEgressConnector { outbound, .. })
+                if outbound == proxy_id
+        ));
+
+        let mpp_id = OutboundId::parse("named-mpp").expect("outbound ID");
+        let context = ClientPathContext::new(
+            vec![
+                "udp://carrier.example:7443"
+                    .parse()
+                    .expect("MPP path endpoint"),
+            ],
+            ClientSecurityConfig::for_test(
+                SharedSecret::new(b"0123456789abcdef0123456789abcdef".to_vec()).expect("secret"),
+            ),
+            ResourceLimits::default(),
+        )
+        .expect("MPP context");
+        let shell = RuntimeOutboundRegistryShell::compile(
+            [RuntimeOutboundLeaf::Mpp {
+                id: mpp_id.clone(),
+                context,
+                performance: MppPerformanceConfig::default(),
+            }],
+            &[],
+        )
+        .expect("shell");
+        let factory =
+            shell.dns_backend_factory(Arc::new(crate::transport::SystemNativeSocketConfigurator));
+        assert!(matches!(
+            DnsGeneration::compile_with_factory(
+                named_tcp_dns_policy(
+                    mpp_id.clone(),
+                    "192.0.2.53:53".parse().expect("bootstrap")
+                ),
+                &factory,
+            ),
+            Err(DnsRuntimeError::RecursiveEgressConnector { outbound, .. })
+                if outbound == mpp_id
+        ));
+
+        let literal_id = OutboundId::parse("literal-mpp").expect("outbound ID");
+        let context = ClientPathContext::new(
+            vec![
+                "udp://127.0.0.1:7443"
+                    .parse()
+                    .expect("literal MPP path endpoint"),
+            ],
+            ClientSecurityConfig::for_test(
+                SharedSecret::new(b"0123456789abcdef0123456789abcdef".to_vec()).expect("secret"),
+            ),
+            ResourceLimits::default(),
+        )
+        .expect("MPP context");
+        let shell = RuntimeOutboundRegistryShell::compile(
+            [RuntimeOutboundLeaf::Mpp {
+                id: literal_id.clone(),
+                context,
+                performance: MppPerformanceConfig::default(),
+            }],
+            &[],
+        )
+        .expect("shell");
+        let factory =
+            shell.dns_backend_factory(Arc::new(crate::transport::SystemNativeSocketConfigurator));
+        DnsGeneration::compile_with_factory(
+            named_tcp_dns_policy(literal_id, "192.0.2.53:53".parse().expect("bootstrap")),
+            &factory,
+        )
+        .expect("literal MPP DNS connector");
+    }
+
+    #[tokio::test]
+    async fn routed_dns_query_traverses_the_selected_socks_connector() {
+        let proxy = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("SOCKS listener");
+        let proxy_address = proxy.local_addr().expect("SOCKS address");
+        let bootstrap: SocketAddr = "192.0.2.53:53".parse().expect("DNS bootstrap");
+        let answer: std::net::Ipv4Addr = "203.0.113.9".parse().expect("DNS answer");
+        let proxy_task = tokio::spawn(async move {
+            let (mut stream, _) = proxy.accept().await.expect("SOCKS accept");
+            let mut greeting = [0_u8; 3];
+            stream
+                .read_exact(&mut greeting)
+                .await
+                .expect("SOCKS greeting");
+            assert_eq!(greeting, [0x05, 0x01, 0x00]);
+            stream.write_all(&[0x05, 0x00]).await.expect("SOCKS method");
+
+            let mut connect = [0_u8; 10];
+            stream
+                .read_exact(&mut connect)
+                .await
+                .expect("SOCKS CONNECT");
+            assert_eq!(&connect[..4], &[0x05, 0x01, 0x00, 0x01]);
+            assert_eq!(
+                &connect[4..8],
+                &bootstrap
+                    .ip()
+                    .to_string()
+                    .parse::<std::net::Ipv4Addr>()
+                    .expect("IPv4")
+                    .octets()
+            );
+            assert_eq!(
+                u16::from_be_bytes([connect[8], connect[9]]),
+                bootstrap.port()
+            );
+            stream
+                .write_all(&[0x05, 0x00, 0x00, 0x01, 127, 0, 0, 1, 0, 0])
+                .await
+                .expect("SOCKS success");
+
+            let mut length = [0_u8; 2];
+            stream
+                .read_exact(&mut length)
+                .await
+                .expect("DNS frame length");
+            let mut request_wire = vec![0_u8; usize::from(u16::from_be_bytes(length))];
+            stream
+                .read_exact(&mut request_wire)
+                .await
+                .expect("DNS request");
+            let request = hickory_proto::op::Message::from_vec(&request_wire).expect("DNS message");
+            let query = request.queries[0].clone();
+            let mut response = hickory_proto::op::Message::response(
+                request.metadata.id,
+                hickory_proto::op::OpCode::Query,
+            );
+            response.add_query(query.clone());
+            response.add_answer(hickory_proto::rr::Record::from_rdata(
+                query.name().clone(),
+                60,
+                hickory_proto::rr::RData::A(hickory_proto::rr::rdata::A(answer)),
+            ));
+            let response_wire = response.to_vec().expect("DNS response");
+            stream
+                .write_all(
+                    &u16::try_from(response_wire.len())
+                        .expect("DNS response length")
+                        .to_be_bytes(),
+                )
+                .await
+                .expect("DNS response length");
+            stream
+                .write_all(&response_wire)
+                .await
+                .expect("DNS response");
+        });
+
+        let id = OutboundId::parse("socks-dns").expect("outbound ID");
+        let shell = RuntimeOutboundRegistryShell::compile(
+            [local_leaf(
+                id.as_str(),
+                OutboundConfig::Socks5(ProxyConfig::new(
+                    proxy_address.to_string().parse().expect("proxy endpoint"),
+                    None,
+                )),
+            )],
+            &[],
+        )
+        .expect("shell");
+        let factory =
+            shell.dns_backend_factory(Arc::new(crate::transport::SystemNativeSocketConfigurator));
+        let dns =
+            DnsGeneration::compile_with_factory(named_tcp_dns_policy(id, bootstrap), &factory)
+                .expect("routed DNS generation");
+        let resolution = dns
+            .resolve(&crate::product::DomainName::parse("through-proxy.example").expect("domain"))
+            .await
+            .expect("routed DNS answer");
+        assert_eq!(resolution.addresses().as_ref(), &[IpAddr::V4(answer)]);
+        proxy_task.await.expect("SOCKS task");
+    }
+}

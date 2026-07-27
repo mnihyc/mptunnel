@@ -1,9 +1,21 @@
-use super::security::{CipherSuite, SecurityPolicyError, SharedSecret};
-use crate::ingress::{IngressConfig, ProxyAuthConfig};
-use crate::outbound::{DnsConfig, OutboundConfig};
-use crate::protocol::codec::CodecLimits;
+use crate::ingress::IngressConfig;
+use crate::outbound::OutboundConfig;
+use crate::performance::{MppPerformanceConfig, ResourceLimitError, ResourceLimits};
+use crate::product::{
+    AclError, AclRuleSpec, BalancerId, CompiledDnsPolicy, CredentialAuthority, CredentialRecord,
+    DestinationAcl, DnsPlanId, DnsPlanSpec, DnsPolicySpec, DnsUpstreamEndpoint, DnsUpstreamId,
+    DnsUpstreamSpec, EgressAction, GatewayBalancer, GatewayBalancerSpec, InboundId, NetworkSet,
+    OutboundId, ProductAdmissionConfig, ProductAdmissionConfigError, ProductPolicyCompileError,
+    ProductPolicyGeneration, RouteRuleSpec, SecurityPolicyError,
+};
+#[cfg(test)]
+use crate::product::{CredentialCatalog, CredentialId, PrincipalId, SharedSecret};
 use crate::transport::PathSpec;
+use crate::transport::encrypted::{TcpClientTlsConfig, TcpServerTlsConfig};
+use ipnet::IpNet;
+use std::collections::{HashMap, HashSet};
 use std::net::SocketAddr;
+use std::sync::Arc;
 use std::time::Duration;
 
 pub const DEFAULT_PATH_PROBE_INTERVAL_MS: u64 = 10_000;
@@ -12,26 +24,6 @@ pub const DEFAULT_PATH_PROBE_INTERVAL: Duration =
     Duration::from_millis(DEFAULT_PATH_PROBE_INTERVAL_MS);
 pub const DEFAULT_PATH_PROBE_TIMEOUT: Duration =
     Duration::from_millis(DEFAULT_PATH_PROBE_TIMEOUT_MS);
-pub const DEFAULT_STREAM_WINDOW_BYTES: u64 = 64 * 1024 * 1024;
-pub const DEFAULT_REPAIR_BYTES: usize = 64 * 1024 * 1024;
-pub const DEFAULT_REORDER_BYTES: usize = 64 * 1024 * 1024;
-pub const DEFAULT_DATAGRAM_QUEUE_BYTES: usize = 16 * 1024 * 1024;
-pub const DEFAULT_PATH_FLIGHT_BYTES: usize = DEFAULT_REPAIR_BYTES;
-pub const DEFAULT_MAX_RELIABLE_RELAY_CHUNK_BYTES: usize = 512 * 1024;
-pub const DEFAULT_MAX_STREAMS: usize = 65_536;
-pub const DEFAULT_MAX_QUIC_CONCURRENT_BIDI_STREAMS: usize = DEFAULT_MAX_STREAMS;
-pub const DEFAULT_TCP_PATH_HEARTBEAT_INTERVAL_MS: u64 = 10_000;
-pub const DEFAULT_TCP_PATH_HEARTBEAT_TIMEOUT_MS: u64 = 30_000;
-pub const DEFAULT_TCP_PATH_HEARTBEAT_INTERVAL: Duration =
-    Duration::from_millis(DEFAULT_TCP_PATH_HEARTBEAT_INTERVAL_MS);
-pub const DEFAULT_TCP_PATH_HEARTBEAT_TIMEOUT: Duration =
-    Duration::from_millis(DEFAULT_TCP_PATH_HEARTBEAT_TIMEOUT_MS);
-pub const DEFAULT_QUIC_PATH_KEEP_ALIVE_INTERVAL_MS: u64 = 10_000;
-pub const DEFAULT_QUIC_PATH_IDLE_TIMEOUT_MS: u64 = 30_000;
-pub const DEFAULT_QUIC_PATH_KEEP_ALIVE_INTERVAL: Duration =
-    Duration::from_millis(DEFAULT_QUIC_PATH_KEEP_ALIVE_INTERVAL_MS);
-pub const DEFAULT_QUIC_PATH_IDLE_TIMEOUT: Duration =
-    Duration::from_millis(DEFAULT_QUIC_PATH_IDLE_TIMEOUT_MS);
 pub const DEFAULT_RESTART_BACKOFF_MS: u64 = 1_000;
 pub const DEFAULT_RESTART_MAX_BACKOFF_MS: u64 = 30_000;
 pub const DEFAULT_RESTART_BACKOFF: Duration = Duration::from_millis(DEFAULT_RESTART_BACKOFF_MS);
@@ -40,6 +32,10 @@ pub const DEFAULT_RESTART_MAX_BACKOFF: Duration =
 pub const DEFAULT_AUTH_FRESHNESS_WINDOW_SECONDS: u64 = 300;
 pub const DEFAULT_AUTH_FRESHNESS_WINDOW: Duration =
     Duration::from_secs(DEFAULT_AUTH_FRESHNESS_WINDOW_SECONDS);
+pub const DEFAULT_AUTHENTICATION_TIMEOUT_MS: u64 = 10_000;
+pub const DEFAULT_AUTHENTICATION_TIMEOUT: Duration =
+    Duration::from_millis(DEFAULT_AUTHENTICATION_TIMEOUT_MS);
+pub const DEFAULT_MAX_PENDING_AUTHENTICATIONS: usize = 128;
 pub const DEFAULT_OUTBOUND_CONNECT_TIMEOUT_MS: u64 = 10_000;
 pub const DEFAULT_OUTBOUND_CONNECT_TIMEOUT: Duration =
     Duration::from_millis(DEFAULT_OUTBOUND_CONNECT_TIMEOUT_MS);
@@ -58,41 +54,308 @@ pub struct AppConfig {
     pub session: SessionConfig,
     /// Runtime envelopes shared by product streams, datagram flows, and carriers.
     pub resources: ResourceLimits,
+    /// Product flow/open/DNS admission, independent of Core transport budgets.
+    pub admission: ProductAdmissionConfig,
     /// Observation/control plane. It must not become a hidden data-plane owner.
     pub management: ManagementConfig,
-    /// Representative process security for CLI/default checks. MPP peer secrets
-    /// are scoped to each MPP inbound/outbound/path where configured.
-    pub security: SecurityConfig,
     /// Role-free runtime graph: client, server, or a node containing both.
     pub command: CommandConfig,
 }
 
 impl AppConfig {
     pub fn validate(&self) -> Result<(), ConfigError> {
-        if self.security.auth_freshness_window.is_zero() {
-            return Err(ConfigError::AuthFreshnessWindowZero);
+        if !matches!(
+            self.log_level.as_str(),
+            "off" | "error" | "warn" | "info" | "debug" | "trace"
+        ) {
+            return Err(ConfigError::InvalidLogLevel(self.log_level.clone()));
         }
         self.service.validate()?;
         self.session.validate()?;
         self.resources.validate()?;
+        self.admission.validate()?;
         self.management.validate()?;
-        match &self.command {
-            CommandConfig::Client(client) => validate_client_config(client, self.resources)?,
-            CommandConfig::Server(server) => validate_server_config(server, self.resources)?,
-            CommandConfig::Node(node) => {
-                if node.clients.is_empty() && node.servers.is_empty() {
-                    return Err(ConfigError::NoRuntimeServices);
-                }
-                for client in &node.clients {
-                    validate_client_config(client, self.resources)?;
-                }
-                for server in &node.servers {
-                    validate_server_config(server, self.resources)?;
+        let CommandConfig::Node(node) = &self.command;
+        validate_node_config(node, self.resources)?;
+        Ok(())
+    }
+}
+
+fn validate_node_config(node: &NodeConfig, resources: ResourceLimits) -> Result<(), ConfigError> {
+    if node.local_ingresses.is_empty() && node.servers.is_empty() {
+        return Err(ConfigError::NoRuntimeServices);
+    }
+
+    let mut leaf_networks = HashMap::with_capacity(node.outbounds.len());
+    for leaf in &node.outbounds {
+        if leaf_networks
+            .insert(leaf.id().clone(), leaf.networks())
+            .is_some()
+        {
+            return Err(ConfigError::ProductPolicy(format!(
+                "duplicate outbound {}",
+                leaf.id().as_str()
+            )));
+        }
+        match leaf {
+            OutboundLeafConfig::Mpp { config, .. } => {
+                validate_mpp_outbound(config, resources)?;
+            }
+            OutboundLeafConfig::Local {
+                connect_timeout, ..
+            } => {
+                if connect_timeout.is_zero() {
+                    return Err(ConfigError::OutboundConnectTimeoutZero);
                 }
             }
         }
-        Ok(())
     }
+
+    let dns_policy = node
+        .dns_policy
+        .compile()
+        .map_err(|error| ConfigError::DnsPolicy(error.to_string()))?;
+    validate_gateway_balancers(&leaf_networks, &node.gateway_balancers)?;
+    for server in &node.servers {
+        validate_mpp_inbound(server, resources)?;
+        if let Some(plan) = &server.dns_plan
+            && dns_policy.plan(plan).is_none()
+        {
+            return Err(ConfigError::DnsPolicy(format!(
+                "MPP inbound references missing DNS plan {}",
+                plan.as_str()
+            )));
+        }
+        validate_route_target(
+            &server.route_target,
+            &leaf_networks,
+            &node.gateway_balancers,
+        )?;
+        validate_mpp_inbound_egress(
+            &server.route_target,
+            &node.gateway_balancers,
+            &node.outbounds,
+        )?;
+    }
+    validate_local_ingresses(&node.local_ingresses)?;
+    validate_fake_dns_tun_routes(&node.local_ingresses, &dns_policy)?;
+    match (&node.product_policy, node.local_ingresses.is_empty()) {
+        (Some(policy), _) => {
+            policy
+                .compile()
+                .map_err(|error| ConfigError::ProductPolicy(error.to_string()))?;
+            validate_product_policy_targets(policy, &leaf_networks, &node.gateway_balancers)?;
+            validate_product_policy_dns_plans(policy, &dns_policy)?;
+        }
+        (None, false) => return Err(ConfigError::LocalIngressRoutingRequired),
+        (None, true) => {}
+    }
+    Ok(())
+}
+
+fn validate_fake_dns_tun_routes(
+    ingresses: &[LocalIngressConfig],
+    dns_policy: &CompiledDnsPolicy,
+) -> Result<(), ConfigError> {
+    let Some(fake_dns) = dns_policy.fake_dns() else {
+        return Ok(());
+    };
+    let pools = fake_dns
+        .ipv4_pool
+        .map(IpNet::V4)
+        .into_iter()
+        .chain(fake_dns.ipv6_pool.map(IpNet::V6));
+    for ingress in ingresses {
+        let IngressConfig::TunL4(tun) = &ingress.config else {
+            continue;
+        };
+        let Some(managed) = tun.managed_vpn() else {
+            continue;
+        };
+        for pool in pools.clone() {
+            if managed
+                .excludes
+                .iter()
+                .any(|excluded| ip_nets_overlap(*excluded, pool))
+            {
+                return Err(ConfigError::DnsPolicy(format!(
+                    "FakeDNS pool {pool} overlaps a managed VPN exclude"
+                )));
+            }
+            if let crate::platform::RouteMode::Split(includes) = &managed.route_mode
+                && !includes
+                    .iter()
+                    .any(|included| ip_net_contains(*included, pool))
+            {
+                return Err(ConfigError::DnsPolicy(format!(
+                    "managed split VPN does not capture FakeDNS pool {pool}"
+                )));
+            }
+        }
+    }
+    Ok(())
+}
+
+fn ip_net_contains(outer: IpNet, inner: IpNet) -> bool {
+    outer.addr().is_ipv4() == inner.addr().is_ipv4()
+        && outer.prefix_len() <= inner.prefix_len()
+        && outer.contains(&inner.addr())
+}
+
+fn ip_nets_overlap(left: IpNet, right: IpNet) -> bool {
+    left.addr().is_ipv4() == right.addr().is_ipv4()
+        && (left.contains(&right.addr()) || right.contains(&left.addr()))
+}
+
+fn validate_product_policy_dns_plans(
+    policy: &ProductPolicyConfig,
+    dns_policy: &CompiledDnsPolicy,
+) -> Result<(), ConfigError> {
+    for rule in &policy.routes {
+        if let Some(plan) = rule.action.dns_plan()
+            && dns_policy.plan(plan).is_none()
+        {
+            return Err(ConfigError::ProductPolicy(format!(
+                "route {} references missing DNS plan {}",
+                rule.id.as_str(),
+                plan.as_str()
+            )));
+        }
+    }
+    Ok(())
+}
+
+fn validate_mpp_inbound_egress(
+    target: &RouteTarget,
+    balancers: &[GatewayBalancerConfig],
+    outbounds: &[OutboundLeafConfig],
+) -> Result<(), ConfigError> {
+    let member_ids = match target.kind {
+        RouteTargetKind::Outbound => vec![
+            OutboundId::parse(&target.tag)
+                .map_err(|error| ConfigError::ProductPolicy(error.to_string()))?,
+        ],
+        RouteTargetKind::Balancer => balancers
+            .iter()
+            .find(|balancer| balancer.id.as_str() == target.tag)
+            .map(|balancer| {
+                balancer
+                    .spec
+                    .members
+                    .iter()
+                    .map(|member| member.id.clone())
+                    .collect()
+            })
+            .unwrap_or_default(),
+    };
+    if member_ids.iter().any(|id| {
+        outbounds.iter().any(
+            |outbound| matches!(outbound, OutboundLeafConfig::Mpp { id: leaf, .. } if leaf == id),
+        )
+    }) {
+        return Err(ConfigError::ProductPolicy(
+            "MPP inbound egress cannot select an MPP outbound".to_string(),
+        ));
+    }
+    Ok(())
+}
+
+fn validate_gateway_balancers(
+    leaf_networks: &HashMap<OutboundId, NetworkSet>,
+    balancers: &[GatewayBalancerConfig],
+) -> Result<(), ConfigError> {
+    let mut balancer_ids = HashSet::with_capacity(balancers.len());
+    for config in balancers {
+        if !balancer_ids.insert(config.id.clone()) {
+            return Err(ConfigError::ProductPolicy(format!(
+                "duplicate MPP balancer {}",
+                config.id.as_str()
+            )));
+        }
+        GatewayBalancer::compile(config.generation, config.spec.clone())
+            .map_err(|error| ConfigError::ProductPolicy(error.to_string()))?;
+        for member in &config.spec.members {
+            let Some(networks) = leaf_networks.get(&member.id) else {
+                return Err(ConfigError::ProductPolicy(format!(
+                    "gateway balancer {} references missing outbound {}",
+                    config.id.as_str(),
+                    member.id.as_str()
+                )));
+            };
+            if member.networks != *networks {
+                return Err(ConfigError::ProductPolicy(format!(
+                    "gateway balancer {} member {} capability metadata does not match its leaf",
+                    config.id.as_str(),
+                    member.id.as_str()
+                )));
+            }
+        }
+    }
+    Ok(())
+}
+
+fn validate_route_target(
+    target: &RouteTarget,
+    leaves: &HashMap<OutboundId, NetworkSet>,
+    balancers: &[GatewayBalancerConfig],
+) -> Result<(), ConfigError> {
+    match target.kind {
+        RouteTargetKind::Outbound => {
+            let id = OutboundId::parse(&target.tag)
+                .map_err(|error| ConfigError::ProductPolicy(error.to_string()))?;
+            if !leaves.contains_key(&id) {
+                return Err(ConfigError::ProductPolicy(format!(
+                    "route target references missing outbound {}",
+                    target.tag
+                )));
+            }
+        }
+        RouteTargetKind::Balancer => {
+            if !balancers
+                .iter()
+                .any(|balancer| balancer.id.as_str() == target.tag)
+            {
+                return Err(ConfigError::ProductPolicy(format!(
+                    "route target references missing gateway balancer {}",
+                    target.tag
+                )));
+            }
+        }
+    }
+    Ok(())
+}
+
+fn validate_product_policy_targets(
+    policy: &ProductPolicyConfig,
+    leaves: &HashMap<OutboundId, NetworkSet>,
+    balancers: &[GatewayBalancerConfig],
+) -> Result<(), ConfigError> {
+    for rule in &policy.routes {
+        match rule.action.egress() {
+            EgressAction::Outbound(id) if !leaves.contains_key(id) => {
+                return Err(ConfigError::ProductPolicy(format!(
+                    "route {} references missing outbound {}",
+                    rule.id.as_str(),
+                    id.as_str()
+                )));
+            }
+            EgressAction::Balancer(id) if !balancers.iter().any(|balancer| &balancer.id == id) => {
+                return Err(ConfigError::ProductPolicy(format!(
+                    "route {} references missing gateway balancer {}",
+                    rule.id.as_str(),
+                    id.as_str()
+                )));
+            }
+            EgressAction::Direct => {
+                return Err(ConfigError::ProductPolicy(format!(
+                    "route {} must select a tagged direct outbound",
+                    rule.id.as_str()
+                )));
+            }
+            _ => {}
+        }
+    }
+    Ok(())
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -119,7 +382,7 @@ impl SessionConfig {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Default)]
+#[derive(Clone, PartialEq, Eq, Default)]
 pub struct ManagementConfig {
     pub listen: Vec<SocketAddr>,
     pub token: Option<String>,
@@ -127,6 +390,18 @@ pub struct ManagementConfig {
     pub dashboard: bool,
     /// Allows an authenticated MPP peer to request a sanitized path snapshot.
     pub allow_peer_diagnostics: bool,
+}
+
+impl std::fmt::Debug for ManagementConfig {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("ManagementConfig")
+            .field("listen", &self.listen)
+            .field("token", &self.token.as_ref().map(|_| "<redacted>"))
+            .field("dashboard", &self.dashboard)
+            .field("allow_peer_diagnostics", &self.allow_peer_diagnostics)
+            .finish()
+    }
 }
 
 impl ManagementConfig {
@@ -160,29 +435,6 @@ impl ManagementConfig {
             return Err(ConfigError::ManagementListenerMustBeLoopback);
         }
         Ok(())
-    }
-}
-
-pub const DEFAULT_EXTRA_TRAFFIC_HINT_PERCENT: u16 = 5;
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct MppPerformanceConfig {
-    /// Operator hint for adaptive duplicate/probe/reinjection overhead, in percent.
-    ///
-    /// 5 means the sender may spend roughly 5% extra transport traffic when
-    /// runtime evidence shows that duplicate, reinjection, or probe work can reduce
-    /// stalls. The sender enforces this as a hard optional-work budget plus a
-    /// small startup floor; it is not a product-data throttle. 100 permits full
-    /// duplication in pathological cases, and values above 100 bias toward
-    /// redundant reinjection under severe instability.
-    pub extra_traffic_hint_percent: u16,
-}
-
-impl Default for MppPerformanceConfig {
-    fn default() -> Self {
-        Self {
-            extra_traffic_hint_percent: DEFAULT_EXTRA_TRAFFIC_HINT_PERCENT,
-        }
     }
 }
 
@@ -225,149 +477,17 @@ impl ServiceConfig {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct ResourceLimits {
-    pub max_frame_bytes: usize,
-    pub max_payload_bytes: usize,
-    pub max_ack_ranges: usize,
-    pub max_paths: usize,
-    pub max_streams: usize,
-    pub max_quic_concurrent_bidi_streams: usize,
-    pub max_stream_window_bytes: u64,
-    pub max_repair_bytes: usize,
-    pub max_reorder_bytes: usize,
-    pub max_datagram_queue_bytes: usize,
-    pub max_path_flight_bytes: usize,
-    pub max_reliable_relay_chunk_bytes: usize,
-    pub tcp_path_heartbeat_interval: Duration,
-    pub tcp_path_heartbeat_timeout: Duration,
-    pub quic_path_keep_alive_interval: Duration,
-    pub quic_path_idle_timeout: Duration,
-}
-
-impl Default for ResourceLimits {
-    fn default() -> Self {
-        Self {
-            max_frame_bytes: 1_048_576,
-            max_payload_bytes: 1_048_512,
-            max_ack_ranges: 256,
-            max_paths: 64,
-            max_streams: DEFAULT_MAX_STREAMS,
-            max_quic_concurrent_bidi_streams: DEFAULT_MAX_QUIC_CONCURRENT_BIDI_STREAMS,
-            max_stream_window_bytes: DEFAULT_STREAM_WINDOW_BYTES,
-            max_repair_bytes: DEFAULT_REPAIR_BYTES,
-            max_reorder_bytes: DEFAULT_REORDER_BYTES,
-            max_datagram_queue_bytes: DEFAULT_DATAGRAM_QUEUE_BYTES,
-            max_path_flight_bytes: DEFAULT_PATH_FLIGHT_BYTES,
-            max_reliable_relay_chunk_bytes: DEFAULT_MAX_RELIABLE_RELAY_CHUNK_BYTES,
-            tcp_path_heartbeat_interval: DEFAULT_TCP_PATH_HEARTBEAT_INTERVAL,
-            tcp_path_heartbeat_timeout: DEFAULT_TCP_PATH_HEARTBEAT_TIMEOUT,
-            quic_path_keep_alive_interval: DEFAULT_QUIC_PATH_KEEP_ALIVE_INTERVAL,
-            quic_path_idle_timeout: DEFAULT_QUIC_PATH_IDLE_TIMEOUT,
-        }
-    }
-}
-
-impl ResourceLimits {
-    pub fn validate(self) -> Result<(), ConfigError> {
-        if self.max_frame_bytes < 64 {
-            return Err(ConfigError::FrameLimitTooSmall);
-        }
-        if self.max_payload_bytes > self.max_frame_bytes.saturating_sub(16) {
-            return Err(ConfigError::PayloadLimitExceedsFrameLimit);
-        }
-        if self.max_ack_ranges == 0 {
-            return Err(ConfigError::AckRangeLimitZero);
-        }
-        if self.max_paths == 0 {
-            return Err(ConfigError::PathLimitZero);
-        }
-        if self.max_paths > u16::MAX as usize {
-            return Err(ConfigError::PathLimitTooLarge);
-        }
-        if self.max_streams == 0 {
-            return Err(ConfigError::StreamLimitZero);
-        }
-        if self.max_quic_concurrent_bidi_streams == 0 {
-            return Err(ConfigError::QuicBidiStreamLimitZero);
-        }
-        if self.max_stream_window_bytes == 0 {
-            return Err(ConfigError::StreamWindowLimitZero);
-        }
-        if self.max_repair_bytes < self.max_payload_bytes {
-            return Err(ConfigError::ReinjectionLimitTooSmall);
-        }
-        if self.max_reorder_bytes < self.max_payload_bytes {
-            return Err(ConfigError::ReorderLimitTooSmall);
-        }
-        if self.max_datagram_queue_bytes < self.max_payload_bytes {
-            return Err(ConfigError::DatagramQueueLimitTooSmall);
-        }
-        if self.max_reliable_relay_chunk_bytes == 0 {
-            return Err(ConfigError::MaxReliableRelayChunkBytesZero);
-        }
-        if self.max_reliable_relay_chunk_bytes > self.max_payload_bytes {
-            return Err(ConfigError::MaxReliableRelayChunkExceedsPayloadLimit);
-        }
-        if self.max_path_flight_bytes < self.max_reliable_relay_chunk_bytes {
-            return Err(ConfigError::PathFlightLimitTooSmall);
-        }
-        if self.max_path_flight_bytes > self.max_repair_bytes {
-            return Err(ConfigError::PathFlightLimitExceedsReinjectionLimit);
-        }
-        if self.tcp_path_heartbeat_interval.is_zero() {
-            return Err(ConfigError::TcpPathHeartbeatIntervalZero);
-        }
-        if self.tcp_path_heartbeat_timeout.is_zero() {
-            return Err(ConfigError::TcpPathHeartbeatTimeoutZero);
-        }
-        if self.tcp_path_heartbeat_timeout < self.tcp_path_heartbeat_interval {
-            return Err(ConfigError::TcpPathHeartbeatTimeoutTooSmall);
-        }
-        if self.quic_path_keep_alive_interval.is_zero() {
-            return Err(ConfigError::QuicPathKeepAliveIntervalZero);
-        }
-        if self.quic_path_idle_timeout.is_zero() {
-            return Err(ConfigError::QuicPathIdleTimeoutZero);
-        }
-        if self.quic_path_idle_timeout <= self.quic_path_keep_alive_interval {
-            return Err(ConfigError::QuicPathIdleTimeoutTooSmall);
-        }
-        if self.quic_path_idle_timeout.as_millis() > quinn::VarInt::MAX.into_inner() as u128 {
-            return Err(ConfigError::QuicPathIdleTimeoutTooLarge);
-        }
-        Ok(())
-    }
-}
-
-impl From<ResourceLimits> for CodecLimits {
-    fn from(value: ResourceLimits) -> Self {
-        Self {
-            max_frame_bytes: value.max_frame_bytes,
-            max_payload_bytes: value.max_payload_bytes,
-            max_ack_ranges: value.max_ack_ranges,
-            max_host_bytes: 255,
-        }
-    }
-}
-
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct SecurityConfig {
-    /// Selects the MPP record cipher used by TCP carriers. QUIC uses TLS 1.3.
-    pub cipher: CipherSuite,
-    pub secret: SharedSecret,
+pub struct ClientSecurityConfig {
+    /// One named application credential selected by this MPP outbound.
+    pub credential: Arc<CredentialRecord>,
     pub auth_freshness_window: Duration,
 }
 
-impl SecurityConfig {
-    pub fn encrypted(secret: SharedSecret) -> Self {
-        Self::encrypted_with_cipher(secret, CipherSuite::default())
-    }
-
-    pub fn encrypted_with_cipher(secret: SharedSecret, cipher: CipherSuite) -> Self {
+impl ClientSecurityConfig {
+    pub fn new(credential: Arc<CredentialRecord>) -> Self {
         Self {
-            cipher,
-            secret,
+            credential,
             auth_freshness_window: DEFAULT_AUTH_FRESHNESS_WINDOW,
         }
     }
@@ -376,19 +496,193 @@ impl SecurityConfig {
         self.auth_freshness_window = value;
         self
     }
+
+    #[cfg(test)]
+    pub(crate) fn for_test(secret: SharedSecret) -> Self {
+        let record = CredentialRecord::new(
+            CredentialId::parse("test-credential").expect("static test credential ID"),
+            PrincipalId::parse("test-peer").expect("static test principal"),
+            secret,
+            None,
+            false,
+            0,
+        )
+        .expect("static test credential");
+        let catalog = CredentialCatalog::compile([record]).expect("test credential catalog");
+        Self::new(
+            catalog
+                .credential(
+                    &CredentialId::parse("test-credential").expect("static test credential ID"),
+                )
+                .expect("test client credential"),
+        )
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ServerSecurityConfig {
+    /// Immutable Product credential set accepted by this MPP inbound.
+    pub credential_authority: CredentialAuthority,
+    pub auth_freshness_window: Duration,
+    /// Absolute bound covering application authentication and admission after
+    /// carrier accept. It is not consulted after the path is registered.
+    pub authentication_timeout: Duration,
+    /// Endpoint-local cap on unauthenticated TCP/QUIC carrier tasks.
+    pub max_pending_authentications: usize,
+}
+
+impl ServerSecurityConfig {
+    pub fn new(credential_authority: CredentialAuthority) -> Self {
+        Self {
+            credential_authority,
+            auth_freshness_window: DEFAULT_AUTH_FRESHNESS_WINDOW,
+            authentication_timeout: DEFAULT_AUTHENTICATION_TIMEOUT,
+            max_pending_authentications: DEFAULT_MAX_PENDING_AUTHENTICATIONS,
+        }
+    }
+
+    pub fn with_auth_freshness_window(mut self, value: Duration) -> Self {
+        self.auth_freshness_window = value;
+        self
+    }
+
+    pub fn with_authentication_timeout(mut self, value: Duration) -> Self {
+        self.authentication_timeout = value;
+        self
+    }
+
+    pub fn with_max_pending_authentications(mut self, value: usize) -> Self {
+        self.max_pending_authentications = value;
+        self
+    }
+
+    #[cfg(test)]
+    pub(crate) fn for_test(secret: SharedSecret) -> Self {
+        let id = CredentialId::parse("test-credential").expect("static test credential ID");
+        let record = CredentialRecord::new(
+            id.clone(),
+            PrincipalId::parse("test-peer").expect("static test principal"),
+            secret,
+            None,
+            false,
+            0,
+        )
+        .expect("static test credential");
+        let catalog = CredentialCatalog::compile([record]).expect("test credential catalog");
+        Self::new(catalog.authority(&[id]).expect("test credential authority"))
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum CommandConfig {
-    Client(ClientConfig),
-    Server(ServerConfig),
     Node(NodeConfig),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct NodeConfig {
-    pub clients: Vec<ClientConfig>,
-    pub servers: Vec<ServerConfig>,
+    /// One globally tagged namespace for MPP and native connector leaves.
+    pub outbounds: Vec<OutboundLeafConfig>,
+    /// Product gateway balancers over compatible leaf outbounds. They never
+    /// merge MPP carrier paths or own Core scheduling state.
+    pub gateway_balancers: Vec<GatewayBalancerConfig>,
+    /// Product-owned local ingress surfaces. They are intentionally not owned
+    /// by any one carrier/path group because routing selects that group per
+    /// normalized flow.
+    pub local_ingresses: Vec<LocalIngressConfig>,
+    /// Immutable new-flow policy generation for local SOCKS/HTTP/TUN traffic.
+    pub product_policy: Option<ProductPolicyConfig>,
+    /// Immutable tagged split-DNS policy shared by local resolution.
+    pub dns_policy: DnsPolicyConfig,
+    pub servers: Vec<MppInboundConfig>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GatewayBalancerConfig {
+    pub id: BalancerId,
+    pub generation: u64,
+    pub spec: GatewayBalancerSpec,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ProductPolicyConfig {
+    pub generation: u64,
+    pub routes: Vec<RouteRuleSpec>,
+    pub destination_acl: Vec<AclRuleSpec>,
+}
+
+impl ProductPolicyConfig {
+    pub fn compile(&self) -> Result<ProductPolicyGeneration, ProductPolicyCompileError> {
+        ProductPolicyGeneration::compile(
+            self.generation,
+            self.routes.clone(),
+            self.destination_acl.clone(),
+        )
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DnsPolicyConfig {
+    pub generation: u64,
+    pub spec: DnsPolicySpec,
+}
+
+impl DnsPolicyConfig {
+    /// Explicit, tagged system resolution for the simple proxy/server profile.
+    /// Managed full-VPN validation rejects this policy before publishing host
+    /// routes, so the convenience default cannot become an implicit DNS leak.
+    pub fn system_default() -> Self {
+        let upstream = DnsUpstreamId::parse("system").expect("static DNS upstream ID");
+        let plan = DnsPlanId::parse("default").expect("static DNS plan ID");
+        Self {
+            generation: 1,
+            spec: DnsPolicySpec {
+                upstreams: vec![DnsUpstreamSpec::direct(
+                    upstream.clone(),
+                    DnsUpstreamEndpoint::System,
+                )],
+                outbound_capabilities: Vec::new(),
+                plans: vec![DnsPlanSpec::new(plan.clone(), vec![upstream])],
+                rules: Vec::new(),
+                hosts: Vec::new(),
+                fake_dns: None,
+                default_plan: plan,
+            },
+        }
+    }
+
+    pub fn compile(&self) -> Result<CompiledDnsPolicy, crate::product::DnsCompileError> {
+        CompiledDnsPolicy::compile(self.generation, self.spec.clone())
+    }
+}
+
+impl Default for DnsPolicyConfig {
+    fn default() -> Self {
+        Self::system_default()
+    }
+}
+
+/// Immutable destination-authorization generation for flows accepted by one
+/// MPP server inbound. An empty rule list retains Product's safe restricted-IP
+/// default; only an explicit `AllowRestricted` rule can opt a scoped target in.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ServerDestinationAclConfig {
+    pub generation: u64,
+    pub rules: Vec<AclRuleSpec>,
+}
+
+impl Default for ServerDestinationAclConfig {
+    fn default() -> Self {
+        Self {
+            generation: 1,
+            rules: Vec::new(),
+        }
+    }
+}
+
+impl ServerDestinationAclConfig {
+    pub fn compile(&self) -> Result<DestinationAcl, AclError> {
+        DestinationAcl::compile(self.generation, self.rules.clone())
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -404,20 +698,47 @@ pub struct RouteTarget {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct ClientConfig {
-    /// Route selected by local inbounds: one MPP outbound tag or MPP balancer tag.
-    pub route_target: Option<RouteTarget>,
-    /// Local SOCKS5/HTTP/TUN ingress surfaces owned by this client service.
-    pub ingresses: Vec<LocalIngressConfig>,
+pub struct MppOutboundConfig {
     /// Representative security for process-level validation; live path security
     /// is stored per `ClientPathConfig`.
-    pub security: SecurityConfig,
+    pub security: ClientSecurityConfig,
     /// Candidate MPP carrier paths. Each path owns its own peer security.
     pub paths: Vec<ClientPathConfig>,
     pub path_probe_interval: Duration,
     pub path_probe_timeout: Duration,
     /// MPP sender behavior for this outbound path group.
     pub performance: MppPerformanceConfig,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum OutboundLeafConfig {
+    Mpp {
+        id: OutboundId,
+        config: Box<MppOutboundConfig>,
+    },
+    Local {
+        id: OutboundId,
+        config: OutboundConfig,
+        connect_timeout: Duration,
+    },
+}
+
+impl OutboundLeafConfig {
+    pub const fn id(&self) -> &OutboundId {
+        match self {
+            Self::Mpp { id, .. } | Self::Local { id, .. } => id,
+        }
+    }
+
+    pub fn networks(&self) -> crate::product::NetworkSet {
+        match self {
+            Self::Mpp { .. } => crate::product::NetworkSet::TCP_UDP,
+            Self::Local { config, .. } if config.supports_udp_targets() => {
+                crate::product::NetworkSet::TCP_UDP
+            }
+            Self::Local { .. } => crate::product::NetworkSet::TCP,
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -431,60 +752,51 @@ pub struct ClientPathConfig {
     /// One configured carrier path for an MPP outbound.
     pub spec: PathSpec,
     /// Security scoped to this path's MPP peer relationship.
-    pub security: SecurityConfig,
+    pub security: ClientSecurityConfig,
+    /// Independently pinned carrier TLS identity. TCP and QUIC consume the same
+    /// Product-configured identity; application credentials never derive it.
+    pub tls: TcpClientTlsConfig,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct ServerConfig {
+pub struct MppInboundConfig {
     /// Display/routing tag for this MPP inbound.
     pub tag: Option<String>,
     /// Egress outbound or egress balancer selected for accepted MPP flows.
-    pub route_target: Option<RouteTarget>,
+    pub route_target: RouteTarget,
+    /// Optional DNS plan for target resolution before native egress.
+    pub dns_plan: Option<crate::product::DnsPlanId>,
     /// Carrier listen/bind paths owned by this MPP inbound.
     pub bind_paths: Vec<PathSpec>,
     /// Security scoped to peers that join this MPP inbound.
-    pub security: SecurityConfig,
-    /// Resolved egress behavior for accepted target TCP/UDP flows.
-    pub outbound: OutboundConfig,
-    /// DNS policy owned by the selected egress behavior.
-    pub outbound_dns: DnsConfig,
-    /// Target connect timeout owned by the selected egress behavior.
-    pub outbound_connect_timeout: Duration,
+    pub security: ServerSecurityConfig,
+    /// TLS identity shared by every TCP and QUIC listener in this MPP inbound.
+    pub tls: TcpServerTlsConfig,
+    /// Immutable Product destination authorization for accepted TCP/UDP flows.
+    pub destination_acl: ServerDestinationAclConfig,
     /// MPP sender behavior for streams accepted by this inbound path group.
     pub performance: MppPerformanceConfig,
 }
 
-fn validate_client_config(
-    client: &ClientConfig,
+fn validate_mpp_outbound(
+    client: &MppOutboundConfig,
     resources: ResourceLimits,
 ) -> Result<(), ConfigError> {
     if client.paths.is_empty() {
         return Err(ConfigError::NoPaths);
     }
-    if client.ingresses.is_empty() {
-        return Err(ConfigError::NoIngresses);
-    }
-    for ingress in &client.ingresses {
-        validate_ingress(&ingress.config)?;
-        if let IngressConfig::TunL4(tun) = &ingress.config {
-            validate_tun_l4(tun)?;
-        }
-    }
-    validate_security_config(&client.security)?;
-    for ingress in &client.ingresses {
-        match &ingress.config {
-            IngressConfig::Socks5 { proxy_auth, .. }
-            | IngressConfig::HttpConnect { proxy_auth, .. } => {
-                validate_proxy_auth(proxy_auth)?;
-            }
-            IngressConfig::TunL4(_) => {}
-        }
-    }
+    validate_client_security_config(&client.security)?;
     if client.paths.len() > resources.max_paths {
         return Err(ConfigError::TooManyPaths {
             actual: client.paths.len(),
             limit: resources.max_paths,
         });
+    }
+    if client.paths.iter().any(|path| {
+        path.spec.underlay == crate::protocol::UnderlayProtocol::Udp
+            && path.tls.quic_server_name_text().is_none()
+    }) {
+        return Err(ConfigError::QuicTlsServerNameRequiresDns);
     }
     if client.path_probe_interval.is_zero() {
         return Err(ConfigError::PathProbeIntervalZero);
@@ -495,8 +807,37 @@ fn validate_client_config(
     Ok(())
 }
 
-fn validate_server_config(
-    server: &ServerConfig,
+fn validate_local_ingresses(ingresses: &[LocalIngressConfig]) -> Result<(), ConfigError> {
+    let managed_tun_count = ingresses
+        .iter()
+        .filter(|ingress| {
+            matches!(
+                &ingress.config,
+                IngressConfig::TunL4(tun) if tun.managed_vpn().is_some()
+            )
+        })
+        .count();
+    if managed_tun_count > 1 {
+        return Err(ConfigError::MultipleManagedTunInbounds {
+            actual: managed_tun_count,
+        });
+    }
+    for ingress in ingresses {
+        let tag = ingress
+            .tag
+            .as_deref()
+            .ok_or(ConfigError::LocalIngressTagRequired)?;
+        InboundId::parse(tag).map_err(|_| ConfigError::LocalIngressTagInvalid)?;
+        validate_ingress(&ingress.config)?;
+        if let IngressConfig::TunL4(tun) = &ingress.config {
+            validate_tun_l4(tun)?;
+        }
+    }
+    Ok(())
+}
+
+fn validate_mpp_inbound(
+    server: &MppInboundConfig,
     resources: ResourceLimits,
 ) -> Result<(), ConfigError> {
     if server.bind_paths.is_empty() {
@@ -515,37 +856,48 @@ fn validate_server_config(
     {
         return Err(ConfigError::ServerPathSourceBinding);
     }
-    validate_security_config(&server.security)?;
-    server.outbound_dns.validate()?;
-    if server.outbound_connect_timeout.is_zero() {
-        return Err(ConfigError::OutboundConnectTimeoutZero);
-    }
+    validate_server_security_config(&server.security)?;
+    server
+        .destination_acl
+        .compile()
+        .map_err(|error| ConfigError::ServerDestinationAcl(error.to_string()))?;
     Ok(())
 }
 
-fn validate_security_config(security: &SecurityConfig) -> Result<(), ConfigError> {
+fn validate_client_security_config(security: &ClientSecurityConfig) -> Result<(), ConfigError> {
     if security.auth_freshness_window.is_zero() {
         return Err(ConfigError::AuthFreshnessWindowZero);
     }
     Ok(())
 }
 
-impl DnsConfig {
-    pub fn validate(&self) -> Result<(), ConfigError> {
-        if self.timeout.is_zero() {
-            return Err(ConfigError::OutboundDnsTimeoutZero);
-        }
-        if self.resolvers.iter().any(|resolver| resolver.port() == 0) {
-            return Err(ConfigError::OutboundDnsResolverPortZero);
-        }
-        Ok(())
+fn validate_server_security_config(security: &ServerSecurityConfig) -> Result<(), ConfigError> {
+    if security.auth_freshness_window.is_zero() {
+        return Err(ConfigError::AuthFreshnessWindowZero);
     }
+    if security.authentication_timeout.is_zero() {
+        return Err(ConfigError::AuthenticationTimeoutZero);
+    }
+    if security.max_pending_authentications == 0 {
+        return Err(ConfigError::MaxPendingAuthenticationsZero);
+    }
+    Ok(())
 }
 
 fn validate_ingress(ingress: &IngressConfig) -> Result<(), ConfigError> {
     match ingress {
         IngressConfig::Socks5 { listen, .. } | IngressConfig::HttpConnect { listen, .. } => {
             if listen.is_empty() {
+                return Err(ConfigError::NoListenAddresses);
+            }
+        }
+        IngressConfig::TcpForward(config) => {
+            if config.listen().is_empty() {
+                return Err(ConfigError::NoListenAddresses);
+            }
+        }
+        IngressConfig::UdpForward(config) => {
+            if config.listen().is_empty() {
                 return Err(ConfigError::NoListenAddresses);
             }
         }
@@ -580,32 +932,19 @@ fn validate_tun_l4(tun: &crate::ingress::tun::TunL4Config) -> Result<(), ConfigE
     {
         return Err(ConfigError::TunDnsResolverPortZero);
     }
-    Ok(())
-}
-
-fn validate_proxy_auth(auth: &ProxyAuthConfig) -> Result<(), ConfigError> {
-    let Some(credentials) = auth.credentials() else {
-        return Ok(());
-    };
-    if credentials.username().is_empty() {
-        return Err(ConfigError::ProxyAuthUsernameEmpty);
-    }
-    if credentials.password().is_empty() {
-        return Err(ConfigError::ProxyAuthPasswordEmpty);
-    }
-    if credentials.username().len() > u8::MAX as usize {
-        return Err(ConfigError::ProxyAuthUsernameTooLong);
-    }
-    if credentials.password().len() > u8::MAX as usize {
-        return Err(ConfigError::ProxyAuthPasswordTooLong);
-    }
+    tun.compile_managed_vpn()
+        .map_err(|error| ConfigError::ManagedVpn(error.to_string()))?;
     Ok(())
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ConfigError {
     Security(SecurityPolicyError),
+    ProductAdmission(ProductAdmissionConfigError),
+    InvalidLogLevel(String),
     AuthFreshnessWindowZero,
+    AuthenticationTimeoutZero,
+    MaxPendingAuthenticationsZero,
     NoPaths,
     FrameLimitTooSmall,
     PayloadLimitExceedsFrameLimit,
@@ -617,6 +956,9 @@ pub enum ConfigError {
     StreamWindowLimitZero,
     ReinjectionLimitTooSmall,
     ReorderLimitTooSmall,
+    ReinjectionCacheChunkLimitZero,
+    ReorderBufferChunkLimitZero,
+    RetainedReceiveRangeLimitZero,
     DatagramQueueLimitTooSmall,
     MaxReliableRelayChunkBytesZero,
     MaxReliableRelayChunkExceedsPayloadLimit,
@@ -639,6 +981,7 @@ pub enum ConfigError {
     TooManyPaths { actual: usize, limit: usize },
     PathProbeIntervalZero,
     PathProbeTimeoutZero,
+    QuicTlsServerNameRequiresDns,
     ServerPathSourceBinding,
     TunAddressRequired,
     TunIpv4PrefixInvalid,
@@ -647,13 +990,15 @@ pub enum ConfigError {
     TunIpv6MtuTooSmall,
     TunDnsTtlZero,
     TunDnsResolverPortZero,
-    OutboundDnsTimeoutZero,
-    OutboundDnsResolverPortZero,
+    ManagedVpn(String),
+    MultipleManagedTunInbounds { actual: usize },
+    DnsPolicy(String),
     OutboundConnectTimeoutZero,
-    ProxyAuthUsernameEmpty,
-    ProxyAuthPasswordEmpty,
-    ProxyAuthUsernameTooLong,
-    ProxyAuthPasswordTooLong,
+    LocalIngressTagRequired,
+    LocalIngressTagInvalid,
+    LocalIngressRoutingRequired,
+    ProductPolicy(String),
+    ServerDestinationAcl(String),
     ManagementListenPortZero,
     ManagementTokenEmpty,
     ManagementTokenInvalid,
@@ -663,9 +1008,63 @@ pub enum ConfigError {
     NoRuntimeServices,
 }
 
+impl From<ResourceLimitError> for ConfigError {
+    fn from(value: ResourceLimitError) -> Self {
+        match value {
+            ResourceLimitError::FrameLimitTooSmall => Self::FrameLimitTooSmall,
+            ResourceLimitError::PayloadLimitExceedsFrameLimit => {
+                Self::PayloadLimitExceedsFrameLimit
+            }
+            ResourceLimitError::AckRangeLimitZero => Self::AckRangeLimitZero,
+            ResourceLimitError::PathLimitZero => Self::PathLimitZero,
+            ResourceLimitError::PathLimitTooLarge => Self::PathLimitTooLarge,
+            ResourceLimitError::StreamLimitZero => Self::StreamLimitZero,
+            ResourceLimitError::QuicBidiStreamLimitZero => Self::QuicBidiStreamLimitZero,
+            ResourceLimitError::StreamWindowLimitZero => Self::StreamWindowLimitZero,
+            ResourceLimitError::ReinjectionLimitTooSmall => Self::ReinjectionLimitTooSmall,
+            ResourceLimitError::ReorderLimitTooSmall => Self::ReorderLimitTooSmall,
+            ResourceLimitError::ReinjectionCacheChunkLimitZero => {
+                Self::ReinjectionCacheChunkLimitZero
+            }
+            ResourceLimitError::ReorderBufferChunkLimitZero => Self::ReorderBufferChunkLimitZero,
+            ResourceLimitError::RetainedReceiveRangeLimitZero => {
+                Self::RetainedReceiveRangeLimitZero
+            }
+            ResourceLimitError::DatagramQueueLimitTooSmall => Self::DatagramQueueLimitTooSmall,
+            ResourceLimitError::MaxReliableRelayChunkBytesZero => {
+                Self::MaxReliableRelayChunkBytesZero
+            }
+            ResourceLimitError::MaxReliableRelayChunkExceedsPayloadLimit => {
+                Self::MaxReliableRelayChunkExceedsPayloadLimit
+            }
+            ResourceLimitError::PathFlightLimitTooSmall => Self::PathFlightLimitTooSmall,
+            ResourceLimitError::PathFlightLimitExceedsReinjectionLimit => {
+                Self::PathFlightLimitExceedsReinjectionLimit
+            }
+            ResourceLimitError::TcpPathHeartbeatIntervalZero => Self::TcpPathHeartbeatIntervalZero,
+            ResourceLimitError::TcpPathHeartbeatTimeoutZero => Self::TcpPathHeartbeatTimeoutZero,
+            ResourceLimitError::TcpPathHeartbeatTimeoutTooSmall => {
+                Self::TcpPathHeartbeatTimeoutTooSmall
+            }
+            ResourceLimitError::QuicPathKeepAliveIntervalZero => {
+                Self::QuicPathKeepAliveIntervalZero
+            }
+            ResourceLimitError::QuicPathIdleTimeoutZero => Self::QuicPathIdleTimeoutZero,
+            ResourceLimitError::QuicPathIdleTimeoutTooSmall => Self::QuicPathIdleTimeoutTooSmall,
+            ResourceLimitError::QuicPathIdleTimeoutTooLarge => Self::QuicPathIdleTimeoutTooLarge,
+        }
+    }
+}
+
 impl From<SecurityPolicyError> for ConfigError {
     fn from(value: SecurityPolicyError) -> Self {
         Self::Security(value)
+    }
+}
+
+impl From<ProductAdmissionConfigError> for ConfigError {
+    fn from(value: ProductAdmissionConfigError) -> Self {
+        Self::ProductAdmission(value)
     }
 }
 
@@ -673,8 +1072,22 @@ impl std::fmt::Display for ConfigError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::Security(err) => write!(f, "{err}"),
+            Self::ProductAdmission(err) => write!(f, "{err}"),
+            Self::InvalidLogLevel(level) => write!(
+                f,
+                "invalid log level {level:?}; expected one of off, error, warn, info, debug, trace"
+            ),
             Self::AuthFreshnessWindowZero => {
                 write!(f, "auth freshness window must be greater than zero")
+            }
+            Self::AuthenticationTimeoutZero => {
+                write!(f, "authentication timeout must be greater than zero")
+            }
+            Self::MaxPendingAuthenticationsZero => {
+                write!(
+                    f,
+                    "maximum pending authentications must be greater than zero"
+                )
             }
             Self::NoPaths => write!(f, "at least one TCP or UDP path is required"),
             Self::FrameLimitTooSmall => write!(f, "max frame bytes must be at least 64"),
@@ -702,6 +1115,15 @@ impl std::fmt::Display for ConfigError {
             }
             Self::ReorderLimitTooSmall => {
                 write!(f, "max reorder bytes must be at least max payload bytes")
+            }
+            Self::ReinjectionCacheChunkLimitZero => {
+                write!(f, "max reinjection cache chunks must be greater than zero")
+            }
+            Self::ReorderBufferChunkLimitZero => {
+                write!(f, "max reorder buffer chunks must be greater than zero")
+            }
+            Self::RetainedReceiveRangeLimitZero => {
+                write!(f, "max retained receive ranges must be greater than zero")
             }
             Self::DatagramQueueLimitTooSmall => {
                 write!(
@@ -784,6 +1206,10 @@ impl std::fmt::Display for ConfigError {
             Self::PathProbeTimeoutZero => {
                 write!(f, "path probe timeout must be greater than zero")
             }
+            Self::QuicTlsServerNameRequiresDns => write!(
+                f,
+                "QUIC paths require a DNS TLS server name because HTTP/3 authority is bound to SNI; carrier endpoints may still use IP addresses"
+            ),
             Self::ServerPathSourceBinding => {
                 write!(f, "source-ip is valid only for client carrier paths")
             }
@@ -794,22 +1220,35 @@ impl std::fmt::Display for ConfigError {
             Self::TunIpv6MtuTooSmall => write!(f, "TUN IPv6 MTU must be at least 1280 bytes"),
             Self::TunDnsTtlZero => write!(f, "TUN DNS TTL must be greater than zero"),
             Self::TunDnsResolverPortZero => write!(f, "TUN DNS resolver port must be nonzero"),
-            Self::OutboundDnsTimeoutZero => {
-                write!(f, "outbound DNS timeout must be greater than zero")
+            Self::ManagedVpn(error) => {
+                write!(f, "invalid managed VPN configuration: {error}")
             }
-            Self::OutboundDnsResolverPortZero => {
-                write!(f, "outbound DNS resolver port must be nonzero")
-            }
+            Self::MultipleManagedTunInbounds { actual } => write!(
+                f,
+                "node config defines {actual} managed TUN inbounds; at most one may own host VPN state"
+            ),
+            Self::DnsPolicy(error) => write!(f, "invalid DNS policy: {error}"),
             Self::OutboundConnectTimeoutZero => {
                 write!(f, "outbound connect timeout must be greater than zero")
             }
-            Self::ProxyAuthUsernameEmpty => write!(f, "proxy auth username must not be empty"),
-            Self::ProxyAuthPasswordEmpty => write!(f, "proxy auth password must not be empty"),
-            Self::ProxyAuthUsernameTooLong => {
-                write!(f, "proxy auth username must fit in 255 bytes")
+            Self::LocalIngressTagRequired => {
+                write!(f, "every local inbound requires a routing tag")
             }
-            Self::ProxyAuthPasswordTooLong => {
-                write!(f, "proxy auth password must fit in 255 bytes")
+            Self::LocalIngressTagInvalid => {
+                write!(
+                    f,
+                    "local inbound tag must be a normalized Product inbound ID"
+                )
+            }
+            Self::LocalIngressRoutingRequired => {
+                write!(
+                    f,
+                    "local inbounds require a compiled Product routing policy"
+                )
+            }
+            Self::ProductPolicy(error) => write!(f, "{error}"),
+            Self::ServerDestinationAcl(error) => {
+                write!(f, "invalid server destination ACL policy: {error}")
             }
             Self::ManagementListenPortZero => {
                 write!(f, "management API listen port must be nonzero")

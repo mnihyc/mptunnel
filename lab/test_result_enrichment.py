@@ -7,6 +7,10 @@ import sys
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from result_enrichment import (
+    MPTUNNEL_CARRIER_PRESENTATION,
+    MPTUNNEL_PROTOCOL_VERSION,
+    RESULT_SCHEMA_VERSION,
+    RUN_MANIFEST_SCHEMA_VERSION,
     application_payload_bytes,
     enrich_baseline_identity,
     enrich_reproducibility,
@@ -18,6 +22,129 @@ from result_enrichment import (
     is_proven_upload_measurement,
     write_run_manifest,
 )
+
+
+def reproducibility_metadata(**overrides):
+    value = {
+        "result_schema_version": RESULT_SCHEMA_VERSION,
+        "run_manifest_schema_version": RUN_MANIFEST_SCHEMA_VERSION,
+        "host_snapshot_schema_version": 1,
+        "host_validity_rules_version": 1,
+        "host_snapshot_sha256": "c" * 64,
+        "host_valid": True,
+        "source_snapshot_sha256": "d" * 64,
+        "cargo_lock_sha256": "e" * 64,
+        "rustc_version": "rustc 1.96.0",
+        "rustc_executable_sha256": "f" * 64,
+        "cargo_version": "cargo 1.96.0",
+        "cargo_executable_sha256": "0" * 64,
+        "source_commit": "0123456789abcdef",
+        "source_tree_dirty": False,
+        "mptunnel_build_profile": "release",
+        "mptunnel_build_features": [],
+        "mptunnel_protocol_version": MPTUNNEL_PROTOCOL_VERSION,
+        "mptunnel_carrier_presentation": MPTUNNEL_CARRIER_PRESENTATION,
+    }
+    value.update(overrides)
+    return value
+
+
+def sample_host_snapshot():
+    rustc_version = "rustc 1.96.0"
+    cargo_version = "cargo 1.96.0"
+    return {
+        "schema_version": 1,
+        "kind": "mptunnel.lab.host-snapshot",
+        "captured_utc": "2026-07-26T00:00:00+00:00",
+        "host": {
+            "kernel": {
+                "system": "Linux",
+                "release": "test",
+                "machine": "x86_64",
+            },
+            "cpu": {
+                "models": ["Test CPU"],
+                "logical_count": 2,
+                "affinity": "0-1",
+                "affinity_count": 2,
+            },
+            "load": {
+                "load1": 0.1,
+                "load5": 0.1,
+                "load15": 0.1,
+                "load1_per_affinity_cpu": 0.05,
+                "runnable": 1,
+                "processes": 10,
+                "runnable_per_affinity_cpu": 0.5,
+            },
+            "memory": {
+                "total_bytes": 8_000_000,
+                "available_bytes": 6_000_000,
+                "available_ratio": 0.75,
+                "swap_total_bytes": 1_000_000,
+                "swap_free_bytes": 900_000,
+            },
+            "frequency": {
+                "exposed": True,
+                "governors": ["performance"],
+                "policies": [{"cpus": "0-1", "governor": "performance"}],
+            },
+            "thermal": {
+                "exposed": False,
+                "max_temp_millicelsius": None,
+                "zones": [],
+            },
+            "containers": {
+                "inventory_available": True,
+                "running_total": 3,
+                "excluded_lab_running": 3,
+                "external_running": 0,
+            },
+        },
+        "toolchain": {
+            "rustc": {
+                "version": rustc_version,
+                "version_verbose": rustc_version,
+                "version_verbose_sha256": hashlib.sha256(
+                    rustc_version.encode()
+                ).hexdigest(),
+                "executable_sha256": "f" * 64,
+            },
+            "cargo": {
+                "version": cargo_version,
+                "version_verbose": cargo_version,
+                "version_verbose_sha256": hashlib.sha256(
+                    cargo_version.encode()
+                ).hexdigest(),
+                "executable_sha256": "0" * 64,
+            },
+        },
+        "source": {
+            "commit": "a" * 40,
+            "tree_dirty": False,
+            "capture_stable": True,
+            "snapshot_algorithm": "git-visible-tree-sha256-v1",
+            "snapshot_sha256": "d" * 64,
+            "tracked_patch_sha256": hashlib.sha256(b"").hexdigest(),
+            "cargo_lock_sha256": "e" * 64,
+        },
+        "validity": {
+            "rules_version": 1,
+            "valid": True,
+            "invalid_reasons": [],
+            "warnings": [{"code": "thermal_state_unavailable"}],
+            "thresholds": {
+                "max_load1_per_affinity_cpu": 0.5,
+                "max_runnable_per_affinity_cpu": 1.0,
+                "min_memory_available_ratio": 0.15,
+                "max_thermal_millicelsius": 85_000,
+                "max_external_running_containers": 0,
+                "required_governor_when_exposed": "performance",
+                "source_tree_must_be_clean": True,
+                "source_capture_must_be_stable": True,
+            },
+        },
+    }
 
 
 class ResultEnrichmentTests(unittest.TestCase):
@@ -85,19 +212,18 @@ class ResultEnrichmentTests(unittest.TestCase):
         enrich_reproducibility(
             row,
             json.dumps(
-                {
-                    "source_commit": "0123456789abcdef",
-                    "source_tree_dirty": False,
-                    "mptunnel_build_profile": "release",
-                    "mptunnel_build_features": ["lab-diagnostics", "lab-diagnostics"],
-                    "mptunnel_protocol_version": 2,
-                    "mptunnel_client_runtime": "wine",
-                    "mptunnel_client_runtime_version": "wine-9.0",
-                    "mptunnel_client_target": "x86_64-pc-windows-gnu",
-                    "mptunnel_client_sha256": "a" * 64,
-                    "mptunnel_server_target": "x86_64-unknown-linux-gnu",
-                    "mptunnel_server_sha256": "b" * 64,
-                }
+                reproducibility_metadata(
+                    mptunnel_build_features=[
+                        "lab-diagnostics",
+                        "lab-diagnostics",
+                    ],
+                    mptunnel_client_runtime="wine",
+                    mptunnel_client_runtime_version="wine-9.0",
+                    mptunnel_client_target="x86_64-pc-windows-gnu",
+                    mptunnel_client_sha256="a" * 64,
+                    mptunnel_server_target="x86_64-unknown-linux-gnu",
+                    mptunnel_server_sha256="b" * 64,
+                )
             ),
         )
 
@@ -105,26 +231,40 @@ class ResultEnrichmentTests(unittest.TestCase):
         self.assertFalse(row["source_tree_dirty"])
         self.assertEqual(row["mptunnel_build_profile"], "release")
         self.assertEqual(row["mptunnel_build_features"], ["lab-diagnostics"])
-        self.assertEqual(row["mptunnel_protocol_version"], 2)
+        self.assertEqual(
+            row["mptunnel_protocol_version"], MPTUNNEL_PROTOCOL_VERSION
+        )
+        self.assertEqual(
+            row["mptunnel_carrier_presentation"],
+            MPTUNNEL_CARRIER_PRESENTATION,
+        )
         self.assertEqual(row["mptunnel_client_runtime"], "wine")
         self.assertEqual(row["mptunnel_client_runtime_version"], "wine-9.0")
         self.assertEqual(row["mptunnel_client_target"], "x86_64-pc-windows-gnu")
         self.assertEqual(row["mptunnel_client_sha256"], "a" * 64)
         self.assertEqual(row["mptunnel_server_target"], "x86_64-unknown-linux-gnu")
         self.assertEqual(row["mptunnel_server_sha256"], "b" * 64)
+        self.assertEqual(row["result_schema_version"], RESULT_SCHEMA_VERSION)
+        self.assertTrue(row["host_valid"])
+        self.assertEqual(row["source_snapshot_sha256"], "d" * 64)
 
     def test_reproducibility_rejects_partial_runtime_identity(self):
-        metadata = {
-            "source_commit": "0123456789abcdef",
-            "source_tree_dirty": False,
-            "mptunnel_build_profile": "release",
-            "mptunnel_build_features": [],
-            "mptunnel_protocol_version": 2,
-            "mptunnel_client_runtime": "wine",
-        }
+        metadata = reproducibility_metadata(mptunnel_client_runtime="wine")
 
         with self.assertRaisesRegex(ValueError, "runtime identity must be complete"):
             enrich_reproducibility({}, metadata)
+
+    def test_reproducibility_rejects_a_stale_wire_identity(self):
+        stale_values = (
+            {"mptunnel_protocol_version": 3},
+            {"mptunnel_carrier_presentation": "unsupported-carrier"},
+        )
+        for overrides in stale_values:
+            with self.subTest(overrides=overrides):
+                with self.assertRaisesRegex(ValueError, "mptunnel_"):
+                    enrich_reproducibility(
+                        {}, reproducibility_metadata(**overrides)
+                    )
 
     def test_run_manifest_records_inputs_without_secrets(self):
         baseline_lock = {
@@ -146,9 +286,8 @@ class ResultEnrichmentTests(unittest.TestCase):
             },
         }
         environment = {
-            "RESULT_FILE": "lab/results/example/results.jsonl",
+            "RESULT_FILE": ".tmp/lab/results/example/results.jsonl",
             "CASE_FILTER_VALUE": "mptunnel_tcp_*",
-            "RESULT_REPRODUCIBILITY": json.dumps({"source_commit": "abc"}),
             "OBJECT_MIB": "4096",
             "LOAD_DURATION_SECONDS": "10",
             "UPLOAD_DRAIN_TIMEOUT_SECONDS": "5",
@@ -165,20 +304,21 @@ class ResultEnrichmentTests(unittest.TestCase):
             "CONTAINER_STATS_VALUE": "1",
             "MANAGEMENT_SNAPSHOTS_VALUE": "0",
             "USE_PATH_HINTS_VALUE": "0",
+            "REQUIRE_COMPETITOR_BASELINES_VALUE": "1",
             "CLIENT_CONTAINER_ID": "client-id",
             "SERVER_CONTAINER_ID": "server-id",
             "TARGET_CONTAINER_ID": "target-id",
             "CLIENT_IMAGE_ID": "client-image",
             "SERVER_IMAGE_ID": "server-image",
             "TARGET_IMAGE_ID": "target-image",
-            "HOST_KERNEL": "Linux test",
-            "HOST_CPU_COUNT": "2",
-            "HOST_MEMORY_BYTES": "4096",
             "DOCKER_VERSION": "1",
             "COMPOSE_VERSION": "2",
             "BASELINE_LOCK_SHA256": "",
             "MPTUNNEL_LAB_FAT_LOSS": "0.00%",
             "MPTUNNEL_LAB_NETEM_LIMIT_PACKETS": "32768",
+            "MPTUNNEL_MAX_QUIC_CONCURRENT_BIDI_STREAMS": "4096",
+            "MPTUNNEL_MAX_RETAINED_RECEIVE_RANGES": "2048",
+            "MPTUNNEL_QUIC_PATH_IDLE_TIMEOUT_MS": "45000",
             "MPTUNNEL_LAB_FAT_LOSS_API_KEY": "must-not-leak-either",
             "MPTUNNEL_LAB_SECRET": "must-not-leak",
         }
@@ -186,20 +326,54 @@ class ResultEnrichmentTests(unittest.TestCase):
             path = Path(directory) / "manifest.json"
             baseline_lock_path = Path(directory) / "baseline-lock.json"
             baseline_lock_path.write_text(json.dumps(baseline_lock), encoding="utf-8")
+            host_snapshot_path = Path(directory) / "host-snapshot.json"
+            host_snapshot_path.write_text(
+                json.dumps(sample_host_snapshot(), indent=2, sort_keys=True) + "\n",
+                encoding="utf-8",
+            )
+            host_snapshot_sha256 = hashlib.sha256(
+                host_snapshot_path.read_bytes()
+            ).hexdigest()
             environment["BASELINE_LOCK_FILE"] = str(baseline_lock_path)
             environment["BASELINE_LOCK_SHA256"] = hashlib.sha256(
                 baseline_lock_path.read_bytes()
             ).hexdigest()
+            environment["HOST_SNAPSHOT_FILE"] = str(host_snapshot_path)
+            environment["HOST_SNAPSHOT_SHA256"] = host_snapshot_sha256
+            environment["RESULT_REPRODUCIBILITY"] = json.dumps(
+                reproducibility_metadata(
+                    source_commit="a" * 40,
+                    host_snapshot_sha256=host_snapshot_sha256,
+                    mptunnel_client_runtime="native",
+                    mptunnel_client_runtime_version="native",
+                    mptunnel_client_target="x86_64-unknown-linux-gnu",
+                    mptunnel_client_sha256="1" * 64,
+                    mptunnel_server_target="x86_64-unknown-linux-gnu",
+                    mptunnel_server_sha256="2" * 64,
+                )
+            )
             manifest = write_run_manifest(path, environment)
 
+            self.assertEqual(
+                manifest["schema_version"], RUN_MANIFEST_SCHEMA_VERSION
+            )
+            self.assertEqual(
+                manifest["result_schema_version"], RESULT_SCHEMA_VERSION
+            )
             self.assertEqual(manifest["workload"]["bulk_connections"], 1)
             self.assertEqual(manifest["workload"]["object_mib"], 4096)
             self.assertTrue(manifest["execution"]["isolate_containers_per_case"])
+            self.assertTrue(
+                manifest["execution"]["require_competitor_baselines"]
+            )
             self.assertEqual(
                 manifest["safe_environment_overrides"],
                 {
                     "MPTUNNEL_LAB_FAT_LOSS": "0.00%",
                     "MPTUNNEL_LAB_NETEM_LIMIT_PACKETS": "32768",
+                    "MPTUNNEL_MAX_QUIC_CONCURRENT_BIDI_STREAMS": "4096",
+                    "MPTUNNEL_MAX_RETAINED_RECEIVE_RANGES": "2048",
+                    "MPTUNNEL_QUIC_PATH_IDLE_TIMEOUT_MS": "45000",
                 },
             )
             self.assertNotIn("must-not-leak", path.read_text(encoding="utf-8"))
@@ -207,6 +381,10 @@ class ResultEnrichmentTests(unittest.TestCase):
             self.assertEqual(
                 manifest["baseline_lock"]["sha256"],
                 environment["BASELINE_LOCK_SHA256"],
+            )
+            self.assertEqual(
+                manifest["host_snapshot"]["source"]["snapshot_sha256"],
+                "d" * 64,
             )
 
     def test_target_observer_exact_snapshot_becomes_primary(self):

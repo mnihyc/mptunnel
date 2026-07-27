@@ -6,10 +6,12 @@
 use super::ManagementTarget;
 use super::schema::{
     ManagementControls, ManagementDiagnostics, ManagementFlowStatus, ManagementPathStatus,
-    ManagementSessionStatus, ManagementSummary, ManagementTraffic,
+    ManagementSessionStatus, ManagementSummary, ManagementTraffic, SCHEMA,
 };
+use crate::config::ConfigRevision;
 use crate::config::ManagementConfig;
 use crate::runtime::error::RuntimeError;
+use crate::runtime::readiness::{RequiredServiceReadiness, RuntimeGenerationPhase};
 use serde::Serialize;
 use serde_json::json;
 use std::sync::Arc;
@@ -18,8 +20,9 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::Semaphore;
 
-const REQUEST_LIMIT: usize = 64 * 1024;
 const HEADER_LIMIT: usize = 32 * 1024;
+const BODY_LIMIT: usize = 4 * 1024 * 1024;
+const REQUEST_LIMIT: usize = HEADER_LIMIT + BODY_LIMIT;
 const HEADER_COUNT_LIMIT: usize = 64;
 const CONNECTION_LIMIT: usize = 64;
 const CONNECTION_TIMEOUT: Duration = Duration::from_secs(10);
@@ -38,7 +41,6 @@ const DASHBOARD_JS: &str = include_str!(concat!(
     "/assets/dashboard/dashboard.js"
 ));
 
-#[derive(Debug)]
 struct HttpSettings {
     token: Option<String>,
     dashboard: bool,
@@ -47,6 +49,7 @@ struct HttpSettings {
 pub(super) async fn run_listeners(
     config: ManagementConfig,
     target: ManagementTarget,
+    readiness: RequiredServiceReadiness,
 ) -> Result<(), RuntimeError> {
     let settings = Arc::new(HttpSettings {
         token: config.token,
@@ -63,6 +66,12 @@ pub(super) async fn run_listeners(
             capacity.clone(),
         ));
     }
+    if listeners.is_empty() {
+        return Err(RuntimeError::Protocol(
+            "management API has no listen addresses",
+        ));
+    }
+    readiness.ready();
     let result = if let Some(result) = listeners.join_next().await {
         match result {
             Ok(Ok(())) => Err(RuntimeError::Protocol("management listener exited")),
@@ -108,7 +117,12 @@ async fn run_listener(
                     {
                         Ok(Ok(())) => {}
                         Ok(Err(err)) => {
-                            eprintln!("warning: management API request failed: {err}");
+                            crate::observability::process_event!(
+                                Warn,
+                                "management",
+                                "request_failed",
+                                "management API request failed: {err}"
+                            );
                         }
                         Err(_) => {
                             let _ = write_error(
@@ -126,7 +140,12 @@ async fn run_listener(
             }
             Some(result) = requests.join_next(), if !requests.is_empty() => {
                 if let Err(err) = result {
-                    eprintln!("warning: management API request task failed: {err}");
+                    crate::observability::process_event!(
+                        Warn,
+                        "management",
+                        "request_task_failed",
+                        "management API request task failed: {err}"
+                    );
                 }
             }
         }
@@ -147,8 +166,7 @@ async fn handle_connection(
     };
     let path = request.path_without_query();
 
-    let public = matches!(path, "/api/health")
-        || settings.dashboard && matches!(path, "/" | "/dashboard.css" | "/dashboard.js");
+    let public = public_path(path, settings.dashboard);
     if !public && !management_auth_ok(&request, settings.token.as_deref()) {
         write_error(
             stream,
@@ -168,23 +186,34 @@ async fn handle_connection(
         ("GET", "/dashboard.js") if settings.dashboard => {
             write_static(stream, "text/javascript; charset=utf-8", DASHBOARD_JS).await
         }
-        ("GET", "/api/") => {
+        ("GET", "/api/v1/") => {
             write_json(
                 stream,
                 200,
                 "OK",
                 &json!({
-                    "schema": "mptunnel.management.v2",
+                    "schema": SCHEMA,
                     "endpoints": {
-                        "health": "GET /api/health",
-                        "status": "GET /api/status",
-                        "paths": "GET /api/paths",
-                        "traffic": "GET /api/traffic",
-                        "sessions": "GET /api/sessions",
-                        "flows": "GET /api/flows",
-                        "diagnostics": "GET /api/diagnostics",
-                        "path_control": "POST /api/control/path",
-                        "peer_diagnostics": "POST /api/diagnostics/peer"
+                        "health": "GET /api/v1/health",
+                        "liveness": "GET /api/v1/health/live",
+                        "readiness": "GET /api/v1/health/ready",
+                        "status": "GET /api/v1/status",
+                        "paths": "GET /api/v1/paths",
+                        "traffic": "GET /api/v1/traffic",
+                        "sessions": "GET /api/v1/sessions",
+                        "flows": "GET /api/v1/flows",
+                        "diagnostics": "GET /api/v1/diagnostics",
+                        "path_control": "POST /api/v1/actions/path",
+                        "peer_diagnostics": "POST /api/v1/diagnostics/peer",
+                        "config": "GET /api/v1/config",
+                        "config_validate": "POST /api/v1/config/validate",
+                        "config_apply": "POST /api/v1/config/apply",
+                        "gateways": "GET /api/v1/gateways",
+                        "gateway_actions": "POST /api/v1/gateways/actions",
+                        "dns_status": "GET /api/v1/dns/status",
+                        "dns_explain": "GET /api/v1/dns/explain?name=<domain>",
+                        "dns_query": "POST /api/v1/dns/query",
+                        "dns_cache_flush": "POST /api/v1/dns/cache/flush"
                     },
                     "dashboard": settings.dashboard,
                     "authentication": if settings.token.is_some() { "bearer" } else { "none" }
@@ -192,12 +221,105 @@ async fn handle_connection(
             )
             .await
         }
-        ("GET", "/api/health") => write_json(stream, 200, "OK", &json!({"ok": true})).await,
-        ("GET", "/api/status") => {
+        ("GET", "/api/v1/health") => {
+            let (status, reason, response) = health_response(&target);
+            write_json(stream, status, reason, &response).await
+        }
+        ("GET", "/api/v1/health/live") => {
+            let (status, reason, response) = liveness_response(&target);
+            write_json(stream, status, reason, &response).await
+        }
+        ("GET", "/api/v1/health/ready") => {
+            let (status, reason, response) = readiness_response(&target);
+            write_json(stream, status, reason, &response).await
+        }
+        ("GET", "/api/v1/config") => match target.config_status_json() {
+            Ok(value) => write_json(stream, 200, "OK", &value).await,
+            Err(err) => write_error(stream, err).await,
+        },
+        ("GET", "/api/v1/gateways") => match target.gateway_status_json() {
+            Ok(value) => write_json(stream, 200, "OK", &value).await,
+            Err(err) => write_error(stream, err).await,
+        },
+        ("POST", "/api/v1/gateways/actions") => {
+            if let Err(err) = require_json(&request) {
+                return write_error(stream, err).await;
+            }
+            match target.control_gateway_json(&request.body) {
+                Ok(value) => write_json(stream, 200, "OK", &value).await,
+                Err(err) => write_error(stream, err).await,
+            }
+        }
+        ("GET", "/api/v1/dns/status") => match target.dns_status_json() {
+            Ok(value) => write_json(stream, 200, "OK", &value).await,
+            Err(err) => write_error(stream, err).await,
+        },
+        ("GET", "/api/v1/dns/explain") => {
+            let name = match required_single_query_parameter(&request, "name") {
+                Ok(name) => name,
+                Err(err) => return write_error(stream, err).await,
+            };
+            match target.dns_explain_json(&name) {
+                Ok(value) => write_json(stream, 200, "OK", &value).await,
+                Err(err) => write_error(stream, err).await,
+            }
+        }
+        ("POST", "/api/v1/dns/query") => {
+            if let Err(err) = require_json(&request) {
+                return write_error(stream, err).await;
+            }
+            match target.dns_query_json(&request.body).await {
+                Ok(value) => write_json(stream, 200, "OK", &value).await,
+                Err(err) => write_error(stream, err).await,
+            }
+        }
+        ("POST", "/api/v1/dns/cache/flush") => {
+            if let Err(err) = require_json(&request) {
+                return write_error(stream, err).await;
+            }
+            match target.dns_flush_json(&request.body) {
+                Ok(value) => write_json(stream, 200, "OK", &value).await,
+                Err(err) => write_error(stream, err).await,
+            }
+        }
+        ("POST", "/api/v1/config/validate") => {
+            if let Err(err) = require_toml(&request) {
+                return write_error(stream, err).await;
+            }
+            match target.validate_config_document(&request.body) {
+                Ok(value) => write_json(stream, 200, "OK", &value).await,
+                Err(err) => write_error(stream, err).await,
+            }
+        }
+        ("POST", "/api/v1/config/apply") => {
+            if let Err(err) = require_toml(&request) {
+                return write_error(stream, err).await;
+            }
+            let expected = match required_config_revision(&request) {
+                Ok(expected) => expected,
+                Err(err) => return write_error(stream, err).await,
+            };
+            match target.apply_config_document(expected, &request.body) {
+                Ok(outcome) => {
+                    let status = if outcome.reload { 202 } else { 200 };
+                    let reason = if outcome.reload { "Accepted" } else { "OK" };
+                    let written = write_json(stream, status, reason, &outcome.response).await;
+                    // Persistence, not delivery of the acknowledgement, commits
+                    // the desired state. A client that disconnects after the
+                    // store transaction must not strand a pending generation.
+                    if outcome.reload {
+                        target.request_config_reload();
+                    }
+                    written
+                }
+                Err(err) => write_error(stream, err).await,
+            }
+        }
+        ("GET", "/api/v1/status") => {
             let snapshot = target.snapshot();
             write_json(stream, 200, "OK", &*snapshot).await
         }
-        ("GET", "/api/paths") => {
+        ("GET", "/api/v1/paths") => {
             let snapshot = target.snapshot();
             write_json(
                 stream,
@@ -211,7 +333,7 @@ async fn handle_connection(
             )
             .await
         }
-        ("GET", "/api/traffic") => {
+        ("GET", "/api/v1/traffic") => {
             let snapshot = target.snapshot();
             write_json(
                 stream,
@@ -226,7 +348,7 @@ async fn handle_connection(
             )
             .await
         }
-        ("GET", "/api/sessions") => {
+        ("GET", "/api/v1/sessions") => {
             let snapshot = target.snapshot();
             write_json(
                 stream,
@@ -240,7 +362,7 @@ async fn handle_connection(
             )
             .await
         }
-        ("GET", "/api/flows") => {
+        ("GET", "/api/v1/flows") => {
             let snapshot = target.snapshot();
             write_json(
                 stream,
@@ -254,7 +376,7 @@ async fn handle_connection(
             )
             .await
         }
-        ("GET", "/api/diagnostics") => {
+        ("GET", "/api/v1/diagnostics") => {
             let snapshot = target.snapshot();
             write_json(
                 stream,
@@ -270,7 +392,7 @@ async fn handle_connection(
             )
             .await
         }
-        ("POST", "/api/control/path") => {
+        ("POST", "/api/v1/actions/path") => {
             if let Err(err) = require_json(&request) {
                 return write_error(stream, err).await;
             }
@@ -279,7 +401,7 @@ async fn handle_connection(
                 Err(err) => write_error(stream, err).await,
             }
         }
-        ("POST", "/api/diagnostics/peer") => {
+        ("POST", "/api/v1/diagnostics/peer") => {
             if let Err(err) = require_json(&request) {
                 return write_error(stream, err).await;
             }
@@ -309,6 +431,188 @@ async fn handle_connection(
             )
             .await
         }
+    }
+}
+
+pub(super) fn health_response(target: &ManagementTarget) -> (u16, &'static str, serde_json::Value) {
+    let health = health_assessment(target);
+    if health.live {
+        (200, "OK", health.value)
+    } else {
+        (503, "Service Unavailable", health.value)
+    }
+}
+
+fn liveness_response(target: &ManagementTarget) -> (u16, &'static str, serde_json::Value) {
+    health_response(target)
+}
+
+fn readiness_response(target: &ManagementTarget) -> (u16, &'static str, serde_json::Value) {
+    let health = health_assessment(target);
+    if health.ready {
+        (200, "OK", health.value)
+    } else {
+        (503, "Service Unavailable", health.value)
+    }
+}
+
+struct HealthAssessment {
+    live: bool,
+    ready: bool,
+    value: serde_json::Value,
+}
+
+fn health_assessment(target: &ManagementTarget) -> HealthAssessment {
+    target.refresh_current_snapshot();
+    let generation = target
+        .config_control()
+        .map(|control| control.generation_status())
+        .unwrap_or_else(|| target.generation().status());
+    let snapshot = target.snapshot();
+    let live = generation.phase != RuntimeGenerationPhase::Failed;
+    let generation_ready = generation.phase == RuntimeGenerationPhase::Ready;
+    let mut readiness_blockers = Vec::new();
+    let mut degraded_reasons = Vec::new();
+    if !generation_ready {
+        readiness_blockers.push(format!("generation-{}", generation.phase.as_str()));
+    }
+
+    let connected_outbound_sessions = snapshot
+        .sessions
+        .iter()
+        .filter(|session| {
+            session.service == "mpp_outbound"
+                && session.state == "connected"
+                && session.carrier_count > 0
+        })
+        .count();
+    if snapshot.services.mpp_outbounds > 0 {
+        if connected_outbound_sessions == 0 {
+            readiness_blockers.push("no-connected-mpp-outbound".to_string());
+        } else if connected_outbound_sessions < snapshot.services.mpp_outbounds {
+            degraded_reasons.push("some-mpp-outbounds-disconnected".to_string());
+        }
+    }
+
+    let unavailable_gateways = snapshot
+        .gateways
+        .iter()
+        .filter(|gateway| gateway.ready_members == 0)
+        .map(|gateway| gateway.tag.clone())
+        .collect::<Vec<_>>();
+    if !unavailable_gateways.is_empty() {
+        readiness_blockers.push("gateway-without-ready-member".to_string());
+    }
+    if snapshot
+        .gateways
+        .iter()
+        .any(|gateway| gateway.unavailable_members > 0 && gateway.ready_members > 0)
+    {
+        degraded_reasons.push("some-gateway-members-unavailable".to_string());
+    }
+
+    let dns_snapshot = target.dns.as_ref().map(|dns| dns.runtime_snapshot());
+    let failed_dns_plans = dns_snapshot
+        .as_ref()
+        .map(|dns| {
+            dns.plans
+                .iter()
+                .filter(|plan| {
+                    plan.queries > 0
+                        && !plan.upstreams.is_empty()
+                        && plan
+                            .upstreams
+                            .iter()
+                            .all(|upstream| upstream.attempts > 0 && upstream.successes == 0)
+                })
+                .map(|plan| plan.plan.to_string())
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
+    if !failed_dns_plans.is_empty() {
+        degraded_reasons.push("dns-plan-without-successful-upstream".to_string());
+    }
+
+    if let Some(control) = target.config_control()
+        && (control.store().revision() != control.store().active_revision()
+            || control.runtime_revision() != control.store().active_revision())
+    {
+        degraded_reasons.push("configuration-activation-pending".to_string());
+    }
+
+    if generation_ready
+        && snapshot.summary.configured_path_count > 0
+        && snapshot.summary.suspect_paths + snapshot.summary.failed_paths > 0
+    {
+        degraded_reasons.push("some-carrier-paths-unhealthy".to_string());
+    }
+    let ready = generation_ready && readiness_blockers.is_empty();
+    let degraded = generation_ready && (!ready || !degraded_reasons.is_empty());
+    let status = match generation.phase {
+        RuntimeGenerationPhase::Starting => "starting",
+        RuntimeGenerationPhase::Stopping => "stopping",
+        RuntimeGenerationPhase::Failed => "failed",
+        RuntimeGenerationPhase::Ready if degraded => "degraded",
+        RuntimeGenerationPhase::Ready => "healthy",
+    };
+    let mut response = json!({
+        "schema": "mptunnel.health.v1",
+        "status": status,
+        "live": live,
+        "ready": ready,
+        "degraded": degraded,
+        "phase": generation.phase.as_str(),
+        "readiness_blockers": readiness_blockers,
+        "degraded_reasons": degraded_reasons,
+        "listeners": {
+            "management": "accepting",
+            "local_inbounds": snapshot.local_inbounds.len(),
+            "mpp_path_listeners": snapshot.services.configured_path_listeners,
+        },
+        "sessions": {
+            "mpp_outbounds": snapshot.services.mpp_outbounds,
+            "connected_mpp_outbounds": connected_outbound_sessions,
+            "authenticated": snapshot.sessions.iter()
+                .filter(|session| session.carrier_count > 0)
+                .count(),
+        },
+        "gateways": {
+            "configured": snapshot.gateways.len(),
+            "unavailable": unavailable_gateways,
+        },
+        "dns": dns_snapshot.as_ref().map(|dns| json!({
+            "generation": dns.generation,
+            "plans": dns.plans.len(),
+            "failed_plans": failed_dns_plans,
+        })),
+    });
+    let object = response
+        .as_object_mut()
+        .expect("health response starts as a JSON object");
+    if let Some(failure) = generation.failure {
+        object.insert(
+            "failure".to_string(),
+            serde_json::Value::String(failure.to_string()),
+        );
+    }
+    if let Some(control) = target.config_control() {
+        object.insert(
+            "desired_revision".to_string(),
+            serde_json::Value::String(control.store().revision().to_string()),
+        );
+        object.insert(
+            "active_revision".to_string(),
+            serde_json::Value::String(control.store().active_revision().to_string()),
+        );
+        object.insert(
+            "runtime_revision".to_string(),
+            serde_json::Value::String(control.runtime_revision().to_string()),
+        );
+    }
+    HealthAssessment {
+        live,
+        ready,
+        value: response,
     }
 }
 
@@ -353,17 +657,32 @@ struct DiagnosticsResponse<'a> {
 fn known_path(path: &str, dashboard: bool) -> bool {
     matches!(
         path,
-        "/api/"
-            | "/api/health"
-            | "/api/status"
-            | "/api/paths"
-            | "/api/traffic"
-            | "/api/sessions"
-            | "/api/flows"
-            | "/api/diagnostics"
-            | "/api/control/path"
-            | "/api/diagnostics/peer"
+        "/api/v1/"
+            | "/api/v1/health"
+            | "/api/v1/health/live"
+            | "/api/v1/health/ready"
+            | "/api/v1/status"
+            | "/api/v1/paths"
+            | "/api/v1/traffic"
+            | "/api/v1/sessions"
+            | "/api/v1/flows"
+            | "/api/v1/diagnostics"
+            | "/api/v1/config"
+            | "/api/v1/config/validate"
+            | "/api/v1/config/apply"
+            | "/api/v1/gateways"
+            | "/api/v1/gateways/actions"
+            | "/api/v1/dns/status"
+            | "/api/v1/dns/explain"
+            | "/api/v1/dns/query"
+            | "/api/v1/dns/cache/flush"
+            | "/api/v1/actions/path"
+            | "/api/v1/diagnostics/peer"
     ) || dashboard && matches!(path, "/" | "/dashboard.css" | "/dashboard.js")
+}
+
+fn public_path(path: &str, dashboard: bool) -> bool {
+    dashboard && matches!(path, "/" | "/dashboard.css" | "/dashboard.js")
 }
 
 fn require_json(request: &ManagementRequest) -> Result<(), ManagementHttpError> {
@@ -382,6 +701,109 @@ fn require_json(request: &ManagementRequest) -> Result<(), ManagementHttpError> 
             "management POST content-type must be application/json",
         ))
     }
+}
+
+fn require_toml(request: &ManagementRequest) -> Result<(), ManagementHttpError> {
+    let is_toml = request.header("content-type").is_some_and(|value| {
+        value
+            .split(';')
+            .next()
+            .is_some_and(|media_type| media_type.trim().eq_ignore_ascii_case("application/toml"))
+    });
+    if is_toml {
+        Ok(())
+    } else {
+        Err(ManagementHttpError::new(
+            415,
+            "Unsupported Media Type",
+            "configuration body content-type must be application/toml",
+        ))
+    }
+}
+
+fn required_single_query_parameter(
+    request: &ManagementRequest,
+    expected: &str,
+) -> Result<String, ManagementHttpError> {
+    let query = request
+        .path
+        .split_once('?')
+        .map(|(_, query)| query)
+        .ok_or_else(|| {
+            ManagementHttpError::new(
+                400,
+                "Bad Request",
+                format!("missing {expected} query parameter"),
+            )
+        })?;
+    let mut found = None;
+    for pair in query.split('&') {
+        let (name, value) = pair.split_once('=').ok_or_else(|| {
+            ManagementHttpError::new(400, "Bad Request", "malformed management query parameter")
+        })?;
+        let name = percent_encoding::percent_decode_str(name)
+            .decode_utf8()
+            .map_err(|_| {
+                ManagementHttpError::new(400, "Bad Request", "query parameter is not UTF-8")
+            })?;
+        if name != expected {
+            return Err(ManagementHttpError::new(
+                400,
+                "Bad Request",
+                format!("unexpected query parameter {name}"),
+            ));
+        }
+        if found.is_some() {
+            return Err(ManagementHttpError::new(
+                400,
+                "Bad Request",
+                format!("duplicate {expected} query parameter"),
+            ));
+        }
+        let value = percent_encoding::percent_decode_str(value)
+            .decode_utf8()
+            .map_err(|_| {
+                ManagementHttpError::new(400, "Bad Request", "query parameter is not UTF-8")
+            })?;
+        if value.is_empty() {
+            return Err(ManagementHttpError::new(
+                400,
+                "Bad Request",
+                format!("{expected} query parameter must not be empty"),
+            ));
+        }
+        found = Some(value.into_owned());
+    }
+    found.ok_or_else(|| {
+        ManagementHttpError::new(
+            400,
+            "Bad Request",
+            format!("missing {expected} query parameter"),
+        )
+    })
+}
+
+fn required_config_revision(
+    request: &ManagementRequest,
+) -> Result<ConfigRevision, ManagementHttpError> {
+    let value = request.header("if-match").ok_or_else(|| {
+        ManagementHttpError::new(
+            428,
+            "Precondition Required",
+            "configuration apply requires If-Match",
+        )
+    })?;
+    let value = value
+        .strip_prefix('"')
+        .and_then(|value| value.strip_suffix('"'))
+        .unwrap_or(value);
+    value.parse().map_err(|_| {
+        ManagementHttpError::new(
+            400,
+            "Bad Request",
+            "If-Match must contain one configuration revision",
+        )
+    })
 }
 
 async fn read_request(stream: &mut TcpStream) -> Result<ManagementRequest, ManagementHttpError> {
@@ -464,6 +886,7 @@ async fn read_request(stream: &mut TcpStream) -> Result<ManagementRequest, Manag
     let mut content_length = None;
     let mut authorization_seen = false;
     let mut content_type_seen = false;
+    let mut if_match_seen = false;
     for header in parsed.headers.iter() {
         let name = header.name.to_ascii_lowercase();
         let value = std::str::from_utf8(header.value)
@@ -515,10 +938,20 @@ async fn read_request(stream: &mut TcpStream) -> Result<ManagementRequest, Manag
             }
             content_type_seen = true;
         }
+        if name == "if-match" {
+            if if_match_seen {
+                return Err(ManagementHttpError::new(
+                    400,
+                    "Bad Request",
+                    "duplicate if-match is not allowed",
+                ));
+            }
+            if_match_seen = true;
+        }
         headers.push((name, value));
     }
     let content_length = content_length.unwrap_or(0);
-    if header_len.saturating_add(content_length) > REQUEST_LIMIT {
+    if content_length > BODY_LIMIT || header_len.saturating_add(content_length) > REQUEST_LIMIT {
         return Err(ManagementHttpError::new(
             413,
             "Payload Too Large",
@@ -640,12 +1073,23 @@ async fn write_response(
     Ok(())
 }
 
-#[derive(Debug)]
 pub(super) struct ManagementRequest {
     pub(super) method: String,
     pub(super) path: String,
     pub(super) headers: Vec<(String, String)>,
     pub(super) body: Vec<u8>,
+}
+
+impl std::fmt::Debug for ManagementRequest {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("ManagementRequest")
+            .field("method", &self.method)
+            .field("path", &self.path)
+            .field("header_count", &self.headers.len())
+            .field("body_bytes", &self.body.len())
+            .finish()
+    }
 }
 
 impl ManagementRequest {
@@ -662,19 +1106,19 @@ impl ManagementRequest {
     }
 }
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone)]
 pub(super) struct ManagementHttpError {
     pub(super) status: u16,
     pub(super) reason: &'static str,
-    pub(super) message: &'static str,
+    pub(super) message: String,
 }
 
 impl ManagementHttpError {
-    pub(super) const fn new(status: u16, reason: &'static str, message: &'static str) -> Self {
+    pub(super) fn new(status: u16, reason: &'static str, message: impl Into<String>) -> Self {
         Self {
             status,
             reason,
-            message,
+            message: message.into(),
         }
     }
 }

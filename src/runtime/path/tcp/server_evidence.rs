@@ -40,7 +40,7 @@ impl ServerTcpEvidenceState {
             delivery_rate_sample: None,
             native_drain_observed: false,
             sender_refresh_pending: false,
-            path_proofs: PathProofTracker::default(),
+            path_proofs: PathProofTracker::from_limits(mux_limits),
             request_capacity_receive: CapacityReceiveTracker::new(
                 reliable_capacity_measurement_session_limit_bytes(mux_limits),
             ),

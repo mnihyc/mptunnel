@@ -3,15 +3,19 @@
 //! This layer owns tasks, queues, channels, and mutation; pure evidence and
 //! admission formulas remain in `model` and `scheduler`.
 
+mod config_control;
 mod datagram;
 mod error;
+mod gateway;
 mod identity;
 mod ingress_runtime;
 mod management;
 mod node;
-mod packet_device;
+mod outbound_registry;
 mod path;
 mod peer_status;
+mod product_policy;
+mod readiness;
 mod recent_ids;
 mod relay;
 mod sender;
@@ -19,17 +23,26 @@ mod stream;
 mod telemetry;
 mod tun_l4;
 
+pub(crate) use config_control::RuntimeConfigControl;
 pub use datagram::{client_udp_datagram_round_trip, client_udp_datagram_round_trip_with_provider};
 pub use error::RuntimeError;
-pub use node::{run, run_with_host_providers, run_with_packet_device_provider};
-pub use packet_device::{PacketDevice, PacketDeviceProvider, SystemPacketDeviceProvider};
+pub(crate) use node::{
+    RuntimeGenerationOutcome, run_with_all_host_providers_and_config_control,
+    run_with_all_host_providers_and_generation_control, run_with_config_control,
+    run_with_generation_control,
+};
+pub use node::{
+    run, run_with_all_host_providers, run_with_host_providers, run_with_packet_device_provider,
+    run_with_vpn_host_providers,
+};
+pub(crate) use readiness::RuntimeGenerationControl;
+#[cfg(test)]
+pub(crate) use readiness::RuntimeGenerationStopReason;
 
 // Runtime integration suites intentionally share the composition namespace.
 // Production modules never inherit these test-only conveniences.
 #[cfg(test)]
-use crate::config::{ManagementConfig, MppPerformanceConfig, SecurityConfig};
-#[cfg(test)]
-use crate::ingress::ProxyAuthConfig;
+use crate::config::{ClientSecurityConfig, ManagementConfig, ServerSecurityConfig};
 #[cfg(test)]
 use crate::ingress::http_connect::{self, HttpStatus};
 #[cfg(test)]
@@ -41,7 +54,7 @@ use crate::mux::MuxLimits;
 #[cfg(test)]
 use crate::mux::stream::{ReliableRecvStream, ReliableSendStream};
 #[cfg(test)]
-use crate::protocol::auth::{PathJoinAuthCheck, SessionAuthCheck, SessionAuthenticator};
+use crate::performance::MppPerformanceConfig;
 #[cfg(test)]
 use crate::protocol::codec::CodecLimits;
 #[cfg(test)]
@@ -52,7 +65,7 @@ use crate::protocol::{
 #[cfg(test)]
 use crate::scheduler::{PathSnapshot, PathState as SchedulerPathState, TrafficClass};
 #[cfg(test)]
-use crate::transport::encrypted::{EncryptedFramedStream, EncryptedFramedTransportError, PeerRole};
+use crate::transport::encrypted::EncryptedFramedStream;
 #[cfg(test)]
 use crate::transport::tcp::{self, TcpConnectOptions};
 #[cfg(test)]

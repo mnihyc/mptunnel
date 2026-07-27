@@ -1,4 +1,5 @@
 use super::{ServerSessionRegistration, ServerSessionTracker};
+use crate::product::PrincipalPermit;
 use crate::protocol::SessionId;
 use std::sync::Arc;
 
@@ -7,10 +8,15 @@ fn balanced_references_reclaim_session() {
     let tracker = ServerSessionTracker::default();
     let session_id = SessionId(7);
 
+    tracker
+        .attach_authenticated_session(session_id, &PrincipalPermit::for_test("test-peer"))
+        .expect("register authenticated carrier");
     tracker.attach_session(session_id);
     tracker.attach_session(session_id);
-    assert_eq!(tracker.reference_count(session_id), 2);
+    assert_eq!(tracker.reference_count(session_id), 3);
 
+    tracker.detach_session(session_id);
+    assert_eq!(tracker.reference_count(session_id), 2);
     tracker.detach_session(session_id);
     assert_eq!(tracker.reference_count(session_id), 1);
     tracker.detach_session(session_id);
@@ -28,12 +34,17 @@ fn registrations_hold_independent_session_references() {
     let tracker = Arc::new(ServerSessionTracker::default());
     let session_id = SessionId(11);
 
+    tracker
+        .attach_authenticated_session(session_id, &PrincipalPermit::for_test("test-peer"))
+        .expect("register authenticated carrier");
     let response = ServerSessionRegistration::new(tracker.clone(), session_id);
     let realtime = ServerSessionRegistration::new(tracker.clone(), session_id);
-    assert_eq!(tracker.reference_count(session_id), 2);
+    assert_eq!(tracker.reference_count(session_id), 3);
 
     drop(response);
-    assert_eq!(tracker.reference_count(session_id), 1);
+    assert_eq!(tracker.reference_count(session_id), 2);
     drop(realtime);
+    assert_eq!(tracker.reference_count(session_id), 1);
+    tracker.detach_session(session_id);
     assert_eq!(tracker.reference_count(session_id), 0);
 }

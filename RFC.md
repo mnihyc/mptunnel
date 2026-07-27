@@ -1,4 +1,4 @@
-# MPTunnel Multipath Proxy Protocol (MPP) Version 3
+# MPTunnel Multipath Proxy Protocol (MPP) Version 4
 
 ## Status
 
@@ -14,9 +14,15 @@ usage model of
 It does not replace the congestion controller or loss recovery of either TCP
 or QUIC.
 
-Protocol version 3 changes datagram identity semantics and is incompatible with
-versions 1 and 2. A peer MUST reject a frame header carrying any unsupported
-version.
+Protocol version 4 replaces the private TCP record cipher with TLS 1.3. TCP
+deliberately negotiates no ALPN; QUIC negotiates the standard `h3` ALPN and
+carries MPP through the HTTP/3 extension defined in Section 10. It retains the
+corrected datagram identity semantics introduced during version 3 development
+and is incompatible with versions 1, 2, and 3. A peer MUST reject an
+unsupported carrier presentation or frame version. TCP and QUIC use one
+independently configured TLS server identity and client trust policy; an MPP
+application credential MUST NOT be used to derive a certificate, private key,
+or certificate verifier.
 
 ## 1. Scope
 
@@ -123,29 +129,142 @@ Carrier implementations MUST expose observations and bounded enqueue
 capacity. They retain authority over native pacing, congestion windows,
 retransmission, connection teardown, and transport errors.
 
+### 3.1 Product gateway boundary
+
+Product routing MUST be deterministic first-match policy over normalized
+destination domain or IP, resolved destination IP, source IP,
+destination/source port, TCP/UDP network, inbound, authenticated principal,
+and pre/post-resolution stage. Implementations MUST reject configuration for
+a match category that live flow construction cannot supply; silently treating
+an unavailable attribute as permanently absent is not conforming behavior.
+
+An implementation MAY place a Product gateway above independent outbound
+leaves or MPP sessions. That gateway selects exactly one member while a new
+flow is opening. It MUST NOT merge carriers from separate MPP sessions or use
+path IDs, congestion state, queue state, reinjection state, or any other
+`PathScheduler` input for member ranking.
+
+Gateway health may use bounded Product-owned end-to-end probes and passive
+target-open or completed-flow outcomes. Probe freshness, hysteresis, circuit
+cooldown, recovery, drain, and manual override are Product state and do not
+change MPP path health or usage.
+
+Multiple member attempts for one flow MUST share one absolute opening
+deadline. A retry is permitted only before application data or a target
+datagram association has crossed the implementation's commit boundary. Once
+committed, the flow remains bound to that member; a later failure is health
+evidence for future flows and MUST NOT cause transparent replay.
+
 ## 4. Session and Path Establishment
 
 ### 4.1 Authentication
 
-A new carrier sends, in order:
+Carrier-session authentication is carrier-specific. Path attachment after
+session authentication is common to TCP and QUIC.
+
+A new QUIC carrier first presents the encrypted credential-derived candidate
+selector defined in Section 10.2. The server MUST accept that selector before
+request DATA reaches the MPP frame parser. This is a bounded parser gate, not
+session or path authorization; every check below remains mandatory. The first
+accepted selector is latched to that QUIC connection, and every later carrier
+request on the connection MUST present the same selector.
+
+On its first selector-accepted HTTP/3 request stream, a new QUIC carrier sends
+in this order:
 
 1. `SESSION_HELLO(session_id)`;
-2. `SESSION_AUTH(session_id, nonce, issued_at_unix_secs, auth_tag)`;
-3. `PATH_JOIN(session_id, path_id, underlay, nonce, issued_at_unix_secs,
-   auth_tag)`; and
+2. `SESSION_AUTH(session_id, credential_id, nonce, issued_at_unix_secs,
+   auth_tag)`;
+3. `PATH_JOIN(session_id, credential_id, path_id, underlay, nonce,
+   issued_at_unix_secs, auth_tag)`; and
 4. sequence-zero `PATH_STATUS` for that direction.
 
-Authentication tags use HMAC-SHA256 over distinct session-authentication and
-path-join contexts. The receiver MUST validate the timestamp freshness,
-session identity, path identity, underlay, nonce, and tag. Replayed path-join
-nonces MUST be rejected.
+A new TCP carrier completes a full TLS 1.3 handshake and then sends, in this
+order:
+
+1. the fixed 131-byte TCP session-admission prelude defined in Section 10.1;
+2. `PATH_JOIN(session_id, credential_id, path_id, underlay, nonce,
+   issued_at_unix_secs, auth_tag)`; and
+3. sequence-zero `PATH_STATUS` for that direction.
+
+The TCP prelude semantically replaces `SESSION_HELLO` and `SESSION_AUTH`.
+A TCP carrier MUST NOT send those two frames before `PATH_JOIN`. The prelude,
+`PATH_JOIN`, and sequence-zero `PATH_STATUS` form one client admission flight;
+TLS record boundaries and write batching do not alter that ordering.
+
+All authentication tags use HMAC-SHA256 keyed by the named MPP application
+credential. The QUIC `SESSION_AUTH` transcript is:
+
+```text
+"mptunnel session auth v4" ||
+session_id:u64 ||
+credential_id_length:u8 || credential_id:bytes ||
+nonce:16B ||
+issued_at_unix_secs:u64
+```
+
+The TCP prelude authentication transcript is:
+
+```text
+"mptunnel tcp session auth v1" ||
+carrier_role:u8 = 1 ||
+direction:u8 = 1 ||
+tls_exporter:32B ||
+session_id:u64 ||
+credential_id_length:u8 || credential_id:bytes ||
+nonce:16B ||
+issued_at_unix_secs:u64
+```
+
+`tls_exporter` is derived from the completed TLS connection as specified in
+Section 10.1. Binding the tag to that value prevents a valid TCP prelude from
+being replayed on another TLS connection.
+
+The `PATH_JOIN` transcript is common to both carrier presentations:
+
+```text
+"mptunnel path join v4" ||
+session_id:u64 ||
+credential_id_length:u8 || credential_id:bytes ||
+path_id:u16 || underlay:u8 ||
+nonce:16B ||
+issued_at_unix_secs:u64
+```
+
+Integers use network byte order and every `auth_tag` is the complete 32-byte
+HMAC. The receiver MUST select the named credential and reject an unknown,
+revoked, or expired credential. It MUST validate timestamp freshness, session
+identity, credential identity, path identity, expected underlay, nonce, and
+tag. For TCP it MUST additionally validate the fixed prelude fields,
+canonical padding, and TLS-exporter-bound tag.
+
+`PATH_JOIN` MUST follow successful carrier-specific session authentication.
+Its session and credential identities MUST equal those authenticated by the
+QUIC `SESSION_AUTH` or TCP admission prelude. Replayed path-join nonces MUST be
+rejected. An endpoint MUST NOT expose which credential lookup or
+authentication check failed to an unauthenticated peer.
+
+Credential lookup and permit issuance are authentication-time operations.
+After a valid tag, the server binds an immutable principal permit to the path;
+per-frame and per-byte data processing MUST NOT call credential policy.
+Different credential IDs MAY overlap during rotation and MAY map to the same
+principal. Every path attached to one MPP session MUST map to that same
+principal.
+
+A credential ID permanently names one principal and key for the process
+lifetime. Rotation uses a new credential ID. Publishing revocation, removal,
+or expiry MUST reject new authentication at publication and retire only actors
+admitted through that credential at its configured absolute deadline plus
+grace. It MUST NOT retire actors using an overlapping credential merely
+because they share a principal. Revocation is monotonic within a process, and
+a retired ID MUST NOT be reused before restart.
 
 After acceptance, the receiver sends `SESSION_READY` and its own
 sequence-zero `PATH_STATUS`. Stream or datagram work MUST NOT be admitted before
 both are received. The authenticated TCP session remains its path control
-channel. For QUIC, the first bidirectional stream that carried authentication
-remains the connection control stream; later bidirectional streams carry
-product streams or datagram flows.
+channel. For QUIC, the first matching HTTP/3 request stream whose admission
+succeeds remains the connection control stream; later bidirectional streams
+carry product streams or datagram flows.
 
 The authenticated transport connection and its registration form one path
 instance. Path metrics and usage sequences MUST be fenced by that physical
@@ -236,7 +355,7 @@ strictly greater than the last accepted sequence for that instance. A stale
 or duplicate sequence MUST NOT change scheduling state. A new authenticated
 instance restarts at zero.
 
-The current protocol-v3 runtime emits only the authenticated sequence-zero
+The current protocol-v4 runtime emits only the authenticated sequence-zero
 status derived from listener policy. Receive paths retain the higher-sequence
 fence, but no management or scheduler action currently originates a later
 status. Dynamic peer-preference control therefore remains reserved until a
@@ -345,6 +464,13 @@ offset the sender may assign in that direction. The maximum is shared across all
 path attachments of that stream and direction. Attaching another
 path does not multiply the receive window. The opposite direction has an
 independent advertised maximum.
+
+The sender retains the greatest `max_offset` observed for the direction; a
+smaller value does not revoke credit. An endpoint therefore MAY acknowledge a
+later attachment with a credit-neutral `STREAM_MAX_DATA(stream_id, 0)`. It
+MUST NOT derive a new maximum from the attachment's demand, carrier type, or
+local carrier limits. Only the logical receive owner publishes additional
+credit.
 
 The sender MUST NOT assign new data whose end offset exceeds `max_offset`.
 Transport queue capacity and congestion-window availability are additional
@@ -589,7 +715,7 @@ Every frame starts with a fixed ten-byte header:
 
 ```text
 0..4   magic          ASCII "MPTF"
-4      version        3
+4      version        4
 5      frame kind     u8
 6..10  payload length u32, network byte order
 ```
@@ -599,9 +725,189 @@ magic, unsupported version, unknown kind, truncated or trailing bytes, invalid
 enum values, a range entry whose start is not less than its end, zero target
 ports, and configured size limit violations.
 
-The MPP frame version is independent of the encrypted TCP record encoding. The
-record envelope remains version 2; peers still reject any unsupported frame
-version after decryption.
+The MPP frame version is independent of TLS records. TCP carriers MUST use TLS
+1.3 with no negotiated ALPN; there is no private MPP record cipher or legacy
+record envelope. QUIC retains its native TLS and packet protection and MUST
+negotiate exactly `h3`. Both carriers MUST authenticate the explicitly
+configured TLS server identity; the server certificate and client trust anchor
+are independent of the MPP application credential. After transport
+authentication, both carriers still reject every unsupported MPP frame
+version. Clients and servers MUST disable 0-RTT for MPP carrier connections.
+
+### 10.1 TCP carrier presentation
+
+The fixed TCP session-admission prelude is carrier-admission data, not an MPP
+frame, and therefore does not begin with the `MPTF` frame header. It is sent
+exactly once after a completed TLS 1.3 handshake. TCP MUST negotiate no ALPN
+and MUST NOT accept early data.
+
+The prelude is exactly 131 bytes:
+
+```text
+0        carrier_role              u8; client = 1
+1        direction                 u8; client-to-server = 1
+2        credential_id_length      u8; 1 through 64
+3..67    credential_id_slot        64B
+67..75   session_id                u64
+75..91   nonce                     16B
+91..99   issued_at_unix_secs       u64
+99..131  auth_tag                  32B
+```
+
+The first `credential_id_length` bytes of `credential_id_slot` contain the
+canonical credential ID. Every remaining byte in that 64-byte slot MUST be
+zero. A receiver MUST reject a noncanonical credential ID, an invalid length,
+or nonzero padding.
+
+Both endpoints export exactly 32 bytes from the completed TLS 1.3 connection
+using label `EXPORTER-mptunnel-tcp-admission-v1` and no exporter context. Those
+bytes are `tls_exporter` in the Section 4.1 HMAC transcript. An early exporter
+MUST NOT be used.
+
+A valid prelude is followed immediately by the ordinary MPP `PATH_JOIN` and
+sequence-zero `PATH_STATUS` frames. After admission, TCP carries ordinary MPP
+frames directly inside TLS application data.
+
+The listener reads exactly one complete prelude before interpreting any field.
+An incomplete or rejected prelude, TLS failure, read failure, or
+authentication timeout MUST be closed without application response bytes or a
+carrier-specific close reason. Once the prelude has authenticated the peer,
+later invalid MPP frames are ordinary authenticated protocol violations and
+follow Section 11.
+
+### 10.2 HTTP/3 carrier presentation
+
+Each logical QUIC carrier stream is one ordinary, full-duplex HTTP/3 request
+stream. Its encrypted request field section MUST contain:
+
+```text
+:method = POST
+:scheme = https
+:authority = configured TLS server identity
+:path = /
+content-type = application/octet-stream
+mpp-datagram = ?1
+authorization = Bearer <64 lowercase hexadecimal digits>
+```
+
+`:authority` MUST exactly equal the TLS server identity sent as SNI on that
+QUIC connection. Because TLS omits SNI for an IP-address identity, a QUIC path
+group MUST configure a DNS TLS server identity; its carrier endpoint remains
+independent and MAY be a literal IP address. `:path` MUST be exactly `/` with
+no query component. A missing SNI, origin-form target, other scheme, other
+authority, or query is a nonmatching request and follows the same public
+rejection behavior below.
+
+The private `mpp-datagram` request field explicitly opts that request into the
+MPP HTTP Datagram extension. It is encrypted by HTTP/3 and is not an ALPN,
+HTTP/3 setting, registered upgrade token, or pre-authentication wire marker.
+MPP does not use Extended CONNECT, CONNECT-UDP, WebTransport, Capsule Protocol,
+the `:protocol` pseudo-header, or `capsule-protocol`.
+
+The selector is:
+
+```text
+HMAC-SHA256(
+  credential_secret,
+  "mptunnel quic candidate selector v1" ||
+  credential_id_length:u64 ||
+  credential_id:bytes
+)
+```
+
+`credential_id_length` is encoded in network byte order. The 32-byte result is
+serialized as exactly 64 lowercase hexadecimal digits after the exact
+`Bearer ` prefix. The request MUST contain exactly one such field. The server
+MUST reject a missing, duplicate, malformed, noncanonical, expired, revoked,
+or unmatched selector before exposing request DATA to the MPP parser.
+Selector equality MUST use constant-time byte comparison over the bounded
+active credential set.
+
+The first accepted selector is latched to the QUIC connection. Later carrier
+requests MUST present the same canonical selector and do not reconsult the
+credential authority; authenticated-session retirement remains governed by
+the bounded revocation grace. The selector demonstrates candidate credential
+knowledge but is not channel-bound, freshness proof, session authorization,
+path authorization, or replay admission. `SESSION_AUTH`, `PATH_JOIN`, and all
+normal checks remain mandatory.
+
+The first selector-accepted request stream sends, in request DATA,
+`SESSION_HELLO`, `SESSION_AUTH`, `PATH_JOIN`, and sequence-zero `PATH_STATUS`
+in the order required by Section 4.1. It becomes the connection control stream
+only after all four records are accepted. Later matching request streams on
+that authenticated connection carry product streams or datagram flows and do
+not repeat connection admission.
+
+The server MUST NOT send a successful HTTP response before application
+authentication, common `PATH_JOIN` validation, replay admission, and the
+sequence-zero usage advertisement succeed. After acceptance it sends a 2xx
+response before response DATA containing `SESSION_READY` and its own
+sequence-zero `PATH_STATUS`.
+
+A nonmatching request, a rejected selector, or a selector-accepted request
+whose MPP authentication fails receives the same marker-free `404 Not Found`
+response used for an ordinary unknown resource. It MUST NOT receive an
+MPP-specific status, header, body, or close reason. TLS or QUIC connections
+that fail before an HTTP/3 request exists are closed using their standard
+transport behavior and have no HTTP-response requirement.
+
+All reliable MPP frames, including datagram flow open, close, and feedback,
+travel in HTTP/3 DATA. Within the DATA byte stream, every MPP frame is prefixed
+by its encoded length as an unsigned 32-bit network-order integer. HTTP/3 DATA
+frame boundaries are independent of MPP record boundaries: one DATA frame MAY
+contain several complete records, and one record MAY span received DATA
+chunks. A receiver MUST apply the configured frame limit before buffering a
+declared record.
+
+Both peers MUST advertise the HTTP/3 `H3_DATAGRAM` setting before sending an
+MPP HTTP Datagram. The setting is a generic capability signal; the encrypted
+`mpp-datagram: ?1` request field is the per-request MPP opt-in. A QUIC
+DATAGRAM carrying MPP data starts with the RFC 9297 Quarter Stream ID of the
+associated client-initiated request stream, encoded as a QUIC variable-length
+integer. The remaining payload is:
+
+```text
+0       extension version       u8; currently 1
+1..9    flow_id                 u64
+9..17   datagram_id             u64
+17..21  remaining_ttl_ms        u32; nonzero
+21..23  fragment_index          u16; zero based
+23..25  fragment_count          u16; 1 through 64
+25..29  total_payload_length    u32
+29..    fragment payload
+```
+
+All multibyte fields in this envelope use network byte order. The MPP envelope
+is 29 bytes per fragment. Including the Quarter Stream ID, its exact
+application overhead is normally 30 bytes and at most 37 bytes per fragment;
+QUIC DATAGRAM framing, packet protection, UDP, and IP overhead are additional.
+The sender fragments against Quinn's current maximum datagram size and MUST
+reject payloads requiring more than 64 fragments. A zero-length UDP datagram
+uses one fragment with index zero and total length zero.
+
+The sender MUST submit `OPEN_DGRAM_FLOW` on reliable DATA before it emits
+native data for that flow. Native QUIC DATAGRAM can nevertheless overtake
+reliable HEADERS or DATA in the network. A receiver MAY retain that first
+flight for no longer than the smaller of its remaining TTL and a bounded
+two-RTT handoff window; this is receiver-side reordering tolerance and MUST NOT
+add a sender round trip or retransmit the datagram. Pending request routes,
+per-route packets, total buffered bytes, active flow IDs, and fragment
+reassemblies MUST all be bounded. Incomplete reassembly expires from the
+packet's original receipt time and releases all resource charges without
+waiting for another packet.
+
+Closing a flow removes only its live-flow charge. Previously used flow IDs
+MUST NOT reopen on the same request stream, while monotonically allocated new
+IDs MUST remain usable for the request's lifetime. A receiver MUST silently
+drop native data for a reliably closed flow and MUST bound any native data
+deferred while its reliable open is still in flight.
+
+### 10.3 MPP frame assignments
+
+The TCP admission prelude is not a frame assignment.
+`SESSION_HELLO` and `SESSION_AUTH` are used by QUIC connection admission;
+TCP uses the Section 10.1 prelude instead. `PATH_JOIN` is the common
+carrier-independent path-admission frame.
 
 The assigned frame kinds are:
 
@@ -610,7 +916,7 @@ The assigned frame kinds are:
 | 1 | `SESSION_HELLO` | `session_id:u64` |
 | 2 | `SESSION_READY` | none |
 | 3 | `SESSION_CLOSE` | `reason:u8` |
-| 4 | `PATH_JOIN` | `session_id:u64, path_id:u16, underlay:u8, nonce:16B, issued_at_unix_secs:u64, auth_tag:32B` |
+| 4 | `PATH_JOIN` | `session_id:u64, credential_id, path_id:u16, underlay:u8, nonce:16B, issued_at_unix_secs:u64, auth_tag:32B` |
 | 7 | `OPEN_STREAM` | `stream_id:u64, target, demand:u8` |
 | 8 | `STREAM_DATA` | `stream_id:u64, offset:u64, length:u32, bytes` |
 | 9 | `STREAM_ACK` | `stream_id:u64, complete:u8, count:u16, ranges[count]` |
@@ -621,7 +927,7 @@ The assigned frame kinds are:
 | 14 | `DGRAM_CLOSE` | `flow_id:u64` |
 | 16 | `PING` | `nonce:u64` |
 | 17 | `PONG` | `nonce:u64` |
-| 18 | `SESSION_AUTH` | `session_id:u64, nonce:16B, issued_at_unix_secs:u64, auth_tag:32B` |
+| 18 | `SESSION_AUTH` | `session_id:u64, credential_id, nonce:16B, issued_at_unix_secs:u64, auth_tag:32B` |
 | 20 | `PATH_STATUS` | `path_id:u16, sequence:u64, usage:u8` |
 | 21 | `PATH_DRAIN` | `path_id:u16` |
 | 22 | `PATH_CLOSE` | `path_id:u16, reason:u8` |
@@ -651,6 +957,11 @@ Each `ranges[count]` entry consists of `start:u64, end:u64`.
 A target begins with a type byte: domain `1`, IPv4 `2`, or IPv6 `3`. A domain
 contains a `u16` UTF-8 byte length, the host bytes, and a nonzero `u16` port.
 IPv4 and IPv6 contain their fixed address bytes and a nonzero `u16` port.
+
+A `credential_id` begins with a `u8` byte length and contains 1 through 64
+ASCII bytes. Its first byte is a lowercase letter or digit; remaining bytes
+are lowercase letters, digits, `.`, `_`, or `-`. Non-canonical text MUST be
+rejected rather than normalized on wire.
 
 Demand values are latency `1`, throughput `2`, and realtime `3`. Underlay
 values are TCP `1` and UDP `2`. Path-metric direction values are
@@ -694,10 +1005,13 @@ measurement tickets, load leases, and registry membership exactly once.
 
 ## 12. Security and Privacy
 
-Every transport path is encrypted and authenticated before MPP data admission. Session
-and path authentication use separate HMAC contexts. Nonces and freshness
-windows limit replay. Target policy is enforced at the receiving endpoint and
-is not delegated to the carrier.
+Every transport path is encrypted and authenticated before MPP data admission.
+Session and path authentication use separate versioned HMAC contexts and bind
+the credential ID. Nonces and freshness windows limit replay. A receiver MUST
+bound concurrent pending authentications and the complete authentication
+flight duration before allocating durable session or product-flow state.
+Target policy is enforced at the receiving endpoint under the authenticated
+principal and is not delegated to the carrier.
 
 Metrics and usage are accepted only for the authenticated path identity. A
 peer cannot use `PATH_STATUS` to declare local health, bypass flow control,
@@ -707,6 +1021,17 @@ Implementations SHOULD limit diagnostic output because path metrics, targets,
 and timing can expose network topology and traffic characteristics.
 Peer-status responses follow the stricter rules in Section 4.3 and disclose no
 target or endpoint value.
+
+The encrypted QUIC candidate selector prevents a source-informed client
+without an active credential from reaching the MPP frame parser or eliciting
+an MPP-specific response. It does not provide passive or active
+indistinguishability. SNI and certificate identity, TLS and QUIC implementation
+behavior, the standard `h3` ALPN, QUIC transport parameters, HTTP/3 settings,
+packet sizes, timing, and endpoint response behavior remain observable or
+probeable. TCP likewise exposes its ordinary TLS endpoint behavior while
+keeping its binary admission and MPP records encrypted. MPTUNNEL is an
+authenticated tunnel, not a cover service, and implementations MUST NOT claim
+that this presentation alone defeats source-aware traffic classification.
 
 ## 13. Platform Boundary
 

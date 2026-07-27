@@ -7,6 +7,7 @@
 use super::commands::ReliablePathCommandSender;
 use crate::model::path::{CarrierPathInstanceId, PathPolicy, next_carrier_path_instance_id};
 use crate::mux::MuxLimits;
+use crate::product::PrincipalPermit;
 use crate::protocol::{
     Frame, OffsetRange, PathId, PathMetrics, PathUsage, PeerPathState, PeerPathStatus, SessionId,
     StreamId, TargetAddr, UnderlayProtocol,
@@ -174,6 +175,7 @@ impl std::fmt::Debug for ServerDatagramOpenError {
 
 pub(in crate::runtime) struct ServerDatagramOpenRequest {
     pub(in crate::runtime) session_id: SessionId,
+    pub(in crate::runtime) principal_permit: PrincipalPermit,
     pub(in crate::runtime) flow_id: crate::protocol::DatagramFlowId,
     pub(in crate::runtime) target: TargetAddr,
     pub(in crate::runtime) commands: ReliablePathCommandSender,
@@ -273,6 +275,7 @@ struct ServerCarrierPathRegistrationInner {
     owner_token: usize,
     identity: ServerCarrierPathIdentity,
     local: ServerLocalPathProperties,
+    principal_permit: PrincipalPermit,
     validation: Arc<AtomicBool>,
 }
 
@@ -320,6 +323,10 @@ impl ServerCarrierPathRegistration {
 
     pub(in crate::runtime) fn initial_metrics(&self) -> Option<PathMetrics> {
         self.inner.local.initial_metrics
+    }
+
+    pub(in crate::runtime) fn principal_permit(&self) -> &PrincipalPermit {
+        &self.inner.principal_permit
     }
 
     /// Returns a fresh challenge until this carrier instance is validated.
@@ -420,7 +427,8 @@ pub(in crate::runtime) trait ServerStreamPortBackend: Send + Sync {
         &self,
         identity: ServerCarrierPathIdentity,
         local: ServerLocalPathProperties,
-    );
+        principal_permit: PrincipalPermit,
+    ) -> Result<(), RuntimeError>;
 
     fn retire_carrier_path(&self, identity: ServerCarrierPathIdentity);
 
@@ -490,7 +498,7 @@ pub(in crate::runtime) struct ServerStreamPort {
 }
 
 pub(in crate::runtime) type ServerStreamTargetAdmission =
-    dyn Fn(&TargetAddr) -> Result<(), RuntimeError> + Send + Sync;
+    dyn Fn(&PrincipalPermit, &TargetAddr) -> Result<(), RuntimeError> + Send + Sync;
 
 impl std::fmt::Debug for ServerStreamPort {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -506,7 +514,7 @@ impl ServerStreamPort {
         Self {
             backend,
             owner_token,
-            target_admission: Arc::new(|_| Ok(())),
+            target_admission: Arc::new(|_, _| Ok(())),
         }
     }
 
@@ -521,9 +529,15 @@ impl ServerStreamPort {
 
     pub(in crate::runtime) fn validate_target(
         &self,
+        path_registration: &ServerCarrierPathRegistration,
         target: &TargetAddr,
     ) -> Result<(), RuntimeError> {
-        (self.target_admission)(target)
+        if !path_registration.belongs_to(self) {
+            return Err(RuntimeError::Protocol(
+                "reliable path registration does not match stream service",
+            ));
+        }
+        (self.target_admission)(path_registration.principal_permit(), target)
     }
 
     pub(in crate::runtime) fn register_carrier_path(
@@ -532,23 +546,44 @@ impl ServerStreamPort {
         underlay: UnderlayProtocol,
         path_id: PathId,
         local: ServerLocalPathProperties,
-    ) -> ServerCarrierPathRegistration {
+        principal_permit: PrincipalPermit,
+    ) -> Result<ServerCarrierPathRegistration, RuntimeError> {
         let identity = ServerCarrierPathIdentity {
             session_id,
             underlay,
             path_id,
             path_instance_id: next_carrier_path_instance_id(),
         };
-        self.backend.activate_carrier_path(identity, local);
-        ServerCarrierPathRegistration {
+        self.backend
+            .activate_carrier_path(identity, local, principal_permit.clone())?;
+        Ok(ServerCarrierPathRegistration {
             inner: Arc::new(ServerCarrierPathRegistrationInner {
                 backend: self.backend.clone(),
                 owner_token: self.owner_token,
                 identity,
                 local,
+                principal_permit,
                 validation: Arc::new(AtomicBool::new(false)),
             }),
-        }
+        })
+    }
+
+    #[cfg(test)]
+    pub(in crate::runtime) fn register_test_carrier_path(
+        &self,
+        session_id: SessionId,
+        underlay: UnderlayProtocol,
+        path_id: PathId,
+        local: ServerLocalPathProperties,
+    ) -> ServerCarrierPathRegistration {
+        self.register_carrier_path(
+            session_id,
+            underlay,
+            path_id,
+            local,
+            PrincipalPermit::for_test("test-peer"),
+        )
+        .expect("register test carrier path")
     }
 
     pub(in crate::runtime) fn register_realtime_flow(

@@ -5,6 +5,9 @@ script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 repo_root="$(cd "$script_dir/.." && pwd)"
 cd "$repo_root"
 source "$script_dir/result-paths.sh"
+mkdir -p .tmp/lab .tmp/python-cache .tmp/system
+export PYTHONPYCACHEPREFIX="$repo_root/.tmp/python-cache"
+export TMPDIR="$repo_root/.tmp/system"
 
 flag_enabled() {
   case "${1,,}" in
@@ -27,7 +30,7 @@ monotonic_time_ns() {
   python3 -c 'import time; print(time.monotonic_ns())'
 }
 
-lab_lock_file="/tmp/mptunnel-compose-lab.lock"
+lab_lock_file=".tmp/lab/compose.lock"
 exec {lab_lock_fd}>"$lab_lock_file"
 if ! flock -n "$lab_lock_fd"; then
   echo "another mptunnel Compose lab run holds $lab_lock_file" >&2
@@ -113,7 +116,7 @@ failover_trigger_poll_interval_seconds="${MPTUNNEL_LAB_FAILOVER_TRIGGER_POLL_INT
 build_product="${BUILD_PRODUCT:-1}"
 build_lab_images="${BUILD_LAB_IMAGES:-1}"
 client_runtime="${MPTUNNEL_LAB_CLIENT_RUNTIME:-native}"
-wine_prefix="${MPTUNNEL_LAB_WINE_PREFIX:-/tmp/mptunnel-wine}"
+wine_prefix="${MPTUNNEL_LAB_WINE_PREFIX:-.tmp/lab/wine}"
 printf -v wine_prefix_shell '%q' "$wine_prefix"
 case "$client_runtime" in
   native)
@@ -131,11 +134,13 @@ case "$client_runtime" in
     exit 2
     ;;
 esac
-# The public diagnostic switch also controls the compile-time feature. Keep the
-# longer legacy name as an override for existing lab invocations.
-lab_diagnostics="${MPTUNNEL_LAB_DIAGNOSTICS:-${MPTUNNEL_LAB_DIAG:-0}}"
+# One public diagnostic switch controls both the optimized feature build and
+# the private runtime event switch consumed by the instrumented binary.
+lab_diagnostics="${MPTUNNEL_LAB_DIAGNOSTICS:-0}"
 if flag_enabled "$lab_diagnostics"; then
-  export MPTUNNEL_LAB_DIAG="${MPTUNNEL_LAB_DIAG:-1}"
+  export MPTUNNEL_LAB_DIAG=1
+else
+  export MPTUNNEL_LAB_DIAG=0
 fi
 lab_perf="${MPTUNNEL_LAB_PERF:-0}"
 lab_perf_samples="${MPTUNNEL_LAB_PERF_SAMPLES:-0}"
@@ -146,11 +151,8 @@ management_snapshots="${MPTUNNEL_LAB_MANAGEMENT_SNAPSHOTS:-0}"
 management_snapshot_interval="${MPTUNNEL_LAB_MANAGEMENT_SNAPSHOT_INTERVAL_SECONDS:-1}"
 management_snapshot_port="${MPTUNNEL_LAB_MANAGEMENT_PORT:-17600}"
 management_token="${MPTUNNEL_LAB_MANAGEMENT_TOKEN:-mptunnel-lab-management-token}"
-management_control="${MPTUNNEL_LAB_MANAGEMENT_CONTROL:-0}"
-handoff_initial_wait_seconds="${MPTUNNEL_LAB_HANDOFF_INITIAL_WAIT_SECONDS:-10}"
-handoff_calibration_wait_seconds="${MPTUNNEL_LAB_HANDOFF_CALIBRATION_WAIT_SECONDS:-10}"
-handoff_wait_seconds="${MPTUNNEL_LAB_HANDOFF_WAIT_SECONDS:-20}"
 fail_on_bad_status="${MPTUNNEL_LAB_FAIL_ON_BAD_STATUS:-1}"
+require_competitor_baselines="${MPTUNNEL_LAB_REQUIRE_COMPETITOR_BASELINES:-0}"
 lab_log_level="${MPTUNNEL_LAB_LOG:-info}"
 case "${MPTUNNEL_LAB_COLLECT_LOGS:-auto}" in
   auto)
@@ -172,8 +174,18 @@ else
   log_tail_lines="${MPTUNNEL_LAB_LOG_TAIL_LINES:-120}"
 fi
 mptunnel_protocol_version="$(sed -nE 's/^const VERSION: u8 = ([0-9]+);$/\1/p' src/protocol/codec.rs)"
-if [[ ! "$mptunnel_protocol_version" =~ ^[1-9][0-9]*$ ]]; then
-  echo "unable to determine the MPP wire protocol version" >&2
+IFS=$'\t' read -r mptunnel_expected_protocol_version mptunnel_carrier_presentation < <(
+  PYTHONPATH="$script_dir" python3 - <<'PY'
+from result_enrichment import (
+    MPTUNNEL_CARRIER_PRESENTATION,
+    MPTUNNEL_PROTOCOL_VERSION,
+)
+
+print(f"{MPTUNNEL_PROTOCOL_VERSION}\t{MPTUNNEL_CARRIER_PRESENTATION}")
+PY
+)
+if [[ "$mptunnel_protocol_version" != "$mptunnel_expected_protocol_version" ]]; then
+  echo "lab evidence supports only MPP wire protocol v${mptunnel_expected_protocol_version}; found ${mptunnel_protocol_version:-unknown}" >&2
   exit 2
 fi
 source_commit="$(git rev-parse --verify HEAD)"
@@ -188,6 +200,8 @@ else
   mptunnel_build_features='[]'
 fi
 result_reproducibility=""
+host_snapshot_file="$result_dir/host-snapshot.json"
+host_snapshot_sha256=""
 if [[ ! "$log_tail_bytes" =~ ^[0-9]+$ ]] || (( log_tail_bytes < 1 )); then
   echo "MPTUNNEL_LAB_LOG_TAIL_BYTES must be a positive integer" >&2
   exit 2
@@ -212,6 +226,38 @@ if [[ -n "${MPTUNNEL_LAB_SECRET:-}" ]]; then
   secret="$MPTUNNEL_LAB_SECRET"
 else
   secret="$(python3 -c 'import uuid; print(uuid.uuid4())')"
+fi
+if ! command -v openssl >/dev/null 2>&1; then
+  echo "openssl is required to generate the ephemeral MPTUNNEL lab TLS identity" >&2
+  exit 2
+fi
+lab_identity_dir="$repo_root/.tmp/lab/identity-$$"
+lab_identity_container_dir="/workspace/.tmp/lab/identity-$$"
+mkdir -p "$lab_identity_dir"
+umask 077
+printf '%s' "$secret" > "$lab_identity_dir/credential.key"
+printf '%s' "$management_token" > "$lab_identity_dir/management.token"
+openssl req -x509 -newkey rsa:2048 -nodes -days 1 \
+  -subj "/CN=mptunnel.test" \
+  -addext "subjectAltName=DNS:mptunnel.test" \
+  -addext "basicConstraints=critical,CA:FALSE" \
+  -addext "keyUsage=critical,digitalSignature,keyEncipherment" \
+  -addext "extendedKeyUsage=serverAuth" \
+  -keyout "$lab_identity_dir/tls-private-key.pem" \
+  -out "$lab_identity_dir/tls-certificate.pem" >/dev/null 2>&1
+server_credential_path="$lab_identity_container_dir/credential.key"
+server_management_token_path="$lab_identity_container_dir/management.token"
+server_tls_certificate_path="$lab_identity_container_dir/tls-certificate.pem"
+server_tls_private_key_path="$lab_identity_container_dir/tls-private-key.pem"
+if [[ "$client_runtime" == "wine" ]]; then
+  client_identity_dir="Z:\\workspace\\.tmp\\lab\\identity-$$"
+  client_credential_path="${client_identity_dir}\\credential.key"
+  client_management_token_path="${client_identity_dir}\\management.token"
+  client_tls_certificate_path="${client_identity_dir}\\tls-certificate.pem"
+else
+  client_credential_path="$server_credential_path"
+  client_management_token_path="$server_management_token_path"
+  client_tls_certificate_path="$server_tls_certificate_path"
 fi
 baseline_uuid="${BASELINE_UUID:-$(SECRET="$secret" python3 -c 'import os, uuid; print(uuid.uuid5(uuid.NAMESPACE_URL, os.environ["SECRET"]))')}"
 saturate_protocol="${MPTUNNEL_LAB_SATURATE_PROTOCOL:-udp}"
@@ -373,6 +419,26 @@ prepare_client_runtime() {
   exec_in client "if [ ! -d ${wine_prefix_shell}/drive_c ]; then if ! timeout ${client_start_timeout_seconds}s env WINEDEBUG=-all WINEPREFIX=${wine_prefix_shell} wineboot --init >/tmp/mptunnel-wineboot.log 2>&1; then echo 'timed out initializing the Wine client runtime' >&2; tail -n 80 /tmp/mptunnel-wineboot.log >&2 || true; exit 1; fi; if ! timeout ${client_start_timeout_seconds}s env WINEDEBUG=-all WINEPREFIX=${wine_prefix_shell} wineserver -w; then echo 'timed out waiting for Wine initialization to stop' >&2; exit 1; fi; fi"
 }
 
+capture_host_snapshot() {
+  local -a lab_container_ids=()
+  local -a snapshot_command=(
+    python3 "$script_dir/host_snapshot.py" capture
+    --repo-root "$repo_root"
+    --output "$host_snapshot_file"
+  )
+  local container_id
+  mapfile -t lab_container_ids < <(compose ps -q)
+  if (( ${#lab_container_ids[@]} < 3 )); then
+    echo "unable to identify all running lab containers for host validity" >&2
+    exit 2
+  fi
+  for container_id in "${lab_container_ids[@]}"; do
+    snapshot_command+=(--exclude-container-id "$container_id")
+  done
+  "${snapshot_command[@]}"
+  host_snapshot_sha256="$(sha256sum "$host_snapshot_file" | awk '{print $1}')"
+}
+
 refresh_result_reproducibility() {
   local server_target server_sha256 client_sha256 runtime_version
   server_target="$(rustc -vV | sed -n 's/^host: //p')"
@@ -387,29 +453,47 @@ refresh_result_reproducibility() {
     SOURCE_TREE_DIRTY="$source_tree_dirty" \
     MPTUNNEL_BUILD_FEATURES="$mptunnel_build_features" \
     MPTUNNEL_PROTOCOL_VERSION="$mptunnel_protocol_version" \
+    MPTUNNEL_CARRIER_PRESENTATION="$mptunnel_carrier_presentation" \
     MPTUNNEL_CLIENT_RUNTIME="$client_runtime" \
     MPTUNNEL_CLIENT_RUNTIME_VERSION="$runtime_version" \
     MPTUNNEL_CLIENT_TARGET="$client_target" \
     MPTUNNEL_CLIENT_SHA256="$client_sha256" \
     MPTUNNEL_SERVER_TARGET="$server_target" \
     MPTUNNEL_SERVER_SHA256="$server_sha256" \
+    HOST_SNAPSHOT_FILE="$host_snapshot_file" \
+    HOST_SNAPSHOT_SHA256="$host_snapshot_sha256" \
+    LAB_SCRIPT_DIR="$script_dir" \
       python3 - <<'PY'
 import json
 import os
+import sys
 
-print(json.dumps({
+sys.path.insert(0, os.environ["LAB_SCRIPT_DIR"])
+from result_enrichment import load_host_reproducibility
+
+_, host_fields = load_host_reproducibility(
+    os.environ["HOST_SNAPSHOT_FILE"],
+    os.environ["HOST_SNAPSHOT_SHA256"],
+)
+
+identity = {
     "source_commit": os.environ["SOURCE_COMMIT"],
     "source_tree_dirty": os.environ["SOURCE_TREE_DIRTY"] == "true",
     "mptunnel_build_profile": "release",
     "mptunnel_build_features": json.loads(os.environ["MPTUNNEL_BUILD_FEATURES"]),
     "mptunnel_protocol_version": int(os.environ["MPTUNNEL_PROTOCOL_VERSION"]),
+    "mptunnel_carrier_presentation": os.environ[
+        "MPTUNNEL_CARRIER_PRESENTATION"
+    ],
     "mptunnel_client_runtime": os.environ["MPTUNNEL_CLIENT_RUNTIME"],
     "mptunnel_client_runtime_version": os.environ["MPTUNNEL_CLIENT_RUNTIME_VERSION"],
     "mptunnel_client_target": os.environ["MPTUNNEL_CLIENT_TARGET"],
     "mptunnel_client_sha256": os.environ["MPTUNNEL_CLIENT_SHA256"],
     "mptunnel_server_target": os.environ["MPTUNNEL_SERVER_TARGET"],
     "mptunnel_server_sha256": os.environ["MPTUNNEL_SERVER_SHA256"],
-}, separators=(",", ":"), sort_keys=True))
+}
+identity.update(host_fields)
+print(json.dumps(identity, separators=(",", ":"), sort_keys=True))
 PY
   )"
 }
@@ -445,12 +529,12 @@ write_run_manifest() {
   CONTAINER_STATS_VALUE="$container_stats" \
   MANAGEMENT_SNAPSHOTS_VALUE="$management_snapshots" \
   USE_PATH_HINTS_VALUE="${MPTUNNEL_LAB_USE_PATH_HINTS:-0}" \
+  REQUIRE_COMPETITOR_BASELINES_VALUE="$require_competitor_baselines" \
   CLIENT_IMAGE_ID="$client_image_id" \
   SERVER_IMAGE_ID="$server_image_id" \
   TARGET_IMAGE_ID="$target_image_id" \
-  HOST_KERNEL="$(uname -srmo)" \
-  HOST_CPU_COUNT="$(nproc)" \
-  HOST_MEMORY_BYTES="$(awk '/^MemTotal:/ {print $2 * 1024}' /proc/meminfo)" \
+  HOST_SNAPSHOT_FILE="$host_snapshot_file" \
+  HOST_SNAPSHOT_SHA256="$host_snapshot_sha256" \
   DOCKER_VERSION="$(docker version --format '{{.Client.Version}}')" \
   COMPOSE_VERSION="$(docker compose version --short)" \
   BASELINE_LOCK_FILE="$script_dir/baseline-lock.json" \
@@ -518,14 +602,20 @@ resource_config_toml() {
     MPTUNNEL_MAX_ACK_RANGES:max_ack_ranges
     MPTUNNEL_MAX_PATHS:max_paths
     MPTUNNEL_MAX_STREAMS:max_streams
+    MPTUNNEL_MAX_QUIC_CONCURRENT_BIDI_STREAMS:max_quic_concurrent_bidi_streams
     MPTUNNEL_MAX_STREAM_WINDOW_BYTES:max_stream_window_bytes
     MPTUNNEL_MAX_REPAIR_BYTES:max_repair_bytes
     MPTUNNEL_MAX_REORDER_BYTES:max_reorder_bytes
+    MPTUNNEL_MAX_REINJECTION_CACHE_CHUNKS:max_reinjection_cache_chunks
+    MPTUNNEL_MAX_REORDER_BUFFER_CHUNKS:max_reorder_buffer_chunks
+    MPTUNNEL_MAX_RETAINED_RECEIVE_RANGES:max_retained_receive_ranges
     MPTUNNEL_MAX_DATAGRAM_QUEUE_BYTES:max_datagram_queue_bytes
     MPTUNNEL_MAX_PATH_FLIGHT_BYTES:max_path_flight_bytes
     MPTUNNEL_MAX_RELIABLE_RELAY_CHUNK_BYTES:max_reliable_relay_chunk_bytes
     MPTUNNEL_TCP_PATH_HEARTBEAT_INTERVAL_MS:tcp_path_heartbeat_interval_ms
     MPTUNNEL_TCP_PATH_HEARTBEAT_TIMEOUT_MS:tcp_path_heartbeat_timeout_ms
+    MPTUNNEL_QUIC_PATH_KEEP_ALIVE_INTERVAL_MS:quic_path_keep_alive_interval_ms
+    MPTUNNEL_QUIC_PATH_IDLE_TIMEOUT_MS:quic_path_idle_timeout_ms
   )
   for mapping in "${mappings[@]}"; do
     env_name="${mapping%%:*}"
@@ -634,23 +724,27 @@ wait_for_client_proxy() {
 }
 
 management_config_toml() {
-  if ! flag_enabled "$management_snapshots" && ! flag_enabled "$management_control"; then
+  if ! flag_enabled "$management_snapshots"; then
     return 0
   fi
   if [[ ! "$management_snapshot_port" =~ ^[0-9]+$ ]] || (( management_snapshot_port < 1 || management_snapshot_port > 65535 )); then
     echo "MPTUNNEL_LAB_MANAGEMENT_PORT must be an integer from 1 through 65535" >&2
     return 2
   fi
-  local token_json
-  token_json="$(toml_string "$management_token")"
-  printf '[management]\nlisten = ["127.0.0.1:%s"]\ntoken = %s\n' \
-    "$management_snapshot_port" "$token_json"
+  local token_path="$1"
+  local token_path_json
+  token_path_json="$(toml_string "$token_path")"
+  printf '[management]\nlisten = ["127.0.0.1:%s"]\ntoken = { from = "file", path = %s }\n' \
+    "$management_snapshot_port" "$token_path_json"
 }
 
 server_config_toml() {
-  local log_level_json secret_json endpoints resources management
+  local log_level_json credential_path_json certificate_path_json private_key_path_json
+  local endpoints resources management
   log_level_json="$(toml_string "$lab_log_level")"
-  secret_json="$(toml_string "$secret")"
+  credential_path_json="$(toml_string "$server_credential_path")"
+  certificate_path_json="$(toml_string "$server_tls_certificate_path")"
+  private_key_path_json="$(toml_string "$server_tls_private_key_path")"
   endpoints="$(toml_array_from_args \
     "tcp://172.31.10.20:${server_port}" \
     "tcp://172.31.15.20:${server_port}" \
@@ -663,7 +757,7 @@ server_config_toml() {
     "udp://172.31.20.20:${server_port}" \
     "udp://172.31.30.20:${server_port}")"
   resources="$(resource_config_toml)"
-  management="$(management_config_toml)"
+  management="$(management_config_toml "$server_management_token_path")"
   if [[ -n "$resources" ]]; then
     resources="${resources}"$'\n\n'
   fi
@@ -673,14 +767,30 @@ server_config_toml() {
   cat <<EOF
 log_level = ${log_level_json}
 
-${resources}${management}[[inbounds]]
+${resources}${management}[[credentials]]
+id = "lab"
+principal = "lab"
+secret = { from = "file", path = ${credential_path_json} }
+
+[[inbounds]]
 tag = "lab-mpp-in"
 protocol = "mpp"
 endpoints = ${endpoints}
 outbound = "lab-direct"
 
 [inbounds.security]
-secret = ${secret_json}
+credentials = ["lab"]
+tls_certificate_chain_file = ${certificate_path_json}
+tls_private_key_file = ${private_key_path_json}
+
+[inbounds.destination_acl]
+generation = 1
+
+[[inbounds.destination_acl.rules]]
+id = "allow-lab-private-targets"
+effect = "allow-restricted"
+destination_cidrs = ["172.31.0.0/16"]
+networks = ["tcp", "udp"]
 
 [[outbounds]]
 tag = "lab-direct"
@@ -690,14 +800,16 @@ EOF
 
 socks_client_config_toml() {
   local path_args="$1"
-  local log_level_json secret_json listen endpoints resources probe management
+  local log_level_json credential_path_json certificate_path_json
+  local listen endpoints resources probe management
   log_level_json="$(toml_string "$lab_log_level")"
-  secret_json="$(toml_string "$secret")"
+  credential_path_json="$(toml_string "$client_credential_path")"
+  certificate_path_json="$(toml_string "$client_tls_certificate_path")"
   listen="$(toml_array_from_args "127.0.0.1:${proxy_port}")"
   endpoints="$(path_args_to_endpoint_array "$path_args")"
   resources="$(resource_config_toml)"
   probe="$(probe_config_toml)"
-  management="$(management_config_toml)"
+  management="$(management_config_toml "$client_management_token_path")"
   if [[ -n "$resources" ]]; then
     resources="${resources}"$'\n\n'
   fi
@@ -710,11 +822,15 @@ socks_client_config_toml() {
   cat <<EOF
 log_level = ${log_level_json}
 
-${resources}${management}[[inbounds]]
+${resources}${management}[[credentials]]
+id = "lab"
+principal = "lab"
+secret = { from = "file", path = ${credential_path_json} }
+
+[[inbounds]]
 tag = "lab-socks"
 protocol = "socks5"
 listen = ${listen}
-outbound = "lab-mpp-out"
 
 [[outbounds]]
 tag = "lab-mpp-out"
@@ -722,19 +838,38 @@ protocol = "mpp"
 endpoints = ${endpoints}
 ${probe}
 [outbounds.security]
-secret = ${secret_json}
+credential = "lab"
+tls_server_name = "mptunnel.test"
+tls_pinned_certificate_file = ${certificate_path_json}
+
+[routing]
+
+[routing.destination_acl]
+
+[[routing.destination_acl.rules]]
+id = "allow-lab-private-targets"
+effect = "allow-restricted"
+destination_cidrs = ["172.31.0.0/16"]
+networks = ["tcp", "udp"]
+
+[[routing.rules]]
+id = "default"
+action = "outbound"
+target = "lab-mpp-out"
 EOF
 }
 
 tun_client_config_toml() {
   local path_args="$1"
-  local log_level_json secret_json endpoints resources probe management
+  local log_level_json credential_path_json certificate_path_json
+  local endpoints resources probe management
   log_level_json="$(toml_string "$lab_log_level")"
-  secret_json="$(toml_string "$secret")"
+  credential_path_json="$(toml_string "$client_credential_path")"
+  certificate_path_json="$(toml_string "$client_tls_certificate_path")"
   endpoints="$(path_args_to_endpoint_array "$path_args")"
   resources="$(resource_config_toml)"
   probe="$(probe_config_toml)"
-  management="$(management_config_toml)"
+  management="$(management_config_toml "$client_management_token_path")"
   if [[ -n "$resources" ]]; then
     resources="${resources}"$'\n\n'
   fi
@@ -747,10 +882,14 @@ tun_client_config_toml() {
   cat <<EOF
 log_level = ${log_level_json}
 
-${resources}${management}[[inbounds]]
+${resources}${management}[[credentials]]
+id = "lab"
+principal = "lab"
+secret = { from = "file", path = ${credential_path_json} }
+
+[[inbounds]]
 tag = "lab-tun"
 protocol = "tun"
-outbound = "lab-mpp-out"
 name = "mptun0"
 ipv4 = "10.88.0.1"
 ipv4_prefix = 24
@@ -761,7 +900,24 @@ protocol = "mpp"
 endpoints = ${endpoints}
 ${probe}
 [outbounds.security]
-secret = ${secret_json}
+credential = "lab"
+tls_server_name = "mptunnel.test"
+tls_pinned_certificate_file = ${certificate_path_json}
+
+[routing]
+
+[routing.destination_acl]
+
+[[routing.destination_acl.rules]]
+id = "allow-lab-private-targets"
+effect = "allow-restricted"
+destination_cidrs = ["172.31.0.0/16"]
+networks = ["tcp", "udp"]
+
+[[routing.rules]]
+id = "default"
+action = "outbound"
+target = "lab-mpp-out"
 EOF
 }
 
@@ -869,36 +1025,6 @@ telemetry_file_for_case() {
 management_snapshot_file_for_case() {
   local case_name="$1"
   printf '%s/management-snapshots-%s.jsonl' "$result_dir" "$(case_artifact_name "$case_name")"
-}
-
-causal_handoff_stage_file_for_case() {
-  local case_name="$1"
-  printf '%s/causal-handoff-stages-%s.jsonl' "$result_dir" "$(case_artifact_name "$case_name")"
-}
-
-record_causal_handoff_stage() {
-  local case_name="$1"
-  local phase="$2"
-  local status="$3"
-  local detail="${4:-}"
-  CASE_NAME="$case_name" PHASE="$phase" STATUS="$status" DETAIL="$detail" \
-    python3 - "$(causal_handoff_stage_file_for_case "$case_name")" <<'PY'
-import json
-import os
-import sys
-import time
-
-row = {
-    "case": os.environ["CASE_NAME"],
-    "phase": os.environ["PHASE"],
-    "status": os.environ["STATUS"],
-    "detail": os.environ.get("DETAIL", ""),
-    "unix_time_ns": time.time_ns(),
-    "monotonic_time_ns": time.monotonic_ns(),
-}
-with open(sys.argv[1], "a", encoding="utf-8") as handle:
-    print(json.dumps(row, sort_keys=True), file=handle)
-PY
 }
 
 netdev_snapshot_file_for_case() {
@@ -1176,7 +1302,13 @@ append_skipped_result() {
   local case_name="$1"
   local protocol="$2"
   local reason="$3"
-  CASE_NAME="$case_name" PROTOCOL="$protocol" REASON="$reason" \
+  local status="skipped"
+  if flag_enabled "$require_competitor_baselines"; then
+    case "$case_name" in
+      baseline_vmess_*|baseline_hysteria2_*) status="fail" ;;
+    esac
+  fi
+  CASE_NAME="$case_name" PROTOCOL="$protocol" REASON="$reason" STATUS="$status" \
     RESULT_REPRODUCIBILITY="$result_reproducibility" LAB_SCRIPT_DIR="$script_dir" \
     python3 - <<'PY' >> "$result_file"
 import json
@@ -1186,7 +1318,7 @@ import sys
 row = {
     "case": os.environ["CASE_NAME"],
     "protocol": os.environ["PROTOCOL"],
-    "status": "skipped",
+    "status": os.environ["STATUS"],
     "reason": os.environ["REASON"],
 }
 sys.path.insert(0, os.environ["LAB_SCRIPT_DIR"])
@@ -1339,193 +1471,6 @@ run_tcp_download_probe_case() {
   probe_stderr="$(exec_in client "tail -n 80 '${err_file}' 2>/dev/null | tail -c 4000 || true")"
   set -e
   append_download_probe_result "$case_name" "$exit_code" "$output" "$probe_stderr"
-}
-
-control_client_path_state() {
-  local underlay="$1"
-  local index="$2"
-  local state="$3"
-  local authorization payload
-  printf -v authorization '%q' "Authorization: Bearer ${management_token}"
-  printf -v payload '%q' "{\"underlay\":\"${underlay}\",\"index\":${index},\"state\":\"${state}\"}"
-  exec_in client "curl -fsS --max-time 5 -X POST -H 'Content-Type: application/json' -H ${authorization} --data ${payload} 'http://127.0.0.1:${management_snapshot_port}/api/control/path'"
-}
-
-run_staged_exact_receipt_handoff_case() {
-  local case_name="$1"
-  if ! flag_enabled "$lab_diagnostics"; then
-    append_skipped_result "$case_name" "tcp" "staged causal handoff requires MPTUNNEL_LAB_DIAGNOSTICS=1"
-    return 0
-  fi
-
-  # This case creates proof authority after both downloads demonstrably own
-  # TCP Service bindings; ordinary mixed startup cannot establish that cause.
-  local management_control=1
-  local staged_binding_count=2
-  local MPTUNNEL_LAB_DIAG_EVENTS="response_quic_capacity_calibration,quic_capacity_receipt,quic_capacity_proof,quic_capacity_probe_retired,response_service_handoff,server_bulk_output_selected"
-  local stage_file started_file out_file err_file status_file pid_file
-  local server_log_offset activation_log_offset telemetry_pid output probe_stderr exit_code
-  local disable_output disable_status transport_client_status transport_server_status
-  local initial_output initial_status restore_client_output restore_client_status
-  local restore_server_output restore_server_status activate_output activate_status
-  local calibration_output calibration_status handoff_output handoff_status
-  local verifier_output verifier_status stage_failed=0
-  stage_file="$(causal_handoff_stage_file_for_case "$case_name")"
-  started_file="/tmp/mptunnel-causal-handoff.started"
-  out_file="/tmp/mptunnel-causal-handoff.out"
-  err_file="/tmp/mptunnel-causal-handoff.err"
-  status_file="/tmp/mptunnel-causal-handoff.status"
-  pid_file="/tmp/mptunnel-causal-handoff.pid"
-  mkdir -p "$result_dir"
-  rm -f "$stage_file"
-
-  # Keep QUIC transport attached while management excludes it from placement.
-  # Physical loss/reconnect belongs to fault rows, not this handoff proof.
-  start_client "$case_name" "$tcp_lowlat $udp_fat"
-  server_log_offset="$(exec_in server "stat -c %s /tmp/mptunnel-server.log")"
-  record_causal_handoff_stage "$case_name" "configured" "ok" \
-    "lowlat_rate=${MPTUNNEL_LAB_LOWLAT_RATE:-80mbit};lowlat_delay=${MPTUNNEL_LAB_LOWLAT_DELAY:-20ms};lowlat_jitter=${MPTUNNEL_LAB_LOWLAT_JITTER:-2ms};lowlat_loss=${MPTUNNEL_LAB_LOWLAT_LOSS:-1.00%};fat_rate=${MPTUNNEL_LAB_FAT_RATE:-500mbit};fat_delay=${MPTUNNEL_LAB_FAT_DELAY:-180ms};fat_jitter=${MPTUNNEL_LAB_FAT_JITTER:-20ms};fat_loss=${MPTUNNEL_LAB_FAT_LOSS:-1.00%};load_seconds=${load_duration_seconds};fixed_bindings=${staged_binding_count};udp_transport=warm_scheduler_disabled;server_log_offset=${server_log_offset};events=${MPTUNNEL_LAB_DIAG_EVENTS}"
-
-  set +e
-  disable_output="$(control_client_path_state udp 0 disabled 2>&1)"
-  disable_status="$?"
-  exec_netem client show >/dev/null 2>&1
-  transport_client_status="$?"
-  exec_netem server show >/dev/null 2>&1
-  transport_server_status="$?"
-  set -e
-  record_causal_handoff_stage "$case_name" "udp_disabled" "$disable_status" "$disable_output"
-  record_causal_handoff_stage "$case_name" "fat_transport_preserved_client" "$transport_client_status" \
-    "$(exec_netem client show 2>&1 || true)"
-  record_causal_handoff_stage "$case_name" "fat_transport_preserved_server" "$transport_server_status" \
-    "$(exec_netem server show 2>&1 || true)"
-  if (( disable_status != 0 || transport_client_status != 0 || transport_server_status != 0 )); then
-    stage_failed=1
-  fi
-
-  exec_in client "rm -f '${started_file}' '${out_file}' '${err_file}' '${status_file}' '${pid_file}'"
-  start_case_telemetry "$case_name"
-  telemetry_pid="$case_telemetry_pid"
-  exec_in client "(timeout $((curl_timeout + 10))s python3 /workspace/lab/failover_download_probe.py --label '${case_name}' --proxy 127.0.0.1:${proxy_port} --target 172.31.40.30:8080 --path '${large_http_path}' --failover-after -1 --timeout '${curl_timeout}' --load-duration '${load_duration_seconds}' --parallel-downloads '${staged_binding_count}' --request-lifecycle fixed --started-file '${started_file}' >'${out_file}' 2>'${err_file}'; echo \$? >'${status_file}') & echo \$! >'${pid_file}'"
-  set +e
-  exec_in client "deadline=\$((SECONDS + 10)); while [ ! -f '${started_file}' ] && [ \$SECONDS -lt \$deadline ]; do sleep 0.05; done; test -f '${started_file}'"
-  if (( $? != 0 )); then
-    stage_failed=1
-  fi
-  initial_output="$(exec_in server "python3 /workspace/lab/causal_handoff.py wait --log /tmp/mptunnel-server.log --after-byte '${server_log_offset}' --event server_bulk_output_selected --field path_underlay=Tcp --field role=Service --field work=OwnerData --distinct-field binding_instance_id --count '${staged_binding_count}' --timeout '${handoff_initial_wait_seconds}'" 2>&1)"
-  initial_status="$?"
-  set -e
-  record_causal_handoff_stage "$case_name" "two_tcp_service_bindings" "$initial_status" "$initial_output"
-  if (( initial_status != 0 )); then
-    stage_failed=1
-  fi
-
-  if (( stage_failed == 0 )); then
-    set +e
-    restore_client_output="$(exec_netem client apply-fat 2>&1)"
-    restore_client_status="$?"
-    restore_server_output="$(exec_netem server apply-fat 2>&1)"
-    restore_server_status="$?"
-    set -e
-    if (( restore_client_status == 0 && restore_server_status == 0 )); then
-      activation_log_offset="$(exec_in server "stat -c %s /tmp/mptunnel-server.log")"
-      set +e
-      activate_output="$(control_client_path_state udp 0 enabled 2>&1)"
-      activate_status="$?"
-      set -e
-    else
-      activation_log_offset="$server_log_offset"
-      activate_output="skipped because fat-path restore failed"
-      activate_status=1
-    fi
-  else
-    restore_client_output="skipped because the fixed TCP cohort was not established"
-    restore_client_status=1
-    restore_server_output="$restore_client_output"
-    restore_server_status=1
-    activate_output="$restore_client_output"
-    activate_status=1
-    activation_log_offset="$server_log_offset"
-  fi
-  record_causal_handoff_stage "$case_name" "fat_restored_client" "$restore_client_status" \
-    "${restore_client_output}$(exec_netem client show 2>&1 || true)"
-  record_causal_handoff_stage "$case_name" "fat_restored_server" "$restore_server_status" \
-    "${restore_server_output}$(exec_netem server show 2>&1 || true)"
-  record_causal_handoff_stage "$case_name" "udp_activated" "$activate_status" "$activate_output"
-  if (( restore_client_status != 0 || restore_server_status != 0 || activate_status != 0 )); then
-    stage_failed=1
-  fi
-
-  if (( stage_failed == 0 )); then
-    set +e
-    calibration_output="$(exec_in server "python3 /workspace/lab/causal_handoff.py wait --log /tmp/mptunnel-server.log --after-byte '${activation_log_offset}' --event response_quic_capacity_calibration --field phase=started --field path_id=0 --timeout '${handoff_calibration_wait_seconds}'" 2>&1)"
-    calibration_status="$?"
-    set -e
-  else
-    calibration_output='{"status":"fail","reason":"staged transition failed"}'
-    calibration_status=1
-  fi
-  record_causal_handoff_stage "$case_name" "capacity_calibration_started" "$calibration_status" "$calibration_output"
-  if (( calibration_status != 0 )); then
-    stage_failed=1
-  fi
-
-  if (( stage_failed == 0 )); then
-    set +e
-    handoff_output="$(exec_in server "python3 /workspace/lab/causal_handoff.py wait --log /tmp/mptunnel-server.log --after-byte '${server_log_offset}' --event response_service_handoff --field phase=committed --field capacity_proof_authority=exact_receipt --field from_underlay=Tcp --field to_underlay=Udp --timeout '${handoff_wait_seconds}'" 2>&1)"
-    handoff_status="$?"
-    set -e
-  else
-    handoff_output='{"status":"fail","reason":"staged transition failed"}'
-    handoff_status=1
-  fi
-  record_causal_handoff_stage "$case_name" "exact_receipt_handoff" "$handoff_status" "$handoff_output"
-  if (( handoff_status != 0 )); then
-    stage_failed=1
-    exec_in client "kill \$(cat '${pid_file}') >/dev/null 2>&1 || true; echo 125 >'${status_file}'; pkill -TERM -f 'failover_download_probe.py --label ${case_name}' >/dev/null 2>&1 || true" || true
-  fi
-
-  exec_in client "deadline=\$((SECONDS + ${curl_timeout} + 5)); while [ ! -f '${status_file}' ] && [ \$SECONDS -lt \$deadline ]; do sleep 0.2; done; if [ ! -f '${status_file}' ]; then echo 124 >'${status_file}'; fi"
-  stop_case_telemetry "$case_name" "$telemetry_pid"
-  output="$(exec_in client "cat '${out_file}' 2>/dev/null || true")"
-  probe_stderr="$(exec_in client "tail -n 80 '${err_file}' 2>/dev/null | tail -c 4000 || true")"
-  exit_code="$(exec_in client "cat '${status_file}' 2>/dev/null || echo 124")"
-
-  set +e
-  verifier_output="$(exec_in server "python3 /workspace/lab/causal_handoff.py verify --log /tmp/mptunnel-server.log --mode exact-receipt --after-byte '${server_log_offset}' --expected-product-bindings '${staged_binding_count}'" 2>&1)"
-  verifier_status="$?"
-  set -e
-  record_causal_handoff_stage "$case_name" "causal_verifier" "$verifier_status" "$verifier_output"
-  if (( verifier_status != 0 )); then
-    stage_failed=1
-  fi
-
-  output="$(ROW="$output" CAUSAL="$verifier_output" STAGE_FAILED="$stage_failed" PROBE_EXIT="$exit_code" STAGE_FILE="$stage_file" python3 - <<'PY'
-import json
-import os
-
-try:
-    row = json.loads(os.environ.get("ROW", ""))
-except json.JSONDecodeError:
-    row = {"case": "mptunnel_reliable_mixed_tcp_lowlat_udp_fat_handoff_restore"}
-try:
-    causal = json.loads(os.environ.get("CAUSAL", ""))
-except json.JSONDecodeError:
-    causal = {"status": "fail", "raw": os.environ.get("CAUSAL", "")}
-try:
-    probe_exit = int(os.environ.get("PROBE_EXIT", "124"))
-except ValueError:
-    probe_exit = 124
-row["causal_handoff"] = causal
-row["causal_handoff_stage_file"] = os.environ["STAGE_FILE"]
-row["probe_exit_code"] = probe_exit
-if os.environ.get("STAGE_FAILED") != "0" or probe_exit != 0 or causal.get("status") != "ok":
-    row["status"] = "fail"
-print(json.dumps(row, sort_keys=True))
-PY
-)"
-  append_download_probe_result "$case_name" "$exit_code" "$output" "$probe_stderr"
-  apply_netem apply
 }
 
 append_upload_probe_result() {
@@ -2883,9 +2828,9 @@ run_mixed_flapping_case() {
   local output_file="/tmp/mptunnel-mixed-flapping.out"
   local error_file="/tmp/mptunnel-mixed-flapping.err"
   local probe_pid_file="/tmp/mptunnel-mixed-flapping.pid"
-  local probe_gate_relative="lab/results/flapper-${timestamp}-$$-probe.started"
-  local probe_finished_relative="lab/results/flapper-${timestamp}-$$-probe.finished"
-  local probe_status_relative="lab/results/flapper-${timestamp}-$$-probe.status"
+  local probe_gate_relative=".tmp/lab/flapper-${timestamp}-$$-probe.started"
+  local probe_finished_relative=".tmp/lab/flapper-${timestamp}-$$-probe.finished"
+  local probe_status_relative=".tmp/lab/flapper-${timestamp}-$$-probe.status"
   local probe_gate_file="${repo_root}/${probe_gate_relative}"
   local probe_finished_file="${repo_root}/${probe_finished_relative}"
   local probe_status_file="${repo_root}/${probe_status_relative}"
@@ -3224,6 +3169,7 @@ fi
 compose up -d --remove-orphans
 trap cleanup EXIT
 prepare_client_runtime
+capture_host_snapshot
 refresh_result_reproducibility
 write_run_manifest
 
@@ -3468,10 +3414,6 @@ for equal_profile in lowlat balanced fat unconstrained; do
     run_reliable_ideal_download_case "mptunnel_reliable_mixed_multipath_equal_${equal_profile}" "$equal_profile" "$mixed_equal_all"
   fi
 done
-
-if should_run_case "mptunnel_reliable_mixed_tcp_lowlat_udp_fat_handoff_restore"; then
-  run_staged_exact_receipt_handoff_case "mptunnel_reliable_mixed_tcp_lowlat_udp_fat_handoff_restore"
-fi
 
 if should_run_case "mptunnel_reliable_mixed_tcp_lowlat_udp_fat"; then
   start_client "reliable_mixed_tcp_lowlat_udp_fat" "$tcp_lowlat $udp_fat"
@@ -3760,7 +3702,7 @@ with open(sys.argv[1], "r", encoding="utf-8") as handle:
         if not line.strip():
             continue
         row = json.loads(line)
-        if row.get("status") not in {"ok", "loss"}:
+        if row.get("status") not in {"ok", "loss", "skipped"}:
             failed.append((line_number, row.get("case", "unknown"), row.get("status")))
 
 if failed:

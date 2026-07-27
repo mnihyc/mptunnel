@@ -1,24 +1,44 @@
 //! Server listener composition; carrier loops remain under `runtime::path`.
 
-use crate::config::{
-    ManagementConfig, MppPerformanceConfig, ResourceLimits, SecurityConfig, SessionConfig,
-};
-use crate::outbound::{self, DnsConfig, OutboundConfig, TargetProtocol};
+#[cfg(test)]
+use crate::config::{ManagementConfig, ServerDestinationAclConfig, SessionConfig};
+use crate::config::{RouteTarget, ServerSecurityConfig};
+use crate::outbound;
+#[cfg(test)]
+use crate::outbound::OutboundConfig;
+use crate::outbound::ServerDestinationPolicy;
+use crate::performance::{MppPerformanceConfig, ResourceLimits};
+use crate::product::Network;
+#[cfg(test)]
+use crate::product::OutboundId;
 use crate::protocol::UnderlayProtocol;
-use crate::runtime::datagram::ServerDatagramService;
+#[cfg(test)]
+use crate::runtime::config_control::RuntimeConfigControl;
+use crate::runtime::datagram::{ServerDatagramService, ServerDatagramServiceConfig};
 use crate::runtime::error::RuntimeError;
-use crate::runtime::management::spawn_server_management_services;
+#[cfg(test)]
+use crate::runtime::management::spawn_node_management_services;
+#[cfg(test)]
+use crate::runtime::outbound_registry::RuntimeOutboundLeaf;
+use crate::runtime::outbound_registry::RuntimeOutboundRegistry;
+use crate::runtime::path::authentication::ProductCredentialAdmission;
 use crate::runtime::path::quic::io::UdpPathEndpoint;
 use crate::runtime::path::quic::server::{bind_server_udp_endpoint, run_server_udp_listener};
-use crate::runtime::path::tcp::server::handle_server_path;
-use crate::runtime::path::{ServerLocalPath, ServerPathContext};
-use crate::runtime::recent_ids::{RecentIdCache, path_join_replay_cache_capacity};
-use crate::runtime::relay::ServerReliableRelayService;
-use crate::runtime::telemetry::{RuntimeTelemetry, active_flow_detail_capacity};
+use crate::runtime::path::tcp::server::handle_server_path_with_authentication_slot;
+use crate::runtime::path::{CredentialRetirementControl, ServerLocalPath, ServerPathContext};
+#[cfg(test)]
+use crate::runtime::readiness::RuntimeReadinessBarrier;
+use crate::runtime::recent_ids::{ExpiringReplayCache, path_join_replay_cache_capacity};
+use crate::runtime::relay::{ServerReliableRelayContext, ServerReliableRelayService};
+use crate::runtime::telemetry::RuntimeTelemetry;
+#[cfg(test)]
+use crate::runtime::telemetry::active_flow_detail_capacity;
+use crate::transport::encrypted::TcpServerTlsConfig;
 use crate::transport::{PathSpec, tcp};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use tokio::net::TcpListener;
+use tokio::sync::Semaphore;
 
 /// Per-identity server services and the carrier context they compose.
 pub(in crate::runtime) struct ServerIdentityRuntime {
@@ -26,30 +46,63 @@ pub(in crate::runtime) struct ServerIdentityRuntime {
     pub(in crate::runtime) reliable_relay: ServerReliableRelayService,
 }
 
+#[cfg(test)]
 #[allow(clippy::too_many_arguments)]
 pub(in crate::runtime) async fn run(
     path_specs: Vec<PathSpec>,
     outbound: OutboundConfig,
-    outbound_dns: DnsConfig,
     outbound_connect_timeout: Duration,
-    security: SecurityConfig,
+    destination_acl: ServerDestinationAclConfig,
+    security: ServerSecurityConfig,
+    tls: TcpServerTlsConfig,
     performance: MppPerformanceConfig,
     resources: ResourceLimits,
     session: SessionConfig,
     management: ManagementConfig,
+    config_control: Option<RuntimeConfigControl>,
 ) -> Result<(), RuntimeError> {
+    let id = OutboundId::parse("test-server-egress")
+        .map_err(|error| RuntimeError::ProductPolicy(error.to_string()))?;
+    let registry = RuntimeOutboundRegistry::compile(
+        [RuntimeOutboundLeaf::Local {
+            id: id.clone(),
+            config: outbound,
+            connect_timeout: outbound_connect_timeout,
+            native_sockets: Arc::new(crate::transport::SystemNativeSocketConfigurator),
+        }],
+        &[],
+        crate::runtime::outbound_registry::test_dns_generation(),
+    )?;
+    let product_admission = registry.product_admission().clone();
+    let destination_policy = Arc::new(ServerDestinationPolicy::new(
+        destination_acl
+            .compile()
+            .map_err(|error| RuntimeError::ProductPolicy(error.to_string()))?,
+    ));
     let runtime = new_identity_runtime_with_metadata(
         None,
         path_specs,
-        outbound,
-        outbound_dns,
-        outbound_connect_timeout,
+        registry,
+        RouteTarget {
+            kind: crate::config::RouteTargetKind::Outbound,
+            tag: id.as_str().to_string(),
+        },
+        None,
+        destination_policy,
         security,
+        tls,
         performance,
         resources,
+        RuntimeTelemetry::new(active_flow_detail_capacity(resources.max_streams)),
         session.retention_timeout,
         management.peer_diagnostics_enabled(),
-    );
+    )?;
+    let generation = config_control
+        .as_ref()
+        .map(RuntimeConfigControl::generation)
+        .unwrap_or_default();
+    let readiness = RuntimeReadinessBarrier::new(generation.clone());
+    let server_readiness = readiness.require("MPP server listeners");
     let bound = bind_paths(&runtime.paths).await?;
     let ServerIdentityRuntime {
         paths,
@@ -57,108 +110,170 @@ pub(in crate::runtime) async fn run(
     } = runtime;
     let mut services = tokio::task::JoinSet::new();
     services.spawn(reliable_relay.run());
+    spawn_listeners(bound, paths.clone(), &mut services);
+    server_readiness.ready();
     if management.http_enabled() {
-        spawn_server_management_services(management, paths.clone(), &mut services);
+        let management_readiness = readiness.require("management listeners");
+        let product_telemetry = paths.telemetry.clone();
+        spawn_node_management_services(
+            management,
+            Vec::new(),
+            vec![paths],
+            crate::runtime::management::ProductRuntimeInventory::default(),
+            product_telemetry,
+            config_control,
+            None,
+            None,
+            product_admission,
+            generation.clone(),
+            management_readiness,
+            &mut services,
+        );
     }
-    spawn_listeners(bound, paths, &mut services);
-    super::supervise_runtime_services(
+    readiness.seal();
+    let result = super::supervise_runtime_services(
         services,
+        &generation,
         "server service exited",
         "server has no runtime services",
     )
     .await
+    .map(|_| ());
+    if let Err(error) = &result {
+        generation.mark_failed(error.to_string());
+    }
+    result
 }
 
 #[cfg(test)]
 pub(in crate::runtime) fn new_identity_runtime(
     server_paths: Vec<PathSpec>,
     outbound: OutboundConfig,
-    outbound_dns: DnsConfig,
     outbound_connect_timeout: Duration,
-    security: SecurityConfig,
+    security: ServerSecurityConfig,
     performance: MppPerformanceConfig,
     resources: ResourceLimits,
 ) -> ServerIdentityRuntime {
+    let destination_policy = Arc::new(ServerDestinationPolicy::allow_restricted_for_test());
+    let id = OutboundId::parse("test-server-egress").expect("static test outbound ID");
+    let registry = RuntimeOutboundRegistry::compile(
+        [RuntimeOutboundLeaf::Local {
+            id: id.clone(),
+            config: outbound,
+            connect_timeout: outbound_connect_timeout,
+            native_sockets: Arc::new(crate::transport::SystemNativeSocketConfigurator),
+        }],
+        &[],
+        crate::runtime::outbound_registry::test_dns_generation(),
+    )
+    .expect("test outbound registry");
     new_identity_runtime_with_metadata(
         None,
         server_paths,
-        outbound,
-        outbound_dns,
-        outbound_connect_timeout,
+        registry,
+        RouteTarget {
+            kind: crate::config::RouteTargetKind::Outbound,
+            tag: id.as_str().to_string(),
+        },
+        None,
+        destination_policy,
         security,
+        crate::transport::encrypted::test_server_tls_config(),
         performance,
         resources,
+        RuntimeTelemetry::new(active_flow_detail_capacity(resources.max_streams)),
         SessionConfig::default().retention_timeout,
         false,
     )
+    .expect("test server identity runtime")
 }
 
 #[allow(clippy::too_many_arguments)]
 pub(super) fn new_identity_runtime_with_metadata(
     tag: Option<String>,
     server_paths: Vec<PathSpec>,
-    outbound: OutboundConfig,
-    outbound_dns: DnsConfig,
-    outbound_connect_timeout: Duration,
-    security: SecurityConfig,
+    outbound_registry: RuntimeOutboundRegistry,
+    route_target: RouteTarget,
+    dns_plan: Option<crate::product::DnsPlanId>,
+    destination_policy: Arc<ServerDestinationPolicy>,
+    security: ServerSecurityConfig,
+    tls: TcpServerTlsConfig,
     performance: MppPerformanceConfig,
     resources: ResourceLimits,
+    telemetry: RuntimeTelemetry,
     session_retention_timeout: Duration,
     allow_peer_diagnostics: bool,
-) -> ServerIdentityRuntime {
+) -> Result<ServerIdentityRuntime, RuntimeError> {
+    let outbound_selector = outbound_registry.selector_for_target(&route_target)?;
+    outbound_registry.ensure_native_selector(&outbound_selector)?;
     let mux_limits = resources.into();
-    let telemetry = RuntimeTelemetry::new(active_flow_detail_capacity(resources.max_streams));
-    let (reliable_streams, reliable_relay) = ServerReliableRelayService::new(
-        outbound.clone(),
-        outbound_dns.clone(),
-        outbound_connect_timeout,
-        performance,
-        mux_limits,
-        session_retention_timeout,
-        telemetry.clone(),
-    );
-    let stream_target_outbound = outbound.clone();
+    let (reliable_streams, reliable_relay) =
+        ServerReliableRelayService::new(ServerReliableRelayContext {
+            outbound_registry: outbound_registry.clone(),
+            outbound_selector: outbound_selector.clone(),
+            dns_plan: dns_plan.clone(),
+            destination_policy: destination_policy.clone(),
+            performance,
+            mux_limits,
+            max_paths_per_session: resources.max_paths,
+            session_retention_timeout,
+            telemetry: telemetry.clone(),
+        });
+    let stream_destination_policy = destination_policy.clone();
     let reliable_stream_port =
         reliable_streams
             .path_port()
-            .with_target_admission(Arc::new(move |target| {
+            .with_target_admission(Arc::new(move |permit, target| {
                 outbound::validate_target(target)?;
-                stream_target_outbound.ensure_supports(TargetProtocol::Tcp)?;
+                stream_destination_policy
+                    .for_principal(permit.principal().clone())
+                    .authorize_pre(Network::Tcp, target)
+                    .map_err(|error| RuntimeError::DestinationDenied(error.to_string()))?;
                 Ok(())
             }));
-    let datagram_port = ServerDatagramService::path_port(
-        outbound,
-        outbound_dns,
-        outbound_connect_timeout,
+    let datagram_port = ServerDatagramService::path_port(ServerDatagramServiceConfig {
+        outbound_registry,
+        outbound_selector,
+        dns_plan,
+        destination_policy,
         session_retention_timeout,
         mux_limits,
-        reliable_stream_port.clone(),
-        telemetry.clone(),
-    );
+        reliable_streams: reliable_stream_port.clone(),
+        telemetry: telemetry.clone(),
+    });
+    let credential_admission = ProductCredentialAdmission::from_security(&security);
+    let pending_authentications = Arc::new(Semaphore::new(security.max_pending_authentications));
     let paths = ServerPathContext {
         tag,
         server_paths: Arc::new(server_paths),
         codec_limits: resources.into(),
         mux_limits,
         security,
+        credential_admission,
+        credential_retirements: CredentialRetirementControl::new(),
+        pending_authentications,
+        tls,
         reliable_streams: reliable_stream_port,
         datagrams: datagram_port,
         telemetry,
         peer_status: crate::runtime::peer_status::PeerStatusBroker::new(allow_peer_diagnostics),
-        path_join_replay: Arc::new(Mutex::new(RecentIdCache::new(
+        path_join_replay: Arc::new(Mutex::new(ExpiringReplayCache::new(
             path_join_replay_cache_capacity(resources.max_streams),
         ))),
         max_udp_flows_per_session: resources.max_streams,
     };
-    ServerIdentityRuntime {
+    Ok(ServerIdentityRuntime {
         paths,
         reliable_relay,
-    }
+    })
 }
 
 pub(super) async fn bind_paths(
     context: &ServerPathContext,
 ) -> Result<Vec<BoundServerPath>, RuntimeError> {
+    if context.server_paths.is_empty() {
+        return Err(RuntimeError::Protocol("MPP server has no path listeners"));
+    }
     let mut bound = Vec::with_capacity(context.server_paths.len());
     for (config_ordinal, path) in context.server_paths.iter().enumerate() {
         let local_path = ServerLocalPath::new(config_ordinal, path.clone());
@@ -211,6 +326,10 @@ pub(super) fn spawn_listeners(
     }
 }
 
+#[allow(
+    clippy::large_enum_variant,
+    reason = "server paths are allocated only at startup; boxing would add allocation and indirection to avoid stack-only ownership"
+)]
 pub(super) enum BoundServerPath {
     Tcp {
         listener: TcpListener,
@@ -230,22 +349,57 @@ pub(super) async fn run_server_tcp_listener(
     let mut connections = tokio::task::JoinSet::new();
     loop {
         tokio::select! {
+            biased;
+            Some(result) = connections.join_next(), if !connections.is_empty() => {
+                if let Err(err) = result {
+                    crate::observability::process_event!(
+                        Warn,
+                        "path",
+                        "server_handler_task_failed",
+                        "server path handler task failed: {err}"
+                    );
+                }
+            }
             accepted = listener.accept() => {
                 let (stream, _) = accepted?;
                 stream.set_nodelay(true)?;
-                let context = context.clone();
-                let local_path = local_path.clone();
-                connections.spawn(async move {
-                    if let Err(err) = handle_server_path(stream, local_path, context).await {
-                        eprintln!("warning: server path handler failed: {err}");
-                    }
-                });
-            }
-            Some(result) = connections.join_next(), if !connections.is_empty() => {
-                if let Err(err) = result {
-                    eprintln!("warning: server path handler task failed: {err}");
-                }
+                try_spawn_server_tcp_connection(
+                    &mut connections,
+                    stream,
+                    local_path.clone(),
+                    context.clone(),
+                );
             }
         }
     }
+}
+
+pub(super) fn try_spawn_server_tcp_connection(
+    connections: &mut tokio::task::JoinSet<()>,
+    stream: tokio::net::TcpStream,
+    local_path: ServerLocalPath,
+    context: ServerPathContext,
+) -> bool {
+    let authentication_slot = match context.try_begin_authentication() {
+        Ok(authentication_slot) => authentication_slot,
+        Err(_) => return false,
+    };
+    connections.spawn(async move {
+        if let Err(err) = handle_server_path_with_authentication_slot(
+            stream,
+            local_path,
+            context,
+            authentication_slot,
+        )
+        .await
+        {
+            crate::observability::process_event!(
+                Warn,
+                "path",
+                "server_handler_failed",
+                "server path handler failed: {err}"
+            );
+        }
+    });
+    true
 }

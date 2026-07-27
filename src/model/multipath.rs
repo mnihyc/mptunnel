@@ -4,7 +4,7 @@
 //! only bounds optional duplicate traffic relative to acknowledged progress of
 //! original connection data.
 
-use crate::config::MppPerformanceConfig;
+use crate::performance::MppPerformanceConfig;
 
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct ExtraTrafficBudget {

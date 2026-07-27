@@ -182,7 +182,7 @@ pub(super) async fn drain_client_udp_stream_commands(
                     carrier_input_open,
                 )
                 .await?;
-                let _ = udp_path_finish_stream(send);
+                let _ = udp_path_finish_stream(send).await;
                 true
             }
             ReliablePathCommand::CloseStream(close_stream_id) => {
@@ -201,7 +201,7 @@ pub(super) async fn drain_client_udp_stream_commands(
                 )
                 .await?;
                 if close_stream_id == stream_id {
-                    let _ = udp_path_finish_stream(send);
+                    let _ = udp_path_finish_stream(send).await;
                     true
                 } else {
                     false

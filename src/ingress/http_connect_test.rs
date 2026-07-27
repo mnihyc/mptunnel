@@ -29,6 +29,7 @@ fn parses_proxy_authorization_header_case_insensitively() {
     .expect("connect");
 
     assert_eq!(request.proxy_authorization.as_deref(), Some("Basic abc"));
+    assert!(!format!("{request:?}").contains("Basic abc"));
 }
 
 #[test]

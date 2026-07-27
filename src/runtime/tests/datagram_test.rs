@@ -700,7 +700,7 @@ fn udp_edge_association_queue_is_bounded_by_resource_bytes() {
     };
     let context = ClientPathContext::new(vec![path], security(), resources).expect("context");
 
-    assert_eq!(udp_edge_queue_slots(&context), 3);
+    assert_eq!(udp_edge_queue_slots(context.mux_limits), 3);
 }
 
 #[test]

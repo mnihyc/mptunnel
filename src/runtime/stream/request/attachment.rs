@@ -453,6 +453,19 @@ impl ReliableRelayRemoteSet {
             .ok_or(RuntimeError::ReliablePathSessionClosed)
     }
 
+    /// Returns the relay-input backlog visible at this instant.
+    ///
+    /// Ready-only receive batching snapshots this value before trying frames so
+    /// producers cannot extend one actor turn indefinitely.
+    pub(in crate::runtime) fn ready_frame_count(&self) -> usize {
+        self.frames_rx.len()
+    }
+
+    /// Takes one already-queued frame without waiting.
+    pub(in crate::runtime) fn try_recv_frame(&mut self) -> Option<ReliableRelayRemoteFrame> {
+        self.frames_rx.try_recv().ok()
+    }
+
     pub(in crate::runtime) fn has_buffered_frame(&self) -> bool {
         !self.frames_rx.is_empty()
     }

@@ -88,7 +88,9 @@ fn completion_requires_terminal_control_ack_and_reorder_drain() {
         .send_data(Bytes::from_static(b"sent"))
         .expect("retain unique bytes until Data ACK");
     assert!(!state.is_finished(&send_stream, &recv_stream, &sender_queue));
-    send_stream.apply_ack(&[OffsetRange { start: 0, end: 4 }]);
+    send_stream
+        .apply_ack(&[OffsetRange { start: 0, end: 4 }])
+        .expect("ACK assigned request bytes");
     assert!(state.is_finished(&send_stream, &recv_stream, &sender_queue));
 
     recv_stream

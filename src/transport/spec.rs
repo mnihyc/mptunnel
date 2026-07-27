@@ -165,7 +165,7 @@ fn parse_path_options(query: &str) -> Result<(PathBinding, PathMetadata), PathSp
                 source_ip_set = true;
                 binding.source_ip = Some(parse_ip_param(key, value)?);
             }
-            "srtt-ms" | "rtt-ms" => {
+            "srtt-ms" => {
                 reject_duplicate(srtt_set, key)?;
                 srtt_set = true;
                 metadata.initial_srtt_ms = Some(parse_u32_param(key, value)?);
@@ -214,7 +214,7 @@ fn parse_path_options(query: &str) -> Result<(PathBinding, PathMetadata), PathSp
                     }
                 };
             }
-            "datagram-payload-limit" | "mtu" | "mtu-bytes" | "payload-mtu" => {
+            "datagram-payload-limit" => {
                 reject_duplicate(datagram_payload_limit_set, key)?;
                 datagram_payload_limit_set = true;
                 metadata.max_datagram_payload_bytes =
@@ -222,8 +222,7 @@ fn parse_path_options(query: &str) -> Result<(PathBinding, PathMetadata), PathSp
             }
             "backup" => metadata.policy.backup = parse_bool_param(key, value)?,
             "expensive" => metadata.policy.expensive = parse_bool_param(key, value)?,
-            "bulk-allowed" | "bulk" => metadata.policy.bulk_allowed = parse_bool_param(key, value)?,
-            "no-bulk" => metadata.policy.bulk_allowed = !parse_bool_param(key, value)?,
+            "bulk-allowed" => metadata.policy.bulk_allowed = parse_bool_param(key, value)?,
             "probe-only" => metadata.policy.probe_only = parse_bool_param(key, value)?,
             "no-udp" => metadata.policy.no_udp = parse_bool_param(key, value)?,
             _ => return Err(PathSpecParseError::UnknownQueryParam(key.to_string())),
@@ -282,8 +281,8 @@ fn parse_datagram_payload_limit(
 
 fn parse_bool_param(key: &str, value: Option<&str>) -> Result<bool, PathSpecParseError> {
     match value.unwrap_or("true") {
-        "true" | "1" | "yes" | "on" => Ok(true),
-        "false" | "0" | "no" | "off" => Ok(false),
+        "true" => Ok(true),
+        "false" => Ok(false),
         value => Err(PathSpecParseError::InvalidQueryParamValue(
             key.to_string(),
             value.to_string(),

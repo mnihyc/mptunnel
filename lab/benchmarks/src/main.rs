@@ -1,7 +1,9 @@
 mod benchmarks;
+mod replay;
 
-use benchmarks::{BenchmarkError, BenchmarkOptions};
+use benchmarks::BenchmarkError;
 use clap::{Args, Parser, Subcommand, ValueEnum};
+use std::path::PathBuf;
 use std::process::ExitCode;
 
 #[derive(Debug, Parser)]
@@ -19,6 +21,8 @@ enum Command {
     Gates(GatesArgs),
     /// Run deterministic path-profile ablation comparisons.
     Ablation(AblationArgs),
+    /// Replay a versioned scheduling/recovery observation trace.
+    Replay(ReplayArgs),
 }
 
 #[derive(Debug, Args)]
@@ -33,13 +37,6 @@ struct GatesArgs {
         default_value_t = OutputFormat::Text
     )]
     format: OutputFormat,
-
-    #[arg(
-        long,
-        env = "MPTUNNEL_BENCH_RESOURCE_SAMPLE_MIB",
-        default_value_t = BenchmarkOptions::default().resource_sample_mib
-    )]
-    resource_sample_mib: u32,
 }
 
 #[derive(Debug, Args)]
@@ -51,6 +48,13 @@ struct AblationArgs {
         default_value_t = OutputFormat::Text
     )]
     format: OutputFormat,
+}
+
+#[derive(Debug, Args)]
+struct ReplayArgs {
+    /// Versioned JSON observation trace.
+    #[arg(long)]
+    input: PathBuf,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
@@ -73,12 +77,12 @@ fn run(cli: Cli) -> Result<(), BenchmarkError> {
     match cli.command {
         Command::Gates(args) => run_gates(args),
         Command::Ablation(args) => run_ablation(args),
+        Command::Replay(args) => run_replay(args),
     }
 }
 
 fn run_gates(args: GatesArgs) -> Result<(), BenchmarkError> {
-    let options = BenchmarkOptions::new(args.resource_sample_mib)?;
-    let report = benchmarks::run_benchmarks(options)?;
+    let report = benchmarks::run_benchmarks();
     match args.format {
         OutputFormat::Text => print!("{}", report.render_text()),
         OutputFormat::Json => println!("{}", report.render_json()?),
@@ -95,5 +99,14 @@ fn run_ablation(args: AblationArgs) -> Result<(), BenchmarkError> {
         OutputFormat::Text => print!("{}", report.render_text()),
         OutputFormat::Json => println!("{}", report.render_json()?),
     }
+    Ok(())
+}
+
+fn run_replay(args: ReplayArgs) -> Result<(), BenchmarkError> {
+    let report = replay::replay_file(&args.input).map_err(BenchmarkError::Replay)?;
+    println!(
+        "{}",
+        replay::render_json(&report).map_err(BenchmarkError::Replay)?
+    );
     Ok(())
 }

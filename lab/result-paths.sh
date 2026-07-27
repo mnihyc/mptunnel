@@ -1,16 +1,21 @@
 #!/usr/bin/env bash
 
-# Lab labels are repository-local evidence, so relative destinations always
-# belong below lab/results. Absolute paths remain available for external disks.
+# Lab labels are repository-local temporary evidence. Every destination stays
+# below the one ignored scratch owner instead of creating root or source-tree
+# output directories.
 normalize_lab_result_path() {
   local path="${1#./}"
 
   case "$path" in
-    /*|lab/results|lab/results/*)
+    .tmp/lab/results|.tmp/lab/results/*)
       printf '%s\n' "$path"
       ;;
+    /*)
+      echo "lab result paths must stay below .tmp/lab/results: $path" >&2
+      return 2
+      ;;
     *)
-      printf 'lab/results/%s\n' "$path"
+      printf '.tmp/lab/results/%s\n' "$path"
       ;;
   esac
 }

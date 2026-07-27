@@ -1,3 +1,5 @@
+//! Wire-type contract tests for the current clean-break wire version.
+
 use super::*;
 
 #[test]

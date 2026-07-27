@@ -1,263 +1,376 @@
-use crate::config::CipherSuite;
+//! TLS 1.3 TCP carrier framing.
+//!
+//! TLS owns confidentiality, integrity, forward secrecy, record sizing, and
+//! traffic-key updates. MPTunnel owns only its bounded admission prelude and
+//! protocol-frame codec.
+
 #[cfg(feature = "lab-diagnostics")]
 use crate::lab_diagnostics::lab_perf_record;
 use crate::protocol::Frame;
-use crate::protocol::codec::{CodecError, CodecLimits, decode_frame_bytes, encode_frame_into};
-use crate::transport::aead::{AEAD_TAG_LEN, TransportAead};
-use bytes::Bytes;
-use hmac::{Hmac, Mac};
-use sha2::Sha256;
-use std::io::{self, IoSlice};
-use std::sync::{Arc, OnceLock};
-use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, ReadHalf, WriteHalf};
+use crate::protocol::codec::{
+    CodecError, CodecLimits, FRAME_HEADER_LEN, decode_frame_bytes, decode_payload_len_from_header,
+    encode_frame_into,
+};
+use bytes::BytesMut;
+use rustls::client::WebPkiServerVerifier;
+use rustls::client::danger::{HandshakeSignatureValid, ServerCertVerified, ServerCertVerifier};
+use rustls::pki_types::{CertificateDer, PrivateKeyDer, ServerName, UnixTime};
+use rustls::{ClientConfig, DigitallySignedStruct, RootCertStore, ServerConfig, SignatureScheme};
+use sha2::{Digest, Sha256};
+use std::io;
+use std::pin::Pin;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::task::{Context, Poll};
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, ReadBuf, ReadHalf, WriteHalf};
+use tokio_rustls::TlsStream;
 
-const MAGIC: &[u8; 4] = b"MPTE";
-const VERSION: u8 = 2;
-const CONNECTION_SALT_LEN: usize = 16;
-const HEADER_LEN: usize = 34;
-const TAG_LEN: usize = AEAD_TAG_LEN;
-const DIR_CLIENT_TO_SERVER: u8 = 1;
-const DIR_SERVER_TO_CLIENT: u8 = 2;
+/// QUIC presents as the standardized HTTP/3 application protocol. MPP
+/// admission is carried only in encrypted HTTP/3 request DATA; TCP
+/// deliberately negotiates no ALPN.
+pub const HTTP_3_ALPN: &[u8] = b"h3";
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum PeerRole {
-    Client,
-    Server,
+/// One fixed, encrypted TCP admission request. This is deliberately not a
+/// public wire marker: the bytes are written only after TLS 1.3 completes.
+pub(crate) const TCP_ADMISSION_PRELUDE_LEN: usize = 131;
+
+const TCP_ADMISSION_EXPORTER_LEN: usize = 32;
+const TCP_ADMISSION_EXPORTER_LABEL: &[u8] = b"EXPORTER-mptunnel-tcp-admission-v1";
+
+#[derive(Clone)]
+pub struct TcpClientTlsConfig {
+    server_name: ServerName<'static>,
+    pinned_leaf: CertificateDer<'static>,
+    tcp_config: Arc<ClientConfig>,
+    config: Arc<ClientConfig>,
 }
 
-impl PeerRole {
-    fn send_direction(self) -> u8 {
-        match self {
-            Self::Client => DIR_CLIENT_TO_SERVER,
-            Self::Server => DIR_SERVER_TO_CLIENT,
+impl TcpClientTlsConfig {
+    /// Builds TLS 1.3-only client trust from an independently distributed
+    /// end-entity certificate and its explicit WebPKI server name.
+    pub fn new(
+        server_name: impl Into<String>,
+        pinned_leaf: CertificateDer<'static>,
+    ) -> Result<Self, EncryptedFramedTransportError> {
+        let server_name_text = server_name.into();
+        let server_name = ServerName::try_from(server_name_text.clone()).map_err(|_| {
+            EncryptedFramedTransportError::TlsConfiguration(format!(
+                "invalid TLS server name {server_name_text:?}"
+            ))
+        })?;
+        let mut roots = RootCertStore::empty();
+        roots.add(pinned_leaf.clone()).map_err(|error| {
+            EncryptedFramedTransportError::TlsConfiguration(format!(
+                "pinned TLS certificate is not a valid trust anchor: {error}"
+            ))
+        })?;
+        let webpki = WebPkiServerVerifier::builder(Arc::new(roots))
+            .build()
+            .map_err(|error| {
+                EncryptedFramedTransportError::TlsConfiguration(format!(
+                    "failed to build WebPKI verifier: {error}"
+                ))
+            })?;
+        let verifier = Arc::new(ExactLeafVerifier {
+            webpki,
+            pinned_leaf: pinned_leaf.clone(),
+        });
+        let mut tcp_config =
+            ClientConfig::builder_with_protocol_versions(&[&rustls::version::TLS13])
+                .dangerous()
+                .with_custom_certificate_verifier(verifier)
+                .with_no_client_auth();
+        tcp_config.enable_early_data = false;
+        tcp_config.alpn_protocols.clear();
+        let mut config = tcp_config.clone();
+        config.alpn_protocols = vec![HTTP_3_ALPN.to_vec()];
+        Ok(Self {
+            server_name,
+            pinned_leaf,
+            tcp_config: Arc::new(tcp_config),
+            config: Arc::new(config),
+        })
+    }
+
+    /// QUIC-facing TLS identity. TCP consumes the separately cached ALPN-free
+    /// configuration built from the same certificate verifier.
+    pub(in crate::transport) fn rustls_config(&self) -> Arc<ClientConfig> {
+        self.config.clone()
+    }
+
+    /// Returns the DNS identity usable as both QUIC SNI and exact HTTP/3
+    /// authority. TLS deliberately omits SNI for IP identities, so they remain
+    /// valid only for TCP-only path groups.
+    pub(crate) fn quic_server_name_text(&self) -> Option<String> {
+        match &self.server_name {
+            ServerName::DnsName(name) => Some(name.as_ref().to_string()),
+            _ => None,
         }
     }
 
-    fn recv_direction(self) -> u8 {
-        match self {
-            Self::Client => DIR_SERVER_TO_CLIENT,
-            Self::Server => DIR_CLIENT_TO_SERVER,
+    #[cfg(test)]
+    pub(in crate::transport) fn from_config(
+        server_name: ServerName<'static>,
+        pinned_leaf: CertificateDer<'static>,
+        config: ClientConfig,
+    ) -> Self {
+        let mut tcp_config = config.clone();
+        tcp_config.enable_early_data = false;
+        tcp_config.alpn_protocols.clear();
+        Self {
+            server_name,
+            pinned_leaf,
+            tcp_config: Arc::new(tcp_config),
+            config: Arc::new(config),
+        }
+    }
+}
+
+impl std::fmt::Debug for TcpClientTlsConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("TcpClientTlsConfig")
+            .field("server_name", &self.server_name)
+            .field("pinned_leaf_len", &self.pinned_leaf.as_ref().len())
+            .finish_non_exhaustive()
+    }
+}
+
+impl PartialEq for TcpClientTlsConfig {
+    fn eq(&self, other: &Self) -> bool {
+        self.server_name == other.server_name && self.pinned_leaf == other.pinned_leaf
+    }
+}
+
+impl Eq for TcpClientTlsConfig {}
+
+#[derive(Clone)]
+pub struct TcpServerTlsConfig {
+    certificate_chain: Arc<Vec<CertificateDer<'static>>>,
+    private_key_fingerprint: [u8; 32],
+    tcp_config: Arc<ServerConfig>,
+    config: Arc<ServerConfig>,
+}
+
+impl TcpServerTlsConfig {
+    /// Builds a TLS 1.3-only server identity from already loaded secret
+    /// material. File handling remains a Product-layer responsibility.
+    pub fn new(
+        certificate_chain: Vec<CertificateDer<'static>>,
+        private_key: PrivateKeyDer<'static>,
+    ) -> Result<Self, EncryptedFramedTransportError> {
+        if certificate_chain.is_empty() {
+            return Err(EncryptedFramedTransportError::TlsConfiguration(
+                "TLS certificate chain must not be empty".to_string(),
+            ));
+        }
+        let private_key_fingerprint: [u8; 32] = Sha256::digest(private_key.secret_der()).into();
+        let mut tcp_config =
+            ServerConfig::builder_with_protocol_versions(&[&rustls::version::TLS13])
+                .with_no_client_auth()
+                .with_single_cert(certificate_chain.clone(), private_key)
+                .map_err(|error| {
+                    EncryptedFramedTransportError::TlsConfiguration(format!(
+                        "invalid TLS certificate/private-key identity: {error}"
+                    ))
+                })?;
+        tcp_config.max_early_data_size = 0;
+        tcp_config.alpn_protocols.clear();
+        let mut config = tcp_config.clone();
+        config.alpn_protocols = vec![HTTP_3_ALPN.to_vec()];
+        Ok(Self {
+            certificate_chain: Arc::new(certificate_chain),
+            private_key_fingerprint,
+            tcp_config: Arc::new(tcp_config),
+            config: Arc::new(config),
+        })
+    }
+
+    /// QUIC-facing TLS identity. TCP consumes the separately cached ALPN-free
+    /// configuration built from the same certificate and key.
+    pub(in crate::transport) fn rustls_config(&self) -> Arc<ServerConfig> {
+        self.config.clone()
+    }
+}
+
+impl std::fmt::Debug for TcpServerTlsConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("TcpServerTlsConfig")
+            .field("certificate_chain_len", &self.certificate_chain.len())
+            .field("private_key", &"<redacted>")
+            .finish_non_exhaustive()
+    }
+}
+
+impl PartialEq for TcpServerTlsConfig {
+    fn eq(&self, other: &Self) -> bool {
+        self.certificate_chain == other.certificate_chain
+            && self.private_key_fingerprint == other.private_key_fingerprint
+    }
+}
+
+impl Eq for TcpServerTlsConfig {}
+
+#[derive(Debug)]
+struct ExactLeafVerifier {
+    webpki: Arc<WebPkiServerVerifier>,
+    pinned_leaf: CertificateDer<'static>,
+}
+
+impl ServerCertVerifier for ExactLeafVerifier {
+    fn verify_server_cert(
+        &self,
+        end_entity: &CertificateDer<'_>,
+        intermediates: &[CertificateDer<'_>],
+        server_name: &ServerName<'_>,
+        ocsp_response: &[u8],
+        now: UnixTime,
+    ) -> Result<ServerCertVerified, rustls::Error> {
+        self.webpki.verify_server_cert(
+            end_entity,
+            intermediates,
+            server_name,
+            ocsp_response,
+            now,
+        )?;
+        if end_entity.as_ref() != self.pinned_leaf.as_ref() {
+            return Err(rustls::Error::InvalidCertificate(
+                rustls::CertificateError::ApplicationVerificationFailure,
+            ));
+        }
+        Ok(ServerCertVerified::assertion())
+    }
+
+    fn verify_tls12_signature(
+        &self,
+        message: &[u8],
+        cert: &CertificateDer<'_>,
+        dss: &DigitallySignedStruct,
+    ) -> Result<HandshakeSignatureValid, rustls::Error> {
+        self.webpki.verify_tls12_signature(message, cert, dss)
+    }
+
+    fn verify_tls13_signature(
+        &self,
+        message: &[u8],
+        cert: &CertificateDer<'_>,
+        dss: &DigitallySignedStruct,
+    ) -> Result<HandshakeSignatureValid, rustls::Error> {
+        self.webpki.verify_tls13_signature(message, cert, dss)
+    }
+
+    fn supported_verify_schemes(&self) -> Vec<SignatureScheme> {
+        self.webpki.supported_verify_schemes()
+    }
+}
+
+#[derive(Clone, Default)]
+struct WireByteCounter(Arc<AtomicU64>);
+
+impl WireByteCounter {
+    fn load(&self) -> u64 {
+        self.0.load(Ordering::Relaxed)
+    }
+
+    fn add(&self, bytes: usize) {
+        let bytes = u64::try_from(bytes).unwrap_or(u64::MAX);
+        let previous = self.0.fetch_add(bytes, Ordering::Relaxed);
+        debug_assert!(previous.checked_add(bytes).is_some());
+    }
+}
+
+struct CountingIo<S> {
+    inner: S,
+    written: WireByteCounter,
+}
+
+impl<S> CountingIo<S> {
+    fn new(inner: S, written: WireByteCounter) -> Self {
+        Self { inner, written }
+    }
+}
+
+impl<S: AsyncRead + Unpin> AsyncRead for CountingIo<S> {
+    fn poll_read(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &mut ReadBuf<'_>,
+    ) -> Poll<io::Result<()>> {
+        Pin::new(&mut self.get_mut().inner).poll_read(cx, buf)
+    }
+}
+
+impl<S: AsyncWrite + Unpin> AsyncWrite for CountingIo<S> {
+    fn poll_write(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &[u8],
+    ) -> Poll<Result<usize, io::Error>> {
+        let this = self.get_mut();
+        match Pin::new(&mut this.inner).poll_write(cx, buf) {
+            Poll::Ready(Ok(written)) => {
+                this.written.add(written);
+                Poll::Ready(Ok(written))
+            }
+            other => other,
+        }
+    }
+
+    fn poll_flush(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Result<(), io::Error>> {
+        Pin::new(&mut self.get_mut().inner).poll_flush(cx)
+    }
+
+    fn poll_shutdown(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Result<(), io::Error>> {
+        Pin::new(&mut self.get_mut().inner).poll_shutdown(cx)
+    }
+
+    fn is_write_vectored(&self) -> bool {
+        self.inner.is_write_vectored()
+    }
+
+    fn poll_write_vectored(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        bufs: &[io::IoSlice<'_>],
+    ) -> Poll<Result<usize, io::Error>> {
+        let this = self.get_mut();
+        match Pin::new(&mut this.inner).poll_write_vectored(cx, bufs) {
+            Poll::Ready(Ok(written)) => {
+                this.written.add(written);
+                Poll::Ready(Ok(written))
+            }
+            other => other,
         }
     }
 }
 
 pub struct EncryptedFramedStream<S> {
-    stream: S,
-    key_material: [u8; 32],
-    cipher_suite: CipherSuite,
-    client_connection_salt: Arc<OnceLock<[u8; CONNECTION_SALT_LEN]>>,
-    send_crypto: Option<SendCrypto>,
-    recv_crypto: Option<RecvCrypto>,
+    stream: TlsStream<CountingIo<S>>,
     limits: CodecLimits,
-    send_direction: u8,
-    recv_direction: u8,
-    send_counter: u64,
-    recv_counter: u64,
-    write_poisoned: bool,
-    encode_buffer: Vec<u8>,
-    pending_frames: std::collections::VecDeque<Frame>,
-}
-
-pub struct EncryptedFramedReader<R> {
-    stream: R,
-    key_material: [u8; 32],
-    cipher_suite: CipherSuite,
-    client_connection_salt: Arc<OnceLock<[u8; CONNECTION_SALT_LEN]>>,
-    recv_crypto: Option<RecvCrypto>,
-    limits: CodecLimits,
-    recv_direction: u8,
-    recv_counter: u64,
-    pending_frames: std::collections::VecDeque<Frame>,
-}
-
-pub struct EncryptedFramedWriter<W> {
-    stream: W,
-    key_material: [u8; 32],
-    cipher_suite: CipherSuite,
-    client_connection_salt: Arc<OnceLock<[u8; CONNECTION_SALT_LEN]>>,
-    send_crypto: Option<SendCrypto>,
-    limits: CodecLimits,
-    send_direction: u8,
-    send_counter: u64,
-    write_poisoned: bool,
-    wire_bytes_written: u64,
+    wire_bytes: WireByteCounter,
     encode_buffer: Vec<u8>,
 }
 
-pub type EncryptedFramedSplit<S> = (
-    EncryptedFramedReader<ReadHalf<S>>,
-    EncryptedFramedWriter<WriteHalf<S>>,
-);
-
-#[derive(Clone)]
-struct SendCrypto {
-    connection_salt: [u8; CONNECTION_SALT_LEN],
-    cipher: TransportAead,
+pub struct EncryptedFramedReader<S> {
+    stream: ReadHalf<TlsStream<CountingIo<S>>>,
+    limits: CodecLimits,
 }
 
-#[derive(Clone)]
-struct RecvCrypto {
-    connection_salt: [u8; CONNECTION_SALT_LEN],
-    cipher: TransportAead,
+pub struct EncryptedFramedWriter<S> {
+    stream: WriteHalf<TlsStream<CountingIo<S>>>,
+    limits: CodecLimits,
+    wire_bytes: WireByteCounter,
+    wire_baseline: u64,
+    write_poisoned: bool,
+    encode_buffer: Vec<u8>,
 }
 
-struct WritePoisonGuard<'a> {
-    poisoned: &'a mut bool,
-    armed: bool,
-}
+pub type EncryptedFramedSplit<S> = (EncryptedFramedReader<S>, EncryptedFramedWriter<S>);
 
-impl<'a> WritePoisonGuard<'a> {
-    fn new(poisoned: &'a mut bool) -> Result<Self, EncryptedFramedTransportError> {
-        if *poisoned {
-            return Err(EncryptedFramedTransportError::WriteStatePoisoned);
-        }
-        Ok(Self {
-            poisoned,
-            armed: true,
-        })
-    }
-
-    fn commit(mut self) {
-        self.armed = false;
-    }
-}
-
-impl Drop for WritePoisonGuard<'_> {
-    fn drop(&mut self) {
-        if self.armed {
-            *self.poisoned = true;
-        }
-    }
-}
-
-impl<S: std::fmt::Debug> std::fmt::Debug for EncryptedFramedStream<S> {
+impl<S> std::fmt::Debug for EncryptedFramedStream<S> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("EncryptedFramedStream")
-            .field("stream", &self.stream)
             .field("limits", &self.limits)
-            .field("send_direction", &self.send_direction)
-            .field("recv_direction", &self.recv_direction)
-            .field("send_counter", &self.send_counter)
-            .field("recv_counter", &self.recv_counter)
             .finish_non_exhaustive()
-    }
-}
-
-impl<S> EncryptedFramedStream<S> {
-    pub fn new(
-        stream: S,
-        secret: &[u8],
-        role: PeerRole,
-        limits: CodecLimits,
-    ) -> Result<Self, EncryptedFramedTransportError> {
-        Self::with_cipher_suite(stream, secret, role, limits, CipherSuite::default())
-    }
-
-    pub fn with_cipher_suite(
-        stream: S,
-        secret: &[u8],
-        role: PeerRole,
-        limits: CodecLimits,
-        cipher_suite: CipherSuite,
-    ) -> Result<Self, EncryptedFramedTransportError> {
-        let key_material = derive_key_material(secret, cipher_suite);
-        let client_connection_salt = Arc::new(OnceLock::new());
-        let send_crypto = if role == PeerRole::Client {
-            let connection_salt = random_connection_salt()?;
-            client_connection_salt
-                .set(connection_salt)
-                .expect("new connection salt cell is empty");
-            let key = derive_connection_key(
-                &key_material,
-                cipher_suite,
-                role.send_direction(),
-                &connection_salt,
-                None,
-            );
-            Some(SendCrypto {
-                connection_salt,
-                cipher: TransportAead::new(cipher_suite, &key),
-            })
-        } else {
-            None
-        };
-        Ok(Self {
-            stream,
-            key_material,
-            cipher_suite,
-            client_connection_salt,
-            send_crypto,
-            recv_crypto: None,
-            limits,
-            send_direction: role.send_direction(),
-            recv_direction: role.recv_direction(),
-            send_counter: 0,
-            recv_counter: 0,
-            write_poisoned: false,
-            encode_buffer: Vec::new(),
-            pending_frames: std::collections::VecDeque::new(),
-        })
-    }
-
-    pub fn limits(&self) -> CodecLimits {
-        self.limits
-    }
-
-    pub fn into_inner(self) -> S {
-        self.stream
-    }
-
-    pub fn split(self) -> Result<EncryptedFramedSplit<S>, EncryptedFramedTransportError>
-    where
-        S: AsyncRead + AsyncWrite + Unpin,
-    {
-        let Self {
-            stream,
-            key_material,
-            cipher_suite,
-            client_connection_salt,
-            send_crypto,
-            recv_crypto,
-            limits,
-            send_direction,
-            recv_direction,
-            send_counter,
-            recv_counter,
-            write_poisoned,
-            encode_buffer: _,
-            pending_frames,
-        } = self;
-        if client_connection_salt.get().is_none() || send_crypto.is_none() || recv_crypto.is_none()
-        {
-            return Err(EncryptedFramedTransportError::KeyExchangeIncomplete);
-        }
-        let (read_half, write_half) = tokio::io::split(stream);
-        Ok((
-            EncryptedFramedReader {
-                stream: read_half,
-                key_material,
-                cipher_suite,
-                client_connection_salt: Arc::clone(&client_connection_salt),
-                recv_crypto,
-                limits,
-                recv_direction,
-                recv_counter,
-                pending_frames,
-            },
-            EncryptedFramedWriter {
-                stream: write_half,
-                key_material,
-                cipher_suite,
-                client_connection_salt,
-                send_crypto,
-                limits,
-                send_direction,
-                send_counter,
-                write_poisoned,
-                wire_bytes_written: 0,
-                encode_buffer: Vec::new(),
-            },
-        ))
     }
 }
 
@@ -265,49 +378,116 @@ impl<S> EncryptedFramedStream<S>
 where
     S: AsyncRead + AsyncWrite + Unpin,
 {
+    pub async fn connect(
+        stream: S,
+        tls: &TcpClientTlsConfig,
+        limits: CodecLimits,
+    ) -> Result<Self, EncryptedFramedTransportError> {
+        let wire_bytes = WireByteCounter::default();
+        let stream = CountingIo::new(stream, wire_bytes.clone());
+        let stream = tokio_rustls::TlsConnector::from(tls.tcp_config.clone())
+            .connect(tls.server_name.clone(), stream)
+            .await
+            .map_err(EncryptedFramedTransportError::TlsHandshake)?;
+        let stream = TlsStream::Client(stream);
+        ensure_no_tcp_alpn(&stream)?;
+        Ok(Self {
+            stream,
+            limits,
+            wire_bytes,
+            encode_buffer: Vec::new(),
+        })
+    }
+
+    pub async fn accept(
+        stream: S,
+        tls: &TcpServerTlsConfig,
+        limits: CodecLimits,
+    ) -> Result<Self, EncryptedFramedTransportError> {
+        let wire_bytes = WireByteCounter::default();
+        let stream = CountingIo::new(stream, wire_bytes.clone());
+        let stream = tokio_rustls::TlsAcceptor::from(tls.tcp_config.clone())
+            .accept(stream)
+            .await
+            .map_err(EncryptedFramedTransportError::TlsHandshake)?;
+        let stream = TlsStream::Server(stream);
+        ensure_no_tcp_alpn(&stream)?;
+        Ok(Self {
+            stream,
+            limits,
+            wire_bytes,
+            encode_buffer: Vec::new(),
+        })
+    }
+
+    pub fn limits(&self) -> CodecLimits {
+        self.limits
+    }
+
+    /// TLS 1.3 exporter shared by the endpoints of this exact TCP connection.
+    ///
+    /// rustls derives this only from a completed full handshake; its early
+    /// exporter is never used. The value is consumed once by admission and is
+    /// not retained by the steady-state framed transport.
+    pub(crate) fn tcp_admission_exporter(
+        &self,
+    ) -> Result<[u8; TCP_ADMISSION_EXPORTER_LEN], EncryptedFramedTransportError> {
+        let output = [0u8; TCP_ADMISSION_EXPORTER_LEN];
+        match &self.stream {
+            TlsStream::Client(stream) => stream
+                .get_ref()
+                .1
+                .export_keying_material(output, TCP_ADMISSION_EXPORTER_LABEL, None)
+                .map_err(EncryptedFramedTransportError::TlsExporter),
+            TlsStream::Server(stream) => stream
+                .get_ref()
+                .1
+                .export_keying_material(output, TCP_ADMISSION_EXPORTER_LABEL, None)
+                .map_err(EncryptedFramedTransportError::TlsExporter),
+        }
+    }
+
+    /// Writes the one-time prelude and its immediately following setup frames
+    /// in one plaintext/TLS write. This avoids adding a handshake syscall or
+    /// record boundary while leaving steady-state frame writes unchanged.
+    pub(crate) async fn write_tcp_admission(
+        &mut self,
+        prelude: &[u8; TCP_ADMISSION_PRELUDE_LEN],
+        frames: &[Frame],
+    ) -> Result<(), EncryptedFramedTransportError> {
+        self.encode_buffer.clear();
+        self.encode_buffer.extend_from_slice(prelude);
+        for frame in frames {
+            encode_frame_into(frame, self.limits, &mut self.encode_buffer)?;
+        }
+        self.stream.write_all(&self.encode_buffer).await?;
+        Ok(())
+    }
+
+    /// Reads the one fixed encrypted admission prelude without exposing a
+    /// carrier-specific response branch to unauthenticated input.
+    pub(crate) async fn read_tcp_admission(
+        &mut self,
+    ) -> Result<[u8; TCP_ADMISSION_PRELUDE_LEN], EncryptedFramedTransportError> {
+        let mut prelude = [0u8; TCP_ADMISSION_PRELUDE_LEN];
+        self.stream.read_exact(&mut prelude).await?;
+        Ok(prelude)
+    }
+
     pub async fn read_frame(&mut self) -> Result<Frame, EncryptedFramedTransportError> {
-        if let Some(frame) = self.pending_frames.pop_front() {
-            return Ok(frame);
-        }
-        let mut frames = read_frames_from(
-            &mut self.stream,
-            self.key_material,
-            self.cipher_suite,
-            &self.client_connection_salt,
-            &mut self.recv_crypto,
-            self.limits,
-            self.recv_direction,
-            &mut self.recv_counter,
-        )
-        .await?;
-        if frames.is_empty() {
-            return Err(EncryptedFramedTransportError::Codec(
-                CodecError::UnexpectedEof,
-            ));
-        }
-        for frame in frames.drain(1..) {
-            self.pending_frames.push_back(frame);
-        }
-        Ok(frames.remove(0))
+        read_frame_from(&mut self.stream, self.limits).await
     }
 
     pub async fn write_frame(
         &mut self,
         frame: &Frame,
     ) -> Result<(), EncryptedFramedTransportError> {
-        write_frame_to(
+        write_frames_to(
             &mut self.stream,
-            self.key_material,
-            self.cipher_suite,
-            &self.client_connection_salt,
-            &mut self.send_crypto,
             self.limits,
-            self.send_direction,
-            &mut self.send_counter,
-            &mut self.write_poisoned,
-            None,
-            frame,
+            std::slice::from_ref(frame),
             &mut self.encode_buffer,
+            None,
         )
         .await
     }
@@ -318,399 +498,139 @@ where
     ) -> Result<(), EncryptedFramedTransportError> {
         write_frames_to(
             &mut self.stream,
-            self.key_material,
-            self.cipher_suite,
-            &self.client_connection_salt,
-            &mut self.send_crypto,
             self.limits,
-            self.send_direction,
-            &mut self.send_counter,
-            &mut self.write_poisoned,
-            None,
             frames,
             &mut self.encode_buffer,
+            None,
         )
         .await
     }
 
     pub async fn flush(&mut self) -> Result<(), EncryptedFramedTransportError> {
-        #[cfg(feature = "lab-diagnostics")]
-        let started = std::time::Instant::now();
-        self.stream.flush().await?;
-        #[cfg(feature = "lab-diagnostics")]
-        lab_perf_record("transport.tcp.flush_wait", started.elapsed(), 0);
-        Ok(())
+        flush_stream(&mut self.stream).await
+    }
+
+    pub fn split(self) -> Result<EncryptedFramedSplit<S>, EncryptedFramedTransportError> {
+        let baseline = self.wire_bytes.load();
+        let (reader, writer) = tokio::io::split(self.stream);
+        Ok((
+            EncryptedFramedReader {
+                stream: reader,
+                limits: self.limits,
+            },
+            EncryptedFramedWriter {
+                stream: writer,
+                limits: self.limits,
+                wire_bytes: self.wire_bytes,
+                wire_baseline: baseline,
+                write_poisoned: false,
+                encode_buffer: Vec::new(),
+            },
+        ))
     }
 }
 
-impl<R> EncryptedFramedReader<R>
+impl<S> EncryptedFramedReader<S>
 where
-    R: AsyncRead + Unpin,
+    S: AsyncRead + AsyncWrite + Unpin,
 {
     pub async fn read_frame(&mut self) -> Result<Frame, EncryptedFramedTransportError> {
-        if let Some(frame) = self.pending_frames.pop_front() {
-            return Ok(frame);
-        }
-        let mut frames = read_frames_from(
-            &mut self.stream,
-            self.key_material,
-            self.cipher_suite,
-            &self.client_connection_salt,
-            &mut self.recv_crypto,
-            self.limits,
-            self.recv_direction,
-            &mut self.recv_counter,
-        )
-        .await?;
-        if frames.is_empty() {
-            return Err(EncryptedFramedTransportError::Codec(
-                CodecError::UnexpectedEof,
-            ));
-        }
-        for frame in frames.drain(1..) {
-            self.pending_frames.push_back(frame);
-        }
-        Ok(frames.remove(0))
+        read_frame_from(&mut self.stream, self.limits).await
     }
 
     pub async fn read_frames(&mut self) -> Result<Vec<Frame>, EncryptedFramedTransportError> {
-        if !self.pending_frames.is_empty() {
-            return Ok(self.pending_frames.drain(..).collect());
-        }
-        read_frames_from(
-            &mut self.stream,
-            self.key_material,
-            self.cipher_suite,
-            &self.client_connection_salt,
-            &mut self.recv_crypto,
-            self.limits,
-            self.recv_direction,
-            &mut self.recv_counter,
-        )
-        .await
+        Ok(vec![self.read_frame().await?])
     }
 }
 
-impl<W> EncryptedFramedWriter<W>
+impl<S> EncryptedFramedWriter<S>
 where
-    W: AsyncWrite + Unpin,
+    S: AsyncRead + AsyncWrite + Unpin,
 {
-    /// Encoded record bytes accepted by the underlying writer since this writer was split.
+    /// Raw TLS bytes accepted by the underlying socket since this writer was split.
     pub fn wire_bytes_written(&self) -> u64 {
-        self.wire_bytes_written
+        self.wire_bytes.load().saturating_sub(self.wire_baseline)
     }
 
     pub async fn write_frame(
         &mut self,
         frame: &Frame,
     ) -> Result<(), EncryptedFramedTransportError> {
-        write_frame_to(
-            &mut self.stream,
-            self.key_material,
-            self.cipher_suite,
-            &self.client_connection_salt,
-            &mut self.send_crypto,
-            self.limits,
-            self.send_direction,
-            &mut self.send_counter,
-            &mut self.write_poisoned,
-            Some(&mut self.wire_bytes_written),
-            frame,
-            &mut self.encode_buffer,
-        )
-        .await
+        self.write_frames(std::slice::from_ref(frame)).await
     }
 
     pub async fn write_frames(
         &mut self,
         frames: &[Frame],
     ) -> Result<(), EncryptedFramedTransportError> {
+        if self.write_poisoned {
+            return Err(EncryptedFramedTransportError::WriteStatePoisoned);
+        }
         write_frames_to(
             &mut self.stream,
-            self.key_material,
-            self.cipher_suite,
-            &self.client_connection_salt,
-            &mut self.send_crypto,
             self.limits,
-            self.send_direction,
-            &mut self.send_counter,
-            &mut self.write_poisoned,
-            Some(&mut self.wire_bytes_written),
             frames,
             &mut self.encode_buffer,
+            Some(&mut self.write_poisoned),
         )
         .await
     }
 
     pub async fn flush(&mut self) -> Result<(), EncryptedFramedTransportError> {
-        #[cfg(feature = "lab-diagnostics")]
-        let started = std::time::Instant::now();
-        self.stream.flush().await?;
-        #[cfg(feature = "lab-diagnostics")]
-        lab_perf_record("transport.tcp.flush_wait", started.elapsed(), 0);
-        Ok(())
+        flush_stream(&mut self.stream).await
     }
 }
 
-#[allow(clippy::too_many_arguments)]
-async fn read_frames_from<R>(
+fn ensure_no_tcp_alpn<S>(
+    stream: &TlsStream<CountingIo<S>>,
+) -> Result<(), EncryptedFramedTransportError> {
+    let negotiated = match stream {
+        TlsStream::Client(stream) => stream.get_ref().1.alpn_protocol(),
+        TlsStream::Server(stream) => stream.get_ref().1.alpn_protocol(),
+    };
+    if negotiated.is_some() {
+        return Err(EncryptedFramedTransportError::UnexpectedTcpAlpn(
+            negotiated.map(ToOwned::to_owned).unwrap_or_default(),
+        ));
+    }
+    Ok(())
+}
+
+async fn read_frame_from<R>(
     stream: &mut R,
-    key_material: [u8; 32],
-    cipher_suite: CipherSuite,
-    client_connection_salt: &Arc<OnceLock<[u8; CONNECTION_SALT_LEN]>>,
-    recv_crypto: &mut Option<RecvCrypto>,
     limits: CodecLimits,
-    recv_direction: u8,
-    recv_counter: &mut u64,
-) -> Result<Vec<Frame>, EncryptedFramedTransportError>
+) -> Result<Frame, EncryptedFramedTransportError>
 where
     R: AsyncRead + Unpin,
 {
     #[cfg(feature = "lab-diagnostics")]
     let total_started = std::time::Instant::now();
-    let mut header = [0u8; HEADER_LEN];
-    #[cfg(feature = "lab-diagnostics")]
-    let stage_started = std::time::Instant::now();
+    let mut header = [0u8; FRAME_HEADER_LEN];
     stream.read_exact(&mut header).await?;
+    let payload_len = decode_payload_len_from_header(&header, limits)?;
+    let frame_len = FRAME_HEADER_LEN
+        .checked_add(payload_len)
+        .ok_or(EncryptedFramedTransportError::LengthOverflow)?;
+    let mut encoded = BytesMut::with_capacity(frame_len);
+    encoded.extend_from_slice(&header);
+    encoded.resize(frame_len, 0);
+    stream.read_exact(&mut encoded[FRAME_HEADER_LEN..]).await?;
+    let frame = decode_frame_bytes(encoded.freeze(), limits)?;
     #[cfg(feature = "lab-diagnostics")]
     lab_perf_record(
-        "transport.tcp.read_header_wait",
-        stage_started.elapsed(),
-        HEADER_LEN,
-    );
-    let Header {
-        direction,
-        connection_salt,
-        counter,
-        ciphertext_len,
-    } = decode_header(&header, limits)?;
-    if direction != recv_direction {
-        return Err(EncryptedFramedTransportError::WrongDirection {
-            expected: recv_direction,
-            actual: direction,
-        });
-    }
-    if counter != *recv_counter {
-        return Err(EncryptedFramedTransportError::UnexpectedCounter {
-            expected: *recv_counter,
-            actual: counter,
-        });
-    }
-    let pending_crypto = match recv_crypto {
-        Some(crypto) if crypto.connection_salt != connection_salt => {
-            return Err(EncryptedFramedTransportError::ConnectionSaltChanged);
-        }
-        Some(_) => None,
-        None => {
-            let client_salt = match direction {
-                DIR_CLIENT_TO_SERVER => connection_salt,
-                DIR_SERVER_TO_CLIENT => *client_connection_salt
-                    .get()
-                    .ok_or(EncryptedFramedTransportError::MissingClientConnectionSalt)?,
-                _ => unreachable!("header direction validated"),
-            };
-            let server_salt = (direction == DIR_SERVER_TO_CLIENT).then_some(&connection_salt);
-            let key = derive_connection_key(
-                &key_material,
-                cipher_suite,
-                direction,
-                &client_salt,
-                server_salt,
-            );
-            Some(RecvCrypto {
-                connection_salt,
-                cipher: TransportAead::new(cipher_suite, &key),
-            })
-        }
-    };
-
-    let mut encrypted = vec![0u8; ciphertext_len];
-    #[cfg(feature = "lab-diagnostics")]
-    let stage_started = std::time::Instant::now();
-    stream.read_exact(&mut encrypted).await?;
-    #[cfg(feature = "lab-diagnostics")]
-    lab_perf_record(
-        "transport.tcp.read_payload_wait",
-        stage_started.elapsed(),
-        ciphertext_len,
-    );
-    let tag_start = encrypted
-        .len()
-        .checked_sub(TAG_LEN)
-        .ok_or(EncryptedFramedTransportError::Crypto)?;
-    let tag_bytes: [u8; TAG_LEN] = encrypted[tag_start..].try_into().expect("tag slice length");
-    encrypted.truncate(tag_start);
-    let nonce = build_nonce(direction, counter);
-    #[cfg(feature = "lab-diagnostics")]
-    let stage_started = std::time::Instant::now();
-    recv_crypto
-        .as_ref()
-        .or(pending_crypto.as_ref())
-        .expect("existing or pending receive crypto is available")
-        .cipher
-        .decrypt_in_place_detached(&nonce, &header, &mut encrypted, &tag_bytes)
-        .map_err(|_| EncryptedFramedTransportError::Crypto)?;
-    if let Some(crypto) = pending_crypto {
-        if direction == DIR_CLIENT_TO_SERVER {
-            client_connection_salt
-                .set(connection_salt)
-                .map_err(|_| EncryptedFramedTransportError::ConnectionSaltChanged)?;
-        }
-        *recv_crypto = Some(crypto);
-    }
-    #[cfg(feature = "lab-diagnostics")]
-    lab_perf_record(
-        "transport.tcp.decrypt",
-        stage_started.elapsed(),
-        encrypted.len(),
-    );
-    #[cfg(feature = "lab-diagnostics")]
-    let stage_started = std::time::Instant::now();
-    #[cfg(feature = "lab-diagnostics")]
-    let decrypted_len = encrypted.len();
-    let frame = decode_frame_bytes(Bytes::from(encrypted), limits)?;
-    #[cfg(feature = "lab-diagnostics")]
-    lab_perf_record(
-        "transport.tcp.decode_frame",
-        stage_started.elapsed(),
-        decrypted_len,
-    );
-    *recv_counter = recv_counter
-        .checked_add(1)
-        .ok_or(EncryptedFramedTransportError::CounterOverflow)?;
-    #[cfg(feature = "lab-diagnostics")]
-    lab_perf_record(
-        "transport.tcp.read_frame_total",
+        "transport.tcp.tls_read_frame_total",
         total_started.elapsed(),
-        HEADER_LEN + ciphertext_len,
+        frame_len,
     );
-    Ok(vec![frame])
+    Ok(frame)
 }
 
-#[allow(clippy::too_many_arguments)]
-async fn write_frame_to<W>(
-    stream: &mut W,
-    key_material: [u8; 32],
-    cipher_suite: CipherSuite,
-    client_connection_salt: &Arc<OnceLock<[u8; CONNECTION_SALT_LEN]>>,
-    send_crypto: &mut Option<SendCrypto>,
-    limits: CodecLimits,
-    send_direction: u8,
-    send_counter: &mut u64,
-    write_poisoned: &mut bool,
-    wire_bytes_written: Option<&mut u64>,
-    frame: &Frame,
-    payload: &mut Vec<u8>,
-) -> Result<(), EncryptedFramedTransportError>
-where
-    W: AsyncWrite + Unpin,
-{
-    if *write_poisoned {
-        return Err(EncryptedFramedTransportError::WriteStatePoisoned);
-    }
-    let next_counter = send_counter
-        .checked_add(1)
-        .ok_or(EncryptedFramedTransportError::CounterOverflow)?;
-    initialize_send_crypto(
-        &key_material,
-        cipher_suite,
-        send_direction,
-        client_connection_salt,
-        send_crypto,
-    )?;
-    let crypto = send_crypto
-        .as_ref()
-        .expect("send crypto initialized before record encoding");
-    #[cfg(feature = "lab-diagnostics")]
-    let total_started = std::time::Instant::now();
-    #[cfg(feature = "lab-diagnostics")]
-    let stage_started = std::time::Instant::now();
-    payload.clear();
-    encode_frame_into(frame, limits, payload)?;
-    #[cfg(feature = "lab-diagnostics")]
-    lab_perf_record(
-        "transport.tcp.encode_frame",
-        stage_started.elapsed(),
-        payload.len(),
-    );
-    let ciphertext_len = payload
-        .len()
-        .checked_add(TAG_LEN)
-        .ok_or(EncryptedFramedTransportError::LengthOverflow)?;
-    validate_encrypted_len(ciphertext_len, limits)?;
-    let header = encode_header(
-        send_direction,
-        crypto.connection_salt,
-        *send_counter,
-        ciphertext_len,
-    )?;
-    let nonce = build_nonce(send_direction, *send_counter);
-    #[cfg(feature = "lab-diagnostics")]
-    let stage_started = std::time::Instant::now();
-    let tag = crypto
-        .cipher
-        .encrypt_in_place_detached(&nonce, &header, payload)
-        .map_err(|_| EncryptedFramedTransportError::Crypto)?;
-    #[cfg(feature = "lab-diagnostics")]
-    lab_perf_record(
-        "transport.tcp.encrypt",
-        stage_started.elapsed(),
-        payload.len(),
-    );
-    let written_bytes = HEADER_LEN
-        .checked_add(payload.len())
-        .and_then(|len| len.checked_add(tag.len()))
-        .ok_or(EncryptedFramedTransportError::LengthOverflow)?;
-    let next_wire_bytes_written = match wire_bytes_written.as_deref() {
-        Some(current) => Some(
-            current
-                .checked_add(
-                    u64::try_from(written_bytes)
-                        .map_err(|_| EncryptedFramedTransportError::LengthOverflow)?,
-                )
-                .ok_or(EncryptedFramedTransportError::LengthOverflow)?,
-        ),
-        None => None,
-    };
-    #[cfg(feature = "lab-diagnostics")]
-    let stage_started = std::time::Instant::now();
-    let write_guard = WritePoisonGuard::new(write_poisoned)?;
-    write_all_vectored_parts(stream, [&header, payload.as_slice(), tag.as_slice()]).await?;
-    *send_counter = next_counter;
-    if let Some(next_wire_bytes_written) = next_wire_bytes_written {
-        *wire_bytes_written.expect("wire byte counter exists when next value was calculated") =
-            next_wire_bytes_written;
-    }
-    write_guard.commit();
-    #[cfg(feature = "lab-diagnostics")]
-    lab_perf_record(
-        "transport.tcp.write_socket_wait",
-        stage_started.elapsed(),
-        written_bytes,
-    );
-    #[cfg(feature = "lab-diagnostics")]
-    lab_perf_record(
-        "transport.tcp.write_frame_total",
-        total_started.elapsed(),
-        written_bytes,
-    );
-    Ok(())
-}
-
-#[allow(clippy::too_many_arguments)]
 async fn write_frames_to<W>(
     stream: &mut W,
-    key_material: [u8; 32],
-    cipher_suite: CipherSuite,
-    client_connection_salt: &Arc<OnceLock<[u8; CONNECTION_SALT_LEN]>>,
-    send_crypto: &mut Option<SendCrypto>,
     limits: CodecLimits,
-    send_direction: u8,
-    send_counter: &mut u64,
-    write_poisoned: &mut bool,
-    wire_bytes_written: Option<&mut u64>,
     frames: &[Frame],
-    payload: &mut Vec<u8>,
+    encode_buffer: &mut Vec<u8>,
+    mut write_poisoned: Option<&mut bool>,
 ) -> Result<(), EncryptedFramedTransportError>
 where
     W: AsyncWrite + Unpin,
@@ -718,345 +638,54 @@ where
     if frames.is_empty() {
         return Ok(());
     }
-    if *write_poisoned {
-        return Err(EncryptedFramedTransportError::WriteStatePoisoned);
-    }
-    if frames.len() == 1 {
-        return write_frame_to(
-            stream,
-            key_material,
-            cipher_suite,
-            client_connection_salt,
-            send_crypto,
-            limits,
-            send_direction,
-            send_counter,
-            write_poisoned,
-            wire_bytes_written,
-            &frames[0],
-            payload,
-        )
-        .await;
-    }
-    let frame_count =
-        u64::try_from(frames.len()).map_err(|_| EncryptedFramedTransportError::CounterOverflow)?;
-    let final_counter = send_counter
-        .checked_add(frame_count)
-        .ok_or(EncryptedFramedTransportError::CounterOverflow)?;
-    initialize_send_crypto(
-        &key_material,
-        cipher_suite,
-        send_direction,
-        client_connection_salt,
-        send_crypto,
-    )?;
-    let crypto = send_crypto
-        .as_ref()
-        .expect("send crypto initialized before record encoding");
     #[cfg(feature = "lab-diagnostics")]
     let total_started = std::time::Instant::now();
-    payload.clear();
-    let mut next_counter = *send_counter;
+    encode_buffer.clear();
     for frame in frames {
-        let record_start = payload.len();
-        payload.resize(record_start + HEADER_LEN, 0);
-        let plaintext_start = payload.len();
-        #[cfg(feature = "lab-diagnostics")]
-        let stage_started = std::time::Instant::now();
-        encode_frame_into(frame, limits, payload)?;
-        let plaintext_len = payload.len().saturating_sub(plaintext_start);
-        #[cfg(feature = "lab-diagnostics")]
-        lab_perf_record(
-            "transport.tcp.encode_frame",
-            stage_started.elapsed(),
-            plaintext_len,
-        );
-        let ciphertext_len = plaintext_len
-            .checked_add(TAG_LEN)
-            .ok_or(EncryptedFramedTransportError::LengthOverflow)?;
-        validate_encrypted_len(ciphertext_len, limits)?;
-        let header = encode_header(
-            send_direction,
-            crypto.connection_salt,
-            next_counter,
-            ciphertext_len,
-        )?;
-        payload[record_start..plaintext_start].copy_from_slice(&header);
-        let nonce = build_nonce(send_direction, next_counter);
-        #[cfg(feature = "lab-diagnostics")]
-        let stage_started = std::time::Instant::now();
-        let tag = crypto
-            .cipher
-            .encrypt_in_place_detached(&nonce, &header, &mut payload[plaintext_start..])
-            .map_err(|_| EncryptedFramedTransportError::Crypto)?;
-        #[cfg(feature = "lab-diagnostics")]
-        lab_perf_record(
-            "transport.tcp.encrypt",
-            stage_started.elapsed(),
-            plaintext_len,
-        );
-        payload.extend_from_slice(&tag);
-        next_counter += 1;
+        encode_frame_into(frame, limits, encode_buffer)?;
     }
-    let next_wire_bytes_written = match wire_bytes_written.as_deref() {
-        Some(current) => Some(
-            current
-                .checked_add(
-                    u64::try_from(payload.len())
-                        .map_err(|_| EncryptedFramedTransportError::LengthOverflow)?,
-                )
-                .ok_or(EncryptedFramedTransportError::LengthOverflow)?,
-        ),
-        None => None,
-    };
-    #[cfg(feature = "lab-diagnostics")]
-    let stage_started = std::time::Instant::now();
-    let write_guard = WritePoisonGuard::new(write_poisoned)?;
-    stream.write_all(payload).await?;
-    debug_assert_eq!(next_counter, final_counter);
-    *send_counter = final_counter;
-    if let Some(next_wire_bytes_written) = next_wire_bytes_written {
-        *wire_bytes_written.expect("wire byte counter exists when next value was calculated") =
-            next_wire_bytes_written;
+    if let Some(poisoned) = write_poisoned.as_deref_mut() {
+        *poisoned = true;
     }
-    write_guard.commit();
+    stream.write_all(encode_buffer).await?;
+    if let Some(poisoned) = write_poisoned {
+        *poisoned = false;
+    }
     #[cfg(feature = "lab-diagnostics")]
     lab_perf_record(
-        "transport.tcp.write_socket_wait",
-        stage_started.elapsed(),
-        payload.len(),
-    );
-    #[cfg(feature = "lab-diagnostics")]
-    lab_perf_record(
-        "transport.tcp.write_frame_total",
+        "transport.tcp.tls_write_frames_total",
         total_started.elapsed(),
-        payload.len(),
+        encode_buffer.len(),
     );
     Ok(())
 }
 
-async fn write_all_vectored_parts<W>(stream: &mut W, parts: [&[u8]; 3]) -> io::Result<()>
+async fn flush_stream<W>(stream: &mut W) -> Result<(), EncryptedFramedTransportError>
 where
     W: AsyncWrite + Unpin,
 {
-    let mut part_index = 0usize;
-    let mut part_offset = 0usize;
-    while part_index < parts.len() {
-        while part_index < parts.len() && part_offset == parts[part_index].len() {
-            part_index += 1;
-            part_offset = 0;
-        }
-        if part_index >= parts.len() {
-            return Ok(());
-        }
-
-        let first = &parts[part_index][part_offset..];
-        let second = parts.get(part_index + 1).copied().unwrap_or(&[]);
-        let third = parts.get(part_index + 2).copied().unwrap_or(&[]);
-        let bufs = [
-            IoSlice::new(first),
-            IoSlice::new(second),
-            IoSlice::new(third),
-        ];
-        let mut written = stream.write_vectored(&bufs).await?;
-        if written == 0 {
-            return Err(io::Error::from(io::ErrorKind::WriteZero));
-        }
-        while written > 0 && part_index < parts.len() {
-            let available = parts[part_index].len().saturating_sub(part_offset);
-            if written < available {
-                part_offset += written;
-                written = 0;
-            } else {
-                written -= available;
-                part_index += 1;
-                part_offset = 0;
-            }
-        }
-    }
+    #[cfg(feature = "lab-diagnostics")]
+    let started = std::time::Instant::now();
+    stream.flush().await?;
+    #[cfg(feature = "lab-diagnostics")]
+    lab_perf_record("transport.tcp.flush_wait", started.elapsed(), 0);
     Ok(())
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-struct Header {
-    direction: u8,
-    connection_salt: [u8; CONNECTION_SALT_LEN],
-    counter: u64,
-    ciphertext_len: usize,
-}
-
-fn encode_header(
-    direction: u8,
-    connection_salt: [u8; CONNECTION_SALT_LEN],
-    counter: u64,
-    ciphertext_len: usize,
-) -> Result<[u8; HEADER_LEN], EncryptedFramedTransportError> {
-    if ciphertext_len > u32::MAX as usize {
-        return Err(EncryptedFramedTransportError::LengthOverflow);
-    }
-    let mut header = [0u8; HEADER_LEN];
-    header[0..4].copy_from_slice(MAGIC);
-    header[4] = VERSION;
-    header[5] = direction;
-    header[6..22].copy_from_slice(&connection_salt);
-    header[22..30].copy_from_slice(&counter.to_be_bytes());
-    header[30..34].copy_from_slice(&(ciphertext_len as u32).to_be_bytes());
-    Ok(header)
-}
-
-fn decode_header(
-    header: &[u8; HEADER_LEN],
-    limits: CodecLimits,
-) -> Result<Header, EncryptedFramedTransportError> {
-    if &header[0..4] != MAGIC {
-        return Err(EncryptedFramedTransportError::InvalidMagic);
-    }
-    if header[4] != VERSION {
-        return Err(EncryptedFramedTransportError::UnsupportedVersion(header[4]));
-    }
-    let direction = header[5];
-    if !matches!(direction, DIR_CLIENT_TO_SERVER | DIR_SERVER_TO_CLIENT) {
-        return Err(EncryptedFramedTransportError::InvalidDirection(direction));
-    }
-    let connection_salt = header[6..22].try_into().expect("connection salt slice");
-    let counter = u64::from_be_bytes(header[22..30].try_into().expect("counter slice"));
-    let ciphertext_len =
-        u32::from_be_bytes(header[30..34].try_into().expect("length slice")) as usize;
-    validate_encrypted_len(ciphertext_len, limits)?;
-    Ok(Header {
-        direction,
-        connection_salt,
-        counter,
-        ciphertext_len,
-    })
-}
-
-fn validate_encrypted_len(
-    ciphertext_len: usize,
-    limits: CodecLimits,
-) -> Result<(), EncryptedFramedTransportError> {
-    if ciphertext_len < TAG_LEN {
-        return Err(EncryptedFramedTransportError::Crypto);
-    }
-    let max_encrypted_len = limits
-        .max_frame_bytes
-        .checked_add(TAG_LEN)
-        .ok_or(EncryptedFramedTransportError::LengthOverflow)?;
-    if ciphertext_len > max_encrypted_len {
-        return Err(EncryptedFramedTransportError::FrameTooLarge {
-            actual: ciphertext_len,
-            limit: max_encrypted_len,
-        });
-    }
-    Ok(())
-}
-
-fn derive_key_material(secret: &[u8], cipher_suite: CipherSuite) -> [u8; 32] {
-    hkdf_extract(
-        b"mptunnel encrypted framed v2",
-        &[cipher_suite.key_context(), secret],
-    )
-}
-
-fn derive_connection_key(
-    key_material: &[u8; 32],
-    cipher_suite: CipherSuite,
-    direction: u8,
-    client_connection_salt: &[u8; CONNECTION_SALT_LEN],
-    server_connection_salt: Option<&[u8; CONNECTION_SALT_LEN]>,
-) -> [u8; 32] {
-    let prk = hkdf_extract(client_connection_salt, &[key_material]);
-    let mut mac = Hmac::<Sha256>::new_from_slice(&prk).expect("HMAC accepts a 32-byte key");
-    mac.update(b"mptunnel encrypted framed v2 traffic key");
-    mac.update(cipher_suite.key_context());
-    mac.update(&[direction]);
-    if let Some(server_connection_salt) = server_connection_salt {
-        mac.update(server_connection_salt);
-    }
-    mac.update(&[1]);
-    mac.finalize().into_bytes().into()
-}
-
-fn hkdf_extract(salt: &[u8], ikm_parts: &[&[u8]]) -> [u8; 32] {
-    let mut mac = Hmac::<Sha256>::new_from_slice(salt).expect("HMAC accepts any salt length");
-    for part in ikm_parts {
-        mac.update(part);
-    }
-    mac.finalize().into_bytes().into()
-}
-
-fn initialize_send_crypto(
-    key_material: &[u8; 32],
-    cipher_suite: CipherSuite,
-    send_direction: u8,
-    client_connection_salt: &Arc<OnceLock<[u8; CONNECTION_SALT_LEN]>>,
-    send_crypto: &mut Option<SendCrypto>,
-) -> Result<(), EncryptedFramedTransportError> {
-    if send_crypto.is_some() {
-        return Ok(());
-    }
-    let client_salt = *client_connection_salt
-        .get()
-        .ok_or(EncryptedFramedTransportError::MissingClientConnectionSalt)?;
-    let connection_salt = match send_direction {
-        DIR_CLIENT_TO_SERVER => client_salt,
-        DIR_SERVER_TO_CLIENT => random_connection_salt()?,
-        _ => {
-            return Err(EncryptedFramedTransportError::InvalidDirection(
-                send_direction,
-            ));
-        }
-    };
-    let server_salt = (send_direction == DIR_SERVER_TO_CLIENT).then_some(&connection_salt);
-    let key = derive_connection_key(
-        key_material,
-        cipher_suite,
-        send_direction,
-        &client_salt,
-        server_salt,
-    );
-    *send_crypto = Some(SendCrypto {
-        connection_salt,
-        cipher: TransportAead::new(cipher_suite, &key),
-    });
-    Ok(())
-}
-
-fn random_connection_salt() -> Result<[u8; CONNECTION_SALT_LEN], EncryptedFramedTransportError> {
-    let mut connection_salt = [0u8; CONNECTION_SALT_LEN];
-    getrandom::getrandom(&mut connection_salt).map_err(EncryptedFramedTransportError::Random)?;
-    Ok(connection_salt)
-}
-
-fn build_nonce(direction: u8, counter: u64) -> [u8; 12] {
-    let mut nonce = [0u8; 12];
-    nonce[0] = direction;
-    nonce[4..12].copy_from_slice(&counter.to_be_bytes());
-    nonce
 }
 
 #[derive(Debug)]
 pub enum EncryptedFramedTransportError {
-    Io(std::io::Error),
+    Io(io::Error),
     Codec(CodecError),
-    Random(getrandom::Error),
-    Crypto,
-    InvalidMagic,
-    UnsupportedVersion(u8),
-    InvalidDirection(u8),
-    WrongDirection { expected: u8, actual: u8 },
-    ConnectionSaltChanged,
-    MissingClientConnectionSalt,
-    KeyExchangeIncomplete,
+    TlsConfiguration(String),
+    TlsHandshake(io::Error),
+    TlsExporter(rustls::Error),
+    UnexpectedTcpAlpn(Vec<u8>),
     WriteStatePoisoned,
-    UnexpectedCounter { expected: u64, actual: u64 },
-    CounterOverflow,
     LengthOverflow,
-    FrameTooLarge { actual: usize, limit: usize },
 }
 
-impl From<std::io::Error> for EncryptedFramedTransportError {
-    fn from(value: std::io::Error) -> Self {
+impl From<io::Error> for EncryptedFramedTransportError {
+    fn from(value: io::Error) -> Self {
         Self::Io(value)
     }
 }
@@ -1070,55 +699,27 @@ impl From<CodecError> for EncryptedFramedTransportError {
 impl std::fmt::Display for EncryptedFramedTransportError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            Self::Io(err) => write!(f, "{err}"),
-            Self::Codec(err) => write!(f, "{err}"),
-            Self::Random(err) => write!(f, "failed to generate TCP connection salt: {err}"),
-            Self::Crypto => write!(f, "encrypted frame authentication failed"),
-            Self::InvalidMagic => write!(f, "invalid encrypted frame magic"),
-            Self::UnsupportedVersion(version) => {
-                write!(f, "unsupported encrypted frame version {version}")
+            Self::Io(error) => write!(f, "TLS carrier I/O failed: {error}"),
+            Self::Codec(error) => write!(f, "TLS carrier frame codec failed: {error}"),
+            Self::TlsConfiguration(error) => {
+                write!(f, "TLS carrier configuration failed: {error}")
             }
-            Self::InvalidDirection(direction) => {
-                write!(f, "invalid encrypted frame direction {direction}")
+            Self::TlsHandshake(error) => write!(f, "TLS 1.3 carrier handshake failed: {error}"),
+            Self::TlsExporter(error) => {
+                write!(f, "TLS carrier admission exporter failed: {error}")
             }
-            Self::WrongDirection { expected, actual } => {
-                write!(
-                    f,
-                    "encrypted frame direction {actual} does not match expected {expected}"
-                )
-            }
-            Self::ConnectionSaltChanged => {
-                write!(
-                    f,
-                    "encrypted frame connection salt changed within one direction"
-                )
-            }
-            Self::MissingClientConnectionSalt => {
-                write!(
-                    f,
-                    "TCP encryption requires an authenticated client connection salt"
-                )
-            }
-            Self::KeyExchangeIncomplete => {
-                write!(f, "TCP encryption key exchange is incomplete")
-            }
+            Self::UnexpectedTcpAlpn(negotiated) => write!(
+                f,
+                "TLS TCP carrier unexpectedly negotiated ALPN {:?}",
+                String::from_utf8_lossy(negotiated)
+            ),
             Self::WriteStatePoisoned => {
                 write!(
                     f,
-                    "encrypted TCP write state is unusable after an incomplete write"
+                    "TLS carrier write state is unusable after an incomplete write"
                 )
             }
-            Self::UnexpectedCounter { expected, actual } => {
-                write!(
-                    f,
-                    "encrypted frame counter {actual} does not match expected {expected}"
-                )
-            }
-            Self::CounterOverflow => write!(f, "encrypted frame counter overflow"),
-            Self::LengthOverflow => write!(f, "encrypted frame length overflow"),
-            Self::FrameTooLarge { actual, limit } => {
-                write!(f, "encrypted frame is {actual} bytes, limit is {limit}")
-            }
+            Self::LengthOverflow => write!(f, "TLS carrier frame length overflow"),
         }
     }
 }
@@ -1126,12 +727,47 @@ impl std::fmt::Display for EncryptedFramedTransportError {
 impl std::error::Error for EncryptedFramedTransportError {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
-            Self::Io(err) => Some(err),
-            Self::Codec(err) => Some(err),
-            Self::Random(err) => Some(err),
+            Self::Io(error) | Self::TlsHandshake(error) => Some(error),
+            Self::TlsExporter(error) => Some(error),
+            Self::Codec(error) => Some(error),
             _ => None,
         }
     }
+}
+
+#[cfg(test)]
+fn test_tls_configs() -> &'static (TcpClientTlsConfig, TcpServerTlsConfig) {
+    static CONFIGS: std::sync::OnceLock<(TcpClientTlsConfig, TcpServerTlsConfig)> =
+        std::sync::OnceLock::new();
+    CONFIGS.get_or_init(|| {
+        let rcgen::CertifiedKey { cert, signing_key } =
+            rcgen::generate_simple_self_signed(vec!["mptunnel.test".to_string()])
+                .expect("generate test TLS identity");
+        let certificate = CertificateDer::from(cert);
+        let private_key =
+            rustls::pki_types::PrivatePkcs8KeyDer::from(signing_key.serialize_der()).into();
+        let client = TcpClientTlsConfig::new("mptunnel.test", certificate.clone())
+            .expect("build test TLS client config");
+        let server = TcpServerTlsConfig::new(vec![certificate], private_key)
+            .expect("build test TLS server config");
+        (client, server)
+    })
+}
+
+#[cfg(test)]
+pub(crate) fn test_client_tls_config() -> TcpClientTlsConfig {
+    test_tls_configs().0.clone()
+}
+
+#[cfg(test)]
+pub(crate) fn test_client_tls_config_for_server_name(server_name: &str) -> TcpClientTlsConfig {
+    TcpClientTlsConfig::new(server_name, test_tls_configs().0.pinned_leaf.clone())
+        .expect("build named test TLS client config")
+}
+
+#[cfg(test)]
+pub(crate) fn test_server_tls_config() -> TcpServerTlsConfig {
+    test_tls_configs().1.clone()
 }
 
 #[cfg(test)]

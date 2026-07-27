@@ -3,7 +3,7 @@
 //! These helpers construct exact path membership and proof evidence used by
 //! the request facade plus both concrete carrier-controller suites.
 
-use crate::config::{ResourceLimits, SecurityConfig, SharedSecret};
+use crate::config::{ClientSecurityConfig, ResourceLimits, SharedSecret};
 use crate::model::capacity::PathRateSample;
 use crate::model::capacity::reliable_relay_buffer_len;
 use crate::model::path::{RelayPathInstance, RelayPathKey};
@@ -23,8 +23,8 @@ use crate::transport::PathSpec;
 use std::time::{Duration, Instant};
 use tokio::sync::mpsc;
 
-pub(super) fn security() -> SecurityConfig {
-    SecurityConfig::encrypted(
+pub(super) fn security() -> ClientSecurityConfig {
+    ClientSecurityConfig::for_test(
         SharedSecret::new(b"0123456789abcdef0123456789abcdef".to_vec()).expect("secret"),
     )
 }

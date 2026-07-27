@@ -53,7 +53,7 @@ fn quic_stream_priority(lane: TrafficClass) -> i32 {
 impl UdpPathSendStream {
     /// QUIC stream priority orders locally buffered streams only. Quinn still
     /// owns connection flow control, congestion control, pacing, and recovery.
-    pub(super) fn set_traffic_class(&self, lane: TrafficClass) -> Result<(), RuntimeError> {
+    pub(super) fn set_traffic_class(&mut self, lane: TrafficClass) -> Result<(), RuntimeError> {
         self.stream.set_priority(quic_stream_priority(lane))?;
         Ok(())
     }
@@ -69,7 +69,8 @@ impl UdpPathEndpoint {
         for addr in addrs {
             match quic_transport::Endpoint::bind_server(
                 addr,
-                context.security.secret.as_bytes(),
+                &context.tls,
+                context.credential_admission.clone(),
                 context.mux_limits,
             )
             .await
@@ -92,7 +93,8 @@ impl UdpPathEndpoint {
         Ok(Self {
             endpoint: quic_transport::Endpoint::bind_client_socket(
                 socket,
-                runtime.security().secret.as_bytes(),
+                runtime.tls(),
+                runtime.candidate_selector.clone(),
                 runtime.mux_limits,
             )
             .await?,
@@ -300,10 +302,16 @@ where
     }
 }
 
-pub(in crate::runtime) fn udp_path_finish_stream(
+pub(in crate::runtime) async fn udp_path_finish_stream(
     send: &mut UdpPathSendStream,
 ) -> Result<(), RuntimeError> {
-    Ok(quic_transport::finish_stream(&mut send.stream)?)
+    Ok(quic_transport::finish_stream(&mut send.stream).await?)
+}
+
+pub(in crate::runtime) async fn udp_path_reject_stream(
+    send: &mut UdpPathSendStream,
+) -> Result<(), RuntimeError> {
+    Ok(send.stream.reject().await?)
 }
 
 // Product-level UDP reliable frame size. This is intentionally the same kind of
@@ -362,7 +370,7 @@ fn udp_runtime_error_is_expected_shutdown(err: &RuntimeError) -> bool {
 
 pub(super) fn warn_unexpected_udp_runtime_error(message: &str, err: &RuntimeError) {
     if !udp_runtime_error_is_expected_shutdown(err) {
-        eprintln!("warning: {message}: {err}");
+        crate::observability::process_event!(Warn, "quic", "runtime_error", "{message}: {err}");
     }
 }
 

@@ -1,0 +1,1734 @@
+{
+  "schema_version": 2,
+  "registry_revision": "2026-07-27.f0-v2",
+  "description": "Versioned minimum coverage for performance-affecting MPTunnel changes. A cell denotes the complete set of registered profiles named by that cell, not one convenient runner row.",
+  "lanes": {
+    "quick": {
+      "rank": 0,
+      "acceptance_capable": false,
+      "role": "triage_only"
+    },
+    "nightly": {
+      "rank": 1,
+      "acceptance_capable": true,
+      "role": "repeated_affected_cell_evidence"
+    },
+    "release": {
+      "rank": 2,
+      "acceptance_capable": true,
+      "role": "complete_packaged_competitive_evidence"
+    }
+  },
+  "metrics": {
+    "receiver_goodput_mbps": {
+      "unit": "Mbit/s",
+      "better": "higher"
+    },
+    "path_useful_contribution_pct": {
+      "unit": "percent",
+      "better": "higher"
+    },
+    "aggregation_efficiency_pct": {
+      "unit": "percent",
+      "better": "higher"
+    },
+    "connect_p95_ms": {
+      "unit": "millisecond",
+      "better": "lower"
+    },
+    "handshake_p95_ms": {
+      "unit": "millisecond",
+      "better": "lower"
+    },
+    "first_byte_p95_ms": {
+      "unit": "millisecond",
+      "better": "lower"
+    },
+    "short_flow_completion_p95_ms": {
+      "unit": "millisecond",
+      "better": "lower"
+    },
+    "interactive_idle_p50_ms": {
+      "unit": "millisecond",
+      "better": "lower"
+    },
+    "interactive_idle_p95_ms": {
+      "unit": "millisecond",
+      "better": "lower"
+    },
+    "interactive_idle_p99_ms": {
+      "unit": "millisecond",
+      "better": "lower"
+    },
+    "interactive_loaded_p50_ms": {
+      "unit": "millisecond",
+      "better": "lower"
+    },
+    "interactive_loaded_p95_ms": {
+      "unit": "millisecond",
+      "better": "lower"
+    },
+    "interactive_loaded_p99_ms": {
+      "unit": "millisecond",
+      "better": "lower"
+    },
+    "datagram_p50_ms": {
+      "unit": "millisecond",
+      "better": "lower"
+    },
+    "datagram_p95_ms": {
+      "unit": "millisecond",
+      "better": "lower"
+    },
+    "datagram_p99_ms": {
+      "unit": "millisecond",
+      "better": "lower"
+    },
+    "datagram_jitter_ms": {
+      "unit": "millisecond",
+      "better": "lower"
+    },
+    "datagram_packet_rate_pps": {
+      "unit": "packet/second",
+      "better": "higher"
+    },
+    "datagram_delivery_pct": {
+      "unit": "percent",
+      "better": "higher"
+    },
+    "datagram_expiry_pct": {
+      "unit": "percent",
+      "better": "lower"
+    },
+    "datagram_duplicate_pct": {
+      "unit": "percent",
+      "better": "lower"
+    },
+    "reorder_depth_bytes": {
+      "unit": "byte",
+      "better": "lower"
+    },
+    "reorder_time_p99_ms": {
+      "unit": "millisecond",
+      "better": "lower"
+    },
+    "fault_blackout_p95_ms": {
+      "unit": "millisecond",
+      "better": "lower"
+    },
+    "survivor_progress_p95_ms": {
+      "unit": "millisecond",
+      "better": "lower"
+    },
+    "failback_gap_p95_ms": {
+      "unit": "millisecond",
+      "better": "lower"
+    },
+    "logical_flow_survival_pct": {
+      "unit": "percent",
+      "better": "higher"
+    },
+    "application_completion_pct": {
+      "unit": "percent",
+      "better": "higher"
+    },
+    "application_error_pct": {
+      "unit": "percent",
+      "better": "lower"
+    },
+    "application_reset_pct": {
+      "unit": "percent",
+      "better": "lower"
+    },
+    "wire_total_per_delivered_pct": {
+      "unit": "percent",
+      "better": "lower"
+    },
+    "wire_duplicate_pct": {
+      "unit": "percent",
+      "better": "lower"
+    },
+    "wire_reinjected_pct": {
+      "unit": "percent",
+      "better": "lower"
+    },
+    "wire_control_pct": {
+      "unit": "percent",
+      "better": "lower"
+    },
+    "wire_proof_pct": {
+      "unit": "percent",
+      "better": "lower"
+    },
+    "client_cpu_seconds_per_gib": {
+      "unit": "CPU-second/GiB",
+      "better": "lower"
+    },
+    "server_cpu_seconds_per_gib": {
+      "unit": "CPU-second/GiB",
+      "better": "lower"
+    },
+    "cycles_per_delivered_byte": {
+      "unit": "cycle/byte",
+      "better": "lower"
+    },
+    "instructions_per_delivered_byte": {
+      "unit": "instruction/byte",
+      "better": "lower"
+    },
+    "syscalls_per_gib": {
+      "unit": "syscall/GiB",
+      "better": "lower"
+    },
+    "context_switches_per_gib": {
+      "unit": "context-switch/GiB",
+      "better": "lower"
+    },
+    "wakeups_per_gib": {
+      "unit": "wakeup/GiB",
+      "better": "lower"
+    },
+    "steady_rss_bytes": {
+      "unit": "byte",
+      "better": "lower"
+    },
+    "peak_rss_bytes": {
+      "unit": "byte",
+      "better": "lower"
+    },
+    "allocations_per_gib": {
+      "unit": "allocation/GiB",
+      "better": "lower"
+    },
+    "copies_per_gib": {
+      "unit": "copy/GiB",
+      "better": "lower"
+    },
+    "peak_queue_bytes": {
+      "unit": "byte",
+      "better": "lower"
+    },
+    "peak_tasks": {
+      "unit": "task",
+      "better": "lower"
+    },
+    "peak_descriptors": {
+      "unit": "descriptor",
+      "better": "lower"
+    },
+    "post_load_retained_bytes": {
+      "unit": "byte",
+      "better": "lower"
+    },
+    "flow_fairness_index": {
+      "unit": "ratio",
+      "better": "higher"
+    },
+    "competing_transport_goodput_pct": {
+      "unit": "percent",
+      "better": "higher"
+    },
+    "saturation_goodput_pct": {
+      "unit": "percent",
+      "better": "higher"
+    },
+    "new_flow_p95_ms": {
+      "unit": "millisecond",
+      "better": "lower"
+    },
+    "startup_p95_ms": {
+      "unit": "millisecond",
+      "better": "lower"
+    },
+    "idle_cpu_pct": {
+      "unit": "percent",
+      "better": "lower"
+    },
+    "shutdown_p95_ms": {
+      "unit": "millisecond",
+      "better": "lower"
+    },
+    "reconnection_p95_ms": {
+      "unit": "millisecond",
+      "better": "lower"
+    },
+    "proxy_full_stack_overhead_pct": {
+      "unit": "percent",
+      "better": "lower"
+    },
+    "tun_full_stack_overhead_pct": {
+      "unit": "percent",
+      "better": "lower"
+    },
+    "energy_per_gib_joule": {
+      "unit": "joule/GiB",
+      "better": "lower"
+    },
+    "thermal_throttle_time_pct": {
+      "unit": "percent",
+      "better": "lower"
+    },
+    "background_flow_survival_pct": {
+      "unit": "percent",
+      "better": "higher"
+    },
+    "diagnostic_cpu_overhead_pct": {
+      "unit": "percent",
+      "better": "lower"
+    },
+    "diagnostic_memory_overhead_bytes": {
+      "unit": "byte",
+      "better": "lower"
+    },
+    "diagnostic_event_drop_pct": {
+      "unit": "percent",
+      "better": "lower"
+    }
+  },
+  "metric_sets": {
+    "reliable_delivery": [
+      "receiver_goodput_mbps",
+      "application_completion_pct",
+      "application_error_pct",
+      "application_reset_pct"
+    ],
+    "path_aggregation": [
+      "path_useful_contribution_pct",
+      "aggregation_efficiency_pct",
+      "reorder_depth_bytes",
+      "reorder_time_p99_ms"
+    ],
+    "setup_latency": [
+      "connect_p95_ms",
+      "handshake_p95_ms",
+      "first_byte_p95_ms",
+      "short_flow_completion_p95_ms"
+    ],
+    "interactive_latency": [
+      "interactive_idle_p50_ms",
+      "interactive_idle_p95_ms",
+      "interactive_idle_p99_ms",
+      "interactive_loaded_p50_ms",
+      "interactive_loaded_p95_ms",
+      "interactive_loaded_p99_ms"
+    ],
+    "datagram_quality": [
+      "datagram_p50_ms",
+      "datagram_p95_ms",
+      "datagram_p99_ms",
+      "datagram_jitter_ms",
+      "datagram_packet_rate_pps",
+      "datagram_delivery_pct",
+      "datagram_expiry_pct",
+      "datagram_duplicate_pct"
+    ],
+    "recovery": [
+      "fault_blackout_p95_ms",
+      "survivor_progress_p95_ms",
+      "failback_gap_p95_ms",
+      "logical_flow_survival_pct"
+    ],
+    "wire_efficiency": [
+      "wire_total_per_delivered_pct",
+      "wire_duplicate_pct",
+      "wire_reinjected_pct",
+      "wire_control_pct",
+      "wire_proof_pct"
+    ],
+    "compute": [
+      "client_cpu_seconds_per_gib",
+      "server_cpu_seconds_per_gib",
+      "cycles_per_delivered_byte",
+      "instructions_per_delivered_byte",
+      "syscalls_per_gib",
+      "context_switches_per_gib",
+      "wakeups_per_gib"
+    ],
+    "memory": [
+      "steady_rss_bytes",
+      "peak_rss_bytes",
+      "allocations_per_gib",
+      "copies_per_gib",
+      "peak_queue_bytes",
+      "peak_tasks",
+      "peak_descriptors",
+      "post_load_retained_bytes"
+    ],
+    "fairness_and_saturation": [
+      "flow_fairness_index",
+      "competing_transport_goodput_pct",
+      "saturation_goodput_pct",
+      "new_flow_p95_ms"
+    ],
+    "lifecycle": [
+      "startup_p95_ms",
+      "idle_cpu_pct",
+      "shutdown_p95_ms",
+      "reconnection_p95_ms"
+    ],
+    "full_stack": [
+      "proxy_full_stack_overhead_pct",
+      "tun_full_stack_overhead_pct"
+    ],
+    "mobile": [
+      "energy_per_gib_joule",
+      "thermal_throttle_time_pct",
+      "background_flow_survival_pct"
+    ],
+    "diagnostic_instrumentation": [
+      "diagnostic_cpu_overhead_pct",
+      "diagnostic_memory_overhead_bytes",
+      "diagnostic_event_drop_pct"
+    ]
+  },
+  "cells": {
+    "diagnostic.instrumentation": {
+      "profiles": [
+        "matched-feature-off-on"
+      ],
+      "metric_sets": [
+        "diagnostic_instrumentation"
+      ],
+      "minimum_lane": "nightly",
+      "minimum_valid_pairs": 7,
+      "minimum_triggered_events": 0,
+      "required_references": [
+        "immediate_parent",
+        "historical_champion"
+      ]
+    },
+    "reliable.tcp.single.download": {
+      "profiles": [
+        "lan",
+        "home-broadband",
+        "regional",
+        "mobile",
+        "high-bdp",
+        "lossy-long-haul",
+        "poor-internet"
+      ],
+      "runner_selectors": [
+        "mptunnel_tcp_single_*"
+      ],
+      "metric_sets": [
+        "reliable_delivery",
+        "setup_latency",
+        "interactive_latency",
+        "wire_efficiency",
+        "compute",
+        "memory",
+        "full_stack"
+      ],
+      "minimum_lane": "nightly",
+      "minimum_valid_pairs": 7,
+      "minimum_triggered_events": 0,
+      "required_references": [
+        "immediate_parent",
+        "historical_champion",
+        "direct_ceiling",
+        "external_competitor"
+      ]
+    },
+    "reliable.tcp.single.upload": {
+      "profiles": [
+        "lan",
+        "home-broadband",
+        "regional",
+        "mobile",
+        "high-bdp",
+        "lossy-long-haul",
+        "poor-internet"
+      ],
+      "runner_selectors": [
+        "mptunnel_tcp_single_*_upload"
+      ],
+      "metric_sets": [
+        "reliable_delivery",
+        "setup_latency",
+        "interactive_latency",
+        "wire_efficiency",
+        "compute",
+        "memory",
+        "full_stack"
+      ],
+      "minimum_lane": "nightly",
+      "minimum_valid_pairs": 7,
+      "minimum_triggered_events": 0,
+      "required_references": [
+        "immediate_parent",
+        "historical_champion",
+        "direct_ceiling",
+        "external_competitor"
+      ]
+    },
+    "reliable.quic.single.download": {
+      "profiles": [
+        "lan",
+        "home-broadband",
+        "regional",
+        "mobile",
+        "high-bdp",
+        "lossy-long-haul",
+        "poor-internet"
+      ],
+      "runner_selectors": [
+        "mptunnel_udp_stream_single_*"
+      ],
+      "metric_sets": [
+        "reliable_delivery",
+        "setup_latency",
+        "interactive_latency",
+        "wire_efficiency",
+        "compute",
+        "memory",
+        "full_stack"
+      ],
+      "minimum_lane": "nightly",
+      "minimum_valid_pairs": 7,
+      "minimum_triggered_events": 0,
+      "required_references": [
+        "immediate_parent",
+        "historical_champion",
+        "direct_ceiling",
+        "external_competitor"
+      ]
+    },
+    "reliable.quic.single.upload": {
+      "profiles": [
+        "lan",
+        "home-broadband",
+        "regional",
+        "mobile",
+        "high-bdp",
+        "lossy-long-haul",
+        "poor-internet"
+      ],
+      "runner_selectors": [
+        "mptunnel_udp_stream_single_*_upload"
+      ],
+      "metric_sets": [
+        "reliable_delivery",
+        "setup_latency",
+        "interactive_latency",
+        "wire_efficiency",
+        "compute",
+        "memory",
+        "full_stack"
+      ],
+      "minimum_lane": "nightly",
+      "minimum_valid_pairs": 7,
+      "minimum_triggered_events": 0,
+      "required_references": [
+        "immediate_parent",
+        "historical_champion",
+        "direct_ceiling",
+        "external_competitor"
+      ]
+    },
+    "reliable.tcp.multipath.download": {
+      "profiles": [
+        "homogeneous-two",
+        "homogeneous-four",
+        "heterogeneous-two",
+        "heterogeneous-four",
+        "shared-bottleneck",
+        "asymmetric"
+      ],
+      "runner_selectors": [
+        "mptunnel_tcp_multipath_*"
+      ],
+      "metric_sets": [
+        "reliable_delivery",
+        "path_aggregation",
+        "setup_latency",
+        "interactive_latency",
+        "wire_efficiency",
+        "compute",
+        "memory",
+        "fairness_and_saturation"
+      ],
+      "minimum_lane": "nightly",
+      "minimum_valid_pairs": 7,
+      "minimum_triggered_events": 0,
+      "required_references": [
+        "immediate_parent",
+        "historical_champion",
+        "matched_single_path",
+        "parallel_direct_ceiling",
+        "external_multipath"
+      ]
+    },
+    "reliable.tcp.multipath.upload": {
+      "profiles": [
+        "homogeneous-two",
+        "homogeneous-four",
+        "heterogeneous-two",
+        "heterogeneous-four",
+        "shared-bottleneck",
+        "asymmetric"
+      ],
+      "runner_selectors": [
+        "mptunnel_tcp_multipath_*_upload"
+      ],
+      "metric_sets": [
+        "reliable_delivery",
+        "path_aggregation",
+        "setup_latency",
+        "interactive_latency",
+        "wire_efficiency",
+        "compute",
+        "memory",
+        "fairness_and_saturation"
+      ],
+      "minimum_lane": "nightly",
+      "minimum_valid_pairs": 7,
+      "minimum_triggered_events": 0,
+      "required_references": [
+        "immediate_parent",
+        "historical_champion",
+        "matched_single_path",
+        "parallel_direct_ceiling",
+        "external_multipath"
+      ]
+    },
+    "reliable.quic.multipath.download": {
+      "profiles": [
+        "homogeneous-two",
+        "homogeneous-four",
+        "heterogeneous-two",
+        "heterogeneous-four",
+        "shared-bottleneck",
+        "asymmetric"
+      ],
+      "runner_selectors": [
+        "mptunnel_udp_stream_multipath_*"
+      ],
+      "metric_sets": [
+        "reliable_delivery",
+        "path_aggregation",
+        "setup_latency",
+        "interactive_latency",
+        "wire_efficiency",
+        "compute",
+        "memory",
+        "fairness_and_saturation"
+      ],
+      "minimum_lane": "nightly",
+      "minimum_valid_pairs": 7,
+      "minimum_triggered_events": 0,
+      "required_references": [
+        "immediate_parent",
+        "historical_champion",
+        "matched_single_path",
+        "parallel_direct_ceiling",
+        "external_multipath"
+      ]
+    },
+    "reliable.quic.multipath.upload": {
+      "profiles": [
+        "homogeneous-two",
+        "homogeneous-four",
+        "heterogeneous-two",
+        "heterogeneous-four",
+        "shared-bottleneck",
+        "asymmetric"
+      ],
+      "runner_selectors": [
+        "mptunnel_udp_stream_multipath_*_upload"
+      ],
+      "metric_sets": [
+        "reliable_delivery",
+        "path_aggregation",
+        "setup_latency",
+        "interactive_latency",
+        "wire_efficiency",
+        "compute",
+        "memory",
+        "fairness_and_saturation"
+      ],
+      "minimum_lane": "nightly",
+      "minimum_valid_pairs": 7,
+      "minimum_triggered_events": 0,
+      "required_references": [
+        "immediate_parent",
+        "historical_champion",
+        "matched_single_path",
+        "parallel_direct_ceiling",
+        "external_multipath"
+      ]
+    },
+    "reliable.mixed.multipath.download": {
+      "profiles": [
+        "homogeneous-two",
+        "homogeneous-four",
+        "heterogeneous-two",
+        "heterogeneous-four",
+        "shared-bottleneck",
+        "asymmetric"
+      ],
+      "runner_selectors": [
+        "mptunnel_reliable_mixed_multipath_*"
+      ],
+      "metric_sets": [
+        "reliable_delivery",
+        "path_aggregation",
+        "setup_latency",
+        "interactive_latency",
+        "wire_efficiency",
+        "compute",
+        "memory",
+        "fairness_and_saturation"
+      ],
+      "minimum_lane": "nightly",
+      "minimum_valid_pairs": 7,
+      "minimum_triggered_events": 0,
+      "required_references": [
+        "immediate_parent",
+        "historical_champion",
+        "matched_single_path",
+        "parallel_direct_ceiling",
+        "external_multipath"
+      ]
+    },
+    "reliable.mixed.multipath.upload": {
+      "profiles": [
+        "homogeneous-two",
+        "homogeneous-four",
+        "heterogeneous-two",
+        "heterogeneous-four",
+        "shared-bottleneck",
+        "asymmetric"
+      ],
+      "runner_selectors": [
+        "mptunnel_reliable_mixed_multipath_*_upload"
+      ],
+      "metric_sets": [
+        "reliable_delivery",
+        "path_aggregation",
+        "setup_latency",
+        "interactive_latency",
+        "wire_efficiency",
+        "compute",
+        "memory",
+        "fairness_and_saturation"
+      ],
+      "minimum_lane": "nightly",
+      "minimum_valid_pairs": 7,
+      "minimum_triggered_events": 0,
+      "required_references": [
+        "immediate_parent",
+        "historical_champion",
+        "matched_single_path",
+        "parallel_direct_ceiling",
+        "external_multipath"
+      ]
+    },
+    "datagram.quic.single": {
+      "profiles": [
+        "lan",
+        "regional",
+        "mobile",
+        "lossy-long-haul",
+        "poor-internet",
+        "path-maximum",
+        "oversized"
+      ],
+      "runner_selectors": [
+        "mptunnel_udp_single_*"
+      ],
+      "metric_sets": [
+        "datagram_quality",
+        "interactive_latency",
+        "wire_efficiency",
+        "compute",
+        "memory"
+      ],
+      "minimum_lane": "nightly",
+      "minimum_valid_pairs": 7,
+      "minimum_triggered_events": 0,
+      "required_references": [
+        "immediate_parent",
+        "historical_champion",
+        "direct_ceiling",
+        "external_competitor"
+      ]
+    },
+    "datagram.quic.multipath": {
+      "profiles": [
+        "homogeneous-two",
+        "heterogeneous-two",
+        "heterogeneous-four",
+        "shared-bottleneck",
+        "asymmetric"
+      ],
+      "runner_selectors": [
+        "mptunnel_udp_multipath_*"
+      ],
+      "metric_sets": [
+        "datagram_quality",
+        "path_aggregation",
+        "interactive_latency",
+        "wire_efficiency",
+        "compute",
+        "memory"
+      ],
+      "minimum_lane": "nightly",
+      "minimum_valid_pairs": 7,
+      "minimum_triggered_events": 0,
+      "required_references": [
+        "immediate_parent",
+        "historical_champion",
+        "matched_single_path",
+        "external_competitor"
+      ]
+    },
+    "datagram.tcp.single": {
+      "profiles": [
+        "lan",
+        "regional",
+        "mobile",
+        "lossy-long-haul",
+        "poor-internet"
+      ],
+      "runner_selectors": [
+        "mptunnel_udp_target_over_tcp_single_*"
+      ],
+      "metric_sets": [
+        "datagram_quality",
+        "interactive_latency",
+        "wire_efficiency",
+        "compute",
+        "memory"
+      ],
+      "minimum_lane": "nightly",
+      "minimum_valid_pairs": 7,
+      "minimum_triggered_events": 0,
+      "required_references": [
+        "immediate_parent",
+        "historical_champion",
+        "external_competitor"
+      ]
+    },
+    "datagram.tcp.multipath": {
+      "profiles": [
+        "homogeneous-two",
+        "heterogeneous-two",
+        "heterogeneous-four",
+        "shared-bottleneck",
+        "asymmetric"
+      ],
+      "runner_selectors": [
+        "mptunnel_udp_target_over_tcp_multipath_*"
+      ],
+      "metric_sets": [
+        "datagram_quality",
+        "path_aggregation",
+        "interactive_latency",
+        "wire_efficiency",
+        "compute",
+        "memory"
+      ],
+      "minimum_lane": "nightly",
+      "minimum_valid_pairs": 7,
+      "minimum_triggered_events": 0,
+      "required_references": [
+        "immediate_parent",
+        "historical_champion",
+        "matched_single_path",
+        "external_competitor"
+      ]
+    },
+    "mixed.loaded.single": {
+      "profiles": [
+        "lan",
+        "regional",
+        "mobile",
+        "lossy-long-haul"
+      ],
+      "runner_selectors": [
+        "mptunnel_mixed_single_*"
+      ],
+      "metric_sets": [
+        "reliable_delivery",
+        "datagram_quality",
+        "setup_latency",
+        "interactive_latency",
+        "wire_efficiency",
+        "compute",
+        "memory",
+        "fairness_and_saturation"
+      ],
+      "minimum_lane": "nightly",
+      "minimum_valid_pairs": 7,
+      "minimum_triggered_events": 0,
+      "required_references": [
+        "immediate_parent",
+        "historical_champion",
+        "external_competitor"
+      ]
+    },
+    "mixed.loaded.multipath": {
+      "profiles": [
+        "homogeneous-two",
+        "heterogeneous-two",
+        "heterogeneous-four",
+        "shared-bottleneck",
+        "saturated-path"
+      ],
+      "runner_selectors": [
+        "mptunnel_mixed_multipath_*"
+      ],
+      "metric_sets": [
+        "reliable_delivery",
+        "path_aggregation",
+        "datagram_quality",
+        "setup_latency",
+        "interactive_latency",
+        "wire_efficiency",
+        "compute",
+        "memory",
+        "fairness_and_saturation"
+      ],
+      "minimum_lane": "nightly",
+      "minimum_valid_pairs": 7,
+      "minimum_triggered_events": 0,
+      "required_references": [
+        "immediate_parent",
+        "historical_champion",
+        "matched_single_path",
+        "external_multipath"
+      ]
+    },
+    "fault.reliable.download": {
+      "profiles": [
+        "graceful-drain",
+        "socket-close",
+        "silent-blackhole",
+        "rate-collapse",
+        "latency-spike",
+        "asymmetric-failure",
+        "all-path-outage-restore"
+      ],
+      "runner_selectors": [
+        "mptunnel_tcp_multipath_failover_*",
+        "mptunnel_tcp_multipath_latency_spike_*"
+      ],
+      "metric_sets": [
+        "reliable_delivery",
+        "recovery",
+        "wire_efficiency",
+        "compute",
+        "memory"
+      ],
+      "minimum_lane": "nightly",
+      "minimum_valid_pairs": 0,
+      "minimum_triggered_events": 30,
+      "required_references": [
+        "immediate_parent",
+        "historical_champion",
+        "matched_survivor",
+        "external_multipath"
+      ]
+    },
+    "fault.reliable.upload": {
+      "profiles": [
+        "graceful-drain",
+        "socket-close",
+        "silent-blackhole",
+        "rate-collapse",
+        "latency-spike",
+        "asymmetric-failure",
+        "all-path-outage-restore"
+      ],
+      "runner_selectors": [
+        "mptunnel_tcp_multipath_failover_*_upload",
+        "mptunnel_tcp_multipath_latency_spike_*_upload"
+      ],
+      "metric_sets": [
+        "reliable_delivery",
+        "recovery",
+        "wire_efficiency",
+        "compute",
+        "memory"
+      ],
+      "minimum_lane": "nightly",
+      "minimum_valid_pairs": 0,
+      "minimum_triggered_events": 30,
+      "required_references": [
+        "immediate_parent",
+        "historical_champion",
+        "matched_survivor",
+        "external_multipath"
+      ]
+    },
+    "fault.mixed.flapping": {
+      "profiles": [
+        "seeded-flapping",
+        "carrier-stall",
+        "nat-rebinding",
+        "wifi-cellular-handover",
+        "stale-instance-event",
+        "suspend-resume"
+      ],
+      "runner_selectors": [
+        "mptunnel_mixed_multipath_flapping_links",
+        "mptunnel_mixed_multipath_failover_*",
+        "mptunnel_mixed_multipath_latency_spike_*"
+      ],
+      "metric_sets": [
+        "reliable_delivery",
+        "datagram_quality",
+        "recovery",
+        "interactive_latency",
+        "wire_efficiency",
+        "compute",
+        "memory"
+      ],
+      "minimum_lane": "nightly",
+      "minimum_valid_pairs": 0,
+      "minimum_triggered_events": 30,
+      "required_references": [
+        "immediate_parent",
+        "historical_champion",
+        "matched_survivor",
+        "external_multipath"
+      ]
+    },
+    "tun.single.download": {
+      "profiles": [
+        "tcp-low-latency",
+        "tcp-regional",
+        "quic-low-latency",
+        "quic-regional"
+      ],
+      "runner_selectors": [
+        "mptunnel_tun_*_single_*"
+      ],
+      "metric_sets": [
+        "reliable_delivery",
+        "datagram_quality",
+        "setup_latency",
+        "interactive_latency",
+        "wire_efficiency",
+        "compute",
+        "memory",
+        "full_stack"
+      ],
+      "minimum_lane": "nightly",
+      "minimum_valid_pairs": 7,
+      "minimum_triggered_events": 0,
+      "required_references": [
+        "immediate_parent",
+        "historical_champion",
+        "external_competitor"
+      ]
+    },
+    "tun.single.upload": {
+      "profiles": [
+        "tcp-low-latency",
+        "tcp-regional",
+        "quic-low-latency",
+        "quic-regional"
+      ],
+      "runner_selectors": [
+        "mptunnel_tun_*_single_*_upload"
+      ],
+      "metric_sets": [
+        "reliable_delivery",
+        "datagram_quality",
+        "setup_latency",
+        "interactive_latency",
+        "wire_efficiency",
+        "compute",
+        "memory",
+        "full_stack"
+      ],
+      "minimum_lane": "nightly",
+      "minimum_valid_pairs": 7,
+      "minimum_triggered_events": 0,
+      "required_references": [
+        "immediate_parent",
+        "historical_champion",
+        "external_competitor"
+      ]
+    },
+    "tun.multipath.download": {
+      "profiles": [
+        "mixed-heterogeneous",
+        "wifi-cellular",
+        "shared-bottleneck"
+      ],
+      "runner_selectors": [
+        "mptunnel_tun_mixed_multipath_*"
+      ],
+      "metric_sets": [
+        "reliable_delivery",
+        "path_aggregation",
+        "datagram_quality",
+        "setup_latency",
+        "interactive_latency",
+        "wire_efficiency",
+        "compute",
+        "memory",
+        "full_stack"
+      ],
+      "minimum_lane": "nightly",
+      "minimum_valid_pairs": 7,
+      "minimum_triggered_events": 0,
+      "required_references": [
+        "immediate_parent",
+        "historical_champion",
+        "matched_single_path",
+        "external_multipath"
+      ]
+    },
+    "tun.multipath.upload": {
+      "profiles": [
+        "mixed-heterogeneous",
+        "wifi-cellular",
+        "shared-bottleneck"
+      ],
+      "runner_selectors": [
+        "mptunnel_tun_mixed_multipath_*_upload"
+      ],
+      "metric_sets": [
+        "reliable_delivery",
+        "path_aggregation",
+        "datagram_quality",
+        "setup_latency",
+        "interactive_latency",
+        "wire_efficiency",
+        "compute",
+        "memory",
+        "full_stack"
+      ],
+      "minimum_lane": "nightly",
+      "minimum_valid_pairs": 7,
+      "minimum_triggered_events": 0,
+      "required_references": [
+        "immediate_parent",
+        "historical_champion",
+        "matched_single_path",
+        "external_multipath"
+      ]
+    },
+    "resource.concurrency": {
+      "profiles": [
+        "one-flow",
+        "ten-flows",
+        "hundred-flows",
+        "thousand-flows",
+        "ten-times-overload",
+        "eight-path-stress"
+      ],
+      "metric_sets": [
+        "reliable_delivery",
+        "datagram_quality",
+        "setup_latency",
+        "compute",
+        "memory",
+        "fairness_and_saturation"
+      ],
+      "minimum_lane": "nightly",
+      "minimum_valid_pairs": 7,
+      "minimum_triggered_events": 0,
+      "required_references": [
+        "immediate_parent",
+        "historical_champion",
+        "external_competitor"
+      ]
+    },
+    "lifecycle.session": {
+      "profiles": [
+        "cold-start",
+        "warm-session",
+        "resumption",
+        "reload",
+        "idle-maintenance",
+        "path-churn",
+        "shutdown",
+        "reconnect"
+      ],
+      "metric_sets": [
+        "reliable_delivery",
+        "setup_latency",
+        "compute",
+        "memory",
+        "lifecycle"
+      ],
+      "minimum_lane": "nightly",
+      "minimum_valid_pairs": 7,
+      "minimum_triggered_events": 0,
+      "required_references": [
+        "immediate_parent",
+        "historical_champion",
+        "external_competitor"
+      ]
+    },
+    "platform.windows.packaged": {
+      "profiles": [
+        "native-x86_64",
+        "native-arm64",
+        "service",
+        "tun",
+        "portable-telemetry-fallback"
+      ],
+      "metric_sets": [
+        "reliable_delivery",
+        "path_aggregation",
+        "datagram_quality",
+        "setup_latency",
+        "interactive_latency",
+        "recovery",
+        "wire_efficiency",
+        "compute",
+        "memory",
+        "lifecycle",
+        "full_stack"
+      ],
+      "minimum_lane": "release",
+      "minimum_valid_pairs": 7,
+      "minimum_triggered_events": 30,
+      "required_references": [
+        "immediate_parent",
+        "historical_champion",
+        "external_competitor",
+        "external_multipath"
+      ]
+    },
+    "platform.macos.packaged": {
+      "profiles": [
+        "native-x86_64",
+        "native-arm64",
+        "service",
+        "tun",
+        "portable-telemetry-fallback"
+      ],
+      "metric_sets": [
+        "reliable_delivery",
+        "path_aggregation",
+        "datagram_quality",
+        "setup_latency",
+        "interactive_latency",
+        "recovery",
+        "wire_efficiency",
+        "compute",
+        "memory",
+        "lifecycle",
+        "full_stack"
+      ],
+      "minimum_lane": "release",
+      "minimum_valid_pairs": 7,
+      "minimum_triggered_events": 30,
+      "required_references": [
+        "immediate_parent",
+        "historical_champion",
+        "external_competitor",
+        "external_multipath"
+      ]
+    },
+    "platform.android.packaged": {
+      "profiles": [
+        "native-arm64",
+        "vpn-service",
+        "background-transition",
+        "wifi-cellular-handover",
+        "portable-telemetry-fallback"
+      ],
+      "metric_sets": [
+        "reliable_delivery",
+        "path_aggregation",
+        "datagram_quality",
+        "setup_latency",
+        "interactive_latency",
+        "recovery",
+        "wire_efficiency",
+        "compute",
+        "memory",
+        "lifecycle",
+        "full_stack",
+        "mobile"
+      ],
+      "minimum_lane": "release",
+      "minimum_valid_pairs": 7,
+      "minimum_triggered_events": 30,
+      "required_references": [
+        "immediate_parent",
+        "historical_champion",
+        "external_competitor",
+        "external_multipath"
+      ]
+    }
+  },
+  "cell_groups": {
+    "diagnostic": [
+      "diagnostic.instrumentation"
+    ],
+    "tcp": [
+      "reliable.tcp.single.download",
+      "reliable.tcp.single.upload",
+      "reliable.tcp.multipath.download",
+      "reliable.tcp.multipath.upload",
+      "reliable.mixed.multipath.download",
+      "reliable.mixed.multipath.upload",
+      "datagram.tcp.single",
+      "datagram.tcp.multipath",
+      "mixed.loaded.single",
+      "mixed.loaded.multipath",
+      "fault.reliable.download",
+      "fault.reliable.upload",
+      "fault.mixed.flapping",
+      "tun.single.download",
+      "tun.single.upload",
+      "tun.multipath.download",
+      "tun.multipath.upload",
+      "resource.concurrency",
+      "lifecycle.session",
+      "platform.windows.packaged",
+      "platform.macos.packaged",
+      "platform.android.packaged"
+    ],
+    "quic": [
+      "reliable.quic.single.download",
+      "reliable.quic.single.upload",
+      "reliable.quic.multipath.download",
+      "reliable.quic.multipath.upload",
+      "reliable.mixed.multipath.download",
+      "reliable.mixed.multipath.upload",
+      "datagram.quic.single",
+      "datagram.quic.multipath",
+      "mixed.loaded.single",
+      "mixed.loaded.multipath",
+      "fault.mixed.flapping",
+      "tun.single.download",
+      "tun.single.upload",
+      "tun.multipath.download",
+      "tun.multipath.upload",
+      "resource.concurrency",
+      "lifecycle.session",
+      "platform.windows.packaged",
+      "platform.macos.packaged",
+      "platform.android.packaged"
+    ],
+    "multipath": [
+      "reliable.tcp.multipath.download",
+      "reliable.tcp.multipath.upload",
+      "reliable.quic.multipath.download",
+      "reliable.quic.multipath.upload",
+      "reliable.mixed.multipath.download",
+      "reliable.mixed.multipath.upload",
+      "datagram.quic.multipath",
+      "datagram.tcp.multipath",
+      "mixed.loaded.multipath",
+      "fault.reliable.download",
+      "fault.reliable.upload",
+      "fault.mixed.flapping",
+      "tun.multipath.download",
+      "tun.multipath.upload",
+      "resource.concurrency",
+      "lifecycle.session",
+      "platform.windows.packaged",
+      "platform.macos.packaged",
+      "platform.android.packaged"
+    ],
+    "datagram": [
+      "datagram.quic.single",
+      "datagram.quic.multipath",
+      "datagram.tcp.single",
+      "datagram.tcp.multipath",
+      "mixed.loaded.single",
+      "mixed.loaded.multipath",
+      "fault.mixed.flapping",
+      "tun.single.download",
+      "tun.single.upload",
+      "tun.multipath.download",
+      "tun.multipath.upload",
+      "resource.concurrency",
+      "platform.windows.packaged",
+      "platform.macos.packaged",
+      "platform.android.packaged"
+    ],
+    "tun": [
+      "tun.single.download",
+      "tun.single.upload",
+      "tun.multipath.download",
+      "tun.multipath.upload",
+      "platform.windows.packaged",
+      "platform.macos.packaged",
+      "platform.android.packaged"
+    ],
+    "platform": [
+      "platform.windows.packaged",
+      "platform.macos.packaged",
+      "platform.android.packaged"
+    ],
+    "product": [
+      "reliable.tcp.single.download",
+      "reliable.tcp.single.upload",
+      "reliable.quic.single.download",
+      "reliable.quic.single.upload",
+      "reliable.tcp.multipath.download",
+      "reliable.tcp.multipath.upload",
+      "reliable.quic.multipath.download",
+      "reliable.quic.multipath.upload",
+      "reliable.mixed.multipath.download",
+      "reliable.mixed.multipath.upload",
+      "datagram.quic.single",
+      "datagram.quic.multipath",
+      "datagram.tcp.single",
+      "datagram.tcp.multipath",
+      "mixed.loaded.single",
+      "mixed.loaded.multipath",
+      "fault.reliable.download",
+      "fault.reliable.upload",
+      "fault.mixed.flapping",
+      "tun.single.download",
+      "tun.single.upload",
+      "tun.multipath.download",
+      "tun.multipath.upload",
+      "resource.concurrency",
+      "lifecycle.session",
+      "platform.windows.packaged",
+      "platform.macos.packaged",
+      "platform.android.packaged"
+    ]
+  },
+  "impact_scopes": {
+    "diagnostic-instrumentation": {
+      "cell_groups": [
+        "diagnostic"
+      ],
+      "metric_sets": [
+        "*"
+      ]
+    },
+    "tcp-carrier": {
+      "cell_groups": [
+        "tcp"
+      ],
+      "metric_sets": [
+        "*"
+      ]
+    },
+    "quic-carrier": {
+      "cell_groups": [
+        "quic"
+      ],
+      "metric_sets": [
+        "*"
+      ]
+    },
+    "scheduler-and-recovery": {
+      "cell_groups": [
+        "multipath"
+      ],
+      "metric_sets": [
+        "*"
+      ]
+    },
+    "datagram-engine": {
+      "cell_groups": [
+        "datagram"
+      ],
+      "metric_sets": [
+        "*"
+      ]
+    },
+    "wire-protocol": {
+      "cell_groups": [
+        "product"
+      ],
+      "metric_sets": [
+        "*"
+      ]
+    },
+    "resource-accounting": {
+      "cell_groups": [
+        "product"
+      ],
+      "metric_sets": [
+        "reliable_delivery",
+        "datagram_quality",
+        "recovery",
+        "compute",
+        "memory",
+        "fairness_and_saturation"
+      ]
+    },
+    "tun-full-stack": {
+      "cell_groups": [
+        "tun"
+      ],
+      "metric_sets": [
+        "*"
+      ]
+    },
+    "platform-runtime": {
+      "cell_groups": [
+        "platform"
+      ],
+      "metric_sets": [
+        "*"
+      ]
+    },
+    "product-full-stack": {
+      "cell_groups": [
+        "product"
+      ],
+      "metric_sets": [
+        "*"
+      ]
+    },
+    "measurement-contract": {
+      "cell_groups": [
+        "product"
+      ],
+      "metric_sets": [
+        "*"
+      ],
+      "requires_dual_run": true
+    },
+    "build-or-dependency": {
+      "cell_groups": [
+        "product"
+      ],
+      "metric_sets": [
+        "*"
+      ]
+    },
+    "full-matrix": {
+      "cell_groups": [
+        "product"
+      ],
+      "metric_sets": [
+        "*"
+      ]
+    }
+  },
+  "ignored_path_patterns": [
+    "AGENTS.md",
+    "CONTRIBUTING.md",
+    "LICENSE",
+    "README.md",
+    "SECURITY.md",
+    "docs/**",
+    "**/*_test.rs",
+    "lab/test_*.py",
+    "lab/PERFORMANCE_DECLARATIONS.md",
+    "lab/performance-change.example.json",
+    "lab/performance-impact-registry.json",
+    "lab/validate_performance_declaration.py"
+  ],
+  "path_rules": [
+    {
+      "id": "build-or-dependency",
+      "patterns": [
+        ".cargo/**",
+        ".github/workflows/**",
+        "Cargo.lock",
+        "Cargo.toml",
+        "build.rs",
+        "rust-toolchain*",
+        "packaging/package-release.*"
+      ],
+      "required_scopes": [
+        "build-or-dependency"
+      ]
+    },
+    {
+      "id": "lab-measurement-contract",
+      "patterns": [
+        "lab/**"
+      ],
+      "required_scopes": [
+        "measurement-contract"
+      ]
+    },
+    {
+      "id": "diagnostic-instrumentation",
+      "patterns": [
+        "src/lab_diagnostics.rs"
+      ],
+      "required_scopes": [
+        "diagnostic-instrumentation"
+      ]
+    },
+    {
+      "id": "simulator-evidence",
+      "patterns": [
+        "src/simulator.rs",
+        "src/simulator/**"
+      ],
+      "required_scopes": [
+        "measurement-contract"
+      ]
+    },
+    {
+      "id": "performance-envelope",
+      "patterns": [
+        "src/performance.rs",
+        "src/performance_test.rs"
+      ],
+      "required_scopes": [
+        "full-matrix"
+      ]
+    },
+    {
+      "id": "wire-protocol",
+      "patterns": [
+        "src/mux.rs",
+        "src/mux/**",
+        "src/protocol.rs",
+        "src/protocol/**",
+        "src/transport/encrypted.rs",
+        "src/transport/framed.rs"
+      ],
+      "required_scopes": [
+        "wire-protocol"
+      ]
+    },
+    {
+      "id": "quic-datagram-engine",
+      "patterns": [
+        "src/runtime/datagram/quic.rs",
+        "src/runtime/datagram/quic_session.rs",
+        "src/runtime/datagram/quic_session/**"
+      ],
+      "required_scopes": [
+        "datagram-engine",
+        "quic-carrier"
+      ]
+    },
+    {
+      "id": "tcp-datagram-engine",
+      "patterns": [
+        "src/runtime/datagram/tcp.rs",
+        "src/runtime/datagram/tcp_session.rs",
+        "src/runtime/datagram/tcp_session/**"
+      ],
+      "required_scopes": [
+        "datagram-engine",
+        "tcp-carrier"
+      ]
+    },
+    {
+      "id": "datagram-engine",
+      "patterns": [
+        "src/model/datagram.rs",
+        "src/runtime/datagram.rs",
+        "src/runtime/datagram/**"
+      ],
+      "required_scopes": [
+        "datagram-engine"
+      ]
+    },
+    {
+      "id": "quic-carrier",
+      "patterns": [
+        "src/transport/quic.rs",
+        "src/transport/quic/**",
+        "src/transport/udp.rs",
+        "crates/quinn-proto/**"
+      ],
+      "required_scopes": [
+        "quic-carrier"
+      ]
+    },
+    {
+      "id": "tcp-carrier",
+      "patterns": [
+        "src/transport/tcp.rs",
+        "src/transport/tcp_telemetry.rs",
+        "src/transport/tcp_telemetry/**"
+      ],
+      "required_scopes": [
+        "tcp-carrier"
+      ]
+    },
+    {
+      "id": "scheduler-and-recovery",
+      "patterns": [
+        "src/model.rs",
+        "src/model/**",
+        "src/runtime/path.rs",
+        "src/runtime/path/**",
+        "src/runtime/relay.rs",
+        "src/runtime/relay/**",
+        "src/runtime/sender.rs",
+        "src/runtime/sender/**",
+        "src/runtime/stream.rs",
+        "src/runtime/stream/**",
+        "src/scheduler.rs",
+        "src/scheduler/**"
+      ],
+      "required_scopes": [
+        "scheduler-and-recovery"
+      ]
+    },
+    {
+      "id": "resource-accounting",
+      "patterns": [
+        "src/runtime/recent_ids.rs",
+        "src/runtime/identity.rs"
+      ],
+      "required_scopes": [
+        "resource-accounting"
+      ]
+    },
+    {
+      "id": "tun-full-stack",
+      "patterns": [
+        "src/ingress/tun.rs",
+        "src/platform/packet_device.rs",
+        "src/runtime/tun_l4.rs"
+      ],
+      "required_scopes": [
+        "tun-full-stack"
+      ]
+    },
+    {
+      "id": "platform-runtime",
+      "patterns": [
+        "src/platform.rs",
+        "src/platform/**"
+      ],
+      "required_scopes": [
+        "platform-runtime"
+      ]
+    },
+    {
+      "id": "product-full-stack",
+      "patterns": [
+        "config.toml",
+        "examples/**",
+        "src/app.rs",
+        "src/cli.rs",
+        "src/config.rs",
+        "src/config/**",
+        "src/ingress.rs",
+        "src/ingress/**",
+        "src/outbound.rs",
+        "src/outbound/**",
+        "src/product.rs",
+        "src/product/**",
+        "src/runtime/ingress_runtime.rs",
+        "src/runtime/management.rs",
+        "src/runtime/management/**",
+        "src/runtime/node.rs",
+        "src/runtime/node/**"
+      ],
+      "required_scopes": [
+        "product-full-stack"
+      ]
+    },
+    {
+      "id": "remaining-shipped-source",
+      "patterns": [
+        "src/**"
+      ],
+      "required_scopes": [
+        "full-matrix"
+      ]
+    }
+  ]
+}

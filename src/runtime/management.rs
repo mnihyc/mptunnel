@@ -4,7 +4,10 @@
 //! transport details. Peer diagnostic exchange remains on authenticated MPP
 //! carrier control channels and is only initiated here on an explicit request.
 
+mod config;
 mod control;
+mod dns;
+mod gateway;
 mod http;
 mod projection;
 mod schema;
@@ -16,57 +19,65 @@ use self::schema::ManagementSnapshot;
 use self::snapshot::ManagementState;
 #[cfg(test)]
 use super::*;
-use crate::config::ManagementConfig;
+use crate::config::{LocalIngressConfig, ManagementConfig, OutboundLeafConfig};
+use crate::dns::DnsGeneration;
+use crate::ingress::IngressConfig;
+use crate::outbound::OutboundConfig;
+use crate::product::{Network, OutboundId, ProductAdmission};
+use crate::runtime::config_control::RuntimeConfigControl;
 use crate::runtime::error::RuntimeError;
+use crate::runtime::outbound_registry::GatewayRuntimeControl;
 use crate::runtime::path::{ClientPathContext, ServerPathContext};
+use crate::runtime::readiness::{RequiredServiceReadiness, RuntimeGenerationControl};
+use crate::runtime::telemetry::RuntimeTelemetry;
 use std::sync::Arc;
 use std::time::Duration;
 
 const SAMPLE_INTERVAL: Duration = Duration::from_secs(1);
 
-pub(super) fn spawn_client_management_services(
-    config: ManagementConfig,
-    context: ClientPathContext,
-    services: &mut tokio::task::JoinSet<Result<(), RuntimeError>>,
-) {
-    let state = ManagementState::new("client");
-    let target = ManagementTarget::Client { context, state };
-    spawn_management_services(config, target, services);
-}
-
-pub(super) fn spawn_server_management_services(
-    config: ManagementConfig,
-    context: ServerPathContext,
-    services: &mut tokio::task::JoinSet<Result<(), RuntimeError>>,
-) {
-    let state = ManagementState::new("server");
-    let target = ManagementTarget::Server { context, state };
-    spawn_management_services(config, target, services);
-}
-
+#[allow(
+    clippy::too_many_arguments,
+    reason = "the generation composition boundary explicitly transfers each independent Product owner"
+)]
 pub(super) fn spawn_node_management_services(
     config: ManagementConfig,
     clients: Vec<ClientPathContext>,
     servers: Vec<ServerPathContext>,
+    inventory: ProductRuntimeInventory,
+    product_telemetry: RuntimeTelemetry,
+    config_control: Option<RuntimeConfigControl>,
+    gateway_control: Option<GatewayRuntimeControl>,
+    dns: Option<DnsGeneration>,
+    product_admission: ProductAdmission,
+    generation: RuntimeGenerationControl,
+    readiness: RequiredServiceReadiness,
     services: &mut tokio::task::JoinSet<Result<(), RuntimeError>>,
 ) {
     let state = ManagementState::new("node");
-    let target = ManagementTarget::Node {
+    let target = ManagementTarget {
         clients,
         servers,
+        inventory,
+        product_telemetry,
         state,
+        config_control,
+        gateway_control,
+        dns,
+        product_admission,
+        generation,
     };
-    spawn_management_services(config, target, services);
+    spawn_management_services(config, target, readiness, services);
 }
 
 fn spawn_management_services(
     config: ManagementConfig,
     target: ManagementTarget,
+    readiness: RequiredServiceReadiness,
     services: &mut tokio::task::JoinSet<Result<(), RuntimeError>>,
 ) {
     target.refresh_sample_snapshot();
     services.spawn(run_sampler(target.clone()));
-    services.spawn(http::run_listeners(config, target));
+    services.spawn(http::run_listeners(config, target, readiness));
 }
 
 async fn run_sampler(target: ManagementTarget) -> Result<(), RuntimeError> {
@@ -80,29 +91,130 @@ async fn run_sampler(target: ManagementTarget) -> Result<(), RuntimeError> {
 }
 
 #[derive(Clone)]
-enum ManagementTarget {
-    Client {
-        context: ClientPathContext,
-        state: ManagementState,
-    },
-    Server {
-        context: ServerPathContext,
-        state: ManagementState,
-    },
-    Node {
-        clients: Vec<ClientPathContext>,
-        servers: Vec<ServerPathContext>,
-        state: ManagementState,
-    },
+struct ManagementTarget {
+    clients: Vec<ClientPathContext>,
+    servers: Vec<ServerPathContext>,
+    inventory: ProductRuntimeInventory,
+    product_telemetry: RuntimeTelemetry,
+    state: ManagementState,
+    config_control: Option<RuntimeConfigControl>,
+    gateway_control: Option<GatewayRuntimeControl>,
+    dns: Option<DnsGeneration>,
+    product_admission: ProductAdmission,
+    generation: RuntimeGenerationControl,
+}
+
+#[derive(Debug, Clone, Default)]
+pub(super) struct ProductRuntimeInventory {
+    local_inbounds: Arc<Vec<ProductInboundInventory>>,
+    outbounds: Arc<Vec<ProductOutboundInventory>>,
+}
+
+#[derive(Debug, Clone)]
+struct ProductInboundInventory {
+    tag: Option<String>,
+    protocol: &'static str,
+    listen: Vec<String>,
+    name: Option<String>,
+    target: Option<String>,
+    auth_required: bool,
+}
+
+#[derive(Debug, Clone)]
+struct ProductOutboundInventory {
+    id: OutboundId,
+    protocol: &'static str,
+    networks: Vec<Network>,
+}
+
+impl ProductRuntimeInventory {
+    pub(super) fn from_config(
+        local_inbounds: &[LocalIngressConfig],
+        outbounds: &[OutboundLeafConfig],
+    ) -> Self {
+        let local_inbounds = local_inbounds
+            .iter()
+            .map(|inbound| {
+                let (protocol, listen, name, target, auth_required) = match &inbound.config {
+                    IngressConfig::Socks5 {
+                        listen, proxy_auth, ..
+                    } => (
+                        "socks5",
+                        listen.iter().map(ToString::to_string).collect(),
+                        None,
+                        None,
+                        proxy_auth.is_required(),
+                    ),
+                    IngressConfig::HttpConnect {
+                        listen, proxy_auth, ..
+                    } => (
+                        "http-connect",
+                        listen.iter().map(ToString::to_string).collect(),
+                        None,
+                        None,
+                        proxy_auth.is_required(),
+                    ),
+                    IngressConfig::TcpForward(config) => (
+                        "tcp-forward",
+                        config.listen().iter().map(ToString::to_string).collect(),
+                        None,
+                        Some(config.target().to_string()),
+                        false,
+                    ),
+                    IngressConfig::UdpForward(config) => (
+                        "udp-forward",
+                        config.listen().iter().map(ToString::to_string).collect(),
+                        None,
+                        Some(config.target().to_string()),
+                        false,
+                    ),
+                    IngressConfig::TunL4(tun) => ("tun", Vec::new(), tun.name.clone(), None, false),
+                };
+                ProductInboundInventory {
+                    tag: inbound.tag.clone(),
+                    protocol,
+                    listen,
+                    name,
+                    target,
+                    auth_required,
+                }
+            })
+            .collect();
+        let outbounds = outbounds
+            .iter()
+            .map(|outbound| match outbound {
+                OutboundLeafConfig::Mpp { id, .. } => ProductOutboundInventory {
+                    id: id.clone(),
+                    protocol: "mpp",
+                    networks: vec![Network::Tcp, Network::Udp],
+                },
+                OutboundLeafConfig::Local { id, config, .. } => ProductOutboundInventory {
+                    id: id.clone(),
+                    protocol: match config {
+                        OutboundConfig::Direct => "direct",
+                        OutboundConfig::BindSourceIp(_) => "bind-source",
+                        OutboundConfig::Socks5(_) => "socks5",
+                        OutboundConfig::HttpConnect(_) => "http-connect",
+                        OutboundConfig::HttpsConnect(_) => "https-connect",
+                    },
+                    networks: if config.supports_udp_targets() {
+                        vec![Network::Tcp, Network::Udp]
+                    } else {
+                        vec![Network::Tcp]
+                    },
+                },
+            })
+            .collect();
+        Self {
+            local_inbounds: Arc::new(local_inbounds),
+            outbounds: Arc::new(outbounds),
+        }
+    }
 }
 
 impl ManagementTarget {
     fn state(&self) -> &ManagementState {
-        match self {
-            Self::Client { state, .. } | Self::Server { state, .. } | Self::Node { state, .. } => {
-                state
-            }
-        }
+        &self.state
     }
 
     fn refresh_sample_snapshot(&self) {
@@ -115,6 +227,14 @@ impl ManagementTarget {
 
     fn snapshot(&self) -> Arc<ManagementSnapshot> {
         self.state().snapshot()
+    }
+
+    fn config_control(&self) -> Option<&RuntimeConfigControl> {
+        self.config_control.as_ref()
+    }
+
+    fn generation(&self) -> &RuntimeGenerationControl {
+        &self.generation
     }
 }
 

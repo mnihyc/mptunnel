@@ -13,7 +13,6 @@ use super::multipath::{
 };
 use super::response_reinjection_avoid_outputs;
 use super::scheduling::{response_completion_snapshot, select_response_frame_path};
-use crate::config::MppPerformanceConfig;
 #[cfg(feature = "lab-diagnostics")]
 use crate::lab_diagnostics::{
     lab_diagnostic, lab_diagnostic_event_enabled, lab_perf_record, lab_sender_service_decision,
@@ -25,6 +24,7 @@ use crate::model::path::CarrierPathKey;
 use crate::model::work::ReliableWorkClass;
 use crate::mux::MuxLimits;
 use crate::mux::stream::ReliableSendStream;
+use crate::performance::MppPerformanceConfig;
 #[cfg(feature = "lab-diagnostics")]
 use crate::protocol::frame::reliable_path_frame_pacing_bytes;
 use crate::protocol::frame::reliable_stream_frame_accounted_bytes;

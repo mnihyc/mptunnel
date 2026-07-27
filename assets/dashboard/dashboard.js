@@ -1,9 +1,11 @@
 (function () {
   "use strict";
 
-  const STATUS_ENDPOINT = "/api/status";
-  const PEER_ENDPOINT = "/api/diagnostics/peer";
-  const EXPECTED_SCHEMA = "mptunnel.management.v2";
+  const HEALTH_ENDPOINT = "/api/v1/health";
+  const STATUS_ENDPOINT = "/api/v1/status";
+  const PEER_ENDPOINT = "/api/v1/diagnostics/peer";
+  const GATEWAY_ACTION_ENDPOINT = "/api/v1/gateways/actions";
+  const EXPECTED_SCHEMA = "mptunnel.management.v4";
   const TOKEN_STORAGE_KEY = "mptunnel.dashboard.bearer";
   const REFRESH_STORAGE_KEY = "mptunnel.dashboard.refresh-interval-ms";
   const REFRESH_INTERVALS_MS = [0, 1000, 5000, 30000];
@@ -24,6 +26,7 @@
     accessButton: byId("access-button"),
     srStatus: byId("sr-status"),
     overviewTimestamp: byId("overview-timestamp"),
+    gatewaysTabCount: byId("gateways-tab-count"),
     pathsTabCount: byId("paths-tab-count"),
     sessionsTabCount: byId("sessions-tab-count"),
     pathUnderlayFilter: byId("path-underlay-filter"),
@@ -39,6 +42,11 @@
     servicesList: byId("services-list"),
     inboundsWrap: byId("inbounds-wrap"),
     inboundsList: byId("inbounds-list"),
+    outboundsWrap: byId("outbounds-wrap"),
+    outboundsList: byId("outbounds-list"),
+    gatewayList: byId("gateway-list"),
+    gatewaysEmpty: byId("gateways-empty"),
+    gatewayActionState: byId("gateway-action-state"),
     trafficChart: byId("traffic-chart"),
     trafficChartEmpty: byId("traffic-chart-empty"),
     flowsChart: byId("flows-chart"),
@@ -76,6 +84,7 @@
   };
 
   const state = {
+    health: null,
     status: null,
     bearerToken: readStoredToken(),
     refreshIntervalMs: readStoredRefreshInterval(),
@@ -83,6 +92,7 @@
     refreshCycleRunning: false,
     fetching: false,
     peerFetching: false,
+    gatewayUpdating: false,
     authenticationRequired: false,
     lastReceivedAt: 0,
     lastError: null,
@@ -411,8 +421,15 @@
     return payload;
   }
 
+  function validateHealth(payload) {
+    if (!payload || typeof payload !== "object" || payload.schema !== "mptunnel.health.v1") {
+      throw new Error("Unsupported management health response");
+    }
+    return payload;
+  }
+
   function refreshBusy() {
-    return state.refreshCycleRunning || state.fetching || state.peerFetching;
+    return state.refreshCycleRunning || state.fetching || state.peerFetching || state.gatewayUpdating;
   }
 
   function peerRequestSupported() {
@@ -441,8 +458,12 @@
     updateRefreshControls();
     updateConnectionState();
     try {
-      const payload = validateStatus(await requestJson(STATUS_ENDPOINT));
-      state.status = payload;
+      const responses = await Promise.all([
+        requestJson(STATUS_ENDPOINT),
+        requestJson(HEALTH_ENDPOINT)
+      ]);
+      state.status = validateStatus(responses[0]);
+      state.health = validateHealth(responses[1]);
       state.lastReceivedAt = Date.now();
       state.lastError = null;
       state.authenticationRequired = false;
@@ -565,6 +586,22 @@
     } else if (state.fetching) {
       setConnection("loading", "Refreshing", freshness);
       setNotice("loading", "Refreshing runtime status", true);
+    } else if (state.health && !state.health.ready) {
+      const blocker = asArray(state.health.readiness_blockers)[0];
+      setConnection("error", "Not ready", freshness);
+      setNotice(
+        "error",
+        blocker ? "Runtime is not ready: " + titleCase(blocker) : "Runtime is not ready.",
+        true
+      );
+    } else if (state.health && state.health.degraded) {
+      const reason = asArray(state.health.degraded_reasons)[0];
+      setConnection("stale", "Degraded", freshness);
+      setNotice(
+        "stale",
+        reason ? "Runtime is degraded: " + titleCase(reason) : "Runtime is serving in a degraded state.",
+        true
+      );
     } else {
       setConnection("live", "Live", freshness);
       setNotice("loading", "", false);
@@ -577,6 +614,7 @@
     renderKpis();
     renderTrafficBreakdown();
     renderServices();
+    renderGateways();
     renderPaths();
     renderSessions();
     renderDiagnostics();
@@ -588,6 +626,7 @@
     const status = state.status;
     replaceText(elements.roleLabel, titleCase(status.role));
     elements.overviewTimestamp.textContent = "Sample " + formatWallTime(status.generated_unix_ms) + " / " + formatRelative(status.generated_unix_ms);
+    elements.gatewaysTabCount.textContent = String(asArray(status.gateways).length);
     elements.pathsTabCount.textContent = String(asArray(status.paths).length);
     elements.sessionsTabCount.textContent = String(asArray(status.sessions).length);
   }
@@ -650,6 +689,9 @@
     appendMetric(elements.servicesList, "MPP outbounds", formatCount(services.mpp_outbounds));
     appendMetric(elements.servicesList, "MPP inbounds", formatCount(services.mpp_inbounds));
     appendMetric(elements.servicesList, "Local inbounds", formatCount(services.local_inbounds));
+    appendMetric(elements.servicesList, "Outbounds", formatCount(services.outbounds));
+    appendMetric(elements.servicesList, "Native outbounds", formatCount(services.local_outbounds));
+    appendMetric(elements.servicesList, "Gateway balancers", formatCount(services.gateway_balancers));
     appendMetric(elements.servicesList, "Path listeners", formatCount(services.configured_path_listeners));
     appendMetric(elements.servicesList, "Uptime", formatDuration(state.status.uptime_ms));
     appendMetric(elements.servicesList, "Schema", String(state.status.schema || "--"));
@@ -668,6 +710,223 @@
       row.append(name, createElement("span", "", details.join(" / ")));
       elements.inboundsList.append(row);
     });
+
+    const outbounds = asArray(state.status.outbounds);
+    elements.outboundsList.replaceChildren();
+    elements.outboundsWrap.hidden = outbounds.length === 0;
+    outbounds.forEach(function (outbound) {
+      const row = createElement("li");
+      const details = [
+        titleCase(outbound.protocol),
+        asArray(outbound.networks).map(function (network) {
+          return String(network).toUpperCase();
+        }).join(" + ")
+      ].filter(Boolean);
+      row.append(
+        createElement("strong", "", outbound.tag || "Outbound"),
+        createElement("span", "", details.join(" / "))
+      );
+      elements.outboundsList.append(row);
+    });
+  }
+
+  function gatewayControl() {
+    return asObject(asObject(asObject(state.status).controls).gateway);
+  }
+
+  function gatewayBadge(value) {
+    const normalized = String(value || "unknown");
+    let kind = "neutral";
+    if (["ready", "healthy", "fresh", "enabled"].includes(normalized)) kind = "success";
+    if (["draining", "stale", "backing-off", "recovery-probe-eligible", "recovery-probe-in-flight"].includes(normalized)) kind = "warning";
+    if (["unavailable", "disabled", "never-observed"].includes(normalized)) kind = "danger";
+    return badge(titleCase(normalized), kind);
+  }
+
+  function gatewayActionButton(label, action, balancer, member, kind, disabled) {
+    const button = createElement("button", "button button--small " + (kind || "button--quiet"), label);
+    button.type = "button";
+    button.dataset.gatewayAction = action;
+    button.dataset.balancer = balancer;
+    if (member) button.dataset.member = member;
+    button.disabled = Boolean(disabled) || state.gatewayUpdating || !gatewayControl().supported;
+    return button;
+  }
+
+  function renderGateways() {
+    const gateways = asArray(state.status.gateways).map(asObject);
+    elements.gatewayList.replaceChildren();
+    elements.gatewaysEmpty.hidden = gateways.length !== 0;
+    gateways.forEach(function (gateway) {
+      const card = createElement("section", "data-section data-section--wide gateway-card");
+      const header = createElement("div", "data-section__header data-section__header--actions gateway-card__header");
+      const heading = createElement("div");
+      heading.append(createElement("h2", "", gateway.tag || "Gateway"));
+      const details = [
+        titleCase(gateway.strategy),
+        "generation " + formatIdentifier(gateway.generation),
+        formatCount(gateway.ready_members) + " ready",
+        formatCount(gateway.active_flows) + " active",
+        formatCount(gateway.pending_flows) + " pending"
+      ];
+      if (gateway.manual_member) details.push("pinned to " + gateway.manual_member);
+      if (gateway.probe) {
+        const probe = asObject(gateway.probe);
+        details.push("probe " + String(probe.target || "--") + " every " + formatDuration(probe.interval_ms));
+      }
+      heading.append(createElement("p", "section-meta", details.join(" / ")));
+      const headerActions = createElement("div", "gateway-actions");
+      headerActions.append(gatewayBadge(gateway.ready_members > 0 ? "ready" : "unavailable"));
+      if (gateway.manual_member && gateway.strategy !== "manual") {
+        headerActions.append(gatewayActionButton(
+          "Use strategy",
+          "automatic",
+          gateway.tag,
+          "",
+          "button--quiet",
+          false
+        ));
+      }
+      header.append(heading, headerActions);
+      card.append(header);
+
+      const wrap = createElement("div", "table-wrap table-wrap--records");
+      const table = createElement("table", "records-table records-table--gateways");
+      const head = createElement("thead");
+      const headRow = createElement("tr");
+      ["Member", "Readiness", "Health", "Latency evidence", "Load", "Outcomes", "Last event", "Actions"].forEach(function (label) {
+        headRow.append(createElement("th", "", label));
+      });
+      head.append(headRow);
+      const body = createElement("tbody");
+      asArray(gateway.members).forEach(function (memberValue) {
+        const member = asObject(memberValue);
+        const row = createElement("tr");
+
+        const identity = createElement("div");
+        identity.append(createElement("span", "cell-primary", member.tag || "--"));
+        identity.append(createElement("span", "cell-secondary", asArray(member.networks).map(titleCase).join(" + ") || "No networks"));
+        appendCell(row, "Member", identity);
+
+        const readiness = createElement("div");
+        readiness.append(gatewayBadge(member.readiness));
+        readiness.append(createElement("span", "cell-secondary", titleCase(member.reason) + " / " + titleCase(member.mode)));
+        appendCell(row, "Readiness", readiness);
+
+        const health = createElement("div");
+        health.append(gatewayBadge(member.health));
+        const freshness = titleCase(member.freshness) + (member.probe_in_flight ? " / probe running" : "");
+        health.append(createElement("span", "cell-secondary", freshness));
+        if (member.cooldown_remaining_ms !== undefined) {
+          health.append(createElement("span", "cell-secondary", formatDuration(member.cooldown_remaining_ms) + " cooldown"));
+        }
+        appendCell(row, "Health", health);
+
+        const latency = createElement("div");
+        latency.append(createElement(
+          "span",
+          "cell-primary",
+          member.latency_ewma_us === undefined ? "--" : formatRtt(finiteNumber(member.latency_ewma_us) / 1000)
+        ));
+        const observation = member.latency_age_ms === undefined
+          ? "no latency sample"
+          : titleCase(member.latency_source) + " " + formatDuration(member.latency_age_ms) + " ago";
+        latency.append(createElement("span", "cell-secondary", observation));
+        appendCell(row, "Latency evidence", latency);
+
+        const load = createElement("div");
+        load.append(createElement("span", "cell-primary", formatCount(member.active_flows) + " active"));
+        load.append(createElement("span", "cell-secondary", formatCount(member.pending_flows) + " pending"));
+        appendCell(row, "Load", load);
+
+        const counters = asObject(member.counters);
+        const outcomes = createElement("div");
+        outcomes.append(createElement(
+          "span",
+          "cell-primary",
+          "open " + formatCount(counters.open_successes) + " ok / " + formatCount(counters.open_failures) + " failed"
+        ));
+        outcomes.append(createElement(
+          "span",
+          "cell-secondary",
+          "flow " + formatCount(counters.flow_successes) + "/" + formatCount(counters.flow_failures) +
+            " / probe " + formatCount(counters.probe_successes) + "/" + formatCount(counters.probe_failures)
+        ));
+        outcomes.append(createElement(
+          "span",
+          "cell-secondary",
+          formatCount(counters.ejections) + " ejections / " + formatCount(counters.recoveries) + " recoveries"
+        ));
+        appendCell(row, "Outcomes", outcomes);
+
+        const lastEvent = createElement("div");
+        lastEvent.append(createElement(
+          "span",
+          "cell-primary",
+          member.last_selection_reason
+            ? titleCase(member.last_selection_reason) + " / " + formatDuration(member.last_selected_age_ms) + " ago"
+            : "Never selected"
+        ));
+        lastEvent.append(createElement(
+          "span",
+          member.last_error ? "cell-secondary gateway-error" : "cell-secondary",
+          member.last_error
+            ? String(member.last_error) + " / " + formatDuration(member.last_error_age_ms) + " ago"
+            : formatCount(counters.selections) + " selections / " + formatCount(counters.open_attempts) + " attempts"
+        ));
+        appendCell(row, "Last event", lastEvent);
+
+        const actions = createElement("div", "gateway-actions gateway-actions--member");
+        actions.append(
+          gatewayActionButton("Pin", "pin-member", gateway.tag, member.tag, "button--primary", gateway.manual_member === member.tag),
+          gatewayActionButton("Enable", "enable-member", gateway.tag, member.tag, "button--quiet", member.mode === "enabled"),
+          gatewayActionButton("Drain", "drain-member", gateway.tag, member.tag, "button--quiet", member.mode === "draining"),
+          gatewayActionButton("Disable", "disable-member", gateway.tag, member.tag, "button--danger-quiet", member.mode === "disabled")
+        );
+        appendCell(row, "Actions", actions);
+        body.append(row);
+      });
+      table.append(head, body);
+      wrap.append(table);
+      card.append(wrap);
+      elements.gatewayList.append(card);
+    });
+  }
+
+  async function applyGatewayAction(button) {
+    if (state.gatewayUpdating || !button || !button.dataset.gatewayAction) return;
+    const payload = {
+      balancer: button.dataset.balancer,
+      action: button.dataset.gatewayAction
+    };
+    if (button.dataset.member) payload.member = button.dataset.member;
+    state.gatewayUpdating = true;
+    elements.gatewayActionState.className = "inline-status gateway-action-state is-loading";
+    elements.gatewayActionState.textContent = "Applying " + titleCase(payload.action);
+    renderGateways();
+    updateRefreshControls();
+    try {
+      await requestJson(GATEWAY_ACTION_ENDPOINT, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(payload)
+      });
+      await refreshStatus("gateway");
+      elements.gatewayActionState.className = "inline-status gateway-action-state";
+      elements.gatewayActionState.textContent = "Applied " + titleCase(payload.action) + " to " + payload.balancer;
+      announce(elements.gatewayActionState.textContent);
+    } catch (error) {
+      if (error instanceof HttpError && error.status === 401) {
+        handleUnauthorized("Authentication required for gateway control");
+      }
+      elements.gatewayActionState.className = "inline-status gateway-action-state is-error";
+      elements.gatewayActionState.textContent = error && error.message ? error.message : "Gateway action failed";
+      announce(elements.gatewayActionState.textContent);
+    } finally {
+      state.gatewayUpdating = false;
+      if (state.status) renderGateways();
+      updateRefreshControls();
+    }
   }
 
   function pathEffectiveState(path) {
@@ -775,9 +1034,12 @@
         flow.flow_id,
         flow.session_id,
         flow.target,
-        flow.service,
-        flow.service_tag,
-        flow.service_index
+        flow.network,
+        flow.inbound_kind,
+        flow.inbound,
+        flow.outbound,
+        flow.balancer,
+        flow.balancer_member
       ].some(function (value) { return String(value === undefined || value === null ? "" : value).toLowerCase().includes(query); });
     });
     elements.flowsBody.replaceChildren();
@@ -786,7 +1048,27 @@
       const row = createElement("tr");
       appendCell(row, "Kind", badge(titleCase(flow.flow_kind), flow.flow_kind === "datagram" ? "warning" : "neutral"));
       appendCell(row, "Flow", formatIdentifier(flow.flow_id), "cell-mono");
-      appendCell(row, "Service", serviceLabel(flow));
+      const origin = createElement("div");
+      origin.append(createElement("span", "cell-primary", flow.inbound || "Unknown inbound"));
+      origin.append(createElement(
+        "span",
+        "cell-secondary",
+        [titleCase(flow.inbound_kind), String(flow.network || "").toUpperCase()]
+          .filter(Boolean)
+          .join(" / ")
+      ));
+      appendCell(row, "Origin", origin);
+      const egress = createElement("div");
+      egress.append(createElement("span", "cell-primary", flow.outbound || "Pending selection"));
+      if (flow.balancer) {
+        egress.append(createElement(
+          "span",
+          "cell-secondary",
+          "via " + flow.balancer +
+            (flow.balancer_member ? " / member " + flow.balancer_member : "")
+        ));
+      }
+      appendCell(row, "Egress", egress);
       appendCell(row, "Session", formatIdentifier(flow.session_id), "cell-mono");
       appendCell(row, "Target", flow.target ? String(flow.target) : "Multiple targets");
       appendCell(row, "Age", formatDuration(flow.age_ms));
@@ -1215,6 +1497,10 @@
     });
     elements.pathUnderlayFilter.addEventListener("change", renderPaths);
     elements.pathStateFilter.addEventListener("change", renderPaths);
+    elements.gatewayList.addEventListener("click", function (event) {
+      const button = event.target.closest("button[data-gateway-action]");
+      if (button && elements.gatewayList.contains(button)) applyGatewayAction(button);
+    });
     elements.sessionFilter.addEventListener("input", renderSessions);
     elements.peerSessionSelect.addEventListener("change", function () {
       state.selectedPeerSessionKey = elements.peerSessionSelect.value;

@@ -5,10 +5,10 @@ use super::{
     recv_server_tcp_path_event,
 };
 use crate::config::{
-    DEFAULT_OUTBOUND_CONNECT_TIMEOUT, MppPerformanceConfig, ResourceLimits, SecurityConfig,
+    DEFAULT_OUTBOUND_CONNECT_TIMEOUT, MppPerformanceConfig, ResourceLimits, ServerSecurityConfig,
     SharedSecret,
 };
-use crate::outbound::{DnsConfig, OutboundConfig};
+use crate::outbound::OutboundConfig;
 use crate::protocol::{
     Frame, PathId, PathUsage, ResetReason, SessionId, StreamDemandHint, StreamId, TargetAddr,
     UnderlayProtocol,
@@ -19,7 +19,7 @@ use crate::runtime::path::commands::{recv_reliable_path_command, reliable_path_c
 use crate::runtime::path::{PathProofObservation, ServerLocalPathProperties};
 use crate::runtime::peer_status::PeerStatusBroker;
 use crate::scheduler::TrafficClass;
-use crate::transport::encrypted::{EncryptedFramedStream, EncryptedFramedTransportError, PeerRole};
+use crate::transport::encrypted::{EncryptedFramedStream, EncryptedFramedTransportError};
 use bytes::Bytes;
 use std::net::SocketAddr;
 use std::time::{Duration, Instant};
@@ -110,7 +110,7 @@ async fn server_tcp_native_sender_deadline_wakes_an_idle_actor() {
 
 #[tokio::test]
 async fn server_tcp_terminal_reset_precedes_detach_and_preserves_shared_session() {
-    let security = SecurityConfig::encrypted(
+    let security = ServerSecurityConfig::for_test(
         SharedSecret::new(b"0123456789abcdef0123456789abcdef".to_vec())
             .expect("test shared secret"),
     );
@@ -120,7 +120,6 @@ async fn server_tcp_terminal_reset_precedes_detach_and_preserves_shared_session(
     } = new_identity_runtime(
         Vec::new(),
         OutboundConfig::Direct,
-        DnsConfig::default(),
         DEFAULT_OUTBOUND_CONNECT_TIMEOUT,
         security,
         MppPerformanceConfig::default(),
@@ -133,22 +132,14 @@ async fn server_tcp_terminal_reset_precedes_detach_and_preserves_shared_session(
         .await
         .expect("connect test TCP carrier");
     let (server_socket, _) = listener.accept().await.expect("accept test TCP carrier");
-    let mut client_framed = EncryptedFramedStream::with_cipher_suite(
-        client_socket,
-        context.security.secret.as_bytes(),
-        PeerRole::Client,
-        context.codec_limits,
-        context.security.cipher,
-    )
-    .expect("client encrypted carrier");
-    let mut server_framed = EncryptedFramedStream::with_cipher_suite(
-        server_socket,
-        context.security.secret.as_bytes(),
-        PeerRole::Server,
-        context.codec_limits,
-        context.security.cipher,
-    )
-    .expect("server encrypted carrier");
+    let client_tls = crate::transport::encrypted::test_client_tls_config();
+    let server_tls = &context.tls;
+    let (client_framed, server_framed) = tokio::join!(
+        EncryptedFramedStream::connect(client_socket, &client_tls, context.codec_limits),
+        EncryptedFramedStream::accept(server_socket, server_tls, context.codec_limits),
+    );
+    let mut client_framed = client_framed.expect("client TLS carrier");
+    let mut server_framed = server_framed.expect("server TLS carrier");
     client_framed
         .write_frame(&Frame::Ping { nonce: 1 })
         .await
@@ -180,7 +171,7 @@ async fn server_tcp_terminal_reset_precedes_detach_and_preserves_shared_session(
 
     let session_id = SessionId(202);
     let path_id = PathId(0);
-    let path_registration = context.reliable_streams.register_carrier_path(
+    let path_registration = context.reliable_streams.register_test_carrier_path(
         session_id,
         UnderlayProtocol::Tcp,
         path_id,

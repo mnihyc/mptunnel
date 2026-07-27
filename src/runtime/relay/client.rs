@@ -5,9 +5,10 @@
 //! evidence as unrelated local variables.
 
 use super::io::{
-    ReliableAckGapReinjectionProgress, ReliableRequestPathStaleness,
+    AuthoritativeStreamAckSnapshot, ReliableAckGapReinjectionProgress,
+    ReliableRequestPathStaleness, begin_reliable_stream_ack,
     stream_ack_gap_reinjection_frames_normalized, stream_ack_ranges_expose_authoritative_gap,
-    update_reinjection_authoritative_ack_snapshot, write_delivered_payloads,
+    update_reinjection_authoritative_ack_snapshot,
 };
 use super::lifecycle::{RelayAdditionalPathOpenTask, maybe_mark_live_relay_path_delivery};
 #[cfg(feature = "lab-diagnostics")]
@@ -18,8 +19,7 @@ use crate::model::timing::{
     reliable_data_ack_recovery_deadline, reliable_data_retransmission_interval,
 };
 use crate::model::work::reliable_critical_tail_reinjection_limit_bytes;
-use crate::mux::stream::{ReliableRecvStream, ReliableSendStream};
-use crate::protocol::frame::normalize_offset_ranges;
+use crate::mux::stream::{ReceiveOutcome, ReliableRecvStream, ReliableSendStream, StreamError};
 use crate::protocol::{OffsetRange, StreamId};
 use crate::runtime::error::RuntimeError;
 use crate::runtime::path::{ClientPathContext, PathDeliveryStats};
@@ -29,7 +29,6 @@ use crate::scheduler::{PathSnapshot, TrafficClass};
 use bytes::Bytes;
 use std::collections::{HashMap, HashSet};
 use std::time::Instant;
-use tokio::io::{AsyncWrite, AsyncWriteExt};
 
 pub(super) struct ClientRelayEndpointState {
     pub(super) local_open: bool,
@@ -53,8 +52,7 @@ pub(super) struct ClientRelayProgressState {
     pub(super) request_path_staleness: ReliableRequestPathStaleness,
     pub(super) last_recv_progress_sent_at: Instant,
     pub(super) last_send_ack_frontier: u64,
-    pub(super) last_send_ack_ranges: Vec<OffsetRange>,
-    pub(super) last_send_ack_complete: bool,
+    pub(super) last_send_ack: AuthoritativeStreamAckSnapshot,
     pub(super) data_ack_reinjection_at: Option<tokio::time::Instant>,
     pub(super) sender_retry_at: Option<tokio::time::Instant>,
     #[cfg(feature = "lab-diagnostics")]
@@ -165,8 +163,7 @@ impl ClientRelayState {
                 request_path_staleness: ReliableRequestPathStaleness::default(),
                 last_recv_progress_sent_at: now,
                 last_send_ack_frontier: 0,
-                last_send_ack_ranges: Vec::new(),
-                last_send_ack_complete: false,
+                last_send_ack: AuthoritativeStreamAckSnapshot::default(),
                 data_ack_reinjection_at: None,
                 sender_retry_at: None,
                 #[cfg(feature = "lab-diagnostics")]
@@ -267,22 +264,20 @@ pub(super) struct ClientStreamDataEffect {
     pub(super) fin_ready: bool,
 }
 
-/// Applies mux ordering and product writes as one event. The typed effect lets
-/// `control` make path-policy decisions only after delivery state is committed.
+/// Applies one original frame to mux and client delivery state without taking
+/// local-socket ownership. The relay I/O layer may therefore preserve
+/// per-path attribution for every frame and write several ready outcomes with
+/// one vectored transaction.
 #[allow(clippy::too_many_arguments)]
-pub(super) async fn apply_client_stream_data<S>(
+pub(super) fn apply_client_stream_data_state(
     state: &mut ClientRelayState,
     context: &ClientPathContext,
-    local: &mut S,
     recv_stream: &mut ReliableRecvStream,
     stream_id: StreamId,
     path_key: RelayPathKey,
     offset: u64,
     payload: Bytes,
-) -> Result<ClientStreamDataEffect, RuntimeError>
-where
-    S: AsyncWrite + Unpin,
-{
+) -> Result<(ClientStreamDataEffect, ReceiveOutcome), RuntimeError> {
     #[cfg(not(feature = "lab-diagnostics"))]
     let _ = stream_id;
     let previous_remote_offset = recv_stream.next_offset();
@@ -338,38 +333,25 @@ where
         state.progress.receive_hole_reinjection_attempts = 0;
         state.progress.interactive_response_pending = false;
     }
-    let delivered = outcome.delivered;
+    let delivered = &outcome.delivered;
     let delivered_payload_bytes = state.record_delivery(
         context,
         path_key,
         delivered.as_slice(),
         if delivered_progress { payload_len } else { 0 },
     );
-    #[cfg(feature = "lab-diagnostics")]
-    let write_started = Instant::now();
-    write_delivered_payloads(local, delivered.as_slice())
-        .await
-        .map_err(RuntimeError::Io)?;
-    #[cfg(feature = "lab-diagnostics")]
-    lab_perf_record(
-        "relay.local_write_wait",
-        write_started.elapsed(),
-        delivered_payload_bytes,
-    );
-    #[cfg(feature = "lab-diagnostics")]
-    let flush_started = Instant::now();
-    local.flush().await.map_err(RuntimeError::Io)?;
-    #[cfg(feature = "lab-diagnostics")]
-    lab_perf_record("relay.local_flush_wait", flush_started.elapsed(), 0);
 
-    Ok(ClientStreamDataEffect {
-        delivered_payload_bytes,
-        delivered_progress,
-        fin_ready: super::io::pending_stream_fin_ready(
-            recv_stream,
-            state.endpoint.pending_remote_fin_offset,
-        ),
-    })
+    Ok((
+        ClientStreamDataEffect {
+            delivered_payload_bytes,
+            delivered_progress,
+            fin_ready: super::io::pending_stream_fin_ready(
+                recv_stream,
+                state.endpoint.pending_remote_fin_offset,
+            ),
+        },
+        outcome,
+    ))
 }
 
 pub(super) struct ClientStreamAckContext<'a> {
@@ -403,7 +385,10 @@ pub(super) fn update_request_path_staleness(
     let has_reinjection_path =
         candidate.is_some_and(|path| sender.request_path_has_reinjection_path(remotes, path));
     let stale_path = state.progress.request_path_staleness.stale_path(
-        state.progress.last_send_ack_complete,
+        state
+            .progress
+            .last_send_ack
+            .has_unacknowledged_extent(send_stream.data_ack_frontier()),
         candidate,
         candidate_made_progress,
         has_reinjection_path,
@@ -468,8 +453,8 @@ pub(super) fn evaluate_client_data_ack_reinjection(
     let reinjection_event_budget =
         sender.reinjection_extra_event_budget_remaining(context.mux_limits);
     let has_multipath_reinjection_alternative = remotes.path_keys().len() > 1;
-    let authoritative_ack_complete = state.progress.last_send_ack_complete;
-    let authoritative_ack_ranges = state.progress.last_send_ack_ranges.as_slice();
+    let authoritative_ack_complete = state.progress.last_send_ack.complete();
+    let authoritative_ack_ranges = state.progress.last_send_ack.ranges();
     let reinjection = sender.data_ack_gap_reinjection_model(
         context,
         remotes,
@@ -614,7 +599,10 @@ pub(super) fn apply_client_stream_ack(
     stream_id: StreamId,
     complete: bool,
     ranges: Vec<OffsetRange>,
-) -> usize {
+) -> Result<usize, StreamError> {
+    // Capture one immutable assignment horizon before touching any ACK-owned
+    // cache, flight, queue, reservation, or recovery evidence.
+    let validated_ack = begin_reliable_stream_ack(ack_context.send_stream, complete, ranges)?;
     #[cfg(not(feature = "lab-diagnostics"))]
     let _ = stream_id;
     let ClientStreamAckContext {
@@ -627,21 +615,19 @@ pub(super) fn apply_client_stream_ack(
         path_snapshot,
         relay_lane,
     } = ack_context;
-    let normalized_ranges = normalize_offset_ranges(ranges);
-    update_reinjection_authoritative_ack_snapshot(
-        &mut state.progress.last_send_ack_ranges,
-        &mut state.progress.last_send_ack_complete,
-        complete,
-        &normalized_ranges,
-    );
+    let normalized_ranges = validated_ack.ranges();
     #[cfg(feature = "lab-diagnostics")]
     let previous_reinjection_bytes = send_stream.reinjection_bytes();
     let ack_outcome =
-        sender.apply_request_product_ack(context, remotes, send_stream, &normalized_ranges);
+        sender.apply_request_product_ack(context, remotes, send_stream, &validated_ack)?;
+    update_reinjection_authoritative_ack_snapshot(
+        &mut state.progress.last_send_ack,
+        &validated_ack,
+    );
     state.progress.last_send_ack_frontier = send_stream.data_ack_frontier();
     let data_ack_progress_paths = ack_outcome.data_ack_progress_paths;
     let ack = ack_outcome.mux;
-    sender_queue.release_normalized_acked_reinjections(&normalized_ranges);
+    sender_queue.release_normalized_acked_reinjections(normalized_ranges);
     update_request_path_staleness(
         state,
         sender,
@@ -689,7 +675,7 @@ pub(super) fn apply_client_stream_ack(
         ),
     );
     state.progress.last_stream_at = Instant::now();
-    ack.released_bytes
+    Ok(ack.released_bytes)
 }
 
 #[cfg(test)]

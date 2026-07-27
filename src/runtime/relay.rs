@@ -17,4 +17,4 @@ mod server;
 pub(super) use flow::*;
 #[cfg(test)]
 pub(super) use io::*;
-pub(in crate::runtime) use server::ServerReliableRelayService;
+pub(in crate::runtime) use server::{ServerReliableRelayContext, ServerReliableRelayService};

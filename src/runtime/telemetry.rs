@@ -5,6 +5,7 @@
 //! carrier writes prevents multipath replication and reinjection from inflating
 //! user-visible traffic.
 
+use crate::product::{BalancerId, FlowContext, InboundId, Network, OutboundId, TargetHost};
 use crate::protocol::{DatagramFlowId, SessionId, StreamId, TargetAddr};
 use std::collections::HashMap;
 use std::io;
@@ -27,23 +28,96 @@ pub(crate) fn active_flow_detail_capacity(max_streams: usize) -> usize {
 pub(crate) enum ProductFlowId {
     Reliable(StreamId),
     Datagram(DatagramFlowId),
+    NativeReliable,
+    NativeDatagram,
 }
 
 impl ProductFlowId {
     fn kind(self) -> ProductFlowKind {
         match self {
-            Self::Reliable(_) => ProductFlowKind::Reliable,
-            Self::Datagram(_) => ProductFlowKind::Datagram,
+            Self::Reliable(_) | Self::NativeReliable => ProductFlowKind::Reliable,
+            Self::Datagram(_) | Self::NativeDatagram => ProductFlowKind::Datagram,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ProductFlowOriginKind {
+    LocalInbound,
+    MppInbound,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct ProductFlowOrigin {
+    pub kind: ProductFlowOriginKind,
+    pub inbound: InboundId,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct ProductFlowSelection {
+    /// The concrete leaf pinned for this flow.
+    pub outbound: OutboundId,
+    /// The configured balancer, when selection passed through one.
+    pub balancer: Option<BalancerId>,
+    /// The concrete balancer member. This equals `outbound` for balanced flows.
+    pub member: Option<OutboundId>,
+}
+
+/// Immutable Product identity attached after routing and before payload I/O.
+///
+/// This scope deliberately contains no connector endpoint, credential, or
+/// carrier detail. A scoped telemetry handle is cloned once per flow; payload
+/// observation then touches only relaxed atomics.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct ProductFlowScope {
+    pub origin: ProductFlowOrigin,
+    pub network: Network,
+    pub target: TargetAddr,
+    pub selection: ProductFlowSelection,
+}
+
+impl ProductFlowScope {
+    pub(crate) fn from_flow(
+        origin_kind: ProductFlowOriginKind,
+        flow: &FlowContext,
+        outbound: OutboundId,
+        balancer: Option<BalancerId>,
+    ) -> Self {
+        let target = match flow.target().host() {
+            TargetHost::Domain(domain) => TargetAddr::Domain {
+                host: domain.as_str().to_string(),
+                port: flow.target().port().get(),
+            },
+            TargetHost::Ip(address) => TargetAddr::Ip(std::net::SocketAddr::new(
+                *address,
+                flow.target().port().get(),
+            )),
+        };
+        Self {
+            origin: ProductFlowOrigin {
+                kind: origin_kind,
+                inbound: flow.inbound().clone(),
+            },
+            network: flow.network(),
+            target,
+            selection: ProductFlowSelection {
+                member: balancer.as_ref().map(|_| outbound.clone()),
+                outbound,
+                balancer,
+            },
         }
     }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct ProductFlowMetadata {
+    pub display_id: u64,
     pub session_id: Option<SessionId>,
     pub flow_id: ProductFlowId,
+    pub network: Network,
     /// `None` denotes a reusable product association that can reach many targets.
     pub target: Option<TargetAddr>,
+    pub scope: Option<Arc<ProductFlowScope>>,
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -89,9 +163,13 @@ pub(crate) struct DatagramTelemetrySnapshot {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct ActiveProductFlowSnapshot {
+    pub display_id: u64,
     pub session_id: Option<SessionId>,
     pub flow_id: ProductFlowId,
+    pub network: Network,
     pub target: Option<TargetAddr>,
+    pub origin: Option<ProductFlowOrigin>,
+    pub selection: Option<ProductFlowSelection>,
     pub started_at: Instant,
     pub last_activity_at: Instant,
     pub io: ProductIoSnapshot,
@@ -207,6 +285,7 @@ struct RuntimeTelemetryInner {
     active_flow_capacity: usize,
     #[cfg(test)]
     next_local_datagram_flow_id: AtomicU64,
+    next_display_id: AtomicU64,
     next_registration_id: AtomicU64,
     active_flow_record_overflow: AtomicU64,
     active_flow_record_overflow_total: AtomicU64,
@@ -246,16 +325,32 @@ impl RuntimeTelemetryInner {
 #[derive(Debug, Clone)]
 pub(crate) struct RuntimeTelemetry {
     inner: Arc<RuntimeTelemetryInner>,
+    scope: Option<Arc<ProductFlowScope>>,
+    observe_unscoped: bool,
 }
 
 impl RuntimeTelemetry {
     pub(crate) fn new(active_flow_capacity: usize) -> Self {
+        Self::new_inner(active_flow_capacity, true)
+    }
+
+    /// Creates the single Product telemetry owner for one runtime generation.
+    ///
+    /// Its unscoped handle is intentionally inert: internal DNS/probe traffic
+    /// can reuse MPP contexts without entering Product totals. Concrete routed
+    /// flows enable observation by cloning a scoped handle.
+    pub(crate) fn generation_owner(active_flow_capacity: usize) -> Self {
+        Self::new_inner(active_flow_capacity, false)
+    }
+
+    fn new_inner(active_flow_capacity: usize, observe_unscoped: bool) -> Self {
         Self {
             inner: Arc::new(RuntimeTelemetryInner {
                 started_at: Instant::now(),
                 active_flow_capacity,
                 #[cfg(test)]
                 next_local_datagram_flow_id: AtomicU64::new(0),
+                next_display_id: AtomicU64::new(1),
                 next_registration_id: AtomicU64::new(1),
                 active_flow_record_overflow: AtomicU64::new(0),
                 active_flow_record_overflow_total: AtomicU64::new(0),
@@ -265,6 +360,16 @@ impl RuntimeTelemetry {
                 datagram_io: ProductIoCounters::default(),
                 datagram_flows: ProductFlowLifecycleCounters::default(),
             }),
+            scope: None,
+            observe_unscoped,
+        }
+    }
+
+    pub(crate) fn scoped(&self, scope: ProductFlowScope) -> Self {
+        Self {
+            inner: self.inner.clone(),
+            scope: Some(Arc::new(scope)),
+            observe_unscoped: false,
         }
     }
 
@@ -274,11 +379,7 @@ impl RuntimeTelemetry {
         stream_id: StreamId,
         target: TargetAddr,
     ) -> ProductFlowLease {
-        self.open_flow(ProductFlowMetadata {
-            session_id,
-            flow_id: ProductFlowId::Reliable(stream_id),
-            target: Some(target),
-        })
+        self.open_flow(session_id, ProductFlowId::Reliable(stream_id), Some(target))
     }
 
     pub(crate) fn open_datagram_flow(
@@ -287,11 +388,17 @@ impl RuntimeTelemetry {
         flow_id: DatagramFlowId,
         target: TargetAddr,
     ) -> ProductFlowLease {
-        self.open_flow(ProductFlowMetadata {
-            session_id,
-            flow_id: ProductFlowId::Datagram(flow_id),
-            target: Some(target),
-        })
+        self.open_flow(session_id, ProductFlowId::Datagram(flow_id), Some(target))
+    }
+
+    pub(crate) fn open_native_reliable_flow(&self, scope: ProductFlowScope) -> ProductFlowLease {
+        self.scoped(scope)
+            .open_flow(None, ProductFlowId::NativeReliable, None)
+    }
+
+    pub(crate) fn open_native_datagram_flow(&self, scope: ProductFlowScope) -> ProductFlowLease {
+        self.scoped(scope)
+            .open_flow(None, ProductFlowId::NativeDatagram, None)
     }
 
     /// Local display identities avoid adding entropy or I/O failure to forwarding.
@@ -305,15 +412,53 @@ impl RuntimeTelemetry {
                 .next_local_datagram_flow_id
                 .fetch_add(1, Ordering::Relaxed),
         );
-        self.open_flow(ProductFlowMetadata {
-            session_id,
-            flow_id: ProductFlowId::Datagram(flow_id),
-            target: None,
-        })
+        self.open_flow(session_id, ProductFlowId::Datagram(flow_id), None)
     }
 
-    fn open_flow(&self, metadata: ProductFlowMetadata) -> ProductFlowLease {
-        let kind = metadata.flow_id.kind();
+    fn open_flow(
+        &self,
+        session_id: Option<SessionId>,
+        flow_id: ProductFlowId,
+        target: Option<TargetAddr>,
+    ) -> ProductFlowLease {
+        let kind = flow_id.kind();
+        let enabled = self.observe_unscoped || self.scope.is_some();
+        if !enabled {
+            return ProductFlowLease {
+                counter: ProductFlowCounter {
+                    telemetry: self.clone(),
+                    flow: None,
+                    kind,
+                    enabled: false,
+                },
+                registration_id: None,
+                observed: false,
+                finished: false,
+            };
+        }
+        let display_id = self.inner.next_display_id.fetch_add(1, Ordering::Relaxed);
+        let network = match kind {
+            ProductFlowKind::Reliable => Network::Tcp,
+            ProductFlowKind::Datagram => Network::Udp,
+        };
+        let metadata = ProductFlowMetadata {
+            display_id,
+            session_id,
+            flow_id,
+            network,
+            target: self
+                .scope
+                .as_ref()
+                .map(|scope| scope.target.clone())
+                .or(target),
+            scope: self.scope.clone(),
+        };
+        debug_assert!(
+            metadata
+                .scope
+                .as_ref()
+                .is_none_or(|scope| scope.network == network)
+        );
         let started_elapsed_nanos = self.inner.elapsed_nanos();
         let (flow, registration_id) = {
             let mut active_flows = self
@@ -347,8 +492,10 @@ impl RuntimeTelemetry {
                 telemetry: self.clone(),
                 flow,
                 kind,
+                enabled: true,
             },
             registration_id,
+            observed: true,
             finished: false,
         }
     }
@@ -380,9 +527,21 @@ impl RuntimeTelemetry {
                 let last_activity_elapsed_nanos =
                     flow.last_activity_elapsed_nanos.load(Ordering::Relaxed);
                 ActiveProductFlowSnapshot {
+                    display_id: flow.metadata.display_id,
                     session_id: flow.metadata.session_id,
                     flow_id: flow.metadata.flow_id,
+                    network: flow.metadata.network,
                     target: flow.metadata.target.clone(),
+                    origin: flow
+                        .metadata
+                        .scope
+                        .as_ref()
+                        .map(|scope| scope.origin.clone()),
+                    selection: flow
+                        .metadata
+                        .scope
+                        .as_ref()
+                        .map(|scope| scope.selection.clone()),
                     started_at: self.inner.instant_at(flow.started_elapsed_nanos),
                     last_activity_at: self.inner.instant_at(last_activity_elapsed_nanos),
                     io: flow.io.snapshot(),
@@ -414,6 +573,7 @@ pub(crate) struct ProductFlowCounter {
     telemetry: RuntimeTelemetry,
     flow: Option<Arc<ActiveProductFlow>>,
     kind: ProductFlowKind,
+    enabled: bool,
 }
 
 impl ProductFlowCounter {
@@ -442,6 +602,9 @@ impl ProductFlowCounter {
     }
 
     fn record_to_peer(&self, bytes: u64, packets: u64) {
+        if !self.enabled {
+            return;
+        }
         self.telemetry
             .inner
             .io(self.kind)
@@ -453,6 +616,9 @@ impl ProductFlowCounter {
     }
 
     fn record_from_peer(&self, bytes: u64, packets: u64) {
+        if !self.enabled {
+            return;
+        }
         self.telemetry
             .inner
             .io(self.kind)
@@ -468,6 +634,7 @@ impl ProductFlowCounter {
 pub(crate) struct ProductFlowLease {
     counter: ProductFlowCounter,
     registration_id: Option<u64>,
+    observed: bool,
     finished: bool,
 }
 
@@ -485,6 +652,9 @@ impl ProductFlowLease {
             return;
         }
         self.finished = true;
+        if !self.observed {
+            return;
+        }
         if let Some(registration_id) = self.registration_id.take() {
             self.counter
                 .telemetry

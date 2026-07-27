@@ -24,7 +24,7 @@ fn address_retry_fits_alternates_inside_short_budget() {
 #[test]
 fn transient_probe_preserves_network_identity_but_isolates_session_state() {
     let path: PathSpec = "udp://127.0.0.1:443".parse().expect("UDP path");
-    let security = SecurityConfig::encrypted(
+    let security = ClientSecurityConfig::for_test(
         crate::config::SharedSecret::new(b"0123456789abcdef0123456789abcdef".to_vec())
             .expect("secret"),
     );
@@ -41,7 +41,12 @@ fn transient_probe_preserves_network_identity_but_isolates_session_state() {
             path_ordinal: 11,
         },
         session_id: SessionId(17),
+        candidate_selector: crate::transport::quic::QuicCandidateSelector::derive(
+            security.credential.id().as_str(),
+            security.credential.secret().as_bytes(),
+        ),
         security: Arc::new(vec![security]),
+        tls: Arc::new(vec![crate::transport::encrypted::test_client_tls_config()]),
         codec_limits: CodecLimits::default(),
         mux_limits: MuxLimits::default(),
         stream_frame_queue: 8,

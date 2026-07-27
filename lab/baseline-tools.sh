@@ -1,8 +1,9 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-base_dir="${MPTUNNEL_LAB_BASELINE_DIR:-/tmp/mptunnel-baselines}"
 script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+repo_root="$(cd "$script_dir/.." && pwd)"
+base_dir="${MPTUNNEL_LAB_BASELINE_DIR:-$repo_root/.tmp/lab/baselines}"
 lock_file="$script_dir/baseline-lock.json"
 mkdir -p "$base_dir"
 

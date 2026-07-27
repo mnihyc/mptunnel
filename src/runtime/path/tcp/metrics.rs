@@ -329,8 +329,11 @@ impl TcpMetricPublisher {
 fn warn_portable_tcp_capacity_fallback(error: Option<&std::io::Error>) {
     static WARN_ONCE: Once = Once::new();
     WARN_ONCE.call_once(|| {
-        eprintln!(
-            "warning: native TCP flight telemetry unavailable{}; multipath uses the portable Data ACK capacity fallback and may have lower throughput on high-bandwidth, high-latency links",
+        crate::observability::process_event!(
+            Warn,
+            "tcp",
+            "portable_capacity_fallback",
+            "native TCP flight telemetry unavailable{}; multipath uses the portable Data ACK capacity fallback and may have lower throughput on high-bandwidth, high-latency links",
             error.map_or(String::new(), |error| format!(" ({error})")),
         );
     });

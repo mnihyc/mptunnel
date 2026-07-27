@@ -1,27 +1,42 @@
-# Generate one random secret and replace REPLACE_ME in both client.toml and
-# server.toml before use. Keep that shared secret private.
+# Generate one random credential into ./mpp-credential.key and transfer that
+# file securely to both endpoints. Keep it outside source control.
 #
-# Linux/macOS: openssl rand -hex 32
-# PowerShell:   [guid]::NewGuid().ToString()
+# Linux/macOS: umask 077; openssl rand -hex 32 > mpp-credential.key
+# PowerShell:   (New-Guid).Guid | Set-Content -NoNewline mpp-credential.key
 
 log_level = "info"
+
+[[credentials]]
+id = "home-2026"
+principal = "home"
+secret = { from = "file", path = "mpp-credential.key" }
 
 [session]
 # Retain established proxy/TUN streams across a complete carrier outage.
 retention_timeout_ms = 300000
 
+[dns]
+default_plan = "system"
+
+[[dns.upstreams]]
+id = "system"
+transport = "system"
+
+[[dns.plans]]
+id = "system"
+upstreams = ["system"]
+
 # The management API is optional, loopback-only, and requires a separate random
 # operator token when enabled.
 # [management]
 # listen = ["127.0.0.1:7600"]
-# token = "replace-with-a-random-operator-token"
+# token = { from = "file", path = "management-token.key" }
 # dashboard = true
 
 [[inbounds]]
 tag = "local-socks"
 protocol = "socks5"
 listen = ["127.0.0.1:1080"]
-outbound = "remote-mpp"
 
 [[outbounds]]
 tag = "remote-mpp"
@@ -31,4 +46,14 @@ protocol = "mpp"
 endpoints = ["tcp://server.example.com:7443", "udp://server.example.com:7443"]
 
 [outbounds.security]
-secret = "REPLACE_ME"
+credential = "home-2026"
+tls_server_name = "server.example.com"
+tls_pinned_certificate_file = "server-cert.pem"
+
+[routing]
+
+[[routing.rules]]
+id = "default"
+action = "outbound"
+target = "remote-mpp"
+traffic_intent = "interactive"

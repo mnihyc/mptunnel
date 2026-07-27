@@ -98,6 +98,7 @@ pub(super) struct ClientTcpOpenStreamRequest {
     pub(super) attempt_id: ClientTcpOpenAttemptId,
     pub(super) target: TargetAddr,
     pub(super) lane: TrafficClass,
+    pub(super) advertised_recv_max_offset: u64,
     pub(super) open_deadline: tokio::time::Instant,
     pub(super) session_commands: ReliablePathCommandSender,
     pub(super) response: oneshot::Sender<ClientTcpOpenResponse>,
@@ -173,6 +174,7 @@ pub(super) async fn open_client_tcp_stream_on_connection(
         attempt_id,
         target,
         lane,
+        advertised_recv_max_offset,
         open_deadline,
         session_commands,
         response,
@@ -219,6 +221,17 @@ pub(super) async fn open_client_tcp_stream_on_connection(
                 stream_id,
                 target,
                 demand: stream_demand_hint_for_traffic_class(lane),
+            })
+            .await?;
+        // Initial opens publish the logical receive owner's starting credit.
+        // Attachments pass zero so accepting another carrier cannot widen the
+        // one shared receive window.
+        connection
+            .carrier
+            .writer
+            .write_frame(&Frame::StreamMaxData {
+                stream_id,
+                max_offset: advertised_recv_max_offset,
             })
             .await?;
         connection.carrier.writer.flush().await

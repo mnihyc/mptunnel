@@ -5,7 +5,7 @@
 
 use super::capacity::RequestTcpCapacityProbeLease;
 use super::client_connection::ClientTcpCarrierConnection;
-use crate::config::SecurityConfig;
+use crate::config::ClientSecurityConfig;
 #[cfg(feature = "lab-diagnostics")]
 use crate::lab_diagnostics::lab_diagnostic;
 use crate::model::capacity::reliable_capacity_measurement_session_limit_bytes;
@@ -20,6 +20,7 @@ use crate::runtime::path::state::ClientPathState;
 use crate::runtime::peer_status::{PeerStatusBroker, PeerStatusCarrier, PeerStatusSnapshotSource};
 use crate::scheduler::PathSnapshot;
 use crate::transport::PathSpec;
+use crate::transport::encrypted::TcpClientTlsConfig;
 use crate::transport::{CarrierNetworkProvider, CarrierPathIdentity};
 use std::sync::Arc;
 use std::time::Instant;
@@ -49,7 +50,7 @@ impl ClientTcpPathConnection {
             startup_metrics,
             carrier,
             peer_status,
-            path_proofs: PathProofTracker::default(),
+            path_proofs: PathProofTracker::from_limits(mux_limits),
             capacity: ClientTcpCapacityState::new(mux_limits),
         }
     }
@@ -66,7 +67,8 @@ pub(in crate::runtime) struct ClientTcpPathSessionRuntime {
     pub(in crate::runtime) path_index: usize,
     pub(in crate::runtime) carrier_identity: CarrierPathIdentity,
     pub(in crate::runtime) session_id: SessionId,
-    pub(in crate::runtime) security: Arc<Vec<SecurityConfig>>,
+    pub(in crate::runtime) security: Arc<Vec<ClientSecurityConfig>>,
+    pub(in crate::runtime) tls: Arc<Vec<TcpClientTlsConfig>>,
     pub(in crate::runtime) codec_limits: CodecLimits,
     pub(in crate::runtime) mux_limits: MuxLimits,
     pub(in crate::runtime) command_queue: usize,
@@ -85,10 +87,16 @@ impl ClientTcpPathSessionRuntime {
             .expect("TCP session path inventory matches its index")
     }
 
-    pub(in crate::runtime) fn security(&self) -> &SecurityConfig {
+    pub(in crate::runtime) fn security(&self) -> &ClientSecurityConfig {
         self.security
             .get(self.config_index)
             .expect("TCP session security inventory matches its index")
+    }
+
+    pub(in crate::runtime) fn tls(&self) -> &TcpClientTlsConfig {
+        self.tls
+            .get(self.config_index)
+            .expect("TCP session TLS inventory matches its index")
     }
 
     pub(super) fn observe_sender_transport_state(

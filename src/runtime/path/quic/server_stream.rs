@@ -6,10 +6,8 @@ use super::io::{
     udp_reliable_stream_frame_queue,
 };
 use super::server_writer::drain_server_udp_reliable_commands;
-use crate::model::capacity::reliable_stream_initial_advertised_window_bytes;
-use crate::protocol::{
-    Frame, PathId, ResetReason, SessionId, StreamId, TargetAddr, UnderlayProtocol,
-};
+use crate::model::capacity::RELIABLE_STREAM_ATTACHMENT_ACCEPT_MAX_OFFSET;
+use crate::protocol::{Frame, PathId, ResetReason, SessionId, StreamId, TargetAddr};
 use crate::runtime::error::RuntimeError;
 use crate::runtime::path::commands::{
     ReliablePathCommandReceivers, ReliablePathCommandSender, recv_reliable_path_command,
@@ -52,18 +50,15 @@ async fn write_udp_stream_accept(
     context: &ServerPathContext,
     path_registration: &ServerCarrierPathRegistration,
     stream_id: StreamId,
-    lane: TrafficClass,
     path_proofs: &mut PathProofTracker,
 ) -> Result<(), RuntimeError> {
     udp_path_write_frame(
         send,
         &Frame::StreamMaxData {
             stream_id,
-            max_offset: reliable_stream_initial_advertised_window_bytes(
-                UnderlayProtocol::Udp,
-                lane,
-                context.mux_limits,
-            ),
+            // The logical receive owner already published this direction's
+            // shared credit. Attachment acceptance must not widen it.
+            max_offset: RELIABLE_STREAM_ATTACHMENT_ACCEPT_MAX_OFFSET,
         },
         context.codec_limits,
     )
@@ -91,7 +86,9 @@ pub(super) async fn handle_server_udp_reliable_stream(
         target,
         lane,
     } = stream_context;
-    context.reliable_streams.validate_target(&target)?;
+    context
+        .reliable_streams
+        .validate_target(&path_registration, &target)?;
     let duplicate_open_target = target.clone();
     let (commands_tx, commands_rx) = reliable_path_command_channels(udp_path_command_queue(
         context.mux_limits,
@@ -102,7 +99,7 @@ pub(super) async fn handle_server_udp_reliable_stream(
         path_registration: path_registration.clone(),
         stream_id,
     };
-    let mut path_proofs = PathProofTracker::default();
+    let mut path_proofs = PathProofTracker::from_limits(context.mux_limits);
     match context
         .reliable_streams
         .open_or_attach(ServerStreamOpenRequest {
@@ -129,7 +126,6 @@ pub(super) async fn handle_server_udp_reliable_stream(
                 &context,
                 &path_registration,
                 stream_id,
-                lane,
                 &mut path_proofs,
             )
             .await?;
@@ -144,7 +140,7 @@ pub(super) async fn handle_server_udp_reliable_stream(
                 context.codec_limits,
             )
             .await?;
-            let _ = udp_path_finish_stream(&mut send);
+            let _ = udp_path_finish_stream(&mut send).await;
             return Ok(());
         }
         ServerStreamOpenOutcome::Rejected => {
@@ -157,7 +153,7 @@ pub(super) async fn handle_server_udp_reliable_stream(
                 context.codec_limits,
             )
             .await?;
-            let _ = udp_path_finish_stream(&mut send);
+            let _ = udp_path_finish_stream(&mut send).await;
             return Ok(());
         }
     }
@@ -385,7 +381,7 @@ async fn run_server_udp_reliable_stream_loop(
                             .reliable_streams
                             .detach_path(&path_registration, stream_id)
                             ?;
-                        let _ = udp_path_finish_stream(&mut send);
+                        let _ = udp_path_finish_stream(&mut send).await;
                         return Ok(());
                     }
                     Some(Ok(Frame::PathMetrics { metrics })) if metrics.path_id == path_id => {
@@ -428,7 +424,6 @@ async fn run_server_udp_reliable_stream_loop(
                                     &context,
                                     &path_registration,
                                     stream_id,
-                                    updated_lane,
                                     &mut path_proofs,
                                 )
                                 .await?;
@@ -448,7 +443,7 @@ async fn run_server_udp_reliable_stream_loop(
                                     context.codec_limits,
                                 )
                                 .await?;
-                                let _ = udp_path_finish_stream(&mut send);
+                                let _ = udp_path_finish_stream(&mut send).await;
                                 return Ok(());
                             }
                             ServerStreamOpenOutcome::Rejected => {
@@ -520,8 +515,11 @@ async fn run_server_udp_reliable_stream_loop(
                     }
                     Some(Ok(Frame::SessionClose { reason })) => return Err(RuntimeError::RemoteClosed(reason)),
                     Some(Ok(frame)) => {
-                        eprintln!(
-                            "warning: unexpected server QUIC reliable carrier frame: stream_id={} frame_kind={}",
+                        crate::observability::process_event!(
+                            Warn,
+                            "quic",
+                            "unexpected_reliable_frame",
+                            "unexpected server QUIC reliable carrier frame: stream_id={} frame_kind={}",
                             stream_id.0,
                             frame.kind_name(),
                         );

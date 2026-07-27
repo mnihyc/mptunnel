@@ -11,11 +11,21 @@ from pathlib import Path
 from typing import Any, Mapping
 
 
+RESULT_SCHEMA_VERSION = 1
+RUN_MANIFEST_SCHEMA_VERSION = 2
+MPTUNNEL_PROTOCOL_VERSION = 4
+MPTUNNEL_CARRIER_PRESENTATION = (
+    "tcp-tls13-no-alpn+quic-h3-post-data-rfc9297"
+)
+
 _SAFE_RUN_OVERRIDE = re.compile(
     r"(?:MPTUNNEL_MAX_(?:FRAME_BYTES|PAYLOAD_BYTES|ACK_RANGES|PATHS|STREAMS|"
-    r"STREAM_WINDOW_BYTES|REPAIR_BYTES|REORDER_BYTES|DATAGRAM_QUEUE_BYTES|"
-    r"PATH_FLIGHT_BYTES|RELIABLE_RELAY_CHUNK_BYTES)|"
+    r"QUIC_CONCURRENT_BIDI_STREAMS|STREAM_WINDOW_BYTES|REPAIR_BYTES|"
+    r"REORDER_BYTES|REINJECTION_CACHE_CHUNKS|REORDER_BUFFER_CHUNKS|"
+    r"RETAINED_RECEIVE_RANGES|DATAGRAM_QUEUE_BYTES|PATH_FLIGHT_BYTES|"
+    r"RELIABLE_RELAY_CHUNK_BYTES)|"
     r"MPTUNNEL_TCP_PATH_HEARTBEAT_(?:INTERVAL|TIMEOUT)_MS|"
+    r"MPTUNNEL_QUIC_PATH_(?:KEEP_ALIVE_INTERVAL|IDLE_TIMEOUT)_MS|"
     r"PATH_PROBE_(?:INTERVAL|TIMEOUT)_MS|"
     r"MPTUNNEL_LAB_OBJECT_MIB|"
     r"MPTUNNEL_LAB_(?:(?:LOWLAT|BALANCED|MILDLOSS|FAT|POOR)_"
@@ -27,6 +37,47 @@ _SAFE_RUN_OVERRIDE = re.compile(
 
 def _flag_enabled(value: Any) -> bool:
     return str(value).lower() in {"1", "true", "yes"}
+
+
+def _require_sha256(value: Any, field: str) -> str:
+    if not isinstance(value, str) or re.fullmatch(r"[0-9a-f]{64}", value) is None:
+        raise ValueError(f"{field} must be a lowercase SHA-256 digest")
+    return value
+
+
+def load_host_reproducibility(
+    path: str | Path, expected_sha256: str
+) -> tuple[dict[str, Any], dict[str, Any]]:
+    """Load one immutable host snapshot and derive its result-row identity."""
+
+    _require_sha256(expected_sha256, "host snapshot SHA-256")
+    try:
+        from host_snapshot import load_snapshot
+    except ModuleNotFoundError:
+        from lab.host_snapshot import load_snapshot
+
+    try:
+        snapshot = load_snapshot(path, expected_sha256)
+    except (OSError, ValueError, RuntimeError) as exc:
+        raise ValueError(str(exc)) from exc
+    source = snapshot["source"]
+    toolchain = snapshot["toolchain"]
+    validity = snapshot["validity"]
+    fields = {
+        "result_schema_version": RESULT_SCHEMA_VERSION,
+        "run_manifest_schema_version": RUN_MANIFEST_SCHEMA_VERSION,
+        "host_snapshot_schema_version": snapshot["schema_version"],
+        "host_validity_rules_version": validity["rules_version"],
+        "host_snapshot_sha256": expected_sha256,
+        "host_valid": validity["valid"],
+        "source_snapshot_sha256": source["snapshot_sha256"],
+        "cargo_lock_sha256": source["cargo_lock_sha256"],
+        "rustc_version": toolchain["rustc"]["version"],
+        "rustc_executable_sha256": toolchain["rustc"]["executable_sha256"],
+        "cargo_version": toolchain["cargo"]["version"],
+        "cargo_executable_sha256": toolchain["cargo"]["executable_sha256"],
+    }
+    return snapshot, fields
 
 
 def load_baseline_lock(
@@ -160,18 +211,47 @@ def enrich_reproducibility(row: dict[str, Any], metadata_value: Any) -> None:
     source_commit = metadata.get("source_commit")
     build_profile = metadata.get("mptunnel_build_profile")
     protocol_version = metadata.get("mptunnel_protocol_version")
+    carrier_presentation = metadata.get("mptunnel_carrier_presentation")
     source_tree_dirty = metadata.get("source_tree_dirty")
     build_features = metadata.get("mptunnel_build_features")
+    if metadata.get("result_schema_version") != RESULT_SCHEMA_VERSION:
+        raise ValueError(
+            f"result_schema_version must be {RESULT_SCHEMA_VERSION}"
+        )
+    if metadata.get("run_manifest_schema_version") != RUN_MANIFEST_SCHEMA_VERSION:
+        raise ValueError(
+            f"run_manifest_schema_version must be {RUN_MANIFEST_SCHEMA_VERSION}"
+        )
+    if metadata.get("host_snapshot_schema_version") != 1:
+        raise ValueError("host_snapshot_schema_version must be 1")
+    if metadata.get("host_validity_rules_version") != 1:
+        raise ValueError("host_validity_rules_version must be 1")
+    if not isinstance(metadata.get("host_valid"), bool):
+        raise ValueError("host_valid must be a boolean")
+    for field in (
+        "host_snapshot_sha256",
+        "source_snapshot_sha256",
+        "cargo_lock_sha256",
+        "rustc_executable_sha256",
+        "cargo_executable_sha256",
+    ):
+        _require_sha256(metadata.get(field), field)
+    for field in ("rustc_version", "cargo_version"):
+        if not isinstance(metadata.get(field), str) or not metadata[field]:
+            raise ValueError(f"{field} must be a non-empty string")
     if not isinstance(source_commit, str) or not source_commit:
         raise ValueError("source_commit must be a non-empty string")
     if not isinstance(build_profile, str) or not build_profile:
         raise ValueError("mptunnel_build_profile must be a non-empty string")
-    if (
-        isinstance(protocol_version, bool)
-        or not isinstance(protocol_version, int)
-        or protocol_version < 1
-    ):
-        raise ValueError("mptunnel_protocol_version must be a positive integer")
+    if protocol_version != MPTUNNEL_PROTOCOL_VERSION:
+        raise ValueError(
+            f"mptunnel_protocol_version must be {MPTUNNEL_PROTOCOL_VERSION}"
+        )
+    if carrier_presentation != MPTUNNEL_CARRIER_PRESENTATION:
+        raise ValueError(
+            "mptunnel_carrier_presentation does not match the current v4 "
+            "TCP/QUIC wire presentation"
+        )
     if not isinstance(source_tree_dirty, bool):
         raise ValueError("source_tree_dirty must be a boolean")
     if not isinstance(build_features, list) or not all(
@@ -184,6 +264,28 @@ def enrich_reproducibility(row: dict[str, Any], metadata_value: Any) -> None:
     row["mptunnel_build_profile"] = build_profile
     row["mptunnel_build_features"] = sorted(set(build_features))
     row["mptunnel_protocol_version"] = protocol_version
+    row["mptunnel_carrier_presentation"] = carrier_presentation
+    for field in (
+        "result_schema_version",
+        "run_manifest_schema_version",
+        "host_snapshot_schema_version",
+        "host_validity_rules_version",
+        "host_snapshot_sha256",
+        "host_valid",
+        "source_snapshot_sha256",
+        "cargo_lock_sha256",
+        "rustc_version",
+        "rustc_executable_sha256",
+        "cargo_version",
+        "cargo_executable_sha256",
+    ):
+        row[field] = metadata[field]
+    if not metadata["host_valid"]:
+        row["performance_comparable"] = False
+        row["performance_comparable_reason"] = (
+            "the versioned host validity rules rejected this run; inspect "
+            "host-snapshot.json for the retained reasons"
+        )
 
     runtime_fields = (
         "mptunnel_client_runtime",
@@ -223,12 +325,31 @@ def write_run_manifest(
     }
     lock_sha256 = env["BASELINE_LOCK_SHA256"]
     baseline_lock = load_baseline_lock(env["BASELINE_LOCK_FILE"], lock_sha256)
+    host_snapshot, host_fields = load_host_reproducibility(
+        env["HOST_SNAPSHOT_FILE"], env["HOST_SNAPSHOT_SHA256"]
+    )
+    product = json.loads(env["RESULT_REPRODUCIBILITY"])
+    validated_product: dict[str, Any] = {}
+    enrich_reproducibility(validated_product, product)
+    for field, value in host_fields.items():
+        if validated_product.get(field) != value:
+            raise ValueError(
+                f"product {field} does not match the frozen host snapshot"
+            )
+    source = host_snapshot["source"]
+    if validated_product["source_commit"] != source["commit"]:
+        raise ValueError("product source_commit does not match the host snapshot")
+    if validated_product["source_tree_dirty"] != source["tree_dirty"]:
+        raise ValueError("product source_tree_dirty does not match the host snapshot")
+
     manifest = {
-        "schema_version": 1,
+        "schema_version": RUN_MANIFEST_SCHEMA_VERSION,
+        "kind": "mptunnel.lab.run-manifest",
+        "result_schema_version": RESULT_SCHEMA_VERSION,
         "created_utc": datetime.now(timezone.utc).isoformat(),
         "result_file": env["RESULT_FILE"],
         "case_filter": env["CASE_FILTER_VALUE"],
-        "product": json.loads(env["RESULT_REPRODUCIBILITY"]),
+        "product": product,
         "workload": {
             "object_mib": int(env["OBJECT_MIB"]),
             "load_duration_seconds": float(env["LOAD_DURATION_SECONDS"]),
@@ -250,15 +371,16 @@ def write_run_manifest(
             "container_stats": env["CONTAINER_STATS_VALUE"],
             "management_snapshots": env["MANAGEMENT_SNAPSHOTS_VALUE"],
             "use_path_hints": env["USE_PATH_HINTS_VALUE"] == "1",
+            "require_competitor_baselines": (
+                env["REQUIRE_COMPETITOR_BASELINES_VALUE"] == "1"
+            ),
         },
         "containers": {
             role: {"image_id": env[f"{role.upper()}_IMAGE_ID"]}
             for role in ("client", "server", "target")
         },
-        "host": {
-            "kernel": env["HOST_KERNEL"],
-            "cpu_count": int(env["HOST_CPU_COUNT"]),
-            "memory_bytes": int(float(env["HOST_MEMORY_BYTES"])),
+        "host_snapshot": host_snapshot,
+        "runtime": {
             "docker_version": env["DOCKER_VERSION"],
             "compose_version": env["COMPOSE_VERSION"],
         },

@@ -1,7 +1,10 @@
 use super::super::next_server_carrier_path_instance_id;
 use super::super::test_support::{binding_for_underlay, output_entry_for_key, stream_data_frame};
-use super::ResponseStreamAttachOutcome;
-use crate::model::path::CarrierPathKey;
+use super::{
+    ResponseOutputAttachment, ResponseOutputAttachmentState, ResponsePathDetachOutcome,
+    ResponseStreamAttachOutcome,
+};
+use crate::model::path::{CarrierPathKey, PathPolicy};
 use crate::protocol::{OffsetRange, PathId, PathUsage, UnderlayProtocol};
 use crate::runtime::path::commands::{
     reliable_path_command_channels, try_recv_reliable_path_priority_command,
@@ -48,11 +51,58 @@ fn output_load_registration_tracks_lane_change_and_withdrawal() {
 
     let incarnation = binding
         .begin_path_detach(key, entry.path_instance_id)
+        .map(|outcome| match outcome {
+            ResponsePathDetachOutcome::Begun(incarnation) => incarnation,
+            ResponsePathDetachOutcome::Pending(_) => panic!("first detach must begin withdrawal"),
+        })
         .expect("attached output begins withdrawal");
     assert_eq!(entry.commands.active_flow_counts(), (0, 0));
 
     binding.complete_path_detach(key, entry.path_instance_id, incarnation);
     assert_eq!(entry.commands.active_flow_counts(), (0, 0));
+}
+
+#[test]
+fn exact_carrier_cannot_reattach_while_ordered_detach_is_pending() {
+    let (binding, key, _receivers) = binding_for_underlay(UnderlayProtocol::Tcp);
+    let entry = output_entry_for_key(&binding, key);
+    let incarnation = binding
+        .begin_path_detach(key, entry.path_instance_id)
+        .map(|outcome| match outcome {
+            ResponsePathDetachOutcome::Begun(incarnation) => incarnation,
+            ResponsePathDetachOutcome::Pending(_) => panic!("first detach must begin withdrawal"),
+        })
+        .expect("begin ordered detach");
+    assert_eq!(
+        binding.begin_path_detach(key, entry.path_instance_id),
+        Some(ResponsePathDetachOutcome::Pending(incarnation)),
+        "repeated control input must share the existing ordered detach"
+    );
+    let (commands, _replacement_receivers) = reliable_path_command_channels(8);
+    assert_eq!(
+        binding.attach_output(
+            ResponseOutputAttachment {
+                key,
+                path_instance_id: entry.path_instance_id,
+                local_policy: PathPolicy::default(),
+                commands,
+                state: ResponseOutputAttachmentState::default(),
+            },
+            TrafficClass::Throughput,
+        ),
+        ResponseStreamAttachOutcome::RejectedDuplicateLiveOutput,
+        "pending ordered lifecycle state must stay one-per-carrier incarnation"
+    );
+    assert_eq!(
+        binding
+            .outputs
+            .lock()
+            .expect("response outputs")
+            .detaching
+            .len(),
+        1
+    );
+    binding.complete_path_detach(key, entry.path_instance_id, incarnation);
 }
 
 #[test]

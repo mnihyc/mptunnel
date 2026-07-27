@@ -40,7 +40,7 @@ fn automatic_bulk_use_honors_every_operator_policy() {
         "expensive=true",
         "backup=true",
         "probe-only=true",
-        "bulk=false",
+        "bulk-allowed=false",
     ] {
         let path = format!("udp://127.0.0.1:10002?{query}")
             .parse::<PathSpec>()

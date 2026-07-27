@@ -275,6 +275,49 @@ impl ReliablePathStream {
         }
     }
 
+    /// Returns the ordered input backlog visible at this instant.
+    ///
+    /// Callers must snapshot this before a ready-only drain. The value is an
+    /// item bound, not permission to cross a lifecycle event.
+    pub(in crate::runtime) fn ready_frame_count(&self) -> usize {
+        match &self.frames {
+            ReliablePathStreamInput::Carrier(frames) => frames.len(),
+            ReliablePathStreamInput::Server { events, pending } => {
+                pending.len().saturating_add(events.len())
+            }
+        }
+    }
+
+    /// Takes one already-queued product frame without waiting.
+    ///
+    /// A server path-detach event is retained as an ordering boundary for the
+    /// ordinary `recv_frame` path; data batching must never process through it.
+    pub(in crate::runtime) fn try_recv_frame(&mut self) -> Option<Result<Frame, RuntimeError>> {
+        match &mut self.frames {
+            ReliablePathStreamInput::Carrier(frames) => frames.try_recv().ok(),
+            ReliablePathStreamInput::Server { events, pending } => {
+                if matches!(
+                    pending.front(),
+                    Some(ServerReliableStreamEvent::PathDetached { .. })
+                ) {
+                    return None;
+                }
+                if let Some(ServerReliableStreamEvent::Frame(frame)) = pending.pop_front() {
+                    return Some(Ok(frame));
+                }
+                match events.try_recv() {
+                    Ok(ServerReliableStreamEvent::Frame(frame)) => Some(Ok(frame)),
+                    Ok(boundary @ ServerReliableStreamEvent::PathDetached { .. }) => {
+                        pending.push_back(boundary);
+                        None
+                    }
+                    Err(mpsc::error::TryRecvError::Empty)
+                    | Err(mpsc::error::TryRecvError::Disconnected) => None,
+                }
+            }
+        }
+    }
+
     /// Client request control remains bound to the carrier that opened it;
     /// switchable response output must use response placement instead.
     pub(in crate::runtime) fn try_enqueue_request_control_frame(

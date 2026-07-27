@@ -6,7 +6,7 @@ use crate::runtime::error::RuntimeError;
 use crate::runtime::path::commands::ReliablePathCommandSender;
 use crate::scheduler::TrafficClass;
 use bytes::Bytes;
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
@@ -20,9 +20,10 @@ pub(in crate::runtime) struct PathProofObservation {
     pub(in crate::runtime) sent_at: Instant,
 }
 
-#[derive(Default)]
 pub(in crate::runtime) struct PathProofTracker {
     pending: HashMap<(PathId, u64), PendingPathProof>,
+    order: VecDeque<(PathId, u64)>,
+    limit: usize,
 }
 
 struct PendingPathProof {
@@ -31,6 +32,17 @@ struct PendingPathProof {
 }
 
 impl PathProofTracker {
+    pub(in crate::runtime) fn from_limits(mux_limits: MuxLimits) -> Self {
+        Self {
+            pending: HashMap::new(),
+            order: VecDeque::new(),
+            // Proof replies are control acknowledgements. Reusing the
+            // configured ACK-range envelope gives this correlation state the
+            // same finite sparse-control budget without adding byte-path work.
+            limit: mux_limits.max_ack_ranges.max(1),
+        }
+    }
+
     pub(in crate::runtime) fn record_sent_frame(&mut self, frame: &Frame) {
         let Frame::PathProofData {
             path_id,
@@ -41,13 +53,24 @@ impl PathProofTracker {
             return;
         };
         let bytes = u32::try_from(payload.len()).unwrap_or(u32::MAX);
-        self.pending.insert(
-            (*path_id, *proof_id),
+        let key = (*path_id, *proof_id);
+        while self.pending.len() >= self.limit {
+            let Some(oldest) = self.order.pop_front() else {
+                self.pending.clear();
+                break;
+            };
+            self.pending.remove(&oldest);
+        }
+        let replaced = self.pending.insert(
+            key,
             PendingPathProof {
                 bytes,
                 sent_at: Instant::now(),
             },
         );
+        if replaced.is_none() {
+            self.order.push_back(key);
+        }
         #[cfg(feature = "lab-diagnostics")]
         lab_diagnostic(
             "path_proof_tracker",
@@ -67,7 +90,8 @@ impl PathProofTracker {
         proof_id: u64,
         payload_bytes: u32,
     ) -> Option<PathProofObservation> {
-        let Some(pending) = self.pending.remove(&(path_id, proof_id)) else {
+        let key = (path_id, proof_id);
+        let Some(pending) = self.pending.remove(&key) else {
             #[cfg(feature = "lab-diagnostics")]
             lab_diagnostic(
                 "path_proof_tracker",
@@ -81,6 +105,9 @@ impl PathProofTracker {
             );
             return None;
         };
+        if let Some(index) = self.order.iter().position(|candidate| *candidate == key) {
+            self.order.remove(index);
+        }
         let bytes = pending.bytes.min(payload_bytes);
         #[cfg(feature = "lab-diagnostics")]
         lab_diagnostic(
@@ -100,6 +127,17 @@ impl PathProofTracker {
             elapsed: pending.sent_at.elapsed(),
             sent_at: pending.sent_at,
         })
+    }
+
+    #[cfg(test)]
+    pub(super) fn pending_len(&self) -> usize {
+        self.pending.len()
+    }
+}
+
+impl Default for PathProofTracker {
+    fn default() -> Self {
+        Self::from_limits(MuxLimits::default())
     }
 }
 

@@ -2,6 +2,47 @@ use super::super::estimator_test_support::*;
 use super::*;
 
 #[test]
+fn new_quic_path_epoch_discards_rate_confidence_and_bulk_proof() {
+    let mut tracker = UdpPathMetricTracker::default();
+    let congestion = quic_congestion(8 * 1024 * 1024, Some(500_000_000));
+    let mut stats = quinn::ConnectionStats::default();
+    stats.path.rtt = Duration::from_millis(50);
+    stats.path.cwnd = congestion.congestion_window;
+    stats.path.current_mtu = 1400;
+    let startup = tracker
+        .quic
+        .observe(stats, congestion, PathMetricDirection::ServerToClient);
+
+    let sample_bytes = 8 * 1024 * 1024_u64;
+    let established = tracker.quic.observe(
+        stats,
+        with_acked_bytes_elapsed(
+            with_delivery_evidence_written(congestion, sample_bytes),
+            sample_bytes,
+            QUIC_INITIAL_WINDOW_PACKETS as u64,
+            Duration::from_millis(200),
+        ),
+        PathMetricDirection::ServerToClient,
+    );
+    assert!(established.delivery_sample_count >= QUIC_INITIAL_WINDOW_PACKETS as u64);
+    assert!(established.delivery_sample_bytes >= sample_bytes);
+    assert!(established.bulk_proof_expires_at.is_some());
+
+    let mut migrated = with_delivery_evidence_written(congestion, sample_bytes);
+    migrated.path_epoch += 1;
+    let reset = tracker
+        .quic
+        .observe(stats, migrated, PathMetricDirection::ServerToClient);
+
+    assert_eq!(reset.delivery_sample_count, 0);
+    assert_eq!(reset.delivery_sample_bytes, 0);
+    assert!(!reset.ack_derived_data_seen);
+    assert_eq!(reset.last_delivery_sample_at, None);
+    assert_eq!(reset.bulk_proof_expires_at, None);
+    assert_eq!(reset.delivery_rate_bps, startup.delivery_rate_bps);
+}
+
+#[test]
 fn quic_bulk_proof_deadline_does_not_shrink_with_falling_rtt() {
     let sample_bytes = RELIABLE_STREAM_STARTUP_PRODUCT_WINDOW_BYTES / 2;
     let congestion = quic_congestion(sample_bytes, Some(100_000_000));

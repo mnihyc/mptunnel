@@ -1,5 +1,5 @@
 use super::*;
-use crate::config::{ResourceLimits, SecurityConfig, SharedSecret};
+use crate::config::{ClientSecurityConfig, ResourceLimits, SharedSecret};
 use crate::model::capacity::reliable_capacity_measurement_session_limit_bytes;
 use crate::model::path::{CarrierPathInstanceId, RelayPathInstance, RelayPathKey};
 use crate::protocol::StreamId;
@@ -29,7 +29,7 @@ fn request_tcp_capacity_test_context(path_count: usize) -> ClientPathContext {
                 .expect("request TCP capacity test path")
         })
         .collect();
-    let security = SecurityConfig::encrypted(
+    let security = ClientSecurityConfig::for_test(
         SharedSecret::new(b"0123456789abcdef0123456789abcdef".to_vec())
             .expect("request TCP capacity test secret"),
     );

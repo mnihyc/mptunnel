@@ -20,19 +20,42 @@ user ports. TUN mode needs host-approved network privileges.
 
 - **Linux**: TUN and route setup need `CAP_NET_ADMIN` or equivalent service
   capability. Ports below 1024 need `CAP_NET_BIND_SERVICE`.
-- **macOS**: packet-device and route/DNS configuration require an approved
-  privileged service or launchd arrangement.
-- **Windows**: package `wintun.dll` beside `mptunnel.exe`; device and route
-  changes require an elevated process or service wrapper.
+- **macOS**: proxy mode can run as an ordinary user. Product VPN packet flow
+  and route/DNS publication require a signed, entitled Network Extension host;
+  a privileged process supervisor alone is insufficient.
+- **Windows**: keep the package's architecture-matched `wintun.dll` beside
+  `mptunnel.exe`; managed VPN auto-discovers that sibling DLL. Wintun creation
+  and route/DNS changes require an elevated process or service wrapper.
 - **Android**: the embedding application obtains user `VpnService` consent,
   establishes the descriptor, and owns addresses, routes, MTU, revocation, JNI,
   and service lifecycle.
 
-Android hosts must provide both `runtime::PacketDeviceProvider` and
-`transport::CarrierNetworkProvider` to `runtime::run_with_host_providers`.
-Resolve each endpoint on the selected native network and protect or bind every
-TCP and QUIC socket before connect. The packet-device-only entry point uses the
-system carrier network and is not valid for a catch-all Android VPN.
+Catch-all Android hosts must call `runtime::run_with_vpn_host_providers` with:
+
+- a `platform::PacketDeviceProvider` for the established `VpnService`
+  descriptor;
+- a `transport::CarrierNetworkProvider` that resolves and constructs MPP
+  carrier sockets on the selected native network; and
+- one `transport::HostSocketProtector` that synchronously calls
+  `VpnService.protect` for the borrowed descriptor it receives.
+
+The same protector is applied exactly once to every carrier and
+MPTunnel-created native target/proxy/DNS TCP/UDP socket, after source binding
+and before connect or first send. Returning an error drops the socket and fails
+the egress attempt closed. Operating-system DNS policies are rejected before
+device or socket startup: OS resolver sockets are hidden from this callback and
+therefore cannot safely bypass a catch-all VPN. Configure literal-bootstrap or
+outbound-backed DNS instead.
+Never close or retain the borrowed descriptor; duplicate it explicitly if the
+host needs separate ownership. The carrier provider must only resolve,
+select/bind a native network, and create the socket; it must not invoke the
+protector independently. Apple packet-tunnel embeddings use the same callback
+for their equivalent native-network exclusion or binding.
+
+`run_with_packet_device_provider` and `run_with_host_providers` leave some
+egress socket classes on system behavior and are not valid for a catch-all
+embedded VPN. `run_with_all_host_providers` remains an advanced seam for hosts
+that deliberately own separate adapters.
 
 ## Service mode
 
@@ -46,8 +69,22 @@ systemd unit, launchd job, Windows SCM service, or Android component.
 backoff.
 
 Use the host service manager as the outer process guard. A Windows SCM wrapper
-or native adapter remains required; Android lifecycle callbacks remain owned by
-the embedding application.
+is optional operational integration rather than a missing VPN adapter; Android
+lifecycle callbacks remain owned by the embedding application.
+
+### Process logs
+
+`log_level` and `--log-level` accept `off`, `error`, `warn`, `info`, `debug`,
+or `trace`. The default output is one structured text record per line on
+stderr. Set `MPTUNNEL_LOG_FORMAT=json` for newline-delimited JSON with
+`timestamp_unix_ms`, `level`, `component`, `event`, `message`, and an optional
+suppressed-event count.
+
+Logs exist only at process lifecycle, control, saturation, and fault
+boundaries. Each call site has a fixed burst limit, records are length-bounded,
+and common authorization/token/password forms are redacted. There is no
+in-process log queue or per-packet success logging. Failed QUIC handshakes are
+pre-authentication attacker input and are intentionally silent.
 
 ## Config and validation
 
@@ -61,6 +98,27 @@ mptunnel --config ./config.toml
 The graph contains tagged `[[inbounds]]`, `[[outbounds]]`, and optional
 balancers. An inbound selects one outbound or balancer. MPP security and path
 endpoints belong to each MPP inbound/outbound rather than to a global path role.
+
+`tcp-forward` and `udp-forward` local inbounds require explicit non-zero
+listeners and one canonical `target`. TCP overload is closed immediately at
+`max_connections`; UDP silently drops new sources at `max_associations`,
+expires source associations at `idle_timeout_ms`, and bounds each datagram by
+`datagram_ttl_ms`. Both use the ordinary route/DNS/ACL/outbound/balancer path;
+they do not dial around configured outbounds.
+
+Gateway strategies are `manual`, `ordered-failover`, `round-robin`, `random`,
+`weighted-random`, `least-latency`, and `least-load`. Members may start
+`enabled`, `draining`, or `disabled`; only enabled members receive new flows.
+Optional destination or principal stickiness is bounded by both TTL and entry
+capacity. Active probes require a literal IP TCP target and run under one
+process-wide concurrency bound. Least-latency uses only fresh Product-owned
+end-to-end observations, while least-load uses Product flow leases. Neither
+strategy reads MPP carrier/path metrics.
+
+All member attempts for one flow share one absolute open deadline. A failed
+member may be retried only before the target connection or association commits.
+After commit, success/failure is passive health evidence and never authorizes
+transparent replay through another member.
 
 Use repeated explicit IPv4 and IPv6 listener/bind/resolver values. Do not rely
 on OS-specific dual-stack defaults. Egress DNS strategy and connect timeout
@@ -76,10 +134,78 @@ Use `mptunnel --help` and subcommand help as the complete option and environment
 variable reference. Validate configs in the target binary whenever possible;
 cross-target parsing can also be smoke-tested under Wine.
 
+## Operational CLI
+
+`config.toml` remains the only persistent profile. Operational commands do not
+create a second configuration format and do not start a runtime generation.
+
+Run the read-only doctor before first start or after editing the file:
+
+```bash
+mptunnel --config ./config.toml doctor
+```
+
+It strictly parses the complete config, resolves every referenced secret and
+TLS file, validates the target's managed-VPN lifecycle contract, reports the
+platform packet-device capability, and checks configured control endpoints.
+Literal-IP MPP UDP and other datagram endpoints are address-checked. Literal-IP
+TCP carrier, proxy, DoT, and DoH endpoints receive only a bounded connect
+probe; application destinations are never probed. Domain endpoints never use
+host/system DNS during doctor: they are reported as skipped because configured
+runtime DNS and routing own resolution and connection setup. A configured
+routed or source-bound literal endpoint is not dialled outside its owner.
+
+Each check is `PASS`, `WARN`, `FAIL`, or `INFO`. Invalid configuration,
+invalid target VPN configuration, or a failed explicitly requested
+`--management-address` check exits non-zero. A currently stopped configured
+runtime or unavailable remote endpoint is a warning and exits zero, so offline
+preflight remains useful. Doctor never changes host routes, DNS, caches, or
+runtime configuration.
+
+Explain the exact immutable Product route table without opening a socket:
+
+```bash
+mptunnel --config ./config.toml route explain \
+  --target api.example:443 \
+  --network tcp \
+  --source 127.0.0.1:41000 \
+  --principal local-user \
+  --inbound local-socks
+```
+
+Omitting `--resolved-ip` evaluates the pre-resolution stage. Supplying it
+evaluates post-resolution policy. Route explanation accepts only attributes
+that every live ingress supplies: destination, resolved IP, network, source,
+principal, and inbound. Output separately identifies the pre-resolution rule
+and DNS plan that owned resolution, then the selected stage rule, action,
+outbound or balancer, traffic intent, every rule's first mismatch, and the
+ID/publisher/revision/expiry/hash of each consulted signed rule set.
+
+Runtime status and DNS operations use only the authenticated versioned API:
+
+```bash
+mptunnel --config ./config.toml status
+mptunnel --config ./config.toml dns status
+mptunnel --config ./config.toml dns explain example.com
+mptunnel --config ./config.toml dns query example.com --type HTTPS
+mptunnel --config ./config.toml dns flush
+mptunnel --config ./config.toml dns flush --plan private
+```
+
+With `--config`, the client uses the first configured management listener and
+its resolved token. Without it, pass `--address` plus
+`--management-token-file` or `--management-token-env`. The address must be
+loopback. The client has fixed connection/I/O, HTTP header, body, and JSON
+bounds; rejects redirects, transfer encoding, duplicate framing headers and
+non-JSON responses; and never includes a token in errors, debug output, or
+rendered JSON. Status and DNS output is pretty JSON. DNS explain is read-only;
+DNS query performs the requested lookup; DNS flush is an explicit cache
+mutation.
+
 ## Path policy and status
 
 Path URI query values have two different owners. `backup`, `expensive`,
-`bulk-allowed`/`no-bulk`, `probe-only`, and `no-udp` are configured operator
+`bulk-allowed`, `probe-only`, and `no-udp` are configured operator
 restrictions for that path runtime; they remain in force until configuration or
 management policy changes them. Rate, RTT, and jitter are startup measurement
 priors that live evidence may replace. Neither category is a persistent
@@ -104,45 +230,118 @@ stream.
 ## Management API
 
 Enable HTTP with `[management].listen` or `--management-listen`. Every listener
-requires `[management].token` or `--management-token` and must use a loopback
-address. For remote access, terminate TLS in a same-host reverse proxy or use an
-SSH tunnel; the built-in HTTP server never binds directly to a non-loopback
-address. Enable the embedded page explicitly with `dashboard = true` or
-`--management-dashboard`; a browser then opens `/`.
+requires `[management].token`, `--management-token-file`, or
+`--management-token-env` and must use a loopback address. For remote access,
+terminate TLS in a same-host reverse proxy or use an SSH tunnel; the built-in
+HTTP server never binds directly to a non-loopback address. Enable the embedded
+page explicitly with `dashboard = true` or `--management-dashboard`; a browser
+then opens `/`.
 
-All data and controls are under `/api/`:
+TOML and CLI accept the management token only through a file or environment
+reference, for example
+`token = { from = "file", path = "management-token.key" }`. Secret bytes never
+belong in TOML, argv, diagnostics, or the runtime configuration API.
 
-- `GET /api/` returns the authenticated endpoint index and schema identifier.
-- `GET /api/health` is the only unauthenticated API route.
-- `GET /api/status` returns the complete cached snapshot.
-- `GET /api/paths` returns configured listeners, logical client paths, and live
+All data and controls are authenticated and live only under `/api/v1/`. There
+are no unversioned compatibility routes:
+
+- `GET /api/v1/` returns the endpoint index and schema identifier.
+- `GET /api/v1/health` returns the complete liveness/readiness/degraded
+  assessment. `GET /api/v1/health/live` gates only terminal generation
+  failure; `GET /api/v1/health/ready` gates serving readiness. Both use the
+  same response body.
+- `GET /api/v1/config` returns the canonical path, desired, active, runtime,
+  and pending revisions, plus the supported mutation endpoints and
+  precondition. It never returns the TOML document or resolved secrets.
+- `POST /api/v1/config/validate` accepts one complete, bounded UTF-8 document
+  with `Content-Type: application/toml`, validates the configuration and its
+  referenced material, and returns its revision without writing or reloading.
+- `POST /api/v1/config/apply` accepts the same complete document and requires
+  exactly one `If-Match: sha256:...` revision from `GET /api/v1/config`
+  (optionally quoted). It atomically persists only when the desired revision
+  still matches, and reports an unchanged document, live credential
+  publication, or a pending generation reload.
+- `GET /api/v1/status` returns the complete cached
+  `mptunnel.management.v4` snapshot, including sanitized local-inbound and
+  leaf-outbound inventory. Outbound entries expose only tag, connector kind,
+  and supported networks; proxy/carrier endpoints and credentials are absent.
+- `GET /api/v1/gateways` returns Product gateway/member readiness, freshness,
+  active/passive observation source, latency-sample source and age, load,
+  selection reason, last error, probe state, circuit cooldown, and monotonic
+  counters.
+- `GET /api/v1/dns/status` returns DNS generation, cache, in-flight query, and
+  upstream outcome counters plus FakeDNS allocation/recovery/capacity state.
+  `GET /api/v1/dns/explain?name=<domain>` explains policy selection, encrypted
+  upstream transport, and capture-only FakeDNS policy without sending a query.
+- `GET /api/v1/paths` returns configured listeners, logical client paths, and live
   server carrier instances with their actual lifecycle state.
-- `GET /api/traffic` returns monotonic product totals, one-second rates, and
+- `GET /api/v1/traffic` returns monotonic product totals, one-second rates, and
   five minutes of one-second trend samples.
-- `GET /api/sessions` returns authenticated MPP session ownership; `GET
-  /api/flows` returns the bounded active reliable/datagram product-flow detail.
-- `GET /api/diagnostics` returns local diagnostic capability and typed peer
+- `GET /api/v1/sessions` returns authenticated MPP session ownership; `GET
+  /api/v1/flows` returns bounded active reliable/datagram Product-flow detail.
+  Each record has a generation-local display ID, immutable origin inbound,
+  network, original requested target, concrete selected leaf, and the
+  balancer/member pair when selection used a balancer.
+- `GET /api/v1/diagnostics` returns local diagnostic capability and typed peer
   service/index/session selectors.
-- `POST /api/control/path` changes endpoint-local client path lifecycle policy.
-- `POST /api/diagnostics/peer` requests a sanitized peer snapshot.
+- `POST /api/v1/actions/path` changes endpoint-local client path lifecycle policy.
+- `POST /api/v1/gateways/actions` accepts only explicit `enable-member`,
+  `drain-member`, `disable-member`, `pin-member`, and `automatic` actions.
+- `POST /api/v1/dns/query` performs an explicit typed query; `POST
+  /api/v1/dns/cache/flush` flushes one named plan or all plans.
+- `POST /api/v1/diagnostics/peer` requests a sanitized peer snapshot.
 
-Static page assets and `GET /api/health` are unauthenticated so the browser and
-local health checks can load before authentication. Every runtime-data and control
-request requires `Authorization: Bearer <token>`. The default page retains it
-only in memory and browser session storage, not a URL or persistent local
-storage. The API has no CORS support and sends restrictive browser security
-headers.
+Configuration mutation is deliberately full-document only: there is no
+`PATCH`, field update, history, or diff API. An inbound credential-authority
+change may publish live only when it is the complete change. Every routing,
+DNS, transport, resource, timeout, client-credential, TLS, or other change is
+persisted and activates through a clean runtime-generation replacement.
+Management listener or authentication changes are rejected by the API and
+require a local file edit and restart.
+
+An identical TOML document is idempotent even if a referenced file was replaced.
+For an online certificate, key, CA, pin, proxy-password, or signed-rule-set
+rotation, write the material under a new versioned path and apply the document
+that names it. A normal process restart re-reads material at unchanged paths.
+Credential principal or secret rotation uses a new credential ID so overlap
+and retirement remain explicit.
+
+Persistence is activation-safe. A newly persisted document remains pending
+while the prior active document is the durable last-good configuration. The
+candidate becomes last-good only after every required service in its
+generation reports ready. Failure before readiness rolls back the canonical
+file, and startup recovery resolves an interrupted activation from the pending
+journal and last-good document; inconsistent external edits fail closed
+instead of being overwritten.
+
+Only static dashboard assets are unauthenticated. Every API request, including
+health probes, requires `Authorization: Bearer <token>`. The default page
+retains it only in memory and browser session storage, not a URL or persistent
+local storage. The API has no CORS support and sends restrictive browser
+security headers.
+
+`live` means the process can answer and its generation has not entered terminal
+failure. `ready` additionally requires a ready generation, a connected MPP
+outbound when one is configured, and at least one ready member in each
+configured gateway. `degraded` reports partial MPP/gateway/path loss, a pending
+configuration activation, or a queried DNS plan that has never produced a
+successful upstream result. Listener and DNS/session/gateway facts used for the
+decision are included in the response; inbound-only servers remain ready while
+waiting for clients.
 
 Tokens must contain 16-256 visible ASCII characters. The server rejects
 duplicate authorization/content-type headers, transfer encoding, ambiguous
 content lengths, pipelining, and non-origin request targets.
 
-Forwarded totals are monotonic logical product counters. `to_peer` counts bytes
+Forwarded totals come from one generation-owned Product observer and are
+monotonic logical Product counters. `to_peer` counts bytes
 or datagrams accepted from the local product source; `from_peer` counts bytes or
-datagrams delivered to the local product destination. They do not grow from carrier retransmission, MPP
-reinjection, or multipath copies. Path delivery rate, queue, and flight remain
-separate current carrier evidence. Numeric identifiers and monotonic byte
-totals are decimal strings so browser clients do not lose 64-bit precision.
+datagrams delivered to the local product destination. They do not grow from
+carrier retransmission, MPP reinjection, multipath copies, DNS connector work,
+or path probes. Native and MPP boundaries share the owner but never observe one
+flow twice. Path delivery rate, queue, and flight remain separate current
+carrier evidence. Numeric identifiers and monotonic byte totals are decimal
+strings so browser clients do not lose 64-bit precision.
 Per-flow detail is capped independently from forwarding capacity; aggregate
 counters remain exact. Diagnostics report both current and cumulative detail
 overflow, and per-session flow counts carry an explicit completeness flag.
@@ -168,6 +367,16 @@ Path control uses `enabled`, `suspect`, `failed`, or `disabled`. Enabling clears
 the operator disable but leaves a path suspect until fresh carrier liveness
 evidence restores it; management never manufactures an active observation.
 
+Gateway actions have the same evidence rule. Enabling a member permits new
+selection but does not invent a successful probe. `drain-member` immediately
+stops new selection while established flows finish on their existing leaf.
+`pin-member` is an explicit manual override; `automatic` returns a non-manual
+strategy to configured ranking. A balancer configured with strategy `manual`
+must always retain a pin and therefore rejects `automatic`. These actions have
+`runtime-generation` scope: persist the corresponding member mode or
+`manual_member` in TOML through the configuration API when it must survive a
+restart or configuration reload.
+
 ## Resource envelopes
 
 Leave `[resources]` unset first. These values are safety envelopes, not manual
@@ -190,6 +399,27 @@ transmission modes and not desired memory occupancy.
 | TCP heartbeat | 10 s / 30 s | idle TCP carrier liveness |
 | QUIC keep-alive / idle timeout | 10 s / 30 s | native QUIC carrier liveness |
 | outbound connect timeout | 10 s | target/upstream dial bound |
+
+`[admission]` is the independent Product envelope used before DNS, target
+connects, or other flow-opening I/O. Defaults are finite:
+
+| Field | Default | Purpose |
+| --- | ---: | --- |
+| `max_live_flows` | 4,096 | all established and opening Product TCP/UDP flows |
+| `max_concurrent_work` | 512 | simultaneous outbound connect transactions |
+| `max_live_flows_per_principal` | 1,024 | one identity across local and authenticated remote inbounds |
+| `max_live_flows_per_outbound` | 3,072 | flows pinned to one selected outbound |
+| `max_connects_per_outbound` | 256 | in-progress connects through one outbound |
+| `max_live_flows_per_target` | 256 | flows to one normalized domain/IP and port |
+| `max_connects_per_target` | 32 | in-progress connects to one normalized target |
+| `max_dns_work` | 128 | cache-miss/refresh DNS work across all plans |
+
+SOCKS5, HTTP CONNECT, fixed forwarding, TUN, and authenticated MPP server
+opens share this one generation owner. Their listener/source/association
+limits still compose at their narrower boundary. Permits release exactly on
+close, error, cancellation, or generation retirement and never enter payload
+forwarding. These fields do not derive from `[resources]`; raising a Core stream
+or queue budget never raises Product admission.
 
 Raise a bound only after diagnostics identify it as the limiting resource.
 Increasing a window cannot authorize a path, prove delivery rate, or force
@@ -338,58 +568,142 @@ address when source-address selection matters.
 
 ## Encryption
 
-All MPP paths are encrypted. TCP paths use the MPP record layer, which defaults
-to AES-256-GCM. Configure `chacha20-poly1305` on both peers when appropriate for
-the deployment CPU; the TCP record cipher is not negotiated. QUIC paths use TLS
-1.3 and QUIC packet protection through rustls; the MPP `cipher` setting does not
-select the QUIC TLS cipher suite.
+All MPP paths use TLS 1.3. TCP deliberately negotiates no ALPN, then uses one
+bounded exporter-bound binary admission prelude followed directly by raw MPP
+frames in TLS application data. Rejected unauthenticated TCP input is closed
+without application response bytes. TCP never changes into HTTP.
 
-The shared secret must be a random UUID or at least 32 bytes of high-entropy
-text. MPP derives domain-separated transport and authentication keys. Session
-and path authentication issue times are checked against the configured
-freshness window, 300 seconds by default.
+QUIC negotiates standard `h3`. Each encrypted request carries a
+credential-derived selector; the same gate requires HTTPS, authority equal to
+the negotiated TLS SNI, and exactly `/` without a query before request DATA
+reaches the MPP parser. Normal `SESSION_AUTH`, `PATH_JOIN`, replay, and
+freshness validation still follow. Reliable records use H3 DATA and UDP
+payloads use RFC 9297 datagrams. Ordinary, nonmatching, and rejected requests
+receive the same marker-free 404, and a successful response is withheld until
+full MPP authentication. Both carriers authenticate the same explicitly
+configured server certificate. The MPP application credential is independent
+and never derives the TLS identity or verifier. QUIC path groups require a DNS
+TLS identity because IP identities do not produce SNI; carrier endpoints may
+still be literal IP addresses. MPP carrier 0-RTT is disabled.
+
+The selector removes an unauthenticated MPP-parser oracle; it does not make the
+endpoint indistinguishable. Source-aware clients and observers can still
+fingerprint certificate/SNI, TLS/QUIC/H3 behavior and parameters, packet
+shape, timing, and the public response profile. MPTUNNEL is not a cover
+service. See the RFC's
+[TCP presentation](../RFC.md#101-tcp-carrier-presentation) and
+[HTTP/3 presentation](../RFC.md#102-http3-carrier-presentation) for the exact
+admission, request, DATA-record, and native-datagram contracts.
+
+Define named credentials globally and reference them from MPP inbounds and
+outbounds. Each key must be a random UUID or at least 32 bytes of high-entropy
+text loaded from a file or environment reference. Overlap old and new
+credential IDs during rotation; a server may map both to the same principal.
+Session and path authentication bind the credential ID and check issue time
+against the configured freshness window, 300 seconds by default. Revocation
+rejects new authentication immediately and retires only work admitted by that
+credential after its configured grace.
+
+Local SOCKS5 and HTTP CONNECT logins are declared once in `[[local_users]]`
+and referenced by inbound `users = [...]`. Each login maps explicitly to a
+Product principal, so routing and per-principal admission do not depend on the
+presented username. Local and upstream proxy passwords use the same
+file/environment reference shape as MPP credentials and the management token.
+Local proxy inbounds separately bound total connections, connections per
+source IP, connections per principal, and their authentication/header deadline
+under `[inbounds.admission]`; these limits never derive from Core capacity.
 
 ## Packaging
 
+The fixed local-Linux and GitHub-native build sequence is documented in
+[`docs/CI.md`](CI.md). Linux development and runtime testing are local;
+Android, native macOS, and native Windows release builds are authoritative only
+on the GitHub matrix.
+
 ```bash
-scripts/package-release.sh --target x86_64-unknown-linux-musl
-pwsh scripts/package-release.ps1 -Target x86_64-pc-windows-msvc
+packaging/package-release.sh --target x86_64-unknown-linux-musl
+pwsh packaging/package-release.ps1 -Target x86_64-pc-windows-msvc
 ```
 
-Release targets:
+The strict release contract maps build triples to user-facing names:
 
-- `x86_64-unknown-linux-musl`
-- `aarch64-unknown-linux-musl`
-- `x86_64-apple-darwin`
-- `aarch64-apple-darwin`
-- `x86_64-pc-windows-msvc`
-- `aarch64-pc-windows-msvc`
-- `aarch64-linux-android`
+| Rust build target | Public asset |
+| --- | --- |
+| `x86_64-unknown-linux-musl` | `mptunnel-linux-amd64.tar.gz` |
+| `aarch64-unknown-linux-musl` | `mptunnel-linux-arm64.tar.gz` |
+| `x86_64-pc-windows-msvc` | `mptunnel-windows-amd64.zip` |
+| `aarch64-pc-windows-msvc` | `mptunnel-windows-arm64.zip` |
+| `x86_64-apple-darwin` | `mptunnel-macos-amd64.zip` |
+| `aarch64-apple-darwin` | `mptunnel-macos-arm64.zip` |
+| `aarch64-linux-android` | `mptunnel-android-arm64.tar.gz` |
 
-Each archive contains the product binary, public configuration examples,
-README, license, security/contribution policy, protocol, and selected operator
-docs. Packaging emits a sibling SHA-256 checksum. Windows archives also contain
-the pinned architecture-matched Wintun DLL and upstream license. Packaging
-validates that artifact and links the MSVC C runtime statically; only a native
-Windows host can prove Wintun device, route, DNS, and service integration.
+Asset and extracted-directory names deliberately omit the version. This keeps
+latest-release URLs stable while the GitHub release and `mptunnel --version`
+remain authoritative for identity.
+
+Every archive contains exactly one product binary, a concise package README,
+`LICENSE`, and client/server TOML examples. Linux archives also contain a
+systemd service unit. Windows archives contain the pinned,
+architecture-matched Wintun DLL and its upstream license. macOS intentionally
+ships no privileged service definition. The Android archive contains the
+command-line core; it is not an APK, AAR, JNI bridge, or `VpnService`
+application.
 
 Linux release archives use musl targets and do not depend on a host glibc
-baseline. The Android aarch64 archive is a best-effort shell proxy executable;
-it is not an APK, AAR, `VpnService` integration, or proof of device runtime.
-Release CI inspects each archive's exact file manifest and binary architecture,
-rejects dynamic MSVC/UCRT imports, and requires static linkage for musl builds.
+baseline. Packaging normalizes archive order, timestamps, ownership, modes, and
+metadata; rebuilding an unchanged staging tree yields identical archive bytes.
+Release CI inspects each exact file manifest, binary architecture, and dynamic
+dependency closure. macOS dependencies must stay under operating-system
+dylib/framework roots, Android `NEEDED` entries must match the explicit
+NDK/system allowlist, Windows imports must be operating-system/API-set DLLs
+with no dynamic MSVC/UCRT, and musl builds must be static. Wintun remains a
+bundled, checksum-pinned DLL that is loaded at runtime rather than a PE import.
+
+The packaged systemd unit runs as `mptunnel` and permits writes only below
+`/etc/mptunnel`. Create that directory and install `config.toml` as the
+`mptunnel:mptunnel` account before enabling the unit. Directory write access is
+required for the management API's atomic persistent-config replacement;
+referenced credential and TLS private-key files should remain mode `0600`.
 
 ## Releases
 
-Stable tags must exactly match the `Cargo.toml` version and be newer than every
-published stable release. A tag runs format, clippy, Rust and lab-contract
-tests, seven linked native/NDK target builds, packaging, checksums, provenance
-attestation, GitHub Release publication, and a fresh-download asset check.
-`Release Check` validates a proposed tag without publishing.
+Stable tags must exactly match the `Cargo.toml` version. A new publication
+must also be newer than every published stable release; rerunning an existing
+published tag is an integrity-only path even after newer releases exist. A tag
+runs format, clippy, Rust and lab-contract tests, seven linked native/NDK
+target builds, deterministic packaging, provenance attestation, GitHub Release
+publication, and a fresh-download asset check. `Release Check` validates a
+proposed tag without publishing.
 
-The release archive does not include the benchmark crate, Docker lab scripts,
-generated results, or lab-only diagnostics. The production binary is built as
-`--bin mptunnel` without the `lab-diagnostics` feature.
+Exactly eight files are public: the seven normalized archives and one sorted
+`SHA256SUMS` manifest. Per-target build uploads are private one-day GitHub
+Actions staging artifacts. Version/build evidence is a separate private
+Actions artifact, and GitHub attestations remain provenance records; neither
+is passed to `gh release create`. The publish job rejects missing, additional,
+raw CI, sidecar, or provenance files before publication. It preflights an
+existing tag and creates an absent draft, resumes only a byte-exact matching
+draft, or verifies an exact already-published release without changing it.
+Mismatches fail closed. Only a draft created by the current run is eligible for
+failure/cancellation cleanup; a public release is never edited or deleted.
+
+Release archives do not include the benchmark crate, Docker lab scripts,
+generated results, lab-only diagnostics, RFC/development documents, or raw CI
+evidence. The production binary is built as `--bin mptunnel` without the
+`lab-diagnostics` feature.
+
+### Remaining installer gaps
+
+- Linux ships a systemd unit, but not a distribution package, user/group
+  creation script, automatic upgrade, or uninstall/rollback command.
+- macOS ships a foreground CLI without a root-by-default service definition,
+  signed/notarized application, package installer, privileged helper, or
+  complete native packet-tunnel adapter.
+- Windows ships Wintun beside the executable, but not an MSI/MSIX installer,
+  code signature, Start-menu integration, native SCM wrapper, or validated
+  route/DNS service lifecycle.
+- Android ships only the clearly labelled arm64 host/core command-line
+  artifact. An APK/AAB, AAR/JNI API, sample `VpnService`, consent UI, and
+  lifecycle integration remain absent.
 
 ## Verification policy
 

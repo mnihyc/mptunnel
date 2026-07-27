@@ -4,6 +4,7 @@
 //! the long-lived session actor, keeping unauthenticated sockets out of product
 //! and scheduling state.
 
+use super::admission::authenticate_prelude;
 use super::io::{encrypted_framed_peer_closed, spawn_encrypted_tcp_reader};
 use super::metrics::TcpMetricPublisher;
 use super::server_evidence::ServerTcpEvidenceState;
@@ -12,14 +13,15 @@ use super::server_writer::ServerTcpWriter;
 use crate::protocol::{Frame, UnderlayProtocol};
 use crate::runtime::error::RuntimeError;
 use crate::runtime::path::ServerLocalPathProperties;
-use crate::runtime::path::authentication::ServerPathAuthentication;
 use crate::runtime::path::commands::{
     reliable_path_command_channels, reliable_path_command_queue, reliable_path_writer_frame_queue,
 };
 use crate::runtime::path::server_context::{ServerLocalPath, ServerPathContext};
-use crate::transport::encrypted::{EncryptedFramedStream, PeerRole};
+use crate::transport::encrypted::EncryptedFramedStream;
 use tokio::net::TcpStream;
+use tokio::sync::OwnedSemaphorePermit;
 
+#[cfg(test)]
 pub(in crate::runtime) async fn handle_server_path(
     stream: TcpStream,
     local_path: ServerLocalPath,
@@ -30,47 +32,73 @@ pub(in crate::runtime) async fn handle_server_path(
             "TCP listener received non-TCP local path configuration",
         ));
     }
-    let mut tcp_metrics = TcpMetricPublisher::capture(&stream);
-    let mut framed = EncryptedFramedStream::with_cipher_suite(
-        stream,
-        context.security.secret.as_bytes(),
-        PeerRole::Server,
-        context.codec_limits,
-        context.security.cipher,
-    )?;
-    let authentication = ServerPathAuthentication::from_session_hello(
-        &context.security,
-        framed.read_frame().await?,
-    )?
-    .ok_or(RuntimeError::Protocol("expected SESSION_HELLO"))?;
-    let authenticated_session = authentication
-        .authenticate_session(framed.read_frame().await?)
-        .ok_or(RuntimeError::Protocol("invalid SESSION_AUTH"))?;
-    let path_join = authenticated_session
-        .authenticate_path_join(UnderlayProtocol::Tcp, framed.read_frame().await?)
-        .ok_or(RuntimeError::Protocol("invalid PATH_JOIN"))?;
-    if !context.accept_path_join_nonce(
-        path_join.session_id,
-        path_join.path_id,
-        UnderlayProtocol::Tcp,
-        path_join.nonce,
-    ) {
-        return Err(RuntimeError::Protocol("invalid PATH_JOIN"));
+    let authentication_slot = context.try_begin_authentication()?;
+    handle_server_path_with_authentication_slot(stream, local_path, context, authentication_slot)
+        .await
+}
+
+pub(in crate::runtime) async fn handle_server_path_with_authentication_slot(
+    stream: TcpStream,
+    local_path: ServerLocalPath,
+    context: ServerPathContext,
+    authentication_slot: OwnedSemaphorePermit,
+) -> Result<(), RuntimeError> {
+    if local_path.underlay() != UnderlayProtocol::Tcp {
+        return Err(RuntimeError::Protocol(
+            "TCP listener received non-TCP local path configuration",
+        ));
     }
+    let mut tcp_metrics = TcpMetricPublisher::capture(&stream);
+    let tls = &context.tls;
+    let admitted = tokio::time::timeout(context.security.authentication_timeout, async {
+        let mut framed = EncryptedFramedStream::accept(stream, tls, context.codec_limits).await?;
+        let tls_exporter = framed.tcp_admission_exporter()?;
+        let encoded = framed.read_tcp_admission().await?;
+        let Some(authenticated_session) = authenticate_prelude(
+            &context.security,
+            context.credential_admission.clone(),
+            &encoded,
+            &tls_exporter,
+        )?
+        else {
+            return Ok(None);
+        };
+        let path_join = authenticated_session
+            .authenticate_path_join(UnderlayProtocol::Tcp, framed.read_frame().await?)?
+            .ok_or(RuntimeError::Protocol("invalid PATH_JOIN"))?;
+        if !context.accept_path_join_nonce(
+            path_join.session_id,
+            path_join.credential_id.clone(),
+            path_join.path_id,
+            UnderlayProtocol::Tcp,
+            path_join.nonce,
+            path_join.issued_at_unix_secs,
+            path_join.verified_at_unix_secs,
+        ) {
+            return Err(RuntimeError::Protocol("invalid PATH_JOIN"));
+        }
+        let peer_usage = match framed.read_frame().await? {
+            Frame::PathStatus {
+                path_id: status_path_id,
+                sequence: 0,
+                usage,
+            } if status_path_id == path_join.path_id => usage,
+            _ => {
+                return Err(RuntimeError::Protocol(
+                    "invalid client TCP path usage advertisement",
+                ));
+            }
+        };
+        Ok::<_, RuntimeError>(Some((framed, path_join, peer_usage)))
+    })
+    .await
+    .map_err(|_| RuntimeError::AuthenticationRejected("authentication timed out"))??;
+    drop(authentication_slot);
+    let Some((mut framed, path_join, peer_usage)) = admitted else {
+        return Ok(());
+    };
     let session_id = path_join.session_id;
     let path_id = path_join.path_id;
-    let peer_usage = match framed.read_frame().await? {
-        Frame::PathStatus {
-            path_id: status_path_id,
-            sequence: 0,
-            usage,
-        } if status_path_id == path_id => usage,
-        _ => {
-            return Err(RuntimeError::Protocol(
-                "invalid client TCP path usage advertisement",
-            ));
-        }
-    };
     let local_metrics = local_path.startup_metrics(path_id);
     let path_registration = context.reliable_streams.register_carrier_path(
         session_id,
@@ -81,7 +109,8 @@ pub(in crate::runtime) async fn handle_server_path(
             policy: local_path.policy(),
             initial_metrics: Some(local_metrics),
         },
-    );
+        path_join.principal_permit,
+    )?;
     context
         .reliable_streams
         .record_peer_path_usage(&path_registration, 0, peer_usage);

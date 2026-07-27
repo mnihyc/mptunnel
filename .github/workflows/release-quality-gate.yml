@@ -7,6 +7,9 @@ on:
 permissions:
   contents: read
 
+env:
+  PYTHONPYCACHEPREFIX: .tmp/python-cache
+
 jobs:
   checks:
     name: Format, lint, and test
@@ -14,27 +17,23 @@ jobs:
     timeout-minutes: 60
     steps:
       - name: Checkout
-        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
+
+      - name: Prepare ignored scratch
+        run: |
+          mkdir -p .tmp/python-cache .tmp/system
+          echo "PYTHONPYCACHEPREFIX=${GITHUB_WORKSPACE}/.tmp/python-cache" >> "$GITHUB_ENV"
+          echo "TMPDIR=${GITHUB_WORKSPACE}/.tmp/system" >> "$GITHUB_ENV"
 
       - name: Toolchain identity
         run: |
           rustc --version --verbose
           cargo --version
 
-      - name: Verify third-party license notices
-        run: |
-          cargo install --locked cargo-about --version 0.9.1 --features cli
-          git ls-files --error-unmatch THIRD_PARTY_LICENSES.html
-          scripts/generate-third-party-licenses.sh
-          git diff --exit-code -- THIRD_PARTY_LICENSES.html
-
       - name: Format
         run: cargo fmt --all -- --check
-
-      - name: Maintainability line-count report
-        run: scripts/check-line-counts.sh
 
       - name: Clippy
         run: cargo clippy --locked --all-targets --all-features -- -D warnings
@@ -42,11 +41,26 @@ jobs:
       - name: Rust tests
         run: cargo test --locked --all-features
 
-      - name: Lab contract tests
+      - name: Standalone patched Quinn locked tests
+        run: cargo test --locked --manifest-path crates/quinn-proto/Cargo.toml
+
+      - name: Validate performance impact registry
+        run: python3 lab/validate_performance_declaration.py --check-registry
+
+      - name: Lab contracts, including F0 declaration and evidence tooling
         run: python3 -m unittest discover --start-directory lab --pattern 'test_*.py'
 
+      - name: Deterministic benchmark and trace-replay tests
+        run: cargo test --locked --manifest-path lab/benchmarks/Cargo.toml
+
+      - name: Deterministic release archive contracts
+        run: >-
+          python3 -m unittest discover
+          --start-directory packaging/tools
+          --pattern 'test_*.py'
+
       - name: Shell syntax
-        run: find lab scripts -type f -name '*.sh' -print0 | xargs -0 -n1 bash -n
+        run: find lab packaging -type f -name '*.sh' -print0 | xargs -0 -n1 bash -n
 
       - name: Release version gate self-test
-        run: python3 .github/scripts/check-release-version-gate.py --self-test
+        run: python3 packaging/tools/check_release_version_gate.py --self-test

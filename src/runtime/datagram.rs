@@ -1,12 +1,14 @@
 //! Product datagram orchestration across TCP and QUIC carrier paths.
 
 use super::RuntimeError;
-use crate::config::{ResourceLimits, SecurityConfig};
+use crate::config::ClientSecurityConfig;
 use crate::mux::MuxLimits;
 use crate::mux::datagram::DatagramError;
+use crate::performance::ResourceLimits;
 use crate::protocol::codec::CodecLimits;
 use crate::protocol::frame::datagram_feedback_range as protocol_datagram_feedback_range;
 use crate::protocol::{DatagramFlowId, DatagramId, OffsetRange, TargetAddr};
+use crate::transport::encrypted::TcpClientTlsConfig;
 use crate::transport::{CarrierNetworkProvider, PathSpec, SystemCarrierNetworkProvider};
 use bytes::Bytes;
 use std::collections::HashMap;
@@ -27,17 +29,16 @@ pub(super) use association::DatagramClientAssociation;
 pub(super) use association::DatagramClientReceive;
 pub(super) use edge::{
     UdpEdgeCompletion, UdpEdgeLane, UdpEdgeRequest, close_udp_edge_lanes,
-    dispatch_udp_edge_request, finish_udp_edge_completion, udp_edge_completion_queue,
+    dispatch_udp_edge_request, finish_udp_edge_completion, remove_udp_edge_lane,
+    udp_edge_completion_queue, udp_edge_queue_slots,
 };
 pub(super) use quic_session::UdpDatagramClientSession;
-pub(in crate::runtime) use server::ServerDatagramService;
+pub(in crate::runtime) use server::{ServerDatagramService, ServerDatagramServiceConfig};
 
 #[cfg(test)]
 pub(super) use association::{
     datagram_underlay_error_is_retryable, runtime_error_is_datagram_response_timeout,
 };
-#[cfg(test)]
-pub(super) use edge::udp_edge_queue_slots;
 #[cfg(test)]
 pub(super) use policy::datagram_feedback_retry_budget;
 #[cfg(test)]
@@ -167,7 +168,8 @@ pub(super) fn datagram_id_is_in_ranges(datagram_id: DatagramId, ranges: &[Offset
 
 pub async fn client_udp_datagram_round_trip(
     path: &PathSpec,
-    security: SecurityConfig,
+    security: ClientSecurityConfig,
+    tls: TcpClientTlsConfig,
     resources: ResourceLimits,
     target: TargetAddr,
     payload: Bytes,
@@ -176,6 +178,7 @@ pub async fn client_udp_datagram_round_trip(
     client_udp_datagram_round_trip_with_provider(
         path,
         security,
+        tls,
         resources,
         target,
         payload,
@@ -186,9 +189,14 @@ pub async fn client_udp_datagram_round_trip(
 }
 
 /// Runs a standalone QUIC datagram flow through a host-provided carrier network.
+#[allow(
+    clippy::too_many_arguments,
+    reason = "the diagnostic API mirrors one complete datagram operation without hidden global state"
+)]
 pub async fn client_udp_datagram_round_trip_with_provider(
     path: &PathSpec,
-    security: SecurityConfig,
+    security: ClientSecurityConfig,
+    tls: TcpClientTlsConfig,
     resources: ResourceLimits,
     target: TargetAddr,
     payload: Bytes,
@@ -198,6 +206,7 @@ pub async fn client_udp_datagram_round_trip_with_provider(
     client_udp_datagram_round_trip_with_limits(
         path,
         security,
+        tls,
         resources.into(),
         resources.into(),
         target,
@@ -211,7 +220,8 @@ pub async fn client_udp_datagram_round_trip_with_provider(
 #[allow(clippy::too_many_arguments)]
 async fn client_udp_datagram_round_trip_with_limits(
     path: &PathSpec,
-    security: SecurityConfig,
+    security: ClientSecurityConfig,
+    tls: TcpClientTlsConfig,
     codec_limits: CodecLimits,
     mux_limits: MuxLimits,
     target: TargetAddr,
@@ -230,6 +240,7 @@ async fn client_udp_datagram_round_trip_with_limits(
         path,
         0,
         security,
+        tls,
         codec_limits,
         mux_limits,
         open_deadline,

@@ -21,7 +21,7 @@ use crate::scheduler::TrafficClass;
 pub(in crate::runtime) use attachment::next_server_carrier_path_instance_id;
 pub(in crate::runtime) use attachment::{
     ResponseDispatchTarget, ResponseOutputAttachment, ResponseOutputAttachmentState,
-    ResponseSenderPathTarget, ResponseStreamAttachOutcome,
+    ResponsePathDetachOutcome, ResponseSenderPathTarget, ResponseStreamAttachOutcome,
 };
 use attachment::{ResponseStreamOutputEntry, ResponseStreamOutputs};
 use delivery::ResponseAckOrderingState;
@@ -130,17 +130,29 @@ impl ResponseStreamBinding {
         mux_limits: MuxLimits,
         session_tracker: Arc<ServerSessionTracker>,
     ) -> Arc<Self> {
-        Self::new_with_limits_tracker_and_path_instance(
+        // This test-only constructor stands in for a live authenticated
+        // carrier. Exercise the same session/principal invariant as production
+        // and release the temporary carrier reference after the product-flow
+        // registration has taken ownership.
+        session_tracker
+            .attach_authenticated_session(
+                session_id,
+                &crate::product::PrincipalPermit::for_test("test-peer"),
+            )
+            .expect("register test authenticated carrier");
+        let binding = Self::new_with_limits_tracker_and_path_instance(
             session_id,
             underlay,
             path_id,
             commands,
             lane,
             mux_limits,
-            session_tracker,
+            session_tracker.clone(),
             next_server_carrier_path_instance_id(),
             PathPolicy::default(),
-        )
+        );
+        session_tracker.detach_session(session_id);
+        binding
     }
 
     #[allow(clippy::too_many_arguments)]

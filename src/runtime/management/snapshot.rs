@@ -94,8 +94,11 @@ impl ManagementSnapshot {
             uptime_ms: 0,
             services: ManagementServices::default(),
             local_inbounds: Vec::new(),
+            outbounds: Vec::new(),
             summary: NumericSummary::default().finish(),
+            admission: Default::default(),
             traffic: TelemetryAggregate::default().traffic(),
+            gateways: Vec::new(),
             paths: Vec::new(),
             sessions: Vec::new(),
             flows: Vec::new(),
@@ -119,14 +122,7 @@ pub(super) struct TelemetryAggregate {
 }
 
 impl TelemetryAggregate {
-    pub(super) fn add(
-        &mut self,
-        service: &'static str,
-        service_index: usize,
-        service_tag: Option<String>,
-        snapshot: RuntimeTelemetrySnapshot,
-        now: Instant,
-    ) {
+    pub(super) fn add(&mut self, snapshot: RuntimeTelemetrySnapshot, now: Instant) {
         self.total.add_snapshot(snapshot.io);
         self.reliable_io.add_snapshot(snapshot.reliable.io);
         self.datagram_io.add_snapshot(snapshot.datagram.io);
@@ -145,7 +141,7 @@ impl TelemetryAggregate {
             snapshot
                 .active_flows
                 .into_iter()
-                .map(|flow| flow_status(service, service_index, service_tag.clone(), flow, now)),
+                .map(|flow| flow_status(flow, now)),
         );
     }
 
@@ -212,22 +208,15 @@ impl SessionInventory {
             let Some(session_id) = flow.session_id.as_ref() else {
                 continue;
             };
-            let key = (flow.service, flow.service_index, session_id.clone());
-            let session = self
+            let Some(session) = self
                 .sessions
-                .entry(key)
-                .or_insert_with(|| ManagementSessionStatus {
-                    service: flow.service,
-                    service_index: flow.service_index,
-                    service_tag: flow.service_tag.clone(),
-                    session_id: session_id.clone(),
-                    state: "active",
-                    carrier_count: 0,
-                    reference_count: None,
-                    active_reliable_flows: 0,
-                    active_datagram_flows: 0,
-                    active_flow_counts_complete,
-                });
+                .values_mut()
+                .find(|session| &session.session_id == session_id)
+            else {
+                // Native flows have no session. A scoped MPP flow should
+                // already have a carrier/session inventory owner.
+                continue;
+            };
             match flow.flow_kind {
                 "reliable" => {
                     session.active_reliable_flows = session.active_reliable_flows.saturating_add(1)

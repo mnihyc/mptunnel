@@ -43,6 +43,7 @@ struct DatagramClientProductFlow {
 struct PendingProductDatagram {
     target: TargetAddr,
     payload: Bytes,
+    traffic_class: TrafficClass,
     expires_at: tokio::time::Instant,
     retry_at: tokio::time::Instant,
     attempted_paths: Vec<RelayPathKey>,
@@ -216,11 +217,17 @@ impl DatagramClientAssociation {
         payload_bytes: usize,
         ttl_ms: u32,
     ) -> Option<UnderlayProtocol> {
-        datagram_underlay_candidates(context, payload_bytes, ttl_ms)
-            .first()
-            .map(|candidate| candidate.key.underlay)
+        datagram_underlay_candidates(
+            context,
+            payload_bytes,
+            ttl_ms,
+            TrafficClass::RealtimeDatagram,
+        )
+        .first()
+        .map(|candidate| candidate.key.underlay)
     }
 
+    #[cfg(test)]
     pub(in crate::runtime) async fn send_to_fresh_datagram_with_route_hint(
         &mut self,
         target: TargetAddr,
@@ -228,12 +235,30 @@ impl DatagramClientAssociation {
         ttl_ms: u32,
         route_hint: Option<RelayPathKey>,
     ) -> Result<(), RuntimeError> {
+        self.send_to_fresh_datagram_with_policy(
+            target,
+            payload,
+            ttl_ms,
+            route_hint,
+            TrafficClass::RealtimeDatagram,
+        )
+        .await
+    }
+
+    pub(in crate::runtime) async fn send_to_fresh_datagram_with_policy(
+        &mut self,
+        target: TargetAddr,
+        payload: Bytes,
+        ttl_ms: u32,
+        route_hint: Option<RelayPathKey>,
+        traffic_class: TrafficClass,
+    ) -> Result<(), RuntimeError> {
         self.prune_pending(tokio::time::Instant::now());
         let (flow_id, datagram_id, telemetry_counter) =
             self.allocate_product_datagram(target.clone())?;
         telemetry_counter.record_datagram_to_peer(payload.len() as u64);
         let expires_at = tokio::time::Instant::now() + Duration::from_millis(u64::from(ttl_ms));
-        let mut candidates = self.ranked_underlay_candidates(payload.len(), ttl_ms);
+        let mut candidates = self.ranked_underlay_candidates(payload.len(), ttl_ms, traffic_class);
         #[cfg(feature = "lab-diagnostics")]
         let requested_route_hint = route_hint;
         if let Some(route_hint) = route_hint
@@ -296,6 +321,7 @@ impl DatagramClientAssociation {
                         PendingProductDatagram {
                             target,
                             payload,
+                            traffic_class,
                             expires_at,
                             retry_at: (tokio::time::Instant::now() + retry_budget).min(expires_at),
                             attempted_paths,
@@ -382,8 +408,10 @@ impl DatagramClientAssociation {
         &mut self,
         payload_bytes: usize,
         ttl_ms: u32,
+        traffic_class: TrafficClass,
     ) -> Vec<DatagramUnderlayCandidate> {
-        let mut candidates = datagram_underlay_candidates(&self.context, payload_bytes, ttl_ms);
+        let mut candidates =
+            datagram_underlay_candidates(&self.context, payload_bytes, ttl_ms, traffic_class);
         if !candidates
             .iter()
             .any(|candidate| candidate.key.underlay == UnderlayProtocol::Udp)
@@ -524,7 +552,7 @@ impl DatagramClientAssociation {
 
         let ttl_ms = datagram_remaining_ttl_ms(pending.expires_at);
         let candidates = self
-            .ranked_underlay_candidates(pending.payload.len(), ttl_ms)
+            .ranked_underlay_candidates(pending.payload.len(), ttl_ms, pending.traffic_class)
             .into_iter()
             .filter(|candidate| !pending.attempted_paths.contains(&candidate.key))
             .collect::<Vec<_>>();
@@ -916,6 +944,7 @@ fn datagram_underlay_candidates(
     context: &ClientPathContext,
     payload_bytes: usize,
     ttl_ms: u32,
+    traffic_class: TrafficClass,
 ) -> Vec<DatagramUnderlayCandidate> {
     if ttl_ms == 0 {
         return Vec::new();
@@ -924,7 +953,7 @@ fn datagram_underlay_candidates(
     let mut candidates = Vec::new();
 
     for (underlay_rank, path_index) in context
-        .ordered_tcp_path_indices(TrafficClass::RealtimeDatagram, payload_bytes)
+        .ordered_tcp_path_indices(traffic_class, payload_bytes)
         .into_iter()
         .enumerate()
     {
@@ -932,8 +961,7 @@ fn datagram_underlay_candidates(
             underlay: UnderlayProtocol::Tcp,
             index: path_index,
         };
-        if let Some(eta_ms) =
-            context.reliable_relay_path_eta_ms(key, TrafficClass::RealtimeDatagram, payload_bytes)
+        if let Some(eta_ms) = context.reliable_relay_path_eta_ms(key, traffic_class, payload_bytes)
             && eta_ms <= freshness_budget_ms
         {
             candidates.push(DatagramUnderlayCandidate {

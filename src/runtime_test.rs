@@ -1,7 +1,6 @@
 use super::*;
 use crate::config::{DEFAULT_OUTBOUND_CONNECT_TIMEOUT, ResourceLimits, SharedSecret};
-use crate::ingress::ProxyAuthConfig;
-use crate::outbound::{DnsConfig, OutboundConfig};
+use crate::outbound::OutboundConfig;
 use crate::protocol::frame::{reliable_path_frame_pacing_bytes, reliable_stream_frame_extent};
 use crate::runtime::node::server::{ServerIdentityRuntime, new_identity_runtime};
 use crate::runtime::path::commands::{
@@ -24,8 +23,14 @@ use crate::transport::Endpoint;
 use crate::transport::tcp::bind_listener;
 use tokio::io::duplex;
 
-fn security() -> SecurityConfig {
-    SecurityConfig::encrypted(
+fn security() -> ClientSecurityConfig {
+    ClientSecurityConfig::for_test(
+        SharedSecret::new(b"0123456789abcdef0123456789abcdef".to_vec()).expect("secret"),
+    )
+}
+
+fn server_security() -> ServerSecurityConfig {
+    ServerSecurityConfig::for_test(
         SharedSecret::new(b"0123456789abcdef0123456789abcdef".to_vec()).expect("secret"),
     )
 }
@@ -96,6 +101,7 @@ async fn ping_client_udp_stream(
         }
     }
     crate::runtime::path::quic::io::udp_path_finish_stream(&mut stream.send)
+        .await
         .expect("finish UDP ping stream");
 }
 
@@ -136,9 +142,8 @@ fn server_runtime(outbound: OutboundConfig) -> ServerIdentityRuntime {
     new_identity_runtime(
         Vec::new(),
         outbound,
-        DnsConfig::default(),
         DEFAULT_OUTBOUND_CONNECT_TIMEOUT,
-        security(),
+        server_security(),
         MppPerformanceConfig::default(),
         ResourceLimits::default(),
     )
@@ -175,6 +180,42 @@ fn socks5_udp_relay_preserves_control_address_family() {
 
     assert_eq!(socks5_udp_relay_bind_addr(v4), SocketAddr::new(v4, 0));
     assert_eq!(socks5_udp_relay_bind_addr(v6), SocketAddr::new(v6, 0));
+}
+
+#[test]
+fn socks5_udp_association_is_owned_by_the_tcp_peer_and_one_udp_port() {
+    let control_ip = "192.0.2.10".parse().expect("control IP");
+    let wildcard = TargetAddr::Ip("0.0.0.0:0".parse().expect("wildcard endpoint"));
+    let mut binding = Socks5UdpPeerBinding::new(control_ip, &wildcard).expect("wildcard binding");
+
+    assert!(!binding.accept("192.0.2.11:40000".parse().expect("foreign peer")));
+    assert!(binding.accept("192.0.2.10:40001".parse().expect("first peer")));
+    assert!(binding.accept("192.0.2.10:40001".parse().expect("same peer")));
+    assert!(!binding.accept("192.0.2.10:40002".parse().expect("changed port")));
+
+    let explicit = TargetAddr::Ip("192.0.2.10:41000".parse().expect("explicit endpoint"));
+    let mut explicit_binding =
+        Socks5UdpPeerBinding::new(control_ip, &explicit).expect("explicit binding");
+    assert!(!explicit_binding.accept("192.0.2.10:40999".parse().expect("wrong port")));
+    assert!(explicit_binding.accept("192.0.2.10:41000".parse().expect("declared peer")));
+
+    let foreign = TargetAddr::Ip("192.0.2.11:41000".parse().expect("foreign endpoint"));
+    assert!(Socks5UdpPeerBinding::new(control_ip, &foreign).is_err());
+    let domain = TargetAddr::Domain {
+        host: "client.example".to_string(),
+        port: 41000,
+    };
+    assert!(Socks5UdpPeerBinding::new(control_ip, &domain).is_err());
+}
+
+#[test]
+fn tun_tcp_accept_tasks_share_the_configured_core_stream_ceiling() {
+    let limits = MuxLimits {
+        max_streams: 37,
+        ..MuxLimits::default()
+    };
+
+    assert_eq!(tun_tcp_flow_limit(limits), 37);
 }
 
 async fn reserve_tcp_path() -> PathSpec {
@@ -353,15 +394,14 @@ async fn spawn_socks5_udp_proxy_once() -> (Endpoint, tokio::task::JoinHandle<()>
         let (datagram, consumed) =
             socks5::parse_udp_datagram(&packet[..len]).expect("udp relay packet");
         assert_eq!(consumed, len);
-        assert_eq!(
-            datagram.target,
-            TargetAddr::Domain {
-                host: "example.com".to_string(),
-                port: 53,
-            }
-        );
+        let TargetAddr::Ip(target) = datagram.target else {
+            panic!("server must pin the post-DNS authorized SOCKS5 target to an IP literal");
+        };
+        assert!(target.ip().is_loopback());
+        assert_eq!(target.port(), 53);
         assert_eq!(datagram.payload, Bytes::from_static(b"ping"));
-        let response = socks5::udp_datagram(&datagram.target, b"pong").expect("udp relay response");
+        let response =
+            socks5::udp_datagram(&TargetAddr::Ip(target), b"pong").expect("udp relay response");
         relay
             .send_to(&response, peer)
             .await
@@ -419,61 +459,29 @@ async fn spawn_reliable_relay_heartbeat_blackhole(
     let listener = bind_listener(&path).await.expect("bind");
     let handle = tokio::spawn(async move {
         let (stream, _) = listener.accept().await.expect("accept");
-        let security = security();
-        let mut framed = EncryptedFramedStream::new(
+        let security = server_security();
+        let mut framed = EncryptedFramedStream::accept(
             stream,
-            security.secret.as_bytes(),
-            PeerRole::Server,
+            &crate::transport::encrypted::test_server_tls_config(),
             CodecLimits::default(),
         )
+        .await
         .expect("initialize encrypted stream");
-        let session_id = match framed.read_frame().await? {
-            Frame::SessionHello { session_id } => session_id,
-            _ => return Err(RuntimeError::Protocol("expected SESSION_HELLO")),
-        };
-        let authenticator = SessionAuthenticator::new(security.secret.as_bytes())?;
-        match framed.read_frame().await? {
-            Frame::SessionAuth {
-                session_id: auth_session_id,
-                nonce,
-                issued_at_unix_secs,
-                auth_tag,
-            } if auth_session_id == session_id
-                && authenticator.verify_session_auth(SessionAuthCheck {
-                    session_id,
-                    nonce,
-                    issued_at_unix_secs,
-                    tag: auth_tag,
-                    now_unix_secs: current_unix_secs()?,
-                    freshness_window_secs: security.auth_freshness_window.as_secs(),
-                }) => {}
-            _ => return Err(RuntimeError::Protocol("invalid SESSION_AUTH")),
-        }
-        let path_id = match framed.read_frame().await? {
-            Frame::PathJoin {
-                session_id: join_session_id,
-                path_id,
-                underlay,
-                nonce,
-                issued_at_unix_secs,
-                auth_tag,
-            } if join_session_id == session_id
-                && underlay == UnderlayProtocol::Tcp
-                && authenticator.verify_path_join(PathJoinAuthCheck {
-                    session_id,
-                    path_id,
-                    underlay,
-                    nonce,
-                    issued_at_unix_secs,
-                    tag: auth_tag,
-                    now_unix_secs: current_unix_secs()?,
-                    freshness_window_secs: security.auth_freshness_window.as_secs(),
-                }) =>
-            {
-                path_id
-            }
-            _ => return Err(RuntimeError::Protocol("invalid PATH_JOIN")),
-        };
+        let exporter = framed.tcp_admission_exporter()?;
+        let encoded = framed.read_tcp_admission().await?;
+        let authenticated = crate::runtime::path::tcp::admission::authenticate_prelude(
+            &security,
+            crate::runtime::path::authentication::ProductCredentialAdmission::from_security(
+                &security,
+            ),
+            &encoded,
+            &exporter,
+        )?
+        .ok_or(RuntimeError::Protocol("invalid TCP admission prelude"))?;
+        let joined = authenticated
+            .authenticate_path_join(UnderlayProtocol::Tcp, framed.read_frame().await?)?
+            .ok_or(RuntimeError::Protocol("invalid PATH_JOIN"))?;
+        let path_id = joined.path_id;
         match framed.read_frame().await? {
             Frame::PathStatus {
                 path_id: status_path_id,
@@ -528,6 +536,10 @@ async fn spawn_reliable_relay_heartbeat_blackhole(
                     ..
                 }
                 | Frame::StreamFin {
+                    stream_id: ack_stream_id,
+                    ..
+                }
+                | Frame::StreamMaxData {
                     stream_id: ack_stream_id,
                     ..
                 } if ack_stream_id == stream_id => {}
@@ -661,12 +673,12 @@ async fn udp_probe_prepares_cold_carrier_then_isolates_live_validation() {
     let provider = Arc::new(CountingCarrierNetworkProvider::default());
     let context = ClientPathContext::new_with_carrier_network(
         vec![crate::config::ClientPathConfig {
+            tls: crate::transport::encrypted::test_client_tls_config(),
             spec: path,
             security: security(),
         }],
         resources,
         None,
-        Vec::new(),
         5,
         provider.clone(),
     )
@@ -766,6 +778,9 @@ fn reliable_relay_sender_queue_budget_is_resource_gated() {
         max_stream_window_bytes: 1024 * 1024,
         max_repair_bytes: 1024 * 1024,
         max_reorder_bytes: 1024 * 1024,
+        max_reinjection_cache_chunks: 65_536,
+        max_reorder_buffer_chunks: 65_536,
+        max_retained_receive_ranges: 65_536,
         max_datagram_queue_bytes: 1024 * 1024,
         max_path_flight_bytes: 32 * 1024,
         max_reliable_relay_chunk_bytes: 32 * 1024,
@@ -1883,6 +1898,8 @@ fn server_registry_replaced_output_does_not_reuse_cached_bulk_metrics() {
             .is_some_and(|entry| entry.observation.has_bulk_rate_evidence)
     );
     drop(old_receivers);
+    let old_path_identity = server_carrier_identity(&old_path_registration);
+    drop(old_path_registration);
 
     let new_path_registration =
         registry.register_carrier_path(session_id, UnderlayProtocol::Tcp, path_id);
@@ -1905,7 +1922,7 @@ fn server_registry_replaced_output_does_not_reuse_cached_bulk_metrics() {
         ServerReliableStreamOpen::Existing
     ));
     registry.record_local_path_metrics(
-        server_carrier_identity(&old_path_registration),
+        old_path_identity,
         server_test_bulk_path_metrics(path_id, 300_000_000),
         false,
     );
@@ -2129,6 +2146,9 @@ fn reliable_stream_frame_queue_tracks_relay_chunk_byte_budget() {
         max_stream_window_bytes: 16 * 1024 * 1024,
         max_repair_bytes: 16 * 1024 * 1024,
         max_reorder_bytes: 16 * 1024 * 1024,
+        max_reinjection_cache_chunks: 65_536,
+        max_reorder_buffer_chunks: 65_536,
+        max_retained_receive_ranges: 65_536,
         max_datagram_queue_bytes: 4 * 1024 * 1024,
         max_path_flight_bytes: 4 * 1024 * 1024,
         max_reliable_relay_chunk_bytes: 256 * 1024,
@@ -2155,6 +2175,9 @@ fn reliable_stream_frame_queue_tracks_actual_attachment_payload() {
         max_stream_window_bytes: 16 * 1024 * 1024,
         max_repair_bytes: 16 * 1024 * 1024,
         max_reorder_bytes: 16 * 1024 * 1024,
+        max_reinjection_cache_chunks: 65_536,
+        max_reorder_buffer_chunks: 65_536,
+        max_retained_receive_ranges: 65_536,
         max_datagram_queue_bytes: 4 * 1024 * 1024,
         max_path_flight_bytes: 4 * 1024 * 1024,
         max_reliable_relay_chunk_bytes: 256 * 1024,
@@ -2185,6 +2208,9 @@ fn reliable_path_and_tcp_command_queues_follow_carrier_backpressure_models() {
         max_stream_window_bytes: 16 * 1024 * 1024,
         max_repair_bytes: 16 * 1024 * 1024,
         max_reorder_bytes: 16 * 1024 * 1024,
+        max_reinjection_cache_chunks: 65_536,
+        max_reorder_buffer_chunks: 65_536,
+        max_retained_receive_ranges: 65_536,
         max_datagram_queue_bytes: 4 * 1024 * 1024,
         max_path_flight_bytes: 4 * 1024 * 1024,
         max_reliable_relay_chunk_bytes: 256 * 1024,
@@ -2226,6 +2252,9 @@ fn reliable_path_command_queue_tracks_actual_payload_quantum() {
         max_stream_window_bytes: 16 * 1024 * 1024,
         max_repair_bytes: 16 * 1024 * 1024,
         max_reorder_bytes: 16 * 1024 * 1024,
+        max_reinjection_cache_chunks: 65_536,
+        max_reorder_buffer_chunks: 65_536,
+        max_retained_receive_ranges: 65_536,
         max_datagram_queue_bytes: 4 * 1024 * 1024,
         max_path_flight_bytes: 4 * 1024 * 1024,
         max_reliable_relay_chunk_bytes: 256 * 1024,
@@ -2691,7 +2720,7 @@ fn reliable_recv_progress_acks_reorder_gap_without_waiting_for_bulk_step() {
 fn reliable_recv_progress_acks_reinjection_horizon_advancement() {
     let mux_limits = MuxLimits {
         max_ack_ranges: 16,
-        max_stream_window_bytes: 64 * 1024,
+        max_stream_window_bytes: 256 * 1024,
         max_repair_bytes: 256 * 1024,
         max_reorder_bytes: 256 * 1024,
         max_path_flight_bytes: 256 * 1024,
@@ -2783,7 +2812,9 @@ fn reliable_relay_stall_watch_ignores_idle_streams_and_tracks_reinjectionable_wo
         false,
         mux_limits
     ));
-    send_stream.apply_ack(&[crate::protocol::OffsetRange { start: 0, end: 7 }]);
+    send_stream
+        .apply_ack(&[crate::protocol::OffsetRange { start: 0, end: 7 }])
+        .expect("ACK assigned stream bytes");
     assert!(!reliable_relay_stall_watch_active(
         &send_stream,
         &recv_stream,
@@ -3202,8 +3233,6 @@ fn server_registry_ignores_active_duplicate_same_path_input_without_output_repla
     };
 
     let (duplicate_commands, _duplicate_rx) = reliable_path_command_channels(4);
-    let duplicate_path_registration =
-        registry.register_carrier_path(session_id, UnderlayProtocol::Udp, PathId(0));
     let duplicate = registry
         .open_or_attach(ServerStreamOpenRequest {
             session_id,
@@ -3211,7 +3240,7 @@ fn server_registry_ignores_active_duplicate_same_path_input_without_output_repla
             target: target.clone(),
             lane: TrafficClass::Throughput,
             attachment: ServerStreamPathAttachment {
-                path_registration: duplicate_path_registration.clone(),
+                path_registration: first_path_registration.clone(),
                 commands: duplicate_commands,
                 max_frame_payload_bytes: reliable_relay_buffer_len(MuxLimits::default()),
             },

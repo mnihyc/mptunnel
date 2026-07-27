@@ -1,34 +1,63 @@
 //! QUIC endpoint, connection, authentication, and transport configuration.
 
+use super::native_datagram::NativeDatagramHub;
+use super::presentation::H3Presentation;
 use super::socket::endpoint_from_udp_socket;
 #[cfg(windows)]
 use super::socket::{bind_client_udp_socket, bind_server_udp_socket};
+use super::stream::DatagramFlowRegistry;
 use super::{
-    CongestionMetrics, InstrumentedBbrConfig, InstrumentedController, QuicCarrierError,
-    QuicCarrierTelemetry, RecvStream, SendStream,
+    CongestionMetrics, InstrumentedBbrConfig, InstrumentedController, QuicCandidateSelector,
+    QuicCandidateVerifier, QuicCarrierError, QuicCarrierTelemetry, RecvStream, SendStream,
 };
 use crate::mux::MuxLimits;
 use crate::transport::CarrierSocket;
+use crate::transport::encrypted::{TcpClientTlsConfig, TcpServerTlsConfig};
 use quinn::{ClientConfig, Endpoint as QuinnEndpoint, ServerConfig, TransportConfig, VarInt};
-use rustls::pki_types::{CertificateDer, PrivatePkcs8KeyDer, ServerName, UnixTime};
-use sha2::{Digest, Sha256};
 use std::net::SocketAddr;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use tokio::sync::Notify;
 
-const QUIC_CERT_DNS_NAME: &str = "mptunnel.invalid";
-const ED25519_PKCS8_PREFIX: &[u8] = &[
-    0x30, 0x2e, 0x02, 0x01, 0x00, 0x30, 0x05, 0x06, 0x03, 0x2b, 0x65, 0x70, 0x04, 0x22, 0x04, 0x20,
-];
 #[derive(Debug)]
 pub struct Endpoint {
     endpoint: QuinnEndpoint,
+    role: EndpointRole,
+    mux_limits: MuxLimits,
+}
+
+#[derive(Clone)]
+enum EndpointRole {
+    Client {
+        server_name: String,
+        candidate_selector: QuicCandidateSelector,
+    },
+    Server {
+        candidate_verifier: Arc<dyn QuicCandidateVerifier>,
+    },
+}
+
+impl std::fmt::Debug for EndpointRole {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Client { server_name, .. } => formatter
+                .debug_struct("EndpointRole::Client")
+                .field("server_name", server_name)
+                .finish_non_exhaustive(),
+            Self::Server { .. } => formatter
+                .debug_struct("EndpointRole::Server")
+                .finish_non_exhaustive(),
+        }
+    }
 }
 
 #[derive(Debug, Clone)]
 pub struct Connection {
     connection: quinn::Connection,
+    presentation: H3Presentation,
+    native_datagrams: NativeDatagramHub,
+    max_deferred_native_bytes: usize,
+    max_datagram_flows: usize,
     write_backlog: Arc<AtomicU64>,
     telemetry: Arc<QuicCarrierTelemetry>,
 }
@@ -36,24 +65,33 @@ pub struct Connection {
 impl Endpoint {
     pub async fn bind_server(
         addr: SocketAddr,
-        secret: &[u8],
+        tls: &TcpServerTlsConfig,
+        candidate_verifier: Arc<dyn QuicCandidateVerifier>,
         mux_limits: MuxLimits,
     ) -> Result<Self, QuicCarrierError> {
         #[cfg(not(windows))]
-        let endpoint = QuinnEndpoint::server(server_config(secret, mux_limits)?, addr)?;
+        let endpoint = QuinnEndpoint::server(server_config(tls, mux_limits)?, addr)?;
         #[cfg(windows)]
         let endpoint = {
             let socket = bind_server_udp_socket(addr)?;
-            endpoint_from_udp_socket(socket, Some(server_config(secret, mux_limits)?))?
+            endpoint_from_udp_socket(socket, Some(server_config(tls, mux_limits)?))?
         };
-        Ok(Self { endpoint })
+        Ok(Self {
+            endpoint,
+            role: EndpointRole::Server { candidate_verifier },
+            mux_limits,
+        })
     }
 
     pub async fn bind_client(
         addr: SocketAddr,
-        secret: &[u8],
+        tls: &TcpClientTlsConfig,
+        candidate_selector: QuicCandidateSelector,
         mux_limits: MuxLimits,
     ) -> Result<Self, QuicCarrierError> {
+        let server_name = tls
+            .quic_server_name_text()
+            .ok_or(QuicCarrierError::H3AuthorityRequiresDnsName)?;
         #[cfg(not(windows))]
         let mut endpoint = QuinnEndpoint::client(addr)?;
         #[cfg(windows)]
@@ -61,27 +99,48 @@ impl Endpoint {
             let socket = bind_client_udp_socket(addr)?;
             endpoint_from_udp_socket(socket, None)?
         };
-        endpoint.set_default_client_config(client_config(secret, mux_limits)?);
-        Ok(Self { endpoint })
+        endpoint.set_default_client_config(client_config(tls, mux_limits)?);
+        Ok(Self {
+            endpoint,
+            role: EndpointRole::Client {
+                server_name,
+                candidate_selector,
+            },
+            mux_limits,
+        })
     }
 
     /// Builds Quinn on a socket already prepared by the host network adapter.
     pub async fn bind_client_socket(
         socket: CarrierSocket,
-        secret: &[u8],
+        tls: &TcpClientTlsConfig,
+        candidate_selector: QuicCandidateSelector,
         mux_limits: MuxLimits,
     ) -> Result<Self, QuicCarrierError> {
+        let server_name = tls
+            .quic_server_name_text()
+            .ok_or(QuicCarrierError::H3AuthorityRequiresDnsName)?;
         let mut endpoint = endpoint_from_udp_socket(socket.into_udp_socket()?, None)?;
-        endpoint.set_default_client_config(client_config(secret, mux_limits)?);
-        Ok(Self { endpoint })
+        endpoint.set_default_client_config(client_config(tls, mux_limits)?);
+        Ok(Self {
+            endpoint,
+            role: EndpointRole::Client {
+                server_name,
+                candidate_selector,
+            },
+            mux_limits,
+        })
     }
 
     pub async fn connect(&self, remote: SocketAddr) -> Result<Connection, QuicCarrierError> {
+        let EndpointRole::Client { server_name, .. } = &self.role else {
+            panic!("only client QUIC endpoints initiate connections");
+        };
         let connecting = self
             .endpoint
-            .connect(remote, QUIC_CERT_DNS_NAME)
+            .connect(remote, server_name)
             .map_err(QuicCarrierError::Connect)?;
-        Ok(Connection::from_quinn(connecting.await?))
+        Connection::from_quinn(connecting.await?, self.role.clone(), self.mux_limits).await
     }
 
     pub async fn accept(&self) -> Option<Connection> {
@@ -89,12 +148,17 @@ impl Endpoint {
             let incoming = self.endpoint.accept().await?;
             match incoming.await {
                 Ok(connection) => {
-                    return Some(Connection::from_quinn(connection));
+                    match Connection::from_quinn(connection, self.role.clone(), self.mux_limits)
+                        .await
+                    {
+                        Ok(connection) => return Some(connection),
+                        Err(_) => continue,
+                    }
                 }
-                Err(err) => {
-                    eprintln!("warning: QUIC carrier accept failed: {err}");
-                    continue;
-                }
+                // Pre-authentication failures are expected on a public UDP
+                // socket and are attacker-controlled. They must not allocate,
+                // amplify logs, or appear as authenticated carrier faults.
+                Err(_) => continue,
             }
         }
     }
@@ -105,7 +169,11 @@ impl Endpoint {
 }
 
 impl Connection {
-    fn from_quinn(connection: quinn::Connection) -> Self {
+    async fn from_quinn(
+        connection: quinn::Connection,
+        role: EndpointRole,
+        mux_limits: MuxLimits,
+    ) -> Result<Self, QuicCarrierError> {
         let telemetry = connection
             .congestion_state()
             .into_any()
@@ -113,43 +181,101 @@ impl Connection {
             .expect("QUIC carrier must use the instrumented congestion controller")
             .telemetry
             .clone();
-        Self {
+        let concurrent_carrier_streams = mux_limits
+            .max_quic_concurrent_bidi_streams
+            .max(1)
+            .min(mux_limits.max_streams.max(1));
+        let native_route_queue = (mux_limits.max_datagram_queue_bytes / 1200).clamp(8, 256);
+        let native_datagrams = NativeDatagramHub::new(
+            connection.clone(),
+            mux_limits.max_datagram_queue_bytes,
+            concurrent_carrier_streams,
+            native_route_queue,
+        );
+        let presentation = match role {
+            EndpointRole::Client {
+                server_name,
+                candidate_selector,
+            } => {
+                H3Presentation::client(connection.clone(), server_name, candidate_selector).await?
+            }
+            EndpointRole::Server { candidate_verifier } => {
+                H3Presentation::server(
+                    connection.clone(),
+                    concurrent_carrier_streams,
+                    candidate_verifier,
+                )
+                .await?
+            }
+        };
+        Ok(Self {
             connection,
+            presentation,
+            native_datagrams,
+            max_deferred_native_bytes: mux_limits.max_datagram_queue_bytes,
+            max_datagram_flows: mux_limits.max_streams,
             write_backlog: Arc::new(AtomicU64::new(0)),
             telemetry,
-        }
+        })
     }
 
     pub async fn open_bi(&self) -> Result<(SendStream, RecvStream), QuicCarrierError> {
-        let (send, recv) = self.connection.open_bi().await?;
+        let stream = self.presentation.open().await?;
+        let known_datagram_flows = Arc::new(std::sync::Mutex::new(DatagramFlowRegistry::new(
+            self.max_datagram_flows,
+        )));
+        let native_send = self.native_datagrams.sender(stream.request_stream_id);
+        let native_recv = self.native_datagrams.register(stream.request_stream_id)?;
         Ok((
             SendStream {
-                stream: send,
+                stream: stream.send,
+                native: native_send,
                 connection: self.connection.clone(),
                 write_backlog: self.write_backlog.clone(),
                 telemetry: self.telemetry.clone(),
-                encode_buffer: Vec::new(),
+                known_datagram_flows: known_datagram_flows.clone(),
+                priority: 0,
             },
-            RecvStream::new(recv),
+            RecvStream::new(
+                stream.recv,
+                native_recv,
+                known_datagram_flows,
+                self.max_deferred_native_bytes,
+            ),
         ))
     }
 
     pub async fn accept_bi(&self) -> Result<(SendStream, RecvStream), QuicCarrierError> {
-        let (send, recv) = self.connection.accept_bi().await?;
+        let stream = self.presentation.accept().await?;
+        let known_datagram_flows = Arc::new(std::sync::Mutex::new(DatagramFlowRegistry::new(
+            self.max_datagram_flows,
+        )));
+        let native_send = self.native_datagrams.sender(stream.request_stream_id);
+        let native_recv = self.native_datagrams.register(stream.request_stream_id)?;
         Ok((
             SendStream {
-                stream: send,
+                stream: stream.send,
+                native: native_send,
                 connection: self.connection.clone(),
                 write_backlog: self.write_backlog.clone(),
                 telemetry: self.telemetry.clone(),
-                encode_buffer: Vec::new(),
+                known_datagram_flows: known_datagram_flows.clone(),
+                priority: 0,
             },
-            RecvStream::new(recv),
+            RecvStream::new(
+                stream.recv,
+                native_recv,
+                known_datagram_flows,
+                self.max_deferred_native_bytes,
+            ),
         ))
     }
 
     pub fn close(&self) {
-        self.connection.close(VarInt::from_u32(0), b"closed");
+        self.connection.close(
+            VarInt::from_u32(h3::error::Code::H3_NO_ERROR.value() as u32),
+            b"closed",
+        );
     }
 
     pub fn is_closed(&self) -> bool {
@@ -181,23 +307,17 @@ impl Connection {
     pub fn congestion_metrics(&self) -> CongestionMetrics {
         let controller = self.connection.congestion_state();
         let metrics = controller.metrics();
-        let current_telemetry = controller
+        let instrumented = controller
             .into_any()
             .downcast::<InstrumentedController>()
-            .expect("QUIC carrier must use the instrumented congestion controller")
-            .telemetry
-            .clone();
-        if !Arc::ptr_eq(&current_telemetry, &self.telemetry) {
-            // Quinn creates a fresh controller for a cross-address migration.
-            // Existing streams still publish through the old telemetry owner,
-            // so fail this carrier instead of reporting split metric epochs.
-            self.connection.close(
-                VarInt::from_u32(1),
-                b"QUIC congestion controller ownership changed",
-            );
-        }
-        let snapshot = current_telemetry.snapshot();
+            .expect("QUIC carrier must use the instrumented congestion controller");
+        debug_assert!(
+            Arc::ptr_eq(&instrumented.telemetry, &self.telemetry),
+            "fresh QUIC paths must preserve the carrier telemetry owner"
+        );
+        let snapshot = instrumented.snapshot();
         CongestionMetrics {
+            path_epoch: snapshot.path_epoch,
             congestion_window: metrics.congestion_window,
             bytes_in_flight: snapshot.bytes_in_flight,
             pending_bytes: self.write_backlog.load(Ordering::Relaxed),
@@ -221,24 +341,32 @@ impl Connection {
     pub fn delivery_activity_notify(&self) -> Arc<Notify> {
         self.telemetry.delivery_activity_notify()
     }
+
+    #[cfg(test)]
+    pub fn negotiated_protocol(&self) -> Option<Vec<u8>> {
+        self.connection
+            .handshake_data()
+            .and_then(|data| data.downcast::<quinn::crypto::rustls::HandshakeData>().ok())
+            .and_then(|data| data.protocol)
+    }
 }
 
-fn server_config(secret: &[u8], mux_limits: MuxLimits) -> Result<ServerConfig, QuicCarrierError> {
-    let (cert_der, key_der) = secret_bound_certificate(secret)?;
-    let mut config = ServerConfig::with_single_cert(vec![cert_der], key_der.into())?;
+fn server_config(
+    tls: &TcpServerTlsConfig,
+    mux_limits: MuxLimits,
+) -> Result<ServerConfig, QuicCarrierError> {
+    let crypto = quinn::crypto::rustls::QuicServerConfig::try_from(tls.rustls_config())?;
+    let mut config = ServerConfig::with_crypto(Arc::new(crypto));
     config.transport = Arc::new(quic_transport_config(mux_limits)?);
     Ok(config)
 }
 
-fn client_config(secret: &[u8], mux_limits: MuxLimits) -> Result<ClientConfig, QuicCarrierError> {
-    let (cert_der, _) = secret_bound_certificate(secret)?;
-    let mut config = rustls::ClientConfig::builder()
-        .dangerous()
-        .with_custom_certificate_verifier(PinnedServerCertificate::new(cert_der))
-        .with_no_client_auth();
-    config.enable_sni = false;
+fn client_config(
+    tls: &TcpClientTlsConfig,
+    mux_limits: MuxLimits,
+) -> Result<ClientConfig, QuicCarrierError> {
     let mut config = ClientConfig::new(Arc::new(
-        quinn::crypto::rustls::QuicClientConfig::try_from(config)?,
+        quinn::crypto::rustls::QuicClientConfig::try_from(tls.rustls_config())?,
     ));
     config.transport_config(Arc::new(quic_transport_config(mux_limits)?));
     Ok(config)
@@ -254,9 +382,10 @@ fn quic_transport_config(mux_limits: MuxLimits) -> Result<TransportConfig, QuicC
     let send_window = (mux_limits.max_path_flight_bytes as u64)
         .max(mux_limits.max_reliable_relay_chunk_bytes as u64)
         .max(1);
-    let concurrent_streams = (mux_limits.max_quic_concurrent_bidi_streams as u64)
+    let concurrent_streams = mux_limits
+        .max_quic_concurrent_bidi_streams
         .max(1)
-        .min(mux_limits.max_streams as u64);
+        .min(mux_limits.max_streams.max(1)) as u64;
 
     let mut transport = TransportConfig::default();
     transport
@@ -264,7 +393,11 @@ fn quic_transport_config(mux_limits: MuxLimits) -> Result<TransportConfig, QuicC
         .receive_window(varint_saturating(connection_receive_window))
         .send_window(send_window)
         .max_concurrent_bidi_streams(varint_saturating(concurrent_streams))
-        .max_concurrent_uni_streams(0_u8.into())
+        // RFC 9114 requires a control stream and both QPACK streams in each
+        // direction. One additional short-lived reserved stream permits
+        // standards-compliant H3 greasing without unbounded unidirectional
+        // stream admission.
+        .max_concurrent_uni_streams(4_u8.into())
         .datagram_receive_buffer_size(Some(mux_limits.max_datagram_queue_bytes))
         .datagram_send_buffer_size(mux_limits.max_datagram_queue_bytes)
         .max_idle_timeout(Some(mux_limits.quic_path_idle_timeout.try_into()?))
@@ -276,95 +409,6 @@ fn quic_transport_config(mux_limits: MuxLimits) -> Result<TransportConfig, QuicC
 fn varint_saturating(value: u64) -> VarInt {
     VarInt::from_u64(value.min(VarInt::MAX.into_inner()))
         .expect("bounded to QUIC variable integer range")
-}
-
-fn secret_bound_certificate(
-    secret: &[u8],
-) -> Result<(CertificateDer<'static>, PrivatePkcs8KeyDer<'static>), QuicCarrierError> {
-    if secret.is_empty() {
-        return Err(QuicCarrierError::EmptySecret);
-    }
-    let mut hasher = Sha256::new();
-    hasher.update(b"mptunnel quic cert ed25519 seed v1");
-    hasher.update(secret);
-    let seed = hasher.finalize();
-    let mut pkcs8 = Vec::with_capacity(ED25519_PKCS8_PREFIX.len() + seed.len());
-    pkcs8.extend_from_slice(ED25519_PKCS8_PREFIX);
-    pkcs8.extend_from_slice(&seed);
-
-    let key_der = PrivatePkcs8KeyDer::from(pkcs8);
-    let key_pair = rcgen::KeyPair::from_pkcs8_der_and_sign_algo(&key_der, &rcgen::PKCS_ED25519)?;
-    let params = rcgen::CertificateParams::new(vec![QUIC_CERT_DNS_NAME.into()])?;
-    let cert = params.self_signed(&key_pair)?;
-    Ok((CertificateDer::from(cert), key_der))
-}
-
-#[derive(Debug)]
-struct PinnedServerCertificate {
-    expected_der: CertificateDer<'static>,
-    provider: Arc<rustls::crypto::CryptoProvider>,
-}
-
-impl PinnedServerCertificate {
-    fn new(expected_der: CertificateDer<'static>) -> Arc<Self> {
-        Arc::new(Self {
-            expected_der,
-            provider: Arc::new(rustls::crypto::ring::default_provider()),
-        })
-    }
-}
-
-impl rustls::client::danger::ServerCertVerifier for PinnedServerCertificate {
-    fn verify_server_cert(
-        &self,
-        end_entity: &CertificateDer<'_>,
-        _intermediates: &[CertificateDer<'_>],
-        _server_name: &ServerName<'_>,
-        _ocsp: &[u8],
-        _now: UnixTime,
-    ) -> Result<rustls::client::danger::ServerCertVerified, rustls::Error> {
-        if end_entity.as_ref() == self.expected_der.as_ref() {
-            Ok(rustls::client::danger::ServerCertVerified::assertion())
-        } else {
-            Err(rustls::Error::General(
-                "QUIC server certificate does not match shared secret".into(),
-            ))
-        }
-    }
-
-    fn verify_tls12_signature(
-        &self,
-        message: &[u8],
-        cert: &CertificateDer<'_>,
-        dss: &rustls::DigitallySignedStruct,
-    ) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
-        rustls::crypto::verify_tls12_signature(
-            message,
-            cert,
-            dss,
-            &self.provider.signature_verification_algorithms,
-        )
-    }
-
-    fn verify_tls13_signature(
-        &self,
-        message: &[u8],
-        cert: &CertificateDer<'_>,
-        dss: &rustls::DigitallySignedStruct,
-    ) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
-        rustls::crypto::verify_tls13_signature(
-            message,
-            cert,
-            dss,
-            &self.provider.signature_verification_algorithms,
-        )
-    }
-
-    fn supported_verify_schemes(&self) -> Vec<rustls::SignatureScheme> {
-        self.provider
-            .signature_verification_algorithms
-            .supported_schemes()
-    }
 }
 
 #[cfg(test)]

@@ -52,6 +52,19 @@ CONTROL_FRAME_KINDS = {
     "datagram_feedback",
 }
 
+OBSERVED_DIAGNOSTIC_EVENTS = (
+    "path_command_queue_send",
+    "receive_hole",
+    "reliable_stream_open_success",
+    "reliable_stream_open_timeout",
+    "sender_service_decision",
+    "sender_service_conformance",
+    "server_response_stream_data_frame",
+    "server_sender_dispatch",
+    "server_sender_enqueue",
+    "stream_ack_received",
+)
+
 
 def diagnostic_event_available(row: dict[str, Any], event: str) -> bool:
     """Return whether a zero count for an event is meaningful for this row."""
@@ -133,8 +146,6 @@ def collect_metrics(
     telemetry: dict[str, Any],
 ) -> dict[str, Any]:
     events: collections.Counter[str] = collections.Counter()
-    candidate_reasons: collections.Counter[str] = collections.Counter()
-    selected_underlays: collections.Counter[str] = collections.Counter()
     path_queue_waits: dict[str, list[int]] = collections.defaultdict(list)
     dispatch_queue_delays: list[int] = []
     repair_bytes_after: list[int] = []
@@ -147,30 +158,13 @@ def collect_metrics(
     conformance_summary_frames = 0
     conformance_summary_decisions = 0
     max_receive_hole_bytes = 0
-    max_stream_ordering_debt = 0
-    max_command_pending_bytes = 0
     max_server_sender_queue_bytes = 0
     reliable_open_timeouts = 0
     reliable_open_successes = 0
-    datagram_timeouts = 0
     teardown_hits: collections.Counter[str] = collections.Counter()
     event_observation = {
         event: diagnostic_event_available(row, event)
-        for event in (
-            "path_command_queue_send",
-            "receive_hole",
-            "reliable_stream_open_success",
-            "reliable_stream_open_timeout",
-            "sender_service_decision",
-            "sender_service_conformance",
-            "server_bulk_output_candidate",
-            "server_bulk_output_selected",
-            "server_response_stream_data_frame",
-            "server_sender_dispatch",
-            "server_sender_enqueue",
-            "stream_ack_received",
-            "udp_datagram_response_timeout",
-        )
+        for event in OBSERVED_DIAGNOSTIC_EVENTS
     }
 
     for _, text in logs:
@@ -225,18 +219,6 @@ def collect_metrics(
             elif event == "stream_ack_received":
                 repair_bytes_after.append(int_field(parsed, "repair_bytes_after"))
                 stream_ack_released_bytes.append(int_field(parsed, "released_bytes"))
-            elif event == "server_bulk_output_candidate":
-                reason = parsed.get("reason")
-                if reason:
-                    candidate_reasons[reason] += 1
-                max_stream_ordering_debt = max(
-                    max_stream_ordering_debt, int_field(parsed, "stream_ordering_debt")
-                )
-                max_command_pending_bytes = max(
-                    max_command_pending_bytes, int_field(parsed, "command_pending_bytes")
-                )
-            elif event == "server_bulk_output_selected":
-                selected_underlays[parsed.get("path_underlay", "unknown")] += 1
             elif event == "path_command_queue_send":
                 kind = parsed.get("frame_kind") or parsed.get("command_kind") or "unknown"
                 path_queue_waits[kind].append(int_field(parsed, "wait_ms"))
@@ -244,8 +226,6 @@ def collect_metrics(
                 reliable_open_timeouts += 1
             elif event == "reliable_stream_open_success":
                 reliable_open_successes += 1
-            elif event == "udp_datagram_response_timeout":
-                datagram_timeouts += 1
 
     control_waits = [
         value
@@ -271,8 +251,6 @@ def collect_metrics(
     enqueue_observed = event_observation["server_sender_enqueue"]
     dispatch_observed = event_observation["server_sender_dispatch"]
     receive_hole_observed = event_observation["receive_hole"]
-    candidate_observed = event_observation["server_bulk_output_candidate"]
-    selected_observed = event_observation["server_bulk_output_selected"]
     ack_observed = event_observation["stream_ack_received"]
     path_queue_observed = event_observation["path_command_queue_send"]
     raw_conformance_observed = (
@@ -350,10 +328,6 @@ def collect_metrics(
         "receive_hole_significant": (
             receive_hole_significant if receive_hole_observed else None
         ),
-        "stream_ordering_debt_max_bytes": (
-            max_stream_ordering_debt if candidate_observed else None
-        ),
-        "command_pending_max_bytes": max_command_pending_bytes if candidate_observed else None,
         "repair_bytes_after_max": max_or_none(repair_bytes_after) if ack_observed else None,
         "repair_debt_has_hole_evidence": (
             repair_debt_has_hole_evidence
@@ -363,10 +337,6 @@ def collect_metrics(
         "stream_ack_released_bytes_total": (
             sum(stream_ack_released_bytes) if ack_observed else None
         ),
-        "candidate_reasons": (
-            dict(candidate_reasons.most_common(16)) if candidate_observed else None
-        ),
-        "selected_underlays": dict(selected_underlays) if selected_observed else None,
         "reliable_stream_open_timeouts": (
             reliable_open_timeouts
             if event_observation["reliable_stream_open_timeout"]
@@ -375,11 +345,6 @@ def collect_metrics(
         "reliable_stream_open_successes": (
             reliable_open_successes
             if event_observation["reliable_stream_open_success"]
-            else None
-        ),
-        "udp_datagram_timeouts": (
-            datagram_timeouts
-            if event_observation["udp_datagram_response_timeout"]
             else None
         ),
         "teardown_hits": dict(teardown_hits.most_common(16)),
@@ -456,24 +421,6 @@ def score_buckets(
             3,
             f"receive-hole max {metrics['receive_hole_max_bytes']} bytes",
         )
-    if (metrics["stream_ordering_debt_max_bytes"] or 0) > 0 and (
-        metrics["receive_hole_significant"] or (metrics["receive_hole_events"] or 0) > 100
-    ):
-        add(
-            "harmful_admission",
-            2,
-            f"stream ordering debt reached {metrics['stream_ordering_debt_max_bytes']} bytes",
-        )
-    if (
-        len(metrics["selected_underlays"] or {}) > 1
-        and metrics["receive_hole_events"]
-        and (metrics["receive_hole_significant"] or metrics["receive_hole_events"] > 100)
-    ):
-        add(
-            "harmful_admission",
-            2,
-            f"mixed underlay selection with receive holes: {metrics['selected_underlays']}",
-        )
     if (
         metrics["repair_bytes_after_max"]
         and metrics["repair_bytes_after_max"] > 0
@@ -491,7 +438,7 @@ def score_buckets(
             control_failures += int(row.get(field) or 0)
         except (TypeError, ValueError):
             pass
-    if row.get("udp_error") or metrics["udp_datagram_timeouts"]:
+    if row.get("udp_error"):
         control_failures += 1
     if metrics["reliable_stream_open_timeouts"]:
         control_failures += metrics["reliable_stream_open_timeouts"]

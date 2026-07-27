@@ -6,7 +6,8 @@
 use crate::protocol::UnderlayProtocol;
 use crate::transport::{
     CarrierNetworkProvider, CarrierPathIdentity, CarrierResolutionRequest, CarrierSocketRequest,
-    Endpoint, PathSpec, SystemCarrierNetworkProvider, interleave_socket_addr_families,
+    Endpoint, NativeEgressPurpose, NativeSocketConfigurator, NativeSocketRequest, PathSpec,
+    SystemCarrierNetworkProvider, SystemNativeSocketConfigurator, interleave_socket_addr_families,
 };
 use futures::StreamExt;
 use futures::stream::FuturesUnordered;
@@ -111,14 +112,70 @@ pub async fn connect_endpoint(
     endpoint: &Endpoint,
     options: TcpConnectOptions,
 ) -> Result<TcpStream, TcpTransportError> {
+    connect_endpoint_with_configurator(
+        endpoint,
+        options,
+        NativeEgressPurpose::Target,
+        &SystemNativeSocketConfigurator,
+    )
+    .await
+}
+
+pub async fn connect_endpoint_with_configurator(
+    endpoint: &Endpoint,
+    options: TcpConnectOptions,
+    purpose: NativeEgressPurpose,
+    configurator: &dyn NativeSocketConfigurator,
+) -> Result<TcpStream, TcpTransportError> {
     let deadline = Instant::now() + options.timeout;
     let addrs = resolve_endpoint(endpoint, deadline).await?;
+    connect_addrs_before(addrs, options, purpose, configurator, deadline).await
+}
+
+/// Races an already-resolved address set with the same family filtering and
+/// RFC 8305 staggering used by endpoint dialing.
+pub async fn connect_addrs(
+    addrs: Vec<SocketAddr>,
+    options: TcpConnectOptions,
+) -> Result<TcpStream, TcpTransportError> {
+    connect_addrs_with_configurator(
+        addrs,
+        options,
+        NativeEgressPurpose::Target,
+        &SystemNativeSocketConfigurator,
+    )
+    .await
+}
+
+pub async fn connect_addrs_with_configurator(
+    addrs: Vec<SocketAddr>,
+    options: TcpConnectOptions,
+    purpose: NativeEgressPurpose,
+    configurator: &dyn NativeSocketConfigurator,
+) -> Result<TcpStream, TcpTransportError> {
+    connect_addrs_before(
+        addrs,
+        options,
+        purpose,
+        configurator,
+        Instant::now() + options.timeout,
+    )
+    .await
+}
+
+async fn connect_addrs_before(
+    addrs: Vec<SocketAddr>,
+    options: TcpConnectOptions,
+    purpose: NativeEgressPurpose,
+    configurator: &dyn NativeSocketConfigurator,
+    deadline: Instant,
+) -> Result<TcpStream, TcpTransportError> {
     let addrs = compatible_tcp_socket_addrs(addrs, options.source_ip);
     if addrs.is_empty() {
         return Err(TcpTransportError::NoCompatibleAddress);
     }
     race_tcp_address_attempts(addrs, deadline, |addr, deadline| {
-        connect_addr_before(addr, options, deadline)
+        connect_addr_before(addr, options, purpose, configurator, deadline)
     })
     .await
 }
@@ -154,27 +211,55 @@ pub async fn connect_addr(
     addr: SocketAddr,
     options: TcpConnectOptions,
 ) -> Result<TcpStream, TcpTransportError> {
-    connect_addr_before(addr, options, Instant::now() + options.timeout).await
+    connect_addr_with_configurator(
+        addr,
+        options,
+        NativeEgressPurpose::Target,
+        &SystemNativeSocketConfigurator,
+    )
+    .await
+}
+
+pub async fn connect_addr_with_configurator(
+    addr: SocketAddr,
+    options: TcpConnectOptions,
+    purpose: NativeEgressPurpose,
+    configurator: &dyn NativeSocketConfigurator,
+) -> Result<TcpStream, TcpTransportError> {
+    connect_addr_before(
+        addr,
+        options,
+        purpose,
+        configurator,
+        Instant::now() + options.timeout,
+    )
+    .await
 }
 
 async fn connect_addr_before(
     addr: SocketAddr,
     options: TcpConnectOptions,
+    purpose: NativeEgressPurpose,
+    configurator: &dyn NativeSocketConfigurator,
     deadline: Instant,
 ) -> Result<TcpStream, TcpTransportError> {
     let connect = async {
-        match options.source_ip {
-            Some(source_ip) => {
-                let socket = if addr.is_ipv4() {
-                    TcpSocket::new_v4()?
-                } else {
-                    TcpSocket::new_v6()?
-                };
-                socket.bind(SocketAddr::new(source_ip, 0))?;
-                socket.connect(addr).await
-            }
-            None => TcpStream::connect(addr).await,
+        let socket = if addr.is_ipv4() {
+            TcpSocket::new_v4()?
+        } else {
+            TcpSocket::new_v6()?
+        };
+        if let Some(source_ip) = options.source_ip {
+            socket.bind(SocketAddr::new(source_ip, 0))?;
         }
+        configurator.configure_tcp(
+            &socket,
+            NativeSocketRequest {
+                remote_addr: addr,
+                purpose,
+            },
+        )?;
+        socket.connect(addr).await
     };
     let stream = timeout_at(deadline, connect)
         .await

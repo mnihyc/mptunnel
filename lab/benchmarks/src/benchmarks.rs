@@ -1,50 +1,13 @@
-use aes_gcm::aead::{AeadInPlace, KeyInit};
-use aes_gcm::{Aes256Gcm, Nonce as AesNonce};
-use chacha20poly1305::{ChaCha20Poly1305, Nonce as ChaChaNonce};
 use mptunnel::config::ResourceLimits;
 use mptunnel::protocol::{PathId, UnderlayProtocol};
 use mptunnel::scheduler::{PathSnapshot, TrafficClass};
 use mptunnel::simulator::{Simulator, VirtualPath};
 use serde::Serialize;
-use std::hint::black_box;
-use std::time::Instant;
 
 const PROFILE: &str = "developer-gates-v1";
 const MIB: usize = 1024 * 1024;
-const GIB_BYTES: f64 = 1024.0 * 1024.0 * 1024.0;
 const IDEAL_LAB_TARGET_MIB: f64 = 256.0;
 const IDEAL_LAB_TARGET_MBPS: f64 = 950.0;
-pub const MAX_RESOURCE_SAMPLE_MIB: u32 = 1024;
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct BenchmarkOptions {
-    pub resource_sample_mib: u32,
-}
-
-impl BenchmarkOptions {
-    pub fn new(resource_sample_mib: u32) -> Result<Self, BenchmarkError> {
-        if resource_sample_mib == 0 {
-            return Err(BenchmarkError::InvalidResourceSample);
-        }
-        if resource_sample_mib > MAX_RESOURCE_SAMPLE_MIB {
-            return Err(BenchmarkError::ResourceSampleTooLarge {
-                actual: resource_sample_mib,
-                limit: MAX_RESOURCE_SAMPLE_MIB,
-            });
-        }
-        Ok(Self {
-            resource_sample_mib,
-        })
-    }
-}
-
-impl Default for BenchmarkOptions {
-    fn default() -> Self {
-        Self {
-            resource_sample_mib: 8,
-        }
-    }
-}
 
 #[derive(Debug, Clone, Serialize)]
 pub struct BenchmarkReport {
@@ -116,32 +79,23 @@ impl GateComparator {
 #[derive(Debug)]
 pub enum BenchmarkError {
     GateFailures(usize),
-    InvalidResourceSample,
-    ResourceSampleTooLarge { actual: u32, limit: u32 },
-    Crypto,
     Serialize(serde_json::Error),
+    Replay(String),
 }
 
 impl std::fmt::Display for BenchmarkError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::GateFailures(count) => write!(f, "{count} benchmark gate(s) failed"),
-            Self::InvalidResourceSample => write!(f, "benchmark resource sample must be nonzero"),
-            Self::ResourceSampleTooLarge { actual, limit } => {
-                write!(
-                    f,
-                    "benchmark resource sample {actual} MiB exceeds limit {limit} MiB"
-                )
-            }
-            Self::Crypto => write!(f, "benchmark crypto operation failed"),
             Self::Serialize(err) => write!(f, "failed to serialize benchmark report: {err}"),
+            Self::Replay(err) => write!(f, "trace replay failed: {err}"),
         }
     }
 }
 
 impl std::error::Error for BenchmarkError {}
 
-pub fn run_benchmarks(options: BenchmarkOptions) -> Result<BenchmarkReport, BenchmarkError> {
+pub fn run_benchmarks() -> BenchmarkReport {
     let mut gates = Vec::new();
 
     let page = page_load_benchmark();
@@ -216,21 +170,7 @@ pub fn run_benchmarks(options: BenchmarkOptions) -> Result<BenchmarkReport, Benc
         "chunks",
     ));
 
-    let resource = resource_benchmark(options.resource_sample_mib)?;
-    gates.push(at_most(
-        "chacha20poly1305_cpu",
-        "cpu_core_seconds_per_gib",
-        resource.chacha_core_seconds_per_gib,
-        300.0,
-        "core-s/GiB",
-    ));
-    gates.push(at_most(
-        "aes256gcm_cpu",
-        "cpu_core_seconds_per_gib",
-        resource.aes_core_seconds_per_gib,
-        300.0,
-        "core-s/GiB",
-    ));
+    let resource = resource_benchmark();
     gates.push(at_most(
         "stream_ram_budget",
         "stream_memory_budget_mib",
@@ -261,11 +201,11 @@ pub fn run_benchmarks(options: BenchmarkOptions) -> Result<BenchmarkReport, Benc
     ));
 
     let passed = gates.iter().all(|gate| gate.passed);
-    Ok(BenchmarkReport {
+    BenchmarkReport {
         profile: PROFILE.to_string(),
         passed,
         gates,
-    })
+    }
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -571,18 +511,13 @@ fn failover_benchmark() -> FailoverMetrics {
 
 #[derive(Debug, Clone, Copy)]
 struct ResourceMetrics {
-    chacha_core_seconds_per_gib: f64,
-    aes_core_seconds_per_gib: f64,
     stream_memory_budget_mib: f64,
     datagram_queue_budget_mib: f64,
     path_flight_budget_mib: f64,
     lab_hot_path_ram_budget_mib: f64,
 }
 
-fn resource_benchmark(sample_mib: u32) -> Result<ResourceMetrics, BenchmarkError> {
-    let sample_bytes = sample_mib as usize * MIB;
-    let chacha_core_seconds_per_gib = measure_chacha20poly1305(sample_bytes)?;
-    let aes_core_seconds_per_gib = measure_aes256gcm(sample_bytes)?;
+fn resource_benchmark() -> ResourceMetrics {
     let limits = ResourceLimits::default();
     let stream_memory_budget_mib = bytes_to_mib(
         limits
@@ -590,14 +525,12 @@ fn resource_benchmark(sample_mib: u32) -> Result<ResourceMetrics, BenchmarkError
             .saturating_add(limits.max_repair_bytes as u64)
             .saturating_add(limits.max_reorder_bytes as u64),
     );
-    Ok(ResourceMetrics {
-        chacha_core_seconds_per_gib,
-        aes_core_seconds_per_gib,
+    ResourceMetrics {
         stream_memory_budget_mib,
         datagram_queue_budget_mib: bytes_to_mib(limits.max_datagram_queue_bytes as u64),
         path_flight_budget_mib: bytes_to_mib(limits.max_path_flight_bytes as u64),
         lab_hot_path_ram_budget_mib: bytes_to_mib(lab_hot_path_ram_budget_bytes(limits)),
-    })
+    }
 }
 
 fn lab_hot_path_ram_budget_bytes(limits: ResourceLimits) -> u64 {
@@ -605,50 +538,6 @@ fn lab_hot_path_ram_budget_bytes(limits: ResourceLimits) -> u64 {
         + limits.max_reorder_bytes as u64
         + limits.max_path_flight_bytes as u64
         + limits.max_datagram_queue_bytes as u64
-}
-
-fn measure_chacha20poly1305(sample_bytes: usize) -> Result<f64, BenchmarkError> {
-    let cipher = ChaCha20Poly1305::new_from_slice(&[0x41; 32]).expect("valid chacha key");
-    measure_aead(sample_bytes, |counter, aad, payload| {
-        let nonce = nonce_bytes(counter);
-        let tag = cipher
-            .encrypt_in_place_detached(ChaChaNonce::from_slice(&nonce), aad, payload)
-            .map_err(|_| BenchmarkError::Crypto)?;
-        cipher
-            .decrypt_in_place_detached(ChaChaNonce::from_slice(&nonce), aad, payload, &tag)
-            .map_err(|_| BenchmarkError::Crypto)
-    })
-}
-
-fn measure_aes256gcm(sample_bytes: usize) -> Result<f64, BenchmarkError> {
-    let cipher = Aes256Gcm::new_from_slice(&[0x23; 32]).expect("valid AES key");
-    measure_aead(sample_bytes, |counter, aad, payload| {
-        let nonce = nonce_bytes(counter);
-        let tag = cipher
-            .encrypt_in_place_detached(AesNonce::from_slice(&nonce), aad, payload)
-            .map_err(|_| BenchmarkError::Crypto)?;
-        cipher
-            .decrypt_in_place_detached(AesNonce::from_slice(&nonce), aad, payload, &tag)
-            .map_err(|_| BenchmarkError::Crypto)
-    })
-}
-
-fn measure_aead<F>(sample_bytes: usize, mut round_trip: F) -> Result<f64, BenchmarkError>
-where
-    F: FnMut(u64, &[u8], &mut [u8]) -> Result<(), BenchmarkError>,
-{
-    let chunk_bytes = 16 * 1024;
-    let iterations = (sample_bytes / chunk_bytes).max(1);
-    let aad = b"mptunnel benchmark aead v1";
-    let mut payload = vec![0xA5; chunk_bytes];
-    let started = Instant::now();
-    for counter in 0..iterations {
-        round_trip(counter as u64, aad, &mut payload)?;
-        black_box(payload[0]);
-    }
-    let elapsed = started.elapsed().as_secs_f64();
-    let processed_bytes = (iterations * chunk_bytes * 2) as f64;
-    Ok(elapsed / (processed_bytes / GIB_BYTES).max(f64::EPSILON))
 }
 
 fn browser_paths() -> Vec<VirtualPath> {
@@ -690,12 +579,6 @@ fn ideal_lab_paths() -> Vec<VirtualPath> {
     ]
 }
 
-fn nonce_bytes(counter: u64) -> [u8; 12] {
-    let mut nonce = [0u8; 12];
-    nonce[4..12].copy_from_slice(&counter.to_be_bytes());
-    nonce
-}
-
 fn mbps(value: f64) -> f64 {
     value * 1_000_000.0
 }
@@ -709,15 +592,11 @@ mod tests {
     use super::*;
 
     #[test]
-    fn developer_benchmark_gates_pass() {
-        let report = run_benchmarks(BenchmarkOptions {
-            resource_sample_mib: 1,
-        })
-        .expect("benchmark report");
-
+    fn deterministic_developer_gates_pass() {
+        let report = run_benchmarks();
         assert!(
-            report.passed,
-            "failed gates: {:?}",
+            report.gates.iter().all(|gate| gate.passed),
+            "failed deterministic gates: {:?}",
             report
                 .gates
                 .iter()
@@ -730,20 +609,12 @@ mod tests {
                 .iter()
                 .any(|gate| gate.name == "page_load_complete")
         );
-        assert!(
-            report
-                .gates
-                .iter()
-                .any(|gate| gate.name == "chacha20poly1305_cpu")
-        );
+        assert!(report.gates.iter().any(|gate| gate.name == "stream_ram_budget"));
     }
 
     #[test]
     fn benchmark_json_contains_profile_and_gates() {
-        let report = run_benchmarks(BenchmarkOptions {
-            resource_sample_mib: 1,
-        })
-        .expect("benchmark report");
+        let report = run_benchmarks();
         let json = report.render_json().expect("json");
 
         assert!(json.contains("\"profile\""));
@@ -766,15 +637,4 @@ mod tests {
         assert!(json.contains("deterministic-path-ablation-v2"));
     }
 
-    #[test]
-    fn invalid_resource_sample_is_rejected() {
-        assert!(matches!(
-            BenchmarkOptions::new(0),
-            Err(BenchmarkError::InvalidResourceSample)
-        ));
-        assert!(matches!(
-            BenchmarkOptions::new(MAX_RESOURCE_SAMPLE_MIB + 1),
-            Err(BenchmarkError::ResourceSampleTooLarge { .. })
-        ));
-    }
 }

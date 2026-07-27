@@ -1,120 +1,135 @@
 //! Client process lifecycle and background path liveness probes.
 
-use crate::config::{
-    ClientConfig, LocalIngressConfig, ManagementConfig, MppPerformanceConfig, ResourceLimits,
-    SessionConfig,
-};
+use crate::config::{LocalIngressConfig, MppOutboundConfig, RouteTarget};
 use crate::ingress::IngressConfig;
+use crate::mux::MuxLimits;
+use crate::performance::ResourceLimits;
+use crate::platform::{PacketDeviceConfig, PacketDeviceProvider};
 use crate::protocol::UnderlayProtocol;
 use crate::runtime::error::RuntimeError;
 use crate::runtime::ingress_runtime::{
     probe_tcp_client_path, probe_udp_client_path, run_http_connect_client_ingress,
-    run_socks5_client_ingress,
+    run_socks5_client_ingress, run_tcp_forward_client_ingress, run_udp_forward_client_ingress,
 };
-use crate::runtime::management::spawn_client_management_services;
-use crate::runtime::packet_device::PacketDeviceProvider;
 use crate::runtime::path::{ClientPathContext, ClientPathRuntimeOptions};
+use crate::runtime::product_policy::ClientIngressRouter;
+use crate::runtime::readiness::RuntimeReadinessBarrier;
+use crate::runtime::telemetry::RuntimeTelemetry;
 use crate::runtime::tun_l4::run_tun_l4_client;
-use crate::transport::CarrierNetworkProvider;
 use std::sync::Arc;
 use std::time::Duration;
 
-pub(super) async fn run(
-    client: ClientConfig,
-    resources: ResourceLimits,
-    session: SessionConfig,
-    management: ManagementConfig,
-    packet_devices: Arc<dyn PacketDeviceProvider>,
-    carrier_network: Arc<dyn CarrierNetworkProvider>,
-) -> Result<(), RuntimeError> {
-    let path_probe_interval = client.path_probe_interval;
-    let path_probe_timeout = client.path_probe_timeout;
-    // Product sender policy follows the configured path group without becoming
-    // carrier-state ownership in `ClientPathContext`.
-    let performance = client.performance;
-    let context = new_path_context(
-        &client,
-        resources,
-        session,
-        0,
-        carrier_network,
-        management.peer_diagnostics_enabled(),
-    )?;
-    let mut services = tokio::task::JoinSet::new();
-    if management.http_enabled() {
-        spawn_client_management_services(management, context.clone(), &mut services);
-    }
-    spawn_ingresses(
-        client.ingresses,
-        context.clone(),
-        performance,
-        packet_devices,
-        &mut services,
-    );
-    if services.is_empty() {
-        return Err(RuntimeError::Protocol("client has no ingress tasks"));
-    }
-    spawn_path_probe_service(
-        context,
-        path_probe_interval,
-        path_probe_timeout,
-        &mut services,
-    );
-    super::supervise_runtime_services(
-        services,
-        "client ingress exited",
-        "client has no ingress tasks",
-    )
-    .await
-}
-
 pub(super) fn new_path_context(
-    client: &ClientConfig,
+    client: &MppOutboundConfig,
     resources: ResourceLimits,
-    session: SessionConfig,
-    path_group_ordinal: usize,
-    carrier_network: Arc<dyn CarrierNetworkProvider>,
-    allow_peer_diagnostics: bool,
+    route_target: RouteTarget,
+    runtime: ClientPathRuntimeOptions,
+    telemetry: RuntimeTelemetry,
 ) -> Result<ClientPathContext, RuntimeError> {
-    ClientPathContext::new_with_runtime_options(
+    ClientPathContext::new_with_runtime_options_and_telemetry(
         client.paths.clone(),
         resources,
-        client.route_target.clone(),
-        client.ingresses.clone(),
-        ClientPathRuntimeOptions {
-            session_retention_timeout: session.retention_timeout,
-            path_group_ordinal,
-            carrier_network,
-            allow_peer_diagnostics,
-        },
+        Some(route_target),
+        runtime,
+        telemetry,
     )
 }
 
 pub(super) fn spawn_ingresses(
     ingresses: Vec<LocalIngressConfig>,
-    context: ClientPathContext,
-    performance: MppPerformanceConfig,
+    mux_limits: MuxLimits,
+    router: ClientIngressRouter,
     packet_devices: Arc<dyn PacketDeviceProvider>,
+    readiness: &RuntimeReadinessBarrier,
     tasks: &mut tokio::task::JoinSet<Result<(), RuntimeError>>,
 ) {
     for ingress in ingresses {
-        let context = context.clone();
+        let router = router.clone();
+        let inbound = ingress
+            .tag
+            .as_deref()
+            .ok_or(RuntimeError::Protocol(
+                "local inbound is missing its routing tag",
+            ))
+            .and_then(|tag| {
+                crate::product::InboundId::parse(tag)
+                    .map_err(|_| RuntimeError::Protocol("local inbound has an invalid routing tag"))
+            });
         match ingress.config {
-            IngressConfig::Socks5 { listen, proxy_auth } => {
+            IngressConfig::Socks5 {
+                listen,
+                proxy_auth,
+                admission,
+            } => {
+                let ingress_readiness = readiness.require("SOCKS5 ingress listeners");
                 tasks.spawn(async move {
-                    run_socks5_client_ingress(listen, context, proxy_auth, performance).await
+                    run_socks5_client_ingress(
+                        listen,
+                        mux_limits,
+                        router,
+                        inbound?,
+                        proxy_auth,
+                        admission,
+                        ingress_readiness,
+                    )
+                    .await
                 });
             }
-            IngressConfig::HttpConnect { listen, proxy_auth } => {
+            IngressConfig::HttpConnect {
+                listen,
+                proxy_auth,
+                admission,
+            } => {
+                let ingress_readiness = readiness.require("HTTP CONNECT ingress listeners");
                 tasks.spawn(async move {
-                    run_http_connect_client_ingress(listen, context, proxy_auth, performance).await
+                    run_http_connect_client_ingress(
+                        listen,
+                        router,
+                        inbound?,
+                        proxy_auth,
+                        admission,
+                        ingress_readiness,
+                    )
+                    .await
+                });
+            }
+            IngressConfig::TcpForward(config) => {
+                let ingress_readiness = readiness.require("TCP port-forward ingress listeners");
+                tasks.spawn(async move {
+                    run_tcp_forward_client_ingress(config, router, inbound?, ingress_readiness)
+                        .await
+                });
+            }
+            IngressConfig::UdpForward(config) => {
+                let ingress_readiness = readiness.require("UDP port-forward ingress listeners");
+                tasks.spawn(async move {
+                    run_udp_forward_client_ingress(
+                        config,
+                        mux_limits,
+                        router,
+                        inbound?,
+                        ingress_readiness,
+                    )
+                    .await
                 });
             }
             IngressConfig::TunL4(tun) => {
                 let packet_devices = packet_devices.clone();
+                let ingress_readiness = readiness.require("TUN packet stack");
                 tasks.spawn(async move {
-                    let device = packet_devices.open(&tun).map_err(RuntimeError::TunDevice)?;
-                    run_tun_l4_client(tun, context, performance, device).await
+                    let device = packet_devices
+                        .open(&PacketDeviceConfig {
+                            name: tun.name.as_deref(),
+                            ipv4: tun.ipv4,
+                            ipv4_prefix: tun.ipv4_prefix,
+                            ipv4_gateway: tun.ipv4_gateway,
+                            ipv6: tun.ipv6,
+                            ipv6_prefix: tun.ipv6_prefix,
+                            mtu: tun.mtu,
+                        })
+                        .map_err(RuntimeError::TunDevice)?;
+                    run_tun_l4_client(tun, mux_limits, router, inbound?, device, ingress_readiness)
+                        .await
                 });
             }
         }
@@ -187,7 +202,12 @@ pub(in crate::runtime) async fn probe_paths(context: &ClientPathContext, timeout
             Ok((UnderlayProtocol::Udp, path_index, Err(_))) => {
                 context.mark_udp_path_failure(path_index);
             }
-            Err(err) => eprintln!("warning: path probe task failed: {err}"),
+            Err(err) => crate::observability::process_event!(
+                Warn,
+                "path",
+                "probe_task_failed",
+                "path probe task failed: {err}"
+            ),
         }
     }
 }

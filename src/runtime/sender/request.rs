@@ -10,7 +10,6 @@ use super::work::{
     CarrierEmitMode, ClientReinjectionOutputIdentity, RelaySendCause, RelaySendOutcome,
     sender_extra_traffic_startup_floor_bytes, sender_reinjection_minimum_useful_attempt_bytes,
 };
-use crate::config::MppPerformanceConfig;
 #[cfg(feature = "lab-diagnostics")]
 use crate::lab_diagnostics::{lab_diagnostic, lab_perf_record, lab_sender_service_decision};
 use crate::model::capacity::{
@@ -25,7 +24,10 @@ use crate::model::work::{
     reliable_failed_original_reinjection_limit_bytes,
 };
 use crate::mux::MuxLimits;
-use crate::mux::stream::{AckOutcome, ReliableRecvStream, ReliableSendStream};
+use crate::mux::stream::{
+    AckOutcome, ReliableRecvStream, ReliableSendStream, StreamError, ValidatedStreamAck,
+};
+use crate::performance::MppPerformanceConfig;
 use crate::protocol::frame::reliable_stream_frame_accounted_bytes;
 #[cfg(feature = "lab-diagnostics")]
 use crate::protocol::frame::{reliable_path_frame_pacing_bytes, stream_ack_contiguous_frontier};
@@ -229,24 +231,24 @@ impl RequestSenderService {
         context: &ClientPathContext,
         remotes: &ReliableRelayRemoteSet,
         send_stream: &mut ReliableSendStream,
-        ranges: &[OffsetRange],
-    ) -> RequestProductAckOutcome {
+        ack: &ValidatedStreamAck,
+    ) -> Result<RequestProductAckOutcome, StreamError> {
         #[cfg(feature = "lab-diagnostics")]
         let mux_started = Instant::now();
-        let mux = send_stream.apply_normalized_ack(ranges);
+        let mux = send_stream.apply_validated_ack(ack)?;
         #[cfg(feature = "lab-diagnostics")]
         lab_perf_record("mux.apply_ack", mux_started.elapsed(), mux.released_bytes);
         if mux.released_bytes > 0 {
             self.record_delivered_data(mux.released_bytes);
         }
         let acked_at = Instant::now();
-        let data_ack_progress_paths = self
-            .multipath
-            .apply_product_ack(context, remotes, ranges, acked_at);
-        RequestProductAckOutcome {
+        let data_ack_progress_paths =
+            self.multipath
+                .apply_product_ack(context, remotes, ack.ranges(), acked_at);
+        Ok(RequestProductAckOutcome {
             mux,
             data_ack_progress_paths,
-        }
+        })
     }
 
     pub(in crate::runtime) fn discard_unusable_tail_reinjections(
@@ -741,7 +743,7 @@ impl RequestSenderService {
         &mut self,
         remotes: &mut ReliableRelayRemoteSet,
         context: &ClientPathContext,
-        recv_stream: &ReliableRecvStream,
+        recv_stream: &mut ReliableRecvStream,
         progress: &mut ReliableRecvProgress,
         request: RelayRecvProgressSend,
     ) -> Result<bool, RuntimeError> {
@@ -824,6 +826,7 @@ impl RequestSenderService {
                 request.lane,
                 context.mux_limits,
             );
+            let max_offset = recv_stream.max_data_offset_with_window(advertised_window);
             match self
                 .send_control_frame(
                     context,
@@ -834,6 +837,7 @@ impl RequestSenderService {
                 .await
             {
                 Ok(_) => {
+                    recv_stream.commit_max_data(max_offset);
                     sent_any = true;
                 }
                 Err(RuntimeError::SenderServiceBlocked) => {
@@ -855,12 +859,16 @@ impl RequestSenderService {
         send_stream: &ReliableSendStream,
         last_send_ack_ranges: &[OffsetRange],
         last_send_ack_complete: bool,
+        last_send_ack_horizon: Option<u64>,
         last_send_ack_frontier: u64,
         lane: TrafficClass,
     ) -> bool {
+        let Some(last_send_ack_horizon) = last_send_ack_horizon else {
+            return false;
+        };
         if !last_send_ack_complete
             || last_send_ack_frontier == 0
-            || last_send_ack_frontier >= send_stream.next_offset()
+            || last_send_ack_frontier >= last_send_ack_horizon
             || send_stream.reinjection_bytes() == 0
             || !matches!(
                 last_send_ack_ranges,
@@ -898,7 +906,7 @@ impl RequestSenderService {
         let reinjection_frames = send_stream.retransmission_frames_for_ranges(
             &[OffsetRange {
                 start: last_send_ack_frontier,
-                end: send_stream.next_offset(),
+                end: last_send_ack_horizon,
             }],
             reinjection_limit,
         );

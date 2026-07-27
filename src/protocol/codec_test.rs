@@ -1,3 +1,5 @@
+//! Wire-codec contract tests for the current clean-break wire version.
+
 use super::*;
 
 fn round_trip(frame: Frame) {
@@ -83,7 +85,7 @@ fn stream_frames_round_trip() {
 }
 
 #[test]
-fn open_stream_v3_has_no_attachment_role_field() {
+fn open_stream_v4_has_no_attachment_role_field() {
     let frame = Frame::OpenStream {
         stream_id: StreamId(0x0102_0304_0506_0708),
         target: TargetAddr::Ip("192.0.2.1:443".parse().expect("addr")),
@@ -94,7 +96,7 @@ fn open_stream_v3_has_no_attachment_role_field() {
     assert_eq!(
         encoded,
         vec![
-            b'M', b'P', b'T', b'F', 3, 7, 0, 0, 0, 16, 1, 2, 3, 4, 5, 6, 7, 8, 2, 192, 0, 2, 1, 1,
+            b'M', b'P', b'T', b'F', 4, 7, 0, 0, 0, 16, 1, 2, 3, 4, 5, 6, 7, 8, 2, 192, 0, 2, 1, 1,
             187, 2,
         ]
     );
@@ -136,14 +138,14 @@ fn decoder_rejects_unknown_path_usage() {
 }
 
 #[test]
-fn decoder_rejects_v2_frames_after_datagram_identity_change() {
+fn decoder_rejects_v3_frames_after_v4_security_cut() {
     let mut encoded =
         encode_frame(&Frame::Ping { nonce: 42 }, CodecLimits::default()).expect("encode");
-    encoded[4] = 2;
+    encoded[4] = 3;
 
     assert_eq!(
         decode_frame_bytes(Bytes::from(encoded), CodecLimits::default()),
-        Err(CodecError::UnsupportedVersion(2))
+        Err(CodecError::UnsupportedVersion(3))
     );
 }
 
@@ -220,12 +222,14 @@ fn control_frames_round_trip_auth_and_path_metrics() {
 
     round_trip(Frame::SessionAuth {
         session_id: SessionId(42),
+        credential_id: "home-2026".to_string(),
         nonce,
         issued_at_unix_secs: 1_735_689_600,
         auth_tag,
     });
     round_trip(Frame::PathJoin {
         session_id: SessionId(42),
+        credential_id: "home-2026".to_string(),
         path_id: PathId(3),
         underlay: UnderlayProtocol::Udp,
         nonce,
@@ -286,6 +290,40 @@ fn control_frames_round_trip_auth_and_path_metrics() {
             data_sample_bytes: 512 * 1024,
         },
     });
+}
+
+#[test]
+fn credential_ids_are_bounded_canonical_wire_names() {
+    let frame = Frame::SessionAuth {
+        session_id: SessionId(42),
+        credential_id: "home-2026".to_string(),
+        nonce: AuthNonce([7; 16]),
+        issued_at_unix_secs: 1_735_689_600,
+        auth_tag: AuthTag([9; 32]),
+    };
+    let mut encoded = encode_frame(&frame, CodecLimits::default()).expect("encode");
+    let credential_start = FRAME_HEADER_LEN + std::mem::size_of::<u64>() + 1;
+    encoded[credential_start] = b'H';
+    assert_eq!(
+        decode_frame_bytes(Bytes::from(encoded), CodecLimits::default()),
+        Err(CodecError::InvalidCredentialId)
+    );
+
+    for credential_id in [String::new(), "a".repeat(65), "home/client".to_string()] {
+        assert_eq!(
+            encode_frame(
+                &Frame::SessionAuth {
+                    session_id: SessionId(42),
+                    credential_id,
+                    nonce: AuthNonce([7; 16]),
+                    issued_at_unix_secs: 1_735_689_600,
+                    auth_tag: AuthTag([9; 32]),
+                },
+                CodecLimits::default(),
+            ),
+            Err(CodecError::InvalidCredentialId)
+        );
+    }
 }
 
 #[test]

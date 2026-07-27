@@ -11,7 +11,7 @@ pub(in crate::runtime) use super::client_datagram::{
 use super::client_session::run_client_tcp_path_session;
 pub(in crate::runtime) use super::client_state::ClientTcpPathSessionRuntime;
 use super::client_stream::{ClientTcpOpenCancellation, next_client_tcp_open_attempt_id};
-use crate::config::ResourceLimits;
+use crate::performance::ResourceLimits;
 use crate::protocol::{StreamId, TargetAddr};
 use crate::runtime::error::RuntimeError;
 use crate::runtime::path::commands::{
@@ -67,6 +67,7 @@ impl ClientTcpPathSessionHandle {
         target: TargetAddr,
         lane: TrafficClass,
         open_deadlines: ClientTcpOpenDeadlines,
+        advertised_recv_max_offset: u64,
     ) -> Result<ClientTcpOpenedStream, RuntimeError> {
         let session = self.ensure_session_slot();
         let commands = session.commands.clone();
@@ -94,6 +95,7 @@ impl ClientTcpPathSessionHandle {
                 observed_carrier_generation,
                 target,
                 lane,
+                advertised_recv_max_offset,
                 open_deadlines,
                 session_commands: commands.clone(),
                 response: response_tx,

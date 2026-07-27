@@ -202,7 +202,12 @@ pub(super) async fn run_client_tcp_path_session(
                 ).await {
                     carrier_generation.clear();
                     fail_client_tcp_products(&mut state.streams, &mut state.datagrams, &err);
-                    eprintln!("warning: TCP pending stream cleanup failed: {err}");
+                    crate::observability::process_event!(
+                        Warn,
+                        "tcp",
+                        "stream_cleanup_failed",
+                        "TCP pending stream cleanup failed: {err}"
+                    );
                     drop_connection = true;
                 }
             }
@@ -221,7 +226,12 @@ pub(super) async fn run_client_tcp_path_session(
                     if let Err(err) = result {
                         carrier_generation.clear();
                         fail_client_tcp_products(&mut state.streams, &mut state.datagrams, &err);
-                        eprintln!("warning: TCP peer status request failed: {err}");
+                        crate::observability::process_event!(
+                            Warn,
+                            "tcp",
+                            "peer_status_failed",
+                            "TCP peer status request failed: {err}"
+                        );
                         drop_connection = true;
                     }
                 }
@@ -241,7 +251,12 @@ pub(super) async fn run_client_tcp_path_session(
                         {
                             carrier_generation.clear();
                             fail_client_tcp_products(&mut state.streams, &mut state.datagrams, &err);
-                            eprintln!("warning: TCP path session frame handling failed: {err}");
+                            crate::observability::process_event!(
+                                Warn,
+                                "tcp",
+                                "session_frame_failed",
+                                "TCP path session frame handling failed: {err}"
+                            );
                             drop_connection = true;
                         } else if command_may_recv
                             && let Some(command) = try_recv_reliable_path_command(&mut commands)
@@ -263,7 +278,12 @@ pub(super) async fn run_client_tcp_path_session(
                             if let Err(err) = result {
                                 carrier_generation.clear();
                                 fail_client_tcp_products(&mut state.streams, &mut state.datagrams, &err);
-                                eprintln!("warning: TCP path session command failed: {err}");
+                                crate::observability::process_event!(
+                                    Warn,
+                                    "tcp",
+                                    "session_command_failed",
+                                    "TCP path session command failed: {err}"
+                                );
                                 drop_connection = true;
                             }
                         }
@@ -272,7 +292,12 @@ pub(super) async fn run_client_tcp_path_session(
                         let err = RuntimeError::Encrypted(err);
                         carrier_generation.clear();
                         fail_client_tcp_products(&mut state.streams, &mut state.datagrams, &err);
-                        eprintln!("warning: TCP path session read failed: {err}");
+                        crate::observability::process_event!(
+                            Warn,
+                            "tcp",
+                            "session_read_failed",
+                            "TCP path session read failed: {err}"
+                        );
                         drop_connection = true;
                     }
                     None => {
@@ -303,7 +328,12 @@ pub(super) async fn run_client_tcp_path_session(
                         if let Err(err) = result {
                             carrier_generation.clear();
                             fail_client_tcp_products(&mut state.streams, &mut state.datagrams, &err);
-                            eprintln!("warning: TCP path session command failed: {err}");
+                            crate::observability::process_event!(
+                                Warn,
+                                "tcp",
+                                "session_command_failed",
+                                "TCP path session command failed: {err}"
+                            );
                             drop_connection = true;
                         }
                     }
@@ -325,7 +355,12 @@ pub(super) async fn run_client_tcp_path_session(
                 {
                     carrier_generation.clear();
                     fail_client_tcp_products(&mut state.streams, &mut state.datagrams, &err);
-                    eprintln!("warning: TCP path heartbeat failed: {err}");
+                    crate::observability::process_event!(
+                        Warn,
+                        "tcp",
+                        "heartbeat_failed",
+                        "TCP path heartbeat failed: {err}"
+                    );
                     drop_connection = true;
                 }
             }
@@ -395,6 +430,7 @@ async fn handle_disconnected_client_tcp_command(
             observed_carrier_generation: _,
             target,
             lane,
+            advertised_recv_max_offset,
             open_deadlines,
             session_commands,
             mut response,
@@ -426,6 +462,7 @@ async fn handle_disconnected_client_tcp_command(
                         attempt_id,
                         target,
                         lane,
+                        advertised_recv_max_offset,
                         open_deadline,
                         session_commands,
                         response,
@@ -440,8 +477,11 @@ async fn handle_disconnected_client_tcp_command(
                     if result.is_ok() {
                         state.connection = Some(connected);
                     } else if let Err(err) = result {
-                        eprintln!(
-                            "warning: reliable stream open on new path session failed: {err}"
+                        crate::observability::process_event!(
+                            Warn,
+                            "tcp",
+                            "stream_open_failed",
+                            "reliable stream open on new path session failed: {err}"
                         );
                         fail_client_tcp_streams(&mut state.streams, &err);
                     }
@@ -536,6 +576,7 @@ async fn connect_client_tcp_path(
             carrier_identity: runtime.carrier_identity,
             session_id: runtime.session_id,
             security: runtime.security(),
+            tls: runtime.tls(),
             codec_limits: runtime.codec_limits,
             mux_limits: runtime.mux_limits,
             carrier_network: runtime.carrier_network.as_ref(),

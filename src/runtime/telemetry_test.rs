@@ -98,6 +98,61 @@ fn active_flow_snapshots_preserve_registration_order() {
     );
 }
 
+#[test]
+fn generation_owner_records_only_scoped_product_flows_with_immutable_attribution() {
+    let telemetry = RuntimeTelemetry::generation_owner(4);
+    let internal = telemetry.open_reliable_flow(None, StreamId(1), target(853));
+    internal.counter().record_to_peer_bytes(99);
+    assert_eq!(
+        telemetry.snapshot().reliable.flows.opened,
+        0,
+        "unscoped DNS/probe work must remain outside Product totals"
+    );
+
+    let flow = FlowContext::new(
+        Network::Tcp,
+        crate::product::ProtocolTarget::parse_authority("service.example:443").expect("target"),
+        crate::product::SourceEndpoint::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 32100),
+        crate::product::PrincipalId::parse("daily-user").expect("principal"),
+        crate::product::InboundId::parse("local-socks").expect("inbound"),
+    );
+    let scope = ProductFlowScope::from_flow(
+        ProductFlowOriginKind::LocalInbound,
+        &flow,
+        crate::product::OutboundId::parse("edge-b").expect("outbound"),
+        Some(crate::product::BalancerId::parse("daily-egress").expect("balancer")),
+    );
+    let native = telemetry.open_native_reliable_flow(scope);
+    native.counter().record_to_peer_bytes(7);
+    native.counter().record_from_peer_bytes(8);
+
+    let snapshot = telemetry.snapshot();
+    assert_eq!(snapshot.reliable.flows.opened, 1);
+    assert_eq!(snapshot.io.to_peer_bytes, 7);
+    assert_eq!(snapshot.io.from_peer_bytes, 8);
+    let active = &snapshot.active_flows[0];
+    assert_eq!(active.display_id, 1);
+    assert_eq!(active.network, Network::Tcp);
+    assert_eq!(
+        active.target.as_ref().map(TargetAddr::authority),
+        Some("service.example:443".to_string())
+    );
+    assert_eq!(
+        active.origin.as_ref().map(|origin| origin.inbound.as_str()),
+        Some("local-socks")
+    );
+    let selection = active.selection.as_ref().expect("selection");
+    assert_eq!(selection.outbound.as_str(), "edge-b");
+    assert_eq!(
+        selection.balancer.as_ref().map(|id| id.as_str()),
+        Some("daily-egress")
+    );
+    assert_eq!(
+        selection.member.as_ref().map(|id| id.as_str()),
+        Some("edge-b")
+    );
+}
+
 #[tokio::test]
 async fn observed_io_counts_only_successfully_transferred_bytes() {
     let telemetry = RuntimeTelemetry::new(1);

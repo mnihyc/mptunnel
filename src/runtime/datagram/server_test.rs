@@ -1,5 +1,6 @@
 use super::*;
-use crate::outbound::{DnsConfig, OutboundConfig};
+use crate::outbound::OutboundConfig;
+use crate::runtime::outbound_registry::{RuntimeOutboundLeaf, RuntimeOutboundRegistry};
 use crate::runtime::path::commands::{
     ReliablePathCommand, recv_reliable_path_command, reliable_path_command_channels,
     reliable_path_command_pending_bytes,
@@ -10,27 +11,86 @@ use crate::runtime::path::{
 use crate::runtime::stream::ServerReliableStreamRegistry;
 use crate::runtime::telemetry::RuntimeTelemetry;
 use bytes::Bytes;
+use std::collections::HashMap;
 use std::sync::Arc;
+use std::sync::Mutex;
 use tokio::net::UdpSocket;
 use tokio::sync::oneshot;
 
-fn test_server_datagram_port(telemetry: RuntimeTelemetry) -> ServerDatagramPort {
+struct TestServerDatagramPort {
+    inner: ServerDatagramPort,
+    reliable_streams: crate::runtime::path::ServerStreamPort,
+    carriers: Mutex<HashMap<SessionId, crate::runtime::path::ServerCarrierPathRegistration>>,
+}
+
+impl TestServerDatagramPort {
+    async fn open(
+        &self,
+        request: ServerDatagramOpenRequest,
+    ) -> Result<AcceptedServerDatagramFlow, ServerDatagramOpenError> {
+        {
+            let mut carriers = self.carriers.lock().expect("test carrier registry");
+            carriers.entry(request.session_id).or_insert_with(|| {
+                self.reliable_streams
+                    .register_carrier_path(
+                        request.session_id,
+                        crate::protocol::UnderlayProtocol::Udp,
+                        crate::protocol::PathId(0),
+                        crate::runtime::path::ServerLocalPathProperties::default(),
+                        request.principal_permit.clone(),
+                    )
+                    .expect("register authenticated test carrier")
+            });
+        }
+        self.inner.open(request).await
+    }
+}
+
+fn test_server_datagram_port(telemetry: RuntimeTelemetry) -> TestServerDatagramPort {
     test_server_datagram_port_with_retention(telemetry, Duration::from_secs(60))
 }
 
 fn test_server_datagram_port_with_retention(
     telemetry: RuntimeTelemetry,
     retention: Duration,
-) -> ServerDatagramPort {
-    ServerDatagramService::path_port(
-        OutboundConfig::Direct,
-        DnsConfig::default(),
-        Duration::from_secs(1),
-        retention,
-        MuxLimits::default(),
-        Arc::new(ServerReliableStreamRegistry::new(8)).path_port(),
-        telemetry,
+) -> TestServerDatagramPort {
+    let outbound = OutboundConfig::Direct;
+    let id = crate::product::OutboundId::parse("test-direct").expect("outbound");
+    let outbound_registry = RuntimeOutboundRegistry::compile(
+        [RuntimeOutboundLeaf::Local {
+            id: id.clone(),
+            config: outbound,
+            connect_timeout: Duration::from_secs(1),
+            native_sockets: Arc::new(crate::transport::SystemNativeSocketConfigurator),
+        }],
+        &[],
+        crate::runtime::outbound_registry::test_dns_generation(),
     )
+    .expect("registry");
+    let outbound_selector = outbound_registry
+        .selector_for_target(&crate::config::RouteTarget {
+            kind: crate::config::RouteTargetKind::Outbound,
+            tag: id.as_str().to_string(),
+        })
+        .expect("selector");
+    let reliable_streams = Arc::new(ServerReliableStreamRegistry::new(8)).path_port();
+    let inner = ServerDatagramService::path_port(ServerDatagramServiceConfig {
+        outbound_registry,
+        outbound_selector,
+        dns_plan: None,
+        destination_policy: Arc::new(
+            crate::outbound::ServerDestinationPolicy::allow_restricted_for_test(),
+        ),
+        session_retention_timeout: retention,
+        mux_limits: MuxLimits::default(),
+        reliable_streams: reliable_streams.clone(),
+        telemetry,
+    });
+    TestServerDatagramPort {
+        inner,
+        reliable_streams,
+        carriers: Mutex::new(HashMap::new()),
+    }
 }
 
 async fn await_test_signal(signal: oneshot::Receiver<()>, context: &str) {
@@ -95,6 +155,7 @@ async fn server_datagram_port_owns_target_connection_and_worker() {
     let datagram_id = DatagramId(22);
     let flow = datagrams
         .open(ServerDatagramOpenRequest {
+            principal_permit: crate::product::PrincipalPermit::for_test("test-peer"),
             session_id: crate::protocol::SessionId(20),
             flow_id,
             target: crate::protocol::TargetAddr::Ip(target_addr),
@@ -170,6 +231,7 @@ async fn distinct_client_datagrams_are_admitted_without_waiting_for_target_data(
     let (commands, _command_rx) = reliable_path_command_channels(8);
     let flow = datagrams
         .open(ServerDatagramOpenRequest {
+            principal_permit: crate::product::PrincipalPermit::for_test("test-peer"),
             session_id: SessionId(25),
             flow_id: DatagramFlowId(26),
             target: TargetAddr::Ip(target_addr),
@@ -242,6 +304,7 @@ async fn one_client_datagram_forwards_all_target_datagrams_with_direction_local_
     let flow_id = DatagramFlowId(28);
     let flow = datagrams
         .open(ServerDatagramOpenRequest {
+            principal_permit: crate::product::PrincipalPermit::for_test("test-peer"),
             session_id: SessionId(27),
             flow_id,
             target: TargetAddr::Ip(target_addr),
@@ -337,6 +400,7 @@ async fn delayed_target_datagram_after_later_request_is_not_mislabeled() {
     let flow_id = DatagramFlowId(30);
     let flow = datagrams
         .open(ServerDatagramOpenRequest {
+            principal_permit: crate::product::PrincipalPermit::for_test("test-peer"),
             session_id: SessionId(29),
             flow_id,
             target: TargetAddr::Ip(target_addr),
@@ -425,6 +489,7 @@ async fn same_client_datagram_across_attachments_is_forwarded_once() {
     let target = TargetAddr::Ip(target_addr);
     let flow_a = datagrams
         .open(ServerDatagramOpenRequest {
+            principal_permit: crate::product::PrincipalPermit::for_test("test-peer"),
             session_id,
             flow_id,
             target: target.clone(),
@@ -434,6 +499,7 @@ async fn same_client_datagram_across_attachments_is_forwarded_once() {
         .expect("open first carrier attachment");
     let flow_b = datagrams
         .open(ServerDatagramOpenRequest {
+            principal_permit: crate::product::PrincipalPermit::for_test("test-peer"),
             session_id,
             flow_id,
             target,
@@ -524,6 +590,7 @@ async fn cached_server_datagram_replay_preserves_direction_local_id() {
     let target = TargetAddr::Ip(target_addr);
     let flow_a = datagrams
         .open(ServerDatagramOpenRequest {
+            principal_permit: crate::product::PrincipalPermit::for_test("test-peer"),
             session_id,
             flow_id,
             target: target.clone(),
@@ -561,6 +628,7 @@ async fn cached_server_datagram_replay_preserves_direction_local_id() {
 
     let _flow_b = datagrams
         .open(ServerDatagramOpenRequest {
+            principal_permit: crate::product::PrincipalPermit::for_test("test-peer"),
             session_id,
             flow_id,
             target,
@@ -624,6 +692,7 @@ async fn same_client_datagram_id_with_different_payload_is_rejected() {
     let target = TargetAddr::Ip(target_addr);
     let flow_a = datagrams
         .open(ServerDatagramOpenRequest {
+            principal_permit: crate::product::PrincipalPermit::for_test("test-peer"),
             session_id,
             flow_id,
             target: target.clone(),
@@ -633,6 +702,7 @@ async fn same_client_datagram_id_with_different_payload_is_rejected() {
         .expect("open first carrier attachment");
     let flow_b = datagrams
         .open(ServerDatagramOpenRequest {
+            principal_permit: crate::product::PrincipalPermit::for_test("test-peer"),
             session_id,
             flow_id,
             target,
@@ -703,6 +773,7 @@ async fn cached_target_datagram_is_delivered_when_live_route_capacity_returns() 
     let flow_id = DatagramFlowId(48);
     let flow = datagrams
         .open(ServerDatagramOpenRequest {
+            principal_permit: crate::product::PrincipalPermit::for_test("test-peer"),
             session_id: SessionId(47),
             flow_id,
             target: TargetAddr::Ip(target_addr),
@@ -797,6 +868,7 @@ async fn attachment_drop_starts_full_retention_and_target_traffic_does_not_exten
     let target_address = TargetAddr::Ip(target_addr);
     let flow = datagrams
         .open(ServerDatagramOpenRequest {
+            principal_permit: crate::product::PrincipalPermit::for_test("test-peer"),
             session_id,
             flow_id,
             target: target_address.clone(),
@@ -863,6 +935,7 @@ async fn attachment_drop_starts_full_retention_and_target_traffic_does_not_exten
     let (replacement_commands, _replacement_command_rx) = reliable_path_command_channels(8);
     let _replacement = datagrams
         .open(ServerDatagramOpenRequest {
+            principal_permit: crate::product::PrincipalPermit::for_test("test-peer"),
             session_id,
             flow_id,
             target: target_address,

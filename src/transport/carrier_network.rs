@@ -6,12 +6,18 @@
 
 use crate::protocol::UnderlayProtocol;
 use crate::transport::PathSpec;
+#[cfg(target_os = "linux")]
+use crate::transport::native_egress::LinuxSocketMarker;
+use crate::transport::native_egress::{
+    HostSocketProtectionRequest, HostSocketProtector, HostSocketPurpose, protect_socket,
+};
 use socket2::{Domain, Protocol, SockAddr, Socket, Type};
 use std::collections::VecDeque;
 use std::future::Future;
 use std::io;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::pin::Pin;
+use std::sync::Arc;
 
 /// Stable position of one path within the process configuration generation.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -100,6 +106,245 @@ impl CarrierNetworkProvider for SystemCarrierNetworkProvider {
     }
 }
 
+/// Applies one host VPN protection callback to every carrier socket created by
+/// an underlying resolver/network selector.
+///
+/// Resolution remains owned by `inner`; protection runs once after socket
+/// creation/source binding and before TCP connect or QUIC's first UDP send.
+#[derive(Clone)]
+pub struct ProtectedCarrierNetworkProvider {
+    inner: Arc<dyn CarrierNetworkProvider>,
+    protector: Arc<dyn HostSocketProtector>,
+}
+
+impl ProtectedCarrierNetworkProvider {
+    pub fn new(
+        inner: Arc<dyn CarrierNetworkProvider>,
+        protector: Arc<dyn HostSocketProtector>,
+    ) -> Self {
+        Self { inner, protector }
+    }
+
+    pub fn inner(&self) -> &Arc<dyn CarrierNetworkProvider> {
+        &self.inner
+    }
+
+    pub fn protector(&self) -> &Arc<dyn HostSocketProtector> {
+        &self.protector
+    }
+}
+
+impl std::fmt::Debug for ProtectedCarrierNetworkProvider {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("ProtectedCarrierNetworkProvider")
+            .finish_non_exhaustive()
+    }
+}
+
+impl CarrierNetworkProvider for ProtectedCarrierNetworkProvider {
+    fn resolve<'a>(&'a self, request: CarrierResolutionRequest<'a>) -> CarrierResolutionFuture<'a> {
+        self.inner.resolve(request)
+    }
+
+    fn create_socket(&self, request: CarrierSocketRequest<'_>) -> io::Result<CarrierSocket> {
+        let socket = self.inner.create_socket(request)?;
+        protect_carrier_socket(self.protector.as_ref(), &socket, request)?;
+        Ok(socket)
+    }
+}
+
+fn protect_carrier_socket(
+    protector: &dyn HostSocketProtector,
+    socket: &CarrierSocket,
+    request: CarrierSocketRequest<'_>,
+) -> io::Result<()> {
+    protect_socket(
+        protector,
+        socket,
+        HostSocketProtectionRequest {
+            remote_addr: request.remote_addr,
+            purpose: HostSocketPurpose::MppCarrier {
+                underlay: request.path.underlay,
+                group_ordinal: request.identity.group_ordinal,
+                path_ordinal: request.identity.path_ordinal,
+            },
+        },
+    )
+}
+
+/// One carrier path resolved before host VPN policy is published.
+///
+/// The full path is retained deliberately: an identity alone is not enough to
+/// authorize reuse after a configuration generation changes its endpoint or
+/// source binding.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PreparedCarrierPath {
+    identity: CarrierPathIdentity,
+    path: PathSpec,
+    addresses: Vec<SocketAddr>,
+}
+
+impl PreparedCarrierPath {
+    pub fn new(
+        identity: CarrierPathIdentity,
+        path: PathSpec,
+        addresses: impl IntoIterator<Item = SocketAddr>,
+    ) -> io::Result<Self> {
+        let mut addresses = addresses.into_iter().collect::<Vec<_>>();
+        addresses.retain(|address| {
+            address.port() == path.endpoint.port
+                && path
+                    .binding
+                    .source_ip
+                    .is_none_or(|source| source.is_ipv4() == address.is_ipv4())
+        });
+        let mut unique = Vec::with_capacity(addresses.len());
+        for address in addresses {
+            if !unique.contains(&address) {
+                unique.push(address);
+            }
+        }
+        let addresses = unique;
+        if addresses.is_empty() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!(
+                    "prepared carrier {} has no compatible address",
+                    path.endpoint.authority()
+                ),
+            ));
+        }
+        Ok(Self {
+            identity,
+            path,
+            addresses,
+        })
+    }
+
+    pub fn identity(&self) -> CarrierPathIdentity {
+        self.identity
+    }
+
+    pub fn path(&self) -> &PathSpec {
+        &self.path
+    }
+
+    pub fn addresses(&self) -> &[SocketAddr] {
+        &self.addresses
+    }
+}
+
+/// Immutable, generation-scoped carrier DNS snapshot.
+///
+/// A managed full-tunnel generation resolves every MPP carrier before
+/// publishing host routes. Runtime reconnects then use this snapshot instead
+/// of opening a resolver dependency through the tunnel they are responsible
+/// for establishing.
+#[derive(Debug, Clone)]
+pub struct PreparedCarrierNetworkProvider {
+    paths: Arc<[PreparedCarrierPath]>,
+}
+
+impl PreparedCarrierNetworkProvider {
+    pub fn new(mut paths: Vec<PreparedCarrierPath>) -> io::Result<Self> {
+        paths
+            .sort_unstable_by_key(|path| (path.identity.group_ordinal, path.identity.path_ordinal));
+        if paths
+            .windows(2)
+            .any(|pair| pair[0].identity == pair[1].identity)
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "prepared carrier path identities must be unique",
+            ));
+        }
+        Ok(Self {
+            paths: paths.into(),
+        })
+    }
+
+    pub fn paths(&self) -> &[PreparedCarrierPath] {
+        &self.paths
+    }
+
+    pub fn endpoint_addresses(&self) -> Vec<IpAddr> {
+        let mut addresses = self
+            .paths
+            .iter()
+            .flat_map(|path| path.addresses.iter().map(SocketAddr::ip))
+            .collect::<Vec<_>>();
+        addresses.sort_unstable();
+        addresses.dedup();
+        addresses
+    }
+}
+
+impl CarrierNetworkProvider for PreparedCarrierNetworkProvider {
+    fn resolve<'a>(&'a self, request: CarrierResolutionRequest<'a>) -> CarrierResolutionFuture<'a> {
+        Box::pin(async move {
+            self.paths
+                .iter()
+                .find(|prepared| {
+                    prepared.identity == request.identity && prepared.path == *request.path
+                })
+                .map(|prepared| prepared.addresses.clone())
+                .ok_or_else(|| {
+                    io::Error::new(
+                        io::ErrorKind::NotFound,
+                        format!(
+                            "carrier path {} was not resolved before VPN publication",
+                            request.path.endpoint.authority()
+                        ),
+                    )
+                })
+        })
+    }
+
+    fn create_socket(&self, request: CarrierSocketRequest<'_>) -> io::Result<CarrierSocket> {
+        CarrierSocket::system(request)
+    }
+}
+
+/// Linux carrier wrapper that applies the native-main routing mark before
+/// TCP connect or QUIC's first UDP send.
+#[cfg(target_os = "linux")]
+#[derive(Clone)]
+pub struct LinuxMarkedCarrierNetworkProvider {
+    inner: Arc<dyn CarrierNetworkProvider>,
+    marker: LinuxSocketMarker,
+}
+
+#[cfg(target_os = "linux")]
+impl LinuxMarkedCarrierNetworkProvider {
+    pub fn new(
+        inner: Arc<dyn CarrierNetworkProvider>,
+        mark: crate::platform::LinuxSocketMark,
+    ) -> Self {
+        Self {
+            inner,
+            marker: LinuxSocketMarker::new(mark),
+        }
+    }
+
+    pub fn mark(&self) -> crate::platform::LinuxSocketMark {
+        self.marker.mark()
+    }
+}
+
+#[cfg(target_os = "linux")]
+impl CarrierNetworkProvider for LinuxMarkedCarrierNetworkProvider {
+    fn resolve<'a>(&'a self, request: CarrierResolutionRequest<'a>) -> CarrierResolutionFuture<'a> {
+        self.inner.resolve(request)
+    }
+
+    fn create_socket(&self, request: CarrierSocketRequest<'_>) -> io::Result<CarrierSocket> {
+        let socket = self.inner.create_socket(request)?;
+        protect_carrier_socket(&self.marker, &socket, request)?;
+        Ok(socket)
+    }
+}
+
 /// An unconnected, nonblocking carrier socket whose raw handle can be protected
 /// or assigned to a platform network before runtime starts the connection.
 #[derive(Debug)]
@@ -183,9 +428,23 @@ fn wildcard_addr(remote_addr: SocketAddr) -> SocketAddr {
 }
 
 #[cfg(unix)]
+impl std::os::fd::AsFd for CarrierSocket {
+    fn as_fd(&self) -> std::os::fd::BorrowedFd<'_> {
+        std::os::fd::AsFd::as_fd(&self.socket)
+    }
+}
+
+#[cfg(unix)]
 impl std::os::fd::AsRawFd for CarrierSocket {
     fn as_raw_fd(&self) -> std::os::fd::RawFd {
         std::os::fd::AsRawFd::as_raw_fd(&self.socket)
+    }
+}
+
+#[cfg(windows)]
+impl std::os::windows::io::AsSocket for CarrierSocket {
+    fn as_socket(&self) -> std::os::windows::io::BorrowedSocket<'_> {
+        std::os::windows::io::AsSocket::as_socket(&self.socket)
     }
 }
 

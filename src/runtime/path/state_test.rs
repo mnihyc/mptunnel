@@ -21,7 +21,7 @@ fn tcp_path_test_context(path_count: usize) -> ClientPathContext {
                 .expect("request TCP capacity test path")
         })
         .collect();
-    let security = SecurityConfig::encrypted(
+    let security = ClientSecurityConfig::for_test(
         SharedSecret::new(b"0123456789abcdef0123456789abcdef".to_vec())
             .expect("request TCP capacity test secret"),
     );
@@ -115,7 +115,7 @@ fn peer_path_usage_is_directional_and_sequence_ordered_per_underlay() {
             .parse::<PathSpec>()
             .expect("QUIC path"),
     ];
-    let security = SecurityConfig::encrypted(
+    let security = ClientSecurityConfig::for_test(
         SharedSecret::new(b"0123456789abcdef0123456789abcdef".to_vec())
             .expect("path usage test secret"),
     );

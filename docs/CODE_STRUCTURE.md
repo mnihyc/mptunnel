@@ -3,6 +3,10 @@
 This is the maintained source-organization contract. `RFC.md` defines protocol
 behavior and `docs/ARCHITECTURE.md` maps current owners.
 
+The Product/Core ownership boundary and execution plan are in
+`docs/PRODUCT_PLAN.md` and `docs/PERFORMANCE_PLAN.md`. Internal owners remain
+modules in one application package; directory count is not an architecture.
+
 ## Dependency direction
 
 Later layers may depend on earlier layers; earlier layers must not import later
@@ -127,6 +131,11 @@ immutable cache/history, and `management/control` owns explicit path mutations
 plus peer-request selection. `telemetry` owns exact logical product counters.
 `peer_status` owns only request correlation; TCP and QUIC carrier actors
 keep their independent control stream and writer lifetimes.
+
+DNS has exactly two layers: `src/product/dns.rs` compiles immutable tagged
+policy and `src/dns.rs` owns generation-scoped runtime state and sockets.
+Outbounds may inject a proved direct/bind DNS connector, but must not create a
+second cache, resolver pool, fallback policy, or per-outbound DNS owner.
 
 Reinjection consumes exact retained ranges. Ordinary work must pass the
 cumulative extra-traffic budget. Cause-specific critical recovery may bypass

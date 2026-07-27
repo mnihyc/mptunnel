@@ -39,6 +39,12 @@ pub(crate) const MIN_RATE_SAMPLE_BYTES: u64 = PATH_OPEN_SCORE_BYTES as u64;
 pub(crate) const RELIABLE_STREAM_STARTUP_PRODUCT_WINDOW_BYTES: u64 = 512 * 1024;
 pub(crate) const RELIABLE_UDP_MIN_PRODUCT_WINDOW_BYTES: u64 = 512 * 1024;
 pub(crate) const CAPACITY_TIMING_SLACK_BYTES: u64 = MAX_RELIABLE_SERVICE_QUANTUM_BYTES as u64;
+/// An attachment OPEN is acknowledged without granting another receive window.
+///
+/// Flow-control credit belongs to one logical stream direction and remains
+/// monotonic at the sender, so an explicit zero is a credit-neutral acceptance
+/// token. Only the initial OPEN and the logical receive owner publish credit.
+pub(crate) const RELIABLE_STREAM_ATTACHMENT_ACCEPT_MAX_OFFSET: u64 = 0;
 
 /// Immutable evidence for one exact TCP capacity train.
 ///

@@ -98,7 +98,18 @@ impl ServerTcpPathSession {
         }
     }
 
-    pub(super) async fn run(mut self) -> Result<(), RuntimeError> {
+    pub(super) async fn run(self) -> Result<(), RuntimeError> {
+        let retirement = self
+            .context
+            .wait_for_credential_retirement(self.path_registration.principal_permit().clone());
+        tokio::pin!(retirement);
+        tokio::select! {
+            result = self.run_active() => result,
+            () = &mut retirement => Ok(()),
+        }
+    }
+
+    async fn run_active(mut self) -> Result<(), RuntimeError> {
         loop {
             let event = if let Some(frame) = self.deferred_input.take() {
                 Some(ServerTcpPathEvent::Frame(frame))
@@ -200,6 +211,7 @@ impl ServerTcpPathSession {
                         &self.context,
                         &self.commands_tx,
                         self.session_id,
+                        self.path_registration.principal_permit().clone(),
                         flow_id,
                         target,
                     )

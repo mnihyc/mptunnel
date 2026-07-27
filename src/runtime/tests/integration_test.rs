@@ -903,6 +903,11 @@ async fn auto_bulk_tcp_stream_attaches_measured_path_for_large_response() {
     let expected_payload = payload.clone();
     let target_listener = TcpListener::bind("127.0.0.1:0").await.expect("target bind");
     let target_addr = target_listener.local_addr().expect("target addr");
+    // Keep the logical response alive until the automatically selected path
+    // has crossed TLS, admission, PATH_JOIN, and both readiness frames.
+    // Otherwise a fast loopback EOF can cancel the speculative connection
+    // while its handshake is still in flight.
+    let (release_target_tail_tx, release_target_tail_rx) = oneshot::channel();
     let target = tokio::spawn(async move {
         let (mut stream, _) = target_listener.accept().await.expect("target accept");
         let mut request = [0u8; 4];
@@ -911,7 +916,18 @@ async fn auto_bulk_tcp_stream_attaches_measured_path_for_large_response() {
             .await
             .expect("target request");
         assert_eq!(&request, b"ping");
-        stream.write_all(&payload).await.expect("target response");
+        let tail = payload.len() - 1;
+        stream
+            .write_all(&payload[..tail])
+            .await
+            .expect("target response prefix");
+        release_target_tail_rx
+            .await
+            .expect("release target response tail");
+        stream
+            .write_all(&payload[tail..])
+            .await
+            .expect("target response tail");
         stream.shutdown().await.expect("target shutdown");
     });
 
@@ -1052,14 +1068,41 @@ async fn auto_bulk_tcp_stream_attaches_measured_path_for_large_response() {
 
     client.write_all(b"ping").await.expect("payload write");
     client.shutdown().await.expect("client shutdown");
-    let mut received = vec![0u8; expected_payload.len()];
-    tokio::time::timeout(
-        FULL_STACK_RESPONSE_TIMEOUT,
-        client.read_exact(&mut received),
-    )
+    let response_len = expected_payload.len();
+    let response = tokio::spawn(async move {
+        let mut received = vec![0u8; response_len];
+        client
+            .read_exact(&mut received)
+            .await
+            .expect("payload read");
+        received
+    });
+    tokio::time::timeout(FULL_STACK_RESPONSE_TIMEOUT, async {
+        loop {
+            let registered = server_context
+                .reliable_streams
+                .management_snapshot()
+                .paths
+                .iter()
+                .any(|path| path.configured_index == 1);
+            let ready = health_context
+                .peer_path_usage(UnderlayProtocol::Tcp, 1)
+                .is_some();
+            if registered && ready {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
     .await
-    .expect("response timeout")
-    .expect("payload read");
+    .expect("measured high-bandwidth path never became ready");
+    release_target_tail_tx
+        .send(())
+        .expect("release target response tail");
+    let received = tokio::time::timeout(FULL_STACK_RESPONSE_TIMEOUT, response)
+        .await
+        .expect("response timeout")
+        .expect("response task");
     assert_eq!(received, expected_payload);
 
     let mut accepted = Vec::new();

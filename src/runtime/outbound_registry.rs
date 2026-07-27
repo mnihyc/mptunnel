@@ -1800,11 +1800,23 @@ mod tests {
 
     #[tokio::test]
     async fn gateway_retries_a_failed_leaf_before_committing_the_flow() {
-        let unavailable_proxy = TcpListener::bind("127.0.0.1:0")
+        let rejecting_proxy = TcpListener::bind("127.0.0.1:0")
             .await
-            .expect("proxy reservation");
-        let unavailable_proxy_addr = unavailable_proxy.local_addr().expect("proxy address");
-        drop(unavailable_proxy);
+            .expect("rejecting proxy bind");
+        let rejecting_proxy_addr = rejecting_proxy.local_addr().expect("proxy address");
+        let rejecting_proxy_task = tokio::spawn(async move {
+            let (mut stream, _) = rejecting_proxy.accept().await.expect("proxy accept");
+            let mut greeting = [0_u8; 3];
+            stream
+                .read_exact(&mut greeting)
+                .await
+                .expect("proxy greeting");
+            assert_eq!(greeting, crate::outbound::socks5::no_auth_greeting());
+            stream
+                .write_all(&[0x05, 0xff])
+                .await
+                .expect("proxy rejection");
+        });
         let target = TcpListener::bind("127.0.0.1:0").await.expect("target bind");
         let target_addr = target.local_addr().expect("target address");
         let first = OutboundId::parse("failed-proxy").expect("outbound ID");
@@ -1826,7 +1838,7 @@ mod tests {
                 local_leaf(
                     "failed-proxy",
                     OutboundConfig::Socks5(ProxyConfig::new(
-                        unavailable_proxy_addr
+                        rejecting_proxy_addr
                             .to_string()
                             .parse()
                             .expect("proxy endpoint"),
@@ -1881,6 +1893,7 @@ mod tests {
                 .map(OutboundId::as_str),
             Some("working-direct")
         );
+        rejecting_proxy_task.await.expect("rejecting proxy task");
         target.accept().await.expect("direct target accepted");
     }
 

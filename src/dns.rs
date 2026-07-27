@@ -645,6 +645,7 @@ impl DnsGeneration {
     /// Compile only the direct plans selected by endpoint names that must be
     /// resolved before a managed VPN publishes protected routing. This
     /// deliberately cannot instantiate system or named-outbound DNS.
+    #[cfg(any(target_os = "linux", target_os = "windows"))]
     pub(crate) fn compile_prepublication(
         policy: Arc<CompiledDnsPolicy>,
         domains: &[DomainName],

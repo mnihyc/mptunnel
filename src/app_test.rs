@@ -660,10 +660,21 @@ fn supervised_restart_reopens_disk_into_a_fresh_canonical_store() {
 
     fs::remove_file(&path).expect("remove externally edited config");
     let missing = reopen_supervised_config_file_generation(&invocation)
-        .expect_err("missing external config must stop supervision")
-        .to_string();
-    assert!(missing.contains(&path.display().to_string()));
-    assert!(missing.contains("No such file") || missing.contains("not found"));
+        .expect_err("missing external config must stop supervision");
+    let (missing_path, source) = match missing {
+        AppError::SupervisedConfigReopen { path, source } => (path, source),
+        other => panic!("missing config produced the wrong app error: {other:?}"),
+    };
+    assert_eq!(missing_path, path);
+    let source = match *source {
+        AppError::ConfigStore(source) => source,
+        other => panic!("missing config produced the wrong reopen source: {other:?}"),
+    };
+    let source = match *source {
+        ConfigStoreError::Io(source) => source,
+        other => panic!("missing config produced the wrong store error: {other:?}"),
+    };
+    assert_eq!(source.kind(), std::io::ErrorKind::NotFound);
 }
 
 #[tokio::test]

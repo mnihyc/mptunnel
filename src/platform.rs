@@ -16,6 +16,7 @@ mod linux_transaction;
 mod linux_vpn;
 #[cfg(target_os = "macos")]
 mod macos;
+#[cfg(any(target_os = "linux", target_os = "windows"))]
 mod managed_vpn;
 mod packet_device;
 mod process_plan;

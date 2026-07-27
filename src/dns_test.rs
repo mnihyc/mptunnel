@@ -1388,6 +1388,7 @@ async fn ordered_deadline_and_racing_expected_cidr_failover_are_bounded() {
     assert_eq!(snapshot.plans[0].upstreams[0].canceled_attempts, 1);
 }
 
+#[cfg(any(target_os = "linux", target_os = "windows"))]
 #[tokio::test]
 async fn direct_factory_never_bypasses_a_named_outbound() {
     let proxy = OutboundId::parse("proxy").expect("outbound");

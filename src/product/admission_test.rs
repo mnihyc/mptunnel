@@ -115,40 +115,37 @@ fn concurrent_admission_never_overshoots_and_old_generation_drop_is_isolated() {
     let old = ProductAdmission::new(limits).expect("old generation");
     let replacement = ProductAdmission::new(limits).expect("replacement generation");
     let start = Arc::new(Barrier::new(17));
-    let hold = Arc::new(Barrier::new(9));
     let mut tasks = Vec::new();
     for _ in 0..16 {
         let admission = old.clone();
         let start = start.clone();
-        let hold = hold.clone();
         tasks.push(std::thread::spawn(move || {
             start.wait();
-            let flow = admission.try_admit_flow(principal("shared"), target("shared.example:443"));
-            if let Ok(flow) = flow {
-                let connect = flow
-                    .try_begin_connect(outbound("edge"))
-                    .expect("one connect per admitted flow");
-                let lease = flow.commit(connect.connected());
-                hold.wait();
-                Some(lease)
-            } else {
-                None
-            }
+            admission
+                .try_admit_flow(principal("shared"), target("shared.example:443"))
+                .ok()
+                .map(|flow| {
+                    let connect = flow
+                        .try_begin_connect(outbound("edge"))
+                        .expect("one connect per admitted flow");
+                    flow.commit(connect.connected())
+                })
         }));
     }
     start.wait();
-    while old.snapshot().live_flows < 8 {
-        std::thread::yield_now();
-    }
+    let leases = tasks
+        .into_iter()
+        .map(|task| task.join().expect("admission worker"))
+        .collect::<Vec<_>>();
+
     assert_eq!(old.snapshot().live_flows, 8);
     assert_eq!(replacement.snapshot().live_flows, 0);
-    hold.wait();
-    for task in tasks {
-        drop(task.join().expect("admission worker"));
-    }
+    assert_eq!(leases.iter().filter(|lease| lease.is_some()).count(), 8);
+    assert_eq!(old.snapshot().rejections.global_live_flows, 8);
+
+    drop(leases);
     assert_eq!(old.snapshot().live_flows, 0);
     assert_eq!(replacement.snapshot().live_flows, 0);
-    assert_eq!(old.snapshot().rejections.global_live_flows, 8);
 }
 
 #[tokio::test]

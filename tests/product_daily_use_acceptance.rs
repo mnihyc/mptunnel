@@ -19,7 +19,7 @@ use std::thread;
 use std::time::{Duration, Instant};
 use support::{
     MptunnelProcess, SocksTarget, TestDirectory, check_config, http_request, join_thread,
-    network_test_guard, socks5_connect, socks5_round_trip, spawn_closing_proxy,
+    network_test_guard, socks5_connect, socks5_round_trip, spawn_blackhole_proxy,
     spawn_echo_socks5_proxy, spawn_tcp_echo, unused_loopback_addr, wait_for_ready_management,
     wait_for_tcp, wait_for_tcp_closed,
 };
@@ -793,7 +793,7 @@ fn packaged_routing_exercises_reject_proxy_failover_mpp_and_direct_egress() {
     let mpp = unused_loopback_addr();
     let socks = unused_loopback_addr();
     let management = unused_loopback_addr();
-    let (failing_proxy, failing_task) = spawn_closing_proxy();
+    let (failing_proxy, failing_task) = spawn_blackhole_proxy();
     let proxy_target = Ipv4Addr::new(8, 8, 8, 8);
     let (working_proxy, working_task) = spawn_echo_socks5_proxy(proxy_target, 443);
     let (direct_target, direct_task) = spawn_tcp_echo();

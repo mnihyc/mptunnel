@@ -186,6 +186,13 @@ impl RuntimeOutboundLeaf {
         matches!(self, Self::Local { .. })
     }
 
+    fn requires_ip_target(&self) -> bool {
+        match self {
+            Self::Mpp { .. } => false,
+            Self::Local { config, .. } => config.requires_ip_target(),
+        }
+    }
+
     const fn open_timeout(&self) -> Duration {
         match self {
             Self::Mpp { .. } => DEFAULT_OUTBOUND_CONNECT_TIMEOUT,
@@ -240,10 +247,8 @@ pub(in crate::runtime) enum OpenedUdpOutbound {
 
 struct ProductLeafOpen<'a> {
     destination: &'a mut ProductDestination,
-    authorizer: &'a dyn DestinationAuthorizer,
     dns_plan: Option<&'a DnsPlanId>,
     traffic_class: TrafficClass,
-    deadline: tokio::time::Instant,
     gateway_lease: Option<GatewayFlowLease>,
     scope: ProductFlowScope,
     observe_native: bool,
@@ -256,7 +261,6 @@ pub(in crate::runtime) struct ProductOpenRequest<'a> {
     pub(in crate::runtime) authorizer: &'a dyn DestinationAuthorizer,
     pub(in crate::runtime) dns_plan: Option<&'a DnsPlanId>,
     pub(in crate::runtime) traffic_class: TrafficClass,
-    pub(in crate::runtime) deadline: tokio::time::Instant,
 }
 
 pub(in crate::runtime) enum ProductDestination {
@@ -523,17 +527,18 @@ impl RuntimeOutboundRegistry {
         }
     }
 
-    /// One absolute transaction deadline shared by DNS, post-resolution route
-    /// groups, balancer members, and MPP path attempts for a Product flow.
-    pub(in crate::runtime) fn flow_open_deadline(&self) -> tokio::time::Instant {
-        let timeout = self
-            .shell
-            .leaves
-            .values()
-            .map(|leaf| leaf.open_timeout())
-            .max()
-            .unwrap_or(DEFAULT_OUTBOUND_CONNECT_TIMEOUT);
-        tokio::time::Instant::now() + timeout
+    pub(in crate::runtime) fn destination_resolution_deadline(
+        &self,
+        dns_plan: Option<&DnsPlanId>,
+        target: &ProtocolTarget,
+    ) -> Result<tokio::time::Instant, RuntimeError> {
+        let Some(domain) = target.domain() else {
+            return deadline_after(Duration::ZERO);
+        };
+        let timeout = self.dns.lookup_timeout(dns_plan, domain).map_err(|error| {
+            RuntimeError::OutboundConnect(outbound::OutboundConnectError::Dns(error))
+        })?;
+        deadline_after(timeout)
     }
 
     pub(in crate::runtime) fn selection_for_egress(
@@ -563,11 +568,11 @@ impl RuntimeOutboundRegistry {
         traffic_class: TrafficClass,
         authorizer: &dyn DestinationAuthorizer,
     ) -> Result<OpenedTcpOutbound, RuntimeError> {
-        let deadline = self.flow_open_deadline();
         let authorization = authorizer
             .begin(Network::Tcp, target)
             .map_err(|error| RuntimeError::DestinationDenied(error.to_string()))?;
         let pending = self.try_admit_product_flow(authorization.flow())?;
+        let deadline = self.destination_resolution_deadline(dns_plan, authorization.target())?;
         let destination =
             authorize_product_destination(&self.dns, dns_plan, authorizer, authorization, deadline)
                 .await?;
@@ -580,7 +585,6 @@ impl RuntimeOutboundRegistry {
                     authorizer,
                     dns_plan,
                     traffic_class,
-                    deadline,
                 },
                 ProductFlowOriginKind::MppInbound,
                 false,
@@ -596,11 +600,11 @@ impl RuntimeOutboundRegistry {
         dns_plan: Option<&DnsPlanId>,
         authorizer: &dyn DestinationAuthorizer,
     ) -> Result<OpenedUdpOutbound, RuntimeError> {
-        let deadline = self.flow_open_deadline();
         let authorization = authorizer
             .begin(Network::Udp, target)
             .map_err(|error| RuntimeError::DestinationDenied(error.to_string()))?;
         let pending = self.try_admit_product_flow(authorization.flow())?;
+        let deadline = self.destination_resolution_deadline(dns_plan, authorization.target())?;
         let destination =
             authorize_product_destination(&self.dns, dns_plan, authorizer, authorization, deadline)
                 .await?;
@@ -613,7 +617,6 @@ impl RuntimeOutboundRegistry {
                     authorizer,
                     dns_plan,
                     traffic_class: TrafficClass::RealtimeDatagram,
-                    deadline,
                 },
                 ProductFlowOriginKind::MppInbound,
                 false,
@@ -643,7 +646,6 @@ impl RuntimeOutboundRegistry {
             authorizer,
             dns_plan,
             traffic_class,
-            deadline,
         } = request;
         ensure_destination_network(&destination, Network::Tcp)?;
         ensure_product_open_identity(&destination, pending)?;
@@ -652,6 +654,10 @@ impl RuntimeOutboundRegistry {
         match selection {
             EgressSelection::Outbound(id) => {
                 let leaf = self.shell.require_leaf(id, Network::Tcp)?;
+                if leaf.requires_ip_target() {
+                    self.resolve_destination(&mut destination, dns_plan, authorizer)
+                        .await?;
+                }
                 let scope = product_flow_scope(&destination, origin_kind, leaf.id(), None)?;
                 let connect = pending
                     .try_begin_connect(leaf.id().clone())
@@ -661,10 +667,8 @@ impl RuntimeOutboundRegistry {
                         leaf,
                         ProductLeafOpen {
                             destination: &mut destination,
-                            authorizer,
                             dns_plan,
                             traffic_class,
-                            deadline,
                             gateway_lease: None,
                             scope,
                             observe_native,
@@ -678,8 +682,8 @@ impl RuntimeOutboundRegistry {
                 let attempt_limit = runtime.member_count();
                 let mut excluded = Vec::with_capacity(attempt_limit);
                 let mut last_error = None;
+                let mut resolution_unavailable = false;
                 for _ in 0..attempt_limit {
-                    ensure_before_deadline(deadline)?;
                     let binding = match runtime.select_for_principal(
                         Network::Tcp,
                         protocol_target,
@@ -693,6 +697,24 @@ impl RuntimeOutboundRegistry {
                     let leaf = self
                         .shell
                         .require_leaf(runtime.member_id(handle)?, Network::Tcp)?;
+                    if leaf.requires_ip_target() {
+                        if resolution_unavailable {
+                            excluded.push(handle);
+                            continue;
+                        }
+                        if let Err(error) = self
+                            .resolve_destination(&mut destination, dns_plan, authorizer)
+                            .await
+                        {
+                            if matches!(error, RuntimeError::DestinationDenied(_)) {
+                                return Err(error);
+                            }
+                            resolution_unavailable = true;
+                            excluded.push(handle);
+                            last_error = Some(error);
+                            continue;
+                        }
+                    }
                     let scope = product_flow_scope(&destination, origin_kind, leaf.id(), Some(id))?;
                     let connect = match pending.try_begin_connect(leaf.id().clone()) {
                         Ok(connect) => connect,
@@ -707,10 +729,8 @@ impl RuntimeOutboundRegistry {
                             leaf,
                             ProductLeafOpen {
                                 destination: &mut destination,
-                                authorizer,
                                 dns_plan,
                                 traffic_class,
-                                deadline,
                                 gateway_lease: Some(binding.lease),
                                 scope,
                                 observe_native,
@@ -756,7 +776,6 @@ impl RuntimeOutboundRegistry {
             authorizer,
             dns_plan,
             traffic_class,
-            deadline,
         } = request;
         ensure_destination_network(&destination, Network::Udp)?;
         ensure_product_open_identity(&destination, pending)?;
@@ -765,6 +784,10 @@ impl RuntimeOutboundRegistry {
         match selection {
             EgressSelection::Outbound(id) => {
                 let leaf = self.shell.require_leaf(id, Network::Udp)?;
+                if leaf.requires_ip_target() {
+                    self.resolve_destination(&mut destination, dns_plan, authorizer)
+                        .await?;
+                }
                 let scope = product_flow_scope(&destination, origin_kind, leaf.id(), None)?;
                 let connect = pending
                     .try_begin_connect(leaf.id().clone())
@@ -774,10 +797,8 @@ impl RuntimeOutboundRegistry {
                         leaf,
                         ProductLeafOpen {
                             destination: &mut destination,
-                            authorizer,
                             dns_plan,
                             traffic_class,
-                            deadline,
                             gateway_lease: None,
                             scope,
                             observe_native,
@@ -791,8 +812,8 @@ impl RuntimeOutboundRegistry {
                 let attempt_limit = runtime.member_count();
                 let mut excluded = Vec::with_capacity(attempt_limit);
                 let mut last_error = None;
+                let mut resolution_unavailable = false;
                 for _ in 0..attempt_limit {
-                    ensure_before_deadline(deadline)?;
                     let binding = match runtime.select_for_principal(
                         Network::Udp,
                         protocol_target,
@@ -806,6 +827,24 @@ impl RuntimeOutboundRegistry {
                     let leaf = self
                         .shell
                         .require_leaf(runtime.member_id(handle)?, Network::Udp)?;
+                    if leaf.requires_ip_target() {
+                        if resolution_unavailable {
+                            excluded.push(handle);
+                            continue;
+                        }
+                        if let Err(error) = self
+                            .resolve_destination(&mut destination, dns_plan, authorizer)
+                            .await
+                        {
+                            if matches!(error, RuntimeError::DestinationDenied(_)) {
+                                return Err(error);
+                            }
+                            resolution_unavailable = true;
+                            excluded.push(handle);
+                            last_error = Some(error);
+                            continue;
+                        }
+                    }
                     let scope = product_flow_scope(&destination, origin_kind, leaf.id(), Some(id))?;
                     let connect = match pending.try_begin_connect(leaf.id().clone()) {
                         Ok(connect) => connect,
@@ -820,10 +859,8 @@ impl RuntimeOutboundRegistry {
                             leaf,
                             ProductLeafOpen {
                                 destination: &mut destination,
-                                authorizer,
                                 dns_plan,
                                 traffic_class,
-                                deadline,
                                 gateway_lease: Some(binding.lease),
                                 scope,
                                 observe_native,
@@ -855,14 +892,13 @@ impl RuntimeOutboundRegistry {
     ) -> Result<OpenedTcpOutbound, RuntimeError> {
         let ProductLeafOpen {
             destination,
-            authorizer,
             dns_plan,
             traffic_class,
-            deadline,
             mut gateway_lease,
             scope,
             observe_native,
         } = request;
+        let deadline = deadline_after(leaf.open_timeout())?;
         let opened: Result<OpenedTcpOutbound, RuntimeError> = async {
             match leaf.as_ref() {
                 RuntimeOutboundLeaf::Mpp {
@@ -885,21 +921,16 @@ impl RuntimeOutboundRegistry {
                 }
                 RuntimeOutboundLeaf::Local {
                     config,
-                    connect_timeout,
                     native_sockets,
                     ..
                 } => {
-                    if config.requires_ip_target() {
-                        self.resolve_destination(destination, dns_plan, authorizer, deadline)
-                            .await?;
-                    }
                     let connector_target = connector_target(destination)?;
                     let stream = outbound::connect_tcp_target_with_configurator(
                         config,
                         &self.dns,
                         dns_plan,
                         connector_target,
-                        leaf_deadline(deadline, *connect_timeout)?,
+                        deadline,
                         native_sockets.as_ref(),
                     )
                     .await?;
@@ -970,10 +1001,8 @@ impl RuntimeOutboundRegistry {
     ) -> Result<OpenedUdpOutbound, RuntimeError> {
         let ProductLeafOpen {
             destination,
-            authorizer,
             dns_plan,
             traffic_class,
-            deadline,
             mut gateway_lease,
             scope,
             observe_native,
@@ -981,7 +1010,6 @@ impl RuntimeOutboundRegistry {
         match leaf.as_ref() {
             RuntimeOutboundLeaf::Mpp { context, .. } => {
                 let target = mpp_udp_target(destination)?;
-                ensure_before_deadline(deadline)?;
                 Ok(OpenedUdpOutbound::Mpp {
                     context: context.with_product_flow_scope(scope.clone()),
                     target,
@@ -992,21 +1020,17 @@ impl RuntimeOutboundRegistry {
             }
             RuntimeOutboundLeaf::Local {
                 config,
-                connect_timeout,
                 native_sockets,
                 ..
             } => {
-                if config.requires_ip_target() {
-                    self.resolve_destination(destination, dns_plan, authorizer, deadline)
-                        .await?;
-                }
                 let connector_target = connector_target(destination)?;
+                let deadline = deadline_after(leaf.open_timeout())?;
                 let socket = match outbound::connect_udp_target_with_configurator(
                     config,
                     &self.dns,
                     dns_plan,
                     connector_target,
-                    leaf_deadline(deadline, *connect_timeout)?,
+                    deadline,
                     native_sockets.as_ref(),
                 )
                 .await
@@ -1040,9 +1064,10 @@ impl RuntimeOutboundRegistry {
         destination: &'a mut ProductDestination,
         dns_plan: Option<&DnsPlanId>,
         authorizer: &dyn DestinationAuthorizer,
-        deadline: tokio::time::Instant,
     ) -> Result<&'a [AuthorizedTarget], RuntimeError> {
         if let ProductDestination::Domain(domain) = destination {
+            let deadline =
+                self.destination_resolution_deadline(dns_plan, domain.flow().target())?;
             let authorized = outbound::resolve_authorized_domain_before(
                 &self.dns, dns_plan, authorizer, domain, deadline,
             )
@@ -1666,21 +1691,10 @@ fn map_destination_resolution_error(error: outbound::OutboundConnectError) -> Ru
     }
 }
 
-fn ensure_before_deadline(deadline: tokio::time::Instant) -> Result<(), RuntimeError> {
-    if tokio::time::Instant::now() >= deadline {
-        return Err(RuntimeError::OutboundConnect(
-            outbound::OutboundConnectError::ConnectTimeout,
-        ));
-    }
-    Ok(())
-}
-
-fn leaf_deadline(
-    transaction_deadline: tokio::time::Instant,
-    leaf_timeout: Duration,
-) -> Result<tokio::time::Instant, RuntimeError> {
-    ensure_before_deadline(transaction_deadline)?;
-    Ok(transaction_deadline.min(tokio::time::Instant::now() + leaf_timeout))
+fn deadline_after(timeout: Duration) -> Result<tokio::time::Instant, RuntimeError> {
+    tokio::time::Instant::now()
+        .checked_add(timeout)
+        .ok_or_else(|| RuntimeError::ProductPolicy("Product stage deadline overflow".to_string()))
 }
 
 #[cfg(test)]
@@ -1707,13 +1721,21 @@ mod tests {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tokio::net::{TcpListener, UdpSocket};
 
-    fn local_leaf(id: &str, config: OutboundConfig) -> RuntimeOutboundLeaf {
+    fn local_leaf_with_timeout(
+        id: &str,
+        config: OutboundConfig,
+        connect_timeout: Duration,
+    ) -> RuntimeOutboundLeaf {
         RuntimeOutboundLeaf::Local {
             id: OutboundId::parse(id).expect("outbound ID"),
             config,
-            connect_timeout: Duration::from_millis(250),
+            connect_timeout,
             native_sockets: Arc::new(crate::transport::SystemNativeSocketConfigurator),
         }
+    }
+
+    fn local_leaf(id: &str, config: OutboundConfig) -> RuntimeOutboundLeaf {
+        local_leaf_with_timeout(id, config, Duration::from_millis(250))
     }
 
     fn selection(registry: &RuntimeOutboundRegistry, id: &str) -> EgressSelection {
@@ -1947,11 +1969,11 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn gateway_domain_resolution_is_lazy_and_irreversible() {
-        let rejecting_proxy = TcpListener::bind("127.0.0.1:0")
+    async fn gateway_blackhole_failover_keeps_domain_resolution_lazy_and_irreversible() {
+        let blackhole_proxy = TcpListener::bind("127.0.0.1:0")
             .await
-            .expect("rejecting proxy bind");
-        let rejecting_proxy_addr = rejecting_proxy.local_addr().expect("proxy address");
+            .expect("blackhole proxy bind");
+        let blackhole_proxy_addr = blackhole_proxy.local_addr().expect("proxy address");
         let target = TcpListener::bind("127.0.0.1:0").await.expect("target bind");
         let target_addr = target.local_addr().expect("target address");
         let target_name = "fallback.example";
@@ -1960,8 +1982,8 @@ mod tests {
             port: target_addr.port(),
         };
         let expected_proxy_target = domain_target.clone();
-        let rejecting_proxy_task = tokio::spawn(async move {
-            let (mut stream, _) = rejecting_proxy.accept().await.expect("proxy accept");
+        let blackhole_proxy_task = tokio::spawn(async move {
+            let (mut stream, _) = blackhole_proxy.accept().await.expect("proxy accept");
             let mut greeting = [0_u8; 3];
             stream
                 .read_exact(&mut greeting)
@@ -1977,10 +1999,11 @@ mod tests {
                 .await
                 .expect("proxy request");
             assert_eq!(request, expected, "proxy must receive the canonical domain");
+            let mut remainder = Vec::new();
             stream
-                .write_all(&[0x05, 0x05, 0x00, 0x01, 0, 0, 0, 0, 0, 0])
+                .read_to_end(&mut remainder)
                 .await
-                .expect("proxy rejection");
+                .expect("timed-out proxy attempt closes");
         });
         let first = OutboundId::parse("failed-proxy").expect("outbound ID");
         let second = OutboundId::parse("working-direct").expect("outbound ID");
@@ -2002,17 +2025,22 @@ mod tests {
         )]));
         let registry = RuntimeOutboundRegistry::compile(
             [
-                local_leaf(
+                local_leaf_with_timeout(
                     "failed-proxy",
                     OutboundConfig::Socks5(ProxyConfig::new(
-                        rejecting_proxy_addr
+                        blackhole_proxy_addr
                             .to_string()
                             .parse()
                             .expect("proxy endpoint"),
                         None,
                     )),
+                    Duration::from_secs(1),
                 ),
-                local_leaf("working-direct", OutboundConfig::Direct),
+                local_leaf_with_timeout(
+                    "working-direct",
+                    OutboundConfig::Direct,
+                    Duration::from_secs(1),
+                ),
             ],
             &balancers,
             dns.clone(),
@@ -2020,6 +2048,7 @@ mod tests {
         .expect("registry");
         let policy = crate::outbound::ServerDestinationPolicy::allow_restricted_for_test()
             .test_principal_policy();
+        let started = tokio::time::Instant::now();
         let opened = registry
             .open_tcp(
                 &EgressSelection::Balancer(balancer_id),
@@ -2030,6 +2059,10 @@ mod tests {
             )
             .await
             .expect("bounded pre-commit failover");
+        assert!(
+            started.elapsed() >= Duration::from_millis(900),
+            "the blackholed member must retain its configured one-second connect stage"
+        );
         let OpenedTcpOutbound::Local {
             _gateway_lease: Some(_),
             _product_flow,
@@ -2060,7 +2093,7 @@ mod tests {
                 .map(OutboundId::as_str),
             Some("working-direct")
         );
-        rejecting_proxy_task.await.expect("rejecting proxy task");
+        blackhole_proxy_task.await.expect("blackhole proxy task");
         target.accept().await.expect("direct target accepted");
         let dns = dns.runtime_snapshot();
         assert!(
@@ -2071,6 +2104,125 @@ mod tests {
             dns.plans[0].fresh_cache_hits, 0,
             "the promoted destination must not be resolved a second time"
         );
+
+        let remote_proxy = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("remote-resolution proxy bind");
+        let remote_proxy_addr = remote_proxy.local_addr().expect("proxy address");
+        let unresolved_target = TargetAddr::Domain {
+            host: "remote-resolution.example".to_string(),
+            port: 443,
+        };
+        let expected_domain = unresolved_target.clone();
+        let remote_proxy_task = tokio::spawn(async move {
+            let (mut stream, _) = remote_proxy.accept().await.expect("proxy accept");
+            let mut greeting = [0_u8; 3];
+            stream
+                .read_exact(&mut greeting)
+                .await
+                .expect("proxy greeting");
+            assert_eq!(greeting, crate::outbound::socks5::no_auth_greeting());
+            stream.write_all(&[0x05, 0x00]).await.expect("proxy method");
+            let expected = crate::outbound::socks5::connect_request(&expected_domain)
+                .expect("expected domain request");
+            let mut request = vec![0_u8; expected.len()];
+            stream
+                .read_exact(&mut request)
+                .await
+                .expect("proxy request");
+            assert_eq!(
+                request, expected,
+                "DNS failure on an IP-only member must not replace the canonical domain"
+            );
+            stream
+                .write_all(&[0x05, 0x00, 0x00, 0x01, 127, 0, 0, 1, 0, 0])
+                .await
+                .expect("proxy success");
+        });
+        let local = OutboundId::parse("dns-required-direct").expect("outbound ID");
+        let second_local = OutboundId::parse("second-dns-required-direct").expect("outbound ID");
+        let remote = OutboundId::parse("remote-domain-proxy").expect("outbound ID");
+        let dns_failover_id = BalancerId::parse("dns-failover").expect("balancer ID");
+        let dns_failover_balancers = [GatewayBalancerConfig {
+            id: dns_failover_id.clone(),
+            generation: 1,
+            spec: GatewayBalancerSpec::new(
+                GatewayStrategy::OrderedFailover,
+                vec![
+                    GatewayMemberSpec::new(local, 1, NetworkSet::TCP_UDP),
+                    GatewayMemberSpec::new(second_local, 1, NetworkSet::TCP_UDP),
+                    GatewayMemberSpec::new(remote, 1, NetworkSet::TCP_UDP),
+                ],
+            ),
+        }];
+        let failing_dns = DnsGeneration::from_test_answers(HashMap::new());
+        let dns_failover_registry = RuntimeOutboundRegistry::compile(
+            [
+                local_leaf_with_timeout(
+                    "dns-required-direct",
+                    OutboundConfig::Direct,
+                    Duration::from_secs(1),
+                ),
+                local_leaf_with_timeout(
+                    "second-dns-required-direct",
+                    OutboundConfig::Direct,
+                    Duration::from_secs(1),
+                ),
+                local_leaf_with_timeout(
+                    "remote-domain-proxy",
+                    OutboundConfig::Socks5(ProxyConfig::new(
+                        remote_proxy_addr
+                            .to_string()
+                            .parse()
+                            .expect("proxy endpoint"),
+                        None,
+                    )),
+                    Duration::from_secs(1),
+                ),
+            ],
+            &dns_failover_balancers,
+            failing_dns.clone(),
+        )
+        .expect("DNS failover registry");
+        let opened = dns_failover_registry
+            .open_tcp(
+                &EgressSelection::Balancer(dns_failover_id.clone()),
+                &unresolved_target,
+                None,
+                TrafficClass::Latency,
+                &policy,
+            )
+            .await
+            .expect("remote-resolution member survives local DNS failure");
+        let OpenedTcpOutbound::Local { _product_flow, .. } = opened else {
+            panic!("expected the remote-resolution proxy member");
+        };
+        assert_eq!(
+            _product_flow.scope().selection.outbound.as_str(),
+            "remote-domain-proxy"
+        );
+        let snapshots = dns_failover_registry
+            .gateway_control()
+            .snapshots()
+            .expect("balancer snapshot");
+        let members = &snapshots[0].runtime.members;
+        assert_eq!(members[0].counters.open_attempts, 1);
+        assert_eq!(
+            members[0].counters.open_failures, 0,
+            "shared target DNS failure is not gateway failure evidence"
+        );
+        assert_eq!(members[1].counters.open_attempts, 1);
+        assert_eq!(
+            members[1].counters.open_failures, 0,
+            "skipping a member after flow-level DNS failure is not gateway failure evidence"
+        );
+        assert_eq!(members[2].counters.open_successes, 1);
+        assert_eq!(
+            failing_dns.runtime_snapshot().plans[0].queries,
+            2,
+            "one dual-family flow lookup must not be repeated for every IP-only member"
+        );
+        remote_proxy_task.await.expect("remote proxy task");
 
         let closed_target = TcpListener::bind("127.0.0.1:0")
             .await

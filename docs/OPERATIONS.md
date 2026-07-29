@@ -160,10 +160,20 @@ process-wide concurrency bound. Least-latency uses only fresh Product-owned
 end-to-end observations, while least-load uses Product flow leases. Neither
 strategy reads MPP carrier/path metrics.
 
-All member attempts for one flow share one absolute open deadline. A failed
-member may be retried only before the target connection or association commits.
-After commit, success/failure is passive health evidence and never authorizes
-transparent replay through another member.
+Each selected local TCP or native UDP member receives its configured outbound
+connect timeout, and an MPP TCP member receives its Product open timeout. A
+blackholed member therefore cannot consume a successor's attempt budget, and
+unrelated outbounds do not lengthen or shorten the selected balancer. MPP UDP
+has no pre-commit network-open stage; its first send supplies the open outcome.
+If an IP-only member needs target DNS, the flow performs one lookup under the
+selected DNS plan's own timeout. Successful authorization promotes the target
+to one retained address set. Failure is retained for that flow, skips later
+IP-only members without another lookup, and may continue to a domain-capable
+member without marking any skipped member unhealthy. The complete pre-commit
+operation remains bounded by the configured member count and stage timeouts. A
+failed member may be retried only before the target connection or association
+commits. After commit, success/failure is passive health evidence and never
+authorizes transparent replay through another member.
 
 Use repeated explicit IPv4 and IPv6 listener/bind/resolver values. Do not rely
 on OS-specific dual-stack defaults. Egress DNS strategy and connect timeout

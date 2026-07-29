@@ -771,6 +771,26 @@ impl DnsGeneration {
         self.policy.generation()
     }
 
+    /// Exact target-resolution bound selected by Product DNS policy.
+    ///
+    /// Connector and balancer stages use this to keep DNS time separate from
+    /// an outbound's own connect timeout. A route-selected plan takes
+    /// precedence; otherwise normal exact/suffix/default DNS selection applies.
+    pub(crate) fn lookup_timeout(
+        &self,
+        plan: Option<&DnsPlanId>,
+        domain: &DomainName,
+    ) -> Result<Duration, DnsRuntimeError> {
+        let plan = match plan {
+            Some(plan) => self
+                .policy
+                .plan(plan)
+                .ok_or_else(|| DnsRuntimeError::UnknownPlan(plan.clone()))?,
+            None => self.policy.select(domain).plan(),
+        };
+        Ok(plan.limits().lookup_timeout)
+    }
+
     pub fn runtime_snapshot(&self) -> DnsRuntimeSnapshot {
         let now = Instant::now();
         DnsRuntimeSnapshot {

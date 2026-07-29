@@ -285,7 +285,10 @@ Implemented policy includes:
 - Product-owned active TCP probes to a literal IP authority;
 - passive open and completed-flow outcomes;
 - freshness, failure/recovery hysteresis, cooldown, and bounded backoff;
-- one absolute open deadline shared by pre-commit member retries; and
+- one retained flow-level Product DNS stage when an IP-only member first needs
+  address evidence, followed by independent TCP/native UDP connect or MPP TCP
+  open stages, so a blackhole cannot consume a successor's configured attempt
+  budget; and
 - per-member load, latency, health, error, selection, and probe counters.
 
 Least-latency and least-load never inspect MPP path metrics. Draining stops

@@ -73,7 +73,9 @@ impl ClientOutboundPlan {
         let pending = self
             .registry
             .try_admit_product_flow(&self.authorizer.flow)?;
-        let deadline = self.registry.flow_open_deadline();
+        let deadline = self
+            .registry
+            .destination_resolution_deadline(self.dns_plan.as_ref(), self.authorization.target())?;
         let groups = self
             .destination_route_groups(Network::Tcp, deadline)
             .await?;
@@ -88,7 +90,6 @@ impl ClientOutboundPlan {
                     authorizer: &self.authorizer,
                     dns_plan: self.dns_plan.as_ref(),
                     traffic_class: group.traffic_class,
-                    deadline,
                 })
                 .await
             {
@@ -120,7 +121,9 @@ impl ClientOutboundPlan {
         let pending = self
             .registry
             .try_admit_product_flow(&self.authorizer.flow)?;
-        let deadline = self.registry.flow_open_deadline();
+        let deadline = self
+            .registry
+            .destination_resolution_deadline(self.dns_plan.as_ref(), self.authorization.target())?;
         let groups = self
             .destination_route_groups(Network::Udp, deadline)
             .await?;
@@ -135,7 +138,6 @@ impl ClientOutboundPlan {
                     authorizer: &self.authorizer,
                     dns_plan: self.dns_plan.as_ref(),
                     traffic_class: group.traffic_class,
-                    deadline,
                 })
                 .await
             {
@@ -493,6 +495,7 @@ mod tests {
         ClientSecurityConfig, GatewayBalancerConfig, ResourceLimits, SharedSecret,
     };
     use crate::ingress::ProxyAuthConfig;
+    use crate::outbound::{OutboundConfig, ProxyConfig};
     use crate::performance::MppPerformanceConfig;
     use crate::product::{
         BalancerId, DomainName, GatewayBalancerSpec, GatewayMemberSpec, GatewayStrategy,
@@ -506,7 +509,10 @@ mod tests {
     use crate::runtime::path::ClientPathContext;
     use std::collections::HashMap;
     use std::net::{IpAddr, Ipv4Addr};
+    use std::sync::Arc;
+    use std::time::Duration;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::net::TcpListener;
 
     fn security() -> ClientSecurityConfig {
         ClientSecurityConfig::for_test(
@@ -859,6 +865,143 @@ mod tests {
             plan.open_udp(&denied).await,
             Err(RuntimeError::RouteRejected)
         ));
+    }
+
+    #[tokio::test]
+    async fn post_resolution_route_groups_keep_independent_member_deadlines() {
+        let blackhole = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("blackhole proxy bind");
+        let blackhole_addr = blackhole.local_addr().expect("blackhole proxy address");
+        let working = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("working proxy bind");
+        let working_addr = working.local_addr().expect("working proxy address");
+        let first_target = TargetAddr::Ip("8.8.8.8:443".parse().expect("first target"));
+        let second_target = TargetAddr::Ip("1.1.1.1:443".parse().expect("second target"));
+        let first_expected = first_target.clone();
+        let second_expected = second_target.clone();
+        let blackhole_task = tokio::spawn(async move {
+            let (mut stream, _) = blackhole.accept().await.expect("blackhole accept");
+            let mut greeting = [0_u8; 3];
+            stream
+                .read_exact(&mut greeting)
+                .await
+                .expect("blackhole greeting");
+            assert_eq!(greeting, crate::outbound::socks5::no_auth_greeting());
+            stream
+                .write_all(&[0x05, 0x00])
+                .await
+                .expect("blackhole method");
+            let expected =
+                crate::outbound::socks5::connect_request(&first_expected).expect("first request");
+            let mut request = vec![0_u8; expected.len()];
+            stream
+                .read_exact(&mut request)
+                .await
+                .expect("blackhole request");
+            assert_eq!(request, expected);
+            let mut remainder = Vec::new();
+            stream
+                .read_to_end(&mut remainder)
+                .await
+                .expect("first route-group timeout closes");
+        });
+        let working_task = tokio::spawn(async move {
+            let (mut stream, _) = working.accept().await.expect("working accept");
+            let mut greeting = [0_u8; 3];
+            stream
+                .read_exact(&mut greeting)
+                .await
+                .expect("working greeting");
+            assert_eq!(greeting, crate::outbound::socks5::no_auth_greeting());
+            stream
+                .write_all(&[0x05, 0x00])
+                .await
+                .expect("working method");
+            let expected =
+                crate::outbound::socks5::connect_request(&second_expected).expect("second request");
+            let mut request = vec![0_u8; expected.len()];
+            stream
+                .read_exact(&mut request)
+                .await
+                .expect("working request");
+            assert_eq!(request, expected);
+            stream
+                .write_all(&[0x05, 0x00, 0x00, 0x01, 127, 0, 0, 1, 0, 0])
+                .await
+                .expect("working success");
+        });
+
+        let first = OutboundId::parse("first-route-proxy").expect("first outbound");
+        let second = OutboundId::parse("second-route-proxy").expect("second outbound");
+        let routes = vec![
+            rule(
+                "first-address",
+                RouteMatchSpec {
+                    destination_cidrs: vec!["8.8.8.0/24".parse().expect("first CIDR")],
+                    stages: vec![RouteStage::PostResolution],
+                    ..RouteMatchSpec::default()
+                },
+                EgressAction::Outbound(first.clone()),
+            ),
+            rule(
+                "second-address",
+                RouteMatchSpec {
+                    destination_cidrs: vec!["1.1.1.0/24".parse().expect("second CIDR")],
+                    stages: vec![RouteStage::PostResolution],
+                    ..RouteMatchSpec::default()
+                },
+                EgressAction::Outbound(second.clone()),
+            ),
+            rule("default", RouteMatchSpec::default(), EgressAction::Reject),
+        ];
+        let dns = crate::dns::DnsGeneration::from_test_answers(HashMap::from([(
+            "route-group.example".to_string(),
+            vec![
+                "8.8.8.8".parse().expect("first IP"),
+                "1.1.1.1".parse().expect("second IP"),
+            ],
+        )]));
+        let leaf = |id: OutboundId, endpoint: SocketAddr| RuntimeOutboundLeaf::Local {
+            id,
+            config: OutboundConfig::Socks5(ProxyConfig::new(
+                endpoint
+                    .to_string()
+                    .parse()
+                    .expect("literal proxy endpoint"),
+                None,
+            )),
+            connect_timeout: Duration::from_millis(500),
+            native_sockets: Arc::new(crate::transport::SystemNativeSocketConfigurator),
+        };
+        let registry = RuntimeOutboundRegistry::compile(
+            [leaf(first, blackhole_addr), leaf(second, working_addr)],
+            &[],
+            dns,
+        )
+        .expect("post-resolution registry");
+        let router =
+            ClientIngressRouter::new(&policy(routes), registry).expect("post-resolution router");
+        let target = TargetAddr::Domain {
+            host: "route-group.example".to_string(),
+            port: 443,
+        };
+        let ClientRoute::Open(plan) = router
+            .route_tcp(&target, source(), anonymous(), inbound())
+            .expect("route plan")
+        else {
+            panic!("expected an open route plan");
+        };
+        let OpenedTcpOutbound::Local { .. } = plan
+            .open_tcp(&target)
+            .await
+            .expect("second post-resolution route group")
+        else {
+            panic!("expected the working local proxy");
+        };
+        blackhole_task.await.expect("blackhole task");
+        working_task.await.expect("working task");
     }
 
     #[test]

@@ -519,8 +519,12 @@ explanation = "route local proxy traffic through the primary MPP outbound"
 # stickiness = { key = "destination", ttl_ms = 60000, capacity = 4096 }
 # probe = { target = "192.0.2.1:443", interval_ms = 10000, timeout_ms = 2000 }
 #
-# `ordered-failover` tries enabled members in configured order. Every member
-# retry shares one total open deadline and occurs only before flow commit.
+# `ordered-failover` tries enabled members in configured order. Retry occurs
+# only before flow commit. Each attempted TCP/native UDP member retains its own
+# outbound stage timeout. The first selected IP-only member may trigger one
+# flow-level lookup bounded by the selected DNS plan; failure skips later
+# IP-only members without re-querying, so one blackhole cannot consume a
+# successor's budget.
 # [[routing.balancers]]
 # name = "egress-fallback"
 # strategy = "ordered-failover"

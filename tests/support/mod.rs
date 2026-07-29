@@ -392,12 +392,24 @@ pub fn socks5_round_trip(
     Ok(())
 }
 
-pub fn spawn_closing_proxy() -> (SocketAddr, thread::JoinHandle<()>) {
-    let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).expect("bind failing proxy");
-    let address = listener.local_addr().expect("failing proxy address");
+pub fn spawn_blackhole_proxy() -> (SocketAddr, thread::JoinHandle<()>) {
+    let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).expect("bind blackhole proxy");
+    let address = listener.local_addr().expect("blackhole proxy address");
     let task = thread::spawn(move || {
-        let (stream, _) = listener.accept().expect("accept failing proxy connection");
-        drop(stream);
+        let (mut stream, _) = listener
+            .accept()
+            .expect("accept blackhole proxy connection");
+        stream
+            .set_read_timeout(Some(IO_TIMEOUT))
+            .expect("set blackhole proxy read timeout");
+        let mut received = Vec::new();
+        stream
+            .read_to_end(&mut received)
+            .expect("timed-out proxy attempt closes");
+        assert!(
+            !received.is_empty(),
+            "blackhole proxy should receive the opening handshake"
+        );
     });
     (address, task)
 }

@@ -11,6 +11,69 @@ Historical entries below are retained as evidence of the decisions made at
 their recorded time. When a later entry changes an earlier decision, the later
 entry is authoritative.
 
+## 2026-07-30T07:12:31+08:00: bounded TCP carrier topology
+
+- Name: represent one configured TCP endpoint as a bounded carrier group
+- Category: Product carrier lifecycle, management identity, resource
+  ownership, and unchanged-Core boundary
+- State: committed and correctness-approved; automatic carrier admission,
+  carrier-only retirement, TCP port replacement, and the unchanged-Core
+  performance guard remain open
+- Source: clean commit `01771753cee53948291d1ebd4d563eea5be509ec`
+- Content:
+  - expanded each configured TCP endpoint to its declared maximum number of
+    runtime carrier slots while preserving every configured endpoint's
+    historical primary `PathId` before appending sibling slots;
+  - mapped siblings back to one immutable configured endpoint, security
+    credential, TLS identity, name, and configured ordinal while retaining a
+    distinct runtime path index, actor, health record, session handle, and
+    carrier identity for every slot;
+  - made only the configured lower bound locally eligible; dormant capacity is
+    represented as draining and cannot be selected, probed, published, acquire
+    peer state or delivery evidence, or obtain a load reservation;
+  - rejected the complete expanded slot count against the session resource
+    envelope before allocating or cloning sibling state;
+  - changed path management to resolve the configured TCP endpoint and apply
+    one atomic action across all of its members without admitting dormant
+    capacity; and
+  - kept configured endpoint count distinct from active carrier count in the
+    management API while exposing each visible TCP carrier's ordinal and
+    configured lower and upper bounds.
+- Correctness evidence:
+  - one persistent path-state model test covers two configured endpoints,
+    primaries-first identity, shared immutable security/TLS mapping, different
+    lower bounds, dormant exclusion, load rejection, selection order, and
+    pre-allocation resource rejection;
+  - existing management tests now cover endpoint-wide disable/enable with two
+    lower-bound carriers, dormant-state preservation, and user-facing carrier
+    presentation;
+  - reservations revalidate lifecycle, administrative state, and scheduler
+    state under the health lock before publishing load, closing the
+    disable-or-fail-after-selection race;
+  - two independent read-only reviews found and verified the resource-bound,
+    dormant-reservation, and endpoint-wide control corrections; and
+  - the complete repository suite passed: 1,390 library tests, two warmed
+    allocation contracts, four packaged daily-use Product tests, formatting,
+    whitespace checks, and warnings-denied all-target Clippy.
+- Performance boundary:
+  - no wire field, frame, congestion controller, scheduling formula, recovery
+    timer, transport parameter, payload path, or connection-establishment rule
+    changed;
+  - the default lower bound remains one carrier, so this milestone establishes
+    no additional TCP connection; and
+  - bounded dormant records add only local inventory scans and require the
+    unchanged-Core representative performance guard before final approval.
+- Decision:
+  - approve the topology and configuration ownership as the prerequisite for
+    bounded TCP expansion;
+  - do not activate an extra carrier from an eligibility Boolean or native TCP
+    telemetry alone; and
+  - keep automatic admission in a separate exact endpoint-claim lifecycle.
+- Next: implement one generation-fenced unproven-carrier claim per configured
+  endpoint, carry exact rollback through authenticated open completion, and
+  keep automatic admission unavailable until MPP product evidence and
+  carrier-only close semantics are complete.
+
 ## 2026-07-30T06:28:03+08:00: ranged QUIC carrier port migration
 
 - Name: migrate one authenticated QUIC carrier across its configured

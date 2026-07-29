@@ -1,4 +1,60 @@
-# Product maturity audit progress
+# MPTUNNEL progress
+
+This is the authoritative execution and milestone ledger for the repository.
+Entries record verified work, evidence, open blockers, and the next bounded
+action. `docs/PRODUCT_PLAN.md` defines Product scope and acceptance;
+`docs/PERFORMANCE_PLAN.md` defines Core performance methodology and acceptance.
+Neither plan is a progress log, and status text in either plan does not
+supersede this file.
+
+Historical entries below are retained as evidence of the decisions made at
+their recorded time. When a later entry changes an earlier decision, the later
+entry is authoritative.
+
+## 2026-07-29T23:22:09+08:00: historical performance restoration
+
+- Name: restore the last clean competitive Core before further development
+- Category: performance, recovery, and change control
+- State: clean champion source and binary restored; representative steady-state
+  gate passed; full transition and condition matrix remains required
+- Source: exact clean commit `a5a6094fc8e07456b057ddc107a0d51849d42d10`
+- Binary: release SHA-256
+  `9a66861a08c0922b432cb73963bc0da0304023b88be4409aeb383397a3166d92`
+- Content:
+  - stopped the unverified BBR2, congestion-epoch migration, TCP expansion,
+    scheduler, and related Core work;
+  - preserved the complete pre-restoration working state as recoverable stash
+    `0e1f6ca0c945e19743371967cbeb2abf8effc58a`;
+  - rebuilt the exact clean champion and compared it adjacently with the dirty
+    tree using the same Linux Docker topology, 20-second load interval, two
+    application flows, and single/five-equal-fat QUIC carrier cases; and
+  - retained all raw generated evidence under ignored `./.tmp/lab/results/`.
+- Evidence:
+  - the dirty tree delivered `260.762` Mbps single-path download and `259.919`
+    Mbps single-path upload, but only `337.920` Mbps five-path download and
+    `575.262` Mbps five-path upload;
+  - the restored champion delivered `234.276` Mbps single-path download and
+    `228.443` Mbps single-path upload, plus `680.359` Mbps five-path download
+    and `762.552` Mbps five-path upload;
+  - an adjacent tagged control delivered `241.869`, `245.267`, `702.349`, and
+    `785.376` Mbps respectively;
+  - the former tree therefore had a reproduced multipath regression of about
+    52% download and 27% upload, while the restored rows returned to the
+    historical range.
+- Decision:
+  - the restored clean tree is the only active performance authority;
+  - no dirty checkpoint, controller replacement, parameter change, migration
+    refactor, or RFC-driven implementation change may return as a group;
+  - each proposed change must be isolated, causally justified, and compared
+    against both its immediate parent and this champion across every affected
+    steady-state and transition cell before promotion; and
+  - ordinary run variation is interpreted from repeated measurements rather
+    than a strict fixed percentage cap.
+- Next: run the representative TCP, QUIC, and mixed steady/transition matrix on
+  the restored champion, then establish the clean RFC without changing this
+  proven behavior.
+
+## Product maturity audit history
 
 ## 2026-07-26: v0.1.1 global product audit
 

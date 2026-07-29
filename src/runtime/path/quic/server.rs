@@ -228,7 +228,7 @@ async fn accept_server_udp_path_handshake(
     ),
     RuntimeError,
 > {
-    let admitted = tokio::time::timeout(context.security.authentication_timeout, async {
+    tokio::time::timeout(context.security.authentication_timeout, async {
         // The absolute Product authentication bound starts when the
         // carrier is accepted, not when a source-aware peer eventually
         // chooses to open a matching request stream.
@@ -244,8 +244,7 @@ async fn accept_server_udp_path_handshake(
     })
     .await
     .map_err(|_| RuntimeError::AuthenticationRejected("authentication timed out"))
-    .and_then(|result| result);
-    admitted
+    .and_then(|result| result)
 }
 
 async fn admit_server_udp_path(

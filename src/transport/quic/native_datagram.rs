@@ -512,9 +512,8 @@ fn route_datagram(
     state: &HubState,
     packet: Bytes,
 ) -> Result<(), QuarterStreamIdError> {
-    let (request_stream_id, header_len) = decode_quarter_stream_id(&packet).map_err(|error| {
+    let (request_stream_id, header_len) = decode_quarter_stream_id(&packet).inspect_err(|_| {
         state.dropped_packets.fetch_add(1, Ordering::Relaxed);
-        error
     })?;
     let payload = packet.slice(header_len..);
     if !reserve_buffered_bytes(state, payload.len()) {

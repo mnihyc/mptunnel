@@ -16,6 +16,7 @@ pub mod udp;
 #[cfg(target_os = "linux")]
 pub use carrier_network::LinuxMarkedCarrierNetworkProvider;
 pub(crate) use carrier_network::interleave_socket_addr_families;
+pub(crate) use carrier_network::validate_carrier_resolution_port;
 pub use carrier_network::{
     CarrierNetworkProvider, CarrierPathIdentity, CarrierResolutionFuture, CarrierResolutionRequest,
     CarrierSocket, CarrierSocketRequest, PreparedCarrierNetworkProvider, PreparedCarrierPath,
@@ -29,6 +30,6 @@ pub use native_egress::{
 #[cfg(target_os = "linux")]
 pub use native_egress::{LinuxMarkedNativeSocketConfigurator, LinuxSocketMarker};
 pub use spec::{
-    Endpoint, EndpointParseError, PathBinding, PathMetadata, PathPolicy, PathSpec,
-    PathSpecParseError, RateHint,
+    CarrierEndpoint, CarrierEndpointParseError, CarrierPortSet, Endpoint, EndpointParseError,
+    PathBinding, PathMetadata, PathPolicy, PathSpec, PathSpecParseError, RateHint,
 };

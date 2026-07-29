@@ -1102,7 +1102,7 @@ protocol = "socks5"
 [[outbounds]]
 name = "mpp-main"
 protocol = "mpp"
-paths = [{ name = "path-1", endpoint = "tcp://127.0.0.1:443" }, { name = "path-2", endpoint = "udp://127.0.0.1:443" }]
+paths = [{ name = "path-1", endpoint = "tcp://127.0.0.1:443" }, { name = "path-2", endpoint = "udp://127.0.0.1:8443-8450" }]
 
 [outbounds.performance]
 extra_traffic_hint_percent = 25
@@ -1134,6 +1134,8 @@ outbound = "mpp-main"
     let clients = mpp_outbounds(&node);
     assert_eq!(clients.len(), 1);
     assert_eq!(clients[0].paths.len(), 2);
+    assert_eq!(clients[0].paths[1].spec.endpoint.ports().first(), 8443);
+    assert_eq!(clients[0].paths[1].spec.endpoint.ports().last(), 8450);
     assert_eq!(clients[0].performance.extra_traffic_hint_percent, 25);
     assert_eq!(node.local_ingresses[0].name, "local-socks");
     assert_eq!(

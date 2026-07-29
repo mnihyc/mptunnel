@@ -210,6 +210,9 @@ probe; application destinations are never probed. Domain endpoints never use
 host/system DNS during doctor: they are reported as skipped because configured
 runtime DNS and routing own resolution and connection setup. A configured
 routed or source-bound literal endpoint is not dialled outside its owner.
+A ranged outbound carrier endpoint is likewise reported as `INFO` and skipped:
+probing one concrete port cannot validate an externally published range, and
+runtime carrier selection remains authoritative.
 
 Each check is `PASS`, `WARN`, `FAIL`, or `INFO`. Invalid configuration,
 invalid target VPN configuration, or a failed explicitly requested

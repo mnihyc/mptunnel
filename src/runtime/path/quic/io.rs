@@ -404,7 +404,13 @@ pub(super) fn udp_path_command_queue(mux_limits: MuxLimits, _codec_limits: Codec
 async fn resolve_udp_server_path_socket_addrs(
     path: &PathSpec,
 ) -> Result<Vec<SocketAddr>, RuntimeError> {
-    let resolved = lookup_host((path.endpoint.host.as_str(), path.endpoint.port))
+    if !path.endpoint.ports().is_single() {
+        return Err(RuntimeError::Io(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "server carrier paths require one listener port; forward any advertised port range to that listener",
+        )));
+    }
+    let resolved = lookup_host((path.endpoint.host.as_str(), path.endpoint.ports().first()))
         .await?
         .collect::<Vec<_>>();
     usable_udp_path_socket_addrs(path, resolved)

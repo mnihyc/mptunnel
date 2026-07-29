@@ -132,7 +132,7 @@ pub(crate) fn compile_managed_vpn_generation_spec(
             continue;
         };
         for (path_ordinal, path) in outbound.paths.iter().enumerate() {
-            if path.spec.endpoint.host.trim().is_empty() || path.spec.endpoint.port == 0 {
+            if path.spec.endpoint.host.trim().is_empty() {
                 return Err(ManagedVpnGenerationSpecError::InvalidCarrierEndpoint {
                     outbound: id.as_str().to_owned(),
                     path_ordinal,

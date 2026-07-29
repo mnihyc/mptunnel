@@ -33,6 +33,27 @@ pub struct CarrierPathIdentity {
 pub struct CarrierResolutionRequest<'a> {
     pub path: &'a PathSpec,
     pub identity: CarrierPathIdentity,
+    /// Concrete port selected once for this physical carrier establishment.
+    ///
+    /// Every address returned for this request must retain this exact port.
+    pub remote_port: u16,
+}
+
+impl CarrierResolutionRequest<'_> {
+    pub fn validate(&self) -> io::Result<()> {
+        if self.path.endpoint.ports().contains(self.remote_port) {
+            Ok(())
+        } else {
+            Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!(
+                    "selected carrier port {} is outside configured endpoint {}",
+                    self.remote_port,
+                    self.path.endpoint.authority()
+                ),
+            ))
+        }
+    }
 }
 
 pub type CarrierResolutionFuture<'a> =
@@ -92,12 +113,10 @@ pub struct SystemCarrierNetworkProvider;
 impl CarrierNetworkProvider for SystemCarrierNetworkProvider {
     fn resolve<'a>(&'a self, request: CarrierResolutionRequest<'a>) -> CarrierResolutionFuture<'a> {
         Box::pin(async move {
-            tokio::net::lookup_host((
-                request.path.endpoint.host.as_str(),
-                request.path.endpoint.port,
-            ))
-            .await
-            .map(|addrs| addrs.collect())
+            request.validate()?;
+            tokio::net::lookup_host((request.path.endpoint.host.as_str(), request.remote_port))
+                .await
+                .map(|addrs| addrs.collect())
         })
     }
 
@@ -182,7 +201,7 @@ fn protect_carrier_socket(
 pub struct PreparedCarrierPath {
     identity: CarrierPathIdentity,
     path: PathSpec,
-    addresses: Vec<SocketAddr>,
+    addresses: Vec<IpAddr>,
 }
 
 impl PreparedCarrierPath {
@@ -193,7 +212,7 @@ impl PreparedCarrierPath {
     ) -> io::Result<Self> {
         let mut addresses = addresses.into_iter().collect::<Vec<_>>();
         addresses.retain(|address| {
-            address.port() == path.endpoint.port
+            path.endpoint.ports().contains(address.port())
                 && path
                     .binding
                     .source_ip
@@ -201,6 +220,7 @@ impl PreparedCarrierPath {
         });
         let mut unique = Vec::with_capacity(addresses.len());
         for address in addresses {
+            let address = address.ip();
             if !unique.contains(&address) {
                 unique.push(address);
             }
@@ -230,7 +250,7 @@ impl PreparedCarrierPath {
         &self.path
     }
 
-    pub fn addresses(&self) -> &[SocketAddr] {
+    pub fn addresses(&self) -> &[IpAddr] {
         &self.addresses
     }
 }
@@ -272,7 +292,7 @@ impl PreparedCarrierNetworkProvider {
         let mut addresses = self
             .paths
             .iter()
-            .flat_map(|path| path.addresses.iter().map(SocketAddr::ip))
+            .flat_map(|path| path.addresses.iter().copied())
             .collect::<Vec<_>>();
         addresses.sort_unstable();
         addresses.dedup();
@@ -283,12 +303,19 @@ impl PreparedCarrierNetworkProvider {
 impl CarrierNetworkProvider for PreparedCarrierNetworkProvider {
     fn resolve<'a>(&'a self, request: CarrierResolutionRequest<'a>) -> CarrierResolutionFuture<'a> {
         Box::pin(async move {
+            request.validate()?;
             self.paths
                 .iter()
                 .find(|prepared| {
                     prepared.identity == request.identity && prepared.path == *request.path
                 })
-                .map(|prepared| prepared.addresses.clone())
+                .map(|prepared| {
+                    prepared
+                        .addresses
+                        .iter()
+                        .map(|address| SocketAddr::new(*address, request.remote_port))
+                        .collect()
+                })
                 .ok_or_else(|| {
                     io::Error::new(
                         io::ErrorKind::NotFound,
@@ -303,6 +330,24 @@ impl CarrierNetworkProvider for PreparedCarrierNetworkProvider {
 
     fn create_socket(&self, request: CarrierSocketRequest<'_>) -> io::Result<CarrierSocket> {
         CarrierSocket::system(request)
+    }
+}
+
+/// Rejects provider answers that violate one-establishment port selection.
+pub(crate) fn validate_carrier_resolution_port(
+    addresses: Vec<SocketAddr>,
+    remote_port: u16,
+) -> io::Result<Vec<SocketAddr>> {
+    if addresses
+        .iter()
+        .all(|address| address.port() == remote_port)
+    {
+        Ok(addresses)
+    } else {
+        Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("carrier resolver returned an address outside selected port {remote_port}"),
+        ))
     }
 }
 

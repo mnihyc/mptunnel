@@ -43,6 +43,14 @@ and liveness mechanics, while the path layer exposes one prepared-connection
 lifecycle and records only the authenticated exchange as RTT, not connection
 setup time.
 
+Carrier bootstrap may select one concrete destination port from a configured
+inclusive set before resolution. Every address-family attempt for that
+establishment uses the same selected port; a later physical carrier
+establishment selects independently. Managed-VPN preparation therefore stores
+resolved carrier IP addresses rather than freezing one selected port before
+host routes are published. This local locator selection does not change MPP
+path or carrier-instance identity.
+
 ## Protocol-v4 model
 
 `OPEN_STREAM` contains only `stream_id`, `target`, and initial `demand`. Opening

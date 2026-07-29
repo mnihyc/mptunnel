@@ -380,16 +380,25 @@ fn doctor_skips_host_dns_for_domains_and_preserves_literal_ip_probes() {
     let results = probe_endpoints(vec![
         ProbeEndpoint {
             label: "domain endpoint".to_string(),
+            authority: "localhost:443".to_string(),
             endpoint: Endpoint::new("localhost", 443).expect("domain endpoint"),
             connect: true,
             skip_connect: false,
         },
         ProbeEndpoint {
             label: "literal endpoint".to_string(),
+            authority: literal.to_string(),
             endpoint: Endpoint::new(literal.ip().to_string(), literal.port())
                 .expect("literal endpoint"),
             connect: true,
             skip_connect: false,
+        },
+        ProbeEndpoint {
+            label: "ranged carrier endpoint".to_string(),
+            authority: "192.0.2.10:20000-40000".to_string(),
+            endpoint: Endpoint::new("192.0.2.10", 20000).expect("carrier endpoint"),
+            connect: false,
+            skip_connect: true,
         },
     ])
     .expect("doctor endpoint probes");
@@ -405,5 +414,11 @@ fn doctor_skips_host_dns_for_domains_and_preserves_literal_ip_probes() {
         &results[1].outcome,
         EndpointProbeOutcome::Reachable(message)
             if message.contains(&literal.to_string())
+    ));
+    assert!(matches!(
+        &results[2].outcome,
+        EndpointProbeOutcome::Skipped(message)
+            if message.contains("192.0.2.10:20000-40000")
+                && message.contains("configured carrier selection")
     ));
 }

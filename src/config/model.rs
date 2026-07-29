@@ -954,6 +954,13 @@ fn validate_mpp_inbound(
     {
         return Err(ConfigError::ServerPathSourceBinding);
     }
+    if server
+        .paths
+        .iter()
+        .any(|path| !path.spec.endpoint.ports().is_single())
+    {
+        return Err(ConfigError::ServerPathPortRange);
+    }
     validate_server_security_config(&server.security)?;
     server
         .destination_acl
@@ -1100,6 +1107,7 @@ pub enum ConfigError {
     PathProbeTimeoutZero,
     QuicTlsServerNameRequiresDns,
     ServerPathSourceBinding,
+    ServerPathPortRange,
     TunAddressRequired,
     TunIpv4PrefixInvalid,
     TunIpv6PrefixInvalid,
@@ -1342,6 +1350,10 @@ impl std::fmt::Display for ConfigError {
             Self::ServerPathSourceBinding => {
                 write!(f, "source-ip is valid only for client carrier paths")
             }
+            Self::ServerPathPortRange => write!(
+                f,
+                "server carrier paths require one listener port; forward any advertised port range to that listener"
+            ),
             Self::TunAddressRequired => write!(f, "TUN L4 ingress requires IPv4 or IPv6 address"),
             Self::TunIpv4PrefixInvalid => write!(f, "TUN IPv4 prefix must be in 0..=32"),
             Self::TunIpv6PrefixInvalid => write!(f, "TUN IPv6 prefix must be in 0..=128"),

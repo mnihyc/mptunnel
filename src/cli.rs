@@ -967,6 +967,7 @@ pub struct ClientArgs {
     )]
     pub tun_dns_dot_server_name: Option<String>,
 
+    /// Outbound carrier endpoint: tcp://host:PORT[-END] or udp://host:PORT[-END].
     #[arg(
         long = "path",
         env = "MPTUNNEL_PATHS",
@@ -1317,6 +1318,7 @@ fn tun_requested(args: &ClientArgs) -> bool {
 
 #[derive(Debug, Args)]
 pub struct ServerArgs {
+    /// Server carrier listener using one fixed PORT.
     #[arg(
         long = "bind-path",
         env = "MPTUNNEL_BIND_PATHS",

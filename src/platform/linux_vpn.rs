@@ -582,11 +582,9 @@ async fn resolve_carrier_paths(
         let dns = dns.cloned();
         resolutions.push(async move {
             let authority = request.path.endpoint.authority();
+            let bootstrap_port = request.path.endpoint.ports().first();
             let addresses = match request.path.endpoint.host.parse::<IpAddr>() {
-                Ok(address) => vec![std::net::SocketAddr::new(
-                    address,
-                    request.path.endpoint.port,
-                )],
+                Ok(address) => vec![std::net::SocketAddr::new(address, bootstrap_port)],
                 Err(_) => {
                     let dns = dns.ok_or_else(|| LinuxVpnPrepareError::DnsResolution {
                         endpoint: authority.clone(),
@@ -599,7 +597,7 @@ async fn resolve_carrier_paths(
                         deadline,
                         dns.resolve_socket_addrs(
                             request.path.endpoint.host.as_str(),
-                            request.path.endpoint.port,
+                            bootstrap_port,
                         ),
                     )
                     .await
@@ -1461,7 +1459,7 @@ mod tests {
         let OutboundLeafConfig::Mpp { config, .. } = &mut node.outbounds[0] else {
             panic!("MPP");
         };
-        config.paths[0].spec.endpoint.port = 0;
+        config.paths[0].spec.endpoint.host.clear();
         assert!(matches!(
             compile_node_linux_vpn_prepare_request(&node),
             Err(LinuxVpnGenerationSpecError::InvalidCarrierEndpoint {
@@ -1607,7 +1605,7 @@ mod tests {
             .expect("carrier resolution");
         assert_eq!(
             carriers.paths()[0].addresses(),
-            &["198.51.100.10:443".parse().expect("carrier socket")]
+            &["198.51.100.10".parse::<IpAddr>().expect("carrier address")]
         );
         let native = resolve_native_endpoints(
             vec![
@@ -1642,7 +1640,7 @@ mod tests {
             .expect("literal carrier does not require DNS");
         assert_eq!(
             literal_carriers.paths()[0].addresses(),
-            &["198.51.100.30:443".parse().expect("literal socket")]
+            &["198.51.100.30".parse::<IpAddr>().expect("literal address")]
         );
         assert_eq!(
             resolve_native_endpoints(

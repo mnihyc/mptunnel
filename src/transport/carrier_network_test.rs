@@ -225,7 +225,7 @@ fn carrier_resolution_interleaves_grouped_address_families() {
 
 #[tokio::test]
 async fn prepared_provider_never_falls_back_to_runtime_dns() {
-    let configured = path("tcp://carrier.invalid:443");
+    let configured = path("tcp://carrier.invalid:440-450");
     let identity = CarrierPathIdentity {
         group_ordinal: 3,
         path_ordinal: 2,
@@ -241,10 +241,14 @@ async fn prepared_provider_never_falls_back_to_runtime_dns() {
             .resolve(CarrierResolutionRequest {
                 path: &configured,
                 identity,
+                remote_port: 447,
             })
             .await
             .expect("prepared resolution"),
-        vec![first, second]
+        vec![
+            "192.0.2.10:447".parse().expect("remapped IPv4"),
+            "[2001:db8::10]:447".parse().expect("remapped IPv6"),
+        ]
     );
     assert_eq!(
         provider.endpoint_addresses(),
@@ -253,12 +257,36 @@ async fn prepared_provider_never_falls_back_to_runtime_dns() {
             "2001:db8::10".parse::<IpAddr>().expect("IPv6"),
         ]
     );
+    assert_eq!(
+        provider
+            .resolve(CarrierResolutionRequest {
+                path: &configured,
+                identity,
+                remote_port: 449,
+            })
+            .await
+            .expect("later carrier selects independently"),
+        vec![
+            "192.0.2.10:449".parse().expect("later IPv4"),
+            "[2001:db8::10]:449".parse().expect("later IPv6"),
+        ]
+    );
+    let error = provider
+        .resolve(CarrierResolutionRequest {
+            path: &configured,
+            identity,
+            remote_port: 451,
+        })
+        .await
+        .expect_err("out-of-range carrier port");
+    assert_eq!(error.kind(), io::ErrorKind::InvalidInput);
 
     let changed = path("tcp://other.invalid:443");
     let error = provider
         .resolve(CarrierResolutionRequest {
             path: &changed,
             identity,
+            remote_port: 443,
         })
         .await
         .expect_err("unprepared generation path");

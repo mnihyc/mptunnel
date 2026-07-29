@@ -404,11 +404,9 @@ async fn resolve_carrier_paths(
         let dns = dns.cloned();
         resolutions.push(async move {
             let authority = request.path.endpoint.authority();
+            let bootstrap_port = request.path.endpoint.ports().first();
             let addresses = match request.path.endpoint.host.parse::<IpAddr>() {
-                Ok(address) => vec![std::net::SocketAddr::new(
-                    address,
-                    request.path.endpoint.port,
-                )],
+                Ok(address) => vec![std::net::SocketAddr::new(address, bootstrap_port)],
                 Err(_) => {
                     let dns = dns.ok_or_else(|| WindowsVpnPrepareError::DnsResolution {
                         endpoint: authority.clone(),
@@ -421,7 +419,7 @@ async fn resolve_carrier_paths(
                         deadline,
                         dns.resolve_socket_addrs(
                             request.path.endpoint.host.as_str(),
-                            request.path.endpoint.port,
+                            bootstrap_port,
                         ),
                     )
                     .await

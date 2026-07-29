@@ -6,6 +6,7 @@
 pub use crate::model::path::PathPolicy;
 use crate::protocol::UnderlayProtocol;
 use std::net::IpAddr;
+use std::num::NonZeroU16;
 use std::str::FromStr;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -63,10 +64,155 @@ impl FromStr for Endpoint {
     }
 }
 
+/// Bounded inclusive destination-port set for one configured carrier path.
+///
+/// The interval is never expanded. A concrete port is selected once for each
+/// new physical carrier establishment and remains fixed across that
+/// establishment's DNS address race.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct CarrierPortSet {
+    first: NonZeroU16,
+    last: NonZeroU16,
+}
+
+impl CarrierPortSet {
+    pub fn new(first: u16, last: u16) -> Result<Self, CarrierEndpointParseError> {
+        let first = NonZeroU16::new(first).ok_or(CarrierEndpointParseError::InvalidPort)?;
+        let last = NonZeroU16::new(last).ok_or(CarrierEndpointParseError::InvalidPort)?;
+        if first > last {
+            return Err(CarrierEndpointParseError::InvalidPortRange);
+        }
+        Ok(Self { first, last })
+    }
+
+    pub fn single(port: u16) -> Result<Self, CarrierEndpointParseError> {
+        Self::new(port, port)
+    }
+
+    pub const fn first(self) -> u16 {
+        self.first.get()
+    }
+
+    pub const fn last(self) -> u16 {
+        self.last.get()
+    }
+
+    pub const fn is_single(self) -> bool {
+        self.first.get() == self.last.get()
+    }
+
+    pub const fn contains(self, port: u16) -> bool {
+        self.first.get() <= port && port <= self.last.get()
+    }
+
+    /// Selects one unbiased port. Fixed endpoints keep the zero-syscall path.
+    pub fn select(self) -> Result<u16, getrandom::Error> {
+        if self.is_single() {
+            return Ok(self.first());
+        }
+        let width = u32::from(self.last()) - u32::from(self.first()) + 1;
+        let sample_space = u32::from(u16::MAX) + 1;
+        let accepted = sample_space - sample_space % width;
+        loop {
+            let mut bytes = [0_u8; 2];
+            getrandom::getrandom(&mut bytes)?;
+            let sample = u32::from(u16::from_ne_bytes(bytes));
+            if sample < accepted {
+                return Ok((u32::from(self.first()) + sample % width) as u16);
+            }
+        }
+    }
+}
+
+impl std::fmt::Display for CarrierPortSet {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        if self.is_single() {
+            write!(formatter, "{}", self.first())
+        } else {
+            write!(formatter, "{}-{}", self.first(), self.last())
+        }
+    }
+}
+
+/// Carrier-only endpoint whose port may be selected from one bounded interval.
+///
+/// Proxy, DNS, target, and management endpoints continue to use the
+/// single-port [`Endpoint`] type.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CarrierEndpoint {
+    pub host: String,
+    ports: CarrierPortSet,
+}
+
+impl CarrierEndpoint {
+    pub fn new(
+        host: impl Into<String>,
+        ports: CarrierPortSet,
+    ) -> Result<Self, CarrierEndpointParseError> {
+        let host = host.into();
+        if host.is_empty() {
+            return Err(CarrierEndpointParseError::EmptyHost);
+        }
+        Ok(Self { host, ports })
+    }
+
+    pub fn single(host: impl Into<String>, port: u16) -> Result<Self, CarrierEndpointParseError> {
+        Self::new(host, CarrierPortSet::single(port)?)
+    }
+
+    pub const fn ports(&self) -> CarrierPortSet {
+        self.ports
+    }
+
+    pub fn authority(&self) -> String {
+        if self.host.contains(':') {
+            format!("[{}]:{}", self.host, self.ports)
+        } else {
+            format!("{}:{}", self.host, self.ports)
+        }
+    }
+
+    pub fn first_endpoint(&self) -> Endpoint {
+        Endpoint {
+            host: self.host.clone(),
+            port: self.ports.first(),
+        }
+    }
+}
+
+impl FromStr for CarrierEndpoint {
+    type Err = CarrierEndpointParseError;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        let value = value.trim();
+        if value.is_empty() {
+            return Err(CarrierEndpointParseError::Empty);
+        }
+
+        if let Some(rest) = value.strip_prefix('[') {
+            let Some((host, tail)) = rest.split_once(']') else {
+                return Err(CarrierEndpointParseError::InvalidIpv6);
+            };
+            let Some(ports) = tail.strip_prefix(':') else {
+                return Err(CarrierEndpointParseError::MissingPort);
+            };
+            return Self::new(host, parse_carrier_ports(ports)?);
+        }
+
+        let Some((host, ports)) = value.rsplit_once(':') else {
+            return Err(CarrierEndpointParseError::MissingPort);
+        };
+        if host.contains(':') {
+            return Err(CarrierEndpointParseError::InvalidIpv6);
+        }
+        Self::new(host, parse_carrier_ports(ports)?)
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PathSpec {
     pub underlay: UnderlayProtocol,
-    pub endpoint: Endpoint,
+    pub endpoint: CarrierEndpoint,
     pub binding: PathBinding,
     pub metadata: PathMetadata,
 }
@@ -300,6 +446,31 @@ fn parse_port(value: &str) -> Result<u16, EndpointParseError> {
     Ok(port)
 }
 
+fn parse_carrier_ports(value: &str) -> Result<CarrierPortSet, CarrierEndpointParseError> {
+    let Some((first, last)) = value.split_once('-') else {
+        return CarrierPortSet::single(parse_carrier_port(value)?);
+    };
+    if first.is_empty() || last.is_empty() || last.contains('-') {
+        return Err(CarrierEndpointParseError::InvalidPortRange);
+    }
+    let first = parse_carrier_port(first)?;
+    let last = parse_carrier_port(last)?;
+    if first == last {
+        return Err(CarrierEndpointParseError::NonCanonicalPortRange);
+    }
+    CarrierPortSet::new(first, last)
+}
+
+fn parse_carrier_port(value: &str) -> Result<u16, CarrierEndpointParseError> {
+    let port = value
+        .parse::<u16>()
+        .map_err(|_| CarrierEndpointParseError::InvalidPort)?;
+    if port == 0 {
+        return Err(CarrierEndpointParseError::InvalidPort);
+    }
+    Ok(port)
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum EndpointParseError {
     Empty,
@@ -324,10 +495,43 @@ impl std::fmt::Display for EndpointParseError {
 impl std::error::Error for EndpointParseError {}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CarrierEndpointParseError {
+    Empty,
+    EmptyHost,
+    MissingPort,
+    InvalidIpv6,
+    InvalidPort,
+    InvalidPortRange,
+    NonCanonicalPortRange,
+}
+
+impl std::fmt::Display for CarrierEndpointParseError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Empty => formatter.write_str("carrier endpoint is empty"),
+            Self::EmptyHost => formatter.write_str("carrier endpoint host is empty"),
+            Self::MissingPort => formatter.write_str("carrier endpoint must include a port"),
+            Self::InvalidIpv6 => {
+                formatter.write_str("IPv6 carrier endpoint must use [addr]:port syntax")
+            }
+            Self::InvalidPort => formatter.write_str("carrier endpoint port must be in 1..=65535"),
+            Self::InvalidPortRange => formatter.write_str(
+                "carrier endpoint port range must be an ascending START-END in 1..=65535",
+            ),
+            Self::NonCanonicalPortRange => {
+                formatter.write_str("a single carrier endpoint port must use PORT, not PORT-PORT")
+            }
+        }
+    }
+}
+
+impl std::error::Error for CarrierEndpointParseError {}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum PathSpecParseError {
     MissingScheme,
     UnknownScheme(String),
-    Endpoint(EndpointParseError),
+    Endpoint(CarrierEndpointParseError),
     EmptyQuery,
     EmptyQueryParam,
     UnknownQueryParam(String),
@@ -338,8 +542,8 @@ pub enum PathSpecParseError {
     NoUdpOnUdpPath,
 }
 
-impl From<EndpointParseError> for PathSpecParseError {
-    fn from(value: EndpointParseError) -> Self {
+impl From<CarrierEndpointParseError> for PathSpecParseError {
+    fn from(value: CarrierEndpointParseError) -> Self {
         Self::Endpoint(value)
     }
 }
@@ -347,7 +551,10 @@ impl From<EndpointParseError> for PathSpecParseError {
 impl std::fmt::Display for PathSpecParseError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            Self::MissingScheme => write!(f, "path must use tcp://host:port or udp://host:port"),
+            Self::MissingScheme => write!(
+                f,
+                "path must use tcp://host:PORT[-END] or udp://host:PORT[-END]"
+            ),
             Self::UnknownScheme(scheme) => write!(f, "unknown path scheme {scheme:?}"),
             Self::Endpoint(err) => write!(f, "{err}"),
             Self::EmptyQuery => write!(f, "path query must not be empty"),

@@ -34,7 +34,18 @@ pub async fn connect_path(
     if path.underlay != UnderlayProtocol::Udp {
         return Err(UdpTransportError::WrongUnderlay(path.underlay));
     }
-    connect_endpoint(&path.endpoint, options).await
+    let port = path.endpoint.ports().select().map_err(|error| {
+        UdpTransportError::Io(std::io::Error::other(format!(
+            "could not select a carrier port for {}: {error}",
+            path.endpoint.authority()
+        )))
+    })?;
+    connect_endpoint(
+        &Endpoint::new(path.endpoint.host.clone(), port)
+            .expect("selected carrier port and parsed host are valid"),
+        options,
+    )
+    .await
 }
 
 pub async fn connect_endpoint(
@@ -76,7 +87,14 @@ pub async fn bind_socket(path: &PathSpec) -> Result<UdpSocket, UdpTransportError
     if path.underlay != UnderlayProtocol::Udp {
         return Err(UdpTransportError::WrongUnderlay(path.underlay));
     }
-    Ok(UdpSocket::bind(path.endpoint.authority()).await?)
+    if !path.endpoint.ports().is_single() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "server carrier paths require one listener port; forward any advertised port range to that listener",
+        )
+        .into());
+    }
+    Ok(UdpSocket::bind(path.endpoint.first_endpoint().authority()).await?)
 }
 
 async fn resolve_endpoint(endpoint: &Endpoint) -> Result<Vec<SocketAddr>, UdpTransportError> {

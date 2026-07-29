@@ -367,13 +367,21 @@ async fn connect_client_udp_path(
     open_deadline: tokio::time::Instant,
 ) -> Result<ClientUdpPathConnection, RuntimeError> {
     let connect = async {
+        let remote_port = runtime.path().endpoint.ports().select().map_err(|error| {
+            RuntimeError::Io(std::io::Error::other(format!(
+                "could not select a carrier port for {}: {error}",
+                runtime.path().endpoint.authority()
+            )))
+        })?;
         let resolved = runtime
             .carrier_network
             .resolve(CarrierResolutionRequest {
                 path: runtime.path(),
                 identity: runtime.carrier_identity,
+                remote_port,
             })
             .await?;
+        let resolved = crate::transport::validate_carrier_resolution_port(resolved, remote_port)?;
         let resolved = usable_udp_path_socket_addrs(runtime.path(), resolved)?;
         let mut remote_addrs = interleave_socket_addr_families(resolved)
             .into_iter()

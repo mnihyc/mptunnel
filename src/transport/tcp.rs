@@ -8,6 +8,7 @@ use crate::transport::{
     CarrierNetworkProvider, CarrierPathIdentity, CarrierResolutionRequest, CarrierSocketRequest,
     Endpoint, NativeEgressPurpose, NativeSocketConfigurator, NativeSocketRequest, PathSpec,
     SystemCarrierNetworkProvider, SystemNativeSocketConfigurator, interleave_socket_addr_families,
+    validate_carrier_resolution_port,
 };
 use futures::StreamExt;
 use futures::stream::FuturesUnordered;
@@ -79,15 +80,22 @@ pub async fn connect_path_with_provider(
     };
     let deadline = Instant::now() + options.timeout;
     let authority = effective_path.endpoint.authority();
+    let remote_port = effective_path.endpoint.ports().select().map_err(|error| {
+        TcpTransportError::Io(std::io::Error::other(format!(
+            "could not select a carrier port for {authority}: {error}"
+        )))
+    })?;
     let addrs = timeout_at(
         deadline,
         provider.resolve(CarrierResolutionRequest {
             path: effective_path.as_ref(),
             identity,
+            remote_port,
         }),
     )
     .await
     .map_err(|_| TcpTransportError::ResolutionTimedOut(authority.clone()))??;
+    let addrs = validate_carrier_resolution_port(addrs, remote_port)?;
     if addrs.is_empty() {
         return Err(TcpTransportError::ResolutionEmpty(authority));
     }
@@ -184,7 +192,14 @@ pub async fn bind_listener(path: &PathSpec) -> Result<TcpListener, TcpTransportE
     if path.underlay != UnderlayProtocol::Tcp {
         return Err(TcpTransportError::WrongUnderlay(path.underlay));
     }
-    let listener = TcpListener::bind(path.endpoint.authority()).await?;
+    if !path.endpoint.ports().is_single() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "server carrier paths require one listener port; forward any advertised port range to that listener",
+        )
+        .into());
+    }
+    let listener = TcpListener::bind(path.endpoint.first_endpoint().authority()).await?;
     Ok(listener)
 }
 

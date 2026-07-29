@@ -42,7 +42,7 @@ use crate::runtime::stream::{
 };
 use crate::scheduler::TrafficClass;
 use crate::transport::{
-    CarrierPathIdentity, CarrierSocket, CarrierSocketRequest, Endpoint as PathEndpoint,
+    CarrierEndpoint as PathEndpoint, CarrierPathIdentity, CarrierSocket, CarrierSocketRequest,
     PathBinding, PathMetadata, PathSpec, SystemCarrierNetworkProvider,
 };
 use std::net::SocketAddr;
@@ -136,12 +136,14 @@ impl ServerUdpTerminalWriterFixture {
             .await
             .expect("receive accepted server QUIC response stream");
 
+        let reserved =
+            std::net::UdpSocket::bind("127.0.0.1:0").expect("reserve server QUIC address");
+        let reserved_addr = reserved.local_addr().expect("reserved QUIC address");
+        drop(reserved);
         let bind_path = PathSpec {
             underlay: UnderlayProtocol::Udp,
-            endpoint: PathEndpoint {
-                host: "127.0.0.1".to_string(),
-                port: 0,
-            },
+            endpoint: PathEndpoint::single("127.0.0.1", reserved_addr.port())
+                .expect("server carrier endpoint"),
             binding: PathBinding::default(),
             metadata: PathMetadata::default(),
         };
@@ -151,10 +153,8 @@ impl ServerUdpTerminalWriterFixture {
         let server_addr = server_endpoint.local_addr().expect("server QUIC address");
         let client_path = PathSpec {
             underlay: UnderlayProtocol::Udp,
-            endpoint: PathEndpoint {
-                host: server_addr.ip().to_string(),
-                port: server_addr.port(),
-            },
+            endpoint: PathEndpoint::single(server_addr.ip().to_string(), server_addr.port())
+                .expect("client carrier endpoint"),
             binding: PathBinding::default(),
             metadata: PathMetadata::default(),
         };

@@ -105,7 +105,7 @@ fn client_cli_builds_default_socks_config() {
         "--check-config",
         "client",
         "--path",
-        "tcp://127.0.0.1:443",
+        "tcp://127.0.0.1:443-445",
         "--path",
         "udp://127.0.0.1:443",
     ])
@@ -119,6 +119,8 @@ fn client_cli_builds_default_socks_config() {
     let node = command_node(config.command);
     let client = only_mpp_outbound(&node);
     assert_eq!(client.paths.len(), 2);
+    assert_eq!(client.paths[0].spec.endpoint.ports().first(), 443);
+    assert_eq!(client.paths[0].spec.endpoint.ports().last(), 445);
     assert_eq!(node.local_ingresses[0].name, "socks5");
     assert_eq!(
         ingress_configs(&node.local_ingresses),
@@ -691,6 +693,15 @@ fn server_outbound_requires_matching_parameters() {
     assert!(matches!(
         cli.into_config(),
         Err(CliConfigError::MissingUpstreamHttp)
+    ));
+
+    let cli = parse_cli(["mptunnel", "server", "--bind-path", "tcp://0.0.0.0:443-445"])
+        .expect("parse ranged carrier endpoint");
+    assert!(matches!(
+        cli.into_config(),
+        Err(CliConfigError::Config(
+            crate::config::ConfigError::ServerPathPortRange
+        ))
     ));
 }
 

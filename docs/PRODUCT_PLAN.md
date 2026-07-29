@@ -251,7 +251,7 @@ target resolution.
 
 | Outbound | TCP targets | UDP targets | Configuration |
 | --- | --- | --- | --- |
-| MPP | Yes | Yes | Multiple TCP/QUIC carrier endpoints under one logical session, one credential, exact TLS leaf pin, path policy, and Core repair envelope. |
+| MPP | Yes | Yes | Multiple TCP/QUIC carrier endpoints under one logical session, one credential, exact TLS leaf pin, path policy, Core repair envelope, and an optional inclusive outbound carrier port range selecting one concrete port per new carrier establishment. |
 | Direct | Yes | Yes | OS-selected source or optional `bind_ip`, DNS plan, and connect timeout. |
 | SOCKS5 | Yes | Yes when the upstream supports UDP ASSOCIATE | Proxy endpoint and optional referenced username/password. |
 | HTTP CONNECT | Yes | No | Proxy endpoint, optional referenced authentication, and timeout. |
@@ -523,7 +523,7 @@ v0.1.2 deliberately does not provide:
 - kill switch, crash/reboot route restoration, or a persistent firewall
   policy;
 - built-in log rotation or support-bundle generation;
-- ECH, REALITY, port hopping, pluggable transports, or a claim of
+- ECH, REALITY, periodic port hopping of an established carrier, pluggable transports, or a claim of
   censorship-proof indistinguishability;
 - binary code signing/notarization beyond GitHub release provenance and the
   separately signed Wintun runtime; or

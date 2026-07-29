@@ -411,13 +411,19 @@ fn configured_probe_endpoints(config: &AppConfig, report: &mut DoctorReport) -> 
             OutboundLeafConfig::Mpp { id, config } => {
                 for path in &config.paths {
                     let connect = path.spec.underlay == UnderlayProtocol::Tcp;
-                    let skip_connect = path.spec.binding.source_ip.is_some();
+                    let skip_connect = path.spec.binding.source_ip.is_some()
+                        || !path.spec.endpoint.ports().is_single();
                     push_probe(
                         &mut probes,
                         &mut seen,
                         ProbeEndpoint {
-                            label: format!("MPP outbound {id} path {}", path.name),
-                            endpoint: path.spec.endpoint.clone(),
+                            label: format!(
+                                "MPP outbound {id} path {} ({})",
+                                path.name,
+                                path.spec.endpoint.authority()
+                            ),
+                            authority: path.spec.endpoint.authority(),
+                            endpoint: path.spec.endpoint.first_endpoint(),
                             connect,
                             skip_connect,
                         },
@@ -431,6 +437,7 @@ fn configured_probe_endpoints(config: &AppConfig, report: &mut DoctorReport) -> 
                         &mut seen,
                         ProbeEndpoint {
                             label: format!("native outbound {id} proxy"),
+                            authority: endpoint.authority(),
                             endpoint: endpoint.clone(),
                             connect: true,
                             skip_connect: false,
@@ -452,15 +459,17 @@ fn configured_probe_endpoints(config: &AppConfig, report: &mut DoctorReport) -> 
                 | crate::product::DnsTransport::Https
         );
         let routed = matches!(upstream.egress, crate::product::DnsEgressSpec::Outbound(_));
+        let endpoint = Endpoint {
+            host: bootstrap.ip().to_string(),
+            port: bootstrap.port(),
+        };
         push_probe(
             &mut probes,
             &mut seen,
             ProbeEndpoint {
                 label: format!("DNS upstream {}", upstream.id),
-                endpoint: Endpoint {
-                    host: bootstrap.ip().to_string(),
-                    port: bootstrap.port(),
-                },
+                authority: endpoint.authority(),
+                endpoint,
                 connect,
                 skip_connect: routed,
             },
@@ -486,15 +495,10 @@ fn configured_probe_endpoints(config: &AppConfig, report: &mut DoctorReport) -> 
 
 fn push_probe(
     probes: &mut Vec<ProbeEndpoint>,
-    seen: &mut HashSet<(String, u16, bool, bool)>,
+    seen: &mut HashSet<(String, bool, bool)>,
     probe: ProbeEndpoint,
 ) {
-    let key = (
-        probe.endpoint.host.clone(),
-        probe.endpoint.port,
-        probe.connect,
-        probe.skip_connect,
-    );
+    let key = (probe.authority.clone(), probe.connect, probe.skip_connect);
     if seen.insert(key) {
         probes.push(probe);
     }
@@ -523,22 +527,22 @@ async fn probe_endpoint(probe: ProbeEndpoint) -> EndpointProbeResult {
             label,
             outcome: EndpointProbeOutcome::Skipped(format!(
                 "{} is a domain endpoint; host DNS and direct probing were skipped because configured runtime DNS and routing own resolution and connection setup",
-                probe.endpoint.authority()
+                probe.authority
             )),
         };
     };
     let outcome = match tokio::time::timeout(DOCTOR_ENDPOINT_TIMEOUT, async {
         let addresses = [SocketAddr::new(ip, probe.endpoint.port)];
-        if !probe.connect {
-            return Ok(EndpointProbeOutcome::Resolved(format!(
-                "{} is a literal address ({})",
-                probe.endpoint.authority(),
+        if probe.skip_connect {
+            return Ok(EndpointProbeOutcome::Skipped(format!(
+                "{} maps to {}; direct probing was skipped because configured carrier selection, routing, or source binding owns the connection",
+                probe.authority,
                 display_addresses(&addresses)
             )));
         }
-        if probe.skip_connect {
-            return Ok(EndpointProbeOutcome::Skipped(format!(
-                "{} resolved to {}; direct TCP probing was skipped because configured routing/source binding owns the connection",
+        if !probe.connect {
+            return Ok(EndpointProbeOutcome::Resolved(format!(
+                "{} is a literal address ({})",
                 probe.endpoint.authority(),
                 display_addresses(&addresses)
             )));
@@ -589,6 +593,7 @@ fn display_addresses(addresses: &[SocketAddr]) -> String {
 #[derive(Debug)]
 struct ProbeEndpoint {
     label: String,
+    authority: String,
     endpoint: Endpoint,
     connect: bool,
     skip_connect: bool,

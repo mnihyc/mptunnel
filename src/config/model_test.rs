@@ -153,7 +153,7 @@ fn extra_traffic_hint_default_is_five_percent() {
 
 #[test]
 fn udp_path_configuration_is_strict_and_requires_sni_identity() {
-    let default_path = "udp://127.0.0.1:443"
+    let default_path = "udp://127.0.0.1:443-445"
         .parse::<PathSpec>()
         .expect("default udp path parses");
 
@@ -195,7 +195,7 @@ fn udp_path_configuration_is_strict_and_requires_sni_identity() {
 }
 
 #[test]
-fn server_paths_reject_client_source_binding() {
+fn server_paths_reject_client_only_endpoint_options() {
     let security = ServerSecurityConfig::for_test(
         SharedSecret::new(b"0123456789abcdef0123456789abcdef".to_vec())
             .expect("test shared secret"),
@@ -220,6 +220,15 @@ fn server_paths_reject_client_source_binding() {
         validate_mpp_inbound(&server, ResourceLimits::default()),
         Err(ConfigError::ServerPathSourceBinding)
     );
+
+    let mut server = server;
+    for ranged in ["tcp://127.0.0.1:443-445", "udp://127.0.0.1:443-445"] {
+        server.paths[0].spec = ranged.parse().expect("ranged server path");
+        assert_eq!(
+            validate_mpp_inbound(&server, ResourceLimits::default()),
+            Err(ConfigError::ServerPathPortRange)
+        );
+    }
 }
 
 #[test]

@@ -164,10 +164,10 @@ async fn product_dns_carrier_resolution_is_generation_scoped_and_literal_safe() 
         });
     let network =
         GenerationCarrierNetwork::new(socket_provider, CarrierResolutionAuthority::ProductDns);
-    let domain_path = "tcp://carrier.product.test:443"
+    let domain_path = "tcp://carrier.product.test:440-450"
         .parse::<PathSpec>()
         .expect("domain carrier");
-    let literal_path = "udp://192.0.2.10:8443"
+    let literal_path = "udp://192.0.2.10:8440-8450"
         .parse::<PathSpec>()
         .expect("literal carrier");
     let identity = CarrierPathIdentity {
@@ -180,6 +180,7 @@ async fn product_dns_carrier_resolution_is_generation_scoped_and_literal_safe() 
         .resolve(CarrierResolutionRequest {
             path: &domain_path,
             identity,
+            remote_port: 447,
         })
         .await
         .expect_err("domain resolution must fail before Product DNS installation");
@@ -190,10 +191,11 @@ async fn product_dns_carrier_resolution_is_generation_scoped_and_literal_safe() 
             .resolve(CarrierResolutionRequest {
                 path: &literal_path,
                 identity,
+                remote_port: 8447,
             })
             .await
             .expect("literal carrier remains DNS-independent"),
-        vec!["192.0.2.10:8443".parse().expect("literal address")]
+        vec!["192.0.2.10:8447".parse().expect("literal address")]
     );
 
     network
@@ -210,11 +212,12 @@ async fn product_dns_carrier_resolution_is_generation_scoped_and_literal_safe() 
             .resolve(CarrierResolutionRequest {
                 path: &domain_path,
                 identity,
+                remote_port: 449,
             })
             .await
             .expect("resolve carrier through Product DNS"),
         vec![
-            "198.51.100.42:443"
+            "198.51.100.42:449"
                 .parse()
                 .expect("resolved carrier address")
         ]
@@ -242,6 +245,7 @@ async fn host_carrier_resolution_authority_is_preserved_without_wrapping() {
                     group_ordinal: 2,
                     path_ordinal: 3,
                 },
+                remote_port: 443,
             })
             .await
             .expect("host resolver remains authoritative"),

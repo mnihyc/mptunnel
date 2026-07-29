@@ -214,6 +214,12 @@ A change hidden below an unchanged address tuple is handled by the native
 transport's measurements and recovery. MPP MUST NOT manufacture a physical
 link identity from the tuple.
 
+An endpoint MAY choose a destination locator from a locally configured set
+before carrier establishment. The set and its selection policy are not
+serialized by MPP and MUST NOT define `PathId` or carrier-instance identity.
+After transport establishment, the resulting TCP or QUIC connection follows
+the identity and roaming rules above.
+
 ## 5. Session and Carrier Establishment
 
 ### 5.1 Transport authentication

@@ -60,8 +60,9 @@ impl CarrierNetworkProvider for ProductDnsCarrierNetworkProvider {
     fn resolve<'a>(&'a self, request: CarrierResolutionRequest<'a>) -> CarrierResolutionFuture<'a> {
         Box::pin(async move {
             let endpoint = &request.path.endpoint;
+            request.validate()?;
             if let Ok(address) = endpoint.host.parse::<IpAddr>() {
-                return Ok(vec![SocketAddr::new(address, endpoint.port)]);
+                return Ok(vec![SocketAddr::new(address, request.remote_port)]);
             }
             let dns = self.dns.get().cloned().ok_or_else(|| {
                 std::io::Error::new(
@@ -70,7 +71,7 @@ impl CarrierNetworkProvider for ProductDnsCarrierNetworkProvider {
                 )
             })?;
             let addresses = dns
-                .resolve_socket_addrs(&endpoint.host, endpoint.port)
+                .resolve_socket_addrs(&endpoint.host, request.remote_port)
                 .await
                 .map_err(|error| {
                     std::io::Error::new(

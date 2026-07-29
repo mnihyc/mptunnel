@@ -151,6 +151,13 @@ they are separate transports. Established logical streams are retained for
 five minutes when every carrier is unavailable; change that policy with
 `--session-retention-timeout-ms` or `[session].retention_timeout_ms`.
 
+Advanced outbound carrier paths may use an inclusive port interval such as
+`udp://server.example:20000-40000`. Each new physical carrier selects one port;
+all advertised ports must reach the server's fixed TCP or UDP listener through
+the deployment's forwarding or redirect rule. See
+[`examples/config.reference.toml`](examples/config.reference.toml) for the
+strict syntax and ownership boundary.
+
 For repeatable deployments, put the same graph in `config.toml`. Every
 inbound, outbound, balancer, route rule, ACL rule, DNS upstream, DNS plan, and
 DNS rule has an explicit canonical `name`. Configured-resource references use

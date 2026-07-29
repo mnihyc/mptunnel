@@ -1342,7 +1342,18 @@ where
                     cancel_pending_additional_path_opens(stream_id, &mut state.recovery.pending_additional_path_opens);
                     continue;
                 };
-                state.recovery.pending_additional_path_opens.remove(&additional_path_open.key);
+                if super::lifecycle::take_matching_additional_path_open(
+                    &mut state.recovery.pending_additional_path_opens,
+                    additional_path_open.key,
+                    additional_path_open.generation,
+                )
+                .is_none()
+                {
+                    if let Ok(opened) = additional_path_open.result {
+                        opened.close().await;
+                    }
+                    continue;
+                }
                 let attached_mode = handle_additional_path_open_result(
                     context,
                     stream_id,

@@ -29,8 +29,22 @@ use crate::runtime::stream::{
 };
 use crate::scheduler::{PathSnapshot, TrafficClass};
 use std::collections::{HashMap, HashSet};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Instant;
 use tokio::sync::mpsc;
+
+static NEXT_RELAY_ADDITIONAL_PATH_OPEN_GENERATION: AtomicU64 = AtomicU64::new(1);
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) struct RelayAdditionalPathOpenGeneration(u64);
+
+fn next_relay_additional_path_open_generation() -> RelayAdditionalPathOpenGeneration {
+    let mut generation = NEXT_RELAY_ADDITIONAL_PATH_OPEN_GENERATION.fetch_add(1, Ordering::Relaxed);
+    if generation == 0 {
+        generation = NEXT_RELAY_ADDITIONAL_PATH_OPEN_GENERATION.fetch_add(1, Ordering::Relaxed);
+    }
+    RelayAdditionalPathOpenGeneration(generation)
+}
 
 pub(super) fn reliable_relay_lane_changed(previous: TrafficClass, current: TrafficClass) -> bool {
     previous != current
@@ -286,7 +300,13 @@ pub(super) async fn drain_completed_additional_path_opens(
 ) -> bool {
     let mut attached = false;
     while let Ok(additional_path_open) = additional_path_open_rx.try_recv() {
-        if pending.remove(&additional_path_open.key).is_none() {
+        if take_matching_additional_path_open(
+            pending,
+            additional_path_open.key,
+            additional_path_open.generation,
+        )
+        .is_none()
+        {
             if let Ok(opened) = additional_path_open.result {
                 opened.close().await;
             }
@@ -335,14 +355,30 @@ fn reliable_relay_live_delivery_sample_bytes(mux_limits: MuxLimits) -> u64 {
 
 pub(super) struct RelayAdditionalPathOpenResult {
     pub(super) key: RelayPathKey,
+    pub(super) generation: RelayAdditionalPathOpenGeneration,
     pub(super) mode: ReliableRelayAttachMode,
     pub(super) result: Result<OpenedRemoteStream, RuntimeError>,
 }
 
 pub(super) struct RelayAdditionalPathOpenTask {
+    generation: RelayAdditionalPathOpenGeneration,
     #[cfg(feature = "lab-diagnostics")]
     lane: TrafficClass,
     handle: tokio::task::JoinHandle<()>,
+}
+
+pub(super) fn take_matching_additional_path_open(
+    pending: &mut HashMap<RelayPathKey, RelayAdditionalPathOpenTask>,
+    key: RelayPathKey,
+    generation: RelayAdditionalPathOpenGeneration,
+) -> Option<RelayAdditionalPathOpenTask> {
+    if !pending
+        .get(&key)
+        .is_some_and(|task| task.generation == generation)
+    {
+        return None;
+    }
+    pending.remove(&key)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -483,10 +519,16 @@ fn spawn_reliable_relay_path_opens(
         let context = context.clone();
         let target = spec.target.clone();
         let result_tx = result_tx.clone();
+        let generation = next_relay_additional_path_open_generation();
         let handle = tokio::spawn(async move {
             let result =
                 open_remote_stream_for_relay_path(&context, stream_id, target, lane, key).await;
-            let message = RelayAdditionalPathOpenResult { key, mode, result };
+            let message = RelayAdditionalPathOpenResult {
+                key,
+                generation,
+                mode,
+                result,
+            };
             if let Err(err) = result_tx.send(message).await {
                 let RelayAdditionalPathOpenResult { key, result, .. } = err.0;
                 #[cfg(not(feature = "lab-diagnostics"))]
@@ -509,6 +551,7 @@ fn spawn_reliable_relay_path_opens(
         pending.insert(
             key,
             RelayAdditionalPathOpenTask {
+                generation,
                 #[cfg(feature = "lab-diagnostics")]
                 lane,
                 handle,

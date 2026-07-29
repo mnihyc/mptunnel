@@ -306,6 +306,37 @@ fn asynchronous_recovery_open_selects_one_non_excluded_path() {
     );
 }
 
+#[tokio::test]
+async fn stale_additional_path_result_cannot_consume_replacement_open() {
+    let key = RelayPathKey {
+        underlay: UnderlayProtocol::Tcp,
+        index: 0,
+    };
+    let stale_generation = next_relay_additional_path_open_generation();
+    let current_generation = next_relay_additional_path_open_generation();
+    let mut pending = HashMap::from([(
+        key,
+        RelayAdditionalPathOpenTask {
+            generation: current_generation,
+            #[cfg(feature = "lab-diagnostics")]
+            lane: TrafficClass::Throughput,
+            handle: tokio::spawn(std::future::pending()),
+        },
+    )]);
+
+    assert!(
+        take_matching_additional_path_open(&mut pending, key, stale_generation).is_none(),
+        "a delayed result must not consume a newer open for the same path"
+    );
+    assert_eq!(pending.len(), 1);
+
+    take_matching_additional_path_open(&mut pending, key, current_generation)
+        .expect("exact open generation")
+        .handle
+        .abort();
+    assert!(pending.is_empty());
+}
+
 #[test]
 fn receive_hole_reinjection_requires_live_remote_and_buffered_gap() {
     let mut recv_stream = ReliableRecvStream::new(StreamId(4), MuxLimits::default());

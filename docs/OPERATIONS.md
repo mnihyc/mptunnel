@@ -214,6 +214,17 @@ A ranged outbound carrier endpoint is likewise reported as `INFO` and skipped:
 probing one concrete port cannot validate an externally published range, and
 runtime carrier selection remains authoritative.
 
+Every port in an outbound carrier range must forward or redirect to the same
+fixed server listener. Ranged QUIC carriers change destination port every five
+minutes by default while retaining the authenticated QUIC connection; use the
+ranged `udp://` path query `port-hop-interval-ms` to select 5000 milliseconds
+or longer. A new host-protected socket is created for each change, the
+established server IP is retained, and another change is not attempted until
+traffic returns through the new port. A failed local rebind keeps the current
+socket. An unreachable forwarded port is a deployment failure and native QUIC
+idle/failure handling owns reconnection. Ranged TCP paths choose a port only
+when a new TCP carrier is established.
+
 Each check is `PASS`, `WARN`, `FAIL`, or `INFO`. Invalid configuration,
 invalid target VPN configuration, or a failed explicitly requested
 `--management-address` check exits non-zero. A currently stopped configured

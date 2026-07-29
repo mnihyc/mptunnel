@@ -263,6 +263,7 @@ struct ClientUdpPathConnection {
     carrier: ClientUdpCarrierInstance,
     metrics_task: Option<tokio::task::JoinHandle<()>>,
     control_task: Option<tokio::task::JoinHandle<()>>,
+    port_migration_task: Option<tokio::task::JoinHandle<()>>,
 }
 
 // The metrics loop holds a carrier clone, so the session must retire it explicitly.
@@ -273,6 +274,9 @@ impl Drop for ClientUdpPathConnection {
             task.abort();
         }
         if let Some(task) = self.control_task.take() {
+            task.abort();
+        }
+        if let Some(task) = self.port_migration_task.take() {
             task.abort();
         }
     }
@@ -448,7 +452,11 @@ async fn connect_client_udp_path(
             }
         };
         drop(attempts);
-        let (endpoint, connection) = established;
+        let EstablishedClientUdpPath {
+            endpoint,
+            connection,
+            canonical_remote,
+        } = established;
 
         // Address retry owns only carrier establishment. Authenticate exactly
         // once so a rejected MPP identity is never retried as a DNS decision.
@@ -480,6 +488,15 @@ async fn connect_client_udp_path(
                 control_connection.close();
             }
         });
+        let port_migration_task = runtime.path().quic_port_hop_interval().map(|interval| {
+            spawn_client_udp_port_migration(
+                runtime.clone(),
+                endpoint.clone(),
+                connection.clone(),
+                canonical_remote,
+                interval,
+            )
+        });
         Ok(ClientUdpPathConnection {
             _endpoint: endpoint,
             carrier: ClientUdpCarrierInstance {
@@ -488,6 +505,7 @@ async fn connect_client_udp_path(
             },
             metrics_task: Some(metrics_task),
             control_task: Some(control_task),
+            port_migration_task,
         })
     };
     tokio::time::timeout_at(open_deadline, connect)
@@ -495,10 +513,16 @@ async fn connect_client_udp_path(
         .map_err(|_| RuntimeError::PathOpenTimedOut)?
 }
 
+struct EstablishedClientUdpPath {
+    endpoint: UdpPathEndpoint,
+    connection: UdpPathConnection,
+    canonical_remote: std::net::SocketAddr,
+}
+
 async fn connect_client_udp_addr(
     runtime: &ClientUdpPathSessionRuntime,
     remote_addr: std::net::SocketAddr,
-) -> Result<(UdpPathEndpoint, UdpPathConnection), RuntimeError> {
+) -> Result<EstablishedClientUdpPath, RuntimeError> {
     // Each attempt needs its own family-correct, host-protected socket.
     let carrier = runtime
         .carrier_network
@@ -509,7 +533,100 @@ async fn connect_client_udp_addr(
         })?;
     let endpoint = UdpPathEndpoint::bind_client(carrier, runtime).await?;
     let connection = endpoint.connect(remote_addr).await?;
-    Ok((endpoint, connection))
+    Ok(EstablishedClientUdpPath {
+        endpoint,
+        connection,
+        canonical_remote: remote_addr,
+    })
+}
+
+fn spawn_client_udp_port_migration(
+    runtime: ClientUdpPathSessionRuntime,
+    endpoint: UdpPathEndpoint,
+    connection: UdpPathConnection,
+    canonical_remote: std::net::SocketAddr,
+    interval: Duration,
+) -> tokio::task::JoinHandle<()> {
+    tokio::spawn(async move {
+        let mut current_port = canonical_remote.port();
+        loop {
+            tokio::select! {
+                _ = tokio::time::sleep(interval) => {}
+                _ = connection.wait_closed() => return,
+            }
+            if connection.is_closed() {
+                return;
+            }
+
+            let selected_port = match runtime.path().endpoint.ports().select_other(current_port) {
+                Ok(port) => port,
+                Err(err) => {
+                    crate::observability::process_event!(
+                        Warn,
+                        "quic",
+                        "carrier_port_migration_failed",
+                        "QUIC carrier destination-port migration could not obtain OS entropy; \
+                         group={}, path={}: {err}",
+                        runtime.carrier_identity.group_ordinal,
+                        runtime.carrier_identity.path_ordinal
+                    );
+                    continue;
+                }
+            };
+            let selected_remote = std::net::SocketAddr::new(canonical_remote.ip(), selected_port);
+            let socket = match runtime.carrier_network.create_socket(CarrierSocketRequest {
+                path: runtime.path(),
+                identity: runtime.carrier_identity,
+                remote_addr: selected_remote,
+            }) {
+                Ok(socket) => socket,
+                Err(err) => {
+                    crate::observability::process_event!(
+                        Warn,
+                        "quic",
+                        "carrier_port_migration_failed",
+                        "QUIC carrier destination-port migration could not create a host-protected \
+                         socket; group={}, path={}: {err}",
+                        runtime.carrier_identity.group_ordinal,
+                        runtime.carrier_identity.path_ordinal
+                    );
+                    continue;
+                }
+            };
+            let migration = match endpoint.migrate_destination_port(
+                socket,
+                canonical_remote,
+                selected_remote,
+            ) {
+                Ok(migration) => migration,
+                Err(err) => {
+                    crate::observability::process_event!(
+                        Warn,
+                        "quic",
+                        "carrier_port_migration_failed",
+                        "QUIC carrier destination-port migration failed; group={}, path={}: {err}",
+                        runtime.carrier_identity.group_ordinal,
+                        runtime.carrier_identity.path_ordinal
+                    );
+                    continue;
+                }
+            };
+            tokio::select! {
+                _ = migration => {}
+                _ = connection.wait_closed() => return,
+            }
+            current_port = selected_port;
+            crate::observability::process_event!(
+                Info,
+                "quic",
+                "carrier_port_migrated",
+                "QUIC carrier changed destination port without changing carrier identity; \
+                 group={}, path={}",
+                runtime.carrier_identity.group_ordinal,
+                runtime.carrier_identity.path_ordinal
+            );
+        }
+    })
 }
 
 async fn perform_client_udp_path_handshake(

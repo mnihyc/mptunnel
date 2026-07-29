@@ -10,6 +10,7 @@ RUN apt-get update \
       ca-certificates \
       curl \
       iperf3 \
+      iptables \
       iproute2 \
       procps \
       python3 \

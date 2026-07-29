@@ -61,10 +61,34 @@ fn path_specs_parse_tcp_and_udp() {
             .expect("fixed selection"),
         443
     );
+    for current in [111, 166, 222] {
+        let selected = ranged_tcp
+            .endpoint
+            .ports()
+            .select_other(current)
+            .expect("OS entropy");
+        assert!(ranged_tcp.endpoint.ports().contains(selected));
+        assert_ne!(selected, current);
+    }
     assert_eq!(ranged_tcp.endpoint.authority(), "example.com:111-222");
     assert_eq!(ranged_udp.endpoint.ports().first(), 5000);
     assert_eq!(ranged_udp.endpoint.ports().last(), 5010);
     assert_eq!(ranged_udp.endpoint.authority(), "[2001:db8::2]:5000-5010");
+    assert_eq!(
+        ranged_udp.quic_port_hop_interval(),
+        Some(std::time::Duration::from_millis(
+            DEFAULT_CARRIER_PORT_HOP_INTERVAL_MS.into()
+        ))
+    );
+    assert_eq!(ranged_tcp.quic_port_hop_interval(), None);
+
+    let ranged_udp_with_interval = "udp://example.com:5000-5010?port-hop-interval-ms=45000"
+        .parse::<PathSpec>()
+        .expect("ranged UDP carrier with migration interval");
+    assert_eq!(
+        ranged_udp_with_interval.quic_port_hop_interval(),
+        Some(std::time::Duration::from_millis(45_000))
+    );
 }
 
 #[test]
@@ -80,6 +104,10 @@ fn path_specs_reject_ambiguous_values() {
         "tcp://example.com:-444",
         "tcp://example.com:443-444-445",
         "udp://2001:db8::1:443-444",
+        "tcp://example.com:443-444?port-hop-interval-ms=300000",
+        "udp://example.com:443?port-hop-interval-ms=300000",
+        "udp://example.com:443-444?port-hop-interval-ms=4999",
+        "udp://example.com:443-444?port-hop-interval-ms=5000&port-hop-interval-ms=6000",
     ] {
         assert!(
             invalid.parse::<PathSpec>().is_err(),

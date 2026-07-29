@@ -152,9 +152,13 @@ five minutes when every carrier is unavailable; change that policy with
 `--session-retention-timeout-ms` or `[session].retention_timeout_ms`.
 
 Advanced outbound carrier paths may use an inclusive port interval such as
-`udp://server.example:20000-40000`. Each new physical carrier selects one port;
-all advertised ports must reach the server's fixed TCP or UDP listener through
-the deployment's forwarding or redirect rule. See
+`udp://server.example:20000-40000`. Each new physical carrier selects one port.
+An established ranged QUIC carrier also moves to another port every five
+minutes without replacing its connection, streams, or MPP carrier identity;
+set `port-hop-interval-ms` in the path query to override the interval (minimum
+five seconds). TCP selects a new port only when it establishes a new carrier.
+All advertised ports must reach the same server IP and fixed TCP or UDP
+listener through the deployment's forwarding or redirect rule. See
 [`examples/config.reference.toml`](examples/config.reference.toml) for the
 strict syntax and ownership boundary.
 

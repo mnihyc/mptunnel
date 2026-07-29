@@ -7,9 +7,7 @@ use quinn::{Endpoint as QuinnEndpoint, EndpointConfig, ServerConfig};
 #[cfg(windows)]
 use socket2::{Domain, Protocol, Socket, Type};
 use std::io;
-#[cfg(windows)]
 use std::net::SocketAddr;
-#[cfg(windows)]
 use std::sync::Arc;
 
 #[cfg(windows)]
@@ -48,6 +46,165 @@ pub(super) fn endpoint_from_udp_socket(
         socket,
         runtime,
     )
+}
+
+pub(super) fn remote_port_mapped_udp_socket(
+    socket: std::net::UdpSocket,
+    canonical_remote: SocketAddr,
+    selected_remote: SocketAddr,
+) -> io::Result<(Arc<dyn quinn::AsyncUdpSocket>, RemotePortMigrationReceipt)> {
+    let runtime =
+        quinn::default_runtime().ok_or_else(|| io::Error::other("no async runtime found"))?;
+    #[cfg(not(windows))]
+    let socket = runtime.wrap_udp_socket(socket)?;
+    #[cfg(windows)]
+    let socket = wrap_udp_socket(socket, &runtime)?;
+    let (socket, receipt) =
+        RemotePortMappedUdpSocket::new(socket, canonical_remote, selected_remote)?;
+    Ok((Arc::new(socket), receipt))
+}
+
+pub(crate) struct RemotePortMigrationReceipt {
+    observation: Arc<RemotePortObservation>,
+}
+
+impl std::fmt::Debug for RemotePortMigrationReceipt {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("RemotePortMigrationReceipt")
+            .finish_non_exhaustive()
+    }
+}
+
+impl RemotePortMigrationReceipt {
+    pub(crate) async fn wait(self) {
+        while !self
+            .observation
+            .observed
+            .load(std::sync::atomic::Ordering::Acquire)
+        {
+            self.observation.notify.notified().await;
+        }
+    }
+}
+
+struct RemotePortObservation {
+    observed: std::sync::atomic::AtomicBool,
+    notify: tokio::sync::Notify,
+}
+
+impl RemotePortObservation {
+    fn observe(&self) {
+        if !self.observed.load(std::sync::atomic::Ordering::Relaxed)
+            && self
+                .observed
+                .compare_exchange(
+                    false,
+                    true,
+                    std::sync::atomic::Ordering::Release,
+                    std::sync::atomic::Ordering::Relaxed,
+                )
+                .is_ok()
+        {
+            self.notify.notify_one();
+        }
+    }
+}
+
+/// Keeps QUIC's peer locator stable while a deployment maps one server across
+/// several externally reachable UDP ports.
+struct RemotePortMappedUdpSocket {
+    socket: Arc<dyn quinn::AsyncUdpSocket>,
+    canonical_remote: SocketAddr,
+    selected_remote: SocketAddr,
+    observation: Arc<RemotePortObservation>,
+}
+
+impl RemotePortMappedUdpSocket {
+    fn new(
+        socket: Arc<dyn quinn::AsyncUdpSocket>,
+        canonical_remote: SocketAddr,
+        selected_remote: SocketAddr,
+    ) -> io::Result<(Self, RemotePortMigrationReceipt)> {
+        if canonical_remote.ip() != selected_remote.ip() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "QUIC destination-port migration must retain the established server IP",
+            ));
+        }
+        let observation = Arc::new(RemotePortObservation {
+            observed: std::sync::atomic::AtomicBool::new(false),
+            notify: tokio::sync::Notify::new(),
+        });
+        Ok((
+            Self {
+                socket,
+                canonical_remote,
+                selected_remote,
+                observation: observation.clone(),
+            },
+            RemotePortMigrationReceipt { observation },
+        ))
+    }
+}
+
+impl std::fmt::Debug for RemotePortMappedUdpSocket {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("RemotePortMappedUdpSocket")
+            .finish_non_exhaustive()
+    }
+}
+
+impl quinn::AsyncUdpSocket for RemotePortMappedUdpSocket {
+    fn create_io_poller(self: Arc<Self>) -> std::pin::Pin<Box<dyn quinn::UdpPoller>> {
+        self.socket.clone().create_io_poller()
+    }
+
+    fn try_send(&self, transmit: &quinn::udp::Transmit<'_>) -> io::Result<()> {
+        if transmit.destination != self.canonical_remote {
+            return self.socket.try_send(transmit);
+        }
+        let mut mapped = transmit.clone();
+        mapped.destination = self.selected_remote;
+        self.socket.try_send(&mapped)
+    }
+
+    fn poll_recv(
+        &self,
+        cx: &mut std::task::Context<'_>,
+        bufs: &mut [std::io::IoSliceMut<'_>],
+        meta: &mut [quinn::udp::RecvMeta],
+    ) -> std::task::Poll<io::Result<usize>> {
+        match self.socket.poll_recv(cx, bufs, meta) {
+            std::task::Poll::Ready(Ok(received)) => {
+                for datagram in meta.iter_mut().take(received) {
+                    if datagram.addr == self.selected_remote {
+                        self.observation.observe();
+                        datagram.addr = self.canonical_remote;
+                    }
+                }
+                std::task::Poll::Ready(Ok(received))
+            }
+            result => result,
+        }
+    }
+
+    fn local_addr(&self) -> io::Result<SocketAddr> {
+        self.socket.local_addr()
+    }
+
+    fn max_transmit_segments(&self) -> usize {
+        self.socket.max_transmit_segments()
+    }
+
+    fn max_receive_segments(&self) -> usize {
+        self.socket.max_receive_segments()
+    }
+
+    fn may_fragment(&self) -> bool {
+        self.socket.may_fragment()
+    }
 }
 
 #[cfg(windows)]
@@ -248,6 +405,6 @@ impl quinn::UdpPoller for PortableUdpPoller {
     }
 }
 
-#[cfg(all(test, windows))]
+#[cfg(test)]
 #[path = "socket_test.rs"]
 mod tests;

@@ -8,6 +8,10 @@ use crate::protocol::UnderlayProtocol;
 use std::net::IpAddr;
 use std::num::NonZeroU16;
 use std::str::FromStr;
+use std::time::Duration;
+
+pub const DEFAULT_CARRIER_PORT_HOP_INTERVAL_MS: u32 = 5 * 60 * 1_000;
+pub const MIN_CARRIER_PORT_HOP_INTERVAL_MS: u32 = 5 * 1_000;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Endpoint {
@@ -110,16 +114,37 @@ impl CarrierPortSet {
         if self.is_single() {
             return Ok(self.first());
         }
-        let width = u32::from(self.last()) - u32::from(self.first()) + 1;
-        let sample_space = u32::from(u16::MAX) + 1;
-        let accepted = sample_space - sample_space % width;
-        loop {
-            let mut bytes = [0_u8; 2];
-            getrandom::getrandom(&mut bytes)?;
-            let sample = u32::from(u16::from_ne_bytes(bytes));
-            if sample < accepted {
-                return Ok((u32::from(self.first()) + sample % width) as u16);
-            }
+        Ok((u32::from(self.first()) + random_offset(self.width())?) as u16)
+    }
+
+    /// Selects uniformly from every configured port except `current`.
+    pub fn select_other(self, current: u16) -> Result<u16, getrandom::Error> {
+        if self.is_single() || !self.contains(current) {
+            return self.select();
+        }
+        let current_offset = u32::from(current) - u32::from(self.first());
+        let mut offset = random_offset(self.width() - 1)?;
+        if offset >= current_offset {
+            offset += 1;
+        }
+        Ok((u32::from(self.first()) + offset) as u16)
+    }
+
+    fn width(self) -> u32 {
+        u32::from(self.last()) - u32::from(self.first()) + 1
+    }
+}
+
+fn random_offset(width: u32) -> Result<u32, getrandom::Error> {
+    debug_assert!((1..=u32::from(u16::MAX) + 1).contains(&width));
+    let sample_space = u32::from(u16::MAX) + 1;
+    let accepted = sample_space - sample_space % width;
+    loop {
+        let mut bytes = [0_u8; 2];
+        getrandom::getrandom(&mut bytes)?;
+        let sample = u32::from(u16::from_ne_bytes(bytes));
+        if sample < accepted {
+            return Ok(sample % width);
         }
     }
 }
@@ -242,6 +267,8 @@ pub struct PathMetadata {
     pub initial_rate: RateHint,
     /// Optional product datagram ceiling. QUIC owns transport PMTU discovery.
     pub max_datagram_payload_bytes: Option<usize>,
+    /// Override for ranged QUIC destination-port migration.
+    pub port_hop_interval_ms: Option<u32>,
 }
 
 impl Default for PathMetadata {
@@ -252,7 +279,21 @@ impl Default for PathMetadata {
             initial_jitter_ms: None,
             initial_rate: RateHint::Unknown,
             max_datagram_payload_bytes: None,
+            port_hop_interval_ms: None,
         }
+    }
+}
+
+impl PathSpec {
+    /// Periodic destination-port migration applies only to ranged QUIC paths.
+    pub fn quic_port_hop_interval(&self) -> Option<Duration> {
+        (self.underlay == UnderlayProtocol::Udp && !self.endpoint.ports().is_single()).then(|| {
+            Duration::from_millis(u64::from(
+                self.metadata
+                    .port_hop_interval_ms
+                    .unwrap_or(DEFAULT_CARRIER_PORT_HOP_INTERVAL_MS),
+            ))
+        })
     }
 }
 
@@ -271,6 +312,7 @@ impl FromStr for PathSpec {
         let (endpoint, query) = path
             .split_once('?')
             .map_or((path, None), |(endpoint, query)| (endpoint, Some(query)));
+        let endpoint: CarrierEndpoint = endpoint.parse()?;
         let (binding, metadata) = match query {
             Some(query) => parse_path_options(query)?,
             None => (PathBinding::default(), PathMetadata::default()),
@@ -278,9 +320,14 @@ impl FromStr for PathSpec {
         if underlay == UnderlayProtocol::Udp && metadata.policy.no_udp {
             return Err(PathSpecParseError::NoUdpOnUdpPath);
         }
+        if metadata.port_hop_interval_ms.is_some()
+            && (underlay != UnderlayProtocol::Udp || endpoint.ports().is_single())
+        {
+            return Err(PathSpecParseError::PortHopIntervalRequiresRangedUdpPath);
+        }
         Ok(Self {
             underlay,
-            endpoint: endpoint.parse()?,
+            endpoint,
             binding,
             metadata,
         })
@@ -298,6 +345,7 @@ fn parse_path_options(query: &str) -> Result<(PathBinding, PathMetadata), PathSp
     let mut jitter_set = false;
     let mut rate_set = false;
     let mut datagram_payload_limit_set = false;
+    let mut port_hop_interval_set = false;
     for part in query.split('&') {
         if part.is_empty() {
             return Err(PathSpecParseError::EmptyQueryParam);
@@ -366,6 +414,11 @@ fn parse_path_options(query: &str) -> Result<(PathBinding, PathMetadata), PathSp
                 metadata.max_datagram_payload_bytes =
                     Some(parse_datagram_payload_limit(key, value)?);
             }
+            "port-hop-interval-ms" => {
+                reject_duplicate(port_hop_interval_set, key)?;
+                port_hop_interval_set = true;
+                metadata.port_hop_interval_ms = Some(parse_port_hop_interval(key, value)?);
+            }
             "backup" => metadata.policy.backup = parse_bool_param(key, value)?,
             "expensive" => metadata.policy.expensive = parse_bool_param(key, value)?,
             "bulk-allowed" => metadata.policy.bulk_allowed = parse_bool_param(key, value)?,
@@ -423,6 +476,17 @@ fn parse_datagram_payload_limit(
         ));
     }
     Ok(payload_limit)
+}
+
+fn parse_port_hop_interval(key: &str, value: Option<&str>) -> Result<u32, PathSpecParseError> {
+    let interval = parse_u32_param(key, value)?;
+    if interval < MIN_CARRIER_PORT_HOP_INTERVAL_MS {
+        return Err(PathSpecParseError::InvalidQueryParamValue(
+            key.to_string(),
+            interval.to_string(),
+        ));
+    }
+    Ok(interval)
 }
 
 fn parse_bool_param(key: &str, value: Option<&str>) -> Result<bool, PathSpecParseError> {
@@ -540,6 +604,7 @@ pub enum PathSpecParseError {
     DuplicateQueryParam(String),
     QueryParamOverflow(String),
     NoUdpOnUdpPath,
+    PortHopIntervalRequiresRangedUdpPath,
 }
 
 impl From<CarrierEndpointParseError> for PathSpecParseError {
@@ -576,6 +641,10 @@ impl std::fmt::Display for PathSpecParseError {
                 write!(f, "path query parameter {key:?} is too large")
             }
             Self::NoUdpOnUdpPath => write!(f, "udp:// paths cannot set no-udp=true"),
+            Self::PortHopIntervalRequiresRangedUdpPath => write!(
+                f,
+                "port-hop-interval-ms requires a ranged udp:// carrier endpoint"
+            ),
         }
     }
 }

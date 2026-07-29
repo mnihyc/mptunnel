@@ -220,6 +220,17 @@ serialized by MPP and MUST NOT define `PathId` or carrier-instance identity.
 After transport establishment, the resulting TCP or QUIC connection follows
 the identity and roaming rules above.
 
+An established QUIC connection MAY rebind through a fresh host-policy-protected
+local socket and another destination port in that same configured set. Every
+port in the set MUST reach the same authenticated service at the
+already-established server IP. The endpoint MUST retain the QUIC connection,
+and it MUST retain the preceding socket until traffic is observed through the
+new locator. QUIC retains sole authority over connection migration, path
+validation, recovery, and path-dependent transport state; `PathId`, the carrier
+instance, its attachments, and all MPP state remain unchanged. This operation
+adds no MPP wire field. Changing a TCP destination port requires a new TCP
+connection and therefore a new carrier instance.
+
 ## 5. Session and Carrier Establishment
 
 ### 5.1 Transport authentication

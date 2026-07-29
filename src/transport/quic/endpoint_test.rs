@@ -1,6 +1,86 @@
 use super::*;
+use crate::protocol::Frame;
+use crate::protocol::codec::CodecLimits;
+use crate::transport::{CarrierPathIdentity, CarrierSocket, CarrierSocketRequest, PathSpec};
 use std::time::Duration;
 use tokio::time::timeout;
+
+async fn spawn_udp_forwarder(
+    upstream_addr: SocketAddr,
+) -> (SocketAddr, tokio::task::JoinHandle<()>) {
+    let public = tokio::net::UdpSocket::bind("127.0.0.1:0")
+        .await
+        .expect("public UDP forwarder");
+    let public_addr = public.local_addr().expect("public forwarder address");
+    let upstream = tokio::net::UdpSocket::bind("127.0.0.1:0")
+        .await
+        .expect("upstream UDP socket");
+    upstream
+        .connect(upstream_addr)
+        .await
+        .expect("connect UDP forwarder upstream");
+    let task = tokio::spawn(async move {
+        let mut client_addr = None;
+        let mut ingress = vec![0_u8; 65_535];
+        let mut egress = vec![0_u8; 65_535];
+        loop {
+            tokio::select! {
+                packet = public.recv_from(&mut ingress) => {
+                    let Ok((len, source)) = packet else {
+                        return;
+                    };
+                    client_addr = Some(source);
+                    if upstream.send(&ingress[..len]).await.is_err() {
+                        return;
+                    }
+                }
+                packet = upstream.recv(&mut egress) => {
+                    let Ok(len) = packet else {
+                        return;
+                    };
+                    if let Some(destination) = client_addr
+                        && public.send_to(&egress[..len], destination).await.is_err()
+                    {
+                        return;
+                    }
+                }
+            }
+        }
+    });
+    (public_addr, task)
+}
+
+async fn assert_quic_ping_round_trip(client: &Connection, server: &Connection, nonce: u64) {
+    let limits = CodecLimits::default();
+    let server = server.clone();
+    let server_stream = tokio::spawn(async move {
+        let (mut send, mut recv) = server.accept_bi().await.expect("server test stream");
+        assert_eq!(
+            crate::transport::quic::read_frame(&mut recv, limits)
+                .await
+                .expect("server read ping"),
+            Frame::Ping { nonce }
+        );
+        crate::transport::quic::write_frame(&mut send, &Frame::Pong { nonce }, limits)
+            .await
+            .expect("server write pong");
+    });
+    let (mut send, mut recv) = client.open_bi().await.expect("client test stream");
+    crate::transport::quic::write_frame(&mut send, &Frame::Ping { nonce }, limits)
+        .await
+        .expect("client write ping");
+    assert_eq!(
+        timeout(
+            Duration::from_secs(5),
+            crate::transport::quic::read_frame(&mut recv, limits)
+        )
+        .await
+        .expect("pong timeout")
+        .expect("client read pong"),
+        Frame::Pong { nonce }
+    );
+    server_stream.await.expect("server stream task");
+}
 
 #[tokio::test]
 async fn quic_carrier_rejects_wrong_independent_tls_identity_before_product_frames() {
@@ -178,6 +258,88 @@ async fn quic_keep_alive_preserves_a_quiet_authenticated_carrier() {
 
     assert!(!client_connection.is_closed());
     assert!(!server_connection.is_closed());
+}
+
+#[tokio::test]
+async fn quic_destination_port_migration_preserves_connection_and_streams() {
+    let mux_limits = MuxLimits {
+        quic_path_keep_alive_interval: Duration::from_millis(20),
+        quic_path_idle_timeout: Duration::from_secs(2),
+        ..MuxLimits::default()
+    };
+    let server = Endpoint::bind_server(
+        "127.0.0.1:0".parse().expect("server address"),
+        &crate::transport::encrypted::test_server_tls_config(),
+        super::super::test_candidate_verifier(),
+        mux_limits,
+    )
+    .await
+    .expect("server endpoint");
+    let server_addr = server.local_addr().expect("server address");
+    let (first_port, first_forwarder) = spawn_udp_forwarder(server_addr).await;
+    let (second_port, second_forwarder) = spawn_udp_forwarder(server_addr).await;
+    let accepted = tokio::spawn(async move { server.accept().await.expect("server connection") });
+
+    let client = Endpoint::bind_client(
+        "127.0.0.1:0".parse().expect("client address"),
+        &crate::transport::encrypted::test_client_tls_config(),
+        super::super::test_candidate_selector(),
+        mux_limits,
+    )
+    .await
+    .expect("client endpoint");
+    let client_connection = timeout(Duration::from_secs(5), client.connect(first_port))
+        .await
+        .expect("initial connection timeout")
+        .expect("initial client connection");
+    let server_connection = timeout(Duration::from_secs(5), accepted)
+        .await
+        .expect("server accept timeout")
+        .expect("server accept task");
+    assert_quic_ping_round_trip(&client_connection, &server_connection, 90).await;
+
+    let first = first_port.port().min(second_port.port());
+    let last = first_port.port().max(second_port.port());
+    let path: PathSpec = format!("udp://127.0.0.1:{first}-{last}")
+        .parse()
+        .expect("ranged UDP path");
+    let carrier = CarrierSocket::system(CarrierSocketRequest {
+        path: &path,
+        identity: CarrierPathIdentity {
+            group_ordinal: 0,
+            path_ordinal: 0,
+        },
+        remote_addr: second_port,
+    })
+    .expect("replacement carrier socket");
+    let receipt = client
+        .rebind_client_socket(carrier, first_port, second_port)
+        .expect("start destination-port migration");
+    timeout(Duration::from_secs(5), receipt.wait())
+        .await
+        .expect("destination-port migration confirmation");
+    assert_quic_ping_round_trip(&client_connection, &server_connection, 91).await;
+
+    let carrier = CarrierSocket::system(CarrierSocketRequest {
+        path: &path,
+        identity: CarrierPathIdentity {
+            group_ordinal: 0,
+            path_ordinal: 0,
+        },
+        remote_addr: first_port,
+    })
+    .expect("second replacement carrier socket");
+    let receipt = client
+        .rebind_client_socket(carrier, first_port, first_port)
+        .expect("start second destination-port migration");
+    timeout(Duration::from_secs(5), receipt.wait())
+        .await
+        .expect("second destination-port migration confirmation");
+    assert_quic_ping_round_trip(&client_connection, &server_connection, 92).await;
+
+    assert!(!client_connection.is_closed());
+    first_forwarder.abort();
+    second_forwarder.abort();
 }
 
 #[test]

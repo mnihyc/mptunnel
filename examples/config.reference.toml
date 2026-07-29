@@ -295,6 +295,14 @@ paths = [
 # externally published range port must be redirected or forwarded to that
 # listener.
 #
+# Ranged QUIC paths periodically move the same authenticated connection to
+# another port in the set. The default interval is five minutes; override it
+# with `port-hop-interval-ms=<u32>` (minimum 5000). Each replacement uses a
+# fresh host-protected socket but retains the established server IP, QUIC
+# connection, streams, and MPP carrier identity. The next interval begins only
+# after traffic returns through the selected port. Ranged TCP paths select a
+# port only for each new TCP carrier.
+#
 # Carrier URI query reference (startup hints are replaced by live evidence;
 # policy flags remain operator constraints):
 #   source-ip=<IP>
@@ -302,6 +310,7 @@ paths = [
 #   jitter-ms=<u32>
 #   rate-bps|rate-kbps|rate-mbps=<u64>, or rate=unknown|unlimited
 #   datagram-payload-limit=512..65000
+#   port-hop-interval-ms=5000..4294967295 (ranged udp:// only)
 #   backup, expensive, bulk-allowed, probe-only, no-udp
 # Boolean flags may omit a value or use canonical true/false. Server bind
 # paths reject `source-ip` and port ranges, and udp:// paths cannot set

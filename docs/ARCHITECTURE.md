@@ -261,6 +261,16 @@ Logical path identity is `(underlay, path_id)`. Physical carrier identity adds
 `path_instance_id`. Evidence, flights, commands, and usage sequences cannot
 cross a reconnect merely because a numeric path ID was reused.
 
+A ranged QUIC path may replace its local UDP socket and external destination
+port while retaining the same Quinn connection and `path_instance_id`. The
+established server IP is pinned for this operation, each socket crosses the
+same host-network protection boundary, and the preceding socket remains
+available until traffic returns through the selected port. Quinn remains the
+only owner of connection IDs, migration, path validation, recovery, and native
+path state. No scheduler, attachment, MPP authentication, or wire state changes.
+A ranged TCP path chooses a port only when creating a new TCP connection, which
+always creates a new physical carrier instance.
+
 Stream membership adds a separate incarnation. Request-side scheduling and
 flight ownership carry `(path_instance_id, attachment_id)`. Response new-data
 dispatch carries `(path_instance_id, output_incarnation)` plus the observed

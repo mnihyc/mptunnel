@@ -19,7 +19,7 @@ use std::sync::Arc;
 use tokio::net::lookup_host;
 use tokio::sync::mpsc;
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub(in crate::runtime) struct UdpPathEndpoint {
     endpoint: quic_transport::Endpoint,
 }
@@ -110,6 +110,18 @@ impl UdpPathEndpoint {
         ))
     }
 
+    pub(super) fn migrate_destination_port(
+        &self,
+        socket: crate::transport::CarrierSocket,
+        canonical_remote: SocketAddr,
+        selected_remote: SocketAddr,
+    ) -> Result<impl Future<Output = ()> + use<>, RuntimeError> {
+        let receipt =
+            self.endpoint
+                .rebind_client_socket(socket, canonical_remote, selected_remote)?;
+        Ok(receipt.wait())
+    }
+
     pub(super) async fn accept(&self) -> Option<UdpPathConnection> {
         self.endpoint.accept().await.map(UdpPathConnection::new)
     }
@@ -164,6 +176,10 @@ impl UdpPathConnection {
 
     pub(super) fn is_closed(&self) -> bool {
         self.connection.is_closed()
+    }
+
+    pub(super) async fn wait_closed(&self) {
+        self.connection.wait_closed().await;
     }
 
     pub(super) fn rtt(&self) -> std::time::Duration {

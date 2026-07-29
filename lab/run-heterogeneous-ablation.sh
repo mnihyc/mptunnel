@@ -59,6 +59,13 @@ bulk_connections="${MPTUNNEL_LAB_BULK_CONNECTIONS:-2}"
 proxy_port="${PROXY_PORT:-1080}"
 baseline_proxy_port="${BASELINE_PROXY_PORT:-1090}"
 server_port="${SERVER_PORT:-7443}"
+port_hop_first_port="$((server_port + 1))"
+port_hop_last_port="$((server_port + 3))"
+if (( port_hop_last_port > 65535 )); then
+  echo "SERVER_PORT leaves no room for the three-port QUIC migration lab range" >&2
+  exit 2
+fi
+port_hop_forwarding=0
 baseline_vmess_port="${BASELINE_VMESS_PORT:-18443}"
 baseline_hysteria2_port="${BASELINE_HYSTERIA2_PORT:-18444}"
 baseline_mptcp_port="${BASELINE_MPTCP_PORT:-18081}"
@@ -1719,7 +1726,27 @@ stop_client() {
 }
 
 stop_server() {
+  stop_server_port_forwarding
   stop_process server /tmp/mptunnel-server.pid
+}
+
+stop_server_port_forwarding() {
+  exec_in server "\
+    while iptables -t nat -C PREROUTING -p udp \
+      --dport '${port_hop_first_port}:${port_hop_last_port}' \
+      -j REDIRECT --to-ports '${server_port}' >/dev/null 2>&1; do \
+      iptables -t nat -D PREROUTING -p udp \
+        --dport '${port_hop_first_port}:${port_hop_last_port}' \
+        -j REDIRECT --to-ports '${server_port}'; \
+    done" >/dev/null 2>&1 || true
+}
+
+start_server_port_forwarding() {
+  stop_server_port_forwarding
+  exec_in server "\
+    iptables -t nat -A PREROUTING -p udp \
+      --dport '${port_hop_first_port}:${port_hop_last_port}' \
+      -j REDIRECT --to-ports '${server_port}'"
 }
 
 stop_saturation() {
@@ -2164,6 +2191,9 @@ start_server() {
       >/tmp/mptunnel-server.log 2>&1 & echo \$! >/tmp/mptunnel-server.pid"
   sleep 1
   exec_in server "kill -0 \$(cat /tmp/mptunnel-server.pid)"
+  if [[ "$port_hop_forwarding" == "1" ]]; then
+    start_server_port_forwarding
+  fi
 }
 
 start_client_with_netem() {
@@ -2949,6 +2979,42 @@ run_reliable_ideal_upload_case() {
   apply_netem apply
 }
 
+start_quic_port_hop_client() {
+  local case_name="$1"
+  shift
+  port_hop_forwarding=1
+  if [[ "$isolate_cases" != "1" ]]; then
+    start_server_port_forwarding
+  fi
+  if ! start_client_with_netem "$case_name" unconstrained "$@"; then
+    port_hop_forwarding=0
+    return 1
+  fi
+  port_hop_forwarding=0
+}
+
+finish_quic_port_hop_case() {
+  stop_client
+  stop_server_port_forwarding
+  apply_netem apply
+}
+
+run_quic_port_hop_download_case() {
+  local case_name="mptunnel_udp_stream_single_unconstrained_port_hopping"
+  local endpoint="--path 'udp://172.31.10.20:${port_hop_first_port}-${port_hop_last_port}?port-hop-interval-ms=5000'"
+  start_quic_port_hop_client "$case_name" "$endpoint"
+  run_tcp_download_probe_case "$case_name"
+  finish_quic_port_hop_case
+}
+
+run_quic_port_hop_upload_case() {
+  local case_name="mptunnel_udp_stream_single_unconstrained_port_hopping_upload"
+  local endpoint="--path 'udp://172.31.10.20:${port_hop_first_port}-${port_hop_last_port}?port-hop-interval-ms=5000'"
+  start_quic_port_hop_client "$case_name" "$endpoint"
+  run_tcp_upload_probe_case "$case_name"
+  finish_quic_port_hop_case
+}
+
 run_mixed_ideal_case() {
   local case_name="$1"
   local ideal_path="$2"
@@ -3390,6 +3456,9 @@ fi
 if should_run_case "mptunnel_udp_stream_single_unconstrained"; then
   run_reliable_ideal_download_case "mptunnel_udp_stream_single_unconstrained" "unconstrained" "$udp_endpoint_lowlat"
 fi
+if should_run_case "mptunnel_udp_stream_single_unconstrained_port_hopping"; then
+  run_quic_port_hop_download_case
+fi
 
 if should_run_case "mptunnel_udp_stream_multipath_all"; then
   start_client "udp_stream_multipath_all" "$udp_all"
@@ -3492,6 +3561,9 @@ if should_run_case "mptunnel_udp_stream_single_cross_continent_high_bandwidth_up
 fi
 if should_run_case "mptunnel_udp_stream_single_unconstrained_upload"; then
   run_reliable_ideal_upload_case "mptunnel_udp_stream_single_unconstrained_upload" "unconstrained" "$udp_endpoint_lowlat"
+fi
+if should_run_case "mptunnel_udp_stream_single_unconstrained_port_hopping_upload"; then
+  run_quic_port_hop_upload_case
 fi
 
 if should_run_case "mptunnel_udp_stream_multipath_all_upload"; then

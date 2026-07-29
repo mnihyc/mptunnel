@@ -2,7 +2,9 @@
 
 use super::native_datagram::NativeDatagramHub;
 use super::presentation::H3Presentation;
-use super::socket::endpoint_from_udp_socket;
+use super::socket::{
+    RemotePortMigrationReceipt, endpoint_from_udp_socket, remote_port_mapped_udp_socket,
+};
 #[cfg(windows)]
 use super::socket::{bind_client_udp_socket, bind_server_udp_socket};
 use super::stream::DatagramFlowRegistry;
@@ -19,7 +21,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use tokio::sync::Notify;
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct Endpoint {
     endpoint: QuinnEndpoint,
     role: EndpointRole,
@@ -141,6 +143,29 @@ impl Endpoint {
             .connect(remote, server_name)
             .map_err(QuicCarrierError::Connect)?;
         Connection::from_quinn(connecting.await?, self.role.clone(), self.mux_limits).await
+    }
+
+    /// Rebinds an established client endpoint through another externally
+    /// forwarded destination port while retaining Quinn's peer locator.
+    pub(crate) fn rebind_client_socket(
+        &self,
+        socket: CarrierSocket,
+        canonical_remote: SocketAddr,
+        selected_remote: SocketAddr,
+    ) -> Result<RemotePortMigrationReceipt, QuicCarrierError> {
+        if !matches!(self.role, EndpointRole::Client { .. }) {
+            return Err(QuicCarrierError::Io(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "only client QUIC endpoints can migrate destination ports",
+            )));
+        }
+        let (socket, receipt) = remote_port_mapped_udp_socket(
+            socket.into_udp_socket()?,
+            canonical_remote,
+            selected_remote,
+        )?;
+        self.endpoint.rebind_abstract(socket)?;
+        Ok(receipt)
     }
 
     pub async fn accept(&self) -> Option<Connection> {
@@ -285,6 +310,10 @@ impl Connection {
 
     pub fn is_closed(&self) -> bool {
         self.connection.close_reason().is_some()
+    }
+
+    pub async fn wait_closed(&self) {
+        let _ = self.connection.closed().await;
     }
 
     pub fn is_locally_closed(&self) -> bool {

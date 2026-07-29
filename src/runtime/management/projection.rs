@@ -490,8 +490,7 @@ fn collect_client(
     );
     summary.configured_path_count = summary.configured_path_count.saturating_add(
         context
-            .tcp_paths
-            .len()
+            .configured_tcp_endpoint_count()
             .saturating_add(context.udp_paths.len()),
     );
     let health = context.health().lock().expect("client path health lock");
@@ -505,6 +504,7 @@ fn collect_client(
         context.session_id.0,
         summary,
         now,
+        Some(context),
     ));
     paths.extend(client_path_set(
         &context.udp_path_names,
@@ -516,6 +516,7 @@ fn collect_client(
         context.session_id.0,
         summary,
         now,
+        None,
     ));
     drop(health);
 }
@@ -531,11 +532,19 @@ fn client_path_set(
     session_id: u64,
     summary: &mut NumericSummary,
     now: Instant,
+    tcp_context: Option<&ClientPathContext>,
 ) -> Vec<ManagementPathStatus> {
     specs
         .iter()
         .enumerate()
-        .map(|(index, spec)| {
+        .filter_map(|(index, spec)| {
+            if underlay == UnderlayProtocol::Tcp
+                && records
+                    .get(index)
+                    .is_some_and(|record| !record.is_locally_eligible())
+            {
+                return None;
+            }
             let path = names
                 .get(index)
                 .expect("client path names align with underlay-local path inventory")
@@ -545,14 +554,20 @@ fn client_path_set(
                 .map(|record| record.observation_at(now))
                 .unwrap_or_default();
             let snapshot = path_snapshot(spec, index, observation);
+            let tcp_endpoint = tcp_context.and_then(|context| context.tcp_endpoint_for_path(index));
             summary.add_path(snapshot, observation.manual_disabled);
-            ManagementPathStatus {
+            Some(ManagementPathStatus {
                 service: "mpp_outbound",
                 service_index,
                 service_name: service_name.clone(),
                 session_id: Some(session_id.to_string()),
                 path,
                 underlay: underlay_name(underlay),
+                tcp_carrier_ordinal: tcp_context
+                    .and_then(|context| context.tcp_member_ordinal(index))
+                    .map(|ordinal| ordinal.saturating_add(1)),
+                tcp_carriers_min: tcp_endpoint.map(|endpoint| endpoint.range.min()),
+                tcp_carriers_max: tcp_endpoint.map(|endpoint| endpoint.range.max()),
                 path_id: Some(snapshot.id.0.to_string()),
                 path_instance_id: None,
                 endpoint: Some(path_endpoint(spec)),
@@ -593,7 +608,7 @@ fn client_path_set(
                         .last_delivery_at
                         .max(observation.carrier_last_delivery_at),
                 ),
-            }
+            })
         })
         .collect()
 }
@@ -623,6 +638,9 @@ fn collect_server(
             session_id: None,
             path,
             underlay: underlay_name(spec.underlay),
+            tcp_carrier_ordinal: None,
+            tcp_carriers_min: None,
+            tcp_carriers_max: None,
             path_id: None,
             path_instance_id: None,
             endpoint: Some(path_endpoint(spec)),
@@ -690,6 +708,9 @@ fn collect_server(
             session_id: Some(path.session_id.0.to_string()),
             path: configured_path,
             underlay: underlay_name(path.underlay),
+            tcp_carrier_ordinal: None,
+            tcp_carriers_min: None,
+            tcp_carriers_max: None,
             path_id: Some(path.path_id.0.to_string()),
             path_instance_id: Some(path.path_instance_id.as_u64().to_string()),
             endpoint: None,

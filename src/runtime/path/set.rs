@@ -33,7 +33,7 @@ use crate::runtime::telemetry::{RuntimeTelemetrySnapshot, active_flow_detail_cap
 #[cfg(test)]
 use crate::transport::SystemCarrierNetworkProvider;
 use crate::transport::encrypted::TcpClientTlsConfig;
-use crate::transport::{CarrierNetworkProvider, CarrierPathIdentity, PathSpec};
+use crate::transport::{CarrierNetworkProvider, CarrierPathIdentity, PathSpec, TcpCarrierRange};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -45,6 +45,13 @@ pub(in crate::runtime) struct ClientPathRuntimeOptions {
     pub(in crate::runtime) allow_peer_diagnostics: bool,
 }
 
+#[derive(Debug)]
+pub(in crate::runtime) struct ClientTcpEndpointTopology {
+    pub(in crate::runtime) config_index: usize,
+    pub(in crate::runtime) range: TcpCarrierRange,
+    pub(in crate::runtime) members: Vec<usize>,
+}
+
 #[derive(Clone)]
 pub struct ClientPathContext {
     // Stable configured Product name of this MPP outbound. Local inbound
@@ -53,12 +60,16 @@ pub struct ClientPathContext {
     pub(in crate::runtime) outbound: Option<OutboundId>,
     // Carrier ownership: path specs, per-path security, and live sessions belong
     // to the MPP session's carrier path registry, not to individual streams.
+    /// Expanded TCP carrier slots used by Core scheduling.
     pub(in crate::runtime) tcp_paths: Arc<Vec<PathSpec>>,
     pub(in crate::runtime) udp_paths: Arc<Vec<PathSpec>>,
     /// Stable Product names aligned with each underlay-local path vector.
     pub(in crate::runtime) tcp_path_names: Arc<Vec<String>>,
     pub(in crate::runtime) udp_path_names: Arc<Vec<String>>,
     pub(in crate::runtime) tcp_path_ordinals: Arc<Vec<usize>>,
+    pub(in crate::runtime) tcp_config_indices: Arc<Vec<usize>>,
+    pub(in crate::runtime) tcp_member_ordinals: Arc<Vec<u16>>,
+    pub(in crate::runtime) tcp_endpoint_topology: Arc<Vec<ClientTcpEndpointTopology>>,
     pub(in crate::runtime) udp_path_ordinals: Arc<Vec<usize>>,
     pub(in crate::runtime) path_group_ordinal: usize,
     pub(in crate::runtime) tcp_security: Arc<Vec<ClientSecurityConfig>>,
@@ -186,7 +197,7 @@ impl ClientPathContext {
         if paths.len() > u16::MAX as usize {
             return Err(RuntimeError::PathIdOverflow);
         }
-        let mut tcp_paths = Vec::new();
+        let mut tcp_config_paths = Vec::new();
         let mut tcp_path_names = Vec::new();
         let mut tcp_path_ordinals = Vec::new();
         let mut tcp_security = Vec::new();
@@ -207,7 +218,7 @@ impl ClientPathContext {
                 UnderlayProtocol::Tcp => {
                     tcp_path_names.push(name);
                     tcp_path_ordinals.push(ordinal);
-                    tcp_paths.push(spec);
+                    tcp_config_paths.push(spec);
                     tcp_security.push(security);
                     tcp_tls.push(tls);
                 }
@@ -220,11 +231,61 @@ impl ClientPathContext {
                 }
             }
         }
+
+        let carrier_slots = tcp_config_paths
+            .iter()
+            .try_fold(udp_paths.len(), |total, path| {
+                total.checked_add(usize::from(
+                    path.tcp_carrier_range()
+                        .expect("TCP configuration has TCP carrier bounds")
+                        .max(),
+                ))
+            })
+            .ok_or(RuntimeError::PathIdOverflow)?;
+        if carrier_slots > resources.max_paths || carrier_slots > u16::MAX as usize {
+            return Err(RuntimeError::PathIdOverflow);
+        }
+
+        // Preserve every configured endpoint's historical primary index, then
+        // append its sibling slots. A second configured endpoint must never be
+        // reinterpreted as the first endpoint's second carrier.
+        let configured_tcp_path_names = tcp_path_names.clone();
+        let configured_tcp_path_ordinals = tcp_path_ordinals.clone();
+        let mut tcp_paths = tcp_config_paths.clone();
+        let mut tcp_config_indices = (0..tcp_config_paths.len()).collect::<Vec<_>>();
+        let mut tcp_member_ordinals = vec![0_u16; tcp_config_paths.len()];
+        let mut tcp_endpoint_topology = tcp_config_paths
+            .iter()
+            .enumerate()
+            .map(|(config_index, path)| ClientTcpEndpointTopology {
+                config_index,
+                range: path
+                    .tcp_carrier_range()
+                    .expect("TCP configuration has TCP carrier bounds"),
+                members: vec![config_index],
+            })
+            .collect::<Vec<_>>();
+        for endpoint in &mut tcp_endpoint_topology {
+            for member_ordinal in 1..endpoint.range.max() {
+                let path_index = tcp_paths.len();
+                tcp_paths.push(tcp_config_paths[endpoint.config_index].clone());
+                tcp_path_names.push(configured_tcp_path_names[endpoint.config_index].clone());
+                tcp_path_ordinals.push(configured_tcp_path_ordinals[endpoint.config_index]);
+                tcp_config_indices.push(endpoint.config_index);
+                tcp_member_ordinals.push(member_ordinal);
+                endpoint.members.push(path_index);
+            }
+        }
+
         // Context and carrier actors share one immutable configuration backing;
         // reconnecting a session must not deep-copy endpoint or secret material.
+        let tcp_config_paths = Arc::new(tcp_config_paths);
         let tcp_paths = Arc::new(tcp_paths);
         let tcp_path_names = Arc::new(tcp_path_names);
         let tcp_path_ordinals = Arc::new(tcp_path_ordinals);
+        let tcp_config_indices = Arc::new(tcp_config_indices);
+        let tcp_member_ordinals = Arc::new(tcp_member_ordinals);
+        let tcp_endpoint_topology = Arc::new(tcp_endpoint_topology);
         let tcp_security = Arc::new(tcp_security);
         let tcp_tls = Arc::new(tcp_tls);
         let udp_paths = Arc::new(udp_paths);
@@ -233,11 +294,25 @@ impl ClientPathContext {
         let udp_security = Arc::new(udp_security);
         let udp_tls = Arc::new(udp_tls);
         let path_proof_limit = resources.max_streams.saturating_mul(2).max(1);
+        let mut tcp_health = vec![
+            ClientPathHealthRecord::with_path_proof_limit_and_eligibility(
+                path_proof_limit,
+                false,
+            );
+            tcp_paths.len()
+        ];
+        for endpoint in tcp_endpoint_topology.iter() {
+            for path_index in endpoint
+                .members
+                .iter()
+                .take(usize::from(endpoint.range.min()))
+            {
+                tcp_health[*path_index] =
+                    ClientPathHealthRecord::with_path_proof_limit(path_proof_limit);
+            }
+        }
         let state = ClientPathState::new(ClientPathHealth {
-            tcp: vec![
-                ClientPathHealthRecord::with_path_proof_limit(path_proof_limit);
-                tcp_paths.len()
-            ],
+            tcp: tcp_health,
             udp: vec![
                 ClientPathHealthRecord::with_path_proof_limit(path_proof_limit);
                 udp_paths.len()
@@ -256,9 +331,10 @@ impl ClientPathContext {
         });
         let tcp_sessions = (0..tcp_paths.len())
             .map(|path_index| {
+                let config_index = tcp_config_indices[path_index];
                 ClientTcpPathSessionHandle::new(ClientTcpPathSessionRuntime {
-                    paths: tcp_paths.clone(),
-                    config_index: path_index,
+                    paths: tcp_config_paths.clone(),
+                    config_index,
                     path_index,
                     carrier_identity: CarrierPathIdentity {
                         group_ordinal: path_group_ordinal,
@@ -315,6 +391,9 @@ impl ClientPathContext {
             tcp_path_names,
             udp_path_names,
             tcp_path_ordinals,
+            tcp_config_indices,
+            tcp_member_ordinals,
+            tcp_endpoint_topology,
             udp_path_ordinals,
             path_group_ordinal,
             tcp_security,
@@ -339,8 +418,13 @@ impl ClientPathContext {
         &self,
         path_index: usize,
     ) -> Result<&ClientSecurityConfig, RuntimeError> {
-        self.tcp_security
+        let config_index = self
+            .tcp_config_indices
             .get(path_index)
+            .copied()
+            .ok_or(RuntimeError::NoSchedulableTcpPath)?;
+        self.tcp_security
+            .get(config_index)
             .ok_or(RuntimeError::NoSchedulableTcpPath)
     }
 
@@ -348,9 +432,41 @@ impl ClientPathContext {
         &self,
         path_index: usize,
     ) -> Result<&TcpClientTlsConfig, RuntimeError> {
-        self.tcp_tls
+        let config_index = self
+            .tcp_config_indices
             .get(path_index)
+            .copied()
+            .ok_or(RuntimeError::NoSchedulableTcpPath)?;
+        self.tcp_tls
+            .get(config_index)
             .ok_or(RuntimeError::NoSchedulableTcpPath)
+    }
+
+    pub(in crate::runtime) fn tcp_config_index(&self, path_index: usize) -> Option<usize> {
+        self.tcp_config_indices.get(path_index).copied()
+    }
+
+    pub(in crate::runtime) fn tcp_member_ordinal(&self, path_index: usize) -> Option<u16> {
+        self.tcp_member_ordinals.get(path_index).copied()
+    }
+
+    pub(in crate::runtime) fn tcp_endpoint(
+        &self,
+        config_index: usize,
+    ) -> Option<&ClientTcpEndpointTopology> {
+        self.tcp_endpoint_topology.get(config_index)
+    }
+
+    pub(in crate::runtime) fn configured_tcp_endpoint_count(&self) -> usize {
+        self.tcp_endpoint_topology.len()
+    }
+
+    pub(in crate::runtime) fn tcp_endpoint_for_path(
+        &self,
+        path_index: usize,
+    ) -> Option<&ClientTcpEndpointTopology> {
+        self.tcp_config_index(path_index)
+            .and_then(|config_index| self.tcp_endpoint(config_index))
     }
 
     #[cfg(test)]
@@ -411,6 +527,7 @@ fn client_peer_status_snapshot(
             .iter()
             .zip(&health.tcp)
             .enumerate()
+            .filter(|(_, (_, record))| record.is_locally_eligible())
             .map(|(index, (path, record))| {
                 peer_path_status(path, index, record.observation_at(now))
             }),

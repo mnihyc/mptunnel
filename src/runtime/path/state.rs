@@ -460,12 +460,15 @@ impl ClientPathContext {
         key: RelayPathKey,
         lane: TrafficClass,
     ) -> Option<RelayPathLoadLease> {
+        let now = Instant::now();
         let mut health = self.state.health.lock().expect("client path health lock");
         let records = match key.underlay {
             UnderlayProtocol::Tcp => &mut health.tcp,
             UnderlayProtocol::Udp => &mut health.udp,
         };
-        records.get_mut(key.index)?.reserve_load(lane);
+        if !records.get_mut(key.index)?.reserve_load(lane, now) {
+            return None;
+        }
         drop(health);
         Some(RelayPathLoadLease::new(self.state.clone(), key, lane))
     }
@@ -528,7 +531,8 @@ impl ClientPathContext {
             .get_mut(index)
             .is_some_and(|record| {
                 record.maintain(now);
-                path_observation_is_idle_for_probe(record.observation_at(now))
+                record.is_locally_eligible()
+                    && path_observation_is_idle_for_probe(record.observation_at(now))
             })
     }
 

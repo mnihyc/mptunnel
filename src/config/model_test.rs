@@ -197,8 +197,10 @@ fn udp_path_configuration_is_strict_and_requires_sni_identity() {
     outbound.paths[0].spec = "tcp://127.0.0.1:443"
         .parse()
         .expect("default TCP carrier range");
-    let mut resources = ResourceLimits::default();
-    resources.max_paths = 2;
+    let resources = ResourceLimits {
+        max_paths: 2,
+        ..ResourceLimits::default()
+    };
     assert_eq!(
         validate_mpp_outbound(&outbound, resources),
         Err(ConfigError::TooManyPaths {

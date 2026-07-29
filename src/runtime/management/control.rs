@@ -21,9 +21,9 @@ impl ManagementTarget {
             ManagementHttpError::new(400, "Bad Request", "invalid path control JSON body")
         })?;
         let context = select_control_client_context(&self.clients, &request)?;
-        let (underlay, index) = select_client_path(context, &request.path)?;
+        let selection = select_client_path(context, &request.path)?;
         let state = parse_control_state(&request.state)?;
-        set_client_path_state(context, underlay, index, state)?;
+        set_client_path_state(context, &selection, state)?;
         self.refresh_current_snapshot();
         Ok(json!({
             "applied": true,
@@ -95,7 +95,7 @@ fn select_control_client_context<'a>(
     Ok(selected)
 }
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum PathControlState {
     Enabled,
     Suspect,
@@ -103,16 +103,23 @@ enum PathControlState {
     Disabled,
 }
 
+#[derive(Debug)]
+struct ClientPathSelection {
+    underlay: UnderlayProtocol,
+    indices: Vec<usize>,
+}
+
 fn select_client_path(
     context: &ClientPathContext,
     path: &str,
-) -> Result<(UnderlayProtocol, usize), ManagementHttpError> {
+) -> Result<ClientPathSelection, ManagementHttpError> {
     let mut selected = None;
-    for (underlay, names) in [
-        (UnderlayProtocol::Tcp, context.tcp_path_names.as_slice()),
-        (UnderlayProtocol::Udp, context.udp_path_names.as_slice()),
-    ] {
-        if let Some(index) = names.iter().position(|name| name == path) {
+    for endpoint in context.tcp_endpoint_topology.iter() {
+        if context
+            .tcp_path_names
+            .get(endpoint.config_index)
+            .is_some_and(|name| name == path)
+        {
             if selected.is_some() {
                 return Err(ManagementHttpError::new(
                     409,
@@ -120,7 +127,25 @@ fn select_client_path(
                     "path name is ambiguous within the outbound",
                 ));
             }
-            selected = Some((underlay, index));
+            selected = Some(ClientPathSelection {
+                underlay: UnderlayProtocol::Tcp,
+                indices: endpoint.members.clone(),
+            });
+        }
+    }
+    for (index, name) in context.udp_path_names.iter().enumerate() {
+        if name == path {
+            if selected.is_some() {
+                return Err(ManagementHttpError::new(
+                    409,
+                    "Conflict",
+                    "path name is ambiguous within the outbound",
+                ));
+            }
+            selected = Some(ClientPathSelection {
+                underlay: UnderlayProtocol::Udp,
+                indices: vec![index],
+            });
         }
     }
     selected.ok_or_else(|| {
@@ -148,51 +173,62 @@ fn parse_control_state(value: &str) -> Result<PathControlState, ManagementHttpEr
 
 fn set_client_path_state(
     context: &ClientPathContext,
-    underlay: UnderlayProtocol,
-    index: usize,
+    selection: &ClientPathSelection,
     state: PathControlState,
 ) -> Result<(), ManagementHttpError> {
     let mut health = context
         .health()
         .lock()
         .expect("client path health management lock");
-    let records = match underlay {
+    let records = match selection.underlay {
         UnderlayProtocol::Tcp => &mut health.tcp,
         UnderlayProtocol::Udp => &mut health.udp,
     };
-    let Some(record) = records.get_mut(index) else {
+    if selection
+        .indices
+        .iter()
+        .any(|index| records.get(*index).is_none())
+    {
         return Err(ManagementHttpError::new(
             404,
             "Not Found",
             "path runtime state is unavailable",
         ));
-    };
-    match state {
-        PathControlState::Enabled => {
-            record.manual_disabled = false;
-            record.invalidate_path_proofs();
-            record.state = SchedulerPathState::Suspect;
+    }
+    let now = Instant::now();
+    for index in &selection.indices {
+        let record = records
+            .get_mut(*index)
+            .expect("validated path runtime state");
+        record.invalidate_path_proofs();
+        if !record.is_locally_eligible() {
+            record.manual_disabled = state == PathControlState::Disabled;
+            record.state = SchedulerPathState::Draining;
             record.failed_until = None;
+            if state == PathControlState::Disabled {
+                record.relay_bytes_in_flight = 0;
+                record.relay_queue_bytes = 0;
+            }
+            continue;
         }
-        PathControlState::Suspect => {
-            record.manual_disabled = false;
-            record.invalidate_path_proofs();
-            record.state = SchedulerPathState::Suspect;
-            record.failed_until = None;
-        }
-        PathControlState::Failed => {
-            record.manual_disabled = false;
-            record.invalidate_path_proofs();
-            record.state = SchedulerPathState::Failed;
-            record.failed_until = Some(Instant::now() + path_record_failure_cooldown(record));
-        }
-        PathControlState::Disabled => {
-            record.manual_disabled = true;
-            record.invalidate_path_proofs();
-            record.state = SchedulerPathState::Failed;
-            record.failed_until = None;
-            record.relay_bytes_in_flight = 0;
-            record.relay_queue_bytes = 0;
+        match state {
+            PathControlState::Enabled | PathControlState::Suspect => {
+                record.manual_disabled = false;
+                record.state = SchedulerPathState::Suspect;
+                record.failed_until = None;
+            }
+            PathControlState::Failed => {
+                record.manual_disabled = false;
+                record.state = SchedulerPathState::Failed;
+                record.failed_until = Some(now + path_record_failure_cooldown(record));
+            }
+            PathControlState::Disabled => {
+                record.manual_disabled = true;
+                record.state = SchedulerPathState::Failed;
+                record.failed_until = None;
+                record.relay_bytes_in_flight = 0;
+                record.relay_queue_bytes = 0;
+            }
         }
     }
     Ok(())

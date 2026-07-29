@@ -75,15 +75,23 @@ impl ClientPathContext {
         underlay: UnderlayProtocol,
         service_index: Option<usize>,
     ) -> usize {
+        let health = self.state.health().lock().expect("client path health lock");
         let paths = match underlay {
             UnderlayProtocol::Tcp => &self.tcp_paths,
             UnderlayProtocol::Udp => &self.udp_paths,
         };
+        let records = match underlay {
+            UnderlayProtocol::Tcp => &health.tcp,
+            UnderlayProtocol::Udp => &health.udp,
+        };
         paths
             .iter()
+            .zip(records)
             .enumerate()
-            .filter(|(index, path)| {
-                Some(*index) != service_index && path_allows_automatic_bulk_use(path)
+            .filter(|(index, (path, record))| {
+                Some(*index) != service_index
+                    && record.is_locally_eligible()
+                    && path_allows_automatic_bulk_use(path)
             })
             .count()
     }
@@ -116,6 +124,7 @@ impl ClientPathContext {
         expected_active_flows: u32,
         expected_active_latency_sensitive_flows: u32,
     ) -> Option<RelayPathLoadLease> {
+        let now = Instant::now();
         let mut health = self.state.health().lock().expect("client path health lock");
         let records = match key.underlay {
             UnderlayProtocol::Tcp => &mut health.tcp,
@@ -130,7 +139,9 @@ impl ClientPathContext {
         {
             return None;
         }
-        current.reserve_load(lane);
+        if !current.reserve_load(lane, now) {
+            return None;
+        }
         drop(health);
         Some(RelayPathLoadLease::new(self.state.clone(), key, lane))
     }
@@ -215,9 +226,12 @@ impl ClientPathContext {
             );
         }
         let selected = candidates.first()?.key;
-        match selected.underlay {
-            UnderlayProtocol::Tcp => health.tcp.get_mut(selected.index)?.reserve_load(lane),
-            UnderlayProtocol::Udp => health.udp.get_mut(selected.index)?.reserve_load(lane),
+        let reserved = match selected.underlay {
+            UnderlayProtocol::Tcp => health.tcp.get_mut(selected.index)?.reserve_load(lane, now),
+            UnderlayProtocol::Udp => health.udp.get_mut(selected.index)?.reserve_load(lane, now),
+        };
+        if !reserved {
+            return None;
         }
         #[cfg(feature = "lab-diagnostics")]
         lab_diagnostic(

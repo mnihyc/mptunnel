@@ -227,7 +227,9 @@ fn enabling_a_path_requires_fresh_liveness_evidence() {
         vec![ClientPathConfig {
             name: "primary".to_string(),
             tls: crate::transport::encrypted::test_client_tls_config(),
-            spec: "tcp://127.0.0.1:443".parse().expect("path"),
+            spec: "tcp://127.0.0.1:443?tcp-carriers=2-3"
+                .parse()
+                .expect("path"),
             security,
         }],
         ResourceLimits::default(),
@@ -253,13 +255,23 @@ fn enabling_a_path_requires_fresh_liveness_evidence() {
         .expect("disable path");
     assert_eq!(disabled["outbound"], "edge-mpp");
     assert_eq!(disabled["path"], "primary");
+    {
+        let health = context.health().lock().expect("disabled health");
+        assert_eq!(health.tcp.len(), 3);
+        assert!(health.tcp.iter().all(|record| record.manual_disabled));
+        assert_eq!(health.tcp[0].state, SchedulerPathState::Failed);
+        assert_eq!(health.tcp[1].state, SchedulerPathState::Failed);
+        assert_eq!(health.tcp[2].state, SchedulerPathState::Draining);
+    }
     target
         .control_path_json(br#"{"outbound":"edge-mpp","path":"primary","state":"enabled"}"#)
         .expect("enable path");
 
     let health = context.health().lock().expect("health");
-    assert!(!health.tcp[0].manual_disabled);
+    assert!(health.tcp.iter().all(|record| !record.manual_disabled));
     assert_eq!(health.tcp[0].state, SchedulerPathState::Suspect);
+    assert_eq!(health.tcp[1].state, SchedulerPathState::Suspect);
+    assert_eq!(health.tcp[2].state, SchedulerPathState::Draining);
 }
 
 #[test]
@@ -381,6 +393,13 @@ fn client_status_exposes_named_inventory_without_credentials() {
     assert!(!status.local_inbounds[1].auth_required);
     assert_eq!(status.services.outbounds, 1);
     assert_eq!(status.services.local_outbounds, 1);
+    assert_eq!(status.summary.configured_path_count, 1);
+    assert_eq!(status.summary.path_count, 1);
+    assert_eq!(status.paths.len(), 1);
+    assert_eq!(status.paths[0].path, "path-1");
+    assert_eq!(status.paths[0].tcp_carrier_ordinal, Some(1));
+    assert_eq!(status.paths[0].tcp_carriers_min, Some(1));
+    assert_eq!(status.paths[0].tcp_carriers_max, Some(3));
     assert_eq!(status.outbounds[0].name, "daily-direct");
     assert_eq!(status.outbounds[0].protocol, "direct");
     assert_eq!(status.outbounds[0].networks, ["tcp", "udp"]);
@@ -448,6 +467,7 @@ fn status_separates_sessions_flows_and_exclusive_path_states() {
     target.refresh_sample_snapshot();
     let status = target.snapshot();
     assert_eq!(status.summary.configured_path_count, 1);
+    assert_eq!(status.summary.path_count, 1);
     assert_eq!(status.summary.disabled_paths, 1);
     assert_eq!(status.summary.failed_paths, 0);
     assert_eq!(status.paths[0].state, "disabled");

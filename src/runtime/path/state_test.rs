@@ -1,5 +1,6 @@
 use super::*;
-use crate::config::{ResourceLimits, SharedSecret};
+use crate::config::{ClientPathConfig, ResourceLimits, SharedSecret};
+use crate::ingress::ProxyAuthConfig;
 use crate::model::path::next_carrier_path_instance_id;
 
 fn tcp_path_instance(index: usize, id: u64) -> RelayPathInstance {
@@ -27,6 +28,125 @@ fn tcp_path_test_context(path_count: usize) -> ClientPathContext {
     );
     ClientPathContext::new(paths, security, ResourceLimits::default())
         .expect("request TCP capacity test context")
+}
+
+#[test]
+fn tcp_endpoint_topology_preserves_configured_primaries_and_dormant_capacity() {
+    let primary_security = ClientSecurityConfig::for_test(
+        SharedSecret::new(b"0123456789abcdef0123456789abcdef".to_vec()).expect("primary security"),
+    );
+    let secondary_security = ClientSecurityConfig::for_test(
+        SharedSecret::new(b"abcdef0123456789abcdef0123456789".to_vec())
+            .expect("secondary security"),
+    )
+    .with_auth_freshness_window(Duration::from_secs(42));
+    let context = ClientPathContext::new_with_path_configs_and_outbound(
+        vec![
+            ClientPathConfig {
+                name: "primary".to_string(),
+                spec: "tcp://127.0.0.1:12700?tcp-carriers=1-3"
+                    .parse()
+                    .expect("primary path"),
+                security: primary_security.clone(),
+                tls: crate::transport::encrypted::test_client_tls_config(),
+            },
+            ClientPathConfig {
+                name: "secondary".to_string(),
+                spec: "tcp://127.0.0.1:12701?tcp-carriers=2-2"
+                    .parse()
+                    .expect("secondary path"),
+                security: secondary_security.clone(),
+                tls: crate::transport::encrypted::test_client_tls_config(),
+            },
+        ],
+        ResourceLimits::default(),
+        ProxyAuthConfig::disabled(),
+        None,
+    )
+    .expect("TCP endpoint topology");
+
+    assert_eq!(context.tcp_config_indices.as_slice(), [0, 1, 0, 0, 1]);
+    assert_eq!(context.tcp_member_ordinals.as_slice(), [0, 0, 1, 2, 1]);
+    assert_eq!(context.tcp_endpoint(0).expect("primary").members, [0, 2, 3]);
+    assert_eq!(context.tcp_endpoint(1).expect("secondary").members, [1, 4]);
+    assert_eq!(
+        context.tcp_path_names.as_slice(),
+        ["primary", "secondary", "primary", "primary", "secondary"]
+    );
+    assert_eq!(
+        context.tcp_path_security(0).expect("primary security"),
+        &primary_security
+    );
+    assert_eq!(
+        context
+            .tcp_path_security(3)
+            .expect("primary sibling security"),
+        &primary_security
+    );
+    assert_eq!(
+        context
+            .tcp_path_security(4)
+            .expect("secondary sibling security"),
+        &secondary_security
+    );
+    assert!(std::ptr::eq(
+        context.tcp_path_security(0).expect("primary security"),
+        context
+            .tcp_path_security(3)
+            .expect("primary sibling security"),
+    ));
+    assert!(std::ptr::eq(
+        context.tcp_path_tls(0).expect("primary TLS"),
+        context.tcp_path_tls(3).expect("primary sibling TLS"),
+    ));
+
+    let health = context.health().lock().expect("path health");
+    let locally_eligible = health
+        .tcp
+        .iter()
+        .map(ClientPathHealthRecord::is_locally_eligible)
+        .collect::<Vec<_>>();
+    assert_eq!(locally_eligible, [true, true, false, false, true]);
+    drop(health);
+
+    assert_eq!(
+        context.automatic_bulk_path_count(UnderlayProtocol::Tcp, None),
+        3
+    );
+    assert!(!context.should_probe_tcp_path(2));
+    assert!(!context.should_probe_tcp_path(3));
+    assert!(
+        context
+            .reserve_relay_path_load(
+                RelayPathKey {
+                    underlay: UnderlayProtocol::Tcp,
+                    index: 2,
+                },
+                TrafficClass::Throughput,
+            )
+            .is_none()
+    );
+    assert_eq!(
+        context.ordered_tcp_path_indices(TrafficClass::Throughput, 64 * 1024),
+        [0, 1, 4]
+    );
+
+    let bounded_resources = ResourceLimits {
+        max_paths: 2,
+        ..ResourceLimits::default()
+    };
+    assert!(matches!(
+        ClientPathContext::new(
+            vec![
+                "tcp://127.0.0.1:12702?tcp-carriers=1-3"
+                    .parse()
+                    .expect("bounded path")
+            ],
+            primary_security,
+            bounded_resources,
+        ),
+        Err(RuntimeError::PathIdOverflow)
+    ));
 }
 
 #[test]

@@ -11,6 +11,82 @@ Historical entries below are retained as evidence of the decisions made at
 their recorded time. When a later entry changes an earlier decision, the later
 entry is authoritative.
 
+## 2026-07-30T06:28:03+08:00: ranged QUIC carrier port migration
+
+- Name: migrate one authenticated QUIC carrier across its configured
+  destination-port set
+- Category: Product carrier lifecycle, RFC-defined QUIC migration, neutral
+  transport boundary, and unchanged-Core performance
+- State: committed and independently approved; focused correctness,
+  cross-target, and two-cohort performance evidence passed; bounded adaptive
+  TCP carriers and the broader Product map remain open
+- Source: clean commit `e456b32ef9cdbd6f7168239c2dbe76f4d5683fc2`
+- Content:
+  - added `port-hop-interval-ms` only for ranged UDP carrier endpoints, with
+    the requested five-minute default and a five-second configuration floor;
+  - retained the same Quinn connection, authenticated carrier instance,
+    streams, path identity, and MPP state while selecting another configured
+    destination port;
+  - created each candidate through the normal protected neutral socket
+    provider, pinned the established server IP, and kept the previous receive
+    socket until authenticated return traffic arrived on the selected port;
+  - serialized migration so another interval cannot start while the current
+    locator remains unconfirmed, while Quinn continues to own validation,
+    recovery, congestion state, and socket release;
+  - implemented a mapping-only UDP adapter: it translates exactly the
+    configured canonical/selected locator pair and leaves ECN, GSO/GRO,
+    source/destination IP metadata, payloads, fragmentation, and every other
+    locator decision unchanged;
+  - bounded runtime ownership to one abort-on-drop task and Quinn's
+    current/previous socket lifecycle; and
+  - kept TCP periodic replacement out of this slice because a TCP port change
+    requires a new authenticated connection and therefore belongs to the
+    bounded multi-carrier pool.
+- Correctness and platform evidence:
+  - durable parsing tests cover defaults, explicit intervals, fixed/ranged
+    rejection, and the minimum;
+  - the existing socket contract verifies exact bidirectional mapping and
+    pass-through behavior;
+  - one transport integration carries request/response traffic before and
+    after two forwarded-port migrations on the same accepted Quinn connection;
+  - focused tests, shell syntax, formatting, and all-target/all-feature checks
+    passed;
+  - independent Windows GNU and musl all-target/all-feature builds passed;
+    macOS and Android use the same neutral adapter and remain assigned to their
+    native GitHub CI jobs; and
+  - an independent lifecycle/RFC review found no remaining correctness,
+    resource, Core-boundary, or platform blocker.
+- Performance evidence:
+  - both accepted cohorts used the exact clean source commit, identical
+    client/server binary, a valid settled host, isolated 20-second cases,
+    diagnostics disabled, one flow, and five confirmed migrations per
+    hopping transfer;
+  - cohort one measured fixed/hopping download at
+    `2805.435`/`2835.804` Mbps and fixed/hopping upload at
+    `2790.870`/`2756.474` Mbps;
+  - the independent repeat measured fixed/hopping download at
+    `2865.815`/`2950.826` Mbps and fixed/hopping upload at
+    `2811.900`/`2778.640` Mbps;
+  - every transfer was exact or complete with zero recovery gap; hopping
+    download maximum read gaps were `0.018` and `0.019445` seconds, and hopping
+    upload retained one finalized target connection with no unexpected
+    connection; and
+  - hopping was positive in both download cohorts and `1.23%`/`1.18%` below
+    the adjacent upload control, which is ordinary run variance rather than a
+    reproducible downgrade. Raw evidence remains under ignored
+    `./.tmp/lab/results/product-quic-port-hop-20260730/` and
+    `./.tmp/lab/results/product-quic-port-hop-repeat-20260730/`.
+- Decision:
+  - approve periodic ranged QUIC destination-port migration without a new wire
+    field or Core timing/scheduling rule;
+  - retain Quinn and the neutral socket provider as the migration authorities;
+    and
+  - proceed to one RFC-defined bounded adaptive TCP carrier pool before
+    periodic TCP replacement.
+- Next: establish the TCP carrier identity and bounded `1..3` pool lifecycle,
+  using additional native TCP capacity only after measured demand and retiring
+  it when it is idle or no longer effective.
+
 ## 2026-07-30T05:51:07+08:00: carrier endpoint port-set bootstrap
 
 - Name: select one concrete locator for each new TCP or QUIC carrier

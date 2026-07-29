@@ -1,6 +1,7 @@
 use super::*;
 use crate::config::{DEFAULT_OUTBOUND_CONNECT_TIMEOUT, ResourceLimits, SharedSecret};
 use crate::outbound::OutboundConfig;
+use crate::protocol::PathUsage;
 use crate::protocol::frame::{reliable_path_frame_pacing_bytes, reliable_stream_frame_extent};
 use crate::runtime::node::server::{ServerIdentityRuntime, new_identity_runtime};
 use crate::runtime::path::commands::{
@@ -613,6 +614,115 @@ async fn spawn_udp_server_path(
         }
     });
     (path, server)
+}
+
+async fn quic_admission_with_existing_registration(
+    registered_underlay: UnderlayProtocol,
+    principal: crate::product::PrincipalPermit,
+) -> (Result<Option<Duration>, RuntimeError>, Option<PathUsage>) {
+    let path = reserve_udp_path().await;
+    let client = ClientPathContext::new(vec![path.clone()], security(), ResourceLimits::default())
+        .expect("client context");
+    let ServerIdentityRuntime {
+        paths,
+        reliable_relay: _,
+    } = server_runtime(OutboundConfig::Direct);
+    let existing = paths
+        .reliable_streams
+        .register_carrier_path(
+            client.session_id,
+            registered_underlay,
+            PathId(0),
+            ServerLocalPathProperties::default(),
+            principal,
+        )
+        .expect("pre-register carrier");
+    let server_context = paths.clone();
+    let endpoint = bind_server_udp_endpoint(&path, &paths)
+        .await
+        .expect("bind UDP endpoint");
+    let local_path = ServerLocalPath::new(0, path);
+    let server = tokio::spawn(run_server_udp_listener(endpoint, local_path, paths));
+
+    let result = client.udp_sessions[0]
+        .prepare_connection(tokio::time::Instant::now() + Duration::from_secs(2))
+        .await;
+    let peer_usage = client.peer_path_usage(UnderlayProtocol::Udp, 0);
+    let snapshot = server_context.reliable_streams.management_snapshot();
+    assert_eq!(snapshot.paths.len(), 1);
+    assert_eq!(snapshot.paths[0].session_id, client.session_id);
+    assert_eq!(snapshot.sessions.len(), 1);
+    assert_eq!(snapshot.sessions[0].reference_count, 1);
+
+    drop(client);
+    drop(existing);
+    server.abort();
+    let _ = server.await;
+    (result, peer_usage)
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn quic_duplicate_carrier_rejection_precedes_readiness() {
+    let (result, peer_usage) = quic_admission_with_existing_registration(
+        UnderlayProtocol::Udp,
+        crate::product::PrincipalPermit::for_test("test-peer"),
+    )
+    .await;
+    assert!(result.is_err(), "duplicate carrier received readiness");
+    assert_eq!(peer_usage, None);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn quic_session_principal_rejection_precedes_readiness() {
+    let (result, peer_usage) = quic_admission_with_existing_registration(
+        UnderlayProtocol::Tcp,
+        crate::product::PrincipalPermit::for_test("different-peer"),
+    )
+    .await;
+    assert!(
+        result.is_err(),
+        "different-principal carrier received readiness"
+    );
+    assert_eq!(peer_usage, None);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn quic_readiness_follows_committed_carrier_registration() {
+    let path = reserve_udp_path().await;
+    let client = ClientPathContext::new(vec![path.clone()], security(), ResourceLimits::default())
+        .expect("client context");
+    let ServerIdentityRuntime {
+        paths,
+        reliable_relay: _,
+    } = server_runtime(OutboundConfig::Direct);
+    let server_context = paths.clone();
+    let endpoint = bind_server_udp_endpoint(&path, &paths)
+        .await
+        .expect("bind UDP endpoint");
+    let local_path = ServerLocalPath::new(0, path);
+    let server = tokio::spawn(run_server_udp_listener(endpoint, local_path, paths));
+
+    assert!(
+        client.udp_sessions[0]
+            .prepare_connection(tokio::time::Instant::now() + Duration::from_secs(2))
+            .await
+            .expect("prepare accepted carrier")
+            .is_some()
+    );
+    let snapshot = server_context.reliable_streams.management_snapshot();
+    assert_eq!(snapshot.paths.len(), 1);
+    assert_eq!(snapshot.paths[0].session_id, client.session_id);
+    assert_eq!(snapshot.sessions.len(), 1);
+    assert_eq!(snapshot.sessions[0].session_id, client.session_id);
+    assert_eq!(snapshot.sessions[0].reference_count, 1);
+    assert_eq!(
+        client.peer_path_usage(UnderlayProtocol::Udp, 0),
+        Some(PathUsage::Available)
+    );
+
+    drop(client);
+    server.abort();
+    let _ = server.await;
 }
 
 #[tokio::test(flavor = "multi_thread")]

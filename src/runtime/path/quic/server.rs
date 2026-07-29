@@ -11,8 +11,7 @@ use super::io::{
 };
 use super::metrics::run_server_quic_path_metrics;
 use super::server_stream::{ServerUdpReliableStreamContext, handle_server_udp_reliable_stream};
-use crate::product::PrincipalPermit;
-use crate::protocol::{Frame, PathId, PathUsage, SessionId, UnderlayProtocol};
+use crate::protocol::{Frame, PathId, SessionId, UnderlayProtocol};
 use crate::runtime::error::RuntimeError;
 use crate::runtime::path::authentication::ServerPathAuthentication;
 use crate::runtime::path::server_context::{ServerLocalPath, ServerPathContext};
@@ -105,27 +104,11 @@ async fn handle_server_udp_connection(
     context: ServerPathContext,
     authentication_slot: OwnedSemaphorePermit,
 ) -> Result<(), RuntimeError> {
-    let (session_id, path_id, peer_usage, principal_permit, control_send, control_recv) =
+    let (path_registration, control_send, control_recv) =
         accept_server_udp_path_handshake(&connection, &local_path, &context).await?;
     drop(authentication_slot);
-    let local_metrics = local_path.startup_metrics(path_id);
-    let path_registration = context.reliable_streams.register_carrier_path(
-        session_id,
-        UnderlayProtocol::Udp,
-        path_id,
-        ServerLocalPathProperties {
-            config_ordinal: local_path.config_ordinal(),
-            policy: local_path.policy(),
-            initial_metrics: Some(local_metrics),
-        },
-        principal_permit,
-    )?;
-    context
-        .reliable_streams
-        .record_peer_path_usage(&path_registration, 0, peer_usage);
-    context
-        .reliable_streams
-        .record_local_path_metrics(&path_registration, local_metrics, false);
+    let session_id = path_registration.session_id();
+    let path_id = path_registration.path_id();
     let peer_status = context.peer_status.register(session_id);
     let control = run_server_udp_control_stream(
         control_send,
@@ -239,10 +222,7 @@ async fn accept_server_udp_path_handshake(
     context: &ServerPathContext,
 ) -> Result<
     (
-        SessionId,
-        PathId,
-        PathUsage,
-        PrincipalPermit,
+        ServerCarrierPathRegistration,
         UdpPathSendStream,
         UdpPathRecvStream,
     ),
@@ -254,8 +234,8 @@ async fn accept_server_udp_path_handshake(
         // chooses to open a matching request stream.
         let (mut send, mut recv) = connection.accept_bi().await?;
         send.set_traffic_class(TrafficClass::Control)?;
-        match authenticate_server_udp_path(&mut send, &mut recv, local_path, context).await {
-            Ok(admitted) => Ok((admitted, send, recv)),
+        match admit_server_udp_path(&mut send, &mut recv, local_path, context).await {
+            Ok(registration) => Ok((registration, send, recv)),
             Err(err) => {
                 let _ = udp_path_reject_stream(&mut send).await;
                 Err(err)
@@ -265,23 +245,15 @@ async fn accept_server_udp_path_handshake(
     .await
     .map_err(|_| RuntimeError::AuthenticationRejected("authentication timed out"))
     .and_then(|result| result);
-    let ((session_id, path_id, peer_usage, principal_permit), send, recv) = admitted?;
-    Ok((
-        session_id,
-        path_id,
-        peer_usage,
-        principal_permit,
-        send,
-        recv,
-    ))
+    admitted
 }
 
-async fn authenticate_server_udp_path(
+async fn admit_server_udp_path(
     send: &mut UdpPathSendStream,
     recv: &mut UdpPathRecvStream,
     local_path: &ServerLocalPath,
     context: &ServerPathContext,
-) -> Result<(SessionId, PathId, PathUsage, PrincipalPermit), RuntimeError> {
+) -> Result<ServerCarrierPathRegistration, RuntimeError> {
     let authentication = ServerPathAuthentication::from_session_hello(
         &context.security,
         context.credential_admission.clone(),
@@ -325,6 +297,24 @@ async fn authenticate_server_udp_path(
         }
     };
     let local_usage = local_path.advertised_usage();
+    let local_metrics = local_path.startup_metrics(path_id);
+    let path_registration = context.reliable_streams.register_carrier_path(
+        session_id,
+        UnderlayProtocol::Udp,
+        path_id,
+        ServerLocalPathProperties {
+            config_ordinal: local_path.config_ordinal(),
+            policy: local_path.policy(),
+            initial_metrics: Some(local_metrics),
+        },
+        path_join.principal_permit,
+    )?;
+    context
+        .reliable_streams
+        .record_peer_path_usage(&path_registration, 0, peer_usage);
+    context
+        .reliable_streams
+        .record_local_path_metrics(&path_registration, local_metrics, false);
     udp_path_write_frame(send, &Frame::SessionReady, context.codec_limits).await?;
     udp_path_write_frame(
         send,
@@ -336,7 +326,7 @@ async fn authenticate_server_udp_path(
         context.codec_limits,
     )
     .await?;
-    Ok((session_id, path_id, peer_usage, path_join.principal_permit))
+    Ok(path_registration)
 }
 
 enum ServerUdpControlEvent {

@@ -451,6 +451,7 @@ fn encode_payload(
             paths,
         } => {
             let path_count = u16::try_from(paths.len()).map_err(|_| CodecError::LengthOverflow)?;
+            validate_peer_status_path_count(*code, usize::from(path_count))?;
             put_u64(out, *request_id);
             put_u8(out, peer_status_code_to_u8(*code));
             put_u16(out, path_count);
@@ -640,6 +641,7 @@ fn decode_payload(
             let request_id = reader.get_u64()?;
             let code = peer_status_code_from_u8(reader.get_u8()?)?;
             let path_count = reader.get_u16()? as usize;
+            validate_peer_status_path_count(code, path_count)?;
             let required_path_bytes = path_count
                 .checked_mul(PEER_PATH_STATUS_ENCODED_LEN)
                 .ok_or(CodecError::LengthOverflow)?;
@@ -1214,6 +1216,16 @@ fn peer_status_code_from_u8(value: u8) -> Result<PeerStatusCode, CodecError> {
     }
 }
 
+fn validate_peer_status_path_count(
+    code: PeerStatusCode,
+    path_count: usize,
+) -> Result<(), CodecError> {
+    if code != PeerStatusCode::Ok && path_count != 0 {
+        return Err(CodecError::InvalidPeerStatus);
+    }
+    Ok(())
+}
+
 fn peer_path_state_to_u8(value: PeerPathState) -> u8 {
     match value {
         PeerPathState::Active => 0,
@@ -1284,6 +1296,7 @@ pub enum CodecError {
     TooManyAckRanges { actual: usize, limit: usize },
     InvalidUtf8,
     InvalidCredentialId,
+    InvalidPeerStatus,
     InvalidEnum,
     InvalidRange,
     InvalidPort,
@@ -1312,6 +1325,7 @@ impl std::fmt::Display for CodecError {
             }
             Self::InvalidUtf8 => write!(f, "string field is not valid UTF-8"),
             Self::InvalidCredentialId => write!(f, "invalid credential ID"),
+            Self::InvalidPeerStatus => write!(f, "non-OK peer status contains path entries"),
             Self::InvalidEnum => write!(f, "invalid enum value"),
             Self::InvalidRange => write!(f, "invalid offset range"),
             Self::InvalidPort => write!(f, "port must be in 1..=65535"),

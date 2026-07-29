@@ -411,6 +411,51 @@ fn peer_status_frames_round_trip_with_bounded_fixed_entries() {
 }
 
 #[test]
+fn peer_status_encoder_rejects_paths_on_non_ok_response() {
+    for code in [PeerStatusCode::Disabled, PeerStatusCode::Unavailable] {
+        assert_eq!(
+            encode_frame(
+                &Frame::PeerStatusResponse {
+                    request_id: 42,
+                    code,
+                    paths: vec![peer_path_status(
+                        PeerPathState::Active,
+                        PathUsage::Available,
+                    )],
+                },
+                CodecLimits::default(),
+            ),
+            Err(CodecError::InvalidPeerStatus)
+        );
+    }
+}
+
+#[test]
+fn peer_status_decoder_rejects_paths_on_non_ok_response() {
+    let encoded = encode_frame(
+        &Frame::PeerStatusResponse {
+            request_id: 42,
+            code: PeerStatusCode::Ok,
+            paths: vec![peer_path_status(
+                PeerPathState::Active,
+                PathUsage::Available,
+            )],
+        },
+        CodecLimits::default(),
+    )
+    .expect("encode canonical peer status");
+
+    for non_ok_code in [1, 2] {
+        let mut malformed = encoded.clone();
+        malformed[FRAME_HEADER_LEN + 8] = non_ok_code;
+        assert_eq!(
+            decode_frame_bytes(Bytes::from(malformed), CodecLimits::default()),
+            Err(CodecError::InvalidPeerStatus)
+        );
+    }
+}
+
+#[test]
 fn peer_status_decoder_rejects_invalid_enums() {
     let response = Frame::PeerStatusResponse {
         request_id: 42,

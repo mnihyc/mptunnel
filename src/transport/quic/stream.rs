@@ -687,7 +687,10 @@ pub async fn read_frame(
     recv: &mut RecvStream,
     limits: CodecLimits,
 ) -> Result<Frame, QuicCarrierError> {
-    recv.stream.ensure_success_response().await?;
+    if let Err(error) = recv.stream.ensure_success_response().await {
+        recv.native.retire_route();
+        return Err(error);
+    }
     loop {
         if let Some(frame) = recv.pop_buffered_frame(limits)? {
             return Ok(frame);
@@ -715,12 +718,20 @@ pub async fn read_frame(
 
         tokio::select! {
             data = recv.stream.recv_data() => {
-                let Some(data) = data? else {
-                    return if recv.read_buffer.is_empty() {
-                        Err(QuicCarrierError::StreamFinished)
-                    } else {
-                        Err(QuicCarrierError::UnexpectedEnd)
-                    };
+                let data = match data {
+                    Ok(Some(data)) => data,
+                    Ok(None) => {
+                        recv.native.retire_route();
+                        return if recv.read_buffer.is_empty() {
+                            Err(QuicCarrierError::StreamFinished)
+                        } else {
+                            Err(QuicCarrierError::UnexpectedEnd)
+                        };
+                    }
+                    Err(error) => {
+                        recv.native.retire_route();
+                        return Err(error);
+                    }
                 };
                 if data.is_empty() {
                     continue;
@@ -732,7 +743,13 @@ pub async fn read_frame(
                 recv.pending_h3_data = data;
             }
             frame = recv.native.recv_frame(limits) => {
-                let frame = frame?;
+                let frame = match frame {
+                    Ok(frame) => frame,
+                    Err(error) => {
+                        recv.native.retire_route();
+                        return Err(error);
+                    }
+                };
                 match recv.native_flow_state(&frame) {
                     DatagramFlowState::Active => return Ok(frame),
                     DatagramFlowState::Closed => {

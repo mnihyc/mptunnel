@@ -30,6 +30,7 @@ struct Route {
 struct RoutingTable {
     active: HashMap<u64, Route>,
     pending: HashMap<u64, VecDeque<PendingPacket>>,
+    largest_registered_request_stream_id: Option<u64>,
 }
 
 #[derive(Debug)]
@@ -168,6 +169,11 @@ impl NativeDatagramHub {
             .routing
             .lock()
             .expect("native datagram route lock");
+        routing.largest_registered_request_stream_id = Some(
+            routing
+                .largest_registered_request_stream_id
+                .map_or(request_stream_id, |largest| largest.max(request_stream_id)),
+        );
         let replacing_active = routing.active.contains_key(&request_stream_id);
         let pending = routing.pending.remove(&request_stream_id);
         if !replacing_active && !make_room_for_active_route(&self.state, &mut routing) {
@@ -195,6 +201,20 @@ impl NativeDatagramHub {
             rx,
             reassemblies: HashMap::new(),
         })
+    }
+
+    #[cfg(test)]
+    pub(super) fn routing_counts(&self) -> (usize, usize, u64) {
+        let routing = self
+            .state
+            .routing
+            .lock()
+            .expect("native datagram route lock");
+        (
+            routing.active.len(),
+            routing.pending.len(),
+            self.state.dropped_packets.load(Ordering::Acquire),
+        )
     }
 }
 
@@ -309,6 +329,21 @@ impl NativeDatagramSender {
 }
 
 impl NativeDatagramReceiver {
+    pub(super) fn retire_route(&self) {
+        let mut routing = self
+            .state
+            .routing
+            .lock()
+            .expect("native datagram route lock");
+        if routing
+            .active
+            .get(&self.request_stream_id)
+            .is_some_and(|route| route.generation == self.generation)
+        {
+            routing.active.remove(&self.request_stream_id);
+        }
+    }
+
     pub(super) async fn recv_frame(
         &mut self,
         limits: CodecLimits,
@@ -441,18 +476,7 @@ impl NativeDatagramReceiver {
 
 impl Drop for NativeDatagramReceiver {
     fn drop(&mut self) {
-        let mut routing = self
-            .state
-            .routing
-            .lock()
-            .expect("native datagram route lock");
-        if routing
-            .active
-            .get(&self.request_stream_id)
-            .is_some_and(|route| route.generation == self.generation)
-        {
-            routing.active.remove(&self.request_stream_id);
-        }
+        self.retire_route();
     }
 }
 
@@ -508,6 +532,13 @@ fn route_datagram(
         if route.tx.try_send(budgeted).is_err() {
             state.dropped_packets.fetch_add(1, Ordering::Relaxed);
         }
+        return Ok(());
+    }
+    if routing
+        .largest_registered_request_stream_id
+        .is_some_and(|largest| request_stream_id <= largest)
+    {
+        state.dropped_packets.fetch_add(1, Ordering::Relaxed);
         return Ok(());
     }
 

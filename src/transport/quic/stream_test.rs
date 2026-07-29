@@ -432,6 +432,144 @@ async fn http_datagram_send_requires_an_open_request_send_side() {
 }
 
 #[tokio::test]
+async fn request_receive_fin_retires_native_datagram_route() {
+    let limits = CodecLimits::default();
+    let mux_limits = MuxLimits::default();
+    let server = Endpoint::bind_server(
+        "127.0.0.1:0".parse().expect("server addr"),
+        &crate::transport::encrypted::test_server_tls_config(),
+        super::super::test_candidate_verifier(),
+        mux_limits,
+    )
+    .await
+    .expect("server endpoint");
+    let server_addr = server.local_addr().expect("server local addr");
+    let server_task = tokio::spawn(async move {
+        let connection = server.accept().await.expect("accepted connection");
+        let (_send, mut recv) = connection.accept_bi().await.expect("accepted stream");
+        assert_eq!(
+            read_frame(&mut recv, limits).await.expect("read request"),
+            Frame::Ping { nonce: 1 }
+        );
+        assert!(matches!(
+            read_frame(&mut recv, limits).await,
+            Err(QuicCarrierError::StreamFinished)
+        ));
+        assert_eq!(
+            connection.native_datagram_routing_counts().0,
+            0,
+            "a closed H3 receive side must not retain its datagram route"
+        );
+    });
+
+    let client = Endpoint::bind_client(
+        "127.0.0.1:0".parse().expect("client addr"),
+        &crate::transport::encrypted::test_client_tls_config(),
+        super::super::test_candidate_selector(),
+        mux_limits,
+    )
+    .await
+    .expect("client endpoint");
+    let connection = client.connect(server_addr).await.expect("client connect");
+    let (mut send, _recv) = connection.open_bi().await.expect("client stream");
+    write_frame(&mut send, &Frame::Ping { nonce: 1 }, limits)
+        .await
+        .expect("write request");
+    finish_stream(&mut send).await.expect("finish request");
+
+    server_task.await.expect("server task");
+}
+
+#[tokio::test]
+async fn closed_request_datagrams_are_dropped_without_handoff_buffering() {
+    let limits = CodecLimits::default();
+    let mux_limits = MuxLimits::default();
+    let server = Endpoint::bind_server(
+        "127.0.0.1:0".parse().expect("server addr"),
+        &crate::transport::encrypted::test_server_tls_config(),
+        super::super::test_candidate_verifier(),
+        mux_limits,
+    )
+    .await
+    .expect("server endpoint");
+    let server_addr = server.local_addr().expect("server local addr");
+    let (route_closed_tx, route_closed_rx) = tokio::sync::oneshot::channel();
+    let (late_sent_tx, late_sent_rx) = tokio::sync::oneshot::channel();
+    let server_task = tokio::spawn(async move {
+        let connection = server.accept().await.expect("accepted connection");
+        let (_send, mut recv) = connection.accept_bi().await.expect("accepted stream");
+        assert!(matches!(
+            read_frame(&mut recv, limits)
+                .await
+                .expect("read datagram flow open"),
+            Frame::OpenDatagramFlow {
+                flow_id: DatagramFlowId(9),
+                ..
+            }
+        ));
+        drop(recv);
+        let before = connection.native_datagram_routing_counts();
+        assert_eq!(before.0, 0);
+        route_closed_tx.send(()).expect("publish closed route");
+        late_sent_rx.await.expect("late datagram sent");
+
+        let after = timeout(Duration::from_secs(1), async {
+            loop {
+                let after = connection.native_datagram_routing_counts();
+                if after.1 > before.1 || after.2 > before.2 {
+                    break after;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("late datagram routing outcome");
+        assert_eq!(
+            after.1, before.1,
+            "a closed request must not re-enter the pre-request handoff queue"
+        );
+        assert!(after.2 > before.2);
+    });
+
+    let client = Endpoint::bind_client(
+        "127.0.0.1:0".parse().expect("client addr"),
+        &crate::transport::encrypted::test_client_tls_config(),
+        super::super::test_candidate_selector(),
+        mux_limits,
+    )
+    .await
+    .expect("client endpoint");
+    let connection = client.connect(server_addr).await.expect("client connect");
+    let (mut send, _recv) = connection.open_bi().await.expect("client stream");
+    write_frame(
+        &mut send,
+        &Frame::OpenDatagramFlow {
+            flow_id: DatagramFlowId(9),
+            target: TargetAddr::Ip("127.0.0.1:53".parse().expect("target")),
+        },
+        limits,
+    )
+    .await
+    .expect("open native datagram flow");
+    route_closed_rx.await.expect("server closed route");
+    write_frame(
+        &mut send,
+        &Frame::DatagramData {
+            flow_id: DatagramFlowId(9),
+            datagram_id: DatagramId(1),
+            ttl_ms: 1_000,
+            payload: Bytes::from_static(b"late"),
+        },
+        limits,
+    )
+    .await
+    .expect("send late native datagram");
+    late_sent_tx.send(()).expect("publish late datagram");
+
+    server_task.await.expect("server task");
+}
+
+#[tokio::test]
 async fn stopped_quic_stream_write_keeps_the_shared_connection_available() {
     let limits = CodecLimits::default();
     let mux_limits = MuxLimits::default();

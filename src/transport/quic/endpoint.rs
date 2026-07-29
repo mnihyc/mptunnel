@@ -278,6 +278,11 @@ impl Connection {
         );
     }
 
+    #[cfg(test)]
+    pub(super) fn native_datagram_routing_counts(&self) -> (usize, usize, u64) {
+        self.native_datagrams.routing_counts()
+    }
+
     pub fn is_closed(&self) -> bool {
         self.connection.close_reason().is_some()
     }

@@ -323,6 +323,91 @@ async fn source_informed_quic_probe_receives_public_not_found_before_parser_admi
     let _ = driver_task.await;
 }
 
+async fn malformed_http_datagram_close(packet: bytes::Bytes) -> quinn::ConnectionError {
+    use h3::ConnectionState;
+    use std::future::poll_fn;
+
+    let mux_limits = MuxLimits::default();
+    let server = Endpoint::bind_server(
+        "127.0.0.1:0".parse().expect("server addr"),
+        &crate::transport::encrypted::test_server_tls_config(),
+        super::super::test_candidate_verifier(),
+        mux_limits,
+    )
+    .await
+    .expect("server endpoint");
+    let server_addr = server.local_addr().expect("server local addr");
+    let server_task =
+        tokio::spawn(async move { server.accept().await.expect("server connection") });
+
+    let client = Endpoint::bind_client(
+        "127.0.0.1:0".parse().expect("client addr"),
+        &crate::transport::encrypted::test_client_tls_config(),
+        super::super::test_candidate_selector(),
+        mux_limits,
+    )
+    .await
+    .expect("client endpoint");
+    let raw = client
+        .endpoint
+        .connect(server_addr, "mptunnel.test")
+        .expect("start QUIC connect")
+        .await
+        .expect("complete QUIC connect");
+    let (mut driver, requests): (
+        h3::client::Connection<h3_quinn::Connection, bytes::Bytes>,
+        h3::client::SendRequest<h3_quinn::OpenStreams, bytes::Bytes>,
+    ) = h3::client::builder()
+        .enable_datagram(true)
+        .build(h3_quinn::Connection::new(raw.clone()))
+        .await
+        .expect("build H3 client");
+    let driver_task = tokio::spawn(async move {
+        let _ = poll_fn(|cx| driver.poll_close(cx)).await;
+    });
+    let _server_connection = timeout(Duration::from_secs(5), server_task)
+        .await
+        .expect("server H3 setup timeout")
+        .expect("server H3 task");
+
+    for _ in 0..64 {
+        if requests.settings().enable_datagram() {
+            break;
+        }
+        tokio::task::yield_now().await;
+    }
+    assert!(
+        requests.settings().enable_datagram(),
+        "peer SETTINGS must negotiate H3 DATAGRAM before the malformed packet"
+    );
+    raw.send_datagram(packet)
+        .expect("send malformed HTTP Datagram");
+    let error = timeout(Duration::from_secs(1), raw.closed())
+        .await
+        .expect("malformed Quarter Stream ID must close the H3 connection");
+    driver_task.abort();
+    let _ = driver_task.await;
+    error
+}
+
+#[tokio::test]
+async fn malformed_quarter_stream_id_closes_h3_with_datagram_error() {
+    let oversized =
+        bytes::Bytes::copy_from_slice(&((0b11_u64 << 62) | (1_u64 << 60)).to_be_bytes());
+    for malformed in [bytes::Bytes::from_static(&[0x40]), oversized] {
+        match malformed_http_datagram_close(malformed).await {
+            quinn::ConnectionError::ApplicationClosed(close) => {
+                assert_eq!(
+                    close.error_code.into_inner(),
+                    h3::error::Code::H3_DATAGRAM_ERROR.value()
+                );
+                assert!(close.reason.is_empty());
+            }
+            error => panic!("unexpected malformed HTTP Datagram close: {error:?}"),
+        }
+    }
+}
+
 #[test]
 fn quic_stream_limit_is_independent_from_receive_window_ratio() {
     let mux_limits = MuxLimits {

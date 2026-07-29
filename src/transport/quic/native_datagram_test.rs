@@ -32,6 +32,26 @@ fn rfc9297_quarter_stream_id_round_trips_at_every_varint_width() {
 }
 
 #[test]
+fn rfc9297_quarter_stream_id_enforces_legal_range_and_complete_encoding() {
+    let mut maximum = Vec::new();
+    encode_varint(MAX_QUARTER_STREAM_ID, &mut maximum).expect("encode maximum legal QSID");
+    assert_eq!(
+        decode_quarter_stream_id(&Bytes::from(maximum)),
+        Ok((MAX_QUARTER_STREAM_ID << 2, 8))
+    );
+
+    assert_eq!(
+        decode_quarter_stream_id(&Bytes::from_static(&[0x40])),
+        Err(QuarterStreamIdError::Truncated)
+    );
+    let oversized = ((0b11_u64 << 62) | (1_u64 << 60)).to_be_bytes();
+    assert_eq!(
+        decode_quarter_stream_id(&Bytes::copy_from_slice(&oversized)),
+        Err(QuarterStreamIdError::OutOfRange)
+    );
+}
+
+#[test]
 fn native_fragment_contract_is_compact_and_rejects_unbounded_metadata() {
     assert_eq!(NATIVE_FRAGMENT_HEADER_BYTES, 29);
 

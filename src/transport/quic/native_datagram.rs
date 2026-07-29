@@ -18,6 +18,7 @@ use tokio::sync::mpsc;
 const NATIVE_DATAGRAM_VERSION: u8 = 1;
 const NATIVE_FRAGMENT_HEADER_BYTES: usize = 1 + 8 + 8 + 4 + 2 + 2 + 4;
 const MAX_NATIVE_FRAGMENTS: usize = 64;
+const MAX_QUARTER_STREAM_ID: u64 = (1_u64 << 60) - 1;
 
 #[derive(Debug)]
 struct Route {
@@ -472,22 +473,29 @@ async fn run_datagram_router(connection: Connection, state: Arc<HubState>) {
         let Ok(packet) = packet else {
             return;
         };
-        route_datagram(&connection, &state, packet);
+        if route_datagram(&connection, &state, packet).is_err() {
+            connection.close(
+                quinn::VarInt::from_u32(h3::error::Code::H3_DATAGRAM_ERROR.value() as u32),
+                b"",
+            );
+            return;
+        }
     }
 }
 
-fn route_datagram(connection: &Connection, state: &HubState, packet: Bytes) {
-    let (request_stream_id, header_len) = match decode_quarter_stream_id(&packet) {
-        Some(decoded) => decoded,
-        None => {
-            state.dropped_packets.fetch_add(1, Ordering::Relaxed);
-            return;
-        }
-    };
+fn route_datagram(
+    connection: &Connection,
+    state: &HubState,
+    packet: Bytes,
+) -> Result<(), QuarterStreamIdError> {
+    let (request_stream_id, header_len) = decode_quarter_stream_id(&packet).map_err(|error| {
+        state.dropped_packets.fetch_add(1, Ordering::Relaxed);
+        error
+    })?;
     let payload = packet.slice(header_len..);
     if !reserve_buffered_bytes(state, payload.len()) {
         state.dropped_packets.fetch_add(1, Ordering::Relaxed);
-        return;
+        return Ok(());
     }
     let now = Instant::now();
     let budgeted = BudgetedPacket {
@@ -500,7 +508,7 @@ fn route_datagram(connection: &Connection, state: &HubState, packet: Bytes) {
         if route.tx.try_send(budgeted).is_err() {
             state.dropped_packets.fetch_add(1, Ordering::Relaxed);
         }
-        return;
+        return Ok(());
     }
 
     // RFC 9297 permits a receiver to retain an HTTP Datagram for roughly one
@@ -512,12 +520,12 @@ fn route_datagram(connection: &Connection, state: &HubState, packet: Bytes) {
         && routing.active.len().saturating_add(routing.pending.len()) >= state.max_routes
     {
         state.dropped_packets.fetch_add(1, Ordering::Relaxed);
-        return;
+        return Ok(());
     }
     let queue = routing.pending.entry(request_stream_id).or_default();
     if queue.len() >= state.max_pending_packets_per_route {
         state.dropped_packets.fetch_add(1, Ordering::Relaxed);
-        return;
+        return Ok(());
     }
     let route_wait = pending_route_wait(connection);
     let deadline = pending_packet_deadline(&budgeted.bytes, now, route_wait);
@@ -525,6 +533,7 @@ fn route_datagram(connection: &Connection, state: &HubState, packet: Bytes) {
         deadline,
         packet: budgeted,
     });
+    Ok(())
 }
 
 fn pending_route_wait(connection: &Connection) -> Duration {
@@ -631,17 +640,26 @@ fn try_acquire_reassembly(state: Arc<HubState>) -> Option<ReassemblyPermit> {
     Some(ReassemblyPermit { state })
 }
 
-fn decode_quarter_stream_id(packet: &Bytes) -> Option<(u64, usize)> {
-    let first = *packet.first()?;
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum QuarterStreamIdError {
+    Truncated,
+    OutOfRange,
+}
+
+fn decode_quarter_stream_id(packet: &Bytes) -> Result<(u64, usize), QuarterStreamIdError> {
+    let first = *packet.first().ok_or(QuarterStreamIdError::Truncated)?;
     let len = 1usize << (first >> 6);
     if packet.len() < len {
-        return None;
+        return Err(QuarterStreamIdError::Truncated);
     }
     let mut value = u64::from(first & 0x3f);
     for byte in &packet[1..len] {
         value = (value << 8) | u64::from(*byte);
     }
-    value.checked_mul(4).map(|stream_id| (stream_id, len))
+    if value > MAX_QUARTER_STREAM_ID {
+        return Err(QuarterStreamIdError::OutOfRange);
+    }
+    Ok((value << 2, len))
 }
 
 fn encode_varint(value: u64, output: &mut Vec<u8>) -> Result<(), QuicCarrierError> {

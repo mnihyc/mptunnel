@@ -17,8 +17,9 @@ entry is authoritative.
   transport
 - Category: Product routing, destination authorization, DNS, outbound, and
   balancer semantics
-- State: implementation and complete Product gate passed; unchanged-Core
-  performance guard is the next bounded action
+- State: committed and approved; complete Product and affected performance
+  guards passed; the broader Product map remains open
+- Source: clean commit `b626dcc6181f554ed15944f4e96e7c49247b26d0`
 - Content:
   - retained one immutable canonical domain as the flow and routing identity;
   - made ordered routing and destination ACL classification request address
@@ -56,14 +57,32 @@ entry is authoritative.
     silent UDP denial across repeated datagrams; and
   - an independent final semantic review reported no remaining material
     correctness or performance blocker in this Product slice.
+- Performance boundary and evidence:
+  - no scheduler, congestion, pacing, recovery, carrier, wire protocol,
+    transport timing, or Core resource default changed;
+  - the clean native Linux release binary is SHA-256
+    `4d19573363dffa2fc6f9c99882316ff28418ee5d00d77ff8cc3410d5ea509916`;
+  - with a clean source, valid settled host, matching client/server binary,
+    diagnostics disabled, isolated cases, 20-second load, and two flows,
+    single/equal-fat QUIC download measured `245.735`/`758.115` Mbps and
+    upload measured `246.364`/`761.841` Mbps;
+  - every row is performance-comparable and remains on the accepted
+    historical plateau; the adjacent canonical-vocabulary guard measured
+    `252.939`/`733.331` Mbps download and `241.272`/`800.008` Mbps upload;
+  - both upload rows confirmed exactly the probe-visible payload at the target.
+    The single-upload row retained the known duration/drain `loss` label
+    because its streams did not emit terminal closure inside the unchanged
+    one-second drain, not because payload was lost; and
+  - the warm-build cohort was rejected by the runner because build load
+    exceeded the host-validity limit. No row from it was admitted. Valid raw
+    evidence remains under ignored
+    `./.tmp/lab/results/product-target-dns-20260730-valid/`.
 - Decision:
-  - accept the Product semantics and keep the restored Core unchanged;
-  - require a clean-source representative performance guard before advancing
-    to the next Product capability; and
+  - approve the Product semantics with no observed performance downgrade;
+  - keep the restored Core unchanged; and
   - retain `PROGRESS.md` as the sole execution ledger.
-- Next: commit this isolated Product milestone, run the standard four-case
-  unchanged-Core performance guard, record the comparable evidence, and then
-  continue the remaining global Product map.
+- Next: continue the remaining daily-use Product capabilities from the global
+  map while preserving the same Product/Core boundary.
 
 ## 2026-07-30T03:15:13+08:00: canonical Product configuration identities
 

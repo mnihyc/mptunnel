@@ -1,6 +1,7 @@
 use crate::cli::{Cli, CliConfigError, Command};
 use crate::config::{
     AppConfig, CanonicalConfigStore, ConfigFileError, ConfigStoreError, DEFAULT_CONFIG_PATH,
+    canonical_config_owned_paths,
 };
 use clap::Parser;
 use clap::error::ErrorKind;
@@ -49,6 +50,21 @@ pub fn report_fatal_error(error: &AppError) {
 }
 
 pub fn run(cli: Cli) -> Result<(), AppError> {
+    if cli.command.is_operational() {
+        let logging = cli.logging_config();
+        logging.validate().map_err(CliConfigError::from)?;
+        let config_path = cli
+            .config_file
+            .clone()
+            .unwrap_or_else(|| PathBuf::from(DEFAULT_CONFIG_PATH));
+        let config_path =
+            std::path::absolute(&config_path).map_err(|source| AppError::ConfigPathResolution {
+                path: config_path,
+                source,
+            })?;
+        let owned_paths = canonical_config_owned_paths(config_path)?;
+        crate::observability::configure_for_owned_paths(&logging, &owned_paths)?;
+    }
     if let Command::Platform(_) = &cli.command {
         print!(
             "{}",
@@ -76,11 +92,12 @@ pub fn run_config_file(mut invocation: ConfigFileInvocation) -> Result<(), AppEr
         config,
         config_control,
     } = open_config_file_generation(&invocation)?;
+    crate::observability::validate_store_path(&config.logging, config_control.store())?;
     if config.check_config {
         return Ok(());
     }
 
-    crate::observability::configure(&config.log_level);
+    crate::observability::configure_for_store(&config.logging, config_control.store())?;
     crate::observability::process_event!(
         Info,
         "process",
@@ -113,7 +130,7 @@ fn run_config(config: AppConfig) -> Result<(), AppError> {
         return Ok(());
     }
 
-    crate::observability::configure(&config.log_level);
+    crate::observability::configure(&config.logging)?;
     crate::observability::process_event!(
         Info,
         "process",
@@ -597,7 +614,6 @@ async fn run_config_file_generations(
     let mut restarts = 0u32;
     let mut backoff = config.service.restart_backoff;
     loop {
-        crate::observability::configure(&config.log_level);
         if shutdown.is_requested() {
             rollback_unactivated_desired(&config_control)?;
             return Ok(());
@@ -654,7 +670,7 @@ async fn run_config_file_generations(
                     backoff = config.service.restart_backoff;
                     continue;
                 }
-                return Err(AppError::ConfigStore(error));
+                return Err(*error);
             }
             CanonicalGenerationTerminal::Runtime {
                 outcome: crate::runtime::RuntimeGenerationOutcome::ShutdownRequested,
@@ -732,7 +748,14 @@ async fn run_config_file_generations(
                 let previous_revision = runtime_revision;
                 let next_backoff =
                     next_restart_backoff(backoff, config.service.restart_max_backoff);
+                let installed_logging = config_control.store().active_config().logging;
                 let reopened = reopen_supervised_config_file_generation(&invocation)?;
+                if reopened.config.logging != installed_logging {
+                    crate::observability::configure_for_store(
+                        &reopened.config.logging,
+                        reopened.config_control.store(),
+                    )?;
+                }
                 config = reopened.config;
                 config_control = reopened.config_control;
                 if config_control.runtime_revision() == previous_revision {
@@ -1004,7 +1027,7 @@ where
                                     policy,
                                 )
                                 .await?;
-                                return Err(error.into());
+                                return Err(error);
                             }
                         }
                     } else {
@@ -1099,7 +1122,7 @@ enum CanonicalGenerationTerminal {
         outcome: crate::runtime::RuntimeGenerationOutcome,
         activated: bool,
     },
-    ActivationFailed(Box<ConfigStoreError>),
+    ActivationFailed(Box<AppError>),
 }
 
 async fn drive_canonical_generation(
@@ -1177,23 +1200,37 @@ async fn drive_canonical_generation(
 
 fn activate_ready_generation(
     config_control: &crate::runtime::RuntimeConfigControl,
-) -> Result<Option<crate::config::CommittedConfig>, ConfigStoreError> {
+) -> Result<Option<crate::config::CommittedConfig>, AppError> {
     let store = config_control.store();
+    let _mutation = store.lock_mutation();
     let runtime_revision = config_control.runtime_revision();
-    if store.revision() == runtime_revision {
-        return store.activate_desired(runtime_revision).map(Some);
-    }
     if store.active_revision() == runtime_revision {
         return Ok(None);
     }
-    store.activate_desired(runtime_revision).map(Some)
+    let config = store.current_config();
+    let active = store.active_config();
+    let prepared = if config.logging != active.logging {
+        Some(crate::observability::prepare_for_store(
+            &config.logging,
+            store,
+        )?)
+    } else {
+        None
+    };
+    let activated = store.activate_desired(runtime_revision)?;
+    if let Some(prepared) = prepared {
+        crate::observability::install(prepared);
+    }
+    Ok(Some(activated))
 }
 
 fn rollback_unactivated_desired(
     config_control: &crate::runtime::RuntimeConfigControl,
 ) -> Result<(), AppError> {
-    if config_control.store().pending_revision().is_some() {
-        config_control.store().rollback_pending()?;
+    let store = config_control.store();
+    let _mutation = store.lock_mutation();
+    if store.pending_revision().is_some() {
+        store.rollback_pending()?;
     }
     Ok(())
 }
@@ -1202,14 +1239,12 @@ fn rollback_failed_candidate(
     config_control: &crate::runtime::RuntimeConfigControl,
     runtime_revision: crate::config::ConfigRevision,
 ) -> Result<Option<crate::config::CommittedConfig>, AppError> {
-    if config_control.store().pending_revision() != Some(runtime_revision) {
+    let store = config_control.store();
+    let _mutation = store.lock_mutation();
+    if store.pending_revision() != Some(runtime_revision) {
         return Ok(None);
     }
-    config_control
-        .store()
-        .rollback_pending()
-        .map(Some)
-        .map_err(AppError::from)
+    store.rollback_pending().map(Some).map_err(AppError::from)
 }
 
 async fn wait_for_restart_or_shutdown(delay: Duration, shutdown: &ProcessShutdown) -> bool {
@@ -1245,6 +1280,7 @@ pub enum AppError {
     },
     Runtime(crate::runtime::RuntimeError),
     Operation(crate::operations::OperationError),
+    Logging(crate::observability::ConfigureError),
     VpnGeneration(Box<crate::platform::VpnGenerationError>),
     ShutdownSignal(std::io::Error),
     ShutdownTimeout(Duration),
@@ -1266,6 +1302,12 @@ impl From<crate::runtime::RuntimeError> for AppError {
 impl From<crate::operations::OperationError> for AppError {
     fn from(value: crate::operations::OperationError) -> Self {
         Self::Operation(value)
+    }
+}
+
+impl From<crate::observability::ConfigureError> for AppError {
+    fn from(value: crate::observability::ConfigureError) -> Self {
+        Self::Logging(value)
     }
 }
 
@@ -1306,6 +1348,7 @@ impl std::fmt::Display for AppError {
             ),
             Self::Runtime(err) => write!(f, "{err}"),
             Self::Operation(err) => write!(f, "{err}"),
+            Self::Logging(err) => write!(f, "{err}"),
             Self::VpnGeneration(err) => write!(f, "{err}"),
             Self::ShutdownSignal(err) => {
                 write!(f, "failed to register process shutdown signal: {err}")

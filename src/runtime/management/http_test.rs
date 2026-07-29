@@ -289,7 +289,6 @@ fn dashboard_auto_refresh_contract_is_bounded_and_includes_peer_status() {
     assert!(DASHBOARD_JS.contains("state.health && state.health.degraded"));
     assert!(DASHBOARD_JS.contains("await refreshDashboard(\"poll\");"));
     assert!(DASHBOARD_JS.contains("await requestPeerStatus(source, true);"));
-    assert!(DASHBOARD_JS.contains("if (refreshBusy()) return;"));
     assert!(DASHBOARD_JS.contains("state.refreshTimer = window.setTimeout(async function ()"));
     assert!(DASHBOARD_JS.contains("state.refreshIntervalMs !== 0"));
 }

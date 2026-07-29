@@ -140,7 +140,7 @@ fn client_cli_builds_default_socks_config() {
 
 #[test]
 fn client_cli_rejects_log_level_typos() {
-    let cli = parse_cli([
+    let error = parse_cli([
         "mptunnel",
         "--log-level",
         "warning",
@@ -148,14 +148,37 @@ fn client_cli_rejects_log_level_typos() {
         "--path",
         "tcp://127.0.0.1:443",
     ])
-    .expect("parse CLI before semantic validation");
+    .expect_err("invalid typed log level must fail CLI parsing");
+    assert_eq!(error.kind(), clap::error::ErrorKind::InvalidValue);
+}
 
-    assert!(matches!(
-        cli.into_config(),
-        Err(CliConfigError::Config(
-            crate::config::ConfigError::InvalidLogLevel(level)
-        )) if level == "warning"
-    ));
+#[test]
+fn simple_cli_maps_the_complete_logging_surface() {
+    let config = parse_cli([
+        "mptunnel",
+        "--log-level",
+        "debug",
+        "--log-format",
+        "json",
+        "--log-file",
+        "mptunnel.jsonl",
+        "--log-no-console",
+        "--log-flow-events",
+        "client",
+        "--path",
+        "tcp://127.0.0.1:443",
+    ])
+    .expect("parse logging CLI")
+    .into_config()
+    .expect("compile logging CLI");
+    assert_eq!(config.logging.level, crate::config::LogLevel::Debug);
+    assert_eq!(config.logging.format, crate::config::LogFormat::Json);
+    assert_eq!(
+        config.logging.file,
+        Some(std::path::PathBuf::from("mptunnel.jsonl"))
+    );
+    assert!(!config.logging.console);
+    assert!(config.logging.flow_events);
 }
 
 #[test]

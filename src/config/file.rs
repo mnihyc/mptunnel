@@ -5,11 +5,11 @@ use super::{
     DEFAULT_MAX_PENDING_AUTHENTICATIONS, DEFAULT_OUTBOUND_CONNECT_TIMEOUT_MS,
     DEFAULT_PATH_PROBE_INTERVAL_MS, DEFAULT_PATH_PROBE_TIMEOUT_MS, DEFAULT_RESTART_BACKOFF_MS,
     DEFAULT_RESTART_MAX_BACKOFF_MS, DEFAULT_SESSION_RETENTION_TIMEOUT_MS, DnsPolicyConfig,
-    GatewayBalancerConfig, LocalIngressConfig, ManagementConfig, MppInboundConfig,
-    MppOutboundConfig, MppPerformanceConfig, NodeConfig, OutboundLeafConfig,
-    ProductAdmissionConfig, ProductPolicyConfig, ResourceLimits, RouteTarget, RouteTargetKind,
-    SecurityPolicyError, ServerDestinationAclConfig, ServerSecurityConfig, ServiceConfig,
-    SessionConfig, SharedSecret,
+    GatewayBalancerConfig, LocalIngressConfig, LogFormat, LogLevel, LoggingConfig,
+    ManagementConfig, MppInboundConfig, MppOutboundConfig, MppPerformanceConfig, NodeConfig,
+    OutboundLeafConfig, ProductAdmissionConfig, ProductPolicyConfig, ResourceLimits, RouteTarget,
+    RouteTargetKind, SecurityPolicyError, ServerDestinationAclConfig, ServerSecurityConfig,
+    ServiceConfig, SessionConfig, SharedSecret,
 };
 use crate::ingress::tun::{
     DEFAULT_TUN_DNS_TTL_MS, DEFAULT_TUN_IPV4, DEFAULT_TUN_IPV4_PREFIX, DEFAULT_TUN_MTU,
@@ -78,8 +78,8 @@ pub(super) fn load_config_toml_str_at(
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct FileConfig {
-    #[serde(default = "default_log_level")]
-    log_level: String,
+    #[serde(default)]
+    logging: LoggingFileConfig,
     #[serde(default)]
     check_config: bool,
     #[serde(default)]
@@ -143,7 +143,7 @@ impl FileConfig {
             &local_user_catalog,
         )?;
         let config = AppConfig {
-            log_level: self.log_level,
+            logging: self.logging.into_config(material_base)?,
             check_config: self.check_config,
             service: self.service.into_config(),
             session: self.session.into_config(),
@@ -261,8 +261,89 @@ impl SessionFileConfig {
     }
 }
 
-fn default_log_level() -> String {
-    "info".to_string()
+#[derive(Debug, Clone, Copy, Default, Deserialize)]
+#[serde(rename_all = "lowercase")]
+enum LogLevelFileValue {
+    Off,
+    Error,
+    Warn,
+    #[default]
+    Info,
+    Debug,
+    Trace,
+}
+
+impl From<LogLevelFileValue> for LogLevel {
+    fn from(value: LogLevelFileValue) -> Self {
+        match value {
+            LogLevelFileValue::Off => Self::Off,
+            LogLevelFileValue::Error => Self::Error,
+            LogLevelFileValue::Warn => Self::Warn,
+            LogLevelFileValue::Info => Self::Info,
+            LogLevelFileValue::Debug => Self::Debug,
+            LogLevelFileValue::Trace => Self::Trace,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, Default, Deserialize)]
+#[serde(rename_all = "lowercase")]
+enum LogFormatFileValue {
+    #[default]
+    Text,
+    Json,
+}
+
+impl From<LogFormatFileValue> for LogFormat {
+    fn from(value: LogFormatFileValue) -> Self {
+        match value {
+            LogFormatFileValue::Text => Self::Text,
+            LogFormatFileValue::Json => Self::Json,
+        }
+    }
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+struct LoggingFileConfig {
+    level: LogLevelFileValue,
+    format: LogFormatFileValue,
+    console: bool,
+    file: Option<PathBuf>,
+    flow_events: bool,
+}
+
+impl Default for LoggingFileConfig {
+    fn default() -> Self {
+        Self {
+            level: LogLevelFileValue::Info,
+            format: LogFormatFileValue::Text,
+            console: true,
+            file: None,
+            flow_events: false,
+        }
+    }
+}
+
+impl LoggingFileConfig {
+    fn into_config(self, material_base: &Path) -> Result<LoggingConfig, ConfigFileError> {
+        if self
+            .file
+            .as_ref()
+            .is_some_and(|path| path.as_os_str().is_empty())
+        {
+            return Err(ConfigError::LoggingFilePathEmpty.into());
+        }
+        Ok(LoggingConfig {
+            level: self.level.into(),
+            format: self.format.into(),
+            console: self.console,
+            file: self
+                .file
+                .map(|configured| material_path(material_base, &configured)),
+            flow_events: self.flow_events,
+        })
+    }
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -2546,7 +2627,7 @@ impl DnsFileConfig {
             .map(DnsHostFileConfig::into_spec)
             .collect::<Result<Vec<_>, _>>()?;
         let fake_dns = self.fake_dns.map(FakeDnsFileConfig::into_spec);
-        let outbound_capabilities = outbounds
+        let mut outbound_capabilities = outbounds
             .leaves
             .values()
             .map(|leaf| match leaf {
@@ -2582,7 +2663,9 @@ impl DnsFileConfig {
                     )
                 }
             })
-            .collect();
+            .collect::<Vec<_>>();
+        outbound_capabilities
+            .sort_by(|left, right| left.outbound.as_str().cmp(right.outbound.as_str()));
         let spec = DnsPolicySpec {
             upstreams,
             outbound_capabilities,

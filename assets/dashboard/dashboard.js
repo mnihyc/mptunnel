@@ -87,6 +87,9 @@
     health: null,
     status: null,
     bearerToken: readStoredToken(),
+    tokenPersistencePending: false,
+    authenticationGeneration: 0,
+    authenticationRefreshPending: false,
     refreshIntervalMs: readStoredRefreshInterval(),
     refreshTimer: null,
     refreshCycleRunning: false,
@@ -116,7 +119,7 @@
 
   function readStoredToken() {
     try {
-      return window.sessionStorage.getItem(TOKEN_STORAGE_KEY) || "";
+      return window.localStorage.getItem(TOKEN_STORAGE_KEY) || "";
     } catch (_error) {
       return "";
     }
@@ -125,9 +128,9 @@
   function storeToken(token) {
     try {
       if (token) {
-        window.sessionStorage.setItem(TOKEN_STORAGE_KEY, token);
+        window.localStorage.setItem(TOKEN_STORAGE_KEY, token);
       } else {
-        window.sessionStorage.removeItem(TOKEN_STORAGE_KEY);
+        window.localStorage.removeItem(TOKEN_STORAGE_KEY);
       }
     } catch (_error) {
       // In-memory authentication still works when storage is unavailable.
@@ -160,7 +163,15 @@
 
   function clearToken() {
     state.bearerToken = "";
+    state.tokenPersistencePending = false;
+    state.authenticationGeneration += 1;
+    state.authenticationRefreshPending = false;
     storeToken("");
+    try {
+      window.sessionStorage.removeItem(TOKEN_STORAGE_KEY);
+    } catch (_error) {
+      // Erasure remains best effort when browser storage is unavailable.
+    }
     elements.tokenInput.value = "";
   }
 
@@ -432,6 +443,12 @@
     return state.refreshCycleRunning || state.fetching || state.peerFetching || state.gatewayUpdating;
   }
 
+  function runPendingAuthenticationRefresh() {
+    if (!state.authenticationRefreshPending || !state.bearerToken || refreshBusy()) return;
+    state.authenticationRefreshPending = false;
+    window.setTimeout(function () { refreshNow("auth"); }, 0);
+  }
+
   function peerRequestSupported() {
     return Boolean(state.status) && Boolean(peerControl().supported) && Boolean(selectedPeerSession());
   }
@@ -454,6 +471,7 @@
       handleUnauthorized("Authentication required");
       return false;
     }
+    const authenticationGeneration = state.authenticationGeneration;
     state.fetching = true;
     updateRefreshControls();
     updateConnectionState();
@@ -462,17 +480,30 @@
         requestJson(STATUS_ENDPOINT),
         requestJson(HEALTH_ENDPOINT)
       ]);
+      if (authenticationGeneration !== state.authenticationGeneration) {
+        state.authenticationRefreshPending = Boolean(state.bearerToken);
+        return false;
+      }
       state.status = validateStatus(responses[0]);
       state.health = validateHealth(responses[1]);
       state.lastReceivedAt = Date.now();
       state.lastError = null;
       state.authenticationRequired = false;
+      if (state.tokenPersistencePending) {
+        storeToken(state.bearerToken);
+        state.tokenPersistencePending = false;
+      }
+      state.authenticationRefreshPending = false;
       renderDashboard();
       if (source === "manual" || source === "auth") {
         announce("Runtime status refreshed");
       }
       return true;
     } catch (error) {
+      if (authenticationGeneration !== state.authenticationGeneration) {
+        state.authenticationRefreshPending = Boolean(state.bearerToken);
+        return false;
+      }
       state.lastError = error;
       if (error instanceof HttpError && error.status === 401) {
         handleUnauthorized(source === "auth" ? "Token rejected" : "Authentication required");
@@ -491,7 +522,10 @@
   }
 
   async function refreshDashboard(source) {
-    if (refreshBusy()) return;
+    if (refreshBusy()) {
+      if (source === "auth") state.authenticationRefreshPending = true;
+      return;
+    }
     state.refreshCycleRunning = true;
     updateRefreshControls();
     try {
@@ -502,6 +536,7 @@
     } finally {
       state.refreshCycleRunning = false;
       updateRefreshControls();
+      runPendingAuthenticationRefresh();
     }
   }
 
@@ -905,6 +940,7 @@
     elements.gatewayActionState.textContent = "Applying " + titleCase(payload.action);
     renderGateways();
     updateRefreshControls();
+    const authenticationGeneration = state.authenticationGeneration;
     try {
       await requestJson(GATEWAY_ACTION_ENDPOINT, {
         method: "POST",
@@ -916,7 +952,11 @@
       elements.gatewayActionState.textContent = "Applied " + titleCase(payload.action) + " to " + payload.balancer;
       announce(elements.gatewayActionState.textContent);
     } catch (error) {
-      if (error instanceof HttpError && error.status === 401) {
+      if (
+        error instanceof HttpError &&
+        error.status === 401 &&
+        authenticationGeneration === state.authenticationGeneration
+      ) {
         handleUnauthorized("Authentication required for gateway control");
       }
       elements.gatewayActionState.className = "inline-status gateway-action-state is-error";
@@ -926,6 +966,7 @@
       state.gatewayUpdating = false;
       if (state.status) renderGateways();
       updateRefreshControls();
+      runPendingAuthenticationRefresh();
     }
   }
 
@@ -1233,6 +1274,7 @@
     updateRefreshControls();
     elements.peerRequestState.className = "inline-status is-loading";
     elements.peerRequestState.textContent = "Requesting current peer path status";
+    const authenticationGeneration = state.authenticationGeneration;
     try {
       const result = await requestJson(PEER_ENDPOINT, {
         method: "POST",
@@ -1245,7 +1287,11 @@
       renderSelectedPeerResult();
       if (source === "manual") announce("Peer path status received");
     } catch (error) {
-      if (error instanceof HttpError && error.status === 401) {
+      if (
+        error instanceof HttpError &&
+        error.status === 401 &&
+        authenticationGeneration === state.authenticationGeneration
+      ) {
         handleUnauthorized("Authentication required for peer diagnostics");
       }
       elements.peerRequestState.className = "inline-status is-error";
@@ -1255,6 +1301,7 @@
       state.peerFetching = false;
       if (state.status) renderDiagnostics();
       updateRefreshControls();
+      runPendingAuthenticationRefresh();
     }
   }
 
@@ -1493,7 +1540,7 @@
       selectRefreshInterval(elements.refreshInterval.value);
     });
     elements.accessButton.addEventListener("click", function () {
-      showAuthDialog(state.bearerToken ? "Replace the bearer token stored for this tab." : "Enter the token configured for this endpoint.");
+      showAuthDialog(state.bearerToken ? "Replace the bearer token saved for this dashboard address." : "Enter the token configured for this endpoint.");
     });
     elements.pathUnderlayFilter.addEventListener("change", renderPaths);
     elements.pathStateFilter.addEventListener("change", renderPaths);
@@ -1517,10 +1564,12 @@
         return;
       }
       state.bearerToken = token;
-      storeToken(token);
+      state.tokenPersistencePending = true;
+      state.authenticationGeneration += 1;
+      state.authenticationRefreshPending = true;
       state.authenticationRequired = false;
       closeAuthDialog();
-      refreshNow("auth");
+      runPendingAuthenticationRefresh();
     });
     elements.forgetTokenButton.addEventListener("click", function () {
       clearToken();

@@ -162,7 +162,7 @@ fn invalid_candidate_never_changes_the_file() {
     let (_directory, path, store) = open_store();
     let before = fs::read(&path).expect("read initial config");
 
-    let invalid_log_level = format!("log_level = \"warning\"\n{CONFIG_B}");
+    let invalid_log_level = format!("[logging]\nlevel = \"warning\"\n{CONFIG_B}");
     for document in [b"not valid = [".as_slice(), invalid_log_level.as_bytes()] {
         let error = store
             .validate_candidate(document)

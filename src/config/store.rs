@@ -139,6 +139,7 @@ pub struct CanonicalConfigStore {
     path: PathBuf,
     last_good_path: PathBuf,
     pending_path: PathBuf,
+    mutation: Mutex<()>,
     state: Mutex<StoreState>,
 }
 
@@ -181,9 +182,7 @@ impl fmt::Debug for CanonicalConfigStore {
 
 impl CanonicalConfigStore {
     pub fn open(path: impl Into<PathBuf>) -> Result<(Self, AppConfig), ConfigStoreError> {
-        let path = path.into();
-        let last_good_path = sidecar_path(&path, LAST_GOOD_SUFFIX)?;
-        let pending_path = sidecar_path(&path, PENDING_SUFFIX)?;
+        let [path, last_good_path, pending_path] = canonical_config_owned_paths(path.into())?;
         let document = recover_interrupted_activation(&path, &last_good_path, &pending_path)?;
         let config = validate_document(&path, &document)?;
         let revision = ConfigRevision::from_bytes(&document);
@@ -193,6 +192,7 @@ impl CanonicalConfigStore {
                 path,
                 last_good_path,
                 pending_path,
+                mutation: Mutex::new(()),
                 state: Mutex::new(StoreState {
                     revision,
                     document: document.clone(),
@@ -209,6 +209,16 @@ impl CanonicalConfigStore {
 
     pub fn path(&self) -> &Path {
         &self.path
+    }
+
+    pub(crate) fn lock_mutation(&self) -> std::sync::MutexGuard<'_, ()> {
+        self.mutation
+            .lock()
+            .expect("canonical configuration mutation lock")
+    }
+
+    pub(crate) fn owned_paths(&self) -> [&Path; 3] {
+        [&self.path, &self.last_good_path, &self.pending_path]
     }
 
     pub fn revision(&self) -> ConfigRevision {
@@ -238,6 +248,14 @@ impl CanonicalConfigStore {
             .lock()
             .expect("canonical configuration store lock")
             .config
+            .clone()
+    }
+
+    pub(crate) fn active_config(&self) -> AppConfig {
+        self.state
+            .lock()
+            .expect("canonical configuration store lock")
+            .active_config
             .clone()
     }
 
@@ -390,6 +408,32 @@ impl CanonicalConfigStore {
             changed: true,
             config: state.config.clone(),
         })
+    }
+}
+
+pub(crate) fn canonical_config_owned_paths(
+    path: impl Into<PathBuf>,
+) -> Result<[PathBuf; 3], ConfigStoreError> {
+    let path = path.into();
+    let last_good_path = sidecar_path(&path, LAST_GOOD_SUFFIX)?;
+    let pending_path = sidecar_path(&path, PENDING_SUFFIX)?;
+    Ok([path, last_good_path, pending_path])
+}
+
+pub(crate) fn paths_equivalent(left: &Path, right: &Path) -> bool {
+    material_path_for_comparison(left) == material_path_for_comparison(right)
+        || same_file::is_same_file(left, right).unwrap_or(false)
+}
+
+fn material_path_for_comparison(path: &Path) -> PathBuf {
+    if let Ok(canonical) = fs::canonicalize(path) {
+        return canonical;
+    }
+    let parent = path.parent().unwrap_or_else(|| Path::new("."));
+    let parent = fs::canonicalize(parent).unwrap_or_else(|_| parent.to_path_buf());
+    match path.file_name() {
+        Some(file_name) => parent.join(file_name),
+        None => parent,
     }
 }
 

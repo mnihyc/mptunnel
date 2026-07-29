@@ -10,11 +10,16 @@
 # rejected. `mptunnel platform` reports host integration support; it is a
 # command, not a TOML setting.
 
-# off, error, warn, info, debug, or trace. Records are bounded, redacted, and
-# rate-limited per lifecycle/fault call site. Set MPTUNNEL_LOG_FORMAT=json for
-# newline-delimited JSON; structured text is the default.
-log_level = "info"
 check_config = false
+
+# Process logging stays outside the forwarding Core. Relative file paths are
+# resolved beside this document; parent directories must already exist.
+[logging]
+level = "info"          # off, error, warn, info, debug, or trace
+format = "text"         # text or newline-delimited json
+console = true          # standard error
+# file = "logs/mptunnel.log"
+flow_events = false     # opt-in destination-bearing flow open/close records
 
 # Global named credentials are referenced by MPP inbounds and outbounds.
 # File references are resolved relative to this TOML document. Environment

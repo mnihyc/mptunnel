@@ -291,13 +291,17 @@ async fn handle_connection(
             };
             match target.apply_config_document(expected, &request.body) {
                 Ok(outcome) => {
-                    let status = if outcome.reload { 202 } else { 200 };
-                    let reason = if outcome.reload { "Accepted" } else { "OK" };
+                    let status = if outcome.pending_activation { 202 } else { 200 };
+                    let reason = if outcome.pending_activation {
+                        "Accepted"
+                    } else {
+                        "OK"
+                    };
                     let written = write_json(stream, status, reason, &outcome.response).await;
                     // Persistence, not delivery of the acknowledgement, commits
                     // the desired state. A client that disconnects after the
                     // store transaction must not strand a pending generation.
-                    if outcome.reload {
+                    if outcome.request_reload {
                         target.request_config_reload();
                     }
                     written

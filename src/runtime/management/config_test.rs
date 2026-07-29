@@ -9,8 +9,8 @@ use crate::runtime::readiness::RuntimeReadinessBarrier;
 use crate::runtime::telemetry::RuntimeTelemetry;
 use std::fs;
 use std::path::PathBuf;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Barrier};
 use std::time::Duration;
 
 static TEST_SEQUENCE: AtomicU64 = AtomicU64::new(0);
@@ -212,7 +212,8 @@ fn health_reports_desired_active_and_running_revisions() {
     let outcome = target
         .apply_config_document(running, CONFIG_B.as_bytes())
         .expect("persist candidate");
-    assert!(outcome.reload);
+    assert!(outcome.pending_activation);
+    assert!(outcome.request_reload);
     let desired = control.store().revision();
     assert_ne!(desired, running);
 
@@ -240,11 +241,36 @@ async fn apply_is_cas_persistent_and_requests_a_generation_reload() {
     let outcome = target
         .apply_config_document(revision, CONFIG_B.as_bytes())
         .expect("apply valid candidate");
-    assert!(outcome.reload);
+    assert!(outcome.pending_activation);
+    assert!(outcome.request_reload);
     assert_eq!(outcome.response["state"], "persisted");
     assert_eq!(
         fs::read_to_string(path).expect("read committed config"),
         CONFIG_B
+    );
+
+    let desired = control.store().revision();
+    let retry = target
+        .apply_config_document(desired, CONFIG_B.as_bytes())
+        .expect("retry pending candidate through prior generation");
+    assert!(retry.pending_activation);
+    assert!(retry.request_reload);
+    assert_eq!(retry.response["state"], "persisted");
+    assert_eq!(retry.response["active_revision"], revision.to_string());
+    assert_eq!(retry.response["pending_revision"], desired.to_string());
+    assert_eq!(retry.response["activation"], "pending-generation-reload");
+
+    let candidate_control = control.next_generation();
+    let mut candidate_target = target.clone();
+    candidate_target.config_control = Some(candidate_control.clone());
+    candidate_target.generation = candidate_control.generation();
+    let candidate_retry = candidate_target
+        .apply_config_document(desired, CONFIG_B.as_bytes())
+        .expect("retry pending candidate through candidate generation");
+    assert!(candidate_retry.pending_activation);
+    assert!(
+        !candidate_retry.request_reload,
+        "a candidate generation must not request its own retirement"
     );
 
     let error = target
@@ -262,6 +288,57 @@ async fn apply_is_cas_persistent_and_requests_a_generation_reload() {
         .await
         .expect("reload notification")
         .expect("reload waiter task");
+}
+
+#[test]
+fn concurrent_apply_has_one_cas_winner_and_no_losing_sink_side_effect() {
+    let (directory, _path, target, control) = target();
+    let revision = control.store().revision();
+    let first = format!(
+        "[logging]\nconsole = false\nfile = \"first.jsonl\"\n{}",
+        CONFIG_B
+    );
+    let second = format!(
+        "[logging]\nconsole = false\nfile = \"second.jsonl\"\n{}",
+        CONFIG_B.replace("127.0.0.1:1081", "127.0.0.1:1082")
+    );
+    let barrier = Arc::new(Barrier::new(3));
+    let first_target = target.clone();
+    let first_barrier = barrier.clone();
+    let first_apply = std::thread::spawn(move || {
+        first_barrier.wait();
+        first_target.apply_config_document(revision, first.as_bytes())
+    });
+    let second_target = target.clone();
+    let second_barrier = barrier.clone();
+    let second_apply = std::thread::spawn(move || {
+        second_barrier.wait();
+        second_target.apply_config_document(revision, second.as_bytes())
+    });
+    barrier.wait();
+
+    let outcomes = [
+        first_apply.join().expect("first apply thread"),
+        second_apply.join().expect("second apply thread"),
+    ];
+    assert_eq!(
+        outcomes.iter().filter(|outcome| outcome.is_ok()).count(),
+        1,
+        "exactly one compare-and-swap apply must commit"
+    );
+    assert_eq!(
+        outcomes
+            .iter()
+            .filter(|outcome| matches!(outcome, Err(error) if error.status == 412))
+            .count(),
+        1,
+        "the losing apply must observe a stale revision"
+    );
+    assert_ne!(
+        directory.0.join("first.jsonl").exists(),
+        directory.0.join("second.jsonl").exists(),
+        "only the committed candidate may create its logging sink"
+    );
 }
 
 #[test]
@@ -309,7 +386,8 @@ allow_peer_diagnostics = true
         .apply_config_document(revision, candidate.as_bytes())
         .expect("generation-scoped management flags may reload");
 
-    assert!(outcome.reload);
+    assert!(outcome.pending_activation);
+    assert!(outcome.request_reload);
     assert_eq!(outcome.response["state"], "persisted");
     assert_eq!(
         fs::read_to_string(path).expect("read committed config"),

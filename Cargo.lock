@@ -1262,6 +1262,7 @@ dependencies = [
  "ring",
  "route_manager",
  "rustls",
+ "same-file",
  "serde",
  "serde_json",
  "sha2",

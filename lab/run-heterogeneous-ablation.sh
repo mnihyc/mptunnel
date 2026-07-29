@@ -765,7 +765,8 @@ server_config_toml() {
     management="${management}"$'\n'
   fi
   cat <<EOF
-log_level = ${log_level_json}
+[logging]
+level = ${log_level_json}
 
 ${resources}${management}[[credentials]]
 id = "lab"
@@ -820,7 +821,8 @@ socks_client_config_toml() {
     management="${management}"$'\n'
   fi
   cat <<EOF
-log_level = ${log_level_json}
+[logging]
+level = ${log_level_json}
 
 ${resources}${management}[[credentials]]
 id = "lab"
@@ -880,7 +882,8 @@ tun_client_config_toml() {
     management="${management}"$'\n'
   fi
   cat <<EOF
-log_level = ${log_level_json}
+[logging]
+level = ${log_level_json}
 
 ${resources}${management}[[credentials]]
 id = "lab"

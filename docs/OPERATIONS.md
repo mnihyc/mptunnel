@@ -74,16 +74,54 @@ lifecycle callbacks remain owned by the embedding application.
 
 ### Process logs
 
-`log_level` and `--log-level` accept `off`, `error`, `warn`, `info`, `debug`,
-or `trace`. The default output is one structured text record per line on
-stderr. Set `MPTUNNEL_LOG_FORMAT=json` for newline-delimited JSON with
-`timestamp_unix_ms`, `level`, `component`, `event`, `message`, and an optional
-suppressed-event count.
+```toml
+[logging]
+level = "info"          # off, error, warn, info, debug, or trace
+format = "text"         # text or json
+console = true          # standard error
+# file = "logs/mptunnel.log"
+flow_events = false
+```
 
-Logs exist only at process lifecycle, control, saturation, and fault
-boundaries. Each call site has a fixed burst limit, records are length-bounded,
-and common authorization/token/password forms are redacted. There is no
-in-process log queue or per-packet success logging. Failed QUIC handshakes are
+The console and optional append-only file receive the same structured text or
+newline-delimited JSON records. Relative file paths are resolved beside
+`config.toml`, while absolute paths are used as written; their parent directory
+must already exist. A CLI-relative `--log-file` is resolved by the operating
+system from the process working directory. The log file must not alias the
+canonical configuration document or its recovery sidecars. Check-only and API
+validation never create the file. Startup fails clearly if a requested file
+cannot be opened, and API apply rejects an unusable sink before it can replace
+or interrupt the active runtime.
+
+Simple CLI profiles expose the same common settings through `--log-level`,
+`--log-format`, `--log-file`, `--log-no-console`, and `--log-flow-events`.
+The matching environment variables are `MPTUNNEL_LOG_LEVEL`,
+`MPTUNNEL_LOG_FORMAT`, `MPTUNNEL_LOG_FILE`, `MPTUNNEL_LOG_NO_CONSOLE`, and
+`MPTUNNEL_LOG_FLOW_EVENTS`.
+
+When logging is enabled, at least the console or file sink must be enabled.
+Flow events require `info`, `debug`, or `trace`, because they are information
+records.
+
+Lifecycle, control, saturation, and fault records are length-bounded,
+rate-limited per call site, and redact common authorization, token, password,
+and credential forms. `flow_events = true` additionally emits one sanitized
+open and close record for each observable Product flow, including its inbound,
+destination, selected concrete outbound, duration, outcome, and byte/packet
+counts. It deliberately omits source addresses, principals, credentials,
+session/protocol IDs, carrier endpoints, and payload. Destinations remain
+privacy-sensitive, so flow logging is disabled by default.
+
+A live logging change applies to newly opened flows. A flow whose open record
+was emitted retains that sink and format through its close record, so enabling,
+disabling, or moving flow logs does not split lifecycle pairs.
+
+Logging performs no per-packet or per-byte output and never enters Core
+scheduling, recovery, congestion, or carrier loops. File rotation is
+host-owned. Changing logging settings or restarting the process reopens the
+file; an unrelated runtime-generation replacement retains the already-open
+descriptor. New files are owner-only on Unix hosts; permissions on existing
+files and non-Unix ACLs remain host-owned. Failed QUIC handshakes are
 pre-authentication attacker input and are intentionally silent.
 
 ## Config and validation
@@ -259,8 +297,8 @@ are no unversioned compatibility routes:
 - `POST /api/v1/config/apply` accepts the same complete document and requires
   exactly one `If-Match: sha256:...` revision from `GET /api/v1/config`
   (optionally quoted). It atomically persists only when the desired revision
-  still matches, and reports an unchanged document, live credential
-  publication, or a pending generation reload.
+  still matches, and reports an unchanged document, a live process-logging or
+  credential-authority update, or a pending generation reload.
 - `GET /api/v1/status` returns the complete cached
   `mptunnel.management.v4` snapshot, including sanitized local-inbound and
   leaf-outbound inventory. Outbound entries expose only tag, connector kind,
@@ -279,7 +317,7 @@ are no unversioned compatibility routes:
   five minutes of one-second trend samples.
 - `GET /api/v1/sessions` returns authenticated MPP session ownership; `GET
   /api/v1/flows` returns bounded active reliable/datagram Product-flow detail.
-  Each record has a generation-local display ID, immutable origin inbound,
+  Each record has a generation-local flow ID, immutable origin inbound,
   network, original requested target, concrete selected leaf, and the
   balancer/member pair when selection used a balancer.
 - `GET /api/v1/diagnostics` returns local diagnostic capability and typed peer
@@ -292,12 +330,17 @@ are no unversioned compatibility routes:
 - `POST /api/v1/diagnostics/peer` requests a sanitized peer snapshot.
 
 Configuration mutation is deliberately full-document only: there is no
-`PATCH`, field update, history, or diff API. An inbound credential-authority
-change may publish live only when it is the complete change. Every routing,
-DNS, transport, resource, timeout, client-credential, TLS, or other change is
-persisted and activates through a clean runtime-generation replacement.
-Management listener or authentication changes are rejected by the API and
-require a local file edit and restart.
+`PATCH`, field update, history, or diff API. Process logging and inbound
+credential-authority changes may publish live when they are the complete
+change. A changed logging sink is prepared inside the serialized apply
+transaction after the document is staged; preparation failure rolls the
+document back before the active runtime is changed or a reload is requested.
+Every routing, DNS, transport, resource, timeout, client-credential, TLS, or
+other change activates through a clean runtime-generation replacement. A
+changed logging sink included with such a replacement is preflighted on apply
+and opened definitively at activation; unchanged logging retains its existing
+descriptor. Management listener or authentication changes are rejected by the
+API and require a local file edit and restart.
 
 An identical TOML document is idempotent even if a referenced file was replaced.
 For an online certificate, key, CA, pin, proxy-password, or signed-rule-set
@@ -316,9 +359,9 @@ instead of being overwritten.
 
 Only static dashboard assets are unauthenticated. Every API request, including
 health probes, requires `Authorization: Bearer <token>`. The default page
-retains it only in memory and browser session storage, not a URL or persistent
-local storage. The API has no CORS support and sends restrictive browser
-security headers.
+retains it in same-origin browser local storage until the operator uses
+**Forget token** or the server rejects it; it never places the token in a URL.
+The API has no CORS support and sends restrictive browser security headers.
 
 `live` means the process can answer and its generation has not entered terminal
 failure. `ready` additionally requires a ready generation, a connected MPP

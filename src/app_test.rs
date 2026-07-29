@@ -412,6 +412,55 @@ fn explicit_operational_commands_bypass_only_the_config_runtime_shortcut() {
 }
 
 #[test]
+fn operational_commands_apply_the_global_logging_contract() {
+    let cli = Cli::try_parse_from(["mptunnel", "--log-no-console", "platform"])
+        .expect("parse platform command");
+    assert!(matches!(
+        run(cli),
+        Err(AppError::Config(CliConfigError::Config(
+            crate::config::ConfigError::LoggingSinkRequired
+        )))
+    ));
+
+    let directory = TestDirectory::new();
+    let config_path = directory.path().join("config.toml");
+    let last_good_path = directory.path().join("config.toml.mptunnel.last-good");
+    let pending_path = directory.path().join("config.toml.mptunnel.pending");
+    let hard_link_path = directory.path().join("config-hard-link.toml");
+    fs::write(&config_path, "persistent-config").expect("write protected config");
+    fs::hard_link(&config_path, &hard_link_path).expect("create protected config hard link");
+
+    for log_path in [
+        &config_path,
+        &last_good_path,
+        &pending_path,
+        &hard_link_path,
+    ] {
+        let cli = Cli::try_parse_from([
+            OsString::from("mptunnel"),
+            OsString::from("--config"),
+            config_path.as_os_str().to_owned(),
+            OsString::from("--log-file"),
+            log_path.as_os_str().to_owned(),
+            OsString::from("platform"),
+        ])
+        .expect("parse protected operational log path");
+        assert!(matches!(
+            run(cli),
+            Err(AppError::Logging(
+                crate::observability::ConfigureError::ConfigStorePath { .. }
+            ))
+        ));
+    }
+    assert_eq!(
+        fs::read_to_string(&config_path).expect("read protected config"),
+        "persistent-config"
+    );
+    assert!(!last_good_path.exists());
+    assert!(!pending_path.exists());
+}
+
+#[test]
 fn config_file_invocation_rejects_unknown_and_duplicate_arguments() {
     let unknown = vec![
         OsString::from("mptunnel"),

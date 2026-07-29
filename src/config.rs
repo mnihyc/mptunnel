@@ -32,9 +32,10 @@ pub use model::{
     DEFAULT_RESTART_BACKOFF, DEFAULT_RESTART_BACKOFF_MS, DEFAULT_RESTART_MAX_BACKOFF,
     DEFAULT_RESTART_MAX_BACKOFF_MS, DEFAULT_SESSION_RETENTION_TIMEOUT,
     DEFAULT_SESSION_RETENTION_TIMEOUT_MS, DnsPolicyConfig, GatewayBalancerConfig,
-    LocalIngressConfig, ManagementConfig, MppInboundConfig, MppOutboundConfig, NodeConfig,
-    OutboundLeafConfig, ProductPolicyConfig, RouteTarget, RouteTargetKind,
-    ServerDestinationAclConfig, ServerSecurityConfig, ServiceConfig, SessionConfig,
+    LocalIngressConfig, LogFormat, LogLevel, LoggingConfig, ManagementConfig, MppInboundConfig,
+    MppOutboundConfig, NodeConfig, OutboundLeafConfig, ProductPolicyConfig, RouteTarget,
+    RouteTargetKind, ServerDestinationAclConfig, ServerSecurityConfig, ServiceConfig,
+    SessionConfig,
 };
 pub(crate) use secret::{
     SecretMaterialError, normalize_secret_bytes, read_secret_environment, read_secret_file,
@@ -43,3 +44,4 @@ pub use store::{
     CanonicalConfigStore, CommittedConfig, ConfigRecoveryConflict, ConfigRevision,
     ConfigRevisionParseError, ConfigStoreError, ValidatedConfigCandidate,
 };
+pub(crate) use store::{canonical_config_owned_paths, paths_equivalent};

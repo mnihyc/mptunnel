@@ -10,10 +10,11 @@ use crate::config::{
     DEFAULT_RESTART_BACKOFF_MS, DEFAULT_RESTART_MAX_BACKOFF_MS,
     DEFAULT_SESSION_RETENTION_TIMEOUT_MS, DEFAULT_STREAM_WINDOW_BYTES,
     DEFAULT_TCP_PATH_HEARTBEAT_INTERVAL_MS, DEFAULT_TCP_PATH_HEARTBEAT_TIMEOUT_MS, DnsPolicyConfig,
-    LocalIngressConfig, ManagementConfig, MppInboundConfig, MppOutboundConfig,
-    MppPerformanceConfig, NodeConfig, OutboundLeafConfig, ProductPolicyConfig, ResourceLimits,
-    RouteTarget, RouteTargetKind, ServerDestinationAclConfig, ServerSecurityConfig, ServiceConfig,
-    SessionConfig, SharedSecret, normalize_secret_bytes, read_secret_environment, read_secret_file,
+    LocalIngressConfig, LogFormat, LogLevel, LoggingConfig, ManagementConfig, MppInboundConfig,
+    MppOutboundConfig, MppPerformanceConfig, NodeConfig, OutboundLeafConfig, ProductPolicyConfig,
+    ResourceLimits, RouteTarget, RouteTargetKind, ServerDestinationAclConfig, ServerSecurityConfig,
+    ServiceConfig, SessionConfig, SharedSecret, normalize_secret_bytes, read_secret_environment,
+    read_secret_file,
 };
 use crate::ingress::tun::{
     DEFAULT_TUN_DNS_TTL_MS, DEFAULT_TUN_MTU, ManagedVpnConfig, ManagedVpnPlatformConfig,
@@ -52,8 +53,45 @@ pub struct Cli {
     #[arg(short = 'c', long = "config", global = true, value_name = "FILE")]
     pub config_file: Option<PathBuf>,
 
-    #[arg(long, global = true, env = "MPTUNNEL_LOG", default_value = "info")]
-    pub log_level: String,
+    #[arg(
+        long,
+        global = true,
+        env = "MPTUNNEL_LOG_LEVEL",
+        value_enum,
+        default_value = "info"
+    )]
+    pub log_level: LogLevelArg,
+
+    #[arg(
+        long,
+        global = true,
+        env = "MPTUNNEL_LOG_FORMAT",
+        value_enum,
+        default_value = "text"
+    )]
+    pub log_format: LogFormatArg,
+
+    /// Append process records to a file in addition to any console sink.
+    #[arg(long, global = true, env = "MPTUNNEL_LOG_FILE", value_name = "FILE")]
+    pub log_file: Option<PathBuf>,
+
+    /// Disable the standard-error log sink.
+    #[arg(
+        long,
+        global = true,
+        env = "MPTUNNEL_LOG_NO_CONSOLE",
+        default_value_t = false
+    )]
+    pub log_no_console: bool,
+
+    /// Emit sanitized Product flow-open and flow-close records.
+    #[arg(
+        long,
+        global = true,
+        env = "MPTUNNEL_LOG_FLOW_EVENTS",
+        default_value_t = false
+    )]
+    pub log_flow_events: bool,
 
     /// Named MPP credential selected by the simple client/server profile.
     #[arg(
@@ -136,6 +174,16 @@ pub struct Cli {
 }
 
 impl Cli {
+    pub(crate) fn logging_config(&self) -> LoggingConfig {
+        LoggingConfig {
+            level: self.log_level.into(),
+            format: self.log_format.into(),
+            console: !self.log_no_console,
+            file: self.log_file.clone(),
+            flow_events: self.log_flow_events,
+        }
+    }
+
     pub fn into_config(self) -> Result<AppConfig, CliConfigError> {
         if !matches!(&self.command, Command::Client(_) | Command::Server(_)) {
             return Err(CliConfigError::OperationalCommandNotRuntimeConfig);
@@ -150,6 +198,7 @@ impl Cli {
                 .map_err(|error| CliConfigError::Credential(error.to_string()))?;
         let catalog = CredentialCatalog::compile([credential])
             .map_err(|error| CliConfigError::Credential(error.to_string()))?;
+        let logging = self.logging_config();
         let command = match self.command {
             Command::Client(args) => {
                 let security = ClientSecurityConfig::new(
@@ -182,7 +231,7 @@ impl Cli {
             }
         };
         let config = AppConfig {
-            log_level: self.log_level,
+            logging,
             check_config: self.check_config,
             service: self.service.into_config(),
             session: self.session.into_config(),
@@ -227,6 +276,44 @@ impl Cli {
         };
         normalize_secret_bytes(&mut value);
         Ok(value)
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+pub enum LogLevelArg {
+    Off,
+    Error,
+    Warn,
+    Info,
+    Debug,
+    Trace,
+}
+
+impl From<LogLevelArg> for LogLevel {
+    fn from(value: LogLevelArg) -> Self {
+        match value {
+            LogLevelArg::Off => Self::Off,
+            LogLevelArg::Error => Self::Error,
+            LogLevelArg::Warn => Self::Warn,
+            LogLevelArg::Info => Self::Info,
+            LogLevelArg::Debug => Self::Debug,
+            LogLevelArg::Trace => Self::Trace,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+pub enum LogFormatArg {
+    Text,
+    Json,
+}
+
+impl From<LogFormatArg> for LogFormat {
+    fn from(value: LogFormatArg) -> Self {
+        match value {
+            LogFormatArg::Text => Self::Text,
+            LogFormatArg::Json => Self::Json,
+        }
     }
 }
 

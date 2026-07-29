@@ -4,7 +4,8 @@
 # Linux/macOS: umask 077; openssl rand -hex 32 > mpp-credential.key
 # PowerShell:   (New-Guid).Guid | Set-Content -NoNewline mpp-credential.key
 
-log_level = "info"
+[logging]
+level = "info"
 
 [[credentials]]
 id = "home-2026"

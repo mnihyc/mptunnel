@@ -11,7 +11,7 @@ use std::collections::HashMap;
 use std::io;
 use std::pin::Pin;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::task::{Context, Poll};
 use std::time::{Duration, Instant};
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
@@ -261,6 +261,16 @@ struct ActiveProductFlow {
     started_elapsed_nanos: u64,
     last_activity_elapsed_nanos: AtomicU64,
     io: ProductIoCounters,
+    flow_log: OnceLock<crate::observability::FlowLogToken>,
+}
+
+#[derive(Debug)]
+struct OverflowFlowLog {
+    flow_id: u64,
+    network: Network,
+    started_elapsed_nanos: u64,
+    io: ProductIoCounters,
+    token: crate::observability::FlowLogToken,
 }
 
 impl ActiveProductFlow {
@@ -270,6 +280,7 @@ impl ActiveProductFlow {
             started_elapsed_nanos,
             last_activity_elapsed_nanos: AtomicU64::new(started_elapsed_nanos),
             io: ProductIoCounters::default(),
+            flow_log: OnceLock::new(),
         }
     }
 
@@ -277,6 +288,75 @@ impl ActiveProductFlow {
         self.last_activity_elapsed_nanos
             .fetch_max(elapsed_nanos, Ordering::Relaxed);
     }
+}
+
+fn flow_network_label(network: Network) -> &'static str {
+    match network {
+        Network::Tcp => "tcp",
+        Network::Udp => "udp",
+    }
+}
+
+fn emit_flow_open(metadata: &ProductFlowMetadata) -> Option<crate::observability::FlowLogToken> {
+    if !crate::observability::flow_events_enabled() {
+        return None;
+    }
+    let scope = metadata.scope.as_ref()?;
+    let origin = match scope.origin.kind {
+        ProductFlowOriginKind::LocalInbound => "local_inbound",
+        ProductFlowOriginKind::MppInbound => "mpp_inbound",
+    };
+    let target = scope.target.authority();
+    crate::observability::emit_flow_open(
+        metadata.display_id,
+        origin,
+        flow_network_label(metadata.network),
+        scope.origin.inbound.as_str(),
+        &target,
+        scope.selection.outbound.as_str(),
+        scope.selection.balancer.as_ref().map(BalancerId::as_str),
+    )
+}
+
+fn emit_flow_close(flow: &ActiveProductFlow, elapsed_nanos: u64, completed: bool) {
+    let Some(token) = flow.flow_log.get() else {
+        return;
+    };
+    let io = flow.io.snapshot();
+    crate::observability::emit_flow_close(
+        token,
+        flow.metadata.display_id,
+        flow_network_label(flow.metadata.network),
+        if completed { "complete" } else { "incomplete" },
+        elapsed_nanos
+            .saturating_sub(flow.started_elapsed_nanos)
+            .saturating_div(1_000_000),
+        crate::observability::FlowIo {
+            to_peer_bytes: io.to_peer_bytes,
+            to_peer_packets: io.to_peer_packets,
+            from_peer_bytes: io.from_peer_bytes,
+            from_peer_packets: io.from_peer_packets,
+        },
+    );
+}
+
+fn emit_overflow_flow_close(flow: &OverflowFlowLog, elapsed_nanos: u64, completed: bool) {
+    let io = flow.io.snapshot();
+    crate::observability::emit_flow_close(
+        &flow.token,
+        flow.flow_id,
+        flow_network_label(flow.network),
+        if completed { "complete" } else { "incomplete" },
+        elapsed_nanos
+            .saturating_sub(flow.started_elapsed_nanos)
+            .saturating_div(1_000_000),
+        crate::observability::FlowIo {
+            to_peer_bytes: io.to_peer_bytes,
+            to_peer_packets: io.to_peer_packets,
+            from_peer_bytes: io.from_peer_bytes,
+            from_peer_packets: io.from_peer_packets,
+        },
+    );
 }
 
 #[derive(Debug)]
@@ -428,6 +508,7 @@ impl RuntimeTelemetry {
                 counter: ProductFlowCounter {
                     telemetry: self.clone(),
                     flow: None,
+                    overflow_flow_log: None,
                     kind,
                     enabled: false,
                 },
@@ -460,7 +541,7 @@ impl RuntimeTelemetry {
                 .is_none_or(|scope| scope.network == network)
         );
         let started_elapsed_nanos = self.inner.elapsed_nanos();
-        let (flow, registration_id) = {
+        let (flow, registration_id, overflow_metadata) = {
             let mut active_flows = self
                 .inner
                 .active_flows
@@ -473,7 +554,7 @@ impl RuntimeTelemetry {
                     .fetch_add(1, Ordering::Relaxed);
                 let flow = Arc::new(ActiveProductFlow::new(metadata, started_elapsed_nanos));
                 active_flows.insert(registration_id, flow.clone());
-                (Some(flow), Some(registration_id))
+                (Some(flow), Some(registration_id), None)
             } else {
                 // Overflow flows keep aggregate counters without per-flow state.
                 self.inner
@@ -482,15 +563,34 @@ impl RuntimeTelemetry {
                 self.inner
                     .active_flow_record_overflow_total
                     .fetch_add(1, Ordering::Relaxed);
-                (None, None)
+                (None, None, Some(metadata))
             }
         };
         self.inner.lifecycle(kind).open();
+        if let Some(flow) = flow.as_ref()
+            && let Some(token) = emit_flow_open(&flow.metadata)
+        {
+            flow.flow_log
+                .set(token)
+                .expect("flow log token is initialized once");
+        }
+        let overflow_flow_log = overflow_metadata.and_then(|metadata| {
+            metadata.scope.as_ref()?;
+            let token = emit_flow_open(&metadata)?;
+            Some(Arc::new(OverflowFlowLog {
+                flow_id: metadata.display_id,
+                network: metadata.network,
+                started_elapsed_nanos,
+                io: ProductIoCounters::default(),
+                token,
+            }))
+        });
 
         ProductFlowLease {
             counter: ProductFlowCounter {
                 telemetry: self.clone(),
                 flow,
+                overflow_flow_log,
                 kind,
                 enabled: true,
             },
@@ -572,6 +672,7 @@ impl RuntimeTelemetry {
 pub(crate) struct ProductFlowCounter {
     telemetry: RuntimeTelemetry,
     flow: Option<Arc<ActiveProductFlow>>,
+    overflow_flow_log: Option<Arc<OverflowFlowLog>>,
     kind: ProductFlowKind,
     enabled: bool,
 }
@@ -612,6 +713,8 @@ impl ProductFlowCounter {
         if let Some(flow) = &self.flow {
             flow.io.record_to_peer(bytes, packets);
             flow.record_activity(self.telemetry.inner.elapsed_nanos());
+        } else if let Some(flow) = &self.overflow_flow_log {
+            flow.io.record_to_peer(bytes, packets);
         }
     }
 
@@ -626,6 +729,8 @@ impl ProductFlowCounter {
         if let Some(flow) = &self.flow {
             flow.io.record_from_peer(bytes, packets);
             flow.record_activity(self.telemetry.inner.elapsed_nanos());
+        } else if let Some(flow) = &self.overflow_flow_log {
+            flow.io.record_from_peer(bytes, packets);
         }
     }
 }
@@ -675,6 +780,19 @@ impl ProductFlowLease {
             .inner
             .lifecycle(self.counter.kind)
             .finish(completed);
+        if let Some(flow) = self.counter.flow.as_ref() {
+            emit_flow_close(
+                flow,
+                self.counter.telemetry.inner.elapsed_nanos(),
+                completed,
+            );
+        } else if let Some(flow) = self.counter.overflow_flow_log.as_ref() {
+            emit_overflow_flow_close(
+                flow,
+                self.counter.telemetry.inner.elapsed_nanos(),
+                completed,
+            );
+        }
     }
 }
 

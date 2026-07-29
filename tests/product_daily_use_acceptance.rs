@@ -11,6 +11,7 @@ use mptunnel::dns::{
 use mptunnel::product::{CompiledDnsPlan, CompiledDnsUpstream, DnsSecurityPolicy, DomainName};
 use std::collections::HashMap;
 use std::fs;
+use std::io::{Read, Write};
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::path::Path;
 use std::sync::Arc;
@@ -34,7 +35,8 @@ fn reject_runtime_config(socks: &[SocketAddr], management: SocketAddr, generatio
         .join(", ");
     format!(
         r#"
-log_level = "warn"
+[logging]
+level = "warn"
 
 [management]
 listen = ["{management}"]
@@ -134,11 +136,14 @@ fn packaged_management_api_validates_applies_persists_and_reloads_one_generation
     let retired_socks = unused_loopback_addr();
     let management = unused_loopback_addr();
     let original = reject_runtime_config(&[retained_socks, retired_socks], management, 1);
-    let candidate = reject_runtime_config(&[retained_socks], management, 2).replacen(
-        "dashboard = false",
-        "dashboard = true",
-        1,
-    );
+    let candidate = reject_runtime_config(&[retained_socks], management, 2)
+        .replacen("dashboard = false", "dashboard = true", 1)
+        .replacen(
+            "[logging]\nlevel = \"warn\"",
+            "[logging]\nlevel = \"info\"\nformat = \"json\"\nconsole = false\nfile = \"applied-runtime.jsonl\"",
+            1,
+        );
+    let applied_log_path = directory.path().join("applied-runtime.jsonl");
     let config_path = directory.write("config.toml", &original);
     assert_check_config_ok(&config_path);
 
@@ -150,6 +155,10 @@ fn packaged_management_api_validates_applies_persists_and_reloads_one_generation
     assert!(
         error.contains("legacy_unsafe_api") && error.contains("unknown field"),
         "strict TOML failure did not identify the unknown field:\n{error}"
+    );
+    assert!(
+        !applied_log_path.exists(),
+        "validation must not create a candidate log file"
     );
 
     let mut process =
@@ -236,6 +245,34 @@ fn packaged_management_api_validates_applies_persists_and_reloads_one_generation
         String::from_utf8_lossy(&invalid.body).contains("unknown_daily_use_option"),
         "validation response should identify the invalid field"
     );
+    fs::hard_link(&config_path, directory.path().join("config-hardlink.toml"))
+        .expect("create canonical-config hard link");
+    for store_owned_path in [
+        "config.toml",
+        "config.toml.mptunnel.last-good",
+        "config.toml.mptunnel.pending",
+        "config-hardlink.toml",
+    ] {
+        let store_collision = original.replacen(
+            "[logging]\nlevel = \"warn\"",
+            &format!("[logging]\nlevel = \"info\"\nconsole = false\nfile = {store_owned_path:?}"),
+            1,
+        );
+        let collision = http_request(
+            management,
+            "POST",
+            "/api/v1/config/validate",
+            Some(OPERATOR_TOKEN),
+            &[("Content-Type", "application/toml")],
+            store_collision.as_bytes(),
+        )
+        .expect("store-owned log path validation");
+        assert_eq!(collision.status, 422);
+        assert!(
+            String::from_utf8_lossy(&collision.body).contains("canonical configuration store"),
+            "store-owned logging path rejection should be explicit for {store_owned_path}"
+        );
+    }
 
     let validated = http_request(
         management,
@@ -279,6 +316,10 @@ fn packaged_management_api_validates_applies_persists_and_reloads_one_generation
     )
     .expect("stale apply");
     assert_eq!(stale.status, 412);
+    assert!(
+        !applied_log_path.exists(),
+        "a stale apply must not create or open the candidate log file"
+    );
 
     let applied = http_request(
         management,
@@ -364,7 +405,212 @@ fn packaged_management_api_validates_applies_persists_and_reloads_one_generation
         fs::read_to_string(&config_path).expect("persisted canonical config"),
         candidate
     );
-    process.assert_running("post-reload verification");
+    let deadline = Instant::now() + PROCESS_START_TIMEOUT;
+    loop {
+        let contents = fs::read_to_string(&applied_log_path).unwrap_or_default();
+        if contents.lines().any(|line| {
+            serde_json::from_str::<serde_json::Value>(line)
+                .is_ok_and(|record| record["event"] == "generation_activated")
+        }) {
+            break;
+        }
+        process.assert_running("runtime-applied logging configuration");
+        assert!(
+            Instant::now() < deadline,
+            "runtime-applied file logger did not record activation:\n{contents}"
+        );
+        thread::sleep(Duration::from_millis(25));
+    }
+
+    let unusable_logging_candidate = candidate.replacen(
+        "file = \"applied-runtime.jsonl\"",
+        "file = \"missing-log-directory/mptunnel.jsonl\"",
+        1,
+    );
+    let validated = http_request(
+        management,
+        "POST",
+        "/api/v1/config/validate",
+        Some(OPERATOR_TOKEN),
+        &[("Content-Type", "application/toml")],
+        unusable_logging_candidate.as_bytes(),
+    )
+    .expect("unusable logging candidate structural validation");
+    assert_eq!(
+        validated.status, 200,
+        "side-effect-free validation should not probe or create the file sink"
+    );
+    let applied = http_request(
+        management,
+        "POST",
+        "/api/v1/config/apply",
+        Some(OPERATOR_TOKEN),
+        &[
+            ("Content-Type", "application/toml"),
+            ("If-Match", &candidate_revision),
+        ],
+        unusable_logging_candidate.as_bytes(),
+    )
+    .expect("unusable logging candidate apply");
+    assert_eq!(
+        applied.status, 422,
+        "an unusable live logging update must roll back without a reload"
+    );
+    assert_eq!(
+        fs::read_to_string(&config_path).expect("preserved configuration"),
+        candidate
+    );
+    let status = http_request(
+        management,
+        "GET",
+        "/api/v1/config",
+        Some(OPERATOR_TOKEN),
+        &[],
+        &[],
+    )
+    .expect("configuration status after rejected logging update")
+    .json();
+    assert_eq!(status["desired_revision"], candidate_revision);
+    assert_eq!(status["active_revision"], candidate_revision);
+    assert_eq!(status["runtime_revision"], candidate_revision);
+    assert!(status["pending_revision"].is_null());
+
+    let live_logging_candidate = candidate.replacen("level = \"info\"", "level = \"debug\"", 1);
+    let validated = http_request(
+        management,
+        "POST",
+        "/api/v1/config/validate",
+        Some(OPERATOR_TOKEN),
+        &[("Content-Type", "application/toml")],
+        live_logging_candidate.as_bytes(),
+    )
+    .expect("live logging candidate validation");
+    assert_eq!(validated.status, 200);
+    let live_revision = validated.json()["revision"]
+        .as_str()
+        .expect("live logging revision")
+        .to_string();
+    let applied = http_request(
+        management,
+        "POST",
+        "/api/v1/config/apply",
+        Some(OPERATOR_TOKEN),
+        &[
+            ("Content-Type", "application/toml"),
+            ("If-Match", &candidate_revision),
+        ],
+        live_logging_candidate.as_bytes(),
+    )
+    .expect("live logging update");
+    assert_eq!(
+        applied.status,
+        200,
+        "logging-only apply was not live: body={}; client log:\n{}",
+        String::from_utf8_lossy(&applied.body),
+        process.log()
+    );
+    let applied = applied.json();
+    assert_eq!(applied["activation"], "live-update");
+    assert_eq!(applied["desired_revision"], live_revision);
+    assert_eq!(applied["active_revision"], live_revision);
+    assert!(applied["pending_revision"].is_null());
+    process.assert_running("live logging update");
+    wait_for_tcp(
+        &mut process,
+        retained_socks,
+        PROCESS_START_TIMEOUT,
+        "listener retained across live logging update",
+    );
+    assert_eq!(
+        fs::read_to_string(&config_path).expect("live logging configuration"),
+        live_logging_candidate
+    );
+
+    let rotated_log_path = directory.path().join("applied-runtime.rotated.jsonl");
+    fs::rename(&applied_log_path, &rotated_log_path).expect("rotate active log descriptor");
+    fs::create_dir(&applied_log_path).expect("make configured sink path unreopenable");
+    let non_logging_candidate =
+        live_logging_candidate.replacen("generation = 2", "generation = 3", 1);
+    let validated = http_request(
+        management,
+        "POST",
+        "/api/v1/config/validate",
+        Some(OPERATOR_TOKEN),
+        &[("Content-Type", "application/toml")],
+        non_logging_candidate.as_bytes(),
+    )
+    .expect("non-logging candidate validation");
+    assert_eq!(validated.status, 200);
+    let non_logging_revision = validated.json()["revision"]
+        .as_str()
+        .expect("non-logging candidate revision")
+        .to_string();
+    let applied = http_request(
+        management,
+        "POST",
+        "/api/v1/config/apply",
+        Some(OPERATOR_TOKEN),
+        &[
+            ("Content-Type", "application/toml"),
+            ("If-Match", &live_revision),
+        ],
+        non_logging_candidate.as_bytes(),
+    )
+    .expect("non-logging update after host-owned log rotation");
+    assert_eq!(applied.status, 202);
+    assert_eq!(applied.json()["activation"], "pending-generation-reload");
+
+    let deadline = Instant::now() + PROCESS_START_TIMEOUT;
+    loop {
+        process.assert_running("non-logging generation replacement");
+        if let Ok(response) = http_request(
+            management,
+            "GET",
+            "/api/v1/config",
+            Some(OPERATOR_TOKEN),
+            &[],
+            &[],
+        ) && response.status == 200
+        {
+            let status = response.json();
+            if status["desired_revision"] == non_logging_revision
+                && status["active_revision"] == non_logging_revision
+                && status["runtime_revision"] == non_logging_revision
+                && status["pending_revision"].is_null()
+            {
+                break;
+            }
+        }
+        assert!(
+            Instant::now() < deadline,
+            "non-logging generation never became active; stderr:\n{}",
+            process.log()
+        );
+        thread::sleep(Duration::from_millis(25));
+    }
+    assert_eq!(
+        fs::read_to_string(&config_path).expect("non-logging configuration"),
+        non_logging_candidate
+    );
+    wait_for_tcp(
+        &mut process,
+        retained_socks,
+        PROCESS_START_TIMEOUT,
+        "listener retained after non-logging generation replacement",
+    );
+    let rotated_contents =
+        fs::read_to_string(&rotated_log_path).expect("read host-rotated active log");
+    assert!(
+        rotated_contents.lines().any(|line| {
+            serde_json::from_str::<serde_json::Value>(line).is_ok_and(|record| {
+                record["event"] == "generation_activated"
+                    && record["message"]
+                        .as_str()
+                        .is_some_and(|message| message.contains(&non_logging_revision))
+            })
+        }),
+        "an unchanged live logger must remain installed across an unrelated generation reload:\n{rotated_contents}"
+    );
 }
 
 fn write_test_tls_material(directory: &TestDirectory) -> (std::path::PathBuf, std::path::PathBuf) {
@@ -393,7 +639,8 @@ fn mpp_server_config(
     let private_key = toml_path(private_key);
     format!(
         r#"
-log_level = "error"
+[logging]
+level = "error"
 
 [[credentials]]
 id = "daily-use"
@@ -431,6 +678,7 @@ protocol = "direct"
 
 fn routing_client_config(
     socks: SocketAddr,
+    management: SocketAddr,
     mpp: SocketAddr,
     failing_proxy: SocketAddr,
     working_proxy: SocketAddr,
@@ -439,7 +687,16 @@ fn routing_client_config(
     let certificate = toml_path(certificate);
     format!(
         r#"
-log_level = "error"
+[logging]
+level = "info"
+format = "json"
+console = false
+file = "product-flows.jsonl"
+flow_events = true
+
+[management]
+listen = ["{management}"]
+token = {{ from = "file", path = "operator-token.key" }}
 
 [[credentials]]
 id = "daily-use"
@@ -535,23 +792,36 @@ fn packaged_routing_exercises_reject_proxy_failover_mpp_and_direct_egress() {
     let directory = TestDirectory::new("routing");
     let mpp = unused_loopback_addr();
     let socks = unused_loopback_addr();
+    let management = unused_loopback_addr();
     let (failing_proxy, failing_task) = spawn_closing_proxy();
     let proxy_target = Ipv4Addr::new(8, 8, 8, 8);
     let (working_proxy, working_task) = spawn_echo_socks5_proxy(proxy_target, 443);
     let (direct_target, direct_task) = spawn_tcp_echo();
     let (certificate, private_key) = write_test_tls_material(&directory);
     directory.write("mpp-credential.key", "0123456789abcdef0123456789abcdef");
+    directory.write("operator-token.key", OPERATOR_TOKEN);
 
     let server_path = directory.write(
         "server.toml",
         &mpp_server_config(mpp, direct_target, &certificate, &private_key),
     );
-    let client_path = directory.write(
-        "client.toml",
-        &routing_client_config(socks, mpp, failing_proxy, working_proxy, &certificate),
+    let client_config = routing_client_config(
+        socks,
+        management,
+        mpp,
+        failing_proxy,
+        working_proxy,
+        &certificate,
     );
+    let client_path = directory.write("client.toml", &client_config);
+    let flow_log_path = directory.path().join("product-flows.jsonl");
+    let next_flow_log_path = directory.path().join("product-flows-next.jsonl");
     assert_check_config_ok(&server_path);
     assert_check_config_ok(&client_path);
+    assert!(
+        !flow_log_path.exists(),
+        "check-only validation must not create a configured log file"
+    );
 
     let mut server = MptunnelProcess::spawn(&server_path, directory.path().join("server.stderr"));
     wait_for_tcp(
@@ -567,18 +837,68 @@ fn packaged_routing_exercises_reject_proxy_failover_mpp_and_direct_egress() {
         PROCESS_START_TIMEOUT,
         "client SOCKS5 listener",
     );
+    wait_for_ready_management(
+        &mut client,
+        management,
+        OPERATOR_TOKEN,
+        PROCESS_START_TIMEOUT,
+    );
 
     let (_stream, rejected) = socks5_connect(socks, SocksTarget::Domain("blocked.example", 443))
         .expect("policy reject response");
     assert_eq!(rejected, 0x02);
 
-    socks5_round_trip(
-        socks,
-        SocksTarget::Ipv4(proxy_target, 443),
-        b"ping",
-        b"pong",
+    let (mut proxy_stream, proxy_reply) =
+        socks5_connect(socks, SocksTarget::Ipv4(proxy_target, 443))
+            .expect("ordered proxy failover connection");
+    assert_eq!(proxy_reply, 0x00);
+    let status = http_request(
+        management,
+        "GET",
+        "/api/v1/config",
+        Some(OPERATOR_TOKEN),
+        &[],
+        &[],
     )
-    .expect("ordered proxy failover round trip");
+    .expect("routing client config status")
+    .json();
+    let active_revision = status["active_revision"]
+        .as_str()
+        .expect("routing client active revision");
+    let next_client_config = client_config.replacen(
+        "file = \"product-flows.jsonl\"",
+        "file = \"product-flows-next.jsonl\"",
+        1,
+    );
+    let applied = http_request(
+        management,
+        "POST",
+        "/api/v1/config/apply",
+        Some(OPERATOR_TOKEN),
+        &[
+            ("Content-Type", "application/toml"),
+            ("If-Match", active_revision),
+        ],
+        next_client_config.as_bytes(),
+    )
+    .expect("live flow-logger update");
+    assert_eq!(
+        applied.status,
+        200,
+        "flow-logger apply was not live: body={}; client log:\n{}",
+        String::from_utf8_lossy(&applied.body),
+        client.log()
+    );
+    assert_eq!(applied.json()["activation"], "live-update");
+    proxy_stream
+        .write_all(b"ping")
+        .expect("send proxied payload after logging update");
+    let mut proxy_response = [0_u8; 4];
+    proxy_stream
+        .read_exact(&mut proxy_response)
+        .expect("receive proxied response after logging update");
+    assert_eq!(&proxy_response, b"pong");
+    drop(proxy_stream);
     join_thread(failing_task, "failing proxy");
     join_thread(working_task, "working proxy");
 
@@ -607,11 +927,104 @@ fn packaged_routing_exercises_reject_proxy_failover_mpp_and_direct_egress() {
     join_thread(direct_task, "direct target");
     client.assert_running("completed routing acceptance");
     server.assert_running("completed routing acceptance");
+
+    let deadline = Instant::now() + PROCESS_START_TIMEOUT;
+    let (old_flow_records, new_flow_records, flow_records) = loop {
+        client.assert_running("Product flow logging");
+        let old_contents = fs::read_to_string(&flow_log_path).unwrap_or_default();
+        let new_contents = fs::read_to_string(&next_flow_log_path).unwrap_or_default();
+        let old_records = old_contents
+            .lines()
+            .filter_map(|line| serde_json::from_str::<serde_json::Value>(line).ok())
+            .filter(|record| record["component"] == "flow")
+            .collect::<Vec<_>>();
+        let new_records = new_contents
+            .lines()
+            .filter_map(|line| serde_json::from_str::<serde_json::Value>(line).ok())
+            .filter(|record| record["component"] == "flow")
+            .collect::<Vec<_>>();
+        let records = old_records
+            .iter()
+            .cloned()
+            .chain(new_records.iter().cloned())
+            .collect::<Vec<_>>();
+        if records
+            .iter()
+            .filter(|record| record["event"] == "closed")
+            .count()
+            >= 2
+        {
+            break (old_records, new_records, records);
+        }
+        assert!(
+            Instant::now() < deadline,
+            "timed out waiting for Product flow log records; old:\n{old_contents}\nnew:\n{new_contents}"
+        );
+        thread::sleep(Duration::from_millis(25));
+    };
+    assert!(
+        new_flow_records
+            .iter()
+            .any(|record| record["event"] == "opened"),
+        "new flows must use the live-updated logging sink: {new_flow_records:#?}"
+    );
+    let proxy_flow_id = old_flow_records
+        .iter()
+        .find(|record| {
+            record["event"] == "opened"
+                && record["target"] == "8.8.8.8:443"
+                && record["outbound"] == "working-proxy"
+                && record["balancer"] == "native-failover"
+        })
+        .and_then(|record| record["flow_id"].as_str())
+        .expect("proxy-balancer flow-open record")
+        .to_string();
+    assert!(
+        old_flow_records.iter().any(|record| {
+            record["event"] == "closed"
+                && record["flow_id"] == proxy_flow_id
+                && record["outcome"] == "complete"
+                && record["to_peer_bytes"]
+                    .as_u64()
+                    .is_some_and(|bytes| bytes >= 4)
+                && record["from_peer_bytes"]
+                    .as_u64()
+                    .is_some_and(|bytes| bytes >= 4)
+        }),
+        "a flow opened before a live logging update must close in the same sink: {old_flow_records:#?}"
+    );
+    for record in &flow_records {
+        let object = record.as_object().expect("flow record object");
+        for forbidden in [
+            "principal",
+            "session_id",
+            "display_id",
+            "credential",
+            "secret",
+            "source_ip",
+            "carrier",
+        ] {
+            assert!(
+                !object.contains_key(forbidden),
+                "flow record leaked forbidden field {forbidden}: {record}"
+            );
+        }
+    }
+    let flow_log = format!(
+        "{}{}",
+        fs::read_to_string(&flow_log_path).expect("read original Product flow log"),
+        fs::read_to_string(&next_flow_log_path).expect("read updated Product flow log")
+    );
+    assert!(
+        !flow_log.contains("0123456789abcdef0123456789abcdef"),
+        "Product flow log leaked credential material"
+    );
 }
 
 fn split_dot_config() -> &'static str {
     r#"
-log_level = "error"
+[logging]
+level = "error"
 
 [dns]
 generation = 17

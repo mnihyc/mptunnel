@@ -1287,7 +1287,7 @@ mod tests {
 
     fn app_with_node(node: NodeConfig) -> AppConfig {
         AppConfig {
-            log_level: "info".to_owned(),
+            logging: crate::config::LoggingConfig::default(),
             check_config: false,
             service: ServiceConfig::default(),
             session: SessionConfig::default(),

@@ -54,7 +54,10 @@ impl CarrierNetworkProvider for AuthoritativeCarrierNetworkProvider {
 
 fn tun_host_runtime_config(host: TunHostConfig) -> AppConfig {
     AppConfig {
-        log_level: "off".to_string(),
+        logging: crate::config::LoggingConfig {
+            level: crate::config::LogLevel::Off,
+            ..crate::config::LoggingConfig::default()
+        },
         check_config: false,
         service: ServiceConfig::default(),
         session: SessionConfig::default(),

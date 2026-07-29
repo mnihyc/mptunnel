@@ -83,7 +83,7 @@ selected TOML document.
 
 | Path | Implemented responsibility |
 | --- | --- |
-| Root `log_level`, `check_config` | Logging and check-only startup. Runtime config apply rejects `check_config = true`. |
+| Root `check_config`, `[logging]` | Check-only startup plus typed level, format, console, file, and opt-in Product flow lifecycle records. Runtime config apply rejects `check_config = true`. |
 | `[[credentials]]` | Named MPP credential, principal, file/environment secret, optional expiry, revocation, and revocation grace. |
 | `[[local_users]]` | Named SOCKS5/HTTP CONNECT username/password mapped to a stable Product principal. |
 | `[service]` | Service intent and optional in-process generation supervision/backoff. It does not install a native service. |

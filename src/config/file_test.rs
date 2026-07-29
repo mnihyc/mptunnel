@@ -107,30 +107,81 @@ fn load_config_toml_str(contents: &str) -> Result<AppConfig, ConfigFileError> {
 }
 
 #[test]
-fn log_level_vocabulary_is_exact_and_case_sensitive() {
-    for level in ["off", "error", "warn", "info", "debug", "trace"] {
+fn logging_schema_is_typed_strict_and_config_relative() {
+    for (level, expected) in [
+        ("off", LogLevel::Off),
+        ("error", LogLevel::Error),
+        ("warn", LogLevel::Warn),
+        ("info", LogLevel::Info),
+        ("debug", LogLevel::Debug),
+        ("trace", LogLevel::Trace),
+    ] {
         let document = format!(
-            "log_level = {level:?}\n{TEST_CREDENTIAL_CATALOG}\n{}",
+            "[logging]\nlevel = {level:?}\n{TEST_CREDENTIAL_CATALOG}\n{}",
             managed_tun_document("")
         );
         assert_eq!(
             load_config_toml_str(&document)
                 .expect("supported log level")
-                .log_level,
-            level
+                .logging
+                .level,
+            expected
         );
     }
 
     for level in ["warning", "INFO", "verbose", ""] {
         let document = format!(
-            "log_level = {level:?}\n{TEST_CREDENTIAL_CATALOG}\n{}",
+            "[logging]\nlevel = {level:?}\n{TEST_CREDENTIAL_CATALOG}\n{}",
             managed_tun_document("")
         );
         assert!(matches!(
             load_config_toml_str(&document),
-            Err(ConfigFileError::Config(ConfigError::InvalidLogLevel(actual)))
-                if actual == level
+            Err(ConfigFileError::Toml(_))
         ));
+    }
+
+    for (format, expected) in [("text", LogFormat::Text), ("json", LogFormat::Json)] {
+        let document = format!(
+            "[logging]\nformat = {format:?}\n{TEST_CREDENTIAL_CATALOG}\n{}",
+            managed_tun_document("")
+        );
+        assert_eq!(
+            load_config_toml_str(&document)
+                .expect("supported log format")
+                .logging
+                .format,
+            expected
+        );
+    }
+
+    let directory = TestTlsDirectory::new();
+    let document = format!(
+        "[logging]\nformat = \"json\"\nconsole = false\nfile = \"logs/mptunnel.jsonl\"\nflow_events = true\n{TEST_CREDENTIAL_CATALOG}\n{}",
+        managed_tun_document("")
+    );
+    let config = super::load_config_toml_str_at(&document, &directory.path)
+        .expect("config-relative file logger");
+    assert_eq!(
+        config.logging.file,
+        Some(directory.path.join("logs/mptunnel.jsonl"))
+    );
+    assert!(config.logging.flow_events);
+
+    for logging in [
+        "log_level = \"info\"",
+        "[logging]\nconsole = false",
+        "[logging]\nfile = \"\"",
+        "[logging]\nlevel = \"warn\"\nflow_events = true",
+        "[logging]\nunknown = true",
+    ] {
+        let document = format!(
+            "{logging}\n{TEST_CREDENTIAL_CATALOG}\n{}",
+            managed_tun_document("")
+        );
+        assert!(
+            load_config_toml_str(&document).is_err(),
+            "invalid logging document was accepted: {logging}"
+        );
     }
 }
 
@@ -1347,6 +1398,16 @@ target = "mpp-main"
     assert_eq!(server.route_target.kind, RouteTargetKind::Outbound);
     assert_eq!(server.route_target.tag, "proxy-egress");
     assert_eq!(server.bind_paths.len(), 2);
+    assert_eq!(
+        node.dns_policy
+            .spec
+            .outbound_capabilities
+            .iter()
+            .map(|capability| capability.outbound.as_str())
+            .collect::<Vec<_>>(),
+        ["mpp-main", "proxy-egress"],
+        "compiled config identity must not depend on map iteration order"
+    );
     assert_eq!(
         server
             .dns_plan

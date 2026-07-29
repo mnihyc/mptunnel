@@ -15,6 +15,7 @@ use crate::transport::encrypted::{TcpClientTlsConfig, TcpServerTlsConfig};
 use ipnet::IpNet;
 use std::collections::{HashMap, HashSet};
 use std::net::SocketAddr;
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -43,10 +44,88 @@ pub const DEFAULT_SESSION_RETENTION_TIMEOUT_MS: u64 = 300_000;
 pub const DEFAULT_SESSION_RETENTION_TIMEOUT: Duration =
     Duration::from_millis(DEFAULT_SESSION_RETENTION_TIMEOUT_MS);
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+#[repr(u8)]
+pub enum LogLevel {
+    Off = 0,
+    Error = 1,
+    Warn = 2,
+    Info = 3,
+    Debug = 4,
+    Trace = 5,
+}
+
+impl LogLevel {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Off => "off",
+            Self::Error => "error",
+            Self::Warn => "warn",
+            Self::Info => "info",
+            Self::Debug => "debug",
+            Self::Trace => "trace",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum LogFormat {
+    #[default]
+    Text,
+    Json,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LoggingConfig {
+    /// Minimum process-event severity written to configured sinks.
+    pub level: LogLevel,
+    /// One stable record encoding shared by the console and file sinks.
+    pub format: LogFormat,
+    /// Write records to standard error.
+    pub console: bool,
+    /// Append records to this file. TOML paths are resolved beside the
+    /// canonical configuration document.
+    pub file: Option<PathBuf>,
+    /// Emit sanitized Product flow-open and flow-close records. This is
+    /// opt-in so normal forwarding never performs connection-log I/O.
+    pub flow_events: bool,
+}
+
+impl Default for LoggingConfig {
+    fn default() -> Self {
+        Self {
+            level: LogLevel::Info,
+            format: LogFormat::Text,
+            console: true,
+            file: None,
+            flow_events: false,
+        }
+    }
+}
+
+impl LoggingConfig {
+    pub(crate) fn validate(&self) -> Result<(), ConfigError> {
+        if self
+            .file
+            .as_ref()
+            .is_some_and(|path| path.as_os_str().is_empty())
+        {
+            return Err(ConfigError::LoggingFilePathEmpty);
+        }
+        if self.level != LogLevel::Off && !self.console && self.file.is_none() {
+            return Err(ConfigError::LoggingSinkRequired);
+        }
+        if self.flow_events && self.level < LogLevel::Info {
+            return Err(ConfigError::FlowEventsRequireInfo);
+        }
+        Ok(())
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AppConfig {
     /// Process-level logging/check behavior. It does not own protocol state.
-    pub log_level: String,
+    pub logging: LoggingConfig,
     pub check_config: bool,
     /// Process supervision behavior, separate from data-plane ownership.
     pub service: ServiceConfig,
@@ -64,12 +143,7 @@ pub struct AppConfig {
 
 impl AppConfig {
     pub fn validate(&self) -> Result<(), ConfigError> {
-        if !matches!(
-            self.log_level.as_str(),
-            "off" | "error" | "warn" | "info" | "debug" | "trace"
-        ) {
-            return Err(ConfigError::InvalidLogLevel(self.log_level.clone()));
-        }
+        self.logging.validate()?;
         self.service.validate()?;
         self.session.validate()?;
         self.resources.validate()?;
@@ -941,7 +1015,9 @@ fn validate_tun_l4(tun: &crate::ingress::tun::TunL4Config) -> Result<(), ConfigE
 pub enum ConfigError {
     Security(SecurityPolicyError),
     ProductAdmission(ProductAdmissionConfigError),
-    InvalidLogLevel(String),
+    LoggingFilePathEmpty,
+    LoggingSinkRequired,
+    FlowEventsRequireInfo,
     AuthFreshnessWindowZero,
     AuthenticationTimeoutZero,
     MaxPendingAuthenticationsZero,
@@ -1073,10 +1149,16 @@ impl std::fmt::Display for ConfigError {
         match self {
             Self::Security(err) => write!(f, "{err}"),
             Self::ProductAdmission(err) => write!(f, "{err}"),
-            Self::InvalidLogLevel(level) => write!(
-                f,
-                "invalid log level {level:?}; expected one of off, error, warn, info, debug, trace"
-            ),
+            Self::LoggingFilePathEmpty => write!(f, "logging file path must not be empty"),
+            Self::LoggingSinkRequired => {
+                write!(f, "enabled logging requires the console or file sink")
+            }
+            Self::FlowEventsRequireInfo => {
+                write!(
+                    f,
+                    "flow-event logging requires log level info, debug, or trace"
+                )
+            }
             Self::AuthFreshnessWindowZero => {
                 write!(f, "auth freshness window must be greater than zero")
             }

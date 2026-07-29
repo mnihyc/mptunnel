@@ -616,5 +616,5 @@ async fn close_client_tcp_path(
             .write_frame(&Frame::PathDrain { path_id })
             .await?;
     }
-    connection.carrier.close(path_id).await
+    connection.carrier.close_path(path_id).await
 }

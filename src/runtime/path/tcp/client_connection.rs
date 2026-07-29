@@ -107,17 +107,16 @@ impl ClientTcpCarrierConnection {
         Ok(())
     }
 
-    /// Closes a session-owning reliable carrier. Datagram-only attachments send
-    /// `PATH_CLOSE` directly because they must not terminate shared session state.
-    pub(in crate::runtime) async fn close(&mut self, path_id: PathId) -> Result<(), RuntimeError> {
+    /// Retires only this physical TCP carrier. Complete MPP session
+    /// termination belongs to the session owner and is never inferred from one
+    /// actor ending.
+    pub(in crate::runtime) async fn close_path(
+        &mut self,
+        path_id: PathId,
+    ) -> Result<(), RuntimeError> {
         self.writer
             .write_frame(&Frame::PathClose {
                 path_id,
-                reason: CloseReason::Normal,
-            })
-            .await?;
-        self.writer
-            .write_frame(&Frame::SessionClose {
                 reason: CloseReason::Normal,
             })
             .await?;

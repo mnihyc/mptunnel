@@ -352,6 +352,7 @@ fn encode_payload(
             payload,
         } => {
             encode_payload_bytes_len(payload.len(), limits)?;
+            validate_stream_data_extent(*offset, payload.len())?;
             put_u64(out, stream_id.0);
             put_u64(out, *offset);
             put_u32(out, payload.len() as u32);
@@ -558,6 +559,7 @@ fn decode_payload(
             let stream_id = StreamId(reader.get_u64()?);
             let offset = reader.get_u64()?;
             let payload = reader.get_bytes_u32(limits.max_payload_bytes)?;
+            validate_stream_data_extent(offset, payload.len())?;
             Ok(Frame::StreamData {
                 stream_id,
                 offset,
@@ -912,6 +914,14 @@ fn encode_stream_demand_hint(out: &mut Vec<u8>, demand: StreamDemandHint) {
             StreamDemandHint::Realtime => 3,
         },
     );
+}
+
+fn validate_stream_data_extent(offset: u64, payload_len: usize) -> Result<(), CodecError> {
+    let payload_len = u64::try_from(payload_len).map_err(|_| CodecError::LengthOverflow)?;
+    offset
+        .checked_add(payload_len)
+        .ok_or(CodecError::LengthOverflow)?;
+    Ok(())
 }
 
 fn decode_stream_demand_hint(reader: &mut Reader<'_>) -> Result<StreamDemandHint, CodecError> {

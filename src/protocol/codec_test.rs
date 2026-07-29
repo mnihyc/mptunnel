@@ -196,6 +196,42 @@ fn owned_single_frame_decode_slices_payload_without_copying() {
 }
 
 #[test]
+fn stream_data_encoder_rejects_offset_extent_overflow() {
+    assert_eq!(
+        encode_frame(
+            &Frame::StreamData {
+                stream_id: StreamId(7),
+                offset: u64::MAX,
+                payload: Bytes::from_static(b"x"),
+            },
+            CodecLimits::default(),
+        ),
+        Err(CodecError::LengthOverflow)
+    );
+}
+
+#[test]
+fn stream_data_decoder_rejects_offset_extent_overflow() {
+    let mut encoded = encode_frame(
+        &Frame::StreamData {
+            stream_id: StreamId(7),
+            offset: 0,
+            payload: Bytes::from_static(b"x"),
+        },
+        CodecLimits::default(),
+    )
+    .expect("encode canonical stream data");
+    let offset_start = FRAME_HEADER_LEN + std::mem::size_of::<u64>();
+    encoded[offset_start..offset_start + std::mem::size_of::<u64>()]
+        .copy_from_slice(&u64::MAX.to_be_bytes());
+
+    assert_eq!(
+        decode_frame_bytes(Bytes::from(encoded), CodecLimits::default()),
+        Err(CodecError::LengthOverflow)
+    );
+}
+
+#[test]
 fn datagram_flow_uses_compact_flow_id_after_open() {
     round_trip(Frame::OpenDatagramFlow {
         flow_id: DatagramFlowId(9),

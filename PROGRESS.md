@@ -11,6 +11,80 @@ Historical entries below are retained as evidence of the decisions made at
 their recorded time. When a later entry changes an earlier decision, the later
 entry is authoritative.
 
+## 2026-07-30T05:51:07+08:00: carrier endpoint port-set bootstrap
+
+- Name: select one concrete locator for each new TCP or QUIC carrier
+- Category: Product carrier configuration, bootstrap DNS, managed VPN, and
+  cross-platform transport boundary
+- State: committed and approved; complete Product and unchanged-Core
+  performance guards passed; periodic migration and the broader Product map
+  remain open
+- Source: clean commit `4d2a9915ecb10de58f216bb879f41a67555babc5`
+- Content:
+  - added a carrier-only endpoint model accepting one fixed nonzero port or one
+    inclusive ascending `START-END` interval without expanding the interval;
+  - retained the zero-entropy fixed-port path and used unbiased OS-entropy
+    rejection sampling for ranged endpoints;
+  - selected exactly once before each new physical TCP or QUIC carrier's DNS
+    resolution and retained that port across every address-family attempt;
+  - rejected carrier-provider answers that do not retain the selected port;
+  - changed prepared managed-VPN carrier state to store resolved IP addresses,
+    then materialize the selected port at runtime, preventing route publication
+    from freezing a future carrier's locator;
+  - kept proxy, DNS, target, and management endpoints single-port and rejected
+    ranged server bind paths in both Product validation and transport bind
+    boundaries; externally published range ports must forward to the fixed
+    listener;
+  - made doctor preserve and report the complete configured range while
+    skipping a direct probe that could not validate the deployment-owned
+    forwarding set; and
+  - clarified RFC locator/identity ownership without adding a wire field,
+    periodic timer, scheduler rule, or transport parameter.
+- Product and platform evidence:
+  - the complete suite passed: 1,386 library tests, two warmed allocation
+    contracts, all four packaged daily-use Product tests, doctests, formatting,
+    whitespace checks, and warnings-denied all-target/all-feature Clippy;
+  - durable tests cover strict fixed/ranged syntax, IPv6 authority rendering,
+    malformed and ambiguous rejection, CLI and TOML retention, inbound range
+    rejection, Product DNS selected-port preservation, port-neutral prepared
+    VPN snapshots, and doctor presentation;
+  - two independent reviews found no correctness, Product, Core-boundary, or
+    cross-platform blocker; and
+  - the neutral implementation and Windows cross-target all-target build pass.
+    macOS and Android require no platform-specific branch for this feature and
+    remain covered by the neutral provider contract pending native GitHub CI.
+- Performance boundary and evidence:
+  - no scheduler, congestion, pacing, recovery, wire framing, native transport
+    timing, payload path, or Core resource default changed;
+  - the clean native Linux release binary is SHA-256
+    `f97b516f27c2e4669805c1589e914ac27611aa7611f2e9ad0639cccaad973650`;
+  - on a valid settled host with identical client/server binary, diagnostics
+    disabled, isolated cases, 20-second load, and two flows, single/equal-fat
+    QUIC download measured `238.912`/`754.002` Mbps and upload measured
+    `247.307`/`705.742` Mbps;
+  - single upload retained the known one-second terminal-drain `loss` label and
+    did not change transport timing;
+  - two immediately adjacent, unchanged-binary equal-fat upload repeats had
+    exact finalized receiver accounting and measured `735.938` and `774.122`
+    Mbps. The recovery to the prior accepted `776.609` Mbps level proves the
+    first lower row was run variance rather than a reproducible Product-code
+    regression; and
+  - valid raw evidence remains under ignored
+    `./.tmp/lab/results/product-carrier-portset-20260730-valid/`,
+    `./.tmp/lab/results/product-carrier-portset-20260730-equal-upload-repeat/`,
+    and
+    `./.tmp/lab/results/product-carrier-portset-20260730-equal-upload-repeat-2/`.
+- Decision:
+  - approve per-establishment carrier locator selection with no reproducible
+    performance downgrade;
+  - retain Core and native transport authority unchanged; and
+  - implement periodic QUIC locator migration separately, while TCP rotation
+    waits for the authenticated bounded multi-carrier pool required by dynamic
+    TCP carrier scaling.
+- Next: establish the clean periodic QUIC port-migration lifecycle with the
+  user-required five-minute default for ranged endpoints, preserving one QUIC
+  connection and carrier instance.
+
 ## 2026-07-30T05:17:29+08:00: selection-local balancer failover deadlines
 
 - Name: preserve configured Product stages across pre-commit failover

@@ -722,6 +722,9 @@ fn decode_target(reader: &mut Reader<'_>, limits: CodecLimits) -> Result<TargetA
 }
 
 fn encode_socket_addr(out: &mut Vec<u8>, addr: &SocketAddr) -> Result<(), CodecError> {
+    if addr.port() == 0 {
+        return Err(CodecError::InvalidPort);
+    }
     match addr {
         SocketAddr::V4(addr) => {
             put_u8(out, 2);

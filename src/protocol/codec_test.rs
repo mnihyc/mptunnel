@@ -216,6 +216,31 @@ fn datagram_flow_uses_compact_flow_id_after_open() {
 }
 
 #[test]
+fn encoder_rejects_zero_port_ip_targets() {
+    for target in [
+        TargetAddr::Ip("192.0.2.1:0".parse().expect("IPv4 target")),
+        TargetAddr::Ip("[2001:db8::1]:0".parse().expect("IPv6 target")),
+    ] {
+        for frame in [
+            Frame::OpenStream {
+                stream_id: StreamId(7),
+                target: target.clone(),
+                demand: StreamDemandHint::Throughput,
+            },
+            Frame::OpenDatagramFlow {
+                flow_id: DatagramFlowId(9),
+                target: target.clone(),
+            },
+        ] {
+            assert_eq!(
+                encode_frame(&frame, CodecLimits::default()),
+                Err(CodecError::InvalidPort)
+            );
+        }
+    }
+}
+
+#[test]
 fn control_frames_round_trip_auth_and_path_metrics() {
     let nonce = AuthNonce([7; 16]);
     let auth_tag = AuthTag([9; 32]);

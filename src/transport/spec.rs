@@ -12,6 +12,55 @@ use std::time::Duration;
 
 pub const DEFAULT_CARRIER_PORT_HOP_INTERVAL_MS: u32 = 5 * 60 * 1_000;
 pub const MIN_CARRIER_PORT_HOP_INTERVAL_MS: u32 = 5 * 1_000;
+pub const DEFAULT_TCP_CARRIER_MIN: u16 = 1;
+pub const DEFAULT_TCP_CARRIER_MAX: u16 = 3;
+
+/// Inclusive local concurrency bounds for one configured TCP endpoint.
+///
+/// These values never enter MPP frames. Each member remains an independently
+/// authenticated carrier with its own `PathId` and physical lifetime.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct TcpCarrierRange {
+    min: u16,
+    max: u16,
+}
+
+impl TcpCarrierRange {
+    pub fn new(min: u16, max: u16) -> Result<Self, TcpCarrierRangeError> {
+        if min == 0 || min > max {
+            return Err(TcpCarrierRangeError);
+        }
+        Ok(Self { min, max })
+    }
+
+    pub const fn min(self) -> u16 {
+        self.min
+    }
+
+    pub const fn max(self) -> u16 {
+        self.max
+    }
+}
+
+impl Default for TcpCarrierRange {
+    fn default() -> Self {
+        Self {
+            min: DEFAULT_TCP_CARRIER_MIN,
+            max: DEFAULT_TCP_CARRIER_MAX,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct TcpCarrierRangeError;
+
+impl std::fmt::Display for TcpCarrierRangeError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("TCP carrier range must satisfy 1 <= MIN <= MAX <= 65535")
+    }
+}
+
+impl std::error::Error for TcpCarrierRangeError {}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Endpoint {
@@ -267,7 +316,9 @@ pub struct PathMetadata {
     pub initial_rate: RateHint,
     /// Optional product datagram ceiling. QUIC owns transport PMTU discovery.
     pub max_datagram_payload_bytes: Option<usize>,
-    /// Override for ranged QUIC destination-port migration.
+    /// Explicit TCP concurrency bounds. Absence selects the Product default.
+    pub tcp_carriers: Option<TcpCarrierRange>,
+    /// Override for ranged TCP or QUIC destination-port replacement.
     pub port_hop_interval_ms: Option<u32>,
 }
 
@@ -279,15 +330,22 @@ impl Default for PathMetadata {
             initial_jitter_ms: None,
             initial_rate: RateHint::Unknown,
             max_datagram_payload_bytes: None,
+            tcp_carriers: None,
             port_hop_interval_ms: None,
         }
     }
 }
 
 impl PathSpec {
-    /// Periodic destination-port migration applies only to ranged QUIC paths.
-    pub fn quic_port_hop_interval(&self) -> Option<Duration> {
-        (self.underlay == UnderlayProtocol::Udp && !self.endpoint.ports().is_single()).then(|| {
+    pub fn tcp_carrier_range(&self) -> Option<TcpCarrierRange> {
+        (self.underlay == UnderlayProtocol::Tcp)
+            .then_some(self.metadata.tcp_carriers.unwrap_or_default())
+    }
+
+    /// A ranged QUIC carrier migrates in place. A ranged TCP carrier uses this
+    /// interval to schedule bounded make-before-break replacement.
+    pub fn port_hop_interval(&self) -> Option<Duration> {
+        (!self.endpoint.ports().is_single()).then(|| {
             Duration::from_millis(u64::from(
                 self.metadata
                     .port_hop_interval_ms
@@ -320,10 +378,11 @@ impl FromStr for PathSpec {
         if underlay == UnderlayProtocol::Udp && metadata.policy.no_udp {
             return Err(PathSpecParseError::NoUdpOnUdpPath);
         }
-        if metadata.port_hop_interval_ms.is_some()
-            && (underlay != UnderlayProtocol::Udp || endpoint.ports().is_single())
-        {
-            return Err(PathSpecParseError::PortHopIntervalRequiresRangedUdpPath);
+        if underlay != UnderlayProtocol::Tcp && metadata.tcp_carriers.is_some() {
+            return Err(PathSpecParseError::TcpCarriersRequireTcpPath);
+        }
+        if metadata.port_hop_interval_ms.is_some() && endpoint.ports().is_single() {
+            return Err(PathSpecParseError::PortHopIntervalRequiresRangedPath);
         }
         Ok(Self {
             underlay,
@@ -345,6 +404,7 @@ fn parse_path_options(query: &str) -> Result<(PathBinding, PathMetadata), PathSp
     let mut jitter_set = false;
     let mut rate_set = false;
     let mut datagram_payload_limit_set = false;
+    let mut tcp_carriers_set = false;
     let mut port_hop_interval_set = false;
     for part in query.split('&') {
         if part.is_empty() {
@@ -413,6 +473,11 @@ fn parse_path_options(query: &str) -> Result<(PathBinding, PathMetadata), PathSp
                 datagram_payload_limit_set = true;
                 metadata.max_datagram_payload_bytes =
                     Some(parse_datagram_payload_limit(key, value)?);
+            }
+            "tcp-carriers" => {
+                reject_duplicate(tcp_carriers_set, key)?;
+                tcp_carriers_set = true;
+                metadata.tcp_carriers = Some(parse_tcp_carrier_range(key, value)?);
             }
             "port-hop-interval-ms" => {
                 reject_duplicate(port_hop_interval_set, key)?;
@@ -487,6 +552,33 @@ fn parse_port_hop_interval(key: &str, value: Option<&str>) -> Result<u32, PathSp
         ));
     }
     Ok(interval)
+}
+
+fn parse_tcp_carrier_range(
+    key: &str,
+    value: Option<&str>,
+) -> Result<TcpCarrierRange, PathSpecParseError> {
+    let value = value.ok_or_else(|| PathSpecParseError::MissingQueryParamValue(key.to_string()))?;
+    let Some((min, max)) = value.split_once('-') else {
+        return Err(PathSpecParseError::InvalidQueryParamValue(
+            key.to_string(),
+            value.to_string(),
+        ));
+    };
+    if min.is_empty() || max.is_empty() || max.contains('-') {
+        return Err(PathSpecParseError::InvalidQueryParamValue(
+            key.to_string(),
+            value.to_string(),
+        ));
+    }
+    let min = min.parse::<u16>().map_err(|_| {
+        PathSpecParseError::InvalidQueryParamValue(key.to_string(), value.to_string())
+    })?;
+    let max = max.parse::<u16>().map_err(|_| {
+        PathSpecParseError::InvalidQueryParamValue(key.to_string(), value.to_string())
+    })?;
+    TcpCarrierRange::new(min, max)
+        .map_err(|_| PathSpecParseError::InvalidQueryParamValue(key.to_string(), value.to_string()))
 }
 
 fn parse_bool_param(key: &str, value: Option<&str>) -> Result<bool, PathSpecParseError> {
@@ -604,7 +696,8 @@ pub enum PathSpecParseError {
     DuplicateQueryParam(String),
     QueryParamOverflow(String),
     NoUdpOnUdpPath,
-    PortHopIntervalRequiresRangedUdpPath,
+    TcpCarriersRequireTcpPath,
+    PortHopIntervalRequiresRangedPath,
 }
 
 impl From<CarrierEndpointParseError> for PathSpecParseError {
@@ -641,10 +734,12 @@ impl std::fmt::Display for PathSpecParseError {
                 write!(f, "path query parameter {key:?} is too large")
             }
             Self::NoUdpOnUdpPath => write!(f, "udp:// paths cannot set no-udp=true"),
-            Self::PortHopIntervalRequiresRangedUdpPath => write!(
-                f,
-                "port-hop-interval-ms requires a ranged udp:// carrier endpoint"
-            ),
+            Self::TcpCarriersRequireTcpPath => {
+                write!(f, "tcp-carriers requires a tcp:// carrier endpoint")
+            }
+            Self::PortHopIntervalRequiresRangedPath => {
+                write!(f, "port-hop-interval-ms requires a ranged carrier endpoint")
+            }
         }
     }
 }

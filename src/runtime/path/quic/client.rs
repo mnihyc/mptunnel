@@ -488,7 +488,7 @@ async fn connect_client_udp_path(
                 control_connection.close();
             }
         });
-        let port_migration_task = runtime.path().quic_port_hop_interval().map(|interval| {
+        let port_migration_task = runtime.path().port_hop_interval().map(|interval| {
             spawn_client_udp_port_migration(
                 runtime.clone(),
                 endpoint.clone(),

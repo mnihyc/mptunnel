@@ -867,9 +867,16 @@ fn validate_mpp_outbound(
     }
     validate_path_names(client.paths.iter().map(|path| path.name.as_str()))?;
     validate_client_security_config(&client.security)?;
-    if client.paths.len() > resources.max_paths {
+    let carrier_slots = client.paths.iter().fold(0usize, |total, path| {
+        total.saturating_add(
+            path.spec
+                .tcp_carrier_range()
+                .map_or(1, |range| usize::from(range.max())),
+        )
+    });
+    if carrier_slots > resources.max_paths {
         return Err(ConfigError::TooManyPaths {
-            actual: client.paths.len(),
+            actual: carrier_slots,
             limit: resources.max_paths,
         });
     }
@@ -960,6 +967,13 @@ fn validate_mpp_inbound(
         .any(|path| !path.spec.endpoint.ports().is_single())
     {
         return Err(ConfigError::ServerPathPortRange);
+    }
+    if server
+        .paths
+        .iter()
+        .any(|path| path.spec.metadata.tcp_carriers.is_some())
+    {
+        return Err(ConfigError::ServerTcpCarrierRange);
     }
     validate_server_security_config(&server.security)?;
     server
@@ -1108,6 +1122,7 @@ pub enum ConfigError {
     QuicTlsServerNameRequiresDns,
     ServerPathSourceBinding,
     ServerPathPortRange,
+    ServerTcpCarrierRange,
     TunAddressRequired,
     TunIpv4PrefixInvalid,
     TunIpv6PrefixInvalid,
@@ -1353,6 +1368,10 @@ impl std::fmt::Display for ConfigError {
             Self::ServerPathPortRange => write!(
                 f,
                 "server carrier paths require one listener port; forward any advertised port range to that listener"
+            ),
+            Self::ServerTcpCarrierRange => write!(
+                f,
+                "tcp-carriers is client endpoint policy and cannot configure a server listener"
             ),
             Self::TunAddressRequired => write!(f, "TUN L4 ingress requires IPv4 or IPv6 address"),
             Self::TunIpv4PrefixInvalid => write!(f, "TUN IPv4 prefix must be in 0..=32"),

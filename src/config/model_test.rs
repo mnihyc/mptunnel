@@ -192,6 +192,24 @@ fn udp_path_configuration_is_strict_and_requires_sni_identity() {
         validate_mpp_outbound(&outbound, ResourceLimits::default()),
         Err(ConfigError::QuicTlsServerNameRequiresDns)
     );
+
+    let mut outbound = outbound;
+    outbound.paths[0].spec = "tcp://127.0.0.1:443"
+        .parse()
+        .expect("default TCP carrier range");
+    let mut resources = ResourceLimits::default();
+    resources.max_paths = 2;
+    assert_eq!(
+        validate_mpp_outbound(&outbound, resources),
+        Err(ConfigError::TooManyPaths {
+            actual: 3,
+            limit: 2
+        })
+    );
+    outbound.paths[0].spec = "tcp://127.0.0.1:443?tcp-carriers=1-2"
+        .parse()
+        .expect("bounded TCP carrier range");
+    assert_eq!(validate_mpp_outbound(&outbound, resources), Ok(()));
 }
 
 #[test]
@@ -229,6 +247,13 @@ fn server_paths_reject_client_only_endpoint_options() {
             Err(ConfigError::ServerPathPortRange)
         );
     }
+    server.paths[0].spec = "tcp://127.0.0.1:443?tcp-carriers=1-3"
+        .parse()
+        .expect("client carrier policy");
+    assert_eq!(
+        validate_mpp_inbound(&server, ResourceLimits::default()),
+        Err(ConfigError::ServerTcpCarrierRange)
+    );
 }
 
 #[test]

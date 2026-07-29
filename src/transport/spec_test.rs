@@ -75,18 +75,40 @@ fn path_specs_parse_tcp_and_udp() {
     assert_eq!(ranged_udp.endpoint.ports().last(), 5010);
     assert_eq!(ranged_udp.endpoint.authority(), "[2001:db8::2]:5000-5010");
     assert_eq!(
-        ranged_udp.quic_port_hop_interval(),
+        ranged_udp.port_hop_interval(),
         Some(std::time::Duration::from_millis(
             DEFAULT_CARRIER_PORT_HOP_INTERVAL_MS.into()
         ))
     );
-    assert_eq!(ranged_tcp.quic_port_hop_interval(), None);
+    assert_eq!(
+        ranged_tcp.port_hop_interval(),
+        Some(std::time::Duration::from_millis(
+            DEFAULT_CARRIER_PORT_HOP_INTERVAL_MS.into()
+        ))
+    );
+    assert_eq!(
+        ranged_tcp.tcp_carrier_range(),
+        Some(TcpCarrierRange::new(1, 3).expect("default range"))
+    );
 
     let ranged_udp_with_interval = "udp://example.com:5000-5010?port-hop-interval-ms=45000"
         .parse::<PathSpec>()
         .expect("ranged UDP carrier with migration interval");
     assert_eq!(
-        ranged_udp_with_interval.quic_port_hop_interval(),
+        ranged_udp_with_interval.port_hop_interval(),
+        Some(std::time::Duration::from_millis(45_000))
+    );
+
+    let ranged_tcp_with_policy =
+        "tcp://example.com:5000-5010?tcp-carriers=2-5&port-hop-interval-ms=45000"
+            .parse::<PathSpec>()
+            .expect("ranged TCP carrier policy");
+    assert_eq!(
+        ranged_tcp_with_policy.tcp_carrier_range(),
+        Some(TcpCarrierRange::new(2, 5).expect("configured range"))
+    );
+    assert_eq!(
+        ranged_tcp_with_policy.port_hop_interval(),
         Some(std::time::Duration::from_millis(45_000))
     );
 }
@@ -104,10 +126,16 @@ fn path_specs_reject_ambiguous_values() {
         "tcp://example.com:-444",
         "tcp://example.com:443-444-445",
         "udp://2001:db8::1:443-444",
-        "tcp://example.com:443-444?port-hop-interval-ms=300000",
+        "tcp://example.com:443?port-hop-interval-ms=300000",
         "udp://example.com:443?port-hop-interval-ms=300000",
         "udp://example.com:443-444?port-hop-interval-ms=4999",
         "udp://example.com:443-444?port-hop-interval-ms=5000&port-hop-interval-ms=6000",
+        "udp://example.com:443-444?tcp-carriers=1-3",
+        "tcp://example.com:443?tcp-carriers=0-3",
+        "tcp://example.com:443?tcp-carriers=4-3",
+        "tcp://example.com:443?tcp-carriers=1",
+        "tcp://example.com:443?tcp-carriers=1-3-5",
+        "tcp://example.com:443?tcp-carriers=1-3&tcp-carriers=1-3",
     ] {
         assert!(
             invalid.parse::<PathSpec>().is_err(),

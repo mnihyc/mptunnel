@@ -357,6 +357,80 @@ async fn quic_carrier_round_trips_product_frames() {
 
     server_task.await.expect("server task");
 }
+
+#[tokio::test]
+async fn http_datagram_send_requires_an_open_request_send_side() {
+    let limits = CodecLimits::default();
+    let mux_limits = MuxLimits::default();
+    let server = Endpoint::bind_server(
+        "127.0.0.1:0".parse().expect("server addr"),
+        &crate::transport::encrypted::test_server_tls_config(),
+        super::super::test_candidate_verifier(),
+        mux_limits,
+    )
+    .await
+    .expect("server endpoint");
+    let server_addr = server.local_addr().expect("server local addr");
+    let (client_done_tx, client_done_rx) = tokio::sync::oneshot::channel();
+    let server_task = tokio::spawn(async move {
+        let connection = server.accept().await.expect("accepted connection");
+        let (_send, mut recv) = connection.accept_bi().await.expect("accepted stream");
+        assert!(matches!(
+            read_frame(&mut recv, limits)
+                .await
+                .expect("read datagram flow open"),
+            Frame::OpenDatagramFlow {
+                flow_id: DatagramFlowId(9),
+                ..
+            }
+        ));
+        let _ = timeout(Duration::from_secs(5), client_done_rx).await;
+    });
+
+    let client = Endpoint::bind_client(
+        "127.0.0.1:0".parse().expect("client addr"),
+        &crate::transport::encrypted::test_client_tls_config(),
+        super::super::test_candidate_selector(),
+        mux_limits,
+    )
+    .await
+    .expect("client endpoint");
+    let connection = client.connect(server_addr).await.expect("client connect");
+    let (mut send, _recv) = connection.open_bi().await.expect("client stream");
+    let target = TargetAddr::Ip("127.0.0.1:53".parse().expect("target"));
+    write_frame(
+        &mut send,
+        &Frame::OpenDatagramFlow {
+            flow_id: DatagramFlowId(9),
+            target,
+        },
+        limits,
+    )
+    .await
+    .expect("open native datagram flow");
+    finish_stream(&mut send)
+        .await
+        .expect("finish request send side");
+
+    assert!(matches!(
+        write_frame(
+            &mut send,
+            &Frame::DatagramData {
+                flow_id: DatagramFlowId(9),
+                datagram_id: DatagramId(1),
+                ttl_ms: 1_000,
+                payload: Bytes::from_static(b"late"),
+            },
+            limits,
+        )
+        .await,
+        Err(QuicCarrierError::H3StreamFinished)
+    ));
+
+    let _ = client_done_tx.send(());
+    server_task.await.expect("server task");
+}
+
 #[tokio::test]
 async fn stopped_quic_stream_write_keeps_the_shared_connection_available() {
     let limits = CodecLimits::default();

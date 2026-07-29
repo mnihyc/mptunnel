@@ -253,6 +253,9 @@ impl H3Presentation {
 
 impl H3SendStream {
     pub(super) async fn ensure_datagrams_negotiated(&mut self) -> Result<(), QuicCarrierError> {
+        if self.finished {
+            return Err(QuicCarrierError::H3StreamFinished);
+        }
         self.ensure_success_response().await?;
         // SETTINGS travels on an independent unidirectional stream and can be
         // reordered behind the request headers. Give the H3 driver a bounded

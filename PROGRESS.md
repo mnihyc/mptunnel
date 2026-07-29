@@ -11,6 +11,72 @@ Historical entries below are retained as evidence of the decisions made at
 their recorded time. When a later entry changes an earlier decision, the later
 entry is authoritative.
 
+## 2026-07-30T03:15:13+08:00: canonical Product configuration identities
+
+- Name: establish one strict public identity and cross-reference vocabulary
+- Category: Product configuration, management API, operations, and presentation
+- State: committed and approved; complete Product and affected performance
+  guards passed; the broader Product map remains open
+- Source: clean commit `9a289e7c8b116772c448a3a0e6b0c7173453c924`
+- Content:
+  - made `name` the explicit operator-owned configuration identity, `*_id`
+    protocol/credential/runtime identity, and `endpoint` the network
+    listener/connector/carrier address;
+  - replaced ambiguous egress references with typed `outbound` or `balancer`
+    fields and stable named MPP paths, peers, inbounds, DNS plans, principals,
+    credentials, publishers, and rule sets;
+  - removed anonymous path indices and implicit MPP egress ownership from
+    mutable Product surfaces without compatibility aliases;
+  - aligned the strict TOML model, simple CLI, runtime projection, management
+    API v2, dashboard, examples, public operations documentation, and lab
+    configuration generation; and
+  - confined runtime changes to Product metadata and lookup boundaries. No
+    scheduler, congestion, pacing, recovery, carrier, protocol, timing, or
+    transport-resource behavior changed.
+- Product evidence:
+  - the complete suite passed: 1,380 library tests, two allocation tests, and
+    all four daily-use Product acceptance tests;
+  - warnings-denied all-target/all-feature Clippy, formatting, whitespace,
+    dashboard JavaScript syntax, shell syntax, and all 18 durable lab-runner
+    contract tests passed;
+  - an independent final static audit found no stale live v1 management
+    endpoint, gateway collection, generic Product selector, index-based
+    mutation, ambiguous cross-reference, Core hot-path drift, or material test
+    weakening; and
+  - the intentional `/api/v1/status` rejection test and internal/native uses of
+    `selector`, `configured_index`, and `gateway` remain outside the public
+    Product vocabulary.
+- Performance boundary and evidence:
+  - the native Linux release binary is SHA-256
+    `ed931fec4b5dc9f96bbbd9235524c87a2817c0a8f385d642cef5955094f96bd7`;
+  - with a clean source, valid host, identical client/server binary,
+    diagnostics disabled, isolated cases, 20-second load, and two flows,
+    single/equal-fat QUIC download measured `252.939`/`733.331` Mbps and
+    upload measured `241.272`/`800.008` Mbps;
+  - the unchanged adjacent single-upload repeat measured `243.512` Mbps;
+  - all cited rows are performance-comparable and remain on the accepted
+    historical plateau;
+  - the single-upload duration workload retained valid target accounting but
+    was labelled `loss` because its streams had not emitted terminal closure
+    within the unchanged one-second drain boundary. The same label exists on
+    accepted `228.443`, `231.957`, and `232.781` Mbps historical rows, so it
+    is not a regression signal and no timeout or Core behavior was changed;
+    and
+  - raw evidence remains under ignored
+    `./.tmp/lab/results/product-config-v2-20260730/` and
+    `./.tmp/lab/results/product-config-v2-20260730-single-upload-repeat/`.
+- Decision:
+  - approve the canonical vocabulary slice with no observed performance
+    downgrade;
+  - retain one clean breaking configuration model with no compatibility
+    aliases; and
+  - keep the unchanged restored Core as the performance authority.
+- Next: implement demand-driven application-target DNS as an isolated Product
+  slice: preserve the canonical domain through MPP, SOCKS5, and HTTP CONNECT;
+  resolve only when IP routing, destination authorization, or the selected
+  native/interface egress requires an address; keep carrier/bootstrap DNS
+  separate; and retain receiving-end authorization without changing Core.
+
 ## 2026-07-30T02:07:54+08:00: transactional operator observability
 
 - Name: establish production logging and safe live configuration transactions

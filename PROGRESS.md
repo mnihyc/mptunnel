@@ -11,6 +11,71 @@ Historical entries below are retained as evidence of the decisions made at
 their recorded time. When a later entry changes an earlier decision, the later
 entry is authoritative.
 
+## 2026-07-30T05:17:29+08:00: selection-local balancer failover deadlines
+
+- Name: preserve configured Product stages across pre-commit failover
+- Category: Product balancer, target DNS, routing, and outbound correctness
+- State: committed and approved; complete Product and unchanged-Core
+  performance guards passed; the broader Product map remains open
+- Source: clean commit `80c557dcb653d018fe6aaf0b499569fb370e484a`
+- Content:
+  - replaced the registry-wide maximum timeout with independent, selected-graph
+    stages, so unrelated outbounds cannot lengthen or shorten an open;
+  - gave every local TCP/native UDP attempt its configured connect timeout and
+    every MPP TCP attempt its Product open timeout, including each later
+    balancer member and each post-resolution route group;
+  - retained target DNS as one flow-level stage under the selected DNS plan:
+    one failed dual-family lookup skips later IP-only members without another
+    lookup, while the canonical domain may continue to a remote-resolution
+    member;
+  - promoted a domain to authorized addresses only once after successful DNS
+    and never converted shared DNS failure into gateway-health failure;
+  - kept MPP UDP honest as a deferred first-send outcome rather than inventing
+    a pre-commit network-open deadline; and
+  - used checked per-stage deadline construction without an arbitrary aggregate
+    cap or a new production timing parameter.
+- Product evidence:
+  - a real silent SOCKS5 member retained its configured one-second connect
+    stage, then the ordered direct successor opened successfully;
+  - a two-IP-only-member DNS failure issued one dual-family flow lookup,
+    preserved the domain for a SOCKS5 successor, and recorded no false member
+    failure;
+  - two post-resolution address groups proved that a blackholed first group
+    cannot consume the second group's connect stage;
+  - the complete suite passed: 1,386 library tests, two warmed allocation
+    contracts, all four packaged daily-use Product tests, doctests, formatting,
+    whitespace checks, and warnings-denied all-target/all-feature Clippy; and
+  - two independent read-only reviews found no remaining material Product or
+    performance blocker after the identified DNS-repeat, unused-budget, and
+    MPP-UDP documentation issues were corrected.
+- Performance boundary and evidence:
+  - no scheduler, congestion, pacing, recovery, carrier, wire protocol,
+    transport timing parameter, payload path, or Core resource default changed;
+  - the clean native Linux release binary is SHA-256
+    `f9a7bc59b26c2349d523d8286c790e49fb63df191688167abb9b29d37bc47633`;
+  - on a valid settled host with matching client/server binary, diagnostics
+    disabled, isolated cases, 20-second load, and two flows, single/equal-fat
+    QUIC download measured `223.266`/`726.461` Mbps and upload measured
+    `234.078`/`776.609` Mbps;
+  - the unchanged adjacent single-download repeat measured `238.240` Mbps,
+    confirming the first row as ordinary shaped-link variance rather than a
+    reproducible Product-code regression; the adjacent prior accepted rows were
+    `245.735`/`758.115` Mbps download and `246.364`/`761.841` Mbps upload;
+  - equal-fat upload had exact finalized receiver accounting. Single upload
+    delivered the complete probe-visible payload but retained the known
+    one-second terminal-drain `loss` label; no timeout was changed; and
+  - valid raw evidence remains under ignored
+    `./.tmp/lab/results/product-balancer-deadlines-20260730-valid/` and
+    `./.tmp/lab/results/product-balancer-deadlines-20260730-single-download-repeat/`.
+- Decision:
+  - approve selection-local Product stage ownership with no reproducible
+    performance downgrade;
+  - retain the Core unchanged; and
+  - continue the remaining daily-use Product map.
+- Next: establish a bounded endpoint port-set model and select one concrete
+  locator for each new TCP/QUIC carrier before adding periodic hopping
+  lifecycle behavior.
+
 ## 2026-07-30T04:23:01+08:00: demand-driven application-target DNS
 
 - Name: separate target representation, routing evidence, and resolver

@@ -1,8 +1,8 @@
 //! Server listener composition; carrier loops remain under `runtime::path`.
 
+use crate::config::{EgressRef, NamedPathConfig, ServerSecurityConfig};
 #[cfg(test)]
 use crate::config::{ManagementConfig, ServerDestinationAclConfig, SessionConfig};
-use crate::config::{RouteTarget, ServerSecurityConfig};
 use crate::outbound;
 #[cfg(test)]
 use crate::outbound::OutboundConfig;
@@ -33,8 +33,10 @@ use crate::runtime::relay::{ServerReliableRelayContext, ServerReliableRelayServi
 use crate::runtime::telemetry::RuntimeTelemetry;
 #[cfg(test)]
 use crate::runtime::telemetry::active_flow_detail_capacity;
+#[cfg(test)]
+use crate::transport::PathSpec;
 use crate::transport::encrypted::TcpServerTlsConfig;
-use crate::transport::{PathSpec, tcp};
+use crate::transport::tcp;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use tokio::net::TcpListener;
@@ -80,13 +82,17 @@ pub(in crate::runtime) async fn run(
             .map_err(|error| RuntimeError::ProductPolicy(error.to_string()))?,
     ));
     let runtime = new_identity_runtime_with_metadata(
-        None,
-        path_specs,
+        "test-mpp-inbound".to_string(),
+        path_specs
+            .into_iter()
+            .enumerate()
+            .map(|(index, spec)| NamedPathConfig {
+                name: format!("path-{}", index + 1),
+                spec,
+            })
+            .collect(),
         registry,
-        RouteTarget {
-            kind: crate::config::RouteTargetKind::Outbound,
-            tag: id.as_str().to_string(),
-        },
+        EgressRef::Outbound(id),
         None,
         destination_policy,
         security,
@@ -173,13 +179,17 @@ pub(in crate::runtime) fn new_identity_runtime(
     )
     .expect("test outbound registry");
     new_identity_runtime_with_metadata(
-        None,
-        server_paths,
+        "test-mpp-inbound".to_string(),
+        server_paths
+            .into_iter()
+            .enumerate()
+            .map(|(index, spec)| NamedPathConfig {
+                name: format!("path-{}", index + 1),
+                spec,
+            })
+            .collect(),
         registry,
-        RouteTarget {
-            kind: crate::config::RouteTargetKind::Outbound,
-            tag: id.as_str().to_string(),
-        },
+        EgressRef::Outbound(id),
         None,
         destination_policy,
         security,
@@ -195,10 +205,10 @@ pub(in crate::runtime) fn new_identity_runtime(
 
 #[allow(clippy::too_many_arguments)]
 pub(super) fn new_identity_runtime_with_metadata(
-    tag: Option<String>,
-    server_paths: Vec<PathSpec>,
+    name: String,
+    configured_paths: Vec<NamedPathConfig>,
     outbound_registry: RuntimeOutboundRegistry,
-    route_target: RouteTarget,
+    egress: EgressRef,
     dns_plan: Option<crate::product::DnsPlanId>,
     destination_policy: Arc<ServerDestinationPolicy>,
     security: ServerSecurityConfig,
@@ -209,13 +219,17 @@ pub(super) fn new_identity_runtime_with_metadata(
     session_retention_timeout: Duration,
     allow_peer_diagnostics: bool,
 ) -> Result<ServerIdentityRuntime, RuntimeError> {
-    let outbound_selector = outbound_registry.selector_for_target(&route_target)?;
-    outbound_registry.ensure_native_selector(&outbound_selector)?;
+    let (configured_path_names, server_paths): (Vec<_>, Vec<_>) = configured_paths
+        .into_iter()
+        .map(|path| (path.name, path.spec))
+        .unzip();
+    let egress_selection = outbound_registry.selection_for_egress(&egress)?;
+    outbound_registry.ensure_native_egress(&egress_selection)?;
     let mux_limits = resources.into();
     let (reliable_streams, reliable_relay) =
         ServerReliableRelayService::new(ServerReliableRelayContext {
             outbound_registry: outbound_registry.clone(),
-            outbound_selector: outbound_selector.clone(),
+            egress_selection: egress_selection.clone(),
             dns_plan: dns_plan.clone(),
             destination_policy: destination_policy.clone(),
             performance,
@@ -238,7 +252,7 @@ pub(super) fn new_identity_runtime_with_metadata(
             }));
     let datagram_port = ServerDatagramService::path_port(ServerDatagramServiceConfig {
         outbound_registry,
-        outbound_selector,
+        egress_selection,
         dns_plan,
         destination_policy,
         session_retention_timeout,
@@ -249,7 +263,8 @@ pub(super) fn new_identity_runtime_with_metadata(
     let credential_admission = ProductCredentialAdmission::from_security(&security);
     let pending_authentications = Arc::new(Semaphore::new(security.max_pending_authentications));
     let paths = ServerPathContext {
-        tag,
+        name,
+        configured_path_names: Arc::new(configured_path_names),
         server_paths: Arc::new(server_paths),
         codec_limits: resources.into(),
         mux_limits,

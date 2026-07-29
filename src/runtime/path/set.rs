@@ -11,12 +11,13 @@ use super::state::ClientPathState;
 use super::tcp::client::{
     ClientTcpPathSessionHandle, ClientTcpPathSessionRuntime, tcp_session_command_queue,
 };
-use crate::config::{ClientPathConfig, ClientSecurityConfig, RouteTarget};
+use crate::config::{ClientPathConfig, ClientSecurityConfig};
 #[cfg(test)]
 use crate::ingress::ProxyAuthConfig;
 use crate::model::path::RelayPathKey;
 use crate::mux::MuxLimits;
 use crate::performance::ResourceLimits;
+use crate::product::OutboundId;
 use crate::protocol::codec::CodecLimits;
 use crate::protocol::{
     PathMetricDirection, PathUsage, PeerPathState, PeerPathStatus, SessionId, UnderlayProtocol,
@@ -46,13 +47,17 @@ pub(in crate::runtime) struct ClientPathRuntimeOptions {
 
 #[derive(Clone)]
 pub struct ClientPathContext {
-    // The route target identifies this MPP outbound. Local inbound inventory
-    // is generation-owned and deliberately absent from carrier context.
-    pub(in crate::runtime) route_target: Option<RouteTarget>,
+    // Stable configured Product name of this MPP outbound. Local inbound
+    // inventory is generation-owned and deliberately absent from carrier
+    // context.
+    pub(in crate::runtime) outbound: Option<OutboundId>,
     // Carrier ownership: path specs, per-path security, and live sessions belong
     // to the MPP session's carrier path registry, not to individual streams.
     pub(in crate::runtime) tcp_paths: Arc<Vec<PathSpec>>,
     pub(in crate::runtime) udp_paths: Arc<Vec<PathSpec>>,
+    /// Stable Product names aligned with each underlay-local path vector.
+    pub(in crate::runtime) tcp_path_names: Arc<Vec<String>>,
+    pub(in crate::runtime) udp_path_names: Arc<Vec<String>>,
     pub(in crate::runtime) tcp_path_ordinals: Arc<Vec<usize>>,
     pub(in crate::runtime) udp_path_ordinals: Arc<Vec<usize>>,
     pub(in crate::runtime) path_group_ordinal: usize,
@@ -104,26 +109,28 @@ impl ClientPathContext {
     ) -> Result<Self, RuntimeError> {
         let paths = paths
             .into_iter()
-            .map(|spec| ClientPathConfig {
+            .enumerate()
+            .map(|(index, spec)| ClientPathConfig {
+                name: format!("path-{}", index + 1),
                 tls: crate::transport::encrypted::test_client_tls_config(),
                 spec,
                 security: security.clone(),
             })
             .collect();
-        Self::new_with_path_configs_and_target(paths, resources, proxy_auth, None)
+        Self::new_with_path_configs_and_outbound(paths, resources, proxy_auth, None)
     }
 
     #[cfg(test)]
-    pub fn new_with_path_configs_and_target(
+    pub fn new_with_path_configs_and_outbound(
         paths: Vec<ClientPathConfig>,
         resources: ResourceLimits,
         proxy_auth: ProxyAuthConfig,
-        route_target: Option<RouteTarget>,
+        outbound: Option<OutboundId>,
     ) -> Result<Self, RuntimeError> {
         let mut context = Self::new_with_carrier_network(
             paths,
             resources,
-            route_target,
+            outbound,
             0,
             Arc::new(SystemCarrierNetworkProvider),
         )?;
@@ -135,14 +142,14 @@ impl ClientPathContext {
     pub fn new_with_carrier_network(
         paths: Vec<ClientPathConfig>,
         resources: ResourceLimits,
-        route_target: Option<RouteTarget>,
+        outbound: Option<OutboundId>,
         path_group_ordinal: usize,
         carrier_network: Arc<dyn CarrierNetworkProvider>,
     ) -> Result<Self, RuntimeError> {
         Self::new_with_runtime_options(
             paths,
             resources,
-            route_target,
+            outbound,
             ClientPathRuntimeOptions {
                 session_retention_timeout: crate::config::DEFAULT_SESSION_RETENTION_TIMEOUT,
                 path_group_ordinal,
@@ -156,23 +163,17 @@ impl ClientPathContext {
     pub(in crate::runtime) fn new_with_runtime_options(
         paths: Vec<ClientPathConfig>,
         resources: ResourceLimits,
-        route_target: Option<RouteTarget>,
+        outbound: Option<OutboundId>,
         runtime: ClientPathRuntimeOptions,
     ) -> Result<Self, RuntimeError> {
         let telemetry = RuntimeTelemetry::new(active_flow_detail_capacity(resources.max_streams));
-        Self::new_with_runtime_options_and_telemetry(
-            paths,
-            resources,
-            route_target,
-            runtime,
-            telemetry,
-        )
+        Self::new_with_runtime_options_and_telemetry(paths, resources, outbound, runtime, telemetry)
     }
 
     pub(in crate::runtime) fn new_with_runtime_options_and_telemetry(
         paths: Vec<ClientPathConfig>,
         resources: ResourceLimits,
-        route_target: Option<RouteTarget>,
+        outbound: Option<OutboundId>,
         runtime: ClientPathRuntimeOptions,
         telemetry: RuntimeTelemetry,
     ) -> Result<Self, RuntimeError> {
@@ -186,27 +187,32 @@ impl ClientPathContext {
             return Err(RuntimeError::PathIdOverflow);
         }
         let mut tcp_paths = Vec::new();
+        let mut tcp_path_names = Vec::new();
         let mut tcp_path_ordinals = Vec::new();
         let mut tcp_security = Vec::new();
         let mut tcp_tls = Vec::new();
         let mut udp_paths = Vec::new();
+        let mut udp_path_names = Vec::new();
         let mut udp_path_ordinals = Vec::new();
         let mut udp_security = Vec::new();
         let mut udp_tls = Vec::new();
         for (ordinal, path) in paths.into_iter().enumerate() {
             let ClientPathConfig {
+                name,
                 spec,
                 security,
                 tls,
             } = path;
             match spec.underlay {
                 UnderlayProtocol::Tcp => {
+                    tcp_path_names.push(name);
                     tcp_path_ordinals.push(ordinal);
                     tcp_paths.push(spec);
                     tcp_security.push(security);
                     tcp_tls.push(tls);
                 }
                 UnderlayProtocol::Udp => {
+                    udp_path_names.push(name);
                     udp_path_ordinals.push(ordinal);
                     udp_paths.push(spec);
                     udp_security.push(security);
@@ -217,10 +223,12 @@ impl ClientPathContext {
         // Context and carrier actors share one immutable configuration backing;
         // reconnecting a session must not deep-copy endpoint or secret material.
         let tcp_paths = Arc::new(tcp_paths);
+        let tcp_path_names = Arc::new(tcp_path_names);
         let tcp_path_ordinals = Arc::new(tcp_path_ordinals);
         let tcp_security = Arc::new(tcp_security);
         let tcp_tls = Arc::new(tcp_tls);
         let udp_paths = Arc::new(udp_paths);
+        let udp_path_names = Arc::new(udp_path_names);
         let udp_path_ordinals = Arc::new(udp_path_ordinals);
         let udp_security = Arc::new(udp_security);
         let udp_tls = Arc::new(udp_tls);
@@ -301,9 +309,11 @@ impl ClientPathContext {
             })
             .collect::<Vec<_>>();
         Ok(Self {
-            route_target,
+            outbound,
             tcp_paths,
             udp_paths,
+            tcp_path_names,
+            udp_path_names,
             tcp_path_ordinals,
             udp_path_ordinals,
             path_group_ordinal,

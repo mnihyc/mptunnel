@@ -57,7 +57,7 @@ use crate::protocol::frame::{
 use crate::protocol::{Frame, OffsetRange, ResetReason, SessionId, StreamId, UnderlayProtocol};
 use crate::runtime::RuntimeError;
 use crate::runtime::outbound_registry::{
-    OpenedTcpOutbound, OutboundSelector, RuntimeOutboundRegistry, finish_gateway_flow,
+    EgressSelection, OpenedTcpOutbound, RuntimeOutboundRegistry, finish_gateway_flow,
 };
 use crate::runtime::path::PathDeliveryStats;
 use crate::runtime::sender::{
@@ -81,7 +81,7 @@ use tokio::task::{Id, JoinError, JoinSet};
 
 pub(in crate::runtime) struct ServerReliableRelayContext {
     pub(in crate::runtime) outbound_registry: RuntimeOutboundRegistry,
-    pub(in crate::runtime) outbound_selector: OutboundSelector,
+    pub(in crate::runtime) egress_selection: EgressSelection,
     pub(in crate::runtime) dns_plan: Option<DnsPlanId>,
     pub(in crate::runtime) destination_policy: Arc<ServerDestinationPolicy>,
     pub(in crate::runtime) performance: MppPerformanceConfig,
@@ -211,7 +211,7 @@ async fn relay_accepted_stream(
     let outbound_stream = match context
         .outbound_registry
         .open_tcp(
-            &context.outbound_selector,
+            &context.egress_selection,
             &target,
             context.dns_plan.as_ref(),
             TrafficClass::Latency,

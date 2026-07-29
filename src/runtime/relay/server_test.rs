@@ -61,15 +61,12 @@ async fn server_relay_expires_only_after_its_absolute_no_output_interval() {
         crate::runtime::outbound_registry::test_dns_generation(),
     )
     .expect("registry");
-    let outbound_selector = outbound_registry
-        .selector_for_target(&crate::config::RouteTarget {
-            kind: crate::config::RouteTargetKind::Outbound,
-            tag: id.as_str().to_string(),
-        })
-        .expect("selector");
+    let egress_selection = outbound_registry
+        .selection_for_egress(&crate::config::EgressRef::Outbound(id))
+        .expect("selection");
     let context = ServerReliableRelayContext {
         outbound_registry,
-        outbound_selector,
+        egress_selection,
         dns_plan: None,
         destination_policy: Arc::new(
             crate::outbound::ServerDestinationPolicy::allow_restricted_for_test(),

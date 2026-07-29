@@ -5,7 +5,7 @@
 //! locks or mutable carrier state.
 
 use super::ManagementTarget;
-use super::gateway::collect_gateway_statuses;
+use super::gateway::collect_balancer_statuses;
 use super::schema::{
     ManagementAdmission, ManagementAdmissionLimits, ManagementAdmissionRejections,
     ManagementControlStatus, ManagementControls, ManagementDiagnostics, ManagementFlowStatus,
@@ -57,19 +57,19 @@ pub(super) fn collect_snapshot(
         .iter()
         .map(|context| context.server_paths.len())
         .sum();
-    let gateways = match collect_gateway_statuses(target.gateway_control.as_ref()) {
-        Ok(gateways) => gateways,
+    let balancers = match collect_balancer_statuses(target.gateway_control.as_ref()) {
+        Ok(balancers) => balancers,
         Err(error) => {
             crate::observability::process_event!(
                 Warn,
                 "management",
-                "gateway_snapshot_unavailable",
-                "gateway management snapshot unavailable: {error:?}"
+                "balancer_snapshot_unavailable",
+                "balancer management snapshot unavailable: {error:?}"
             );
             Vec::new()
         }
     };
-    services.gateway_balancers = gateways.len();
+    services.balancers = balancers.len();
     for (index, context) in target.clients.iter().enumerate() {
         collect_client(
             context,
@@ -79,21 +79,21 @@ pub(super) fn collect_snapshot(
             &mut session_inventory,
             now,
         );
-        let tag = context
-            .route_target
+        let service_name = context
+            .outbound
             .as_ref()
-            .map(|target| target.tag.clone());
+            .map(|outbound| outbound.as_str().to_string());
         peer_sessions.extend(service_peer_sessions(
             &context.peer_status,
             "mpp_outbound",
             index,
-            tag.clone(),
+            service_name.clone(),
         ));
         peer_results.extend(latest_peer_results(
             &context.peer_status,
             "mpp_outbound",
             index,
-            tag,
+            service_name,
         ));
     }
     for (index, context) in target.servers.iter().enumerate() {
@@ -109,13 +109,13 @@ pub(super) fn collect_snapshot(
             &context.peer_status,
             "mpp_inbound",
             index,
-            context.tag.clone(),
+            Some(context.name.clone()),
         ));
         peer_results.extend(latest_peer_results(
             &context.peer_status,
             "mpp_inbound",
             index,
-            context.tag.clone(),
+            Some(context.name.clone()),
         ));
     }
     telemetry.add(target.product_telemetry.snapshot(), now);
@@ -151,24 +151,24 @@ pub(super) fn collect_snapshot(
     let controls = ManagementControls {
         path: ManagementControlStatus {
             supported: services.mpp_outbounds > 0,
-            endpoint: (services.mpp_outbounds > 0).then_some("POST /api/v1/actions/path"),
+            operation: (services.mpp_outbounds > 0).then_some("POST /api/v2/actions/path"),
             reason: (services.mpp_outbounds == 0)
                 .then_some("path control requires a local inbound service with an MPP outbound"),
         },
-        gateway: ManagementControlStatus {
+        balancer: ManagementControlStatus {
             supported: target.gateway_control.is_some(),
-            endpoint: target
+            operation: target
                 .gateway_control
                 .is_some()
-                .then_some("POST /api/v1/gateways/actions"),
+                .then_some("POST /api/v2/balancers/actions"),
             reason: target
                 .gateway_control
                 .is_none()
-                .then_some("gateway control requires a configured Product balancer"),
+                .then_some("balancer control requires a configured Product balancer"),
         },
         peer_diagnostics: ManagementControlStatus {
             supported: !peer_sessions.is_empty(),
-            endpoint: (!peer_sessions.is_empty()).then_some("POST /api/v1/diagnostics/peer"),
+            operation: (!peer_sessions.is_empty()).then_some("POST /api/v2/diagnostics/peer"),
             reason: peer_sessions
                 .is_empty()
                 .then_some("no authenticated peer control carrier is currently available"),
@@ -203,10 +203,10 @@ pub(super) fn collect_snapshot(
         .enumerate()
         .map(|(service_index, inbound)| ManagementIngressStatus {
             service_index,
-            tag: inbound.tag.clone(),
+            name: inbound.name.clone(),
             protocol: inbound.protocol,
             listen: inbound.listen.clone(),
-            name: inbound.name.clone(),
+            interface_name: inbound.interface_name.clone(),
             target: inbound.target.clone(),
             auth_required: inbound.auth_required,
         })
@@ -216,7 +216,7 @@ pub(super) fn collect_snapshot(
         .outbounds
         .iter()
         .map(|outbound| ManagementOutboundStatus {
-            tag: outbound.id.as_str().to_string(),
+            name: outbound.id.as_str().to_string(),
             protocol: outbound.protocol,
             networks: outbound
                 .networks
@@ -238,7 +238,7 @@ pub(super) fn collect_snapshot(
         summary,
         admission,
         traffic,
-        gateways,
+        balancers,
         paths,
         sessions,
         flows,
@@ -285,7 +285,7 @@ fn service_peer_sessions(
     broker: &PeerStatusBroker,
     service: &'static str,
     service_index: usize,
-    service_tag: Option<String>,
+    service_name: Option<String>,
 ) -> Vec<ManagementPeerSession> {
     broker
         .session_ids()
@@ -293,7 +293,7 @@ fn service_peer_sessions(
         .map(|session_id| ManagementPeerSession {
             service,
             service_index,
-            service_tag: service_tag.clone(),
+            service_name: service_name.clone(),
             session_id: session_id.0.to_string(),
             carrier_count: broker.carrier_count(session_id),
         })
@@ -304,13 +304,13 @@ fn latest_peer_results(
     broker: &PeerStatusBroker,
     service: &'static str,
     service_index: usize,
-    service_tag: Option<String>,
+    service_name: Option<String>,
 ) -> Vec<ManagementPeerStatusResult> {
     broker
         .session_ids()
         .into_iter()
         .filter_map(|session_id| broker.latest(session_id))
-        .map(|result| peer_status_result(result, service, service_index, service_tag.clone()))
+        .map(|result| peer_status_result(result, service, service_index, service_name.clone()))
         .collect()
 }
 
@@ -318,7 +318,7 @@ pub(super) fn peer_status_result(
     result: PeerStatusResult,
     service: &'static str,
     service_index: usize,
-    service_tag: Option<String>,
+    service_name: Option<String>,
 ) -> ManagementPeerStatusResult {
     let received_unix_ms = result
         .received_at
@@ -329,7 +329,7 @@ pub(super) fn peer_status_result(
     ManagementPeerStatusResult {
         service,
         service_index,
-        service_tag,
+        service_name,
         session_id: result.session_id.0.to_string(),
         request_id: result.request_id.to_string(),
         code: peer_status_code_name(result.code),
@@ -469,16 +469,16 @@ fn collect_client(
     sessions: &mut SessionInventory,
     now: Instant,
 ) {
-    let tag = context
-        .route_target
+    let service_name = context
+        .outbound
         .as_ref()
-        .map(|target| target.tag.clone());
+        .map(|outbound| outbound.as_str().to_string());
     let session_id = context.session_id.0.to_string();
     let carrier_count = context.peer_status.carrier_count(context.session_id);
     sessions.insert(
         "mpp_outbound",
         service_index,
-        tag.clone(),
+        service_name.clone(),
         session_id,
         if carrier_count > 0 {
             "connected"
@@ -496,21 +496,23 @@ fn collect_client(
     );
     let health = context.health().lock().expect("client path health lock");
     paths.extend(client_path_set(
+        &context.tcp_path_names,
         &context.tcp_paths,
         &health.tcp,
         UnderlayProtocol::Tcp,
         service_index,
-        tag.clone(),
+        service_name.clone(),
         context.session_id.0,
         summary,
         now,
     ));
     paths.extend(client_path_set(
+        &context.udp_path_names,
         &context.udp_paths,
         &health.udp,
         UnderlayProtocol::Udp,
         service_index,
-        tag.clone(),
+        service_name,
         context.session_id.0,
         summary,
         now,
@@ -520,11 +522,12 @@ fn collect_client(
 
 #[allow(clippy::too_many_arguments)]
 fn client_path_set(
+    names: &[String],
     specs: &[PathSpec],
     records: &[ClientPathHealthRecord],
     underlay: UnderlayProtocol,
     service_index: usize,
-    service_tag: Option<String>,
+    service_name: Option<String>,
     session_id: u64,
     summary: &mut NumericSummary,
     now: Instant,
@@ -533,6 +536,10 @@ fn client_path_set(
         .iter()
         .enumerate()
         .map(|(index, spec)| {
+            let path = names
+                .get(index)
+                .expect("client path names align with underlay-local path inventory")
+                .clone();
             let observation = records
                 .get(index)
                 .map(|record| record.observation_at(now))
@@ -540,18 +547,14 @@ fn client_path_set(
             let snapshot = path_snapshot(spec, index, observation);
             summary.add_path(snapshot, observation.manual_disabled);
             ManagementPathStatus {
-                id: format!(
-                    "outbound:{service_index}:{}:{index}",
-                    underlay_name(underlay)
-                ),
                 service: "mpp_outbound",
                 service_index,
-                service_tag: service_tag.clone(),
+                service_name: service_name.clone(),
                 session_id: Some(session_id.to_string()),
+                path,
                 underlay: underlay_name(underlay),
                 path_id: Some(snapshot.id.0.to_string()),
                 path_instance_id: None,
-                configured_index: Some(index),
                 endpoint: Some(path_endpoint(spec)),
                 state: if observation.manual_disabled {
                     "disabled"
@@ -606,18 +609,22 @@ fn collect_server(
     summary.configured_path_count = summary
         .configured_path_count
         .saturating_add(context.server_paths.len());
-    let tag = context.tag.clone();
+    let service_name = Some(context.name.clone());
     for (index, spec) in context.server_paths.iter().enumerate() {
+        let path = context
+            .configured_path_names
+            .get(index)
+            .expect("server path names align with configured path inventory")
+            .clone();
         paths.push(ManagementPathStatus {
-            id: format!("inbound:{service_index}:listener:{index}"),
             service: "mpp_inbound",
             service_index,
-            service_tag: tag.clone(),
+            service_name: service_name.clone(),
             session_id: None,
+            path,
             underlay: underlay_name(spec.underlay),
             path_id: None,
             path_instance_id: None,
-            configured_index: Some(index),
             endpoint: Some(path_endpoint(spec)),
             state: "listening",
             manual_disabled: false,
@@ -657,7 +664,7 @@ fn collect_server(
         sessions.insert(
             "mpp_inbound",
             service_index,
-            tag.clone(),
+            service_name.clone(),
             session.session_id.0.to_string(),
             if carrier_count > 0 {
                 "connected"
@@ -671,22 +678,20 @@ fn collect_server(
     for path in registry.paths {
         summary.add_server_path(path.state, path.metrics);
         let metrics = path.metrics;
+        let configured_path = context
+            .configured_path_names
+            .get(path.configured_index)
+            .expect("server session path refers to configured path inventory")
+            .clone();
         paths.push(ManagementPathStatus {
-            id: format!(
-                "inbound:{service_index}:session:{}:{}:{}:{}",
-                path.session_id.0,
-                underlay_name(path.underlay),
-                path.path_id.0,
-                path.path_instance_id.as_u64(),
-            ),
             service: "mpp_inbound",
             service_index,
-            service_tag: tag.clone(),
+            service_name: service_name.clone(),
             session_id: Some(path.session_id.0.to_string()),
+            path: configured_path,
             underlay: underlay_name(path.underlay),
             path_id: Some(path.path_id.0.to_string()),
             path_instance_id: Some(path.path_instance_id.as_u64().to_string()),
-            configured_index: Some(path.configured_index),
             endpoint: None,
             state: peer_path_state_name(path.state),
             manual_disabled: false,
@@ -749,9 +754,6 @@ pub(super) fn flow_status(flow: ActiveProductFlowSnapshot, now: Instant) -> Mana
         balancer: selection
             .and_then(|selection| selection.balancer.as_ref())
             .map(|balancer| balancer.as_str().to_string()),
-        balancer_member: selection
-            .and_then(|selection| selection.member.as_ref())
-            .map(|member| member.as_str().to_string()),
         target: flow.target.as_ref().map(target_name),
         age_ms: now
             .saturating_duration_since(flow.started_at)

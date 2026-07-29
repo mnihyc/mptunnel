@@ -6,7 +6,7 @@ use crate::outbound::{self, ServerDestinationPolicy};
 use crate::product::{DnsPlanId, Network};
 use crate::protocol::{DatagramFlowId, DatagramId, Frame, OffsetRange, SessionId, TargetAddr};
 use crate::runtime::error::RuntimeError;
-use crate::runtime::outbound_registry::{OutboundSelector, RuntimeOutboundRegistry};
+use crate::runtime::outbound_registry::{EgressSelection, RuntimeOutboundRegistry};
 use crate::runtime::path::commands::ReliablePathCommandSender;
 use crate::runtime::path::{
     AcceptedServerDatagramFlow, ServerDatagramOpenError, ServerDatagramOpenRequest,
@@ -38,7 +38,7 @@ type ServerDatagramFlowRegistry =
 /// Composition-owned UDP target policy and session-level flow registry.
 pub(in crate::runtime) struct ServerDatagramService {
     outbound_registry: RuntimeOutboundRegistry,
-    outbound_selector: OutboundSelector,
+    egress_selection: EgressSelection,
     dns_plan: Option<DnsPlanId>,
     destination_policy: Arc<ServerDestinationPolicy>,
     session_retention_timeout: Duration,
@@ -78,7 +78,7 @@ impl Drop for ServerDatagramAttachment {
 
 pub(in crate::runtime) struct ServerDatagramServiceConfig {
     pub(in crate::runtime) outbound_registry: RuntimeOutboundRegistry,
-    pub(in crate::runtime) outbound_selector: OutboundSelector,
+    pub(in crate::runtime) egress_selection: EgressSelection,
     pub(in crate::runtime) dns_plan: Option<DnsPlanId>,
     pub(in crate::runtime) destination_policy: Arc<ServerDestinationPolicy>,
     pub(in crate::runtime) session_retention_timeout: Duration,
@@ -91,7 +91,7 @@ impl ServerDatagramService {
     pub(in crate::runtime) fn path_port(config: ServerDatagramServiceConfig) -> ServerDatagramPort {
         let ServerDatagramServiceConfig {
             outbound_registry,
-            outbound_selector,
+            egress_selection,
             dns_plan,
             destination_policy,
             session_retention_timeout,
@@ -101,7 +101,7 @@ impl ServerDatagramService {
         } = config;
         ServerDatagramPort::new(Arc::new(Self {
             outbound_registry,
-            outbound_selector,
+            egress_selection,
             dns_plan,
             destination_policy,
             session_retention_timeout,
@@ -200,7 +200,7 @@ impl ServerDatagramPortBackend for ServerDatagramService {
                     let opened = self
                         .outbound_registry
                         .open_udp(
-                            &self.outbound_selector,
+                            &self.egress_selection,
                             &target,
                             self.dns_plan.as_ref(),
                             &principal_destination_policy,
@@ -393,9 +393,9 @@ fn spawn_server_datagram_flow_worker(
                             {
                                 crate::observability::process_event!(
                                     Warn,
-                                    "udp_gateway",
+                                    "udp_balancer",
                                     "server_flow_failure_feedback_failed",
-                                    "gateway server UDP flow-failure feedback failed: {feedback}"
+                                    "balancer server UDP flow-failure feedback failed: {feedback}"
                                 );
                             }
                             let _ = admission.send(result);
@@ -495,9 +495,9 @@ fn spawn_server_datagram_flow_worker(
         {
             crate::observability::process_event!(
                 Warn,
-                "udp_gateway",
+                "udp_balancer",
                 "flow_outcome_feedback_failed",
-                "gateway UDP flow-outcome feedback failed: {error}"
+                "balancer UDP flow-outcome feedback failed: {error}"
             );
         }
         if failure.is_none() {

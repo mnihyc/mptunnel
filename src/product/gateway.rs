@@ -172,59 +172,59 @@ pub enum GatewayCompileError {
 impl fmt::Display for GatewayCompileError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Self::MissingMembers => formatter.write_str("gateway balancer requires members"),
+            Self::MissingMembers => formatter.write_str("balancer requires members"),
             Self::TooManyMembers { count, maximum } => {
                 write!(
                     formatter,
-                    "gateway balancer has {count} members; maximum is {maximum}"
+                    "balancer has {count} members; maximum is {maximum}"
                 )
             }
-            Self::DuplicateMember(id) => write!(formatter, "duplicate gateway member {id}"),
-            Self::ZeroWeight(id) => write!(formatter, "gateway member {id} has zero weight"),
+            Self::DuplicateMember(id) => write!(formatter, "duplicate balancer member {id}"),
+            Self::ZeroWeight(id) => write!(formatter, "balancer member {id} has zero weight"),
             Self::MissingNetworkCapability(id) => {
-                write!(formatter, "gateway member {id} supports no target network")
+                write!(formatter, "balancer member {id} supports no target network")
             }
             Self::InvalidFailureThreshold(value) => write!(
                 formatter,
-                "gateway failure threshold {value} is outside 1..={MAX_HEALTH_THRESHOLD}"
+                "balancer failure threshold {value} is outside 1..={MAX_HEALTH_THRESHOLD}"
             ),
             Self::InvalidRecoveryThreshold(value) => write!(
                 formatter,
-                "gateway recovery threshold {value} is outside 1..={MAX_HEALTH_THRESHOLD}"
+                "balancer recovery threshold {value} is outside 1..={MAX_HEALTH_THRESHOLD}"
             ),
             Self::InvalidBackoff => formatter.write_str(
-                "gateway backoff must be millisecond-granular, non-zero, bounded, and ordered",
+                "balancer backoff must be millisecond-granular, non-zero, bounded, and ordered",
             ),
             Self::InvalidStickinessTtl => formatter.write_str(
-                "gateway stickiness TTL must be millisecond-granular, non-zero, and bounded",
+                "balancer stickiness TTL must be millisecond-granular, non-zero, and bounded",
             ),
             Self::InvalidStickinessCapacity { capacity, maximum } => write!(
                 formatter,
-                "gateway stickiness capacity {capacity} is outside 1..={maximum}"
+                "balancer stickiness capacity {capacity} is outside 1..={maximum}"
             ),
             Self::MissingManualMember => {
-                formatter.write_str("manual gateway strategy requires manual_member")
+                formatter.write_str("manual balancer strategy requires manual_outbound")
             }
             Self::UnknownManualMember(id) => {
-                write!(formatter, "gateway manual member {id} is not a configured member")
+                write!(formatter, "balancer manual outbound {id} is not a configured member")
             }
             Self::ManualMemberNotEnabled(id) => {
-                write!(formatter, "gateway manual member {id} is not enabled")
+                write!(formatter, "balancer manual outbound {id} is not enabled")
             }
             Self::InvalidFreshnessTtl => formatter.write_str(
-                "gateway freshness TTL must be millisecond-granular, non-zero, and bounded",
+                "balancer freshness TTL must be millisecond-granular, non-zero, and bounded",
             ),
             Self::InvalidProbeInterval => formatter.write_str(
-                "gateway probe interval must be millisecond-granular, non-zero, and bounded",
+                "balancer probe interval must be millisecond-granular, non-zero, and bounded",
             ),
             Self::InvalidProbeTimeout => formatter.write_str(
-                "gateway probe timeout must be millisecond-granular, non-zero, bounded, and no longer than its interval",
+                "balancer probe timeout must be millisecond-granular, non-zero, bounded, and no longer than its interval",
             ),
             Self::ProbeTargetMustBeLiteralIp => {
-                formatter.write_str("gateway probe target must be a literal IP authority")
+                formatter.write_str("balancer probe target must be a literal IP authority")
             }
             Self::ProbeMemberDoesNotSupportTcp(id) => {
-                write!(formatter, "gateway probe member {id} does not support TCP")
+                write!(formatter, "balancer probe member {id} does not support TCP")
             }
         }
     }
@@ -396,13 +396,11 @@ pub enum GatewayStateError {
 impl fmt::Display for GatewayStateError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter.write_str(match self {
-            Self::ForeignHandle => "gateway member handle belongs to another balancer generation",
+            Self::ForeignHandle => "balancer member handle belongs to another generation",
             Self::ManualStrategyRequiresOverride => {
-                "manual gateway strategy cannot clear its member override"
+                "manual balancer strategy cannot clear its outbound override"
             }
-            Self::ManualOverrideMemberNotEnabled => {
-                "gateway manual override member must be enabled"
-            }
+            Self::ManualOverrideMemberNotEnabled => "balancer manual outbound must be enabled",
         })
     }
 }
@@ -423,23 +421,21 @@ impl fmt::Display for GatewaySelectionError {
         match self {
             Self::TooManyExclusions { count, maximum } => write!(
                 formatter,
-                "gateway selection has {count} exclusions; maximum is {maximum}"
+                "balancer selection has {count} exclusions; maximum is {maximum}"
             ),
-            Self::ForeignExclusionHandle => formatter
-                .write_str("gateway exclusion handle belongs to another balancer generation"),
+            Self::ForeignExclusionHandle => {
+                formatter.write_str("balancer exclusion handle belongs to another generation")
+            }
             Self::NoCompatibleMembers(network) => {
-                write!(
-                    formatter,
-                    "gateway balancer has no {network}-capable members"
-                )
+                write!(formatter, "balancer has no {network}-capable members")
             }
             Self::NoEnabledMembers(network) => write!(
                 formatter,
-                "gateway balancer has no enabled {network}-capable members for a new flow"
+                "balancer has no enabled {network}-capable members for a new flow"
             ),
             Self::ManualMemberUnavailable(network) => write!(
                 formatter,
-                "gateway manual member is not healthy, enabled, and {network}-capable"
+                "balancer manual outbound is not healthy, enabled, and {network}-capable"
             ),
         }
     }
@@ -661,7 +657,7 @@ impl GatewayBalancer {
             spec.members
                 .iter()
                 .position(|member| &member.id == manual)
-                .expect("validated manual gateway member exists") as u16
+                .expect("validated manual balancer member exists") as u16
         });
         Ok(Self {
             generation,

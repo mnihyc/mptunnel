@@ -48,9 +48,9 @@
       <button id="tab-overview" class="tab is-active" type="button" role="tab"
               aria-selected="true" aria-controls="panel-overview" tabindex="0"
               data-tab="overview">Overview</button>
-      <button id="tab-gateways" class="tab" type="button" role="tab"
-              aria-selected="false" aria-controls="panel-gateways" tabindex="-1"
-              data-tab="gateways">Gateways <span id="gateways-tab-count" class="tab-count">0</span></button>
+      <button id="tab-balancers" class="tab" type="button" role="tab"
+              aria-selected="false" aria-controls="panel-balancers" tabindex="-1"
+              data-tab="balancers">Balancers <span id="balancers-tab-count" class="tab-count">0</span></button>
       <button id="tab-paths" class="tab" type="button" role="tab"
               aria-selected="false" aria-controls="panel-paths" tabindex="-1"
               data-tab="paths">Paths <span id="paths-tab-count" class="tab-count">0</span></button>
@@ -186,23 +186,23 @@
       </div>
     </section>
 
-    <section id="panel-gateways" class="tab-panel" role="tabpanel"
-             aria-labelledby="tab-gateways" data-panel="gateways" hidden>
+    <section id="panel-balancers" class="tab-panel" role="tabpanel"
+             aria-labelledby="tab-balancers" data-panel="balancers" hidden>
       <div class="section-heading">
         <div>
           <p class="eyebrow">Product egress</p>
-          <h1>Gateways</h1>
+          <h1>Balancers</h1>
         </div>
         <p class="section-meta">Failover occurs before flow commit. Actions affect this runtime
           generation; edit configuration to persist them.</p>
       </div>
 
-      <div id="gateway-list" class="gateway-list"></div>
-      <div id="gateways-empty" class="data-section empty-state" hidden>
-        <h2>No gateway balancers configured</h2>
+      <div id="balancer-list" class="balancer-list"></div>
+      <div id="balancers-empty" class="data-section empty-state" hidden>
+        <h2>No balancers configured</h2>
         <p>Routes currently select leaf outbounds directly.</p>
       </div>
-      <div id="gateway-action-state" class="inline-status gateway-action-state"
+      <div id="balancer-action-state" class="inline-status balancer-action-state"
            role="status" aria-live="polite"></div>
     </section>
 

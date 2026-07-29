@@ -17,28 +17,28 @@ const TEST_MANAGEMENT_TOKEN_FILE: &str = "management-token.key";
 const TEST_PROXY_PASSWORD_FILE: &str = "proxy-password.key";
 const TEST_CREDENTIAL_CATALOG: &str = r#"
 [[credentials]]
-id = "test-default"
-principal = "test-peer"
+credential_id = "test-default"
+principal_id = "test-peer"
 secret = { from = "file", path = "mptunnel-test-credential.key" }
 
 [[credentials]]
-id = "test-a"
-principal = "test-peer"
+credential_id = "test-a"
+principal_id = "test-peer"
 secret = { from = "file", path = "mptunnel-test-credential-a.key" }
 
 [[credentials]]
-id = "test-b"
-principal = "test-peer"
+credential_id = "test-b"
+principal_id = "test-peer"
 secret = { from = "file", path = "mptunnel-test-credential-b.key" }
 
 [[credentials]]
-id = "test-c"
-principal = "test-peer"
+credential_id = "test-c"
+principal_id = "test-peer"
 secret = { from = "file", path = "mptunnel-test-credential-c.key" }
 
 [[credentials]]
-id = "test-fed"
-principal = "test-peer"
+credential_id = "test-fed"
+principal_id = "test-peer"
 secret = { from = "file", path = "mptunnel-test-credential-fed.key" }
 "#;
 
@@ -220,9 +220,9 @@ fn managed_tun_document(host: &str) -> String {
     format!(
         r#"
 [[inbounds]]
-tag = "local-tun"
+name = "local-tun"
 protocol = "tun"
-name = "daily0"
+interface_name = "daily0"
 ipv4 = "10.88.0.1"
 ipv4_prefix = 24
 ipv6 = "fd00:88::1"
@@ -231,21 +231,21 @@ ipv6_prefix = 64
 {host}
 
 [[outbounds]]
-tag = "edge"
+name = "edge"
 protocol = "mpp"
-endpoints = ["udp://127.0.0.1:443"]
+paths = [{{ name = "path-1", endpoint = "udp://127.0.0.1:443" }}]
 
 [outbounds.security]
-credential = "test-default"
+credential_id = "test-default"
 tls_server_name = "mptunnel.test"
 tls_pinned_certificate_file = "mptunnel-test-certificate.pem"
 
 [routing]
 
 [[routing.rules]]
-id = "default"
+name = "default"
 action = "outbound"
-target = "edge"
+outbound = "edge"
 "#
     )
 }
@@ -254,8 +254,7 @@ fn managed_fake_dns_document(host: &str) -> String {
     format!(
         r#"
 [dns]
-default_plan = "secure"
-system_fallback = false
+default_dns_plan = "secure"
 
 [dns.fake_dns]
 ipv4_pool = "198.18.0.0/16"
@@ -264,13 +263,13 @@ answer_ttl_ms = 30000
 recovery_ttl_ms = 120000
 
 [[dns.upstreams]]
-id = "dot"
+name = "dot"
 transport = "tls"
 bootstrap = "1.1.1.1:853"
 server_name = "cloudflare-dns.com"
 
 [[dns.plans]]
-id = "secure"
+name = "secure"
 upstreams = ["dot"]
 security = "require-encrypted"
 
@@ -343,7 +342,7 @@ socket_mark = 1297106006
         .expect("compile")
         .expect("managed");
 
-    assert_eq!(tun.name.as_deref(), Some("daily0"));
+    assert_eq!(tun.interface_name.as_deref(), Some("daily0"));
     assert_eq!(portable.route_mode(), &crate::platform::RouteMode::Full);
     assert_eq!(
         portable.excludes(),
@@ -530,20 +529,20 @@ fn dns_file_config_exposes_tagged_transport_bounds_and_ttl_caps() {
     let file: DnsFileConfig = toml::from_str(
         r#"
 generation = 7
-default_plan = "default"
+default_dns_plan = "default"
 
 [[upstreams]]
-id = "v4"
+name = "v4"
 transport = "udp-tcp"
 bootstrap = "1.1.1.1:53"
 
 [[upstreams]]
-id = "v6"
+name = "v6"
 transport = "udp-tcp"
 bootstrap = "[2606:4700:4700::1111]:53"
 
 [[plans]]
-id = "default"
+name = "default"
 upstreams = ["v4", "v6"]
 ip_strategy = "ipv6-and-ipv4"
 upstream_strategy = "race"
@@ -558,7 +557,7 @@ stale_if_error_ms = 45000
 prefetch_max_ms = 12000
 
 [[hosts]]
-name = "router.home.arpa"
+domain = "router.home.arpa"
 addresses = ["192.0.2.1", "2001:db8::1"]
 "#,
     )
@@ -619,8 +618,7 @@ addresses = ["192.0.2.1", "2001:db8::1"]
 fn dns_file_config_strictly_compiles_doq_and_fake_dns() {
     let file: DnsFileConfig = toml::from_str(
         r#"
-default_plan = "secure"
-system_fallback = false
+default_dns_plan = "secure"
 
 [fake_dns]
 ipv4_pool = "198.18.0.0/16"
@@ -630,13 +628,13 @@ answer_ttl_ms = 30000
 recovery_ttl_ms = 120000
 
 [[upstreams]]
-id = "doq"
+name = "doq"
 transport = "quic"
 bootstrap = "1.1.1.1:853"
 server_name = "cloudflare-dns.com"
 
 [[plans]]
-id = "secure"
+name = "secure"
 upstreams = ["doq"]
 security = "require-encrypted"
 "#,
@@ -665,17 +663,17 @@ security = "require-encrypted"
 
     let invalid_pool = toml::from_str::<DnsFileConfig>(
         r#"
-default_plan = "default"
+default_dns_plan = "default"
 [fake_dns]
 ipv4_pool = "203.0.113.0/24"
 max_entries = 32
 answer_ttl_ms = 30000
 recovery_ttl_ms = 120000
 [[upstreams]]
-id = "system"
+name = "system"
 transport = "system"
 [[plans]]
-id = "default"
+name = "default"
 upstreams = ["system"]
 "#,
     )
@@ -695,15 +693,15 @@ upstreams = ["system"]
 
     let invalid_doq_path = toml::from_str::<DnsFileConfig>(
         r#"
-default_plan = "default"
+default_dns_plan = "default"
 [[upstreams]]
-id = "doq"
+name = "doq"
 transport = "quic"
 bootstrap = "1.1.1.1:853"
 server_name = "cloudflare-dns.com"
 path = "/dns-query"
 [[plans]]
-id = "default"
+name = "default"
 upstreams = ["doq"]
 "#,
     )
@@ -719,31 +717,6 @@ upstreams = ["doq"]
         invalid_doq_path,
         ConfigFileError::DnsValue(message) if message.contains("does not accept an HTTP path")
     ));
-
-    let fallback = toml::from_str::<DnsFileConfig>(
-        r#"
-default_plan = "default"
-system_fallback = true
-[[upstreams]]
-id = "system"
-transport = "system"
-[[plans]]
-id = "default"
-upstreams = ["system"]
-"#,
-    )
-    .expect("file shape")
-    .into_config(&ParsedOutbounds {
-        leaves: HashMap::new(),
-        balancers: HashMap::new(),
-        order: Vec::new(),
-        balancer_order: Vec::new(),
-    })
-    .expect_err("implicit system fallback is forbidden");
-    assert!(matches!(
-        fallback,
-        ConfigFileError::DnsValue(message) if message.contains("system_fallback must be false")
-    ));
 }
 
 #[test]
@@ -751,34 +724,34 @@ fn routed_dot_accepts_only_a_literal_proxy_control_endpoint() {
     let literal = load_config_toml_str(
         r#"
 [dns]
-default_plan = "secure"
+default_dns_plan = "secure"
 
 [[dns.upstreams]]
-id = "dot"
+name = "dot"
 transport = "tls"
 bootstrap = "1.1.1.1:853"
 server_name = "cloudflare-dns.com"
-egress_outbound = "proxy"
+outbound = "proxy"
 
 [[dns.plans]]
-id = "secure"
+name = "secure"
 upstreams = ["dot"]
 security = "require-encrypted"
 
 [[inbounds]]
-tag = "local"
+name = "local"
 protocol = "socks5"
 
 [[outbounds]]
-tag = "proxy"
+name = "proxy"
 protocol = "socks5"
-proxy = "127.0.0.1:1080"
+endpoint = "127.0.0.1:1080"
 
 [routing]
 [[routing.rules]]
-id = "default"
+name = "default"
 action = "outbound"
-target = "proxy"
+outbound = "proxy"
 "#,
     );
     assert!(
@@ -789,34 +762,34 @@ target = "proxy"
     let named = load_config_toml_str(
         r#"
 [dns]
-default_plan = "secure"
+default_dns_plan = "secure"
 
 [[dns.upstreams]]
-id = "dot"
+name = "dot"
 transport = "tls"
 bootstrap = "1.1.1.1:853"
 server_name = "cloudflare-dns.com"
-egress_outbound = "proxy"
+outbound = "proxy"
 
 [[dns.plans]]
-id = "secure"
+name = "secure"
 upstreams = ["dot"]
 security = "require-encrypted"
 
 [[inbounds]]
-tag = "local"
+name = "local"
 protocol = "socks5"
 
 [[outbounds]]
-tag = "proxy"
+name = "proxy"
 protocol = "socks5"
-proxy = "proxy.example:1080"
+endpoint = "proxy.example:1080"
 
 [routing]
 [[routing.rules]]
-id = "default"
+name = "default"
 action = "outbound"
-target = "proxy"
+outbound = "proxy"
 "#,
     )
     .expect_err("a proxy hostname would recursively require DNS");
@@ -831,32 +804,32 @@ fn routed_dns_capabilities_do_not_overstate_udp_support() {
     let error = load_config_toml_str(
         r#"
 [dns]
-default_plan = "plain"
+default_dns_plan = "plain"
 
 [[dns.upstreams]]
-id = "udp"
+name = "udp"
 transport = "udp"
 bootstrap = "1.1.1.1:53"
-egress_outbound = "proxy"
+outbound = "proxy"
 
 [[dns.plans]]
-id = "plain"
+name = "plain"
 upstreams = ["udp"]
 
 [[inbounds]]
-tag = "local"
+name = "local"
 protocol = "socks5"
 
 [[outbounds]]
-tag = "proxy"
+name = "proxy"
 protocol = "socks5"
-proxy = "127.0.0.1:1080"
+endpoint = "127.0.0.1:1080"
 
 [routing]
 [[routing.rules]]
-id = "default"
+name = "default"
 action = "outbound"
-target = "proxy"
+outbound = "proxy"
 "#,
     )
     .expect_err("UDP DNS has no routed datagram connector yet");
@@ -872,40 +845,40 @@ fn routed_doh_accepts_a_literal_mpp_carrier_inventory() {
     let config = load_config_toml_str(
         r#"
 [dns]
-default_plan = "secure"
+default_dns_plan = "secure"
 
 [[dns.upstreams]]
-id = "doh"
+name = "doh"
 transport = "https"
 bootstrap = "1.1.1.1:443"
 server_name = "cloudflare-dns.com"
 path = "/dns-query"
-egress_outbound = "edge"
+outbound = "edge"
 
 [[dns.plans]]
-id = "secure"
+name = "secure"
 upstreams = ["doh"]
 security = "require-encrypted"
 
 [[inbounds]]
-tag = "local"
+name = "local"
 protocol = "socks5"
 
 [[outbounds]]
-tag = "edge"
+name = "edge"
 protocol = "mpp"
-endpoints = ["udp://127.0.0.1:7443"]
+paths = [{ name = "path-1", endpoint = "udp://127.0.0.1:7443" }]
 
 [outbounds.security]
-credential = "test-default"
+credential_id = "test-default"
 tls_server_name = "mptunnel.test"
 tls_pinned_certificate_file = "mptunnel-test-certificate.pem"
 
 [routing]
 [[routing.rules]]
-id = "default"
+name = "default"
 action = "outbound"
-target = "edge"
+outbound = "edge"
 "#,
     );
     assert!(
@@ -933,15 +906,15 @@ fn named_local_users_resolve_secret_references_and_map_to_product_principals() {
     let config = load_config_toml_str(
         r#"
 [[local_users]]
-id = "phone-login"
-principal = "family"
+name = "phone-login"
+principal_id = "family"
 username = "mobile-user"
 password = { from = "file", path = "proxy-password.key" }
 
 [[inbounds]]
-tag = "local"
+name = "local"
 protocol = "socks5"
-users = ["phone-login"]
+local_users = ["phone-login"]
 
 [inbounds.admission]
 max_connections = 40
@@ -950,20 +923,20 @@ max_connections_per_principal = 10
 handshake_timeout_ms = 5000
 
 [[outbounds]]
-tag = "edge"
+name = "edge"
 protocol = "mpp"
-endpoints = ["udp://127.0.0.1:7443"]
+paths = [{ name = "path-1", endpoint = "udp://127.0.0.1:7443" }]
 
 [outbounds.security]
-credential = "test-default"
+credential_id = "test-default"
 tls_server_name = "mptunnel.test"
 tls_pinned_certificate_file = "mptunnel-test-certificate.pem"
 
 [routing]
 [[routing.rules]]
-id = "default"
+name = "default"
 action = "outbound"
-target = "edge"
+outbound = "edge"
 "#,
     )
     .expect("named local user config");
@@ -1050,24 +1023,25 @@ quic_path_keep_alive_interval_ms = 3000
 quic_path_idle_timeout_ms = 12000
 
 [[inbounds]]
-tag = "local-socks"
+name = "local-socks"
 protocol = "socks5"
 
 [[outbounds]]
+name = "mpp"
 protocol = "mpp"
-endpoints = ["tcp://127.0.0.1:443", "udp://127.0.0.1:443"]
+paths = [{ name = "path-1", endpoint = "tcp://127.0.0.1:443" }, { name = "path-2", endpoint = "udp://127.0.0.1:443" }]
 
 [outbounds.security]
-credential = "test-default"
+credential_id = "test-default"
 tls_server_name = "mptunnel.test"
 tls_pinned_certificate_file = "mptunnel-test-certificate.pem"
 
 [routing]
 
 [[routing.rules]]
-id = "default"
+name = "default"
 action = "outbound"
-target = "mpp"
+outbound = "mpp"
 "#,
     )
     .expect("config");
@@ -1122,28 +1096,28 @@ dashboard = true
 allow_peer_diagnostics = true
 
 [[inbounds]]
-tag = "local-socks"
+name = "local-socks"
 protocol = "socks5"
 
 [[outbounds]]
-tag = "mpp-main"
+name = "mpp-main"
 protocol = "mpp"
-endpoints = ["tcp://127.0.0.1:443", "udp://127.0.0.1:443"]
+paths = [{ name = "path-1", endpoint = "tcp://127.0.0.1:443" }, { name = "path-2", endpoint = "udp://127.0.0.1:443" }]
 
 [outbounds.performance]
 extra_traffic_hint_percent = 25
 
 [outbounds.security]
-credential = "test-default"
+credential_id = "test-default"
 tls_server_name = "mptunnel.test"
 tls_pinned_certificate_file = "mptunnel-test-certificate.pem"
 
 [routing]
 
 [[routing.rules]]
-id = "default"
+name = "default"
 action = "outbound"
-target = "mpp-main"
+outbound = "mpp-main"
 "#,
     )
     .expect("config");
@@ -1161,7 +1135,7 @@ target = "mpp-main"
     assert_eq!(clients.len(), 1);
     assert_eq!(clients[0].paths.len(), 2);
     assert_eq!(clients[0].performance.extra_traffic_hint_percent, 25);
-    assert_eq!(node.local_ingresses[0].tag.as_deref(), Some("local-socks"));
+    assert_eq!(node.local_ingresses[0].name, "local-socks");
     assert_eq!(
         ingress_configs(&node.local_ingresses),
         vec![IngressConfig::Socks5 {
@@ -1173,35 +1147,35 @@ target = "mpp-main"
 }
 
 #[test]
-fn node_config_toml_preserves_local_inbound_tags() {
+fn node_config_toml_preserves_local_inbound_names() {
     let config = load_config_toml_str(
         r#"
 [[inbounds]]
-tag = "local-socks"
+name = "local-socks"
 protocol = "socks5"
 listen = ["127.0.0.1:1080"]
 
 [[inbounds]]
-tag = "local-http"
+name = "local-http"
 protocol = "http-connect"
 listen = ["127.0.0.1:8080"]
 
 [[outbounds]]
-tag = "mpp-main"
+name = "mpp-main"
 protocol = "mpp"
-endpoints = ["tcp://127.0.0.1:443"]
+paths = [{ name = "path-1", endpoint = "tcp://127.0.0.1:443" }]
 
 [outbounds.security]
-credential = "test-default"
+credential_id = "test-default"
 tls_server_name = "mptunnel.test"
 tls_pinned_certificate_file = "mptunnel-test-certificate.pem"
 
 [routing]
 
 [[routing.rules]]
-id = "default"
+name = "default"
 action = "outbound"
-target = "mpp-main"
+outbound = "mpp-main"
 "#,
     )
     .expect("config");
@@ -1210,8 +1184,8 @@ target = "mpp-main"
     assert_eq!(mpp_outbounds(&node).len(), 1);
     let ingresses = &node.local_ingresses;
     assert_eq!(ingresses.len(), 2);
-    assert_eq!(ingresses[0].tag.as_deref(), Some("local-socks"));
-    assert_eq!(ingresses[1].tag.as_deref(), Some("local-http"));
+    assert_eq!(ingresses[0].name, "local-socks");
+    assert_eq!(ingresses[1].name, "local-http");
     assert!(matches!(&ingresses[0].config, IngressConfig::Socks5 { .. }));
     assert!(matches!(
         &ingresses[1].config,
@@ -1224,14 +1198,14 @@ fn node_config_toml_builds_strict_fixed_target_tcp_and_udp_inbounds() {
     let config = load_config_toml_str(
         r#"
 [[inbounds]]
-tag = "local-tcp-forward"
+name = "local-tcp-forward"
 protocol = "tcp-forward"
 listen = ["127.0.0.1:8443", "[::1]:8443"]
 target = "BÜCHER.Example.:443"
 max_connections = 32
 
 [[inbounds]]
-tag = "local-udp-forward"
+name = "local-udp-forward"
 protocol = "udp-forward"
 listen = ["127.0.0.1:5353"]
 target = "[2001:db8::53]:53"
@@ -1240,21 +1214,21 @@ idle_timeout_ms = 5000
 datagram_ttl_ms = 1500
 
 [[outbounds]]
-tag = "mpp-main"
+name = "mpp-main"
 protocol = "mpp"
-endpoints = ["tcp://127.0.0.1:443"]
+paths = [{ name = "path-1", endpoint = "tcp://127.0.0.1:443" }]
 
 [outbounds.security]
-credential = "test-default"
+credential_id = "test-default"
 tls_server_name = "mptunnel.test"
 tls_pinned_certificate_file = "mptunnel-test-certificate.pem"
 
 [routing]
 
 [[routing.rules]]
-id = "default"
+name = "default"
 action = "outbound"
-target = "mpp-main"
+outbound = "mpp-main"
 "#,
     )
     .expect("fixed-target inbound config");
@@ -1263,7 +1237,7 @@ target = "mpp-main"
     let [tcp, udp] = node.local_ingresses.as_slice() else {
         panic!("expected TCP and UDP fixed-target inbounds");
     };
-    assert_eq!(tcp.tag.as_deref(), Some("local-tcp-forward"));
+    assert_eq!(tcp.name, "local-tcp-forward");
     let IngressConfig::TcpForward(tcp) = &tcp.config else {
         panic!("expected TCP fixed-target inbound");
     };
@@ -1271,7 +1245,7 @@ target = "mpp-main"
     assert_eq!(tcp.target().to_string(), "xn--bcher-kva.example:443");
     assert_eq!(tcp.max_connections(), 32);
 
-    assert_eq!(udp.tag.as_deref(), Some("local-udp-forward"));
+    assert_eq!(udp.name, "local-udp-forward");
     let IngressConfig::UdpForward(udp) = &udp.config else {
         panic!("expected UDP fixed-target inbound");
     };
@@ -1286,33 +1260,33 @@ target = "mpp-main"
 }
 
 #[test]
-fn inbound_tags_must_be_unique() {
+fn inbound_names_must_be_unique() {
     let err = load_config_toml_str(
         r#"
 [[inbounds]]
-tag = "duplicate"
+name = "duplicate"
 protocol = "socks5"
 
 [[inbounds]]
-tag = "duplicate"
+name = "duplicate"
 protocol = "http-connect"
 
 [[outbounds]]
-tag = "mpp-main"
+name = "mpp-main"
 protocol = "mpp"
-endpoints = ["tcp://127.0.0.1:443"]
+paths = [{ name = "path-1", endpoint = "tcp://127.0.0.1:443" }]
 
 [outbounds.security]
-credential = "test-default"
+credential_id = "test-default"
 tls_server_name = "mptunnel.test"
 tls_pinned_certificate_file = "mptunnel-test-certificate.pem"
 "#,
     )
-    .expect_err("duplicate inbound tag should fail");
+    .expect_err("duplicate inbound name should fail");
 
     assert!(matches!(
         err,
-        ConfigFileError::DuplicateInboundTag(tag) if tag == "duplicate"
+        ConfigFileError::DuplicateInboundName(name) if name == "duplicate"
     ));
 }
 
@@ -1322,20 +1296,20 @@ fn node_config_toml_covers_forwarding_chaining_and_outbound_dns() {
         r#"
 [dns]
 generation = 3
-default_plan = "egress"
+default_dns_plan = "egress"
 
 [[dns.upstreams]]
-id = "v4"
+name = "v4"
 transport = "udp-tcp"
 bootstrap = "1.1.1.1:53"
 
 [[dns.upstreams]]
-id = "v6"
+name = "v6"
 transport = "udp-tcp"
 bootstrap = "[2606:4700:4700::1111]:53"
 
 [[dns.plans]]
-id = "egress"
+name = "egress"
 upstreams = ["v4", "v6"]
 ip_strategy = "ipv4-and-ipv6"
 lookup_timeout_ms = 1500
@@ -1345,19 +1319,19 @@ positive_ttl_cap_ms = 120000
 negative_ttl_cap_ms = 15000
 
 [[inbounds]]
-tag = "local-http"
+name = "local-http"
 protocol = "http-connect"
 listen = ["127.0.0.1:8081"]
 
 [[inbounds]]
-tag = "edge-mpp"
+name = "edge-mpp"
 protocol = "mpp"
-endpoints = ["tcp://0.0.0.0:8443", "udp://0.0.0.0:8443"]
+paths = [{ name = "path-1", endpoint = "tcp://0.0.0.0:8443" }, { name = "path-2", endpoint = "udp://0.0.0.0:8443" }]
 outbound = "proxy-egress"
 dns_plan = "egress"
 
 [inbounds.security]
-credentials = ["test-default"]
+credential_ids = ["test-default"]
 tls_certificate_chain_file = "mptunnel-test-certificate.pem"
 tls_private_key_file = "mptunnel-test-private-key.pem"
 
@@ -1365,26 +1339,26 @@ tls_private_key_file = "mptunnel-test-private-key.pem"
 extra_traffic_hint_percent = 200
 
 [[outbounds]]
-tag = "mpp-main"
+name = "mpp-main"
 protocol = "mpp"
-endpoints = ["tcp://127.0.0.1:443"]
+paths = [{ name = "path-1", endpoint = "tcp://127.0.0.1:443" }]
 
 [outbounds.security]
-credential = "test-fed"
+credential_id = "test-fed"
 tls_server_name = "mptunnel.test"
 tls_pinned_certificate_file = "mptunnel-test-certificate.pem"
 
 [[outbounds]]
-tag = "proxy-egress"
+name = "proxy-egress"
 protocol = "socks5"
-proxy = "127.0.0.1:8080"
+endpoint = "127.0.0.1:8080"
 
 [routing]
 
 [[routing.rules]]
-id = "default"
+name = "default"
 action = "outbound"
-target = "mpp-main"
+outbound = "mpp-main"
 "#,
     )
     .expect("config");
@@ -1393,11 +1367,13 @@ target = "mpp-main"
     assert_eq!(mpp_outbounds(&node).len(), 1);
     assert_eq!(node.servers.len(), 1);
     let server = &node.servers[0];
-    assert_eq!(server.tag.as_deref(), Some("edge-mpp"));
+    assert_eq!(server.name, "edge-mpp");
     assert_eq!(server.performance.extra_traffic_hint_percent, 200);
-    assert_eq!(server.route_target.kind, RouteTargetKind::Outbound);
-    assert_eq!(server.route_target.tag, "proxy-egress");
-    assert_eq!(server.bind_paths.len(), 2);
+    assert!(matches!(
+        &server.egress,
+        EgressRef::Outbound(outbound) if outbound.as_str() == "proxy-egress"
+    ));
+    assert_eq!(server.paths.len(), 2);
     assert_eq!(
         node.dns_policy
             .spec
@@ -1442,13 +1418,13 @@ fn https_connect_outbound_parses_tls_identity_roots_and_redacted_auth() {
     let config = load_config_toml_str(
         r#"
 [[inbounds]]
-tag = "local-http"
+name = "local-http"
 protocol = "http-connect"
 
 [[outbounds]]
-tag = "secure-proxy"
+name = "secure-proxy"
 protocol = "https-connect"
-proxy = "127.0.0.1:4443"
+endpoint = "127.0.0.1:4443"
 tls_server_name = "mptunnel.test"
 tls_ca_certificate_file = "mptunnel-test-certificate.pem"
 
@@ -1459,9 +1435,9 @@ password = { from = "file", path = "proxy-password.key" }
 [routing]
 
 [[routing.rules]]
-id = "default"
+name = "default"
 action = "outbound"
-target = "secure-proxy"
+outbound = "secure-proxy"
 "#,
     )
     .expect("config");
@@ -1483,19 +1459,20 @@ fn outbound_proxy_auth_requires_a_complete_credential_pair() {
     let err = load_config_toml_str(
         r#"
 [[inbounds]]
+name = "edge"
 protocol = "mpp"
-endpoints = ["tcp://127.0.0.1:8443"]
+paths = [{ name = "path-1", endpoint = "tcp://127.0.0.1:8443" }]
 outbound = "proxy"
 
 [inbounds.security]
-credentials = ["test-default"]
+credential_ids = ["test-default"]
 tls_certificate_chain_file = "mptunnel-test-certificate.pem"
 tls_private_key_file = "mptunnel-test-private-key.pem"
 
 [[outbounds]]
-tag = "proxy"
+name = "proxy"
 protocol = "socks5"
-proxy = "127.0.0.1:1080"
+endpoint = "127.0.0.1:1080"
 
 [outbounds.auth]
 username = "alice"
@@ -1512,55 +1489,55 @@ fn routing_builds_independent_mpp_gateway_leaves_and_leaf_egress() {
     let config = load_config_toml_str(
         r#"
 [[inbounds]]
-tag = "local-socks"
+name = "local-socks"
 protocol = "socks5"
 
 [[inbounds]]
-tag = "edge"
+name = "edge"
 protocol = "mpp"
-endpoints = ["tcp://0.0.0.0:8443"]
+paths = [{ name = "path-1", endpoint = "tcp://0.0.0.0:8443" }]
 outbound = "direct-a"
 
 [inbounds.security]
-credentials = ["test-a"]
+credential_ids = ["test-a"]
 tls_certificate_chain_file = "mptunnel-test-certificate.pem"
 tls_private_key_file = "mptunnel-test-private-key.pem"
 
 [[outbounds]]
-tag = "mpp-a"
+name = "mpp-a"
 protocol = "mpp"
-endpoints = ["tcp://127.0.0.1:443"]
+paths = [{ name = "path-1", endpoint = "tcp://127.0.0.1:443" }]
 
 [outbounds.security]
-credential = "test-b"
+credential_id = "test-b"
 tls_server_name = "mptunnel.test"
 tls_pinned_certificate_file = "mptunnel-test-certificate.pem"
 
 [[outbounds]]
-tag = "mpp-b"
+name = "mpp-b"
 protocol = "mpp"
-endpoints = ["udp://127.0.0.1:443"]
+paths = [{ name = "path-1", endpoint = "udp://127.0.0.1:443" }]
 
 [outbounds.security]
-credential = "test-c"
+credential_id = "test-c"
 tls_server_name = "mptunnel.test"
 tls_pinned_certificate_file = "mptunnel-test-certificate.pem"
 
 [[outbounds]]
-tag = "direct-a"
+name = "direct-a"
 protocol = "direct"
 
 [routing]
 
 [[routing.balancers]]
-tag = "edge-gateway"
+name = "edge-gateway"
 strategy = "round-robin"
 members = [{ outbound = "mpp-a" }, { outbound = "mpp-b" }]
 
 [[routing.rules]]
-id = "default"
+name = "default"
 action = "balancer"
-target = "edge-gateway"
+balancer = "edge-gateway"
 "#,
     )
     .expect("config");
@@ -1580,8 +1557,10 @@ target = "edge-gateway"
     assert_eq!(node.gateway_balancers[0].id.as_str(), "edge-gateway");
     assert_eq!(node.gateway_balancers[0].spec.members.len(), 2);
     assert_eq!(node.servers.len(), 1);
-    assert_eq!(node.servers[0].route_target.kind, RouteTargetKind::Outbound);
-    assert_eq!(node.servers[0].route_target.tag, "direct-a");
+    assert!(matches!(
+        &node.servers[0].egress,
+        EgressRef::Outbound(outbound) if outbound.as_str() == "direct-a"
+    ));
     assert!(matches!(
         local_outbound(&node, "direct-a"),
         OutboundConfig::Direct
@@ -1593,24 +1572,24 @@ fn routing_gateway_schema_compiles_manual_random_affinity_probe_and_member_modes
     let config = load_config_toml_str(
         r#"
 [[inbounds]]
-tag = "local-socks"
+name = "local-socks"
 protocol = "socks5"
 
 [[outbounds]]
-tag = "edge-a"
+name = "edge-a"
 protocol = "direct"
 
 [[outbounds]]
-tag = "edge-b"
+name = "edge-b"
 protocol = "direct"
 
 [routing]
 generation = 9
 
 [[routing.balancers]]
-tag = "manual-edge"
+name = "manual-edge"
 strategy = "manual"
-manual_member = "edge-a"
+manual_outbound = "edge-a"
 freshness_ttl_ms = 30000
 members = [
   { outbound = "edge-a", weight = 3 },
@@ -1620,7 +1599,7 @@ stickiness = { key = "principal", ttl_ms = 60000, capacity = 1024 }
 probe = { target = "192.0.2.1:443", interval_ms = 10000, timeout_ms = 2000 }
 
 [[routing.balancers]]
-tag = "random-edge"
+name = "random-edge"
 strategy = "random"
 members = [
   { outbound = "edge-a" },
@@ -1628,9 +1607,9 @@ members = [
 ]
 
 [[routing.rules]]
-id = "default"
+name = "default"
 action = "balancer"
-target = "manual-edge"
+balancer = "manual-edge"
 "#,
     )
     .expect("mature gateway config");
@@ -1661,33 +1640,33 @@ fn legacy_combined_mpp_strategy_is_rejected() {
     let err = load_config_toml_str(
         r#"
 [[inbounds]]
-tag = "local-socks"
+name = "local-socks"
 protocol = "socks5"
 
 [[outbounds]]
-tag = "mpp-a"
+name = "mpp-a"
 protocol = "mpp"
-endpoints = ["tcp://127.0.0.1:443"]
+paths = [{ name = "path-1", endpoint = "tcp://127.0.0.1:443" }]
 
 [outbounds.security]
-credential = "test-b"
+credential_id = "test-b"
 tls_server_name = "mptunnel.test"
 tls_pinned_certificate_file = "mptunnel-test-certificate.pem"
 
 [[outbounds]]
-tag = "mpp-b"
+name = "mpp-b"
 protocol = "mpp"
-endpoints = ["udp://127.0.0.1:443"]
+paths = [{ name = "path-1", endpoint = "udp://127.0.0.1:443" }]
 
 [outbounds.security]
-credential = "test-c"
+credential_id = "test-c"
 tls_server_name = "mptunnel.test"
 tls_pinned_certificate_file = "mptunnel-test-certificate.pem"
 
 [routing]
 
 [[routing.balancers]]
-tag = "combined-edge"
+name = "combined-edge"
 strategy = "combined-mpp"
 members = [{ outbound = "mpp-a" }, { outbound = "mpp-b" }]
 "#,
@@ -1702,7 +1681,7 @@ fn legacy_http_protocol_alias_is_rejected() {
     let err = load_config_toml_str(
         r#"
 [[inbounds]]
-tag = "local-http"
+name = "local-http"
 protocol = "http"
 "#,
     )
@@ -1716,32 +1695,33 @@ fn legacy_sequence_balancer_schema_is_rejected() {
     let err = load_config_toml_str(
         r#"
 [[inbounds]]
+name = "edge"
 protocol = "mpp"
-endpoints = ["tcp://0.0.0.0:8443"]
+paths = [{ name = "path-1", endpoint = "tcp://0.0.0.0:8443" }]
 balancer = "outer"
 
 [inbounds.security]
-credentials = ["test-a"]
+credential_ids = ["test-a"]
 tls_certificate_chain_file = "mptunnel-test-certificate.pem"
 tls_private_key_file = "mptunnel-test-private-key.pem"
 
 [[outbounds]]
-tag = "direct-a"
+name = "direct-a"
 protocol = "direct"
 
 [[outbounds]]
-tag = "direct-b"
+name = "direct-b"
 protocol = "direct"
 
 [routing]
 
 [[routing.balancers]]
-tag = "inner"
+name = "inner"
 strategy = "sequence"
 members = [{ outbound = "direct-a" }]
 
 [[routing.balancers]]
-tag = "outer"
+name = "outer"
 strategy = "sequence"
 members = [{ outbound = "inner" }, { outbound = "direct-b" }]
 "#,
@@ -1756,28 +1736,28 @@ fn routing_rules_compile_every_match_category_and_select_named_mpp_targets() {
     let config = load_config_toml_str(
         r#"
 [[inbounds]]
-tag = "local-socks"
+name = "local-socks"
 protocol = "socks5"
 
 [[inbounds]]
-tag = "local-http"
+name = "local-http"
 protocol = "http-connect"
 
 [[outbounds]]
-tag = "edge-a"
+name = "edge-a"
 protocol = "mpp"
-endpoints = ["udp://127.0.0.1:7443"]
+paths = [{ name = "path-1", endpoint = "udp://127.0.0.1:7443" }]
 [outbounds.security]
-credential = "test-a"
+credential_id = "test-a"
 tls_server_name = "mptunnel.test"
 tls_pinned_certificate_file = "mptunnel-test-certificate.pem"
 
 [[outbounds]]
-tag = "edge-b"
+name = "edge-b"
 protocol = "mpp"
-endpoints = ["udp://127.0.0.1:8443"]
+paths = [{ name = "path-1", endpoint = "udp://127.0.0.1:8443" }]
 [outbounds.security]
-credential = "test-b"
+credential_id = "test-b"
 tls_server_name = "mptunnel.test"
 tls_pinned_certificate_file = "mptunnel-test-certificate.pem"
 
@@ -1785,12 +1765,12 @@ tls_pinned_certificate_file = "mptunnel-test-certificate.pem"
 generation = 42
 
 [[routing.balancers]]
-tag = "all-edges"
+name = "all-edges"
 strategy = "round-robin"
 members = [{ outbound = "edge-a" }, { outbound = "edge-b" }]
 
 [[routing.rules]]
-id = "interactive-api"
+name = "interactive-api"
 domain_exact = ["api.example.com"]
 domain_suffix = ["example.com"]
 domain_keyword = ["api"]
@@ -1801,17 +1781,17 @@ destination_ports = [443, "8443-8444"]
 source_ports = ["40000-50000"]
 networks = ["tcp"]
 inbounds = ["local-socks"]
-principals = ["alice"]
+principal_ids = ["alice"]
 stages = ["pre-resolution"]
 action = "outbound"
-target = "edge-a"
+outbound = "edge-a"
 traffic_intent = "throughput"
 explanation = "API traffic uses edge A"
 
 [[routing.rules]]
-id = "default"
+name = "default"
 action = "balancer"
-target = "all-edges"
+balancer = "all-edges"
 traffic_intent = "interactive"
 "#,
     )
@@ -1904,46 +1884,46 @@ fn signed_rule_sets_are_pinned_compiled_and_visible_in_route_explain() {
 {TEST_CREDENTIAL_CATALOG}
 
 [[inbounds]]
-tag = "local-socks"
+name = "local-socks"
 protocol = "socks5"
 
 [[outbounds]]
-tag = "edge"
+name = "edge"
 protocol = "mpp"
-endpoints = ["udp://127.0.0.1:7443"]
+paths = [{{ name = "path-1", endpoint = "udp://127.0.0.1:7443" }}]
 [outbounds.security]
-credential = "test-a"
+credential_id = "test-a"
 tls_server_name = "mptunnel.test"
 tls_pinned_certificate_file = "mptunnel-test-certificate.pem"
 
 [routing]
 
 [[routing.rule_set_publishers]]
-id = "official"
+publisher_id = "official"
 ed25519_public_key_base64 = "{public_key}"
 
 [[routing.rule_sets]]
-id = "geo-public"
-publisher = "official"
+rule_set_id = "geo-public"
+publisher_id = "official"
 minimum_revision = {minimum_revision}
 file = "geo-public.ruleset.json"
 
 [[routing.rules]]
-id = "signed-domain"
-domain_rule_sets = ["geo-public"]
+name = "signed-domain"
+domain_rule_set_ids = ["geo-public"]
 action = "outbound"
-target = "edge"
+outbound = "edge"
 
 [[routing.rules]]
-id = "signed-network"
-destination_rule_sets = ["geo-public"]
+name = "signed-network"
+destination_rule_set_ids = ["geo-public"]
 stages = ["post-resolution"]
 action = "reject"
 
 [[routing.rules]]
-id = "default"
+name = "default"
 action = "outbound"
-target = "edge"
+outbound = "edge"
 "#
         )
     };
@@ -2022,24 +2002,24 @@ fn routing_rules_require_a_final_default_and_existing_typed_target() {
     let missing_default = load_config_toml_str(
         r#"
 [[inbounds]]
-tag = "local-socks"
+name = "local-socks"
 protocol = "socks5"
 
 [[outbounds]]
-tag = "edge"
+name = "edge"
 protocol = "mpp"
-endpoints = ["udp://127.0.0.1:7443"]
+paths = [{ name = "path-1", endpoint = "udp://127.0.0.1:7443" }]
 [outbounds.security]
-credential = "test-a"
+credential_id = "test-a"
 tls_server_name = "mptunnel.test"
 tls_pinned_certificate_file = "mptunnel-test-certificate.pem"
 
 [routing]
 [[routing.rules]]
-id = "only-specific"
+name = "only-specific"
 domain_suffix = ["example.com"]
 action = "outbound"
-target = "edge"
+outbound = "edge"
 "#,
     )
     .expect_err("final default is mandatory");
@@ -2051,23 +2031,23 @@ target = "edge"
     let missing_target = load_config_toml_str(
         r#"
 [[inbounds]]
-tag = "local-socks"
+name = "local-socks"
 protocol = "socks5"
 
 [[outbounds]]
-tag = "edge"
+name = "edge"
 protocol = "mpp"
-endpoints = ["udp://127.0.0.1:7443"]
+paths = [{ name = "path-1", endpoint = "udp://127.0.0.1:7443" }]
 [outbounds.security]
-credential = "test-a"
+credential_id = "test-a"
 tls_server_name = "mptunnel.test"
 tls_pinned_certificate_file = "mptunnel-test-certificate.pem"
 
 [routing]
 [[routing.rules]]
-id = "default"
+name = "default"
 action = "outbound"
-target = "missing"
+outbound = "missing"
 "#,
     )
     .expect_err("referenced outbound must exist");
@@ -2091,19 +2071,19 @@ fn routing_schema_rejects_unsupported_runtime_metadata_selectors() {
         let document = format!(
             r#"
 [[inbounds]]
-tag = "local-socks"
+name = "local-socks"
 protocol = "socks5"
 
 [[outbounds]]
-tag = "direct"
+name = "direct"
 protocol = "direct"
 
 [routing]
 [[routing.rules]]
-id = "default"
+name = "default"
 {field} = []
 action = "outbound"
-target = "direct"
+outbound = "direct"
 "#
         );
         let error = load_config_toml_str(&document)
@@ -2121,21 +2101,21 @@ fn routing_terminal_actions_are_strict_targetless_and_compile() {
     let config = load_config_toml_str(
         r#"
 [[inbounds]]
-tag = "local-socks"
+name = "local-socks"
 protocol = "socks5"
 
 [[outbounds]]
-tag = "edge"
+name = "edge"
 protocol = "mpp"
-endpoints = ["udp://127.0.0.1:7443"]
+paths = [{ name = "path-1", endpoint = "udp://127.0.0.1:7443" }]
 [outbounds.security]
-credential = "test-a"
+credential_id = "test-a"
 tls_server_name = "mptunnel.test"
 tls_pinned_certificate_file = "mptunnel-test-certificate.pem"
 
 [routing]
 [[routing.rules]]
-id = "default-deny"
+name = "default-deny"
 action = "reject"
 traffic_intent = "background"
 "#,
@@ -2164,12 +2144,12 @@ traffic_intent = "background"
     let unsupported_reset = load_config_toml_str(
         r#"
 [[inbounds]]
-tag = "local-socks"
+name = "local-socks"
 protocol = "socks5"
 
 [routing]
 [[routing.rules]]
-id = "default-deny"
+name = "default-deny"
 action = "reset"
 "#,
     )
@@ -2190,12 +2170,12 @@ fn product_admission_is_strict_finite_and_independent_from_core_resources() {
 {admission}
 
 [[inbounds]]
-tag = "local-socks"
+name = "local-socks"
 protocol = "socks5"
 
 [routing]
 [[routing.rules]]
-id = "default-deny"
+name = "default-deny"
 action = "reject"
 "#
         )

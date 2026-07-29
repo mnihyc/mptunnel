@@ -136,7 +136,10 @@ impl ServerLocalPath {
 /// Immutable server policy plus registries shared by every carrier listener.
 #[derive(Debug, Clone)]
 pub(in crate::runtime) struct ServerPathContext {
-    pub(in crate::runtime) tag: Option<String>,
+    /// Stable configured Product inbound name; never serialized on the wire.
+    pub(in crate::runtime) name: String,
+    /// Stable Product names aligned with `server_paths`; never serialized.
+    pub(in crate::runtime) configured_path_names: Arc<Vec<String>>,
     pub(in crate::runtime) server_paths: Arc<Vec<PathSpec>>,
     pub(in crate::runtime) codec_limits: CodecLimits,
     pub(in crate::runtime) mux_limits: MuxLimits,

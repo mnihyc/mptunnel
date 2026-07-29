@@ -21,14 +21,14 @@ impl ManagementTarget {
             ManagementHttpError::new(400, "Bad Request", "invalid path control JSON body")
         })?;
         let context = select_control_client_context(&self.clients, &request)?;
-        let underlay = parse_underlay(&request.underlay)?;
+        let (underlay, index) = select_client_path(context, &request.path)?;
         let state = parse_control_state(&request.state)?;
-        set_client_path_state(context, underlay, request.index, state)?;
+        set_client_path_state(context, underlay, index, state)?;
         self.refresh_current_snapshot();
         Ok(json!({
             "applied": true,
-            "underlay": underlay_name(underlay),
-            "index": request.index,
+            "outbound": request.outbound,
+            "path": request.path,
             "state": request.state
         }))
     }
@@ -40,11 +40,7 @@ impl ManagementTarget {
         let request = serde_json::from_slice::<PeerDiagnosticsRequest>(body).map_err(|_| {
             ManagementHttpError::new(400, "Bad Request", "invalid peer diagnostics JSON body")
         })?;
-        let requested_session = request
-            .session_id
-            .as_deref()
-            .map(parse_session_id)
-            .transpose()?;
+        let requested_session = parse_session_id(&request.session_id)?;
         let selected = select_peer_status_broker(self, &request, requested_session)?;
         let result = selected
             .broker
@@ -56,7 +52,7 @@ impl ManagementTarget {
             result,
             selected.service,
             selected.service_index,
-            selected.service_tag,
+            selected.service_name,
         ))
         .map_err(|_| {
             ManagementHttpError::new(
@@ -71,12 +67,8 @@ impl ManagementTarget {
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct PathControlRequest {
-    #[serde(default)]
-    client_index: Option<usize>,
-    #[serde(default)]
-    client_tag: Option<String>,
-    underlay: String,
-    index: usize,
+    outbound: String,
+    path: String,
     state: String,
 }
 
@@ -84,58 +76,23 @@ fn select_control_client_context<'a>(
     clients: &'a [ClientPathContext],
     request: &PathControlRequest,
 ) -> Result<&'a ClientPathContext, ManagementHttpError> {
-    if request.client_index.is_some() && request.client_tag.is_some() {
+    let mut matches = clients.iter().filter(|context| {
+        context
+            .outbound
+            .as_ref()
+            .is_some_and(|outbound| outbound.as_str() == request.outbound)
+    });
+    let selected = matches.next().ok_or_else(|| {
+        ManagementHttpError::new(404, "Not Found", "outbound does not match an MPP outbound")
+    })?;
+    if matches.next().is_some() {
         return Err(ManagementHttpError::new(
-            400,
-            "Bad Request",
-            "path control must set at most one of client_index or client_tag",
+            409,
+            "Conflict",
+            "outbound matches more than one MPP path owner",
         ));
     }
-    if let Some(tag) = request.client_tag.as_deref() {
-        let mut matches = clients.iter().filter(|context| {
-            context
-                .route_target
-                .as_ref()
-                .is_some_and(|target| target.tag == tag)
-        });
-        let selected = matches.next().ok_or_else(|| {
-            ManagementHttpError::new(
-                404,
-                "Not Found",
-                "client_tag does not match an MPP outbound or balancer",
-            )
-        })?;
-        if matches.next().is_some() {
-            return Err(ManagementHttpError::new(
-                409,
-                "Conflict",
-                "client_tag matches more than one MPP outbound or balancer",
-            ));
-        }
-        return Ok(selected);
-    }
-    if let Some(index) = request.client_index {
-        return clients.get(index).ok_or_else(|| {
-            ManagementHttpError::new(
-                404,
-                "Not Found",
-                "client_index does not match an MPP outbound or balancer",
-            )
-        });
-    }
-    match clients {
-        [context] => Ok(context),
-        [] => Err(ManagementHttpError::new(
-            409,
-            "Conflict",
-            "path control requires an existing MPP outbound",
-        )),
-        _ => Err(ManagementHttpError::new(
-            409,
-            "Conflict",
-            "path control is ambiguous; provide client_index or client_tag",
-        )),
-    }
+    Ok(selected)
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -146,16 +103,33 @@ enum PathControlState {
     Disabled,
 }
 
-fn parse_underlay(value: &str) -> Result<UnderlayProtocol, ManagementHttpError> {
-    match value {
-        "tcp" => Ok(UnderlayProtocol::Tcp),
-        "udp" | "quic" => Ok(UnderlayProtocol::Udp),
-        _ => Err(ManagementHttpError::new(
-            400,
-            "Bad Request",
-            "underlay must be tcp or udp",
-        )),
+fn select_client_path(
+    context: &ClientPathContext,
+    path: &str,
+) -> Result<(UnderlayProtocol, usize), ManagementHttpError> {
+    let mut selected = None;
+    for (underlay, names) in [
+        (UnderlayProtocol::Tcp, context.tcp_path_names.as_slice()),
+        (UnderlayProtocol::Udp, context.udp_path_names.as_slice()),
+    ] {
+        if let Some(index) = names.iter().position(|name| name == path) {
+            if selected.is_some() {
+                return Err(ManagementHttpError::new(
+                    409,
+                    "Conflict",
+                    "path name is ambiguous within the outbound",
+                ));
+            }
+            selected = Some((underlay, index));
+        }
     }
+    selected.ok_or_else(|| {
+        ManagementHttpError::new(
+            404,
+            "Not Found",
+            "path does not match a configured path for the outbound",
+        )
+    })
 }
 
 fn parse_control_state(value: &str) -> Result<PathControlState, ManagementHttpError> {
@@ -190,7 +164,7 @@ fn set_client_path_state(
         return Err(ManagementHttpError::new(
             404,
             "Not Found",
-            "path index does not exist",
+            "path runtime state is unavailable",
         ));
     };
     match state {
@@ -227,12 +201,9 @@ fn set_client_path_state(
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct PeerDiagnosticsRequest {
-    #[serde(default)]
-    service: Option<String>,
-    #[serde(default)]
-    service_index: Option<usize>,
-    #[serde(default)]
-    session_id: Option<String>,
+    service: String,
+    service_name: String,
+    session_id: String,
 }
 
 fn parse_session_id(value: &str) -> Result<SessionId, ManagementHttpError> {
@@ -250,26 +221,15 @@ struct PeerStatusSelection {
     session_id: SessionId,
     service: &'static str,
     service_index: usize,
-    service_tag: Option<String>,
+    service_name: Option<String>,
 }
 
 fn select_peer_status_broker(
     target: &ManagementTarget,
     request: &PeerDiagnosticsRequest,
-    requested_session: Option<SessionId>,
+    requested_session: SessionId,
 ) -> Result<PeerStatusSelection, ManagementHttpError> {
-    if request.service.is_none() && request.service_index.is_some() {
-        return Err(ManagementHttpError::new(
-            400,
-            "Bad Request",
-            "service_index requires service",
-        ));
-    }
-    if request
-        .service
-        .as_deref()
-        .is_some_and(|service| !matches!(service, "mpp_outbound" | "mpp_inbound"))
-    {
+    if !matches!(request.service.as_str(), "mpp_outbound" | "mpp_inbound") {
         return Err(ManagementHttpError::new(
             400,
             "Bad Request",
@@ -283,9 +243,9 @@ fn select_peer_status_broker(
             "mpp_outbound",
             index,
             context
-                .route_target
+                .outbound
                 .as_ref()
-                .map(|target| target.tag.clone()),
+                .map(|outbound| outbound.as_str().to_string()),
             request,
             requested_session,
         ));
@@ -295,7 +255,7 @@ fn select_peer_status_broker(
             &context.peer_status,
             "mpp_inbound",
             index,
-            context.tag.clone(),
+            Some(context.name.clone()),
             request,
             requested_session,
         ));
@@ -306,7 +266,7 @@ fn select_peer_status_broker(
             session_id: selected.session_id,
             service: selected.service,
             service_index: selected.service_index,
-            service_tag: selected.service_tag.clone(),
+            service_name: selected.service_name.clone(),
         }),
         [] => Err(ManagementHttpError::new(
             404,
@@ -316,7 +276,7 @@ fn select_peer_status_broker(
         _ => Err(ManagementHttpError::new(
             409,
             "Conflict",
-            "peer session is ambiguous; provide service, service_index, and session_id",
+            "peer session is ambiguous for service, service_name, and session_id",
         )),
     }
 }
@@ -325,30 +285,24 @@ fn peer_broker_candidates(
     broker: &PeerStatusBroker,
     service: &'static str,
     service_index: usize,
-    service_tag: Option<String>,
+    service_name: Option<String>,
     request: &PeerDiagnosticsRequest,
-    requested_session: Option<SessionId>,
+    requested_session: SessionId,
 ) -> Vec<PeerStatusSelection> {
-    if request
-        .service
-        .as_deref()
-        .is_some_and(|requested| requested != service)
-        || request
-            .service_index
-            .is_some_and(|requested| requested != service_index)
+    if request.service != service || service_name.as_deref() != Some(request.service_name.as_str())
     {
         return Vec::new();
     }
     broker
         .session_ids()
         .into_iter()
-        .filter(|session_id| requested_session.is_none_or(|requested| requested == *session_id))
+        .filter(|session_id| requested_session == *session_id)
         .map(|session_id| PeerStatusSelection {
             broker: broker.clone(),
             session_id,
             service,
             service_index,
-            service_tag: service_tag.clone(),
+            service_name: service_name.clone(),
         })
         .collect()
 }
@@ -371,12 +325,5 @@ fn map_peer_request_error(error: PeerStatusRequestError) -> ManagementHttpError 
         PeerStatusRequestError::TimedOut => {
             ManagementHttpError::new(504, "Gateway Timeout", "peer status request timed out")
         }
-    }
-}
-
-fn underlay_name(underlay: UnderlayProtocol) -> &'static str {
-    match underlay {
-        UnderlayProtocol::Tcp => "tcp",
-        UnderlayProtocol::Udp => "udp",
     }
 }

@@ -568,7 +568,20 @@ print(json.dumps(sys.argv[1:]))
 PY
 }
 
-path_args_to_endpoint_array() {
+toml_named_paths_from_args() {
+  python3 - "$@" <<'PY'
+import json
+import sys
+
+paths = [
+    f'{{ name = {json.dumps(f"path-{index}")}, endpoint = {json.dumps(endpoint)} }}'
+    for index, endpoint in enumerate(sys.argv[1:], start=1)
+]
+print(f"[{', '.join(paths)}]")
+PY
+}
+
+path_args_to_named_path_array() {
   local path_args="$1"
   python3 - "$path_args" <<'PY'
 import json
@@ -590,7 +603,11 @@ while index < len(tokens):
 if not endpoints:
     raise SystemExit("lab mptunnel client config requires at least one endpoint")
 
-print(json.dumps(endpoints))
+paths = [
+    f'{{ name = {json.dumps(f"path-{index}")}, endpoint = {json.dumps(endpoint)} }}'
+    for index, endpoint in enumerate(endpoints, start=1)
+]
+print(f"[{', '.join(paths)}]")
 PY
 }
 
@@ -740,12 +757,12 @@ management_config_toml() {
 
 server_config_toml() {
   local log_level_json credential_path_json certificate_path_json private_key_path_json
-  local endpoints resources management
+  local paths resources management
   log_level_json="$(toml_string "$lab_log_level")"
   credential_path_json="$(toml_string "$server_credential_path")"
   certificate_path_json="$(toml_string "$server_tls_certificate_path")"
   private_key_path_json="$(toml_string "$server_tls_private_key_path")"
-  endpoints="$(toml_array_from_args \
+  paths="$(toml_named_paths_from_args \
     "tcp://172.31.10.20:${server_port}" \
     "tcp://172.31.15.20:${server_port}" \
     "tcp://172.31.16.20:${server_port}" \
@@ -769,18 +786,18 @@ server_config_toml() {
 level = ${log_level_json}
 
 ${resources}${management}[[credentials]]
-id = "lab"
-principal = "lab"
+credential_id = "lab"
+principal_id = "lab"
 secret = { from = "file", path = ${credential_path_json} }
 
 [[inbounds]]
-tag = "lab-mpp-in"
+name = "lab-mpp-in"
 protocol = "mpp"
-endpoints = ${endpoints}
+paths = ${paths}
 outbound = "lab-direct"
 
 [inbounds.security]
-credentials = ["lab"]
+credential_ids = ["lab"]
 tls_certificate_chain_file = ${certificate_path_json}
 tls_private_key_file = ${private_key_path_json}
 
@@ -788,13 +805,13 @@ tls_private_key_file = ${private_key_path_json}
 generation = 1
 
 [[inbounds.destination_acl.rules]]
-id = "allow-lab-private-targets"
+name = "allow-lab-private-targets"
 effect = "allow-restricted"
 destination_cidrs = ["172.31.0.0/16"]
 networks = ["tcp", "udp"]
 
 [[outbounds]]
-tag = "lab-direct"
+name = "lab-direct"
 protocol = "direct"
 EOF
 }
@@ -802,12 +819,12 @@ EOF
 socks_client_config_toml() {
   local path_args="$1"
   local log_level_json credential_path_json certificate_path_json
-  local listen endpoints resources probe management
+  local listen paths resources probe management
   log_level_json="$(toml_string "$lab_log_level")"
   credential_path_json="$(toml_string "$client_credential_path")"
   certificate_path_json="$(toml_string "$client_tls_certificate_path")"
   listen="$(toml_array_from_args "127.0.0.1:${proxy_port}")"
-  endpoints="$(path_args_to_endpoint_array "$path_args")"
+  paths="$(path_args_to_named_path_array "$path_args")"
   resources="$(resource_config_toml)"
   probe="$(probe_config_toml)"
   management="$(management_config_toml "$client_management_token_path")"
@@ -825,22 +842,22 @@ socks_client_config_toml() {
 level = ${log_level_json}
 
 ${resources}${management}[[credentials]]
-id = "lab"
-principal = "lab"
+credential_id = "lab"
+principal_id = "lab"
 secret = { from = "file", path = ${credential_path_json} }
 
 [[inbounds]]
-tag = "lab-socks"
+name = "lab-socks"
 protocol = "socks5"
 listen = ${listen}
 
 [[outbounds]]
-tag = "lab-mpp-out"
+name = "lab-mpp-out"
 protocol = "mpp"
-endpoints = ${endpoints}
+paths = ${paths}
 ${probe}
 [outbounds.security]
-credential = "lab"
+credential_id = "lab"
 tls_server_name = "mptunnel.test"
 tls_pinned_certificate_file = ${certificate_path_json}
 
@@ -849,26 +866,26 @@ tls_pinned_certificate_file = ${certificate_path_json}
 [routing.destination_acl]
 
 [[routing.destination_acl.rules]]
-id = "allow-lab-private-targets"
+name = "allow-lab-private-targets"
 effect = "allow-restricted"
 destination_cidrs = ["172.31.0.0/16"]
 networks = ["tcp", "udp"]
 
 [[routing.rules]]
-id = "default"
+name = "default"
 action = "outbound"
-target = "lab-mpp-out"
+outbound = "lab-mpp-out"
 EOF
 }
 
 tun_client_config_toml() {
   local path_args="$1"
   local log_level_json credential_path_json certificate_path_json
-  local endpoints resources probe management
+  local paths resources probe management
   log_level_json="$(toml_string "$lab_log_level")"
   credential_path_json="$(toml_string "$client_credential_path")"
   certificate_path_json="$(toml_string "$client_tls_certificate_path")"
-  endpoints="$(path_args_to_endpoint_array "$path_args")"
+  paths="$(path_args_to_named_path_array "$path_args")"
   resources="$(resource_config_toml)"
   probe="$(probe_config_toml)"
   management="$(management_config_toml "$client_management_token_path")"
@@ -886,24 +903,24 @@ tun_client_config_toml() {
 level = ${log_level_json}
 
 ${resources}${management}[[credentials]]
-id = "lab"
-principal = "lab"
+credential_id = "lab"
+principal_id = "lab"
 secret = { from = "file", path = ${credential_path_json} }
 
 [[inbounds]]
-tag = "lab-tun"
+name = "lab-tun"
 protocol = "tun"
-name = "mptun0"
+interface_name = "mptun0"
 ipv4 = "10.88.0.1"
 ipv4_prefix = 24
 
 [[outbounds]]
-tag = "lab-mpp-out"
+name = "lab-mpp-out"
 protocol = "mpp"
-endpoints = ${endpoints}
+paths = ${paths}
 ${probe}
 [outbounds.security]
-credential = "lab"
+credential_id = "lab"
 tls_server_name = "mptunnel.test"
 tls_pinned_certificate_file = ${certificate_path_json}
 
@@ -912,15 +929,15 @@ tls_pinned_certificate_file = ${certificate_path_json}
 [routing.destination_acl]
 
 [[routing.destination_acl.rules]]
-id = "allow-lab-private-targets"
+name = "allow-lab-private-targets"
 effect = "allow-restricted"
 destination_cidrs = ["172.31.0.0/16"]
 networks = ["tcp", "udp"]
 
 [[routing.rules]]
-id = "default"
+name = "default"
 action = "outbound"
-target = "lab-mpp-out"
+outbound = "lab-mpp-out"
 EOF
 }
 

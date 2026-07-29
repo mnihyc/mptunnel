@@ -44,7 +44,7 @@ pub struct ManagedVpnPlatformConfig {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TunL4Config {
-    pub name: Option<String>,
+    pub interface_name: Option<String>,
     pub ipv4: Option<Ipv4Addr>,
     pub ipv4_prefix: u8,
     pub ipv4_gateway: Option<Ipv4Addr>,
@@ -60,7 +60,7 @@ pub struct TunL4Config {
 impl Default for TunL4Config {
     fn default() -> Self {
         Self {
-            name: None,
+            interface_name: None,
             ipv4: Some(DEFAULT_TUN_IPV4),
             ipv4_prefix: DEFAULT_TUN_IPV4_PREFIX,
             ipv4_gateway: None,

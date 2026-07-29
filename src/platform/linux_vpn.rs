@@ -95,7 +95,7 @@ pub fn compile_node_linux_vpn_prepare_request(
         managed_tun_count,
         interface_name,
         ingress_index,
-        ingress_tag,
+        ingress_name,
         platform,
         carrier_paths,
         native_proxy_endpoints,
@@ -106,7 +106,7 @@ pub fn compile_node_linux_vpn_prepare_request(
     let interface = LinuxInterfaceName::parse(interface_name).map_err(|source| {
         LinuxVpnGenerationSpecError::LinuxInterface {
             ingress_index,
-            ingress_tag,
+            ingress_name,
             source,
         }
     })?;
@@ -136,12 +136,12 @@ pub enum LinuxVpnGenerationSpecError {
     },
     ManagedTun {
         ingress_index: usize,
-        ingress_tag: Option<String>,
+        ingress_name: String,
         source: ManagedVpnCompileError,
     },
     LinuxInterface {
         ingress_index: usize,
-        ingress_tag: Option<String>,
+        ingress_name: String,
         source: LinuxInterfaceNameError,
     },
     MppOutboundWithoutCarrierPaths {
@@ -184,11 +184,11 @@ impl From<ManagedVpnGenerationSpecError> for LinuxVpnGenerationSpecError {
             }
             ManagedVpnGenerationSpecError::ManagedTun {
                 ingress_index,
-                ingress_tag,
+                ingress_name,
                 source,
             } => Self::ManagedTun {
                 ingress_index,
-                ingress_tag,
+                ingress_name,
                 source,
             },
             ManagedVpnGenerationSpecError::MppOutboundWithoutCarrierPaths { outbound } => {
@@ -238,21 +238,19 @@ impl fmt::Display for LinuxVpnGenerationSpecError {
             ),
             Self::ManagedTun {
                 ingress_index,
-                ingress_tag,
+                ingress_name,
                 source,
             } => write!(
                 formatter,
-                "managed TUN ingress {} at index {ingress_index} is invalid: {source}",
-                ingress_tag.as_deref().unwrap_or("<untagged>")
+                "managed TUN inbound {ingress_name} at index {ingress_index} is invalid: {source}"
             ),
             Self::LinuxInterface {
                 ingress_index,
-                ingress_tag,
+                ingress_name,
                 source,
             } => write!(
                 formatter,
-                "managed TUN ingress {} at index {ingress_index} has an invalid Linux interface: {source}",
-                ingress_tag.as_deref().unwrap_or("<untagged>")
+                "managed TUN inbound {ingress_name} at index {ingress_index} has an invalid Linux interface: {source}"
             ),
             Self::MppOutboundWithoutCarrierPaths { outbound } => write!(
                 formatter,
@@ -1201,9 +1199,9 @@ mod tests {
         }
     }
 
-    fn managed_tun(tag: &str) -> LocalIngressConfig {
+    fn managed_tun(name: &str) -> LocalIngressConfig {
         LocalIngressConfig {
-            tag: Some(tag.to_owned()),
+            name: name.to_owned(),
             config: IngressConfig::TunL4(TunL4Config {
                 host: TunHostConfig::Managed(ManagedVpnConfig {
                     route_mode: RouteMode::Full,
@@ -1219,9 +1217,9 @@ mod tests {
         }
     }
 
-    fn external_tun(tag: &str) -> LocalIngressConfig {
+    fn external_tun(name: &str) -> LocalIngressConfig {
         LocalIngressConfig {
-            tag: Some(tag.to_owned()),
+            name: name.to_owned(),
             config: IngressConfig::TunL4(TunL4Config::default()),
         }
     }
@@ -1252,7 +1250,9 @@ mod tests {
         let security = test_security();
         let paths = paths
             .into_iter()
-            .map(|spec| ClientPathConfig {
+            .enumerate()
+            .map(|(index, spec)| ClientPathConfig {
+                name: format!("path-{}", index + 1),
                 tls: crate::transport::encrypted::test_client_tls_config(),
                 spec,
                 security: security.clone(),
@@ -1435,9 +1435,9 @@ mod tests {
             error,
             LinuxVpnGenerationSpecError::ManagedTun {
                 ingress_index: 0,
-                ingress_tag: Some(ref tag),
+                ref ingress_name,
                 source: ManagedVpnCompileError::ExternalDnsResolvers,
-            } if tag == "vpn"
+            } if ingress_name == "vpn"
         ));
         assert!(error.to_string().contains("vpn"));
     }

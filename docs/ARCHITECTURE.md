@@ -13,7 +13,7 @@ Quinn source mirror required by Cargo's path override.
 ```text
 SOCKS5 / HTTP CONNECT / TUN ingress
     -> canonical Product flow + routing/DNS/admission
-    -> optional Product gateway -> one outbound leaf
+    -> optional Product balancer -> one outbound leaf
     -> MPP stream or datagram identity (for an MPP leaf)
     -> per-direction connection sequencing, flow control, Data ACKs, and reinjection
     -> carrier-neutral path scheduler and sender queue
@@ -125,9 +125,9 @@ boundary, or adapter. File size alone does not earn a module.
 - `src/runtime/management/`: cached typed snapshots, bounded HTTP transport,
   explicit action controls, and embedded-dashboard delivery. Its one-second
   sampler is the only reader of runtime observability owners on behalf of HTTP
-  requests. Gateway status reads detached Product snapshots, not carrier
+  requests. Balancer status reads detached Product snapshots, not carrier
   metrics.
-- `src/product/dns.rs`: strict tagged DNS upstreams and plans,
+- `src/product/dns.rs`: strict named DNS upstreams and plans,
   exact/longest-suffix/default selection, encryption and recursion checks, and
   bounded per-generation policy facts, including reserved-range FakeDNS pool
   validation. It owns no sockets or caches.
@@ -139,14 +139,15 @@ boundary, or adapter. File size alone does not earn a module.
   stream DNS egress is injected by the outbound registry and never falls back
   to direct; DoQ remains a direct/source-bound QUIC leaf and never enters the
   MPP path scheduler.
-- `src/product/gateway.rs`: pure new-flow gateway selection, stickiness,
+- `src/product/gateway.rs`: pure new-flow balancer selection, stickiness,
   Product-owned health hysteresis/circuit state, drain/manual policy, and
   counters. It cannot import scheduler, carrier, runtime, DNS, or platform
   state.
-- `src/runtime/gateway.rs` and `src/runtime/outbound_registry.rs`: generation
-  ownership, bounded active probes, passive open/flow outcomes, total-deadline
-  pre-commit retries, and leaf opening. A committed flow remains bound to its
-  selected leaf and is never replayed because a later outcome is unhealthy.
+- `src/runtime/gateway.rs` and `src/runtime/outbound_registry.rs`: balancer
+  generation ownership, bounded active probes, passive open/flow outcomes,
+  total-deadline pre-commit retries, and leaf opening. A committed flow remains
+  bound to its selected leaf and is never replayed because a later outcome is
+  unhealthy.
 - `src/ingress/` and `src/outbound/`: local protocol parsing and remote target
   connection policy respectively. Neither chooses MPP data paths.
 - `src/runtime/node/`: constructs client, server, or combined nodes and injects

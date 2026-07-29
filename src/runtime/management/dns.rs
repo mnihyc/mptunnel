@@ -15,10 +15,10 @@ use serde::Deserialize;
 use serde_json::{Value, json};
 use std::str::FromStr;
 
-const DNS_STATUS_SCHEMA: &str = "mptunnel.dns.status.v1";
-const DNS_EXPLAIN_SCHEMA: &str = "mptunnel.dns.explain.v1";
-const DNS_QUERY_SCHEMA: &str = "mptunnel.dns.query.v1";
-const DNS_FLUSH_SCHEMA: &str = "mptunnel.dns.flush.v1";
+const DNS_STATUS_SCHEMA: &str = "mptunnel.dns.status.v2";
+const DNS_EXPLAIN_SCHEMA: &str = "mptunnel.dns.explain.v2";
+const DNS_QUERY_SCHEMA: &str = "mptunnel.dns.query.v2";
+const DNS_FLUSH_SCHEMA: &str = "mptunnel.dns.flush.v2";
 
 impl ManagementTarget {
     pub(super) fn dns_status_json(&self) -> Result<Value, ManagementHttpError> {
@@ -42,22 +42,22 @@ impl ManagementTarget {
             })),
             "plans": snapshot.plans.into_iter().map(plan_status_json).collect::<Vec<_>>(),
             "operations": {
-                "explain": "GET /api/v1/dns/explain?name=<domain>",
-                "query": "POST /api/v1/dns/query",
-                "flush": "POST /api/v1/dns/cache/flush"
+                "explain": "GET /api/v2/dns/explain?domain=<domain>",
+                "query": "POST /api/v2/dns/query",
+                "flush": "POST /api/v2/dns/cache/flush"
             }
         }))
     }
 
-    pub(super) fn dns_explain_json(&self, name: &str) -> Result<Value, ManagementHttpError> {
+    pub(super) fn dns_explain_json(&self, domain: &str) -> Result<Value, ManagementHttpError> {
         let dns = self.dns.as_ref().ok_or_else(dns_runtime_unavailable)?;
-        let domain = parse_domain(name)?;
+        let domain = parse_domain(domain)?;
         let explanation = dns.explain(&domain);
         Ok(json!({
             "schema": DNS_EXPLAIN_SCHEMA,
             "generation": explanation.generation,
-            "name": explanation.domain.as_str(),
-            "plan": explanation.plan.as_str(),
+            "domain": explanation.domain.as_str(),
+            "dns_plan": explanation.plan.as_str(),
             "rule": explanation.rule.as_ref().map(|rule| rule.as_str()),
             "match": format!("{:?}", explanation.match_kind).to_ascii_lowercase(),
             "matched_domain": explanation.matched_domain.as_ref().map(DomainName::as_str),
@@ -83,7 +83,7 @@ impl ManagementTarget {
         let request = serde_json::from_slice::<DnsQueryRequest>(body).map_err(|_| {
             ManagementHttpError::new(400, "Bad Request", "invalid DNS query JSON body")
         })?;
-        let domain = parse_domain(&request.name)?;
+        let domain = parse_domain(&request.domain)?;
         let record_type =
             RecordType::from_str(&request.record_type.to_ascii_uppercase()).map_err(|_| {
                 ManagementHttpError::new(400, "Bad Request", "unsupported DNS record type")
@@ -104,9 +104,9 @@ impl ManagementTarget {
         Ok(json!({
             "schema": DNS_QUERY_SCHEMA,
             "generation": resolution.metadata().generation(),
-            "name": domain.as_str(),
+            "domain": domain.as_str(),
             "type": record_type.to_string(),
-            "plan": resolution.metadata().plan().as_str(),
+            "dns_plan": resolution.metadata().plan().as_str(),
             "rule": resolution.metadata().rule().map(|rule| rule.as_str()),
             "match": format!("{:?}", resolution.metadata().match_kind()).to_ascii_lowercase(),
             "stale": resolution.is_stale(),
@@ -126,18 +126,18 @@ impl ManagementTarget {
             ManagementHttpError::new(400, "Bad Request", "invalid DNS cache-flush JSON body")
         })?;
         let plan = request
-            .plan
+            .dns_plan
             .as_deref()
             .map(DnsPlanId::parse)
             .transpose()
-            .map_err(|_| ManagementHttpError::new(400, "Bad Request", "invalid DNS plan ID"))?;
+            .map_err(|_| ManagementHttpError::new(400, "Bad Request", "invalid DNS plan name"))?;
         let flushed = dns
             .flush_cache(plan.as_ref())
             .map_err(map_dns_runtime_error)?;
         Ok(json!({
             "schema": DNS_FLUSH_SCHEMA,
             "generation": flushed.generation,
-            "plans": flushed.plans,
+            "flushed_dns_plan_count": flushed.plans,
             "removed_entries": flushed.removed_entries,
         }))
     }
@@ -146,7 +146,7 @@ impl ManagementTarget {
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct DnsQueryRequest {
-    name: String,
+    domain: String,
     #[serde(rename = "type")]
     record_type: String,
 }
@@ -155,7 +155,7 @@ struct DnsQueryRequest {
 #[serde(deny_unknown_fields)]
 struct DnsFlushRequest {
     #[serde(default)]
-    plan: Option<String>,
+    dns_plan: Option<String>,
 }
 
 fn parse_domain(value: &str) -> Result<DomainName, ManagementHttpError> {
@@ -165,7 +165,7 @@ fn parse_domain(value: &str) -> Result<DomainName, ManagementHttpError> {
 
 fn plan_status_json(plan: DnsPlanRuntimeSnapshot) -> Value {
     json!({
-        "id": plan.plan.as_str(),
+        "name": plan.plan.as_str(),
         "upstream_strategy": upstream_strategy_json(plan.upstream_strategy),
         "expected_cidrs": plan.expected_cidrs.iter().map(ToString::to_string).collect::<Vec<_>>(),
         "cache": {
@@ -191,7 +191,7 @@ fn upstream_status_json(upstream: DnsUpstreamRuntimeSnapshot) -> Value {
     let average_latency_micros =
         (upstream.successes > 0).then(|| upstream.total_latency_micros / upstream.successes);
     json!({
-        "id": upstream.upstream.as_str(),
+        "name": upstream.upstream.as_str(),
         "transport": format!("{:?}", upstream.transport).to_ascii_lowercase(),
         "bootstrap": upstream.bootstrap.map(|address| address.to_string()),
         "egress": egress_json(&upstream.egress),
@@ -209,7 +209,7 @@ fn upstream_status_json(upstream: DnsUpstreamRuntimeSnapshot) -> Value {
 
 fn upstream_descriptor_json(upstream: &DnsUpstreamDescriptor) -> Value {
     json!({
-        "id": upstream.upstream.as_str(),
+        "name": upstream.upstream.as_str(),
         "transport": format!("{:?}", upstream.transport).to_ascii_lowercase(),
         "bootstrap": upstream.bootstrap.map(|address| address.to_string()),
         "egress": egress_json(&upstream.egress),
@@ -240,7 +240,7 @@ fn records_json(records: &[Record]) -> Vec<Value> {
         .iter()
         .map(|record| {
             json!({
-                "name": record.name.to_utf8(),
+                "owner_name": record.name.to_utf8(),
                 "type": record.record_type().to_string(),
                 "class": record.dns_class.to_string(),
                 "ttl": record.ttl,

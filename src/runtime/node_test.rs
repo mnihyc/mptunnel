@@ -68,7 +68,7 @@ fn tun_host_runtime_config(host: TunHostConfig) -> AppConfig {
             outbounds: Vec::new(),
             gateway_balancers: Vec::new(),
             local_ingresses: vec![LocalIngressConfig {
-                tag: Some("host-tun".to_string()),
+                name: "host-tun".to_string(),
                 config: IngressConfig::TunL4(TunL4Config {
                     host,
                     ..TunL4Config::default()

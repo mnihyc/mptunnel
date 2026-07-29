@@ -7,60 +7,60 @@ static TEST_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 
 const CONFIG_A: &str = r#"
 [[credentials]]
-id = "home"
-principal = "home"
+credential_id = "home"
+principal_id = "home"
 secret = { from = "file", path = "credential.key" }
 
 [[inbounds]]
-tag = "local-socks"
+name = "local-socks"
 protocol = "socks5"
 listen = ["127.0.0.1:1080"]
 
 [[outbounds]]
-tag = "edge"
+name = "edge"
 protocol = "mpp"
-endpoints = ["udp://127.0.0.1:7443"]
+paths = [{ name = "path-1", endpoint = "udp://127.0.0.1:7443" }]
 
 [outbounds.security]
-credential = "home"
+credential_id = "home"
 tls_server_name = "mptunnel.test"
 tls_pinned_certificate_file = "certificate.pem"
 
 [routing]
 
 [[routing.rules]]
-id = "default"
+name = "default"
 action = "outbound"
-target = "edge"
+outbound = "edge"
 "#;
 
 const CONFIG_B: &str = r#"
 [[credentials]]
-id = "home"
-principal = "home"
+credential_id = "home"
+principal_id = "home"
 secret = { from = "file", path = "credential.key" }
 
 [[inbounds]]
-tag = "local-socks"
+name = "local-socks"
 protocol = "socks5"
 listen = ["127.0.0.1:1081"]
 
 [[outbounds]]
-tag = "edge"
+name = "edge"
 protocol = "mpp"
-endpoints = ["udp://127.0.0.1:7443"]
+paths = [{ name = "path-1", endpoint = "udp://127.0.0.1:7443" }]
 
 [outbounds.security]
-credential = "home"
+credential_id = "home"
 tls_server_name = "mptunnel.test"
 tls_pinned_certificate_file = "certificate.pem"
 
 [routing]
 
 [[routing.rules]]
-id = "default"
+name = "default"
 action = "outbound"
-target = "edge"
+outbound = "edge"
 "#;
 
 struct TestDirectory(PathBuf);

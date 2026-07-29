@@ -10,11 +10,11 @@ use crate::config::{
     DEFAULT_RESTART_BACKOFF_MS, DEFAULT_RESTART_MAX_BACKOFF_MS,
     DEFAULT_SESSION_RETENTION_TIMEOUT_MS, DEFAULT_STREAM_WINDOW_BYTES,
     DEFAULT_TCP_PATH_HEARTBEAT_INTERVAL_MS, DEFAULT_TCP_PATH_HEARTBEAT_TIMEOUT_MS, DnsPolicyConfig,
-    LocalIngressConfig, LogFormat, LogLevel, LoggingConfig, ManagementConfig, MppInboundConfig,
-    MppOutboundConfig, MppPerformanceConfig, NodeConfig, OutboundLeafConfig, ProductPolicyConfig,
-    ResourceLimits, RouteTarget, RouteTargetKind, ServerDestinationAclConfig, ServerSecurityConfig,
-    ServiceConfig, SessionConfig, SharedSecret, normalize_secret_bytes, read_secret_environment,
-    read_secret_file,
+    EgressRef, LocalIngressConfig, LogFormat, LogLevel, LoggingConfig, ManagementConfig,
+    MppInboundConfig, MppOutboundConfig, MppPerformanceConfig, NamedPathConfig, NodeConfig,
+    OutboundLeafConfig, ProductPolicyConfig, ResourceLimits, ServerDestinationAclConfig,
+    ServerSecurityConfig, ServiceConfig, SessionConfig, SharedSecret, normalize_secret_bytes,
+    read_secret_environment, read_secret_file,
 };
 use crate::ingress::tun::{
     DEFAULT_TUN_DNS_TTL_MS, DEFAULT_TUN_MTU, ManagedVpnConfig, ManagedVpnPlatformConfig,
@@ -102,14 +102,15 @@ pub struct Cli {
     )]
     pub credential_id: String,
 
-    /// Principal assigned to a simple server credential or route-explain input.
+    /// Principal identity assigned to a simple server credential or
+    /// route-explain input.
     #[arg(
-        long,
+        long = "principal-id",
         global = true,
-        env = "MPTUNNEL_PRINCIPAL",
+        env = "MPTUNNEL_PRINCIPAL_ID",
         default_value = "default-user"
     )]
-    pub principal: String,
+    pub principal_id: String,
 
     /// Read the MPP credential key from this file.
     #[arg(
@@ -190,7 +191,7 @@ impl Cli {
         }
         let credential_id = CredentialId::parse(&self.credential_id)
             .map_err(|error| CliConfigError::Credential(error.to_string()))?;
-        let principal = PrincipalId::parse(&self.principal)
+        let principal = PrincipalId::parse(&self.principal_id)
             .map_err(|error| CliConfigError::Credential(error.to_string()))?;
         let secret = SharedSecret::new(self.resolve_credential_secret()?)?;
         let credential =
@@ -770,12 +771,12 @@ pub enum DnsCommand {
 
 #[derive(Debug, Args)]
 pub struct DnsExplainArgs {
-    pub name: DomainName,
+    pub domain: DomainName,
 }
 
 #[derive(Debug, Args)]
 pub struct DnsQueryArgs {
-    pub name: DomainName,
+    pub domain: DomainName,
 
     /// DNS record type, for example A, AAAA, HTTPS, MX, SRV, or TXT.
     #[arg(long = "type", default_value = "A")]
@@ -784,9 +785,9 @@ pub struct DnsQueryArgs {
 
 #[derive(Debug, Args)]
 pub struct DnsFlushArgs {
-    /// Flush only this plan; omit to flush every plan.
-    #[arg(long)]
-    pub plan: Option<DnsPlanId>,
+    /// Flush only this DNS plan; omit to flush every DNS plan.
+    #[arg(long = "dns-plan")]
+    pub dns_plan: Option<DnsPlanId>,
 }
 
 #[derive(Debug, Args)]
@@ -868,8 +869,8 @@ pub struct ClientArgs {
     #[arg(long, env = "MPTUNNEL_TUN", default_value_t = false)]
     pub tun: bool,
 
-    #[arg(long, env = "MPTUNNEL_TUN_NAME")]
-    pub tun_name: Option<String>,
+    #[arg(long, env = "MPTUNNEL_TUN_INTERFACE_NAME")]
+    pub tun_interface_name: Option<String>,
 
     #[arg(long, env = "MPTUNNEL_TUN_IPV4")]
     pub tun_ipv4: Option<Ipv4Addr>,
@@ -1086,7 +1087,7 @@ impl ClientArgs {
         let mut ingresses = Vec::with_capacity(5);
         if socks5_enabled {
             ingresses.push(LocalIngressConfig {
-                tag: Some("socks5".to_string()),
+                name: "socks5".to_string(),
                 config: IngressConfig::Socks5 {
                     listen: listen_or_default(socks5_listen, 1080),
                     proxy_auth: proxy_auth.clone(),
@@ -1096,7 +1097,7 @@ impl ClientArgs {
         }
         if http_connect_enabled {
             ingresses.push(LocalIngressConfig {
-                tag: Some("http".to_string()),
+                name: "http".to_string(),
                 config: IngressConfig::HttpConnect {
                     listen: self.http_listen.clone(),
                     proxy_auth: proxy_auth.clone(),
@@ -1113,7 +1114,7 @@ impl ClientArgs {
             )
             .map_err(|error| CliConfigError::PortForward(error.to_string()))?;
             ingresses.push(LocalIngressConfig {
-                tag: Some("tcp-forward".to_string()),
+                name: "tcp-forward".to_string(),
                 config: IngressConfig::TcpForward(config),
             });
         }
@@ -1134,7 +1135,7 @@ impl ClientArgs {
             )
             .map_err(|error| CliConfigError::PortForward(error.to_string()))?;
             ingresses.push(LocalIngressConfig {
-                tag: Some("udp-forward".to_string()),
+                name: "udp-forward".to_string(),
                 config: IngressConfig::UdpForward(config),
             });
         }
@@ -1176,9 +1177,9 @@ impl ClientArgs {
                 }),
             };
             ingresses.push(LocalIngressConfig {
-                tag: Some("tun".to_string()),
+                name: "tun".to_string(),
                 config: IngressConfig::TunL4(TunL4Config {
-                    name: self.tun_name.clone(),
+                    interface_name: self.tun_interface_name.clone(),
                     ipv4: tun_ipv4,
                     ipv4_prefix: self.tun_ipv4_prefix,
                     ipv4_gateway: self.tun_ipv4_gateway,
@@ -1198,7 +1199,9 @@ impl ClientArgs {
             paths: self
                 .paths
                 .into_iter()
-                .map(|spec| ClientPathConfig {
+                .enumerate()
+                .map(|(index, spec)| ClientPathConfig {
+                    name: format!("path-{}", index + 1),
                     tls: tls.clone(),
                     spec,
                     security: security.clone(),
@@ -1292,7 +1295,7 @@ fn listen_or_default(listen: Vec<SocketAddr>, port: u16) -> Vec<SocketAddr> {
 
 fn tun_requested(args: &ClientArgs) -> bool {
     args.tun
-        || args.tun_name.is_some()
+        || args.tun_interface_name.is_some()
         || args.tun_ipv4.is_some()
         || args.tun_disable_ipv4
         || args.tun_ipv4_prefix != crate::ingress::tun::DEFAULT_TUN_IPV4_PREFIX
@@ -1336,8 +1339,13 @@ pub struct ServerArgs {
     )]
     pub tls_private_key: Option<PathBuf>,
 
-    #[arg(long, env = "MPTUNNEL_OUTBOUND", value_enum, default_value_t = OutboundArg::Direct)]
-    pub outbound: OutboundArg,
+    #[arg(
+        long = "outbound-protocol",
+        env = "MPTUNNEL_OUTBOUND_PROTOCOL",
+        value_enum,
+        default_value_t = OutboundArg::Direct
+    )]
+    pub outbound_protocol: OutboundArg,
 
     #[arg(long, env = "MPTUNNEL_OUTBOUND_BIND_IP")]
     pub outbound_bind_ip: Option<IpAddr>,
@@ -1450,16 +1458,19 @@ impl ServerArgs {
                 ));
             }
         };
-        if matches!(self.outbound, OutboundArg::Direct | OutboundArg::Bind) && credentials.is_some()
+        if matches!(
+            self.outbound_protocol,
+            OutboundArg::Direct | OutboundArg::Bind
+        ) && credentials.is_some()
         {
             return Err(CliConfigError::UpstreamProxyAuthWithoutProxy);
         }
-        if self.outbound != OutboundArg::HttpsConnect
+        if self.outbound_protocol != OutboundArg::HttpsConnect
             && self.upstream_http_tls_server_name.is_some()
         {
             return Err(CliConfigError::UpstreamTlsNameWithoutHttps);
         }
-        let outbound = match self.outbound {
+        let outbound = match self.outbound_protocol {
             OutboundArg::Direct => OutboundConfig::Direct,
             OutboundArg::Bind => OutboundConfig::BindSourceIp(
                 self.outbound_bind_ip
@@ -1497,13 +1508,18 @@ impl ServerArgs {
             Duration::from_millis(self.outbound_dns_timeout_ms),
         )?;
         let server = MppInboundConfig {
-            tag: None,
-            route_target: RouteTarget {
-                kind: RouteTargetKind::Outbound,
-                tag: id.as_str().to_string(),
-            },
+            name: "cli-mpp-inbound".to_string(),
+            egress: EgressRef::Outbound(id.clone()),
             dns_plan: Some(dns_plan),
-            bind_paths: self.bind_paths,
+            paths: self
+                .bind_paths
+                .into_iter()
+                .enumerate()
+                .map(|(index, spec)| NamedPathConfig {
+                    name: format!("path-{}", index + 1),
+                    spec,
+                })
+                .collect(),
             security,
             tls,
             destination_acl: ServerDestinationAclConfig::default(),

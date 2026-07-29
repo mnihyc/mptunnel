@@ -17,7 +17,7 @@ use tokio::sync::oneshot;
 /// the layer-3 device.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct PacketDeviceConfig<'a> {
-    pub name: Option<&'a str>,
+    pub interface_name: Option<&'a str>,
     pub ipv4: Option<Ipv4Addr>,
     pub ipv4_prefix: u8,
     pub ipv4_gateway: Option<Ipv4Addr>,
@@ -201,8 +201,8 @@ impl PacketDeviceProvider for SystemPacketDeviceProvider {
 ))]
 fn open_system_packet_device(config: &PacketDeviceConfig<'_>) -> io::Result<PacketDevice> {
     let mut builder = tun_rs::DeviceBuilder::new().mtu(config.mtu);
-    if let Some(name) = &config.name {
-        builder = builder.name((*name).to_owned());
+    if let Some(interface_name) = &config.interface_name {
+        builder = builder.name((*interface_name).to_owned());
     }
     if let Some(ipv4) = config.ipv4 {
         builder = builder.ipv4(ipv4, config.ipv4_prefix, config.ipv4_gateway);

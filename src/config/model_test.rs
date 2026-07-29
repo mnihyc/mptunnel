@@ -27,7 +27,7 @@ fn external_tun_is_the_non_mutating_default() {
 #[test]
 fn managed_full_tun_compiles_portable_platform_config() {
     let mut tun = managed_tun(crate::platform::RouteMode::Full);
-    tun.name = None;
+    tun.interface_name = None;
     let managed = tun.managed_vpn().expect("managed");
     assert_eq!(
         tun.managed_dns_capture_servers(),
@@ -52,7 +52,7 @@ fn managed_full_tun_compiles_portable_platform_config() {
 #[test]
 fn managed_vpn_compile_excludes_platform_identity_and_linux_tuning() {
     let mut tun = managed_tun(crate::platform::RouteMode::Full);
-    tun.name = Some("host/adapter/owned/name".to_string());
+    tun.interface_name = Some("host/adapter/owned/name".to_string());
     let baseline = tun
         .compile_managed_vpn()
         .expect("portable compile")
@@ -132,8 +132,8 @@ fn managed_tun_uses_platform_family_validation() {
 
 #[test]
 fn node_rejects_multiple_managed_tun_owners() {
-    let ingress = |tag: &str| LocalIngressConfig {
-        tag: Some(tag.to_string()),
+    let ingress = |name: &str| LocalIngressConfig {
+        name: name.to_string(),
         config: IngressConfig::TunL4(managed_tun(crate::platform::RouteMode::Full)),
     };
 
@@ -179,6 +179,7 @@ fn udp_path_configuration_is_strict_and_requires_sni_identity() {
     let outbound = MppOutboundConfig {
         security: security.clone(),
         paths: vec![ClientPathConfig {
+            name: "path-1".to_string(),
             spec: default_path,
             security,
             tls: crate::transport::encrypted::test_client_tls_config_for_server_name("127.0.0.1"),
@@ -200,17 +201,15 @@ fn server_paths_reject_client_source_binding() {
             .expect("test shared secret"),
     );
     let server = MppInboundConfig {
-        tag: None,
-        route_target: RouteTarget {
-            kind: RouteTargetKind::Outbound,
-            tag: "direct".to_string(),
-        },
+        name: "mpp-inbound".to_string(),
+        egress: EgressRef::Outbound(OutboundId::parse("direct").expect("outbound")),
         dns_plan: None,
-        bind_paths: vec![
-            "tcp://127.0.0.1:443?source-ip=127.0.0.1"
+        paths: vec![NamedPathConfig {
+            name: "path-1".to_string(),
+            spec: "tcp://127.0.0.1:443?source-ip=127.0.0.1"
                 .parse()
                 .expect("server path"),
-        ],
+        }],
         security,
         tls: crate::transport::encrypted::test_server_tls_config(),
         destination_acl: ServerDestinationAclConfig::default(),

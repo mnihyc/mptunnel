@@ -1,6 +1,6 @@
-//! Product gateway status projection and explicit operator actions.
+//! Product balancer status projection and explicit operator actions.
 //!
-//! This module reads the gateway control plane once per management sample.
+//! This module reads the balancer control plane once per management sample.
 //! It never consults carrier schedulers or enters payload forwarding.
 
 use super::ManagementTarget;
@@ -14,34 +14,34 @@ use crate::runtime::outbound_registry::{GatewayRuntimeControl, NamedGatewayRunti
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
-pub(super) const GATEWAY_SCHEMA: &str = "mptunnel.gateway.v1";
+pub(super) const BALANCER_SCHEMA: &str = "mptunnel.balancer.v1";
 
 #[derive(Debug, Clone, Serialize)]
-pub(super) struct ManagementGatewayStatus {
-    pub(super) tag: String,
+pub(super) struct ManagementBalancerStatus {
+    pub(super) name: String,
     pub(super) generation: String,
     pub(super) strategy: &'static str,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub(super) manual_member: Option<String>,
-    pub(super) probe: Option<ManagementGatewayProbe>,
+    pub(super) manual_outbound: Option<String>,
+    pub(super) probe: Option<ManagementBalancerProbe>,
     pub(super) ready_members: usize,
     pub(super) draining_members: usize,
     pub(super) unavailable_members: usize,
     pub(super) active_flows: u64,
     pub(super) pending_flows: u64,
-    pub(super) members: Vec<ManagementGatewayMemberStatus>,
+    pub(super) members: Vec<ManagementBalancerMemberStatus>,
 }
 
 #[derive(Debug, Clone, Serialize)]
-pub(super) struct ManagementGatewayProbe {
+pub(super) struct ManagementBalancerProbe {
     pub(super) target: String,
     pub(super) interval_ms: u64,
     pub(super) timeout_ms: u64,
 }
 
 #[derive(Debug, Clone, Serialize)]
-pub(super) struct ManagementGatewayMemberStatus {
-    pub(super) tag: String,
+pub(super) struct ManagementBalancerMemberStatus {
+    pub(super) outbound: String,
     pub(super) networks: Vec<&'static str>,
     pub(super) mode: &'static str,
     pub(super) readiness: &'static str,
@@ -73,11 +73,11 @@ pub(super) struct ManagementGatewayMemberStatus {
     pub(super) last_selection_reason: Option<&'static str>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(super) last_selected_age_ms: Option<u64>,
-    pub(super) counters: ManagementGatewayCounters,
+    pub(super) counters: ManagementBalancerCounters,
 }
 
 #[derive(Debug, Clone, Serialize)]
-pub(super) struct ManagementGatewayCounters {
+pub(super) struct ManagementBalancerCounters {
     pub(super) selections: String,
     pub(super) open_attempts: String,
     pub(super) open_successes: String,
@@ -92,36 +92,36 @@ pub(super) struct ManagementGatewayCounters {
 }
 
 #[derive(Debug, Serialize)]
-struct GatewayStatusResponse {
+struct BalancerStatusResponse {
     schema: &'static str,
-    gateways: Vec<ManagementGatewayStatus>,
+    balancers: Vec<ManagementBalancerStatus>,
 }
 
 impl ManagementTarget {
-    pub(super) fn gateway_status_json(&self) -> Result<Value, ManagementHttpError> {
-        let gateways = collect_gateway_statuses(self.gateway_control.as_ref())?;
-        serde_json::to_value(GatewayStatusResponse {
-            schema: GATEWAY_SCHEMA,
-            gateways,
+    pub(super) fn balancer_status_json(&self) -> Result<Value, ManagementHttpError> {
+        let balancers = collect_balancer_statuses(self.gateway_control.as_ref())?;
+        serde_json::to_value(BalancerStatusResponse {
+            schema: BALANCER_SCHEMA,
+            balancers,
         })
         .map_err(|_| {
             ManagementHttpError::new(
                 500,
                 "Internal Server Error",
-                "gateway status serialization failed",
+                "balancer status serialization failed",
             )
         })
     }
 
-    pub(super) fn control_gateway_json(&self, body: &[u8]) -> Result<Value, ManagementHttpError> {
-        let request = serde_json::from_slice::<GatewayControlRequest>(body).map_err(|_| {
-            ManagementHttpError::new(400, "Bad Request", "invalid gateway control JSON body")
+    pub(super) fn control_balancer_json(&self, body: &[u8]) -> Result<Value, ManagementHttpError> {
+        let request = serde_json::from_slice::<BalancerControlRequest>(body).map_err(|_| {
+            ManagementHttpError::new(400, "Bad Request", "invalid balancer control JSON body")
         })?;
         let control = self.gateway_control.as_ref().ok_or_else(|| {
             ManagementHttpError::new(
                 409,
                 "Conflict",
-                "gateway control requires a configured balancer",
+                "balancer control requires a configured balancer",
             )
         })?;
         let balancer = BalancerId::parse(&request.balancer).map_err(|error| {
@@ -131,29 +131,29 @@ impl ManagementTarget {
             "enable-member" => set_member_mode(
                 control,
                 &balancer,
-                required_member(&request)?,
+                required_outbound(&request)?,
                 GatewayMemberMode::Enabled,
             )?,
             "drain-member" => set_member_mode(
                 control,
                 &balancer,
-                required_member(&request)?,
+                required_outbound(&request)?,
                 GatewayMemberMode::Draining,
             )?,
             "disable-member" => set_member_mode(
                 control,
                 &balancer,
-                required_member(&request)?,
+                required_outbound(&request)?,
                 GatewayMemberMode::Disabled,
             )?,
             "pin-member" => {
-                let member = parse_member(required_member(&request)?)?;
+                let member = parse_outbound(required_outbound(&request)?)?;
                 control
                     .set_manual_member(&balancer, Some(&member))
                     .map_err(map_gateway_control_error)?;
             }
             "automatic" => {
-                reject_member(&request)?;
+                reject_outbound(&request)?;
                 control
                     .set_manual_member(&balancer, None)
                     .map_err(map_gateway_control_error)?;
@@ -168,28 +168,28 @@ impl ManagementTarget {
         }
         self.refresh_current_snapshot();
         Ok(json!({
-            "schema": GATEWAY_SCHEMA,
+            "schema": BALANCER_SCHEMA,
             "applied": true,
             "scope": "runtime-generation",
             "balancer": balancer.as_str(),
             "action": request.action,
-            "member": request.member,
+            "outbound": request.outbound,
         }))
     }
 }
 
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
-struct GatewayControlRequest {
+struct BalancerControlRequest {
     balancer: String,
     action: String,
     #[serde(default)]
-    member: Option<String>,
+    outbound: Option<String>,
 }
 
-pub(super) fn collect_gateway_statuses(
+pub(super) fn collect_balancer_statuses(
     control: Option<&GatewayRuntimeControl>,
-) -> Result<Vec<ManagementGatewayStatus>, ManagementHttpError> {
+) -> Result<Vec<ManagementBalancerStatus>, ManagementHttpError> {
     let Some(control) = control else {
         return Ok(Vec::new());
     };
@@ -197,13 +197,13 @@ pub(super) fn collect_gateway_statuses(
         .snapshots()
         .map_err(map_gateway_control_error)?
         .into_iter()
-        .map(project_gateway)
+        .map(project_balancer)
         .collect()
 }
 
-fn project_gateway(
+fn project_balancer(
     snapshot: NamedGatewayRuntimeSnapshot,
-) -> Result<ManagementGatewayStatus, ManagementHttpError> {
+) -> Result<ManagementBalancerStatus, ManagementHttpError> {
     let now = snapshot.runtime.now;
     let mut ready_members = 0;
     let mut draining_members = 0;
@@ -220,8 +220,8 @@ fn project_gateway(
         }
         active_flows = active_flows.saturating_add(u64::from(member.load.active_flows));
         pending_flows = pending_flows.saturating_add(u64::from(member.load.pending_flows));
-        members.push(ManagementGatewayMemberStatus {
-            tag: member.member.to_string(),
+        members.push(ManagementBalancerMemberStatus {
+            outbound: member.member.to_string(),
             networks: [Network::Tcp, Network::Udp]
                 .into_iter()
                 .filter(|network| member.networks.contains(*network))
@@ -256,7 +256,7 @@ fn project_gateway(
             last_error_age_ms: age(now, member.last_error_at),
             last_selection_reason: member.last_selection_reason.map(selection_reason_name),
             last_selected_age_ms: age(now, member.last_selected_at),
-            counters: ManagementGatewayCounters {
+            counters: ManagementBalancerCounters {
                 selections: member.counters.selections.to_string(),
                 open_attempts: member.counters.open_attempts.to_string(),
                 open_successes: member.counters.open_successes.to_string(),
@@ -271,15 +271,15 @@ fn project_gateway(
             },
         });
     }
-    Ok(ManagementGatewayStatus {
-        tag: snapshot.id.to_string(),
+    Ok(ManagementBalancerStatus {
+        name: snapshot.id.to_string(),
         generation: snapshot.runtime.generation.to_string(),
         strategy: strategy_name(snapshot.runtime.strategy),
-        manual_member: snapshot
+        manual_outbound: snapshot
             .runtime
             .manual_member
             .map(|member| member.to_string()),
-        probe: snapshot.runtime.probe.map(|probe| ManagementGatewayProbe {
+        probe: snapshot.runtime.probe.map(|probe| ManagementBalancerProbe {
             target: probe.target.authority(),
             interval_ms: bounded_millis(probe.interval),
             timeout_ms: bounded_millis(probe.timeout),
@@ -293,36 +293,36 @@ fn project_gateway(
     })
 }
 
-fn required_member(request: &GatewayControlRequest) -> Result<&str, ManagementHttpError> {
-    request.member.as_deref().ok_or_else(|| {
-        ManagementHttpError::new(400, "Bad Request", "gateway action requires member")
+fn required_outbound(request: &BalancerControlRequest) -> Result<&str, ManagementHttpError> {
+    request.outbound.as_deref().ok_or_else(|| {
+        ManagementHttpError::new(400, "Bad Request", "balancer action requires outbound")
     })
 }
 
-fn reject_member(request: &GatewayControlRequest) -> Result<(), ManagementHttpError> {
-    if request.member.is_some() {
+fn reject_outbound(request: &BalancerControlRequest) -> Result<(), ManagementHttpError> {
+    if request.outbound.is_some() {
         return Err(ManagementHttpError::new(
             400,
             "Bad Request",
-            "automatic action must not set member",
+            "automatic action must not set outbound",
         ));
     }
     Ok(())
 }
 
-fn parse_member(value: &str) -> Result<OutboundId, ManagementHttpError> {
+fn parse_outbound(value: &str) -> Result<OutboundId, ManagementHttpError> {
     OutboundId::parse(value).map_err(|error| {
-        ManagementHttpError::new(400, "Bad Request", format!("invalid member: {error}"))
+        ManagementHttpError::new(400, "Bad Request", format!("invalid outbound: {error}"))
     })
 }
 
 fn set_member_mode(
     control: &GatewayRuntimeControl,
     balancer: &BalancerId,
-    member: &str,
+    outbound: &str,
     mode: GatewayMemberMode,
 ) -> Result<(), ManagementHttpError> {
-    let member = parse_member(member)?;
+    let member = parse_outbound(outbound)?;
     control
         .set_member_mode(balancer, &member, mode)
         .map_err(map_gateway_control_error)

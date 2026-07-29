@@ -119,7 +119,7 @@ fn client_cli_builds_default_socks_config() {
     let node = command_node(config.command);
     let client = only_mpp_outbound(&node);
     assert_eq!(client.paths.len(), 2);
-    assert_eq!(node.local_ingresses[0].tag.as_deref(), Some("socks5"));
+    assert_eq!(node.local_ingresses[0].name, "socks5");
     assert_eq!(
         ingress_configs(&node.local_ingresses),
         vec![IngressConfig::Socks5 {
@@ -521,7 +521,7 @@ fn operational_commands_are_typed_and_do_not_require_runtime_credentials() {
         "tcp",
         "--source",
         "198.51.100.8:41000",
-        "--principal",
+        "--principal-id",
         "alice",
         "--inbound",
         "local-socks",
@@ -611,7 +611,7 @@ fn operational_commands_are_typed_and_do_not_require_runtime_credentials() {
             "tcp",
             "--source",
             "127.0.0.1:1",
-            "--principal",
+            "--principal-id",
             "alice",
             "--inbound",
             "local-socks",
@@ -668,7 +668,7 @@ fn server_outbound_requires_matching_parameters() {
         "server",
         "--bind-path",
         "tcp://0.0.0.0:443",
-        "--outbound",
+        "--outbound-protocol",
         "socks5",
     ])
     .expect("parse cli");
@@ -683,7 +683,7 @@ fn server_outbound_requires_matching_parameters() {
         "server",
         "--bind-path",
         "udp://0.0.0.0:443",
-        "--outbound",
+        "--outbound-protocol",
         "http-connect",
     ])
     .expect("parse cli");
@@ -702,7 +702,7 @@ fn server_https_connect_outbound_and_proxy_auth_are_parsed() {
         OsString::from("server"),
         OsString::from("--bind-path"),
         OsString::from("udp://0.0.0.0:443"),
-        OsString::from("--outbound"),
+        OsString::from("--outbound-protocol"),
         OsString::from("https-connect"),
         OsString::from("--upstream-http"),
         OsString::from("127.0.0.1:8443"),
@@ -735,7 +735,7 @@ fn server_upstream_proxy_auth_requires_both_fields() {
         "server",
         "--bind-path",
         "udp://0.0.0.0:443",
-        "--outbound",
+        "--outbound-protocol",
         "socks5",
         "--upstream-socks5",
         "127.0.0.1:1080",
@@ -807,7 +807,7 @@ fn tun_l4_cli_parses_dual_stack_and_dns() {
     let cli = parse_cli([
         "mptunnel",
         "client",
-        "--tun-name",
+        "--tun-interface-name",
         "mptun0",
         "--tun-ipv6",
         "fd00::1",
@@ -834,7 +834,7 @@ fn tun_l4_cli_parses_dual_stack_and_dns() {
     else {
         panic!("expected TUN L4 ingress");
     };
-    assert_eq!(tun.name.as_deref(), Some("mptun0"));
+    assert_eq!(tun.interface_name.as_deref(), Some("mptun0"));
     assert_eq!(tun.ipv4, Some(crate::ingress::tun::DEFAULT_TUN_IPV4));
     assert_eq!(tun.ipv6, Some("fd00::1".parse().expect("ipv6")));
     assert_eq!(
@@ -958,7 +958,7 @@ fn managed_full_vpn_cli_builds_explicit_host_policy() {
         "client",
         "--tun-vpn-mode",
         "full",
-        "--tun-name",
+        "--tun-interface-name",
         "daily0",
         "--tun-exclude-cidr",
         "192.168.4.7/16",
@@ -1004,7 +1004,7 @@ fn managed_full_vpn_cli_builds_explicit_host_policy() {
         .expect("compile")
         .expect("managed");
 
-    assert_eq!(tun.name.as_deref(), Some("daily0"));
+    assert_eq!(tun.interface_name.as_deref(), Some("daily0"));
     assert_eq!(platform.route_mode(), &crate::platform::RouteMode::Full);
     assert_eq!(
         platform.excludes(),

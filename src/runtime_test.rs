@@ -783,6 +783,7 @@ async fn udp_probe_prepares_cold_carrier_then_isolates_live_validation() {
     let provider = Arc::new(CountingCarrierNetworkProvider::default());
     let context = ClientPathContext::new_with_carrier_network(
         vec![crate::config::ClientPathConfig {
+            name: "path-1".to_string(),
             tls: crate::transport::encrypted::test_client_tls_config(),
             spec: path,
             security: security(),

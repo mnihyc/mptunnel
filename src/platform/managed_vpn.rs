@@ -39,7 +39,7 @@ pub(crate) struct ManagedVpnGenerationSpec {
     pub(crate) managed_tun_count: usize,
     pub(crate) interface_name: String,
     pub(crate) ingress_index: usize,
-    pub(crate) ingress_tag: Option<String>,
+    pub(crate) ingress_name: String,
     pub(crate) platform: ManagedVpnPlatformConfig,
     pub(crate) carrier_paths: Vec<ManagedVpnCarrierPath>,
     pub(crate) native_proxy_endpoints: Vec<Endpoint>,
@@ -61,7 +61,7 @@ pub(crate) fn compile_managed_vpn_generation_spec(
         };
         if tun.managed_vpn().is_some() {
             managed_tun_count = managed_tun_count.saturating_add(1);
-            managed_tun.get_or_insert((ingress_index, ingress.tag.as_deref(), tun));
+            managed_tun.get_or_insert((ingress_index, ingress.name.as_str(), tun));
         }
     }
     if managed_tun_count == 0 {
@@ -73,18 +73,18 @@ pub(crate) fn compile_managed_vpn_generation_spec(
         });
     }
 
-    let (ingress_index, ingress_tag, tun) =
+    let (ingress_index, ingress_name, tun) =
         managed_tun.expect("one managed TUN was counted and retained");
     let managed = tun
         .compile_managed_vpn()
         .map_err(|source| ManagedVpnGenerationSpecError::ManagedTun {
             ingress_index,
-            ingress_tag: ingress_tag.map(str::to_owned),
+            ingress_name: ingress_name.to_owned(),
             source,
         })?
         .expect("a managed TUN compiles to a platform VPN config");
     let interface_name = tun
-        .name
+        .interface_name
         .clone()
         .unwrap_or_else(|| DEFAULT_MANAGED_TUN_NAME.to_owned());
     let platform = tun
@@ -222,7 +222,7 @@ pub(crate) fn compile_managed_vpn_generation_spec(
         managed_tun_count,
         interface_name,
         ingress_index,
-        ingress_tag: ingress_tag.map(str::to_owned),
+        ingress_name: ingress_name.to_owned(),
         platform,
         carrier_paths,
         native_proxy_endpoints,
@@ -255,7 +255,7 @@ pub(crate) enum ManagedVpnGenerationSpecError {
     },
     ManagedTun {
         ingress_index: usize,
-        ingress_tag: Option<String>,
+        ingress_name: String,
         source: ManagedVpnCompileError,
     },
     MppOutboundWithoutCarrierPaths {
@@ -299,12 +299,11 @@ impl fmt::Display for ManagedVpnGenerationSpecError {
             ),
             Self::ManagedTun {
                 ingress_index,
-                ingress_tag,
+                ingress_name,
                 source,
             } => write!(
                 formatter,
-                "managed TUN ingress {} at index {ingress_index} is invalid: {source}",
-                ingress_tag.as_deref().unwrap_or("<untagged>")
+                "managed TUN inbound {ingress_name} at index {ingress_index} is invalid: {source}"
             ),
             Self::MppOutboundWithoutCarrierPaths { outbound } => write!(
                 formatter,

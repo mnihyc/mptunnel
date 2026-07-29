@@ -55,7 +55,7 @@ fn run_status(
     output: &mut dyn Write,
 ) -> Result<(), OperationError> {
     let client = management_client(cli, args.address)?;
-    let value = client.get("/api/v1/status")?;
+    let value = client.get("/api/v2/status")?;
     write_json(output, &value, client.token())
 }
 
@@ -66,7 +66,7 @@ fn run_dns(
 ) -> Result<(), OperationError> {
     let client = management_client(cli, args.address)?;
     let value = match &args.command {
-        DnsCommand::Status => client.get("/api/v1/dns/status")?,
+        DnsCommand::Status => client.get("/api/v2/dns/status")?,
         DnsCommand::Explain(args) => dns_explain(&client, args)?,
         DnsCommand::Query(args) => dns_query(&client, args)?,
         DnsCommand::Flush(args) => dns_flush(&client, args)?,
@@ -75,8 +75,8 @@ fn run_dns(
 }
 
 fn dns_explain(client: &ManagementClient, args: &DnsExplainArgs) -> Result<Value, OperationError> {
-    let encoded = utf8_percent_encode(args.name.as_str(), NON_ALPHANUMERIC);
-    client.get(&format!("/api/v1/dns/explain?name={encoded}"))
+    let encoded = utf8_percent_encode(args.domain.as_str(), NON_ALPHANUMERIC);
+    client.get(&format!("/api/v2/dns/explain?domain={encoded}"))
 }
 
 fn dns_query(client: &ManagementClient, args: &DnsQueryArgs) -> Result<Value, OperationError> {
@@ -90,9 +90,9 @@ fn dns_query(client: &ManagementClient, args: &DnsQueryArgs) -> Result<Value, Op
         return Err(OperationError::InvalidDnsRecordType);
     }
     client.post(
-        "/api/v1/dns/query",
+        "/api/v2/dns/query",
         &json!({
-            "name": args.name.as_str(),
+            "domain": args.domain.as_str(),
             "type": args.record_type.to_ascii_uppercase(),
         }),
     )
@@ -100,8 +100,8 @@ fn dns_query(client: &ManagementClient, args: &DnsQueryArgs) -> Result<Value, Op
 
 fn dns_flush(client: &ManagementClient, args: &DnsFlushArgs) -> Result<Value, OperationError> {
     client.post(
-        "/api/v1/dns/cache/flush",
-        &json!({"plan": args.plan.as_ref().map(|plan| plan.as_str())}),
+        "/api/v2/dns/cache/flush",
+        &json!({"dns_plan": args.dns_plan.as_ref().map(|plan| plan.as_str())}),
     )
 }
 
@@ -124,7 +124,7 @@ fn run_route_explain(
         args.network.into(),
         args.target.clone(),
         SourceEndpoint::from_socket_addr(args.source),
-        crate::product::PrincipalId::parse(&cli.principal)
+        crate::product::PrincipalId::parse(&cli.principal_id)
             .map_err(|error| OperationError::RouteInput(error.to_string()))?,
         args.inbound.clone(),
     );
@@ -146,7 +146,7 @@ fn render_route_explanation(
 ) -> Result<(), OperationError> {
     let selected = explanation.selected();
     let action = selected.action();
-    let (action_name, outbound) = action_labels(action.egress());
+    let action_name = egress_action_name(action.egress());
     let resolution = policy.routes().classify(RouteInput::pre_resolution(flow));
     let resolution_action = resolution.action();
     let resolution_dns_plan = resolution_action
@@ -193,7 +193,11 @@ fn render_route_explanation(
     writeln!(output, "selected:")?;
     writeln!(output, "  rule: {}", selected.rule_id())?;
     writeln!(output, "  action: {action_name}")?;
-    writeln!(output, "  outbound: {outbound}")?;
+    match action.egress() {
+        EgressAction::Outbound(outbound) => writeln!(output, "  outbound: {outbound}")?,
+        EgressAction::Balancer(balancer) => writeln!(output, "  balancer: {balancer}")?,
+        EgressAction::Direct | EgressAction::Reject | EgressAction::Drop => {}
+    }
     writeln!(
         output,
         "  traffic_intent: {}",
@@ -231,16 +235,13 @@ fn render_route_explanation(
     Ok(())
 }
 
-fn action_labels(action: &EgressAction) -> (&'static str, String) {
+fn egress_action_name(action: &EgressAction) -> &'static str {
     match action {
-        EgressAction::Direct => ("direct", "direct".to_string()),
-        EgressAction::Reject => ("reject", "none".to_string()),
-        EgressAction::Drop => ("drop", "none".to_string()),
-        EgressAction::Outbound(outbound) => ("outbound", outbound.to_string()),
-        EgressAction::Balancer(balancer) => (
-            "balancer",
-            format!("{balancer} (member selected at flow open)"),
-        ),
+        EgressAction::Direct => "direct",
+        EgressAction::Reject => "reject",
+        EgressAction::Drop => "drop",
+        EgressAction::Outbound(_) => "outbound",
+        EgressAction::Balancer(_) => "balancer",
     }
 }
 
@@ -362,7 +363,7 @@ fn doctor_management_checks(
     for address in addresses {
         let label = format!("management {address}");
         let result = ManagementClient::new(address, token.clone())
-            .and_then(|client| client.request("GET", "/api/v1/health", None, true));
+            .and_then(|client| client.request("GET", "/api/v2/health", None, true));
         match result {
             Ok(response) => {
                 let live = response.body.get("live").and_then(Value::as_bool);
@@ -387,9 +388,9 @@ fn doctor_management_checks(
                         }
                     }
                     _ if explicit => {
-                        report.fail(&label, "health response did not match the v1 schema")
+                        report.fail(&label, "health response did not match the v2 schema")
                     }
-                    _ => report.warn(&label, "health response did not match the v1 schema"),
+                    _ => report.warn(&label, "health response did not match the v2 schema"),
                 }
             }
             Err(error) if explicit => report.fail(&label, error.to_string()),
@@ -408,14 +409,14 @@ fn configured_probe_endpoints(config: &AppConfig, report: &mut DoctorReport) -> 
     for outbound in &node.outbounds {
         match outbound {
             OutboundLeafConfig::Mpp { id, config } => {
-                for (index, path) in config.paths.iter().enumerate() {
+                for path in &config.paths {
                     let connect = path.spec.underlay == UnderlayProtocol::Tcp;
                     let skip_connect = path.spec.binding.source_ip.is_some();
                     push_probe(
                         &mut probes,
                         &mut seen,
                         ProbeEndpoint {
-                            label: format!("MPP outbound {id} path {index}"),
+                            label: format!("MPP outbound {id} path {}", path.name),
                             endpoint: path.spec.endpoint.clone(),
                             connect,
                             skip_connect,
@@ -904,7 +905,7 @@ struct ManagementResponse {
 fn validate_management_path(path: &str) -> Result<(), OperationError> {
     if path.is_empty()
         || path.len() > MANAGEMENT_PATH_LIMIT
-        || !path.starts_with("/api/v1/")
+        || !path.starts_with("/api/v2/")
         || !path.is_ascii()
         || path
             .bytes()

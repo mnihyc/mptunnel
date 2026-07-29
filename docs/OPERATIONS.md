@@ -133,9 +133,16 @@ mptunnel --config ./config.toml --check-config
 mptunnel --config ./config.toml
 ```
 
-The graph contains tagged `[[inbounds]]`, `[[outbounds]]`, and optional
-balancers. An inbound selects one outbound or balancer. MPP security and path
-endpoints belong to each MPP inbound/outbound rather than to a global path role.
+The graph contains explicitly named `[[inbounds]]`, `[[outbounds]]`, and
+optional `[[routing.balancers]]`. Every configured resource name is canonical
+lowercase ASCII. Configured-resource references use the selected resource noun:
+`inbounds`, `outbound`, `balancer`, or `dns_plan`. The `_id` suffix is
+reserved for protocol, principal, or signed-artifact identities such as
+`credential_id`, `principal_id`, `rule_set_id`, and `publisher_id`; `target`
+is reserved for an application or active-probe destination authority, while
+`endpoint` is reserved for a listener, connector, or carrier network endpoint.
+MPP security and named carrier paths belong to each MPP inbound/outbound
+rather than to a global path role.
 
 `tcp-forward` and `udp-forward` local inbounds require explicit non-zero
 listeners and one canonical `target`. TCP overload is closed immediately at
@@ -144,7 +151,7 @@ expires source associations at `idle_timeout_ms`, and bounds each datagram by
 `datagram_ttl_ms`. Both use the ordinary route/DNS/ACL/outbound/balancer path;
 they do not dial around configured outbounds.
 
-Gateway strategies are `manual`, `ordered-failover`, `round-robin`, `random`,
+Balancer strategies are `manual`, `ordered-failover`, `round-robin`, `random`,
 `weighted-random`, `least-latency`, and `least-load`. Members may start
 `enabled`, `draining`, or `disabled`; only enabled members receive new flows.
 Optional destination or principal stickiness is bounded by both TTL and entry
@@ -161,6 +168,7 @@ transparent replay through another member.
 Use repeated explicit IPv4 and IPv6 listener/bind/resolver values. Do not rely
 on OS-specific dual-stack defaults. Egress DNS strategy and connect timeout
 belong to the outbound that performs resolution and connection.
+`[dns].default_dns_plan` selects the named plan used when no DNS rule matches.
 
 `[session].retention_timeout_ms` and
 `--session-retention-timeout-ms` set the absolute time an established logical
@@ -203,11 +211,10 @@ runtime configuration.
 Explain the exact immutable Product route table without opening a socket:
 
 ```bash
-mptunnel --config ./config.toml route explain \
+mptunnel --config ./config.toml --principal-id local-user route explain \
   --target api.example:443 \
   --network tcp \
   --source 127.0.0.1:41000 \
-  --principal local-user \
   --inbound local-socks
 ```
 
@@ -227,7 +234,7 @@ mptunnel --config ./config.toml dns status
 mptunnel --config ./config.toml dns explain example.com
 mptunnel --config ./config.toml dns query example.com --type HTTPS
 mptunnel --config ./config.toml dns flush
-mptunnel --config ./config.toml dns flush --plan private
+mptunnel --config ./config.toml dns flush --dns-plan private
 ```
 
 With `--config`, the client uses the first configured management listener and
@@ -249,10 +256,11 @@ management policy changes them. Rate, RTT, and jitter are startup measurement
 priors that live evidence may replace. Neither category is a persistent
 stream-placement role.
 
-A configured path ordinal is endpoint-local composition identity. The server
-preserves the accepting ordinal with its bound socket or QUIC endpoint; a
-peer-supplied `path_id` is opaque and never indexes local configuration. Client
-and server path lists therefore do not need matching order.
+A configured path `name` is its stable endpoint-local Product identity. The
+server preserves that name with its bound socket or QUIC endpoint; a
+peer-supplied `path_id` is opaque runtime identity and never indexes local
+configuration. Client and server path lists therefore do not need matching
+names or order.
 
 During authenticated setup the peer advertises sequence-zero directional
 `PathUsage::{Available, Backup}`. This is separate from local path health.
@@ -280,54 +288,62 @@ reference, for example
 `token = { from = "file", path = "management-token.key" }`. Secret bytes never
 belong in TOML, argv, diagnostics, or the runtime configuration API.
 
-All data and controls are authenticated and live only under `/api/v1/`. There
-are no unversioned compatibility routes:
+All data and controls are authenticated under `/api/v2/`:
 
-- `GET /api/v1/` returns the endpoint index and schema identifier.
-- `GET /api/v1/health` returns the complete liveness/readiness/degraded
-  assessment. `GET /api/v1/health/live` gates only terminal generation
-  failure; `GET /api/v1/health/ready` gates serving readiness. Both use the
-  same response body.
-- `GET /api/v1/config` returns the canonical path, desired, active, runtime,
-  and pending revisions, plus the supported mutation endpoints and
-  precondition. It never returns the TOML document or resolved secrets.
-- `POST /api/v1/config/validate` accepts one complete, bounded UTF-8 document
-  with `Content-Type: application/toml`, validates the configuration and its
-  referenced material, and returns its revision without writing or reloading.
-- `POST /api/v1/config/apply` accepts the same complete document and requires
-  exactly one `If-Match: sha256:...` revision from `GET /api/v1/config`
-  (optionally quoted). It atomically persists only when the desired revision
-  still matches, and reports an unchanged document, a live process-logging or
-  credential-authority update, or a pending generation reload.
-- `GET /api/v1/status` returns the complete cached
-  `mptunnel.management.v4` snapshot, including sanitized local-inbound and
-  leaf-outbound inventory. Outbound entries expose only tag, connector kind,
-  and supported networks; proxy/carrier endpoints and credentials are absent.
-- `GET /api/v1/gateways` returns Product gateway/member readiness, freshness,
-  active/passive observation source, latency-sample source and age, load,
-  selection reason, last error, probe state, circuit cooldown, and monotonic
-  counters.
-- `GET /api/v1/dns/status` returns DNS generation, cache, in-flight query, and
-  upstream outcome counters plus FakeDNS allocation/recovery/capacity state.
-  `GET /api/v1/dns/explain?name=<domain>` explains policy selection, encrypted
-  upstream transport, and capture-only FakeDNS policy without sending a query.
-- `GET /api/v1/paths` returns configured listeners, logical client paths, and live
-  server carrier instances with their actual lifecycle state.
-- `GET /api/v1/traffic` returns monotonic product totals, one-second rates, and
-  five minutes of one-second trend samples.
-- `GET /api/v1/sessions` returns authenticated MPP session ownership; `GET
-  /api/v1/flows` returns bounded active reliable/datagram Product-flow detail.
-  Each record has a generation-local flow ID, immutable origin inbound,
-  network, original requested target, concrete selected leaf, and the
-  balancer/member pair when selection used a balancer.
-- `GET /api/v1/diagnostics` returns local diagnostic capability and typed peer
-  service/index/session selectors.
-- `POST /api/v1/actions/path` changes endpoint-local client path lifecycle policy.
-- `POST /api/v1/gateways/actions` accepts only explicit `enable-member`,
-  `drain-member`, `disable-member`, `pin-member`, and `automatic` actions.
-- `POST /api/v1/dns/query` performs an explicit typed query; `POST
-  /api/v1/dns/cache/flush` flushes one named plan or all plans.
-- `POST /api/v1/diagnostics/peer` requests a sanitized peer snapshot.
+- `GET /api/v2/` returns the endpoint index with
+  `mptunnel.management.v5`.
+- `GET /api/v2/health`, `GET /api/v2/health/live`, and
+  `GET /api/v2/health/ready` return `mptunnel.health.v2`. The latter two gate
+  terminal generation failure and serving readiness respectively.
+- `GET /api/v2/status` returns the complete cached
+  `mptunnel.management.v5` snapshot, including sanitized named inbound and
+  outbound inventory. Connector and carrier endpoints and credentials are
+  absent.
+- `GET /api/v2/paths` returns configured named paths and live carrier
+  instances with their lifecycle state.
+- `GET /api/v2/traffic` returns monotonic Product totals, one-second rates,
+  and five minutes of one-second trend samples.
+- `GET /api/v2/sessions` returns authenticated MPP session ownership.
+- `GET /api/v2/flows` returns bounded active reliable/datagram Product-flow
+  detail, including the origin inbound, application target, selected outbound,
+  and optional balancer.
+- `GET /api/v2/diagnostics` returns local diagnostic capability, peer session
+  references, controls, and path state.
+- `GET /api/v2/config` returns `mptunnel.config.v2` with the canonical path,
+  desired, active, runtime, and pending revisions, mutation endpoints, and
+  required precondition. It never returns TOML or resolved secrets.
+- `GET /api/v2/balancers` returns `mptunnel.balancer.v1` with named balancer
+  and outbound-member readiness, freshness, load, observations, probes,
+  circuit state, and counters.
+- `GET /api/v2/dns/status` returns `mptunnel.dns.status.v2` with DNS
+  generation, cache, in-flight query, upstream, and FakeDNS state.
+- `GET /api/v2/dns/explain?domain=<domain>` returns
+  `mptunnel.dns.explain.v2` without issuing a query.
+- `POST /api/v2/actions/path` accepts exactly
+  `{ "outbound": "...", "path": "...", "state": "..." }`; `state` is
+  `enabled`, `suspect`, `failed`, or `disabled`.
+- `POST /api/v2/diagnostics/peer` accepts exactly
+  `{ "service": "mpp_outbound", "service_name": "...", "session_id": "..." }`
+  or the corresponding `mpp_inbound` service.
+- `POST /api/v2/config/validate` accepts one bounded UTF-8
+  `application/toml` document, validates it and its referenced material, and
+  returns its revision without writing or reloading.
+- `POST /api/v2/config/apply` accepts the same complete document and exactly
+  one `If-Match: sha256:...` revision from `GET /api/v2/config`. It persists
+  only when the desired revision still matches.
+- `POST /api/v2/balancers/actions` accepts exactly `balancer`, `action`, and,
+  except for `automatic`, `outbound`. Actions are `enable-member`,
+  `drain-member`, `disable-member`, `pin-member`, and `automatic`; responses
+  use `mptunnel.balancer.v1`.
+- `POST /api/v2/dns/query` accepts exactly
+  `{ "domain": "...", "type": "..." }` and returns
+  `mptunnel.dns.query.v2`.
+- `POST /api/v2/dns/cache/flush` accepts `{}` or
+  `{ "dns_plan": "..." }` and returns `mptunnel.dns.flush.v2`.
+
+Every `service_index` in a response is presentation-only. Mutations select
+stable configured names (`outbound`, `path`, `balancer`, and `service_name`)
+plus the protocol `session_id`; they never accept an index.
 
 Configuration mutation is deliberately full-document only: there is no
 `PATCH`, field update, history, or diff API. Process logging and inbound
@@ -366,9 +382,9 @@ The API has no CORS support and sends restrictive browser security headers.
 `live` means the process can answer and its generation has not entered terminal
 failure. `ready` additionally requires a ready generation, a connected MPP
 outbound when one is configured, and at least one ready member in each
-configured gateway. `degraded` reports partial MPP/gateway/path loss, a pending
+configured balancer. `degraded` reports partial MPP/balancer/path loss, a pending
 configuration activation, or a queried DNS plan that has never produced a
-successful upstream result. Listener and DNS/session/gateway facts used for the
+successful upstream result. Listener and DNS/session/balancer facts used for the
 decision are included in the response; inbound-only servers remain ready while
 waiting for clients.
 
@@ -394,12 +410,13 @@ Set `allow_peer_diagnostics = true` or
 authenticated peer. The permission is independent of local HTTP and disabled
 by default. Either endpoint may initiate from its own management API; the
 remote endpoint's flag decides whether it returns data. Responses contain only
-per-session path state, usage, and metrics. They exclude endpoints, route
-targets, local tags, credentials, and every other authenticated session. One
+per-session path state, usage, and metrics. They exclude endpoints,
+application targets, local resource names, credentials, and every other
+authenticated session. One
 request per session may be in flight, requests time out, and responders admit
 at most one snapshot request per session per second. A rate-limited or
 codec-oversized complete snapshot returns `unavailable`; it is never truncated.
-The dashboard auto-refresh selector applies one completion-driven cadence to
+The dashboard auto-refresh control applies one completion-driven cadence to
 both local status and the currently selected peer diagnostic request: 1 s,
 5 s, 30 s, or manual only. It never overlaps cycles. Peer requests occur only
 when the local endpoint advertises a connected diagnostic control session and
@@ -410,14 +427,14 @@ Path control uses `enabled`, `suspect`, `failed`, or `disabled`. Enabling clears
 the operator disable but leaves a path suspect until fresh carrier liveness
 evidence restores it; management never manufactures an active observation.
 
-Gateway actions have the same evidence rule. Enabling a member permits new
+Balancer actions have the same evidence rule. Enabling a member permits new
 selection but does not invent a successful probe. `drain-member` immediately
 stops new selection while established flows finish on their existing leaf.
 `pin-member` is an explicit manual override; `automatic` returns a non-manual
 strategy to configured ranking. A balancer configured with strategy `manual`
 must always retain a pin and therefore rejects `automatic`. These actions have
 `runtime-generation` scope: persist the corresponding member mode or
-`manual_member` in TOML through the configuration API when it must survive a
+`manual_outbound` in TOML through the configuration API when it must survive a
 restart or configuration reload.
 
 ## Resource envelopes
@@ -648,9 +665,10 @@ rejects new authentication immediately and retires only work admitted by that
 credential after its configured grace.
 
 Local SOCKS5 and HTTP CONNECT logins are declared once in `[[local_users]]`
-and referenced by inbound `users = [...]`. Each login maps explicitly to a
-Product principal, so routing and per-principal admission do not depend on the
-presented username. Local and upstream proxy passwords use the same
+with a canonical `name` and referenced by inbound `local_users = [...]`. Each
+login maps explicitly to a `principal_id`, so routing and per-principal
+admission do not depend on the presented username. Local and upstream proxy
+passwords use the same
 file/environment reference shape as MPP credentials and the management token.
 Local proxy inbounds separately bound total connections, connections per
 source IP, connections per principal, and their authentication/header deadline

@@ -411,7 +411,9 @@ fn client_context_with_session_retention(
 ) -> ClientPathContext {
     let paths = paths
         .into_iter()
-        .map(|spec| ClientPathConfig {
+        .enumerate()
+        .map(|(index, spec)| ClientPathConfig {
+            name: format!("path-{}", index + 1),
             tls: crate::transport::encrypted::test_client_tls_config(),
             spec,
             security: security(),

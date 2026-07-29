@@ -113,10 +113,10 @@ pub(super) struct ProductRuntimeInventory {
 
 #[derive(Debug, Clone)]
 struct ProductInboundInventory {
-    tag: Option<String>,
+    name: String,
     protocol: &'static str,
     listen: Vec<String>,
-    name: Option<String>,
+    interface_name: Option<String>,
     target: Option<String>,
     auth_required: bool,
 }
@@ -136,46 +136,49 @@ impl ProductRuntimeInventory {
         let local_inbounds = local_inbounds
             .iter()
             .map(|inbound| {
-                let (protocol, listen, name, target, auth_required) = match &inbound.config {
-                    IngressConfig::Socks5 {
-                        listen, proxy_auth, ..
-                    } => (
-                        "socks5",
-                        listen.iter().map(ToString::to_string).collect(),
-                        None,
-                        None,
-                        proxy_auth.is_required(),
-                    ),
-                    IngressConfig::HttpConnect {
-                        listen, proxy_auth, ..
-                    } => (
-                        "http-connect",
-                        listen.iter().map(ToString::to_string).collect(),
-                        None,
-                        None,
-                        proxy_auth.is_required(),
-                    ),
-                    IngressConfig::TcpForward(config) => (
-                        "tcp-forward",
-                        config.listen().iter().map(ToString::to_string).collect(),
-                        None,
-                        Some(config.target().to_string()),
-                        false,
-                    ),
-                    IngressConfig::UdpForward(config) => (
-                        "udp-forward",
-                        config.listen().iter().map(ToString::to_string).collect(),
-                        None,
-                        Some(config.target().to_string()),
-                        false,
-                    ),
-                    IngressConfig::TunL4(tun) => ("tun", Vec::new(), tun.name.clone(), None, false),
-                };
+                let (protocol, listen, interface_name, target, auth_required) =
+                    match &inbound.config {
+                        IngressConfig::Socks5 {
+                            listen, proxy_auth, ..
+                        } => (
+                            "socks5",
+                            listen.iter().map(ToString::to_string).collect(),
+                            None,
+                            None,
+                            proxy_auth.is_required(),
+                        ),
+                        IngressConfig::HttpConnect {
+                            listen, proxy_auth, ..
+                        } => (
+                            "http-connect",
+                            listen.iter().map(ToString::to_string).collect(),
+                            None,
+                            None,
+                            proxy_auth.is_required(),
+                        ),
+                        IngressConfig::TcpForward(config) => (
+                            "tcp-forward",
+                            config.listen().iter().map(ToString::to_string).collect(),
+                            None,
+                            Some(config.target().to_string()),
+                            false,
+                        ),
+                        IngressConfig::UdpForward(config) => (
+                            "udp-forward",
+                            config.listen().iter().map(ToString::to_string).collect(),
+                            None,
+                            Some(config.target().to_string()),
+                            false,
+                        ),
+                        IngressConfig::TunL4(tun) => {
+                            ("tun", Vec::new(), tun.interface_name.clone(), None, false)
+                        }
+                    };
                 ProductInboundInventory {
-                    tag: inbound.tag.clone(),
+                    name: inbound.name.clone(),
                     protocol,
                     listen,
-                    name,
+                    interface_name,
                     target,
                     auth_required,
                 }

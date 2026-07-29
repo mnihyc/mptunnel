@@ -67,16 +67,13 @@ fn test_server_datagram_port_with_retention(
         crate::runtime::outbound_registry::test_dns_generation(),
     )
     .expect("registry");
-    let outbound_selector = outbound_registry
-        .selector_for_target(&crate::config::RouteTarget {
-            kind: crate::config::RouteTargetKind::Outbound,
-            tag: id.as_str().to_string(),
-        })
-        .expect("selector");
+    let egress_selection = outbound_registry
+        .selection_for_egress(&crate::config::EgressRef::Outbound(id))
+        .expect("selection");
     let reliable_streams = Arc::new(ServerReliableStreamRegistry::new(8)).path_port();
     let inner = ServerDatagramService::path_port(ServerDatagramServiceConfig {
         outbound_registry,
-        outbound_selector,
+        egress_selection,
         dns_plan: None,
         destination_policy: Arc::new(
             crate::outbound::ServerDestinationPolicy::allow_restricted_for_test(),

@@ -1,10 +1,11 @@
 //! Client process lifecycle and background path liveness probes.
 
-use crate::config::{LocalIngressConfig, MppOutboundConfig, RouteTarget};
+use crate::config::{LocalIngressConfig, MppOutboundConfig};
 use crate::ingress::IngressConfig;
 use crate::mux::MuxLimits;
 use crate::performance::ResourceLimits;
 use crate::platform::{PacketDeviceConfig, PacketDeviceProvider};
+use crate::product::OutboundId;
 use crate::protocol::UnderlayProtocol;
 use crate::runtime::error::RuntimeError;
 use crate::runtime::ingress_runtime::{
@@ -23,14 +24,14 @@ use std::time::Duration;
 pub(super) fn new_path_context(
     client: &MppOutboundConfig,
     resources: ResourceLimits,
-    route_target: RouteTarget,
+    outbound: OutboundId,
     runtime: ClientPathRuntimeOptions,
     telemetry: RuntimeTelemetry,
 ) -> Result<ClientPathContext, RuntimeError> {
     ClientPathContext::new_with_runtime_options_and_telemetry(
         client.paths.clone(),
         resources,
-        Some(route_target),
+        Some(outbound),
         runtime,
         telemetry,
     )
@@ -46,16 +47,8 @@ pub(super) async fn spawn_ingresses(
 ) -> Result<(), RuntimeError> {
     for ingress in ingresses {
         let router = router.clone();
-        let inbound = ingress
-            .tag
-            .as_deref()
-            .ok_or(RuntimeError::Protocol(
-                "local inbound is missing its routing tag",
-            ))
-            .and_then(|tag| {
-                crate::product::InboundId::parse(tag)
-                    .map_err(|_| RuntimeError::Protocol("local inbound has an invalid routing tag"))
-            })?;
+        let inbound = crate::product::InboundId::parse(&ingress.name)
+            .map_err(|_| RuntimeError::Protocol("local inbound has an invalid name"))?;
         match ingress.config {
             IngressConfig::Socks5 {
                 listen,
@@ -115,7 +108,7 @@ pub(super) async fn spawn_ingresses(
                 tasks.spawn(async move {
                     let device = packet_devices
                         .open(&PacketDeviceConfig {
-                            name: tun.name.as_deref(),
+                            interface_name: tun.interface_name.as_deref(),
                             ipv4: tun.ipv4,
                             ipv4_prefix: tun.ipv4_prefix,
                             ipv4_gateway: tun.ipv4_gateway,

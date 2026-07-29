@@ -9,7 +9,7 @@ use crate::product::{
 use crate::protocol::TargetAddr;
 use crate::runtime::error::RuntimeError;
 use crate::runtime::outbound_registry::{
-    OpenedTcpOutbound, OpenedUdpOutbound, OutboundSelector, RuntimeOutboundRegistry,
+    EgressSelection, OpenedTcpOutbound, OpenedUdpOutbound, RuntimeOutboundRegistry,
 };
 use crate::scheduler::TrafficClass;
 use bytes::Bytes;
@@ -45,7 +45,7 @@ pub(in crate::runtime) struct ClientOutboundPlan {
 }
 
 struct PostResolutionRouteGroup {
-    selector: OutboundSelector,
+    selection: EgressSelection,
     authorized: Vec<AuthorizedTarget>,
     traffic_class: TrafficClass,
 }
@@ -76,7 +76,7 @@ impl ClientOutboundPlan {
                 .registry
                 .open_authorized_tcp(
                     &pending,
-                    &group.selector,
+                    &group.selection,
                     &group.authorized,
                     self.dns_plan.as_ref(),
                     group.traffic_class,
@@ -122,7 +122,7 @@ impl ClientOutboundPlan {
                 .registry
                 .open_authorized_udp(
                     &pending,
-                    &group.selector,
+                    &group.selection,
                     &group.authorized,
                     self.dns_plan.as_ref(),
                     group.traffic_class,
@@ -175,26 +175,26 @@ impl ClientOutboundPlan {
                     authorized_target.address(),
                 ));
             let traffic_class = traffic_class(decision.action().traffic_intent(), network);
-            let selector = match decision.action().egress() {
+            let selection = match decision.action().egress() {
                 EgressAction::Outbound(_) | EgressAction::Balancer(_) => self
                     .registry
-                    .selector_for_action(decision.action().egress())?,
+                    .selection_for_action(decision.action().egress())?,
                 EgressAction::Reject | EgressAction::Drop => continue,
                 EgressAction::Direct => {
                     return Err(RuntimeError::ProductPolicy(format!(
-                        "post-resolution route {} must select a tagged direct outbound",
+                        "post-resolution route {} must select a configured direct outbound",
                         decision.rule_id().as_str()
                     )));
                 }
             };
             if let Some(group) = groups
                 .iter_mut()
-                .find(|group| group.selector == selector && group.traffic_class == traffic_class)
+                .find(|group| group.selection == selection && group.traffic_class == traffic_class)
             {
                 group.authorized.push(authorized_target);
             } else {
                 groups.push(PostResolutionRouteGroup {
-                    selector,
+                    selection,
                     authorized: vec![authorized_target],
                     traffic_class,
                 });

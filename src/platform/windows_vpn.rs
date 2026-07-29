@@ -68,7 +68,7 @@ fn compile_node_windows_vpn_prepare_request(
         managed_tun_count,
         interface_name,
         ingress_index,
-        ingress_tag,
+        ingress_name,
         platform,
         carrier_paths,
         native_proxy_endpoints,
@@ -82,7 +82,7 @@ fn compile_node_windows_vpn_prepare_request(
     validate_wintun_name(&interface_name).map_err(|source| {
         WindowsVpnGenerationSpecError::Wintun {
             ingress_index,
-            ingress_tag,
+            ingress_name,
             source,
         }
     })?;
@@ -107,7 +107,7 @@ pub(crate) enum WindowsVpnGenerationSpecError {
     Portable(ManagedVpnGenerationSpecError),
     Wintun {
         ingress_index: usize,
-        ingress_tag: Option<String>,
+        ingress_name: String,
         source: WindowsWintunConfigError,
     },
 }
@@ -118,12 +118,11 @@ impl fmt::Display for WindowsVpnGenerationSpecError {
             Self::Portable(error) => fmt::Display::fmt(error, formatter),
             Self::Wintun {
                 ingress_index,
-                ingress_tag,
+                ingress_name,
                 source,
             } => write!(
                 formatter,
-                "managed TUN ingress {} at index {ingress_index} has an invalid Wintun identity: {source}",
-                ingress_tag.as_deref().unwrap_or("<untagged>")
+                "managed TUN inbound {ingress_name} at index {ingress_index} has an invalid Wintun identity: {source}"
             ),
         }
     }

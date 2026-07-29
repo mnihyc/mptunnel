@@ -22,13 +22,13 @@ exist. Future ideas are listed only as explicit exclusions or evidence gaps.
 | SOCKS5, HTTP CONNECT, fixed forwarding, and TUN ingress | MPP v4 frames and identities |
 | Canonical flow context and principals | Logical sessions, streams, datagrams, and path instances |
 | Routing, destination ACL, DNS, and outbound selection | Directional sequence numbers, Data ACKs, flow control, and reassembly |
-| Product gateway selection between independent outbounds | Carrier selection inside one selected MPP session |
+| Product balancer selection between independent outbounds | Carrier selection inside one selected MPP session |
 | Credentials, admission policy, configuration, API, and dashboard | TCP/QUIC carrier lifecycle, scheduling, reinjection, and failover |
 | Host VPN transactions and release packaging | RFC-defined timing, evidence, congestion, and recovery boundaries |
 
 The separation is structural:
 
-- A Product gateway selects one outbound for a new flow. It never merges paths
+- A Product balancer selects one outbound for a new flow. It never merges paths
   from separate MPP sessions.
 - The Core scheduler selects TCP or QUIC carriers only inside that chosen MPP
   session.
@@ -37,7 +37,7 @@ The separation is structural:
   state, reinjection thresholds, or benchmark-derived timing.
 - Core cannot import route rules, DNS plans, users, TOML, UI, or host VPN
   policy.
-- Gateway retry is allowed only before flow commit. An established flow is
+- Balancer retry is allowed only before flow commit. An established flow is
   never replayed through an unrelated server.
 - Product actions and observability use bounded control/snapshot ports and do
   not enter per-byte or per-packet Core hot paths.
@@ -56,10 +56,10 @@ The separation is structural:
 | `mptunnel ... server` | Ephemeral | Builds one MPP inbound plus one native outbound selected from `direct`, `bind`, `socks5`, `http-connect`, or `https-connect`. |
 | `MPTUNNEL_*` environment variables | Ephemeral | Mirrors the simple CLI fields. Secret values are accepted only through referenced files, named environment variables, or credential stdin where explicitly supported. |
 | Authenticated config API | Persistent | Validates or atomically replaces the complete TOML document with revision compare-and-swap. It is not a field-patch API. |
-| Runtime action API | Generation-local | Controls path lifecycle, gateway member mode/pin, DNS cache/query, and peer diagnostics. These actions persist only when also represented in TOML through config apply. |
+| Runtime action API | Generation-local | Controls path lifecycle, balancer member mode/pin, DNS cache/query, and peer diagnostics. These actions persist only when also represented in TOML through config apply. |
 
 Simple CLI commands do not write `config.toml`. Advanced routing, split DNS,
-multiple independent MPP servers, gateways, named users, signed rule sets, and
+multiple independent MPP servers, balancers, named users, signed rule sets, and
 combined client/server nodes require TOML.
 
 The only operational commands are:
@@ -69,9 +69,9 @@ The only operational commands are:
 - `mptunnel --config FILE doctor`
 - `mptunnel --config FILE route explain ...`
 - `mptunnel --config FILE dns status`
-- `mptunnel --config FILE dns explain NAME`
-- `mptunnel --config FILE dns query NAME --type TYPE`
-- `mptunnel --config FILE dns flush [--plan PLAN]`
+- `mptunnel --config FILE dns explain DOMAIN`
+- `mptunnel --config FILE dns query DOMAIN --type TYPE`
+- `mptunnel --config FILE dns flush [--dns-plan PLAN]`
 
 There is no `init`, `config set`, profile, subscription, connect/disconnect,
 install, update, or rollback command.
@@ -81,17 +81,26 @@ install, update, or rollback command.
 Unknown keys are rejected. Referenced files are resolved relative to the
 selected TOML document.
 
+Every configured inbound, outbound, balancer, route rule, ACL rule, DNS
+upstream, DNS plan, and DNS rule has an explicit canonical `name`.
+Configured-resource references use `inbounds`, `outbound`, `balancer`, or
+`dns_plan`; `_id` is reserved for protocol, principal, and signed-artifact
+identities such as `credential_id`, `principal_id`, `rule_set_id`, and
+`publisher_id`. `target` denotes an application or active-probe destination
+authority; `endpoint` denotes a listener, connector, or carrier network
+endpoint.
+
 | Path | Implemented responsibility |
 | --- | --- |
 | Root `check_config`, `[logging]` | Check-only startup plus typed level, format, console, file, and opt-in Product flow lifecycle records. Runtime config apply rejects `check_config = true`. |
-| `[[credentials]]` | Named MPP credential, principal, file/environment secret, optional expiry, revocation, and revocation grace. |
-| `[[local_users]]` | Named SOCKS5/HTTP CONNECT username/password mapped to a stable Product principal. |
+| `[[credentials]]` | MPP `credential_id`, `principal_id`, file/environment secret, optional expiry, revocation, and revocation grace. |
+| `[[local_users]]` | Canonically named SOCKS5/HTTP CONNECT username/password mapped to a stable Product `principal_id`. |
 | `[service]` | Service intent and optional in-process generation supervision/backoff. It does not install a native service. |
 | `[session]` | Core-owned authenticated-carrier outage retention envelope. |
 | `[management]` | Loopback listeners, referenced bearer token, dashboard switch, and peer-diagnostic permission. |
 | `[resources]` | Core capacity and liveness envelopes documented by the reference config. These are not Product traffic profiles. |
 | `[admission]` | Product-wide live-flow, concurrent-work, principal, outbound, target, connect, and DNS-work bounds. |
-| `[dns]` | One immutable DNS generation with default plan and explicit no-implicit-fallback policy. |
+| `[dns]` | One immutable DNS generation with explicit `default_dns_plan` and no implicit fallback. |
 | `[[dns.upstreams]]` | `system`, UDP, TCP, UDP+TCP, DoT, DoH, or DoQ upstream; literal bootstrap; TLS name/path; optional named outbound egress. |
 | `[[dns.plans]]` | Upstream set, IP strategy, encryption requirement, ordered/race behavior, expected CIDRs, deadline, cache, answer, stale, and prefetch bounds. |
 | `[[dns.rules]]` | Exact or longest-suffix plan selection. |
@@ -99,7 +108,7 @@ selected TOML document.
 | `[dns.fake_dns]` | Bounded reserved IPv4/IPv6 pools and recovery lifetimes for captured A/AAAA traffic. |
 | `[[inbounds]]` | `socks5`, `http-connect`, `tcp-forward`, `udp-forward`, `tun`, or `mpp`. |
 | `[[outbounds]]` | `mpp`, `direct`, `socks5`, `http-connect`, or `https-connect`. |
-| `[routing]` | Immutable generation containing routes, destination ACL, gateways, and signed rule-set references. |
+| `[routing]` | Immutable generation containing routes, destination ACL, balancers, and signed rule-set references. |
 | `[[routing.rules]]` | Ordered first-match Product routing. |
 | `[[routing.balancers]]` | New-flow outbound selection. |
 | `[[routing.rule_set_publishers]]`, `[[routing.rule_sets]]` | Pinned Ed25519 publisher and signed domain/CIDR artifact loading. |
@@ -116,10 +125,10 @@ selected TOML document.
 | --- | --- | --- |
 | SOCKS5 | TCP CONNECT, UDP ASSOCIATE, domain/IPv4/IPv6 targets, optional username/password authentication, multiple explicit listeners, and bounded admission. | SOCKS5 BIND is not implemented. |
 | HTTP CONNECT | TCP CONNECT with domain/IPv4/IPv6 authority and optional Basic proxy authentication. | It is not a general HTTP forward proxy and does not carry UDP. |
-| TCP forward | One fixed target per inbound, multiple listeners, bounded concurrent accepts, and the normal route/DNS/ACL/outbound/gateway pipeline. | No connector bypass. |
+| TCP forward | One fixed target per inbound, multiple listeners, bounded concurrent accepts, and the normal route/DNS/ACL/outbound/balancer pipeline. | No connector bypass. |
 | UDP forward | One fixed target, source-keyed bounded associations, idle expiry, datagram TTL, and generation-safe response mapping. | New associations are dropped at capacity; no transparent replay after commit. |
 | TUN | IPv4 and/or IPv6 L4 TCP/UDP, optional local-netstack ICMP handling, configurable MTU, external/manual mode, managed full/split policy, DNS capture, and FakeDNS recovery. | It is not an arbitrary L2 bridge or arbitrary-IP-protocol tunnel. |
-| MPP server | TCP and/or QUIC listeners, named credential authority, TLS identity, per-inbound ACL and DNS plan, and one native outbound or native gateway. | An MPP inbound cannot select an MPP outbound or both an outbound and balancer. |
+| MPP server | TCP and/or QUIC listeners, named credential authority, TLS identity, per-inbound ACL and DNS plan, and one native outbound or native balancer. | An MPP inbound cannot select an MPP outbound or both an outbound and balancer. |
 
 SOCKS5, HTTP CONNECT, fixed forwards, TUN flows, and authenticated MPP opens
 share the Product admission owner. Listener/source/association bounds remain
@@ -136,8 +145,8 @@ categories are:
 - source CIDR;
 - destination and source port or port range;
 - TCP or UDP;
-- inbound tag;
-- authenticated principal; and
+- named inbound;
+- authenticated principal ID; and
 - pre-resolution or post-resolution stage.
 
 Nonempty categories are ANDed; values inside a category are ORed. Local
@@ -146,7 +155,7 @@ ingress configuration requires a final catch-all rule.
 Supported route actions are exactly:
 
 - `action = "outbound"` with a named outbound;
-- `action = "balancer"` with a named Product gateway;
+- `action = "balancer"` with a named Product balancer;
 - `action = "reject"`; and
 - `action = "drop"`.
 
@@ -206,12 +215,11 @@ The DNS runtime implements:
 - status and explanation without issuing a query.
 
 There is no fallback outside a compiled DNS plan. Omitting `[dns]` in a simple
-proxy/server profile synthesizes the tagged `system` upstream and `default`
+proxy/server profile synthesizes the named `system` upstream and `default`
 plan; once `[dns]` is present, every upstream and fallback is explicit.
-`system_fallback = true` is rejected, and managed full-VPN mode rejects system
-or plaintext resolution before host routes are published. Stream proxy and MPP
-DNS egress support TCP/DoT/DoH. DoQ is available only through direct or
-source-bound native egress.
+Managed full-VPN mode rejects system or plaintext resolution before host
+routes are published. Stream proxy and MPP DNS egress support TCP/DoT/DoH.
+DoQ is available only through direct or source-bound native egress.
 
 ### 4.4 Outbounds
 
@@ -227,9 +235,9 @@ All native target opens use the selected DNS plan and destination
 authorization. Proxy and carrier sockets cross the host socket-protection or
 binding boundary before I/O in catch-all VPN hosts.
 
-### 4.5 Product gateways
+### 4.5 Product balancers
 
-A gateway contains leaf outbounds only and cannot nest another gateway.
+A balancer contains leaf outbounds only and cannot nest another balancer.
 Implemented strategies are:
 
 - `manual`
@@ -319,46 +327,51 @@ signals with bounded orderly retirement.
 ### 4.8 Management and user presentation
 
 The management listener is disabled by default, loopback-only,
-bearer-token-protected, bounded, and has no CORS support. Every `/api/v1/`
+bearer-token-protected, bounded, and has no CORS support. Every `/api/v2/`
 request, including health, requires authentication. Optional static dashboard
 assets are public only when dashboard serving is enabled.
 
-Implemented endpoints are exactly:
+The management surface is exactly:
 
-- `GET /api/v1/`
-- `GET /api/v1/health`
-- `GET /api/v1/health/live`
-- `GET /api/v1/health/ready`
-- `GET /api/v1/status`
-- `GET /api/v1/paths`
-- `GET /api/v1/traffic`
-- `GET /api/v1/sessions`
-- `GET /api/v1/flows`
-- `GET /api/v1/diagnostics`
-- `GET /api/v1/config`
-- `GET /api/v1/gateways`
-- `GET /api/v1/dns/status`
-- `GET /api/v1/dns/explain?name=<domain>`
-- `POST /api/v1/actions/path`
-- `POST /api/v1/diagnostics/peer`
-- `POST /api/v1/config/validate`
-- `POST /api/v1/config/apply`
-- `POST /api/v1/gateways/actions`
-- `POST /api/v1/dns/query`
-- `POST /api/v1/dns/cache/flush`
+- `GET /api/v2/`
+- `GET /api/v2/health`
+- `GET /api/v2/health/live`
+- `GET /api/v2/health/ready`
+- `GET /api/v2/status`
+- `GET /api/v2/paths`
+- `GET /api/v2/traffic`
+- `GET /api/v2/sessions`
+- `GET /api/v2/flows`
+- `GET /api/v2/diagnostics`
+- `GET /api/v2/config`
+- `GET /api/v2/balancers`
+- `GET /api/v2/dns/status`
+- `GET /api/v2/dns/explain?domain=<domain>`
+- `POST /api/v2/actions/path`
+- `POST /api/v2/diagnostics/peer`
+- `POST /api/v2/config/validate`
+- `POST /api/v2/config/apply`
+- `POST /api/v2/balancers/actions`
+- `POST /api/v2/dns/query`
+- `POST /api/v2/dns/cache/flush`
 
-`GET /api/v1/config` returns path/revision/activation state, not secret-bearing
+The main snapshot schema is `mptunnel.management.v5`; health uses
+`mptunnel.health.v2` and balancer status/actions use
+`mptunnel.balancer.v1`. `GET /api/v2/config` returns
+path/revision/activation state, not secret-bearing
 TOML. Config mutation accepts a complete `application/toml` document; there is
 no PATCH, diff, history, or per-field endpoint.
 
 Path control accepts endpoint-local `enabled`, `suspect`, `failed`, or
-`disabled` state. Gateway actions are exactly `enable-member`, `drain-member`,
+`disabled` state through stable `{outbound, path, state}` names. Peer requests
+use `{service, service_name, session_id}`; response indexes are not mutation
+identity. Balancer actions are exactly `enable-member`, `drain-member`,
 `disable-member`, `pin-member`, and `automatic`.
 
 Observability includes:
 
 - readiness/liveness/degraded reasons;
-- Product gateway state;
+- Product balancer state;
 - local and peer path state;
 - logical sessions and bounded active-flow detail;
 - sanitized inbound/outbound inventory and immutable per-flow origin,
@@ -371,7 +384,7 @@ Observability includes:
 - structured text or JSON logs with redaction, bounds, and rate limiting; and
 - opt-in sanitized authenticated peer diagnostics.
 
-The embedded dashboard presents health, gateways and member controls, paths,
+The embedded dashboard presents health, balancers and member controls, paths,
 traffic, sessions, flows, and peer diagnostics. It is not a separate
 configuration system.
 
@@ -504,7 +517,7 @@ v0.1.2 deliberately does not provide:
 The source implements the main daily-use Product graph: authenticated SOCKS5
 and HTTP CONNECT, fixed TCP/UDP forwarding, TUN L4, strict routing and ACLs,
 split/encrypted DNS and FakeDNS, native and MPP outbounds,
-independent-server gateways, canonical persistent configuration,
+independent-server balancers, canonical persistent configuration,
 generation-safe runtime apply, operational CLI, management API, and
 dashboard.
 

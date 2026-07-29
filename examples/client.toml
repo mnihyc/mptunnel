@@ -8,8 +8,8 @@
 level = "info"
 
 [[credentials]]
-id = "home-2026"
-principal = "home"
+credential_id = "home-2026"
+principal_id = "home"
 secret = { from = "file", path = "mpp-credential.key" }
 
 [session]
@@ -17,14 +17,14 @@ secret = { from = "file", path = "mpp-credential.key" }
 retention_timeout_ms = 300000
 
 [dns]
-default_plan = "system"
+default_dns_plan = "system"
 
 [[dns.upstreams]]
-id = "system"
+name = "system"
 transport = "system"
 
 [[dns.plans]]
-id = "system"
+name = "system"
 upstreams = ["system"]
 
 # The management API is optional, loopback-only, and requires a separate random
@@ -35,26 +35,29 @@ upstreams = ["system"]
 # dashboard = true
 
 [[inbounds]]
-tag = "local-socks"
+name = "local-socks"
 protocol = "socks5"
 listen = ["127.0.0.1:1080"]
 
 [[outbounds]]
-tag = "remote-mpp"
+name = "remote-mpp"
 protocol = "mpp"
 # Replace server.example.com with the server's reachable name or address.
 # TCP and QUIC/UDP remain separate carriers under one MPP data-level session.
-endpoints = ["tcp://server.example.com:7443", "udp://server.example.com:7443"]
+paths = [
+  { name = "path-1", endpoint = "tcp://server.example.com:7443" },
+  { name = "path-2", endpoint = "udp://server.example.com:7443" },
+]
 
 [outbounds.security]
-credential = "home-2026"
+credential_id = "home-2026"
 tls_server_name = "server.example.com"
 tls_pinned_certificate_file = "server-cert.pem"
 
 [routing]
 
 [[routing.rules]]
-id = "default"
+name = "default"
 action = "outbound"
-target = "remote-mpp"
+outbound = "remote-mpp"
 traffic_intent = "interactive"

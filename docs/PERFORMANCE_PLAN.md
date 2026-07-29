@@ -76,16 +76,16 @@ Performance/Core owns only the MPP session and data plane:
 | MPP v4 codec, authentication transcript, identities, and bounds | CLI, TOML, API, persistence, and reload |
 | Stream offsets, Data ACK, shared receive window, FIN, reset, and detach | Routing, DNS, ingress, and destination policy |
 | Datagram identity, TTL, feedback, retries, and reassembly | Outbound and independent-server selection |
-| TCP and QUIC carrier adapters and typed observations | Gateway probes, circuits, stickiness, and new-flow retry |
+| TCP and QUIC carrier adapters and typed observations | Balancer probes, circuits, stickiness, and new-flow retry |
 | Within-session path scheduling, aggregation, and recovery | TUN/VPN host policy and platform service integration |
 | Exact carrier, attachment, and model-generation fences | Credentials, principals, and Product admission policy |
 | Core diagnostics and controlled performance evidence | Dashboard and operator presentation |
 
 Product selects exactly one outbound leaf or MPP session for a new flow. Core
-may then select only carriers belonging to that session. A Product gateway
+may then select only carriers belonging to that session. A Product balancer
 never receives path IDs, congestion state, queue state, Data ACK state, or
-reinjection state, and Core never receives route tags, DNS objects, gateway
-scores, UI state, or platform policy.
+reinjection state, and Core never receives route configuration, DNS objects,
+balancer scores, UI state, or platform policy.
 
 The boundary carries a normalized protocol target, demand, immutable admission
 permit, hard resource envelope, and prepared carrier capabilities. Core

@@ -1,11 +1,11 @@
 (function () {
   "use strict";
 
-  const HEALTH_ENDPOINT = "/api/v1/health";
-  const STATUS_ENDPOINT = "/api/v1/status";
-  const PEER_ENDPOINT = "/api/v1/diagnostics/peer";
-  const GATEWAY_ACTION_ENDPOINT = "/api/v1/gateways/actions";
-  const EXPECTED_SCHEMA = "mptunnel.management.v4";
+  const HEALTH_ENDPOINT = "/api/v2/health";
+  const STATUS_ENDPOINT = "/api/v2/status";
+  const PEER_ENDPOINT = "/api/v2/diagnostics/peer";
+  const BALANCER_ACTION_ENDPOINT = "/api/v2/balancers/actions";
+  const EXPECTED_SCHEMA = "mptunnel.management.v5";
   const TOKEN_STORAGE_KEY = "mptunnel.dashboard.bearer";
   const REFRESH_STORAGE_KEY = "mptunnel.dashboard.refresh-interval-ms";
   const REFRESH_INTERVALS_MS = [0, 1000, 5000, 30000];
@@ -26,7 +26,7 @@
     accessButton: byId("access-button"),
     srStatus: byId("sr-status"),
     overviewTimestamp: byId("overview-timestamp"),
-    gatewaysTabCount: byId("gateways-tab-count"),
+    balancersTabCount: byId("balancers-tab-count"),
     pathsTabCount: byId("paths-tab-count"),
     sessionsTabCount: byId("sessions-tab-count"),
     pathUnderlayFilter: byId("path-underlay-filter"),
@@ -44,9 +44,9 @@
     inboundsList: byId("inbounds-list"),
     outboundsWrap: byId("outbounds-wrap"),
     outboundsList: byId("outbounds-list"),
-    gatewayList: byId("gateway-list"),
-    gatewaysEmpty: byId("gateways-empty"),
-    gatewayActionState: byId("gateway-action-state"),
+    balancerList: byId("balancer-list"),
+    balancersEmpty: byId("balancers-empty"),
+    balancerActionState: byId("balancer-action-state"),
     trafficChart: byId("traffic-chart"),
     trafficChartEmpty: byId("traffic-chart-empty"),
     flowsChart: byId("flows-chart"),
@@ -95,7 +95,7 @@
     refreshCycleRunning: false,
     fetching: false,
     peerFetching: false,
-    gatewayUpdating: false,
+    balancerUpdating: false,
     authenticationRequired: false,
     lastReceivedAt: 0,
     lastError: null,
@@ -350,10 +350,10 @@
   }
 
   function serviceLabel(item) {
-    const tag = item && item.service_tag ? String(item.service_tag) : "";
+    const name = item && item.service_name ? String(item.service_name) : "";
     const service = titleCase(item && item.service ? item.service : "service");
     const index = finiteNumber(item && item.service_index);
-    return tag || service + " " + index;
+    return name || service + " " + index;
   }
 
   function safeStateClass(value) {
@@ -433,14 +433,14 @@
   }
 
   function validateHealth(payload) {
-    if (!payload || typeof payload !== "object" || payload.schema !== "mptunnel.health.v1") {
+    if (!payload || typeof payload !== "object" || payload.schema !== "mptunnel.health.v2") {
       throw new Error("Unsupported management health response");
     }
     return payload;
   }
 
   function refreshBusy() {
-    return state.refreshCycleRunning || state.fetching || state.peerFetching || state.gatewayUpdating;
+    return state.refreshCycleRunning || state.fetching || state.peerFetching || state.balancerUpdating;
   }
 
   function runPendingAuthenticationRefresh() {
@@ -649,7 +649,7 @@
     renderKpis();
     renderTrafficBreakdown();
     renderServices();
-    renderGateways();
+    renderBalancers();
     renderPaths();
     renderSessions();
     renderDiagnostics();
@@ -661,7 +661,7 @@
     const status = state.status;
     replaceText(elements.roleLabel, titleCase(status.role));
     elements.overviewTimestamp.textContent = "Sample " + formatWallTime(status.generated_unix_ms) + " / " + formatRelative(status.generated_unix_ms);
-    elements.gatewaysTabCount.textContent = String(asArray(status.gateways).length);
+    elements.balancersTabCount.textContent = String(asArray(status.balancers).length);
     elements.pathsTabCount.textContent = String(asArray(status.paths).length);
     elements.sessionsTabCount.textContent = String(asArray(status.sessions).length);
   }
@@ -726,7 +726,7 @@
     appendMetric(elements.servicesList, "Local inbounds", formatCount(services.local_inbounds));
     appendMetric(elements.servicesList, "Outbounds", formatCount(services.outbounds));
     appendMetric(elements.servicesList, "Native outbounds", formatCount(services.local_outbounds));
-    appendMetric(elements.servicesList, "Gateway balancers", formatCount(services.gateway_balancers));
+    appendMetric(elements.servicesList, "Balancers", formatCount(services.balancers));
     appendMetric(elements.servicesList, "Path listeners", formatCount(services.configured_path_listeners));
     appendMetric(elements.servicesList, "Uptime", formatDuration(state.status.uptime_ms));
     appendMetric(elements.servicesList, "Schema", String(state.status.schema || "--"));
@@ -736,11 +736,11 @@
     elements.inboundsWrap.hidden = inbounds.length === 0;
     inbounds.forEach(function (inbound) {
       const row = createElement("li");
-      const name = createElement("strong", "", inbound.tag || titleCase(inbound.protocol));
+      const name = createElement("strong", "", inbound.name || titleCase(inbound.protocol));
       const details = [];
       details.push(titleCase(inbound.protocol));
       if (asArray(inbound.listen).length > 0) details.push(asArray(inbound.listen).join(", "));
-      if (inbound.name) details.push(String(inbound.name));
+      if (inbound.interface_name) details.push(String(inbound.interface_name));
       if (inbound.auth_required) details.push("authenticated");
       row.append(name, createElement("span", "", details.join(" / ")));
       elements.inboundsList.append(row);
@@ -758,18 +758,18 @@
         }).join(" + ")
       ].filter(Boolean);
       row.append(
-        createElement("strong", "", outbound.tag || "Outbound"),
+        createElement("strong", "", outbound.name || "Outbound"),
         createElement("span", "", details.join(" / "))
       );
       elements.outboundsList.append(row);
     });
   }
 
-  function gatewayControl() {
-    return asObject(asObject(asObject(state.status).controls).gateway);
+  function balancerControl() {
+    return asObject(asObject(asObject(state.status).controls).balancer);
   }
 
-  function gatewayBadge(value) {
+  function balancerBadge(value) {
     const normalized = String(value || "unknown");
     let kind = "neutral";
     if (["ready", "healthy", "fresh", "enabled"].includes(normalized)) kind = "success";
@@ -778,45 +778,45 @@
     return badge(titleCase(normalized), kind);
   }
 
-  function gatewayActionButton(label, action, balancer, member, kind, disabled) {
+  function balancerActionButton(label, action, balancer, outbound, kind, disabled) {
     const button = createElement("button", "button button--small " + (kind || "button--quiet"), label);
     button.type = "button";
-    button.dataset.gatewayAction = action;
+    button.dataset.balancerAction = action;
     button.dataset.balancer = balancer;
-    if (member) button.dataset.member = member;
-    button.disabled = Boolean(disabled) || state.gatewayUpdating || !gatewayControl().supported;
+    if (outbound) button.dataset.outbound = outbound;
+    button.disabled = Boolean(disabled) || state.balancerUpdating || !balancerControl().supported;
     return button;
   }
 
-  function renderGateways() {
-    const gateways = asArray(state.status.gateways).map(asObject);
-    elements.gatewayList.replaceChildren();
-    elements.gatewaysEmpty.hidden = gateways.length !== 0;
-    gateways.forEach(function (gateway) {
-      const card = createElement("section", "data-section data-section--wide gateway-card");
-      const header = createElement("div", "data-section__header data-section__header--actions gateway-card__header");
+  function renderBalancers() {
+    const balancers = asArray(state.status.balancers).map(asObject);
+    elements.balancerList.replaceChildren();
+    elements.balancersEmpty.hidden = balancers.length !== 0;
+    balancers.forEach(function (balancer) {
+      const card = createElement("section", "data-section data-section--wide balancer-card");
+      const header = createElement("div", "data-section__header data-section__header--actions balancer-card__header");
       const heading = createElement("div");
-      heading.append(createElement("h2", "", gateway.tag || "Gateway"));
+      heading.append(createElement("h2", "", balancer.name || "Balancer"));
       const details = [
-        titleCase(gateway.strategy),
-        "generation " + formatIdentifier(gateway.generation),
-        formatCount(gateway.ready_members) + " ready",
-        formatCount(gateway.active_flows) + " active",
-        formatCount(gateway.pending_flows) + " pending"
+        titleCase(balancer.strategy),
+        "generation " + formatIdentifier(balancer.generation),
+        formatCount(balancer.ready_members) + " ready",
+        formatCount(balancer.active_flows) + " active",
+        formatCount(balancer.pending_flows) + " pending"
       ];
-      if (gateway.manual_member) details.push("pinned to " + gateway.manual_member);
-      if (gateway.probe) {
-        const probe = asObject(gateway.probe);
+      if (balancer.manual_outbound) details.push("pinned to " + balancer.manual_outbound);
+      if (balancer.probe) {
+        const probe = asObject(balancer.probe);
         details.push("probe " + String(probe.target || "--") + " every " + formatDuration(probe.interval_ms));
       }
       heading.append(createElement("p", "section-meta", details.join(" / ")));
-      const headerActions = createElement("div", "gateway-actions");
-      headerActions.append(gatewayBadge(gateway.ready_members > 0 ? "ready" : "unavailable"));
-      if (gateway.manual_member && gateway.strategy !== "manual") {
-        headerActions.append(gatewayActionButton(
+      const headerActions = createElement("div", "balancer-actions");
+      headerActions.append(balancerBadge(balancer.ready_members > 0 ? "ready" : "unavailable"));
+      if (balancer.manual_outbound && balancer.strategy !== "manual") {
+        headerActions.append(balancerActionButton(
           "Use strategy",
           "automatic",
-          gateway.tag,
+          balancer.name,
           "",
           "button--quiet",
           false
@@ -826,30 +826,30 @@
       card.append(header);
 
       const wrap = createElement("div", "table-wrap table-wrap--records");
-      const table = createElement("table", "records-table records-table--gateways");
+      const table = createElement("table", "records-table records-table--balancers");
       const head = createElement("thead");
       const headRow = createElement("tr");
-      ["Member", "Readiness", "Health", "Latency evidence", "Load", "Outcomes", "Last event", "Actions"].forEach(function (label) {
+      ["Outbound", "Readiness", "Health", "Latency evidence", "Load", "Outcomes", "Last event", "Actions"].forEach(function (label) {
         headRow.append(createElement("th", "", label));
       });
       head.append(headRow);
       const body = createElement("tbody");
-      asArray(gateway.members).forEach(function (memberValue) {
+      asArray(balancer.members).forEach(function (memberValue) {
         const member = asObject(memberValue);
         const row = createElement("tr");
 
         const identity = createElement("div");
-        identity.append(createElement("span", "cell-primary", member.tag || "--"));
+        identity.append(createElement("span", "cell-primary", member.outbound || "--"));
         identity.append(createElement("span", "cell-secondary", asArray(member.networks).map(titleCase).join(" + ") || "No networks"));
-        appendCell(row, "Member", identity);
+        appendCell(row, "Outbound", identity);
 
         const readiness = createElement("div");
-        readiness.append(gatewayBadge(member.readiness));
+        readiness.append(balancerBadge(member.readiness));
         readiness.append(createElement("span", "cell-secondary", titleCase(member.reason) + " / " + titleCase(member.mode)));
         appendCell(row, "Readiness", readiness);
 
         const health = createElement("div");
-        health.append(gatewayBadge(member.health));
+        health.append(balancerBadge(member.health));
         const freshness = titleCase(member.freshness) + (member.probe_in_flight ? " / probe running" : "");
         health.append(createElement("span", "cell-secondary", freshness));
         if (member.cooldown_remaining_ms !== undefined) {
@@ -904,19 +904,19 @@
         ));
         lastEvent.append(createElement(
           "span",
-          member.last_error ? "cell-secondary gateway-error" : "cell-secondary",
+          member.last_error ? "cell-secondary balancer-error" : "cell-secondary",
           member.last_error
             ? String(member.last_error) + " / " + formatDuration(member.last_error_age_ms) + " ago"
             : formatCount(counters.selections) + " selections / " + formatCount(counters.open_attempts) + " attempts"
         ));
         appendCell(row, "Last event", lastEvent);
 
-        const actions = createElement("div", "gateway-actions gateway-actions--member");
+        const actions = createElement("div", "balancer-actions balancer-actions--member");
         actions.append(
-          gatewayActionButton("Pin", "pin-member", gateway.tag, member.tag, "button--primary", gateway.manual_member === member.tag),
-          gatewayActionButton("Enable", "enable-member", gateway.tag, member.tag, "button--quiet", member.mode === "enabled"),
-          gatewayActionButton("Drain", "drain-member", gateway.tag, member.tag, "button--quiet", member.mode === "draining"),
-          gatewayActionButton("Disable", "disable-member", gateway.tag, member.tag, "button--danger-quiet", member.mode === "disabled")
+          balancerActionButton("Pin", "pin-member", balancer.name, member.outbound, "button--primary", balancer.manual_outbound === member.outbound),
+          balancerActionButton("Enable", "enable-member", balancer.name, member.outbound, "button--quiet", member.mode === "enabled"),
+          balancerActionButton("Drain", "drain-member", balancer.name, member.outbound, "button--quiet", member.mode === "draining"),
+          balancerActionButton("Disable", "disable-member", balancer.name, member.outbound, "button--danger-quiet", member.mode === "disabled")
         );
         appendCell(row, "Actions", actions);
         body.append(row);
@@ -924,47 +924,47 @@
       table.append(head, body);
       wrap.append(table);
       card.append(wrap);
-      elements.gatewayList.append(card);
+      elements.balancerList.append(card);
     });
   }
 
-  async function applyGatewayAction(button) {
-    if (state.gatewayUpdating || !button || !button.dataset.gatewayAction) return;
+  async function applyBalancerAction(button) {
+    if (state.balancerUpdating || !button || !button.dataset.balancerAction) return;
     const payload = {
       balancer: button.dataset.balancer,
-      action: button.dataset.gatewayAction
+      action: button.dataset.balancerAction
     };
-    if (button.dataset.member) payload.member = button.dataset.member;
-    state.gatewayUpdating = true;
-    elements.gatewayActionState.className = "inline-status gateway-action-state is-loading";
-    elements.gatewayActionState.textContent = "Applying " + titleCase(payload.action);
-    renderGateways();
+    if (button.dataset.outbound) payload.outbound = button.dataset.outbound;
+    state.balancerUpdating = true;
+    elements.balancerActionState.className = "inline-status balancer-action-state is-loading";
+    elements.balancerActionState.textContent = "Applying " + titleCase(payload.action);
+    renderBalancers();
     updateRefreshControls();
     const authenticationGeneration = state.authenticationGeneration;
     try {
-      await requestJson(GATEWAY_ACTION_ENDPOINT, {
+      await requestJson(BALANCER_ACTION_ENDPOINT, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify(payload)
       });
-      await refreshStatus("gateway");
-      elements.gatewayActionState.className = "inline-status gateway-action-state";
-      elements.gatewayActionState.textContent = "Applied " + titleCase(payload.action) + " to " + payload.balancer;
-      announce(elements.gatewayActionState.textContent);
+      await refreshStatus("balancer");
+      elements.balancerActionState.className = "inline-status balancer-action-state";
+      elements.balancerActionState.textContent = "Applied " + titleCase(payload.action) + " to " + payload.balancer;
+      announce(elements.balancerActionState.textContent);
     } catch (error) {
       if (
         error instanceof HttpError &&
         error.status === 401 &&
         authenticationGeneration === state.authenticationGeneration
       ) {
-        handleUnauthorized("Authentication required for gateway control");
+        handleUnauthorized("Authentication required for balancer control");
       }
-      elements.gatewayActionState.className = "inline-status gateway-action-state is-error";
-      elements.gatewayActionState.textContent = error && error.message ? error.message : "Gateway action failed";
-      announce(elements.gatewayActionState.textContent);
+      elements.balancerActionState.className = "inline-status balancer-action-state is-error";
+      elements.balancerActionState.textContent = error && error.message ? error.message : "Balancer action failed";
+      announce(elements.balancerActionState.textContent);
     } finally {
-      state.gatewayUpdating = false;
-      if (state.status) renderGateways();
+      state.balancerUpdating = false;
+      if (state.status) renderBalancers();
       updateRefreshControls();
       runPendingAuthenticationRefresh();
     }
@@ -991,18 +991,17 @@
       appendCell(row, "State", stateIndicator(currentState));
 
       const identity = createElement("div");
-      const pathName = path.path_id !== undefined && path.path_id !== null
-        ? "Path " + formatIdentifier(path.path_id)
-        : path.configured_index !== undefined && path.configured_index !== null
-          ? "Configured " + String(path.configured_index)
-          : formatIdentifier(path.id);
-      identity.append(createElement("span", "cell-primary", pathName));
-      identity.append(createElement("span", "cell-secondary", path.endpoint || formatIdentifier(path.id)));
+      identity.append(createElement("span", "cell-primary", formatIdentifier(path.path)));
+      identity.append(createElement(
+        "span",
+        "cell-secondary",
+        path.endpoint || (path.path_id ? "Protocol path " + formatIdentifier(path.path_id) : "--")
+      ));
       appendCell(row, "Path", identity);
 
       const service = createElement("div");
       service.append(createElement("span", "cell-primary", serviceLabel(path)));
-      service.append(createElement("span", "cell-secondary", titleCase(path.service) + " " + finiteNumber(path.service_index)));
+      service.append(createElement("span", "cell-secondary", titleCase(path.service)));
       appendCell(row, "Service", service);
 
       const carrier = createElement("div");
@@ -1050,7 +1049,7 @@
         session.state,
         session.session_id,
         session.service,
-        session.service_tag,
+        session.service_name,
         session.service_index
       ].some(function (value) { return String(value === undefined || value === null ? "" : value).toLowerCase().includes(query); });
     });
@@ -1079,8 +1078,7 @@
         flow.inbound_kind,
         flow.inbound,
         flow.outbound,
-        flow.balancer,
-        flow.balancer_member
+        flow.balancer
       ].some(function (value) { return String(value === undefined || value === null ? "" : value).toLowerCase().includes(query); });
     });
     elements.flowsBody.replaceChildren();
@@ -1105,8 +1103,7 @@
         egress.append(createElement(
           "span",
           "cell-secondary",
-          "via " + flow.balancer +
-            (flow.balancer_member ? " / member " + flow.balancer_member : "")
+          "via " + flow.balancer
         ));
       }
       appendCell(row, "Egress", egress);
@@ -1182,7 +1179,7 @@
   }
 
   function peerSessionKey(session) {
-    return String(session.service) + ":" + String(session.service_index) + ":" + String(session.session_id);
+    return String(session.service) + ":" + String(session.service_name) + ":" + String(session.session_id);
   }
 
   function selectedPeerSession() {
@@ -1197,7 +1194,7 @@
       .filter(function (result) {
         return String(result.session_id) === String(session.session_id) &&
           String(result.service) === String(session.service) &&
-          Number(result.service_index) === Number(session.service_index);
+          String(result.service_name) === String(session.service_name);
       })
       .sort(function (left, right) { return finiteNumber(right.received_unix_ms) - finiteNumber(left.received_unix_ms); });
     return results[0] || null;
@@ -1208,7 +1205,7 @@
     const explicit = state.peerResult && selectedSession &&
       String(state.peerResult.session_id) === String(selectedSession.session_id) &&
       String(state.peerResult.service) === String(selectedSession.service) &&
-      Number(state.peerResult.service_index) === Number(selectedSession.service_index)
+      String(state.peerResult.service_name) === String(selectedSession.service_name)
       ? state.peerResult
       : null;
     renderPeerResult(explicit || newestCachedPeerResult(selectedSession));
@@ -1265,7 +1262,7 @@
     if (!session) return;
     const payload = {
       service: session.service,
-      service_index: session.service_index,
+      service_name: session.service_name,
       session_id: session.session_id
     };
 
@@ -1544,9 +1541,9 @@
     });
     elements.pathUnderlayFilter.addEventListener("change", renderPaths);
     elements.pathStateFilter.addEventListener("change", renderPaths);
-    elements.gatewayList.addEventListener("click", function (event) {
-      const button = event.target.closest("button[data-gateway-action]");
-      if (button && elements.gatewayList.contains(button)) applyGatewayAction(button);
+    elements.balancerList.addEventListener("click", function (event) {
+      const button = event.target.closest("button[data-balancer-action]");
+      if (button && elements.balancerList.contains(button)) applyBalancerAction(button);
     });
     elements.sessionFilter.addEventListener("input", renderSessions);
     elements.peerSessionSelect.addEventListener("change", function () {

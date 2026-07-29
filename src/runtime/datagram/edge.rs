@@ -1,6 +1,6 @@
 //! Bounded UDP ingress association shared by SOCKS5 and packet-device ingress.
 //!
-//! Product routing and gateway selection occur once when a lane opens. The
+//! Product routing and balancer selection occur once when a lane opens. The
 //! actor then resolves the concrete MPP or native connector branch once, before
 //! entering its payload loop.
 
@@ -230,9 +230,9 @@ async fn run_mpp_udp_edge_lane<M>(
             {
                 crate::observability::process_event!(
                     Warn,
-                    "udp_gateway",
+                    "udp_balancer",
                     "open_feedback_failed",
-                    "MPP gateway UDP open-failure feedback failed: {feedback}"
+                    "MPP balancer UDP open-failure feedback failed: {feedback}"
                 );
             }
             let _ = send_udp_edge_completion(
@@ -382,9 +382,9 @@ async fn run_mpp_udp_edge_lane<M>(
     {
         crate::observability::process_event!(
             Warn,
-            "udp_gateway",
+            "udp_balancer",
             "outcome_feedback_failed",
-            "gateway UDP flow-outcome feedback failed: {error}"
+            "balancer UDP flow-outcome feedback failed: {error}"
         );
     }
 }
@@ -440,9 +440,9 @@ where
         if let Err(error) = feedback {
             crate::observability::process_event!(
                 Warn,
-                "udp_gateway",
+                "udp_balancer",
                 "outcome_feedback_failed",
-                "MPP gateway UDP outcome feedback failed: {error}"
+                "MPP balancer UDP outcome feedback failed: {error}"
             );
         }
     } else if let Some(lease) = context.gateway_lease.as_mut()
@@ -451,9 +451,9 @@ where
     {
         crate::observability::process_event!(
             Warn,
-            "udp_gateway",
+            "udp_balancer",
             "flow_failure_feedback_failed",
-            "MPP gateway UDP flow-failure feedback failed: {feedback}"
+            "MPP balancer UDP flow-failure feedback failed: {feedback}"
         );
     }
     send_udp_edge_completion(
@@ -655,9 +655,9 @@ fn complete_udp_gateway_flow(gateway_lease: &mut Option<GatewayFlowLease>, error
     {
         crate::observability::process_event!(
             Warn,
-            "udp_gateway",
+            "udp_balancer",
             "native_outcome_feedback_failed",
-            "native gateway UDP flow-outcome feedback failed: {feedback}"
+            "native balancer UDP flow-outcome feedback failed: {feedback}"
         );
     }
 }

@@ -1,12 +1,10 @@
 //! Unified Product outbound registry.
 //!
-//! Selection, pre-commit gateway failover, and connector opening happen once
+//! Selection, pre-commit balancer failover, and connector opening happen once
 //! per Product flow. The returned concrete branch is then pinned for the flow
-//! lifetime and no routing or gateway decision enters payload forwarding.
+//! lifetime and no routing or balancer decision enters payload forwarding.
 
-use crate::config::{
-    DEFAULT_OUTBOUND_CONNECT_TIMEOUT, GatewayBalancerConfig, RouteTarget, RouteTargetKind,
-};
+use crate::config::{DEFAULT_OUTBOUND_CONNECT_TIMEOUT, EgressRef, GatewayBalancerConfig};
 use crate::dns::{
     DirectDnsBackendFactory, DnsBackendError, DnsBackendFactory, DnsGeneration,
     DnsNativeSocketPolicy, DnsQueryBackend, DnsRuntimeError, DnsTcpConnectFuture, DnsTcpConnector,
@@ -199,8 +197,8 @@ impl RuntimeOutboundLeaf {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(in crate::runtime) enum OutboundSelector {
-    Leaf(OutboundId),
+pub(in crate::runtime) enum EgressSelection {
+    Outbound(OutboundId),
     Balancer(BalancerId),
 }
 
@@ -401,9 +399,9 @@ pub(in crate::runtime) fn finish_gateway_flow(
     if let Err(feedback) = lease.completed(error) {
         crate::observability::process_event!(
             Warn,
-            "gateway",
+            "balancer",
             "flow_outcome_feedback_failed",
-            "gateway flow-outcome feedback failed: {feedback}"
+            "balancer flow-outcome feedback failed: {feedback}"
         );
     }
 }
@@ -418,11 +416,11 @@ impl RuntimeOutboundRegistry {
         Ok(RuntimeOutboundRegistryShell::compile(leaves, balancer_configs)?.with_dns(dns))
     }
 
-    pub(in crate::runtime) fn selector_for_action(
+    pub(in crate::runtime) fn selection_for_action(
         &self,
         action: &EgressAction,
-    ) -> Result<OutboundSelector, RuntimeError> {
-        self.shell.selector_for_action(action)
+    ) -> Result<EgressSelection, RuntimeError> {
+        self.shell.selection_for_action(action)
     }
 
     pub(in crate::runtime) const fn dns(&self) -> &DnsGeneration {
@@ -469,7 +467,7 @@ impl RuntimeOutboundRegistry {
     }
 
     /// One absolute transaction deadline shared by DNS, post-resolution route
-    /// groups, gateway members, and MPP path attempts for a Product flow.
+    /// groups, balancer members, and MPP path attempts for a Product flow.
     pub(in crate::runtime) fn flow_open_deadline(&self) -> tokio::time::Instant {
         let timeout = self
             .shell
@@ -481,11 +479,11 @@ impl RuntimeOutboundRegistry {
         tokio::time::Instant::now() + timeout
     }
 
-    pub(in crate::runtime) fn selector_for_target(
+    pub(in crate::runtime) fn selection_for_egress(
         &self,
-        target: &RouteTarget,
-    ) -> Result<OutboundSelector, RuntimeError> {
-        self.shell.selector_for_target(target)
+        egress: &EgressRef,
+    ) -> Result<EgressSelection, RuntimeError> {
+        self.shell.selection_for_egress(egress)
     }
 
     /// Proves the server-side no-chaining invariant at runtime assembly.
@@ -493,16 +491,16 @@ impl RuntimeOutboundRegistry {
     /// Configuration validation performs the same check, but server services
     /// retain this defense so a hand-built runtime cannot forward one MPP
     /// session into another MPP session.
-    pub(in crate::runtime) fn ensure_native_selector(
+    pub(in crate::runtime) fn ensure_native_egress(
         &self,
-        selector: &OutboundSelector,
+        selection: &EgressSelection,
     ) -> Result<(), RuntimeError> {
-        self.shell.ensure_native_selector(selector)
+        self.shell.ensure_native_egress(selection)
     }
 
     pub(in crate::runtime) async fn open_tcp(
         &self,
-        selector: &OutboundSelector,
+        selection: &EgressSelection,
         target: &TargetAddr,
         dns_plan: Option<&DnsPlanId>,
         traffic_class: TrafficClass,
@@ -525,7 +523,7 @@ impl RuntimeOutboundRegistry {
         let (opened, outbound) = self
             .open_authorized_tcp_for_origin(
                 &pending,
-                selector,
+                selection,
                 &authorized,
                 dns_plan,
                 traffic_class,
@@ -539,7 +537,7 @@ impl RuntimeOutboundRegistry {
 
     pub(in crate::runtime) async fn open_udp(
         &self,
-        selector: &OutboundSelector,
+        selection: &EgressSelection,
         target: &TargetAddr,
         dns_plan: Option<&DnsPlanId>,
         authorizer: &dyn DestinationAuthorizer,
@@ -561,7 +559,7 @@ impl RuntimeOutboundRegistry {
         let (opened, outbound) = self
             .open_authorized_udp_for_origin(
                 &pending,
-                selector,
+                selection,
                 &authorized,
                 dns_plan,
                 TrafficClass::RealtimeDatagram,
@@ -576,7 +574,7 @@ impl RuntimeOutboundRegistry {
     pub(in crate::runtime) async fn open_authorized_tcp(
         &self,
         pending: &PendingProductFlow,
-        selector: &OutboundSelector,
+        selection: &EgressSelection,
         authorized: &[AuthorizedTarget],
         dns_plan: Option<&DnsPlanId>,
         traffic_class: TrafficClass,
@@ -584,7 +582,7 @@ impl RuntimeOutboundRegistry {
     ) -> Result<(OpenedTcpOutbound, ProductOutboundFlow), RuntimeError> {
         self.open_authorized_tcp_for_origin(
             pending,
-            selector,
+            selection,
             authorized,
             dns_plan,
             traffic_class,
@@ -599,7 +597,7 @@ impl RuntimeOutboundRegistry {
     async fn open_authorized_tcp_for_origin(
         &self,
         pending: &PendingProductFlow,
-        selector: &OutboundSelector,
+        selection: &EgressSelection,
         authorized: &[AuthorizedTarget],
         dns_plan: Option<&DnsPlanId>,
         traffic_class: TrafficClass,
@@ -613,8 +611,8 @@ impl RuntimeOutboundRegistry {
             .expect("authorized protocol target requires one address")
             .flow()
             .principal();
-        match selector {
-            OutboundSelector::Leaf(id) => {
+        match selection {
+            EgressSelection::Outbound(id) => {
                 let leaf = self.shell.require_leaf(id, Network::Tcp)?;
                 let scope = product_flow_scope(authorized, origin_kind, leaf.id(), None)?;
                 let connect = pending
@@ -636,7 +634,7 @@ impl RuntimeOutboundRegistry {
                     .await?;
                 Ok((opened, connect.connected()))
             }
-            OutboundSelector::Balancer(id) => {
+            EgressSelection::Balancer(id) => {
                 let runtime = self.shell.require_balancer(id)?;
                 let attempt_limit = runtime.member_count();
                 let mut excluded = Vec::with_capacity(attempt_limit);
@@ -689,7 +687,7 @@ impl RuntimeOutboundRegistry {
                 }
                 Err(last_error.unwrap_or_else(|| {
                     RuntimeError::GatewayUnavailable(
-                        "gateway has no TCP member attempts".to_string(),
+                        "balancer has no TCP member attempts".to_string(),
                     )
                 }))
             }
@@ -699,7 +697,7 @@ impl RuntimeOutboundRegistry {
     pub(in crate::runtime) async fn open_authorized_udp(
         &self,
         pending: &PendingProductFlow,
-        selector: &OutboundSelector,
+        selection: &EgressSelection,
         authorized: &[AuthorizedTarget],
         dns_plan: Option<&DnsPlanId>,
         traffic_class: TrafficClass,
@@ -707,7 +705,7 @@ impl RuntimeOutboundRegistry {
     ) -> Result<(OpenedUdpOutbound, ProductOutboundFlow), RuntimeError> {
         self.open_authorized_udp_for_origin(
             pending,
-            selector,
+            selection,
             authorized,
             dns_plan,
             traffic_class,
@@ -722,7 +720,7 @@ impl RuntimeOutboundRegistry {
     async fn open_authorized_udp_for_origin(
         &self,
         pending: &PendingProductFlow,
-        selector: &OutboundSelector,
+        selection: &EgressSelection,
         authorized: &[AuthorizedTarget],
         dns_plan: Option<&DnsPlanId>,
         traffic_class: TrafficClass,
@@ -736,8 +734,8 @@ impl RuntimeOutboundRegistry {
             .expect("authorized protocol target requires one address")
             .flow()
             .principal();
-        match selector {
-            OutboundSelector::Leaf(id) => {
+        match selection {
+            EgressSelection::Outbound(id) => {
                 let leaf = self.shell.require_leaf(id, Network::Udp)?;
                 let scope = product_flow_scope(authorized, origin_kind, leaf.id(), None)?;
                 let connect = pending
@@ -759,7 +757,7 @@ impl RuntimeOutboundRegistry {
                     .await?;
                 Ok((opened, connect.connected()))
             }
-            OutboundSelector::Balancer(id) => {
+            EgressSelection::Balancer(id) => {
                 let runtime = self.shell.require_balancer(id)?;
                 let attempt_limit = runtime.member_count();
                 let mut excluded = Vec::with_capacity(attempt_limit);
@@ -812,7 +810,7 @@ impl RuntimeOutboundRegistry {
                 }
                 Err(last_error.unwrap_or_else(|| {
                     RuntimeError::GatewayUnavailable(
-                        "gateway has no UDP member attempts".to_string(),
+                        "balancer has no UDP member attempts".to_string(),
                     )
                 }))
             }
@@ -916,9 +914,9 @@ impl RuntimeOutboundRegistry {
                 {
                     crate::observability::process_event!(
                         Warn,
-                        "gateway",
+                        "balancer",
                         "open_failure_feedback_failed",
-                        "gateway open-failure feedback failed: {feedback}"
+                        "balancer open-failure feedback failed: {feedback}"
                     );
                 }
                 return Err(error);
@@ -1041,7 +1039,7 @@ async fn run_gateway_probe_service(
         for member in runtime.members() {
             let permit = permits.clone().acquire_owned().await.map_err(|_| {
                 RuntimeError::ProductPolicy(
-                    "gateway active-probe concurrency owner closed".to_string(),
+                    "balancer active-probe concurrency owner closed".to_string(),
                 )
             })?;
             let Some(mut lease) = runtime.begin_active_probe(member)? else {
@@ -1058,9 +1056,9 @@ async fn run_gateway_probe_service(
             if let Err(error) = result {
                 crate::observability::process_event!(
                     Warn,
-                    "gateway",
+                    "balancer",
                     "active_probe_failed",
-                    "gateway active probe failed: balancer={} member={} error={error}",
+                    "balancer active probe failed: balancer={} outbound={} error={error}",
                     id.as_str(),
                     member.as_str(),
                 );
@@ -1080,7 +1078,7 @@ impl RuntimeOutboundRegistry {
         let address = SocketAddr::new(
             target.ip().ok_or_else(|| {
                 RuntimeError::ProductPolicy(
-                    "validated gateway probe target is not a literal IP".to_string(),
+                    "validated balancer probe target is not a literal IP".to_string(),
                 )
             })?,
             target.port().get(),
@@ -1159,7 +1157,7 @@ impl GatewayRuntimeControl {
 
     fn require_balancer(&self, id: &BalancerId) -> Result<&ClientGatewayRuntime, RuntimeError> {
         self.balancers.get(id).ok_or_else(|| {
-            RuntimeError::GatewayUnavailable(format!("gateway {} is not configured", id.as_str()))
+            RuntimeError::GatewayUnavailable(format!("balancer {} is not configured", id.as_str()))
         })
     }
 }
@@ -1184,13 +1182,13 @@ impl RuntimeOutboundRegistryShell {
             for member in &config.spec.members {
                 let Some(leaf) = leaf_map.get(&member.id) else {
                     return Err(RuntimeError::ProductPolicy(format!(
-                        "gateway member {} has no runtime outbound leaf",
+                        "balancer member {} has no runtime outbound",
                         member.id.as_str()
                     )));
                 };
                 if member.networks != leaf.networks() {
                     return Err(RuntimeError::ProductPolicy(format!(
-                        "gateway member {} capability differs from runtime leaf",
+                        "balancer member {} capability differs from runtime outbound",
                         member.id.as_str()
                     )));
                 }
@@ -1200,7 +1198,7 @@ impl RuntimeOutboundRegistryShell {
                 .is_some()
             {
                 return Err(RuntimeError::ProductPolicy(
-                    "duplicate runtime gateway balancer".to_string(),
+                    "duplicate runtime balancer".to_string(),
                 ));
             }
         }
@@ -1248,27 +1246,27 @@ impl RuntimeOutboundRegistryShell {
         }
     }
 
-    pub(in crate::runtime) fn selector_for_action(
+    pub(in crate::runtime) fn selection_for_action(
         &self,
         action: &EgressAction,
-    ) -> Result<OutboundSelector, RuntimeError> {
+    ) -> Result<EgressSelection, RuntimeError> {
         match action {
             EgressAction::Outbound(id) if self.leaves.contains_key(id) => {
-                Ok(OutboundSelector::Leaf(id.clone()))
+                Ok(EgressSelection::Outbound(id.clone()))
             }
             EgressAction::Balancer(id) if self.balancers.contains_key(id) => {
-                Ok(OutboundSelector::Balancer(id.clone()))
+                Ok(EgressSelection::Balancer(id.clone()))
             }
             EgressAction::Outbound(id) => Err(RuntimeError::ProductPolicy(format!(
                 "route selected unavailable outbound {}",
                 id.as_str()
             ))),
             EgressAction::Balancer(id) => Err(RuntimeError::ProductPolicy(format!(
-                "route selected unavailable gateway {}",
+                "route selected unavailable balancer {}",
                 id.as_str()
             ))),
             EgressAction::Direct => Err(RuntimeError::ProductPolicy(
-                "direct route must select a tagged direct outbound".to_string(),
+                "direct route must select a configured direct outbound".to_string(),
             )),
             EgressAction::Reject | EgressAction::Drop => Err(RuntimeError::ProductPolicy(
                 "terminal route cannot open an outbound".to_string(),
@@ -1276,29 +1274,20 @@ impl RuntimeOutboundRegistryShell {
         }
     }
 
-    pub(in crate::runtime) fn selector_for_target(
+    pub(in crate::runtime) fn selection_for_egress(
         &self,
-        target: &RouteTarget,
-    ) -> Result<OutboundSelector, RuntimeError> {
-        match target.kind {
-            RouteTargetKind::Outbound => OutboundId::parse(&target.tag)
-                .map(OutboundSelector::Leaf)
-                .map_err(|error| RuntimeError::ProductPolicy(error.to_string())),
-            RouteTargetKind::Balancer => BalancerId::parse(&target.tag)
-                .map(OutboundSelector::Balancer)
-                .map_err(|error| RuntimeError::ProductPolicy(error.to_string())),
-        }
-        .and_then(|selector| {
-            let present = match &selector {
-                OutboundSelector::Leaf(id) => self.leaves.contains_key(id),
-                OutboundSelector::Balancer(id) => self.balancers.contains_key(id),
-            };
-            present.then_some(selector).ok_or_else(|| {
-                RuntimeError::ProductPolicy(format!(
-                    "route target {} has no runtime binding",
-                    target.tag
-                ))
-            })
+        egress: &EgressRef,
+    ) -> Result<EgressSelection, RuntimeError> {
+        let selection = match egress {
+            EgressRef::Outbound(outbound) => EgressSelection::Outbound(outbound.clone()),
+            EgressRef::Balancer(balancer) => EgressSelection::Balancer(balancer.clone()),
+        };
+        let present = match &selection {
+            EgressSelection::Outbound(id) => self.leaves.contains_key(id),
+            EgressSelection::Balancer(id) => self.balancers.contains_key(id),
+        };
+        present.then_some(selection).ok_or_else(|| {
+            RuntimeError::ProductPolicy(format!("egress {} has no runtime binding", egress.name()))
         })
     }
 
@@ -1307,9 +1296,9 @@ impl RuntimeOutboundRegistryShell {
     /// Configuration validation performs the same check, but server services
     /// retain this defense so a hand-built runtime cannot forward one MPP
     /// session into another MPP session.
-    pub(in crate::runtime) fn ensure_native_selector(
+    pub(in crate::runtime) fn ensure_native_egress(
         &self,
-        selector: &OutboundSelector,
+        selection: &EgressSelection,
     ) -> Result<(), RuntimeError> {
         let ensure_leaf = |id: &OutboundId| {
             let leaf = self.leaves.get(id).ok_or_else(|| {
@@ -1323,9 +1312,9 @@ impl RuntimeOutboundRegistryShell {
                 ))
             }
         };
-        match selector {
-            OutboundSelector::Leaf(id) => ensure_leaf(id),
-            OutboundSelector::Balancer(id) => {
+        match selection {
+            EgressSelection::Outbound(id) => ensure_leaf(id),
+            EgressSelection::Balancer(id) => {
                 let runtime = self.require_balancer(id)?;
                 for member in runtime.members() {
                     ensure_leaf(member)?;
@@ -1354,7 +1343,7 @@ impl RuntimeOutboundRegistryShell {
 
     fn require_balancer(&self, id: &BalancerId) -> Result<&ClientGatewayRuntime, RuntimeError> {
         self.balancers.get(id).ok_or_else(|| {
-            RuntimeError::ProductPolicy(format!("gateway {} is unavailable", id.as_str()))
+            RuntimeError::ProductPolicy(format!("balancer {} is unavailable", id.as_str()))
         })
     }
 }
@@ -1567,13 +1556,12 @@ mod tests {
         }
     }
 
-    fn selector(registry: &RuntimeOutboundRegistry, id: &str) -> OutboundSelector {
+    fn selection(registry: &RuntimeOutboundRegistry, id: &str) -> EgressSelection {
         registry
-            .selector_for_target(&RouteTarget {
-                kind: RouteTargetKind::Outbound,
-                tag: id.to_string(),
-            })
-            .expect("outbound selector")
+            .selection_for_egress(&EgressRef::Outbound(
+                OutboundId::parse(id).expect("outbound ID"),
+            ))
+            .expect("outbound selection")
     }
 
     fn registry_with_product_admission(
@@ -1615,13 +1603,13 @@ mod tests {
             [local_leaf("direct", OutboundConfig::Direct)],
             admission.clone(),
         );
-        let selector = selector(&registry, "direct");
+        let selection = selection(&registry, "direct");
         let policy = crate::outbound::ServerDestinationPolicy::allow_restricted_for_test()
             .test_principal_policy();
 
         let first = registry
             .open_tcp(
-                &selector,
+                &selection,
                 &TargetAddr::Ip(first_address),
                 None,
                 TrafficClass::Latency,
@@ -1633,7 +1621,7 @@ mod tests {
         assert!(matches!(
             registry
                 .open_tcp(
-                    &selector,
+                    &selection,
                     &TargetAddr::Ip(second_address),
                     None,
                     TrafficClass::Latency,
@@ -1654,7 +1642,7 @@ mod tests {
         assert_eq!(admission.snapshot().live_flows, 0);
         let recovered = registry
             .open_tcp(
-                &selector,
+                &selection,
                 &TargetAddr::Ip(second_address),
                 None,
                 TrafficClass::Latency,
@@ -1689,13 +1677,13 @@ mod tests {
             )],
             admission.clone(),
         );
-        let selector = selector(&registry, "proxy");
+        let selection = selection(&registry, "proxy");
         let policy = crate::outbound::ServerDestinationPolicy::allow_restricted_for_test()
             .test_principal_policy();
         let opener = tokio::spawn(async move {
             registry
                 .open_tcp(
-                    &selector,
+                    &selection,
                     &TargetAddr::Ip("192.0.2.1:443".parse().expect("target")),
                     None,
                     TrafficClass::Latency,
@@ -1751,7 +1739,7 @@ mod tests {
         .expect("registry")
         .with_product_telemetry(telemetry.clone())
         .with_dns(test_dns_generation());
-        let selector = selector(&registry, "direct");
+        let selection = selection(&registry, "direct");
         let policy = crate::outbound::ServerDestinationPolicy::allow_restricted_for_test()
             .test_principal_policy();
 
@@ -1760,7 +1748,7 @@ mod tests {
             ..
         } = registry
             .open_tcp(
-                &selector,
+                &selection,
                 &TargetAddr::Ip(tcp_addr),
                 None,
                 TrafficClass::Latency,
@@ -1780,7 +1768,7 @@ mod tests {
             socket: OutboundUdpSocket::Direct(udp),
             ..
         } = registry
-            .open_udp(&selector, &TargetAddr::Ip(udp_addr), None, &policy)
+            .open_udp(&selection, &TargetAddr::Ip(udp_addr), None, &policy)
             .await
             .expect("local UDP")
         else {
@@ -1855,7 +1843,7 @@ mod tests {
             .test_principal_policy();
         let opened = registry
             .open_tcp(
-                &OutboundSelector::Balancer(balancer_id),
+                &EgressSelection::Balancer(balancer_id),
                 &TargetAddr::Ip(target_addr),
                 None,
                 TrafficClass::Latency,
@@ -1869,7 +1857,7 @@ mod tests {
             ..
         } = opened
         else {
-            panic!("gateway failover must return the working native member");
+            panic!("balancer failover must return the working native member");
         };
         assert_eq!(
             _product_flow.scope().selection.outbound.as_str(),
@@ -1919,7 +1907,7 @@ mod tests {
         )
         .expect("registry");
         assert!(matches!(
-            registry.ensure_native_selector(&OutboundSelector::Leaf(id)),
+            registry.ensure_native_egress(&EgressSelection::Outbound(id)),
             Err(RuntimeError::ProductPolicy(message))
                 if message.contains("cannot select an MPP outbound")
         ));

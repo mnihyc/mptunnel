@@ -28,7 +28,7 @@ not compatible with protocol v1, v2, or v3.
   and bounded FakeDNS through one strict Product policy.
 - Select direct, source-bound, SOCKS5, HTTP(S) CONNECT, or independent MPP
   outbounds through configurable failover, latency, load, random, or manual
-  gateways.
+  balancers.
 - Continue a reliable flow across a failed carrier through bounded
   data-level reinjection.
 - Inspect paths, sessions, flows, and forwarded traffic through a local
@@ -121,14 +121,14 @@ distribute its certificate to the client as a trust pin. Then start the server:
 
 ```bash
 mptunnel --credential-id home-2026 \
-  --principal home \
+  --principal-id home \
   --credential-secret-file ./mpp-credential.key \
   server \
   --bind-path tcp://0.0.0.0:4433 \
   --bind-path udp://0.0.0.0:4433 \
   --tls-certificate-chain ./server-cert-chain.pem \
   --tls-private-key ./server-private-key.pem \
-  --outbound direct
+  --outbound-protocol direct
 ```
 
 Start the client with the same credential file and the pinned server identity:
@@ -151,10 +151,16 @@ they are separate transports. Established logical streams are retained for
 five minutes when every carrier is unavailable; change that policy with
 `--session-retention-timeout-ms` or `[session].retention_timeout_ms`.
 
-For repeatable deployments, put the same graph in `config.toml`. Tagged
-`[[inbounds]]` select tagged `[[outbounds]]` or routing balancers; MPP
-endpoints and security are scoped to their MPP inbound or outbound. Validate
-without opening listeners, then start it:
+For repeatable deployments, put the same graph in `config.toml`. Every
+inbound, outbound, balancer, route rule, ACL rule, DNS upstream, DNS plan, and
+DNS rule has an explicit canonical `name`. Configured-resource references use
+the resource term (`inbounds`, `outbound`, `balancer`, or `dns_plan`);
+`credential_id`, `principal_id`, `rule_set_id`, and `publisher_id` are
+protocol or signed-artifact identities. `target` is reserved for an
+application or active-probe destination authority; `endpoint` is reserved for
+a listener, connector, or carrier network endpoint. MPP carrier `paths` and
+security are scoped to their MPP inbound or outbound. Validate without opening
+listeners, then start it:
 
 ```bash
 mptunnel --config ./config.toml --check-config
@@ -181,9 +187,9 @@ and validate it without starting a tunnel:
 
 ```bash
 mptunnel --config ./config.toml doctor
-mptunnel --config ./config.toml route explain \
+mptunnel --config ./config.toml --principal-id local-user route explain \
   --target api.example:443 --network tcp \
-  --source 127.0.0.1:41000 --principal local-user --inbound local-socks
+  --source 127.0.0.1:41000 --inbound local-socks
 ```
 
 Add `--resolved-ip 192.0.2.10` to explain post-resolution routing. Optional
@@ -201,7 +207,7 @@ mptunnel --config ./config.toml status
 mptunnel --config ./config.toml dns status
 mptunnel --config ./config.toml dns explain example.com
 mptunnel --config ./config.toml dns query example.com --type AAAA
-mptunnel --config ./config.toml dns flush --plan default
+mptunnel --config ./config.toml dns flush --dns-plan default
 ```
 
 Alternatively pass `--address 127.0.0.1:7600` and a
@@ -220,11 +226,11 @@ listeners. Add these options to either the client or server command:
 --management-dashboard
 ```
 
-Open `http://127.0.0.1:7600/`. The dashboard shows current Product gateway
+Open `http://127.0.0.1:7600/`. The dashboard shows current Product balancer
 readiness and explicit drain/pin controls, path state and metrics, forwarded
 traffic rates and history, sanitized inbound/outbound inventory, sessions, and
 active flows with their origin and selected egress.
-Runtime data, health, and controls are authenticated under `/api/v1/`; only
+Runtime data, health, and controls are authenticated under `/api/v2/`; only
 the static dashboard assets are public.
 
 ![mptunnel management dashboard](docs/assets/dashboard.png)

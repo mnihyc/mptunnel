@@ -12,9 +12,9 @@ use crate::runtime::telemetry::{ProductFlowLifecycleSnapshot, ProductIoSnapshot}
 use crate::scheduler::PathState as SchedulerPathState;
 use serde::Serialize;
 
-use super::gateway::ManagementGatewayStatus;
+use super::gateway::ManagementBalancerStatus;
 
-pub(super) const SCHEMA: &str = "mptunnel.management.v4";
+pub(super) const SCHEMA: &str = "mptunnel.management.v5";
 
 #[derive(Debug, Clone, Serialize)]
 pub(super) struct ManagementSnapshot {
@@ -29,7 +29,7 @@ pub(super) struct ManagementSnapshot {
     pub(super) summary: ManagementSummary,
     pub(super) admission: ManagementAdmission,
     pub(super) traffic: ManagementTraffic,
-    pub(super) gateways: Vec<ManagementGatewayStatus>,
+    pub(super) balancers: Vec<ManagementBalancerStatus>,
     pub(super) paths: Vec<ManagementPathStatus>,
     pub(super) sessions: Vec<ManagementSessionStatus>,
     pub(super) flows: Vec<ManagementFlowStatus>,
@@ -81,13 +81,13 @@ pub(super) struct ManagementServices {
     pub(super) local_inbounds: usize,
     pub(super) local_outbounds: usize,
     pub(super) outbounds: usize,
-    pub(super) gateway_balancers: usize,
+    pub(super) balancers: usize,
     pub(super) configured_path_listeners: usize,
 }
 
 #[derive(Debug, Clone, Serialize)]
 pub(super) struct ManagementOutboundStatus {
-    pub(super) tag: String,
+    pub(super) name: String,
     pub(super) protocol: &'static str,
     pub(super) networks: Vec<&'static str>,
 }
@@ -95,12 +95,11 @@ pub(super) struct ManagementOutboundStatus {
 #[derive(Debug, Clone, Serialize)]
 pub(super) struct ManagementIngressStatus {
     pub(super) service_index: usize,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub(super) tag: Option<String>,
+    pub(super) name: String,
     pub(super) protocol: &'static str,
     pub(super) listen: Vec<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub(super) name: Option<String>,
+    pub(super) interface_name: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(super) target: Option<String>,
     pub(super) auth_required: bool,
@@ -225,20 +224,18 @@ pub(super) struct ManagementTrendSample {
 
 #[derive(Debug, Clone, Serialize)]
 pub(super) struct ManagementPathStatus {
-    pub(super) id: String,
     pub(super) service: &'static str,
     pub(super) service_index: usize,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub(super) service_tag: Option<String>,
+    pub(super) service_name: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(super) session_id: Option<String>,
+    pub(super) path: String,
     pub(super) underlay: &'static str,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(super) path_id: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(super) path_instance_id: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub(super) configured_index: Option<usize>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(super) endpoint: Option<String>,
     pub(super) state: &'static str,
@@ -276,7 +273,7 @@ pub(super) struct ManagementSessionStatus {
     pub(super) service: &'static str,
     pub(super) service_index: usize,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub(super) service_tag: Option<String>,
+    pub(super) service_name: Option<String>,
     pub(super) session_id: String,
     pub(super) state: &'static str,
     pub(super) carrier_count: usize,
@@ -303,8 +300,6 @@ pub(super) struct ManagementFlowStatus {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(super) balancer: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub(super) balancer_member: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
     pub(super) target: Option<String>,
     pub(super) age_ms: u64,
     pub(super) idle_ms: u64,
@@ -327,7 +322,7 @@ pub(super) struct ManagementPeerSession {
     pub(super) service: &'static str,
     pub(super) service_index: usize,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub(super) service_tag: Option<String>,
+    pub(super) service_name: Option<String>,
     pub(super) session_id: String,
     pub(super) carrier_count: usize,
 }
@@ -337,7 +332,7 @@ pub(super) struct ManagementPeerStatusResult {
     pub(super) service: &'static str,
     pub(super) service_index: usize,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub(super) service_tag: Option<String>,
+    pub(super) service_name: Option<String>,
     pub(super) session_id: String,
     pub(super) request_id: String,
     pub(super) code: &'static str,
@@ -373,7 +368,7 @@ pub(super) struct ManagementPeerPathStatus {
 #[derive(Debug, Clone, Default, Serialize)]
 pub(super) struct ManagementControls {
     pub(super) path: ManagementControlStatus,
-    pub(super) gateway: ManagementControlStatus,
+    pub(super) balancer: ManagementControlStatus,
     pub(super) peer_diagnostics: ManagementControlStatus,
 }
 
@@ -381,7 +376,7 @@ pub(super) struct ManagementControls {
 pub(super) struct ManagementControlStatus {
     pub(super) supported: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub(super) endpoint: Option<&'static str>,
+    pub(super) operation: Option<&'static str>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(super) reason: Option<&'static str>,
 }

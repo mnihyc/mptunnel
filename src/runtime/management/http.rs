@@ -176,34 +176,34 @@ async fn handle_connection(
         ("GET", "/dashboard.js") if settings.dashboard => {
             write_static(stream, "text/javascript; charset=utf-8", DASHBOARD_JS).await
         }
-        ("GET", "/api/v1/") => {
+        ("GET", "/api/v2/") => {
             write_json(
                 stream,
                 200,
                 "OK",
                 &json!({
                     "schema": SCHEMA,
-                    "endpoints": {
-                        "health": "GET /api/v1/health",
-                        "liveness": "GET /api/v1/health/live",
-                        "readiness": "GET /api/v1/health/ready",
-                        "status": "GET /api/v1/status",
-                        "paths": "GET /api/v1/paths",
-                        "traffic": "GET /api/v1/traffic",
-                        "sessions": "GET /api/v1/sessions",
-                        "flows": "GET /api/v1/flows",
-                        "diagnostics": "GET /api/v1/diagnostics",
-                        "path_control": "POST /api/v1/actions/path",
-                        "peer_diagnostics": "POST /api/v1/diagnostics/peer",
-                        "config": "GET /api/v1/config",
-                        "config_validate": "POST /api/v1/config/validate",
-                        "config_apply": "POST /api/v1/config/apply",
-                        "gateways": "GET /api/v1/gateways",
-                        "gateway_actions": "POST /api/v1/gateways/actions",
-                        "dns_status": "GET /api/v1/dns/status",
-                        "dns_explain": "GET /api/v1/dns/explain?name=<domain>",
-                        "dns_query": "POST /api/v1/dns/query",
-                        "dns_cache_flush": "POST /api/v1/dns/cache/flush"
+                    "operations": {
+                        "health": "GET /api/v2/health",
+                        "liveness": "GET /api/v2/health/live",
+                        "readiness": "GET /api/v2/health/ready",
+                        "status": "GET /api/v2/status",
+                        "paths": "GET /api/v2/paths",
+                        "traffic": "GET /api/v2/traffic",
+                        "sessions": "GET /api/v2/sessions",
+                        "flows": "GET /api/v2/flows",
+                        "diagnostics": "GET /api/v2/diagnostics",
+                        "path_control": "POST /api/v2/actions/path",
+                        "peer_diagnostics": "POST /api/v2/diagnostics/peer",
+                        "config": "GET /api/v2/config",
+                        "config_validate": "POST /api/v2/config/validate",
+                        "config_apply": "POST /api/v2/config/apply",
+                        "balancers": "GET /api/v2/balancers",
+                        "balancer_actions": "POST /api/v2/balancers/actions",
+                        "dns_status": "GET /api/v2/dns/status",
+                        "dns_explain": "GET /api/v2/dns/explain?domain=<domain>",
+                        "dns_query": "POST /api/v2/dns/query",
+                        "dns_cache_flush": "POST /api/v2/dns/cache/flush"
                     },
                     "dashboard": settings.dashboard,
                     "authentication": if settings.token.is_some() { "bearer" } else { "none" }
@@ -211,50 +211,50 @@ async fn handle_connection(
             )
             .await
         }
-        ("GET", "/api/v1/health") => {
+        ("GET", "/api/v2/health") => {
             let (status, reason, response) = health_response(&target);
             write_json(stream, status, reason, &response).await
         }
-        ("GET", "/api/v1/health/live") => {
+        ("GET", "/api/v2/health/live") => {
             let (status, reason, response) = liveness_response(&target);
             write_json(stream, status, reason, &response).await
         }
-        ("GET", "/api/v1/health/ready") => {
+        ("GET", "/api/v2/health/ready") => {
             let (status, reason, response) = readiness_response(&target);
             write_json(stream, status, reason, &response).await
         }
-        ("GET", "/api/v1/config") => match target.config_status_json() {
+        ("GET", "/api/v2/config") => match target.config_status_json() {
             Ok(value) => write_json(stream, 200, "OK", &value).await,
             Err(err) => write_error(stream, err).await,
         },
-        ("GET", "/api/v1/gateways") => match target.gateway_status_json() {
+        ("GET", "/api/v2/balancers") => match target.balancer_status_json() {
             Ok(value) => write_json(stream, 200, "OK", &value).await,
             Err(err) => write_error(stream, err).await,
         },
-        ("POST", "/api/v1/gateways/actions") => {
+        ("POST", "/api/v2/balancers/actions") => {
             if let Err(err) = require_json(&request) {
                 return write_error(stream, err).await;
             }
-            match target.control_gateway_json(&request.body) {
+            match target.control_balancer_json(&request.body) {
                 Ok(value) => write_json(stream, 200, "OK", &value).await,
                 Err(err) => write_error(stream, err).await,
             }
         }
-        ("GET", "/api/v1/dns/status") => match target.dns_status_json() {
+        ("GET", "/api/v2/dns/status") => match target.dns_status_json() {
             Ok(value) => write_json(stream, 200, "OK", &value).await,
             Err(err) => write_error(stream, err).await,
         },
-        ("GET", "/api/v1/dns/explain") => {
-            let name = match required_single_query_parameter(&request, "name") {
-                Ok(name) => name,
+        ("GET", "/api/v2/dns/explain") => {
+            let domain = match required_single_query_parameter(&request, "domain") {
+                Ok(domain) => domain,
                 Err(err) => return write_error(stream, err).await,
             };
-            match target.dns_explain_json(&name) {
+            match target.dns_explain_json(&domain) {
                 Ok(value) => write_json(stream, 200, "OK", &value).await,
                 Err(err) => write_error(stream, err).await,
             }
         }
-        ("POST", "/api/v1/dns/query") => {
+        ("POST", "/api/v2/dns/query") => {
             if let Err(err) = require_json(&request) {
                 return write_error(stream, err).await;
             }
@@ -263,7 +263,7 @@ async fn handle_connection(
                 Err(err) => write_error(stream, err).await,
             }
         }
-        ("POST", "/api/v1/dns/cache/flush") => {
+        ("POST", "/api/v2/dns/cache/flush") => {
             if let Err(err) = require_json(&request) {
                 return write_error(stream, err).await;
             }
@@ -272,7 +272,7 @@ async fn handle_connection(
                 Err(err) => write_error(stream, err).await,
             }
         }
-        ("POST", "/api/v1/config/validate") => {
+        ("POST", "/api/v2/config/validate") => {
             if let Err(err) = require_toml(&request) {
                 return write_error(stream, err).await;
             }
@@ -281,7 +281,7 @@ async fn handle_connection(
                 Err(err) => write_error(stream, err).await,
             }
         }
-        ("POST", "/api/v1/config/apply") => {
+        ("POST", "/api/v2/config/apply") => {
             if let Err(err) = require_toml(&request) {
                 return write_error(stream, err).await;
             }
@@ -309,11 +309,11 @@ async fn handle_connection(
                 Err(err) => write_error(stream, err).await,
             }
         }
-        ("GET", "/api/v1/status") => {
+        ("GET", "/api/v2/status") => {
             let snapshot = target.snapshot();
             write_json(stream, 200, "OK", &*snapshot).await
         }
-        ("GET", "/api/v1/paths") => {
+        ("GET", "/api/v2/paths") => {
             let snapshot = target.snapshot();
             write_json(
                 stream,
@@ -327,7 +327,7 @@ async fn handle_connection(
             )
             .await
         }
-        ("GET", "/api/v1/traffic") => {
+        ("GET", "/api/v2/traffic") => {
             let snapshot = target.snapshot();
             write_json(
                 stream,
@@ -342,7 +342,7 @@ async fn handle_connection(
             )
             .await
         }
-        ("GET", "/api/v1/sessions") => {
+        ("GET", "/api/v2/sessions") => {
             let snapshot = target.snapshot();
             write_json(
                 stream,
@@ -356,7 +356,7 @@ async fn handle_connection(
             )
             .await
         }
-        ("GET", "/api/v1/flows") => {
+        ("GET", "/api/v2/flows") => {
             let snapshot = target.snapshot();
             write_json(
                 stream,
@@ -370,7 +370,7 @@ async fn handle_connection(
             )
             .await
         }
-        ("GET", "/api/v1/diagnostics") => {
+        ("GET", "/api/v2/diagnostics") => {
             let snapshot = target.snapshot();
             write_json(
                 stream,
@@ -386,7 +386,7 @@ async fn handle_connection(
             )
             .await
         }
-        ("POST", "/api/v1/actions/path") => {
+        ("POST", "/api/v2/actions/path") => {
             if let Err(err) = require_json(&request) {
                 return write_error(stream, err).await;
             }
@@ -395,7 +395,7 @@ async fn handle_connection(
                 Err(err) => write_error(stream, err).await,
             }
         }
-        ("POST", "/api/v1/diagnostics/peer") => {
+        ("POST", "/api/v2/diagnostics/peer") => {
             if let Err(err) = require_json(&request) {
                 return write_error(stream, err).await;
             }
@@ -488,21 +488,21 @@ fn health_assessment(target: &ManagementTarget) -> HealthAssessment {
         }
     }
 
-    let unavailable_gateways = snapshot
-        .gateways
+    let unavailable_balancers = snapshot
+        .balancers
         .iter()
-        .filter(|gateway| gateway.ready_members == 0)
-        .map(|gateway| gateway.tag.clone())
+        .filter(|balancer| balancer.ready_members == 0)
+        .map(|balancer| balancer.name.clone())
         .collect::<Vec<_>>();
-    if !unavailable_gateways.is_empty() {
-        readiness_blockers.push("gateway-without-ready-member".to_string());
+    if !unavailable_balancers.is_empty() {
+        readiness_blockers.push("balancer-without-ready-outbound".to_string());
     }
     if snapshot
-        .gateways
+        .balancers
         .iter()
-        .any(|gateway| gateway.unavailable_members > 0 && gateway.ready_members > 0)
+        .any(|balancer| balancer.unavailable_members > 0 && balancer.ready_members > 0)
     {
-        degraded_reasons.push("some-gateway-members-unavailable".to_string());
+        degraded_reasons.push("some-balancer-outbounds-unavailable".to_string());
     }
 
     let dns_snapshot = target.dns.as_ref().map(|dns| dns.runtime_snapshot());
@@ -550,7 +550,7 @@ fn health_assessment(target: &ManagementTarget) -> HealthAssessment {
         RuntimeGenerationPhase::Ready => "healthy",
     };
     let mut response = json!({
-        "schema": "mptunnel.health.v1",
+        "schema": "mptunnel.health.v2",
         "status": status,
         "live": live,
         "ready": ready,
@@ -570,9 +570,9 @@ fn health_assessment(target: &ManagementTarget) -> HealthAssessment {
                 .filter(|session| session.carrier_count > 0)
                 .count(),
         },
-        "gateways": {
-            "configured": snapshot.gateways.len(),
-            "unavailable": unavailable_gateways,
+        "balancers": {
+            "configured": snapshot.balancers.len(),
+            "unavailable": unavailable_balancers,
         },
         "dns": dns_snapshot.as_ref().map(|dns| json!({
             "generation": dns.generation,
@@ -651,27 +651,27 @@ struct DiagnosticsResponse<'a> {
 fn known_path(path: &str, dashboard: bool) -> bool {
     matches!(
         path,
-        "/api/v1/"
-            | "/api/v1/health"
-            | "/api/v1/health/live"
-            | "/api/v1/health/ready"
-            | "/api/v1/status"
-            | "/api/v1/paths"
-            | "/api/v1/traffic"
-            | "/api/v1/sessions"
-            | "/api/v1/flows"
-            | "/api/v1/diagnostics"
-            | "/api/v1/config"
-            | "/api/v1/config/validate"
-            | "/api/v1/config/apply"
-            | "/api/v1/gateways"
-            | "/api/v1/gateways/actions"
-            | "/api/v1/dns/status"
-            | "/api/v1/dns/explain"
-            | "/api/v1/dns/query"
-            | "/api/v1/dns/cache/flush"
-            | "/api/v1/actions/path"
-            | "/api/v1/diagnostics/peer"
+        "/api/v2/"
+            | "/api/v2/health"
+            | "/api/v2/health/live"
+            | "/api/v2/health/ready"
+            | "/api/v2/status"
+            | "/api/v2/paths"
+            | "/api/v2/traffic"
+            | "/api/v2/sessions"
+            | "/api/v2/flows"
+            | "/api/v2/diagnostics"
+            | "/api/v2/config"
+            | "/api/v2/config/validate"
+            | "/api/v2/config/apply"
+            | "/api/v2/balancers"
+            | "/api/v2/balancers/actions"
+            | "/api/v2/dns/status"
+            | "/api/v2/dns/explain"
+            | "/api/v2/dns/query"
+            | "/api/v2/dns/cache/flush"
+            | "/api/v2/actions/path"
+            | "/api/v2/diagnostics/peer"
     ) || dashboard && matches!(path, "/" | "/dashboard.css" | "/dashboard.js")
 }
 

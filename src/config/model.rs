@@ -159,6 +159,7 @@ fn validate_node_config(node: &NodeConfig, resources: ResourceLimits) -> Result<
     if node.local_ingresses.is_empty() && node.servers.is_empty() {
         return Err(ConfigError::NoRuntimeServices);
     }
+    validate_inbound_names(&node.local_ingresses, &node.servers)?;
 
     let mut leaf_networks = HashMap::with_capacity(node.outbounds.len());
     for leaf in &node.outbounds {
@@ -200,16 +201,8 @@ fn validate_node_config(node: &NodeConfig, resources: ResourceLimits) -> Result<
                 plan.as_str()
             )));
         }
-        validate_route_target(
-            &server.route_target,
-            &leaf_networks,
-            &node.gateway_balancers,
-        )?;
-        validate_mpp_inbound_egress(
-            &server.route_target,
-            &node.gateway_balancers,
-            &node.outbounds,
-        )?;
+        validate_egress(&server.egress, &leaf_networks, &node.gateway_balancers)?;
+        validate_mpp_inbound_egress(&server.egress, &node.gateway_balancers, &node.outbounds)?;
     }
     validate_local_ingresses(&node.local_ingresses)?;
     validate_fake_dns_tun_routes(&node.local_ingresses, &dns_policy)?;
@@ -300,18 +293,15 @@ fn validate_product_policy_dns_plans(
 }
 
 fn validate_mpp_inbound_egress(
-    target: &RouteTarget,
+    egress: &EgressRef,
     balancers: &[GatewayBalancerConfig],
     outbounds: &[OutboundLeafConfig],
 ) -> Result<(), ConfigError> {
-    let member_ids = match target.kind {
-        RouteTargetKind::Outbound => vec![
-            OutboundId::parse(&target.tag)
-                .map_err(|error| ConfigError::ProductPolicy(error.to_string()))?,
-        ],
-        RouteTargetKind::Balancer => balancers
+    let member_ids = match egress {
+        EgressRef::Outbound(outbound) => vec![outbound.clone()],
+        EgressRef::Balancer(selected) => balancers
             .iter()
-            .find(|balancer| balancer.id.as_str() == target.tag)
+            .find(|balancer| &balancer.id == selected)
             .map(|balancer| {
                 balancer
                     .spec
@@ -351,14 +341,14 @@ fn validate_gateway_balancers(
         for member in &config.spec.members {
             let Some(networks) = leaf_networks.get(&member.id) else {
                 return Err(ConfigError::ProductPolicy(format!(
-                    "gateway balancer {} references missing outbound {}",
+                    "balancer {} references missing outbound {}",
                     config.id.as_str(),
                     member.id.as_str()
                 )));
             };
             if member.networks != *networks {
                 return Err(ConfigError::ProductPolicy(format!(
-                    "gateway balancer {} member {} capability metadata does not match its leaf",
+                    "balancer {} member {} capability metadata does not match its outbound",
                     config.id.as_str(),
                     member.id.as_str()
                 )));
@@ -368,30 +358,25 @@ fn validate_gateway_balancers(
     Ok(())
 }
 
-fn validate_route_target(
-    target: &RouteTarget,
+fn validate_egress(
+    egress: &EgressRef,
     leaves: &HashMap<OutboundId, NetworkSet>,
     balancers: &[GatewayBalancerConfig],
 ) -> Result<(), ConfigError> {
-    match target.kind {
-        RouteTargetKind::Outbound => {
-            let id = OutboundId::parse(&target.tag)
-                .map_err(|error| ConfigError::ProductPolicy(error.to_string()))?;
-            if !leaves.contains_key(&id) {
+    match egress {
+        EgressRef::Outbound(outbound) => {
+            if !leaves.contains_key(outbound) {
                 return Err(ConfigError::ProductPolicy(format!(
-                    "route target references missing outbound {}",
-                    target.tag
+                    "egress references missing outbound {}",
+                    outbound.as_str()
                 )));
             }
         }
-        RouteTargetKind::Balancer => {
-            if !balancers
-                .iter()
-                .any(|balancer| balancer.id.as_str() == target.tag)
-            {
+        EgressRef::Balancer(selected) => {
+            if !balancers.iter().any(|balancer| &balancer.id == selected) {
                 return Err(ConfigError::ProductPolicy(format!(
-                    "route target references missing gateway balancer {}",
-                    target.tag
+                    "egress references missing balancer {}",
+                    selected.as_str()
                 )));
             }
         }
@@ -415,14 +400,14 @@ fn validate_product_policy_targets(
             }
             EgressAction::Balancer(id) if !balancers.iter().any(|balancer| &balancer.id == id) => {
                 return Err(ConfigError::ProductPolicy(format!(
-                    "route {} references missing gateway balancer {}",
+                    "route {} references missing balancer {}",
                     rule.id.as_str(),
                     id.as_str()
                 )));
             }
             EgressAction::Direct => {
                 return Err(ConfigError::ProductPolicy(format!(
-                    "route {} must select a tagged direct outbound",
+                    "route {} must select a configured direct outbound",
                     rule.id.as_str()
                 )));
             }
@@ -654,9 +639,9 @@ pub enum CommandConfig {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct NodeConfig {
-    /// One globally tagged namespace for MPP and native connector leaves.
+    /// One canonical namespace for MPP and native outbound leaves.
     pub outbounds: Vec<OutboundLeafConfig>,
-    /// Product gateway balancers over compatible leaf outbounds. They never
+    /// Product balancers over compatible leaf outbounds. They never
     /// merge MPP carrier paths or own Core scheduling state.
     pub gateway_balancers: Vec<GatewayBalancerConfig>,
     /// Product-owned local ingress surfaces. They are intentionally not owned
@@ -665,7 +650,7 @@ pub struct NodeConfig {
     pub local_ingresses: Vec<LocalIngressConfig>,
     /// Immutable new-flow policy generation for local SOCKS/HTTP/TUN traffic.
     pub product_policy: Option<ProductPolicyConfig>,
-    /// Immutable tagged split-DNS policy shared by local resolution.
+    /// Immutable named split-DNS policy shared by local resolution.
     pub dns_policy: DnsPolicyConfig,
     pub servers: Vec<MppInboundConfig>,
 }
@@ -701,7 +686,7 @@ pub struct DnsPolicyConfig {
 }
 
 impl DnsPolicyConfig {
-    /// Explicit, tagged system resolution for the simple proxy/server profile.
+    /// Explicit named system resolution for the simple proxy/server profile.
     /// Managed full-VPN validation rejects this policy before publishing host
     /// routes, so the convenience default cannot become an implicit DNS leak.
     pub fn system_default() -> Self {
@@ -759,16 +744,23 @@ impl ServerDestinationAclConfig {
     }
 }
 
+/// Typed reference from one MPP inbound to its native Product egress.
+///
+/// Configuration text is parsed once into this enum so an outbound and a
+/// balancer never share an untyped string discriminator.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub enum RouteTargetKind {
-    Outbound,
-    Balancer,
+pub enum EgressRef {
+    Outbound(OutboundId),
+    Balancer(BalancerId),
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct RouteTarget {
-    pub kind: RouteTargetKind,
-    pub tag: String,
+impl EgressRef {
+    pub fn name(&self) -> &str {
+        match self {
+            Self::Outbound(name) => name.as_str(),
+            Self::Balancer(name) => name.as_str(),
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -817,12 +809,17 @@ impl OutboundLeafConfig {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct LocalIngressConfig {
-    pub tag: Option<String>,
+    /// Required canonical operator-assigned name used by routing and
+    /// management. It is not a protocol identity.
+    pub name: String,
     pub config: IngressConfig,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ClientPathConfig {
+    /// Stable Product name of one configured carrier path. Core scheduling
+    /// continues to use protocol path identities and never this name.
+    pub name: String,
     /// One configured carrier path for an MPP outbound.
     pub spec: PathSpec,
     /// Security scoped to this path's MPP peer relationship.
@@ -833,15 +830,23 @@ pub struct ClientPathConfig {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NamedPathConfig {
+    /// Stable Product name used for management and presentation only.
+    pub name: String,
+    pub spec: PathSpec,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct MppInboundConfig {
-    /// Display/routing tag for this MPP inbound.
-    pub tag: Option<String>,
+    /// Required canonical operator-assigned name used by Product policy and
+    /// management. It never enters the MPP wire protocol.
+    pub name: String,
     /// Egress outbound or egress balancer selected for accepted MPP flows.
-    pub route_target: RouteTarget,
+    pub egress: EgressRef,
     /// Optional DNS plan for target resolution before native egress.
     pub dns_plan: Option<crate::product::DnsPlanId>,
-    /// Carrier listen/bind paths owned by this MPP inbound.
-    pub bind_paths: Vec<PathSpec>,
+    /// Named carrier listen/bind paths owned by this MPP inbound.
+    pub paths: Vec<NamedPathConfig>,
     /// Security scoped to peers that join this MPP inbound.
     pub security: ServerSecurityConfig,
     /// TLS identity shared by every TCP and QUIC listener in this MPP inbound.
@@ -859,6 +864,7 @@ fn validate_mpp_outbound(
     if client.paths.is_empty() {
         return Err(ConfigError::NoPaths);
     }
+    validate_path_names(client.paths.iter().map(|path| path.name.as_str()))?;
     validate_client_security_config(&client.security)?;
     if client.paths.len() > resources.max_paths {
         return Err(ConfigError::TooManyPaths {
@@ -897,14 +903,30 @@ fn validate_local_ingresses(ingresses: &[LocalIngressConfig]) -> Result<(), Conf
         });
     }
     for ingress in ingresses {
-        let tag = ingress
-            .tag
-            .as_deref()
-            .ok_or(ConfigError::LocalIngressTagRequired)?;
-        InboundId::parse(tag).map_err(|_| ConfigError::LocalIngressTagInvalid)?;
         validate_ingress(&ingress.config)?;
         if let IngressConfig::TunL4(tun) = &ingress.config {
             validate_tun_l4(tun)?;
+        }
+    }
+    Ok(())
+}
+
+fn validate_inbound_names(
+    local_ingresses: &[LocalIngressConfig],
+    mpp_inbounds: &[MppInboundConfig],
+) -> Result<(), ConfigError> {
+    let mut seen = HashSet::with_capacity(local_ingresses.len() + mpp_inbounds.len());
+    for name in local_ingresses
+        .iter()
+        .map(|inbound| inbound.name.as_str())
+        .chain(mpp_inbounds.iter().map(|inbound| inbound.name.as_str()))
+    {
+        let canonical = InboundId::parse(name).map_err(|_| ConfigError::InboundNameInvalid)?;
+        if canonical.as_str() != name {
+            return Err(ConfigError::InboundNameInvalid);
+        }
+        if !seen.insert(name) {
+            return Err(ConfigError::DuplicateInboundName(name.to_string()));
         }
     }
     Ok(())
@@ -914,19 +936,20 @@ fn validate_mpp_inbound(
     server: &MppInboundConfig,
     resources: ResourceLimits,
 ) -> Result<(), ConfigError> {
-    if server.bind_paths.is_empty() {
+    if server.paths.is_empty() {
         return Err(ConfigError::NoPaths);
     }
-    if server.bind_paths.len() > resources.max_paths {
+    validate_path_names(server.paths.iter().map(|path| path.name.as_str()))?;
+    if server.paths.len() > resources.max_paths {
         return Err(ConfigError::TooManyPaths {
-            actual: server.bind_paths.len(),
+            actual: server.paths.len(),
             limit: resources.max_paths,
         });
     }
     if server
-        .bind_paths
+        .paths
         .iter()
-        .any(|path| path.binding.source_ip.is_some())
+        .any(|path| path.spec.binding.source_ip.is_some())
     {
         return Err(ConfigError::ServerPathSourceBinding);
     }
@@ -935,6 +958,21 @@ fn validate_mpp_inbound(
         .destination_acl
         .compile()
         .map_err(|error| ConfigError::ServerDestinationAcl(error.to_string()))?;
+    Ok(())
+}
+
+fn validate_path_names<'a>(names: impl IntoIterator<Item = &'a str>) -> Result<(), ConfigError> {
+    let mut seen = HashSet::new();
+    for name in names {
+        let canonical =
+            crate::product::RuleId::parse(name).map_err(|_| ConfigError::PathNameInvalid)?;
+        if canonical.as_str() != name {
+            return Err(ConfigError::PathNameInvalid);
+        }
+        if !seen.insert(name) {
+            return Err(ConfigError::DuplicatePathName(name.to_string()));
+        }
+    }
     Ok(())
 }
 
@@ -1055,6 +1093,8 @@ pub enum ConfigError {
     NoIngresses,
     NoListenAddresses,
     TooManyPaths { actual: usize, limit: usize },
+    PathNameInvalid,
+    DuplicatePathName(String),
     PathProbeIntervalZero,
     PathProbeTimeoutZero,
     QuicTlsServerNameRequiresDns,
@@ -1070,8 +1110,8 @@ pub enum ConfigError {
     MultipleManagedTunInbounds { actual: usize },
     DnsPolicy(String),
     OutboundConnectTimeoutZero,
-    LocalIngressTagRequired,
-    LocalIngressTagInvalid,
+    InboundNameInvalid,
+    DuplicateInboundName(String),
     LocalIngressRoutingRequired,
     ProductPolicy(String),
     ServerDestinationAcl(String),
@@ -1282,6 +1322,12 @@ impl std::fmt::Display for ConfigError {
             Self::TooManyPaths { actual, limit } => {
                 write!(f, "{actual} paths configured, limit is {limit}")
             }
+            Self::PathNameInvalid => {
+                write!(f, "path name must be canonical Product name text")
+            }
+            Self::DuplicatePathName(name) => {
+                write!(f, "duplicate path name {name:?}")
+            }
             Self::PathProbeIntervalZero => {
                 write!(f, "path probe interval must be greater than zero")
             }
@@ -1313,14 +1359,11 @@ impl std::fmt::Display for ConfigError {
             Self::OutboundConnectTimeoutZero => {
                 write!(f, "outbound connect timeout must be greater than zero")
             }
-            Self::LocalIngressTagRequired => {
-                write!(f, "every local inbound requires a routing tag")
+            Self::InboundNameInvalid => {
+                write!(f, "inbound name must be canonical Product name text")
             }
-            Self::LocalIngressTagInvalid => {
-                write!(
-                    f,
-                    "local inbound tag must be a normalized Product inbound ID"
-                )
+            Self::DuplicateInboundName(name) => {
+                write!(f, "duplicate inbound name {name:?}")
             }
             Self::LocalIngressRoutingRequired => {
                 write!(

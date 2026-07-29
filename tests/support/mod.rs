@@ -289,7 +289,7 @@ pub fn wait_for_ready_management(
         if let Ok(response) = http_request(
             address,
             "GET",
-            "/api/v1/health/ready",
+            "/api/v2/health/ready",
             Some(token),
             &[],
             &[],

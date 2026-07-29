@@ -1,4 +1,4 @@
-//! Product gateway selection and flow-lifetime accounting.
+//! Product balancer selection and flow-lifetime accounting.
 //!
 //! This state is consulted only when a Product flow opens or completes. It
 //! never enters carrier selection, payload forwarding, or reinjection.
@@ -151,12 +151,12 @@ impl ClientGatewayRuntime {
     ) -> Result<&OutboundId, RuntimeError> {
         if handle.generation() != self.generation {
             return Err(RuntimeError::ProductPolicy(
-                "gateway selection handle belongs to another runtime generation".to_string(),
+                "balancer selection handle belongs to another runtime generation".to_string(),
             ));
         }
         self.members.get(usize::from(handle.slot())).ok_or_else(|| {
             RuntimeError::ProductPolicy(
-                "gateway selection handle has no runtime member".to_string(),
+                "balancer selection handle has no runtime member".to_string(),
             )
         })
     }
@@ -225,7 +225,7 @@ impl ClientGatewayRuntime {
         let mut state = self.lock()?;
         let handle = state.balancer.handle_for(member).ok_or_else(|| {
             RuntimeError::GatewayUnavailable(format!(
-                "gateway member {} is not configured",
+                "balancer member {} is not configured",
                 member.as_str()
             ))
         })?;
@@ -244,7 +244,7 @@ impl ClientGatewayRuntime {
             .map(|member| {
                 state.balancer.handle_for(member).ok_or_else(|| {
                     RuntimeError::GatewayUnavailable(format!(
-                        "gateway member {} is not configured",
+                        "balancer member {} is not configured",
                         member.as_str()
                     ))
                 })
@@ -264,7 +264,7 @@ impl ClientGatewayRuntime {
         let mut state = self.lock()?;
         let handle = state.balancer.handle_for(member).ok_or_else(|| {
             RuntimeError::GatewayUnavailable(format!(
-                "gateway member {} is not configured",
+                "balancer member {} is not configured",
                 member.as_str()
             ))
         })?;
@@ -550,12 +550,12 @@ fn adjust_active(
 
 fn adjust_counter(value: u32, increment: bool) -> Result<u32, RuntimeError> {
     if increment {
-        value
-            .checked_add(1)
-            .ok_or_else(|| RuntimeError::ProductPolicy("gateway flow counter overflow".to_string()))
+        value.checked_add(1).ok_or_else(|| {
+            RuntimeError::ProductPolicy("balancer flow counter overflow".to_string())
+        })
     } else {
         value.checked_sub(1).ok_or_else(|| {
-            RuntimeError::ProductPolicy("gateway flow counter underflow".to_string())
+            RuntimeError::ProductPolicy("balancer flow counter underflow".to_string())
         })
     }
 }

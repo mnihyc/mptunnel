@@ -20,60 +20,60 @@ const TEST_CERTIFICATE_FILE: &str = "edge-certificate.pem";
 
 const CONFIG_A: &str = r#"
 [[credentials]]
-id = "edge-client"
-principal = "edge-peer"
+credential_id = "edge-client"
+principal_id = "edge-peer"
 secret = { from = "file", path = "edge-credential.key" }
 
 [[inbounds]]
-tag = "local-socks"
+name = "local-socks"
 protocol = "socks5"
 listen = ["127.0.0.1:1080"]
 
 [[outbounds]]
-tag = "edge"
+name = "edge"
 protocol = "mpp"
-endpoints = ["udp://127.0.0.1:7443"]
+paths = [{ name = "path-1", endpoint = "udp://127.0.0.1:7443" }]
 
 [outbounds.security]
-credential = "edge-client"
+credential_id = "edge-client"
 tls_server_name = "mptunnel.test"
 tls_pinned_certificate_file = "edge-certificate.pem"
 
 [routing]
 
 [[routing.rules]]
-id = "default"
+name = "default"
 action = "outbound"
-target = "edge"
+outbound = "edge"
 "#;
 
 const CONFIG_B: &str = r#"
 [[credentials]]
-id = "edge-client"
-principal = "edge-peer"
+credential_id = "edge-client"
+principal_id = "edge-peer"
 secret = { from = "file", path = "edge-credential.key" }
 
 [[inbounds]]
-tag = "local-socks"
+name = "local-socks"
 protocol = "socks5"
 listen = ["127.0.0.1:1081"]
 
 [[outbounds]]
-tag = "edge"
+name = "edge"
 protocol = "mpp"
-endpoints = ["udp://127.0.0.1:7443"]
+paths = [{ name = "path-1", endpoint = "udp://127.0.0.1:7443" }]
 
 [outbounds.security]
-credential = "edge-client"
+credential_id = "edge-client"
 tls_server_name = "mptunnel.test"
 tls_pinned_certificate_file = "edge-certificate.pem"
 
 [routing]
 
 [[routing.rules]]
-id = "default"
+name = "default"
 action = "outbound"
-target = "edge"
+outbound = "edge"
 "#;
 
 const CONFIG_WITH_CHANGED_MANAGEMENT: &str = r#"
@@ -82,31 +82,31 @@ listen = ["127.0.0.1:7600"]
 token = { from = "file", path = "management-token.key" }
 
 [[credentials]]
-id = "edge-client"
-principal = "edge-peer"
+credential_id = "edge-client"
+principal_id = "edge-peer"
 secret = { from = "file", path = "edge-credential.key" }
 
 [[inbounds]]
-tag = "local-socks"
+name = "local-socks"
 protocol = "socks5"
 listen = ["127.0.0.1:1081"]
 
 [[outbounds]]
-tag = "edge"
+name = "edge"
 protocol = "mpp"
-endpoints = ["udp://127.0.0.1:7443"]
+paths = [{ name = "path-1", endpoint = "udp://127.0.0.1:7443" }]
 
 [outbounds.security]
-credential = "edge-client"
+credential_id = "edge-client"
 tls_server_name = "mptunnel.test"
 tls_pinned_certificate_file = "edge-certificate.pem"
 
 [routing]
 
 [[routing.rules]]
-id = "default"
+name = "default"
 action = "outbound"
-target = "edge"
+outbound = "edge"
 "#;
 
 struct TestDirectory(PathBuf);

@@ -214,8 +214,8 @@ impl std::fmt::Display for RuntimeError {
                 )
             }
             Self::ProductPolicy(error) => write!(f, "product policy error: {error}"),
-            Self::GatewayStatePoisoned => write!(f, "product gateway state lock is poisoned"),
-            Self::GatewayUnavailable(error) => write!(f, "product gateway unavailable: {error}"),
+            Self::GatewayStatePoisoned => write!(f, "product balancer state lock is poisoned"),
+            Self::GatewayUnavailable(error) => write!(f, "product balancer unavailable: {error}"),
             Self::DestinationDenied(error) => write!(f, "destination denied: {error}"),
             Self::RemoteReset(reason) => write!(f, "remote reset stream: {reason:?}"),
             Self::RemoteClosed(reason) => write!(f, "remote closed session: {reason:?}"),

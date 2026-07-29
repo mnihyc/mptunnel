@@ -1,8 +1,5 @@
 use super::*;
-use crate::config::{
-    ClientPathConfig, LocalIngressConfig, ResourceLimits, RouteTarget, RouteTargetKind,
-    SharedSecret,
-};
+use crate::config::{ClientPathConfig, LocalIngressConfig, ResourceLimits, SharedSecret};
 use crate::ingress::{IngressConfig, LocalProxyUser, ProxyAuthConfig};
 use crate::runtime::management::snapshot::SessionInventory;
 use crate::runtime::outbound_registry::{
@@ -33,7 +30,7 @@ fn local_proxy_auth() -> ProxyAuthConfig {
 fn auth_accepts_bearer_and_rejects_wrong_token() {
     let request = ManagementRequest {
         method: "GET".to_string(),
-        path: "/api/v1/status".to_string(),
+        path: "/api/v2/status".to_string(),
         headers: vec![(
             "authorization".to_string(),
             "Bearer correct-token".to_string(),
@@ -54,7 +51,7 @@ fn auth_accepts_bearer_and_rejects_wrong_token() {
 }
 
 #[test]
-fn gateway_status_and_actions_share_the_generation_owned_balancer() {
+fn balancer_status_and_actions_share_the_generation_owned_balancer() {
     let first = OutboundId::parse("edge-a").expect("first");
     let second = OutboundId::parse("edge-b").expect("second");
     let balancer = BalancerId::parse("daily-egress").expect("balancer");
@@ -94,51 +91,51 @@ fn gateway_status_and_actions_share_the_generation_owned_balancer() {
 
     target.refresh_sample_snapshot();
     let initial = target.snapshot();
-    assert_eq!(initial.schema, "mptunnel.management.v4");
-    assert_eq!(initial.services.gateway_balancers, 1);
-    assert!(initial.controls.gateway.supported);
-    assert_eq!(initial.gateways[0].ready_members, 2);
+    assert_eq!(initial.schema, "mptunnel.management.v5");
+    assert_eq!(initial.services.balancers, 1);
+    assert!(initial.controls.balancer.supported);
+    assert_eq!(initial.balancers[0].ready_members, 2);
 
     let response = target
-        .control_gateway_json(
-            br#"{"balancer":"daily-egress","action":"drain-member","member":"edge-b"}"#,
+        .control_balancer_json(
+            br#"{"balancer":"daily-egress","action":"drain-member","outbound":"edge-b"}"#,
         )
         .expect("drain");
     assert_eq!(response["scope"], "runtime-generation");
-    let drained = target.gateway_status_json().expect("gateway status");
-    assert_eq!(drained["schema"], "mptunnel.gateway.v1");
+    let drained = target.balancer_status_json().expect("balancer status");
+    assert_eq!(drained["schema"], "mptunnel.balancer.v1");
     assert_eq!(
-        drained["gateways"][0]["members"][1]["readiness"],
+        drained["balancers"][0]["members"][1]["readiness"],
         "draining"
     );
     assert!(
         target
-            .control_gateway_json(
-                br#"{"balancer":"daily-egress","action":"pin-member","member":"edge-b"}"#,
+            .control_balancer_json(
+                br#"{"balancer":"daily-egress","action":"pin-member","outbound":"edge-b"}"#,
             )
             .is_err(),
         "a non-enabled member cannot become the manual override"
     );
 
     target
-        .control_gateway_json(
-            br#"{"balancer":"daily-egress","action":"enable-member","member":"edge-b"}"#,
+        .control_balancer_json(
+            br#"{"balancer":"daily-egress","action":"enable-member","outbound":"edge-b"}"#,
         )
         .expect("enable");
     target
-        .control_gateway_json(
-            br#"{"balancer":"daily-egress","action":"pin-member","member":"edge-b"}"#,
+        .control_balancer_json(
+            br#"{"balancer":"daily-egress","action":"pin-member","outbound":"edge-b"}"#,
         )
         .expect("pin");
     assert_eq!(
-        target.gateway_status_json().expect("pinned status")["gateways"][0]["manual_member"],
+        target.balancer_status_json().expect("pinned status")["balancers"][0]["manual_outbound"],
         "edge-b"
     );
     target
-        .control_gateway_json(br#"{"balancer":"daily-egress","action":"automatic"}"#)
+        .control_balancer_json(br#"{"balancer":"daily-egress","action":"automatic"}"#)
         .expect("automatic");
     assert!(
-        target.gateway_status_json().expect("automatic status")["gateways"][0]["manual_member"]
+        target.balancer_status_json().expect("automatic status")["balancers"][0]["manual_outbound"]
             .is_null()
     );
 }
@@ -163,28 +160,31 @@ async fn dns_management_contract_explains_queries_observes_and_flushes_one_gener
     };
 
     let initial = target.dns_status_json().expect("initial DNS status");
-    assert_eq!(initial["schema"], "mptunnel.dns.status.v1");
+    assert_eq!(initial["schema"], "mptunnel.dns.status.v2");
     assert_eq!(initial["generation"], 1);
-    assert_eq!(initial["plans"][0]["id"], "test-default");
+    assert_eq!(initial["plans"][0]["name"], "test-default");
     assert_eq!(initial["plans"][0]["cache"]["entries"], 0);
 
     let explanation = target
         .dns_explain_json("managed.example")
         .expect("DNS explanation");
-    assert_eq!(explanation["schema"], "mptunnel.dns.explain.v1");
-    assert_eq!(explanation["plan"], "test-default");
+    assert_eq!(explanation["schema"], "mptunnel.dns.explain.v2");
+    assert_eq!(explanation["domain"], "managed.example");
+    assert_eq!(explanation["dns_plan"], "test-default");
     assert_eq!(explanation["match"], "default");
-    assert_eq!(explanation["upstreams"][0]["id"], "test-static");
+    assert_eq!(explanation["upstreams"][0]["name"], "test-static");
 
     let queried = target
-        .dns_query_json(br#"{"name":"managed.example","type":"A"}"#)
+        .dns_query_json(br#"{"domain":"managed.example","type":"A"}"#)
         .await
         .expect("typed DNS query");
-    assert_eq!(queried["schema"], "mptunnel.dns.query.v1");
-    assert_eq!(queried["plan"], "test-default");
+    assert_eq!(queried["schema"], "mptunnel.dns.query.v2");
+    assert_eq!(queried["domain"], "managed.example");
+    assert_eq!(queried["dns_plan"], "test-default");
     assert_eq!(queried["rcode"], 0);
     assert_eq!(queried["rcode_name"], "NOERROR");
     assert_eq!(queried["answers"][0]["type"], "A");
+    assert_eq!(queried["answers"][0]["owner_name"], "managed.example.");
     assert_eq!(queried["answers"][0]["data"], "192.0.2.53");
 
     let observed = target.dns_status_json().expect("observed DNS status");
@@ -193,8 +193,8 @@ async fn dns_management_contract_explains_queries_observes_and_flushes_one_gener
     assert_eq!(observed["plans"][0]["upstreams"][0]["successes"], "1");
 
     let flushed = target.dns_flush_json(br#"{}"#).expect("flush all plans");
-    assert_eq!(flushed["schema"], "mptunnel.dns.flush.v1");
-    assert_eq!(flushed["plans"], 1);
+    assert_eq!(flushed["schema"], "mptunnel.dns.flush.v2");
+    assert_eq!(flushed["flushed_dns_plan_count"], 1);
     assert_eq!(flushed["removed_entries"], 1);
     assert_eq!(
         target.dns_status_json().expect("flushed DNS status")["plans"][0]["cache"]["entries"],
@@ -203,7 +203,7 @@ async fn dns_management_contract_explains_queries_observes_and_flushes_one_gener
 
     assert_eq!(
         target
-            .dns_query_json(br#"{"name":"managed.example","type":"A","legacy":true}"#)
+            .dns_query_json(br#"{"domain":"managed.example","type":"A","legacy":true}"#)
             .await
             .expect_err("unknown query fields must fail closed")
             .status,
@@ -211,7 +211,7 @@ async fn dns_management_contract_explains_queries_observes_and_flushes_one_gener
     );
     assert_eq!(
         target
-            .dns_flush_json(br#"{"plan":"missing"}"#)
+            .dns_flush_json(br#"{"dns_plan":"missing"}"#)
             .expect_err("unknown plan")
             .status,
         404
@@ -223,10 +223,16 @@ fn enabling_a_path_requires_fresh_liveness_evidence() {
     let security = ClientSecurityConfig::for_test(
         SharedSecret::new(b"0123456789abcdef0123456789abcdef".to_vec()).expect("secret"),
     );
-    let context = ClientPathContext::new(
-        vec!["tcp://127.0.0.1:443".parse().expect("path")],
-        security,
+    let context = ClientPathContext::new_with_path_configs_and_outbound(
+        vec![ClientPathConfig {
+            name: "primary".to_string(),
+            tls: crate::transport::encrypted::test_client_tls_config(),
+            spec: "tcp://127.0.0.1:443".parse().expect("path"),
+            security,
+        }],
         ResourceLimits::default(),
+        ProxyAuthConfig::disabled(),
+        Some(OutboundId::parse("edge-mpp").expect("outbound")),
     )
     .expect("context");
     let target = ManagementTarget {
@@ -242,11 +248,13 @@ fn enabling_a_path_requires_fresh_liveness_evidence() {
         generation: RuntimeGenerationControl::new(),
     };
 
-    target
-        .control_path_json(br#"{"underlay":"tcp","index":0,"state":"disabled"}"#)
+    let disabled = target
+        .control_path_json(br#"{"outbound":"edge-mpp","path":"primary","state":"disabled"}"#)
         .expect("disable path");
+    assert_eq!(disabled["outbound"], "edge-mpp");
+    assert_eq!(disabled["path"], "primary");
     target
-        .control_path_json(br#"{"underlay":"tcp","index":0,"state":"enabled"}"#)
+        .control_path_json(br#"{"outbound":"edge-mpp","path":"primary","state":"enabled"}"#)
         .expect("enable path");
 
     let health = context.health().lock().expect("health");
@@ -255,52 +263,20 @@ fn enabling_a_path_requires_fresh_liveness_evidence() {
 }
 
 #[test]
-fn node_path_control_requires_a_selector_when_clients_are_ambiguous() {
+fn node_path_control_can_select_client_by_outbound_name() {
     let security = ClientSecurityConfig::for_test(
         SharedSecret::new(b"0123456789abcdef0123456789abcdef".to_vec()).expect("secret"),
     );
-    let context = ClientPathContext::new(
-        vec!["tcp://127.0.0.1:443".parse().expect("path")],
-        security,
-        ResourceLimits::default(),
-    )
-    .expect("context");
-    let target = ManagementTarget {
-        clients: vec![context.clone(), context],
-        servers: Vec::new(),
-        inventory: ProductRuntimeInventory::default(),
-        product_telemetry: RuntimeTelemetry::new(8),
-        state: ManagementState::new("node"),
-        config_control: None,
-        gateway_control: None,
-        dns: None,
-        product_admission: ProductAdmission::default(),
-        generation: RuntimeGenerationControl::new(),
-    };
-
-    let error = target
-        .control_path_json(br#"{"underlay":"tcp","index":0,"state":"disabled"}"#)
-        .expect_err("ambiguous clients");
-    assert_eq!(error.status, 409);
-}
-
-#[test]
-fn node_path_control_can_select_client_by_route_target_tag() {
-    let security = ClientSecurityConfig::for_test(
-        SharedSecret::new(b"0123456789abcdef0123456789abcdef".to_vec()).expect("secret"),
-    );
-    let context = ClientPathContext::new_with_path_configs_and_target(
+    let context = ClientPathContext::new_with_path_configs_and_outbound(
         vec![ClientPathConfig {
+            name: "path-1".to_string(),
             tls: crate::transport::encrypted::test_client_tls_config(),
             spec: "tcp://127.0.0.1:443".parse().expect("path"),
             security,
         }],
         ResourceLimits::default(),
         ProxyAuthConfig::disabled(),
-        Some(RouteTarget {
-            kind: RouteTargetKind::Outbound,
-            tag: "edge-mpp".to_string(),
-        }),
+        Some(OutboundId::parse("edge-mpp").expect("outbound")),
     )
     .expect("context");
     let target = ManagementTarget {
@@ -317,9 +293,7 @@ fn node_path_control_can_select_client_by_route_target_tag() {
     };
 
     target
-        .control_path_json(
-            br#"{"client_tag":"edge-mpp","underlay":"tcp","index":0,"state":"disabled"}"#,
-        )
+        .control_path_json(br#"{"outbound":"edge-mpp","path":"path-1","state":"disabled"}"#)
         .expect("control path");
 
     let health = context.health().lock().expect("health");
@@ -328,13 +302,13 @@ fn node_path_control_can_select_client_by_route_target_tag() {
 }
 
 #[test]
-fn client_status_exposes_inbound_tags_without_credentials() {
+fn client_status_exposes_named_inventory_without_credentials() {
     let security = ClientSecurityConfig::for_test(
         SharedSecret::new(b"0123456789abcdef0123456789abcdef".to_vec()).expect("secret"),
     );
     let local_inbounds = vec![
         LocalIngressConfig {
-            tag: Some("local-socks".to_string()),
+            name: "local-socks".to_string(),
             config: IngressConfig::Socks5 {
                 listen: vec!["127.0.0.1:1080".parse().expect("listen")],
                 proxy_auth: local_proxy_auth(),
@@ -342,7 +316,7 @@ fn client_status_exposes_inbound_tags_without_credentials() {
             },
         },
         LocalIngressConfig {
-            tag: Some("local-forward".to_string()),
+            name: "local-forward".to_string(),
             config: IngressConfig::TcpForward(
                 crate::ingress::TcpForwardConfig::with_defaults(
                     vec!["127.0.0.1:8443".parse().expect("forward listen")],
@@ -358,18 +332,16 @@ fn client_status_exposes_inbound_tags_without_credentials() {
         config: OutboundConfig::Direct,
         connect_timeout: Duration::from_secs(3),
     }];
-    let context = ClientPathContext::new_with_path_configs_and_target(
+    let context = ClientPathContext::new_with_path_configs_and_outbound(
         vec![ClientPathConfig {
+            name: "path-1".to_string(),
             tls: crate::transport::encrypted::test_client_tls_config(),
             spec: "tcp://127.0.0.1:443".parse().expect("path"),
             security,
         }],
         ResourceLimits::default(),
         ProxyAuthConfig::disabled(),
-        Some(RouteTarget {
-            kind: RouteTargetKind::Outbound,
-            tag: "edge-mpp".to_string(),
-        }),
+        Some(OutboundId::parse("edge-mpp").expect("outbound")),
     )
     .expect("context");
     let product_admission = ProductAdmission::default();
@@ -396,7 +368,7 @@ fn client_status_exposes_inbound_tags_without_credentials() {
     target.refresh_sample_snapshot();
     let status = target.snapshot();
     assert_eq!(status.local_inbounds.len(), 2);
-    assert_eq!(status.local_inbounds[0].tag.as_deref(), Some("local-socks"));
+    assert_eq!(status.local_inbounds[0].name, "local-socks");
     assert_eq!(status.local_inbounds[0].protocol, "socks5");
     assert!(status.local_inbounds[0].target.is_none());
     assert!(status.local_inbounds[0].auth_required);
@@ -405,11 +377,11 @@ fn client_status_exposes_inbound_tags_without_credentials() {
         status.local_inbounds[1].target.as_deref(),
         Some("service.example:443")
     );
-    assert!(status.local_inbounds[1].name.is_none());
+    assert!(status.local_inbounds[1].interface_name.is_none());
     assert!(!status.local_inbounds[1].auth_required);
     assert_eq!(status.services.outbounds, 1);
     assert_eq!(status.services.local_outbounds, 1);
-    assert_eq!(status.outbounds[0].tag, "daily-direct");
+    assert_eq!(status.outbounds[0].name, "daily-direct");
     assert_eq!(status.outbounds[0].protocol, "direct");
     assert_eq!(status.outbounds[0].networks, ["tcp", "udp"]);
     assert_eq!(status.admission.live_flows, 1);
@@ -427,10 +399,16 @@ fn status_separates_sessions_flows_and_exclusive_path_states() {
     let security = ClientSecurityConfig::for_test(
         SharedSecret::new(b"0123456789abcdef0123456789abcdef".to_vec()).expect("secret"),
     );
-    let context = ClientPathContext::new(
-        vec!["tcp://127.0.0.1:443".parse().expect("path")],
-        security,
+    let context = ClientPathContext::new_with_path_configs_and_outbound(
+        vec![ClientPathConfig {
+            name: "primary".to_string(),
+            tls: crate::transport::encrypted::test_client_tls_config(),
+            spec: "tcp://127.0.0.1:443".parse().expect("path"),
+            security,
+        }],
         ResourceLimits::default(),
+        ProxyAuthConfig::disabled(),
+        Some(OutboundId::parse("edge-mpp").expect("outbound")),
     )
     .expect("context");
     context.health().lock().expect("health").tcp[0].manual_disabled = true;
@@ -473,6 +451,7 @@ fn status_separates_sessions_flows_and_exclusive_path_states() {
     assert_eq!(status.summary.disabled_paths, 1);
     assert_eq!(status.summary.failed_paths, 0);
     assert_eq!(status.paths[0].state, "disabled");
+    assert_eq!(status.paths[0].path, "primary");
     assert_eq!(status.sessions.len(), 1);
     assert_eq!(status.sessions[0].active_reliable_flows, 1);
     assert_eq!(status.summary.active_flows, 1);
@@ -482,7 +461,6 @@ fn status_separates_sessions_flows_and_exclusive_path_states() {
     assert_eq!(status.flows[0].inbound.as_deref(), Some("local-socks"));
     assert_eq!(status.flows[0].outbound.as_deref(), Some("edge-b"));
     assert_eq!(status.flows[0].balancer.as_deref(), Some("daily-egress"));
-    assert_eq!(status.flows[0].balancer_member.as_deref(), Some("edge-b"));
     assert_eq!(
         status.flows[0].target.as_deref(),
         Some("service.example:443")
@@ -497,10 +475,16 @@ fn control_refresh_does_not_advance_one_hertz_trends() {
     let security = ClientSecurityConfig::for_test(
         SharedSecret::new(b"0123456789abcdef0123456789abcdef".to_vec()).expect("secret"),
     );
-    let context = ClientPathContext::new(
-        vec!["tcp://127.0.0.1:443".parse().expect("path")],
-        security,
+    let context = ClientPathContext::new_with_path_configs_and_outbound(
+        vec![ClientPathConfig {
+            name: "primary".to_string(),
+            tls: crate::transport::encrypted::test_client_tls_config(),
+            spec: "tcp://127.0.0.1:443".parse().expect("path"),
+            security,
+        }],
         ResourceLimits::default(),
+        ProxyAuthConfig::disabled(),
+        Some(OutboundId::parse("edge-mpp").expect("outbound")),
     )
     .expect("context");
     let target = ManagementTarget {
@@ -519,7 +503,7 @@ fn control_refresh_does_not_advance_one_hertz_trends() {
     assert_eq!(target.snapshot().traffic.trends.len(), 1);
 
     target
-        .control_path_json(br#"{"underlay":"tcp","index":0,"state":"disabled"}"#)
+        .control_path_json(br#"{"outbound":"edge-mpp","path":"primary","state":"disabled"}"#)
         .expect("control");
     assert_eq!(target.snapshot().traffic.trends.len(), 1);
 

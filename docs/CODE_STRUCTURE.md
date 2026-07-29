@@ -139,7 +139,7 @@ boundary before a replacement generation binds. Accepted connections remain
 independent bounded tasks so listener ownership does not serialize data-plane
 work.
 
-DNS has exactly two layers: `src/product/dns.rs` compiles immutable tagged
+DNS has exactly two layers: `src/product/dns.rs` compiles immutable named
 policy and `src/dns.rs` owns generation-scoped runtime state and sockets.
 Outbounds may inject a proved direct/bind DNS connector, but must not create a
 second cache, resolver pool, fallback policy, or per-outbound DNS owner.

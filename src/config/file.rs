@@ -5,11 +5,11 @@ use super::{
     DEFAULT_MAX_PENDING_AUTHENTICATIONS, DEFAULT_OUTBOUND_CONNECT_TIMEOUT_MS,
     DEFAULT_PATH_PROBE_INTERVAL_MS, DEFAULT_PATH_PROBE_TIMEOUT_MS, DEFAULT_RESTART_BACKOFF_MS,
     DEFAULT_RESTART_MAX_BACKOFF_MS, DEFAULT_SESSION_RETENTION_TIMEOUT_MS, DnsPolicyConfig,
-    GatewayBalancerConfig, LocalIngressConfig, LogFormat, LogLevel, LoggingConfig,
-    ManagementConfig, MppInboundConfig, MppOutboundConfig, MppPerformanceConfig, NodeConfig,
-    OutboundLeafConfig, ProductAdmissionConfig, ProductPolicyConfig, ResourceLimits, RouteTarget,
-    RouteTargetKind, SecurityPolicyError, ServerDestinationAclConfig, ServerSecurityConfig,
-    ServiceConfig, SessionConfig, SharedSecret,
+    EgressRef, GatewayBalancerConfig, LocalIngressConfig, LogFormat, LogLevel, LoggingConfig,
+    ManagementConfig, MppInboundConfig, MppOutboundConfig, MppPerformanceConfig, NamedPathConfig,
+    NodeConfig, OutboundLeafConfig, ProductAdmissionConfig, ProductPolicyConfig, ResourceLimits,
+    SecurityPolicyError, ServerDestinationAclConfig, ServerSecurityConfig, ServiceConfig,
+    SessionConfig, SharedSecret,
 };
 use crate::ingress::tun::{
     DEFAULT_TUN_DNS_TTL_MS, DEFAULT_TUN_IPV4, DEFAULT_TUN_IPV4_PREFIX, DEFAULT_TUN_MTU,
@@ -43,7 +43,7 @@ use crate::product::{
     RuleSetPublisherCatalog, RuleSetPublisherId, TrafficIntent, VerifiedRuleSet,
 };
 use crate::transport::encrypted::{TcpClientTlsConfig, TcpServerTlsConfig};
-use crate::transport::{EndpointParseError, PathSpec, PathSpecParseError};
+use crate::transport::{EndpointParseError, PathSpecParseError};
 use base64::Engine as _;
 use base64::engine::general_purpose::STANDARD as BASE64;
 use rustls::pki_types::{CertificateDer, PrivateKeyDer, pem::PemObject};
@@ -126,13 +126,13 @@ impl FileConfig {
         } = self.routing;
         let rule_sets = compile_rule_set_registry(rule_set_publishers, rule_sets, material_base)?;
         apply_routing(generation, balancers, &mut parsed_outbounds)?;
-        let local_inbound_tags = configured_local_inbound_tags(&self.inbounds)?;
+        let local_inbound_names = configured_local_inbound_names(&self.inbounds)?;
         let product_policy = compile_product_policy(
             generation,
             rules,
             destination_acl,
             &rule_sets,
-            &local_inbound_tags,
+            &local_inbound_names,
             &parsed_outbounds,
         )?;
         let (outbounds, gateway_balancers, local_ingresses, servers) = build_node_services(
@@ -167,8 +167,8 @@ impl FileConfig {
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct LocalUserFileConfig {
-    id: String,
-    principal: String,
+    name: String,
+    principal_id: String,
     username: String,
     password: SecretMaterialReference,
 }
@@ -177,8 +177,8 @@ impl std::fmt::Debug for LocalUserFileConfig {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         formatter
             .debug_struct("LocalUserFileConfig")
-            .field("id", &self.id)
-            .field("principal", &self.principal)
+            .field("name", &self.name)
+            .field("principal_id", &self.principal_id)
             .field("username", &"<redacted>")
             .field("password", &self.password)
             .finish()
@@ -203,7 +203,8 @@ impl LocalUserCatalog {
         let mut users = HashMap::with_capacity(values.len());
         let mut all = Vec::with_capacity(values.len());
         for value in values {
-            let principal = PrincipalId::parse(&value.principal)
+            let name = canonical_config_name(&value.name)?;
+            let principal = PrincipalId::parse(&value.principal_id)
                 .map_err(|error| ConfigFileError::LocalUser(error.to_string()))?;
             let password = value
                 .password
@@ -211,12 +212,11 @@ impl LocalUserCatalog {
                 .map_err(ConfigFileError::SecretMaterial)?
                 .into_utf8("local proxy user password")
                 .map_err(ConfigFileError::SecretMaterial)?;
-            let user = LocalProxyUser::new(value.id.clone(), principal, value.username, password)
+            let user = LocalProxyUser::new(name.clone(), principal, value.username, password)
                 .map_err(ConfigFileError::ProxyAuth)?;
-            if users.insert(value.id.clone(), user.clone()).is_some() {
+            if users.insert(name.clone(), user.clone()).is_some() {
                 return Err(ConfigFileError::LocalUser(format!(
-                    "duplicate local user ID {:?}",
-                    value.id
+                    "duplicate local user name {name:?}"
                 )));
             }
             all.push(user);
@@ -232,10 +232,11 @@ impl LocalUserCatalog {
             return Ok(ProxyAuthConfig::disabled());
         }
         let mut selected = Vec::with_capacity(ids.len());
-        for id in ids {
-            let user = self.users.get(&id).cloned().ok_or_else(|| {
+        for name in ids {
+            let name = canonical_config_name(&name)?;
+            let user = self.users.get(&name).cloned().ok_or_else(|| {
                 ConfigFileError::LocalUser(format!(
-                    "local inbound references missing local user {id:?}"
+                    "local inbound references missing local user {name:?}"
                 ))
             })?;
             selected.push(user);
@@ -548,8 +549,8 @@ impl ResourceFileConfig {
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct CredentialFileConfig {
-    id: String,
-    principal: String,
+    credential_id: String,
+    principal_id: String,
     secret: SecretMaterialReference,
     expires_at_unix_secs: Option<u64>,
     #[serde(default)]
@@ -562,8 +563,8 @@ impl std::fmt::Debug for CredentialFileConfig {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         formatter
             .debug_struct("CredentialFileConfig")
-            .field("id", &self.id)
-            .field("principal", &self.principal)
+            .field("credential_id", &self.credential_id)
+            .field("principal_id", &self.principal_id)
             .field("secret", &self.secret)
             .field("expires_at_unix_secs", &self.expires_at_unix_secs)
             .field("revoked", &self.revoked)
@@ -579,9 +580,9 @@ fn parse_credential_catalog(
     let records = values
         .into_iter()
         .map(|value| {
-            let id = CredentialId::parse(&value.id)
+            let id = CredentialId::parse(&value.credential_id)
                 .map_err(|error| ConfigFileError::Credential(error.to_string()))?;
-            let principal = PrincipalId::parse(&value.principal)
+            let principal = PrincipalId::parse(&value.principal_id)
                 .map_err(|error| ConfigFileError::Credential(error.to_string()))?;
             let secret = value
                 .secret
@@ -606,9 +607,9 @@ fn parse_credential_catalog(
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct SecurityFileConfig {
-    credential: Option<String>,
+    credential_id: Option<String>,
     #[serde(default)]
-    credentials: Vec<String>,
+    credential_ids: Vec<String>,
     auth_freshness_window_seconds: Option<u64>,
     authentication_timeout_ms: Option<u64>,
     max_pending_authentications: Option<usize>,
@@ -623,13 +624,13 @@ impl SecurityFileConfig {
         &self,
         catalog: &CredentialCatalog,
     ) -> Result<ClientSecurityConfig, ConfigFileError> {
-        if !self.credentials.is_empty() {
+        if !self.credential_ids.is_empty() {
             return Err(ConfigFileError::Credential(
-                "MPP outbound security accepts exactly one credential reference".to_string(),
+                "MPP outbound security accepts exactly one credential_id".to_string(),
             ));
         }
-        let id = CredentialId::parse(self.credential.as_deref().ok_or_else(|| {
-            ConfigFileError::Credential("MPP outbound security requires credential".to_string())
+        let id = CredentialId::parse(self.credential_id.as_deref().ok_or_else(|| {
+            ConfigFileError::Credential("MPP outbound security requires credential_id".to_string())
         })?)
         .map_err(|error| ConfigFileError::Credential(error.to_string()))?;
         let credential = catalog
@@ -665,13 +666,13 @@ impl SecurityFileConfig {
         &self,
         catalog: &CredentialCatalog,
     ) -> Result<ServerSecurityConfig, ConfigFileError> {
-        if self.credential.is_some() {
+        if self.credential_id.is_some() {
             return Err(ConfigFileError::Credential(
-                "MPP inbound security requires credentials, not credential".to_string(),
+                "MPP inbound security requires credential_ids, not credential_id".to_string(),
             ));
         }
         let ids = self
-            .credentials
+            .credential_ids
             .iter()
             .map(|id| {
                 CredentialId::parse(id)
@@ -855,31 +856,31 @@ impl MppPerformanceFileConfig {
 #[serde(tag = "protocol", rename_all = "kebab-case", deny_unknown_fields)]
 enum InboundFileConfig {
     Socks5 {
-        tag: String,
+        name: String,
         #[serde(default)]
         listen: Vec<SocketAddr>,
         #[serde(default)]
-        users: Vec<String>,
+        local_users: Vec<String>,
         #[serde(default)]
         admission: LocalIngressAdmissionFileConfig,
     },
     HttpConnect {
-        tag: String,
+        name: String,
         #[serde(default)]
         listen: Vec<SocketAddr>,
         #[serde(default)]
-        users: Vec<String>,
+        local_users: Vec<String>,
         #[serde(default)]
         admission: LocalIngressAdmissionFileConfig,
     },
     TcpForward {
-        tag: String,
+        name: String,
         listen: Vec<SocketAddr>,
         target: String,
         max_connections: Option<u32>,
     },
     UdpForward {
-        tag: String,
+        name: String,
         listen: Vec<SocketAddr>,
         target: String,
         max_associations: Option<u32>,
@@ -887,8 +888,8 @@ enum InboundFileConfig {
         datagram_ttl_ms: Option<u64>,
     },
     Tun {
-        tag: String,
-        name: Option<String>,
+        name: String,
+        interface_name: Option<String>,
         ipv4: Option<Ipv4Addr>,
         #[serde(default)]
         disable_ipv4: bool,
@@ -906,14 +907,14 @@ enum InboundFileConfig {
         host: TunHostFileConfig,
     },
     Mpp {
-        tag: Option<String>,
+        name: String,
         security: SecurityFileConfig,
         #[serde(default)]
         performance: MppPerformanceFileConfig,
         #[serde(default)]
         destination_acl: ServerDestinationAclFileConfig,
         #[serde(default)]
-        endpoints: Vec<String>,
+        paths: Vec<MppPathFileConfig>,
         outbound: Option<String>,
         balancer: Option<String>,
         dns_plan: Option<String>,
@@ -985,7 +986,7 @@ impl OutboundProxyAuthFileConfig {
 #[derive(Debug, Default, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct TunFileConfig {
-    name: Option<String>,
+    interface_name: Option<String>,
     ipv4: Option<Ipv4Addr>,
     #[serde(default)]
     disable_ipv4: bool,
@@ -1014,7 +1015,7 @@ impl TunFileConfig {
             Some(self.ipv4.unwrap_or(DEFAULT_TUN_IPV4))
         };
         Ok(TunL4Config {
-            name: self.name,
+            interface_name: self.interface_name,
             ipv4,
             ipv4_prefix: self.ipv4_prefix.unwrap_or(DEFAULT_TUN_IPV4_PREFIX),
             ipv4_gateway: self.ipv4_gateway,
@@ -1144,10 +1145,24 @@ fn listen_or_default(listen: Vec<SocketAddr>, port: u16) -> Vec<SocketAddr> {
     }
 }
 
-fn parse_path_specs(values: Vec<String>) -> Result<Vec<PathSpec>, ConfigFileError> {
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct MppPathFileConfig {
+    name: String,
+    endpoint: String,
+}
+
+fn parse_named_path_specs(
+    values: Vec<MppPathFileConfig>,
+) -> Result<Vec<NamedPathConfig>, ConfigFileError> {
     values
         .into_iter()
-        .map(|value| value.parse().map_err(ConfigFileError::PathSpec))
+        .map(|value| {
+            Ok(NamedPathConfig {
+                name: canonical_config_name(&value.name)?,
+                spec: value.endpoint.parse().map_err(ConfigFileError::PathSpec)?,
+            })
+        })
         .collect()
 }
 
@@ -1155,35 +1170,35 @@ fn parse_path_specs(values: Vec<String>) -> Result<Vec<PathSpec>, ConfigFileErro
 #[serde(tag = "protocol", rename_all = "kebab-case", deny_unknown_fields)]
 enum OutboundFileConfig {
     Mpp {
-        tag: Option<String>,
+        name: String,
         security: SecurityFileConfig,
         #[serde(default)]
         performance: MppPerformanceFileConfig,
         #[serde(default)]
-        endpoints: Vec<String>,
+        paths: Vec<MppPathFileConfig>,
         path_probe_interval_ms: Option<u64>,
         path_probe_timeout_ms: Option<u64>,
     },
     Direct {
-        tag: Option<String>,
+        name: String,
         bind_ip: Option<IpAddr>,
         connect_timeout_ms: Option<u64>,
     },
     Socks5 {
-        tag: Option<String>,
-        proxy: Option<String>,
+        name: String,
+        endpoint: Option<String>,
         auth: Option<OutboundProxyAuthFileConfig>,
         connect_timeout_ms: Option<u64>,
     },
     HttpConnect {
-        tag: Option<String>,
-        proxy: Option<String>,
+        name: String,
+        endpoint: Option<String>,
         auth: Option<OutboundProxyAuthFileConfig>,
         connect_timeout_ms: Option<u64>,
     },
     HttpsConnect {
-        tag: Option<String>,
-        proxy: Option<String>,
+        name: String,
+        endpoint: Option<String>,
         auth: Option<OutboundProxyAuthFileConfig>,
         tls_server_name: Option<String>,
         tls_ca_certificate_file: Option<PathBuf>,
@@ -1211,15 +1226,15 @@ struct RoutingFileConfig {
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct RoutingRuleSetPublisherFileConfig {
-    id: String,
+    publisher_id: String,
     ed25519_public_key_base64: String,
 }
 
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct RoutingRuleSetFileConfig {
-    id: String,
-    publisher: String,
+    rule_set_id: String,
+    publisher_id: String,
     minimum_revision: u64,
     file: PathBuf,
 }
@@ -1227,14 +1242,14 @@ struct RoutingRuleSetFileConfig {
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct RoutingBalancerFileConfig {
-    tag: String,
+    name: String,
     strategy: RoutingStrategyFileValue,
     #[serde(default)]
     members: Vec<RoutingBalancerMemberFileConfig>,
     #[serde(default)]
     health: RoutingBalancerHealthFileConfig,
     stickiness: Option<RoutingBalancerStickinessFileConfig>,
-    manual_member: Option<String>,
+    manual_outbound: Option<String>,
     probe: Option<RoutingBalancerProbeFileConfig>,
     freshness_ttl_ms: Option<u64>,
 }
@@ -1350,7 +1365,7 @@ const fn default_product_policy_generation() -> u64 {
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct RoutingRuleFileConfig {
-    id: String,
+    name: String,
     #[serde(default)]
     domain_exact: Vec<String>,
     #[serde(default)]
@@ -1360,11 +1375,11 @@ struct RoutingRuleFileConfig {
     #[serde(default)]
     domain_regex: Vec<String>,
     #[serde(default)]
-    domain_rule_sets: Vec<String>,
+    domain_rule_set_ids: Vec<String>,
     #[serde(default)]
     destination_cidrs: Vec<String>,
     #[serde(default)]
-    destination_rule_sets: Vec<String>,
+    destination_rule_set_ids: Vec<String>,
     #[serde(default)]
     source_cidrs: Vec<String>,
     #[serde(default)]
@@ -1376,11 +1391,12 @@ struct RoutingRuleFileConfig {
     #[serde(default)]
     inbounds: Vec<String>,
     #[serde(default)]
-    principals: Vec<String>,
+    principal_ids: Vec<String>,
     #[serde(default)]
     stages: Vec<RoutingStageFileValue>,
     action: RoutingActionFileValue,
-    target: Option<String>,
+    outbound: Option<String>,
+    balancer: Option<String>,
     dns_plan: Option<String>,
     #[serde(default)]
     traffic_intent: RoutingTrafficIntentFileValue,
@@ -1454,7 +1470,7 @@ impl ServerDestinationAclFileConfig {
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct ServerDestinationAclRuleFileConfig {
-    id: String,
+    name: String,
     effect: DestinationAclEffectFileValue,
     #[serde(default)]
     domain_exact: Vec<String>,
@@ -1476,7 +1492,8 @@ struct ServerDestinationAclRuleFileConfig {
 
 impl ServerDestinationAclRuleFileConfig {
     fn into_spec(self) -> Result<AclRuleSpec, ConfigFileError> {
-        let id = RuleId::parse(&self.id)
+        let name = canonical_config_name(&self.name)?;
+        let id = RuleId::parse(&name)
             .map_err(|error| ConfigFileError::DestinationAclValue(error.to_string()))?;
         let matcher = RouteMatchSpec {
             domain_exact: parse_destination_acl_values(self.domain_exact, DomainName::parse)?,
@@ -1564,37 +1581,38 @@ fn parse_outbounds(
         order: Vec::new(),
         balancer_order: Vec::new(),
     };
-    for (index, value) in values.into_iter().enumerate() {
+    for value in values {
         match value {
             OutboundFileConfig::Mpp {
-                tag,
+                name,
                 security,
                 performance,
-                endpoints,
+                paths,
                 path_probe_interval_ms,
                 path_probe_timeout_ms,
             } => {
-                let tag = outbound_tag(tag, "mpp", index)?;
-                insert_config_tag(&parsed, &tag)?;
-                let specs = parse_path_specs(endpoints)?;
-                if specs.is_empty() {
-                    return Err(ConfigFileError::MppOutboundRequiresEndpoint(tag));
+                let name = canonical_config_name(&name)?;
+                insert_outbound_name(&parsed, &name)?;
+                let named_paths = parse_named_path_specs(paths)?;
+                if named_paths.is_empty() {
+                    return Err(ConfigFileError::MppOutboundRequiresPath(name));
                 }
                 let security_config = security.client_auth_config(credential_catalog)?;
                 let tls = security.client_tls(material_base)?;
-                let paths = specs
+                let paths = named_paths
                     .into_iter()
-                    .map(|spec| ClientPathConfig {
+                    .map(|path| ClientPathConfig {
+                        name: path.name,
                         tls: tls.clone(),
-                        spec,
+                        spec: path.spec,
                         security: security_config.clone(),
                     })
                     .collect();
-                let id = OutboundId::parse(&tag)
+                let id = OutboundId::parse(&name)
                     .map_err(|error| ConfigFileError::RoutingValue(error.to_string()))?;
-                parsed.order.push(tag.clone());
+                parsed.order.push(name.clone());
                 parsed.leaves.insert(
-                    tag,
+                    name,
                     OutboundLeafConfig::Mpp {
                         id,
                         config: Box::new(MppOutboundConfig {
@@ -1612,17 +1630,17 @@ fn parse_outbounds(
                 );
             }
             OutboundFileConfig::Direct {
-                tag,
+                name,
                 bind_ip,
                 connect_timeout_ms,
             } => {
-                let tag = outbound_tag(tag, "direct", index)?;
-                insert_config_tag(&parsed, &tag)?;
-                let id = OutboundId::parse(&tag)
+                let name = canonical_config_name(&name)?;
+                insert_outbound_name(&parsed, &name)?;
+                let id = OutboundId::parse(&name)
                     .map_err(|error| ConfigFileError::RoutingValue(error.to_string()))?;
-                parsed.order.push(tag.clone());
+                parsed.order.push(name.clone());
                 parsed.leaves.insert(
-                    tag,
+                    name,
                     OutboundLeafConfig::Local {
                         id,
                         config: match bind_ip {
@@ -1634,23 +1652,23 @@ fn parse_outbounds(
                 );
             }
             OutboundFileConfig::Socks5 {
-                tag,
-                proxy,
+                name,
+                endpoint,
                 auth,
                 connect_timeout_ms,
             } => {
-                let tag = outbound_tag(tag, "socks5", index)?;
-                insert_config_tag(&parsed, &tag)?;
-                let id = OutboundId::parse(&tag)
+                let name = canonical_config_name(&name)?;
+                insert_outbound_name(&parsed, &name)?;
+                let id = OutboundId::parse(&name)
                     .map_err(|error| ConfigFileError::RoutingValue(error.to_string()))?;
-                parsed.order.push(tag.clone());
+                parsed.order.push(name.clone());
                 parsed.leaves.insert(
-                    tag,
+                    name,
                     OutboundLeafConfig::Local {
                         id,
                         config: OutboundConfig::Socks5(ProxyConfig::new(
-                            proxy
-                                .ok_or(ConfigFileError::MissingOutboundProxy)?
+                            endpoint
+                                .ok_or(ConfigFileError::MissingOutboundEndpoint)?
                                 .parse()
                                 .map_err(ConfigFileError::Endpoint)?,
                             auth.map(|auth| auth.into_outbound_credentials(material_base))
@@ -1661,23 +1679,23 @@ fn parse_outbounds(
                 );
             }
             OutboundFileConfig::HttpConnect {
-                tag,
-                proxy,
+                name,
+                endpoint,
                 auth,
                 connect_timeout_ms,
             } => {
-                let tag = outbound_tag(tag, "http-connect", index)?;
-                insert_config_tag(&parsed, &tag)?;
-                let id = OutboundId::parse(&tag)
+                let name = canonical_config_name(&name)?;
+                insert_outbound_name(&parsed, &name)?;
+                let id = OutboundId::parse(&name)
                     .map_err(|error| ConfigFileError::RoutingValue(error.to_string()))?;
-                parsed.order.push(tag.clone());
+                parsed.order.push(name.clone());
                 parsed.leaves.insert(
-                    tag,
+                    name,
                     OutboundLeafConfig::Local {
                         id,
                         config: OutboundConfig::HttpConnect(ProxyConfig::new(
-                            proxy
-                                .ok_or(ConfigFileError::MissingOutboundProxy)?
+                            endpoint
+                                .ok_or(ConfigFileError::MissingOutboundEndpoint)?
                                 .parse()
                                 .map_err(ConfigFileError::Endpoint)?,
                             auth.map(|auth| auth.into_outbound_credentials(material_base))
@@ -1688,18 +1706,18 @@ fn parse_outbounds(
                 );
             }
             OutboundFileConfig::HttpsConnect {
-                tag,
-                proxy,
+                name,
+                endpoint,
                 auth,
                 tls_server_name,
                 tls_ca_certificate_file,
                 connect_timeout_ms,
             } => {
-                let tag = outbound_tag(tag, "https-connect", index)?;
-                insert_config_tag(&parsed, &tag)?;
+                let name = canonical_config_name(&name)?;
+                insert_outbound_name(&parsed, &name)?;
                 let proxy = ProxyConfig::new(
-                    proxy
-                        .ok_or(ConfigFileError::MissingOutboundProxy)?
+                    endpoint
+                        .ok_or(ConfigFileError::MissingOutboundEndpoint)?
                         .parse()
                         .map_err(ConfigFileError::Endpoint)?,
                     auth.map(|auth| auth.into_outbound_credentials(material_base))
@@ -1710,11 +1728,11 @@ fn parse_outbounds(
                     .map(|path| load_certificates(material_base, path))
                     .transpose()?
                     .unwrap_or_default();
-                let id = OutboundId::parse(&tag)
+                let id = OutboundId::parse(&name)
                     .map_err(|error| ConfigFileError::RoutingValue(error.to_string()))?;
-                parsed.order.push(tag.clone());
+                parsed.order.push(name.clone());
                 parsed.leaves.insert(
-                    tag,
+                    name,
                     OutboundLeafConfig::Local {
                         id,
                         config: OutboundConfig::HttpsConnect(Box::new(
@@ -1736,12 +1754,10 @@ fn apply_routing(
     parsed: &mut ParsedOutbounds,
 ) -> Result<(), ConfigFileError> {
     for balancer in balancers {
-        validate_tag(&balancer.tag)?;
-        insert_config_tag(parsed, &balancer.tag)?;
+        let name = canonical_config_name(&balancer.name)?;
+        insert_balancer_name(parsed, &name)?;
         if balancer.members.is_empty() {
-            return Err(ConfigFileError::RoutingBalancerRequiresMembers(
-                balancer.tag,
-            ));
+            return Err(ConfigFileError::RoutingBalancerRequiresMembers(name));
         }
         let strategy = match balancer.strategy {
             RoutingStrategyFileValue::Manual => GatewayStrategy::Manual,
@@ -1754,11 +1770,11 @@ fn apply_routing(
         };
         let mut members = Vec::with_capacity(balancer.members.len());
         for member in balancer.members {
-            let tag = member.outbound;
+            let name = canonical_config_name(&member.outbound)?;
             let leaf = parsed
                 .leaves
-                .get(&tag)
-                .ok_or_else(|| ConfigFileError::MissingOutboundTag(tag.clone()))?;
+                .get(&name)
+                .ok_or_else(|| ConfigFileError::MissingOutboundName(name.clone()))?;
             let mode = match member.mode {
                 RoutingBalancerMemberModeFileValue::Enabled => GatewayMemberMode::Enabled,
                 RoutingBalancerMemberModeFileValue::Draining => GatewayMemberMode::Draining,
@@ -1779,9 +1795,10 @@ fn apply_routing(
             spec.stickiness_key = key;
         }
         spec.manual_member = balancer
-            .manual_member
-            .map(|member| {
-                OutboundId::parse(&member)
+            .manual_outbound
+            .map(|outbound| {
+                let outbound = canonical_config_name(&outbound)?;
+                OutboundId::parse(&outbound)
                     .map_err(|error| ConfigFileError::RoutingValue(error.to_string()))
             })
             .transpose()?;
@@ -1801,11 +1818,11 @@ fn apply_routing(
         }
         GatewayBalancer::compile(generation, spec.clone())
             .map_err(|error| ConfigFileError::RoutingValue(error.to_string()))?;
-        let id = BalancerId::parse(&balancer.tag)
+        let id = BalancerId::parse(&name)
             .map_err(|error| ConfigFileError::RoutingValue(error.to_string()))?;
-        parsed.balancer_order.push(balancer.tag.clone());
+        parsed.balancer_order.push(name.clone());
         parsed.balancers.insert(
-            balancer.tag,
+            name,
             GatewayBalancerConfig {
                 id,
                 generation,
@@ -1816,57 +1833,55 @@ fn apply_routing(
     Ok(())
 }
 
-fn outbound_tag(
-    tag: Option<String>,
-    protocol: &'static str,
-    index: usize,
-) -> Result<String, ConfigFileError> {
-    let tag = tag.unwrap_or_else(|| {
-        if index == 0 {
-            protocol.to_string()
-        } else {
-            format!("{protocol}-{index}")
-        }
-    });
-    validate_tag(&tag)?;
-    Ok(tag)
-}
-
-fn validate_tag(tag: &str) -> Result<(), ConfigFileError> {
-    if tag.trim().is_empty() {
-        return Err(ConfigFileError::EmptyTag);
+fn canonical_config_name(name: &str) -> Result<String, ConfigFileError> {
+    if name.trim().is_empty() {
+        return Err(ConfigFileError::EmptyName);
     }
-    RuleId::parse(tag).map_err(|error| ConfigFileError::RoutingValue(error.to_string()))?;
-    Ok(())
+    let canonical = RuleId::parse(name)
+        .map_err(|error| ConfigFileError::RoutingValue(error.to_string()))?
+        .as_str()
+        .to_string();
+    if canonical != name {
+        return Err(ConfigFileError::NonCanonicalName(name.to_string()));
+    }
+    Ok(canonical)
 }
 
-fn insert_config_tag(parsed: &ParsedOutbounds, tag: &str) -> Result<(), ConfigFileError> {
-    if parsed.leaves.contains_key(tag) || parsed.balancers.contains_key(tag) {
-        return Err(ConfigFileError::DuplicateTag(tag.to_string()));
+fn insert_outbound_name(parsed: &ParsedOutbounds, name: &str) -> Result<(), ConfigFileError> {
+    if parsed.leaves.contains_key(name) {
+        return Err(ConfigFileError::DuplicateOutboundName(name.to_string()));
     }
     Ok(())
 }
 
-fn configured_local_inbound_tags(
+fn insert_balancer_name(parsed: &ParsedOutbounds, name: &str) -> Result<(), ConfigFileError> {
+    if parsed.balancers.contains_key(name) {
+        return Err(ConfigFileError::DuplicateBalancerName(name.to_string()));
+    }
+    Ok(())
+}
+
+fn configured_local_inbound_names(
     inbounds: &[InboundFileConfig],
 ) -> Result<HashSet<String>, ConfigFileError> {
-    let mut tags = HashSet::new();
+    let mut names = HashSet::new();
     for inbound in inbounds {
-        let tag = match inbound {
-            InboundFileConfig::Socks5 { tag, .. }
-            | InboundFileConfig::HttpConnect { tag, .. }
-            | InboundFileConfig::TcpForward { tag, .. }
-            | InboundFileConfig::UdpForward { tag, .. }
-            | InboundFileConfig::Tun { tag, .. } => tag,
+        let name = match inbound {
+            InboundFileConfig::Socks5 { name, .. }
+            | InboundFileConfig::HttpConnect { name, .. }
+            | InboundFileConfig::TcpForward { name, .. }
+            | InboundFileConfig::UdpForward { name, .. }
+            | InboundFileConfig::Tun { name, .. } => name,
             InboundFileConfig::Mpp { .. } => continue,
         };
-        validate_tag(tag)?;
-        InboundId::parse(tag).map_err(|error| ConfigFileError::RoutingValue(error.to_string()))?;
-        if !tags.insert(tag.to_ascii_lowercase()) {
-            return Err(ConfigFileError::DuplicateInboundTag(tag.clone()));
+        let name = canonical_config_name(name)?;
+        InboundId::parse(&name)
+            .map_err(|error| ConfigFileError::RoutingValue(error.to_string()))?;
+        if !names.insert(name.clone()) {
+            return Err(ConfigFileError::DuplicateInboundName(name));
         }
     }
-    Ok(tags)
+    Ok(names)
 }
 
 fn compile_rule_set_registry(
@@ -1877,7 +1892,7 @@ fn compile_rule_set_registry(
     let publishers = publishers
         .into_iter()
         .map(|publisher| {
-            let id = RuleSetPublisherId::parse(&publisher.id)
+            let id = RuleSetPublisherId::parse(&publisher.publisher_id)
                 .map_err(|error| ConfigFileError::RuleSet(error.to_string()))?;
             if publisher.ed25519_public_key_base64.trim() != publisher.ed25519_public_key_base64 {
                 return Err(ConfigFileError::RuleSet(format!(
@@ -1908,9 +1923,9 @@ fn compile_rule_set_registry(
         .as_secs();
     let mut verified = Vec::with_capacity(rule_sets.len());
     for rule_set in rule_sets {
-        let expected_id = RuleSetId::parse(&rule_set.id)
+        let expected_id = RuleSetId::parse(&rule_set.rule_set_id)
             .map_err(|error| ConfigFileError::RuleSet(error.to_string()))?;
-        let expected_publisher = RuleSetPublisherId::parse(&rule_set.publisher)
+        let expected_publisher = RuleSetPublisherId::parse(&rule_set.publisher_id)
             .map_err(|error| ConfigFileError::RuleSet(error.to_string()))?;
         if rule_set.minimum_revision == 0 {
             return Err(ConfigFileError::RuleSet(format!(
@@ -2001,18 +2016,20 @@ fn compile_product_route_rule(
     local_inbounds: &HashSet<String>,
     outbounds: &ParsedOutbounds,
 ) -> Result<RouteRuleSpec, ConfigFileError> {
-    let id = RuleId::parse(&rule.id)
-        .map_err(|error| ConfigFileError::RoutingValue(error.to_string()))?;
+    let name = canonical_config_name(&rule.name)?;
+    let id =
+        RuleId::parse(&name).map_err(|error| ConfigFileError::RoutingValue(error.to_string()))?;
     let inbounds = rule
         .inbounds
         .into_iter()
-        .map(|tag| {
-            let inbound = InboundId::parse(&tag)
+        .map(|name| {
+            let name = canonical_config_name(&name)?;
+            let inbound = InboundId::parse(&name)
                 .map_err(|error| ConfigFileError::RoutingValue(error.to_string()))?;
             if !local_inbounds.contains(inbound.as_str()) {
                 return Err(ConfigFileError::RoutingRuleMissingInbound {
                     rule: id.as_str().to_string(),
-                    inbound: tag,
+                    inbound: name,
                 });
             }
             Ok(inbound)
@@ -2024,19 +2041,19 @@ fn compile_product_route_rule(
         domain_keyword: rule.domain_keyword,
         domain_regex: rule.domain_regex,
         domain_rule_sets: resolve_route_rule_sets(
-            rule.domain_rule_sets,
+            rule.domain_rule_set_ids,
             rule_sets,
             &id,
-            "domain_rule_sets",
+            "domain_rule_set_ids",
         )?,
         destination_cidrs: parse_route_values(rule.destination_cidrs, |value| {
             value.parse::<ipnet::IpNet>()
         })?,
         destination_rule_sets: resolve_route_rule_sets(
-            rule.destination_rule_sets,
+            rule.destination_rule_set_ids,
             rule_sets,
             &id,
-            "destination_rule_sets",
+            "destination_rule_set_ids",
         )?,
         source_cidrs: parse_route_values(rule.source_cidrs, |value| value.parse::<ipnet::IpNet>())?,
         destination_ports: rule
@@ -2058,7 +2075,7 @@ fn compile_product_route_rule(
             })
             .collect(),
         inbounds,
-        principals: parse_route_values(rule.principals, PrincipalId::parse)?,
+        principals: parse_route_values(rule.principal_ids, PrincipalId::parse)?,
         stages: rule
             .stages
             .into_iter()
@@ -2068,45 +2085,47 @@ fn compile_product_route_rule(
             })
             .collect(),
     };
-    let target = rule.target;
     let dns_plan = rule
         .dns_plan
-        .map(|plan| crate::product::DnsPlanId::parse(&plan))
-        .transpose()
-        .map_err(|error| ConfigFileError::DnsValue(error.to_string()))?;
+        .map(|plan| {
+            let plan = canonical_config_name(&plan)?;
+            crate::product::DnsPlanId::parse(&plan)
+                .map_err(|error| ConfigFileError::DnsValue(error.to_string()))
+        })
+        .transpose()?;
     let egress = match rule.action {
         RoutingActionFileValue::Outbound => {
-            let tag = required_route_target(&id, target)?;
-            if !outbounds.leaves.contains_key(&tag) {
+            let name = required_route_reference(&id, rule.outbound, rule.balancer, "outbound")?;
+            if !outbounds.leaves.contains_key(&name) {
                 return Err(ConfigFileError::RoutingRuleMissingOutbound {
                     rule: id.as_str().to_string(),
-                    outbound: tag,
+                    outbound: name,
                 });
             }
             EgressAction::Outbound(
-                OutboundId::parse(&tag)
+                OutboundId::parse(&name)
                     .map_err(|error| ConfigFileError::RoutingValue(error.to_string()))?,
             )
         }
         RoutingActionFileValue::Balancer => {
-            let tag = required_route_target(&id, target)?;
-            if !outbounds.balancers.contains_key(&tag) {
+            let name = required_route_reference(&id, rule.balancer, rule.outbound, "balancer")?;
+            if !outbounds.balancers.contains_key(&name) {
                 return Err(ConfigFileError::RoutingRuleMissingBalancer {
                     rule: id.as_str().to_string(),
-                    balancer: tag,
+                    balancer: name,
                 });
             }
             EgressAction::Balancer(
-                BalancerId::parse(&tag)
+                BalancerId::parse(&name)
                     .map_err(|error| ConfigFileError::RoutingValue(error.to_string()))?,
             )
         }
         RoutingActionFileValue::Reject => {
-            reject_unexpected_route_target(&id, target)?;
+            reject_route_references(&id, rule.outbound, rule.balancer)?;
             EgressAction::Reject
         }
         RoutingActionFileValue::Drop => {
-            reject_unexpected_route_target(&id, target)?;
+            reject_route_references(&id, rule.outbound, rule.balancer)?;
             EgressAction::Drop
         }
     };
@@ -2234,18 +2253,34 @@ fn parse_destination_acl_port(value: RoutingPortFileValue) -> Result<PortRange, 
         .map_err(|error| ConfigFileError::DestinationAclValue(error.to_string()))
 }
 
-fn required_route_target(rule: &RuleId, target: Option<String>) -> Result<String, ConfigFileError> {
-    target.ok_or_else(|| ConfigFileError::RoutingRuleTargetRequired(rule.as_str().to_string()))
+fn required_route_reference(
+    rule: &RuleId,
+    selected: Option<String>,
+    other: Option<String>,
+    field: &'static str,
+) -> Result<String, ConfigFileError> {
+    if other.is_some() {
+        return Err(ConfigFileError::RoutingRuleReferenceConflict {
+            rule: rule.as_str().to_string(),
+            field,
+        });
+    }
+    let name = selected.ok_or_else(|| ConfigFileError::RoutingRuleReferenceRequired {
+        rule: rule.as_str().to_string(),
+        field,
+    })?;
+    canonical_config_name(&name)
 }
 
-fn reject_unexpected_route_target(
+fn reject_route_references(
     rule: &RuleId,
-    target: Option<String>,
+    outbound: Option<String>,
+    balancer: Option<String>,
 ) -> Result<(), ConfigFileError> {
-    if target.is_some() {
-        return Err(ConfigFileError::RoutingRuleTargetForbidden(
-            rule.as_str().to_string(),
-        ));
+    if outbound.is_some() || balancer.is_some() {
+        return Err(ConfigFileError::RoutingRuleReferenceForbidden {
+            rule: rule.as_str().to_string(),
+        });
     }
     Ok(())
 }
@@ -2264,54 +2299,54 @@ fn build_node_services(
     credential_catalog: &CredentialCatalog,
     local_user_catalog: &LocalUserCatalog,
 ) -> Result<BuiltNodeServices, ConfigFileError> {
-    let mut inbound_tags = HashSet::new();
+    let mut inbound_names = HashSet::new();
     let mut local_ingresses = Vec::new();
     let mut servers = Vec::new();
 
     for inbound in inbounds {
         match inbound {
             InboundFileConfig::Socks5 {
-                tag,
+                name,
                 listen,
-                users,
+                local_users,
                 admission,
             } => {
-                validate_tag(&tag)?;
-                validate_unique_inbound_tag(Some(&tag), &mut inbound_tags)?;
+                let name = canonical_config_name(&name)?;
+                validate_unique_inbound_name(&name, &mut inbound_names)?;
                 local_ingresses.push(LocalIngressConfig {
-                    tag: Some(tag),
+                    name,
                     config: IngressConfig::Socks5 {
                         listen: listen_or_default(listen, 1080),
-                        proxy_auth: local_user_catalog.auth_for(users)?,
+                        proxy_auth: local_user_catalog.auth_for(local_users)?,
                         admission: admission.into_config()?,
                     },
                 });
             }
             InboundFileConfig::HttpConnect {
-                tag,
+                name,
                 listen,
-                users,
+                local_users,
                 admission,
             } => {
-                validate_tag(&tag)?;
-                validate_unique_inbound_tag(Some(&tag), &mut inbound_tags)?;
+                let name = canonical_config_name(&name)?;
+                validate_unique_inbound_name(&name, &mut inbound_names)?;
                 local_ingresses.push(LocalIngressConfig {
-                    tag: Some(tag),
+                    name,
                     config: IngressConfig::HttpConnect {
                         listen: listen_or_default(listen, 8080),
-                        proxy_auth: local_user_catalog.auth_for(users)?,
+                        proxy_auth: local_user_catalog.auth_for(local_users)?,
                         admission: admission.into_config()?,
                     },
                 });
             }
             InboundFileConfig::TcpForward {
-                tag,
+                name,
                 listen,
                 target,
                 max_connections,
             } => {
-                validate_tag(&tag)?;
-                validate_unique_inbound_tag(Some(&tag), &mut inbound_tags)?;
+                let name = canonical_config_name(&name)?;
+                validate_unique_inbound_name(&name, &mut inbound_names)?;
                 let target = PortForwardTarget::parse(&target)
                     .map_err(|error| ConfigFileError::PortForward(error.to_string()))?;
                 let max_connections = max_connections
@@ -2320,20 +2355,20 @@ fn build_node_services(
                 let config = TcpForwardConfig::new(listen, target, max_connections)
                     .map_err(|error| ConfigFileError::PortForward(error.to_string()))?;
                 local_ingresses.push(LocalIngressConfig {
-                    tag: Some(tag),
+                    name,
                     config: IngressConfig::TcpForward(config),
                 });
             }
             InboundFileConfig::UdpForward {
-                tag,
+                name,
                 listen,
                 target,
                 max_associations,
                 idle_timeout_ms,
                 datagram_ttl_ms,
             } => {
-                validate_tag(&tag)?;
-                validate_unique_inbound_tag(Some(&tag), &mut inbound_tags)?;
+                let name = canonical_config_name(&name)?;
+                validate_unique_inbound_name(&name, &mut inbound_names)?;
                 let target = PortForwardTarget::parse(&target)
                     .map_err(|error| ConfigFileError::PortForward(error.to_string()))?;
                 let max_associations = max_associations
@@ -2354,13 +2389,13 @@ fn build_node_services(
                 )
                 .map_err(|error| ConfigFileError::PortForward(error.to_string()))?;
                 local_ingresses.push(LocalIngressConfig {
-                    tag: Some(tag),
+                    name,
                     config: IngressConfig::UdpForward(config),
                 });
             }
             InboundFileConfig::Tun {
-                tag,
                 name,
+                interface_name,
                 ipv4,
                 disable_ipv4,
                 ipv4_prefix,
@@ -2373,13 +2408,13 @@ fn build_node_services(
                 dns_ttl_ms,
                 host,
             } => {
-                validate_tag(&tag)?;
-                validate_unique_inbound_tag(Some(&tag), &mut inbound_tags)?;
+                let name = canonical_config_name(&name)?;
+                validate_unique_inbound_name(&name, &mut inbound_names)?;
                 local_ingresses.push(LocalIngressConfig {
-                    tag: Some(tag),
+                    name,
                     config: IngressConfig::TunL4(
                         TunFileConfig {
-                            name,
+                            interface_name,
                             ipv4,
                             disable_ipv4,
                             ipv4_prefix,
@@ -2397,30 +2432,33 @@ fn build_node_services(
                 });
             }
             InboundFileConfig::Mpp {
-                tag,
+                name,
                 security,
                 performance,
                 destination_acl,
-                endpoints,
+                paths,
                 outbound,
                 balancer,
                 dns_plan,
             } => {
-                validate_optional_tag(tag.as_deref())?;
-                validate_unique_inbound_tag(tag.as_deref(), &mut inbound_tags)?;
-                let route_target = resolve_egress_target(outbound, balancer, &outbounds)?;
-                let paths = parse_path_specs(endpoints)?;
+                let name = canonical_config_name(&name)?;
+                validate_unique_inbound_name(&name, &mut inbound_names)?;
+                let egress = resolve_egress(outbound, balancer, &outbounds)?;
+                let paths = parse_named_path_specs(paths)?;
                 if paths.is_empty() {
-                    return Err(ConfigFileError::MppInboundRequiresEndpoint);
+                    return Err(ConfigFileError::MppInboundRequiresPath);
                 }
                 servers.push(MppInboundConfig {
-                    tag,
-                    route_target,
+                    name,
+                    egress,
                     dns_plan: dns_plan
-                        .map(|plan| crate::product::DnsPlanId::parse(&plan))
-                        .transpose()
-                        .map_err(|error| ConfigFileError::DnsValue(error.to_string()))?,
-                    bind_paths: paths,
+                        .map(|plan| {
+                            let plan = canonical_config_name(&plan)?;
+                            crate::product::DnsPlanId::parse(&plan)
+                                .map_err(|error| ConfigFileError::DnsValue(error.to_string()))
+                        })
+                        .transpose()?,
+                    paths,
                     security: security.server_auth_config(credential_catalog)?,
                     tls: security.server_tls(material_base)?,
                     destination_acl: destination_acl.into_config()?,
@@ -2433,23 +2471,23 @@ fn build_node_services(
     let leaves = outbounds
         .order
         .iter()
-        .map(|tag| {
+        .map(|name| {
             outbounds
                 .leaves
-                .get(tag)
+                .get(name)
                 .cloned()
-                .ok_or_else(|| ConfigFileError::MissingOutboundTag(tag.clone()))
+                .ok_or_else(|| ConfigFileError::MissingOutboundName(name.clone()))
         })
         .collect::<Result<Vec<_>, _>>()?;
     let gateway_balancers = outbounds
         .balancer_order
         .iter()
-        .map(|tag| {
+        .map(|name| {
             outbounds
                 .balancers
-                .get(tag)
+                .get(name)
                 .cloned()
-                .ok_or_else(|| ConfigFileError::MissingBalancerTag(tag.clone()))
+                .ok_or_else(|| ConfigFileError::MissingBalancerName(name.clone()))
         })
         .collect::<Result<Vec<_>, _>>()?;
 
@@ -2459,82 +2497,47 @@ fn build_node_services(
     Ok((leaves, gateway_balancers, local_ingresses, servers))
 }
 
-fn resolve_egress_target(
+fn resolve_egress(
     outbound: Option<String>,
     balancer: Option<String>,
     outbounds: &ParsedOutbounds,
-) -> Result<RouteTarget, ConfigFileError> {
+) -> Result<EgressRef, ConfigFileError> {
     match (outbound, balancer) {
-        (Some(_), Some(_)) => Err(ConfigFileError::InboundTargetConflict),
-        (Some(tag), None) => {
-            validate_tag(&tag)?;
-            if outbounds.leaves.contains_key(&tag) {
-                return Ok(RouteTarget {
-                    kind: RouteTargetKind::Outbound,
-                    tag,
-                });
+        (Some(_), Some(_)) => Err(ConfigFileError::InboundEgressConflict),
+        (Some(name), None) => {
+            let name = canonical_config_name(&name)?;
+            if outbounds.leaves.contains_key(&name) {
+                return OutboundId::parse(&name)
+                    .map(EgressRef::Outbound)
+                    .map_err(|error| ConfigFileError::RoutingValue(error.to_string()));
             }
-            if outbounds.balancers.contains_key(&tag) {
-                return Err(ConfigFileError::OutboundFieldReferencesBalancer(tag));
+            if outbounds.balancers.contains_key(&name) {
+                return Err(ConfigFileError::OutboundFieldReferencesBalancer(name));
             }
-            Err(ConfigFileError::MissingOutboundTag(tag))
+            Err(ConfigFileError::MissingOutboundName(name))
         }
-        (None, Some(tag)) => {
-            validate_tag(&tag)?;
-            if outbounds.leaves.contains_key(&tag) {
-                return Err(ConfigFileError::BalancerFieldReferencesOutbound(tag));
+        (None, Some(name)) => {
+            let name = canonical_config_name(&name)?;
+            if outbounds.leaves.contains_key(&name) {
+                return Err(ConfigFileError::BalancerFieldReferencesOutbound(name));
             }
-            if outbounds.balancers.contains_key(&tag) {
-                return Ok(RouteTarget {
-                    kind: RouteTargetKind::Balancer,
-                    tag,
-                });
+            if outbounds.balancers.contains_key(&name) {
+                return BalancerId::parse(&name)
+                    .map(EgressRef::Balancer)
+                    .map_err(|error| ConfigFileError::RoutingValue(error.to_string()));
             }
-            Err(ConfigFileError::MissingBalancerTag(tag))
+            Err(ConfigFileError::MissingBalancerName(name))
         }
-        (None, None) => resolve_default_egress_target(outbounds),
+        (None, None) => Err(ConfigFileError::MppInboundRequiresEgress),
     }
 }
 
-fn resolve_default_egress_target(
-    outbounds: &ParsedOutbounds,
-) -> Result<RouteTarget, ConfigFileError> {
-    let mut candidates = Vec::new();
-    for tag in &outbounds.order {
-        candidates.push(RouteTarget {
-            kind: RouteTargetKind::Outbound,
-            tag: tag.clone(),
-        });
-    }
-    for tag in &outbounds.balancer_order {
-        candidates.push(RouteTarget {
-            kind: RouteTargetKind::Balancer,
-            tag: tag.clone(),
-        });
-    }
-    match candidates.as_slice() {
-        [target] => Ok(target.clone()),
-        [] => Err(ConfigFileError::MppInboundRequiresEgressOutbound),
-        _ => Err(ConfigFileError::MultipleDefaultEgressTargets),
-    }
-}
-
-fn validate_optional_tag(tag: Option<&str>) -> Result<(), ConfigFileError> {
-    if let Some(tag) = tag {
-        validate_tag(tag)?;
-    }
-    Ok(())
-}
-
-fn validate_unique_inbound_tag(
-    tag: Option<&str>,
+fn validate_unique_inbound_name(
+    name: &str,
     seen: &mut HashSet<String>,
 ) -> Result<(), ConfigFileError> {
-    let Some(tag) = tag else {
-        return Ok(());
-    };
-    if !seen.insert(tag.to_string()) {
-        return Err(ConfigFileError::DuplicateInboundTag(tag.to_string()));
+    if !seen.insert(name.to_string()) {
+        return Err(ConfigFileError::DuplicateInboundName(name.to_string()));
     }
     Ok(())
 }
@@ -2555,9 +2558,7 @@ struct DnsFileConfig {
     #[serde(default)]
     hosts: Vec<DnsHostFileConfig>,
     fake_dns: Option<FakeDnsFileConfig>,
-    #[serde(default)]
-    system_fallback: bool,
-    default_plan: String,
+    default_dns_plan: String,
 }
 
 impl Default for DnsFileConfig {
@@ -2565,15 +2566,15 @@ impl Default for DnsFileConfig {
         Self {
             generation: default_product_policy_generation(),
             upstreams: vec![DnsUpstreamFileConfig {
-                id: "system".to_string(),
+                name: "system".to_string(),
                 transport: DnsTransportFileValue::System,
                 bootstrap: None,
                 server_name: None,
                 path: None,
-                egress_outbound: None,
+                outbound: None,
             }],
             plans: vec![DnsPlanFileConfig {
-                id: "default".to_string(),
+                name: "default".to_string(),
                 upstreams: vec!["system".to_string()],
                 ip_strategy: DnsStrategyFileValue::default(),
                 security: DnsSecurityFileValue::default(),
@@ -2592,20 +2593,13 @@ impl Default for DnsFileConfig {
             rules: Vec::new(),
             hosts: Vec::new(),
             fake_dns: None,
-            system_fallback: false,
-            default_plan: "default".to_string(),
+            default_dns_plan: "default".to_string(),
         }
     }
 }
 
 impl DnsFileConfig {
     fn into_config(self, outbounds: &ParsedOutbounds) -> Result<DnsPolicyConfig, ConfigFileError> {
-        if self.system_fallback {
-            return Err(ConfigFileError::DnsValue(
-                "DNS system_fallback must be false; add an explicit tagged system upstream if desired"
-                    .to_string(),
-            ));
-        }
         let upstreams = self
             .upstreams
             .into_iter()
@@ -2673,8 +2667,11 @@ impl DnsFileConfig {
             rules,
             hosts,
             fake_dns,
-            default_plan: crate::product::DnsPlanId::parse(&self.default_plan)
-                .map_err(|error| ConfigFileError::DnsValue(error.to_string()))?,
+            default_plan: {
+                let name = canonical_config_name(&self.default_dns_plan)?;
+                crate::product::DnsPlanId::parse(&name)
+                    .map_err(|error| ConfigFileError::DnsValue(error.to_string()))?
+            },
         };
         let config = DnsPolicyConfig {
             generation: self.generation,
@@ -2712,25 +2709,26 @@ impl FakeDnsFileConfig {
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct DnsUpstreamFileConfig {
-    id: String,
+    name: String,
     transport: DnsTransportFileValue,
     bootstrap: Option<SocketAddr>,
     server_name: Option<String>,
     path: Option<String>,
-    egress_outbound: Option<String>,
+    outbound: Option<String>,
 }
 
 impl DnsUpstreamFileConfig {
     fn into_spec(self) -> Result<DnsUpstreamSpec, ConfigFileError> {
         let Self {
-            id: raw_id,
+            name,
             transport,
             bootstrap,
             server_name,
             path,
-            egress_outbound,
+            outbound,
         } = self;
-        let id = DnsUpstreamId::parse(&raw_id)
+        let name = canonical_config_name(&name)?;
+        let id = DnsUpstreamId::parse(&name)
             .map_err(|error| ConfigFileError::DnsValue(error.to_string()))?;
         if matches!(
             transport,
@@ -2757,7 +2755,7 @@ impl DnsUpstreamFileConfig {
                 if bootstrap.is_some()
                     || server_name.is_some()
                     || path.is_some()
-                    || egress_outbound.is_some()
+                    || outbound.is_some()
                 {
                     return Err(ConfigFileError::DnsValue(
                         "system DNS upstream cannot set bootstrap, TLS identity, path, or outbound egress".to_string(),
@@ -2793,8 +2791,9 @@ impl DnsUpstreamFileConfig {
                 server_name: required_dns_server_name(server_name, &id)?,
             },
         };
-        let egress = egress_outbound
+        let egress = outbound
             .map(|outbound| {
+                let outbound = canonical_config_name(&outbound)?;
                 OutboundId::parse(&outbound)
                     .map(DnsEgressSpec::Outbound)
                     .map_err(|error| ConfigFileError::DnsValue(error.to_string()))
@@ -2849,7 +2848,7 @@ enum DnsTransportFileValue {
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct DnsPlanFileConfig {
-    id: String,
+    name: String,
     upstreams: Vec<String>,
     #[serde(default)]
     ip_strategy: DnsStrategyFileValue,
@@ -2872,7 +2871,8 @@ struct DnsPlanFileConfig {
 
 impl DnsPlanFileConfig {
     fn into_spec(self) -> Result<DnsPlanSpec, ConfigFileError> {
-        let id = crate::product::DnsPlanId::parse(&self.id)
+        let name = canonical_config_name(&self.name)?;
+        let id = crate::product::DnsPlanId::parse(&name)
             .map_err(|error| ConfigFileError::DnsValue(error.to_string()))?;
         let defaults = DnsPlanLimits::default();
         let upstream_strategy = match (self.upstream_strategy, self.fallback_delay_ms) {
@@ -2899,6 +2899,7 @@ impl DnsPlanFileConfig {
                 .upstreams
                 .into_iter()
                 .map(|value| {
+                    let value = canonical_config_name(&value)?;
                     DnsUpstreamId::parse(&value)
                         .map_err(|error| ConfigFileError::DnsValue(error.to_string()))
                 })
@@ -2958,14 +2959,14 @@ enum DnsUpstreamStrategyFileValue {
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct DnsHostFileConfig {
-    name: String,
+    domain: String,
     addresses: Vec<IpAddr>,
 }
 
 impl DnsHostFileConfig {
     fn into_spec(self) -> Result<DnsHostSpec, ConfigFileError> {
         Ok(DnsHostSpec {
-            domain: DomainName::parse(&self.name)
+            domain: DomainName::parse(&self.domain)
                 .map_err(|error| ConfigFileError::DnsValue(error.to_string()))?,
             addresses: self.addresses,
         })
@@ -2975,15 +2976,17 @@ impl DnsHostFileConfig {
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct DnsRuleFileConfig {
-    id: String,
+    name: String,
     exact: Option<String>,
     suffix: Option<String>,
-    plan: String,
+    dns_plan: String,
     explanation: Option<String>,
 }
 
 impl DnsRuleFileConfig {
     fn into_spec(self) -> Result<DnsRuleSpec, ConfigFileError> {
+        let name = canonical_config_name(&self.name)?;
+        let dns_plan = canonical_config_name(&self.dns_plan)?;
         let matcher = match (self.exact, self.suffix) {
             (Some(exact), None) => DnsRuleMatch::Exact(
                 DomainName::parse(&exact)
@@ -3000,10 +3003,10 @@ impl DnsRuleFileConfig {
             }
         };
         Ok(DnsRuleSpec {
-            id: DnsRuleId::parse(&self.id)
+            id: DnsRuleId::parse(&name)
                 .map_err(|error| ConfigFileError::DnsValue(error.to_string()))?,
             matcher,
-            plan: crate::product::DnsPlanId::parse(&self.plan)
+            plan: crate::product::DnsPlanId::parse(&dns_plan)
                 .map_err(|error| ConfigFileError::DnsValue(error.to_string()))?,
             explanation: self.explanation,
         })
@@ -3067,34 +3070,20 @@ pub enum ConfigFileError {
     Outbound(OutboundError),
     PathSpec(PathSpecParseError),
     NoRuntimeServices,
-    EmptyTag,
-    DuplicateTag(String),
-    DuplicateInboundTag(String),
-    MissingOutboundTag(String),
-    MissingBalancerTag(String),
-    OutboundTagWrongProtocol {
-        tag: String,
-        expected: &'static str,
-    },
-    BalancerTagWrongProtocol {
-        tag: String,
-        expected: &'static str,
-    },
-    InboundTargetConflict,
+    EmptyName,
+    NonCanonicalName(String),
+    DuplicateInboundName(String),
+    DuplicateOutboundName(String),
+    DuplicateBalancerName(String),
+    MissingOutboundName(String),
+    MissingBalancerName(String),
+    InboundEgressConflict,
     OutboundFieldReferencesBalancer(String),
     BalancerFieldReferencesOutbound(String),
-    LocalInboundRequiresMppOutbound,
-    MppInboundRequiresEgressOutbound,
-    MultipleDefaultMppTargets,
-    MultipleDefaultEgressTargets,
-    MppInboundRequiresEndpoint,
-    MppOutboundRequiresEndpoint(String),
+    MppInboundRequiresEgress,
+    MppInboundRequiresPath,
+    MppOutboundRequiresPath(String),
     RoutingBalancerRequiresMembers(String),
-    RoutingBalancerMemberWrongProtocol {
-        balancer: String,
-        member: String,
-        expected: &'static str,
-    },
     RoutingPolicy(String),
     RoutingValue(String),
     RuleSet(String),
@@ -3102,21 +3091,13 @@ pub enum ConfigFileError {
     DnsValue(String),
     DestinationAclPolicy(String),
     DestinationAclValue(String),
-    RoutingRuleMissingInbound {
-        rule: String,
-        inbound: String,
-    },
-    RoutingRuleMissingOutbound {
-        rule: String,
-        outbound: String,
-    },
-    RoutingRuleMissingBalancer {
-        rule: String,
-        balancer: String,
-    },
-    RoutingRuleTargetRequired(String),
-    RoutingRuleTargetForbidden(String),
-    MissingOutboundProxy,
+    RoutingRuleMissingInbound { rule: String, inbound: String },
+    RoutingRuleMissingOutbound { rule: String, outbound: String },
+    RoutingRuleMissingBalancer { rule: String, balancer: String },
+    RoutingRuleReferenceRequired { rule: String, field: &'static str },
+    RoutingRuleReferenceConflict { rule: String, field: &'static str },
+    RoutingRuleReferenceForbidden { rule: String },
+    MissingOutboundEndpoint,
     TunIpv4DisabledWithIpv4Options,
     ManagedVpnValue(String),
     ProxyUsernameRequired,
@@ -3157,71 +3138,53 @@ impl std::fmt::Display for ConfigFileError {
             Self::NoRuntimeServices => {
                 write!(f, "config must define at least one [[inbounds]] entry")
             }
-            Self::EmptyTag => write!(f, "inbound and outbound tags must not be empty"),
-            Self::DuplicateTag(tag) => write!(f, "duplicate outbound or balancer tag {tag:?}"),
-            Self::DuplicateInboundTag(tag) => write!(f, "duplicate inbound tag {tag:?}"),
-            Self::MissingOutboundTag(tag) => write!(f, "outbound tag {tag:?} does not exist"),
-            Self::MissingBalancerTag(tag) => {
-                write!(f, "routing balancer tag {tag:?} does not exist")
+            Self::EmptyName => write!(f, "configured resource names must not be empty"),
+            Self::NonCanonicalName(name) => write!(
+                f,
+                "configured resource name {name:?} must be canonical lowercase ASCII"
+            ),
+            Self::DuplicateInboundName(name) => {
+                write!(f, "duplicate inbound name {name:?}")
             }
-            Self::OutboundTagWrongProtocol { tag, expected } => {
-                write!(f, "outbound tag {tag:?} must use protocol {expected}")
+            Self::DuplicateOutboundName(name) => {
+                write!(f, "duplicate outbound name {name:?}")
             }
-            Self::BalancerTagWrongProtocol { tag, expected } => {
+            Self::DuplicateBalancerName(name) => {
+                write!(f, "duplicate balancer name {name:?}")
+            }
+            Self::MissingOutboundName(name) => {
+                write!(f, "outbound name {name:?} does not exist")
+            }
+            Self::MissingBalancerName(name) => {
+                write!(f, "balancer name {name:?} does not exist")
+            }
+            Self::InboundEgressConflict => {
+                write!(f, "inbound cannot set both outbound and balancer")
+            }
+            Self::OutboundFieldReferencesBalancer(name) => write!(
+                f,
+                "inbound outbound field references balancer {name:?}; use balancer instead"
+            ),
+            Self::BalancerFieldReferencesOutbound(name) => write!(
+                f,
+                "inbound balancer field references outbound {name:?}; use outbound instead"
+            ),
+            Self::MppInboundRequiresEgress => write!(
+                f,
+                "MPP inbound must set exactly one of outbound or balancer"
+            ),
+            Self::MppInboundRequiresPath => {
+                write!(f, "MPP inbound requires at least one named path")
+            }
+            Self::MppOutboundRequiresPath(name) => {
+                write!(f, "MPP outbound {name:?} requires at least one named path")
+            }
+            Self::RoutingBalancerRequiresMembers(name) => {
                 write!(
                     f,
-                    "routing balancer tag {tag:?} must use strategy {expected}"
+                    "routing balancer {name:?} requires at least one outbound member"
                 )
             }
-            Self::InboundTargetConflict => {
-                write!(f, "inbound must set at most one of outbound or balancer")
-            }
-            Self::OutboundFieldReferencesBalancer(tag) => write!(
-                f,
-                "inbound outbound field references routing balancer {tag:?}; use balancer instead"
-            ),
-            Self::BalancerFieldReferencesOutbound(tag) => write!(
-                f,
-                "inbound balancer field references outbound {tag:?}; use outbound instead"
-            ),
-            Self::LocalInboundRequiresMppOutbound => {
-                write!(
-                    f,
-                    "SOCKS5, HTTP CONNECT, and TUN inbounds require an MPP outbound or gateway balancer"
-                )
-            }
-            Self::MppInboundRequiresEgressOutbound => write!(
-                f,
-                "MPP inbounds require an egress outbound or egress balancer with protocol direct, socks5, http-connect, or https-connect"
-            ),
-            Self::MultipleDefaultMppTargets => write!(
-                f,
-                "local inbound outbound or balancer tag is required when multiple MPP targets exist"
-            ),
-            Self::MultipleDefaultEgressTargets => write!(
-                f,
-                "MPP inbound outbound or balancer tag is required when multiple egress targets exist"
-            ),
-            Self::MppInboundRequiresEndpoint => {
-                write!(f, "MPP inbound requires at least one endpoint")
-            }
-            Self::MppOutboundRequiresEndpoint(tag) => {
-                write!(f, "MPP outbound {tag:?} requires at least one endpoint")
-            }
-            Self::RoutingBalancerRequiresMembers(tag) => {
-                write!(
-                    f,
-                    "routing balancer {tag:?} requires at least one outbound member"
-                )
-            }
-            Self::RoutingBalancerMemberWrongProtocol {
-                balancer,
-                member,
-                expected,
-            } => write!(
-                f,
-                "routing balancer {balancer:?} member {member:?} must be an {expected} outbound tag"
-            ),
             Self::RoutingPolicy(error) => write!(f, "{error}"),
             Self::RoutingValue(error) => write!(f, "invalid routing value: {error}"),
             Self::RuleSet(error) => write!(f, "invalid routing rule set: {error}"),
@@ -3245,15 +3208,20 @@ impl std::fmt::Display for ConfigFileError {
                 f,
                 "routing rule {rule:?} references missing MPP balancer {balancer:?}"
             ),
-            Self::RoutingRuleTargetRequired(rule) => write!(
+            Self::RoutingRuleReferenceRequired { rule, field } => {
+                write!(f, "routing rule {rule:?} action requires {field}")
+            }
+            Self::RoutingRuleReferenceConflict { rule, field } => write!(
                 f,
-                "routing rule {rule:?} outbound/balancer action requires target"
+                "routing rule {rule:?} action selects {field} and cannot set the other egress reference"
             ),
-            Self::RoutingRuleTargetForbidden(rule) => write!(
+            Self::RoutingRuleReferenceForbidden { rule } => write!(
                 f,
-                "routing rule {rule:?} reject/drop action cannot set target"
+                "routing rule {rule:?} reject/drop action cannot set outbound or balancer"
             ),
-            Self::MissingOutboundProxy => write!(f, "proxied outbound requires proxy"),
+            Self::MissingOutboundEndpoint => {
+                write!(f, "proxied outbound requires endpoint")
+            }
             Self::TunIpv4DisabledWithIpv4Options => {
                 write!(
                     f,
@@ -3290,24 +3258,20 @@ impl std::error::Error for ConfigFileError {
             Self::Outbound(err) => Some(err),
             Self::PathSpec(err) => Some(err),
             Self::NoRuntimeServices
-            | Self::EmptyTag
-            | Self::DuplicateTag(_)
-            | Self::DuplicateInboundTag(_)
-            | Self::MissingOutboundTag(_)
-            | Self::MissingBalancerTag(_)
-            | Self::OutboundTagWrongProtocol { .. }
-            | Self::BalancerTagWrongProtocol { .. }
-            | Self::InboundTargetConflict
+            | Self::EmptyName
+            | Self::NonCanonicalName(_)
+            | Self::DuplicateInboundName(_)
+            | Self::DuplicateOutboundName(_)
+            | Self::DuplicateBalancerName(_)
+            | Self::MissingOutboundName(_)
+            | Self::MissingBalancerName(_)
+            | Self::InboundEgressConflict
             | Self::OutboundFieldReferencesBalancer(_)
             | Self::BalancerFieldReferencesOutbound(_)
-            | Self::LocalInboundRequiresMppOutbound
-            | Self::MppInboundRequiresEgressOutbound
-            | Self::MultipleDefaultMppTargets
-            | Self::MultipleDefaultEgressTargets
-            | Self::MppInboundRequiresEndpoint
-            | Self::MppOutboundRequiresEndpoint(_)
+            | Self::MppInboundRequiresEgress
+            | Self::MppInboundRequiresPath
+            | Self::MppOutboundRequiresPath(_)
             | Self::RoutingBalancerRequiresMembers(_)
-            | Self::RoutingBalancerMemberWrongProtocol { .. }
             | Self::RoutingPolicy(_)
             | Self::RoutingValue(_)
             | Self::RuleSet(_)
@@ -3318,9 +3282,10 @@ impl std::error::Error for ConfigFileError {
             | Self::RoutingRuleMissingInbound { .. }
             | Self::RoutingRuleMissingOutbound { .. }
             | Self::RoutingRuleMissingBalancer { .. }
-            | Self::RoutingRuleTargetRequired(_)
-            | Self::RoutingRuleTargetForbidden(_)
-            | Self::MissingOutboundProxy
+            | Self::RoutingRuleReferenceRequired { .. }
+            | Self::RoutingRuleReferenceConflict { .. }
+            | Self::RoutingRuleReferenceForbidden { .. }
+            | Self::MissingOutboundEndpoint
             | Self::TunIpv4DisabledWithIpv4Options
             | Self::ManagedVpnValue(_)
             | Self::ProxyUsernameRequired

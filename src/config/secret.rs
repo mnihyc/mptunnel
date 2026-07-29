@@ -11,7 +11,7 @@ use std::path::{Path, PathBuf};
 #[serde(tag = "from", rename_all = "kebab-case", deny_unknown_fields)]
 pub(super) enum SecretMaterialReference {
     File { path: PathBuf },
-    Environment { name: String },
+    Environment { variable: String },
 }
 
 impl SecretMaterialReference {
@@ -31,18 +31,18 @@ impl SecretMaterialReference {
                     })?;
                 Ok(SecretMaterial::new(bytes))
             }
-            Self::Environment { name } => {
-                validate_environment_name(&name, purpose)?;
-                let value = std::env::var_os(&name).ok_or_else(|| {
+            Self::Environment { variable } => {
+                validate_environment_name(&variable, purpose)?;
+                let value = std::env::var_os(&variable).ok_or_else(|| {
                     SecretMaterialError::EnvironmentMissing {
                         purpose,
-                        name: name.clone(),
+                        name: variable.clone(),
                     }
                 })?;
                 let value = value.into_string().map_err(|_| {
                     SecretMaterialError::EnvironmentNotUnicode {
                         purpose,
-                        name: name.clone(),
+                        name: variable.clone(),
                     }
                 })?;
                 Ok(SecretMaterial::new(value.into_bytes()))
@@ -55,9 +55,9 @@ impl std::fmt::Debug for SecretMaterialReference {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::File { path } => formatter.debug_struct("File").field("path", path).finish(),
-            Self::Environment { name } => formatter
+            Self::Environment { variable } => formatter
                 .debug_struct("Environment")
-                .field("name", name)
+                .field("variable", variable)
                 .finish(),
         }
     }

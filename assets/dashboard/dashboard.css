@@ -624,25 +624,25 @@ h3 {
   width: 100%;
 }
 
-.gateway-list {
+.balancer-list {
   display: grid;
   gap: 12px;
 }
 
-.gateway-card__header {
+.balancer-card__header {
   align-items: flex-start;
 }
 
-.gateway-card__header .section-meta {
+.balancer-card__header .section-meta {
   margin-top: 3px;
   text-align: left;
 }
 
-.records-table--gateways {
+.records-table--balancers {
   min-width: 1280px;
 }
 
-.gateway-actions {
+.balancer-actions {
   display: flex;
   flex-wrap: wrap;
   align-items: center;
@@ -650,7 +650,7 @@ h3 {
   gap: 5px;
 }
 
-.gateway-actions--member {
+.balancer-actions--member {
   min-width: 230px;
 }
 
@@ -661,11 +661,11 @@ h3 {
   font-size: 0.68rem;
 }
 
-.gateway-error {
+.balancer-error {
   color: var(--red);
 }
 
-.gateway-action-state {
+.balancer-action-state {
   margin-top: 12px;
   border: 1px solid transparent;
   border-radius: var(--radius);

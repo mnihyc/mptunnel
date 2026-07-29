@@ -1,9 +1,7 @@
 //! Combined-node composition for multiple client and server identities.
 
 use super::{client, server};
-use crate::config::{
-    ManagementConfig, NodeConfig, OutboundLeafConfig, RouteTarget, RouteTargetKind, SessionConfig,
-};
+use crate::config::{ManagementConfig, NodeConfig, OutboundLeafConfig, SessionConfig};
 use crate::performance::ResourceLimits;
 use crate::platform::PacketDeviceProvider;
 use crate::product::{ProductAdmission, ProductAdmissionConfig};
@@ -69,10 +67,7 @@ pub(super) async fn run(
                 let context = client::new_path_context(
                     &config,
                     resources,
-                    RouteTarget {
-                        kind: RouteTargetKind::Outbound,
-                        tag: id.as_str().to_string(),
-                    },
+                    id.clone(),
                     ClientPathRuntimeOptions {
                         session_retention_timeout: session.retention_timeout,
                         path_group_ordinal,
@@ -152,7 +147,7 @@ pub(super) async fn run(
     }
 
     let mut server_contexts = Vec::with_capacity(servers.len());
-    for (server_index, server_config) in servers.into_iter().enumerate() {
+    for server_config in servers {
         let server_readiness = readiness.require("MPP server listeners");
         let destination_acl = match server_config.destination_acl.compile() {
             Ok(destination_acl) => destination_acl,
@@ -161,13 +156,7 @@ pub(super) async fn run(
                 return Err(RuntimeError::ProductPolicy(error.to_string()));
             }
         };
-        // This fallback is generation-local display/routing identity only; it
-        // never enters the carrier protocol.
-        let inbound_id = server_config
-            .tag
-            .clone()
-            .unwrap_or_else(|| format!("mpp-inbound-{server_index}"));
-        let inbound_id = match crate::product::InboundId::parse(&inbound_id) {
+        let inbound_id = match crate::product::InboundId::parse(&server_config.name) {
             Ok(inbound_id) => inbound_id,
             Err(error) => {
                 super::retire_runtime_services(&mut services).await;
@@ -179,10 +168,10 @@ pub(super) async fn run(
             inbound_id,
         ));
         let runtime = match server::new_identity_runtime_with_metadata(
-            server_config.tag,
-            server_config.bind_paths,
+            server_config.name,
+            server_config.paths,
             outbound_registry.clone(),
-            server_config.route_target,
+            server_config.egress,
             server_config.dns_plan,
             destination_policy,
             server_config.security,

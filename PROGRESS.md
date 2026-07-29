@@ -11,6 +11,69 @@ Historical entries below are retained as evidence of the decisions made at
 their recorded time. When a later entry changes an earlier decision, the later
 entry is authoritative.
 
+## 2026-07-30T00:34:43+08:00: direct version 4 conformance corrections
+
+- Name: admit only independently reproduced protocol corrections
+- Category: protocol correctness, security, lifecycle, and performance
+  change control
+- State: seven isolated correctness corrections approved; affected
+  steady-state non-regression guard passed; the formal repeated performance
+  matrix remains open
+- Content:
+  - reproduced and corrected zero-port IP target encoding, non-canonical
+    `PEER_STATUS` error paths, and overflowing `STREAM_DATA` extents;
+  - made malformed RFC 9297 Quarter Stream IDs close HTTP/3 with
+    `H3_DATAGRAM_ERROR`;
+  - rejected HTTP Datagrams after request-send completion and retired closed
+    request associations without retaining late datagrams as future-stream
+    handoff;
+  - committed QUIC carrier registry admission before publishing readiness,
+    with cancellation-safe rollback; and
+  - made no congestion-controller, scheduler, recovery, timing, pacing,
+    resource-default, or path-policy change.
+- Correctness evidence:
+  - every issue first failed a persistent codec, real HTTP/3 loopback, or
+    runtime admission test on the restored champion and then passed after its
+    isolated correction;
+  - the complete current suite passed: 1,378 library tests, two Product
+    allocation tests, and four daily-use Product acceptance tests;
+  - warnings-denied all-target/all-feature Clippy, formatting, and whitespace
+    checks passed; and
+  - commits `d3575a8` through `4afcc51` retain each correction separately.
+- Performance boundary:
+  - the only new operation on every reliable data frame is one checked extent
+    calculation on encode and decode; it adds no allocation or lock;
+  - native HTTP Datagram active routing retains its existing lock, lookup, and
+    queue operation, while new lifecycle work occurs on malformed, absent, or
+    terminal associations;
+  - QUIC admission reorders existing setup work without adding a frame or
+    round trip; and
+  - the release binary measured here is SHA-256
+    `f1ea26a70fef4c82d483dd83fff13dd09265b76b0b853b0c9c1e205fe89f53a0`.
+- Affected non-regression evidence:
+  - under the same native Linux target, Rust/Cargo toolchain, Docker images,
+    clean-host validity rules, 20-second load, two flows, and netem profiles
+    as the restored champion, QUIC single/five-path download measured
+    `241.442`/`738.897` Mbps and upload measured
+    `231.957`/`762.933` Mbps;
+  - the matched restored values were `234.276`/`680.359` Mbps download and
+    `228.443`/`762.552` Mbps upload;
+  - all four rows are performance-comparable, the source tree was clean, and
+    client/server hashes match; and
+  - raw manifests, qdisc state, counters, and rows remain under ignored
+    `./.tmp/lab/results/correctness-conformance-20260730/`.
+- Decision:
+  - approve these changes for proven protocol correctness with no observed
+    affected steady-state downgrade;
+  - do not attribute ordinary run variation to the corrections and do not use
+    a fixed percentage as a promotion threshold; and
+  - keep all other later Core, migration, TCP expansion, congestion, and
+    recovery work rejected until it independently reproduces a defect or
+    demonstrates a gain against both its parent and the historical champion.
+- Next: close the highest-value Product observability gap without entering
+  Core hot paths, then resume the preregistered representative Core condition
+  and transition matrix before considering any new performance mechanism.
+
 ## 2026-07-29T23:22:09+08:00: historical performance restoration
 
 - Name: restore the last clean competitive Core before further development

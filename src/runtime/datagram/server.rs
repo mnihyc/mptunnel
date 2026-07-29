@@ -185,7 +185,7 @@ impl ServerDatagramPortBackend for ServerDatagramService {
             outbound::validate_target(&target)
                 .map_err(|error| ServerDatagramOpenError::new(error.into()))?;
             principal_destination_policy
-                .authorize_pre(Network::Udp, &target)
+                .evaluate_pre(Network::Udp, &target)
                 .map_err(|error| {
                     ServerDatagramOpenError::new(RuntimeError::DestinationDenied(error.to_string()))
                 })?;

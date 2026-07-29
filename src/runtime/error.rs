@@ -47,6 +47,8 @@ pub enum RuntimeError {
     GatewayStatePoisoned,
     GatewayUnavailable(String),
     DestinationDenied(String),
+    RouteRejected,
+    RouteDropped,
     RemoteReset(ResetReason),
     RemoteClosed(CloseReason),
     AuthenticationRejected(&'static str),
@@ -217,6 +219,8 @@ impl std::fmt::Display for RuntimeError {
             Self::GatewayStatePoisoned => write!(f, "product balancer state lock is poisoned"),
             Self::GatewayUnavailable(error) => write!(f, "product balancer unavailable: {error}"),
             Self::DestinationDenied(error) => write!(f, "destination denied: {error}"),
+            Self::RouteRejected => write!(f, "destination rejected by routing policy"),
+            Self::RouteDropped => write!(f, "destination silently dropped by routing policy"),
             Self::RemoteReset(reason) => write!(f, "remote reset stream: {reason:?}"),
             Self::RemoteClosed(reason) => write!(f, "remote closed session: {reason:?}"),
             Self::AuthenticationRejected(message) => {
@@ -268,6 +272,8 @@ impl std::error::Error for RuntimeError {
             | Self::GatewayStatePoisoned
             | Self::GatewayUnavailable(_)
             | Self::DestinationDenied(_)
+            | Self::RouteRejected
+            | Self::RouteDropped
             | Self::RemoteReset(_)
             | Self::RemoteClosed(_)
             | Self::AuthenticationRejected(_)

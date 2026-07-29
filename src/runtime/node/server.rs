@@ -246,7 +246,7 @@ pub(super) fn new_identity_runtime_with_metadata(
                 outbound::validate_target(target)?;
                 stream_destination_policy
                     .for_principal(permit.principal().clone())
-                    .authorize_pre(Network::Tcp, target)
+                    .evaluate_pre(Network::Tcp, target)
                     .map_err(|error| RuntimeError::DestinationDenied(error.to_string()))?;
                 Ok(())
             }));

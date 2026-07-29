@@ -14,8 +14,8 @@ mod routing;
 mod rule_set;
 
 pub use acl::{
-    AclEffect, AclError, AclRuleSpec, AclVerdict, AuthorizedResolution, AuthorizedTarget,
-    DestinationAcl, PreResolutionApproval, RestrictedIpClass,
+    AclEffect, AclError, AclRuleSpec, AclVerdict, AuthorizedDomainTarget, AuthorizedResolution,
+    AuthorizedTarget, DestinationAcl, PreResolutionDecision, RestrictedIpClass,
 };
 pub use admission::{
     DEFAULT_MAX_PRODUCT_CONCURRENT_WORK, DEFAULT_MAX_PRODUCT_CONNECTS_PER_OUTBOUND,

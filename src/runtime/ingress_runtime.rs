@@ -445,7 +445,15 @@ where
             return Ok(());
         }
     };
-    let opened = plan.open_tcp(target.as_ref()).await?;
+    let opened = match plan.open_tcp(target.as_ref()).await {
+        Ok(opened) => opened,
+        Err(RuntimeError::RouteRejected) => return Ok(()),
+        Err(RuntimeError::RouteDropped) => {
+            hold_silent_route_drop(&mut stream).await;
+            return Ok(());
+        }
+        Err(error) => return Err(error),
+    };
     relay_opened_tcp(stream, opened).await
 }
 
@@ -662,6 +670,7 @@ pub(super) async fn run_udp_forward_client_socket(
                         }
                     }
                     UdpEdgeCompletion::Sent { result: Ok(()), .. } => {}
+                    UdpEdgeCompletion::Discarded { .. } => {}
                 }
             }
             _ = async {
@@ -785,6 +794,20 @@ where
             };
             let opened = match plan.open_tcp(&target).await {
                 Ok(opened) => opened,
+                Err(RuntimeError::RouteRejected) => {
+                    return apply_socks5_policy_disposition(
+                        &mut stream,
+                        ClientPolicyDisposition::Reject,
+                    )
+                    .await;
+                }
+                Err(RuntimeError::RouteDropped) => {
+                    return apply_socks5_policy_disposition(
+                        &mut stream,
+                        ClientPolicyDisposition::Drop,
+                    )
+                    .await;
+                }
                 Err(err) => {
                     stream
                         .write_all(&socks5::connect_reply(
@@ -897,6 +920,13 @@ where
     };
     let opened = match plan.open_tcp(&target).await {
         Ok(opened) => opened,
+        Err(RuntimeError::RouteRejected) => {
+            return apply_http_policy_disposition(&mut stream, ClientPolicyDisposition::Reject)
+                .await;
+        }
+        Err(RuntimeError::RouteDropped) => {
+            return apply_http_policy_disposition(&mut stream, ClientPolicyDisposition::Drop).await;
+        }
         Err(err) => {
             stream
                 .write_all(http_connect::error_response(HttpStatus::BadGateway))
@@ -1294,6 +1324,7 @@ where
                         );
                     }
                     UdpEdgeCompletion::Sent { result: Ok(()), .. } => {}
+                    UdpEdgeCompletion::Discarded { .. } => {}
                 }
             }
         }

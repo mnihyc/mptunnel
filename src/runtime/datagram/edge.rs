@@ -35,6 +35,9 @@ pub(in crate::runtime) enum UdpEdgeCompletion<M> {
         metadata: M,
         result: Result<(), RuntimeError>,
     },
+    Discarded {
+        lane_id: usize,
+    },
     Received {
         target: TargetAddr,
         metadata: M,
@@ -127,6 +130,18 @@ async fn run_udp_edge_lane<M>(
     debug_assert!(initial.metadata == local_metadata);
     let opened = match plan.open_udp(&initial.target).await {
         Ok(opened) => opened,
+        Err(RuntimeError::RouteRejected | RuntimeError::RouteDropped) => {
+            run_silent_udp_denial_lane(
+                lane_id,
+                local_metadata,
+                requests,
+                completions,
+                cancelled,
+                initial,
+            )
+            .await;
+            return;
+        }
         Err(error) => {
             let _ = send_udp_edge_completion(
                 &completions,
@@ -201,6 +216,49 @@ async fn run_udp_edge_lane<M>(
                 .await;
             }
         },
+    }
+}
+
+/// Retain a denied UDP association until its ingress flow expires.
+///
+/// UDP has no protocol-level rejection response. Completing each queued send
+/// without opening an outbound preserves silent Reject/Drop behavior and
+/// prevents later datagrams from repeating DNS and policy evaluation.
+async fn run_silent_udp_denial_lane<M>(
+    lane_id: usize,
+    local_metadata: M,
+    mut requests: mpsc::Receiver<UdpEdgeRequest<M>>,
+    completions: mpsc::Sender<UdpEdgeCompletion<M>>,
+    mut cancelled: tokio::sync::watch::Receiver<bool>,
+    initial: UdpEdgeRequest<M>,
+) where
+    M: Eq + Send + Sync + 'static,
+{
+    let mut current = initial;
+    loop {
+        debug_assert!(current.metadata == local_metadata);
+        if !send_udp_edge_completion(
+            &completions,
+            &mut cancelled,
+            UdpEdgeCompletion::Discarded { lane_id },
+        )
+        .await
+        {
+            return;
+        }
+        current = match tokio::select! {
+            request = requests.recv() => request,
+            result = cancelled.changed() => {
+                if result.is_err() || *cancelled.borrow() {
+                    None
+                } else {
+                    requests.recv().await
+                }
+            }
+        } {
+            Some(request) => request,
+            None => return,
+        };
     }
 }
 
@@ -726,8 +784,11 @@ pub(in crate::runtime) fn finish_udp_edge_completion<M>(
     lanes: &mut [UdpEdgeLane<M>],
     completion: &UdpEdgeCompletion<M>,
 ) {
-    let UdpEdgeCompletion::Sent { lane_id, .. } = completion else {
-        return;
+    let lane_id = match completion {
+        UdpEdgeCompletion::Sent { lane_id, .. } | UdpEdgeCompletion::Discarded { lane_id } => {
+            lane_id
+        }
+        UdpEdgeCompletion::Received { .. } => return,
     };
     if let Some(lane) = lanes.iter_mut().find(|lane| lane.lane_id == *lane_id) {
         lane.pending = lane.pending.saturating_sub(1);
@@ -771,5 +832,57 @@ pub(in crate::runtime) async fn close_udp_edge_lanes<M>(mut lanes: Vec<UdpEdgeLa
                 "UDP edge association task failed: {error}"
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn terminal_udp_denial_remains_silent_for_the_association_lifetime() {
+        let (request_tx, request_rx) = mpsc::channel(2);
+        let (completion_tx, mut completion_rx) = mpsc::channel(2);
+        let (_cancel_tx, cancelled) = tokio::sync::watch::channel(false);
+        let target = TargetAddr::Domain {
+            host: "denied.example".to_string(),
+            port: 443,
+        };
+        let initial = UdpEdgeRequest {
+            target: target.clone(),
+            payload: Bytes::from_static(b"first"),
+            ttl_ms: 1_000,
+            metadata: 9_u8,
+        };
+        let lane = tokio::spawn(run_silent_udp_denial_lane(
+            7,
+            9_u8,
+            request_rx,
+            completion_tx,
+            cancelled,
+            initial,
+        ));
+        request_tx
+            .send(UdpEdgeRequest {
+                target: target.clone(),
+                payload: Bytes::from_static(b"second"),
+                ttl_ms: 1_000,
+                metadata: 9_u8,
+            })
+            .await
+            .expect("second datagram");
+
+        for _ in 0..2 {
+            assert!(matches!(
+                completion_rx.recv().await.expect("silent completion"),
+                UdpEdgeCompletion::Discarded { lane_id: 7 }
+            ));
+        }
+        assert!(
+            !lane.is_finished(),
+            "the denied association must cache its terminal policy outcome"
+        );
+        drop(request_tx);
+        lane.await.expect("denied lane task");
     }
 }

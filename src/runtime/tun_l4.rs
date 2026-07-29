@@ -192,7 +192,15 @@ where
             return Ok(());
         }
     };
-    let opened = plan.open_tcp(&target).await?;
+    let opened = match plan.open_tcp(&target).await {
+        Ok(opened) => opened,
+        Err(RuntimeError::RouteRejected) => return Ok(()),
+        Err(RuntimeError::RouteDropped) => {
+            hold_silent_route_drop(&mut stream).await;
+            return Ok(());
+        }
+        Err(error) => return Err(error),
+    };
     relay_opened_tcp(stream, opened).await?;
     Ok(())
 }
@@ -588,6 +596,7 @@ async fn handle_tun_udp_flow(
                         );
                     }
                     UdpEdgeCompletion::Sent { result: Ok(()), .. } => {}
+                    UdpEdgeCompletion::Discarded { .. } => {}
                 }
             }
             else => break Ok(()),

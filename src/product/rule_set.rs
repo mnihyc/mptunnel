@@ -573,6 +573,7 @@ mod tests {
     use base64::engine::general_purpose::STANDARD as BASE64;
     use ring::signature::{Ed25519KeyPair, KeyPair};
     use serde_json::json;
+    use std::net::{IpAddr, Ipv4Addr};
 
     const TEST_NOW: u64 = 1_800_000_000;
 
@@ -685,5 +686,69 @@ mod tests {
             CompiledRuleSetRegistry::compile(vec![verified.clone(), verified]),
             Err(RuleSetError::DuplicateRuleSet(id)) if id.as_str() == "geo-public"
         ));
+    }
+
+    #[test]
+    fn domain_only_destination_set_cannot_create_address_routing_demand() {
+        use crate::product::{
+            CompiledRouteTable, EgressAction, FlowContext, InboundId, Network, OutboundId,
+            PrincipalId, ProtocolTarget, RouteAction, RouteMatchSpec, RouteRuleSpec, RuleId,
+            SourceEndpoint, TrafficIntent,
+        };
+
+        let (artifact, catalog) = signed_artifact(json!({
+            "schema": 1,
+            "id": "domains-only",
+            "revision": 1,
+            "expires_at_unix_secs": TEST_NOW + 3600,
+            "domain_exact": ["unrelated.example"],
+            "domain_suffix": [],
+            "destination_cidrs": []
+        }));
+        let domain_only = Arc::new(
+            VerifiedRuleSet::verify_json(&artifact, &catalog, TEST_NOW).expect("verified set"),
+        );
+        let table = CompiledRouteTable::compile(
+            7,
+            vec![
+                RouteRuleSpec::new(
+                    RuleId::parse("impossible-address-set").expect("rule"),
+                    RouteMatchSpec {
+                        destination_rule_sets: vec![domain_only],
+                        ..RouteMatchSpec::default()
+                    },
+                    RouteAction::new(EgressAction::Reject, None, TrafficIntent::Interactive),
+                ),
+                RouteRuleSpec::new(
+                    RuleId::parse("stable-domain").expect("rule"),
+                    RouteMatchSpec {
+                        domain_exact: vec![DomainName::parse("service.example").expect("domain")],
+                        ..RouteMatchSpec::default()
+                    },
+                    RouteAction::new(
+                        EgressAction::Outbound(OutboundId::parse("proxy").expect("outbound")),
+                        None,
+                        TrafficIntent::Interactive,
+                    ),
+                ),
+                RouteRuleSpec::new(
+                    RuleId::parse("default").expect("rule"),
+                    RouteMatchSpec::default(),
+                    RouteAction::new(EgressAction::Reject, None, TrafficIntent::Interactive),
+                ),
+            ],
+        )
+        .expect("route table");
+        let flow = FlowContext::new(
+            Network::Tcp,
+            ProtocolTarget::from_host_port("service.example", 443).expect("target"),
+            SourceEndpoint::new(IpAddr::V4(Ipv4Addr::new(198, 51, 100, 4)), 40_000),
+            PrincipalId::parse("anonymous").expect("principal"),
+            InboundId::parse("local-socks").expect("inbound"),
+        );
+
+        let (decision, requires_address_evidence) = table.classify_pre_resolution(&flow);
+        assert_eq!(decision.rule_id().as_str(), "stable-domain");
+        assert!(!requires_address_evidence);
     }
 }

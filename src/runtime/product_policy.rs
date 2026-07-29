@@ -1,15 +1,17 @@
 use crate::config::ProductPolicyConfig;
 use crate::dns::{DnsWireError, FakeDnsRecovery};
-use crate::outbound::{DestinationAuthorizationError, DestinationAuthorizer};
+use crate::outbound::{
+    DestinationAuthorization, DestinationAuthorizationError, DestinationAuthorizer,
+};
 use crate::product::{
-    AuthorizedTarget, DestinationAcl, DnsPlanId, EgressAction, FlowContext, InboundId, Network,
-    PrincipalId, ProductPolicyGeneration, ProtocolTarget, RouteInput, SourceEndpoint,
-    TrafficIntent,
+    DestinationAcl, DnsPlanId, EgressAction, FlowContext, InboundId, Network, PrincipalId,
+    ProductPolicyGeneration, ProtocolTarget, RouteInput, SourceEndpoint, TrafficIntent,
 };
 use crate::protocol::TargetAddr;
 use crate::runtime::error::RuntimeError;
 use crate::runtime::outbound_registry::{
-    EgressSelection, OpenedTcpOutbound, OpenedUdpOutbound, RuntimeOutboundRegistry,
+    EgressSelection, OpenedTcpOutbound, OpenedUdpOutbound, ProductDestination, ProductOpenRequest,
+    RuntimeOutboundRegistry,
 };
 use crate::scheduler::TrafficClass;
 use bytes::Bytes;
@@ -40,13 +42,18 @@ pub(in crate::runtime) struct ClientIngressRouter {
 #[derive(Clone)]
 pub(in crate::runtime) struct ClientOutboundPlan {
     registry: RuntimeOutboundRegistry,
+    selection: Option<EgressSelection>,
     dns_plan: Option<DnsPlanId>,
+    traffic_class: TrafficClass,
+    route_requires_post_resolution: bool,
+    acl_requires_post_resolution: bool,
     authorizer: ProductFlowDestinationAuthorizer,
+    authorization: DestinationAuthorization,
 }
 
-struct PostResolutionRouteGroup {
+struct DestinationRouteGroup {
     selection: EgressSelection,
-    authorized: Vec<AuthorizedTarget>,
+    destination: ProductDestination,
     traffic_class: TrafficClass,
 }
 
@@ -68,20 +75,21 @@ impl ClientOutboundPlan {
             .try_admit_product_flow(&self.authorizer.flow)?;
         let deadline = self.registry.flow_open_deadline();
         let groups = self
-            .post_resolution_route_groups(Network::Tcp, target, deadline)
+            .destination_route_groups(Network::Tcp, deadline)
             .await?;
         let mut last_error = None;
         for group in groups {
             match self
                 .registry
-                .open_authorized_tcp(
-                    &pending,
-                    &group.selection,
-                    &group.authorized,
-                    self.dns_plan.as_ref(),
-                    group.traffic_class,
+                .open_product_tcp(ProductOpenRequest {
+                    pending: &pending,
+                    selection: &group.selection,
+                    destination: group.destination,
+                    authorizer: &self.authorizer,
+                    dns_plan: self.dns_plan.as_ref(),
+                    traffic_class: group.traffic_class,
                     deadline,
-                )
+                })
                 .await
             {
                 Ok((opened, outbound)) => {
@@ -114,20 +122,21 @@ impl ClientOutboundPlan {
             .try_admit_product_flow(&self.authorizer.flow)?;
         let deadline = self.registry.flow_open_deadline();
         let groups = self
-            .post_resolution_route_groups(Network::Udp, target, deadline)
+            .destination_route_groups(Network::Udp, deadline)
             .await?;
         let mut last_error = None;
         for group in groups {
             match self
                 .registry
-                .open_authorized_udp(
-                    &pending,
-                    &group.selection,
-                    &group.authorized,
-                    self.dns_plan.as_ref(),
-                    group.traffic_class,
+                .open_product_udp(ProductOpenRequest {
+                    pending: &pending,
+                    selection: &group.selection,
+                    destination: group.destination,
+                    authorizer: &self.authorizer,
+                    dns_plan: self.dns_plan.as_ref(),
+                    traffic_class: group.traffic_class,
                     deadline,
-                )
+                })
                 .await
             {
                 Ok((opened, outbound)) => {
@@ -143,18 +152,34 @@ impl ClientOutboundPlan {
         }))
     }
 
-    async fn post_resolution_route_groups(
+    async fn destination_route_groups(
         &self,
         network: Network,
-        target: &TargetAddr,
         deadline: tokio::time::Instant,
-    ) -> Result<Vec<PostResolutionRouteGroup>, RuntimeError> {
-        let authorized = crate::outbound::resolve_authorized_target_before(
+    ) -> Result<Vec<DestinationRouteGroup>, RuntimeError> {
+        if self.authorization.target().ip().is_none()
+            && !self.route_requires_post_resolution
+            && !self.acl_requires_post_resolution
+        {
+            let domain = self
+                .authorizer
+                .authorize_domain(self.authorization.clone())
+                .map_err(|error| RuntimeError::DestinationDenied(error.to_string()))?;
+            return Ok(vec![DestinationRouteGroup {
+                selection: self
+                    .selection
+                    .clone()
+                    .expect("stable non-terminal pre-resolution route has an egress"),
+                destination: ProductDestination::domain(domain),
+                traffic_class: self.traffic_class,
+            }]);
+        }
+
+        let authorized = crate::outbound::resolve_authorization_before(
             self.registry.dns(),
             self.dns_plan.as_ref(),
             &self.authorizer,
-            network,
-            target,
+            self.authorization.clone(),
             deadline,
         )
         .await
@@ -164,7 +189,24 @@ impl ClientOutboundPlan {
             }
             error => RuntimeError::OutboundConnect(error),
         })?;
-        let mut groups: Vec<PostResolutionRouteGroup> = Vec::new();
+        if !self.route_requires_post_resolution {
+            return Ok(vec![DestinationRouteGroup {
+                selection: self
+                    .selection
+                    .clone()
+                    .expect("non-post-resolution route has an egress"),
+                destination: ProductDestination::resolved(authorized)?,
+                traffic_class: self.traffic_class,
+            }]);
+        }
+
+        struct PendingRouteGroup {
+            selection: EgressSelection,
+            authorized: Vec<crate::product::AuthorizedTarget>,
+            traffic_class: TrafficClass,
+        }
+        let mut groups: Vec<PendingRouteGroup> = Vec::new();
+        let mut terminal_disposition = None;
         for authorized_target in authorized {
             let decision = self
                 .authorizer
@@ -179,7 +221,14 @@ impl ClientOutboundPlan {
                 EgressAction::Outbound(_) | EgressAction::Balancer(_) => self
                     .registry
                     .selection_for_action(decision.action().egress())?,
-                EgressAction::Reject | EgressAction::Drop => continue,
+                EgressAction::Reject => {
+                    terminal_disposition.get_or_insert(ClientPolicyDisposition::Reject);
+                    continue;
+                }
+                EgressAction::Drop => {
+                    terminal_disposition = Some(ClientPolicyDisposition::Drop);
+                    continue;
+                }
                 EgressAction::Direct => {
                     return Err(RuntimeError::ProductPolicy(format!(
                         "post-resolution route {} must select a configured direct outbound",
@@ -193,7 +242,7 @@ impl ClientOutboundPlan {
             {
                 group.authorized.push(authorized_target);
             } else {
-                groups.push(PostResolutionRouteGroup {
+                groups.push(PendingRouteGroup {
                     selection,
                     authorized: vec![authorized_target],
                     traffic_class,
@@ -201,18 +250,31 @@ impl ClientOutboundPlan {
             }
         }
         if groups.is_empty() {
-            return Err(RuntimeError::DestinationDenied(
-                "post-resolution routing denied every authorized address".to_string(),
-            ));
+            return Err(match terminal_disposition {
+                Some(ClientPolicyDisposition::Reject) => RuntimeError::RouteRejected,
+                Some(ClientPolicyDisposition::Drop) => RuntimeError::RouteDropped,
+                None => RuntimeError::DestinationDenied(
+                    "post-resolution routing produced no usable address".to_string(),
+                ),
+            });
         }
-        Ok(groups)
+        groups
+            .into_iter()
+            .map(|group| {
+                Ok(DestinationRouteGroup {
+                    selection: group.selection,
+                    destination: ProductDestination::resolved(group.authorized)?,
+                    traffic_class: group.traffic_class,
+                })
+            })
+            .collect()
     }
 }
 
 #[derive(Clone)]
 struct ProductFlowDestinationAuthorizer {
     policy: Arc<ProductPolicyGeneration>,
-    flow: FlowContext,
+    flow: Arc<FlowContext>,
 }
 
 impl DestinationAuthorizer for ProductFlowDestinationAuthorizer {
@@ -223,11 +285,9 @@ impl DestinationAuthorizer for ProductFlowDestinationAuthorizer {
     fn flow(
         &self,
         network: Network,
-        target: &TargetAddr,
-    ) -> Result<FlowContext, DestinationAuthorizationError> {
-        let normalized =
-            protocol_target(target).map_err(|_| DestinationAuthorizationError::TargetChanged)?;
-        if network != self.flow.network() || &normalized != self.flow.target() {
+        target: &ProtocolTarget,
+    ) -> Result<Arc<FlowContext>, DestinationAuthorizationError> {
+        if network != self.flow.network() || target != self.flow.target() {
             return Err(DestinationAuthorizationError::TargetChanged);
         }
         Ok(self.flow.clone())
@@ -354,51 +414,54 @@ impl ClientIngressRouter {
         principal: PrincipalId,
         inbound: InboundId,
     ) -> Result<ClientRoute, RuntimeError> {
-        let target = protocol_target(target)?;
-        let flow = FlowContext::new(
+        let normalized_target = protocol_target(target)?;
+        let flow = Arc::new(FlowContext::new(
             network,
-            target.clone(),
+            normalized_target,
             SourceEndpoint::from_socket_addr(source),
             principal,
             inbound,
-        );
-        let decision = self
-            .policy
-            .routes()
-            .classify(RouteInput::pre_resolution(&flow));
-        match decision.action().egress() {
-            EgressAction::Reject => {
+        ));
+        let (decision, route_requires_post_resolution) =
+            self.policy.routes().classify_pre_resolution(flow.as_ref());
+        let selection = match decision.action().egress() {
+            EgressAction::Reject if !route_requires_post_resolution => {
                 return Ok(ClientRoute::Deny(ClientPolicyDisposition::Reject));
             }
-            EgressAction::Drop => {
+            EgressAction::Drop if !route_requires_post_resolution => {
                 return Ok(ClientRoute::Deny(ClientPolicyDisposition::Drop));
             }
+            EgressAction::Reject | EgressAction::Drop => None,
             EgressAction::Direct => {
                 return Err(RuntimeError::ProductPolicy(
                     "direct action has no local MPP runtime binding".to_string(),
                 ));
             }
-            EgressAction::Outbound(_) | EgressAction::Balancer(_) => {}
-        }
-        self.policy
-            .destination_acl()
-            .authorize_pre_resolution(flow.clone())
+            EgressAction::Outbound(_) | EgressAction::Balancer(_) => Some(
+                self.registry
+                    .selection_for_action(decision.action().egress())?,
+            ),
+        };
+        let dns_plan = decision.action().dns_plan().cloned();
+        let selected_traffic_class = traffic_class(decision.action().traffic_intent(), network);
+        let authorizer = ProductFlowDestinationAuthorizer {
+            policy: self.policy.clone(),
+            flow,
+        };
+        let authorization = authorizer
+            .begin_target(network, authorizer.flow.target())
             .map_err(|error| RuntimeError::DestinationDenied(error.to_string()))?;
-        match decision.action().egress() {
-            EgressAction::Outbound(_) | EgressAction::Balancer(_) => {
-                Ok(ClientRoute::Open(ClientOutboundPlan {
-                    registry: self.registry.clone(),
-                    dns_plan: decision.action().dns_plan().cloned(),
-                    authorizer: ProductFlowDestinationAuthorizer {
-                        policy: self.policy.clone(),
-                        flow,
-                    },
-                }))
-            }
-            EgressAction::Reject | EgressAction::Drop | EgressAction::Direct => {
-                unreachable!("terminal Product action handled above")
-            }
-        }
+        let acl_requires_post_resolution = authorization.requires_post_resolution();
+        Ok(ClientRoute::Open(ClientOutboundPlan {
+            registry: self.registry.clone(),
+            selection,
+            dns_plan,
+            traffic_class: selected_traffic_class,
+            route_requires_post_resolution,
+            acl_requires_post_resolution,
+            authorizer,
+            authorization,
+        }))
     }
 }
 
@@ -642,11 +705,53 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn stable_domain_route_delegates_canonical_target_without_dns() {
+        let edge = context(7443);
+        let config = policy(vec![rule(
+            "default",
+            RouteMatchSpec::default(),
+            EgressAction::Outbound(OutboundId::parse("edge").expect("outbound")),
+        )]);
+        let router = ClientIngressRouter::new(
+            &config,
+            registry_with_dns(
+                [("edge", edge)],
+                &[],
+                crate::dns::DnsGeneration::from_test_answers(HashMap::new()),
+            ),
+        )
+        .expect("router");
+        let target = TargetAddr::Domain {
+            host: "ExAmPlE.COM".to_string(),
+            port: 443,
+        };
+
+        let ClientRoute::Open(plan) = router
+            .route_udp(&target, source(), anonymous(), inbound())
+            .expect("domain route")
+        else {
+            panic!("expected an open plan");
+        };
+        let OpenedUdpOutbound::Mpp {
+            target: delegated, ..
+        } = plan.open_udp(&target).await.expect("domain delegation")
+        else {
+            panic!("expected MPP UDP outbound");
+        };
+
+        assert_eq!(
+            delegated,
+            TargetAddr::Domain {
+                host: "example.com".to_string(),
+                port: 443,
+            }
+        );
+    }
+
+    #[tokio::test]
     async fn post_dns_routing_authorizes_the_complete_answer_and_opens_only_a_literal_action() {
-        let default_context = context(7443);
         let routed_context = context(8443);
         let routed_session = routed_context.session_id;
-        let default_id = OutboundId::parse("default-edge").expect("outbound");
         let routed_id = OutboundId::parse("routed-edge").expect("outbound");
         let config = policy(vec![
             rule(
@@ -671,11 +776,7 @@ mod tests {
                     TrafficIntent::Throughput,
                 ),
             ),
-            rule(
-                "default",
-                RouteMatchSpec::default(),
-                EgressAction::Outbound(default_id),
-            ),
+            rule("default", RouteMatchSpec::default(), EgressAction::Reject),
         ]);
         let dns = crate::dns::DnsGeneration::from_test_answers(HashMap::from([
             (
@@ -692,17 +793,14 @@ mod tests {
                     "127.0.0.1".parse().expect("restricted answer"),
                 ],
             ),
+            (
+                "denied.example".to_string(),
+                vec!["8.8.8.8".parse().expect("denied answer")],
+            ),
         ]));
         let router = ClientIngressRouter::new(
             &config,
-            registry_with_dns(
-                [
-                    ("default-edge", default_context),
-                    ("routed-edge", routed_context),
-                ],
-                &[],
-                dns,
-            ),
+            registry_with_dns([("routed-edge", routed_context)], &[], dns),
         )
         .expect("router");
 
@@ -745,6 +843,21 @@ mod tests {
         assert!(matches!(
             plan.open_udp(&mixed_safety).await,
             Err(RuntimeError::DestinationDenied(_))
+        ));
+
+        let denied = TargetAddr::Domain {
+            host: "denied.example".to_string(),
+            port: 443,
+        };
+        let ClientRoute::Open(plan) = router
+            .route_udp(&denied, source(), anonymous(), inbound())
+            .expect("provisional pre-resolution route")
+        else {
+            panic!("expected an open plan");
+        };
+        assert!(matches!(
+            plan.open_udp(&denied).await,
+            Err(RuntimeError::RouteRejected)
         ));
     }
 
@@ -804,13 +917,33 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn socks5_reject_returns_connection_not_allowed_without_mpp_open() {
-        let config = policy(vec![rule(
-            "default",
-            RouteMatchSpec::default(),
-            EgressAction::Reject,
-        )]);
-        let router = ClientIngressRouter::new(&config, registry([], &[])).expect("router");
+    async fn socks5_post_resolution_reject_returns_connection_not_allowed() {
+        let edge = context(8443);
+        let edge_id = OutboundId::parse("allowlisted-edge").expect("outbound");
+        let config = policy(vec![
+            rule(
+                "allowlisted-address",
+                RouteMatchSpec {
+                    destination_cidrs: vec!["1.1.1.0/24".parse().expect("CIDR")],
+                    stages: vec![RouteStage::PostResolution],
+                    ..RouteMatchSpec::default()
+                },
+                EgressAction::Outbound(edge_id),
+            ),
+            rule("default", RouteMatchSpec::default(), EgressAction::Reject),
+        ]);
+        let router = ClientIngressRouter::new(
+            &config,
+            registry_with_dns(
+                [("allowlisted-edge", edge)],
+                &[],
+                crate::dns::DnsGeneration::from_test_answers(HashMap::from([(
+                    "example.com".to_string(),
+                    vec!["8.8.8.8".parse().expect("non-allowlisted answer")],
+                )])),
+            ),
+        )
+        .expect("router");
         let udp_context = context(7443);
         let (mut client, server) = tokio::io::duplex(1024);
         let task = tokio::spawn(handle_socks5_client_stream_with_auth(

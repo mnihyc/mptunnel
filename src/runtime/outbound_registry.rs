@@ -15,9 +15,9 @@ use crate::outbound::{
 };
 use crate::performance::MppPerformanceConfig;
 use crate::product::{
-    AuthorizedTarget, BalancerId, CompiledDnsPlan, CompiledDnsUpstream, DnsEgressSpec, DnsPlanId,
-    EgressAction, FlowContext, GatewayMemberMode, Network, NetworkSet, OutboundId,
-    PendingProductFlow, ProductAdmission, ProductFlowLease as ProductAdmissionLease,
+    AuthorizedDomainTarget, AuthorizedTarget, BalancerId, CompiledDnsPlan, CompiledDnsUpstream,
+    DnsEgressSpec, DnsPlanId, EgressAction, FlowContext, GatewayMemberMode, Network, NetworkSet,
+    OutboundId, PendingProductFlow, ProductAdmission, ProductFlowLease as ProductAdmissionLease,
     ProductOutboundFlow, ProtocolTarget,
 };
 use crate::protocol::TargetAddr;
@@ -239,13 +239,70 @@ pub(in crate::runtime) enum OpenedUdpOutbound {
 }
 
 struct ProductLeafOpen<'a> {
-    authorized: &'a [AuthorizedTarget],
+    destination: &'a mut ProductDestination,
+    authorizer: &'a dyn DestinationAuthorizer,
     dns_plan: Option<&'a DnsPlanId>,
     traffic_class: TrafficClass,
     deadline: tokio::time::Instant,
     gateway_lease: Option<GatewayFlowLease>,
     scope: ProductFlowScope,
     observe_native: bool,
+}
+
+pub(in crate::runtime) struct ProductOpenRequest<'a> {
+    pub(in crate::runtime) pending: &'a PendingProductFlow,
+    pub(in crate::runtime) selection: &'a EgressSelection,
+    pub(in crate::runtime) destination: ProductDestination,
+    pub(in crate::runtime) authorizer: &'a dyn DestinationAuthorizer,
+    pub(in crate::runtime) dns_plan: Option<&'a DnsPlanId>,
+    pub(in crate::runtime) traffic_class: TrafficClass,
+    pub(in crate::runtime) deadline: tokio::time::Instant,
+}
+
+pub(in crate::runtime) enum ProductDestination {
+    Domain(AuthorizedDomainTarget),
+    Resolved(ResolvedProductDestination),
+}
+
+pub(in crate::runtime) struct ResolvedProductDestination {
+    targets: Vec<AuthorizedTarget>,
+}
+
+impl ResolvedProductDestination {
+    fn new(targets: Vec<AuthorizedTarget>) -> Result<Self, RuntimeError> {
+        authorized_flow(&targets)?;
+        Ok(Self { targets })
+    }
+
+    fn flow(&self) -> &FlowContext {
+        self.targets
+            .first()
+            .expect("validated resolved Product destination has an address")
+            .flow()
+    }
+
+    fn targets(&self) -> &[AuthorizedTarget] {
+        &self.targets
+    }
+}
+
+impl ProductDestination {
+    pub(in crate::runtime) const fn domain(domain: AuthorizedDomainTarget) -> Self {
+        Self::Domain(domain)
+    }
+
+    pub(in crate::runtime) fn resolved(
+        targets: Vec<AuthorizedTarget>,
+    ) -> Result<Self, RuntimeError> {
+        ResolvedProductDestination::new(targets).map(Self::Resolved)
+    }
+
+    fn flow(&self) -> Result<&FlowContext, RuntimeError> {
+        match self {
+            Self::Domain(domain) => Ok(domain.flow()),
+            Self::Resolved(resolved) => Ok(resolved.flow()),
+        }
+    }
 }
 
 /// Product ownership retained for the lifetime of one concrete opened branch.
@@ -507,27 +564,24 @@ impl RuntimeOutboundRegistry {
         authorizer: &dyn DestinationAuthorizer,
     ) -> Result<OpenedTcpOutbound, RuntimeError> {
         let deadline = self.flow_open_deadline();
-        let flow = authorizer
-            .flow(Network::Tcp, target)
+        let authorization = authorizer
+            .begin(Network::Tcp, target)
             .map_err(|error| RuntimeError::DestinationDenied(error.to_string()))?;
-        let pending = self.try_admit_product_flow(&flow)?;
-        let authorized = outbound::resolve_authorized_target_before(
-            &self.dns,
-            dns_plan,
-            authorizer,
-            Network::Tcp,
-            target,
-            deadline,
-        )
-        .await?;
+        let pending = self.try_admit_product_flow(authorization.flow())?;
+        let destination =
+            authorize_product_destination(&self.dns, dns_plan, authorizer, authorization, deadline)
+                .await?;
         let (opened, outbound) = self
-            .open_authorized_tcp_for_origin(
-                &pending,
-                selection,
-                &authorized,
-                dns_plan,
-                traffic_class,
-                deadline,
+            .open_product_tcp_for_origin(
+                ProductOpenRequest {
+                    pending: &pending,
+                    selection,
+                    destination,
+                    authorizer,
+                    dns_plan,
+                    traffic_class,
+                    deadline,
+                },
                 ProductFlowOriginKind::MppInbound,
                 false,
             )
@@ -543,27 +597,24 @@ impl RuntimeOutboundRegistry {
         authorizer: &dyn DestinationAuthorizer,
     ) -> Result<OpenedUdpOutbound, RuntimeError> {
         let deadline = self.flow_open_deadline();
-        let flow = authorizer
-            .flow(Network::Udp, target)
+        let authorization = authorizer
+            .begin(Network::Udp, target)
             .map_err(|error| RuntimeError::DestinationDenied(error.to_string()))?;
-        let pending = self.try_admit_product_flow(&flow)?;
-        let authorized = outbound::resolve_authorized_target_before(
-            &self.dns,
-            dns_plan,
-            authorizer,
-            Network::Udp,
-            target,
-            deadline,
-        )
-        .await?;
+        let pending = self.try_admit_product_flow(authorization.flow())?;
+        let destination =
+            authorize_product_destination(&self.dns, dns_plan, authorizer, authorization, deadline)
+                .await?;
         let (opened, outbound) = self
-            .open_authorized_udp_for_origin(
-                &pending,
-                selection,
-                &authorized,
-                dns_plan,
-                TrafficClass::RealtimeDatagram,
-                deadline,
+            .open_product_udp_for_origin(
+                ProductOpenRequest {
+                    pending: &pending,
+                    selection,
+                    destination,
+                    authorizer,
+                    dns_plan,
+                    traffic_class: TrafficClass::RealtimeDatagram,
+                    deadline,
+                },
                 ProductFlowOriginKind::MppInbound,
                 false,
             )
@@ -571,58 +622,46 @@ impl RuntimeOutboundRegistry {
         Ok(opened.with_product_flow(pending.commit(outbound)))
     }
 
-    pub(in crate::runtime) async fn open_authorized_tcp(
+    pub(in crate::runtime) async fn open_product_tcp(
         &self,
-        pending: &PendingProductFlow,
-        selection: &EgressSelection,
-        authorized: &[AuthorizedTarget],
-        dns_plan: Option<&DnsPlanId>,
-        traffic_class: TrafficClass,
-        deadline: tokio::time::Instant,
+        request: ProductOpenRequest<'_>,
     ) -> Result<(OpenedTcpOutbound, ProductOutboundFlow), RuntimeError> {
-        self.open_authorized_tcp_for_origin(
-            pending,
-            selection,
-            authorized,
-            dns_plan,
-            traffic_class,
-            deadline,
-            ProductFlowOriginKind::LocalInbound,
-            true,
-        )
-        .await
+        self.open_product_tcp_for_origin(request, ProductFlowOriginKind::LocalInbound, true)
+            .await
     }
 
-    #[allow(clippy::too_many_arguments)]
-    async fn open_authorized_tcp_for_origin(
+    async fn open_product_tcp_for_origin(
         &self,
-        pending: &PendingProductFlow,
-        selection: &EgressSelection,
-        authorized: &[AuthorizedTarget],
-        dns_plan: Option<&DnsPlanId>,
-        traffic_class: TrafficClass,
-        deadline: tokio::time::Instant,
+        request: ProductOpenRequest<'_>,
         origin_kind: ProductFlowOriginKind,
         observe_native: bool,
     ) -> Result<(OpenedTcpOutbound, ProductOutboundFlow), RuntimeError> {
-        let protocol_target = authorized_protocol_target(authorized, Network::Tcp)?;
-        let principal = authorized
-            .first()
-            .expect("authorized protocol target requires one address")
-            .flow()
-            .principal();
+        let ProductOpenRequest {
+            pending,
+            selection,
+            mut destination,
+            authorizer,
+            dns_plan,
+            traffic_class,
+            deadline,
+        } = request;
+        ensure_destination_network(&destination, Network::Tcp)?;
+        ensure_product_open_identity(&destination, pending)?;
+        let protocol_target = pending.target();
+        let principal = pending.principal();
         match selection {
             EgressSelection::Outbound(id) => {
                 let leaf = self.shell.require_leaf(id, Network::Tcp)?;
-                let scope = product_flow_scope(authorized, origin_kind, leaf.id(), None)?;
+                let scope = product_flow_scope(&destination, origin_kind, leaf.id(), None)?;
                 let connect = pending
                     .try_begin_connect(leaf.id().clone())
                     .map_err(RuntimeError::ProductAdmission)?;
                 let opened = self
-                    .open_authorized_tcp_leaf(
+                    .open_product_tcp_leaf(
                         leaf,
                         ProductLeafOpen {
-                            authorized,
+                            destination: &mut destination,
+                            authorizer,
                             dns_plan,
                             traffic_class,
                             deadline,
@@ -643,7 +682,7 @@ impl RuntimeOutboundRegistry {
                     ensure_before_deadline(deadline)?;
                     let binding = match runtime.select_for_principal(
                         Network::Tcp,
-                        &protocol_target,
+                        protocol_target,
                         Some(principal),
                         &excluded,
                     ) {
@@ -654,7 +693,7 @@ impl RuntimeOutboundRegistry {
                     let leaf = self
                         .shell
                         .require_leaf(runtime.member_id(handle)?, Network::Tcp)?;
-                    let scope = product_flow_scope(authorized, origin_kind, leaf.id(), Some(id))?;
+                    let scope = product_flow_scope(&destination, origin_kind, leaf.id(), Some(id))?;
                     let connect = match pending.try_begin_connect(leaf.id().clone()) {
                         Ok(connect) => connect,
                         Err(error) => {
@@ -664,10 +703,11 @@ impl RuntimeOutboundRegistry {
                         }
                     };
                     match self
-                        .open_authorized_tcp_leaf(
+                        .open_product_tcp_leaf(
                             leaf,
                             ProductLeafOpen {
-                                authorized,
+                                destination: &mut destination,
+                                authorizer,
                                 dns_plan,
                                 traffic_class,
                                 deadline,
@@ -679,6 +719,7 @@ impl RuntimeOutboundRegistry {
                         .await
                     {
                         Ok(opened) => return Ok((opened, connect.connected())),
+                        Err(error @ RuntimeError::DestinationDenied(_)) => return Err(error),
                         Err(error) => {
                             excluded.push(handle);
                             last_error = Some(error);
@@ -694,58 +735,46 @@ impl RuntimeOutboundRegistry {
         }
     }
 
-    pub(in crate::runtime) async fn open_authorized_udp(
+    pub(in crate::runtime) async fn open_product_udp(
         &self,
-        pending: &PendingProductFlow,
-        selection: &EgressSelection,
-        authorized: &[AuthorizedTarget],
-        dns_plan: Option<&DnsPlanId>,
-        traffic_class: TrafficClass,
-        deadline: tokio::time::Instant,
+        request: ProductOpenRequest<'_>,
     ) -> Result<(OpenedUdpOutbound, ProductOutboundFlow), RuntimeError> {
-        self.open_authorized_udp_for_origin(
-            pending,
-            selection,
-            authorized,
-            dns_plan,
-            traffic_class,
-            deadline,
-            ProductFlowOriginKind::LocalInbound,
-            true,
-        )
-        .await
+        self.open_product_udp_for_origin(request, ProductFlowOriginKind::LocalInbound, true)
+            .await
     }
 
-    #[allow(clippy::too_many_arguments)]
-    async fn open_authorized_udp_for_origin(
+    async fn open_product_udp_for_origin(
         &self,
-        pending: &PendingProductFlow,
-        selection: &EgressSelection,
-        authorized: &[AuthorizedTarget],
-        dns_plan: Option<&DnsPlanId>,
-        traffic_class: TrafficClass,
-        deadline: tokio::time::Instant,
+        request: ProductOpenRequest<'_>,
         origin_kind: ProductFlowOriginKind,
         observe_native: bool,
     ) -> Result<(OpenedUdpOutbound, ProductOutboundFlow), RuntimeError> {
-        let protocol_target = authorized_protocol_target(authorized, Network::Udp)?;
-        let principal = authorized
-            .first()
-            .expect("authorized protocol target requires one address")
-            .flow()
-            .principal();
+        let ProductOpenRequest {
+            pending,
+            selection,
+            mut destination,
+            authorizer,
+            dns_plan,
+            traffic_class,
+            deadline,
+        } = request;
+        ensure_destination_network(&destination, Network::Udp)?;
+        ensure_product_open_identity(&destination, pending)?;
+        let protocol_target = pending.target();
+        let principal = pending.principal();
         match selection {
             EgressSelection::Outbound(id) => {
                 let leaf = self.shell.require_leaf(id, Network::Udp)?;
-                let scope = product_flow_scope(authorized, origin_kind, leaf.id(), None)?;
+                let scope = product_flow_scope(&destination, origin_kind, leaf.id(), None)?;
                 let connect = pending
                     .try_begin_connect(leaf.id().clone())
                     .map_err(RuntimeError::ProductAdmission)?;
                 let opened = self
-                    .open_authorized_udp_leaf(
+                    .open_product_udp_leaf(
                         leaf,
                         ProductLeafOpen {
-                            authorized,
+                            destination: &mut destination,
+                            authorizer,
                             dns_plan,
                             traffic_class,
                             deadline,
@@ -766,7 +795,7 @@ impl RuntimeOutboundRegistry {
                     ensure_before_deadline(deadline)?;
                     let binding = match runtime.select_for_principal(
                         Network::Udp,
-                        &protocol_target,
+                        protocol_target,
                         Some(principal),
                         &excluded,
                     ) {
@@ -777,7 +806,7 @@ impl RuntimeOutboundRegistry {
                     let leaf = self
                         .shell
                         .require_leaf(runtime.member_id(handle)?, Network::Udp)?;
-                    let scope = product_flow_scope(authorized, origin_kind, leaf.id(), Some(id))?;
+                    let scope = product_flow_scope(&destination, origin_kind, leaf.id(), Some(id))?;
                     let connect = match pending.try_begin_connect(leaf.id().clone()) {
                         Ok(connect) => connect,
                         Err(error) => {
@@ -787,10 +816,11 @@ impl RuntimeOutboundRegistry {
                         }
                     };
                     match self
-                        .open_authorized_udp_leaf(
+                        .open_product_udp_leaf(
                             leaf,
                             ProductLeafOpen {
-                                authorized,
+                                destination: &mut destination,
+                                authorizer,
                                 dns_plan,
                                 traffic_class,
                                 deadline,
@@ -802,6 +832,7 @@ impl RuntimeOutboundRegistry {
                         .await
                     {
                         Ok(opened) => return Ok((opened, connect.connected())),
+                        Err(error @ RuntimeError::DestinationDenied(_)) => return Err(error),
                         Err(error) => {
                             excluded.push(handle);
                             last_error = Some(error);
@@ -817,13 +848,14 @@ impl RuntimeOutboundRegistry {
         }
     }
 
-    async fn open_authorized_tcp_leaf(
+    async fn open_product_tcp_leaf(
         &self,
         leaf: Arc<RuntimeOutboundLeaf>,
         request: ProductLeafOpen<'_>,
     ) -> Result<OpenedTcpOutbound, RuntimeError> {
         let ProductLeafOpen {
-            authorized,
+            destination,
+            authorizer,
             dns_plan,
             traffic_class,
             deadline,
@@ -839,44 +871,17 @@ impl RuntimeOutboundRegistry {
                     ..
                 } => {
                     let context = context.with_product_flow_scope(scope.clone());
-                    let mut last_error = None;
-                    for authorized_target in authorized {
-                        let target = authorized_literal_target(authorized_target, Network::Tcp)?;
-                        let remote = match tokio::time::timeout_at(
-                            deadline,
-                            open_remote_stream(&context, target.clone(), traffic_class),
-                        )
-                        .await
-                        {
-                            Ok(Ok(remote)) => remote,
-                            Ok(Err(error)) => {
-                                last_error = Some(error);
-                                continue;
-                            }
-                            Err(_) => {
-                                return Err(RuntimeError::OutboundConnect(
-                                    outbound::OutboundConnectError::ConnectTimeout,
-                                ));
-                            }
-                        };
-                        return Ok(OpenedTcpOutbound::Mpp {
-                            context: context.clone(),
-                            performance: *performance,
-                            remote,
-                            spec: ReliableRelayOpenSpec { target },
-                            _gateway_lease: None,
-                            _product_flow: OpenedProductFlow::new(
-                                scope.clone(),
-                                None,
-                                Network::Tcp,
-                            ),
-                        });
-                    }
-                    Err(last_error.unwrap_or_else(|| {
-                        RuntimeError::OutboundConnect(
-                            outbound::OutboundConnectError::NoAuthorizedAddresses,
-                        )
-                    }))
+                    let (remote, target) =
+                        open_mpp_tcp_destination(&context, destination, traffic_class, deadline)
+                            .await?;
+                    Ok(OpenedTcpOutbound::Mpp {
+                        context: context.clone(),
+                        performance: *performance,
+                        remote,
+                        spec: ReliableRelayOpenSpec { target },
+                        _gateway_lease: None,
+                        _product_flow: OpenedProductFlow::new(scope.clone(), None, Network::Tcp),
+                    })
                 }
                 RuntimeOutboundLeaf::Local {
                     config,
@@ -884,11 +889,16 @@ impl RuntimeOutboundRegistry {
                     native_sockets,
                     ..
                 } => {
-                    let stream = outbound::connect_tcp_authorized_with_configurator(
+                    if config.requires_ip_target() {
+                        self.resolve_destination(destination, dns_plan, authorizer, deadline)
+                            .await?;
+                    }
+                    let connector_target = connector_target(destination)?;
+                    let stream = outbound::connect_tcp_target_with_configurator(
                         config,
                         &self.dns,
                         dns_plan,
-                        authorized,
+                        connector_target,
                         leaf_deadline(deadline, *connect_timeout)?,
                         native_sockets.as_ref(),
                     )
@@ -953,13 +963,14 @@ impl RuntimeOutboundRegistry {
         })
     }
 
-    async fn open_authorized_udp_leaf(
+    async fn open_product_udp_leaf(
         &self,
         leaf: Arc<RuntimeOutboundLeaf>,
         request: ProductLeafOpen<'_>,
     ) -> Result<OpenedUdpOutbound, RuntimeError> {
         let ProductLeafOpen {
-            authorized,
+            destination,
+            authorizer,
             dns_plan,
             traffic_class,
             deadline,
@@ -969,12 +980,7 @@ impl RuntimeOutboundRegistry {
         } = request;
         match leaf.as_ref() {
             RuntimeOutboundLeaf::Mpp { context, .. } => {
-                let first = authorized.first().ok_or_else(|| {
-                    RuntimeError::OutboundConnect(
-                        outbound::OutboundConnectError::NoAuthorizedAddresses,
-                    )
-                })?;
-                let target = authorized_literal_target(first, Network::Udp)?;
+                let target = mpp_udp_target(destination)?;
                 ensure_before_deadline(deadline)?;
                 Ok(OpenedUdpOutbound::Mpp {
                     context: context.with_product_flow_scope(scope.clone()),
@@ -990,11 +996,16 @@ impl RuntimeOutboundRegistry {
                 native_sockets,
                 ..
             } => {
-                let socket = match outbound::connect_udp_authorized_with_configurator(
+                if config.requires_ip_target() {
+                    self.resolve_destination(destination, dns_plan, authorizer, deadline)
+                        .await?;
+                }
+                let connector_target = connector_target(destination)?;
+                let socket = match outbound::connect_udp_target_with_configurator(
                     config,
                     &self.dns,
                     dns_plan,
-                    authorized,
+                    connector_target,
                     leaf_deadline(deadline, *connect_timeout)?,
                     native_sockets.as_ref(),
                 )
@@ -1020,6 +1031,29 @@ impl RuntimeOutboundRegistry {
                         Network::Udp,
                     ),
                 })
+            }
+        }
+    }
+
+    async fn resolve_destination<'a>(
+        &self,
+        destination: &'a mut ProductDestination,
+        dns_plan: Option<&DnsPlanId>,
+        authorizer: &dyn DestinationAuthorizer,
+        deadline: tokio::time::Instant,
+    ) -> Result<&'a [AuthorizedTarget], RuntimeError> {
+        if let ProductDestination::Domain(domain) = destination {
+            let authorized = outbound::resolve_authorized_domain_before(
+                &self.dns, dns_plan, authorizer, domain, deadline,
+            )
+            .await
+            .map_err(map_destination_resolution_error)?;
+            *destination = ProductDestination::resolved(authorized)?;
+        }
+        match destination {
+            ProductDestination::Resolved(resolved) => Ok(resolved.targets()),
+            ProductDestination::Domain(_) => {
+                unreachable!("domain destination was promoted to resolved addresses")
             }
         }
     }
@@ -1453,42 +1487,159 @@ impl DnsBackendFactory for RuntimeOutboundDnsBackendFactory {
     }
 }
 
-fn authorized_protocol_target(
-    authorized: &[AuthorizedTarget],
-    network: Network,
-) -> Result<ProtocolTarget, RuntimeError> {
+async fn authorize_product_destination(
+    dns: &DnsGeneration,
+    dns_plan: Option<&DnsPlanId>,
+    authorizer: &dyn DestinationAuthorizer,
+    authorization: crate::outbound::DestinationAuthorization,
+    deadline: tokio::time::Instant,
+) -> Result<ProductDestination, RuntimeError> {
+    if authorization.target().ip().is_some() || authorization.requires_post_resolution() {
+        let authorized = outbound::resolve_authorization_before(
+            dns,
+            dns_plan,
+            authorizer,
+            authorization,
+            deadline,
+        )
+        .await
+        .map_err(map_destination_resolution_error)?;
+        ProductDestination::resolved(authorized)
+    } else {
+        authorizer
+            .authorize_domain(authorization)
+            .map(ProductDestination::Domain)
+            .map_err(|error| RuntimeError::DestinationDenied(error.to_string()))
+    }
+}
+
+fn authorized_flow(authorized: &[AuthorizedTarget]) -> Result<&FlowContext, RuntimeError> {
     let first = authorized.first().ok_or_else(|| {
         RuntimeError::OutboundConnect(outbound::OutboundConnectError::NoAuthorizedAddresses)
     })?;
     let generation = first.acl_generation();
     let flow = first.flow();
-    if flow.network() != network
-        || authorized
-            .iter()
-            .any(|target| target.acl_generation() != generation || target.flow() != flow)
+    if authorized
+        .iter()
+        .any(|target| target.acl_generation() != generation || target.flow() != flow)
     {
         return Err(RuntimeError::DestinationDenied(
             "authorized connector targets do not belong to one Product flow".to_string(),
         ));
     }
-    Ok(flow.target().clone())
+    Ok(flow)
+}
+
+fn ensure_destination_network(
+    destination: &ProductDestination,
+    network: Network,
+) -> Result<(), RuntimeError> {
+    if destination.flow()?.network() != network {
+        return Err(RuntimeError::DestinationDenied(
+            "authorized connector target has the wrong network".to_string(),
+        ));
+    }
+    Ok(())
+}
+
+fn ensure_product_open_identity(
+    destination: &ProductDestination,
+    pending: &PendingProductFlow,
+) -> Result<(), RuntimeError> {
+    let flow = destination.flow()?;
+    if flow.principal() != pending.principal() || flow.target() != pending.target() {
+        return Err(RuntimeError::DestinationDenied(
+            "Product destination does not belong to the admitted flow".to_string(),
+        ));
+    }
+    Ok(())
 }
 
 fn product_flow_scope(
-    authorized: &[AuthorizedTarget],
+    destination: &ProductDestination,
     origin_kind: ProductFlowOriginKind,
     outbound: &OutboundId,
     balancer: Option<&BalancerId>,
 ) -> Result<ProductFlowScope, RuntimeError> {
-    let flow = authorized.first().ok_or_else(|| {
-        RuntimeError::OutboundConnect(outbound::OutboundConnectError::NoAuthorizedAddresses)
-    })?;
     Ok(ProductFlowScope::from_flow(
         origin_kind,
-        flow.flow(),
+        destination.flow()?,
         outbound.clone(),
         balancer.cloned(),
     ))
+}
+
+fn connector_target(
+    destination: &ProductDestination,
+) -> Result<outbound::ConnectorTarget<'_>, RuntimeError> {
+    match destination {
+        ProductDestination::Domain(domain) => Ok(outbound::ConnectorTarget::Domain(domain)),
+        ProductDestination::Resolved(resolved) => {
+            Ok(outbound::ConnectorTarget::Resolved(resolved.targets()))
+        }
+    }
+}
+
+async fn open_mpp_tcp_destination(
+    context: &ClientPathContext,
+    destination: &ProductDestination,
+    traffic_class: TrafficClass,
+    deadline: tokio::time::Instant,
+) -> Result<(OpenedRemoteStream, TargetAddr), RuntimeError> {
+    ensure_destination_network(destination, Network::Tcp)?;
+    match destination {
+        ProductDestination::Domain(domain) => {
+            let target = outbound::protocol_target_addr(domain.flow().target());
+            let remote =
+                open_mpp_tcp_target(context, target.clone(), traffic_class, deadline).await?;
+            Ok((remote, target))
+        }
+        ProductDestination::Resolved(resolved) => {
+            let mut last_error = None;
+            for authorized in resolved.targets() {
+                let target = authorized_literal_target(authorized, Network::Tcp)?;
+                match open_mpp_tcp_target(context, target.clone(), traffic_class, deadline).await {
+                    Ok(remote) => return Ok((remote, target)),
+                    Err(error) => last_error = Some(error),
+                }
+            }
+            Err(last_error.unwrap_or_else(|| {
+                RuntimeError::OutboundConnect(outbound::OutboundConnectError::NoAuthorizedAddresses)
+            }))
+        }
+    }
+}
+
+async fn open_mpp_tcp_target(
+    context: &ClientPathContext,
+    target: TargetAddr,
+    traffic_class: TrafficClass,
+    deadline: tokio::time::Instant,
+) -> Result<OpenedRemoteStream, RuntimeError> {
+    match tokio::time::timeout_at(deadline, open_remote_stream(context, target, traffic_class))
+        .await
+    {
+        Ok(result) => result,
+        Err(_) => Err(RuntimeError::OutboundConnect(
+            outbound::OutboundConnectError::ConnectTimeout,
+        )),
+    }
+}
+
+fn mpp_udp_target(destination: &ProductDestination) -> Result<TargetAddr, RuntimeError> {
+    ensure_destination_network(destination, Network::Udp)?;
+    match destination {
+        ProductDestination::Domain(domain) => {
+            Ok(outbound::protocol_target_addr(domain.flow().target()))
+        }
+        ProductDestination::Resolved(resolved) => {
+            let first = resolved
+                .targets()
+                .first()
+                .expect("validated resolved Product destination has an address");
+            authorized_literal_target(first, Network::Udp)
+        }
+    }
 }
 
 fn authorized_literal_target(
@@ -1504,6 +1655,15 @@ fn authorized_literal_target(
         authorized.address(),
         authorized.flow().target().port().get(),
     )))
+}
+
+fn map_destination_resolution_error(error: outbound::OutboundConnectError) -> RuntimeError {
+    match error {
+        outbound::OutboundConnectError::DestinationAuthorization(error) => {
+            RuntimeError::DestinationDenied(error.to_string())
+        }
+        error => RuntimeError::OutboundConnect(error),
+    }
 }
 
 fn ensure_before_deadline(deadline: tokio::time::Instant) -> Result<(), RuntimeError> {
@@ -1787,11 +1947,19 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn gateway_retries_a_failed_leaf_before_committing_the_flow() {
+    async fn gateway_domain_resolution_is_lazy_and_irreversible() {
         let rejecting_proxy = TcpListener::bind("127.0.0.1:0")
             .await
             .expect("rejecting proxy bind");
         let rejecting_proxy_addr = rejecting_proxy.local_addr().expect("proxy address");
+        let target = TcpListener::bind("127.0.0.1:0").await.expect("target bind");
+        let target_addr = target.local_addr().expect("target address");
+        let target_name = "fallback.example";
+        let domain_target = TargetAddr::Domain {
+            host: target_name.to_string(),
+            port: target_addr.port(),
+        };
+        let expected_proxy_target = domain_target.clone();
         let rejecting_proxy_task = tokio::spawn(async move {
             let (mut stream, _) = rejecting_proxy.accept().await.expect("proxy accept");
             let mut greeting = [0_u8; 3];
@@ -1800,13 +1968,20 @@ mod tests {
                 .await
                 .expect("proxy greeting");
             assert_eq!(greeting, crate::outbound::socks5::no_auth_greeting());
+            stream.write_all(&[0x05, 0x00]).await.expect("proxy method");
+            let expected = crate::outbound::socks5::connect_request(&expected_proxy_target)
+                .expect("expected SOCKS5 request");
+            let mut request = vec![0_u8; expected.len()];
             stream
-                .write_all(&[0x05, 0xff])
+                .read_exact(&mut request)
+                .await
+                .expect("proxy request");
+            assert_eq!(request, expected, "proxy must receive the canonical domain");
+            stream
+                .write_all(&[0x05, 0x05, 0x00, 0x01, 0, 0, 0, 0, 0, 0])
                 .await
                 .expect("proxy rejection");
         });
-        let target = TcpListener::bind("127.0.0.1:0").await.expect("target bind");
-        let target_addr = target.local_addr().expect("target address");
         let first = OutboundId::parse("failed-proxy").expect("outbound ID");
         let second = OutboundId::parse("working-direct").expect("outbound ID");
         let balancer_id = BalancerId::parse("native-failover").expect("balancer ID");
@@ -1821,6 +1996,10 @@ mod tests {
                 ],
             ),
         }];
+        let dns = DnsGeneration::from_test_answers(HashMap::from([(
+            target_name.to_string(),
+            vec![target_addr.ip()],
+        )]));
         let registry = RuntimeOutboundRegistry::compile(
             [
                 local_leaf(
@@ -1836,7 +2015,7 @@ mod tests {
                 local_leaf("working-direct", OutboundConfig::Direct),
             ],
             &balancers,
-            test_dns_generation(),
+            dns.clone(),
         )
         .expect("registry");
         let policy = crate::outbound::ServerDestinationPolicy::allow_restricted_for_test()
@@ -1844,7 +2023,7 @@ mod tests {
         let opened = registry
             .open_tcp(
                 &EgressSelection::Balancer(balancer_id),
-                &TargetAddr::Ip(target_addr),
+                &domain_target,
                 None,
                 TrafficClass::Latency,
                 &policy,
@@ -1883,6 +2062,121 @@ mod tests {
         );
         rejecting_proxy_task.await.expect("rejecting proxy task");
         target.accept().await.expect("direct target accepted");
+        let dns = dns.runtime_snapshot();
+        assert!(
+            dns.plans[0].queries > 0,
+            "failover to an IP-only leaf must request Product DNS evidence"
+        );
+        assert_eq!(
+            dns.plans[0].fresh_cache_hits, 0,
+            "the promoted destination must not be resolved a second time"
+        );
+
+        let closed_target = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("closed target reservation");
+        let closed_target_addr = closed_target.local_addr().expect("closed target address");
+        drop(closed_target);
+        let accepting_proxy = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("accepting proxy bind");
+        let accepting_proxy_addr = accepting_proxy.local_addr().expect("proxy address");
+        let promoted_name = "promoted.example";
+        let promoted_target = TargetAddr::Domain {
+            host: promoted_name.to_string(),
+            port: closed_target_addr.port(),
+        };
+        let expected_literal = TargetAddr::Ip(closed_target_addr);
+        let accepting_proxy_task = tokio::spawn(async move {
+            let (mut stream, _) = accepting_proxy.accept().await.expect("proxy accept");
+            let mut greeting = [0_u8; 3];
+            stream
+                .read_exact(&mut greeting)
+                .await
+                .expect("proxy greeting");
+            assert_eq!(greeting, crate::outbound::socks5::no_auth_greeting());
+            stream.write_all(&[0x05, 0x00]).await.expect("proxy method");
+            let expected = crate::outbound::socks5::connect_request(&expected_literal)
+                .expect("expected SOCKS5 request");
+            let mut request = vec![0_u8; expected.len()];
+            stream
+                .read_exact(&mut request)
+                .await
+                .expect("proxy request");
+            assert_eq!(
+                request, expected,
+                "a proxy attempted after an IP-only member must receive the authorized literal"
+            );
+            stream
+                .write_all(&[0x05, 0x00, 0x00, 0x01, 127, 0, 0, 1, 0, 0])
+                .await
+                .expect("proxy success");
+        });
+        let failed_direct = OutboundId::parse("failed-direct").expect("outbound ID");
+        let working_proxy = OutboundId::parse("working-proxy").expect("outbound ID");
+        let promoted_balancer = BalancerId::parse("promoted-failover").expect("balancer ID");
+        let promoted_balancers = [GatewayBalancerConfig {
+            id: promoted_balancer.clone(),
+            generation: 1,
+            spec: GatewayBalancerSpec::new(
+                GatewayStrategy::OrderedFailover,
+                vec![
+                    GatewayMemberSpec::new(failed_direct, 1, NetworkSet::TCP_UDP),
+                    GatewayMemberSpec::new(working_proxy, 1, NetworkSet::TCP_UDP),
+                ],
+            ),
+        }];
+        let promoted_dns = DnsGeneration::from_test_answers(HashMap::from([(
+            promoted_name.to_string(),
+            vec![closed_target_addr.ip()],
+        )]));
+        let promoted_registry = RuntimeOutboundRegistry::compile(
+            [
+                local_leaf("failed-direct", OutboundConfig::Direct),
+                local_leaf(
+                    "working-proxy",
+                    OutboundConfig::Socks5(ProxyConfig::new(
+                        accepting_proxy_addr
+                            .to_string()
+                            .parse()
+                            .expect("proxy endpoint"),
+                        None,
+                    )),
+                ),
+            ],
+            &promoted_balancers,
+            promoted_dns.clone(),
+        )
+        .expect("promoted registry");
+        let opened = promoted_registry
+            .open_tcp(
+                &EgressSelection::Balancer(promoted_balancer),
+                &promoted_target,
+                None,
+                TrafficClass::Latency,
+                &policy,
+            )
+            .await
+            .expect("IP-only failure followed by proxy fallback");
+        let OpenedTcpOutbound::Local {
+            _gateway_lease: Some(_),
+            _product_flow,
+            ..
+        } = opened
+        else {
+            panic!("balancer failover must return the working proxy member");
+        };
+        assert_eq!(
+            _product_flow.scope().selection.outbound.as_str(),
+            "working-proxy"
+        );
+        accepting_proxy_task.await.expect("accepting proxy task");
+        let promoted_dns = promoted_dns.runtime_snapshot();
+        assert!(promoted_dns.plans[0].queries > 0);
+        assert_eq!(
+            promoted_dns.plans[0].fresh_cache_hits, 0,
+            "an already promoted destination must never be resolved again or revert to its domain"
+        );
     }
 
     #[test]

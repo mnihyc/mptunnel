@@ -317,9 +317,11 @@ auth_freshness_window_seconds = 300
 [routing]
 generation = 1
 
-# Destination authorization is independent from route selection and runs both
-# before and after resolution. Restricted address space is denied unless an
-# explicit matching rule uses `allow-restricted`.
+# Destination policy is independent from route selection and runs before and,
+# when this node has or requires IP evidence, after resolution. Restricted
+# address space is denied unless an explicit matching rule uses
+# `allow-restricted`. Domain-capable outbounds otherwise delegate resolution to
+# the configured upstream trust boundary.
 # [routing.destination_acl]
 #
 # [[routing.destination_acl.rules]]
@@ -420,8 +422,10 @@ explanation = "route local proxy traffic through the primary MPP outbound"
 # authentication_timeout_ms = 5000
 # max_pending_authentications = 1024
 #
-# Server-side destination authorization is scoped to this MPP inbound and
-# defaults to denying restricted address space.
+# Server-side destination policy is scoped to this MPP inbound. Restricted
+# addresses are denied whenever this node has IP evidence. A domain delegated
+# unchanged to a proxy is resolved by that trusted upstream; add an applicable
+# IP or post-resolution rule when this node must enforce addresses first.
 # [inbounds.destination_acl]
 # generation = 1
 #
@@ -432,12 +436,20 @@ explanation = "route local proxy traffic through the primary MPP outbound"
 # destination_ports = [443, "8000-8999"]
 # networks = ["tcp", "udp"]
 # stages = ["pre-resolution", "post-resolution"]
+#
+# Force address evidence for otherwise unrestricted public targets:
+# [[inbounds.destination_acl.rules]]
+# name = "require-address-evidence"
+# effect = "allow"
+# stages = ["post-resolution"]
 
 # Server egress leaves
 #
-# Direct egress uses the DNS plan selected globally or by the accepting MPP
-# inbound. Omit bind_ip to let the OS select a source address; set it to bind
-# all target and selected DNS connections to one local source IP.
+# Direct egress needs an IP target and obtains domain addresses through the DNS
+# plan selected by the route or accepting MPP inbound. That plan may use a
+# system, direct, or routed remote resolver upstream. Omit bind_ip to let the
+# OS select a source address; set it to bind all target and selected DNS
+# connections to one local source IP.
 # [[outbounds]]
 # name = "direct-egress"
 # protocol = "direct"
@@ -445,8 +457,10 @@ explanation = "route local proxy traffic through the primary MPP outbound"
 # connect_timeout_ms = 10000
 #
 # Relay through SOCKS5. TCP CONNECT and UDP ASSOCIATE are supported when the
-# upstream implements them. MPTUNNEL resolves domains through the selected DNS
-# plan and sends the authorized IP target to the proxy.
+# upstream implements them. A canonical domain is normally carried to the
+# proxy for upstream resolution. Routing or destination policy that needs IP
+# evidence first resolves through the selected DNS plan and carries the
+# authorized literal instead.
 # [[outbounds]]
 # name = "socks5-egress"
 # protocol = "socks5"
@@ -458,8 +472,8 @@ explanation = "route local proxy traffic through the primary MPP outbound"
 # password = { from = "file", path = "upstream-proxy-password.key" }
 #
 # Plain HTTP CONNECT carries TCP targets and supports the same referenced
-# authentication table. MPTUNNEL resolves and authorizes the IP target before
-# opening the proxy tunnel.
+# authentication table. It preserves a canonical domain unless routing or
+# destination policy requires authorized IP evidence.
 # [[outbounds]]
 # name = "http-egress"
 # protocol = "http-connect"

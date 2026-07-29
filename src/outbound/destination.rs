@@ -1,6 +1,6 @@
 use crate::product::{
-    AclError, AuthorizedTarget, DestinationAcl, FlowContext, FlowError, InboundId, Network,
-    PreResolutionApproval, PrincipalId, ProtocolTarget, SourceEndpoint,
+    AclError, AuthorizedDomainTarget, AuthorizedTarget, DestinationAcl, FlowContext, FlowError,
+    InboundId, Network, PreResolutionDecision, PrincipalId, ProtocolTarget, SourceEndpoint,
 };
 use crate::protocol::TargetAddr;
 use std::net::{IpAddr, Ipv4Addr};
@@ -26,7 +26,7 @@ pub struct ServerPrincipalDestinationPolicy {
 
 /// Flow-scoped authorization seam used by every native connector. Implementors
 /// create the normalized Product flow, while this shared implementation binds
-/// pre-resolution approval, the complete DNS answer, and the literal addresses
+/// pre-resolution decision, the complete DNS answer, and the literal addresses
 /// handed to the connector.
 pub trait DestinationAuthorizer: Send + Sync {
     fn destination_acl(&self) -> &DestinationAcl;
@@ -34,8 +34,8 @@ pub trait DestinationAuthorizer: Send + Sync {
     fn flow(
         &self,
         network: Network,
-        target: &TargetAddr,
-    ) -> Result<FlowContext, DestinationAuthorizationError>;
+        target: &ProtocolTarget,
+    ) -> Result<Arc<FlowContext>, DestinationAuthorizationError>;
 
     fn begin(
         &self,
@@ -43,18 +43,23 @@ pub trait DestinationAuthorizer: Send + Sync {
         target: &TargetAddr,
     ) -> Result<DestinationAuthorization, DestinationAuthorizationError> {
         let normalized_target = protocol_target(target)?;
+        self.begin_target(network, &normalized_target)
+    }
+
+    fn begin_target(
+        &self,
+        network: Network,
+        target: &ProtocolTarget,
+    ) -> Result<DestinationAuthorization, DestinationAuthorizationError> {
         let flow = self.flow(network, target)?;
-        if flow.network() != network || flow.target() != &normalized_target {
+        if flow.network() != network || flow.target() != target {
             return Err(DestinationAuthorizationError::TargetChanged);
         }
-        let approval = self
+        let decision = self
             .destination_acl()
-            .authorize_pre_resolution(flow)
+            .evaluate_pre_resolution_shared(flow)
             .map_err(DestinationAuthorizationError::Acl)?;
-        Ok(DestinationAuthorization {
-            target: normalized_target,
-            approval,
-        })
+        Ok(DestinationAuthorization { decision })
     }
 
     fn authorize_addresses(
@@ -63,6 +68,36 @@ pub trait DestinationAuthorizer: Send + Sync {
         addresses: &[IpAddr],
     ) -> Result<Vec<AuthorizedTarget>, DestinationAuthorizationError> {
         authorize_addresses(self.destination_acl(), authorization, addresses)
+    }
+
+    fn authorize_domain(
+        &self,
+        authorization: DestinationAuthorization,
+    ) -> Result<AuthorizedDomainTarget, DestinationAuthorizationError> {
+        self.destination_acl()
+            .authorize_domain(authorization.decision)
+            .map_err(DestinationAuthorizationError::Acl)
+    }
+
+    fn authorize_domain_addresses(
+        &self,
+        domain: &AuthorizedDomainTarget,
+        addresses: &[IpAddr],
+    ) -> Result<Vec<AuthorizedTarget>, DestinationAuthorizationError> {
+        let resolution = self
+            .destination_acl()
+            .authorize_domain_resolution(domain, addresses)
+            .map_err(DestinationAuthorizationError::Acl)?;
+        resolution
+            .addresses()
+            .iter()
+            .copied()
+            .map(|address| {
+                resolution
+                    .authorize_connect(domain.flow().target(), address)
+                    .map_err(DestinationAuthorizationError::Acl)
+            })
+            .collect()
     }
 }
 
@@ -119,9 +154,10 @@ impl ServerDestinationPolicy {
 }
 
 impl ServerPrincipalDestinationPolicy {
-    /// Cheap pre-resolution admission. Connectors repeat this check so a
-    /// caller cannot bypass the post-resolution proof by skipping admission.
-    pub fn authorize_pre(
+    /// Cheap pre-resolution policy evaluation. Stable denials fail here;
+    /// decisions requiring address evidence continue to the final connector,
+    /// which performs the mandatory post-resolution check.
+    pub fn evaluate_pre(
         &self,
         network: Network,
         target: &TargetAddr,
@@ -138,15 +174,15 @@ impl DestinationAuthorizer for ServerPrincipalDestinationPolicy {
     fn flow(
         &self,
         network: Network,
-        target: &TargetAddr,
-    ) -> Result<FlowContext, DestinationAuthorizationError> {
-        Ok(FlowContext::new(
+        target: &ProtocolTarget,
+    ) -> Result<Arc<FlowContext>, DestinationAuthorizationError> {
+        Ok(Arc::new(FlowContext::new(
             network,
-            protocol_target(target)?,
+            target.clone(),
             SourceEndpoint::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), 0),
             self.principal.clone(),
             self.inbound.clone(),
-        ))
+        )))
     }
 }
 
@@ -156,7 +192,7 @@ fn authorize_addresses(
     addresses: &[IpAddr],
 ) -> Result<Vec<AuthorizedTarget>, DestinationAuthorizationError> {
     let resolution = acl
-        .authorize_resolution(authorization.approval, addresses)
+        .authorize_resolution(authorization.decision, addresses)
         .map_err(DestinationAuthorizationError::Acl)?;
     resolution
         .addresses()
@@ -164,15 +200,29 @@ fn authorize_addresses(
         .copied()
         .map(|address| {
             resolution
-                .authorize_connect(&authorization.target, address)
+                .authorize_connect(resolution.flow().target(), address)
                 .map_err(DestinationAuthorizationError::Acl)
         })
         .collect()
 }
 
+#[derive(Clone)]
 pub struct DestinationAuthorization {
-    target: ProtocolTarget,
-    approval: PreResolutionApproval,
+    decision: PreResolutionDecision,
+}
+
+impl DestinationAuthorization {
+    pub(crate) fn flow(&self) -> &FlowContext {
+        self.decision.flow()
+    }
+
+    pub(crate) fn target(&self) -> &ProtocolTarget {
+        self.decision.flow().target()
+    }
+
+    pub(crate) const fn requires_post_resolution(&self) -> bool {
+        self.decision.requires_post_resolution()
+    }
 }
 
 fn protocol_target(target: &TargetAddr) -> Result<ProtocolTarget, DestinationAuthorizationError> {
@@ -181,6 +231,20 @@ fn protocol_target(target: &TargetAddr) -> Result<ProtocolTarget, DestinationAut
         TargetAddr::Ip(address) => ProtocolTarget::from_ip(address.ip(), address.port()),
     }
     .map_err(DestinationAuthorizationError::Target)
+}
+
+pub(crate) fn protocol_target_addr(target: &ProtocolTarget) -> TargetAddr {
+    match target.ip() {
+        Some(address) => TargetAddr::Ip(std::net::SocketAddr::new(address, target.port().get())),
+        None => TargetAddr::Domain {
+            host: target
+                .domain()
+                .expect("non-IP Product target has a domain")
+                .as_str()
+                .to_string(),
+            port: target.port().get(),
+        },
+    }
 }
 
 #[derive(Debug)]

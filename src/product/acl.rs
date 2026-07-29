@@ -6,6 +6,7 @@ use std::collections::HashSet;
 use std::error::Error;
 use std::fmt;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
+use std::sync::Arc;
 
 const MAX_ACL_RULES: usize = 4_096;
 const MAX_RESOLUTION_ADDRESSES: usize = 64;
@@ -95,6 +96,31 @@ impl DestinationAcl {
         self.generation
     }
 
+    /// Return whether an explicit ACL rule can change the pre-resolution
+    /// verdict once a domain has address evidence.
+    ///
+    /// This is deliberately about configured first-match rules. The built-in
+    /// restricted-address guard is always applied when MPTUNNEL owns a native
+    /// connection or otherwise resolves a target. A configured proxy that
+    /// receives an unresolved domain is the resolution trust boundary, so it
+    /// does not trigger a query through the selected DNS plan by itself.
+    pub fn requires_post_resolution(&self, flow: &FlowContext) -> bool {
+        if let Some(address) = flow.target().ip() {
+            let pre_input = RouteInput::pre_resolution(flow);
+            let selected = self
+                .rules
+                .iter()
+                .position(|rule| rule.matcher.matches(pre_input));
+            let post_input = RouteInput::post_resolution(flow, address);
+            let post_selected = self
+                .rules
+                .iter()
+                .position(|rule| rule.matcher.matches(post_input));
+            return post_selected != selected;
+        }
+        self.pre_resolution_verdict_and_demand(flow).1
+    }
+
     /// Evaluate without allocating. This is suitable for route explanation and
     /// dry-run tooling.
     pub fn evaluate<'a>(&'a self, input: RouteInput<'_>) -> AclVerdict<'a> {
@@ -126,14 +152,26 @@ impl DestinationAcl {
     }
 
     /// Bind one immutable normalized flow to this ACL generation before DNS.
-    pub fn authorize_pre_resolution(
+    pub fn evaluate_pre_resolution(
         &self,
         flow: FlowContext,
-    ) -> Result<PreResolutionApproval, AclError> {
-        verdict_to_result(self.evaluate(RouteInput::pre_resolution(&flow)))?;
-        Ok(PreResolutionApproval {
+    ) -> Result<PreResolutionDecision, AclError> {
+        self.evaluate_pre_resolution_shared(Arc::new(flow))
+    }
+
+    pub(crate) fn evaluate_pre_resolution_shared(
+        &self,
+        flow: Arc<FlowContext>,
+    ) -> Result<PreResolutionDecision, AclError> {
+        let (verdict, requires_post_resolution) =
+            self.pre_resolution_verdict_and_demand(flow.as_ref());
+        if !requires_post_resolution {
+            verdict_to_result(verdict)?;
+        }
+        Ok(PreResolutionDecision {
             acl_generation: self.generation,
             flow,
+            requires_post_resolution,
         })
     }
 
@@ -142,12 +180,12 @@ impl DestinationAcl {
     /// fallback.
     pub fn authorize_resolution(
         &self,
-        approval: PreResolutionApproval,
+        decision: PreResolutionDecision,
         addresses: &[IpAddr],
     ) -> Result<AuthorizedResolution, AclError> {
-        if approval.acl_generation != self.generation {
+        if decision.acl_generation != self.generation {
             return Err(AclError::GenerationMismatch {
-                approved: approval.acl_generation,
+                evaluated: decision.acl_generation,
                 current: self.generation,
             });
         }
@@ -161,13 +199,13 @@ impl DestinationAcl {
             });
         }
 
-        let literal = approval.flow.target().ip();
+        let literal = decision.flow.target().ip();
         let mut canonical = Vec::with_capacity(addresses.len());
         for address in addresses.iter().copied().map(canonical_ip) {
             if literal.is_some_and(|literal| literal != address) {
                 return Err(AclError::TargetChanged);
             }
-            verdict_to_result(self.evaluate(RouteInput::post_resolution(&approval.flow, address)))?;
+            verdict_to_result(self.evaluate(RouteInput::post_resolution(&decision.flow, address)))?;
             if !canonical.contains(&address) {
                 canonical.push(address);
             }
@@ -175,21 +213,100 @@ impl DestinationAcl {
 
         Ok(AuthorizedResolution {
             acl_generation: self.generation,
-            flow: approval.flow,
+            flow: decision.flow,
             addresses: canonical,
         })
     }
 
     pub fn authorize_literal(
         &self,
-        approval: PreResolutionApproval,
+        decision: PreResolutionDecision,
     ) -> Result<AuthorizedResolution, AclError> {
-        let address = approval
+        let address = decision
             .flow
             .target()
             .ip()
             .ok_or(AclError::ExpectedLiteralIp)?;
-        self.authorize_resolution(approval, &[address])
+        self.authorize_resolution(decision, &[address])
+    }
+
+    /// Authorize delegation of the canonical domain to a configured
+    /// domain-capable outbound. Explicit post-resolution ACL dependencies must
+    /// be resolved through the selected DNS plan and therefore cannot produce
+    /// this proof.
+    pub fn authorize_domain(
+        &self,
+        decision: PreResolutionDecision,
+    ) -> Result<AuthorizedDomainTarget, AclError> {
+        if decision.acl_generation != self.generation {
+            return Err(AclError::GenerationMismatch {
+                evaluated: decision.acl_generation,
+                current: self.generation,
+            });
+        }
+        if decision.flow.target().domain().is_none() {
+            return Err(AclError::ExpectedDomain);
+        }
+        if decision.requires_post_resolution {
+            return Err(AclError::PostResolutionRequired);
+        }
+        Ok(AuthorizedDomainTarget { decision })
+    }
+
+    /// Promote a delegated-domain proof to exact address proofs when a later
+    /// IP-only leaf requires address evidence from the selected DNS plan.
+    pub fn authorize_domain_resolution(
+        &self,
+        domain: &AuthorizedDomainTarget,
+        addresses: &[IpAddr],
+    ) -> Result<AuthorizedResolution, AclError> {
+        self.authorize_resolution(domain.decision.clone(), addresses)
+    }
+
+    fn pre_resolution_verdict_and_demand<'a>(
+        &'a self,
+        flow: &FlowContext,
+    ) -> (AclVerdict<'a>, bool) {
+        if let Some(address) = flow.target().ip() {
+            let pre_input = RouteInput::pre_resolution(flow);
+            let post_input = RouteInput::post_resolution(flow, address);
+            let pre_selected = self
+                .rules
+                .iter()
+                .position(|rule| rule.matcher.matches(pre_input));
+            let post_selected = self
+                .rules
+                .iter()
+                .position(|rule| rule.matcher.matches(post_input));
+            return (self.evaluate(pre_input), pre_selected != post_selected);
+        }
+
+        let input = RouteInput::pre_resolution(flow);
+        let mut earlier_post_candidate = false;
+        for rule in &self.rules {
+            if rule.matcher.matches(input) {
+                let verdict = if rule.effect == AclEffect::Deny {
+                    AclVerdict::DeniedByRule { rule_id: &rule.id }
+                } else {
+                    AclVerdict::Allowed {
+                        rule_id: Some(&rule.id),
+                        restricted_override: false,
+                    }
+                };
+                return (
+                    verdict,
+                    earlier_post_candidate || !rule.matcher.could_match_post_resolution(flow),
+                );
+            }
+            earlier_post_candidate |= rule.matcher.could_match_post_resolution(flow);
+        }
+        (
+            AclVerdict::Allowed {
+                rule_id: None,
+                restricted_override: false,
+            },
+            earlier_post_candidate,
+        )
     }
 }
 
@@ -208,29 +325,54 @@ pub enum AclVerdict<'a> {
     },
 }
 
-/// Proof that the immutable flow passed the pre-resolution policy generation.
-/// Its fields are private so it cannot be forged by an ingress.
-#[derive(Debug)]
-pub struct PreResolutionApproval {
+/// Unforgeable pre-resolution policy decision for one immutable flow.
+///
+/// Stable denials are returned as errors. A decision may instead require
+/// post-resolution evidence before it can authorize either a domain or exact
+/// addresses.
+#[derive(Debug, Clone)]
+pub struct PreResolutionDecision {
     acl_generation: u64,
-    flow: FlowContext,
+    flow: Arc<FlowContext>,
+    requires_post_resolution: bool,
 }
 
-impl PreResolutionApproval {
+/// Unforgeable proof that one normalized domain may cross a configured
+/// domain-capable outbound without target resolution at this node.
+#[derive(Debug, Clone)]
+pub struct AuthorizedDomainTarget {
+    decision: PreResolutionDecision,
+}
+
+impl AuthorizedDomainTarget {
+    pub const fn acl_generation(&self) -> u64 {
+        self.decision.acl_generation()
+    }
+
+    pub fn flow(&self) -> &FlowContext {
+        self.decision.flow()
+    }
+}
+
+impl PreResolutionDecision {
     pub const fn acl_generation(&self) -> u64 {
         self.acl_generation
     }
 
-    pub const fn flow(&self) -> &FlowContext {
-        &self.flow
+    pub fn flow(&self) -> &FlowContext {
+        self.flow.as_ref()
+    }
+
+    pub const fn requires_post_resolution(&self) -> bool {
+        self.requires_post_resolution
     }
 }
 
-/// Exact normalized addresses approved for one immutable DNS result.
+/// Exact normalized addresses authorized for one immutable DNS result.
 #[derive(Debug)]
 pub struct AuthorizedResolution {
     acl_generation: u64,
-    flow: FlowContext,
+    flow: Arc<FlowContext>,
     addresses: Vec<IpAddr>,
 }
 
@@ -239,8 +381,8 @@ impl AuthorizedResolution {
         self.acl_generation
     }
 
-    pub const fn flow(&self) -> &FlowContext {
-        &self.flow
+    pub fn flow(&self) -> &FlowContext {
+        self.flow.as_ref()
     }
 
     pub fn addresses(&self) -> &[IpAddr] {
@@ -273,7 +415,7 @@ impl AuthorizedResolution {
 #[derive(Debug, Clone)]
 pub struct AuthorizedTarget {
     acl_generation: u64,
-    flow: FlowContext,
+    flow: Arc<FlowContext>,
     address: IpAddr,
 }
 
@@ -282,8 +424,8 @@ impl AuthorizedTarget {
         self.acl_generation
     }
 
-    pub const fn flow(&self) -> &FlowContext {
-        &self.flow
+    pub fn flow(&self) -> &FlowContext {
+        self.flow.as_ref()
     }
 
     pub const fn address(&self) -> IpAddr {
@@ -336,7 +478,7 @@ pub enum AclError {
         maximum: usize,
     },
     GenerationMismatch {
-        approved: u64,
+        evaluated: u64,
         current: u64,
     },
     TargetChanged,
@@ -344,6 +486,8 @@ pub enum AclError {
         address: IpAddr,
     },
     ExpectedLiteralIp,
+    ExpectedDomain,
+    PostResolutionRequired,
 }
 
 impl fmt::Display for AclError {
@@ -376,12 +520,12 @@ impl fmt::Display for AclError {
                 formatter,
                 "DNS resolution returned {count} addresses; maximum is {maximum}"
             ),
-            Self::GenerationMismatch { approved, current } => write!(
+            Self::GenerationMismatch { evaluated, current } => write!(
                 formatter,
-                "destination approval generation {approved} does not match ACL generation {current}"
+                "destination decision generation {evaluated} does not match ACL generation {current}"
             ),
             Self::TargetChanged => {
-                formatter.write_str("destination changed after pre-resolution authorization")
+                formatter.write_str("destination changed after the pre-resolution decision")
             }
             Self::DnsRebinding { address } => {
                 write!(
@@ -391,6 +535,12 @@ impl fmt::Display for AclError {
             }
             Self::ExpectedLiteralIp => {
                 formatter.write_str("literal authorization requires an IP target")
+            }
+            Self::ExpectedDomain => {
+                formatter.write_str("domain delegation authorization requires a domain target")
+            }
+            Self::PostResolutionRequired => {
+                formatter.write_str("destination ACL requires post-resolution authorization")
             }
         }
     }
@@ -501,10 +651,10 @@ mod tests {
     fn safe_default_allows_public_ipv4_and_ipv6() {
         let acl = DestinationAcl::safe_default(1);
         for address in ["8.8.8.8", "2606:4700:4700::1111"] {
-            let approval = acl
-                .authorize_pre_resolution(ip_flow(address))
+            let decision = acl
+                .evaluate_pre_resolution(ip_flow(address))
                 .expect("public pre-check");
-            let authorized = acl.authorize_literal(approval).expect("public post-check");
+            let authorized = acl.authorize_literal(decision).expect("public post-check");
             assert_eq!(
                 authorized.addresses(),
                 &[address.parse::<IpAddr>().expect("address")]
@@ -532,7 +682,7 @@ mod tests {
         let acl = DestinationAcl::safe_default(1);
         for (address, expected_class) in cases {
             let error = acl
-                .authorize_pre_resolution(ip_flow(address))
+                .evaluate_pre_resolution(ip_flow(address))
                 .expect_err("restricted address");
             assert!(matches!(
                 error,
@@ -545,7 +695,7 @@ mod tests {
     fn ipv4_mapped_ipv6_cannot_bypass_ipv4_policy() {
         let acl = DestinationAcl::safe_default(1);
         let error = acl
-            .authorize_pre_resolution(ip_flow("::ffff:127.0.0.1"))
+            .evaluate_pre_resolution(ip_flow("::ffff:127.0.0.1"))
             .expect_err("mapped loopback");
         assert!(matches!(
             error,
@@ -574,12 +724,12 @@ mod tests {
         )
         .expect("ACL");
         let flow = domain_flow("router.home.arpa");
-        let approval = ordinary_allow
-            .authorize_pre_resolution(flow)
+        let decision = ordinary_allow
+            .evaluate_pre_resolution(flow)
             .expect("domain pre-check");
         assert!(matches!(
             ordinary_allow
-                .authorize_resolution(approval, &["192.168.1.1".parse().expect("address")]),
+                .authorize_resolution(decision, &["192.168.1.1".parse().expect("address")]),
             Err(AclError::RestrictedAddress { .. })
         ));
 
@@ -592,11 +742,11 @@ mod tests {
             )],
         )
         .expect("ACL");
-        let approval = override_acl
-            .authorize_pre_resolution(domain_flow("router.home.arpa"))
+        let decision = override_acl
+            .evaluate_pre_resolution(domain_flow("router.home.arpa"))
             .expect("pre-check");
         let authorized = override_acl
-            .authorize_resolution(approval, &["192.168.1.1".parse().expect("address")])
+            .authorize_resolution(decision, &["192.168.1.1".parse().expect("address")])
             .expect("explicit override");
         assert_eq!(
             authorized.addresses(),
@@ -619,11 +769,11 @@ mod tests {
             )],
         )
         .expect("ACL");
-        let approval = acl
-            .authorize_pre_resolution(domain_flow("router.home"))
+        let decision = acl
+            .evaluate_pre_resolution(domain_flow("router.home"))
             .expect("pre-check");
         assert!(matches!(
-            acl.authorize_resolution(approval, &["192.168.1.2".parse().expect("address")]),
+            acl.authorize_resolution(decision, &["192.168.1.2".parse().expect("address")]),
             Err(AclError::RestrictedAddress { .. })
         ));
     }
@@ -653,16 +803,16 @@ mod tests {
         )
         .expect("ACL");
         assert!(matches!(
-            acl.authorize_pre_resolution(domain_flow("api.blocked.example")),
+            acl.evaluate_pre_resolution(domain_flow("api.blocked.example")),
             Err(AclError::DeniedByRule { rule_id }) if rule_id.as_str() == "blocked-domain"
         ));
 
-        let approval = acl
-            .authorize_pre_resolution(domain_flow("allowed.example"))
+        let decision = acl
+            .evaluate_pre_resolution(domain_flow("allowed.example"))
             .expect("pre-check");
         assert!(matches!(
             acl.authorize_resolution(
-                approval,
+                decision,
                 &["203.0.113.12".parse().expect("address")]
             ),
             Err(AclError::DeniedByRule { rule_id }) if rule_id.as_str() == "blocked-range"
@@ -670,14 +820,121 @@ mod tests {
     }
 
     #[test]
+    fn explicit_first_match_policy_controls_domain_delegation() {
+        let current = domain_flow("service.example");
+        let safe = DestinationAcl::safe_default(5);
+        assert!(!safe.requires_post_resolution(&current));
+        let decision = safe
+            .evaluate_pre_resolution(current.clone())
+            .expect("pre-resolution decision");
+        let delegated = safe.authorize_domain(decision).expect("domain proof");
+        assert_eq!(delegated.flow(), &current);
+
+        let address_first = DestinationAcl::compile(
+            6,
+            vec![
+                AclRuleSpec::new(
+                    id("blocked-address"),
+                    RouteMatchSpec {
+                        destination_cidrs: vec!["203.0.113.0/24".parse().expect("CIDR")],
+                        ..RouteMatchSpec::default()
+                    },
+                    AclEffect::Deny,
+                ),
+                AclRuleSpec::new(
+                    id("domain"),
+                    RouteMatchSpec {
+                        domain_exact: vec![DomainName::parse("service.example").expect("domain")],
+                        ..RouteMatchSpec::default()
+                    },
+                    AclEffect::Allow,
+                ),
+            ],
+        )
+        .expect("address-first ACL");
+        assert!(address_first.requires_post_resolution(&current));
+        let decision = address_first
+            .evaluate_pre_resolution(current.clone())
+            .expect("pre-resolution decision");
+        assert!(matches!(
+            address_first.authorize_domain(decision),
+            Err(AclError::PostResolutionRequired)
+        ));
+
+        let domain_first = DestinationAcl::compile(
+            7,
+            vec![
+                AclRuleSpec::new(
+                    id("domain"),
+                    RouteMatchSpec {
+                        domain_exact: vec![DomainName::parse("service.example").expect("domain")],
+                        ..RouteMatchSpec::default()
+                    },
+                    AclEffect::Allow,
+                ),
+                AclRuleSpec::new(
+                    id("blocked-address"),
+                    RouteMatchSpec {
+                        destination_cidrs: vec!["203.0.113.0/24".parse().expect("CIDR")],
+                        ..RouteMatchSpec::default()
+                    },
+                    AclEffect::Deny,
+                ),
+            ],
+        )
+        .expect("domain-first ACL");
+        assert!(!domain_first.requires_post_resolution(&current));
+
+        let address_allowlist = DestinationAcl::compile(
+            8,
+            vec![
+                AclRuleSpec::new(
+                    id("allowed-address"),
+                    RouteMatchSpec {
+                        destination_cidrs: vec!["203.0.113.0/24".parse().expect("CIDR")],
+                        ..RouteMatchSpec::default()
+                    },
+                    AclEffect::Allow,
+                ),
+                AclRuleSpec::new(
+                    id("default-deny"),
+                    RouteMatchSpec::default(),
+                    AclEffect::Deny,
+                ),
+            ],
+        )
+        .expect("address allowlist ACL");
+        let decision = address_allowlist
+            .evaluate_pre_resolution(current.clone())
+            .expect("default denial is provisional while an earlier address rule can match");
+        assert!(decision.requires_post_resolution());
+        assert!(matches!(
+            address_allowlist.authorize_domain(decision.clone()),
+            Err(AclError::PostResolutionRequired)
+        ));
+        assert_eq!(
+            address_allowlist
+                .authorize_resolution(
+                    decision,
+                    &["203.0.113.9".parse().expect("allowlisted address")],
+                )
+                .expect("post-resolution allowlist authorization")
+                .addresses(),
+            &["203.0.113.9"
+                .parse::<IpAddr>()
+                .expect("allowlisted address")]
+        );
+    }
+
+    #[test]
     fn all_dns_answers_must_pass_policy() {
         let acl = DestinationAcl::safe_default(5);
-        let approval = acl
-            .authorize_pre_resolution(domain_flow("mixed.example"))
+        let decision = acl
+            .evaluate_pre_resolution(domain_flow("mixed.example"))
             .expect("pre-check");
         assert!(matches!(
             acl.authorize_resolution(
-                approval,
+                decision,
                 &[
                     "203.0.113.5".parse().expect("public"),
                     "127.0.0.1".parse().expect("loopback")
@@ -694,12 +951,12 @@ mod tests {
     fn authorized_resolution_preserves_preference_order_deduplicates_and_binds() {
         let acl = DestinationAcl::safe_default(6);
         let original = domain_flow("service.example");
-        let approval = acl
-            .authorize_pre_resolution(original.clone())
+        let decision = acl
+            .evaluate_pre_resolution(original.clone())
             .expect("pre-check");
         let resolution = acl
             .authorize_resolution(
-                approval,
+                decision,
                 &[
                     "203.0.113.9".parse().expect("address"),
                     "2001:db8::9".parse().expect("address"),
@@ -726,11 +983,11 @@ mod tests {
     fn post_dns_rebinding_and_target_substitution_are_rejected() {
         let acl = DestinationAcl::safe_default(7);
         let original = domain_flow("service.example");
-        let approval = acl
-            .authorize_pre_resolution(original.clone())
+        let decision = acl
+            .evaluate_pre_resolution(original.clone())
             .expect("pre-check");
         let resolution = acl
-            .authorize_resolution(approval, &["203.0.113.9".parse().expect("address")])
+            .authorize_resolution(decision, &["203.0.113.9".parse().expect("address")])
             .expect("resolution");
         assert!(matches!(
             resolution
@@ -746,16 +1003,16 @@ mod tests {
     }
 
     #[test]
-    fn pre_approval_cannot_cross_acl_generation() {
+    fn pre_resolution_decision_cannot_cross_acl_generation() {
         let old = DestinationAcl::safe_default(8);
         let new = DestinationAcl::safe_default(9);
-        let approval = old
-            .authorize_pre_resolution(domain_flow("service.example"))
+        let decision = old
+            .evaluate_pre_resolution(domain_flow("service.example"))
             .expect("pre-check");
         assert!(matches!(
-            new.authorize_resolution(approval, &["203.0.113.9".parse().expect("address")]),
+            new.authorize_resolution(decision, &["203.0.113.9".parse().expect("address")]),
             Err(AclError::GenerationMismatch {
-                approved: 8,
+                evaluated: 8,
                 current: 9
             })
         ));

@@ -1,10 +1,10 @@
 use super::{
-    destination::{DestinationAuthorizationError, DestinationAuthorizer},
+    destination::{DestinationAuthorization, DestinationAuthorizationError, DestinationAuthorizer},
     http_connect, socks5,
 };
 use crate::dns::{DnsGeneration, DnsRuntimeError};
 use crate::ingress::socks5 as socks5_udp;
-use crate::product::{AuthorizedTarget, DnsPlanId, Network};
+use crate::product::{AuthorizedDomainTarget, AuthorizedTarget, DnsPlanId, Network};
 use crate::protocol::TargetAddr;
 use crate::transport::Endpoint;
 use crate::transport::tcp::{self, TcpConnectOptions, TcpTransportError};
@@ -198,6 +198,15 @@ impl OutboundConfig {
         }
     }
 
+    /// Native target sockets need an IP target. Proxy protocols can carry a
+    /// domain in their own request and delegate target resolution upstream.
+    ///
+    /// Resolution for an IP-only leaf uses the selected Product DNS plan; its
+    /// upstream transport may be system, direct, or routed.
+    pub const fn requires_ip_target(&self) -> bool {
+        matches!(self, Self::Direct | Self::BindSourceIp(_))
+    }
+
     /// Returns the process-owned native proxy control endpoint, when this leaf
     /// uses one. Runtime lifecycle code can pre-resolve this inventory before
     /// publishing full-tunnel policy; target endpoints remain flow-scoped.
@@ -296,6 +305,11 @@ enum DnsResolutionContext<'a> {
     LiteralOnly,
 }
 
+pub(crate) enum ConnectorTarget<'a> {
+    Domain(&'a AuthorizedDomainTarget),
+    Resolved(&'a [AuthorizedTarget]),
+}
+
 impl DnsResolutionContext<'_> {
     async fn resolve_socket_addrs(
         &self,
@@ -348,43 +362,84 @@ pub async fn connect_tcp_with_configurator(
     config.ensure_supports(TargetProtocol::Tcp)?;
     validate_target(target)?;
     let deadline = tokio::time::Instant::now() + timeout;
-    let authorized = resolve_authorized_target_before(
-        dns,
-        dns_plan,
-        destination_policy,
-        Network::Tcp,
-        target,
-        deadline,
-    )
-    .await?;
-    connect_tcp_authorized_with_configurator(
-        config,
-        dns,
-        dns_plan,
-        &authorized,
-        deadline,
-        configurator,
-    )
-    .await
+    let authorization = destination_policy.begin(Network::Tcp, target)?;
+    if authorization.target().ip().is_some()
+        || config.requires_ip_target()
+        || authorization.requires_post_resolution()
+    {
+        let authorized = resolve_authorization_before(
+            dns,
+            dns_plan,
+            destination_policy,
+            authorization,
+            deadline,
+        )
+        .await?;
+        connect_tcp_target_with_configurator(
+            config,
+            dns,
+            dns_plan,
+            ConnectorTarget::Resolved(&authorized),
+            deadline,
+            configurator,
+        )
+        .await
+    } else {
+        let domain = destination_policy.authorize_domain(authorization)?;
+        connect_tcp_target_with_configurator(
+            config,
+            dns,
+            dns_plan,
+            ConnectorTarget::Domain(&domain),
+            deadline,
+            configurator,
+        )
+        .await
+    }
 }
 
-/// Opens an already-authorized destination without resolving or authorizing it
-/// again. Only Product-owned `AuthorizedTarget` proofs can cross this seam.
-pub(crate) async fn connect_tcp_authorized_with_configurator(
+pub(crate) async fn connect_tcp_target_with_configurator(
     config: &OutboundConfig,
     dns: &DnsGeneration,
     dns_plan: Option<&DnsPlanId>,
-    authorized: &[AuthorizedTarget],
+    target: ConnectorTarget<'_>,
     deadline: tokio::time::Instant,
     configurator: &dyn NativeSocketConfigurator,
 ) -> Result<OutboundTcpStream, OutboundConnectError> {
     config.ensure_supports(TargetProtocol::Tcp)?;
-    let addresses = authorized_socket_addrs(authorized, Network::Tcp)?;
     let dns = DnsResolutionContext::Product {
         generation: dns,
         plan: dns_plan,
     };
-    connect_tcp_leaf_to_addresses(config, &dns, &addresses, deadline, configurator).await
+    match target {
+        ConnectorTarget::Resolved(authorized) => {
+            let addresses = authorized_socket_addrs(authorized, Network::Tcp)?;
+            connect_tcp_leaf_to_addresses(config, &dns, &addresses, deadline, configurator).await
+        }
+        ConnectorTarget::Domain(domain) => {
+            let target = super::destination::protocol_target_addr(domain.flow().target());
+            validate_target(&target)?;
+            match config {
+                OutboundConfig::Direct | OutboundConfig::BindSourceIp(_) => {
+                    Err(OutboundConnectError::TargetResolutionRequired)
+                }
+                OutboundConfig::Socks5(proxy) => {
+                    connect_socks5_tcp_one(proxy, &target, &dns, deadline, configurator)
+                        .await
+                        .map(OutboundTcpStream::Plain)
+                }
+                OutboundConfig::HttpConnect(proxy) => {
+                    connect_http_connect_tcp_one(proxy, &target, &dns, deadline, configurator)
+                        .await
+                        .map(OutboundTcpStream::Plain)
+                }
+                OutboundConfig::HttpsConnect(proxy) => {
+                    connect_https_connect_tcp_one(proxy, &target, &dns, deadline, configurator)
+                        .await
+                }
+            }
+        }
+    }
 }
 
 async fn connect_tcp_leaf_to_addresses(
@@ -476,58 +531,94 @@ pub async fn connect_udp_with_configurator(
     config.ensure_supports(TargetProtocol::Udp)?;
     validate_target(target)?;
     let deadline = tokio::time::Instant::now() + timeout;
-    let authorized = resolve_authorized_target_before(
-        dns,
-        dns_plan,
-        destination_policy,
-        Network::Udp,
-        target,
-        deadline,
-    )
-    .await?;
-    connect_udp_authorized_with_configurator(
-        config,
-        dns,
-        dns_plan,
-        &authorized,
-        deadline,
-        configurator,
-    )
-    .await
+    let authorization = destination_policy.begin(Network::Udp, target)?;
+    if authorization.target().ip().is_some()
+        || config.requires_ip_target()
+        || authorization.requires_post_resolution()
+    {
+        let authorized = resolve_authorization_before(
+            dns,
+            dns_plan,
+            destination_policy,
+            authorization,
+            deadline,
+        )
+        .await?;
+        connect_udp_target_with_configurator(
+            config,
+            dns,
+            dns_plan,
+            ConnectorTarget::Resolved(&authorized),
+            deadline,
+            configurator,
+        )
+        .await
+    } else {
+        let domain = destination_policy.authorize_domain(authorization)?;
+        connect_udp_target_with_configurator(
+            config,
+            dns,
+            dns_plan,
+            ConnectorTarget::Domain(&domain),
+            deadline,
+            configurator,
+        )
+        .await
+    }
 }
 
-/// UDP counterpart to `connect_tcp_authorized_with_configurator`.
-pub(crate) async fn connect_udp_authorized_with_configurator(
+pub(crate) async fn connect_udp_target_with_configurator(
     config: &OutboundConfig,
     dns: &DnsGeneration,
     dns_plan: Option<&DnsPlanId>,
-    authorized: &[AuthorizedTarget],
+    target: ConnectorTarget<'_>,
     deadline: tokio::time::Instant,
     configurator: &dyn NativeSocketConfigurator,
 ) -> Result<OutboundUdpSocket, OutboundConnectError> {
     config.ensure_supports(TargetProtocol::Udp)?;
-    let addresses = authorized_socket_addrs(authorized, Network::Udp)?;
     let dns = DnsResolutionContext::Product {
         generation: dns,
         plan: dns_plan,
     };
-    match config {
-        OutboundConfig::Direct => connect_direct_udp(&addresses, None, deadline, configurator)
-            .await
-            .map(OutboundUdpSocket::Direct),
-        OutboundConfig::BindSourceIp(ip) => {
-            connect_direct_udp(&addresses, Some(*ip), deadline, configurator)
-                .await
-                .map(OutboundUdpSocket::Direct)
+    match target {
+        ConnectorTarget::Resolved(authorized) => {
+            let addresses = authorized_socket_addrs(authorized, Network::Udp)?;
+            match config {
+                OutboundConfig::Direct => {
+                    connect_direct_udp(&addresses, None, deadline, configurator)
+                        .await
+                        .map(OutboundUdpSocket::Direct)
+                }
+                OutboundConfig::BindSourceIp(ip) => {
+                    connect_direct_udp(&addresses, Some(*ip), deadline, configurator)
+                        .await
+                        .map(OutboundUdpSocket::Direct)
+                }
+                OutboundConfig::Socks5(proxy) => {
+                    connect_socks5_udp(proxy, &addresses, &dns, deadline, configurator)
+                        .await
+                        .map(OutboundUdpSocket::Socks5)
+                }
+                OutboundConfig::HttpConnect(_) | OutboundConfig::HttpsConnect(_) => {
+                    Err(OutboundError::UdpNotSupported.into())
+                }
+            }
         }
-        OutboundConfig::Socks5(proxy) => {
-            connect_socks5_udp(proxy, &addresses, &dns, deadline, configurator)
-                .await
-                .map(OutboundUdpSocket::Socks5)
-        }
-        OutboundConfig::HttpConnect(_) | OutboundConfig::HttpsConnect(_) => {
-            Err(OutboundError::UdpNotSupported.into())
-        }
+        ConnectorTarget::Domain(domain) => match config {
+            OutboundConfig::Direct | OutboundConfig::BindSourceIp(_) => {
+                Err(OutboundConnectError::TargetResolutionRequired)
+            }
+            OutboundConfig::Socks5(proxy) => {
+                let target = super::destination::protocol_target_addr(domain.flow().target());
+                validate_target(&target)?;
+                connect_socks5_udp_one(proxy, &target, &dns, deadline, configurator)
+                    .await
+                    .map(OutboundUdpSocket::Socks5)
+            }
+            OutboundConfig::HttpConnect(_) | OutboundConfig::HttpsConnect(_) => {
+                Err(OutboundError::UdpNotSupported.into())
+            }
+        },
     }
 }
 
@@ -982,32 +1073,65 @@ where
     Ok(response)
 }
 
-pub(crate) async fn resolve_authorized_target_before(
+pub(crate) async fn resolve_authorization_before(
     dns: &DnsGeneration,
     dns_plan: Option<&DnsPlanId>,
     destination_policy: &dyn DestinationAuthorizer,
-    network: Network,
-    target: &TargetAddr,
+    authorization: DestinationAuthorization,
     deadline: tokio::time::Instant,
 ) -> Result<Vec<AuthorizedTarget>, OutboundConnectError> {
-    validate_target(target)?;
     let dns = DnsResolutionContext::Product {
         generation: dns,
         plan: dns_plan,
     };
-    let authorization = destination_policy.begin(network, target)?;
-    let addresses = match target {
-        TargetAddr::Ip(address) => vec![address.ip()],
-        TargetAddr::Domain { host, port } => {
-            operation_before(deadline, dns.resolve_socket_addrs(host, *port))
-                .await??
-                .into_iter()
-                .map(|address| address.ip())
-                .collect()
+    let target = authorization.target();
+    let addresses = match target.ip() {
+        Some(address) => vec![address],
+        None => {
+            let host = target
+                .domain()
+                .expect("non-IP Product target has a domain")
+                .as_str();
+            operation_before(
+                deadline,
+                dns.resolve_socket_addrs(host, target.port().get()),
+            )
+            .await??
+            .into_iter()
+            .map(|address| address.ip())
+            .collect()
         }
     };
     destination_policy
         .authorize_addresses(authorization, &addresses)
+        .map_err(Into::into)
+}
+
+pub(crate) async fn resolve_authorized_domain_before(
+    dns: &DnsGeneration,
+    dns_plan: Option<&DnsPlanId>,
+    destination_policy: &dyn DestinationAuthorizer,
+    domain: &AuthorizedDomainTarget,
+    deadline: tokio::time::Instant,
+) -> Result<Vec<AuthorizedTarget>, OutboundConnectError> {
+    let target = domain.flow().target();
+    let Some(host) = target.domain() else {
+        return Err(DestinationAuthorizationError::TargetChanged.into());
+    };
+    let dns = DnsResolutionContext::Product {
+        generation: dns,
+        plan: dns_plan,
+    };
+    let addresses = operation_before(
+        deadline,
+        dns.resolve_socket_addrs(host.as_str(), target.port().get()),
+    )
+    .await??
+    .into_iter()
+    .map(|address| address.ip())
+    .collect::<Vec<_>>();
+    destination_policy
+        .authorize_domain_addresses(domain, &addresses)
         .map_err(Into::into)
 }
 
@@ -1229,6 +1353,7 @@ pub enum OutboundConnectError {
     },
     InvalidProxyResponse,
     NoAuthorizedAddresses,
+    TargetResolutionRequired,
     DnsDependentProxyEndpoint(String),
 }
 
@@ -1332,6 +1457,9 @@ impl std::fmt::Display for OutboundConnectError {
                     "destination authorization returned no connector addresses"
                 )
             }
+            Self::TargetResolutionRequired => {
+                write!(f, "native target connector requires resolved addresses")
+            }
             Self::DnsDependentProxyEndpoint(host) => write!(
                 f,
                 "DNS-routed proxy control endpoint {host:?} is not a literal IP"
@@ -1361,6 +1489,7 @@ impl std::error::Error for OutboundConnectError {
             | Self::UdpReceiveBufferTooSmall { .. }
             | Self::InvalidProxyResponse
             | Self::NoAuthorizedAddresses
+            | Self::TargetResolutionRequired
             | Self::DnsDependentProxyEndpoint(_) => None,
         }
     }

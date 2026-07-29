@@ -331,7 +331,7 @@ async fn socks5_udp_outbound_builds_udp_association() {
         host: "example.com".to_string(),
         port: 53,
     };
-    let expected_target = TargetAddr::Ip(test_resolved_addr(53));
+    let expected_target = target.clone();
     let credentials = ProxyCredentials::new("alice".to_string(), "udp-password".to_string())
         .expect("credentials");
     let expected_auth = socks5::username_password_request(&credentials);
@@ -379,7 +379,7 @@ async fn socks5_udp_outbound_builds_udp_association() {
     });
 
     let config = OutboundConfig::Socks5(ProxyConfig::new(proxy, Some(credentials)));
-    let dns = test_dns_runtime();
+    let dns = static_dns_runtime([]);
     let mut socket = connect_udp(&config, &dns, &target, Duration::from_secs(1))
         .await
         .expect("connect");
@@ -392,7 +392,7 @@ async fn socks5_udp_outbound_builds_udp_association() {
 }
 
 #[tokio::test]
-async fn socks5_tcp_outbound_builds_connect_tunnel() {
+async fn socks5_tcp_preserves_domain_unless_policy_requires_ip_evidence() {
     let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
     let proxy: Endpoint = listener
         .local_addr()
@@ -407,8 +407,11 @@ async fn socks5_tcp_outbound_builds_connect_tunnel() {
         assert_eq!(greeting, socks5::no_auth_greeting());
         stream.write_all(&[0x05, 0x00]).await.expect("method");
 
-        let expected = socks5::connect_request(&TargetAddr::Ip(test_resolved_addr(443)))
-            .expect("expected request");
+        let expected = socks5::connect_request(&TargetAddr::Domain {
+            host: "example.com".to_string(),
+            port: 443,
+        })
+        .expect("expected request");
         let mut request = vec![0u8; expected.len()];
         stream.read_exact(&mut request).await.expect("request");
         assert_eq!(request, expected);
@@ -421,10 +424,33 @@ async fn socks5_tcp_outbound_builds_connect_tunnel() {
         stream.read_exact(&mut buf).await.expect("payload read");
         assert_eq!(&buf, b"ping");
         stream.write_all(b"pong").await.expect("payload write");
+        drop(stream);
+
+        let (mut stream, _) = listener.accept().await.expect("second accept");
+        stream.read_exact(&mut greeting).await.expect("greeting");
+        assert_eq!(greeting, socks5::no_auth_greeting());
+        stream.write_all(&[0x05, 0x00]).await.expect("method");
+        let expected = socks5::connect_request(&TargetAddr::Ip(
+            "127.0.0.1:443".parse().expect("authorized literal"),
+        ))
+        .expect("expected literal request");
+        let mut request = vec![0u8; expected.len()];
+        stream.read_exact(&mut request).await.expect("request");
+        assert_eq!(
+            request, expected,
+            "IP-dependent ACL policy must resolve before proxy delegation"
+        );
+        stream
+            .write_all(&[0x05, 0x00, 0x00, 0x01, 127, 0, 0, 1, 0, 0])
+            .await
+            .expect("reply");
+        stream.read_exact(&mut buf).await.expect("payload read");
+        assert_eq!(&buf, b"ping");
+        stream.write_all(b"pong").await.expect("payload write");
     });
 
     let config = OutboundConfig::Socks5(ProxyConfig::new(proxy, None));
-    let dns = test_dns_runtime();
+    let dns = static_dns_runtime([]);
     let mut stream = connect_tcp(
         &config,
         &dns,
@@ -440,6 +466,27 @@ async fn socks5_tcp_outbound_builds_connect_tunnel() {
     let mut buf = [0u8; 4];
     stream.read_exact(&mut buf).await.expect("payload read");
 
+    assert_eq!(&buf, b"pong");
+    drop(stream);
+
+    let resolved_dns = static_dns_runtime([("example.com", vec![IpAddr::V4(Ipv4Addr::LOCALHOST)])]);
+    let resolved_policy = scoped_loopback_policy("example.com", 443);
+    let target = TargetAddr::Domain {
+        host: "example.com".to_string(),
+        port: 443,
+    };
+    let mut stream = super::connect_tcp(
+        &config,
+        &resolved_dns,
+        None,
+        &resolved_policy,
+        &target,
+        Duration::from_secs(1),
+    )
+    .await
+    .expect("policy-driven resolution");
+    stream.write_all(b"ping").await.expect("payload write");
+    stream.read_exact(&mut buf).await.expect("payload read");
     assert_eq!(&buf, b"pong");
     server.await.expect("server");
 }
@@ -466,8 +513,15 @@ async fn http_connect_tcp_outbound_builds_connect_tunnel() {
         }
         assert_eq!(
             request,
-            http_connect::connect_request(&TargetAddr::Ip(test_resolved_addr(443)), None, None,)
-                .expect("expected request")
+            http_connect::connect_request(
+                &TargetAddr::Domain {
+                    host: "example.com".to_string(),
+                    port: 443,
+                },
+                None,
+                None,
+            )
+            .expect("expected request")
         );
         stream
             .write_all(b"HTTP/1.1 200 Connection Established\r\n\r\n")
@@ -481,7 +535,7 @@ async fn http_connect_tcp_outbound_builds_connect_tunnel() {
     });
 
     let config = OutboundConfig::HttpConnect(ProxyConfig::new(proxy, None));
-    let dns = test_dns_runtime();
+    let dns = static_dns_runtime([]);
     let mut stream = connect_tcp(
         &config,
         &dns,
@@ -529,7 +583,7 @@ async fn https_connect_authenticates_proxy_name_and_builds_basic_tunnel() {
             }
         }
         let request = String::from_utf8(request).expect("request text");
-        assert!(request.starts_with("CONNECT 192.0.2.10:443 HTTP/1.1\r\n"));
+        assert!(request.starts_with("CONNECT example.com:443 HTTP/1.1\r\n"));
         assert!(request.contains("Proxy-Authorization: Basic YWxpY2U6aHR0cHMtcGFzc3dvcmQ=\r\n"));
         stream
             .write_all(b"HTTP/1.1 200 Connection Established\r\n\r\n")
@@ -546,7 +600,7 @@ async fn https_connect_authenticates_proxy_name_and_builds_basic_tunnel() {
         "mptunnel.test",
         Some(credentials),
     )));
-    let dns = test_dns_runtime();
+    let dns = static_dns_runtime([]);
     let mut stream = connect_tcp(
         &config,
         &dns,
@@ -586,7 +640,7 @@ async fn https_connect_rejects_certificate_for_wrong_proxy_name() {
         "wrong-name.test",
         None,
     )));
-    let dns = test_dns_runtime();
+    let dns = static_dns_runtime([]);
 
     let error = connect_tcp(
         &config,
@@ -619,7 +673,7 @@ async fn proxy_handshake_timeout_bounds_silent_http_proxy() {
         std::future::pending::<()>().await;
     });
     let config = OutboundConfig::HttpConnect(ProxyConfig::new(proxy, None));
-    let dns = test_dns_runtime();
+    let dns = static_dns_runtime([]);
 
     let error = connect_tcp(
         &config,
@@ -661,7 +715,7 @@ async fn http_proxy_response_headers_are_strictly_bounded() {
             .expect("oversized response");
     });
     let config = OutboundConfig::HttpConnect(ProxyConfig::new(proxy, None));
-    let dns = test_dns_runtime();
+    let dns = static_dns_runtime([]);
 
     let error = connect_tcp(
         &config,

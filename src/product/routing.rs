@@ -355,6 +355,69 @@ impl CompiledRouteTable {
         }
     }
 
+    /// Classify a pre-resolution flow and determine, in the same ordered rule
+    /// pass, whether any earlier rule can require IP routing evidence or the
+    /// selected rule cannot remain first after resolution.
+    pub fn classify_pre_resolution<'table>(
+        &'table self,
+        flow: &FlowContext,
+    ) -> (RouteDecision<'table>, bool) {
+        if let Some(address) = flow.target().ip() {
+            let pre = self.classify(RouteInput::pre_resolution(flow));
+            let post = self.classify(RouteInput::post_resolution(flow, address));
+            let requires_post_resolution = pre.rule_id() != post.rule_id();
+            return (pre, requires_post_resolution);
+        }
+
+        let input = RouteInput::pre_resolution(flow);
+        let mut earlier_post_candidate = false;
+        for rule in &self.rules {
+            if rule.matcher.matches(input) {
+                let requires_post_resolution =
+                    earlier_post_candidate || !rule.matcher.could_match_post_resolution(flow);
+                return (
+                    RouteDecision {
+                        generation: self.generation,
+                        rule_id: &rule.id,
+                        action: &rule.action,
+                        explanation: &rule.explanation,
+                    },
+                    requires_post_resolution,
+                );
+            }
+            earlier_post_candidate |= rule.matcher.could_match_post_resolution(flow);
+        }
+        unreachable!("compiled route table has a final catch-all rule")
+    }
+
+    /// Return whether first-match routing for this flow can change once a
+    /// domain has address evidence.
+    ///
+    /// Rules are inspected only up to the rule selected before resolution.
+    /// An earlier rule whose non-address fields can match after resolution may
+    /// become the first match for at least one answer, while a pre-resolution
+    /// rule that cannot remain eligible after resolution must also advance to
+    /// the post-resolution table. Rules after a stable selected rule cannot
+    /// affect the result and therefore do not trigger DNS.
+    pub fn requires_post_resolution(&self, flow: &FlowContext) -> bool {
+        if let Some(address) = flow.target().ip() {
+            let pre_input = RouteInput::pre_resolution(flow);
+            let selected = self
+                .rules
+                .iter()
+                .position(|rule| rule.matcher.matches(pre_input))
+                .expect("compiled route table has a final catch-all rule");
+            let post_input = RouteInput::post_resolution(flow, address);
+            let post_selected = self
+                .rules
+                .iter()
+                .position(|rule| rule.matcher.matches(post_input))
+                .expect("compiled route table has a final catch-all rule");
+            return post_selected != selected;
+        }
+        self.classify_pre_resolution(flow).1
+    }
+
     /// Produce a bounded control-plane trace without changing classification
     /// semantics. Normal forwarding calls `classify` and allocates nothing;
     /// explicit route-explain/dry-run operations may allocate this trace.
@@ -644,6 +707,33 @@ impl CompiledMatcher {
                 RouteMismatch::DestinationIp
             });
         }
+        self.first_mismatch_after_destination(input)
+    }
+
+    /// A non-empty address matcher may match at least one possible answer.
+    /// Referenced sets without address entries cannot, so they must not turn
+    /// an otherwise stable domain decision into a DNS dependency.
+    pub(crate) fn could_match_post_resolution(&self, flow: &FlowContext) -> bool {
+        let input = RouteInput {
+            flow,
+            stage: RouteStage::PostResolution,
+            resolved_ip: None,
+        };
+        self.destination_can_match_post_resolution()
+            && self.matches_domain(input)
+            && self.first_mismatch_after_destination(input).is_none()
+    }
+
+    fn destination_can_match_post_resolution(&self) -> bool {
+        !self.destination_cidrs.is_empty()
+            || self.destination_rule_sets.is_empty()
+            || self
+                .destination_rule_sets
+                .iter()
+                .any(|rule_set| !rule_set.destination_cidrs().is_empty())
+    }
+
+    fn first_mismatch_after_destination(&self, input: RouteInput<'_>) -> Option<RouteMismatch> {
         if !matches_value(
             &self.source_cidrs,
             Some(input.flow().source().address()),
@@ -1181,6 +1271,93 @@ mod tests {
             "private",
             "a literal destination remains authoritative after resolution"
         );
+    }
+
+    #[test]
+    fn first_match_order_determines_domain_resolution_demand() {
+        let domain_rule = || {
+            RouteRuleSpec::new(
+                id("domain"),
+                RouteMatchSpec {
+                    domain_exact: vec![DomainName::parse("service.example").expect("domain")],
+                    ..RouteMatchSpec::default()
+                },
+                RouteAction::new(
+                    EgressAction::Outbound(id("domain-edge")),
+                    None,
+                    TrafficIntent::Interactive,
+                ),
+            )
+        };
+        let address_rule = || {
+            RouteRuleSpec::new(
+                id("address"),
+                RouteMatchSpec {
+                    destination_cidrs: vec!["203.0.113.0/24".parse().expect("CIDR")],
+                    ..RouteMatchSpec::default()
+                },
+                RouteAction::new(
+                    EgressAction::Outbound(id("address-edge")),
+                    None,
+                    TrafficIntent::Interactive,
+                ),
+            )
+        };
+        let current = flow("service.example", Network::Tcp);
+
+        let address_first =
+            CompiledRouteTable::compile(5, vec![address_rule(), domain_rule(), default_rule()])
+                .expect("address-first table");
+        assert!(address_first.requires_post_resolution(&current));
+
+        let domain_first =
+            CompiledRouteTable::compile(6, vec![domain_rule(), address_rule(), default_rule()])
+                .expect("domain-first table");
+        assert!(!domain_first.requires_post_resolution(&current));
+
+        let fixed_mismatch = CompiledRouteTable::compile(
+            7,
+            vec![
+                RouteRuleSpec::new(
+                    id("udp-address"),
+                    RouteMatchSpec {
+                        destination_cidrs: vec!["203.0.113.0/24".parse().expect("CIDR")],
+                        networks: vec![Network::Udp],
+                        ..RouteMatchSpec::default()
+                    },
+                    RouteAction::new(
+                        EgressAction::Outbound(id("udp-edge")),
+                        None,
+                        TrafficIntent::Interactive,
+                    ),
+                ),
+                domain_rule(),
+                default_rule(),
+            ],
+        )
+        .expect("fixed-category mismatch table");
+        assert!(
+            !fixed_mismatch.requires_post_resolution(&current),
+            "an IP rule that cannot match this flow must not trigger DNS"
+        );
+
+        let post_stage = CompiledRouteTable::compile(
+            8,
+            vec![
+                RouteRuleSpec::new(
+                    id("post"),
+                    RouteMatchSpec {
+                        networks: vec![Network::Tcp],
+                        stages: vec![RouteStage::PostResolution],
+                        ..RouteMatchSpec::default()
+                    },
+                    RouteAction::new(EgressAction::Reject, None, TrafficIntent::Interactive),
+                ),
+                default_rule(),
+            ],
+        )
+        .expect("post-stage table");
+        assert!(post_stage.requires_post_resolution(&current));
     }
 
     #[test]

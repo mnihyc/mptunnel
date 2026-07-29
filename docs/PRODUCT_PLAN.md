@@ -188,6 +188,15 @@ addresses are denied. Every returned DNS address is authorized; one
 disallowed answer fails the resolution instead of silently filtering into a
 different result.
 
+Address checks apply to literal targets and whenever this MPTUNNEL node
+obtains IP evidence. If a domain is delegated unchanged to SOCKS5, HTTP(S)
+CONNECT, or MPP, only domain-level policy can be enforced here; the configured
+upstream is explicitly trusted to resolve and connect it. Operators who need
+restricted-address or IP-allowlist enforcement before a proxy add an
+applicable destination-IP rule, destination rule set, or post-resolution ACL
+rule. That requires evidence through the selected DNS plan—which may itself
+use routed remote transport—and sends only the authorized literal target.
+
 Signed rule sets pin publisher, signed ID, minimum revision, expiry, checksum,
 and Ed25519 signature. Invalid, expired, oversized, rolled-back, or
 incorrectly signed artifacts reject the complete candidate generation.
@@ -221,6 +230,23 @@ Managed full-VPN mode rejects system or plaintext resolution before host
 routes are published. Stream proxy and MPP DNS egress support TCP/DoT/DoH.
 DoQ is available only through direct or source-bound native egress.
 
+Target resolution is demand-driven and separate from resolver transport. The
+immutable original domain remains the routing identity. An earlier applicable
+destination-IP route or explicit destination ACL rule requests IP routing
+evidence through the selected DNS plan; a stable domain route does not.
+SOCKS5, HTTP(S) CONNECT, and MPP carry the canonical domain when no IP evidence
+is required, so the selected upstream egress becomes the resolution authority.
+Direct and source-bound leaves require an IP target and query the selected DNS
+plan, whose upstream may itself be system, direct, or routed remotely.
+
+Balancer retries retain one target representation. A domain-capable member is
+tried without a target query; reaching an IP-required member resolves and
+authorizes once. Later attempts receive those same authorized literal
+addresses and never revert to the domain. Policy-required resolution is
+fail-closed and every returned address must pass destination authorization.
+Proxy-control and carrier-bootstrap resolution are independent of application
+target resolution.
+
 ### 4.4 Outbounds
 
 | Outbound | TCP targets | UDP targets | Configuration |
@@ -231,9 +257,12 @@ DoQ is available only through direct or source-bound native egress.
 | HTTP CONNECT | Yes | No | Proxy endpoint, optional referenced authentication, and timeout. |
 | HTTPS CONNECT | Yes | No | HTTP CONNECT over WebPKI-authenticated TLS, optional additional CA file, optional authentication, and timeout. |
 
-All native target opens use the selected DNS plan and destination
-authorization. Proxy and carrier sockets cross the host socket-protection or
-binding boundary before I/O in catch-all VPN hosts.
+Every target receives a pre-resolution policy decision before opening.
+Address authorization additionally applies whenever this node has IP evidence.
+IP-required leaves use the selected DNS plan; domain-capable proxy leaves
+preserve the canonical domain unless routing or ACL policy required address
+evidence. Proxy and carrier sockets cross the host socket-protection or binding
+boundary before I/O in catch-all VPN hosts.
 
 ### 4.5 Product balancers
 

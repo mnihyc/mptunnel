@@ -650,7 +650,8 @@ pub struct NodeConfig {
     pub local_ingresses: Vec<LocalIngressConfig>,
     /// Immutable new-flow policy generation for local SOCKS/HTTP/TUN traffic.
     pub product_policy: Option<ProductPolicyConfig>,
-    /// Immutable named split-DNS policy shared by local resolution.
+    /// Immutable named split-DNS policy used whenever this node needs address
+    /// evidence. Upstream transport may be system, direct, or routed.
     pub dns_policy: DnsPolicyConfig,
     pub servers: Vec<MppInboundConfig>,
 }

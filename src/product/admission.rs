@@ -457,6 +457,14 @@ impl fmt::Debug for PendingProductFlow {
 }
 
 impl PendingProductFlow {
+    pub const fn principal(&self) -> &PrincipalId {
+        &self.principal
+    }
+
+    pub const fn target(&self) -> &ProtocolTarget {
+        &self.target
+    }
+
     pub fn try_begin_connect(
         &self,
         outbound: OutboundId,

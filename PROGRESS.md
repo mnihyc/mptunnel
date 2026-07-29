@@ -11,6 +11,60 @@ Historical entries below are retained as evidence of the decisions made at
 their recorded time. When a later entry changes an earlier decision, the later
 entry is authoritative.
 
+## 2026-07-30T04:23:01+08:00: demand-driven application-target DNS
+
+- Name: separate target representation, routing evidence, and resolver
+  transport
+- Category: Product routing, destination authorization, DNS, outbound, and
+  balancer semantics
+- State: implementation and complete Product gate passed; unchanged-Core
+  performance guard is the next bounded action
+- Content:
+  - retained one immutable canonical domain as the flow and routing identity;
+  - made ordered routing and destination ACL classification request address
+    evidence only when an applicable IP/post-resolution rule can change the
+    first match;
+  - preserved domains through MPP, SOCKS5, HTTP CONNECT, HTTPS CONNECT, and
+    SOCKS5 UDP when no address evidence is required;
+  - made direct and source-bound leaves resolve through the selected Product
+    DNS plan, whose upstream transport may be system, direct, or routed;
+  - kept target resolution independent from proxy-control and carrier
+    bootstrap resolution;
+  - authorized every address in one complete answer and made balancer
+    promotion from domain to authorized literals one-way across retries;
+  - preserved Reject and Drop when a provisional pre-resolution decision
+    becomes terminal after DNS, including a retained silent-discard lane for
+    denied UDP associations; and
+  - excluded domain-only signed destination sets from address demand because
+    they cannot match an IP answer.
+- Correctness boundary:
+  - stable domain policy does not query DNS or depend on its availability;
+  - explicit IP policy fails closed through the selected DNS plan and sends
+    only authorized literals to later domain-capable members;
+  - a delegated proxy is an explicit target-resolution trust boundary, while
+    MPP repeats the final-egress decision on the receiving node; and
+  - no scheduler, congestion, pacing, recovery, carrier, wire protocol,
+    transport timing, or Core resource default changed.
+- Evidence:
+  - warnings-denied all-target/all-feature Clippy, formatting, and whitespace
+    checks passed;
+  - the complete Rust suite passed: 1,385 library tests, two allocation
+    contracts, all four packaged daily-use acceptance tests, and doctests;
+  - durable scenarios cover stable delegation without DNS, earlier IP rules,
+    provisional terminal routes, complete-answer authorization, domain-only
+    signed sets, routed proxy literals, irreversible balancer promotion, and
+    silent UDP denial across repeated datagrams; and
+  - an independent final semantic review reported no remaining material
+    correctness or performance blocker in this Product slice.
+- Decision:
+  - accept the Product semantics and keep the restored Core unchanged;
+  - require a clean-source representative performance guard before advancing
+    to the next Product capability; and
+  - retain `PROGRESS.md` as the sole execution ledger.
+- Next: commit this isolated Product milestone, run the standard four-case
+  unchanged-Core performance guard, record the comparable evidence, and then
+  continue the remaining global Product map.
+
 ## 2026-07-30T03:15:13+08:00: canonical Product configuration identities
 
 - Name: establish one strict public identity and cross-reference vocabulary

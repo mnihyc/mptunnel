@@ -395,14 +395,14 @@ async fn spawn_socks5_udp_proxy_once() -> (Endpoint, tokio::task::JoinHandle<()>
         let (datagram, consumed) =
             socks5::parse_udp_datagram(&packet[..len]).expect("udp relay packet");
         assert_eq!(consumed, len);
-        let TargetAddr::Ip(target) = datagram.target else {
-            panic!("server must pin the post-DNS authorized SOCKS5 target to an IP literal");
+        let TargetAddr::Domain { host, port } = datagram.target else {
+            panic!("server must delegate the canonical domain to its SOCKS5 outbound");
         };
-        assert!(target.ip().is_loopback());
-        assert_eq!(target.port(), 53);
+        assert_eq!(host, "localhost");
+        assert_eq!(port, 53);
         assert_eq!(datagram.payload, Bytes::from_static(b"ping"));
-        let response =
-            socks5::udp_datagram(&TargetAddr::Ip(target), b"pong").expect("udp relay response");
+        let response = socks5::udp_datagram(&TargetAddr::Domain { host, port }, b"pong")
+            .expect("udp relay response");
         relay
             .send_to(&response, peer)
             .await

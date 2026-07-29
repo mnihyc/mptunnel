@@ -63,8 +63,8 @@ protocol = "direct"
 # protocol = "socks5"
 # endpoint = "127.0.0.1:1080"
 # connect_timeout_ms = 10000
-# Target domains are resolved through the selected MPTUNNEL DNS plan; the
-# authorized IP target is then sent to the no-auth upstream SOCKS5 proxy.
+# Canonical target domains are carried to the upstream SOCKS5 proxy unless an
+# IP-dependent destination ACL requires evidence from the selected DNS plan.
 
 # Plain HTTP CONNECT relays TCP. Use SOCKS5 when an upstream proxy must relay
 # both TCP and UDP.

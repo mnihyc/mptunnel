@@ -591,8 +591,8 @@ endpoint indistinguishable. Source-aware clients and observers can still
 fingerprint certificate/SNI, TLS/QUIC/H3 behavior and parameters, packet
 shape, timing, and the public response profile. MPTUNNEL is not a cover
 service. See the RFC's
-[TCP presentation](../RFC.md#101-tcp-carrier-presentation) and
-[HTTP/3 presentation](../RFC.md#102-http3-carrier-presentation) for the exact
+[TCP presentation](../RFC.md#61-tcp-over-tls-13) and
+[HTTP/3 presentation](../RFC.md#62-quic-over-http3) for the exact
 admission, request, DATA-record, and native-datagram contracts.
 
 Define named credentials globally and reference them from MPP inbounds and

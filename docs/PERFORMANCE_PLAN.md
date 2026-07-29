@@ -97,7 +97,7 @@ they do not transfer Product ownership into Core.
 
 ## 3. Required invariants
 
-The implementation preserves every invariant in RFC Section 14:
+The implementation preserves every invariant in RFC Section 16:
 
 1. One data byte keeps one connection-level sequence identity across all
    copies.

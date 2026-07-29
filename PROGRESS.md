@@ -54,6 +54,98 @@ entry is authoritative.
   the restored champion, then establish the clean RFC without changing this
   proven behavior.
 
+## 2026-07-29T23:35:44+08:00: restored transition survival guard
+
+- Name: current-version balanced blackhole guard on the restored champion
+- Category: performance, failover, and evidence boundary
+- State: representative survival guard passed; transition-performance
+  acceptance remains open
+- Content:
+  - ran the existing TCP download, TCP upload, and mixed-traffic balanced-path
+    blackhole cases once on a clean host with diagnostics disabled;
+  - used the exact restored release binary
+    `9a66861a08c0922b432cb73963bc0da0304023b88be4409aeb383397a3166d92`;
+    and
+  - retained the raw manifest, result rows, interface counters, qdisc snapshots,
+    and container telemetry under ignored
+    `./.tmp/lab/results/restored-champion-transition-20260729/`.
+- Evidence:
+  - TCP download continued at `240.273` Mbps with a `0.280` second observed
+    recovery gap and no failed request;
+  - TCP upload delivered a receiver-confirmed lower bound of `211.684` Mbps
+    with a `1.876` second observed recovery gap;
+  - mixed traffic retained all `40/40` interactive exchanges, observed a
+    `0.494` second bulk recovery gap, and delivered `176/178` UDP exchanges;
+    and
+  - the manifest identifies a clean source tree, a valid host, protocol version
+    4, diagnostics disabled, and the exact champion client/server binary.
+- Decision:
+  - this single guard establishes that the restored implementation survives the
+    representative blackhole transitions; it is not a formal recovery-latency
+    or throughput distribution and does not approve any later patch;
+  - an identified issue or proposed change is only a candidate until its
+    failure reproduces against this champion and the isolated change proves a
+    correctness or performance gain across every affected guard; and
+  - formal fault-cell acceptance still requires the preregistered repeated
+    triggered-event cohort. A fixed percentage is neither a tolerance nor a
+    promotion rule.
+- Next: establish the clean current-version RFC without altering champion
+  behavior, then re-investigate later issue candidates individually.
+
+## 2026-07-29T23:58:53+08:00: current-version protocol model established
+
+- Name: standards-shaped MPP version 4 authority
+- Category: protocol, Core architecture, security, and change control
+- State: documentation complete; focused protocol gate passed; implementation
+  conformance defects remain candidates until independently reproduced and
+  corrected
+- Content:
+  - rewrote `./RFC.md` as the current version 4 protocol specification instead
+    of a development narrative;
+  - separated the MPP data level from native TCP and QUIC authority and from
+    Product routing, DNS, gateway balancing, VPN, configuration, and
+    presentation;
+  - defined session, carrier-instance, attachment-incarnation, offset, Data
+    ACK, locator, evidence, demand, and recovery-interval terminology without
+    deriving identity from source address or port;
+  - retained the exact version 4 frame registry and carrier profiles, including
+    TLS 1.3 TCP, HTTP/3 QUIC, RFC 9221 QUIC DATAGRAM, and RFC 9297 HTTP
+    Datagram association semantics;
+  - specified the active transport-neutral recovery formulas and explicitly
+    distinguished them from native TCP RTO, QUIC PTO, RFC 8985 RACK, and RFC
+    9002 loss decisions; and
+  - repaired the two public cross-references affected by the new stable section
+    structure. `./docs/PERFORMANCE_PLAN.md` remains an acceptance-methodology
+    document and contains no progress state.
+- Evidence:
+  - `cargo test --locked protocol`: 41 passed, 0 failed;
+  - `git diff --check`: passed;
+  - the release binary remains byte-identical to the restored champion at
+    SHA-256
+    `9a66861a08c0922b432cb73963bc0da0304023b88be4409aeb383397a3166d92`;
+    and
+  - no runtime source, timing value, congestion controller, scheduler, or wire
+    value changed in this milestone.
+- Open conformance candidates:
+  - malformed RFC 9297 Quarter Stream IDs are silently dropped instead of
+    closing the HTTP/3 connection with `H3_DATAGRAM_ERROR`;
+  - datagrams associated with an already closed request stream can enter the
+    bounded not-yet-created-stream handoff queue;
+  - QUIC can publish `SESSION_READY` before carrier-registry admission; and
+  - several codec canonicality and arithmetic checks require exact failing
+    reproduction before any fix is admitted.
+- Decision:
+  - the RFC is the protocol and Core-model authority, while this file alone is
+    the execution ledger;
+  - the identified discrepancies are not approved patches; each must first
+    fail a persistent conformance or adversarial test on the restored champion,
+    then pass with one isolated correction and the affected non-regression
+    guards; and
+  - no preserved later Core implementation is restored wholesale.
+- Next: reproduce and resolve the smallest directly proven wire-conformance
+  defects one at a time, then re-evaluate transition and performance
+  candidates against the unchanged champion.
+
 ## Product maturity audit history
 
 ## 2026-07-26: v0.1.1 global product audit

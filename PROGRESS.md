@@ -11,6 +11,72 @@ Historical entries below are retained as evidence of the decisions made at
 their recorded time. When a later entry changes an earlier decision, the later
 entry is authoritative.
 
+## 2026-07-30T02:07:54+08:00: transactional operator observability
+
+- Name: establish production logging and safe live configuration transactions
+- Category: Product observability, configuration, and operations
+- State: committed and approved; Product acceptance and the affected
+  performance guard passed; the broader Product map remains open
+- Source: clean commit `529971ff16986d87c1826dd977c457c2c07f9311`
+- Content:
+  - added one typed `[logging]` model for CLI, TOML, environment, file, and
+    console output with reloadable level/format/sink configuration;
+  - made opt-in Product flow open/close records sanitized and sink-generation
+    paired without adding Core or per-payload logging;
+  - serialized configuration compare-and-swap, pending persistence, logger
+    preparation, activation, rollback, and supervised restart so one
+    generation cannot overwrite another;
+  - protected the canonical configuration and sidecars from lexical,
+    canonical, symbolic-link, hard-link, and time-of-check/time-of-use output
+    aliasing, including operational CLI commands;
+  - made DNS capability ordering deterministic; and
+  - made dashboard credentials persist in local storage only after
+    current-generation status and health validation, with stale-response
+    guards and explicit erasure.
+- Product evidence:
+  - the complete suite passed: 1,381 library tests, two allocation tests, and
+    all four daily-use Product acceptance tests;
+  - warnings-denied all-target/all-feature Clippy, formatting, shell and
+    JavaScript syntax, and whitespace checks passed;
+  - a real-browser run proved invalid credentials are never stored, valid
+    credentials survive reload, no credential appears in the URL or document,
+    Forget clears both current and legacy stores, and a delayed stale `401`
+    cannot erase a newer authenticated generation; and
+  - independent transaction, hot-path, dashboard, and public-documentation
+    audits found no remaining concrete defect in this slice.
+- Performance boundary and evidence:
+  - no scheduler, congestion, pacing, recovery, carrier, protocol, timing, or
+    resource-default behavior changed; disabled flow logging adds only
+    lifecycle-level atomic reads outside normal payload processing;
+  - the clean native Linux release binary measured here is SHA-256
+    `4ee348bb5cb85e7abfca58a1f5e6d1e8df0b7bee95f09e185bbdbfd00db43f7a`;
+  - with the retained clean-host Docker topology, 20-second load, two flows,
+    diagnostics disabled, and isolated cases, single/five-path QUIC download
+    measured `220.899`/`754.154` Mbps and upload measured
+    `232.781`/`775.025` Mbps;
+  - an adjacent repeat using the identical binary resolved the lower
+    single-path sample and duration-bound five-path receiver closure at
+    `249.676` Mbps download and `796.663` Mbps upload, both complete and
+    `ok`;
+  - the immediately preceding corrected-protocol cohort measured
+    `241.442`/`738.897` Mbps download and `231.957`/`762.933` Mbps upload,
+    while the restored champion measured `234.276`/`680.359` and
+    `228.443`/`762.552` Mbps respectively; and
+  - every cited row is performance-comparable with a valid clean source and
+    matching client/server hashes. Raw evidence remains under ignored
+    `./.tmp/lab/results/product-observability-20260730/` and
+    `./.tmp/lab/results/product-observability-repeat-20260730/`.
+- Decision:
+  - approve this Product-only slice with no observed affected performance
+    downgrade;
+  - treat the first lower single-path sample and duration-bound receiver
+    closure as measured run variation, not as a tuning signal; and
+  - retain the unchanged Core as the performance authority while completing
+    the remaining Product scope.
+- Next: establish one clean, breaking public configuration vocabulary, then
+  continue the remaining daily-use routing, DNS, balancer, inbound/outbound,
+  VPN, and operator gaps before the full performance and transition matrix.
+
 ## 2026-07-30T00:34:43+08:00: direct version 4 conformance corrections
 
 - Name: admit only independently reproduced protocol corrections

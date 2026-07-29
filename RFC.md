@@ -391,8 +391,10 @@ Section 13.
 One TCP carrier instance multiplexes path control, stream attachments, and
 datagram-flow attachments. `PING` and `PONG` may provide MPP-level heartbeat.
 `PATH_DRAIN` and `PATH_CLOSE` request graceful retirement and are valid only on
-TCP carriers. No new attachment SHOULD be admitted after drain begins;
-existing work may finish.
+TCP carriers. Their `path_id` MUST match the TCP carrier carrying the frame.
+After drain begins, both endpoints MUST make that carrier ineligible for new
+attachments and original placement. Existing work may finish, detach, or
+continue on another carrier before `PATH_CLOSE` completes retirement.
 
 `PATH_CAPACITY_DATA`, `PATH_CAPACITY_FINISH`, and
 `PATH_CAPACITY_RECEIPT` are valid only on TCP carriers.
@@ -537,7 +539,49 @@ On TCP, `PATH_DRAIN(path_id)` requests graceful retirement and
 `PATH_CLOSE(path_id, reason)` completes it. On QUIC, native connection
 lifecycle performs carrier retirement.
 
-### 7.2 Directional usage
+Sending or accepting `SESSION_CLOSE` retires the complete MPP session
+identified by the carrying carrier. It MUST NOT be used for ordinary carrier
+drain, replacement, or failure.
+
+### 7.2 Bounded TCP carrier establishment
+
+An endpoint MAY maintain more than one TCP carrier to the same locally
+configured endpoint when throughput demand exceeds the service demonstrated by
+the existing carriers. This is local carrier-lifecycle policy. It introduces
+no new carrier family or wire field and MUST NOT merge independent TCP
+congestion-control or recovery state.
+
+Every additional TCP connection:
+
+- is a new carrier instance with a fresh TLS connection, TCP prelude,
+  `PATH_JOIN`, sequence-zero `PATH_STATUS`, readiness exchange, and evidence;
+- uses the same `SessionId` and resolves to the same principal when it joins an
+  existing MPP session;
+- uses a `PathId` not concurrently used by another TCP carrier in that
+  session; and
+- retains independent attachments, queues, flight, transport evidence, and
+  failure scope even when its configured endpoint and locator set are shared.
+
+The number of ready, establishing, and draining TCP carriers MUST remain within
+local endpoint and session resource envelopes.
+
+Exact carrier failure permits immediate replacement within the same resource
+envelopes without first proving marginal benefit. A ready lower bound MAY be
+retained for future demand. A carrier above that lower bound SHOULD be retired
+at exact quiescence: it has no live attachment, queued frame, retained flight,
+pending proof or capacity work, or pending demand.
+
+Changing the destination port of a TCP carrier creates a replacement carrier;
+it never migrates the existing TCP connection. Planned replacement MUST be
+make-before-break when the resource envelopes have spare capacity: authenticate
+and ready the replacement, admit streams that must continue through their normal
+attachment procedure, stop new attachments on the old carrier with
+`PATH_DRAIN`, and complete it with `PATH_CLOSE` after its attachments finish.
+When no spare capacity exists, replacement waits for capacity or exact
+quiescence rather than forcing an active carrier closed. No transport or MPP
+delivery evidence transfers to the replacement.
+
+### 7.3 Directional usage
 
 `PATH_STATUS` contains:
 
@@ -785,6 +829,9 @@ once per candidate carrier.
 Per-flow evidence MUST NOT be treated as shared carrier capacity without
 sufficient carrier-level proof. A configured rate is a startup prior, not
 measurement.
+
+A locator, interface, or route cannot establish carrier capacity, marginal
+benefit, or bottleneck identity.
 
 Native ACK evidence MAY establish transport readiness within its carrier.
 Only unambiguous MPP Data ACK coverage establishes unique data-level delivery
@@ -1067,6 +1114,24 @@ After exact original-data Data ACK coverage reaches the configured startup
 sample floor, the response scheduler may use its mature completion-time model.
 Duplicated bytes do not satisfy that floor for either copy.
 
+Non-failure TCP carrier expansion is permitted only for throughput demand with
+queued unique original data after existing eligible carriers are carrying
+original data and current evidence indicates that demand exceeds their
+demonstrated service. For one locally configured endpoint, expansion MUST
+establish at most one unproven additional carrier at a time. Native transport
+telemetry MAY strengthen that decision but MUST NOT be required for
+correctness.
+
+An additional TCP carrier remains subject to the same bounded startup flight.
+It may mature only after unambiguous MPP Data ACK coverage of its original
+transmissions and aggregate unique-delivery evidence demonstrates service
+beyond the previously mature carriers. An implementation MUST account for the
+observed measurement variation; an inconclusive difference is not evidence of
+marginal benefit. MPP defines no fixed percentage as a universal benefit
+threshold. A candidate that does not reach readiness is cancelled. A ready
+candidate whose benefit remains unproven, or whose demand disappears, is
+gracefully retired before another non-failure candidate is established.
+
 ### 15.2 Reinjection budget and timing
 
 Ordinary reinjection is limited by cumulative extra-traffic credit funded by a
@@ -1173,6 +1238,12 @@ A conforming implementation preserves all of the following:
     attempts.
 17. A retained datagram request identity is forwarded to its target at most
     once.
+18. Simultaneous TCP carriers within one MPP session always have distinct
+    `PathId` values and distinct carrier instances.
+19. Non-failure TCP carrier expansion is bounded, serialized, and matured only
+    by unambiguous unique-delivery evidence.
+20. `PATH_DRAIN` and `PATH_CLOSE` retire one matching TCP carrier;
+    `SESSION_CLOSE` retires the complete `SessionId`.
 
 ## 17. Relationship to Existing Standards
 

@@ -11,6 +11,52 @@ Historical entries below are retained as evidence of the decisions made at
 their recorded time. When a later entry changes an earlier decision, the later
 entry is authoritative.
 
+## 2026-07-30T12:27:52+08:00: bounded TCP service validation model
+
+- Name: exact endpoint/session/direction validation authority
+- Category: Core model, evidence integrity, cancellation safety, and resource
+  bounds
+- State: committed and independently approved; runtime evidence adapters,
+  carrier admission, and retirement remain disabled and open
+- Source: commit `1649bd1e61b09a3cf7b480aad1d4d70e34ff7396`
+- Content:
+  - implemented one session-serialized, direction-owned validation lifecycle
+    with exact range, demand, carrier-instance, eligibility, stream-demand,
+    attachment, and Data ACK horizon fences;
+  - implemented the RFC's two pre-reference, readiness, two comparison, and
+    two post-reference windows using indivisible complete Data ACK events and
+    exact rational rate ordering, without a percentage threshold;
+  - bounded candidate placement, outstanding work, ACK records, range history,
+    stream/path cohorts, lifecycle IDs, and absolute resource lifetime;
+  - made preparation and cleanup authority linear, scoped every candidate
+    permit to its non-reusable lifecycle, and retained exact deadline
+    `WITHDRAWN` identity through cancellation-safe observer cleanup;
+  - excluded pre-install and wrong-lifecycle accepted flights without
+    manufacturing evidence, while wrong-lifecycle candidate work fails closed;
+    and
+  - made process-wide physical carrier instance allocation fail before numeric
+    identity reuse instead of wrapping.
+- Evidence:
+  - all 9 focused semantic tests passed;
+  - the complete 1,407-test library gate passed before the final pure-model
+    corrections, and the focused gate passed again afterward;
+  - three independent read-only reviews approved RFC conformance, runtime API
+    shape, cancellation lifetime, and false-`RETAIN` safety; and
+  - formatting and whitespace checks passed.
+- Performance boundary:
+  - no scheduler, timing, threshold, congestion controller, carrier count,
+    connection establishment, or runtime placement behavior changed;
+  - automatic TCP expansion remains unavailable; and
+  - commit `a5a6094fc8e07456b057ddc107a0d51849d42d10` remains the historical
+    performance authority.
+- Adjacent prerequisite:
+  - commit `c413f79` now reserves carrier queue capacity, records exact request
+    flight ownership, and only then publishes the command, matching the
+    response-side atomic contract without changing queue geometry.
+- Next: install the validation-only strict writer clock and exact request and
+  response release sidecars, then connect the session coordinator without
+  enabling carrier expansion.
+
 ## 2026-07-30T10:45:01+08:00: TCP carrier QoS evidence fixture
 
 - Name: make beneficial and non-beneficial TCP carrier expansion measurable

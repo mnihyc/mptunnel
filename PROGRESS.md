@@ -11,6 +11,83 @@ Historical entries below are retained as evidence of the decisions made at
 their recorded time. When a later entry changes an earlier decision, the later
 entry is authoritative.
 
+## 2026-07-30T20:37:27+08:00: TCP expansion model reduced to reachable state
+
+- Name: destructive RFC and prior-patch necessity audit
+- Category: Core architecture, wire contract, and performance change control
+- State: RFC and wire codec are coherent; automatic TCP expansion remains
+  inactive and is not releasable
+- Supersedes:
+  - the six-stage service-validation model recorded at 10:22, 10:37, 12:27,
+    and every later entry that depended on its observer lifecycle; and
+  - the 20:16 next action insofar as it referred to the former v5 frame shape.
+- Prior-patch classification:
+  - retained as independently justified: the direct v4 protocol-conformance
+    corrections, transactional observability, canonical Product identities,
+    demand-driven target DNS, selection-local balancer deadlines, carrier port
+    sets, native QUIC port migration, session-local TCP carrier retirement,
+    exact asynchronous-open fencing, and queue-before-publication request
+    flight ordering;
+  - retained as a real acceptance fixture: the opt-in adjacent `1-1` versus
+    `1-3` TCP QoS/shared-bottleneck lab cohort; it changes no runtime behavior;
+  - provisional and still inactive: the `tcp-carriers` Product range and its
+    bounded slot topology. They express the requested default `1-3`, but no
+    dormant slot becomes ordinary-use eligible without the remaining
+    session-level lifecycle;
+  - amended rather than preserved: the original bounded-carrier RFC, the
+    endpoint-scoped service RFC, and MPP v5 controls now follow the smaller
+    session-direction model below; and
+  - removed as redundant: the standalone validation model, per-flow writer
+    registries and observers, duplicate cleanup authority, and disconnected
+    runtime adapters reverted before this milestone.
+- Clean model:
+  - one real saturation event may admit one unsettled elastic TCP connection;
+    polling, ACK silence, locator change, interface change, or native queue
+    occupancy cannot manufacture demand;
+  - the directional sender freezes a session-wide accepted set, bounded stream
+    cohort, and ordinary aggregate-service interval;
+  - candidate outstanding and cumulative original work use explicit finite
+    resource bounds and must reach the existing Data ACK startup sample floor;
+  - `RETAIN` requires the combined interval's lower bound to exceed the frozen
+    accepted interval's upper bound. Equal, overlapping, or inconclusive
+    evidence is `NO_GAIN`; stale state or ended demand is `WITHDRAWN`;
+  - minimum and exact failure-replacement carriers are ordinary by
+    construction; only elastic carriers require directional `RETAIN`;
+  - ordinary-use authority belongs to one exact live instance and direction
+    and ends on drain, failure, or session close; and
+  - QUIC roaming remains native. TCP recovery replaces an exact failed carrier
+    without inferring link identity from an IP address, interface, or route.
+- Wire correction:
+  - `TCP_CARRIER_DEMAND(request_id, stream_ids)` remains the bounded
+    server-to-client demand signal;
+  - `TCP_CARRIER_VALIDATE(validation_id, request_id, direction, stream_ids)`
+    now relies on the authenticated carrying connection for candidate identity
+    and serializes no accepted-path list, `PathId`, or cross-carrier nonce;
+  - `TCP_CARRIER_RESULT(validation_id, direction, result)` repeats no
+    candidate path ID; and
+  - the codec rejects direction/request-ID disagreement before allocating a
+    stream list.
+- Evidence:
+  - the RFC review found and removed the unreachable pre/reference/post
+    comparison phases, repeated candidate identity, server dependence on
+    client-local carrier groups, and minimum-carrier authority gap;
+  - exact stale identifiers are absent from current source;
+  - all 32 durable protocol codec tests pass;
+  - the complete library gate passes: 1,401 tests, zero failures;
+  - `cargo check --locked --all-targets`, formatting, and whitespace checks
+    pass; and
+  - the simplified change removes more RFC/source/test lines than it adds.
+- Performance boundary:
+  - no scheduler choice, congestion controller, transport parameter, timing
+    formula, carrier count, or runtime placement behavior changed;
+  - the normal data path gains no validation observer or phase branch; and
+  - historical performance authority remains `a5a6094` until the integrated
+    lifecycle passes adjacent representative labs.
+- Next: implement one coherent client-to-server vertical slice under a single
+  session-level carrier owner: exact candidate preparation, validation-only
+  attachment outside ordinary scheduling, bounded sender evidence, result,
+  directional authority, ordered drain, and terminal cleanup.
+
 ## 2026-07-30T20:16:29+08:00: disconnected TCP service stack removed
 
 - Name: restore one reachable runtime model before adaptive-carrier work

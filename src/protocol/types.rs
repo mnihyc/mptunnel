@@ -39,16 +39,6 @@ pub enum PathMetricDirection {
     ServerToClient,
 }
 
-/// Exact authenticated TCP carrier instance referenced by service validation.
-///
-/// A `PathId` alone is reusable after carrier retirement. The accepted
-/// `PATH_JOIN` nonce fences this record to one current physical instance.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
-pub struct TcpCarrierAcceptedPath {
-    pub path_id: PathId,
-    pub path_join_nonce: AuthNonce,
-}
-
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TcpCarrierValidationResult {
     Retain,
@@ -309,15 +299,13 @@ pub enum Frame {
         stream_ids: Vec<StreamId>,
     },
     TcpCarrierValidate {
-        trial_id: u64,
+        validation_id: u64,
         request_id: u64,
         direction: PathMetricDirection,
-        accepted_paths: Vec<TcpCarrierAcceptedPath>,
         stream_ids: Vec<StreamId>,
     },
     TcpCarrierResult {
-        trial_id: u64,
-        candidate_path_id: PathId,
+        validation_id: u64,
         direction: PathMetricDirection,
         result: TcpCarrierValidationResult,
     },

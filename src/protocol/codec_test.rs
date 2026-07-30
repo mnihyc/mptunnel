@@ -406,13 +406,6 @@ fn path_capacity_protocol_round_trips_without_product_stream_identity() {
     });
 }
 
-fn accepted_path(path_id: u16, nonce: u8) -> TcpCarrierAcceptedPath {
-    TcpCarrierAcceptedPath {
-        path_id: PathId(path_id),
-        path_join_nonce: AuthNonce([nonce; 16]),
-    }
-}
-
 #[test]
 fn tcp_carrier_coordination_frames_use_v5_kinds_and_round_trip() {
     let frames = [
@@ -425,34 +418,29 @@ fn tcp_carrier_coordination_frames_use_v5_kinds_and_round_trip() {
             stream_ids: Vec::new(),
         },
         Frame::TcpCarrierValidate {
-            trial_id: 51,
+            validation_id: 51,
             request_id: 41,
             direction: PathMetricDirection::ServerToClient,
-            accepted_paths: vec![accepted_path(1, 3), accepted_path(2, 4)],
             stream_ids: vec![StreamId(7), StreamId(11)],
         },
         Frame::TcpCarrierValidate {
-            trial_id: 52,
+            validation_id: 52,
             request_id: 0,
             direction: PathMetricDirection::ClientToServer,
-            accepted_paths: vec![accepted_path(1, 3)],
             stream_ids: vec![StreamId(9)],
         },
         Frame::TcpCarrierResult {
-            trial_id: 51,
-            candidate_path_id: PathId(3),
+            validation_id: 51,
             direction: PathMetricDirection::ServerToClient,
             result: TcpCarrierValidationResult::Retain,
         },
         Frame::TcpCarrierResult {
-            trial_id: 52,
-            candidate_path_id: PathId(3),
+            validation_id: 52,
             direction: PathMetricDirection::ClientToServer,
             result: TcpCarrierValidationResult::NoGain,
         },
         Frame::TcpCarrierResult {
-            trial_id: 53,
-            candidate_path_id: PathId(3),
+            validation_id: 53,
             direction: PathMetricDirection::ClientToServer,
             result: TcpCarrierValidationResult::Withdrawn,
         },
@@ -493,10 +481,9 @@ fn tcp_carrier_demand_has_stable_v5_wire_layout() {
 fn tcp_carrier_validation_and_result_have_stable_v5_wire_layouts() {
     let validation = encode_frame(
         &Frame::TcpCarrierValidate {
-            trial_id: 0x0102_0304_0506_0708,
+            validation_id: 0x0102_0304_0506_0708,
             request_id: 0x1112_1314_1516_1718,
             direction: PathMetricDirection::ServerToClient,
-            accepted_paths: vec![accepted_path(0x0102, 3)],
             stream_ids: vec![StreamId(0x2122_2324_2526_2728)],
         },
         CodecLimits::default(),
@@ -505,16 +492,14 @@ fn tcp_carrier_validation_and_result_have_stable_v5_wire_layouts() {
     assert_eq!(
         validation,
         vec![
-            b'M', b'P', b'T', b'F', 5, 39, 0, 0, 0, 47, 1, 2, 3, 4, 5, 6, 7, 8, 17, 18, 19, 20, 21,
-            22, 23, 24, 2, 0, 1, 1, 2, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 0, 1, 33,
-            34, 35, 36, 37, 38, 39, 40,
+            b'M', b'P', b'T', b'F', 5, 39, 0, 0, 0, 27, 1, 2, 3, 4, 5, 6, 7, 8, 17, 18, 19, 20, 21,
+            22, 23, 24, 2, 0, 1, 33, 34, 35, 36, 37, 38, 39, 40,
         ]
     );
 
     let result = encode_frame(
         &Frame::TcpCarrierResult {
-            trial_id: 0x0102_0304_0506_0708,
-            candidate_path_id: PathId(0x1112),
+            validation_id: 0x0102_0304_0506_0708,
             direction: PathMetricDirection::ClientToServer,
             result: TcpCarrierValidationResult::Withdrawn,
         },
@@ -524,7 +509,7 @@ fn tcp_carrier_validation_and_result_have_stable_v5_wire_layouts() {
     assert_eq!(
         result,
         vec![
-            b'M', b'P', b'T', b'F', 5, 40, 0, 0, 0, 12, 1, 2, 3, 4, 5, 6, 7, 8, 17, 18, 1, 3,
+            b'M', b'P', b'T', b'F', 5, 40, 0, 0, 0, 10, 1, 2, 3, 4, 5, 6, 7, 8, 1, 3,
         ]
     );
 }
@@ -546,7 +531,7 @@ fn empty_tcp_carrier_demand_is_the_canonical_withdrawal_encoding() {
 }
 
 #[test]
-fn tcp_carrier_codec_rejects_zero_ids_and_empty_validation_lists() {
+fn tcp_carrier_codec_rejects_zero_ids_and_empty_validation_stream_list() {
     let limits = CodecLimits::default();
     for frame in [
         Frame::TcpCarrierDemand {
@@ -554,15 +539,13 @@ fn tcp_carrier_codec_rejects_zero_ids_and_empty_validation_lists() {
             stream_ids: Vec::new(),
         },
         Frame::TcpCarrierValidate {
-            trial_id: 0,
+            validation_id: 0,
             request_id: 0,
             direction: PathMetricDirection::ClientToServer,
-            accepted_paths: vec![accepted_path(1, 1)],
             stream_ids: vec![StreamId(1)],
         },
         Frame::TcpCarrierResult {
-            trial_id: 0,
-            candidate_path_id: PathId(2),
+            validation_id: 0,
             direction: PathMetricDirection::ClientToServer,
             result: TcpCarrierValidationResult::Withdrawn,
         },
@@ -573,45 +556,66 @@ fn tcp_carrier_codec_rejects_zero_ids_and_empty_validation_lists() {
         );
     }
 
-    for frame in [
-        Frame::TcpCarrierValidate {
-            trial_id: 1,
-            request_id: 0,
-            direction: PathMetricDirection::ClientToServer,
-            accepted_paths: Vec::new(),
-            stream_ids: vec![StreamId(1)],
-        },
-        Frame::TcpCarrierValidate {
-            trial_id: 1,
-            request_id: 0,
-            direction: PathMetricDirection::ClientToServer,
-            accepted_paths: vec![accepted_path(1, 1)],
-            stream_ids: Vec::new(),
-        },
-    ] {
-        assert_eq!(encode_frame(&frame, limits), Err(CodecError::EmptyList));
-    }
-
     let validation = Frame::TcpCarrierValidate {
-        trial_id: 1,
+        validation_id: 1,
         request_id: 0,
         direction: PathMetricDirection::ClientToServer,
-        accepted_paths: vec![accepted_path(1, 1)],
         stream_ids: vec![StreamId(1)],
     };
-    let mut empty_paths = encode_frame(&validation, limits).expect("validation");
-    empty_paths[FRAME_HEADER_LEN + 17..FRAME_HEADER_LEN + 19].copy_from_slice(&0_u16.to_be_bytes());
+    let empty_validation = Frame::TcpCarrierValidate {
+        validation_id: 1,
+        request_id: 0,
+        direction: PathMetricDirection::ClientToServer,
+        stream_ids: Vec::new(),
+    };
     assert_eq!(
-        decode_frame_bytes(Bytes::from(empty_paths), limits),
+        encode_frame(&empty_validation, limits),
         Err(CodecError::EmptyList)
     );
 
     let mut empty_streams = encode_frame(&validation, limits).expect("validation");
-    empty_streams[FRAME_HEADER_LEN + 37..FRAME_HEADER_LEN + 39]
+    empty_streams[FRAME_HEADER_LEN + 17..FRAME_HEADER_LEN + 19]
         .copy_from_slice(&0_u16.to_be_bytes());
     assert_eq!(
         decode_frame_bytes(Bytes::from(empty_streams), limits),
         Err(CodecError::EmptyList)
+    );
+}
+
+#[test]
+fn tcp_carrier_validation_request_id_is_canonical_for_direction() {
+    let limits = CodecLimits::default();
+    for frame in [
+        Frame::TcpCarrierValidate {
+            validation_id: 1,
+            request_id: 1,
+            direction: PathMetricDirection::ClientToServer,
+            stream_ids: vec![StreamId(1)],
+        },
+        Frame::TcpCarrierValidate {
+            validation_id: 1,
+            request_id: 0,
+            direction: PathMetricDirection::ServerToClient,
+            stream_ids: vec![StreamId(1)],
+        },
+    ] {
+        assert_eq!(
+            encode_frame(&frame, limits),
+            Err(CodecError::InvalidCarrierValidationRequest)
+        );
+    }
+
+    let valid = Frame::TcpCarrierValidate {
+        validation_id: 1,
+        request_id: 0,
+        direction: PathMetricDirection::ClientToServer,
+        stream_ids: vec![StreamId(1)],
+    };
+    let mut noncanonical = encode_frame(&valid, limits).expect("validation");
+    noncanonical[FRAME_HEADER_LEN + 8..FRAME_HEADER_LEN + 16].copy_from_slice(&1_u64.to_be_bytes());
+    assert_eq!(
+        decode_frame_bytes(Bytes::from(noncanonical), limits),
+        Err(CodecError::InvalidCarrierValidationRequest)
     );
 }
 
@@ -633,18 +637,17 @@ fn tcp_carrier_codec_rejects_noncanonical_lists_on_encode_and_decode() {
             Err(CodecError::NonCanonicalList)
         );
     }
-    for accepted_paths in [
-        vec![accepted_path(2, 2), accepted_path(1, 1)],
-        vec![accepted_path(1, 1), accepted_path(1, 1)],
+    for stream_ids in [
+        vec![StreamId(2), StreamId(1)],
+        vec![StreamId(1), StreamId(1)],
     ] {
         assert_eq!(
             encode_frame(
                 &Frame::TcpCarrierValidate {
-                    trial_id: 1,
+                    validation_id: 1,
                     request_id: 0,
                     direction: PathMetricDirection::ClientToServer,
-                    accepted_paths,
-                    stream_ids: vec![StreamId(1)],
+                    stream_ids,
                 },
                 limits,
             ),
@@ -669,19 +672,16 @@ fn tcp_carrier_codec_rejects_noncanonical_lists_on_encode_and_decode() {
 
     let mut validation = encode_frame(
         &Frame::TcpCarrierValidate {
-            trial_id: 1,
+            validation_id: 1,
             request_id: 0,
             direction: PathMetricDirection::ClientToServer,
-            accepted_paths: vec![accepted_path(1, 1), accepted_path(2, 2)],
-            stream_ids: vec![StreamId(1)],
+            stream_ids: vec![StreamId(1), StreamId(2)],
         },
         limits,
     )
     .expect("canonical validation");
-    let first_path = FRAME_HEADER_LEN + 8 + 8 + 1 + 2;
-    let second_path = first_path + 18;
-    let first_record = validation[first_path..first_path + 18].to_vec();
-    validation[second_path..second_path + 18].copy_from_slice(&first_record);
+    let second_stream = FRAME_HEADER_LEN + 8 + 8 + 1 + 2 + 8;
+    validation[second_stream..second_stream + 8].copy_from_slice(&1_u64.to_be_bytes());
     assert_eq!(
         decode_frame_bytes(Bytes::from(validation), limits),
         Err(CodecError::NonCanonicalList)
@@ -691,7 +691,6 @@ fn tcp_carrier_codec_rejects_noncanonical_lists_on_encode_and_decode() {
 #[test]
 fn tcp_carrier_counts_are_resource_bounded_before_allocation() {
     let limits = CodecLimits {
-        max_paths: 1,
         max_streams: 1,
         ..CodecLimits::default()
     };
@@ -714,25 +713,13 @@ fn tcp_carrier_counts_are_resource_bounded_before_allocation() {
     );
 
     let validation = Frame::TcpCarrierValidate {
-        trial_id: 1,
+        validation_id: 1,
         request_id: 0,
         direction: PathMetricDirection::ClientToServer,
-        accepted_paths: vec![accepted_path(1, 1)],
         stream_ids: vec![StreamId(1)],
     };
-    let mut excessive_paths = encode_frame(&validation, limits).expect("validation");
-    excessive_paths[FRAME_HEADER_LEN + 17..FRAME_HEADER_LEN + 19]
-        .copy_from_slice(&u16::MAX.to_be_bytes());
-    assert_eq!(
-        decode_frame_bytes(Bytes::from(excessive_paths), limits),
-        Err(CodecError::TooManyPaths {
-            actual: usize::from(u16::MAX),
-            limit: 1,
-        })
-    );
-
     let mut excessive_streams = encode_frame(&validation, limits).expect("validation");
-    excessive_streams[FRAME_HEADER_LEN + 37..FRAME_HEADER_LEN + 39]
+    excessive_streams[FRAME_HEADER_LEN + 17..FRAME_HEADER_LEN + 19]
         .copy_from_slice(&u16::MAX.to_be_bytes());
     assert_eq!(
         decode_frame_bytes(Bytes::from(excessive_streams), limits),
@@ -758,15 +745,14 @@ fn tcp_carrier_counts_are_resource_bounded_before_allocation() {
     assert_eq!(
         encode_frame(
             &Frame::TcpCarrierValidate {
-                trial_id: 2,
+                validation_id: 2,
                 request_id: 0,
                 direction: PathMetricDirection::ClientToServer,
-                accepted_paths: vec![accepted_path(1, 1), accepted_path(2, 2)],
-                stream_ids: vec![StreamId(1)],
+                stream_ids: vec![StreamId(1), StreamId(2)],
             },
             limits,
         ),
-        Err(CodecError::TooManyPaths {
+        Err(CodecError::TooManyStreams {
             actual: 2,
             limit: 1,
         })
@@ -791,15 +777,14 @@ fn tcp_carrier_decoder_rejects_zero_ids_and_unknown_result() {
     );
 
     let result_frame = Frame::TcpCarrierResult {
-        trial_id: 1,
-        candidate_path_id: PathId(2),
+        validation_id: 1,
         direction: PathMetricDirection::ClientToServer,
         result: TcpCarrierValidationResult::Retain,
     };
-    let mut zero_trial = encode_frame(&result_frame, limits).expect("result");
-    zero_trial[FRAME_HEADER_LEN..FRAME_HEADER_LEN + 8].fill(0);
+    let mut zero_validation_id = encode_frame(&result_frame, limits).expect("result");
+    zero_validation_id[FRAME_HEADER_LEN..FRAME_HEADER_LEN + 8].fill(0);
     assert_eq!(
-        decode_frame_bytes(Bytes::from(zero_trial), limits),
+        decode_frame_bytes(Bytes::from(zero_validation_id), limits),
         Err(CodecError::InvalidIdentifier)
     );
 

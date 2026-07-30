@@ -1,8 +1,8 @@
 use super::{
     AuthNonce, AuthTag, CloseReason, DatagramFlowId, DatagramId, Frame, OffsetRange, PathId,
     PathMetricDirection, PathMetrics, PathUsage, PeerPathState, PeerPathStatus, PeerStatusCode,
-    ResetReason, SessionId, StreamDemandHint, StreamId, TargetAddr, TcpCarrierAcceptedPath,
-    TcpCarrierValidationResult, UnderlayProtocol,
+    ResetReason, SessionId, StreamDemandHint, StreamId, TargetAddr, TcpCarrierValidationResult,
+    UnderlayProtocol,
 };
 use bytes::Bytes;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
@@ -135,13 +135,9 @@ fn encoded_payload_capacity_hint(frame: &Frame) -> usize {
         Frame::TcpCarrierDemand { stream_ids, .. } => {
             10usize.saturating_add(stream_ids.len().saturating_mul(8))
         }
-        Frame::TcpCarrierValidate {
-            accepted_paths,
-            stream_ids,
-            ..
-        } => 21usize
-            .saturating_add(accepted_paths.len().saturating_mul(18))
-            .saturating_add(stream_ids.len().saturating_mul(8)),
+        Frame::TcpCarrierValidate { stream_ids, .. } => {
+            19usize.saturating_add(stream_ids.len().saturating_mul(8))
+        }
         Frame::OpenStream { .. } => 128,
         _ => 64,
     }
@@ -494,26 +490,17 @@ fn encode_payload(
             Ok(FrameKind::TcpCarrierDemand)
         }
         Frame::TcpCarrierValidate {
-            trial_id,
+            validation_id,
             request_id,
             direction,
-            accepted_paths,
             stream_ids,
         } => {
-            validate_nonzero_id(*trial_id)?;
-            validate_accepted_paths(accepted_paths, limits)?;
+            validate_nonzero_id(*validation_id)?;
+            validate_tcp_carrier_validation_request(*direction, *request_id)?;
             validate_stream_ids(stream_ids, limits, false)?;
-            put_u64(out, *trial_id);
+            put_u64(out, *validation_id);
             put_u64(out, *request_id);
             put_u8(out, path_metric_direction_to_u8(*direction));
-            put_u16(
-                out,
-                u16::try_from(accepted_paths.len()).map_err(|_| CodecError::LengthOverflow)?,
-            );
-            for accepted in accepted_paths {
-                put_u16(out, accepted.path_id.0);
-                encode_nonce(out, accepted.path_join_nonce);
-            }
             put_u16(
                 out,
                 u16::try_from(stream_ids.len()).map_err(|_| CodecError::LengthOverflow)?,
@@ -522,14 +509,12 @@ fn encode_payload(
             Ok(FrameKind::TcpCarrierValidate)
         }
         Frame::TcpCarrierResult {
-            trial_id,
-            candidate_path_id,
+            validation_id,
             direction,
             result,
         } => {
-            validate_nonzero_id(*trial_id)?;
-            put_u64(out, *trial_id);
-            put_u16(out, candidate_path_id.0);
+            validate_nonzero_id(*validation_id)?;
+            put_u64(out, *validation_id);
             put_u8(out, path_metric_direction_to_u8(*direction));
             put_u8(out, tcp_carrier_result_to_u8(*result));
             Ok(FrameKind::TcpCarrierResult)
@@ -746,47 +731,24 @@ fn decode_payload(
             })
         }
         FrameKind::TcpCarrierValidate => {
-            let trial_id = reader.get_u64()?;
-            validate_nonzero_id(trial_id)?;
+            let validation_id = reader.get_u64()?;
+            validate_nonzero_id(validation_id)?;
             let request_id = reader.get_u64()?;
             let direction = path_metric_direction_from_u8(reader.get_u8()?)?;
-            let path_count = reader.get_u16()? as usize;
-            validate_path_count(path_count, limits, true)?;
-            let required_path_bytes = path_count
-                .checked_mul(18)
-                .ok_or(CodecError::LengthOverflow)?;
-            if required_path_bytes > reader.remaining() {
-                return Err(CodecError::UnexpectedEof);
-            }
-            let mut accepted_paths = Vec::with_capacity(path_count);
-            for _ in 0..path_count {
-                let accepted = TcpCarrierAcceptedPath {
-                    path_id: PathId(reader.get_u16()?),
-                    path_join_nonce: decode_nonce(reader)?,
-                };
-                if accepted_paths
-                    .last()
-                    .is_some_and(|previous| previous >= &accepted)
-                {
-                    return Err(CodecError::NonCanonicalList);
-                }
-                accepted_paths.push(accepted);
-            }
+            validate_tcp_carrier_validation_request(direction, request_id)?;
             let stream_ids = decode_stream_ids(reader, limits, false)?;
             Ok(Frame::TcpCarrierValidate {
-                trial_id,
+                validation_id,
                 request_id,
                 direction,
-                accepted_paths,
                 stream_ids,
             })
         }
         FrameKind::TcpCarrierResult => {
-            let trial_id = reader.get_u64()?;
-            validate_nonzero_id(trial_id)?;
+            let validation_id = reader.get_u64()?;
+            validate_nonzero_id(validation_id)?;
             Ok(Frame::TcpCarrierResult {
-                trial_id,
-                candidate_path_id: PathId(reader.get_u16()?),
+                validation_id,
                 direction: path_metric_direction_from_u8(reader.get_u8()?)?,
                 result: tcp_carrier_result_from_u8(reader.get_u8()?)?,
             })
@@ -1090,6 +1052,17 @@ fn validate_nonzero_id(id: u64) -> Result<(), CodecError> {
     Ok(())
 }
 
+fn validate_tcp_carrier_validation_request(
+    direction: PathMetricDirection,
+    request_id: u64,
+) -> Result<(), CodecError> {
+    match (direction, request_id) {
+        (PathMetricDirection::ClientToServer, 0)
+        | (PathMetricDirection::ServerToClient, 1..=u64::MAX) => Ok(()),
+        _ => Err(CodecError::InvalidCarrierValidationRequest),
+    }
+}
+
 fn validate_path_count(
     count: usize,
     limits: CodecLimits,
@@ -1137,17 +1110,6 @@ fn validate_stream_ids(
 ) -> Result<(), CodecError> {
     validate_stream_count(stream_ids.len(), limits, allow_empty)?;
     if !stream_ids.windows(2).all(|pair| pair[0] < pair[1]) {
-        return Err(CodecError::NonCanonicalList);
-    }
-    Ok(())
-}
-
-fn validate_accepted_paths(
-    accepted_paths: &[TcpCarrierAcceptedPath],
-    limits: CodecLimits,
-) -> Result<(), CodecError> {
-    validate_path_count(accepted_paths.len(), limits, true)?;
-    if !accepted_paths.windows(2).all(|pair| pair[0] < pair[1]) {
         return Err(CodecError::NonCanonicalList);
     }
     Ok(())
@@ -1562,6 +1524,7 @@ pub enum CodecError {
     InvalidUtf8,
     InvalidCredentialId,
     InvalidPeerStatus,
+    InvalidCarrierValidationRequest,
     InvalidEnum,
     InvalidRange,
     InvalidIdentifier,
@@ -1600,6 +1563,12 @@ impl std::fmt::Display for CodecError {
             Self::InvalidUtf8 => write!(f, "string field is not valid UTF-8"),
             Self::InvalidCredentialId => write!(f, "invalid credential ID"),
             Self::InvalidPeerStatus => write!(f, "non-OK peer status contains path entries"),
+            Self::InvalidCarrierValidationRequest => {
+                write!(
+                    f,
+                    "TCP carrier validation direction and request ID disagree"
+                )
+            }
             Self::InvalidEnum => write!(f, "invalid enum value"),
             Self::InvalidRange => write!(f, "invalid offset range"),
             Self::InvalidIdentifier => write!(f, "identifier must be nonzero"),

@@ -1,6 +1,6 @@
-# MPTUNNEL v0.1.2 Product capability map
+# MPTUNNEL v0.1.4 Product capability map
 
-Status: release capability map with evidence-scoped platform claims
+Status: development capability map; release evidence remains incomplete
 
 Scope: Product and user-facing integration only
 
@@ -11,15 +11,16 @@ Companion: [Performance/Core capability map](PERFORMANCE_PLAN.md)
 Configuration authority: the strict parser and
 [configuration reference](../examples/config.reference.toml)
 
-This document records what the v0.1.2 source actually implements. A capability
-is not treated as shipped on a platform until its package and native evidence
-exist. Future ideas are listed only as explicit exclusions or evidence gaps.
+This document records what the v0.1.4 development source actually implements.
+A capability is not treated as shipped on a platform until its package and
+native evidence exist. Future ideas are listed only as explicit exclusions or
+evidence gaps.
 
 ## 1. Product/Core boundary
 
 | Product owns | Core owns |
 | --- | --- |
-| SOCKS5, HTTP CONNECT, fixed forwarding, and TUN ingress | MPP v4 frames and identities |
+| SOCKS5, HTTP CONNECT, fixed forwarding, and TUN ingress | MPP v5 frames and identities |
 | Canonical flow context and principals | Logical sessions, streams, datagrams, and path instances |
 | Routing, destination ACL, DNS, and outbound selection | Directional sequence numbers, Data ACKs, flow control, and reassembly |
 | Product balancer selection between independent outbounds | Carrier selection inside one selected MPP session |
@@ -425,7 +426,7 @@ configuration system.
 Product relies on the following already-wired Core contract without owning or
 tuning it:
 
-- MPP wire version 4 only;
+- MPP wire version 5 only;
 - reliable streams and datagrams over TCP, QUIC, or both;
 - one logical stream identity and directional offset space across carrier
   changes;
@@ -448,7 +449,7 @@ Portable desired state stays generic. Platform-specific device, route, DNS,
 and socket work remains under `src/platform/`; generic Product/Core code
 consumes prepared providers and host-protection interfaces.
 
-| Platform | Package target | Actual v0.1.2 Product status |
+| Platform | Package target | Actual v0.1.4 development status |
 | --- | --- | --- |
 | Linux amd64/arm64 | Static musl CLI | Proxy and external TUN implemented. Managed full/split TUN owns device, RPDB/routes, endpoint bypass, DNS publication, socket marking, readiness, and exact rollback. Linux-only RPDB tuning is isolated under `[inbounds.host.linux]`. |
 | Windows amd64/arm64 | Static-runtime MSVC CLI plus Wintun | Proxy implemented. Built-in managed VPN bridge covers Wintun, native-route snapshot, route/DNS transaction, native socket binding/protection, two-phase publication, and reverse cleanup. Native clean-machine lifecycle/performance evidence remains pending. |
@@ -503,9 +504,9 @@ or pushed as release assets.
 
 ## 8. Explicit non-goals
 
-v0.1.2 deliberately does not provide:
+v0.1.4 deliberately does not provide:
 
-- compatibility with MPP v1-v3, old configuration aliases, or unversioned
+- compatibility with MPP v1-v4, old configuration aliases, or unversioned
   APIs;
 - V2Ray/Xray/Hysteria protocol interoperability;
 - enterprise RBAC, SSO, billing, fleet control, compliance, or Kubernetes

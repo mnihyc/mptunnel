@@ -1,7 +1,7 @@
-# MPTUNNEL v0.1.2 Performance/Core capability and evidence map
+# MPTUNNEL v0.1.4 Performance/Core capability and evidence map
 
-Status: Core implemented; Core-frozen candidate guards recorded; tagged-binary
-and formal runtime acceptance incomplete
+Status: MPP v5 protocol contract established; Core runtime, tagged-binary, and
+formal performance acceptance incomplete
 
 Normative authority: [`RFC.md`](../RFC.md)
 
@@ -11,11 +11,10 @@ Evidence companions: [`PERFORMANCE.md`](PERFORMANCE.md) and
 [`LAB.md`](LAB.md)
 
 The evidence companions record the method, retained historical evidence, and
-current measurements. The Core-frozen no-feature protocol-v4 candidate has
-targeted representative guards, but later Product-only work changes the full
-binary identity. A tagged-binary guard and the fixed repeated matched matrix
-remain incomplete; these documents therefore make no broad competitiveness
-claim.
+current measurements. The Core-frozen no-feature protocol-v4 candidate remains
+historical evidence; it is not evidence for the MPP v5 development source. A
+tagged-binary guard and the fixed repeated matched matrix remain incomplete;
+these documents therefore make no broad competitiveness claim.
 
 ## 1. Authority and frozen model
 
@@ -24,7 +23,8 @@ recovery, datagrams, migration, security, and platform neutrality. If code,
 tests, this document, or a lab assumption conflicts with the RFC, the non-RFC
 artifact is wrong.
 
-The v0.1.2 performance model is frozen. Performance work MUST NOT change:
+The MPP v5 performance model in `RFC.md` is authoritative. Performance work
+MUST NOT change:
 
 - service quanta, startup windows, evidence sample floors, ordering or flight
   envelopes;
@@ -51,7 +51,7 @@ A user-configured hard resource envelope remains valid Product input.
 Competitive evidence uses one declared canonical configuration for candidate
 and controls; configuration is never changed per row to improve a result.
 
-Protocol v4 is final for this release:
+Protocol v5 is the sole current source protocol:
 
 - TCP uses TLS 1.3 and negotiates no ALPN.
 - QUIC negotiates standard `h3`; each carrier stream is an ordinary
@@ -63,7 +63,7 @@ Protocol v4 is final for this release:
   per-request opt-in.
 - The evidence identity is
   `tcp-tls13-no-alpn+quic-h3-post-data-rfc9297`.
-- Versions 1 through 3 and every superseded carrier presentation are rejected.
+- Versions 1 through 4 and every superseded carrier presentation are rejected.
   There is no compatibility codec, private ALPN, draft listener, or custom
   TLS-like protocol.
 
@@ -73,7 +73,7 @@ Performance/Core owns only the MPP session and data plane:
 
 | Core owns | Product owns |
 | --- | --- |
-| MPP v4 codec, authentication transcript, identities, and bounds | CLI, TOML, API, persistence, and reload |
+| MPP v5 codec, authentication transcript, identities, and bounds | CLI, TOML, API, persistence, and reload |
 | Stream offsets, Data ACK, shared receive window, FIN, reset, and detach | Routing, DNS, ingress, and destination policy |
 | Datagram identity, TTL, feedback, retries, and reassembly | Outbound and independent-server selection |
 | TCP and QUIC carrier adapters and typed observations | Balancer probes, circuits, stickiness, and new-flow retry |
@@ -120,7 +120,7 @@ The implementation preserves every invariant in RFC Section 16:
 
 These invariants are not optimization candidates.
 
-## 4. Implemented v0.1.2 Core
+## 4. Implemented Core
 
 ### 4.1 Reliable data plane
 
@@ -356,7 +356,7 @@ Forbidden optimization includes:
 - retaining rejected experiments, compatibility paths, or diagnostic-only
   code in the shipped hot path.
 
-The target for v0.1.2 is ordinary non-regression. A theoretically necessary
+The target for v0.1.4 is ordinary non-regression. A theoretically necessary
 latency/stability tradeoff still requires a preregistered owner-approved
 record with theoretical rationale, Pareto evidence, ablation evidence, and
 the observed normalized cost. It has no universal maximum-regression cap, and
@@ -478,7 +478,7 @@ tagged-binary fault control, so it does not prove broad competitiveness or
 transfer historical failover results to protocol v4. Exact rows, path shares,
 identities, and host limitations are recorded in `docs/PERFORMANCE.md`.
 
-MPTUNNEL may claim only what fresh protocol-v4 rows establish:
+MPTUNNEL may claim only what fresh protocol-v5 rows establish:
 
 - one topology cannot support "faster on every Internet";
 - shaped Docker is not the public Internet;

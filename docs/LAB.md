@@ -79,8 +79,8 @@ Do not combine these cohorts in one performance claim:
   inventory, time window, and runner. Record it as not run when those inputs do
   not exist.
 
-Pre-v4 results are historical references only. Current performance claims
-require fresh protocol-v4 matched rows.
+Pre-v5 results are historical references only. Current performance claims
+require fresh protocol-v5 matched rows.
 
 ## Topology
 

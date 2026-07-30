@@ -7,8 +7,9 @@ layers.
 
 The shared Multipath Proxy Protocol (MPP) data layer provides directional data
 sequence numbers, Data ACKs, flow control, measured path selection,
-cross-path reinjection, and failover. The current wire format is MPP v4 and is
-not compatible with protocol v1, v2, or v3.
+cross-path reinjection, and failover. The current source wire format is MPP v5
+and is not compatible with protocol v1 through v4. The stable v0.1.2 release
+uses MPP v4; measurements below identify that release protocol explicitly.
 
 > **Release status:** v0.1.2 is the current stable release. The protocol is
 > custom and has not received an independent security audit. Review the

@@ -11,6 +11,56 @@ Historical entries below are retained as evidence of the decisions made at
 their recorded time. When a later entry changes an earlier decision, the later
 entry is authoritative.
 
+## 2026-07-30T22:39:23+08:00: corrected inactive-range gate passed
+
+- Name: valid TCP QoS fixture and exact QUIC datagram terminal state
+- Category: Core performance evidence, QUIC correctness, and source gate
+- State: complete; clean baseline is ready for session carrier-group ownership
+- Corrected inactive-range evidence:
+  - clean commit `3cc2d40f9fc9793ba59dd24777dada77ba1aa581`,
+    valid host, diagnostics disabled, fixed 30-second load, three synchronized
+    application flows, 500 Mbps per-flow rate, zero configured loss, and the
+    established fat-path propagation delay;
+  - adjacent inactive `1-1`/`1-3` ranges delivered `355.455`/`356.173` Mbps
+    download and receiver-confirmed `336.391`/`337.620` Mbps upload;
+  - every saved child qdisc reports the intended aggregate `limit 45256p` and
+    per-flow `flow_limit 15256p`, with zero drops and zero `flows_plimit`;
+  - the corrected pairs therefore establish that the configured maximum has
+    no throughput effect while expansion is disconnected; and
+  - complete evidence is retained under
+    `./.tmp/lab/results/current-3cc2d40-corrected-per-flow-20260730/`.
+- QUIC terminal-state completion:
+  - the first full source gate correctly rejected merely removing the unsafe
+    stream-ID watermark, because a known retired request would re-enter the
+    bounded pre-registration queue;
+  - the router now keeps an exact retired-ID set populated only by
+    generation-owned route retirement and bounded to the configured route
+    capacity;
+  - active-route lookup remains first, exact retired IDs drop immediately, and
+    only unknown IDs enter the already bounded one-RTT handoff queue;
+  - this preserves concurrent out-of-order request registration without
+    retaining unbounded terminal state or inferring closure from stream-ID
+    order.
+- Verification:
+  - both persistent request-route retirement tests pass;
+  - the complete library gate passes: 1,401 tests, zero failures;
+  - `cargo check --locked --all-targets` passes;
+  - `cargo clippy --locked --all-targets -- -D warnings` passes;
+  - all 198 persistent lab tests pass; and
+  - formatting and whitespace checks pass.
+- Decision:
+  - historical representative performance and the inactive `1-3` boundary are
+    satisfactory;
+  - no performance parameter, timing, scheduler, congestion controller,
+    transport default, production queue, or payload-path operation was changed
+    by the fixture or exact-terminal corrections; and
+  - automatic elastic TCP expansion remains disconnected until one
+    session-owned carrier group can maintain minimum readiness and own every
+    candidate transition.
+- Next: establish that carrier-group owner without manufacturing absent paths,
+  then prove its minimum-readiness lifecycle before connecting aggregate
+  expansion evidence.
+
 ## 2026-07-30T22:29:53+08:00: restored performance reproduced; invalid QoS fixture isolated
 
 - Name: post-audit representative Core gate and retained-patch correction

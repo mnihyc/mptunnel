@@ -9,7 +9,7 @@ use crate::protocol::codec::CodecLimits;
 use crate::protocol::{DatagramFlowId, DatagramId, Frame};
 use bytes::{Buf, Bytes};
 use quinn::Connection;
-use std::collections::{HashMap, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -30,6 +30,8 @@ struct Route {
 struct RoutingTable {
     active: HashMap<u64, Route>,
     pending: HashMap<u64, VecDeque<PendingPacket>>,
+    retired: HashSet<u64>,
+    retired_order: VecDeque<u64>,
 }
 
 #[derive(Debug)]
@@ -335,6 +337,7 @@ impl NativeDatagramReceiver {
             .is_some_and(|route| route.generation == self.generation)
         {
             routing.active.remove(&self.request_stream_id);
+            remember_retired_route(&self.state, &mut routing, self.request_stream_id);
         }
     }
 
@@ -527,6 +530,10 @@ fn route_datagram(
         }
         return Ok(());
     }
+    if routing.retired.contains(&request_stream_id) {
+        state.dropped_packets.fetch_add(1, Ordering::Relaxed);
+        return Ok(());
+    }
     // RFC 9297 permits a receiver to retain an HTTP Datagram for roughly one
     // RTT while the associated request stream is still being created. H3
     // request opens may register concurrently, so stream-ID order cannot
@@ -552,6 +559,20 @@ fn route_datagram(
         packet: budgeted,
     });
     Ok(())
+}
+
+fn remember_retired_route(state: &HubState, routing: &mut RoutingTable, request_stream_id: u64) {
+    if !routing.retired.insert(request_stream_id) {
+        return;
+    }
+    routing.retired_order.push_back(request_stream_id);
+    while routing.retired_order.len() > state.max_routes {
+        let retired = routing
+            .retired_order
+            .pop_front()
+            .expect("retired native route length checked");
+        routing.retired.remove(&retired);
+    }
 }
 
 fn pending_route_wait(connection: &Connection) -> Duration {

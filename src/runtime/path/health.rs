@@ -443,6 +443,9 @@ impl ClientPathHealthRecord {
     }
 
     pub(in crate::runtime) fn reserve_load(&mut self, lane: TrafficClass, now: Instant) -> bool {
+        // Selection may precede an asynchronous open. Revalidate at the
+        // reservation commit point so a concurrent disable or failure cannot
+        // publish load onto a path that is no longer schedulable.
         self.maintain(now);
         if self.manual_disabled
             || !matches!(

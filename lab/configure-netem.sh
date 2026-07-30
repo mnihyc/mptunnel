@@ -180,7 +180,7 @@ apply_profile_all() {
 apply_tcp_per_flow_qos() {
   local subnet_prefix="$1"
   local maxrate="$2"
-  local iface limit_packets aggregate_rate
+  local iface limit_packets flow_limit_packets aggregate_rate
 
   iface="$(interface_for_subnet "$subnet_prefix")"
   if [[ -z "$iface" ]]; then
@@ -194,8 +194,15 @@ apply_tcp_per_flow_qos() {
   limit_packets="${MPTUNNEL_LAB_NETEM_LIMIT_PACKETS:-$(
     netem_limit_packets "$aggregate_rate" "$fat_delay" "0ms"
   )}"
+  flow_limit_packets="$(
+    netem_limit_packets "$maxrate" "$fat_delay" "0ms"
+  )"
   if [[ ! "$limit_packets" =~ ^[1-9][0-9]*$ ]]; then
     echo "MPTUNNEL_LAB_NETEM_LIMIT_PACKETS must be a positive integer" >&2
+    exit 2
+  fi
+  if [[ ! "$flow_limit_packets" =~ ^[1-9][0-9]*$ ]]; then
+    echo "derived TCP per-flow queue limit must be a positive integer" >&2
     exit 2
   fi
 
@@ -206,6 +213,8 @@ apply_tcp_per_flow_qos() {
     limit "$limit_packets" \
     delay "$fat_delay"
   tc qdisc add dev "$iface" parent 1:1 handle 10: fq \
+    limit "$limit_packets" \
+    flow_limit "$flow_limit_packets" \
     maxrate "$maxrate"
 }
 

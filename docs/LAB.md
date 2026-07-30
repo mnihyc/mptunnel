@@ -153,8 +153,10 @@ For download and upload, it runs adjacent `tcp-carriers=1-1` and
 post-connect start, and a 30-second load window. The per-flow profile applies a
 500 Mbps `fq maxrate` to each native TCP flow; the shared profile applies one
 200 Mbps aggregate bottleneck. Both use the fat-path propagation delay, zero
-configured loss, a derived queue limit, and saved `tc -s -d` state. The client
-URI alone owns the carrier range.
+configured loss, BDP-derived aggregate and per-flow queue limits, and saved
+`tc -s -d` state. The per-flow limit prevents Linux `fq`'s small default queue
+from adding an undocumented loss model on the high-BDP path. The client URI
+alone owns the carrier range.
 
 This cohort is a measurement fixture, not evidence that the current runtime
 has retained elastic carriers. Accept expansion only from repeated adjacent

@@ -193,6 +193,7 @@ class RunnerContractTests(unittest.TestCase):
 
         self.assertIn("root handle 1: netem", per_flow_profile)
         self.assertIn("parent 1:1 handle 10: fq", per_flow_profile)
+        self.assertIn('flow_limit "$flow_limit_packets"', per_flow_profile)
         self.assertIn('maxrate "$maxrate"', per_flow_profile)
         self.assertIn('tc qdisc del dev "$iface" root', per_flow_profile)
         self.assertIn("root handle 1: netem", shared_profile)

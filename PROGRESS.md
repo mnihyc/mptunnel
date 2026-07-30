@@ -11,6 +11,75 @@ Historical entries below are retained as evidence of the decisions made at
 their recorded time. When a later entry changes an earlier decision, the later
 entry is authoritative.
 
+## 2026-07-30T22:29:53+08:00: restored performance reproduced; invalid QoS fixture isolated
+
+- Name: post-audit representative Core gate and retained-patch correction
+- Category: Core performance, QUIC correctness, and lab validity
+- State: representative gate passes; inactive shared-bottleneck range is
+  inert; corrected per-flow fixture rerun and complete source gate remain open
+- Representative evidence:
+  - clean commit `71463212bb86bd8274cbb76072d7697de4d46d68`,
+    protocol v5, valid host, diagnostics disabled, fixed Linux Docker
+    topology, 20-second load, and two application flows;
+  - TCP single/equal-fat download delivered `126.708`/`769.951` Mbps and
+    receiver-confirmed single/equal-fat upload delivered `132.318`/`534.774`
+    Mbps; the exact equal-fat upload repeated at `535.664` Mbps;
+  - QUIC single/equal-fat download delivered `247.703`/`743.915` Mbps and
+    receiver-confirmed single/equal-fat upload delivered `228.999`/`704.738`
+    Mbps; the only ambiguous exact upload repeated at `788.547` Mbps;
+  - no steady-state multipath collapse reproduced. QUIC returned to the
+    historical range in every direction, including the historical-best range
+    on the repeated upload; and
+  - raw manifests, qdisc state, configs, telemetry, and rows are retained under
+    `./.tmp/lab/results/current-7146321-representative-20260730/` and
+    `./.tmp/lab/results/current-7146321-multipath-upload-repeat-20260730/`.
+- Inactive-range evidence:
+  - the fixed shared 200 Mbps bottleneck produced adjacent `1-1`/`1-3`
+    download rows of `158.558`/`158.737` Mbps and upload lower bounds of
+    `154.676`/`154.969` Mbps, establishing no range-dependent effect;
+  - the per-flow rows were contradictory rather than evidence of expansion:
+    `318.492`/`270.391` Mbps download and `59.310`/`237.293` Mbps upload;
+  - saved `tc -s -d` evidence identified the cause in the fixture: the child
+    `fq` retained its default 100-packet per-flow queue on a 500 Mbps,
+    360 ms-RTT path and recorded `flows_plimit` drops in every per-flow row,
+    including 6,473 drops in the low upload result; and
+  - that accidental queue overflow is neither configured single-flow QoS nor
+    runtime behavior, so the per-flow rows are rejected and will not be used
+    to justify Core changes.
+- Corrections:
+  - the per-flow fixture now applies its existing BDP-derived queue model to
+    both the three-flow aggregate and each `fq` flow, leaving duration,
+    propagation, rate, loss, concurrency, and all production parameters
+    unchanged;
+  - removed the QUIC HTTP-datagram router's largest-registered-stream
+    watermark. Concurrent H3 request opens need not register in stream-ID
+    order, so the watermark could misclassify a valid lower-ID first datagram
+    as belonging to a closed stream;
+  - exact generation-owned route retirement remains, while unknown routes stay
+    bounded by the existing global route, byte, packet, and one-RTT expiry
+    limits; and
+  - documented `reserve_load` as the required commit fence against a disable
+    or failure racing an asynchronous open. It remains flow-setup work, not a
+    payload-path mechanism.
+- Focused verification:
+  - all 19 persistent lab runner-contract tests pass;
+  - all seven native HTTP-datagram and route-retirement tests pass; and
+  - formatting and whitespace checks pass.
+- Decision:
+  - no retained change after historical authority modifies congestion
+    control, pacing, recovery, scheduling, windows, transport defaults, queue
+    geometry, or `quinn-proto`;
+  - retain independently justified wire-extent validation,
+    queue-before-publication ownership, transactional telemetry, balancer
+    deadlines, port migration, asynchronous-open fencing, and peer-owned
+    retirement;
+  - do not interpret the invalid per-flow rows as product behavior and do not
+    tune the Core against them; and
+  - automatic elastic TCP expansion remains disconnected.
+- Next: checkpoint these two corrections, rerun the corrected four-row
+  per-flow cohort from a clean source, then complete the full source gate
+  before establishing session carrier-group ownership.
+
 ## 2026-07-30T21:57:16+08:00: false topology removed and result commit defined
 
 - Name: retained-patch reflection and MPP v5 lifecycle correction

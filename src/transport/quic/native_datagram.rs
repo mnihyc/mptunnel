@@ -30,7 +30,6 @@ struct Route {
 struct RoutingTable {
     active: HashMap<u64, Route>,
     pending: HashMap<u64, VecDeque<PendingPacket>>,
-    largest_registered_request_stream_id: Option<u64>,
 }
 
 #[derive(Debug)]
@@ -169,11 +168,6 @@ impl NativeDatagramHub {
             .routing
             .lock()
             .expect("native datagram route lock");
-        routing.largest_registered_request_stream_id = Some(
-            routing
-                .largest_registered_request_stream_id
-                .map_or(request_stream_id, |largest| largest.max(request_stream_id)),
-        );
         let replacing_active = routing.active.contains_key(&request_stream_id);
         let pending = routing.pending.remove(&request_stream_id);
         if !replacing_active && !make_room_for_active_route(&self.state, &mut routing) {
@@ -533,19 +527,13 @@ fn route_datagram(
         }
         return Ok(());
     }
-    if routing
-        .largest_registered_request_stream_id
-        .is_some_and(|largest| request_stream_id <= largest)
-    {
-        state.dropped_packets.fetch_add(1, Ordering::Relaxed);
-        return Ok(());
-    }
-
     // RFC 9297 permits a receiver to retain an HTTP Datagram for roughly one
-    // RTT while the associated request stream is still being created. This is
-    // the normal first-packet race between QUIC DATAGRAM and H3 HEADERS/DATA,
-    // not a reliability mechanism: the wait adds no sender RTT and expiry
-    // still drops the packet.
+    // RTT while the associated request stream is still being created. H3
+    // request opens may register concurrently, so stream-ID order cannot
+    // distinguish that race from a retired route. Exact active generations
+    // own retirement; unknown IDs remain within the route, byte, queue, and
+    // expiry bounds below. The wait adds no sender RTT and expiry still drops
+    // the packet.
     if !routing.pending.contains_key(&request_stream_id)
         && routing.active.len().saturating_add(routing.pending.len()) >= state.max_routes
     {

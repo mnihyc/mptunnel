@@ -11,6 +11,106 @@ Historical entries below are retained as evidence of the decisions made at
 their recorded time. When a later entry changes an earlier decision, the later
 entry is authoritative.
 
+## 2026-07-31T03:19:27+08:00: elastic TCP RFC approved after retained-change audit
+
+- Name: destructive Core authority and post-baseline patch reflection
+- Category: RFC conformance, Core architecture, and performance change control
+- State: the RFC model passed independent role, lifecycle, resource, and
+  implementability gates; runtime expansion, validation, retention, and
+  contraction remain disconnected and make no Product or performance claim
+- Retained implementation:
+  - keep canonical protocol bounds, hostile-input rejection, exact QUIC
+    HTTP-datagram route retirement, admission-before-readiness,
+    queue-before-publication flight ownership, asynchronous-open generation
+    fences, transactional observability, canonical Product identities,
+    demand-driven DNS, balancer attempt lifetimes, endpoint port sets, native
+    QUIC migration, and the configured-minimum TCP group owner;
+  - each retained behavior covers malformed authenticated input, an ordered
+    runtime race, a reload/failover transition, or an explicit Product
+    requirement;
+  - no retained post-v0.1.2 change alters congestion control, pacing, native
+    recovery, transport windows, scheduler formulas, steady-state defaults, or
+    `quinn-proto`; and
+  - keep `CodecLimits.max_paths` because it bounds active peer-status frames,
+    but remove codec-only `max_streams` with the obsolete plural carrier schema;
+    runtime `ResourceLimits.max_streams` remains independently required.
+- Removed or rejected implementation:
+  - keep removed the dormant maximum-carrier topology, per-stream carrier
+    verdicts, waiter-owned lifecycle, disconnected observer/service stack,
+    source or locator identity, ACK-silence reopening, periodic retry, duplicate
+    cleanup owners, and overlay congestion or pacing;
+  - reject ordinary pre-retention scheduling and capacity-payload retention
+    evidence because neither proves bounded unique-original Product gain;
+  - reject provisional authority, rollback, tombstones, peer-assumed deadlines,
+    post-result withdrawal, and hidden result-reason classifications; and
+  - reject the earlier preserve-on-disable behavior: client-local policy cannot
+    stop server-to-client use of a live carrier, so disable now requires ordered
+    carrier drain and fresh instances on re-enable.
+- Approved model:
+  - configured-minimum carriers authenticate as `ORDINARY`; an actual elastic
+    carrier authenticates as `VALIDATION`, consumes one real reservation and
+    `PathId`, and has no ordinary authority before exact `RETAIN` settlement;
+  - one throughput placement-to-saturation edge owns one sequential
+    group-selection sequence, with one live candidate, at most one attempt per
+    client-local group, and no group identity on wire;
+  - a validation binds one direction of one exact target attachment and uses
+    only unique-original Product work; capacity payload, duplication,
+    reinjection, native ACKs, and peer metrics are never verdict evidence;
+  - after the Data ACK startup floor, assisted validation uses the existing
+    mature path-flight and queue model, so the cold startup bound cannot cap a
+    high-BDP candidate;
+  - the sender records two candidate-free pre samples, two consecutive assisted
+    samples, and two candidate-free post samples; `RETAIN` requires the minimum
+    assisted target and session rates to exceed their independent four-sample
+    reference maxima using exact fractions and no fixed percentage or EWMA;
+  - the cumulative horizon need not fit simultaneously in a stream window;
+    every instantaneous flight, queue, credit, repair, reorder, window, and
+    memory bound still applies;
+  - immutable result plus exact result acknowledgment commits authority at
+    role-correct points: C2S client result serialization/ACK receipt and S2C
+    client result acceptance/ACK serialization;
+  - local non-restarting establishment, validation, and Product-phase leases
+    bound resources; expiry or disable enters ordered carrier retirement;
+  - a NO_GAIN attempt and later admission gate have distinct state: the client
+    tracks attempted local groups, while the sender gates a later generation
+    until ordinary membership/policy changes or two candidate-free session
+    samples establish a disjoint service interval;
+  - later throughput work may provide that rearm evidence after the original
+    target ends, while target change, source IP, interface, locator, elapsed
+    time, backpressure, or ACK silence alone cannot reopen expansion; and
+  - TCP port hopping is planned replacement with no state transfer; QUIC uses
+    native rebinding/migration; random port choice, the five-minute default, and
+    five-second safety floor are endpoint-local maintenance policy, never
+    capacity or failure evidence.
+- Independent evidence:
+  - the retained-runtime gate found the abandoned observer/service stack fully
+    removed and every other retained change reachable and justified;
+  - the Product-evidence review rejected a one-assisted-sample verdict and
+    established the two-pre/two-assisted/two-post geometry;
+  - the wire/lifecycle review established exact role fences, settlement
+    barriers, local leases, minimum-member overlap, and no cross-carrier state
+    transfer;
+  - the suppression review approved the bounded multi-group model after removal
+    of the unjustified `path_probe_interval_ms` elastic timer; and
+  - the final contradiction gate returned `APPROVE`.
+- Release-blocking reachable gaps:
+  - MPP v5 `TCP_CARRIER_*` remains codec-only and plural in source; implement
+    the singular complete vertical slice or remove the version as one unit;
+  - configured TCP maximum has no elastic runtime consumer;
+  - ranged TCP accepts `port_hop_interval_ms`, but only QUIC consumes it; and
+  - received `SESSION_CLOSE` lacks one session-wide terminal owner and may
+    reconnect the same `SessionId`.
+- Performance boundary:
+  - this checkpoint changes only `RFC.md` and this ledger;
+  - no runtime operation, timing, transport, scheduler, queue, window, bundle,
+    or platform path changed; and
+  - QoS gain, shared-bottleneck no-gain, disruption recovery, and the full
+    representative no-regression matrix remain mandatory before retention.
+- Next: checkpoint this authority, align the wire to singular fail-closed
+  validation purpose, and implement one complete client-to-server Product
+  lifecycle without changing the configured-minimum or ordinary payload fast
+  paths.
+
 ## 2026-07-31T00:22:00+08:00: configured-minimum TCP group owner accepted
 
 - Name: session-owned TCP configured-minimum lifecycle and retained-patch

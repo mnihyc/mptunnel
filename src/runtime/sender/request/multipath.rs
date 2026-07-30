@@ -528,8 +528,20 @@ impl RequestMultipathController {
         if observer.writer.lifecycle() != lifecycle {
             return TcpServiceObserverRemoval::DifferentLifecycle;
         }
-        self.tcp_service = None;
+        let invalidated = self.invalidate_tcp_service_observer();
+        debug_assert!(invalidated);
         TcpServiceObserverRemoval::Removed
+    }
+
+    pub(super) fn invalidate_tcp_service_observer(&mut self) -> bool {
+        let Some(observer) = self.tcp_service.take() else {
+            return false;
+        };
+        let coordinator = observer.coordinator.clone();
+        let mut transaction = coordinator.lock();
+        debug_assert_eq!(transaction.lifecycle(), observer.writer.lifecycle());
+        transaction.stop();
+        true
     }
 
     pub(super) fn finish_tcp_service_ack_active(

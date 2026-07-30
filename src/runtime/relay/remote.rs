@@ -18,6 +18,7 @@ use crate::mux::stream::ReliableSendStream;
 use crate::protocol::{Frame, UnderlayProtocol};
 use crate::runtime::error::{RuntimeError, reliable_path_error_is_migratable};
 use crate::runtime::path::ClientPathContext;
+use crate::runtime::sender::RequestSenderService;
 use crate::runtime::stream::{
     ReliablePathStream, ReliableRelayAttachOutcome, ReliableRelayRemoteSet,
 };
@@ -60,6 +61,7 @@ struct RelayPathAttachResult {
 
 async fn attach_relay_path_candidates(
     context: &ClientPathContext,
+    sender: &mut RequestSenderService,
     remotes: &mut ReliableRelayRemoteSet,
     request: RelayPathAttachRequest<'_>,
 ) -> Result<RelayPathAttachResult, RuntimeError> {
@@ -88,7 +90,9 @@ async fn attach_relay_path_candidates(
                 );
                 match attach_control_result {
                     Ok(()) => {
-                        let attach_outcome = remotes.attach_candidate(opened);
+                        let attach_outcome = remotes.attach_candidate_before_commit(opened, |_| {
+                            sender.invalidate_tcp_service_observer();
+                        });
                         match attach_outcome {
                             ReliableRelayAttachOutcome::Attached => {
                                 return Ok(RelayPathAttachResult {
@@ -131,6 +135,7 @@ async fn attach_relay_path_candidates(
 #[allow(clippy::too_many_arguments)]
 pub(in crate::runtime) async fn attach_reliable_relay_paths(
     context: &ClientPathContext,
+    sender: &mut RequestSenderService,
     spec: &ReliableRelayOpenSpec,
     lane: TrafficClass,
     remotes: &mut ReliableRelayRemoteSet,
@@ -142,6 +147,7 @@ pub(in crate::runtime) async fn attach_reliable_relay_paths(
     let mut recovery_excluded_paths = HashSet::<RelayPathKey>::new();
     attach_reliable_relay_paths_with_claims_and_recovery_exclusions(
         context,
+        sender,
         spec,
         lane,
         remotes,
@@ -157,6 +163,7 @@ pub(in crate::runtime) async fn attach_reliable_relay_paths(
 #[allow(clippy::too_many_arguments)]
 pub(super) async fn attach_reliable_relay_paths_with_claims_and_recovery_exclusions(
     context: &ClientPathContext,
+    sender: &mut RequestSenderService,
     spec: &ReliableRelayOpenSpec,
     lane: TrafficClass,
     remotes: &mut ReliableRelayRemoteSet,
@@ -177,6 +184,7 @@ pub(super) async fn attach_reliable_relay_paths_with_claims_and_recovery_exclusi
     if matches!(mode, ReliableRelayAttachMode::BulkStriping) {
         let result = attach_relay_path_candidates(
             context,
+            sender,
             remotes,
             RelayPathAttachRequest {
                 spec,
@@ -203,6 +211,7 @@ pub(super) async fn attach_reliable_relay_paths_with_claims_and_recovery_exclusi
     if prefer_reinjection_alternative {
         let result = attach_relay_path_candidates(
             context,
+            sender,
             remotes,
             RelayPathAttachRequest {
                 spec,
@@ -234,6 +243,7 @@ pub(super) async fn attach_reliable_relay_paths_with_claims_and_recovery_exclusi
     }
     let result = attach_relay_path_candidates(
         context,
+        sender,
         remotes,
         RelayPathAttachRequest {
             spec,

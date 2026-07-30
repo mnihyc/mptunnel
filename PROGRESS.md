@@ -2387,3 +2387,47 @@ entry is authoritative.
   - formatting and whitespace checks passed. No parameter, timer, carrier
     establishment, Product placement, or performance policy changed, and no
     new performance verdict is claimed.
+
+## 2026-07-30T16:11:00+08:00: Actor-owned request observer invalidation
+
+- Name: synchronous request writer freeze at actor fence changes
+- Category: Core runtime and RFC alignment
+- State: actor-owned request invalidation complete; external authenticated
+  path-state invalidation, response symmetry, validation-only candidate
+  attachment, and the session producer remain disconnected
+- Content:
+  - made exact-lifecycle request observer removal stop the shared writer
+    coordinator before dropping actor state, while a stale lifecycle remains
+    an explicit no-op against current commit authority;
+  - synchronously stopped an installed observer before every actor-owned
+    request demand transition, local EOF transition, successful attachment
+    membership commit, exact attached-path failure, and actor exit;
+  - placed attachment invalidation after all fallible candidate setup but
+    before publishing the new path and attachment incarnation, so no writer
+    commit can enter between a changed topology and the coordinator stop;
+  - stopped path-failure authority before the asynchronous detach and close
+    sequence, retaining the established early load-release behavior; and
+  - threaded the existing serialized sender owner through cold attachment
+    helpers rather than introducing a second authority, timer, polling loop,
+    locator inference, or transport-specific implementation.
+- Ordinary-path cost:
+  - no scheduling, admission, timing, carrier-count, congestion-control, or
+    transport parameter changed;
+  - inactive removal and failure checks remain one nullable observer branch;
+    topology callbacks run only on successful attachment, and EOF or demand
+    invalidation runs only on the corresponding state transition; and
+  - no validation candidate can yet attach and no service producer is
+    connected.
+- Evidence:
+  - the existing observer-provenance regression now proves stale removal
+    preserves active authority, exact removal stops later commits, and repeated
+    exact removal is idempotent;
+  - the existing path-failure cleanup regression proves coordinator stop is
+    visible while detach cleanup is still blocked;
+  - the existing candidate-load regression proves the actor callback occurs
+    on the successful membership-commit boundary;
+  - the complete root library suite passed: 1,420 tests;
+  - every Cargo target compiles under the locked dependency graph; and
+  - formatting and whitespace checks passed. This is a correctness boundary,
+    not a new performance verdict; the historical-performance gate remains
+    mandatory before any producer or candidate placement is connected.

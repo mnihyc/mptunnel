@@ -190,6 +190,10 @@ impl RequestSenderService {
         self.multipath.remove_tcp_service_observer(lifecycle)
     }
 
+    pub(in crate::runtime) fn invalidate_tcp_service_observer(&mut self) -> bool {
+        self.multipath.invalidate_tcp_service_observer()
+    }
+
     /// Runs one complete Product ACK transaction under the shared lifecycle
     /// writer lock when an observer is installed. The inactive path has one
     /// nullable branch and otherwise executes its unchanged callback.
@@ -223,6 +227,9 @@ impl RequestSenderService {
         remotes: &mut ReliableRelayRemoteSet,
         instance: RelayPathInstance,
     ) -> bool {
+        if remotes.contains_path_instance(instance) {
+            self.invalidate_tcp_service_observer();
+        }
         remotes.fail_path_instance(context, instance).await
     }
 

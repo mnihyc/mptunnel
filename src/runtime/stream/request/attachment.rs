@@ -559,20 +559,29 @@ impl ReliableRelayRemoteSet {
         &mut self,
         opened: OpenedRemoteStream,
     ) -> ReliableRelayAttachOutcome {
-        self.attach_opened(opened, true)
+        self.attach_opened(opened, true, |_| {})
     }
 
     pub(in crate::runtime) fn attach_candidate(
         &mut self,
         opened: OpenedRemoteStream,
     ) -> ReliableRelayAttachOutcome {
-        self.attach_opened(opened, false)
+        self.attach_candidate_before_commit(opened, |_| {})
+    }
+
+    pub(in crate::runtime) fn attach_candidate_before_commit(
+        &mut self,
+        opened: OpenedRemoteStream,
+        before_membership_commit: impl FnOnce(&Self),
+    ) -> ReliableRelayAttachOutcome {
+        self.attach_opened(opened, false, before_membership_commit)
     }
 
     fn attach_opened(
         &mut self,
         opened: OpenedRemoteStream,
         retain_open_load: bool,
+        before_membership_commit: impl FnOnce(&Self),
     ) -> ReliableRelayAttachOutcome {
         let path_index = opened.path_index();
         let underlay = opened.stream().underlay;
@@ -654,6 +663,7 @@ impl ReliableRelayRemoteSet {
         if let Ok(Some(proof_id)) = path.stream.enqueue_path_proof() {
             path.path_proof_id = Some(proof_id);
         }
+        before_membership_commit(self);
         self.paths.push(path);
         self.next_instance_id = next_instance_id;
         self.membership_generation = next_membership_generation;

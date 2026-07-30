@@ -578,6 +578,7 @@ where
                         .remove(&additional_path_open.key);
                     let attached = handle_additional_path_open_result(
                         context,
+                        &mut sender,
                         stream_id,
                         &mut remotes,
                         &mut send_stream,
@@ -647,6 +648,7 @@ where
         if !state.recovery.pending_additional_path_opens.is_empty()
             && drain_completed_additional_path_opens(
                 context,
+                &mut sender,
                 stream_id,
                 &mut remotes,
                 &mut send_stream,
@@ -693,6 +695,7 @@ where
         let request_lane_changed =
             reliable_relay_lane_changed(request_demand_update.previous_lane, request_lane);
         if request_lane_changed {
+            sender.invalidate_tcp_service_observer();
             state.refresh_request_tcp_service_demand(request_lane);
         }
         let path_snapshot =
@@ -836,6 +839,7 @@ where
                 }
             } else if let Err(err) = switch_reliable_relay_to_best_path(
                 context,
+                &mut sender,
                 &spec,
                 relay_lane,
                 &mut remotes,
@@ -1269,6 +1273,7 @@ where
                         }
                         match attach_reliable_relay_paths_with_recovery_exclusions(
                             context,
+                            &mut sender,
                             &spec,
                             relay_lane,
                             &mut remotes,
@@ -1351,6 +1356,7 @@ where
                         }
                         match attach_reliable_relay_paths_with_recovery_exclusions(
                             context,
+                            &mut sender,
                             &spec,
                             relay_lane,
                             &mut remotes,
@@ -1395,6 +1401,7 @@ where
                         }
                         match attach_reliable_relay_paths_with_recovery_exclusions(
                             context,
+                            &mut sender,
                             &spec,
                             relay_lane,
                             &mut remotes,
@@ -1450,6 +1457,7 @@ where
                         }
                         match attach_reliable_relay_paths_with_recovery_exclusions(
                             context,
+                            &mut sender,
                             &spec,
                             relay_lane,
                             &mut remotes,
@@ -1524,6 +1532,7 @@ where
                             }
                             match attach_reliable_relay_paths_with_recovery_exclusions(
                                 context,
+                                &mut sender,
                                 &spec,
                                 relay_lane,
                                 &mut remotes,
@@ -1614,6 +1623,7 @@ where
                 }
                 let attached_mode = handle_additional_path_open_result(
                     context,
+                    &mut sender,
                     stream_id,
                     &mut remotes,
                     &mut send_stream,
@@ -1688,6 +1698,7 @@ where
                 };
                 permit.retain(&mut send_buffer_reservation, read);
                 if read == 0 {
+                    sender.invalidate_tcp_service_observer();
                     state.record_local_eof();
                 } else {
                     state.record_local_payload(relay_lane);
@@ -1743,6 +1754,7 @@ where
                         let (read, payload) = read.map_err(RuntimeError::Io)?;
                         permit.retain(&mut send_buffer_reservation, read);
                         if read == 0 {
+                            sender.invalidate_tcp_service_observer();
                             state.record_local_eof();
                             break;
                         }
@@ -1791,6 +1803,7 @@ where
                     Err(err) if reliable_path_error_is_migratable(&err) => {
                         match attach_reliable_relay_paths_with_recovery_exclusions(
                             context,
+                            &mut sender,
                             &spec,
                             relay_lane,
                             &mut remotes,
@@ -2004,6 +2017,7 @@ where
                                 }
                                 match attach_reliable_relay_paths_with_recovery_exclusions(
                                     context,
+                                    &mut sender,
                                     &spec,
                                     relay_lane,
                                     &mut remotes,
@@ -2106,6 +2120,7 @@ where
                                     }
                                     match attach_reliable_relay_paths_with_recovery_exclusions(
                                         context,
+                                        &mut sender,
                                         &spec,
                                         relay_lane,
                                         &mut remotes,
@@ -2238,9 +2253,11 @@ where
         }
     };
 
+    sender.invalidate_tcp_service_observer();
     drop(tcp_service_writer_registration);
     let _ = drain_completed_additional_path_opens(
         context,
+        &mut sender,
         stream_id,
         &mut remotes,
         &mut send_stream,

@@ -194,9 +194,23 @@ async fn tcp_service_observer_separates_preinstall_and_active_partial_ack_proven
     assert!(event.releases[1].committed_at.is_some());
     drop(events);
 
+    let different_lifecycle = request_tcp_service_lifecycle(99);
+    assert_eq!(
+        controller.remove_tcp_service_observer(different_lifecycle),
+        TcpServiceObserverRemoval::DifferentLifecycle
+    );
+    assert!(
+        coordinator.lock().mark_commit().is_ok(),
+        "a stale removal request must not stop current commit authority"
+    );
     assert_eq!(
         controller.remove_tcp_service_observer(lifecycle),
         TcpServiceObserverRemoval::Removed
+    );
+    assert_eq!(
+        coordinator.lock().mark_commit(),
+        Err(TcpServiceFlightSidecarError::ObserverStopped),
+        "matching removal must stop commit authority before dropping the observer"
     );
     assert_eq!(
         controller.remove_tcp_service_observer(lifecycle),

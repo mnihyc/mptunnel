@@ -19,6 +19,7 @@ use crate::runtime::stream::{OpenedRemoteStream, ReliablePathStream, ReliablePat
 use crate::scheduler::TrafficClass;
 use crate::transport::PathSpec;
 use bytes::Bytes;
+use std::cell::Cell;
 use std::collections::HashSet;
 use std::time::Duration;
 use tokio::sync::mpsc;
@@ -188,10 +189,31 @@ async fn candidate_membership_drops_open_load_until_product_claim_commits() {
     let open_lease = context
         .reserve_relay_path_load(key, TrafficClass::Throughput)
         .expect("candidate-open load");
+    let membership_commit_started = Cell::new(false);
+    let previous_generation = remotes.membership_generation();
 
     assert_eq!(
-        remotes.attach_candidate(candidate.with_load_lease(open_lease)),
+        remotes.attach_candidate_before_commit(candidate.with_load_lease(open_lease), |current| {
+            assert!(
+                !membership_commit_started.replace(true),
+                "one successful attachment has one membership commit"
+            );
+            assert_eq!(
+                current.path_instances().len(),
+                1,
+                "candidate membership must not be visible before the callback"
+            );
+            assert_eq!(
+                current.membership_generation(),
+                previous_generation,
+                "membership identity must change only after the callback"
+            );
+        }),
         ReliableRelayAttachOutcome::Attached
+    );
+    assert!(
+        membership_commit_started.get(),
+        "the actor must be notified before candidate membership commits"
     );
     let instance = remotes
         .path_instance_for_key(key)

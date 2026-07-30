@@ -77,6 +77,7 @@ pub(in crate::runtime) async fn recover_reliable_relay_after_path_failure(
 #[allow(clippy::too_many_arguments)]
 pub(super) async fn switch_reliable_relay_to_best_path(
     context: &ClientPathContext,
+    sender: &mut RequestSenderService,
     spec: &ReliableRelayOpenSpec,
     lane: TrafficClass,
     remotes: &mut ReliableRelayRemoteSet,
@@ -91,6 +92,7 @@ pub(super) async fn switch_reliable_relay_to_best_path(
         .collect::<HashSet<_>>();
     let attached = attach_reliable_relay_paths(
         context,
+        sender,
         spec,
         lane,
         remotes,
@@ -158,6 +160,7 @@ pub(super) fn reliable_relay_queued_send_blocked_for_retry(
 #[allow(clippy::too_many_arguments)]
 pub(super) async fn handle_additional_path_open_result(
     context: &ClientPathContext,
+    sender: &mut RequestSenderService,
     stream_id: StreamId,
     remotes: &mut ReliableRelayRemoteSet,
     send_stream: &mut ReliableSendStream,
@@ -209,7 +212,9 @@ pub(super) async fn handle_additional_path_open_result(
                 );
                 return None;
             }
-            match remotes.attach_candidate(opened) {
+            match remotes.attach_candidate_before_commit(opened, |_| {
+                sender.invalidate_tcp_service_observer();
+            }) {
                 ReliableRelayAttachOutcome::Attached => {
                     send_stream.update_max_offset(remotes.max_offset());
                     *last_stream_progress_at = Instant::now();
@@ -304,6 +309,7 @@ pub(super) async fn handle_additional_path_open_result(
 #[allow(clippy::too_many_arguments)]
 pub(super) async fn drain_completed_additional_path_opens(
     context: &ClientPathContext,
+    sender: &mut RequestSenderService,
     stream_id: StreamId,
     remotes: &mut ReliableRelayRemoteSet,
     send_stream: &mut ReliableSendStream,
@@ -328,6 +334,7 @@ pub(super) async fn drain_completed_additional_path_opens(
         }
         attached |= handle_additional_path_open_result(
             context,
+            sender,
             stream_id,
             remotes,
             send_stream,
@@ -670,6 +677,7 @@ fn reliable_relay_recovery_path_open_candidates(
 #[allow(clippy::too_many_arguments)]
 pub(super) async fn attach_reliable_relay_paths_with_recovery_exclusions(
     context: &ClientPathContext,
+    sender: &mut RequestSenderService,
     spec: &ReliableRelayOpenSpec,
     lane: TrafficClass,
     remotes: &mut ReliableRelayRemoteSet,
@@ -687,6 +695,7 @@ pub(super) async fn attach_reliable_relay_paths_with_recovery_exclusions(
         .collect::<HashSet<_>>();
     attach_reliable_relay_paths_with_claims_and_recovery_exclusions(
         context,
+        sender,
         spec,
         lane,
         remotes,

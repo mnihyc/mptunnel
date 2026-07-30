@@ -2237,3 +2237,57 @@ entry is authoritative.
   - no performance conclusion is recorded here. The next gate is the fixed
     representative download/upload lab set on this clean commit, compared
     with the historical champion before any producer is connected.
+
+## 2026-07-30T15:08:25+08:00: Inactive TCP service v5 performance gate
+
+- Name: adjacent parent/candidate guard before producer connection
+- Category: Core performance change control
+- State: representative inactive boundary passed; full condition and
+  transition matrix remains open
+- Correction:
+  - supersedes the preceding entry's broad statement that native behavior is
+    unchanged: carrier count, RFC timing, scheduling policy, congestion
+    control, and transport parameters are unchanged, but the disconnected
+    runtime authority adds measurable ordinary-path scaffolding;
+  - restored the established ACK fast path so reinjected or non-evidence
+    releases do not perform ambiguity searches unless an active observer needs
+    their provenance; and
+  - boxed the rare response observer-install payload so the inactive feature
+    does not enlarge every bounded server-stream event slot.
+- Verification:
+  - focused TCP-service tests passed: 18;
+  - complete root library suite passed: 1,418;
+  - formatting and whitespace checks passed; and
+  - no configuration, producer, candidate-open path, carrier-count change, or
+    new RFC timing parameter is connected.
+- Matched protocol-v5 evidence:
+  - direct parent `e9dd008646da1377b6ecf2f69f95f02c2193f09c`, release
+    binary `b001a285a82deec65848f50f8fd85686cea851e1c7027c80b9a9673867a658dd`;
+  - candidate `3112e2d24ef358f80c74ad31dc7fcb78b655595c`, release binary
+    `cfca58089f4d4d11a99045e7b6d25bc3114e00f8218a6dad32f633ac5f749c36`;
+  - both clean sources used the same native Linux toolchain, retained Docker
+    images, valid-host rules, isolated topology, diagnostics-disabled release
+    profile, 20-second load, and two application flows;
+  - parent/candidate single-path download measured `245.418`/`234.896` Mbps,
+    while equal-fat multipath download measured `728.004`/`728.579` Mbps;
+  - parent/candidate single-path upload lower bounds measured
+    `231.522`/`241.582` Mbps, while exact equal-fat multipath upload measured
+    `720.733`/`750.275` Mbps; and
+  - the only lower candidate row was repeated adjacently: parent/candidate
+    single-path download measured `228.451`/`236.733` Mbps. The two paired
+    signs therefore reversed, and the two-run medians were `236.935` and
+    `235.815` Mbps without a reproduced directional downgrade.
+- Decision:
+  - accept the inactive writer-authority boundary with no observed systematic
+    performance regression;
+  - do not treat the isolated fluctuation as a tuning signal or introduce a
+    percentage pass margin; and
+  - keep the unsafe caller-fabricated install/bind interface and every service
+    producer disconnected until the logical stream actors own exact
+    snapshot/freeze validation.
+- Evidence:
+  - `./.tmp/lab/results/adjacent-parent-e9dd008-v5-20260730/`;
+  - `./.tmp/lab/results/adjacent-candidate-3112e2d-v5-20260730/`;
+  - `./.tmp/lab/results/adjacent-parent-e9dd008-v5-single-repeat-20260730/`;
+    and
+  - `./.tmp/lab/results/adjacent-candidate-3112e2d-v5-single-repeat-20260730/`.

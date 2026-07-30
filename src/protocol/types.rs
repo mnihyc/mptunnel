@@ -21,7 +21,7 @@ pub struct DatagramFlowId(pub u64);
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct DatagramId(pub u64);
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct AuthNonce(pub [u8; 16]);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -37,6 +37,23 @@ pub enum UnderlayProtocol {
 pub enum PathMetricDirection {
     ClientToServer,
     ServerToClient,
+}
+
+/// Exact authenticated TCP carrier instance referenced by service validation.
+///
+/// A `PathId` alone is reusable after carrier retirement. The accepted
+/// `PATH_JOIN` nonce fences this record to one current physical instance.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub struct TcpCarrierAcceptedPath {
+    pub path_id: PathId,
+    pub path_join_nonce: AuthNonce,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TcpCarrierValidationResult {
+    Retain,
+    NoGain,
+    Withdrawn,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -287,6 +304,23 @@ pub enum Frame {
         code: PeerStatusCode,
         paths: Vec<PeerPathStatus>,
     },
+    TcpCarrierDemand {
+        request_id: u64,
+        stream_ids: Vec<StreamId>,
+    },
+    TcpCarrierValidate {
+        trial_id: u64,
+        request_id: u64,
+        direction: PathMetricDirection,
+        accepted_paths: Vec<TcpCarrierAcceptedPath>,
+        stream_ids: Vec<StreamId>,
+    },
+    TcpCarrierResult {
+        trial_id: u64,
+        candidate_path_id: PathId,
+        direction: PathMetricDirection,
+        result: TcpCarrierValidationResult,
+    },
     Ping {
         nonce: u64,
     },
@@ -343,6 +377,9 @@ impl Frame {
             Self::PathMetrics { .. } => "PATH_METRICS",
             Self::PeerStatusRequest { .. } => "PEER_STATUS_REQUEST",
             Self::PeerStatusResponse { .. } => "PEER_STATUS_RESPONSE",
+            Self::TcpCarrierDemand { .. } => "TCP_CARRIER_DEMAND",
+            Self::TcpCarrierValidate { .. } => "TCP_CARRIER_VALIDATE",
+            Self::TcpCarrierResult { .. } => "TCP_CARRIER_RESULT",
             Self::Ping { .. } => "PING",
             Self::Pong { .. } => "PONG",
         }

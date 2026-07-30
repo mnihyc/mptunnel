@@ -117,6 +117,30 @@ fn frame_subject(frame: &Frame) -> String {
             "request_id={request_id} code={code:?} path_count={}",
             paths.len()
         ),
+        Frame::TcpCarrierDemand {
+            request_id,
+            stream_ids,
+        } => format!("request_id={request_id} stream_count={}", stream_ids.len()),
+        Frame::TcpCarrierValidate {
+            trial_id,
+            request_id,
+            direction,
+            accepted_paths,
+            stream_ids,
+        } => format!(
+            "trial_id={trial_id} request_id={request_id} direction={direction:?} path_count={} stream_count={}",
+            accepted_paths.len(),
+            stream_ids.len()
+        ),
+        Frame::TcpCarrierResult {
+            trial_id,
+            candidate_path_id,
+            direction,
+            result,
+        } => format!(
+            "trial_id={trial_id} candidate_path_id={} direction={direction:?} result={result:?}",
+            candidate_path_id.0
+        ),
     }
 }
 

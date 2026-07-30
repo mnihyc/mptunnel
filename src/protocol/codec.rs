@@ -1,13 +1,14 @@
 use super::{
     AuthNonce, AuthTag, CloseReason, DatagramFlowId, DatagramId, Frame, OffsetRange, PathId,
     PathMetricDirection, PathMetrics, PathUsage, PeerPathState, PeerPathStatus, PeerStatusCode,
-    ResetReason, SessionId, StreamDemandHint, StreamId, TargetAddr, UnderlayProtocol,
+    ResetReason, SessionId, StreamDemandHint, StreamId, TargetAddr, TcpCarrierAcceptedPath,
+    TcpCarrierValidationResult, UnderlayProtocol,
 };
 use bytes::Bytes;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 
 const MAGIC: &[u8; 4] = b"MPTF";
-const VERSION: u8 = 4;
+const VERSION: u8 = 5;
 const MAX_CREDENTIAL_ID_BYTES: usize = 64;
 pub const FRAME_HEADER_LEN: usize = 10;
 const PATH_METRICS_ENCODED_LEN: usize = 104;
@@ -20,6 +21,8 @@ pub struct CodecLimits {
     pub max_payload_bytes: usize,
     pub max_ack_ranges: usize,
     pub max_host_bytes: usize,
+    pub max_paths: usize,
+    pub max_streams: usize,
 }
 
 impl Default for CodecLimits {
@@ -29,6 +32,8 @@ impl Default for CodecLimits {
             max_payload_bytes: 1_048_512,
             max_ack_ranges: 256,
             max_host_bytes: 255,
+            max_paths: 64,
+            max_streams: 65_536,
         }
     }
 }
@@ -38,7 +43,7 @@ pub fn peer_status_response_path_limit(limits: CodecLimits) -> usize {
         .max_frame_bytes
         .saturating_sub(FRAME_HEADER_LEN + PEER_STATUS_RESPONSE_FIXED_PAYLOAD_LEN)
         / PEER_PATH_STATUS_ENCODED_LEN;
-    frame_limit.min(usize::from(u16::MAX))
+    frame_limit.min(limits.max_paths).min(usize::from(u16::MAX))
 }
 
 pub fn encode_frame(frame: &Frame, limits: CodecLimits) -> Result<Vec<u8>, CodecError> {
@@ -127,6 +132,16 @@ fn encoded_payload_capacity_hint(frame: &Frame) -> usize {
         Frame::StreamAck { ranges, .. } => 16usize.saturating_add(ranges.len().saturating_mul(16)),
         Frame::PeerStatusResponse { paths, .. } => PEER_STATUS_RESPONSE_FIXED_PAYLOAD_LEN
             .saturating_add(paths.len().saturating_mul(PEER_PATH_STATUS_ENCODED_LEN)),
+        Frame::TcpCarrierDemand { stream_ids, .. } => {
+            10usize.saturating_add(stream_ids.len().saturating_mul(8))
+        }
+        Frame::TcpCarrierValidate {
+            accepted_paths,
+            stream_ids,
+            ..
+        } => 21usize
+            .saturating_add(accepted_paths.len().saturating_mul(18))
+            .saturating_add(stream_ids.len().saturating_mul(8)),
         Frame::OpenStream { .. } => 128,
         _ => 64,
     }
@@ -451,6 +466,7 @@ fn encode_payload(
             code,
             paths,
         } => {
+            validate_path_count(paths.len(), limits, false)?;
             let path_count = u16::try_from(paths.len()).map_err(|_| CodecError::LengthOverflow)?;
             validate_peer_status_path_count(*code, usize::from(path_count))?;
             put_u64(out, *request_id);
@@ -462,6 +478,61 @@ fn encode_payload(
                 encode_path_metrics(out, path.metrics);
             }
             Ok(FrameKind::PeerStatusResponse)
+        }
+        Frame::TcpCarrierDemand {
+            request_id,
+            stream_ids,
+        } => {
+            validate_nonzero_id(*request_id)?;
+            validate_stream_ids(stream_ids, limits, true)?;
+            put_u64(out, *request_id);
+            put_u16(
+                out,
+                u16::try_from(stream_ids.len()).map_err(|_| CodecError::LengthOverflow)?,
+            );
+            encode_stream_ids(out, stream_ids);
+            Ok(FrameKind::TcpCarrierDemand)
+        }
+        Frame::TcpCarrierValidate {
+            trial_id,
+            request_id,
+            direction,
+            accepted_paths,
+            stream_ids,
+        } => {
+            validate_nonzero_id(*trial_id)?;
+            validate_accepted_paths(accepted_paths, limits)?;
+            validate_stream_ids(stream_ids, limits, false)?;
+            put_u64(out, *trial_id);
+            put_u64(out, *request_id);
+            put_u8(out, path_metric_direction_to_u8(*direction));
+            put_u16(
+                out,
+                u16::try_from(accepted_paths.len()).map_err(|_| CodecError::LengthOverflow)?,
+            );
+            for accepted in accepted_paths {
+                put_u16(out, accepted.path_id.0);
+                encode_nonce(out, accepted.path_join_nonce);
+            }
+            put_u16(
+                out,
+                u16::try_from(stream_ids.len()).map_err(|_| CodecError::LengthOverflow)?,
+            );
+            encode_stream_ids(out, stream_ids);
+            Ok(FrameKind::TcpCarrierValidate)
+        }
+        Frame::TcpCarrierResult {
+            trial_id,
+            candidate_path_id,
+            direction,
+            result,
+        } => {
+            validate_nonzero_id(*trial_id)?;
+            put_u64(out, *trial_id);
+            put_u16(out, candidate_path_id.0);
+            put_u8(out, path_metric_direction_to_u8(*direction));
+            put_u8(out, tcp_carrier_result_to_u8(*result));
+            Ok(FrameKind::TcpCarrierResult)
         }
         Frame::Ping { nonce } => {
             put_u64(out, *nonce);
@@ -643,6 +714,7 @@ fn decode_payload(
             let request_id = reader.get_u64()?;
             let code = peer_status_code_from_u8(reader.get_u8()?)?;
             let path_count = reader.get_u16()? as usize;
+            validate_path_count(path_count, limits, false)?;
             validate_peer_status_path_count(code, path_count)?;
             let required_path_bytes = path_count
                 .checked_mul(PEER_PATH_STATUS_ENCODED_LEN)
@@ -662,6 +734,61 @@ fn decode_payload(
                 request_id,
                 code,
                 paths,
+            })
+        }
+        FrameKind::TcpCarrierDemand => {
+            let request_id = reader.get_u64()?;
+            validate_nonzero_id(request_id)?;
+            let stream_ids = decode_stream_ids(reader, limits, true)?;
+            Ok(Frame::TcpCarrierDemand {
+                request_id,
+                stream_ids,
+            })
+        }
+        FrameKind::TcpCarrierValidate => {
+            let trial_id = reader.get_u64()?;
+            validate_nonzero_id(trial_id)?;
+            let request_id = reader.get_u64()?;
+            let direction = path_metric_direction_from_u8(reader.get_u8()?)?;
+            let path_count = reader.get_u16()? as usize;
+            validate_path_count(path_count, limits, true)?;
+            let required_path_bytes = path_count
+                .checked_mul(18)
+                .ok_or(CodecError::LengthOverflow)?;
+            if required_path_bytes > reader.remaining() {
+                return Err(CodecError::UnexpectedEof);
+            }
+            let mut accepted_paths = Vec::with_capacity(path_count);
+            for _ in 0..path_count {
+                let accepted = TcpCarrierAcceptedPath {
+                    path_id: PathId(reader.get_u16()?),
+                    path_join_nonce: decode_nonce(reader)?,
+                };
+                if accepted_paths
+                    .last()
+                    .is_some_and(|previous| previous >= &accepted)
+                {
+                    return Err(CodecError::NonCanonicalList);
+                }
+                accepted_paths.push(accepted);
+            }
+            let stream_ids = decode_stream_ids(reader, limits, false)?;
+            Ok(Frame::TcpCarrierValidate {
+                trial_id,
+                request_id,
+                direction,
+                accepted_paths,
+                stream_ids,
+            })
+        }
+        FrameKind::TcpCarrierResult => {
+            let trial_id = reader.get_u64()?;
+            validate_nonzero_id(trial_id)?;
+            Ok(Frame::TcpCarrierResult {
+                trial_id,
+                candidate_path_id: PathId(reader.get_u16()?),
+                direction: path_metric_direction_from_u8(reader.get_u8()?)?,
+                result: tcp_carrier_result_from_u8(reader.get_u8()?)?,
             })
         }
         FrameKind::Ping => Ok(Frame::Ping {
@@ -956,6 +1083,109 @@ fn decode_offset_ranges(
     Ok(ranges)
 }
 
+fn validate_nonzero_id(id: u64) -> Result<(), CodecError> {
+    if id == 0 {
+        return Err(CodecError::InvalidIdentifier);
+    }
+    Ok(())
+}
+
+fn validate_path_count(
+    count: usize,
+    limits: CodecLimits,
+    require_nonempty: bool,
+) -> Result<(), CodecError> {
+    if require_nonempty && count == 0 {
+        return Err(CodecError::EmptyList);
+    }
+    if count > limits.max_paths {
+        return Err(CodecError::TooManyPaths {
+            actual: count,
+            limit: limits.max_paths,
+        });
+    }
+    if count > u16::MAX as usize {
+        return Err(CodecError::LengthOverflow);
+    }
+    Ok(())
+}
+
+fn validate_stream_count(
+    count: usize,
+    limits: CodecLimits,
+    allow_empty: bool,
+) -> Result<(), CodecError> {
+    if !allow_empty && count == 0 {
+        return Err(CodecError::EmptyList);
+    }
+    if count > limits.max_streams {
+        return Err(CodecError::TooManyStreams {
+            actual: count,
+            limit: limits.max_streams,
+        });
+    }
+    if count > u16::MAX as usize {
+        return Err(CodecError::LengthOverflow);
+    }
+    Ok(())
+}
+
+fn validate_stream_ids(
+    stream_ids: &[StreamId],
+    limits: CodecLimits,
+    allow_empty: bool,
+) -> Result<(), CodecError> {
+    validate_stream_count(stream_ids.len(), limits, allow_empty)?;
+    if !stream_ids.windows(2).all(|pair| pair[0] < pair[1]) {
+        return Err(CodecError::NonCanonicalList);
+    }
+    Ok(())
+}
+
+fn validate_accepted_paths(
+    accepted_paths: &[TcpCarrierAcceptedPath],
+    limits: CodecLimits,
+) -> Result<(), CodecError> {
+    validate_path_count(accepted_paths.len(), limits, true)?;
+    if !accepted_paths.windows(2).all(|pair| pair[0] < pair[1]) {
+        return Err(CodecError::NonCanonicalList);
+    }
+    Ok(())
+}
+
+fn encode_stream_ids(out: &mut Vec<u8>, stream_ids: &[StreamId]) {
+    for stream_id in stream_ids {
+        put_u64(out, stream_id.0);
+    }
+}
+
+fn decode_stream_ids(
+    reader: &mut Reader<'_>,
+    limits: CodecLimits,
+    allow_empty: bool,
+) -> Result<Vec<StreamId>, CodecError> {
+    let count = reader.get_u16()? as usize;
+    validate_stream_count(count, limits, allow_empty)?;
+    let required_bytes = count
+        .checked_mul(std::mem::size_of::<u64>())
+        .ok_or(CodecError::LengthOverflow)?;
+    if required_bytes > reader.remaining() {
+        return Err(CodecError::UnexpectedEof);
+    }
+    let mut stream_ids = Vec::with_capacity(count);
+    for _ in 0..count {
+        let stream_id = StreamId(reader.get_u64()?);
+        if stream_ids
+            .last()
+            .is_some_and(|previous| previous >= &stream_id)
+        {
+            return Err(CodecError::NonCanonicalList);
+        }
+        stream_ids.push(stream_id);
+    }
+    Ok(stream_ids)
+}
+
 fn encode_payload_bytes_len(len: usize, limits: CodecLimits) -> Result<(), CodecError> {
     if len > limits.max_payload_bytes {
         return Err(CodecError::PayloadTooLarge {
@@ -1117,6 +1347,9 @@ enum FrameKind {
     PathCapacityReceipt = 35,
     PeerStatusRequest = 36,
     PeerStatusResponse = 37,
+    TcpCarrierDemand = 38,
+    TcpCarrierValidate = 39,
+    TcpCarrierResult = 40,
 }
 
 impl FrameKind {
@@ -1151,6 +1384,9 @@ impl FrameKind {
             35 => Ok(Self::PathCapacityReceipt),
             36 => Ok(Self::PeerStatusRequest),
             37 => Ok(Self::PeerStatusResponse),
+            38 => Ok(Self::TcpCarrierDemand),
+            39 => Ok(Self::TcpCarrierValidate),
+            40 => Ok(Self::TcpCarrierResult),
             _ => Err(CodecError::UnknownKind(value)),
         }
     }
@@ -1182,6 +1418,23 @@ fn path_metric_direction_from_u8(value: u8) -> Result<PathMetricDirection, Codec
     match value {
         1 => Ok(PathMetricDirection::ClientToServer),
         2 => Ok(PathMetricDirection::ServerToClient),
+        _ => Err(CodecError::InvalidEnum),
+    }
+}
+
+fn tcp_carrier_result_to_u8(value: TcpCarrierValidationResult) -> u8 {
+    match value {
+        TcpCarrierValidationResult::Retain => 1,
+        TcpCarrierValidationResult::NoGain => 2,
+        TcpCarrierValidationResult::Withdrawn => 3,
+    }
+}
+
+fn tcp_carrier_result_from_u8(value: u8) -> Result<TcpCarrierValidationResult, CodecError> {
+    match value {
+        1 => Ok(TcpCarrierValidationResult::Retain),
+        2 => Ok(TcpCarrierValidationResult::NoGain),
+        3 => Ok(TcpCarrierValidationResult::Withdrawn),
         _ => Err(CodecError::InvalidEnum),
     }
 }
@@ -1304,11 +1557,16 @@ pub enum CodecError {
     PayloadTooLarge { actual: usize, limit: usize },
     HostTooLong { actual: usize, limit: usize },
     TooManyAckRanges { actual: usize, limit: usize },
+    TooManyPaths { actual: usize, limit: usize },
+    TooManyStreams { actual: usize, limit: usize },
     InvalidUtf8,
     InvalidCredentialId,
     InvalidPeerStatus,
     InvalidEnum,
     InvalidRange,
+    InvalidIdentifier,
+    EmptyList,
+    NonCanonicalList,
     InvalidPort,
     LengthOverflow,
 }
@@ -1333,11 +1591,20 @@ impl std::fmt::Display for CodecError {
             Self::TooManyAckRanges { actual, limit } => {
                 write!(f, "ACK has {actual} ranges, limit is {limit}")
             }
+            Self::TooManyPaths { actual, limit } => {
+                write!(f, "frame has {actual} paths, limit is {limit}")
+            }
+            Self::TooManyStreams { actual, limit } => {
+                write!(f, "frame has {actual} streams, limit is {limit}")
+            }
             Self::InvalidUtf8 => write!(f, "string field is not valid UTF-8"),
             Self::InvalidCredentialId => write!(f, "invalid credential ID"),
             Self::InvalidPeerStatus => write!(f, "non-OK peer status contains path entries"),
             Self::InvalidEnum => write!(f, "invalid enum value"),
             Self::InvalidRange => write!(f, "invalid offset range"),
+            Self::InvalidIdentifier => write!(f, "identifier must be nonzero"),
+            Self::EmptyList => write!(f, "frame list must not be empty"),
+            Self::NonCanonicalList => write!(f, "frame list is not in canonical order"),
             Self::InvalidPort => write!(f, "port must be in 1..=65535"),
             Self::LengthOverflow => write!(f, "frame length overflow"),
         }

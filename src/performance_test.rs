@@ -12,6 +12,10 @@ fn defaults_preserve_the_deployed_resource_envelope() {
     assert_eq!(limits.max_reorder_buffer_chunks, 65_536);
     assert_eq!(limits.max_retained_receive_ranges, 65_536);
     assert_eq!(limits.validate(), Ok(()));
+
+    let codec_limits = CodecLimits::from(limits);
+    assert_eq!(codec_limits.max_paths, limits.max_paths);
+    assert_eq!(codec_limits.max_streams, limits.max_streams);
 }
 
 #[test]

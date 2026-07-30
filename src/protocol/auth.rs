@@ -6,8 +6,8 @@ use sha2::Sha256;
 
 type HmacSha256 = Hmac<Sha256>;
 
-const SESSION_AUTH_CONTEXT: &[u8] = b"mptunnel session auth v4";
-const PATH_JOIN_CONTEXT: &[u8] = b"mptunnel path join v4";
+const SESSION_AUTH_CONTEXT: &[u8] = b"mptunnel session auth v5";
+const PATH_JOIN_CONTEXT: &[u8] = b"mptunnel path join v5";
 const TCP_SESSION_AUTH_CONTEXT: &[u8] = b"mptunnel tcp session auth v1";
 const TCP_CARRIER_ROLE_CLIENT: u8 = 1;
 const TCP_DIRECTION_CLIENT_TO_SERVER: u8 = 1;

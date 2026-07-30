@@ -1444,6 +1444,9 @@ fn reliable_path_frame_kind(frame: &Frame) -> &'static str {
         Frame::Pong { .. } => "pong",
         Frame::PeerStatusRequest { .. } => "peer_status_request",
         Frame::PeerStatusResponse { .. } => "peer_status_response",
+        Frame::TcpCarrierDemand { .. } => "tcp_carrier_demand",
+        Frame::TcpCarrierValidate { .. } => "tcp_carrier_validate",
+        Frame::TcpCarrierResult { .. } => "tcp_carrier_result",
     }
 }
 

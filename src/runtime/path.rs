@@ -44,7 +44,8 @@ pub(in crate::runtime) use server_context::{
 };
 pub(in crate::runtime) use set::{ClientPathContext, ClientPathRuntimeOptions};
 pub(in crate::runtime) use state::{
-    ClientPathState, RelayPathLoadLease, RequestCapacityProbeCampaignBudget,
+    ClientPathState, ClientRequestTcpServiceLifecycleState, RelayPathLoadLease,
+    RequestCapacityProbeCampaignBudget,
 };
 pub(in crate::runtime) use tcp::capacity::{
     RequestTcpCapacityProbeLease, RequestTcpCapacityProofQuery,

@@ -8,13 +8,15 @@ use crate::protocol::{
     AuthNonce, OffsetRange, PathId, PathMetricDirection, PathUsage, SessionId, StreamId,
     TargetAddr, UnderlayProtocol,
 };
+use crate::runtime::path::ClientRequestTcpServiceLifecycleState;
 use crate::runtime::path::commands::{
     ReliablePathCommand, ReliablePathCommandReceivers, recv_reliable_path_command,
     reliable_path_command_channels,
 };
 use crate::runtime::stream::{ReliablePathStream, ReliablePathStreamOutput};
 use crate::runtime::tcp_service::{
-    RequestTcpServiceObserverInstall, TcpServiceAckDisposition, TcpServiceDataAckSink,
+    RequestTcpServiceObserverInstall, RequestTcpServiceObserverInstallation,
+    TcpServiceAckDisposition, TcpServiceDataAckSink, TcpServiceFlightSidecarError,
     TcpServiceWriterCoordinator,
 };
 use crate::transport::PathSpec;
@@ -171,6 +173,9 @@ async fn request_tcp_service_install_requires_the_exact_actor_snapshot() {
         0,
     );
     let remotes = ReliableRelayRemoteSet::new(opened, 8);
+    let writer_registration = context
+        .register_tcp_service_writer(stream_id, remotes.tcp_service_writer())
+        .expect("register exact stream actor");
     let accepted_instance = remotes.paths[0].instance();
     context.install_authenticated_path_for_test(
         UnderlayProtocol::Tcp,
@@ -236,8 +241,23 @@ async fn request_tcp_service_install_requires_the_exact_actor_snapshot() {
         }
     };
 
+    let foreign_session_id = SessionId(context.session_id.0.wrapping_add(1));
+    let foreign_lifecycle = TcpServiceWriterLifecycle::for_runtime_test(
+        foreign_session_id,
+        1,
+        PathMetricDirection::ClientToServer,
+    );
+    let foreign_coordinator = Arc::new(TcpServiceWriterCoordinator::new(
+        foreign_lifecycle,
+        Arc::new(IgnoreTcpServiceAck),
+    ));
+    assert_eq!(
+        context.arm_request_tcp_service_lifecycle(&[frozen.clone()], foreign_coordinator,),
+        Err(TcpServiceWithdrawalReason::InvalidEvidence),
+        "another session cannot occupy this session's lifecycle registry"
+    );
     let lifecycle = TcpServiceWriterLifecycle::for_runtime_test(
-        SessionId(902),
+        context.session_id,
         1,
         PathMetricDirection::ClientToServer,
     );
@@ -245,6 +265,9 @@ async fn request_tcp_service_install_requires_the_exact_actor_snapshot() {
         lifecycle,
         Arc::new(IgnoreTcpServiceAck),
     ));
+    context
+        .arm_request_tcp_service_lifecycle(&[frozen.clone()], coordinator.clone())
+        .expect("arm exact request lifecycle");
     let (install_tx, install_rx) = tokio::sync::oneshot::channel();
     apply_request_tcp_service_control(
         &state,
@@ -254,8 +277,8 @@ async fn request_tcp_service_install_requires_the_exact_actor_snapshot() {
         &remotes,
         RequestTcpServiceControl::Install {
             install: RequestTcpServiceObserverInstall {
-                frozen,
-                coordinator,
+                frozen: frozen.clone(),
+                coordinator: coordinator.clone(),
                 max_flight_records: 8,
                 max_ack_release_records: 8,
             },
@@ -266,10 +289,118 @@ async fn request_tcp_service_install_requires_the_exact_actor_snapshot() {
         install_rx.await.expect("install receipt"),
         RequestTcpServiceControlOutcome::Complete(RequestTcpServiceObserverInstallation::Installed)
     );
-    assert_eq!(
-        sender.remove_tcp_service_observer(lifecycle),
-        TcpServiceObserverRemoval::Removed
+    let wrong_coordinator = Arc::new(TcpServiceWriterCoordinator::new(
+        lifecycle,
+        Arc::new(IgnoreTcpServiceAck),
+    ));
+    let (wrong_install_tx, wrong_install_rx) = tokio::sync::oneshot::channel();
+    apply_request_tcp_service_control(
+        &state,
+        &mut sender,
+        &sender_queue,
+        &context,
+        &remotes,
+        RequestTcpServiceControl::Install {
+            install: RequestTcpServiceObserverInstall {
+                frozen: frozen.clone(),
+                coordinator: wrong_coordinator,
+                max_flight_records: 8,
+                max_ack_release_records: 8,
+            },
+            receipt: wrong_install_tx,
+        },
     );
+    assert_eq!(
+        wrong_install_rx.await.expect("wrong install receipt"),
+        RequestTcpServiceControlOutcome::Withdrawn(TcpServiceWithdrawalReason::FenceChanged)
+    );
+    assert_eq!(
+        context.request_tcp_service_lifecycle_state(lifecycle),
+        Some(ClientRequestTcpServiceLifecycleState::Current),
+        "a rejected coordinator has no authority to clean the valid observer"
+    );
+    assert_eq!(coordinator.failure(), None);
+    let (retry_install_tx, retry_install_rx) = tokio::sync::oneshot::channel();
+    apply_request_tcp_service_control(
+        &state,
+        &mut sender,
+        &sender_queue,
+        &context,
+        &remotes,
+        RequestTcpServiceControl::Install {
+            install: RequestTcpServiceObserverInstall {
+                frozen,
+                coordinator: coordinator.clone(),
+                max_flight_records: 8,
+                max_ack_release_records: 8,
+            },
+            receipt: retry_install_tx,
+        },
+    );
+    assert_eq!(
+        retry_install_rx.await.expect("retry install receipt"),
+        RequestTcpServiceControlOutcome::Complete(
+            RequestTcpServiceObserverInstallation::AlreadyInstalled
+        )
+    );
+    assert!(
+        !context.disarm_request_tcp_service_lifecycle(lifecycle),
+        "an installed observer cannot be forgotten before cleanup"
+    );
+    assert!(
+        matches!(
+            context.begin_request_tcp_service_cleanup(lifecycle, None),
+            Err(TcpServiceWithdrawalReason::InvalidEvidence)
+        ),
+        "a live lifecycle needs an exact terminal cause before cleanup"
+    );
+    assert_eq!(
+        context
+            .begin_request_tcp_service_cleanup(
+                lifecycle,
+                Some(TcpServiceWithdrawalReason::DemandEnded),
+            )
+            .expect("begin exact cleanup")
+            .len(),
+        1
+    );
+    assert_eq!(
+        context
+            .begin_request_tcp_service_cleanup(lifecycle, None)
+            .expect("reissue exact cleanup")
+            .len(),
+        1,
+        "cleanup cancellation must reissue the same outstanding actor"
+    );
+    assert_eq!(
+        context.request_tcp_service_lifecycle_state(lifecycle),
+        Some(ClientRequestTcpServiceLifecycleState::Withdrawn(
+            TcpServiceWithdrawalReason::DemandEnded
+        ))
+    );
+    let (remove_tx, remove_rx) = tokio::sync::oneshot::channel();
+    apply_request_tcp_service_control(
+        &state,
+        &mut sender,
+        &sender_queue,
+        &context,
+        &remotes,
+        RequestTcpServiceControl::Remove {
+            lifecycle,
+            receipt: remove_tx,
+        },
+    );
+    assert_eq!(
+        remove_rx.await.expect("remove receipt"),
+        RequestTcpServiceControlOutcome::Complete(TcpServiceObserverRemoval::Removed)
+    );
+    assert!(
+        context
+            .begin_request_tcp_service_cleanup(lifecycle, None)
+            .expect("observe completed cleanup")
+            .is_empty()
+    );
+    assert!(context.disarm_request_tcp_service_lifecycle(lifecycle));
 
     let (stale_snapshot_tx, stale_snapshot_rx) = tokio::sync::oneshot::channel();
     apply_request_tcp_service_control(
@@ -289,15 +420,8 @@ async fn request_tcp_service_install_requires_the_exact_actor_snapshot() {
             panic!("unchanged actor snapshot withdrew: {reason:?}")
         }
     };
-    assert!(context.update_peer_path_usage_for_test(
-        UnderlayProtocol::Tcp,
-        1,
-        candidate_instance,
-        1,
-        PathUsage::Backup,
-    ));
     let stale_lifecycle = TcpServiceWriterLifecycle::for_runtime_test(
-        SessionId(902),
+        context.session_id,
         2,
         PathMetricDirection::ClientToServer,
     );
@@ -305,6 +429,39 @@ async fn request_tcp_service_install_requires_the_exact_actor_snapshot() {
         stale_lifecycle,
         Arc::new(IgnoreTcpServiceAck),
     ));
+    context
+        .arm_request_tcp_service_lifecycle(&[stale_frozen.clone()], stale_coordinator.clone())
+        .expect("arm lifecycle before external fence change");
+    assert!(context.update_peer_path_usage_for_test(
+        UnderlayProtocol::Tcp,
+        1,
+        candidate_instance,
+        1,
+        PathUsage::Available,
+    ));
+    assert_eq!(
+        context.request_tcp_service_lifecycle_state(stale_lifecycle),
+        Some(ClientRequestTcpServiceLifecycleState::Current),
+        "a newer unchanged PATH_STATUS must preserve the exact lifecycle"
+    );
+    assert_eq!(stale_coordinator.failure(), None);
+    assert!(context.update_peer_path_usage_for_test(
+        UnderlayProtocol::Tcp,
+        1,
+        candidate_instance,
+        2,
+        PathUsage::Backup,
+    ));
+    assert_eq!(
+        context.request_tcp_service_lifecycle_state(stale_lifecycle),
+        Some(ClientRequestTcpServiceLifecycleState::Withdrawn(
+            TcpServiceWithdrawalReason::FenceChanged
+        ))
+    );
+    assert_eq!(
+        stale_coordinator.failure(),
+        Some(TcpServiceFlightSidecarError::ObserverStopped)
+    );
     let (stale_install_tx, stale_install_rx) = tokio::sync::oneshot::channel();
     apply_request_tcp_service_control(
         &state,
@@ -315,7 +472,7 @@ async fn request_tcp_service_install_requires_the_exact_actor_snapshot() {
         RequestTcpServiceControl::Install {
             install: RequestTcpServiceObserverInstall {
                 frozen: stale_frozen,
-                coordinator: stale_coordinator,
+                coordinator: stale_coordinator.clone(),
                 max_flight_records: 8,
                 max_ack_release_records: 8,
             },
@@ -330,6 +487,123 @@ async fn request_tcp_service_install_requires_the_exact_actor_snapshot() {
         sender.remove_tcp_service_observer(stale_lifecycle),
         TcpServiceObserverRemoval::AlreadyAbsent
     );
+    assert!(context.disarm_request_tcp_service_lifecycle(stale_lifecycle));
+
+    assert!(context.update_peer_path_usage_for_test(
+        UnderlayProtocol::Tcp,
+        1,
+        candidate_instance,
+        3,
+        PathUsage::Available,
+    ));
+    let restored_request = RequestTcpServiceSnapshotRequest {
+        candidate: context
+            .current_request_tcp_service_candidate(RelayPathKey {
+                underlay: UnderlayProtocol::Tcp,
+                index: 1,
+            })
+            .expect("restored candidate authority"),
+        ..request
+    };
+    let replacement_frozen = match snapshot_request_tcp_service_stream(
+        &state,
+        &sender,
+        &sender_queue,
+        &context,
+        &remotes,
+        restored_request,
+    ) {
+        RequestTcpServiceControlOutcome::Complete(frozen) => frozen,
+        RequestTcpServiceControlOutcome::Withdrawn(reason) => {
+            panic!("restored actor snapshot withdrew: {reason:?}")
+        }
+    };
+    let replacement_lifecycle = TcpServiceWriterLifecycle::for_runtime_test(
+        context.session_id,
+        3,
+        PathMetricDirection::ClientToServer,
+    );
+    let replacement_coordinator = Arc::new(TcpServiceWriterCoordinator::new(
+        replacement_lifecycle,
+        Arc::new(IgnoreTcpServiceAck),
+    ));
+    context
+        .arm_request_tcp_service_lifecycle(&[replacement_frozen], replacement_coordinator.clone())
+        .expect("arm before accepted carrier replacement");
+    let replacement_instance = next_carrier_path_instance_id();
+    context.install_authenticated_path_for_test(
+        UnderlayProtocol::Tcp,
+        0,
+        PathId(12),
+        AuthNonce([12; 16]),
+        replacement_instance,
+        0,
+        PathUsage::Available,
+    );
+    assert_eq!(
+        context.request_tcp_service_lifecycle_state(replacement_lifecycle),
+        Some(ClientRequestTcpServiceLifecycleState::Withdrawn(
+            TcpServiceWithdrawalReason::FenceChanged
+        ))
+    );
+    assert_eq!(
+        replacement_coordinator.failure(),
+        Some(TcpServiceFlightSidecarError::ObserverStopped)
+    );
+    assert!(
+        context
+            .begin_request_tcp_service_cleanup(replacement_lifecycle, None)
+            .expect("clean never-installed replacement lifecycle")
+            .is_empty()
+    );
+    assert!(context.disarm_request_tcp_service_lifecycle(replacement_lifecycle));
+
+    context.install_authenticated_path_for_test(
+        UnderlayProtocol::Tcp,
+        0,
+        PathId(10),
+        AuthNonce([10; 16]),
+        accepted_instance.path_instance_id,
+        0,
+        PathUsage::Available,
+    );
+    let actor_drop_frozen = match snapshot_request_tcp_service_stream(
+        &state,
+        &sender,
+        &sender_queue,
+        &context,
+        &remotes,
+        restored_request,
+    ) {
+        RequestTcpServiceControlOutcome::Complete(frozen) => frozen,
+        RequestTcpServiceControlOutcome::Withdrawn(reason) => {
+            panic!("restored attachment snapshot withdrew: {reason:?}")
+        }
+    };
+    let actor_drop_lifecycle = TcpServiceWriterLifecycle::for_runtime_test(
+        context.session_id,
+        4,
+        PathMetricDirection::ClientToServer,
+    );
+    let actor_drop_coordinator = Arc::new(TcpServiceWriterCoordinator::new(
+        actor_drop_lifecycle,
+        Arc::new(IgnoreTcpServiceAck),
+    ));
+    context
+        .arm_request_tcp_service_lifecycle(&[actor_drop_frozen], actor_drop_coordinator.clone())
+        .expect("arm before stream actor retirement");
+    drop(writer_registration);
+    assert_eq!(
+        context.request_tcp_service_lifecycle_state(actor_drop_lifecycle),
+        Some(ClientRequestTcpServiceLifecycleState::Withdrawn(
+            TcpServiceWithdrawalReason::FenceChanged
+        ))
+    );
+    assert_eq!(
+        actor_drop_coordinator.failure(),
+        Some(TcpServiceFlightSidecarError::ObserverStopped)
+    );
+    assert!(context.disarm_request_tcp_service_lifecycle(actor_drop_lifecycle));
 }
 
 async fn closed_output_relay(

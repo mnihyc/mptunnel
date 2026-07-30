@@ -1,13 +1,29 @@
 use super::*;
 use crate::config::{ClientPathConfig, LocalIngressConfig, ResourceLimits, SharedSecret};
 use crate::ingress::{IngressConfig, LocalProxyUser, ProxyAuthConfig};
+use crate::model::capacity::reliable_relay_buffer_len;
 use crate::model::path::{RelayPathKey, next_carrier_path_instance_id};
-use crate::protocol::{AuthNonce, PathId, PathUsage, UnderlayProtocol};
+use crate::model::tcp_service::{
+    TcpServiceDataAckEvent, TcpServiceWithdrawalReason, TcpServiceWriterLifecycle,
+};
+use crate::protocol::{
+    AuthNonce, PathId, PathMetricDirection, PathUsage, StreamId, UnderlayProtocol,
+};
 use crate::runtime::management::snapshot::SessionInventory;
 use crate::runtime::outbound_registry::{
     RuntimeOutboundLeaf, RuntimeOutboundRegistry, test_dns_generation,
 };
+use crate::runtime::path::ClientRequestTcpServiceLifecycleState;
+use crate::runtime::path::commands::reliable_path_command_channels;
 use crate::runtime::readiness::RuntimeGenerationControl;
+use crate::runtime::stream::{
+    OpenedRemoteStream, ReliablePathStream, ReliablePathStreamOutput, ReliableRelayRemoteSet,
+};
+use crate::runtime::tcp_service::{
+    RequestTcpServiceSnapshotRequest, TcpServiceAckDisposition, TcpServiceDataAckSink,
+    TcpServiceFlightSidecarError, TcpServiceWriterCoordinator,
+};
+use crate::scheduler::TrafficClass;
 use crate::{
     config::GatewayBalancerConfig,
     outbound::OutboundConfig,
@@ -16,6 +32,7 @@ use crate::{
     },
 };
 use std::time::Duration;
+use tokio::sync::mpsc;
 
 fn local_proxy_auth() -> ProxyAuthConfig {
     let user = LocalProxyUser::new(
@@ -26,6 +43,19 @@ fn local_proxy_auth() -> ProxyAuthConfig {
     )
     .expect("local user");
     ProxyAuthConfig::required([user]).expect("proxy auth")
+}
+
+#[derive(Debug)]
+struct IgnoreManagementTcpServiceAck;
+
+impl TcpServiceDataAckSink for IgnoreManagementTcpServiceAck {
+    fn apply_data_ack(
+        &self,
+        _event: TcpServiceDataAckEvent,
+        _now: std::time::Instant,
+    ) -> Result<TcpServiceAckDisposition, TcpServiceFlightSidecarError> {
+        Ok(TcpServiceAckDisposition::Continue)
+    }
 }
 
 #[test]
@@ -220,8 +250,8 @@ async fn dns_management_contract_explains_queries_observes_and_flushes_one_gener
     );
 }
 
-#[test]
-fn enabling_a_path_requires_fresh_liveness_evidence() {
+#[tokio::test]
+async fn enabling_a_path_requires_fresh_liveness_evidence() {
     let security = ClientSecurityConfig::for_test(
         SharedSecret::new(b"0123456789abcdef0123456789abcdef".to_vec()).expect("secret"),
     );
@@ -256,6 +286,68 @@ fn enabling_a_path_requires_fresh_liveness_evidence() {
     let initial_candidate = context
         .current_request_tcp_service_candidate(dormant_key)
         .expect("ready dormant candidate");
+    let stream_id = StreamId(903);
+    let (commands, _receivers) = reliable_path_command_channels(8);
+    let (_frames_tx, frames_rx) = mpsc::channel(1);
+    let remotes = ReliableRelayRemoteSet::new(
+        OpenedRemoteStream::pending(
+            ReliablePathStream {
+                stream_id,
+                max_offset: context.mux_limits.max_stream_window_bytes,
+                lane: TrafficClass::Throughput,
+                underlay: UnderlayProtocol::Tcp,
+                max_frame_payload_bytes: reliable_relay_buffer_len(context.mux_limits),
+                output: ReliablePathStreamOutput::fixed(
+                    UnderlayProtocol::Tcp,
+                    PathId(0),
+                    commands,
+                    context.mux_limits,
+                ),
+                frames: frames_rx.into(),
+            },
+            0,
+        ),
+        8,
+    );
+    let accepted_instance = remotes.paths[0].instance();
+    context.install_authenticated_path_for_test(
+        UnderlayProtocol::Tcp,
+        0,
+        PathId(10),
+        AuthNonce([10; 16]),
+        accepted_instance.path_instance_id,
+        0,
+        PathUsage::Available,
+    );
+    let _writer_registration = context
+        .register_tcp_service_writer(stream_id, remotes.tcp_service_writer())
+        .expect("register managed-path test actor");
+    let frozen = remotes
+        .snapshot_tcp_service_stream(
+            &context,
+            RequestTcpServiceSnapshotRequest {
+                carrier_group_id: context
+                    .tcp_service_carrier_group_id(0)
+                    .expect("configured carrier group"),
+                candidate: initial_candidate,
+                max_accepted_paths: 3,
+            },
+            1,
+            1024,
+        )
+        .expect("freeze managed-path lifecycle");
+    let lifecycle = TcpServiceWriterLifecycle::for_runtime_test(
+        context.session_id,
+        1,
+        PathMetricDirection::ClientToServer,
+    );
+    let coordinator = Arc::new(TcpServiceWriterCoordinator::new(
+        lifecycle,
+        Arc::new(IgnoreManagementTcpServiceAck),
+    ));
+    context
+        .arm_request_tcp_service_lifecycle(&[frozen], coordinator.clone())
+        .expect("arm before explicit management failure");
     let target = ManagementTarget {
         clients: vec![context.clone()],
         servers: Vec::new(),
@@ -272,6 +364,23 @@ fn enabling_a_path_requires_fresh_liveness_evidence() {
     target
         .control_path_json(br#"{"outbound":"edge-mpp","path":"primary","state":"failed"}"#)
         .expect("fail path");
+    assert_eq!(
+        context.request_tcp_service_lifecycle_state(lifecycle),
+        Some(ClientRequestTcpServiceLifecycleState::Withdrawn(
+            TcpServiceWithdrawalReason::FenceChanged
+        ))
+    );
+    assert_eq!(
+        coordinator.failure(),
+        Some(TcpServiceFlightSidecarError::ObserverStopped)
+    );
+    assert!(
+        context
+            .begin_request_tcp_service_cleanup(lifecycle, None)
+            .expect("clean never-installed managed lifecycle")
+            .is_empty()
+    );
+    assert!(context.disarm_request_tcp_service_lifecycle(lifecycle));
     {
         let health = context.health().lock().expect("failed health");
         assert_eq!(health.tcp.len(), 3);

@@ -17,6 +17,7 @@ use super::remote::{
 use crate::lab_diagnostics::lab_diagnostic;
 use crate::model::capacity::{QUIC_PERSISTENT_CONGESTION_THRESHOLD, reliable_relay_buffer_len};
 use crate::model::path::{RelayPathInstance, RelayPathKey};
+use crate::model::tcp_service::TcpServiceWithdrawalReason;
 use crate::model::timing::transport_pto_from_snapshot;
 use crate::mux::MuxLimits;
 use crate::mux::stream::{ReliableRecvStream, ReliableSendStream};
@@ -213,7 +214,10 @@ pub(super) async fn handle_additional_path_open_result(
                 return None;
             }
             match remotes.attach_candidate_before_commit(opened, |_| {
-                sender.invalidate_tcp_service_observer();
+                sender.withdraw_tcp_service_observer(
+                    context,
+                    TcpServiceWithdrawalReason::FenceChanged,
+                );
             }) {
                 ReliableRelayAttachOutcome::Attached => {
                     send_stream.update_max_offset(remotes.max_offset());

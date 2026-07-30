@@ -150,6 +150,14 @@ pub(crate) struct TcpServiceWriterLifecycle {
 }
 
 impl TcpServiceWriterLifecycle {
+    pub(crate) fn session_id(self) -> SessionId {
+        self.session_id
+    }
+
+    pub(crate) fn direction(self) -> PathMetricDirection {
+        self.direction
+    }
+
     /// Runtime clocks serialize `at` before constructing the point. The model
     /// rejects points from every other lifecycle.
     pub(crate) fn point(self, at: Instant) -> TcpServiceWriterPoint {

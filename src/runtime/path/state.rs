@@ -4,7 +4,7 @@
 //! module owns its reservation, proof, and rollback transaction.
 
 use super::commands::CapacityProbeCommandTicket;
-use super::health::{ClientPathHealth, RequestCapacityReconciliationView};
+use super::health::{ClientPathHealth, ClientPathHealthRecord, RequestCapacityReconciliationView};
 use super::model::{
     PathDeliveryStats, UdpDatagramPathObservation, path_observation_is_idle_for_probe,
     path_records_have_schedulable_alternative,
@@ -19,13 +19,20 @@ use super::tcp::capacity::{
 use super::*;
 use crate::model::capacity::{PathRateSample, reliable_capacity_measurement_session_limit_bytes};
 use crate::model::path::{CarrierPathInstanceId, RelayPathInstance, RelayPathKey};
-use crate::model::tcp_service::TcpServiceCarrierFence;
+use crate::model::tcp_service::{
+    TcpServiceCarrierFence, TcpServiceCarrierGroupId, TcpServiceStreamFence,
+    TcpServiceWithdrawalReason, TcpServiceWriterLifecycle,
+};
 use crate::protocol::{
-    AuthNonce, DatagramFlowId, PathId, PathUsage, StreamId, TcpCarrierAcceptedPath,
-    UnderlayProtocol,
+    AuthNonce, DatagramFlowId, PathId, PathMetricDirection, PathUsage, StreamId,
+    TcpCarrierAcceptedPath, UnderlayProtocol,
 };
 use crate::runtime::error::RuntimeError;
-use crate::runtime::stream::RequestTcpServiceWriter;
+use crate::runtime::stream::{RequestTcpServiceFrozenStream, RequestTcpServiceWriter};
+use crate::runtime::tcp_service::{
+    RequestTcpServiceObserverInstallation, TcpServiceFlightSidecarError,
+    TcpServiceWriterCoordinator,
+};
 use crate::scheduler::TrafficClass;
 use std::collections::HashMap;
 use std::collections::hash_map::Entry;
@@ -40,7 +47,7 @@ use std::time::{Duration, Instant};
 pub(in crate::runtime) struct ClientPathState {
     health: Mutex<ClientPathHealth>,
     registered_carriers: Mutex<ClientRegisteredCarrierPaths>,
-    tcp_service_writers: Mutex<HashMap<StreamId, RequestTcpServiceWriter>>,
+    tcp_service_registry: Mutex<ClientTcpServiceRegistry>,
     next_reliable_stream_id: Mutex<u64>,
     next_datagram_flow_id: Mutex<u64>,
     request_tcp_capacity_probe: RequestTcpCapacityProbeSession,
@@ -59,6 +66,215 @@ struct ClientRegisteredCarrierPaths {
     udp: Vec<Option<ClientRegisteredCarrierPath>>,
 }
 
+#[derive(Debug, Default)]
+struct ClientTcpServiceRegistry {
+    writers: HashMap<StreamId, RequestTcpServiceWriter>,
+    active_request: Option<ClientRequestTcpServiceActiveLifecycle>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct ClientRequestTcpServicePathBinding {
+    key: RelayPathKey,
+    carrier: TcpServiceCarrierFence,
+}
+
+#[derive(Debug, Clone)]
+struct ClientRequestTcpServiceStreamBinding {
+    stream: TcpServiceStreamFence,
+    writer: RequestTcpServiceWriter,
+    observer_installed: bool,
+    cleanup_acknowledged: bool,
+}
+
+#[derive(Debug)]
+struct ClientRequestTcpServiceActiveLifecycle {
+    lifecycle: TcpServiceWriterLifecycle,
+    coordinator: Arc<TcpServiceWriterCoordinator>,
+    carrier_group_id: TcpServiceCarrierGroupId,
+    accepted: Vec<ClientRequestTcpServicePathBinding>,
+    candidate: ClientRequestTcpServicePathBinding,
+    streams: Vec<ClientRequestTcpServiceStreamBinding>,
+    withdrawal_reason: Option<TcpServiceWithdrawalReason>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(in crate::runtime) enum ClientRequestTcpServiceLifecycleState {
+    Current,
+    CleanupPending,
+    Withdrawn(TcpServiceWithdrawalReason),
+}
+
+impl ClientRequestTcpServiceActiveLifecycle {
+    fn matches_frozen_stream(
+        &self,
+        frozen: &RequestTcpServiceFrozenStream,
+    ) -> Result<bool, TcpServiceWithdrawalReason> {
+        Ok(self.carrier_group_id == frozen.carrier_group_id()
+            && self.candidate == request_tcp_service_candidate_binding(frozen)
+            && request_tcp_service_accepted_bindings(frozen)? == self.accepted
+            && self
+                .streams
+                .iter()
+                .any(|current| current.stream == frozen.stream()))
+    }
+
+    fn stream_writer_is_current(
+        &self,
+        writers: &HashMap<StreamId, RequestTcpServiceWriter>,
+        stream_id: StreamId,
+    ) -> bool {
+        let Some(armed) = self
+            .streams
+            .iter()
+            .find(|current| current.stream.stream_id == stream_id)
+        else {
+            return false;
+        };
+        writers
+            .get(&stream_id)
+            .is_some_and(|current| current.same_actor(&armed.writer))
+    }
+
+    fn stream_mut(
+        &mut self,
+        stream: TcpServiceStreamFence,
+    ) -> Option<&mut ClientRequestTcpServiceStreamBinding> {
+        self.streams
+            .iter_mut()
+            .find(|current| current.stream == stream)
+    }
+
+    fn cleanup_is_complete(&self) -> bool {
+        self.streams
+            .iter()
+            .all(|stream| stream.cleanup_acknowledged && !stream.observer_installed)
+    }
+
+    fn depends_on_any(&self, indices: &[usize]) -> bool {
+        self.accepted
+            .iter()
+            .chain(std::iter::once(&self.candidate))
+            .any(|binding| indices.contains(&binding.key.index))
+    }
+}
+
+fn request_tcp_service_accepted_bindings(
+    frozen: &RequestTcpServiceFrozenStream,
+) -> Result<Vec<ClientRequestTcpServicePathBinding>, TcpServiceWithdrawalReason> {
+    let mut accepted = Vec::new();
+    accepted
+        .try_reserve(frozen.accepted().len())
+        .map_err(|_| TcpServiceWithdrawalReason::ResourceLimit)?;
+    for binding in frozen.accepted() {
+        let instance = binding.instance();
+        let carrier = binding.carrier();
+        if instance.key.underlay != UnderlayProtocol::Tcp
+            || instance.path_instance_id != carrier.local_instance_id
+        {
+            return Err(TcpServiceWithdrawalReason::InvalidEvidence);
+        }
+        accepted.push(ClientRequestTcpServicePathBinding {
+            key: instance.key,
+            carrier,
+        });
+    }
+    accepted.sort_unstable_by_key(|binding| (binding.key.underlay, binding.key.index));
+    if accepted.windows(2).any(|pair| pair[0].key == pair[1].key) {
+        return Err(TcpServiceWithdrawalReason::InvalidEvidence);
+    }
+    Ok(accepted)
+}
+
+fn request_tcp_service_candidate_binding(
+    frozen: &RequestTcpServiceFrozenStream,
+) -> ClientRequestTcpServicePathBinding {
+    let (key, carrier) = frozen.candidate_path_binding();
+    ClientRequestTcpServicePathBinding { key, carrier }
+}
+
+fn request_tcp_service_sidecar_error(
+    reason: TcpServiceWithdrawalReason,
+) -> TcpServiceFlightSidecarError {
+    match reason {
+        TcpServiceWithdrawalReason::ResourceLimit => TcpServiceFlightSidecarError::ResourceLimit,
+        TcpServiceWithdrawalReason::InvalidEvidence => TcpServiceFlightSidecarError::InvalidRelease,
+        TcpServiceWithdrawalReason::Deadline
+        | TcpServiceWithdrawalReason::DemandEnded
+        | TcpServiceWithdrawalReason::FenceChanged
+        | TcpServiceWithdrawalReason::NoGainSuppressed => {
+            TcpServiceFlightSidecarError::ObserverStopped
+        }
+    }
+}
+
+fn request_tcp_service_withdrawal_reason(
+    error: TcpServiceFlightSidecarError,
+) -> TcpServiceWithdrawalReason {
+    match error {
+        TcpServiceFlightSidecarError::ResourceLimit => TcpServiceWithdrawalReason::ResourceLimit,
+        TcpServiceFlightSidecarError::InvalidRelease => TcpServiceWithdrawalReason::InvalidEvidence,
+        TcpServiceFlightSidecarError::ObserverStopped => TcpServiceWithdrawalReason::FenceChanged,
+    }
+}
+
+fn maintain_request_tcp_service_path_bindings(
+    health: &mut ClientPathHealth,
+    accepted: &[ClientRequestTcpServicePathBinding],
+    candidate: ClientRequestTcpServicePathBinding,
+) {
+    let now = Instant::now();
+    for binding in accepted.iter().chain(std::iter::once(&candidate)) {
+        if let Some(record) = health.tcp.get_mut(binding.key.index) {
+            record.maintain(now);
+        }
+    }
+}
+
+fn request_tcp_service_path_bindings_match(
+    health: &ClientPathHealth,
+    registered: &ClientRegisteredCarrierPaths,
+    accepted: &[ClientRequestTcpServicePathBinding],
+    candidate: ClientRequestTcpServicePathBinding,
+) -> bool {
+    accepted.iter().all(|binding| {
+        request_tcp_service_path_binding_matches(health, registered, *binding, false)
+    }) && request_tcp_service_path_binding_matches(health, registered, candidate, true)
+}
+
+fn request_tcp_service_path_binding_matches(
+    health: &ClientPathHealth,
+    registered: &ClientRegisteredCarrierPaths,
+    binding: ClientRequestTcpServicePathBinding,
+    candidate: bool,
+) -> bool {
+    if binding.key.underlay != UnderlayProtocol::Tcp {
+        return false;
+    }
+    let Some(record) = health.tcp.get(binding.key.index) else {
+        return false;
+    };
+    let generation = if candidate {
+        record.request_tcp_service_candidate_generation()
+    } else {
+        record.request_tcp_service_eligibility_generation()
+    };
+    let Some(generation) = generation else {
+        return false;
+    };
+    let Some(carrier) = registered.tcp.get(binding.key.index).copied().flatten() else {
+        return false;
+    };
+    binding.carrier
+        == (TcpServiceCarrierFence {
+            accepted: TcpCarrierAcceptedPath {
+                path_id: carrier.path_id,
+                path_join_nonce: carrier.path_join_nonce,
+            },
+            local_instance_id: carrier.path_instance_id,
+            eligibility_generation: generation,
+        })
+}
+
 impl ClientPathState {
     pub(in crate::runtime) fn new(health: ClientPathHealth) -> Arc<Self> {
         let tcp_path_count = health.tcp.len();
@@ -69,7 +285,7 @@ impl ClientPathState {
                 tcp: vec![None; tcp_path_count],
                 udp: vec![None; udp_path_count],
             }),
-            tcp_service_writers: Mutex::new(HashMap::new()),
+            tcp_service_registry: Mutex::new(ClientTcpServiceRegistry::default()),
             next_reliable_stream_id: Mutex::new(0),
             next_datagram_flow_id: Mutex::new(0),
             request_tcp_capacity_probe: RequestTcpCapacityProbeSession::new(tcp_path_count),
@@ -85,11 +301,11 @@ impl ClientPathState {
         stream_id: StreamId,
         writer: RequestTcpServiceWriter,
     ) -> Result<ClientTcpServiceWriterRegistration, RuntimeError> {
-        let mut writers = self
-            .tcp_service_writers
+        let mut registry = self
+            .tcp_service_registry
             .lock()
             .expect("client TCP service writer registry lock");
-        match writers.entry(stream_id) {
+        match registry.writers.entry(stream_id) {
             Entry::Vacant(entry) => {
                 entry.insert(writer.clone());
             }
@@ -110,11 +326,551 @@ impl ClientPathState {
         &self,
         stream_id: StreamId,
     ) -> Option<RequestTcpServiceWriter> {
-        self.tcp_service_writers
+        self.tcp_service_registry
             .lock()
             .expect("client TCP service writer registry lock")
+            .writers
             .get(&stream_id)
             .cloned()
+    }
+
+    /// Publishes one request-direction validation lifecycle before any stream
+    /// observer installation. The opaque actor snapshots are the only source
+    /// of stream attachment identity; this registry adds no placement credit.
+    pub(in crate::runtime) fn arm_request_tcp_service_lifecycle(
+        &self,
+        frozen_streams: &[RequestTcpServiceFrozenStream],
+        coordinator: Arc<TcpServiceWriterCoordinator>,
+    ) -> Result<(), TcpServiceWithdrawalReason> {
+        if frozen_streams.is_empty()
+            || coordinator.lifecycle().direction() != PathMetricDirection::ClientToServer
+        {
+            return Err(TcpServiceWithdrawalReason::InvalidEvidence);
+        }
+        let first = &frozen_streams[0];
+        let carrier_group_id = first.carrier_group_id();
+        let accepted = request_tcp_service_accepted_bindings(first)?;
+        let candidate = request_tcp_service_candidate_binding(first);
+        if accepted.is_empty()
+            || accepted
+                .iter()
+                .any(|binding| binding.carrier == candidate.carrier)
+        {
+            return Err(TcpServiceWithdrawalReason::InvalidEvidence);
+        }
+
+        let mut stream_fences = Vec::new();
+        stream_fences
+            .try_reserve(frozen_streams.len())
+            .map_err(|_| TcpServiceWithdrawalReason::ResourceLimit)?;
+        for frozen in frozen_streams {
+            if frozen.carrier_group_id() != carrier_group_id
+                || request_tcp_service_candidate_binding(frozen) != candidate
+                || request_tcp_service_accepted_bindings(frozen)? != accepted
+            {
+                return Err(TcpServiceWithdrawalReason::FenceChanged);
+            }
+            stream_fences.push(frozen.stream());
+        }
+        stream_fences.sort_unstable_by_key(|stream| stream.stream_id);
+        if stream_fences
+            .windows(2)
+            .any(|pair| pair[0].stream_id == pair[1].stream_id)
+        {
+            return Err(TcpServiceWithdrawalReason::InvalidEvidence);
+        }
+
+        let mut registry = self
+            .tcp_service_registry
+            .lock()
+            .expect("client TCP service writer registry lock");
+        if registry.active_request.is_some() {
+            return Err(TcpServiceWithdrawalReason::ResourceLimit);
+        }
+        let mut streams = Vec::new();
+        streams
+            .try_reserve(stream_fences.len())
+            .map_err(|_| TcpServiceWithdrawalReason::ResourceLimit)?;
+        for stream in stream_fences {
+            let writer = registry
+                .writers
+                .get(&stream.stream_id)
+                .cloned()
+                .ok_or(TcpServiceWithdrawalReason::DemandEnded)?;
+            streams.push(ClientRequestTcpServiceStreamBinding {
+                stream,
+                writer,
+                observer_installed: false,
+                cleanup_acknowledged: false,
+            });
+        }
+
+        let transaction = coordinator.lock();
+        if !transaction.installation_is_current() {
+            return Err(TcpServiceWithdrawalReason::FenceChanged);
+        }
+        let mut health = self.health.lock().expect("client path health lock");
+        maintain_request_tcp_service_path_bindings(&mut health, &accepted, candidate);
+        let registered = self
+            .registered_carriers
+            .lock()
+            .expect("client registered carrier lock");
+        if !request_tcp_service_path_bindings_match(&health, &registered, &accepted, candidate) {
+            return Err(TcpServiceWithdrawalReason::FenceChanged);
+        }
+        registry.active_request = Some(ClientRequestTcpServiceActiveLifecycle {
+            lifecycle: coordinator.lifecycle(),
+            coordinator: coordinator.clone(),
+            carrier_group_id,
+            accepted,
+            candidate,
+            streams,
+            withdrawal_reason: None,
+        });
+        drop(registered);
+        drop(health);
+        drop(transaction);
+        Ok(())
+    }
+
+    pub(in crate::runtime) fn request_tcp_service_lifecycle_state(
+        &self,
+        lifecycle: TcpServiceWriterLifecycle,
+    ) -> Option<ClientRequestTcpServiceLifecycleState> {
+        let mut registry = self
+            .tcp_service_registry
+            .lock()
+            .expect("client TCP service writer registry lock");
+        let Some(active) = registry
+            .active_request
+            .as_ref()
+            .filter(|active| active.lifecycle == lifecycle)
+        else {
+            return None;
+        };
+        if let Some(reason) = active.withdrawal_reason {
+            return Some(ClientRequestTcpServiceLifecycleState::Withdrawn(reason));
+        }
+        let coordinator = active.coordinator.clone();
+        let transaction = coordinator.lock();
+        if let Some(error) = transaction.failure() {
+            let reason = request_tcp_service_withdrawal_reason(error);
+            registry
+                .active_request
+                .as_mut()
+                .expect("matched request lifecycle")
+                .withdrawal_reason = Some(reason);
+            return Some(ClientRequestTcpServiceLifecycleState::Withdrawn(reason));
+        }
+        Some(if transaction.accepts_invalidation() {
+            ClientRequestTcpServiceLifecycleState::Current
+        } else {
+            ClientRequestTcpServiceLifecycleState::CleanupPending
+        })
+    }
+
+    /// Runs one actor-local installation while the armed session lifecycle,
+    /// shared coordinator, authenticated carrier fence, and writer identity
+    /// remain one indivisible authority check.
+    pub(in crate::runtime) fn install_request_tcp_service_observer(
+        &self,
+        frozen: &RequestTcpServiceFrozenStream,
+        coordinator: &Arc<TcpServiceWriterCoordinator>,
+        install: impl FnOnce() -> Result<bool, TcpServiceFlightSidecarError>,
+    ) -> Result<RequestTcpServiceObserverInstallation, TcpServiceWithdrawalReason> {
+        let mut registry = self
+            .tcp_service_registry
+            .lock()
+            .expect("client TCP service writer registry lock");
+        let Some(active) = registry.active_request.as_ref() else {
+            return Err(TcpServiceWithdrawalReason::FenceChanged);
+        };
+        let frozen_matches = active.matches_frozen_stream(frozen)?;
+        if let Some(reason) = active.withdrawal_reason {
+            return Err(reason);
+        }
+        if !Arc::ptr_eq(&active.coordinator, coordinator)
+            || active.lifecycle != coordinator.lifecycle()
+            || !frozen_matches
+            || !active.stream_writer_is_current(&registry.writers, frozen.stream().stream_id)
+        {
+            return Err(TcpServiceWithdrawalReason::FenceChanged);
+        }
+        let coordinator = active.coordinator.clone();
+        let mut transaction = coordinator.lock();
+        if !transaction.installation_is_current() {
+            return Err(TcpServiceWithdrawalReason::FenceChanged);
+        }
+        let health = self.health.lock().expect("client path health lock");
+        let registered = self
+            .registered_carriers
+            .lock()
+            .expect("client registered carrier lock");
+        let fence_matches = request_tcp_service_path_bindings_match(
+            &health,
+            &registered,
+            &active.accepted,
+            active.candidate,
+        );
+        drop(registered);
+        drop(health);
+        if !fence_matches {
+            if let Some(active) = registry.active_request.as_mut() {
+                active
+                    .withdrawal_reason
+                    .get_or_insert(TcpServiceWithdrawalReason::FenceChanged);
+            }
+            transaction.fail(TcpServiceFlightSidecarError::ObserverStopped);
+            return Err(TcpServiceWithdrawalReason::FenceChanged);
+        }
+        match install() {
+            Ok(installed) => {
+                let active = registry
+                    .active_request
+                    .as_mut()
+                    .expect("validated request lifecycle");
+                let binding = active
+                    .stream_mut(frozen.stream())
+                    .expect("validated request stream fence");
+                if !installed && !binding.observer_installed {
+                    active
+                        .withdrawal_reason
+                        .get_or_insert(TcpServiceWithdrawalReason::InvalidEvidence);
+                    transaction.fail(TcpServiceFlightSidecarError::InvalidRelease);
+                    return Err(TcpServiceWithdrawalReason::InvalidEvidence);
+                }
+                binding.observer_installed = true;
+                Ok(if installed {
+                    RequestTcpServiceObserverInstallation::Installed
+                } else {
+                    RequestTcpServiceObserverInstallation::AlreadyInstalled
+                })
+            }
+            Err(error) => {
+                let proposed = request_tcp_service_withdrawal_reason(error);
+                let reason = *registry
+                    .active_request
+                    .as_mut()
+                    .expect("validated request lifecycle")
+                    .withdrawal_reason
+                    .get_or_insert(proposed);
+                transaction.fail(error);
+                Err(reason)
+            }
+        }
+    }
+
+    /// Records an exact actor- or controller-observed withdrawal before the
+    /// actor destroys its passive observer. A successfully settled lifecycle
+    /// remains a verdict, not a late withdrawal.
+    pub(in crate::runtime) fn withdraw_request_tcp_service_stream(
+        &self,
+        stream: TcpServiceStreamFence,
+        lifecycle: TcpServiceWriterLifecycle,
+        proposed: TcpServiceWithdrawalReason,
+    ) -> Option<TcpServiceWithdrawalReason> {
+        let mut registry = self
+            .tcp_service_registry
+            .lock()
+            .expect("client TCP service writer registry lock");
+        let active = registry.active_request.as_ref().filter(|active| {
+            active.lifecycle == lifecycle
+                && active
+                    .streams
+                    .iter()
+                    .any(|current| current.stream == stream)
+                && active.stream_writer_is_current(&registry.writers, stream.stream_id)
+        })?;
+        if let Some(reason) = active.withdrawal_reason {
+            return Some(reason);
+        }
+        let coordinator = active.coordinator.clone();
+        let mut transaction = coordinator.lock();
+        let reason = if transaction.accepts_invalidation() {
+            proposed
+        } else if let Some(error) = transaction.failure() {
+            request_tcp_service_withdrawal_reason(error)
+        } else {
+            return None;
+        };
+        registry
+            .active_request
+            .as_mut()
+            .expect("matched request lifecycle")
+            .withdrawal_reason = Some(reason);
+        transaction.fail(request_tcp_service_sidecar_error(reason));
+        Some(reason)
+    }
+
+    /// A rejected Install may withdraw only the exact frozen actor snapshot
+    /// and shared coordinator that were armed together. A stale control with
+    /// the same lifecycle value has no cleanup authority.
+    pub(in crate::runtime) fn withdraw_request_tcp_service_installation(
+        &self,
+        frozen: &RequestTcpServiceFrozenStream,
+        coordinator: &Arc<TcpServiceWriterCoordinator>,
+        proposed: TcpServiceWithdrawalReason,
+    ) -> Option<TcpServiceWithdrawalReason> {
+        let mut registry = self
+            .tcp_service_registry
+            .lock()
+            .expect("client TCP service writer registry lock");
+        let active = registry.active_request.as_ref()?;
+        let frozen_matches = active.matches_frozen_stream(frozen).ok()?;
+        if !frozen_matches
+            || !Arc::ptr_eq(&active.coordinator, coordinator)
+            || active.lifecycle != coordinator.lifecycle()
+            || !active.stream_writer_is_current(&registry.writers, frozen.stream().stream_id)
+        {
+            return None;
+        }
+        if let Some(reason) = active.withdrawal_reason {
+            return Some(reason);
+        }
+        let coordinator = active.coordinator.clone();
+        let mut transaction = coordinator.lock();
+        let reason = if transaction.accepts_invalidation() {
+            proposed
+        } else if let Some(error) = transaction.failure() {
+            request_tcp_service_withdrawal_reason(error)
+        } else {
+            return None;
+        };
+        registry
+            .active_request
+            .as_mut()
+            .expect("matched request lifecycle")
+            .withdrawal_reason = Some(reason);
+        transaction.fail(request_tcp_service_sidecar_error(reason));
+        Some(reason)
+    }
+
+    /// A serialized actor confirms that this exact lifecycle has no remaining
+    /// passive observer on its exact stream incarnation.
+    pub(in crate::runtime) fn acknowledge_request_tcp_service_cleanup(
+        &self,
+        stream: TcpServiceStreamFence,
+        lifecycle: TcpServiceWriterLifecycle,
+    ) -> bool {
+        let mut registry = self
+            .tcp_service_registry
+            .lock()
+            .expect("client TCP service writer registry lock");
+        let writer_is_current = registry
+            .active_request
+            .as_ref()
+            .filter(|active| active.lifecycle == lifecycle)
+            .is_some_and(|active| {
+                active.stream_writer_is_current(&registry.writers, stream.stream_id)
+            });
+        if !writer_is_current {
+            return false;
+        }
+        let coordinator = registry
+            .active_request
+            .as_ref()
+            .expect("matched request lifecycle")
+            .coordinator
+            .clone();
+        let transaction = coordinator.lock();
+        if !transaction.is_stopped() {
+            return false;
+        }
+        let Some(binding) = registry
+            .active_request
+            .as_mut()
+            .and_then(|active| active.stream_mut(stream))
+        else {
+            return false;
+        };
+        binding.observer_installed = false;
+        binding.cleanup_acknowledged = true;
+        true
+    }
+
+    /// The registered stream actor acknowledges absence by its current actor
+    /// identity when a Remove control has no frozen stream payload.
+    pub(in crate::runtime) fn acknowledge_request_tcp_service_actor_cleanup(
+        &self,
+        stream_id: StreamId,
+        lifecycle: TcpServiceWriterLifecycle,
+    ) -> bool {
+        let mut registry = self
+            .tcp_service_registry
+            .lock()
+            .expect("client TCP service writer registry lock");
+        let writer_is_current = registry
+            .active_request
+            .as_ref()
+            .filter(|active| active.lifecycle == lifecycle)
+            .is_some_and(|active| active.stream_writer_is_current(&registry.writers, stream_id));
+        if !writer_is_current {
+            return false;
+        }
+        let coordinator = registry
+            .active_request
+            .as_ref()
+            .expect("matched request lifecycle")
+            .coordinator
+            .clone();
+        let transaction = coordinator.lock();
+        if !transaction.is_stopped() {
+            return false;
+        }
+        let Some(binding) = registry.active_request.as_mut().and_then(|active| {
+            active
+                .streams
+                .iter_mut()
+                .find(|binding| binding.stream.stream_id == stream_id)
+        }) else {
+            return false;
+        };
+        binding.observer_installed = false;
+        binding.cleanup_acknowledged = true;
+        true
+    }
+
+    /// Starts or reissues cleanup for one exact lifecycle. Never-installed
+    /// actors require no message; installed actors remain in every returned
+    /// snapshot until their serialized Remove control acknowledges absence.
+    pub(in crate::runtime) fn begin_request_tcp_service_cleanup(
+        &self,
+        lifecycle: TcpServiceWriterLifecycle,
+        proposed: Option<TcpServiceWithdrawalReason>,
+    ) -> Result<Vec<RequestTcpServiceWriter>, TcpServiceWithdrawalReason> {
+        let mut registry = self
+            .tcp_service_registry
+            .lock()
+            .expect("client TCP service writer registry lock");
+        let Some(active) = registry
+            .active_request
+            .as_mut()
+            .filter(|active| active.lifecycle == lifecycle)
+        else {
+            return Err(TcpServiceWithdrawalReason::FenceChanged);
+        };
+        let coordinator = active.coordinator.clone();
+        let mut transaction = coordinator.lock();
+        let count = active
+            .streams
+            .iter()
+            .filter(|stream| stream.observer_installed && !stream.cleanup_acknowledged)
+            .count();
+        let mut writers = Vec::new();
+        writers
+            .try_reserve(count)
+            .map_err(|_| TcpServiceWithdrawalReason::ResourceLimit)?;
+        writers.extend(
+            active
+                .streams
+                .iter()
+                .filter(|stream| stream.observer_installed && !stream.cleanup_acknowledged)
+                .map(|stream| stream.writer.clone()),
+        );
+        let terminal_reason = if let Some(reason) = active.withdrawal_reason {
+            Some(reason)
+        } else if let Some(error) = transaction.failure() {
+            Some(request_tcp_service_withdrawal_reason(error))
+        } else if transaction.accepts_invalidation() {
+            let Some(reason) = proposed else {
+                return Err(TcpServiceWithdrawalReason::InvalidEvidence);
+            };
+            Some(reason)
+        } else {
+            None
+        };
+        if let Some(reason) = terminal_reason {
+            active.withdrawal_reason.get_or_insert(reason);
+            transaction.fail(request_tcp_service_sidecar_error(reason));
+        } else if !transaction.is_stopped() {
+            return Err(TcpServiceWithdrawalReason::InvalidEvidence);
+        }
+        for stream in &mut active.streams {
+            if !stream.observer_installed {
+                stream.cleanup_acknowledged = true;
+            }
+        }
+        Ok(writers)
+    }
+
+    /// Clears only a stopped exact lifecycle after all actor observers have
+    /// acknowledged cleanup. A running or replacement lifecycle is untouched.
+    pub(in crate::runtime) fn disarm_request_tcp_service_lifecycle(
+        &self,
+        lifecycle: TcpServiceWriterLifecycle,
+    ) -> bool {
+        let mut registry = self
+            .tcp_service_registry
+            .lock()
+            .expect("client TCP service writer registry lock");
+        let Some(active) = registry
+            .active_request
+            .as_ref()
+            .filter(|active| active.lifecycle == lifecycle)
+        else {
+            return false;
+        };
+        let coordinator = active.coordinator.clone();
+        let transaction = coordinator.lock();
+        if !transaction.is_stopped() || !active.cleanup_is_complete() {
+            return false;
+        }
+        drop(transaction);
+        registry.active_request = None;
+        true
+    }
+
+    /// Serializes one cold TCP authority mutation with the active validation
+    /// writer boundary. No actor send or asynchronous operation is permitted
+    /// while this lock domain is held.
+    fn mutate_request_tcp_service_authority<T>(
+        &self,
+        affected_indices: &[usize],
+        mutation: impl FnOnce(&mut ClientPathHealth, &mut ClientRegisteredCarrierPaths) -> T,
+    ) -> T {
+        let mut registry = self
+            .tcp_service_registry
+            .lock()
+            .expect("client TCP service writer registry lock");
+        let coordinator = registry
+            .active_request
+            .as_ref()
+            .filter(|active| {
+                active.withdrawal_reason.is_none() && active.depends_on_any(affected_indices)
+            })
+            .map(|active| active.coordinator.clone());
+        let mut transaction = coordinator.as_ref().map(|coordinator| coordinator.lock());
+        let monitor_current = transaction
+            .as_ref()
+            .is_some_and(|transaction| transaction.accepts_invalidation());
+        let mut health = self.health.lock().expect("client path health lock");
+        let mut registered = self
+            .registered_carriers
+            .lock()
+            .expect("client registered carrier lock");
+        let result = mutation(&mut health, &mut registered);
+        let fence_changed = monitor_current
+            && registry.active_request.as_ref().is_some_and(|active| {
+                !request_tcp_service_path_bindings_match(
+                    &health,
+                    &registered,
+                    &active.accepted,
+                    active.candidate,
+                )
+            });
+        if fence_changed {
+            registry
+                .active_request
+                .as_mut()
+                .expect("monitored request lifecycle")
+                .withdrawal_reason
+                .get_or_insert(TcpServiceWithdrawalReason::FenceChanged);
+            transaction
+                .as_mut()
+                .expect("current request lifecycle transaction")
+                .fail(TcpServiceFlightSidecarError::ObserverStopped);
+        }
+        result
     }
 
     /// Installs the first preference from a newly authenticated carrier. A new
@@ -129,17 +885,28 @@ impl ClientPathState {
         sequence: u64,
         usage: PathUsage,
     ) {
+        if underlay == UnderlayProtocol::Tcp {
+            self.mutate_request_tcp_service_authority(&[index], |health, registered| {
+                if let (Some(record), Some(registration)) =
+                    (health.tcp.get_mut(index), registered.tcp.get_mut(index))
+                {
+                    record.install_peer_usage(path_instance_id, sequence, usage);
+                    *registration = Some(ClientRegisteredCarrierPath {
+                        path_id,
+                        path_join_nonce,
+                        path_instance_id,
+                    });
+                }
+            });
+            return;
+        }
         let mut health = self.health.lock().expect("client path health lock");
         let mut registered = self
             .registered_carriers
             .lock()
             .expect("client registered carrier lock");
-        let (records, registrations) = match underlay {
-            UnderlayProtocol::Tcp => (&mut health.tcp, &mut registered.tcp),
-            UnderlayProtocol::Udp => (&mut health.udp, &mut registered.udp),
-        };
         if let (Some(record), Some(registration)) =
-            (records.get_mut(index), registrations.get_mut(index))
+            (health.udp.get_mut(index), registered.udp.get_mut(index))
         {
             record.install_peer_usage(path_instance_id, sequence, usage);
             *registration = Some(ClientRegisteredCarrierPath {
@@ -286,26 +1053,38 @@ impl ClientPathState {
         key: RelayPathKey,
         expected_instance: CarrierPathInstanceId,
     ) -> bool {
+        if key.underlay == UnderlayProtocol::Tcp {
+            return self.mutate_request_tcp_service_authority(
+                &[key.index],
+                |health, registered| {
+                    let Some(registration) = registered.tcp.get_mut(key.index) else {
+                        return false;
+                    };
+                    if registration
+                        .is_none_or(|current| current.path_instance_id != expected_instance)
+                    {
+                        return false;
+                    }
+                    if let Some(current) = health.tcp.get_mut(key.index) {
+                        current.retire_request_tcp_service_authority(expected_instance);
+                    }
+                    *registration = None;
+                    true
+                },
+            );
+        }
         let mut health = self.health.lock().expect("client path health lock");
         let mut registered = self
             .registered_carriers
             .lock()
             .expect("client registered carrier lock");
-        let records = match key.underlay {
-            UnderlayProtocol::Tcp => &mut registered.tcp,
-            UnderlayProtocol::Udp => &mut registered.udp,
-        };
-        let Some(record) = records.get_mut(key.index) else {
+        let Some(record) = registered.udp.get_mut(key.index) else {
             return false;
         };
         if record.is_none_or(|current| current.path_instance_id != expected_instance) {
             return false;
         }
-        let health_records = match key.underlay {
-            UnderlayProtocol::Tcp => &mut health.tcp,
-            UnderlayProtocol::Udp => &mut health.udp,
-        };
-        if let Some(current) = health_records.get_mut(key.index) {
+        if let Some(current) = health.udp.get_mut(key.index) {
             current.retire_request_tcp_service_authority(expected_instance);
         }
         *record = None;
@@ -320,12 +1099,16 @@ impl ClientPathState {
         sequence: u64,
         usage: PathUsage,
     ) -> bool {
+        if underlay == UnderlayProtocol::Tcp {
+            return self.mutate_request_tcp_service_authority(&[index], |health, _registered| {
+                health.tcp.get_mut(index).is_some_and(|record| {
+                    record.update_peer_usage(path_instance_id, sequence, usage)
+                })
+            });
+        }
         let mut health = self.health.lock().expect("client path health lock");
-        let records = match underlay {
-            UnderlayProtocol::Tcp => &mut health.tcp,
-            UnderlayProtocol::Udp => &mut health.udp,
-        };
-        records
+        health
+            .udp
             .get_mut(index)
             .is_some_and(|record| record.update_peer_usage(path_instance_id, sequence, usage))
     }
@@ -351,16 +1134,78 @@ impl ClientPathState {
         path_instance_id: CarrierPathInstanceId,
     ) -> bool {
         let now = Instant::now();
+        if key.underlay == UnderlayProtocol::Tcp {
+            return self.mutate_request_tcp_service_authority(
+                &[key.index],
+                |health, _registered| {
+                    let has_schedulable_alternative =
+                        path_records_have_schedulable_alternative(&health.tcp, key.index, now);
+                    health.tcp.get_mut(key.index).is_some_and(|current| {
+                        current.mark_data_plane_failure(
+                            path_instance_id,
+                            now,
+                            has_schedulable_alternative,
+                        )
+                    })
+                },
+            );
+        }
         let mut health = self.health.lock().expect("client path health lock");
-        let records = match key.underlay {
-            UnderlayProtocol::Tcp => &mut health.tcp,
-            UnderlayProtocol::Udp => &mut health.udp,
-        };
         let has_schedulable_alternative =
-            path_records_have_schedulable_alternative(records, key.index, now);
-        records.get_mut(key.index).is_some_and(|current| {
+            path_records_have_schedulable_alternative(&health.udp, key.index, now);
+        health.udp.get_mut(key.index).is_some_and(|current| {
             current.mark_data_plane_failure(path_instance_id, now, has_schedulable_alternative)
         })
+    }
+
+    pub(in crate::runtime) fn mark_tcp_path_failure(&self, index: usize) {
+        let now = Instant::now();
+        self.mutate_request_tcp_service_authority(&[index], |health, _registered| {
+            let has_schedulable_alternative =
+                path_records_have_schedulable_alternative(&health.tcp, index, now);
+            if let Some(current) = health.tcp.get_mut(index) {
+                current.mark_failure(now, has_schedulable_alternative);
+            }
+        });
+    }
+
+    /// Applies one explicit management transaction under the same authority
+    /// ordering as authenticated TCP lifecycle changes.
+    pub(in crate::runtime) fn update_managed_path_records(
+        &self,
+        underlay: UnderlayProtocol,
+        indices: &[usize],
+        mut update: impl FnMut(&mut ClientPathHealthRecord),
+    ) -> bool {
+        if underlay == UnderlayProtocol::Tcp {
+            return self.mutate_request_tcp_service_authority(indices, |health, _registered| {
+                if indices.iter().any(|index| health.tcp.get(*index).is_none()) {
+                    return false;
+                }
+                for index in indices {
+                    update(
+                        health
+                            .tcp
+                            .get_mut(*index)
+                            .expect("validated TCP path runtime state"),
+                    );
+                }
+                true
+            });
+        }
+        let mut health = self.health.lock().expect("client path health lock");
+        if indices.iter().any(|index| health.udp.get(*index).is_none()) {
+            return false;
+        }
+        for index in indices {
+            update(
+                health
+                    .udp
+                    .get_mut(*index)
+                    .expect("validated UDP path runtime state"),
+            );
+        }
+        true
     }
 
     pub(in crate::runtime::path) fn request_tcp_capacity_probe_session(
@@ -408,16 +1253,62 @@ impl Drop for ClientTcpServiceWriterRegistration {
         let Some(state) = self.state.upgrade() else {
             return;
         };
-        let mut writers = state
-            .tcp_service_writers
+        let mut registry = state
+            .tcp_service_registry
             .lock()
             .expect("client TCP service writer registry lock");
-        if writers
+        if !registry
+            .writers
             .get(&self.stream_id)
             .is_some_and(|current| current.same_actor(&self.writer))
         {
-            writers.remove(&self.stream_id);
+            return;
         }
+        let active_stream = registry.active_request.as_ref().and_then(|active| {
+            active
+                .streams
+                .iter()
+                .position(|stream| {
+                    stream.stream.stream_id == self.stream_id
+                        && stream.writer.same_actor(&self.writer)
+                })
+                .map(|position| {
+                    (
+                        position,
+                        active.coordinator.clone(),
+                        active.withdrawal_reason,
+                    )
+                })
+        });
+        if let Some((position, coordinator, withdrawal_reason)) = active_stream {
+            let mut transaction = coordinator.lock();
+            let reason = if withdrawal_reason.is_some() {
+                None
+            } else if transaction.accepts_invalidation() {
+                Some(TcpServiceWithdrawalReason::FenceChanged)
+            } else {
+                transaction
+                    .failure()
+                    .map(request_tcp_service_withdrawal_reason)
+            };
+            if reason.is_some() {
+                transaction.fail(TcpServiceFlightSidecarError::ObserverStopped);
+            }
+            let active = registry
+                .active_request
+                .as_mut()
+                .expect("armed request lifecycle");
+            if let Some(reason) = reason {
+                active.withdrawal_reason.get_or_insert(reason);
+            }
+            let binding = active
+                .streams
+                .get_mut(position)
+                .expect("matched request stream position");
+            binding.observer_installed = false;
+            binding.cleanup_acknowledged = true;
+        }
+        registry.writers.remove(&self.stream_id);
     }
 }
 
@@ -622,6 +1513,120 @@ impl ClientPathContext {
         stream_id: StreamId,
     ) -> Option<RequestTcpServiceWriter> {
         self.state.tcp_service_writer(stream_id)
+    }
+
+    pub(in crate::runtime) fn arm_request_tcp_service_lifecycle(
+        &self,
+        frozen_streams: &[RequestTcpServiceFrozenStream],
+        coordinator: Arc<TcpServiceWriterCoordinator>,
+    ) -> Result<(), TcpServiceWithdrawalReason> {
+        if coordinator.lifecycle().session_id() != self.session_id {
+            return Err(TcpServiceWithdrawalReason::InvalidEvidence);
+        }
+        self.state
+            .arm_request_tcp_service_lifecycle(frozen_streams, coordinator)
+    }
+
+    pub(in crate::runtime) fn request_tcp_service_lifecycle_state(
+        &self,
+        lifecycle: TcpServiceWriterLifecycle,
+    ) -> Option<ClientRequestTcpServiceLifecycleState> {
+        if lifecycle.session_id() != self.session_id {
+            return None;
+        }
+        self.state.request_tcp_service_lifecycle_state(lifecycle)
+    }
+
+    pub(in crate::runtime) fn install_request_tcp_service_observer(
+        &self,
+        frozen: &RequestTcpServiceFrozenStream,
+        coordinator: &Arc<TcpServiceWriterCoordinator>,
+        install: impl FnOnce() -> Result<bool, TcpServiceFlightSidecarError>,
+    ) -> Result<RequestTcpServiceObserverInstallation, TcpServiceWithdrawalReason> {
+        self.state
+            .install_request_tcp_service_observer(frozen, coordinator, install)
+    }
+
+    pub(in crate::runtime) fn withdraw_request_tcp_service_stream(
+        &self,
+        stream: TcpServiceStreamFence,
+        lifecycle: TcpServiceWriterLifecycle,
+        reason: TcpServiceWithdrawalReason,
+    ) -> Option<TcpServiceWithdrawalReason> {
+        if lifecycle.session_id() != self.session_id {
+            return None;
+        }
+        self.state
+            .withdraw_request_tcp_service_stream(stream, lifecycle, reason)
+    }
+
+    pub(in crate::runtime) fn withdraw_request_tcp_service_installation(
+        &self,
+        frozen: &RequestTcpServiceFrozenStream,
+        coordinator: &Arc<TcpServiceWriterCoordinator>,
+        reason: TcpServiceWithdrawalReason,
+    ) -> Option<TcpServiceWithdrawalReason> {
+        if coordinator.lifecycle().session_id() != self.session_id {
+            return None;
+        }
+        self.state
+            .withdraw_request_tcp_service_installation(frozen, coordinator, reason)
+    }
+
+    pub(in crate::runtime) fn acknowledge_request_tcp_service_cleanup(
+        &self,
+        stream: TcpServiceStreamFence,
+        lifecycle: TcpServiceWriterLifecycle,
+    ) -> bool {
+        if lifecycle.session_id() != self.session_id {
+            return false;
+        }
+        self.state
+            .acknowledge_request_tcp_service_cleanup(stream, lifecycle)
+    }
+
+    pub(in crate::runtime) fn acknowledge_request_tcp_service_actor_cleanup(
+        &self,
+        stream_id: StreamId,
+        lifecycle: TcpServiceWriterLifecycle,
+    ) -> bool {
+        if lifecycle.session_id() != self.session_id {
+            return false;
+        }
+        self.state
+            .acknowledge_request_tcp_service_actor_cleanup(stream_id, lifecycle)
+    }
+
+    pub(in crate::runtime) fn begin_request_tcp_service_cleanup(
+        &self,
+        lifecycle: TcpServiceWriterLifecycle,
+        reason: Option<TcpServiceWithdrawalReason>,
+    ) -> Result<Vec<RequestTcpServiceWriter>, TcpServiceWithdrawalReason> {
+        if lifecycle.session_id() != self.session_id {
+            return Err(TcpServiceWithdrawalReason::InvalidEvidence);
+        }
+        self.state
+            .begin_request_tcp_service_cleanup(lifecycle, reason)
+    }
+
+    pub(in crate::runtime) fn disarm_request_tcp_service_lifecycle(
+        &self,
+        lifecycle: TcpServiceWriterLifecycle,
+    ) -> bool {
+        if lifecycle.session_id() != self.session_id {
+            return false;
+        }
+        self.state.disarm_request_tcp_service_lifecycle(lifecycle)
+    }
+
+    pub(in crate::runtime) fn update_managed_path_records(
+        &self,
+        underlay: UnderlayProtocol,
+        indices: &[usize],
+        update: impl FnMut(&mut ClientPathHealthRecord),
+    ) -> bool {
+        self.state
+            .update_managed_path_records(underlay, indices, update)
     }
 
     pub(in crate::runtime) fn current_request_tcp_service_carrier(
@@ -1065,13 +2070,7 @@ impl ClientPathContext {
     }
 
     pub(in crate::runtime) fn mark_tcp_path_failure(&self, index: usize) {
-        let now = Instant::now();
-        let mut health = self.state.health.lock().expect("client path health lock");
-        let has_schedulable_alternative =
-            path_records_have_schedulable_alternative(&health.tcp, index, now);
-        if let Some(current) = health.tcp.get_mut(index) {
-            current.mark_failure(now, has_schedulable_alternative);
-        }
+        self.state.mark_tcp_path_failure(index);
     }
 
     pub(in crate::runtime) fn mark_udp_path_open_success(&self, index: usize, elapsed: Duration) {

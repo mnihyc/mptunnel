@@ -263,6 +263,24 @@ impl TcpServiceWriterTransaction<'_> {
         self.coordinator.lifecycle()
     }
 
+    pub(in crate::runtime) fn installation_is_current(&self) -> bool {
+        self.state.phase == TcpServiceWriterCoordinatorPhase::Installing
+            && self.state.failure.is_none()
+    }
+
+    pub(in crate::runtime) fn accepts_invalidation(&self) -> bool {
+        self.state.phase != TcpServiceWriterCoordinatorPhase::Stopped
+            && self.state.failure.is_none()
+    }
+
+    pub(in crate::runtime) fn is_stopped(&self) -> bool {
+        self.state.phase == TcpServiceWriterCoordinatorPhase::Stopped
+    }
+
+    pub(in crate::runtime) fn failure(&self) -> Option<TcpServiceFlightSidecarError> {
+        self.state.failure
+    }
+
     pub(in crate::runtime) fn mark_commit(
         &mut self,
     ) -> Result<TcpServiceWriterPoint, TcpServiceFlightSidecarError> {

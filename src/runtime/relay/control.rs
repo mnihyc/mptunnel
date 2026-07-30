@@ -47,7 +47,9 @@ use crate::protocol::frame::reliable_path_frame_pacing_bytes;
 use crate::protocol::{Frame, OffsetRange, ResetReason, StreamId};
 use crate::runtime::error::{RuntimeError, reliable_path_error_is_migratable};
 use crate::runtime::path::commands::reliable_stream_frame_queue;
-use crate::runtime::path::{ClientPathContext, PathDeliveryStats};
+use crate::runtime::path::{
+    ClientPathContext, ClientRequestTcpServiceLifecycleState, PathDeliveryStats,
+};
 use crate::runtime::sender::{
     ClientQueuedDispatch, RelayRecvProgressSend, RelaySendCause, ReliableRelaySenderQueue,
     RequestSenderService, reliable_relay_can_read_product_source,
@@ -62,9 +64,8 @@ use crate::runtime::stream::{
     reliable_relay_recv_progress_resend_active, reliable_stream_recv_progress_interval,
 };
 use crate::runtime::tcp_service::{
-    RequestTcpServiceControl, RequestTcpServiceControlOutcome,
-    RequestTcpServiceObserverInstallation, RequestTcpServiceSnapshotRequest,
-    TcpServiceFlightSidecarError, TcpServiceObserverRemoval,
+    RequestTcpServiceControl, RequestTcpServiceControlOutcome, RequestTcpServiceObserverInstall,
+    RequestTcpServiceSnapshotRequest, TcpServiceObserverRemoval,
 };
 use crate::runtime::telemetry::ObservedProductIo;
 use crate::scheduler::{PathSnapshot, TrafficClass};
@@ -199,6 +200,38 @@ fn snapshot_request_tcp_service_stream(
     RequestTcpServiceControlOutcome::Complete(frozen)
 }
 
+fn withdraw_request_tcp_service_installation(
+    sender: &mut RequestSenderService,
+    context: &ClientPathContext,
+    frozen: &RequestTcpServiceFrozenStream,
+    coordinator: &std::sync::Arc<crate::runtime::tcp_service::TcpServiceWriterCoordinator>,
+    proposed: TcpServiceWithdrawalReason,
+) -> TcpServiceWithdrawalReason {
+    let lifecycle = coordinator.lifecycle();
+    let accepted = context.withdraw_request_tcp_service_installation(frozen, coordinator, proposed);
+    let state = context.request_tcp_service_lifecycle_state(lifecycle);
+    let terminal = matches!(
+        state,
+        Some(
+            ClientRequestTcpServiceLifecycleState::CleanupPending
+                | ClientRequestTcpServiceLifecycleState::Withdrawn(_)
+        )
+    );
+    if accepted.is_none() && !terminal {
+        return proposed;
+    }
+    let reason = accepted
+        .or_else(|| match state {
+            Some(ClientRequestTcpServiceLifecycleState::Withdrawn(reason)) => Some(reason),
+            _ => None,
+        })
+        .unwrap_or(proposed);
+    let _ = sender.remove_tcp_service_observer(lifecycle);
+    let _ =
+        context.acknowledge_request_tcp_service_actor_cleanup(frozen.stream().stream_id, lifecycle);
+    reason
+}
+
 fn apply_request_tcp_service_control(
     state: &ClientRelayState,
     sender: &mut RequestSenderService,
@@ -220,68 +253,76 @@ fn apply_request_tcp_service_control(
             let _ = receipt.send(result);
         }
         RequestTcpServiceControl::Install { install, receipt } => {
+            let RequestTcpServiceObserverInstall {
+                frozen,
+                coordinator,
+                max_flight_records,
+                max_ack_release_records,
+            } = install;
             let revalidated = snapshot_request_tcp_service_stream(
                 state,
                 sender,
                 sender_queue,
                 context,
                 remotes,
-                install.frozen.snapshot_request(),
+                frozen.snapshot_request(),
             );
-            let result = match revalidated {
-                RequestTcpServiceControlOutcome::Complete(current) if current == install.frozen => {
-                    let accepted = install
-                        .frozen
+            let installation = match revalidated {
+                RequestTcpServiceControlOutcome::Complete(current) if current == frozen => {
+                    let accepted = frozen
                         .accepted()
                         .iter()
                         .map(|binding| (binding.instance(), binding.carrier()))
                         .collect();
-                    match sender.install_tcp_service_observer(
-                        install.frozen.stream(),
-                        accepted,
-                        install.frozen.candidate(),
-                        install.coordinator,
-                        install.max_flight_records,
-                        install.max_ack_release_records,
-                    ) {
-                        Ok(true) => RequestTcpServiceControlOutcome::Complete(
-                            RequestTcpServiceObserverInstallation::Installed,
-                        ),
-                        Ok(false) => RequestTcpServiceControlOutcome::Complete(
-                            RequestTcpServiceObserverInstallation::AlreadyInstalled,
-                        ),
-                        Err(TcpServiceFlightSidecarError::ResourceLimit) => {
-                            RequestTcpServiceControlOutcome::Withdrawn(
-                                TcpServiceWithdrawalReason::ResourceLimit,
-                            )
-                        }
-                        Err(
-                            TcpServiceFlightSidecarError::InvalidRelease
-                            | TcpServiceFlightSidecarError::ObserverStopped,
-                        ) => RequestTcpServiceControlOutcome::Withdrawn(
-                            TcpServiceWithdrawalReason::FenceChanged,
-                        ),
-                    }
+                    context.install_request_tcp_service_observer(&frozen, &coordinator, || {
+                        sender.install_tcp_service_observer(
+                            frozen.stream(),
+                            accepted,
+                            frozen.candidate(),
+                            coordinator.clone(),
+                            max_flight_records,
+                            max_ack_release_records,
+                        )
+                    })
                 }
                 RequestTcpServiceControlOutcome::Complete(_) => {
-                    RequestTcpServiceControlOutcome::Withdrawn(
-                        TcpServiceWithdrawalReason::FenceChanged,
-                    )
+                    Err(TcpServiceWithdrawalReason::FenceChanged)
                 }
-                RequestTcpServiceControlOutcome::Withdrawn(reason) => {
-                    RequestTcpServiceControlOutcome::Withdrawn(reason)
-                }
+                RequestTcpServiceControlOutcome::Withdrawn(reason) => Err(reason),
+            };
+            let result = match installation {
+                Ok(installation) => RequestTcpServiceControlOutcome::Complete(installation),
+                Err(reason) => RequestTcpServiceControlOutcome::Withdrawn(
+                    withdraw_request_tcp_service_installation(
+                        sender,
+                        context,
+                        &frozen,
+                        &coordinator,
+                        reason,
+                    ),
+                ),
             };
             let _ = receipt.send(result);
         }
         RequestTcpServiceControl::Remove { lifecycle, receipt } => {
-            let result = match sender.remove_tcp_service_observer(lifecycle) {
-                TcpServiceObserverRemoval::DifferentLifecycle => {
-                    RequestTcpServiceControlOutcome::Withdrawn(
-                        TcpServiceWithdrawalReason::FenceChanged,
-                    )
+            let result = if context.request_tcp_service_lifecycle_state(lifecycle)
+                == Some(ClientRequestTcpServiceLifecycleState::Current)
+            {
+                RequestTcpServiceControlOutcome::Withdrawn(
+                    TcpServiceWithdrawalReason::InvalidEvidence,
+                )
+            } else {
+                let removal = sender.remove_tcp_service_observer(lifecycle);
+                context
+                    .acknowledge_request_tcp_service_actor_cleanup(remotes.stream_id(), lifecycle);
+                match removal {
+                    TcpServiceObserverRemoval::DifferentLifecycle => {
+                        RequestTcpServiceControlOutcome::Withdrawn(
+                            TcpServiceWithdrawalReason::FenceChanged,
+                        )
+                    }
+                    removal => RequestTcpServiceControlOutcome::Complete(removal),
                 }
-                removal => RequestTcpServiceControlOutcome::Complete(removal),
             };
             let _ = receipt.send(result);
         }
@@ -455,9 +496,12 @@ where
         adaptive_reliable_relay_chunk_bytes(None, TrafficClass::Latency, context.mux_limits);
     let mut buf = bytes::BytesMut::with_capacity(chunk_size);
     let mut state = ClientRelayState::new();
-    let mut sender = RequestSenderService::new_with_performance(stream_id, performance);
     let tcp_service_writer_registration =
         context.register_tcp_service_writer(stream_id, remotes.tcp_service_writer())?;
+    // Declaration order is cleanup authority: on cancellation or panic the
+    // local observer is destroyed before its actor registration acknowledges
+    // that no observer can remain.
+    let mut sender = RequestSenderService::new_with_performance(stream_id, performance);
     let mut flow_demand = ReliableRelayFlowDemandTracker::new();
     let mut request_flow_demand = ReliableRelayFlowDemandTracker::new();
     let mut sender_queue = ReliableRelaySenderQueue::default();
@@ -695,7 +739,7 @@ where
         let request_lane_changed =
             reliable_relay_lane_changed(request_demand_update.previous_lane, request_lane);
         if request_lane_changed {
-            sender.invalidate_tcp_service_observer();
+            sender.withdraw_tcp_service_observer(context, TcpServiceWithdrawalReason::DemandEnded);
             state.refresh_request_tcp_service_demand(request_lane);
         }
         let path_snapshot =
@@ -1698,7 +1742,10 @@ where
                 };
                 permit.retain(&mut send_buffer_reservation, read);
                 if read == 0 {
-                    sender.invalidate_tcp_service_observer();
+                    sender.withdraw_tcp_service_observer(
+                        context,
+                        TcpServiceWithdrawalReason::DemandEnded,
+                    );
                     state.record_local_eof();
                 } else {
                     state.record_local_payload(relay_lane);
@@ -1754,7 +1801,10 @@ where
                         let (read, payload) = read.map_err(RuntimeError::Io)?;
                         permit.retain(&mut send_buffer_reservation, read);
                         if read == 0 {
-                            sender.invalidate_tcp_service_observer();
+                            sender.withdraw_tcp_service_observer(
+                                context,
+                                TcpServiceWithdrawalReason::DemandEnded,
+                            );
                             state.record_local_eof();
                             break;
                         }
@@ -2253,7 +2303,7 @@ where
         }
     };
 
-    sender.invalidate_tcp_service_observer();
+    sender.withdraw_tcp_service_observer(context, TcpServiceWithdrawalReason::DemandEnded);
     drop(tcp_service_writer_registration);
     let _ = drain_completed_additional_path_opens(
         context,

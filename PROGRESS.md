@@ -2431,3 +2431,62 @@ entry is authoritative.
   - formatting and whitespace checks passed. This is a correctness boundary,
     not a new performance verdict; the historical-performance gate remains
     mandatory before any producer or candidate placement is connected.
+
+## 2026-07-30T17:07:17+08:00: Session-owned request lifecycle authority
+
+- Name: exact request service installation, withdrawal, cleanup, and disarm
+- Category: Core runtime and RFC alignment
+- State: request lifecycle registry and external invalidation complete; the
+  production session producer, response symmetry, and validation-only
+  candidate attachment remain disconnected
+- Content:
+  - established one session-owned active request lifecycle with exact
+    lifecycle, coordinator, bounded carrier group, accepted and validation
+    candidate path fences, and per-stream writer and observer state;
+  - required one session identity and one coherent frozen actor view across
+    every stream before publishing lifecycle authority, then revalidated
+    authenticated carrier and eligibility generations under the established
+    lock order;
+  - made actor installation acknowledge the exact writer fence before
+    returning its receipt, and made stale or mismatched installation controls
+    harmless to a different current observer;
+  - made actor-owned demand, EOF, attachment, path-failure, and exit
+    transitions record their precise shared withdrawal cause before removing
+    and acknowledging the local observer;
+  - routed authenticated TCP carrier replacement, retirement, ordered
+    `PATH_STATUS`, data-plane failure, generic TCP failure, and explicit
+    management failure through the same lifecycle boundary, while leaving UDP
+    path handling unchanged;
+  - made terminal cleanup replayable after cancellation: only installed,
+    unacknowledged observers are returned, exact actor acknowledgements settle
+    them, and disarm requires a stopped coordinator plus every stream clean;
+  - rejected cause-free cleanup of a live lifecycle while preserving normal
+    cause-free settlement after the coordinator has already stopped;
+  - made writer-registration loss fail-stop the exact current lifecycle and
+    ordered relay ownership so the actor observer is destroyed before its
+    registration guard acknowledges final cleanup; and
+  - extended the existing durable lifecycle and management regressions rather
+    than adding disposable one-condition test files.
+- Ordinary-path cost:
+  - no packet, acknowledgement, scheduler, congestion-control, timer,
+    carrier-count, admission, or transport parameter changed;
+  - the new registry lock is taken only for cold TCP authority transitions;
+    the inactive actor path remains a nullable observer branch; and
+  - no candidate placement or production service traffic is enabled by this
+    milestone.
+- Evidence:
+  - the durable lifecycle regression proves foreign-session rejection, exact
+    install, stale-control isolation, mandatory terminal cause, replay after
+    cancellation, acknowledgement-before-receipt, stopped-and-clean disarm,
+    unchanged-status preservation, candidate-fence withdrawal, accepted
+    carrier replacement withdrawal, and registration-drop cleanup;
+  - the durable management regression proves that an explicit authenticated
+    TCP failure withdraws the active lifecycle;
+  - three independent read-only reviews found the lock order and mutation
+    coverage sound and confirmed the stale-install cleanup blocker was closed;
+  - the complete root library suite passed: 1,420 tests;
+  - every Cargo target compiles under the locked dependency graph;
+  - formatting and whitespace checks passed; and
+  - no new timing, threshold, parameter, or performance claim is made.
+    Historical-performance restoration and the representative lab matrix
+    remain mandatory before candidate placement or release.

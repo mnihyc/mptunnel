@@ -13,6 +13,7 @@ use crate::model::capacity::{
     reliable_relay_buffer_len,
 };
 use crate::model::path::RelayPathKey;
+use crate::model::tcp_service::TcpServiceWithdrawalReason;
 use crate::mux::MuxLimits;
 use crate::mux::stream::ReliableSendStream;
 use crate::protocol::{Frame, UnderlayProtocol};
@@ -91,7 +92,10 @@ async fn attach_relay_path_candidates(
                 match attach_control_result {
                     Ok(()) => {
                         let attach_outcome = remotes.attach_candidate_before_commit(opened, |_| {
-                            sender.invalidate_tcp_service_observer();
+                            sender.withdraw_tcp_service_observer(
+                                context,
+                                TcpServiceWithdrawalReason::FenceChanged,
+                            );
                         });
                         match attach_outcome {
                             ReliableRelayAttachOutcome::Attached => {

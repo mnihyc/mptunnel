@@ -183,14 +183,14 @@ async fn response_actor_preserves_install_ack_boundaries_and_partial_provenance(
     let (install_receipt, installed) = oneshot::channel();
     events
         .try_send(ServerReliableStreamEvent::InstallTcpServiceObserver {
-            install: ResponseTcpServiceObserverInstall {
+            install: Box::new(ResponseTcpServiceObserverInstall {
                 stream: stream_fence,
                 accepted: vec![accepted],
                 candidate,
                 coordinator: coordinator.clone(),
                 max_flight_records: 8,
                 max_ack_release_records: 8,
-            },
+            }),
             receipt: install_receipt,
         })
         .expect("queue observer installation");

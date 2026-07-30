@@ -961,8 +961,13 @@ fn release_carrier_path_flight_ranges_impl<const OBSERVE: bool>(
             if bytes == 0 {
                 continue;
             }
-            let unambiguous =
-                !flight_intervals_overlap(&ambiguous_intervals, acked_start, acked_end);
+            let path_evidence_candidate =
+                flight.evidence_eligible && flight.kind.is_original_transmission();
+            let unambiguous = if OBSERVE || path_evidence_candidate {
+                !flight_intervals_overlap(&ambiguous_intervals, acked_start, acked_end)
+            } else {
+                false
+            };
             if OBSERVE {
                 observe(ResponseObservedPathRelease {
                     output: ResponseTcpServiceOutputIdentity {
@@ -985,9 +990,7 @@ fn release_carrier_path_flight_ranges_impl<const OBSERVE: bool>(
                         bytes,
                         ..flight
                     },
-                    path_proving: flight.evidence_eligible
-                        && flight.kind.is_original_transmission()
-                        && unambiguous,
+                    path_proving: path_evidence_candidate && unambiguous,
                 },
             ));
         }

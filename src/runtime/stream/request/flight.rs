@@ -121,8 +121,12 @@ impl RequestFlightLedger {
                 if bytes == 0 {
                     continue;
                 }
-                let unambiguous =
-                    !flight_intervals_overlap(&ambiguous_intervals, acked_start, acked_end);
+                let original = flight.kind.is_original_transmission();
+                let unambiguous = if OBSERVE || original {
+                    !flight_intervals_overlap(&ambiguous_intervals, acked_start, acked_end)
+                } else {
+                    false
+                };
                 if OBSERVE {
                     observe(RequestObservedPathRelease {
                         instance: flight.instance,
@@ -139,7 +143,7 @@ impl RequestFlightLedger {
                     bytes,
                     sent_at: flight.sent_at,
                     elapsed: now.saturating_duration_since(flight.sent_at),
-                    path_proving: flight.kind.is_original_transmission() && unambiguous,
+                    path_proving: original && unambiguous,
                 });
             }
             for (retained_start, retained_end) in split.retained {

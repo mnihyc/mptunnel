@@ -71,7 +71,7 @@ pub(in crate::runtime) enum ServerReliableStreamEvent {
         output_incarnation: u64,
     },
     InstallTcpServiceObserver {
-        install: ResponseTcpServiceObserverInstall,
+        install: Box<ResponseTcpServiceObserverInstall>,
         receipt: oneshot::Sender<Result<bool, TcpServiceFlightSidecarError>>,
     },
     RemoveTcpServiceObserver {
@@ -297,7 +297,7 @@ impl ReliablePathStream {
                             let coordinator = install.coordinator.clone();
                             let result = match &self.output {
                                 ReliablePathStreamOutput::Switchable(binding) => {
-                                    binding.install_tcp_service_observer(install)
+                                    binding.install_tcp_service_observer(*install)
                                 }
                                 ReliablePathStreamOutput::Fixed(_) => {
                                     Err(TcpServiceFlightSidecarError::InvalidRelease)

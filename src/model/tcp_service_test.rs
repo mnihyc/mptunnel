@@ -13,10 +13,6 @@ fn carrier(path_id: u16, nonce: u8, local_instance: u64) -> TcpServiceCarrierFen
     }
 }
 
-fn carrier_group(raw: u64) -> TcpServiceCarrierGroupId {
-    TcpServiceCarrierGroupId::from_raw(raw)
-}
-
 fn stream(stream_id: u64, horizon_bytes: u64) -> TcpServiceStreamFence {
     TcpServiceStreamFence {
         stream_id: StreamId(stream_id),
@@ -100,7 +96,6 @@ impl ValidationHarness {
                 session_id: SessionId(9),
                 trial_id: 3,
                 direction: PathMetricDirection::ClientToServer,
-                carrier_group_id: carrier_group(1),
                 fence: fence.clone(),
                 limits,
                 registered_at,
@@ -142,15 +137,6 @@ impl ValidationHarness {
     }
 
     fn restart_validation(&mut self, trial_id: u64, fence: TcpServiceValidationFence) {
-        self.restart_validation_for_group(trial_id, carrier_group(1), fence);
-    }
-
-    fn restart_validation_for_group(
-        &mut self,
-        trial_id: u64,
-        carrier_group_id: TcpServiceCarrierGroupId,
-        fence: TcpServiceValidationFence,
-    ) {
         if self.controller.has_active_validation() {
             self.controller
                 .finish(&mut self.validation, self.clock, &self.fence)
@@ -165,7 +151,6 @@ impl ValidationHarness {
                 session_id: SessionId(9),
                 trial_id,
                 direction: PathMetricDirection::ClientToServer,
-                carrier_group_id,
                 fence: fence.clone(),
                 limits: limits(),
                 registered_at,
@@ -442,7 +427,6 @@ fn no_gain_records_exact_reference_suppression_without_a_percentage_margin() {
                 session_id: SessionId(9),
                 trial_id: 0,
                 direction: PathMetricDirection::ClientToServer,
-                carrier_group_id: carrier_group(1),
                 fence: unchanged_fence.clone(),
                 limits: limits(),
                 registered_at: invalid_registered_at,
@@ -453,31 +437,7 @@ fn no_gain_records_exact_reference_suppression_without_a_percentage_margin() {
     );
 
     let same_fence = harness.fence.clone();
-    let mut other_group_fence = same_fence.clone();
-    other_group_fence.accepted = vec![carrier(3, 33, 303)];
-    other_group_fence.candidate = carrier(4, 44, 404);
-    assert_ne!(
-        other_group_fence.suppression_identity(),
-        same_fence.suppression_identity(),
-        "the unrelated carrier group must exercise a distinct suppression slot"
-    );
-    harness.restart_validation_for_group(4, carrier_group(2), other_group_fence);
-    assert_eq!(
-        harness
-            .validation
-            .withdraw(TcpServiceWithdrawalReason::DemandEnded),
-        TcpServiceValidationUpdate::Settled
-    );
-    let other_group_outcome = harness
-        .controller
-        .finish(&mut harness.validation, harness.clock, &harness.fence)
-        .expect("unrelated carrier-group withdrawal finishes");
-    assert_eq!(
-        other_group_outcome.withdrawal_reason,
-        Some(TcpServiceWithdrawalReason::DemandEnded)
-    );
-
-    harness.restart_validation_for_group(5, carrier_group(1), same_fence);
+    harness.restart_validation(4, same_fence);
     harness.accepted_window(Duration::from_millis(20));
     harness.accepted_window(Duration::from_millis(20));
     assert_eq!(
@@ -488,15 +448,10 @@ fn no_gain_records_exact_reference_suppression_without_a_percentage_margin() {
             .withdrawal_reason,
         Some(TcpServiceWithdrawalReason::NoGainSuppressed)
     );
-    assert_eq!(
-        harness.validation.candidate_placement_credit_bytes(),
-        0,
-        "suppressed validation grants no candidate Product placement"
-    );
 
     let mut changed_cohort_fence = harness.fence.clone();
     changed_cohort_fence.streams[0].demand_generation += 1;
-    harness.restart_validation(6, changed_cohort_fence);
+    harness.restart_validation(5, changed_cohort_fence);
     harness.accepted_window(Duration::from_millis(20));
     harness.accepted_window(Duration::from_millis(20));
     assert_eq!(
@@ -859,7 +814,6 @@ fn absolute_deadline_recovers_cancelled_installing_and_running_lifecycles() {
         session_id: SessionId(31),
         trial_id,
         direction: PathMetricDirection::ClientToServer,
-        carrier_group_id: carrier_group(1),
         fence: template.fence.clone(),
         limits: limits(),
         registered_at,
@@ -1009,7 +963,6 @@ fn constructors_and_session_serialization_enforce_bounded_authority() {
             session_id: SessionId(1),
             trial_id: 1,
             direction: PathMetricDirection::ServerToClient,
-            carrier_group_id: carrier_group(1),
             fence: invalid_fence,
             limits: limits(),
             registered_at,
@@ -1032,7 +985,6 @@ fn constructors_and_session_serialization_enforce_bounded_authority() {
             session_id: SessionId(9),
             trial_id: 2,
             direction: PathMetricDirection::ClientToServer,
-            carrier_group_id: carrier_group(1),
             fence: duplicate_path_fence,
             limits: limits(),
             registered_at,
@@ -1054,7 +1006,6 @@ fn constructors_and_session_serialization_enforce_bounded_authority() {
         session_id: SessionId(5),
         trial_id,
         direction,
-        carrier_group_id: carrier_group(1),
         fence,
         limits: limits(),
         registered_at,
@@ -1188,7 +1139,6 @@ fn windows_require_every_frozen_stream_and_keep_ack_events_indivisible() {
             session_id: SessionId(9),
             trial_id: 3,
             direction: PathMetricDirection::ClientToServer,
-            carrier_group_id: carrier_group(1),
             fence: fence.clone(),
             limits: limits(),
             registered_at,

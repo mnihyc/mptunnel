@@ -11,6 +11,47 @@ Historical entries below are retained as evidence of the decisions made at
 their recorded time. When a later entry changes an earlier decision, the later
 entry is authoritative.
 
+## 2026-07-30T10:45:01+08:00: TCP carrier QoS evidence fixture
+
+- Name: make beneficial and non-beneficial TCP carrier expansion measurable
+  without changing Core behavior
+- Category: performance methodology, reproducibility, and lab accounting
+- State: committed and locally verified; no performance result or runtime
+  acceptance is claimed
+- Source: commit `bb8ebdfaa9d0ec46b3cc4bcb3ee4a1d26162771a`
+- Content:
+  - added an opt-in fixed cohort with adjacent `tcp-carriers=1-1` and `1-3`
+    download/upload rows for both per-flow QoS and one shared bottleneck;
+  - uses three persistent application flows, a post-connect synchronized
+    measurement anchor, a 30-second load window, and client-only carrier-range
+    policy;
+  - established deterministic zero-configured-loss qdiscs: a 500 Mbps
+    per-native-flow `fq maxrate` profile and a 200 Mbps aggregate profile, both
+    with the existing fat-path propagation delay and derived queue capacity;
+  - made special qdisc profiles recreate their hierarchy so per-flow state
+    cannot leak into a later shared-bottleneck row;
+  - records detailed qdisc counters and all new environment inputs in the
+    immutable run manifest; and
+  - advanced new lab-result identity to MPP v5 while retaining all recorded v4
+    rows as historical evidence.
+- Evidence:
+  - all 198 lab unit tests passed;
+  - shell syntax, ShellCheck, and whitespace validation passed;
+  - both qdisc hierarchies were created in a disposable Linux container with
+    `NET_ADMIN`; inspection proved the per-flow child exists only in the
+    per-flow profile and is absent from the aggregate profile; and
+  - no Docker performance row was run because the adaptive controller does not
+    yet exist and a `1-3` maximum alone grants no extra carrier.
+- Acceptance boundary:
+  - repeated adjacent per-flow pairs must prove useful added service;
+  - shared-bottleneck pairs must preserve ordinary service and drain an
+    unhelpful candidate without churn;
+  - no single row, nominal rate sum, or universal percentage margin can retain
+    a carrier or establish competitiveness.
+- Next: implement and causally test the pure endpoint/session/direction
+  controller before connecting it to runtime carrier establishment or running
+  this cohort.
+
 ## 2026-07-30T10:37:10+08:00: bounded MPP v5 control contract
 
 - Name: implement the wire and authentication prerequisite without enabling

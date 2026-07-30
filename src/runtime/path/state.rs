@@ -531,8 +531,7 @@ impl ClientPathContext {
             .get_mut(index)
             .is_some_and(|record| {
                 record.maintain(now);
-                record.is_locally_eligible()
-                    && path_observation_is_idle_for_probe(record.observation_at(now))
+                path_observation_is_idle_for_probe(record.observation_at(now))
             })
     }
 

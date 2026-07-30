@@ -427,10 +427,6 @@ impl ClientTcpDatagramState {
             }
         }
     }
-
-    pub(super) fn is_empty(&self) -> bool {
-        self.flows.is_empty()
-    }
 }
 
 #[cfg(test)]

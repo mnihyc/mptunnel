@@ -444,9 +444,14 @@ fn tcp_carrier_coordination_frames_use_v5_kinds_and_round_trip() {
             direction: PathMetricDirection::ClientToServer,
             result: TcpCarrierValidationResult::Withdrawn,
         },
+        Frame::TcpCarrierResultAck {
+            validation_id: 51,
+            direction: PathMetricDirection::ServerToClient,
+            result: TcpCarrierValidationResult::Retain,
+        },
     ];
 
-    for (frame, kind) in frames.into_iter().zip([38, 38, 39, 39, 40, 40, 40]) {
+    for (frame, kind) in frames.into_iter().zip([38, 38, 39, 39, 40, 40, 40, 41]) {
         let encoded = encode_frame(&frame, CodecLimits::default()).expect("encode");
         assert_eq!(encoded[4], 5);
         assert_eq!(encoded[5], kind);
@@ -478,7 +483,7 @@ fn tcp_carrier_demand_has_stable_v5_wire_layout() {
 }
 
 #[test]
-fn tcp_carrier_validation_and_result_have_stable_v5_wire_layouts() {
+fn tcp_carrier_validation_result_and_ack_have_stable_v5_wire_layouts() {
     let validation = encode_frame(
         &Frame::TcpCarrierValidate {
             validation_id: 0x0102_0304_0506_0708,
@@ -510,6 +515,22 @@ fn tcp_carrier_validation_and_result_have_stable_v5_wire_layouts() {
         result,
         vec![
             b'M', b'P', b'T', b'F', 5, 40, 0, 0, 0, 10, 1, 2, 3, 4, 5, 6, 7, 8, 1, 3,
+        ]
+    );
+
+    let result_ack = encode_frame(
+        &Frame::TcpCarrierResultAck {
+            validation_id: 0x0102_0304_0506_0708,
+            direction: PathMetricDirection::ClientToServer,
+            result: TcpCarrierValidationResult::Withdrawn,
+        },
+        CodecLimits::default(),
+    )
+    .expect("encode result acknowledgment");
+    assert_eq!(
+        result_ack,
+        vec![
+            b'M', b'P', b'T', b'F', 5, 41, 0, 0, 0, 10, 1, 2, 3, 4, 5, 6, 7, 8, 1, 3,
         ]
     );
 }
@@ -545,6 +566,11 @@ fn tcp_carrier_codec_rejects_zero_ids_and_empty_validation_stream_list() {
             stream_ids: vec![StreamId(1)],
         },
         Frame::TcpCarrierResult {
+            validation_id: 0,
+            direction: PathMetricDirection::ClientToServer,
+            result: TcpCarrierValidationResult::Withdrawn,
+        },
+        Frame::TcpCarrierResultAck {
             validation_id: 0,
             direction: PathMetricDirection::ClientToServer,
             result: TcpCarrierValidationResult::Withdrawn,

@@ -519,6 +519,17 @@ fn encode_payload(
             put_u8(out, tcp_carrier_result_to_u8(*result));
             Ok(FrameKind::TcpCarrierResult)
         }
+        Frame::TcpCarrierResultAck {
+            validation_id,
+            direction,
+            result,
+        } => {
+            validate_nonzero_id(*validation_id)?;
+            put_u64(out, *validation_id);
+            put_u8(out, path_metric_direction_to_u8(*direction));
+            put_u8(out, tcp_carrier_result_to_u8(*result));
+            Ok(FrameKind::TcpCarrierResultAck)
+        }
         Frame::Ping { nonce } => {
             put_u64(out, *nonce);
             Ok(FrameKind::Ping)
@@ -748,6 +759,15 @@ fn decode_payload(
             let validation_id = reader.get_u64()?;
             validate_nonzero_id(validation_id)?;
             Ok(Frame::TcpCarrierResult {
+                validation_id,
+                direction: path_metric_direction_from_u8(reader.get_u8()?)?,
+                result: tcp_carrier_result_from_u8(reader.get_u8()?)?,
+            })
+        }
+        FrameKind::TcpCarrierResultAck => {
+            let validation_id = reader.get_u64()?;
+            validate_nonzero_id(validation_id)?;
+            Ok(Frame::TcpCarrierResultAck {
                 validation_id,
                 direction: path_metric_direction_from_u8(reader.get_u8()?)?,
                 result: tcp_carrier_result_from_u8(reader.get_u8()?)?,
@@ -1300,7 +1320,7 @@ enum FrameKind {
     PathMetrics = 24,
     // 25 is reserved for a removed hint; 26 has never been allocated.
     StreamFin = 27,
-    // 28 and 29 are reserved for a removed product-PMTU experiment.
+    // 28 and 29 are reserved for a removed product-PMTU draft.
     StreamDetach = 30,
     PathProofData = 31,
     PathProofAck = 32,
@@ -1312,6 +1332,7 @@ enum FrameKind {
     TcpCarrierDemand = 38,
     TcpCarrierValidate = 39,
     TcpCarrierResult = 40,
+    TcpCarrierResultAck = 41,
 }
 
 impl FrameKind {
@@ -1349,6 +1370,7 @@ impl FrameKind {
             38 => Ok(Self::TcpCarrierDemand),
             39 => Ok(Self::TcpCarrierValidate),
             40 => Ok(Self::TcpCarrierResult),
+            41 => Ok(Self::TcpCarrierResultAck),
             _ => Err(CodecError::UnknownKind(value)),
         }
     }

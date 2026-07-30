@@ -309,6 +309,11 @@ pub enum Frame {
         direction: PathMetricDirection,
         result: TcpCarrierValidationResult,
     },
+    TcpCarrierResultAck {
+        validation_id: u64,
+        direction: PathMetricDirection,
+        result: TcpCarrierValidationResult,
+    },
     Ping {
         nonce: u64,
     },
@@ -368,6 +373,7 @@ impl Frame {
             Self::TcpCarrierDemand { .. } => "TCP_CARRIER_DEMAND",
             Self::TcpCarrierValidate { .. } => "TCP_CARRIER_VALIDATE",
             Self::TcpCarrierResult { .. } => "TCP_CARRIER_RESULT",
+            Self::TcpCarrierResultAck { .. } => "TCP_CARRIER_RESULT_ACK",
             Self::Ping { .. } => "PING",
             Self::Pong { .. } => "PONG",
         }

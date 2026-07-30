@@ -60,7 +60,8 @@ pub struct ClientPathContext {
     pub(in crate::runtime) outbound: Option<OutboundId>,
     // Carrier ownership: path specs, per-path security, and live sessions belong
     // to the MPP session's carrier path registry, not to individual streams.
-    /// Expanded TCP carrier slots used by Core scheduling.
+    /// Configured-minimum TCP carriers visible to ordinary Core scheduling.
+    /// Elastic candidates stay outside this inventory until validation commits.
     pub(in crate::runtime) tcp_paths: Arc<Vec<PathSpec>>,
     pub(in crate::runtime) udp_paths: Arc<Vec<PathSpec>>,
     /// Stable Product names aligned with each underlay-local path vector.
@@ -247,8 +248,8 @@ impl ClientPathContext {
         }
 
         // Preserve every configured endpoint's historical primary index, then
-        // append its sibling slots. A second configured endpoint must never be
-        // reinterpreted as the first endpoint's second carrier.
+        // append only its configured-minimum siblings. Unopened elastic
+        // capacity is not an ordinary path, health record, or session actor.
         let configured_tcp_path_names = tcp_path_names.clone();
         let configured_tcp_path_ordinals = tcp_path_ordinals.clone();
         let mut tcp_paths = tcp_config_paths.clone();
@@ -266,7 +267,7 @@ impl ClientPathContext {
             })
             .collect::<Vec<_>>();
         for endpoint in &mut tcp_endpoint_topology {
-            for member_ordinal in 1..endpoint.range.max() {
+            for member_ordinal in 1..endpoint.range.min() {
                 let path_index = tcp_paths.len();
                 tcp_paths.push(tcp_config_paths[endpoint.config_index].clone());
                 tcp_path_names.push(configured_tcp_path_names[endpoint.config_index].clone());
@@ -294,25 +295,11 @@ impl ClientPathContext {
         let udp_security = Arc::new(udp_security);
         let udp_tls = Arc::new(udp_tls);
         let path_proof_limit = resources.max_streams.saturating_mul(2).max(1);
-        let mut tcp_health = vec![
-            ClientPathHealthRecord::with_path_proof_limit_and_eligibility(
-                path_proof_limit,
-                false,
-            );
-            tcp_paths.len()
-        ];
-        for endpoint in tcp_endpoint_topology.iter() {
-            for path_index in endpoint
-                .members
-                .iter()
-                .take(usize::from(endpoint.range.min()))
-            {
-                tcp_health[*path_index] =
-                    ClientPathHealthRecord::with_path_proof_limit(path_proof_limit);
-            }
-        }
         let state = ClientPathState::new(ClientPathHealth {
-            tcp: tcp_health,
+            tcp: vec![
+                ClientPathHealthRecord::with_path_proof_limit(path_proof_limit);
+                tcp_paths.len()
+            ],
             udp: vec![
                 ClientPathHealthRecord::with_path_proof_limit(path_proof_limit);
                 udp_paths.len()
@@ -527,7 +514,6 @@ fn client_peer_status_snapshot(
             .iter()
             .zip(&health.tcp)
             .enumerate()
-            .filter(|(_, (_, record))| record.is_locally_eligible())
             .map(|(index, (path, record))| {
                 peer_path_status(path, index, record.observation_at(now))
             }),

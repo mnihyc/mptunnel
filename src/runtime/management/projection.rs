@@ -537,14 +537,7 @@ fn client_path_set(
     specs
         .iter()
         .enumerate()
-        .filter_map(|(index, spec)| {
-            if underlay == UnderlayProtocol::Tcp
-                && records
-                    .get(index)
-                    .is_some_and(|record| !record.is_locally_eligible())
-            {
-                return None;
-            }
+        .map(|(index, spec)| {
             let path = names
                 .get(index)
                 .expect("client path names align with underlay-local path inventory")
@@ -556,7 +549,7 @@ fn client_path_set(
             let snapshot = path_snapshot(spec, index, observation);
             let tcp_endpoint = tcp_context.and_then(|context| context.tcp_endpoint_for_path(index));
             summary.add_path(snapshot, observation.manual_disabled);
-            Some(ManagementPathStatus {
+            ManagementPathStatus {
                 service: "mpp_outbound",
                 service_index,
                 service_name: service_name.clone(),
@@ -608,7 +601,7 @@ fn client_path_set(
                         .last_delivery_at
                         .max(observation.carrier_last_delivery_at),
                 ),
-            })
+            }
         })
         .collect()
 }

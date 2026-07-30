@@ -201,16 +201,6 @@ fn set_client_path_state(
             .get_mut(*index)
             .expect("validated path runtime state");
         record.invalidate_path_proofs();
-        if !record.is_locally_eligible() {
-            record.manual_disabled = state == PathControlState::Disabled;
-            record.state = SchedulerPathState::Draining;
-            record.failed_until = None;
-            if state == PathControlState::Disabled {
-                record.relay_bytes_in_flight = 0;
-                record.relay_queue_bytes = 0;
-            }
-            continue;
-        }
         match state {
             PathControlState::Enabled | PathControlState::Suspect => {
                 record.manual_disabled = false;

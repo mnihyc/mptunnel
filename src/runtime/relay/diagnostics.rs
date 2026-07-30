@@ -134,6 +134,11 @@ fn frame_subject(frame: &Frame) -> String {
             validation_id,
             direction,
             result,
+        }
+        | Frame::TcpCarrierResultAck {
+            validation_id,
+            direction,
+            result,
         } => format!("validation_id={validation_id} direction={direction:?} result={result:?}"),
     }
 }

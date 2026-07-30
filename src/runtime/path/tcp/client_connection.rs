@@ -9,7 +9,7 @@ use super::metrics::TcpMetricPublisher;
 use crate::config::ClientSecurityConfig;
 use crate::mux::MuxLimits;
 use crate::protocol::codec::CodecLimits;
-use crate::protocol::{CloseReason, Frame, PathId, PathUsage, SessionId};
+use crate::protocol::{Frame, PathId, PathUsage, SessionId};
 use crate::runtime::error::RuntimeError;
 use crate::runtime::identity::random_u64;
 use crate::runtime::path::commands::reliable_path_writer_frame_queue;
@@ -104,23 +104,6 @@ impl ClientTcpCarrierConnection {
             self.writer.flush().await?;
             self.pending_heartbeat = Some((nonce, now + self.heartbeat_timeout));
         }
-        Ok(())
-    }
-
-    /// Retires only this physical TCP carrier. Complete MPP session
-    /// termination belongs to the session owner and is never inferred from one
-    /// actor ending.
-    pub(in crate::runtime) async fn close_path(
-        &mut self,
-        path_id: PathId,
-    ) -> Result<(), RuntimeError> {
-        self.writer
-            .write_frame(&Frame::PathClose {
-                path_id,
-                reason: CloseReason::Normal,
-            })
-            .await?;
-        self.writer.flush().await?;
         Ok(())
     }
 }

@@ -257,11 +257,10 @@ fn enabling_a_path_requires_fresh_liveness_evidence() {
     assert_eq!(disabled["path"], "primary");
     {
         let health = context.health().lock().expect("disabled health");
-        assert_eq!(health.tcp.len(), 3);
+        assert_eq!(health.tcp.len(), 2);
         assert!(health.tcp.iter().all(|record| record.manual_disabled));
         assert_eq!(health.tcp[0].state, SchedulerPathState::Failed);
         assert_eq!(health.tcp[1].state, SchedulerPathState::Failed);
-        assert_eq!(health.tcp[2].state, SchedulerPathState::Draining);
     }
     target
         .control_path_json(br#"{"outbound":"edge-mpp","path":"primary","state":"enabled"}"#)
@@ -271,7 +270,6 @@ fn enabling_a_path_requires_fresh_liveness_evidence() {
     assert!(health.tcp.iter().all(|record| !record.manual_disabled));
     assert_eq!(health.tcp[0].state, SchedulerPathState::Suspect);
     assert_eq!(health.tcp[1].state, SchedulerPathState::Suspect);
-    assert_eq!(health.tcp[2].state, SchedulerPathState::Draining);
 }
 
 #[test]

@@ -27,9 +27,6 @@ pub(in crate::runtime) struct ClientPathHealth {
 pub(in crate::runtime) struct ClientPathHealthRecord {
     pub(in crate::runtime) state: SchedulerPathState,
     pub(in crate::runtime) manual_disabled: bool,
-    /// Local carrier-lifecycle admission. Dormant TCP members are not failed
-    /// paths and cannot be selected, probed, or published until admitted.
-    locally_eligible: bool,
     data_plane_failure_instance_id: Option<CarrierPathInstanceId>,
     pub(in crate::runtime) peer_usage: Option<PathUsage>,
     path_instance_id: Option<CarrierPathInstanceId>,
@@ -106,7 +103,6 @@ impl Default for ClientPathHealthRecord {
         Self {
             state: SchedulerPathState::Active,
             manual_disabled: false,
-            locally_eligible: true,
             data_plane_failure_instance_id: None,
             peer_usage: None,
             path_instance_id: None,
@@ -159,9 +155,6 @@ impl ClientPathHealthRecord {
         sequence: u64,
         usage: PathUsage,
     ) {
-        if !self.locally_eligible {
-            return;
-        }
         if self.path_instance_id != Some(path_instance_id) {
             self.data_plane_failure_instance_id = None;
             if self.path_instance_id.is_some() {
@@ -182,7 +175,7 @@ impl ClientPathHealthRecord {
         sequence: u64,
         usage: PathUsage,
     ) -> bool {
-        if !self.locally_eligible || self.path_instance_id != Some(path_instance_id) {
+        if self.path_instance_id != Some(path_instance_id) {
             return false;
         }
         if self
@@ -201,26 +194,6 @@ impl ClientPathHealthRecord {
             successful_path_proof_limit: limit.max(1),
             ..Self::default()
         }
-    }
-
-    pub(super) fn with_path_proof_limit_and_eligibility(
-        limit: usize,
-        locally_eligible: bool,
-    ) -> Self {
-        Self {
-            state: if locally_eligible {
-                SchedulerPathState::Active
-            } else {
-                SchedulerPathState::Draining
-            },
-            locally_eligible,
-            successful_path_proof_limit: limit.max(1),
-            ..Self::default()
-        }
-    }
-
-    pub(in crate::runtime) fn is_locally_eligible(&self) -> bool {
-        self.locally_eligible
     }
 
     pub(super) fn path_proof_generation(&self) -> u64 {
@@ -341,9 +314,7 @@ impl ClientPathHealthRecord {
                 path_proof_success: self.path_proof_success,
             };
         }
-        let state = if !self.locally_eligible {
-            SchedulerPathState::Draining
-        } else if self.state == SchedulerPathState::Failed
+        let state = if self.state == SchedulerPathState::Failed
             && self.failed_until.is_some_and(|deadline| now >= deadline)
         {
             SchedulerPathState::Suspect
@@ -402,7 +373,7 @@ impl ClientPathHealthRecord {
     }
 
     pub(in crate::runtime) fn mark_success(&mut self, elapsed: Duration) {
-        if self.manual_disabled || !self.locally_eligible {
+        if self.manual_disabled {
             return;
         }
         self.mark_liveness_success();
@@ -417,10 +388,7 @@ impl ClientPathHealthRecord {
         &mut self,
         observation: PathProofObservation,
     ) {
-        if self.manual_disabled
-            || !self.locally_eligible
-            || observation.sent_at < self.path_proof_valid_after
-        {
+        if self.manual_disabled || observation.sent_at < self.path_proof_valid_after {
             return;
         }
         self.mark_success(observation.elapsed);
@@ -454,7 +422,7 @@ impl ClientPathHealthRecord {
     }
 
     pub(in crate::runtime) fn mark_liveness_success(&mut self) {
-        if self.manual_disabled || !self.locally_eligible {
+        if self.manual_disabled {
             return;
         }
         self.state = SchedulerPathState::Active;
@@ -463,7 +431,7 @@ impl ClientPathHealthRecord {
     }
 
     pub(in crate::runtime) fn mark_open_success(&mut self, _elapsed: Duration, lane: TrafficClass) {
-        if self.manual_disabled || !self.locally_eligible {
+        if self.manual_disabled {
             return;
         }
         self.mark_liveness_success();
@@ -477,7 +445,6 @@ impl ClientPathHealthRecord {
     pub(in crate::runtime) fn reserve_load(&mut self, lane: TrafficClass, now: Instant) -> bool {
         self.maintain(now);
         if self.manual_disabled
-            || !self.locally_eligible
             || !matches!(
                 self.state,
                 SchedulerPathState::Active | SchedulerPathState::Suspect
@@ -516,7 +483,7 @@ impl ClientPathHealthRecord {
     }
 
     pub(in crate::runtime) fn mark_delivery(&mut self, sample: PathRateSample) {
-        if self.manual_disabled || !self.locally_eligible {
+        if self.manual_disabled {
             return;
         }
         self.mark_liveness_success();
@@ -530,7 +497,7 @@ impl ClientPathHealthRecord {
     }
 
     pub(in crate::runtime) fn mark_product_delivery(&mut self, sample: PathRateSample) {
-        if self.manual_disabled || !self.locally_eligible {
+        if self.manual_disabled {
             return;
         }
         let sample_bps = sample.rate_bps();
@@ -558,7 +525,7 @@ impl ClientPathHealthRecord {
         &mut self,
         sample: PathRateSample,
     ) {
-        if self.manual_disabled || !self.locally_eligible {
+        if self.manual_disabled {
             return;
         }
         self.product_delivery_sample_bytes = self
@@ -625,8 +592,7 @@ impl ClientPathHealthRecord {
     }
 
     fn accepts_native_carrier_observation(&self, path_instance_id: CarrierPathInstanceId) -> bool {
-        self.locally_eligible
-            && !self.manual_disabled
+        !self.manual_disabled
             && self.path_instance_id == Some(path_instance_id)
             && self.data_plane_failure_instance_id != Some(path_instance_id)
     }
@@ -636,9 +602,6 @@ impl ClientPathHealthRecord {
         now: Instant,
         has_schedulable_alternative: bool,
     ) {
-        if !self.locally_eligible {
-            return;
-        }
         self.consecutive_failures = self.consecutive_failures.saturating_add(1);
         self.relay_bytes_in_flight = 0;
         self.relay_queue_bytes = 0;

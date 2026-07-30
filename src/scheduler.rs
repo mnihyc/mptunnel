@@ -1,7 +1,7 @@
 //! Carrier-neutral path scoring over immutable snapshots.
 //!
 //! Deployed queue ownership stays in runtime senders. Deterministic virtual
-//! queues and experimental policies stay in `simulator`.
+//! queues and simulation-only policies stay in `simulator`.
 
 mod policy;
 mod traffic;

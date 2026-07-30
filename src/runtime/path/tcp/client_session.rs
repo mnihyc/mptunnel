@@ -139,14 +139,9 @@ pub(super) async fn run_client_tcp_path_session(
 
         let receivers_open = !reliable_path_receivers_closed(&commands);
         if !receivers_open {
-            if let Some(connection_ref) = state.connection.as_mut() {
-                let _ = close_client_tcp_path(
-                    connection_ref,
-                    PathId(runtime.path_index as u16),
-                    !state.streams.is_empty() || !state.datagrams.is_empty(),
-                )
-                .await;
-            }
+            // No lifecycle owner remains. Native carrier termination is valid;
+            // graceful retirement requires an actor-owned PATH_DRAIN followed
+            // by the peer's PATH_CLOSE receipt.
             return;
         }
         let request_probe_deadline = state
@@ -339,12 +334,8 @@ pub(super) async fn run_client_tcp_path_session(
                     }
                     None => {
                         if reliable_path_receivers_closed(&commands) {
-                            let _ = close_client_tcp_path(
-                                connection,
-                                PathId(runtime.path_index as u16),
-                                !state.streams.is_empty() || !state.datagrams.is_empty(),
-                            )
-                            .await;
+                            // See the receiver-closed boundary above. Do not
+                            // manufacture the peer's PATH_CLOSE receipt.
                             return;
                         }
                     }
@@ -602,19 +593,4 @@ async fn connect_client_tcp_path(
         peer_status,
         runtime.mux_limits,
     ))
-}
-
-async fn close_client_tcp_path(
-    connection: &mut ClientTcpPathConnection,
-    path_id: PathId,
-    drain: bool,
-) -> Result<(), RuntimeError> {
-    if drain {
-        connection
-            .carrier
-            .writer
-            .write_frame(&Frame::PathDrain { path_id })
-            .await?;
-    }
-    connection.carrier.close_path(path_id).await
 }

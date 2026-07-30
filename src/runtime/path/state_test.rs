@@ -31,7 +31,7 @@ fn tcp_path_test_context(path_count: usize) -> ClientPathContext {
 }
 
 #[test]
-fn tcp_endpoint_topology_preserves_configured_primaries_and_dormant_capacity() {
+fn tcp_endpoint_topology_publishes_only_configured_minimum_carriers() {
     let primary_security = ClientSecurityConfig::for_test(
         SharedSecret::new(b"0123456789abcdef0123456789abcdef".to_vec()).expect("primary security"),
     );
@@ -65,13 +65,13 @@ fn tcp_endpoint_topology_preserves_configured_primaries_and_dormant_capacity() {
     )
     .expect("TCP endpoint topology");
 
-    assert_eq!(context.tcp_config_indices.as_slice(), [0, 1, 0, 0, 1]);
-    assert_eq!(context.tcp_member_ordinals.as_slice(), [0, 0, 1, 2, 1]);
-    assert_eq!(context.tcp_endpoint(0).expect("primary").members, [0, 2, 3]);
-    assert_eq!(context.tcp_endpoint(1).expect("secondary").members, [1, 4]);
+    assert_eq!(context.tcp_config_indices.as_slice(), [0, 1, 1]);
+    assert_eq!(context.tcp_member_ordinals.as_slice(), [0, 0, 1]);
+    assert_eq!(context.tcp_endpoint(0).expect("primary").members, [0]);
+    assert_eq!(context.tcp_endpoint(1).expect("secondary").members, [1, 2]);
     assert_eq!(
         context.tcp_path_names.as_slice(),
-        ["primary", "secondary", "primary", "primary", "secondary"]
+        ["primary", "secondary", "secondary"]
     );
     assert_eq!(
         context.tcp_path_security(0).expect("primary security"),
@@ -79,42 +79,29 @@ fn tcp_endpoint_topology_preserves_configured_primaries_and_dormant_capacity() {
     );
     assert_eq!(
         context
-            .tcp_path_security(3)
-            .expect("primary sibling security"),
-        &primary_security
-    );
-    assert_eq!(
-        context
-            .tcp_path_security(4)
+            .tcp_path_security(2)
             .expect("secondary sibling security"),
         &secondary_security
     );
     assert!(std::ptr::eq(
-        context.tcp_path_security(0).expect("primary security"),
+        context.tcp_path_security(1).expect("secondary security"),
         context
-            .tcp_path_security(3)
-            .expect("primary sibling security"),
+            .tcp_path_security(2)
+            .expect("secondary sibling security"),
     ));
     assert!(std::ptr::eq(
-        context.tcp_path_tls(0).expect("primary TLS"),
-        context.tcp_path_tls(3).expect("primary sibling TLS"),
+        context.tcp_path_tls(1).expect("secondary TLS"),
+        context.tcp_path_tls(2).expect("secondary sibling TLS"),
     ));
 
     let health = context.health().lock().expect("path health");
-    let locally_eligible = health
-        .tcp
-        .iter()
-        .map(ClientPathHealthRecord::is_locally_eligible)
-        .collect::<Vec<_>>();
-    assert_eq!(locally_eligible, [true, true, false, false, true]);
+    assert_eq!(health.tcp.len(), 3);
     drop(health);
 
     assert_eq!(
         context.automatic_bulk_path_count(UnderlayProtocol::Tcp, None),
         3
     );
-    assert!(!context.should_probe_tcp_path(2));
-    assert!(!context.should_probe_tcp_path(3));
     assert!(
         context
             .reserve_relay_path_load(
@@ -124,11 +111,11 @@ fn tcp_endpoint_topology_preserves_configured_primaries_and_dormant_capacity() {
                 },
                 TrafficClass::Throughput,
             )
-            .is_none()
+            .is_some()
     );
     assert_eq!(
         context.ordered_tcp_path_indices(TrafficClass::Throughput, 64 * 1024),
-        [0, 1, 4]
+        [0, 1, 2]
     );
 
     let bounded_resources = ResourceLimits {

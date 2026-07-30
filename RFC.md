@@ -95,7 +95,10 @@ third transport protocol.
   session, carrier, physical-link, or bottleneck identity.
 
 **Stream attachment**
-: One reliable MPP stream's membership on one carrier instance.
+: One reliable MPP stream's bidirectional membership on one carrier instance.
+  It permits the stream control and feedback required by Sections 8.3 through
+  8.6, but does not by itself grant ordinary payload authority in either
+  direction.
 
 **Attachment incarnation**
 : The local stale-work fence for one stream attachment. Detach followed by
@@ -160,10 +163,12 @@ third transport protocol.
   frozen accepted-set service.
 
 **Directional ordinary-use authority**
-: Permission for ordinary Product placement on one exact live TCP carrier in
-  one direction. Configured-minimum carriers receive it on readiness; an
-  elastic carrier receives it only through `RETAIN`. It is not receive credit,
-  delivery acknowledgment, carrier health, or a permanent attachment role.
+: Permission for ordinary `STREAM_DATA` or `DGRAM_DATA` placement on one exact
+  live TCP carrier in one direction. Configured-minimum TCP carriers receive
+  it on readiness; an elastic TCP carrier receives it only through a committed
+  `RETAIN`. Bounded validation work is the only pre-authority payload
+  exception. Authority is not receive credit, delivery acknowledgment, carrier
+  health, or a permanent attachment role.
 
 **Aggregate service interval**
 : A closed interval `[lower, upper]` produced by the ordinary directional
@@ -444,10 +449,10 @@ retirement acknowledgment. It removes the carrier only after applying every
 preceding responder frame and reaching the same local zero-work condition.
 Native failure before that boundary uses ordinary retained-state recovery.
 
-`TCP_CARRIER_DEMAND`, `TCP_CARRIER_VALIDATE`, and `TCP_CARRIER_RESULT` are
-also valid only on ready TCP carriers. They coordinate bounded directional
-carrier validation in Sections 7.2 and 15.1; they never grant stream credit or
-delivery.
+`TCP_CARRIER_DEMAND`, `TCP_CARRIER_VALIDATE`, `TCP_CARRIER_RESULT`, and
+`TCP_CARRIER_RESULT_ACK` are also valid only on ready TCP carriers. They
+coordinate bounded directional carrier validation in Sections 7.2 and 15.1;
+they never grant stream credit or delivery.
 
 `PATH_CAPACITY_DATA`, `PATH_CAPACITY_FINISH`, and
 `PATH_CAPACITY_RECEIPT` are valid only on TCP carriers.
@@ -621,15 +626,31 @@ minimum without first proving aggregate benefit. It MUST NOT open every
 remaining elastic slot as one failure reaction. Non-failure expansion above
 the minimum requires directional carrier validation under Section 15.1. At
 most one unsettled elastic connection may exist in an MPP session from connect
-initiation until its first `RETAIN`, terminal `PATH_CLOSE`, or native failure.
+initiation until its first committed `RETAIN`, terminal `PATH_CLOSE`, or native
+failure.
 At most one directional validation may be active in the session. After a first
-`RETAIN`, that accepted carrier MAY separately validate its other direction
-only while no other validation is active.
+committed `RETAIN`, that accepted carrier MAY separately validate its other
+direction only while no other validation is active.
 
 A configured-minimum carrier, including an exact failure replacement, gains
 ordinary-use authority in both directions after readiness, subject to current
 `PATH_STATUS` and local eligibility. An elastic connection begins with no
 ordinary-use authority.
+
+Attachment membership and ordinary-use authority are independent. On TCP,
+every ordinary `STREAM_DATA` and `DGRAM_DATA` enqueue MUST revalidate authority
+for its sender direction. `STREAM_ACK`, `STREAM_MAX_DATA`, `STREAM_FIN`,
+`STREAM_RESET`, `STREAM_DETACH`, datagram feedback and close, and carrier
+lifecycle control MAY use a ready live attachment as their existing semantics
+require; doing so creates no ordinary-use authority in the opposite direction.
+
+On TCP, an `OPEN_STREAM` that creates a new stream or `OPEN_DGRAM_FLOW` that
+creates a new flow MUST use a carrier with ordinary-use authority in both
+directions. A carrier authorized in only one direction may subsequently attach
+that existing stream or flow and carry ordinary payload only in its authorized
+direction. Before its first committed `RETAIN`, a candidate may attach only
+the frozen existing validation cohort. This prevents a one-direction result
+from silently becoming the sole bidirectional Product path.
 
 The client owns physical TCP establishment because only it knows the
 configured carrier group and its bounds. The sender owns demand and delivery
@@ -643,6 +664,14 @@ evidence for its direction:
 Per-stream state is input to those session-scoped directional controllers. One
 stream MUST NOT publish endpoint-wide ordinary-use authority by itself, but a
 single saturated stream MAY be the complete bounded demand cohort.
+
+The session has at most one active directional validation. Each sender
+direction owns one session-scoped controller and aggregate-service history.
+While validation is active, that controller consumes the exact fully processed
+Data ACK releases from every stream served by the frozen accepted set. The
+bounded cohort limits which streams may place candidate work; it does not
+narrow accepted-set or combined aggregate service to one stream. A per-stream
+controller MUST NOT independently compare service or conclude the validation.
 
 For server-to-client demand, the server sends
 `TCP_CARRIER_DEMAND(request_id, stream_ids)` on any ready TCP carrier in the
@@ -691,23 +720,70 @@ deadline expiry emits `WITHDRAWN`. The client lifecycle owner independently
 stops and drains a candidate whose local resource deadline expires. A timeout
 or invalidation cannot produce `NO_GAIN`.
 
-The sender concludes a validation with
+After accepting `TCP_CARRIER_VALIDATE`, each endpoint owns its validation
+record and absolute deadline independently of the lifetime of the stream actor
+that supplied the cohort. Dropping a local waiter or request handle does not
+cancel an already admitted lifecycle operation. Expiry releases the bounded
+cohort and evidence, serializes `WITHDRAWN`, and retains only a compact
+terminal tombstone. The tombstone is not active carrier validation or queued
+work; it only classifies a crossing result. It is discarded after the exact
+acknowledgment or native failure. During drain, the initiator discards it on
+receipt of `PATH_CLOSE`; the responder discards it atomically when serializing
+`PATH_CLOSE` after all earlier peer frames. It therefore cannot block the
+Section 6.1 zero-work boundary.
+
+The directional sender prepares a validation result with
 `TCP_CARRIER_RESULT(validation_id, direction, result)` on the candidate
-carrier. `RETAIN` creates directional ordinary-use authority; `NO_GAIN`
+carrier. `RETAIN` proposes directional ordinary-use authority; `NO_GAIN`
 records a completed validation whose marginal benefit was not established;
 and `WITHDRAWN` records invalidation or ended demand without a capacity
 verdict. A result applies only to the exact current session, authenticated
 candidate instance, validation, direction, and cohort. It grants no delivery,
-flow-control, or health evidence. The client retains an elastic carrier while
-at least one direction has current ordinary-use authority. A direction without
-that authority keeps the carrier ineligible for ordinary placement until a
-later independent validation succeeds.
+flow-control, or health evidence.
 
-Ordinary-use authority is recorded by both endpoints, lasts only for the exact
-live carrier instance and direction, and is revoked by carrier drain, carrier
-failure, or session close. Demand or cohort ending does not revoke an already
-recorded `RETAIN`, and a later `WITHDRAWN` applies only to a still-active
-validation. Authority never transfers to a replacement carrier.
+The receiver of a current result atomically applies its exact provisional
+effect and serializes
+`TCP_CARRIER_RESULT_ACK(validation_id, direction, result)`. The acknowledgment
+MUST repeat all three fields exactly and MUST NOT be emitted for an unknown,
+already settled, conflicting, or stale result. As the sole exception, a
+`WITHDRAWN` result exactly matching the retained terminal tombstone MAY be
+acknowledged idempotently. A result emitter's ordered `WITHDRAWN` MAY also
+supersede its own provisionally acknowledged `RETAIN` or `NO_GAIN` before the
+emitter accepts that acknowledgment. The acknowledgment is an acceptance
+receipt, not delivery, flow-control, rate, health, or demand evidence.
+
+Serializing an acknowledgment for any current exact result is the receiver's
+final locally originated validation decision. The receiver cancels its
+validation deadline, releases its cohort fences, and MUST NOT originate a
+later `WITHDRAWN` for that validation. Only the result emitter's ordered
+pre-commit `WITHDRAWN`, or ordinary carrier drain, failure, or session close,
+may supersede the accepted decision. For `RETAIN`, the receiver holds compact
+provisional authority until an ordered emitter withdrawal, later ordinary
+payload, or carrier termination resolves it.
+
+The result emitter settles `NO_GAIN`, and commits `RETAIN`, only after
+receiving the matching acknowledgment while its exact local fences and
+deadline remain current. It settles `WITHDRAWN` on the acknowledgment matching
+its terminal tombstone, or on `PATH_CLOSE` or native failure; the invalid fence
+that caused withdrawal need not become current again. Before accepting a
+`RETAIN` or `NO_GAIN` acknowledgment, the emitter's own `WITHDRAWN` has
+precedence over a crossing result or acknowledgment and is serialized after
+the prepared result on the same TCP byte-stream direction. A receiver rolls
+back provisional authority or decision state on that ordered withdrawal. An
+endpoint that has already made or accepted a withdrawal MUST NOT acknowledge a
+crossing `RETAIN` or `NO_GAIN`. Each endpoint's carrier actor therefore
+chooses its linearization event without relying on clock synchronization or
+ordering between the two TCP byte-stream directions.
+
+After the result emitter accepts acknowledged `RETAIN`, it cancels its
+validation deadline and ordinary-use authority lasts only for the exact live
+carrier instance and direction. A later `WITHDRAWN` for that validation is
+invalid; carrier drain, carrier failure, or session close revokes the
+authority. Demand or cohort ending does not revoke committed authority, and
+authority never transfers to a replacement carrier. The client retains an
+elastic carrier while at least one direction has committed ordinary-use
+authority. A direction without that authority remains ineligible for ordinary
+placement until a later independent validation succeeds.
 
 Only the directional sender may emit `RETAIN` or `NO_GAIN`. Either endpoint
 may emit `WITHDRAWN` when its exact local fence or resource lifetime becomes
@@ -715,11 +791,12 @@ invalid; withdrawal carries no verdict and therefore needs no reconstructed
 peer evidence.
 
 A client-to-server validation is started, advanced, concluded, and locally
-applied by the client sender; the server validates its registration and
-result but does not reconstruct the decision. A server-to-client validation is
-requested, advanced, and concluded by the server sender; the client opens and
-attaches the candidate, echoes the exact frozen request, and applies the
-server's result to physical lifecycle. In both cases the sender is the sole
+applied by the client sender after the server acknowledges the exact result;
+the server validates registration and result but does not reconstruct the
+decision. A server-to-client validation is requested, advanced, and concluded
+by the server sender after the client acknowledges the exact result; the
+client opens and attaches the candidate, echoes the exact frozen request, and
+applies the result to physical lifecycle. In both cases the sender is the sole
 rate and verdict authority, while the client remains the sole TCP
 establishment and final resource authority.
 
@@ -727,11 +804,18 @@ A candidate carries only its bounded validation work and control or feedback
 needed to complete existing MPP semantics. It MUST NOT accept unrelated
 attachments or ordinary placement before the relevant direction gains
 ordinary-use authority. The directional sender MUST serialize
-`TCP_CARRIER_RESULT` before any later ordinary Product frame it sends on that
-TCP carrier. Invalidated, withdrawn, or no-gain validation stops new candidate
-work immediately. If no direction retains the carrier and the configured
-minimum does not require it, the client retires it through `PATH_DRAIN` and
-waits for the peer's ordered `PATH_CLOSE` boundary from Section 6.1.
+`TCP_CARRIER_RESULT`, await its exact acknowledgment, and commit `RETAIN`
+before any later ordinary payload frame it sends on that TCP carrier.
+Invalidated, withdrawn, or no-gain validation stops new candidate work
+immediately. Result, acknowledgment, validation-record transition, attachment
+retirement, and any following `PATH_DRAIN` share one carrier-actor ordering
+domain; queue priority or caller cancellation cannot omit or overtake a
+suffix. If no direction retains the carrier and the configured minimum does
+not require it, the client retires it through `PATH_DRAIN` and waits for the
+peer's ordered `PATH_CLOSE` boundary from Section 6.1. `PATH_CLOSE` or native
+failure may settle an unretained draining candidate without a result
+acknowledgment. The client does not release the physical candidate slot at
+local result or drain write completion.
 
 Changing the destination port of a TCP carrier creates a replacement carrier;
 it never migrates the existing TCP connection. Planned replacement MUST be
@@ -1163,12 +1247,13 @@ frames.
 | 38 | `TCP_CARRIER_DEMAND` | `request_id:u64, stream_count:u16, stream_ids[stream_count]` |
 | 39 | `TCP_CARRIER_VALIDATE` | `validation_id:u64, request_id:u64, direction:u8, stream_count:u16, stream_ids[stream_count]` |
 | 40 | `TCP_CARRIER_RESULT` | `validation_id:u64, direction:u8, result:u8` |
+| 41 | `TCP_CARRIER_RESULT_ACK` | `validation_id:u64, direction:u8, result:u8` |
 
 Kinds 5, 6, 15, 19, 25, 26, 28, and 29 are reserved and MUST NOT be sent.
 
 `SESSION_HELLO` and `SESSION_AUTH` are QUIC carrier-admission frames; TCP uses
 the Section 6.1 prelude. `PATH_DRAIN`, `PATH_CLOSE`, kinds 33 through 35, and
-kinds 38 through 40 are TCP-only. Receiving a carrier-incompatible frame is a
+kinds 38 through 41 are TCP-only. Receiving a carrier-incompatible frame is a
 protocol violation.
 
 ### 12.3 Common field encodings
@@ -1196,9 +1281,9 @@ TCP carrier result values are `RETAIN = 1`, `NO_GAIN = 2`, and
 and duplicate-free. A demand stream list is strictly increasing and
 duplicate-free when nonempty; a newer empty list has only the withdrawal
 meaning defined in Section 7.2. `request_id` in `TCP_CARRIER_DEMAND` and
-`validation_id` in `TCP_CARRIER_VALIDATE` and `TCP_CARRIER_RESULT` MUST be
-nonzero. A zero validation `request_id` has the local-demand meaning defined
-in Section 7.2.
+`validation_id` in `TCP_CARRIER_VALIDATE`, `TCP_CARRIER_RESULT`, and
+`TCP_CARRIER_RESULT_ACK` MUST be nonzero. A zero validation `request_id` has
+the local-demand meaning defined in Section 7.2.
 
 Usage values are `AVAILABLE = 0` and `BACKUP = 1`.
 
@@ -1223,7 +1308,7 @@ Endpoints MUST enforce configured bounds for:
 - datagram attempts, TTL, caches, fragments, and reassemblies;
 - proof, capacity, metric, and peer-status work;
 - TCP carrier demand requests, validations, stream cohorts, candidate work,
-  results, ordinary-use authority, and drain work; and
+  results, result acknowledgments, ordinary-use authority, and drain work; and
 - all teardown and no-attachment retention.
 
 A protocol violation closes the smallest safe scope: product flow, stream,
@@ -1357,8 +1442,8 @@ Only unambiguous original-data releases from a fully processed MPP Data ACK
 event establish candidate delivery or aggregate unique-delivery service. Both
 complete snapshots and positive partial ACK ranges qualify after transactional
 validation and release. Releases of reinjection or bytes with ambiguous copy
-provenance do not. The sender records ordinary-use authority for the candidate
-in that direction only after:
+provenance do not. The sender may prepare `RETAIN` only after all of the
+following:
 
 1. the candidate has unambiguous original-data ACK coverage of at least the
    configured Data ACK startup sample floor;
@@ -1367,6 +1452,9 @@ in that direction only after:
    interval; and
 3. the exact candidate, accepted set, cohort, demand, attachment,
    configuration, and deadline fences remain current.
+
+The authority becomes current only when the sender accepts the exact result
+acknowledgment under Section 7.2 while those fences remain current.
 
 Any settled result that does not satisfy those conditions, including equal or
 overlapping intervals, is `NO_GAIN`. Demand ending, deadline expiry, ambiguous
@@ -1497,6 +1585,12 @@ A conforming implementation preserves all of the following:
 22. `PATH_CLOSE` is the ordered aggregate acknowledgment of a matching
     `PATH_DRAIN`; local emptiness or write completion cannot replace it.
 23. `SESSION_CLOSE` retires the complete `SessionId`; carrier drain does not.
+24. Attachment membership and feedback capability grant no TCP payload
+    authority in either direction.
+25. Elastic TCP `RETAIN` commits only after the exact result acknowledgment;
+    a prepared result or local drain write is not a settlement boundary.
+26. Configured elastic capacity that has not established a physical carrier is
+    not an eligible carrier, path attachment, or health state.
 
 ## 17. Relationship to Existing Standards
 

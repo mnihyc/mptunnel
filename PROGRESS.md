@@ -11,6 +11,142 @@ Historical entries below are retained as evidence of the decisions made at
 their recorded time. When a later entry changes an earlier decision, the later
 entry is authoritative.
 
+## 2026-07-30T21:57:16+08:00: false topology removed and result commit defined
+
+- Name: retained-patch reflection and MPP v5 lifecycle correction
+- Category: Core topology, carrier retirement, wire protocol, and performance
+  change control
+- State: implemented and locally verified; elastic TCP expansion remains
+  inactive until the session actor implements this contract
+- Supersedes:
+  - the provisional maximum-slot topology retained at 20:37; and
+  - any earlier implication that writing a local `PATH_CLOSE` or unacknowledged
+    `RETAIN` settles a carrier lifecycle
+- Prior-patch audit:
+  - retained the direct v4 conformance fixes, canonical Product identities,
+    transactional observability, demand-driven DNS, balancer attempt
+    lifetimes, carrier port sets, native QUIC migration, exact asynchronous
+    open fencing, and queue-before-publication flight ordering;
+  - found no retained change to the scheduler, congestion controller, pacing,
+    windows, recovery formulas, queue geometry, transport defaults, or the
+    patched `quinn-proto`;
+  - retained the balancer's per-member deadline as an explicit
+    availability-versus-failed-member-latency trade that still requires the
+    final short-flow matrix; and
+  - identified the maximum-slot TCP topology as the only unjustified
+    established payload-path delta.
+- Topology correction:
+  - configured TCP maximum remains a strict resource and future-establishment
+    bound, but physically absent elastic capacity is no longer represented as
+    a `PathSpec`, health record, session actor, draining path, or management
+    state;
+  - only configured-minimum TCP carriers enter ordinary scheduling; this
+    preserves explicit minima greater than one without exposing unestablished
+    candidates;
+  - removed the dormant-path eligibility flag and its branches from health,
+    observation, proof, delivery, reservation, failure, management, and
+    scheduler paths; and
+  - removed the extra health mutex and record scan previously performed by
+    `automatic_bulk_path_count` on bulk payload placement.
+- Retirement correction:
+  - client actor teardown no longer sends its own `PATH_CLOSE`; when no owner
+    remains it drops the native carrier, which is an honest native terminal
+    boundary;
+  - future graceful retirement remains one actor-owned
+    `PATH_DRAIN`-to-peer-`PATH_CLOSE` transaction and cannot reuse the removed
+    shortcut.
+- RFC and wire correction:
+  - attachment is bidirectional membership and feedback capability, not
+    ordinary TCP payload authority; payload authority remains directional,
+    while ACK, credit, FIN, reset, detach, datagram feedback, and lifecycle
+    control preserve existing semantics;
+  - one session has at most one active directional validation, and each
+    direction has one session-scoped aggregate controller; a per-stream
+    controller cannot publish session authority;
+  - validation deadline, result, attachment retirement, drain, and terminal
+    cleanup are actor-owned even if a caller stops waiting; and
+  - added `TCP_CARRIER_RESULT_ACK` kind 41. `RETAIN` is prepared by the sender,
+    applied provisionally by the receiver, and committed only after the exact
+    acknowledgment, eliminating the unordered result/withdrawal race between
+    TCP directions without established-path overhead.
+- Evidence:
+  - all 13 focused TCP-carrier/protocol/integration tests pass;
+  - the configured-minimum topology and management lifecycle tests pass;
+  - the complete library gate passes: 1,401 tests, zero failures;
+  - formatting and whitespace checks pass; and
+  - the correction removes more runtime/test lines than it adds.
+- Performance boundary:
+  - no Core selection formula, transport parameter, timing value, queue
+    capacity, carrier count at the configured minimum, or native controller
+    changed;
+  - the established payload path loses one mutex acquisition, one scan, and
+    dormant-eligibility branches introduced after historical authority;
+  - result acknowledgment is one small control frame and one setup round trip
+    only for an elastic candidate; and
+  - historical performance authority remains `a5a6094` until the adjacent
+    inactive-range and representative Core labs pass.
+- Open lifecycle boundary:
+  - configured-minimum members now have distinct lazy actors, but an idle
+    native failure is currently restored by later demand or the periodic path
+    probe rather than immediate group reconciliation;
+  - the session carrier-group owner must therefore maintain desired minimum
+    readiness and hold endpoint-level management policy independently of
+    current carrier records before it may own elastic candidates; and
+  - one persistent multi-carrier lifecycle acceptance must cover minimum
+    readiness, distinct instances, exact failure replacement, maximum
+    non-expansion, endpoint disable, and terminal cleanup together.
+- Next: establish that session carrier-group owner, then implement the smallest
+  client-to-server candidate lifecycle against the exact committed-result and
+  terminal-retirement contract; run adjacent `1-1` versus inactive `1-3` and
+  representative historical labs before enabling expansion.
+
+## 2026-07-30T21:39:02+08:00: per-flow carrier slice rejected before commit
+
+- Name: TCP carrier vertical-slice reflection gate
+- Category: Core ownership, directional authority, and change control
+- State: rejected and removed; the source tree is restored to the clean
+  `2b2d36c` baseline and automatic elastic TCP expansion remains inactive
+- Supersedes: no committed milestone; this entry records why the uncommitted
+  implementation following the 20:37 milestone was not retained
+- Rejected implementation:
+  - placed aggregate service estimation and the validation verdict inside
+    each reliable-stream request controller, so concurrent streams could
+    mistake service shifted between streams for session-wide gain;
+  - represented client-to-server authority with generic attachment/path
+    eligibility, even though ordinary Product-data authority is directional;
+  - allowed a validation waiter cancellation to suppress already-admitted
+    lifecycle work and released the one-candidate fence after writing
+    `PATH_DRAIN`, before the ordered `PATH_CLOSE` or native-failure boundary;
+  - let the receiver's validation state depend on the initiating cohort
+    lifetime without an independent absolute resource deadline; and
+  - added repairs for result/withdrawal and cleanup races before the RFC had
+    defined one deterministic commit boundary.
+- Retained conclusions:
+  - aggregate service and the expansion verdict belong to one long-lived
+    session-direction owner; per-stream state supplies bounded exact demand,
+    attachment, flight, and Data ACK observations only;
+  - ordinary Product-data authority must remain separate by direction from
+    the control and feedback needed to preserve existing stream semantics;
+  - one unsettled candidate remains physically owned through matching
+    `PATH_CLOSE` or native failure, not merely through local drain enqueue;
+  - an admitted actor operation completes independently of whether its caller
+    still waits for the receipt; and
+  - both endpoints need a finite validation resource lifetime, so the RFC must
+    define a deterministic result/withdrawal boundary before runtime code.
+- Evidence:
+  - the roughly 2,900-line uncommitted source/test slice was removed in full;
+  - `git status --short` is empty and `git diff --check` passes;
+  - `cargo check --locked --all-targets` passes from the restored baseline;
+    and
+  - no scheduler rule, transport parameter, timing formula, carrier count, or
+    runtime Product behavior changed.
+- Performance boundary: historical authority remains `a5a6094`; the rejected
+  slice produced no accepted performance claim and leaves no runtime overhead.
+- Next: clarify the existing RFC session-direction actor, directional
+  attachment authority, result/withdrawal commit, independent deadline, and
+  terminal ownership contract; only then implement the smallest
+  client-to-server lifecycle and measure it adjacently.
+
 ## 2026-07-30T20:37:27+08:00: TCP expansion model reduced to reachable state
 
 - Name: destructive RFC and prior-patch necessity audit

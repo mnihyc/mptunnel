@@ -75,23 +75,15 @@ impl ClientPathContext {
         underlay: UnderlayProtocol,
         service_index: Option<usize>,
     ) -> usize {
-        let health = self.state.health().lock().expect("client path health lock");
         let paths = match underlay {
             UnderlayProtocol::Tcp => &self.tcp_paths,
             UnderlayProtocol::Udp => &self.udp_paths,
         };
-        let records = match underlay {
-            UnderlayProtocol::Tcp => &health.tcp,
-            UnderlayProtocol::Udp => &health.udp,
-        };
         paths
             .iter()
-            .zip(records)
             .enumerate()
-            .filter(|(index, (path, record))| {
-                Some(*index) != service_index
-                    && record.is_locally_eligible()
-                    && path_allows_automatic_bulk_use(path)
+            .filter(|(index, path)| {
+                Some(*index) != service_index && path_allows_automatic_bulk_use(path)
             })
             .count()
     }

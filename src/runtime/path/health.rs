@@ -102,6 +102,12 @@ struct SuccessfulPathProof {
     acked_at: Instant,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RequestTcpServiceAuthorityState {
+    Accepted,
+    Candidate,
+}
+
 impl Default for ClientPathHealthRecord {
     fn default() -> Self {
         Self {
@@ -162,7 +168,7 @@ impl ClientPathHealthRecord {
         usage: PathUsage,
     ) {
         let new_instance = self.path_instance_id != Some(path_instance_id);
-        let was_eligible = self.request_tcp_service_eligible();
+        let previous_authority = self.request_tcp_service_authority_state();
         if new_instance {
             self.data_plane_failure_instance_id = None;
             if self.path_instance_id.is_some() {
@@ -179,7 +185,7 @@ impl ClientPathHealthRecord {
         self.peer_usage = Some(usage);
         self.mark_liveness_success_inner();
         if !new_instance {
-            self.record_tcp_service_eligibility_transition(was_eligible);
+            self.record_tcp_service_authority_transition(previous_authority);
         }
     }
 
@@ -189,7 +195,7 @@ impl ClientPathHealthRecord {
         sequence: u64,
         usage: PathUsage,
     ) -> bool {
-        if !self.locally_eligible || self.path_instance_id != Some(path_instance_id) {
+        if self.path_instance_id != Some(path_instance_id) {
             return false;
         }
         if self
@@ -198,10 +204,10 @@ impl ClientPathHealthRecord {
         {
             return false;
         }
-        let was_eligible = self.request_tcp_service_eligible();
+        let previous_authority = self.request_tcp_service_authority_state();
         self.peer_usage_sequence = Some(sequence);
         self.peer_usage = Some(usage);
-        self.record_tcp_service_eligibility_transition(was_eligible);
+        self.record_tcp_service_authority_transition(previous_authority);
         true
     }
 
@@ -238,11 +244,20 @@ impl ClientPathHealthRecord {
             .flatten()
     }
 
+    pub(in crate::runtime) fn request_tcp_service_candidate_generation(&self) -> Option<u64> {
+        (self.request_tcp_service_authority_state()
+            == Some(RequestTcpServiceAuthorityState::Candidate))
+        .then_some(self.tcp_service_eligibility_generation)
+        .flatten()
+    }
+
     pub(in crate::runtime) fn retire_request_tcp_service_authority(
         &mut self,
         path_instance_id: CarrierPathInstanceId,
     ) {
-        if self.path_instance_id == Some(path_instance_id) && self.request_tcp_service_eligible() {
+        if self.path_instance_id == Some(path_instance_id)
+            && self.request_tcp_service_authority_state().is_some()
+        {
             self.advance_tcp_service_eligibility_generation();
         }
     }
@@ -254,7 +269,7 @@ impl ClientPathHealthRecord {
         failed_until: Option<Instant>,
         clear_flight: bool,
     ) {
-        let was_eligible = self.request_tcp_service_eligible();
+        let previous_authority = self.request_tcp_service_authority_state();
         self.manual_disabled = manual_disabled;
         self.state = state;
         self.failed_until = failed_until;
@@ -262,23 +277,41 @@ impl ClientPathHealthRecord {
             self.relay_bytes_in_flight = 0;
             self.relay_queue_bytes = 0;
         }
-        self.record_tcp_service_eligibility_transition(was_eligible);
+        self.record_tcp_service_authority_transition(previous_authority);
     }
 
     fn request_tcp_service_eligible(&self) -> bool {
-        self.locally_eligible
-            && !self.manual_disabled
-            && self.path_instance_id.is_some()
-            && self.data_plane_failure_instance_id != self.path_instance_id
-            && self.peer_usage == Some(PathUsage::Available)
-            && matches!(
-                self.state,
-                SchedulerPathState::Active | SchedulerPathState::Suspect
-            )
+        self.request_tcp_service_authority_state()
+            == Some(RequestTcpServiceAuthorityState::Accepted)
     }
 
-    fn record_tcp_service_eligibility_transition(&mut self, was_eligible: bool) {
-        if was_eligible != self.request_tcp_service_eligible() {
+    fn request_tcp_service_authority_state(&self) -> Option<RequestTcpServiceAuthorityState> {
+        if self.manual_disabled
+            || self.path_instance_id.is_none()
+            || self.data_plane_failure_instance_id == self.path_instance_id
+            || self.peer_usage != Some(PathUsage::Available)
+        {
+            return None;
+        }
+        if !self.locally_eligible {
+            return matches!(
+                self.state,
+                SchedulerPathState::Draining | SchedulerPathState::Suspect
+            )
+            .then_some(RequestTcpServiceAuthorityState::Candidate);
+        }
+        matches!(
+            self.state,
+            SchedulerPathState::Active | SchedulerPathState::Suspect
+        )
+        .then_some(RequestTcpServiceAuthorityState::Accepted)
+    }
+
+    fn record_tcp_service_authority_transition(
+        &mut self,
+        previous: Option<RequestTcpServiceAuthorityState>,
+    ) {
+        if previous != self.request_tcp_service_authority_state() {
             self.advance_tcp_service_eligibility_generation();
         }
     }
@@ -359,7 +392,7 @@ impl ClientPathHealthRecord {
 
     /// Applies time-driven lifecycle transitions. Observation remains pure.
     pub(in crate::runtime) fn maintain(&mut self, now: Instant) {
-        let was_eligible = self.request_tcp_service_eligible();
+        let previous_authority = self.request_tcp_service_authority_state();
         self.tcp_capacity.maintain(now);
         if self.state == SchedulerPathState::Failed
             && self.failed_until.is_some_and(|deadline| now >= deadline)
@@ -367,7 +400,7 @@ impl ClientPathHealthRecord {
             self.state = SchedulerPathState::Suspect;
             self.failed_until = None;
         }
-        self.record_tcp_service_eligibility_transition(was_eligible);
+        self.record_tcp_service_authority_transition(previous_authority);
     }
 
     pub(in crate::runtime) fn observation_at(&self, now: Instant) -> ClientPathObservation {
@@ -522,9 +555,9 @@ impl ClientPathHealthRecord {
     }
 
     pub(in crate::runtime) fn mark_liveness_success(&mut self) {
-        let was_eligible = self.request_tcp_service_eligible();
+        let previous_authority = self.request_tcp_service_authority_state();
         self.mark_liveness_success_inner();
-        self.record_tcp_service_eligibility_transition(was_eligible);
+        self.record_tcp_service_authority_transition(previous_authority);
     }
 
     fn mark_liveness_success_inner(&mut self) {
@@ -713,7 +746,7 @@ impl ClientPathHealthRecord {
         if !self.locally_eligible {
             return;
         }
-        let was_eligible = self.request_tcp_service_eligible();
+        let previous_authority = self.request_tcp_service_authority_state();
         self.consecutive_failures = self.consecutive_failures.saturating_add(1);
         self.relay_bytes_in_flight = 0;
         self.relay_queue_bytes = 0;
@@ -725,7 +758,7 @@ impl ClientPathHealthRecord {
             self.state = SchedulerPathState::Failed;
             self.failed_until = Some(now + path_record_failure_cooldown(self));
         }
-        self.record_tcp_service_eligibility_transition(was_eligible);
+        self.record_tcp_service_authority_transition(previous_authority);
     }
 
     pub(in crate::runtime) fn mark_data_plane_failure(
@@ -739,7 +772,7 @@ impl ClientPathHealthRecord {
         {
             return false;
         }
-        let was_eligible = self.request_tcp_service_eligible();
+        let previous_authority = self.request_tcp_service_authority_state();
         self.data_plane_failure_instance_id = Some(path_instance_id);
         self.consecutive_failures = self.consecutive_failures.saturating_add(1);
         self.relay_bytes_in_flight = 0;
@@ -757,7 +790,7 @@ impl ClientPathHealthRecord {
             self.state = SchedulerPathState::Suspect;
             self.failed_until = None;
         }
-        self.record_tcp_service_eligibility_transition(was_eligible);
+        self.record_tcp_service_authority_transition(previous_authority);
         true
     }
 

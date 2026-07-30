@@ -331,7 +331,7 @@ impl ReliableRelayRemoteSet {
                 underlay: UnderlayProtocol::Tcp,
                 index: *path_index,
             };
-            if context.current_request_tcp_service_carrier(key) == Some(request.candidate) {
+            if context.current_request_tcp_service_candidate(key) == Some(request.candidate) {
                 candidate_matches = candidate_matches.saturating_add(1);
                 if self.contains_path_key(key) {
                     return Err(TcpServiceWithdrawalReason::FenceChanged);

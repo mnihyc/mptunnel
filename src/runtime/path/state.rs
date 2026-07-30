@@ -150,6 +150,34 @@ impl ClientPathState {
         }
     }
 
+    /// Publishes one exact authenticated carrier for the lifetime of the
+    /// returned connection-owned registration.
+    pub(in crate::runtime) fn register_authenticated_path(
+        self: &Arc<Self>,
+        underlay: UnderlayProtocol,
+        index: usize,
+        path_id: PathId,
+        path_join_nonce: AuthNonce,
+        path_instance_id: CarrierPathInstanceId,
+        sequence: u64,
+        usage: PathUsage,
+    ) -> ClientAuthenticatedPathRegistration {
+        self.install_authenticated_path(
+            underlay,
+            index,
+            path_id,
+            path_join_nonce,
+            path_instance_id,
+            sequence,
+            usage,
+        );
+        ClientAuthenticatedPathRegistration {
+            state: Arc::downgrade(self),
+            key: RelayPathKey { underlay, index },
+            path_instance_id,
+        }
+    }
+
     #[cfg(test)]
     pub(in crate::runtime) fn install_peer_path_usage(
         &self,
@@ -206,6 +234,38 @@ impl ClientPathState {
         let record = health.tcp.get_mut(key.index)?;
         record.maintain(Instant::now());
         let eligibility_generation = record.request_tcp_service_eligibility_generation()?;
+        let registered = self
+            .registered_carriers
+            .lock()
+            .expect("client registered carrier lock");
+        let carrier = registered.tcp.get(key.index).copied().flatten()?;
+        Some(TcpServiceCarrierFence {
+            accepted: TcpCarrierAcceptedPath {
+                path_id: carrier.path_id,
+                path_join_nonce: carrier.path_join_nonce,
+            },
+            local_instance_id: carrier.path_instance_id,
+            eligibility_generation,
+        })
+    }
+
+    /// Returns one lock-coherent authenticated validation-candidate authority.
+    ///
+    /// A candidate occupies a configured TCP carrier slot above the group's
+    /// configured minimum. It is deliberately absent from ordinary Product
+    /// scheduling while its physical instance and peer availability remain
+    /// independently fenced for validation.
+    pub(in crate::runtime) fn current_request_tcp_service_candidate(
+        &self,
+        key: RelayPathKey,
+    ) -> Option<TcpServiceCarrierFence> {
+        if key.underlay != UnderlayProtocol::Tcp {
+            return None;
+        }
+        let mut health = self.health.lock().expect("client path health lock");
+        let record = health.tcp.get_mut(key.index)?;
+        record.maintain(Instant::now());
+        let eligibility_generation = record.request_tcp_service_candidate_generation()?;
         let registered = self
             .registered_carriers
             .lock()
@@ -325,6 +385,22 @@ pub(in crate::runtime) struct ClientTcpServiceWriterRegistration {
     state: Weak<ClientPathState>,
     stream_id: StreamId,
     writer: RequestTcpServiceWriter,
+}
+
+#[must_use = "dropping the registration retires the authenticated carrier path"]
+pub(in crate::runtime) struct ClientAuthenticatedPathRegistration {
+    state: Weak<ClientPathState>,
+    key: RelayPathKey,
+    path_instance_id: CarrierPathInstanceId,
+}
+
+impl Drop for ClientAuthenticatedPathRegistration {
+    fn drop(&mut self) {
+        let Some(state) = self.state.upgrade() else {
+            return;
+        };
+        state.retire_authenticated_path(self.key, self.path_instance_id);
+    }
 }
 
 impl Drop for ClientTcpServiceWriterRegistration {
@@ -553,6 +629,13 @@ impl ClientPathContext {
         key: RelayPathKey,
     ) -> Option<TcpServiceCarrierFence> {
         self.state.current_request_tcp_service_carrier(key)
+    }
+
+    pub(in crate::runtime) fn current_request_tcp_service_candidate(
+        &self,
+        key: RelayPathKey,
+    ) -> Option<TcpServiceCarrierFence> {
+        self.state.current_request_tcp_service_candidate(key)
     }
 
     pub(in crate::runtime) fn request_tcp_capacity_probe_remaining_bytes(&self) -> u64 {

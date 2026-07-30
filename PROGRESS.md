@@ -2339,3 +2339,51 @@ entry is authoritative.
   - no performance verdict beyond the previously recorded inactive v5 gate is
     claimed. Representative performance remains a required global-map gate
     before any candidate or producer can be connected.
+
+## 2026-07-30T15:53:36+08:00: Dormant TCP validation-candidate authority
+
+- Name: accepted-set and candidate fence separation
+- Category: Core runtime and RFC alignment
+- State: authority correction complete; validation candidate attachment and
+  session producer remain disconnected
+- Content:
+  - corrected the request actor proof to use the configured `1-2` TCP carrier
+    range: slot zero is accepted Product authority while slot one is dormant
+    validation capacity above the configured minimum;
+  - established a separate authenticated candidate fence for a ready dormant
+    slot without changing its immutable scheduler eligibility or admitting it
+    to the ordinary Product attachment set;
+  - retained exact physical carrier instance, `PATH_JOIN` nonce, peer
+    directional availability, and checked generation identity for both
+    accepted and candidate authority;
+  - allowed ordered `PATH_STATUS` updates to invalidate dormant candidate
+    authority while preserving their exclusion from ordinary path selection;
+  - tied every client TCP authenticated-path registration to the exact
+    connection owner's lifetime. Cancellation, actor exit, connection
+    replacement, and local failure therefore retire the exact instance and
+    cannot leave a disconnected candidate fence published;
+  - made an explicit management `failed` decision invalidate dormant
+    candidate authority for the same established failure cooldown used by
+    active members, after which maintenance restores only a newly generated
+    suspect candidate fence; and
+  - made the actor snapshot require exactly one current, unattached candidate
+    from the requested TCP carrier group. It no longer incorrectly requires
+    that candidate to be an already accepted carrier.
+- Evidence:
+  - the durable endpoint-topology regression proves that an authenticated
+    dormant slot remains unschedulable, retains a stable fence across an
+    unchanged status, receives a new fence after withdrawal and restoration,
+    and disappears when its exact connection registration is dropped;
+  - the existing endpoint-management regression now proves failure
+    invalidation and generated restoration for dormant capacity while
+    retaining the established disabled/enabled behavior;
+  - the actor snapshot/install regression now uses the real `1-2` expansion
+    case and proves that a candidate withdrawal between snapshot and install
+    produces `WITHDRAWN(FenceChanged)`;
+  - the retained-carrier integration test passed after connection-lifetime
+    ownership moved to the exact registration guard;
+  - focused TCP-service tests passed: 19;
+  - the complete root library suite passed: 1,420 tests; and
+  - formatting and whitespace checks passed. No parameter, timer, carrier
+    establishment, Product placement, or performance policy changed, and no
+    new performance verdict is claimed.

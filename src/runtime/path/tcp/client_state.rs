@@ -16,7 +16,7 @@ use crate::protocol::path_capacity::{CapacityReceiveTracker, PathCapacityReceive
 use crate::protocol::{PathId, PathMetricDirection, PathMetrics, SessionId};
 use crate::runtime::path::commands::TcpCapacityProbeCommand;
 use crate::runtime::path::proof::PathProofTracker;
-use crate::runtime::path::state::ClientPathState;
+use crate::runtime::path::state::{ClientAuthenticatedPathRegistration, ClientPathState};
 use crate::runtime::peer_status::{PeerStatusBroker, PeerStatusCarrier, PeerStatusSnapshotSource};
 use crate::scheduler::PathSnapshot;
 use crate::transport::PathSpec;
@@ -26,6 +26,7 @@ use std::sync::Arc;
 use std::time::Instant;
 
 pub(super) struct ClientTcpPathConnection {
+    _path_registration: ClientAuthenticatedPathRegistration,
     pub(super) path_instance_id: CarrierPathInstanceId,
     pub(super) startup_snapshot: PathSnapshot,
     pub(super) startup_metrics: PathMetrics,
@@ -37,6 +38,7 @@ pub(super) struct ClientTcpPathConnection {
 
 impl ClientTcpPathConnection {
     pub(super) fn new(
+        path_registration: ClientAuthenticatedPathRegistration,
         path_instance_id: CarrierPathInstanceId,
         startup_snapshot: PathSnapshot,
         startup_metrics: PathMetrics,
@@ -45,6 +47,7 @@ impl ClientTcpPathConnection {
         mux_limits: MuxLimits,
     ) -> Self {
         Self {
+            _path_registration: path_registration,
             path_instance_id,
             startup_snapshot,
             startup_metrics,

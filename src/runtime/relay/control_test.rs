@@ -145,7 +145,7 @@ async fn client_ack_extent_rejection_precedes_all_transaction_mutation() {
 #[tokio::test]
 async fn request_tcp_service_install_requires_the_exact_actor_snapshot() {
     let stream_id = StreamId(902);
-    let path = "tcp://127.0.0.1:10902?tcp-carriers=2-2"
+    let path = "tcp://127.0.0.1:10902?tcp-carriers=1-2"
         .parse::<PathSpec>()
         .expect("bounded TCP carrier group");
     let context = ClientPathContext::new(vec![path], test_security(), ResourceLimits::default())
@@ -192,7 +192,7 @@ async fn request_tcp_service_install_requires_the_exact_actor_snapshot() {
         PathUsage::Available,
     );
     let candidate = context
-        .current_request_tcp_service_carrier(RelayPathKey {
+        .current_request_tcp_service_candidate(RelayPathKey {
             underlay: UnderlayProtocol::Tcp,
             index: 1,
         })

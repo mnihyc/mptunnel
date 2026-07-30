@@ -131,6 +131,82 @@ fn tcp_endpoint_topology_preserves_configured_primaries_and_dormant_capacity() {
         [0, 1, 4]
     );
 
+    let dormant_instance = next_carrier_path_instance_id();
+    let dormant_registration = context.state.register_authenticated_path(
+        UnderlayProtocol::Tcp,
+        2,
+        PathId(12),
+        AuthNonce([12; 16]),
+        dormant_instance,
+        0,
+        PathUsage::Available,
+    );
+    let dormant_key = RelayPathKey {
+        underlay: UnderlayProtocol::Tcp,
+        index: 2,
+    };
+    assert_eq!(
+        context.current_request_tcp_service_carrier(dormant_key),
+        None,
+        "dormant capacity must remain absent from accepted Product scheduling"
+    );
+    let candidate = context
+        .current_request_tcp_service_candidate(dormant_key)
+        .expect("authenticated dormant capacity is validation-candidate authority");
+    assert!(context.state.update_peer_path_usage(
+        UnderlayProtocol::Tcp,
+        2,
+        dormant_instance,
+        1,
+        PathUsage::Available,
+    ));
+    assert_eq!(
+        context
+            .current_request_tcp_service_candidate(dormant_key)
+            .expect("unchanged candidate authority")
+            .eligibility_generation,
+        candidate.eligibility_generation,
+        "an unchanged peer preference must not advance the candidate fence"
+    );
+    assert!(context.state.update_peer_path_usage(
+        UnderlayProtocol::Tcp,
+        2,
+        dormant_instance,
+        2,
+        PathUsage::Backup,
+    ));
+    assert_eq!(
+        context.current_request_tcp_service_candidate(dormant_key),
+        None,
+        "peer withdrawal must invalidate dormant validation authority"
+    );
+    assert!(context.state.update_peer_path_usage(
+        UnderlayProtocol::Tcp,
+        2,
+        dormant_instance,
+        3,
+        PathUsage::Available,
+    ));
+    assert!(
+        context
+            .current_request_tcp_service_candidate(dormant_key)
+            .expect("restored candidate authority")
+            .eligibility_generation
+            > candidate.eligibility_generation
+    );
+    assert!(
+        context
+            .reserve_relay_path_load(dormant_key, TrafficClass::Throughput)
+            .is_none(),
+        "candidate authority must not make a dormant slot schedulable"
+    );
+    drop(dormant_registration);
+    assert_eq!(
+        context.current_request_tcp_service_candidate(dormant_key),
+        None,
+        "carrier-owner retirement must remove dormant candidate authority"
+    );
+
     let bounded_resources = ResourceLimits {
         max_paths: 2,
         ..ResourceLimits::default()

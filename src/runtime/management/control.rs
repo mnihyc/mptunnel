@@ -202,12 +202,23 @@ fn set_client_path_state(
             .expect("validated path runtime state");
         record.invalidate_path_proofs();
         if !record.is_locally_eligible() {
-            record.set_managed_path_state(
-                state == PathControlState::Disabled,
-                SchedulerPathState::Draining,
-                None,
-                state == PathControlState::Disabled,
-            );
+            match state {
+                PathControlState::Enabled | PathControlState::Suspect => {
+                    record.set_managed_path_state(false, SchedulerPathState::Draining, None, false);
+                }
+                PathControlState::Failed => {
+                    let failed_until = now + path_record_failure_cooldown(record);
+                    record.set_managed_path_state(
+                        false,
+                        SchedulerPathState::Failed,
+                        Some(failed_until),
+                        false,
+                    );
+                }
+                PathControlState::Disabled => {
+                    record.set_managed_path_state(true, SchedulerPathState::Draining, None, true);
+                }
+            }
             continue;
         }
         match state {

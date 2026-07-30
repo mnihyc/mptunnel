@@ -15,7 +15,6 @@ use crate::config::{ClientPathConfig, ClientSecurityConfig};
 #[cfg(test)]
 use crate::ingress::ProxyAuthConfig;
 use crate::model::path::RelayPathKey;
-use crate::model::tcp_service::TcpServiceCarrierGroupId;
 use crate::mux::MuxLimits;
 use crate::performance::ResourceLimits;
 use crate::product::OutboundId;
@@ -101,41 +100,6 @@ impl ClientPathContext {
         index: usize,
     ) -> Option<crate::protocol::PathUsage> {
         self.state.peer_path_usage(underlay, index)
-    }
-
-    #[cfg(test)]
-    pub(in crate::runtime) fn install_authenticated_path_for_test(
-        &self,
-        underlay: UnderlayProtocol,
-        index: usize,
-        path_id: crate::protocol::PathId,
-        path_join_nonce: crate::protocol::AuthNonce,
-        path_instance_id: crate::model::path::CarrierPathInstanceId,
-        sequence: u64,
-        usage: PathUsage,
-    ) {
-        self.state.install_authenticated_path(
-            underlay,
-            index,
-            path_id,
-            path_join_nonce,
-            path_instance_id,
-            sequence,
-            usage,
-        );
-    }
-
-    #[cfg(test)]
-    pub(in crate::runtime) fn update_peer_path_usage_for_test(
-        &self,
-        underlay: UnderlayProtocol,
-        index: usize,
-        path_instance_id: crate::model::path::CarrierPathInstanceId,
-        sequence: u64,
-        usage: PathUsage,
-    ) -> bool {
-        self.state
-            .update_peer_path_usage(underlay, index, path_instance_id, sequence, usage)
     }
 
     #[cfg(test)]
@@ -503,31 +467,6 @@ impl ClientPathContext {
     ) -> Option<&ClientTcpEndpointTopology> {
         self.tcp_config_index(path_index)
             .and_then(|config_index| self.tcp_endpoint(config_index))
-    }
-
-    /// Returns the session-local TCP carrier-group identity for one slot.
-    ///
-    /// Configured endpoint indices are stable for this context. The wire never
-    /// carries this identity, and zero remains unavailable for checked
-    /// conversion from the zero-based configuration index.
-    pub(in crate::runtime) fn tcp_service_carrier_group_id(
-        &self,
-        path_index: usize,
-    ) -> Option<TcpServiceCarrierGroupId> {
-        let config_index = self.tcp_config_index(path_index)?;
-        let raw = u64::try_from(config_index).ok()?.checked_add(1)?;
-        Some(TcpServiceCarrierGroupId::from_raw(raw))
-    }
-
-    pub(in crate::runtime) fn tcp_service_endpoint(
-        &self,
-        carrier_group_id: TcpServiceCarrierGroupId,
-    ) -> Option<&ClientTcpEndpointTopology> {
-        let config_index = carrier_group_id
-            .raw()
-            .checked_sub(1)
-            .and_then(|index| usize::try_from(index).ok())?;
-        self.tcp_endpoint(config_index)
     }
 
     #[cfg(test)]

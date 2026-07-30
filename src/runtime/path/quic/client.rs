@@ -187,15 +187,7 @@ impl ClientUdpPathSessionHandle {
             .as_ref()
             .is_some_and(|connection| connection.carrier.connection.is_closed())
         {
-            if let Some(connection) = current.take() {
-                self.runtime.state.retire_authenticated_path(
-                    RelayPathKey {
-                        underlay: UnderlayProtocol::Udp,
-                        index: self.runtime.path_index,
-                    },
-                    connection.carrier.path_instance_id,
-                );
-            }
+            current.take();
         }
         if let Some(connection) = current.as_ref() {
             return Ok((connection.carrier.clone(), false));
@@ -209,16 +201,13 @@ impl ClientUdpPathSessionHandle {
     async fn drop_failed_connection(&self) {
         let mut current = self.connection.lock().await;
         if let Some(connection) = current.take() {
-            let key = RelayPathKey {
-                underlay: UnderlayProtocol::Udp,
-                index: self.runtime.path_index,
-            };
-            self.runtime
-                .state
-                .mark_path_instance_data_plane_failure(key, connection.carrier.path_instance_id);
-            self.runtime
-                .state
-                .retire_authenticated_path(key, connection.carrier.path_instance_id);
+            self.runtime.state.mark_path_instance_data_plane_failure(
+                RelayPathKey {
+                    underlay: UnderlayProtocol::Udp,
+                    index: self.runtime.path_index,
+                },
+                connection.carrier.path_instance_id,
+            );
             connection.carrier.connection.close();
         }
     }
@@ -471,14 +460,12 @@ async fn connect_client_udp_path(
 
         // Address retry owns only carrier establishment. Authenticate exactly
         // once so a rejected MPP identity is never retried as a DNS decision.
-        let (path_join_nonce, peer_usage, control_send, control_recv) =
+        let (peer_usage, control_send, control_recv) =
             perform_client_udp_path_handshake(&connection, runtime).await?;
         let path_instance_id = next_carrier_path_instance_id();
-        runtime.state.install_authenticated_path(
+        runtime.state.install_peer_path_usage(
             UnderlayProtocol::Udp,
             runtime.path_index,
-            PathId(runtime.path_index as u16),
-            path_join_nonce,
             path_instance_id,
             0,
             peer_usage,
@@ -645,26 +632,17 @@ fn spawn_client_udp_port_migration(
 async fn perform_client_udp_path_handshake(
     connection: &UdpPathConnection,
     runtime: &ClientUdpPathSessionRuntime,
-) -> Result<
-    (
-        crate::protocol::AuthNonce,
-        PathUsage,
-        UdpPathSendStream,
-        UdpPathRecvStream,
-    ),
-    RuntimeError,
-> {
+) -> Result<(PathUsage, UdpPathSendStream, UdpPathRecvStream), RuntimeError> {
     let (mut send, mut recv) = connection.open_bi().await?;
     send.set_traffic_class(TrafficClass::Control)?;
     let path_id = PathId(runtime.path_index as u16);
-    let authentication = ClientPathAuthenticationFrames::for_session(
+    let [session_hello, session_auth, path_join] = ClientPathAuthenticationFrames::for_session(
         runtime.security(),
         path_id,
         UnderlayProtocol::Udp,
         runtime.session_id,
-    )?;
-    let path_join_nonce = authentication.path_join_nonce();
-    let [session_hello, session_auth, path_join] = authentication.into_array();
+    )?
+    .into_array();
     udp_path_write_frame(&mut send, &session_hello, runtime.codec_limits).await?;
     udp_path_write_frame(&mut send, &session_auth, runtime.codec_limits).await?;
     udp_path_write_frame(&mut send, &path_join, runtime.codec_limits).await?;
@@ -706,7 +684,6 @@ async fn perform_client_udp_path_handshake(
         }
     }
     Ok((
-        path_join_nonce,
         peer_usage.expect("path usage checked before handshake completion"),
         send,
         recv,

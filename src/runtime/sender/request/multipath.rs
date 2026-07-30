@@ -25,29 +25,15 @@ use crate::model::request_evidence::{
     RequestOwnerAckProgress, RequestPathRateEvidenceUpdate, RequestPerFlowRateModel,
     request_path_rate_coverage_floor_bytes,
 };
-use crate::model::tcp_service::{
-    TcpServiceAckRelease, TcpServiceCarrierFence, TcpServiceReleaseKind, TcpServiceStreamFence,
-    TcpServiceWriterLifecycle, TcpServiceWriterPoint,
-};
 use crate::model::timing::reliable_relay_tail_reinjection_delay;
-use crate::model::work::CarrierWorkKind;
 use crate::protocol::frame::{reliable_stream_frame_accounted_bytes, reliable_stream_frame_extent};
 use crate::protocol::{Frame, OffsetRange, StreamId, UnderlayProtocol};
 use crate::runtime::error::RuntimeError;
 use crate::runtime::path::ClientPathContext;
-use crate::runtime::stream::request::{
-    RequestAckClockOperation, RequestObservedPathRelease, RequestStreamState,
-};
-use crate::runtime::stream::{
-    ReliableRelayRemotePath, ReliableRelayRemoteSet, RequestTcpServiceAcceptedBinding,
-};
-use crate::runtime::tcp_service::{
-    TcpServiceFlightSidecarError, TcpServiceObserverRemoval, TcpServicePreparedAck,
-    TcpServiceWriterCoordinator, TcpServiceWriterObserver, TcpServiceWriterTransaction,
-};
+use crate::runtime::stream::request::{RequestAckClockOperation, RequestStreamState};
+use crate::runtime::stream::{ReliableRelayRemotePath, ReliableRelayRemoteSet};
 use crate::scheduler::{self, PathSnapshot, TrafficClass, cyclic_cursor_distance};
 use std::collections::{HashMap, HashSet};
-use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 #[allow(clippy::too_many_arguments)]
@@ -229,227 +215,7 @@ pub(super) struct RequestMultipathController {
     stream_id: StreamId,
     request: RequestStreamState,
     tcp_capacity: RequestTcpCapacityController,
-    pub(super) tcp_service: Option<Box<RequestTcpServiceObserver>>,
     next_send_index: usize,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-struct RequestTcpServiceFlightIdentity {
-    instance: RelayPathInstance,
-    kind: CarrierWorkKind,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(super) struct RequestTcpServiceRecordedCommit {
-    pub(super) stream: TcpServiceStreamFence,
-    pub(super) carrier: TcpServiceCarrierFence,
-    pub(super) range: OffsetRange,
-    pub(super) committed_at: TcpServiceWriterPoint,
-}
-
-#[derive(Debug)]
-pub(super) struct RequestTcpServiceObserver {
-    stream: TcpServiceStreamFence,
-    carriers: Vec<(RelayPathInstance, TcpServiceCarrierFence)>,
-    candidate: TcpServiceCarrierFence,
-    candidate_instance: Option<RelayPathInstance>,
-    writer: TcpServiceWriterObserver<RequestTcpServiceFlightIdentity>,
-    pub(super) coordinator: Arc<TcpServiceWriterCoordinator>,
-    max_flight_records: usize,
-    max_ack_release_records: usize,
-    failure: Option<TcpServiceFlightSidecarError>,
-    failure_reported: bool,
-    pending_ack: Option<TcpServicePreparedAck>,
-}
-
-impl RequestTcpServiceObserver {
-    fn new(
-        stream: TcpServiceStreamFence,
-        carriers: Vec<(RelayPathInstance, TcpServiceCarrierFence)>,
-        candidate: TcpServiceCarrierFence,
-        coordinator: Arc<TcpServiceWriterCoordinator>,
-        max_flight_records: usize,
-        max_ack_release_records: usize,
-    ) -> Result<Self, TcpServiceFlightSidecarError> {
-        if carriers.is_empty()
-            || max_ack_release_records == 0
-            || carriers.iter().any(|(_, carrier)| *carrier == candidate)
-            || carriers
-                .iter()
-                .enumerate()
-                .any(|(index, (instance, carrier))| {
-                    carriers[..index]
-                        .iter()
-                        .any(|(current_instance, current_carrier)| {
-                            current_instance == instance || current_carrier == carrier
-                        })
-                })
-        {
-            return Err(TcpServiceFlightSidecarError::InvalidRelease);
-        }
-        let lifecycle = coordinator.lifecycle();
-        Ok(Self {
-            stream,
-            carriers,
-            candidate,
-            candidate_instance: None,
-            writer: TcpServiceWriterObserver::new(lifecycle, max_flight_records)?,
-            coordinator,
-            max_flight_records,
-            max_ack_release_records,
-            failure: None,
-            failure_reported: false,
-            pending_ack: None,
-        })
-    }
-
-    fn carrier(&self, instance: RelayPathInstance) -> Option<TcpServiceCarrierFence> {
-        self.carriers
-            .iter()
-            .find_map(|(current, carrier)| (*current == instance).then_some(*carrier))
-            .or_else(|| (self.candidate_instance == Some(instance)).then_some(self.candidate))
-    }
-
-    fn fail(
-        &mut self,
-        error: TcpServiceFlightSidecarError,
-        transaction: Option<&mut TcpServiceWriterTransaction<'_>>,
-    ) {
-        self.failure.get_or_insert(error);
-        self.pending_ack = None;
-        let lifecycle = self.writer.lifecycle();
-        self.writer.stop(lifecycle);
-        if let Some(transaction) = transaction
-            && transaction.lifecycle() == lifecycle
-        {
-            transaction.fail(error);
-        }
-    }
-
-    fn observe_commit(
-        &mut self,
-        instance: RelayPathInstance,
-        frame: &Frame,
-        kind: CarrierWorkKind,
-        transaction: &mut TcpServiceWriterTransaction<'_>,
-    ) -> Result<Option<RequestTcpServiceRecordedCommit>, TcpServiceFlightSidecarError> {
-        if self.failure.is_some() || !kind.is_original_transmission() {
-            return Ok(None);
-        }
-        let Some(carrier) = self.carrier(instance) else {
-            return Ok(None);
-        };
-        let Some((start, end, _)) = reliable_stream_frame_extent(frame) else {
-            return Ok(None);
-        };
-        if transaction.lifecycle() != self.writer.lifecycle() {
-            let error = TcpServiceFlightSidecarError::InvalidRelease;
-            self.fail(error, Some(transaction));
-            return Err(error);
-        }
-        let range = OffsetRange { start, end };
-        let committed_at = match self.writer.record_commit(
-            RequestTcpServiceFlightIdentity { instance, kind },
-            range,
-            transaction,
-        ) {
-            Ok(point) => point,
-            Err(error) => {
-                self.fail(error, Some(transaction));
-                return Err(error);
-            }
-        };
-        Ok(Some(RequestTcpServiceRecordedCommit {
-            stream: self.stream,
-            carrier,
-            range,
-            committed_at,
-        }))
-    }
-
-    fn observe_ack(
-        &mut self,
-        releases: &[RequestObservedPathRelease],
-        assigned_end: u64,
-        lifecycle: Option<TcpServiceWriterLifecycle>,
-    ) {
-        if self.failure.is_some() {
-            return;
-        }
-        if lifecycle != Some(self.writer.lifecycle()) {
-            self.fail(TcpServiceFlightSidecarError::InvalidRelease, None);
-            return;
-        }
-        if self.pending_ack.is_some() {
-            self.fail(TcpServiceFlightSidecarError::ResourceLimit, None);
-            return;
-        }
-        let mapped_release_count = releases
-            .iter()
-            .filter(|release| self.carrier(release.instance).is_some())
-            .count();
-        if mapped_release_count > self.max_ack_release_records {
-            self.fail(TcpServiceFlightSidecarError::ResourceLimit, None);
-            return;
-        }
-        let mut observed = Vec::new();
-        if observed.try_reserve(mapped_release_count).is_err() {
-            self.fail(TcpServiceFlightSidecarError::ResourceLimit, None);
-            return;
-        }
-        for release in releases {
-            let Some(carrier) = self.carrier(release.instance) else {
-                continue;
-            };
-            let committed_at = match self.writer.release(
-                RequestTcpServiceFlightIdentity {
-                    instance: release.instance,
-                    kind: release.kind,
-                },
-                release.range,
-            ) {
-                Ok(point) => point,
-                Err(error) => {
-                    self.fail(error, None);
-                    return;
-                }
-            };
-            observed.push(TcpServiceAckRelease {
-                carrier,
-                range: release.range,
-                committed_at,
-                kind: if release.kind.is_original_transmission() {
-                    TcpServiceReleaseKind::Original
-                } else {
-                    TcpServiceReleaseKind::Duplicate
-                },
-                unambiguous: release.unambiguous,
-            });
-        }
-        if observed.is_empty() {
-            return;
-        }
-        self.pending_ack = Some(TcpServicePreparedAck {
-            lifecycle: self.writer.lifecycle(),
-            stream: self.stream,
-            assigned_end,
-            releases: observed,
-        });
-    }
-
-    fn finish_ack(&mut self, transaction: &mut TcpServiceWriterTransaction<'_>) {
-        if let Some(error) = self.failure {
-            self.pending_ack = None;
-            transaction.fail(error);
-            return;
-        }
-        let Some(ack) = self.pending_ack.take() else {
-            return;
-        };
-        if let Err(error) = transaction.commit_ack(ack) {
-            self.fail(error, Some(transaction));
-        }
-    }
 }
 
 impl RequestMultipathController {
@@ -458,7 +224,6 @@ impl RequestMultipathController {
             stream_id,
             request: RequestStreamState::default(),
             tcp_capacity: RequestTcpCapacityController::default(),
-            tcp_service: None,
             next_send_index: 0,
         }
     }
@@ -466,102 +231,6 @@ impl RequestMultipathController {
     #[cfg(feature = "lab-diagnostics")]
     pub(super) fn stream_id(&self) -> StreamId {
         self.stream_id
-    }
-
-    pub(super) fn install_tcp_service_observer(
-        &mut self,
-        stream: TcpServiceStreamFence,
-        carriers: Vec<(RelayPathInstance, TcpServiceCarrierFence)>,
-        candidate: TcpServiceCarrierFence,
-        coordinator: Arc<TcpServiceWriterCoordinator>,
-        max_flight_records: usize,
-        max_ack_release_records: usize,
-    ) -> Result<bool, TcpServiceFlightSidecarError> {
-        if stream.stream_id != self.stream_id {
-            return Err(TcpServiceFlightSidecarError::InvalidRelease);
-        }
-        if let Some(current) = self.tcp_service.as_ref() {
-            if current.writer.lifecycle() == coordinator.lifecycle()
-                && current.stream == stream
-                && current.carriers == carriers
-                && current.candidate == candidate
-                && current.max_flight_records == max_flight_records
-                && current.max_ack_release_records == max_ack_release_records
-                && Arc::ptr_eq(&current.coordinator, &coordinator)
-                && current.failure.is_none()
-                && current.writer.is_observing()
-            {
-                return Ok(false);
-            }
-            return Err(TcpServiceFlightSidecarError::InvalidRelease);
-        }
-        self.tcp_service = Some(Box::new(RequestTcpServiceObserver::new(
-            stream,
-            carriers,
-            candidate,
-            coordinator,
-            max_flight_records,
-            max_ack_release_records,
-        )?));
-        Ok(true)
-    }
-
-    pub(super) fn tcp_service_accepted_set_has_original_flight(
-        &self,
-        accepted: &[RequestTcpServiceAcceptedBinding],
-    ) -> bool {
-        !accepted.is_empty()
-            && accepted.iter().all(|binding| {
-                self.request
-                    .flights
-                    .has_original_transmission_flights_for_instance(binding.instance())
-            })
-    }
-
-    pub(super) fn remove_tcp_service_observer(
-        &mut self,
-        lifecycle: TcpServiceWriterLifecycle,
-    ) -> TcpServiceObserverRemoval {
-        let Some(observer) = self.tcp_service.as_ref() else {
-            return TcpServiceObserverRemoval::AlreadyAbsent;
-        };
-        if observer.writer.lifecycle() != lifecycle {
-            return TcpServiceObserverRemoval::DifferentLifecycle;
-        }
-        let invalidated = self.invalidate_tcp_service_observer();
-        debug_assert!(invalidated);
-        TcpServiceObserverRemoval::Removed
-    }
-
-    pub(super) fn invalidate_tcp_service_observer(&mut self) -> bool {
-        let Some(observer) = self.tcp_service.take() else {
-            return false;
-        };
-        let coordinator = observer.coordinator.clone();
-        let mut transaction = coordinator.lock();
-        debug_assert_eq!(transaction.lifecycle(), observer.writer.lifecycle());
-        transaction.stop();
-        true
-    }
-
-    pub(super) fn finish_tcp_service_ack_active(
-        &mut self,
-        transaction: &mut TcpServiceWriterTransaction<'_>,
-    ) {
-        self.tcp_service
-            .as_mut()
-            .expect("active TCP service ACK has its installed observer")
-            .finish_ack(transaction);
-    }
-
-    pub(super) fn take_tcp_service_failure(&mut self) -> Option<TcpServiceFlightSidecarError> {
-        let observer = self.tcp_service.as_mut()?;
-        if observer.failure_reported {
-            return None;
-        }
-        let failure = observer.failure?;
-        observer.failure_reported = true;
-        Some(failure)
     }
 
     pub(super) fn data_ack_gap_reinjection_model(
@@ -823,57 +492,20 @@ impl RequestMultipathController {
             .collect()
     }
 
-    /// Records one Product publication and makes the reserved carrier command
-    /// visible at the same writer boundary.
-    ///
-    /// The inactive path has one nullable observer branch. The active path
-    /// keeps the shared writer transaction across sidecar provenance,
-    /// permanent flight accounting, and carrier publication, so an ACK cannot
-    /// observe a command before its exact writer point exists.
-    #[inline]
-    pub(super) fn record_and_publish_emitted_frame(
+    pub(super) fn record_emitted_frame(
         &mut self,
         instance: RelayPathInstance,
         frame: &Frame,
         cause: RelaySendCause,
-        publish: impl FnOnce(),
     ) -> usize {
-        match self.tcp_service.as_mut() {
-            Some(observer) => {
-                let coordinator = observer.coordinator.clone();
-                let mut transaction = coordinator.lock();
-                let kind = if cause.is_reinjection() {
-                    CarrierWorkKind::ReinjectedData
-                } else {
-                    CarrierWorkKind::OriginalData
-                };
-                let _recorded_commit =
-                    observer.observe_commit(instance, frame, kind, &mut transaction);
-                let payload_bytes = if cause.is_reinjection() {
-                    self.request
-                        .flights
-                        .record_reinjection_frame_instance(instance, frame)
-                } else {
-                    self.request
-                        .flights
-                        .record_original_frame_instance(instance, frame)
-                };
-                publish();
-                payload_bytes
-            }
-            None => {
-                let payload_bytes = if cause.is_reinjection() {
-                    self.request
-                        .flights
-                        .record_reinjection_frame_instance(instance, frame)
-                } else {
-                    self.request
-                        .flights
-                        .record_original_frame_instance(instance, frame)
-                };
-                publish();
-                payload_bytes
-            }
+        if cause.is_reinjection() {
+            self.request
+                .flights
+                .record_reinjection_frame_instance(instance, frame)
+        } else {
+            self.request
+                .flights
+                .record_original_frame_instance(instance, frame)
         }
     }
 
@@ -971,9 +603,6 @@ impl RequestMultipathController {
     ) -> Result<PreparedRequestMultipathDecision, RuntimeError> {
         if remotes.paths.is_empty() {
             return Err(RuntimeError::ReliablePathSessionClosed);
-        }
-        if remotes.accepted_attachment_incarnation().is_none() {
-            return Err(RuntimeError::StreamAttachmentIdentityExhausted);
         }
         let membership_generation = remotes.membership_generation();
         let unique_data_payload_bytes = (matches!(frame, Frame::StreamData { .. })
@@ -1672,57 +1301,12 @@ impl RequestMultipathController {
     pub(super) fn apply_product_ack(
         &mut self,
         context: &ClientPathContext,
-        remotes: &ReliableRelayRemoteSet,
-        ranges: &[OffsetRange],
-        assigned_end: u64,
-        acked_at: Instant,
-    ) -> smallvec::SmallVec<[RelayPathInstance; 4]> {
-        self.apply_product_ack_inner::<false>(
-            context,
-            remotes,
-            ranges,
-            assigned_end,
-            acked_at,
-            None,
-        )
-    }
-
-    pub(super) fn apply_product_ack_for_tcp_service(
-        &mut self,
-        context: &ClientPathContext,
-        remotes: &ReliableRelayRemoteSet,
-        ranges: &[OffsetRange],
-        assigned_end: u64,
-        acked_at: Instant,
-        lifecycle: TcpServiceWriterLifecycle,
-    ) -> smallvec::SmallVec<[RelayPathInstance; 4]> {
-        self.apply_product_ack_inner::<true>(
-            context,
-            remotes,
-            ranges,
-            assigned_end,
-            acked_at,
-            Some(lifecycle),
-        )
-    }
-
-    fn apply_product_ack_inner<const OBSERVE_TCP_SERVICE: bool>(
-        &mut self,
-        context: &ClientPathContext,
         _remotes: &ReliableRelayRemoteSet,
         ranges: &[OffsetRange],
-        assigned_end: u64,
         acked_at: Instant,
-        tcp_service_lifecycle: Option<TcpServiceWriterLifecycle>,
     ) -> smallvec::SmallVec<[RelayPathInstance; 4]> {
-        let delivered_data = self
-            .release_normalized_acked_ranges_with_delivered_data_at::<OBSERVE_TCP_SERVICE>(
-                context,
-                ranges,
-                assigned_end,
-                acked_at,
-                tcp_service_lifecycle,
-            );
+        let delivered_data =
+            self.release_normalized_acked_ranges_with_delivered_data_at(context, ranges, acked_at);
         let data_ack_progress_paths = delivered_data
             .iter()
             .map(|progress| progress.instance)
@@ -1733,58 +1317,17 @@ impl RequestMultipathController {
         data_ack_progress_paths
     }
 
-    fn release_normalized_acked_ranges_with_delivered_data_at<const OBSERVE_TCP_SERVICE: bool>(
+    fn release_normalized_acked_ranges_with_delivered_data_at(
         &mut self,
         context: &ClientPathContext,
         ranges: &[OffsetRange],
-        assigned_end: u64,
         acked_at: Instant,
-        tcp_service_lifecycle: Option<TcpServiceWriterLifecycle>,
     ) -> smallvec::SmallVec<[RequestOwnerAckProgress<RelayPathInstance>; 4]> {
         let mut ordinary_owner_samples =
             HashMap::<RelayPathInstance, (u64, Instant, Instant)>::new();
         let mut delivered_data =
             smallvec::SmallVec::<[RequestOwnerAckProgress<RelayPathInstance>; 4]>::new();
-        let releases = if OBSERVE_TCP_SERVICE {
-            let observer = self
-                .tcp_service
-                .as_mut()
-                .expect("active TCP service ACK has its installed observer");
-            let mut observed = Vec::new();
-            let mut observation_failed = observed
-                .try_reserve(observer.max_ack_release_records)
-                .is_err();
-            let carriers = &observer.carriers;
-            let candidate_instance = observer.candidate_instance;
-            let max_ack_release_records = observer.max_ack_release_records;
-            let releases = self
-                .request
-                .flights
-                .release_normalized_acked_ranges_observed(ranges, |release| {
-                    if observation_failed
-                        || !(carriers
-                            .iter()
-                            .any(|(instance, _)| *instance == release.instance)
-                            || candidate_instance == Some(release.instance))
-                    {
-                        return;
-                    }
-                    if observed.len() >= max_ack_release_records {
-                        observation_failed = true;
-                        return;
-                    }
-                    observed.push(release);
-                });
-            if observation_failed {
-                observer.fail(TcpServiceFlightSidecarError::ResourceLimit, None);
-            } else {
-                observer.observe_ack(&observed, assigned_end, tcp_service_lifecycle);
-            }
-            releases
-        } else {
-            self.request.flights.release_normalized_acked_ranges(ranges)
-        };
-        for release in releases {
+        for release in self.request.flights.release_normalized_acked_ranges(ranges) {
             self.request.reinjection_attempts.remove(&release.instance);
             context.release_relay_path_inflight(
                 release.instance.key.underlay,

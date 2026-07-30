@@ -3,58 +3,13 @@ use super::super::test_support::{
     opened_test_relay_stream_with_underlay, seed_client_bulk_evidence_for_test,
 };
 use super::*;
-use crate::model::path::CarrierPathInstanceId;
 use crate::model::request_evidence::RequestPerFlowRateModel;
-use crate::model::tcp_service::TcpServiceDataAckEvent;
 use crate::protocol::frame::reliable_stream_frame_extent;
-use crate::protocol::{AuthNonce, PathId, PathMetricDirection, SessionId, TcpCarrierAcceptedPath};
 use crate::runtime::path::commands::{
     recv_reliable_path_command, reliable_path_command_channels, reliable_path_command_pending_bytes,
 };
 use crate::runtime::stream::ReliableRelayRemoteSet;
-use crate::runtime::tcp_service::TcpServiceAckDisposition;
-use crate::runtime::tcp_service::{TcpServiceDataAckSink, TcpServiceObserverRemoval};
 use bytes::Bytes;
-use std::sync::{Arc, Mutex};
-
-#[derive(Debug, Default)]
-struct RecordingTcpServiceAckSink {
-    events: Mutex<Vec<TcpServiceDataAckEvent>>,
-}
-
-impl TcpServiceDataAckSink for RecordingTcpServiceAckSink {
-    fn apply_data_ack(
-        &self,
-        event: TcpServiceDataAckEvent,
-        _now: Instant,
-    ) -> Result<TcpServiceAckDisposition, TcpServiceFlightSidecarError> {
-        self.events.lock().expect("recorded ACK events").push(event);
-        Ok(TcpServiceAckDisposition::Continue)
-    }
-}
-
-fn request_tcp_service_lifecycle(id: u64) -> TcpServiceWriterLifecycle {
-    TcpServiceWriterLifecycle::for_runtime_test(
-        SessionId(77),
-        id,
-        PathMetricDirection::ClientToServer,
-    )
-}
-
-fn request_tcp_service_carrier(
-    path_id: u16,
-    nonce: u8,
-    instance: CarrierPathInstanceId,
-) -> TcpServiceCarrierFence {
-    TcpServiceCarrierFence {
-        accepted: TcpCarrierAcceptedPath {
-            path_id: PathId(path_id),
-            path_join_nonce: AuthNonce([nonce; 16]),
-        },
-        local_instance_id: instance,
-        eligibility_generation: 1,
-    }
-}
 
 fn data_frame(stream_id: StreamId, offset: u64, payload_bytes: usize) -> Frame {
     Frame::StreamData {
@@ -92,223 +47,6 @@ async fn mixed_remote_set() -> (
         .expect("UDP attachment")
         .instance();
     (context, remotes, tcp, udp)
-}
-
-#[tokio::test]
-async fn tcp_service_observer_separates_preinstall_and_active_partial_ack_provenance() {
-    let (context, remotes, tcp, _udp) = mixed_remote_set().await;
-    let stream_id = remotes.stream_id();
-    let lifecycle = request_tcp_service_lifecycle(1);
-    let sink = Arc::new(RecordingTcpServiceAckSink::default());
-    let coordinator = Arc::new(TcpServiceWriterCoordinator::new(lifecycle, sink.clone()));
-    let stream = TcpServiceStreamFence {
-        stream_id,
-        demand_generation: 2,
-        attachment_incarnation: 3,
-        data_ack_horizon_bytes: 1024,
-    };
-    let carrier = request_tcp_service_carrier(0, 9, tcp.path_instance_id);
-    let candidate =
-        request_tcp_service_carrier(1, 19, crate::model::path::next_carrier_path_instance_id());
-    let mut controller = RequestMultipathController::new(stream_id);
-    let preinstall = data_frame(stream_id, 0, 1024);
-    assert_eq!(
-        controller
-            .request
-            .flights
-            .record_original_frame_instance(tcp, &preinstall),
-        1024
-    );
-    assert_eq!(
-        controller.install_tcp_service_observer(
-            stream,
-            vec![(tcp, carrier)],
-            candidate,
-            coordinator.clone(),
-            4,
-            4,
-        ),
-        Ok(true)
-    );
-    {
-        let mut transaction = coordinator.lock();
-        transaction.initial_boundary().expect("initial boundary");
-        assert!(transaction.activate());
-    }
-
-    let frame = data_frame(stream_id, 1024, 3072);
-    assert_eq!(
-        controller
-            .record_and_publish_emitted_frame(tcp, &frame, RelaySendCause::StreamData, || {},),
-        3072
-    );
-    {
-        let mut transaction = coordinator.lock();
-        let progress = controller.apply_product_ack_for_tcp_service(
-            &context,
-            &remotes,
-            &[OffsetRange {
-                start: 0,
-                end: 2048,
-            }],
-            4096,
-            Instant::now(),
-            lifecycle,
-        );
-        assert_eq!(progress.as_slice(), &[tcp]);
-        controller.finish_tcp_service_ack_active(&mut transaction);
-    }
-
-    let events = sink.events.lock().expect("recorded ACK events");
-    assert_eq!(events.len(), 1);
-    let event = &events[0];
-    assert_eq!(event.stream, stream);
-    assert_eq!(event.assigned_end, 4096);
-    assert_eq!(event.releases.len(), 2);
-    assert!(
-        event
-            .releases
-            .iter()
-            .all(|release| release.carrier == carrier)
-    );
-    assert_eq!(
-        event.releases[0].range,
-        OffsetRange {
-            start: 0,
-            end: 1024,
-        }
-    );
-    assert_eq!(
-        event.releases[1].range,
-        OffsetRange {
-            start: 1024,
-            end: 2048,
-        }
-    );
-    assert!(
-        event.releases.iter().all(|release| {
-            release.kind == TcpServiceReleaseKind::Original && release.unambiguous
-        })
-    );
-    assert_eq!(event.releases[0].committed_at, None);
-    assert!(event.releases[1].committed_at.is_some());
-    drop(events);
-
-    let different_lifecycle = request_tcp_service_lifecycle(99);
-    assert_eq!(
-        controller.remove_tcp_service_observer(different_lifecycle),
-        TcpServiceObserverRemoval::DifferentLifecycle
-    );
-    assert!(
-        coordinator.lock().mark_commit().is_ok(),
-        "a stale removal request must not stop current commit authority"
-    );
-    assert_eq!(
-        controller.remove_tcp_service_observer(lifecycle),
-        TcpServiceObserverRemoval::Removed
-    );
-    assert_eq!(
-        coordinator.lock().mark_commit(),
-        Err(TcpServiceFlightSidecarError::ObserverStopped),
-        "matching removal must stop commit authority before dropping the observer"
-    );
-    assert_eq!(
-        controller.remove_tcp_service_observer(lifecycle),
-        TcpServiceObserverRemoval::AlreadyAbsent
-    );
-}
-
-#[tokio::test]
-async fn tcp_service_observation_exhaustion_withdraws_once_without_blocking_ordinary_release() {
-    let (context, remotes, tcp, _udp) = mixed_remote_set().await;
-    let stream_id = remotes.stream_id();
-    let lifecycle = request_tcp_service_lifecycle(2);
-    let sink = Arc::new(RecordingTcpServiceAckSink::default());
-    let coordinator = Arc::new(TcpServiceWriterCoordinator::new(lifecycle, sink.clone()));
-    let stream = TcpServiceStreamFence {
-        stream_id,
-        demand_generation: 4,
-        attachment_incarnation: 5,
-        data_ack_horizon_bytes: 4096,
-    };
-    let tcp_carrier = request_tcp_service_carrier(0, 10, tcp.path_instance_id);
-    let candidate =
-        request_tcp_service_carrier(1, 11, crate::model::path::next_carrier_path_instance_id());
-    let mut controller = RequestMultipathController::new(stream_id);
-    controller
-        .install_tcp_service_observer(
-            stream,
-            vec![(tcp, tcp_carrier)],
-            candidate,
-            coordinator.clone(),
-            4,
-            1,
-        )
-        .expect("bounded observer install");
-    {
-        let mut transaction = coordinator.lock();
-        transaction.initial_boundary().expect("initial boundary");
-        assert!(transaction.activate());
-    }
-    let frame = data_frame(stream_id, 0, 4096);
-    controller.record_and_publish_emitted_frame(tcp, &frame, RelaySendCause::StreamData, || {});
-    controller.record_and_publish_emitted_frame(
-        tcp,
-        &frame,
-        RelaySendCause::AckGapReinjection,
-        || {},
-    );
-    {
-        let mut transaction = coordinator.lock();
-        let progress = controller.apply_product_ack_for_tcp_service(
-            &context,
-            &remotes,
-            &[OffsetRange {
-                start: 0,
-                end: 4096,
-            }],
-            4096,
-            Instant::now(),
-            lifecycle,
-        );
-        assert!(
-            progress.is_empty(),
-            "duplicate delivery does not invent an owner"
-        );
-        controller.finish_tcp_service_ack_active(&mut transaction);
-    }
-    assert!(sink.events.lock().expect("recorded ACK events").is_empty());
-    assert_eq!(
-        controller.take_tcp_service_failure(),
-        Some(TcpServiceFlightSidecarError::ResourceLimit)
-    );
-    assert_eq!(
-        controller.take_tcp_service_failure(),
-        None,
-        "the fail-stop observation is reported once but remains latched"
-    );
-    assert_eq!(
-        controller
-            .tcp_service
-            .as_ref()
-            .and_then(|observer| observer.failure),
-        Some(TcpServiceFlightSidecarError::ResourceLimit)
-    );
-
-    let later = data_frame(stream_id, 4096, 512);
-    assert_eq!(
-        controller
-            .record_and_publish_emitted_frame(tcp, &later, RelaySendCause::StreamData, || {},),
-        512,
-        "accepted traffic remains work-conserving after observation withdrawal"
-    );
-    assert_eq!(
-        controller.latest_unacked_ranges_for_path_instance(tcp),
-        vec![OffsetRange {
-            start: 4096,
-            end: 4608,
-        }]
-    );
 }
 
 #[tokio::test]
@@ -865,7 +603,7 @@ async fn duplicated_product_ack_does_not_invent_exact_path_progress() {
     );
 
     let data_ack_progress_paths =
-        controller.apply_product_ack(&context, &remotes, &[range], end, Instant::now());
+        controller.apply_product_ack(&context, &remotes, &[range], Instant::now());
     assert!(
         data_ack_progress_paths.is_empty(),
         "a Data ACK cannot identify which duplicate delivered the range"
@@ -906,7 +644,6 @@ async fn product_ack_returns_the_exact_path_that_made_progress() {
             start: 0,
             end: payload_bytes as u64,
         }],
-        payload_bytes as u64,
         Instant::now(),
     );
 
@@ -1039,7 +776,6 @@ async fn reinjected_data_ack_clocks_the_next_stale_path_range() {
             start: 0,
             end: 4096,
         }],
-        4096,
         Instant::now(),
     );
 

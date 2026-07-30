@@ -215,13 +215,6 @@ impl ClientPathAuthenticationFrames {
     pub(in crate::runtime) fn into_array(self) -> [Frame; 3] {
         [self.session_hello, self.session_auth, self.path_join]
     }
-
-    pub(in crate::runtime) fn path_join_nonce(&self) -> AuthNonce {
-        let Frame::PathJoin { nonce, .. } = self.path_join else {
-            unreachable!("client path authentication owns a PATH_JOIN frame");
-        };
-        nonce
-    }
 }
 
 /// Pending server authentication after a syntactically valid SESSION_HELLO.

@@ -25,14 +25,6 @@ pub(in crate::runtime) struct RequestPathRelease {
     pub(in crate::runtime) path_proving: bool,
 }
 
-#[derive(Debug, Clone, Copy)]
-pub(in crate::runtime) struct RequestObservedPathRelease {
-    pub(in crate::runtime) instance: RelayPathInstance,
-    pub(in crate::runtime) range: OffsetRange,
-    pub(in crate::runtime) kind: CarrierWorkKind,
-    pub(in crate::runtime) unambiguous: bool,
-}
-
 #[derive(Debug, Default)]
 pub(in crate::runtime) struct RequestFlightLedger {
     // OriginalData identifies the ordered path; ReinjectedData remains a duplicate.
@@ -80,25 +72,6 @@ impl RequestFlightLedger {
         &mut self,
         ranges: &[OffsetRange],
     ) -> Vec<RequestPathRelease> {
-        self.release_normalized_acked_ranges_inner::<false, _>(ranges, |_| {})
-    }
-
-    pub(in crate::runtime) fn release_normalized_acked_ranges_observed(
-        &mut self,
-        ranges: &[OffsetRange],
-        observe: impl FnMut(RequestObservedPathRelease),
-    ) -> Vec<RequestPathRelease> {
-        self.release_normalized_acked_ranges_inner::<true, _>(ranges, observe)
-    }
-
-    fn release_normalized_acked_ranges_inner<
-        const OBSERVE: bool,
-        F: FnMut(RequestObservedPathRelease),
-    >(
-        &mut self,
-        ranges: &[OffsetRange],
-        mut observe: F,
-    ) -> Vec<RequestPathRelease> {
         if ranges.is_empty() || self.flights.is_empty() {
             return Vec::new();
         }
@@ -121,29 +94,13 @@ impl RequestFlightLedger {
                 if bytes == 0 {
                     continue;
                 }
-                let original = flight.kind.is_original_transmission();
-                let unambiguous = if OBSERVE || original {
-                    !flight_intervals_overlap(&ambiguous_intervals, acked_start, acked_end)
-                } else {
-                    false
-                };
-                if OBSERVE {
-                    observe(RequestObservedPathRelease {
-                        instance: flight.instance,
-                        range: OffsetRange {
-                            start: acked_start,
-                            end: acked_end,
-                        },
-                        kind: flight.kind,
-                        unambiguous,
-                    });
-                }
                 released.push(RequestPathRelease {
                     instance: flight.instance,
                     bytes,
                     sent_at: flight.sent_at,
                     elapsed: now.saturating_duration_since(flight.sent_at),
-                    path_proving: original && unambiguous,
+                    path_proving: flight.kind.is_original_transmission()
+                        && !flight_intervals_overlap(&ambiguous_intervals, acked_start, acked_end),
                 });
             }
             for (retained_start, retained_end) in split.retained {

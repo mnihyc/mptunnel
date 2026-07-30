@@ -373,13 +373,13 @@ pub(super) async fn run_client_tcp_path_session(
                 .as_ref()
                 .expect("connected TCP path being retired")
                 .path_instance_id;
-            let key = RelayPathKey {
-                underlay: UnderlayProtocol::Tcp,
-                index: runtime.path_index,
-            };
-            runtime
-                .state
-                .mark_path_instance_data_plane_failure(key, path_instance_id);
+            runtime.state.mark_path_instance_data_plane_failure(
+                RelayPathKey {
+                    underlay: UnderlayProtocol::Tcp,
+                    index: runtime.path_index,
+                },
+                path_instance_id,
+            );
             state.connection = None;
         }
     }
@@ -569,7 +569,7 @@ async fn connect_client_tcp_path(
         PathId(runtime.path_index as u16),
         PathMetricDirection::ClientToServer,
     );
-    let (carrier, path_join_nonce) = connect_client_tcp_carrier(
+    let carrier = connect_client_tcp_carrier(
         ClientTcpCarrierConnect {
             path: runtime.path(),
             path_index: runtime.path_index,
@@ -585,11 +585,9 @@ async fn connect_client_tcp_path(
     )
     .await?;
     let path_instance_id = next_carrier_path_instance_id();
-    let path_registration = runtime.state.register_authenticated_path(
+    runtime.state.install_peer_path_usage(
         UnderlayProtocol::Tcp,
         runtime.path_index,
-        PathId(runtime.path_index as u16),
-        path_join_nonce,
         path_instance_id,
         carrier.peer_usage_sequence,
         carrier.peer_usage,
@@ -597,7 +595,6 @@ async fn connect_client_tcp_path(
     startup_snapshot.peer_usage = Some(carrier.peer_usage);
     let peer_status = runtime.peer_status.register(runtime.session_id);
     Ok(ClientTcpPathConnection::new(
-        path_registration,
         path_instance_id,
         startup_snapshot,
         startup_metrics,

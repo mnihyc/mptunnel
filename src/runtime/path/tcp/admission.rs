@@ -98,13 +98,6 @@ impl ClientTcpPathAuthentication {
     pub(in crate::runtime) fn into_parts(self) -> ([u8; TCP_ADMISSION_PRELUDE_LEN], Frame) {
         (self.prelude, self.path_join)
     }
-
-    pub(in crate::runtime) fn path_join_nonce(&self) -> AuthNonce {
-        let Frame::PathJoin { nonce, .. } = &self.path_join else {
-            unreachable!("client TCP authentication always owns PATH_JOIN");
-        };
-        *nonce
-    }
 }
 
 pub(in crate::runtime) fn authenticate_prelude(

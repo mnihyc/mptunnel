@@ -5,12 +5,10 @@
 use super::ResponseStreamBinding;
 use super::ack_clock::apply_response_ack_clock_release_samples;
 use super::attachment::{ResponseDispatchTarget, ResponseStreamOutputs};
-use super::tcp_service::{ResponseObservedPathRelease, ResponseTcpServiceOutputIdentity};
 #[cfg(feature = "lab-diagnostics")]
 use crate::lab_diagnostics::lab_diagnostic;
 use crate::model::path::CarrierPathKey;
 use crate::model::response::CarrierPathFlightDebt;
-use crate::model::tcp_service::TcpServiceWriterLifecycle;
 use crate::model::work::{
     CarrierWorkKind, ambiguous_flight_intervals, flight_interval_bytes, flight_intervals_overlap,
     split_flight_interval_by_ack,
@@ -21,7 +19,6 @@ use crate::protocol::frame::{
 use crate::protocol::{Frame, OffsetRange, UnderlayProtocol};
 use crate::runtime::RuntimeError;
 use crate::runtime::path::commands::ReliablePathCommandSender;
-use crate::runtime::tcp_service::TcpServiceFlightSidecarError;
 use crate::scheduler::{PathSnapshot, TrafficClass};
 use std::collections::{BTreeMap, HashMap};
 use std::sync::atomic::Ordering;
@@ -405,35 +402,10 @@ impl ResponseStreamBinding {
     }
 
     pub(in crate::runtime) fn release_normalized_acked_ranges(&self, ranges: &[OffsetRange]) {
-        self.release_normalized_acked_ranges_inner::<false>(ranges, 0, None, Instant::now())
+        self.release_normalized_acked_ranges_at(ranges, Instant::now())
     }
 
     pub(super) fn release_normalized_acked_ranges_at(&self, ranges: &[OffsetRange], now: Instant) {
-        self.release_normalized_acked_ranges_inner::<false>(ranges, 0, None, now)
-    }
-
-    pub(in crate::runtime) fn release_normalized_acked_ranges_for_tcp_service(
-        &self,
-        ranges: &[OffsetRange],
-        assigned_end: u64,
-        lifecycle: TcpServiceWriterLifecycle,
-        now: Instant,
-    ) {
-        self.release_normalized_acked_ranges_inner::<true>(
-            ranges,
-            assigned_end,
-            Some(lifecycle),
-            now,
-        )
-    }
-
-    fn release_normalized_acked_ranges_inner<const OBSERVE_TCP_SERVICE: bool>(
-        &self,
-        ranges: &[OffsetRange],
-        assigned_end: u64,
-        lifecycle: Option<TcpServiceWriterLifecycle>,
-        now: Instant,
-    ) {
         if ranges.is_empty() {
             return;
         }
@@ -445,32 +417,7 @@ impl ResponseStreamBinding {
             .flights
             .lock()
             .expect("server reliable stream flight lock");
-        let released = if OBSERVE_TCP_SERVICE {
-            let Some(limit) = outputs.tcp_service_ack_release_limit() else {
-                return;
-            };
-            let mut observed = Vec::new();
-            let mut observation_failed = observed.try_reserve(limit).is_err();
-            let released =
-                release_carrier_path_flight_ranges_observed(&mut flights, ranges, |release| {
-                    if observation_failed || !outputs.tcp_service_observes_output(release.output) {
-                        return;
-                    }
-                    if observed.len() >= limit {
-                        observation_failed = true;
-                        return;
-                    }
-                    observed.push(release);
-                });
-            if observation_failed {
-                outputs.fail_tcp_service_observer(TcpServiceFlightSidecarError::ResourceLimit);
-            } else {
-                outputs.observe_tcp_service_ack(&observed, assigned_end, lifecycle);
-            }
-            released
-        } else {
-            release_carrier_path_flight_ranges(&mut flights, ranges)
-        };
+        let released = release_carrier_path_flight_ranges(&mut flights, ranges);
         if released.is_empty() {
             drop(flights);
             let ordering_update = self
@@ -922,22 +869,6 @@ pub(in crate::runtime::stream) fn release_carrier_path_flight_ranges(
     flights: &mut BTreeMap<u64, Vec<CarrierPathFlight>>,
     ranges: &[OffsetRange],
 ) -> Vec<(u64, CarrierPathReleasedFlight)> {
-    release_carrier_path_flight_ranges_impl::<false>(flights, ranges, |_| {})
-}
-
-pub(super) fn release_carrier_path_flight_ranges_observed(
-    flights: &mut BTreeMap<u64, Vec<CarrierPathFlight>>,
-    ranges: &[OffsetRange],
-    observe: impl FnMut(ResponseObservedPathRelease),
-) -> Vec<(u64, CarrierPathReleasedFlight)> {
-    release_carrier_path_flight_ranges_impl::<true>(flights, ranges, observe)
-}
-
-fn release_carrier_path_flight_ranges_impl<const OBSERVE: bool>(
-    flights: &mut BTreeMap<u64, Vec<CarrierPathFlight>>,
-    ranges: &[OffsetRange],
-    mut observe: impl FnMut(ResponseObservedPathRelease),
-) -> Vec<(u64, CarrierPathReleasedFlight)> {
     if ranges.is_empty() || flights.is_empty() {
         return Vec::new();
     }
@@ -961,27 +892,6 @@ fn release_carrier_path_flight_ranges_impl<const OBSERVE: bool>(
             if bytes == 0 {
                 continue;
             }
-            let path_evidence_candidate =
-                flight.evidence_eligible && flight.kind.is_original_transmission();
-            let unambiguous = if OBSERVE || path_evidence_candidate {
-                !flight_intervals_overlap(&ambiguous_intervals, acked_start, acked_end)
-            } else {
-                false
-            };
-            if OBSERVE {
-                observe(ResponseObservedPathRelease {
-                    output: ResponseTcpServiceOutputIdentity {
-                        key: flight.key,
-                        output_incarnation: flight.output_incarnation,
-                    },
-                    range: OffsetRange {
-                        start: acked_start,
-                        end: acked_end,
-                    },
-                    kind: flight.kind,
-                    unambiguous,
-                });
-            }
             released.push((
                 acked_start,
                 CarrierPathReleasedFlight {
@@ -990,7 +900,9 @@ fn release_carrier_path_flight_ranges_impl<const OBSERVE: bool>(
                         bytes,
                         ..flight
                     },
-                    path_proving: path_evidence_candidate && unambiguous,
+                    path_proving: flight.evidence_eligible
+                        && flight.kind.is_original_transmission()
+                        && !flight_intervals_overlap(&ambiguous_intervals, acked_start, acked_end),
                 },
             ));
         }

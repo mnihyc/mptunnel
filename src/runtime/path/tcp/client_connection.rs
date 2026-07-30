@@ -9,7 +9,7 @@ use super::metrics::TcpMetricPublisher;
 use crate::config::ClientSecurityConfig;
 use crate::mux::MuxLimits;
 use crate::protocol::codec::CodecLimits;
-use crate::protocol::{AuthNonce, CloseReason, Frame, PathId, PathUsage, SessionId};
+use crate::protocol::{CloseReason, Frame, PathId, PathUsage, SessionId};
 use crate::runtime::error::RuntimeError;
 use crate::runtime::identity::random_u64;
 use crate::runtime::path::commands::reliable_path_writer_frame_queue;
@@ -130,7 +130,7 @@ impl ClientTcpCarrierConnection {
 pub(in crate::runtime) async fn connect_client_tcp_carrier(
     request: ClientTcpCarrierConnect<'_>,
     open_deadline: tokio::time::Instant,
-) -> Result<(ClientTcpCarrierConnection, AuthNonce), RuntimeError> {
+) -> Result<ClientTcpCarrierConnection, RuntimeError> {
     let ClientTcpCarrierConnect {
         path,
         path_index,
@@ -158,10 +158,9 @@ pub(in crate::runtime) async fn connect_client_tcp_carrier(
         let mut framed = EncryptedFramedStream::connect(tcp_stream, tls, codec_limits).await?;
         let path_id = PathId(path_index as u16);
         let tls_exporter = framed.tcp_admission_exporter()?;
-        let authentication =
-            ClientTcpPathAuthentication::for_session(security, path_id, session_id, &tls_exporter)?;
-        let path_join_nonce = authentication.path_join_nonce();
-        let (admission_prelude, path_join) = authentication.into_parts();
+        let (admission_prelude, path_join) =
+            ClientTcpPathAuthentication::for_session(security, path_id, session_id, &tls_exporter)?
+                .into_parts();
 
         let readiness_started_at = Instant::now();
         framed
@@ -214,24 +213,21 @@ pub(in crate::runtime) async fn connect_client_tcp_carrier(
 
         let (reader, writer) = framed.split()?;
         let now = tokio::time::Instant::now();
-        Ok((
-            ClientTcpCarrierConnection {
-                writer,
-                frames: spawn_encrypted_tcp_reader(
-                    reader,
-                    reliable_path_writer_frame_queue(mux_limits),
-                ),
-                heartbeat_interval: mux_limits.tcp_path_heartbeat_interval,
-                heartbeat_timeout: mux_limits.tcp_path_heartbeat_timeout,
-                next_heartbeat_at: now + mux_limits.tcp_path_heartbeat_interval,
-                pending_heartbeat: None,
-                tcp_metrics,
-                peer_usage_sequence: 0,
-                peer_usage: peer_usage.expect("path usage checked before carrier creation"),
-                readiness_rtt,
-            },
-            path_join_nonce,
-        ))
+        Ok(ClientTcpCarrierConnection {
+            writer,
+            frames: spawn_encrypted_tcp_reader(
+                reader,
+                reliable_path_writer_frame_queue(mux_limits),
+            ),
+            heartbeat_interval: mux_limits.tcp_path_heartbeat_interval,
+            heartbeat_timeout: mux_limits.tcp_path_heartbeat_timeout,
+            next_heartbeat_at: now + mux_limits.tcp_path_heartbeat_interval,
+            pending_heartbeat: None,
+            tcp_metrics,
+            peer_usage_sequence: 0,
+            peer_usage: peer_usage.expect("path usage checked before carrier creation"),
+            readiness_rtt,
+        })
     };
     tokio::time::timeout_at(open_deadline, connect)
         .await

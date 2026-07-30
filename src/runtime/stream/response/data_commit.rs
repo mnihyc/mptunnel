@@ -9,7 +9,6 @@ use super::attachment::{ResponseDispatchTarget, ResponseStreamOutputEntry};
 use crate::protocol::Frame;
 use crate::protocol::frame::reliable_stream_frame_extent;
 use crate::runtime::RuntimeError;
-use crate::runtime::tcp_service::TcpServiceWriterTransaction;
 use crate::scheduler::TrafficClass;
 use std::sync::atomic::Ordering;
 
@@ -20,40 +19,6 @@ impl ResponseStreamBinding {
         frame: &Frame,
         lane: TrafficClass,
         expected_model_generation: u64,
-    ) -> Result<(), RuntimeError> {
-        self.try_enqueue_data_frame_for_dispatch_target_inner::<false>(
-            target,
-            frame,
-            lane,
-            expected_model_generation,
-            None,
-        )
-    }
-
-    pub(in crate::runtime) fn try_enqueue_data_frame_for_dispatch_target_with_tcp_service(
-        &self,
-        target: &ResponseDispatchTarget,
-        frame: &Frame,
-        lane: TrafficClass,
-        expected_model_generation: u64,
-        tcp_service: &mut TcpServiceWriterTransaction<'_>,
-    ) -> Result<(), RuntimeError> {
-        self.try_enqueue_data_frame_for_dispatch_target_inner::<true>(
-            target,
-            frame,
-            lane,
-            expected_model_generation,
-            Some(tcp_service),
-        )
-    }
-
-    fn try_enqueue_data_frame_for_dispatch_target_inner<const OBSERVE_TCP_SERVICE: bool>(
-        &self,
-        target: &ResponseDispatchTarget,
-        frame: &Frame,
-        lane: TrafficClass,
-        expected_model_generation: u64,
-        tcp_service: Option<&mut TcpServiceWriterTransaction<'_>>,
     ) -> Result<(), RuntimeError> {
         if !self.response_stream_open.load(Ordering::Acquire)
             || reliable_stream_frame_extent(frame).is_none()
@@ -88,10 +53,6 @@ impl ResponseStreamBinding {
         // STREAM_DATA carries an explicit offset, so independent streams may
         // retain their traffic-class priority without changing byte ordering.
         let command = target_commands.try_reserve_admitted_frame(frame.clone(), lane)?;
-        if OBSERVE_TCP_SERVICE {
-            let _recorded_commit =
-                outputs.observe_tcp_service_commit(target_index, frame, tcp_service);
-        }
         self.record_validated_original_flight_with_outputs(&mut outputs, target_index, frame);
         command.commit();
         Ok(())

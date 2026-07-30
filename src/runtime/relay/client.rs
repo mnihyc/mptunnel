@@ -15,18 +15,17 @@ use super::lifecycle::{RelayAdditionalPathOpenTask, maybe_mark_live_relay_path_d
 use crate::lab_diagnostics::{lab_diagnostic, lab_perf_record};
 use crate::model::capacity::adaptive_reliable_relay_reinjection_bytes;
 use crate::model::path::{RelayPathInstance, RelayPathKey};
-use crate::model::tcp_service::{TcpServiceWithdrawalReason, TcpServiceWriterLifecycle};
 use crate::model::timing::{
     reliable_data_ack_recovery_deadline, reliable_data_retransmission_interval,
 };
 use crate::model::work::reliable_critical_tail_reinjection_limit_bytes;
 use crate::mux::stream::{ReceiveOutcome, ReliableRecvStream, ReliableSendStream, StreamError};
-use crate::protocol::{OffsetRange, StreamDemandHint, StreamId};
+use crate::protocol::{OffsetRange, StreamId};
 use crate::runtime::error::RuntimeError;
 use crate::runtime::path::{ClientPathContext, PathDeliveryStats};
 use crate::runtime::sender::{RelaySendCause, ReliableRelaySenderQueue, RequestSenderService};
 use crate::runtime::stream::{ReliableRecvProgress, ReliableRelayRemoteSet};
-use crate::scheduler::{PathSnapshot, TrafficClass, stream_demand_hint_for_traffic_class};
+use crate::scheduler::{PathSnapshot, TrafficClass};
 use bytes::Bytes;
 use std::collections::{HashMap, HashSet};
 use std::time::Instant;
@@ -64,46 +63,6 @@ pub(super) struct ClientRelayRecoveryState {
     pub(super) pending_additional_path_opens: HashMap<RelayPathKey, RelayAdditionalPathOpenTask>,
     pub(super) excluded_paths: HashSet<RelayPathKey>,
     pub(super) disconnected: Option<ClientRelayDisconnectedState>,
-}
-
-/// Request-direction demand identity owned by the serialized relay actor.
-///
-/// Queue progress, ACKs, polling, and reinjection never advance this identity.
-/// Only the RFC demand class or Product open state may change it.
-pub(super) struct ClientRequestTcpServiceDemand {
-    demand: StreamDemandHint,
-    local_open: bool,
-    generation: Option<u64>,
-}
-
-impl ClientRequestTcpServiceDemand {
-    fn new() -> Self {
-        Self {
-            demand: StreamDemandHint::Latency,
-            local_open: true,
-            generation: Some(1),
-        }
-    }
-
-    fn refresh(&mut self, demand: StreamDemandHint, local_open: bool) -> bool {
-        if self.demand == demand && self.local_open == local_open {
-            return false;
-        }
-        self.demand = demand;
-        self.local_open = local_open;
-        self.generation = self
-            .generation
-            .and_then(|generation| generation.checked_add(1));
-        true
-    }
-
-    fn throughput_generation(&self) -> Result<u64, TcpServiceWithdrawalReason> {
-        if !self.local_open || self.demand != StreamDemandHint::Throughput {
-            return Err(TcpServiceWithdrawalReason::DemandEnded);
-        }
-        self.generation
-            .ok_or(TcpServiceWithdrawalReason::ResourceLimit)
-    }
 }
 
 /// Break-before-make state for one already-established logical stream.
@@ -174,7 +133,6 @@ impl ClientRelayDeliveryState {
 /// only the serialized relay actor mutates this value.
 pub(super) struct ClientRelayState {
     pub(super) endpoint: ClientRelayEndpointState,
-    pub(super) request_tcp_service_demand: ClientRequestTcpServiceDemand,
     pub(super) progress: ClientRelayProgressState,
     pub(super) recovery: ClientRelayRecoveryState,
     pub(super) delivery: ClientRelayDeliveryState,
@@ -192,7 +150,6 @@ impl ClientRelayState {
                 terminal_fin_replayed: false,
                 pending_remote_fin_offset: None,
             },
-            request_tcp_service_demand: ClientRequestTcpServiceDemand::new(),
             progress: ClientRelayProgressState {
                 last_stream_at: now,
                 last_delivery_at: now,
@@ -240,25 +197,9 @@ impl ClientRelayState {
             && recv_stream.reorder_bytes() == 0
     }
 
-    pub(super) fn refresh_request_tcp_service_demand(&mut self, lane: TrafficClass) -> bool {
-        self.request_tcp_service_demand.refresh(
-            stream_demand_hint_for_traffic_class(lane),
-            self.endpoint.local_open,
-        )
-    }
-
-    pub(super) fn request_tcp_service_demand_generation(
-        &self,
-    ) -> Result<u64, TcpServiceWithdrawalReason> {
-        self.request_tcp_service_demand.throughput_generation()
-    }
-
-    pub(super) fn record_local_eof(&mut self) -> bool {
-        let was_open = self.endpoint.local_open;
+    pub(super) fn record_local_eof(&mut self) {
         self.endpoint.local_open = false;
         self.endpoint.pending_local_fin = true;
-        let demand = self.request_tcp_service_demand.demand;
-        was_open && self.request_tcp_service_demand.refresh(demand, false)
     }
 
     pub(super) fn record_local_payload(&mut self, lane: TrafficClass) {
@@ -659,26 +600,6 @@ pub(super) fn apply_client_stream_ack(
     complete: bool,
     ranges: Vec<OffsetRange>,
 ) -> Result<usize, StreamError> {
-    apply_client_stream_ack_inner::<false>(ack_context, stream_id, complete, ranges, None)
-}
-
-pub(super) fn apply_client_stream_ack_for_tcp_service(
-    ack_context: ClientStreamAckContext<'_>,
-    stream_id: StreamId,
-    complete: bool,
-    ranges: Vec<OffsetRange>,
-    lifecycle: TcpServiceWriterLifecycle,
-) -> Result<usize, StreamError> {
-    apply_client_stream_ack_inner::<true>(ack_context, stream_id, complete, ranges, Some(lifecycle))
-}
-
-fn apply_client_stream_ack_inner<const OBSERVE_TCP_SERVICE: bool>(
-    ack_context: ClientStreamAckContext<'_>,
-    stream_id: StreamId,
-    complete: bool,
-    ranges: Vec<OffsetRange>,
-    tcp_service_lifecycle: Option<TcpServiceWriterLifecycle>,
-) -> Result<usize, StreamError> {
     // Capture one immutable assignment horizon before touching any ACK-owned
     // cache, flight, queue, reservation, or recovery evidence.
     let validated_ack = begin_reliable_stream_ack(ack_context.send_stream, complete, ranges)?;
@@ -697,17 +618,8 @@ fn apply_client_stream_ack_inner<const OBSERVE_TCP_SERVICE: bool>(
     let normalized_ranges = validated_ack.ranges();
     #[cfg(feature = "lab-diagnostics")]
     let previous_reinjection_bytes = send_stream.reinjection_bytes();
-    let ack_outcome = if OBSERVE_TCP_SERVICE {
-        sender.apply_request_product_ack_for_tcp_service(
-            context,
-            remotes,
-            send_stream,
-            &validated_ack,
-            tcp_service_lifecycle.expect("active TCP service ACK carries its writer lifecycle"),
-        )?
-    } else {
-        sender.apply_request_product_ack(context, remotes, send_stream, &validated_ack)?
-    };
+    let ack_outcome =
+        sender.apply_request_product_ack(context, remotes, send_stream, &validated_ack)?;
     update_reinjection_authoritative_ack_snapshot(
         &mut state.progress.last_send_ack,
         &validated_ack,

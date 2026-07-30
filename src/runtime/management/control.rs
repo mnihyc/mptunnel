@@ -202,40 +202,32 @@ fn set_client_path_state(
             .expect("validated path runtime state");
         record.invalidate_path_proofs();
         if !record.is_locally_eligible() {
-            match state {
-                PathControlState::Enabled | PathControlState::Suspect => {
-                    record.set_managed_path_state(false, SchedulerPathState::Draining, None, false);
-                }
-                PathControlState::Failed => {
-                    let failed_until = now + path_record_failure_cooldown(record);
-                    record.set_managed_path_state(
-                        false,
-                        SchedulerPathState::Failed,
-                        Some(failed_until),
-                        false,
-                    );
-                }
-                PathControlState::Disabled => {
-                    record.set_managed_path_state(true, SchedulerPathState::Draining, None, true);
-                }
+            record.manual_disabled = state == PathControlState::Disabled;
+            record.state = SchedulerPathState::Draining;
+            record.failed_until = None;
+            if state == PathControlState::Disabled {
+                record.relay_bytes_in_flight = 0;
+                record.relay_queue_bytes = 0;
             }
             continue;
         }
         match state {
             PathControlState::Enabled | PathControlState::Suspect => {
-                record.set_managed_path_state(false, SchedulerPathState::Suspect, None, false);
+                record.manual_disabled = false;
+                record.state = SchedulerPathState::Suspect;
+                record.failed_until = None;
             }
             PathControlState::Failed => {
-                let failed_until = now + path_record_failure_cooldown(record);
-                record.set_managed_path_state(
-                    false,
-                    SchedulerPathState::Failed,
-                    Some(failed_until),
-                    false,
-                );
+                record.manual_disabled = false;
+                record.state = SchedulerPathState::Failed;
+                record.failed_until = Some(now + path_record_failure_cooldown(record));
             }
             PathControlState::Disabled => {
-                record.set_managed_path_state(true, SchedulerPathState::Failed, None, true);
+                record.manual_disabled = true;
+                record.state = SchedulerPathState::Failed;
+                record.failed_until = None;
+                record.relay_bytes_in_flight = 0;
+                record.relay_queue_bytes = 0;
             }
         }
     }

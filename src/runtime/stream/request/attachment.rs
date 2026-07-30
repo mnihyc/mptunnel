@@ -8,16 +8,11 @@ use crate::model::capacity::reliable_relay_buffer_len;
 #[cfg(test)]
 use crate::model::path::next_carrier_path_instance_id;
 use crate::model::path::{CarrierPathInstanceId, RelayPathInstance, RelayPathKey};
-use crate::model::tcp_service::{
-    TcpServiceCarrierFence, TcpServiceCarrierGroupId, TcpServiceStreamFence,
-    TcpServiceWithdrawalReason,
-};
 use crate::mux::MuxLimits;
 use crate::protocol::{Frame, ResetReason, StreamId, UnderlayProtocol};
 use crate::runtime::error::RuntimeError;
 use crate::runtime::path::{ClientPathContext, RelayPathLoadLease};
 use crate::runtime::stream::{ReliablePathStream, ReliablePathStreamHandle};
-use crate::runtime::tcp_service::{RequestTcpServiceControl, RequestTcpServiceSnapshotRequest};
 use crate::scheduler::{PathSnapshot, TrafficClass, path_is_backup, score_path};
 use std::time::Instant;
 use tokio::sync::mpsc;
@@ -159,104 +154,21 @@ pub(in crate::runtime) struct ReliableRelayRemoteFrame {
     pub(in crate::runtime) frame: Result<Frame, RuntimeError>,
 }
 
-/// Exact actor-owned attachment binding for one frozen accepted carrier.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(in crate::runtime) struct RequestTcpServiceAcceptedBinding {
-    instance: RelayPathInstance,
-    carrier: TcpServiceCarrierFence,
-}
-
-impl RequestTcpServiceAcceptedBinding {
-    pub(in crate::runtime) fn instance(self) -> RelayPathInstance {
-        self.instance
-    }
-
-    pub(in crate::runtime) fn carrier(self) -> TcpServiceCarrierFence {
-        self.carrier
-    }
-}
-
-/// Opaque request-stream fence minted only by its attachment owner.
-///
-/// Its private constructor prevents a session controller from fabricating
-/// stream attachment identity. Installation must rederive and compare the
-/// complete value in the same serialized actor.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub(in crate::runtime) struct RequestTcpServiceFrozenStream {
-    carrier_group_id: TcpServiceCarrierGroupId,
-    stream: TcpServiceStreamFence,
-    accepted: Vec<RequestTcpServiceAcceptedBinding>,
-    candidate: TcpServiceCarrierFence,
-    max_accepted_paths: usize,
-}
-
-impl RequestTcpServiceFrozenStream {
-    pub(in crate::runtime) fn snapshot_request(&self) -> RequestTcpServiceSnapshotRequest {
-        RequestTcpServiceSnapshotRequest {
-            carrier_group_id: self.carrier_group_id,
-            candidate: self.candidate,
-            max_accepted_paths: self.max_accepted_paths,
-        }
-    }
-
-    pub(in crate::runtime) fn stream(&self) -> TcpServiceStreamFence {
-        self.stream
-    }
-
-    pub(in crate::runtime) fn accepted(&self) -> &[RequestTcpServiceAcceptedBinding] {
-        &self.accepted
-    }
-
-    pub(in crate::runtime) fn candidate(&self) -> TcpServiceCarrierFence {
-        self.candidate
-    }
-}
-
-pub(in crate::runtime) enum RequestRelayActorEvent {
-    Frame(ReliableRelayRemoteFrame),
-    TcpService(Box<RequestTcpServiceControl>),
-}
-
-#[derive(Debug, Clone)]
-pub(in crate::runtime) struct RequestTcpServiceWriter {
-    events: mpsc::Sender<RequestRelayActorEvent>,
-}
-
-impl RequestTcpServiceWriter {
-    pub(in crate::runtime) async fn send(
-        &self,
-        control: RequestTcpServiceControl,
-    ) -> Result<(), RuntimeError> {
-        self.events
-            .send(RequestRelayActorEvent::TcpService(Box::new(control)))
-            .await
-            .map_err(|_| RuntimeError::ReliablePathSessionClosed)
-    }
-
-    pub(in crate::runtime) fn same_actor(&self, other: &Self) -> bool {
-        self.events.same_channel(&other.events)
-    }
-}
-
 /// Reports whether attachment-set ownership committed; a rejected pending open
 /// rolls back its carrier and scheduler lease when the value is dropped.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(in crate::runtime) enum ReliableRelayAttachOutcome {
     Attached,
     RejectedDuplicate,
-    RejectedResourceLimit,
 }
 
 pub(in crate::runtime) struct ReliableRelayRemoteSet {
     stream_id: StreamId,
     pub(in crate::runtime) paths: Vec<ReliableRelayRemotePath>,
-    events_tx: mpsc::Sender<RequestRelayActorEvent>,
-    events_rx: mpsc::Receiver<RequestRelayActorEvent>,
-    pending_tcp_service_control: Option<Box<RequestTcpServiceControl>>,
-    next_instance_id: Option<u64>,
+    frames_tx: mpsc::Sender<ReliableRelayRemoteFrame>,
+    frames_rx: mpsc::Receiver<ReliableRelayRemoteFrame>,
+    next_instance_id: u64,
     membership_generation: u64,
-    accepted_attachment_incarnation: u64,
-    topology_identity_valid: bool,
 }
 
 impl ReliableRelayRemoteSet {
@@ -266,19 +178,12 @@ impl ReliableRelayRemoteSet {
         let mut set = Self {
             stream_id,
             paths: Vec::new(),
-            events_tx: frames_tx,
-            events_rx: frames_rx,
-            pending_tcp_service_control: None,
-            next_instance_id: Some(1),
-            membership_generation: 1,
-            accepted_attachment_incarnation: 1,
-            topology_identity_valid: true,
+            frames_tx,
+            frames_rx,
+            next_instance_id: 0,
+            membership_generation: 0,
         };
-        assert_eq!(
-            set.attach(opened),
-            ReliableRelayAttachOutcome::Attached,
-            "a newly initialized attachment set must accept its first path"
-        );
+        set.attach(opened);
         set
     }
 
@@ -286,113 +191,8 @@ impl ReliableRelayRemoteSet {
         self.stream_id
     }
 
-    pub(in crate::runtime) fn tcp_service_writer(&self) -> RequestTcpServiceWriter {
-        RequestTcpServiceWriter {
-            events: self.events_tx.clone(),
-        }
-    }
-
     pub(in crate::runtime) fn membership_generation(&self) -> u64 {
         self.membership_generation
-    }
-
-    pub(in crate::runtime) fn accepted_attachment_incarnation(&self) -> Option<u64> {
-        self.topology_identity_valid
-            .then_some(self.accepted_attachment_incarnation)
-    }
-
-    /// Resolves one controller request into exact current stream authority.
-    ///
-    /// Only accepted Product attachments from the requested configured TCP
-    /// group enter the result. Every physical instance, PATH_JOIN nonce, and
-    /// directional eligibility generation is re-read from authenticated path
-    /// state; the candidate must be current and remain unattached.
-    pub(in crate::runtime) fn snapshot_tcp_service_stream(
-        &self,
-        context: &ClientPathContext,
-        request: RequestTcpServiceSnapshotRequest,
-        demand_generation: u64,
-        data_ack_horizon_bytes: u64,
-    ) -> Result<RequestTcpServiceFrozenStream, TcpServiceWithdrawalReason> {
-        if request.max_accepted_paths == 0 || demand_generation == 0 || data_ack_horizon_bytes == 0
-        {
-            return Err(TcpServiceWithdrawalReason::ResourceLimit);
-        }
-        let attachment_incarnation = self
-            .accepted_attachment_incarnation()
-            .ok_or(TcpServiceWithdrawalReason::ResourceLimit)?;
-        let endpoint = context
-            .tcp_service_endpoint(request.carrier_group_id)
-            .ok_or(TcpServiceWithdrawalReason::FenceChanged)?;
-
-        let mut candidate_matches = 0usize;
-        for path_index in &endpoint.members {
-            let key = RelayPathKey {
-                underlay: UnderlayProtocol::Tcp,
-                index: *path_index,
-            };
-            if context.current_request_tcp_service_candidate(key) == Some(request.candidate) {
-                candidate_matches = candidate_matches.saturating_add(1);
-                if self.contains_path_key(key) {
-                    return Err(TcpServiceWithdrawalReason::FenceChanged);
-                }
-            }
-        }
-        if candidate_matches != 1 {
-            return Err(TcpServiceWithdrawalReason::FenceChanged);
-        }
-
-        let accepted_count = self
-            .paths
-            .iter()
-            .filter(|path| {
-                path.key().underlay == UnderlayProtocol::Tcp
-                    && endpoint.members.contains(&path.key().index)
-            })
-            .count();
-        if accepted_count == 0 {
-            return Err(TcpServiceWithdrawalReason::DemandEnded);
-        }
-        if accepted_count > request.max_accepted_paths {
-            return Err(TcpServiceWithdrawalReason::ResourceLimit);
-        }
-        let mut accepted = Vec::new();
-        accepted
-            .try_reserve(accepted_count)
-            .map_err(|_| TcpServiceWithdrawalReason::ResourceLimit)?;
-        for path in self.paths.iter().filter(|path| {
-            path.key().underlay == UnderlayProtocol::Tcp
-                && endpoint.members.contains(&path.key().index)
-        }) {
-            let instance = path.instance();
-            let carrier = context
-                .current_request_tcp_service_carrier(path.key())
-                .filter(|carrier| carrier.local_instance_id == instance.path_instance_id)
-                .ok_or(TcpServiceWithdrawalReason::FenceChanged)?;
-            if carrier == request.candidate {
-                return Err(TcpServiceWithdrawalReason::FenceChanged);
-            }
-            accepted.push(RequestTcpServiceAcceptedBinding { instance, carrier });
-        }
-        accepted.sort_unstable_by_key(|binding| binding.carrier.accepted);
-        if accepted
-            .windows(2)
-            .any(|pair| pair[0].carrier.accepted == pair[1].carrier.accepted)
-        {
-            return Err(TcpServiceWithdrawalReason::FenceChanged);
-        }
-        Ok(RequestTcpServiceFrozenStream {
-            carrier_group_id: request.carrier_group_id,
-            stream: TcpServiceStreamFence {
-                stream_id: self.stream_id,
-                demand_generation,
-                attachment_incarnation,
-                data_ack_horizon_bytes,
-            },
-            accepted,
-            candidate: request.candidate,
-            max_accepted_paths: request.max_accepted_paths,
-        })
     }
 
     /// A selection is valid only for the exact attachment topology it observed.
@@ -401,7 +201,7 @@ impl ReliableRelayRemoteSet {
         generation: u64,
         instance: RelayPathInstance,
     ) -> Option<usize> {
-        if !self.topology_identity_valid || self.membership_generation != generation {
+        if self.membership_generation != generation {
             return None;
         }
         self.paths
@@ -559,29 +359,20 @@ impl ReliableRelayRemoteSet {
         &mut self,
         opened: OpenedRemoteStream,
     ) -> ReliableRelayAttachOutcome {
-        self.attach_opened(opened, true, |_| {})
+        self.attach_opened(opened, true)
     }
 
     pub(in crate::runtime) fn attach_candidate(
         &mut self,
         opened: OpenedRemoteStream,
     ) -> ReliableRelayAttachOutcome {
-        self.attach_candidate_before_commit(opened, |_| {})
-    }
-
-    pub(in crate::runtime) fn attach_candidate_before_commit(
-        &mut self,
-        opened: OpenedRemoteStream,
-        before_membership_commit: impl FnOnce(&Self),
-    ) -> ReliableRelayAttachOutcome {
-        self.attach_opened(opened, false, before_membership_commit)
+        self.attach_opened(opened, false)
     }
 
     fn attach_opened(
         &mut self,
         opened: OpenedRemoteStream,
         retain_open_load: bool,
-        before_membership_commit: impl FnOnce(&Self),
     ) -> ReliableRelayAttachOutcome {
         let path_index = opened.path_index();
         let underlay = opened.stream().underlay;
@@ -592,20 +383,8 @@ impl ReliableRelayRemoteSet {
         if self.contains_path_key(key) {
             return ReliableRelayAttachOutcome::RejectedDuplicate;
         }
-        if !self.topology_identity_valid {
-            return ReliableRelayAttachOutcome::RejectedResourceLimit;
-        }
-        let Some(attachment_id) = self.next_instance_id else {
-            return ReliableRelayAttachOutcome::RejectedResourceLimit;
-        };
-        let Some(next_membership_generation) = self.membership_generation.checked_add(1) else {
-            return ReliableRelayAttachOutcome::RejectedResourceLimit;
-        };
-        let Some(next_attachment_incarnation) = self.accepted_attachment_incarnation.checked_add(1)
-        else {
-            return ReliableRelayAttachOutcome::RejectedResourceLimit;
-        };
-        let next_instance_id = attachment_id.checked_add(1);
+        let attachment_id = self.next_instance_id;
+        self.next_instance_id = self.next_instance_id.wrapping_add(1);
         let path_instance_id = opened.path_instance_id;
         let instance = RelayPathInstance {
             key,
@@ -619,7 +398,7 @@ impl ReliableRelayRemoteSet {
             drop(load_lease.take());
         }
         let (stream, mut frames) = stream.into_handle_and_frames();
-        let events_tx = self.events_tx.clone();
+        let frames_tx = self.frames_tx.clone();
         tokio::spawn(async move {
             let mut product_terminal_received = false;
             while let Some(frame) = frames.recv().await {
@@ -628,11 +407,8 @@ impl ReliableRelayRemoteSet {
                     Ok(Frame::StreamFin { .. } | Frame::StreamReset { .. })
                 );
                 let done = frame.is_err();
-                if events_tx
-                    .send(RequestRelayActorEvent::Frame(ReliableRelayRemoteFrame {
-                        instance,
-                        frame,
-                    }))
+                if frames_tx
+                    .send(ReliableRelayRemoteFrame { instance, frame })
                     .await
                     .is_err()
                     || done
@@ -643,11 +419,11 @@ impl ReliableRelayRemoteSet {
             if product_terminal_received {
                 return;
             }
-            let _ = events_tx
-                .send(RequestRelayActorEvent::Frame(ReliableRelayRemoteFrame {
+            let _ = frames_tx
+                .send(ReliableRelayRemoteFrame {
                     instance,
                     frame: Err(RuntimeError::ReliablePathSessionClosed),
-                }))
+                })
                 .await;
         });
         let mut path = ReliableRelayRemotePath {
@@ -663,21 +439,15 @@ impl ReliableRelayRemoteSet {
         if let Ok(Some(proof_id)) = path.stream.enqueue_path_proof() {
             path.path_proof_id = Some(proof_id);
         }
-        before_membership_commit(self);
         self.paths.push(path);
-        self.next_instance_id = next_instance_id;
-        self.membership_generation = next_membership_generation;
-        self.accepted_attachment_incarnation = next_attachment_incarnation;
+        self.membership_generation = self.membership_generation.wrapping_add(1);
         ReliableRelayAttachOutcome::Attached
     }
 
-    pub(in crate::runtime) async fn recv_event(
+    pub(in crate::runtime) async fn recv_frame(
         &mut self,
-    ) -> Result<RequestRelayActorEvent, RuntimeError> {
-        if let Some(control) = self.pending_tcp_service_control.take() {
-            return Ok(RequestRelayActorEvent::TcpService(control));
-        }
-        self.events_rx
+    ) -> Result<ReliableRelayRemoteFrame, RuntimeError> {
+        self.frames_rx
             .recv()
             .await
             .ok_or(RuntimeError::ReliablePathSessionClosed)
@@ -688,28 +458,16 @@ impl ReliableRelayRemoteSet {
     /// Ready-only receive batching snapshots this value before trying frames so
     /// producers cannot extend one actor turn indefinitely.
     pub(in crate::runtime) fn ready_frame_count(&self) -> usize {
-        self.events_rx
-            .len()
-            .saturating_add(usize::from(self.pending_tcp_service_control.is_some()))
+        self.frames_rx.len()
     }
 
-    /// Takes one already-queued frame without passing a lifecycle boundary.
+    /// Takes one already-queued frame without waiting.
     pub(in crate::runtime) fn try_recv_frame(&mut self) -> Option<ReliableRelayRemoteFrame> {
-        if self.pending_tcp_service_control.is_some() {
-            return None;
-        }
-        match self.events_rx.try_recv() {
-            Ok(RequestRelayActorEvent::Frame(frame)) => Some(frame),
-            Ok(RequestRelayActorEvent::TcpService(control)) => {
-                self.pending_tcp_service_control = Some(control);
-                None
-            }
-            Err(_) => None,
-        }
+        self.frames_rx.try_recv().ok()
     }
 
-    pub(in crate::runtime) fn has_buffered_event(&self) -> bool {
-        self.pending_tcp_service_control.is_some() || !self.events_rx.is_empty()
+    pub(in crate::runtime) fn has_buffered_frame(&self) -> bool {
+        !self.frames_rx.is_empty()
     }
 
     pub(in crate::runtime) async fn close_all(&mut self) {
@@ -739,7 +497,7 @@ impl ReliableRelayRemoteSet {
 
     fn take_paths_for_close(&mut self) -> Vec<ReliableRelayRemotePath> {
         if !self.paths.is_empty() {
-            self.advance_attachment_incarnation();
+            self.membership_generation = self.membership_generation.wrapping_add(1);
         }
         let mut paths = std::mem::take(&mut self.paths);
         // The set stops owning every path as one atomic scheduling event even
@@ -781,25 +539,8 @@ impl ReliableRelayRemoteSet {
         position: usize,
     ) -> Option<ReliableRelayRemotePath> {
         let path = self.paths.remove(position);
-        self.advance_attachment_incarnation();
+        self.membership_generation = self.membership_generation.wrapping_add(1);
         Some(path)
-    }
-
-    fn advance_attachment_incarnation(&mut self) {
-        if !self.topology_identity_valid {
-            return;
-        }
-        let Some(membership_generation) = self.membership_generation.checked_add(1) else {
-            self.topology_identity_valid = false;
-            return;
-        };
-        let Some(attachment_incarnation) = self.accepted_attachment_incarnation.checked_add(1)
-        else {
-            self.topology_identity_valid = false;
-            return;
-        };
-        self.membership_generation = membership_generation;
-        self.accepted_attachment_incarnation = attachment_incarnation;
     }
 
     /// Transfers a pre-enqueue claim after the synchronous queue commit.

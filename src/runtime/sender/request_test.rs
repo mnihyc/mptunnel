@@ -1,10 +1,8 @@
 use super::test_support::*;
 use super::*;
 use crate::config::ResourceLimits;
-use crate::model::path::next_carrier_path_instance_id;
-use crate::model::tcp_service::TcpServiceDataAckEvent;
 use crate::model::work::{ReliableWorkClass, reliable_critical_tail_reinjection_limit_bytes};
-use crate::protocol::{AuthNonce, PathId, PathMetricDirection, SessionId, TcpCarrierAcceptedPath};
+use crate::protocol::{PathId, SessionId};
 use crate::runtime::path::commands::{
     ReliablePathCommand, recv_reliable_path_command, reliable_path_command_channels,
     try_recv_reliable_path_command, try_recv_reliable_path_priority_command,
@@ -12,24 +10,8 @@ use crate::runtime::path::commands::{
 use crate::runtime::sender::response::ServerResponseSenderService;
 use crate::runtime::stream::response::ResponseStreamBinding;
 use crate::runtime::stream::{FixedReliablePathOutput, ReliableRelayRemotePath};
-use crate::runtime::tcp_service::{
-    TcpServiceAckDisposition, TcpServiceDataAckSink, TcpServiceWriterCoordinator,
-};
 use crate::transport::PathSpec;
 use std::sync::Arc;
-
-#[derive(Debug)]
-struct IgnoreTcpServiceAck;
-
-impl TcpServiceDataAckSink for IgnoreTcpServiceAck {
-    fn apply_data_ack(
-        &self,
-        _event: TcpServiceDataAckEvent,
-        _now: Instant,
-    ) -> Result<TcpServiceAckDisposition, TcpServiceFlightSidecarError> {
-        Ok(TcpServiceAckDisposition::Continue)
-    }
-}
 
 #[test]
 fn budgeted_critical_reinjection_preempts_original_data_and_debits_budget() {
@@ -716,53 +698,6 @@ async fn client_path_failure_releases_path_load_before_cleanup_waits() {
         1
     );
     let mut sender = RequestSenderService::new(stream_id);
-    let lifecycle = TcpServiceWriterLifecycle::for_runtime_test(
-        SessionId(124),
-        1,
-        PathMetricDirection::ClientToServer,
-    );
-    let coordinator = Arc::new(TcpServiceWriterCoordinator::new(
-        lifecycle,
-        Arc::new(IgnoreTcpServiceAck),
-    ));
-    let accepted = TcpServiceCarrierFence {
-        accepted: TcpCarrierAcceptedPath {
-            path_id: PathId(0),
-            path_join_nonce: AuthNonce([1; 16]),
-        },
-        local_instance_id: instance.path_instance_id,
-        eligibility_generation: 1,
-    };
-    let candidate = TcpServiceCarrierFence {
-        accepted: TcpCarrierAcceptedPath {
-            path_id: PathId(1),
-            path_join_nonce: AuthNonce([2; 16]),
-        },
-        local_instance_id: next_carrier_path_instance_id(),
-        eligibility_generation: 1,
-    };
-    sender
-        .install_tcp_service_observer(
-            TcpServiceStreamFence {
-                stream_id,
-                demand_generation: 1,
-                attachment_incarnation: remotes
-                    .accepted_attachment_incarnation()
-                    .expect("one accepted attachment"),
-                data_ack_horizon_bytes: 1,
-            },
-            vec![(instance, accepted)],
-            candidate,
-            coordinator.clone(),
-            4,
-            4,
-        )
-        .expect("install active observer");
-    {
-        let mut transaction = coordinator.lock();
-        transaction.initial_boundary().expect("initial boundary");
-        assert!(transaction.activate());
-    }
 
     let task_context = context.clone();
     let failure = tokio::spawn(async move {
@@ -781,11 +716,6 @@ async fn client_path_failure_releases_path_load_before_cleanup_waits() {
     assert!(
         !failure.is_finished(),
         "the full control queue must keep detach cleanup pending for the race assertion"
-    );
-    assert_eq!(
-        coordinator.lock().mark_commit(),
-        Err(TcpServiceFlightSidecarError::ObserverStopped),
-        "path authority must stop before asynchronous detach cleanup"
     );
     assert!(matches!(
         recv_reliable_path_command(&mut receivers).await,

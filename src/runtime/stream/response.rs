@@ -11,7 +11,6 @@ mod diagnostics;
 mod evidence;
 mod session;
 mod snapshot;
-mod tcp_service;
 
 use crate::model::path::{CarrierPathInstanceId, CarrierPathKey, PathPolicy};
 use crate::mux::MuxLimits;
@@ -37,7 +36,6 @@ pub(in crate::runtime) use session::{ServerSessionRegistration, ServerSessionTra
 use std::collections::BTreeMap;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
-pub(in crate::runtime) use tcp_service::ResponseTcpServiceObserverInstall;
 use tokio::sync::watch;
 
 // Reliable-path bindings own attachment instances, exact range flights,
@@ -206,7 +204,6 @@ impl ResponseStreamBinding {
                     path_proof: None,
                 }],
                 data_level_queue_bytes: 0,
-                tcp_service: None,
             }),
             request_feedback_ingress: Mutex::new(Some(RequestFeedbackIngress {
                 key,
@@ -228,12 +225,11 @@ impl ResponseStreamBinding {
 
     fn begin_close(&self) -> Vec<ReliablePathCommandSender> {
         {
-            let mut outputs = self
+            let outputs = self
                 .outputs
                 .lock()
                 .expect("server reliable stream binding lock");
             self.response_stream_open.store(false, Ordering::Release);
-            outputs.stop_tcp_service_observer();
             for entry in outputs.entries.iter().chain(&outputs.detaching) {
                 entry.load_registration.deactivate();
             }

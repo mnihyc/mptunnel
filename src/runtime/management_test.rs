@@ -1,8 +1,6 @@
 use super::*;
 use crate::config::{ClientPathConfig, LocalIngressConfig, ResourceLimits, SharedSecret};
 use crate::ingress::{IngressConfig, LocalProxyUser, ProxyAuthConfig};
-use crate::model::path::{RelayPathKey, next_carrier_path_instance_id};
-use crate::protocol::{AuthNonce, PathId, PathUsage, UnderlayProtocol};
 use crate::runtime::management::snapshot::SessionInventory;
 use crate::runtime::outbound_registry::{
     RuntimeOutboundLeaf, RuntimeOutboundRegistry, test_dns_generation,
@@ -239,23 +237,6 @@ fn enabling_a_path_requires_fresh_liveness_evidence() {
         Some(OutboundId::parse("edge-mpp").expect("outbound")),
     )
     .expect("context");
-    let dormant_instance = next_carrier_path_instance_id();
-    context.install_authenticated_path_for_test(
-        UnderlayProtocol::Tcp,
-        2,
-        PathId(12),
-        AuthNonce([12; 16]),
-        dormant_instance,
-        0,
-        PathUsage::Available,
-    );
-    let dormant_key = RelayPathKey {
-        underlay: UnderlayProtocol::Tcp,
-        index: 2,
-    };
-    let initial_candidate = context
-        .current_request_tcp_service_candidate(dormant_key)
-        .expect("ready dormant candidate");
     let target = ManagementTarget {
         clients: vec![context.clone()],
         servers: Vec::new(),
@@ -268,33 +249,6 @@ fn enabling_a_path_requires_fresh_liveness_evidence() {
         product_admission: ProductAdmission::default(),
         generation: RuntimeGenerationControl::new(),
     };
-
-    target
-        .control_path_json(br#"{"outbound":"edge-mpp","path":"primary","state":"failed"}"#)
-        .expect("fail path");
-    {
-        let health = context.health().lock().expect("failed health");
-        assert_eq!(health.tcp.len(), 3);
-        assert_eq!(health.tcp[0].state, SchedulerPathState::Failed);
-        assert_eq!(health.tcp[1].state, SchedulerPathState::Failed);
-        assert_eq!(health.tcp[2].state, SchedulerPathState::Failed);
-        assert!(health.tcp.iter().all(|record| !record.manual_disabled));
-    }
-    assert_eq!(
-        context.current_request_tcp_service_candidate(dormant_key),
-        None,
-        "a failed endpoint cannot retain dormant validation authority"
-    );
-    target
-        .control_path_json(br#"{"outbound":"edge-mpp","path":"primary","state":"enabled"}"#)
-        .expect("re-enable failed path");
-    assert!(
-        context
-            .current_request_tcp_service_candidate(dormant_key)
-            .expect("re-enabled dormant candidate")
-            .eligibility_generation
-            > initial_candidate.eligibility_generation
-    );
 
     let disabled = target
         .control_path_json(br#"{"outbound":"edge-mpp","path":"primary","state":"disabled"}"#)

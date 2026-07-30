@@ -293,10 +293,8 @@ fn data_plane_failure_is_published_once_until_liveness_recovers() {
     let now = Instant::now();
     let original = crate::model::path::next_carrier_path_instance_id();
     record.install_peer_usage(original, 0, PathUsage::Available);
-    assert_eq!(record.request_tcp_service_eligibility_generation(), Some(1));
 
     assert!(record.mark_data_plane_failure(original, now, true));
-    assert_eq!(record.request_tcp_service_eligibility_generation(), None);
     assert!(!record.mark_data_plane_failure(original, now, true));
 
     // A separate reachability probe may recover logical health, but it must not
@@ -309,11 +307,6 @@ fn data_plane_failure_is_published_once_until_liveness_recovers() {
 
     let replacement = crate::model::path::next_carrier_path_instance_id();
     record.install_peer_usage(replacement, 0, PathUsage::Available);
-    assert_eq!(
-        record.request_tcp_service_eligibility_generation(),
-        Some(1),
-        "a replacement carrier has an independent physical-instance fence"
-    );
     assert!(!record.mark_data_plane_failure(original, now, false));
     assert_eq!(record.state, SchedulerPathState::Active);
     assert!(record.mark_data_plane_failure(replacement, now, false));

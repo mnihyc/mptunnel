@@ -444,7 +444,6 @@ fn best_live_path_uses_completion_score_including_command_queue() {
         detaching: Vec::new(),
         entries: vec![queued, clear],
         data_level_queue_bytes: 0,
-        tcp_service: None,
     };
 
     let best = outputs
@@ -480,7 +479,6 @@ fn best_live_path_uses_peer_available_before_faster_backup() {
         detaching: Vec::new(),
         entries: vec![backup, available],
         data_level_queue_bytes: 0,
-        tcp_service: None,
     };
 
     let best = outputs
@@ -545,7 +543,6 @@ fn closed_outputs_are_excluded_from_key_and_best_path_snapshots() {
         detaching: Vec::new(),
         entries: vec![closed, live],
         data_level_queue_bytes: 0,
-        tcp_service: None,
     };
 
     assert!(

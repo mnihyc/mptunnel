@@ -1,7 +1,6 @@
 use super::response::{
     CarrierPathFlight, ResponseDataAckRecoveryCandidate, ResponseStreamBinding,
-    ResponseTcpServiceObserverInstall, product_flights_have_recent_reinjection_overlap,
-    release_carrier_path_flight_ranges,
+    product_flights_have_recent_reinjection_overlap, release_carrier_path_flight_ranges,
 };
 use crate::model::capacity::{
     PATH_OPEN_SCORE_BYTES, PathRateSample, RELIABLE_INITIAL_WINDOW_PACKETS,
@@ -9,7 +8,6 @@ use crate::model::capacity::{
     reliable_path_startup_sample_limit_bytes,
 };
 use crate::model::path::{CarrierPathInstanceId, CarrierPathKey};
-use crate::model::tcp_service::TcpServiceWriterLifecycle;
 use crate::model::work::{CarrierWorkKind, ReliableWorkClass};
 use crate::mux::MuxLimits;
 #[cfg(test)]
@@ -24,15 +22,11 @@ use crate::runtime::path::commands::{
 use crate::runtime::path::model::{default_path_rate_bps, default_path_srtt_ms};
 use crate::runtime::path::proof::enqueue_path_proof_frame;
 use crate::runtime::path::{OpenedReliableCarrierStream, RequestTcpCapacityProbeLease};
-use crate::runtime::tcp_service::{
-    TcpServiceFlightSidecarError, TcpServiceObserverRemoval, TcpServiceWriterCoordinator,
-    TcpServiceWriterTransaction,
-};
 use crate::scheduler::{PathRateScope, PathSnapshot, TrafficClass};
 use std::collections::{BTreeMap, VecDeque};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
-use tokio::sync::{Notify, mpsc, oneshot, watch};
+use tokio::sync::{Notify, mpsc, watch};
 
 /// Product reliable stream handle after an OPEN_STREAM has been accepted.
 ///
@@ -59,7 +53,6 @@ pub(in crate::runtime) enum ReliablePathStreamInput {
     Server {
         events: mpsc::Receiver<ServerReliableStreamEvent>,
         pending: VecDeque<ServerReliableStreamEvent>,
-        tcp_service_coordinator: Option<Arc<TcpServiceWriterCoordinator>>,
     },
 }
 
@@ -69,14 +62,6 @@ pub(in crate::runtime) enum ServerReliableStreamEvent {
         key: CarrierPathKey,
         path_instance_id: CarrierPathInstanceId,
         output_incarnation: u64,
-    },
-    InstallTcpServiceObserver {
-        install: Box<ResponseTcpServiceObserverInstall>,
-        receipt: oneshot::Sender<Result<bool, TcpServiceFlightSidecarError>>,
-    },
-    RemoveTcpServiceObserver {
-        lifecycle: TcpServiceWriterLifecycle,
-        receipt: oneshot::Sender<TcpServiceObserverRemoval>,
     },
 }
 
@@ -93,7 +78,6 @@ impl ReliablePathStreamInput {
         Self::Server {
             events,
             pending: VecDeque::new(),
-            tcp_service_coordinator: None,
         }
     }
 
@@ -235,20 +219,14 @@ impl ReliablePathStream {
                         None => Err(RuntimeError::ReliablePathSessionClosed),
                     };
                 }
-                ReliablePathStreamInput::Server {
-                    events,
-                    pending,
-                    tcp_service_coordinator,
-                } => {
+                ReliablePathStreamInput::Server { events, pending } => {
                     let (event, received_from_channel) = match pending.pop_front() {
                         Some(event) => (Some(event), false),
                         None => (events.recv().await, true),
                     };
                     match event {
                         Some(ServerReliableStreamEvent::Frame(frame))
-                            if received_from_channel
-                                && tcp_service_coordinator.is_none()
-                                && ServerFeedbackBatch::accepts(&frame) =>
+                            if received_from_channel && ServerFeedbackBatch::accepts(&frame) =>
                         {
                             let mut batch = ServerFeedbackBatch::default();
                             batch.push(frame);
@@ -290,45 +268,6 @@ impl ReliablePathStream {
                             path_instance_id,
                             output_incarnation,
                         ),
-                        Some(ServerReliableStreamEvent::InstallTcpServiceObserver {
-                            install,
-                            receipt,
-                        }) => {
-                            let coordinator = install.coordinator.clone();
-                            let result = match &self.output {
-                                ReliablePathStreamOutput::Switchable(binding) => {
-                                    binding.install_tcp_service_observer(*install)
-                                }
-                                ReliablePathStreamOutput::Fixed(_) => {
-                                    Err(TcpServiceFlightSidecarError::InvalidRelease)
-                                }
-                            };
-                            if result.is_ok() {
-                                *tcp_service_coordinator = Some(coordinator);
-                            }
-                            let _ = receipt.send(result);
-                        }
-                        Some(ServerReliableStreamEvent::RemoveTcpServiceObserver {
-                            lifecycle,
-                            receipt,
-                        }) => {
-                            let result = match &self.output {
-                                ReliablePathStreamOutput::Switchable(binding) => {
-                                    binding.remove_tcp_service_observer(lifecycle)
-                                }
-                                ReliablePathStreamOutput::Fixed(_) => {
-                                    TcpServiceObserverRemoval::AlreadyAbsent
-                                }
-                            };
-                            if result != TcpServiceObserverRemoval::DifferentLifecycle
-                                && tcp_service_coordinator
-                                    .as_ref()
-                                    .is_some_and(|coordinator| coordinator.lifecycle() == lifecycle)
-                            {
-                                *tcp_service_coordinator = None;
-                            }
-                            let _ = receipt.send(result);
-                        }
                         None => return Err(RuntimeError::ReliablePathSessionClosed),
                     }
                 }
@@ -343,9 +282,9 @@ impl ReliablePathStream {
     pub(in crate::runtime) fn ready_frame_count(&self) -> usize {
         match &self.frames {
             ReliablePathStreamInput::Carrier(frames) => frames.len(),
-            ReliablePathStreamInput::Server {
-                events, pending, ..
-            } => pending.len().saturating_add(events.len()),
+            ReliablePathStreamInput::Server { events, pending } => {
+                pending.len().saturating_add(events.len())
+            }
         }
     }
 
@@ -356,13 +295,11 @@ impl ReliablePathStream {
     pub(in crate::runtime) fn try_recv_frame(&mut self) -> Option<Result<Frame, RuntimeError>> {
         match &mut self.frames {
             ReliablePathStreamInput::Carrier(frames) => frames.try_recv().ok(),
-            ReliablePathStreamInput::Server {
-                events, pending, ..
-            } => {
-                if pending
-                    .front()
-                    .is_some_and(|event| !matches!(event, ServerReliableStreamEvent::Frame(_)))
-                {
+            ReliablePathStreamInput::Server { events, pending } => {
+                if matches!(
+                    pending.front(),
+                    Some(ServerReliableStreamEvent::PathDetached { .. })
+                ) {
                     return None;
                 }
                 if let Some(ServerReliableStreamEvent::Frame(frame)) = pending.pop_front() {
@@ -370,7 +307,7 @@ impl ReliablePathStream {
                 }
                 match events.try_recv() {
                     Ok(ServerReliableStreamEvent::Frame(frame)) => Some(Ok(frame)),
-                    Ok(boundary) => {
+                    Ok(boundary @ ServerReliableStreamEvent::PathDetached { .. }) => {
                         pending.push_back(boundary);
                         None
                     }
@@ -378,18 +315,6 @@ impl ReliablePathStream {
                     | Err(mpsc::error::TryRecvError::Disconnected) => None,
                 }
             }
-        }
-    }
-
-    pub(in crate::runtime) fn tcp_service_coordinator(
-        &self,
-    ) -> Option<Arc<TcpServiceWriterCoordinator>> {
-        match &self.frames {
-            ReliablePathStreamInput::Server {
-                tcp_service_coordinator,
-                ..
-            } => tcp_service_coordinator.clone(),
-            ReliablePathStreamInput::Carrier(_) => None,
         }
     }
 
@@ -488,28 +413,6 @@ impl ReliablePathStream {
 
     pub(in crate::runtime) fn release_normalized_acked_ranges(&self, ranges: &[OffsetRange]) {
         self.output.release_normalized_acked_ranges(ranges);
-    }
-
-    pub(in crate::runtime) fn release_normalized_acked_ranges_for_tcp_service(
-        &self,
-        ranges: &[OffsetRange],
-        assigned_end: u64,
-        lifecycle: TcpServiceWriterLifecycle,
-    ) {
-        self.output.release_normalized_acked_ranges_for_tcp_service(
-            ranges,
-            assigned_end,
-            lifecycle,
-        );
-    }
-
-    pub(in crate::runtime) fn finish_tcp_service_ack(
-        &self,
-        transaction: &mut TcpServiceWriterTransaction<'_>,
-    ) {
-        if let ReliablePathStreamOutput::Switchable(binding) = &self.output {
-            binding.finish_tcp_service_ack(transaction);
-        }
     }
 
     pub(in crate::runtime) fn has_recent_reinjection_overlap(
@@ -1196,23 +1099,6 @@ impl ReliablePathStreamOutput {
         match self {
             Self::Fixed(fixed) => fixed.release_normalized_acked_ranges(ranges),
             Self::Switchable(binding) => binding.release_normalized_acked_ranges(ranges),
-        }
-    }
-
-    pub(in crate::runtime) fn release_normalized_acked_ranges_for_tcp_service(
-        &self,
-        ranges: &[OffsetRange],
-        assigned_end: u64,
-        lifecycle: TcpServiceWriterLifecycle,
-    ) {
-        match self {
-            Self::Fixed(fixed) => fixed.release_normalized_acked_ranges(ranges),
-            Self::Switchable(binding) => binding.release_normalized_acked_ranges_for_tcp_service(
-                ranges,
-                assigned_end,
-                lifecycle,
-                Instant::now(),
-            ),
         }
     }
 

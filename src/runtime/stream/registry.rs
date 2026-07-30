@@ -96,7 +96,6 @@ struct ServerPathUsageEntry {
 
 #[derive(Debug, Clone)]
 struct ServerRegisteredPath {
-    path_join_nonce: crate::protocol::AuthNonce,
     local: crate::runtime::path::ServerLocalPathProperties,
     state: PeerPathState,
     path_proof: Option<PathProofObservation>,
@@ -831,7 +830,6 @@ impl ServerReliableStreamRegistry {
     fn activate_carrier_path(
         &self,
         identity: ServerCarrierPathIdentity,
-        path_join_nonce: crate::protocol::AuthNonce,
         local: crate::runtime::path::ServerLocalPathProperties,
         principal_permit: PrincipalPermit,
     ) -> Result<(), RuntimeError> {
@@ -896,7 +894,6 @@ impl ServerReliableStreamRegistry {
                     .insert(
                         (session_id, underlay, path_id, path_instance_id),
                         ServerRegisteredPath {
-                            path_join_nonce,
                             local,
                             state: PeerPathState::Active,
                             path_proof: None,
@@ -1699,7 +1696,9 @@ impl ServerReliableStreamRegistry {
             // See `route_frame`: retirement owns this short closed-receiver
             // interval, and one finished stream must not close its carrier.
             Err(mpsc::error::TrySendError::Closed(_)) => Ok(ServerStreamFrameRoute::Routed),
-            Err(mpsc::error::TrySendError::Full(_)) => {
+            Err(mpsc::error::TrySendError::Full(ServerReliableStreamEvent::PathDetached {
+                ..
+            })) => {
                 unreachable!("server frame routing only sends frame events")
             }
         }
@@ -1800,12 +1799,11 @@ impl ServerStreamPortBackend for ServerReliableStreamPortBackend {
     fn activate_carrier_path(
         &self,
         identity: ServerCarrierPathIdentity,
-        path_join_nonce: crate::protocol::AuthNonce,
         local: crate::runtime::path::ServerLocalPathProperties,
         principal_permit: PrincipalPermit,
     ) -> Result<(), RuntimeError> {
         self.registry
-            .activate_carrier_path(identity, path_join_nonce, local, principal_permit)
+            .activate_carrier_path(identity, local, principal_permit)
     }
 
     fn retire_carrier_path(&self, identity: ServerCarrierPathIdentity) {

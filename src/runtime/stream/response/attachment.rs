@@ -132,7 +132,6 @@ pub(in crate::runtime) struct ResponseStreamOutputs {
     /// Offset-free sender-service staging belongs to the response stream, not
     /// to any carrier output.
     pub(super) data_level_queue_bytes: u64,
-    pub(super) tcp_service: Option<Box<super::tcp_service::ResponseTcpServiceObserver>>,
 }
 
 impl ResponseStreamBinding {
@@ -332,13 +331,10 @@ impl ResponseStreamBinding {
         };
         apply_attachment_state(&mut entry, attachment_state);
         outputs.entries.push(entry);
-        let attached_index = outputs.entries.len().saturating_sub(1);
-        outputs.observe_tcp_service_attachment(attached_index);
         for output in outputs.entries.iter().chain(&outputs.detaching) {
             output.load_registration.set_lane(lane);
         }
         if let Some(incarnation) = replaced_incarnation {
-            outputs.observe_tcp_service_detach(key, incarnation);
             self.invalidate_path_flight_evidence(key, incarnation);
         }
         *current_lane = lane;
@@ -413,7 +409,6 @@ impl ResponseStreamBinding {
         let entry = outputs.entries.remove(position);
         entry.load_registration.deactivate();
         let output_incarnation = entry.incarnation;
-        outputs.observe_tcp_service_detach(key, output_incarnation);
         outputs.detaching.push(entry);
         self.clear_request_feedback_ingress_if(key, path_instance_id);
         self.response_model_generation
@@ -465,7 +460,6 @@ impl ResponseStreamBinding {
         outputs.detaching.retain(&mut retain);
         if !removed.is_empty() {
             for (incarnation, _) in &removed {
-                outputs.observe_tcp_service_detach(key, *incarnation);
                 self.invalidate_path_flight_evidence(key, *incarnation);
             }
             for (_, path_instance_id) in &removed {

@@ -29,7 +29,7 @@ pub(in crate::runtime) use super::queue::{
     try_recv_reliable_path_command, try_recv_reliable_path_priority_command,
 };
 pub(in crate::runtime) use super::queue::{
-    ReliablePathCommandSender, ReliablePathLoadRegistration,
+    ReliablePathCommandSender, ReliablePathFrameReservation, ReliablePathLoadRegistration,
 };
 #[cfg(test)]
 pub(in crate::runtime) use super::queue::{

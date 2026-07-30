@@ -34,10 +34,13 @@ use crate::protocol::frame::{reliable_path_frame_pacing_bytes, stream_ack_contig
 use crate::protocol::{Frame, OffsetRange, StreamId, UnderlayProtocol};
 use crate::runtime::error::{RuntimeError, reliable_path_error_is_migratable};
 use crate::runtime::path::ClientPathContext;
-use crate::runtime::path::commands::reliable_path_effective_frame_lane;
+use crate::runtime::path::commands::{
+    ReliablePathCommandSender, ReliablePathFrameReservation, reliable_path_effective_frame_lane,
+};
+#[cfg(test)]
+use crate::runtime::stream::ReliablePathStreamHandle;
 use crate::runtime::stream::{
-    ReliablePathStreamHandle, ReliablePathStreamOutput, ReliableRecvProgress,
-    ReliableRelayRemoteSet,
+    ReliablePathStreamOutput, ReliableRecvProgress, ReliableRelayRemoteSet,
 };
 use crate::scheduler::{PathSnapshot, TrafficClass};
 use bytes::Bytes;
@@ -558,7 +561,7 @@ impl RequestSenderService {
         let avoid_instances =
             self.multipath
                 .reinjection_avoid_instances(&sent_frame, cause, remotes);
-        let instance = self
+        let (instance, payload_bytes) = self
             .emit_relay_frame(
                 context,
                 remotes,
@@ -569,9 +572,6 @@ impl RequestSenderService {
             )
             .await?;
         let path_key = instance.key;
-        let payload_bytes = self
-            .multipath
-            .record_emitted_frame(instance, &sent_frame, cause);
         self.record_decision(path_key, payload_bytes, &sent_frame, cause);
         Ok(RelaySendOutcome { path_key })
     }
@@ -584,7 +584,7 @@ impl RequestSenderService {
         cause: RelaySendCause,
         avoid_instances: &[RelayPathInstance],
         request_lane: Option<TrafficClass>,
-    ) -> Result<RelayPathInstance, RuntimeError> {
+    ) -> Result<(RelayPathInstance, usize), RuntimeError> {
         let mut last_error = None;
         while !remotes.paths.is_empty() {
             if let Some(instance) = remotes
@@ -693,14 +693,15 @@ impl RequestSenderService {
                 } else {
                     None
                 };
-            match emit_request_frame_with_mode(
-                &remotes.paths[position].stream,
+            let commands = fixed_request_output_commands(&remotes.paths[position].stream.output)?;
+            match reserve_request_frame_with_mode(
+                &commands,
                 frame.clone(),
                 lane,
                 emit_mode,
                 cause.is_reinjection(),
             ) {
-                Ok(()) => {
+                Ok(command) => {
                     if let Some(claim) = request_load_claim {
                         // The exact path owns the lease after carrier enqueue;
                         // path removal or relay cancellation releases it.
@@ -723,7 +724,10 @@ impl RequestSenderService {
                         position,
                         remotes.paths.len(),
                     );
-                    return Ok(instance);
+                    let payload_bytes =
+                        self.multipath.record_emitted_frame(instance, &frame, cause);
+                    command.commit();
+                    return Ok((instance, payload_bytes));
                 }
                 Err(RuntimeError::SenderServiceBlocked) => {
                     return Err(RuntimeError::SenderServiceBlocked);
@@ -1113,6 +1117,7 @@ impl RequestSenderService {
     }
 }
 
+#[cfg(test)]
 fn emit_request_frame_with_mode(
     stream: &ReliablePathStreamHandle,
     frame: Frame,
@@ -1120,26 +1125,35 @@ fn emit_request_frame_with_mode(
     emit_mode: CarrierEmitMode,
     reinjection: bool,
 ) -> Result<(), RuntimeError> {
-    emit_fixed_request_output(&stream.output, frame, lane, emit_mode, reinjection)
+    let commands = fixed_request_output_commands(&stream.output)?;
+    let reservation =
+        reserve_request_frame_with_mode(&commands, frame, lane, emit_mode, reinjection)?;
+    reservation.commit();
+    Ok(())
 }
 
-fn emit_fixed_request_output(
+fn fixed_request_output_commands(
     output: &ReliablePathStreamOutput,
+) -> Result<ReliablePathCommandSender, RuntimeError> {
+    match output {
+        ReliablePathStreamOutput::Fixed(fixed) => Ok(fixed.commands().clone()),
+        ReliablePathStreamOutput::Switchable(_) => {
+            Err(RuntimeError::Protocol("request relay path is not fixed"))
+        }
+    }
+}
+
+fn reserve_request_frame_with_mode<'a>(
+    commands: &'a ReliablePathCommandSender,
     frame: Frame,
     lane: TrafficClass,
     emit_mode: CarrierEmitMode,
     reinjection: bool,
-) -> Result<(), RuntimeError> {
-    match output {
-        ReliablePathStreamOutput::Fixed(fixed) if reinjection => {
-            fixed.commands().try_enqueue_reinjection_frame(frame, lane)
-        }
-        ReliablePathStreamOutput::Fixed(fixed) => {
-            emit_mode.try_enqueue_frame(fixed.commands(), frame, lane)
-        }
-        ReliablePathStreamOutput::Switchable(_) => {
-            Err(RuntimeError::Protocol("request relay path is not fixed"))
-        }
+) -> Result<ReliablePathFrameReservation<'a>, RuntimeError> {
+    if reinjection {
+        commands.try_reserve_reinjection_frame(frame, lane)
+    } else {
+        emit_mode.try_reserve_frame(commands, frame, lane)
     }
 }
 

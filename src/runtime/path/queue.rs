@@ -813,6 +813,7 @@ impl ReliablePathCommandSender {
         )
     }
 
+    #[cfg(test)]
     pub(in crate::runtime) fn try_enqueue_reinjection_frame(
         &self,
         frame: Frame,

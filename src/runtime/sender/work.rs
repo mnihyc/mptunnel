@@ -6,7 +6,7 @@ use crate::model::timing::reliable_data_retransmission_interval;
 use crate::mux::MuxLimits;
 use crate::protocol::Frame;
 use crate::runtime::RuntimeError;
-use crate::runtime::path::commands::ReliablePathCommandSender;
+use crate::runtime::path::commands::{ReliablePathCommandSender, ReliablePathFrameReservation};
 use crate::scheduler::{PathSnapshot, TrafficClass};
 use std::time::Instant;
 
@@ -17,16 +17,27 @@ pub(in crate::runtime) enum CarrierEmitMode {
 }
 
 impl CarrierEmitMode {
+    pub(in crate::runtime::sender) fn try_reserve_frame<'a>(
+        self,
+        commands: &'a ReliablePathCommandSender,
+        frame: Frame,
+        lane: TrafficClass,
+    ) -> Result<ReliablePathFrameReservation<'a>, RuntimeError> {
+        match self {
+            Self::Classified => commands.try_reserve_admitted_frame(frame, lane),
+            Self::StreamOrdered => commands.try_reserve_stream_ordered_frame(frame, lane),
+        }
+    }
+
     pub(in crate::runtime::sender) fn try_enqueue_frame(
         self,
         commands: &ReliablePathCommandSender,
         frame: Frame,
         lane: TrafficClass,
     ) -> Result<(), RuntimeError> {
-        match self {
-            Self::Classified => commands.try_enqueue_admitted_frame(frame, lane),
-            Self::StreamOrdered => commands.try_enqueue_stream_ordered_frame(frame, lane),
-        }
+        let reservation = self.try_reserve_frame(commands, frame, lane)?;
+        reservation.commit();
+        Ok(())
     }
 }
 

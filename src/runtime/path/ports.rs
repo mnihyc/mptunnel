@@ -9,8 +9,8 @@ use crate::model::path::{CarrierPathInstanceId, PathPolicy, next_carrier_path_in
 use crate::mux::MuxLimits;
 use crate::product::PrincipalPermit;
 use crate::protocol::{
-    Frame, OffsetRange, PathId, PathMetrics, PathUsage, PeerPathState, PeerPathStatus, SessionId,
-    StreamId, TargetAddr, UnderlayProtocol,
+    AuthNonce, Frame, OffsetRange, PathId, PathMetrics, PathUsage, PeerPathState, PeerPathStatus,
+    SessionId, StreamId, TargetAddr, UnderlayProtocol,
 };
 use crate::runtime::error::RuntimeError;
 use crate::runtime::path::proof::{PathProofObservation, allocated_path_proof_data_frame};
@@ -297,20 +297,24 @@ impl ServerPathValidation {
 }
 
 impl ServerCarrierPathRegistration {
+    fn identity(&self) -> ServerCarrierPathIdentity {
+        self.inner.identity
+    }
+
     pub(in crate::runtime) fn path_instance_id(&self) -> CarrierPathInstanceId {
-        self.inner.identity.path_instance_id
+        self.identity().path_instance_id
     }
 
     pub(in crate::runtime) fn session_id(&self) -> SessionId {
-        self.inner.identity.session_id
+        self.identity().session_id
     }
 
     pub(in crate::runtime) fn underlay(&self) -> UnderlayProtocol {
-        self.inner.identity.underlay
+        self.identity().underlay
     }
 
     pub(in crate::runtime) fn path_id(&self) -> PathId {
-        self.inner.identity.path_id
+        self.identity().path_id
     }
 
     pub(in crate::runtime) fn local_policy(&self) -> PathPolicy {
@@ -351,7 +355,7 @@ impl ServerCarrierPathRegistration {
     pub(in crate::runtime) fn set_state(&self, state: PeerPathState) {
         self.inner
             .backend
-            .set_carrier_path_state(self.inner.identity, state);
+            .set_carrier_path_state(self.identity(), state);
     }
 
     fn belongs_to(&self, port: &ServerStreamPort) -> bool {
@@ -426,6 +430,7 @@ pub(in crate::runtime) trait ServerStreamPortBackend: Send + Sync {
     fn activate_carrier_path(
         &self,
         identity: ServerCarrierPathIdentity,
+        path_join_nonce: AuthNonce,
         local: ServerLocalPathProperties,
         principal_permit: PrincipalPermit,
     ) -> Result<(), RuntimeError>;
@@ -540,11 +545,12 @@ impl ServerStreamPort {
         (self.target_admission)(path_registration.principal_permit(), target)
     }
 
-    pub(in crate::runtime) fn register_carrier_path(
+    pub(in crate::runtime) fn register_authenticated_carrier_path(
         &self,
         session_id: SessionId,
         underlay: UnderlayProtocol,
         path_id: PathId,
+        path_join_nonce: AuthNonce,
         local: ServerLocalPathProperties,
         principal_permit: PrincipalPermit,
     ) -> Result<ServerCarrierPathRegistration, RuntimeError> {
@@ -554,8 +560,12 @@ impl ServerStreamPort {
             path_id,
             path_instance_id: next_carrier_path_instance_id(),
         };
-        self.backend
-            .activate_carrier_path(identity, local, principal_permit.clone())?;
+        self.backend.activate_carrier_path(
+            identity,
+            path_join_nonce,
+            local,
+            principal_permit.clone(),
+        )?;
         Ok(ServerCarrierPathRegistration {
             inner: Arc::new(ServerCarrierPathRegistrationInner {
                 backend: self.backend.clone(),
@@ -569,6 +579,25 @@ impl ServerStreamPort {
     }
 
     #[cfg(test)]
+    pub(in crate::runtime) fn register_carrier_path(
+        &self,
+        session_id: SessionId,
+        underlay: UnderlayProtocol,
+        path_id: PathId,
+        local: ServerLocalPathProperties,
+        principal_permit: PrincipalPermit,
+    ) -> Result<ServerCarrierPathRegistration, RuntimeError> {
+        self.register_authenticated_carrier_path(
+            session_id,
+            underlay,
+            path_id,
+            AuthNonce([0; 16]),
+            local,
+            principal_permit,
+        )
+    }
+
+    #[cfg(test)]
     pub(in crate::runtime) fn register_test_carrier_path(
         &self,
         session_id: SessionId,
@@ -576,10 +605,11 @@ impl ServerStreamPort {
         path_id: PathId,
         local: ServerLocalPathProperties,
     ) -> ServerCarrierPathRegistration {
-        self.register_carrier_path(
+        self.register_authenticated_carrier_path(
             session_id,
             underlay,
             path_id,
+            AuthNonce([0; 16]),
             local,
             PrincipalPermit::for_test("test-peer"),
         )
@@ -638,7 +668,7 @@ impl ServerStreamPort {
             ));
         }
         self.backend
-            .route_frame(path_registration.inner.identity, stream_id, frame)
+            .route_frame(path_registration.identity(), stream_id, frame)
             .await
     }
 
@@ -654,7 +684,7 @@ impl ServerStreamPort {
             ));
         }
         self.backend
-            .try_route_frame(path_registration.inner.identity, stream_id, frame)
+            .try_route_frame(path_registration.identity(), stream_id, frame)
     }
 
     pub(in crate::runtime) fn detach_path(
@@ -668,7 +698,7 @@ impl ServerStreamPort {
             ));
         }
         self.backend
-            .detach_path(path_registration.inner.identity, stream_id)
+            .detach_path(path_registration.identity(), stream_id)
     }
 
     pub(in crate::runtime) fn record_peer_path_metrics(
@@ -678,7 +708,7 @@ impl ServerStreamPort {
     ) {
         if registration.belongs_to(self) {
             self.backend
-                .record_peer_path_metrics(registration.inner.identity, metrics);
+                .record_peer_path_metrics(registration.identity(), metrics);
         }
     }
 
@@ -690,7 +720,7 @@ impl ServerStreamPort {
     ) {
         if registration.belongs_to(self) {
             self.backend
-                .record_peer_path_usage(registration.inner.identity, sequence, usage);
+                .record_peer_path_usage(registration.identity(), sequence, usage);
         }
     }
 
@@ -717,7 +747,7 @@ impl ServerStreamPort {
     ) {
         if registration.belongs_to(self) {
             self.backend.record_local_path_metrics(
-                registration.inner.identity,
+                registration.identity(),
                 metrics,
                 native_drain_observed,
                 delivery_rate_sample,
@@ -733,7 +763,7 @@ impl ServerStreamPort {
         if registration.belongs_to(self) {
             registration.mark_path_validated();
             self.backend
-                .record_path_proof_success(registration.inner.identity, observation);
+                .record_path_proof_success(registration.identity(), observation);
         }
     }
 

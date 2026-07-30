@@ -1808,6 +1808,9 @@ where
                     complete,
                     ranges,
                 } if ack_stream_id == stream_id => {
+                    let tcp_service = path_stream.tcp_service_coordinator();
+                    let mut tcp_service_transaction =
+                        tcp_service.as_ref().map(|coordinator| coordinator.lock());
                     // Freeze the assigned DSN horizon and validate every
                     // original range before any cache, flight, queue,
                     // reservation, or recovery-evidence mutation.
@@ -1829,8 +1832,22 @@ where
                     }
                     #[cfg(feature = "lab-diagnostics")]
                     lab_perf_record("mux.apply_ack", mux_started.elapsed(), ack.released_bytes);
-                    path_stream.release_normalized_acked_ranges(normalized_ranges);
-                    response_sender.release_normalized_acked_reinjections(normalized_ranges);
+                    if let Some(transaction) = tcp_service_transaction.as_mut() {
+                        path_stream.release_normalized_acked_ranges_for_tcp_service(
+                            normalized_ranges,
+                            validated_ack.assigned_end(),
+                            transaction.lifecycle(),
+                        );
+                        response_sender.release_normalized_acked_reinjections(normalized_ranges);
+                        path_stream.finish_tcp_service_ack(transaction);
+                    } else {
+                        path_stream.release_normalized_acked_ranges(normalized_ranges);
+                        response_sender.release_normalized_acked_reinjections(normalized_ranges);
+                    }
+                    // Recovery planning below is outside the indivisible Data
+                    // ACK release/boundary transaction and must not stall
+                    // frozen writers in either direction.
+                    drop(tcp_service_transaction);
                     #[cfg(feature = "lab-diagnostics")]
                     let largest_ack_end = normalized_ranges.last().map_or(0, |range| range.end);
                     #[cfg(feature = "lab-diagnostics")]

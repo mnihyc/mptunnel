@@ -99,6 +99,9 @@ async fn attach_relay_path_candidates(
                             ReliableRelayAttachOutcome::RejectedDuplicate => {
                                 continue;
                             }
+                            ReliableRelayAttachOutcome::RejectedResourceLimit => {
+                                return Err(RuntimeError::StreamAttachmentIdentityExhausted);
+                            }
                         }
                     }
                     Err(err) if reliable_path_error_is_migratable(&err) => {

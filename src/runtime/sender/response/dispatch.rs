@@ -85,12 +85,24 @@ pub(super) fn emit_planned_response_data_frame(
             let ReliablePathStreamOutput::Switchable(binding) = &stream.output else {
                 return Err(RuntimeError::SenderServiceBlocked);
             };
-            let enqueue_result = binding.try_enqueue_data_frame_for_dispatch_target(
-                &target,
-                &frame,
-                lane,
-                expected_model_generation,
-            );
+            let tcp_service = stream.tcp_service_coordinator();
+            let enqueue_result = if let Some(coordinator) = tcp_service.as_ref() {
+                let mut transaction = coordinator.lock();
+                binding.try_enqueue_data_frame_for_dispatch_target_with_tcp_service(
+                    &target,
+                    &frame,
+                    lane,
+                    expected_model_generation,
+                    &mut transaction,
+                )
+            } else {
+                binding.try_enqueue_data_frame_for_dispatch_target(
+                    &target,
+                    &frame,
+                    lane,
+                    expected_model_generation,
+                )
+            };
             match enqueue_result {
                 Ok(_) => {}
                 Err(RuntimeError::SenderServiceBlocked) => {

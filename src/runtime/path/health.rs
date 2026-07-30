@@ -34,6 +34,7 @@ pub(in crate::runtime) struct ClientPathHealthRecord {
     pub(in crate::runtime) peer_usage: Option<PathUsage>,
     path_instance_id: Option<CarrierPathInstanceId>,
     peer_usage_sequence: Option<u64>,
+    tcp_service_eligibility_generation: Option<u64>,
     pub(in crate::runtime) consecutive_failures: u32,
     pub(in crate::runtime) measured_srtt_ms: Option<f64>,
     pub(in crate::runtime) measured_jitter_ms: Option<f64>,
@@ -111,6 +112,7 @@ impl Default for ClientPathHealthRecord {
             peer_usage: None,
             path_instance_id: None,
             peer_usage_sequence: None,
+            tcp_service_eligibility_generation: Some(1),
             consecutive_failures: 0,
             measured_srtt_ms: None,
             measured_jitter_ms: None,
@@ -159,21 +161,26 @@ impl ClientPathHealthRecord {
         sequence: u64,
         usage: PathUsage,
     ) {
-        if !self.locally_eligible {
-            return;
-        }
-        if self.path_instance_id != Some(path_instance_id) {
+        let new_instance = self.path_instance_id != Some(path_instance_id);
+        let was_eligible = self.request_tcp_service_eligible();
+        if new_instance {
             self.data_plane_failure_instance_id = None;
             if self.path_instance_id.is_some() {
                 self.clear_native_carrier_state();
                 self.tcp_capacity.reset_after_data_plane_failure();
                 self.invalidate_path_proofs();
             }
+            // The physical carrier instance independently fences old work, so
+            // its local directional eligibility sequence starts at one.
+            self.tcp_service_eligibility_generation = Some(1);
         }
         self.path_instance_id = Some(path_instance_id);
         self.peer_usage_sequence = Some(sequence);
         self.peer_usage = Some(usage);
-        self.mark_liveness_success();
+        self.mark_liveness_success_inner();
+        if !new_instance {
+            self.record_tcp_service_eligibility_transition(was_eligible);
+        }
     }
 
     pub(in crate::runtime) fn update_peer_usage(
@@ -191,8 +198,10 @@ impl ClientPathHealthRecord {
         {
             return false;
         }
+        let was_eligible = self.request_tcp_service_eligible();
         self.peer_usage_sequence = Some(sequence);
         self.peer_usage = Some(usage);
+        self.record_tcp_service_eligibility_transition(was_eligible);
         true
     }
 
@@ -221,6 +230,63 @@ impl ClientPathHealthRecord {
 
     pub(in crate::runtime) fn is_locally_eligible(&self) -> bool {
         self.locally_eligible
+    }
+
+    pub(in crate::runtime) fn request_tcp_service_eligibility_generation(&self) -> Option<u64> {
+        self.request_tcp_service_eligible()
+            .then_some(self.tcp_service_eligibility_generation)
+            .flatten()
+    }
+
+    pub(in crate::runtime) fn retire_request_tcp_service_authority(
+        &mut self,
+        path_instance_id: CarrierPathInstanceId,
+    ) {
+        if self.path_instance_id == Some(path_instance_id) && self.request_tcp_service_eligible() {
+            self.advance_tcp_service_eligibility_generation();
+        }
+    }
+
+    pub(in crate::runtime) fn set_managed_path_state(
+        &mut self,
+        manual_disabled: bool,
+        state: SchedulerPathState,
+        failed_until: Option<Instant>,
+        clear_flight: bool,
+    ) {
+        let was_eligible = self.request_tcp_service_eligible();
+        self.manual_disabled = manual_disabled;
+        self.state = state;
+        self.failed_until = failed_until;
+        if clear_flight {
+            self.relay_bytes_in_flight = 0;
+            self.relay_queue_bytes = 0;
+        }
+        self.record_tcp_service_eligibility_transition(was_eligible);
+    }
+
+    fn request_tcp_service_eligible(&self) -> bool {
+        self.locally_eligible
+            && !self.manual_disabled
+            && self.path_instance_id.is_some()
+            && self.data_plane_failure_instance_id != self.path_instance_id
+            && self.peer_usage == Some(PathUsage::Available)
+            && matches!(
+                self.state,
+                SchedulerPathState::Active | SchedulerPathState::Suspect
+            )
+    }
+
+    fn record_tcp_service_eligibility_transition(&mut self, was_eligible: bool) {
+        if was_eligible != self.request_tcp_service_eligible() {
+            self.advance_tcp_service_eligibility_generation();
+        }
+    }
+
+    fn advance_tcp_service_eligibility_generation(&mut self) {
+        self.tcp_service_eligibility_generation = self
+            .tcp_service_eligibility_generation
+            .and_then(|generation| generation.checked_add(1));
     }
 
     pub(super) fn path_proof_generation(&self) -> u64 {
@@ -293,6 +359,7 @@ impl ClientPathHealthRecord {
 
     /// Applies time-driven lifecycle transitions. Observation remains pure.
     pub(in crate::runtime) fn maintain(&mut self, now: Instant) {
+        let was_eligible = self.request_tcp_service_eligible();
         self.tcp_capacity.maintain(now);
         if self.state == SchedulerPathState::Failed
             && self.failed_until.is_some_and(|deadline| now >= deadline)
@@ -300,6 +367,7 @@ impl ClientPathHealthRecord {
             self.state = SchedulerPathState::Suspect;
             self.failed_until = None;
         }
+        self.record_tcp_service_eligibility_transition(was_eligible);
     }
 
     pub(in crate::runtime) fn observation_at(&self, now: Instant) -> ClientPathObservation {
@@ -454,6 +522,12 @@ impl ClientPathHealthRecord {
     }
 
     pub(in crate::runtime) fn mark_liveness_success(&mut self) {
+        let was_eligible = self.request_tcp_service_eligible();
+        self.mark_liveness_success_inner();
+        self.record_tcp_service_eligibility_transition(was_eligible);
+    }
+
+    fn mark_liveness_success_inner(&mut self) {
         if self.manual_disabled || !self.locally_eligible {
             return;
         }
@@ -639,6 +713,7 @@ impl ClientPathHealthRecord {
         if !self.locally_eligible {
             return;
         }
+        let was_eligible = self.request_tcp_service_eligible();
         self.consecutive_failures = self.consecutive_failures.saturating_add(1);
         self.relay_bytes_in_flight = 0;
         self.relay_queue_bytes = 0;
@@ -650,6 +725,7 @@ impl ClientPathHealthRecord {
             self.state = SchedulerPathState::Failed;
             self.failed_until = Some(now + path_record_failure_cooldown(self));
         }
+        self.record_tcp_service_eligibility_transition(was_eligible);
     }
 
     pub(in crate::runtime) fn mark_data_plane_failure(
@@ -663,6 +739,7 @@ impl ClientPathHealthRecord {
         {
             return false;
         }
+        let was_eligible = self.request_tcp_service_eligible();
         self.data_plane_failure_instance_id = Some(path_instance_id);
         self.consecutive_failures = self.consecutive_failures.saturating_add(1);
         self.relay_bytes_in_flight = 0;
@@ -680,6 +757,7 @@ impl ClientPathHealthRecord {
             self.state = SchedulerPathState::Suspect;
             self.failed_until = None;
         }
+        self.record_tcp_service_eligibility_transition(was_eligible);
         true
     }
 

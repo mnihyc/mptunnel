@@ -19,12 +19,18 @@ use super::tcp::capacity::{
 use super::*;
 use crate::model::capacity::{PathRateSample, reliable_capacity_measurement_session_limit_bytes};
 use crate::model::path::{CarrierPathInstanceId, RelayPathInstance, RelayPathKey};
-use crate::protocol::{DatagramFlowId, PathUsage, StreamId, UnderlayProtocol};
+use crate::model::tcp_service::TcpServiceCarrierFence;
+use crate::protocol::{
+    AuthNonce, DatagramFlowId, PathId, PathUsage, StreamId, TcpCarrierAcceptedPath,
+    UnderlayProtocol,
+};
 use crate::runtime::error::RuntimeError;
+use crate::runtime::stream::RequestTcpServiceWriter;
 use crate::scheduler::TrafficClass;
 use std::collections::HashMap;
+use std::collections::hash_map::Entry;
 use std::sync::{
-    Arc, Mutex,
+    Arc, Mutex, Weak,
     atomic::{AtomicU64, Ordering},
 };
 use std::time::{Duration, Instant};
@@ -33,16 +39,37 @@ use std::time::{Duration, Instant};
 #[derive(Debug)]
 pub(in crate::runtime) struct ClientPathState {
     health: Mutex<ClientPathHealth>,
+    registered_carriers: Mutex<ClientRegisteredCarrierPaths>,
+    tcp_service_writers: Mutex<HashMap<StreamId, RequestTcpServiceWriter>>,
     next_reliable_stream_id: Mutex<u64>,
     next_datagram_flow_id: Mutex<u64>,
     request_tcp_capacity_probe: RequestTcpCapacityProbeSession,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(in crate::runtime) struct ClientRegisteredCarrierPath {
+    pub(in crate::runtime) path_id: PathId,
+    pub(in crate::runtime) path_join_nonce: AuthNonce,
+    pub(in crate::runtime) path_instance_id: CarrierPathInstanceId,
+}
+
+#[derive(Debug)]
+struct ClientRegisteredCarrierPaths {
+    tcp: Vec<Option<ClientRegisteredCarrierPath>>,
+    udp: Vec<Option<ClientRegisteredCarrierPath>>,
+}
+
 impl ClientPathState {
     pub(in crate::runtime) fn new(health: ClientPathHealth) -> Arc<Self> {
         let tcp_path_count = health.tcp.len();
+        let udp_path_count = health.udp.len();
         Arc::new(Self {
             health: Mutex::new(health),
+            registered_carriers: Mutex::new(ClientRegisteredCarrierPaths {
+                tcp: vec![None; tcp_path_count],
+                udp: vec![None; udp_path_count],
+            }),
+            tcp_service_writers: Mutex::new(HashMap::new()),
             next_reliable_stream_id: Mutex::new(0),
             next_datagram_flow_id: Mutex::new(0),
             request_tcp_capacity_probe: RequestTcpCapacityProbeSession::new(tcp_path_count),
@@ -53,8 +80,77 @@ impl ClientPathState {
         &self.health
     }
 
+    pub(in crate::runtime) fn register_tcp_service_writer(
+        self: &Arc<Self>,
+        stream_id: StreamId,
+        writer: RequestTcpServiceWriter,
+    ) -> Result<ClientTcpServiceWriterRegistration, RuntimeError> {
+        let mut writers = self
+            .tcp_service_writers
+            .lock()
+            .expect("client TCP service writer registry lock");
+        match writers.entry(stream_id) {
+            Entry::Vacant(entry) => {
+                entry.insert(writer.clone());
+            }
+            Entry::Occupied(_) => {
+                return Err(RuntimeError::Protocol(
+                    "duplicate client TCP service writer",
+                ));
+            }
+        }
+        Ok(ClientTcpServiceWriterRegistration {
+            state: Arc::downgrade(self),
+            stream_id,
+            writer,
+        })
+    }
+
+    pub(in crate::runtime) fn tcp_service_writer(
+        &self,
+        stream_id: StreamId,
+    ) -> Option<RequestTcpServiceWriter> {
+        self.tcp_service_writers
+            .lock()
+            .expect("client TCP service writer registry lock")
+            .get(&stream_id)
+            .cloned()
+    }
+
     /// Installs the first preference from a newly authenticated carrier. A new
     /// carrier instance restarts its sequence space at zero.
+    pub(in crate::runtime) fn install_authenticated_path(
+        &self,
+        underlay: UnderlayProtocol,
+        index: usize,
+        path_id: PathId,
+        path_join_nonce: AuthNonce,
+        path_instance_id: CarrierPathInstanceId,
+        sequence: u64,
+        usage: PathUsage,
+    ) {
+        let mut health = self.health.lock().expect("client path health lock");
+        let mut registered = self
+            .registered_carriers
+            .lock()
+            .expect("client registered carrier lock");
+        let (records, registrations) = match underlay {
+            UnderlayProtocol::Tcp => (&mut health.tcp, &mut registered.tcp),
+            UnderlayProtocol::Udp => (&mut health.udp, &mut registered.udp),
+        };
+        if let (Some(record), Some(registration)) =
+            (records.get_mut(index), registrations.get_mut(index))
+        {
+            record.install_peer_usage(path_instance_id, sequence, usage);
+            *registration = Some(ClientRegisteredCarrierPath {
+                path_id,
+                path_join_nonce,
+                path_instance_id,
+            });
+        }
+    }
+
+    #[cfg(test)]
     pub(in crate::runtime) fn install_peer_path_usage(
         &self,
         underlay: UnderlayProtocol,
@@ -63,14 +159,97 @@ impl ClientPathState {
         sequence: u64,
         usage: PathUsage,
     ) {
+        self.install_authenticated_path(
+            underlay,
+            index,
+            PathId(index as u16),
+            AuthNonce([0; 16]),
+            path_instance_id,
+            sequence,
+            usage,
+        );
+    }
+
+    pub(in crate::runtime) fn registered_carrier(
+        &self,
+        key: RelayPathKey,
+        expected_instance: CarrierPathInstanceId,
+    ) -> Option<ClientRegisteredCarrierPath> {
+        let registered = self
+            .registered_carriers
+            .lock()
+            .expect("client registered carrier lock");
+        let records = match key.underlay {
+            UnderlayProtocol::Tcp => &registered.tcp,
+            UnderlayProtocol::Udp => &registered.udp,
+        };
+        records
+            .get(key.index)
+            .copied()
+            .flatten()
+            .filter(|record| record.path_instance_id == expected_instance)
+    }
+
+    /// Returns one lock-coherent authenticated request-direction authority.
+    ///
+    /// Source addresses and configured locators are deliberately absent. The
+    /// physical instance and PATH_JOIN nonce fence carrier replacement; the
+    /// generation changes only with effective directional eligibility.
+    pub(in crate::runtime) fn current_request_tcp_service_carrier(
+        &self,
+        key: RelayPathKey,
+    ) -> Option<TcpServiceCarrierFence> {
+        if key.underlay != UnderlayProtocol::Tcp {
+            return None;
+        }
         let mut health = self.health.lock().expect("client path health lock");
-        let records = match underlay {
+        let record = health.tcp.get_mut(key.index)?;
+        record.maintain(Instant::now());
+        let eligibility_generation = record.request_tcp_service_eligibility_generation()?;
+        let registered = self
+            .registered_carriers
+            .lock()
+            .expect("client registered carrier lock");
+        let carrier = registered.tcp.get(key.index).copied().flatten()?;
+        Some(TcpServiceCarrierFence {
+            accepted: TcpCarrierAcceptedPath {
+                path_id: carrier.path_id,
+                path_join_nonce: carrier.path_join_nonce,
+            },
+            local_instance_id: carrier.path_instance_id,
+            eligibility_generation,
+        })
+    }
+
+    pub(in crate::runtime) fn retire_authenticated_path(
+        &self,
+        key: RelayPathKey,
+        expected_instance: CarrierPathInstanceId,
+    ) -> bool {
+        let mut health = self.health.lock().expect("client path health lock");
+        let mut registered = self
+            .registered_carriers
+            .lock()
+            .expect("client registered carrier lock");
+        let records = match key.underlay {
+            UnderlayProtocol::Tcp => &mut registered.tcp,
+            UnderlayProtocol::Udp => &mut registered.udp,
+        };
+        let Some(record) = records.get_mut(key.index) else {
+            return false;
+        };
+        if record.is_none_or(|current| current.path_instance_id != expected_instance) {
+            return false;
+        }
+        let health_records = match key.underlay {
             UnderlayProtocol::Tcp => &mut health.tcp,
             UnderlayProtocol::Udp => &mut health.udp,
         };
-        if let Some(record) = records.get_mut(index) {
-            record.install_peer_usage(path_instance_id, sequence, usage);
+        if let Some(current) = health_records.get_mut(key.index) {
+            current.retire_request_tcp_service_authority(expected_instance);
         }
+        *record = None;
+        true
     }
 
     pub(in crate::runtime) fn update_peer_path_usage(
@@ -138,6 +317,30 @@ impl ClientPathState {
         };
         if let Some(record) = records.get_mut(key.index) {
             record.release_load(lane);
+        }
+    }
+}
+
+pub(in crate::runtime) struct ClientTcpServiceWriterRegistration {
+    state: Weak<ClientPathState>,
+    stream_id: StreamId,
+    writer: RequestTcpServiceWriter,
+}
+
+impl Drop for ClientTcpServiceWriterRegistration {
+    fn drop(&mut self) {
+        let Some(state) = self.state.upgrade() else {
+            return;
+        };
+        let mut writers = state
+            .tcp_service_writers
+            .lock()
+            .expect("client TCP service writer registry lock");
+        if writers
+            .get(&self.stream_id)
+            .is_some_and(|current| current.same_actor(&self.writer))
+        {
+            writers.remove(&self.stream_id);
         }
     }
 }
@@ -328,6 +531,28 @@ impl Drop for RelayPathLoadLease {
 impl ClientPathContext {
     pub(in crate::runtime) fn health(&self) -> &Mutex<ClientPathHealth> {
         self.state.health()
+    }
+
+    pub(in crate::runtime) fn register_tcp_service_writer(
+        &self,
+        stream_id: StreamId,
+        writer: RequestTcpServiceWriter,
+    ) -> Result<ClientTcpServiceWriterRegistration, RuntimeError> {
+        self.state.register_tcp_service_writer(stream_id, writer)
+    }
+
+    pub(in crate::runtime) fn tcp_service_writer(
+        &self,
+        stream_id: StreamId,
+    ) -> Option<RequestTcpServiceWriter> {
+        self.state.tcp_service_writer(stream_id)
+    }
+
+    pub(in crate::runtime) fn current_request_tcp_service_carrier(
+        &self,
+        key: RelayPathKey,
+    ) -> Option<TcpServiceCarrierFence> {
+        self.state.current_request_tcp_service_carrier(key)
     }
 
     pub(in crate::runtime) fn request_tcp_capacity_probe_remaining_bytes(&self) -> u64 {

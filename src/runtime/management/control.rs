@@ -202,32 +202,29 @@ fn set_client_path_state(
             .expect("validated path runtime state");
         record.invalidate_path_proofs();
         if !record.is_locally_eligible() {
-            record.manual_disabled = state == PathControlState::Disabled;
-            record.state = SchedulerPathState::Draining;
-            record.failed_until = None;
-            if state == PathControlState::Disabled {
-                record.relay_bytes_in_flight = 0;
-                record.relay_queue_bytes = 0;
-            }
+            record.set_managed_path_state(
+                state == PathControlState::Disabled,
+                SchedulerPathState::Draining,
+                None,
+                state == PathControlState::Disabled,
+            );
             continue;
         }
         match state {
             PathControlState::Enabled | PathControlState::Suspect => {
-                record.manual_disabled = false;
-                record.state = SchedulerPathState::Suspect;
-                record.failed_until = None;
+                record.set_managed_path_state(false, SchedulerPathState::Suspect, None, false);
             }
             PathControlState::Failed => {
-                record.manual_disabled = false;
-                record.state = SchedulerPathState::Failed;
-                record.failed_until = Some(now + path_record_failure_cooldown(record));
+                let failed_until = now + path_record_failure_cooldown(record);
+                record.set_managed_path_state(
+                    false,
+                    SchedulerPathState::Failed,
+                    Some(failed_until),
+                    false,
+                );
             }
             PathControlState::Disabled => {
-                record.manual_disabled = true;
-                record.state = SchedulerPathState::Failed;
-                record.failed_until = None;
-                record.relay_bytes_in_flight = 0;
-                record.relay_queue_bytes = 0;
+                record.set_managed_path_state(true, SchedulerPathState::Failed, None, true);
             }
         }
     }

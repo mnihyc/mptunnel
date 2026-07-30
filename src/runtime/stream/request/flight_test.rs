@@ -47,10 +47,14 @@ fn duplicate_data_ack_releases_original_and_reinjected_flights_without_path_proo
         "a reinjection copy must not become the ordering owner"
     );
 
-    let released = ledger.release_normalized_acked_ranges(&[OffsetRange {
-        start: 0,
-        end: 4096,
-    }]);
+    let mut observed = Vec::new();
+    let released = ledger.release_normalized_acked_ranges_observed(
+        &[OffsetRange {
+            start: 0,
+            end: 4096,
+        }],
+        |release| observed.push(release),
+    );
 
     assert_eq!(released.len(), 2);
     for instance in [owner, reinjection] {
@@ -58,7 +62,19 @@ fn duplicate_data_ack_releases_original_and_reinjected_flights_without_path_proo
             .iter()
             .find(|release| release.instance == instance)
             .expect("the ACK releases every exact flight carrying these bytes");
+        let observed_release = observed
+            .iter()
+            .find(|release| release.instance == instance)
+            .expect("active observation retains exact release provenance");
+        assert_eq!(
+            observed_release.range,
+            OffsetRange {
+                start: 0,
+                end: 4096
+            }
+        );
         assert_eq!(release.bytes, 4096);
+        assert!(!observed_release.unambiguous);
         assert!(
             !release.path_proving,
             "duplicated bytes cannot identify which path delivered them"
@@ -100,13 +116,29 @@ fn an_unambiguous_partial_owner_ack_retains_and_proves_the_suffix() {
     let mut ledger = RequestFlightLedger::default();
     ledger.record_original_frame_instance(owner, &data_frame(0, 4096));
 
-    let prefix = ledger.release_normalized_acked_ranges(&[OffsetRange {
-        start: 0,
-        end: 1024,
-    }]);
+    let mut observed = Vec::new();
+    let prefix = ledger.release_normalized_acked_ranges_observed(
+        &[OffsetRange {
+            start: 0,
+            end: 1024,
+        }],
+        |release| observed.push(release),
+    );
     assert_eq!(prefix.len(), 1);
     assert_eq!(prefix[0].instance, owner);
+    assert_eq!(
+        observed[0].range,
+        OffsetRange {
+            start: 0,
+            end: 1024
+        }
+    );
     assert_eq!(prefix[0].bytes, 1024);
+    assert_eq!(
+        observed[0].kind,
+        crate::model::work::CarrierWorkKind::OriginalData
+    );
+    assert!(observed[0].unambiguous);
     assert!(prefix[0].path_proving);
     assert_eq!(
         ledger.latest_unacked_ranges_for_path_instance(owner),

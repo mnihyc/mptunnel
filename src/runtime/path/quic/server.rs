@@ -297,17 +297,20 @@ async fn admit_server_udp_path(
     };
     let local_usage = local_path.advertised_usage();
     let local_metrics = local_path.startup_metrics(path_id);
-    let path_registration = context.reliable_streams.register_carrier_path(
-        session_id,
-        UnderlayProtocol::Udp,
-        path_id,
-        ServerLocalPathProperties {
-            config_ordinal: local_path.config_ordinal(),
-            policy: local_path.policy(),
-            initial_metrics: Some(local_metrics),
-        },
-        path_join.principal_permit,
-    )?;
+    let path_registration = context
+        .reliable_streams
+        .register_authenticated_carrier_path(
+            session_id,
+            UnderlayProtocol::Udp,
+            path_id,
+            path_join.nonce,
+            ServerLocalPathProperties {
+                config_ordinal: local_path.config_ordinal(),
+                policy: local_path.policy(),
+                initial_metrics: Some(local_metrics),
+            },
+            path_join.principal_permit,
+        )?;
     context
         .reliable_streams
         .record_peer_path_usage(&path_registration, 0, peer_usage);

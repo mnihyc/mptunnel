@@ -2206,3 +2206,34 @@ entry is authoritative.
   - targeted regression passed;
   - all test targets compiled; and
   - formatting and whitespace checks passed.
+
+## 2026-07-30T14:45:02+08:00: Exact TCP service writer authority boundary
+
+- Name: directional writer observation and authenticated carrier fencing
+- Category: Core model and RFC alignment
+- State: authority boundary complete; producer and carrier expansion remain disconnected
+- Content:
+  - placed request-direction TCP-service controls in the logical stream actor's
+    existing FIFO so they cannot overtake data, attachment, or close events and
+    remain deliverable while the accepted attachment set is empty;
+  - established exact writer-flight observation at committed carrier writes
+    and exact Data ACK settlement at the owning stream actor, preserving
+    original, reinjected, pre-install, and active provenance without adding a
+    scheduler timer or changing an RFC parameter;
+  - replaced wrapping or zero attachment identities with checked nonzero
+    incarnations and fail-closed topology invalidation when a changed
+    attachment set can no longer receive a new identity;
+  - bound request-direction TCP-service eligibility to the authenticated path
+    identity, PATH_JOIN nonce, physical carrier instance, and a checked
+    eligibility generation rather than a locator or source address; and
+  - kept candidate creation, candidate binding, and the session controller
+    unconnected. The existing native TCP and QUIC carrier count and behavior
+    are therefore unchanged at this milestone.
+- Evidence:
+  - the focused TCP-service suite passed: 18 tests;
+  - the complete root library suite passed: 1,418 tests;
+  - all test targets compile under the locked dependency graph;
+  - whitespace validation passed; and
+  - no performance conclusion is recorded here. The next gate is the fixed
+    representative download/upload lab set on this clean commit, compared
+    with the historical champion before any producer is connected.

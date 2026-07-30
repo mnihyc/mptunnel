@@ -20,6 +20,7 @@ mod recent_ids;
 mod relay;
 mod sender;
 mod stream;
+mod tcp_service;
 mod telemetry;
 mod tun_l4;
 

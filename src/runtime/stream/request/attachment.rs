@@ -13,6 +13,7 @@ use crate::protocol::{Frame, ResetReason, StreamId, UnderlayProtocol};
 use crate::runtime::error::RuntimeError;
 use crate::runtime::path::{ClientPathContext, RelayPathLoadLease};
 use crate::runtime::stream::{ReliablePathStream, ReliablePathStreamHandle};
+use crate::runtime::tcp_service::RequestTcpServiceControl;
 use crate::scheduler::{PathSnapshot, TrafficClass, path_is_backup, score_path};
 use std::time::Instant;
 use tokio::sync::mpsc;
@@ -154,21 +155,51 @@ pub(in crate::runtime) struct ReliableRelayRemoteFrame {
     pub(in crate::runtime) frame: Result<Frame, RuntimeError>,
 }
 
+pub(in crate::runtime) enum RequestRelayActorEvent {
+    Frame(ReliableRelayRemoteFrame),
+    TcpService(Box<RequestTcpServiceControl>),
+}
+
+#[derive(Debug, Clone)]
+pub(in crate::runtime) struct RequestTcpServiceWriter {
+    events: mpsc::Sender<RequestRelayActorEvent>,
+}
+
+impl RequestTcpServiceWriter {
+    pub(in crate::runtime) async fn send(
+        &self,
+        control: RequestTcpServiceControl,
+    ) -> Result<(), RuntimeError> {
+        self.events
+            .send(RequestRelayActorEvent::TcpService(Box::new(control)))
+            .await
+            .map_err(|_| RuntimeError::ReliablePathSessionClosed)
+    }
+
+    pub(in crate::runtime) fn same_actor(&self, other: &Self) -> bool {
+        self.events.same_channel(&other.events)
+    }
+}
+
 /// Reports whether attachment-set ownership committed; a rejected pending open
 /// rolls back its carrier and scheduler lease when the value is dropped.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(in crate::runtime) enum ReliableRelayAttachOutcome {
     Attached,
     RejectedDuplicate,
+    RejectedResourceLimit,
 }
 
 pub(in crate::runtime) struct ReliableRelayRemoteSet {
     stream_id: StreamId,
     pub(in crate::runtime) paths: Vec<ReliableRelayRemotePath>,
-    frames_tx: mpsc::Sender<ReliableRelayRemoteFrame>,
-    frames_rx: mpsc::Receiver<ReliableRelayRemoteFrame>,
-    next_instance_id: u64,
+    events_tx: mpsc::Sender<RequestRelayActorEvent>,
+    events_rx: mpsc::Receiver<RequestRelayActorEvent>,
+    pending_tcp_service_control: Option<Box<RequestTcpServiceControl>>,
+    next_instance_id: Option<u64>,
     membership_generation: u64,
+    accepted_attachment_incarnation: u64,
+    topology_identity_valid: bool,
 }
 
 impl ReliableRelayRemoteSet {
@@ -178,12 +209,19 @@ impl ReliableRelayRemoteSet {
         let mut set = Self {
             stream_id,
             paths: Vec::new(),
-            frames_tx,
-            frames_rx,
-            next_instance_id: 0,
-            membership_generation: 0,
+            events_tx: frames_tx,
+            events_rx: frames_rx,
+            pending_tcp_service_control: None,
+            next_instance_id: Some(1),
+            membership_generation: 1,
+            accepted_attachment_incarnation: 1,
+            topology_identity_valid: true,
         };
-        set.attach(opened);
+        assert_eq!(
+            set.attach(opened),
+            ReliableRelayAttachOutcome::Attached,
+            "a newly initialized attachment set must accept its first path"
+        );
         set
     }
 
@@ -191,8 +229,19 @@ impl ReliableRelayRemoteSet {
         self.stream_id
     }
 
+    pub(in crate::runtime) fn tcp_service_writer(&self) -> RequestTcpServiceWriter {
+        RequestTcpServiceWriter {
+            events: self.events_tx.clone(),
+        }
+    }
+
     pub(in crate::runtime) fn membership_generation(&self) -> u64 {
         self.membership_generation
+    }
+
+    pub(in crate::runtime) fn accepted_attachment_incarnation(&self) -> Option<u64> {
+        self.topology_identity_valid
+            .then_some(self.accepted_attachment_incarnation)
     }
 
     /// A selection is valid only for the exact attachment topology it observed.
@@ -201,7 +250,7 @@ impl ReliableRelayRemoteSet {
         generation: u64,
         instance: RelayPathInstance,
     ) -> Option<usize> {
-        if self.membership_generation != generation {
+        if !self.topology_identity_valid || self.membership_generation != generation {
             return None;
         }
         self.paths
@@ -383,8 +432,20 @@ impl ReliableRelayRemoteSet {
         if self.contains_path_key(key) {
             return ReliableRelayAttachOutcome::RejectedDuplicate;
         }
-        let attachment_id = self.next_instance_id;
-        self.next_instance_id = self.next_instance_id.wrapping_add(1);
+        if !self.topology_identity_valid {
+            return ReliableRelayAttachOutcome::RejectedResourceLimit;
+        }
+        let Some(attachment_id) = self.next_instance_id else {
+            return ReliableRelayAttachOutcome::RejectedResourceLimit;
+        };
+        let Some(next_membership_generation) = self.membership_generation.checked_add(1) else {
+            return ReliableRelayAttachOutcome::RejectedResourceLimit;
+        };
+        let Some(next_attachment_incarnation) = self.accepted_attachment_incarnation.checked_add(1)
+        else {
+            return ReliableRelayAttachOutcome::RejectedResourceLimit;
+        };
+        let next_instance_id = attachment_id.checked_add(1);
         let path_instance_id = opened.path_instance_id;
         let instance = RelayPathInstance {
             key,
@@ -398,7 +459,7 @@ impl ReliableRelayRemoteSet {
             drop(load_lease.take());
         }
         let (stream, mut frames) = stream.into_handle_and_frames();
-        let frames_tx = self.frames_tx.clone();
+        let events_tx = self.events_tx.clone();
         tokio::spawn(async move {
             let mut product_terminal_received = false;
             while let Some(frame) = frames.recv().await {
@@ -407,8 +468,11 @@ impl ReliableRelayRemoteSet {
                     Ok(Frame::StreamFin { .. } | Frame::StreamReset { .. })
                 );
                 let done = frame.is_err();
-                if frames_tx
-                    .send(ReliableRelayRemoteFrame { instance, frame })
+                if events_tx
+                    .send(RequestRelayActorEvent::Frame(ReliableRelayRemoteFrame {
+                        instance,
+                        frame,
+                    }))
                     .await
                     .is_err()
                     || done
@@ -419,11 +483,11 @@ impl ReliableRelayRemoteSet {
             if product_terminal_received {
                 return;
             }
-            let _ = frames_tx
-                .send(ReliableRelayRemoteFrame {
+            let _ = events_tx
+                .send(RequestRelayActorEvent::Frame(ReliableRelayRemoteFrame {
                     instance,
                     frame: Err(RuntimeError::ReliablePathSessionClosed),
-                })
+                }))
                 .await;
         });
         let mut path = ReliableRelayRemotePath {
@@ -440,14 +504,19 @@ impl ReliableRelayRemoteSet {
             path.path_proof_id = Some(proof_id);
         }
         self.paths.push(path);
-        self.membership_generation = self.membership_generation.wrapping_add(1);
+        self.next_instance_id = next_instance_id;
+        self.membership_generation = next_membership_generation;
+        self.accepted_attachment_incarnation = next_attachment_incarnation;
         ReliableRelayAttachOutcome::Attached
     }
 
-    pub(in crate::runtime) async fn recv_frame(
+    pub(in crate::runtime) async fn recv_event(
         &mut self,
-    ) -> Result<ReliableRelayRemoteFrame, RuntimeError> {
-        self.frames_rx
+    ) -> Result<RequestRelayActorEvent, RuntimeError> {
+        if let Some(control) = self.pending_tcp_service_control.take() {
+            return Ok(RequestRelayActorEvent::TcpService(control));
+        }
+        self.events_rx
             .recv()
             .await
             .ok_or(RuntimeError::ReliablePathSessionClosed)
@@ -458,16 +527,28 @@ impl ReliableRelayRemoteSet {
     /// Ready-only receive batching snapshots this value before trying frames so
     /// producers cannot extend one actor turn indefinitely.
     pub(in crate::runtime) fn ready_frame_count(&self) -> usize {
-        self.frames_rx.len()
+        self.events_rx
+            .len()
+            .saturating_add(usize::from(self.pending_tcp_service_control.is_some()))
     }
 
-    /// Takes one already-queued frame without waiting.
+    /// Takes one already-queued frame without passing a lifecycle boundary.
     pub(in crate::runtime) fn try_recv_frame(&mut self) -> Option<ReliableRelayRemoteFrame> {
-        self.frames_rx.try_recv().ok()
+        if self.pending_tcp_service_control.is_some() {
+            return None;
+        }
+        match self.events_rx.try_recv() {
+            Ok(RequestRelayActorEvent::Frame(frame)) => Some(frame),
+            Ok(RequestRelayActorEvent::TcpService(control)) => {
+                self.pending_tcp_service_control = Some(control);
+                None
+            }
+            Err(_) => None,
+        }
     }
 
-    pub(in crate::runtime) fn has_buffered_frame(&self) -> bool {
-        !self.frames_rx.is_empty()
+    pub(in crate::runtime) fn has_buffered_event(&self) -> bool {
+        self.pending_tcp_service_control.is_some() || !self.events_rx.is_empty()
     }
 
     pub(in crate::runtime) async fn close_all(&mut self) {
@@ -497,7 +578,7 @@ impl ReliableRelayRemoteSet {
 
     fn take_paths_for_close(&mut self) -> Vec<ReliableRelayRemotePath> {
         if !self.paths.is_empty() {
-            self.membership_generation = self.membership_generation.wrapping_add(1);
+            self.advance_attachment_incarnation();
         }
         let mut paths = std::mem::take(&mut self.paths);
         // The set stops owning every path as one atomic scheduling event even
@@ -539,8 +620,25 @@ impl ReliableRelayRemoteSet {
         position: usize,
     ) -> Option<ReliableRelayRemotePath> {
         let path = self.paths.remove(position);
-        self.membership_generation = self.membership_generation.wrapping_add(1);
+        self.advance_attachment_incarnation();
         Some(path)
+    }
+
+    fn advance_attachment_incarnation(&mut self) {
+        if !self.topology_identity_valid {
+            return;
+        }
+        let Some(membership_generation) = self.membership_generation.checked_add(1) else {
+            self.topology_identity_valid = false;
+            return;
+        };
+        let Some(attachment_incarnation) = self.accepted_attachment_incarnation.checked_add(1)
+        else {
+            self.topology_identity_valid = false;
+            return;
+        };
+        self.membership_generation = membership_generation;
+        self.accepted_attachment_incarnation = attachment_incarnation;
     }
 
     /// Transfers a pre-enqueue claim after the synchronous queue commit.

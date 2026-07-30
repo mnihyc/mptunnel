@@ -1,6 +1,7 @@
 use super::client::{
     ClientRelayDisconnectedState, ClientRelayState, ClientStreamAckContext,
-    apply_client_stream_ack, apply_client_stream_data_state, evaluate_client_data_ack_reinjection,
+    apply_client_stream_ack, apply_client_stream_ack_for_tcp_service,
+    apply_client_stream_data_state, evaluate_client_data_ack_reinjection,
     update_request_path_staleness,
 };
 use super::diagnostics::log_unexpected_stream_relay_frame;
@@ -35,13 +36,14 @@ use crate::model::capacity::{
     reliable_relay_buffer_len, reliable_relay_sender_dispatch_budget,
     reliable_stream_initial_advertised_window_bytes,
 };
+use crate::model::tcp_service::TcpServiceWriterLifecycle;
 use crate::model::timing::sender_service_retry_delay;
 use crate::model::timing::transport_pto_from_snapshot;
-use crate::mux::stream::{ReliableRecvStream, ReliableSendStream};
+use crate::mux::stream::{ReliableRecvStream, ReliableSendStream, StreamError};
 use crate::performance::MppPerformanceConfig;
 #[cfg(feature = "lab-diagnostics")]
 use crate::protocol::frame::reliable_path_frame_pacing_bytes;
-use crate::protocol::{Frame, ResetReason};
+use crate::protocol::{Frame, OffsetRange, ResetReason, StreamId};
 use crate::runtime::error::{RuntimeError, reliable_path_error_is_migratable};
 use crate::runtime::path::commands::reliable_stream_frame_queue;
 use crate::runtime::path::{ClientPathContext, PathDeliveryStats};
@@ -52,13 +54,14 @@ use crate::runtime::sender::{
 };
 use crate::runtime::stream::{
     OpenedRemoteStream, ReliableRelayRemoteFrame, ReliableRelayRemotePath, ReliableRelayRemoteSet,
-    wait_for_carrier_capacity_notifies,
+    RequestRelayActorEvent, StreamSendBufferReservation, wait_for_carrier_capacity_notifies,
 };
 use crate::runtime::stream::{
     reliable_relay_recv_progress_resend_active, reliable_stream_recv_progress_interval,
 };
+use crate::runtime::tcp_service::RequestTcpServiceControl;
 use crate::runtime::telemetry::ObservedProductIo;
-use crate::scheduler::TrafficClass;
+use crate::scheduler::{PathSnapshot, TrafficClass};
 use std::future::Future;
 use std::time::Instant;
 use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt};
@@ -68,6 +71,126 @@ async fn wait_for_optional_deadline(deadline: Option<tokio::time::Instant>) {
     match deadline {
         Some(deadline) => tokio::time::sleep_until(deadline).await,
         None => std::future::pending().await,
+    }
+}
+
+struct ClientStreamAckOperation<'a> {
+    state: &'a mut ClientRelayState,
+    sender_queue: &'a mut ReliableRelaySenderQueue,
+    context: &'a ClientPathContext,
+    remotes: &'a ReliableRelayRemoteSet,
+    send_stream: &'a mut ReliableSendStream,
+    path_snapshot: Option<PathSnapshot>,
+    relay_lane: TrafficClass,
+    send_buffer_reservation: &'a mut StreamSendBufferReservation,
+    stream_id: StreamId,
+    complete: bool,
+    ranges: Vec<OffsetRange>,
+}
+
+fn apply_ordinary_client_stream_ack(
+    sender: &mut RequestSenderService,
+    operation: ClientStreamAckOperation<'_>,
+) -> Result<usize, StreamError> {
+    let ClientStreamAckOperation {
+        state,
+        sender_queue,
+        context,
+        remotes,
+        send_stream,
+        path_snapshot,
+        relay_lane,
+        send_buffer_reservation,
+        stream_id,
+        complete,
+        ranges,
+    } = operation;
+    let released = apply_client_stream_ack(
+        ClientStreamAckContext {
+            state,
+            sender,
+            sender_queue,
+            context,
+            remotes,
+            send_stream,
+            path_snapshot,
+            relay_lane,
+        },
+        stream_id,
+        complete,
+        ranges,
+    )?;
+    send_buffer_reservation.release(released);
+    Ok(released)
+}
+
+fn apply_observed_client_stream_ack(
+    sender: &mut RequestSenderService,
+    operation: ClientStreamAckOperation<'_>,
+    lifecycle: TcpServiceWriterLifecycle,
+) -> Result<usize, StreamError> {
+    let ClientStreamAckOperation {
+        state,
+        sender_queue,
+        context,
+        remotes,
+        send_stream,
+        path_snapshot,
+        relay_lane,
+        send_buffer_reservation,
+        stream_id,
+        complete,
+        ranges,
+    } = operation;
+    let released = apply_client_stream_ack_for_tcp_service(
+        ClientStreamAckContext {
+            state,
+            sender,
+            sender_queue,
+            context,
+            remotes,
+            send_stream,
+            path_snapshot,
+            relay_lane,
+        },
+        stream_id,
+        complete,
+        ranges,
+        lifecycle,
+    )?;
+    send_buffer_reservation.release(released);
+    Ok(released)
+}
+
+fn apply_request_tcp_service_control(
+    sender: &mut RequestSenderService,
+    control: RequestTcpServiceControl,
+) {
+    match control {
+        RequestTcpServiceControl::Install { install, receipt } => {
+            let result = sender.install_tcp_service_observer(
+                install.stream,
+                install.accepted,
+                install.candidate,
+                install.coordinator,
+                install.max_flight_records,
+                install.max_ack_release_records,
+            );
+            let _ = receipt.send(result);
+        }
+        RequestTcpServiceControl::BindCandidate {
+            lifecycle,
+            instance,
+            fence,
+            receipt,
+        } => {
+            let result = sender.bind_tcp_service_candidate(lifecycle, instance, fence);
+            let _ = receipt.send(result);
+        }
+        RequestTcpServiceControl::Remove { lifecycle, receipt } => {
+            let result = sender.remove_tcp_service_observer(lifecycle);
+            let _ = receipt.send(result);
+        }
     }
 }
 
@@ -239,6 +362,8 @@ where
     let mut buf = bytes::BytesMut::with_capacity(chunk_size);
     let mut state = ClientRelayState::new();
     let mut sender = RequestSenderService::new_with_performance(stream_id, performance);
+    let tcp_service_writer_registration =
+        context.register_tcp_service_writer(stream_id, remotes.tcp_service_writer())?;
     let mut flow_demand = ReliableRelayFlowDemandTracker::new();
     let mut request_flow_demand = ReliableRelayFlowDemandTracker::new();
     let mut sender_queue = ReliableRelaySenderQueue::default();
@@ -300,6 +425,16 @@ where
                     .expect("disconnected relay state")
                     .retry_at;
                 tokio::select! {
+                    event = remotes.recv_event() => {
+                        match event {
+                            Ok(RequestRelayActorEvent::TcpService(control)) => {
+                                apply_request_tcp_service_control(&mut sender, *control);
+                            }
+                            Ok(RequestRelayActorEvent::Frame(_)) => {}
+                            Err(err) => break Err(err),
+                        }
+                        continue;
+                    }
                     _ = tokio::time::sleep_until(retry_at) => continue,
                     _ = wait_for_optional_deadline(retention_deadline) => {
                         break Err(RuntimeError::SessionRetentionTimeout);
@@ -308,6 +443,16 @@ where
             }
 
             tokio::select! {
+                event = remotes.recv_event() => {
+                    match event {
+                        Ok(RequestRelayActorEvent::TcpService(control)) => {
+                            apply_request_tcp_service_control(&mut sender, *control);
+                        }
+                        Ok(RequestRelayActorEvent::Frame(_)) => {}
+                        Err(err) => break Err(err),
+                    }
+                    continue;
+                }
                 additional_path_open = additional_path_open_rx.recv() => {
                     let Some(additional_path_open) = additional_path_open else {
                         cancel_pending_additional_path_opens(
@@ -701,7 +846,7 @@ where
         if sender.discard_resolved_stale_path_reinjections(&mut sender_queue, &remotes) > 0 {
             state.progress.sender_retry_at = None;
         }
-        let inbound_frame_ready = deferred_remote_frame.is_some() || remotes.has_buffered_frame();
+        let inbound_frame_ready = deferred_remote_frame.is_some() || remotes.has_buffered_event();
         let queued_send_blocked = reliable_relay_queued_send_blocked_for_retry(
             sender_queue.is_empty(),
             state.progress.sender_retry_at,
@@ -1511,11 +1656,15 @@ where
                 #[cfg(feature = "lab-diagnostics")]
                 let recv_started = Instant::now();
                 let result = match deferred_remote_frame.take() {
-                    Some(frame) => Ok(frame),
-                    None => remotes.recv_frame().await,
+                    Some(frame) => Ok(RequestRelayActorEvent::Frame(frame)),
+                    None => remotes.recv_event().await,
                 };
                 #[cfg(feature = "lab-diagnostics")]
-                if let Ok(ReliableRelayRemoteFrame { frame: Ok(frame), .. }) = &result {
+                if let Ok(RequestRelayActorEvent::Frame(ReliableRelayRemoteFrame {
+                    frame: Ok(frame),
+                    ..
+                })) = &result
+                {
                     lab_perf_record(
                         "relay.path_recv_frame_wait",
                         recv_started.elapsed(),
@@ -1523,9 +1672,9 @@ where
                     );
                 }
                 result
-            }, if state.endpoint.remote_open || send_stream.reinjection_bytes() > 0 => {
-                let ReliableRelayRemoteFrame { instance, frame } = match frame {
-                    Ok(frame) => frame,
+            } => {
+                let event = match frame {
+                    Ok(event) => event,
                     Err(err) if reliable_path_error_is_migratable(&err) => {
                         match attach_reliable_relay_paths_with_recovery_exclusions(
                             context,
@@ -1565,6 +1714,19 @@ where
                         }
                         break Err(err);
                     }
+                };
+                let ReliableRelayRemoteFrame { instance, frame } = match event {
+                    RequestRelayActorEvent::TcpService(control) => {
+                        apply_request_tcp_service_control(&mut sender, *control);
+                        continue;
+                    }
+                    RequestRelayActorEvent::Frame(frame)
+                        if state.endpoint.remote_open
+                            || send_stream.reinjection_bytes() > 0 =>
+                    {
+                        frame
+                    }
+                    RequestRelayActorEvent::Frame(_) => continue,
                 };
                 let path_key = instance.key;
                 let frame = match frame {
@@ -1781,25 +1943,26 @@ where
                         complete,
                         ranges,
                     } if ack_stream_id == stream_id => {
-                        let released_bytes = match apply_client_stream_ack(
-                            ClientStreamAckContext {
-                                state: &mut state,
-                                sender: &mut sender,
-                                sender_queue: &mut sender_queue,
-                                context,
-                                remotes: &remotes,
-                                send_stream: &mut send_stream,
-                                path_snapshot,
-                                relay_lane,
-                            },
+                        let ack = ClientStreamAckOperation {
+                            state: &mut state,
+                            sender_queue: &mut sender_queue,
+                            context,
+                            remotes: &remotes,
+                            send_stream: &mut send_stream,
+                            path_snapshot,
+                            relay_lane,
+                            send_buffer_reservation: &mut send_buffer_reservation,
                             stream_id,
                             complete,
                             ranges,
-                        ) {
-                            Ok(released_bytes) => released_bytes,
-                            Err(err) => break Err(err.into()),
                         };
-                        send_buffer_reservation.release(released_bytes);
+                        if let Err(err) = sender.with_tcp_service_ack_transaction(
+                            ack,
+                            apply_ordinary_client_stream_ack,
+                            apply_observed_client_stream_ack,
+                        ) {
+                            break Err(err.into());
+                        }
                         if reliable_relay_can_send_pending_fin(
                             state.endpoint.pending_local_fin,
                             sender_queue.is_empty(),
@@ -1955,6 +2118,7 @@ where
         }
     };
 
+    drop(tcp_service_writer_registration);
     let _ = drain_completed_additional_path_opens(
         context,
         stream_id,

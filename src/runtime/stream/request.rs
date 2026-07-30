@@ -9,11 +9,14 @@ mod state;
 
 pub(in crate::runtime) use attachment::{
     OpenedRemoteStream, ReliableRelayAttachOutcome, ReliableRelayRemoteFrame,
-    ReliableRelayRemotePath, ReliableRelayRemoteSet,
+    ReliableRelayRemotePath, ReliableRelayRemoteSet, RequestRelayActorEvent,
+    RequestTcpServiceWriter,
 };
 // Keep inferred result/state types nameable without exposing child modules.
 #[allow(unused_imports)]
-pub(in crate::runtime) use flight::{RequestFlightLedger, RequestPathRelease};
+pub(in crate::runtime) use flight::{
+    RequestFlightLedger, RequestObservedPathRelease, RequestPathRelease,
+};
 #[allow(unused_imports)]
 pub(in crate::runtime) use state::{
     RequestAckClockOperation, RequestPathState, RequestPathStates, RequestStreamState,

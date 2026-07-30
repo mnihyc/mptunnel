@@ -18,6 +18,9 @@ use crate::model::capacity::{
 };
 use crate::model::multipath::ExtraTrafficLedger;
 use crate::model::path::{RelayPathInstance, RelayPathKey};
+use crate::model::tcp_service::{
+    TcpServiceCarrierFence, TcpServiceStreamFence, TcpServiceWriterLifecycle,
+};
 use crate::model::timing::reliable_relay_tail_reinjection_delay;
 use crate::model::work::{
     reliable_critical_tail_reinjection_limit_bytes,
@@ -42,8 +45,12 @@ use crate::runtime::stream::ReliablePathStreamHandle;
 use crate::runtime::stream::{
     ReliablePathStreamOutput, ReliableRecvProgress, ReliableRelayRemoteSet,
 };
+use crate::runtime::tcp_service::{
+    TcpServiceFlightSidecarError, TcpServiceObserverRemoval, TcpServiceWriterCoordinator,
+};
 use crate::scheduler::{PathSnapshot, TrafficClass};
 use bytes::Bytes;
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 mod multipath;
@@ -148,6 +155,69 @@ impl RequestSenderService {
         }
     }
 
+    pub(in crate::runtime) fn install_tcp_service_observer(
+        &mut self,
+        stream: TcpServiceStreamFence,
+        carriers: Vec<(RelayPathInstance, TcpServiceCarrierFence)>,
+        candidate: TcpServiceCarrierFence,
+        coordinator: Arc<TcpServiceWriterCoordinator>,
+        max_flight_records: usize,
+        max_ack_release_records: usize,
+    ) -> Result<bool, TcpServiceFlightSidecarError> {
+        self.multipath.install_tcp_service_observer(
+            stream,
+            carriers,
+            candidate,
+            coordinator,
+            max_flight_records,
+            max_ack_release_records,
+        )
+    }
+
+    pub(in crate::runtime) fn bind_tcp_service_candidate(
+        &mut self,
+        lifecycle: TcpServiceWriterLifecycle,
+        instance: RelayPathInstance,
+        fence: TcpServiceCarrierFence,
+    ) -> Result<bool, TcpServiceFlightSidecarError> {
+        self.multipath
+            .bind_tcp_service_candidate(lifecycle, instance, fence)
+    }
+
+    pub(in crate::runtime) fn remove_tcp_service_observer(
+        &mut self,
+        lifecycle: TcpServiceWriterLifecycle,
+    ) -> TcpServiceObserverRemoval {
+        self.multipath.remove_tcp_service_observer(lifecycle)
+    }
+
+    /// Runs one complete Product ACK transaction under the shared lifecycle
+    /// writer lock when an observer is installed. The inactive path has one
+    /// nullable branch and otherwise executes its unchanged callback.
+    #[inline]
+    pub(in crate::runtime) fn with_tcp_service_ack_transaction<C, R>(
+        &mut self,
+        context: C,
+        ordinary: impl FnOnce(&mut Self, C) -> R,
+        active: impl FnOnce(&mut Self, C, TcpServiceWriterLifecycle) -> R,
+    ) -> R {
+        let Some(observer) = self.multipath.tcp_service.as_ref() else {
+            return ordinary(self, context);
+        };
+        let coordinator = observer.coordinator.clone();
+        let mut transaction = coordinator.lock();
+        let result = active(self, context, transaction.lifecycle());
+        self.multipath
+            .finish_tcp_service_ack_active(&mut transaction);
+        result
+    }
+
+    pub(in crate::runtime) fn take_tcp_service_failure(
+        &mut self,
+    ) -> Option<TcpServiceFlightSidecarError> {
+        self.multipath.take_tcp_service_failure()
+    }
+
     pub(in crate::runtime) async fn fail_client_path_instance(
         &mut self,
         context: &ClientPathContext,
@@ -236,6 +306,34 @@ impl RequestSenderService {
         send_stream: &mut ReliableSendStream,
         ack: &ValidatedStreamAck,
     ) -> Result<RequestProductAckOutcome, StreamError> {
+        self.apply_request_product_ack_inner::<false>(context, remotes, send_stream, ack, None)
+    }
+
+    pub(in crate::runtime) fn apply_request_product_ack_for_tcp_service(
+        &mut self,
+        context: &ClientPathContext,
+        remotes: &ReliableRelayRemoteSet,
+        send_stream: &mut ReliableSendStream,
+        ack: &ValidatedStreamAck,
+        lifecycle: TcpServiceWriterLifecycle,
+    ) -> Result<RequestProductAckOutcome, StreamError> {
+        self.apply_request_product_ack_inner::<true>(
+            context,
+            remotes,
+            send_stream,
+            ack,
+            Some(lifecycle),
+        )
+    }
+
+    fn apply_request_product_ack_inner<const OBSERVE_TCP_SERVICE: bool>(
+        &mut self,
+        context: &ClientPathContext,
+        remotes: &ReliableRelayRemoteSet,
+        send_stream: &mut ReliableSendStream,
+        ack: &ValidatedStreamAck,
+        tcp_service_lifecycle: Option<TcpServiceWriterLifecycle>,
+    ) -> Result<RequestProductAckOutcome, StreamError> {
         #[cfg(feature = "lab-diagnostics")]
         let mux_started = Instant::now();
         let mux = send_stream.apply_validated_ack(ack)?;
@@ -245,9 +343,24 @@ impl RequestSenderService {
             self.record_delivered_data(mux.released_bytes);
         }
         let acked_at = Instant::now();
-        let data_ack_progress_paths =
-            self.multipath
-                .apply_product_ack(context, remotes, ack.ranges(), acked_at);
+        let data_ack_progress_paths = if OBSERVE_TCP_SERVICE {
+            self.multipath.apply_product_ack_for_tcp_service(
+                context,
+                remotes,
+                ack.ranges(),
+                ack.assigned_end(),
+                acked_at,
+                tcp_service_lifecycle.expect("active TCP service ACK carries its writer lifecycle"),
+            )
+        } else {
+            self.multipath.apply_product_ack(
+                context,
+                remotes,
+                ack.ranges(),
+                ack.assigned_end(),
+                acked_at,
+            )
+        };
         Ok(RequestProductAckOutcome {
             mux,
             data_ack_progress_paths,
@@ -724,9 +837,14 @@ impl RequestSenderService {
                         position,
                         remotes.paths.len(),
                     );
-                    let payload_bytes =
-                        self.multipath.record_emitted_frame(instance, &frame, cause);
-                    command.commit();
+                    let payload_bytes = self.multipath.record_and_publish_emitted_frame(
+                        instance,
+                        &frame,
+                        cause,
+                        || {
+                            command.commit();
+                        },
+                    );
                     return Ok((instance, payload_bytes));
                 }
                 Err(RuntimeError::SenderServiceBlocked) => {

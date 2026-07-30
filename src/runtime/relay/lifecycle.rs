@@ -241,6 +241,20 @@ pub(super) async fn handle_additional_path_open_result(
                     );
                     None
                 }
+                ReliableRelayAttachOutcome::RejectedResourceLimit => {
+                    #[cfg(feature = "lab-diagnostics")]
+                    lab_diagnostic(
+                        "relay_additional_path_open_resource_limit",
+                        format_args!(
+                            "stream_id={} path_underlay={:?} path_index={} pending={}",
+                            stream_id.0,
+                            additional_path_open.key.underlay,
+                            additional_path_open.key.index,
+                            pending_count,
+                        ),
+                    );
+                    None
+                }
             }
         }
         Err(err) if relay_path_open_error_is_retryable(additional_path_open.key.underlay, &err) => {

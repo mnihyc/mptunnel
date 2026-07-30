@@ -290,6 +290,51 @@ fn peer_path_usage_is_directional_and_sequence_ordered_per_underlay() {
         Some(PathUsage::Available),
         "stale or duplicate PATH_STATUS must not overwrite the newest preference"
     );
+    let tcp_key = RelayPathKey {
+        underlay: UnderlayProtocol::Tcp,
+        index: 0,
+    };
+    let available_authority = context
+        .current_request_tcp_service_carrier(tcp_key)
+        .expect("AVAILABLE authenticated TCP carrier authority");
+    assert!(context.state.update_peer_path_usage(
+        UnderlayProtocol::Tcp,
+        0,
+        tcp_g1,
+        3,
+        PathUsage::Available,
+    ));
+    assert_eq!(
+        context
+            .current_request_tcp_service_carrier(tcp_key)
+            .expect("unchanged AVAILABLE authority")
+            .eligibility_generation,
+        available_authority.eligibility_generation,
+        "a newer status sequence with unchanged usage is not an eligibility change"
+    );
+    assert!(context.state.update_peer_path_usage(
+        UnderlayProtocol::Tcp,
+        0,
+        tcp_g1,
+        4,
+        PathUsage::Backup,
+    ));
+    assert_eq!(
+        context.current_request_tcp_service_carrier(tcp_key),
+        None,
+        "BACKUP preference cannot be bypassed for service validation"
+    );
+    assert!(context.state.update_peer_path_usage(
+        UnderlayProtocol::Tcp,
+        0,
+        tcp_g1,
+        5,
+        PathUsage::Available,
+    ));
+    let restored_authority = context
+        .current_request_tcp_service_carrier(tcp_key)
+        .expect("restored AVAILABLE authority");
+    assert!(restored_authority.eligibility_generation > available_authority.eligibility_generation);
 
     let tcp_g2 = next_carrier_path_instance_id();
     context

@@ -15,6 +15,7 @@ use super::lifecycle::{RelayAdditionalPathOpenTask, maybe_mark_live_relay_path_d
 use crate::lab_diagnostics::{lab_diagnostic, lab_perf_record};
 use crate::model::capacity::adaptive_reliable_relay_reinjection_bytes;
 use crate::model::path::{RelayPathInstance, RelayPathKey};
+use crate::model::tcp_service::TcpServiceWriterLifecycle;
 use crate::model::timing::{
     reliable_data_ack_recovery_deadline, reliable_data_retransmission_interval,
 };
@@ -600,6 +601,26 @@ pub(super) fn apply_client_stream_ack(
     complete: bool,
     ranges: Vec<OffsetRange>,
 ) -> Result<usize, StreamError> {
+    apply_client_stream_ack_inner::<false>(ack_context, stream_id, complete, ranges, None)
+}
+
+pub(super) fn apply_client_stream_ack_for_tcp_service(
+    ack_context: ClientStreamAckContext<'_>,
+    stream_id: StreamId,
+    complete: bool,
+    ranges: Vec<OffsetRange>,
+    lifecycle: TcpServiceWriterLifecycle,
+) -> Result<usize, StreamError> {
+    apply_client_stream_ack_inner::<true>(ack_context, stream_id, complete, ranges, Some(lifecycle))
+}
+
+fn apply_client_stream_ack_inner<const OBSERVE_TCP_SERVICE: bool>(
+    ack_context: ClientStreamAckContext<'_>,
+    stream_id: StreamId,
+    complete: bool,
+    ranges: Vec<OffsetRange>,
+    tcp_service_lifecycle: Option<TcpServiceWriterLifecycle>,
+) -> Result<usize, StreamError> {
     // Capture one immutable assignment horizon before touching any ACK-owned
     // cache, flight, queue, reservation, or recovery evidence.
     let validated_ack = begin_reliable_stream_ack(ack_context.send_stream, complete, ranges)?;
@@ -618,8 +639,17 @@ pub(super) fn apply_client_stream_ack(
     let normalized_ranges = validated_ack.ranges();
     #[cfg(feature = "lab-diagnostics")]
     let previous_reinjection_bytes = send_stream.reinjection_bytes();
-    let ack_outcome =
-        sender.apply_request_product_ack(context, remotes, send_stream, &validated_ack)?;
+    let ack_outcome = if OBSERVE_TCP_SERVICE {
+        sender.apply_request_product_ack_for_tcp_service(
+            context,
+            remotes,
+            send_stream,
+            &validated_ack,
+            tcp_service_lifecycle.expect("active TCP service ACK carries its writer lifecycle"),
+        )?
+    } else {
+        sender.apply_request_product_ack(context, remotes, send_stream, &validated_ack)?
+    };
     update_reinjection_authoritative_ack_snapshot(
         &mut state.progress.last_send_ack,
         &validated_ack,

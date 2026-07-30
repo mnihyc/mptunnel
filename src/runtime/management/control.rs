@@ -176,43 +176,35 @@ fn set_client_path_state(
     selection: &ClientPathSelection,
     state: PathControlState,
 ) -> Result<(), ManagementHttpError> {
+    let mut health = context
+        .health()
+        .lock()
+        .expect("client path health management lock");
+    let records = match selection.underlay {
+        UnderlayProtocol::Tcp => &mut health.tcp,
+        UnderlayProtocol::Udp => &mut health.udp,
+    };
+    if selection
+        .indices
+        .iter()
+        .any(|index| records.get(*index).is_none())
+    {
+        return Err(ManagementHttpError::new(
+            404,
+            "Not Found",
+            "path runtime state is unavailable",
+        ));
+    }
     let now = Instant::now();
-    let updated =
-        context.update_managed_path_records(selection.underlay, &selection.indices, |record| {
-            record.invalidate_path_proofs();
-            if !record.is_locally_eligible() {
-                match state {
-                    PathControlState::Enabled | PathControlState::Suspect => {
-                        record.set_managed_path_state(
-                            false,
-                            SchedulerPathState::Draining,
-                            None,
-                            false,
-                        );
-                    }
-                    PathControlState::Failed => {
-                        let failed_until = now + path_record_failure_cooldown(record);
-                        record.set_managed_path_state(
-                            false,
-                            SchedulerPathState::Failed,
-                            Some(failed_until),
-                            false,
-                        );
-                    }
-                    PathControlState::Disabled => {
-                        record.set_managed_path_state(
-                            true,
-                            SchedulerPathState::Draining,
-                            None,
-                            true,
-                        );
-                    }
-                }
-                return;
-            }
+    for index in &selection.indices {
+        let record = records
+            .get_mut(*index)
+            .expect("validated path runtime state");
+        record.invalidate_path_proofs();
+        if !record.is_locally_eligible() {
             match state {
                 PathControlState::Enabled | PathControlState::Suspect => {
-                    record.set_managed_path_state(false, SchedulerPathState::Suspect, None, false);
+                    record.set_managed_path_state(false, SchedulerPathState::Draining, None, false);
                 }
                 PathControlState::Failed => {
                     let failed_until = now + path_record_failure_cooldown(record);
@@ -224,16 +216,28 @@ fn set_client_path_state(
                     );
                 }
                 PathControlState::Disabled => {
-                    record.set_managed_path_state(true, SchedulerPathState::Failed, None, true);
+                    record.set_managed_path_state(true, SchedulerPathState::Draining, None, true);
                 }
             }
-        });
-    if !updated {
-        return Err(ManagementHttpError::new(
-            404,
-            "Not Found",
-            "path runtime state is unavailable",
-        ));
+            continue;
+        }
+        match state {
+            PathControlState::Enabled | PathControlState::Suspect => {
+                record.set_managed_path_state(false, SchedulerPathState::Suspect, None, false);
+            }
+            PathControlState::Failed => {
+                let failed_until = now + path_record_failure_cooldown(record);
+                record.set_managed_path_state(
+                    false,
+                    SchedulerPathState::Failed,
+                    Some(failed_until),
+                    false,
+                );
+            }
+            PathControlState::Disabled => {
+                record.set_managed_path_state(true, SchedulerPathState::Failed, None, true);
+            }
+        }
     }
     Ok(())
 }

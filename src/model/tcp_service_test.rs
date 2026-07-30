@@ -151,12 +151,10 @@ impl ValidationHarness {
         carrier_group_id: TcpServiceCarrierGroupId,
         fence: TcpServiceValidationFence,
     ) {
-        if self.controller.has_active_lifecycle() {
-            let cleanup = self
-                .controller
+        if self.controller.has_active_validation() {
+            self.controller
                 .finish(&mut self.validation, self.clock, &self.fence)
                 .expect("settled validation must finish before replacement");
-            assert!(self.controller.complete_cleanup(cleanup));
         }
         let registered_at = self.clock + Duration::from_nanos(1);
         let initial_at = registered_at + Duration::from_nanos(1);
@@ -358,30 +356,12 @@ fn six_window_validation_retains_only_strictly_faster_aggregate_service() {
         harness.validation.phase(),
         TcpServiceValidationPhase::Settled
     );
-    let cleanup = harness
-        .controller
-        .finish(&mut harness.validation, harness.clock, &harness.fence)
-        .expect("settled validation enters cleanup");
-    assert_eq!(cleanup.outcome(), &outcome);
-    assert!(harness.controller.has_active_lifecycle());
     assert_eq!(
         harness
             .controller
-            .reserve(TcpServiceValidationPlan {
-                session_id: SessionId(9),
-                trial_id: 4,
-                direction: PathMetricDirection::ClientToServer,
-                carrier_group_id: carrier_group(1),
-                fence: harness.fence.clone(),
-                limits: limits(),
-                registered_at: harness.clock + Duration::from_nanos(1),
-                absolute_deadline: harness.clock + Duration::from_secs(1),
-            })
-            .expect_err("observer cleanup must precede a later reservation"),
-        TcpServiceValidationError::ValidationInProgress
+            .finish(&mut harness.validation, harness.clock, &harness.fence),
+        Some(outcome)
     );
-    assert_eq!(harness.controller.pending_cleanup(), Some(cleanup.clone()));
-    assert!(harness.controller.complete_cleanup(cleanup));
 
     let mut stale_finish = ValidationHarness::new();
     stale_finish.drive_to_post_reference(Duration::from_millis(1));
@@ -389,19 +369,15 @@ fn six_window_validation_retains_only_strictly_faster_aggregate_service() {
     stale_finish.accepted_window(Duration::from_millis(20));
     let mut changed = stale_finish.fence.clone();
     changed.accepted[0].eligibility_generation += 1;
-    let cleanup = stale_finish
+    let outcome = stale_finish
         .controller
         .finish(&mut stale_finish.validation, stale_finish.clock, &changed)
         .expect("finish produces current authority");
+    assert_eq!(outcome.result, TcpCarrierValidationResult::Withdrawn);
     assert_eq!(
-        cleanup.outcome().result,
-        TcpCarrierValidationResult::Withdrawn
-    );
-    assert_eq!(
-        cleanup.outcome().withdrawal_reason,
+        outcome.withdrawal_reason,
         Some(TcpServiceWithdrawalReason::FenceChanged)
     );
-    assert!(stale_finish.controller.complete_cleanup(cleanup));
 }
 
 #[test]
@@ -417,12 +393,12 @@ fn no_gain_records_exact_reference_suppression_without_a_percentage_margin() {
         .expect("settled outcome")
         .clone();
     assert_eq!(outcome.result, TcpCarrierValidationResult::NoGain);
-    let cleanup = harness
-        .controller
-        .finish(&mut harness.validation, harness.clock, &harness.fence)
-        .expect("no-gain settlement enters cleanup");
-    assert_eq!(cleanup.outcome(), &outcome);
-    assert!(harness.controller.complete_cleanup(cleanup));
+    assert_eq!(
+        harness
+            .controller
+            .finish(&mut harness.validation, harness.clock, &harness.fence),
+        Some(outcome.clone())
+    );
     let suppression = outcome
         .no_gain_suppression
         .as_ref()
@@ -492,15 +468,14 @@ fn no_gain_records_exact_reference_suppression_without_a_percentage_margin() {
             .withdraw(TcpServiceWithdrawalReason::DemandEnded),
         TcpServiceValidationUpdate::Settled
     );
-    let other_group_cleanup = harness
+    let other_group_outcome = harness
         .controller
         .finish(&mut harness.validation, harness.clock, &harness.fence)
         .expect("unrelated carrier-group withdrawal finishes");
     assert_eq!(
-        other_group_cleanup.outcome().withdrawal_reason,
+        other_group_outcome.withdrawal_reason,
         Some(TcpServiceWithdrawalReason::DemandEnded)
     );
-    assert!(harness.controller.complete_cleanup(other_group_cleanup));
 
     harness.restart_validation_for_group(5, carrier_group(1), same_fence);
     harness.accepted_window(Duration::from_millis(20));
@@ -765,11 +740,10 @@ fn candidate_permits_cannot_cross_validation_lifecycles() {
     harness
         .validation
         .withdraw(TcpServiceWithdrawalReason::DemandEnded);
-    let cleanup = harness
+    harness
         .controller
         .finish(&mut harness.validation, harness.clock, &harness.fence)
         .expect("first lifecycle settlement");
-    assert!(harness.controller.complete_cleanup(cleanup));
 
     let fence = harness.fence.clone();
     harness.restart_validation(4, fence);
@@ -905,18 +879,18 @@ fn absolute_deadline_recovers_cancelled_installing_and_running_lifecycles() {
             .begin_expiry(absolute_deadline - Duration::from_nanos(1))
             .is_none()
     );
-    let cleanup = controller
+    let expired = controller
         .begin_expiry(absolute_deadline)
         .expect("cancelled installation expires");
-    assert_eq!(cleanup.writer_lifecycle(), installing_lifecycle);
-    drop(cleanup);
-    let cleanup = controller
+    assert_eq!(expired.writer_lifecycle(), installing_lifecycle);
+    drop(expired);
+    let expired = controller
         .begin_expiry(absolute_deadline)
         .expect("cancelled cleanup can reacquire exact authority");
-    assert_eq!(cleanup.writer_lifecycle(), installing_lifecycle);
-    assert_eq!(cleanup.stage(), TcpServiceCleanupStage::Installing);
+    assert_eq!(expired.writer_lifecycle(), installing_lifecycle);
+    assert_eq!(expired.stage(), TcpServiceExpiredStage::Installing);
     assert_eq!(
-        cleanup.outcome().withdrawal_reason,
+        expired.withdrawal_outcome().withdrawal_reason,
         Some(TcpServiceWithdrawalReason::Deadline)
     );
     assert_eq!(
@@ -925,18 +899,12 @@ fn absolute_deadline_recovers_cancelled_installing_and_running_lifecycles() {
             .expect_err("cleanup acknowledgment precedes replacement"),
         TcpServiceValidationError::ValidationInProgress
     );
-    assert_eq!(controller.pending_cleanup(), Some(cleanup.clone()));
-    let stale_cleanup = cleanup.clone();
-    assert!(controller.complete_cleanup(cleanup));
-    assert!(!controller.has_active_lifecycle());
+    assert!(controller.complete_expiry(expired));
+    assert!(!controller.has_active_validation());
 
     let preparation = controller
         .reserve(plan(2))
         .expect("running lifecycle reservation");
-    assert!(
-        !controller.complete_cleanup(stale_cleanup),
-        "an acknowledged lifecycle cannot clear its replacement"
-    );
     let running_lifecycle = preparation.writer_lifecycle();
     let validation = controller
         .activate(
@@ -951,12 +919,12 @@ fn absolute_deadline_recovers_cancelled_installing_and_running_lifecycles() {
         )
         .expect("running lifecycle");
     drop(validation);
-    let cleanup = controller
+    let expired = controller
         .begin_expiry(absolute_deadline)
         .expect("cancelled running lifecycle expires");
-    assert_eq!(cleanup.writer_lifecycle(), running_lifecycle);
-    assert_eq!(cleanup.stage(), TcpServiceCleanupStage::Running);
-    let withdrawal = cleanup.outcome();
+    assert_eq!(expired.writer_lifecycle(), running_lifecycle);
+    assert_eq!(expired.stage(), TcpServiceExpiredStage::Running);
+    let withdrawal = expired.withdrawal_outcome();
     assert_eq!(withdrawal.session_id, SessionId(31));
     assert_eq!(withdrawal.trial_id, 2);
     assert_eq!(withdrawal.candidate, template.fence.candidate);
@@ -967,8 +935,8 @@ fn absolute_deadline_recovers_cancelled_installing_and_running_lifecycles() {
         Some(TcpServiceWithdrawalReason::Deadline)
     );
     assert_eq!(withdrawal.no_gain_suppression, None);
-    assert!(controller.complete_cleanup(cleanup));
-    assert!(!controller.has_active_lifecycle());
+    assert!(controller.complete_expiry(expired));
+    assert!(!controller.has_active_validation());
 }
 
 #[test]
@@ -1100,7 +1068,7 @@ fn constructors_and_session_serialization_enforce_bounded_authority() {
         ))
         .expect("first session preparation");
     let first_writer_lifecycle = first_preparation.writer_lifecycle();
-    assert!(session.has_active_lifecycle());
+    assert!(session.has_active_validation());
     assert_eq!(
         session
             .reserve(plan(
@@ -1124,20 +1092,11 @@ fn constructors_and_session_serialization_enforce_bounded_authority() {
         )
         .expect("first session validation");
     first.withdraw(TcpServiceWithdrawalReason::DemandEnded);
-    let first_cleanup = session
-        .finish(&mut first, initial_at, &first_fence)
-        .expect("first direction enters cleanup");
-    assert_eq!(
+    assert!(
         session
-            .reserve(plan(
-                2,
-                PathMetricDirection::ServerToClient,
-                second_fence.clone(),
-            ))
-            .expect_err("observer cleanup precedes the other direction"),
-        TcpServiceValidationError::ValidationInProgress
+            .finish(&mut first, initial_at, &first_fence)
+            .is_some()
     );
-    assert!(session.complete_cleanup(first_cleanup));
     assert_eq!(
         session
             .reserve(plan(
@@ -1169,10 +1128,11 @@ fn constructors_and_session_serialization_enforce_bounded_authority() {
         )
         .expect("second direction after release");
     second.withdraw(TcpServiceWithdrawalReason::DemandEnded);
-    let second_cleanup = session
-        .finish(&mut second, initial_at, &second_fence)
-        .expect("second direction enters cleanup");
-    assert!(session.complete_cleanup(second_cleanup));
+    assert!(
+        session
+            .finish(&mut second, initial_at, &second_fence)
+            .is_some()
+    );
     assert!(session.retire_candidate(first_fence.candidate));
 
     let third_preparation = session
@@ -1195,29 +1155,8 @@ fn constructors_and_session_serialization_enforce_bounded_authority() {
         )
         .expect_err("an earlier lifecycle cannot activate frozen writers");
     assert_eq!(failure.error, TcpServiceValidationError::InvalidBoundary);
-    let installation_cleanup = session
-        .begin_installation_cleanup(
-            failure.preparation,
-            TcpServiceWithdrawalReason::InvalidEvidence,
-            initial_at,
-        )
-        .expect("failed installation enters cleanup");
-    assert_eq!(
-        installation_cleanup.outcome().withdrawal_reason,
-        Some(TcpServiceWithdrawalReason::InvalidEvidence)
-    );
-    assert_eq!(
-        session
-            .reserve(plan(
-                4,
-                PathMetricDirection::ServerToClient,
-                second_fence.clone(),
-            ))
-            .expect_err("failed-install observers must clean before replacement"),
-        TcpServiceValidationError::ValidationInProgress
-    );
-    assert!(session.complete_cleanup(installation_cleanup));
-    assert!(!session.has_active_lifecycle());
+    assert!(session.cancel(failure.preparation));
+    assert!(!session.has_active_validation());
     assert_eq!(
         session
             .reserve(plan(3, PathMetricDirection::ServerToClient, second_fence,))

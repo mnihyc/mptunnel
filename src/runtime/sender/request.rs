@@ -19,8 +19,7 @@ use crate::model::capacity::{
 use crate::model::multipath::ExtraTrafficLedger;
 use crate::model::path::{RelayPathInstance, RelayPathKey};
 use crate::model::tcp_service::{
-    TcpServiceCarrierFence, TcpServiceStreamFence, TcpServiceWithdrawalReason,
-    TcpServiceWriterLifecycle,
+    TcpServiceCarrierFence, TcpServiceStreamFence, TcpServiceWriterLifecycle,
 };
 use crate::model::timing::reliable_relay_tail_reinjection_delay;
 use crate::model::work::{
@@ -191,28 +190,8 @@ impl RequestSenderService {
         self.multipath.remove_tcp_service_observer(lifecycle)
     }
 
-    /// Publishes the exact actor-side withdrawal before destroying its local
-    /// observer, then acknowledges that this stream needs no later cleanup.
-    pub(in crate::runtime) fn withdraw_tcp_service_observer(
-        &mut self,
-        context: &ClientPathContext,
-        reason: TcpServiceWithdrawalReason,
-    ) -> bool {
-        let Some((lifecycle, stream)) = self.multipath.tcp_service_observer_identity() else {
-            return false;
-        };
-        context.withdraw_request_tcp_service_stream(stream, lifecycle, reason);
-        let removed = self.multipath.invalidate_tcp_service_observer();
-        debug_assert!(removed);
-        let acknowledged = context.acknowledge_request_tcp_service_cleanup(stream, lifecycle);
-        debug_assert!(
-            acknowledged
-                || context
-                    .request_tcp_service_lifecycle_state(lifecycle)
-                    .is_none(),
-            "a current exact request actor must acknowledge observer cleanup"
-        );
-        true
+    pub(in crate::runtime) fn invalidate_tcp_service_observer(&mut self) -> bool {
+        self.multipath.invalidate_tcp_service_observer()
     }
 
     /// Runs one complete Product ACK transaction under the shared lifecycle
@@ -249,7 +228,7 @@ impl RequestSenderService {
         instance: RelayPathInstance,
     ) -> bool {
         if remotes.contains_path_instance(instance) {
-            self.withdraw_tcp_service_observer(context, TcpServiceWithdrawalReason::FenceChanged);
+            self.invalidate_tcp_service_observer();
         }
         remotes.fail_path_instance(context, instance).await
     }

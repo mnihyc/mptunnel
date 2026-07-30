@@ -176,17 +176,6 @@ impl RequestTcpServiceAcceptedBinding {
     }
 }
 
-/// Exact authenticated candidate binding retained by the actor snapshot.
-///
-/// The local path key is controller authority and is never encoded on the
-/// wire. Keeping it beside the authenticated fence lets the session owner
-/// monitor only this configured carrier slot for lifecycle invalidation.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-struct RequestTcpServiceCandidateBinding {
-    key: RelayPathKey,
-    carrier: TcpServiceCarrierFence,
-}
-
 /// Opaque request-stream fence minted only by its attachment owner.
 ///
 /// Its private constructor prevents a session controller from fabricating
@@ -197,7 +186,7 @@ pub(in crate::runtime) struct RequestTcpServiceFrozenStream {
     carrier_group_id: TcpServiceCarrierGroupId,
     stream: TcpServiceStreamFence,
     accepted: Vec<RequestTcpServiceAcceptedBinding>,
-    candidate: RequestTcpServiceCandidateBinding,
+    candidate: TcpServiceCarrierFence,
     max_accepted_paths: usize,
 }
 
@@ -205,13 +194,9 @@ impl RequestTcpServiceFrozenStream {
     pub(in crate::runtime) fn snapshot_request(&self) -> RequestTcpServiceSnapshotRequest {
         RequestTcpServiceSnapshotRequest {
             carrier_group_id: self.carrier_group_id,
-            candidate: self.candidate.carrier,
+            candidate: self.candidate,
             max_accepted_paths: self.max_accepted_paths,
         }
-    }
-
-    pub(in crate::runtime) fn carrier_group_id(&self) -> TcpServiceCarrierGroupId {
-        self.carrier_group_id
     }
 
     pub(in crate::runtime) fn stream(&self) -> TcpServiceStreamFence {
@@ -223,13 +208,7 @@ impl RequestTcpServiceFrozenStream {
     }
 
     pub(in crate::runtime) fn candidate(&self) -> TcpServiceCarrierFence {
-        self.candidate.carrier
-    }
-
-    pub(in crate::runtime) fn candidate_path_binding(
-        &self,
-    ) -> (RelayPathKey, TcpServiceCarrierFence) {
-        (self.candidate.key, self.candidate.carrier)
+        self.candidate
     }
 }
 
@@ -346,26 +325,22 @@ impl ReliableRelayRemoteSet {
             .tcp_service_endpoint(request.carrier_group_id)
             .ok_or(TcpServiceWithdrawalReason::FenceChanged)?;
 
-        let mut candidate_binding = None;
+        let mut candidate_matches = 0usize;
         for path_index in &endpoint.members {
             let key = RelayPathKey {
                 underlay: UnderlayProtocol::Tcp,
                 index: *path_index,
             };
             if context.current_request_tcp_service_candidate(key) == Some(request.candidate) {
-                if candidate_binding.is_some() {
-                    return Err(TcpServiceWithdrawalReason::FenceChanged);
-                }
+                candidate_matches = candidate_matches.saturating_add(1);
                 if self.contains_path_key(key) {
                     return Err(TcpServiceWithdrawalReason::FenceChanged);
                 }
-                candidate_binding = Some(RequestTcpServiceCandidateBinding {
-                    key,
-                    carrier: request.candidate,
-                });
             }
         }
-        let candidate = candidate_binding.ok_or(TcpServiceWithdrawalReason::FenceChanged)?;
+        if candidate_matches != 1 {
+            return Err(TcpServiceWithdrawalReason::FenceChanged);
+        }
 
         let accepted_count = self
             .paths
@@ -415,7 +390,7 @@ impl ReliableRelayRemoteSet {
                 data_ack_horizon_bytes,
             },
             accepted,
-            candidate,
+            candidate: request.candidate,
             max_accepted_paths: request.max_accepted_paths,
         })
     }

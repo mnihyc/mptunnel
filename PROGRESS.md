@@ -11,6 +11,53 @@ Historical entries below are retained as evidence of the decisions made at
 their recorded time. When a later entry changes an earlier decision, the later
 entry is authoritative.
 
+## 2026-07-30T19:17:35+08:00: single TCP service lifecycle authority
+
+- Name: remove duplicate lifecycle state before production integration
+- Category: Core architecture correction and change-control audit
+- State: verified correction; the production session actor, carrier controls,
+  validation-only attachment, and candidate placement remain disconnected
+- Supersedes:
+  - the runtime ownership claimed by the 17:07 entry; and
+  - the replay-token design claimed by the 17:24 entry.
+- Content:
+  - audited the complete uncommitted receiver attempt and every committed
+    change from the inactive writer boundary through `caf5d1e`;
+  - rejected the uncommitted 1,989-line server receiver/attachment checkpoint
+    because it reconstructed one carrier lifecycle in the reliable-stream
+    registry, introduced a second wrapping attachment generation beside the
+    established incarnation, and had no production client producer;
+  - removed the committed `ClientRequestTcpServiceActiveLifecycle` registry
+    and its installation, withdrawal, acknowledgement, replay, and disarm
+    state, which duplicated the model controller and writer coordinator;
+  - removed the model's externally replayable cleanup token. A long-lived
+    session actor will own the model lifecycle and its terminal cleanup
+    directly, while child stream actors only acknowledge exact observer
+    installation or removal;
+  - retained the validation-only writer clock, exact flight sidecars, passive
+    request/response observers, actor-minted stream snapshots, authenticated
+    carrier-instance fences, dormant-candidate separation, and synchronous
+    local observer stop at stream-owned fence changes; and
+  - changed no scheduler policy, congestion controller, transport parameter,
+    timing value, carrier count, or Product behavior.
+- Evidence:
+  - `cargo check --locked --all-targets` passed after the correction;
+  - the complete library gate passed: 1,420 tests, zero failures;
+  - formatting was unchanged and `git diff --cached --check` passed; and
+  - dead-code diagnostics now expose the remaining disconnected producer
+    boundary instead of hiding it behind a second lifecycle registry.
+- Performance boundary:
+  - this removes cold disconnected state and does not enable adaptive carrier
+    behavior;
+  - commit `3112e2d` remains the only inactive-runtime boundary with an
+    adjacent representative performance gate; and
+  - commit `a5a6094fc8e07456b057ddc107a0d51849d42d10` remains the historical
+    performance authority until the integrated actor passes matched labs.
+- Next: implement one long-lived session actor as the sole owner of
+  `TcpServiceSessionController`, candidate deadline, child-actor receipts,
+  exact TCP controls, validation-only attachment, bounded placement, result,
+  and terminal cleanup; do not checkpoint another disconnected layer.
+
 ## 2026-07-30T12:27:52+08:00: bounded TCP service validation model
 
 - Name: exact endpoint/session/direction validation authority

@@ -150,14 +150,6 @@ pub(crate) struct TcpServiceWriterLifecycle {
 }
 
 impl TcpServiceWriterLifecycle {
-    pub(crate) fn session_id(self) -> SessionId {
-        self.session_id
-    }
-
-    pub(crate) fn direction(self) -> PathMetricDirection {
-        self.direction
-    }
-
     /// Runtime clocks serialize `at` before constructing the point. The model
     /// rejects points from every other lifecycle.
     pub(crate) fn point(self, at: Instant) -> TcpServiceWriterPoint {
@@ -512,7 +504,7 @@ pub(crate) struct TcpServiceActivationFailure {
     pub(crate) error: TcpServiceValidationError,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum TcpServiceActiveValidation {
     Installing {
         reservation: TcpServiceValidationReservation,
@@ -522,66 +514,69 @@ enum TcpServiceActiveValidation {
         reservation: TcpServiceValidationReservation,
         absolute_deadline: Instant,
     },
-    Cleaning(TcpServiceCleanupRecord),
+    Expiring {
+        reservation: TcpServiceValidationReservation,
+        stage: TcpServiceExpiredStage,
+    },
 }
 
 impl TcpServiceActiveValidation {
-    fn reservation(&self) -> TcpServiceValidationReservation {
+    fn reservation(self) -> TcpServiceValidationReservation {
         match self {
-            Self::Installing { reservation, .. } | Self::Running { reservation, .. } => {
-                *reservation
-            }
-            Self::Cleaning(cleanup) => cleanup.reservation,
+            Self::Installing { reservation, .. }
+            | Self::Running { reservation, .. }
+            | Self::Expiring { reservation, .. } => reservation,
         }
     }
 
-    fn absolute_deadline(&self) -> Option<Instant> {
+    fn absolute_deadline(self) -> Option<Instant> {
         match self {
             Self::Installing {
                 absolute_deadline, ..
             }
             | Self::Running {
                 absolute_deadline, ..
-            } => Some(*absolute_deadline),
-            Self::Cleaning(_) => None,
+            } => Some(absolute_deadline),
+            Self::Expiring { .. } => None,
         }
     }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum TcpServiceCleanupStage {
+pub(crate) enum TcpServiceExpiredStage {
     Installing,
     Running,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
-struct TcpServiceCleanupRecord {
+/// Exact lifecycle whose absolute resource lifetime elapsed. Runtime removes
+/// only this lifecycle's passive writer observers before acknowledging cleanup.
+#[derive(Debug)]
+pub(crate) struct TcpServiceExpiredLifecycle {
     reservation: TcpServiceValidationReservation,
-    stage: TcpServiceCleanupStage,
-    outcome: TcpServiceValidationOutcome,
+    stage: TcpServiceExpiredStage,
 }
 
-/// Exact terminal lifecycle retained until runtime has removed and
-/// acknowledged every passive writer observer.
-///
-/// The token is replayable so cancellation of a cleanup task cannot release
-/// session authority or affect a later lifecycle.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct TcpServiceCleanup {
-    record: TcpServiceCleanupRecord,
-}
-
-impl TcpServiceCleanup {
+impl TcpServiceExpiredLifecycle {
     pub(crate) fn writer_lifecycle(&self) -> TcpServiceWriterLifecycle {
-        self.record.reservation.writer_lifecycle()
+        self.reservation.writer_lifecycle()
     }
 
-    pub(crate) fn stage(&self) -> TcpServiceCleanupStage {
-        self.record.stage
+    pub(crate) fn stage(&self) -> TcpServiceExpiredStage {
+        self.stage
     }
 
-    pub(crate) fn outcome(&self) -> &TcpServiceValidationOutcome {
-        &self.record.outcome
+    /// Exact withdrawal authority retained even if the running validation
+    /// object was lost with a cancelled task. It carries no capacity verdict.
+    pub(crate) fn withdrawal_outcome(&self) -> TcpServiceValidationOutcome {
+        TcpServiceValidationOutcome {
+            session_id: self.reservation.session_id,
+            trial_id: self.reservation.trial_id,
+            candidate: self.reservation.candidate,
+            direction: self.reservation.direction,
+            result: TcpCarrierValidationResult::Withdrawn,
+            withdrawal_reason: Some(TcpServiceWithdrawalReason::Deadline),
+            no_gain_suppression: None,
+        }
     }
 }
 
@@ -786,46 +781,17 @@ impl TcpServiceSessionController {
         Ok(validation)
     }
 
-    /// Moves an installation that cannot activate into durable cleanup.
-    ///
-    /// The controller remains occupied until `complete_cleanup`; consuming a
-    /// preparation can therefore never expose a later lifecycle while an
-    /// earlier actor observer may still exist.
-    pub(crate) fn begin_installation_cleanup(
-        &mut self,
-        preparation: TcpServiceValidationPreparation,
-        proposed: TcpServiceWithdrawalReason,
-        now: Instant,
-    ) -> Result<TcpServiceCleanup, TcpServiceValidationPreparation> {
-        let expected = TcpServiceActiveValidation::Installing {
-            reservation: preparation.reservation,
-            absolute_deadline: preparation.plan.absolute_deadline,
-        };
-        if self.active.as_ref() != Some(&expected) {
-            return Err(preparation);
-        }
-        let reason = if now >= preparation.plan.absolute_deadline {
-            TcpServiceWithdrawalReason::Deadline
-        } else {
-            proposed
-        };
-        let cleanup = TcpServiceCleanup {
-            record: TcpServiceCleanupRecord {
+    pub(crate) fn cancel(&mut self, preparation: TcpServiceValidationPreparation) -> bool {
+        if self.active
+            != Some(TcpServiceActiveValidation::Installing {
                 reservation: preparation.reservation,
-                stage: TcpServiceCleanupStage::Installing,
-                outcome: TcpServiceValidationOutcome {
-                    session_id: preparation.reservation.session_id,
-                    trial_id: preparation.reservation.trial_id,
-                    candidate: preparation.reservation.candidate,
-                    direction: preparation.reservation.direction,
-                    result: TcpCarrierValidationResult::Withdrawn,
-                    withdrawal_reason: Some(reason),
-                    no_gain_suppression: None,
-                },
-            },
-        };
-        self.active = Some(TcpServiceActiveValidation::Cleaning(cleanup.record.clone()));
-        Ok(cleanup)
+                absolute_deadline: preparation.plan.absolute_deadline,
+            })
+        {
+            return false;
+        }
+        self.active = None;
+        true
     }
 
     pub(crate) fn finish(
@@ -833,7 +799,7 @@ impl TcpServiceSessionController {
         validation: &mut TcpServiceSenderValidation,
         now: Instant,
         current_fence: &TcpServiceValidationFence,
-    ) -> Option<TcpServiceCleanup> {
+    ) -> Option<TcpServiceValidationOutcome> {
         if validation.lifecycle_finished
             || self.active
                 != Some(TcpServiceActiveValidation::Running {
@@ -875,15 +841,8 @@ impl TcpServiceSessionController {
             group.no_gain_suppression = Some(suppression.clone());
         }
         validation.lifecycle_finished = true;
-        let cleanup = TcpServiceCleanup {
-            record: TcpServiceCleanupRecord {
-                reservation: validation.reservation,
-                stage: TcpServiceCleanupStage::Running,
-                outcome,
-            },
-        };
-        self.active = Some(TcpServiceActiveValidation::Cleaning(cleanup.record.clone()));
-        Some(cleanup)
+        self.active = None;
+        Some(outcome)
     }
 
     pub(crate) fn observe_saturation(
@@ -965,14 +924,13 @@ impl TcpServiceSessionController {
         validation.record_saturation_event(event)
     }
 
-    /// Begins deadline cleanup or reissues any terminal cleanup already owed.
-    ///
-    /// Reissuing the same token lets an independently supervised session owner
-    /// recover after installation, validation, or cleanup task cancellation.
-    pub(crate) fn begin_expiry(&mut self, now: Instant) -> Option<TcpServiceCleanup> {
-        let active = self.active.as_ref()?.clone();
-        if let TcpServiceActiveValidation::Cleaning(record) = active {
-            return Some(TcpServiceCleanup { record });
+    /// Begins cleanup only after the active lifecycle's absolute deadline.
+    /// The controller remains unavailable until the caller conditionally
+    /// removes the returned lifecycle's writer observers and acknowledges it.
+    pub(crate) fn begin_expiry(&mut self, now: Instant) -> Option<TcpServiceExpiredLifecycle> {
+        let active = self.active?;
+        if let TcpServiceActiveValidation::Expiring { reservation, stage } = active {
+            return Some(TcpServiceExpiredLifecycle { reservation, stage });
         }
         if active
             .absolute_deadline()
@@ -982,43 +940,20 @@ impl TcpServiceSessionController {
         }
         let reservation = active.reservation();
         let stage = match active {
-            TcpServiceActiveValidation::Installing { .. } => TcpServiceCleanupStage::Installing,
-            TcpServiceActiveValidation::Running { .. } => TcpServiceCleanupStage::Running,
-            TcpServiceActiveValidation::Cleaning(_) => unreachable!("returned above"),
+            TcpServiceActiveValidation::Installing { .. } => TcpServiceExpiredStage::Installing,
+            TcpServiceActiveValidation::Running { .. } => TcpServiceExpiredStage::Running,
+            TcpServiceActiveValidation::Expiring { .. } => unreachable!("returned above"),
         };
-        let cleanup = TcpServiceCleanup {
-            record: TcpServiceCleanupRecord {
-                reservation,
-                stage,
-                outcome: TcpServiceValidationOutcome {
-                    session_id: reservation.session_id,
-                    trial_id: reservation.trial_id,
-                    candidate: reservation.candidate,
-                    direction: reservation.direction,
-                    result: TcpCarrierValidationResult::Withdrawn,
-                    withdrawal_reason: Some(TcpServiceWithdrawalReason::Deadline),
-                    no_gain_suppression: None,
-                },
-            },
-        };
-        self.active = Some(TcpServiceActiveValidation::Cleaning(cleanup.record.clone()));
-        Some(cleanup)
+        self.active = Some(TcpServiceActiveValidation::Expiring { reservation, stage });
+        Some(TcpServiceExpiredLifecycle { reservation, stage })
     }
 
-    pub(crate) fn pending_cleanup(&self) -> Option<TcpServiceCleanup> {
-        let TcpServiceActiveValidation::Cleaning(record) = self.active.as_ref()? else {
-            return None;
-        };
-        Some(TcpServiceCleanup {
-            record: record.clone(),
-        })
-    }
-
-    pub(crate) fn complete_cleanup(&mut self, cleanup: TcpServiceCleanup) -> bool {
-        if self.active.as_ref()
-            != Some(&TcpServiceActiveValidation::Cleaning(
-                cleanup.record.clone(),
-            ))
+    pub(crate) fn complete_expiry(&mut self, expired: TcpServiceExpiredLifecycle) -> bool {
+        if self.active
+            != Some(TcpServiceActiveValidation::Expiring {
+                reservation: expired.reservation,
+                stage: expired.stage,
+            })
         {
             return false;
         }
@@ -1028,12 +963,11 @@ impl TcpServiceSessionController {
 
     pub(crate) fn active_deadline(&self) -> Option<Instant> {
         self.active
-            .as_ref()
             .and_then(TcpServiceActiveValidation::absolute_deadline)
     }
 
     pub(crate) fn retire_candidate(&mut self, candidate: TcpServiceCarrierFence) -> bool {
-        if self.active.as_ref().is_some_and(|active| {
+        if self.active.is_some_and(|active| {
             active.reservation().candidate.local_instance_id == candidate.local_instance_id
         }) {
             return false;
@@ -1049,7 +983,7 @@ impl TcpServiceSessionController {
         true
     }
 
-    pub(crate) fn has_active_lifecycle(&self) -> bool {
+    pub(crate) fn has_active_validation(&self) -> bool {
         self.active.is_some()
     }
 

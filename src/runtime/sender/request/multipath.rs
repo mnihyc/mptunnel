@@ -533,14 +533,6 @@ impl RequestMultipathController {
         TcpServiceObserverRemoval::Removed
     }
 
-    pub(super) fn tcp_service_observer_identity(
-        &self,
-    ) -> Option<(TcpServiceWriterLifecycle, TcpServiceStreamFence)> {
-        self.tcp_service
-            .as_ref()
-            .map(|observer| (observer.writer.lifecycle(), observer.stream))
-    }
-
     pub(super) fn invalidate_tcp_service_observer(&mut self) -> bool {
         let Some(observer) = self.tcp_service.take() else {
             return false;

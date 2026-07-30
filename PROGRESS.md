@@ -2177,3 +2177,32 @@ entry is authoritative.
   - 8 release contract tests and the normalized Linux musl archive check
     passed;
   - Actionlint and shell syntax passed after the scratch-path conversion.
+
+## 2026-07-30T14:06:45+08:00: Per-carrier-group TCP service suppression authority
+
+- Name: bounded directional no-gain suppression ownership
+- Category: Core model and RFC alignment
+- State: model correction complete; runtime session owner remains in progress
+- Content:
+  - kept one session-scoped service controller and one active validation
+    authority, as required by `./RFC.md`;
+  - introduced an endpoint-local TCP carrier-group identity that is never
+    serialized or reconstructed from locators;
+  - replaced direction-global suppression state with one current suppression
+    slot per direction and carrier group, bounded by the existing configured
+    carrier-inventory limit rather than a timer, retry threshold, or new
+    tuning parameter;
+  - identity change clears suppression only inside the affected group, while
+    validation of another group cannot erase established no-gain evidence;
+    and
+  - preserved exact rational-rate comparison and zero candidate Product credit
+    for an overlapping suppressed validation.
+- Evidence:
+  - extended the durable six-window/no-gain model test with an
+    `group A -> unrelated group B -> unchanged group A` lifecycle;
+  - the regression proves that B may activate and withdraw without changing
+    A, after which A remains suppressed on the same overlapping two-window
+    reference range;
+  - targeted regression passed;
+  - all test targets compiled; and
+  - formatting and whitespace checks passed.

@@ -12,6 +12,19 @@ use crate::protocol::{
 use std::cmp::Ordering;
 use std::time::{Duration, Instant};
 
+/// Endpoint-local identity of one configured TCP carrier group.
+///
+/// This topology identity is controller authority only. It is never encoded
+/// on the wire and cannot be reconstructed from carrier locators.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct TcpServiceCarrierGroupId(u64);
+
+impl TcpServiceCarrierGroupId {
+    pub(crate) fn from_raw(raw: u64) -> Self {
+        Self(raw)
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct TcpServiceCarrierFence {
     pub(crate) accepted: TcpCarrierAcceptedPath,
@@ -141,6 +154,19 @@ impl TcpServiceWriterLifecycle {
             at,
         }
     }
+
+    #[cfg(test)]
+    pub(crate) fn for_runtime_test(
+        session_id: SessionId,
+        lifecycle_id: u64,
+        direction: PathMetricDirection,
+    ) -> Self {
+        Self {
+            session_id,
+            lifecycle_id,
+            direction,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -150,6 +176,10 @@ pub(crate) struct TcpServiceWriterPoint {
 }
 
 impl TcpServiceWriterPoint {
+    pub(crate) fn lifecycle(self) -> TcpServiceWriterLifecycle {
+        self.lifecycle
+    }
+
     pub(crate) fn at(self) -> Instant {
         self.at
     }
@@ -178,6 +208,7 @@ pub(crate) struct TcpServiceValidationPlan {
     pub(crate) session_id: SessionId,
     pub(crate) trial_id: u64,
     pub(crate) direction: PathMetricDirection,
+    pub(crate) carrier_group_id: TcpServiceCarrierGroupId,
     pub(crate) fence: TcpServiceValidationFence,
     pub(crate) limits: TcpServiceValidationLimits,
     pub(crate) registered_at: Instant,
@@ -416,6 +447,7 @@ pub(crate) enum TcpServiceValidationError {
     ValidationInProgress,
     TrialNotIncreasing,
     CandidateHistoryLimit,
+    CarrierGroupLimit,
     LifecycleOverflow,
     ValidationNotInstalling,
     FenceChanged,
@@ -429,6 +461,7 @@ struct TcpServiceValidationReservation {
     trial_id: u64,
     candidate: TcpServiceCarrierFence,
     direction: PathMetricDirection,
+    carrier_group_id: TcpServiceCarrierGroupId,
 }
 
 impl TcpServiceValidationReservation {
@@ -545,10 +578,16 @@ impl TcpServiceExpiredLifecycle {
 
 #[derive(Debug, Default)]
 struct TcpServiceDirectionState {
-    current_suppression_identity: Option<TcpServiceSuppressionIdentity>,
-    no_gain_suppression: Option<TcpServiceNoGainSuppression>,
+    carrier_groups: Vec<TcpServiceCarrierGroupState>,
     saturation_cohort: Option<Vec<TcpServiceSuppressionStreamIdentity>>,
     saturation_high_watermarks: Vec<(TcpServiceSuppressionStreamIdentity, u64)>,
+}
+
+#[derive(Debug)]
+struct TcpServiceCarrierGroupState {
+    carrier_group_id: TcpServiceCarrierGroupId,
+    current_suppression_identity: TcpServiceSuppressionIdentity,
+    no_gain_suppression: Option<TcpServiceNoGainSuppression>,
 }
 
 #[derive(Debug)]
@@ -556,7 +595,9 @@ pub(crate) struct TcpServiceSessionController {
     session_id: SessionId,
     active: Option<TcpServiceActiveValidation>,
     candidate_trial_high_watermarks: Vec<(CarrierPathInstanceId, u64)>,
-    max_candidate_instances: usize,
+    /// Every configured group owns at least one carrier slot, so the existing
+    /// carrier-inventory bound also bounds per-direction group state.
+    max_carrier_instances: usize,
     next_lifecycle_id: u64,
     next_saturation_sequence: u64,
     client_to_server: TcpServiceDirectionState,
@@ -566,16 +607,16 @@ pub(crate) struct TcpServiceSessionController {
 impl TcpServiceSessionController {
     pub(crate) fn new(
         session_id: SessionId,
-        max_candidate_instances: usize,
+        max_carrier_instances: usize,
     ) -> Result<Self, TcpServiceValidationError> {
-        if max_candidate_instances == 0 {
+        if max_carrier_instances == 0 {
             return Err(TcpServiceValidationError::InvalidLimits);
         }
         Ok(Self {
             session_id,
             active: None,
             candidate_trial_high_watermarks: Vec::new(),
-            max_candidate_instances,
+            max_carrier_instances,
             next_lifecycle_id: 1,
             next_saturation_sequence: 1,
             client_to_server: TcpServiceDirectionState::default(),
@@ -605,7 +646,7 @@ impl TcpServiceSessionController {
             return Err(TcpServiceValidationError::TrialNotIncreasing);
         }
         if trial_index.is_none()
-            && self.candidate_trial_high_watermarks.len() >= self.max_candidate_instances
+            && self.candidate_trial_high_watermarks.len() >= self.max_carrier_instances
         {
             return Err(TcpServiceValidationError::CandidateHistoryLimit);
         }
@@ -618,17 +659,24 @@ impl TcpServiceSessionController {
             trial_id: plan.trial_id,
             candidate: plan.fence.candidate,
             direction: plan.direction,
+            carrier_group_id: plan.carrier_group_id,
         };
         let suppression_identity = plan.fence.suppression_identity();
         let cohort_identity = plan.fence.cohort_identity();
         let direction = plan.direction;
         let state = self.direction_state(direction);
-        let identity_changed =
-            state.current_suppression_identity.as_ref() != Some(&suppression_identity);
-        let prior_no_gain_suppression = if identity_changed {
-            None
-        } else {
-            state.no_gain_suppression.clone()
+        let group_state = state
+            .carrier_groups
+            .iter()
+            .find(|group| group.carrier_group_id == plan.carrier_group_id);
+        if group_state.is_none() && state.carrier_groups.len() >= self.max_carrier_instances {
+            return Err(TcpServiceValidationError::CarrierGroupLimit);
+        }
+        let identity_changed = group_state
+            .is_none_or(|group| group.current_suppression_identity != suppression_identity);
+        let prior_no_gain_suppression = match group_state {
+            Some(group) if !identity_changed => group.no_gain_suppression.clone(),
+            _ => None,
         };
 
         if let Some(index) = trial_index {
@@ -698,10 +746,25 @@ impl TcpServiceSessionController {
         };
 
         let direction = preparation.plan.direction;
+        let carrier_group_id = preparation.reservation.carrier_group_id;
+        let max_carrier_instances = self.max_carrier_instances;
         let state = self.direction_state_mut(direction);
-        if preparation.identity_changed {
-            state.current_suppression_identity = Some(preparation.suppression_identity);
-            state.no_gain_suppression = None;
+        if let Some(group) = state
+            .carrier_groups
+            .iter_mut()
+            .find(|group| group.carrier_group_id == carrier_group_id)
+        {
+            if preparation.identity_changed {
+                group.current_suppression_identity = preparation.suppression_identity;
+                group.no_gain_suppression = None;
+            }
+        } else {
+            debug_assert!(state.carrier_groups.len() < max_carrier_instances);
+            state.carrier_groups.push(TcpServiceCarrierGroupState {
+                carrier_group_id,
+                current_suppression_identity: preparation.suppression_identity,
+                no_gain_suppression: None,
+            });
         }
         if state.saturation_cohort.as_ref() != Some(&preparation.cohort_identity) {
             state.saturation_cohort = Some(preparation.cohort_identity);
@@ -761,10 +824,17 @@ impl TcpServiceSessionController {
         }
         if let Some(suppression) = outcome.no_gain_suppression.as_ref() {
             let state = self.direction_state_mut(outcome.direction);
-            if state.current_suppression_identity.as_ref() != Some(&suppression.identity) {
+            let Some(group) = state
+                .carrier_groups
+                .iter_mut()
+                .find(|group| group.carrier_group_id == validation.reservation.carrier_group_id)
+            else {
+                return None;
+            };
+            if group.current_suppression_identity != suppression.identity {
                 return None;
             }
-            state.no_gain_suppression = Some(suppression.clone());
+            group.no_gain_suppression = Some(suppression.clone());
         }
         validation.lifecycle_finished = true;
         self.active = None;
@@ -1121,6 +1191,7 @@ impl TcpServiceSenderValidation {
             || reservation.trial_id != plan.trial_id
             || reservation.candidate != plan.fence.candidate
             || reservation.direction != plan.direction
+            || reservation.carrier_group_id != plan.carrier_group_id
             || initial_boundary.writer.lifecycle != reservation.writer_lifecycle()
         {
             return Err(TcpServiceValidationError::InvalidCarrierFence);

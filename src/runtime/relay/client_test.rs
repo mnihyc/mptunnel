@@ -1,9 +1,11 @@
 use super::{ClientRelayDeliveryState, ClientRelayDisconnectedState, ClientRelayState};
 use crate::model::path::RelayPathKey;
+use crate::model::tcp_service::TcpServiceWithdrawalReason;
 use crate::mux::MuxLimits;
 use crate::mux::stream::{ReliableRecvStream, ReliableSendStream};
 use crate::protocol::{OffsetRange, StreamId, UnderlayProtocol};
 use crate::runtime::sender::ReliableRelaySenderQueue;
+use crate::scheduler::TrafficClass;
 use bytes::Bytes;
 use std::time::{Duration, Instant};
 
@@ -64,6 +66,46 @@ fn endpoint_transitions_keep_fin_state_coherent() {
 
     state.record_terminal_fin_replayed();
     assert!(state.endpoint.terminal_fin_replayed);
+}
+
+#[test]
+fn request_service_demand_generation_changes_only_with_rfc_identity() {
+    let mut state = ClientRelayState::new();
+    assert_eq!(
+        state.request_tcp_service_demand_generation(),
+        Err(TcpServiceWithdrawalReason::DemandEnded)
+    );
+
+    assert!(state.refresh_request_tcp_service_demand(TrafficClass::Throughput));
+    let throughput_generation = state
+        .request_tcp_service_demand_generation()
+        .expect("open throughput demand");
+    assert!(!state.refresh_request_tcp_service_demand(TrafficClass::Throughput));
+    assert_eq!(
+        state.request_tcp_service_demand_generation(),
+        Ok(throughput_generation),
+        "polling unchanged demand must not manufacture a new cohort"
+    );
+
+    assert!(state.refresh_request_tcp_service_demand(TrafficClass::Latency));
+    assert_eq!(
+        state.request_tcp_service_demand_generation(),
+        Err(TcpServiceWithdrawalReason::DemandEnded)
+    );
+    assert!(state.refresh_request_tcp_service_demand(TrafficClass::Throughput));
+    assert!(
+        state
+            .request_tcp_service_demand_generation()
+            .expect("renewed throughput demand")
+            > throughput_generation
+    );
+
+    assert!(state.record_local_eof());
+    assert!(!state.record_local_eof());
+    assert_eq!(
+        state.request_tcp_service_demand_generation(),
+        Err(TcpServiceWithdrawalReason::DemandEnded)
+    );
 }
 
 #[test]

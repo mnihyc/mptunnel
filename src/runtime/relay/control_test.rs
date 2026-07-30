@@ -1,15 +1,25 @@
 use super::*;
 use crate::config::{ClientSecurityConfig, ResourceLimits, SharedSecret};
 use crate::model::capacity::reliable_relay_buffer_len;
+use crate::model::path::{RelayPathKey, next_carrier_path_instance_id};
+use crate::model::tcp_service::{TcpServiceDataAckEvent, TcpServiceWriterLifecycle};
 use crate::mux::MuxLimits;
-use crate::protocol::{OffsetRange, PathId, StreamId, TargetAddr, UnderlayProtocol};
+use crate::protocol::{
+    AuthNonce, OffsetRange, PathId, PathMetricDirection, PathUsage, SessionId, StreamId,
+    TargetAddr, UnderlayProtocol,
+};
 use crate::runtime::path::commands::{
     ReliablePathCommand, ReliablePathCommandReceivers, recv_reliable_path_command,
     reliable_path_command_channels,
 };
 use crate::runtime::stream::{ReliablePathStream, ReliablePathStreamOutput};
+use crate::runtime::tcp_service::{
+    RequestTcpServiceObserverInstall, TcpServiceAckDisposition, TcpServiceDataAckSink,
+    TcpServiceWriterCoordinator,
+};
 use crate::transport::PathSpec;
 use bytes::Bytes;
+use std::sync::Arc;
 use std::time::Duration;
 use tokio::io::{AsyncReadExt, AsyncWriteExt, duplex};
 use tokio::sync::mpsc;
@@ -18,6 +28,19 @@ fn test_security() -> ClientSecurityConfig {
     ClientSecurityConfig::for_test(
         SharedSecret::new(b"0123456789abcdef0123456789abcdef".to_vec()).expect("secret"),
     )
+}
+
+#[derive(Debug)]
+struct IgnoreTcpServiceAck;
+
+impl TcpServiceDataAckSink for IgnoreTcpServiceAck {
+    fn apply_data_ack(
+        &self,
+        _event: TcpServiceDataAckEvent,
+        _now: Instant,
+    ) -> Result<TcpServiceAckDisposition, TcpServiceFlightSidecarError> {
+        Ok(TcpServiceAckDisposition::Continue)
+    }
 }
 
 #[tokio::test]
@@ -117,6 +140,196 @@ async fn client_ack_extent_rejection_precedes_all_transaction_mutation() {
     assert_eq!(released, 8);
     assert!(sender_queue.is_empty());
     assert_eq!(state.progress.last_send_ack.horizon(), Some(8));
+}
+
+#[tokio::test]
+async fn request_tcp_service_install_requires_the_exact_actor_snapshot() {
+    let stream_id = StreamId(902);
+    let path = "tcp://127.0.0.1:10902?tcp-carriers=2-2"
+        .parse::<PathSpec>()
+        .expect("bounded TCP carrier group");
+    let context = ClientPathContext::new(vec![path], test_security(), ResourceLimits::default())
+        .expect("client context");
+    let limits = context.mux_limits;
+    let (commands, _receivers) = reliable_path_command_channels(8);
+    let (_frames_tx, frames_rx) = mpsc::channel(1);
+    let opened = OpenedRemoteStream::pending(
+        ReliablePathStream {
+            stream_id,
+            max_offset: limits.max_stream_window_bytes,
+            lane: TrafficClass::Throughput,
+            underlay: UnderlayProtocol::Tcp,
+            max_frame_payload_bytes: reliable_relay_buffer_len(limits),
+            output: ReliablePathStreamOutput::fixed(
+                UnderlayProtocol::Tcp,
+                PathId(0),
+                commands,
+                limits,
+            ),
+            frames: frames_rx.into(),
+        },
+        0,
+    );
+    let remotes = ReliableRelayRemoteSet::new(opened, 8);
+    let accepted_instance = remotes.paths[0].instance();
+    context.install_authenticated_path_for_test(
+        UnderlayProtocol::Tcp,
+        0,
+        PathId(10),
+        AuthNonce([10; 16]),
+        accepted_instance.path_instance_id,
+        0,
+        PathUsage::Available,
+    );
+    let candidate_instance = next_carrier_path_instance_id();
+    context.install_authenticated_path_for_test(
+        UnderlayProtocol::Tcp,
+        1,
+        PathId(11),
+        AuthNonce([11; 16]),
+        candidate_instance,
+        0,
+        PathUsage::Available,
+    );
+    let candidate = context
+        .current_request_tcp_service_carrier(RelayPathKey {
+            underlay: UnderlayProtocol::Tcp,
+            index: 1,
+        })
+        .expect("authenticated candidate authority");
+    let request = RequestTcpServiceSnapshotRequest {
+        carrier_group_id: context
+            .tcp_service_carrier_group_id(0)
+            .expect("configured carrier group"),
+        candidate,
+        max_accepted_paths: 2,
+    };
+
+    let mut state = ClientRelayState::new();
+    assert!(state.refresh_request_tcp_service_demand(TrafficClass::Throughput));
+    let mut sender = RequestSenderService::new(stream_id);
+    let original = Frame::StreamData {
+        stream_id,
+        offset: 0,
+        payload: Bytes::from_static(b"accepted-flight"),
+    };
+    sender.record_original_frame_for_test(accepted_instance, &original);
+    let mut sender_queue = ReliableRelaySenderQueue::default();
+    sender_queue.push_data(Bytes::from_static(b"fresh-demand"));
+
+    let (snapshot_tx, snapshot_rx) = tokio::sync::oneshot::channel();
+    apply_request_tcp_service_control(
+        &state,
+        &mut sender,
+        &sender_queue,
+        &context,
+        &remotes,
+        RequestTcpServiceControl::Snapshot {
+            request,
+            receipt: snapshot_tx,
+        },
+    );
+    let frozen = match snapshot_rx.await.expect("snapshot receipt") {
+        RequestTcpServiceControlOutcome::Complete(frozen) => frozen,
+        RequestTcpServiceControlOutcome::Withdrawn(reason) => {
+            panic!("exact actor snapshot withdrew: {reason:?}")
+        }
+    };
+
+    let lifecycle = TcpServiceWriterLifecycle::for_runtime_test(
+        SessionId(902),
+        1,
+        PathMetricDirection::ClientToServer,
+    );
+    let coordinator = Arc::new(TcpServiceWriterCoordinator::new(
+        lifecycle,
+        Arc::new(IgnoreTcpServiceAck),
+    ));
+    let (install_tx, install_rx) = tokio::sync::oneshot::channel();
+    apply_request_tcp_service_control(
+        &state,
+        &mut sender,
+        &sender_queue,
+        &context,
+        &remotes,
+        RequestTcpServiceControl::Install {
+            install: RequestTcpServiceObserverInstall {
+                frozen,
+                coordinator,
+                max_flight_records: 8,
+                max_ack_release_records: 8,
+            },
+            receipt: install_tx,
+        },
+    );
+    assert_eq!(
+        install_rx.await.expect("install receipt"),
+        RequestTcpServiceControlOutcome::Complete(RequestTcpServiceObserverInstallation::Installed)
+    );
+    assert_eq!(
+        sender.remove_tcp_service_observer(lifecycle),
+        TcpServiceObserverRemoval::Removed
+    );
+
+    let (stale_snapshot_tx, stale_snapshot_rx) = tokio::sync::oneshot::channel();
+    apply_request_tcp_service_control(
+        &state,
+        &mut sender,
+        &sender_queue,
+        &context,
+        &remotes,
+        RequestTcpServiceControl::Snapshot {
+            request,
+            receipt: stale_snapshot_tx,
+        },
+    );
+    let stale_frozen = match stale_snapshot_rx.await.expect("second snapshot receipt") {
+        RequestTcpServiceControlOutcome::Complete(frozen) => frozen,
+        RequestTcpServiceControlOutcome::Withdrawn(reason) => {
+            panic!("unchanged actor snapshot withdrew: {reason:?}")
+        }
+    };
+    assert!(context.update_peer_path_usage_for_test(
+        UnderlayProtocol::Tcp,
+        1,
+        candidate_instance,
+        1,
+        PathUsage::Backup,
+    ));
+    let stale_lifecycle = TcpServiceWriterLifecycle::for_runtime_test(
+        SessionId(902),
+        2,
+        PathMetricDirection::ClientToServer,
+    );
+    let stale_coordinator = Arc::new(TcpServiceWriterCoordinator::new(
+        stale_lifecycle,
+        Arc::new(IgnoreTcpServiceAck),
+    ));
+    let (stale_install_tx, stale_install_rx) = tokio::sync::oneshot::channel();
+    apply_request_tcp_service_control(
+        &state,
+        &mut sender,
+        &sender_queue,
+        &context,
+        &remotes,
+        RequestTcpServiceControl::Install {
+            install: RequestTcpServiceObserverInstall {
+                frozen: stale_frozen,
+                coordinator: stale_coordinator,
+                max_flight_records: 8,
+                max_ack_release_records: 8,
+            },
+            receipt: stale_install_tx,
+        },
+    );
+    assert_eq!(
+        stale_install_rx.await.expect("stale install receipt"),
+        RequestTcpServiceControlOutcome::Withdrawn(TcpServiceWithdrawalReason::FenceChanged)
+    );
+    assert_eq!(
+        sender.remove_tcp_service_observer(stale_lifecycle),
+        TcpServiceObserverRemoval::AlreadyAbsent
+    );
 }
 
 async fn closed_output_relay(

@@ -10,7 +10,7 @@ mod state;
 pub(in crate::runtime) use attachment::{
     OpenedRemoteStream, ReliableRelayAttachOutcome, ReliableRelayRemoteFrame,
     ReliableRelayRemotePath, ReliableRelayRemoteSet, RequestRelayActorEvent,
-    RequestTcpServiceWriter,
+    RequestTcpServiceAcceptedBinding, RequestTcpServiceFrozenStream, RequestTcpServiceWriter,
 };
 // Keep inferred result/state types nameable without exposing child modules.
 #[allow(unused_imports)]

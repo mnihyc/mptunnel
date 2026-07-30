@@ -38,7 +38,9 @@ use crate::runtime::path::ClientPathContext;
 use crate::runtime::stream::request::{
     RequestAckClockOperation, RequestObservedPathRelease, RequestStreamState,
 };
-use crate::runtime::stream::{ReliableRelayRemotePath, ReliableRelayRemoteSet};
+use crate::runtime::stream::{
+    ReliableRelayRemotePath, ReliableRelayRemoteSet, RequestTcpServiceAcceptedBinding,
+};
 use crate::runtime::tcp_service::{
     TcpServiceFlightSidecarError, TcpServiceObserverRemoval, TcpServicePreparedAck,
     TcpServiceWriterCoordinator, TcpServiceWriterObserver, TcpServiceWriterTransaction,
@@ -308,32 +310,6 @@ impl RequestTcpServiceObserver {
             .or_else(|| (self.candidate_instance == Some(instance)).then_some(self.candidate))
     }
 
-    fn bind_candidate(
-        &mut self,
-        instance: RelayPathInstance,
-        fence: TcpServiceCarrierFence,
-        lifecycle: TcpServiceWriterLifecycle,
-    ) -> Result<bool, TcpServiceFlightSidecarError> {
-        if self.failure.is_some()
-            || lifecycle != self.writer.lifecycle()
-            || fence != self.candidate
-            || self
-                .carriers
-                .iter()
-                .any(|(current, _)| *current == instance)
-        {
-            return Err(TcpServiceFlightSidecarError::InvalidRelease);
-        }
-        match self.candidate_instance {
-            Some(current) if current == instance => Ok(false),
-            Some(_) => Err(TcpServiceFlightSidecarError::InvalidRelease),
-            None => {
-                self.candidate_instance = Some(instance);
-                Ok(true)
-            }
-        }
-    }
-
     fn fail(
         &mut self,
         error: TcpServiceFlightSidecarError,
@@ -530,16 +506,16 @@ impl RequestMultipathController {
         Ok(true)
     }
 
-    pub(super) fn bind_tcp_service_candidate(
-        &mut self,
-        lifecycle: TcpServiceWriterLifecycle,
-        instance: RelayPathInstance,
-        fence: TcpServiceCarrierFence,
-    ) -> Result<bool, TcpServiceFlightSidecarError> {
-        let Some(observer) = self.tcp_service.as_mut() else {
-            return Err(TcpServiceFlightSidecarError::ObserverStopped);
-        };
-        observer.bind_candidate(instance, fence, lifecycle)
+    pub(super) fn tcp_service_accepted_set_has_original_flight(
+        &self,
+        accepted: &[RequestTcpServiceAcceptedBinding],
+    ) -> bool {
+        !accepted.is_empty()
+            && accepted.iter().all(|binding| {
+                self.request
+                    .flights
+                    .has_original_transmission_flights_for_instance(binding.instance())
+            })
     }
 
     pub(super) fn remove_tcp_service_observer(

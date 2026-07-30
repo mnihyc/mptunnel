@@ -3,12 +3,13 @@
 //! These adapters exist only while one RFC TCP service validation is active.
 //! Permanent request and response flight records stay unchanged.
 
-use crate::model::path::RelayPathInstance;
 use crate::model::tcp_service::{
-    TcpServiceAckRelease, TcpServiceBoundary, TcpServiceCarrierFence, TcpServiceDataAckEvent,
-    TcpServiceStreamFence, TcpServiceWriterLifecycle, TcpServiceWriterPoint,
+    TcpServiceAckRelease, TcpServiceBoundary, TcpServiceCarrierFence, TcpServiceCarrierGroupId,
+    TcpServiceDataAckEvent, TcpServiceStreamFence, TcpServiceWithdrawalReason,
+    TcpServiceWriterLifecycle, TcpServiceWriterPoint,
 };
 use crate::protocol::OffsetRange;
+use crate::runtime::stream::request::RequestTcpServiceFrozenStream;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::{Duration, Instant};
@@ -27,11 +28,32 @@ pub(in crate::runtime) struct TcpServicePreparedAck {
     pub(in crate::runtime) releases: Vec<TcpServiceAckRelease>,
 }
 
+/// Controller request whose carrier identities are still untrusted input.
+///
+/// The request grants no placement or observer authority. The serialized
+/// stream actor resolves it against its current authenticated carrier group.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(in crate::runtime) struct RequestTcpServiceSnapshotRequest {
+    pub(in crate::runtime) carrier_group_id: TcpServiceCarrierGroupId,
+    pub(in crate::runtime) candidate: TcpServiceCarrierFence,
+    pub(in crate::runtime) max_accepted_paths: usize,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(in crate::runtime) enum RequestTcpServiceControlOutcome<T> {
+    Complete(T),
+    Withdrawn(TcpServiceWithdrawalReason),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(in crate::runtime) enum RequestTcpServiceObserverInstallation {
+    Installed,
+    AlreadyInstalled,
+}
+
 #[derive(Debug)]
 pub(in crate::runtime) struct RequestTcpServiceObserverInstall {
-    pub(in crate::runtime) stream: TcpServiceStreamFence,
-    pub(in crate::runtime) accepted: Vec<(RelayPathInstance, TcpServiceCarrierFence)>,
-    pub(in crate::runtime) candidate: TcpServiceCarrierFence,
+    pub(in crate::runtime) frozen: RequestTcpServiceFrozenStream,
     pub(in crate::runtime) coordinator: Arc<TcpServiceWriterCoordinator>,
     pub(in crate::runtime) max_flight_records: usize,
     pub(in crate::runtime) max_ack_release_records: usize,
@@ -39,19 +61,18 @@ pub(in crate::runtime) struct RequestTcpServiceObserverInstall {
 
 #[derive(Debug)]
 pub(in crate::runtime) enum RequestTcpServiceControl {
+    Snapshot {
+        request: RequestTcpServiceSnapshotRequest,
+        receipt: oneshot::Sender<RequestTcpServiceControlOutcome<RequestTcpServiceFrozenStream>>,
+    },
     Install {
         install: RequestTcpServiceObserverInstall,
-        receipt: oneshot::Sender<Result<bool, TcpServiceFlightSidecarError>>,
-    },
-    BindCandidate {
-        lifecycle: TcpServiceWriterLifecycle,
-        instance: RelayPathInstance,
-        fence: TcpServiceCarrierFence,
-        receipt: oneshot::Sender<Result<bool, TcpServiceFlightSidecarError>>,
+        receipt:
+            oneshot::Sender<RequestTcpServiceControlOutcome<RequestTcpServiceObserverInstallation>>,
     },
     Remove {
         lifecycle: TcpServiceWriterLifecycle,
-        receipt: oneshot::Sender<TcpServiceObserverRemoval>,
+        receipt: oneshot::Sender<RequestTcpServiceControlOutcome<TcpServiceObserverRemoval>>,
     },
 }
 

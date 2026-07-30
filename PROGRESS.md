@@ -2291,3 +2291,51 @@ entry is authoritative.
   - `./.tmp/lab/results/adjacent-parent-e9dd008-v5-single-repeat-20260730/`;
     and
   - `./.tmp/lab/results/adjacent-candidate-3112e2d-v5-single-repeat-20260730/`.
+
+## 2026-07-30T15:33:18+08:00: Actor-owned request service freeze
+
+- Name: exact request demand and attachment authority
+- Category: Core runtime and RFC alignment
+- State: request snapshot/install boundary complete; validation candidate
+  attachment and session producer remain disconnected
+- Content:
+  - replaced the request observer's caller-built stream fence and attachment
+    map with an opaque value minted only by the serialized logical-stream
+    attachment owner;
+  - resolved the accepted set from one exact configured TCP carrier group and
+    re-read each authenticated `PATH_JOIN` nonce, physical carrier instance,
+    directional eligibility generation, and Product attachment identity;
+  - required open throughput demand, fresh queued unique data, existing
+    original flight on every accepted attachment, a nonzero existing Data ACK
+    horizon, and bounded accepted-set cardinality before returning a snapshot;
+  - established a checked request demand generation that changes only with the
+    RFC demand class or local Product open state. Polling, enqueue progress,
+    ACKs, reinjection, and timers do not change it;
+  - made installation synchronously rederive and compare the complete actor
+    snapshot before publishing a passive observer, and mapped ordinary stale
+    races to `WITHDRAWN` rather than protocol or release errors;
+  - removed the caller-supplied request candidate bind operation. A later
+    validation candidate must have a lifecycle-owned attachment slot outside
+    the ordinary accepted Product attachment set before binding is restored;
+    and
+  - added no timing parameter, percentage threshold, locator inference,
+    carrier open, Product placement authority, or active service producer.
+- Ordinary-path cost:
+  - snapshot, group traversal, authentication checks, allocation, and flight
+    checks execute only for a queued service control;
+  - the ordinary request loop adds only the required demand-class transition
+    predicate, with demand-state mutation only when that class actually
+    changes; and
+  - local EOF performs one checked cold-path generation transition.
+- Evidence:
+  - the durable actor-authority regression proves that an unchanged exact
+    group installs while a candidate eligibility change between snapshot and
+    install withdraws without publishing an observer;
+  - the durable demand regression proves stable generation under unchanged
+    polling and exact changes for demand and EOF;
+  - the complete root library suite passed: 1,420 tests;
+  - focused TCP-service tests passed: 19;
+  - formatting and whitespace checks passed; and
+  - no performance verdict beyond the previously recorded inactive v5 gate is
+    claimed. Representative performance remains a required global-map gate
+    before any candidate or producer can be connected.

@@ -30,13 +30,14 @@ use super::open::{ReliableRelayOpenSpec, relay_error_is_tcp_path_failure};
 use super::remote::ReliableRelayAttachMode;
 #[cfg(feature = "lab-diagnostics")]
 use crate::lab_diagnostics::{lab_diagnostic, lab_perf_flush, lab_perf_record};
+use crate::model::ack_clock::reliable_ack_clock_measurement_limit_bytes;
 use crate::model::capacity::{
     PATH_OPEN_SCORE_BYTES, adaptive_reliable_relay_chunk_bytes,
     adaptive_reliable_relay_chunk_bytes_with_frame_limit, adaptive_reliable_relay_inflight_bytes,
     reliable_relay_buffer_len, reliable_relay_sender_dispatch_budget,
     reliable_stream_initial_advertised_window_bytes,
 };
-use crate::model::tcp_service::TcpServiceWriterLifecycle;
+use crate::model::tcp_service::{TcpServiceWithdrawalReason, TcpServiceWriterLifecycle};
 use crate::model::timing::sender_service_retry_delay;
 use crate::model::timing::transport_pto_from_snapshot;
 use crate::mux::stream::{ReliableRecvStream, ReliableSendStream, StreamError};
@@ -54,12 +55,17 @@ use crate::runtime::sender::{
 };
 use crate::runtime::stream::{
     OpenedRemoteStream, ReliableRelayRemoteFrame, ReliableRelayRemotePath, ReliableRelayRemoteSet,
-    RequestRelayActorEvent, StreamSendBufferReservation, wait_for_carrier_capacity_notifies,
+    RequestRelayActorEvent, RequestTcpServiceFrozenStream, StreamSendBufferReservation,
+    wait_for_carrier_capacity_notifies,
 };
 use crate::runtime::stream::{
     reliable_relay_recv_progress_resend_active, reliable_stream_recv_progress_interval,
 };
-use crate::runtime::tcp_service::RequestTcpServiceControl;
+use crate::runtime::tcp_service::{
+    RequestTcpServiceControl, RequestTcpServiceControlOutcome,
+    RequestTcpServiceObserverInstallation, RequestTcpServiceSnapshotRequest,
+    TcpServiceFlightSidecarError, TcpServiceObserverRemoval,
+};
 use crate::runtime::telemetry::ObservedProductIo;
 use crate::scheduler::{PathSnapshot, TrafficClass};
 use std::future::Future;
@@ -162,33 +168,121 @@ fn apply_observed_client_stream_ack(
     Ok(released)
 }
 
+fn snapshot_request_tcp_service_stream(
+    state: &ClientRelayState,
+    sender: &RequestSenderService,
+    sender_queue: &ReliableRelaySenderQueue,
+    context: &ClientPathContext,
+    remotes: &ReliableRelayRemoteSet,
+    request: RequestTcpServiceSnapshotRequest,
+) -> RequestTcpServiceControlOutcome<RequestTcpServiceFrozenStream> {
+    let demand_generation = match state.request_tcp_service_demand_generation() {
+        Ok(generation) => generation,
+        Err(reason) => return RequestTcpServiceControlOutcome::Withdrawn(reason),
+    };
+    if sender_queue.data_bytes() == 0 {
+        return RequestTcpServiceControlOutcome::Withdrawn(TcpServiceWithdrawalReason::DemandEnded);
+    }
+    let data_ack_horizon_bytes = reliable_ack_clock_measurement_limit_bytes(context.mux_limits);
+    let frozen = match remotes.snapshot_tcp_service_stream(
+        context,
+        request,
+        demand_generation,
+        data_ack_horizon_bytes,
+    ) {
+        Ok(frozen) => frozen,
+        Err(reason) => return RequestTcpServiceControlOutcome::Withdrawn(reason),
+    };
+    if !sender.tcp_service_accepted_set_has_original_flight(frozen.accepted()) {
+        return RequestTcpServiceControlOutcome::Withdrawn(TcpServiceWithdrawalReason::DemandEnded);
+    }
+    RequestTcpServiceControlOutcome::Complete(frozen)
+}
+
 fn apply_request_tcp_service_control(
+    state: &ClientRelayState,
     sender: &mut RequestSenderService,
+    sender_queue: &ReliableRelaySenderQueue,
+    context: &ClientPathContext,
+    remotes: &ReliableRelayRemoteSet,
     control: RequestTcpServiceControl,
 ) {
     match control {
-        RequestTcpServiceControl::Install { install, receipt } => {
-            let result = sender.install_tcp_service_observer(
-                install.stream,
-                install.accepted,
-                install.candidate,
-                install.coordinator,
-                install.max_flight_records,
-                install.max_ack_release_records,
+        RequestTcpServiceControl::Snapshot { request, receipt } => {
+            let result = snapshot_request_tcp_service_stream(
+                state,
+                sender,
+                sender_queue,
+                context,
+                remotes,
+                request,
             );
             let _ = receipt.send(result);
         }
-        RequestTcpServiceControl::BindCandidate {
-            lifecycle,
-            instance,
-            fence,
-            receipt,
-        } => {
-            let result = sender.bind_tcp_service_candidate(lifecycle, instance, fence);
+        RequestTcpServiceControl::Install { install, receipt } => {
+            let revalidated = snapshot_request_tcp_service_stream(
+                state,
+                sender,
+                sender_queue,
+                context,
+                remotes,
+                install.frozen.snapshot_request(),
+            );
+            let result = match revalidated {
+                RequestTcpServiceControlOutcome::Complete(current) if current == install.frozen => {
+                    let accepted = install
+                        .frozen
+                        .accepted()
+                        .iter()
+                        .map(|binding| (binding.instance(), binding.carrier()))
+                        .collect();
+                    match sender.install_tcp_service_observer(
+                        install.frozen.stream(),
+                        accepted,
+                        install.frozen.candidate(),
+                        install.coordinator,
+                        install.max_flight_records,
+                        install.max_ack_release_records,
+                    ) {
+                        Ok(true) => RequestTcpServiceControlOutcome::Complete(
+                            RequestTcpServiceObserverInstallation::Installed,
+                        ),
+                        Ok(false) => RequestTcpServiceControlOutcome::Complete(
+                            RequestTcpServiceObserverInstallation::AlreadyInstalled,
+                        ),
+                        Err(TcpServiceFlightSidecarError::ResourceLimit) => {
+                            RequestTcpServiceControlOutcome::Withdrawn(
+                                TcpServiceWithdrawalReason::ResourceLimit,
+                            )
+                        }
+                        Err(
+                            TcpServiceFlightSidecarError::InvalidRelease
+                            | TcpServiceFlightSidecarError::ObserverStopped,
+                        ) => RequestTcpServiceControlOutcome::Withdrawn(
+                            TcpServiceWithdrawalReason::FenceChanged,
+                        ),
+                    }
+                }
+                RequestTcpServiceControlOutcome::Complete(_) => {
+                    RequestTcpServiceControlOutcome::Withdrawn(
+                        TcpServiceWithdrawalReason::FenceChanged,
+                    )
+                }
+                RequestTcpServiceControlOutcome::Withdrawn(reason) => {
+                    RequestTcpServiceControlOutcome::Withdrawn(reason)
+                }
+            };
             let _ = receipt.send(result);
         }
         RequestTcpServiceControl::Remove { lifecycle, receipt } => {
-            let result = sender.remove_tcp_service_observer(lifecycle);
+            let result = match sender.remove_tcp_service_observer(lifecycle) {
+                TcpServiceObserverRemoval::DifferentLifecycle => {
+                    RequestTcpServiceControlOutcome::Withdrawn(
+                        TcpServiceWithdrawalReason::FenceChanged,
+                    )
+                }
+                removal => RequestTcpServiceControlOutcome::Complete(removal),
+            };
             let _ = receipt.send(result);
         }
     }
@@ -428,7 +522,14 @@ where
                     event = remotes.recv_event() => {
                         match event {
                             Ok(RequestRelayActorEvent::TcpService(control)) => {
-                                apply_request_tcp_service_control(&mut sender, *control);
+                                apply_request_tcp_service_control(
+                                    &state,
+                                    &mut sender,
+                                    &sender_queue,
+                                    context,
+                                    &remotes,
+                                    *control,
+                                );
                             }
                             Ok(RequestRelayActorEvent::Frame(_)) => {}
                             Err(err) => break Err(err),
@@ -446,7 +547,14 @@ where
                 event = remotes.recv_event() => {
                     match event {
                         Ok(RequestRelayActorEvent::TcpService(control)) => {
-                            apply_request_tcp_service_control(&mut sender, *control);
+                            apply_request_tcp_service_control(
+                                &state,
+                                &mut sender,
+                                &sender_queue,
+                                context,
+                                &remotes,
+                                *control,
+                            );
                         }
                         Ok(RequestRelayActorEvent::Frame(_)) => {}
                         Err(err) => break Err(err),
@@ -582,6 +690,11 @@ where
             context.mux_limits,
         );
         let request_lane = request_demand_update.lane;
+        let request_lane_changed =
+            reliable_relay_lane_changed(request_demand_update.previous_lane, request_lane);
+        if request_lane_changed {
+            state.refresh_request_tcp_service_demand(request_lane);
+        }
         let path_snapshot =
             remotes.lowest_eta_path_snapshot(context, relay_lane, PATH_OPEN_SCORE_BYTES);
         update_request_path_staleness(
@@ -595,7 +708,7 @@ where
             stream_id,
         );
         #[cfg(feature = "lab-diagnostics")]
-        if reliable_relay_lane_changed(request_demand_update.previous_lane, request_lane) {
+        if request_lane_changed {
             lab_diagnostic(
                 "client_request_lane_changed",
                 format_args!(
@@ -1717,7 +1830,14 @@ where
                 };
                 let ReliableRelayRemoteFrame { instance, frame } = match event {
                     RequestRelayActorEvent::TcpService(control) => {
-                        apply_request_tcp_service_control(&mut sender, *control);
+                        apply_request_tcp_service_control(
+                            &state,
+                            &mut sender,
+                            &sender_queue,
+                            context,
+                            &remotes,
+                            *control,
+                        );
                         continue;
                     }
                     RequestRelayActorEvent::Frame(frame)

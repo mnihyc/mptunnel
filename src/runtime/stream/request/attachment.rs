@@ -8,12 +8,16 @@ use crate::model::capacity::reliable_relay_buffer_len;
 #[cfg(test)]
 use crate::model::path::next_carrier_path_instance_id;
 use crate::model::path::{CarrierPathInstanceId, RelayPathInstance, RelayPathKey};
+use crate::model::tcp_service::{
+    TcpServiceCarrierFence, TcpServiceCarrierGroupId, TcpServiceStreamFence,
+    TcpServiceWithdrawalReason,
+};
 use crate::mux::MuxLimits;
 use crate::protocol::{Frame, ResetReason, StreamId, UnderlayProtocol};
 use crate::runtime::error::RuntimeError;
 use crate::runtime::path::{ClientPathContext, RelayPathLoadLease};
 use crate::runtime::stream::{ReliablePathStream, ReliablePathStreamHandle};
-use crate::runtime::tcp_service::RequestTcpServiceControl;
+use crate::runtime::tcp_service::{RequestTcpServiceControl, RequestTcpServiceSnapshotRequest};
 use crate::scheduler::{PathSnapshot, TrafficClass, path_is_backup, score_path};
 use std::time::Instant;
 use tokio::sync::mpsc;
@@ -155,6 +159,59 @@ pub(in crate::runtime) struct ReliableRelayRemoteFrame {
     pub(in crate::runtime) frame: Result<Frame, RuntimeError>,
 }
 
+/// Exact actor-owned attachment binding for one frozen accepted carrier.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(in crate::runtime) struct RequestTcpServiceAcceptedBinding {
+    instance: RelayPathInstance,
+    carrier: TcpServiceCarrierFence,
+}
+
+impl RequestTcpServiceAcceptedBinding {
+    pub(in crate::runtime) fn instance(self) -> RelayPathInstance {
+        self.instance
+    }
+
+    pub(in crate::runtime) fn carrier(self) -> TcpServiceCarrierFence {
+        self.carrier
+    }
+}
+
+/// Opaque request-stream fence minted only by its attachment owner.
+///
+/// Its private constructor prevents a session controller from fabricating
+/// stream attachment identity. Installation must rederive and compare the
+/// complete value in the same serialized actor.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(in crate::runtime) struct RequestTcpServiceFrozenStream {
+    carrier_group_id: TcpServiceCarrierGroupId,
+    stream: TcpServiceStreamFence,
+    accepted: Vec<RequestTcpServiceAcceptedBinding>,
+    candidate: TcpServiceCarrierFence,
+    max_accepted_paths: usize,
+}
+
+impl RequestTcpServiceFrozenStream {
+    pub(in crate::runtime) fn snapshot_request(&self) -> RequestTcpServiceSnapshotRequest {
+        RequestTcpServiceSnapshotRequest {
+            carrier_group_id: self.carrier_group_id,
+            candidate: self.candidate,
+            max_accepted_paths: self.max_accepted_paths,
+        }
+    }
+
+    pub(in crate::runtime) fn stream(&self) -> TcpServiceStreamFence {
+        self.stream
+    }
+
+    pub(in crate::runtime) fn accepted(&self) -> &[RequestTcpServiceAcceptedBinding] {
+        &self.accepted
+    }
+
+    pub(in crate::runtime) fn candidate(&self) -> TcpServiceCarrierFence {
+        self.candidate
+    }
+}
+
 pub(in crate::runtime) enum RequestRelayActorEvent {
     Frame(ReliableRelayRemoteFrame),
     TcpService(Box<RequestTcpServiceControl>),
@@ -242,6 +299,100 @@ impl ReliableRelayRemoteSet {
     pub(in crate::runtime) fn accepted_attachment_incarnation(&self) -> Option<u64> {
         self.topology_identity_valid
             .then_some(self.accepted_attachment_incarnation)
+    }
+
+    /// Resolves one controller request into exact current stream authority.
+    ///
+    /// Only accepted Product attachments from the requested configured TCP
+    /// group enter the result. Every physical instance, PATH_JOIN nonce, and
+    /// directional eligibility generation is re-read from authenticated path
+    /// state; the candidate must be current and remain unattached.
+    pub(in crate::runtime) fn snapshot_tcp_service_stream(
+        &self,
+        context: &ClientPathContext,
+        request: RequestTcpServiceSnapshotRequest,
+        demand_generation: u64,
+        data_ack_horizon_bytes: u64,
+    ) -> Result<RequestTcpServiceFrozenStream, TcpServiceWithdrawalReason> {
+        if request.max_accepted_paths == 0 || demand_generation == 0 || data_ack_horizon_bytes == 0
+        {
+            return Err(TcpServiceWithdrawalReason::ResourceLimit);
+        }
+        let attachment_incarnation = self
+            .accepted_attachment_incarnation()
+            .ok_or(TcpServiceWithdrawalReason::ResourceLimit)?;
+        let endpoint = context
+            .tcp_service_endpoint(request.carrier_group_id)
+            .ok_or(TcpServiceWithdrawalReason::FenceChanged)?;
+
+        let mut candidate_matches = 0usize;
+        for path_index in &endpoint.members {
+            let key = RelayPathKey {
+                underlay: UnderlayProtocol::Tcp,
+                index: *path_index,
+            };
+            if context.current_request_tcp_service_carrier(key) == Some(request.candidate) {
+                candidate_matches = candidate_matches.saturating_add(1);
+                if self.contains_path_key(key) {
+                    return Err(TcpServiceWithdrawalReason::FenceChanged);
+                }
+            }
+        }
+        if candidate_matches != 1 {
+            return Err(TcpServiceWithdrawalReason::FenceChanged);
+        }
+
+        let accepted_count = self
+            .paths
+            .iter()
+            .filter(|path| {
+                path.key().underlay == UnderlayProtocol::Tcp
+                    && endpoint.members.contains(&path.key().index)
+            })
+            .count();
+        if accepted_count == 0 {
+            return Err(TcpServiceWithdrawalReason::DemandEnded);
+        }
+        if accepted_count > request.max_accepted_paths {
+            return Err(TcpServiceWithdrawalReason::ResourceLimit);
+        }
+        let mut accepted = Vec::new();
+        accepted
+            .try_reserve(accepted_count)
+            .map_err(|_| TcpServiceWithdrawalReason::ResourceLimit)?;
+        for path in self.paths.iter().filter(|path| {
+            path.key().underlay == UnderlayProtocol::Tcp
+                && endpoint.members.contains(&path.key().index)
+        }) {
+            let instance = path.instance();
+            let carrier = context
+                .current_request_tcp_service_carrier(path.key())
+                .filter(|carrier| carrier.local_instance_id == instance.path_instance_id)
+                .ok_or(TcpServiceWithdrawalReason::FenceChanged)?;
+            if carrier == request.candidate {
+                return Err(TcpServiceWithdrawalReason::FenceChanged);
+            }
+            accepted.push(RequestTcpServiceAcceptedBinding { instance, carrier });
+        }
+        accepted.sort_unstable_by_key(|binding| binding.carrier.accepted);
+        if accepted
+            .windows(2)
+            .any(|pair| pair[0].carrier.accepted == pair[1].carrier.accepted)
+        {
+            return Err(TcpServiceWithdrawalReason::FenceChanged);
+        }
+        Ok(RequestTcpServiceFrozenStream {
+            carrier_group_id: request.carrier_group_id,
+            stream: TcpServiceStreamFence {
+                stream_id: self.stream_id,
+                demand_generation,
+                attachment_incarnation,
+                data_ack_horizon_bytes,
+            },
+            accepted,
+            candidate: request.candidate,
+            max_accepted_paths: request.max_accepted_paths,
+        })
     }
 
     /// A selection is valid only for the exact attachment topology it observed.

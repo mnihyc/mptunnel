@@ -44,6 +44,7 @@ use crate::runtime::path::commands::{
 use crate::runtime::stream::ReliablePathStreamHandle;
 use crate::runtime::stream::{
     ReliablePathStreamOutput, ReliableRecvProgress, ReliableRelayRemoteSet,
+    RequestTcpServiceAcceptedBinding,
 };
 use crate::runtime::tcp_service::{
     TcpServiceFlightSidecarError, TcpServiceObserverRemoval, TcpServiceWriterCoordinator,
@@ -174,14 +175,12 @@ impl RequestSenderService {
         )
     }
 
-    pub(in crate::runtime) fn bind_tcp_service_candidate(
-        &mut self,
-        lifecycle: TcpServiceWriterLifecycle,
-        instance: RelayPathInstance,
-        fence: TcpServiceCarrierFence,
-    ) -> Result<bool, TcpServiceFlightSidecarError> {
+    pub(in crate::runtime) fn tcp_service_accepted_set_has_original_flight(
+        &self,
+        accepted: &[RequestTcpServiceAcceptedBinding],
+    ) -> bool {
         self.multipath
-            .bind_tcp_service_candidate(lifecycle, instance, fence)
+            .tcp_service_accepted_set_has_original_flight(accepted)
     }
 
     pub(in crate::runtime) fn remove_tcp_service_observer(

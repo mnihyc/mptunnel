@@ -4,7 +4,9 @@ use crate::model::tcp_service::TcpServiceWriterLifecycle;
 use crate::protocol::{PathId, PathMetricDirection, SessionId};
 use crate::runtime::path::commands::reliable_path_command_channels;
 use crate::runtime::stream::{ReliablePathStream, ReliablePathStreamOutput};
-use crate::runtime::tcp_service::{RequestTcpServiceControl, TcpServiceObserverRemoval};
+use crate::runtime::tcp_service::{
+    RequestTcpServiceControl, RequestTcpServiceControlOutcome, TcpServiceObserverRemoval,
+};
 use std::time::Duration;
 
 fn opened_stream(
@@ -141,7 +143,9 @@ async fn tcp_service_controls_share_fifo_and_survive_zero_attachments() {
                 receipt,
             } => {
                 assert_eq!(observed, lifecycle);
-                let _ = receipt.send(TcpServiceObserverRemoval::AlreadyAbsent);
+                let _ = receipt.send(RequestTcpServiceControlOutcome::Complete(
+                    TcpServiceObserverRemoval::AlreadyAbsent,
+                ));
             }
             _ => panic!("unexpected TCP service control"),
         },
@@ -149,7 +153,7 @@ async fn tcp_service_controls_share_fifo_and_survive_zero_attachments() {
     }
     assert_eq!(
         removed_rx.await.expect("removal receipt"),
-        TcpServiceObserverRemoval::AlreadyAbsent
+        RequestTcpServiceControlOutcome::Complete(TcpServiceObserverRemoval::AlreadyAbsent)
     );
     assert!(matches!(
         remotes.try_recv_frame(),
@@ -177,7 +181,9 @@ async fn tcp_service_controls_share_fifo_and_survive_zero_attachments() {
     {
         RequestRelayActorEvent::TcpService(control) => match *control {
             RequestTcpServiceControl::Remove { receipt, .. } => {
-                let _ = receipt.send(TcpServiceObserverRemoval::AlreadyAbsent);
+                let _ = receipt.send(RequestTcpServiceControlOutcome::Complete(
+                    TcpServiceObserverRemoval::AlreadyAbsent,
+                ));
             }
             _ => panic!("unexpected disconnected TCP service control"),
         },
@@ -185,7 +191,7 @@ async fn tcp_service_controls_share_fifo_and_survive_zero_attachments() {
     }
     assert_eq!(
         disconnected_rx.await.expect("disconnected receipt"),
-        TcpServiceObserverRemoval::AlreadyAbsent
+        RequestTcpServiceControlOutcome::Complete(TcpServiceObserverRemoval::AlreadyAbsent)
     );
 }
 

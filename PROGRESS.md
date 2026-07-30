@@ -11,6 +11,75 @@ Historical entries below are retained as evidence of the decisions made at
 their recorded time. When a later entry changes an earlier decision, the later
 entry is authoritative.
 
+## 2026-07-30T10:22:47+08:00: endpoint-scoped TCP service authority
+
+- Name: establish the clean breaking protocol model before adaptive TCP work
+- Category: Core RFC, directional evidence, bounded resources, retirement,
+  and performance change control
+- State: RFC committed and independently reviewed; runtime remains on the
+  restored Core and MPP v4 until the ordered v5 implementation slices pass
+- Source: clean commit `95b6a24dc9992e24d7ba011a66843dd08794354b`
+- Content:
+  - removed the complete uncommitted 3,032-line TCP expansion attempt after
+    proving that one request stream could publish endpoint-wide authority,
+    response provenance was inferred after receiver reordering, candidate
+    credit rolled without a finite lifetime bound, and retirement could close
+    with original flight outstanding;
+  - established MPP v5 as a clean break with no compatibility or downgrade
+    mode, leaving the TLS 1.3 TCP prelude and standard HTTP/3 QUIC presentation
+    unchanged;
+  - assigned TCP establishment to the client and unique-delivery verdicts to
+    two independent sender-owned session/group/direction controllers;
+  - retained `PATH_JOIN.nonce` as the authenticated carrier-instance token for
+    cross-carrier references instead of using a locator or reusable numeric
+    `PathId`;
+  - defined encrypted, TCP-only demand, validation, and result frames with
+    exact bounded carrier and stream cohorts; the stream list is one immutable
+    response-demand snapshot, not a per-stream demand protocol;
+  - bounded candidate Product work to one readiness and two comparison phases,
+    at most three existing bulk scheduling horizons in total and always within
+    the existing unproven-flight bound;
+  - matched two pre-reference and two post-reference windows around the two
+    comparison windows, used indivisible exact Data ACK events and exact
+    rational rate comparison, and introduced no fixed percentage verdict;
+  - made invalidation and absolute resource-lifetime expiry withdraw without a
+    capacity verdict, and suppressed no-gain retries until exact cohort
+    identity or the observed reference range materially changes; and
+  - made peer `PATH_CLOSE` the ordered aggregate acknowledgment of a drained
+    TCP carrier, with both-direction queues, attachments, Data ACKs, flights,
+    proofs, validation work, and leases at zero before removal.
+- Evidence:
+  - three read-only architecture audits independently located the per-stream
+    authority, response-provenance, candidate-instance, and drain-ordering
+    defects and agreed that no `STREAM_DEMAND` or `STREAM_DETACH_ACK` frame is
+    required;
+  - the final hostile review required exact response cohort equality,
+    race-safe withdrawal, authenticated instance references, finite deadlines,
+    canonical demand lifecycle, and bounded cohort work before approval;
+  - `cargo check --locked` passed on the restored clean runtime;
+  - the focused existing protocol gate passed all 46 selected tests; and
+  - whitespace validation passed.
+- Performance boundary:
+  - this milestone changes no runtime source, congestion controller, scheduler,
+    recovery rule, timing parameter, transport setting, payload loop, or
+    connection count;
+  - commit `a5a6094fc8e07456b057ddc107a0d51849d42d10` remains the historical
+    runtime performance authority; and
+  - protocol-v4 measurements remain historical evidence and will not be
+    relabeled as v5. Fresh matched v5 parent, champion, QoS, shared-bottleneck,
+    condition, and transition rows are mandatory before enabling or releasing
+    adaptive carriers.
+- Decision:
+  - `./RFC.md` is the sole implementation authority for this work;
+  - no code from the rejected per-stream or older TCP-pool attempts may return
+    by bulk restoration; and
+  - each v5 slice must be isolated, causally reviewed, and verified before
+    runtime behavior is enabled.
+- Next: implement only the v5 authentication contexts, bounded codec, and
+  three encrypted TCP carrier-control frames with permanent canonicality and
+  allocation-limit coverage; then implement the pure endpoint-direction
+  controller before any runtime scheduling integration.
+
 ## 2026-07-30T07:12:31+08:00: bounded TCP carrier topology
 
 - Name: represent one configured TCP endpoint as a bounded carrier group

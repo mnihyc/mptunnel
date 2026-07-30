@@ -2490,3 +2490,39 @@ entry is authoritative.
   - no new timing, threshold, parameter, or performance claim is made.
     Historical-performance restoration and the representative lab matrix
     remain mandatory before candidate placement or release.
+
+## 2026-07-30T17:24:29+08:00: Durable terminal TCP service cleanup authority
+
+- Name: retain exact validation authority through observer cleanup
+- Category: Core model and RFC alignment
+- State: pure session model complete; the production session owner, response
+  symmetry, and validation-only candidate attachment remain disconnected
+- Content:
+  - made every installation, settled validation, withdrawal, and deadline path
+    enter one durable `Cleaning` state instead of releasing session authority
+    before passive writer observers have been removed;
+  - made the cleanup token carry the exact session, trial, candidate,
+    direction, lifecycle, installation stage, terminal verdict, withdrawal
+    reason, and no-gain suppression evidence;
+  - made cleanup replayable after task cancellation while rejecting stale
+    acknowledgements from an earlier lifecycle;
+  - kept later reservations, including the opposite direction, blocked until
+    exact cleanup acknowledgement; and
+  - made a reached absolute deadline override an earlier proposed
+    installation-withdrawal reason without introducing a second timer.
+- Ordinary-path cost:
+  - no packet, acknowledgement, scheduler, congestion-control, timer,
+    carrier-count, admission, transport, or runtime behavior changed;
+  - this is a cold, production-disconnected state-machine correction; and
+  - no performance claim is made until the session owner is connected and the
+    historical and representative lab gates pass.
+- Evidence:
+  - the existing nine durable TCP service model tests cover retained, no-gain,
+    fence-changed, demand-ended, failed-installation, installing-deadline,
+    running-deadline, cross-direction, replayed-cleanup, and stale-token
+    lifecycles;
+  - two independent read-only reviews found the generalized cleanup automaton
+    sound and the token safe for lock-ordered runtime integration;
+  - the complete root library suite passed: 1,420 tests;
+  - every Cargo target compiles under the locked dependency graph; and
+  - formatting and whitespace checks passed.

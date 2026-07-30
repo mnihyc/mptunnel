@@ -257,6 +257,7 @@ class ResultEnrichmentTests(unittest.TestCase):
     def test_reproducibility_rejects_a_stale_wire_identity(self):
         stale_values = (
             {"mptunnel_protocol_version": 3},
+            {"mptunnel_protocol_version": 4},
             {"mptunnel_carrier_presentation": "unsupported-carrier"},
         )
         for overrides in stale_values:
@@ -316,6 +317,9 @@ class ResultEnrichmentTests(unittest.TestCase):
             "BASELINE_LOCK_SHA256": "",
             "MPTUNNEL_LAB_FAT_LOSS": "0.00%",
             "MPTUNNEL_LAB_NETEM_LIMIT_PACKETS": "32768",
+            "MPTUNNEL_LAB_TCP_CARRIER_QOS_COHORT": "1",
+            "MPTUNNEL_LAB_TCP_PER_FLOW_QOS_RATE": "500mbit",
+            "MPTUNNEL_LAB_TCP_SHARED_BOTTLENECK_RATE": "200mbit",
             "MPTUNNEL_MAX_QUIC_CONCURRENT_BIDI_STREAMS": "4096",
             "MPTUNNEL_MAX_RETAINED_RECEIVE_RANGES": "2048",
             "MPTUNNEL_QUIC_PATH_IDLE_TIMEOUT_MS": "45000",
@@ -371,6 +375,9 @@ class ResultEnrichmentTests(unittest.TestCase):
                 {
                     "MPTUNNEL_LAB_FAT_LOSS": "0.00%",
                     "MPTUNNEL_LAB_NETEM_LIMIT_PACKETS": "32768",
+                    "MPTUNNEL_LAB_TCP_CARRIER_QOS_COHORT": "1",
+                    "MPTUNNEL_LAB_TCP_PER_FLOW_QOS_RATE": "500mbit",
+                    "MPTUNNEL_LAB_TCP_SHARED_BOTTLENECK_RATE": "200mbit",
                     "MPTUNNEL_MAX_QUIC_CONCURRENT_BIDI_STREAMS": "4096",
                     "MPTUNNEL_MAX_RETAINED_RECEIVE_RANGES": "2048",
                     "MPTUNNEL_QUIC_PATH_IDLE_TIMEOUT_MS": "45000",

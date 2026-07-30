@@ -65,11 +65,50 @@ def read_exact(sock, size, deadline):
     return b"".join(chunks)
 
 
-def write_started_file(path):
+def write_started_file(path, timestamp=None):
     if not path:
         return
+    if timestamp is None:
+        timestamp = time.time()
     with open(path, "w", encoding="utf-8") as handle:
-        handle.write(f"{time.time():.9f}\n")
+        handle.write(f"{timestamp:.9f}\n")
+
+
+class SynchronizedStartAnchor:
+    """Releases a stream cohort and establishes its shared load-time origin."""
+
+    def __init__(self, parties, started_file=None):
+        self.monotonic = None
+        self.wall_time = None
+        self.started_file = started_file
+        self.released = threading.Event()
+        self.barrier = threading.Barrier(parties, action=self._release)
+
+    def _release(self):
+        self.monotonic = time.monotonic()
+        self.wall_time = time.time()
+        write_started_file(self.started_file, self.wall_time)
+        self.released.set()
+
+    def wait(self, deadline):
+        remaining = remaining_before(deadline)
+        try:
+            self.barrier.wait(timeout=remaining)
+        except threading.BrokenBarrierError as exc:
+            raise RuntimeError("upload synchronized-start barrier broke") from exc
+        if self.monotonic is None:
+            raise RuntimeError("upload synchronized-start anchor is missing")
+        return self.monotonic
+
+    def abort(self):
+        try:
+            self.barrier.abort()
+        except threading.BrokenBarrierError:
+            pass
+
+    @property
+    def completed(self):
+        return self.released.is_set()
 
 
 def watch_failover_marker(path, started, state, lock, stop_event):
@@ -259,9 +298,22 @@ def consume_acknowledgements(data, started, state, lock, stream_state):
 
 
 def upload_one_stream(
-    args, started, load_deadline, drain_deadline, state, lock, payload
+    args,
+    started,
+    load_deadline,
+    drain_deadline,
+    state,
+    lock,
+    payload,
+    start_anchor=None,
+    setup_deadline=None,
 ):
-    sock = connect_target(args, load_deadline)
+    connection_deadline = (
+        setup_deadline if start_anchor is not None else load_deadline
+    )
+    if connection_deadline is None:
+        raise RuntimeError("synchronized upload start requires a setup deadline")
+    sock = connect_target(args, connection_deadline)
     stream_state = {
         "local_accepted_bytes": 0,
         "confirmed_bytes": 0,
@@ -270,6 +322,12 @@ def upload_one_stream(
         "response_buffer": bytearray(),
     }
     with sock:
+        if start_anchor is not None:
+            measurement_duration = max(0.0, load_deadline - started)
+            drain_duration = max(0.0, drain_deadline - load_deadline)
+            started = start_anchor.wait(connection_deadline)
+            load_deadline = started + measurement_duration
+            drain_deadline = load_deadline + drain_duration
         sock.setblocking(False)
         while time.monotonic() < load_deadline:
             remaining = load_deadline - time.monotonic()
@@ -338,11 +396,21 @@ def upload_one_stream(
 
 def interval_upload(args):
     started = time.monotonic()
-    write_started_file(args.started_file)
     load_duration = args.load_duration if args.load_duration > 0 else args.timeout
-    load_deadline = started + min(load_duration, args.timeout)
+    measurement_duration = min(load_duration, args.timeout)
+    load_deadline = started + measurement_duration
     drain_timeout = max(0.0, getattr(args, "drain_timeout", 1.0))
     drain_deadline = load_deadline + drain_timeout
+    expected_streams = max(1, args.parallel_uploads)
+    synchronized_start = bool(getattr(args, "synchronized_start", False))
+    start_anchor = (
+        SynchronizedStartAnchor(expected_streams, args.started_file)
+        if synchronized_start and expected_streams > 1
+        else None
+    )
+    if start_anchor is None:
+        write_started_file(args.started_file)
+    setup_deadline = started + args.timeout
     state = {
         "bytes": 0,
         "local_accepted_bytes": 0,
@@ -380,17 +448,32 @@ def interval_upload(args):
         complete = False
         probe_error = None
         try:
-            stream_result = upload_one_stream(
-                args,
-                started,
-                load_deadline,
-                drain_deadline,
-                state,
-                lock,
-                payload,
-            )
+            if start_anchor is None:
+                stream_result = upload_one_stream(
+                    args,
+                    started,
+                    load_deadline,
+                    drain_deadline,
+                    state,
+                    lock,
+                    payload,
+                )
+            else:
+                stream_result = upload_one_stream(
+                    args,
+                    started,
+                    load_deadline,
+                    drain_deadline,
+                    state,
+                    lock,
+                    payload,
+                    start_anchor,
+                    setup_deadline,
+                )
             complete = stream_result["complete"]
         except Exception as exc:
+            if start_anchor is not None and not start_anchor.completed:
+                start_anchor.abort()
             detail = str(exc) or "no error detail"
             probe_error = (stream_index, f"{type(exc).__name__}: {detail}")
         with lock:
@@ -409,7 +492,7 @@ def interval_upload(args):
             name=f"upload-worker-{stream_index}",
             daemon=False,
         )
-        for stream_index in range(max(1, args.parallel_uploads))
+        for stream_index in range(expected_streams)
     ]
     for thread in threads:
         thread.start()
@@ -430,10 +513,14 @@ def interval_upload(args):
             for stream_index, message in sorted(state["probe_errors"])
         ]
 
-    elapsed = time.monotonic() - started
+    measurement_started = (
+        start_anchor.monotonic
+        if start_anchor is not None and start_anchor.monotonic is not None
+        else started
+    )
+    elapsed = time.monotonic() - measurement_started
     confirmed_bytes = aggregate["bytes"]
     local_accepted_bytes = aggregate["local_accepted_bytes"]
-    expected_streams = max(1, args.parallel_uploads)
     ack_accounting_valid = (
         not aggregate["probe_errors"] and aggregate["streams"] == expected_streams
     )
@@ -457,7 +544,7 @@ def interval_upload(args):
         "mode": "duration-upload",
         "load_duration_s": round(load_duration, 6),
         "drain_timeout_s": round(drain_timeout, 6),
-        "parallel_uploads": max(1, args.parallel_uploads),
+        "parallel_uploads": expected_streams,
         "time_s": round(elapsed, 6),
         "goodput_mbps": round(goodput, 3),
         "upload_goodput_mbps": round(goodput, 3),
@@ -491,6 +578,18 @@ def interval_upload(args):
         if args.failover_marker_file
         else "timer",
     }
+    if synchronized_start:
+        result.update(
+            {
+                "synchronized_start": True,
+                "synchronized_start_completed": start_anchor is None
+                or start_anchor.completed,
+                "measurement_anchor": "post-connect-barrier"
+                if start_anchor is not None
+                else "probe-start",
+                "measurement_start_delay_s": round(measurement_started - started, 6),
+            }
+        )
     result.update(
         interval_metric_fields(
             aggregate["interval_bytes"] if ack_accounting_valid else {},
@@ -517,6 +616,11 @@ def main():
     parser.add_argument("--chunk-bytes", type=int, default=64 * 1024)
     parser.add_argument("--load-duration", type=float, default=30.0)
     parser.add_argument("--parallel-uploads", type=int, default=1)
+    parser.add_argument(
+        "--synchronized-start",
+        action="store_true",
+        help="connect every stream before anchoring and starting the shared load window",
+    )
     parser.add_argument(
         "--interval-seconds", type=float, default=DEFAULT_INTERVAL_SECONDS
     )

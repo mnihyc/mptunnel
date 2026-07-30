@@ -137,6 +137,31 @@ Useful families include:
 The runner source is the authoritative case list. Case names are public lab
 identifiers, not runtime algorithms or diagnostic event names.
 
+### TCP carrier QoS cohort
+
+The adaptive TCP carrier gate has one opt-in, fixed cohort:
+
+```bash
+MPTUNNEL_LAB_TCP_CARRIER_QOS_COHORT=1 \
+CASE_FILTER='mptunnel_tcp_carrier_qos_*' \
+BUILD_LAB_IMAGES=0 \
+lab/run-heterogeneous-ablation.sh
+```
+
+For download and upload, it runs adjacent `tcp-carriers=1-1` and
+`tcp-carriers=1-3` rows with three persistent application flows, a synchronized
+post-connect start, and a 30-second load window. The per-flow profile applies a
+500 Mbps `fq maxrate` to each native TCP flow; the shared profile applies one
+200 Mbps aggregate bottleneck. Both use the fat-path propagation delay, zero
+configured loss, a derived queue limit, and saved `tc -s -d` state. The client
+URI alone owns the carrier range.
+
+This cohort is a measurement fixture, not evidence that the current runtime
+has retained elastic carriers. Accept expansion only from repeated adjacent
+pairs: the per-flow profile must establish useful added service, while the
+shared bottleneck must preserve goodput and retire an unhelpful candidate
+without churn. There is no universal percentage margin.
+
 Xray and Hysteria2 releases, asset URLs, architectures, and SHA-256 digests are
 pinned in `lab/baseline-lock.json`; no mutable `latest` URL is resolved. The
 runner freezes that lock by SHA-256 for the full invocation. Each external

@@ -84,6 +84,8 @@ fat_rate="${MPTUNNEL_LAB_FAT_RATE:-500mbit}"
 fat_delay="${MPTUNNEL_LAB_FAT_DELAY:-180ms}"
 fat_jitter="${MPTUNNEL_LAB_FAT_JITTER:-20ms}"
 fat_loss="${MPTUNNEL_LAB_FAT_LOSS:-1.00%}"
+tcp_per_flow_qos_rate="${MPTUNNEL_LAB_TCP_PER_FLOW_QOS_RATE:-500mbit}"
+tcp_shared_bottleneck_rate="${MPTUNNEL_LAB_TCP_SHARED_BOTTLENECK_RATE:-200mbit}"
 
 poor_rate="${MPTUNNEL_LAB_POOR_RATE:-50mbit}"
 poor_delay="${MPTUNNEL_LAB_POOR_DELAY:-420ms}"
@@ -175,6 +177,65 @@ apply_profile_all() {
   apply_profile "172.31.30" "$rate" "$delay" "$jitter" "$loss"
 }
 
+apply_tcp_per_flow_qos() {
+  local subnet_prefix="$1"
+  local maxrate="$2"
+  local iface limit_packets aggregate_rate
+
+  iface="$(interface_for_subnet "$subnet_prefix")"
+  if [[ -z "$iface" ]]; then
+    return 0
+  fi
+
+  # The root models only deterministic propagation. Its queue must hold the
+  # aggregate delay-rate product of the largest configured carrier cohort;
+  # the child fq qdisc then applies maxrate independently to each TCP flow.
+  aggregate_rate="$(scale_netem_value "$maxrate" 3)"
+  limit_packets="${MPTUNNEL_LAB_NETEM_LIMIT_PACKETS:-$(
+    netem_limit_packets "$aggregate_rate" "$fat_delay" "0ms"
+  )}"
+  if [[ ! "$limit_packets" =~ ^[1-9][0-9]*$ ]]; then
+    echo "MPTUNNEL_LAB_NETEM_LIMIT_PACKETS must be a positive integer" >&2
+    exit 2
+  fi
+
+  # Recreate the hierarchy so a preceding shared-bottleneck profile cannot
+  # leave a child qdisc with different semantics.
+  tc qdisc del dev "$iface" root 2>/dev/null || true
+  tc qdisc add dev "$iface" root handle 1: netem \
+    limit "$limit_packets" \
+    delay "$fat_delay"
+  tc qdisc add dev "$iface" parent 1:1 handle 10: fq \
+    maxrate "$maxrate"
+}
+
+apply_tcp_shared_bottleneck() {
+  local subnet_prefix="$1"
+  local rate="$2"
+  local iface limit_packets
+
+  iface="$(interface_for_subnet "$subnet_prefix")"
+  if [[ -z "$iface" ]]; then
+    return 0
+  fi
+
+  limit_packets="${MPTUNNEL_LAB_NETEM_LIMIT_PACKETS:-$(
+    netem_limit_packets "$rate" "$fat_delay" "0ms"
+  )}"
+  if [[ ! "$limit_packets" =~ ^[1-9][0-9]*$ ]]; then
+    echo "MPTUNNEL_LAB_NETEM_LIMIT_PACKETS must be a positive integer" >&2
+    exit 2
+  fi
+
+  # Remove any per-flow child from an earlier profile before installing the
+  # single aggregate bottleneck.
+  tc qdisc del dev "$iface" root 2>/dev/null || true
+  tc qdisc add dev "$iface" root handle 1: netem \
+    limit "$limit_packets" \
+    rate "$rate" \
+    delay "$fat_delay"
+}
+
 blackhole_profile() {
   local subnet_prefix="$1"
   local iface
@@ -204,7 +265,7 @@ show_profile() {
     case "$addr" in
       172.31.10.*|172.31.15.*|172.31.16.*|172.31.20.*|172.31.30.*)
         echo "$iface $addr"
-        tc -s qdisc show dev "$iface"
+        tc -s -d qdisc show dev "$iface"
         ;;
     esac
   done
@@ -265,6 +326,12 @@ case "$mode" in
     ;;
   ideal-all-poor)
     apply_profile_all "$poor_rate" "$poor_delay" "$poor_jitter" "$ideal_loss"
+    ;;
+  tcp-per-flow-qos)
+    apply_tcp_per_flow_qos "172.31.20" "$tcp_per_flow_qos_rate"
+    ;;
+  tcp-shared-bottleneck)
+    apply_tcp_shared_bottleneck "172.31.20" "$tcp_shared_bottleneck_rate"
     ;;
   matrix-b*)
     bits="${mode#matrix-}"
@@ -329,7 +396,7 @@ case "$mode" in
     show_profile
     ;;
   *)
-    echo "usage: $0 [apply|apply-lowlat|apply-balanced|apply-mildloss|apply-fat|apply-poor|ideal-lowlat|ideal-balanced|ideal-mildloss|ideal-fat|ideal-poor|ideal-all-lowlat|ideal-all-balanced|ideal-all-fat|ideal-all-poor|unconstrained|unconstrained-all|matrix-b000..matrix-b111|blackhole-fat|blackhole-lowlat|blackhole-balanced|blackhole-poor|spike-fat|spike-lowlat|spike-balanced|spike-poor|clear|show]" >&2
+    echo "usage: $0 [apply|apply-lowlat|apply-balanced|apply-mildloss|apply-fat|apply-poor|ideal-lowlat|ideal-balanced|ideal-mildloss|ideal-fat|ideal-poor|ideal-all-lowlat|ideal-all-balanced|ideal-all-fat|ideal-all-poor|tcp-per-flow-qos|tcp-shared-bottleneck|unconstrained|unconstrained-all|matrix-b000..matrix-b111|blackhole-fat|blackhole-lowlat|blackhole-balanced|blackhole-poor|spike-fat|spike-lowlat|spike-balanced|spike-poor|clear|show]" >&2
     exit 2
     ;;
 esac

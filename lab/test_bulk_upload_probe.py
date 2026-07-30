@@ -309,6 +309,81 @@ class BulkUploadProbeTests(unittest.TestCase):
         self.assertEqual(result["upload_probe_errors"], [])
         self.assertTrue(result["upload_ack_accounting_valid"])
 
+    def test_synchronized_start_anchors_load_after_every_stream_connects(self):
+        args = probe_args(
+            SimpleNamespace(server_address=("127.0.0.1", 9)),
+            parallel_uploads=2,
+        )
+        args.load_duration = 0.03
+        args.synchronized_start = True
+        connected = 0
+        next_connection = 0
+        connected_lock = threading.Lock()
+        early_payload = []
+
+        class ColdStartSocket:
+            def __init__(self):
+                self.sent = 0
+                self.response = bytearray()
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, _exc_type, _exc, _traceback):
+                return False
+
+            def setblocking(self, blocking):
+                if blocking:
+                    raise AssertionError("cold-start socket must stay nonblocking")
+
+            def send(self, data):
+                if self.sent:
+                    raise OSError("scripted load complete")
+                with connected_lock:
+                    early_payload.append(connected < 2)
+                self.sent = len(data)
+                return self.sent
+
+            def shutdown(self, how):
+                if how != socket.SHUT_WR:
+                    raise AssertionError(f"unexpected shutdown direction: {how}")
+                self.response.extend(
+                    f"ACK {self.sent}\nOK {self.sent}\n".encode("ascii")
+                )
+
+            def recv(self, size):
+                chunk = bytes(self.response[:size])
+                del self.response[:size]
+                return chunk
+
+        def connect(_args, _deadline):
+            nonlocal connected, next_connection
+            with connected_lock:
+                connection_index = next_connection
+                next_connection += 1
+            if connection_index == 1:
+                time.sleep(0.08)
+            with connected_lock:
+                connected += 1
+            return ColdStartSocket()
+
+        def select_ready(readers, writers, _errors, _timeout):
+            readable = [sock for sock in readers if sock.response]
+            return readable, list(writers), []
+
+        with (
+            mock.patch("bulk_upload_probe.connect_target", side_effect=connect),
+            mock.patch("bulk_upload_probe.select.select", side_effect=select_ready),
+        ):
+            result = interval_upload(args)
+
+        self.assertEqual(result["status"], "ok")
+        self.assertTrue(result["synchronized_start"])
+        self.assertTrue(result["synchronized_start_completed"])
+        self.assertEqual(result["measurement_anchor"], "post-connect-barrier")
+        self.assertGreater(result["measurement_start_delay_s"], args.load_duration)
+        self.assertEqual(early_payload, [False, False])
+
     def test_slow_socks_handshake_uses_load_deadline(self):
         with slow_socks_server() as server:
             host, port = server.server_address

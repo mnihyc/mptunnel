@@ -49,11 +49,55 @@ def read_exact(sock, size):
     return b"".join(chunks)
 
 
-def write_started_file(path):
+def write_started_file(path, timestamp=None):
     if not path:
         return
+    if timestamp is None:
+        timestamp = time.time()
     with open(path, "w", encoding="utf-8") as handle:
-        handle.write(f"{time.time():.9f}\n")
+        handle.write(f"{timestamp:.9f}\n")
+
+
+class SynchronizedStartAnchor:
+    """Releases a worker cohort and establishes its shared load-time origin."""
+
+    def __init__(self, parties, started_file=None):
+        self.monotonic = None
+        self.wall_time = None
+        self.started_file = started_file
+        self.released = threading.Event()
+        self.barrier = threading.Barrier(parties, action=self._release)
+
+    def _release(self):
+        self.monotonic = time.monotonic()
+        self.wall_time = time.time()
+        write_started_file(self.started_file, self.wall_time)
+        self.released.set()
+
+    def wait(self, deadline):
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            self.abort()
+            raise TimeoutError(
+                "download setup deadline expired before synchronized start"
+            )
+        try:
+            self.barrier.wait(timeout=remaining)
+        except threading.BrokenBarrierError as exc:
+            raise RuntimeError("download synchronized-start barrier broke") from exc
+        if self.monotonic is None:
+            raise RuntimeError("download synchronized-start anchor is missing")
+        return self.monotonic
+
+    def abort(self):
+        try:
+            self.barrier.abort()
+        except threading.BrokenBarrierError:
+            pass
+
+    @property
+    def completed(self):
+        return self.released.is_set()
 
 
 def read_failover_marker_elapsed(path, started):
@@ -183,10 +227,29 @@ def record_interval_chunk(started, state, lock, size):
         state["interval_bytes"][interval] = state["interval_bytes"].get(interval, 0) + size
 
 
-def download_one_request(args, started, deadline, state, lock):
+def download_one_request(
+    args,
+    started,
+    deadline,
+    state,
+    lock,
+    start_anchor=None,
+    setup_deadline=None,
+):
     sock, target_host, target_port = connect_http(args)
-    sock.settimeout(min(args.timeout, 1.0))
+    measurement_started = started
+    measurement_deadline = deadline
     with sock:
+        if start_anchor is not None:
+            if setup_deadline is None:
+                raise RuntimeError(
+                    "synchronized download start requires a setup deadline"
+                )
+            measurement_started = start_anchor.wait(setup_deadline)
+            measurement_deadline = measurement_started + max(
+                0.0, deadline - started
+            )
+        sock.settimeout(min(args.timeout, 1.0))
         request = (
             f"GET {args.path} HTTP/1.1\r\n"
             f"Host: {target_host}:{target_port}\r\n"
@@ -196,7 +259,7 @@ def download_one_request(args, started, deadline, state, lock):
         sock.sendall(request)
         buffer = b""
         while b"\r\n\r\n" not in buffer:
-            if time.monotonic() >= deadline:
+            if time.monotonic() >= measurement_deadline:
                 return False, None, "deadline"
             try:
                 chunk = sock.recv(args.chunk_bytes)
@@ -211,9 +274,9 @@ def download_one_request(args, started, deadline, state, lock):
         bytes_read = 0
         if body:
             bytes_read += len(body)
-            record_interval_chunk(started, state, lock, len(body))
+            record_interval_chunk(measurement_started, state, lock, len(body))
         while content_length is None or bytes_read < content_length:
-            if time.monotonic() >= deadline:
+            if time.monotonic() >= measurement_deadline:
                 return False, status, "deadline"
             try:
                 chunk = sock.recv(args.chunk_bytes)
@@ -222,7 +285,7 @@ def download_one_request(args, started, deadline, state, lock):
             if not chunk:
                 break
             bytes_read += len(chunk)
-            record_interval_chunk(started, state, lock, len(chunk))
+            record_interval_chunk(measurement_started, state, lock, len(chunk))
     complete = content_length is None or bytes_read == content_length
     return complete, status, "complete" if complete else "eof"
 
@@ -234,6 +297,8 @@ def run_download_worker(
     state,
     lock,
     download_request=download_one_request,
+    start_anchor=None,
+    setup_deadline=None,
 ):
     """Run one fixed request or replenish requests for a duration cohort."""
     fixed = args.request_lifecycle == "fixed"
@@ -241,10 +306,27 @@ def run_download_worker(
         with lock:
             state["request_attempts_started"] += 1
         try:
-            complete, status, termination = download_request(
-                args, started, deadline, state, lock
-            )
-            ended_before_deadline = time.monotonic() < deadline
+            if start_anchor is None:
+                complete, status, termination = download_request(
+                    args, started, deadline, state, lock
+                )
+                effective_deadline = deadline
+            else:
+                complete, status, termination = download_request(
+                    args,
+                    started,
+                    deadline,
+                    state,
+                    lock,
+                    start_anchor=start_anchor,
+                    setup_deadline=setup_deadline,
+                )
+                effective_deadline = (
+                    start_anchor.monotonic + max(0.0, deadline - started)
+                    if start_anchor.monotonic is not None
+                    else deadline
+                )
+            ended_before_deadline = time.monotonic() < effective_deadline
             with lock:
                 state["requests"] += 1
                 if complete:
@@ -256,6 +338,8 @@ def run_download_worker(
                 if fixed and termination != "deadline" and ended_before_deadline:
                     state["early_terminations"] += 1
         except Exception:
+            if start_anchor is not None and not start_anchor.completed:
+                start_anchor.abort()
             with lock:
                 state["requests"] += 1
                 state["failures"] += 1
@@ -269,9 +353,19 @@ def run_download_worker(
 
 def interval_download(args):
     started = time.monotonic()
-    write_started_file(args.started_file)
     load_duration = args.load_duration if args.load_duration > 0 else args.timeout
-    deadline = started + min(load_duration, args.timeout)
+    measurement_duration = min(load_duration, args.timeout)
+    deadline = started + measurement_duration
+    worker_count = max(1, args.parallel_downloads)
+    synchronized_start = bool(getattr(args, "synchronized_start", False))
+    start_anchor = (
+        SynchronizedStartAnchor(worker_count, args.started_file)
+        if synchronized_start and worker_count > 1
+        else None
+    )
+    if start_anchor is None:
+        write_started_file(args.started_file)
+    setup_deadline = started + args.timeout
     state = {
         "bytes": 0,
         "first_body_at": None,
@@ -300,23 +394,40 @@ def interval_download(args):
         )
         marker_thread.start()
 
-    worker_count = max(1, args.parallel_downloads)
     threads = [
         threading.Thread(
             target=run_download_worker,
             args=(args, started, deadline, state, lock),
+            kwargs={
+                "start_anchor": start_anchor,
+                "setup_deadline": setup_deadline,
+            },
             daemon=True,
         )
         for _ in range(worker_count)
     ]
     for thread in threads:
         thread.start()
+    join_deadline = (
+        setup_deadline + measurement_duration + 2.0
+        if start_anchor is not None
+        else deadline + 2.0
+    )
     for thread in threads:
-        thread.join(timeout=max(0.1, deadline - time.monotonic() + 2.0))
+        thread.join(timeout=max(0.1, join_deadline - time.monotonic()))
+    if any(thread.is_alive() for thread in threads):
+        if start_anchor is not None:
+            start_anchor.abort()
+        raise RuntimeError("download worker remained alive after the operation deadline")
     if marker_thread is not None:
         marker_thread.join(timeout=0.1)
 
-    elapsed = time.monotonic() - started
+    measurement_started = (
+        start_anchor.monotonic
+        if start_anchor is not None and start_anchor.monotonic is not None
+        else started
+    )
+    elapsed = time.monotonic() - measurement_started
     with lock:
         bytes_read = state["bytes"]
         failover_after_s = state["failover_after_s"]
@@ -361,6 +472,18 @@ def interval_download(args):
         "failover_after_s": round(failover_after_s, 6),
         "failover_trigger_source": failover_trigger_source,
     }
+    if synchronized_start:
+        result.update(
+            {
+                "synchronized_start": True,
+                "synchronized_start_completed": start_anchor is None
+                or start_anchor.completed,
+                "measurement_anchor": "post-connect-barrier"
+                if start_anchor is not None
+                else "probe-start",
+                "measurement_start_delay_s": round(measurement_started - started, 6),
+            }
+        )
     result.update(interval_metric_fields(state["interval_bytes"], args.interval_seconds))
     return result
 
@@ -377,6 +500,11 @@ def main():
     parser.add_argument("--chunk-bytes", type=int, default=64 * 1024)
     parser.add_argument("--load-duration", type=float, default=30.0)
     parser.add_argument("--parallel-downloads", type=int, default=1)
+    parser.add_argument(
+        "--synchronized-start",
+        action="store_true",
+        help="connect every worker before anchoring and starting the shared load window",
+    )
     parser.add_argument(
         "--request-lifecycle",
         choices=("duration", "fixed"),

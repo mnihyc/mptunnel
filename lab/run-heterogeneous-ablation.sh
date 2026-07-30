@@ -56,6 +56,14 @@ small_object_kib="${MPTUNNEL_LAB_SMALL_OBJECT_KIB:-32}"
 load_duration_seconds="${MPTUNNEL_LAB_LOAD_DURATION_SECONDS:-30}"
 upload_drain_timeout_seconds="${MPTUNNEL_LAB_UPLOAD_DRAIN_TIMEOUT_SECONDS:-1}"
 bulk_connections="${MPTUNNEL_LAB_BULK_CONNECTIONS:-2}"
+tcp_carrier_qos_cohort="${MPTUNNEL_LAB_TCP_CARRIER_QOS_COHORT:-0}"
+tcp_carrier_qos_duration_seconds=30
+tcp_carrier_qos_workers=3
+tcp_carrier_qos_probe_timeout_seconds=60
+tcp_carrier_qos_object_mib=4096
+tcp_carrier_qos_http_path="/tcp-carrier-qos.bin"
+tcp_per_flow_qos_rate="${MPTUNNEL_LAB_TCP_PER_FLOW_QOS_RATE:-500mbit}"
+tcp_shared_bottleneck_rate="${MPTUNNEL_LAB_TCP_SHARED_BOTTLENECK_RATE:-200mbit}"
 proxy_port="${PROXY_PORT:-1080}"
 baseline_proxy_port="${BASELINE_PROXY_PORT:-1090}"
 server_port="${SERVER_PORT:-7443}"
@@ -365,6 +373,8 @@ exec_netem() {
     -e MPTUNNEL_LAB_FAT_DELAY="${MPTUNNEL_LAB_FAT_DELAY:-180ms}" \
     -e MPTUNNEL_LAB_FAT_JITTER="${MPTUNNEL_LAB_FAT_JITTER:-20ms}" \
     -e MPTUNNEL_LAB_FAT_LOSS="${MPTUNNEL_LAB_FAT_LOSS:-1.00%}" \
+    -e MPTUNNEL_LAB_TCP_PER_FLOW_QOS_RATE="$tcp_per_flow_qos_rate" \
+    -e MPTUNNEL_LAB_TCP_SHARED_BOTTLENECK_RATE="$tcp_shared_bottleneck_rate" \
     -e MPTUNNEL_LAB_POOR_RATE="${MPTUNNEL_LAB_POOR_RATE:-50mbit}" \
     -e MPTUNNEL_LAB_POOR_DELAY="${MPTUNNEL_LAB_POOR_DELAY:-420ms}" \
     -e MPTUNNEL_LAB_POOR_JITTER="${MPTUNNEL_LAB_POOR_JITTER:-120ms}" \
@@ -1484,14 +1494,34 @@ run_unproxied_download_probe_case() {
 
 run_tcp_download_probe_case() {
   local case_name="$1"
+  local probe_load_duration="${2:-$load_duration_seconds}"
+  local probe_workers="${3:-$bulk_connections}"
+  local request_lifecycle="${4:-duration}"
+  local synchronized_start="${5:-0}"
+  local probe_path="${6:-$large_http_path}"
+  local probe_timeout="${7:-$curl_timeout}"
   local out_file="/tmp/mptunnel-probe-${case_name}.out"
   local err_file="/tmp/mptunnel-probe-${case_name}.err"
-  local telemetry_pid
+  local telemetry_pid synchronized_start_arg="" probe_process_timeout
+  if flag_enabled "$synchronized_start"; then
+    synchronized_start_arg=" --synchronized-start"
+  fi
+  probe_process_timeout="$(
+    python3 - "$probe_timeout" "$probe_load_duration" "$synchronized_start" <<'PY'
+import math
+import sys
+
+setup_timeout = float(sys.argv[1])
+load_duration = float(sys.argv[2])
+synchronized = sys.argv[3].lower() in {"1", "true", "yes"}
+print(math.ceil(setup_timeout + (load_duration if synchronized else 0.0) + 10.0))
+PY
+  )"
   start_case_telemetry "$case_name"
   telemetry_pid="$case_telemetry_pid"
   set +e
   local output probe_stderr
-  exec_in client "rm -f '${out_file}' '${err_file}'; timeout $((curl_timeout + 10))s python3 /workspace/lab/failover_download_probe.py --label '${case_name}' --proxy 127.0.0.1:${proxy_port} --target 172.31.40.30:8080 --path '${large_http_path}' --failover-after -1 --timeout '${curl_timeout}' --load-duration '${load_duration_seconds}' --parallel-downloads '${bulk_connections}' >'${out_file}' 2>'${err_file}'"
+  exec_in client "rm -f '${out_file}' '${err_file}'; timeout ${probe_process_timeout}s python3 /workspace/lab/failover_download_probe.py --label '${case_name}' --proxy 127.0.0.1:${proxy_port} --target 172.31.40.30:8080 --path '${probe_path}' --failover-after -1 --timeout '${probe_timeout}' --load-duration '${probe_load_duration}' --parallel-downloads '${probe_workers}' --request-lifecycle '${request_lifecycle}'${synchronized_start_arg} >'${out_file}' 2>'${err_file}'"
   local exit_code="$?"
   stop_case_telemetry "$case_name" "$telemetry_pid"
   output="$(exec_in client "cat '${out_file}' 2>/dev/null || true")"
@@ -1672,17 +1702,43 @@ run_unproxied_upload_probe_case() {
 
 run_tcp_upload_probe_case() {
   local case_name="$1"
+  local probe_load_duration="${2:-$load_duration_seconds}"
+  local probe_workers="${3:-$bulk_connections}"
+  local synchronized_start="${4:-0}"
+  local probe_timeout="${5:-$curl_timeout}"
   local out_file="/tmp/mptunnel-upload-${case_name}.out"
   local err_file="/tmp/mptunnel-upload-${case_name}.err"
   local telemetry_pid observer_started_ns observer_stopped_ns
   local observer_elapsed_seconds observer_freeze_exit_code
+  local synchronized_start_arg="" probe_process_timeout
+  if flag_enabled "$synchronized_start"; then
+    synchronized_start_arg=" --synchronized-start"
+  fi
+  probe_process_timeout="$(
+    python3 - \
+      "$probe_timeout" \
+      "$probe_load_duration" \
+      "$upload_drain_timeout_seconds" \
+      "$synchronized_start" <<'PY'
+import math
+import sys
+
+setup_timeout = float(sys.argv[1])
+load_duration = float(sys.argv[2])
+drain_timeout = max(0.0, float(sys.argv[3]))
+synchronized = sys.argv[4].lower() in {"1", "true", "yes"}
+active = setup_timeout if load_duration <= 0 else min(load_duration, setup_timeout)
+setup = setup_timeout if synchronized else 0.0
+print(max(1, math.ceil(setup + active + drain_timeout + 10.0)))
+PY
+  )"
   restart_target_tcp_sink
   start_case_telemetry "$case_name"
   telemetry_pid="$case_telemetry_pid"
   set +e
   local output probe_stderr
   observer_started_ns="$(monotonic_time_ns)"
-  exec_in client "rm -f '${out_file}' '${err_file}'; timeout ${upload_process_timeout_seconds}s python3 /workspace/lab/bulk_upload_probe.py --label '${case_name}' --proxy 127.0.0.1:${proxy_port} --target 172.31.40.30:${tcp_upload_target_port} --failover-after -1 --timeout '${curl_timeout}' --load-duration '${load_duration_seconds}' --drain-timeout '${upload_drain_timeout_seconds}' --parallel-uploads '${bulk_connections}' >'${out_file}' 2>'${err_file}'"
+  exec_in client "rm -f '${out_file}' '${err_file}'; timeout ${probe_process_timeout}s python3 /workspace/lab/bulk_upload_probe.py --label '${case_name}' --proxy 127.0.0.1:${proxy_port} --target 172.31.40.30:${tcp_upload_target_port} --failover-after -1 --timeout '${probe_timeout}' --load-duration '${probe_load_duration}' --drain-timeout '${upload_drain_timeout_seconds}' --parallel-uploads '${probe_workers}'${synchronized_start_arg} >'${out_file}' 2>'${err_file}'"
   local exit_code="$?"
   freeze_target_tcp_sink
   observer_freeze_exit_code="$?"
@@ -2169,6 +2225,9 @@ PY"
 
 start_target_services() {
   exec_in target "mkdir -p /tmp/mptunnel-lab && truncate -s '${object_mib}M' /tmp/mptunnel-lab/large.bin"
+  if flag_enabled "$tcp_carrier_qos_cohort"; then
+    exec_in target "truncate -s '${tcp_carrier_qos_object_mib}M' '/tmp/mptunnel-lab${tcp_carrier_qos_http_path}'"
+  fi
   exec_in target "dd if=/dev/zero of=/tmp/mptunnel-lab/small.bin bs=1K count='${small_object_kib}' status=none && printf 'mptunnel lab target\\n' >/tmp/mptunnel-lab/index.html"
   exec_in target "if [ -f /tmp/mptunnel-http.pid ]; then kill \$(cat /tmp/mptunnel-http.pid) >/dev/null 2>&1 || true; rm -f /tmp/mptunnel-http.pid; fi"
   exec_in target "if [ -f /tmp/mptunnel-udp-echo.pid ]; then kill \$(cat /tmp/mptunnel-udp-echo.pid) >/dev/null 2>&1 || true; rm -f /tmp/mptunnel-udp-echo.pid; fi"
@@ -2979,6 +3038,43 @@ run_reliable_ideal_upload_case() {
   apply_netem apply
 }
 
+run_tcp_carrier_qos_case() {
+  local regime="$1"
+  local netem_mode="$2"
+  local carrier_range="$3"
+  local direction="$4"
+  local range_label="${carrier_range//-/_}"
+  local case_name="mptunnel_tcp_carrier_qos_${regime}_range_${range_label}_${direction}"
+  local endpoint="--path 'tcp://172.31.20.20:${server_port}?tcp-carriers=${carrier_range}'"
+
+  start_client_with_netem "$case_name" "$netem_mode" "$endpoint"
+  case "$direction" in
+    download)
+      run_tcp_download_probe_case \
+        "$case_name" \
+        "$tcp_carrier_qos_duration_seconds" \
+        "$tcp_carrier_qos_workers" \
+        fixed \
+        1 \
+        "$tcp_carrier_qos_http_path" \
+        "$tcp_carrier_qos_probe_timeout_seconds"
+      ;;
+    upload)
+      run_tcp_upload_probe_case \
+        "$case_name" \
+        "$tcp_carrier_qos_duration_seconds" \
+        "$tcp_carrier_qos_workers" \
+        1 \
+        "$tcp_carrier_qos_probe_timeout_seconds"
+      ;;
+    *)
+      echo "unknown TCP carrier QoS direction: $direction" >&2
+      return 2
+      ;;
+  esac
+  apply_netem apply
+}
+
 start_quic_port_hop_client() {
   local case_name="$1"
   shift
@@ -3763,6 +3859,27 @@ for matrix_bits in 000 001 010 011 100 101 110 111; do
     run_matrix_upload_case "$matrix_bits"
   fi
 done
+
+if flag_enabled "$tcp_carrier_qos_cohort"; then
+  for qos_profile in \
+    "per_flow_qos:tcp-per-flow-qos" \
+    "shared_bottleneck:tcp-shared-bottleneck"; do
+    IFS=':' read -r qos_regime qos_netem_mode <<< "$qos_profile"
+    for qos_direction in download upload; do
+      for qos_carrier_range in 1-1 1-3; do
+        qos_range_label="${qos_carrier_range//-/_}"
+        qos_case_name="mptunnel_tcp_carrier_qos_${qos_regime}_range_${qos_range_label}_${qos_direction}"
+        if should_run_case "$qos_case_name"; then
+          run_tcp_carrier_qos_case \
+            "$qos_regime" \
+            "$qos_netem_mode" \
+            "$qos_carrier_range" \
+            "$qos_direction"
+        fi
+      done
+    done
+  done
+fi
 
 if should_run_case "mptunnel_tcp_multipath_failover_blackhole_${failover_profile}"; then
   run_failover_case

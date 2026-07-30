@@ -17,6 +17,9 @@ BASELINE_TOOLS = (
 EXHAUSTIVE = (
     Path(__file__).resolve().parent / "run-exhaustive-experiments.sh"
 ).read_text(encoding="utf-8")
+NETEM = (Path(__file__).resolve().parent / "configure-netem.sh").read_text(
+    encoding="utf-8"
+)
 
 
 class RunnerContractTests(unittest.TestCase):
@@ -154,6 +157,56 @@ class RunnerContractTests(unittest.TestCase):
         self.assertIn("capture_qdisc_snapshot", telemetry)
         self.assertIn('normalize_lab_result_path "run-${timestamp}-$$"', SCRIPT)
         self.assertIn(': > "$result_dir/config-sha256.txt"', SCRIPT)
+
+    def test_tcp_carrier_qos_cohort_is_opt_in_paired_and_reproducible(self):
+        server_config = SCRIPT.split("server_config_toml() {", 1)[1].split(
+            "\n}", 1
+        )[0]
+        qos_case = SCRIPT.split("run_tcp_carrier_qos_case() {", 1)[1].split(
+            "\n}", 1
+        )[0]
+        qos_dispatch = SCRIPT.rsplit(
+            'if flag_enabled "$tcp_carrier_qos_cohort"; then', 1
+        )[1].split("\nfi", 1)[0]
+        per_flow_profile = NETEM.split("apply_tcp_per_flow_qos() {", 1)[1].split(
+            "\n}", 1
+        )[0]
+        shared_profile = NETEM.split(
+            "apply_tcp_shared_bottleneck() {", 1
+        )[1].split("\n}", 1)[0]
+
+        self.assertIn(
+            'tcp_carrier_qos_cohort="${MPTUNNEL_LAB_TCP_CARRIER_QOS_COHORT:-0}"',
+            SCRIPT,
+        )
+        self.assertIn("tcp_carrier_qos_duration_seconds=30", SCRIPT)
+        self.assertIn("tcp_carrier_qos_workers=3", SCRIPT)
+        self.assertIn("for qos_carrier_range in 1-1 1-3", qos_dispatch)
+        self.assertIn('"per_flow_qos:tcp-per-flow-qos"', qos_dispatch)
+        self.assertIn('"shared_bottleneck:tcp-shared-bottleneck"', qos_dispatch)
+        self.assertIn("?tcp-carriers=${carrier_range}", qos_case)
+        self.assertNotIn("tcp-carriers", server_config)
+        self.assertIn("fixed", qos_case)
+        self.assertIn("$tcp_carrier_qos_workers", qos_case)
+        self.assertIn("$tcp_carrier_qos_duration_seconds", qos_case)
+        self.assertIn("--synchronized-start", SCRIPT)
+
+        self.assertIn("root handle 1: netem", per_flow_profile)
+        self.assertIn("parent 1:1 handle 10: fq", per_flow_profile)
+        self.assertIn('maxrate "$maxrate"', per_flow_profile)
+        self.assertIn('tc qdisc del dev "$iface" root', per_flow_profile)
+        self.assertIn("root handle 1: netem", shared_profile)
+        self.assertIn('rate "$rate"', shared_profile)
+        self.assertIn('tc qdisc del dev "$iface" root', shared_profile)
+        self.assertIn(
+            'tcp_per_flow_qos_rate="${MPTUNNEL_LAB_TCP_PER_FLOW_QOS_RATE:-500mbit}"',
+            NETEM,
+        )
+        self.assertIn(
+            'tcp_shared_bottleneck_rate="${MPTUNNEL_LAB_TCP_SHARED_BOTTLENECK_RATE:-200mbit}"',
+            NETEM,
+        )
+        self.assertIn("tc -s -d qdisc show dev", NETEM)
 
     def test_versioned_host_snapshot_is_captured_before_result_identity(self):
         capture = SCRIPT.split("capture_host_snapshot() {", 1)[1].split(

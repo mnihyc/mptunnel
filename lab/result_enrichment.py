@@ -13,7 +13,7 @@ from typing import Any, Mapping
 
 RESULT_SCHEMA_VERSION = 1
 RUN_MANIFEST_SCHEMA_VERSION = 2
-MPTUNNEL_PROTOCOL_VERSION = 4
+MPTUNNEL_PROTOCOL_VERSION = 5
 MPTUNNEL_CARRIER_PRESENTATION = (
     "tcp-tls13-no-alpn+quic-h3-post-data-rfc9297"
 )
@@ -31,7 +31,9 @@ _SAFE_RUN_OVERRIDE = re.compile(
     r"MPTUNNEL_LAB_(?:(?:LOWLAT|BALANCED|MILDLOSS|FAT|POOR)_"
     r"(?:RATE|DELAY|JITTER|LOSS)|IDEAL_LOSS|NETEM_LIMIT_PACKETS|MATRIX_(?:GOOD|POOR)_"
     r"(?:RATE|DELAY|JITTER|LOSS)|BLACKHOLE_LOSS|SPIKE_"
-    r"(?:FAT|LOWLAT|BALANCED|POOR)_(?:RATE|DELAY|JITTER|LOSS)|USE_PATH_HINTS))"
+    r"(?:FAT|LOWLAT|BALANCED|POOR)_(?:RATE|DELAY|JITTER|LOSS)|"
+    r"TCP_CARRIER_QOS_COHORT|TCP_PER_FLOW_QOS_RATE|"
+    r"TCP_SHARED_BOTTLENECK_RATE|USE_PATH_HINTS))"
 )
 
 
@@ -249,7 +251,7 @@ def enrich_reproducibility(row: dict[str, Any], metadata_value: Any) -> None:
         )
     if carrier_presentation != MPTUNNEL_CARRIER_PRESENTATION:
         raise ValueError(
-            "mptunnel_carrier_presentation does not match the current v4 "
+            "mptunnel_carrier_presentation does not match the current v5 "
             "TCP/QUIC wire presentation"
         )
     if not isinstance(source_tree_dirty, bool):

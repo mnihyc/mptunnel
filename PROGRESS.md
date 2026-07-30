@@ -11,6 +11,52 @@ Historical entries below are retained as evidence of the decisions made at
 their recorded time. When a later entry changes an earlier decision, the later
 entry is authoritative.
 
+## 2026-07-30T10:37:10+08:00: bounded MPP v5 control contract
+
+- Name: implement the wire and authentication prerequisite without enabling
+  adaptive TCP behavior
+- Category: Core protocol, authentication separation, resource safety, and
+  implementation sequencing
+- State: committed and independently verified; TCP service controllers and
+  runtime dispatch remain intentionally absent
+- Source: clean Core commit `cc260a262947dbc45a288826aedcc46b303bb181`
+- Content:
+  - advanced the sole codec to MPP v5 and the MPP session and path-join
+    authentication contexts to v5, with no v4 decoder, compatibility mode, or
+    downgrade path;
+  - kept the separately versioned authenticated TCP prelude at version 1
+    because its wire transcript and security contract did not change;
+  - implemented frame kinds 38 through 40 exactly as specified by `./RFC.md`,
+    including the authenticated `(PathId, PATH_JOIN.nonce)` carrier-instance
+    record;
+  - required nonzero owner sequence IDs, canonical duplicate-free cohorts,
+    nonempty validation cohorts, and the explicit empty-demand withdrawal
+    encoding;
+  - applied configured path and stream limits before allocation on both encode
+    and decode, including the existing peer-status path vector; and
+  - added only mechanical frame classification and bounded diagnostics to
+    existing exhaustive consumers. TCP and QUIC actors still reject these
+    frames until their RFC owners are implemented.
+- Evidence:
+  - 47 all-feature protocol tests passed, including stable v5 byte layouts for
+    demand, validation, and result frames, v5 authentication vectors, v4
+    rejection, canonicality, identifier, enum, and pre-allocation limit
+    checks;
+  - all 4 focused carrier-neutral resource-policy tests passed;
+  - `cargo check --locked --all-targets --all-features` passed;
+  - `cargo fmt --all -- --check` and whitespace validation passed.
+- Performance boundary:
+  - no scheduler, sender, ACK, placement, recovery, congestion controller,
+    timing, carrier count, payload loop, or runtime dispatch behavior changed;
+  - the historical v4 performance authority remains unchanged and is not
+    relabeled as v5 evidence; and
+  - no adaptive TCP behavior may be enabled until the pure controller,
+    instance/demand fences, exact sender evidence, bounded work, and ordered
+    drain lifecycle are implemented and causally tested.
+- Next: implement the pure session/group/direction service controller from
+  RFC Sections 7.2 and 15.1, then connect exact runtime events without moving
+  authority into per-stream state.
+
 ## 2026-07-30T10:22:47+08:00: endpoint-scoped TCP service authority
 
 - Name: establish the clean breaking protocol model before adaptive TCP work

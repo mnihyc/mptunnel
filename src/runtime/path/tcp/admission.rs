@@ -6,7 +6,9 @@
 
 use crate::config::{ClientSecurityConfig, ServerSecurityConfig};
 use crate::protocol::auth::SessionAuthenticator;
-use crate::protocol::{AuthNonce, AuthTag, Frame, PathId, SessionId, UnderlayProtocol};
+use crate::protocol::{
+    AuthNonce, AuthTag, Frame, PathId, PathPurpose, SessionId, UnderlayProtocol,
+};
 use crate::runtime::error::RuntimeError;
 use crate::runtime::identity::{current_unix_secs, random_nonce, random_session_id};
 use crate::runtime::path::authentication::{
@@ -72,6 +74,7 @@ impl ClientTcpPathAuthentication {
             credential_id,
             path_id,
             UnderlayProtocol::Tcp,
+            PathPurpose::Ordinary,
             path_nonce,
             issued_at_unix_secs,
         );
@@ -88,6 +91,7 @@ impl ClientTcpPathAuthentication {
                 credential_id: credential_id.to_string(),
                 path_id,
                 underlay: UnderlayProtocol::Tcp,
+                purpose: PathPurpose::Ordinary,
                 nonce: path_nonce,
                 issued_at_unix_secs,
                 auth_tag: path_tag,

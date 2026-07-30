@@ -11,7 +11,7 @@ use super::io::{
 };
 use super::metrics::run_server_quic_path_metrics;
 use super::server_stream::{ServerUdpReliableStreamContext, handle_server_udp_reliable_stream};
-use crate::protocol::{Frame, PathId, SessionId, UnderlayProtocol};
+use crate::protocol::{Frame, PathId, PathPurpose, SessionId, UnderlayProtocol};
 use crate::runtime::error::RuntimeError;
 use crate::runtime::path::authentication::ServerPathAuthentication;
 use crate::runtime::path::server_context::{ServerLocalPath, ServerPathContext};
@@ -270,6 +270,12 @@ async fn admit_server_udp_path(
             udp_path_read_frame(recv, context.codec_limits).await?,
         )?
         .ok_or(RuntimeError::Protocol("invalid QUIC UDP path PATH_JOIN"))?;
+    match path_join.purpose {
+        PathPurpose::Ordinary => {}
+        PathPurpose::Validation => {
+            return Err(RuntimeError::Protocol("invalid QUIC UDP path PATH_JOIN"));
+        }
+    }
     if !context.accept_path_join_nonce(
         path_join.session_id,
         path_join.credential_id.clone(),

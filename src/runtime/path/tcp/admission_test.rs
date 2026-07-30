@@ -51,6 +51,7 @@ fn fixed_tcp_prelude_authenticates_session_and_then_distinct_path_join() {
         .expect("separately authenticated PATH_JOIN");
     assert_eq!(joined.session_id, session_id);
     assert_eq!(joined.path_id, path_id);
+    assert_eq!(joined.purpose, PathPurpose::Ordinary);
 }
 
 #[test]

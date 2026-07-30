@@ -74,7 +74,7 @@ fn session_auth_tag_verifies_and_detects_tampering() {
 }
 
 #[test]
-fn path_join_tag_covers_identity_underlay_nonce_and_freshness() {
+fn path_join_tag_covers_identity_underlay_purpose_nonce_and_freshness() {
     let auth = authenticator();
     let credential_id = "home-2026";
     let nonce = AuthNonce([3; 16]);
@@ -84,6 +84,7 @@ fn path_join_tag_covers_identity_underlay_nonce_and_freshness() {
         credential_id,
         PathId(2),
         UnderlayProtocol::Udp,
+        PathPurpose::Ordinary,
         nonce,
         issued_at,
     );
@@ -92,6 +93,7 @@ fn path_join_tag_covers_identity_underlay_nonce_and_freshness() {
         credential_id,
         path_id: PathId(2),
         underlay: UnderlayProtocol::Udp,
+        purpose: PathPurpose::Ordinary,
         nonce,
         issued_at_unix_secs: issued_at,
         tag,
@@ -110,6 +112,10 @@ fn path_join_tag_covers_identity_underlay_nonce_and_freshness() {
     }));
     assert!(!auth.verify_path_join(PathJoinAuthCheck {
         underlay: UnderlayProtocol::Tcp,
+        ..check
+    }));
+    assert!(!auth.verify_path_join(PathJoinAuthCheck {
+        purpose: PathPurpose::Validation,
         ..check
     }));
     assert!(!auth.verify_path_join(PathJoinAuthCheck {
@@ -147,13 +153,14 @@ fn v5_auth_contexts_and_v1_tcp_prelude_have_stable_tags() {
             "home-2026",
             PathId(2),
             UnderlayProtocol::Udp,
+            PathPurpose::Ordinary,
             AuthNonce([3; 16]),
             issued_at,
         ),
         AuthTag([
-            0xcb, 0xd9, 0xc9, 0x38, 0x51, 0x81, 0xf6, 0xd9, 0xbf, 0x88, 0xb9, 0x1e, 0xef, 0x0e,
-            0xd9, 0x8d, 0x16, 0xd5, 0x25, 0x9f, 0xfc, 0x2d, 0xd9, 0xe3, 0xce, 0x43, 0xec, 0x58,
-            0xdd, 0x91, 0x4f, 0x71,
+            0xaa, 0xdf, 0x16, 0xef, 0x20, 0xb3, 0xbe, 0xed, 0xf5, 0x23, 0x44, 0xb4, 0x14, 0x32,
+            0x5f, 0x56, 0x57, 0xc0, 0x79, 0x60, 0xb2, 0xfe, 0xae, 0xd2, 0x98, 0xb2, 0x28, 0xe5,
+            0x47, 0xa4, 0xe6, 0xcf,
         ])
     );
     assert_eq!(

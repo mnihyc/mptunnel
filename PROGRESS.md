@@ -11,6 +11,60 @@ Historical entries below are retained as evidence of the decisions made at
 their recorded time. When a later entry changes an earlier decision, the later
 entry is authoritative.
 
+## 2026-07-31T03:42:16+08:00: MPP v5 wire and authenticated path purpose aligned
+
+- Name: singular carrier-validation wire and fail-closed purpose boundary
+- Category: Product protocol, authentication, resource cleanup, and Core
+  change control
+- State: the RFC-facing wire/authentication boundary is complete; elastic TCP
+  establishment, measurement, settlement, authority, and retirement remain
+  disconnected, and TCP `VALIDATION` therefore remains fail-closed
+- Implemented:
+  - `PATH_JOIN` now carries canonical `ORDINARY = 1` or `VALIDATION = 2`
+    immediately after underlay, and the purpose is covered by the v5 HMAC
+    transcript and preserved by authenticated admission;
+  - existing TCP and QUIC clients emit `ORDINARY`; QUIC permanently rejects an
+    authenticated `VALIDATION` before replay admission, path registration,
+    peer-state publication, or readiness;
+  - `TCP_CARRIER_DEMAND` now names zero or one stream through its canonical
+    presence byte, and `TCP_CARRIER_VALIDATE` names exactly one stream;
+  - removed the plural-list codec, its list-order and allocation errors, and
+    codec-only `max_streams`; Product/Core `ResourceLimits.max_streams` remains
+    unchanged and continues to bound live streams and sessions; and
+  - replay identity deliberately remains purpose-independent: the HMAC covers
+    purpose while one path-join nonce remains one-use across both purposes.
+- Necessity and retained-patch reflection:
+  - the removed list states were introduced with the incomplete untagged v5
+    work but are impossible in the approved RFC model, so retaining their
+    helpers, bounds, and tests would preserve dead design rather than safety;
+  - this fixes a concrete RFC/code/security mismatch, not a predicted network
+    edge case or a performance-test workaround;
+  - MPP remains v5 because released v0.1.2 used v4 and the incomplete v5 work
+    has never been released; an artificial v6 cut would add no protection; and
+  - no scheduler, congestion, pacing, recovery, transport window, queue,
+    timing, carrier range, platform path, or steady payload operation changed.
+    Ordinary admission adds one purpose byte and one HMAC transcript byte only.
+- Persistent evidence:
+  - exact wire-vector tests pin path-purpose position, demand presence, singular
+    validation, enum values, and v5 frame kinds;
+  - authentication vectors and tamper tests prove purpose is signed;
+  - a real QUIC admission test sends an authenticated `VALIDATION`, observes no
+    readiness or registry state, then reuses the exact session, path, and nonce
+    with its valid `ORDINARY` tag and reaches readiness, proving rejection
+    precedes replay insertion and publication;
+  - independent wire, runtime, and minimality reviews returned `APPROVE`;
+  - `cargo test --all-targets --all-features --quiet` passes: 1,410 library
+    tests, two allocation tests, and four daily-use tests, with zero failures;
+  - `cargo clippy --all-targets --all-features -- -D warnings`, formatting, and
+    whitespace checks pass.
+- Release blocker: TCP may accept `VALIDATION` only when the complete
+  session-owned C2S controller can enforce candidate authority, exact target
+  binding, bounded Product evidence, immutable result settlement, and ordered
+  retirement as one vertical slice.
+- Next: implement that C2S vertical slice without changing ordinary carrier
+  scheduling or any Core performance formula, then prove gain/no-gain behavior
+  in the RFC labs before enabling expansion by default.
+
 ## 2026-07-31T03:19:27+08:00: elastic TCP RFC approved after retained-change audit
 
 - Name: destructive Core authority and post-baseline patch reflection

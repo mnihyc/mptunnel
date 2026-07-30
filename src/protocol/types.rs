@@ -33,6 +33,12 @@ pub enum UnderlayProtocol {
     Udp,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum PathPurpose {
+    Ordinary,
+    Validation,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PathMetricDirection {
     ClientToServer,
@@ -191,6 +197,7 @@ pub enum Frame {
         credential_id: String,
         path_id: PathId,
         underlay: UnderlayProtocol,
+        purpose: PathPurpose,
         nonce: AuthNonce,
         issued_at_unix_secs: u64,
         auth_tag: AuthTag,
@@ -296,13 +303,13 @@ pub enum Frame {
     },
     TcpCarrierDemand {
         request_id: u64,
-        stream_ids: Vec<StreamId>,
+        stream_id: Option<StreamId>,
     },
     TcpCarrierValidate {
         validation_id: u64,
         request_id: u64,
         direction: PathMetricDirection,
-        stream_ids: Vec<StreamId>,
+        stream_id: StreamId,
     },
     TcpCarrierResult {
         validation_id: u64,

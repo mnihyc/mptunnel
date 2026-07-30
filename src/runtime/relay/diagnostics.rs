@@ -12,9 +12,10 @@ fn frame_subject(frame: &Frame) -> String {
             session_id,
             path_id,
             underlay,
+            purpose,
             ..
         } => format!(
-            "session_id={} path_id={} underlay={underlay:?}",
+            "session_id={} path_id={} underlay={underlay:?} purpose={purpose:?}",
             session_id.0, path_id.0
         ),
         Frame::PathDrain { path_id }
@@ -119,16 +120,19 @@ fn frame_subject(frame: &Frame) -> String {
         ),
         Frame::TcpCarrierDemand {
             request_id,
-            stream_ids,
-        } => format!("request_id={request_id} stream_count={}", stream_ids.len()),
+            stream_id,
+        } => format!(
+            "request_id={request_id} stream_id={}",
+            stream_id.map_or_else(|| "none".to_string(), |stream_id| stream_id.0.to_string())
+        ),
         Frame::TcpCarrierValidate {
             validation_id,
             request_id,
             direction,
-            stream_ids,
+            stream_id,
         } => format!(
-            "validation_id={validation_id} request_id={request_id} direction={direction:?} stream_count={}",
-            stream_ids.len()
+            "validation_id={validation_id} request_id={request_id} direction={direction:?} stream_id={}",
+            stream_id.0
         ),
         Frame::TcpCarrierResult {
             validation_id,

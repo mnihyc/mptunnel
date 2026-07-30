@@ -195,7 +195,6 @@ impl From<ResourceLimits> for CodecLimits {
             max_ack_ranges: value.max_ack_ranges,
             max_host_bytes: 255,
             max_paths: value.max_paths,
-            max_streams: value.max_streams,
         }
     }
 }

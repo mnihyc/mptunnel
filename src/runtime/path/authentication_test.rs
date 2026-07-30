@@ -64,6 +64,14 @@ fn authenticated_session(
 }
 
 fn path_join_frame(security: &ClientSecurityConfig, issued_at_unix_secs: u64) -> Frame {
+    path_join_frame_with_purpose(security, issued_at_unix_secs, PathPurpose::Ordinary)
+}
+
+fn path_join_frame_with_purpose(
+    security: &ClientSecurityConfig,
+    issued_at_unix_secs: u64,
+    purpose: PathPurpose,
+) -> Frame {
     let nonce = AuthNonce([5; 16]);
     let credential_id = security.credential.id().as_str();
     let authenticator =
@@ -73,6 +81,7 @@ fn path_join_frame(security: &ClientSecurityConfig, issued_at_unix_secs: u64) ->
         credential_id: credential_id.to_string(),
         path_id: PATH_ID,
         underlay: UnderlayProtocol::Tcp,
+        purpose,
         nonce,
         issued_at_unix_secs,
         auth_tag: authenticator.path_join_tag(
@@ -80,6 +89,7 @@ fn path_join_frame(security: &ClientSecurityConfig, issued_at_unix_secs: u64) ->
             credential_id,
             PATH_ID,
             UnderlayProtocol::Tcp,
+            purpose,
             nonce,
             issued_at_unix_secs,
         ),
@@ -340,17 +350,40 @@ fn session_auth_rejects_stale_and_too_far_future_timestamps() {
 }
 
 #[test]
-fn authenticated_path_join_preserves_its_signed_issue_time() {
+fn authenticated_path_join_preserves_its_signed_issue_time_and_purpose() {
     let (client, server) = security(10);
     let authenticated =
         authenticated_session(&client, &server, 100, 105).expect("fresh SESSION_AUTH");
 
     let joined = authenticated
-        .authenticate_path_join_at(UnderlayProtocol::Tcp, path_join_frame(&client, 104), 106)
+        .authenticate_path_join_at(
+            UnderlayProtocol::Tcp,
+            path_join_frame_with_purpose(&client, 104, PathPurpose::Validation),
+            106,
+        )
         .expect("fresh PATH_JOIN");
 
     assert_eq!(joined.session_id, SESSION_ID);
     assert_eq!(joined.path_id, PATH_ID);
+    assert_eq!(joined.purpose, PathPurpose::Validation);
     assert_eq!(joined.issued_at_unix_secs, 104);
     assert_eq!(joined.verified_at_unix_secs, 106);
+}
+
+#[test]
+fn path_join_rejects_a_purpose_changed_after_authentication() {
+    let (client, server) = security(10);
+    let authenticated =
+        authenticated_session(&client, &server, 100, 100).expect("fresh SESSION_AUTH");
+    let mut path_join = path_join_frame(&client, 100);
+    let Frame::PathJoin { purpose, .. } = &mut path_join else {
+        unreachable!("helper returns PATH_JOIN");
+    };
+    *purpose = PathPurpose::Validation;
+
+    assert!(
+        authenticated
+            .authenticate_path_join_at(UnderlayProtocol::Tcp, path_join, 100)
+            .is_none()
+    );
 }

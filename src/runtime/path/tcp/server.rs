@@ -10,7 +10,7 @@ use super::metrics::TcpMetricPublisher;
 use super::server_evidence::ServerTcpEvidenceState;
 use super::server_session::{ServerTcpPathAdmission, ServerTcpPathSession};
 use super::server_writer::ServerTcpWriter;
-use crate::protocol::{Frame, UnderlayProtocol};
+use crate::protocol::{Frame, PathPurpose, UnderlayProtocol};
 use crate::runtime::error::RuntimeError;
 use crate::runtime::path::ServerLocalPathProperties;
 use crate::runtime::path::commands::{
@@ -66,6 +66,12 @@ pub(in crate::runtime) async fn handle_server_path_with_authentication_slot(
         let path_join = authenticated_session
             .authenticate_path_join(UnderlayProtocol::Tcp, framed.read_frame().await?)?
             .ok_or(RuntimeError::Protocol("invalid PATH_JOIN"))?;
+        match path_join.purpose {
+            PathPurpose::Ordinary => {}
+            PathPurpose::Validation => {
+                return Err(RuntimeError::Protocol("invalid PATH_JOIN"));
+            }
+        }
         if !context.accept_path_join_nonce(
             path_join.session_id,
             path_join.credential_id.clone(),

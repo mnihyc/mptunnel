@@ -1,8 +1,8 @@
-# MPTunnel Multipath Proxy Protocol (MPP) Version 4
+# MPTunnel Multipath Proxy Protocol (MPP) Version 5
 
 ## 1. Status and Conventions
 
-This document specifies MPP version 4: its wire format, carrier profiles,
+This document specifies MPP version 5: its wire format, carrier profiles,
 data-level semantics, and transport-neutral Core requirements.
 
 The key words **MUST**, **MUST NOT**, **REQUIRED**, **SHALL**, **SHALL NOT**,
@@ -21,7 +21,7 @@ it is a separate protocol:
 - MPP does not implement coupled congestion control above TCP and QUIC.
 - MPP's HTTP Datagram mapping is not CONNECT-UDP.
 
-Wire version 4 is identified by the frame header in Section 12. A peer MUST
+Wire version 5 is identified by the frame header in Section 12. A peer MUST
 reject every unsupported frame version. This version has no downgrade or
 compatibility mode.
 
@@ -80,6 +80,12 @@ third transport protocol.
 **Carrier instance**
 : One physical transport lifetime. A reconnect creates a new instance even
   when configuration and `PathId` are unchanged.
+
+**Carrier instance token**
+: The authenticated `PATH_JOIN.nonce` retained for one carrier lifetime. It
+  identifies that lifetime only together with its session, underlay, and
+  `PathId`, and is used when one encrypted carrier-control frame must refer to
+  another carrier instance.
 
 **MPP Path ID**
 : The opaque `PathId` wire label for a carrier. It is not an address,
@@ -143,6 +149,28 @@ third transport protocol.
 **Demand**
 : A mutable scheduling objective: latency, throughput, or realtime. Demand is
   not a permanent carrier or attachment role.
+
+**TCP carrier group**
+: The client-local set of independently authenticated TCP carrier slots
+  derived from one configured endpoint. Group identity and slot ordinals are
+  never sent and cannot be reconstructed from locators.
+
+**Accepted TCP carrier set**
+: The exact carrier instances in one TCP carrier group that have already
+  established directional aggregate service. This set is frozen while an
+  additional carrier is being validated.
+
+**Directional service validation**
+: A bounded comparison of unique MPP delivery by one exact accepted TCP
+  carrier set before and after one exact candidate carrier is admitted. The
+  two directions have independent demand, evidence, results, and ordinary-use
+  authority.
+
+**Directional retention lease**
+: The current sender's conclusion that one additional TCP carrier established
+  aggregate service for that sender direction. A lease is lifecycle authority,
+  not receive credit, delivery acknowledgment, carrier health, or a permanent
+  role.
 
 ## 4. Architecture and Authority
 
@@ -273,7 +301,7 @@ two frames before `PATH_JOIN`.
 The `SESSION_AUTH` transcript is:
 
 ```text
-"mptunnel session auth v4" ||
+"mptunnel session auth v5" ||
 session_id:u64 ||
 credential_id_length:u8 || credential_id:bytes ||
 nonce:16B ||
@@ -296,7 +324,7 @@ issued_at_unix_secs:u64
 The common `PATH_JOIN` transcript is:
 
 ```text
-"mptunnel path join v4" ||
+"mptunnel path join v5" ||
 session_id:u64 ||
 credential_id_length:u8 || credential_id:bytes ||
 path_id:u16 || underlay:u8 ||
@@ -341,6 +369,12 @@ initiator has received both.
 Within a session, the wire label is `(underlay, path_id)`. The initiator
 selects `path_id`; the receiver treats it as opaque. The same numeric
 `path_id` MAY label one TCP carrier and one QUIC carrier.
+
+The accepted `PATH_JOIN.nonce` is retained with that carrier as its instance
+token. A cross-carrier reference uses
+`(underlay, path_id, path_join_nonce)` and MUST match one current authenticated
+instance exactly. The token does not replace the carrying cryptographic
+connection, authorize a new carrier, or permit state transfer.
 
 Local listener policy MUST NOT index local configuration with a peer-supplied
 `PathId`. Local policy remains off wire except for the directional
@@ -393,8 +427,24 @@ datagram-flow attachments. `PING` and `PONG` may provide MPP-level heartbeat.
 `PATH_DRAIN` and `PATH_CLOSE` request graceful retirement and are valid only on
 TCP carriers. Their `path_id` MUST match the TCP carrier carrying the frame.
 After drain begins, both endpoints MUST make that carrier ineligible for new
-attachments and original placement. Existing work may finish, detach, or
-continue on another carrier before `PATH_CLOSE` completes retirement.
+attachments and original placement while retaining receive, Data ACK,
+recovery, and ordered-control processing.
+
+The drain responder sends `PATH_CLOSE` only after every earlier frame from the
+initiator has been applied and the exact carrier has no attachment, datagram
+binding, queued or retained frame, original or reinjected flight, pending Data
+ACK, path proof, capacity work, service validation, retention lease, or demand
+request. All responder frames that complete that work MUST precede
+`PATH_CLOSE` in the TCP byte stream. The initiator treats receipt of
+`PATH_CLOSE`, not its own write completion or local emptiness, as the aggregate
+retirement acknowledgment. It removes the carrier only after applying every
+preceding responder frame and reaching the same local zero-work condition.
+Native failure before that boundary uses ordinary retained-state recovery.
+
+`TCP_CARRIER_DEMAND`, `TCP_CARRIER_VALIDATE`, and `TCP_CARRIER_RESULT` are
+also valid only on ready TCP carriers. They coordinate the bounded
+directional service validation in Sections 7.2 and 15.1; they never grant
+stream credit or delivery.
 
 `PATH_CAPACITY_DATA`, `PATH_CAPACITY_FINISH`, and
 `PATH_CAPACITY_RECEIPT` are valid only on TCP carriers.
@@ -475,8 +525,8 @@ before buffering a declared record.
 QUIC native liveness and connection retirement remain transport-owned.
 `PING` and `PONG` on a QUIC request stream may prove MPP response-direction
 reachability, but they do not govern QUIC connection liveness or retirement.
-`PATH_DRAIN`, `PATH_CLOSE`, and all `PATH_CAPACITY_*` frames are invalid on a
-QUIC carrier.
+`PATH_DRAIN`, `PATH_CLOSE`, all `PATH_CAPACITY_*`, and all `TCP_CARRIER_*`
+frames are invalid on a QUIC carrier.
 
 ### 6.3 HTTP Datagrams
 
@@ -545,11 +595,11 @@ drain, replacement, or failure.
 
 ### 7.2 Bounded TCP carrier establishment
 
-An endpoint MAY maintain more than one TCP carrier to the same locally
-configured endpoint when throughput demand exceeds the service demonstrated by
-the existing carriers. This is local carrier-lifecycle policy. It introduces
-no new carrier family or wire field and MUST NOT merge independent TCP
-congestion-control or recovery state.
+A client MAY configure an inclusive minimum and maximum for one TCP carrier
+group. The minimum is durable ready capacity; capacity above it is elastic.
+Both bounds MUST be positive, the minimum MUST NOT exceed the maximum, and
+every ready, establishing, validating, and draining carrier MUST fit the
+endpoint and session resource envelopes.
 
 Every additional TCP connection:
 
@@ -562,24 +612,119 @@ Every additional TCP connection:
 - retains independent attachments, queues, flight, transport evidence, and
   failure scope even when its configured endpoint and locator set are shared.
 
-The number of ready, establishing, and draining TCP carriers MUST remain within
-local endpoint and session resource envelopes.
+Exact carrier failure permits immediate replacement up to the configured
+minimum without first proving aggregate benefit. It MUST NOT open every
+remaining elastic slot as one failure reaction. Non-failure expansion above
+the minimum requires the directional service validation in Section 15.1. At
+most one non-failure validation may be active in an MPP session at a time, and
+one candidate may validate at most one direction at a time. This serialization
+prevents one candidate or one demand cohort from contaminating another
+comparison.
 
-Exact carrier failure permits immediate replacement within the same resource
-envelopes without first proving marginal benefit. A ready lower bound MAY be
-retained for future demand. A carrier above that lower bound SHOULD be retired
-at exact quiescence: it has no live attachment, queued frame, retained flight,
-pending proof or capacity work, or pending demand.
+The client owns physical TCP establishment because only it knows the
+configured carrier group and its bounds. The sender owns demand and delivery
+evidence for its direction:
+
+- client-to-server validation is driven by the client's aggregate sender
+  state and exact request Data ACK release; and
+- server-to-client validation is driven by the server's aggregate sender
+  state and exact response Data ACK release.
+
+Per-stream state is input to those session-scoped directional controllers. One
+stream MUST NOT publish endpoint-wide ordinary-use authority by itself, but a
+single saturated stream MAY be the complete frozen demand cohort and can
+therefore establish aggregate service through the session controller.
+
+For server-to-client demand, the server sends
+`TCP_CARRIER_DEMAND(request_id, stream_ids)` on one accepted TCP carrier. The
+carrying carrier is the client-local group anchor; no locator or group ordinal
+is encoded. Request IDs are nonzero and strictly increase in one server-owned
+session sequence. A nonempty list creates the immutable response-demand
+snapshot for that ID and supersedes any older request. An empty list carrying
+the current ID on the same current anchor instance withdraws it. A request has
+one configured finite absolute deadline that progress cannot extend. Stale,
+duplicate, or expired requests have no authority.
+
+The client MAY ignore the advisory and MUST independently revalidate the
+anchor instance, configured range, resources, frozen accepted set, stream
+identities, deadline, and one-validation limit before establishing or reusing
+a candidate. A request grants no path, attachment, placement, or byte credit.
+Its bounded stream list identifies one frozen response-demand cohort so the
+client can attach only relevant existing streams; it is not a dynamic
+per-stream demand protocol.
+
+Before candidate Product data, the client sends
+`TCP_CARRIER_VALIDATE(trial_id, request_id, direction, accepted_paths,
+stream_ids)` on the candidate carrier. The candidate is identified by the
+carrying authenticated carrier. `trial_id` is nonzero and MUST NOT be reused
+within that candidate instance. `request_id` is zero for locally established
+client-to-server demand and otherwise MUST match a current nonzero
+`TCP_CARRIER_DEMAND`; for server-to-client validation, the stream list MUST
+exactly equal that request's frozen list. Each accepted-path record contains
+the `PathId` and `PATH_JOIN.nonce` of one exact current TCP carrier instance.
+The accepted records and stream list are nonempty, strictly increasing,
+duplicate-free, and bounded.
+
+Malformed, noncanonical, duplicate, candidate-containing, or unauthorized
+references are protocol violations on the candidate. A well-formed reference
+that became stale because a carrier, stream, attachment, demand request, or
+eligibility changed races harmlessly to `WITHDRAWN`; it is not a peer fault.
+Validation Product data additionally requires the candidate's peer usage to be
+`AVAILABLE` for that direction. `BACKUP` preference is never bypassed as a
+measurement exception.
+
+Every validation has one configured finite absolute deadline beginning no
+later than candidate registration. Progress, ACKs, phase changes, and demand
+updates MUST NOT extend it. The endpoint detecting changed demand, an invalid
+exact fence, or deadline expiry emits `WITHDRAWN`. The client lifecycle owner
+independently stops and drains a candidate whose local resource deadline
+expires. A timeout or invalidation cannot produce `NO_GAIN`.
+
+The sender concludes a validation with
+`TCP_CARRIER_RESULT(trial_id, candidate_path_id, direction, result)`.
+`RETAIN` creates a directional retention lease; `NO_GAIN` records a completed
+comparison that did not establish benefit; and `WITHDRAWN` records
+invalidation or ended demand without a capacity verdict. A result is accepted
+only when it is carried on that candidate and its `candidate_path_id` matches,
+and only for the exact current session, candidate instance, trial, and
+direction. It grants no delivery, flow-control, health, or scheduling
+evidence. The client retains an elastic carrier while at least one direction
+has a current lease. A direction without a lease keeps the carrier ineligible
+for ordinary placement in that direction until a later independent validation
+succeeds.
+
+Only the directional sender may emit `RETAIN` or `NO_GAIN`. Either endpoint
+may emit `WITHDRAWN` when its exact local fence or resource lifetime becomes
+invalid; withdrawal carries no verdict and therefore needs no reconstructed
+peer evidence.
+
+A client-to-server validation is started, advanced, concluded, and locally
+applied by the client sender; the server validates its registration and
+result but does not reconstruct the decision. A server-to-client validation is
+requested, advanced, and concluded by the server sender; the client opens and
+attaches the candidate, echoes the exact frozen request, and applies the
+server's result to physical lifecycle. In both cases the sender is the sole
+rate and verdict authority, while the client remains the sole TCP
+establishment and final resource authority.
+
+A candidate carries only its bounded validation work and control or feedback
+needed to complete existing MPP semantics. It MUST NOT accept unrelated
+attachments or ordinary placement before the relevant direction earns a
+lease. Invalidated, withdrawn, or no-gain validation stops new candidate work
+immediately. If no direction retains the carrier and the configured minimum
+does not require it, the client retires it through `PATH_DRAIN` and waits for
+the peer's ordered `PATH_CLOSE` boundary from Section 6.1.
 
 Changing the destination port of a TCP carrier creates a replacement carrier;
 it never migrates the existing TCP connection. Planned replacement MUST be
-make-before-break when the resource envelopes have spare capacity: authenticate
-and ready the replacement, admit streams that must continue through their normal
-attachment procedure, stop new attachments on the old carrier with
-`PATH_DRAIN`, and complete it with `PATH_CLOSE` after its attachments finish.
-When no spare capacity exists, replacement waits for capacity or exact
-quiescence rather than forcing an active carrier closed. No transport or MPP
-delivery evidence transfers to the replacement.
+make-before-break when the resource envelopes have spare capacity:
+authenticate and ready the replacement, admit streams that must continue
+through their normal attachment procedure, stop new attachments and original
+placement on the old carrier, send `PATH_DRAIN` after its preceding writer
+work, and wait for the peer's `PATH_CLOSE`. When no spare capacity exists,
+replacement waits for capacity or exact quiescence rather than forcing an
+active carrier closed. No transport, MPP delivery, validation, or retention
+evidence transfers to the replacement.
 
 ### 7.3 Directional usage
 
@@ -619,7 +764,14 @@ demand are independent facts.
 
 `OPEN_STREAM(stream_id, target, demand)` has no carrier role. The first
 accepted open creates the stream. A later open with the same `StreamId` adds an
-attachment only when the target exactly matches the original target.
+attachment only when the target and initial demand hint exactly match the
+original values.
+
+The wire demand value is an immutable admission hint. A sender's live
+throughput, latency, or realtime objective may change from local Product and
+queue state without a wire update. That sender-local state controls its
+direction only and cannot overwrite the peer's objective or the initial
+attachment-consistency value.
 
 One live carrier instance may have at most one live output attachment for a
 given stream. Replacing a closed output creates a new attachment incarnation.
@@ -700,7 +852,11 @@ final offset. Otherwise FIN remains pending until contiguous delivery reaches
 it. Matching duplicate FINs are idempotent.
 
 `STREAM_DETACH(stream_id)` removes only the attachment on the carrier carrying
-the frame. `STREAM_RESET(stream_id, reason)` terminates the MPP stream.
+the frame. It is not an acknowledgment of peer-side flight or carrier
+quiescence. During TCP carrier drain, an endpoint MUST retain the attachment
+state needed to receive preceding frames, publish or process Data ACK, and
+complete recovery until the ordered `PATH_CLOSE` boundary in Section 6.1.
+`STREAM_RESET(stream_id, reason)` terminates the MPP stream.
 
 Native TCP EOF ends the carrier and is not stream FIN or detach. Native QUIC
 stream FIN closes only that native byte-stream direction and MUST NOT be
@@ -826,9 +982,10 @@ pipeline. A completion-time estimate MUST NOT add them as independent
 outstanding byte counts. Common connection-wide backlog MUST NOT be charged
 once per candidate carrier.
 
-Per-flow evidence MUST NOT be treated as shared carrier capacity without
-sufficient carrier-level proof. A configured rate is a startup prior, not
-measurement.
+Per-flow evidence MUST NOT be treated as shared carrier capacity without a
+session-scoped controller that freezes the exact carrier and demand cohort.
+The controller consumes per-stream events but owns the aggregate conclusion.
+A configured rate is a startup prior, not measurement.
 
 A locator, interface, or route cannot establish carrier capacity, marginal
 benefit, or bottleneck identity.
@@ -837,6 +994,13 @@ Native ACK evidence MAY establish transport readiness within its carrier.
 Only unambiguous MPP Data ACK coverage establishes unique data-level delivery
 on an additional output. Data ACK coverage of duplicated bytes MUST NOT be
 attributed to either copy.
+
+Directional aggregate delivery is observed at the sender that owns original
+flight provenance. A receiver-side reordered delivery callback cannot
+reconstruct whether the sender classified a range as original or reinjected
+and MUST NOT substitute for that authority. One complete Data ACK transaction
+is one indivisible aggregate event; an implementation MUST NOT split or
+truncate it to manufacture a measurement boundary.
 
 ### 10.3 No second congestion controller
 
@@ -932,7 +1096,7 @@ Every MPP frame begins with:
 
 ```text
 0..4   magic          ASCII "MPTF"
-4      version        4
+4      version        5
 5      frame kind     u8
 6..10  payload length u32, network byte order
 ```
@@ -978,12 +1142,16 @@ frames.
 | 35 | `PATH_CAPACITY_RECEIPT` | `path_id:u16, measurement_id:u64, received_payload_bytes:u64` |
 | 36 | `PEER_STATUS_REQUEST` | `request_id:u64` |
 | 37 | `PEER_STATUS_RESPONSE` | `request_id:u64, code:u8, count:u16, paths[count]` |
+| 38 | `TCP_CARRIER_DEMAND` | `request_id:u64, stream_count:u16, stream_ids[stream_count]` |
+| 39 | `TCP_CARRIER_VALIDATE` | `trial_id:u64, request_id:u64, direction:u8, path_count:u16, accepted_paths[path_count], stream_count:u16, stream_ids[stream_count]` |
+| 40 | `TCP_CARRIER_RESULT` | `trial_id:u64, candidate_path_id:u16, direction:u8, result:u8` |
 
 Kinds 5, 6, 15, 19, 25, 26, 28, and 29 are reserved and MUST NOT be sent.
 
 `SESSION_HELLO` and `SESSION_AUTH` are QUIC carrier-admission frames; TCP uses
-the Section 6.1 prelude. `PATH_DRAIN`, `PATH_CLOSE`, and kinds 33 through 35
-are TCP-only. Receiving a carrier-incompatible frame is a protocol violation.
+the Section 6.1 prelude. `PATH_DRAIN`, `PATH_CLOSE`, kinds 33 through 35, and
+kinds 38 through 40 are TCP-only. Receiving a carrier-incompatible frame is a
+protocol violation.
 
 ### 12.3 Common field encodings
 
@@ -1004,6 +1172,16 @@ text.
 Demand values are latency `1`, throughput `2`, and realtime `3`. Underlay
 values are TCP `1` and UDP `2`. Metric directions are client-to-server `1` and
 server-to-client `2`. Boolean fields use `0` or `1`.
+
+TCP carrier result values are `RETAIN = 1`, `NO_GAIN = 2`, and
+`WITHDRAWN = 3`. Each `accepted_paths` record is
+`path_id:u16, path_join_nonce:16B` and the records are strictly increasing by
+that tuple. Every validation path or stream list is nonempty and
+duplicate-free. A demand stream list is strictly increasing and
+duplicate-free when nonempty; an empty list has only the withdrawal meaning
+defined in Section 7.2. `request_id` in `TCP_CARRIER_DEMAND` and `trial_id` in
+`TCP_CARRIER_VALIDATE` and `TCP_CARRIER_RESULT` MUST be nonzero. A zero
+validation `request_id` has the local-demand meaning defined in Section 7.2.
 
 Usage values are `AVAILABLE = 0` and `BACKUP = 1`.
 
@@ -1026,7 +1204,9 @@ Endpoints MUST enforce configured bounds for:
 - reorder bytes and intervals;
 - carrier queues and flight;
 - datagram attempts, TTL, caches, fragments, and reassemblies;
-- proof, capacity, metric, and peer-status work; and
+- proof, capacity, metric, and peer-status work;
+- TCP carrier demand requests, validations, path and stream cohorts, candidate
+  work, results, suppression state, leases, and drain work; and
 - all teardown and no-attachment retention.
 
 A protocol violation closes the smallest safe scope: product flow, stream,
@@ -1059,7 +1239,8 @@ grant policy or capacity.
 
 ### 14.2 Malicious evidence and resource exhaustion
 
-Peer metrics and usage are advisory authenticated input. They MUST NOT:
+Peer metrics, usage, TCP carrier demand, and TCP carrier results are
+authenticated input. They MUST NOT:
 
 - grant receive credit;
 - release retained data;
@@ -1067,6 +1248,13 @@ Peer metrics and usage are advisory authenticated input. They MUST NOT:
 - declare local health;
 - bypass queue or flight bounds; or
 - transfer state to another carrier instance.
+
+A peer can request or retain only capacity inside the client's configured TCP
+carrier range and the session resource envelope. The client MUST bound request
+frequency, outstanding identifiers, cohort members, validation work, and
+retained elastic carriers independently of peer input. A validation or result
+for a stale physical instance, trial, direction, accepted set, stream cohort,
+or demand generation has no authority.
 
 Datagram replay windows, response caches, pending native datagrams,
 reassemblies, and target forwarding are bounded. Reused IDs with conflicting
@@ -1090,7 +1278,7 @@ carrier presentation defeats a source-aware classifier. Fixed private
 cleartext protocol markers are avoided, but authenticated tunneling—not
 traffic impersonation—is the security objective.
 
-## 15. MPTunnel Core Profile 4
+## 15. MPTunnel Core Profile 5
 
 This section specifies the transport-neutral Core policy used with the wire
 semantics above. It defines Core conformance, not peer interoperability.
@@ -1115,22 +1303,120 @@ sample floor, the response scheduler may use its mature completion-time model.
 Duplicated bytes do not satisfy that floor for either copy.
 
 Non-failure TCP carrier expansion is permitted only for throughput demand with
-queued unique original data after existing eligible carriers are carrying
-original data and current evidence indicates that demand exceeds their
-demonstrated service. For one locally configured endpoint, expansion MUST
-establish at most one unproven additional carrier at a time. Native transport
-telemetry MAY strengthen that decision but MUST NOT be required for
-correctness.
+fresh queued unique original data after every carrier in the accepted set is
+already carrying original data and an original-placement attempt found that
+set unable to accept more. The blocked placement is a one-shot saturation
+event. Polling the same queue, retained flight, reinjection, native
+transport-buffer occupancy, or ACK silence MUST NOT create another event.
+Native transport telemetry MAY strengthen admission but MUST NOT be required.
 
-An additional TCP carrier remains subject to the same bounded startup flight.
-It may mature only after unambiguous MPP Data ACK coverage of its original
-transmissions and aggregate unique-delivery evidence demonstrates service
-beyond the previously mature carriers. An implementation MUST account for the
-observed measurement variation; an inconclusive difference is not evidence of
-marginal benefit. MPP defines no fixed percentage as a universal benefit
-threshold. A candidate that does not reach readiness is cancelled. A ready
-candidate whose benefit remains unproven, or whose demand disappears, is
-gracefully retired before another non-failure candidate is established.
+Each direction has one session-scoped service controller keyed by the exact
+TCP carrier group. The controller freezes:
+
+- the exact accepted carrier instances and their current directional
+  eligibility;
+- a bounded, nonempty set of throughput streams with fresh sender-side demand;
+- each stream's demand generation and attachment incarnation; and
+- one existing bounded Data ACK coverage horizon for each stream.
+
+The stream cohort generation changes only when its membership, demand class,
+open state, or attachment identity changes. Ordinary enqueue progress does not
+manufacture a new cohort. Each qualified window must satisfy every stream's
+frozen horizon; one busy stream cannot silently substitute for another. The
+checked sum is the directional stream horizon. The cohort cardinality and
+checked horizon MUST fit configured validation-specific stream and byte bounds
+that are no larger than the session stream and memory envelopes. A larger live
+workload is represented by a bounded qualifying subset; it is never scanned or
+serialized without limit.
+
+Only unambiguous original-data releases from one complete MPP Data ACK
+transaction enter a window. Releases of reinjection or bytes with ambiguous
+copy provenance do not. Each release retains its exact carrier instance and
+original writer-commit time. An ACK event is applied atomically and may carry a
+bounded overshoot beyond the horizon; it MUST NOT be split, truncated, or
+reassigned to make a boundary.
+
+A window begins at an ACK boundary and an independent writer boundary. It
+contains only original bytes committed after its writer boundary. It completes
+when a fresh saturation event exists, every stream horizon is covered, and the
+matched aggregate horizon defined below is covered. Let `B` be all qualified
+unique bytes, `A` the ACK-boundary span, and `W` the writer-boundary span. Its
+service rate is the exact rational value `B / max(A, W)`. Zero duration,
+missing provenance, or missing demand produces no window. Implementations
+compare rates by exact cross multiplication rather than a rounded
+floating-point percentage.
+
+Candidate work uses two existing configured bounds. The unproven-flight bound
+limits candidate-owned unique original bytes outstanding at one time. The
+validation horizon is the existing bulk scheduling horizon capped by the
+applicable path-flight, repair, reorder, and shared stream-credit resource
+ceilings; it is the exact cumulative candidate target in each validation
+phase. It is not a congestion window or rate target and adds no new tuning
+constant. No candidate phase is valid when either bound cannot cover the
+configured Data ACK sample floor. The matched aggregate horizon is the checked
+sum of the directional stream horizon and validation horizon. Every
+pre-reference, comparison, and post-reference window covers that same
+aggregate horizon.
+
+Validation proceeds in this fixed order:
+
+1. **Preparation and fence.** Authenticate, ready, and register the candidate
+   without Product attachment or Product data. After setup traffic completes,
+   freeze the exact accepted set, stream cohort, and generations. Preparation
+   failure or a stale fence withdraws the validation.
+2. **Pre-reference.** With the exact accepted set and the ready candidate
+   carrying no Product data, collect two consecutive complete aggregate
+   windows.
+3. **Readiness.** Attach the candidate only to the frozen cohort and admit at
+   most the validation horizon of candidate-owned original data. At every
+   instant, candidate-owned unacknowledged original data remains inside the
+   unproven-flight bound; released credit may admit another quantum only while
+   the cumulative phase horizon remains. Readiness requires unambiguous Data
+   ACK coverage of the complete validation horizon. The completing ACK
+   establishes fresh ACK and writer boundaries but is not aggregate-benefit
+   evidence.
+4. **Comparison.** Collect two consecutive complete aggregate windows using
+   the same accepted set plus the exact candidate. Each window requires
+   post-boundary original flight on both sets, exact candidate contribution,
+   at least the directional stream horizon from the accepted set, every frozen
+   per-stream horizon, and a fresh saturation event. Candidate original work
+   in each window must cover exactly one validation horizon and its outstanding
+   work remains inside the unproven-flight bound. The next comparison window
+   cannot begin until all candidate original bytes in the preceding window
+   have an unambiguous Data ACK.
+5. **Post-reference.** Stop candidate original placement, wait for zero
+   candidate-owned original flight, and collect two further complete windows
+   from the unchanged accepted set. These windows detect a service change that
+   merely coincided with candidate admission.
+6. **Result.** `RETAIN` is valid only when each comparison rate is strictly
+   greater than every pre- and post-reference rate. Any settled overlap,
+   equality, or decrease is `NO_GAIN`; MPP defines no universal percentage
+   margin. Demand ending before settlement, ambiguous candidate completion, or
+   invalidation is `WITHDRAWN` and has no capacity verdict.
+
+Candidate original work is therefore finite: one readiness phase and two
+comparison phases, at most three validation horizons in total, with
+outstanding work always inside the existing unproven-flight bound.
+Previously accepted carriers remain work-conserving under their ordinary
+credit, reorder, native enqueue, and scheduling rules. Candidate controls do
+not throttle them and do not create a second congestion controller.
+
+Any change to the exact accepted carrier instances or eligibility, candidate
+instance, configured range generation, frozen stream membership, demand
+generation, attachment incarnation, or direction invalidates all incomplete
+windows and stops new candidate work. Reaching the absolute validation
+deadline has the same effect. A lease in one direction does not admit ordinary
+placement in the other.
+
+After `NO_GAIN`, another validation for the same direction and carrier group
+is suppressed while the accepted-instance identity and stream-cohort identity
+remain unchanged and a fresh two-window reference range overlaps the rejected
+combined reference range. Validation becomes eligible again only when one of
+those exact identities changes or the new reference range is strictly
+disjoint.
+Thus changed live service can reopen validation without a locator signal,
+fixed delay, fixed percentage, periodic retry, or unlimited connection
+growth.
 
 ### 15.2 Reinjection budget and timing
 
@@ -1227,6 +1513,8 @@ A conforming implementation preserves all of the following:
 7. Regular carriers are considered before backup carriers.
 8. Usage, local health, authentication, and demand remain independent.
 9. A locator and numeric `PathId` never replace carrier-instance identity.
+   Cross-carrier instance references also match the authenticated
+   `PATH_JOIN.nonce`.
 10. A QUIC locator change does not create a new carrier when QUIC preserves
     the connection.
 11. Scheduling observes immutable state and revalidates before commit.
@@ -1240,10 +1528,15 @@ A conforming implementation preserves all of the following:
     once.
 18. Simultaneous TCP carriers within one MPP session always have distinct
     `PathId` values and distinct carrier instances.
-19. Non-failure TCP carrier expansion is bounded, serialized, and matured only
-    by unambiguous unique-delivery evidence.
-20. `PATH_DRAIN` and `PATH_CLOSE` retire one matching TCP carrier;
-    `SESSION_CLOSE` retires the complete `SessionId`.
+19. Non-failure TCP carrier expansion is bounded, serialized, and retained
+    only by sender-owned, session-scoped, directional aggregate evidence.
+20. A TCP candidate can own no more than its finite readiness and comparison
+    flights before a directional result.
+21. A retention lease in one direction grants no ordinary-use authority in
+    the other direction.
+22. `PATH_CLOSE` is the ordered aggregate acknowledgment of a matching
+    `PATH_DRAIN`; local emptiness or write completion cannot replace it.
+23. `SESSION_CLOSE` retires the complete `SessionId`; carrier drain does not.
 
 ## 17. Relationship to Existing Standards
 
@@ -1258,6 +1551,12 @@ per direction of each MPP stream rather than one connection-level DSN space
 per direction.
 `STREAM_ACK` uses range snapshots and positive partial ranges rather than a
 cumulative DSS Data ACK. MPP carriers are not MPTCP subflows.
+
+RFC 6356 documents why independently controlled subflows sharing a bottleneck
+can be less fair than one TCP flow. MPP cannot install coupled control above
+kernel TCP, so an elastic TCP carrier is retained only after the bounded
+aggregate validation in Section 15.1. That validation establishes observed
+MPP service; it does not claim coupled fairness or identify a bottleneck.
 
 ### 17.2 QUIC
 

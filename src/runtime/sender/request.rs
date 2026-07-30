@@ -693,42 +693,51 @@ impl RequestSenderService {
                 } else {
                     None
                 };
-            let commands = fixed_request_output_commands(&remotes.paths[position].stream.output)?;
-            match reserve_request_frame_with_mode(
-                &commands,
-                frame.clone(),
-                lane,
-                emit_mode,
-                cause.is_reinjection(),
-            ) {
-                Ok(command) => {
-                    if let Some(claim) = request_load_claim {
-                        // The exact path owns the lease after carrier enqueue;
-                        // path removal or relay cancellation releases it.
-                        remotes.commit_path_instance_load_claim(instance, claim);
-                        #[cfg(feature = "lab-diagnostics")]
-                        lab_diagnostic(
-                            "request_startup_selection",
-                            format_args!(
-                                "phase=claim_committed stream_id={} path_index={} instance_id={}",
-                                self.multipath.stream_id().0,
-                                instance.key.index,
-                                instance.attachment_id,
-                            ),
+            let path_count = remotes.paths.len();
+            let publish_result = {
+                let remote = &mut remotes.paths[position];
+                let commands = fixed_request_output_commands(&remote.stream.output)?;
+                match reserve_request_frame_with_mode(
+                    commands,
+                    frame.clone(),
+                    lane,
+                    emit_mode,
+                    cause.is_reinjection(),
+                ) {
+                    Ok(command) => {
+                        if let Some(claim) = request_load_claim {
+                            // The exact path owns the lease after queue
+                            // reservation and before carrier publication; path
+                            // removal or relay cancellation releases it.
+                            assert!(
+                                remote.load_lease.is_none(),
+                                "conditionally claimed path load must remain unowned before transfer"
+                            );
+                            remote.load_lease = Some(claim);
+                            #[cfg(feature = "lab-diagnostics")]
+                            lab_diagnostic(
+                                "request_startup_selection",
+                                format_args!(
+                                    "phase=claim_committed stream_id={} path_index={} instance_id={}",
+                                    self.multipath.stream_id().0,
+                                    instance.key.index,
+                                    instance.attachment_id,
+                                ),
+                            );
+                        }
+                        self.multipath.commit_enqueued_request_product_send(
+                            context, &frame, plan, position, path_count,
                         );
+                        let payload_bytes =
+                            self.multipath.record_emitted_frame(instance, &frame, cause);
+                        command.commit();
+                        Ok(payload_bytes)
                     }
-                    self.multipath.commit_enqueued_request_product_send(
-                        context,
-                        &frame,
-                        plan,
-                        position,
-                        remotes.paths.len(),
-                    );
-                    let payload_bytes =
-                        self.multipath.record_emitted_frame(instance, &frame, cause);
-                    command.commit();
-                    return Ok((instance, payload_bytes));
+                    Err(error) => Err(error),
                 }
+            };
+            match publish_result {
+                Ok(payload_bytes) => return Ok((instance, payload_bytes)),
                 Err(RuntimeError::SenderServiceBlocked) => {
                     return Err(RuntimeError::SenderServiceBlocked);
                 }
@@ -1127,16 +1136,16 @@ fn emit_request_frame_with_mode(
 ) -> Result<(), RuntimeError> {
     let commands = fixed_request_output_commands(&stream.output)?;
     let reservation =
-        reserve_request_frame_with_mode(&commands, frame, lane, emit_mode, reinjection)?;
+        reserve_request_frame_with_mode(commands, frame, lane, emit_mode, reinjection)?;
     reservation.commit();
     Ok(())
 }
 
 fn fixed_request_output_commands(
     output: &ReliablePathStreamOutput,
-) -> Result<ReliablePathCommandSender, RuntimeError> {
+) -> Result<&ReliablePathCommandSender, RuntimeError> {
     match output {
-        ReliablePathStreamOutput::Fixed(fixed) => Ok(fixed.commands().clone()),
+        ReliablePathStreamOutput::Fixed(fixed) => Ok(fixed.commands()),
         ReliablePathStreamOutput::Switchable(_) => {
             Err(RuntimeError::Protocol("request relay path is not fixed"))
         }

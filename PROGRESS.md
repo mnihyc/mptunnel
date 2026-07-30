@@ -11,6 +11,69 @@ Historical entries below are retained as evidence of the decisions made at
 their recorded time. When a later entry changes an earlier decision, the later
 entry is authoritative.
 
+## 2026-07-30T20:16:29+08:00: disconnected TCP service stack removed
+
+- Name: restore one reachable runtime model before adaptive-carrier work
+- Category: Core architecture, performance change control, and source audit
+- State: verified cleanup; MPP v5 service frames and the RFC remain design
+  inputs, but adaptive TCP carrier expansion is not implemented or releasable
+- Supersedes:
+  - the runtime/model acceptance claims at 12:27 and 19:17; and
+  - every intervening claim that the passive writer stack was a production
+    integration boundary.
+- Content:
+  - audited every implementation commit from the restored v4 Product boundary
+    through `f4a36dc` and separated independently reproduced protocol/Product
+    invariants from speculative TCP-service machinery;
+  - retained the v4 conformance fixes, Product logging/configuration/DNS/
+    balancer/port-set work, native QUIC migration, session-local TCP close,
+    asynchronous carrier-open fence, and request queue-before-publication
+    ordering;
+  - removed the unconstructed `TcpServiceSessionController`, its 1,552-line
+    model test mirror, the passive request/response writer observers, global
+    per-flow writer registry, dormant carrier authority generations, and the
+    disconnected client/runtime adapters;
+  - rejected an uncommitted sparse-topology rewrite because eliminating
+    dormant slots had expanded into a performance-sensitive rewrite of every
+    scheduler/scoring API; the proven scheduler remains unchanged;
+  - rejected an uncommitted server implementation that represented
+    validation feedback as a Product output and then added ordinary hot-path
+    eligibility branches to filter it again; and
+  - removed the per-frame clone of the fixed request path's command sender
+    while preserving queue reservation, exact load-lease transfer, flight
+    recording, and publication order.
+- Evidence:
+  - the removed committed runtime/model stack was nearly 9,000 source/test
+    lines and produced 78 dead-code warnings because no production owner
+    constructed its controller;
+  - the same removal compiled cleanly first in an isolated ignored worktree and
+    then in the primary tree with `cargo check --locked --all-targets`;
+  - the complete library gate passed: 1,400 tests, zero failures;
+  - 52 focused request-sender tests passed after the clone removal; and
+  - formatting and whitespace checks passed.
+- Performance boundary:
+  - no clean post-`a5a6094` commit has a reproduced directional regression;
+    `3112e2d` is the last adjacent measured v5 boundary and `ecd5b5e` was only
+    the first later unmeasured runtime boundary;
+  - the only retained large regression belongs to the historical dirty
+    protocol-6 tree and cannot honestly be assigned to one commit; and
+  - no timing, congestion controller, scheduler rule, path count, transport
+    parameter, or Product behavior changed in this cleanup.
+- Decision:
+  - an inactive protocol feature may not leave permanent per-flow or
+    per-payload branches in the runtime;
+  - the next TCP-service implementation must be owned by one long-lived
+    session/carrier-group actor, install temporary evidence only for an active
+    bounded cohort, and keep lifecycle feedback separate from Product outputs;
+  - if the v5 wire/RFC cannot support that model without duplicate authority,
+    they will be revised before implementation rather than patched around; and
+  - performance attribution requires adjacent clean evidence, not a suspected
+    commit or a fixed percentage cap.
+- Next: complete the destructive RFC/actor-boundary review, then implement one
+  coherent client-to-server lifecycle through candidate open, bounded
+  evidence, result, directional lease, drain, and cleanup before adding the
+  symmetric server-to-client demand path.
+
 ## 2026-07-30T19:17:35+08:00: single TCP service lifecycle authority
 
 - Name: remove duplicate lifecycle state before production integration

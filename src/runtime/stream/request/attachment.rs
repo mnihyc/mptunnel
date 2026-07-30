@@ -545,6 +545,7 @@ impl ReliableRelayRemoteSet {
 
     /// Transfers a pre-enqueue claim after the synchronous queue commit.
     /// Generation and instance were resolved with no intervening await.
+    #[cfg(test)]
     pub(in crate::runtime) fn commit_path_instance_load_claim(
         &mut self,
         instance: RelayPathInstance,

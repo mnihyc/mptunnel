@@ -680,6 +680,14 @@ exact fence, or deadline expiry emits `WITHDRAWN`. The client lifecycle owner
 independently stops and drains a candidate whose local resource deadline
 expires. A timeout or invalidation cannot produce `NO_GAIN`.
 
+In Core Profile 5, the configured session retention timeout is also the
+maximum lifetime of one transient TCP service-validation authority. The
+client computes the local absolute deadline once from the exact candidate
+registration instant; the server computes a response-demand deadline once
+from request creation. Arithmetic failure withdraws the authority as a
+resource-limit failure. Neither endpoint transmits its local deadline or
+extends it from later activity.
+
 The sender concludes a validation with
 `TCP_CARRIER_RESULT(trial_id, candidate_path_id, direction, result)`.
 `RETAIN` creates a directional retention lease; `NO_GAIN` records a completed

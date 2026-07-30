@@ -1329,12 +1329,40 @@ that are no larger than the session stream and memory envelopes. A larger live
 workload is represented by a bounded qualifying subset; it is never scanned or
 serialized without limit.
 
+Before taking the initial writer boundary, the session controller reserves one
+non-reusable validation lifecycle and installs its passive writer observer on
+every frozen stream. The reservation grants no attachment, byte credit, or
+placement authority. After every installation is acknowledged, the sender
+revalidates the exact fence, applies a complete Data ACK transaction, takes one
+common lifecycle-tagged writer boundary, and activates the validation without
+an intervening asynchronous operation. Failure, closure, fence change, or
+deadline expiry during installation conditionally removes only that lifecycle's
+observers and withdraws the reservation; its trial identifier is not reused.
+The session owner arms the absolute resource deadline when it reserves the
+lifecycle, not when installation finishes. Task cancellation or loss of either
+the installation preparation or running validation cannot strand session
+authority: at the deadline the controller enters cleanup, conditionally removes
+only that lifecycle's observers, and acknowledges cleanup before another
+validation may be reserved. Cleanup authority for that same non-reusable
+lifecycle is reissued after cleanup-task cancellation, so cancellation cannot
+strand the controller and cannot affect a later lifecycle. It preserves the
+exact session, candidate, trial, and direction needed to emit `WITHDRAWN` even
+when the running validation task was lost; expiry never reconstructs or emits
+a capacity verdict.
+
 Only unambiguous original-data releases from one complete MPP Data ACK
 transaction enter a window. Releases of reinjection or bytes with ambiguous
 copy provenance do not. Each release retains its exact carrier instance and
-original writer-commit time. An ACK event is applied atomically and may carry a
-bounded overshoot beyond the horizon; it MUST NOT be split, truncated, or
-reassigned to make a boundary.
+original writer-commit point. A point is valid only for the active validation
+lifecycle. Accepted-set data already in flight when observers were installed,
+or carrying another lifecycle's point, is pre-boundary work: it drains normally
+but cannot enter a window. Candidate work without the exact current lifecycle
+point is invalid. The lifecycle writer clock serializes every boundary and
+observed commit into a strict total order; equal readings from a platform clock
+are advanced to the next representable point and cannot collapse distinct
+events. An ACK event is applied atomically and may carry a bounded
+overshoot beyond the horizon; it MUST NOT be split, truncated, or reassigned to
+make a boundary.
 
 A window begins at an ACK boundary and an independent writer boundary. It
 contains only original bytes committed after its writer boundary. It completes

@@ -96,7 +96,12 @@ impl CarrierPathInstanceId {
 
 /// Allocates process-unique carrier lifetime identity across all path owners.
 pub(crate) fn next_carrier_path_instance_id() -> CarrierPathInstanceId {
-    CarrierPathInstanceId::from_raw(NEXT_CARRIER_PATH_INSTANCE_ID.fetch_add(1, Ordering::AcqRel))
+    let instance_id = NEXT_CARRIER_PATH_INSTANCE_ID
+        .fetch_update(Ordering::AcqRel, Ordering::Acquire, |current| {
+            current.checked_add(1)
+        })
+        .expect("carrier path instance identity space exhausted");
+    CarrierPathInstanceId::from_raw(instance_id)
 }
 
 #[cfg(test)]

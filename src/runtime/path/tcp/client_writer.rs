@@ -34,7 +34,7 @@ use tokio::sync::mpsc;
 
 #[derive(Clone, Copy)]
 struct ClientTcpCommandOptions {
-    carrier_generation: u64,
+    carrier_instance: u64,
     stream_frame_queue: usize,
     flush_after_frame: bool,
 }
@@ -48,7 +48,7 @@ pub(super) async fn handle_connected_client_tcp_command_run(
     closed_streams: &mut RecentIdCache<StreamId>,
     datagrams: &mut ClientTcpDatagramState,
     runtime: &ClientTcpPathSessionRuntime,
-    carrier_generation: u64,
+    carrier_instance: u64,
     stream_frame_queue: usize,
     mux_limits: MuxLimits,
     pending_frames: &mut Vec<Frame>,
@@ -266,7 +266,7 @@ pub(super) async fn handle_connected_client_tcp_command_run(
                     closed_streams,
                     datagrams,
                     ClientTcpCommandOptions {
-                        carrier_generation,
+                        carrier_instance,
                         stream_frame_queue,
                         flush_after_frame: false,
                     },
@@ -593,7 +593,7 @@ async fn handle_connected_client_tcp_command(
     options: ClientTcpCommandOptions,
 ) -> Result<(), RuntimeError> {
     let ClientTcpCommandOptions {
-        carrier_generation,
+        carrier_instance,
         stream_frame_queue,
         flush_after_frame,
     } = options;
@@ -605,7 +605,7 @@ async fn handle_connected_client_tcp_command(
         ReliablePathCommand::OpenStream {
             stream_id,
             attempt_id,
-            observed_carrier_generation,
+            observed_carrier_instance,
             target,
             lane,
             advertised_recv_max_offset,
@@ -613,8 +613,8 @@ async fn handle_connected_client_tcp_command(
             session_commands,
             response,
         } => {
-            let open_deadline = open_deadlines
-                .for_carrier_generation(observed_carrier_generation, carrier_generation);
+            let open_deadline =
+                open_deadlines.for_carrier_instance(observed_carrier_instance, carrier_instance);
             let open = ClientTcpOpenStreamRequest {
                 stream_id,
                 attempt_id,

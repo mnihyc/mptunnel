@@ -148,9 +148,14 @@ third transport protocol.
   not a permanent carrier or attachment role.
 
 **TCP carrier group**
-: The client-local set of independently authenticated TCP carrier slots
-  derived from one configured endpoint. Group identity and slot ordinals are
-  never sent and cannot be reconstructed from locators.
+: The client-local configured bounds and configured-minimum member identities
+  derived from one configured endpoint within one MPP session. One session
+  service reconciles the desired minimum and elastic reservations; each exact
+  carrier actor owns its socket, wire ordering, readiness, drain, failure, and
+  terminal release. Group identity and local capacity ordinals are never sent
+  and cannot be reconstructed from locators. Unoccupied elastic capacity above
+  the configured minimum is not a carrier, attachment, health record, or
+  scheduling state.
 
 **Accepted TCP carrier set**
 : The exact live TCP carrier instances in one MPP session that have
@@ -384,6 +389,17 @@ Within a session, the wire label is `(underlay, path_id)`. The initiator
 selects `path_id`; the receiver treats it as opaque. The same numeric
 `path_id` MAY label one TCP carrier and one QUIC carrier.
 
+The client session allocates TCP `PathId` values across the complete MPP
+session, not independently per configured endpoint. It MUST NOT assign a value
+held by a locally nonterminal TCP carrier. The receiver MUST reject a second
+current TCP carrier with the same `(SessionId, TCP, PathId)` without replacing
+or mutating the first. A reconnect may reuse a label after the client's old
+instance reaches native failure, but the peer may still reject that admission
+until it observes the old terminal boundary. Such a rejected connection never
+becomes a carrier and transfers no state; at most one replacement attempt is
+active for that configured member. Reuse never transfers attachment, authority,
+evidence, queue, or flight state.
+
 Local listener policy MUST NOT index local configuration with a peer-supplied
 `PathId`. Local policy remains off wire except for the directional
 regular/backup preference.
@@ -590,6 +606,32 @@ local policy changes are distinct events. Local states such as active,
 suspect, draining, failed, disabled, and cooldown are not peer scheduling
 values.
 
+Runtime-disable is local admission and scheduling control. It suspends the
+configured minimum, forbids new establishment, validation, and original
+placement, makes every group carrier locally ineligible, and invalidates each
+active group validation to `WITHDRAWN`. It does not by itself retire a healthy
+configured-minimum or already-retained carrier, or interrupt an attachment on
+one of those carriers. An unretained candidate invalidated to `WITHDRAWN`
+still completes the candidate-retirement transaction in Section 7.2.
+Re-enabling MAY make the same nonterminal accepted carrier eligible again. The
+establishment-policy generation still advances across each transition so an
+in-progress pre-readiness connection from an older policy cannot publish
+afterward.
+
+Removing a TCP carrier group requests that each exact carrier actor retire
+through the ordered `PATH_DRAIN`/`PATH_CLOSE` procedure. Re-adding it creates
+new group and policy generations and does not cancel a drain already begun.
+Disable, removal, and re-add use the client-local group identity and MUST NOT
+use a source address, locator, interface, `PathId`, or peer `PATH_STATUS` as
+group identity.
+
+A bound change MUST NOT retroactively reclassify a live carrier. Increasing
+the minimum establishes fresh configured-minimum instances. Decreasing it
+gracefully drains selected surplus configured-minimum instances. Decreasing
+the maximum below occupied physical reservations MUST be rejected or remain
+unapplied until ordered retirement brings occupancy within the new bound. An
+implementation MUST NOT satisfy a lower bound by hiding live instances.
+
 Product FIN, detach, reset, or `DGRAM_CLOSE` retires only the corresponding
 product state. It does not implicitly retire a carrier.
 
@@ -609,6 +651,38 @@ Both bounds MUST be positive, the minimum MUST NOT exceed the maximum, and
 every ready, establishing, validating, and draining carrier MUST fit the
 endpoint and session resource envelopes. The Product default is `1-3`;
 explicit bounds may differ within those resource envelopes.
+
+One physical carrier consumes one group-capacity reservation from connect
+initiation. A pre-readiness admission, connection, or authentication failure,
+or cancellation before publication, releases it immediately. After readiness,
+receipt of its ordered `PATH_CLOSE` or exact native failure releases it.
+Establishing, ready, validating, retained, and draining instances all consume
+that reservation. The reservation count MUST NOT exceed the configured
+maximum or the endpoint and session resource envelopes. An unoccupied elastic
+position above the configured minimum consumes no carrier, `PathId`, actor,
+attachment, queue, evidence, or health state.
+
+While the group and MPP session are enabled, one client session service
+maintains the configured minimum using bounded connection attempts and local
+retry policy. At most one attempt may be active for one configured member;
+distinct missing members MAY establish concurrently within the group and
+session resource envelopes. A reservation created to satisfy that minimum is
+a configured-minimum carrier for that exact instance and gains authority in
+both directions only after readiness. An elastic carrier is not promoted into
+configured-minimum authority. Loss of a configured-minimum instance releases
+only that exact instance and authorizes one fresh replacement while the group
+remains below minimum.
+
+Minimum classification and reconciliation are session-owned, not
+stream-owned. Product demand MAY wake the exact actor for an already
+authorized configured-minimum member, but one stream open, close,
+cancellation, or actor exit MUST NOT classify, promote, or retire group
+capacity. Concurrent failure notifications for one instance are reconciled
+once. Ready and establishing instances suppress duplicate connection
+attempts, but only readiness satisfies the durable minimum. Replacement stops
+at the minimum and MUST NOT consume elastic capacity merely because
+application demand remains queued. The peer does not reconstruct the
+client-local group or bound.
 
 Every additional TCP connection:
 
@@ -977,6 +1051,15 @@ restore attachment MUST NOT extend the original no-attachment deadline.
 Expiry retires the stream and its application connection. Ordinary application
 idle on a live attachment is not attachment loss.
 
+Loss of the last carrier is not `SESSION_CLOSE`. While the MPP session or any
+retained stream or datagram state remains within its original configured
+absolute retention lifetime, the client session service may establish
+configured-minimum replacements with the same `SessionId` and fresh carrier
+instances. Reattachment uses ordinary authenticated admission and attachment;
+no authority, attachment, transport evidence, queue, or flight transfers from
+a failed instance. Reconnect attempts MUST NOT extend any original retention
+deadline.
+
 ### 8.7 Reinjection
 
 Reinjection preserves `StreamId`, direction, offset, length, and payload. It
@@ -1308,7 +1391,10 @@ Endpoints MUST enforce configured bounds for:
 - datagram attempts, TTL, caches, fragments, and reassemblies;
 - proof, capacity, metric, and peer-status work;
 - TCP carrier demand requests, validations, stream cohorts, candidate work,
-  results, result acknowledgments, ordinary-use authority, and drain work; and
+  results, result acknowledgments, ordinary-use authority, and drain work;
+- TCP group-capacity reservations, minimum connection and reconnect attempts,
+  `PathId` allocation state, removal and bound-reduction drains, and
+  carrierless-session retention; and
 - all teardown and no-attachment retention.
 
 A protocol violation closes the smallest safe scope: product flow, stream,
@@ -1591,6 +1677,14 @@ A conforming implementation preserves all of the following:
     a prepared result or local drain write is not a settlement boundary.
 26. Configured elastic capacity that has not established a physical carrier is
     not an eligible carrier, path attachment, or health state.
+27. One client session service reconciles each TCP carrier group; an exact
+    carrier actor owns its wire lifecycle, while a stream never owns group
+    capacity or replacement.
+28. A configured-minimum classification belongs to one exact carrier instance;
+    an elastic carrier is never silently promoted after another carrier fails.
+29. A disabled TCP carrier group establishes no carrier and grants no new
+    original placement; disable alone neither invents a terminal event nor
+    discards an exact configured-minimum or already-retained carrier instance.
 
 ## 17. Relationship to Existing Standards
 

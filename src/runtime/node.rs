@@ -8,7 +8,7 @@ mod combined;
 pub(super) mod server;
 
 #[cfg(test)]
-pub(in crate::runtime) use client::probe_paths;
+pub(in crate::runtime) use client::{probe_paths, run_path_probe_service};
 
 use crate::config::{AppConfig, CommandConfig};
 use crate::dns::DnsGeneration;

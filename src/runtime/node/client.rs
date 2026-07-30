@@ -6,13 +6,15 @@ use crate::mux::MuxLimits;
 use crate::performance::ResourceLimits;
 use crate::platform::{PacketDeviceConfig, PacketDeviceProvider};
 use crate::product::OutboundId;
-use crate::protocol::UnderlayProtocol;
 use crate::runtime::error::RuntimeError;
+#[cfg(test)]
+use crate::runtime::ingress_runtime::probe_tcp_client_path;
 use crate::runtime::ingress_runtime::{
-    probe_tcp_client_path, probe_udp_client_path, spawn_http_connect_client_ingress,
-    spawn_socks5_client_ingress, spawn_tcp_forward_client_ingress,
-    spawn_udp_forward_client_ingress,
+    ReadyTcpPathProbe, probe_ready_tcp_client_path, probe_udp_client_path,
+    spawn_http_connect_client_ingress, spawn_socks5_client_ingress,
+    spawn_tcp_forward_client_ingress, spawn_udp_forward_client_ingress,
 };
+use crate::runtime::path::tcp::group::ClientTcpMinimumRetry;
 use crate::runtime::path::{ClientPathContext, ClientPathRuntimeOptions};
 use crate::runtime::product_policy::ClientIngressRouter;
 use crate::runtime::readiness::RuntimeReadinessBarrier;
@@ -132,37 +134,146 @@ pub(super) fn spawn_path_probe_service(
     timeout: Duration,
     services: &mut tokio::task::JoinSet<Result<(), RuntimeError>>,
 ) {
-    // Probes share node supervision so a restart cannot update stale path state.
-    services.spawn(run_path_probes(context, interval, timeout));
+    services.spawn(run_path_probe_service(context, interval, timeout));
 }
 
-async fn run_path_probes(
+pub(in crate::runtime) async fn run_path_probe_service(
     context: ClientPathContext,
     interval: Duration,
     timeout: Duration,
 ) -> Result<(), RuntimeError> {
+    let groups = context.tcp_carrier_groups.clone();
+    let mut changes = groups.subscribe();
+    let now = tokio::time::Instant::now();
+    let mut retry = vec![ClientTcpMinimumRetry::new(now); context.tcp_sessions.len()];
+    let mut measurements = tokio::task::JoinSet::new();
+
+    // Preserve immediate UDP measurement while the same service establishes
+    // configured-minimum TCP carriers.
+    {
+        let context = context.clone();
+        measurements.spawn(async move {
+            probe_selected_paths(&context, timeout, TcpProbeSelection::None).await;
+        });
+    }
+
     let mut ticker = tokio::time::interval(interval);
     ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    ticker.tick().await;
+
+    groups
+        .reconcile_configured_minimum(&context, timeout, interval, &mut retry)
+        .await;
+
     loop {
-        ticker.tick().await;
-        probe_paths(&context, timeout).await;
+        tokio::select! {
+            changed = changes.changed() => {
+                changed.expect("TCP carrier group sender lives with path context");
+                groups
+                    .reconcile_configured_minimum(
+                        &context,
+                        timeout,
+                        interval,
+                        &mut retry,
+                    )
+                    .await;
+            }
+            _ = ticker.tick() => {
+                if measurements.is_empty() {
+                    let context = context.clone();
+                    measurements.spawn(async move {
+                        probe_selected_paths(
+                            &context,
+                            timeout,
+                            TcpProbeSelection::ReadyOnly,
+                        )
+                        .await;
+                    });
+                }
+                groups
+                    .reconcile_configured_minimum(
+                        &context,
+                        timeout,
+                        interval,
+                        &mut retry,
+                    )
+                    .await;
+            }
+            measurement = measurements.join_next(), if !measurements.is_empty() => {
+                if let Some(Err(error)) = measurement {
+                    crate::observability::process_event!(
+                        Warn,
+                        "path",
+                        "probe_batch_failed",
+                        "path measurement batch failed: {error}"
+                    );
+                }
+            }
+        }
     }
 }
 
+#[cfg(test)]
 pub(in crate::runtime) async fn probe_paths(context: &ClientPathContext, timeout: Duration) {
+    probe_selected_paths(context, timeout, TcpProbeSelection::All).await;
+}
+
+#[derive(Clone, Copy)]
+enum TcpProbeSelection {
+    None,
+    ReadyOnly,
+    #[cfg(test)]
+    All,
+}
+
+enum PathProbeResult {
+    ReadyTcp {
+        path_index: usize,
+        result: Option<ReadyTcpPathProbe>,
+    },
+    Udp {
+        path_index: usize,
+        result: Result<Duration, RuntimeError>,
+    },
+}
+
+async fn probe_selected_paths(
+    context: &ClientPathContext,
+    timeout: Duration,
+    tcp: TcpProbeSelection,
+) {
     let mut probes = tokio::task::JoinSet::new();
-    for path_index in 0..context.tcp_paths.len() {
-        if !context.should_probe_tcp_path(path_index) {
-            continue;
+    match tcp {
+        TcpProbeSelection::None => {}
+        TcpProbeSelection::ReadyOnly => {
+            for path_index in 0..context.tcp_paths.len() {
+                if !context.should_probe_tcp_path(path_index) {
+                    continue;
+                }
+                let context = context.clone();
+                probes.spawn(async move {
+                    PathProbeResult::ReadyTcp {
+                        path_index,
+                        result: probe_ready_tcp_client_path(&context, path_index, timeout).await,
+                    }
+                });
+            }
         }
-        let context = context.clone();
-        probes.spawn(async move {
-            (
-                UnderlayProtocol::Tcp,
-                path_index,
-                probe_tcp_client_path(&context, path_index, timeout).await,
-            )
-        });
+        #[cfg(test)]
+        TcpProbeSelection::All => {
+            for path_index in 0..context.tcp_paths.len() {
+                if !context.should_probe_tcp_path(path_index) {
+                    continue;
+                }
+                let context = context.clone();
+                probes.spawn(async move {
+                    PathProbeResult::ReadyTcp {
+                        path_index,
+                        result: probe_tcp_client_path(&context, path_index, timeout).await,
+                    }
+                });
+            }
+        }
     }
     for path_index in 0..context.udp_paths.len() {
         if !context.should_probe_udp_path(path_index) {
@@ -170,26 +281,43 @@ pub(in crate::runtime) async fn probe_paths(context: &ClientPathContext, timeout
         }
         let context = context.clone();
         probes.spawn(async move {
-            (
-                UnderlayProtocol::Udp,
+            PathProbeResult::Udp {
                 path_index,
-                probe_udp_client_path(&context, path_index, timeout).await,
-            )
+                result: probe_udp_client_path(&context, path_index, timeout).await,
+            }
         });
     }
 
     while let Some(result) = probes.join_next().await {
         match result {
-            Ok((UnderlayProtocol::Tcp, path_index, Ok(elapsed))) => {
-                context.mark_tcp_path_probe_success(path_index, elapsed);
-            }
-            Ok((UnderlayProtocol::Tcp, path_index, Err(_))) => {
-                context.mark_tcp_path_failure(path_index);
-            }
-            Ok((UnderlayProtocol::Udp, path_index, Ok(elapsed))) => {
+            Ok(PathProbeResult::ReadyTcp {
+                path_index,
+                result:
+                    Some(ReadyTcpPathProbe {
+                        path_instance_id,
+                        result,
+                    }),
+            }) => match result {
+                Ok(elapsed) => context.mark_tcp_path_probe_success_for_instance(
+                    path_index,
+                    path_instance_id,
+                    elapsed,
+                ),
+                Err(_) => {
+                    context.mark_tcp_path_probe_failure_for_instance(path_index, path_instance_id)
+                }
+            },
+            Ok(PathProbeResult::ReadyTcp { .. }) => {}
+            Ok(PathProbeResult::Udp {
+                path_index,
+                result: Ok(elapsed),
+            }) => {
                 context.mark_udp_path_probe_success(path_index, elapsed);
             }
-            Ok((UnderlayProtocol::Udp, path_index, Err(_))) => {
+            Ok(PathProbeResult::Udp {
+                path_index,
+                result: Err(_),
+            }) => {
                 context.mark_udp_path_failure(path_index);
             }
             Err(err) => crate::observability::process_event!(

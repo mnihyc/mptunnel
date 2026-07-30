@@ -15,6 +15,7 @@ mod client_session;
 mod client_state;
 mod client_stream;
 mod client_writer;
+pub(in crate::runtime) mod group;
 pub(in crate::runtime) mod io;
 pub(in crate::runtime) mod metrics;
 pub(in crate::runtime) mod server;

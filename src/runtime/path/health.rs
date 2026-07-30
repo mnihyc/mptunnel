@@ -376,12 +376,39 @@ impl ClientPathHealthRecord {
         if self.manual_disabled {
             return;
         }
+        self.record_success(elapsed);
+    }
+
+    fn record_success(&mut self, elapsed: Duration) {
         self.mark_liveness_success();
         let sample_ms = elapsed.as_secs_f64() * 1000.0;
         self.measured_srtt_ms = Some(match self.measured_srtt_ms {
             Some(previous) => previous.mul_add(0.875, sample_ms * 0.125),
             None => sample_ms,
         });
+    }
+
+    pub(in crate::runtime) fn mark_probe_success_for_instance(
+        &mut self,
+        path_instance_id: CarrierPathInstanceId,
+        elapsed: Duration,
+    ) {
+        if !self.accepts_native_carrier_observation(path_instance_id) {
+            return;
+        }
+        self.record_success(elapsed);
+    }
+
+    pub(in crate::runtime) fn mark_probe_failure_for_instance(
+        &mut self,
+        path_instance_id: CarrierPathInstanceId,
+        now: Instant,
+        has_schedulable_alternative: bool,
+    ) {
+        if !self.accepts_native_carrier_observation(path_instance_id) {
+            return;
+        }
+        self.mark_failure(now, has_schedulable_alternative);
     }
 
     pub(in crate::runtime) fn mark_path_proof_success(

@@ -5,6 +5,7 @@
 
 use super::capacity::RequestTcpCapacityProbeLease;
 use super::client_connection::ClientTcpCarrierConnection;
+use super::group::{ClientTcpCarrierGroups, ClientTcpEndpointPolicy};
 use crate::config::ClientSecurityConfig;
 #[cfg(feature = "lab-diagnostics")]
 use crate::lab_diagnostics::lab_diagnostic;
@@ -78,6 +79,8 @@ pub(in crate::runtime) struct ClientTcpPathSessionRuntime {
     pub(in crate::runtime) carrier_network: Arc<dyn CarrierNetworkProvider>,
     pub(in crate::runtime) peer_status: PeerStatusBroker,
     pub(in crate::runtime) peer_status_snapshot: PeerStatusSnapshotSource,
+    pub(in crate::runtime) endpoint_policy: Arc<ClientTcpEndpointPolicy>,
+    pub(in crate::runtime) carrier_groups: Arc<ClientTcpCarrierGroups>,
 }
 
 impl ClientTcpPathSessionRuntime {

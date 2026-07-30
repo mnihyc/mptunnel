@@ -6,6 +6,7 @@ use crate::config::{
 use crate::outbound::OutboundConfig;
 use crate::protocol::{DatagramFlowId, DatagramId, PathUsage, SessionId};
 use crate::runtime::path::ServerLocalPath;
+use crate::runtime::path::tcp::group::ClientTcpEndpointControlState;
 use crate::transport::SystemCarrierNetworkProvider;
 
 const FULL_STACK_RESPONSE_TIMEOUT: Duration = Duration::from_secs(15);
@@ -483,6 +484,24 @@ async fn wait_for_tcp_path_detached(context: &ClientPathContext, path_index: usi
     .expect("TCP carrier did not detach");
 }
 
+async fn wait_for_tcp_ready_count(context: &ClientPathContext, expected: usize) {
+    tokio::time::timeout(Duration::from_secs(2), async {
+        loop {
+            let ready = context
+                .tcp_sessions
+                .iter()
+                .filter(|session| session.is_connection_ready())
+                .count();
+            if ready == expected {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("configured-minimum TCP readiness did not converge");
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn mixed_server_listeners_apply_local_policy_independent_of_wire_path_id() {
     let tcp_path = reserve_tcp_path_with_query("srtt-ms=20&rate-mbps=100").await;
@@ -551,6 +570,289 @@ async fn initial_path_probe_retains_tcp_carrier_without_stream_load() {
 
     server.abort();
     let _ = server.await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn session_owner_reconciles_configured_minimum_without_elastic_expansion() {
+    enum CarrierServerControl {
+        Abort(usize),
+        AbortAll,
+    }
+
+    let path = reserve_tcp_path_with_query("tcp-carriers=2-3").await;
+    let listener = bind_listener(&path).await.expect("bind carrier listener");
+    let local_path = ServerLocalPath::new(0, path.clone());
+    let ServerIdentityRuntime {
+        paths: server_context,
+        reliable_relay,
+    } = server_runtime(OutboundConfig::Direct);
+    let snapshot_context = server_context.clone();
+    let server_relay = tokio::spawn(reliable_relay.run());
+    let (server_control, mut server_commands) = mpsc::unbounded_channel::<CarrierServerControl>();
+    let carrier_server = tokio::spawn(async move {
+        let mut sessions = tokio::task::JoinSet::new();
+        let mut abort_handles = Vec::new();
+        loop {
+            tokio::select! {
+                accepted_stream = listener.accept() => {
+                    let (stream, _) = accepted_stream.expect("accept carrier");
+                    let local_path = local_path.clone();
+                    let server_context = server_context.clone();
+                    abort_handles.push(sessions.spawn(async move {
+                        handle_server_path(stream, local_path, server_context).await
+                    }));
+                }
+                command = server_commands.recv() => {
+                    match command {
+                        Some(CarrierServerControl::Abort(index)) => {
+                            if let Some(handle) = abort_handles.get(index) {
+                                handle.abort();
+                            }
+                        }
+                        Some(CarrierServerControl::AbortAll) => {
+                            for handle in &abort_handles {
+                                handle.abort();
+                            }
+                        }
+                        None => break,
+                    }
+                }
+                Some(_) = sessions.join_next(), if !sessions.is_empty() => {}
+            }
+        }
+    });
+
+    let context = ClientPathContext::new_with_carrier_network(
+        vec![ClientPathConfig {
+            name: "primary".to_string(),
+            tls: crate::transport::encrypted::test_client_tls_config(),
+            spec: path,
+            security: security(),
+        }],
+        ResourceLimits::default(),
+        None,
+        0,
+        Arc::new(SystemCarrierNetworkProvider),
+    )
+    .expect("client carrier context");
+    let session_id = context.session_id;
+    let path_service = tokio::spawn(run_client_path_service(
+        context.clone(),
+        Duration::from_secs(2),
+        Duration::from_secs(1),
+    ));
+
+    wait_for_tcp_ready_count(&context, 2).await;
+    let initial_client_instances = context
+        .tcp_sessions
+        .iter()
+        .map(|session| {
+            session
+                .connection_instance_id()
+                .expect("configured-minimum carrier instance")
+        })
+        .collect::<Vec<_>>();
+    let initial = tokio::time::timeout(Duration::from_secs(2), async {
+        loop {
+            let snapshot = snapshot_context.reliable_streams.management_snapshot();
+            if snapshot.paths.len() == 2 {
+                break snapshot;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("initial server carrier inventory");
+    assert_eq!(
+        initial.paths.len(),
+        2,
+        "unoccupied maximum capacity must stay absent"
+    );
+    assert!(
+        initial
+            .paths
+            .iter()
+            .all(|path| path.session_id == session_id),
+        "configured-minimum carriers must belong to one MPP session"
+    );
+    assert_ne!(
+        initial.paths[0].path_id, initial.paths[1].path_id,
+        "simultaneous TCP carriers require distinct wire labels"
+    );
+    let initial_instances = initial
+        .paths
+        .iter()
+        .map(|path| path.path_instance_id)
+        .collect::<HashSet<_>>();
+
+    // The existing retry interval is also the churn gate. Let the initial
+    // carriers become stable before proving event-driven replacement.
+    tokio::time::sleep(Duration::from_millis(2100)).await;
+    server_control
+        .send(CarrierServerControl::Abort(0))
+        .expect("abort exact server carrier");
+    tokio::time::timeout(Duration::from_millis(1500), async {
+        loop {
+            let current = context
+                .tcp_sessions
+                .iter()
+                .map(ClientTcpPathSessionHandle::connection_instance_id)
+                .collect::<Vec<_>>();
+            if current.iter().all(Option::is_some)
+                && current
+                    .iter()
+                    .zip(&initial_client_instances)
+                    .filter(|(current, initial)| **current != Some(**initial))
+                    .count()
+                    == 1
+            {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("exact loss must wake replacement before periodic retry");
+    let replacement = tokio::time::timeout(Duration::from_secs(2), async {
+        loop {
+            let snapshot = snapshot_context.reliable_streams.management_snapshot();
+            if snapshot.paths.len() == 2
+                && snapshot
+                    .paths
+                    .iter()
+                    .any(|path| !initial_instances.contains(&path.path_instance_id))
+            {
+                break snapshot;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("replacement server carrier inventory");
+    assert!(
+        replacement
+            .paths
+            .iter()
+            .all(|path| path.session_id == session_id),
+        "replacement must preserve logical session identity"
+    );
+    let initial_pairs = initial
+        .paths
+        .iter()
+        .map(|path| (path.path_id, path.path_instance_id))
+        .collect::<HashSet<_>>();
+    let replacement_pairs = replacement
+        .paths
+        .iter()
+        .map(|path| (path.path_id, path.path_instance_id))
+        .collect::<HashSet<_>>();
+    assert_eq!(
+        initial_pairs.intersection(&replacement_pairs).count(),
+        1,
+        "the unaffected configured-minimum carrier must remain exact"
+    );
+    assert_eq!(
+        initial
+            .paths
+            .iter()
+            .map(|path| path.path_id)
+            .collect::<HashSet<_>>(),
+        replacement
+            .paths
+            .iter()
+            .map(|path| path.path_id)
+            .collect::<HashSet<_>>(),
+        "replacement must preserve the configured member label"
+    );
+
+    let (target_addr, target) = spawn_echo_target().await;
+    let (mut product_client, product_server) = duplex(4096);
+    let product = tokio::spawn(handle_socks5_client_stream(product_server, context.clone()));
+    drive_socks5_echo_client(&mut product_client, target_addr).await;
+    product.await.expect("product join").expect("product relay");
+    target.await.expect("target join");
+
+    let stable_client_instances = context
+        .tcp_sessions
+        .iter()
+        .map(ClientTcpPathSessionHandle::connection_instance_id)
+        .collect::<Vec<_>>();
+    context.set_tcp_endpoint_control(0, ClientTcpEndpointControlState::Disabled);
+    tokio::task::yield_now().await;
+    assert_eq!(
+        context
+            .tcp_sessions
+            .iter()
+            .map(ClientTcpPathSessionHandle::connection_instance_id)
+            .collect::<Vec<_>>(),
+        stable_client_instances,
+        "runtime disable must not invent carrier retirement"
+    );
+    context.set_tcp_endpoint_control(0, ClientTcpEndpointControlState::Enabled);
+    tokio::task::yield_now().await;
+    assert_eq!(
+        context
+            .tcp_sessions
+            .iter()
+            .map(ClientTcpPathSessionHandle::connection_instance_id)
+            .collect::<Vec<_>>(),
+        stable_client_instances,
+        "runtime re-enable must not require replacement of nonterminal carriers"
+    );
+
+    context.set_tcp_endpoint_control(0, ClientTcpEndpointControlState::Disabled);
+    server_control
+        .send(CarrierServerControl::AbortAll)
+        .expect("abort disabled endpoint carriers");
+    wait_for_tcp_ready_count(&context, 0).await;
+    tokio::time::timeout(Duration::from_secs(2), async {
+        loop {
+            if snapshot_context
+                .reliable_streams
+                .management_snapshot()
+                .paths
+                .is_empty()
+            {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("disabled server carriers must reach native terminal state");
+    assert!(
+        context
+            .tcp_sessions
+            .iter()
+            .all(|session| !session.is_connection_ready()),
+        "disable plus exact native failure must suppress minimum replacement"
+    );
+
+    context.set_tcp_endpoint_control(0, ClientTcpEndpointControlState::Enabled);
+    wait_for_tcp_ready_count(&context, 2).await;
+    tokio::time::timeout(Duration::from_secs(2), async {
+        loop {
+            if snapshot_context
+                .reliable_streams
+                .management_snapshot()
+                .paths
+                .len()
+                == 2
+            {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("re-enable must restore only the configured minimum");
+
+    path_service.abort();
+    let _ = path_service.await;
+    carrier_server.abort();
+    let _ = carrier_server.await;
+    server_relay.abort();
+    let _ = server_relay.await;
 }
 
 #[tokio::test]

@@ -31,7 +31,7 @@ fn tcp_path_test_context(path_count: usize) -> ClientPathContext {
 }
 
 #[test]
-fn tcp_endpoint_topology_publishes_only_configured_minimum_carriers() {
+fn tcp_carrier_groups_publish_only_configured_minimum_members() {
     let primary_security = ClientSecurityConfig::for_test(
         SharedSecret::new(b"0123456789abcdef0123456789abcdef".to_vec()).expect("primary security"),
     );

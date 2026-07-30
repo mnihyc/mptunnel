@@ -15,6 +15,7 @@ use super::set::ClientPathContext;
 use super::tcp::capacity::{
     RequestTcpCapacityProbeLease, RequestTcpCapacityProbeSession, RequestTcpCapacityProofQuery,
 };
+use super::tcp::group::ClientTcpEndpointPolicy;
 #[cfg(test)]
 use super::*;
 use crate::model::capacity::{PathRateSample, reliable_capacity_measurement_session_limit_bytes};
@@ -28,6 +29,15 @@ use std::sync::{
     atomic::{AtomicU64, Ordering},
 };
 use std::time::{Duration, Instant};
+
+pub(in crate::runtime) struct ClientTcpCarrierPublication {
+    pub(in crate::runtime) path_index: usize,
+    pub(in crate::runtime) endpoint_generation: u64,
+    pub(in crate::runtime) path_instance_id: CarrierPathInstanceId,
+    pub(in crate::runtime) peer_usage_sequence: u64,
+    pub(in crate::runtime) peer_usage: PathUsage,
+    pub(in crate::runtime) readiness_rtt: Option<Duration>,
+}
 
 /// One lock domain for coherent health, load, and carrier budget composition.
 #[derive(Debug)]
@@ -71,6 +81,54 @@ impl ClientPathState {
         if let Some(record) = records.get_mut(index) {
             record.install_peer_usage(path_instance_id, sequence, usage);
         }
+    }
+
+    /// Publishes authenticated TCP health and actor readiness in one policy
+    /// transaction.
+    pub(in crate::runtime) fn publish_tcp_peer_path_usage_for_endpoint_generation(
+        &self,
+        endpoint_policy: &ClientTcpEndpointPolicy,
+        publication: ClientTcpCarrierPublication,
+        publish_readiness: impl FnOnce(),
+    ) -> bool {
+        let mut health = self.health.lock().expect("client path health lock");
+        if !endpoint_policy.allows(publication.endpoint_generation) {
+            return false;
+        }
+        let record = health
+            .tcp
+            .get_mut(publication.path_index)
+            .expect("TCP carrier actor must have one health record");
+        record.install_peer_usage(
+            publication.path_instance_id,
+            publication.peer_usage_sequence,
+            publication.peer_usage,
+        );
+        if let Some(readiness_rtt) = publication.readiness_rtt {
+            record.mark_success(readiness_rtt);
+        }
+        publish_readiness();
+        true
+    }
+
+    pub(in crate::runtime) fn mark_tcp_path_establishment_failure_for_endpoint_generation(
+        &self,
+        index: usize,
+        endpoint_policy: &ClientTcpEndpointPolicy,
+        endpoint_generation: u64,
+    ) {
+        let now = Instant::now();
+        let mut health = self.health.lock().expect("client path health lock");
+        if !endpoint_policy.allows(endpoint_generation) {
+            return;
+        }
+        let has_schedulable_alternative =
+            path_records_have_schedulable_alternative(&health.tcp, index, now);
+        health
+            .tcp
+            .get_mut(index)
+            .expect("TCP carrier actor must have one health record")
+            .mark_failure(now, has_schedulable_alternative);
     }
 
     pub(in crate::runtime) fn update_peer_path_usage(
@@ -508,6 +566,7 @@ impl ClientPathContext {
         }
     }
 
+    #[cfg(test)]
     pub(in crate::runtime) fn mark_tcp_path_probe_success(&self, index: usize, elapsed: Duration) {
         if let Some(current) = self
             .state
@@ -521,6 +580,22 @@ impl ClientPathContext {
         }
     }
 
+    pub(in crate::runtime) fn mark_tcp_path_probe_success_for_instance(
+        &self,
+        index: usize,
+        path_instance_id: CarrierPathInstanceId,
+        elapsed: Duration,
+    ) {
+        self.state
+            .health
+            .lock()
+            .expect("client path health lock")
+            .tcp
+            .get_mut(index)
+            .expect("TCP carrier actor must have one health record")
+            .mark_probe_success_for_instance(path_instance_id, elapsed);
+    }
+
     pub(in crate::runtime) fn should_probe_tcp_path(&self, index: usize) -> bool {
         let now = Instant::now();
         self.state
@@ -531,7 +606,8 @@ impl ClientPathContext {
             .get_mut(index)
             .is_some_and(|record| {
                 record.maintain(now);
-                path_observation_is_idle_for_probe(record.observation_at(now))
+                !record.manual_disabled
+                    && path_observation_is_idle_for_probe(record.observation_at(now))
             })
     }
 
@@ -765,6 +841,22 @@ impl ClientPathContext {
         }
     }
 
+    pub(in crate::runtime) fn mark_tcp_path_probe_failure_for_instance(
+        &self,
+        index: usize,
+        path_instance_id: CarrierPathInstanceId,
+    ) {
+        let now = Instant::now();
+        let mut health = self.state.health.lock().expect("client path health lock");
+        let has_schedulable_alternative =
+            path_records_have_schedulable_alternative(&health.tcp, index, now);
+        health
+            .tcp
+            .get_mut(index)
+            .expect("TCP carrier actor must have one health record")
+            .mark_probe_failure_for_instance(path_instance_id, now, has_schedulable_alternative);
+    }
+
     pub(in crate::runtime) fn mark_udp_path_open_success(&self, index: usize, elapsed: Duration) {
         if let Some(current) = self
             .state
@@ -801,7 +893,8 @@ impl ClientPathContext {
             .get_mut(index)
             .is_some_and(|record| {
                 record.maintain(now);
-                path_observation_is_idle_for_probe(record.observation_at(now))
+                !record.manual_disabled
+                    && path_observation_is_idle_for_probe(record.observation_at(now))
             })
     }
 

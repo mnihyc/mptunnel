@@ -11,6 +11,92 @@ Historical entries below are retained as evidence of the decisions made at
 their recorded time. When a later entry changes an earlier decision, the later
 entry is authoritative.
 
+## 2026-07-31T00:22:00+08:00: configured-minimum TCP group owner accepted
+
+- Name: session-owned TCP configured-minimum lifecycle and retained-patch
+  reflection
+- Category: Product carrier lifecycle, RFC alignment, and Core change control
+- State: configured-minimum ownership is complete; automatic elastic
+  expansion, validation, and contraction remain disconnected
+- Reflection and removals:
+  - retained only the group owner, establishment-policy fence, exact
+    carrier-instance publication, exact-instance probe commit, and durable
+    minimum reconciliation because each closes a reachable ownership race or
+    implements the configured lower bound;
+  - runtime disable is now explicitly suspend/preserve control: it prevents
+    new establishment and placement through group policy and health, but does
+    not manufacture carrier retirement; ordered `PATH_DRAIN` remains reserved
+    for actual removal, bound reduction, replacement, or elastic-candidate
+    retirement;
+  - removed a meaningless watch revision, the duplicate carrier-generation
+    counter and test alias, an impossible probe-mode Boolean, ignored
+    exact-probe result values, a duplicate disabled-success check, and a
+    second impossible management 404;
+  - the group signal is now a coalescing lifecycle notification, management
+    selection is a tagged TCP/UDP identity, and construction mismatches are
+    structural assertions rather than runtime fallbacks; and
+  - no extra timer, source-address identity, actor registry, running flag,
+    platform branch, or Product-stream-owned carrier classification remains.
+- Implemented model:
+  - one client session service reconciles only the immutable
+    configured-minimum member actors; configured maximum capacity remains
+    physically absent and consumes no actor, health record, or scheduler path;
+  - distinct missing minimum members may authenticate concurrently, while one
+    exact actor still serializes one member's connection attempt and wire
+    ownership;
+  - the existing path-probe interval bounds connection-attempt start rate;
+    exact readiness loss wakes reconciliation, so stable loss need not wait for
+    the next periodic tick and authenticate-then-drop churn cannot spin;
+  - endpoint policy generation cancels and rejects stale pre-readiness work,
+    while runtime disable/re-enable preserves exact nonterminal minimum
+    carriers;
+  - authenticated peer usage, exact health identity, and readiness become
+    visible in one health-lock transaction; an old actor can clear the shared
+    readiness cell only with an exact-instance compare-and-exchange; and
+  - cold Product stream admission now publishes that transaction before
+    writing `OPEN_STREAM`, making disable versus admission one linearized
+    decision without repeated policy checks.
+- Persistent acceptance:
+  - one production-service integration scenario proves a `2-3` endpoint
+    materializes exactly two carriers in one `SessionId`, uses distinct
+    `PathId` and carrier identities, replaces one exact stable failure before
+    the next periodic tick, preserves the unaffected instance, carries SOCKS5
+    Product traffic, preserves exact instances across suspend/re-enable,
+    suppresses replacement after disable plus exact native failure, and
+    restores only the minimum after re-enable;
+  - the focused scenario passes in `2.30` seconds;
+  - the complete library gate passes: 1,402 tests, zero failures;
+  - `cargo check --locked --all-targets` passes;
+  - `cargo clippy --locked --all-targets -- -D warnings` passes;
+  - all 198 persistent lab tests pass; and
+  - formatting and whitespace checks pass.
+- Core performance boundary:
+  - no payload framing, connected writer operation, scheduler formula,
+    congestion controller, pacing, recovery, window, queue, transport
+    parameter, carrier range, or RFC timing constant changed;
+  - configured-minimum startup count is unchanged from the former immediate
+    probe behavior, and the configured maximum remains inactive;
+  - all new work is confined to connection, loss, management, and periodic
+    probe control paths; and
+  - no new throughput claim is made by this slice; the corrected representative
+    and inactive-range evidence recorded below remains the current Core
+    authority.
+- Explicit open boundaries:
+  - RFC clauses for elastic reservations, directional validation, removal and
+    bound-change drain, and bounded carrierless retention are prospective
+    acceptance for the next lifecycle step, not claims about this source;
+  - reflection exposed a broader existing conformance gap: a received
+    `SESSION_CLOSE` currently retires the carrier but may let the same
+    `ClientPathContext` reconnect with the same `SessionId`; session-terminal
+    ownership must be corrected in the later session/disruption lifecycle
+    step; and
+  - MPP v5 elastic carrier-control frames remain runtime-unconsumed and must be
+    connected by the coherent elastic lifecycle or removed before release.
+- Next: implement the one session-direction aggregate elastic lifecycle,
+  including bounded reservation and ordered contraction, without changing the
+  proven Core; then require the causal TCP-QoS cohort and representative
+  no-regression matrix before retaining it.
+
 ## 2026-07-30T22:39:23+08:00: corrected inactive-range gate passed
 
 - Name: valid TCP QoS fixture and exact QUIC datagram terminal state

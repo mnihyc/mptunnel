@@ -7,7 +7,7 @@ use crate::ingress::socks5::{self, Socks5Error, Socks5Reply};
 use crate::ingress::{
     LocalIngressAdmissionConfig, ProxyAuthConfig, TcpForwardConfig, UdpForwardConfig,
 };
-use crate::model::path::RelayPathKey;
+use crate::model::path::{CarrierPathInstanceId, RelayPathKey};
 use crate::mux::MuxLimits;
 #[cfg(test)]
 use crate::performance::MppPerformanceConfig;
@@ -1389,24 +1389,53 @@ impl Socks5UdpPeerBinding {
     }
 }
 
+#[cfg(test)]
 pub(super) async fn probe_tcp_client_path(
     context: &ClientPathContext,
     path_index: usize,
     timeout: Duration,
-) -> Result<Duration, RuntimeError> {
-    let durable_path_session = context
-        .tcp_sessions
-        .get(path_index)
-        .ok_or(RuntimeError::NoSchedulableTcpPath)?;
+) -> Option<ReadyTcpPathProbe> {
+    let durable_path_session = context.tcp_sessions.get(path_index)?;
     let probe_deadline = tokio::time::Instant::now() + timeout;
     // Retain the first authenticated carrier. Later probes stay isolated from
     // live product streams, matching the QUIC path lifecycle.
-    if let Some(rtt) = durable_path_session
+    match durable_path_session
         .prepare_connection(probe_deadline)
-        .await?
+        .await
     {
-        return Ok(rtt);
+        Ok(Some(_)) | Err(_) => None,
+        Ok(None) => probe_ready_tcp_client_path(context, path_index, timeout).await,
     }
+}
+
+pub(super) struct ReadyTcpPathProbe {
+    pub(super) path_instance_id: CarrierPathInstanceId,
+    pub(super) result: Result<Duration, RuntimeError>,
+}
+
+/// Measures a TCP endpoint only while its configured-minimum carrier is live.
+/// The exact instance lets the health transaction discard an observation that
+/// raced carrier replacement.
+pub(super) async fn probe_ready_tcp_client_path(
+    context: &ClientPathContext,
+    path_index: usize,
+    timeout: Duration,
+) -> Option<ReadyTcpPathProbe> {
+    let session = context.tcp_sessions.get(path_index)?;
+    let path_instance_id = session.connection_instance_id()?;
+    let probe_deadline = tokio::time::Instant::now() + timeout;
+    let result = probe_isolated_tcp_client_path(context, path_index, probe_deadline).await;
+    Some(ReadyTcpPathProbe {
+        path_instance_id,
+        result,
+    })
+}
+
+async fn probe_isolated_tcp_client_path(
+    context: &ClientPathContext,
+    path_index: usize,
+    probe_deadline: tokio::time::Instant,
+) -> Result<Duration, RuntimeError> {
     let path = context
         .tcp_paths
         .get(path_index)

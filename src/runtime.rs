@@ -108,6 +108,8 @@ use ingress_runtime::*;
 #[cfg(test)]
 use node::probe_paths as probe_client_paths;
 #[cfg(test)]
+use node::run_path_probe_service as run_client_path_service;
+#[cfg(test)]
 use node::server::run as run_server;
 #[cfg(test)]
 use path::tcp::client::*;

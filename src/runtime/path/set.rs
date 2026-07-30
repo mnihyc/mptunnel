@@ -11,6 +11,7 @@ use super::state::ClientPathState;
 use super::tcp::client::{
     ClientTcpPathSessionHandle, ClientTcpPathSessionRuntime, tcp_session_command_queue,
 };
+use super::tcp::group::{ClientTcpCarrierGroup, ClientTcpCarrierGroups};
 use crate::config::{ClientPathConfig, ClientSecurityConfig};
 #[cfg(test)]
 use crate::ingress::ProxyAuthConfig;
@@ -33,7 +34,7 @@ use crate::runtime::telemetry::{RuntimeTelemetrySnapshot, active_flow_detail_cap
 #[cfg(test)]
 use crate::transport::SystemCarrierNetworkProvider;
 use crate::transport::encrypted::TcpClientTlsConfig;
-use crate::transport::{CarrierNetworkProvider, CarrierPathIdentity, PathSpec, TcpCarrierRange};
+use crate::transport::{CarrierNetworkProvider, CarrierPathIdentity, PathSpec};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -43,13 +44,6 @@ pub(in crate::runtime) struct ClientPathRuntimeOptions {
     pub(in crate::runtime) path_group_ordinal: usize,
     pub(in crate::runtime) carrier_network: Arc<dyn CarrierNetworkProvider>,
     pub(in crate::runtime) allow_peer_diagnostics: bool,
-}
-
-#[derive(Debug)]
-pub(in crate::runtime) struct ClientTcpEndpointTopology {
-    pub(in crate::runtime) config_index: usize,
-    pub(in crate::runtime) range: TcpCarrierRange,
-    pub(in crate::runtime) members: Vec<usize>,
 }
 
 #[derive(Clone)]
@@ -70,7 +64,7 @@ pub struct ClientPathContext {
     pub(in crate::runtime) tcp_path_ordinals: Arc<Vec<usize>>,
     pub(in crate::runtime) tcp_config_indices: Arc<Vec<usize>>,
     pub(in crate::runtime) tcp_member_ordinals: Arc<Vec<u16>>,
-    pub(in crate::runtime) tcp_endpoint_topology: Arc<Vec<ClientTcpEndpointTopology>>,
+    pub(in crate::runtime) tcp_carrier_groups: Arc<ClientTcpCarrierGroups>,
     pub(in crate::runtime) udp_path_ordinals: Arc<Vec<usize>>,
     pub(in crate::runtime) path_group_ordinal: usize,
     pub(in crate::runtime) tcp_security: Arc<Vec<ClientSecurityConfig>>,
@@ -255,26 +249,27 @@ impl ClientPathContext {
         let mut tcp_paths = tcp_config_paths.clone();
         let mut tcp_config_indices = (0..tcp_config_paths.len()).collect::<Vec<_>>();
         let mut tcp_member_ordinals = vec![0_u16; tcp_config_paths.len()];
-        let mut tcp_endpoint_topology = tcp_config_paths
+        let mut tcp_carrier_groups = tcp_config_paths
             .iter()
             .enumerate()
-            .map(|(config_index, path)| ClientTcpEndpointTopology {
-                config_index,
-                range: path
-                    .tcp_carrier_range()
-                    .expect("TCP configuration has TCP carrier bounds"),
-                members: vec![config_index],
+            .map(|(config_index, path)| {
+                ClientTcpCarrierGroup::new(
+                    config_index,
+                    path.tcp_carrier_range()
+                        .expect("TCP configuration has TCP carrier bounds"),
+                    vec![config_index],
+                )
             })
             .collect::<Vec<_>>();
-        for endpoint in &mut tcp_endpoint_topology {
-            for member_ordinal in 1..endpoint.range.min() {
+        for group in &mut tcp_carrier_groups {
+            for member_ordinal in 1..group.range.min() {
                 let path_index = tcp_paths.len();
-                tcp_paths.push(tcp_config_paths[endpoint.config_index].clone());
-                tcp_path_names.push(configured_tcp_path_names[endpoint.config_index].clone());
-                tcp_path_ordinals.push(configured_tcp_path_ordinals[endpoint.config_index]);
-                tcp_config_indices.push(endpoint.config_index);
+                tcp_paths.push(tcp_config_paths[group.config_index].clone());
+                tcp_path_names.push(configured_tcp_path_names[group.config_index].clone());
+                tcp_path_ordinals.push(configured_tcp_path_ordinals[group.config_index]);
+                tcp_config_indices.push(group.config_index);
                 tcp_member_ordinals.push(member_ordinal);
-                endpoint.members.push(path_index);
+                group.members.push(path_index);
             }
         }
 
@@ -286,7 +281,7 @@ impl ClientPathContext {
         let tcp_path_ordinals = Arc::new(tcp_path_ordinals);
         let tcp_config_indices = Arc::new(tcp_config_indices);
         let tcp_member_ordinals = Arc::new(tcp_member_ordinals);
-        let tcp_endpoint_topology = Arc::new(tcp_endpoint_topology);
+        let tcp_carrier_groups = ClientTcpCarrierGroups::new(tcp_carrier_groups);
         let tcp_security = Arc::new(tcp_security);
         let tcp_tls = Arc::new(tcp_tls);
         let udp_paths = Arc::new(udp_paths);
@@ -319,6 +314,9 @@ impl ClientPathContext {
         let tcp_sessions = (0..tcp_paths.len())
             .map(|path_index| {
                 let config_index = tcp_config_indices[path_index];
+                let endpoint_policy = tcp_carrier_groups
+                    .endpoint_policy(config_index)
+                    .expect("TCP carrier group must own endpoint policy");
                 ClientTcpPathSessionHandle::new(ClientTcpPathSessionRuntime {
                     paths: tcp_config_paths.clone(),
                     config_index,
@@ -341,6 +339,8 @@ impl ClientPathContext {
                     carrier_network: carrier_network.clone(),
                     peer_status: peer_status.clone(),
                     peer_status_snapshot: peer_status_snapshot.clone(),
+                    endpoint_policy,
+                    carrier_groups: tcp_carrier_groups.clone(),
                 })
             })
             .collect::<Vec<_>>();
@@ -380,7 +380,7 @@ impl ClientPathContext {
             tcp_path_ordinals,
             tcp_config_indices,
             tcp_member_ordinals,
-            tcp_endpoint_topology,
+            tcp_carrier_groups,
             udp_path_ordinals,
             path_group_ordinal,
             tcp_security,
@@ -440,18 +440,18 @@ impl ClientPathContext {
     pub(in crate::runtime) fn tcp_endpoint(
         &self,
         config_index: usize,
-    ) -> Option<&ClientTcpEndpointTopology> {
-        self.tcp_endpoint_topology.get(config_index)
+    ) -> Option<&ClientTcpCarrierGroup> {
+        self.tcp_carrier_groups.get(config_index)
     }
 
     pub(in crate::runtime) fn configured_tcp_endpoint_count(&self) -> usize {
-        self.tcp_endpoint_topology.len()
+        self.tcp_carrier_groups.len()
     }
 
     pub(in crate::runtime) fn tcp_endpoint_for_path(
         &self,
         path_index: usize,
-    ) -> Option<&ClientTcpEndpointTopology> {
+    ) -> Option<&ClientTcpCarrierGroup> {
         self.tcp_config_index(path_index)
             .and_then(|config_index| self.tcp_endpoint(config_index))
     }

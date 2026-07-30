@@ -205,12 +205,13 @@ impl Drop for TcpCapacityProbeCommand {
 pub(in crate::runtime) enum ReliablePathCommand {
     PrepareConnection {
         open_deadline: tokio::time::Instant,
+        endpoint_generation: u64,
         response: oneshot::Sender<Result<Option<Duration>, RuntimeError>>,
     },
     OpenStream {
         stream_id: StreamId,
         attempt_id: ClientTcpOpenAttemptId,
-        observed_carrier_generation: u64,
+        observed_carrier_instance: u64,
         target: TargetAddr,
         lane: TrafficClass,
         advertised_recv_max_offset: u64,
@@ -284,12 +285,12 @@ impl ClientTcpOpenDeadlines {
         }
     }
 
-    pub(in crate::runtime) fn for_carrier_generation(
+    pub(in crate::runtime) fn for_carrier_instance(
         self,
-        observed_generation: u64,
-        current_generation: u64,
+        observed_instance: u64,
+        current_instance: u64,
     ) -> tokio::time::Instant {
-        if observed_generation != 0 && observed_generation == current_generation {
+        if observed_instance != 0 && observed_instance == current_instance {
             self.live
         } else {
             self.setup

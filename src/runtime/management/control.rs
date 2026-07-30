@@ -6,9 +6,10 @@
 use super::ManagementTarget;
 use super::http::ManagementHttpError;
 use super::projection::peer_status_result;
-use crate::protocol::{SessionId, UnderlayProtocol};
+use crate::protocol::SessionId;
 use crate::runtime::path::ClientPathContext;
 use crate::runtime::path::model::path_record_failure_cooldown;
+use crate::runtime::path::tcp::group::ClientTcpEndpointControlState;
 use crate::runtime::peer_status::{PeerStatusBroker, PeerStatusRequestError};
 use crate::scheduler::PathState as SchedulerPathState;
 use serde::Deserialize;
@@ -104,9 +105,9 @@ enum PathControlState {
 }
 
 #[derive(Debug)]
-struct ClientPathSelection {
-    underlay: UnderlayProtocol,
-    indices: Vec<usize>,
+enum ClientPathSelection {
+    Tcp { config_index: usize },
+    Udp { index: usize },
 }
 
 fn select_client_path(
@@ -114,7 +115,7 @@ fn select_client_path(
     path: &str,
 ) -> Result<ClientPathSelection, ManagementHttpError> {
     let mut selected = None;
-    for endpoint in context.tcp_endpoint_topology.iter() {
+    for endpoint in context.tcp_carrier_groups.iter() {
         if context
             .tcp_path_names
             .get(endpoint.config_index)
@@ -127,9 +128,8 @@ fn select_client_path(
                     "path name is ambiguous within the outbound",
                 ));
             }
-            selected = Some(ClientPathSelection {
-                underlay: UnderlayProtocol::Tcp,
-                indices: endpoint.members.clone(),
+            selected = Some(ClientPathSelection::Tcp {
+                config_index: endpoint.config_index,
             });
         }
     }
@@ -142,10 +142,7 @@ fn select_client_path(
                     "path name is ambiguous within the outbound",
                 ));
             }
-            selected = Some(ClientPathSelection {
-                underlay: UnderlayProtocol::Udp,
-                indices: vec![index],
-            });
+            selected = Some(ClientPathSelection::Udp { index });
         }
     }
     selected.ok_or_else(|| {
@@ -176,49 +173,46 @@ fn set_client_path_state(
     selection: &ClientPathSelection,
     state: PathControlState,
 ) -> Result<(), ManagementHttpError> {
+    let index = match *selection {
+        ClientPathSelection::Tcp { config_index } => {
+            let state = match state {
+                PathControlState::Enabled => ClientTcpEndpointControlState::Enabled,
+                PathControlState::Suspect => ClientTcpEndpointControlState::Suspect,
+                PathControlState::Failed => ClientTcpEndpointControlState::Failed,
+                PathControlState::Disabled => ClientTcpEndpointControlState::Disabled,
+            };
+            context.set_tcp_endpoint_control(config_index, state);
+            return Ok(());
+        }
+        ClientPathSelection::Udp { index } => index,
+    };
     let mut health = context
         .health()
         .lock()
         .expect("client path health management lock");
-    let records = match selection.underlay {
-        UnderlayProtocol::Tcp => &mut health.tcp,
-        UnderlayProtocol::Udp => &mut health.udp,
-    };
-    if selection
-        .indices
-        .iter()
-        .any(|index| records.get(*index).is_none())
-    {
-        return Err(ManagementHttpError::new(
-            404,
-            "Not Found",
-            "path runtime state is unavailable",
-        ));
-    }
+    let records = &mut health.udp;
+    let record = records
+        .get_mut(index)
+        .expect("configured UDP path must have one health record");
     let now = Instant::now();
-    for index in &selection.indices {
-        let record = records
-            .get_mut(*index)
-            .expect("validated path runtime state");
-        record.invalidate_path_proofs();
-        match state {
-            PathControlState::Enabled | PathControlState::Suspect => {
-                record.manual_disabled = false;
-                record.state = SchedulerPathState::Suspect;
-                record.failed_until = None;
-            }
-            PathControlState::Failed => {
-                record.manual_disabled = false;
-                record.state = SchedulerPathState::Failed;
-                record.failed_until = Some(now + path_record_failure_cooldown(record));
-            }
-            PathControlState::Disabled => {
-                record.manual_disabled = true;
-                record.state = SchedulerPathState::Failed;
-                record.failed_until = None;
-                record.relay_bytes_in_flight = 0;
-                record.relay_queue_bytes = 0;
-            }
+    record.invalidate_path_proofs();
+    match state {
+        PathControlState::Enabled | PathControlState::Suspect => {
+            record.manual_disabled = false;
+            record.state = SchedulerPathState::Suspect;
+            record.failed_until = None;
+        }
+        PathControlState::Failed => {
+            record.manual_disabled = false;
+            record.state = SchedulerPathState::Failed;
+            record.failed_until = Some(now + path_record_failure_cooldown(record));
+        }
+        PathControlState::Disabled => {
+            record.manual_disabled = true;
+            record.state = SchedulerPathState::Failed;
+            record.failed_until = None;
+            record.relay_bytes_in_flight = 0;
+            record.relay_queue_bytes = 0;
         }
     }
     Ok(())

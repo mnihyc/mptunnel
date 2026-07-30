@@ -13,7 +13,49 @@ class ManagementSnapshotTests(unittest.TestCase):
     def test_container_snapshot_parses_management_and_interfaces(self):
         payload = {
             "interfaces": {"eth0": {"ipv4": "172.31.10.10", "tx_bytes": 42}},
-            "management": {"paths": [{"index": 0, "delivery_samples": 3}]},
+            "management": {
+                "schema": "mptunnel.management.v5",
+                "role": "client",
+                "summary": {
+                    "path_count": 1,
+                    "active_paths": 1,
+                    "active_flows": 1,
+                },
+                "traffic": {
+                    "rates": {
+                        "to_peer_bps": "12000000",
+                        "from_peer_bps": "0",
+                    }
+                },
+                "paths": [
+                    {
+                        "service": "mpp_outbound",
+                        "service_index": 0,
+                        "path": "primary",
+                        "underlay": "tcp",
+                        "tcp_carrier_ordinal": 1,
+                        "state": "active",
+                        "delivery_samples": 3,
+                    }
+                ],
+                "sessions": [
+                    {
+                        "service": "mpp_outbound",
+                        "service_index": 0,
+                        "session_id": "17",
+                        "state": "active",
+                        "carrier_count": 1,
+                    }
+                ],
+                "flows": [
+                    {
+                        "session_id": "17",
+                        "flow_kind": "reliable",
+                        "flow_id": "23",
+                        "network": "tcp",
+                    }
+                ],
+            },
         }
         completed = subprocess.CompletedProcess(
             ["docker"], 0, stdout=json.dumps(payload), stderr=""
@@ -28,7 +70,8 @@ class ManagementSnapshotTests(unittest.TestCase):
 
         self.assertEqual(snapshot, payload)
         command = run_mock.call_args.args[0]
-        self.assertIn("/api/diagnostics", command[5])
+        self.assertIn("/api/v2/status", command[5])
+        self.assertIn("mptunnel.management.v5", command[5])
         self.assertIn("Authorization", command[5])
         self.assertEqual(command[-2:], ["17600", "lab-management-token"])
 
@@ -73,6 +116,13 @@ class ManagementSnapshotTests(unittest.TestCase):
         self.assertEqual(result, 0)
         self.assertEqual([row["service"] for row in rows], ["client", "server"])
         self.assertEqual(rows[0]["management"]["role"], "client-id")
+        for row in rows:
+            self.assertIsInstance(row["sample_started_monotonic_ns"], int)
+            self.assertIsInstance(row["sample_finished_monotonic_ns"], int)
+            self.assertLessEqual(
+                row["sample_started_monotonic_ns"],
+                row["sample_finished_monotonic_ns"],
+            )
 
 
 if __name__ == "__main__":

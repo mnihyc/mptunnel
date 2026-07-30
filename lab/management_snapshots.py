@@ -56,11 +56,32 @@ with open("/proc/net/dev", encoding="ascii") as handle:
 result = {"interfaces": interfaces}
 try:
     request = urllib.request.Request(
-        f"http://127.0.0.1:{int(sys.argv[1])}/api/diagnostics",
+        f"http://127.0.0.1:{int(sys.argv[1])}/api/v2/status",
         headers={"Authorization": f"Bearer {sys.argv[2]}"},
     )
     with urllib.request.urlopen(request, timeout=2.0) as response:
-        result["management"] = json.load(response)
+        status = json.load(response)
+    if not isinstance(status, dict):
+        raise ValueError("management status is not a JSON object")
+    if status.get("schema") != "mptunnel.management.v5":
+        raise ValueError(
+            f"unexpected management status schema: {status.get('schema')!r}"
+        )
+    expected_fields = {
+        "role": str,
+        "summary": dict,
+        "traffic": dict,
+        "paths": list,
+        "sessions": list,
+        "flows": list,
+    }
+    for field, expected_type in expected_fields.items():
+        if not isinstance(status.get(field), expected_type):
+            raise ValueError(
+                f"management status field {field!r} is not "
+                f"{expected_type.__name__}"
+            )
+    result["management"] = status
 except Exception as error:
     result["management_error"] = f"{type(error).__name__}: {error}"
 
@@ -159,13 +180,17 @@ def sample(args: argparse.Namespace) -> int:
             for service, container_id in ids.items():
                 if should_stop():
                     break
+                sample_started_monotonic_ns = time.monotonic_ns()
                 payload = container_snapshot(container_id, args.port, args.token)
+                sample_finished_monotonic_ns = time.monotonic_ns()
                 if payload is None:
                     continue
                 row = {
                     "case": args.case,
                     "ts": utc_now(),
                     "t_mono_ms": int((time.monotonic() - started_at) * 1000),
+                    "sample_started_monotonic_ns": sample_started_monotonic_ns,
+                    "sample_finished_monotonic_ns": sample_finished_monotonic_ns,
                     "service": service,
                     "container_id": container_id[:12],
                     **payload,

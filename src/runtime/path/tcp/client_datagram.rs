@@ -410,6 +410,14 @@ impl ClientTcpDatagramState {
             .collect()
     }
 
+    pub(super) fn flow_ids(&self) -> Vec<DatagramFlowId> {
+        self.flows.keys().copied().collect()
+    }
+
+    pub(super) fn is_empty(&self) -> bool {
+        self.attachments.is_empty() && self.flows.is_empty()
+    }
+
     pub(super) fn remove_attachment(&mut self, attachment_id: u64) {
         self.attachments.remove(&attachment_id);
         let flow_ids = self.attachment_flow_ids(attachment_id);

@@ -20,7 +20,7 @@ use crate::runtime::path::commands::{
     ReliablePathCommandSender, reliable_path_command_channels, reliable_path_command_queue,
 };
 use crate::scheduler::TrafficClass;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use tokio::sync::oneshot;
@@ -36,6 +36,7 @@ pub(in crate::runtime) struct ClientTcpPathSessionHandle {
 #[derive(Clone)]
 struct ClientTcpPathSessionSlot {
     commands: ReliablePathCommandSender,
+    terminal: Arc<AtomicBool>,
 }
 
 impl std::fmt::Debug for ClientTcpPathSessionHandle {
@@ -72,7 +73,7 @@ impl ClientTcpPathSessionHandle {
         open_deadlines: ClientTcpOpenDeadlines,
         advertised_recv_max_offset: u64,
     ) -> Result<ClientTcpOpenedStream, RuntimeError> {
-        let session = self.ensure_session_slot();
+        let session = self.ensure_session_slot()?;
         let commands = session.commands.clone();
         let observed_carrier_instance = self.ready_carrier_instance.load(Ordering::Acquire);
         let (response_tx, response_rx) = oneshot::channel();
@@ -133,7 +134,7 @@ impl ClientTcpPathSessionHandle {
         open_deadline: tokio::time::Instant,
         frame_queue: usize,
     ) -> Result<ClientTcpDatagramAttachment, RuntimeError> {
-        let session = self.ensure_session_slot();
+        let session = self.ensure_session_slot()?;
         let commands = session.commands.clone();
         let channels = ClientTcpDatagramAttachment::channel(frame_queue);
         let attachment_id = channels.attachment_id;
@@ -198,7 +199,7 @@ impl ClientTcpPathSessionHandle {
         if !self.runtime.endpoint_policy.allows(endpoint_generation) {
             return Err(RuntimeError::NoSchedulableTcpPath);
         }
-        let session = self.ensure_session_slot();
+        let session = self.ensure_session_slot_for_endpoint_generation(endpoint_generation)?;
         let commands = session.commands.clone();
         let (response_tx, response_rx) = oneshot::channel();
         tokio::select! {
@@ -234,23 +235,49 @@ impl ClientTcpPathSessionHandle {
         }
     }
 
-    fn ensure_session_slot(&self) -> ClientTcpPathSessionSlot {
-        let mut current = self.commands.lock().expect("TCP path session lock");
+    pub(in crate::runtime) fn begin_path_drain(&self) {
+        self.ready_carrier_instance.store(0, Ordering::Release);
+        let current = self.commands.lock().expect("TCP path session lock");
         if let Some(session) = current.as_ref()
-            && !session.commands.is_closed()
+            && !session.terminal.load(Ordering::Acquire)
         {
-            return session.clone();
+            session.commands.begin_path_drain();
         }
+    }
 
-        let (commands, receivers) = reliable_path_command_channels(self.runtime.command_queue);
-        tokio::spawn(run_client_tcp_path_session(
-            self.runtime.clone(),
-            receivers,
-            self.ready_carrier_instance.clone(),
-        ));
-        let session = ClientTcpPathSessionSlot { commands };
-        *current = Some(session.clone());
-        session
+    fn ensure_session_slot(&self) -> Result<ClientTcpPathSessionSlot, RuntimeError> {
+        let endpoint_generation = self.runtime.endpoint_policy.snapshot().generation;
+        self.ensure_session_slot_for_endpoint_generation(endpoint_generation)
+    }
+
+    fn ensure_session_slot_for_endpoint_generation(
+        &self,
+        endpoint_generation: u64,
+    ) -> Result<ClientTcpPathSessionSlot, RuntimeError> {
+        self.runtime
+            .endpoint_policy
+            .with_current(endpoint_generation, || {
+                let mut current = self.commands.lock().expect("TCP path session lock");
+                if let Some(session) = current.as_ref()
+                    && !session.terminal.load(Ordering::Acquire)
+                {
+                    return session.clone();
+                }
+
+                let (commands, receivers) =
+                    reliable_path_command_channels(self.runtime.command_queue);
+                let terminal = Arc::new(AtomicBool::new(false));
+                tokio::spawn(run_client_tcp_path_session(
+                    self.runtime.clone(),
+                    receivers,
+                    self.ready_carrier_instance.clone(),
+                    terminal.clone(),
+                ));
+                let session = ClientTcpPathSessionSlot { commands, terminal };
+                *current = Some(session.clone());
+                session
+            })
+            .ok_or(RuntimeError::NoSchedulableTcpPath)
     }
 }
 

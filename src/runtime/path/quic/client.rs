@@ -23,10 +23,8 @@ use crate::protocol::{
     UnderlayProtocol,
 };
 use crate::runtime::error::RuntimeError;
-use crate::runtime::identity::random_session_id;
 use crate::runtime::path::authentication::ClientPathAuthenticationFrames;
 use crate::runtime::path::commands::reliable_path_command_channels;
-use crate::runtime::path::health::{ClientPathHealth, ClientPathHealthRecord};
 use crate::runtime::path::model::path_startup_snapshot;
 use crate::runtime::path::ports::OpenedReliableCarrierStream;
 use crate::runtime::path::state::ClientPathState;
@@ -86,18 +84,6 @@ impl ClientUdpPathSessionHandle {
             runtime,
             connection: Arc::new(AsyncMutex::new(None)),
         }
-    }
-
-    pub(in crate::runtime) fn transient_probe(&self) -> Result<Self, RuntimeError> {
-        let mut runtime = self.runtime.clone();
-        runtime.session_id = random_session_id()?;
-        runtime.state = ClientPathState::new(ClientPathHealth {
-            tcp: Vec::new(),
-            udp: vec![ClientPathHealthRecord::default(); runtime.paths.len()],
-        });
-        runtime.peer_status = PeerStatusBroker::new(false);
-        runtime.peer_status_snapshot = PeerStatusSnapshotSource::new(Vec::new);
-        Ok(Self::new(runtime))
     }
 
     pub(in crate::runtime) async fn prepare_connection(
@@ -808,7 +794,7 @@ async fn open_client_udp_stream_on_connection(
         receivers,
         frames_tx,
     ));
-    let mut startup = path_startup_snapshot(runtime.path(), runtime.path_index);
+    let mut startup = path_startup_snapshot(runtime.path(), PathId(runtime.path_index as u16));
     startup.peer_usage = runtime
         .state
         .peer_path_usage(UnderlayProtocol::Udp, runtime.path_index);

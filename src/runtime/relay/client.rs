@@ -102,14 +102,14 @@ impl ClientRelayDisconnectedState {
 #[derive(Default)]
 pub(super) struct ClientRelayDeliveryState {
     pub(super) total: PathDeliveryStats,
-    pub(super) by_path: HashMap<RelayPathKey, PathDeliveryStats>,
-    next_live_sample_bytes: HashMap<RelayPathKey, u64>,
+    pub(super) by_path: HashMap<RelayPathInstance, PathDeliveryStats>,
+    next_live_sample_bytes: HashMap<RelayPathInstance, u64>,
 }
 
 impl ClientRelayDeliveryState {
     fn record_response(
         &mut self,
-        path_key: RelayPathKey,
+        instance: RelayPathInstance,
         delivered: &[Bytes],
         path_scoped_received_bytes: usize,
     ) -> usize {
@@ -121,7 +121,7 @@ impl ClientRelayDeliveryState {
         let path_scoped_delivered_bytes = path_scoped_received_bytes.min(delivered_payload_bytes);
         if path_scoped_delivered_bytes > 0 {
             self.by_path
-                .entry(path_key)
+                .entry(instance)
                 .or_default()
                 .record_payload_bytes(path_scoped_delivered_bytes);
         }
@@ -238,17 +238,17 @@ impl ClientRelayState {
     fn record_delivery(
         &mut self,
         context: &ClientPathContext,
-        path_key: RelayPathKey,
+        instance: RelayPathInstance,
         delivered: &[Bytes],
         path_scoped_received_bytes: usize,
     ) -> usize {
         let delivered_payload_bytes =
             self.delivery
-                .record_response(path_key, delivered, path_scoped_received_bytes);
-        if let Some(path_stats) = self.delivery.by_path.get(&path_key).copied() {
+                .record_response(instance, delivered, path_scoped_received_bytes);
+        if let Some(path_stats) = self.delivery.by_path.get(&instance).copied() {
             maybe_mark_live_relay_path_delivery(
                 context,
-                path_key,
+                instance,
                 path_stats,
                 &mut self.delivery.next_live_sample_bytes,
             );
@@ -274,10 +274,11 @@ pub(super) fn apply_client_stream_data_state(
     context: &ClientPathContext,
     recv_stream: &mut ReliableRecvStream,
     stream_id: StreamId,
-    path_key: RelayPathKey,
+    instance: RelayPathInstance,
     offset: u64,
     payload: Bytes,
 ) -> Result<(ClientStreamDataEffect, ReceiveOutcome), RuntimeError> {
+    let path_key = instance.key;
     #[cfg(not(feature = "lab-diagnostics"))]
     let _ = stream_id;
     let previous_remote_offset = recv_stream.next_offset();
@@ -336,7 +337,7 @@ pub(super) fn apply_client_stream_data_state(
     let delivered = &outcome.delivered;
     let delivered_payload_bytes = state.record_delivery(
         context,
-        path_key,
+        instance,
         delivered.as_slice(),
         if delivered_progress { payload_len } else { 0 },
     );

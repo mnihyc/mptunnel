@@ -66,6 +66,8 @@ pub(in crate::runtime) struct ClientTcpPathSessionRuntime {
     pub(in crate::runtime) paths: Arc<Vec<PathSpec>>,
     pub(in crate::runtime) config_index: usize,
     pub(in crate::runtime) path_index: usize,
+    pub(in crate::runtime) path_id: PathId,
+    pub(in crate::runtime) purpose: crate::protocol::PathPurpose,
     pub(in crate::runtime) carrier_identity: CarrierPathIdentity,
     pub(in crate::runtime) session_id: SessionId,
     pub(in crate::runtime) security: Arc<Vec<ClientSecurityConfig>>,
@@ -75,6 +77,7 @@ pub(in crate::runtime) struct ClientTcpPathSessionRuntime {
     pub(in crate::runtime) command_queue: usize,
     pub(in crate::runtime) stream_frame_queue: usize,
     pub(in crate::runtime) closed_stream_cache_capacity: usize,
+    pub(in crate::runtime) session_retention_timeout: std::time::Duration,
     pub(in crate::runtime) state: Arc<ClientPathState>,
     pub(in crate::runtime) carrier_network: Arc<dyn CarrierNetworkProvider>,
     pub(in crate::runtime) peer_status: PeerStatusBroker,
@@ -107,13 +110,12 @@ impl ClientTcpPathSessionRuntime {
         connection: &mut ClientTcpPathConnection,
         force: bool,
     ) {
-        let path_id = PathId(self.path_index as u16);
         let Some(observation) = connection
             .carrier
             .tcp_metrics
             .as_mut()
             .and_then(|publisher| {
-                publisher.maybe_observe(path_id, PathMetricDirection::ClientToServer, force)
+                publisher.maybe_observe(self.path_id, PathMetricDirection::ClientToServer, force)
             })
         else {
             return;
@@ -214,6 +216,12 @@ impl ClientTcpCapacityState {
         self.discarded_request_receipt = Some(DiscardedClientTcpCapacityReceipt::from_probe(
             &pending.probe,
         ));
+    }
+
+    pub(super) fn is_idle(&self) -> bool {
+        self.request_probe.is_none()
+            && self.discarded_request_receipt.is_none()
+            && self.receive.is_idle()
     }
 
     pub(super) fn record_received_data(

@@ -149,7 +149,8 @@ mptunnel --credential-id home-2026 \
 The client now exposes SOCKS5 on `127.0.0.1:1080` and HTTP CONNECT on
 `127.0.0.1:8080`. TCP and UDP listeners can share a numeric port because
 they are separate transports. Established logical streams are retained for
-five minutes when every carrier is unavailable; change that policy with
+five minutes when every carrier is unavailable. The same absolute ceiling
+bounds graceful TCP carrier retirement; change it with
 `--session-retention-timeout-ms` or `[session].retention_timeout_ms`.
 
 Advanced outbound carrier paths may use an inclusive port interval such as

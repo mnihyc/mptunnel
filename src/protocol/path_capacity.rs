@@ -86,6 +86,14 @@ impl CapacityReceiveTracker {
         }
         Ok(received_bytes)
     }
+
+    pub(crate) fn cancel_for_path_drain(&mut self) {
+        self.active = None;
+    }
+
+    pub(crate) fn is_idle(&self) -> bool {
+        self.active.is_none()
+    }
 }
 
 #[cfg(test)]

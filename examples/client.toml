@@ -13,7 +13,7 @@ principal_id = "home"
 secret = { from = "file", path = "mpp-credential.key" }
 
 [session]
-# Retain established proxy/TUN streams across a complete carrier outage.
+# Retain streams across outage and bound graceful TCP carrier retirement.
 retention_timeout_ms = 300000
 
 [dns]

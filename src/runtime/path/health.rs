@@ -156,17 +156,46 @@ impl ClientPathHealthRecord {
         usage: PathUsage,
     ) {
         if self.path_instance_id != Some(path_instance_id) {
-            self.data_plane_failure_instance_id = None;
-            if self.path_instance_id.is_some() {
-                self.clear_native_carrier_state();
-                self.tcp_capacity.reset_after_data_plane_failure();
-                self.invalidate_path_proofs();
-            }
+            self.clear_physical_carrier_state();
         }
         self.path_instance_id = Some(path_instance_id);
         self.peer_usage_sequence = Some(sequence);
         self.peer_usage = Some(usage);
         self.mark_liveness_success();
+    }
+
+    pub(in crate::runtime) fn begin_planned_retirement(&mut self) {
+        if self.path_instance_id.is_some() && self.state != SchedulerPathState::Draining {
+            self.state = SchedulerPathState::Draining;
+            self.failed_until = None;
+            self.invalidate_path_proofs();
+        }
+    }
+
+    pub(in crate::runtime) fn begin_planned_instance_retirement(
+        &mut self,
+        path_instance_id: CarrierPathInstanceId,
+    ) -> bool {
+        if self.path_instance_id != Some(path_instance_id) {
+            return false;
+        }
+        self.begin_planned_retirement();
+        true
+    }
+
+    pub(in crate::runtime) fn retire_planned_instance(
+        &mut self,
+        path_instance_id: CarrierPathInstanceId,
+    ) -> bool {
+        if self.path_instance_id != Some(path_instance_id) {
+            return false;
+        }
+        self.clear_physical_carrier_state();
+        true
+    }
+
+    pub(in crate::runtime) fn has_physical_carrier(&self) -> bool {
+        self.path_instance_id.is_some()
     }
 
     pub(in crate::runtime) fn update_peer_usage(
@@ -388,29 +417,6 @@ impl ClientPathHealthRecord {
         });
     }
 
-    pub(in crate::runtime) fn mark_probe_success_for_instance(
-        &mut self,
-        path_instance_id: CarrierPathInstanceId,
-        elapsed: Duration,
-    ) {
-        if !self.accepts_native_carrier_observation(path_instance_id) {
-            return;
-        }
-        self.record_success(elapsed);
-    }
-
-    pub(in crate::runtime) fn mark_probe_failure_for_instance(
-        &mut self,
-        path_instance_id: CarrierPathInstanceId,
-        now: Instant,
-        has_schedulable_alternative: bool,
-    ) {
-        if !self.accepts_native_carrier_observation(path_instance_id) {
-            return;
-        }
-        self.mark_failure(now, has_schedulable_alternative);
-    }
-
     pub(in crate::runtime) fn mark_path_proof_success(
         &mut self,
         observation: PathProofObservation,
@@ -568,6 +574,16 @@ impl ClientPathHealthRecord {
         self.measured_rate_bps = Some(sample.rate_bps());
     }
 
+    pub(in crate::runtime) fn mark_product_delivery_replacing_rate_for_instance(
+        &mut self,
+        path_instance_id: CarrierPathInstanceId,
+        sample: PathRateSample,
+    ) {
+        if self.accepts_native_carrier_observation(path_instance_id) {
+            self.mark_product_delivery_replacing_rate(sample);
+        }
+    }
+
     pub(in crate::runtime) fn mark_udp_datagram_feedback(
         &mut self,
         observation: UdpDatagramPathObservation,
@@ -694,11 +710,53 @@ impl ClientPathHealthRecord {
         self.carrier_ack_derived_data_seen = false;
     }
 
-    pub(in crate::runtime) fn record_relay_send(&mut self, bytes: usize) {
+    fn clear_physical_carrier_state(&mut self) {
+        self.data_plane_failure_instance_id = None;
+        self.peer_usage = None;
+        self.path_instance_id = None;
+        self.peer_usage_sequence = None;
+        self.consecutive_failures = 0;
+        self.measured_srtt_ms = None;
+        self.measured_jitter_ms = None;
+        self.measured_rate_bps = None;
+        self.measured_loss_rate = None;
+        self.delivery_samples = 0;
+        self.product_delivery_rate_bps = None;
+        self.product_delivery_sample_bytes = 0;
+        self.datagram_feedback_samples = 0;
+        self.last_delivery_at = None;
+        self.failed_until = None;
+        self.relay_bytes_in_flight = 0;
+        self.relay_queue_bytes = 0;
+        self.clear_native_carrier_state();
+        self.tcp_capacity.reset_after_data_plane_failure();
+        self.invalidate_path_proofs();
+        self.state = if self.manual_disabled {
+            SchedulerPathState::Failed
+        } else {
+            SchedulerPathState::Suspect
+        };
+    }
+
+    pub(in crate::runtime) fn record_relay_send(
+        &mut self,
+        path_instance_id: CarrierPathInstanceId,
+        bytes: usize,
+    ) {
+        if !self.accepts_native_carrier_observation(path_instance_id) {
+            return;
+        }
         self.relay_bytes_in_flight = self.relay_bytes_in_flight.saturating_add(bytes as u64);
     }
 
-    pub(in crate::runtime) fn release_relay_inflight(&mut self, bytes: usize) {
+    pub(in crate::runtime) fn release_relay_inflight(
+        &mut self,
+        path_instance_id: CarrierPathInstanceId,
+        bytes: usize,
+    ) {
+        if self.path_instance_id != Some(path_instance_id) {
+            return;
+        }
         self.relay_bytes_in_flight = self.relay_bytes_in_flight.saturating_sub(bytes as u64);
     }
 }

@@ -108,27 +108,27 @@ pub(super) async fn switch_reliable_relay_to_best_path(
 
 pub(super) fn maybe_mark_live_relay_path_delivery(
     context: &ClientPathContext,
-    key: RelayPathKey,
+    instance: RelayPathInstance,
     stats: PathDeliveryStats,
-    next_sample_bytes: &mut HashMap<RelayPathKey, u64>,
+    next_sample_bytes: &mut HashMap<RelayPathInstance, u64>,
 ) {
     let sample_step = reliable_relay_live_delivery_sample_bytes(context.mux_limits);
-    let next = next_sample_bytes.entry(key).or_insert(sample_step);
+    let next = next_sample_bytes.entry(instance).or_insert(sample_step);
     if stats.payload_bytes < *next {
         return;
     }
     let Some(sample) = stats.rate_sample() else {
         return;
     };
-    context.mark_relay_path_rate_sample(key.underlay, key.index, sample);
+    context.mark_relay_path_rate_sample(instance, sample);
     *next = stats.payload_bytes.saturating_add(sample_step);
     #[cfg(feature = "lab-diagnostics")]
     lab_diagnostic(
         "path_model",
         format_args!(
             "path_underlay={:?} path_index={} delivered_bytes={} elapsed_ms={:.3} cause=live_delivery",
-            key.underlay,
-            key.index,
+            instance.key.underlay,
+            instance.key.index,
             stats.payload_bytes,
             stats
                 .last_payload_at

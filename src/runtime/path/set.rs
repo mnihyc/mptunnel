@@ -12,16 +12,18 @@ use super::tcp::client::{
     ClientTcpPathSessionHandle, ClientTcpPathSessionRuntime, tcp_session_command_queue,
 };
 use super::tcp::group::{ClientTcpCarrierGroup, ClientTcpCarrierGroups};
-use crate::config::{ClientPathConfig, ClientSecurityConfig};
+use crate::config::ClientPathConfig;
+#[cfg(test)]
+use crate::config::ClientSecurityConfig;
 #[cfg(test)]
 use crate::ingress::ProxyAuthConfig;
 use crate::model::path::RelayPathKey;
 use crate::mux::MuxLimits;
 use crate::performance::ResourceLimits;
 use crate::product::OutboundId;
-use crate::protocol::codec::CodecLimits;
 use crate::protocol::{
-    PathMetricDirection, PathUsage, PeerPathState, PeerPathStatus, SessionId, UnderlayProtocol,
+    PathId, PathMetricDirection, PathUsage, PeerPathState, PeerPathStatus, SessionId,
+    UnderlayProtocol,
 };
 use crate::runtime::error::RuntimeError;
 use crate::runtime::identity::random_session_id;
@@ -33,6 +35,7 @@ use crate::runtime::telemetry::{ProductFlowScope, RuntimeTelemetry};
 use crate::runtime::telemetry::{RuntimeTelemetrySnapshot, active_flow_detail_capacity};
 #[cfg(test)]
 use crate::transport::SystemCarrierNetworkProvider;
+#[cfg(test)]
 use crate::transport::encrypted::TcpClientTlsConfig;
 use crate::transport::{CarrierNetworkProvider, CarrierPathIdentity, PathSpec};
 use std::sync::Arc;
@@ -66,17 +69,16 @@ pub struct ClientPathContext {
     pub(in crate::runtime) tcp_member_ordinals: Arc<Vec<u16>>,
     pub(in crate::runtime) tcp_carrier_groups: Arc<ClientTcpCarrierGroups>,
     pub(in crate::runtime) udp_path_ordinals: Arc<Vec<usize>>,
-    pub(in crate::runtime) path_group_ordinal: usize,
+    #[cfg(test)]
     pub(in crate::runtime) tcp_security: Arc<Vec<ClientSecurityConfig>>,
+    #[cfg(test)]
     pub(in crate::runtime) tcp_tls: Arc<Vec<TcpClientTlsConfig>>,
     pub(in crate::runtime) tcp_sessions: Arc<Vec<ClientTcpPathSessionHandle>>,
     pub(in crate::runtime) udp_sessions: Arc<Vec<ClientUdpPathSessionHandle>>,
-    pub(in crate::runtime) carrier_network: Arc<dyn CarrierNetworkProvider>,
     pub(super) state: Arc<ClientPathState>,
     pub(in crate::runtime) session_id: SessionId,
     pub(in crate::runtime) telemetry: RuntimeTelemetry,
     pub(in crate::runtime) peer_status: PeerStatusBroker,
-    pub(in crate::runtime) codec_limits: CodecLimits,
     pub(in crate::runtime) mux_limits: MuxLimits,
     /// RFC 8684 break-before-make lifetime for established logical streams.
     pub(in crate::runtime) session_retention_timeout: std::time::Duration,
@@ -321,6 +323,8 @@ impl ClientPathContext {
                     paths: tcp_config_paths.clone(),
                     config_index,
                     path_index,
+                    path_id: PathId(path_index as u16),
+                    purpose: crate::protocol::PathPurpose::Ordinary,
                     carrier_identity: CarrierPathIdentity {
                         group_ordinal: path_group_ordinal,
                         path_ordinal: tcp_path_ordinals[path_index],
@@ -335,6 +339,7 @@ impl ClientPathContext {
                     closed_stream_cache_capacity: reliable_closed_stream_cache_capacity(
                         resources.max_streams,
                     ),
+                    session_retention_timeout,
                     state: state.clone(),
                     carrier_network: carrier_network.clone(),
                     peer_status: peer_status.clone(),
@@ -382,17 +387,16 @@ impl ClientPathContext {
             tcp_member_ordinals,
             tcp_carrier_groups,
             udp_path_ordinals,
-            path_group_ordinal,
+            #[cfg(test)]
             tcp_security,
+            #[cfg(test)]
             tcp_tls,
             tcp_sessions: Arc::new(tcp_sessions),
             udp_sessions: Arc::new(udp_sessions),
-            carrier_network,
             state,
             session_id,
             telemetry,
             peer_status,
-            codec_limits,
             mux_limits,
             session_retention_timeout,
             session_send_buffer,
@@ -401,6 +405,7 @@ impl ClientPathContext {
         })
     }
 
+    #[cfg(test)]
     pub(in crate::runtime) fn tcp_path_security(
         &self,
         path_index: usize,
@@ -415,6 +420,7 @@ impl ClientPathContext {
             .ok_or(RuntimeError::NoSchedulableTcpPath)
     }
 
+    #[cfg(test)]
     pub(in crate::runtime) fn tcp_path_tls(
         &self,
         path_index: usize,
@@ -477,16 +483,6 @@ impl ClientPathContext {
             UnderlayProtocol::Udp => self.udp_path_ordinals.get(key.index).copied(),
         }
         .unwrap_or(usize::MAX)
-    }
-
-    pub(in crate::runtime) fn carrier_path_identity(
-        &self,
-        key: RelayPathKey,
-    ) -> CarrierPathIdentity {
-        CarrierPathIdentity {
-            group_ordinal: self.path_group_ordinal,
-            path_ordinal: self.relay_path_config_ordinal(key),
-        }
     }
 
     pub(in crate::runtime) fn relay_path_key_order(

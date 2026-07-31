@@ -15,7 +15,9 @@ use crate::protocol::{
     TargetAddr, UnderlayProtocol,
 };
 use crate::runtime::error::RuntimeError;
-use crate::runtime::identity::{random_session_id, random_u64};
+use crate::runtime::identity::random_session_id;
+#[cfg(test)]
+use crate::runtime::identity::random_u64;
 use crate::runtime::path::commands::reliable_stream_frame_queue;
 use crate::runtime::path::model::{PathDeliveryStats, UdpDatagramPathObservation};
 use crate::runtime::path::quic::client::{
@@ -385,6 +387,7 @@ impl UdpDatagramClientSession {
         Ok(())
     }
 
+    #[cfg(test)]
     pub(in crate::runtime) async fn ping_until(
         &mut self,
         probe_deadline: tokio::time::Instant,

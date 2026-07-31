@@ -208,21 +208,43 @@ fn tcp_transport_state_retains_non_app_limited_ack_window_without_data_ack_autho
 fn replacement_tcp_carrier_rejects_stale_native_observation_and_clears_credit() {
     let original = crate::model::path::next_carrier_path_instance_id();
     let replacement = crate::model::path::next_carrier_path_instance_id();
-    let mut record = ClientPathHealthRecord {
-        carrier_delivery_rate_bps: Some(200_000_000.0),
-        carrier_pacing_rate_bps: Some(250_000_000.0),
-        carrier_bytes_in_flight: 128 * 1024,
-        carrier_inflight_limit_bytes: 512 * 1024,
-        carrier_delivery_samples: 3,
-        carrier_delivery_sample_bytes: 1024 * 1024,
-        carrier_delivery_window_covered: true,
-        carrier_last_delivery_at: Some(Instant::now()),
-        carrier_app_limited: false,
-        ..ClientPathHealthRecord::default()
-    };
+    let mut record = ClientPathHealthRecord::default();
     record.install_peer_usage(original, 0, PathUsage::Available);
+    record.measured_srtt_ms = Some(25.0);
+    record.measured_jitter_ms = Some(3.0);
+    record.measured_rate_bps = Some(180_000_000.0);
+    record.measured_loss_rate = Some(0.01);
+    record.delivery_samples = 4;
+    record.product_delivery_rate_bps = Some(175_000_000.0);
+    record.product_delivery_sample_bytes = 2 * 1024 * 1024;
+    record.datagram_feedback_samples = 2;
+    record.last_delivery_at = Some(Instant::now());
+    record.relay_bytes_in_flight = 64 * 1024;
+    record.relay_queue_bytes = 32 * 1024;
+    record.carrier_delivery_rate_bps = Some(200_000_000.0);
+    record.carrier_pacing_rate_bps = Some(250_000_000.0);
+    record.carrier_bytes_in_flight = 128 * 1024;
+    record.carrier_inflight_limit_bytes = 512 * 1024;
+    record.carrier_delivery_samples = 3;
+    record.carrier_delivery_sample_bytes = 1024 * 1024;
+    record.carrier_delivery_window_covered = true;
+    record.carrier_last_delivery_at = Some(Instant::now());
+    record.carrier_app_limited = false;
+    record.active_flows = 2;
+    record.active_latency_sensitive_flows = 1;
     record.install_peer_usage(replacement, 0, PathUsage::Available);
 
+    assert_eq!(record.measured_srtt_ms, None);
+    assert_eq!(record.measured_jitter_ms, None);
+    assert_eq!(record.measured_rate_bps, None);
+    assert_eq!(record.measured_loss_rate, None);
+    assert_eq!(record.delivery_samples, 0);
+    assert_eq!(record.product_delivery_rate_bps, None);
+    assert_eq!(record.product_delivery_sample_bytes, 0);
+    assert_eq!(record.datagram_feedback_samples, 0);
+    assert_eq!(record.last_delivery_at, None);
+    assert_eq!(record.relay_bytes_in_flight, 0);
+    assert_eq!(record.relay_queue_bytes, 0);
     assert_eq!(record.carrier_delivery_rate_bps, None);
     assert_eq!(record.carrier_pacing_rate_bps, None);
     assert_eq!(record.carrier_bytes_in_flight, 0);
@@ -230,21 +252,30 @@ fn replacement_tcp_carrier_rejects_stale_native_observation_and_clears_credit() 
     assert_eq!(record.carrier_delivery_samples, 0);
     assert!(!record.carrier_delivery_window_covered);
     assert_eq!(record.carrier_last_delivery_at, None);
+    assert_eq!(record.active_flows, 2);
+    assert_eq!(record.active_latency_sensitive_flows, 1);
     assert!(!record.mark_tcp_transport_state(original, request_tcp_native_observation(0)));
     assert_eq!(record.carrier_srtt_ms, None);
+
+    record.begin_planned_retirement();
+    assert_eq!(record.state, SchedulerPathState::Draining);
+    assert!(record.retire_planned_instance(replacement));
+    assert_eq!(record.state, SchedulerPathState::Suspect);
+    assert_eq!(record.consecutive_failures, 0);
+    assert_eq!(record.failed_until, None);
+    assert_eq!(record.active_flows, 2);
+    assert!(!record.retire_planned_instance(replacement));
 }
 
 #[test]
 fn partial_tcp_transport_state_does_not_clear_unknown_fields() {
-    let mut record = ClientPathHealthRecord {
-        carrier_bytes_in_flight: 64 * 1024,
-        carrier_inflight_limit_bytes: 512 * 1024,
-        carrier_queue_bytes: 8 * 1024,
-        native_drain_observed: true,
-        ..ClientPathHealthRecord::default()
-    };
+    let mut record = ClientPathHealthRecord::default();
     let path_instance_id = crate::model::path::next_carrier_path_instance_id();
     record.install_peer_usage(path_instance_id, 0, PathUsage::Available);
+    record.carrier_bytes_in_flight = 64 * 1024;
+    record.carrier_inflight_limit_bytes = 512 * 1024;
+    record.carrier_queue_bytes = 8 * 1024;
+    record.native_drain_observed = true;
     let snapshot = TcpNativeSnapshot {
         rtt: Some(TcpNativeRtt {
             srtt_us: 30_000,

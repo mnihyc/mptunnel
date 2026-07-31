@@ -9,7 +9,7 @@ use super::metrics::TcpMetricPublisher;
 use crate::config::ClientSecurityConfig;
 use crate::mux::MuxLimits;
 use crate::protocol::codec::CodecLimits;
-use crate::protocol::{Frame, PathId, PathUsage, SessionId};
+use crate::protocol::{Frame, PathId, PathPurpose, PathUsage, SessionId};
 use crate::runtime::error::RuntimeError;
 use crate::runtime::identity::random_u64;
 use crate::runtime::path::commands::reliable_path_writer_frame_queue;
@@ -23,6 +23,8 @@ use std::time::{Duration, Instant};
 use tokio::sync::mpsc;
 
 pub(in crate::runtime) struct ClientTcpCarrierConnection {
+    pub(in crate::runtime) path_id: PathId,
+    pub(in crate::runtime) purpose: PathPurpose,
     pub(in crate::runtime) writer: EncryptedTcpWriter,
     pub(in crate::runtime) frames: mpsc::Receiver<Result<Frame, EncryptedFramedTransportError>>,
     heartbeat_interval: Duration,
@@ -39,7 +41,8 @@ pub(in crate::runtime) struct ClientTcpCarrierConnection {
 /// Immutable inputs for one concrete TCP carrier instance.
 pub(in crate::runtime) struct ClientTcpCarrierConnect<'a> {
     pub(in crate::runtime) path: &'a PathSpec,
-    pub(in crate::runtime) path_index: usize,
+    pub(in crate::runtime) path_id: PathId,
+    pub(in crate::runtime) purpose: PathPurpose,
     pub(in crate::runtime) carrier_identity: CarrierPathIdentity,
     pub(in crate::runtime) session_id: SessionId,
     pub(in crate::runtime) security: &'a ClientSecurityConfig,
@@ -116,7 +119,8 @@ pub(in crate::runtime) async fn connect_client_tcp_carrier(
 ) -> Result<ClientTcpCarrierConnection, RuntimeError> {
     let ClientTcpCarrierConnect {
         path,
-        path_index,
+        path_id,
+        purpose,
         carrier_identity,
         session_id,
         security,
@@ -139,11 +143,15 @@ pub(in crate::runtime) async fn connect_client_tcp_carrier(
         .await?;
         let mut tcp_metrics = TcpMetricPublisher::capture(&tcp_stream);
         let mut framed = EncryptedFramedStream::connect(tcp_stream, tls, codec_limits).await?;
-        let path_id = PathId(path_index as u16);
         let tls_exporter = framed.tcp_admission_exporter()?;
-        let (admission_prelude, path_join) =
-            ClientTcpPathAuthentication::for_session(security, path_id, session_id, &tls_exporter)?
-                .into_parts();
+        let (admission_prelude, path_join) = ClientTcpPathAuthentication::for_session_with_purpose(
+            security,
+            path_id,
+            session_id,
+            purpose,
+            &tls_exporter,
+        )?
+        .into_parts();
 
         let readiness_started_at = Instant::now();
         framed
@@ -197,6 +205,8 @@ pub(in crate::runtime) async fn connect_client_tcp_carrier(
         let (reader, writer) = framed.split()?;
         let now = tokio::time::Instant::now();
         Ok(ClientTcpCarrierConnection {
+            path_id,
+            purpose,
             writer,
             frames: spawn_encrypted_tcp_reader(
                 reader,

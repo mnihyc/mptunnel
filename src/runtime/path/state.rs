@@ -91,24 +91,24 @@ impl ClientPathState {
         publication: ClientTcpCarrierPublication,
         publish_readiness: impl FnOnce(),
     ) -> bool {
-        let mut health = self.health.lock().expect("client path health lock");
-        if !endpoint_policy.allows(publication.endpoint_generation) {
-            return false;
-        }
-        let record = health
-            .tcp
-            .get_mut(publication.path_index)
-            .expect("TCP carrier actor must have one health record");
-        record.install_peer_usage(
-            publication.path_instance_id,
-            publication.peer_usage_sequence,
-            publication.peer_usage,
-        );
-        if let Some(readiness_rtt) = publication.readiness_rtt {
-            record.mark_success(readiness_rtt);
-        }
-        publish_readiness();
-        true
+        endpoint_policy
+            .with_current(publication.endpoint_generation, || {
+                let mut health = self.health.lock().expect("client path health lock");
+                let record = health
+                    .tcp
+                    .get_mut(publication.path_index)
+                    .expect("TCP carrier actor must have one health record");
+                record.install_peer_usage(
+                    publication.path_instance_id,
+                    publication.peer_usage_sequence,
+                    publication.peer_usage,
+                );
+                if let Some(readiness_rtt) = publication.readiness_rtt {
+                    record.mark_success(readiness_rtt);
+                }
+                publish_readiness();
+            })
+            .is_some()
     }
 
     pub(in crate::runtime) fn mark_tcp_path_establishment_failure_for_endpoint_generation(
@@ -117,18 +117,17 @@ impl ClientPathState {
         endpoint_policy: &ClientTcpEndpointPolicy,
         endpoint_generation: u64,
     ) {
-        let now = Instant::now();
-        let mut health = self.health.lock().expect("client path health lock");
-        if !endpoint_policy.allows(endpoint_generation) {
-            return;
-        }
-        let has_schedulable_alternative =
-            path_records_have_schedulable_alternative(&health.tcp, index, now);
-        health
-            .tcp
-            .get_mut(index)
-            .expect("TCP carrier actor must have one health record")
-            .mark_failure(now, has_schedulable_alternative);
+        endpoint_policy.with_current(endpoint_generation, || {
+            let now = Instant::now();
+            let mut health = self.health.lock().expect("client path health lock");
+            let has_schedulable_alternative =
+                path_records_have_schedulable_alternative(&health.tcp, index, now);
+            health
+                .tcp
+                .get_mut(index)
+                .expect("TCP carrier actor must have one health record")
+                .mark_failure(now, has_schedulable_alternative);
+        });
     }
 
     pub(in crate::runtime) fn update_peer_path_usage(
@@ -180,6 +179,36 @@ impl ClientPathState {
         records.get_mut(key.index).is_some_and(|current| {
             current.mark_data_plane_failure(path_instance_id, now, has_schedulable_alternative)
         })
+    }
+
+    pub(in crate::runtime) fn retire_path_instance_planned(
+        &self,
+        key: RelayPathKey,
+        path_instance_id: CarrierPathInstanceId,
+    ) -> bool {
+        let mut health = self.health.lock().expect("client path health lock");
+        let records = match key.underlay {
+            UnderlayProtocol::Tcp => &mut health.tcp,
+            UnderlayProtocol::Udp => &mut health.udp,
+        };
+        records
+            .get_mut(key.index)
+            .is_some_and(|record| record.retire_planned_instance(path_instance_id))
+    }
+
+    pub(in crate::runtime) fn begin_path_instance_planned_retirement(
+        &self,
+        key: RelayPathKey,
+        path_instance_id: CarrierPathInstanceId,
+    ) -> bool {
+        let mut health = self.health.lock().expect("client path health lock");
+        let records = match key.underlay {
+            UnderlayProtocol::Tcp => &mut health.tcp,
+            UnderlayProtocol::Udp => &mut health.udp,
+        };
+        records
+            .get_mut(key.index)
+            .is_some_and(|record| record.begin_planned_instance_retirement(path_instance_id))
     }
 
     pub(in crate::runtime::path) fn request_tcp_capacity_probe_session(
@@ -580,22 +609,7 @@ impl ClientPathContext {
         }
     }
 
-    pub(in crate::runtime) fn mark_tcp_path_probe_success_for_instance(
-        &self,
-        index: usize,
-        path_instance_id: CarrierPathInstanceId,
-        elapsed: Duration,
-    ) {
-        self.state
-            .health
-            .lock()
-            .expect("client path health lock")
-            .tcp
-            .get_mut(index)
-            .expect("TCP carrier actor must have one health record")
-            .mark_probe_success_for_instance(path_instance_id, elapsed);
-    }
-
+    #[cfg(test)]
     pub(in crate::runtime) fn should_probe_tcp_path(&self, index: usize) -> bool {
         let now = Instant::now();
         self.state
@@ -663,39 +677,37 @@ impl ClientPathContext {
 
     pub(in crate::runtime) fn record_relay_path_send(
         &self,
-        underlay: UnderlayProtocol,
-        index: usize,
+        instance: RelayPathInstance,
         bytes: usize,
     ) {
         if bytes == 0 {
             return;
         }
         let mut health = self.state.health.lock().expect("client path health lock");
-        let records = match underlay {
+        let records = match instance.key.underlay {
             UnderlayProtocol::Tcp => &mut health.tcp,
             UnderlayProtocol::Udp => &mut health.udp,
         };
-        if let Some(current) = records.get_mut(index) {
-            current.record_relay_send(bytes);
+        if let Some(current) = records.get_mut(instance.key.index) {
+            current.record_relay_send(instance.path_instance_id, bytes);
         }
     }
 
     pub(in crate::runtime) fn release_relay_path_inflight(
         &self,
-        underlay: UnderlayProtocol,
-        index: usize,
+        instance: RelayPathInstance,
         bytes: usize,
     ) {
         if bytes == 0 {
             return;
         }
         let mut health = self.state.health.lock().expect("client path health lock");
-        let records = match underlay {
+        let records = match instance.key.underlay {
             UnderlayProtocol::Tcp => &mut health.tcp,
             UnderlayProtocol::Udp => &mut health.udp,
         };
-        if let Some(current) = records.get_mut(index) {
-            current.release_relay_inflight(bytes);
+        if let Some(current) = records.get_mut(instance.key.index) {
+            current.release_relay_inflight(instance.path_instance_id, bytes);
         }
     }
 
@@ -726,49 +738,83 @@ impl ClientPathContext {
 
     pub(in crate::runtime) fn mark_relay_path_delivery(
         &self,
-        underlay: UnderlayProtocol,
-        index: usize,
+        instance: RelayPathInstance,
         stats: PathDeliveryStats,
     ) {
-        match underlay {
-            UnderlayProtocol::Tcp => self.mark_tcp_path_delivery(index, stats),
-            UnderlayProtocol::Udp => self.mark_udp_reliable_path_delivery(index, stats),
+        match instance.key.underlay {
+            UnderlayProtocol::Tcp => self.mark_tcp_path_delivery_for_instance(
+                instance.key.index,
+                instance.path_instance_id,
+                stats,
+            ),
+            UnderlayProtocol::Udp => {
+                let Some(sample) = stats.rate_sample() else {
+                    return;
+                };
+                if let Some(current) = self
+                    .state
+                    .health
+                    .lock()
+                    .expect("client path health lock")
+                    .udp
+                    .get_mut(instance.key.index)
+                {
+                    current.mark_product_delivery_for_instance(instance.path_instance_id, sample);
+                }
+            }
         }
     }
 
     pub(in crate::runtime) fn mark_relay_path_rate_sample(
         &self,
-        underlay: UnderlayProtocol,
-        index: usize,
+        instance: RelayPathInstance,
         sample: PathRateSample,
     ) {
         let mut health = self.state.health.lock().expect("client path health lock");
-        let records = match underlay {
+        let records = match instance.key.underlay {
             UnderlayProtocol::Tcp => &mut health.tcp,
             UnderlayProtocol::Udp => &mut health.udp,
         };
-        if let Some(current) = records.get_mut(index) {
+        if let Some(current) = records.get_mut(instance.key.index) {
+            current.mark_product_delivery_for_instance(instance.path_instance_id, sample);
+        }
+    }
+
+    #[cfg(test)]
+    pub(in crate::runtime) fn mark_relay_path_rate_sample_for_test(
+        &self,
+        key: RelayPathKey,
+        sample: PathRateSample,
+    ) {
+        let mut health = self.state.health.lock().expect("client path health lock");
+        let records = match key.underlay {
+            UnderlayProtocol::Tcp => &mut health.tcp,
+            UnderlayProtocol::Udp => &mut health.udp,
+        };
+        if let Some(current) = records.get_mut(key.index) {
             current.mark_product_delivery(sample);
         }
     }
 
     pub(in crate::runtime) fn mark_relay_path_ack_clock_rate_sample(
         &self,
-        underlay: UnderlayProtocol,
-        index: usize,
+        instance: RelayPathInstance,
         sample: PathRateSample,
         replace_startup_rate: bool,
     ) {
         let mut health = self.state.health.lock().expect("client path health lock");
-        let records = match underlay {
+        let records = match instance.key.underlay {
             UnderlayProtocol::Tcp => &mut health.tcp,
             UnderlayProtocol::Udp => &mut health.udp,
         };
-        if let Some(current) = records.get_mut(index) {
+        if let Some(current) = records.get_mut(instance.key.index) {
             if replace_startup_rate {
-                current.mark_product_delivery_replacing_rate(sample);
+                current.mark_product_delivery_replacing_rate_for_instance(
+                    instance.path_instance_id,
+                    sample,
+                );
             } else {
-                current.mark_product_delivery(sample);
+                current.mark_product_delivery_for_instance(instance.path_instance_id, sample);
             }
         }
     }
@@ -790,6 +836,7 @@ impl ClientPathContext {
         }
     }
 
+    #[cfg(test)]
     pub(in crate::runtime) fn mark_tcp_path_delivery(
         &self,
         index: usize,
@@ -839,22 +886,6 @@ impl ClientPathContext {
         if let Some(current) = health.tcp.get_mut(index) {
             current.mark_failure(now, has_schedulable_alternative);
         }
-    }
-
-    pub(in crate::runtime) fn mark_tcp_path_probe_failure_for_instance(
-        &self,
-        index: usize,
-        path_instance_id: CarrierPathInstanceId,
-    ) {
-        let now = Instant::now();
-        let mut health = self.state.health.lock().expect("client path health lock");
-        let has_schedulable_alternative =
-            path_records_have_schedulable_alternative(&health.tcp, index, now);
-        health
-            .tcp
-            .get_mut(index)
-            .expect("TCP carrier actor must have one health record")
-            .mark_probe_failure_for_instance(path_instance_id, now, has_schedulable_alternative);
     }
 
     pub(in crate::runtime) fn mark_udp_path_open_success(&self, index: usize, elapsed: Duration) {
@@ -908,22 +939,6 @@ impl ClientPathContext {
             .get_mut(index)
         {
             current.release_load(TrafficClass::RealtimeDatagram);
-        }
-    }
-
-    fn mark_udp_reliable_path_delivery(&self, index: usize, stats: PathDeliveryStats) {
-        let Some(sample) = stats.rate_sample() else {
-            return;
-        };
-        if let Some(current) = self
-            .state
-            .health
-            .lock()
-            .expect("client path health lock")
-            .udp
-            .get_mut(index)
-        {
-            current.mark_product_delivery(sample);
         }
     }
 

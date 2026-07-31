@@ -7,32 +7,27 @@ use crate::ingress::socks5::{self, Socks5Error, Socks5Reply};
 use crate::ingress::{
     LocalIngressAdmissionConfig, ProxyAuthConfig, TcpForwardConfig, UdpForwardConfig,
 };
-use crate::model::path::{CarrierPathInstanceId, RelayPathKey};
 use crate::mux::MuxLimits;
 #[cfg(test)]
 use crate::performance::MppPerformanceConfig;
 use crate::product::{InboundId, PrincipalId};
-use crate::protocol::{CloseReason, Frame, PathId, PathUsage, TargetAddr, UnderlayProtocol};
+use crate::protocol::TargetAddr;
 use crate::runtime::datagram::{
-    UdpDatagramClientSession, UdpEdgeCompletion, UdpEdgeLane, UdpEdgeRequest, close_udp_edge_lanes,
+    UdpEdgeCompletion, UdpEdgeLane, UdpEdgeRequest, close_udp_edge_lanes,
     dispatch_udp_edge_request, finish_udp_edge_completion, remove_udp_edge_lane,
     udp_edge_completion_queue,
 };
 use crate::runtime::error::RuntimeError;
-use crate::runtime::identity::random_u64;
 use crate::runtime::outbound_registry::relay_opened_tcp;
 use crate::runtime::path::ClientPathContext;
-use crate::runtime::path::tcp::admission::ClientTcpPathAuthentication;
 use crate::runtime::product_policy::{ClientIngressRouter, ClientPolicyDisposition, ClientRoute};
 use crate::runtime::readiness::RequiredServiceReadiness;
-use crate::transport::encrypted::EncryptedFramedStream;
-use crate::transport::tcp::{self, TcpConnectOptions};
 use std::cmp::Reverse;
 use std::collections::{BinaryHeap, HashMap, hash_map::Entry};
 use std::future::pending;
 use std::net::{IpAddr, SocketAddr};
 use std::sync::{Arc, Mutex};
-use std::time::{Duration, Instant};
+use std::time::Duration;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::net::{TcpListener, UdpSocket};
 use tokio::sync::{Semaphore, mpsc};
@@ -1394,177 +1389,34 @@ pub(super) async fn probe_tcp_client_path(
     context: &ClientPathContext,
     path_index: usize,
     timeout: Duration,
-) -> Option<ReadyTcpPathProbe> {
-    let durable_path_session = context.tcp_sessions.get(path_index)?;
+) {
+    let Some(durable_path_session) = context.tcp_sessions.get(path_index) else {
+        return;
+    };
     let probe_deadline = tokio::time::Instant::now() + timeout;
-    // Retain the first authenticated carrier. Later probes stay isolated from
-    // live product streams, matching the QUIC path lifecycle.
-    match durable_path_session
+    // The durable carrier owns native liveness and heartbeat evidence.
+    // Preparing an absent carrier is useful; opening another socket must not
+    // change the health of a different live carrier instance.
+    let _ = durable_path_session
         .prepare_connection(probe_deadline)
-        .await
-    {
-        Ok(Some(_)) | Err(_) => None,
-        Ok(None) => probe_ready_tcp_client_path(context, path_index, timeout).await,
-    }
-}
-
-pub(super) struct ReadyTcpPathProbe {
-    pub(super) path_instance_id: CarrierPathInstanceId,
-    pub(super) result: Result<Duration, RuntimeError>,
-}
-
-/// Measures a TCP endpoint only while its configured-minimum carrier is live.
-/// The exact instance lets the health transaction discard an observation that
-/// raced carrier replacement.
-pub(super) async fn probe_ready_tcp_client_path(
-    context: &ClientPathContext,
-    path_index: usize,
-    timeout: Duration,
-) -> Option<ReadyTcpPathProbe> {
-    let session = context.tcp_sessions.get(path_index)?;
-    let path_instance_id = session.connection_instance_id()?;
-    let probe_deadline = tokio::time::Instant::now() + timeout;
-    let result = probe_isolated_tcp_client_path(context, path_index, probe_deadline).await;
-    Some(ReadyTcpPathProbe {
-        path_instance_id,
-        result,
-    })
-}
-
-async fn probe_isolated_tcp_client_path(
-    context: &ClientPathContext,
-    path_index: usize,
-    probe_deadline: tokio::time::Instant,
-) -> Result<Duration, RuntimeError> {
-    let path = context
-        .tcp_paths
-        .get(path_index)
-        .ok_or(RuntimeError::NoSchedulableTcpPath)?;
-    let security = context.tcp_path_security(path_index)?;
-    let tls = context.tcp_path_tls(path_index)?;
-    let probe_rtt = tokio::time::timeout_at(probe_deadline, async {
-        let connect_timeout = probe_deadline.saturating_duration_since(tokio::time::Instant::now());
-        let tcp_stream = tcp::connect_path_with_provider(
-            path,
-            context.carrier_path_identity(RelayPathKey {
-                underlay: UnderlayProtocol::Tcp,
-                index: path_index,
-            }),
-            TcpConnectOptions {
-                timeout: connect_timeout,
-                ..TcpConnectOptions::default()
-            },
-            context.carrier_network.as_ref(),
-        )
-        .await?;
-        let mut framed =
-            EncryptedFramedStream::connect(tcp_stream, tls, context.codec_limits).await?;
-        let path_id = PathId(path_index as u16);
-        let tls_exporter = framed.tcp_admission_exporter()?;
-        let (admission_prelude, path_join) =
-            ClientTcpPathAuthentication::for_new_session(security, path_id, &tls_exporter)?
-                .into_parts();
-        let nonce = random_u64()?;
-
-        // Connection setup is liveness cost, not RTT. Time only the single
-        // authenticated request/response exchange used by the path model.
-        let ping_started_at = Instant::now();
-        framed
-            .write_tcp_admission(
-                &admission_prelude,
-                &[
-                    path_join,
-                    Frame::PathStatus {
-                        path_id,
-                        sequence: 0,
-                        usage: if path.metadata.policy.backup {
-                            PathUsage::Backup
-                        } else {
-                            PathUsage::Available
-                        },
-                    },
-                    Frame::Ping { nonce },
-                ],
-            )
-            .await?;
-        framed.flush().await?;
-
-        let mut session_ready = false;
-        let mut peer_usage_received = false;
-        let mut pong_received = false;
-        while !session_ready || !peer_usage_received || !pong_received {
-            match framed.read_frame().await? {
-                Frame::SessionReady => session_ready = true,
-                Frame::PathStatus {
-                    path_id: status_path_id,
-                    sequence: 0,
-                    ..
-                } if status_path_id == path_id => peer_usage_received = true,
-                Frame::PathStatus { .. } => {
-                    return Err(RuntimeError::Protocol(
-                        "TCP path probe returned an invalid usage advertisement",
-                    ));
-                }
-                Frame::Pong {
-                    nonce: received_nonce,
-                } if received_nonce == nonce => pong_received = true,
-                Frame::SessionClose { reason } => return Err(RuntimeError::RemoteClosed(reason)),
-                _ => return Err(RuntimeError::Protocol("unexpected TCP path probe frame")),
-            }
-        }
-        let probe_rtt = ping_started_at.elapsed();
-
-        framed
-            .write_frame(&Frame::SessionClose {
-                reason: CloseReason::Normal,
-            })
-            .await?;
-        framed.flush().await?;
-        Ok(probe_rtt)
-    })
-    .await
-    .map_err(|_| RuntimeError::Protocol("TCP path probe timed out"))??;
-    Ok(probe_rtt)
+        .await;
 }
 
 pub(super) async fn probe_udp_client_path(
     context: &ClientPathContext,
     path_index: usize,
     timeout: Duration,
-) -> Result<Duration, RuntimeError> {
+) -> Result<Option<Duration>, RuntimeError> {
     let durable_path_session = context
         .udp_sessions
         .get(path_index)
         .ok_or(RuntimeError::NoSchedulableUdpPath)?;
     let probe_deadline = tokio::time::Instant::now() + timeout;
-    // Cold validation prepares the authenticated product carrier and takes its
-    // RTT from QUIC. Later probes are isolated from that durable connection.
-    if let Some(rtt) = durable_path_session
+    // Cold validation prepares the authenticated Product carrier. Once live,
+    // QUIC's own connection RTT and liveness remain the only carrier evidence.
+    durable_path_session
         .prepare_connection(probe_deadline)
-        .await?
-    {
-        return Ok(rtt);
-    }
-    let path_session = durable_path_session.transient_probe()?;
-    let probe_rtt = tokio::time::timeout_at(probe_deadline, async {
-        // A timed probe owns a distinct authenticated QUIC connection. Its
-        // cancellation must never reset product streams on the live path.
-        let mut session = UdpDatagramClientSession::open_from_udp_session(
-            path_session,
-            path_index,
-            context.mux_limits,
-            probe_deadline,
-        )
-        .await?;
-        let ping_started_at = Instant::now();
-        session.ping_until(probe_deadline).await?;
-        let probe_rtt = ping_started_at.elapsed();
-        session.close().await?;
-        Ok::<Duration, RuntimeError>(probe_rtt)
-    })
-    .await
-    .map_err(|_| RuntimeError::Protocol("UDP path probe timed out"))??;
-    Ok(probe_rtt)
+        .await
 }
 
 pub(super) async fn read_socks5_auth<S>(stream: &mut S) -> Result<socks5::AuthRequest, RuntimeError>

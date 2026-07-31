@@ -30,10 +30,11 @@ use crate::runtime::path::commands::{
 };
 use crate::runtime::path::proof::PathProofObservation;
 use crate::runtime::path::{
-    CarrierDeliveryRateSample, ServerCarrierPathIdentity, ServerCarrierPathStatusSnapshot,
-    ServerNewStreamPolicy, ServerPathValidation, ServerRealtimeFlowLease,
-    ServerSessionManagementSnapshot, ServerStreamFrameRoute, ServerStreamManagementSnapshot,
-    ServerStreamOpenOutcome, ServerStreamOpenRequest, ServerStreamPort, ServerStreamPortBackend,
+    CarrierDeliveryRateSample, ServerCarrierPathIdentity, ServerCarrierPathRetirement,
+    ServerCarrierPathStatusSnapshot, ServerNewStreamPolicy, ServerPathValidation,
+    ServerRealtimeFlowLease, ServerSessionManagementSnapshot, ServerStreamFrameRoute,
+    ServerStreamManagementSnapshot, ServerStreamOpenOutcome, ServerStreamOpenRequest,
+    ServerStreamPort, ServerStreamPortBackend,
 };
 use crate::runtime::recent_ids::{RecentIdCache, reliable_closed_stream_cache_capacity};
 use crate::scheduler::TrafficClass;
@@ -43,7 +44,7 @@ use std::pin::Pin;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
-use tokio::sync::{Mutex as AsyncMutex, mpsc};
+use tokio::sync::{Mutex as AsyncMutex, mpsc, watch};
 
 /// Session-wide registry for server-side product reliable streams.
 ///
@@ -100,6 +101,7 @@ struct ServerRegisteredPath {
     state: PeerPathState,
     path_proof: Option<PathProofObservation>,
     retirement_started: bool,
+    retirement_completion: watch::Sender<bool>,
 }
 
 type ServerLogicalPathKey = (SessionId, UnderlayProtocol, PathId);
@@ -193,13 +195,27 @@ impl ExistingOrderedPathDetach {
 
 impl PendingOrderedPathDetach {
     async fn send(self) {
-        if self.events.send(self.event).await.is_err() {
-            self.binding.complete_path_detach(
-                self.key,
-                self.path_instance_id,
-                self.output_incarnation,
-            );
+        let Self {
+            events,
+            binding,
+            key,
+            path_instance_id,
+            output_incarnation,
+            event,
+        } = self;
+        if events.send(event).await.is_err() {
+            binding.complete_path_detach(key, path_instance_id, output_incarnation);
+            return;
         }
+        ExistingOrderedPathDetach {
+            events,
+            binding,
+            key,
+            path_instance_id,
+            output_incarnation,
+        }
+        .wait()
+        .await;
     }
 
     fn blocking_send(self) {
@@ -881,6 +897,7 @@ impl ServerReliableStreamRegistry {
             return Err(error);
         }
 
+        let (retirement_completion, _) = watch::channel(false);
         let inserted = {
             let mut paths = self
                 .registered_path_instances
@@ -898,6 +915,7 @@ impl ServerReliableStreamRegistry {
                             state: PeerPathState::Active,
                             path_proof: None,
                             retirement_started: false,
+                            retirement_completion,
                         },
                     )
                     .is_none()
@@ -944,14 +962,17 @@ impl ServerReliableStreamRegistry {
         }
     }
 
-    fn retire_carrier_path(self: &Arc<Self>, identity: ServerCarrierPathIdentity) {
+    fn retire_carrier_path(
+        self: &Arc<Self>,
+        identity: ServerCarrierPathIdentity,
+    ) -> ServerCarrierPathRetirement {
         let ServerCarrierPathIdentity {
             session_id,
             underlay,
             path_id,
             path_instance_id,
         } = identity;
-        let retirement_started = {
+        let (retirement, retirement_started) = {
             let logical_key = (session_id, underlay, path_id);
             let physical_key = (session_id, underlay, path_id, path_instance_id);
             let mut paths = self
@@ -959,22 +980,25 @@ impl ServerReliableStreamRegistry {
                 .lock()
                 .expect("server active path instance lock");
             if paths.logical_instances.get(&logical_key) != Some(&path_instance_id) {
-                false
+                return ServerCarrierPathRetirement::complete();
             } else {
                 let Some(path) = paths.instances.get_mut(&physical_key) else {
-                    return;
+                    return ServerCarrierPathRetirement::complete();
                 };
-                if path.retirement_started {
+                let retirement =
+                    ServerCarrierPathRetirement::pending(path.retirement_completion.subscribe());
+                let retirement_started = if path.retirement_started {
                     false
                 } else {
                     path.retirement_started = true;
                     path.state = PeerPathState::Draining;
                     true
-                }
+                };
+                (retirement, retirement_started)
             }
         };
         if !retirement_started {
-            return;
+            return retirement;
         }
         let key = CarrierPathKey { underlay, path_id };
         let stream_inputs = {
@@ -999,13 +1023,24 @@ impl ServerReliableStreamRegistry {
             match outcome {
                 ResponsePathDetachOutcome::Begun(output_incarnation) => {
                     if let Some(detach) = try_queue_ordered_path_detach(
-                        events,
-                        binding,
+                        events.clone(),
+                        binding.clone(),
                         key,
                         path_instance_id,
                         output_incarnation,
                     ) {
                         pending.push(detach);
+                    } else {
+                        // A successful queue send is not the lifecycle
+                        // boundary. The stream actor must apply the detach
+                        // before aggregate carrier retirement can complete.
+                        existing.push(ExistingOrderedPathDetach {
+                            events,
+                            binding,
+                            key,
+                            path_instance_id,
+                            output_incarnation,
+                        });
                     }
                 }
                 ResponsePathDetachOutcome::Pending(output_incarnation) => {
@@ -1021,7 +1056,7 @@ impl ServerReliableStreamRegistry {
         }
         if pending.is_empty() && existing.is_empty() {
             self.finish_carrier_path_retirement(identity);
-            return;
+            return retirement;
         }
         if let Ok(runtime) = tokio::runtime::Handle::try_current() {
             let registry = self.clone();
@@ -1043,6 +1078,7 @@ impl ServerReliableStreamRegistry {
             }
             self.finish_carrier_path_retirement(identity);
         }
+        retirement
     }
 
     fn finish_carrier_path_retirement(&self, identity: ServerCarrierPathIdentity) {
@@ -1060,19 +1096,19 @@ impl ServerReliableStreamRegistry {
                 .lock()
                 .expect("server active path instance lock");
             if paths.logical_instances.get(&logical_key) != Some(&path_instance_id) {
-                false
+                None
             } else {
-                let removed = paths.instances.remove(&physical_key).is_some();
-                if removed {
+                let removed = paths.instances.remove(&physical_key);
+                if removed.is_some() {
                     paths.logical_instances.remove(&logical_key);
                     decrement_session_path_count(&mut paths.session_path_counts, session_id);
                 }
                 removed
             }
         };
-        if !removed {
+        let Some(removed) = removed else {
             return;
-        }
+        };
         self.path_metrics
             .lock()
             .expect("server path metrics lock")
@@ -1082,6 +1118,7 @@ impl ServerReliableStreamRegistry {
             .expect("server path usage lock")
             .remove(&(session_id, underlay, path_id, path_instance_id));
         self.session_tracker.detach_session(session_id);
+        removed.retirement_completion.send_replace(true);
     }
 
     pub(in crate::runtime) fn open_or_attach(
@@ -1806,8 +1843,11 @@ impl ServerStreamPortBackend for ServerReliableStreamPortBackend {
             .activate_carrier_path(identity, local, principal_permit)
     }
 
-    fn retire_carrier_path(&self, identity: ServerCarrierPathIdentity) {
-        self.registry.retire_carrier_path(identity);
+    fn retire_carrier_path(
+        &self,
+        identity: ServerCarrierPathIdentity,
+    ) -> ServerCarrierPathRetirement {
+        self.registry.retire_carrier_path(identity)
     }
 
     fn set_carrier_path_state(&self, identity: ServerCarrierPathIdentity, state: PeerPathState) {

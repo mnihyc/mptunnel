@@ -330,6 +330,7 @@ fn tcp_path_stream_error(reason: &RuntimeError) -> RuntimeError {
         RuntimeError::PathHeartbeatTimeout => RuntimeError::PathHeartbeatTimeout,
         RuntimeError::PathOpenTimedOut => RuntimeError::PathOpenTimedOut,
         RuntimeError::ReliablePathSessionClosed => RuntimeError::ReliablePathSessionClosed,
+        RuntimeError::ReliablePathRetired => RuntimeError::ReliablePathRetired,
         RuntimeError::RemoteReset(reason) => RuntimeError::RemoteReset(*reason),
         RuntimeError::RemoteClosed(reason) => RuntimeError::RemoteClosed(*reason),
         RuntimeError::Protocol(message) => RuntimeError::Protocol(message),

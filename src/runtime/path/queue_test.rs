@@ -1,7 +1,8 @@
 use super::{
-    ReliablePathCommand, recv_reliable_path_command, reliable_path_command_channels,
-    reliable_path_command_pending_bytes, reliable_path_effective_frame_lane,
-    reliable_path_frame_uses_priority_queue, try_recv_reliable_path_command,
+    ReliablePathCommand, recv_reliable_path_command, recv_reliable_path_command_during_drain,
+    reliable_path_command_channels, reliable_path_command_pending_bytes,
+    reliable_path_effective_frame_lane, reliable_path_frame_uses_priority_queue,
+    try_recv_reliable_path_command,
 };
 use crate::protocol::{
     DatagramFlowId, Frame, PathId, PathUsage, ResetReason, StreamDemandHint, StreamId, TargetAddr,
@@ -45,6 +46,70 @@ fn ordered_writer_flow_load_tracks_lane_changes_and_lifetime() {
 
     drop(throughput);
     assert_eq!(commands.active_flow_counts(), (0, 0));
+}
+
+#[tokio::test]
+async fn path_drain_closes_admission_and_waits_for_preexisting_reservations() {
+    let (commands, mut receivers) = reliable_path_command_channels(1);
+    let reservation = commands
+        .try_reserve_admitted_frame(stream_data_frame(1, 1024), TrafficClass::Throughput)
+        .expect("pre-drain queue reservation");
+
+    commands.begin_path_drain();
+    assert!(matches!(
+        commands.try_reserve_admitted_frame(stream_data_frame(2, 1024), TrafficClass::Throughput),
+        Err(crate::runtime::error::RuntimeError::ReliablePathSessionClosed)
+    ));
+    commands
+        .try_enqueue_admitted_frame(
+            Frame::StreamAck {
+                stream_id: StreamId(1),
+                complete: false,
+                ranges: Vec::new(),
+            },
+            TrafficClass::Control,
+        )
+        .expect("crossing settlement control remains ordered after the application fence");
+    receivers.close_for_path_drain();
+    assert!(commands.is_closed(), "path drain stops all queue admission");
+    let mut draining = Box::pin(recv_reliable_path_command_during_drain(&mut receivers));
+    let control = draining
+        .as_mut()
+        .await
+        .expect("crossing settlement control is preserved");
+    drop(draining);
+    assert!(matches!(
+        control,
+        ReliablePathCommand::SendFrame(Frame::StreamAck {
+            stream_id: StreamId(1),
+            ..
+        })
+    ));
+    receivers.release_pending_command_bytes(reliable_path_command_pending_bytes(&control));
+
+    let mut draining = Box::pin(recv_reliable_path_command_during_drain(&mut receivers));
+    tokio::select! {
+        biased;
+        _ = draining.as_mut() => panic!("outstanding reservation ended path drain early"),
+        _ = std::future::ready(()) => {}
+    }
+
+    reservation.commit();
+    let command = draining.await.expect("pre-drain reservation is preserved");
+    assert!(matches!(
+        &command,
+        ReliablePathCommand::SendFrame(Frame::StreamData {
+            stream_id: StreamId(1),
+            ..
+        })
+    ));
+    receivers.release_pending_command_bytes(reliable_path_command_pending_bytes(&command));
+    assert!(
+        recv_reliable_path_command_during_drain(&mut receivers)
+            .await
+            .is_none(),
+        "terminal drain follows every accepted queue reservation"
+    );
 }
 
 #[test]

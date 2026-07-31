@@ -18,7 +18,7 @@ use crate::model::capacity::reliable_capacity_measurement_session_limit_bytes;
 use crate::mux::MuxLimits;
 #[cfg(feature = "lab-diagnostics")]
 use crate::protocol::frame::stream_ack_contiguous_frontier;
-use crate::protocol::{Frame, PathId, StreamId, UnderlayProtocol};
+use crate::protocol::{Frame, StreamId, UnderlayProtocol};
 use crate::runtime::error::RuntimeError;
 use crate::runtime::path::commands::{
     ReliablePathCommand, ReliablePathCommandReceivers, TcpCapacityProbeCommand,
@@ -40,7 +40,7 @@ struct ClientTcpCommandOptions {
 }
 
 #[allow(clippy::too_many_arguments)]
-pub(super) async fn handle_connected_client_tcp_command_run(
+pub(super) async fn handle_connected_client_tcp_command_run<const POLL_ADDITIONAL: bool>(
     first_command: ReliablePathCommand,
     commands: &mut ReliablePathCommandReceivers,
     connection: &mut ClientTcpPathConnection,
@@ -65,19 +65,21 @@ pub(super) async fn handle_connected_client_tcp_command_run(
     let mut terminal_stream_id = None;
 
     loop {
-        let Some(command) = next_command
-            .take()
-            .or_else(|| try_recv_reliable_path_command(commands))
-        else {
-            if try_coalesce_reliable_path_writer_run(
-                commands,
-                &mut next_command,
-                sent_items,
-                sent_bytes,
-                byte_budget,
-                item_budget,
-            )
-            .await
+        let Some(command) = next_command.take().or_else(|| {
+            POLL_ADDITIONAL
+                .then(|| try_recv_reliable_path_command(commands))
+                .flatten()
+        }) else {
+            if POLL_ADDITIONAL
+                && try_coalesce_reliable_path_writer_run(
+                    commands,
+                    &mut next_command,
+                    sent_items,
+                    sent_bytes,
+                    byte_budget,
+                    item_budget,
+                )
+                .await
             {
                 continue;
             }
@@ -143,7 +145,7 @@ pub(super) async fn handle_connected_client_tcp_command_run(
                     commands.release_pending_command_bytes(pending_bytes);
                     return Ok(());
                 }
-                if probe.path_id != PathId(runtime.path_index as u16)
+                if probe.path_id != runtime.path_id
                     || path_instance.key.underlay != UnderlayProtocol::Tcp
                     || path_instance.key.index != runtime.path_index
                     || probe.train_payload_bytes < probe.sample_floor_bytes
@@ -319,7 +321,7 @@ pub(super) async fn handle_connected_client_tcp_command_run(
     Ok(())
 }
 
-async fn flush_client_tcp_frame_batch(
+pub(super) async fn flush_client_tcp_frame_batch(
     connection: &mut ClientTcpPathConnection,
     frames: &mut Vec<Frame>,
     streams: &mut HashMap<StreamId, ClientTcpPathStreamState>,
@@ -327,8 +329,41 @@ async fn flush_client_tcp_frame_batch(
     datagrams: &mut ClientTcpDatagramState,
     runtime: &ClientTcpPathSessionRuntime,
 ) -> Result<(), RuntimeError> {
+    let deferred_frame = write_client_tcp_frame_batch_interlocked(
+        connection,
+        frames,
+        streams,
+        closed_streams,
+        datagrams,
+        runtime,
+    )
+    .await?;
+    if let Some(frame) = deferred_frame {
+        handle_client_tcp_path_frame(
+            frame,
+            connection,
+            streams,
+            closed_streams,
+            datagrams,
+            runtime,
+        )
+        .await?;
+    }
+    Ok(())
+}
+
+/// Writes one ordered frame batch while preserving an inbound barrier for the
+/// caller that owns the next lifecycle transition.
+pub(super) async fn write_client_tcp_frame_batch_interlocked(
+    connection: &mut ClientTcpPathConnection,
+    frames: &mut Vec<Frame>,
+    streams: &mut HashMap<StreamId, ClientTcpPathStreamState>,
+    closed_streams: &mut RecentIdCache<StreamId>,
+    datagrams: &mut ClientTcpDatagramState,
+    runtime: &ClientTcpPathSessionRuntime,
+) -> Result<Option<Frame>, RuntimeError> {
     if frames.is_empty() {
-        return Ok(());
+        return Ok(None);
     }
     let mut deferred_frame = None;
     let mut routed_frames = 0usize;
@@ -405,18 +440,7 @@ async fn flush_client_tcp_frame_batch(
             ),
         );
     }
-    if let Some(frame) = deferred_frame {
-        handle_client_tcp_path_frame(
-            frame,
-            connection,
-            streams,
-            closed_streams,
-            datagrams,
-            runtime,
-        )
-        .await?;
-    }
-    Ok(())
+    Ok(deferred_frame)
 }
 
 async fn client_write_tcp_capacity_probe_interlocked(

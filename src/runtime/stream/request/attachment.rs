@@ -523,6 +523,19 @@ impl ReliableRelayRemoteSet {
         true
     }
 
+    pub(in crate::runtime) async fn retire_path_instance(
+        &mut self,
+        instance: RelayPathInstance,
+    ) -> bool {
+        let Some(mut path) = self.remove_path_instance(instance) else {
+            return false;
+        };
+        path.depublish_load();
+        path.stream.send_detach().await;
+        path.stream.close().await;
+        true
+    }
+
     pub(in crate::runtime) fn remove_path_instance(
         &mut self,
         instance: RelayPathInstance,

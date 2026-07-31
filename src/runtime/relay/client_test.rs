@@ -1,5 +1,5 @@
 use super::{ClientRelayDeliveryState, ClientRelayDisconnectedState, ClientRelayState};
-use crate::model::path::RelayPathKey;
+use crate::model::path::{CarrierPathInstanceId, RelayPathInstance, RelayPathKey};
 use crate::mux::MuxLimits;
 use crate::mux::stream::{ReliableRecvStream, ReliableSendStream};
 use crate::protocol::{OffsetRange, StreamId, UnderlayProtocol};
@@ -29,20 +29,25 @@ fn delivery_attribution_credits_current_frame_not_released_buffer() {
         underlay: UnderlayProtocol::Udp,
         index: 1,
     };
+    let instance = RelayPathInstance {
+        key: path_key,
+        path_instance_id: CarrierPathInstanceId::from_raw(7),
+        attachment_id: 11,
+    };
     let delivered = [
         Bytes::from_static(&[0; 1024]),
         Bytes::from_static(&[1; 4096]),
     ];
     let mut delivery = ClientRelayDeliveryState::default();
 
-    let delivered_bytes = delivery.record_response(path_key, &delivered, 1024);
+    let delivered_bytes = delivery.record_response(instance, &delivered, 1024);
 
     assert_eq!(delivered_bytes, 5120);
     assert_eq!(delivery.total.payload_bytes, 5120);
     assert_eq!(
         delivery
             .by_path
-            .get(&path_key)
+            .get(&instance)
             .expect("path stat")
             .payload_bytes,
         1024,

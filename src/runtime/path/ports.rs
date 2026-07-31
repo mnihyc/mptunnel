@@ -20,7 +20,7 @@ use std::future::Future;
 use std::pin::Pin;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Weak};
-use tokio::sync::{mpsc, oneshot};
+use tokio::sync::{mpsc, oneshot, watch};
 
 /// A positive-ACK, non-application-limited delivery sample for one carrier.
 ///
@@ -270,6 +270,30 @@ pub(in crate::runtime) struct ServerCarrierPathRegistration {
     inner: Arc<ServerCarrierPathRegistrationInner>,
 }
 
+/// Completion authority for one exact carrier's ordered attachment retirement.
+pub(in crate::runtime) struct ServerCarrierPathRetirement {
+    completed: watch::Receiver<bool>,
+}
+
+impl ServerCarrierPathRetirement {
+    pub(in crate::runtime) fn pending(completed: watch::Receiver<bool>) -> Self {
+        Self { completed }
+    }
+
+    pub(in crate::runtime) fn complete() -> Self {
+        let (_completion, completed) = watch::channel(true);
+        Self { completed }
+    }
+
+    pub(in crate::runtime) async fn wait(mut self) {
+        while !*self.completed.borrow_and_update() {
+            if self.completed.changed().await.is_err() {
+                break;
+            }
+        }
+    }
+}
+
 struct ServerCarrierPathRegistrationInner {
     backend: Arc<dyn ServerStreamPortBackend>,
     owner_token: usize,
@@ -354,6 +378,10 @@ impl ServerCarrierPathRegistration {
             .set_carrier_path_state(self.inner.identity, state);
     }
 
+    pub(in crate::runtime) fn begin_retirement(&self) -> ServerCarrierPathRetirement {
+        self.inner.backend.retire_carrier_path(self.inner.identity)
+    }
+
     fn belongs_to(&self, port: &ServerStreamPort) -> bool {
         self.inner.owner_token == port.owner_token
     }
@@ -374,7 +402,7 @@ impl std::fmt::Debug for ServerCarrierPathRegistration {
 
 impl Drop for ServerCarrierPathRegistrationInner {
     fn drop(&mut self) {
-        self.backend.retire_carrier_path(self.identity);
+        let _ = self.backend.retire_carrier_path(self.identity);
     }
 }
 
@@ -430,7 +458,10 @@ pub(in crate::runtime) trait ServerStreamPortBackend: Send + Sync {
         principal_permit: PrincipalPermit,
     ) -> Result<(), RuntimeError>;
 
-    fn retire_carrier_path(&self, identity: ServerCarrierPathIdentity);
+    fn retire_carrier_path(
+        &self,
+        identity: ServerCarrierPathIdentity,
+    ) -> ServerCarrierPathRetirement;
 
     fn set_carrier_path_state(&self, identity: ServerCarrierPathIdentity, state: PeerPathState);
 

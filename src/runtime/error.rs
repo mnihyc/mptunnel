@@ -42,6 +42,7 @@ pub enum RuntimeError {
     DatagramResponseTimedOut,
     SenderServiceBlocked,
     ReliablePathSessionClosed,
+    ReliablePathRetired,
     SessionRetentionTimeout,
     ProductPolicy(String),
     GatewayStatePoisoned,
@@ -65,6 +66,7 @@ pub(in crate::runtime) fn reliable_path_error_is_migratable(err: &RuntimeError) 
         RuntimeError::PathHeartbeatTimeout
             | RuntimeError::PathOpenTimedOut
             | RuntimeError::ReliablePathSessionClosed
+            | RuntimeError::ReliablePathRetired
             | RuntimeError::Tcp(_)
             | RuntimeError::Encrypted(_)
             | RuntimeError::RemoteClosed(_)
@@ -209,6 +211,7 @@ impl std::fmt::Display for RuntimeError {
                 write!(f, "sender service has no currently admissible path")
             }
             Self::ReliablePathSessionClosed => write!(f, "reliable path session closed"),
+            Self::ReliablePathRetired => write!(f, "reliable path retired normally"),
             Self::SessionRetentionTimeout => {
                 write!(
                     f,
@@ -267,6 +270,7 @@ impl std::error::Error for RuntimeError {
             | Self::DatagramResponseTimedOut
             | Self::SenderServiceBlocked
             | Self::ReliablePathSessionClosed
+            | Self::ReliablePathRetired
             | Self::SessionRetentionTimeout
             | Self::ProductPolicy(_)
             | Self::GatewayStatePoisoned

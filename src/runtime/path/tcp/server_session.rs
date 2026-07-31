@@ -14,11 +14,11 @@ use crate::protocol::{CloseReason, Frame, PathId, PeerPathState, ResetReason, Se
 use crate::runtime::error::RuntimeError;
 use crate::runtime::path::commands::{
     ReliablePathCommand, ReliablePathCommandReceivers, ReliablePathCommandSender,
-    recv_reliable_path_command, reliable_path_command_pending_bytes,
-    reliable_path_command_writer_run_budget_bytes, reliable_path_command_writer_run_budget_items,
-    reliable_path_command_writer_run_bytes, reliable_path_frame_requires_capacity_command,
-    reliable_path_receivers_closed, try_coalesce_reliable_path_writer_run,
-    try_recv_reliable_path_command,
+    recv_reliable_path_command, recv_reliable_path_command_during_drain,
+    reliable_path_command_pending_bytes, reliable_path_command_writer_run_budget_bytes,
+    reliable_path_command_writer_run_budget_items, reliable_path_command_writer_run_bytes,
+    reliable_path_frame_requires_capacity_command, reliable_path_receivers_closed,
+    try_coalesce_reliable_path_writer_run, try_recv_reliable_path_command,
 };
 use crate::runtime::path::server_context::ServerPathContext;
 use crate::runtime::path::{ServerCarrierPathRegistration, ServerStreamFrameRoute};
@@ -35,8 +35,16 @@ enum ServerTcpSessionDisposition {
 
 enum ServerTcpFrameDisposition {
     Continue,
+    BeginPathDrain,
     SkipCommandPoll,
     Stop,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum ServerTcpCarrierState {
+    Active,
+    Draining,
+    Terminal,
 }
 
 enum ServerTcpPathEvent {
@@ -44,6 +52,11 @@ enum ServerTcpPathEvent {
     Command(ReliablePathCommand),
     PeerStatusRequest(u64),
     SenderObservationDue,
+}
+
+enum ServerTcpPathDrainEvent {
+    Incoming(Option<Result<Frame, EncryptedFramedTransportError>>),
+    Command(Option<ReliablePathCommand>),
 }
 
 /// Owned state transferred from authenticated admission into the long-lived actor.
@@ -63,7 +76,7 @@ pub(super) struct ServerTcpPathAdmission {
 pub(super) struct ServerTcpPathSession {
     session_id: SessionId,
     path_id: PathId,
-    draining: bool,
+    state: ServerTcpCarrierState,
     // Field order releases probe/flow RAII before queues and registration.
     evidence: ServerTcpEvidenceState,
     datagrams: ServerTcpDatagramState,
@@ -83,7 +96,7 @@ impl ServerTcpPathSession {
         Self {
             session_id: admission.session_id,
             path_id: admission.path_id,
-            draining: false,
+            state: ServerTcpCarrierState::Active,
             evidence: admission.evidence,
             datagrams: ServerTcpDatagramState::new(),
             streams: ServerTcpStreamState::new(),
@@ -139,6 +152,9 @@ impl ServerTcpPathSession {
                 ServerTcpPathEvent::Frame(frame) => {
                     match self.handle_frame(frame).await? {
                         ServerTcpFrameDisposition::Continue => {}
+                        ServerTcpFrameDisposition::BeginPathDrain => {
+                            return self.run_path_drain().await;
+                        }
                         ServerTcpFrameDisposition::SkipCommandPoll => continue,
                         ServerTcpFrameDisposition::Stop => return Ok(()),
                     }
@@ -165,6 +181,137 @@ impl ServerTcpPathSession {
         }
     }
 
+    async fn run_path_drain(&mut self) -> Result<(), RuntimeError> {
+        let deadline = tokio::time::Instant::now() + self.context.session_retention_timeout;
+        tokio::time::timeout_at(deadline, self.complete_path_drain())
+            .await
+            .map_err(|_| RuntimeError::ReliablePathSessionClosed)?
+    }
+
+    async fn complete_path_drain(&mut self) -> Result<(), RuntimeError> {
+        debug_assert!(self.state == ServerTcpCarrierState::Draining);
+        let retirement = self.path_registration.begin_retirement().wait();
+        tokio::pin!(retirement);
+
+        loop {
+            let event = if let Some(frame) = self.deferred_input.take() {
+                Some(ServerTcpPathEvent::Frame(frame))
+            } else {
+                tokio::select! {
+                    biased;
+                    () = &mut retirement => break,
+                    event = recv_server_tcp_path_event(
+                        &mut self.path_frames,
+                        &mut self.commands_rx,
+                        &mut self.peer_status,
+                        self.evidence.next_sender_observation_at(),
+                    ) => event?,
+                }
+            };
+            let Some(event) = event else {
+                return Ok(());
+            };
+            match event {
+                ServerTcpPathEvent::Command(command) => {
+                    if matches!(
+                        self.drain_path_command(command).await?,
+                        ServerTcpSessionDisposition::Stop
+                    ) {
+                        return Ok(());
+                    }
+                }
+                ServerTcpPathEvent::Frame(frame) => match self.handle_frame(frame).await? {
+                    ServerTcpFrameDisposition::Continue
+                    | ServerTcpFrameDisposition::BeginPathDrain => {}
+                    ServerTcpFrameDisposition::SkipCommandPoll => continue,
+                    ServerTcpFrameDisposition::Stop => return Ok(()),
+                },
+                ServerTcpPathEvent::PeerStatusRequest(request_id) => {
+                    if matches!(
+                        self.write_reply(Frame::PeerStatusRequest { request_id })
+                            .await?,
+                        ServerTcpFrameDisposition::Stop
+                    ) {
+                        return Ok(());
+                    }
+                }
+                ServerTcpPathEvent::SenderObservationDue => {}
+            }
+        }
+
+        self.commands_rx.close_for_path_drain();
+
+        loop {
+            if let Some(frame) = self.deferred_input.take() {
+                match self.handle_frame(frame).await? {
+                    ServerTcpFrameDisposition::Continue
+                    | ServerTcpFrameDisposition::BeginPathDrain
+                    | ServerTcpFrameDisposition::SkipCommandPoll => continue,
+                    ServerTcpFrameDisposition::Stop => return Ok(()),
+                }
+            }
+
+            let event = {
+                let command = recv_reliable_path_command_during_drain(&mut self.commands_rx);
+                tokio::pin!(command);
+                tokio::select! {
+                    biased;
+                    incoming = self.path_frames.recv() => {
+                        ServerTcpPathDrainEvent::Incoming(incoming)
+                    }
+                    command = &mut command => ServerTcpPathDrainEvent::Command(command),
+                }
+            };
+            match event {
+                ServerTcpPathDrainEvent::Incoming(incoming) => {
+                    let frame = match incoming {
+                        Some(Ok(frame)) => frame,
+                        Some(Err(err)) if encrypted_framed_peer_closed(&err) => return Ok(()),
+                        Some(Err(err)) => return Err(RuntimeError::Encrypted(err)),
+                        None => return Ok(()),
+                    };
+                    match self.handle_frame(frame).await? {
+                        ServerTcpFrameDisposition::Continue
+                        | ServerTcpFrameDisposition::BeginPathDrain
+                        | ServerTcpFrameDisposition::SkipCommandPoll => {}
+                        ServerTcpFrameDisposition::Stop => return Ok(()),
+                    }
+                }
+                ServerTcpPathDrainEvent::Command(command) => {
+                    let Some(command) = command else {
+                        break;
+                    };
+                    if matches!(
+                        self.drain_path_command(command).await?,
+                        ServerTcpSessionDisposition::Stop
+                    ) {
+                        return Ok(());
+                    }
+                }
+            }
+        }
+
+        if !self.streams.is_empty() || !self.datagrams.is_empty() {
+            return Err(RuntimeError::Protocol(
+                "TCP path drain preceded product attachment retirement",
+            ));
+        }
+        debug_assert!(self.evidence.is_idle());
+        self.state = ServerTcpCarrierState::Terminal;
+        if !self
+            .writer
+            .write_frame_unflushed(&Frame::PathClose {
+                path_id: self.path_id,
+                reason: CloseReason::Normal,
+            })
+            .await?
+        {
+            return Ok(());
+        }
+        let _ = self.writer.flush().await?;
+        Ok(())
+    }
+
     async fn handle_frame(
         &mut self,
         frame: Frame,
@@ -175,7 +322,7 @@ impl ServerTcpPathSession {
                 target,
                 demand,
                 ..
-            } if !self.draining => {
+            } if self.state == ServerTcpCarrierState::Active => {
                 let reply = self
                     .streams
                     .open(
@@ -204,7 +351,7 @@ impl ServerTcpPathSession {
             }
             Frame::OpenDatagramFlow {
                 flow_id, target, ..
-            } if !self.draining => {
+            } if self.state == ServerTcpCarrierState::Active => {
                 let effect = self
                     .datagrams
                     .open(
@@ -252,15 +399,7 @@ impl ServerTcpPathSession {
             }
             Frame::DatagramClose { flow_id } => {
                 self.datagrams.remove(flow_id);
-                if self.draining && self.streams.is_empty() && self.datagrams.is_empty() {
-                    self.write_stop_reply(Frame::PathClose {
-                        path_id: self.path_id,
-                        reason: CloseReason::Normal,
-                    })
-                    .await
-                } else {
-                    Ok(ServerTcpFrameDisposition::Continue)
-                }
+                Ok(ServerTcpFrameDisposition::Continue)
             }
             frame @ (Frame::StreamData { stream_id, .. }
             | Frame::StreamAck { stream_id, .. }
@@ -281,22 +420,14 @@ impl ServerTcpPathSession {
             Frame::StreamDetach { stream_id } => {
                 self.streams
                     .detach(&self.context, &self.path_registration, stream_id)?;
-                if self.draining && self.streams.is_empty() && self.datagrams.is_empty() {
-                    self.write_stop_reply(Frame::PathClose {
-                        path_id: self.path_id,
-                        reason: CloseReason::Normal,
-                    })
-                    .await
-                } else {
-                    Ok(ServerTcpFrameDisposition::Continue)
-                }
+                Ok(ServerTcpFrameDisposition::Continue)
             }
             Frame::Ping { nonce } => self.write_reply(Frame::Pong { nonce }).await,
             Frame::PathProofData {
                 path_id: proof_path_id,
                 proof_id,
                 payload,
-            } if proof_path_id == self.path_id => {
+            } if proof_path_id == self.path_id && self.state == ServerTcpCarrierState::Active => {
                 let reply =
                     self.evidence
                         .handle_path_proof_data(self.path_id, proof_id, payload.len());
@@ -306,7 +437,7 @@ impl ServerTcpPathSession {
                 path_id: proof_path_id,
                 proof_id,
                 payload_bytes,
-            } if proof_path_id == self.path_id => {
+            } if proof_path_id == self.path_id && self.state == ServerTcpCarrierState::Active => {
                 self.evidence.handle_path_proof_ack(
                     &self.context,
                     &self.path_registration,
@@ -320,7 +451,9 @@ impl ServerTcpPathSession {
                 path_id: capacity_path_id,
                 measurement_id,
                 payload,
-            } if capacity_path_id == self.path_id => {
+            } if capacity_path_id == self.path_id
+                && self.state == ServerTcpCarrierState::Active =>
+            {
                 self.evidence
                     .handle_request_capacity_data(measurement_id, payload.len())?;
                 Ok(ServerTcpFrameDisposition::Continue)
@@ -329,13 +462,39 @@ impl ServerTcpPathSession {
                 path_id: capacity_path_id,
                 measurement_id,
                 payload_bytes,
-            } if capacity_path_id == self.path_id => {
+            } if capacity_path_id == self.path_id
+                && self.state == ServerTcpCarrierState::Active =>
+            {
                 let reply = self.evidence.handle_request_capacity_finish(
                     self.path_id,
                     measurement_id,
                     payload_bytes,
                 )?;
                 self.write_reply(reply).await
+            }
+            Frame::PathProofData {
+                path_id: measurement_path_id,
+                ..
+            }
+            | Frame::PathProofAck {
+                path_id: measurement_path_id,
+                ..
+            }
+            | Frame::PathCapacityData {
+                path_id: measurement_path_id,
+                ..
+            }
+            | Frame::PathCapacityFinish {
+                path_id: measurement_path_id,
+                ..
+            }
+            | Frame::PathCapacityReceipt {
+                path_id: measurement_path_id,
+                ..
+            } if measurement_path_id == self.path_id
+                && self.state == ServerTcpCarrierState::Draining =>
+            {
+                Ok(ServerTcpFrameDisposition::Continue)
             }
             Frame::PathMetrics { metrics } if metrics.path_id == self.path_id => {
                 self.evidence
@@ -375,29 +534,60 @@ impl ServerTcpPathSession {
             }
             Frame::PathDrain {
                 path_id: drain_path_id,
-            } if drain_path_id == self.path_id => {
-                self.draining = true;
-                self.path_registration.set_state(PeerPathState::Draining);
-                if self.streams.is_empty() && self.datagrams.is_empty() {
-                    self.write_stop_reply(Frame::PathClose {
-                        path_id: self.path_id,
-                        reason: CloseReason::Normal,
-                    })
-                    .await
-                } else {
-                    Ok(ServerTcpFrameDisposition::Continue)
+            } if drain_path_id == self.path_id => match self.state {
+                ServerTcpCarrierState::Active => {
+                    self.commands_tx.begin_path_drain();
+                    self.state = ServerTcpCarrierState::Draining;
+                    self.path_registration.set_state(PeerPathState::Draining);
+                    self.evidence.cancel_for_path_drain();
+                    Ok(ServerTcpFrameDisposition::BeginPathDrain)
                 }
-            }
-            Frame::PathClose {
-                path_id: close_path_id,
-                ..
-            } if close_path_id == self.path_id => Ok(ServerTcpFrameDisposition::Stop),
+                ServerTcpCarrierState::Draining | ServerTcpCarrierState::Terminal => {
+                    Err(RuntimeError::Protocol("duplicate TCP path drain request"))
+                }
+            },
+            Frame::PathDrain { .. } => Err(RuntimeError::Protocol(
+                "TCP path drain request path mismatch",
+            )),
+            Frame::PathClose { .. } => Err(RuntimeError::Protocol(
+                "TCP server received peer path close",
+            )),
             Frame::SessionClose { .. } => Ok(ServerTcpFrameDisposition::Stop),
             _ => Err(RuntimeError::Protocol("unexpected TCP path session frame")),
         }
     }
 
     async fn drain_commands(
+        &mut self,
+        first_command: ReliablePathCommand,
+    ) -> Result<ServerTcpSessionDisposition, RuntimeError> {
+        self.write_command_run::<true>(first_command).await
+    }
+
+    async fn drain_path_command(
+        &mut self,
+        command: ReliablePathCommand,
+    ) -> Result<ServerTcpSessionDisposition, RuntimeError> {
+        let pending_bytes = reliable_path_command_pending_bytes(&command);
+        match command {
+            ReliablePathCommand::SendFrame(frame)
+                if server_tcp_frame_is_measurement_only(&frame) =>
+            {
+                self.commands_rx
+                    .release_pending_command_bytes(pending_bytes);
+                Ok(ServerTcpSessionDisposition::Continue)
+            }
+            ReliablePathCommand::SendTcpCapacityProbe(probe) => {
+                drop(probe);
+                self.commands_rx
+                    .release_pending_command_bytes(pending_bytes);
+                Ok(ServerTcpSessionDisposition::Continue)
+            }
+            command => self.write_command_run::<false>(command).await,
+        }
+    }
+
+    async fn write_command_run<const POLL_READY: bool>(
         &mut self,
         first_command: ReliablePathCommand,
     ) -> Result<ServerTcpSessionDisposition, RuntimeError> {
@@ -413,19 +603,21 @@ impl ServerTcpPathSession {
         let mut writer_pending_bytes = 0usize;
 
         loop {
-            let Some(command) = next_command
-                .take()
-                .or_else(|| try_recv_reliable_path_command(&mut self.commands_rx))
-            else {
-                if try_coalesce_reliable_path_writer_run(
-                    &mut self.commands_rx,
-                    &mut next_command,
-                    sent_items,
-                    sent_bytes,
-                    byte_budget,
-                    item_budget,
-                )
-                .await
+            let Some(command) = next_command.take().or_else(|| {
+                POLL_READY
+                    .then(|| try_recv_reliable_path_command(&mut self.commands_rx))
+                    .flatten()
+            }) else {
+                if POLL_READY
+                    && try_coalesce_reliable_path_writer_run(
+                        &mut self.commands_rx,
+                        &mut next_command,
+                        sent_items,
+                        sent_bytes,
+                        byte_budget,
+                        item_budget,
+                    )
+                    .await
                 {
                     continue;
                 }
@@ -484,16 +676,6 @@ impl ServerTcpPathSession {
                     }
                     self.streams
                         .detach(&self.context, &self.path_registration, stream_id)?;
-                    if self.draining && self.streams.is_empty() && self.datagrams.is_empty() {
-                        let _ = self
-                            .writer
-                            .write_frame(&Frame::PathClose {
-                                path_id: self.path_id,
-                                reason: CloseReason::Normal,
-                            })
-                            .await?;
-                        return Ok(ServerTcpSessionDisposition::Stop);
-                    }
                     if self.deferred_input.is_some() {
                         break;
                     }
@@ -508,18 +690,6 @@ impl ServerTcpPathSession {
                     }
                     self.streams
                         .detach(&self.context, &self.path_registration, stream_id)?;
-                    if self.draining && self.streams.is_empty() && self.datagrams.is_empty() {
-                        let _ = self
-                            .writer
-                            .write_frame(&Frame::PathClose {
-                                path_id: self.path_id,
-                                reason: CloseReason::Normal,
-                            })
-                            .await?;
-                        self.commands_rx
-                            .release_pending_command_bytes(pending_bytes);
-                        return Ok(ServerTcpSessionDisposition::Stop);
-                    }
                     self.commands_rx
                         .release_pending_command_bytes(pending_bytes);
                     sent_items = sent_items.saturating_add(1);
@@ -721,14 +891,17 @@ impl ServerTcpPathSession {
             Ok(ServerTcpFrameDisposition::Stop)
         }
     }
+}
 
-    async fn write_stop_reply(
-        &mut self,
-        frame: Frame,
-    ) -> Result<ServerTcpFrameDisposition, RuntimeError> {
-        let _ = self.writer.write_frame(&frame).await?;
-        Ok(ServerTcpFrameDisposition::Stop)
-    }
+fn server_tcp_frame_is_measurement_only(frame: &Frame) -> bool {
+    matches!(
+        frame,
+        Frame::PathProofData { .. }
+            | Frame::PathProofAck { .. }
+            | Frame::PathCapacityData { .. }
+            | Frame::PathCapacityFinish { .. }
+            | Frame::PathCapacityReceipt { .. }
+    )
 }
 
 async fn recv_server_tcp_path_event(

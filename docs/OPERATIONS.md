@@ -182,9 +182,11 @@ belong to the outbound that performs resolution and connection.
 
 `[session].retention_timeout_ms` and
 `--session-retention-timeout-ms` set the absolute time an established logical
-stream may remain without any authenticated carrier. The default is 300,000 ms.
-Retries never extend that deadline. Healthy idle streams with a live carrier do
-not consume it; TCP heartbeat and native QUIC idle timers remain separate.
+stream may remain without any authenticated carrier and the absolute ceiling
+for graceful TCP carrier retirement. The default is 300,000 ms. Retries and
+retirement progress never extend a deadline. Healthy idle streams with a live
+carrier do not consume it; TCP heartbeat and native QUIC idle timers remain
+separate.
 
 Use `mptunnel --help` and subcommand help as the complete option and environment
 variable reference. Validate configs in the target binary whenever possible;

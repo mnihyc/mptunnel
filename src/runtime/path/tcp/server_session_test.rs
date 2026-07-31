@@ -108,15 +108,23 @@ async fn server_tcp_native_sender_deadline_wakes_an_idle_actor() {
     assert!(matches!(event, ServerTcpPathEvent::SenderObservationDue));
 }
 
-#[tokio::test]
-async fn server_tcp_terminal_reset_precedes_detach_and_preserves_shared_session() {
+async fn server_tcp_test_session(
+    session_id: SessionId,
+    path_id: PathId,
+) -> (
+    ServerTcpPathSession,
+    EncryptedFramedStream<TcpStream>,
+    crate::runtime::path::commands::ReliablePathCommandSender,
+    mpsc::Sender<Result<Frame, EncryptedFramedTransportError>>,
+    crate::runtime::relay::ServerReliableRelayService,
+) {
     let security = ServerSecurityConfig::for_test(
         SharedSecret::new(b"0123456789abcdef0123456789abcdef".to_vec())
             .expect("test shared secret"),
     );
     let ServerIdentityRuntime {
         paths: context,
-        reliable_relay: _reliable_relay,
+        reliable_relay,
     } = new_identity_runtime(
         Vec::new(),
         OutboundConfig::Direct,
@@ -169,17 +177,46 @@ async fn server_tcp_terminal_reset_precedes_detach_and_preserves_shared_session(
     );
     let (_server_reader, server_writer) = server_framed.split().expect("split server carrier");
 
-    let session_id = SessionId(202);
-    let path_id = PathId(0);
     let path_registration = context.reliable_streams.register_test_carrier_path(
         session_id,
         UnderlayProtocol::Tcp,
         path_id,
         ServerLocalPathProperties::default(),
     );
+    let (commands_tx, commands_rx) = reliable_path_command_channels(8);
+    let commands = commands_tx.clone();
+    let (path_frames_tx, path_frames) = mpsc::channel(1);
+    let evidence = ServerTcpEvidenceState::new(None, None, context.mux_limits);
+    let peer_status = context.peer_status.register(session_id);
+    (
+        ServerTcpPathSession::new(ServerTcpPathAdmission {
+            context,
+            session_id,
+            path_id,
+            path_registration,
+            writer: ServerTcpWriter::new(server_writer),
+            path_frames,
+            commands_tx,
+            commands_rx,
+            evidence,
+            peer_status,
+        }),
+        client_framed,
+        commands,
+        path_frames_tx,
+        reliable_relay,
+    )
+}
+
+#[tokio::test]
+async fn server_tcp_terminal_reset_precedes_detach_and_preserves_shared_session() {
+    let session_id = SessionId(202);
+    let path_id = PathId(0);
+    let (mut session, mut client_framed, commands_for_streams, _path_frames_tx, _reliable_relay) =
+        server_tcp_test_session(session_id, path_id).await;
     let proof_elapsed = Duration::from_millis(1);
-    context.reliable_streams.record_path_proof_success(
-        &path_registration,
+    session.context.reliable_streams.record_path_proof_success(
+        &session.path_registration,
         PathProofObservation {
             proof_id: 1,
             elapsed: proof_elapsed,
@@ -188,23 +225,6 @@ async fn server_tcp_terminal_reset_precedes_detach_and_preserves_shared_session(
                 .expect("test validation instant"),
         },
     );
-    let (commands_tx, commands_rx) = reliable_path_command_channels(8);
-    let commands_for_streams = commands_tx.clone();
-    let (_path_frames_tx, path_frames) = mpsc::channel(1);
-    let evidence = ServerTcpEvidenceState::new(None, None, context.mux_limits);
-    let peer_status = context.peer_status.register(session_id);
-    let mut session = ServerTcpPathSession::new(ServerTcpPathAdmission {
-        context,
-        session_id,
-        path_id,
-        path_registration,
-        writer: ServerTcpWriter::new(server_writer),
-        path_frames,
-        commands_tx,
-        commands_rx,
-        evidence,
-        peer_status,
-    });
     session
         .handle_frame(Frame::PathStatus {
             path_id,
@@ -324,5 +344,55 @@ async fn server_tcp_terminal_reset_precedes_detach_and_preserves_shared_session(
     assert!(
         session.streams.is_empty(),
         "the terminal command must have removed only its own TCP attachment"
+    );
+}
+
+#[tokio::test]
+async fn server_tcp_path_close_is_the_aggregate_responder_suffix() {
+    let session_id = SessionId(203);
+    let path_id = PathId(0);
+    let (session, mut client_framed, commands, path_frames, _reliable_relay) =
+        server_tcp_test_session(session_id, path_id).await;
+    commands
+        .try_enqueue_admitted_frame(
+            Frame::PathProofData {
+                path_id,
+                proof_id: 1,
+                payload: Bytes::from_static(b"proof"),
+            },
+            TrafficClass::Control,
+        )
+        .expect("queue proof before path drain");
+    let final_control = Frame::Pong { nonce: 99 };
+    commands
+        .try_enqueue_admitted_frame(final_control.clone(), TrafficClass::Control)
+        .expect("queue product control before path drain");
+    path_frames
+        .send(Ok(Frame::PathDrain { path_id }))
+        .await
+        .expect("deliver ordered PATH_DRAIN");
+
+    tokio::time::timeout(Duration::from_secs(5), session.run())
+        .await
+        .expect("aggregate TCP path drain timeout")
+        .expect("complete aggregate TCP path drain");
+    assert_eq!(
+        tokio::time::timeout(Duration::from_secs(5), client_framed.read_frame())
+            .await
+            .expect("final TCP control timeout")
+            .expect("read final TCP control"),
+        final_control,
+        "ordinary accepted responder work must survive the drain fence"
+    );
+    assert_eq!(
+        tokio::time::timeout(Duration::from_secs(5), client_framed.read_frame())
+            .await
+            .expect("TCP PATH_CLOSE timeout")
+            .expect("read TCP PATH_CLOSE"),
+        Frame::PathClose {
+            path_id,
+            reason: crate::protocol::CloseReason::Normal,
+        },
+        "measurement work is canceled and PATH_CLOSE is serialized last"
     );
 }

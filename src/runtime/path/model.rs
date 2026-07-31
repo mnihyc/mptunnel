@@ -550,6 +550,14 @@ pub(in crate::runtime) fn path_snapshot(
     index: usize,
     observation: ClientPathObservation,
 ) -> PathSnapshot {
+    path_snapshot_with_id(path, PathId(index as u16), observation)
+}
+
+pub(in crate::runtime) fn path_snapshot_with_id(
+    path: &PathSpec,
+    path_id: PathId,
+    observation: ClientPathObservation,
+) -> PathSnapshot {
     let hinted_delivery_rate_bps = match path.metadata.initial_rate {
         RateHint::Unknown => default_path_rate_bps(),
         RateHint::Unlimited => 1_000_000_000_000.0,
@@ -594,7 +602,7 @@ pub(in crate::runtime) fn path_snapshot(
     // scheduler's current max(delivery, pacing) projection.
     let pacing_rate_bps = delivery_rate_bps;
     PathSnapshot {
-        id: PathId(index as u16),
+        id: path_id,
         underlay: path.underlay,
         state: observation.state,
         policy: path.metadata.policy,
@@ -625,10 +633,10 @@ pub(in crate::runtime) fn path_snapshot(
     }
 }
 
-pub(in crate::runtime) fn path_startup_snapshot(path: &PathSpec, index: usize) -> PathSnapshot {
-    path_snapshot(
+pub(in crate::runtime) fn path_startup_snapshot(path: &PathSpec, path_id: PathId) -> PathSnapshot {
+    path_snapshot_with_id(
         path,
-        index,
+        path_id,
         ClientPathObservation {
             state: SchedulerPathState::Active,
             carrier_app_limited: path.metadata.initial_rate == RateHint::Unknown,

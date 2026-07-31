@@ -91,9 +91,8 @@ pub(super) fn seed_client_bulk_evidence_for_test(context: &ClientPathContext, ke
             context.mark_udp_path_open_success(key.index, Duration::from_millis(20));
         }
     }
-    context.mark_relay_path_rate_sample(
-        key.underlay,
-        key.index,
+    context.mark_relay_path_rate_sample_for_test(
+        key,
         PathRateSample::new(4 * 1024 * 1024, Duration::from_millis(20)).expect("bulk rate sample"),
     );
 }

@@ -364,7 +364,15 @@ async fn reconnect_waits_for_bounded_ordered_retirement_under_backpressure() {
         .expect("first explicit detach");
     port.detach_path(&registration, stream_id)
         .expect("replayed explicit detach shares pending lifecycle");
-    drop(registration);
+    let retirement = registration.begin_retirement();
+    let mut retirement = Box::pin(retirement.wait());
+    tokio::select! {
+        biased;
+        () = retirement.as_mut() => {
+            panic!("aggregate retirement completed before the ordered detach");
+        }
+        _ = std::future::ready(()) => {}
+    }
     assert!(
         port.register_carrier_path(
             session_id,
@@ -387,13 +395,11 @@ async fn reconnect_waits_for_bounded_ordered_retirement_under_backpressure() {
     })
     .await
     .expect("the one ordered detach must drain through actor backpressure");
-    tokio::time::timeout(Duration::from_secs(1), async {
-        while !port.management_snapshot().paths.is_empty() {
-            tokio::task::yield_now().await;
-        }
-    })
-    .await
-    .expect("ordered retirement must finish after queue capacity recovers");
+    tokio::time::timeout(Duration::from_secs(1), retirement)
+        .await
+        .expect("aggregate retirement must finish after ordered detach completion");
+    assert!(port.management_snapshot().paths.is_empty());
+    drop(registration);
     let replacement = port
         .register_carrier_path(
             session_id,
@@ -403,6 +409,58 @@ async fn reconnect_waits_for_bounded_ordered_retirement_under_backpressure() {
             PrincipalPermit::for_test("test-peer"),
         )
         .expect("reconnect after ordered retirement");
+    let (replacement_commands, _replacement_receivers) = reliable_path_command_channels(8);
+    assert!(matches!(
+        registry
+            .open_or_attach(ServerStreamOpenRequest {
+                session_id,
+                stream_id,
+                target: TargetAddr::Ip(SocketAddr::from(([127, 0, 0, 1], 80))),
+                lane: TrafficClass::Throughput,
+                attachment: ServerStreamPathAttachment {
+                    path_registration: replacement.clone(),
+                    commands: replacement_commands,
+                    max_frame_payload_bytes: MuxLimits::default().max_payload_bytes,
+                },
+                mux_limits: MuxLimits::default(),
+            })
+            .expect("attach replacement carrier"),
+        ServerReliableStreamOpen::Existing
+    ));
+    let replacement_key = CarrierPathKey {
+        underlay: replacement.underlay(),
+        path_id: replacement.path_id(),
+    };
+    let replacement_incarnation = match &stream.output {
+        ReliablePathStreamOutput::Switchable(binding) => {
+            binding
+                .sender_path_targets(TrafficClass::Throughput, 1)
+                .first()
+                .expect("replacement response output")
+                .observation
+                .incarnation
+        }
+        ReliablePathStreamOutput::Fixed(_) => panic!("expected switchable response output"),
+    };
+    let replacement_retirement = replacement.begin_retirement();
+    let mut replacement_retirement = Box::pin(replacement_retirement.wait());
+    tokio::select! {
+        biased;
+        () = replacement_retirement.as_mut() => {
+            panic!("aggregate retirement completed when detach was only queued");
+        }
+        _ = std::future::ready(()) => {}
+    }
+    tokio::time::timeout(Duration::from_secs(1), async {
+        while stream.has_output_incarnation(replacement_key, replacement_incarnation) {
+            let _ = tokio::time::timeout(Duration::from_millis(10), stream.recv_frame()).await;
+        }
+    })
+    .await
+    .expect("replacement detach must be applied by the stream actor");
+    tokio::time::timeout(Duration::from_secs(1), replacement_retirement)
+        .await
+        .expect("fast-path retirement must finish after detach application");
     drop(replacement);
 }
 

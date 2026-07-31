@@ -573,10 +573,9 @@ async fn initial_path_probe_retains_tcp_carrier_without_stream_load() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn session_owner_reconciles_configured_minimum_without_elastic_expansion() {
+async fn session_owner_reconciles_minimum_and_retires_disabled_group() {
     enum CarrierServerControl {
         Abort(usize),
-        AbortAll,
     }
 
     let path = reserve_tcp_path_with_query("tcp-carriers=2-3").await;
@@ -606,11 +605,6 @@ async fn session_owner_reconciles_configured_minimum_without_elastic_expansion()
                     match command {
                         Some(CarrierServerControl::Abort(index)) => {
                             if let Some(handle) = abort_handles.get(index) {
-                                handle.abort();
-                            }
-                        }
-                        Some(CarrierServerControl::AbortAll) => {
-                            for handle in &abort_handles {
                                 handle.abort();
                             }
                         }
@@ -765,53 +759,76 @@ async fn session_owner_reconciles_configured_minimum_without_elastic_expansion()
         "replacement must preserve the configured member label"
     );
 
-    let (target_addr, target) = spawn_echo_target().await;
+    let target_listener = TcpListener::bind("127.0.0.1:0").await.expect("target bind");
+    let target_addr = target_listener.local_addr().expect("target addr");
+    let target = tokio::spawn(async move {
+        let (mut stream, _) = target_listener.accept().await.expect("target accept");
+        let mut first = [0u8; 4];
+        stream
+            .read_exact(&mut first)
+            .await
+            .expect("target first read");
+        assert_eq!(&first, b"ping");
+        stream.write_all(b"pong").await.expect("target first write");
+        let mut second = [0u8; 4];
+        stream
+            .read_exact(&mut second)
+            .await
+            .expect("target post-drain read");
+        assert_eq!(&second, b"next");
+        stream
+            .write_all(b"done")
+            .await
+            .expect("target post-drain write");
+        stream.shutdown().await.expect("target shutdown");
+    });
     let (mut product_client, product_server) = duplex(4096);
     let product = tokio::spawn(handle_socks5_client_stream(product_server, context.clone()));
-    drive_socks5_echo_client(&mut product_client, target_addr).await;
-    product.await.expect("product join").expect("product relay");
-    target.await.expect("target join");
+    open_socks5_tcp_tunnel(&mut product_client, target_addr).await;
+    product_client
+        .write_all(b"ping")
+        .await
+        .expect("pre-drain payload");
+    let mut first_response = [0u8; 4];
+    product_client
+        .read_exact(&mut first_response)
+        .await
+        .expect("pre-drain response");
+    assert_eq!(&first_response, b"pong");
 
     let stable_client_instances = context
         .tcp_sessions
         .iter()
         .map(ClientTcpPathSessionHandle::connection_instance_id)
         .collect::<Vec<_>>();
+    let stable_server_instances = replacement
+        .paths
+        .iter()
+        .map(|path| path.path_instance_id)
+        .collect::<HashSet<_>>();
     context.set_tcp_endpoint_control(0, ClientTcpEndpointControlState::Disabled);
-    tokio::task::yield_now().await;
-    assert_eq!(
-        context
-            .tcp_sessions
-            .iter()
-            .map(ClientTcpPathSessionHandle::connection_instance_id)
-            .collect::<Vec<_>>(),
-        stable_client_instances,
-        "runtime disable must not invent carrier retirement"
-    );
+    // A later generation must not cancel drains already requested by the
+    // disabled generation.
     context.set_tcp_endpoint_control(0, ClientTcpEndpointControlState::Enabled);
-    tokio::task::yield_now().await;
-    assert_eq!(
-        context
-            .tcp_sessions
-            .iter()
-            .map(ClientTcpPathSessionHandle::connection_instance_id)
-            .collect::<Vec<_>>(),
-        stable_client_instances,
-        "runtime re-enable must not require replacement of nonterminal carriers"
-    );
-
-    context.set_tcp_endpoint_control(0, ClientTcpEndpointControlState::Disabled);
-    server_control
-        .send(CarrierServerControl::AbortAll)
-        .expect("abort disabled endpoint carriers");
-    wait_for_tcp_ready_count(&context, 0).await;
-    tokio::time::timeout(Duration::from_secs(2), async {
+    tokio::time::timeout(Duration::from_secs(5), async {
         loop {
-            if snapshot_context
+            let client_instances = context
+                .tcp_sessions
+                .iter()
+                .map(ClientTcpPathSessionHandle::connection_instance_id)
+                .collect::<Vec<_>>();
+            let server_paths = snapshot_context
                 .reliable_streams
                 .management_snapshot()
-                .paths
-                .is_empty()
+                .paths;
+            if client_instances.iter().all(Option::is_some)
+                && client_instances
+                    .iter()
+                    .all(|instance| !stable_client_instances.contains(instance))
+                && server_paths.len() == 2
+                && server_paths
+                    .iter()
+                    .all(|path| !stable_server_instances.contains(&path.path_instance_id))
             {
                 break;
             }
@@ -819,33 +836,41 @@ async fn session_owner_reconciles_configured_minimum_without_elastic_expansion()
         }
     })
     .await
-    .expect("disabled server carriers must reach native terminal state");
+    .expect("re-enable must finish old drains before restoring fresh minimum carriers");
+    let restored_client_instances = context
+        .tcp_sessions
+        .iter()
+        .map(|session| {
+            session
+                .connection_instance_id()
+                .expect("re-enabled configured-minimum carrier")
+        })
+        .collect::<Vec<_>>();
     assert!(
-        context
-            .tcp_sessions
+        restored_client_instances
             .iter()
-            .all(|session| !session.is_connection_ready()),
-        "disable plus exact native failure must suppress minimum replacement"
+            .all(|instance| !stable_client_instances.contains(&Some(*instance))),
+        "re-enable must establish fresh physical instances after terminal drain"
     );
-
-    context.set_tcp_endpoint_control(0, ClientTcpEndpointControlState::Enabled);
-    wait_for_tcp_ready_count(&context, 2).await;
-    tokio::time::timeout(Duration::from_secs(2), async {
-        loop {
-            if snapshot_context
-                .reliable_streams
-                .management_snapshot()
-                .paths
-                .len()
-                == 2
-            {
-                break;
-            }
-            tokio::time::sleep(Duration::from_millis(10)).await;
-        }
-    })
+    product_client
+        .write_all(b"next")
+        .await
+        .expect("post-drain payload");
+    let mut second_response = [0u8; 4];
+    tokio::time::timeout(
+        Duration::from_secs(5),
+        product_client.read_exact(&mut second_response),
+    )
     .await
-    .expect("re-enable must restore only the configured minimum");
+    .expect("post-drain response timeout")
+    .expect("post-drain response");
+    assert_eq!(&second_response, b"done");
+    product_client
+        .shutdown()
+        .await
+        .expect("product client shutdown");
+    product.await.expect("product join").expect("product relay");
+    target.await.expect("target join");
 
     path_service.abort();
     let _ = path_service.await;
@@ -873,22 +898,6 @@ async fn path_probe_refreshes_udp_health_without_association_load() {
 }
 
 #[tokio::test]
-async fn path_probe_skips_tcp_path_with_active_stream() {
-    let path = reserve_tcp_path().await;
-    let context =
-        ClientPathContext::new(vec![path], security(), ResourceLimits::default()).expect("ctx");
-    context.mark_tcp_path_open_success(0, Duration::from_millis(5), TrafficClass::Throughput);
-
-    probe_client_paths(&context, Duration::from_millis(20)).await;
-
-    let health = context.health().lock().expect("health lock");
-    assert_eq!(health.tcp[0].state, SchedulerPathState::Active);
-    assert_eq!(health.tcp[0].consecutive_failures, 0);
-    assert_eq!(health.tcp[0].active_flows, 1);
-    assert_eq!(health.tcp[0].relay_bytes_in_flight, 0);
-}
-
-#[tokio::test]
 async fn path_probe_skips_udp_path_with_active_session() {
     let path = reserve_udp_path().await;
     let context =
@@ -902,45 +911,6 @@ async fn path_probe_skips_udp_path_with_active_session() {
     assert_eq!(health.udp[0].consecutive_failures, 0);
     assert_eq!(health.udp[0].active_flows, 1);
     assert_eq!(health.udp[0].relay_bytes_in_flight, 0);
-}
-
-#[tokio::test]
-async fn repeated_path_probe_failure_keeps_only_tcp_path_probeable() {
-    let path = reserve_tcp_path().await;
-    let context =
-        ClientPathContext::new(vec![path], security(), ResourceLimits::default()).expect("ctx");
-
-    probe_client_paths(&context, Duration::from_millis(50)).await;
-
-    {
-        let health = context.health().lock().expect("health lock");
-        assert_eq!(health.tcp[0].state, SchedulerPathState::Suspect);
-        assert_eq!(health.tcp[0].consecutive_failures, 1);
-        assert!(health.tcp[0].failed_until.is_none());
-    }
-    assert_eq!(
-        context
-            .ordered_tcp_path_indices(TrafficClass::Latency, 512)
-            .first()
-            .copied(),
-        Some(0)
-    );
-
-    probe_client_paths(&context, Duration::from_millis(50)).await;
-
-    {
-        let health = context.health().lock().expect("health lock");
-        assert_eq!(health.tcp[0].state, SchedulerPathState::Suspect);
-        assert_eq!(health.tcp[0].consecutive_failures, 2);
-        assert!(health.tcp[0].failed_until.is_none());
-    }
-    assert_eq!(
-        context
-            .ordered_tcp_path_indices(TrafficClass::Latency, 512)
-            .first()
-            .copied(),
-        Some(0)
-    );
 }
 
 #[tokio::test]

@@ -129,6 +129,16 @@ impl PathProofTracker {
         })
     }
 
+    /// Cancels measurement-only proof state when its exact carrier drains.
+    pub(in crate::runtime) fn cancel_for_path_drain(&mut self) {
+        self.pending.clear();
+        self.order.clear();
+    }
+
+    pub(in crate::runtime) fn is_idle(&self) -> bool {
+        self.pending.is_empty()
+    }
+
     #[cfg(test)]
     pub(super) fn pending_len(&self) -> usize {
         self.pending.len()

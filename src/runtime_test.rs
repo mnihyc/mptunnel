@@ -942,7 +942,7 @@ async fn server_udp_listener_accepts_probe_after_noise() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn udp_probe_prepares_cold_carrier_then_isolates_live_validation() {
+async fn udp_probe_prepares_and_reuses_the_durable_carrier() {
     let (path, server) = spawn_udp_server_path(OutboundConfig::Direct).await;
     let resources = ResourceLimits::default();
     let provider = Arc::new(CountingCarrierNetworkProvider::default());
@@ -962,7 +962,8 @@ async fn udp_probe_prepares_cold_carrier_then_isolates_live_validation() {
 
     probe_udp_client_path(&context, 0, Duration::from_secs(2))
         .await
-        .expect("prepare cold UDP path");
+        .expect("prepare cold UDP path")
+        .expect("cold UDP path publishes native RTT");
     assert_eq!(provider.socket_count(), 1);
 
     let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
@@ -974,22 +975,20 @@ async fn udp_probe_prepares_cold_carrier_then_isolates_live_validation() {
     ping_client_udp_stream(&mut product_stream).await;
     assert_eq!(provider.socket_count(), 1);
 
-    probe_udp_client_path(&context, 0, Duration::from_secs(2))
+    let observation = probe_udp_client_path(&context, 0, Duration::from_secs(2))
         .await
-        .expect("isolated UDP path probe");
-    assert_eq!(provider.socket_count(), 2);
+        .expect("observe durable UDP carrier");
+    assert!(
+        observation.is_none(),
+        "a ready carrier does not manufacture fresh liveness evidence"
+    );
+    assert_eq!(provider.socket_count(), 1);
     assert_eq!(
         provider.socket_identities(),
-        vec![
-            crate::transport::CarrierPathIdentity {
-                group_ordinal: 5,
-                path_ordinal: 0,
-            },
-            crate::transport::CarrierPathIdentity {
-                group_ordinal: 5,
-                path_ordinal: 0,
-            },
-        ],
+        vec![crate::transport::CarrierPathIdentity {
+            group_ordinal: 5,
+            path_ordinal: 0,
+        }],
     );
 
     let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
@@ -998,7 +997,7 @@ async fn udp_probe_prepares_cold_carrier_then_isolates_live_validation() {
         .await
         .expect("reuse durable UDP carrier");
     assert_eq!(reused_stream.path_instance_id, product_instance);
-    assert_eq!(provider.socket_count(), 2);
+    assert_eq!(provider.socket_count(), 1);
     ping_client_udp_stream(&mut reused_stream).await;
 
     server.abort();

@@ -281,6 +281,7 @@ pub(super) fn new_identity_runtime_with_metadata(
             path_join_replay_cache_capacity(resources.max_streams),
         ))),
         max_udp_flows_per_session: resources.max_streams,
+        session_retention_timeout,
     };
     Ok(ServerIdentityRuntime {
         paths,

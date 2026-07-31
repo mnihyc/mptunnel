@@ -55,7 +55,8 @@ max_restarts = 10
 
 [session]
 # Established streams survive a complete carrier outage for five minutes.
-# Healthy idle streams with an authenticated carrier do not consume this timer.
+# The same absolute ceiling bounds graceful TCP carrier retirement.
+# Healthy idle streams with an authenticated carrier do not consume it.
 retention_timeout_ms = 300000
 
 [management]

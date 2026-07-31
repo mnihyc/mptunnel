@@ -846,11 +846,7 @@ impl RequestMultipathController {
             RequestProductSendMutation::Data
             | RequestProductSendMutation::MeasurementFence { .. }
             | RequestProductSendMutation::OriginalData { .. } => {
-                context.record_relay_path_send(
-                    instance.key.underlay,
-                    instance.key.index,
-                    sent_bytes,
-                );
+                context.record_relay_path_send(instance, sent_bytes);
             }
             // Reinjection data repeats an existing product offset, so enqueue must
             // not install or advance unique-data ownership.
@@ -1329,11 +1325,7 @@ impl RequestMultipathController {
             smallvec::SmallVec::<[RequestOwnerAckProgress<RelayPathInstance>; 4]>::new();
         for release in self.request.flights.release_normalized_acked_ranges(ranges) {
             self.request.reinjection_attempts.remove(&release.instance);
-            context.release_relay_path_inflight(
-                release.instance.key.underlay,
-                release.instance.key.index,
-                release.bytes,
-            );
+            context.release_relay_path_inflight(release.instance, release.bytes);
             if release.path_proving {
                 if let Some(progress) = delivered_data
                     .iter_mut()
@@ -1440,8 +1432,7 @@ impl RequestMultipathController {
                             replace_startup_rate,
                         );
                         context.mark_relay_path_ack_clock_rate_sample(
-                            instance.key.underlay,
-                            instance.key.index,
+                            instance,
                             sample,
                             replace_startup_rate,
                         );
@@ -1469,11 +1460,7 @@ impl RequestMultipathController {
                         .get_mut(instance)
                         .mark_capacity_admitted();
                     self.record_request_per_flow_rate_sample(instance, sample, false);
-                    context.mark_relay_path_rate_sample(
-                        instance.key.underlay,
-                        instance.key.index,
-                        sample,
-                    );
+                    context.mark_relay_path_rate_sample(instance, sample);
                 }
             }
         }
@@ -1564,11 +1551,7 @@ impl RequestMultipathController {
 
     pub(super) fn release_all(&mut self, context: &ClientPathContext) {
         for release in self.request.flights.drain_all() {
-            context.release_relay_path_inflight(
-                release.instance.key.underlay,
-                release.instance.key.index,
-                release.bytes,
-            );
+            context.release_relay_path_inflight(release.instance, release.bytes);
         }
     }
 

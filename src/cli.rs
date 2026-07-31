@@ -326,7 +326,7 @@ fn secret_utf8(bytes: Vec<u8>, purpose: &'static str) -> Result<String, CliConfi
 
 #[derive(Debug, Args)]
 pub struct SessionArgs {
-    /// Retain established logical streams while every carrier path is unavailable.
+    /// Bound carrierless stream retention and graceful TCP carrier retirement.
     #[arg(
         long = "session-retention-timeout-ms",
         global = true,

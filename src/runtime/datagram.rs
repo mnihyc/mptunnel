@@ -32,6 +32,7 @@ pub(super) use edge::{
     dispatch_udp_edge_request, finish_udp_edge_completion, remove_udp_edge_lane,
     udp_edge_completion_queue, udp_edge_queue_slots,
 };
+#[cfg(test)]
 pub(super) use quic_session::UdpDatagramClientSession;
 pub(in crate::runtime) use server::{ServerDatagramService, ServerDatagramServiceConfig};
 

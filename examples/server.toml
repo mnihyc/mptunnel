@@ -13,7 +13,7 @@ principal_id = "home"
 secret = { from = "file", path = "mpp-credential.key" }
 
 [session]
-# Keep target sockets available for client carrier reattachment.
+# Keep target sockets for reattachment and bound graceful TCP carrier retirement.
 retention_timeout_ms = 300000
 
 [dns]

@@ -8,7 +8,7 @@ use crate::runtime::path::ClientPathContext;
 use crate::runtime::path::model::path_record_failure_cooldown;
 use crate::scheduler::PathState as SchedulerPathState;
 use crate::transport::TcpCarrierRange;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use tokio::sync::watch;
 
@@ -21,6 +21,7 @@ pub(in crate::runtime) struct ClientTcpEndpointPolicySnapshot {
 #[derive(Debug)]
 pub(in crate::runtime) struct ClientTcpEndpointPolicy {
     changes: watch::Sender<ClientTcpEndpointPolicySnapshot>,
+    commitment: Mutex<()>,
 }
 
 impl ClientTcpEndpointPolicy {
@@ -29,7 +30,10 @@ impl ClientTcpEndpointPolicy {
             enabled: true,
             generation: 1,
         });
-        Arc::new(Self { changes })
+        Arc::new(Self {
+            changes,
+            commitment: Mutex::new(()),
+        })
     }
 
     pub(in crate::runtime) fn snapshot(&self) -> ClientTcpEndpointPolicySnapshot {
@@ -41,7 +45,21 @@ impl ClientTcpEndpointPolicy {
         snapshot.enabled && snapshot.generation == generation
     }
 
-    fn set_enabled(&self, enabled: bool) {
+    pub(in crate::runtime) fn with_current<R>(
+        &self,
+        generation: u64,
+        apply: impl FnOnce() -> R,
+    ) -> Option<R> {
+        let _commitment = self
+            .commitment
+            .lock()
+            .expect("TCP endpoint policy commitment lock");
+        let snapshot = self.snapshot();
+        (snapshot.enabled && snapshot.generation == generation).then(apply)
+    }
+
+    /// Replaces the published policy while the caller owns `commitment`.
+    fn replace_enabled(&self, enabled: bool) {
         let current = self.snapshot();
         if current.enabled == enabled {
             return;
@@ -223,39 +241,57 @@ impl ClientPathContext {
             .tcp_carrier_groups
             .get(config_index)
             .expect("configured TCP endpoint must retain its carrier group");
+
+        let _policy_commitment = group
+            .policy
+            .commitment
+            .lock()
+            .expect("TCP endpoint policy commitment lock");
+        let enabled = !matches!(state, ClientTcpEndpointControlState::Disabled);
+        if !enabled {
+            for &index in &group.members {
+                self.tcp_sessions
+                    .get(index)
+                    .expect("TCP group member must have one carrier actor")
+                    .begin_path_drain();
+            }
+        }
+        group.policy.replace_enabled(enabled);
         let mut health = self
             .health()
             .lock()
             .expect("client path health management lock");
-
-        match state {
-            ClientTcpEndpointControlState::Enabled
-            | ClientTcpEndpointControlState::Suspect
-            | ClientTcpEndpointControlState::Failed => group.policy.set_enabled(true),
-            ClientTcpEndpointControlState::Disabled => group.policy.set_enabled(false),
-        }
-
         let now = std::time::Instant::now();
         for &index in &group.members {
             let record = health
                 .tcp
                 .get_mut(index)
                 .expect("TCP group member must have one health record");
-            record.invalidate_path_proofs();
             match state {
                 ClientTcpEndpointControlState::Enabled | ClientTcpEndpointControlState::Suspect => {
+                    record.invalidate_path_proofs();
+                    let retiring = record.has_physical_carrier()
+                        && record.state == SchedulerPathState::Draining;
                     record.manual_disabled = false;
-                    record.state = SchedulerPathState::Suspect;
-                    record.failed_until = None;
+                    if !retiring {
+                        record.state = SchedulerPathState::Suspect;
+                        record.failed_until = None;
+                    }
                 }
                 ClientTcpEndpointControlState::Failed => {
+                    record.invalidate_path_proofs();
                     record.manual_disabled = false;
                     record.state = SchedulerPathState::Failed;
                     record.failed_until = Some(now + path_record_failure_cooldown(record));
                 }
                 ClientTcpEndpointControlState::Disabled => {
                     record.manual_disabled = true;
-                    record.state = SchedulerPathState::Failed;
+                    if record.has_physical_carrier() {
+                        record.begin_planned_retirement();
+                    } else {
+                        record.invalidate_path_proofs();
+                        record.state = SchedulerPathState::Failed;
+                    }
                     record.failed_until = None;
                     record.relay_bytes_in_flight = 0;
                     record.relay_queue_bytes = 0;
@@ -263,6 +299,7 @@ impl ClientPathContext {
             }
         }
         drop(health);
+        drop(_policy_commitment);
 
         // Control transitions wake the one configured-minimum reconciler.
         // Only Disabled forbids establishment; Failed remains health evidence.

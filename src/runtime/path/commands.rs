@@ -18,6 +18,7 @@ use std::sync::{
 use std::time::{Duration, Instant};
 use tokio::sync::{mpsc, oneshot};
 
+pub(in crate::runtime) use super::queue::recv_reliable_path_command_during_drain;
 pub(in crate::runtime) use super::queue::{
     ReliablePathCommandQueueSnapshot, ReliablePathCommandReceivers, recv_reliable_path_command,
     reliable_path_command_channels, reliable_path_command_pending_bytes,

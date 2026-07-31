@@ -419,8 +419,8 @@ fn validate_product_policy_targets(
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct SessionConfig {
-    /// Maximum interval an established logical stream may have no carrier.
-    /// Healthy idle streams with an authenticated carrier do not consume it.
+    /// Absolute ceiling for carrierless stream retention and graceful TCP
+    /// carrier retirement. Healthy idle streams do not consume it.
     pub retention_timeout: Duration,
 }
 

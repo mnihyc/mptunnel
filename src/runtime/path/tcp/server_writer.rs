@@ -63,7 +63,10 @@ impl ServerTcpWriter {
         self.flush().await
     }
 
-    async fn write_frame_unflushed(&mut self, frame: &Frame) -> Result<bool, RuntimeError> {
+    pub(super) async fn write_frame_unflushed(
+        &mut self,
+        frame: &Frame,
+    ) -> Result<bool, RuntimeError> {
         match self.framed.write_frame(frame).await {
             Ok(()) => Ok(true),
             Err(err) if encrypted_framed_peer_closed(&err) => Ok(false),

@@ -10,8 +10,7 @@ use crate::runtime::error::RuntimeError;
 #[cfg(test)]
 use crate::runtime::ingress_runtime::probe_tcp_client_path;
 use crate::runtime::ingress_runtime::{
-    ReadyTcpPathProbe, probe_ready_tcp_client_path, probe_udp_client_path,
-    spawn_http_connect_client_ingress, spawn_socks5_client_ingress,
+    probe_udp_client_path, spawn_http_connect_client_ingress, spawn_socks5_client_ingress,
     spawn_tcp_forward_client_ingress, spawn_udp_forward_client_ingress,
 };
 use crate::runtime::path::tcp::group::ClientTcpMinimumRetry;
@@ -182,12 +181,7 @@ pub(in crate::runtime) async fn run_path_probe_service(
                 if measurements.is_empty() {
                     let context = context.clone();
                     measurements.spawn(async move {
-                        probe_selected_paths(
-                            &context,
-                            timeout,
-                            TcpProbeSelection::ReadyOnly,
-                        )
-                        .await;
+                        probe_selected_paths(&context, timeout, TcpProbeSelection::None).await;
                     });
                 }
                 groups
@@ -221,19 +215,16 @@ pub(in crate::runtime) async fn probe_paths(context: &ClientPathContext, timeout
 #[derive(Clone, Copy)]
 enum TcpProbeSelection {
     None,
-    ReadyOnly,
     #[cfg(test)]
     All,
 }
 
 enum PathProbeResult {
-    ReadyTcp {
-        path_index: usize,
-        result: Option<ReadyTcpPathProbe>,
-    },
+    #[cfg(test)]
+    Tcp,
     Udp {
         path_index: usize,
-        result: Result<Duration, RuntimeError>,
+        result: Result<Option<Duration>, RuntimeError>,
     },
 }
 
@@ -245,20 +236,6 @@ async fn probe_selected_paths(
     let mut probes = tokio::task::JoinSet::new();
     match tcp {
         TcpProbeSelection::None => {}
-        TcpProbeSelection::ReadyOnly => {
-            for path_index in 0..context.tcp_paths.len() {
-                if !context.should_probe_tcp_path(path_index) {
-                    continue;
-                }
-                let context = context.clone();
-                probes.spawn(async move {
-                    PathProbeResult::ReadyTcp {
-                        path_index,
-                        result: probe_ready_tcp_client_path(&context, path_index, timeout).await,
-                    }
-                });
-            }
-        }
         #[cfg(test)]
         TcpProbeSelection::All => {
             for path_index in 0..context.tcp_paths.len() {
@@ -267,10 +244,8 @@ async fn probe_selected_paths(
                 }
                 let context = context.clone();
                 probes.spawn(async move {
-                    PathProbeResult::ReadyTcp {
-                        path_index,
-                        result: probe_tcp_client_path(&context, path_index, timeout).await,
-                    }
+                    probe_tcp_client_path(&context, path_index, timeout).await;
+                    PathProbeResult::Tcp
                 });
             }
         }
@@ -290,30 +265,17 @@ async fn probe_selected_paths(
 
     while let Some(result) = probes.join_next().await {
         match result {
-            Ok(PathProbeResult::ReadyTcp {
-                path_index,
-                result:
-                    Some(ReadyTcpPathProbe {
-                        path_instance_id,
-                        result,
-                    }),
-            }) => match result {
-                Ok(elapsed) => context.mark_tcp_path_probe_success_for_instance(
-                    path_index,
-                    path_instance_id,
-                    elapsed,
-                ),
-                Err(_) => {
-                    context.mark_tcp_path_probe_failure_for_instance(path_index, path_instance_id)
-                }
-            },
-            Ok(PathProbeResult::ReadyTcp { .. }) => {}
+            #[cfg(test)]
+            Ok(PathProbeResult::Tcp) => {}
             Ok(PathProbeResult::Udp {
                 path_index,
-                result: Ok(elapsed),
+                result: Ok(Some(elapsed)),
             }) => {
                 context.mark_udp_path_probe_success(path_index, elapsed);
             }
+            Ok(PathProbeResult::Udp {
+                result: Ok(None), ..
+            }) => {}
             Ok(PathProbeResult::Udp {
                 path_index,
                 result: Err(_),

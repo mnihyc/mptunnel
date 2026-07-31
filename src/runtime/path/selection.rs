@@ -11,7 +11,7 @@ use crate::model::admission::{
 };
 use crate::model::capacity::{PATH_OPEN_SCORE_BYTES, relay_lane_startup_chunk_bytes};
 use crate::model::path::{RelayPathKey, RelayPathProofEpoch};
-use crate::protocol::{PathMetricDirection, PathMetrics, UnderlayProtocol};
+use crate::protocol::{PathId, PathMetricDirection, PathMetrics, UnderlayProtocol};
 use crate::runtime::path::health::ClientPathHealthRecord;
 use crate::runtime::path::model::{
     ClientPathObservation, UdpPathCandidate, UdpPathRuntimeModel, apply_bulk_latency_isolation,
@@ -608,7 +608,7 @@ impl ClientPathContext {
                     shared_snapshot: Some(path_snapshot(path, key.index, observation)),
                     tcp: (key.underlay == UnderlayProtocol::Tcp).then(|| {
                         ReliableRequestTcpPathEvidence {
-                            startup_snapshot: path_startup_snapshot(path, key.index),
+                            startup_snapshot: path_startup_snapshot(path, PathId(key.index as u16)),
                             rate_hint_unknown: path.metadata.initial_rate == RateHint::Unknown,
                         }
                     }),

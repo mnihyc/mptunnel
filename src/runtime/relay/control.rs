@@ -1570,6 +1570,7 @@ where
                 let frame = match frame {
                     Ok(frame) => frame,
                     Err(err) if reliable_path_error_is_migratable(&err) => {
+                        let planned_retirement = matches!(&err, RuntimeError::ReliablePathRetired);
                         #[cfg(feature = "lab-diagnostics")]
                         lab_diagnostic(
                             "client_path_frame_error",
@@ -1583,10 +1584,14 @@ where
                                 err,
                             ),
                         );
-                        sender
-                            .fail_client_path_instance(context, &mut remotes, instance)
-                            .await;
-                        state.recovery.excluded_paths.insert(path_key);
+                        if planned_retirement {
+                            remotes.retire_path_instance(instance).await;
+                        } else {
+                            sender
+                                .fail_client_path_instance(context, &mut remotes, instance)
+                                .await;
+                            state.recovery.excluded_paths.insert(path_key);
+                        }
                         match recover_reliable_relay_after_path_failure(
                             &mut sender,
                             &mut sender_queue,
@@ -1692,7 +1697,7 @@ where
                                     context,
                                     recv_stream,
                                     stream_id,
-                                    instance.key,
+                                    instance,
                                     offset,
                                     payload,
                                 )?;
@@ -1977,8 +1982,8 @@ where
         .map(ReliableRelayRemotePath::key)
         .collect::<Vec<_>>();
     if result.is_ok() {
-        for (key, path_stats) in std::mem::take(&mut state.delivery.by_path) {
-            context.mark_relay_path_delivery(key.underlay, key.index, path_stats);
+        for (instance, path_stats) in std::mem::take(&mut state.delivery.by_path) {
+            context.mark_relay_path_delivery(instance, path_stats);
         }
     }
     // Successful teardown stays behind ordered FIN work. A failed local

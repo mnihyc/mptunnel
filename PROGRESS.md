@@ -11,6 +11,75 @@ Historical entries below are retained as evidence of the decisions made at
 their recorded time. When a later entry changes an earlier decision, the later
 entry is authoritative.
 
+## 2026-07-31T15:02:46+08:00: ordered TCP retirement correctness candidate
+
+- Name: exact carrier drain, planned replacement, and native evidence cleanup
+- Category: Product carrier lifecycle, RFC correction, and Core change control
+- State: correctness gates pass; this remains a performance-unaccepted
+  candidate until adjacent representative labs complete
+- RFC correction:
+  - removed the unproved two-pre/two-assisted/two-post sample geometry,
+    universal percentages, sample bytes, validation timers, and timed
+    contraction from the previously recorded elastic-controller model;
+  - retained only bounded admission, finite exact Product evidence, strict
+    target and aggregate improvement, exact result settlement, and zero-work
+    retirement; and
+  - automatic elastic expansion remains disconnected. No removed controller
+    rule is replaced by another threshold, timer, estimator, or vocabulary.
+- Implemented Product lifecycle:
+  - the client alone initiates ordered TCP `PATH_DRAIN`; the server alone emits
+    the matching `PATH_CLOSE`, and wrong-direction, unsolicited, duplicate, or
+    path-mismatched lifecycle frames fail closed;
+  - one carrier-instance admission fence rejects fresh Product work while
+    preserving every command whose queue reservation crossed the boundary;
+    drain order remains retirement, control, priority, reinjection, then data;
+  - the existing non-restarting session-retention deadline bounds the complete
+    graceful drain operation on each endpoint; expiry closes the exact native
+    carrier and enters ordinary recovery without synthesizing peer authority;
+  - management disable drains exact minimum carriers, immediate re-enable
+    cannot revive a draining actor, and terminal actors are replaced with
+    fresh physical instances under the same logical session; and
+  - planned retirement is distinct from failure, exact server detach
+    completion is awaited, and Product streams retain aggregate state across
+    the carrier replacement.
+- Evidence and health ownership:
+  - relay send, in-flight release, delivery, ACK-clock, peer usage, and
+    transport observations now carry exact physical carrier identity, so late
+    callbacks from a retired instance cannot mutate its replacement;
+  - physical replacement clears only physical evidence while preserving
+    configured policy and logical flow ownership;
+  - removed separate TCP sockets and transient QUIC connections that attempted
+    to infer a live carrier's health from another carrier;
+  - recurring QUIC maintenance now prepares a missing durable connection but
+    treats an already-ready connection as no new observation; cached RTT is not
+    manufactured into fresh liveness evidence; and
+  - two tests for a test-only TCP probe path were removed because production
+    configured-minimum reconciliation no longer executes that path.
+- Practical corrections during the gate:
+  - a full-suite failure showed that a full queue after drain could be reported
+    as temporary backpressure. The nonblocking reservation path now reports
+    exact carrier closure while retaining a single lifecycle load on the
+    ordinary successful hot path; and
+  - recurring durable QUIC recovery was restored after the false-probe cleanup
+    had accidentally left only the startup pass.
+- Verification:
+  - `cargo fmt --all`, `git diff --check`,
+    `cargo check --all-targets --all-features`, and
+    `cargo clippy --all-targets --all-features -- -D warnings` pass;
+  - `cargo test --all-targets --all-features --quiet` passes: 1,409 library
+    tests, two allocation tests, and four daily-use acceptance tests;
+  - the full-stack configured-minimum scenario passes disable, ordered drain,
+    immediate re-enable, exact fresh-instance replacement, and continuation of
+    the same SOCKS5 Product stream; and
+  - the durable QUIC scenario proves one socket/identity is reused and a ready
+    carrier does not publish a false probe result.
+- Performance boundary: no congestion control, pacing, scheduler formula,
+  native recovery, transport window, carrier range, or timing value changed.
+  No no-regression or competitive-performance claim is made yet.
+- Next: commit this coherent candidate, run adjacent representative TCP/QUIC,
+  TCP-range QoS, and balanced blackhole guards, then retain or revert the
+  candidate from those measurements before any further protocol work.
+
 ## 2026-07-31T03:42:16+08:00: MPP v5 wire and authenticated path purpose aligned
 
 - Name: singular carrier-validation wire and fail-closed purpose boundary

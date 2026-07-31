@@ -158,6 +158,7 @@ pub(in crate::runtime) struct ServerPathContext {
     pub(in crate::runtime) telemetry: RuntimeTelemetry,
     pub(in crate::runtime) path_join_replay: Arc<Mutex<ExpiringReplayCache<PathJoinReplayKey>>>,
     pub(in crate::runtime) max_udp_flows_per_session: usize,
+    pub(in crate::runtime) session_retention_timeout: Duration,
 }
 
 impl ServerPathContext {

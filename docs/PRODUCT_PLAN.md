@@ -97,7 +97,7 @@ endpoint.
 | `[[credentials]]` | MPP `credential_id`, `principal_id`, file/environment secret, optional expiry, revocation, and revocation grace. |
 | `[[local_users]]` | Canonically named SOCKS5/HTTP CONNECT username/password mapped to a stable Product `principal_id`. |
 | `[service]` | Service intent and optional in-process generation supervision/backoff. It does not install a native service. |
-| `[session]` | Core-owned authenticated-carrier outage retention envelope. |
+| `[session]` | Core-owned carrierless-stream retention and graceful TCP carrier-retirement envelope. |
 | `[management]` | Loopback listeners, referenced bearer token, dashboard switch, and peer-diagnostic permission. |
 | `[resources]` | Core capacity and liveness envelopes documented by the reference config. These are not Product traffic profiles. |
 | `[admission]` | Product-wide live-flow, concurrent-work, principal, outbound, target, connect, and DNS-work bounds. |

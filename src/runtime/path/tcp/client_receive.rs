@@ -9,7 +9,7 @@ use super::client_state::{ClientTcpPathConnection, ClientTcpPathSessionRuntime};
 use super::client_stream::{
     ClientTcpPathStreamState, expire_client_tcp_pending_opens, handle_client_tcp_stream_frame,
 };
-use crate::protocol::{Frame, PathId, StreamId, UnderlayProtocol};
+use crate::protocol::{Frame, StreamId, UnderlayProtocol};
 use crate::runtime::error::RuntimeError;
 use crate::runtime::path::proof::path_proof_ack_frame;
 use crate::runtime::recent_ids::RecentIdCache;
@@ -25,7 +25,7 @@ pub(super) async fn handle_client_tcp_path_frame(
 ) -> Result<(), RuntimeError> {
     connection.carrier.refresh_liveness();
     expire_client_tcp_pending_opens(connection, streams, closed_streams).await?;
-    let path_id = PathId(runtime.path_index as u16);
+    let path_id = runtime.path_id;
     match &frame {
         Frame::PathCapacityData { .. }
         | Frame::PathCapacityFinish { .. }
@@ -141,9 +141,12 @@ pub(super) async fn handle_client_tcp_path_frame(
             Ok(())
         }
         Frame::SessionClose { reason } => Err(RuntimeError::RemoteClosed(reason)),
-        Frame::PathDrain { .. } | Frame::PathClose { .. } => {
-            Err(RuntimeError::ReliablePathSessionClosed)
-        }
+        Frame::PathDrain { .. } => Err(RuntimeError::Protocol(
+            "TCP client received peer path drain request",
+        )),
+        Frame::PathClose { .. } => Err(RuntimeError::Protocol(
+            "TCP path close preceded a client drain request",
+        )),
         _ => Err(RuntimeError::Protocol("unexpected TCP path session frame")),
     }
 }

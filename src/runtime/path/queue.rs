@@ -52,6 +52,17 @@ pub(in crate::runtime) struct ReliablePathCommandReceivers {
     closed_streams: RecentIdCache<StreamId>,
     metrics: Arc<ReliablePathCommandQueueMetrics>,
     dequeued_unreleased_bytes: AtomicU64,
+    path_drain_phase: Option<ReliablePathCommandDrainPhase>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ReliablePathCommandDrainPhase {
+    Retirement,
+    Control,
+    Priority,
+    Reinjection,
+    Data,
+    Complete,
 }
 
 /// Live logical-flow load for one ordered carrier writer queue.
@@ -218,12 +229,91 @@ struct ReliablePathCommandQueueMetrics {
     flow_counts: AtomicU64,
     capacity_released: Arc<Notify>,
     tcp_capacity_probe: TcpCapacityProbeLeaseState,
+    lifecycle: ReliablePathCarrierLifecycle,
 }
 
 #[derive(Debug, Default)]
 struct TcpCapacityProbeLeaseState {
     active: AtomicBool,
     attempts: AtomicU8,
+}
+
+/// One exact carrier-instance fence for new application work.
+///
+/// The lifecycle check after queue reservation is the admission boundary.
+/// Work whose reservation crossed it before retirement remains owned by the
+/// ordered queue and is drained; later work is rejected and can migrate.
+#[derive(Debug)]
+struct ReliablePathCarrierLifecycle {
+    phase: AtomicU8,
+    changed: Notify,
+}
+
+const RELIABLE_PATH_CARRIER_ACTIVE: u8 = 0;
+const RELIABLE_PATH_CARRIER_DRAINING: u8 = 1;
+const RELIABLE_PATH_CARRIER_TERMINAL: u8 = 2;
+
+impl Default for ReliablePathCarrierLifecycle {
+    fn default() -> Self {
+        Self {
+            phase: AtomicU8::new(RELIABLE_PATH_CARRIER_ACTIVE),
+            changed: Notify::new(),
+        }
+    }
+}
+
+impl ReliablePathCarrierLifecycle {
+    fn is_active(&self) -> bool {
+        self.phase.load(Ordering::Acquire) == RELIABLE_PATH_CARRIER_ACTIVE
+    }
+
+    fn begin_drain(&self) {
+        if self
+            .phase
+            .compare_exchange(
+                RELIABLE_PATH_CARRIER_ACTIVE,
+                RELIABLE_PATH_CARRIER_DRAINING,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            )
+            .is_ok()
+        {
+            self.changed.notify_waiters();
+        }
+    }
+
+    fn finish(&self) {
+        if self
+            .phase
+            .swap(RELIABLE_PATH_CARRIER_TERMINAL, Ordering::AcqRel)
+            != RELIABLE_PATH_CARRIER_TERMINAL
+        {
+            self.changed.notify_waiters();
+        }
+    }
+
+    async fn wait_for_drain(&self) {
+        loop {
+            let changed = self.changed.notified();
+            tokio::pin!(changed);
+            changed.as_mut().enable();
+            if !self.is_active() {
+                return;
+            }
+            changed.await;
+        }
+    }
+}
+
+#[derive(Clone)]
+pub(in crate::runtime) struct ReliablePathDrainSignal {
+    metrics: Arc<ReliablePathCommandQueueMetrics>,
+}
+
+impl ReliablePathDrainSignal {
+    pub(in crate::runtime) async fn wait(&self) {
+        self.metrics.lifecycle.wait_for_drain().await;
+    }
 }
 
 #[derive(Debug)]
@@ -410,6 +500,30 @@ impl ReliablePathCommandQueueMetrics {
 }
 
 impl ReliablePathCommandReceivers {
+    pub(in crate::runtime) fn path_drain_signal(&self) -> ReliablePathDrainSignal {
+        ReliablePathDrainSignal {
+            metrics: self.metrics.clone(),
+        }
+    }
+
+    /// Stops new admission while preserving every already reserved command.
+    ///
+    /// Tokio keeps a closed channel alive until outstanding permits resolve.
+    /// `recv_reliable_path_command_during_drain` therefore remains the sole
+    /// terminal test after this operation.
+    pub(in crate::runtime) fn close_for_path_drain(&mut self) {
+        if self.path_drain_phase.is_some() {
+            return;
+        }
+        self.metrics.lifecycle.begin_drain();
+        self.retirement.close();
+        self.control.close();
+        self.priority.close();
+        self.reinjection.close();
+        self.data.close();
+        self.path_drain_phase = Some(ReliablePathCommandDrainPhase::Retirement);
+    }
+
     fn take_queued_command(&self, command: QueuedReliablePathCommand) -> ReliablePathCommand {
         let (command, accounted_bytes) = command.into_parts();
         self.dequeued_unreleased_bytes
@@ -467,6 +581,7 @@ impl ReliablePathCommandReceivers {
 
 impl Drop for ReliablePathCommandReceivers {
     fn drop(&mut self) {
+        self.metrics.lifecycle.finish();
         // Queued envelopes reconcile themselves. This covers a command already
         // removed from mpsc when a writer exits through an async error path.
         let outstanding = self.dequeued_unreleased_bytes.swap(0, Ordering::Relaxed);
@@ -476,6 +591,13 @@ impl Drop for ReliablePathCommandReceivers {
 }
 
 impl ReliablePathCommandSender {
+    /// Stops fresh application work at the carrier-instance boundary without
+    /// preventing ordered control needed to settle work already admitted.
+    pub(in crate::runtime) fn begin_path_drain(&self) {
+        self.metrics.lifecycle.begin_drain();
+        self.metrics.capacity_released.notify_waiters();
+    }
+
     pub(in crate::runtime) fn register_flow(
         &self,
         lane: TrafficClass,
@@ -494,12 +616,15 @@ impl ReliablePathCommandSender {
     }
 
     pub(in crate::runtime) fn queue_snapshot(&self) -> ReliablePathCommandQueueSnapshot {
+        let product_open = self.metrics.lifecycle.is_active();
         let priority_open = !self.priority.is_closed();
         let data_open = !self.data.is_closed();
         ReliablePathCommandQueueSnapshot {
-            priority_ready: priority_open && self.priority.capacity() > 0,
-            reinjection_ready: !self.reinjection.is_closed() && self.reinjection.capacity() > 0,
-            data_ready: data_open && self.data.capacity() > 0,
+            priority_ready: product_open && priority_open && self.priority.capacity() > 0,
+            reinjection_ready: product_open
+                && !self.reinjection.is_closed()
+                && self.reinjection.capacity() > 0,
+            data_ready: product_open && data_open && self.data.capacity() > 0,
         }
     }
 
@@ -535,15 +660,18 @@ impl ReliablePathCommandSender {
         let stream_id = reliable_path_command_stream_id(&command).unwrap_or(StreamId(0));
         #[cfg(feature = "lab-diagnostics")]
         let started = Instant::now();
-        let result = self
-            .control
-            .send(QueuedReliablePathCommand::new(
-                command,
-                0,
-                self.metrics.clone(),
-            ))
-            .await
-            .map_err(|err| mpsc::error::SendError(err.0.into_rejected_command()));
+        let requires_product_admission = reliable_path_command_requires_product_admission(&command);
+        let result = match self.control.reserve().await {
+            Ok(permit) if !requires_product_admission || self.metrics.lifecycle.is_active() => {
+                permit.send(QueuedReliablePathCommand::new(
+                    command,
+                    0,
+                    self.metrics.clone(),
+                ));
+                Ok(())
+            }
+            Ok(_) | Err(_) => Err(mpsc::error::SendError(command)),
+        };
         #[cfg(feature = "lab-diagnostics")]
         {
             let elapsed = started.elapsed();
@@ -587,15 +715,20 @@ impl ReliablePathCommandSender {
             response,
         };
         let pending_bytes = reliable_path_command_pending_bytes(&command);
+        let requires_product_admission = reliable_path_command_requires_product_admission(&command);
         self.metrics.add_pending_bytes(pending_bytes);
-        self.priority
-            .send(QueuedReliablePathCommand::new(
-                command,
-                pending_bytes,
-                self.metrics.clone(),
-            ))
-            .await
-            .map_err(|err| mpsc::error::SendError(err.0.into_rejected_command()))
+        let queued = QueuedReliablePathCommand::new(command, pending_bytes, self.metrics.clone());
+        let permit = match self.priority.reserve().await {
+            Ok(permit) => permit,
+            Err(_) => {
+                return Err(mpsc::error::SendError(queued.into_rejected_command()));
+            }
+        };
+        if requires_product_admission && !self.metrics.lifecycle.is_active() {
+            return Err(mpsc::error::SendError(queued.into_rejected_command()));
+        }
+        permit.send(queued);
+        Ok(())
     }
 
     pub(in crate::runtime) async fn send_stream_ordered_close(
@@ -635,15 +768,16 @@ impl ReliablePathCommandSender {
         let queue = &self.data;
         #[cfg(feature = "lab-diagnostics")]
         let started = Instant::now();
+        let requires_product_admission = reliable_path_command_requires_product_admission(&command);
         self.metrics.add_pending_bytes(pending_bytes);
-        let result = queue
-            .send(QueuedReliablePathCommand::new(
-                command,
-                pending_bytes,
-                self.metrics.clone(),
-            ))
-            .await
-            .map_err(|err| mpsc::error::SendError(err.0.into_rejected_command()));
+        let queued = QueuedReliablePathCommand::new(command, pending_bytes, self.metrics.clone());
+        let result = match queue.reserve().await {
+            Ok(permit) if !requires_product_admission || self.metrics.lifecycle.is_active() => {
+                permit.send(queued);
+                Ok(())
+            }
+            Ok(_) | Err(_) => Err(mpsc::error::SendError(queued.into_rejected_command())),
+        };
         #[cfg(feature = "lab-diagnostics")]
         {
             let elapsed = started.elapsed();
@@ -725,12 +859,19 @@ impl ReliablePathCommandSender {
         let permit = match self.data.try_reserve() {
             Ok(permit) => permit,
             Err(tokio::sync::mpsc::error::TrySendError::Full(_)) => {
+                if !self.metrics.lifecycle.is_active() {
+                    return Err(RuntimeError::ReliablePathSessionClosed);
+                }
                 return Err(RuntimeError::SenderServiceBlocked);
             }
             Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => {
                 return Err(RuntimeError::ReliablePathSessionClosed);
             }
         };
+        if !self.metrics.lifecycle.is_active() {
+            drop(permit);
+            return Err(RuntimeError::ReliablePathSessionClosed);
+        }
         let lease = self.metrics.try_reserve_tcp_capacity_probe()?;
         let pending_bytes = usize::try_from(request.train_payload_bytes).unwrap_or(usize::MAX);
         let probe = TcpCapacityProbeCommand {
@@ -855,6 +996,7 @@ impl ReliablePathCommandSender {
                 "PATH_CAPACITY_* requires an explicit typed carrier command",
             ));
         }
+        let requires_product_admission = reliable_path_frame_requires_product_admission(&frame);
         let bytes = reliable_path_frame_pacing_bytes(&frame);
         #[cfg(feature = "lab-diagnostics")]
         let frame_kind = reliable_path_frame_kind(&frame);
@@ -865,7 +1007,11 @@ impl ReliablePathCommandSender {
             Err(err) => {
                 let error = match err {
                     tokio::sync::mpsc::error::TrySendError::Full(_) => {
-                        RuntimeError::SenderServiceBlocked
+                        if requires_product_admission && !self.metrics.lifecycle.is_active() {
+                            RuntimeError::ReliablePathSessionClosed
+                        } else {
+                            RuntimeError::SenderServiceBlocked
+                        }
                     }
                     tokio::sync::mpsc::error::TrySendError::Closed(_) => {
                         RuntimeError::ReliablePathSessionClosed
@@ -892,6 +1038,10 @@ impl ReliablePathCommandSender {
                 return Err(error);
             }
         };
+        if requires_product_admission && !self.metrics.lifecycle.is_active() {
+            drop(permit);
+            return Err(RuntimeError::ReliablePathSessionClosed);
+        }
         Ok(ReliablePathFrameReservation {
             permit: Some(permit),
             frame: Some(frame),
@@ -1000,6 +1150,40 @@ pub(in crate::runtime) fn reliable_path_frame_requires_capacity_command(frame: &
     )
 }
 
+fn reliable_path_frame_requires_product_admission(frame: &Frame) -> bool {
+    matches!(
+        frame,
+        Frame::OpenStream { .. }
+            | Frame::StreamData { .. }
+            | Frame::StreamFin { .. }
+            | Frame::OpenDatagramFlow { .. }
+            | Frame::DatagramData { .. }
+            | Frame::PathProofData { .. }
+            | Frame::PathProofAck { .. }
+            | Frame::PathCapacityData { .. }
+            | Frame::PathCapacityFinish { .. }
+            | Frame::PathCapacityReceipt { .. }
+    )
+}
+
+fn reliable_path_command_requires_product_admission(command: &ReliablePathCommand) -> bool {
+    match command {
+        ReliablePathCommand::PrepareConnection { .. }
+        | ReliablePathCommand::OpenStream { .. }
+        | ReliablePathCommand::OpenDatagramAttachment { .. }
+        | ReliablePathCommand::OpenDatagramFlow { .. }
+        | ReliablePathCommand::SendTcpCapacityProbe(_) => true,
+        ReliablePathCommand::SendDatagramFrame { frame, .. }
+        | ReliablePathCommand::SendFrame(frame) => {
+            reliable_path_frame_requires_product_admission(frame)
+        }
+        ReliablePathCommand::CancelTcpOpen { .. }
+        | ReliablePathCommand::CloseDatagramAttachment { .. }
+        | ReliablePathCommand::ResetAndCloseStream { .. }
+        | ReliablePathCommand::CloseStream(_) => false,
+    }
+}
+
 pub(in crate::runtime) fn reliable_path_command_channels(
     queue: usize,
 ) -> (ReliablePathCommandSender, ReliablePathCommandReceivers) {
@@ -1034,6 +1218,7 @@ pub(in crate::runtime) fn reliable_path_command_channels(
             ),
             metrics,
             dequeued_unreleased_bytes: AtomicU64::new(0),
+            path_drain_phase: None,
         },
     )
 }
@@ -1103,6 +1288,78 @@ pub(in crate::runtime) async fn recv_reliable_path_command(
                 }
             }
             ReceivedCommand::Retirement(None) | ReceivedCommand::Queued(None) => {}
+        }
+    }
+}
+
+/// Drains every command and every outstanding queue reservation after path
+/// admission has been closed.
+pub(in crate::runtime) async fn recv_reliable_path_command_during_drain(
+    receivers: &mut ReliablePathCommandReceivers,
+) -> Option<ReliablePathCommand> {
+    loop {
+        match receivers
+            .path_drain_phase
+            .expect("path drain must close command admission first")
+        {
+            ReliablePathCommandDrainPhase::Retirement => {
+                if let Some(stream_id) = receivers.pending_retirement_close.take() {
+                    let command = ReliablePathCommand::CloseStream(stream_id);
+                    receivers.record_terminal_command(&command);
+                    return Some(command);
+                }
+                match receivers.retirement.recv().await {
+                    Some(command) => {
+                        return Some(begin_reliable_path_retirement(receivers, command));
+                    }
+                    None => {
+                        receivers.path_drain_phase = Some(ReliablePathCommandDrainPhase::Control);
+                    }
+                }
+            }
+            ReliablePathCommandDrainPhase::Control => match receivers.control.recv().await {
+                Some(command) => {
+                    if let Some(command) = receivers.take_live_queued_command(command) {
+                        return Some(command);
+                    }
+                }
+                None => {
+                    receivers.path_drain_phase = Some(ReliablePathCommandDrainPhase::Priority);
+                }
+            },
+            ReliablePathCommandDrainPhase::Priority => match receivers.priority.recv().await {
+                Some(command) => {
+                    if let Some(command) = receivers.take_live_queued_command(command) {
+                        return Some(command);
+                    }
+                }
+                None => {
+                    receivers.path_drain_phase = Some(ReliablePathCommandDrainPhase::Reinjection);
+                }
+            },
+            ReliablePathCommandDrainPhase::Reinjection => {
+                match receivers.reinjection.recv().await {
+                    Some(command) => {
+                        if let Some(command) = receivers.take_live_queued_command(command) {
+                            return Some(command);
+                        }
+                    }
+                    None => {
+                        receivers.path_drain_phase = Some(ReliablePathCommandDrainPhase::Data);
+                    }
+                }
+            }
+            ReliablePathCommandDrainPhase::Data => match receivers.data.recv().await {
+                Some(command) => {
+                    if let Some(command) = receivers.take_live_queued_command(command) {
+                        return Some(command);
+                    }
+                }
+                None => {
+                    receivers.path_drain_phase = Some(ReliablePathCommandDrainPhase::Complete);
+                }
+            },
+            ReliablePathCommandDrainPhase::Complete => return None,
         }
     }
 }

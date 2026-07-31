@@ -16,7 +16,7 @@ use super::metrics::{TcpMetricPublisher, TcpSenderQueueSnapshot};
 #[cfg(feature = "lab-diagnostics")]
 use crate::lab_diagnostics::lab_diagnostic;
 use crate::model::capacity::{TRANSPORT_TIMER_GRANULARITY, TcpCapacityProofCandidate};
-use crate::protocol::{Frame, PathId, PathMetricDirection, UnderlayProtocol};
+use crate::protocol::{Frame, PathMetricDirection, UnderlayProtocol};
 use crate::runtime::error::RuntimeError;
 use crate::runtime::path::commands::TcpCapacityProbeCommand;
 use bytes::Bytes;
@@ -181,7 +181,7 @@ pub(super) async fn handle_client_tcp_capacity_frame(
     connection: &mut ClientTcpPathConnection,
     runtime: &ClientTcpPathSessionRuntime,
 ) -> Result<(), RuntimeError> {
-    let path_id = PathId(runtime.path_index as u16);
+    let path_id = runtime.path_id;
     match frame {
         Frame::PathCapacityData {
             path_id: capacity_path_id,

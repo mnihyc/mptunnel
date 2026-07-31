@@ -239,6 +239,16 @@ impl ServerTcpEvidenceState {
             .reliable_streams
             .record_peer_path_metrics(path_registration, metrics);
     }
+
+    pub(super) fn cancel_for_path_drain(&mut self) {
+        self.sender_refresh_pending = false;
+        self.path_proofs.cancel_for_path_drain();
+        self.request_capacity_receive.cancel_for_path_drain();
+    }
+
+    pub(super) fn is_idle(&self) -> bool {
+        self.path_proofs.is_idle() && self.request_capacity_receive.is_idle()
+    }
 }
 
 fn merge_local_tcp_metrics(

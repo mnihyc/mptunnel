@@ -28,13 +28,14 @@ pub(in crate::runtime) use health::{
 pub(in crate::runtime) use model::{PathDeliveryStats, UdpPathCandidate};
 pub(in crate::runtime) use ports::{
     AcceptedServerDatagramFlow, CarrierDeliveryRateSample, OpenedReliableCarrierStream,
-    ServerCarrierPathIdentity, ServerCarrierPathRegistration, ServerCarrierPathStatusSnapshot,
-    ServerDatagramOpenError, ServerDatagramOpenRequest, ServerDatagramPort,
-    ServerDatagramPortBackend, ServerDatagramRequest, ServerDatagramSendOutcome,
-    ServerDatagramWorkerMessage, ServerLocalPathProperties, ServerNewStreamPolicy,
-    ServerPathValidation, ServerRealtimeFlowLease, ServerSessionManagementSnapshot,
-    ServerStreamFrameRoute, ServerStreamManagementSnapshot, ServerStreamOpenOutcome,
-    ServerStreamOpenRequest, ServerStreamPathAttachment, ServerStreamPort, ServerStreamPortBackend,
+    ServerCarrierPathIdentity, ServerCarrierPathRegistration, ServerCarrierPathRetirement,
+    ServerCarrierPathStatusSnapshot, ServerDatagramOpenError, ServerDatagramOpenRequest,
+    ServerDatagramPort, ServerDatagramPortBackend, ServerDatagramRequest,
+    ServerDatagramSendOutcome, ServerDatagramWorkerMessage, ServerLocalPathProperties,
+    ServerNewStreamPolicy, ServerPathValidation, ServerRealtimeFlowLease,
+    ServerSessionManagementSnapshot, ServerStreamFrameRoute, ServerStreamManagementSnapshot,
+    ServerStreamOpenOutcome, ServerStreamOpenRequest, ServerStreamPathAttachment, ServerStreamPort,
+    ServerStreamPortBackend,
 };
 #[cfg(test)]
 pub(super) use proof::*;

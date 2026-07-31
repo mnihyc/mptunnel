@@ -362,6 +362,8 @@ pub(super) async fn write_client_tcp_frame_batch_interlocked(
     datagrams: &mut ClientTcpDatagramState,
     runtime: &ClientTcpPathSessionRuntime,
 ) -> Result<Option<Frame>, RuntimeError> {
+    #[cfg(not(feature = "lab-diagnostics"))]
+    let _ = runtime;
     if frames.is_empty() {
         return Ok(None);
     }

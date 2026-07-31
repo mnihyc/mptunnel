@@ -1623,78 +1623,6 @@ async fn server_response_sender_promotes_remaining_data_at_dispatch() {
 }
 
 #[tokio::test]
-async fn server_response_sender_dispatches_control_before_reinjection_and_data() {
-    let stream_id = StreamId(47);
-    let (commands, mut receivers) = reliable_path_command_channels(4);
-    let (_frame_tx, frame_rx) = mpsc::channel(1);
-    let path_stream = ReliablePathStream {
-        stream_id,
-        max_offset: 1024,
-        lane: TrafficClass::Throughput,
-        underlay: UnderlayProtocol::Tcp,
-        max_frame_payload_bytes: reliable_relay_buffer_len(MuxLimits::default()),
-        output: ReliablePathStreamOutput::fixed(
-            UnderlayProtocol::Tcp,
-            PathId(0),
-            commands,
-            MuxLimits::default(),
-        ),
-        frames: frame_rx.into(),
-    };
-    let mut send_stream = ReliableSendStream::new(stream_id, MuxLimits::default());
-    send_stream.update_max_offset(1024);
-    let mut sender = ServerResponseSenderService::new(SessionId(47), stream_id);
-    sender.enqueue_data_for_lane(Bytes::from_static(b"ordinary"), TrafficClass::Throughput);
-    assert!(
-        sender
-            .enqueue_reinjection_frame_with_priority(
-                Frame::StreamData {
-                    stream_id,
-                    offset: 64,
-                    payload: Bytes::from_static(b"reinjection"),
-                },
-                MuxLimits::default(),
-                true,
-            )
-            .is_some()
-    );
-    sender.enqueue_control_frame(Frame::StreamAck {
-        stream_id,
-        complete: false,
-        ranges: Vec::new(),
-    });
-
-    let control_dispatch = sender
-        .dispatch_next(
-            &path_stream,
-            &mut send_stream,
-            TrafficClass::Throughput,
-            MuxLimits::default(),
-        )
-        .expect("dispatch control");
-    assert_eq!(control_dispatch.lane, ReliableWorkClass::Control);
-    assert_eq!(send_stream.next_offset(), 0);
-    assert!(matches!(
-        recv_emitted_tcp_path_command(&mut receivers).await,
-        Some(ReliablePathCommand::SendFrame(Frame::StreamAck {
-            stream_id: id,
-            complete: false,
-            ..
-        })) if id == stream_id
-    ));
-
-    let reinjection_dispatch = sender
-        .dispatch_next(
-            &path_stream,
-            &mut send_stream,
-            TrafficClass::Throughput,
-            MuxLimits::default(),
-        )
-        .expect("dispatch reinjection");
-    assert_eq!(reinjection_dispatch.lane, ReliableWorkClass::Reinjection);
-}
-
-#[tokio::test]
 async fn server_response_sender_dispatches_final_fin_after_queued_data() {
     let stream_id = StreamId(49);
     let (commands, mut receivers) = reliable_path_command_channels(4);
@@ -1756,60 +1684,6 @@ async fn server_response_sender_dispatches_final_fin_after_queued_data() {
             stream_id: id,
             final_offset,
         })) if id == stream_id && final_offset == b"ordinary".len() as u64
-    ));
-}
-
-#[tokio::test]
-async fn server_response_control_queue_full_is_sender_backpressure() {
-    let stream_id = StreamId(48);
-    let (commands, mut receivers) = reliable_path_command_channels(1);
-    commands
-        .try_enqueue_admitted_frame(
-            Frame::StreamAck {
-                stream_id,
-                complete: false,
-                ranges: Vec::new(),
-            },
-            TrafficClass::Control,
-        )
-        .expect("prefill priority queue");
-    let (_frame_tx, frame_rx) = mpsc::channel(1);
-    let path_stream = ReliablePathStream {
-        stream_id,
-        max_offset: 1024,
-        lane: TrafficClass::Throughput,
-        underlay: UnderlayProtocol::Tcp,
-        max_frame_payload_bytes: reliable_relay_buffer_len(MuxLimits::default()),
-        output: ReliablePathStreamOutput::fixed(
-            UnderlayProtocol::Tcp,
-            PathId(0),
-            commands,
-            MuxLimits::default(),
-        ),
-        frames: frame_rx.into(),
-    };
-    let mut send_stream = ReliableSendStream::new(stream_id, MuxLimits::default());
-    send_stream.update_max_offset(1024);
-    let mut sender = ServerResponseSenderService::new(SessionId(48), stream_id);
-    sender.enqueue_control_frame(Frame::StreamAck {
-        stream_id,
-        complete: false,
-        ranges: Vec::new(),
-    });
-
-    let err = sender
-        .dispatch_next(
-            &path_stream,
-            &mut send_stream,
-            TrafficClass::Throughput,
-            MuxLimits::default(),
-        )
-        .expect_err("full control queue should be sender-service backpressure");
-    assert!(matches!(err, RuntimeError::SenderServiceBlocked));
-    assert_eq!(sender.bytes(), 1);
-    assert!(matches!(
-        recv_emitted_tcp_path_command(&mut receivers).await,
-        Some(ReliablePathCommand::SendFrame(Frame::StreamAck { .. }))
     ));
 }
 
@@ -2930,6 +2804,19 @@ fn reliable_recv_progress_batches_bulk_acks_by_reinjection_release_cadence() {
         mux_limits,
         false,
     ));
+    let first_generation = progress.ack_generation();
+    assert!(progress.should_send_ack(
+        &recv_stream,
+        None,
+        TrafficClass::Throughput,
+        mux_limits,
+        true,
+    ));
+    assert_eq!(
+        progress.ack_generation(),
+        first_generation,
+        "forced publication of unchanged cumulative state reuses its fence"
+    );
 
     recv_stream
         .receive_data(1024, Bytes::from(vec![0x22; 1024]))

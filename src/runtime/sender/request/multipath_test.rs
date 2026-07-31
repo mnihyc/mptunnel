@@ -743,9 +743,27 @@ async fn stale_path_is_not_selected_for_new_request_data() {
 }
 
 #[tokio::test]
-async fn reinjected_data_ack_clocks_the_next_stale_path_range() {
-    let (context, remotes, tcp, udp) = mixed_remote_set().await;
+async fn current_recovery_copy_does_not_clock_a_disjoint_stale_range() {
+    let context =
+        client_test_context_with_paths(&["tcp://127.0.0.1:10251", "udp://127.0.0.1:10252"]);
     let stream_id = StreamId(20);
+    let (tcp_commands, _tcp_receivers) = reliable_path_command_channels(8);
+    let mut remotes =
+        ReliableRelayRemoteSet::new(opened_test_relay_stream(stream_id, 0, tcp_commands), 8);
+    let tcp = remotes.paths[0].instance();
+    let (udp_commands, _udp_receivers) = reliable_path_command_channels(8);
+    remotes.attach_candidate(opened_test_relay_stream_with_underlay(
+        stream_id,
+        UnderlayProtocol::Udp,
+        0,
+        udp_commands,
+    ));
+    let udp = remotes
+        .paths
+        .iter()
+        .find(|path| path.key().underlay == UnderlayProtocol::Udp)
+        .expect("UDP attachment")
+        .instance();
     let first = data_frame(stream_id, 0, 4096);
     let second = data_frame(stream_id, 4096, 4096);
     let mut controller = RequestMultipathController::new(stream_id);
@@ -762,11 +780,15 @@ async fn reinjected_data_ack_clocks_the_next_stale_path_range() {
         .flights
         .record_reinjection_frame_instance(udp, &first);
     assert!(controller.mark_path_stale(tcp));
-    controller.record_reinjection_attempts(&[tcp], Instant::now());
-    assert!(
+    assert_eq!(
         controller
-            .stale_paths_requiring_reinjection(&remotes, Duration::from_secs(60))
-            .is_empty()
+            .stale_path_recovery_state(&remotes, tcp, Duration::from_secs(60))
+            .uncovered_ranges,
+        vec![OffsetRange {
+            start: 4096,
+            end: 8192,
+        }],
+        "the never-attempted second range remains immediately eligible"
     );
 
     let data_ack_progress_paths = controller.apply_product_ack(
@@ -785,15 +807,22 @@ async fn reinjected_data_ack_clocks_the_next_stale_path_range() {
     );
     assert!(controller.path_is_stale(tcp));
     assert_eq!(
-        controller.stale_paths_requiring_reinjection(&remotes, Duration::from_secs(60)),
-        vec![tcp],
-        "acknowledging one reinjected range immediately admits the next range"
+        controller
+            .stale_path_recovery_state(&remotes, tcp, Duration::from_secs(60))
+            .uncovered_ranges,
+        vec![OffsetRange {
+            start: 4096,
+            end: 8192,
+        }],
+        "acknowledging one recovery range leaves the disjoint range eligible"
     );
 }
 
 #[tokio::test]
-async fn live_reinjected_flight_suppresses_duplicate_reinjection() {
+async fn exact_recovery_copy_suppresses_only_its_recovery_interval() {
     let stream_id = StreamId(21);
+    let context =
+        client_test_context_with_paths(&["tcp://127.0.0.1:10251", "udp://127.0.0.1:10252"]);
     let (tcp_commands, _tcp_receivers) = reliable_path_command_channels(8);
     let mut remotes =
         ReliableRelayRemoteSet::new(opened_test_relay_stream(stream_id, 0, tcp_commands), 8);
@@ -823,19 +852,38 @@ async fn live_reinjected_flight_suppresses_duplicate_reinjection() {
         .record_reinjection_frame_instance(udp, &frame);
     assert!(controller.mark_path_stale(tcp));
 
+    let recovery = controller.stale_path_recovery_state(&remotes, tcp, Duration::from_secs(1));
     assert!(
+        recovery.uncovered_ranges.is_empty(),
+        "the current exact-range recovery copy suppresses a duplicate"
+    );
+    assert!(
+        recovery.retry_deadline.is_some(),
+        "the current copy exposes its retry wake deadline"
+    );
+
+    controller
+        .request
+        .flights
+        .age_reinjected_flights_for_test(Duration::from_secs(2));
+    assert_eq!(
         controller
-            .stale_paths_requiring_reinjection(&remotes, Duration::ZERO)
-            .is_empty(),
-        "the alternate carrier owns recovery for its live reinjected flight"
+            .stale_path_recovery_state(&remotes, tcp, Duration::from_secs(1))
+            .uncovered_ranges,
+        vec![OffsetRange {
+            start: 0,
+            end: 4096,
+        }],
+        "an unacknowledged exact range is eligible after its recovery interval"
     );
 
     drop(remotes.remove_path_instance(udp));
-    assert_eq!(
-        controller.stale_paths_requiring_reinjection(&remotes, Duration::ZERO),
-        vec![tcp],
-        "loss of the reinjection path makes the range eligible again"
+    controller.reconcile_request_path_state(&context, &remotes);
+    assert!(
+        !controller.path_is_stale(tcp),
+        "staleness is removed when the original attachment becomes the sole survivor"
     );
+    assert!(!controller.has_reinjection_path(&remotes, tcp));
 }
 
 #[tokio::test]
@@ -871,7 +919,7 @@ async fn missing_owner_detection_is_fenced_by_attachment_instance() {
         controller.unreported_missing_owner_instances(&remotes, Duration::ZERO),
         vec![old_instance]
     );
-    controller.record_reinjection_attempts(&[old_instance], Instant::now());
+    controller.record_missing_owner_reinjection_attempts(&[old_instance], Instant::now());
     assert!(
         controller
             .unreported_missing_owner_instances(&remotes, Duration::from_secs(1))

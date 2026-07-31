@@ -27,7 +27,10 @@ pub(super) fn response_reinjection_avoid_outputs(
     frame: &Frame,
     cause: RelaySendCause,
 ) -> Vec<ResponseOutputIdentity> {
-    if cause.is_ack_gap_reinjection() || cause == RelaySendCause::TailReinjection {
+    if cause.is_ack_gap_reinjection()
+        || cause == RelaySendCause::TailReinjection
+        || matches!(cause, RelaySendCause::StaleResponsePathReinjection(_))
+    {
         binding.original_flight_outputs_overlapping_frame(frame)
     } else if cause.is_reinjection() {
         binding.flight_outputs_overlapping_frame(frame)

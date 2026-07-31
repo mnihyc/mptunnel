@@ -19,7 +19,8 @@ pub(in crate::runtime) use feedback::{
 pub(in crate::runtime) use handle::FixedReliablePathOutput;
 pub(in crate::runtime) use handle::{
     ReliablePathStream, ReliablePathStreamHandle, ReliablePathStreamOutput,
-    reliable_work_lane_to_carrier_lane, wait_for_carrier_capacity_notifies,
+    arm_carrier_capacity_notifies, reliable_work_lane_to_carrier_lane,
+    wait_for_carrier_capacity_notifies,
 };
 #[cfg(test)]
 pub(in crate::runtime) use registry::ServerReliableStreamOpen;

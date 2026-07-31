@@ -3,6 +3,7 @@ use super::*;
 use crate::model::work::CarrierWorkKind;
 use crate::protocol::{OffsetRange, PathId, UnderlayProtocol};
 use crate::runtime::path::commands::reliable_path_command_channels;
+use crate::runtime::sender::ServerReinjectionOutputIdentity;
 use crate::scheduler::TrafficClass;
 use std::collections::BTreeMap;
 
@@ -31,6 +32,14 @@ fn output_identity(
         .find(|target| target.observation.key == key)
         .map(|target| (key, target.observation.incarnation))
         .expect("attached response output")
+}
+
+fn server_output_identity(
+    binding: &super::super::ResponseStreamBinding,
+    key: CarrierPathKey,
+) -> ServerReinjectionOutputIdentity {
+    let (key, incarnation) = output_identity(binding, key);
+    ServerReinjectionOutputIdentity { key, incarnation }
 }
 
 #[test]
@@ -118,6 +127,57 @@ fn exact_original_data_ack_releases_output_flight_and_progress() {
 }
 
 #[test]
+fn stale_response_output_recovery_preserves_exact_ack_authority() {
+    let (binding, original, _receivers) = binding_for_underlay(UnderlayProtocol::Tcp);
+    let original_identity = server_output_identity(&binding, original);
+    assert!(
+        !binding.mark_output_stale(original_identity),
+        "the only live output cannot be withdrawn"
+    );
+
+    let alternate = key(UnderlayProtocol::Udp, 1);
+    let (commands, _alternate_receivers) = reliable_path_command_channels(8);
+    binding.attach(
+        alternate.underlay,
+        alternate.path_id,
+        commands,
+        TrafficClass::Throughput,
+    );
+    let first = stream_data_frame_at(0, 4096);
+    let second = stream_data_frame_at(4096, 4096);
+    binding.record_original_flight(original, &first);
+    binding.record_original_flight(original, &second);
+
+    assert!(binding.mark_output_stale(original_identity));
+    assert!(binding.output_is_stale(original_identity));
+    assert_eq!(
+        binding
+            .stale_original_recovery_state(original_identity, Duration::from_secs(1))
+            .uncovered_ranges,
+        vec![range(0, 8192)]
+    );
+
+    binding.record_reinjected_flight(alternate, &first);
+    assert_eq!(
+        binding
+            .stale_original_recovery_state(original_identity, Duration::from_secs(1))
+            .uncovered_ranges,
+        vec![range(4096, 8192)],
+        "a live exact reinjection copy covers only its own range"
+    );
+    let ambiguous = binding.release_normalized_acked_ranges(&[range(0, 4096)]);
+    assert!(ambiguous.path_progress_outputs.is_empty());
+    assert!(
+        binding.output_is_stale(original_identity),
+        "ambiguous duplicate delivery cannot reactivate an output"
+    );
+
+    let exact = binding.release_normalized_acked_ranges(&[range(4096, 8192)]);
+    assert_eq!(exact.path_progress_outputs.as_slice(), &[original_identity]);
+    assert!(!binding.output_is_stale(original_identity));
+}
+
+#[test]
 fn data_ack_recovery_candidate_uses_the_blocking_original_flight_identity() {
     let (binding, path, _receivers) = binding_for_underlay(UnderlayProtocol::Tcp);
     let before = Instant::now();
@@ -132,6 +192,122 @@ fn data_ack_recovery_candidate_uses_the_blocking_original_flight_identity() {
     assert_eq!(candidate.key, path);
     assert!(candidate.sent_at >= before && candidate.sent_at <= after);
     assert_eq!(binding.data_ack_recovery_candidate(8192), None);
+}
+
+#[test]
+fn data_ack_recovery_candidates_keep_each_output_earliest_flight_below_horizon() {
+    let (binding, first, _first_receivers) = binding_for_underlay(UnderlayProtocol::Tcp);
+    let second = key(UnderlayProtocol::Udp, 1);
+    let (commands, _second_receivers) = reliable_path_command_channels(8);
+    binding.attach(
+        second.underlay,
+        second.path_id,
+        commands,
+        TrafficClass::Throughput,
+    );
+    let first_identity = output_identity(&binding, first);
+    let second_identity = output_identity(&binding, second);
+
+    binding.record_original_flight(second, &stream_data_frame_at(0, 4096));
+    binding.record_original_flight(first, &stream_data_frame_at(4096, 8192));
+    binding.record_original_flight(second, &stream_data_frame_at(12288, 4096));
+    binding.record_original_flight(first, &stream_data_frame_at(16384, 4096));
+
+    assert!(binding.data_ack_recovery_candidates(0).is_empty());
+    let prefix = binding.data_ack_recovery_candidates(4096);
+    assert_eq!(prefix.len(), 1);
+    assert_eq!(
+        (prefix[0].key, prefix[0].output_incarnation),
+        second_identity
+    );
+    assert_eq!((prefix[0].start, prefix[0].end), (0, 4096));
+
+    let candidates = binding.data_ack_recovery_candidates(10_000);
+    assert_eq!(candidates.len(), 2);
+    assert_eq!(
+        (candidates[0].key, candidates[0].output_incarnation),
+        second_identity
+    );
+    assert_eq!((candidates[0].start, candidates[0].end), (0, 4096));
+    assert_eq!(
+        (candidates[1].key, candidates[1].output_incarnation),
+        first_identity
+    );
+    assert_eq!(
+        (candidates[1].start, candidates[1].end),
+        (4096, 12288),
+        "a flight starting below the horizon remains authoritative when it crosses the horizon"
+    );
+}
+
+#[test]
+fn data_ack_recovery_candidates_exclude_nonlive_and_stale_output_incarnations() {
+    let (binding, live, _live_receivers) = binding_for_underlay(UnderlayProtocol::Tcp);
+    let stale = key(UnderlayProtocol::Udp, 1);
+    let detaching = key(UnderlayProtocol::Tcp, 2);
+    let replaced = key(UnderlayProtocol::Udp, 3);
+
+    let (stale_commands, _stale_receivers) = reliable_path_command_channels(8);
+    binding.attach(
+        stale.underlay,
+        stale.path_id,
+        stale_commands,
+        TrafficClass::Throughput,
+    );
+    let (detaching_commands, _detaching_receivers) = reliable_path_command_channels(8);
+    binding.attach(
+        detaching.underlay,
+        detaching.path_id,
+        detaching_commands,
+        TrafficClass::Throughput,
+    );
+    let (replaced_commands, replaced_receivers) = reliable_path_command_channels(8);
+    binding.attach(
+        replaced.underlay,
+        replaced.path_id,
+        replaced_commands,
+        TrafficClass::Throughput,
+    );
+
+    binding.record_original_flight(live, &stream_data_frame_at(0, 4096));
+    binding.record_original_flight(stale, &stream_data_frame_at(4096, 4096));
+    binding.record_original_flight(detaching, &stream_data_frame_at(8192, 4096));
+    binding.record_original_flight(replaced, &stream_data_frame_at(12288, 4096));
+
+    assert!(binding.mark_output_stale(server_output_identity(&binding, stale)));
+    let detaching_path_instance = binding
+        .outputs
+        .lock()
+        .expect("test response outputs lock")
+        .entries
+        .iter()
+        .find(|entry| entry.key == detaching)
+        .expect("detaching output")
+        .path_instance_id;
+    assert!(
+        binding
+            .begin_path_detach(detaching, detaching_path_instance)
+            .is_some()
+    );
+
+    drop(replaced_receivers);
+    let closed_candidates = binding.data_ack_recovery_candidates(16384);
+    assert_eq!(closed_candidates.len(), 1);
+    assert_eq!(closed_candidates[0].key, live);
+
+    let (replacement_commands, _replacement_receivers) = reliable_path_command_channels(8);
+    assert_eq!(
+        binding.attach(
+            replaced.underlay,
+            replaced.path_id,
+            replacement_commands,
+            TrafficClass::Throughput,
+        ),
+        super::super::attachment::ResponseStreamAttachOutcome::ReplacedClosedOutput
+    );
+    let candidates = binding.data_ack_recovery_candidates(16384);
+    assert_eq!(candidates.len(), 1);
+    assert_eq!(candidates[0].key, live);
 }
 
 #[test]
@@ -185,7 +361,7 @@ fn only_live_recent_reinjection_suppresses_another_attempt() {
         4096,
         Instant::now(),
         retry_after,
-        |candidate| candidate == path,
+        |candidate, incarnation| candidate == path && incarnation == 0,
     ));
     assert!(!product_flights_have_recent_reinjection_overlap(
         &flights,
@@ -193,7 +369,15 @@ fn only_live_recent_reinjection_suppresses_another_attempt() {
         4096,
         Instant::now(),
         retry_after,
-        |_| false,
+        |candidate, incarnation| candidate == path && incarnation == 1,
+    ));
+    assert!(!product_flights_have_recent_reinjection_overlap(
+        &flights,
+        0,
+        4096,
+        Instant::now(),
+        retry_after,
+        |_, _| false,
     ));
 
     flights.get_mut(&0).unwrap()[0].sent_at = Instant::now() - Duration::from_millis(200);
@@ -203,7 +387,7 @@ fn only_live_recent_reinjection_suppresses_another_attempt() {
         4096,
         Instant::now(),
         retry_after,
-        |_| true,
+        |_, _| true,
     ));
 }
 

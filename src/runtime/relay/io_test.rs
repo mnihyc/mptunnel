@@ -615,7 +615,7 @@ fn authoritative_ack_snapshot_merges_positive_incomplete_delta_without_regressin
                 end: 128,
             },
         ],
-        128,
+        256,
     )
     .expect("complete ACK is within its assigned horizon");
     update_reinjection_authoritative_ack_snapshot(&mut snapshot, &complete);
@@ -636,6 +636,48 @@ fn authoritative_ack_snapshot_merges_positive_incomplete_delta_without_regressin
     assert_eq!(snapshot.ranges(), &[OffsetRange { start: 0, end: 128 }]);
     assert!(snapshot.complete());
     assert_eq!(snapshot.horizon(), Some(128));
+    assert!(snapshot.has_unacknowledged_extent(64));
+    assert!(!snapshot.has_unacknowledged_extent(128));
+}
+
+#[test]
+fn retained_authoritative_ack_state_subsumes_redundant_publication() {
+    let mut snapshot = AuthoritativeStreamAckSnapshot::default();
+    let initial = validate_stream_ack(
+        true,
+        vec![
+            OffsetRange { start: 0, end: 64 },
+            OffsetRange {
+                start: 96,
+                end: 128,
+            },
+        ],
+        256,
+    )
+    .expect("initial ACK is valid");
+    assert!(!snapshot.subsumes(&initial));
+    update_reinjection_authoritative_ack_snapshot(&mut snapshot, &initial);
+
+    let duplicate = validate_stream_ack(true, initial.ranges().to_vec(), 256)
+        .expect("redundant cumulative ACK is valid");
+    let covered_delta = validate_stream_ack(false, vec![OffsetRange { start: 16, end: 48 }], 256)
+        .expect("covered positive update is valid");
+    let new_positive = validate_stream_ack(
+        false,
+        vec![OffsetRange {
+            start: 128,
+            end: 160,
+        }],
+        256,
+    )
+    .expect("new positive update is valid");
+    let newer_snapshot = validate_stream_ack(true, vec![OffsetRange { start: 0, end: 160 }], 256)
+        .expect("newer cumulative ACK is valid");
+
+    assert!(snapshot.subsumes(&duplicate));
+    assert!(snapshot.subsumes(&covered_delta));
+    assert!(!snapshot.subsumes(&new_positive));
+    assert!(!snapshot.subsumes(&newer_snapshot));
 }
 
 #[test]
@@ -658,7 +700,7 @@ fn incomplete_ack_cannot_establish_gap_authority() {
 }
 
 #[test]
-fn empty_complete_ack_retains_only_its_captured_assignment_horizon() {
+fn complete_ack_negative_authority_never_infers_an_unobserved_assignment_tail() {
     let mut snapshot = AuthoritativeStreamAckSnapshot::default();
     let empty =
         validate_stream_ack(true, Vec::new(), 128).expect("empty complete ACK is well formed");
@@ -666,9 +708,14 @@ fn empty_complete_ack_retains_only_its_captured_assignment_horizon() {
 
     assert!(snapshot.complete());
     assert!(snapshot.ranges().is_empty());
-    assert_eq!(snapshot.horizon(), Some(128));
-    assert!(snapshot.has_unacknowledged_extent(0));
-    assert!(!snapshot.has_unacknowledged_extent(128));
+    assert_eq!(snapshot.horizon(), Some(0));
+    assert!(!snapshot.has_unacknowledged_extent(0));
+
+    let contiguous_prefix = validate_stream_ack(true, vec![OffsetRange { start: 0, end: 64 }], 128)
+        .expect("delayed complete prefix is within assigned data");
+    update_reinjection_authoritative_ack_snapshot(&mut snapshot, &contiguous_prefix);
+    assert_eq!(snapshot.horizon(), Some(64));
+    assert!(!snapshot.has_unacknowledged_extent(64));
 
     let later_positive = validate_stream_ack(
         false,
@@ -680,12 +727,8 @@ fn empty_complete_ack_retains_only_its_captured_assignment_horizon() {
     )
     .expect("later positive ACK stays within newly assigned data");
     update_reinjection_authoritative_ack_snapshot(&mut snapshot, &later_positive);
-    assert_eq!(
-        snapshot.horizon(),
-        Some(128),
-        "an incomplete delta cannot make the old complete snapshot omit newly assigned bytes"
-    );
-    assert!(snapshot.ranges().is_empty());
+    assert_eq!(snapshot.horizon(), Some(64));
+    assert_eq!(snapshot.ranges(), &[OffsetRange { start: 0, end: 64 }]);
 }
 
 #[test]
@@ -1220,32 +1263,98 @@ fn request_path_staleness_requires_persistent_missing_data_ack_progress() {
     let now = Instant::now();
     let persistence = Duration::from_millis(300);
     let mut progress = ReliableRequestPathStaleness::default();
+    let observation = ReliablePathStalenessObservation::with_persistence(path, true, persistence);
 
-    assert_eq!(
-        progress.stale_path_at(true, Some(path), false, true, persistence, now),
-        None
+    assert!(progress.stale_paths_at(&[observation], &[], now).is_empty());
+    assert_eq!(progress.next_deadline(), Some(now + persistence));
+    assert!(
+        progress
+            .stale_paths_at(
+                &[observation],
+                &[],
+                now + persistence - Duration::from_millis(1),
+            )
+            .is_empty()
     );
     assert_eq!(
-        progress.stale_path_at(
-            true,
-            Some(path),
-            false,
-            true,
-            persistence,
-            now + persistence - Duration::from_millis(1),
-        ),
-        None
+        progress
+            .stale_paths_at(&[observation], &[], now + persistence)
+            .as_slice(),
+        &[path]
+    );
+    assert!(
+        progress
+            .stale_paths_at(&[observation], &[path], now + persistence)
+            .is_empty(),
+        "positive progress on the exact attachment restarts its clock"
     );
     assert_eq!(
-        progress.stale_path_at(
-            true,
-            Some(path),
-            false,
-            true,
-            persistence,
-            now + persistence,
-        ),
-        Some(path)
+        progress
+            .stale_paths_at(&[observation], &[], now + persistence * 2)
+            .as_slice(),
+        &[path],
+        "the restarted clock expires after one full persistence interval"
+    );
+}
+
+#[test]
+fn request_path_staleness_keeps_independent_attachment_clocks() {
+    let first = RelayPathInstance {
+        key: RelayPathKey {
+            underlay: UnderlayProtocol::Tcp,
+            index: 0,
+        },
+        path_instance_id: CarrierPathInstanceId::from_raw(17),
+        attachment_id: 17,
+    };
+    let second = RelayPathInstance {
+        key: RelayPathKey {
+            underlay: UnderlayProtocol::Tcp,
+            index: 1,
+        },
+        path_instance_id: CarrierPathInstanceId::from_raw(18),
+        attachment_id: 18,
+    };
+    let now = Instant::now();
+    let persistence = Duration::from_millis(300);
+    let observations = [
+        ReliablePathStalenessObservation::with_persistence(first, true, persistence),
+        ReliablePathStalenessObservation::with_persistence(second, true, persistence),
+    ];
+    let mut progress = ReliableRequestPathStaleness::default();
+
+    assert!(progress.stale_paths_at(&observations, &[], now).is_empty());
+    assert!(
+        progress
+            .stale_paths_at(&observations, &[second], now + Duration::from_millis(200),)
+            .is_empty()
+    );
+    assert_eq!(
+        progress
+            .stale_paths_at(&observations, &[], now + persistence)
+            .as_slice(),
+        &[first],
+        "progress on the second attachment cannot restart the first clock"
+    );
+    assert_eq!(
+        progress
+            .stale_paths_at(
+                &observations,
+                &[],
+                now + persistence + Duration::from_millis(199),
+            )
+            .as_slice(),
+        &[first]
+    );
+    assert_eq!(
+        progress
+            .stale_paths_at(
+                &observations,
+                &[],
+                now + persistence + Duration::from_millis(200),
+            )
+            .as_slice(),
+        &[first, second]
     );
 }
 
@@ -1262,36 +1371,28 @@ fn request_path_staleness_resets_on_exact_data_ack_progress() {
     let now = Instant::now();
     let persistence = Duration::from_millis(200);
     let mut progress = ReliableRequestPathStaleness::default();
+    let observation = ReliablePathStalenessObservation::with_persistence(path, true, persistence);
 
-    assert_eq!(
-        progress.stale_path_at(true, Some(path), false, true, persistence, now),
-        None
+    assert!(progress.stale_paths_at(&[observation], &[], now).is_empty());
+    assert!(
+        progress
+            .stale_paths_at(&[observation], &[path], now + persistence)
+            .is_empty()
+    );
+    assert!(
+        progress
+            .stale_paths_at(
+                &[observation],
+                &[],
+                now + persistence + persistence - Duration::from_millis(1),
+            )
+            .is_empty()
     );
     assert_eq!(
-        progress.stale_path_at(true, Some(path), true, true, persistence, now + persistence,),
-        None
-    );
-    assert_eq!(
-        progress.stale_path_at(
-            true,
-            Some(path),
-            false,
-            true,
-            persistence,
-            now + persistence + persistence - Duration::from_millis(1),
-        ),
-        None
-    );
-    assert_eq!(
-        progress.stale_path_at(
-            true,
-            Some(path),
-            false,
-            true,
-            persistence,
-            now + persistence + persistence,
-        ),
-        Some(path)
+        progress
+            .stale_paths_at(&[observation], &[], now + persistence + persistence,)
+            .as_slice(),
+        &[path]
     );
 }
 
@@ -1308,24 +1409,14 @@ fn partial_data_ack_does_not_erase_request_path_staleness_evidence() {
     let now = Instant::now();
     let persistence = Duration::from_millis(100);
     let mut progress = ReliableRequestPathStaleness::default();
+    let observation = ReliablePathStalenessObservation::with_persistence(path, true, persistence);
 
+    assert!(progress.stale_paths_at(&[observation], &[], now).is_empty());
     assert_eq!(
-        progress.stale_path_at(true, Some(path), false, true, persistence, now),
-        None
-    );
-    assert_eq!(
-        progress.stale_path_at(false, None, false, false, persistence, now + persistence,),
-        None
-    );
-    assert_eq!(
-        progress.stale_path_at(
-            true,
-            Some(path),
-            false,
-            true,
-            persistence,
-            now + persistence,
-        ),
-        Some(path)
+        progress
+            .stale_paths_at(&[observation], &[], now + persistence)
+            .as_slice(),
+        &[path],
+        "an ACK that does not prove progress on this attachment cannot restart it"
     );
 }

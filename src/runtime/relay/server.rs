@@ -12,7 +12,8 @@ use super::flow::{
 use super::io::normalized_stream_ack_first_gap;
 use super::io::{
     AuthoritativeStreamAckSnapshot, ReadyStreamDataBatchBounds, ReadyStreamDataDirection,
-    ReliableAckGapReinjectionProgress, apply_and_write_ready_stream_data_batch,
+    ReliableAckGapReinjectionProgress, ReliablePathStalenessObservation,
+    ReliableResponsePathStaleness, apply_and_write_ready_stream_data_batch,
     begin_reliable_stream_ack, collect_ready_stream_data_batch, pending_stream_fin_ready,
     read_reliable_relay_payload, receive_stream_fin, resize_reliable_relay_buffer,
     stream_ack_gap_reinjection_frames_normalized, stream_ack_ranges_expose_authoritative_gap,
@@ -61,17 +62,19 @@ use crate::runtime::outbound_registry::{
 };
 use crate::runtime::path::PathDeliveryStats;
 use crate::runtime::sender::{
-    RelaySendCause, ServerResponseSenderService, emit_response_control_frame,
-    reliable_relay_sender_queue_limit,
+    RelaySendCause, ServerReinjectionOutputIdentity, ServerResponseSenderService,
+    emit_response_control_frame, reliable_relay_sender_queue_limit,
 };
 use crate::runtime::stream::response::ResponseDataAckRecoveryCandidate;
 use crate::runtime::stream::{
     AcceptedServerReliableStream, AcceptedServerReliableStreamRetirement, ReliablePathStream,
-    ReliableRecvProgress, ServerReliableStreamRegistry, reliable_relay_recv_progress_resend_active,
-    reliable_stream_recv_progress_interval, wait_for_carrier_capacity_notifies,
+    ReliableRecvProgress, ServerReliableStreamRegistry, arm_carrier_capacity_notifies,
+    reliable_relay_recv_progress_resend_active, reliable_stream_recv_progress_interval,
+    wait_for_carrier_capacity_notifies,
 };
 use crate::runtime::telemetry::{ObservedProductIo, RuntimeTelemetry};
 use crate::scheduler::{PathSnapshot, TrafficClass};
+use smallvec::SmallVec;
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -601,46 +604,115 @@ impl RequestTcpSparseAckProgress {
     }
 }
 
+#[derive(Debug, Default)]
+struct ServerAckPublicationState {
+    generation: u64,
+    published_generation: u64,
+    pending: bool,
+    cumulative_frames: Vec<Frame>,
+}
+
+impl ServerAckPublicationState {
+    fn record_status(&mut self, generation: u64, published: bool, pending: bool) {
+        self.generation = generation;
+        self.pending = pending;
+        self.published_generation = if published { generation } else { 0 };
+    }
+
+    fn record_generation(
+        &mut self,
+        generation: u64,
+        published: bool,
+        pending: bool,
+        cumulative_frames: Vec<Frame>,
+    ) {
+        self.record_status(generation, published, pending);
+        self.cumulative_frames = cumulative_frames;
+    }
+
+    fn current_generation_is_fully_published(&self) -> bool {
+        !self.pending && (self.generation == 0 || self.published_generation == self.generation)
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 fn enqueue_tcp_recv_progress(
-    response_sender: &mut ServerResponseSenderService,
+    path_stream: &ReliablePathStream,
     recv_stream: &mut ReliableRecvStream,
     progress: &mut ReliableRecvProgress,
     sparse_ack_progress: &mut RequestTcpSparseAckProgress,
+    ack_publication: &mut ServerAckPublicationState,
     path: Option<PathSnapshot>,
     lane: TrafficClass,
     mux_limits: MuxLimits,
+    force_ack: bool,
+    publish_max_data: bool,
     force_max_data: bool,
 ) -> bool {
     let mut sent_any = false;
-    let sparse_delta = !force_max_data
+    let sparse_delta = !force_ack
         && progress.has_sent_ack()
         && lane.is_bulk()
         && path.is_some_and(|snapshot| snapshot.underlay == UnderlayProtocol::Tcp)
         && recv_stream.reorder_bytes() > 0;
-    if progress.should_send_ack(recv_stream, path, lane, mux_limits, force_max_data) {
-        #[cfg(feature = "lab-diagnostics")]
-        let ack_started = Instant::now();
-        let ack_frames = sparse_ack_progress.ack_frames(recv_stream, sparse_delta);
-        #[cfg(feature = "lab-diagnostics")]
-        lab_perf_record("mux.ack_frames", ack_started.elapsed(), ack_frames.len());
-        // Multipath receive ranges can exceed one ACK frame under normal
-        // reordering. Send every incomplete ACK chunk instead of truncating a
-        // single `complete=true` ACK; otherwise the peer treats omitted ranges
-        // as loss and starts product reinjection that cannot improve TCP/QUIC
-        // carrier delivery.
-        for ack_frame in ack_frames {
-            response_sender.enqueue_control_frame(ack_frame);
+    let previous_ack_generation = progress.ack_generation();
+    if progress.should_send_ack(recv_stream, path, lane, mux_limits, force_ack) {
+        let generation = progress.ack_generation();
+        if generation == previous_ack_generation
+            && generation == ack_publication.generation
+            && !ack_publication.cumulative_frames.is_empty()
+        {
+            let publication =
+                path_stream.retry_pending_ack(generation, &ack_publication.cumulative_frames);
+            ack_publication.record_status(generation, publication.published, publication.pending);
+            sent_any |= publication.published;
+        } else {
+            #[cfg(feature = "lab-diagnostics")]
+            let ack_started = Instant::now();
+            let mut ack_frames = sparse_ack_progress.ack_frames(recv_stream, sparse_delta);
+            // A sparse update can be empty when newly contiguous coverage was
+            // already represented by older positive ranges. Publish a cumulative
+            // snapshot for that generation so gap authority still advances.
+            let sparse_update_available = sparse_delta && !ack_frames.is_empty();
+            if !sparse_update_available {
+                ack_frames = recv_stream.ack_frames();
+            }
+            let cumulative_ack_frames = sparse_update_available.then(|| recv_stream.ack_frames());
+            #[cfg(feature = "lab-diagnostics")]
+            let cumulative_ack_frame_count = cumulative_ack_frames
+                .as_ref()
+                .map_or(ack_frames.len(), Vec::len);
+            #[cfg(feature = "lab-diagnostics")]
+            lab_perf_record(
+                "mux.ack_frames",
+                ack_started.elapsed(),
+                cumulative_ack_frame_count,
+            );
+            let publication = path_stream.publish_ack(
+                generation,
+                &ack_frames,
+                cumulative_ack_frames.as_deref().unwrap_or(&ack_frames),
+            );
+            let cumulative_ack_frames = cumulative_ack_frames.unwrap_or(ack_frames);
+            ack_publication.record_generation(
+                generation,
+                publication.published,
+                publication.pending,
+                cumulative_ack_frames,
+            );
+            sent_any |= publication.published;
         }
-        sent_any = true;
     }
-    if progress.should_send_max_data(recv_stream, path, lane, mux_limits, force_max_data) {
+    if publish_max_data
+        && progress.should_send_max_data(recv_stream, path, lane, mux_limits, force_max_data)
+    {
         let advertised_window = reliable_stream_advertised_window_bytes(path, lane, mux_limits);
         let max_offset = recv_stream.max_data_offset_with_window(advertised_window);
-        response_sender
-            .enqueue_control_frame(recv_stream.max_data_frame_with_window(advertised_window));
-        recv_stream.commit_max_data(max_offset);
-        sent_any = true;
+        let publication = path_stream.publish_max_data(max_offset);
+        if let Some(published_offset) = publication.published_offset {
+            recv_stream.commit_max_data(published_offset);
+            sent_any = true;
+        }
     }
     sent_any
 }
@@ -710,6 +782,55 @@ fn reliable_failed_original_tail_reinjection_ready(
 ) -> bool {
     send_stream.reinjection_bytes() > 0
         && !path_stream.uncovered_failed_original_ranges().is_empty()
+}
+
+fn response_recovery_output_identity(
+    candidate: ResponseDataAckRecoveryCandidate,
+) -> ServerReinjectionOutputIdentity {
+    ServerReinjectionOutputIdentity {
+        key: candidate.key,
+        incarnation: candidate.output_incarnation,
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn mark_response_path_staleness(
+    staleness: &mut ReliableResponsePathStaleness,
+    path_stream: &ReliablePathStream,
+    candidates: &[ResponseDataAckRecoveryCandidate],
+    data_ack_progress_outputs: &[ServerReinjectionOutputIdentity],
+    lane: TrafficClass,
+) -> bool {
+    let observations = candidates
+        .iter()
+        .map(|candidate| {
+            let identity = response_recovery_output_identity(*candidate);
+            ReliablePathStalenessObservation::new(
+                identity,
+                path_stream.has_nonstale_reinjection_alternative(identity),
+                Some(candidate.key.underlay),
+                path_stream.response_output_snapshot(identity, lane),
+            )
+        })
+        .collect::<SmallVec<[_; 4]>>();
+    let mut marked_stale = false;
+    for stale in staleness.stale_paths(&observations, data_ack_progress_outputs) {
+        if path_stream.mark_response_output_stale(stale) {
+            marked_stale = true;
+            #[cfg(feature = "lab-diagnostics")]
+            lab_diagnostic(
+                "response_path_stale",
+                format_args!(
+                    "stream_id={} path_underlay={:?} path_id={} output_incarnation={}",
+                    path_stream.stream_id.0,
+                    stale.key.underlay,
+                    stale.key.path_id.0,
+                    stale.incarnation,
+                ),
+            );
+        }
+    }
+    marked_stale
 }
 
 fn reliable_final_tail_reinjection_ready(
@@ -1297,7 +1418,16 @@ where
     let mut pending_remote_fin_offset = None;
     let mut recv_progress = ReliableRecvProgress::default();
     let mut request_sparse_ack_progress = RequestTcpSparseAckProgress::default();
+    let mut request_ack_publication = ServerAckPublicationState::default();
+    let mut request_ack_capacity_wait = None;
+    let mut request_ack_capacity_wait_generation = 0_u64;
     let mut ack_gap_reinjection = ReliableAckGapReinjectionProgress::default();
+    let mut response_path_staleness = ReliableResponsePathStaleness::default();
+    let mut response_data_ack_progress_outputs = Vec::<ServerReinjectionOutputIdentity>::new();
+    let mut response_path_staleness_dirty = true;
+    let mut response_recovery_dirty = true;
+    let mut response_range_recovery_deadline = None::<Instant>;
+    let mut response_recovery_capacity_blocked = false;
     let mut last_recv_progress_sent_at = Instant::now();
     let mut last_send_ack_progress_at = Instant::now();
     let mut last_send_ack_frontier = 0_u64;
@@ -1306,10 +1436,13 @@ where
     let mut flow_demand =
         ReliableRelayFlowDemandTracker::with_initial_lane(path_stream.current_lane());
     let mut output_updates = path_stream.subscribe_output_updates();
+    let mut observed_output_membership_generation = path_stream.output_membership_generation();
     let mut multipath_reinjection_alternative_available =
         path_stream.has_multipath_reinjection_alternative();
     let mut response_sender =
         ServerResponseSenderService::new_with_performance(session_id, stream_id, performance);
+    let mut observed_response_recovery_generation =
+        response_sender.stale_response_recovery_generation();
     let mut deferred_path_frame = None::<Result<Frame, RuntimeError>>;
     let mut ready_path_data = super::io::ReadyStreamDataBatch::new();
     let mut send_buffer_reservation = session_send_buffer.stream_reservation();
@@ -1368,6 +1501,8 @@ where
             && send_stream.reinjection_bytes() == 0
             && response_sender.is_empty()
             && (!pending_local_fin || close.sent)
+            && (!has_live_output || request_ack_publication.current_generation_is_fully_published())
+            && path_stream.output_membership_generation() == observed_output_membership_generation
         {
             break Ok(stats);
         }
@@ -1423,16 +1558,134 @@ where
             relay_lane_startup_chunk_bytes(relay_lane, mux_limits)
                 .min(path_stream.max_frame_payload_bytes),
         );
-        let data_ack_recovery_candidate = path_stream
-            .data_ack_recovery_candidate(last_send_ack_frontier)
-            .map(ReliableRelayTailRecoveryCandidate::Tracked);
+        let response_path_staleness_due = response_path_staleness
+            .next_deadline()
+            .is_some_and(|deadline| deadline <= Instant::now());
+        if response_path_staleness_dirty || response_path_staleness_due {
+            let response_path_staleness_candidates =
+                path_stream.data_ack_recovery_candidates(last_send_ack.horizon().unwrap_or(0));
+            if mark_response_path_staleness(
+                &mut response_path_staleness,
+                path_stream,
+                &response_path_staleness_candidates,
+                &response_data_ack_progress_outputs,
+                relay_lane,
+            ) {
+                response_recovery_dirty = true;
+            }
+            response_data_ack_progress_outputs.clear();
+            response_path_staleness_dirty = false;
+        }
+        let response_recovery_generation = response_sender.stale_response_recovery_generation();
+        if response_recovery_generation != observed_response_recovery_generation {
+            observed_response_recovery_generation = response_recovery_generation;
+            response_recovery_dirty = true;
+        }
+        let response_range_recovery_due =
+            response_range_recovery_deadline.is_some_and(|deadline| deadline <= Instant::now());
+        let response_recovery_due = response_recovery_dirty || response_range_recovery_due;
+        let output_membership_generation = path_stream.output_membership_generation();
+        let output_membership_changed =
+            output_membership_generation != observed_output_membership_generation;
+        if output_membership_changed {
+            observed_output_membership_generation = output_membership_generation;
+        }
+        let request_ack_generation = recv_progress.ack_generation();
+        if output_membership_changed
+            || request_ack_capacity_wait_generation != request_ack_generation
+            || !request_ack_publication.pending
+        {
+            // A retained wait covers only the exact attachment set and ACK
+            // generation for which it was armed.
+            request_ack_capacity_wait = None;
+        }
+        let request_ack_reconciliation_due = request_ack_generation != 0
+            && (output_membership_changed
+                || (request_ack_publication.pending && request_ack_capacity_wait.is_none()));
+        if request_ack_reconciliation_due {
+            // Arm before retry: Notify::notify_waiters is not retained if a
+            // writer releases capacity between the retry and waiter creation.
+            let capacity_wait = arm_carrier_capacity_notifies(
+                path_stream.pending_ack_capacity_notifies(request_ack_generation),
+            );
+            debug_assert_eq!(request_ack_publication.generation, request_ack_generation);
+            debug_assert!(!request_ack_publication.cumulative_frames.is_empty());
+            let publication = path_stream.retry_pending_ack(
+                request_ack_generation,
+                &request_ack_publication.cumulative_frames,
+            );
+            request_ack_publication.record_status(
+                request_ack_generation,
+                publication.published,
+                publication.pending,
+            );
+            if request_ack_publication.pending {
+                request_ack_capacity_wait = capacity_wait;
+                request_ack_capacity_wait_generation = request_ack_generation;
+            }
+        }
+        let max_data_publication_pending = path_stream.has_pending_max_data_publication();
+        let mut response_state_capacity_notifies =
+            if response_recovery_due || response_recovery_capacity_blocked {
+                path_stream.response_recovery_capacity_notifies()
+            } else {
+                Vec::new()
+            };
+        if max_data_publication_pending {
+            for notify in path_stream.pending_max_data_capacity_notifies() {
+                if !response_state_capacity_notifies
+                    .iter()
+                    .any(|current| Arc::ptr_eq(current, &notify))
+                {
+                    response_state_capacity_notifies.push(notify);
+                }
+            }
+        }
+        let response_state_capacity_wait =
+            arm_carrier_capacity_notifies(response_state_capacity_notifies);
+        let has_response_state_capacity_wait = response_state_capacity_wait.is_some();
+        if max_data_publication_pending
+            && let Some(published_offset) = path_stream.retry_pending_max_data().published_offset
+        {
+            recv_stream.commit_max_data(published_offset);
+        }
+        if response_recovery_due {
+            response_sender.discard_resolved_stale_output_reinjections(path_stream);
+            let response_recovery =
+                response_sender.drive_stale_output_recovery(path_stream, &send_stream, mux_limits);
+            if response_recovery.queued {
+                response_sender_retry_at = None;
+            }
+            response_range_recovery_deadline = response_recovery.retry_deadline;
+            response_recovery_capacity_blocked = response_recovery.blocked_for_carrier_capacity;
+            response_recovery_dirty = false;
+        }
+        let max_data_publication_blocked = path_stream.has_pending_max_data_publication();
+        let response_state_capacity_blocked =
+            response_recovery_capacity_blocked || max_data_publication_blocked;
+        let has_request_ack_capacity_wait = request_ack_capacity_wait.is_some();
+        let response_path_recovery_deadline = response_path_staleness
+            .next_deadline()
+            .into_iter()
+            .chain(response_range_recovery_deadline)
+            .min()
+            .map(tokio::time::Instant::from_std);
+        let data_ack_recovery_candidate =
+            path_stream.data_ack_recovery_candidate(last_send_ack_frontier);
+        let data_ack_recovery_candidate =
+            data_ack_recovery_candidate.map(ReliableRelayTailRecoveryCandidate::Tracked);
         let request_feedback_path_snapshot = path_stream.request_feedback_path_snapshot(relay_lane);
         let request_feedback_underlay = request_feedback_path_snapshot
             .map(|snapshot| snapshot.underlay)
             .or_else(|| path_stream.request_feedback_underlay())
             .unwrap_or(path_stream.underlay);
+        let recv_progress_observed_at = recv_progress
+            .last_ack_at()
+            .map_or(last_recv_progress_sent_at, |ack_at| {
+                ack_at.max(last_recv_progress_sent_at)
+            });
         let recv_progress_deadline = tokio::time::Instant::from_std(
-            last_recv_progress_sent_at
+            recv_progress_observed_at
                 + reliable_stream_recv_progress_interval(request_feedback_path_snapshot),
         );
         let has_tail_reinjection_alternative = path_stream.has_multipath_reinjection_alternative();
@@ -1580,7 +1833,8 @@ where
             Vec::new()
         };
         let has_carrier_capacity_notify = !carrier_capacity_notifies.is_empty();
-        let queued_send_blocks_source_read = queued_send_blocked;
+        let queued_send_blocks_source_read =
+            queued_send_blocked || response_recovery_capacity_blocked;
         let can_read_by_flow = source_read_ceiling > 0
             && source_staging_headroom > 0
             && response_sender.can_read_product_source(
@@ -1603,6 +1857,16 @@ where
         // ready during an upload. Fair polling keeps response progress from
         // being hidden behind an unbounded run of incoming STREAM_DATA.
         tokio::select! {
+        _ = async {
+            match response_path_recovery_deadline {
+                Some(deadline) => tokio::time::sleep_until(deadline).await,
+                None => std::future::pending().await,
+            }
+        }, if response_path_recovery_deadline.is_some() => {
+            // Re-evaluate exact attachment and range recovery clocks before
+            // assigning more OriginalData; native recovery continues.
+            continue;
+        }
         _ = async {
             match session_retention_deadline {
                 Some(deadline) => tokio::time::sleep_until(deadline).await,
@@ -1771,13 +2035,16 @@ where
                     )
                     .await?;
                     if enqueue_tcp_recv_progress(
-                        &mut response_sender,
+                        path_stream,
                         &mut recv_stream,
                         &mut recv_progress,
                         &mut request_sparse_ack_progress,
+                        &mut request_ack_publication,
                         request_feedback_path_snapshot,
                         relay_lane,
                         mux_limits,
+                        false,
+                        true,
                         false,
                     )
                     {
@@ -1786,14 +2053,17 @@ where
                     }
                     if pending_stream_fin_ready(&recv_stream, pending_remote_fin_offset) {
                         if enqueue_tcp_recv_progress(
-                            &mut response_sender,
+                            path_stream,
                             &mut recv_stream,
                             &mut recv_progress,
                             &mut request_sparse_ack_progress,
+                            &mut request_ack_publication,
                             request_feedback_path_snapshot,
                             relay_lane,
                             mux_limits,
                             true,
+                            false,
+                            false,
                         ) {
                             response_sender_retry_at = None;
                             last_recv_progress_sent_at = Instant::now();
@@ -1808,7 +2078,7 @@ where
                     complete,
                     ranges,
                 } if ack_stream_id == stream_id => {
-                    // Freeze the assigned DSN horizon and validate every
+                    // Freeze the send-assignment extent and validate every
                     // original range before any cache, flight, queue,
                     // reservation, or recovery-evidence mutation.
                     let validated_ack =
@@ -1816,6 +2086,9 @@ where
                             Ok(ack) => ack,
                             Err(err) => break Err(err.into()),
                         };
+                    if last_send_ack.subsumes(&validated_ack) {
+                        continue;
+                    }
                     let normalized_ranges = validated_ack.ranges();
                     #[cfg(feature = "lab-diagnostics")]
                     let mux_started = Instant::now();
@@ -1829,8 +2102,19 @@ where
                     }
                     #[cfg(feature = "lab-diagnostics")]
                     lab_perf_record("mux.apply_ack", mux_started.elapsed(), ack.released_bytes);
-                    path_stream.release_normalized_acked_ranges(normalized_ranges);
+                    let response_data_ack_release =
+                        path_stream.release_normalized_acked_ranges(normalized_ranges);
+                    response_data_ack_progress_outputs =
+                        response_data_ack_release.path_progress_outputs.into_vec();
+                    response_path_staleness_dirty = true;
+                    response_recovery_dirty = true;
                     response_sender.release_normalized_acked_reinjections(normalized_ranges);
+                    // The next dirty observation includes every binding
+                    // mutation completed before this borrow. A later external
+                    // attachment change remains pending on the watch.
+                    if let Some(updates) = output_updates.as_mut() {
+                        updates.borrow_and_update();
+                    }
                     #[cfg(feature = "lab-diagnostics")]
                     let largest_ack_end = normalized_ranges.last().map_or(0, |range| range.end);
                     #[cfg(feature = "lab-diagnostics")]
@@ -2113,14 +2397,17 @@ where
                         final_offset,
                     )? {
                         if enqueue_tcp_recv_progress(
-                            &mut response_sender,
+                            path_stream,
                             &mut recv_stream,
                             &mut recv_progress,
                             &mut request_sparse_ack_progress,
+                            &mut request_ack_publication,
                             request_feedback_path_snapshot,
                             relay_lane,
                             mux_limits,
                             true,
+                            false,
+                            false,
                         ) {
                             response_sender_retry_at = None;
                             last_recv_progress_sent_at = Instant::now();
@@ -2143,13 +2430,16 @@ where
                     && stream_data_range_already_delivered(&recv_stream, offset, payload.len()) =>
                 {
                     if enqueue_tcp_recv_progress(
-                        &mut response_sender,
+                        path_stream,
                         &mut recv_stream,
                         &mut recv_progress,
                         &mut request_sparse_ack_progress,
+                        &mut request_ack_publication,
                         request_feedback_path_snapshot,
                         relay_lane,
                         mux_limits,
+                        true,
+                        true,
                         true,
                     ) {
                         response_sender_retry_at = None;
@@ -2196,6 +2486,8 @@ where
             }
         }, if output_updates.is_some() => {
             changed?;
+            response_path_staleness_dirty = true;
+            response_recovery_dirty = true;
             let now_has_reinjection_alternative = path_stream.has_multipath_reinjection_alternative();
             let gained_reinjection_alternative =
                 now_has_reinjection_alternative && !multipath_reinjection_alternative_available;
@@ -2343,6 +2635,27 @@ where
         }
         _ = wait_for_carrier_capacity_notifies(carrier_capacity_notifies), if queued_send_blocked && has_carrier_capacity_notify => {
             response_sender_retry_at = None;
+            if response_recovery_capacity_blocked {
+                response_recovery_dirty = true;
+            }
+            continue;
+        }
+        _ = async {
+            if let Some(wait) = request_ack_capacity_wait.as_mut() {
+                wait.as_mut().await;
+            }
+        }, if request_ack_publication.pending && has_request_ack_capacity_wait => {
+            request_ack_capacity_wait = None;
+            continue;
+        }
+        _ = async move {
+            if let Some(wait) = response_state_capacity_wait {
+                wait.await;
+            }
+        }, if response_state_capacity_blocked && has_response_state_capacity_wait => {
+            if response_recovery_capacity_blocked {
+                response_recovery_dirty = true;
+            }
             continue;
         }
         _ = tokio::time::sleep_until(queued_send_retry_deadline), if queued_send_blocked => {
@@ -2359,13 +2672,16 @@ where
                 Some(request_feedback_underlay),
             ) => {
             if enqueue_tcp_recv_progress(
-                &mut response_sender,
+                path_stream,
                 &mut recv_stream,
                 &mut recv_progress,
                 &mut request_sparse_ack_progress,
+                &mut request_ack_publication,
                 request_feedback_path_snapshot,
                 relay_lane,
                 mux_limits,
+                true,
+                true,
                 true,
             ) {
                 response_sender_retry_at = None;

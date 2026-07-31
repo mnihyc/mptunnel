@@ -5,8 +5,9 @@ use crate::mux::stream::{
     validate_stream_ack,
 };
 use crate::protocol::frame::normalize_offset_ranges;
-use crate::protocol::{Frame, OffsetRange, StreamId};
+use crate::protocol::{Frame, OffsetRange, StreamId, UnderlayProtocol};
 use crate::runtime::error::RuntimeError;
+use crate::runtime::sender::ServerReinjectionOutputIdentity;
 use crate::scheduler::PathSnapshot;
 use bytes::Bytes;
 use smallvec::SmallVec;
@@ -55,7 +56,7 @@ pub(in crate::runtime) fn stream_ack_ranges_expose_authoritative_gap(
 ///
 /// Positive ACK evidence is applied directly to cache and flight ledgers. This
 /// snapshot is narrower: it authorizes recovery for omissions only through the
-/// assigned DSN horizon captured by a complete ACK transaction. Incomplete
+/// receiver-observed DSN horizon carried by a complete ACK transaction. Incomplete
 /// deltas may fill an existing authoritative gap, but cannot extend that
 /// horizon to data assigned after the snapshot.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -81,19 +82,46 @@ impl AuthoritativeStreamAckSnapshot {
         self.horizon.is_some_and(|horizon| frontier < horizon)
     }
 
+    /// Returns true when this logical stream has already applied every
+    /// positive and negative fact carried by `ack`.
+    ///
+    /// Retained ACK state is shared across attachments. Redundant publication
+    /// must therefore be idempotent at this owner rather than re-running
+    /// cache, flight, and recovery mutations once per carrier.
+    pub(in crate::runtime) fn subsumes(&self, ack: &ValidatedStreamAck) -> bool {
+        let Some(horizon) = self.horizon else {
+            return false;
+        };
+        if ack.complete() {
+            let observed_horizon = ack.ranges().last().map_or(0, |range| range.end);
+            if observed_horizon > horizon {
+                return false;
+            }
+        }
+        ack.ranges().iter().all(|range| {
+            range.end <= horizon
+                && self
+                    .ranges
+                    .iter()
+                    .any(|stored| stored.start <= range.start && range.end <= stored.end)
+        })
+    }
+
     fn update(&mut self, ack: &ValidatedStreamAck) {
         if !ack.complete() && self.horizon.is_none() {
             return;
         }
 
         if ack.complete() {
-            self.horizon = Some(self.horizon.map_or(ack.assigned_end(), |horizon| {
-                horizon.max(ack.assigned_end())
-            }));
+            let observed_horizon = ack.ranges().last().map_or(0, |range| range.end);
+            self.horizon = Some(
+                self.horizon
+                    .map_or(observed_horizon, |horizon| horizon.max(observed_horizon)),
+            );
         }
         let horizon = self
             .horizon
-            .expect("complete ACK authority must have an assigned horizon");
+            .expect("complete ACK authority must have a receiver-observed horizon");
         let mut merged = std::mem::take(&mut self.ranges);
         merged.extend(ack.ranges().iter().filter_map(|range| {
             let end = range.end.min(horizon);
@@ -189,72 +217,126 @@ pub(in crate::runtime) struct ReliableAckGapReinjectionProgress {
     last_reinjection_at: Option<Instant>,
 }
 
-/// Detects a path that has retained the earliest unacknowledged data sequence
-/// range without making exact Data ACK progress. TCP and QUIC recovery remain
-/// path-local; this state only decides when connection-level reinjection may
-/// stop assigning new data to that path.
-#[derive(Debug, Default)]
-pub(in crate::runtime) struct ReliableRequestPathStaleness {
-    candidate: Option<RelayPathInstance>,
-    first_seen_at: Option<Instant>,
+/// One exact attachment with authoritative outstanding OriginalData.
+#[derive(Debug, Clone, Copy)]
+pub(in crate::runtime) struct ReliablePathStalenessObservation<Candidate> {
+    candidate: Candidate,
+    persistence: Duration,
+    has_reinjection_path: bool,
 }
 
-impl ReliableRequestPathStaleness {
-    pub(in crate::runtime) fn stale_path(
-        &mut self,
-        complete: bool,
-        candidate: Option<RelayPathInstance>,
-        candidate_made_progress: bool,
+impl<Candidate> ReliablePathStalenessObservation<Candidate> {
+    pub(in crate::runtime) fn new(
+        candidate: Candidate,
         has_reinjection_path: bool,
+        underlay: Option<UnderlayProtocol>,
         path: Option<PathSnapshot>,
-    ) -> Option<RelayPathInstance> {
-        self.stale_path_at(
-            complete,
+    ) -> Self {
+        Self {
             candidate,
-            candidate_made_progress,
+            persistence: reliable_path_stale_interval(underlay, path),
             has_reinjection_path,
-            reliable_path_stale_interval(candidate.map(|path| path.key.underlay), path),
-            Instant::now(),
-        )
+        }
     }
 
-    fn stale_path_at(
-        &mut self,
-        complete: bool,
-        candidate: Option<RelayPathInstance>,
-        candidate_made_progress: bool,
+    #[cfg(test)]
+    fn with_persistence(
+        candidate: Candidate,
         has_reinjection_path: bool,
         persistence: Duration,
-        now: Instant,
-    ) -> Option<RelayPathInstance> {
-        // A partial ACK cannot invalidate an already observed complete Data
-        // ACK range set. Wait for the next complete update instead.
-        if !complete {
-            return None;
+    ) -> Self {
+        Self {
+            candidate,
+            persistence,
+            has_reinjection_path,
         }
-        let Some(candidate) = candidate else {
-            self.clear();
-            return None;
-        };
-        if !has_reinjection_path {
-            self.clear();
-            return None;
+    }
+}
+
+/// Tracks an independent persistence clock for every exact attachment
+/// incarnation.
+///
+/// TCP and QUIC recovery remain path-local. This state only decides when
+/// connection-level reinjection may stop assigning new OriginalData to an
+/// attachment. Gap repair or frontier movement on another attachment cannot
+/// restart its clock.
+#[derive(Debug)]
+pub(in crate::runtime) struct ReliablePathStaleness<Candidate> {
+    clocks: SmallVec<[(Candidate, Instant); 4]>,
+    next_deadline: Option<Instant>,
+}
+
+impl<Candidate> Default for ReliablePathStaleness<Candidate> {
+    fn default() -> Self {
+        Self {
+            clocks: SmallVec::new(),
+            next_deadline: None,
         }
-        if self.candidate != Some(candidate) || candidate_made_progress {
-            self.candidate = Some(candidate);
-            self.first_seen_at = Some(now);
-            return None;
-        }
-        self.first_seen_at
-            .is_some_and(|first_seen_at| {
-                now.saturating_duration_since(first_seen_at) >= persistence
-            })
-            .then_some(candidate)
+    }
+}
+
+pub(in crate::runtime) type ReliableRequestPathStaleness = ReliablePathStaleness<RelayPathInstance>;
+pub(in crate::runtime) type ReliableResponsePathStaleness =
+    ReliablePathStaleness<ServerReinjectionOutputIdentity>;
+
+impl<Candidate: Copy + Eq> ReliablePathStaleness<Candidate> {
+    pub(in crate::runtime) fn stale_paths(
+        &mut self,
+        observations: &[ReliablePathStalenessObservation<Candidate>],
+        made_progress: &[Candidate],
+    ) -> SmallVec<[Candidate; 4]> {
+        self.stale_paths_at(observations, made_progress, Instant::now())
     }
 
-    fn clear(&mut self) {
-        self.candidate = None;
-        self.first_seen_at = None;
+    pub(in crate::runtime) fn next_deadline(&self) -> Option<Instant> {
+        self.next_deadline
+    }
+
+    fn stale_paths_at(
+        &mut self,
+        observations: &[ReliablePathStalenessObservation<Candidate>],
+        made_progress: &[Candidate],
+        now: Instant,
+    ) -> SmallVec<[Candidate; 4]> {
+        self.clocks.retain(|(candidate, _)| {
+            observations.iter().any(|observation| {
+                observation.candidate == *candidate && observation.has_reinjection_path
+            })
+        });
+
+        let mut stale = SmallVec::<[Candidate; 4]>::new();
+        let mut next_deadline = None;
+        for observation in observations
+            .iter()
+            .filter(|observation| observation.has_reinjection_path)
+        {
+            if stale.contains(&observation.candidate) {
+                continue;
+            }
+            let Some((_, first_seen_at)) = self
+                .clocks
+                .iter_mut()
+                .find(|(candidate, _)| *candidate == observation.candidate)
+            else {
+                self.clocks.push((observation.candidate, now));
+                let deadline = now + observation.persistence;
+                next_deadline =
+                    Some(next_deadline.map_or(deadline, |current: Instant| current.min(deadline)));
+                continue;
+            };
+            if made_progress.contains(&observation.candidate) {
+                *first_seen_at = now;
+            }
+            let deadline = *first_seen_at + observation.persistence;
+            if deadline <= now {
+                stale.push(observation.candidate);
+            } else {
+                next_deadline =
+                    Some(next_deadline.map_or(deadline, |current: Instant| current.min(deadline)));
+            }
+        }
+        self.next_deadline = next_deadline;
+        stale
     }
 }
 

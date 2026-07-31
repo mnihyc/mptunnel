@@ -21,7 +21,9 @@ use crate::lab_diagnostics::{
 use crate::model::capacity::adaptive_reliable_relay_chunk_bytes_with_frame_limit;
 use crate::model::multipath::ExtraTrafficLedger;
 use crate::model::path::CarrierPathKey;
+use crate::model::timing::reliable_data_retransmission_interval;
 use crate::model::work::ReliableWorkClass;
+use crate::model::work::reliable_failed_original_reinjection_limit_bytes;
 use crate::mux::MuxLimits;
 use crate::mux::stream::ReliableSendStream;
 use crate::performance::MppPerformanceConfig;
@@ -102,6 +104,7 @@ pub(in crate::runtime) struct ServerResponseSenderService {
     pub(in crate::runtime::sender) queue: ReliableRelaySenderQueue,
     pub(in crate::runtime::sender) performance: MppPerformanceConfig,
     pub(in crate::runtime::sender) extra_traffic: ExtraTrafficLedger,
+    stale_response_recovery_generation: u64,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -117,6 +120,13 @@ pub(in crate::runtime) struct ServerAckGapReinjectionTarget {
     pub(in crate::runtime) identity: ServerReinjectionOutputIdentity,
     pub(in crate::runtime) snapshot: PathSnapshot,
     pub(in crate::runtime) completion: Duration,
+}
+
+#[derive(Debug, Default)]
+pub(in crate::runtime) struct StaleResponseRecoveryOutcome {
+    pub(in crate::runtime) queued: bool,
+    pub(in crate::runtime) retry_deadline: Option<Instant>,
+    pub(in crate::runtime) blocked_for_carrier_capacity: bool,
 }
 
 impl ServerResponseSenderService {
@@ -136,7 +146,12 @@ impl ServerResponseSenderService {
             queue: ReliableRelaySenderQueue::default(),
             performance,
             extra_traffic: ExtraTrafficLedger::default(),
+            stale_response_recovery_generation: 0,
         }
+    }
+
+    pub(in crate::runtime) fn stale_response_recovery_generation(&self) -> u64 {
+        self.stale_response_recovery_generation
     }
 
     pub(in crate::runtime) fn ack_gap_reinjection_path_snapshot(
@@ -253,6 +268,17 @@ impl ServerResponseSenderService {
                 cause.persistent_server_target().is_none_or(|target| {
                     path_stream.has_output_incarnation(target.key, target.incarnation)
                 }) && cause.persistent_client_target().is_none()
+            })
+    }
+
+    pub(in crate::runtime) fn discard_resolved_stale_output_reinjections(
+        &mut self,
+        path_stream: &ReliablePathStream,
+    ) -> usize {
+        let active = path_stream.stale_response_original_outputs();
+        self.queue
+            .discard_resolved_stale_response_path_reinjections(|identity| {
+                active.contains(&identity)
             })
     }
 
@@ -387,10 +413,6 @@ impl ServerResponseSenderService {
         self.queue.push_data_for_lane(payload, lane)
     }
 
-    pub(in crate::runtime) fn enqueue_control_frame(&mut self, frame: Frame) -> u64 {
-        self.queue.push_control(frame)
-    }
-
     pub(in crate::runtime) fn enqueue_final_control_frame(&mut self, frame: Frame) -> u64 {
         self.queue.push_final_control(frame)
     }
@@ -441,6 +463,67 @@ impl ServerResponseSenderService {
         self.extra_traffic.record_reinjection(payload_bytes);
         self.queue
             .push_critical_reinjection_with_cause(frame, cause)
+    }
+
+    /// Reinjects exact OriginalData owned by a connection-level stale output.
+    /// The native TCP/QUIC sender remains alive; retained product ranges,
+    /// alternate carrier credit, queue bounds, and the owner's recovery clock
+    /// constrain this work.
+    pub(in crate::runtime) fn drive_stale_output_recovery(
+        &mut self,
+        path_stream: &ReliablePathStream,
+        send_stream: &ReliableSendStream,
+        mux_limits: MuxLimits,
+    ) -> StaleResponseRecoveryOutcome {
+        let mut outcome = StaleResponseRecoveryOutcome::default();
+        for identity in path_stream.stale_response_original_outputs() {
+            let owner_path =
+                path_stream.response_output_snapshot(identity, path_stream.current_lane());
+            let retry_after =
+                reliable_data_retransmission_interval(Some(identity.key.underlay), owner_path);
+            let recovery = path_stream.stale_original_recovery_state(identity, retry_after);
+            outcome.retry_deadline = match (outcome.retry_deadline, recovery.retry_deadline) {
+                (Some(current), Some(deadline)) => Some(current.min(deadline)),
+                (None, deadline) => deadline,
+                (current, None) => current,
+            };
+            if recovery.uncovered_ranges.is_empty() {
+                continue;
+            }
+
+            let cause = RelaySendCause::StaleResponsePathReinjection(identity);
+            let preview = send_stream
+                .retransmission_frames_for_ranges(
+                    &recovery.uncovered_ranges,
+                    mux_limits.max_repair_bytes.max(1),
+                )
+                .into_iter()
+                .find(|frame| !self.has_queued_reinjection_overlap(frame));
+            let Some(preview) = preview else {
+                continue;
+            };
+            let Some((_, reinjection_path)) =
+                self.reinjection_path_snapshot_for_frame(path_stream, &preview, cause)
+            else {
+                outcome.blocked_for_carrier_capacity = true;
+                continue;
+            };
+            let reinjection_limit = reliable_failed_original_reinjection_limit_bytes(
+                Some(reinjection_path),
+                send_stream.reinjection_bytes(),
+                mux_limits,
+            );
+            for frame in send_stream
+                .retransmission_frames_for_ranges(&recovery.uncovered_ranges, reinjection_limit)
+            {
+                if self.has_queued_reinjection_overlap(&frame) {
+                    continue;
+                }
+                self.enqueue_critical_reinjection_frame_with_cause(frame, cause);
+                outcome.queued = true;
+            }
+        }
+        outcome
     }
 
     pub(in crate::runtime) fn has_queued_reinjection_overlap(&self, frame: &Frame) -> bool {
@@ -627,6 +710,16 @@ impl ServerResponseSenderService {
         enqueue_id: u64,
         queue_delay_ms: u128,
     ) -> Result<ServerResponseDispatch, RuntimeError> {
+        if matches!(
+            &committed.kind,
+            ReliableRelayQueuedWorkKind::Reinjection {
+                cause: RelaySendCause::StaleResponsePathReinjection(_),
+                ..
+            }
+        ) {
+            self.stale_response_recovery_generation =
+                self.stale_response_recovery_generation.wrapping_add(1);
+        }
         #[cfg(feature = "lab-diagnostics")]
         let send_lane = match queued_lane {
             ReliableWorkClass::Control => TrafficClass::Control,

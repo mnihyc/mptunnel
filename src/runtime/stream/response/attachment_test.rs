@@ -5,10 +5,11 @@ use super::{
     ResponseStreamAttachOutcome,
 };
 use crate::model::path::{CarrierPathKey, PathPolicy};
-use crate::protocol::{OffsetRange, PathId, PathUsage, UnderlayProtocol};
+use crate::protocol::{Frame, OffsetRange, PathId, PathUsage, StreamId, UnderlayProtocol};
 use crate::runtime::path::commands::{
-    reliable_path_command_channels, try_recv_reliable_path_priority_command,
+    ReliablePathCommand, reliable_path_command_channels, try_recv_reliable_path_priority_command,
 };
+use crate::runtime::sender::ServerReinjectionOutputIdentity;
 use crate::scheduler::TrafficClass;
 
 fn alternate_key(underlay: UnderlayProtocol) -> CarrierPathKey {
@@ -128,6 +129,280 @@ fn neutral_attach_adds_one_output_without_publishing_protocol_frames() {
     drop(outputs);
     assert_eq!(binding.lane(), TrafficClass::Latency);
     assert!(try_recv_reliable_path_priority_command(&mut receivers).is_none());
+}
+
+#[test]
+fn retained_max_data_retries_only_blocked_outputs_and_replays_on_attach() {
+    let stream_id = StreamId(7);
+    let (binding, initial, mut initial_receivers) = binding_for_underlay(UnderlayProtocol::Tcp);
+    let initial_entry = output_entry_for_key(&binding, initial);
+    for nonce in 0..8 {
+        initial_entry
+            .commands
+            .try_enqueue_admitted_frame(Frame::Ping { nonce }, TrafficClass::Control)
+            .expect("fill initial output priority queue");
+    }
+    let alternate = alternate_key(UnderlayProtocol::Udp);
+    let (alternate_commands, mut alternate_receivers) = reliable_path_command_channels(8);
+    assert_eq!(
+        binding.attach(
+            alternate.underlay,
+            alternate.path_id,
+            alternate_commands,
+            TrafficClass::Throughput,
+        ),
+        ResponseStreamAttachOutcome::Attached
+    );
+
+    let first = binding.retry_pending_max_data(stream_id);
+    let published = first
+        .published_offset
+        .expect("available output publishes retained initial credit");
+    assert!(
+        !first.pending,
+        "the opening attachment already accepted the initial grant"
+    );
+    assert!(matches!(
+        try_recv_reliable_path_priority_command(&mut alternate_receivers),
+        Some(ReliablePathCommand::SendFrame(Frame::StreamMaxData {
+            stream_id: received_stream_id,
+            max_offset,
+        })) if received_stream_id == stream_id && max_offset == published
+    ));
+
+    assert!(matches!(
+        try_recv_reliable_path_priority_command(&mut initial_receivers),
+        Some(ReliablePathCommand::SendFrame(Frame::Ping { nonce: 0 }))
+    ));
+    let retry = binding.retry_pending_max_data(stream_id);
+    assert_eq!(retry.published_offset, None);
+    assert!(!retry.pending);
+    for nonce in 1..8 {
+        assert!(matches!(
+            try_recv_reliable_path_priority_command(&mut initial_receivers),
+            Some(ReliablePathCommand::SendFrame(Frame::Ping {
+                nonce: received
+            })) if received == nonce
+        ));
+    }
+    assert!(
+        try_recv_reliable_path_priority_command(&mut initial_receivers).is_none(),
+        "the initial attachment must not receive its already accepted opening grant again"
+    );
+    assert!(
+        try_recv_reliable_path_priority_command(&mut alternate_receivers).is_none(),
+        "an already-published output must not receive an unchanged duplicate"
+    );
+}
+
+#[test]
+fn sole_surviving_response_output_is_restored_from_stale_placement() {
+    let (binding, initial, _initial_receivers) = binding_for_underlay(UnderlayProtocol::Tcp);
+    let initial_entry = output_entry_for_key(&binding, initial);
+    let alternate = alternate_key(UnderlayProtocol::Udp);
+    let (alternate_commands, alternate_receivers) = reliable_path_command_channels(8);
+    assert_eq!(
+        binding.attach(
+            alternate.underlay,
+            alternate.path_id,
+            alternate_commands,
+            TrafficClass::Throughput,
+        ),
+        ResponseStreamAttachOutcome::Attached
+    );
+    let initial_identity = ServerReinjectionOutputIdentity {
+        key: initial,
+        incarnation: initial_entry.incarnation,
+    };
+    assert!(binding.mark_output_stale(initial_identity));
+    assert!(
+        binding
+            .sender_path_targets(TrafficClass::Throughput, 1)
+            .into_iter()
+            .find(|target| target.observation.key == initial)
+            .expect("initial output remains attached")
+            .observation
+            .stale_for_original_data
+    );
+
+    drop(alternate_receivers);
+    let targets = binding.sender_path_targets(TrafficClass::Throughput, 1);
+    assert_eq!(targets.len(), 1);
+    assert_eq!(targets[0].observation.key, initial);
+    assert!(
+        !targets[0].observation.stale_for_original_data,
+        "the sole live survivor regains OriginalData and reinjection eligibility"
+    );
+}
+
+#[test]
+fn retained_ack_uses_updates_only_for_caught_up_outputs() {
+    let stream_id = StreamId(7);
+    let (binding, _initial, mut initial_receivers) = binding_for_underlay(UnderlayProtocol::Tcp);
+    let initial_snapshot = vec![Frame::StreamAck {
+        stream_id,
+        complete: true,
+        ranges: vec![OffsetRange { start: 0, end: 8 }],
+    }];
+    let first = binding.publish_ack(1, &initial_snapshot, &initial_snapshot);
+    assert!(first.published);
+    assert!(!first.pending);
+    assert!(matches!(
+        try_recv_reliable_path_priority_command(&mut initial_receivers),
+        Some(ReliablePathCommand::SendFrame(Frame::StreamAck {
+            complete: true,
+            ranges,
+            ..
+        })) if ranges == vec![OffsetRange { start: 0, end: 8 }]
+    ));
+
+    let alternate = alternate_key(UnderlayProtocol::Udp);
+    let (alternate_commands, mut alternate_receivers) = reliable_path_command_channels(8);
+    assert_eq!(
+        binding.attach(
+            alternate.underlay,
+            alternate.path_id,
+            alternate_commands,
+            TrafficClass::Throughput,
+        ),
+        ResponseStreamAttachOutcome::Attached
+    );
+    let update = vec![Frame::StreamAck {
+        stream_id,
+        complete: false,
+        ranges: vec![OffsetRange { start: 16, end: 24 }],
+    }];
+    let cumulative = vec![Frame::StreamAck {
+        stream_id,
+        complete: true,
+        ranges: vec![
+            OffsetRange { start: 0, end: 8 },
+            OffsetRange { start: 16, end: 24 },
+        ],
+    }];
+    let second = binding.publish_ack(2, &update, &cumulative);
+    assert!(second.published);
+    assert!(!second.pending);
+    assert!(matches!(
+        try_recv_reliable_path_priority_command(&mut initial_receivers),
+        Some(ReliablePathCommand::SendFrame(Frame::StreamAck {
+            complete: false,
+            ranges,
+            ..
+        })) if ranges == vec![OffsetRange { start: 16, end: 24 }]
+    ));
+    assert!(matches!(
+        try_recv_reliable_path_priority_command(&mut alternate_receivers),
+        Some(ReliablePathCommand::SendFrame(Frame::StreamAck {
+            complete: true,
+            ranges,
+            ..
+        })) if ranges == vec![
+            OffsetRange { start: 0, end: 8 },
+            OffsetRange { start: 16, end: 24 },
+        ]
+    ));
+}
+
+#[test]
+fn retained_ack_retry_resumes_at_the_first_unaccepted_cumulative_chunk() {
+    let stream_id = StreamId(7);
+    let (binding, initial, mut receivers) = binding_for_underlay(UnderlayProtocol::Tcp);
+    let entry = output_entry_for_key(&binding, initial);
+    for nonce in 0..8 {
+        entry
+            .commands
+            .try_enqueue_admitted_frame(Frame::Ping { nonce }, TrafficClass::Control)
+            .expect("fill response priority queue");
+    }
+    let cumulative = vec![
+        Frame::StreamAck {
+            stream_id,
+            complete: false,
+            ranges: vec![OffsetRange { start: 0, end: 8 }],
+        },
+        Frame::StreamAck {
+            stream_id,
+            complete: false,
+            ranges: vec![OffsetRange { start: 16, end: 24 }],
+        },
+    ];
+    let first = binding.publish_ack(1, &cumulative, &cumulative);
+    assert!(!first.published);
+    assert!(first.pending);
+
+    assert!(matches!(
+        try_recv_reliable_path_priority_command(&mut receivers),
+        Some(ReliablePathCommand::SendFrame(Frame::Ping { nonce: 0 }))
+    ));
+    let partial = binding.retry_pending_ack(1, &cumulative);
+    assert!(partial.accepted);
+    assert!(!partial.published);
+    assert!(partial.pending);
+    for nonce in 1..8 {
+        assert!(matches!(
+            try_recv_reliable_path_priority_command(&mut receivers),
+            Some(ReliablePathCommand::SendFrame(Frame::Ping { nonce: received }))
+                if received == nonce
+        ));
+    }
+    assert!(matches!(
+        try_recv_reliable_path_priority_command(&mut receivers),
+        Some(ReliablePathCommand::SendFrame(Frame::StreamAck { ranges, .. }))
+            if ranges == vec![OffsetRange { start: 0, end: 8 }]
+    ));
+
+    let complete = binding.retry_pending_ack(1, &cumulative);
+    assert!(complete.accepted);
+    assert!(complete.published);
+    assert!(!complete.pending);
+    assert!(matches!(
+        try_recv_reliable_path_priority_command(&mut receivers),
+        Some(ReliablePathCommand::SendFrame(Frame::StreamAck { ranges, .. }))
+            if ranges == vec![OffsetRange { start: 16, end: 24 }]
+    ));
+    let fenced = binding.retry_pending_ack(1, &cumulative);
+    assert!(!fenced.accepted);
+    assert!(fenced.published);
+    assert!(!fenced.pending);
+}
+
+#[test]
+fn retained_ack_publication_status_excludes_a_detached_fence() {
+    let stream_id = StreamId(7);
+    let (binding, initial, _initial_receivers) = binding_for_underlay(UnderlayProtocol::Tcp);
+    let cumulative = vec![Frame::StreamAck {
+        stream_id,
+        complete: true,
+        ranges: vec![OffsetRange { start: 0, end: 8 }],
+    }];
+    assert!(binding.publish_ack(1, &cumulative, &cumulative).published);
+
+    let alternate = alternate_key(UnderlayProtocol::Udp);
+    let (alternate_commands, _alternate_receivers) = reliable_path_command_channels(8);
+    for nonce in 0..8 {
+        alternate_commands
+            .try_enqueue_admitted_frame(Frame::Ping { nonce }, TrafficClass::Control)
+            .expect("fill alternate response priority queue");
+    }
+    assert_eq!(
+        binding.attach(
+            alternate.underlay,
+            alternate.path_id,
+            alternate_commands,
+            TrafficClass::Throughput,
+        ),
+        ResponseStreamAttachOutcome::Attached
+    );
+    let mixed = binding.retry_pending_ack(1, &cumulative);
+    assert!(mixed.published, "the original live output remains fenced");
+    assert!(mixed.pending, "the new output still needs cumulative state");
+
+    let initial_entry = output_entry_for_key(&binding, initial);
+    binding.detach(initial, &initial_entry.commands);
+    let only_blocked_output = binding.retry_pending_ack(1, &cumulative);
+    assert!(!only_blocked_output.published);
+    assert!(only_blocked_output.pending);
 }
 
 #[test]

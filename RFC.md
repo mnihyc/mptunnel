@@ -1046,13 +1046,22 @@ envelope.
 
 ### 8.3 MPP Data ACK
 
-`STREAM_ACK(stream_id, complete, ranges)` carries non-empty half-open ranges in
-one directional MPP stream offset space. The list MAY be empty.
+`STREAM_ACK(stream_id, complete, ranges)` carries a list of half-open ranges in
+one directional MPP stream offset space. Every listed range is non-empty; the
+list itself MAY be empty.
 
 When `complete` is true, the list is an authoritative snapshot of the
 receiver's retained received ranges and can establish an omitted gap. When
 false, the ranges report partial positive progress and omission does not imply
 a gap. `complete` does not mean end of stream.
+
+Negative authority from a complete snapshot extends only through the greatest
+range end carried by that snapshot. The sender's current assigned offset is not
+receiver evidence and MUST NOT be used as the snapshot horizon. A complete
+contiguous prefix therefore proves its positive range but does not declare a
+later assigned tail missing; an empty complete snapshot establishes no negative
+extent. An incomplete update can fill an already authoritative gap but cannot
+extend its horizon.
 
 Data ACK processing MUST be one transaction:
 
@@ -1067,6 +1076,26 @@ If a byte was outstanding on multiple carriers, the Data ACK proves delivery
 but not which copy delivered it. No implementation may invent per-carrier
 delivery evidence for that range.
 
+The logical receiver retains its latest cumulative received-range state until
+the stream becomes terminal. At the existing Data ACK cadence, changed
+cumulative state advances one local publication generation and is offered
+independently to every currently live exact attachment. Forced publication of
+unchanged state reuses that generation. Queue acceptance advances only that
+exact attachment incarnation's publication fence; a blocked attachment remains
+pending and retries on existing carrier-capacity or attachment-membership
+events. A newly accepted attachment starts without a fence and receives the
+retained latest state. This publication rule adds no timer, ACK threshold,
+receive window, congestion signal, or carrier-delivery attribution.
+
+When the cumulative range set fits one frame, that frame MAY be complete. When
+it requires multiple frames, every chunk MUST be incomplete positive evidence,
+and an attachment advances its generation fence only after every chunk was
+accepted. Received positive ranges are monotonic for the stream lifetime, so a
+newer cumulative generation MAY supersede the unqueued tail of an older
+generation; already accepted older chunks remain valid and idempotent. The
+logical receive range ledger remains the sole range owner. Each attachment
+retains only its exact-incarnation generation and next-chunk cursor.
+
 ### 8.4 Shared flow control
 
 `STREAM_MAX_DATA(stream_id, max_offset)` grants the greatest offset the sender
@@ -1077,6 +1106,17 @@ The sender retains the greatest observed maximum; a smaller value does not
 revoke credit. A new attachment MAY therefore receive a credit-neutral
 `STREAM_MAX_DATA(stream_id, 0)`. Only the logical receive owner grants new
 credit.
+
+The logical receive owner MUST retain its greatest grant as idempotent
+connection state until the stream becomes terminal. When that grant advances,
+the owner MUST attempt to publish the latest value independently on every
+currently live attachment. Acceptance by one attachment publishes the shared
+grant and permits the receiver to admit bytes through that offset; an
+attachment whose carrier queue is blocked remains pending rather than
+consuming the publication. A newly attached carrier MUST receive the retained
+latest value after its credit-neutral attachment acceptance. Carrier-capacity
+notifications retry pending publication; this rule adds no independent timer,
+window, or congestion control.
 
 `STREAM_ACK` releases retained data and flight but grants no new offset.
 `STREAM_MAX_DATA` grants offsets but acknowledges no byte. Transport enqueue
@@ -1672,10 +1712,36 @@ A contiguous live tail without an authoritative gap may send one bounded probe
 after one MPP recovery interval. Another repair requires another full interval
 without MPP Data ACK progress.
 
-When another attachment is available, request placement stops selecting a
-non-progressing original attachment after four TCP MPP recovery intervals or
-three QUIC MPP recovery intervals. The carrier remains connected and native
-recovery continues.
+When another non-stale attachment is available, original placement in either
+direction stops selecting a non-progressing attachment after four TCP MPP
+recovery intervals or three QUIC MPP recovery intervals. Every exact
+unacknowledged OriginalData range owned by that stale attachment then becomes
+connection-level reinjection work on a distinct non-stale attachment. The work
+is admitted through the existing shared receive-credit, retained-range, repair,
+queue, and native-enqueue bounds.
+
+Recovery suppression is exact-range state, not one clock for the complete
+owner. Acceptance of a recovery copy by an exact carrier command queue covers
+only that copy's Data Sequence range for one owning-path MPP recovery interval.
+It MUST NOT delay a disjoint stale-owned range that has no current recovery
+copy. If the exact range remains unacknowledged when that interval expires, the
+range becomes eligible again and MAY reuse the same non-stale survivor; the
+survivor need only remain distinct from the stale original attachment. The
+earliest current range expiry is an actor wake deadline. Thus every range is
+retried no more than once per owning path's MPP recovery interval until MPP
+Data ACK covers it, while the existing queue, flight, repair, and extra-traffic
+bounds limit aggregate work. Exact unambiguous MPP Data ACK progress on the
+stale attachment makes it eligible for original placement again. The carrier
+remains connected and native recovery continues throughout.
+
+The persistence clock is independent for every exact attachment incarnation
+that owns OriginalData omitted below the authoritative Data ACK horizon.
+Progress or gap repair on another attachment, and movement of the stream's
+lowest missing frontier between attachments, MUST NOT restart that clock.
+Only exact unambiguous OriginalData ACK progress on the same attachment
+restarts it. The clock is removed when that attachment has no authoritative
+outstanding OriginalData or no non-stale alternative. Attachment staleness is
+stream-local; only exact carrier-instance failure is session-wide.
 
 If cumulative extra-traffic credit is exhausted, an exact carrier failure,
 persistent authoritative gap, or live-tail event may use one critical recovery

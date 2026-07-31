@@ -151,10 +151,6 @@ impl ResponseStreamBinding {
             self.response_model_generation
                 .fetch_add(1, Ordering::AcqRel);
         }
-        drop(outputs);
-        if changed {
-            self.notify_update();
-        }
     }
 
     #[cfg(test)]

@@ -60,7 +60,16 @@ pub(super) fn select_response_data_path_with_payload(
     lower_flights: &[CarrierPathFlightDebt],
     connection_ordering_debt_bytes: usize,
 ) -> Option<ResponseDataPathSelection> {
-    let single_live_path = targets.len() == 1;
+    let nonstale_live_paths = targets
+        .iter()
+        .filter(|target| !target.observation.stale_for_original_data)
+        .count();
+    let has_nonstale_live_path = nonstale_live_paths > 0;
+    let single_live_path = if has_nonstale_live_path {
+        nonstale_live_paths == 1
+    } else {
+        targets.len() == 1
+    };
     let connection_window = u64::try_from(mux_limits.max_reorder_bytes)
         .unwrap_or(u64::MAX)
         .min(mux_limits.max_stream_window_bytes);
@@ -70,9 +79,10 @@ pub(super) fn select_response_data_path_with_payload(
         return None;
     }
     let lower_owner = response_oldest_lower_flight_owner(lower_flights);
-    let select = |allow_backup: bool| {
+    let select = |allow_backup: bool, allow_stale: bool| {
         let candidates = targets
             .iter()
+            .filter(|target| allow_stale || !target.observation.stale_for_original_data)
             .filter(|target| target.can_enqueue_stream_data(lane))
             // Registration follows the carrier's TCP/QUIC establishment and
             // authenticated PATH_JOIN/SESSION_READY exchange. That is the
@@ -111,6 +121,7 @@ pub(super) fn select_response_data_path_with_payload(
                 targets.iter().find(|target| {
                     target.observation.key == owner_key
                         && target.observation.incarnation == owner_incarnation
+                        && (allow_stale || !target.observation.stale_for_original_data)
                 })
             })
             .and_then(|target| {
@@ -280,7 +291,18 @@ pub(super) fn select_response_data_path_with_payload(
             )
     };
 
-    select(false).or_else(|| select(true))
+    select(false, false)
+        .or_else(|| select(true, false))
+        .or_else(|| {
+            (!has_nonstale_live_path)
+                .then(|| select(false, true))
+                .flatten()
+        })
+        .or_else(|| {
+            (!has_nonstale_live_path)
+                .then(|| select(true, true))
+                .flatten()
+        })
 }
 
 pub(super) fn response_completion_snapshot(
@@ -311,7 +333,14 @@ pub(super) fn select_response_frame_path(
     let ack_gap_reinjection = reinjection_cause.is_some_and(RelaySendCause::is_ack_gap_reinjection);
     let path_failure_reinjection = matches!(
         reinjection_cause,
-        Some(RelaySendCause::PathFailureReinjection)
+        Some(
+            RelaySendCause::PathFailureReinjection
+                | RelaySendCause::StaleResponsePathReinjection(_)
+        )
+    );
+    let stale_response_path_reinjection = matches!(
+        reinjection_cause,
+        Some(RelaySendCause::StaleResponsePathReinjection(_))
     );
     let requires_measured_reinjection_target =
         reinjection_cause.is_some_and(RelaySendCause::is_persistent_ack_gap_reinjection);
@@ -333,6 +362,9 @@ pub(super) fn select_response_frame_path(
                   require_idle: bool| {
         let candidates = targets
             .iter()
+            .filter(|target| {
+                reinjection_cause.is_none() || !target.observation.stale_for_original_data
+            })
             .filter(|target| can_enqueue(target, require_idle))
             .filter(|target| {
                 allow_backup || !scheduler::path_is_backup(target.observation.snapshot)
@@ -405,7 +437,8 @@ pub(super) fn select_response_frame_path(
 
     let prefer_distinct = reinjection_cause.is_some() && !avoid_outputs.is_empty();
     let require_distinct = (matches!(reinjection_cause, Some(RelaySendCause::TailReinjection))
-        || ack_gap_reinjection)
+        || ack_gap_reinjection
+        || stale_response_path_reinjection)
         && !avoid_outputs.is_empty();
     if require_distinct {
         // Reinjection of a live output's range is useful only on a different

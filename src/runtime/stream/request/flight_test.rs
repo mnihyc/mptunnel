@@ -2,7 +2,7 @@ use super::RequestFlightLedger;
 use crate::model::path::{CarrierPathInstanceId, RelayPathInstance, RelayPathKey};
 use crate::protocol::{Frame, OffsetRange, StreamId, UnderlayProtocol};
 use bytes::Bytes;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 fn data_frame(offset: u64, len: usize) -> Frame {
     Frame::StreamData {
@@ -140,7 +140,9 @@ fn reinjection_ranges_exclude_live_alternate_flights_only() {
     ledger.record_reinjection_frame_instance(unavailable, &data_frame(8192, 1024));
 
     assert_eq!(
-        ledger.uncovered_unacked_ranges_for_reinjection(original, &[alternate]),
+        ledger
+            .range_recovery_state(original, &[alternate], Duration::from_secs(1))
+            .uncovered_ranges,
         vec![
             OffsetRange {
                 start: 0,
@@ -163,7 +165,9 @@ fn reinjection_ranges_exclude_live_alternate_flights_only() {
         end: 4096,
     }]);
     assert_eq!(
-        ledger.uncovered_unacked_ranges_for_reinjection(original, &[alternate]),
+        ledger
+            .range_recovery_state(original, &[alternate], Duration::from_secs(1))
+            .uncovered_ranges,
         vec![
             OffsetRange {
                 start: 4096,
@@ -179,20 +183,42 @@ fn reinjection_ranges_exclude_live_alternate_flights_only() {
 }
 
 #[test]
-fn earliest_unacked_original_path_advances_with_data_ack_release() {
+fn authoritative_horizon_enumerates_every_exact_original_owner_below_it() {
     let first = path(UnderlayProtocol::Tcp, 0, 3);
+    let replacement = path(UnderlayProtocol::Tcp, 0, 4);
     let second = path(UnderlayProtocol::Udp, 1, 5);
+    let duplicate = path(UnderlayProtocol::Udp, 2, 7);
     let mut ledger = RequestFlightLedger::default();
     ledger.record_original_frame_instance(first, &data_frame(0, 4096));
+    ledger.record_reinjection_frame_instance(duplicate, &data_frame(0, 4096));
     ledger.record_original_frame_instance(second, &data_frame(4096, 4096));
-    ledger.record_reinjection_frame_instance(second, &data_frame(0, 4096));
+    ledger.record_original_frame_instance(replacement, &data_frame(8192, 4096));
 
-    assert_eq!(ledger.earliest_unacked_original_path(), Some(first));
+    assert!(ledger.unacked_original_paths_before(0).is_empty());
+    assert_eq!(
+        ledger.unacked_original_paths_before(4096).as_slice(),
+        &[first]
+    );
+    assert_eq!(
+        ledger.unacked_original_paths_before(8192).as_slice(),
+        &[first, second],
+        "reinjection copies never become authoritative original owners",
+    );
+    assert_eq!(
+        ledger.unacked_original_paths_before(8193).as_slice(),
+        &[first, second, replacement],
+        "a replacement attachment sharing one logical key remains an exact owner",
+    );
+
     ledger.release_normalized_acked_ranges(&[OffsetRange {
         start: 0,
         end: 4096,
     }]);
-    assert_eq!(ledger.earliest_unacked_original_path(), Some(second));
+    assert_eq!(
+        ledger.unacked_original_paths_before(8192).as_slice(),
+        &[second],
+        "ACK release removes only the resolved owner's persistence-clock input",
+    );
 }
 
 #[test]

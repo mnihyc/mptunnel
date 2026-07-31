@@ -245,9 +245,17 @@ fn sender_queue_discards_reinjection_after_exact_path_progress() {
         attachment_id: 12,
     };
     let mut queue = ReliableRelaySenderQueue::default();
+    let response = ServerReinjectionOutputIdentity {
+        key: CarrierPathKey {
+            underlay: UnderlayProtocol::Udp,
+            path_id: PathId(5),
+        },
+        incarnation: 17,
+    };
     for (offset, cause) in [
         (0, RelaySendCause::StalePathReinjection(path)),
-        (64, RelaySendCause::AckGapReinjection),
+        (64, RelaySendCause::StaleResponsePathReinjection(response)),
+        (128, RelaySendCause::AckGapReinjection),
     ] {
         queue.push_critical_reinjection_with_cause(
             Frame::StreamData {
@@ -259,6 +267,12 @@ fn sender_queue_discards_reinjection_after_exact_path_progress() {
         );
     }
 
+    assert_eq!(
+        queue.discard_resolved_stale_response_path_reinjections(|candidate| {
+            candidate != response
+        }),
+        64
+    );
     assert_eq!(
         queue.discard_resolved_stale_path_reinjections(|candidate| candidate != path),
         64

@@ -62,10 +62,10 @@ pub(in crate::runtime) struct ClientReinjectionOutputIdentity {
     pub(in crate::runtime::sender) instance: RelayPathInstance,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub(in crate::runtime) struct ServerReinjectionOutputIdentity {
-    pub(in crate::runtime::sender) key: CarrierPathKey,
-    pub(in crate::runtime::sender) incarnation: u64,
+    pub(in crate::runtime) key: CarrierPathKey,
+    pub(in crate::runtime) incarnation: u64,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -84,7 +84,6 @@ pub(in crate::runtime) struct PersistentServerAckGapBatch {
 pub(in crate::runtime) enum RelaySendCause {
     StreamData,
     StreamFin,
-    RecvProgress,
     AckGapReinjection,
     PersistentAckGapReinjection,
     PersistentClientAckGapReinjection(PersistentClientAckGapBatch),
@@ -92,6 +91,7 @@ pub(in crate::runtime) enum RelaySendCause {
     TailReinjection,
     PathFailureReinjection,
     StalePathReinjection(RelayPathInstance),
+    StaleResponsePathReinjection(ServerReinjectionOutputIdentity),
 }
 
 impl RelaySendCause {
@@ -100,14 +100,15 @@ impl RelaySendCause {
         match self {
             Self::StreamData => "stream_data",
             Self::StreamFin => "stream_fin",
-            Self::RecvProgress => "recv_progress",
             Self::AckGapReinjection => "ack_gap_reinjection",
             Self::PersistentAckGapReinjection
             | Self::PersistentClientAckGapReinjection(_)
             | Self::PersistentServerAckGapReinjection(_) => "persistent_ack_gap_reinjection",
             Self::TailReinjection => "tail_reinjection",
             Self::PathFailureReinjection => "path_failure_reinjection",
-            Self::StalePathReinjection(_) => "stale_path_reinjection",
+            Self::StalePathReinjection(_) | Self::StaleResponsePathReinjection(_) => {
+                "stale_path_reinjection"
+            }
         }
     }
 
@@ -121,6 +122,7 @@ impl RelaySendCause {
                 | Self::TailReinjection
                 | Self::PathFailureReinjection
                 | Self::StalePathReinjection(_)
+                | Self::StaleResponsePathReinjection(_)
         )
     }
 

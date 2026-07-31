@@ -11,6 +11,7 @@ use crate::mux::MuxLimits;
 use crate::protocol::OffsetRange;
 use crate::scheduler::{PathSnapshot, TrafficClass};
 use std::collections::BTreeMap;
+use std::time::Instant;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum CarrierWorkKind {
@@ -29,6 +30,17 @@ pub(crate) enum ReliableWorkClass {
     Control,
     Data,
     Reinjection,
+}
+
+/// One atomic observation of exact-range recovery state.
+///
+/// Recovery actors must consume the due ranges and the next expiry from the
+/// same ledger scan. Splitting those observations can lose the wake when a
+/// recovery copy expires between two scans.
+#[derive(Debug, Default)]
+pub(crate) struct RangeRecoveryState {
+    pub(crate) uncovered_ranges: Vec<OffsetRange>,
+    pub(crate) retry_deadline: Option<Instant>,
 }
 
 /// Caps one product reinjection event by current debt and configured resource

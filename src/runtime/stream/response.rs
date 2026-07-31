@@ -12,6 +12,7 @@ mod evidence;
 mod session;
 mod snapshot;
 
+use crate::model::capacity::reliable_stream_initial_advertised_window_bytes;
 use crate::model::path::{CarrierPathInstanceId, CarrierPathKey, PathPolicy};
 use crate::mux::MuxLimits;
 use crate::protocol::{PathId, ResetReason, SessionId, StreamId, UnderlayProtocol};
@@ -25,11 +26,11 @@ pub(in crate::runtime) use attachment::{
 };
 use attachment::{ResponseStreamOutputEntry, ResponseStreamOutputs};
 use delivery::ResponseAckOrderingState;
-pub(in crate::runtime) use delivery::ResponseDataAckRecoveryCandidate;
 pub(super) use delivery::{
     CarrierPathFlight, product_flights_have_recent_reinjection_overlap,
     release_carrier_path_flight_ranges,
 };
+pub(in crate::runtime) use delivery::{ResponseDataAckRecoveryCandidate, ResponseDataAckRelease};
 pub(in crate::runtime) use diagnostics::record_server_sender_decision;
 pub(in crate::runtime) use evidence::{ServerPathMetricsEntry, ServerPathMetricsSource};
 pub(in crate::runtime) use session::{ServerSessionRegistration, ServerSessionTracker};
@@ -67,6 +68,8 @@ pub(in crate::runtime) struct ResponseStreamBinding {
     mux_limits: MuxLimits,
     session_registration: ServerSessionRegistration,
     next_output_incarnation: AtomicU64,
+    /// Changes only when the set of live response attachments changes.
+    output_membership_generation: AtomicU64,
     // Publishes coherent path evidence, exact flights, ACK ordering, and queues.
     response_model_generation: AtomicU64,
     // Close publishes before carrier commands so no later scheduler commit can
@@ -171,12 +174,15 @@ impl ResponseStreamBinding {
         let key = CarrierPathKey { underlay, path_id };
         let session_registration = ServerSessionRegistration::new(session_tracker, session_id);
         let load_registration = commands.register_flow(lane);
+        let initial_max_data_offset =
+            reliable_stream_initial_advertised_window_bytes(underlay, lane, mux_limits);
         Arc::new(Self {
             session_id,
             lane: Mutex::new(lane),
             mux_limits,
             session_registration,
             next_output_incarnation: AtomicU64::new(2),
+            output_membership_generation: AtomicU64::new(1),
             response_model_generation: AtomicU64::new(0),
             response_stream_open: AtomicBool::new(true),
             outputs: Mutex::new(ResponseStreamOutputs {
@@ -189,6 +195,7 @@ impl ResponseStreamBinding {
                     commands,
                     load_registration,
                     original_data_in_flight_bytes: 0,
+                    stale_for_original_data: false,
                     bytes_in_flight: 0,
                     product_progress_rate_bps: None,
                     delivery_rate_bps: None,
@@ -197,6 +204,10 @@ impl ResponseStreamBinding {
                     srtt_ms: None,
                     delivery_samples: 0,
                     original_data_acked_bytes: 0,
+                    // Opening acceptance already queued this exact grant on
+                    // the initial attachment before supervision begins.
+                    published_max_data_offset: initial_max_data_offset,
+                    ack_publication: Default::default(),
                     local_path_metrics: None,
                     peer_path_metrics: None,
                     peer_usage: None,
@@ -204,6 +215,7 @@ impl ResponseStreamBinding {
                     path_proof: None,
                 }],
                 data_level_queue_bytes: 0,
+                desired_max_data_offset: initial_max_data_offset,
             }),
             request_feedback_ingress: Mutex::new(Some(RequestFeedbackIngress {
                 key,

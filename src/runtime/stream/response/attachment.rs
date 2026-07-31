@@ -12,12 +12,15 @@ use crate::model::path::{CarrierPathInstanceId, CarrierPathKey, PathPolicy};
 use crate::model::response::ResponsePathObservation;
 #[cfg(test)]
 use crate::protocol::PathId;
-use crate::protocol::{Frame, PathUsage, UnderlayProtocol};
+use crate::protocol::{Frame, PathUsage, StreamId, UnderlayProtocol};
 use crate::runtime::RuntimeError;
 use crate::runtime::path::commands::{
     ReliablePathCommandQueueSnapshot, ReliablePathCommandSender, ReliablePathLoadRegistration,
 };
 use crate::runtime::path::proof::PathProofObservation;
+use crate::runtime::stream::feedback::{
+    StreamAckPublication, StreamAckPublicationCursor, StreamMaxDataPublication,
+};
 use crate::scheduler::{PathSnapshot, TrafficClass};
 use std::sync::atomic::Ordering;
 
@@ -98,6 +101,9 @@ pub(in crate::runtime) struct ResponseStreamOutputEntry {
     /// Unacknowledged unique OriginalData assigned to this response output.
     /// Reinjection copies remain in `bytes_in_flight` but never enter this counter.
     pub(super) original_data_in_flight_bytes: u64,
+    /// Data-ACK recovery may withdraw an output from new OriginalData placement
+    /// without closing it or interfering with native carrier recovery.
+    pub(super) stale_for_original_data: bool,
     pub(super) bytes_in_flight: u64,
     pub(super) product_progress_rate_bps: Option<f64>,
     pub(super) delivery_rate_bps: Option<f64>,
@@ -114,6 +120,10 @@ pub(in crate::runtime) struct ResponseStreamOutputEntry {
     /// The flight ledger increments this only for unambiguous `OriginalData`;
     /// duplicated `ReinjectedData` never contributes.
     pub(super) original_data_acked_bytes: u64,
+    /// Greatest shared receive grant accepted by this attachment's queue.
+    pub(super) published_max_data_offset: u64,
+    /// Latest cumulative Data ACK generation accepted by this attachment.
+    pub(super) ack_publication: StreamAckPublicationCursor,
     pub(super) local_path_metrics: Option<ServerPathMetricsEntry>,
     pub(super) peer_path_metrics: Option<ServerPathMetricsEntry>,
     /// Latest directional preference advertised by the peer for this exact
@@ -132,6 +142,135 @@ pub(in crate::runtime) struct ResponseStreamOutputs {
     /// Offset-free sender-service staging belongs to the response stream, not
     /// to any carrier output.
     pub(super) data_level_queue_bytes: u64,
+    /// Retained idempotent receive grant shared by every attachment.
+    pub(super) desired_max_data_offset: u64,
+}
+
+impl ResponseStreamOutputs {
+    /// Restores stale outputs when no distinct live non-stale attachment
+    /// remains. Staleness is relative placement state, not a permanent health
+    /// verdict on a carrier that becomes the sole survivor.
+    pub(super) fn reconcile_stale_output_eligibility(&mut self) -> bool {
+        if self
+            .entries
+            .iter()
+            .any(|entry| !entry.commands.is_closed() && !entry.stale_for_original_data)
+        {
+            return false;
+        }
+        let mut changed = false;
+        for entry in &mut self.entries {
+            if !entry.commands.is_closed() && entry.stale_for_original_data {
+                entry.stale_for_original_data = false;
+                changed = true;
+            }
+        }
+        changed
+    }
+}
+
+fn publish_pending_max_data(
+    outputs: &mut ResponseStreamOutputs,
+    stream_id: StreamId,
+) -> StreamMaxDataPublication {
+    let desired = outputs.desired_max_data_offset;
+    let mut publication = StreamMaxDataPublication::default();
+    for entry in &mut outputs.entries {
+        if entry.commands.control_frame_queue_is_closed()
+            || entry.published_max_data_offset >= desired
+        {
+            continue;
+        }
+        if entry
+            .commands
+            .try_enqueue_admitted_frame(
+                Frame::StreamMaxData {
+                    stream_id,
+                    max_offset: desired,
+                },
+                TrafficClass::Control,
+            )
+            .is_ok()
+        {
+            entry.published_max_data_offset = desired;
+            publication.published_offset = Some(desired);
+        }
+    }
+    publication.pending = outputs.entries.iter().any(|entry| {
+        !entry.commands.control_frame_queue_is_closed() && entry.published_max_data_offset < desired
+    });
+    publication
+}
+
+fn publish_ack_update(
+    outputs: &mut ResponseStreamOutputs,
+    generation: u64,
+    update_frames: &[Frame],
+    cumulative_frames: &[Frame],
+) -> StreamAckPublication {
+    let mut publication = StreamAckPublication::default();
+    for entry in &mut outputs.entries {
+        if entry.commands.control_frame_queue_is_closed() {
+            continue;
+        }
+        let commands = &entry.commands;
+        let attachment = entry.ack_publication.publish_update(
+            generation,
+            update_frames,
+            cumulative_frames,
+            |frame| {
+                commands
+                    .try_enqueue_admitted_frame(frame, TrafficClass::Control)
+                    .is_ok()
+            },
+        );
+        publication.accepted |= attachment.accepted;
+        publication.published |= attachment.published;
+    }
+    publication.published = outputs.entries.iter().any(|entry| {
+        !entry.commands.control_frame_queue_is_closed()
+            && !entry.ack_publication.is_pending(generation)
+    });
+    publication.pending = outputs.entries.iter().any(|entry| {
+        !entry.commands.control_frame_queue_is_closed()
+            && entry.ack_publication.is_pending(generation)
+    });
+    publication
+}
+
+fn retry_pending_ack(
+    outputs: &mut ResponseStreamOutputs,
+    generation: u64,
+    cumulative_frames: &[Frame],
+) -> StreamAckPublication {
+    let mut publication = StreamAckPublication::default();
+    for entry in &mut outputs.entries {
+        if entry.commands.control_frame_queue_is_closed()
+            || !entry.ack_publication.is_pending(generation)
+        {
+            continue;
+        }
+        let commands = &entry.commands;
+        let attachment =
+            entry
+                .ack_publication
+                .retry_cumulative(generation, cumulative_frames, |frame| {
+                    commands
+                        .try_enqueue_admitted_frame(frame, TrafficClass::Control)
+                        .is_ok()
+                });
+        publication.accepted |= attachment.accepted;
+        publication.published |= attachment.published;
+    }
+    publication.published = outputs.entries.iter().any(|entry| {
+        !entry.commands.control_frame_queue_is_closed()
+            && !entry.ack_publication.is_pending(generation)
+    });
+    publication.pending = outputs.entries.iter().any(|entry| {
+        !entry.commands.control_frame_queue_is_closed()
+            && entry.ack_publication.is_pending(generation)
+    });
+    publication
 }
 
 impl ResponseStreamBinding {
@@ -146,6 +285,115 @@ impl ResponseStreamBinding {
 
     fn allocate_output_incarnation(&self) -> u64 {
         self.next_output_incarnation.fetch_add(1, Ordering::AcqRel)
+    }
+
+    pub(in crate::runtime) fn output_membership_generation(&self) -> u64 {
+        self.output_membership_generation.load(Ordering::Acquire)
+    }
+
+    /// Publishes one newly observed Data ACK generation on every live output.
+    /// An output exactly caught up to the preceding generation may receive the
+    /// smaller update; a new or blocked output receives cumulative state.
+    pub(in crate::runtime) fn publish_ack(
+        &self,
+        generation: u64,
+        update_frames: &[Frame],
+        cumulative_frames: &[Frame],
+    ) -> StreamAckPublication {
+        let mut outputs = self
+            .outputs
+            .lock()
+            .expect("server reliable stream binding lock");
+        publish_ack_update(&mut outputs, generation, update_frames, cumulative_frames)
+    }
+
+    pub(in crate::runtime) fn retry_pending_ack(
+        &self,
+        generation: u64,
+        cumulative_frames: &[Frame],
+    ) -> StreamAckPublication {
+        let mut outputs = self
+            .outputs
+            .lock()
+            .expect("server reliable stream binding lock");
+        retry_pending_ack(&mut outputs, generation, cumulative_frames)
+    }
+
+    pub(in crate::runtime) fn pending_ack_capacity_notifies(
+        &self,
+        generation: u64,
+    ) -> Vec<std::sync::Arc<tokio::sync::Notify>> {
+        if generation == 0 {
+            return Vec::new();
+        }
+        let outputs = self
+            .outputs
+            .lock()
+            .expect("server reliable stream binding lock");
+        outputs
+            .entries
+            .iter()
+            .filter(|entry| {
+                !entry.commands.control_frame_queue_is_closed()
+                    && entry.ack_publication.is_pending(generation)
+            })
+            .map(|entry| entry.commands.capacity_notify())
+            .collect()
+    }
+
+    /// Advances retained shared receive credit and publishes it independently
+    /// on every currently live attachment.
+    pub(in crate::runtime) fn publish_max_data(
+        &self,
+        stream_id: StreamId,
+        max_offset: u64,
+    ) -> StreamMaxDataPublication {
+        let mut outputs = self
+            .outputs
+            .lock()
+            .expect("server reliable stream binding lock");
+        outputs.desired_max_data_offset = outputs.desired_max_data_offset.max(max_offset);
+        publish_pending_max_data(&mut outputs, stream_id)
+    }
+
+    pub(in crate::runtime) fn retry_pending_max_data(
+        &self,
+        stream_id: StreamId,
+    ) -> StreamMaxDataPublication {
+        let mut outputs = self
+            .outputs
+            .lock()
+            .expect("server reliable stream binding lock");
+        publish_pending_max_data(&mut outputs, stream_id)
+    }
+
+    pub(in crate::runtime) fn has_pending_max_data_publication(&self) -> bool {
+        let outputs = self
+            .outputs
+            .lock()
+            .expect("server reliable stream binding lock");
+        outputs.entries.iter().any(|entry| {
+            !entry.commands.control_frame_queue_is_closed()
+                && entry.published_max_data_offset < outputs.desired_max_data_offset
+        })
+    }
+
+    pub(in crate::runtime) fn pending_max_data_capacity_notifies(
+        &self,
+    ) -> Vec<std::sync::Arc<tokio::sync::Notify>> {
+        let outputs = self
+            .outputs
+            .lock()
+            .expect("server reliable stream binding lock");
+        outputs
+            .entries
+            .iter()
+            .filter(|entry| {
+                !entry.commands.control_frame_queue_is_closed()
+                    && entry.published_max_data_offset < outputs.desired_max_data_offset
+            })
+            .map(|entry| entry.commands.capacity_notify())
+            .collect()
     }
 
     #[cfg(test)]
@@ -268,6 +516,7 @@ impl ResponseStreamBinding {
                 entry.commands = commands;
                 entry.load_registration = entry.commands.register_flow(lane);
                 entry.original_data_in_flight_bytes = 0;
+                entry.stale_for_original_data = false;
                 entry.bytes_in_flight = 0;
                 entry.product_progress_rate_bps = None;
                 entry.delivery_rate_bps = None;
@@ -276,6 +525,8 @@ impl ResponseStreamBinding {
                 entry.srtt_ms = None;
                 entry.delivery_samples = 0;
                 entry.original_data_acked_bytes = 0;
+                entry.published_max_data_offset = 0;
+                entry.ack_publication = StreamAckPublicationCursor::default();
                 entry.local_path_metrics = None;
                 entry.peer_path_metrics = None;
                 entry.peer_usage = None;
@@ -314,6 +565,7 @@ impl ResponseStreamBinding {
                 commands,
                 load_registration,
                 original_data_in_flight_bytes: 0,
+                stale_for_original_data: false,
                 bytes_in_flight: 0,
                 product_progress_rate_bps: None,
                 delivery_rate_bps: None,
@@ -322,6 +574,8 @@ impl ResponseStreamBinding {
                 srtt_ms: None,
                 delivery_samples: 0,
                 original_data_acked_bytes: 0,
+                published_max_data_offset: 0,
+                ack_publication: StreamAckPublicationCursor::default(),
                 local_path_metrics: None,
                 peer_path_metrics: None,
                 peer_usage: None,
@@ -339,6 +593,8 @@ impl ResponseStreamBinding {
         }
         *current_lane = lane;
         self.response_model_generation
+            .fetch_add(1, Ordering::AcqRel);
+        self.output_membership_generation
             .fetch_add(1, Ordering::AcqRel);
         drop(outputs);
         drop(current_lane);
@@ -413,6 +669,8 @@ impl ResponseStreamBinding {
         self.clear_request_feedback_ingress_if(key, path_instance_id);
         self.response_model_generation
             .fetch_add(1, Ordering::AcqRel);
+        self.output_membership_generation
+            .fetch_add(1, Ordering::AcqRel);
         drop(outputs);
         self.notify_update();
         Some(ResponsePathDetachOutcome::Begun(output_incarnation))
@@ -447,6 +705,7 @@ impl ResponseStreamBinding {
             .outputs
             .lock()
             .expect("server reliable stream binding lock");
+        let live_outputs_before = outputs.entries.len();
         let mut removed = Vec::new();
         let mut retain = |entry: &ResponseStreamOutputEntry| {
             let remove = entry.key == key && matches(entry);
@@ -457,6 +716,7 @@ impl ResponseStreamBinding {
             !remove
         };
         outputs.entries.retain(&mut retain);
+        let live_membership_changed = outputs.entries.len() != live_outputs_before;
         outputs.detaching.retain(&mut retain);
         if !removed.is_empty() {
             for (incarnation, _) in &removed {
@@ -467,6 +727,10 @@ impl ResponseStreamBinding {
             }
             self.response_model_generation
                 .fetch_add(1, Ordering::AcqRel);
+            if live_membership_changed {
+                self.output_membership_generation
+                    .fetch_add(1, Ordering::AcqRel);
+            }
             drop(outputs);
             self.notify_update();
         }

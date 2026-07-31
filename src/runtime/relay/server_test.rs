@@ -26,6 +26,19 @@ fn tail_recovery_candidate(start: u64, sent_at: Instant) -> ReliableRelayTailRec
     }
 }
 
+#[test]
+fn server_completion_waits_for_every_live_ack_publication() {
+    let mut publication = ServerAckPublicationState::default();
+    publication.record_status(1, true, true);
+    assert!(
+        !publication.current_generation_is_fully_published(),
+        "one accepted copy cannot retire retained state for a blocked attachment"
+    );
+
+    publication.record_status(1, true, false);
+    assert!(publication.current_generation_is_fully_published());
+}
+
 #[tokio::test]
 async fn server_relay_expires_only_after_its_absolute_no_output_interval() {
     let limits = MuxLimits::default();

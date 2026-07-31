@@ -5,7 +5,7 @@ use crate::mux::MuxLimits;
 use crate::protocol::{OffsetRange, PathId, StreamId, TargetAddr, UnderlayProtocol};
 use crate::runtime::path::commands::{
     ReliablePathCommand, ReliablePathCommandReceivers, recv_reliable_path_command,
-    reliable_path_command_channels,
+    reliable_path_command_channels, try_recv_reliable_path_priority_command,
 };
 use crate::runtime::stream::{ReliablePathStream, ReliablePathStreamOutput};
 use crate::transport::PathSpec;
@@ -314,6 +314,89 @@ async fn retained_in_order_fin_commits_after_reattachment_feedback() {
 }
 
 #[tokio::test]
+async fn client_completion_retains_ack_until_every_live_attachment_accepts_it() {
+    let stream_id = StreamId(615);
+    let limits = MuxLimits::default();
+    let opened = |path_index, commands| {
+        let (frames_tx, frames_rx) = mpsc::channel(1);
+        (
+            frames_tx,
+            OpenedRemoteStream::pending(
+                ReliablePathStream {
+                    stream_id,
+                    max_offset: limits.max_stream_window_bytes,
+                    lane: TrafficClass::Latency,
+                    underlay: UnderlayProtocol::Tcp,
+                    max_frame_payload_bytes: reliable_relay_buffer_len(limits),
+                    output: ReliablePathStreamOutput::fixed(
+                        UnderlayProtocol::Tcp,
+                        PathId(path_index),
+                        commands,
+                        limits,
+                    ),
+                    frames: frames_rx.into(),
+                },
+                usize::from(path_index),
+            ),
+        )
+    };
+    let (first_commands, mut first_receivers) = reliable_path_command_channels(4);
+    let (_first_frames, first) = opened(0, first_commands);
+    let mut remotes = ReliableRelayRemoteSet::new(first, 4);
+    while try_recv_reliable_path_priority_command(&mut first_receivers).is_some() {}
+
+    let (blocked_commands, mut blocked_receivers) = reliable_path_command_channels(1);
+    let (_blocked_frames, blocked) = opened(1, blocked_commands.clone());
+    remotes.attach(blocked);
+    while try_recv_reliable_path_priority_command(&mut blocked_receivers).is_some() {}
+    blocked_commands
+        .try_enqueue_admitted_frame(Frame::Ping { nonce: 1 }, TrafficClass::Control)
+        .expect("block one exact attachment");
+
+    let publication = remotes.publish_stream_ack(
+        1,
+        vec![Frame::StreamAck {
+            stream_id,
+            complete: true,
+            ranges: Vec::new(),
+        }],
+    );
+    assert!(publication.published);
+    assert!(publication.pending);
+
+    let mut state = ClientRelayState::new();
+    state.record_local_eof();
+    state.record_local_fin_sent();
+    state.record_terminal_fin_replayed();
+    state.record_remote_finished();
+    let send_stream = ReliableSendStream::new(stream_id, limits);
+    let recv_stream = ReliableRecvStream::new(stream_id, limits);
+    let sender_queue = ReliableRelaySenderQueue::default();
+    assert!(!client_relay_finished(
+        &state,
+        &send_stream,
+        &recv_stream,
+        &sender_queue,
+        &remotes,
+    ));
+
+    assert!(matches!(
+        try_recv_reliable_path_priority_command(&mut blocked_receivers),
+        Some(ReliablePathCommand::SendFrame(Frame::Ping { nonce: 1 }))
+    ));
+    let publication = remotes.retry_pending_stream_ack();
+    assert!(publication.published);
+    assert!(!publication.pending);
+    assert!(client_relay_finished(
+        &state,
+        &send_stream,
+        &recv_stream,
+        &sender_queue,
+        &remotes,
+    ));
+}
+
+#[tokio::test]
 async fn final_feedback_backpressure_keeps_fin_pending_until_ack_is_queued() {
     let stream_id = StreamId(614);
     let (mut application, relay, frames_tx, mut command_receivers) =
@@ -338,19 +421,27 @@ async fn final_feedback_backpressure_keeps_fin_pending_until_ack_is_queued() {
         recv_reliable_path_command(&mut command_receivers).await,
         Some(ReliablePathCommand::SendFrame(Frame::StreamAck { .. }))
     ));
-    assert!(matches!(
-        tokio::time::timeout(
-            Duration::from_secs(1),
-            recv_reliable_path_command(&mut command_receivers),
-        )
-        .await
-        .expect("final feedback enqueue deadline"),
-        Some(ReliablePathCommand::SendFrame(Frame::StreamAck {
-            stream_id: ack_stream_id,
-            complete: true,
-            ..
-        })) if ack_stream_id == stream_id
-    ));
+    let final_feedback = tokio::time::timeout(
+        Duration::from_secs(1),
+        recv_reliable_path_command(&mut command_receivers),
+    )
+    .await
+    .expect("final feedback enqueue deadline");
+    match final_feedback {
+        Some(ReliablePathCommand::SendFrame(frame)) => assert!(
+            matches!(
+                &frame,
+                Frame::StreamAck {
+                    stream_id: ack_stream_id,
+                    complete: true,
+                    ..
+                } if *ack_stream_id == stream_id
+            ),
+            "unexpected frame before final Data ACK: {frame:?}"
+        ),
+        Some(_) => panic!("unexpected non-frame command before final Data ACK"),
+        None => panic!("carrier command queue closed before final Data ACK"),
+    }
     assert_eq!(
         tokio::time::timeout(Duration::from_secs(1), application.read(&mut byte))
             .await

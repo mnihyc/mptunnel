@@ -411,24 +411,88 @@ async fn client_recv_progress_backpressure_is_retryable_not_stream_fatal() {
         Some(ReliablePathCommand::SendFrame(Frame::StreamAck { .. }))
     ));
 
-    let retried = sender
-        .send_recv_progress(
-            &mut remotes,
-            &context,
-            &mut recv_stream,
-            &mut progress,
-            RelayRecvProgressSend::new(None, TrafficClass::Throughput, false),
-        )
-        .await
-        .expect("recv progress should retry once queue capacity returns");
-
-    assert!(
-        retried,
-        "progress watermark must roll back after a blocked enqueue"
-    );
+    let retried = remotes.retry_pending_stream_ack();
+    assert!(retried.published);
+    assert!(!retried.pending);
     assert!(matches!(
         try_recv_reliable_path_priority_command(&mut receivers),
         Some(ReliablePathCommand::SendFrame(Frame::StreamAck { .. }))
+    ));
+
+    let (replacement_commands, mut replacement_rx) = reliable_path_command_channels(4);
+    remotes.attach(opened_test_relay_stream(stream_id, 1, replacement_commands));
+    consume_client_path_proof_for_test(&mut replacement_rx);
+    let replacement = remotes.retry_pending_stream_ack();
+    assert!(replacement.published);
+    assert!(!replacement.pending);
+    assert!(matches!(
+        try_recv_reliable_path_priority_command(&mut replacement_rx),
+        Some(ReliablePathCommand::SendFrame(Frame::StreamAck { .. }))
+    ));
+}
+
+#[tokio::test]
+async fn client_stream_ack_publication_resumes_at_the_exact_cumulative_chunk() {
+    let stream_id = StreamId(920);
+    let (commands, mut receivers) = reliable_path_command_channels(1);
+    commands
+        .try_enqueue_admitted_frame(
+            Frame::StreamAck {
+                stream_id,
+                complete: false,
+                ranges: Vec::new(),
+            },
+            TrafficClass::Control,
+        )
+        .expect("prefill priority queue");
+    let mut remotes =
+        ReliableRelayRemoteSet::new(opened_test_relay_stream(stream_id, 0, commands), 4);
+    let chunks = vec![
+        Frame::StreamAck {
+            stream_id,
+            complete: false,
+            ranges: vec![OffsetRange { start: 0, end: 4 }],
+        },
+        Frame::StreamAck {
+            stream_id,
+            complete: false,
+            ranges: vec![OffsetRange { start: 8, end: 12 }],
+        },
+    ];
+
+    let blocked = remotes.publish_stream_ack(1, chunks);
+    assert!(!blocked.published);
+    assert!(blocked.pending);
+    assert!(matches!(
+        try_recv_reliable_path_priority_command(&mut receivers),
+        Some(ReliablePathCommand::SendFrame(Frame::StreamAck {
+            ranges,
+            ..
+        })) if ranges.is_empty()
+    ));
+
+    let first = remotes.retry_pending_stream_ack();
+    assert!(first.accepted);
+    assert!(!first.published);
+    assert!(first.pending);
+    assert!(matches!(
+        try_recv_reliable_path_priority_command(&mut receivers),
+        Some(ReliablePathCommand::SendFrame(Frame::StreamAck {
+            ranges,
+            ..
+        })) if ranges == vec![OffsetRange { start: 0, end: 4 }]
+    ));
+
+    let second = remotes.retry_pending_stream_ack();
+    assert!(second.accepted);
+    assert!(second.published);
+    assert!(!second.pending);
+    assert!(matches!(
+        try_recv_reliable_path_priority_command(&mut receivers),
+        Some(ReliablePathCommand::SendFrame(Frame::StreamAck {
+            ranges,
+            ..
+        })) if ranges == vec![OffsetRange { start: 8, end: 12 }]
     ));
 }
 
@@ -449,6 +513,7 @@ async fn client_max_data_credit_commits_only_after_control_queue_accepts_it() {
         .expect("prefill priority queue");
     let mut remotes =
         ReliableRelayRemoteSet::new(opened_test_relay_stream(stream_id, 0, commands), 4);
+    let original_instance = remotes.paths[0].instance();
     let mut recv_stream =
         ReliableRecvStream::new_with_initial_max_offset(stream_id, MuxLimits::default(), 0);
     let mut progress = ReliableRecvProgress::default();
@@ -476,28 +541,119 @@ async fn client_max_data_credit_commits_only_after_control_queue_accepts_it() {
         Some(ReliablePathCommand::SendFrame(Frame::StreamAck { .. }))
     ));
 
-    let retried = sender
-        .send_recv_progress(
-            &mut remotes,
-            &context,
-            &mut recv_stream,
-            &mut progress,
-            RelayRecvProgressSend::new(None, TrafficClass::Throughput, false),
-        )
-        .await
-        .expect("MAX_DATA publication should retry once capacity returns");
-
-    assert!(retried);
+    drop(remotes.remove_path_instance(original_instance));
+    let (replacement_commands, mut replacement_rx) = reliable_path_command_channels(4);
+    remotes.attach(opened_test_relay_stream(stream_id, 0, replacement_commands));
+    consume_client_path_proof_for_test(&mut replacement_rx);
+    assert!(
+        try_recv_reliable_path_priority_command(&mut replacement_rx).is_none(),
+        "neutral attachment cannot publish receive credit outside the actor commit"
+    );
+    let publication = remotes.retry_pending_max_data();
+    let published_offset = publication
+        .published_offset
+        .expect("replacement must replay retained MAX_DATA through the actor");
+    recv_stream.commit_max_data(published_offset);
+    assert!(!publication.pending);
     let Some(ReliablePathCommand::SendFrame(Frame::StreamMaxData {
         stream_id: published_stream_id,
         max_offset,
-    })) = try_recv_reliable_path_priority_command(&mut receivers)
+    })) = try_recv_reliable_path_priority_command(&mut replacement_rx)
     else {
-        panic!("retry must enqueue STREAM_MAX_DATA");
+        panic!("replacement retry must enqueue STREAM_MAX_DATA");
     };
     assert_eq!(published_stream_id, stream_id);
     assert_eq!(recv_stream.published_max_offset(), max_offset);
+    assert_eq!(published_offset, max_offset);
     assert!(max_offset > 0);
+    recv_stream
+        .receive_data(published_offset.saturating_sub(1), Bytes::from_static(b"x"))
+        .expect("data within replacement-published credit must remain admissible");
+}
+
+#[tokio::test]
+async fn client_max_data_retries_only_the_blocked_attachment() {
+    let stream_id = StreamId(98);
+    let context = client_test_context();
+    let (blocked_commands, mut blocked_rx) = reliable_path_command_channels(1);
+    blocked_commands
+        .try_enqueue_admitted_frame(
+            Frame::StreamAck {
+                stream_id,
+                complete: false,
+                ranges: Vec::new(),
+            },
+            TrafficClass::Control,
+        )
+        .expect("prefill first priority queue");
+    let (available_commands, mut available_rx) = reliable_path_command_channels(4);
+    let mut remotes =
+        ReliableRelayRemoteSet::new(opened_test_relay_stream(stream_id, 0, blocked_commands), 4);
+    remotes.attach(opened_test_relay_stream(stream_id, 1, available_commands));
+    consume_client_path_proof_for_test(&mut available_rx);
+    let mut recv_stream =
+        ReliableRecvStream::new_with_initial_max_offset(stream_id, MuxLimits::default(), 0);
+    let mut progress = ReliableRecvProgress::default();
+    let mut sender = RequestSenderService::new(stream_id);
+
+    assert!(
+        sender
+            .send_recv_progress(
+                &mut remotes,
+                &context,
+                &mut recv_stream,
+                &mut progress,
+                RelayRecvProgressSend::new(None, TrafficClass::Throughput, false),
+            )
+            .await
+            .expect("one live attachment publishes shared credit")
+    );
+    let Some(ReliablePathCommand::SendFrame(Frame::StreamMaxData {
+        max_offset: published,
+        ..
+    })) = try_recv_reliable_path_priority_command(&mut available_rx)
+    else {
+        panic!("available attachment must publish STREAM_MAX_DATA");
+    };
+    assert_eq!(recv_stream.published_max_offset(), published);
+    assert!(remotes.has_pending_max_data_publication());
+
+    assert!(matches!(
+        try_recv_reliable_path_priority_command(&mut blocked_rx),
+        Some(ReliablePathCommand::SendFrame(Frame::StreamAck { .. }))
+    ));
+    let retry = remotes.retry_pending_max_data();
+    assert_eq!(retry.published_offset, Some(published));
+    assert!(!retry.pending);
+    assert!(matches!(
+        try_recv_reliable_path_priority_command(&mut blocked_rx),
+        Some(ReliablePathCommand::SendFrame(Frame::StreamMaxData {
+            max_offset,
+            ..
+        })) if max_offset == published
+    ));
+    assert!(
+        try_recv_reliable_path_priority_command(&mut available_rx).is_none(),
+        "an already-published attachment must not receive an unchanged duplicate"
+    );
+
+    let (replacement_commands, mut replacement_rx) = reliable_path_command_channels(4);
+    remotes.attach(opened_test_relay_stream(stream_id, 2, replacement_commands));
+    consume_client_path_proof_for_test(&mut replacement_rx);
+    assert!(
+        try_recv_reliable_path_priority_command(&mut replacement_rx).is_none(),
+        "attachment itself cannot publish credit outside the receive owner"
+    );
+    let replacement_publication = remotes.retry_pending_max_data();
+    assert_eq!(replacement_publication.published_offset, Some(published));
+    assert!(!replacement_publication.pending);
+    assert!(matches!(
+        try_recv_reliable_path_priority_command(&mut replacement_rx),
+        Some(ReliablePathCommand::SendFrame(Frame::StreamMaxData {
+            max_offset,
+            ..
+        })) if max_offset == published
+    ));
 }
 
 #[tokio::test]
@@ -558,116 +714,6 @@ async fn client_recv_progress_uses_available_control_queue_instead_of_full_low_e
         try_recv_reliable_path_priority_command(&mut second_rx),
         Some(ReliablePathCommand::SendFrame(Frame::StreamAck { .. }))
     ));
-}
-
-#[tokio::test]
-async fn client_recv_progress_uses_lowest_eta_attached_path() {
-    let stream_id = StreamId(96);
-    let tcp_path = "tcp://127.0.0.1:10270?srtt-ms=500&rate-mbps=50"
-        .parse::<PathSpec>()
-        .expect("tcp path");
-    let udp_path = "udp://127.0.0.1:10271?srtt-ms=5&rate-mbps=500"
-        .parse::<PathSpec>()
-        .expect("udp path");
-    let context = ClientPathContext::new(
-        vec![tcp_path, udp_path],
-        security(),
-        ResourceLimits::default(),
-    )
-    .expect("context");
-    let (tcp_commands, mut tcp_rx) = reliable_path_command_channels(8);
-    let (udp_commands, mut udp_rx) = reliable_path_command_channels(8);
-    let mut remotes = ReliableRelayRemoteSet::new(
-        opened_test_relay_stream_with_underlay(stream_id, UnderlayProtocol::Tcp, 0, tcp_commands),
-        8,
-    );
-    consume_client_path_proof_for_test(&mut tcp_rx);
-    remotes.attach_candidate(opened_test_relay_stream_with_underlay(
-        stream_id,
-        UnderlayProtocol::Udp,
-        0,
-        udp_commands,
-    ));
-    consume_client_path_proof_for_test(&mut udp_rx);
-    let mut recv_stream = ReliableRecvStream::new(stream_id, MuxLimits::default());
-    recv_stream
-        .receive_data(0, Bytes::from_static(b"reply"))
-        .expect("receive response bytes");
-    let mut progress = ReliableRecvProgress::default();
-    let mut sender = RequestSenderService::new(stream_id);
-
-    let sent = sender
-        .send_recv_progress(
-            &mut remotes,
-            &context,
-            &mut recv_stream,
-            &mut progress,
-            RelayRecvProgressSend::new(None, TrafficClass::Throughput, false),
-        )
-        .await
-        .expect("recv progress should use a live return path");
-
-    assert!(sent);
-    assert!(try_recv_reliable_path_priority_command(&mut tcp_rx).is_none());
-    assert!(matches!(
-        try_recv_reliable_path_priority_command(&mut udp_rx),
-        Some(ReliablePathCommand::SendFrame(Frame::StreamAck { .. }))
-    ));
-}
-
-#[tokio::test]
-async fn client_recv_progress_uses_metrics_not_attachment_order() {
-    let stream_id = StreamId(97);
-    let tcp_path = "tcp://127.0.0.1:10272?srtt-ms=5&rate-mbps=500"
-        .parse::<PathSpec>()
-        .expect("tcp path");
-    let udp_path = "udp://127.0.0.1:10273?srtt-ms=500&rate-mbps=50"
-        .parse::<PathSpec>()
-        .expect("udp path");
-    let context = ClientPathContext::new(
-        vec![tcp_path, udp_path],
-        security(),
-        ResourceLimits::default(),
-    )
-    .expect("context");
-    let (tcp_commands, mut tcp_rx) = reliable_path_command_channels(8);
-    let (udp_commands, mut udp_rx) = reliable_path_command_channels(8);
-    let mut remotes = ReliableRelayRemoteSet::new(
-        opened_test_relay_stream_with_underlay(stream_id, UnderlayProtocol::Tcp, 0, tcp_commands),
-        8,
-    );
-    consume_client_path_proof_for_test(&mut tcp_rx);
-    remotes.attach_candidate(opened_test_relay_stream_with_underlay(
-        stream_id,
-        UnderlayProtocol::Udp,
-        0,
-        udp_commands,
-    ));
-    consume_client_path_proof_for_test(&mut udp_rx);
-    let mut recv_stream = ReliableRecvStream::new(stream_id, MuxLimits::default());
-    recv_stream
-        .receive_data(0, Bytes::from_static(b"reply"))
-        .expect("receive response bytes");
-    let mut progress = ReliableRecvProgress::default();
-    let mut sender = RequestSenderService::new(stream_id);
-
-    let sent = sender
-        .send_recv_progress(
-            &mut remotes,
-            &context,
-            &mut recv_stream,
-            &mut progress,
-            RelayRecvProgressSend::new(None, TrafficClass::Latency, true),
-        )
-        .await
-        .expect("recv progress should use a live return path");
-
-    assert!(sent);
-    assert!(matches!(
-        try_recv_reliable_path_priority_command(&mut tcp_rx),
-        Some(ReliablePathCommand::SendFrame(Frame::StreamAck { .. }))
-    ));
-    assert!(try_recv_reliable_path_priority_command(&mut udp_rx).is_none());
 }
 
 #[tokio::test]

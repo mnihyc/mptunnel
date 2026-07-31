@@ -4,6 +4,9 @@
 //! scheduler leases, and frame fan-in. Relay code may open or select carriers,
 //! but a pending carrier becomes durable only when this owner commits it.
 
+use super::super::feedback::{
+    StreamAckPublication, StreamAckPublicationCursor, StreamMaxDataPublication,
+};
 use crate::model::capacity::reliable_relay_buffer_len;
 #[cfg(test)]
 use crate::model::path::next_carrier_path_instance_id;
@@ -25,6 +28,7 @@ pub(in crate::runtime) struct OpenedRemoteStream {
     stream: Option<ReliablePathStream>,
     path_index: usize,
     path_instance_id: CarrierPathInstanceId,
+    advertised_recv_max_offset: u64,
     load_lease: Option<RelayPathLoadLease>,
 }
 
@@ -32,12 +36,14 @@ impl OpenedRemoteStream {
     pub(in crate::runtime) fn from_opened_carrier(
         carrier: crate::runtime::path::OpenedReliableCarrierStream,
         path_index: usize,
+        advertised_recv_max_offset: u64,
     ) -> Self {
         let path_instance_id = carrier.path_instance_id;
         Self {
             stream: Some(ReliablePathStream::from_opened_carrier(carrier)),
             path_index,
             path_instance_id,
+            advertised_recv_max_offset,
             load_lease: None,
         }
     }
@@ -50,6 +56,7 @@ impl OpenedRemoteStream {
             stream: Some(stream),
             path_index,
             path_instance_id: next_carrier_path_instance_id(),
+            advertised_recv_max_offset: 0,
             load_lease: None,
         }
     }
@@ -81,11 +88,18 @@ impl OpenedRemoteStream {
         ReliablePathStream,
         usize,
         CarrierPathInstanceId,
+        u64,
         Option<RelayPathLoadLease>,
     ) {
         let stream = self.stream.take().expect("pending remote stream");
         let load_lease = self.load_lease.take();
-        (stream, self.path_index, self.path_instance_id, load_lease)
+        (
+            stream,
+            self.path_index,
+            self.path_instance_id,
+            self.advertised_recv_max_offset,
+            load_lease,
+        )
     }
 
     /// A stream that never commits to a remote set must release both the peer
@@ -120,6 +134,10 @@ pub(in crate::runtime) struct ReliableRelayRemotePath {
     pub(in crate::runtime) attached_at: Instant,
     pub(in crate::runtime) path_proof_id: Option<u64>,
     pub(in crate::runtime) path_proof_generation: u64,
+    /// Greatest shared receive grant accepted by this attachment's queue.
+    pub(in crate::runtime) published_max_data_offset: u64,
+    /// Publication fence for the logical receiver's retained cumulative ACK.
+    stream_ack_publication: StreamAckPublicationCursor,
     pub(in crate::runtime) stream: ReliablePathStreamHandle,
 }
 
@@ -169,6 +187,9 @@ pub(in crate::runtime) struct ReliableRelayRemoteSet {
     frames_rx: mpsc::Receiver<ReliableRelayRemoteFrame>,
     next_instance_id: u64,
     membership_generation: u64,
+    desired_max_data_offset: u64,
+    desired_stream_ack_generation: u64,
+    desired_stream_ack_frames: Vec<Frame>,
 }
 
 impl ReliableRelayRemoteSet {
@@ -182,6 +203,9 @@ impl ReliableRelayRemoteSet {
             frames_rx,
             next_instance_id: 0,
             membership_generation: 0,
+            desired_max_data_offset: 0,
+            desired_stream_ack_generation: 0,
+            desired_stream_ack_frames: Vec::new(),
         };
         set.attach(opened);
         set
@@ -298,6 +322,139 @@ impl ReliableRelayRemoteSet {
         self.paths.len()
     }
 
+    /// Advances retained shared receive credit and publishes it independently
+    /// on every currently live attachment.
+    pub(in crate::runtime) fn publish_max_data(
+        &mut self,
+        max_offset: u64,
+    ) -> StreamMaxDataPublication {
+        self.desired_max_data_offset = self.desired_max_data_offset.max(max_offset);
+        self.retry_pending_max_data()
+    }
+
+    pub(in crate::runtime) fn retry_pending_max_data(&mut self) -> StreamMaxDataPublication {
+        let desired = self.desired_max_data_offset;
+        let mut publication = StreamMaxDataPublication::default();
+        for path in &mut self.paths {
+            if path.stream.request_control_frame_queue_is_closed()
+                || path.published_max_data_offset >= desired
+            {
+                continue;
+            }
+            if path
+                .stream
+                .try_enqueue_request_control_frame(Frame::StreamMaxData {
+                    stream_id: self.stream_id,
+                    max_offset: desired,
+                })
+                .is_ok()
+            {
+                path.published_max_data_offset = desired;
+                publication.published_offset = Some(desired);
+            }
+        }
+        publication.pending = self.has_pending_max_data_publication();
+        publication
+    }
+
+    pub(in crate::runtime) fn has_pending_max_data_publication(&self) -> bool {
+        self.paths.iter().any(|path| {
+            !path.stream.request_control_frame_queue_is_closed()
+                && path.published_max_data_offset < self.desired_max_data_offset
+        })
+    }
+
+    pub(in crate::runtime) fn pending_max_data_capacity_notifies(
+        &self,
+    ) -> Vec<std::sync::Arc<tokio::sync::Notify>> {
+        self.paths
+            .iter()
+            .filter(|path| {
+                path.published_max_data_offset < self.desired_max_data_offset
+                    && !path.stream.request_control_frame_queue_is_closed()
+            })
+            .filter_map(|path| path.stream.request_control_capacity_notify())
+            .collect()
+    }
+
+    /// Retains the latest cumulative receive evidence and offers it to every
+    /// exact live attachment. A newer generation subsumes an unqueued tail
+    /// from an older cumulative snapshot.
+    pub(in crate::runtime) fn publish_stream_ack(
+        &mut self,
+        generation: u64,
+        cumulative_frames: Vec<Frame>,
+    ) -> StreamAckPublication {
+        debug_assert!(generation != 0);
+        debug_assert!(!cumulative_frames.is_empty());
+        debug_assert!(
+            cumulative_frames
+                .iter()
+                .all(|frame| matches!(frame, Frame::StreamAck { .. }))
+        );
+        self.desired_stream_ack_generation = generation;
+        self.desired_stream_ack_frames = cumulative_frames;
+        self.retry_pending_stream_ack()
+    }
+
+    pub(in crate::runtime) fn stream_ack_generation(&self) -> u64 {
+        self.desired_stream_ack_generation
+    }
+
+    pub(in crate::runtime) fn retry_pending_stream_ack(&mut self) -> StreamAckPublication {
+        let generation = self.desired_stream_ack_generation;
+        if generation == 0 || self.desired_stream_ack_frames.is_empty() {
+            return StreamAckPublication::default();
+        }
+
+        let stream_id = self.stream_id;
+        let frames = &self.desired_stream_ack_frames;
+        let mut publication = StreamAckPublication::default();
+        for path in &mut self.paths {
+            if path.stream.request_control_frame_queue_is_closed() {
+                continue;
+            }
+            let attachment = path.stream_ack_publication.retry_cumulative(
+                generation,
+                frames,
+                |frame| {
+                    debug_assert!(
+                        matches!(&frame, Frame::StreamAck { stream_id: id, .. } if *id == stream_id)
+                    );
+                    path.stream.try_enqueue_request_control_frame(frame).is_ok()
+                },
+            );
+            publication.accepted |= attachment.accepted;
+            publication.published |= attachment.published;
+        }
+        publication.pending = self.has_pending_stream_ack_publication();
+        publication
+    }
+
+    pub(in crate::runtime) fn has_pending_stream_ack_publication(&self) -> bool {
+        let generation = self.desired_stream_ack_generation;
+        generation != 0
+            && self.paths.iter().any(|path| {
+                !path.stream.request_control_frame_queue_is_closed()
+                    && path.stream_ack_publication.is_pending(generation)
+            })
+    }
+
+    pub(in crate::runtime) fn pending_stream_ack_capacity_notifies(
+        &self,
+    ) -> Vec<std::sync::Arc<tokio::sync::Notify>> {
+        let generation = self.desired_stream_ack_generation;
+        self.paths
+            .iter()
+            .filter(|path| {
+                generation != 0
+                    && path.stream_ack_publication.is_pending(generation)
+                    && !path.stream.request_control_frame_queue_is_closed()
+            })
+            .filter_map(|path| path.stream.request_control_capacity_notify())
+            .collect()
+    }
+
     #[cfg(test)]
     pub(in crate::runtime) fn path_instance_for_key(
         &self,
@@ -391,7 +548,9 @@ impl ReliableRelayRemoteSet {
             path_instance_id,
             attachment_id,
         };
-        let (stream, path_index, path_instance_id, mut load_lease) = opened.into_attachment_parts();
+        let (stream, path_index, path_instance_id, advertised_recv_max_offset, mut load_lease) =
+            opened.into_attachment_parts();
+        self.desired_max_data_offset = self.desired_max_data_offset.max(advertised_recv_max_offset);
         if !retain_open_load {
             // Candidate ranking reserves during an open transaction. Attached
             // membership is not load until this stream assigns product data.
@@ -434,6 +593,8 @@ impl ReliableRelayRemoteSet {
             attached_at: Instant::now(),
             path_proof_id: None,
             path_proof_generation: 0,
+            published_max_data_offset: advertised_recv_max_offset,
+            stream_ack_publication: StreamAckPublicationCursor::default(),
             stream,
         };
         if let Ok(Some(proof_id)) = path.stream.enqueue_path_proof() {

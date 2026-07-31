@@ -21,6 +21,7 @@ use crate::model::response::ResponsePathObservation;
 use crate::mux::MuxLimits;
 use crate::protocol::{SessionId, UnderlayProtocol};
 use crate::runtime::path::model::{default_path_rate_bps, default_path_srtt_ms};
+use crate::runtime::sender::ServerReinjectionOutputIdentity;
 use crate::scheduler::{PathRateScope, PathSnapshot, TrafficClass, path_is_backup, score_path};
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
@@ -51,8 +52,35 @@ impl ResponseStreamBinding {
             .collect()
     }
 
+    pub(in crate::runtime::stream) fn response_recovery_capacity_notifies(
+        &self,
+    ) -> Vec<Arc<Notify>> {
+        self.outputs
+            .lock()
+            .expect("server reliable stream binding lock")
+            .entries
+            .iter()
+            .filter(|entry| {
+                !entry.stale_for_original_data
+                    && !entry.commands.reinjection_frame_queue_is_closed()
+            })
+            .map(|entry| entry.commands.capacity_notify())
+            .collect()
+    }
+
     pub(in crate::runtime) fn response_model_generation(&self) -> u64 {
         self.response_model_generation.load(Ordering::Acquire)
+    }
+
+    pub(in crate::runtime) fn response_output_snapshot(
+        &self,
+        identity: ServerReinjectionOutputIdentity,
+        lane: TrafficClass,
+    ) -> Option<PathSnapshot> {
+        self.outputs
+            .lock()
+            .expect("server reliable stream binding lock")
+            .snapshot_for_instance(identity.key, identity.incarnation, lane, self.mux_limits)
     }
 
     pub(in crate::runtime) fn sender_path_targets(
@@ -60,16 +88,17 @@ impl ResponseStreamBinding {
         lane: TrafficClass,
         _payload_bytes: usize,
     ) -> Vec<ResponseSenderPathTarget> {
-        let outputs = self
+        let mut outputs = self
             .outputs
             .lock()
             .expect("server reliable stream binding lock");
+        let eligibility_changed = outputs.reconcile_stale_output_eligibility();
         let request_feedback_ingress = *self
             .request_feedback_ingress
             .lock()
             .expect("server reliable stream request feedback ingress lock");
 
-        outputs
+        let targets = outputs
             .entries
             .iter()
             .filter(|entry| !entry.commands.is_closed())
@@ -95,6 +124,7 @@ impl ResponseStreamBinding {
                             ingress.key == entry.key
                                 && ingress.path_instance_id == entry.path_instance_id
                         }),
+                        stale_for_original_data: entry.stale_for_original_data,
                         #[cfg(test)]
                         has_path_proof_evidence: entry.path_proof.is_some(),
                         has_bulk_rate_evidence: server_output_has_bulk_rate_evidence(
@@ -105,7 +135,14 @@ impl ResponseStreamBinding {
                     command_queue: entry.commands.queue_snapshot(),
                 }
             })
-            .collect()
+            .collect();
+        drop(outputs);
+        if eligibility_changed {
+            self.response_model_generation
+                .fetch_add(1, Ordering::AcqRel);
+            self.notify_update();
+        }
+        targets
     }
 
     pub(in crate::runtime) fn mux_limits(&self) -> MuxLimits {
@@ -160,10 +197,15 @@ impl ResponseStreamOutputs {
         payload_bytes: usize,
         mux_limits: MuxLimits,
     ) -> Option<PathSnapshot> {
-        let choose = |allow_backup: bool| {
+        let has_nonstale_output = self
+            .entries
+            .iter()
+            .any(|entry| !entry.commands.is_closed() && !entry.stale_for_original_data);
+        let choose = |allow_backup: bool, allow_stale: bool| {
             self.entries
                 .iter()
                 .filter(|entry| !entry.commands.is_closed())
+                .filter(|entry| allow_stale || !entry.stale_for_original_data)
                 .filter_map(|entry| {
                     let snapshot = server_bulk_output_snapshot(
                         entry,
@@ -179,7 +221,14 @@ impl ResponseStreamOutputs {
                 .min_by(|left, right| left.0.total_cmp(&right.0))
                 .map(|(_, snapshot)| snapshot)
         };
-        choose(false).or_else(|| choose(true))
+        choose(false, false)
+            .or_else(|| choose(true, false))
+            .or_else(|| {
+                (!has_nonstale_output)
+                    .then(|| choose(false, true))
+                    .flatten()
+            })
+            .or_else(|| (!has_nonstale_output).then(|| choose(true, true)).flatten())
     }
 }
 

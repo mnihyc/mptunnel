@@ -52,7 +52,7 @@ use crate::runtime::sender::{
 };
 use crate::runtime::stream::{
     OpenedRemoteStream, ReliableRelayRemoteFrame, ReliableRelayRemotePath, ReliableRelayRemoteSet,
-    wait_for_carrier_capacity_notifies,
+    arm_carrier_capacity_notifies, wait_for_carrier_capacity_notifies,
 };
 use crate::runtime::stream::{
     reliable_relay_recv_progress_resend_active, reliable_stream_recv_progress_interval,
@@ -87,6 +87,17 @@ where
         state.record_remote_finished();
     }
     Ok(())
+}
+
+fn client_relay_finished(
+    state: &ClientRelayState,
+    send_stream: &ReliableSendStream,
+    recv_stream: &ReliableRecvStream,
+    sender_queue: &ReliableRelaySenderQueue,
+    remotes: &ReliableRelayRemoteSet,
+) -> bool {
+    state.is_finished(send_stream, recv_stream, sender_queue)
+        && !remotes.has_pending_stream_ack_publication()
 }
 
 fn record_final_recv_progress_enqueue(
@@ -219,6 +230,12 @@ where
     );
     let mut remotes =
         ReliableRelayRemoteSet::new(remote, reliable_stream_frame_queue(context.mux_limits));
+    let mut observed_request_membership_generation = remotes.membership_generation();
+    let mut request_path_staleness_dirty = true;
+    let mut request_recovery_dirty = true;
+    let mut request_range_recovery_deadline = None::<Instant>;
+    let mut observed_stream_ack_generation = remotes.stream_ack_generation();
+    let mut stream_ack_capacity_wait = None;
     let stream_id = remotes.stream_id();
     let telemetry_flow = context.telemetry.open_reliable_flow(
         Some(context.session_id),
@@ -258,7 +275,7 @@ where
     #[cfg(feature = "lab-diagnostics")]
     let mut last_reported_read_block: Option<(usize, usize, usize, usize, usize)> = None;
     let result = loop {
-        if state.is_finished(&send_stream, &recv_stream, &sender_queue) {
+        if client_relay_finished(&state, &send_stream, &recv_stream, &sender_queue, &remotes) {
             break Ok(state.delivery.total);
         }
         if remotes.is_empty() {
@@ -343,13 +360,21 @@ where
                             relay_lane,
                             PATH_OPEN_SCORE_BYTES,
                         );
+                        let recv_progress_send = if pending_stream_fin_ready(
+                            &recv_stream,
+                            state.endpoint.pending_remote_fin_offset,
+                        ) {
+                            RelayRecvProgressSend::final_ack(path_snapshot, relay_lane)
+                        } else {
+                            RelayRecvProgressSend::new(path_snapshot, relay_lane, true)
+                        };
                         let progress_ready = match sender
                             .send_recv_progress(
                                 &mut remotes,
                                 context,
                                 &mut recv_stream,
                                 &mut state.progress.recv_progress,
-                                RelayRecvProgressSend::new(path_snapshot, relay_lane, true),
+                                recv_progress_send,
                             )
                             .await
                         {
@@ -439,16 +464,44 @@ where
         let request_lane = request_demand_update.lane;
         let path_snapshot =
             remotes.lowest_eta_path_snapshot(context, relay_lane, PATH_OPEN_SCORE_BYTES);
-        update_request_path_staleness(
-            &mut state,
-            &mut sender,
-            &mut sender_queue,
-            context,
-            &remotes,
-            &send_stream,
-            &[],
-            stream_id,
-        );
+        let request_membership_generation = remotes.membership_generation();
+        let request_membership_changed =
+            request_membership_generation != observed_request_membership_generation;
+        if request_membership_changed {
+            observed_request_membership_generation = request_membership_generation;
+            request_path_staleness_dirty = true;
+            request_recovery_dirty = true;
+        }
+        let stream_ack_generation = remotes.stream_ack_generation();
+        if request_membership_changed || stream_ack_generation != observed_stream_ack_generation {
+            observed_stream_ack_generation = stream_ack_generation;
+            // The old wait does not cover a replacement attachment or a
+            // newly retained cumulative generation.
+            stream_ack_capacity_wait = None;
+        }
+        let request_path_staleness_due = state
+            .progress
+            .request_path_staleness
+            .next_deadline()
+            .is_some_and(|deadline| deadline <= Instant::now());
+        if request_path_staleness_dirty || request_path_staleness_due {
+            if update_request_path_staleness(
+                &mut state,
+                &mut sender,
+                context,
+                &remotes,
+                &[],
+                stream_id,
+            ) {
+                request_recovery_dirty = true;
+            }
+            request_path_staleness_dirty = false;
+        }
+        let request_path_staleness_deadline = state
+            .progress
+            .request_path_staleness
+            .next_deadline()
+            .map(tokio::time::Instant::from_std);
         #[cfg(feature = "lab-diagnostics")]
         if reliable_relay_lane_changed(request_demand_update.previous_lane, request_lane) {
             lab_diagnostic(
@@ -467,35 +520,47 @@ where
                 ),
             );
         }
-        for failed_instance in sender.unreported_missing_owner_instances(
-            &remotes,
-            transport_pto_from_snapshot(path_snapshot),
+        if request_membership_changed {
+            for failed_instance in sender.unreported_missing_owner_instances(
+                &remotes,
+                transport_pto_from_snapshot(path_snapshot),
+            ) {
+                if sender.enqueue_failed_path_reinjections(
+                    &mut sender_queue,
+                    context,
+                    &remotes,
+                    &send_stream,
+                    failed_instance,
+                ) {
+                    state.progress.sender_retry_at = None;
+                }
+            }
+        }
+        let request_range_recovery_due =
+            request_range_recovery_deadline.is_some_and(|deadline| deadline <= Instant::now());
+        if request_recovery_dirty || request_range_recovery_due {
+            let request_recovery = sender.drive_stale_path_recovery(
+                &mut sender_queue,
+                context,
+                &remotes,
+                &send_stream,
+            );
+            if request_recovery.queued {
+                state.progress.sender_retry_at = None;
+            }
+            request_range_recovery_deadline = request_recovery.retry_deadline;
+            request_recovery_dirty = false;
+        }
+        let request_range_reinjection_deadline =
+            request_range_recovery_deadline.map(tokio::time::Instant::from_std);
+        let request_path_recovery_deadline = match (
+            request_path_staleness_deadline,
+            request_range_reinjection_deadline,
         ) {
-            if sender.enqueue_failed_path_reinjections(
-                &mut sender_queue,
-                context,
-                &remotes,
-                &send_stream,
-                failed_instance,
-            ) {
-                state.progress.sender_retry_at = None;
-            }
-        }
-        let request_reinjection_retry_after =
-            sender.request_reinjection_retry_after(context, &remotes);
-        for stale_instance in
-            sender.stale_paths_requiring_reinjection(&remotes, request_reinjection_retry_after)
-        {
-            if sender.enqueue_stale_path_reinjections(
-                &mut sender_queue,
-                context,
-                &remotes,
-                &send_stream,
-                stale_instance,
-            ) {
-                state.progress.sender_retry_at = None;
-            }
-        }
+            (Some(left), Some(right)) => Some(left.min(right)),
+            (Some(deadline), None) | (None, Some(deadline)) => Some(deadline),
+            (None, None) => None,
+        };
         if reliable_relay_lane_changed(demand_update.previous_lane, relay_lane) {
             #[cfg(feature = "lab-diagnostics")]
             lab_diagnostic(
@@ -711,14 +776,40 @@ where
         let final_feedback_retry_blocked = pending_remote_fin_ready
             && !remotes.is_empty()
             && state.progress.sender_retry_at.is_some();
-        let carrier_retry_blocked = queued_send_blocked || final_feedback_retry_blocked;
+        let timed_carrier_retry_blocked = queued_send_blocked || final_feedback_retry_blocked;
+        if !remotes.has_pending_stream_ack_publication() {
+            stream_ack_capacity_wait = None;
+        } else if stream_ack_capacity_wait.is_none() {
+            let capacity_wait =
+                arm_carrier_capacity_notifies(remotes.pending_stream_ack_capacity_notifies());
+            let publication = remotes.retry_pending_stream_ack();
+            if publication.published && pending_remote_fin_ready {
+                state.progress.sender_retry_at = None;
+            }
+            if remotes.has_pending_stream_ack_publication() {
+                stream_ack_capacity_wait = capacity_wait;
+            }
+        }
+        let stream_ack_publication_blocked = remotes.has_pending_stream_ack_publication();
+        let has_stream_ack_capacity_wait = stream_ack_capacity_wait.is_some();
+        let max_data_publication_pending = remotes.has_pending_max_data_publication();
+        let max_data_capacity_wait = max_data_publication_pending
+            .then(|| arm_carrier_capacity_notifies(remotes.pending_max_data_capacity_notifies()))
+            .flatten();
+        if max_data_publication_pending
+            && let Some(published_offset) = remotes.retry_pending_max_data().published_offset
+        {
+            recv_stream.commit_max_data(published_offset);
+        }
+        let max_data_publication_blocked = remotes.has_pending_max_data_publication();
+        let has_max_data_capacity_wait = max_data_capacity_wait.is_some();
         let queued_send_ready =
             !sender_queue.is_empty() && !queued_send_blocked && !inbound_frame_ready;
         let queued_send_retry_deadline = state
             .progress
             .sender_retry_at
             .unwrap_or_else(tokio::time::Instant::now);
-        let carrier_capacity_notifies = if carrier_retry_blocked {
+        let carrier_capacity_notifies = if timed_carrier_retry_blocked {
             remotes
                 .paths
                 .iter()
@@ -799,6 +890,11 @@ where
         }
 
         tokio::select! {
+            _ = wait_for_optional_deadline(request_path_recovery_deadline), if request_path_recovery_deadline.is_some() => {
+                // Re-evaluate exact attachment and range recovery clocks
+                // before assigning more OriginalData; native recovery continues.
+                continue;
+            }
             _ = std::future::ready(()), if pending_remote_fin_ready
                 && !remotes.is_empty()
                 && state.progress.sender_retry_at.is_none() => {
@@ -808,7 +904,7 @@ where
                         context,
                         &mut recv_stream,
                         &mut state.progress.recv_progress,
-                        RelayRecvProgressSend::new(path_snapshot, relay_lane, true),
+                        RelayRecvProgressSend::final_ack(path_snapshot, relay_lane),
                     )
                     .await
                 {
@@ -1250,6 +1346,7 @@ where
                             let _ = payload_bytes;
                             dispatched_items = dispatched_items.saturating_add(1);
                             state.progress.last_stream_at = Instant::now();
+                            request_recovery_dirty = true;
                         }
                         Ok(ClientQueuedDispatch::ReinjectionDeferred) => {
                             dispatched_items = dispatched_items.saturating_add(1);
@@ -1329,12 +1426,28 @@ where
                     tokio::task::yield_now().await;
                 }
             }
-            _ = tokio::time::sleep_until(queued_send_retry_deadline), if carrier_retry_blocked => {
+            _ = tokio::time::sleep_until(queued_send_retry_deadline), if timed_carrier_retry_blocked => {
                 state.progress.sender_retry_at = None;
                 continue;
             }
-            _ = wait_for_carrier_capacity_notifies(carrier_capacity_notifies), if carrier_retry_blocked && has_carrier_capacity_notify => {
+            _ = wait_for_carrier_capacity_notifies(carrier_capacity_notifies), if timed_carrier_retry_blocked && has_carrier_capacity_notify => {
                 state.progress.sender_retry_at = None;
+                continue;
+            }
+            _ = async {
+                if let Some(wait) = stream_ack_capacity_wait.as_mut() {
+                    wait.as_mut().await;
+                }
+            }, if stream_ack_publication_blocked && has_stream_ack_capacity_wait => {
+                stream_ack_capacity_wait = None;
+                state.progress.sender_retry_at = None;
+                continue;
+            }
+            _ = async move {
+                if let Some(wait) = max_data_capacity_wait {
+                    wait.await;
+                }
+            }, if max_data_publication_blocked && has_max_data_capacity_wait => {
                 continue;
             }
             additional_path_open = additional_path_open_rx.recv(), if !state.recovery.pending_additional_path_opens.is_empty() => {
@@ -1754,7 +1867,7 @@ where
                                 context,
                                 &mut recv_stream,
                                 &mut state.progress.recv_progress,
-                                RelayRecvProgressSend::new(path_snapshot, relay_lane, true),
+                                RelayRecvProgressSend::final_ack(path_snapshot, relay_lane),
                             )
                             .await
                             {
@@ -1805,6 +1918,7 @@ where
                             Err(err) => break Err(err.into()),
                         };
                         send_buffer_reservation.release(released_bytes);
+                        request_recovery_dirty = true;
                         if reliable_relay_can_send_pending_fin(
                             state.endpoint.pending_local_fin,
                             sender_queue.is_empty(),
@@ -1892,7 +2006,7 @@ where
                                 context,
                                 &mut recv_stream,
                                 &mut state.progress.recv_progress,
-                                RelayRecvProgressSend::new(path_snapshot, relay_lane, true),
+                                RelayRecvProgressSend::final_ack(path_snapshot, relay_lane),
                             )
                             .await
                             {

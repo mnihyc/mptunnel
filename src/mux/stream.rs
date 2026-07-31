@@ -617,6 +617,7 @@ impl ValidatedStreamAck {
     }
 
     /// Exclusive DSN horizon assigned at the start of this ACK transaction.
+    #[cfg(test)]
     pub(crate) fn assigned_end(&self) -> u64 {
         self.assigned_end
     }

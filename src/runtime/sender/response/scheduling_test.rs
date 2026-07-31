@@ -71,6 +71,52 @@ fn response_data_queue_readiness_follows_its_traffic_class() {
 }
 
 #[test]
+fn stale_response_output_is_excluded_until_it_is_the_only_live_output() {
+    let mut stale = response_target(0, UnderlayProtocol::Tcp, 1.0, 0, 16 * 1024 * 1024, true);
+    stale.observation.stale_for_original_data = true;
+    let mut alternate = response_target(1, UnderlayProtocol::Udp, 40.0, 0, 16 * 1024 * 1024, false);
+
+    assert_eq!(
+        select(&[stale.clone(), alternate.clone()], &[], 0),
+        Some(alternate.observation.key),
+        "a live non-stale output owns all new OriginalData placement"
+    );
+    block_data_queue(&mut alternate);
+    assert_eq!(
+        select(&[stale.clone(), alternate], &[], 0),
+        None,
+        "transient alternate backpressure does not reactivate stale placement"
+    );
+    assert_eq!(
+        select(std::slice::from_ref(&stale), &[], 0),
+        Some(stale.observation.key),
+        "the still-live stale output is the sole-output liveness fallback"
+    );
+
+    let identity = crate::runtime::sender::ServerReinjectionOutputIdentity {
+        key: stale.observation.key,
+        incarnation: stale.observation.incarnation,
+    };
+    let frame = Frame::StreamData {
+        stream_id: StreamId(1),
+        offset: 0,
+        payload: Bytes::from_static(b"repair"),
+    };
+    assert!(
+        select_response_frame_path(
+            std::slice::from_ref(&stale),
+            TrafficClass::Throughput,
+            &frame,
+            CarrierEmitMode::Classified,
+            &[(identity.key, identity.incarnation)],
+            Some(RelaySendCause::StaleResponsePathReinjection(identity)),
+        )
+        .is_none(),
+        "stale recovery never reinjects onto its stale owner"
+    );
+}
+
+#[test]
 fn latency_response_does_not_wait_for_a_bulk_service_window() {
     let mut target = response_target(0, UnderlayProtocol::Tcp, 20.0, 0, 1024 * 1024, true);
     target.observation.snapshot.active_flows = 2;

@@ -36,6 +36,7 @@ fn output_entry(
         commands,
         load_registration,
         original_data_in_flight_bytes: 0,
+        stale_for_original_data: false,
         bytes_in_flight: 0,
         product_progress_rate_bps: None,
         delivery_rate_bps: None,
@@ -44,6 +45,8 @@ fn output_entry(
         srtt_ms: None,
         delivery_samples: 0,
         original_data_acked_bytes: 0,
+        published_max_data_offset: 0,
+        ack_publication: Default::default(),
         local_path_metrics: None,
         peer_path_metrics: None,
         peer_usage: None,
@@ -444,6 +447,7 @@ fn best_live_path_uses_completion_score_including_command_queue() {
         detaching: Vec::new(),
         entries: vec![queued, clear],
         data_level_queue_bytes: 0,
+        desired_max_data_offset: 0,
     };
 
     let best = outputs
@@ -479,6 +483,7 @@ fn best_live_path_uses_peer_available_before_faster_backup() {
         detaching: Vec::new(),
         entries: vec![backup, available],
         data_level_queue_bytes: 0,
+        desired_max_data_offset: 0,
     };
 
     let best = outputs
@@ -543,6 +548,7 @@ fn closed_outputs_are_excluded_from_key_and_best_path_snapshots() {
         detaching: Vec::new(),
         entries: vec![closed, live],
         data_level_queue_bytes: 0,
+        desired_max_data_offset: 0,
     };
 
     assert!(

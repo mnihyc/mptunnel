@@ -3,7 +3,7 @@
 //! This queue is above TCP and QUIC carrier queues. It prioritizes correctness
 //! work and accounts product bytes without selecting or mutating a path.
 
-use super::RelaySendCause;
+use super::{RelaySendCause, ServerReinjectionOutputIdentity};
 use crate::model::capacity::reliable_relay_buffer_len;
 use crate::model::work::ReliableWorkClass;
 use crate::mux::MuxLimits;
@@ -48,7 +48,6 @@ pub(in crate::runtime) struct ReliableRelayQueuedWork {
 /// It owns queued product work and queue age before dispatch. Path command
 /// queues must receive only already-admitted frames.
 pub(in crate::runtime) struct ReliableRelaySenderQueue {
-    control: VecDeque<ReliableRelayQueuedWork>,
     critical_reinjection: VecDeque<ReliableRelayQueuedWork>,
     reinjection: VecDeque<ReliableRelayQueuedWork>,
     data: VecDeque<ReliableRelayQueuedWork>,
@@ -61,8 +60,7 @@ pub(in crate::runtime) struct ReliableRelaySenderQueue {
 
 impl ReliableRelaySenderQueue {
     pub(in crate::runtime) fn is_empty(&self) -> bool {
-        self.control.is_empty()
-            && self.critical_reinjection.is_empty()
+        self.critical_reinjection.is_empty()
             && self.reinjection.is_empty()
             && self.data.is_empty()
             && self.final_control.is_empty()
@@ -74,17 +72,6 @@ impl ReliableRelaySenderQueue {
 
     pub(in crate::runtime) fn data_bytes(&self) -> usize {
         self.data_bytes
-    }
-
-    pub(in crate::runtime) fn push_control(&mut self, frame: Frame) -> u64 {
-        let payload_bytes = reliable_stream_frame_accounted_bytes(&frame);
-        self.push_work(
-            ReliableWorkClass::Control,
-            ReliableRelayQueuedWorkKind::Control(frame),
-            None,
-            false,
-            payload_bytes,
-        )
     }
 
     pub(in crate::runtime) fn push_final_control(&mut self, frame: Frame) -> u64 {
@@ -193,10 +180,10 @@ impl ReliableRelaySenderQueue {
             queued_at: Instant::now(),
         };
         match lane {
-            ReliableWorkClass::Control if final_control => {
+            ReliableWorkClass::Control => {
+                debug_assert!(final_control);
                 self.final_control.push_back(work);
             }
-            ReliableWorkClass::Control => self.control.push_back(work),
             ReliableWorkClass::Data => self.data.push_back(work),
             ReliableWorkClass::Reinjection => self.reinjection.push_back(work),
         }
@@ -206,9 +193,7 @@ impl ReliableRelaySenderQueue {
     pub(in crate::runtime) fn front(
         &self,
     ) -> Option<(ReliableWorkClass, &ReliableRelayQueuedWork)> {
-        if let Some(work) = self.control.front() {
-            Some((ReliableWorkClass::Control, work))
-        } else if let Some(work) = self.critical_reinjection.front() {
+        if let Some(work) = self.critical_reinjection.front() {
             Some((ReliableWorkClass::Reinjection, work))
         } else if let Some(work) = self.data.front() {
             Some((ReliableWorkClass::Data, work))
@@ -316,6 +301,22 @@ impl ReliableRelaySenderQueue {
         released
     }
 
+    pub(in crate::runtime) fn discard_resolved_stale_response_path_reinjections(
+        &mut self,
+        path_is_stale: impl Fn(ServerReinjectionOutputIdentity) -> bool,
+    ) -> usize {
+        let released = discard_resolved_stale_response_path_reinjection_queue(
+            &mut self.critical_reinjection,
+            &path_is_stale,
+        )
+        .saturating_add(discard_resolved_stale_response_path_reinjection_queue(
+            &mut self.reinjection,
+            &path_is_stale,
+        ));
+        self.bytes = self.bytes.saturating_sub(released);
+        released
+    }
+
     pub(super) fn discard_persistent_ack_gap_reinjection_batch(
         &mut self,
         cause: RelaySendCause,
@@ -342,9 +343,7 @@ impl ReliableRelaySenderQueue {
     pub(in crate::runtime) fn commit_front(
         &mut self,
     ) -> Option<(ReliableWorkClass, ReliableRelayQueuedWork)> {
-        let (lane, work) = if let Some(work) = self.control.pop_front() {
-            (ReliableWorkClass::Control, work)
-        } else if let Some(work) = self.critical_reinjection.pop_front() {
+        let (lane, work) = if let Some(work) = self.critical_reinjection.pop_front() {
             (ReliableWorkClass::Reinjection, work)
         } else if let Some(work) = self.data.pop_front() {
             (ReliableWorkClass::Data, work)
@@ -484,6 +483,27 @@ fn discard_resolved_stale_path_reinjection_queue(
             &work.kind,
             ReliableRelayQueuedWorkKind::Reinjection {
                 cause: RelaySendCause::StalePathReinjection(path),
+                ..
+            } if !path_is_stale(*path)
+        );
+        if !keep {
+            released = released.saturating_add(work.payload_bytes);
+        }
+        keep
+    });
+    released
+}
+
+fn discard_resolved_stale_response_path_reinjection_queue(
+    queue: &mut VecDeque<ReliableRelayQueuedWork>,
+    path_is_stale: &impl Fn(ServerReinjectionOutputIdentity) -> bool,
+) -> usize {
+    let mut released = 0usize;
+    queue.retain(|work| {
+        let keep = !matches!(
+            &work.kind,
+            ReliableRelayQueuedWorkKind::Reinjection {
+                cause: RelaySendCause::StaleResponsePathReinjection(path),
                 ..
             } if !path_is_stale(*path)
         );

@@ -5,13 +5,14 @@
 
 use crate::model::path::{RelayPathInstance, RelayPathKey};
 use crate::model::work::{
-    CarrierWorkKind, ambiguous_flight_intervals, flight_interval_bytes, flight_intervals_overlap,
-    split_flight_interval_by_ack,
+    CarrierWorkKind, RangeRecoveryState, ambiguous_flight_intervals, flight_interval_bytes,
+    flight_intervals_overlap, split_flight_interval_by_ack,
 };
 use crate::protocol::frame::{
     normalize_offset_ranges, offset_ranges_not_covered, reliable_stream_frame_extent,
 };
 use crate::protocol::{Frame, OffsetRange, UnderlayProtocol};
+use smallvec::SmallVec;
 use std::collections::BTreeMap;
 use std::time::{Duration, Instant};
 
@@ -440,40 +441,95 @@ impl RequestFlightLedger {
         normalize_offset_ranges(ranges)
     }
 
-    pub(in crate::runtime) fn earliest_unacked_original_path(&self) -> Option<RelayPathInstance> {
-        self.flights
-            .values()
-            .find_map(|flights| latest_original_transmission(flights).map(|flight| flight.instance))
+    /// Exact attachment owners with unacknowledged OriginalData below an
+    /// authoritative Data ACK horizon. The caller filters current liveness.
+    pub(in crate::runtime) fn unacked_original_paths_before(
+        &self,
+        horizon: u64,
+    ) -> SmallVec<[RelayPathInstance; 4]> {
+        let mut paths = SmallVec::new();
+        for (_, flights) in self.flights.range(..horizon) {
+            let Some(original) = latest_original_transmission(flights) else {
+                continue;
+            };
+            if !paths.contains(&original.instance) {
+                paths.push(original.instance);
+            }
+        }
+        paths
     }
 
-    /// Returns original data not already reinjected on a usable alternate
-    /// path. Each carrier remains responsible for recovering its own flights.
-    pub(in crate::runtime) fn uncovered_unacked_ranges_for_reinjection(
+    /// Observes one stale owner's due ranges and next exact-copy expiry in one
+    /// ledger pass. Each carrier remains responsible for its own flights.
+    pub(in crate::runtime) fn range_recovery_state(
         &self,
         original_path: RelayPathInstance,
         usable_alternate_paths: &[RelayPathInstance],
-    ) -> Vec<OffsetRange> {
-        let original_ranges = self.latest_unacked_ranges_for_path_instance(original_path);
-        if original_ranges.is_empty() {
-            return Vec::new();
-        }
-        let reinjected_ranges = normalize_offset_ranges(
-            self.flights
-                .iter()
-                .flat_map(|(start, flights)| {
-                    flights.iter().filter_map(move |flight| {
-                        (flight.kind == CarrierWorkKind::ReinjectedData
-                            && flight.instance != original_path
-                            && usable_alternate_paths.contains(&flight.instance))
-                        .then_some(OffsetRange {
+        retry_after: Duration,
+    ) -> RangeRecoveryState {
+        let now = Instant::now();
+        let mut original_ranges = Vec::new();
+        let mut current_reinjections = Vec::new();
+        for (start, flights) in &self.flights {
+            if let Some(owner) = latest_original_transmission(flights)
+                && owner.instance == original_path
+            {
+                original_ranges.push(OffsetRange {
+                    start: *start,
+                    end: owner.end,
+                });
+            }
+            for flight in flights {
+                if flight.kind != CarrierWorkKind::ReinjectedData
+                    || flight.instance == original_path
+                    || !usable_alternate_paths.contains(&flight.instance)
+                {
+                    continue;
+                }
+                let Some(deadline) = flight.sent_at.checked_add(retry_after) else {
+                    continue;
+                };
+                if deadline > now {
+                    current_reinjections.push((
+                        OffsetRange {
                             start: *start,
                             end: flight.end,
-                        })
-                    })
-                })
-                .collect(),
-        );
-        offset_ranges_not_covered(&original_ranges, &reinjected_ranges)
+                        },
+                        deadline,
+                    ));
+                }
+            }
+        }
+        let original_ranges = normalize_offset_ranges(original_ranges);
+        if original_ranges.is_empty() {
+            return RangeRecoveryState::default();
+        }
+
+        let mut covered_ranges = Vec::new();
+        let mut retry_deadline = None;
+        let mut original_index = 0usize;
+        for (range, deadline) in current_reinjections {
+            while original_index < original_ranges.len()
+                && original_ranges[original_index].end <= range.start
+            {
+                original_index += 1;
+            }
+            if original_ranges
+                .get(original_index)
+                .is_some_and(|original| original.start < range.end)
+            {
+                covered_ranges.push(range);
+                retry_deadline =
+                    Some(retry_deadline.map_or(deadline, |current: Instant| current.min(deadline)));
+            }
+        }
+        RangeRecoveryState {
+            uncovered_ranges: offset_ranges_not_covered(
+                &original_ranges,
+                &normalize_offset_ranges(covered_ranges),
+            ),
+            retry_deadline,
+        }
     }
 
     pub(in crate::runtime) fn original_transmission_instances(&self) -> Vec<RelayPathInstance> {

@@ -36,6 +36,7 @@ pub(in crate::runtime::sender) fn response_target(
             writer_pending_bytes: 0,
             original_data_in_flight_bytes: bytes_in_flight,
             is_request_feedback: request_feedback,
+            stale_for_original_data: false,
             has_path_proof_evidence: true,
             has_bulk_rate_evidence: true,
         },

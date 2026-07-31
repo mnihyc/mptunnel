@@ -6,7 +6,7 @@
 
 use super::io::{
     AuthoritativeStreamAckSnapshot, ReliableAckGapReinjectionProgress,
-    ReliableRequestPathStaleness, begin_reliable_stream_ack,
+    ReliablePathStalenessObservation, ReliableRequestPathStaleness, begin_reliable_stream_ack,
     stream_ack_gap_reinjection_frames_normalized, stream_ack_ranges_expose_authoritative_gap,
     update_reinjection_authoritative_ack_snapshot,
 };
@@ -27,6 +27,7 @@ use crate::runtime::sender::{RelaySendCause, ReliableRelaySenderQueue, RequestSe
 use crate::runtime::stream::{ReliableRecvProgress, ReliableRelayRemoteSet};
 use crate::scheduler::{PathSnapshot, TrafficClass};
 use bytes::Bytes;
+use smallvec::SmallVec;
 use std::collections::{HashMap, HashSet};
 use std::time::Instant;
 
@@ -280,7 +281,7 @@ pub(super) fn apply_client_stream_data_state(
 ) -> Result<(ClientStreamDataEffect, ReceiveOutcome), RuntimeError> {
     let path_key = instance.key;
     #[cfg(not(feature = "lab-diagnostics"))]
-    let _ = stream_id;
+    let _ = (stream_id, path_key);
     let previous_remote_offset = recv_stream.next_offset();
     let payload_len = payload.len();
     super::io::validate_stream_data_final_offset(
@@ -366,64 +367,58 @@ pub(super) struct ClientStreamAckContext<'a> {
     pub(super) relay_lane: TrafficClass,
 }
 
-/// Runs the connection-level stale-path decision on both Data ACK events and
+/// Runs exact-attachment stale-path decisions on both Data ACK events and
 /// relay timer ticks. A path that stops every ACK must still become stale;
 /// TCP and QUIC continue to own recovery of their already-emitted flights.
 #[allow(clippy::too_many_arguments)]
 pub(super) fn update_request_path_staleness(
     state: &mut ClientRelayState,
     sender: &mut RequestSenderService,
-    sender_queue: &mut ReliableRelaySenderQueue,
     context: &ClientPathContext,
     remotes: &ReliableRelayRemoteSet,
-    send_stream: &ReliableSendStream,
     data_ack_progress_paths: &[RelayPathInstance],
     stream_id: StreamId,
-) {
-    let candidate = sender.earliest_unacked_original_path(remotes);
-    let candidate_made_progress =
-        candidate.is_some_and(|path| data_ack_progress_paths.contains(&path));
-    let has_reinjection_path =
-        candidate.is_some_and(|path| sender.request_path_has_reinjection_path(remotes, path));
-    let stale_path = state.progress.request_path_staleness.stale_path(
-        state
-            .progress
-            .last_send_ack
-            .has_unacknowledged_extent(send_stream.data_ack_frontier()),
-        candidate,
-        candidate_made_progress,
-        has_reinjection_path,
-        candidate.and_then(|path| context.reliable_path_snapshot(path.key)),
-    );
-    let Some(stale_path) = stale_path else {
-        return;
-    };
-    if !sender.mark_request_path_stale(stale_path) {
-        return;
+) -> bool {
+    let authoritative_horizon = state.progress.last_send_ack.horizon().unwrap_or(0);
+    let candidates = sender.unacked_original_paths_before(remotes, authoritative_horizon);
+    let observations = candidates
+        .iter()
+        .copied()
+        .map(|candidate| {
+            ReliablePathStalenessObservation::new(
+                candidate,
+                sender.request_path_has_reinjection_path(remotes, candidate),
+                Some(candidate.key.underlay),
+                context.reliable_path_snapshot(candidate.key),
+            )
+        })
+        .collect::<SmallVec<[_; 4]>>();
+    let stale_paths = state
+        .progress
+        .request_path_staleness
+        .stale_paths(&observations, data_ack_progress_paths);
+    let mut marked_stale = false;
+    for stale_path in stale_paths {
+        if !sender.mark_request_path_stale(remotes, stale_path) {
+            continue;
+        }
+        marked_stale = true;
+        #[cfg(feature = "lab-diagnostics")]
+        lab_diagnostic(
+            "request_path_stale",
+            format_args!(
+                "stream_id={} path_underlay={:?} path_index={} path_instance_id={} attachment_id={}",
+                stream_id.0,
+                stale_path.key.underlay,
+                stale_path.key.index,
+                stale_path.path_instance_id.as_u64(),
+                stale_path.attachment_id,
+            ),
+        );
     }
-    if sender.enqueue_stale_path_reinjections(
-        sender_queue,
-        context,
-        remotes,
-        send_stream,
-        stale_path,
-    ) {
-        state.progress.sender_retry_at = None;
-    }
-    #[cfg(feature = "lab-diagnostics")]
-    lab_diagnostic(
-        "request_path_stale",
-        format_args!(
-            "stream_id={} path_underlay={:?} path_index={} path_instance_id={} attachment_id={}",
-            stream_id.0,
-            stale_path.key.underlay,
-            stale_path.key.index,
-            stale_path.path_instance_id.as_u64(),
-            stale_path.attachment_id,
-        ),
-    );
     #[cfg(not(feature = "lab-diagnostics"))]
     let _ = stream_id;
+    marked_stale
 }
 
 #[derive(Debug, Default)]
@@ -601,9 +596,18 @@ pub(super) fn apply_client_stream_ack(
     complete: bool,
     ranges: Vec<OffsetRange>,
 ) -> Result<usize, StreamError> {
-    // Capture one immutable assignment horizon before touching any ACK-owned
+    // Capture one immutable send-assignment extent before touching any ACK-owned
     // cache, flight, queue, reservation, or recovery evidence.
     let validated_ack = begin_reliable_stream_ack(ack_context.send_stream, complete, ranges)?;
+    if ack_context
+        .state
+        .progress
+        .last_send_ack
+        .subsumes(&validated_ack)
+    {
+        ack_context.state.progress.last_stream_at = Instant::now();
+        return Ok(0);
+    }
     #[cfg(not(feature = "lab-diagnostics"))]
     let _ = stream_id;
     let ClientStreamAckContext {
@@ -632,10 +636,8 @@ pub(super) fn apply_client_stream_ack(
     update_request_path_staleness(
         state,
         sender,
-        sender_queue,
         context,
         remotes,
-        send_stream,
         &data_ack_progress_paths,
         stream_id,
     );

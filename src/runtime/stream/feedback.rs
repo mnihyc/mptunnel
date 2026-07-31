@@ -10,14 +10,156 @@ use crate::model::capacity::{
 use crate::model::timing::transport_pto_from_snapshot;
 use crate::mux::MuxLimits;
 use crate::mux::stream::ReliableRecvStream;
-use crate::protocol::UnderlayProtocol;
+use crate::protocol::{Frame, UnderlayProtocol};
 use crate::scheduler::{PathSnapshot, TrafficClass};
 use std::time::{Duration, Instant};
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub(in crate::runtime) struct StreamMaxDataPublication {
+    /// Latest shared offset accepted by at least one live carrier queue.
+    pub(in crate::runtime) published_offset: Option<u64>,
+    /// At least one live attachment still needs the retained latest value.
+    pub(in crate::runtime) pending: bool,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub(in crate::runtime) struct StreamAckPublication {
+    /// At least one ACK frame was accepted by a live attachment queue.
+    pub(in crate::runtime) accepted: bool,
+    /// At least one live attachment accepted the complete latest generation.
+    pub(in crate::runtime) published: bool,
+    /// At least one live attachment still needs the latest cumulative state.
+    pub(in crate::runtime) pending: bool,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub(in crate::runtime) struct StreamAckAttachmentPublication {
+    pub(in crate::runtime) accepted: bool,
+    pub(in crate::runtime) published: bool,
+}
+
+/// Per-attachment publication fence for cumulative MPP Data ACK state.
+///
+/// The receive stream remains the sole range owner. This cursor retains only
+/// generation and chunk position, so attachment fanout does not duplicate the
+/// bounded receive-range ledger.
+#[derive(Debug, Clone, Default)]
+pub(in crate::runtime) struct StreamAckPublicationCursor {
+    published_generation: u64,
+    pending_generation: u64,
+    next_cumulative_frame: usize,
+}
+
+impl StreamAckPublicationCursor {
+    pub(in crate::runtime) fn publish_update<E>(
+        &mut self,
+        generation: u64,
+        update_frames: &[Frame],
+        cumulative_frames: &[Frame],
+        mut enqueue: E,
+    ) -> StreamAckAttachmentPublication
+    where
+        E: FnMut(Frame) -> bool,
+    {
+        debug_assert!(generation != 0);
+        debug_assert!(!update_frames.is_empty());
+        debug_assert!(!cumulative_frames.is_empty());
+        debug_assert!(
+            update_frames
+                .iter()
+                .chain(cumulative_frames)
+                .all(|frame| matches!(frame, Frame::StreamAck { .. }))
+        );
+        if self.published_generation == generation {
+            return StreamAckAttachmentPublication {
+                accepted: false,
+                published: true,
+            };
+        }
+
+        let previous_generation = generation.wrapping_sub(1);
+        if self.pending_generation == 0 && self.published_generation == previous_generation {
+            let mut accepted = false;
+            for frame in update_frames {
+                if !enqueue(frame.clone()) {
+                    self.pending_generation = generation;
+                    self.next_cumulative_frame = 0;
+                    return StreamAckAttachmentPublication {
+                        accepted,
+                        published: false,
+                    };
+                }
+                accepted = true;
+            }
+            self.published_generation = generation;
+            return StreamAckAttachmentPublication {
+                accepted,
+                published: true,
+            };
+        }
+
+        self.retry_cumulative(generation, cumulative_frames, enqueue)
+    }
+
+    pub(in crate::runtime) fn retry_cumulative<E>(
+        &mut self,
+        generation: u64,
+        cumulative_frames: &[Frame],
+        mut enqueue: E,
+    ) -> StreamAckAttachmentPublication
+    where
+        E: FnMut(Frame) -> bool,
+    {
+        debug_assert!(generation != 0);
+        debug_assert!(!cumulative_frames.is_empty());
+        debug_assert!(
+            cumulative_frames
+                .iter()
+                .all(|frame| matches!(frame, Frame::StreamAck { .. }))
+        );
+        if self.published_generation == generation {
+            self.pending_generation = 0;
+            self.next_cumulative_frame = 0;
+            return StreamAckAttachmentPublication {
+                accepted: false,
+                published: true,
+            };
+        }
+        if self.pending_generation != generation {
+            self.pending_generation = generation;
+            self.next_cumulative_frame = 0;
+        }
+
+        let mut accepted = false;
+        while let Some(frame) = cumulative_frames.get(self.next_cumulative_frame) {
+            if !enqueue(frame.clone()) {
+                return StreamAckAttachmentPublication {
+                    accepted,
+                    published: false,
+                };
+            }
+            accepted = true;
+            self.next_cumulative_frame = self.next_cumulative_frame.saturating_add(1);
+        }
+        self.published_generation = generation;
+        self.pending_generation = 0;
+        self.next_cumulative_frame = 0;
+        StreamAckAttachmentPublication {
+            accepted,
+            published: true,
+        }
+    }
+
+    pub(in crate::runtime) fn is_pending(&self, generation: u64) -> bool {
+        generation != 0 && self.published_generation != generation
+    }
+}
 
 #[derive(Debug, Clone, Default)]
 pub(in crate::runtime) struct ReliableRecvProgress {
     last_max_data_offset: u64,
     last_max_data_window_bytes: u64,
+    ack_generation: u64,
     last_ack_offset: u64,
     last_ack_reorder_bytes: usize,
     last_ack_range_count: usize,
@@ -28,6 +170,14 @@ pub(in crate::runtime) struct ReliableRecvProgress {
 impl ReliableRecvProgress {
     pub(in crate::runtime) fn has_sent_ack(&self) -> bool {
         self.last_ack_at.is_some()
+    }
+
+    pub(in crate::runtime) fn ack_generation(&self) -> u64 {
+        self.ack_generation
+    }
+
+    pub(in crate::runtime) fn last_ack_at(&self) -> Option<Instant> {
+        self.last_ack_at
     }
 
     pub(in crate::runtime) fn should_send_ack(
@@ -46,6 +196,11 @@ impl ReliableRecvProgress {
         let largest_end = ack_summary.largest_end;
         let has_progress = next_offset > 0 || reorder_bytes > 0;
         let first_ack = self.last_ack_at.is_none() && has_progress;
+        let cumulative_state_changed = self.ack_generation == 0
+            || next_offset != self.last_ack_offset
+            || reorder_bytes != self.last_ack_reorder_bytes
+            || range_count != self.last_ack_range_count
+            || largest_end != self.last_ack_largest_end;
         let ack_step = reliable_stream_ack_update_bytes(path, traffic_class, mux_limits);
         let horizon_advanced = largest_end.saturating_sub(self.last_ack_largest_end) >= ack_step;
         let reorder_delta = reorder_bytes.abs_diff(self.last_ack_reorder_bytes) as u64 >= ack_step;
@@ -63,6 +218,12 @@ impl ReliableRecvProgress {
             || enough_delivered
             || (has_progress && delivered_since_ack > 0 && ack_timer_elapsed)
         {
+            if cumulative_state_changed {
+                self.ack_generation = self.ack_generation.wrapping_add(1);
+                if self.ack_generation == 0 {
+                    self.ack_generation = 1;
+                }
+            }
             self.last_ack_offset = next_offset;
             self.last_ack_reorder_bytes = reorder_bytes;
             self.last_ack_range_count = range_count;

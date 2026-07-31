@@ -11,6 +11,71 @@ Historical entries below are retained as evidence of the decisions made at
 their recorded time. When a later entry changes an earlier decision, the later
 entry is authoritative.
 
+## 2026-07-31T20:41:18+08:00: exact-attachment feedback and recovery accepted
+
+- Name: retained stream feedback, exact recovery, and transition timing
+- Category: Core RFC conformance and performance change control
+- State: accepted; correctness, steady-state, and representative transition
+  gates pass without changing a scheduler, congestion-control, pacing, window,
+  carrier-range, threshold, or timing value
+- Clean model:
+  - cumulative `STREAM_DATA_ACK` and `STREAM_MAX_DATA` are independent retained
+    state and are published on every exact live attachment;
+  - publication remains pending per attachment until that attachment accepts
+    the authoritative generation, including terminal stream feedback;
+  - request and response recovery use exact owned ranges, the existing RFC
+    retransmission interval, and capacity/membership notifications;
+  - stale placement is valid only while a distinct non-stale live alternative
+    exists, so a sole survivor is restored rather than excluded; and
+  - the opening response grant is fenced as already published on its opening
+    attachment, preventing a duplicate initial `STREAM_MAX_DATA`.
+- Practical root cause and correction:
+  - mixed-carrier blackhole runs had plateaued for 7--14 seconds near
+    57--59 Mbps because response ACK state could be accepted only by a
+    locally-live but wire-blackholed selected attachment;
+  - exact retained publication removes that single-attachment authority while
+    preserving one cumulative logical feedback state;
+  - redundant generations are detected by logical subsumption before
+    cache/flight/recovery work, retaining exact publication without a steady
+    CPU regression; and
+  - no unreliable datagram retransmission was added: the small datagram loss
+    around an induced underlay blackhole remains the declared unreliable
+    Product behavior.
+- Correctness evidence:
+  - `cargo test --all-targets --all-features --quiet` passes 1,421 library
+    tests, two allocation tests, and four daily-use acceptance tests;
+  - `cargo check --all-targets --all-features`,
+    `cargo clippy --all-targets --all-features -- -D warnings`,
+    `cargo build --release --locked --bin mptunnel`, formatting, and whitespace
+    checks pass; and
+  - durable tests cover redundant ACK subsumption, per-attachment terminal ACK
+    retention on both roles, sole-survivor stale restoration, exact recovery
+    suppression, and retained credit replay.
+- Performance evidence:
+  - two final balanced transition cohorts record mixed/TCP-download goodput of
+    282.250--293.900/256.577--270.927 Mbps, local recovery of
+    0.240--0.480 seconds, and application interruption of
+    0.402--1.998 seconds;
+  - the final representative steady matrix records TCP/QUIC single-path
+    download 123.899/235.408 Mbps, upload 130.473/251.006 Mbps, multipath
+    download 784.600/694.429 Mbps, and multipath upload
+    514.499/748.483 Mbps;
+  - duration-upload rows marked `loss` terminated their non-finalized probe
+    sockets at the configured duration; their target-confirmed byte accounting
+    and goodput remain valid, and no Product patch is justified by that label;
+  - the release binary is
+    `b8f4c276fc3167e7a2db8ddc84c80cd63597637ed10f4de20473bba36b5ce201`;
+    retained source-diff evidence is
+    `cc7112172103ccf6c1edfa709d0deb7c8e33f5d8cf99aaddf0c912042744efdb`;
+    and
+  - detailed local evidence is retained under the ignored
+    `./.tmp/lab/results/core-final-balanced-transition-{1,2}` and
+    `./.tmp/lab/results/core-final-representative-1` directories.
+- Next: add the generation-owned Product offline admission boundary and
+  restart acceptance without touching existing flows or Core behavior, then
+  validate whole-link quality-swap timing with a deterministic lab whose
+  convergence metric actually measures post-transition steady performance.
+
 ## 2026-07-31T15:02:46+08:00: ordered TCP retirement correctness candidate
 
 - Name: exact carrier drain, planned replacement, and native evidence cleanup

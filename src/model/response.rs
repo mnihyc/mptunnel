@@ -28,6 +28,9 @@ pub(crate) struct ResponsePathObservation {
     pub(crate) original_data_in_flight_bytes: u64,
     /// Exact request ingress preferred for path-neutral stream feedback.
     pub(crate) is_request_feedback: bool,
+    /// Connection-level recovery has stopped assigning new original response
+    /// data to this output. Native carrier recovery remains active.
+    pub(crate) stale_for_original_data: bool,
     #[cfg(test)]
     pub(crate) has_path_proof_evidence: bool,
     pub(crate) has_bulk_rate_evidence: bool,

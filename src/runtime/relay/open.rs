@@ -340,7 +340,11 @@ pub(in crate::runtime) async fn open_remote_stream_on_preselected_tcp_path(
             advertised_recv_max_offset,
         )
         .await?;
-    let pending = OpenedRemoteStream::from_opened_carrier(opened.carrier, path_index);
+    let pending = OpenedRemoteStream::from_opened_carrier(
+        opened.carrier,
+        path_index,
+        advertised_recv_max_offset,
+    );
     tokio::time::timeout_at(
         opened.open_deadline,
         send_open_path_metrics(context, pending.stream(), UnderlayProtocol::Tcp, path_index),
@@ -467,7 +471,8 @@ pub(in crate::runtime) async fn open_remote_stream_on_preselected_udp_path(
             advertised_recv_max_offset,
         )
         .await?;
-    let pending = OpenedRemoteStream::from_opened_carrier(carrier, path_index);
+    let pending =
+        OpenedRemoteStream::from_opened_carrier(carrier, path_index, advertised_recv_max_offset);
     let elapsed = started_at.elapsed();
     context.mark_udp_stream_reserved_open_success(path_index, elapsed, true);
     send_open_path_metrics(context, pending.stream(), UnderlayProtocol::Udp, path_index).await?;

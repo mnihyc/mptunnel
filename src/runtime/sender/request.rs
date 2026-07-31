@@ -18,7 +18,9 @@ use crate::model::capacity::{
 };
 use crate::model::multipath::ExtraTrafficLedger;
 use crate::model::path::{RelayPathInstance, RelayPathKey};
-use crate::model::timing::reliable_relay_tail_reinjection_delay;
+use crate::model::timing::{
+    reliable_data_retransmission_interval, reliable_relay_tail_reinjection_delay,
+};
 use crate::model::work::{
     reliable_critical_tail_reinjection_limit_bytes,
     reliable_failed_original_reinjection_limit_bytes,
@@ -91,6 +93,12 @@ pub(in crate::runtime) struct RequestProductAckOutcome {
     pub(in crate::runtime) data_ack_progress_paths: smallvec::SmallVec<[RelayPathInstance; 4]>,
 }
 
+#[derive(Debug, Default)]
+pub(in crate::runtime) struct StaleRequestRecoveryOutcome {
+    pub(in crate::runtime) queued: bool,
+    pub(in crate::runtime) retry_deadline: Option<Instant>,
+}
+
 /// Immutable evidence used to decide whether one Data ACK gap may be
 /// reinjected on a different live path.
 #[derive(Debug, Clone, Copy, Default)]
@@ -114,6 +122,8 @@ pub(in crate::runtime) struct RequestSenderService {
 pub(in crate::runtime) struct RelayRecvProgressSend {
     path: Option<PathSnapshot>,
     lane: TrafficClass,
+    force_ack: bool,
+    publish_max_data: bool,
     force_max_data: bool,
 }
 
@@ -126,7 +136,21 @@ impl RelayRecvProgressSend {
         Self {
             path,
             lane,
+            force_ack: force_max_data,
+            publish_max_data: true,
             force_max_data,
+        }
+    }
+
+    pub(in crate::runtime) fn final_ack(path: Option<PathSnapshot>, lane: TrafficClass) -> Self {
+        Self {
+            path,
+            lane,
+            force_ack: true,
+            publish_max_data: false,
+            // Once the final receive offset is contiguous, new receive credit
+            // has no consumer and must not precede the terminal Data ACK.
+            force_max_data: false,
         }
     }
 }
@@ -292,16 +316,22 @@ impl RequestSenderService {
 
     pub(in crate::runtime) fn mark_request_path_stale(
         &mut self,
+        remotes: &ReliableRelayRemoteSet,
         instance: RelayPathInstance,
     ) -> bool {
+        if !self.multipath.has_reinjection_path(remotes, instance) {
+            return false;
+        }
         self.multipath.mark_path_stale(instance)
     }
 
-    pub(in crate::runtime) fn earliest_unacked_original_path(
+    pub(in crate::runtime) fn unacked_original_paths_before(
         &self,
         remotes: &ReliableRelayRemoteSet,
-    ) -> Option<RelayPathInstance> {
-        self.multipath.earliest_unacked_original_path(remotes)
+        horizon: u64,
+    ) -> smallvec::SmallVec<[RelayPathInstance; 4]> {
+        self.multipath
+            .unacked_original_paths_before(remotes, horizon)
     }
 
     pub(in crate::runtime) fn request_path_has_reinjection_path(
@@ -310,27 +340,6 @@ impl RequestSenderService {
         candidate: RelayPathInstance,
     ) -> bool {
         self.multipath.has_reinjection_path(remotes, candidate)
-    }
-
-    pub(in crate::runtime) fn stale_paths_requiring_reinjection(
-        &self,
-        remotes: &ReliableRelayRemoteSet,
-        retry_after: Duration,
-    ) -> Vec<RelayPathInstance> {
-        self.multipath
-            .stale_paths_requiring_reinjection(remotes, retry_after)
-    }
-
-    pub(in crate::runtime) fn request_reinjection_retry_after(
-        &self,
-        context: &ClientPathContext,
-        remotes: &ReliableRelayRemoteSet,
-    ) -> Duration {
-        reliable_relay_tail_reinjection_delay(self.multipath.reinjection_path_snapshot(
-            context,
-            remotes,
-            &[],
-        ))
     }
 
     pub(in crate::runtime) fn release_all(&mut self, context: &ClientPathContext) {
@@ -760,45 +769,56 @@ impl RequestSenderService {
         progress: &mut ReliableRecvProgress,
         request: RelayRecvProgressSend,
     ) -> Result<bool, RuntimeError> {
+        let closed_outputs = remotes
+            .paths
+            .iter()
+            .filter(|path| path.stream.request_control_frame_queue_is_closed())
+            .map(|path| path.instance())
+            .collect::<Vec<_>>();
+        for instance in closed_outputs {
+            self.fail_client_path_instance(context, remotes, instance)
+                .await;
+        }
+        if remotes.is_empty() {
+            return Err(RuntimeError::ReliablePathSessionClosed);
+        }
+
         let mut sent_any = false;
-        let cause = RelaySendCause::RecvProgress;
-        let ack_progress_before = progress.clone();
+        let ack_generation_before = progress.ack_generation();
         if progress.should_send_ack(
             recv_stream,
             request.path,
             request.lane,
             context.mux_limits,
-            request.force_max_data,
+            request.force_ack,
         ) {
-            #[cfg(feature = "lab-diagnostics")]
-            let ack_started = Instant::now();
-            let ack_frames = recv_stream.ack_frames();
-            #[cfg(feature = "lab-diagnostics")]
-            lab_perf_record("mux.ack_frames", ack_started.elapsed(), ack_frames.len());
-            for ack_frame in ack_frames {
+            let generation = progress.ack_generation();
+            let publication = if generation == ack_generation_before {
+                remotes.retry_pending_stream_ack()
+            } else {
                 #[cfg(feature = "lab-diagnostics")]
-                let (ack_complete, ack_ranges, ack_frontier, ack_largest_end) = match &ack_frame {
-                    Frame::StreamAck {
-                        complete, ranges, ..
-                    } => (
-                        *complete,
-                        ranges.len(),
-                        stream_ack_contiguous_frontier(ranges),
-                        ranges.last().map_or(0, |range| range.end),
-                    ),
-                    _ => unreachable!("ack_frames only returns STREAM_ACK"),
-                };
-                match self
-                    .send_control_frame(context, remotes, ack_frame, cause)
-                    .await
+                let ack_started = Instant::now();
+                let ack_frames = recv_stream.ack_frames();
+                #[cfg(feature = "lab-diagnostics")]
                 {
-                    Ok(outcome) => {
-                        sent_any = true;
-                        #[cfg(feature = "lab-diagnostics")]
+                    lab_perf_record("mux.ack_frames", ack_started.elapsed(), ack_frames.len());
+                    if let Some(ack_frame) = ack_frames.last() {
+                        let (ack_complete, ack_ranges, ack_frontier, ack_largest_end) =
+                            match ack_frame {
+                                Frame::StreamAck {
+                                    complete, ranges, ..
+                                } => (
+                                    *complete,
+                                    ranges.len(),
+                                    stream_ack_contiguous_frontier(ranges),
+                                    ranges.last().map_or(0, |range| range.end),
+                                ),
+                                _ => unreachable!("ack_frames only returns STREAM_ACK"),
+                            };
                         lab_diagnostic(
-                            "recv_progress_ack_emit",
+                            "recv_progress_ack_state",
                             format_args!(
-                                "stream_id={} complete={} ranges={} frontier={} largest_end={} recv_next_offset={} recv_reorder_bytes={} cause={} path_underlay={:?} path_index={}",
+                                "stream_id={} complete={} ranges={} frontier={} largest_end={} recv_next_offset={} recv_reorder_bytes={} generation={}",
                                 self.multipath.stream_id().0,
                                 ack_complete,
                                 ack_ranges,
@@ -806,58 +826,47 @@ impl RequestSenderService {
                                 ack_largest_end,
                                 recv_stream.next_offset(),
                                 recv_stream.reorder_bytes(),
-                                cause.as_str(),
-                                outcome.path_key.underlay,
-                                outcome.path_key.index,
+                                generation,
                             ),
                         );
-                        #[cfg(not(feature = "lab-diagnostics"))]
-                        let _ = outcome;
                     }
-                    Err(RuntimeError::SenderServiceBlocked) => {
-                        // Partial incomplete ACK chunks are safe to repeat. Put
-                        // the ACK progress cursor back so the omitted chunks are
-                        // sent on the next capacity notification instead of
-                        // being inferred as sender-side loss.
-                        *progress = ack_progress_before;
-                        return Ok(sent_any);
-                    }
-                    Err(err) => return Err(err),
                 }
-            }
+                remotes.publish_stream_ack(generation, ack_frames)
+            };
+            sent_any |= publication.published;
+            #[cfg(feature = "lab-diagnostics")]
+            lab_diagnostic(
+                "recv_progress_ack_emit",
+                format_args!(
+                    "stream_id={} cause={} generation={} state_changed={} published={} pending={}",
+                    self.multipath.stream_id().0,
+                    "recv_progress",
+                    generation,
+                    generation != ack_generation_before,
+                    publication.published,
+                    publication.pending,
+                ),
+            );
         }
-        let max_data_progress_before = progress.clone();
-        if progress.should_send_max_data(
-            recv_stream,
-            request.path,
-            request.lane,
-            context.mux_limits,
-            request.force_max_data,
-        ) {
+        if request.publish_max_data
+            && progress.should_send_max_data(
+                recv_stream,
+                request.path,
+                request.lane,
+                context.mux_limits,
+                request.force_max_data,
+            )
+        {
             let advertised_window = reliable_stream_advertised_window_bytes(
                 request.path,
                 request.lane,
                 context.mux_limits,
             );
             let max_offset = recv_stream.max_data_offset_with_window(advertised_window);
-            match self
-                .send_control_frame(
-                    context,
-                    remotes,
-                    recv_stream.max_data_frame_with_window(advertised_window),
-                    cause,
-                )
-                .await
-            {
-                Ok(_) => {
-                    recv_stream.commit_max_data(max_offset);
-                    sent_any = true;
-                }
-                Err(RuntimeError::SenderServiceBlocked) => {
-                    *progress = max_data_progress_before;
-                    return Ok(sent_any);
-                }
-                Err(err) => return Err(err),
+            let publication = remotes.publish_max_data(max_offset);
+            if let Some(published_offset) = publication.published_offset {
+                recv_stream.commit_max_data(published_offset);
+                sent_any = true;
             }
         }
         Ok(sent_any)
@@ -1003,27 +1012,39 @@ impl RequestSenderService {
         )
     }
 
-    pub(in crate::runtime) fn enqueue_stale_path_reinjections(
+    pub(in crate::runtime) fn drive_stale_path_recovery(
         &mut self,
         sender_queue: &mut ReliableRelaySenderQueue,
         context: &ClientPathContext,
         remotes: &ReliableRelayRemoteSet,
         send_stream: &ReliableSendStream,
-        stale_instance: RelayPathInstance,
-    ) -> bool {
-        let ranges = self
-            .multipath
-            .uncovered_unacked_ranges_for_reinjection(remotes, stale_instance);
-        self.enqueue_path_data_for_reinjection(
-            sender_queue,
-            context,
-            remotes,
-            send_stream,
-            stale_instance.key,
-            &[stale_instance],
-            ranges,
-            RelaySendCause::StalePathReinjection(stale_instance),
-        )
+    ) -> StaleRequestRecoveryOutcome {
+        let mut outcome = StaleRequestRecoveryOutcome::default();
+        for stale_instance in self.multipath.stale_original_paths(remotes) {
+            let retry_after = reliable_data_retransmission_interval(
+                Some(stale_instance.key.underlay),
+                context.reliable_path_snapshot(stale_instance.key),
+            );
+            let recovery =
+                self.multipath
+                    .stale_path_recovery_state(remotes, stale_instance, retry_after);
+            outcome.retry_deadline = match (outcome.retry_deadline, recovery.retry_deadline) {
+                (Some(current), Some(deadline)) => Some(current.min(deadline)),
+                (None, deadline) => deadline,
+                (current, None) => current,
+            };
+            outcome.queued |= self.enqueue_path_data_for_reinjection(
+                sender_queue,
+                context,
+                remotes,
+                send_stream,
+                stale_instance.key,
+                &[stale_instance],
+                recovery.uncovered_ranges,
+                RelaySendCause::StalePathReinjection(stale_instance),
+            );
+        }
+        outcome
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -1077,9 +1098,9 @@ impl RequestSenderService {
                 ),
             );
         }
-        if queued {
+        if queued && cause == RelaySendCause::PathFailureReinjection {
             self.multipath
-                .record_reinjection_attempts(failed_instances, Instant::now());
+                .record_missing_owner_reinjection_attempts(failed_instances, Instant::now());
         }
         queued
     }

@@ -1,6 +1,8 @@
+use super::feedback::{StreamAckPublication, StreamMaxDataPublication};
 use super::response::{
-    CarrierPathFlight, ResponseDataAckRecoveryCandidate, ResponseStreamBinding,
-    product_flights_have_recent_reinjection_overlap, release_carrier_path_flight_ranges,
+    CarrierPathFlight, ResponseDataAckRecoveryCandidate, ResponseDataAckRelease,
+    ResponseStreamBinding, product_flights_have_recent_reinjection_overlap,
+    release_carrier_path_flight_ranges,
 };
 use crate::model::capacity::{
     PATH_OPEN_SCORE_BYTES, PathRateSample, RELIABLE_INITIAL_WINDOW_PACKETS,
@@ -8,7 +10,7 @@ use crate::model::capacity::{
     reliable_path_startup_sample_limit_bytes,
 };
 use crate::model::path::{CarrierPathInstanceId, CarrierPathKey};
-use crate::model::work::{CarrierWorkKind, ReliableWorkClass};
+use crate::model::work::{CarrierWorkKind, RangeRecoveryState, ReliableWorkClass};
 use crate::mux::MuxLimits;
 #[cfg(test)]
 use crate::protocol::PathId;
@@ -22,8 +24,12 @@ use crate::runtime::path::commands::{
 use crate::runtime::path::model::{default_path_rate_bps, default_path_srtt_ms};
 use crate::runtime::path::proof::enqueue_path_proof_frame;
 use crate::runtime::path::{OpenedReliableCarrierStream, RequestTcpCapacityProbeLease};
+use crate::runtime::sender::ServerReinjectionOutputIdentity;
 use crate::scheduler::{PathRateScope, PathSnapshot, TrafficClass};
+use smallvec::SmallVec;
 use std::collections::{BTreeMap, VecDeque};
+use std::future::Future;
+use std::pin::Pin;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 use tokio::sync::{Notify, mpsc, watch};
@@ -371,6 +377,22 @@ impl ReliablePathStream {
         self.output.data_ack_recovery_candidate(ack_frontier)
     }
 
+    pub(in crate::runtime) fn data_ack_recovery_candidates(
+        &self,
+        authoritative_horizon: u64,
+    ) -> SmallVec<[ResponseDataAckRecoveryCandidate; 4]> {
+        self.output
+            .data_ack_recovery_candidates(authoritative_horizon)
+    }
+
+    pub(in crate::runtime) fn response_output_snapshot(
+        &self,
+        identity: ServerReinjectionOutputIdentity,
+        lane: TrafficClass,
+    ) -> Option<PathSnapshot> {
+        self.output.response_output_snapshot(identity, lane)
+    }
+
     pub(in crate::runtime) fn request_feedback_underlay(&self) -> Option<UnderlayProtocol> {
         self.output.request_feedback_underlay()
     }
@@ -406,13 +428,107 @@ impl ReliablePathStream {
         self.output.capacity_notifies()
     }
 
+    pub(in crate::runtime) fn output_membership_generation(&self) -> u64 {
+        match &self.output {
+            ReliablePathStreamOutput::Switchable(binding) => binding.output_membership_generation(),
+            ReliablePathStreamOutput::Fixed(_) => 0,
+        }
+    }
+
+    pub(in crate::runtime) fn publish_ack(
+        &self,
+        generation: u64,
+        update_frames: &[Frame],
+        cumulative_frames: &[Frame],
+    ) -> StreamAckPublication {
+        match &self.output {
+            ReliablePathStreamOutput::Switchable(binding) => {
+                binding.publish_ack(generation, update_frames, cumulative_frames)
+            }
+            ReliablePathStreamOutput::Fixed(_) => StreamAckPublication::default(),
+        }
+    }
+
+    pub(in crate::runtime) fn retry_pending_ack(
+        &self,
+        generation: u64,
+        cumulative_frames: &[Frame],
+    ) -> StreamAckPublication {
+        match &self.output {
+            ReliablePathStreamOutput::Switchable(binding) => {
+                binding.retry_pending_ack(generation, cumulative_frames)
+            }
+            ReliablePathStreamOutput::Fixed(_) => StreamAckPublication::default(),
+        }
+    }
+
+    pub(in crate::runtime) fn pending_ack_capacity_notifies(
+        &self,
+        generation: u64,
+    ) -> Vec<Arc<Notify>> {
+        match &self.output {
+            ReliablePathStreamOutput::Switchable(binding) => {
+                binding.pending_ack_capacity_notifies(generation)
+            }
+            ReliablePathStreamOutput::Fixed(_) => Vec::new(),
+        }
+    }
+
+    pub(in crate::runtime) fn publish_max_data(&self, max_offset: u64) -> StreamMaxDataPublication {
+        match &self.output {
+            ReliablePathStreamOutput::Switchable(binding) => {
+                binding.publish_max_data(self.stream_id, max_offset)
+            }
+            ReliablePathStreamOutput::Fixed(_) => StreamMaxDataPublication::default(),
+        }
+    }
+
+    pub(in crate::runtime) fn retry_pending_max_data(&self) -> StreamMaxDataPublication {
+        match &self.output {
+            ReliablePathStreamOutput::Switchable(binding) => {
+                binding.retry_pending_max_data(self.stream_id)
+            }
+            ReliablePathStreamOutput::Fixed(_) => StreamMaxDataPublication::default(),
+        }
+    }
+
+    pub(in crate::runtime) fn has_pending_max_data_publication(&self) -> bool {
+        match &self.output {
+            ReliablePathStreamOutput::Switchable(binding) => {
+                binding.has_pending_max_data_publication()
+            }
+            ReliablePathStreamOutput::Fixed(_) => false,
+        }
+    }
+
+    pub(in crate::runtime) fn pending_max_data_capacity_notifies(&self) -> Vec<Arc<Notify>> {
+        match &self.output {
+            ReliablePathStreamOutput::Switchable(binding) => {
+                binding.pending_max_data_capacity_notifies()
+            }
+            ReliablePathStreamOutput::Fixed(_) => Vec::new(),
+        }
+    }
+
+    pub(in crate::runtime) fn response_recovery_capacity_notifies(&self) -> Vec<Arc<Notify>> {
+        match &self.output {
+            ReliablePathStreamOutput::Switchable(binding) => {
+                binding.response_recovery_capacity_notifies()
+            }
+            ReliablePathStreamOutput::Fixed(_) => Vec::new(),
+        }
+    }
+
     pub(in crate::runtime) fn set_lane(&mut self, lane: TrafficClass) {
         self.lane = lane;
         self.output.set_lane(lane);
     }
 
-    pub(in crate::runtime) fn release_normalized_acked_ranges(&self, ranges: &[OffsetRange]) {
-        self.output.release_normalized_acked_ranges(ranges);
+    pub(in crate::runtime) fn release_normalized_acked_ranges(
+        &self,
+        ranges: &[OffsetRange],
+    ) -> ResponseDataAckRelease {
+        self.output.release_normalized_acked_ranges(ranges)
     }
 
     pub(in crate::runtime) fn has_recent_reinjection_overlap(
@@ -438,6 +554,35 @@ impl ReliablePathStream {
 
     pub(in crate::runtime) fn uncovered_failed_original_ranges(&self) -> Vec<OffsetRange> {
         self.output.uncovered_failed_original_ranges()
+    }
+
+    pub(in crate::runtime) fn has_nonstale_reinjection_alternative(
+        &self,
+        candidate: ServerReinjectionOutputIdentity,
+    ) -> bool {
+        self.output.has_nonstale_reinjection_alternative(candidate)
+    }
+
+    pub(in crate::runtime) fn mark_response_output_stale(
+        &self,
+        identity: ServerReinjectionOutputIdentity,
+    ) -> bool {
+        self.output.mark_response_output_stale(identity)
+    }
+
+    pub(in crate::runtime) fn stale_response_original_outputs(
+        &self,
+    ) -> Vec<ServerReinjectionOutputIdentity> {
+        self.output.stale_response_original_outputs()
+    }
+
+    pub(in crate::runtime) fn stale_original_recovery_state(
+        &self,
+        identity: ServerReinjectionOutputIdentity,
+        retry_after: Duration,
+    ) -> RangeRecoveryState {
+        self.output
+            .stale_original_recovery_state(identity, retry_after)
     }
 
     pub(in crate::runtime) fn has_untracked_data_reinjection_path_for_frame(
@@ -487,6 +632,40 @@ pub(in crate::runtime) struct ReliablePathStreamHandle {
 }
 
 impl ReliablePathStreamHandle {
+    pub(in crate::runtime) fn try_enqueue_request_control_frame(
+        &self,
+        frame: Frame,
+    ) -> Result<(), RuntimeError> {
+        match &self.output {
+            ReliablePathStreamOutput::Fixed(fixed) => fixed
+                .commands()
+                .try_enqueue_admitted_frame(frame, TrafficClass::Control),
+            ReliablePathStreamOutput::Switchable(_) => {
+                Err(RuntimeError::Protocol("request relay path is not fixed"))
+            }
+        }
+    }
+
+    pub(in crate::runtime) fn request_control_frame_queue_is_closed(&self) -> bool {
+        match &self.output {
+            ReliablePathStreamOutput::Fixed(fixed) => {
+                fixed.commands().control_frame_queue_is_closed()
+            }
+            ReliablePathStreamOutput::Switchable(_) => true,
+        }
+    }
+
+    pub(in crate::runtime) fn request_control_capacity_notify(&self) -> Option<Arc<Notify>> {
+        match &self.output {
+            ReliablePathStreamOutput::Fixed(fixed)
+                if !fixed.commands().control_frame_queue_is_closed() =>
+            {
+                Some(fixed.commands().capacity_notify())
+            }
+            _ => None,
+        }
+    }
+
     pub(in crate::runtime) async fn send_detach(&self) {
         self.output.send_stream_detach(self.stream_id).await;
     }
@@ -804,7 +983,7 @@ impl FixedReliablePathOutput {
             end,
             Instant::now(),
             retry_after,
-            |_| true,
+            |_, _| true,
         )
     }
 }
@@ -1033,6 +1212,29 @@ impl ReliablePathStreamOutput {
         }
     }
 
+    pub(in crate::runtime) fn data_ack_recovery_candidates(
+        &self,
+        authoritative_horizon: u64,
+    ) -> SmallVec<[ResponseDataAckRecoveryCandidate; 4]> {
+        match self {
+            Self::Fixed(_) => SmallVec::new(),
+            Self::Switchable(binding) => {
+                binding.data_ack_recovery_candidates(authoritative_horizon)
+            }
+        }
+    }
+
+    pub(in crate::runtime) fn response_output_snapshot(
+        &self,
+        identity: ServerReinjectionOutputIdentity,
+        lane: TrafficClass,
+    ) -> Option<PathSnapshot> {
+        match self {
+            Self::Fixed(_) => None,
+            Self::Switchable(binding) => binding.response_output_snapshot(identity, lane),
+        }
+    }
+
     pub(in crate::runtime) fn request_feedback_underlay(&self) -> Option<UnderlayProtocol> {
         match self {
             Self::Fixed(fixed) => Some(fixed.key().underlay),
@@ -1095,9 +1297,15 @@ impl ReliablePathStreamOutput {
         }
     }
 
-    pub(in crate::runtime) fn release_normalized_acked_ranges(&self, ranges: &[OffsetRange]) {
+    pub(in crate::runtime) fn release_normalized_acked_ranges(
+        &self,
+        ranges: &[OffsetRange],
+    ) -> ResponseDataAckRelease {
         match self {
-            Self::Fixed(fixed) => fixed.release_normalized_acked_ranges(ranges),
+            Self::Fixed(fixed) => {
+                fixed.release_normalized_acked_ranges(ranges);
+                ResponseDataAckRelease::default()
+            }
             Self::Switchable(binding) => binding.release_normalized_acked_ranges(ranges),
         }
     }
@@ -1141,6 +1349,48 @@ impl ReliablePathStreamOutput {
         }
     }
 
+    pub(in crate::runtime) fn has_nonstale_reinjection_alternative(
+        &self,
+        candidate: ServerReinjectionOutputIdentity,
+    ) -> bool {
+        match self {
+            Self::Fixed(_) => false,
+            Self::Switchable(binding) => binding.has_nonstale_reinjection_alternative(candidate),
+        }
+    }
+
+    pub(in crate::runtime) fn mark_response_output_stale(
+        &self,
+        identity: ServerReinjectionOutputIdentity,
+    ) -> bool {
+        match self {
+            Self::Fixed(_) => false,
+            Self::Switchable(binding) => binding.mark_output_stale(identity),
+        }
+    }
+
+    pub(in crate::runtime) fn stale_response_original_outputs(
+        &self,
+    ) -> Vec<ServerReinjectionOutputIdentity> {
+        match self {
+            Self::Fixed(_) => Vec::new(),
+            Self::Switchable(binding) => binding.stale_original_outputs(),
+        }
+    }
+
+    pub(in crate::runtime) fn stale_original_recovery_state(
+        &self,
+        identity: ServerReinjectionOutputIdentity,
+        retry_after: Duration,
+    ) -> RangeRecoveryState {
+        match self {
+            Self::Fixed(_) => RangeRecoveryState::default(),
+            Self::Switchable(binding) => {
+                binding.stale_original_recovery_state(identity, retry_after)
+            }
+        }
+    }
+
     pub(in crate::runtime) fn has_untracked_data_reinjection_path_for_frame(
         &self,
         frame: &Frame,
@@ -1174,6 +1424,30 @@ pub(in crate::runtime) async fn wait_for_carrier_capacity_notifies(notifies: Vec
         .map(|notify| Box::pin(async move { notify.notified().await }))
         .collect::<Vec<_>>();
     let _ = futures::future::select_all(waits).await;
+}
+
+pub(in crate::runtime) type ArmedCarrierCapacityWait = Pin<Box<dyn Future<Output = ()> + Send>>;
+
+/// Arms capacity notifications before the caller retries a failed queue
+/// reservation. `Notify::notify_waiters` is not retained for a future waiter,
+/// so creating the waiter after retry would leave a lost-wake window.
+pub(in crate::runtime) fn arm_carrier_capacity_notifies(
+    notifies: Vec<Arc<Notify>>,
+) -> Option<ArmedCarrierCapacityWait> {
+    if notifies.is_empty() {
+        return None;
+    }
+    let waits = notifies
+        .into_iter()
+        .map(|notify| {
+            let mut wait = Box::pin(notify.notified_owned());
+            wait.as_mut().enable();
+            wait
+        })
+        .collect::<Vec<_>>();
+    Some(Box::pin(async move {
+        let _ = futures::future::select_all(waits).await;
+    }))
 }
 
 #[cfg(test)]

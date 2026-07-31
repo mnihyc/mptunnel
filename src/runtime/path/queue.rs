@@ -1084,6 +1084,14 @@ impl ReliablePathCommandSender {
         self.metrics.capacity_released.clone()
     }
 
+    pub(in crate::runtime) fn control_frame_queue_is_closed(&self) -> bool {
+        self.priority.is_closed()
+    }
+
+    pub(in crate::runtime) fn reinjection_frame_queue_is_closed(&self) -> bool {
+        self.reinjection.is_closed()
+    }
+
     pub(in crate::runtime) fn capacity_notifies(&self) -> Vec<Arc<Notify>> {
         vec![self.capacity_notify()]
     }

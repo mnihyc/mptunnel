@@ -26,6 +26,7 @@ use crate::model::request_evidence::{
     request_path_rate_coverage_floor_bytes,
 };
 use crate::model::timing::reliable_relay_tail_reinjection_delay;
+use crate::model::work::RangeRecoveryState;
 use crate::protocol::frame::{reliable_stream_frame_accounted_bytes, reliable_stream_frame_extent};
 use crate::protocol::{Frame, OffsetRange, StreamId, UnderlayProtocol};
 use crate::runtime::error::RuntimeError;
@@ -324,6 +325,10 @@ impl RequestMultipathController {
                 .request
                 .flights
                 .original_transmission_instances_for_frame(frame, &remotes.path_instances()),
+            RelaySendCause::StalePathReinjection(_) => self
+                .request
+                .flights
+                .original_transmission_instances_for_frame(frame, &remotes.path_instances()),
             cause if cause.is_reinjection() => self.request.flights.sent_instances_for_frame(frame),
             _ => Vec::new(),
         }
@@ -370,42 +375,57 @@ impl RequestMultipathController {
             .latest_unacked_ranges_for_path_instance(instance)
     }
 
-    pub(super) fn earliest_unacked_original_path(
+    pub(super) fn unacked_original_paths_before(
         &self,
         remotes: &ReliableRelayRemoteSet,
-    ) -> Option<RelayPathInstance> {
+        horizon: u64,
+    ) -> smallvec::SmallVec<[RelayPathInstance; 4]> {
         self.request
             .flights
-            .earliest_unacked_original_path()
+            .unacked_original_paths_before(horizon)
+            .into_iter()
             .filter(|instance| remotes.contains_path_instance(*instance))
+            .filter(|instance| !self.request.stale_paths.contains(instance))
+            .collect()
     }
 
-    pub(super) fn uncovered_unacked_ranges_for_reinjection(
+    pub(super) fn stale_path_recovery_state(
         &self,
         remotes: &ReliableRelayRemoteSet,
         original_path: RelayPathInstance,
-    ) -> Vec<OffsetRange> {
-        let usable_alternate_paths = remotes
+        retry_after: Duration,
+    ) -> RangeRecoveryState {
+        let usable_alternate_paths = self.usable_reinjection_paths(remotes, original_path);
+        self.request.flights.range_recovery_state(
+            original_path,
+            &usable_alternate_paths,
+            retry_after,
+        )
+    }
+
+    fn usable_reinjection_paths(
+        &self,
+        remotes: &ReliableRelayRemoteSet,
+        original_path: RelayPathInstance,
+    ) -> Vec<RelayPathInstance> {
+        remotes
             .paths
             .iter()
             .filter(|path| path.instance() != original_path)
             .filter(|path| !self.request.stale_paths.contains(&path.instance()))
             .filter(|path| !path.stream.output_is_terminally_closed())
             .map(|path| path.instance())
-            .collect::<Vec<_>>();
-        self.request
-            .flights
-            .uncovered_unacked_ranges_for_reinjection(original_path, &usable_alternate_paths)
+            .collect()
     }
 
-    pub(super) fn record_reinjection_attempts(
+    pub(super) fn record_missing_owner_reinjection_attempts(
         &mut self,
         instances: &[RelayPathInstance],
         attempted_at: Instant,
     ) {
         for instance in instances {
             self.request
-                .reinjection_attempts
+                .missing_owner_reinjection_attempts
                 .insert(*instance, attempted_at);
         }
     }
@@ -455,23 +475,9 @@ impl RequestMultipathController {
         choose(false).or_else(|| choose(true))
     }
 
-    pub(super) fn stale_path_reinjection_due(
-        &self,
-        instance: RelayPathInstance,
-        retry_after: Duration,
-    ) -> bool {
-        self.request.stale_paths.contains(&instance)
-            && self
-                .request
-                .reinjection_attempts
-                .get(&instance)
-                .is_none_or(|attempted_at| attempted_at.elapsed() >= retry_after)
-    }
-
-    pub(super) fn stale_paths_requiring_reinjection(
+    pub(super) fn stale_original_paths(
         &self,
         remotes: &ReliableRelayRemoteSet,
-        retry_after: Duration,
     ) -> Vec<RelayPathInstance> {
         self.request
             .stale_paths
@@ -482,12 +488,6 @@ impl RequestMultipathController {
                 self.request
                     .flights
                     .has_original_transmission_flights_for_instance(*instance)
-            })
-            .filter(|instance| self.stale_path_reinjection_due(*instance, retry_after))
-            .filter(|instance| {
-                !self
-                    .uncovered_unacked_ranges_for_reinjection(remotes, *instance)
-                    .is_empty()
             })
             .collect()
     }
@@ -1199,6 +1199,15 @@ impl RequestMultipathController {
             self.request
                 .stale_paths
                 .retain(|instance| live_instances.contains(instance));
+            if !live_instances
+                .iter()
+                .any(|instance| !self.request.stale_paths.contains(instance))
+            {
+                // Staleness only withdraws OriginalData while a distinct
+                // non-stale attachment can own it. Restoring the sole
+                // surviving set is one membership reconciliation.
+                self.request.stale_paths.clear();
+            }
             self.request.membership_generation = Some(membership_generation);
         }
         let now = Instant::now();
@@ -1324,7 +1333,9 @@ impl RequestMultipathController {
         let mut delivered_data =
             smallvec::SmallVec::<[RequestOwnerAckProgress<RelayPathInstance>; 4]>::new();
         for release in self.request.flights.release_normalized_acked_ranges(ranges) {
-            self.request.reinjection_attempts.remove(&release.instance);
+            self.request
+                .missing_owner_reinjection_attempts
+                .remove(&release.instance);
             context.release_relay_path_inflight(release.instance, release.bytes);
             if release.path_proving {
                 if let Some(progress) = delivered_data
@@ -1528,11 +1539,11 @@ impl RequestMultipathController {
         retry_after: Duration,
     ) -> Vec<RelayPathInstance> {
         let owner_instances = self.request.flights.original_transmission_instances();
-        self.request.reinjection_attempts.retain(|instance, _| {
-            owner_instances.contains(instance)
-                && (!remotes.contains_path_instance(*instance)
-                    || self.request.stale_paths.contains(instance))
-        });
+        self.request
+            .missing_owner_reinjection_attempts
+            .retain(|instance, _| {
+                owner_instances.contains(instance) && !remotes.contains_path_instance(*instance)
+            });
         let now = Instant::now();
         owner_instances
             .into_iter()
@@ -1540,7 +1551,7 @@ impl RequestMultipathController {
                 !remotes.contains_path_instance(*instance)
                     && self
                         .request
-                        .reinjection_attempts
+                        .missing_owner_reinjection_attempts
                         .get(instance)
                         .is_none_or(|attempt| {
                             now.saturating_duration_since(*attempt) >= retry_after

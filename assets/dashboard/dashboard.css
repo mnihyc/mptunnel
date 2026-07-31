@@ -787,17 +787,20 @@ tbody tr:hover td {
 }
 
 .state-cell--active::before,
+.state-cell--connected::before,
 .state-cell--listening::before,
 .state-cell--available::before {
   background: var(--green);
 }
 
+.state-cell--connecting::before,
 .state-cell--suspect::before,
 .state-cell--draining::before,
 .state-cell--backup::before {
   background: var(--amber);
 }
 
+.state-cell--offline::before,
 .state-cell--failed::before,
 .state-cell--disabled::before,
 .state-cell--unavailable::before {

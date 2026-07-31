@@ -39,7 +39,7 @@ Start the server:
   --tls-private-key ./server-private-key.pem \
   --bind-path tcp://0.0.0.0:4433 \
   --bind-path udp://0.0.0.0:4433 \
-  --outbound direct
+  --outbound-protocol direct
 ```
 
 Start the client:

@@ -11,6 +11,40 @@ Historical entries below are retained as evidence of the decisions made at
 their recorded time. When a later entry changes an earlier decision, the later
 entry is authoritative.
 
+## 2026-07-31T21:14:51+08:00: Product availability presentation aligned
+
+- Name: authenticated-carrier management projection
+- Category: Product observability and operator presentation
+- State: accepted; one previously separate presentation authority now reads
+  the same generation-owned inventory as new-flow admission
+- Correction:
+  - MPP outbound session state and carrier count now come from exact
+    authenticated TCP/QUIC connection lifetimes, not the optional peer
+    diagnostics broker;
+  - the three states are `connecting` before first authentication,
+    `connected` while a carrier is live, and `offline` after the last carrier
+    is lost;
+  - retained established-flow counts no longer overwrite carrier availability,
+    while peer diagnostics remain independently reported; and
+  - the dashboard presents the three availability states explicitly.
+- Documentation corrections: fixed the packaged server CLI example, described
+  the intentionally visible local MPP path endpoints accurately, and recorded
+  logging-only live configuration updates.
+- Verification:
+  - the management test proves initial, connected, and offline projection while
+    a diagnostic registration remains live and an established flow is retained;
+  - `cargo test --all-targets --all-features --quiet` passes 1,427 library
+    tests, two allocation tests, and five daily-use acceptance tests;
+  - `cargo clippy --all-targets --all-features -- -D warnings`, release build,
+    formatting, and whitespace checks pass; and
+  - the release binary is
+    `a117f6135dffb84b85b71024684f660c3efe2f4d4c574f36481b4565280b36b0`.
+- Performance boundary: projection samples one already-existing Product
+  inventory snapshot; no carrier, payload, scheduler, congestion, recovery,
+  timing, or RFC value changed.
+- Next: close only missing high-value executable Product evidence, then run the
+  deterministic disruption timing and competitive-performance gates.
+
 ## 2026-07-31T21:01:02+08:00: offline new-flow admission and restart recovery accepted
 
 - Name: authenticated-carrier Product availability

@@ -391,6 +391,9 @@ fn client_status_exposes_named_inventory_without_credentials() {
     assert!(!status.local_inbounds[1].auth_required);
     assert_eq!(status.services.outbounds, 1);
     assert_eq!(status.services.local_outbounds, 1);
+    assert_eq!(status.sessions.len(), 1);
+    assert_eq!(status.sessions[0].state, "connecting");
+    assert_eq!(status.sessions[0].carrier_count, 0);
     assert_eq!(status.summary.configured_path_count, 1);
     assert_eq!(status.summary.path_count, 1);
     assert_eq!(status.paths.len(), 1);
@@ -429,6 +432,7 @@ fn status_separates_sessions_flows_and_exclusive_path_states() {
     )
     .expect("context");
     context.health().lock().expect("health").tcp[0].manual_disabled = true;
+    let authenticated_carrier = context.authenticated_carriers.register();
     let _peer_carrier = context.peer_status.register(context.session_id);
     let product_telemetry = RuntimeTelemetry::generation_owner(4);
     let product_flow = crate::product::FlowContext::new(
@@ -471,6 +475,8 @@ fn status_separates_sessions_flows_and_exclusive_path_states() {
     assert_eq!(status.paths[0].state, "disabled");
     assert_eq!(status.paths[0].path, "primary");
     assert_eq!(status.sessions.len(), 1);
+    assert_eq!(status.sessions[0].state, "connected");
+    assert_eq!(status.sessions[0].carrier_count, 1);
     assert_eq!(status.sessions[0].active_reliable_flows, 1);
     assert_eq!(status.summary.active_flows, 1);
     assert_eq!(status.flows.len(), 1);
@@ -486,6 +492,14 @@ fn status_separates_sessions_flows_and_exclusive_path_states() {
     assert_eq!(status.diagnostics.peer_sessions.len(), 1);
     assert_eq!(status.diagnostics.peer_sessions[0].service, "mpp_outbound");
     assert_eq!(status.diagnostics.peer_sessions[0].service_index, 0);
+
+    drop(authenticated_carrier);
+    target.refresh_sample_snapshot();
+    let offline = target.snapshot();
+    assert_eq!(offline.sessions[0].state, "offline");
+    assert_eq!(offline.sessions[0].carrier_count, 0);
+    assert_eq!(offline.sessions[0].active_reliable_flows, 1);
+    assert_eq!(offline.diagnostics.peer_sessions[0].carrier_count, 1);
 }
 
 #[test]

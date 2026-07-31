@@ -323,8 +323,9 @@ All data and controls are authenticated under `/api/v2/`:
   terminal generation failure and serving readiness respectively.
 - `GET /api/v2/status` returns the complete cached
   `mptunnel.management.v5` snapshot, including sanitized named inbound and
-  outbound inventory. Connector and carrier endpoints and credentials are
-  absent.
+  outbound inventory. Credentials and native proxy connector endpoints are
+  absent; configured MPP carrier endpoints are present in the authenticated
+  local path inventory.
 - `GET /api/v2/paths` returns configured named paths and live carrier
   instances with their lifecycle state.
 - `GET /api/v2/traffic` returns monotonic Product totals, one-second rates,

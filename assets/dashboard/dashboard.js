@@ -359,8 +359,9 @@
   function safeStateClass(value) {
     const stateName = String(value || "unknown").toLowerCase();
     const allowed = [
-      "active", "listening", "available", "suspect", "draining",
-      "backup", "failed", "disabled", "unavailable"
+      "active", "connected", "listening", "available", "connecting",
+      "suspect", "draining", "backup", "offline", "failed", "disabled",
+      "unavailable"
     ];
     return allowed.includes(stateName) ? stateName : "unknown";
   }

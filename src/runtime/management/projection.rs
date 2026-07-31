@@ -19,7 +19,9 @@ use super::snapshot::{SessionInventory, TelemetryAggregate, unix_millis};
 use crate::product::Network;
 use crate::protocol::{PeerPathState, TargetAddr, UnderlayProtocol};
 use crate::runtime::path::model::path_snapshot;
-use crate::runtime::path::{ClientPathContext, ClientPathHealthRecord, ServerPathContext};
+use crate::runtime::path::{
+    AuthenticatedCarrierAvailability, ClientPathContext, ClientPathHealthRecord, ServerPathContext,
+};
 use crate::runtime::peer_status::{PeerStatusBroker, PeerStatusResult};
 use crate::runtime::telemetry::{ActiveProductFlowSnapshot, ProductFlowId, ProductFlowOriginKind};
 use crate::scheduler::{PathSnapshot, PathState as SchedulerPathState};
@@ -474,18 +476,19 @@ fn collect_client(
         .as_ref()
         .map(|outbound| outbound.as_str().to_string());
     let session_id = context.session_id.0.to_string();
-    let carrier_count = context.peer_status.carrier_count(context.session_id);
+    let authenticated_carriers = context.authenticated_carriers.snapshot();
+    let state = match authenticated_carriers.availability() {
+        AuthenticatedCarrierAvailability::AwaitingFirstCarrier => "connecting",
+        AuthenticatedCarrierAvailability::Available => "connected",
+        AuthenticatedCarrierAvailability::Offline => "offline",
+    };
     sessions.insert(
         "mpp_outbound",
         service_index,
         service_name.clone(),
         session_id,
-        if carrier_count > 0 {
-            "connected"
-        } else {
-            "idle"
-        },
-        carrier_count,
+        state,
+        authenticated_carriers.live_count,
         None,
     );
     summary.configured_path_count = summary.configured_path_count.saturating_add(

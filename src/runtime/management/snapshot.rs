@@ -226,9 +226,6 @@ impl SessionInventory {
                 }
                 _ => {}
             }
-            if session.state != "connected" {
-                session.state = "active";
-            }
         }
         self.sessions.into_values().collect()
     }

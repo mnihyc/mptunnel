@@ -367,9 +367,9 @@ The canonical store implements:
 - rollback when a candidate generation fails before readiness; and
 - interrupted-activation recovery on the next start.
 
-Only an inbound credential-authority-only change activates in place. Routing,
-DNS, listeners, outbounds, resources, TLS, client credentials, and mixed
-changes persist and request a clean generation replacement. Management
+Logging-only and inbound credential-authority-only changes activate in place.
+Routing, DNS, listeners, outbounds, resources, TLS, client credentials, and
+mixed changes persist and request a clean generation replacement. Management
 listener/authentication changes are rejected by the API and require a local
 edit plus restart.
 
@@ -425,6 +425,9 @@ identity. Balancer actions are exactly `enable-member`, `drain-member`,
 Observability includes:
 
 - readiness/liveness/degraded reasons;
+- exact `connecting`, `connected`, or `offline` MPP outbound availability from
+  authenticated carrier lifetimes, independently of optional peer diagnostics
+  and established-flow counts;
 - Product balancer state;
 - local and peer path state;
 - logical sessions and bounded active-flow detail;

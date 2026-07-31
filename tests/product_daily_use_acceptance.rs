@@ -20,8 +20,8 @@ use std::time::{Duration, Instant};
 use support::{
     MptunnelProcess, SocksTarget, TestDirectory, check_config, http_request, join_thread,
     network_test_guard, socks5_connect, socks5_round_trip, spawn_blackhole_proxy,
-    spawn_echo_socks5_proxy, spawn_tcp_echo, unused_loopback_addr, wait_for_ready_management,
-    wait_for_tcp, wait_for_tcp_closed,
+    spawn_echo_socks5_proxy, spawn_tcp_echo, spawn_tcp_echo_connections, unused_loopback_addr,
+    wait_for_ready_management, wait_for_tcp, wait_for_tcp_closed,
 };
 
 const OPERATOR_TOKEN: &str = "daily-use-operator-token";
@@ -784,6 +784,191 @@ action = "outbound"
 outbound = "direct-default"
 "#
     )
+}
+
+fn wait_for_mpp_outbound_carriers(
+    process: &mut MptunnelProcess,
+    management: SocketAddr,
+    expected: usize,
+    context: &str,
+) {
+    let deadline = Instant::now() + PROCESS_START_TIMEOUT;
+    loop {
+        process.assert_running(context);
+        if let Ok(response) = http_request(
+            management,
+            "GET",
+            "/api/v2/sessions",
+            Some(OPERATOR_TOKEN),
+            &[],
+            &[],
+        ) && response.status == 200
+        {
+            let sessions = response.json();
+            let count = sessions["sessions"]
+                .as_array()
+                .and_then(|sessions| {
+                    sessions.iter().find(|session| {
+                        session["service"] == "mpp_outbound"
+                            && session["service_name"] == "edge-mpp"
+                    })
+                })
+                .and_then(|session| session["carrier_count"].as_u64())
+                .and_then(|count| usize::try_from(count).ok());
+            if count == Some(expected) {
+                return;
+            }
+        }
+        assert!(
+            Instant::now() < deadline,
+            "timed out waiting for {context}; client stderr:\n{}",
+            process.log()
+        );
+        thread::sleep(Duration::from_millis(25));
+    }
+}
+
+#[test]
+fn packaged_mpp_outage_rejects_new_flows_and_client_server_restarts_recover() {
+    let _network = network_test_guard();
+    let directory = TestDirectory::new("mpp-restart");
+    let mpp = unused_loopback_addr();
+    let socks = unused_loopback_addr();
+    let management = unused_loopback_addr();
+    let failed_proxy = unused_loopback_addr();
+    let unused_proxy = unused_loopback_addr();
+    let (direct_target, direct_task) = spawn_tcp_echo_connections(3);
+    let (certificate, private_key) = write_test_tls_material(&directory);
+    directory.write("mpp-credential.key", "0123456789abcdef0123456789abcdef");
+    directory.write("operator-token.key", OPERATOR_TOKEN);
+    let server_path = directory.write(
+        "restart-server.toml",
+        &mpp_server_config(mpp, direct_target, &certificate, &private_key),
+    );
+    let client_path = directory.write(
+        "restart-client.toml",
+        &routing_client_config(
+            socks,
+            management,
+            mpp,
+            failed_proxy,
+            unused_proxy,
+            &certificate,
+        ),
+    );
+    assert_check_config_ok(&server_path);
+    assert_check_config_ok(&client_path);
+
+    let mut server = MptunnelProcess::spawn(
+        &server_path,
+        directory.path().join("restart-server-1.stderr"),
+    );
+    wait_for_tcp(
+        &mut server,
+        mpp,
+        PROCESS_START_TIMEOUT,
+        "initial MPP server listener",
+    );
+    let mut client = MptunnelProcess::spawn(
+        &client_path,
+        directory.path().join("restart-client-1.stderr"),
+    );
+    wait_for_tcp(
+        &mut client,
+        socks,
+        PROCESS_START_TIMEOUT,
+        "initial client SOCKS5 listener",
+    );
+    wait_for_ready_management(
+        &mut client,
+        management,
+        OPERATOR_TOKEN,
+        PROCESS_START_TIMEOUT,
+    );
+    wait_for_mpp_outbound_carriers(&mut client, management, 1, "initial authenticated carrier");
+    socks5_round_trip(
+        socks,
+        SocksTarget::Domain("localhost", direct_target.port()),
+        b"ping",
+        b"pong",
+    )
+    .expect("initial MPP Product flow");
+
+    server.stop();
+    wait_for_mpp_outbound_carriers(
+        &mut client,
+        management,
+        0,
+        "authenticated carrier withdrawal after server stop",
+    );
+    let (_stream, unavailable) = socks5_connect(
+        socks,
+        SocksTarget::Domain("localhost", direct_target.port()),
+    )
+    .expect("offline SOCKS5 response");
+    assert_eq!(
+        unavailable, 0x03,
+        "an offline MPP outbound must report network unreachable"
+    );
+
+    server = MptunnelProcess::spawn(
+        &server_path,
+        directory.path().join("restart-server-2.stderr"),
+    );
+    wait_for_tcp(
+        &mut server,
+        mpp,
+        PROCESS_START_TIMEOUT,
+        "restarted MPP server listener",
+    );
+    wait_for_mpp_outbound_carriers(
+        &mut client,
+        management,
+        1,
+        "authenticated carrier after server restart",
+    );
+    socks5_round_trip(
+        socks,
+        SocksTarget::Domain("localhost", direct_target.port()),
+        b"ping",
+        b"pong",
+    )
+    .expect("Product flow after server restart");
+
+    client.stop();
+    client = MptunnelProcess::spawn(
+        &client_path,
+        directory.path().join("restart-client-2.stderr"),
+    );
+    wait_for_tcp(
+        &mut client,
+        socks,
+        PROCESS_START_TIMEOUT,
+        "restarted client SOCKS5 listener",
+    );
+    wait_for_ready_management(
+        &mut client,
+        management,
+        OPERATOR_TOKEN,
+        PROCESS_START_TIMEOUT,
+    );
+    wait_for_mpp_outbound_carriers(
+        &mut client,
+        management,
+        1,
+        "authenticated carrier after client restart",
+    );
+    socks5_round_trip(
+        socks,
+        SocksTarget::Domain("localhost", direct_target.port()),
+        b"ping",
+        b"pong",
+    )
+    .expect("Product flow after client restart");
+
+    client.assert_running("completed client restart acceptance");
+    server.assert_running("completed server restart acceptance");
+    join_thread(direct_task, "restart echo target");
 }
 
 #[test]

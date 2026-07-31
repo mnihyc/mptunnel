@@ -310,6 +310,27 @@ MPP identity and admission implement:
 - atomic live publication when an API candidate changes only inbound
   credential authorities.
 
+Each configured MPP outbound also owns one generation-local authenticated
+carrier inventory. Its new-flow availability has exactly three states:
+
+- before the first authenticated carrier, initial establishment remains
+  permitted under the existing connection and Product admission bounds;
+- while one or more exact TCP or QUIC connection registrations are live, new
+  flows may select the outbound; and
+- after the last registration disappears, the outbound is offline and rejects
+  new flows until background carrier reconciliation authenticates a
+  replacement.
+
+This inventory is published by neutral TCP/QUIC connection lifetime guards,
+not by source addresses, timers, diagnostics, routing, or payload observations.
+It is recreated on configuration-generation replacement. Existing flows never
+recheck it and retain the RFC session-retention behavior. Balancers skip an
+offline MPP member before opening a flow but continue to consider initial MPP
+and native members; skipped members do not receive failure feedback. SOCKS5
+CONNECT reports `network unreachable`, HTTP CONNECT reports `503`, new raw TCP
+flows close, and UDP datagrams are silently discarded without permanently
+caching the outage as a routing denial.
+
 Carrier presentation is implemented as:
 
 - TCP: TLS 1.3 only, no ALPN, no 0-RTT, then an encrypted fixed-size

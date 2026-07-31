@@ -6,7 +6,8 @@ use crate::product::{InboundId, PrincipalId};
 use crate::protocol::TargetAddr;
 use crate::runtime::datagram::{
     UdpEdgeCompletion, UdpEdgeLane, UdpEdgeRequest, close_udp_edge_lanes,
-    dispatch_udp_edge_request, finish_udp_edge_completion, udp_edge_completion_queue,
+    dispatch_udp_edge_request, finish_udp_edge_completion, remove_udp_edge_lane,
+    udp_edge_completion_queue,
 };
 use crate::runtime::error::RuntimeError;
 use crate::runtime::ingress_runtime::{DEFAULT_SOCKS5_UDP_TTL_MS, hold_silent_route_drop};
@@ -199,6 +200,7 @@ where
             hold_silent_route_drop(&mut stream).await;
             return Ok(());
         }
+        Err(RuntimeError::OutboundUnavailable(_)) => return Ok(()),
         Err(error) => return Err(error),
     };
     relay_opened_tcp(stream, opened).await?;
@@ -586,7 +588,18 @@ async fn handle_tun_udp_flow(
                             .await
                             .map_err(|_| RuntimeError::Protocol("TUN UDP response channel closed"))?;
                     }
-                    UdpEdgeCompletion::Sent { metadata, result: Err(err), .. } => {
+                    UdpEdgeCompletion::Sent {
+                        metadata,
+                        result: Err(RuntimeError::OutboundUnavailable(_)),
+                        ..
+                    } => {
+                        remove_udp_edge_lane(&mut lanes, &metadata);
+                    }
+                    UdpEdgeCompletion::Sent {
+                        metadata,
+                        result: Err(err),
+                        ..
+                    } => {
                         crate::observability::process_event!(
                             Warn,
                             "tun",

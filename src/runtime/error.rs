@@ -47,6 +47,7 @@ pub enum RuntimeError {
     ProductPolicy(String),
     GatewayStatePoisoned,
     GatewayUnavailable(String),
+    OutboundUnavailable(crate::product::OutboundId),
     DestinationDenied(String),
     RouteRejected,
     RouteDropped,
@@ -221,6 +222,13 @@ impl std::fmt::Display for RuntimeError {
             Self::ProductPolicy(error) => write!(f, "product policy error: {error}"),
             Self::GatewayStatePoisoned => write!(f, "product balancer state lock is poisoned"),
             Self::GatewayUnavailable(error) => write!(f, "product balancer unavailable: {error}"),
+            Self::OutboundUnavailable(outbound) => {
+                write!(
+                    f,
+                    "outbound {} has no authenticated carrier",
+                    outbound.as_str()
+                )
+            }
             Self::DestinationDenied(error) => write!(f, "destination denied: {error}"),
             Self::RouteRejected => write!(f, "destination rejected by routing policy"),
             Self::RouteDropped => write!(f, "destination silently dropped by routing policy"),
@@ -275,6 +283,7 @@ impl std::error::Error for RuntimeError {
             | Self::ProductPolicy(_)
             | Self::GatewayStatePoisoned
             | Self::GatewayUnavailable(_)
+            | Self::OutboundUnavailable(_)
             | Self::DestinationDenied(_)
             | Self::RouteRejected
             | Self::RouteDropped

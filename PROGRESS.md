@@ -11,6 +11,59 @@ Historical entries below are retained as evidence of the decisions made at
 their recorded time. When a later entry changes an earlier decision, the later
 entry is authoritative.
 
+## 2026-07-31T21:01:02+08:00: offline new-flow admission and restart recovery accepted
+
+- Name: authenticated-carrier Product availability
+- Category: Product admission, disruption recovery, and daily-use acceptance
+- State: accepted; the implementation is carrier-neutral, generation-owned,
+  and absent from established-flow and Core payload paths
+- Clean model:
+  - each MPP client outbound owns one exact inventory containing live
+    authenticated-carrier count and whether that generation has ever
+    authenticated a carrier;
+  - a non-cloneable RAII registration is published after authenticated
+    readiness and retained by the exact TCP or QUIC connection, independently
+    of diagnostic-control streams;
+  - before first authentication, bounded initial establishment remains
+    permitted; one or more registrations make the outbound available; loss of
+    the last registration makes it offline until ordinary background
+    reconciliation authenticates a replacement;
+  - a new configuration generation starts with a fresh inventory, while an
+    established Product flow never rechecks availability; and
+  - no source address, endpoint locator, timer, polling loop, transport metric,
+    path score, or payload observation enters the state transition.
+- Product behavior:
+  - direct MPP selection rejects a new flow before DNS/connect work while
+    offline;
+  - balancers skip offline MPP leaves without marking them failed, continue to
+    consider initial MPP and native leaves, and return typed outbound
+    unavailability only when no concrete attempt supersedes it;
+  - SOCKS5 CONNECT returns `network unreachable`, HTTP CONNECT returns `503`,
+    new TCP-forward/TUN TCP sockets close, and UDP is silently discarded;
+  - an offline UDP lane is not retained as a policy denial, so a later
+    datagram can use a newly authenticated carrier; and
+  - captured local TUN DNS remains ahead of Product routing and is unchanged.
+- Verification:
+  - the packaged acceptance scenario proves initial use, server kill,
+    authenticated-carrier withdrawal, `0x03` rejection for a new flow, server
+    restart and renewed use, then client kill/restart and renewed use;
+  - direct initial/offline and mixed/all-offline balancer tests pass, TCP/QUIC
+    actor tests prove exact connection publication, and SOCKS5/HTTP protocol
+    mappings pass;
+  - `cargo test --all-targets --all-features --quiet` passes 1,427 library
+    tests, two allocation tests, and five daily-use acceptance tests;
+  - `cargo clippy --all-targets --all-features -- -D warnings`,
+    `cargo build --release --locked --bin mptunnel`, formatting, and whitespace
+    checks pass; and
+  - the release binary is
+    `4cdd01e846bdc4599684b75137886869146cd4e7d36847faf9ba2d9c1ee77b94`.
+- Performance boundary: the only recurring operation is one mutex snapshot per
+  new concrete MPP flow selection; registration changes occur only on carrier
+  authentication/teardown. No per-byte/per-packet work or Core value changed.
+- Next: audit and close only remaining proven daily-use Product gaps, then
+  restore a deterministic whole-link quality-swap lab with separate delivery
+  interruption and post-transition steady-performance timing.
+
 ## 2026-07-31T20:41:18+08:00: exact-attachment feedback and recovery accepted
 
 - Name: retained stream feedback, exact recovery, and transition timing

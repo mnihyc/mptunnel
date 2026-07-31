@@ -447,6 +447,7 @@ where
             hold_silent_route_drop(&mut stream).await;
             return Ok(());
         }
+        Err(RuntimeError::OutboundUnavailable(_)) => return Ok(()),
         Err(error) => return Err(error),
     };
     relay_opened_tcp(stream, opened).await
@@ -641,6 +642,13 @@ pub(super) async fn run_udp_forward_client_socket(
                     }
                     UdpEdgeCompletion::Sent {
                         metadata,
+                        result: Err(RuntimeError::OutboundUnavailable(_)),
+                        ..
+                    } => {
+                        remove_udp_edge_lane(&mut lanes, &metadata);
+                    }
+                    UdpEdgeCompletion::Sent {
+                        metadata,
                         result: Err(error),
                         ..
                     } => {
@@ -803,6 +811,15 @@ where
                     )
                     .await;
                 }
+                Err(err @ RuntimeError::OutboundUnavailable(_)) => {
+                    stream
+                        .write_all(&socks5::connect_reply(
+                            Socks5Reply::NetworkUnreachable,
+                            SocketAddr::from(([0, 0, 0, 0], 0)),
+                        ))
+                        .await?;
+                    return Err(err);
+                }
                 Err(err) => {
                     stream
                         .write_all(&socks5::connect_reply(
@@ -921,6 +938,12 @@ where
         }
         Err(RuntimeError::RouteDropped) => {
             return apply_http_policy_disposition(&mut stream, ClientPolicyDisposition::Drop).await;
+        }
+        Err(err @ RuntimeError::OutboundUnavailable(_)) => {
+            stream
+                .write_all(http_connect::error_response(HttpStatus::ServiceUnavailable))
+                .await?;
+            return Err(err);
         }
         Err(err) => {
             stream
@@ -1309,7 +1332,18 @@ where
                             break Err(RuntimeError::Io(err));
                         }
                     }
-                    UdpEdgeCompletion::Sent { target, result: Err(err), .. } => {
+                    UdpEdgeCompletion::Sent {
+                        metadata,
+                        result: Err(RuntimeError::OutboundUnavailable(_)),
+                        ..
+                    } => {
+                        remove_udp_edge_lane(&mut lanes, &metadata);
+                    }
+                    UdpEdgeCompletion::Sent {
+                        target,
+                        result: Err(err),
+                        ..
+                    } => {
                         crate::observability::process_event!(
                             Warn,
                             "socks5_udp",

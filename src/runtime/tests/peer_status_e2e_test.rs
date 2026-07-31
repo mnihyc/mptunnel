@@ -82,6 +82,7 @@ async fn authenticated_peer_status_round_trips_through_tcp_carrier_actors() {
         server_context.peer_status.carrier_count(context.session_id),
         1
     );
+    assert_eq!(context.authenticated_carriers.snapshot().live_count, 1);
 
     request_and_assert_server_path(&context, UnderlayProtocol::Tcp).await;
 
@@ -122,6 +123,7 @@ async fn authenticated_peer_status_round_trips_through_quic_carrier_actors() {
         server_context.peer_status.carrier_count(context.session_id),
         1
     );
+    assert_eq!(context.authenticated_carriers.snapshot().live_count, 1);
 
     request_and_assert_server_path(&context, UnderlayProtocol::Udp).await;
 

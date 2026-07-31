@@ -3,6 +3,7 @@
 //! Capacity reservations stay beside health publication and lease rollback so
 //! no sender or carrier can observe half of a request-probe transaction.
 
+use super::carrier_inventory::AuthenticatedCarrierInventory;
 use super::commands::reliable_stream_frame_queue;
 use super::health::{ClientPathHealth, ClientPathHealthRecord};
 use super::model::{ClientPathObservation, path_metrics_from_snapshot, path_snapshot};
@@ -79,6 +80,7 @@ pub struct ClientPathContext {
     pub(in crate::runtime) session_id: SessionId,
     pub(in crate::runtime) telemetry: RuntimeTelemetry,
     pub(in crate::runtime) peer_status: PeerStatusBroker,
+    pub(in crate::runtime) authenticated_carriers: AuthenticatedCarrierInventory,
     pub(in crate::runtime) mux_limits: MuxLimits,
     /// RFC 8684 break-before-make lifetime for established logical streams.
     pub(in crate::runtime) session_retention_timeout: std::time::Duration,
@@ -307,6 +309,7 @@ impl ClientPathContext {
         let session_send_buffer = SessionSendBuffer::from_limits(mux_limits);
         let session_id = random_session_id()?;
         let peer_status = PeerStatusBroker::new(allow_peer_diagnostics);
+        let authenticated_carriers = AuthenticatedCarrierInventory::default();
         let peer_status_snapshot = PeerStatusSnapshotSource::new({
             let tcp_paths = tcp_paths.clone();
             let udp_paths = udp_paths.clone();
@@ -344,6 +347,7 @@ impl ClientPathContext {
                     carrier_network: carrier_network.clone(),
                     peer_status: peer_status.clone(),
                     peer_status_snapshot: peer_status_snapshot.clone(),
+                    authenticated_carriers: authenticated_carriers.clone(),
                     endpoint_policy,
                     carrier_groups: tcp_carrier_groups.clone(),
                 })
@@ -373,6 +377,7 @@ impl ClientPathContext {
                     carrier_network: carrier_network.clone(),
                     peer_status: peer_status.clone(),
                     peer_status_snapshot: peer_status_snapshot.clone(),
+                    authenticated_carriers: authenticated_carriers.clone(),
                 })
             })
             .collect::<Vec<_>>();
@@ -397,6 +402,7 @@ impl ClientPathContext {
             session_id,
             telemetry,
             peer_status,
+            authenticated_carriers,
             mux_limits,
             session_retention_timeout,
             session_send_buffer,

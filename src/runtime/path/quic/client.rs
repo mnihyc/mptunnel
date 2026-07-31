@@ -216,6 +216,8 @@ pub(in crate::runtime) struct ClientUdpPathSessionRuntime {
     pub(in crate::runtime) carrier_network: Arc<dyn CarrierNetworkProvider>,
     pub(in crate::runtime) peer_status: PeerStatusBroker,
     pub(in crate::runtime) peer_status_snapshot: PeerStatusSnapshotSource,
+    pub(in crate::runtime) authenticated_carriers:
+        crate::runtime::path::AuthenticatedCarrierInventory,
 }
 
 impl ClientUdpPathSessionRuntime {
@@ -247,6 +249,7 @@ struct ClientUdpCarrierInstance {
 struct ClientUdpPathConnection {
     _endpoint: UdpPathEndpoint,
     carrier: ClientUdpCarrierInstance,
+    _authenticated_carrier: crate::runtime::path::AuthenticatedCarrierRegistration,
     metrics_task: Option<tokio::task::JoinHandle<()>>,
     control_task: Option<tokio::task::JoinHandle<()>>,
     port_migration_task: Option<tokio::task::JoinHandle<()>>,
@@ -489,6 +492,7 @@ async fn connect_client_udp_path(
                 connection,
                 path_instance_id,
             },
+            _authenticated_carrier: runtime.authenticated_carriers.register(),
             metrics_task: Some(metrics_task),
             control_task: Some(control_task),
             port_migration_task,

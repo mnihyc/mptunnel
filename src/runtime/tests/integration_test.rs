@@ -2000,6 +2000,73 @@ async fn socks5_ingress_retries_next_tcp_path_after_connect_failure() {
 }
 
 #[tokio::test]
+async fn socks5_ingress_reports_network_unreachable_while_mpp_outbound_is_offline() {
+    let context = ClientPathContext::new(
+        vec![reserve_tcp_path().await],
+        security(),
+        ResourceLimits::default(),
+    )
+    .expect("context");
+    drop(context.authenticated_carriers.register());
+    let (mut client, server) = duplex(1_024);
+    let handler = tokio::spawn(handle_socks5_client_stream(server, context));
+
+    client
+        .write_all(&[0x05, 0x01, 0x00])
+        .await
+        .expect("auth request");
+    let mut auth_response = [0_u8; 2];
+    client
+        .read_exact(&mut auth_response)
+        .await
+        .expect("auth response");
+    assert_eq!(auth_response, [0x05, 0x00]);
+    client
+        .write_all(&[0x05, 0x01, 0x00, 0x01, 192, 0, 2, 1, 0x01, 0xbb])
+        .await
+        .expect("CONNECT request");
+    let mut response = [0_u8; 10];
+    client
+        .read_exact(&mut response)
+        .await
+        .expect("CONNECT reply");
+    assert_eq!(response[1], Socks5Reply::NetworkUnreachable as u8);
+    assert!(matches!(
+        handler.await.expect("handler join"),
+        Err(RuntimeError::OutboundUnavailable(_))
+    ));
+}
+
+#[tokio::test]
+async fn http_connect_ingress_reports_service_unavailable_while_mpp_outbound_is_offline() {
+    let context = ClientPathContext::new(
+        vec![reserve_tcp_path().await],
+        security(),
+        ResourceLimits::default(),
+    )
+    .expect("context");
+    drop(context.authenticated_carriers.register());
+    let (mut client, server) = duplex(1_024);
+    let handler = tokio::spawn(handle_http_connect_client_stream(server, context));
+
+    client
+        .write_all(b"CONNECT 192.0.2.1:443 HTTP/1.1\r\nHost: 192.0.2.1:443\r\n\r\n")
+        .await
+        .expect("CONNECT request");
+    let expected = http_connect::error_response(HttpStatus::ServiceUnavailable);
+    let mut response = vec![0_u8; expected.len()];
+    client
+        .read_exact(&mut response)
+        .await
+        .expect("CONNECT reply");
+    assert_eq!(response, expected);
+    assert!(matches!(
+        handler.await.expect("handler join"),
+        Err(RuntimeError::OutboundUnavailable(_))
+    ));
+}
+
+#[tokio::test]
 async fn http_connect_ingress_relays_tcp_payload_over_encrypted_internal_stream() {
     let (target_addr, target) = spawn_echo_target().await;
     let (path, server_path) = spawn_server_path(OutboundConfig::Direct).await;

@@ -183,6 +183,7 @@ impl ServerUdpTerminalWriterFixture {
             carrier_network: Arc::new(SystemCarrierNetworkProvider),
             peer_status: PeerStatusBroker::new(false),
             peer_status_snapshot: PeerStatusSnapshotSource::new(Vec::new),
+            authenticated_carriers: crate::runtime::path::AuthenticatedCarrierInventory::default(),
         };
         let client_carrier = CarrierSocket::system(CarrierSocketRequest {
             path: &client_path,

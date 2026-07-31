@@ -464,20 +464,26 @@ pub fn spawn_echo_socks5_proxy(
 }
 
 pub fn spawn_tcp_echo() -> (SocketAddr, thread::JoinHandle<()>) {
+    spawn_tcp_echo_connections(1)
+}
+
+pub fn spawn_tcp_echo_connections(connection_count: usize) -> (SocketAddr, thread::JoinHandle<()>) {
     let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).expect("bind echo target");
     let address = listener.local_addr().expect("echo target address");
     let task = thread::spawn(move || {
-        let (mut stream, _) = listener.accept().expect("accept echo connection");
-        stream
-            .set_read_timeout(Some(IO_TIMEOUT))
-            .expect("set echo read timeout");
-        stream
-            .set_write_timeout(Some(IO_TIMEOUT))
-            .expect("set echo write timeout");
-        let mut request = [0_u8; 4];
-        stream.read_exact(&mut request).expect("echo request");
-        assert_eq!(&request, b"ping");
-        stream.write_all(b"pong").expect("echo response");
+        for _ in 0..connection_count {
+            let (mut stream, _) = listener.accept().expect("accept echo connection");
+            stream
+                .set_read_timeout(Some(IO_TIMEOUT))
+                .expect("set echo read timeout");
+            stream
+                .set_write_timeout(Some(IO_TIMEOUT))
+                .expect("set echo write timeout");
+            let mut request = [0_u8; 4];
+            stream.read_exact(&mut request).expect("echo request");
+            assert_eq!(&request, b"ping");
+            stream.write_all(b"pong").expect("echo response");
+        }
     });
     (address, task)
 }

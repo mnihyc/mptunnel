@@ -23,6 +23,7 @@ use crate::product::{
 use crate::protocol::TargetAddr;
 use crate::runtime::error::RuntimeError;
 use crate::runtime::gateway::{ClientGatewayRuntime, GatewayFlowLease, GatewayRuntimeSnapshot};
+use crate::runtime::path::AuthenticatedCarrierAvailability;
 use crate::runtime::path::ClientPathContext;
 use crate::runtime::relay::open::{ReliableRelayOpenSpec, open_remote_stream};
 use crate::runtime::stream::OpenedRemoteStream;
@@ -199,6 +200,18 @@ impl RuntimeOutboundLeaf {
             Self::Local {
                 connect_timeout, ..
             } => *connect_timeout,
+        }
+    }
+
+    fn ensure_new_product_flow_available(&self) -> Result<(), RuntimeError> {
+        match self {
+            Self::Mpp { id, context, .. }
+                if context.authenticated_carriers.snapshot().availability()
+                    == AuthenticatedCarrierAvailability::Offline =>
+            {
+                Err(RuntimeError::OutboundUnavailable(id.clone()))
+            }
+            Self::Mpp { .. } | Self::Local { .. } => Ok(()),
         }
     }
 }
@@ -654,6 +667,7 @@ impl RuntimeOutboundRegistry {
         match selection {
             EgressSelection::Outbound(id) => {
                 let leaf = self.shell.require_leaf(id, Network::Tcp)?;
+                leaf.ensure_new_product_flow_available()?;
                 if leaf.requires_ip_target() {
                     self.resolve_destination(&mut destination, dns_plan, authorizer)
                         .await?;
@@ -697,6 +711,13 @@ impl RuntimeOutboundRegistry {
                     let leaf = self
                         .shell
                         .require_leaf(runtime.member_id(handle)?, Network::Tcp)?;
+                    if let Err(error) = leaf.ensure_new_product_flow_available() {
+                        excluded.push(handle);
+                        if last_error.is_none() {
+                            last_error = Some(error);
+                        }
+                        continue;
+                    }
                     if leaf.requires_ip_target() {
                         if resolution_unavailable {
                             excluded.push(handle);
@@ -784,6 +805,7 @@ impl RuntimeOutboundRegistry {
         match selection {
             EgressSelection::Outbound(id) => {
                 let leaf = self.shell.require_leaf(id, Network::Udp)?;
+                leaf.ensure_new_product_flow_available()?;
                 if leaf.requires_ip_target() {
                     self.resolve_destination(&mut destination, dns_plan, authorizer)
                         .await?;
@@ -827,6 +849,13 @@ impl RuntimeOutboundRegistry {
                     let leaf = self
                         .shell
                         .require_leaf(runtime.member_id(handle)?, Network::Udp)?;
+                    if let Err(error) = leaf.ensure_new_product_flow_available() {
+                        excluded.push(handle);
+                        if last_error.is_none() {
+                            last_error = Some(error);
+                        }
+                        continue;
+                    }
                     if leaf.requires_ip_target() {
                         if resolution_unavailable {
                             excluded.push(handle);
@@ -1738,6 +1767,26 @@ mod tests {
         local_leaf_with_timeout(id, config, Duration::from_millis(250))
     }
 
+    fn mpp_context(port: u16) -> ClientPathContext {
+        ClientPathContext::new(
+            vec![format!("udp://127.0.0.1:{port}").parse().expect("MPP path")],
+            ClientSecurityConfig::for_test(
+                SharedSecret::new(b"0123456789abcdef0123456789abcdef".to_vec())
+                    .expect("test secret"),
+            ),
+            ResourceLimits::default(),
+        )
+        .expect("MPP context")
+    }
+
+    fn mpp_leaf(id: &str, context: ClientPathContext) -> RuntimeOutboundLeaf {
+        RuntimeOutboundLeaf::Mpp {
+            id: OutboundId::parse(id).expect("outbound ID"),
+            context,
+            performance: MppPerformanceConfig::default(),
+        }
+    }
+
     fn selection(registry: &RuntimeOutboundRegistry, id: &str) -> EgressSelection {
         registry
             .selection_for_egress(&EgressRef::Outbound(
@@ -1768,6 +1817,142 @@ mod tests {
             max_dns_work: 1,
         })
         .expect("one-flow Product admission")
+    }
+
+    #[tokio::test]
+    async fn new_flow_admission_distinguishes_initial_establishment_from_outage() {
+        let target = TargetAddr::Ip("192.0.2.1:443".parse().expect("target"));
+        let policy = crate::outbound::ServerDestinationPolicy::allow_restricted_for_test()
+            .test_principal_policy();
+
+        let initial = mpp_context(7443);
+        let initial_registry = RuntimeOutboundRegistry::compile(
+            [mpp_leaf("initial", initial)],
+            &[],
+            test_dns_generation(),
+        )
+        .expect("initial registry");
+        let initial_selection = selection(&initial_registry, "initial");
+        assert!(matches!(
+            initial_registry
+                .open_udp(&initial_selection, &target, None, &policy)
+                .await,
+            Ok(OpenedUdpOutbound::Mpp { .. })
+        ));
+
+        let offline = mpp_context(8443);
+        let authenticated = offline.authenticated_carriers.register();
+        assert_eq!(
+            offline.authenticated_carriers.snapshot().availability(),
+            AuthenticatedCarrierAvailability::Available
+        );
+        drop(authenticated);
+        assert_eq!(
+            offline.authenticated_carriers.snapshot().availability(),
+            AuthenticatedCarrierAvailability::Offline
+        );
+        let offline_registry = RuntimeOutboundRegistry::compile(
+            [mpp_leaf("offline", offline)],
+            &[],
+            test_dns_generation(),
+        )
+        .expect("offline registry");
+        let offline_selection = selection(&offline_registry, "offline");
+        assert!(matches!(
+            offline_registry
+                .open_udp(&offline_selection, &target, None, &policy)
+                .await,
+            Err(RuntimeError::OutboundUnavailable(id)) if id.as_str() == "offline"
+        ));
+    }
+
+    #[tokio::test]
+    async fn balancer_skips_offline_mpp_without_masking_native_availability() {
+        let offline = mpp_context(7443);
+        drop(offline.authenticated_carriers.register());
+        let offline_id = OutboundId::parse("offline-edge").expect("outbound ID");
+        let direct_id = OutboundId::parse("direct-edge").expect("outbound ID");
+        let balancer_id = BalancerId::parse("daily-egress").expect("balancer ID");
+        let balancers = [GatewayBalancerConfig {
+            id: balancer_id.clone(),
+            generation: 1,
+            spec: GatewayBalancerSpec::new(
+                GatewayStrategy::OrderedFailover,
+                vec![
+                    GatewayMemberSpec::new(offline_id.clone(), 1, NetworkSet::TCP_UDP),
+                    GatewayMemberSpec::new(direct_id.clone(), 1, NetworkSet::TCP_UDP),
+                ],
+            ),
+        }];
+        let registry = RuntimeOutboundRegistry::compile(
+            [
+                mpp_leaf(offline_id.as_str(), offline),
+                local_leaf(direct_id.as_str(), OutboundConfig::Direct),
+            ],
+            &balancers,
+            test_dns_generation(),
+        )
+        .expect("mixed registry");
+        let target = UdpSocket::bind("127.0.0.1:0").await.expect("UDP target");
+        let target = TargetAddr::Ip(target.local_addr().expect("target address"));
+        let policy = crate::outbound::ServerDestinationPolicy::allow_restricted_for_test()
+            .test_principal_policy();
+        assert!(matches!(
+            registry
+                .open_udp(
+                    &EgressSelection::Balancer(balancer_id),
+                    &target,
+                    None,
+                    &policy,
+                )
+                .await,
+            Ok(OpenedUdpOutbound::Local { .. })
+        ));
+    }
+
+    #[tokio::test]
+    async fn all_offline_balancer_members_return_typed_unavailability() {
+        let first = mpp_context(7443);
+        let second = mpp_context(8443);
+        drop(first.authenticated_carriers.register());
+        drop(second.authenticated_carriers.register());
+        let first_id = OutboundId::parse("edge-a").expect("outbound ID");
+        let second_id = OutboundId::parse("edge-b").expect("outbound ID");
+        let balancer_id = BalancerId::parse("daily-egress").expect("balancer ID");
+        let balancers = [GatewayBalancerConfig {
+            id: balancer_id.clone(),
+            generation: 1,
+            spec: GatewayBalancerSpec::new(
+                GatewayStrategy::OrderedFailover,
+                vec![
+                    GatewayMemberSpec::new(first_id.clone(), 1, NetworkSet::TCP_UDP),
+                    GatewayMemberSpec::new(second_id.clone(), 1, NetworkSet::TCP_UDP),
+                ],
+            ),
+        }];
+        let registry = RuntimeOutboundRegistry::compile(
+            [
+                mpp_leaf(first_id.as_str(), first),
+                mpp_leaf(second_id.as_str(), second),
+            ],
+            &balancers,
+            test_dns_generation(),
+        )
+        .expect("offline registry");
+        let target = TargetAddr::Ip("192.0.2.1:443".parse().expect("target"));
+        let policy = crate::outbound::ServerDestinationPolicy::allow_restricted_for_test()
+            .test_principal_policy();
+        assert!(matches!(
+            registry
+                .open_udp(
+                    &EgressSelection::Balancer(balancer_id),
+                    &target,
+                    None,
+                    &policy,
+                )
+                .await,
+            Err(RuntimeError::OutboundUnavailable(_))
+        ));
     }
 
     #[tokio::test]

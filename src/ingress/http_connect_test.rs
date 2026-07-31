@@ -73,6 +73,10 @@ fn builds_responses() {
         error_response(HttpStatus::BadGateway),
         b"HTTP/1.1 502 Bad Gateway\r\nContent-Length: 0\r\n\r\n"
     );
+    assert_eq!(
+        error_response(HttpStatus::ServiceUnavailable),
+        b"HTTP/1.1 503 Service Unavailable\r\nContent-Length: 0\r\n\r\n"
+    );
     assert!(
         std::str::from_utf8(error_response(HttpStatus::ProxyAuthenticationRequired))
             .expect("response")

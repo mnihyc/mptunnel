@@ -1120,29 +1120,52 @@ async fn connect_client_tcp_path(
 
 fn publish_client_tcp_connection(
     runtime: &ClientTcpPathSessionRuntime,
-    state: &ClientTcpPathSessionState,
+    state: &mut ClientTcpPathSessionState,
     carrier_readiness: &mut ClientTcpCarrierReadiness,
     endpoint_generation: u64,
     readiness_rtt: Option<Duration>,
 ) -> bool {
-    let connection = state
-        .connection
-        .as_ref()
-        .expect("TCP readiness requires an actor-owned connection");
-    runtime
+    let (path_instance_id, peer_usage_sequence, peer_usage) = {
+        let connection = state
+            .connection
+            .as_ref()
+            .expect("TCP readiness requires an actor-owned connection");
+        (
+            connection.path_instance_id,
+            connection.carrier.peer_usage_sequence,
+            connection.carrier.peer_usage,
+        )
+    };
+    let mut authenticated_carrier = None;
+    let published = runtime
         .state
         .publish_tcp_peer_path_usage_for_endpoint_generation(
             &runtime.endpoint_policy,
             ClientTcpCarrierPublication {
                 path_index: runtime.path_index,
                 endpoint_generation,
-                path_instance_id: connection.path_instance_id,
-                peer_usage_sequence: connection.carrier.peer_usage_sequence,
-                peer_usage: connection.carrier.peer_usage,
+                path_instance_id,
+                peer_usage_sequence,
+                peer_usage,
                 readiness_rtt,
             },
-            || carrier_readiness.publish(connection.path_instance_id),
-        )
+            || {
+                authenticated_carrier = Some(runtime.authenticated_carriers.register());
+                carrier_readiness.publish(path_instance_id);
+            },
+        );
+    if published {
+        state
+            .connection
+            .as_mut()
+            .expect("published TCP readiness retains its connection")
+            .retain_authenticated_carrier(
+                authenticated_carrier
+                    .take()
+                    .expect("TCP readiness transaction publishes authenticated carrier"),
+            );
+    }
+    published
 }
 
 fn enabled_endpoint_generation(runtime: &ClientTcpPathSessionRuntime) -> Result<u64, RuntimeError> {

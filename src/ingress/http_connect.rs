@@ -65,6 +65,9 @@ pub fn error_response(status: HttpStatus) -> &'static [u8] {
     match status {
         HttpStatus::BadRequest => b"HTTP/1.1 400 Bad Request\r\nContent-Length: 0\r\n\r\n",
         HttpStatus::BadGateway => b"HTTP/1.1 502 Bad Gateway\r\nContent-Length: 0\r\n\r\n",
+        HttpStatus::ServiceUnavailable => {
+            b"HTTP/1.1 503 Service Unavailable\r\nContent-Length: 0\r\n\r\n"
+        }
         HttpStatus::Forbidden => b"HTTP/1.1 403 Forbidden\r\nContent-Length: 0\r\n\r\n",
         HttpStatus::MethodNotAllowed => {
             b"HTTP/1.1 405 Method Not Allowed\r\nContent-Length: 0\r\n\r\n"
@@ -133,6 +136,7 @@ fn parse_authority(authority: &str) -> Result<TargetAddr, HttpConnectError> {
 pub enum HttpStatus {
     BadRequest,
     BadGateway,
+    ServiceUnavailable,
     Forbidden,
     MethodNotAllowed,
     ProxyAuthenticationRequired,

@@ -507,6 +507,13 @@ close, error, cancellation, or generation retirement and never enter payload
 forwarding. These fields do not derive from `[resources]`; raising a Core stream
 or queue budget never raises Product admission.
 
+An MPP client outbound that has previously authenticated a carrier rejects new
+Product flows while its exact authenticated-carrier count is zero. Existing
+flows remain retained under `[session]`, and the normal TCP/QUIC maintenance
+services continue reconnection. A newly started configuration generation may
+perform its first bounded establishment attempt; no source-address heuristic or
+additional retry timer is involved.
+
 Raise a bound only after diagnostics identify it as the limiting resource.
 Increasing a window cannot authorize a path, prove delivery rate, or force
 aggregation. Data sequence offsets, retained ranges, per-copy flight, transport queues,

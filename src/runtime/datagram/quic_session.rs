@@ -144,6 +144,7 @@ impl UdpDatagramClientSession {
             carrier_network,
             peer_status,
             peer_status_snapshot: PeerStatusSnapshotSource::new(Vec::new),
+            authenticated_carriers: crate::runtime::path::AuthenticatedCarrierInventory::default(),
         });
         Self::open_from_udp_session(path_session, path_index, mux_limits, open_deadline).await
     }

@@ -18,6 +18,7 @@ use crate::protocol::{PathId, PathMetricDirection, PathMetrics, SessionId};
 use crate::runtime::path::commands::TcpCapacityProbeCommand;
 use crate::runtime::path::proof::PathProofTracker;
 use crate::runtime::path::state::ClientPathState;
+use crate::runtime::path::{AuthenticatedCarrierInventory, AuthenticatedCarrierRegistration};
 use crate::runtime::peer_status::{PeerStatusBroker, PeerStatusCarrier, PeerStatusSnapshotSource};
 use crate::scheduler::PathSnapshot;
 use crate::transport::PathSpec;
@@ -32,6 +33,7 @@ pub(super) struct ClientTcpPathConnection {
     pub(super) startup_metrics: PathMetrics,
     pub(super) carrier: ClientTcpCarrierConnection,
     pub(super) peer_status: PeerStatusCarrier,
+    authenticated_carrier: Option<AuthenticatedCarrierRegistration>,
     pub(super) path_proofs: PathProofTracker,
     pub(super) capacity: ClientTcpCapacityState,
 }
@@ -51,6 +53,7 @@ impl ClientTcpPathConnection {
             startup_metrics,
             carrier,
             peer_status,
+            authenticated_carrier: None,
             path_proofs: PathProofTracker::from_limits(mux_limits),
             capacity: ClientTcpCapacityState::new(mux_limits),
         }
@@ -58,6 +61,17 @@ impl ClientTcpPathConnection {
 
     pub(super) fn record_outbound_activity(&mut self) {
         self.carrier.refresh_liveness();
+    }
+
+    pub(super) fn retain_authenticated_carrier(
+        &mut self,
+        registration: AuthenticatedCarrierRegistration,
+    ) {
+        assert!(
+            self.authenticated_carrier.is_none(),
+            "TCP connection authenticated carrier published more than once"
+        );
+        self.authenticated_carrier = Some(registration);
     }
 }
 
@@ -82,6 +96,7 @@ pub(in crate::runtime) struct ClientTcpPathSessionRuntime {
     pub(in crate::runtime) carrier_network: Arc<dyn CarrierNetworkProvider>,
     pub(in crate::runtime) peer_status: PeerStatusBroker,
     pub(in crate::runtime) peer_status_snapshot: PeerStatusSnapshotSource,
+    pub(in crate::runtime) authenticated_carriers: AuthenticatedCarrierInventory,
     pub(in crate::runtime) endpoint_policy: Arc<ClientTcpEndpointPolicy>,
     pub(in crate::runtime) carrier_groups: Arc<ClientTcpCarrierGroups>,
 }

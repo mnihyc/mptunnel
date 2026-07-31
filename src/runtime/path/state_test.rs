@@ -213,6 +213,77 @@ fn relay_path_load_lease_releases_the_reclassified_lane() {
 }
 
 #[test]
+fn session_product_ownership_fences_tcp_replacement_across_attachment_changes() {
+    let paths = vec![
+        "tcp://127.0.0.1:12720"
+            .parse::<PathSpec>()
+            .expect("TCP path"),
+        "udp://127.0.0.1:12721"
+            .parse::<PathSpec>()
+            .expect("QUIC path"),
+    ];
+    let security = ClientSecurityConfig::for_test(
+        SharedSecret::new(b"0123456789abcdef0123456789abcdef".to_vec())
+            .expect("session Product ownership secret"),
+    );
+    let context = ClientPathContext::new(paths, security, ResourceLimits::default())
+        .expect("mixed path context");
+    let tcp_instance = next_carrier_path_instance_id();
+    context.state.install_peer_path_usage(
+        UnderlayProtocol::Tcp,
+        0,
+        tcp_instance,
+        0,
+        PathUsage::Available,
+    );
+    assert!(
+        context
+            .state
+            .tcp_path_is_product_quiescent_for_instance(0, tcp_instance)
+    );
+
+    let mut carrier_changes = context.tcp_carrier_groups.subscribe();
+    let product_flow = context.reserve_session_product_flow();
+    assert!(
+        !context
+            .state
+            .tcp_path_is_product_quiescent_for_instance(0, tcp_instance),
+        "a logical Product flow must fence replacement even without path load"
+    );
+    drop(product_flow);
+    assert!(
+        carrier_changes
+            .has_changed()
+            .expect("carrier change sender"),
+        "the final logical Product owner must wake overdue maintenance"
+    );
+    carrier_changes.borrow_and_update();
+
+    let udp_load = context
+        .reserve_relay_path_load(
+            RelayPathKey {
+                underlay: UnderlayProtocol::Udp,
+                index: 0,
+            },
+            TrafficClass::RealtimeDatagram,
+        )
+        .expect("cross-underlay Product load");
+    assert!(
+        !context
+            .state
+            .tcp_path_is_product_quiescent_for_instance(0, tcp_instance),
+        "replacement quiescence is session-wide, not one TCP record"
+    );
+    drop(udp_load);
+    assert!(
+        carrier_changes
+            .has_changed()
+            .expect("carrier change sender"),
+        "the final cross-underlay load owner must wake TCP maintenance"
+    );
+}
+
+#[test]
 fn peer_path_usage_is_directional_and_sequence_ordered_per_underlay() {
     let paths = vec![
         "tcp://127.0.0.1:12710"

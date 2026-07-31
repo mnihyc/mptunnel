@@ -11,8 +11,8 @@ use crate::model::path::RelayPathKey;
 use crate::mux::datagram::DatagramError;
 use crate::protocol::{DatagramFlowId, DatagramId, Frame, TargetAddr, UnderlayProtocol};
 use crate::runtime::error::RuntimeError;
-use crate::runtime::path::ClientPathContext;
 use crate::runtime::path::tcp::client::ClientTcpDatagramInbound;
+use crate::runtime::path::{ClientPathContext, ClientSessionProductFlowLease};
 use crate::runtime::telemetry::{ProductFlowCounter, ProductFlowLease};
 use crate::scheduler::{TrafficClass, path_is_backup};
 use bytes::Bytes;
@@ -36,6 +36,7 @@ struct DatagramClientProductFlow {
     next_datagram_id: u64,
     received_responses: DatagramReceiveWindow,
     detached_since: Option<tokio::time::Instant>,
+    _session_product_flow: ClientSessionProductFlowLease,
     telemetry_flow: ProductFlowLease,
     telemetry_counter: ProductFlowCounter,
 }
@@ -146,6 +147,7 @@ impl DatagramClientAssociation {
                     target.clone(),
                 );
                 let telemetry_counter = telemetry_flow.counter();
+                let session_product_flow = self.context.reserve_session_product_flow();
                 self.product_flows.push(DatagramClientProductFlow {
                     target,
                     flow_id,
@@ -154,6 +156,7 @@ impl DatagramClientAssociation {
                         self.context.mux_limits.max_ack_ranges,
                     ),
                     detached_since: None,
+                    _session_product_flow: session_product_flow,
                     telemetry_flow,
                     telemetry_counter,
                 });

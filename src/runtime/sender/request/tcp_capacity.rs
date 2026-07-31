@@ -16,7 +16,7 @@ use crate::model::request_capacity::{
 use crate::model::request_evidence::RequestPerFlowRateModel;
 use crate::model::timing::transport_pto_from_snapshot;
 use crate::model::work::ReliableWorkClass;
-use crate::protocol::{PathId, StreamId, UnderlayProtocol};
+use crate::protocol::{StreamId, UnderlayProtocol};
 use crate::runtime::path::{
     CapacityProbeCommandTicket, ClientPathContext, RequestCapacityProbeCampaignBudget,
     RequestCapacityReconciliationView, RequestTcpCapacityProbeLease,
@@ -360,7 +360,7 @@ impl RequestTcpCapacityController {
             let request = RequestTcpCapacityProbeRequest {
                 stream_id,
                 path_instance: instance,
-                path_id: PathId(instance.key.index as u16),
+                path_id: candidate_snapshot.id,
                 measurement_id: token,
                 train_payload_bytes,
                 sample_floor_bytes: geometry.sample_floor_bytes,

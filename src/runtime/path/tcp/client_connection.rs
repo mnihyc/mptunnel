@@ -25,6 +25,7 @@ use tokio::sync::mpsc;
 pub(in crate::runtime) struct ClientTcpCarrierConnection {
     pub(in crate::runtime) path_id: PathId,
     pub(in crate::runtime) purpose: PathPurpose,
+    pub(in crate::runtime) remote_port: u16,
     pub(in crate::runtime) writer: EncryptedTcpWriter,
     pub(in crate::runtime) frames: mpsc::Receiver<Result<Frame, EncryptedFramedTransportError>>,
     heartbeat_interval: Duration,
@@ -50,6 +51,9 @@ pub(in crate::runtime) struct ClientTcpCarrierConnect<'a> {
     pub(in crate::runtime) codec_limits: CodecLimits,
     pub(in crate::runtime) mux_limits: MuxLimits,
     pub(in crate::runtime) carrier_network: &'a dyn CarrierNetworkProvider,
+    /// Exact configured port selected by the lifecycle owner. Initial and
+    /// failure establishment leave this unset and select uniformly once.
+    pub(in crate::runtime) remote_port: Option<u16>,
 }
 
 impl ClientTcpCarrierConnection {
@@ -128,12 +132,22 @@ pub(in crate::runtime) async fn connect_client_tcp_carrier(
         codec_limits,
         mux_limits,
         carrier_network,
+        remote_port,
     } = request;
     let connect = async {
         let connect_timeout = open_deadline.saturating_duration_since(tokio::time::Instant::now());
-        let tcp_stream = tcp_transport::connect_path_with_provider(
+        let remote_port = match remote_port {
+            Some(remote_port) => remote_port,
+            None => path
+                .endpoint
+                .ports()
+                .select()
+                .map_err(RuntimeError::Random)?,
+        };
+        let tcp_stream = tcp_transport::connect_path_with_provider_to_port(
             path,
             carrier_identity,
+            remote_port,
             TcpConnectOptions {
                 timeout: connect_timeout,
                 ..TcpConnectOptions::default()
@@ -207,6 +221,7 @@ pub(in crate::runtime) async fn connect_client_tcp_carrier(
         Ok(ClientTcpCarrierConnection {
             path_id,
             purpose,
+            remote_port,
             writer,
             frames: spawn_encrypted_tcp_reader(
                 reader,

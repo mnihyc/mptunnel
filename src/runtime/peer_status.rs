@@ -89,7 +89,9 @@ pub(in crate::runtime) struct PeerStatusCarrier {
 
 #[derive(Clone)]
 pub(in crate::runtime) struct PeerStatusSnapshotSource {
-    snapshot: Arc<dyn Fn() -> Vec<PeerPathStatus> + Send + Sync>,
+    // `None` means the full exact session-owned set cannot be represented at
+    // this instant. The wire boundary converts it to `UNAVAILABLE`.
+    snapshot: Arc<dyn Fn() -> Option<Vec<PeerPathStatus>> + Send + Sync>,
 }
 
 impl std::fmt::Debug for PeerStatusSnapshotSource {
@@ -102,14 +104,14 @@ impl std::fmt::Debug for PeerStatusSnapshotSource {
 
 impl PeerStatusSnapshotSource {
     pub(in crate::runtime) fn new(
-        snapshot: impl Fn() -> Vec<PeerPathStatus> + Send + Sync + 'static,
+        snapshot: impl Fn() -> Option<Vec<PeerPathStatus>> + Send + Sync + 'static,
     ) -> Self {
         Self {
             snapshot: Arc::new(snapshot),
         }
     }
 
-    pub(in crate::runtime) fn snapshot(&self) -> Vec<PeerPathStatus> {
+    pub(in crate::runtime) fn snapshot(&self) -> Option<Vec<PeerPathStatus>> {
         (self.snapshot)()
     }
 }
@@ -309,7 +311,7 @@ impl PeerStatusCarrier {
         &self,
         request_id: u64,
         codec_limits: CodecLimits,
-        paths: impl FnOnce() -> Vec<PeerPathStatus>,
+        paths: impl FnOnce() -> Option<Vec<PeerPathStatus>>,
     ) -> Frame {
         if !self.broker.inner.allow_incoming {
             return Frame::PeerStatusResponse {
@@ -325,7 +327,13 @@ impl PeerStatusCarrier {
                 paths: Vec::new(),
             };
         }
-        let paths = paths();
+        let Some(paths) = paths() else {
+            return Frame::PeerStatusResponse {
+                request_id,
+                code: PeerStatusCode::Unavailable,
+                paths: Vec::new(),
+            };
+        };
         if paths.len() > peer_status_response_path_limit(codec_limits) {
             return Frame::PeerStatusResponse {
                 request_id,

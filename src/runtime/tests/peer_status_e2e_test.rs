@@ -70,6 +70,7 @@ async fn authenticated_peer_status_round_trips_through_tcp_carrier_actors() {
     let (target_addr, target) = hold_tcp_target().await;
     let context =
         ClientPathContext::new(vec![path], security(), ResourceLimits::default()).expect("context");
+    probe_client_paths(&context, Duration::from_secs(2)).await;
 
     let remote = tokio::time::timeout(
         PEER_STATUS_E2E_TIMEOUT,

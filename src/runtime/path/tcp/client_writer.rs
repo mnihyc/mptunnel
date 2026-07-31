@@ -21,11 +21,12 @@ use crate::protocol::frame::stream_ack_contiguous_frontier;
 use crate::protocol::{Frame, StreamId, UnderlayProtocol};
 use crate::runtime::error::RuntimeError;
 use crate::runtime::path::commands::{
-    ReliablePathCommand, ReliablePathCommandReceivers, TcpCapacityProbeCommand,
-    reliable_path_command_pending_bytes, reliable_path_command_writer_run_budget_bytes,
-    reliable_path_command_writer_run_budget_items, reliable_path_command_writer_run_bytes,
-    reliable_path_frame_requires_capacity_command, reliable_path_writer_frame_queue,
-    try_coalesce_reliable_path_writer_run, try_recv_reliable_path_command,
+    ClientTcpOpenedDatagramAttachment, ReliablePathCommand, ReliablePathCommandReceivers,
+    TcpCapacityProbeCommand, reliable_path_command_pending_bytes,
+    reliable_path_command_writer_run_budget_bytes, reliable_path_command_writer_run_budget_items,
+    reliable_path_command_writer_run_bytes, reliable_path_frame_requires_capacity_command,
+    reliable_path_writer_frame_queue, try_coalesce_reliable_path_writer_run,
+    try_recv_reliable_path_command,
 };
 use crate::runtime::recent_ids::RecentIdCache;
 use std::collections::HashMap;
@@ -145,7 +146,7 @@ pub(super) async fn handle_connected_client_tcp_command_run<const POLL_ADDITIONA
                     commands.release_pending_command_bytes(pending_bytes);
                     return Ok(());
                 }
-                if probe.path_id != runtime.path_id
+                if probe.path_id != runtime.path_id()
                     || path_instance.key.underlay != UnderlayProtocol::Tcp
                     || path_instance.key.index != runtime.path_index
                     || probe.train_payload_bytes < probe.sample_floor_bytes
@@ -267,6 +268,7 @@ pub(super) async fn handle_connected_client_tcp_command_run<const POLL_ADDITIONA
                     streams,
                     closed_streams,
                     datagrams,
+                    runtime,
                     ClientTcpCommandOptions {
                         carrier_instance,
                         stream_frame_queue,
@@ -616,6 +618,7 @@ async fn handle_connected_client_tcp_command(
     streams: &mut HashMap<StreamId, ClientTcpPathStreamState>,
     closed_streams: &mut RecentIdCache<StreamId>,
     datagrams: &mut ClientTcpDatagramState,
+    runtime: &ClientTcpPathSessionRuntime,
     options: ClientTcpCommandOptions,
 ) -> Result<(), RuntimeError> {
     let ClientTcpCommandOptions {
@@ -686,7 +689,14 @@ async fn handle_connected_client_tcp_command(
                 let _ = response.send(Err(err));
                 return Ok(());
             }
-            if response.send(Ok(connection.path_instance_id)).is_err() {
+            let evidence = runtime.attachment_evidence(connection);
+            if response
+                .send(Ok(ClientTcpOpenedDatagramAttachment {
+                    path_instance_id: connection.path_instance_id,
+                    path_snapshot: evidence.snapshot,
+                }))
+                .is_err()
+            {
                 datagrams.remove_attachment(attachment_id);
             }
             Ok(())

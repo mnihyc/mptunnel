@@ -6,7 +6,9 @@
 use super::carrier_inventory::AuthenticatedCarrierInventory;
 use super::commands::reliable_stream_frame_queue;
 use super::health::{ClientPathHealth, ClientPathHealthRecord};
-use super::model::{ClientPathObservation, path_metrics_from_snapshot, path_snapshot};
+use super::model::{
+    ClientPathObservation, path_metrics_from_snapshot, path_snapshot, path_snapshot_with_id,
+};
 use super::quic::client::{ClientUdpPathSessionHandle, ClientUdpPathSessionRuntime};
 use super::state::ClientPathState;
 use super::tcp::client::{
@@ -314,7 +316,10 @@ impl ClientPathContext {
             let tcp_paths = tcp_paths.clone();
             let udp_paths = udp_paths.clone();
             let state = state.clone();
-            move || client_peer_status_snapshot(&tcp_paths, &udp_paths, &state)
+            let authenticated_carriers = authenticated_carriers.clone();
+            move || {
+                client_peer_status_snapshot(&tcp_paths, &udp_paths, &state, &authenticated_carriers)
+            }
         });
         let tcp_sessions = (0..tcp_paths.len())
             .map(|path_index| {
@@ -326,7 +331,8 @@ impl ClientPathContext {
                     paths: tcp_config_paths.clone(),
                     config_index,
                     path_index,
-                    path_id: PathId(path_index as u16),
+                    path_id: None,
+                    remote_port: None,
                     purpose: crate::protocol::PathPurpose::Ordinary,
                     carrier_identity: CarrierPathIdentity {
                         group_ordinal: path_group_ordinal,
@@ -507,19 +513,36 @@ fn client_peer_status_snapshot(
     tcp_paths: &[PathSpec],
     udp_paths: &[PathSpec],
     state: &ClientPathState,
-) -> Vec<PeerPathStatus> {
+    authenticated_carriers: &AuthenticatedCarrierInventory,
+) -> Option<Vec<PeerPathStatus>> {
     let now = Instant::now();
     let health = state.health().lock().expect("client path health lock");
+    if tcp_paths.len() != health.tcp.len() || udp_paths.len() != health.udp.len() {
+        return None;
+    }
+    let represented_authenticated_carriers = health
+        .tcp
+        .iter()
+        .chain(&health.udp)
+        .filter(|record| record.has_live_authenticated_carrier())
+        .count();
+    if represented_authenticated_carriers != authenticated_carriers.snapshot().live_count {
+        return None;
+    }
+
     let mut paths = Vec::with_capacity(tcp_paths.len() + udp_paths.len());
-    paths.extend(
-        tcp_paths
-            .iter()
-            .zip(&health.tcp)
-            .enumerate()
-            .map(|(index, (path, record))| {
-                peer_path_status(path, index, record.observation_at(now))
-            }),
-    );
+    let mut tcp_path_ids = std::collections::HashSet::with_capacity(health.tcp.len());
+    for (path, record) in tcp_paths.iter().zip(&health.tcp) {
+        if !record.has_live_authenticated_carrier() {
+            continue;
+        }
+        let observation = record.observation_at(now);
+        let path_id = observation.wire_path_id?;
+        if !tcp_path_ids.insert(path_id) {
+            return None;
+        }
+        paths.push(peer_path_status_with_id(path, path_id, observation));
+    }
     paths.extend(
         udp_paths
             .iter()
@@ -529,8 +552,24 @@ fn client_peer_status_snapshot(
                 peer_path_status(path, index, record.observation_at(now))
             }),
     );
-    paths
+    Some(paths)
 }
+
+fn peer_path_status_with_id(
+    path: &PathSpec,
+    path_id: PathId,
+    observation: ClientPathObservation,
+) -> PeerPathStatus {
+    peer_path_status_from_snapshot(
+        path,
+        path_snapshot_with_id(path, path_id, observation),
+        observation,
+    )
+}
+
+#[cfg(test)]
+#[path = "set_test.rs"]
+mod tests;
 
 fn peer_path_status(
     path: &PathSpec,
@@ -538,6 +577,14 @@ fn peer_path_status(
     observation: ClientPathObservation,
 ) -> PeerPathStatus {
     let snapshot = path_snapshot(path, index, observation);
+    peer_path_status_from_snapshot(path, snapshot, observation)
+}
+
+fn peer_path_status_from_snapshot(
+    path: &PathSpec,
+    snapshot: crate::scheduler::PathSnapshot,
+    observation: ClientPathObservation,
+) -> PeerPathStatus {
     PeerPathStatus {
         state: match snapshot.state {
             crate::scheduler::PathState::Active => PeerPathState::Active,

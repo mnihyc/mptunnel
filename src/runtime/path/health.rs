@@ -12,7 +12,7 @@ use super::tcp::capacity::RequestTcpCapacityRecord;
 use super::tcp::metrics::TcpNativeObservation;
 use crate::model::capacity::{PathRateSample, TcpCapacityProofCandidate};
 use crate::model::path::{CarrierPathInstanceId, RelayPathInstance};
-use crate::protocol::PathUsage;
+use crate::protocol::{PathId, PathUsage};
 use crate::scheduler::{PathState as SchedulerPathState, TrafficClass};
 use std::collections::{HashMap, VecDeque};
 use std::time::{Duration, Instant};
@@ -28,6 +28,7 @@ pub(in crate::runtime) struct ClientPathHealthRecord {
     pub(in crate::runtime) state: SchedulerPathState,
     pub(in crate::runtime) manual_disabled: bool,
     data_plane_failure_instance_id: Option<CarrierPathInstanceId>,
+    wire_path_id: Option<PathId>,
     pub(in crate::runtime) peer_usage: Option<PathUsage>,
     path_instance_id: Option<CarrierPathInstanceId>,
     peer_usage_sequence: Option<u64>,
@@ -104,6 +105,7 @@ impl Default for ClientPathHealthRecord {
             state: SchedulerPathState::Active,
             manual_disabled: false,
             data_plane_failure_instance_id: None,
+            wire_path_id: None,
             peer_usage: None,
             path_instance_id: None,
             peer_usage_sequence: None,
@@ -148,6 +150,15 @@ impl Default for ClientPathHealthRecord {
     }
 }
 
+impl ClientPathHealth {
+    pub(in crate::runtime) fn is_product_quiescent(&self) -> bool {
+        self.tcp
+            .iter()
+            .chain(&self.udp)
+            .all(ClientPathHealthRecord::has_no_product_work)
+    }
+}
+
 impl ClientPathHealthRecord {
     pub(in crate::runtime) fn install_peer_usage(
         &mut self,
@@ -162,6 +173,17 @@ impl ClientPathHealthRecord {
         self.peer_usage_sequence = Some(sequence);
         self.peer_usage = Some(usage);
         self.mark_liveness_success();
+    }
+
+    pub(in crate::runtime) fn install_tcp_peer_usage(
+        &mut self,
+        wire_path_id: PathId,
+        path_instance_id: CarrierPathInstanceId,
+        sequence: u64,
+        usage: PathUsage,
+    ) {
+        self.install_peer_usage(path_instance_id, sequence, usage);
+        self.wire_path_id = Some(wire_path_id);
     }
 
     pub(in crate::runtime) fn begin_planned_retirement(&mut self) {
@@ -196,6 +218,34 @@ impl ClientPathHealthRecord {
 
     pub(in crate::runtime) fn has_physical_carrier(&self) -> bool {
         self.path_instance_id.is_some()
+    }
+
+    pub(in crate::runtime) fn has_live_authenticated_carrier(&self) -> bool {
+        self.path_instance_id.is_some()
+            && self.data_plane_failure_instance_id != self.path_instance_id
+    }
+
+    /// Product admission owns these counters from before carrier I/O until the
+    /// exact logical attachment releases them. Planned physical replacement
+    /// may therefore use this lock-coherent boundary without an idle timer.
+    pub(in crate::runtime) fn is_product_quiescent_for_instance(
+        &self,
+        path_instance_id: CarrierPathInstanceId,
+    ) -> bool {
+        self.path_instance_id == Some(path_instance_id)
+            && self.data_plane_failure_instance_id != Some(path_instance_id)
+            && !self.manual_disabled
+            && matches!(
+                self.state,
+                SchedulerPathState::Active | SchedulerPathState::Suspect
+            )
+            && self.active_flows == 0
+            && self.relay_bytes_in_flight == 0
+            && self.relay_queue_bytes == 0
+    }
+
+    fn has_no_product_work(&self) -> bool {
+        self.active_flows == 0 && self.relay_bytes_in_flight == 0 && self.relay_queue_bytes == 0
     }
 
     pub(in crate::runtime) fn update_peer_usage(
@@ -309,6 +359,7 @@ impl ClientPathHealthRecord {
             return ClientPathObservation {
                 state: SchedulerPathState::Failed,
                 manual_disabled: true,
+                wire_path_id: self.wire_path_id,
                 peer_usage: self.peer_usage,
                 measured_srtt_ms: self.measured_srtt_ms,
                 measured_jitter_ms: self.measured_jitter_ms,
@@ -358,6 +409,7 @@ impl ClientPathHealthRecord {
         ClientPathObservation {
             state,
             manual_disabled: false,
+            wire_path_id: self.wire_path_id,
             peer_usage: self.peer_usage,
             measured_srtt_ms: self.measured_srtt_ms,
             measured_jitter_ms: self.measured_jitter_ms,
@@ -399,6 +451,20 @@ impl ClientPathHealthRecord {
             explicit_carrier_capacity_proof,
             path_proof_success: self.path_proof_success,
         }
+    }
+
+    /// Returns evidence only while it still belongs to the requested physical
+    /// carrier. A stable configured path may publish a replacement instance at
+    /// any time, so attachment owners must never infer this identity from its
+    /// current record after opening.
+    pub(in crate::runtime) fn observation_for_instance_at(
+        &self,
+        path_instance_id: CarrierPathInstanceId,
+        now: Instant,
+    ) -> Option<ClientPathObservation> {
+        (self.path_instance_id == Some(path_instance_id)
+            && self.data_plane_failure_instance_id != Some(path_instance_id))
+        .then(|| self.observation_at(now))
     }
 
     pub(in crate::runtime) fn mark_success(&mut self, elapsed: Duration) {
@@ -475,6 +541,20 @@ impl ClientPathHealthRecord {
         }
     }
 
+    #[cfg(test)]
+    pub(in crate::runtime) fn mark_open_success_for_instance(
+        &mut self,
+        path_instance_id: CarrierPathInstanceId,
+        elapsed: Duration,
+        lane: TrafficClass,
+    ) -> bool {
+        if !self.accepts_native_carrier_observation(path_instance_id) {
+            return false;
+        }
+        self.mark_open_success(elapsed, lane);
+        true
+    }
+
     pub(in crate::runtime) fn reserve_load(&mut self, lane: TrafficClass, now: Instant) -> bool {
         // Selection may precede an asynchronous open. Revalidate at the
         // reservation commit point so a concurrent disable or failure cannot
@@ -498,6 +578,18 @@ impl ClientPathHealthRecord {
 
     pub(in crate::runtime) fn mark_reserved_open_success(&mut self, _elapsed: Duration) {
         self.mark_liveness_success();
+    }
+
+    pub(in crate::runtime) fn mark_reserved_open_success_for_instance(
+        &mut self,
+        path_instance_id: CarrierPathInstanceId,
+        elapsed: Duration,
+    ) -> bool {
+        if !self.accepts_native_carrier_observation(path_instance_id) {
+            return false;
+        }
+        self.mark_reserved_open_success(elapsed);
+        true
     }
 
     pub(in crate::runtime) fn release_load(&mut self, lane: TrafficClass) {
@@ -712,6 +804,7 @@ impl ClientPathHealthRecord {
 
     fn clear_physical_carrier_state(&mut self) {
         self.data_plane_failure_instance_id = None;
+        self.wire_path_id = None;
         self.peer_usage = None;
         self.path_instance_id = None;
         self.peer_usage_sequence = None;
@@ -753,11 +846,12 @@ impl ClientPathHealthRecord {
         &mut self,
         path_instance_id: CarrierPathInstanceId,
         bytes: usize,
-    ) {
+    ) -> bool {
         if self.path_instance_id != Some(path_instance_id) {
-            return;
+            return false;
         }
         self.relay_bytes_in_flight = self.relay_bytes_in_flight.saturating_sub(bytes as u64);
+        self.is_product_quiescent_for_instance(path_instance_id)
     }
 }
 

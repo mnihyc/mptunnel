@@ -14,7 +14,7 @@ use crate::model::path::RelayPathKey;
 use crate::model::timing::{
     path_open_pto, path_open_serialized_exchanges, path_open_timeout, transport_pto_from_snapshot,
 };
-use crate::protocol::{Frame, StreamId, TargetAddr, UnderlayProtocol};
+use crate::protocol::{Frame, PathMetrics, StreamId, TargetAddr, UnderlayProtocol};
 use crate::runtime::error::RuntimeError;
 use crate::runtime::path::commands::ClientTcpOpenDeadlines;
 use crate::runtime::path::{ClientPathContext, RelayPathLoadLease};
@@ -340,19 +340,22 @@ pub(in crate::runtime) async fn open_remote_stream_on_preselected_tcp_path(
             advertised_recv_max_offset,
         )
         .await?;
+    let path_instance_id = opened.carrier.path_instance_id;
+    let path_metrics = opened.path_metrics;
+    let open_deadline = opened.open_deadline;
     let pending = OpenedRemoteStream::from_opened_carrier(
         opened.carrier,
         path_index,
         advertised_recv_max_offset,
     );
     tokio::time::timeout_at(
-        opened.open_deadline,
-        send_open_path_metrics(context, pending.stream(), UnderlayProtocol::Tcp, path_index),
+        open_deadline,
+        send_open_path_metrics(pending.stream(), Some(path_metrics)),
     )
     .await
     .map_err(|_| RuntimeError::PathOpenTimedOut)??;
     let elapsed = started_at.elapsed();
-    context.mark_tcp_path_reserved_open_success(path_index, elapsed);
+    context.mark_tcp_path_reserved_open_success_for_instance(path_index, path_instance_id, elapsed);
     #[cfg(feature = "lab-diagnostics")]
     lab_diagnostic(
         "reliable_stream_open_success",
@@ -475,7 +478,11 @@ pub(in crate::runtime) async fn open_remote_stream_on_preselected_udp_path(
         OpenedRemoteStream::from_opened_carrier(carrier, path_index, advertised_recv_max_offset);
     let elapsed = started_at.elapsed();
     context.mark_udp_stream_reserved_open_success(path_index, elapsed, true);
-    send_open_path_metrics(context, pending.stream(), UnderlayProtocol::Udp, path_index).await?;
+    send_open_path_metrics(
+        pending.stream(),
+        context.relay_path_metrics(UnderlayProtocol::Udp, path_index),
+    )
+    .await?;
     #[cfg(feature = "lab-diagnostics")]
     lab_diagnostic(
         "reliable_stream_open_success",
@@ -491,12 +498,10 @@ pub(in crate::runtime) async fn open_remote_stream_on_preselected_udp_path(
 }
 
 async fn send_open_path_metrics(
-    context: &ClientPathContext,
     stream: &ReliablePathStream,
-    underlay: UnderlayProtocol,
-    path_index: usize,
+    metrics: Option<PathMetrics>,
 ) -> Result<(), RuntimeError> {
-    let Some(metrics) = context.relay_path_metrics(underlay, path_index) else {
+    let Some(metrics) = metrics else {
         return Ok(());
     };
     stream.try_enqueue_request_control_frame(Frame::PathMetrics { metrics })

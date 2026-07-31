@@ -550,7 +550,11 @@ pub(in crate::runtime) fn path_snapshot(
     index: usize,
     observation: ClientPathObservation,
 ) -> PathSnapshot {
-    path_snapshot_with_id(path, PathId(index as u16), observation)
+    path_snapshot_with_id(
+        path,
+        observation.wire_path_id.unwrap_or(PathId(index as u16)),
+        observation,
+    )
 }
 
 pub(in crate::runtime) fn path_snapshot_with_id(
@@ -1008,6 +1012,7 @@ pub(in crate::runtime) fn default_path_rate_bps() -> f64 {
 pub(in crate::runtime) struct ClientPathObservation {
     pub(in crate::runtime) state: SchedulerPathState,
     pub(in crate::runtime) manual_disabled: bool,
+    pub(in crate::runtime) wire_path_id: Option<PathId>,
     pub(in crate::runtime) peer_usage: Option<PathUsage>,
     pub(in crate::runtime) measured_srtt_ms: Option<f64>,
     pub(in crate::runtime) measured_jitter_ms: Option<f64>,
@@ -1045,6 +1050,7 @@ impl Default for ClientPathObservation {
         Self {
             state: SchedulerPathState::Suspect,
             manual_disabled: false,
+            wire_path_id: None,
             peer_usage: None,
             measured_srtt_ms: None,
             measured_jitter_ms: None,

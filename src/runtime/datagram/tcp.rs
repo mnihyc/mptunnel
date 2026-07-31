@@ -91,14 +91,24 @@ impl TcpDatagramClientAssociation {
         if remaining.is_zero() || eta_ms > remaining.as_secs_f64() * 1000.0 {
             return Err(RuntimeError::PathOpenTimedOut);
         }
+        // Product ownership precedes carrier I/O. The lease stays with the
+        // exact attachment, making cancellation and planned replacement share
+        // the same admission boundary as reliable streams.
+        let load_lease = self
+            .context
+            .reserve_relay_path_load(key, TrafficClass::RealtimeDatagram)
+            .ok_or(RuntimeError::NoSchedulableTcpPath)?;
         let started_at = Instant::now();
-        match TcpDatagramClientSession::open(&self.context, path_index, setup_deadline).await {
+        match TcpDatagramClientSession::open(&self.context, path_index, setup_deadline, load_lease)
+            .await
+        {
             Ok(session) => {
-                self.context.mark_tcp_path_open_success(
-                    path_index,
-                    started_at.elapsed(),
-                    TrafficClass::RealtimeDatagram,
-                );
+                self.context
+                    .mark_tcp_path_reserved_open_success_for_instance(
+                        path_index,
+                        session.path_instance_id(),
+                        started_at.elapsed(),
+                    );
                 self.paths.push(session);
                 Ok(self.paths.len() - 1)
             }
@@ -134,8 +144,6 @@ impl TcpDatagramClientAssociation {
                 session.path_instance_id(),
                 session.delivery_stats(),
             );
-            self.context
-                .release_tcp_path_load(path_index, TrafficClass::RealtimeDatagram);
             if close_error.is_none() {
                 close_error = result.err();
             }
@@ -227,8 +235,6 @@ impl TcpDatagramClientAssociation {
             session.path_instance_id(),
             session.delivery_stats(),
         );
-        self.context
-            .release_tcp_path_load(path_index, TrafficClass::RealtimeDatagram);
         if failed {
             self.context.mark_tcp_path_failure(path_index);
         }

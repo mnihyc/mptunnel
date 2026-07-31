@@ -25,7 +25,7 @@ pub(super) async fn handle_client_tcp_path_frame(
 ) -> Result<(), RuntimeError> {
     connection.carrier.refresh_liveness();
     expire_client_tcp_pending_opens(connection, streams, closed_streams).await?;
-    let path_id = runtime.path_id;
+    let path_id = runtime.path_id();
     match &frame {
         Frame::PathCapacityData { .. }
         | Frame::PathCapacityFinish { .. }

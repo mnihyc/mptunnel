@@ -268,6 +268,44 @@ fn replacement_tcp_carrier_rejects_stale_native_observation_and_clears_credit() 
 }
 
 #[test]
+fn attachment_evidence_and_open_success_are_owned_by_the_exact_tcp_carrier() {
+    let now = Instant::now();
+    let original = crate::model::path::next_carrier_path_instance_id();
+    let replacement = crate::model::path::next_carrier_path_instance_id();
+    let mut record = ClientPathHealthRecord::default();
+    record.install_tcp_peer_usage(PathId(3), original, 0, PathUsage::Available);
+    record.install_tcp_peer_usage(PathId(7), replacement, 0, PathUsage::Available);
+    record.state = SchedulerPathState::Suspect;
+
+    assert!(record.observation_for_instance_at(original, now).is_none());
+    assert_eq!(
+        record
+            .observation_for_instance_at(replacement, now)
+            .and_then(|observation| observation.wire_path_id),
+        Some(PathId(7))
+    );
+
+    assert!(!record.mark_reserved_open_success_for_instance(original, Duration::from_millis(20)));
+    assert_eq!(record.state, SchedulerPathState::Suspect);
+    assert!(!record.mark_open_success_for_instance(
+        original,
+        Duration::from_millis(20),
+        TrafficClass::Latency,
+    ));
+    assert_eq!(record.active_flows, 0);
+
+    assert!(record.mark_reserved_open_success_for_instance(replacement, Duration::from_millis(20)));
+    assert_eq!(record.state, SchedulerPathState::Active);
+    assert!(record.mark_open_success_for_instance(
+        replacement,
+        Duration::from_millis(20),
+        TrafficClass::Latency,
+    ));
+    assert_eq!(record.active_flows, 1);
+    assert_eq!(record.active_latency_sensitive_flows, 1);
+}
+
+#[test]
 fn partial_tcp_transport_state_does_not_clear_unknown_fields() {
     let mut record = ClientPathHealthRecord::default();
     let path_instance_id = crate::model::path::next_carrier_path_instance_id();

@@ -181,7 +181,7 @@ pub(super) async fn handle_client_tcp_capacity_frame(
     connection: &mut ClientTcpPathConnection,
     runtime: &ClientTcpPathSessionRuntime,
 ) -> Result<(), RuntimeError> {
-    let path_id = runtime.path_id;
+    let path_id = runtime.path_id();
     match frame {
         Frame::PathCapacityData {
             path_id: capacity_path_id,

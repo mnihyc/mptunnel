@@ -15,48 +15,64 @@ use super::client_stream::{
 use super::client_writer::{
     handle_connected_client_tcp_command_run, write_client_tcp_frame_batch_interlocked,
 };
-use super::group::ClientTcpCarrierGroups;
+use super::group::{ClientTcpCarrierGroups, ClientTcpCarrierReservation};
 #[cfg(feature = "lab-diagnostics")]
 use crate::lab_diagnostics::lab_diagnostic;
 use crate::model::path::{CarrierPathInstanceId, RelayPathKey, next_carrier_path_instance_id};
 use crate::protocol::{CloseReason, Frame, PathMetricDirection, StreamId, UnderlayProtocol};
 use crate::runtime::error::RuntimeError;
 use crate::runtime::path::commands::{
-    ClientTcpOpenResponse, ReliablePathCommand, ReliablePathCommandReceivers,
-    recv_reliable_path_command, recv_reliable_path_command_during_drain,
-    reliable_path_command_pending_bytes, reliable_path_receivers_closed,
-    try_recv_reliable_path_command,
+    ClientTcpOpenResponse, ClientTcpOpenedDatagramAttachment, ReliablePathCommand,
+    ReliablePathCommandReceivers, recv_reliable_path_command,
+    recv_reliable_path_command_during_drain, reliable_path_command_pending_bytes,
+    reliable_path_receivers_closed, try_recv_reliable_path_command,
 };
 use crate::runtime::path::model::{path_startup_metrics, path_startup_snapshot};
 use crate::runtime::path::state::ClientTcpCarrierPublication;
 use crate::runtime::recent_ids::RecentIdCache;
 use std::collections::HashMap;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::time::Duration;
 
 struct ClientTcpCarrierReadiness {
     published_instance: Arc<AtomicU64>,
+    published_remote_port: Arc<AtomicU32>,
     groups: Arc<ClientTcpCarrierGroups>,
     current_instance: Option<CarrierPathInstanceId>,
 }
 
 impl ClientTcpCarrierReadiness {
-    fn new(published_instance: Arc<AtomicU64>, groups: Arc<ClientTcpCarrierGroups>) -> Self {
+    fn new(
+        published_instance: Arc<AtomicU64>,
+        published_remote_port: Arc<AtomicU32>,
+        groups: Arc<ClientTcpCarrierGroups>,
+    ) -> Self {
         Self {
             published_instance,
+            published_remote_port,
             groups,
             current_instance: None,
         }
     }
 
-    fn publish(&mut self, path_instance_id: CarrierPathInstanceId) {
+    fn publish(&mut self, path_instance_id: CarrierPathInstanceId, remote_port: u16) {
         let instance = path_instance_id.as_u64();
         self.published_instance
             .compare_exchange(0, instance, Ordering::AcqRel, Ordering::Acquire)
             .expect("one TCP carrier actor owns readiness publication");
+        self.published_remote_port
+            .store(u32::from(remote_port), Ordering::Release);
         self.current_instance = Some(path_instance_id);
         self.groups.publish_change();
+    }
+
+    fn adopt_published(&mut self, path_instance_id: CarrierPathInstanceId) {
+        debug_assert_eq!(
+            self.published_instance.load(Ordering::Acquire),
+            path_instance_id.as_u64()
+        );
+        self.current_instance = Some(path_instance_id);
     }
 
     fn clear(&mut self) {
@@ -73,6 +89,7 @@ impl ClientTcpCarrierReadiness {
             )
             .is_ok()
         {
+            self.published_remote_port.store(0, Ordering::Release);
             self.groups.publish_change();
         }
     }
@@ -98,16 +115,65 @@ struct ClientTcpPathSessionState {
 
 pub(super) async fn run_client_tcp_path_session(
     runtime: ClientTcpPathSessionRuntime,
+    commands: ReliablePathCommandReceivers,
+    published_carrier_instance: Arc<AtomicU64>,
+    published_remote_port: Arc<AtomicU32>,
+    actor_terminal: Arc<AtomicBool>,
+    reservation: ClientTcpCarrierReservation,
+) {
+    run_client_tcp_path_session_inner(
+        runtime,
+        commands,
+        published_carrier_instance,
+        published_remote_port,
+        actor_terminal,
+        reservation,
+        None,
+    )
+    .await;
+}
+
+pub(super) async fn run_client_tcp_path_session_with_connection(
+    runtime: ClientTcpPathSessionRuntime,
+    commands: ReliablePathCommandReceivers,
+    published_carrier_instance: Arc<AtomicU64>,
+    published_remote_port: Arc<AtomicU32>,
+    actor_terminal: Arc<AtomicBool>,
+    reservation: ClientTcpCarrierReservation,
+    connection: ClientTcpPathConnection,
+) {
+    run_client_tcp_path_session_inner(
+        runtime,
+        commands,
+        published_carrier_instance,
+        published_remote_port,
+        actor_terminal,
+        reservation,
+        Some(connection),
+    )
+    .await;
+}
+
+async fn run_client_tcp_path_session_inner(
+    runtime: ClientTcpPathSessionRuntime,
     mut commands: ReliablePathCommandReceivers,
     published_carrier_instance: Arc<AtomicU64>,
+    published_remote_port: Arc<AtomicU32>,
     actor_terminal: Arc<AtomicBool>,
+    reservation: ClientTcpCarrierReservation,
+    initial_connection: Option<ClientTcpPathConnection>,
 ) {
-    let mut actor_terminal =
-        ClientTcpPathActorTerminal::new(actor_terminal, runtime.carrier_groups.clone());
-    let mut carrier_readiness =
-        ClientTcpCarrierReadiness::new(published_carrier_instance, runtime.carrier_groups.clone());
+    let mut actor_terminal = ClientTcpPathActorTerminal::new(actor_terminal, reservation);
+    let mut carrier_readiness = ClientTcpCarrierReadiness::new(
+        published_carrier_instance,
+        published_remote_port,
+        runtime.carrier_groups.clone(),
+    );
+    if let Some(connection) = initial_connection.as_ref() {
+        carrier_readiness.adopt_published(connection.path_instance_id);
+    }
     let mut state = ClientTcpPathSessionState {
-        connection: None,
+        connection: initial_connection,
         streams: HashMap::new(),
         closed_streams: RecentIdCache::new(runtime.closed_stream_cache_capacity),
         datagrams: ClientTcpDatagramState::new(
@@ -149,6 +215,10 @@ pub(super) async fn run_client_tcp_path_session(
                         )
                         .await;
                         commands.release_pending_command_bytes(pending_bytes);
+                        if state.connection.is_none() {
+                            actor_terminal.finish();
+                            return;
+                        }
                     }
                     None => return,
                 }
@@ -496,24 +566,23 @@ pub(super) async fn run_client_tcp_path_session(
         }
         if drop_connection {
             retire_failed_client_tcp_connection(&runtime, &mut state, &mut carrier_readiness);
-            if draining {
-                return;
-            }
+            actor_terminal.finish();
+            return;
         }
     }
 }
 
 struct ClientTcpPathActorTerminal {
     terminal: Arc<AtomicBool>,
-    groups: Arc<ClientTcpCarrierGroups>,
+    reservation: Option<ClientTcpCarrierReservation>,
     finished: bool,
 }
 
 impl ClientTcpPathActorTerminal {
-    fn new(terminal: Arc<AtomicBool>, groups: Arc<ClientTcpCarrierGroups>) -> Self {
+    fn new(terminal: Arc<AtomicBool>, reservation: ClientTcpCarrierReservation) -> Self {
         Self {
             terminal,
-            groups,
+            reservation: Some(reservation),
             finished: false,
         }
     }
@@ -524,7 +593,9 @@ impl ClientTcpPathActorTerminal {
         }
         self.terminal.store(true, Ordering::Release);
         self.finished = true;
-        self.groups.publish_change();
+        // Reconciliation wakes from the reservation's release only after the
+        // slot is terminal and group capacity is actually available.
+        drop(self.reservation.take());
     }
 }
 
@@ -987,7 +1058,6 @@ async fn handle_disconnected_client_tcp_command(
                         let _ = response.send(Err(RuntimeError::PathOpenTimedOut));
                         return;
                     }
-                    let path_instance_id = connected.path_instance_id;
                     if let Err(err) = state.datagrams.attach(attachment_id, frames, failure) {
                         let _ = response.send(Err(err));
                         return;
@@ -1005,7 +1075,18 @@ async fn handle_disconnected_client_tcp_command(
                         let _ = response.send(Err(RuntimeError::NoSchedulableTcpPath));
                         return;
                     }
-                    if response.send(Ok(path_instance_id)).is_err() {
+                    let connection = state
+                        .connection
+                        .as_ref()
+                        .expect("published TCP datagram carrier remains actor-owned");
+                    let evidence = runtime.attachment_evidence(connection);
+                    if response
+                        .send(Ok(ClientTcpOpenedDatagramAttachment {
+                            path_instance_id: connection.path_instance_id,
+                            path_snapshot: evidence.snapshot,
+                        }))
+                        .is_err()
+                    {
                         state.datagrams.remove_attachment(attachment_id);
                     }
                 }
@@ -1065,7 +1146,7 @@ fn retire_failed_client_tcp_connection(
     carrier_readiness.clear();
 }
 
-async fn connect_client_tcp_path(
+pub(super) async fn connect_client_tcp_path(
     runtime: &ClientTcpPathSessionRuntime,
     open_deadline: tokio::time::Instant,
     endpoint_generation: u64,
@@ -1073,16 +1154,14 @@ async fn connect_client_tcp_path(
     if !runtime.endpoint_policy.allows(endpoint_generation) {
         return Err(RuntimeError::NoSchedulableTcpPath);
     }
-    let mut startup_snapshot = path_startup_snapshot(runtime.path(), runtime.path_id);
-    let startup_metrics = path_startup_metrics(
-        runtime.path(),
-        runtime.path_id,
-        PathMetricDirection::ClientToServer,
-    );
+    let path_id = runtime.path_id();
+    let mut startup_snapshot = path_startup_snapshot(runtime.path(), path_id);
+    let startup_metrics =
+        path_startup_metrics(runtime.path(), path_id, PathMetricDirection::ClientToServer);
     let connect = connect_client_tcp_carrier(
         ClientTcpCarrierConnect {
             path: runtime.path(),
-            path_id: runtime.path_id,
+            path_id,
             purpose: runtime.purpose,
             carrier_identity: runtime.carrier_identity,
             session_id: runtime.session_id,
@@ -1091,6 +1170,7 @@ async fn connect_client_tcp_path(
             codec_limits: runtime.codec_limits,
             mux_limits: runtime.mux_limits,
             carrier_network: runtime.carrier_network.as_ref(),
+            remote_port: runtime.remote_port,
         },
         open_deadline,
     );
@@ -1103,7 +1183,7 @@ async fn connect_client_tcp_path(
         _ = &mut policy_changed => return Err(RuntimeError::NoSchedulableTcpPath),
         result = &mut connect => result?,
     };
-    debug_assert_eq!(carrier.path_id, runtime.path_id);
+    debug_assert_eq!(carrier.path_id, path_id);
     debug_assert_eq!(carrier.purpose, runtime.purpose);
     let path_instance_id = next_carrier_path_instance_id();
     startup_snapshot.peer_usage = Some(carrier.peer_usage);
@@ -1125,45 +1205,86 @@ fn publish_client_tcp_connection(
     endpoint_generation: u64,
     readiness_rtt: Option<Duration>,
 ) -> bool {
-    let (path_instance_id, peer_usage_sequence, peer_usage) = {
-        let connection = state
-            .connection
-            .as_ref()
-            .expect("TCP readiness requires an actor-owned connection");
-        (
-            connection.path_instance_id,
-            connection.carrier.peer_usage_sequence,
-            connection.carrier.peer_usage,
-        )
-    };
-    let mut authenticated_carrier = None;
-    let published = runtime
-        .state
-        .publish_tcp_peer_path_usage_for_endpoint_generation(
-            &runtime.endpoint_policy,
-            ClientTcpCarrierPublication {
-                path_index: runtime.path_index,
-                endpoint_generation,
-                path_instance_id,
-                peer_usage_sequence,
-                peer_usage,
+    runtime
+        .endpoint_policy
+        .with_current(endpoint_generation, || {
+            let connection = state
+                .connection
+                .as_mut()
+                .expect("TCP readiness requires an actor-owned connection");
+            publish_client_tcp_connection_committed(
+                runtime,
+                connection,
                 readiness_rtt,
-            },
-            || {
-                authenticated_carrier = Some(runtime.authenticated_carriers.register());
-                carrier_readiness.publish(path_instance_id);
-            },
-        );
-    if published {
-        state
-            .connection
-            .as_mut()
-            .expect("published TCP readiness retains its connection")
-            .retain_authenticated_carrier(
-                authenticated_carrier
-                    .take()
-                    .expect("TCP readiness transaction publishes authenticated carrier"),
+                |path_instance_id, remote_port| {
+                    carrier_readiness.publish(path_instance_id, remote_port);
+                },
             );
+        })
+        .is_some()
+}
+
+pub(super) fn publish_client_tcp_connection_committed(
+    runtime: &ClientTcpPathSessionRuntime,
+    connection: &mut ClientTcpPathConnection,
+    readiness_rtt: Option<Duration>,
+    publish_readiness: impl FnOnce(CarrierPathInstanceId, u16),
+) {
+    let path_instance_id = connection.path_instance_id;
+    let remote_port = connection.carrier.remote_port;
+    let mut authenticated_carrier = None;
+    runtime.state.publish_tcp_peer_path_usage_committed(
+        ClientTcpCarrierPublication {
+            path_index: runtime.path_index,
+            path_id: runtime.path_id(),
+            path_instance_id,
+            peer_usage_sequence: connection.carrier.peer_usage_sequence,
+            peer_usage: connection.carrier.peer_usage,
+            readiness_rtt,
+        },
+        || {
+            authenticated_carrier = Some(runtime.authenticated_carriers.register());
+            publish_readiness(path_instance_id, remote_port);
+        },
+    );
+    connection.retain_authenticated_carrier(
+        authenticated_carrier.expect("TCP readiness transaction publishes authenticated carrier"),
+    );
+}
+
+/// Publishes a provisional successor only if the predecessor still owns an
+/// exact Product-quiescent member. The shared path-state transaction also
+/// serializes every Product load reservation.
+pub(super) fn publish_client_tcp_replacement_connection_committed(
+    runtime: &ClientTcpPathSessionRuntime,
+    connection: &mut ClientTcpPathConnection,
+    predecessor_instance_id: CarrierPathInstanceId,
+    readiness_rtt: Option<Duration>,
+    publish_readiness: impl FnOnce(CarrierPathInstanceId, u16),
+) -> bool {
+    let path_instance_id = connection.path_instance_id;
+    let remote_port = connection.carrier.remote_port;
+    let mut authenticated_carrier = None;
+    let published = runtime.state.publish_tcp_replacement_if_product_quiescent(
+        predecessor_instance_id,
+        ClientTcpCarrierPublication {
+            path_index: runtime.path_index,
+            path_id: runtime.path_id(),
+            path_instance_id,
+            peer_usage_sequence: connection.carrier.peer_usage_sequence,
+            peer_usage: connection.carrier.peer_usage,
+            readiness_rtt,
+        },
+        || {
+            authenticated_carrier = Some(runtime.authenticated_carriers.register());
+            publish_readiness(path_instance_id, remote_port);
+        },
+    );
+    if published {
+        connection.retain_authenticated_carrier(
+            authenticated_carrier
+                .expect("TCP replacement transaction publishes authenticated carrier"),
+        );
     }
     published
 }

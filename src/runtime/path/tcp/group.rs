@@ -4,10 +4,15 @@
 //! endpoint establishment policy. Exact carrier actors retain ownership of
 //! sockets, wire ordering, Product attachments, and terminal failure.
 
+use crate::model::path::CarrierPathInstanceId;
+use crate::protocol::PathId;
+use crate::runtime::error::RuntimeError;
 use crate::runtime::path::ClientPathContext;
 use crate::runtime::path::model::path_record_failure_cooldown;
 use crate::scheduler::PathState as SchedulerPathState;
 use crate::transport::TcpCarrierRange;
+use std::collections::BTreeSet;
+use std::sync::Weak;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use tokio::sync::watch;
@@ -101,13 +106,65 @@ impl ClientTcpCarrierGroup {
 #[derive(Debug)]
 pub(in crate::runtime) struct ClientTcpCarrierGroups {
     groups: Box<[ClientTcpCarrierGroup]>,
+    resources: Mutex<ClientTcpCarrierResourceState>,
     changes: watch::Sender<()>,
+}
+
+#[derive(Debug)]
+struct ClientTcpCarrierResourceState {
+    occupied_by_group: Box<[u16]>,
+    occupied_path_ids: BTreeSet<u16>,
+    next_path_id: u16,
+}
+
+/// Exact physical-carrier reservation.
+///
+/// The reservation starts immediately before connection initiation and stays
+/// owned by that one actor through readiness, validation or ordinary use, and
+/// ordered drain. Dropping it releases both the group envelope and wire ID.
+#[derive(Debug)]
+pub(in crate::runtime) struct ClientTcpCarrierReservation {
+    owner: Weak<ClientTcpCarrierGroups>,
+    config_index: usize,
+    path_id: PathId,
+}
+
+impl ClientTcpCarrierReservation {
+    pub(in crate::runtime) fn path_id(&self) -> PathId {
+        self.path_id
+    }
+}
+
+impl Drop for ClientTcpCarrierReservation {
+    fn drop(&mut self) {
+        let Some(owner) = self.owner.upgrade() else {
+            return;
+        };
+        {
+            let mut resources = owner.resources.lock().expect("TCP carrier resource lock");
+            let occupied = resources
+                .occupied_by_group
+                .get_mut(self.config_index)
+                .expect("TCP carrier reservation group");
+            *occupied = occupied
+                .checked_sub(1)
+                .expect("TCP carrier group reservation released once");
+            assert!(
+                resources.occupied_path_ids.remove(&self.path_id.0),
+                "TCP wire PathId reservation released once"
+            );
+        }
+        owner.publish_change();
+    }
 }
 
 #[derive(Clone, Copy)]
 pub(in crate::runtime) struct ClientTcpMinimumRetry {
     endpoint_generation: u64,
     not_before: tokio::time::Instant,
+    hop_instance: Option<CarrierPathInstanceId>,
+    hop_not_before: Option<tokio::time::Instant>,
+    replacement_port: Option<u16>,
 }
 
 impl ClientTcpMinimumRetry {
@@ -115,17 +172,73 @@ impl ClientTcpMinimumRetry {
         Self {
             endpoint_generation: 0,
             not_before: now,
+            hop_instance: None,
+            hop_not_before: None,
+            replacement_port: None,
         }
+    }
+
+    pub(in crate::runtime) fn next_maintenance_at(&self) -> Option<tokio::time::Instant> {
+        self.hop_not_before
     }
 }
 
 impl ClientTcpCarrierGroups {
     pub(in crate::runtime) fn new(groups: Vec<ClientTcpCarrierGroup>) -> Arc<Self> {
         let (changes, _) = watch::channel(());
+        let occupied_by_group = vec![0; groups.len()].into_boxed_slice();
         Arc::new(Self {
             groups: groups.into_boxed_slice(),
+            resources: Mutex::new(ClientTcpCarrierResourceState {
+                occupied_by_group,
+                occupied_path_ids: BTreeSet::new(),
+                next_path_id: 0,
+            }),
             changes,
         })
+    }
+
+    /// Reserves one physical carrier and a concurrently unique TCP `PathId`.
+    ///
+    /// Unoccupied configured maximum capacity has no actor, command queue,
+    /// health record, or protocol identity.
+    pub(in crate::runtime) fn reserve(
+        self: &Arc<Self>,
+        config_index: usize,
+    ) -> Option<ClientTcpCarrierReservation> {
+        let group = self.get(config_index)?;
+        let mut resources = self.resources.lock().expect("TCP carrier resource lock");
+        let occupied = *resources.occupied_by_group.get(config_index)?;
+        if occupied >= group.range.max() {
+            return None;
+        }
+
+        let mut candidate = resources.next_path_id;
+        let path_id = (0..=u16::MAX).find_map(|_| {
+            let available = !resources.occupied_path_ids.contains(&candidate);
+            let selected = available.then_some(candidate);
+            candidate = candidate.wrapping_add(1);
+            selected
+        })?;
+        resources.next_path_id = candidate;
+        resources.occupied_path_ids.insert(path_id);
+        resources.occupied_by_group[config_index] = occupied + 1;
+        drop(resources);
+
+        Some(ClientTcpCarrierReservation {
+            owner: Arc::downgrade(self),
+            config_index,
+            path_id: PathId(path_id),
+        })
+    }
+
+    pub(in crate::runtime) fn occupied(&self, config_index: usize) -> Option<u16> {
+        self.resources
+            .lock()
+            .expect("TCP carrier resource lock")
+            .occupied_by_group
+            .get(config_index)
+            .copied()
     }
 
     pub(in crate::runtime) fn iter(&self) -> std::slice::Iter<'_, ClientTcpCarrierGroup> {
@@ -155,9 +268,38 @@ impl ClientTcpCarrierGroups {
         self.changes.subscribe()
     }
 
-    /// Restores only configured-minimum members. Distinct missing members may
-    /// establish concurrently, while each exact actor serializes its commands.
-    pub(in crate::runtime) async fn reconcile_configured_minimum(
+    pub(in crate::runtime) fn next_maintenance_at(
+        &self,
+        context: &ClientPathContext,
+        retry: &[ClientTcpMinimumRetry],
+    ) -> Option<tokio::time::Instant> {
+        self.iter()
+            .filter(|group| {
+                group.policy.snapshot().enabled
+                    && group.members.iter().all(|path_index| {
+                        context
+                            .tcp_sessions
+                            .get(*path_index)
+                            .is_some_and(|session| session.connection_instance_id().is_some())
+                    })
+            })
+            .flat_map(|group| group.members.iter().copied())
+            .filter(|path_index| {
+                context
+                    .tcp_sessions
+                    .get(*path_index)
+                    .is_some_and(|session| {
+                        session.can_plan_replacement() && session.is_product_quiescent()
+                    })
+            })
+            .filter_map(|path_index| retry.get(path_index)?.next_maintenance_at())
+            .min()
+    }
+
+    /// Reconciles durable minimum capacity and planned ranged-port
+    /// replacement. Distinct missing members may establish concurrently; a
+    /// minimum member has at most one current establishment or successor.
+    pub(in crate::runtime) async fn reconcile(
         &self,
         context: &ClientPathContext,
         connect_timeout: Duration,
@@ -171,7 +313,7 @@ impl ClientTcpCarrierGroups {
         );
 
         let now = tokio::time::Instant::now();
-        let mut attempts = tokio::task::JoinSet::new();
+        let mut minimum_attempts = tokio::task::JoinSet::new();
         for group in self.iter() {
             let policy_snapshot = group.policy.snapshot();
             if !policy_snapshot.enabled {
@@ -188,8 +330,33 @@ impl ClientTcpCarrierGroups {
                 if retry.endpoint_generation != policy_snapshot.generation {
                     retry.endpoint_generation = policy_snapshot.generation;
                     retry.not_before = now;
+                    retry.hop_instance = None;
+                    retry.hop_not_before = None;
+                    retry.replacement_port = None;
                 }
-                if session.is_connection_ready() || retry.not_before > now {
+                let ready_instance = session.connection_instance_id();
+                if retry.hop_instance != ready_instance {
+                    retry.hop_instance = ready_instance;
+                    retry.hop_not_before = ready_instance.and_then(|_| {
+                        context
+                            .tcp_paths
+                            .get(path_index)
+                            .and_then(|path| path.port_hop_interval())
+                            .map(|interval| now + interval)
+                    });
+                }
+                if ready_instance.is_some() {
+                    continue;
+                }
+                retry.hop_instance = None;
+                retry.hop_not_before = None;
+                if !session.can_establish_minimum() {
+                    continue;
+                }
+                if self.occupied(group.config_index).unwrap_or_default() >= group.range.max() {
+                    continue;
+                }
+                if retry.not_before > now {
                     continue;
                 }
                 // The existing probe interval bounds attempt start rate.
@@ -198,26 +365,172 @@ impl ClientTcpCarrierGroups {
                 // spin.
                 retry.not_before = now + retry_interval;
                 let session = session.clone();
-                attempts.spawn(async move {
+                let replacement_port = retry.replacement_port.take();
+                minimum_attempts.spawn(async move {
                     let deadline = tokio::time::Instant::now() + connect_timeout;
-                    let _ = session
-                        .prepare_connection_for_endpoint_generation(
+                    session
+                        .prepare_connection_for_endpoint_generation_on_port(
                             deadline,
                             policy_snapshot.generation,
+                            replacement_port,
                         )
-                        .await;
+                        .await
                 });
             }
         }
 
-        while let Some(attempt) = attempts.join_next().await {
-            if let Err(error) = attempt {
-                crate::observability::process_event!(
-                    Warn,
-                    "tcp",
-                    "minimum_reconciliation_task_failed",
-                    "configured-minimum TCP carrier task failed: {error}"
-                );
+        while let Some(attempt) = minimum_attempts.join_next().await {
+            match attempt {
+                Ok(Ok(_)) | Ok(Err(_)) => {}
+                Err(error) => {
+                    crate::observability::process_event!(
+                        Warn,
+                        "tcp",
+                        "minimum_reconciliation_task_failed",
+                        "configured-minimum TCP carrier task failed: {error}"
+                    );
+                }
+            }
+        }
+
+        // Optional port replacement is considered only after every durable
+        // minimum member is ready. It can therefore never consume a
+        // reservation needed to restore the configured minimum.
+        let now = tokio::time::Instant::now();
+        let mut replacement_attempts = tokio::task::JoinSet::new();
+        for group in self.iter() {
+            let policy_snapshot = group.policy.snapshot();
+            if !policy_snapshot.enabled
+                || !group.members.iter().all(|path_index| {
+                    context
+                        .tcp_sessions
+                        .get(*path_index)
+                        .is_some_and(|session| session.connection_instance_id().is_some())
+                })
+            {
+                continue;
+            }
+
+            // One planned replacement is initiated per group reconciliation.
+            // The successor publication or terminal predecessor release wakes
+            // the owner before another member can be considered.
+            for &path_index in &group.members {
+                let session = context
+                    .tcp_sessions
+                    .get(path_index)
+                    .expect("TCP group member must have one carrier actor");
+                let retry = retry
+                    .get_mut(path_index)
+                    .expect("TCP group member must have retry state");
+                let ready_instance = session.connection_instance_id();
+                if retry.hop_instance != ready_instance {
+                    retry.hop_instance = ready_instance;
+                    retry.hop_not_before = ready_instance.and_then(|_| {
+                        context
+                            .tcp_paths
+                            .get(path_index)
+                            .and_then(|path| path.port_hop_interval())
+                            .map(|interval| now + interval)
+                    });
+                }
+                let Some(hop_not_before) = retry.hop_not_before else {
+                    continue;
+                };
+                if hop_not_before > now
+                    || !session.can_plan_replacement()
+                    || !session.is_product_quiescent()
+                {
+                    continue;
+                }
+                let Some(current_port) = session.connection_remote_port() else {
+                    continue;
+                };
+                let Some(path) = context.tcp_paths.get(path_index) else {
+                    continue;
+                };
+                let Some(interval) = path.port_hop_interval() else {
+                    continue;
+                };
+                let remote_port = match path.endpoint.ports().select_other(current_port) {
+                    Ok(remote_port) => remote_port,
+                    Err(error) => {
+                        retry.hop_not_before = Some(now + interval);
+                        crate::observability::process_event!(
+                            Warn,
+                            "tcp",
+                            "port_replacement_selection_failed",
+                            "TCP carrier replacement port selection failed: {error}"
+                        );
+                        continue;
+                    }
+                };
+                if self.occupied(group.config_index).unwrap_or_default() < group.range.max() {
+                    let session = session.clone();
+                    replacement_attempts.spawn(async move {
+                        let deadline = tokio::time::Instant::now() + connect_timeout;
+                        (
+                            path_index,
+                            interval,
+                            session
+                                .replace_connection_for_endpoint_generation(
+                                    deadline,
+                                    policy_snapshot.generation,
+                                    remote_port,
+                                )
+                                .await
+                                .map(|_| ()),
+                        )
+                    });
+                } else {
+                    match session.begin_connection_replacement_if_product_quiescent(
+                        policy_snapshot.generation,
+                    ) {
+                        Ok(true) => {
+                            retry.replacement_port = Some(remote_port);
+                            retry.hop_not_before = None;
+                            retry.not_before = now;
+                        }
+                        Ok(false) | Err(RuntimeError::NoSchedulableTcpPath) => {}
+                        Err(error) => {
+                            retry.hop_not_before = Some(now + interval);
+                            crate::observability::process_event!(
+                                Warn,
+                                "tcp",
+                                "port_replacement_failed",
+                                "planned TCP carrier replacement failed: {error}"
+                            );
+                        }
+                    }
+                }
+                break;
+            }
+        }
+
+        while let Some(attempt) = replacement_attempts.join_next().await {
+            match attempt {
+                Ok((path_index, _, Ok(())))
+                | Ok((path_index, _, Err(RuntimeError::NoSchedulableTcpPath))) => {
+                    let _ = path_index;
+                }
+                Ok((path_index, interval, Err(error))) => {
+                    if let Some(retry) = retry.get_mut(path_index) {
+                        retry.hop_not_before = Some(tokio::time::Instant::now() + interval);
+                    }
+                    crate::observability::process_event!(
+                        Warn,
+                        "tcp",
+                        "port_replacement_failed",
+                        "planned TCP carrier replacement failed: {error}"
+                    );
+                }
+                Err(error) => {
+                    crate::observability::process_event!(
+                        Warn,
+                        "tcp",
+                        "port_replacement_task_failed",
+                        "planned TCP carrier replacement task failed: {error}"
+                    );
+                }
             }
         }
     }

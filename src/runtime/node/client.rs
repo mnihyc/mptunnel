@@ -161,20 +161,28 @@ pub(in crate::runtime) async fn run_path_probe_service(
     ticker.tick().await;
 
     groups
-        .reconcile_configured_minimum(&context, timeout, interval, &mut retry)
+        .reconcile(&context, timeout, interval, &mut retry)
         .await;
 
     loop {
+        let maintenance_at = groups.next_maintenance_at(&context, &retry);
+        let maintenance_timer = async {
+            match maintenance_at {
+                Some(deadline) => tokio::time::sleep_until(deadline).await,
+                None => std::future::pending::<()>().await,
+            }
+        };
+        tokio::pin!(maintenance_timer);
         tokio::select! {
             changed = changes.changed() => {
                 changed.expect("TCP carrier group sender lives with path context");
                 groups
-                    .reconcile_configured_minimum(
-                        &context,
-                        timeout,
-                        interval,
-                        &mut retry,
-                    )
+                    .reconcile(&context, timeout, interval, &mut retry)
+                    .await;
+            }
+            _ = &mut maintenance_timer => {
+                groups
+                    .reconcile(&context, timeout, interval, &mut retry)
                     .await;
             }
             _ = ticker.tick() => {
@@ -185,12 +193,7 @@ pub(in crate::runtime) async fn run_path_probe_service(
                     });
                 }
                 groups
-                    .reconcile_configured_minimum(
-                        &context,
-                        timeout,
-                        interval,
-                        &mut retry,
-                    )
+                    .reconcile(&context, timeout, interval, &mut retry)
                     .await;
             }
             measurement = measurements.join_next(), if !measurements.is_empty() => {

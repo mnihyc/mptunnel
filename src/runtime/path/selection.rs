@@ -135,7 +135,12 @@ impl ClientPathContext {
             return None;
         }
         drop(health);
-        Some(RelayPathLoadLease::new(self.state.clone(), key, lane))
+        Some(RelayPathLoadLease::new(
+            self.state.clone(),
+            key,
+            lane,
+            self.tcp_carrier_groups.clone(),
+        ))
     }
 
     pub(in crate::runtime) fn reserve_reliable_stream_path(
@@ -237,7 +242,12 @@ impl ClientPathContext {
                 candidates.len(),
             ),
         );
-        Some(RelayPathLoadLease::new(self.state.clone(), selected, lane))
+        Some(RelayPathLoadLease::new(
+            self.state.clone(),
+            selected,
+            lane,
+            self.tcp_carrier_groups.clone(),
+        ))
     }
 
     pub(in crate::runtime) fn ordered_reliable_path_keys(
@@ -608,7 +618,10 @@ impl ClientPathContext {
                     shared_snapshot: Some(path_snapshot(path, key.index, observation)),
                     tcp: (key.underlay == UnderlayProtocol::Tcp).then(|| {
                         ReliableRequestTcpPathEvidence {
-                            startup_snapshot: path_startup_snapshot(path, PathId(key.index as u16)),
+                            startup_snapshot: path_startup_snapshot(
+                                path,
+                                observation.wire_path_id.unwrap_or(PathId(key.index as u16)),
+                            ),
                             rate_hint_unknown: path.metadata.initial_rate == RateHint::Unknown,
                         }
                     }),

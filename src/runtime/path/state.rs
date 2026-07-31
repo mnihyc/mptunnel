@@ -6,8 +6,8 @@
 use super::commands::CapacityProbeCommandTicket;
 use super::health::{ClientPathHealth, RequestCapacityReconciliationView};
 use super::model::{
-    PathDeliveryStats, UdpDatagramPathObservation, path_observation_is_idle_for_probe,
-    path_records_have_schedulable_alternative,
+    ClientPathObservation, PathDeliveryStats, UdpDatagramPathObservation,
+    path_observation_is_idle_for_probe, path_records_have_schedulable_alternative,
 };
 #[cfg(test)]
 use super::proof::PathProofObservation;
@@ -15,12 +15,12 @@ use super::set::ClientPathContext;
 use super::tcp::capacity::{
     RequestTcpCapacityProbeLease, RequestTcpCapacityProbeSession, RequestTcpCapacityProofQuery,
 };
-use super::tcp::group::ClientTcpEndpointPolicy;
+use super::tcp::group::{ClientTcpCarrierGroups, ClientTcpEndpointPolicy};
 #[cfg(test)]
 use super::*;
 use crate::model::capacity::{PathRateSample, reliable_capacity_measurement_session_limit_bytes};
 use crate::model::path::{CarrierPathInstanceId, RelayPathInstance, RelayPathKey};
-use crate::protocol::{DatagramFlowId, PathUsage, StreamId, UnderlayProtocol};
+use crate::protocol::{DatagramFlowId, PathId, PathUsage, StreamId, UnderlayProtocol};
 use crate::runtime::error::RuntimeError;
 use crate::scheduler::TrafficClass;
 use std::collections::HashMap;
@@ -32,7 +32,7 @@ use std::time::{Duration, Instant};
 
 pub(in crate::runtime) struct ClientTcpCarrierPublication {
     pub(in crate::runtime) path_index: usize,
-    pub(in crate::runtime) endpoint_generation: u64,
+    pub(in crate::runtime) path_id: PathId,
     pub(in crate::runtime) path_instance_id: CarrierPathInstanceId,
     pub(in crate::runtime) peer_usage_sequence: u64,
     pub(in crate::runtime) peer_usage: PathUsage,
@@ -43,6 +43,9 @@ pub(in crate::runtime) struct ClientTcpCarrierPublication {
 #[derive(Debug)]
 pub(in crate::runtime) struct ClientPathState {
     health: Mutex<ClientPathHealth>,
+    // Accessed only while `health` is locked so logical Product ownership and
+    // physical replacement share one transaction boundary.
+    active_product_flows: AtomicU64,
     next_reliable_stream_id: Mutex<u64>,
     next_datagram_flow_id: Mutex<u64>,
     request_tcp_capacity_probe: RequestTcpCapacityProbeSession,
@@ -53,6 +56,7 @@ impl ClientPathState {
         let tcp_path_count = health.tcp.len();
         Arc::new(Self {
             health: Mutex::new(health),
+            active_product_flows: AtomicU64::new(0),
             next_reliable_stream_id: Mutex::new(0),
             next_datagram_flow_id: Mutex::new(0),
             request_tcp_capacity_probe: RequestTcpCapacityProbeSession::new(tcp_path_count),
@@ -61,6 +65,19 @@ impl ClientPathState {
 
     pub(in crate::runtime) fn health(&self) -> &Mutex<ClientPathHealth> {
         &self.health
+    }
+
+    pub(in crate::runtime) fn tcp_path_observation_for_instance(
+        &self,
+        index: usize,
+        path_instance_id: CarrierPathInstanceId,
+    ) -> Option<ClientPathObservation> {
+        self.health
+            .lock()
+            .expect("client path health lock")
+            .tcp
+            .get(index)?
+            .observation_for_instance_at(path_instance_id, Instant::now())
     }
 
     /// Installs the first preference from a newly authenticated carrier. A new
@@ -83,32 +100,116 @@ impl ClientPathState {
         }
     }
 
-    /// Publishes authenticated TCP health and actor readiness in one policy
-    /// transaction.
-    pub(in crate::runtime) fn publish_tcp_peer_path_usage_for_endpoint_generation(
+    /// Publishes while the caller owns the matching endpoint-policy
+    /// commitment. This permits a minimum-member supervisor to swap its
+    /// physical command owner in the same health transaction.
+    pub(in crate::runtime) fn publish_tcp_peer_path_usage_committed(
         &self,
-        endpoint_policy: &ClientTcpEndpointPolicy,
+        publication: ClientTcpCarrierPublication,
+        publish_readiness: impl FnOnce(),
+    ) {
+        let mut health = self.health.lock().expect("client path health lock");
+        let record = health
+            .tcp
+            .get_mut(publication.path_index)
+            .expect("TCP carrier actor must have one health record");
+        record.install_tcp_peer_usage(
+            publication.path_id,
+            publication.path_instance_id,
+            publication.peer_usage_sequence,
+            publication.peer_usage,
+        );
+        if let Some(readiness_rtt) = publication.readiness_rtt {
+            record.mark_success(readiness_rtt);
+        }
+        publish_readiness();
+    }
+
+    /// Commits a provisional TCP successor only while the predecessor still
+    /// owns the stable member and has no Product ownership. Product admission
+    /// uses this same health lock, so no open can cross the instance swap.
+    pub(in crate::runtime) fn publish_tcp_replacement_if_product_quiescent(
+        &self,
+        predecessor_instance_id: CarrierPathInstanceId,
         publication: ClientTcpCarrierPublication,
         publish_readiness: impl FnOnce(),
     ) -> bool {
-        endpoint_policy
-            .with_current(publication.endpoint_generation, || {
-                let mut health = self.health.lock().expect("client path health lock");
-                let record = health
-                    .tcp
-                    .get_mut(publication.path_index)
-                    .expect("TCP carrier actor must have one health record");
-                record.install_peer_usage(
-                    publication.path_instance_id,
-                    publication.peer_usage_sequence,
-                    publication.peer_usage,
-                );
-                if let Some(readiness_rtt) = publication.readiness_rtt {
-                    record.mark_success(readiness_rtt);
-                }
-                publish_readiness();
+        let mut health = self.health.lock().expect("client path health lock");
+        if self.active_product_flows.load(Ordering::Relaxed) != 0 || !health.is_product_quiescent()
+        {
+            return false;
+        }
+        let record = health
+            .tcp
+            .get_mut(publication.path_index)
+            .expect("TCP carrier actor must have one health record");
+        if !record.is_product_quiescent_for_instance(predecessor_instance_id) {
+            return false;
+        }
+        record.install_tcp_peer_usage(
+            publication.path_id,
+            publication.path_instance_id,
+            publication.peer_usage_sequence,
+            publication.peer_usage,
+        );
+        if let Some(readiness_rtt) = publication.readiness_rtt {
+            record.mark_success(readiness_rtt);
+        }
+        publish_readiness();
+        true
+    }
+
+    pub(in crate::runtime) fn tcp_path_is_product_quiescent_for_instance(
+        &self,
+        index: usize,
+        path_instance_id: CarrierPathInstanceId,
+    ) -> bool {
+        let health = self.health.lock().expect("client path health lock");
+        self.active_product_flows.load(Ordering::Relaxed) == 0
+            && health.is_product_quiescent()
+            && health
+                .tcp
+                .get(index)
+                .is_some_and(|record| record.is_product_quiescent_for_instance(path_instance_id))
+    }
+
+    /// Fences a no-spare replacement at the same exact Product-admission
+    /// boundary. Marking the record draining makes all later load reservations
+    /// fail before the physical actor receives its ordered drain request.
+    pub(in crate::runtime) fn begin_tcp_replacement_if_product_quiescent(
+        &self,
+        index: usize,
+        path_instance_id: CarrierPathInstanceId,
+    ) -> bool {
+        let mut health = self.health.lock().expect("client path health lock");
+        if self.active_product_flows.load(Ordering::Relaxed) != 0 || !health.is_product_quiescent()
+        {
+            return false;
+        }
+        let Some(record) = health.tcp.get_mut(index) else {
+            return false;
+        };
+        if !record.is_product_quiescent_for_instance(path_instance_id) {
+            return false;
+        }
+        record.begin_planned_retirement();
+        true
+    }
+
+    fn acquire_product_flow(&self) {
+        let _health = self.health.lock().expect("client path health lock");
+        self.active_product_flows
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |active| {
+                active.checked_add(1)
             })
-            .is_some()
+            .expect("bounded Product flow count cannot overflow");
+    }
+
+    fn release_product_flow(&self) -> bool {
+        let health = self.health.lock().expect("client path health lock");
+        let previous = self.active_product_flows.fetch_sub(1, Ordering::Relaxed);
+        assert!(previous > 0, "Product flow ownership released exactly once");
+        previous == 1 && health.is_product_quiescent()
     }
 
     pub(in crate::runtime) fn mark_tcp_path_establishment_failure_for_endpoint_generation(
@@ -217,15 +318,17 @@ impl ClientPathState {
         &self.request_tcp_capacity_probe
     }
 
-    fn release_relay_path_load(&self, key: RelayPathKey, lane: TrafficClass) {
+    fn release_relay_path_load(&self, key: RelayPathKey, lane: TrafficClass) -> bool {
         let mut health = self.health.lock().expect("client path health lock");
         let records = match key.underlay {
             UnderlayProtocol::Tcp => &mut health.tcp,
             UnderlayProtocol::Udp => &mut health.udp,
         };
-        if let Some(record) = records.get_mut(key.index) {
-            record.release_load(lane);
-        }
+        let Some(record) = records.get_mut(key.index) else {
+            return false;
+        };
+        record.release_load(lane);
+        self.active_product_flows.load(Ordering::Relaxed) == 0 && health.is_product_quiescent()
     }
 }
 
@@ -390,11 +493,38 @@ pub(in crate::runtime) struct RelayPathLoadLease {
     state: Arc<ClientPathState>,
     key: RelayPathKey,
     lane: TrafficClass,
+    tcp_carrier_groups: Arc<ClientTcpCarrierGroups>,
+}
+
+/// Session-owned logical Product lifetime, independent of telemetry and exact
+/// physical attachment membership. It covers peer-direction work, retention,
+/// and recovery until the Product flow itself becomes terminal.
+pub(in crate::runtime) struct ClientSessionProductFlowLease {
+    state: Arc<ClientPathState>,
+    tcp_carrier_groups: Arc<ClientTcpCarrierGroups>,
+}
+
+impl Drop for ClientSessionProductFlowLease {
+    fn drop(&mut self) {
+        if self.state.release_product_flow() {
+            self.tcp_carrier_groups.publish_change();
+        }
+    }
 }
 
 impl RelayPathLoadLease {
-    pub(super) fn new(state: Arc<ClientPathState>, key: RelayPathKey, lane: TrafficClass) -> Self {
-        Self { state, key, lane }
+    pub(super) fn new(
+        state: Arc<ClientPathState>,
+        key: RelayPathKey,
+        lane: TrafficClass,
+        tcp_carrier_groups: Arc<ClientTcpCarrierGroups>,
+    ) -> Self {
+        Self {
+            state,
+            key,
+            lane,
+            tcp_carrier_groups,
+        }
     }
 
     pub(in crate::runtime) fn set_recorded_lane(&mut self, lane: TrafficClass) {
@@ -408,13 +538,24 @@ impl RelayPathLoadLease {
 
 impl Drop for RelayPathLoadLease {
     fn drop(&mut self) {
-        self.state.release_relay_path_load(self.key, self.lane);
+        let product_quiescent = self.state.release_relay_path_load(self.key, self.lane);
+        if product_quiescent {
+            self.tcp_carrier_groups.publish_change();
+        }
     }
 }
 
 impl ClientPathContext {
     pub(in crate::runtime) fn health(&self) -> &Mutex<ClientPathHealth> {
         self.state.health()
+    }
+
+    pub(in crate::runtime) fn reserve_session_product_flow(&self) -> ClientSessionProductFlowLease {
+        self.state.acquire_product_flow();
+        ClientSessionProductFlowLease {
+            state: self.state.clone(),
+            tcp_carrier_groups: self.tcp_carrier_groups.clone(),
+        }
     }
 
     pub(in crate::runtime) fn request_tcp_capacity_probe_remaining_bytes(&self) -> u64 {
@@ -557,9 +698,15 @@ impl ClientPathContext {
             return None;
         }
         drop(health);
-        Some(RelayPathLoadLease::new(self.state.clone(), key, lane))
+        Some(RelayPathLoadLease::new(
+            self.state.clone(),
+            key,
+            lane,
+            self.tcp_carrier_groups.clone(),
+        ))
     }
 
+    #[cfg(test)]
     pub(in crate::runtime) fn mark_tcp_path_open_success(
         &self,
         index: usize,
@@ -578,6 +725,7 @@ impl ClientPathContext {
         }
     }
 
+    #[cfg(test)]
     pub(in crate::runtime) fn mark_tcp_path_reserved_open_success(
         &self,
         index: usize,
@@ -593,6 +741,23 @@ impl ClientPathContext {
         {
             current.mark_reserved_open_success(elapsed);
         }
+    }
+
+    pub(in crate::runtime) fn mark_tcp_path_reserved_open_success_for_instance(
+        &self,
+        index: usize,
+        path_instance_id: CarrierPathInstanceId,
+        elapsed: Duration,
+    ) -> bool {
+        self.state
+            .health
+            .lock()
+            .expect("client path health lock")
+            .tcp
+            .get_mut(index)
+            .is_some_and(|current| {
+                current.mark_reserved_open_success_for_instance(path_instance_id, elapsed)
+            })
     }
 
     #[cfg(test)]
@@ -625,6 +790,7 @@ impl ClientPathContext {
             })
     }
 
+    #[cfg(test)]
     pub(in crate::runtime) fn release_tcp_path_load(&self, index: usize, lane: TrafficClass) {
         if let Some(current) = self
             .state
@@ -706,8 +872,13 @@ impl ClientPathContext {
             UnderlayProtocol::Tcp => &mut health.tcp,
             UnderlayProtocol::Udp => &mut health.udp,
         };
-        if let Some(current) = records.get_mut(instance.key.index) {
-            current.release_relay_inflight(instance.path_instance_id, bytes);
+        let product_quiescent = records.get_mut(instance.key.index).is_some_and(|current| {
+            current.release_relay_inflight(instance.path_instance_id, bytes)
+        }) && self.state.active_product_flows.load(Ordering::Relaxed) == 0
+            && health.is_product_quiescent();
+        drop(health);
+        if product_quiescent {
+            self.tcp_carrier_groups.publish_change();
         }
     }
 

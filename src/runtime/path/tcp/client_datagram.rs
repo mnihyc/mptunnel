@@ -8,6 +8,7 @@ use crate::protocol::{DatagramFlowId, Frame, TargetAddr};
 use crate::runtime::error::RuntimeError;
 use crate::runtime::path::commands::{ReliablePathCommand, ReliablePathCommandSender};
 use crate::runtime::recent_ids::RecentIdCache;
+use crate::scheduler::PathSnapshot;
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
 use tokio::sync::{mpsc, oneshot};
@@ -78,6 +79,7 @@ fn next_client_tcp_datagram_attachment_id() -> u64 {
 pub(in crate::runtime) struct ClientTcpDatagramAttachment {
     attachment_id: u64,
     path_instance_id: CarrierPathInstanceId,
+    path_snapshot: PathSnapshot,
     commands: ReliablePathCommandSender,
     frames: mpsc::Receiver<Result<ClientTcpDatagramInbound, RuntimeError>>,
     failure: oneshot::Receiver<()>,
@@ -101,6 +103,7 @@ impl ClientTcpDatagramAttachment {
     pub(super) fn new(
         attachment_id: u64,
         path_instance_id: CarrierPathInstanceId,
+        path_snapshot: PathSnapshot,
         commands: ReliablePathCommandSender,
         frames: mpsc::Receiver<Result<ClientTcpDatagramInbound, RuntimeError>>,
         failure: oneshot::Receiver<()>,
@@ -108,6 +111,7 @@ impl ClientTcpDatagramAttachment {
         Self {
             attachment_id,
             path_instance_id,
+            path_snapshot,
             commands,
             frames,
             failure,
@@ -121,6 +125,10 @@ impl ClientTcpDatagramAttachment {
 
     pub(in crate::runtime) fn path_instance_id(&self) -> CarrierPathInstanceId {
         self.path_instance_id
+    }
+
+    pub(in crate::runtime) fn path_snapshot(&self) -> PathSnapshot {
+        self.path_snapshot
     }
 
     pub(in crate::runtime) async fn open_flow(

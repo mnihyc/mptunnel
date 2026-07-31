@@ -520,7 +520,7 @@ impl ServerTcpPathSession {
                 let response =
                     self.peer_status
                         .response_frame(request_id, self.context.codec_limits, || {
-                            self.context.peer_status_snapshot(self.session_id)
+                            Some(self.context.peer_status_snapshot(self.session_id))
                         });
                 self.write_reply(response).await
             }

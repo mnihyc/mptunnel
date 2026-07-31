@@ -62,7 +62,7 @@ fn response_reports_unavailable_instead_of_exceeding_codec_limit() {
         ..CodecLimits::default()
     };
     assert_eq!(
-        carrier.response_frame(10, limits, || vec![status(1)]),
+        carrier.response_frame(10, limits, || Some(vec![status(1)])),
         Frame::PeerStatusResponse {
             request_id: 10,
             code: PeerStatusCode::Unavailable,
@@ -85,7 +85,7 @@ fn incoming_requests_are_rate_limited_across_session_carriers() {
     let second = broker.register(SessionId(12));
     assert_eq!(broker.carrier_count(SessionId(12)), 2);
     assert!(matches!(
-        first.response_frame(1, CodecLimits::default(), || vec![status(1)]),
+        first.response_frame(1, CodecLimits::default(), || Some(vec![status(1)])),
         Frame::PeerStatusResponse {
             code: PeerStatusCode::Ok,
             ..
@@ -97,6 +97,20 @@ fn incoming_requests_are_rate_limited_across_session_carriers() {
         }),
         Frame::PeerStatusResponse {
             request_id: 2,
+            code: PeerStatusCode::Unavailable,
+            paths: Vec::new(),
+        }
+    );
+}
+
+#[test]
+fn unrepresentable_snapshot_reports_unavailable() {
+    let broker = PeerStatusBroker::new(true);
+    let carrier = broker.register(SessionId(13));
+    assert_eq!(
+        carrier.response_frame(3, CodecLimits::default(), || None),
+        Frame::PeerStatusResponse {
+            request_id: 3,
             code: PeerStatusCode::Unavailable,
             paths: Vec::new(),
         }

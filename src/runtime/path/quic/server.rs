@@ -358,7 +358,7 @@ async fn run_server_udp_control_stream(
         let outgoing = match event {
             ServerUdpControlEvent::Frame(Ok(Frame::PeerStatusRequest { request_id })) => Some(
                 peer_status.response_frame(request_id, context.codec_limits, || {
-                    context.peer_status_snapshot(session_id)
+                    Some(context.peer_status_snapshot(session_id))
                 }),
             ),
             ServerUdpControlEvent::Frame(Ok(Frame::PeerStatusResponse {

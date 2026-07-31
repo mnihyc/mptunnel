@@ -3486,3 +3486,68 @@ entry is authoritative.
   - the complete root library suite passed: 1,420 tests;
   - every Cargo target compiles under the locked dependency graph; and
   - formatting and whitespace checks passed.
+
+## 2026-07-31T23:33:22+08:00: Exact TCP carrier ownership and quiescent port replacement
+
+- Name: bounded configured-minimum TCP lifecycle with ranged-port replacement
+- Category: Core runtime, RFC alignment, and disruption safety
+- State: implementation and deterministic acceptance complete; elastic
+  expansion and representative performance labs remain the next gate
+- Content:
+  - made the session TCP carrier group own every physical reservation,
+    concurrently unique wire `PathId`, configured-minimum member, connection
+    attempt, current instance, provisional successor, and retiring predecessor;
+  - removed Product opens as implicit connection owners: one session service
+    now reconciles missing configured-minimum members, and exact actor terminal
+    state plus reservation release wakes replacement without locator or source
+    address inference;
+  - made authenticated peer status report the exact physical carrier inventory
+    and reject overlapping/incomplete stable-member observations instead of
+    publishing a partial logical view;
+  - made attachment and native transport observations retain their exact
+    physical instance so an old carrier cannot borrow a successor's health,
+    capacity, or failure authority;
+  - established one authoritative session Product-flow owner, independent of
+    telemetry, for the complete reliable or datagram logical lifetime,
+    including peer-direction work, retention, and recovery;
+  - moved TCP datagram path-load ownership before carrier I/O and retained it
+    with the exact attachment, matching the established reliable-open
+    transaction;
+  - defined planned TCP port replacement at an exact session
+    Product-quiescent boundary: a spare-capacity successor authenticates first
+    and commits atomically or is discarded, while a full group fences and
+    drains the predecessor before restoring the selected alternate port;
+  - made final logical-flow, cross-underlay load, and relay-flight release wake
+    an already-overdue hop, while the configured hop interval remains only an
+    eligibility boundary and never proves quiescence or usefulness; and
+  - kept `1-3` as the default configured TCP carrier range and preserved the
+    configured maximum across establishing, ready, and draining instances.
+- Ordinary-path cost:
+  - one session-flow ownership increment/decrement occurs at logical Product
+    flow creation/terminal release, not per packet;
+  - existing path-load and relay-flight release transactions publish a carrier
+    lifecycle event only on the final session Product-quiescent transition;
+  - no scheduler score, congestion controller, packet format, transport
+    parameter, retransmission timing, hop interval, or performance threshold
+    changed.
+- Evidence:
+  - the persistent session-ownership regression proves a logical Product flow
+    with zero attachments and cross-underlay Product load both fence TCP
+    replacement, and their final release wakes maintenance;
+  - the ranged spare-capacity integration test carries Product traffic beyond
+    the five-second hop interval without establishing a successor, then proves
+    owner-event-driven make-before-break replacement, alternate-port
+    selection, physical overlap, stable `SessionId`, fresh carrier instance,
+    distinct concurrent `PathId`, and exact predecessor reservation release;
+  - the maximum-one integration test uses an unrelated 60-second probe
+    interval, proves no drain while Product traffic is active, then converges
+    after the owner event within its bounded test deadline without exceeding
+    one physical carrier;
+  - the complete root library suite passed: 1,436 tests;
+  - all targets and all features passed Clippy with warnings denied;
+  - the standalone patched `quinn-proto` suite passed: 282 unit tests and 3
+    doctests; and
+  - formatting and whitespace checks passed. This milestone establishes
+    correctness and lifecycle timing; it does not claim a new throughput
+    verdict. Historical restoration and the representative competitive lab
+    matrix remain mandatory before release.

@@ -64,8 +64,34 @@ pub async fn connect_path_with_provider(
     options: TcpConnectOptions,
     provider: &dyn CarrierNetworkProvider,
 ) -> Result<TcpStream, TcpTransportError> {
+    let authority = path.endpoint.authority();
+    let remote_port = path.endpoint.ports().select().map_err(|error| {
+        TcpTransportError::Io(std::io::Error::other(format!(
+            "could not select a carrier port for {authority}: {error}"
+        )))
+    })?;
+    connect_path_with_provider_to_port(path, identity, remote_port, options, provider).await
+}
+
+/// Connects one carrier establishment to an already selected configured port.
+///
+/// Selection is separate so a lifecycle owner can retain the exact port with
+/// the physical carrier and choose a different one for planned replacement.
+pub(crate) async fn connect_path_with_provider_to_port(
+    path: &PathSpec,
+    identity: CarrierPathIdentity,
+    remote_port: u16,
+    options: TcpConnectOptions,
+    provider: &dyn CarrierNetworkProvider,
+) -> Result<TcpStream, TcpTransportError> {
     if path.underlay != UnderlayProtocol::Tcp {
         return Err(TcpTransportError::WrongUnderlay(path.underlay));
+    }
+    if !path.endpoint.ports().contains(remote_port) {
+        return Err(TcpTransportError::Io(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            format!("TCP carrier port {remote_port} is outside the configured set"),
+        )));
     }
     let effective_path = match (path.binding.source_ip, options.source_ip) {
         (Some(configured), Some(requested)) if configured != requested => {
@@ -80,11 +106,6 @@ pub async fn connect_path_with_provider(
     };
     let deadline = Instant::now() + options.timeout;
     let authority = effective_path.endpoint.authority();
-    let remote_port = effective_path.endpoint.ports().select().map_err(|error| {
-        TcpTransportError::Io(std::io::Error::other(format!(
-            "could not select a carrier port for {authority}: {error}"
-        )))
-    })?;
     let addrs = timeout_at(
         deadline,
         provider.resolve(CarrierResolutionRequest {

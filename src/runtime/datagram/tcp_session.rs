@@ -12,7 +12,7 @@ use crate::mux::MuxLimits;
 use crate::protocol::{DatagramFlowId, DatagramId, Frame, OffsetRange, TargetAddr};
 use crate::runtime::error::RuntimeError;
 use crate::runtime::path::tcp::client::{ClientTcpDatagramAttachment, ClientTcpDatagramInbound};
-use crate::runtime::path::{ClientPathContext, PathDeliveryStats};
+use crate::runtime::path::{ClientPathContext, PathDeliveryStats, RelayPathLoadLease};
 use crate::scheduler::PathSnapshot;
 use bytes::Bytes;
 use std::time::{Duration, Instant};
@@ -21,17 +21,17 @@ use std::time::{Duration, Instant};
 use crate::lab_diagnostics::lab_diagnostic;
 
 pub(in crate::runtime) struct TcpDatagramClientSession {
-    context: ClientPathContext,
     attachment: ClientTcpDatagramAttachment,
     flows: Vec<DatagramClientFlow>,
     mux_limits: MuxLimits,
     pub(in crate::runtime) path_index: usize,
-    initial_path_snapshot: PathSnapshot,
+    path_snapshot: PathSnapshot,
     stats: PathDeliveryStats,
     sent_datagrams: SentDatagramEvidence,
     last_datagram_rtt: Option<Duration>,
     response_rttvar: Option<Duration>,
     pub(in crate::runtime) connection_usable: bool,
+    _load_lease: RelayPathLoadLease,
 }
 
 impl TcpDatagramClientSession {
@@ -39,13 +39,11 @@ impl TcpDatagramClientSession {
         context: &ClientPathContext,
         path_index: usize,
         open_deadline: tokio::time::Instant,
+        load_lease: RelayPathLoadLease,
     ) -> Result<Self, RuntimeError> {
         context
             .tcp_paths
             .get(path_index)
-            .ok_or(RuntimeError::NoSchedulableTcpPath)?;
-        let initial_path_snapshot = context
-            .tcp_path_snapshot(path_index)
             .ok_or(RuntimeError::NoSchedulableTcpPath)?;
         let frame_queue = (context.mux_limits.max_datagram_queue_bytes
             / context.mux_limits.max_payload_bytes.max(1))
@@ -56,18 +54,19 @@ impl TcpDatagramClientSession {
             .ok_or(RuntimeError::NoSchedulableTcpPath)?
             .open_datagram_attachment(open_deadline, frame_queue)
             .await?;
+        let path_snapshot = attachment.path_snapshot();
         Ok(Self {
-            context: context.clone(),
             attachment,
             flows: Vec::new(),
             mux_limits: context.mux_limits,
             path_index,
-            initial_path_snapshot,
+            path_snapshot,
             stats: PathDeliveryStats::default(),
             sent_datagrams: SentDatagramEvidence::new(context.mux_limits),
             last_datagram_rtt: None,
             response_rttvar: None,
             connection_usable: true,
+            _load_lease: load_lease,
         })
     }
 
@@ -262,12 +261,8 @@ impl TcpDatagramClientSession {
     }
 
     pub(in crate::runtime) fn response_timeout(&self, ttl_ms: u32) -> Duration {
-        let snapshot = self
-            .context
-            .tcp_path_snapshot(self.path_index)
-            .unwrap_or(self.initial_path_snapshot);
         tcp_datagram_response_timeout(
-            snapshot,
+            self.path_snapshot,
             self.last_datagram_rtt,
             self.response_rttvar,
             ttl_ms,

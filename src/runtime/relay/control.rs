@@ -223,6 +223,7 @@ pub(in crate::runtime) async fn relay_migrating_tcp_stream<S>(
 where
     S: AsyncRead + AsyncWrite + Unpin,
 {
+    let _session_product_flow = context.reserve_session_product_flow();
     let initial_recv_max_offset = reliable_stream_initial_advertised_window_bytes(
         remote.stream().underlay,
         remote.stream().lane,

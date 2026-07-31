@@ -359,6 +359,7 @@ pub(super) async fn handle_client_tcp_stream_frame(
                     .frames
                     .take()
                     .ok_or(RuntimeError::Protocol("missing TCP stream frame receiver"))?;
+                let evidence = runtime.attachment_evidence(connection);
                 let carrier = OpenedReliableCarrierStream {
                     stream_id,
                     path_instance_id: connection.path_instance_id,
@@ -366,7 +367,7 @@ pub(super) async fn handle_client_tcp_stream_frame(
                     lane: pending.lane,
                     underlay: UnderlayProtocol::Tcp,
                     max_frame_payload_bytes: reliable_relay_buffer_len(runtime.mux_limits),
-                    startup: connection.startup_snapshot,
+                    startup: evidence.snapshot,
                     commands: pending.session_commands,
                     mux_limits: runtime.mux_limits,
                     frames,
@@ -376,6 +377,7 @@ pub(super) async fn handle_client_tcp_stream_frame(
                     .send(ClientTcpOpenResponse::Opened(ClientTcpOpenedStream {
                         carrier,
                         open_deadline,
+                        path_metrics: evidence.metrics,
                     }))
                     .is_err()
                 {

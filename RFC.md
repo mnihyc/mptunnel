@@ -718,9 +718,11 @@ The member identity names durable configured capacity, not a physical
 connection. It normally has one current carrier instance. During a planned
 make-before-break replacement it may additionally have one provisional
 successor or one retiring predecessor, and both exact instances consume
-reservations. Readiness atomically makes the successor current before the
-predecessor begins ordered retirement. No queue, attachment, flight, evidence,
-or authority is transferred between those exact instances.
+reservations. The successor can become current only at the old instance's
+exact Product-quiescent admission boundary. That commit atomically publishes
+the successor before the predecessor begins ordered retirement. No queue,
+attachment, flight, evidence, or authority is transferred between those exact
+instances.
 
 Exact failure removes only the failed instance. Loss of a minimum member
 authorizes one replacement for that same member; loss of a retained elastic
@@ -947,14 +949,34 @@ retirement. This specification defines no idle interval for contraction.
 Changing the destination port of a TCP carrier creates a replacement carrier;
 it never migrates the existing TCP connection. Planned replacement MUST be
 make-before-break for a configured-minimum member when the resource envelopes
-have spare capacity: authenticate and ready the replacement, admit streams
-that must continue through their normal attachment procedure, stop new
-attachments and original placement on the old carrier, have the client send
-`PATH_DRAIN` after its preceding writer work, and wait for the server's
-`PATH_CLOSE`. The
-replacement has ordinary authority after readiness under Section 7.2. When no
-spare capacity exists, replacement waits for capacity or exact quiescence
-rather than forcing an active carrier closed.
+have spare capacity: authenticate a provisional successor while the predecessor
+remains current, then revalidate the predecessor identity and exact
+Product-quiescent state at the same transaction that publishes the successor.
+If Product work was admitted during establishment, the provisional successor is
+discarded and the predecessor remains unchanged. A successful commit fences
+new attachment and original placement on the predecessor, publishes ordinary
+authority on the successor, has the client send `PATH_DRAIN` after the
+predecessor's preceding writer work, and waits for the server's `PATH_CLOSE`.
+
+Product quiescence is an exact session work-ownership state, not an idle timer
+or a traffic sample: the MPP session has no logical Product-flow owner, no
+carrier has admitted Product load, relay queue, or relay flight, and the old
+TCP instance still matches the configured-minimum member being replaced. A
+logical reliable or datagram Product flow retains its session owner through
+peer-direction traffic, retention, and recovery even when it temporarily has
+no attachment. Every Product open reserves path-load ownership before carrier
+I/O; its logical owner releases only when the complete Product flow becomes
+terminal. An idle attachment shell grants no Product-work ownership and is
+settled by the normal ordered drain. Logical Product ownership, path admission,
+and the replacement commit are serialized by the same path-state transaction.
+The configured hop interval only makes a replacement eligible for
+consideration; it proves neither quiescence nor usefulness.
+
+When no spare capacity exists, replacement waits for exact Product quiescence,
+fences and drains the predecessor within the configured maximum, then
+establishes the next carrier. It never closes an active carrier to satisfy a
+hop deadline. New demand during retirement uses another schedulable carrier or
+waits for minimum reconciliation; it does not reverse an ordered drain.
 
 The expansion verdict in Section 15.1 proves old-plus-candidate aggregate gain,
 not replacement equivalence. A retained elastic carrier is therefore never
@@ -1821,7 +1843,8 @@ A conforming implementation preserves all of the following:
     group capacity or replacement.
 28. A configured-minimum member identity is client-local and persists across
     its successive replacement instances. A planned replacement permits only
-    the bounded current/successor/predecessor overlap in Section 7.2.
+    the bounded current/successor/predecessor overlap and exact
+    Product-quiescent commit in Section 7.2.
     Classification of each exact carrier instance as minimum or elastic is
     immutable and is never inferred from a locator or peer path label.
 29. A disabled TCP carrier group establishes no carrier and grants no new

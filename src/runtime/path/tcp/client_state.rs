@@ -16,6 +16,7 @@ use crate::protocol::codec::CodecLimits;
 use crate::protocol::path_capacity::{CapacityReceiveTracker, PathCapacityReceiveError};
 use crate::protocol::{PathId, PathMetricDirection, PathMetrics, SessionId};
 use crate::runtime::path::commands::TcpCapacityProbeCommand;
+use crate::runtime::path::model::{path_metrics_from_snapshot, path_snapshot_with_id};
 use crate::runtime::path::proof::PathProofTracker;
 use crate::runtime::path::state::ClientPathState;
 use crate::runtime::path::{AuthenticatedCarrierInventory, AuthenticatedCarrierRegistration};
@@ -36,6 +37,12 @@ pub(super) struct ClientTcpPathConnection {
     authenticated_carrier: Option<AuthenticatedCarrierRegistration>,
     pub(super) path_proofs: PathProofTracker,
     pub(super) capacity: ClientTcpCapacityState,
+}
+
+#[derive(Debug, Clone, Copy)]
+pub(super) struct ClientTcpAttachmentEvidence {
+    pub(super) snapshot: PathSnapshot,
+    pub(super) metrics: PathMetrics,
 }
 
 impl ClientTcpPathConnection {
@@ -80,7 +87,10 @@ pub(in crate::runtime) struct ClientTcpPathSessionRuntime {
     pub(in crate::runtime) paths: Arc<Vec<PathSpec>>,
     pub(in crate::runtime) config_index: usize,
     pub(in crate::runtime) path_index: usize,
-    pub(in crate::runtime) path_id: PathId,
+    /// Wire identity exists only while one exact physical actor owns a group
+    /// reservation.
+    pub(in crate::runtime) path_id: Option<PathId>,
+    pub(in crate::runtime) remote_port: Option<u16>,
     pub(in crate::runtime) purpose: crate::protocol::PathPurpose,
     pub(in crate::runtime) carrier_identity: CarrierPathIdentity,
     pub(in crate::runtime) session_id: SessionId,
@@ -102,10 +112,54 @@ pub(in crate::runtime) struct ClientTcpPathSessionRuntime {
 }
 
 impl ClientTcpPathSessionRuntime {
+    pub(in crate::runtime) fn for_carrier(
+        &self,
+        path_id: PathId,
+        remote_port: Option<u16>,
+    ) -> Self {
+        let mut runtime = self.clone();
+        runtime.path_id = Some(path_id);
+        runtime.remote_port = remote_port;
+        runtime
+    }
+
+    pub(in crate::runtime) fn path_id(&self) -> PathId {
+        self.path_id
+            .expect("physical TCP actor owns one reserved wire PathId")
+    }
+
     pub(in crate::runtime) fn path(&self) -> &PathSpec {
         self.paths
             .get(self.config_index)
             .expect("TCP session path inventory matches its index")
+    }
+
+    /// Captures one attachment's carrier evidence while exact physical-instance
+    /// ownership can still be verified. If a replacement has already taken the
+    /// stable member record, retain this actor's exact startup evidence instead
+    /// of borrowing the replacement's measurements.
+    pub(super) fn attachment_evidence(
+        &self,
+        connection: &ClientTcpPathConnection,
+    ) -> ClientTcpAttachmentEvidence {
+        let Some(observation) = self
+            .state
+            .tcp_path_observation_for_instance(self.path_index, connection.path_instance_id)
+        else {
+            return ClientTcpAttachmentEvidence {
+                snapshot: connection.startup_snapshot,
+                metrics: connection.startup_metrics,
+            };
+        };
+        let snapshot = path_snapshot_with_id(self.path(), self.path_id(), observation);
+        ClientTcpAttachmentEvidence {
+            snapshot,
+            metrics: path_metrics_from_snapshot(
+                snapshot,
+                observation,
+                PathMetricDirection::ClientToServer,
+            ),
+        }
     }
 
     pub(in crate::runtime) fn security(&self) -> &ClientSecurityConfig {
@@ -130,7 +184,7 @@ impl ClientTcpPathSessionRuntime {
             .tcp_metrics
             .as_mut()
             .and_then(|publisher| {
-                publisher.maybe_observe(self.path_id, PathMetricDirection::ClientToServer, force)
+                publisher.maybe_observe(self.path_id(), PathMetricDirection::ClientToServer, force)
             })
         else {
             return;

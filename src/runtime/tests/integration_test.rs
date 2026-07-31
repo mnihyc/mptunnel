@@ -11,6 +11,28 @@ use crate::transport::SystemCarrierNetworkProvider;
 
 const FULL_STACK_RESPONSE_TIMEOUT: Duration = Duration::from_secs(15);
 
+fn spawn_configured_tcp_minimum_reconciliation(
+    context: &ClientPathContext,
+) -> tokio::task::JoinHandle<()> {
+    let context = context.clone();
+    tokio::spawn(async move {
+        let now = tokio::time::Instant::now();
+        let mut retry = vec![
+            crate::runtime::path::tcp::group::ClientTcpMinimumRetry::new(now);
+            context.tcp_sessions.len()
+        ];
+        context
+            .tcp_carrier_groups
+            .reconcile(
+                &context,
+                crate::config::DEFAULT_PATH_PROBE_TIMEOUT,
+                crate::config::DEFAULT_PATH_PROBE_INTERVAL,
+                &mut retry,
+            )
+            .await;
+    })
+}
+
 fn local_proxy_auth() -> crate::ingress::ProxyAuthConfig {
     let user = crate::ingress::LocalProxyUser::new(
         "operator".to_string(),
@@ -467,12 +489,15 @@ where
 }
 
 async fn wait_for_tcp_path_detached(context: &ClientPathContext, path_index: usize) {
-    tokio::time::timeout(Duration::from_secs(2), async {
+    let result = tokio::time::timeout(Duration::from_secs(2), async {
         loop {
             let detached = {
                 let health = context.health().lock().expect("health lock");
                 let path = health.tcp.get(path_index).expect("TCP path health");
-                path.active_flows == 0 && path.state != SchedulerPathState::Active
+                context.tcp_sessions[path_index]
+                    .connection_instance_id()
+                    .is_none()
+                    && path.state != SchedulerPathState::Active
             };
             if detached {
                 break;
@@ -480,8 +505,23 @@ async fn wait_for_tcp_path_detached(context: &ClientPathContext, path_index: usi
             tokio::time::sleep(Duration::from_millis(10)).await;
         }
     })
-    .await
-    .expect("TCP carrier did not detach");
+    .await;
+    if result.is_err() {
+        let (state, active_flows, relay_bytes_in_flight, relay_queue_bytes) = {
+            let health = context.health().lock().expect("health lock");
+            let path = health.tcp.get(path_index).expect("TCP path health");
+            (
+                path.state,
+                path.active_flows,
+                path.relay_bytes_in_flight,
+                path.relay_queue_bytes,
+            )
+        };
+        panic!(
+            "TCP carrier did not detach: state={:?} active_flows={} relay_bytes_in_flight={} relay_queue_bytes={}",
+            state, active_flows, relay_bytes_in_flight, relay_queue_bytes
+        );
+    }
 }
 
 async fn wait_for_tcp_ready_count(context: &ClientPathContext, expected: usize) {
@@ -500,6 +540,101 @@ async fn wait_for_tcp_ready_count(context: &ClientPathContext, expected: usize) 
     })
     .await
     .expect("configured-minimum TCP readiness did not converge");
+}
+
+async fn bind_contiguous_tcp_listener_pair() -> (u16, TcpListener, TcpListener) {
+    loop {
+        let first = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind first ranged TCP listener");
+        let first_port = first.local_addr().expect("first listener address").port();
+        let Some(second_port) = first_port.checked_add(1) else {
+            continue;
+        };
+        if let Ok(second) = TcpListener::bind(("127.0.0.1", second_port)).await {
+            return (first_port, first, second);
+        }
+    }
+}
+
+struct RangedTcpCarrierServer {
+    first_port: u16,
+    paths: crate::runtime::path::ServerPathContext,
+    active: Arc<std::sync::atomic::AtomicUsize>,
+    maximum_active: Arc<std::sync::atomic::AtomicUsize>,
+    accepted: Arc<[std::sync::atomic::AtomicUsize; 2]>,
+    carriers: tokio::task::JoinHandle<()>,
+    relay: tokio::task::JoinHandle<Result<(), RuntimeError>>,
+}
+
+impl RangedTcpCarrierServer {
+    async fn spawn() -> Self {
+        let (first_port, first_listener, second_listener) =
+            bind_contiguous_tcp_listener_pair().await;
+        let server_path = format!("tcp://127.0.0.1:{first_port}")
+            .parse::<PathSpec>()
+            .expect("server TCP path");
+        let local_path = ServerLocalPath::new(0, server_path);
+        let ServerIdentityRuntime {
+            paths,
+            reliable_relay,
+        } = server_runtime(OutboundConfig::Direct);
+        let relay = tokio::spawn(reliable_relay.run());
+        let active = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let maximum_active = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let accepted = Arc::new([
+            std::sync::atomic::AtomicUsize::new(0),
+            std::sync::atomic::AtomicUsize::new(0),
+        ]);
+        let carriers = {
+            let active = active.clone();
+            let maximum_active = maximum_active.clone();
+            let accepted = accepted.clone();
+            let server_context = paths.clone();
+            tokio::spawn(async move {
+                let mut sessions = tokio::task::JoinSet::new();
+                loop {
+                    let (stream, listener_index) = tokio::select! {
+                        accepted = first_listener.accept() => {
+                            (accepted.expect("accept first ranged carrier").0, 0)
+                        }
+                        accepted = second_listener.accept() => {
+                            (accepted.expect("accept second ranged carrier").0, 1)
+                        }
+                    };
+                    accepted[listener_index].fetch_add(1, std::sync::atomic::Ordering::AcqRel);
+                    let active = active.clone();
+                    let maximum_active = maximum_active.clone();
+                    let local_path = local_path.clone();
+                    let server_context = server_context.clone();
+                    sessions.spawn(async move {
+                        let current = active.fetch_add(1, std::sync::atomic::Ordering::AcqRel) + 1;
+                        maximum_active.fetch_max(current, std::sync::atomic::Ordering::AcqRel);
+                        let result = handle_server_path(stream, local_path, server_context).await;
+                        active.fetch_sub(1, std::sync::atomic::Ordering::AcqRel);
+                        result
+                    });
+                    while sessions.try_join_next().is_some() {}
+                }
+            })
+        };
+        Self {
+            first_port,
+            paths,
+            active,
+            maximum_active,
+            accepted,
+            carriers,
+            relay,
+        }
+    }
+
+    async fn shutdown(self) {
+        self.carriers.abort();
+        let _ = self.carriers.await;
+        self.relay.abort();
+        let _ = self.relay.await;
+    }
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -746,17 +881,14 @@ async fn session_owner_reconciles_minimum_and_retires_disabled_group() {
         "the unaffected configured-minimum carrier must remain exact"
     );
     assert_eq!(
-        initial
-            .paths
-            .iter()
-            .map(|path| path.path_id)
-            .collect::<HashSet<_>>(),
         replacement
             .paths
             .iter()
             .map(|path| path.path_id)
-            .collect::<HashSet<_>>(),
-        "replacement must preserve the configured member label"
+            .collect::<HashSet<_>>()
+            .len(),
+        replacement.paths.len(),
+        "simultaneously live replacement carriers require distinct wire PathIds"
     );
 
     let target_listener = TcpListener::bind("127.0.0.1:0").await.expect("target bind");
@@ -880,6 +1012,342 @@ async fn session_owner_reconciles_minimum_and_retires_disabled_group() {
     let _ = server_relay.await;
 }
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn ranged_tcp_replacement_waits_for_product_quiescence_then_commits_make_before_break() {
+    let carrier_server = RangedTcpCarrierServer::spawn().await;
+    let first_port = carrier_server.first_port;
+    let second_port = first_port + 1;
+    let client_path = format!(
+        "tcp://127.0.0.1:{first_port}-{second_port}?tcp-carriers=1-3&port-hop-interval-ms=5000"
+    )
+    .parse::<PathSpec>()
+    .expect("ranged client TCP path");
+    let snapshot_context = carrier_server.paths.clone();
+    let maximum_active = carrier_server.maximum_active.clone();
+    let accepted = carrier_server.accepted.clone();
+
+    let context = ClientPathContext::new_with_carrier_network(
+        vec![ClientPathConfig {
+            name: "ranged".to_string(),
+            tls: crate::transport::encrypted::test_client_tls_config(),
+            spec: client_path,
+            security: security(),
+        }],
+        ResourceLimits::default(),
+        None,
+        0,
+        Arc::new(SystemCarrierNetworkProvider),
+    )
+    .expect("ranged client carrier context");
+    let path_service = tokio::spawn(run_client_path_service(
+        context.clone(),
+        Duration::from_secs(60),
+        Duration::from_secs(2),
+    ));
+    wait_for_tcp_ready_count(&context, 1).await;
+    let initial_server_path = tokio::time::timeout(Duration::from_secs(2), async {
+        loop {
+            let snapshot = snapshot_context.reliable_streams.management_snapshot();
+            if snapshot.paths.len() == 1 {
+                break snapshot.paths[0];
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("initial ranged server carrier inventory");
+
+    let target_listener = TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind replacement target");
+    let target_addr = target_listener
+        .local_addr()
+        .expect("replacement target address");
+    let target = tokio::spawn(async move {
+        let (mut stream, _) = target_listener.accept().await.expect("accept target");
+        let mut payload = [0_u8; 4];
+        loop {
+            match stream.read_exact(&mut payload).await {
+                Ok(_) => stream
+                    .write_all(&payload)
+                    .await
+                    .expect("echo target payload"),
+                Err(error) if error.kind() == std::io::ErrorKind::UnexpectedEof => break,
+                Err(error) => panic!("read target payload: {error}"),
+            }
+        }
+    });
+    let (mut product_client, product_server) = duplex(4096);
+    let product = tokio::spawn(handle_socks5_client_stream(product_server, context.clone()));
+    open_socks5_tcp_tunnel(&mut product_client, target_addr).await;
+
+    let initial_instance = context.tcp_sessions[0]
+        .connection_instance_id()
+        .expect("initial ranged TCP carrier instance");
+    let initial_port = context.tcp_sessions[0]
+        .connection_remote_port()
+        .expect("initial ranged TCP carrier port");
+
+    // The hop interval makes replacement eligible; it never permits an active
+    // Product attachment to be moved between physical TCP instances.
+    for sequence in 0_u32..6 {
+        let payload = sequence.to_be_bytes();
+        product_client
+            .write_all(&payload)
+            .await
+            .expect("write while planned replacement is deferred");
+        let mut echoed = [0_u8; 4];
+        tokio::time::timeout(
+            Duration::from_secs(3),
+            product_client.read_exact(&mut echoed),
+        )
+        .await
+        .expect("deferred replacement interrupted Product delivery")
+        .expect("read while planned replacement is deferred");
+        assert_eq!(echoed, payload);
+        tokio::time::sleep(Duration::from_secs(1)).await;
+    }
+    assert_eq!(
+        context.tcp_sessions[0].connection_instance_id(),
+        Some(initial_instance),
+        "an overdue hop must not replace an active Product attachment"
+    );
+    assert_eq!(
+        context.tcp_sessions[0].connection_remote_port(),
+        Some(initial_port),
+        "an overdue hop must retain the active physical TCP connection"
+    );
+    assert_eq!(
+        maximum_active.load(std::sync::atomic::Ordering::Acquire),
+        1,
+        "replacement establishment must remain absent while Product work exists"
+    );
+
+    product_client
+        .shutdown()
+        .await
+        .expect("shutdown Product client");
+    product
+        .await
+        .expect("Product relay join")
+        .expect("Product relay");
+    target.await.expect("target join");
+
+    // Releasing the exact Product owner publishes a lifecycle event. The
+    // already-overdue replacement therefore starts without waiting for the
+    // unrelated 60-second probe interval.
+    tokio::time::timeout(Duration::from_secs(3), async {
+        loop {
+            if context.tcp_sessions[0].connection_instance_id() != Some(initial_instance)
+                && context.tcp_sessions[0].connection_remote_port() != Some(initial_port)
+            {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("Product-quiescent owner event did not initiate replacement");
+
+    assert!(
+        accepted
+            .iter()
+            .all(|count| count.load(std::sync::atomic::Ordering::Acquire) > 0),
+        "the replacement must select the other configured destination port"
+    );
+    assert!(
+        maximum_active.load(std::sync::atomic::Ordering::Acquire) >= 2,
+        "a spare-capacity successor must coexist with its predecessor"
+    );
+
+    tokio::time::timeout(Duration::from_secs(3), async {
+        loop {
+            if context.tcp_carrier_groups.occupied(0) == Some(1) {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("retired predecessor did not release its exact reservation");
+    let replacement_server_path = tokio::time::timeout(Duration::from_secs(2), async {
+        loop {
+            let snapshot = snapshot_context.reliable_streams.management_snapshot();
+            if snapshot.paths.len() == 1
+                && snapshot.paths[0].path_instance_id != initial_server_path.path_instance_id
+            {
+                break snapshot.paths[0];
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("replacement ranged server carrier inventory");
+    assert_eq!(
+        replacement_server_path.session_id, initial_server_path.session_id,
+        "a physical port replacement must preserve the MPP SessionId"
+    );
+    assert_ne!(
+        replacement_server_path.path_id, initial_server_path.path_id,
+        "a make-before-break successor must reserve a distinct concurrent PathId"
+    );
+
+    path_service.abort();
+    let _ = path_service.await;
+    carrier_server.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn ranged_tcp_maximum_one_reconnects_only_after_product_quiescence() {
+    let carrier_server = RangedTcpCarrierServer::spawn().await;
+    let first_port = carrier_server.first_port;
+    let second_port = first_port + 1;
+    let client_path = format!(
+        "tcp://127.0.0.1:{first_port}-{second_port}?tcp-carriers=1-1&port-hop-interval-ms=5000"
+    )
+    .parse::<PathSpec>()
+    .expect("maximum-one ranged client TCP path");
+    let context = ClientPathContext::new_with_carrier_network(
+        vec![ClientPathConfig {
+            name: "maximum-one-ranged".to_string(),
+            tls: crate::transport::encrypted::test_client_tls_config(),
+            spec: client_path,
+            security: security(),
+        }],
+        ResourceLimits::default(),
+        None,
+        0,
+        Arc::new(SystemCarrierNetworkProvider),
+    )
+    .expect("maximum-one client carrier context");
+    let path_service = tokio::spawn(run_client_path_service(
+        context.clone(),
+        Duration::from_secs(60),
+        Duration::from_secs(2),
+    ));
+    wait_for_tcp_ready_count(&context, 1).await;
+    let initial_instance = context.tcp_sessions[0]
+        .connection_instance_id()
+        .expect("initial maximum-one carrier");
+    let initial_port = context.tcp_sessions[0]
+        .connection_remote_port()
+        .expect("initial maximum-one port");
+
+    let target_listener = TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind maximum-one target");
+    let target_addr = target_listener
+        .local_addr()
+        .expect("maximum-one target address");
+    let target = tokio::spawn(async move {
+        let (mut stream, _) = target_listener
+            .accept()
+            .await
+            .expect("accept maximum-one target");
+        let mut payload = [0_u8; 4];
+        loop {
+            match stream.read_exact(&mut payload).await {
+                Ok(_) => stream
+                    .write_all(&payload)
+                    .await
+                    .expect("echo maximum-one target payload"),
+                Err(error) if error.kind() == std::io::ErrorKind::UnexpectedEof => break,
+                Err(error) => panic!("read maximum-one target payload: {error}"),
+            }
+        }
+    });
+    let (mut product_client, product_server) = duplex(4096);
+    let product = tokio::spawn(handle_socks5_client_stream(product_server, context.clone()));
+    open_socks5_tcp_tunnel(&mut product_client, target_addr).await;
+    product_client
+        .write_all(b"live")
+        .await
+        .expect("maximum-one live payload");
+    let mut echoed = [0_u8; 4];
+    product_client
+        .read_exact(&mut echoed)
+        .await
+        .expect("maximum-one live response");
+    assert_eq!(&echoed, b"live");
+
+    tokio::time::sleep(Duration::from_secs(6)).await;
+    assert_eq!(
+        context.tcp_sessions[0].connection_instance_id(),
+        Some(initial_instance),
+        "maximum-one hopping must not drain an active Product carrier"
+    );
+    assert_eq!(
+        context.tcp_sessions[0].connection_remote_port(),
+        Some(initial_port),
+        "maximum-one hopping must retain the active destination port"
+    );
+    assert_eq!(
+        context.tcp_carrier_groups.occupied(0),
+        Some(1),
+        "maximum-one replacement must remain inside its resource envelope"
+    );
+
+    product_client
+        .shutdown()
+        .await
+        .expect("shutdown maximum-one Product client");
+    product
+        .await
+        .expect("maximum-one Product relay join")
+        .expect("maximum-one Product relay");
+    target.await.expect("maximum-one target join");
+
+    // The ordinary probe/retry interval is 60 seconds. Convergence here proves
+    // the exact Product release and predecessor terminal events drive the
+    // break-before-make transaction without inheriting that deadline.
+    tokio::time::timeout(Duration::from_secs(3), async {
+        loop {
+            if context.tcp_sessions[0]
+                .connection_instance_id()
+                .is_some_and(|instance| {
+                    instance != initial_instance
+                        && context.tcp_sessions[0].connection_remote_port() != Some(initial_port)
+                })
+            {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("maximum-one Product-quiescent replacement did not converge");
+    assert_eq!(
+        context.tcp_carrier_groups.occupied(0),
+        Some(1),
+        "terminal predecessor release must precede maximum-one successor reservation"
+    );
+    assert_eq!(
+        carrier_server
+            .maximum_active
+            .load(std::sync::atomic::Ordering::Acquire),
+        1,
+        "maximum-one replacement must never overlap physical TCP carriers"
+    );
+    assert_eq!(
+        carrier_server
+            .active
+            .load(std::sync::atomic::Ordering::Acquire),
+        1,
+        "maximum-one reconciliation must restore one authenticated carrier"
+    );
+    assert!(
+        carrier_server
+            .accepted
+            .iter()
+            .all(|count| count.load(std::sync::atomic::Ordering::Acquire) > 0),
+        "maximum-one replacement must select the other configured port"
+    );
+
+    path_service.abort();
+    let _ = path_service.await;
+    carrier_server.shutdown().await;
+}
+
 #[tokio::test]
 async fn path_probe_refreshes_udp_health_without_association_load() {
     let (path, server) = spawn_udp_server_path(OutboundConfig::Direct).await;
@@ -919,6 +1387,7 @@ async fn socks5_ingress_relays_tcp_payload_over_encrypted_internal_stream() {
     let (path, server_path) = spawn_server_path(OutboundConfig::Direct).await;
     let context =
         ClientPathContext::new(vec![path], security(), ResourceLimits::default()).expect("ctx");
+    probe_client_paths(&context, Duration::from_secs(2)).await;
     let telemetry_context = context.clone();
     let (mut client, server) = duplex(4096);
     let handler = tokio::spawn(handle_socks5_client_stream(server, context));
@@ -990,6 +1459,7 @@ async fn socks5_ingress_accepts_configured_username_password_auth() {
         local_proxy_auth(),
     )
     .expect("ctx");
+    probe_client_paths(&context, Duration::from_secs(2)).await;
     let (mut client, server) = duplex(4096);
     let handler = tokio::spawn(handle_socks5_client_stream(server, context));
 
@@ -1142,6 +1612,7 @@ async fn tcp_path_session_multiplexes_multiple_single_path_interactive_streams()
     let (path, server_path) = spawn_server_path(OutboundConfig::Direct).await;
     let context =
         ClientPathContext::new(vec![path], security(), ResourceLimits::default()).expect("ctx");
+    probe_client_paths(&context, Duration::from_secs(2)).await;
     let (mut first_client, first_server) = duplex(4096);
     let (mut second_client, second_server) = duplex(4096);
     let first_handler = tokio::spawn(handle_socks5_client_stream(first_server, context.clone()));
@@ -1298,6 +1769,7 @@ async fn auto_bulk_tcp_stream_attaches_measured_path_for_large_response() {
             last_payload_at: Some(Instant::now() + Duration::from_millis(100)),
         },
     );
+    probe_client_paths(&context, Duration::from_secs(2)).await;
     let health_context = context.clone();
     let ingress_listener = TcpListener::bind("127.0.0.1:0")
         .await
@@ -1353,16 +1825,9 @@ async fn auto_bulk_tcp_stream_attaches_measured_path_for_large_response() {
     });
     tokio::time::timeout(FULL_STACK_RESPONSE_TIMEOUT, async {
         loop {
-            let registered = server_context
-                .reliable_streams
-                .management_snapshot()
-                .paths
-                .iter()
-                .any(|path| path.configured_index == 1);
-            let ready = health_context
-                .peer_path_usage(UnderlayProtocol::Tcp, 1)
-                .is_some();
-            if registered && ready {
+            let attached =
+                health_context.health().lock().expect("health lock").tcp[1].active_flows > 0;
+            if attached {
                 break;
             }
             tokio::task::yield_now().await;
@@ -1476,6 +1941,7 @@ async fn tcp_stream_migrates_to_survivor_path_after_active_path_failure() {
     };
     let context =
         ClientPathContext::new(vec![first_path, second_path], security(), resources).expect("ctx");
+    probe_client_paths(&context, Duration::from_secs(2)).await;
     let health_context = context.clone();
     let ingress_listener = TcpListener::bind("127.0.0.1:0")
         .await
@@ -1595,6 +2061,8 @@ async fn live_socks5_stream_survives_five_second_total_outage_and_reattaches_ove
     };
     let context = ClientPathContext::new(vec![tcp_path, udp_path.clone()], security(), resources)
         .expect("client context with default session retention");
+    let _minimum = spawn_configured_tcp_minimum_reconciliation(&context);
+    wait_for_tcp_ready_count(&context, 1).await;
     let health_context = context.clone();
     let ingress_listener = TcpListener::bind("127.0.0.1:0")
         .await
@@ -1616,6 +2084,12 @@ async fn live_socks5_stream_survives_five_second_total_outage_and_reattaches_ove
         .await
         .expect("first response");
     assert_eq!(&first_response, b"pong");
+    let active_before_outage =
+        health_context.health().lock().expect("health lock").tcp[0].active_flows;
+    assert_eq!(
+        active_before_outage, 1,
+        "one live Product attachment must own one path-load lease"
+    );
 
     tcp_server.abort();
     let _ = tcp_server.await;
@@ -1697,6 +2171,7 @@ async fn disconnected_logical_stream_expires_at_configured_retention_timeout() {
     };
     let context =
         client_context_with_session_retention(vec![path], resources, Duration::from_millis(150));
+    probe_client_paths(&context, Duration::from_secs(2)).await;
     let health_context = context.clone();
     let (mut client, server) = duplex(4096);
     let mut handler = tokio::spawn(handle_socks5_client_stream(server, context));
@@ -1742,6 +2217,7 @@ async fn reliable_relay_heartbeat_timeout_enters_session_retention_without_a_sur
     };
     let context =
         client_context_with_session_retention(vec![path], resources, Duration::from_millis(300));
+    probe_client_paths(&context, Duration::from_secs(2)).await;
     let health_context = context.clone();
     let (mut client, server) = duplex(4096);
     let mut handler = tokio::spawn(handle_socks5_client_stream(server, context));
@@ -1813,7 +2289,7 @@ fn tcp_path_activity_does_not_extend_pending_heartbeat_deadline() {
 }
 
 #[tokio::test]
-async fn socks5_ingress_schedules_tcp_stream_to_best_configured_path() {
+async fn socks5_ingress_uses_ranked_tcp_carriers_for_product_stream() {
     let (target_addr, target) = spawn_echo_target().await;
     let high_latency_path = reserve_tcp_path_with_query("srtt-ms=200&rate-mbps=1000").await;
     let low_latency_path = reserve_tcp_path_with_query("srtt-ms=10&rate-mbps=50").await;
@@ -1838,6 +2314,31 @@ async fn socks5_ingress_schedules_tcp_stream_to_best_configured_path() {
         ResourceLimits::default(),
     )
     .expect("ctx");
+    probe_client_paths(&context, Duration::from_secs(2)).await;
+    {
+        let mut health = context.health().lock().expect("health lock");
+        health.tcp[0].carrier_srtt_ms = Some(200.0);
+        health.tcp[0].carrier_rttvar_ms = Some(50.0);
+        health.tcp[1].carrier_srtt_ms = Some(10.0);
+        health.tcp[1].carrier_rttvar_ms = Some(2.5);
+    }
+    let ready_paths = HashSet::from([
+        accepted_rx.recv().await.expect("first ready TCP carrier"),
+        accepted_rx.recv().await.expect("second ready TCP carrier"),
+    ]);
+    assert_eq!(ready_paths, HashSet::from([0, 1]));
+    assert_eq!(
+        context
+            .ordered_reliable_path_keys(TrafficClass::Latency, 1)
+            .first()
+            .copied(),
+        Some(RelayPathKey {
+            underlay: UnderlayProtocol::Tcp,
+            index: 1,
+        }),
+        "the lower-latency carrier must lead initial Product placement"
+    );
+    let health_context = context.clone();
     let (mut client, server) = duplex(4096);
     let handler = tokio::spawn(handle_socks5_client_stream(server, context));
 
@@ -1863,20 +2364,30 @@ async fn socks5_ingress_schedules_tcp_stream_to_best_configured_path() {
     let mut response = [0u8; 10];
     client.read_exact(&mut response).await.expect("reply");
     assert_eq!(response[1], Socks5Reply::Succeeded as u8);
+    let low_latency_active_flows = {
+        let health = health_context.health().lock().expect("health lock");
+        health.tcp[1].active_flows
+    };
+    assert_eq!(
+        low_latency_active_flows, 1,
+        "the Product stream must attach to the leading carrier"
+    );
     client.write_all(b"ping").await.expect("payload write");
     client.shutdown().await.expect("client shutdown");
     let mut payload = [0u8; 4];
     client.read_exact(&mut payload).await.expect("payload read");
     assert_eq!(&payload, b"pong");
 
-    assert_eq!(accepted_rx.recv().await, Some(1));
     handler.await.expect("join").expect("handler");
+    drop(health_context);
     low_latency_server
         .await
         .expect("low latency server join")
         .expect("low latency server");
-    high_latency_server.abort();
-    let _ = high_latency_server.await;
+    high_latency_server
+        .await
+        .expect("high latency server join")
+        .expect("high latency server");
     target.await.expect("target join");
 }
 
@@ -1907,6 +2418,20 @@ async fn socks5_ingress_starts_reliable_auto_latency_first() {
         ResourceLimits::default(),
     )
     .expect("ctx");
+    probe_client_paths(&context, Duration::from_secs(2)).await;
+    {
+        let mut health = context.health().lock().expect("health lock");
+        health.tcp[0].carrier_srtt_ms = Some(10.0);
+        health.tcp[0].carrier_rttvar_ms = Some(2.5);
+        health.tcp[1].carrier_srtt_ms = Some(120.0);
+        health.tcp[1].carrier_rttvar_ms = Some(30.0);
+    }
+    let ready_paths = HashSet::from([
+        accepted_rx.recv().await.expect("first ready TCP carrier"),
+        accepted_rx.recv().await.expect("second ready TCP carrier"),
+    ]);
+    assert_eq!(ready_paths, HashSet::from([0, 1]));
+    let health_context = context.clone();
     let (mut client, server) = duplex(4096);
     let handler = tokio::spawn(handle_socks5_client_stream(server, context));
 
@@ -1932,25 +2457,36 @@ async fn socks5_ingress_starts_reliable_auto_latency_first() {
     let mut response = [0u8; 10];
     client.read_exact(&mut response).await.expect("reply");
     assert_eq!(response[1], Socks5Reply::Succeeded as u8);
+    let active_flows = {
+        let health = health_context.health().lock().expect("health lock");
+        (health.tcp[0].active_flows, health.tcp[1].active_flows)
+    };
+    assert_eq!(
+        active_flows,
+        (1, 0),
+        "ReliableAuto must start its interactive Product stream on the latency carrier"
+    );
     client.write_all(b"ping").await.expect("payload write");
     client.shutdown().await.expect("client shutdown");
     let mut payload = [0u8; 4];
     client.read_exact(&mut payload).await.expect("payload read");
     assert_eq!(&payload, b"pong");
 
-    assert_eq!(accepted_rx.recv().await, Some(0));
     handler.await.expect("join").expect("handler");
+    drop(health_context);
     low_latency_server
         .await
         .expect("low latency server join")
         .expect("low latency server");
-    bulk_allowed_server.abort();
-    let _ = bulk_allowed_server.await;
+    bulk_allowed_server
+        .await
+        .expect("bulk allowed server join")
+        .expect("bulk allowed server");
     target.await.expect("target join");
 }
 
 #[tokio::test]
-async fn socks5_ingress_retries_next_tcp_path_after_connect_failure() {
+async fn socks5_ingress_uses_ready_minimum_when_another_member_is_unavailable() {
     let (target_addr, target) = spawn_echo_target().await;
     let failed_path = reserve_tcp_path().await;
     let (working_path, server_path) = spawn_server_path(OutboundConfig::Direct).await;
@@ -1960,6 +2496,8 @@ async fn socks5_ingress_retries_next_tcp_path_after_connect_failure() {
         ResourceLimits::default(),
     )
     .expect("ctx");
+    probe_client_paths(&context, Duration::from_secs(2)).await;
+    let health_context = context.clone();
     let (mut client, server) = duplex(4096);
     let handler = tokio::spawn(handle_socks5_client_stream(server, context));
 
@@ -1985,6 +2523,11 @@ async fn socks5_ingress_retries_next_tcp_path_after_connect_failure() {
     let mut response = [0u8; 10];
     client.read_exact(&mut response).await.expect("reply");
     assert_eq!(response[1], Socks5Reply::Succeeded as u8);
+    {
+        let health = health_context.health().lock().expect("health lock");
+        assert!(!health.tcp[0].has_physical_carrier());
+        assert_eq!(health.tcp[1].active_flows, 1);
+    }
     client.write_all(b"ping").await.expect("payload write");
     client.shutdown().await.expect("client shutdown");
     let mut payload = [0u8; 4];
@@ -1992,6 +2535,7 @@ async fn socks5_ingress_retries_next_tcp_path_after_connect_failure() {
     assert_eq!(&payload, b"pong");
 
     handler.await.expect("join").expect("handler");
+    drop(health_context);
     server_path
         .await
         .expect("server join")
@@ -2072,6 +2616,7 @@ async fn http_connect_ingress_relays_tcp_payload_over_encrypted_internal_stream(
     let (path, server_path) = spawn_server_path(OutboundConfig::Direct).await;
     let context =
         ClientPathContext::new(vec![path], security(), ResourceLimits::default()).expect("ctx");
+    probe_client_paths(&context, Duration::from_secs(2)).await;
     let (mut client, server) = duplex(4096);
     let handler = tokio::spawn(handle_http_connect_client_stream(server, context));
 
@@ -2110,6 +2655,7 @@ async fn http_connect_ingress_accepts_configured_basic_proxy_auth() {
         local_proxy_auth(),
     )
     .expect("ctx");
+    probe_client_paths(&context, Duration::from_secs(2)).await;
     let (mut client, server) = duplex(4096);
     let handler = tokio::spawn(handle_http_connect_client_stream(server, context));
 
@@ -2508,6 +3054,7 @@ async fn tcp_datagram_send_and_receive_use_independent_direction_ids() {
     .await;
     let context =
         ClientPathContext::new(vec![path], security(), ResourceLimits::default()).expect("context");
+    let _minimum = spawn_configured_tcp_minimum_reconciliation(&context);
     let mut association = DatagramClientAssociation::new(context)
         .await
         .expect("association");
@@ -2713,6 +3260,7 @@ async fn socks5_udp_associate_relays_datagram_over_encrypted_tcp_path() {
     let (path, server_path) = spawn_server_path(OutboundConfig::Direct).await;
     let context =
         ClientPathContext::new(vec![path], security(), ResourceLimits::default()).expect("ctx");
+    let _minimum = spawn_configured_tcp_minimum_reconciliation(&context);
     let health_context = context.clone();
     let (mut control_client, control_server) = duplex(4096);
     let handler = tokio::spawn(handle_socks5_client_stream(control_server, context));
@@ -2758,6 +3306,7 @@ async fn tcp_datagram_feedback_then_carrier_close_cancels_retry() {
         ResourceLimits::default(),
     )
     .expect("context");
+    let _minimum = spawn_configured_tcp_minimum_reconciliation(&context);
     let mut association = DatagramClientAssociation::new(context)
         .await
         .expect("association");
@@ -2832,6 +3381,7 @@ async fn tcp_datagram_no_feedback_reinjects_same_identity_on_alternative() {
     );
     let expected_session_id = context.session_id;
     let health_context = context.clone();
+    let _minimum = spawn_configured_tcp_minimum_reconciliation(&context);
     let mut association = DatagramClientAssociation::new(context)
         .await
         .expect("association");
@@ -2900,6 +3450,7 @@ async fn tcp_datagram_send_does_not_wait_for_feedback_or_target_response() {
     )
     .expect("context");
     let ttl_ms = 900;
+    let _minimum = spawn_configured_tcp_minimum_reconciliation(&context);
     let mut association = DatagramClientAssociation::new(context)
         .await
         .expect("association");
@@ -2957,6 +3508,7 @@ async fn tcp_datagram_carrier_failure_reinjects_on_fallback() {
         ResourceLimits::default(),
     )
     .expect("context");
+    let _minimum = spawn_configured_tcp_minimum_reconciliation(&context);
     let mut association = DatagramClientAssociation::new(context)
         .await
         .expect("association");
@@ -3033,6 +3585,7 @@ async fn configured_udp_payload_limit_falls_through_to_tcp_without_emission() {
     )
     .expect("context");
     let telemetry_context = context.clone();
+    let _minimum = spawn_configured_tcp_minimum_reconciliation(&context);
     let mut association = DatagramClientAssociation::new(context)
         .await
         .expect("association");
@@ -3084,6 +3637,7 @@ async fn tcp_datagram_setup_consumes_the_original_absolute_ttl() {
     .await;
     let context =
         ClientPathContext::new(vec![path], security(), ResourceLimits::default()).expect("context");
+    let _minimum = spawn_configured_tcp_minimum_reconciliation(&context);
     let mut association = DatagramClientAssociation::new(context)
         .await
         .expect("association");
@@ -3135,6 +3689,7 @@ async fn tcp_datagram_carrier_setup_uses_remaining_ttl_for_same_family_fallback(
         ResourceLimits::default(),
     )
     .expect("context");
+    let _minimum = spawn_configured_tcp_minimum_reconciliation(&context);
     let mut association = DatagramClientAssociation::new(context)
         .await
         .expect("association");

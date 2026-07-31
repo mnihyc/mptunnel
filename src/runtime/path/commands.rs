@@ -10,7 +10,7 @@ use super::tcp::client::ClientTcpDatagramInbound;
 use crate::model::path::{CarrierPathInstanceId, RelayPathInstance};
 use crate::protocol::{DatagramFlowId, Frame, PathId, ResetReason, StreamId, TargetAddr};
 use crate::runtime::error::RuntimeError;
-use crate::scheduler::TrafficClass;
+use crate::scheduler::{PathSnapshot, TrafficClass};
 use std::sync::{
     Arc,
     atomic::{AtomicU8, Ordering},
@@ -229,7 +229,7 @@ pub(in crate::runtime) enum ReliablePathCommand {
         frames: mpsc::Sender<Result<ClientTcpDatagramInbound, RuntimeError>>,
         failure: oneshot::Sender<()>,
         open_deadline: tokio::time::Instant,
-        response: oneshot::Sender<Result<CarrierPathInstanceId, RuntimeError>>,
+        response: oneshot::Sender<Result<ClientTcpOpenedDatagramAttachment, RuntimeError>>,
     },
     OpenDatagramFlow {
         attachment_id: u64,
@@ -302,6 +302,13 @@ impl ClientTcpOpenDeadlines {
 pub(in crate::runtime) struct ClientTcpOpenedStream {
     pub(in crate::runtime) carrier: OpenedReliableCarrierStream,
     pub(in crate::runtime) open_deadline: tokio::time::Instant,
+    pub(in crate::runtime) path_metrics: crate::protocol::PathMetrics,
+}
+
+#[derive(Debug, Clone, Copy)]
+pub(in crate::runtime) struct ClientTcpOpenedDatagramAttachment {
+    pub(in crate::runtime) path_instance_id: CarrierPathInstanceId,
+    pub(in crate::runtime) path_snapshot: PathSnapshot,
 }
 
 // This value crosses one one-shot channel. Keeping the success payload inline

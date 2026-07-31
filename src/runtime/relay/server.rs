@@ -1306,6 +1306,7 @@ where
     let mut flow_demand =
         ReliableRelayFlowDemandTracker::with_initial_lane(path_stream.current_lane());
     let mut output_updates = path_stream.subscribe_output_updates();
+    let switchable_output = output_updates.is_some();
     let mut multipath_reinjection_alternative_available =
         path_stream.has_multipath_reinjection_alternative();
     let mut response_sender =
@@ -2569,6 +2570,11 @@ where
                             send_stream.reinjection_bytes(),
                         ),
                     );
+                    // Switchable outputs publish path state from independent
+                    // actors while this source can remain continuously ready.
+                    if switchable_output {
+                        tokio::task::yield_now().await;
+                    }
                 }
                 if response_sender.queued_send_ready() {
                     let data_ack_outstanding_bytes = reliable_relay_current_data_ack_outstanding_bytes(
@@ -2593,6 +2599,13 @@ where
                         response_sender_retry_at =
                             Some(tokio::time::Instant::now() + sender_service_retry_delay(send_path_snapshot));
                     }
+                }
+                // A switchable response has independent output and feedback
+                // actors. Give them one cooperative turn after this bounded
+                // source-service pass; fixed single-carrier relays keep their
+                // original hot path.
+                if switchable_output {
+                    tokio::task::yield_now().await;
                 }
             }
         }

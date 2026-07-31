@@ -11,6 +11,40 @@ Historical entries below are retained as evidence of the decisions made at
 their recorded time. When a later entry changes an earlier decision, the later
 entry is authoritative.
 
+## 2026-07-31T21:23:30+08:00: portable daily-use Product graph accepted
+
+- Name: packaged ingress, egress, and DNS-authority matrix
+- Category: Product executable acceptance
+- State: accepted; the remaining high-value portable assembly paths are
+  exercised through one packaged process without adding Product behavior
+- Evidence:
+  - HTTP CONNECT reaches direct TCP through an explicit host override, proving
+    local Product resolution and destination authorization;
+  - a fixed TCP forward selects an HTTP CONNECT outbound, whose test peer
+    verifies the canonical domain authority is delegated unchanged;
+  - SOCKS5 UDP ASSOCIATE and a fixed UDP forward both complete through direct
+    native UDP; and
+  - the existing packaged matrix continues to prove routing rejection,
+    SOCKS5-outbound failover, MPP-to-direct egress, offline rejection,
+    configuration persistence, and process restart recovery.
+- Existing nonduplicated evidence:
+  - the full runtime already proves one established SOCKS5 TCP flow remains
+    open through a five-second total carrier outage and resumes on the same
+    logical flow after fresh QUIC attachment;
+  - focused integration tests continue to cover forwarding limits and cleanup,
+    HTTP/HTTPS and SOCKS connector mechanics, routed remote DNS transport,
+    encrypted DNS capture, FakeDNS, and TUN L4 packet handling.
+- Verification:
+  - `cargo test --all-targets --all-features --quiet` passes 1,427 library
+    tests, two allocation tests, and six packaged daily-use acceptance tests;
+  - `cargo clippy --all-targets --all-features -- -D warnings`, formatting, and
+    whitespace checks pass.
+- Performance boundary: only test support and one packaged acceptance scenario
+  changed; the release binary is byte-identical to the preceding accepted
+  Product milestone.
+- Next: correct the proven ranged-TCP port-hopping lifecycle mismatch, then
+  restore the deterministic whole-link quality-swap timing gate.
+
 ## 2026-07-31T21:14:51+08:00: Product availability presentation aligned
 
 - Name: authenticated-carrier management projection

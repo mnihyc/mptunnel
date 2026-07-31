@@ -12,20 +12,23 @@ use mptunnel::product::{CompiledDnsPlan, CompiledDnsUpstream, DnsSecurityPolicy,
 use std::collections::HashMap;
 use std::fs;
 use std::io::{Read, Write};
-use std::net::{IpAddr, Ipv4Addr, SocketAddr};
+use std::net::{IpAddr, Ipv4Addr, SocketAddr, TcpStream};
 use std::path::Path;
 use std::sync::Arc;
 use std::thread;
 use std::time::{Duration, Instant};
 use support::{
-    MptunnelProcess, SocksTarget, TestDirectory, check_config, http_request, join_thread,
-    network_test_guard, socks5_connect, socks5_round_trip, spawn_blackhole_proxy,
-    spawn_echo_socks5_proxy, spawn_tcp_echo, spawn_tcp_echo_connections, unused_loopback_addr,
-    wait_for_ready_management, wait_for_tcp, wait_for_tcp_closed,
+    MptunnelProcess, SocksTarget, TestDirectory, check_config, http_connect, http_request,
+    join_thread, network_test_guard, socks5_connect, socks5_round_trip, socks5_udp_round_trip,
+    spawn_blackhole_proxy, spawn_echo_http_connect_proxy, spawn_echo_socks5_proxy, spawn_tcp_echo,
+    spawn_tcp_echo_connections, spawn_udp_echo_packets, udp_round_trip, unused_loopback_addr,
+    unused_loopback_udp_addr, wait_for_ready_management, wait_for_tcp, wait_for_tcp_closed,
 };
 
 const OPERATOR_TOKEN: &str = "daily-use-operator-token";
 const PROCESS_START_TIMEOUT: Duration = Duration::from_secs(10);
+const LOCAL_DNS_TARGET: &str = "daily-use.test";
+const DELEGATED_HTTP_TARGET: &str = "remote-resolution.invalid:443";
 
 fn reject_runtime_config(socks: &[SocketAddr], management: SocketAddr, generation: u64) -> String {
     let socks = socks
@@ -57,6 +60,116 @@ name = "default-reject"
 action = "reject"
 traffic_intent = "background"
 "#
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn native_daily_use_config(
+    http: SocketAddr,
+    socks: SocketAddr,
+    tcp_forward: SocketAddr,
+    udp_forward: SocketAddr,
+    management: SocketAddr,
+    direct_tcp_target: SocketAddr,
+    direct_udp_target: SocketAddr,
+    http_proxy: SocketAddr,
+) -> String {
+    format!(
+        r#"
+[logging]
+level = "error"
+
+[management]
+listen = ["{management}"]
+token = {{ from = "file", path = "operator-token.key" }}
+dashboard = false
+allow_peer_diagnostics = false
+
+[dns]
+generation = 1
+default_dns_plan = "local"
+
+[[dns.upstreams]]
+name = "system"
+transport = "system"
+
+[[dns.plans]]
+name = "local"
+upstreams = ["system"]
+ip_strategy = "ipv4-only"
+
+[[dns.hosts]]
+domain = "{LOCAL_DNS_TARGET}"
+addresses = ["127.0.0.1"]
+
+[[inbounds]]
+name = "local-http"
+protocol = "http-connect"
+listen = ["{http}"]
+
+[[inbounds]]
+name = "local-socks"
+protocol = "socks5"
+listen = ["{socks}"]
+
+[[inbounds]]
+name = "local-tcp-forward"
+protocol = "tcp-forward"
+listen = ["{tcp_forward}"]
+target = "{DELEGATED_HTTP_TARGET}"
+max_connections = 4
+
+[[inbounds]]
+name = "local-udp-forward"
+protocol = "udp-forward"
+listen = ["{udp_forward}"]
+target = "{direct_udp_target}"
+max_associations = 4
+idle_timeout_ms = 5000
+datagram_ttl_ms = 3000
+
+[[outbounds]]
+name = "direct-egress"
+protocol = "direct"
+
+[[outbounds]]
+name = "http-egress"
+protocol = "http-connect"
+endpoint = "{http_proxy}"
+connect_timeout_ms = 2000
+
+[routing]
+generation = 1
+
+[routing.destination_acl]
+
+[[routing.destination_acl.rules]]
+name = "allow-delegated-test-authority"
+effect = "allow"
+domain_exact = ["remote-resolution.invalid"]
+destination_ports = [443]
+networks = ["tcp"]
+
+[[routing.destination_acl.rules]]
+name = "allow-loopback-test-targets"
+effect = "allow-restricted"
+destination_cidrs = ["127.0.0.1/32"]
+destination_ports = [{direct_tcp_port}, {direct_udp_port}]
+networks = ["tcp", "udp"]
+
+[[routing.rules]]
+name = "tcp-forward-through-http"
+inbounds = ["local-tcp-forward"]
+action = "outbound"
+outbound = "http-egress"
+
+[[routing.rules]]
+name = "default-direct"
+action = "outbound"
+outbound = "direct-egress"
+"#,
+        direct_tcp_port = direct_tcp_target.port(),
+        direct_udp_port = direct_udp_target.port(),
     )
 }
 
@@ -611,6 +724,145 @@ fn packaged_management_api_validates_applies_persists_and_reloads_one_generation
         }),
         "an unchanged live logger must remain installed across an unrelated generation reload:\n{rotated_contents}"
     );
+}
+
+#[test]
+fn packaged_daily_use_ingresses_reach_configured_native_egress() {
+    let _network = network_test_guard();
+    let directory = TestDirectory::new("daily-use-ingresses");
+    let http = unused_loopback_addr();
+    let socks = unused_loopback_addr();
+    let tcp_forward = unused_loopback_addr();
+    let udp_forward = unused_loopback_udp_addr();
+    let management = unused_loopback_addr();
+    let (direct_tcp_target, direct_tcp_task) = spawn_tcp_echo();
+    let (direct_udp_target, direct_udp_task) = spawn_udp_echo_packets(2);
+    let (http_proxy, http_proxy_task) = spawn_echo_http_connect_proxy(DELEGATED_HTTP_TARGET);
+    directory.write("operator-token.key", OPERATOR_TOKEN);
+    let config_path = directory.write(
+        "native-daily-use.toml",
+        &native_daily_use_config(
+            http,
+            socks,
+            tcp_forward,
+            udp_forward,
+            management,
+            direct_tcp_target,
+            direct_udp_target,
+            http_proxy,
+        ),
+    );
+    assert_check_config_ok(&config_path);
+
+    let mut process = MptunnelProcess::spawn(
+        &config_path,
+        directory.path().join("native-daily-use.stderr"),
+    );
+    wait_for_ready_management(
+        &mut process,
+        management,
+        OPERATOR_TOKEN,
+        PROCESS_START_TIMEOUT,
+    );
+
+    enum TcpIngress<'a> {
+        HttpConnect {
+            listener: SocketAddr,
+            authority: &'a str,
+        },
+        FixedForward {
+            listener: SocketAddr,
+        },
+    }
+    let local_authority = format!("{LOCAL_DNS_TARGET}:{}", direct_tcp_target.port());
+    let tcp_cases = [
+        (
+            "HTTP CONNECT to direct TCP with local DNS",
+            TcpIngress::HttpConnect {
+                listener: http,
+                authority: local_authority.as_str(),
+            },
+        ),
+        (
+            "fixed TCP forward through HTTP CONNECT",
+            TcpIngress::FixedForward {
+                listener: tcp_forward,
+            },
+        ),
+    ];
+    for (name, case) in tcp_cases {
+        let mut stream = match case {
+            TcpIngress::HttpConnect {
+                listener,
+                authority,
+            } => {
+                let (stream, status) = http_connect(listener, authority)
+                    .unwrap_or_else(|error| panic!("{name} failed to open: {error}"));
+                assert_eq!(status, 200, "{name} returned HTTP status {status}");
+                stream
+            }
+            TcpIngress::FixedForward { listener } => {
+                TcpStream::connect_timeout(&listener, Duration::from_millis(500))
+                    .unwrap_or_else(|error| panic!("{name} failed to open: {error}"))
+            }
+        };
+        stream
+            .set_read_timeout(Some(Duration::from_secs(5)))
+            .expect("set packaged TCP case read timeout");
+        stream
+            .set_write_timeout(Some(Duration::from_secs(5)))
+            .expect("set packaged TCP case write timeout");
+        stream
+            .write_all(b"ping")
+            .unwrap_or_else(|error| panic!("{name} request failed: {error}"));
+        let mut response = [0_u8; 4];
+        stream
+            .read_exact(&mut response)
+            .unwrap_or_else(|error| panic!("{name} response failed: {error}"));
+        assert_eq!(&response, b"pong", "{name} returned the wrong payload");
+    }
+
+    enum UdpIngress {
+        Socks5Associate {
+            listener: SocketAddr,
+            target: SocketAddr,
+        },
+        FixedForward {
+            listener: SocketAddr,
+        },
+    }
+    let udp_cases = [
+        (
+            "SOCKS5 UDP ASSOCIATE to direct UDP",
+            UdpIngress::Socks5Associate {
+                listener: socks,
+                target: direct_udp_target,
+            },
+        ),
+        (
+            "fixed UDP forward to direct UDP",
+            UdpIngress::FixedForward {
+                listener: udp_forward,
+            },
+        ),
+    ];
+    for (name, case) in udp_cases {
+        let result = match case {
+            UdpIngress::Socks5Associate { listener, target } => socks5_udp_round_trip(
+                listener,
+                SocksTarget::Ipv4(Ipv4Addr::LOCALHOST, target.port()),
+                b"ping",
+                b"pong",
+            ),
+            UdpIngress::FixedForward { listener } => udp_round_trip(listener, b"ping", b"pong"),
+        };
+        result.unwrap_or_else(|error| panic!("{name} failed: {error}"));
+    }
+
+    process.assert_running("completed packaged daily-use ingress acceptance");
+    join_thread(direct_tcp_task, "daily-use direct TCP target");
+    join_thread(http_proxy_task, "daily-use HTTP CONNECT proxy");
+    join_thread(direct_udp_task, "daily-use direct UDP target");
 }
 
 fn write_test_tls_material(directory: &TestDirectory) -> (std::path::PathBuf, std::path::PathBuf) {

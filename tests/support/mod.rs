@@ -1,6 +1,8 @@
 use std::fs::{self, File};
 use std::io::{self, Read, Write};
-use std::net::{Ipv4Addr, Shutdown, SocketAddr, TcpListener, TcpStream};
+use std::net::{
+    IpAddr, Ipv4Addr, Ipv6Addr, Shutdown, SocketAddr, TcpListener, TcpStream, UdpSocket,
+};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Output, Stdio};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -160,6 +162,26 @@ pub fn unused_loopback_addr() -> SocketAddr {
     }
 }
 
+pub fn unused_loopback_udp_addr() -> SocketAddr {
+    let mut duplicate_reservations = Vec::new();
+    loop {
+        let reservation =
+            UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).expect("reserve loopback UDP port");
+        let address = reservation
+            .local_addr()
+            .expect("reserved loopback UDP address");
+        let mut issued = ISSUED_LOOPBACK_ADDRESSES
+            .lock()
+            .expect("acceptance-test port ledger");
+        if !issued.contains(&address) {
+            issued.push(address);
+            return address;
+        }
+        drop(issued);
+        duplicate_reservations.push(reservation);
+    }
+}
+
 pub fn network_test_guard() -> MutexGuard<'static, ()> {
     // Released port-0 reservations cannot be handed atomically to a child
     // process, so socket-owning acceptance scenarios must not race each other.
@@ -306,9 +328,66 @@ pub fn wait_for_ready_management(
     }
 }
 
+#[derive(Clone, Copy)]
 pub enum SocksTarget<'a> {
     Domain(&'a str, u16),
     Ipv4(Ipv4Addr, u16),
+}
+
+fn protocol_target(target: SocksTarget<'_>) -> mptunnel::protocol::TargetAddr {
+    match target {
+        SocksTarget::Domain(host, port) => mptunnel::protocol::TargetAddr::Domain {
+            host: host.to_string(),
+            port,
+        },
+        SocksTarget::Ipv4(address, port) => {
+            mptunnel::protocol::TargetAddr::Ip(SocketAddr::new(IpAddr::V4(address), port))
+        }
+    }
+}
+
+fn read_socks5_reply(stream: &mut TcpStream) -> io::Result<(u8, Option<SocketAddr>)> {
+    let mut prefix = [0_u8; 4];
+    stream.read_exact(&mut prefix)?;
+    if prefix[0] != 0x05 || prefix[2] != 0x00 {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("invalid SOCKS5 reply prefix: {prefix:?}"),
+        ));
+    }
+    let address = match prefix[3] {
+        0x01 => {
+            let mut encoded = [0_u8; 6];
+            stream.read_exact(&mut encoded)?;
+            Some(SocketAddr::from((
+                [encoded[0], encoded[1], encoded[2], encoded[3]],
+                u16::from_be_bytes([encoded[4], encoded[5]]),
+            )))
+        }
+        0x04 => {
+            let mut encoded = [0_u8; 18];
+            stream.read_exact(&mut encoded)?;
+            let octets: [u8; 16] = encoded[..16].try_into().expect("IPv6 reply length");
+            Some(SocketAddr::new(
+                IpAddr::V6(Ipv6Addr::from(octets)),
+                u16::from_be_bytes([encoded[16], encoded[17]]),
+            ))
+        }
+        0x03 => {
+            let mut length = [0_u8; 1];
+            stream.read_exact(&mut length)?;
+            let mut encoded = vec![0_u8; usize::from(length[0]) + 2];
+            stream.read_exact(&mut encoded)?;
+            None
+        }
+        atyp => {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("invalid SOCKS5 reply address type: {atyp}"),
+            ));
+        }
+    };
+    Ok((prefix[1], address))
 }
 
 pub fn socks5_connect(proxy: SocketAddr, target: SocksTarget<'_>) -> io::Result<(TcpStream, u8)> {
@@ -340,32 +419,117 @@ pub fn socks5_connect(proxy: SocketAddr, target: SocksTarget<'_>) -> io::Result<
         }
     }
     stream.write_all(&request)?;
-    let mut prefix = [0_u8; 4];
-    stream.read_exact(&mut prefix)?;
-    if prefix[0] != 0x05 || prefix[2] != 0x00 {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidData,
-            format!("invalid SOCKS5 reply prefix: {prefix:?}"),
-        ));
-    }
-    let address_len = match prefix[3] {
-        0x01 => 4,
-        0x04 => 16,
-        0x03 => {
-            let mut length = [0_u8; 1];
-            stream.read_exact(&mut length)?;
-            usize::from(length[0])
-        }
-        atyp => {
+    let (reply, _) = read_socks5_reply(&mut stream)?;
+    Ok((stream, reply))
+}
+
+pub fn http_connect(proxy: SocketAddr, authority: &str) -> io::Result<(TcpStream, u16)> {
+    let mut stream = TcpStream::connect_timeout(&proxy, Duration::from_millis(500))?;
+    stream.set_read_timeout(Some(IO_TIMEOUT))?;
+    stream.set_write_timeout(Some(IO_TIMEOUT))?;
+    write!(
+        stream,
+        "CONNECT {authority} HTTP/1.1\r\nHost: {authority}\r\n\r\n"
+    )?;
+    let mut response = Vec::new();
+    while !response.ends_with(b"\r\n\r\n") {
+        if response.len() >= 64 * 1024 {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
-                format!("invalid SOCKS5 reply address type: {atyp}"),
+                "HTTP CONNECT response headers exceed 64 KiB",
             ));
         }
-    };
-    let mut remainder = vec![0_u8; address_len + 2];
-    stream.read_exact(&mut remainder)?;
-    Ok((stream, prefix[1]))
+        let mut byte = [0_u8; 1];
+        stream.read_exact(&mut byte)?;
+        response.push(byte[0]);
+    }
+    let parsed = mptunnel::outbound::http_connect::parse_connect_response(&response)
+        .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
+    Ok((stream, parsed.status))
+}
+
+pub fn socks5_udp_round_trip(
+    proxy: SocketAddr,
+    target: SocksTarget<'_>,
+    request: &[u8],
+    response: &[u8],
+) -> io::Result<()> {
+    let mut control = TcpStream::connect_timeout(&proxy, Duration::from_millis(500))?;
+    control.set_read_timeout(Some(IO_TIMEOUT))?;
+    control.set_write_timeout(Some(IO_TIMEOUT))?;
+    control.write_all(&[0x05, 0x01, 0x00])?;
+    let mut method = [0_u8; 2];
+    control.read_exact(&mut method)?;
+    if method != [0x05, 0x00] {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("unexpected SOCKS5 method reply: {method:?}"),
+        ));
+    }
+    control.write_all(&[0x05, 0x03, 0x00, 0x01, 0, 0, 0, 0, 0, 0])?;
+    let (reply, relay) = read_socks5_reply(&mut control)?;
+    if reply != 0x00 {
+        return Err(io::Error::other(format!(
+            "SOCKS5 UDP ASSOCIATE failed with status {reply:#04x}"
+        )));
+    }
+    let mut relay = relay.ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::InvalidData,
+            "SOCKS5 UDP relay reply used a domain address",
+        )
+    })?;
+    if relay.ip().is_unspecified() {
+        relay.set_ip(proxy.ip());
+    }
+
+    let socket = UdpSocket::bind((Ipv4Addr::LOCALHOST, 0))?;
+    socket.set_read_timeout(Some(IO_TIMEOUT))?;
+    socket.set_write_timeout(Some(IO_TIMEOUT))?;
+    let target = protocol_target(target);
+    let packet = mptunnel::ingress::socks5::udp_datagram(&target, request)
+        .map_err(|error| io::Error::new(io::ErrorKind::InvalidInput, error))?;
+    socket.send_to(&packet, relay)?;
+    let mut received = [0_u8; 65_535];
+    let (received_len, source) = socket.recv_from(&mut received)?;
+    if source != relay {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("SOCKS5 UDP response came from {source}, expected {relay}"),
+        ));
+    }
+    let (datagram, consumed) =
+        mptunnel::ingress::socks5::parse_udp_datagram(&received[..received_len])
+            .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
+    if consumed != received_len
+        || datagram.target != target
+        || datagram.payload.as_ref() != response
+    {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("unexpected SOCKS5 UDP response: {datagram:?}"),
+        ));
+    }
+    Ok(())
+}
+
+pub fn udp_round_trip(address: SocketAddr, request: &[u8], response: &[u8]) -> io::Result<()> {
+    let socket = UdpSocket::bind((Ipv4Addr::LOCALHOST, 0))?;
+    socket.set_read_timeout(Some(IO_TIMEOUT))?;
+    socket.set_write_timeout(Some(IO_TIMEOUT))?;
+    socket.send_to(request, address)?;
+    let mut received = vec![0_u8; response.len().max(1)];
+    let (length, source) = socket.recv_from(&mut received)?;
+    if source != address || length != response.len() || &received[..length] != response {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!(
+                "unexpected UDP response from {source}: {:?}",
+                &received[..length]
+            ),
+        ));
+    }
+    Ok(())
 }
 
 pub fn socks5_round_trip(
@@ -463,6 +627,60 @@ pub fn spawn_echo_socks5_proxy(
     (address, task)
 }
 
+pub fn spawn_echo_http_connect_proxy(
+    expected_authority: &str,
+) -> (SocketAddr, thread::JoinHandle<()>) {
+    let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).expect("bind HTTP CONNECT proxy");
+    let address = listener.local_addr().expect("HTTP CONNECT proxy address");
+    let expected_authority = expected_authority.to_string();
+    let task = thread::spawn(move || {
+        let (mut stream, _) = listener
+            .accept()
+            .expect("accept HTTP CONNECT proxy connection");
+        stream
+            .set_read_timeout(Some(IO_TIMEOUT))
+            .expect("set HTTP CONNECT proxy read timeout");
+        stream
+            .set_write_timeout(Some(IO_TIMEOUT))
+            .expect("set HTTP CONNECT proxy write timeout");
+        let mut request = Vec::new();
+        while !request.ends_with(b"\r\n\r\n") {
+            assert!(
+                request.len() < 16 * 1024,
+                "HTTP CONNECT request exceeded the Product request bound"
+            );
+            let mut byte = [0_u8; 1];
+            stream
+                .read_exact(&mut byte)
+                .expect("HTTP CONNECT proxy request");
+            request.push(byte[0]);
+        }
+        let request = std::str::from_utf8(&request).expect("ASCII HTTP CONNECT request");
+        assert!(
+            request.starts_with(&format!("CONNECT {expected_authority} HTTP/1.1\r\n")),
+            "HTTP CONNECT outbound changed the delegated authority: {request:?}"
+        );
+        assert!(
+            request
+                .lines()
+                .any(|line| line == format!("Host: {expected_authority}")),
+            "HTTP CONNECT outbound changed the delegated Host authority: {request:?}"
+        );
+        stream
+            .write_all(b"HTTP/1.1 200 Connection Established\r\n\r\n")
+            .expect("HTTP CONNECT proxy success reply");
+        let mut payload = [0_u8; 4];
+        stream
+            .read_exact(&mut payload)
+            .expect("HTTP CONNECT proxied payload");
+        assert_eq!(&payload, b"ping");
+        stream
+            .write_all(b"pong")
+            .expect("HTTP CONNECT proxied response");
+    });
+    (address, task)
+}
+
 pub fn spawn_tcp_echo() -> (SocketAddr, thread::JoinHandle<()>) {
     spawn_tcp_echo_connections(1)
 }
@@ -483,6 +701,26 @@ pub fn spawn_tcp_echo_connections(connection_count: usize) -> (SocketAddr, threa
             stream.read_exact(&mut request).expect("echo request");
             assert_eq!(&request, b"ping");
             stream.write_all(b"pong").expect("echo response");
+        }
+    });
+    (address, task)
+}
+
+pub fn spawn_udp_echo_packets(packet_count: usize) -> (SocketAddr, thread::JoinHandle<()>) {
+    let socket = UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).expect("bind UDP echo target");
+    socket
+        .set_read_timeout(Some(IO_TIMEOUT))
+        .expect("set UDP echo read timeout");
+    socket
+        .set_write_timeout(Some(IO_TIMEOUT))
+        .expect("set UDP echo write timeout");
+    let address = socket.local_addr().expect("UDP echo target address");
+    let task = thread::spawn(move || {
+        let mut payload = [0_u8; 65_535];
+        for _ in 0..packet_count {
+            let (length, peer) = socket.recv_from(&mut payload).expect("UDP echo request");
+            assert_eq!(&payload[..length], b"ping");
+            socket.send_to(b"pong", peer).expect("UDP echo response");
         }
     });
     (address, task)

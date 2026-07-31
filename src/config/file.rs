@@ -270,8 +270,6 @@ enum LogLevelFileValue {
     Warn,
     #[default]
     Info,
-    Debug,
-    Trace,
 }
 
 impl From<LogLevelFileValue> for LogLevel {
@@ -281,8 +279,6 @@ impl From<LogLevelFileValue> for LogLevel {
             LogLevelFileValue::Error => Self::Error,
             LogLevelFileValue::Warn => Self::Warn,
             LogLevelFileValue::Info => Self::Info,
-            LogLevelFileValue::Debug => Self::Debug,
-            LogLevelFileValue::Trace => Self::Trace,
         }
     }
 }

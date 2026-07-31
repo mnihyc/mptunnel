@@ -141,17 +141,19 @@ fn client_cli_builds_default_socks_config() {
 }
 
 #[test]
-fn client_cli_rejects_log_level_typos() {
-    let error = parse_cli([
-        "mptunnel",
-        "--log-level",
-        "warning",
-        "client",
-        "--path",
-        "tcp://127.0.0.1:443",
-    ])
-    .expect_err("invalid typed log level must fail CLI parsing");
-    assert_eq!(error.kind(), clap::error::ErrorKind::InvalidValue);
+fn client_cli_rejects_unsupported_log_levels() {
+    for level in ["warning", "debug", "trace"] {
+        let error = parse_cli([
+            "mptunnel",
+            "--log-level",
+            level,
+            "client",
+            "--path",
+            "tcp://127.0.0.1:443",
+        ])
+        .expect_err("unsupported typed log level must fail CLI parsing");
+        assert_eq!(error.kind(), clap::error::ErrorKind::InvalidValue);
+    }
 }
 
 #[test]
@@ -159,7 +161,7 @@ fn simple_cli_maps_the_complete_logging_surface() {
     let config = parse_cli([
         "mptunnel",
         "--log-level",
-        "debug",
+        "info",
         "--log-format",
         "json",
         "--log-file",
@@ -173,7 +175,7 @@ fn simple_cli_maps_the_complete_logging_surface() {
     .expect("parse logging CLI")
     .into_config()
     .expect("compile logging CLI");
-    assert_eq!(config.logging.level, crate::config::LogLevel::Debug);
+    assert_eq!(config.logging.level, crate::config::LogLevel::Info);
     assert_eq!(config.logging.format, crate::config::LogFormat::Json);
     assert_eq!(
         config.logging.file,

@@ -51,8 +51,6 @@ pub enum LogLevel {
     Error = 1,
     Warn = 2,
     Info = 3,
-    Debug = 4,
-    Trace = 5,
 }
 
 impl LogLevel {
@@ -62,8 +60,6 @@ impl LogLevel {
             Self::Error => "error",
             Self::Warn => "warn",
             Self::Info => "info",
-            Self::Debug => "debug",
-            Self::Trace => "trace",
         }
     }
 }
@@ -77,7 +73,7 @@ pub enum LogFormat {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct LoggingConfig {
-    /// Minimum process-event severity written to configured sinks.
+    /// Process-event verbosity threshold written to configured sinks.
     pub level: LogLevel,
     /// One stable record encoding shared by the console and file sinks.
     pub format: LogFormat,
@@ -1218,10 +1214,7 @@ impl std::fmt::Display for ConfigError {
                 write!(f, "enabled logging requires the console or file sink")
             }
             Self::FlowEventsRequireInfo => {
-                write!(
-                    f,
-                    "flow-event logging requires log level info, debug, or trace"
-                )
+                write!(f, "flow-event logging requires log level info")
             }
             Self::AuthFreshnessWindowZero => {
                 write!(f, "auth freshness window must be greater than zero")

@@ -76,7 +76,7 @@ lifecycle callbacks remain owned by the embedding application.
 
 ```toml
 [logging]
-level = "info"          # off, error, warn, info, debug, or trace
+level = "info"          # off, error, warn, or info
 format = "text"         # text or json
 console = true          # standard error
 # file = "logs/mptunnel.log"
@@ -100,8 +100,7 @@ The matching environment variables are `MPTUNNEL_LOG_LEVEL`,
 `MPTUNNEL_LOG_FLOW_EVENTS`.
 
 When logging is enabled, at least the console or file sink must be enabled.
-Flow events require `info`, `debug`, or `trace`, because they are information
-records.
+Flow events require `info`, because they are information records.
 
 Lifecycle, control, saturation, and fault records are length-bounded,
 rate-limited per call site, and redact common authorization, token, password,

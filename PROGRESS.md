@@ -11,6 +11,29 @@ Historical entries below are retained as evidence of the decisions made at
 their recorded time. When a later entry changes an earlier decision, the later
 entry is authoritative.
 
+## 2026-07-31T21:32:01+08:00: process logging surface aligned with real output
+
+- Name: four-level operator logging model
+- Category: Product configuration and observability
+- State: accepted; configuration now exposes only behavior implemented by the
+  process event system
+- Correction:
+  - TOML, CLI, and environment configuration accept `off`, `error`, `warn`,
+    and `info`;
+  - the previously accepted `debug` and `trace` values were removed because
+    production has no events at either level and both behaved identically to
+    `info`;
+  - flow-event logging consequently requires `info`; and
+  - operator and reference documentation describe the same four-level model.
+- Verification:
+  - focused file-schema, CLI, and packaged live-logging-update tests pass;
+  - formatting and whitespace checks pass; and
+  - the change adds no event call, transport branch, timer, payload work, or
+    Core behavior.
+- Next: complete the RFC-defined bounded TCP carrier lifecycle, beginning with
+  one shared reservation/identity model used by elastic establishment and
+  planned ranged-port replacement.
+
 ## 2026-07-31T21:23:30+08:00: portable daily-use Product graph accepted
 
 - Name: packaged ingress, egress, and DNS-authority matrix

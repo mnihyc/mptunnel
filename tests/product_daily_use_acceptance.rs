@@ -588,7 +588,7 @@ fn packaged_management_api_validates_applies_persists_and_reloads_one_generation
     assert_eq!(status["runtime_revision"], candidate_revision);
     assert!(status["pending_revision"].is_null());
 
-    let live_logging_candidate = candidate.replacen("level = \"info\"", "level = \"debug\"", 1);
+    let live_logging_candidate = candidate.replacen("console = false", "console = true", 1);
     let validated = http_request(
         management,
         "POST",

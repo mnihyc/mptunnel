@@ -286,8 +286,6 @@ pub enum LogLevelArg {
     Error,
     Warn,
     Info,
-    Debug,
-    Trace,
 }
 
 impl From<LogLevelArg> for LogLevel {
@@ -297,8 +295,6 @@ impl From<LogLevelArg> for LogLevel {
             LogLevelArg::Error => Self::Error,
             LogLevelArg::Warn => Self::Warn,
             LogLevelArg::Info => Self::Info,
-            LogLevelArg::Debug => Self::Debug,
-            LogLevelArg::Trace => Self::Trace,
         }
     }
 }

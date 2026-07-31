@@ -15,7 +15,7 @@ check_config = false
 # Process logging stays outside the forwarding Core. Relative file paths are
 # resolved beside this document; parent directories must already exist.
 [logging]
-level = "info"          # off, error, warn, info, debug, or trace
+level = "info"          # off, error, warn, or info
 format = "text"         # text or newline-delimited json
 console = true          # standard error
 # file = "logs/mptunnel.log"
